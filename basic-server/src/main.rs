@@ -1,6 +1,8 @@
 #![allow(unused)]
 
 use std::{env, path};
+use tokio::fs;
+
 use cloudillo::auth_adapter::TokenData;
 use auth_adapter_sqlite::AuthAdapterSqlite;
 
@@ -15,7 +17,7 @@ async fn main() {
 	};
 	//tracing_subscriber::fmt::init();
 
-	//let cld = cloudillo::Cloudillo::new(auth_adapter).await.unwrap();
+	fs::create_dir_all(&config.db_dir).await.unwrap();
 	let auth_adapter = Box::new(AuthAdapterSqlite::new(config.db_dir.join("auth.db")).await.unwrap());
 	//let auth_adapter = &AuthAdapterSqlite::new("auth.db").await.unwrap();
 
