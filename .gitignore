@@ -1,0 +1,7 @@
+/target
+/data
+/perf.data
+/Cargo.lock
+*.sw?
+*.tmp
+*.bak

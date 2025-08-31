@@ -1,0 +1,11 @@
+[package]
+name = "auth-adapter-sqlite"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-sqlite = "0.5.0"
+async-trait = "0.1.88"
+cloudillo = { path = "../../server" }
+jsonwebtoken = "9.3.1"
+openssl = "0.10.71"
