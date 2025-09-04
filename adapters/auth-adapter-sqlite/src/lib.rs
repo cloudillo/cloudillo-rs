@@ -4,7 +4,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use async_sqlite as sqlite;
 
-use cloudillo::auth_adapter;
+use cloudillo::{auth_adapter, AppState};
 
 mod token;
 
@@ -27,17 +27,17 @@ impl AuthAdapterSqlite {
 
 #[async_trait]
 impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
-	async fn create_key(&self, tn_id: u32) -> Result<(Box<str>, Box<str>), Box<dyn std::error::Error>> {
-		let (private_key, public_key) = token::generate_key().await?;
+	async fn create_key(&self, state: &AppState, tn_id: u32) -> Result<(Box<str>, Box<str>), Box<dyn std::error::Error>> {
+		let (private_key, public_key) = token::generate_key(&state).await?;
 		Ok((private_key, public_key))
 	}
 
-	async fn create_token(&self, tn_id: u32, data: auth_adapter::TokenData) -> Result<Box<str>, Box<dyn std::error::Error>> {
+	async fn create_token(&self, state: &AppState, tn_id: u32, data: auth_adapter::TokenData) -> Result<Box<str>, Box<dyn std::error::Error>> {
 		let value: String = self.db.conn(|conn| {
 			conn.query_row("SELECT '1'", [], |row| row.get(0))
 		}).await?;
 		println!("[auth-adapter-sqlite] initialized");
-		let key = token::generate_key();
+		let key = token::generate_key(&state);
 		Ok(Box::from(value))
 	}
 }

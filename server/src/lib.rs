@@ -20,7 +20,6 @@ use crate::file::handler as file_handler;
 use auth_adapter::AuthAdapter;
 
 pub struct Cloudillo {
-	//auth_adapter: &'static dyn AuthAdapter,
 	auth_adapter: Box<dyn auth_adapter::AuthAdapter>,
 }
 
@@ -28,9 +27,10 @@ pub struct Cloudillo {
 //	cloudillo: &'a Cloudillo<'a>
 //}
 pub struct AppState {
+	pub worker: worker::WorkerPool,
 	//cloudillo: &'a Cloudillo,
 	//auth_adapter: &'static dyn AuthAdapter,
-	auth_adapter: Box<dyn auth_adapter::AuthAdapter>,
+	pub auth_adapter: Box<dyn auth_adapter::AuthAdapter>,
 }
 
 /*
@@ -70,12 +70,16 @@ pub struct CloudilloOpts {
 }
 
 pub async fn run(opts: CloudilloOpts) -> Result<(), std::io::Error> {
-	//let state = Rc::new(AppState { cloudillo: &self });
-	//let state = Arc::new(Mutex::new(AppState { cloudillo: &self }));
-	//let state = Arc::new(AppState { cloudillo: &self });
+	/*
 	let state = Arc::new(AppState {
+		worker: worker::WorkerPool::new(1, 2, 1),
 		auth_adapter: opts.auth_adapter,
 	});
+	*/
+	let state = AppState {
+		worker: worker::WorkerPool::new(1, 2, 1),
+		auth_adapter: opts.auth_adapter,
+	};
 
 	let router = Router::new()
 		.route("/", get(get_root))
@@ -83,27 +87,25 @@ pub async fn run(opts: CloudilloOpts) -> Result<(), std::io::Error> {
 		.route("/action", get(action_handler::list_actions))
 		.route("/action", post(action_handler::post_action))
 		.route("/file", post(file_handler::post_file))
-		.with_state(state);
+		.with_state(state.into());
 
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
 		.await
 		.unwrap();
+
 	print!("Listening on http://127.0.0.1:3000\n");
-	tokio::task::spawn(async {
-		worker::run_worker().await;
-	});
 	axum::serve(listener, router).await
 }
 
 async fn get_root(
 	Query(query): Query<HashMap<String, String>>,
 	State(state): State<Arc<AppState>>,
-	//State(state): State<Arc<Mutex<AppState<'_>>>>,
 	//) -> &'static str {
 ) -> Box<str> {
 	let token = state
 		.auth_adapter
 		.create_token(
+			&state,
 			1,
 			auth_adapter::TokenData {
 				issuer: "test".into(),

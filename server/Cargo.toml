@@ -7,8 +7,9 @@ edition = "2021"
 async-trait = "0.1.88"
 axum = "0.8.1"
 flume = { version = "0.11.1", features = ["async"] }
+futures = "0.3.31"
 hmac = "0.12.1"
-image = "0.25.5"
+image = "0.25.6"
 jwt = "0.16.0"
 lazy_static = "1.5.0"
 serde = { version = "1.0.219", features = ["derive"] }

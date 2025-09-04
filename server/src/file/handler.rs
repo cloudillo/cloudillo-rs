@@ -10,41 +10,33 @@ use std::sync::Arc;
 use crate::action::action;
 use crate::auth_adapter::TokenData;
 use crate::AppState;
-use crate::worker::{Task, run};
 
-#[derive(Default, Debug)]
-struct ImageResizeTask {
-    orig_buf: axum::body::Bytes,
-	resize: (u32, u32),
-	resized_buf: Option<Box<[u8]>>
-	//resized_buf: Result<Box<[u8]>, ()>>,
-}
+//fn resize_image(orig_buf: &axum::body::Bytes, resize: (u32, u32)) -> Result<Box<[u8]>, impl std::error::Error> {
+fn resize_image<'a>(orig_buf: impl AsRef<[u8]> + 'a, resize: (u32, u32)) -> Result<Box<[u8]>, image::error::ImageError> {
+	print!("decoding...");
+	let now = std::time::Instant::now();
+	let original = ImageReader::new(Cursor::new(&orig_buf.as_ref()))
+		.with_guessed_format()?
+		.decode()?;
+	println!(" [{:.2}ms]", now.elapsed().as_millis());
 
-impl Task for ImageResizeTask {
-    fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-		println!("decoding...");
-		let original = ImageReader::new(Cursor::new(&self.orig_buf))
-			.with_guessed_format().unwrap()
-			.decode().unwrap();
+	print!("resizing...");
+	let now = std::time::Instant::now();
+	let resized = original.resize(200, 200, image::imageops::FilterType::Lanczos3);
+	println!(" [{:.2}ms]", now.elapsed().as_millis());
 
-		print!("resizing...");
-		let now = std::time::Instant::now();
-		let resized = original.resize(1000, 1000, image::imageops::FilterType::Lanczos3);
-		println!(" [{:.2}ms]", now.elapsed().as_millis());
+	print!("writing...");
+	let mut output = Cursor::new(Vec::new());
+	let now = std::time::Instant::now();
 
-		print!("writing...");
-		let mut output = Cursor::new(Vec::new());
-		let now = std::time::Instant::now();
-		match resized.write_to(&mut output, image::ImageFormat::Avif)
-			.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR) {
-			Ok(_) => self.resized_buf = Some(output.into_inner().into()),
-			Err(err) => self.resized_buf = None,
-			//Err(err) => self.resized_buf = Err(err),
-		}
-		println!(" [{:.2}ms]", now.elapsed().as_millis());
-        Ok(())
-    }
-	fn into_any(self: Box<Self>) -> Box<dyn Any> { self }
+	let encoder = image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut output, 4, 80).with_num_threads(Some(1));
+	resized.write_with_encoder(encoder)?;
+	//resized.write_to(&mut output, image::ImageFormat::Avif)?;
+	println!(" [{:.2}ms]", now.elapsed().as_millis());
+	Ok(output.into_inner().into())
+	//resized_buf
+		//Ok(_) => resized_buf = Some(output.into_inner().into()),
+		//Err(err) => resized_buf = None,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,18 +52,19 @@ pub async fn post_file(
 	let bytes = to_bytes(body, 50000000).await.map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
 	println!("{} bytes", bytes.len());
 
-    if let Ok(task) = run(Box::new(ImageResizeTask {
-		orig_buf: bytes,
-		resize: (1000, 1000),
-		..Default::default()
-	})).await {
-		Ok(([
+	let task = state.worker.run(move || {
+		return resize_image(bytes, (1000, 1000))
+	});
+
+	let res: Result<Box<[u8]>, image::error::ImageError> = task.await;
+
+	match res {
+		Err(err) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+		Ok(resized_buf) => Ok(([
 			("Content-Type", "image/avif"),
-			//("Content-Length", Box::from(output.get_ref().len().to_string().as_str()))
-		], task.resized_buf.unwrap()))
-    } else {
-        Err(StatusCode::INTERNAL_SERVER_ERROR)
-    }
+			//("Content-Length", Box::from(resized_buf.len().to_string().as_str()))
+		], resized_buf))
+	}
 }
 
 // vim: ts=4

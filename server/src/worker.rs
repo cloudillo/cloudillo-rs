@@ -1,136 +1,158 @@
-use async_trait::async_trait;
-use flume;
-use lazy_static::lazy_static;
-use std::any::Any;
-use std::collections::HashMap;
-use std::fmt::{Debug, Display};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use std::{sync::Arc, thread};
+use flume::{Receiver, Sender};
+use futures::channel::oneshot;
 
-lazy_static! {
-	static ref WORKER_POOL: Mutex<WorkerPool> = Mutex::new(WorkerPool::new());
-}
-
-pub trait Task: Sync + Send + Any + Debug + 'static {
-	fn run(&mut self) -> Result<(), Box<dyn std::error::Error>>;
-	fn into_any(self: Box<Self>) -> Box<dyn Any>;
-}
-
-/*
-//impl<T: Sync + Send + Any + Debug + 'static> Task for T {
-#[async_trait]
-impl dyn Task {
-	fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> { Ok(()) }
-	fn into_any(self: Box<Self>) -> Box<dyn Any> { self }
-}
-*/
-
-#[derive(Debug)]
-struct TaskData {
-	task: Arc<Mutex<Box<dyn Task + 'static>>>,
-	notify: Arc<Notify>,
+#[derive(Clone, Copy, Debug)]
+pub enum Priority {
+	High,
+	Medium,
+	Low,
 }
 
 pub struct WorkerPool {
-	id: u32,
-	tasks: Mutex<HashMap<u32, Box<TaskData>>>,
-	tx: flume::Sender<(u32, Arc<Mutex<Box<dyn Task>>>)>,
-	re_rx: flume::Receiver<(u32, Arc<Mutex<Box<dyn Task>>>)>,
+	tx_high: Sender<Box<dyn FnOnce() + Send>>,
+	tx_med: Sender<Box<dyn FnOnce() + Send>>,
+	tx_low: Sender<Box<dyn FnOnce() + Send>>,
 }
 
 impl WorkerPool {
-	pub fn new() -> Self {
-		let (tx, rx) = flume::unbounded::<(u32, Arc<Mutex<Box<dyn Task>>>)>();
-		let (re_tx, re_rx) = flume::unbounded::<(u32, Arc<Mutex<Box<dyn Task>>>)>();
-		let threads = std::thread::available_parallelism().unwrap().get();
-		println!("Starting {} workers", threads);
-		for thread_id in 0..threads {
-			let (rx, re_tx) = (rx.clone(), re_tx.clone());
-			//thread::spawn(move || {
-			thread::Builder::new()
-				.name(format!("worker-{}", thread_id))
-				.spawn(move || {
-					//println!("[{}] started", std::thread::current().name().unwrap_or(""));
-					while let Ok((id, task_data)) = rx.recv() {
-						{
-							let mut task = task_data.lock().unwrap();
-							let _ = task.run();
-						}
-						re_tx.send((id, task_data)).unwrap();
-					}
-				});
+	pub fn new(n1: usize, n2: usize, n3: usize) -> Self {
+		let (tx_high, rx_high) = flume::unbounded();
+		let (tx_med, rx_med) = flume::unbounded();
+		let (tx_low, rx_low) = flume::unbounded();
+
+		let rx_high = Arc::new(rx_high);
+		let rx_med = Arc::new(rx_med);
+		let rx_low = Arc::new(rx_low);
+
+		// Workers dedicated to High only
+		for _ in 0..n1 {
+			let rx_high = Arc::clone(&rx_high);
+			thread::spawn(move || worker_loop(vec![rx_high]));
 		}
-		//WorkerPool { id: 0, tasks: Mutex::new(HashMap::new()), tx, re_rx }
-		WorkerPool {
-			id: 0,
-			tasks: Mutex::new(HashMap::new()),
-			tx,
-			re_rx,
+
+		// Workers for High + Medium
+		for _ in 0..n2 {
+			let rx_high = Arc::clone(&rx_high);
+			let rx_med = Arc::clone(&rx_med);
+			thread::spawn(move || worker_loop(vec![rx_high, rx_med]));
+		}
+
+		// Workers for High + Medium + Low
+		for _ in 0..n3 {
+			let rx_high = Arc::clone(&rx_high);
+			let rx_med = Arc::clone(&rx_med);
+			let rx_low = Arc::clone(&rx_low);
+			thread::spawn(move || worker_loop(vec![rx_high, rx_med, rx_low]));
+		}
+
+		Self {
+			tx_high,
+			tx_med,
+			tx_low,
 		}
 	}
 
-	pub fn get_re_rx(&self) -> flume::Receiver<(u32, Arc<Mutex<Box<dyn Task>>>)> {
-		self.re_rx.clone()
+	/// Submit a closure with arguments → returns a Future for the result
+	pub fn spawn<F, T>(&self, priority: Priority, f: F) -> impl std::future::Future<Output = T>
+	where
+		F: FnOnce() -> T + Send + 'static,
+		T: Send + 'static,
+	{
+		let (res_tx, res_rx) = oneshot::channel();
+
+		let job = Box::new(move || {
+			let result = f();
+			let _ = res_tx.send(result);
+		});
+
+		match priority {
+			Priority::High => self.tx_high.send(job).unwrap(),
+			Priority::Medium => self.tx_med.send(job).unwrap(),
+			Priority::Low => self.tx_low.send(job).unwrap(),
+		}
+
+		async move { res_rx.await.expect("worker dropped result") }
 	}
 
-	pub fn start_task(
-		&mut self,
-		task: Arc<Mutex<Box<dyn Task>>>,
-	) -> Result<Arc<Notify>, Box<dyn std::error::Error>> {
-		let notify = Arc::new(Notify::new());
-		{
-			self.id = self.id.wrapping_add(1);
-			self.tasks.lock().unwrap().insert(
-				self.id,
-				Box::new(TaskData {
-					task: task.clone(),
-					notify: notify.clone(),
-				}),
-			);
-		}
-		self.tx.send((self.id, task))?;
-		Ok(notify)
+	pub fn run<F, T>(&self, f: F) -> impl std::future::Future<Output = T>
+	where
+		F: FnOnce() -> T + Send + 'static,
+		T: Send + 'static,
+	{
+		let (res_tx, res_rx) = oneshot::channel();
+
+		let job = Box::new(move || {
+			let result = f();
+			res_tx.send(result);
+		});
+
+		self.tx_med.send(job).unwrap();
+
+		async move { res_rx.await.expect("worker dropped result") }
+	}
+
+	pub fn run_immed<F, T>(&self, f: F) -> impl std::future::Future<Output = T>
+	where
+		F: FnOnce() -> T + Send + 'static,
+		T: Send + 'static,
+	{
+		let (res_tx, res_rx) = oneshot::channel();
+
+		let job = Box::new(move || {
+			let result = f();
+			res_tx.send(result);
+		});
+
+		self.tx_med.send(job).unwrap();
+
+		async move { res_rx.await.expect("worker dropped result") }
+	}
+
+	pub fn run_slow<F, T>(&self, f: F) -> impl std::future::Future<Output = T>
+	where
+		F: FnOnce() -> T + Send + 'static,
+		T: Send + 'static,
+	{
+		let (res_tx, res_rx) = oneshot::channel();
+
+		let job = Box::new(move || {
+			let result = f();
+			res_tx.send(result);
+		});
+
+		self.tx_low.send(job).unwrap();
+
+		async move { res_rx.await.expect("worker dropped result") }
 	}
 }
 
-fn get_re_rx() -> flume::Receiver<(u32, Arc<Mutex<Box<dyn Task>>>)> {
-	WORKER_POOL.lock().unwrap().get_re_rx()
-}
-pub async fn run_worker() {
-	//let re_rx = { WORKER_POOL.lock().await.get_re_rx() };
-	let re_rx = get_re_rx();
-	while let Ok((id, recv)) = re_rx.recv_async().await {
-		let worker_pool = WORKER_POOL.lock().unwrap();
-		let mut tasks = worker_pool.tasks.lock().unwrap();
-		println!("TASKS {:?}", tasks.keys());
-		if let Some(task_data) = tasks.remove(&id) {
-			println!("data {}", id);
-			task_data.notify.notify_one();
-		} else {
+fn worker_loop(queues: Vec<Arc<Receiver<Box<dyn FnOnce() + Send>>>>) {
+	loop {
+		// Try higher-priority queues first (non-blocking)
+		let mut job = None;
+		for rx in &queues {
+			if let Ok(j) = rx.try_recv() {
+				job = Some(j);
+				break;
+			}
 		}
-	}
-}
 
-//#![allow(trait_upcasting)]
-pub async fn run<T: Task + 'static>(task: Box<T>) -> Result<Box<T>, Box<dyn std::error::Error>> {
-	let task: Arc<Mutex<Box<dyn Task + 'static>>> = Arc::new(Mutex::new(task));
-	let notify = {
-		WORKER_POOL
-			.lock()
-			.unwrap()
-			.start_task(task.clone())
-			.unwrap()
-	};
-	notify.notified().await;
-
-	match Arc::try_unwrap(task) {
-		Ok(mutex) => {
-			let t = mutex.into_inner().unwrap();
-			let task = <Box<dyn Any>>::downcast::<T>(t.into_any()).unwrap();
-			Ok(task)
+		if let Some(job) = job {
+			job();
+			continue;
 		}
-		Err(_) => Err(Box::new(std::io::Error::from(std::io::ErrorKind::NotFound))),
+
+		// Wait for next job
+		let mut selector = flume::Selector::new();
+		for rx in &queues {
+			selector = selector.recv(&rx, |res| res);
+		}
+
+		let job: Result<Box<dyn FnOnce() + Send>, flume::RecvError> = selector.wait();
+		if let Ok(job) = job {
+			job()
+		}
 	}
 }
 
