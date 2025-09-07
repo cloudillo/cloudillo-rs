@@ -8,7 +8,7 @@ use openssl::nid::Nid;
 use openssl::pkey::Private;
 use openssl::error::ErrorStack;
 
-use cloudillo::run;
+use cloudillo::worker;
 
 fn generate_key_sync() -> Result<(Box<str>, Box<str>), openssl::error::ErrorStack> {
 	// Create a new EC group for P-384
@@ -37,8 +37,8 @@ fn generate_key_sync() -> Result<(Box<str>, Box<str>), openssl::error::ErrorStac
 	Ok((private_key.into(), public_key.into()))
 }
 
-pub async fn generate_key(state: &cloudillo::AppState) -> Result<(Box<str>, Box<str>), Box<dyn std::error::Error>> {
-	let res = state.worker.run(move || {
+pub async fn generate_key(worker: &worker::WorkerPool) -> Result<(Box<str>, Box<str>), Box<dyn std::error::Error>> {
+	let res = worker.run(move || {
 		generate_key_sync()
 	}).await;
 

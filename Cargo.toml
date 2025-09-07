@@ -1,3 +1,8 @@
 [workspace]
 resolver = "2"
-members = [ "basic-server", "server", "adapters/auth-adapter-sqlite" ]
+members = [
+	"basic-server",
+	"server",
+	"adapters/auth-adapter-sqlite",
+	"adapters/meta-adapter-sqlite",
+]

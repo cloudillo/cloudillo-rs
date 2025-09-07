@@ -8,10 +8,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::action::action;
-use crate::auth_adapter::TokenData;
+use crate::auth_adapter;
 use crate::AppState;
 
-//fn resize_image(orig_buf: &axum::body::Bytes, resize: (u32, u32)) -> Result<Box<[u8]>, impl std::error::Error> {
 fn resize_image<'a>(orig_buf: impl AsRef<[u8]> + 'a, resize: (u32, u32)) -> Result<Box<[u8]>, image::error::ImageError> {
 	print!("decoding...");
 	let now = std::time::Instant::now();
@@ -53,13 +52,13 @@ pub async fn post_file(
 	println!("{} bytes", bytes.len());
 
 	let task = state.worker.run(move || {
-		return resize_image(bytes, (1000, 1000))
+		resize_image(bytes, (1000, 1000))
 	});
 
 	let res: Result<Box<[u8]>, image::error::ImageError> = task.await;
 
 	match res {
-		Err(err) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+		Err(err) => Err(StatusCode::INTERNAL_SERVER_ERROR),
 		Ok(resized_buf) => Ok(([
 			("Content-Type", "image/avif"),
 			//("Content-Length", Box::from(resized_buf.len().to_string().as_str()))

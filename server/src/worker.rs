@@ -146,7 +146,7 @@ fn worker_loop(queues: Vec<Arc<Receiver<Box<dyn FnOnce() + Send>>>>) {
 		// Wait for next job
 		let mut selector = flume::Selector::new();
 		for rx in &queues {
-			selector = selector.recv(&rx, |res| res);
+			selector = selector.recv(rx, |res| res);
 		}
 
 		let job: Result<Box<dyn FnOnce() + Send>, flume::RecvError> = selector.wait();

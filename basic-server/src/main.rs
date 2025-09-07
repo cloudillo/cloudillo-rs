@@ -1,29 +1,85 @@
 #![allow(unused)]
 
-use std::{env, path};
+use std::{sync::Arc, env, path::PathBuf};
 use tokio::fs;
 
-use cloudillo::auth_adapter::TokenData;
+use cloudillo::{auth_adapter, meta_adapter, worker};
 use auth_adapter_sqlite::AuthAdapterSqlite;
+use meta_adapter_sqlite::MetaAdapterSqlite;
 
 pub struct Config {
-	pub db_dir: path::PathBuf,
+	pub mode: cloudillo::ServerMode,
+	pub listen: String,
+	pub listen_http: Option<String>,
+	pub base_id_tag: String,
+	pub base_app_domain: String,
+	pub base_password: Option<String>,
+	pub dist_dir: PathBuf,
+	pub acme_email: Option<String>,
+	pub local_ips: Vec<String>,
+	pub identity_providers: Vec<String>,
+	pub db_dir: PathBuf,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+	let base_id_tag = env::var("BASE_ID_TAG").expect("BASE_ID_TAG must be set");
+
 	let config = Config {
-		db_dir: path::PathBuf::from(env::var("DB_DIR").unwrap_or("./data".to_string()))
+		//mode: match env::var("MODE").map(|v| v.as_deref()) {
+		mode: match env::var("MODE").as_deref() {
+			Ok("standalone") => cloudillo::ServerMode::Standalone,
+			Ok("proxy") => cloudillo::ServerMode::Proxy,
+			Ok("stream-proxy") => cloudillo::ServerMode::StreamProxy,
+			Ok(&_) => panic!("Unknown mode"),
+			Err(_) => cloudillo::ServerMode::Standalone
+		},
+		listen: env::var("LISTEN").unwrap_or("127.0.0.1:8080".to_string()),
+		listen_http: env::var("LISTEN_HTTP").ok(),
+		base_app_domain: env::var("BASE_APP_DOMAIN").unwrap_or_else(|_| base_id_tag.clone()),
+		base_id_tag,
+		base_password: env::var("BASE_PASSWORD").ok(),
+		dist_dir: env::var("DIST_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./dist")),
+		acme_email: env::var("ACME_EMAIL").ok(),
+		local_ips: env::var("LOCAL_IPS").ok().map(|s| s.split(',').map(|s| s.to_string()).collect()).unwrap_or_default(),
+		identity_providers: env::var("IDENTITY_PROVIDERS").ok().map(|s| s.split(',').map(|s| s.to_string()).collect()).unwrap_or_default(),
+		db_dir: env::var("DB_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./data")),
 	};
+	fs::create_dir_all(&config.db_dir).await.expect("Cannot create db dir");
 	//tracing_subscriber::fmt::init();
 
-	fs::create_dir_all(&config.db_dir).await.unwrap();
-	let auth_adapter = Box::new(AuthAdapterSqlite::new(config.db_dir.join("auth.db")).await.unwrap());
-	//let auth_adapter = &AuthAdapterSqlite::new("auth.db").await.unwrap();
+	let worker = Arc::new(worker::WorkerPool::new(1, 2, 1));
+	let auth_adapter = Box::new(AuthAdapterSqlite::new(worker.clone(), config.db_dir.join("auth.db")).await.unwrap());
+	let meta_adapter = Box::new(MetaAdapterSqlite::new(worker.clone(), config.db_dir.join("meta.db")).await.unwrap());
 
-	//let token = cld.create_token(1, TokenData { issuer: "test".into() }).await.unwrap();
-	//cloudillo::run(auth_adapter).await.unwrap();
-	cloudillo::run(cloudillo::CloudilloOpts { auth_adapter }).await.unwrap();
+	let mut cloudillo = cloudillo::Builder::new()
+		.mode(config.mode)
+		.listen(config.listen)
+		.base_id_tag(config.base_id_tag)
+		.base_app_domain(config.base_app_domain)
+		.dist_dir(config.dist_dir)
+		.local_ips(config.local_ips)
+		.identity_providers(config.identity_providers)
+		.auth_adapter(auth_adapter)
+		.meta_adapter(meta_adapter)
+		.worker(worker);
+	if let Some(listen_http) = config.listen_http {
+		cloudillo = cloudillo.listen_http(listen_http);
+	}
+	if let Some(base_password) = config.base_password {
+		cloudillo = cloudillo.base_password(base_password);
+	}
+	if let Some(acme_email) = config.acme_email {
+		cloudillo = cloudillo.acme_email(acme_email);
+	}
+	cloudillo.run().await.expect("Internal error");
+
+	/*
+	cloudillo::run(cloudillo::CloudilloOpts {
+		worker: worker,
+		auth_adapter: auth_adapter
+	}).await.unwrap();
+	*/
 
 	//println!("token: {}", token);
 }

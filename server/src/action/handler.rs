@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::action::action;
-use crate::auth_adapter::TokenData;
+use crate::auth_adapter;
 use crate::AppState;
 
 #[derive(Serialize)]
@@ -20,7 +20,7 @@ pub struct CreateKey {
 }
 
 pub async fn create_key(State(state): State<Arc<AppState>>) -> (StatusCode, Json<CreateKey>) {
-	let (private_key, public_key) = state.auth_adapter.create_key(&state, 1).await.unwrap();
+	let (private_key, public_key) = state.auth_adapter.create_key(1).await.unwrap();
 	(StatusCode::CREATED, Json(CreateKey { public_key }))
 }
 
@@ -44,14 +44,14 @@ pub async fn post_action(
 	Json(action): Json<action::NewAction>,
 ) -> (StatusCode, Json<PostAction>) {
 	//let token = action::create_token(&action);
-	let (private, public) = state.auth_adapter.create_key(&state, 1).await.unwrap();
+	let (private, public) = state.auth_adapter.create_key(1).await.unwrap();
 	let token = state
 		.auth_adapter
-		.create_token(
-			&state,
-			1,
-			TokenData {
-				issuer: "zizi".into(),
+		.create_access_token(1,
+			&auth_adapter::AccessToken {
+				t: "a@a",
+				u: "zizi",
+				..Default::default()
 			},
 		)
 		.await
@@ -59,7 +59,7 @@ pub async fn post_action(
 	(
 		StatusCode::CREATED,
 		Json(PostAction {
-			token: token.into(),
+			token,
 		}),
 	)
 }
