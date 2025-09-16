@@ -19,33 +19,21 @@ use crate::types::{Timestamp};
 #[derive(Debug)]
 pub struct CertResolver {
 	state: Arc<AppState>,
-	certs: Mutex<HashMap<Box<str>, Arc<CertifiedKey>>>
 }
 
 impl CertResolver {
 	pub fn new(state: Arc<AppState>) -> CertResolver {
 		CertResolver {
 			state: state,
-			certs: Mutex::new(HashMap::new())
 		}
 	}
 
-	pub fn with_state(state: Arc<AppState>) -> (CertResolver, Arc<AppState>) {
-		(
-			CertResolver {
-				state: state.clone(),
-				certs: Mutex::new(HashMap::new())
-			},
-			state
-		)
-	}
-
 	pub fn get(&self, name: &str) -> Option<Arc<CertifiedKey>> {
-		self.certs.lock().ok()?.get(name).cloned()
+		self.state.certs.lock().ok()?.get(name).cloned()
 	}
 
 	pub fn insert(&self, name: Box<str>, cert: Arc<CertifiedKey>) -> Result<(), Box<dyn std::error::Error + '_>> {
-		self.certs.lock()?.insert(name, cert);
+		self.state.certs.lock()?.insert(name, cert);
 		Ok(())
 	}
 }
@@ -59,7 +47,7 @@ impl ResolvesServerCert for CertResolver {
 				Some(cert)
 			} else {
 				let domain = if &name[..5] == "cl-o." { &name[5..] } else { name };
-				// FIXME: Should no block
+				// FIXME: Should not block
 				let cert_data = tokio::task::block_in_place(||
 					tokio::runtime::Handle::current().block_on(async {
 						self.state.auth_adapter.read_cert_by_domain(domain).await
@@ -73,7 +61,7 @@ impl ResolvesServerCert for CertResolver {
 						CryptoProvider::get_default()?
 					).ok()?;
 					let certified_key = Arc::new(certified_key);
-					let mut cache = self.certs.lock().ok()?;
+					let mut cache = self.state.certs.lock().ok()?;
 					println!("[inserting into cache]");
 					cache.insert(("cl-o.".to_string() + &cert_data.id_tag).into_boxed_str(), certified_key.clone());
 					cache.insert(cert_data.domain.into(), certified_key.clone());

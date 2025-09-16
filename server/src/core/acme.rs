@@ -75,7 +75,6 @@ pub async fn renew_tenant<'a>(state: Arc<AppState>, account: &'a acme::Account, 
 	Ok(())
 }
 
-//pub async fn renew_domains(state: &Arc<AppState>, account: &acme::Account, domains: impl Iterator<Item = &String>) -> std::result::Result<(), acme::Error> {
 async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account, domains: Vec<String>) -> std::result::Result<X509CertData, Box<dyn std::error::Error + 'a>> {
 	println!("ACME {:?}", &domains);
 	let identifiers = domains.iter().map(|domain| acme::Identifier::Dns(domain.to_string())).collect::<Vec<_>>();
@@ -130,11 +129,9 @@ async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account,
 			PrivateKeyDer::from_pem_slice(&private_key_pem.as_bytes())?,
 			CryptoProvider::get_default().ok_or(acme::Error::Str("no crypto provider"))?,
 		)?);
-		/*
 		for domain in domains.iter() {
-			state.cert_resolver.insert(domain.clone().into_boxed_str(), certified_key.clone());
+			state.certs.lock()?.insert(domain.clone().into_boxed_str(), certified_key.clone());
 		}
-		*/
 
 		let cert_data = X509CertData {
 			private_key_pem: private_key_pem.to_string().into_boxed_str(),
@@ -151,7 +148,6 @@ async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account,
 
 pub async fn get_acme_challenge(
 	State(state): State<Arc<AppState>>,
-	//HeaderName(host): HeaderName,
 	headers: HeaderMap,
 ) -> Result<Box<str>> {
 	let domain = headers.get("host").ok_or(Error::Unknown)?.to_str().map_err(|_| Error::Unknown)?;

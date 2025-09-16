@@ -6,6 +6,7 @@ use axum::{
 	response::Result as HttpResult,
 	Router,
 };
+use rustls::sign::CertifiedKey;
 use serde::Deserialize;
 use std::{
 	collections::HashMap,
@@ -41,7 +42,7 @@ pub enum ServerMode {
 pub struct AppState {
 	pub worker: Arc<worker::WorkerPool>,
 	pub acme_challenge_map: Mutex<HashMap<Box<str>, Box<str>>>,
-	pub cert_resolver: Option<Arc<webserver::CertResolver>>,
+	pub certs: Mutex<HashMap<Box<str>, Arc<CertifiedKey>>>,
 
 	pub auth_adapter: Box<dyn AuthAdapter>,
 	pub meta_adapter: Box<dyn MetaAdapter>,
@@ -124,27 +125,14 @@ impl Builder {
 	pub fn meta_adapter(mut self, meta_adapter: Box<dyn meta_adapter::MetaAdapter>) -> Self { self.adapters.meta_adapter = Some(meta_adapter); self }
 
 	pub async fn run(self) -> Result<()> {
-		/*
 		let state = Arc::new(AppState {
 			worker: self.worker.expect("FATAL: No worker pool defined"),
 			acme_challenge_map: Mutex::new(HashMap::new()),
-			//cert_resolver: Arc::new(webserver::CertResolver::new(&self.adapters.auth_adapter)),
-			cert_resolver: None,
+			certs: Mutex::new(HashMap::new()),
 
 			auth_adapter: self.adapters.auth_adapter.expect("FATAL: No auth adapter"),
 			meta_adapter: self.adapters.meta_adapter.expect("FATAL: No meta adapter"),
 		});
-		*/
-		let mut state = Arc::new(AppState {
-			worker: self.worker.expect("FATAL: No worker pool defined"),
-			acme_challenge_map: Mutex::new(HashMap::new()),
-			cert_resolver: None,
-
-			auth_adapter: self.adapters.auth_adapter.expect("FATAL: No auth adapter"),
-			meta_adapter: self.adapters.meta_adapter.expect("FATAL: No meta adapter"),
-		});
-		let (cert_resolver, mut state) = webserver::CertResolver::with_state(state).into();
-		Arc::get_mut(&mut state).ok_or(Error::Unknown)?.cert_resolver = Some(Arc::new(cert_resolver));
 
 		let mut https_router = Router::new();
 		let mut http_router = Router::new();
