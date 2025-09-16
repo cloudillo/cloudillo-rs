@@ -1,4 +1,4 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::rc::Rc;
@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::action::action;
 use crate::auth_adapter;
-use crate::AppState;
+use crate::{AppState, Auth};
 
 #[derive(Serialize)]
 pub struct ActionView {
@@ -19,8 +19,8 @@ pub struct CreateKey {
 	public_key: Box<str>,
 }
 
-pub async fn create_key(State(state): State<Arc<AppState>>) -> (StatusCode, Json<CreateKey>) {
-	let (private_key, public_key) = state.auth_adapter.create_key(1).await.unwrap();
+pub async fn create_key(State(state): State<Arc<AppState>>, Extension(auth): Extension<Auth>) -> (StatusCode, Json<CreateKey>) {
+	let public_key = state.auth_adapter.create_key(1).await.unwrap();
 	(StatusCode::CREATED, Json(CreateKey { public_key }))
 }
 
@@ -44,7 +44,7 @@ pub async fn post_action(
 	Json(action): Json<action::NewAction>,
 ) -> (StatusCode, Json<PostAction>) {
 	//let token = action::create_token(&action);
-	let (private, public) = state.auth_adapter.create_key(1).await.unwrap();
+	let public = state.auth_adapter.create_key(1).await.unwrap();
 	let token = state
 		.auth_adapter
 		.create_access_token(1,

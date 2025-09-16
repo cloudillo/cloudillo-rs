@@ -6,24 +6,27 @@ use axum::{
 	response::Result as HttpResult,
 	Router,
 };
+use serde::Deserialize;
 use std::{
-	sync::Arc,
 	collections::HashMap,
 	path::Path,
 	path::PathBuf,
+	sync::{Arc, Mutex},
 };
-use tokio::sync::Mutex;
 
-mod error;
+pub mod error;
+pub mod core;
 pub mod action;
+pub mod auth;
 pub mod file;
 pub mod profile;
 pub mod auth_adapter;
 pub mod meta_adapter;
+pub mod types;
 pub mod routes;
-pub mod worker;
 
 pub use self::error::{Error, Result};
+use core::{acme, webserver, worker};
 
 use auth_adapter::AuthAdapter;
 use meta_adapter::MetaAdapter;
@@ -34,10 +37,20 @@ pub enum ServerMode {
 	StreamProxy,
 }
 
+#[derive(Debug)]
 pub struct AppState {
 	pub worker: Arc<worker::WorkerPool>,
+	pub acme_challenge_map: Mutex<HashMap<Box<str>, Box<str>>>,
+	pub cert_resolver: Option<Arc<webserver::CertResolver>>,
+
 	pub auth_adapter: Box<dyn AuthAdapter>,
 	pub meta_adapter: Box<dyn MetaAdapter>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Auth {
+	pub tn_id: u32,
+	pub r: Box<[Box<str>]>,
 }
 
 pub struct Adapters {
@@ -111,20 +124,54 @@ impl Builder {
 	pub fn meta_adapter(mut self, meta_adapter: Box<dyn meta_adapter::MetaAdapter>) -> Self { self.adapters.meta_adapter = Some(meta_adapter); self }
 
 	pub async fn run(self) -> Result<()> {
+		/*
 		let state = Arc::new(AppState {
 			worker: self.worker.expect("FATAL: No worker pool defined"),
+			acme_challenge_map: Mutex::new(HashMap::new()),
+			//cert_resolver: Arc::new(webserver::CertResolver::new(&self.adapters.auth_adapter)),
+			cert_resolver: None,
+
 			auth_adapter: self.adapters.auth_adapter.expect("FATAL: No auth adapter"),
 			meta_adapter: self.adapters.meta_adapter.expect("FATAL: No meta adapter"),
 		});
+		*/
+		let mut state = Arc::new(AppState {
+			worker: self.worker.expect("FATAL: No worker pool defined"),
+			acme_challenge_map: Mutex::new(HashMap::new()),
+			cert_resolver: None,
 
-		let mut router = Router::new();
-		router = routes::init(state.clone());
+			auth_adapter: self.adapters.auth_adapter.expect("FATAL: No auth adapter"),
+			meta_adapter: self.adapters.meta_adapter.expect("FATAL: No meta adapter"),
+		});
+		let (cert_resolver, mut state) = webserver::CertResolver::with_state(state).into();
+		Arc::get_mut(&mut state).ok_or(Error::Unknown)?.cert_resolver = Some(Arc::new(cert_resolver));
 
-		let listener = tokio::net::TcpListener::bind(&*self.opts.listen).await?;
+		let mut https_router = Router::new();
+		let mut http_router = Router::new();
+		(https_router, http_router) = routes::init(state.clone());
 
-		println!("Listening on {}", self.opts.listen);
-		bootstrap(state.clone(), &self.opts).await?;
-		axum::serve(listener, router).await?;
+		let https_server = webserver::create_https_server(state.clone(), &self.opts.listen, https_router).await?;
+
+		let http_server = if let Some(listen_http) = &self.opts.listen_http {
+			let http_listener = tokio::net::TcpListener::bind(listen_http.as_ref()).await?;
+			let http = tokio::spawn(async move { axum::serve(http_listener, http_router).await });
+			println!("Listening on HTTP {}", listen_http);
+			Some(http)
+		} else {
+			None
+		};
+
+		// Run bootstrapper in the background
+		tokio::spawn(async move {
+			println!("Bootstrapping...");
+			bootstrap(state, &self.opts).await
+		});
+
+		if let Some(http_server) = http_server {
+			tokio::try_join!(https_server, http_server).map_err(|_| Error::Unknown)?;
+		} else {
+			https_server.await.map_err(|e| Error::Unknown)?;
+		}
 
 		Ok(())
 	}
@@ -137,21 +184,29 @@ impl Default for Builder {
 async fn bootstrap(state: Arc<AppState>, opts: &BuilderOpts) -> Result<()> {
 	let auth = &state.auth_adapter;
 
-	let id_tag = auth.read_id_tag(1).await;
-	if let Err(Error::NotFound) = id_tag {
-		println!("======================================\nBootstrapping...\n======================================");
+	if true {
 		let base_id_tag = &opts.base_id_tag.as_ref().expect("FATAL: No base id tag");
-		let base_app_domain = &opts.base_app_domain.as_ref().expect("FATAL: No base app domain");
-		let base_password = &opts.base_password.as_ref().expect("FATAL: No base password");
+		let id_tag = auth.read_id_tag(1).await;
+		println!("Got id tag: {:?}", id_tag);
 
-		println!("Creating tenant {}", base_id_tag);
-		auth.create_auth_profile(base_id_tag, &auth_adapter::CreateTenantData {
-			password: base_password,
-			vfy_code: None,
-			email: None,
-		}).await?;
+		if let Err(Error::NotFound) = id_tag {
+			println!("======================================\nBootstrapping...\n======================================");
+			let base_password = &opts.base_password.as_ref().expect("FATAL: No base password");
+
+			println!("Creating tenant {}", base_id_tag);
+			auth.create_auth_profile(base_id_tag, &auth_adapter::CreateTenantData {
+				password: base_password,
+				vfy_code: None,
+				email: None,
+			}).await?;
+		}
+		if let Some(ref acme_email) = opts.acme_email {
+			let cert_data = auth.read_cert_by_tn_id(1).await;
+			if let Err(Error::NotFound) = cert_data {
+				acme::init(state.clone(), &acme_email, &base_id_tag, opts.base_app_domain.as_deref()).await?;
+			}
+		}
 	}
-	println!("Got id tag: {:?}", id_tag);
 	Ok(())
 }
 

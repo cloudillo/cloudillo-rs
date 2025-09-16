@@ -7,4 +7,4 @@ edition = "2021"
 auth-adapter-sqlite = { path = "../adapters/auth-adapter-sqlite" }
 meta-adapter-sqlite = { path = "../adapters/meta-adapter-sqlite" }
 cloudillo = { path = "../server" }
-tokio = { version = "1.43.0", features = ["rt", "macros", "fs"] }
+tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }

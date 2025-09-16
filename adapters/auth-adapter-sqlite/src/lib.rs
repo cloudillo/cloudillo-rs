@@ -1,13 +1,14 @@
 #![allow(unused)]
 
-use std::{sync::Arc, path::Path};
+use std::{fmt::Debug, sync::Arc, path::Path};
 use async_trait::async_trait;
 use sqlx::{sqlite, sqlite::SqlitePool, Row};
 
-use cloudillo::{auth_adapter, worker::WorkerPool, Result, Error};
+use cloudillo::{auth_adapter, core::route_auth, types::{TnId, Timestamp}, core::worker::WorkerPool, Result, Error};
 
-mod token;
+mod crypto;
 
+#[derive(Debug)]
 pub struct AuthAdapterSqlite {
 	db: SqlitePool,
 	worker: Arc<WorkerPool>,
@@ -45,7 +46,7 @@ fn inspect(err: &sqlx::Error) {
 
 #[async_trait]
 impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
-	async fn read_id_tag(&self, tn_id: u32) -> Result<Box<str>> {
+	async fn read_id_tag(&self, tn_id: TnId) -> Result<Box<str>> {
 		let res = sqlx::query(
 			"SELECT id_tag FROM tenants WHERE tn_id = ?1"
 		).bind(tn_id).fetch_one(&self.db).await.inspect_err(inspect);
@@ -91,12 +92,12 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			).bind(vfy_code).fetch_one(&self.db).await.or(Err(Error::DbError))?;
 
 			let email: &str = row.try_get("email").or(Err(Error::DbError))?;
-			if (email != profile.email.unwrap_or("")) {
+			if email != profile.email.unwrap_or("") {
 				return Err(Error::PermissionDenied);
 			}
 		}
 		println!("create_auth_profile");
-		let res = sqlx::query(
+		sqlx::query(
 			"INSERT INTO tenants (id_tag, email, password, status) VALUES (?1, ?2, ?3, ?4)"
 		).bind(id_tag).bind(profile.email).bind(profile.password).bind("A")
 			.execute(&self.db).await
@@ -104,32 +105,138 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		Ok(())
 	}
 
-	async fn check_auth_password(&self, id_tag: &str, password: &str) -> Result<auth_adapter::AuthProfile> {
-		Ok(auth_adapter::AuthProfile {
-			id_tag: Box::from("a"),
-			roles: Some(Box::new([])),
-			keys: Box::new([])
-		})
+	async fn check_auth_password(&self, id_tag: &str, password: &str) -> Result<auth_adapter::AuthLogin> {
+		let res = sqlx::query(
+			"SELECT tn_id, id_tag, password, roles FROM tenants WHERE id_tag = ?1"
+		).bind(id_tag).fetch_one(&self.db).await;
+
+		match res {
+			Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
+			Err(err) => {
+				println!("DbError: {:#?}", err);
+				Err(Error::DbError)
+			},
+			Ok(row) => {
+				let tn_id: TnId = row.try_get("tn_id").or(Err(Error::DbError))?;
+				let password_hash: &str = row.try_get("password").or(Err(Error::DbError))?;
+				let roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
+
+				crypto::check_password(password, password_hash)?;
+
+				let token = route_auth::generate_access_token(tn_id, roles.as_deref())?;
+
+				Ok(auth_adapter::AuthLogin {
+					tn_id: row.try_get("tn_id").or(Err(Error::DbError))?,
+					id_tag: Box::from(id_tag),
+					roles: roles.map(|s| parse_str_list(&s)),
+					token,
+				})
+			}
+		}
 	}
 
-	async fn write_auth_password(&self, id_tag: &str, password: &str) -> Result<()> {
+	async fn update_auth_password(&self, id_tag: &str, password: &str) -> Result<()> {
 		Ok(())
+	}
+
+	//async fn create_cert(&self, tn_id: TnId, id_tag: &str, domain: &str, cert: &str, key: &str, expires_at: Timestamp) -> Result<()> {
+	async fn create_cert(&self, cert_data: &auth_adapter::CertData) -> Result<()> {
+		println!("create_cert {}", &cert_data.id_tag);
+		sqlx::query(
+			"INSERT OR REPLACE INTO certs (tn_id, id_tag, domain, expires_at, cert, key)
+			VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+		).bind(cert_data.tn_id)
+			.bind(&cert_data.id_tag)
+			.bind(&cert_data.domain)
+			.bind(cert_data.expires_at)
+			.bind(&cert_data.cert)
+			.bind(&cert_data.key)
+			.execute(&self.db).await;
+
+		Ok(())
+	}
+
+	async fn read_cert_by_tn_id(&self, tn_id: TnId) -> Result<auth_adapter::CertData> {
+		let res = sqlx::query(
+			"SELECT tn_id, id_tag, domain, cert, key, expires_at FROM certs WHERE tn_id = ?1"
+		).bind(tn_id).fetch_one(&self.db).await;
+
+		match res {
+			Ok(row) => Ok(auth_adapter::CertData {
+				tn_id: row.try_get("tn_id").or(Err(Error::DbError))?,
+				id_tag: row.try_get("id_tag").or(Err(Error::DbError))?,
+				domain: row.try_get("domain").or(Err(Error::DbError))?,
+				cert: row.try_get("cert").or(Err(Error::DbError))?,
+				key: row.try_get("key").or(Err(Error::DbError))?,
+				expires_at: row.try_get("expires_at").or(Err(Error::DbError))?,
+			}),
+			Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
+			Err(err) => {
+				println!("DbError: {:#?}", err);
+				Err(Error::DbError)
+			}
+		}
+	}
+
+	async fn read_cert_by_id_tag(&self, id_tag: &str) -> Result<auth_adapter::CertData> {
+		let res = sqlx::query(
+			"SELECT tn_id, id_tag, domain, cert, key, expires_at FROM certs WHERE id_tag = ?1"
+		).bind(id_tag).fetch_one(&self.db).await;
+
+		match res {
+			Ok(row) => Ok(auth_adapter::CertData {
+				tn_id: row.try_get("tn_id").or(Err(Error::DbError))?,
+				id_tag: row.try_get("id_tag").or(Err(Error::DbError))?,
+				domain: row.try_get("domain").or(Err(Error::DbError))?,
+				cert: row.try_get("cert").or(Err(Error::DbError))?,
+				key: row.try_get("key").or(Err(Error::DbError))?,
+				expires_at: row.try_get("expires_at").or(Err(Error::DbError))?,
+			}),
+			Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
+			Err(err) => {
+				println!("DbError: {:#?}", err);
+				Err(Error::DbError)
+			}
+		}
+	}
+
+	async fn read_cert_by_domain(&self, domain: &str) -> Result<auth_adapter::CertData> {
+		println!("read_cert_by_domain {}", &domain);
+		let res = sqlx::query(
+			"SELECT tn_id, id_tag, domain, cert, key, expires_at FROM certs WHERE domain = ?1"
+		).bind(domain).fetch_one(&self.db).await;
+
+		match res {
+			Ok(row) => Ok(auth_adapter::CertData {
+				tn_id: row.try_get("tn_id").or(Err(Error::DbError))?,
+				id_tag: row.try_get("id_tag").or(Err(Error::DbError))?,
+				domain: row.try_get("domain").or(Err(Error::DbError))?,
+				cert: row.try_get("cert").or(Err(Error::DbError))?,
+				key: row.try_get("key").or(Err(Error::DbError))?,
+				expires_at: row.try_get("expires_at").or(Err(Error::DbError))?,
+			}),
+			Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
+			Err(err) => {
+				println!("DbError: {:#?}", err);
+				Err(Error::DbError)
+			}
+		}
 	}
 
 	async fn list_auth_keys(&self, id_tag: &str) -> Result<&[&auth_adapter::AuthKey]> {
 		Ok(&[])
 	}
 
-	async fn create_key(&self, tn_id: u32) -> Result<(Box<str>, Box<str>)> {
-		let (private_key, public_key) = token::generate_key(&self.worker).await.or(Err(Error::DbError))?;
+	async fn create_key(&self, tn_id: TnId) -> Result<Box<str>> {
+		let keypair = crypto::generate_key(&self.worker).await.or(Err(Error::DbError))?;
 
-		Ok((private_key, public_key))
+		Ok(keypair.public_key)
 	}
 
-	async fn create_access_token(&self, tn_id: u32, data: &auth_adapter::AccessToken) -> Result<Box<str>> {
-		let key = token::generate_key(&self.worker).await.or(Err(Error::DbError))?;
+	async fn create_access_token(&self, tn_id: TnId, data: &auth_adapter::AccessToken) -> Result<Box<str>> {
+		let key = crypto::generate_key(&self.worker).await.or(Err(Error::DbError))?;
 
-		Ok(key.0)
+		Ok(key.public_key)
 	}
 }
 

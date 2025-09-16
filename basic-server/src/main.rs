@@ -3,7 +3,7 @@
 use std::{sync::Arc, env, path::PathBuf};
 use tokio::fs;
 
-use cloudillo::{auth_adapter, meta_adapter, worker};
+use cloudillo::{auth_adapter, meta_adapter, core::worker};
 use auth_adapter_sqlite::AuthAdapterSqlite;
 use meta_adapter_sqlite::MetaAdapterSqlite;
 
@@ -21,7 +21,9 @@ pub struct Config {
 	pub db_dir: PathBuf,
 }
 
-#[tokio::main(flavor = "current_thread")]
+//#[tokio::main(flavor = "current_thread")]
+// This is needed for task::block_in_place() which is used in SNI certificate resolver
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() {
 	let base_id_tag = env::var("BASE_ID_TAG").expect("BASE_ID_TAG must be set");
 

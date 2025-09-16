@@ -7,6 +7,7 @@ pub enum Error {
 	NotFound,
 	PermissionDenied,
 	DbError,
+	Unknown,
 
 	// externals
 	Io(std::io::Error),
@@ -24,10 +25,13 @@ impl std::fmt::Display for Error {
 	}
 }
 
+impl std::error::Error for Error {}
+
 impl IntoResponse for Error {
 	fn into_response(self) -> axum::response::Response {
 		match self {
 			Error::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
+			Error::PermissionDenied => (StatusCode::FORBIDDEN, "permission denied").into_response(),
 			_ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
 		}
 	}

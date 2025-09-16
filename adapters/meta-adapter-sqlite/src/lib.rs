@@ -1,11 +1,12 @@
 #![allow(unused)]
 
-use std::{sync::Arc, path::Path, collections::HashMap};
+use std::{fmt::Debug, sync::Arc, path::Path, collections::HashMap};
 use async_trait::async_trait;
 use sqlx::{sqlite, sqlite::SqlitePool, Row};
 
-use cloudillo::{meta_adapter, worker::WorkerPool, Result, Error};
+use cloudillo::{meta_adapter, core::worker::WorkerPool, Result, Error};
 
+#[derive(Debug)]
 pub struct MetaAdapterSqlite {
 	db: SqlitePool,
 	worker: Arc<WorkerPool>,

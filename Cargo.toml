@@ -6,3 +6,5 @@ members = [
 	"adapters/auth-adapter-sqlite",
 	"adapters/meta-adapter-sqlite",
 ]
+[profile.release]
+opt-level = "s"

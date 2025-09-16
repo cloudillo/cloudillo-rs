@@ -9,6 +9,7 @@ pub enum Priority {
 	Low,
 }
 
+#[derive(Debug)]
 pub struct WorkerPool {
 	tx_high: Sender<Box<dyn FnOnce() + Send>>,
 	tx_med: Sender<Box<dyn FnOnce() + Send>>,

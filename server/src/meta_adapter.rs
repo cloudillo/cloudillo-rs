@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::{num::NonZero, collections::HashMap};
+use std::{fmt::Debug, num::NonZero, collections::HashMap};
 use serde::{Serialize, Deserialize};
 
 use crate::AppState;
@@ -98,7 +98,7 @@ pub struct UpdateProfileData {
 }
 
 #[async_trait]
-pub trait MetaAdapter: Send + Sync {
+pub trait MetaAdapter: Debug + Send + Sync {
 	/// # Tenants
 	async fn read_tenant(&self, tn_id: u32) -> Result<Tenant>;
 	async fn create_tenant(&self, tn_id: u32, id_tag: &str) -> Result<u32>;
