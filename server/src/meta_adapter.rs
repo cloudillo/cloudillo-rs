@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use std::{fmt::Debug, num::NonZero, collections::HashMap};
 use serde::{Serialize, Deserialize};
 
+use crate::prelude::*;
 use crate::AppState;
-use crate::error::{Error, Result};
 
 #[derive(Serialize, Deserialize)]
 pub enum ProfileType {
@@ -100,30 +100,30 @@ pub struct UpdateProfileData {
 #[async_trait]
 pub trait MetaAdapter: Debug + Send + Sync {
 	/// # Tenants
-	async fn read_tenant(&self, tn_id: u32) -> Result<Tenant>;
-	async fn create_tenant(&self, tn_id: u32, id_tag: &str) -> Result<u32>;
-	async fn update_tenant(&self, tn_id: u32, tenant: &UpdateTenantData) -> Result<()>;
-	async fn delete_tenant(&self, tn_id: u32) -> Result<()>;
+	async fn read_tenant(&self, tn_id: u32) -> ClResult<Tenant>;
+	async fn create_tenant(&self, tn_id: u32, id_tag: &str) -> ClResult<u32>;
+	async fn update_tenant(&self, tn_id: u32, tenant: &UpdateTenantData) -> ClResult<()>;
+	async fn delete_tenant(&self, tn_id: u32) -> ClResult<()>;
 
-	//async fn list_profiles(&self, tn_id: u32, opts: &ListProfileOptions) -> Result<dyn Iterator<Item=Box<Profile>>>;
-	async fn list_profiles(&self, tn_id: u32, opts: &ListProfileOptions) -> Result<Vec<Profile>>;
+	//async fn list_profiles(&self, tn_id: u32, opts: &ListProfileOptions) -> ClResult<dyn Iterator<Item=Box<Profile>>>;
+	async fn list_profiles(&self, tn_id: u32, opts: &ListProfileOptions) -> ClResult<Vec<Profile>>;
 
 	/// Reads profile by id tag
 	/// Returns (etag, Profile) tuple
-	async fn read_profile(&self, tn_id: u32, id_tag: &str) -> Result<(Box<str>, Profile)>;
-	async fn create_profile(&self, profile: &Profile, etag: &str) -> Result<()>;
-	async fn update_profile(&self, id_tag: &str, profile: &UpdateProfileData) -> Result<()>;
+	async fn read_profile(&self, tn_id: u32, id_tag: &str) -> ClResult<(Box<str>, Profile)>;
+	async fn create_profile(&self, profile: &Profile, etag: &str) -> ClResult<()>;
+	async fn update_profile(&self, id_tag: &str, profile: &UpdateProfileData) -> ClResult<()>;
 
 	/// Reads profile public key
 	/// Returns (public key, expiration) tuple
-	async fn read_profile_public_key(&self, id_tag: &str, key_id: &str) -> Result<(Box<str>, u32)>;
-	async fn add_profile_public_key(&self, id_tag: &str, key_id: &str, public_key: &str) -> Result<()>;
+	async fn read_profile_public_key(&self, id_tag: &str, key_id: &str) -> ClResult<(Box<str>, u32)>;
+	async fn add_profile_public_key(&self, id_tag: &str, key_id: &str, public_key: &str) -> ClResult<()>;
 	/// Process profile refresh
 	/// callback(tn_id: u32, id_tag: &str, etag: Option<&str>)
 	//async fn process_profile_refresh(&self, callback: FnOnce<(u32, &str, Option<&str>)>);
 	//async fn process_profile_refresh<'a, F>(&self, callback: F)
-	//	where F: FnOnce(u32, &'a str, Option<&'a str>) -> Result<()> + Send;
-	async fn process_profile_refresh<'a>(&self, callback: Box<dyn Fn(u32, &'a str, Option<&'a str>) -> Result<()> + Send>);
+	//	where F: FnOnce(u32, &'a str, Option<&'a str>) -> ClResult<()> + Send;
+	async fn process_profile_refresh<'a>(&self, callback: Box<dyn Fn(u32, &'a str, Option<&'a str>) -> ClResult<()> + Send>);
 }
 
 // vim: ts=4

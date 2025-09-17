@@ -1,6 +1,6 @@
 use axum::{response::IntoResponse, Json, http::StatusCode};
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type ClResult<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum Error {

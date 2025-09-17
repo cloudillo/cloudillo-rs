@@ -4,10 +4,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	error::{Error, Result},
+	prelude::*,
 	auth_adapter,
 	AppState,
-	Auth,
 };
 
 /// # Login
@@ -27,7 +26,7 @@ pub struct Login {
 	settings: Box<[(Box<str>, Box<str>)]>,
 }
 
-pub async fn return_login(state: &AppState, auth: auth_adapter::AuthLogin) -> Result<(StatusCode, Json<Login>)> {
+pub async fn return_login(state: &AppState, auth: auth_adapter::AuthLogin) -> ClResult<(StatusCode, Json<Login>)> {
 	let login = Login {
 		tn_id: auth.tn_id,
 		id_tag: auth.id_tag,
@@ -50,7 +49,7 @@ pub struct LoginReq {
 
 #[axum::debug_handler]
 pub async fn post_login(State(state): State<Arc<AppState>>, Json(login): Json<LoginReq>)
--> Result<(StatusCode, Json<Login>)> {
+-> ClResult<(StatusCode, Json<Login>)> {
 	let auth = state.auth_adapter.check_auth_password(&login.id_tag, &login.password).await;
 
 	if let Ok(auth) = auth {

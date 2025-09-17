@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use std::{fmt::Debug, num::NonZero};
 use serde::Serialize;
 
+use crate::prelude::*;
 use crate::AppState;
-use crate::error::{Error, Result};
 use crate::types::{TnId, Timestamp};
 
 /// # Token structs
@@ -97,27 +97,28 @@ pub struct CertData {
 pub trait AuthAdapter: Debug + Send + Sync {
 	/// # Profiles
 	/// Get auth profile for the given tenant
-	async fn read_id_tag(&self, tn_id: TnId) -> Result<Box<str>>;
-	async fn read_auth_profile(&self, id_tag: &str) -> Result<AuthProfile>;
-	async fn create_auth_profile(&self, id_tag: &str, profile: &CreateTenantData) -> Result<()>;
+	async fn read_id_tag(&self, tn_id: TnId) -> ClResult<Box<str>>;
+	async fn read_tn_id(&self, id_tag: &str) -> ClResult<TnId>;
+	async fn read_auth_profile(&self, id_tag: &str) -> ClResult<AuthProfile>;
+	async fn create_auth_profile(&self, id_tag: &str, profile: &CreateTenantData) -> ClResult<()>;
 
 	/// Check password for a given tenant
-	async fn check_auth_password(&self, id_tag: &str, password: &str) -> Result<AuthLogin>;
-	async fn update_auth_password(&self, id_tag: &str, password: &str) -> Result<()>;
+	async fn check_auth_password(&self, id_tag: &str, password: &str) -> ClResult<AuthLogin>;
+	async fn update_auth_password(&self, id_tag: &str, password: &str) -> ClResult<()>;
 
 	// Manage certificates
-	async fn create_cert(&self, cert_data: &CertData) -> Result<()>;
-	async fn read_cert_by_tn_id(&self, tn_id: TnId) -> Result<CertData>;
-	async fn read_cert_by_id_tag(&self, id_tag: &str) -> Result<CertData>;
-	async fn read_cert_by_domain(&self, domain: &str) -> Result<CertData>;
+	async fn create_cert(&self, cert_data: &CertData) -> ClResult<()>;
+	async fn read_cert_by_tn_id(&self, tn_id: TnId) -> ClResult<CertData>;
+	async fn read_cert_by_id_tag(&self, id_tag: &str) -> ClResult<CertData>;
+	async fn read_cert_by_domain(&self, domain: &str) -> ClResult<CertData>;
 
 	// Manage keys
-	async fn list_auth_keys(&self, id_tag: &str) -> Result<&[&AuthKey]>;
+	async fn list_auth_keys(&self, id_tag: &str) -> ClResult<&[&AuthKey]>;
 	/// Creates a new key pair for the given tenant
 	async fn create_key(&self, tn_id: TnId)
-		-> Result<Box<str>>;
+		-> ClResult<Box<str>>;
 	async fn create_access_token(&self, tn_id: TnId, data: &AccessToken)
-		-> Result<Box<str>>;
+		-> ClResult<Box<str>>;
 }
 
 #[cfg(test)]

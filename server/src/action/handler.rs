@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::action::action;
 use crate::auth_adapter;
-use crate::{AppState, Auth};
+use crate::{AppState};
 
 #[derive(Serialize)]
 pub struct ActionView {
@@ -19,7 +19,8 @@ pub struct CreateKey {
 	public_key: Box<str>,
 }
 
-pub async fn create_key(State(state): State<Arc<AppState>>, Extension(auth): Extension<Auth>) -> (StatusCode, Json<CreateKey>) {
+//pub async fn create_key(State(state): State<Arc<AppState>>, Extension(auth): Extension<Auth>) -> (StatusCode, Json<CreateKey>) {
+pub async fn create_key(State(state): State<Arc<AppState>>) -> (StatusCode, Json<CreateKey>) {
 	let public_key = state.auth_adapter.create_key(1).await.unwrap();
 	(StatusCode::CREATED, Json(CreateKey { public_key }))
 }

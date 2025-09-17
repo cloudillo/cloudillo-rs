@@ -12,9 +12,9 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use pem;
 use x509_parser::{parse_x509_certificate, pem::Pem};
 
+use crate::prelude::*;
 use crate::AppState;
 use crate::auth_adapter;
-use crate::error::{Error, Result};
 use crate::types::{TnId, Timestamp};
 
 #[derive(Debug)]
@@ -32,8 +32,8 @@ struct TenantCertData {
 	cert_data: X509CertData,
 }
 
-pub async fn init(state: Arc<AppState>, acme_email: &str, id_tag: &str, app_domain: Option<&str>) -> Result<()> {
-	println!("ACME init {}", acme_email);
+pub async fn init(state: Arc<AppState>, acme_email: &str, id_tag: &str, app_domain: Option<&str>) -> ClResult<()> {
+	info!("ACME init {}", acme_email);
 
 	let (account, credentials) = Account::builder().map_err(|_| Error::Unknown)?.create(
 		&acme::NewAccount {
@@ -45,24 +45,24 @@ pub async fn init(state: Arc<AppState>, acme_email: &str, id_tag: &str, app_doma
 		acme::LetsEncrypt::Production.url().to_owned(),
 		None,
 	).await.map_err(|_| Error::Unknown)?;
-	println!("ACME credentials {}", serde_json::to_string_pretty(&credentials).map_err(|_| Error::Unknown)?);
+	info!("ACME credentials {}", serde_json::to_string_pretty(&credentials).map_err(|_| Error::Unknown)?);
 
 	renew_tenant(state, &account, id_tag, 1, app_domain).await.map_err(|_| Error::Unknown)?;
 
 	Ok(())
 }
 
-pub async fn renew_tenant<'a>(state: Arc<AppState>, account: &'a acme::Account, id_tag: &'a str, tn_id: u32, app_domain: Option<&'a str>) -> Result<()> {
+pub async fn renew_tenant<'a>(state: Arc<AppState>, account: &'a acme::Account, id_tag: &'a str, tn_id: u32, app_domain: Option<&'a str>) -> ClResult<()> {
 	let mut domains: Vec<String> = vec!["cl-o.".to_string() + &id_tag];
 	if let Some(app_domain) = app_domain {
 		domains.push(app_domain.to_string());
 	} else {
-		println!("cloudillo app domain: {}", &id_tag);
+		info!("cloudillo app domain: {}", &id_tag);
 		domains.push(id_tag.into());
 	}
 
 	let cert = renew_domains(&state, &account, domains).await.map_err(|_| Error::Unknown)?;
-	println!("ACME cert {}", &cert.expires_at);
+	info!("ACME cert {}", &cert.expires_at);
 	state.auth_adapter.create_cert(&auth_adapter::CertData {
 		tn_id,
 		id_tag: id_tag.into(),
@@ -75,13 +75,13 @@ pub async fn renew_tenant<'a>(state: Arc<AppState>, account: &'a acme::Account, 
 	Ok(())
 }
 
-async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account, domains: Vec<String>) -> std::result::Result<X509CertData, Box<dyn std::error::Error + 'a>> {
-	println!("ACME {:?}", &domains);
+async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account, domains: Vec<String>) -> Result<X509CertData, Box<dyn std::error::Error + 'a>> {
+	info!("ACME {:?}", &domains);
 	let identifiers = domains.iter().map(|domain| acme::Identifier::Dns(domain.to_string())).collect::<Vec<_>>();
 
 	let mut order = account.new_order(&acme::NewOrder::new(identifiers.as_slice())).await?;
 
-	println!("ACME order {:#?}", order.state());
+	info!("ACME order {:#?}", order.state());
 
 	if order.state().status == acme::OrderStatus::Pending {
 		let mut authorizations = order.authorizations();
@@ -96,27 +96,27 @@ async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account,
 			let mut challenge = authz.challenge(acme::ChallengeType::Http01).ok_or(acme::Error::Str("no challenge"))?;
 			let identifier = challenge.identifier().to_string().into_boxed_str();
 			let token: Box<str> = challenge.key_authorization().as_str().into();
-			println!("ACME challenge {} {}", identifier, token);
-			state.acme_challenge_map.lock()?.insert(identifier, token);
+			info!("ACME challenge {} {}", identifier, token);
+			state.acme_challenge_map.write()?.insert(identifier, token);
 
 			challenge.set_ready().await?;
 		}
 
-		println!("Start polling...");
+		info!("Start polling...");
 		let status = order.poll_ready(&acme::RetryPolicy::default()).await?;
 
 		if status != acme::OrderStatus::Ready {
 			Err(acme::Error::Str("order not ready"))?;
 		}
 
-		println!("Finalizing...");
+		info!("Finalizing...");
 		let private_key_pem = order.finalize().await?;
 		let cert_chain_pem = order.poll_certificate(&acme::RetryPolicy::default()).await?;
-		println!("Got cert.");
+		info!("Got cert.");
 
 		// Clean up ACME challenges
 		for domain in domains.iter() {
-			state.acme_challenge_map.lock()?.remove(&*domain.as_str());
+			state.acme_challenge_map.write()?.remove(&*domain.as_str());
 		}
 
 		let pem = &pem::parse(&cert_chain_pem).map_err(|_| Error::Unknown)?;
@@ -130,7 +130,7 @@ async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account,
 			CryptoProvider::get_default().ok_or(acme::Error::Str("no crypto provider"))?,
 		)?);
 		for domain in domains.iter() {
-			state.certs.lock()?.insert(domain.clone().into_boxed_str(), certified_key.clone());
+			state.certs.write()?.insert(domain.clone().into_boxed_str(), certified_key.clone());
 		}
 
 		let cert_data = X509CertData {
@@ -149,11 +149,11 @@ async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account,
 pub async fn get_acme_challenge(
 	State(state): State<Arc<AppState>>,
 	headers: HeaderMap,
-) -> Result<Box<str>> {
+) -> ClResult<Box<str>> {
 	let domain = headers.get("host").ok_or(Error::Unknown)?.to_str().map_err(|_| Error::Unknown)?;
-	println!("ACME challenge for domain {:?}", domain);
+	info!("ACME challenge for domain {:?}", domain);
 
-	if let Some(token) = state.acme_challenge_map.lock().map_err(|_| Error::Unknown)?.get(&*domain).clone() {
+	if let Some(token) = state.acme_challenge_map.read().map_err(|_| Error::Unknown)?.get(&*domain).clone() {
 		println!("    -> {:?}", &token);
 		Ok(token.clone())
 	} else {

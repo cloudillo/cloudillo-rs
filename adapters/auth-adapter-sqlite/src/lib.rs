@@ -4,7 +4,13 @@ use std::{fmt::Debug, sync::Arc, path::Path};
 use async_trait::async_trait;
 use sqlx::{sqlite, sqlite::SqlitePool, Row};
 
-use cloudillo::{auth_adapter, core::route_auth, types::{TnId, Timestamp}, core::worker::WorkerPool, Result, Error};
+use cloudillo::{
+	prelude::*,
+	auth_adapter,
+	core::route_auth,
+	types::{TnId, Timestamp},
+	core::worker::WorkerPool
+};
 
 mod crypto;
 
@@ -15,7 +21,7 @@ pub struct AuthAdapterSqlite {
 }
 
 impl AuthAdapterSqlite {
-	pub async fn new(worker: Arc<WorkerPool>, path: impl AsRef<Path>) -> Result<Self> {
+	pub async fn new(worker: Arc<WorkerPool>, path: impl AsRef<Path>) -> ClResult<Self> {
 		let opts = sqlite::SqliteConnectOptions::new()
 			.filename(path.as_ref())
 			.create_if_missing(true)
@@ -46,7 +52,7 @@ fn inspect(err: &sqlx::Error) {
 
 #[async_trait]
 impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
-	async fn read_id_tag(&self, tn_id: TnId) -> Result<Box<str>> {
+	async fn read_id_tag(&self, tn_id: TnId) -> ClResult<Box<str>> {
 		let res = sqlx::query(
 			"SELECT id_tag FROM tenants WHERE tn_id = ?1"
 		).bind(tn_id).fetch_one(&self.db).await.inspect_err(inspect);
@@ -61,7 +67,22 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		}
 	}
 
-	async fn read_auth_profile(&self, id_tag: &str) -> Result<auth_adapter::AuthProfile> {
+	async fn read_tn_id(&self, id_tag: &str) -> ClResult<TnId> {
+		let res = sqlx::query(
+			"SELECT tn_id FROM tenants WHERE id_tag = ?1"
+		).bind(id_tag).fetch_one(&self.db).await.inspect_err(inspect);
+
+		match res {
+			Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
+			Err(err) => {
+				println!("DbError: {:#?}", err);
+				Err(Error::DbError)
+			},
+			Ok(row) => Ok(row.try_get("tn_id").or(Err(Error::DbError))?)
+		}
+	}
+
+	async fn read_auth_profile(&self, id_tag: &str) -> ClResult<auth_adapter::AuthProfile> {
 		let res = sqlx::query(
 			"SELECT id_tag, roles FROM tenants WHERE id_tag = ?1"
 		).bind(id_tag).fetch_one(&self.db).await;
@@ -83,7 +104,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		}
 	}
 
-	async fn create_auth_profile(&self, id_tag: &str, profile: &auth_adapter::CreateTenantData) -> Result<()> {
+	async fn create_auth_profile(&self, id_tag: &str, profile: &auth_adapter::CreateTenantData) -> ClResult<()> {
 		println!("create_auth_profile");
 		if let Some(vfy_code) = &profile.vfy_code {
 			println!("create_auth_profile VFY");
@@ -105,7 +126,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		Ok(())
 	}
 
-	async fn check_auth_password(&self, id_tag: &str, password: &str) -> Result<auth_adapter::AuthLogin> {
+	async fn check_auth_password(&self, id_tag: &str, password: &str) -> ClResult<auth_adapter::AuthLogin> {
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, password, roles FROM tenants WHERE id_tag = ?1"
 		).bind(id_tag).fetch_one(&self.db).await;
@@ -135,12 +156,12 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		}
 	}
 
-	async fn update_auth_password(&self, id_tag: &str, password: &str) -> Result<()> {
+	async fn update_auth_password(&self, id_tag: &str, password: &str) -> ClResult<()> {
 		Ok(())
 	}
 
-	//async fn create_cert(&self, tn_id: TnId, id_tag: &str, domain: &str, cert: &str, key: &str, expires_at: Timestamp) -> Result<()> {
-	async fn create_cert(&self, cert_data: &auth_adapter::CertData) -> Result<()> {
+	//async fn create_cert(&self, tn_id: TnId, id_tag: &str, domain: &str, cert: &str, key: &str, expires_at: Timestamp) -> ClResult<()> {
+	async fn create_cert(&self, cert_data: &auth_adapter::CertData) -> ClResult<()> {
 		println!("create_cert {}", &cert_data.id_tag);
 		sqlx::query(
 			"INSERT OR REPLACE INTO certs (tn_id, id_tag, domain, expires_at, cert, key)
@@ -156,7 +177,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		Ok(())
 	}
 
-	async fn read_cert_by_tn_id(&self, tn_id: TnId) -> Result<auth_adapter::CertData> {
+	async fn read_cert_by_tn_id(&self, tn_id: TnId) -> ClResult<auth_adapter::CertData> {
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, domain, cert, key, expires_at FROM certs WHERE tn_id = ?1"
 		).bind(tn_id).fetch_one(&self.db).await;
@@ -178,7 +199,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		}
 	}
 
-	async fn read_cert_by_id_tag(&self, id_tag: &str) -> Result<auth_adapter::CertData> {
+	async fn read_cert_by_id_tag(&self, id_tag: &str) -> ClResult<auth_adapter::CertData> {
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, domain, cert, key, expires_at FROM certs WHERE id_tag = ?1"
 		).bind(id_tag).fetch_one(&self.db).await;
@@ -200,7 +221,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		}
 	}
 
-	async fn read_cert_by_domain(&self, domain: &str) -> Result<auth_adapter::CertData> {
+	async fn read_cert_by_domain(&self, domain: &str) -> ClResult<auth_adapter::CertData> {
 		println!("read_cert_by_domain {}", &domain);
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, domain, cert, key, expires_at FROM certs WHERE domain = ?1"
@@ -223,24 +244,24 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		}
 	}
 
-	async fn list_auth_keys(&self, id_tag: &str) -> Result<&[&auth_adapter::AuthKey]> {
+	async fn list_auth_keys(&self, id_tag: &str) -> ClResult<&[&auth_adapter::AuthKey]> {
 		Ok(&[])
 	}
 
-	async fn create_key(&self, tn_id: TnId) -> Result<Box<str>> {
+	async fn create_key(&self, tn_id: TnId) -> ClResult<Box<str>> {
 		let keypair = crypto::generate_key(&self.worker).await.or(Err(Error::DbError))?;
 
 		Ok(keypair.public_key)
 	}
 
-	async fn create_access_token(&self, tn_id: TnId, data: &auth_adapter::AccessToken) -> Result<Box<str>> {
+	async fn create_access_token(&self, tn_id: TnId, data: &auth_adapter::AccessToken) -> ClResult<Box<str>> {
 		let key = crypto::generate_key(&self.worker).await.or(Err(Error::DbError))?;
 
 		Ok(key.public_key)
 	}
 }
 
-async fn init_db(db: &SqlitePool) -> std::result::Result<(), sqlx::Error> {
+async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	let mut tx = db.begin().await?;
 
 	sqlx::query("CREATE TABLE IF NOT EXISTS globals (

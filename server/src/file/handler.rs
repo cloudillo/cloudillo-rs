@@ -7,31 +7,28 @@ use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::prelude::*;
 use crate::action::action;
 use crate::auth_adapter;
 use crate::AppState;
 
 fn resize_image<'a>(orig_buf: impl AsRef<[u8]> + 'a, resize: (u32, u32)) -> Result<Box<[u8]>, image::error::ImageError> {
-	print!("decoding...");
 	let now = std::time::Instant::now();
 	let original = ImageReader::new(Cursor::new(&orig_buf.as_ref()))
 		.with_guessed_format()?
 		.decode()?;
-	println!(" [{:.2}ms]", now.elapsed().as_millis());
+	debug!("decoded [{:.2}ms]", now.elapsed().as_millis());
 
-	print!("resizing...");
 	let now = std::time::Instant::now();
 	let resized = original.resize(200, 200, image::imageops::FilterType::Lanczos3);
-	println!(" [{:.2}ms]", now.elapsed().as_millis());
+	debug!("resized [{:.2}ms]", now.elapsed().as_millis());
 
-	print!("writing...");
 	let mut output = Cursor::new(Vec::new());
 	let now = std::time::Instant::now();
 
 	let encoder = image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut output, 4, 80).with_num_threads(Some(1));
 	resized.write_with_encoder(encoder)?;
-	//resized.write_to(&mut output, image::ImageFormat::Avif)?;
-	println!(" [{:.2}ms]", now.elapsed().as_millis());
+	debug!("written [{:.2}ms]", now.elapsed().as_millis());
 	Ok(output.into_inner().into())
 	//resized_buf
 		//Ok(_) => resized_buf = Some(output.into_inner().into()),
@@ -49,7 +46,7 @@ pub async fn post_file(
 	body: Body,
 ) -> Result<impl response::IntoResponse, StatusCode> {
 	let bytes = to_bytes(body, 50000000).await.map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
-	println!("{} bytes", bytes.len());
+	debug!("{} bytes", bytes.len());
 
 	let task = state.worker.run(move || {
 		resize_image(bytes, (1000, 1000))

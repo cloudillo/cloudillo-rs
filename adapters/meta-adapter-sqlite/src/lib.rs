@@ -4,7 +4,12 @@ use std::{fmt::Debug, sync::Arc, path::Path, collections::HashMap};
 use async_trait::async_trait;
 use sqlx::{sqlite, sqlite::SqlitePool, Row};
 
-use cloudillo::{meta_adapter, core::worker::WorkerPool, Result, Error};
+use cloudillo::{
+	prelude::*,
+	core::worker::WorkerPool,
+	meta_adapter,
+	types::TnId,
+};
 
 #[derive(Debug)]
 pub struct MetaAdapterSqlite {
@@ -13,7 +18,7 @@ pub struct MetaAdapterSqlite {
 }
 
 impl MetaAdapterSqlite {
-	pub async fn new(worker: Arc<WorkerPool>, path: impl AsRef<Path>) -> Result<Self> {
+	pub async fn new(worker: Arc<WorkerPool>, path: impl AsRef<Path>) -> ClResult<Self> {
 		let opts = sqlite::SqliteConnectOptions::new()
 			.filename(path.as_ref())
 			.create_if_missing(true)
@@ -43,7 +48,7 @@ fn inspect(err: &sqlx::Error) {
 
 #[async_trait]
 impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
-	async fn read_tenant(&self, tn_id: u32) -> Result<meta_adapter::Tenant> {
+	async fn read_tenant(&self, tn_id: TnId) -> ClResult<meta_adapter::Tenant> {
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, name, type, profile_pic, cover_pic, created_at, x FROM tenants WHERE tn_id = ?1"
 		).bind(tn_id).fetch_one(&self.db).await;
@@ -76,44 +81,44 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		}
 	}
 
-	async fn create_tenant(&self, tn_id: u32, id_tag: &str) -> Result<u32> {
+	async fn create_tenant(&self, tn_id: TnId, id_tag: &str) -> ClResult<TnId> {
 		Ok(tn_id)
 	}
-	async fn update_tenant(&self, tn_id: u32, tenant: &meta_adapter::UpdateTenantData) -> Result<()> {
+	async fn update_tenant(&self, tn_id: TnId, tenant: &meta_adapter::UpdateTenantData) -> ClResult<()> {
 		Ok(())
 	}
-	async fn delete_tenant(&self, tn_id: u32) -> Result<()> {
+	async fn delete_tenant(&self, tn_id: TnId) -> ClResult<()> {
 		Ok(())
 	}
 
-	//async fn list_profiles(&self, tn_id: u32, opts: &meta_adapter::ListProfileOptions) -> Result<impl Iterator<Item=meta_adapter::Profile>> {
-	async fn list_profiles(&self, tn_id: u32, opts: &meta_adapter::ListProfileOptions) -> Result<Vec<meta_adapter::Profile>> {
+	//async fn list_profiles(&self, tn_id: TnId, opts: &meta_adapter::ListProfileOptions) -> ClResult<impl Iterator<Item=meta_adapter::Profile>> {
+	async fn list_profiles(&self, tn_id: TnId, opts: &meta_adapter::ListProfileOptions) -> ClResult<Vec<meta_adapter::Profile>> {
 		Ok(vec!())
 	}
 
-	async fn read_profile(&self, tn_id: u32, id_tag: &str) -> Result<(Box<str>, meta_adapter::Profile)> {
+	async fn read_profile(&self, tn_id: TnId, id_tag: &str) -> ClResult<(Box<str>, meta_adapter::Profile)> {
 		Err(Error::NotFound)
 	}
-	async fn create_profile(&self, profile: &meta_adapter::Profile, etag: &str) -> Result<()> {
+	async fn create_profile(&self, profile: &meta_adapter::Profile, etag: &str) -> ClResult<()> {
 		Ok(())
 	}
-	async fn update_profile(&self, id_tag: &str, profile: &meta_adapter::UpdateProfileData) -> Result<()> {
+	async fn update_profile(&self, id_tag: &str, profile: &meta_adapter::UpdateProfileData) -> ClResult<()> {
 		Ok(())
 	}
 
-	async fn read_profile_public_key(&self, id_tag: &str, key_id: &str) -> Result<(Box<str>, u32)> {
+	async fn read_profile_public_key(&self, id_tag: &str, key_id: &str) -> ClResult<(Box<str>, u32)> {
 		Err(Error::NotFound)
 	}
-	async fn add_profile_public_key(&self, id_tag: &str, key_id: &str, public_key: &str) -> Result<()> {
+	async fn add_profile_public_key(&self, id_tag: &str, key_id: &str, public_key: &str) -> ClResult<()> {
 		Ok(())
 	}
 	//async fn process_profile_refresh<'a, F>(&self, callback: F)
-	//	where F: FnOnce(u32, &'a str, Option<&'a str>) -> Result<()> + Send {
-	async fn process_profile_refresh<'a>(&self, callback: Box<dyn Fn(u32, &'a str, Option<&'a str>) -> Result<()> + Send>) {
+	//	where F: FnOnce(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send {
+	async fn process_profile_refresh<'a>(&self, callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>) {
 	}
 }
 
-async fn init_db(db: &SqlitePool) -> std::result::Result<(), sqlx::Error> {
+async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	let mut tx = db.begin().await?;
 
 	sqlx::query("CREATE TABLE IF NOT EXISTS globals (

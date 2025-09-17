@@ -3,10 +3,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use serde::Serialize;
 
-use crate::error::Result;
+use crate::prelude::*;
 use crate::action::action;
 use crate::auth_adapter;
 use crate::AppState;
+use crate::core::route_auth::IdTag;
 
 /// # Profile
 #[derive(Serialize)]
@@ -21,8 +22,9 @@ pub struct Profile {
 
 pub async fn get_tenant_profile(
 	State(state): State<Arc<AppState>>,
-) -> Result<(StatusCode, Json<Profile>)> {
-	let profile = state.auth_adapter.read_auth_profile("zsuzska.symbion.hu").await?;
+	IdTag(id_tag): IdTag
+) -> ClResult<(StatusCode, Json<Profile>)> {
+	let profile = state.auth_adapter.read_auth_profile(&id_tag).await?;
 
 	let profile = Profile {
 		id_tag: profile.id_tag,

@@ -28,7 +28,6 @@ async fn main() {
 	let base_id_tag = env::var("BASE_ID_TAG").expect("BASE_ID_TAG must be set");
 
 	let config = Config {
-		//mode: match env::var("MODE").map(|v| v.as_deref()) {
 		mode: match env::var("MODE").as_deref() {
 			Ok("standalone") => cloudillo::ServerMode::Standalone,
 			Ok("proxy") => cloudillo::ServerMode::Proxy,
@@ -54,8 +53,8 @@ async fn main() {
 	let auth_adapter = Box::new(AuthAdapterSqlite::new(worker.clone(), config.db_dir.join("auth.db")).await.unwrap());
 	let meta_adapter = Box::new(MetaAdapterSqlite::new(worker.clone(), config.db_dir.join("meta.db")).await.unwrap());
 
-	let mut cloudillo = cloudillo::Builder::new()
-		.mode(config.mode)
+	let mut cloudillo = cloudillo::Builder::new();
+	cloudillo.mode(config.mode)
 		.listen(config.listen)
 		.base_id_tag(config.base_id_tag)
 		.base_app_domain(config.base_app_domain)
@@ -66,24 +65,15 @@ async fn main() {
 		.meta_adapter(meta_adapter)
 		.worker(worker);
 	if let Some(listen_http) = config.listen_http {
-		cloudillo = cloudillo.listen_http(listen_http);
+		cloudillo.listen_http(listen_http);
 	}
 	if let Some(base_password) = config.base_password {
-		cloudillo = cloudillo.base_password(base_password);
+		cloudillo.base_password(base_password);
 	}
 	if let Some(acme_email) = config.acme_email {
-		cloudillo = cloudillo.acme_email(acme_email);
+		cloudillo.acme_email(acme_email);
 	}
 	cloudillo.run().await.expect("Internal error");
-
-	/*
-	cloudillo::run(cloudillo::CloudilloOpts {
-		worker: worker,
-		auth_adapter: auth_adapter
-	}).await.unwrap();
-	*/
-
-	//println!("token: {}", token);
 }
 
 // vim: ts=4

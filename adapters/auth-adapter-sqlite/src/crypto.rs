@@ -1,24 +1,22 @@
-use bcrypt;
-use jsonwebtoken;
-//use openssl::{ec::{EcGroup, EcKey}, nid::Nid, pkey::Private, error::ErrorStack};
 use p384::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use p384::{SecretKey, elliptic_curve::rand_core::{CryptoRngCore, OsRng}};
 use zeroize::Zeroizing;
 
 use serde::{Serialize, Deserialize};
 
-use cloudillo::{auth_adapter, core::worker, Result, Error};
+use cloudillo::{
+	prelude::*,
+	auth_adapter,
+	core::worker,
+};
 
-pub fn generate_password_hash(password: &str) -> Result<Box<str>> {
+pub fn generate_password_hash(password: &str) -> ClResult<Box<str>> {
 	let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|_| Error::PermissionDenied)?;
 
 	Ok(hash.into())
-	//bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|_| Error::PermissionDenied)?.into()
 }
 
-pub fn check_password(password: &str, password_hash: &str) -> Result<()> {
-	//let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|_| Error::PermissionDenied)?;
-	//println!("{} {} {:?}", password, hash, bcrypt::verify(password, password_hash).map_err(|_| Error::PermissionDenied));
+pub fn check_password(password: &str, password_hash: &str) -> ClResult<()> {
 	let res = bcrypt::verify(password, password_hash).map_err(|_| Error::PermissionDenied)?;
 	if (!res) { return Err(Error::PermissionDenied); }
 
@@ -26,7 +24,7 @@ pub fn check_password(password: &str, password_hash: &str) -> Result<()> {
 }
 
 /*
-fn generate_key_sync() -> Result<(Box<str>, Box<str>)> {
+fn generate_key_sync() -> ClResult<(Box<str>, Box<str>)> {
 	// Create a new EC group for P-384
 	let group = EcGroup::from_curve_name(Nid::SECP384R1).map_err(|_| Error::PermissionDenied)?;
 
@@ -58,7 +56,7 @@ pub struct KeyPair {
 	pub public_key: Box<str>,
 }
 
-fn generate_key_sync() -> Result<KeyPair> {
+fn generate_key_sync() -> ClResult<KeyPair> {
 	let private = SecretKey::random(&mut OsRng);
 	let public = private.public_key();
 
@@ -75,7 +73,7 @@ fn generate_key_sync() -> Result<KeyPair> {
 	Ok(KeyPair { private_key, public_key })
 }
 
-pub async fn generate_key(worker: &worker::WorkerPool) -> Result<KeyPair> {
+pub async fn generate_key(worker: &worker::WorkerPool) -> ClResult<KeyPair> {
 	worker.run(move || {
 		generate_key_sync()
 	}).await.map_err(|_| Error::PermissionDenied)
