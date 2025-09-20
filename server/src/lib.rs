@@ -51,6 +51,8 @@ pub struct AppState {
 	pub meta_adapter: Box<dyn MetaAdapter>,
 }
 
+pub type App = Arc<AppState>;
+
 pub struct Adapters {
 	pub auth_adapter: Option<Box<dyn AuthAdapter>>,
 	pub meta_adapter: Option<Box<dyn MetaAdapter>>,
@@ -123,7 +125,7 @@ impl Builder {
 	pub fn meta_adapter(&mut self, meta_adapter: Box<dyn meta_adapter::MetaAdapter>) -> &mut Self { self.adapters.meta_adapter = Some(meta_adapter); self }
 
 	pub async fn run(self) -> ClResult<()> {
-		let state = Arc::new(AppState {
+		let state: App = Arc::new(AppState {
 			worker: self.worker.expect("FATAL: No worker pool defined"),
 			acme_challenge_map: RwLock::new(HashMap::new()),
 			certs: RwLock::new(HashMap::new()),
@@ -159,9 +161,9 @@ impl Builder {
 		});
 
 		if let Some(http_server) = http_server {
-			tokio::try_join!(https_server, http_server).map_err(|_| Error::Unknown)?;
+			tokio::try_join!(https_server, http_server)?;
 		} else {
-			https_server.await.map_err(|e| Error::Unknown)?;
+			https_server.await?;
 		}
 
 		Ok(())
@@ -185,11 +187,9 @@ async fn bootstrap(state: Arc<AppState>, opts: &BuilderOpts) -> ClResult<()> {
 			let base_password = &opts.base_password.as_ref().expect("FATAL: No base password");
 
 			info!("Creating tenant {}", base_id_tag);
-			auth.create_auth_profile(base_id_tag, &auth_adapter::CreateTenantData {
-				password: base_password,
-				vfy_code: None,
-				email: None,
-			}).await?;
+			let tn_id = auth.create_tenant(base_id_tag, None).await?;
+			auth.update_tenant_password(base_id_tag, base_password).await?;
+			auth.create_profile_key(tn_id, None).await?;
 		}
 		if let Some(ref acme_email) = opts.acme_email {
 			let cert_data = auth.read_cert_by_tn_id(1).await;

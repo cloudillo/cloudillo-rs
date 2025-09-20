@@ -4,30 +4,27 @@ use serde_json;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::action::action;
-use crate::auth_adapter;
-use crate::{AppState};
+use crate::{
+	prelude::*,
+	action::action,
+	auth_adapter,
+	App,
+};
 
 #[derive(Serialize)]
 pub struct ActionView {
 	issuer: Box<str>,
 }
 
-#[derive(Serialize)]
-pub struct CreateKey {
-	#[serde(rename = "publicKey")]
-	public_key: Box<str>,
-}
-
-//pub async fn create_key(State(state): State<Arc<AppState>>, Extension(auth): Extension<Auth>) -> (StatusCode, Json<CreateKey>) {
-pub async fn create_key(State(state): State<Arc<AppState>>) -> (StatusCode, Json<CreateKey>) {
-	let public_key = state.auth_adapter.create_key(1).await.unwrap();
-	(StatusCode::CREATED, Json(CreateKey { public_key }))
+pub async fn create_key(State(state): State<App>) -> (StatusCode, Json<auth_adapter::AuthKey>) {
+	let key = state.auth_adapter.create_profile_key(1, None).await.unwrap();
+	(StatusCode::CREATED, Json(key))
 }
 
 pub async fn list_actions(
-	State(state): State<Arc<AppState>>,
+	State(state): State<App>,
 ) -> (StatusCode, Json<Vec<Box<ActionView>>>) {
+	info!("list_actions");
 	let actions = vec![Box::new(ActionView {
 		//issuer: Box::<str>::from("cloudillo")
 		issuer: "cloudillo".into(),
@@ -41,11 +38,11 @@ pub struct PostAction {
 }
 
 pub async fn post_action(
-	State(state): State<Arc<AppState>>,
+	State(state): State<App>,
 	Json(action): Json<action::NewAction>,
 ) -> (StatusCode, Json<PostAction>) {
 	//let token = action::create_token(&action);
-	let public = state.auth_adapter.create_key(1).await.unwrap();
+	let public = state.auth_adapter.create_profile_key(1, None).await.unwrap();
 	let token = state
 		.auth_adapter
 		.create_access_token(1,

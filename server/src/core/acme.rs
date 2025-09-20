@@ -35,7 +35,7 @@ struct TenantCertData {
 pub async fn init(state: Arc<AppState>, acme_email: &str, id_tag: &str, app_domain: Option<&str>) -> ClResult<()> {
 	info!("ACME init {}", acme_email);
 
-	let (account, credentials) = Account::builder().map_err(|_| Error::Unknown)?.create(
+	let (account, credentials) = Account::builder()?.create(
 		&acme::NewAccount {
 			contact: &[],
 			terms_of_service_agreed: true,
@@ -44,10 +44,10 @@ pub async fn init(state: Arc<AppState>, acme_email: &str, id_tag: &str, app_doma
 		//acme::LetsEncrypt::Staging.url().to_owned(),
 		acme::LetsEncrypt::Production.url().to_owned(),
 		None,
-	).await.map_err(|_| Error::Unknown)?;
-	info!("ACME credentials {}", serde_json::to_string_pretty(&credentials).map_err(|_| Error::Unknown)?);
+	).await?;
+	info!("ACME credentials {}", serde_json::to_string_pretty(&credentials)?);
 
-	renew_tenant(state, &account, id_tag, 1, app_domain).await.map_err(|_| Error::Unknown)?;
+	renew_tenant(state, &account, id_tag, 1, app_domain).await?;
 
 	Ok(())
 }
@@ -61,7 +61,7 @@ pub async fn renew_tenant<'a>(state: Arc<AppState>, account: &'a acme::Account, 
 		domains.push(id_tag.into());
 	}
 
-	let cert = renew_domains(&state, &account, domains).await.map_err(|_| Error::Unknown)?;
+	let cert = renew_domains(&state, &account, domains).await?;
 	info!("ACME cert {}", &cert.expires_at);
 	state.auth_adapter.create_cert(&auth_adapter::CertData {
 		tn_id,
@@ -75,7 +75,8 @@ pub async fn renew_tenant<'a>(state: Arc<AppState>, account: &'a acme::Account, 
 	Ok(())
 }
 
-async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account, domains: Vec<String>) -> Result<X509CertData, Box<dyn std::error::Error + 'a>> {
+//async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account, domains: Vec<String>) -> Result<X509CertData, Box<dyn std::error::Error + 'a>> {
+async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account, domains: Vec<String>) -> ClResult<X509CertData> {
 	info!("ACME {:?}", &domains);
 	let identifiers = domains.iter().map(|domain| acme::Identifier::Dns(domain.to_string())).collect::<Vec<_>>();
 
@@ -97,7 +98,7 @@ async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account,
 			let identifier = challenge.identifier().to_string().into_boxed_str();
 			let token: Box<str> = challenge.key_authorization().as_str().into();
 			info!("ACME challenge {} {}", identifier, token);
-			state.acme_challenge_map.write()?.insert(identifier, token);
+			state.acme_challenge_map.write().map_err(|_| Error::Unknown)?.insert(identifier, token);
 
 			challenge.set_ready().await?;
 		}
@@ -116,10 +117,10 @@ async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account,
 
 		// Clean up ACME challenges
 		for domain in domains.iter() {
-			state.acme_challenge_map.write()?.remove(&*domain.as_str());
+			state.acme_challenge_map.write().map_err(|_| Error::Unknown)?.remove(&*domain.as_str());
 		}
 
-		let pem = &pem::parse(&cert_chain_pem).map_err(|_| Error::Unknown)?;
+		let pem = &pem::parse(&cert_chain_pem)?;
 		let cert_der = pem.contents();
 		let (_, parsed_cert) = parse_x509_certificate(&cert_der)?;
 		let not_after = parsed_cert.validity().not_after;
@@ -130,7 +131,7 @@ async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account,
 			CryptoProvider::get_default().ok_or(acme::Error::Str("no crypto provider"))?,
 		)?);
 		for domain in domains.iter() {
-			state.certs.write()?.insert(domain.clone().into_boxed_str(), certified_key.clone());
+			state.certs.write().map_err(|_| Error::Unknown)?.insert(domain.clone().into_boxed_str(), certified_key.clone());
 		}
 
 		let cert_data = X509CertData {
@@ -150,7 +151,7 @@ pub async fn get_acme_challenge(
 	State(state): State<Arc<AppState>>,
 	headers: HeaderMap,
 ) -> ClResult<Box<str>> {
-	let domain = headers.get("host").ok_or(Error::Unknown)?.to_str().map_err(|_| Error::Unknown)?;
+	let domain = headers.get("host").ok_or(Error::Unknown)?.to_str()?;
 	info!("ACME challenge for domain {:?}", domain);
 
 	if let Some(token) = state.acme_challenge_map.read().map_err(|_| Error::Unknown)?.get(&*domain).clone() {

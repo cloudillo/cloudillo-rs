@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	prelude::*,
 	auth_adapter,
-	AppState,
+	App,
 };
 
 /// # Login
@@ -26,7 +26,7 @@ pub struct Login {
 	settings: Box<[(Box<str>, Box<str>)]>,
 }
 
-pub async fn return_login(state: &AppState, auth: auth_adapter::AuthLogin) -> ClResult<(StatusCode, Json<Login>)> {
+pub async fn return_login(state: &App, auth: auth_adapter::AuthLogin) -> ClResult<(StatusCode, Json<Login>)> {
 	let login = Login {
 		tn_id: auth.tn_id,
 		id_tag: auth.id_tag,
@@ -40,6 +40,7 @@ pub async fn return_login(state: &AppState, auth: auth_adapter::AuthLogin) -> Cl
 	Ok((StatusCode::OK, Json(login)))
 }
 
+/// # POST /api/login
 #[derive(Deserialize)]
 pub struct LoginReq {
 	#[serde(rename = "idTag")]
@@ -48,9 +49,9 @@ pub struct LoginReq {
 }
 
 #[axum::debug_handler]
-pub async fn post_login(State(state): State<Arc<AppState>>, Json(login): Json<LoginReq>)
+pub async fn post_login(State(state): State<App>, Json(login): Json<LoginReq>)
 -> ClResult<(StatusCode, Json<Login>)> {
-	let auth = state.auth_adapter.check_auth_password(&login.id_tag, &login.password).await;
+	let auth = state.auth_adapter.check_tenant_password(&login.id_tag, login.password).await;
 
 	if let Ok(auth) = auth {
 		return_login(&state, auth).await
@@ -58,6 +59,22 @@ pub async fn post_login(State(state): State<Arc<AppState>>, Json(login): Json<Lo
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		Err(Error::PermissionDenied)
 	}
+}
+
+/// # POST /api/auth/password
+#[derive(Deserialize)]
+pub struct PasswordReq {
+	#[serde(rename = "idTag")]
+	id_tag: Box<str>,
+	password: Box<str>,
+	#[serde(rename = "newPassword")]
+	new_password: Box<str>,
+}
+
+#[axum::debug_handler]
+pub async fn post_password(State(state): State<App>, Json(req): Json<PasswordReq>) -> ClResult<StatusCode> {
+	state.auth_adapter.update_tenant_password(&req.id_tag, &req.new_password).await?;
+	Ok(StatusCode::OK)
 }
 
 // vim: ts=4

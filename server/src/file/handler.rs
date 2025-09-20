@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::prelude::*;
 use crate::action::action;
 use crate::auth_adapter;
-use crate::AppState;
+use crate::App;
 
 fn resize_image<'a>(orig_buf: impl AsRef<[u8]> + 'a, resize: (u32, u32)) -> Result<Box<[u8]>, image::error::ImageError> {
 	let now = std::time::Instant::now();
@@ -42,7 +42,7 @@ pub struct FileRes {
 }
 
 pub async fn post_file(
-	extract::State(state): extract::State<Arc<AppState>>,
+	extract::State(state): extract::State<App>,
 	body: Body,
 ) -> Result<impl response::IntoResponse, StatusCode> {
 	let bytes = to_bytes(body, 50000000).await.map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;

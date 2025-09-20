@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::prelude::*;
 use crate::action::action;
 use crate::auth_adapter;
-use crate::AppState;
+use crate::App;
 use crate::core::route_auth::IdTag;
 
 /// # Profile
@@ -17,14 +17,14 @@ pub struct Profile {
 	name: Box<str>,
 	#[serde(rename = "type")]
 	profile_type: Box<str>,
-	keys: Box<[Box<auth_adapter::AuthKey>]>,
+	keys: Vec<auth_adapter::AuthKey>,
 }
 
 pub async fn get_tenant_profile(
-	State(state): State<Arc<AppState>>,
+	State(app): State<App>,
 	IdTag(id_tag): IdTag
 ) -> ClResult<(StatusCode, Json<Profile>)> {
-	let profile = state.auth_adapter.read_auth_profile(&id_tag).await?;
+	let profile = app.auth_adapter.read_tenant(&id_tag).await?;
 
 	let profile = Profile {
 		id_tag: profile.id_tag,

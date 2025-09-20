@@ -47,7 +47,7 @@ impl ResolvesServerCert for CertResolver {
 				//debug!("[found in cache]");
 				Some(cert)
 			} else {
-				let domain = if &name[..5] == "cl-o." { &name[5..] } else { name };
+				let domain = if name.starts_with("cl-o.") { &name[5..] } else { name };
 				// FIXME: Should not block
 				let cert_data = tokio::task::block_in_place(||
 					tokio::runtime::Handle::current().block_on(async {
@@ -108,11 +108,10 @@ pub async fn create_https_server(mut state: Arc<AppState>, listen: &str, api_rou
 						req.uri().host()
 						.or_else(|| req.headers().get(hyper::header::HOST).and_then(|h| h.to_str().ok()))
 						.unwrap_or_default();
-					//let router = if &host[..5] == "cl-o." { api_router.clone() } else { app_router.clone() };
 
-					if &host[..5] == "cl-o." {
-						let id_tag = &host[5..];
-						let id_tag = IdTag::new(&id_tag);
+					info!("Host: {}", host);
+					if host.starts_with("cl-o.") {
+						let id_tag = IdTag::new(&host[5..]);
 						req.extensions_mut().insert(id_tag);
 						api_router.clone().oneshot(req)
 					} else {
