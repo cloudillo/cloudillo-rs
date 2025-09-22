@@ -73,7 +73,7 @@ pub struct PasswordReq {
 
 #[axum::debug_handler]
 pub async fn post_password(State(state): State<App>, Json(req): Json<PasswordReq>) -> ClResult<StatusCode> {
-	state.auth_adapter.update_tenant_password(&req.id_tag, &req.new_password).await?;
+	state.auth_adapter.update_tenant_password(&req.id_tag, req.new_password).await?;
 	Ok(StatusCode::OK)
 }
 

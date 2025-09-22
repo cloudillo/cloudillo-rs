@@ -103,21 +103,18 @@ where
 #[derive(Clone, Debug)]
 pub struct TnId(pub types::TnId);
 
-impl<S> FromRequestParts<S> for TnId
+impl FromRequestParts<App> for TnId
 
 where
-	S: Send + Sync,
 {
 	type Rejection = Error;
 
-	async fn from_request_parts(parts: &mut Parts, _state: &S,) -> Result<Self, Self::Rejection> {
+	async fn from_request_parts(parts: &mut Parts, state: &App) -> Result<Self, Self::Rejection> {
 		if let Some(id_tag) = parts.extensions.get::<IdTag>().cloned() {
-			if let Some(state) = parts.extensions.get::<App>() {
-				let tn_id = state.auth_adapter.read_tn_id(&id_tag.0).await.map_err(|_| Error::PermissionDenied)?;
-				Ok(TnId(tn_id))
-			} else {
-				Err(Error::PermissionDenied)
-			}
+			info!("idTag: {}", &id_tag.0);
+			let tn_id = state.auth_adapter.read_tn_id(&id_tag.0).await.map_err(|_| Error::PermissionDenied)?;
+			info!("tnId: {:?}", &tn_id);
+			Ok(TnId(tn_id))
 		} else {
 			Err(Error::PermissionDenied)
 		}

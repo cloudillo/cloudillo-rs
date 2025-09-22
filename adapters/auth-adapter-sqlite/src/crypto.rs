@@ -13,20 +13,32 @@ use cloudillo::{
 	core::worker,
 };
 
-pub fn generate_password_hash(password: &str) -> ClResult<Box<str>> {
-	let hash = bcrypt::hash(password, BCRYPT_COST).map_err(|_| Error::PermissionDenied)?;
+fn generate_password_hash_sync(password: Box<str>) -> ClResult<Box<str>> {
+	let hash = bcrypt::hash(password.as_ref(), BCRYPT_COST).map_err(|_| Error::PermissionDenied)?;
 
 	Ok(hash.into())
 }
 
-pub fn check_password(password: Box<str>, password_hash: Box<str>) -> ClResult<()> {
-	let res = bcrypt::verify(&*password, &password_hash).map_err(|_| Error::PermissionDenied)?;
+pub async fn generate_password_hash(worker: &worker::WorkerPool, password: Box<str>) -> ClResult<Box<str>> {
+	worker.run_immed(move || {
+		generate_password_hash_sync(password)
+	}).await.map_err(|_| Error::PermissionDenied)
+}
+
+fn check_password_sync(password: Box<str>, password_hash: Box<str>) -> ClResult<()> {
+	let res = bcrypt::verify(password.as_ref(), &password_hash).map_err(|_| Error::PermissionDenied)?;
 	if (!res) { return Err(Error::PermissionDenied); }
 
 	Ok(())
 }
 
-pub fn generate_access_token(tn_id: u32, roles: Option<&str>) -> ClResult<Box<str>> {
+pub async fn check_password(worker: &worker::WorkerPool, password: Box<str>, password_hash: Box<str>) -> ClResult<()> {
+	worker.run_immed(move || {
+		check_password_sync(password, password_hash)
+	}).await.map_err(|_| Error::PermissionDenied)
+}
+
+fn generate_access_token_sync(tn_id: u32, roles: Option<Box<str>>) -> ClResult<Box<str>> {
 	let expire = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH).map_err(|_| Error::PermissionDenied)?
 		.as_secs() + 3600 * TOKEN_EXPIRE;
@@ -36,7 +48,7 @@ pub fn generate_access_token(tn_id: u32, roles: Option<&str>) -> ClResult<Box<st
 		&auth_adapter::AuthToken::<&str> {
 			sub: tn_id,
 			exp: expire as u32,
-			r: roles,
+			r: roles.as_deref(),
 		},
 		&jsonwebtoken::EncodingKey::from_secret("FIXME secret".as_bytes()),
 	).map_err(|_| Error::PermissionDenied)?.into();
@@ -44,33 +56,15 @@ pub fn generate_access_token(tn_id: u32, roles: Option<&str>) -> ClResult<Box<st
 	Ok(token)
 }
 
-/*
-fn generate_key_sync() -> ClResult<(Box<str>, Box<str>)> {
-	// Create a new EC group for P-384
-	let group = EcGroup::from_curve_name(Nid::SECP384R1).map_err(|_| Error::PermissionDenied)?;
-
-	// Generate the keypair
-	let keypair = EcKey::generate(&group).map_err(|_| Error::PermissionDenied)?;
-	//for i in 0..1000 { EcKey::generate(&group)?; };
-
-	// Convert private key to PEM
-	let private_key_pem = keypair.private_key_to_pem().map_err(|_| Error::PermissionDenied)?;
-	let private_key: String = String::from_utf8(private_key_pem).map_err(|_| Error::PermissionDenied)?
-		.lines()
-		.map(|s| if s.starts_with(char::is_alphanumeric) { s.trim() } else { "" })
-		.collect();
-
-	// Convert public key to PEM
-	let public_key_pem = keypair.public_key_to_pem().map_err(|_| Error::PermissionDenied)?;
-	let public_key: String = String::from_utf8(public_key_pem).map_err(|_| Error::PermissionDenied)?
-		.lines()
-		.map(|s| if s.starts_with(char::is_alphanumeric) { s.trim() } else { "" })
-		.collect();
-
-	Ok((private_key.into(), public_key.into()))
+pub async fn generate_access_token(worker: &worker::WorkerPool, tn_id: u32, roles: Option<Box<str>>) -> ClResult<Box<str>> {
+	worker.run_immed(move || {
+		generate_access_token_sync(tn_id, roles)
+	}).await.map_err(|_| Error::PermissionDenied)
 }
-*/
 
+/// Generate a keypair (sync)
+///
+/// Must be run on a worker thread!
 fn generate_key_sync() -> ClResult<auth_adapter::KeyPair> {
 	let private = SecretKey::random(&mut OsRng);
 	let public = private.public_key();
@@ -88,9 +82,29 @@ fn generate_key_sync() -> ClResult<auth_adapter::KeyPair> {
 	Ok(auth_adapter::KeyPair { private_key, public_key })
 }
 
+/// Generate a keypair
 pub async fn generate_key(worker: &worker::WorkerPool) -> ClResult<auth_adapter::KeyPair> {
 	worker.run(move || {
 		generate_key_sync()
+	}).await.map_err(|_| Error::PermissionDenied)
+}
+
+fn generate_action_token_sync(action_data: auth_adapter::ActionToken, private_key: Box<str>) -> ClResult<Box<str>> {
+	let private_key_pem = format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----", private_key);
+	let token = jsonwebtoken::encode(
+		&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES384),
+		&action_data,
+		&jsonwebtoken::EncodingKey::from_ec_pem(&private_key_pem.as_bytes())
+			.inspect_err(|err| error!("from_ec_pem err: {}", err))
+			.map_err(|_| Error::PermissionDenied)?,
+	).inspect_err(|err| error!("encode err: {}", err)).map_err(|_| Error::PermissionDenied)?.into();
+
+	Ok(token)
+}
+
+pub async fn generate_action_token(worker: &worker::WorkerPool, action_data: auth_adapter::ActionToken, private_key: Box<str>) -> ClResult<Box<str>> {
+	worker.run_immed(move || {
+		generate_action_token_sync(action_data, private_key)
 	}).await.map_err(|_| Error::PermissionDenied)
 }
 

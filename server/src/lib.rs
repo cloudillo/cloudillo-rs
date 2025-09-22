@@ -28,7 +28,7 @@ pub mod types;
 pub mod routes;
 
 use crate::prelude::*;
-use core::{acme, webserver, worker};
+use core::{acme, request, webserver, worker};
 
 use auth_adapter::AuthAdapter;
 use meta_adapter::MetaAdapter;
@@ -43,6 +43,7 @@ pub enum ServerMode {
 #[derive(Debug)]
 pub struct AppState {
 	pub worker: Arc<worker::WorkerPool>,
+	pub request: request::Request,
 	pub acme_challenge_map: RwLock<HashMap<Box<str>, Box<str>>>,
 	pub certs: RwLock<HashMap<Box<str>, Arc<CertifiedKey>>>,
 	pub opts: BuilderOpts,
@@ -127,6 +128,7 @@ impl Builder {
 	pub async fn run(self) -> ClResult<()> {
 		let state: App = Arc::new(AppState {
 			worker: self.worker.expect("FATAL: No worker pool defined"),
+			request: request::Request::new(),
 			acme_challenge_map: RwLock::new(HashMap::new()),
 			certs: RwLock::new(HashMap::new()),
 			opts: self.opts,
@@ -184,7 +186,7 @@ async fn bootstrap(state: Arc<AppState>, opts: &BuilderOpts) -> ClResult<()> {
 
 		if let Err(Error::NotFound) = id_tag {
 			info!("======================================\nBootstrapping...\n======================================");
-			let base_password = &opts.base_password.as_ref().expect("FATAL: No base password");
+			let base_password = opts.base_password.clone().expect("FATAL: No base password");
 
 			info!("Creating tenant {}", base_id_tag);
 			let tn_id = auth.create_tenant(base_id_tag, None).await?;

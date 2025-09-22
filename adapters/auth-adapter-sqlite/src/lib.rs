@@ -3,13 +3,14 @@
 use async_trait::async_trait;
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
 use std::{fmt::Debug, sync::Arc, path::Path};
-use sqlx::{sqlite::{self, SqlitePool, SqliteRow}, Row, FromRow};
+use sqlx::{sqlite::{self, SqlitePool, SqliteRow}, Row};
 
 use cloudillo::{
 	prelude::*,
 	auth_adapter,
+	meta_adapter,
 	core::route_auth,
-	types::{TnId, Timestamp},
+	types::{TnId, Timestamp, TimestampExt},
 	core::worker::WorkerPool
 };
 
@@ -121,16 +122,6 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		).bind(tn_id).fetch_one(&self.db).await.inspect_err(inspect);
 
 		map_res(res, |row| row.try_get("id_tag"))
-		/*
-		match res {
-			Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
-			Err(err) => {
-				println!("DbError: {:#?}", err);
-				Err(Error::DbError)
-			},
-			Ok(row) => Ok(row.try_get("id_tag").or(Err(Error::DbError))?)
-		}
-		*/
 	}
 
 	async fn read_tn_id(&self, id_tag: &str) -> ClResult<TnId> {
@@ -139,24 +130,12 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		).bind(id_tag).fetch_one(&self.db).await.inspect_err(inspect);
 
 		map_res(res, |row| row.try_get("tn_id"))
-		/*
-		match res {
-			Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
-			Err(err) => {
-				println!("DbError: {:#?}", err);
-				Err(Error::DbError)
-			},
-			Ok(row) => Ok(row.try_get("tn_id").or(Err(Error::DbError))?)
-		}
-		*/
 	}
 
 	async fn read_tenant(&self, id_tag: &str) -> ClResult<auth_adapter::AuthProfile> {
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, roles FROM tenants WHERE id_tag = ?1"
 		).bind(id_tag).fetch_one(&self.db).await;
-
-		info!("KEYS: {:#?}", self.list_profile_keys(1).await.unwrap_or(vec![]));
 
 		async_map_res(res, async |row| {
 			let tn_id: TnId = row.try_get("tn_id")?;
@@ -167,23 +146,6 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 				keys: self.list_profile_keys(tn_id).await.unwrap_or(vec![]),
 			})
 		}).await
-		/*
-		match res {
-			Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
-			Err(err) => {
-				println!("DbError: {:#?}", err);
-				Err(Error::DbError)
-			},
-			Ok(row) => {
-				let roles: Option<Box<str>> = row.try_get("roles").or(Err(Error::DbError))?;
-				Ok(auth_adapter::AuthProfile {
-					id_tag: row.try_get("id_tag").or(Err(Error::DbError))?,
-					roles: roles.map(|s| parse_str_list(&s)),
-					keys: Box::from([])
-				})
-			}
-		}
-		*/
 	}
 
 	async fn create_tenant_registration(&self, email: &str) -> ClResult<()> {
@@ -229,14 +191,8 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 				let password_hash: Box<str> = row.try_get("password").or(Err(Error::DbError))?;
 				let roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
 
-				info!("check_auth_password {} {} {}", &id_tag, password, password_hash);
-				self.worker.run_immed(move || {
-					crypto::check_password(password, password_hash)
-				}).await?;
-
-				info!("check_auth_password {}", &id_tag);
-				let token = crypto::generate_access_token(tn_id, roles.as_deref())?;
-				info!("check_auth_password {}", &token);
+				crypto::check_password(&self.worker, password, password_hash).await?;
+				let token = crypto::generate_access_token(&self.worker, tn_id, roles.map(|s| s.into())).await?;
 
 				Ok(auth_adapter::AuthLogin {
 					tn_id: row.try_get("tn_id").or(Err(Error::DbError))?,
@@ -248,8 +204,8 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		}
 	}
 
-	async fn update_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<()> {
-		let password_hash = crypto::generate_password_hash(password)?;
+	async fn update_tenant_password(&self, id_tag: &str, password: Box<str>) -> ClResult<()> {
+		let password_hash = crypto::generate_password_hash(&self.worker, password).await?;
 		let res = sqlx::query(
 			"UPDATE tenants SET password=?2 WHERE id_tag = ?1"
 		).bind(id_tag).bind(password_hash).execute(&self.db).await;
@@ -286,23 +242,6 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			key: row.try_get("key")?,
 			expires_at: row.try_get("expires_at")?,
 		}))
-		/*
-		match res {
-			Ok(row) => Ok(auth_adapter::CertData {
-				tn_id: row.try_get("tn_id").or(Err(Error::DbError))?,
-				id_tag: row.try_get("id_tag").or(Err(Error::DbError))?,
-				domain: row.try_get("domain").or(Err(Error::DbError))?,
-				cert: row.try_get("cert").or(Err(Error::DbError))?,
-				key: row.try_get("key").or(Err(Error::DbError))?,
-				expires_at: row.try_get("expires_at").or(Err(Error::DbError))?,
-			}),
-			Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
-			Err(err) => {
-				println!("DbError: {:#?}", err);
-				Err(Error::DbError)
-			}
-		}
-		*/
 	}
 
 	async fn read_cert_by_id_tag(&self, id_tag: &str) -> ClResult<auth_adapter::CertData> {
@@ -318,23 +257,6 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			key: row.try_get("key")?,
 			expires_at: row.try_get("expires_at")?,
 		}))
-		/*
-		match res {
-			Ok(row) => Ok(auth_adapter::CertData {
-				tn_id: row.try_get("tn_id").or(Err(Error::DbError))?,
-				id_tag: row.try_get("id_tag").or(Err(Error::DbError))?,
-				domain: row.try_get("domain").or(Err(Error::DbError))?,
-				cert: row.try_get("cert").or(Err(Error::DbError))?,
-				key: row.try_get("key").or(Err(Error::DbError))?,
-				expires_at: row.try_get("expires_at").or(Err(Error::DbError))?,
-			}),
-			Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
-			Err(err) => {
-				println!("DbError: {:#?}", err);
-				Err(Error::DbError)
-			}
-		}
-		*/
 	}
 
 	async fn read_cert_by_domain(&self, domain: &str) -> ClResult<auth_adapter::CertData> {
@@ -351,24 +273,6 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			key: row.try_get("key")?,
 			expires_at: row.try_get("expires_at")?,
 		}))
-
-		/*
-		match res {
-			Ok(row) => Ok(auth_adapter::CertData {
-				tn_id: row.try_get("tn_id").or(Err(Error::DbError))?,
-				id_tag: row.try_get("id_tag").or(Err(Error::DbError))?,
-				domain: row.try_get("domain").or(Err(Error::DbError))?,
-				cert: row.try_get("cert").or(Err(Error::DbError))?,
-				key: row.try_get("key").or(Err(Error::DbError))?,
-				expires_at: row.try_get("expires_at").or(Err(Error::DbError))?,
-			}),
-			Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
-			Err(err) => {
-				println!("DbError: {:#?}", err);
-				Err(Error::DbError)
-			}
-		}
-		*/
 	}
 
 	// Key management
@@ -407,6 +311,36 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		// TODO
 
 		Ok(key.public_key)
+	}
+
+	async fn create_action_token(&self, tn_id: TnId, action: meta_adapter::NewAction) -> ClResult<Box<str>> {
+		let res = sqlx::query("SELECT t.id_tag, k.key_id, k.private_key FROM tenants t
+			JOIN keys k ON t.tn_id = k.tn_id
+			WHERE t.tn_id=? ORDER BY k.key_id DESC LIMIT 1")
+			.bind(tn_id).fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let id_tag: &str = res.try_get("id_tag").or(Err(Error::DbError))?;
+		let key_id: Box<str> = res.try_get("key_id").or(Err(Error::DbError))?;
+		let private_key: Box<str> = res.try_get("private_key").or(Err(Error::DbError))?;
+
+		let mut typ = action.typ.to_string();
+		if let Some(sub_typ) = &action.sub_typ {
+			typ = typ + ":" + &sub_typ;
+		}
+		let action_data = auth_adapter::ActionToken {
+			t: typ.into(),
+			iss: id_tag.into(),
+			k: key_id,
+			p: action.parent_id,
+			aud: action.audience_tag,
+			c: action.content,
+			a: action.attachments,
+			sub: action.subject,
+			exp: action.expires_at,
+			iat: Timestamp::now(),
+		};
+		let token = crypto::generate_action_token(&self.worker, action_data, private_key).await?;
+
+		Ok(token)
 	}
 
 	async fn verify_access_token(&self, token: &str) -> ClResult<()> {todo!()}

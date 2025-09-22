@@ -15,7 +15,7 @@ use crate::core::route_auth::{require_auth, optional_auth, main_middleware};
 fn init_api_service(app: App) -> Router {
 	info!("INIT APP {:?}", std::any::TypeId::of::<App>());
 	let protected_router = Router::new()
-		.route("/api/key", post(action::handler::create_key))
+		//.route("/api/key", post(action::handler::create_key))
 		.route("/api/action", get(action::handler::list_actions))
 		.route("/api/action", post(action::handler::post_action))
 		.route("/api/file", post(file::handler::post_file))
@@ -24,6 +24,8 @@ fn init_api_service(app: App) -> Router {
 
 	let public_router = Router::new()
 		.route("/api/me", get(profile::handler::get_tenant_profile))
+		.route("/api/me/keys", get(profile::handler::get_tenant_profile))
+		.route("/api/me/full", get(profile::handler::get_tenant_profile))
 		.route("/api/login", post(auth::handler::post_login))
 		.route("/api/auth/password", post(auth::handler::post_password))
 		.route_layer(middleware::from_fn_with_state(app.clone(), optional_auth));

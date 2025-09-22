@@ -1,8 +1,12 @@
 #![allow(unused)]
 
-use std::{fmt::Debug, sync::Arc, path::Path, collections::HashMap};
+use std::{borrow::Cow, fmt::Debug, sync::Arc, path::Path, collections::HashMap};
 use async_trait::async_trait;
-use sqlx::{sqlite, sqlite::SqlitePool, Row};
+use sqlx::{
+	sqlite::{self, SqlitePool, SqliteRow},
+	query_builder::Separated,
+	Row
+};
 
 use cloudillo::{
 	prelude::*,
@@ -10,6 +14,75 @@ use cloudillo::{
 	meta_adapter,
 	types::TnId,
 };
+
+// Helper functions
+//******************
+/*
+fn push_in<'a, Sep>(query: &'a mut Separated<'a, 'a, sqlx::Sqlite, Sep>, values: &[&'a str])
+where
+	Sep: std::fmt::Display
+{
+*/
+//fn push_in<'a>(query: &'a mut Separated<'a, 'a, sqlx::Sqlite, impl std::fmt::Display>, values: &[&'a str]) {
+//fn push_in<'a>(mut query: Separated<'a, 'a, sqlx::Sqlite, &'a str>, values: &'a [Cow<'a, str>])
+//	-> Separated<'a, 'a, sqlx::Sqlite, &'a str> {
+fn push_in<'a>(mut query: sqlx::QueryBuilder<'a, sqlx::Sqlite>, values: &'a [Box<str>])
+	-> sqlx::QueryBuilder<'a, sqlx::Sqlite> {
+	query.push("(");
+	for (i, value) in values.iter().enumerate() {
+		if i > 0 {
+			query.push(", ");
+		}
+		query.push_bind(value.clone());
+	}
+	query.push(")");
+	query
+}
+
+fn parse_str_list(s: &str) -> Box<[Box<str>]> {
+	s.split(',').map(|s| s.trim().to_owned().into_boxed_str()).collect::<Vec<_>>().into_boxed_slice()
+}
+
+fn inspect(err: &sqlx::Error) {
+	warn!("DB: {:#?}", err);
+}
+
+pub fn map_res<T, F>(row: Result<SqliteRow, sqlx::Error>, f: F) -> ClResult<T>
+where
+	F: FnOnce(SqliteRow) -> Result<T, sqlx::Error>
+{
+	match row {
+		Ok(row) => f(row).inspect_err(inspect).map_err(|_| Error::DbError),
+		Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
+		Err(err) => {
+			inspect(&err);
+			Err(Error::DbError)
+		}
+	}
+}
+
+pub async fn async_map_res<T, F>(row: Result<SqliteRow, sqlx::Error>, f: F) -> ClResult<T>
+where
+	F: AsyncFnOnce(SqliteRow) -> Result<T, sqlx::Error>
+{
+	match row {
+		Ok(row) => f(row).await.inspect_err(inspect).map_err(|_| Error::DbError),
+		Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
+		Err(err) => {
+			inspect(&err);
+			Err(Error::DbError)
+		}
+	}
+}
+
+pub fn collect_res<T>(mut iter: impl Iterator<Item = Result<T, sqlx::Error>> + Unpin) -> ClResult<Vec<T>>
+{
+    let mut items = Vec::new();
+    while let Some(item) = iter.next() {
+        items.push(item.inspect_err(inspect).map_err(|_| Error::DbError)?);
+    }
+    Ok(items)
+}
 
 #[derive(Debug)]
 pub struct MetaAdapterSqlite {
@@ -38,16 +111,10 @@ impl MetaAdapterSqlite {
 	}
 }
 
-fn parse_str_list(s: &str) -> Box<[Box<str>]> {
-	s.split(',').map(|s| s.trim().to_owned().into_boxed_str()).collect::<Vec<_>>().into_boxed_slice()
-}
-
-fn inspect(err: &sqlx::Error) {
-	println!("DbError: {:#?}", err);
-}
-
 #[async_trait]
 impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
+	// Tenant management
+	//*******************
 	async fn read_tenant(&self, tn_id: TnId) -> ClResult<meta_adapter::Tenant> {
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, name, type, profile_pic, cover_pic, created_at, x FROM tenants WHERE tn_id = ?1"
@@ -115,6 +182,149 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	//async fn process_profile_refresh<'a, F>(&self, callback: F)
 	//	where F: FnOnce(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send {
 	async fn process_profile_refresh<'a>(&self, callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>) {
+	}
+
+	// Action management
+	//*******************
+	async fn list_actions(&self, tn_id: u32, opts: &meta_adapter::ListActionsOptions) -> ClResult<Vec<meta_adapter::ActionView>> {
+		let mut query = sqlx::QueryBuilder::new(
+			"SELECT a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
+			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic,
+			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic,
+			a.subject, a.content, a.created_at, a.expires_at,
+			own.content as own_reaction,
+			a.attachments, a.status, a.reactions, a.comments, a.comments_read
+			FROM actions a
+			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
+			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
+			LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.parent_id=a.action_id AND own.issuer_tag=");
+		query.push_bind("")
+			.push("AND own.type='REACT' AND coalesce(own.status, 'A') NOT IN ('D') WHERE a.tn_id=")
+			.push_bind(tn_id);
+
+		if let Some(status) = &opts.status {
+			query.push(" AND coalesce(a.status, 'A') IN ");
+			query = push_in(query, &status);
+		} else {
+			query.push(" AND coalesce(a.status, 'A') NOT IN ('D')");
+		}
+		if let Some(typ) = &opts.typ {
+			query.push(" AND a.type IN ");
+			query = push_in(query, typ.as_slice());
+		}
+		if let Some(issuer) = &opts.issuer {
+			query.push(" AND a.issuer_tag=").push_bind(issuer);
+		}
+		if let Some(audience) = &opts.audience {
+			query.push(" AND a.audience=").push_bind(audience);
+		}
+		if let Some(involved) = &opts.involved {
+			query.push(" AND a.audience=").push_bind(involved);
+		}
+		if let Some(parent_id) = &opts.parent_id {
+			query.push(" AND a.parent_id=").push_bind(parent_id);
+		}
+		if let Some(root_id) = &opts.root_id {
+			query.push(" AND a.root_id=").push_bind(root_id);
+		}
+		if let Some(subject) = &opts.subject {
+			query.push(" AND a.subject=").push_bind(subject);
+		}
+		if let Some(created_after) = &opts.created_after {
+			query.push(" AND a.created_at>").push_bind(created_after);
+		}
+		query.push(" ORDER BY a.created_at DESC LIMIT 100");
+		info!("SQL: {}", query.sql());
+
+		let res = query.build().fetch_all(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+
+		collect_res(res.iter().map(|row| {
+			let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag")?;
+			let audienc_tag = row.try_get::<Option<Box<str>>, _>("audience")?;
+			let attachments = row.try_get::<Option<Box<str>>, _>("attachments")?;
+			// stat
+			let stat = Some(Box::from("stat"));
+			Ok(meta_adapter::ActionView {
+				action_id: row.try_get::<Box<str>, _>("action_id")?,
+				typ: row.try_get::<Box<str>, _>("type")?,
+				sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type")?,
+				parent_id: row.try_get::<Option<Box<str>>, _>("parent_id")?,
+				root_id: row.try_get::<Option<Box<str>>, _>("root_id")?,
+				issuer: meta_adapter::ProfileInfo {
+					id_tag: issuer_tag,
+					name: row.try_get::<Box<str>, _>("issuer_name")?,
+					typ: match row.try_get::<Option<&str>, _>("type")? {
+						Some("C") => meta_adapter::ProfileType::Community,
+						_ => meta_adapter::ProfileType::Person,
+					},
+					profile_pic: row.try_get::<Option<Box<str>>, _>("issuer_profile_pic")?,
+				},
+				audience: if let Some(audienc_tag) = audienc_tag {
+					Some(meta_adapter::ProfileInfo {
+						id_tag: audienc_tag,
+						name: row.try_get::<Box<str>, _>("audience_name")?,
+						typ: match row.try_get::<Option<&str>, _>("type")? {
+							Some("C") => meta_adapter::ProfileType::Community,
+							_ => meta_adapter::ProfileType::Person,
+						},
+						profile_pic: row.try_get::<Option<Box<str>>, _>("audience_profile_pic")?,
+					})
+				} else { None },
+				subject: row.try_get("subject")?,
+				content: row.try_get("content")?,
+				attachments: attachments.map(|s| parse_str_list(&s)),
+				created_at: row.try_get("created_at")?,
+				expires_at: row.try_get("expires_at")?,
+				status: row.try_get("status")?,
+				stat,
+				//own_reaction: row.try_get("own_reaction")?,
+			})
+		}))
+	}
+
+	async fn list_action_tokens(&self, tn_id: u32, opts: &meta_adapter::ListActionsOptions) -> ClResult<Box<[Box<str>]>> {
+		todo!("zizi");
+	}
+
+	async fn create_action(&self, tn_id: u32, action: &meta_adapter::Action, key: Option<&str>) -> ClResult<()> {
+		let mut tx = self.db.begin().await.map_err(|_| Error::DbError)?;
+		let mut query = sqlx::QueryBuilder::new(
+			"INSERT OR IGNORE INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, expires_at, attachments) VALUES(")
+			.push_bind(tn_id).push(", ")
+			.push_bind(&action.action_id).push(", ")
+			.push_bind(key).push(", ")
+			.push_bind(&action.typ).push(", ")
+			.push_bind(&action.sub_typ).push(", ")
+			.push_bind(&action.parent_id).push(", ")
+			.push_bind(&action.root_id).push(", ")
+			.push_bind(&action.issuer_tag).push(", ")
+			.push_bind(&action.audience_tag).push(", ")
+			.push_bind(&action.subject).push(", ")
+			.push_bind(&action.content).push(", ")
+			.push_bind(action.created_at).push(", ")
+			.push_bind(action.expires_at).push(", ")
+			.push_bind(action.attachments.as_ref().map(|s| s.join(",")))
+			.push(")")
+			.build().execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+
+		let mut add_reactions = if action.content == None { 0 } else { 1 };
+		if let Some(key) = &key {
+			info!("update with key: {}", key);
+			let res = sqlx::query("UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND action_id!=? AND coalesce(status, '')!='D' RETURNING content")
+				.bind(tn_id).bind(key).bind(&action.action_id)
+				.fetch_all(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			if res.len() > 0 && res[0].try_get::<Option<&str>, _>("content").map_err(|_| Error::DbError)? != None {
+				add_reactions -= 1;
+			}
+		}
+		if action.typ.as_ref() == "REACT" && action.content != None {
+			info!("update with reaction: {}", action.content.as_ref().unwrap());
+			sqlx::query("UPDATE actions SET reactions=coalesce(reactions, 0)+? WHERE tn_id=? AND action_id IN (?, ?)")
+				.bind(add_reactions).bind(tn_id).bind(&action.parent_id).bind(&action.root_id)
+				.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		}
+		tx.commit().await;
+		Ok(())
 	}
 }
 
@@ -273,7 +483,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sub_type text,
 		parent_id text,
 		root_id text,
-		id_tag text NOT NULL,
+		issuer_tag text NOT NULL,
 		status char(1),				-- 'A' - Active, 'P' - Processing, 'D' - Deleted
 		audience text,
 		subject text,

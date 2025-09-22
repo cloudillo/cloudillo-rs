@@ -4,8 +4,8 @@ use std::{sync::Arc, env, path::PathBuf};
 use tokio::fs;
 
 use cloudillo::{auth_adapter, meta_adapter, core::worker};
-use auth_adapter_sqlite::AuthAdapterSqlite;
-use meta_adapter_sqlite::MetaAdapterSqlite;
+use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
+use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 
 pub struct Config {
 	pub mode: cloudillo::ServerMode,

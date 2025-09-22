@@ -1,37 +1,46 @@
 use async_trait::async_trait;
-use std::{fmt::Debug, num::NonZero, collections::HashMap};
+use std::{fmt::Debug, collections::HashMap};
 use serde::{Serialize, Deserialize};
+use serde_with::skip_serializing_none;
 
-use crate::prelude::*;
-use crate::AppState;
+use crate::{
+	prelude::*,
+	AppState,
+	types::{Timestamp, TnId},
+};
 
-#[derive(Serialize, Deserialize)]
+// Tenants, profiles
+//*******************
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ProfileType {
+	#[serde(rename = "person")]
 	Person,
+	#[serde(rename = "community")]
 	Community,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 pub enum ProfileStatus {
 	Active,
 	Blocked,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 pub enum ProfileConnectionStatus {
 	Disconnected,
 	RequestPending,
 	Connected,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub enum ProfilePerm {
 	Moderated,
 	Write,
 	Admin
 }
 
-#[derive(Serialize)]
+#[skip_serializing_none]
+#[derive(Debug, Serialize)]
 pub struct Tenant {
 	#[serde(rename = "id")]
 	pub tn_id: u32,
@@ -49,7 +58,7 @@ pub struct Tenant {
 	pub x: HashMap<Box<str>, Box<str>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct UpdateTenantData {
 	#[serde(rename = "id")]
 	tn_id: u32,
@@ -60,7 +69,7 @@ pub struct UpdateTenantData {
 	typ: ProfileType,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Profile {
 	#[serde(rename = "id")]
 	pub tn_id: u32,
@@ -77,45 +86,178 @@ pub struct Profile {
 	pub created_at: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ListProfileOptions {
 	#[serde(rename = "type")]
-	typ: Option<ProfileType>,
-	status: Option<Box<[ProfileStatus]>>,
-	connected: Option<ProfileConnectionStatus>,
-	following: Option<bool>,
-	q: Option<Box<str>>,
-	id_tag: Option<Box<str>>,
+	pub typ: Option<ProfileType>,
+	pub status: Option<Box<[ProfileStatus]>>,
+	pub connected: Option<ProfileConnectionStatus>,
+	pub following: Option<bool>,
+	pub q: Option<Box<str>>,
+	pub id_tag: Option<Box<str>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct UpdateProfileData {
-	status: Option<ProfileStatus>,
-	perm: Option<ProfilePerm>,
-	synced: Option<bool>,
-	following: Option<bool>,
-	connected: Option<ProfileConnectionStatus>,
+	pub status: Option<ProfileStatus>,
+	pub perm: Option<ProfilePerm>,
+	pub synced: Option<bool>,
+	pub following: Option<bool>,
+	pub connected: Option<ProfileConnectionStatus>,
+}
+
+// Actions
+//*********
+fn deserialize_split<'de, D>(deserializer: D) -> Result<Option<Vec<Box<str>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+	let s = <Option<&str>>::deserialize(deserializer)?;
+	match s {
+		Some(s) => Ok(Some(s.split(',').map(|v| v.trim().into()).collect())),
+		_ => Ok(None)
+	}
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListActionsOptions {
+	#[serde(default, rename="type", deserialize_with = "deserialize_split")]
+	pub typ: Option<Vec<Box<str>>>,
+	#[serde(default, deserialize_with = "deserialize_split")]
+	pub status: Option<Vec<Box<str>>>,
+	pub tag: Option<Box<str>>,
+	pub issuer: Option<Box<str>>,
+	pub audience: Option<Box<str>>,
+	pub involved: Option<Box<str>>,
+	#[serde(rename = "actionId")]
+	pub action_id: Option<Box<str>>,
+	#[serde(rename = "parentId")]
+	pub parent_id: Option<Box<str>>,
+	#[serde(rename = "rootId")]
+	pub root_id: Option<Box<str>>,
+	pub subject: Option<Box<str>>,
+	#[serde(rename = "createdAfter")]
+	pub created_after: Option<Timestamp>,
+	pub _limit: Option<u32>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileInfo {
+	#[serde(rename = "idTag")]
+	pub id_tag: Box<str>,
+	pub name: Box<str>,
+	#[serde(rename = "type")]
+	pub typ: ProfileType,
+	#[serde(rename = "profilePic")]
+	pub profile_pic: Option<Box<str>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewAction {
+	#[serde(rename = "type")]
+	pub typ: Box<str>,
+	#[serde(rename = "subType")]
+	pub sub_typ: Option<Box<str>>,
+	#[serde(rename = "parentId")]
+	pub parent_id: Option<Box<str>>,
+	#[serde(rename = "rootId")]
+	pub root_id: Option<Box<str>>,
+	#[serde(rename = "audienceTag")]
+	pub audience_tag: Option<Box<str>>,
+	pub content: Option<Box<str>>,
+	pub attachments: Option<Vec<Box<str>>>,
+	pub subject: Option<Box<str>>,
+	#[serde(rename = "expiresAt")]
+	pub expires_at: Option<u32>,
+}
+
+//#[derive(Serialize)]
+pub struct Action {
+//	#[serde(rename = "actionId")]
+	pub action_id: Box<str>,
+//	#[serde(rename = "type")]
+	pub typ: Box<str>,
+//	#[serde(rename = "subType")]
+	pub sub_typ: Option<Box<str>>,
+//	#[serde(rename = "issuerTag")]
+	pub issuer_tag: Box<str>,
+//	#[serde(rename = "parentId")]
+	pub parent_id: Option<Box<str>>,
+//	#[serde(rename = "rootId")]
+	pub root_id: Option<Box<str>>,
+	pub audience_tag: Option<Box<str>>,
+	pub content: Option<Box<str>>,
+	pub attachments: Option<Vec<Box<str>>>,
+	pub subject: Option<Box<str>>,
+	pub created_at: Timestamp,
+	pub expires_at: Option<u32>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize)]
+pub struct ActionView {
+	#[serde(rename = "actionId")]
+	pub action_id: Box<str>,
+	#[serde(rename = "type")]
+	pub typ: Box<str>,
+	#[serde(rename = "subType")]
+	pub sub_typ: Option<Box<str>>,
+	#[serde(rename = "parentId")]
+	pub parent_id: Option<Box<str>>,
+	#[serde(rename = "rootId")]
+	pub root_id: Option<Box<str>>,
+	#[serde(rename = "issuer")]
+	pub issuer: ProfileInfo,
+	#[serde(rename = "audience")]
+	pub audience: Option<ProfileInfo>,
+	#[serde(rename = "content")]
+	pub content: Option<Box<str>>,
+	#[serde(rename = "attachments")]
+	pub attachments: Option<Box<[Box<str>]>>,
+	#[serde(rename = "subject")]
+	pub subject: Option<Box<str>>,
+	#[serde(rename = "createdAt")]
+	pub created_at: u32,
+	#[serde(rename = "expiresAt")]
+	pub expires_at: Option<u32>,
+	#[serde(rename = "status")]
+	pub status: Option<Box<str>>,
+	#[serde(rename = "stat")]
+	pub stat: Option<Box<str>>,
 }
 
 #[async_trait]
 pub trait MetaAdapter: Debug + Send + Sync {
-	/// # Tenants
+	// Tenant management
+	//*******************
+
+	/// Reads a tenant profile
 	async fn read_tenant(&self, tn_id: u32) -> ClResult<Tenant>;
+
+	/// Creates a new tenant
 	async fn create_tenant(&self, tn_id: u32, id_tag: &str) -> ClResult<u32>;
+
+	/// Updates a tenant
 	async fn update_tenant(&self, tn_id: u32, tenant: &UpdateTenantData) -> ClResult<()>;
+
+	/// Deletes a tenant
 	async fn delete_tenant(&self, tn_id: u32) -> ClResult<()>;
 
-	//async fn list_profiles(&self, tn_id: u32, opts: &ListProfileOptions) -> ClResult<dyn Iterator<Item=Box<Profile>>>;
+	/// Lists all profiles matching a set of options
 	async fn list_profiles(&self, tn_id: u32, opts: &ListProfileOptions) -> ClResult<Vec<Profile>>;
 
-	/// Reads profile by id tag
-	/// Returns (etag, Profile) tuple
+	/// Reads a profile
+	///
+	/// Returns an `(etag, Profile)` tuple.
 	async fn read_profile(&self, tn_id: u32, id_tag: &str) -> ClResult<(Box<str>, Profile)>;
 	async fn create_profile(&self, profile: &Profile, etag: &str) -> ClResult<()>;
 	async fn update_profile(&self, id_tag: &str, profile: &UpdateProfileData) -> ClResult<()>;
 
-	/// Reads profile public key
-	/// Returns (public key, expiration) tuple
+	/// Reads the public key of a profile
+	///
+	/// Returns a `(public key, expiration)` tuple.
 	async fn read_profile_public_key(&self, id_tag: &str, key_id: &str) -> ClResult<(Box<str>, u32)>;
 	async fn add_profile_public_key(&self, id_tag: &str, key_id: &str, public_key: &str) -> ClResult<()>;
 	/// Process profile refresh
@@ -124,6 +266,29 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	//async fn process_profile_refresh<'a, F>(&self, callback: F)
 	//	where F: FnOnce(u32, &'a str, Option<&'a str>) -> ClResult<()> + Send;
 	async fn process_profile_refresh<'a>(&self, callback: Box<dyn Fn(u32, &'a str, Option<&'a str>) -> ClResult<()> + Send>);
+
+	// Action management
+	//*******************
+	async fn list_actions(&self, tn_id: u32, opts: &ListActionsOptions) -> ClResult<Vec<ActionView>>;
+	async fn list_action_tokens(&self, tn_id: u32, opts: &ListActionsOptions) -> ClResult<Box<[Box<str>]>>;
+
+	async fn create_action(&self, tn_id: u32, action: &Action, key: Option<&str>) -> ClResult<()>;
+
+	/*
+	getActionRootId: (tnId: number, actionId: string) => Promise<string>
+	getActionData: (tnId: number, actionId: string) => Promise<{ subject?: string, reactions?: number, comments?: number } | undefined>
+	getActionByKey: (tnId: number, actionKey: string) => Promise<Action | undefined>
+	getActionToken: (tnId: number, actionId: string) => Promise<string | undefined>
+	createAction: (tnId: number, action: Action, key?: string) => Promise<void>
+	updateActionData: (tnId: number, actionId: string, opts: UpdateActionDataOptions) => Promise<void>
+	// Inbound actions
+	createInboundAction: (tnId: number, actionId: string, token: string, rel?: string) => Promise<void>
+	processPendingInboundActions: (callback: (tnId: number, actionId: string, token: string) => Promise<boolean>) => Promise<number>
+	updateInboundAction: (tnId: number, actionId: string, opts: { status: 'R' | 'P' | 'D' | null }) => Promise<void>
+	// Outbound actions
+	createOutboundAction: (tnId: number, actionId: string, token: string, opts: CreateOutboundActionOptions) => Promise<void>
+	processPendingOutboundActions: (callback: (tnId: number, actionId: string, type: string, token: string, recipientTag: string) => Promise<boolean>) => Promise<number>
+	*/
 }
 
 // vim: ts=4

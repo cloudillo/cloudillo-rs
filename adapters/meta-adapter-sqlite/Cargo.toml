@@ -1,5 +1,5 @@
 [package]
-name = "meta-adapter-sqlite"
+name = "cloudillo-meta-adapter-sqlite"
 version = "0.1.0"
 edition = "2021"
 

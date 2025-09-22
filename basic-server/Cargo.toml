@@ -1,10 +1,10 @@
 [package]
-name = "cloudillo-rs"
+name = "cloudillo-basic-server"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-auth-adapter-sqlite = { path = "../adapters/auth-adapter-sqlite" }
-meta-adapter-sqlite = { path = "../adapters/meta-adapter-sqlite" }
+cloudillo-auth-adapter-sqlite = { path = "../adapters/auth-adapter-sqlite" }
+cloudillo-meta-adapter-sqlite = { path = "../adapters/meta-adapter-sqlite" }
 cloudillo = { path = "../server" }
 tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }
