@@ -1,38 +1,21 @@
-use axum::{extract, response, body::{Body, to_bytes}, http::StatusCode, Json};
-use image::ImageReader;
+use axum::{extract::{self, Query, State}, response, body::{Body, to_bytes}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use serde_json;
-use std::any::Any;
-use std::io::Cursor;
-use std::rc::Rc;
-use std::sync::Arc;
+use serde_json::json;
+use std::{any::Any, path::Path, rc::Rc, sync::Arc};
 
 use crate::prelude::*;
-use crate::action::action;
-use crate::auth_adapter;
+use crate::blob_adapter;
+use crate::meta_adapter;
 use crate::App;
+use crate::types::Timestamp;
+use crate::file::{file, image, store};
+use crate::core::route_auth::TnId;
 
-fn resize_image<'a>(orig_buf: impl AsRef<[u8]> + 'a, resize: (u32, u32)) -> Result<Box<[u8]>, image::error::ImageError> {
-	let now = std::time::Instant::now();
-	let original = ImageReader::new(Cursor::new(&orig_buf.as_ref()))
-		.with_guessed_format()?
-		.decode()?;
-	debug!("decoded [{:.2}ms]", now.elapsed().as_millis());
-
-	let now = std::time::Instant::now();
-	let resized = original.resize(200, 200, image::imageops::FilterType::Lanczos3);
-	debug!("resized [{:.2}ms]", now.elapsed().as_millis());
-
-	let mut output = Cursor::new(Vec::new());
-	let now = std::time::Instant::now();
-
-	let encoder = image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut output, 4, 80).with_num_threads(Some(1));
-	resized.write_with_encoder(encoder)?;
-	debug!("written [{:.2}ms]", now.elapsed().as_millis());
-	Ok(output.into_inner().into())
-	//resized_buf
-		//Ok(_) => resized_buf = Some(output.into_inner().into()),
-		//Err(err) => resized_buf = None,
+pub async fn get_file_list(
+	State(app): State<App>,
+	body: Body,
+) -> ClResult<Json<Vec<meta_adapter::FileView>>> {
+	Ok(Json(vec![]))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -41,26 +24,53 @@ pub struct FileRes {
 	file_id: Box<str>
 }
 
+#[derive(Deserialize)]
+pub struct PostFileQuery {
+	created_at: Option<Timestamp>,
+	tags: Option<String>,
+}
+
 pub async fn post_file(
-	extract::State(state): extract::State<App>,
+	State(app): State<App>,
+	TnId(tn_id): TnId,
+	extract::Path((preset, file_name)): extract::Path<(Box<str>, Box<str>)>,
+	query: Query<PostFileQuery>,
 	body: Body,
-) -> Result<impl response::IntoResponse, StatusCode> {
-	let bytes = to_bytes(body, 50000000).await.map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
+) -> ClResult<impl response::IntoResponse> {
+	let bytes = to_bytes(body, 50000000).await?;
 	debug!("{} bytes", bytes.len());
+	let file_id_orig = store::create_blob_buf(&app, tn_id, &bytes, blob_adapter::CreateBlobOptions::default()).await?;
+	let orig_file = app.opts.tmp_dir.join::<&str>(&file_id_orig);
+	tokio::fs::write(&orig_file, &bytes).await?;
 
-	let task = state.worker.run(move || {
-		resize_image(bytes, (1000, 1000))
-	});
+	let f_id = app.meta_adapter.create_file(tn_id, meta_adapter::CreateFile {
+		preset: Some(preset.into()),
+		//content_type,
+		file_name: file_name.into(),
+		created_at: query.created_at,
+		//tags: query.tags,
+		..Default::default()
+	}).await?;
 
-	let res: Result<Box<[u8]>, image::error::ImageError> = task.await;
+	// Generate thumbnail
+	let resized_tn = image::resize_image(app.clone(), bytes.into(), (128, 128)).await?;
+	debug!("resized {:?}", resized_tn.len());
+	let variant_id_tn = store::create_blob_buf(&app, tn_id, &resized_tn, blob_adapter::CreateBlobOptions::default()).await?;
+	app.meta_adapter.create_file_variant(tn_id, f_id, variant_id_tn.clone().into(), meta_adapter::CreateFileVariant {
+		variant: "tn".into(),
+		format: "AVIF".into(),
+		resolution: (128, 128),
+		size: resized_tn.len() as u64,
+	}).await?;
 
-	match res {
-		Err(err) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-		Ok(resized_buf) => Ok(([
-			("Content-Type", "image/avif"),
-			//("Content-Length", Box::from(resized_buf.len().to_string().as_str()))
-		], resized_buf))
-	}
+	let task_sd = image::ImageResizerTask::new(tn_id, f_id, orig_file.clone(), "sd", (720, 720));
+	let task_hd = image::ImageResizerTask::new(tn_id, f_id, orig_file, "hd", (1280, 1280));
+
+	let task_sd_id = app.scheduler.add(task_sd, None, None).await?;
+	let task_hd_id = app.scheduler.add(task_hd, None, None).await?;
+	let task_id = app.scheduler.add(file::FileIdGeneratorTask::new(tn_id, f_id) , None, Some(vec![task_sd_id, task_hd_id])).await?;
+
+	Ok(Json(json!({"fId": f_id, "variantId": variant_id_tn })))
 }
 
 // vim: ts=4

@@ -1,0 +1,9 @@
+[package]
+name = "cloudillo-blob-adapter-fs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1.89"
+cloudillo = { path = "../../server" }
+tokio = { version = "1.47.1", features = ["fs"] }

@@ -22,16 +22,18 @@ pub mod auth;
 pub mod file;
 pub mod profile;
 pub mod auth_adapter;
+pub mod blob_adapter;
 pub mod meta_adapter;
 pub mod prelude;
 pub mod types;
 pub mod routes;
 
 use crate::prelude::*;
-use core::{acme, request, webserver, worker};
+use core::{acme, request, scheduler, webserver, worker};
 
 use auth_adapter::AuthAdapter;
 use meta_adapter::MetaAdapter;
+use blob_adapter::BlobAdapter;
 
 #[derive(Debug)]
 pub enum ServerMode {
@@ -40,8 +42,8 @@ pub enum ServerMode {
 	StreamProxy,
 }
 
-#[derive(Debug)]
 pub struct AppState {
+	pub scheduler: Arc<scheduler::Scheduler<App>>,
 	pub worker: Arc<worker::WorkerPool>,
 	pub request: request::Request,
 	pub acme_challenge_map: RwLock<HashMap<Box<str>, Box<str>>>,
@@ -50,6 +52,7 @@ pub struct AppState {
 
 	pub auth_adapter: Box<dyn AuthAdapter>,
 	pub meta_adapter: Box<dyn MetaAdapter>,
+	pub blob_adapter: Box<dyn BlobAdapter>,
 }
 
 pub type App = Arc<AppState>;
@@ -57,6 +60,7 @@ pub type App = Arc<AppState>;
 pub struct Adapters {
 	pub auth_adapter: Option<Box<dyn AuthAdapter>>,
 	pub meta_adapter: Option<Box<dyn MetaAdapter>>,
+	pub blob_adapter: Option<Box<dyn BlobAdapter>>,
 }
 
 #[derive(Debug)]
@@ -68,6 +72,7 @@ pub struct BuilderOpts {
 	base_app_domain: Option<Box<str>>,
 	base_password: Option<Box<str>>,
 	dist_dir: Box<Path>,
+	tmp_dir: Box<Path>,
 	acme_email: Option<Box<str>>,
 	local_ips: Box<[Box<str>]>,
 	identity_providers: Box<[Box<str>]>,
@@ -90,6 +95,7 @@ impl Builder {
 				base_app_domain: None,
 				base_password: None,
 				dist_dir: PathBuf::from("./dist").into(),
+				tmp_dir: PathBuf::from("./tmp").into(),
 				acme_email: None,
 				local_ips: Box::new([]),
 				identity_providers: Box::new([]),
@@ -98,6 +104,7 @@ impl Builder {
 			adapters: Adapters {
 				auth_adapter: None,
 				meta_adapter: None,
+				blob_adapter: None,
 			},
 		}
 	}
@@ -110,6 +117,7 @@ impl Builder {
 	pub fn base_app_domain(&mut self, base_app_domain: impl Into<Box<str>>) -> &mut Self { self.opts.base_app_domain = Some(base_app_domain.into()); self }
 	pub fn base_password(&mut self, base_password: impl Into<Box<str>>) -> &mut Self { self.opts.base_password = Some(base_password.into()); self }
 	pub fn dist_dir(&mut self, dist_dir: impl Into<Box<Path>>) -> &mut Self { self.opts.dist_dir = dist_dir.into(); self }
+	pub fn tmp_dir(&mut self, tmp_dir: impl Into<Box<Path>>) -> &mut Self { self.opts.tmp_dir = tmp_dir.into(); self }
 	pub fn acme_email(&mut self, acme_email: impl Into<Box<str>>) -> &mut Self { self.opts.acme_email = Some(acme_email.into()); self }
 	pub fn local_ips(&mut self, local_ips: impl IntoIterator<Item = impl Into<Box<str>>>) -> &mut Self {
 		self.opts.local_ips = local_ips.into_iter().map(|ip| ip.into()).collect();
@@ -124,9 +132,12 @@ impl Builder {
 	// Adapters
 	pub fn auth_adapter(&mut self, auth_adapter: Box<dyn auth_adapter::AuthAdapter>) -> &mut Self { self.adapters.auth_adapter = Some(auth_adapter); self }
 	pub fn meta_adapter(&mut self, meta_adapter: Box<dyn meta_adapter::MetaAdapter>) -> &mut Self { self.adapters.meta_adapter = Some(meta_adapter); self }
+	pub fn blob_adapter(&mut self, blob_adapter: Box<dyn blob_adapter::BlobAdapter>) -> &mut Self { self.adapters.blob_adapter = Some(blob_adapter); self }
 
 	pub async fn run(self) -> ClResult<()> {
-		let state: App = Arc::new(AppState {
+		let mut task_store: Arc<dyn scheduler::TaskStore<App>> = scheduler::InMemoryTaskStore::new();
+		let app: App = Arc::new(AppState {
+			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker: self.worker.expect("FATAL: No worker pool defined"),
 			request: request::Request::new(),
 			acme_challenge_map: RwLock::new(HashMap::new()),
@@ -135,7 +146,9 @@ impl Builder {
 
 			auth_adapter: self.adapters.auth_adapter.expect("FATAL: No auth adapter"),
 			meta_adapter: self.adapters.meta_adapter.expect("FATAL: No meta adapter"),
+			blob_adapter: self.adapters.blob_adapter.expect("FATAL: No blob adapter"),
 		});
+		tokio::fs::create_dir_all(&app.opts.tmp_dir).await.expect("Cannot create tmp dir");
 
 		tracing_subscriber::fmt()
 			.with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -143,11 +156,11 @@ impl Builder {
 			//.with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
 			.init();
 
-		let (mut api_router, mut app_router, mut http_router) = routes::init(state.clone());
+		let (mut api_router, mut app_router, mut http_router) = routes::init(app.clone());
 
-		let https_server = webserver::create_https_server(state.clone(), &state.opts.listen, api_router, app_router).await?;
+		let https_server = webserver::create_https_server(app.clone(), &app.opts.listen, api_router, app_router).await?;
 
-		let http_server = if let Some(listen_http) = &state.opts.listen_http {
+		let http_server = if let Some(listen_http) = &app.opts.listen_http {
 			let http_listener = tokio::net::TcpListener::bind(listen_http.as_ref()).await?;
 			let http = tokio::spawn(async move { axum::serve(http_listener, http_router).await });
 			info!("Listening on HTTP {}", listen_http);
@@ -156,10 +169,13 @@ impl Builder {
 			None
 		};
 
+		// Start scheduler
+		app.scheduler.start(app.clone());
+
 		// Run bootstrapper in the background
 		tokio::spawn(async move {
 			info!("Bootstrapping...");
-			bootstrap(state.clone(), &state.opts).await
+			bootstrap(app.clone(), &app.opts).await
 		});
 
 		if let Some(http_server) = http_server {
@@ -176,8 +192,8 @@ impl Default for Builder {
 	fn default() -> Self { Self::new() }
 }
 
-async fn bootstrap(state: Arc<AppState>, opts: &BuilderOpts) -> ClResult<()> {
-	let auth = &state.auth_adapter;
+async fn bootstrap(app: Arc<AppState>, opts: &BuilderOpts) -> ClResult<()> {
+	let auth = &app.auth_adapter;
 
 	if true {
 		let base_id_tag = &opts.base_id_tag.as_ref().expect("FATAL: No base id tag");
@@ -196,7 +212,7 @@ async fn bootstrap(state: Arc<AppState>, opts: &BuilderOpts) -> ClResult<()> {
 		if let Some(ref acme_email) = opts.acme_email {
 			let cert_data = auth.read_cert_by_tn_id(1).await;
 			if let Err(Error::NotFound) = cert_data {
-				acme::init(state.clone(), &acme_email, &base_id_tag, opts.base_app_domain.as_deref()).await?;
+				acme::init(app.clone(), &acme_email, &base_id_tag, opts.base_app_domain.as_deref()).await?;
 			}
 		}
 	}

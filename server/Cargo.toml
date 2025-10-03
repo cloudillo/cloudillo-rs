@@ -4,32 +4,35 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-async-trait = "0.1.88"
-axum = { version = "0.8.1", features = ["http2", "macros", "multipart"] }
+async-trait = "0.1.89"
+axum = { version = "0.8.4", features = ["http2", "macros", "multipart", "ws"] }
 base64 = "0.22.1"
 flume = { version = "0.11.1", features = ["async"] }
 futures = "0.3.31"
 hmac = "0.12.1"
-hyper = "1.7.0"
-hyper-util = "0.1.16"
-image = "0.25.6"
+#hyper = "1.7.0"
+#hyper-util = "0.1.17"
+image = "0.25.8"
 instant-acme = "0.8.2"
 jsonwebtoken = "9.3.1"
 lazy_static = "1.5.0"
 pem = "3.0.5"
-rustls = "0.23.31"
+rustls = "0.23.32"
 rustls-pki-types = { version = "1.12.0", features = ["alloc"] }
 reqwest = { version = "0.12.23", features = ["json", "rustls-tls"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-sha2 = "0.10.8"
-tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }
-tokio-rustls = "0.26.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+tokio-rustls = "0.26.4"
 tower = { version = "0.5.2", features = ["util"] }
-tower-http = { version = "0.6.6", features = ["fs", "trace"] }
+tower-http = { version = "0.6.6", features = ["cors", "fs", "set-header", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 x509-parser = "0.18.0"
 sqlx = "0.8.6"
 serde_with = "3.14.1"
 croner = "3.0.0"
+axum-server = { version = "0.7.2", features = ["tls-rustls"] }
+hyper = "1.7.0"
+itertools = "0.14.0"

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 cloudillo-auth-adapter-sqlite = { path = "../adapters/auth-adapter-sqlite" }
+cloudillo-blob-adapter-fs = { path = "../adapters/blob-adapter-fs" }
 cloudillo-meta-adapter-sqlite = { path = "../adapters/meta-adapter-sqlite" }
 cloudillo = { path = "../server" }
-tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "fs"] }

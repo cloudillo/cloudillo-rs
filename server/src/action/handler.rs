@@ -1,6 +1,6 @@
 use axum::{extract::Query, extract::State, http::StatusCode, Extension, Json};
 use serde::{Deserialize, Serialize};
-use serde_json;
+use serde_json::{json, Value};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -20,11 +20,13 @@ pub async fn create_key(State(state): State<App>) -> (StatusCode, Json<auth_adap
 
 pub async fn list_actions(
 	State(state): State<App>,
-	Query(opts): Query<meta_adapter::ListActionsOptions>,
-) -> ClResult<(StatusCode, Json<Vec<meta_adapter::ActionView>>)> {
+	Query(opts): Query<meta_adapter::ListActionOptions>,
+//) -> ClResult<(StatusCode, Json<Vec<meta_adapter::ActionView>>)> {
+) -> ClResult<(StatusCode, Json<Value>)> {
 	info!("list_actions");
 	let actions = state.meta_adapter.list_actions(1, &opts).await?;
-	Ok((StatusCode::OK, Json(actions)))
+
+	Ok((StatusCode::OK, Json(json!({ "actions": actions }))))
 }
 
 #[axum::debug_handler]
@@ -32,13 +34,13 @@ pub async fn post_action(
 	State(state): State<App>,
 	TnId(tn_id): TnId,
 	IdTag(id_tag): IdTag,
-	Json(action): Json<meta_adapter::NewAction>,
+	Json(action): Json<meta_adapter::CreateAction>,
 ) -> ClResult<(StatusCode, Json<meta_adapter::ActionView>)> {
 
 	let action_id = action::create_action(&state, tn_id, &id_tag, action).await?;
 	info!("actionId {:?}", &action_id);
 
-	let list = state.meta_adapter.list_actions(tn_id, &meta_adapter::ListActionsOptions {
+	let list = state.meta_adapter.list_actions(tn_id, &meta_adapter::ListActionOptions {
 		action_id: Some(action_id),
 		..Default::default()
 	}).await?;

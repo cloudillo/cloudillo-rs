@@ -23,7 +23,7 @@ pub fn sha256_b64url(input: &str) -> Box<str> {
 	Box::from(result)
 }
 
-pub async fn create_action(state: &App, tn_id: TnId, id_tag: &str, action: meta_adapter::NewAction) -> ClResult<Box<str>>{
+pub async fn create_action(state: &App, tn_id: TnId, id_tag: &str, action: meta_adapter::CreateAction) -> ClResult<Box<str>>{
 	let action_token = state.auth_adapter.create_action_token(tn_id, action.clone()).await?;
 	let action_id = sha256_b64url(&action_token);
 	let action = meta_adapter::Action {

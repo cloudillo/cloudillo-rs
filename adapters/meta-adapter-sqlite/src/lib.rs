@@ -12,7 +12,7 @@ use cloudillo::{
 	prelude::*,
 	core::worker::WorkerPool,
 	meta_adapter,
-	types::TnId,
+	types::{TnId, now},
 };
 
 // Helper functions
@@ -186,7 +186,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 	// Action management
 	//*******************
-	async fn list_actions(&self, tn_id: u32, opts: &meta_adapter::ListActionsOptions) -> ClResult<Vec<meta_adapter::ActionView>> {
+	async fn list_actions(&self, tn_id: u32, opts: &meta_adapter::ListActionOptions) -> ClResult<Vec<meta_adapter::ActionView>> {
 		let mut query = sqlx::QueryBuilder::new(
 			"SELECT a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
 			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic,
@@ -282,7 +282,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		}))
 	}
 
-	async fn list_action_tokens(&self, tn_id: u32, opts: &meta_adapter::ListActionsOptions) -> ClResult<Box<[Box<str>]>> {
+	async fn list_action_tokens(&self, tn_id: u32, opts: &meta_adapter::ListActionOptions) -> ClResult<Box<[Box<str>]>> {
 		todo!("zizi");
 	}
 
@@ -326,6 +326,56 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		tx.commit().await;
 		Ok(())
 	}
+
+	// File management
+	//*****************
+	async fn list_files(&self, tn_id: u32, opts: meta_adapter::ListFileOptions) -> ClResult<Vec<meta_adapter::FileView>> {
+		todo!();
+	}
+
+	async fn list_file_variants(&self, tn_id: u32, file_id: meta_adapter::FileId, variant_selector: meta_adapter::FileVariantSelector) -> ClResult<Vec<meta_adapter::FileVariant>> {
+		let res = match file_id {
+			meta_adapter::FileId::FId(f_id) => sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size
+				FROM file_variants WHERE tn_id=? AND f_id=?")
+			.bind(tn_id).bind(f_id as i64)
+			.fetch_all(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?,
+			meta_adapter::FileId::FileId(file_id) => sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size
+				FROM file_variants WHERE tn_id=? AND file_id=?")
+			.bind(tn_id).bind(file_id)
+			.fetch_all(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?
+		};
+
+		collect_res(res.iter().map(|row| {
+			let res_x = row.try_get("res_x")?;
+			let res_y = row.try_get("res_y")?;
+			Ok(meta_adapter::FileVariant {
+				variant_id: row.try_get("variant_id")?,
+				variant: row.try_get("variant")?,
+				resolution: (res_x, res_y),
+				format: row.try_get("format")?,
+				size: row.try_get("size")?,
+			})
+		}))
+	}
+
+	async fn create_file(&self, tn_id: u32, opts: meta_adapter::CreateFile) -> ClResult<u64> {
+		let status = "P";
+		let created_at = if let Some(created_at) = opts.created_at { created_at } else { now()? };
+		let res = sqlx::query("INSERT OR IGNORE INTO files (tn_id, file_id, status, owner_tag, preset, content_type, file_name, created_at, tags) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
+			.bind(tn_id).bind(opts.file_id).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(created_at).bind(opts.tags.map(|tags| tags.join(",")))
+			//.bind(tn_id).bind(opts.file_id.map(|f| f as i64)).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(created_at).bind(opts.tags.map(|tags| tags.join(","))
+			.fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+
+		Ok(res.get(0))
+	}
+
+	async fn create_file_variant(&self, tn_id: u32, f_id: u64, variant_id: Box<str>, opts: meta_adapter::CreateFileVariant) -> ClResult<Box<str>> {
+		let res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING variant_id")
+			.bind(tn_id).bind(f_id as i64).bind(variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64)
+			.fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+
+		Ok(res.get(0))
+	}
 }
 
 async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -351,7 +401,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		profile_pic json,
 		cover_pic json,
 		x json,
-		created_at datetime DEFAULT current_timestamp,
+		created_at datetime DEFAULT (unixepoch()),
 		PRIMARY KEY(tn_id)
 	)").execute(&mut *tx).await?;
 	// profileData:
@@ -381,7 +431,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query("CREATE TABLE IF NOT EXISTS subscriptions (
 		tn_id integer NOT NULL,
 		subs_id integer NOT NULL,
-		created_at datetime DEFAULT current_timestamp,
+		created_at datetime DEFAULT (unixepoch()),
 		subscription json,
 		PRIMARY KEY(subs_id)
 	)").execute(&mut *tx).await?;
@@ -401,7 +451,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		following boolean,
 		connected boolean,
 		roles json,
-		created_at datetime DEFAULT current_timestamp,
+		created_at datetime DEFAULT (unixepoch()),
 		synced_at datetime,
 		etag text,
 		PRIMARY KEY(tn_id, id_tag)
@@ -420,6 +470,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 
 	// Files
 	sqlx::query("CREATE TABLE IF NOT EXISTS files (
+		f_id integer NOT NULL,
 		tn_id integer NOT NULL,
 		file_id text,
 		file_tp integer,
@@ -429,11 +480,11 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		preset text,
 		content_type text,
 		file_name text,
-		created_at datetime,
+		created_at datetime DEFAULT (unixepoch()),
 		modified_at datetime,
 		tags json,
 		x json,
-		PRIMARY KEY(tn_id, file_id)
+		PRIMARY KEY(f_id)
 	)").execute(&mut *tx).await?;
 	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_fileid ON files(file_id, tn_id)")
 		.execute(&mut *tx).await?;
@@ -441,14 +492,16 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query("CREATE TABLE IF NOT EXISTS file_variants (
 		tn_id integer NOT NULL,
 		variant_id text,
-		file_id text,
+		f_id integer NOT NULL,
 		variant text,				-- 'orig' - original, 'hd' - high density, 'sd' - small density, 'tn' - thumbnail, 'ic' - icon
+		res_x integer,
+		res_y integer,
 		format text,
 		size integer,
 		global boolean,				-- true: stored in global cache
 		PRIMARY KEY(variant_id, tn_id)
 	)").execute(&mut *tx).await?;
-	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_file_variants_fileid ON file_variants(file_id, variant, tn_id)")
+	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_file_variants_fileid ON file_variants(f_id, variant, tn_id)")
 		.execute(&mut *tx).await?;
 
 	// Refs //
@@ -488,7 +541,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		audience text,
 		subject text,
 		content json,
-		created_at datetime NOT NULL,
+		created_at datetime DEFAULT (unixepoch()),
 		expires_at datetime,
 		attachments json,
 		reactions integer,

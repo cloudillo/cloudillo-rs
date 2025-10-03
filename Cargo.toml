@@ -4,6 +4,7 @@ members = [
 	"basic-server",
 	"server",
 	"adapters/auth-adapter-sqlite",
+	"adapters/blob-adapter-fs",
 	"adapters/meta-adapter-sqlite",
 ]
 [profile.release]

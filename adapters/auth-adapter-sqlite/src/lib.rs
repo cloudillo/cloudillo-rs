@@ -179,6 +179,29 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 	}
 
 	// Password management
+	async fn create_tenant_login(&self, id_tag: &str) -> ClResult<auth_adapter::AuthLogin> {
+		let res = sqlx::query(
+			"SELECT tn_id, id_tag, roles FROM tenants WHERE id_tag = ?1"
+		).bind(id_tag).fetch_one(&self.db).await;
+
+		match res {
+			Err(err) => Err(Error::PermissionDenied),
+			Ok(row) => {
+				let tn_id: TnId = row.try_get("tn_id").or(Err(Error::DbError))?;
+				let roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
+
+				let token = crypto::generate_access_token(&self.worker, tn_id, roles.map(|s| s.into())).await?;
+
+				Ok(auth_adapter::AuthLogin {
+					tn_id: row.try_get("tn_id").or(Err(Error::DbError))?,
+					id_tag: Box::from(id_tag),
+					roles: roles.map(|s| parse_str_list(&s)),
+					token,
+				})
+			}
+		}
+	}
+
 	async fn check_tenant_password(&self, id_tag: &str, password: Box<str>) -> ClResult<auth_adapter::AuthLogin> {
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, password, roles FROM tenants WHERE id_tag = ?1"
@@ -313,7 +336,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		Ok(key.public_key)
 	}
 
-	async fn create_action_token(&self, tn_id: TnId, action: meta_adapter::NewAction) -> ClResult<Box<str>> {
+	async fn create_action_token(&self, tn_id: TnId, action: meta_adapter::CreateAction) -> ClResult<Box<str>> {
 		let res = sqlx::query("SELECT t.id_tag, k.key_id, k.private_key FROM tenants t
 			JOIN keys k ON t.tn_id = k.tn_id
 			WHERE t.tn_id=? ORDER BY k.key_id DESC LIMIT 1")

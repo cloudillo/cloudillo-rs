@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::{fmt::Debug, collections::HashMap};
+use std::{cmp::Ordering, fmt::Debug, collections::HashMap};
 use serde::{Serialize, Deserialize};
 use serde_with::skip_serializing_none;
 
@@ -121,7 +121,7 @@ where
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ListActionsOptions {
+pub struct ListActionOptions {
 	#[serde(default, rename="type", deserialize_with = "deserialize_split")]
 	pub typ: Option<Vec<Box<str>>>,
 	#[serde(default, deserialize_with = "deserialize_split")]
@@ -155,7 +155,7 @@ pub struct ProfileInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct NewAction {
+pub struct CreateAction {
 	#[serde(rename = "type")]
 	pub typ: Box<str>,
 	#[serde(rename = "subType")]
@@ -228,6 +228,126 @@ pub struct ActionView {
 	pub stat: Option<Box<str>>,
 }
 
+// Files
+//*******
+/*
+pub enum FileId<'a> {
+	FileId(&'a str),
+	FId(u64),
+}
+*/
+pub enum FileId {
+	FileId(Box<str>),
+	FId(u64),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub enum FileStatus {
+	#[serde(rename = "I")]
+	Immutable,
+	#[serde(rename = "M")]
+	Mutable,
+	#[serde(rename = "P")]
+	Pending,
+	#[serde(rename = "D")]
+	Deleted,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize)]
+pub struct FileView {
+	#[serde(rename = "fileId")]
+	pub file_id: Box<str>,
+	owner: Option<ProfileInfo>,
+	preset: Option<Box<str>>,
+	#[serde(rename = "contentType")]
+	content_type: Option<Box<str>>,
+	#[serde(rename = "fileName")]
+	file_name: Box<str>,
+	created_at: Timestamp,
+	status: FileStatus,
+	tags: Option<Vec<Box<str>>>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct FileVariant {
+	#[serde(rename = "variantId")]
+	pub variant_id: Box<str>,
+	pub variant: Box<str>,
+	pub resolution: (u32, u32),
+	pub format: Box<str>,
+	pub size: u64,
+}
+
+impl PartialOrd for FileVariant {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl Ord for FileVariant {
+	fn cmp(&self, other: &Self) -> Ordering {
+		info!("cmp: {:?} vs {:?}", self, other);
+		//self.variant.cmp(&other.variant)
+		self.size.cmp(&other.size)
+			.then_with(|| self.resolution.0.cmp(&other.resolution.0))
+			.then_with(|| self.resolution.1.cmp(&other.resolution.1))
+			.then_with(|| self.size.cmp(&other.size))
+	}
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListFileOptions {
+	pub _limit: Option<u32>,
+	#[serde(rename = "fileId")]
+	file_id: Option<Box<str>>,
+	tag: Option<Box<str>>,
+	preset: Option<Box<str>>,
+	variant: Option<Box<str>>,
+	status: Option<FileStatus>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FileVariantSelector {
+	variant: Option<Box<str>>,
+	min_x: Option<u32>,
+	min_y: Option<u32>,
+	min_res: Option<u32>, // min resolution in kpx
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CreateFile {
+	#[serde(rename = "fileId")]
+	pub file_id: Option<Box<str>>,
+	pub owner_tag: Option<Box<str>>,
+	pub preset: Option<Box<str>>,
+	#[serde(rename = "contentType")]
+	pub content_type: Option<Box<str>>,
+	#[serde(rename = "fileName")]
+	pub file_name: Box<str>,
+	#[serde(rename = "fileSize")]
+	pub created_at: Option<Timestamp>,
+	pub tags: Option<Vec<Box<str>>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateFileVariant {
+	pub variant: Box<str>,
+	pub format: Box<str>,
+	pub resolution: (u32, u32),
+	pub size: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateFileOptions {
+	#[serde(rename = "fileName")]
+	file_name: Option<Box<str>>,
+	created_at: Option<Timestamp>,
+	status: Option<Box<str>>,
+}
+
 #[async_trait]
 pub trait MetaAdapter: Debug + Send + Sync {
 	// Tenant management
@@ -269,8 +389,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// Action management
 	//*******************
-	async fn list_actions(&self, tn_id: u32, opts: &ListActionsOptions) -> ClResult<Vec<ActionView>>;
-	async fn list_action_tokens(&self, tn_id: u32, opts: &ListActionsOptions) -> ClResult<Box<[Box<str>]>>;
+	async fn list_actions(&self, tn_id: u32, opts: &ListActionOptions) -> ClResult<Vec<ActionView>>;
+	async fn list_action_tokens(&self, tn_id: u32, opts: &ListActionOptions) -> ClResult<Box<[Box<str>]>>;
 
 	async fn create_action(&self, tn_id: u32, action: &Action, key: Option<&str>) -> ClResult<()>;
 
@@ -289,6 +409,13 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	createOutboundAction: (tnId: number, actionId: string, token: string, opts: CreateOutboundActionOptions) => Promise<void>
 	processPendingOutboundActions: (callback: (tnId: number, actionId: string, type: string, token: string, recipientTag: string) => Promise<boolean>) => Promise<number>
 	*/
+
+	// File management
+	//*****************
+	async fn list_files(&self, tn_id: u32, opts: ListFileOptions) -> ClResult<Vec<FileView>>;
+	async fn list_file_variants(&self, tn_id: u32, file_id: FileId, variant_selector: FileVariantSelector) -> ClResult<Vec<FileVariant>>;
+	async fn create_file(&self, tn_id: u32, opts: CreateFile) -> ClResult<u64>;
+	async fn create_file_variant(&self, tn_id: u32, f_id: u64, variant_id: Box<str>, opts: CreateFileVariant) -> ClResult<Box<str>>;
 }
 
 // vim: ts=4

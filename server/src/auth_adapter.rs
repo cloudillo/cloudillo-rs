@@ -152,6 +152,7 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn delete_tenant(&self, id_tag: &str) -> ClResult<()>;
 
 	// Password management
+	async fn create_tenant_login(&self, id_tag: &str) -> ClResult<AuthLogin>;
 	async fn check_tenant_password(&self, id_tag: &str, password: Box<str>) -> ClResult<AuthLogin>;
 	async fn update_tenant_password(&self, id_tag: &str, password: Box<str>) -> ClResult<()>;
 
@@ -172,7 +173,7 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	/// Creates an access token for the given tenant
 	async fn create_access_token(&self, tn_id: TnId, data: &AccessToken)
 		-> ClResult<Box<str>>;
-	async fn create_action_token(&self, tn_id: TnId, data: meta_adapter::NewAction)
+	async fn create_action_token(&self, tn_id: TnId, data: meta_adapter::CreateAction)
 		-> ClResult<Box<str>>;
 
 	/// Verifies that the given access token is valid

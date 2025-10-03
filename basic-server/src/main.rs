@@ -6,6 +6,7 @@ use tokio::fs;
 use cloudillo::{auth_adapter, meta_adapter, core::worker};
 use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
+use cloudillo_blob_adapter_fs::BlobAdapterFs;
 
 pub struct Config {
 	pub mode: cloudillo::ServerMode,
@@ -14,6 +15,9 @@ pub struct Config {
 	pub base_id_tag: String,
 	pub base_app_domain: String,
 	pub base_password: Option<String>,
+	pub data_dir: PathBuf,
+	pub priv_data_dir: PathBuf,
+	pub pub_data_dir: PathBuf,
 	pub dist_dir: PathBuf,
 	pub acme_email: Option<String>,
 	pub local_ips: Vec<String>,
@@ -40,6 +44,9 @@ async fn main() {
 		base_app_domain: env::var("BASE_APP_DOMAIN").unwrap_or_else(|_| base_id_tag.clone()),
 		base_id_tag,
 		base_password: env::var("BASE_PASSWORD").ok(),
+		data_dir: env::var("DATA_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./data")),
+		priv_data_dir: env::var("PRIVATE_DATA_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./data")),
+		pub_data_dir: env::var("PUBLIC_DATA_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./data")),
 		dist_dir: env::var("DIST_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./dist")),
 		acme_email: env::var("ACME_EMAIL").ok(),
 		local_ips: env::var("LOCAL_IPS").ok().map(|s| s.split(',').map(|s| s.to_string()).collect()).unwrap_or_default(),
@@ -52,6 +59,7 @@ async fn main() {
 	let worker = Arc::new(worker::WorkerPool::new(1, 2, 1));
 	let auth_adapter = Box::new(AuthAdapterSqlite::new(worker.clone(), config.db_dir.join("auth.db")).await.unwrap());
 	let meta_adapter = Box::new(MetaAdapterSqlite::new(worker.clone(), config.db_dir.join("meta.db")).await.unwrap());
+	let blob_adapter = Box::new(BlobAdapterFs::new(config.data_dir.into()).await.unwrap());
 
 	let mut cloudillo = cloudillo::Builder::new();
 	cloudillo.mode(config.mode)
@@ -63,6 +71,7 @@ async fn main() {
 		.identity_providers(config.identity_providers)
 		.auth_adapter(auth_adapter)
 		.meta_adapter(meta_adapter)
+		.blob_adapter(blob_adapter)
 		.worker(worker);
 	if let Some(listen_http) = config.listen_http {
 		cloudillo.listen_http(listen_http);

@@ -11,7 +11,7 @@ use std::{sync::Arc, time};
 use crate::prelude::*;
 use crate::{App, auth_adapter, types};
 
-pub async fn require_auth(State(state): State<App>, mut req: Request<Body>, next: Next) -> ClResult<Response<Body>> {
+pub async fn require_auth(State(state): State<App>, TnId(tn_id): TnId, mut req: Request<Body>, next: Next) -> ClResult<Response<Body>> {
 	let auth_header = req
 		.headers()
 		.get("Authorization")
@@ -25,21 +25,44 @@ pub async fn require_auth(State(state): State<App>, mut req: Request<Body>, next
 	let token = &auth_header[7..].trim();
 	let claims = state.auth_adapter.validate_token(token).await?;
 
-	req.extensions_mut().insert(claims);
+	if claims.tn_id != tn_id {
+		return Err(Error::PermissionDenied);
+	}
+
+	req.extensions_mut().insert(Auth(claims));
 
 	Ok(next.run(req).await)
 }
 
-pub async fn optional_auth(State(state): State<App>, mut req: Request<Body>, next: Next) -> ClResult<Response<Body>> {
+pub async fn optional_auth(State(state): State<App>, TnId(tn_id): TnId, mut req: Request<Body>, next: Next) -> ClResult<Response<Body>> {
 	if let Some(auth_header) = req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()) {
 		if auth_header.starts_with("Bearer ") {
 			let token = &auth_header[7..].trim();
 			let claims = state.auth_adapter.validate_token(token).await?;
-			req.extensions_mut().insert(claims);
+
+			if claims.tn_id != tn_id {
+				return Err(Error::PermissionDenied);
+			}
+
+			req.extensions_mut().insert(Auth(claims));
 		}
 	}
 
 	Ok(next.run(req).await)
+}
+
+pub async fn api_middleware(mut req: Request<Body>, next: Next ) -> Response<Body> {
+	let host =
+		req.uri().host()
+		.or_else(|| req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()))
+		.unwrap_or_default();
+
+	if host.starts_with("cl-o.") {
+		let id_tag = Box::from(&host[5..]);
+		req.extensions_mut().insert(IdTag(id_tag));
+	}
+
+	next.run(req).await
 }
 
 pub async fn main_middleware(mut req: Request<Body>, next: Next ) -> Response<Body> {
@@ -52,17 +75,19 @@ pub async fn main_middleware(mut req: Request<Body>, next: Next ) -> Response<Bo
 	} else {
 		let host =
 			req.uri().host()
-			.or_else(|| req.headers().get(hyper::header::HOST).and_then(|h| h.to_str().ok()))
+			.or_else(|| req.headers().get(header::HOST).and_then(|h| h.to_str().ok()))
 			.unwrap_or("-");
 		info!("REQ App: {} {} {}", req.method(), host, req.uri().path());
 	}
+	info!("    headers: {:?}", req.headers());
 
 	let res = next.run(req).await;
 
-	if res.status().is_success() {
-		info!("RES: {} tm:{:?}", &res.status(), start.elapsed().as_millis());
-	} else {
+	//if res.status().is_success() {
+	if res.status().is_client_error() || res.status().is_server_error() {
 		warn!("RES: {} tm:{:?}", &res.status(), start.elapsed().as_millis());
+	} else {
+		info!("RES: {} tm:{:?}", &res.status(), start.elapsed().as_millis());
 	}
 
 	res
@@ -111,9 +136,9 @@ where
 
 	async fn from_request_parts(parts: &mut Parts, state: &App) -> Result<Self, Self::Rejection> {
 		if let Some(id_tag) = parts.extensions.get::<IdTag>().cloned() {
-			info!("idTag: {}", &id_tag.0);
+			//info!("idTag: {}", &id_tag.0);
 			let tn_id = state.auth_adapter.read_tn_id(&id_tag.0).await.map_err(|_| Error::PermissionDenied)?;
-			info!("tnId: {:?}", &tn_id);
+			//info!("tnId: {:?}", &tn_id);
 			Ok(TnId(tn_id))
 		} else {
 			Err(Error::PermissionDenied)
@@ -123,7 +148,7 @@ where
 
 // Auth //
 //////////
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Auth(pub auth_adapter::AuthCtx);
 
 impl<S> FromRequestParts<S> for Auth
@@ -133,6 +158,7 @@ where
 	type Rejection = Error;
 
 	async fn from_request_parts(parts: &mut Parts, _state: &S,) -> Result<Self, Self::Rejection> {
+		info!("Auth extractor: {:?}", &parts.extensions.get::<Auth>());
 		if let Some(auth) = parts.extensions.get::<Auth>().cloned() {
 			Ok(auth)
 		} else {
