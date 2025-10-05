@@ -16,4 +16,4 @@ p384 = { version = "0.13.1", features = ["pkcs8", "pem"] }
 serde = { version = "1.0.228", features = ["derive"] }
 sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio-rustls"] }
 time = { version = "0.3.44", features = ["local-offset"] }
-zeroize = "1.8.1"
+zeroize = "1.8.2"

@@ -7,7 +7,7 @@ use crate::prelude::*;
 use crate::action::action;
 use crate::auth_adapter;
 use crate::App;
-use crate::core::route_auth::IdTag;
+use crate::core::IdTag;
 
 /// # Profile
 #[derive(Serialize)]

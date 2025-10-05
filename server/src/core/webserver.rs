@@ -19,8 +19,7 @@ use tower::{Service, /*util::ServiceExt*/};
 use crate::prelude::*;
 use crate::AppState;
 use crate::auth_adapter;
-use crate::core::acme;
-use crate::core::route_auth::IdTag;
+use crate::core;
 use crate::types::{Timestamp};
 
 pub struct CertResolver {
@@ -100,87 +99,44 @@ pub async fn create_https_server(mut state: Arc<AppState>, listen: &str, api_rou
 
 	let addr = SocketAddr::from(([0, 0, 0, 0], 1443));
 	let https_server = axum_server::bind_rustls(addr, axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config)));
-		//.serve(api_router.into_make_service())
-		//.await?;
-		//.map_err(|_| std::io::ErrorKind::Other)?
 
-	//let svc = tower::service_fn(move |req: axum::http::Request<axum::body::Body>| {
-	let svc = tower::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+	let svc = tower::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
 		let api_router = api_router.clone();
 		let app_router = app_router.clone();
 		async move {
+			let start = std::time::Instant::now();
+			let span = info_span!("REQ", req = req.uri().path());
+			span.enter();
+			let peer_addr = req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().map(|a| a.to_string()).unwrap_or("-".to_string());
 			let host =
 				req.uri().host()
 				.or_else(|| req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()))
 				.unwrap_or_default();
-			if host.starts_with("cl-o.") {
+
+			let res = if host.starts_with("cl-o.") {
+				let id_tag = Box::from(&host[5..]);
+				info!("REQ [{}] API: {} {} {}", &peer_addr, req.method(), &id_tag, req.uri().path());
+				req.extensions_mut().insert(core::IdTag(id_tag));
 				api_router.clone().call(req).await
 			} else {
+				info!("REQ [{}] App: {} {} {}", &peer_addr, req.method(), &host, req.uri().path());
 				app_router.clone().call(req).await
+			};
+
+			let status = res.as_ref().map(|r| r.status()).unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+			if status.is_client_error() || status.is_server_error() {
+				warn!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
+			} else {
+				info!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
 			}
+
+			res
 		}
 	});
 		
 
 	info!("Listening on HTTPS {}", &listen);
-	let handle = tokio::spawn(async move { https_server.serve(svc.into_make_service()).await });
-	//let handle = tokio::spawn(async move { https_server.serve(api_router.into_make_service()).await });
-
-	/*
-	server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-	let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
-
-	let listener = tokio::net::TcpListener::bind(&listen).await?;
-	info!("Listening on HTTPS {}", &listen);
-	*/
-
-
-/*
-	let handle = tokio::spawn(async move {
-		loop {
-			let (tcp_stream, peer_addr) = listener.accept().await?;
-			info!("Accepted connection from {}", peer_addr);
-			let tls_acceptor = tls_acceptor.clone();
-			let api_router = api_router.clone();
-			let app_router = app_router.clone();
-
-			tokio::spawn(async move {
-				if let Ok(tls_stream) = tls_acceptor.accept(tcp_stream).await {
-					let io = hyper_util::rt::TokioIo::new(tls_stream);
-					let api_router = api_router.clone();
-					let app_router = app_router.clone();
-
-					let api_service = api_router.into_make_service();
-
-					hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-						.serve_connection(io, api_service);
-					/*
-					let hyper_service = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
-						let host =
-							req.uri().host()
-							.or_else(|| req.headers().get(hyper::header::HOST).and_then(|h| h.to_str().ok()))
-							.unwrap_or_default();
-
-						info!("Host: {}", host);
-						if host.starts_with("cl-o.") {
-							let id_tag = IdTag::new(&host[5..]);
-							req.extensions_mut().insert(id_tag);
-							api_router.clone().oneshot(req)
-						} else {
-							app_router.clone().oneshot(req)
-						}
-					});
-					if let Err(err) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-						.serve_connection(io, hyper_service).await {
-						error!("Error serving connection from {}: {}", peer_addr, err);
-					}
-					*/
-				}
-			});
-		}
-		Ok::<(), std::io::Error>(())
-	});
-*/
+	let handle = tokio::spawn(async move { https_server.serve(svc.into_make_service_with_connect_info::<SocketAddr>()).await });
 
 	Ok(handle)
 }

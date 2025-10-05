@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1.89"
-axum = { version = "0.8.4", features = ["http2", "macros", "multipart", "ws"] }
+axum = { version = "0.8.6", features = ["http2", "macros", "multipart", "ws"] }
 base64 = "0.22.1"
 flume = { version = "0.11.1", features = ["async"] }
 futures = "0.3.31"
@@ -31,7 +31,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 x509-parser = "0.18.0"
 sqlx = "0.8.6"
-serde_with = "3.14.1"
+serde_with = "3.15.0"
 croner = "3.0.0"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 hyper = "1.7.0"

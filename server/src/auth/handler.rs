@@ -7,7 +7,7 @@ use crate::{
 	prelude::*,
 	auth_adapter,
 	App,
-	core::route_auth::{Auth},
+	core::{Auth},
 };
 
 /// # Login

@@ -9,7 +9,7 @@ use crate::meta_adapter;
 use crate::App;
 use crate::types::Timestamp;
 use crate::file::{file, image, store};
-use crate::core::route_auth::TnId;
+use crate::core::TnId;
 
 pub async fn get_file_list(
 	State(app): State<App>,

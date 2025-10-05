@@ -9,7 +9,6 @@ use cloudillo::{
 	prelude::*,
 	auth_adapter,
 	meta_adapter,
-	core::route_auth,
 	types::{TnId, Timestamp, TimestampExt},
 	core::worker::WorkerPool
 };

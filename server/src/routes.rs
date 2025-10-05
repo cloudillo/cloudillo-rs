@@ -8,7 +8,7 @@ use tower_http::{
 use crate::prelude::*;
 use crate::App;
 use crate::core::acme;
-use crate::core::route_auth::{require_auth, optional_auth, api_middleware, main_middleware};
+use crate::core::middleware::{require_auth, optional_auth};
 use crate::core::websocket;
 use crate::action;
 use crate::auth;
@@ -40,9 +40,7 @@ fn init_api_service(app: App) -> Router {
 
 		.route_layer(middleware::from_fn_with_state(app.clone(), require_auth))
 		.layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-cache")))
-		.layer(SetResponseHeaderLayer::if_not_present(header::EXPIRES, header::HeaderValue::from_static("0")))
-		.route_layer(middleware::from_fn(api_middleware))
-		.route_layer(middleware::from_fn(main_middleware));
+		.layer(SetResponseHeaderLayer::if_not_present(header::EXPIRES, header::HeaderValue::from_static("0")));
 
 	let public_router = Router::new()
 		// Tenant API
@@ -59,14 +57,11 @@ fn init_api_service(app: App) -> Router {
 
 		.route_layer(middleware::from_fn_with_state(app.clone(), optional_auth))
 		.layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-cache")))
-		.layer(SetResponseHeaderLayer::if_not_present(header::EXPIRES, header::HeaderValue::from_static("0")))
-		.route_layer(middleware::from_fn(api_middleware))
-		.route_layer(middleware::from_fn(main_middleware));
+		.layer(SetResponseHeaderLayer::if_not_present(header::EXPIRES, header::HeaderValue::from_static("0")));
 
 	Router::new()
 		.merge(public_router)
 		.merge(protected_router)
-		//.layer(middleware::from_fn(main_middleware))
 		.layer(cors_layer)
 		.with_state(app)
 }
@@ -83,7 +78,6 @@ fn init_app_service(app: App) -> Router {
 	Router::new()
 		.route("/.well-known/cloudillo/id-tag", get(auth::handler::get_id_tag))
 		.fallback_service(serve_dir)
-		.layer(middleware::from_fn(main_middleware))
 		.with_state(app)
 }
 
