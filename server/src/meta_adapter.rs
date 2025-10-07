@@ -154,7 +154,8 @@ pub struct ProfileInfo {
 	pub profile_pic: Option<Box<str>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateAction {
 	#[serde(rename = "type")]
 	pub typ: Box<str>,
@@ -195,6 +196,13 @@ pub struct Action {
 	pub expires_at: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachmentView {
+	#[serde(rename = "fileId")]
+	pub file_id: Box<str>,
+	pub dim: Option<(u32, u32)>,
+}
+
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct ActionView {
@@ -215,7 +223,7 @@ pub struct ActionView {
 	#[serde(rename = "content")]
 	pub content: Option<Box<str>>,
 	#[serde(rename = "attachments")]
-	pub attachments: Option<Box<[Box<str>]>>,
+	pub attachments: Option<Vec<AttachmentView>>,
 	#[serde(rename = "subject")]
 	pub subject: Option<Box<str>>,
 	#[serde(rename = "createdAt")]
@@ -278,6 +286,7 @@ pub struct FileVariant {
 	pub resolution: (u32, u32),
 	pub format: Box<str>,
 	pub size: u64,
+	pub available: bool,
 }
 
 impl PartialOrd for FileVariant {
@@ -288,7 +297,7 @@ impl PartialOrd for FileVariant {
 
 impl Ord for FileVariant {
 	fn cmp(&self, other: &Self) -> Ordering {
-		info!("cmp: {:?} vs {:?}", self, other);
+		//info!("cmp: {:?} vs {:?}", self, other);
 		//self.variant.cmp(&other.variant)
 		self.size.cmp(&other.size)
 			.then_with(|| self.resolution.0.cmp(&other.resolution.0))
@@ -309,27 +318,17 @@ pub struct ListFileOptions {
 	status: Option<FileStatus>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct FileVariantSelector {
-	variant: Option<Box<str>>,
-	min_x: Option<u32>,
-	min_y: Option<u32>,
-	min_res: Option<u32>, // min resolution in kpx
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct CreateFile {
-	#[serde(rename = "fileId")]
+	pub orig_variant_id: Box<str>,
 	pub file_id: Option<Box<str>>,
 	pub owner_tag: Option<Box<str>>,
-	pub preset: Option<Box<str>>,
-	#[serde(rename = "contentType")]
-	pub content_type: Option<Box<str>>,
-	#[serde(rename = "fileName")]
+	pub preset: Box<str>,
+	pub content_type: Box<str>,
 	pub file_name: Box<str>,
-	#[serde(rename = "fileSize")]
 	pub created_at: Option<Timestamp>,
 	pub tags: Option<Vec<Box<str>>>,
+	pub x: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -338,6 +337,7 @@ pub struct CreateFileVariant {
 	pub format: Box<str>,
 	pub resolution: (u32, u32),
 	pub size: u64,
+	pub	available: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -346,6 +346,26 @@ pub struct UpdateFileOptions {
 	file_name: Option<Box<str>>,
 	created_at: Option<Timestamp>,
 	status: Option<Box<str>>,
+}
+
+// Tasks
+//*******
+pub struct Task {
+	pub task_id: u64,
+	pub tn_id: TnId,
+	pub kind: Box<str>,
+	pub status: char,
+	pub created_at: Timestamp,
+	pub next_at: Option<Timestamp>,
+	pub input: Box<str>,
+	pub output: Box<str>,
+	pub deps: Box<[u64]>,
+}
+
+#[derive(Debug, Default)]
+pub struct ListTaskOptions {
+	status: Option<char>,
+	since: Option<Timestamp>,
 }
 
 #[async_trait]
@@ -412,10 +432,21 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// File management
 	//*****************
+	async fn get_file_id(&self, tn_id: u32, f_id: u64) -> ClResult<Box<str>>;
 	async fn list_files(&self, tn_id: u32, opts: ListFileOptions) -> ClResult<Vec<FileView>>;
-	async fn list_file_variants(&self, tn_id: u32, file_id: FileId, variant_selector: FileVariantSelector) -> ClResult<Vec<FileVariant>>;
-	async fn create_file(&self, tn_id: u32, opts: CreateFile) -> ClResult<u64>;
-	async fn create_file_variant(&self, tn_id: u32, f_id: u64, variant_id: Box<str>, opts: CreateFileVariant) -> ClResult<Box<str>>;
+	async fn list_file_variants(&self, tn_id: u32, file_id: FileId) -> ClResult<Vec<FileVariant>>;
+	async fn read_file_variant(&self, tn_id: u32, variant_id: &str) -> ClResult<FileVariant>;
+	async fn create_file(&self, tn_id: u32, opts: CreateFile) -> ClResult<FileId>;
+	async fn create_file_variant<'a>(&'a self, tn_id: u32, f_id: u64, variant_id: &'a str, opts: CreateFileVariant) -> ClResult<&'a str>;
+	async fn update_file_id(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
+
+	// Task scheduler
+	//****************
+	async fn list_tasks(&self, opts: ListTaskOptions) -> ClResult<Vec<Task>>;
+	async fn list_task_ids(&self, kind: &str, keys: &[Box<str>]) -> ClResult<Vec<u64>>;
+	async fn create_task(&self, kind: &'static str, input: &str, deps: &[u64]) -> ClResult<u64>;
+	async fn update_task_finished(&self, task_id: u64, output: &str) -> ClResult<()>;
+	async fn update_task_error(&self, task_id: u64, output: &str, next_at: Option<Timestamp>) -> ClResult<()>;
 }
 
 // vim: ts=4

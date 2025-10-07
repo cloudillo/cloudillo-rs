@@ -17,14 +17,7 @@ use crate::profile;
 
 //fn init_api_service(state: App) -> Router {
 fn init_api_service(app: App) -> Router {
-	info!("INIT APP {:?}", std::any::TypeId::of::<App>());
-
 	let cors_layer = tower_http::cors::CorsLayer::very_permissive();
-	/*
-	let cors_layer = tower_http::cors::CorsLayer::new()
-		.allow_credentials(true)
-		.allow_origin(tower_http::cors::Any);
-	*/
 
 	let protected_router = Router::new()
 		//.route("/api/key", post(action::handler::create_key))
@@ -36,7 +29,12 @@ fn init_api_service(app: App) -> Router {
 
 		// File API
 		.route("/api/file", get(file::handler::get_file_list))
+		.route("/api/file/variant/{variant_id}", get(file::handler::get_file_variant))
+		.route("/api/file/{file_id}", get(file::handler::get_file_variant_file_id))
 		.route("/api/file/{preset}/{file_name}", post(file::handler::post_file))
+
+		.route("/api/store", get(file::handler::get_file_list))
+		.route("/api/store/{preset}/{file_name}", post(file::handler::post_file))
 
 		.route_layer(middleware::from_fn_with_state(app.clone(), require_auth))
 		.layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-cache")))

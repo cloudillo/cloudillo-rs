@@ -62,6 +62,13 @@ impl From<axum::Error> for Error {
 	}
 }
 
+impl From<axum::http::Error> for Error {
+	fn from(_err: axum::http::Error) -> Self {
+		warn!("http error: {}", _err);
+		Error::Unknown
+	}
+}
+
 impl From<axum::http::header::ToStrError> for Error {
 	fn from(_err: axum::http::header::ToStrError) -> Self {
 		warn!("header to str error: {}", _err);

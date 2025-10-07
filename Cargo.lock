@@ -531,6 +531,7 @@ dependencies = [
  "croner",
  "flume",
  "futures",
+ "futures-core",
  "hmac",
  "hyper",
  "image",
@@ -549,6 +550,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -588,7 +590,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cloudillo",
+ "futures-core",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

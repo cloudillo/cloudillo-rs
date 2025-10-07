@@ -1,8 +1,10 @@
 #![allow(unused)]
 
 use async_trait::async_trait;
-use std::{fmt::Debug, path::{Path, PathBuf}};
+use futures_core::Stream;
+use std::{fmt::Debug, path::{Path, PathBuf}, pin::Pin};
 use tokio::{fs::{*, File}, io::{AsyncRead, AsyncReadExt, AsyncWriteExt}};
+use tokio_util::{bytes::Bytes, io::{ReaderStream}};
 
 use cloudillo::{
 	prelude::*,
@@ -75,9 +77,12 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 	}
 
 	/// Reads a blob
-	async fn read_blob_stream(&self, tn_id: u32, blob_id: &str) -> ClResult<Box<dyn AsyncRead>> {
-		let file = File::open(obj_file_path(&self.base_dir, tn_id, blob_id)?).await?;
-		Ok(Box::new(file))
+	async fn read_blob_stream(&self, tn_id: u32, blob_id: &str) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>> {
+		info!("path: {:?}", obj_file_path(&self.base_dir, tn_id, blob_id)?);
+		let file = File::open(obj_file_path(&self.base_dir, tn_id, blob_id)?).await.map_err(|_| Error::NotFound)?;
+		let stream = ReaderStream::new(file);
+
+		Ok(Box::pin(stream))
 	}
 }
 

@@ -84,7 +84,7 @@ fn generate_key_sync() -> ClResult<auth_adapter::KeyPair> {
 
 /// Generate a keypair
 pub async fn generate_key(worker: &worker::WorkerPool) -> ClResult<auth_adapter::KeyPair> {
-	worker.run(move || {
+	worker.run_immed(move || {
 		generate_key_sync()
 	}).await.map_err(|_| Error::PermissionDenied)
 }

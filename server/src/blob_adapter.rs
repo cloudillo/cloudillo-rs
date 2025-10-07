@@ -1,6 +1,8 @@
 use async_trait::async_trait;
-use std::{fmt::Debug, collections::HashMap};
+use axum::body::Bytes;
+use std::{fmt::Debug, collections::HashMap, pin::Pin};
 use tokio::io::AsyncRead;
+use futures_core::Stream;
 
 use crate::{
 	prelude::*,
@@ -24,7 +26,7 @@ pub trait BlobAdapter: Debug + Send + Sync {
 	async fn read_blob_buf(&self, tn_id: u32, blob_id: &str) -> ClResult<Box<[u8]>>;
 
 	/// Reads a blob
-	async fn read_blob_stream(&self, tn_id: u32, blob_id: &str) -> ClResult<Box<dyn AsyncRead>>;
+	async fn read_blob_stream(&self, tn_id: u32, blob_id: &str) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>>;
 }
 
 // vim: ts=4

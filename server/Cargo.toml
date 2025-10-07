@@ -36,3 +36,5 @@ croner = "3.0.0"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 hyper = "1.7.0"
 itertools = "0.14.0"
+tokio-util = { version = "0.7.16", features = ["io"] }
+futures-core = "0.3.31"

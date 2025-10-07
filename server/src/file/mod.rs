@@ -2,3 +2,12 @@ pub mod file;
 pub mod handler;
 pub mod image;
 pub mod store;
+
+use crate::App;
+
+pub fn init(app: &App) {
+	app.scheduler.register::<image::ImageResizerTask>();
+	app.scheduler.register::<file::FileIdGeneratorTask>();
+}
+
+// vim: ts=4

@@ -12,28 +12,19 @@ use cloudillo::{
 	prelude::*,
 	core::worker::WorkerPool,
 	meta_adapter,
-	types::{TnId, now},
+	types::{TnId, Timestamp, now},
 };
 
 // Helper functions
 //******************
-/*
-fn push_in<'a, Sep>(query: &'a mut Separated<'a, 'a, sqlx::Sqlite, Sep>, values: &[&'a str])
-where
-	Sep: std::fmt::Display
-{
-*/
-//fn push_in<'a>(query: &'a mut Separated<'a, 'a, sqlx::Sqlite, impl std::fmt::Display>, values: &[&'a str]) {
-//fn push_in<'a>(mut query: Separated<'a, 'a, sqlx::Sqlite, &'a str>, values: &'a [Cow<'a, str>])
-//	-> Separated<'a, 'a, sqlx::Sqlite, &'a str> {
-fn push_in<'a>(mut query: sqlx::QueryBuilder<'a, sqlx::Sqlite>, values: &'a [Box<str>])
+fn push_in<'a>(mut query: sqlx::QueryBuilder<'a, sqlx::Sqlite>, values: &'a [impl AsRef<str>])
 	-> sqlx::QueryBuilder<'a, sqlx::Sqlite> {
 	query.push("(");
 	for (i, value) in values.iter().enumerate() {
 		if i > 0 {
 			query.push(", ");
 		}
-		query.push_bind(value.clone());
+		query.push_bind(value.as_ref());
 	}
 	query.push(")");
 	query
@@ -41,6 +32,10 @@ fn push_in<'a>(mut query: sqlx::QueryBuilder<'a, sqlx::Sqlite>, values: &'a [Box
 
 fn parse_str_list(s: &str) -> Box<[Box<str>]> {
 	s.split(',').map(|s| s.trim().to_owned().into_boxed_str()).collect::<Vec<_>>().into_boxed_slice()
+}
+
+fn parse_u64_list(s: &str) -> Box<[u64]> {
+	s.split(',').map(|s| s.trim().parse().unwrap()).collect::<Vec<_>>().into_boxed_slice()
 }
 
 fn inspect(err: &sqlx::Error) {
@@ -87,6 +82,7 @@ pub fn collect_res<T>(mut iter: impl Iterator<Item = Result<T, sqlx::Error>> + U
 #[derive(Debug)]
 pub struct MetaAdapterSqlite {
 	db: SqlitePool,
+	dbr: SqlitePool,
 	worker: Arc<WorkerPool>,
 }
 
@@ -96,9 +92,16 @@ impl MetaAdapterSqlite {
 			.filename(path.as_ref())
 			.create_if_missing(true)
 			.journal_mode(sqlite::SqliteJournalMode::Wal);
+
 		let db = sqlite::SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect_with(opts.clone())
+			.await
+			.inspect_err(|err| println!("DbError: {:#?}", err))
+			.or(Err(Error::DbError))?;
+		let dbr = sqlite::SqlitePoolOptions::new()
 			.max_connections(5)
-			.connect_with(opts)
+			.connect_with(opts.read_only(true))
 			.await
 			.inspect_err(|err| println!("DbError: {:#?}", err))
 			.or(Err(Error::DbError))?;
@@ -107,7 +110,7 @@ impl MetaAdapterSqlite {
 			.inspect_err(|err| println!("DbError: {:#?}", err))
 			.or(Err(Error::DbError))?;
 
-		Ok(Self { worker, db })
+		Ok(Self { worker, db, dbr })
 	}
 }
 
@@ -118,7 +121,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	async fn read_tenant(&self, tn_id: TnId) -> ClResult<meta_adapter::Tenant> {
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, name, type, profile_pic, cover_pic, created_at, x FROM tenants WHERE tn_id = ?1"
-		).bind(tn_id).fetch_one(&self.db).await;
+		).bind(tn_id).fetch_one(&self.dbr).await;
 
 		match res {
 			Err(sqlx::Error::RowNotFound) => return Err(Error::NotFound),
@@ -236,12 +239,13 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		query.push(" ORDER BY a.created_at DESC LIMIT 100");
 		info!("SQL: {}", query.sql());
 
-		let res = query.build().fetch_all(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let res = query.build().fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 		collect_res(res.iter().map(|row| {
 			let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag")?;
 			let audienc_tag = row.try_get::<Option<Box<str>>, _>("audience")?;
 			let attachments = row.try_get::<Option<Box<str>>, _>("attachments")?;
+			let attachments = attachments.map(|s| parse_str_list(&s).iter().map(|a| meta_adapter::AttachmentView { file_id: a.clone(), dim: None }).collect::<Vec<_>>());
 			// stat
 			let stat = Some(Box::from("stat"));
 			Ok(meta_adapter::ActionView {
@@ -272,7 +276,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				} else { None },
 				subject: row.try_get("subject")?,
 				content: row.try_get("content")?,
-				attachments: attachments.map(|s| parse_str_list(&s)),
+				attachments,
 				created_at: row.try_get("created_at")?,
 				expires_at: row.try_get("expires_at")?,
 				status: row.try_get("status")?,
@@ -329,20 +333,41 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 	// File management
 	//*****************
+	async fn get_file_id(&self, tn_id: u32, f_id: u64) -> ClResult<Box<str>> {
+		let res = sqlx::query("SELECT file_id FROM files WHERE tn_id=? AND f_id=?")
+			.bind(tn_id).bind(f_id as i64)
+			.fetch_one(&self.dbr).await;
+
+		map_res(res, |row| {
+			Ok(row.try_get("file_id")?)
+		})
+	}
+
 	async fn list_files(&self, tn_id: u32, opts: meta_adapter::ListFileOptions) -> ClResult<Vec<meta_adapter::FileView>> {
 		todo!();
 	}
 
-	async fn list_file_variants(&self, tn_id: u32, file_id: meta_adapter::FileId, variant_selector: meta_adapter::FileVariantSelector) -> ClResult<Vec<meta_adapter::FileVariant>> {
+	async fn list_file_variants(&self, tn_id: u32, file_id: meta_adapter::FileId) -> ClResult<Vec<meta_adapter::FileVariant>> {
 		let res = match file_id {
-			meta_adapter::FileId::FId(f_id) => sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size
+			meta_adapter::FileId::FId(f_id) => sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size, available
 				FROM file_variants WHERE tn_id=? AND f_id=?")
-			.bind(tn_id).bind(f_id as i64)
-			.fetch_all(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?,
-			meta_adapter::FileId::FileId(file_id) => sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size
-				FROM file_variants WHERE tn_id=? AND file_id=?")
-			.bind(tn_id).bind(file_id)
-			.fetch_all(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?
+				.bind(tn_id).bind(f_id as i64)
+				.fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?,
+			meta_adapter::FileId::FileId(file_id) => {
+				if file_id.starts_with("@") {
+					sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size, available
+						FROM file_variants WHERE tn_id=? AND f_id=?")
+						.bind(tn_id).bind(&file_id[1..])
+						.fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?
+				} else {
+					sqlx::query("SELECT fv.variant_id, fv.variant, fv.res_x, fv.res_y, fv.format, fv.size, fv.available
+						FROM files f
+						JOIN file_variants fv ON fv.tn_id=f.tn_id AND fv.f_id=f.f_id
+						WHERE f.tn_id=? AND f.file_id=?")
+						.bind(tn_id).bind(file_id)
+						.fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?
+				}
+			}
 		};
 
 		collect_res(res.iter().map(|row| {
@@ -354,27 +379,165 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				resolution: (res_x, res_y),
 				format: row.try_get("format")?,
 				size: row.try_get("size")?,
+				available: row.try_get("available")?,
 			})
 		}))
 	}
 
-	async fn create_file(&self, tn_id: u32, opts: meta_adapter::CreateFile) -> ClResult<u64> {
-		let status = "P";
-		let created_at = if let Some(created_at) = opts.created_at { created_at } else { now()? };
-		let res = sqlx::query("INSERT OR IGNORE INTO files (tn_id, file_id, status, owner_tag, preset, content_type, file_name, created_at, tags) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
-			.bind(tn_id).bind(opts.file_id).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(created_at).bind(opts.tags.map(|tags| tags.join(",")))
-			//.bind(tn_id).bind(opts.file_id.map(|f| f as i64)).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(created_at).bind(opts.tags.map(|tags| tags.join(","))
-			.fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	async fn read_file_variant(&self, tn_id: u32, variant_id: &str) -> ClResult<meta_adapter::FileVariant> {
+		info!("read_file_variant: {} {}", tn_id, &variant_id);
+		let res =sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size, available
+				FROM file_variants WHERE tn_id=? AND variant_id=?")
+			.bind(tn_id).bind(variant_id)
+			.fetch_one(&self.dbr).await;
 
-		Ok(res.get(0))
+		map_res(res, |row| {
+			let res_x = row.try_get("res_x")?;
+			let res_y = row.try_get("res_y")?;
+			Ok(meta_adapter::FileVariant {
+				variant_id: row.try_get("variant_id")?,
+				variant: row.try_get("variant")?,
+				resolution: (res_x, res_y),
+				format: row.try_get("format")?,
+				size: row.try_get("size")?,
+				available: row.try_get("available")?,
+			})
+		})
 	}
 
-	async fn create_file_variant(&self, tn_id: u32, f_id: u64, variant_id: Box<str>, opts: meta_adapter::CreateFileVariant) -> ClResult<Box<str>> {
-		let res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING variant_id")
-			.bind(tn_id).bind(f_id as i64).bind(variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64)
+	async fn create_file(&self, tn_id: u32, opts: meta_adapter::CreateFile) -> ClResult<meta_adapter::FileId> {
+		info!("Exists?: {:?} {:?} {:?}", &opts.preset, tn_id, &opts.orig_variant_id);
+		let file_id_exists = sqlx::query("SELECT min(f.file_id) FROM file_variants fv
+			JOIN files f ON f.tn_id=fv.tn_id AND f.f_id=fv.f_id AND f.preset=? AND f.file_id IS NOT NULL
+			WHERE fv.tn_id=? AND fv.variant_id=? AND fv.variant='orig'")
+			.bind(&opts.preset).bind(tn_id).bind(&opts.orig_variant_id)
+			.fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?.get(0);
+
+		info!("Exists: {:?}", file_id_exists);
+		if let Some(file_id) = file_id_exists {
+			return Ok(meta_adapter::FileId::FileId(file_id));
+		}
+
+		let status = "P";
+		let created_at = if let Some(created_at) = opts.created_at { created_at } else { now()? };
+		let res = sqlx::query("INSERT OR IGNORE INTO files (tn_id, file_id, status, owner_tag, preset, content_type, file_name, created_at, tags, x) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
+			.bind(tn_id).bind(opts.file_id).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(created_at).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x)
 			.fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
-		Ok(res.get(0))
+		Ok(meta_adapter::FileId::FId(res.get(0)))
+	}
+
+	async fn create_file_variant<'a>(&'a self, tn_id: u32, f_id: u64, variant_id: &'a str, opts: meta_adapter::CreateFileVariant) -> ClResult<&'a str> {
+		info!("START create_file_variant: {} {} {}", tn_id, f_id, &variant_id);
+		let mut tx = self.db.begin().await.map_err(|_| Error::DbError)?;
+		let res = sqlx::query("SELECT f_id FROM files WHERE tn_id=? AND f_id=? AND file_id IS NULL")
+			.bind(tn_id).bind(f_id as i64)
+			.fetch_one(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+
+		let res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+			.bind(tn_id).bind(f_id as i64).bind(&variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64)
+			.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		tx.commit().await;
+
+		Ok(variant_id)
+	}
+
+	async fn update_file_id(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()> {
+		let res = sqlx::query("UPDATE files SET file_id=? WHERE tn_id=? AND f_id=? AND file_id IS NULL")
+			.bind(file_id).bind(tn_id).bind(f_id as i64)
+			.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		if res.rows_affected() == 0 {
+			return Err(Error::NotFound);
+		}
+
+		Ok(())
+	}
+
+	// Task scheduler
+	//****************
+	async fn list_tasks(&self, opts: meta_adapter::ListTaskOptions) -> ClResult<Vec<meta_adapter::Task>> {
+		let res = sqlx::query("SELECT t.task_id, t.tn_id, t.kind, t.status, t.created_at, t.next_at,
+			t.input, t.output, string_agg(td.dep_id, ',') as deps
+			FROM tasks t
+			LEFT JOIN task_dependencies td ON td.tn_id=t.tn_id AND td.task_id=t.task_id
+			WHERE true
+			GROUP BY t.task_id, t.tn_id")
+			.fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+
+		collect_res(res.iter().map(|row| {
+			let deps: Option<Box<str>> = row.try_get("deps")?;
+			let status: &str = row.try_get("status")?;
+			Ok(meta_adapter::Task {
+				task_id: row.try_get("task_id")?,
+				tn_id: row.try_get("tn_id")?,
+				kind: row.try_get::<Box<str>, _>("kind")?,
+				status: status.chars().next().unwrap_or('E'),
+				created_at: row.try_get("created_at")?,
+				next_at: row.try_get("next_at")?,
+				input: row.try_get("input")?,
+				output: row.try_get("output")?,
+				deps: deps.map(|s| parse_u64_list(&s)).unwrap_or_default(),
+			})
+		}))
+	}
+
+	async fn list_task_ids(&self, kind: &str, keys: &[Box<str>]) -> ClResult<Vec<u64>> {
+		let mut query = sqlx::QueryBuilder::new("SELECT t.task_id FROM tasks t
+			WHERE status IN ('P') AND kind=");
+		query.push_bind(&kind)
+			//FIXME .push(" AND key IN ");
+			.push(" AND input IN ");
+		query = push_in(query, keys);
+
+		let res = query.build().fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+
+		collect_res(res.iter().map(|row| {
+			Ok(row.try_get("task_id")?)
+		}))
+	}
+
+	async fn create_task(&self, kind: &'static str, input: &str, deps: &[u64]) -> ClResult<u64> {
+		let mut tx = self.db.begin().await.map_err(|_| Error::DbError)?;
+
+		let res = sqlx::query("INSERT INTO tasks (tn_id, kind, status, input)
+			VALUES (?, ?, ?, ?) RETURNING task_id")
+			.bind(0).bind(&kind).bind("P").bind(&input)
+			.fetch_one(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let task_id = res.get(0);
+
+		for dep in deps {
+			sqlx::query("INSERT INTO task_dependencies (tn_id, task_id, dep_id) VALUES (?, ?, ?)")
+				.bind(0).bind(task_id as i64).bind(*dep as i64)
+				.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		}
+		tx.commit().await;
+
+		Ok(task_id)
+	}
+
+	async fn update_task_finished(&self, task_id: u64, output: &str) -> ClResult<()> {
+		sqlx::query("UPDATE tasks SET status='F', output=?, next_at=NULL WHERE task_id=? AND status='P'")
+			.bind(output).bind(task_id as i64)
+			.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+
+		Ok(())
+	}
+
+	async fn update_task_error(&self, task_id: u64, output: &str, next_at: Option<Timestamp>) -> ClResult<()> {
+		match next_at {
+			Some(next_at) => {
+				sqlx::query("UPDATE tasks SET error=?, next_at=? WHERE task_id=? AND status='P'")
+					.bind(output).bind(next_at).bind(task_id as i64)
+					.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			},
+			None => {
+				sqlx::query("UPDATE tasks SET error=?, status='E', next_at=NULL WHERE task_id=? AND status='P'")
+					.bind(output).bind(task_id as i64)
+					.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			}
+		}
+
+		Ok(())
 	}
 }
 
@@ -391,8 +554,8 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	/* Init DB */
 	/***********/
 
-	// Tenants //
-	/////////////
+	// Tenants
+	//*********
 	sqlx::query("CREATE TABLE IF NOT EXISTS tenants (
 		tn_id integer NOT NULL,
 		id_tag text NOT NULL,
@@ -404,15 +567,6 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		created_at datetime DEFAULT (unixepoch()),
 		PRIMARY KEY(tn_id)
 	)").execute(&mut *tx).await?;
-	// profileData:
-	//		intro text,
-	//		-- contact
-	//		phone text,
-	//		-- address
-	//		country text,
-	//		postCode text,
-	//		city text,
-	//		address text,
 
 	sqlx::query("CREATE TABLE IF NOT EXISTS tenant_data (
 		tn_id integer NOT NULL,
@@ -438,8 +592,8 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query("CREATE INDEX IF NOT EXISTS idx_subscriptions_tnid ON subscriptions(tn_id)")
 		.execute(&mut *tx).await?;
 
-	// Profiles //
-	//////////////
+	// Profiles
+	//**********
 	sqlx::query("CREATE TABLE IF NOT EXISTS profiles (
 		tn_id integer NOT NULL,
 		id_tag text,
@@ -459,8 +613,8 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_tnid_idtag ON profiles(tn_id, id_tag)")
 		.execute(&mut *tx).await?;
 
-	// Metadata //
-	//////////////
+	// Metadata
+	//**********
 	sqlx::query("CREATE TABLE IF NOT EXISTS tags (
 		tn_id integer NOT NULL,
 		tag text,
@@ -469,6 +623,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	)").execute(&mut *tx).await?;
 
 	// Files
+	//*******
 	sqlx::query("CREATE TABLE IF NOT EXISTS files (
 		f_id integer NOT NULL,
 		tn_id integer NOT NULL,
@@ -491,21 +646,22 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 
 	sqlx::query("CREATE TABLE IF NOT EXISTS file_variants (
 		tn_id integer NOT NULL,
-		variant_id text,
 		f_id integer NOT NULL,
+		variant_id text,
 		variant text,				-- 'orig' - original, 'hd' - high density, 'sd' - small density, 'tn' - thumbnail, 'ic' - icon
 		res_x integer,
 		res_y integer,
 		format text,
 		size integer,
+		available boolean,
 		global boolean,				-- true: stored in global cache
-		PRIMARY KEY(variant_id, tn_id)
+		PRIMARY KEY(f_id, variant_id, tn_id)
 	)").execute(&mut *tx).await?;
 	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_file_variants_fileid ON file_variants(f_id, variant, tn_id)")
 		.execute(&mut *tx).await?;
 
-	// Refs //
-	//////////
+	// Refs
+	//******
 	sqlx::query("CREATE TABLE IF NOT EXISTS refs (
 		tn_id integer NOT NULL,
 		ref_id text NOT NULL,
@@ -517,8 +673,8 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		PRIMARY KEY(tn_id, ref_id)
 	)").execute(&mut *tx).await?;
 
-	// Event store //
-	/////////////////
+	// Event store
+	//*************
 	sqlx::query("CREATE TABLE IF NOT EXISTS key_cache (
 		id_tag text,
 		keY_id text,
@@ -569,6 +725,30 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		next datetime,
 		PRIMARY KEY(action_id, tn_id, id_tag)
 	)").execute(&mut *tx).await?;
+
+	// Task scheduler
+	//****************
+	sqlx::query("CREATE TABLE IF NOT EXISTS tasks (
+		task_id integer NOT NULL,
+		tn_id integer NOT NULL,
+		kind text NOT NULL,
+		status char(1),			-- 'P': pending, 'F': finished, 'E': error
+		created_at datetime DEFAULT (unixepoch()),
+		next_at datetime,
+		input text,
+		output text,
+		error text,
+		PRIMARY KEY(task_id)
+	)").execute(&mut *tx).await?;
+
+	sqlx::query("CREATE TABLE IF NOT EXISTS task_dependencies (
+		task_id integer NOT NULL,
+		tn_id integer NOT NULL,
+		dep_id integer NOT NULL,
+		PRIMARY KEY(task_id, dep_id)
+	)").execute(&mut *tx).await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_task_dependencies_dep_id ON task_dependencies(dep_id)")
+		.execute(&mut *tx).await?;
 
 	tx.commit().await?;
 

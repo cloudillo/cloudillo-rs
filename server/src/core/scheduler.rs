@@ -1,14 +1,16 @@
 use async_trait::async_trait;
 use flume;
-use std::{collections::{BTreeMap, HashMap}, fmt::Debug, future::Future, pin::Pin, sync::{Arc, Mutex}};
+use std::{collections::{BTreeMap, HashMap}, fmt::Debug, future::Future, pin::Pin, sync::{Arc, Mutex, RwLock}};
 use serde::{Serialize, Deserialize, de::DeserializeOwned};
 
 use crate::{
 	prelude::*,
+	meta_adapter,
+	App,
 	types::{Timestamp, TimestampExt},
 };
 
-pub type TaskId = u32;
+pub type TaskId = u64;
 
 pub enum TaskType {
 	Periodic,
@@ -21,14 +23,37 @@ pub trait Task<S: Clone>: Send + Sync + Debug {
 		where Self: Sized;
 	fn build(id: TaskId, context: &str) -> ClResult<Arc<dyn Task<S>>>
 		where Self: Sized;
+	fn serialize(&self) -> String;
 	async fn run(&self, state: S) -> ClResult<()>;
+
+	fn kind_of(&self) -> &'static str;
+}
+
+#[derive(Debug)]
+pub enum TaskStatus {
+	Pending,
+	Finished,
+	Error,
+}
+
+pub struct TaskData {
+	id: TaskId,
+	kind: Box<str>,
+	status: TaskStatus,
+	input: Box<str>,
+	deps: Box<[TaskId]>,
+	next_at: Option<Timestamp>,
 }
 
 #[async_trait]
 pub trait TaskStore<S: Clone>: Send + Sync {
 	async fn add(&self, task: &TaskMeta<S>) -> ClResult<TaskId>;
+	async fn finished(&self, id: TaskId, output: &str) -> ClResult<()>;
+	async fn load(&self) -> ClResult<Vec<TaskData>>;
 }
 
+// InMemoryTaskStore
+//*******************
 pub struct InMemoryTaskStore {
 	last_id: Mutex<TaskId>,
 }
@@ -46,6 +71,56 @@ impl<S: Clone> TaskStore<S> for InMemoryTaskStore {
 		*last_id += 1;
 		Ok(*last_id)
 	}
+
+	async fn finished(&self, id: TaskId, output: &str) -> ClResult<()> {
+		Ok(())
+	}
+
+	async fn load(&self) -> ClResult<Vec<TaskData>> {
+		Ok(vec![])
+	}
+}
+
+// MetaAdapterTaskStore
+//**********************
+pub struct MetaAdapterTaskStore {
+	meta_adapter: Arc<dyn meta_adapter::MetaAdapter>,
+}
+
+impl MetaAdapterTaskStore {
+	pub fn new(meta_adapter: Arc<dyn meta_adapter::MetaAdapter>) -> Arc<Self> {
+		Arc::new(Self { meta_adapter })
+	}
+}
+
+#[async_trait]
+impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
+	async fn add(&self, task: &TaskMeta<S>) -> ClResult<TaskId> {
+		let id = self.meta_adapter.create_task(task.task.kind_of(), &task.task.serialize(), &task.deps).await?;
+		Ok(id)
+	}
+
+	async fn finished(&self, id: TaskId, output: &str) -> ClResult<()> {
+		self.meta_adapter.update_task_finished(id, output).await
+	}
+
+	async fn load(&self) -> ClResult<Vec<TaskData>> {
+		let tasks = self.meta_adapter.list_tasks(meta_adapter::ListTaskOptions::default()).await?;
+		let tasks = tasks.into_iter().map(|t| TaskData {
+			id: t.task_id,
+			kind: t.kind,
+			status: match t.status {
+				'P' => TaskStatus::Pending,
+				'F' => TaskStatus::Finished,
+				'E' => TaskStatus::Error,
+				_ => TaskStatus::Error,
+			},
+			input: t.input,
+			deps: t.deps,
+			next_at: t.next_at,
+		}).collect();
+		Ok(tasks)
+	}
 }
 
 type TaskBuilder<S> = dyn Fn(TaskId, &str) -> ClResult<Arc<dyn Task<S>>> + Send + Sync;
@@ -53,13 +128,13 @@ type TaskBuilder<S> = dyn Fn(TaskId, &str) -> ClResult<Arc<dyn Task<S>>> + Send 
 #[derive(Debug, Clone)]
 pub struct TaskMeta<S: Clone> {
 	pub task: Arc<dyn Task<S>>,
-	pub next: Option<Timestamp>,
+	pub next_at: Option<Timestamp>,
 	pub deps: Vec<TaskId>,
 }
 
 #[derive(Clone)]
 pub struct Scheduler<S: Clone> {
-	task_builders: HashMap<&'static str, Arc<TaskBuilder<S>>>,
+	task_builders: Arc<RwLock<HashMap<&'static str, Box<TaskBuilder<S>>>>>,
 	store: Arc<dyn TaskStore<S>>,
 	tasks_running: Arc<Mutex<HashMap<TaskId, TaskMeta<S>>>>,
 	tasks_waiting: Arc<Mutex<HashMap<TaskId, TaskMeta<S>>>>,
@@ -75,7 +150,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		let (tx_finish, rx_finish) = flume::unbounded();
 
 		let scheduler = Self {
-			task_builders: HashMap::new(),
+			task_builders: Arc::new(RwLock::new(HashMap::new())),
 			store,
 			tasks_running: Arc::new(Mutex::new(HashMap::new())),
 			tasks_waiting: Arc::new(Mutex::new(HashMap::new())),
@@ -91,15 +166,17 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		Arc::new(scheduler)
 	}
 
-	//fn run(&self, rx_finish: flume::Receiver<TaskId>) -> ClResult<()> {
 	pub fn start(&self, state: S) {
 
 		// Handle finished tasks and dependencies
 		let schedule = self.clone();
 		let stat = state.clone();
 		let rx_finish = self.rx_finish.clone();
+
 		tokio::spawn(async move {
 			while let Ok(id) = rx_finish.recv_async().await {
+				info!("Finished task {}", id);
+				schedule.store.finished(id, "").await.unwrap_or(());
 				schedule.tasks_running.lock().unwrap().remove(&id);
 				if let Some(dependents) = schedule.task_dependents.lock().unwrap().remove(&id) {
 					for dep in dependents {
@@ -149,45 +226,73 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				}
 			}
 		});
+
+		let schedule = self.clone();
+		tokio::spawn(async move {
+			schedule.load().await;
+		});
 	}
 
-	fn register_builder(&mut self, name: &'static str, builder: &'static TaskBuilder<S>) -> &mut Self {
-		self.task_builders.insert(name, Arc::new(builder));
-		self
+	fn register_builder(&self, name: &'static str, builder: &'static TaskBuilder<S>) -> ClResult<&Self> {
+		let mut task_builders = self.task_builders.write().map_err(|_| Error::Unknown)?;
+		task_builders.insert(name, Box::new(builder));
+		Ok(self)
 	}
 
-	pub fn register<T: Task<S>>(&mut self) -> &mut Self {
+	pub fn register<T: Task<S>>(&self) -> ClResult<&Self> {
+		info!("Registering task type {}", T::kind());
 		self.register_builder(T::kind(), &|id: TaskId, params: &str| {
 			T::build(id, params)
-		});
-		self
+		})?;
+		Ok(self)
 	}
 
-	pub async fn add(&self, task: Arc<dyn Task<S>>, not_before: Option<Timestamp>, dependencies: Option<Vec<TaskId>>) -> ClResult<TaskId> {
-		let deps = dependencies.clone();
-		let task_meta = TaskMeta { task: task.clone(), next: not_before, deps: dependencies.unwrap_or_default() };
+	pub async fn add(&self, task: Arc<dyn Task<S>>, next_at: Option<Timestamp>, deps: Option<Vec<TaskId>>) -> ClResult<TaskId> {
+		let task_meta = TaskMeta { task: task.clone(), next_at, deps: deps.clone().unwrap_or_default() };
 		let id = self.store.add(&task_meta).await?;
+		self.add_queue(id, task_meta).await
+	}
 
-		if deps.is_none() && not_before.unwrap_or(0) < Timestamp::now() {
-			//self.tasks_running.lock().map_err(|_| Error::Unknown)?.insert(id, task_meta);
+	pub async fn add_queue(&self, id: TaskId, task_meta: TaskMeta<S>) -> ClResult<TaskId> {
+		let deps = task_meta.deps.clone();
+
+		if deps.len() == 0 && task_meta.next_at.unwrap_or(0) < Timestamp::now() {
 			info!("Spawning task {}", id);
-			//self.spawn(task, id);
 			self.tasks_scheduled.lock().map_err(|_| Error::Unknown)?.insert((0, id), task_meta);
 			self.notify_schedule.notify_one();
-		} else if let Some(not_before) = not_before {
-			info!("Scheduling task {} for {}", id, not_before);
-			self.tasks_scheduled.lock().map_err(|_| Error::Unknown)?.insert((not_before, id), task_meta);
+		} else if let Some(next_at) = task_meta.next_at {
+			info!("Scheduling task {} for {}", id, next_at);
+			self.tasks_scheduled.lock().map_err(|_| Error::Unknown)?.insert((next_at, id), task_meta);
 			self.notify_schedule.notify_one();
 		} else {
 			self.tasks_waiting.lock().map_err(|_| Error::Unknown)?.insert(id, task_meta);
-			if let Some(ref deps) = deps {
-				info!("Task {} is waiting for {:?}", id, &deps);
-				for dep in deps {
-					self.task_dependents.lock().map_err(|_| Error::Unknown)?.entry(*dep).or_default().push(id);
-				}
+			info!("Task {} is waiting for {:?}", id, &deps);
+			for dep in deps {
+				self.task_dependents.lock().map_err(|_| Error::Unknown)?.entry(dep).or_default().push(id);
 			}
 		}
 		Ok(id)
+	}
+
+	async fn load(&self) -> ClResult<()> {
+		let tasks = self.store.load().await?;
+		info!("Loaded {} tasks from store", tasks.len());
+		for t in tasks {
+			match t.status {
+				TaskStatus::Pending => {
+					info!("Loading task {} {}", t.id, t.kind);
+					let task = {
+						let builder_map = self.task_builders.read().map_err(|_| Error::Unknown)?;
+						let builder = builder_map.get(t.kind.as_ref()).ok_or(Error::Unknown)?;
+						builder(t.id, &t.input)?
+					};
+					let task_meta = TaskMeta { task, next_at: t.next_at, deps: t.deps.into() };
+					self.add_queue(t.id, task_meta).await?;
+				},
+				_ => (),
+			}
+		}
+		Ok(())
 	}
 
 	fn spawn_task(&self, state: S, task: Arc<dyn Task<S>>, id: TaskId) {
@@ -209,11 +314,9 @@ mod tests {
 	#[derive(Debug, Serialize, Deserialize)]
 	struct TestTask {
 		num: u8,
-		//res: Arc<Mutex<Vec<u8>>>,
 	}
 
 	impl TestTask {
-		//pub fn new(num: u8, res: Arc<Mutex<Vec<u8>>>) -> Arc<Self> {
 		pub fn new(num: u8) -> Arc<Self> {
 			Arc::new(Self { num })
 		}

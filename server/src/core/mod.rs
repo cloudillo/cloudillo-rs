@@ -1,5 +1,6 @@
 pub mod acme;
 pub mod extract;
+pub mod hasher;
 pub mod request;
 pub mod middleware;
 pub mod scheduler;

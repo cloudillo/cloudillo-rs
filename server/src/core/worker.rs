@@ -2,6 +2,8 @@ use std::{sync::Arc, thread};
 use flume::{Receiver, Sender};
 use futures::channel::oneshot;
 
+use crate::prelude::*;
+
 #[derive(Clone, Copy, Debug)]
 pub enum Priority {
 	High,
@@ -81,6 +83,7 @@ impl WorkerPool {
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
 	{
+		info!("[RUN normal]");
 		let (res_tx, res_rx) = oneshot::channel();
 
 		let job = Box::new(move || {
@@ -98,6 +101,7 @@ impl WorkerPool {
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
 	{
+		info!("[RUN immed]");
 		let (res_tx, res_rx) = oneshot::channel();
 
 		let job = Box::new(move || {
@@ -105,7 +109,7 @@ impl WorkerPool {
 			res_tx.send(result);
 		});
 
-		self.tx_med.send(job).unwrap();
+		self.tx_high.send(job).unwrap();
 
 		async move { res_rx.await.expect("worker dropped result") }
 	}
@@ -115,6 +119,7 @@ impl WorkerPool {
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
 	{
+		info!("[RUN slow]");
 		let (res_tx, res_rx) = oneshot::channel();
 
 		let job = Box::new(move || {

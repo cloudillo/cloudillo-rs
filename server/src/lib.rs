@@ -1,4 +1,5 @@
 #![allow(unused)]
+#![forbid(unsafe_code)]
 
 use axum::{
 	extract::{State, Query},
@@ -50,17 +51,17 @@ pub struct AppState {
 	pub certs: RwLock<HashMap<Box<str>, Arc<CertifiedKey>>>,
 	pub opts: BuilderOpts,
 
-	pub auth_adapter: Box<dyn AuthAdapter>,
-	pub meta_adapter: Box<dyn MetaAdapter>,
-	pub blob_adapter: Box<dyn BlobAdapter>,
+	pub auth_adapter: Arc<dyn AuthAdapter>,
+	pub meta_adapter: Arc<dyn MetaAdapter>,
+	pub blob_adapter: Arc<dyn BlobAdapter>,
 }
 
 pub type App = Arc<AppState>;
 
 pub struct Adapters {
-	pub auth_adapter: Option<Box<dyn AuthAdapter>>,
-	pub meta_adapter: Option<Box<dyn MetaAdapter>>,
-	pub blob_adapter: Option<Box<dyn BlobAdapter>>,
+	pub auth_adapter: Option<Arc<dyn AuthAdapter>>,
+	pub meta_adapter: Option<Arc<dyn MetaAdapter>>,
+	pub blob_adapter: Option<Arc<dyn BlobAdapter>>,
 }
 
 #[derive(Debug)]
@@ -130,12 +131,13 @@ impl Builder {
 	pub fn worker(&mut self, worker: Arc<worker::WorkerPool>) -> &mut Self { self.worker = Some(worker); self }
 
 	// Adapters
-	pub fn auth_adapter(&mut self, auth_adapter: Box<dyn auth_adapter::AuthAdapter>) -> &mut Self { self.adapters.auth_adapter = Some(auth_adapter); self }
-	pub fn meta_adapter(&mut self, meta_adapter: Box<dyn meta_adapter::MetaAdapter>) -> &mut Self { self.adapters.meta_adapter = Some(meta_adapter); self }
-	pub fn blob_adapter(&mut self, blob_adapter: Box<dyn blob_adapter::BlobAdapter>) -> &mut Self { self.adapters.blob_adapter = Some(blob_adapter); self }
+	pub fn auth_adapter(&mut self, auth_adapter: Arc<dyn auth_adapter::AuthAdapter>) -> &mut Self { self.adapters.auth_adapter = Some(auth_adapter); self }
+	pub fn meta_adapter(&mut self, meta_adapter: Arc<dyn meta_adapter::MetaAdapter>) -> &mut Self { self.adapters.meta_adapter = Some(meta_adapter); self }
+	pub fn blob_adapter(&mut self, blob_adapter: Arc<dyn blob_adapter::BlobAdapter>) -> &mut Self { self.adapters.blob_adapter = Some(blob_adapter); self }
 
 	pub async fn run(self) -> ClResult<()> {
-		let mut task_store: Arc<dyn scheduler::TaskStore<App>> = scheduler::InMemoryTaskStore::new();
+		let meta_adapter = self.adapters.meta_adapter.expect("FATAL: No meta adapter");
+		let mut task_store: Arc<dyn scheduler::TaskStore<App>> = scheduler::MetaAdapterTaskStore::new(meta_adapter.clone());
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker: self.worker.expect("FATAL: No worker pool defined"),
@@ -145,7 +147,7 @@ impl Builder {
 			opts: self.opts,
 
 			auth_adapter: self.adapters.auth_adapter.expect("FATAL: No auth adapter"),
-			meta_adapter: self.adapters.meta_adapter.expect("FATAL: No meta adapter"),
+			meta_adapter,
 			blob_adapter: self.adapters.blob_adapter.expect("FATAL: No blob adapter"),
 		});
 		tokio::fs::create_dir_all(&app.opts.tmp_dir).await.expect("Cannot create tmp dir");
@@ -156,7 +158,13 @@ impl Builder {
 			//.with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
 			.init();
 
+		// Init modules
+		action::init(&app);
+		file::init(&app);
 		let (mut api_router, mut app_router, mut http_router) = routes::init(app.clone());
+
+		// Start scheduler
+		app.scheduler.start(app.clone());
 
 		let https_server = webserver::create_https_server(app.clone(), &app.opts.listen, api_router, app_router).await?;
 
@@ -168,9 +176,6 @@ impl Builder {
 		} else {
 			None
 		};
-
-		// Start scheduler
-		app.scheduler.start(app.clone());
 
 		// Run bootstrapper in the background
 		tokio::spawn(async move {
