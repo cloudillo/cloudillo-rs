@@ -47,7 +47,7 @@ pub struct TaskData {
 
 #[async_trait]
 pub trait TaskStore<S: Clone>: Send + Sync {
-	async fn add(&self, task: &TaskMeta<S>) -> ClResult<TaskId>;
+	async fn add(&self, task: &TaskMeta<S>, key: Option<&str>) -> ClResult<TaskId>;
 	async fn finished(&self, id: TaskId, output: &str) -> ClResult<()>;
 	async fn load(&self) -> ClResult<Vec<TaskData>>;
 }
@@ -66,7 +66,7 @@ impl InMemoryTaskStore {
 
 #[async_trait]
 impl<S: Clone> TaskStore<S> for InMemoryTaskStore {
-	async fn add(&self, task: &TaskMeta<S>) -> ClResult<TaskId> {
+	async fn add(&self, task: &TaskMeta<S>, key: Option<&str>) -> ClResult<TaskId> {
 		let mut last_id = self.last_id.lock().map_err(|_| Error::Unknown)?;
 		*last_id += 1;
 		Ok(*last_id)
@@ -95,8 +95,8 @@ impl MetaAdapterTaskStore {
 
 #[async_trait]
 impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
-	async fn add(&self, task: &TaskMeta<S>) -> ClResult<TaskId> {
-		let id = self.meta_adapter.create_task(task.task.kind_of(), &task.task.serialize(), &task.deps).await?;
+	async fn add(&self, task: &TaskMeta<S>, key: Option<&str>) -> ClResult<TaskId> {
+		let id = self.meta_adapter.create_task(task.task.kind_of(), key, &task.task.serialize(), &task.deps).await?;
 		Ok(id)
 	}
 
@@ -247,10 +247,18 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		Ok(self)
 	}
 
-	pub async fn add(&self, task: Arc<dyn Task<S>>, next_at: Option<Timestamp>, deps: Option<Vec<TaskId>>) -> ClResult<TaskId> {
+	pub async fn add_full(&self, task: Arc<dyn Task<S>>, key: Option<&str>, next_at: Option<Timestamp>, deps: Option<Vec<TaskId>>) -> ClResult<TaskId> {
 		let task_meta = TaskMeta { task: task.clone(), next_at, deps: deps.clone().unwrap_or_default() };
-		let id = self.store.add(&task_meta).await?;
+		let id = self.store.add(&task_meta, key).await?;
 		self.add_queue(id, task_meta).await
+	}
+
+	pub async fn add(&self, task: Arc<dyn Task<S>>) -> ClResult<TaskId> {
+		self.add_full(task, None, None, None).await
+	}
+
+	pub async fn add_with_deps(&self, task: Arc<dyn Task<S>>, deps: Option<Vec<TaskId>>) -> ClResult<TaskId> {
+		self.add_full(task, None, None, deps).await
 	}
 
 	pub async fn add_queue(&self, id: TaskId, task_meta: TaskMeta<S>) -> ClResult<TaskId> {

@@ -133,9 +133,9 @@ async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, content_typ
 	let task_sd = image::ImageResizerTask::new(tn_id, f_id, orig_file.clone(), "sd", image::ImageFormat::Avif, (720, 720));
 	let task_hd = image::ImageResizerTask::new(tn_id, f_id, orig_file, "hd", image::ImageFormat::Avif, (1280, 1280));
 
-	let task_sd_id = app.scheduler.add(task_sd, None, None).await?;
-	let task_hd_id = app.scheduler.add(task_hd, None, None).await?;
-	let task_id = app.scheduler.add(file::FileIdGeneratorTask::new(tn_id, f_id) , None, Some(vec![task_sd_id, task_hd_id])).await?;
+	let task_sd_id = app.scheduler.add(task_sd).await?;
+	let task_hd_id = app.scheduler.add(task_hd).await?;
+	let task_id = app.scheduler.add_full(file::FileIdGeneratorTask::new(tn_id, f_id), Some(format!("{},{}", tn_id, f_id).as_str()), None, Some(vec![task_sd_id, task_hd_id])).await?;
 
 	Ok(Json(json!({"fileId": format!("@{}", f_id), "thumbnailVariantId": variant_id_tn })))
 }
@@ -155,7 +155,7 @@ pub async fn post_file(
 	match content_type {
 		"image/jpeg" | "image/png" | "image/webp" | "image/avif" => {
 			let bytes = to_bytes(body, 50000000).await?;
-			let orig_variant_id = hasher::hash(&bytes);
+			let orig_variant_id = hasher::hash("b", &bytes);
 			let dim = image::get_image_dimensions(&bytes).await?;
 			info!("dimensions: {}/{}", dim.0, dim.1);
 			let f_id = app.meta_adapter.create_file(tn_id, meta_adapter::CreateFile {

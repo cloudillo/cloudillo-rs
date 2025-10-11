@@ -14,22 +14,24 @@ use cloudillo::{
 
 /// Calculates the path of the directory for a blob
 fn obj_dir(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
-	if file_id.len() < 4 { Err(Error::Unknown)? };
+	let hash_start = file_id.find('~').ok_or(Error::Unknown)? + 1;
+	if file_id.len() < hash_start + 4 { Err(Error::Unknown)? };
 
 	Ok(PathBuf::from(base_dir)
 		.join(tn_id.to_string())
-		.join(&file_id[..2])
-		.join(&file_id[2..4]))
+		.join(&file_id[hash_start..hash_start + 2])
+		.join(&file_id[hash_start + 2..hash_start + 4]))
 }
 
 fn obj_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
-	if file_id.len() < 5 { Err(Error::Unknown)? };
+	let hash_start = file_id.find('~').ok_or(Error::Unknown)? + 1;
+	if file_id.len() < hash_start + 5 { Err(Error::Unknown)? };
 
 	Ok(PathBuf::from(base_dir)
 		.join(tn_id.to_string())
-		.join(&file_id[..2])
-		.join(&file_id[2..4])
-		.join(&file_id[4..]))
+		.join(&file_id[hash_start..hash_start + 2])
+		.join(&file_id[hash_start + 2..hash_start + 4])
+		.join(&file_id))
 }
 
 #[derive(Debug)]

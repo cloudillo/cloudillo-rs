@@ -11,7 +11,7 @@ use rustls::{
 	server::{ResolvesServerCert, ClientHello}
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use std::{collections::HashMap, net::SocketAddr, sync::{Arc, Mutex}, fs::File, io::BufReader};
+use std::{collections::HashMap, net::{SocketAddr, SocketAddrV4}, str::FromStr, sync::{Arc, Mutex}, fs::File, io::BufReader};
 use tokio::{net::TcpListener, io::{AsyncReadExt, AsyncWriteExt}};
 use tokio_rustls::TlsAcceptor;
 use tower::{Service, /*util::ServiceExt*/};
@@ -97,7 +97,7 @@ pub async fn create_https_server(mut state: Arc<AppState>, listen: &str, api_rou
 		.with_cert_resolver(cert_resolver);
 	server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-	let addr = SocketAddr::from(([0, 0, 0, 0], 1443));
+	let addr = SocketAddr::from_str(listen).map_err(|_| std::io::ErrorKind::Other)?;
 	let https_server = axum_server::bind_rustls(addr, axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config)));
 
 	let svc = tower::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {

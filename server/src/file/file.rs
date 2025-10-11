@@ -82,7 +82,7 @@ impl Task<App> for FileIdGeneratorTask {
 
 		let mut hasher = Hasher::new();
 		hasher.update(descriptor.as_bytes());
-		let file_id = hasher.finalize();
+		let file_id = hasher.finalize("f");
 		app.meta_adapter.update_file_id(self.tn_id, self.f_id, &file_id).await?;
 
 		info!("Finished task file.id-generator {} {}", descriptor, file_id);

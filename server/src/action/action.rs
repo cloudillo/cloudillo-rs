@@ -27,7 +27,7 @@ pub async fn create_action(app: &App, tn_id: TnId, id_tag: &str, action: meta_ad
 	info!("Dependencies: {:?}", deps);
 
 	let task = ActionCreatorTask::new(tn_id, Box::from(id_tag), action);
-	let task_id = app.scheduler.add(task, None, Some(deps)).await?;
+	let task_id = app.scheduler.add_with_deps(task, Some(deps)).await?;
 
 	Ok(Box::from("FIXME"))
 }
@@ -63,7 +63,7 @@ impl Task<App> for ActionCreatorTask {
 	async fn run(&self, app: App) -> ClResult<()> {
 		info!("Running task action.create {:?} {:?}", self.tn_id, &self.action);
 		let action_token = app.auth_adapter.create_action_token(self.tn_id, self.action.clone()).await?;
-		let action_id = hasher::hash(action_token.as_bytes());
+		let action_id = hasher::hash("a", action_token.as_bytes());
 
 		let attachments: Option<Vec<Box<str>>> = if let Some(attachments) = &self.action.attachments {
 			let mut attachment_vec: Vec<Box<str>> = Vec::new();

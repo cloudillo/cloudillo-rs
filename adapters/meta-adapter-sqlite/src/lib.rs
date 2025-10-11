@@ -241,49 +241,72 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 		let res = query.build().fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
-		collect_res(res.iter().map(|row| {
-			let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag")?;
-			let audienc_tag = row.try_get::<Option<Box<str>>, _>("audience")?;
-			let attachments = row.try_get::<Option<Box<str>>, _>("attachments")?;
-			let attachments = attachments.map(|s| parse_str_list(&s).iter().map(|a| meta_adapter::AttachmentView { file_id: a.clone(), dim: None }).collect::<Vec<_>>());
+		let mut actions = Vec::new();
+		let mut iter = res.iter();
+		while let Some(row) = iter.next() {
+			let action_id = row.try_get::<Box<str>, _>("action_id").map_err(|_| Error::DbError)?;
+			info!("row: {:?}", action_id);
+
+			let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag").map_err(|_| Error::DbError)?;
+			let audience_tag = row.try_get::<Option<Box<str>>, _>("audience").map_err(|_| Error::DbError)?;
+
+			// collect attachments
+			let attachments = row.try_get::<Option<Box<str>>, _>("attachments").inspect_err(inspect).map_err(|_| Error::DbError)?;
+			let attachments = if let Some(attachments) = &attachments {
+				info!("attachments: {:?}", attachments);
+				let mut attachments = parse_str_list(attachments).iter().map(|a| meta_adapter::AttachmentView { file_id: a.clone(), dim: None }).collect::<Vec<_>>();
+				info!("attachments: {:?}", attachments);
+				for a in attachments.iter_mut() {
+					if let Ok(file_res) = sqlx::query("SELECT x->>'dim' as dim FROM files WHERE tn_id=? AND file_id=?").bind(tn_id).bind(&a.file_id).fetch_one(&self.dbr).await.inspect_err(inspect) {
+						a.dim = serde_json::from_str(file_res.try_get("dim").inspect_err(inspect).map_err(|_| Error::DbError)?)?;
+					}
+					info!("attachment: {:?}", a);
+				}
+				Some(attachments)
+			} else {
+				None
+			};
+
 			// stat
 			let stat = Some(Box::from("stat"));
-			Ok(meta_adapter::ActionView {
-				action_id: row.try_get::<Box<str>, _>("action_id")?,
-				typ: row.try_get::<Box<str>, _>("type")?,
-				sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type")?,
-				parent_id: row.try_get::<Option<Box<str>>, _>("parent_id")?,
-				root_id: row.try_get::<Option<Box<str>>, _>("root_id")?,
+			actions.push(meta_adapter::ActionView {
+				action_id: row.try_get::<Box<str>, _>("action_id").map_err(|_| Error::DbError)?,
+				typ: row.try_get::<Box<str>, _>("type").map_err(|_| Error::DbError)?,
+				sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type").map_err(|_| Error::DbError)?,
+				parent_id: row.try_get::<Option<Box<str>>, _>("parent_id").map_err(|_| Error::DbError)?,
+				root_id: row.try_get::<Option<Box<str>>, _>("root_id").map_err(|_| Error::DbError)?,
 				issuer: meta_adapter::ProfileInfo {
 					id_tag: issuer_tag,
-					name: row.try_get::<Box<str>, _>("issuer_name")?,
-					typ: match row.try_get::<Option<&str>, _>("type")? {
+					name: row.try_get::<Box<str>, _>("issuer_name").map_err(|_| Error::DbError)?,
+					typ: match row.try_get::<Option<&str>, _>("type").map_err(|_| Error::DbError)? {
 						Some("C") => meta_adapter::ProfileType::Community,
 						_ => meta_adapter::ProfileType::Person,
 					},
-					profile_pic: row.try_get::<Option<Box<str>>, _>("issuer_profile_pic")?,
+					profile_pic: row.try_get::<Option<Box<str>>, _>("issuer_profile_pic").map_err(|_| Error::DbError)?,
 				},
-				audience: if let Some(audienc_tag) = audienc_tag {
+				audience: if let Some(audience_tag) = audience_tag {
 					Some(meta_adapter::ProfileInfo {
-						id_tag: audienc_tag,
-						name: row.try_get::<Box<str>, _>("audience_name")?,
-						typ: match row.try_get::<Option<&str>, _>("type")? {
+						id_tag: audience_tag,
+						name: row.try_get::<Box<str>, _>("audience_name").map_err(|_| Error::DbError)?,
+						typ: match row.try_get::<Option<&str>, _>("type").map_err(|_| Error::DbError)? {
 							Some("C") => meta_adapter::ProfileType::Community,
 							_ => meta_adapter::ProfileType::Person,
 						},
-						profile_pic: row.try_get::<Option<Box<str>>, _>("audience_profile_pic")?,
+						profile_pic: row.try_get::<Option<Box<str>>, _>("audience_profile_pic").map_err(|_| Error::DbError)?,
 					})
 				} else { None },
-				subject: row.try_get("subject")?,
-				content: row.try_get("content")?,
+				subject: row.try_get("subject").map_err(|_| Error::DbError)?,
+				content: row.try_get("content").map_err(|_| Error::DbError)?,
 				attachments,
-				created_at: row.try_get("created_at")?,
-				expires_at: row.try_get("expires_at")?,
-				status: row.try_get("status")?,
+				created_at: row.try_get("created_at").map_err(|_| Error::DbError)?,
+				expires_at: row.try_get("expires_at").map_err(|_| Error::DbError)?,
+				status: row.try_get("status").map_err(|_| Error::DbError)?,
 				stat,
 				//own_reaction: row.try_get("own_reaction")?,
 			})
-		}))
+		}
+
+		Ok(actions)
 	}
 
 	async fn list_action_tokens(&self, tn_id: u32, opts: &meta_adapter::ListActionOptions) -> ClResult<Box<[Box<str>]>> {
@@ -459,9 +482,9 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		let res = sqlx::query("SELECT t.task_id, t.tn_id, t.kind, t.status, t.created_at, t.next_at,
 			t.input, t.output, string_agg(td.dep_id, ',') as deps
 			FROM tasks t
-			LEFT JOIN task_dependencies td ON td.tn_id=t.tn_id AND td.task_id=t.task_id
-			WHERE true
-			GROUP BY t.task_id, t.tn_id")
+			LEFT JOIN task_dependencies td ON td.task_id=t.task_id
+			WHERE status IN ('P')
+			GROUP BY t.task_id")
 			.fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 		collect_res(res.iter().map(|row| {
@@ -496,18 +519,18 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		}))
 	}
 
-	async fn create_task(&self, kind: &'static str, input: &str, deps: &[u64]) -> ClResult<u64> {
+	async fn create_task(&self, kind: &'static str, key: Option<&str>, input: &str, deps: &[u64]) -> ClResult<u64> {
 		let mut tx = self.db.begin().await.map_err(|_| Error::DbError)?;
 
-		let res = sqlx::query("INSERT INTO tasks (tn_id, kind, status, input)
-			VALUES (?, ?, ?, ?) RETURNING task_id")
-			.bind(0).bind(&kind).bind("P").bind(&input)
+		let res = sqlx::query("INSERT INTO tasks (tn_id, kind, key, status, input)
+			VALUES (?, ?, ?, ?, ?) RETURNING task_id")
+			.bind(0).bind(&kind).bind(&key).bind("P").bind(&input)
 			.fetch_one(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 		let task_id = res.get(0);
 
 		for dep in deps {
-			sqlx::query("INSERT INTO task_dependencies (tn_id, task_id, dep_id) VALUES (?, ?, ?)")
-				.bind(0).bind(task_id as i64).bind(*dep as i64)
+			sqlx::query("INSERT INTO task_dependencies (task_id, dep_id) VALUES (?, ?)")
+				.bind(task_id as i64).bind(*dep as i64)
 				.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 		}
 		tx.commit().await;
@@ -518,6 +541,9 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	async fn update_task_finished(&self, task_id: u64, output: &str) -> ClResult<()> {
 		sqlx::query("UPDATE tasks SET status='F', output=?, next_at=NULL WHERE task_id=? AND status='P'")
 			.bind(output).bind(task_id as i64)
+			.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		sqlx::query("DELETE FROM task_dependencies WHERE dep_id=?")
+			.bind(task_id as i64)
 			.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 		Ok(())
@@ -732,6 +758,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		task_id integer NOT NULL,
 		tn_id integer NOT NULL,
 		kind text NOT NULL,
+		key text,
 		status char(1),			-- 'P': pending, 'F': finished, 'E': error
 		created_at datetime DEFAULT (unixepoch()),
 		next_at datetime,
@@ -740,13 +767,14 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		error text,
 		PRIMARY KEY(task_id)
 	)").execute(&mut *tx).await?;
+	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_task_kind_key ON tasks(kind, key)")
+		.execute(&mut *tx).await?;
 
 	sqlx::query("CREATE TABLE IF NOT EXISTS task_dependencies (
 		task_id integer NOT NULL,
-		tn_id integer NOT NULL,
 		dep_id integer NOT NULL,
 		PRIMARY KEY(task_id, dep_id)
-	)").execute(&mut *tx).await?;
+	) WITHOUT ROWID").execute(&mut *tx).await?;
 	sqlx::query("CREATE INDEX IF NOT EXISTS idx_task_dependencies_dep_id ON task_dependencies(dep_id)")
 		.execute(&mut *tx).await?;
 

@@ -10,7 +10,7 @@ pub async fn create_blob_buf(app: &App, tn_id: TnId, data: &[u8], opts: blob_ada
 	let tm = std::time::SystemTime::now();
 	let mut hasher = hasher::Hasher::new();
 	hasher.update(data);
-	let file_id = hasher.finalize();
+	let file_id = hasher.finalize("b");
 	info!("SHA256 elapsed: {}ms", tm.elapsed().unwrap().as_millis());
 	app.blob_adapter.create_blob_buf(tn_id, &file_id, data, &opts).await?;
 

@@ -444,7 +444,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	//****************
 	async fn list_tasks(&self, opts: ListTaskOptions) -> ClResult<Vec<Task>>;
 	async fn list_task_ids(&self, kind: &str, keys: &[Box<str>]) -> ClResult<Vec<u64>>;
-	async fn create_task(&self, kind: &'static str, input: &str, deps: &[u64]) -> ClResult<u64>;
+	async fn create_task(&self, kind: &'static str, key: Option<&str>, input: &str, deps: &[u64]) -> ClResult<u64>;
 	async fn update_task_finished(&self, task_id: u64, output: &str) -> ClResult<()>;
 	async fn update_task_error(&self, task_id: u64, output: &str, next_at: Option<Timestamp>) -> ClResult<()>;
 }

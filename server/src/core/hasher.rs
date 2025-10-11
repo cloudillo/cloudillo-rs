@@ -22,26 +22,26 @@ impl Hasher {
 		}
 	}
 
-	pub fn finalize(self) -> String {
+	pub fn finalize(self, prefix: &str) -> String {
 		match self {
 			//Self::V2(hasher) => "2.".to_string() + &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
-			Self::V1(hasher) => base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+			Self::V1(hasher) => prefix.to_string() + "1~" + &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
 		}
 	}
 }
 
-pub fn hash_v1(data: &[u8]) -> Box<str> {
+pub fn hash_v1(prefix: &str, data: &[u8]) -> Box<str> {
 	let tm = std::time::SystemTime::now();
 	let mut hasher = Hasher::new();
 	hasher.update(data);
-	let result = hasher.finalize();
+	let result = hasher.finalize(prefix);
 	info!("elapsed: {}ms", tm.elapsed().unwrap().as_millis());
 
 	result.into()
 }
 
-pub fn hash(data: &[u8]) -> Box<str> {
-	hash_v1(data)
+pub fn hash(prefix: &str, data: &[u8]) -> Box<str> {
+	hash_v1(prefix, data)
 }
 
 // vim: ts=4
