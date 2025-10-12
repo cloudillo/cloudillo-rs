@@ -1,3 +1,8 @@
+//! Basic **Cloudillo** Server
+//!
+//! Implements a self-contained, basic **Cloudillo** server with adapters using embedded databases and file system.
+//! Configuration is done through environment variables, ideal for self-hosting with containerization.
+
 #![allow(unused)]
 
 use std::{sync::Arc, env, path::PathBuf};
