@@ -1,6 +1,8 @@
+//! Request client implementation
+
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{prelude::*, App};
+use crate::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct Request(reqwest::Client);

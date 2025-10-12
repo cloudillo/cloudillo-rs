@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use crate::{
 	prelude::*,
-	App,
 	file::file,
 	core::hasher,
 	core::request,

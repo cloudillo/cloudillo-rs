@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::prelude::*;
-use crate::App;
 use crate::meta_adapter;
 use crate::core::{hasher::Hasher, scheduler::{Task, TaskId}};
 use crate::types::TnId;

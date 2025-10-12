@@ -10,7 +10,6 @@ use crate::{
 	core::IdTag,
 	auth_adapter,
 	meta_adapter,
-	App,
 };
 
 pub async fn create_key(State(app): State<App>) -> (StatusCode, Json<auth_adapter::AuthKey>) {

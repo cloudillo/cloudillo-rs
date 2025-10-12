@@ -61,7 +61,7 @@ async fn main() {
 	let meta_adapter = Arc::new(MetaAdapterSqlite::new(worker.clone(), config.db_dir.join("meta.db")).await.unwrap());
 	let blob_adapter = Arc::new(BlobAdapterFs::new(config.data_dir.into()).await.unwrap());
 
-	let mut cloudillo = cloudillo::Builder::new();
+	let mut cloudillo = cloudillo::AppBuilder::new();
 	cloudillo.mode(config.mode)
 		.listen(config.listen)
 		.base_id_tag(config.base_id_tag)

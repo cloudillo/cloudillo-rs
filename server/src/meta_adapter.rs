@@ -1,3 +1,5 @@
+//! Adapter that manages metadata. Everything including tenants, profiles, actions, file metadata, etc.
+
 use async_trait::async_trait;
 use std::{cmp::Ordering, fmt::Debug, collections::HashMap};
 use serde::{Serialize, Deserialize};
@@ -5,7 +7,6 @@ use serde_with::skip_serializing_none;
 
 use crate::{
 	prelude::*,
-	AppState,
 	types::{Timestamp, TnId},
 };
 

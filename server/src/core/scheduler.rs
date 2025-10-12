@@ -1,3 +1,5 @@
+//! Scheduler subsystem. Handles async tasks, dependencies, fallbacks, repetitions, persistence..
+
 use async_trait::async_trait;
 use flume;
 use std::{collections::{BTreeMap, HashMap}, fmt::Debug, future::Future, pin::Pin, sync::{Arc, Mutex, RwLock}};
@@ -6,7 +8,6 @@ use serde::{Serialize, Deserialize, de::DeserializeOwned};
 use crate::{
 	prelude::*,
 	meta_adapter,
-	App,
 	types::now,
 };
 

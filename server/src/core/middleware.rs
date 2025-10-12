@@ -1,3 +1,5 @@
+//! Custom middlewares
+
 use async_trait::async_trait;
 use axum::{
 	body::Body,
@@ -9,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time};
 
 use crate::prelude::*;
-use crate::{App, auth_adapter, core::Auth, types};
+use crate::{auth_adapter, core::Auth};
 
 pub async fn require_auth(State(state): State<App>, tn_id: TnId, mut req: Request<Body>, next: Next) -> ClResult<Response<Body>> {
 	let auth_header = req

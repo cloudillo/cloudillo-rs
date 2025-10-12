@@ -1,3 +1,5 @@
+//! API routes
+
 use axum::{Router, Extension, middleware, http::{header, StatusCode}, response::IntoResponse, routing::{any, get, post}};
 use std::sync::Arc;
 use tower_http::{
@@ -6,7 +8,6 @@ use tower_http::{
 };
 
 use crate::prelude::*;
-use crate::App;
 use crate::core::acme;
 use crate::core::middleware::{require_auth, optional_auth};
 use crate::core::websocket;
@@ -62,10 +63,6 @@ fn init_api_service(app: App) -> Router {
 		.merge(protected_router)
 		.layer(cors_layer)
 		.with_state(app)
-}
-
-fn handle_error() -> impl IntoResponse {
-	(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
 }
 
 fn init_app_service(app: App) -> Router {

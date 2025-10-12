@@ -1,3 +1,5 @@
+//! ACME subsystem. Handles automatic certificate management using Let's Encrypt.
+
 use std::{
 	collections::HashMap,
 	sync::Arc,
@@ -13,7 +15,6 @@ use pem;
 use x509_parser::{parse_x509_certificate, pem::Pem};
 
 use crate::prelude::*;
-use crate::AppState;
 use crate::auth_adapter;
 
 #[derive(Debug)]
@@ -31,7 +32,7 @@ struct TenantCertData {
 	cert_data: X509CertData,
 }
 
-pub async fn init(state: Arc<AppState>, acme_email: &str, id_tag: &str, app_domain: Option<&str>) -> ClResult<()> {
+pub async fn init(state: App, acme_email: &str, id_tag: &str, app_domain: Option<&str>) -> ClResult<()> {
 	info!("ACME init {}", acme_email);
 
 	let (account, credentials) = Account::builder()?.create(
@@ -51,7 +52,7 @@ pub async fn init(state: Arc<AppState>, acme_email: &str, id_tag: &str, app_doma
 	Ok(())
 }
 
-pub async fn renew_tenant<'a>(state: Arc<AppState>, account: &'a acme::Account, id_tag: &'a str, tn_id: u32, app_domain: Option<&'a str>) -> ClResult<()> {
+pub async fn renew_tenant<'a>(state: App, account: &'a acme::Account, id_tag: &'a str, tn_id: u32, app_domain: Option<&'a str>) -> ClResult<()> {
 	let mut domains: Vec<String> = vec!["cl-o.".to_string() + &id_tag];
 	if let Some(app_domain) = app_domain {
 		domains.push(app_domain.to_string());
@@ -74,8 +75,8 @@ pub async fn renew_tenant<'a>(state: Arc<AppState>, account: &'a acme::Account, 
 	Ok(())
 }
 
-//async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account, domains: Vec<String>) -> Result<X509CertData, Box<dyn std::error::Error + 'a>> {
-async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account, domains: Vec<String>) -> ClResult<X509CertData> {
+//async fn renew_domains<'a>(state: &'a App, account: &'a acme::Account, domains: Vec<String>) -> Result<X509CertData, Box<dyn std::error::Error + 'a>> {
+async fn renew_domains<'a>(state: &'a App, account: &'a acme::Account, domains: Vec<String>) -> ClResult<X509CertData> {
 	info!("ACME {:?}", &domains);
 	let identifiers = domains.iter().map(|domain| acme::Identifier::Dns(domain.to_string())).collect::<Vec<_>>();
 
@@ -147,7 +148,7 @@ async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account,
 }
 
 pub async fn get_acme_challenge(
-	State(state): State<Arc<AppState>>,
+	State(state): State<App>,
 	headers: HeaderMap,
 ) -> ClResult<Box<str>> {
 	let domain = headers.get("host").ok_or(Error::Unknown)?.to_str()?;

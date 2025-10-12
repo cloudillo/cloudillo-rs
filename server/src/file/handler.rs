@@ -7,7 +7,6 @@ use std::{any::Any, path::Path, pin::Pin, rc::Rc, sync::Arc};
 use crate::prelude::*;
 use crate::blob_adapter;
 use crate::meta_adapter;
-use crate::App;
 use crate::types::{self, Timestamp};
 use crate::file::{file, image, store};
 use crate::core::{hasher, Auth};

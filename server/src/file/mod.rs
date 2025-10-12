@@ -1,9 +1,11 @@
+//! File subsystem. File storage, metadata, documents, etc.
+
 pub mod file;
 pub mod handler;
 pub mod image;
 pub mod store;
 
-use crate::App;
+use crate::prelude::*;
 
 pub fn init(app: &App) {
 	app.scheduler.register::<image::ImageResizerTask>();

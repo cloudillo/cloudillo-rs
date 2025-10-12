@@ -1,3 +1,5 @@
+//! Adapter that manages and stores blobs (immutable file data)
+
 use async_trait::async_trait;
 use axum::body::Bytes;
 use std::{fmt::Debug, collections::HashMap, pin::Pin};

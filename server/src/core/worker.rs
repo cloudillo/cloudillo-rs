@@ -1,3 +1,5 @@
+//! Worker pool. Handles synchronous tasks with 3 priority levels, configurable worker threads.
+
 use std::{sync::Arc, thread};
 use flume::{Receiver, Sender};
 use futures::channel::oneshot;

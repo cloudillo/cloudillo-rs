@@ -1,5 +1,6 @@
+//! Websocket bus implementations
+
 use crate::prelude::*;
-use crate::App;
 use axum::{
 	extract::{
 		Path,

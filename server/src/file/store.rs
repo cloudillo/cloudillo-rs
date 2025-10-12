@@ -1,7 +1,6 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::prelude::*;
-use crate::App;
 use crate::blob_adapter;
 use crate::core::hasher;
 use crate::types::TnId;

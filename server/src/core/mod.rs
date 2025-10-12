@@ -1,4 +1,7 @@
+//! Core subsystem. This handles the core infrascructure of Cloudillo.
+
 pub mod acme;
+pub mod app;
 pub mod extract;
 pub mod hasher;
 pub mod request;

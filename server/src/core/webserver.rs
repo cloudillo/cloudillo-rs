@@ -1,3 +1,5 @@
+// Webserver implementation
+
 use axum::{extract::{
 		WebSocketUpgrade,
 		ws::{Message as WsMessage, WebSocket},
@@ -17,17 +19,16 @@ use tokio_rustls::TlsAcceptor;
 use tower::{Service, /*util::ServiceExt*/};
 
 use crate::prelude::*;
-use crate::AppState;
 use crate::auth_adapter;
 use crate::core;
 use crate::types::{Timestamp};
 
 pub struct CertResolver {
-	state: Arc<AppState>,
+	state: App,
 }
 
 impl CertResolver {
-	pub fn new(state: Arc<AppState>) -> CertResolver {
+	pub fn new(state: App) -> CertResolver {
 		CertResolver {
 			state: state,
 		}
@@ -88,7 +89,7 @@ impl ResolvesServerCert for CertResolver {
 	}
 }
 
-pub async fn create_https_server(mut state: Arc<AppState>, listen: &str, api_router: axum::Router, app_router: axum::Router)
+pub async fn create_https_server(mut state: App, listen: &str, api_router: axum::Router, app_router: axum::Router)
 	-> Result<tokio::task::JoinHandle<Result<(), std::io::Error>>, std::io::Error> {
 	CryptoProvider::install_default(aws_lc_rs::default_provider()).map_err(|_| std::io::ErrorKind::Other)?;
 	let cert_resolver = Arc::new(CertResolver::new(state.clone()));

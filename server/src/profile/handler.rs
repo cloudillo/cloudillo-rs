@@ -6,7 +6,6 @@ use serde::Serialize;
 use crate::prelude::*;
 use crate::action::action;
 use crate::auth_adapter;
-use crate::App;
 use crate::core::IdTag;
 
 /// # Profile

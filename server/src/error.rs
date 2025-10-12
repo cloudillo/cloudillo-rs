@@ -1,3 +1,5 @@
+//! Error handling subsystem. Implements a custom Error type.
+
 use axum::{response::IntoResponse, Json, http::StatusCode};
 use std::sync::Arc;
 

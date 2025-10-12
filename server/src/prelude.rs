@@ -1,3 +1,4 @@
+pub use crate::core::app::App;
 pub use crate::error::{Error, ClResult};
 pub use crate::types::{TnId, Timestamp};
 

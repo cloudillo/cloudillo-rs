@@ -1,3 +1,5 @@
+//! Custom extractors for Cloudillo-specific data
+
 use async_trait::async_trait;
 use axum::{
 	body::Body,
@@ -8,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time};
 
 use crate::prelude::*;
-use crate::{App, auth_adapter, types};
+use crate::{auth_adapter};
 
 // Extractors //
 //************//
@@ -41,9 +43,6 @@ where
 
 // TnId //
 //******//
-//#[derive(Clone, Debug)]
-//pub struct TnId(pub types::TnId);
-
 impl FromRequestParts<App> for TnId
 
 where

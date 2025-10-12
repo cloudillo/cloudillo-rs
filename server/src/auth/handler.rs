@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	prelude::*,
 	auth_adapter,
-	App,
 	core::{Auth},
 };
 

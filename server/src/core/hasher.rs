@@ -1,3 +1,5 @@
+//! Hasher format for content-addressing. Capable of handling multiple versions and object variants.
+
 use base64::Engine;
 use sha2::{Digest, Sha256};
 

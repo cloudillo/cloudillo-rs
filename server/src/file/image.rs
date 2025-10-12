@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::{io::Cursor, path::Path, sync::Arc};
 
 use crate::prelude::*;
-use crate::App;
 use crate::meta_adapter;
 use crate::blob_adapter;
 use crate::core::scheduler::{Task, TaskId};

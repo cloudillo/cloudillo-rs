@@ -1,3 +1,5 @@
+//! Common types used throughout the Cloudillo platform.
+
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
