@@ -202,7 +202,7 @@ async fn bootstrap(app: Arc<AppState>, opts: &BuilderOpts) -> ClResult<()> {
 
 	if true {
 		let base_id_tag = &opts.base_id_tag.as_ref().expect("FATAL: No base id tag");
-		let id_tag = auth.read_id_tag(1).await;
+		let id_tag = auth.read_id_tag(TnId(1)).await;
 		debug!("Got id tag: {:?}", id_tag);
 
 		if let Err(Error::NotFound) = id_tag {
@@ -215,7 +215,7 @@ async fn bootstrap(app: Arc<AppState>, opts: &BuilderOpts) -> ClResult<()> {
 			auth.create_profile_key(tn_id, None).await?;
 		}
 		if let Some(ref acme_email) = opts.acme_email {
-			let cert_data = auth.read_cert_by_tn_id(1).await;
+			let cert_data = auth.read_cert_by_tn_id(TnId(1)).await;
 			if let Err(Error::NotFound) = cert_data {
 				acme::init(app.clone(), &acme_email, &base_id_tag, opts.base_app_domain.as_deref()).await?;
 			}

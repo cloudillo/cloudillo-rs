@@ -10,7 +10,7 @@ use crate::meta_adapter;
 use crate::App;
 use crate::types::{self, Timestamp};
 use crate::file::{file, image, store};
-use crate::core::{hasher, TnId, Auth};
+use crate::core::{hasher, Auth};
 
 // Utility functions //
 //*******************//
@@ -61,7 +61,7 @@ pub async fn get_file_list(
 /// GET /api/file/variant/{variant_id}
 pub async fn get_file_variant(
 	State(app): State<App>,
-	TnId(tn_id): TnId,
+	tn_id: TnId,
 	header: axum::http::HeaderMap,
 	extract::Path(variant_id): extract::Path<Box<str>>,
 ) -> ClResult<impl response::IntoResponse> {
@@ -82,7 +82,7 @@ pub struct GetFileVariantSelector {
 
 pub async fn get_file_variant_file_id(
 	State(app): State<App>,
-	TnId(tn_id): TnId,
+	tn_id: TnId,
 	header: axum::http::HeaderMap,
 	extract::Path((file_id)): extract::Path<Box<str>>,
 	extract::Query(selector): extract::Query<GetFileVariantSelector>,
@@ -142,7 +142,7 @@ async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, content_typ
 
 pub async fn post_file(
 	State(app): State<App>,
-	TnId(tn_id): TnId,
+	tn_id: TnId,
 	auth: Auth,
 	extract::Path((preset, file_name)): extract::Path<(Box<str>, Box<str>)>,
 	query: Query<PostFileQuery>,

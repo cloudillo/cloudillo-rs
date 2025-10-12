@@ -75,7 +75,7 @@ pub struct AuthProfile {
 /// Context struct for an authenticated user
 #[derive(Clone, Debug)]
 pub struct AuthCtx {
-	pub tn_id: u32,
+	pub tn_id: TnId,
 	pub id_tag: Box<str>,
 	pub roles: Box<[Box<str>]>,
 }

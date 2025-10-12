@@ -7,14 +7,14 @@ use std::sync::Arc;
 use crate::{
 	prelude::*,
 	action::action,
-	core::{TnId, IdTag},
+	core::IdTag,
 	auth_adapter,
 	meta_adapter,
 	App,
 };
 
 pub async fn create_key(State(app): State<App>) -> (StatusCode, Json<auth_adapter::AuthKey>) {
-	let key = app.auth_adapter.create_profile_key(1, None).await.unwrap();
+	let key = app.auth_adapter.create_profile_key(TnId(1), None).await.unwrap();
 	(StatusCode::CREATED, Json(key))
 }
 
@@ -24,7 +24,7 @@ pub async fn list_actions(
 //) -> ClResult<(StatusCode, Json<Vec<meta_adapter::ActionView>>)> {
 ) -> ClResult<(StatusCode, Json<Value>)> {
 	info!("list_actions");
-	let actions = app.meta_adapter.list_actions(1, &opts).await?;
+	let actions = app.meta_adapter.list_actions(TnId(1), &opts).await?;
 
 	Ok((StatusCode::OK, Json(json!({ "actions": actions }))))
 }
@@ -32,7 +32,7 @@ pub async fn list_actions(
 #[axum::debug_handler]
 pub async fn post_action(
 	State(app): State<App>,
-	TnId(tn_id): TnId,
+	tn_id: TnId,
 	IdTag(id_tag): IdTag,
 	Json(action): Json<meta_adapter::CreateAction>,
 ) -> ClResult<(StatusCode, Json<meta_adapter::ActionView>)> {

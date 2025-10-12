@@ -66,7 +66,7 @@ impl Task<App> for FileIdGeneratorTask {
 
 	fn build(id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
 		let (tn_id, f_id) = ctx.split(',').collect_tuple().ok_or(Error::Unknown)?;
-		let task = FileIdGeneratorTask::new(tn_id.parse()?, f_id.parse()?);
+		let task = FileIdGeneratorTask::new(TnId(tn_id.parse()?), f_id.parse()?);
 		Ok(task)
 	}
 

@@ -8,4 +8,4 @@ pub mod webserver;
 pub mod websocket;
 pub mod worker;
 
-pub use crate::core::extract::{IdTag, TnId, Auth};
+pub use crate::core::extract::{IdTag, Auth};

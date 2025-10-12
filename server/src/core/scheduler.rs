@@ -7,7 +7,7 @@ use crate::{
 	prelude::*,
 	meta_adapter,
 	App,
-	types::{Timestamp, TimestampExt},
+	types::now,
 };
 
 pub type TaskId = u64;
@@ -199,13 +199,13 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					schedule.notify_schedule.notified().await;
 					info!("NOTIFY: tasks_scheduled");
 				}
-				let now = Timestamp::now();
+				let time = now();
 				if let Some((timestamp, id)) = loop {
 					//info!("first task: {:?}", schedule.tasks_scheduled.lock().unwrap().first_key_value());
 					let mut tasks_scheduled = schedule.tasks_scheduled.lock().unwrap();
 					if let Some((&(timestamp, id), _)) = tasks_scheduled.first_key_value() {
 						let (timestamp, id) = (timestamp, id);
-						if timestamp <= Timestamp::now() {
+						if timestamp <= now() {
 							info!("Spawning task id {}", id);
 							let task = tasks_scheduled.remove(&(timestamp, id)).unwrap();
 							schedule.tasks_running.lock().unwrap().insert(id, task.clone());
@@ -217,7 +217,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 						break None;
 					}
 				} {
-					let wait = tokio::time::Duration::from_secs((timestamp - now) as u64);
+					let wait = tokio::time::Duration::from_secs((timestamp.0 - time.0) as u64);
 					info!("wait: {}", wait.as_secs());
 					tokio::select! {
 						_ = tokio::time::sleep(wait) => (), _ = schedule.notify_schedule.notified() => ()
@@ -264,9 +264,9 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 	pub async fn add_queue(&self, id: TaskId, task_meta: TaskMeta<S>) -> ClResult<TaskId> {
 		let deps = task_meta.deps.clone();
 
-		if deps.len() == 0 && task_meta.next_at.unwrap_or(0) < Timestamp::now() {
+		if deps.len() == 0 && task_meta.next_at.unwrap_or(Timestamp(0)) < now() {
 			info!("Spawning task {}", id);
-			self.tasks_scheduled.lock().map_err(|_| Error::Unknown)?.insert((0, id), task_meta);
+			self.tasks_scheduled.lock().map_err(|_| Error::Unknown)?.insert((Timestamp(0), id), task_meta);
 			self.notify_schedule.notify_one();
 		} else if let Some(next_at) = task_meta.next_at {
 			info!("Scheduling task {} for {}", id, next_at);
@@ -364,15 +364,15 @@ mod tests {
 		let task2 = TestTask::new(2);
 		let task3 = TestTask::new(3);
 
-		let task2_id = scheduler.add(task2, Some(Timestamp::now() + 2), None).await.unwrap();
+		let task2_id = scheduler.add(task2, Some(now() + 2), None).await.unwrap();
 		let task3_id = scheduler.add(task3, None, None).await.unwrap();
 		scheduler.add(TestTask::new(1) , None, Some(vec![task2_id, task3_id])).await.unwrap();
 
 		tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 		let task4 = TestTask::new(4);
 		let task5 = TestTask::new(5);
-		scheduler.add(task4, Some(Timestamp::now() + 2), None).await.unwrap();
-		scheduler.add(task5, Some(Timestamp::now() + 1), None).await.unwrap();
+		scheduler.add(task4, Some(now() + 2), None).await.unwrap();
+		scheduler.add(task5, Some(now() + 1), None).await.unwrap();
 
 		tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 

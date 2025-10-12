@@ -15,7 +15,7 @@ use crate::{
 pub struct Login {
 	// auth data
 	#[serde(rename = "tnId")]
-	tn_id: u32,
+	tn_id: TnId,
 	#[serde(rename = "idTag")]
 	id_tag: Box<str>,
 	roles: Option<Box<[Box<str>]>>,

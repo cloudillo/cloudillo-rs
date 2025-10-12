@@ -13,7 +13,7 @@ use crate::{
 	core::scheduler::{Task, TaskId},
 	auth_adapter,
 	meta_adapter,
-	types::{TnId, Timestamp, TimestampExt}
+	types::now,
 };
 
 pub async fn create_action(app: &App, tn_id: TnId, id_tag: &str, action: meta_adapter::CreateAction) -> ClResult<Box<str>>{
@@ -92,7 +92,7 @@ impl Task<App> for ActionCreatorTask {
 			attachments,
 			subject: self.action.subject.clone(),
 			expires_at: self.action.expires_at.clone(),
-			created_at: Timestamp::now(),
+			created_at: now(),
 		};
 
 		let key = Some(action.action_id.as_ref());

@@ -9,8 +9,8 @@ use cloudillo::{
 	prelude::*,
 	auth_adapter,
 	meta_adapter,
-	types::{TnId, Timestamp, TimestampExt},
-	core::worker::WorkerPool
+	core::worker::WorkerPool,
+	types::now,
 };
 
 mod crypto;
@@ -106,10 +106,10 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			&self.jwt_secret,
 			&Validation::new(Algorithm::HS256),
 		).map_err(|_| Error::PermissionDenied)?;
-		let id_tag = self.read_id_tag(token_data.claims.sub).await.map_err(|_| Error::PermissionDenied)?;
+		let id_tag = self.read_id_tag(TnId(token_data.claims.sub)).await.map_err(|_| Error::PermissionDenied)?;
 
 		Ok(auth_adapter::AuthCtx {
-			tn_id: token_data.claims.sub,
+			tn_id: TnId(token_data.claims.sub),
 			id_tag,
 			roles: token_data.claims.r.unwrap_or("".into()).split(',').map(Box::from).collect(),
 		})
@@ -118,7 +118,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 	async fn read_id_tag(&self, tn_id: TnId) -> ClResult<Box<str>> {
 		let res = sqlx::query(
 			"SELECT id_tag FROM tenants WHERE tn_id = ?1"
-		).bind(tn_id).fetch_one(&self.db).await.inspect_err(inspect);
+		).bind(tn_id.0).fetch_one(&self.db).await.inspect_err(inspect);
 
 		map_res(res, |row| row.try_get("id_tag"))
 	}
@@ -128,7 +128,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			"SELECT tn_id FROM tenants WHERE id_tag = ?1"
 		).bind(id_tag).fetch_one(&self.db).await.inspect_err(inspect);
 
-		map_res(res, |row| row.try_get("tn_id"))
+		map_res(res, |row| row.try_get("tn_id").map(|t| TnId(t)))
 	}
 
 	async fn read_tenant(&self, id_tag: &str) -> ClResult<auth_adapter::AuthProfile> {
@@ -137,7 +137,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		).bind(id_tag).fetch_one(&self.db).await;
 
 		async_map_res(res, async |row| {
-			let tn_id: TnId = row.try_get("tn_id")?;
+			let tn_id = TnId(row.try_get("tn_id")?);
 			let roles: Option<Box<str>> = row.try_get("roles")?;
 			Ok(auth_adapter::AuthProfile {
 				id_tag: row.try_get("id_tag")?,
@@ -170,7 +170,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		).bind(id_tag).bind(email)
 			.fetch_one(&self.db).await;
 
-		map_res(res, |row| row.try_get("tn_id"))
+		map_res(res, |row| row.try_get("tn_id").map(|t| TnId(t)))
 	}
 
 	async fn delete_tenant(&self, id_tag: &str) -> ClResult<()> {
@@ -186,13 +186,13 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		match res {
 			Err(err) => Err(Error::PermissionDenied),
 			Ok(row) => {
-				let tn_id: TnId = row.try_get("tn_id").or(Err(Error::DbError))?;
+				let tn_id = row.try_get("tn_id").map(|t| TnId(t)).or(Err(Error::DbError))?;
 				let roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
 
 				let token = crypto::generate_access_token(&self.worker, tn_id, roles.map(|s| s.into())).await?;
 
 				Ok(auth_adapter::AuthLogin {
-					tn_id: row.try_get("tn_id").or(Err(Error::DbError))?,
+					tn_id: row.try_get("tn_id").map(|t| TnId(t)).or(Err(Error::DbError))?,
 					id_tag: Box::from(id_tag),
 					roles: roles.map(|s| parse_str_list(&s)),
 					token,
@@ -209,7 +209,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		match res {
 			Err(err) => Err(Error::PermissionDenied),
 			Ok(row) => {
-				let tn_id: TnId = row.try_get("tn_id").or(Err(Error::DbError))?;
+				let tn_id: TnId = row.try_get("tn_id").map(|t| TnId(t)).or(Err(Error::DbError))?;
 				let password_hash: Box<str> = row.try_get("password").or(Err(Error::DbError))?;
 				let roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
 
@@ -217,7 +217,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 				let token = crypto::generate_access_token(&self.worker, tn_id, roles.map(|s| s.into())).await?;
 
 				Ok(auth_adapter::AuthLogin {
-					tn_id: row.try_get("tn_id").or(Err(Error::DbError))?,
+					tn_id: row.try_get("tn_id").map(|t| TnId(t)).or(Err(Error::DbError))?,
 					id_tag: Box::from(id_tag),
 					roles: roles.map(|s| parse_str_list(&s)),
 					token,
@@ -240,10 +240,10 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		sqlx::query(
 			"INSERT OR REPLACE INTO certs (tn_id, id_tag, domain, expires_at, cert, key)
 			VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-		).bind(cert_data.tn_id)
+		).bind(cert_data.tn_id.0)
 			.bind(&cert_data.id_tag)
 			.bind(&cert_data.domain)
-			.bind(cert_data.expires_at)
+			.bind(cert_data.expires_at.0)
 			.bind(&cert_data.cert)
 			.bind(&cert_data.key)
 			.execute(&self.db).await;
@@ -254,15 +254,15 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 	async fn read_cert_by_tn_id(&self, tn_id: TnId) -> ClResult<auth_adapter::CertData> {
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, domain, cert, key, expires_at FROM certs WHERE tn_id = ?1"
-		).bind(tn_id).fetch_one(&self.db).await;
+		).bind(tn_id.0).fetch_one(&self.db).await;
 
 		map_res(res, |row| Ok(auth_adapter::CertData {
-			tn_id: row.try_get("tn_id")?,
+			tn_id: TnId(row.try_get("tn_id")?),
 			id_tag: row.try_get("id_tag")?,
 			domain: row.try_get("domain")?,
 			cert: row.try_get("cert")?,
 			key: row.try_get("key")?,
-			expires_at: row.try_get("expires_at")?,
+			expires_at: Timestamp(row.try_get::<i64, _>("expires_at")?),
 		}))
 	}
 
@@ -272,12 +272,12 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		).bind(id_tag).fetch_one(&self.db).await;
 
 		map_res(res, |row| Ok(auth_adapter::CertData {
-			tn_id: row.try_get("tn_id")?,
+			tn_id: TnId(row.try_get("tn_id")?),
 			id_tag: row.try_get("id_tag")?,
 			domain: row.try_get("domain")?,
 			cert: row.try_get("cert")?,
 			key: row.try_get("key")?,
-			expires_at: row.try_get("expires_at")?,
+			expires_at: Timestamp(row.try_get::<i64, _>("expires_at")?),
 		}))
 	}
 
@@ -288,12 +288,12 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		).bind(domain).fetch_one(&self.db).await;
 
 		map_res(res, |row| Ok(auth_adapter::CertData {
-			tn_id: row.try_get("tn_id")?,
+			tn_id: TnId(row.try_get("tn_id")?),
 			id_tag: row.try_get("id_tag")?,
 			domain: row.try_get("domain")?,
 			cert: row.try_get("cert")?,
 			key: row.try_get("key")?,
-			expires_at: row.try_get("expires_at")?,
+			expires_at: Timestamp(row.try_get::<i64, _>("expires_at")?),
 		}))
 	}
 
@@ -301,12 +301,12 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 	async fn list_profile_keys(&self, tn_id: TnId) -> ClResult<Vec<auth_adapter::AuthKey>> {
 		let res = sqlx::query(
 			"SELECT key_id, public_key, expires_at FROM keys WHERE tn_id = ?1"
-		).bind(tn_id).fetch_all(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		).bind(tn_id.0).fetch_all(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 		collect_res(res.iter().map(|row| Ok(auth_adapter::AuthKey {
 			key_id: row.try_get::<Box<str>, _>("key_id")?,
 			public_key: row.try_get::<Box<str>, _>("public_key")?,
-			expires_at: row.try_get::<Option<Timestamp>, _>("expires_at")?,
+			expires_at: row.try_get::<Option<i64>, _>("expires_at")?.map(Timestamp),
 		})))
 	}
 
@@ -319,7 +319,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 
 		sqlx::query(
 			"INSERT INTO keys (tn_id, key_id, private_key, public_key, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)"
-		).bind(tn_id).bind(&key_id).bind(&keypair.private_key).bind(&keypair.public_key).bind(expires_at).execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		).bind(tn_id.0).bind(&key_id).bind(&keypair.private_key).bind(&keypair.public_key).bind(expires_at.map(|t| t.0)).execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 		Ok(auth_adapter::AuthKey {
 			key_id: key_id.into(),
@@ -339,7 +339,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		let res = sqlx::query("SELECT t.id_tag, k.key_id, k.private_key FROM tenants t
 			JOIN keys k ON t.tn_id = k.tn_id
 			WHERE t.tn_id=? ORDER BY k.key_id DESC LIMIT 1")
-			.bind(tn_id).fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0).fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 		let id_tag: &str = res.try_get("id_tag").or(Err(Error::DbError))?;
 		let key_id: Box<str> = res.try_get("key_id").or(Err(Error::DbError))?;
 		let private_key: Box<str> = res.try_get("private_key").or(Err(Error::DbError))?;
@@ -358,7 +358,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			a: action.attachments,
 			sub: action.subject,
 			exp: action.expires_at,
-			iat: Timestamp::now(),
+			iat: now(),
 		};
 		let token = crypto::generate_action_token(&self.worker, action_data, private_key).await?;
 

@@ -43,7 +43,7 @@ pub enum ProfilePerm {
 #[derive(Debug, Serialize)]
 pub struct Tenant {
 	#[serde(rename = "id")]
-	pub tn_id: u32,
+	pub tn_id: TnId,
 	#[serde(rename = "idTag")]
 	pub id_tag: Box<str>,
 	pub name: Box<str>,
@@ -54,14 +54,14 @@ pub struct Tenant {
 	#[serde(rename = "coverPic")]
 	pub cover_pic: Option<Box<str>>,
 	#[serde(rename = "createdAt")]
-	pub created_at: u32,
+	pub created_at: Timestamp,
 	pub x: HashMap<Box<str>, Box<str>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateTenantData {
 	#[serde(rename = "id")]
-	tn_id: u32,
+	tn_id: TnId,
 	#[serde(rename = "idTag")]
 	id_tag: Box<str>,
 	name: Box<str>,
@@ -72,7 +72,7 @@ pub struct UpdateTenantData {
 #[derive(Debug, Deserialize)]
 pub struct Profile {
 	#[serde(rename = "id")]
-	pub tn_id: u32,
+	pub tn_id: TnId,
 	#[serde(rename = "idTag")]
 	pub id_tag: Box<str>,
 	pub name: Box<str>,
@@ -83,7 +83,7 @@ pub struct Profile {
 	#[serde(rename = "coverPic")]
 	pub cover_pic: Option<Box<str>>,
 	#[serde(rename = "createdAt")]
-	pub created_at: u32,
+	pub created_at: Timestamp,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,7 +171,7 @@ pub struct CreateAction {
 	pub attachments: Option<Vec<Box<str>>>,
 	pub subject: Option<Box<str>>,
 	#[serde(rename = "expiresAt")]
-	pub expires_at: Option<u32>,
+	pub expires_at: Option<Timestamp>,
 }
 
 //#[derive(Serialize)]
@@ -193,7 +193,7 @@ pub struct Action {
 	pub attachments: Option<Vec<Box<str>>>,
 	pub subject: Option<Box<str>>,
 	pub created_at: Timestamp,
-	pub expires_at: Option<u32>,
+	pub expires_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -227,9 +227,9 @@ pub struct ActionView {
 	#[serde(rename = "subject")]
 	pub subject: Option<Box<str>>,
 	#[serde(rename = "createdAt")]
-	pub created_at: u32,
+	pub created_at: Timestamp,
 	#[serde(rename = "expiresAt")]
-	pub expires_at: Option<u32>,
+	pub expires_at: Option<Timestamp>,
 	#[serde(rename = "status")]
 	pub status: Option<Box<str>>,
 	#[serde(rename = "stat")]
@@ -374,45 +374,45 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	//*******************
 
 	/// Reads a tenant profile
-	async fn read_tenant(&self, tn_id: u32) -> ClResult<Tenant>;
+	async fn read_tenant(&self, tn_id: TnId) -> ClResult<Tenant>;
 
 	/// Creates a new tenant
-	async fn create_tenant(&self, tn_id: u32, id_tag: &str) -> ClResult<u32>;
+	async fn create_tenant(&self, tn_id: TnId, id_tag: &str) -> ClResult<TnId>;
 
 	/// Updates a tenant
-	async fn update_tenant(&self, tn_id: u32, tenant: &UpdateTenantData) -> ClResult<()>;
+	async fn update_tenant(&self, tn_id: TnId, tenant: &UpdateTenantData) -> ClResult<()>;
 
 	/// Deletes a tenant
-	async fn delete_tenant(&self, tn_id: u32) -> ClResult<()>;
+	async fn delete_tenant(&self, tn_id: TnId) -> ClResult<()>;
 
 	/// Lists all profiles matching a set of options
-	async fn list_profiles(&self, tn_id: u32, opts: &ListProfileOptions) -> ClResult<Vec<Profile>>;
+	async fn list_profiles(&self, tn_id: TnId, opts: &ListProfileOptions) -> ClResult<Vec<Profile>>;
 
 	/// Reads a profile
 	///
 	/// Returns an `(etag, Profile)` tuple.
-	async fn read_profile(&self, tn_id: u32, id_tag: &str) -> ClResult<(Box<str>, Profile)>;
+	async fn read_profile(&self, tn_id: TnId, id_tag: &str) -> ClResult<(Box<str>, Profile)>;
 	async fn create_profile(&self, profile: &Profile, etag: &str) -> ClResult<()>;
 	async fn update_profile(&self, id_tag: &str, profile: &UpdateProfileData) -> ClResult<()>;
 
 	/// Reads the public key of a profile
 	///
 	/// Returns a `(public key, expiration)` tuple.
-	async fn read_profile_public_key(&self, id_tag: &str, key_id: &str) -> ClResult<(Box<str>, u32)>;
+	async fn read_profile_public_key(&self, id_tag: &str, key_id: &str) -> ClResult<(Box<str>, Timestamp)>;
 	async fn add_profile_public_key(&self, id_tag: &str, key_id: &str, public_key: &str) -> ClResult<()>;
 	/// Process profile refresh
-	/// callback(tn_id: u32, id_tag: &str, etag: Option<&str>)
-	//async fn process_profile_refresh(&self, callback: FnOnce<(u32, &str, Option<&str>)>);
+	/// callback(tn_id: TnId, id_tag: &str, etag: Option<&str>)
+	//async fn process_profile_refresh(&self, callback: FnOnce<(TnId, &str, Option<&str>)>);
 	//async fn process_profile_refresh<'a, F>(&self, callback: F)
-	//	where F: FnOnce(u32, &'a str, Option<&'a str>) -> ClResult<()> + Send;
-	async fn process_profile_refresh<'a>(&self, callback: Box<dyn Fn(u32, &'a str, Option<&'a str>) -> ClResult<()> + Send>);
+	//	where F: FnOnce(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send;
+	async fn process_profile_refresh<'a>(&self, callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>);
 
 	// Action management
 	//*******************
-	async fn list_actions(&self, tn_id: u32, opts: &ListActionOptions) -> ClResult<Vec<ActionView>>;
-	async fn list_action_tokens(&self, tn_id: u32, opts: &ListActionOptions) -> ClResult<Box<[Box<str>]>>;
+	async fn list_actions(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<Vec<ActionView>>;
+	async fn list_action_tokens(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<Box<[Box<str>]>>;
 
-	async fn create_action(&self, tn_id: u32, action: &Action, key: Option<&str>) -> ClResult<()>;
+	async fn create_action(&self, tn_id: TnId, action: &Action, key: Option<&str>) -> ClResult<()>;
 
 	/*
 	getActionRootId: (tnId: number, actionId: string) => Promise<string>
@@ -432,12 +432,12 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// File management
 	//*****************
-	async fn get_file_id(&self, tn_id: u32, f_id: u64) -> ClResult<Box<str>>;
-	async fn list_files(&self, tn_id: u32, opts: ListFileOptions) -> ClResult<Vec<FileView>>;
-	async fn list_file_variants(&self, tn_id: u32, file_id: FileId) -> ClResult<Vec<FileVariant>>;
-	async fn read_file_variant(&self, tn_id: u32, variant_id: &str) -> ClResult<FileVariant>;
-	async fn create_file(&self, tn_id: u32, opts: CreateFile) -> ClResult<FileId>;
-	async fn create_file_variant<'a>(&'a self, tn_id: u32, f_id: u64, variant_id: &'a str, opts: CreateFileVariant) -> ClResult<&'a str>;
+	async fn get_file_id(&self, tn_id: TnId, f_id: u64) -> ClResult<Box<str>>;
+	async fn list_files(&self, tn_id: TnId, opts: ListFileOptions) -> ClResult<Vec<FileView>>;
+	async fn list_file_variants(&self, tn_id: TnId, file_id: FileId) -> ClResult<Vec<FileVariant>>;
+	async fn read_file_variant(&self, tn_id: TnId, variant_id: &str) -> ClResult<FileVariant>;
+	async fn create_file(&self, tn_id: TnId, opts: CreateFile) -> ClResult<FileId>;
+	async fn create_file_variant<'a>(&'a self, tn_id: TnId, f_id: u64, variant_id: &'a str, opts: CreateFileVariant) -> ClResult<&'a str>;
 	async fn update_file_id(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
 
 	// Task scheduler

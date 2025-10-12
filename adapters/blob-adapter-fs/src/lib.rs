@@ -49,7 +49,7 @@ impl BlobAdapterFs {
 #[async_trait]
 impl blob_adapter::BlobAdapter for BlobAdapterFs {
 	/// Creates a new blob from a buffer
-	async fn create_blob_buf(&self, tn_id: u32, file_id: &str, data: &[u8], opts: &blob_adapter::CreateBlobOptions) -> ClResult<()> {
+	async fn create_blob_buf(&self, tn_id: TnId, file_id: &str, data: &[u8], opts: &blob_adapter::CreateBlobOptions) -> ClResult<()> {
 		info!("create_blob_buf: {:?}", obj_file_path(&self.base_dir, tn_id, &file_id)?);
 		tokio::fs::create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
 
@@ -60,7 +60,7 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 	}
 
 	/// Creates a new blob using a stream
-	async fn create_blob_stream(&self, tn_id: u32, file_id: &str, stream: &mut (dyn AsyncRead + Send + Unpin)) -> ClResult<()> {
+	async fn create_blob_stream(&self, tn_id: TnId, file_id: &str, stream: &mut (dyn AsyncRead + Send + Unpin)) -> ClResult<()> {
 		tokio::fs::create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
 
 		let mut file = File::create(obj_file_path(&self.base_dir, tn_id, file_id)?).await?;
@@ -70,7 +70,7 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 	}
 
 	/// Reads a blob
-	async fn read_blob_buf(&self, tn_id: u32, blob_id: &str) -> ClResult<Box<[u8]>> {
+	async fn read_blob_buf(&self, tn_id: TnId, blob_id: &str) -> ClResult<Box<[u8]>> {
 		let mut file = File::open(obj_file_path(&self.base_dir, tn_id, blob_id)?).await?;
 		let mut buf: Vec<u8> = Vec::new();
 		file.read_to_end(&mut buf).await;
@@ -79,7 +79,7 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 	}
 
 	/// Reads a blob
-	async fn read_blob_stream(&self, tn_id: u32, blob_id: &str) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>> {
+	async fn read_blob_stream(&self, tn_id: TnId, blob_id: &str) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>> {
 		info!("path: {:?}", obj_file_path(&self.base_dir, tn_id, blob_id)?);
 		let file = File::open(obj_file_path(&self.base_dir, tn_id, blob_id)?).await.map_err(|_| Error::NotFound)?;
 		let stream = ReaderStream::new(file);

@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time};
 
 use crate::prelude::*;
-use crate::{App, auth_adapter, core::{TnId, Auth}, types};
+use crate::{App, auth_adapter, core::Auth, types};
 
-pub async fn require_auth(State(state): State<App>, TnId(tn_id): TnId, mut req: Request<Body>, next: Next) -> ClResult<Response<Body>> {
+pub async fn require_auth(State(state): State<App>, tn_id: TnId, mut req: Request<Body>, next: Next) -> ClResult<Response<Body>> {
 	let auth_header = req
 		.headers()
 		.get("Authorization")
@@ -34,7 +34,7 @@ pub async fn require_auth(State(state): State<App>, TnId(tn_id): TnId, mut req: 
 	Ok(next.run(req).await)
 }
 
-pub async fn optional_auth(State(state): State<App>, TnId(tn_id): TnId, mut req: Request<Body>, next: Next) -> ClResult<Response<Body>> {
+pub async fn optional_auth(State(state): State<App>, tn_id: TnId, mut req: Request<Body>, next: Next) -> ClResult<Response<Body>> {
 	if let Some(auth_header) = req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()) {
 		if auth_header.starts_with("Bearer ") {
 			let token = &auth_header[7..].trim();

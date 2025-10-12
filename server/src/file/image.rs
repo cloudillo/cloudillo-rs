@@ -109,7 +109,7 @@ impl Task<App> for ImageResizerTask {
 			"png" => ImageFormat::Png,
 			_ => return Err(Error::Unknown),
 		};
-		let task = ImageResizerTask::new(tn_id.parse()?, f_id.parse()?, Box::from(Path::new(path)), variant, format, (x_res.parse()?, y_res.parse()?));
+		let task = ImageResizerTask::new(TnId(tn_id.parse()?), f_id.parse()?, Box::from(Path::new(path)), variant, format, (x_res.parse()?, y_res.parse()?));
 		Ok(task)
 	}
 

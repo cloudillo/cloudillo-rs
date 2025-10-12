@@ -15,7 +15,6 @@ use x509_parser::{parse_x509_certificate, pem::Pem};
 use crate::prelude::*;
 use crate::AppState;
 use crate::auth_adapter;
-use crate::types::{TnId, Timestamp};
 
 #[derive(Debug)]
 struct X509CertData {
@@ -64,7 +63,7 @@ pub async fn renew_tenant<'a>(state: Arc<AppState>, account: &'a acme::Account, 
 	let cert = renew_domains(&state, &account, domains).await?;
 	info!("ACME cert {}", &cert.expires_at);
 	state.auth_adapter.create_cert(&auth_adapter::CertData {
-		tn_id,
+		tn_id: TnId(tn_id),
 		id_tag: id_tag.into(),
 		domain: app_domain.unwrap_or(&id_tag).into(),
 		key: cert.private_key_pem.into(),
@@ -138,7 +137,7 @@ async fn renew_domains<'a>(state: &'a Arc<AppState>, account: &'a acme::Account,
 			private_key_pem: private_key_pem.to_string().into_boxed_str(),
 			certificate_pem: cert_chain_pem.to_string().into_boxed_str(),
 			certified_key,
-			expires_at: not_after.timestamp() as Timestamp,
+			expires_at: Timestamp(not_after.timestamp()),
 		};
 
 		Ok(cert_data)
