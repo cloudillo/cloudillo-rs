@@ -10,6 +10,7 @@ use crate::prelude::*;
 
 pub fn init(app: &App) {
 	app.scheduler.register::<action::ActionCreatorTask>();
+	app.scheduler.register::<action::ActionVerifierTask>();
 }
 
 // vim: ts=4

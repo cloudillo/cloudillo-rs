@@ -24,6 +24,8 @@ use crate::blob_adapter::BlobAdapter;
 
 use crate::{action, file, routes};
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug)]
 pub enum ServerMode {
 	Standalone,
@@ -124,9 +126,21 @@ impl AppBuilder {
 	pub fn blob_adapter(&mut self, blob_adapter: Arc<dyn BlobAdapter>) -> &mut Self { self.adapters.blob_adapter = Some(blob_adapter); self }
 
 	pub async fn run(self) -> ClResult<()> {
-		info!("HERE 1");
+		tracing_subscriber::fmt()
+			.with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+			.with_target(false)
+			//.with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
+			.init();
+		info!("     ______");
+		info!("    /  __  \\ ___        ____ _                 _ _ _ _");
+		info!("  _|  (  )  V _ \\__    / ___| | ___  _   _  __| (_) | | ___");
+		info!(" / __  ‾‾___ (_) _ \\  | |   | |/ _ \\| | | |/ _` | | | |/ _ \\");
+		info!("| (__)  /   \\   (_) | | |___| | (_) | |_| | (_| | | | | (_) |");
+		info!(" \\------\\___/------/   \\____|_|\\___/ \\__,_|\\__,_|_|_|_|\\___/");
+		info!("V{}", VERSION);
+		info!("");
+
 		rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider()).expect("FATAL: Failed to install default crypto provider");
-		info!("HERE 2");
 		let auth_adapter = self.adapters.auth_adapter.expect("FATAL: No auth adapter");
 		let meta_adapter = self.adapters.meta_adapter.expect("FATAL: No meta adapter");
 		let mut task_store: Arc<dyn scheduler::TaskStore<App>> = scheduler::MetaAdapterTaskStore::new(meta_adapter.clone());
@@ -143,12 +157,6 @@ impl AppBuilder {
 			blob_adapter: self.adapters.blob_adapter.expect("FATAL: No blob adapter"),
 		});
 		tokio::fs::create_dir_all(&app.opts.tmp_dir).await.expect("Cannot create tmp dir");
-
-		tracing_subscriber::fmt()
-			.with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-			.with_target(false)
-			//.with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
-			.init();
 
 		// Init modules
 		action::init(&app);

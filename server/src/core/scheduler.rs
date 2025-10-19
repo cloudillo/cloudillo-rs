@@ -8,7 +8,6 @@ use serde::{Serialize, Deserialize, de::DeserializeOwned};
 use crate::{
 	prelude::*,
 	meta_adapter,
-	types::now,
 };
 
 pub type TaskId = u64;
@@ -200,13 +199,13 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					schedule.notify_schedule.notified().await;
 					info!("NOTIFY: tasks_scheduled");
 				}
-				let time = now();
+				let time = Timestamp::now();
 				if let Some((timestamp, id)) = loop {
 					//info!("first task: {:?}", schedule.tasks_scheduled.lock().unwrap().first_key_value());
 					let mut tasks_scheduled = schedule.tasks_scheduled.lock().unwrap();
 					if let Some((&(timestamp, id), _)) = tasks_scheduled.first_key_value() {
 						let (timestamp, id) = (timestamp, id);
-						if timestamp <= now() {
+						if timestamp <= Timestamp::now() {
 							info!("Spawning task id {}", id);
 							let task = tasks_scheduled.remove(&(timestamp, id)).unwrap();
 							schedule.tasks_running.lock().unwrap().insert(id, task.clone());
@@ -265,7 +264,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 	pub async fn add_queue(&self, id: TaskId, task_meta: TaskMeta<S>) -> ClResult<TaskId> {
 		let deps = task_meta.deps.clone();
 
-		if deps.len() == 0 && task_meta.next_at.unwrap_or(Timestamp(0)) < now() {
+		if deps.len() == 0 && task_meta.next_at.unwrap_or(Timestamp(0)) < Timestamp::now() {
 			info!("Spawning task {}", id);
 			self.tasks_scheduled.lock().map_err(|_| Error::Unknown)?.insert((Timestamp(0), id), task_meta);
 			self.notify_schedule.notify_one();

@@ -9,7 +9,7 @@ use crate::{
 	prelude::*,
 	auth_adapter,
 	meta_adapter,
-	types::{TnId, Timestamp},
+	action::action,
 };
 
 /// Action tokens represent user actions
@@ -175,7 +175,7 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	/// Creates an access token for the given tenant
 	async fn create_access_token(&self, tn_id: TnId, data: &AccessToken)
 		-> ClResult<Box<str>>;
-	async fn create_action_token(&self, tn_id: TnId, data: meta_adapter::CreateAction)
+	async fn create_action_token(&self, tn_id: TnId, data: action::CreateAction)
 		-> ClResult<Box<str>>;
 
 	/// Verifies that the given access token is valid

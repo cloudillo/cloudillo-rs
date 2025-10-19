@@ -29,7 +29,7 @@ pub async fn post_action(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(id_tag): IdTag,
-	Json(action): Json<meta_adapter::CreateAction>,
+	Json(action): Json<action::CreateAction>,
 ) -> ClResult<(StatusCode, Json<meta_adapter::ActionView>)> {
 
 	let action_id = action::create_action(&app, tn_id, &id_tag, action).await?;

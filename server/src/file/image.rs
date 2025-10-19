@@ -133,8 +133,9 @@ impl Task<App> for ImageResizerTask {
 		}).await?;
 		info!("Finished task image.resize {:?} {}", self.path, resized.len());
 		let variant_id = store::create_blob_buf(&app, self.tn_id, &resized, blob_adapter::CreateBlobOptions::default()).await?;
-		app.meta_adapter.create_file_variant(self.tn_id, self.f_id, &variant_id, meta_adapter::CreateFileVariant {
-			variant: self.variant.clone(),
+		app.meta_adapter.create_file_variant(self.tn_id, self.f_id, meta_adapter::FileVariant {
+			variant_id: &variant_id,
+			variant: &self.variant,
 			format: match self.format {
 				ImageFormat::Avif => "avif",
 				ImageFormat::Webp => "webp",

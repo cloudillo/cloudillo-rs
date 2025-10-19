@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{fmt::Debug, fmt::Display, sync::Arc};
 
 use crate::prelude::*;
 use crate::meta_adapter;
@@ -10,32 +10,65 @@ use crate::types::TnId;
 use crate::file::handler::GetFileVariantSelector;
 
 /// Get file variant descriptor
-pub fn get_file_descriptor(variants: &Vec<meta_adapter::FileVariant>) -> String {
-	variants.iter().map(|v| format!("{}:{}:s={}:r={}x{}", v.variant, v.variant_id, v.size, v.resolution.0, v.resolution.1)).join(",")
+pub fn get_file_descriptor<S: AsRef<str> + Debug + Eq>(variants: &Vec<meta_adapter::FileVariant<S>>) -> String {
+	"d1~".to_owned() + &variants.iter().map(|v| format!("{}:{}:s={}:r={}x{}", v.variant.as_ref(), v.variant_id.as_ref(), v.size, v.resolution.0, v.resolution.1)).join(",")
+}
+
+pub fn parse_file_descriptor<S: AsRef<str> + Debug + Eq + for<'a>From<&'a str>>(descriptor: &str) -> ClResult<Vec<meta_adapter::FileVariant<S>>> {
+	let variants: ClResult<Vec<meta_adapter::FileVariant<S>>> = descriptor.split(',').map(|v| {
+		let v_vec: Vec<&str> = v.split(':').collect();
+		if (v_vec.len() < 2) { Err(Error::Parse)?; }
+		let (variant, variant_id) = (v_vec[0], v_vec[1]);
+		let mut resolution: Option<(u32, u32)> = None;
+		let mut format: Option<&str> = None;
+		let mut size: Option<u64> = None;
+
+		for v in v_vec[2..].iter() {
+			if v.starts_with("s=") {
+				size = Some(v[2..].parse().ok().ok_or(Error::Parse)?);
+			} else if v.starts_with("r=") {
+				let res_str: (&str, &str) = v[2..].split('x').collect_tuple().ok_or(Error::Parse)?;
+				resolution = Some((res_str.0.parse()?, res_str.1.parse()?));
+			}
+		}
+		if let (Some(resolution), Some(format), Some(size)) = (resolution, format, size) {
+			Ok(meta_adapter::FileVariant {
+				variant: variant.into(),
+				variant_id: variant_id.into(),
+				resolution,
+				format: format.into(),
+				size,
+				available: false,
+			})
+		} else {
+			Err(Error::Parse)
+		}
+	}).collect();
+	variants
 }
 
 /// Choose best variant
-pub fn get_best_file_variant<'a>(variants: &'a Vec<meta_adapter::FileVariant>, selector: &'_ GetFileVariantSelector) -> ClResult<&'a meta_adapter::FileVariant> {
+pub fn get_best_file_variant<'a, S: AsRef<str> + Debug + Eq>(variants: &'a Vec<meta_adapter::FileVariant<S>>, selector: &'_ GetFileVariantSelector) -> ClResult<&'a meta_adapter::FileVariant<S>> {
 	info!("get_best_file_variant: {:?}", selector);
 	let best = match selector.variant.as_deref() {
-		Some("tn") => variants.iter().find(|v| *v.variant == *"tn")
-			.or_else(|| variants.iter().find(|v| *v.variant == *"sd"))
-			.or_else(|| variants.iter().find(|v| *v.variant == *"md"))
+		Some("tn") => variants.iter().find(|v| v.variant.as_ref() == "tn")
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "sd"))
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "md"))
 			.ok_or(Error::NotFound),
-		Some("sd") => variants.iter().find(|v| *v.variant == *"sd")
-			.or_else(|| variants.iter().find(|v| *v.variant == *"md"))
+		Some("sd") => variants.iter().find(|v| v.variant.as_ref() == "sd")
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "md"))
 			.ok_or(Error::NotFound),
-		Some("md") => variants.iter().find(|v| *v.variant == *"md")
-			.or_else(|| variants.iter().find(|v| *v.variant == *"sd"))
+		Some("md") => variants.iter().find(|v| v.variant.as_ref() == "md")
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "sd"))
 			.ok_or(Error::NotFound),
-		Some("hd") => variants.iter().find(|v| *v.variant == *"hd")
-			.or_else(|| variants.iter().find(|v| *v.variant == *"md"))
-			.or_else(|| variants.iter().find(|v| *v.variant == *"sd"))
+		Some("hd") => variants.iter().find(|v| v.variant.as_ref() == "hd")
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "md"))
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "sd"))
 			.ok_or(Error::NotFound),
-		Some("xd") => variants.iter().find(|v| *v.variant == *"xd")
-			.or_else(|| variants.iter().find(|v| *v.variant == *"hd"))
-			.or_else(|| variants.iter().find(|v| *v.variant == *"md"))
-			.or_else(|| variants.iter().find(|v| *v.variant == *"sd"))
+		Some("xd") => variants.iter().find(|v| v.variant.as_ref() == "xd")
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "hd"))
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "md"))
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "sd"))
 			.ok_or(Error::NotFound),
 		Some(_) => Err(Error::NotFound),
 		None => Err(Error::NotFound)
@@ -60,7 +93,7 @@ impl FileIdGeneratorTask {
 
 #[async_trait]
 impl Task<App> for FileIdGeneratorTask {
-	fn kind() -> &'static str { "file.id-generator" }
+	fn kind() -> &'static str { "file.id-generate" }
 	fn kind_of(&self) -> &'static str { Self::kind() }
 
 	fn build(id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
@@ -74,7 +107,7 @@ impl Task<App> for FileIdGeneratorTask {
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
-		info!("Running task file.id-generator {}", self.f_id);
+		info!("Running task file.id-generate {}", self.f_id);
 		let mut variants = app.meta_adapter.list_file_variants(self.tn_id, meta_adapter::FileId::FId(self.f_id)).await?;
 		variants.sort();
 		let descriptor = get_file_descriptor(&variants);
@@ -84,7 +117,7 @@ impl Task<App> for FileIdGeneratorTask {
 		let file_id = hasher.finalize("f");
 		app.meta_adapter.update_file_id(self.tn_id, self.f_id, &file_id).await?;
 
-		info!("Finished task file.id-generator {} {}", descriptor, file_id);
+		info!("Finished task file.id-generate {} {}", descriptor, file_id);
 		Ok(())
 	}
 }

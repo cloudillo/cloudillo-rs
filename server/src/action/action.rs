@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use itertools::Itertools;
 //use jsonwebtoken::{self as jwt, Algorithm, DecodingKey, EncodingKey, Validation};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_with::skip_serializing_none;
 use std::sync::Arc;
 
 use crate::{
@@ -13,10 +14,29 @@ use crate::{
 	core::scheduler::{Task, TaskId},
 	auth_adapter,
 	meta_adapter,
-	types::now,
 };
 
-pub async fn create_action(app: &App, tn_id: TnId, id_tag: &str, action: meta_adapter::CreateAction) -> ClResult<Box<str>>{
+#[skip_serializing_none]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CreateAction {
+	#[serde(rename = "type")]
+	pub typ: Box<str>,
+	#[serde(rename = "subType")]
+	pub sub_typ: Option<Box<str>>,
+	#[serde(rename = "parentId")]
+	pub parent_id: Option<Box<str>>,
+	#[serde(rename = "rootId")]
+	pub root_id: Option<Box<str>>,
+	#[serde(rename = "audienceTag")]
+	pub audience_tag: Option<Box<str>>,
+	pub content: Option<Box<str>>,
+	pub attachments: Option<Vec<Box<str>>>,
+	pub subject: Option<Box<str>>,
+	#[serde(rename = "expiresAt")]
+	pub expires_at: Option<Timestamp>,
+}
+
+pub async fn create_action(app: &App, tn_id: TnId, id_tag: &str, action: CreateAction) -> ClResult<Box<str>>{
 	let attachments_to_wait = if let Some(attachments) = &action.attachments {
 		attachments.iter().filter(|a| a.starts_with("@")).map(|a| format!("{},{}", tn_id, &a[1..]).into_boxed_str()).collect::<Vec<_>>()
 	} else {
@@ -37,11 +57,11 @@ pub async fn create_action(app: &App, tn_id: TnId, id_tag: &str, action: meta_ad
 pub struct ActionCreatorTask {
 	tn_id: TnId,
 	id_tag: Box<str>,
-	action: meta_adapter::CreateAction,
+	action: CreateAction,
 }
 
 impl ActionCreatorTask {
-	pub fn new(tn_id: TnId, id_tag: Box<str>, action: meta_adapter::CreateAction) -> Arc<Self> {
+	pub fn new(tn_id: TnId, id_tag: Box<str>, action: CreateAction) -> Arc<Self> {
 		Arc::new(Self { tn_id, id_tag, action })
 	}
 }
@@ -81,18 +101,18 @@ impl Task<App> for ActionCreatorTask {
 		};
 
 		let action = meta_adapter::Action {
-			action_id,
-			issuer_tag: self.id_tag.clone(),
-			typ: self.action.typ.clone(),
-			sub_typ: self.action.sub_typ.clone(),
-			parent_id: self.action.parent_id.clone(),
-			root_id: self.action.root_id.clone(),
-			audience_tag: self.action.audience_tag.clone(),
-			content: self.action.content.clone(),
-			attachments,
-			subject: self.action.subject.clone(),
-			expires_at: self.action.expires_at.clone(),
-			created_at: now(),
+			action_id: action_id.as_ref(),
+			issuer_tag: self.id_tag.as_ref(),
+			typ: self.action.typ.as_ref(),
+			sub_typ: self.action.sub_typ.as_deref(),
+			parent_id: self.action.parent_id.as_deref(),
+			root_id: self.action.root_id.as_deref(),
+			audience_tag: self.action.audience_tag.as_deref(),
+			content: self.action.content.as_deref(),
+			attachments: attachments.as_ref().map(|v| v.iter().map(|a| a.as_ref()).collect()),
+			subject: self.action.subject.as_deref(),
+			expires_at: self.action.expires_at,
+			created_at: Timestamp::now(),
 		};
 
 		let key = Some(action.action_id.as_ref());
@@ -125,7 +145,7 @@ impl ActionVerifierTask {
 
 #[async_trait]
 impl Task<App> for ActionVerifierTask {
-	fn kind() -> &'static str { "file.id-generator" }
+	fn kind() -> &'static str { "action.verify" }
 	fn kind_of(&self) -> &'static str { Self::kind() }
 
 	fn build(id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {

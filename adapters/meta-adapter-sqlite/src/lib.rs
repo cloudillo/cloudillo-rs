@@ -12,7 +12,6 @@ use cloudillo::{
 	prelude::*,
 	core::worker::WorkerPool,
 	meta_adapter,
-	types::{TnId, Timestamp, now},
 };
 
 // Helper functions
@@ -118,7 +117,7 @@ impl MetaAdapterSqlite {
 impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	// Tenant management
 	//*******************
-	async fn read_tenant(&self, tn_id: TnId) -> ClResult<meta_adapter::Tenant> {
+	async fn read_tenant(&self, tn_id: TnId) -> ClResult<meta_adapter::Tenant<Box<str>>> {
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, name, type, profile_pic, cover_pic, created_at, x FROM tenants WHERE tn_id = ?1"
 		).bind(tn_id.0).fetch_one(&self.dbr).await;
@@ -161,12 +160,11 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		Ok(())
 	}
 
-	//async fn list_profiles(&self, tn_id: TnId, opts: &meta_adapter::ListProfileOptions) -> ClResult<impl Iterator<Item=meta_adapter::Profile>> {
-	async fn list_profiles(&self, tn_id: TnId, opts: &meta_adapter::ListProfileOptions) -> ClResult<Vec<meta_adapter::Profile>> {
+	async fn list_profiles(&self, tn_id: TnId, opts: &meta_adapter::ListProfileOptions) -> ClResult<Vec<meta_adapter::Profile<Box<str>>>> {
 		Ok(vec!())
 	}
 
-	async fn read_profile(&self, tn_id: TnId, id_tag: &str) -> ClResult<(Box<str>, meta_adapter::Profile)> {
+	async fn read_profile(&self, tn_id: TnId, id_tag: &str) -> ClResult<(Box<str>, meta_adapter::Profile<Box<str>>)> {
 		let res = sqlx::query("SELECT id_tag, type, name, profile_pic, status, perm, following, connected, etag
 			FROM profiles WHERE tn_id=? AND id_tag=?")
 			.bind(tn_id.0).bind(id_tag).fetch_one(&self.dbr).await;
@@ -192,7 +190,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			Ok((etag, profile))
 		})
 	}
-	async fn create_profile(&self, profile: &meta_adapter::Profile, etag: &str) -> ClResult<()> {
+	async fn create_profile(&self, profile: &meta_adapter::Profile<&str>, etag: &str) -> ClResult<()> {
 		Ok(())
 	}
 	async fn update_profile(&self, id_tag: &str, profile: &meta_adapter::UpdateProfileData) -> ClResult<()> {
@@ -347,7 +345,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		todo!("zizi");
 	}
 
-	async fn create_action(&self, tn_id: TnId, action: &meta_adapter::Action, key: Option<&str>) -> ClResult<()> {
+	async fn create_action(&self, tn_id: TnId, action: &meta_adapter::Action<&str>, key: Option<&str>) -> ClResult<()> {
 		let mut tx = self.db.begin().await.map_err(|_| Error::DbError)?;
 		let mut query = sqlx::QueryBuilder::new(
 			"INSERT OR IGNORE INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, expires_at, attachments) VALUES(")
@@ -378,8 +376,8 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				add_reactions -= 1;
 			}
 		}
-		if action.typ.as_ref() == "REACT" && action.content != None {
-			info!("update with reaction: {}", action.content.as_ref().unwrap());
+		if action.typ == "REACT" && action.content != None {
+			info!("update with reaction: {}", action.content.unwrap());
 			sqlx::query("UPDATE actions SET reactions=coalesce(reactions, 0)+? WHERE tn_id=? AND action_id IN (?, ?)")
 				.bind(add_reactions).bind(tn_id.0).bind(&action.parent_id).bind(&action.root_id)
 				.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
@@ -416,7 +414,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		todo!();
 	}
 
-	async fn list_file_variants(&self, tn_id: TnId, file_id: meta_adapter::FileId) -> ClResult<Vec<meta_adapter::FileVariant>> {
+	async fn list_file_variants(&self, tn_id: TnId, file_id: meta_adapter::FileId<&str>) -> ClResult<Vec<meta_adapter::FileVariant<Box<str>>>> {
 		let res = match file_id {
 			meta_adapter::FileId::FId(f_id) => sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size, available
 				FROM file_variants WHERE tn_id=? AND f_id=?")
@@ -453,7 +451,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		}))
 	}
 
-	async fn read_file_variant(&self, tn_id: TnId, variant_id: &str) -> ClResult<meta_adapter::FileVariant> {
+	async fn read_file_variant(&self, tn_id: TnId, variant_id: &str) -> ClResult<meta_adapter::FileVariant<Box<str>>> {
 		info!("read_file_variant: {} {}", tn_id, &variant_id);
 		let res =sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size, available
 				FROM file_variants WHERE tn_id=? AND variant_id=?")
@@ -474,7 +472,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		})
 	}
 
-	async fn create_file(&self, tn_id: TnId, opts: meta_adapter::CreateFile) -> ClResult<meta_adapter::FileId> {
+	async fn create_file(&self, tn_id: TnId, opts: meta_adapter::CreateFile) -> ClResult<meta_adapter::FileId<Box<str>>> {
 		info!("Exists?: {:?} {:?} {:?}", &opts.preset, tn_id, &opts.orig_variant_id);
 		let file_id_exists = sqlx::query("SELECT min(f.file_id) FROM file_variants fv
 			JOIN files f ON f.tn_id=fv.tn_id AND f.f_id=fv.f_id AND f.preset=? AND f.file_id IS NOT NULL
@@ -488,7 +486,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		}
 
 		let status = "P";
-		let created_at = if let Some(created_at) = opts.created_at { created_at } else { now() };
+		let created_at = if let Some(created_at) = opts.created_at { created_at } else { Timestamp::now() };
 		let res = sqlx::query("INSERT OR IGNORE INTO files (tn_id, file_id, status, owner_tag, preset, content_type, file_name, created_at, tags, x) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
 			.bind(tn_id.0).bind(opts.file_id).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(created_at.0).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x)
 			.fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
@@ -496,19 +494,19 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		Ok(meta_adapter::FileId::FId(res.get(0)))
 	}
 
-	async fn create_file_variant<'a>(&'a self, tn_id: TnId, f_id: u64, variant_id: &'a str, opts: meta_adapter::CreateFileVariant) -> ClResult<&'a str> {
-		info!("START create_file_variant: {} {} {}", tn_id, f_id, &variant_id);
+	async fn create_file_variant<'a>(&'a self, tn_id: TnId, f_id: u64, opts: meta_adapter::FileVariant<&'a str>) -> ClResult<&'a str> {
+		info!("START create_file_variant: {} {} {}", tn_id, f_id, &opts.variant_id);
 		let mut tx = self.db.begin().await.map_err(|_| Error::DbError)?;
 		let res = sqlx::query("SELECT f_id FROM files WHERE tn_id=? AND f_id=? AND file_id IS NULL")
 			.bind(tn_id.0).bind(f_id as i64)
 			.fetch_one(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 		let res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-			.bind(tn_id.0).bind(f_id as i64).bind(&variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64)
+			.bind(tn_id.0).bind(f_id as i64).bind(&opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64)
 			.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 		tx.commit().await;
 
-		Ok(variant_id)
+		Ok(opts.variant_id)
 	}
 
 	async fn update_file_id(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()> {

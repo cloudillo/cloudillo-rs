@@ -103,9 +103,4 @@ impl<'de> Deserialize<'de> for Timestamp {
 	}
 }
 
-pub fn now() -> Timestamp {
-	let res = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-	Timestamp(res.as_secs() as i64)
-}
-
 // vim: ts=4

@@ -2,7 +2,7 @@ use axum::{extract::{self, Query, State}, response, body::{Body, to_bytes}, http
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{any::Any, path::Path, pin::Pin, rc::Rc, sync::Arc};
+use std::{any::Any, fmt::Debug, path::Path, pin::Pin, rc::Rc, sync::Arc};
 
 use crate::prelude::*;
 use crate::blob_adapter;
@@ -33,7 +33,7 @@ pub fn content_type_from_format(format: &str) -> &str {
 	}
 }
 
-fn serve_file(descriptor: Option<&str>, variant: &meta_adapter::FileVariant, stream: Pin<Box<dyn Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>>)
+fn serve_file<S: AsRef<str> + Debug>(descriptor: Option<&str>, variant: &meta_adapter::FileVariant<S>, stream: Pin<Box<dyn Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>>)
 -> ClResult<response::Response<axum::body::Body>> {
 	let content_type = content_type_from_format(variant.format.as_ref());
 
@@ -87,7 +87,7 @@ pub async fn get_file_variant_file_id(
 	extract::Query(selector): extract::Query<GetFileVariantSelector>,
 ) -> ClResult<impl response::IntoResponse> {
 
-	let mut variants = app.meta_adapter.list_file_variants(tn_id, meta_adapter::FileId::FileId(file_id)).await?;
+	let mut variants = app.meta_adapter.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id)).await?;
 	variants.sort();
 	info!("variants: {:?}", variants);
 
@@ -106,7 +106,7 @@ pub async fn get_file_descriptor(
 	extract::Query(selector): extract::Query<GetFileVariantSelector>,
 ) -> ClResult<impl response::IntoResponse> {
 
-	let mut variants = app.meta_adapter.list_file_variants(tn_id, meta_adapter::FileId::FileId(file_id)).await?;
+	let mut variants = app.meta_adapter.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id)).await?;
 	variants.sort();
 
 	let descriptor = file::get_file_descriptor(&variants);
@@ -122,9 +122,10 @@ pub struct PostFileQuery {
 
 async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, content_type: &str, bytes: &[u8]) -> ClResult<Json<serde_json::Value>> {
 	let file_id_orig = store::create_blob_buf(&app, tn_id, &bytes, blob_adapter::CreateBlobOptions::default()).await?;
-	app.meta_adapter.create_file_variant(tn_id, f_id, &file_id_orig, meta_adapter::CreateFileVariant {
-		variant: "orig".into(),
-		format: "avif".into(),
+	app.meta_adapter.create_file_variant(tn_id, f_id, meta_adapter::FileVariant {
+		variant_id: file_id_orig.as_ref(),
+		variant: "orig",
+		format: "avif",
 		resolution: (128, 128),
 		size: bytes.len() as u64,
 		available: true,
@@ -137,8 +138,9 @@ async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, content_typ
 	let resized_tn = image::resize_image(app.clone(), bytes.into(), image::ImageFormat::Avif, (128, 128)).await?;
 	debug!("resized {:?}", resized_tn.len());
 	let variant_id_tn = store::create_blob_buf(&app, tn_id, &resized_tn, blob_adapter::CreateBlobOptions::default()).await?;
-	app.meta_adapter.create_file_variant(tn_id, f_id, &variant_id_tn, meta_adapter::CreateFileVariant {
-		variant: "tn".into(),
+	app.meta_adapter.create_file_variant(tn_id, f_id, meta_adapter::FileVariant {
+		variant_id: variant_id_tn.as_ref(),
+		variant: "tn",
 		format: "avif".into(),
 		resolution: (128, 128),
 		size: resized_tn.len() as u64,

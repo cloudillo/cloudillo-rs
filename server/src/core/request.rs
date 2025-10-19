@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::prelude::*;
 use crate::auth_adapter::AuthAdapter;
 use crate::meta_adapter;
+use crate::action::action;
 
 fn to_boxed<B>(body: B) -> BoxBody<Bytes, Error>
 where
@@ -49,7 +50,7 @@ impl Request {
 	}
 
 	async fn create_proxy_token(&self, tn_id: TnId, id_tag: &str, subject: Option<&str>) -> ClResult<Box<str>> {
-		let auth_token = self.auth_adapter.create_action_token(tn_id, meta_adapter::CreateAction {
+		let auth_token = self.auth_adapter.create_action_token(tn_id, action::CreateAction {
 			typ: "PROXY".into(),
 			audience_tag: Some(id_tag.into()),
 			expires_at: Some(Timestamp::from_now(60)), // 1 min

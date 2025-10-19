@@ -9,8 +9,8 @@ use cloudillo::{
 	prelude::*,
 	auth_adapter,
 	meta_adapter,
+	action::action,
 	core::worker::WorkerPool,
-	types::now,
 };
 
 mod crypto;
@@ -339,7 +339,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		Ok(token)
 	}
 
-	async fn create_action_token(&self, tn_id: TnId, action: meta_adapter::CreateAction) -> ClResult<Box<str>> {
+	async fn create_action_token(&self, tn_id: TnId, action: action::CreateAction) -> ClResult<Box<str>> {
 		let res = sqlx::query("SELECT t.id_tag, k.key_id, k.private_key FROM tenants t
 			JOIN keys k ON t.tn_id = k.tn_id
 			WHERE t.tn_id=? ORDER BY k.key_id DESC LIMIT 1")
@@ -362,7 +362,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			a: action.attachments,
 			sub: action.subject,
 			exp: action.expires_at,
-			iat: now(),
+			iat: Timestamp::now(),
 		};
 		let token = crypto::generate_action_token(&self.worker, action_data, private_key).await?;
 

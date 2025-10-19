@@ -13,6 +13,7 @@ pub enum Error {
 	PermissionDenied,
 	DbError,
 	Unknown,
+	Parse,
 
 	// externals
 	Io(std::io::Error),

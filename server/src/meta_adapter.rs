@@ -42,21 +42,21 @@ pub enum ProfilePerm {
 
 #[skip_serializing_none]
 #[derive(Debug, Serialize)]
-pub struct Tenant {
+pub struct Tenant<S: AsRef<str>> {
 	#[serde(rename = "id")]
 	pub tn_id: TnId,
 	#[serde(rename = "idTag")]
-	pub id_tag: Box<str>,
-	pub name: Box<str>,
+	pub id_tag: S,
+	pub name: S,
 	#[serde(rename = "type")]
 	pub typ: ProfileType,
 	#[serde(rename = "profilePic")]
-	pub profile_pic: Option<Box<str>>,
+	pub profile_pic: Option<S>,
 	#[serde(rename = "coverPic")]
-	pub cover_pic: Option<Box<str>>,
+	pub cover_pic: Option<S>,
 	#[serde(rename = "createdAt")]
 	pub created_at: Timestamp,
-	pub x: HashMap<Box<str>, Box<str>>,
+	pub x: HashMap<S, S>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,11 +71,11 @@ pub struct UpdateTenantData {
 }
 
 #[derive(Debug)]
-pub struct Profile {
-	pub id_tag: Box<str>,
-	pub name: Box<str>,
+pub struct Profile<S: AsRef<str>> {
+	pub id_tag: S,
+	pub name: S,
 	pub typ: ProfileType,
-	pub profile_pic: Option<Box<str>>,
+	pub profile_pic: Option<S>,
 	pub following: bool,
 	pub connected: bool,
 }
@@ -148,44 +148,17 @@ pub struct ProfileInfo {
 	pub profile_pic: Option<Box<str>>,
 }
 
-#[skip_serializing_none]
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct CreateAction {
-	#[serde(rename = "type")]
-	pub typ: Box<str>,
-	#[serde(rename = "subType")]
-	pub sub_typ: Option<Box<str>>,
-	#[serde(rename = "parentId")]
-	pub parent_id: Option<Box<str>>,
-	#[serde(rename = "rootId")]
-	pub root_id: Option<Box<str>>,
-	#[serde(rename = "audienceTag")]
-	pub audience_tag: Option<Box<str>>,
-	pub content: Option<Box<str>>,
-	pub attachments: Option<Vec<Box<str>>>,
-	pub subject: Option<Box<str>>,
-	#[serde(rename = "expiresAt")]
-	pub expires_at: Option<Timestamp>,
-}
-
-//#[derive(Serialize)]
-pub struct Action {
-//	#[serde(rename = "actionId")]
-	pub action_id: Box<str>,
-//	#[serde(rename = "type")]
-	pub typ: Box<str>,
-//	#[serde(rename = "subType")]
-	pub sub_typ: Option<Box<str>>,
-//	#[serde(rename = "issuerTag")]
-	pub issuer_tag: Box<str>,
-//	#[serde(rename = "parentId")]
-	pub parent_id: Option<Box<str>>,
-//	#[serde(rename = "rootId")]
-	pub root_id: Option<Box<str>>,
-	pub audience_tag: Option<Box<str>>,
-	pub content: Option<Box<str>>,
-	pub attachments: Option<Vec<Box<str>>>,
-	pub subject: Option<Box<str>>,
+pub struct Action<S: AsRef<str>> {
+	pub action_id: S,
+	pub typ: S,
+	pub sub_typ: Option<S>,
+	pub issuer_tag: S,
+	pub parent_id: Option<S>,
+	pub root_id: Option<S>,
+	pub audience_tag: Option<S>,
+	pub content: Option<S>,
+	pub attachments: Option<Vec<S>>,
+	pub subject: Option<S>,
 	pub created_at: Timestamp,
 	pub expires_at: Option<Timestamp>,
 }
@@ -232,14 +205,8 @@ pub struct ActionView {
 
 // Files
 //*******
-/*
-pub enum FileId<'a> {
-	FileId(&'a str),
-	FId(u64),
-}
-*/
-pub enum FileId {
-	FileId(Box<str>),
+pub enum FileId<S: AsRef<str>> {
+	FileId(S),
 	FId(u64),
 }
 
@@ -273,26 +240,25 @@ pub struct FileView {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct FileVariant {
+pub struct FileVariant<S: AsRef<str> + Debug> {
 	#[serde(rename = "variantId")]
-	pub variant_id: Box<str>,
-	pub variant: Box<str>,
+	pub variant_id: S,
+	pub variant: S,
 	pub resolution: (u32, u32),
-	pub format: Box<str>,
+	pub format: S,
 	pub size: u64,
 	pub available: bool,
 }
 
-impl PartialOrd for FileVariant {
+impl<S: AsRef<str> + Debug + Ord> PartialOrd for FileVariant<S> {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
-impl Ord for FileVariant {
+impl<S: AsRef<str> + Debug + Ord> Ord for FileVariant<S> {
 	fn cmp(&self, other: &Self) -> Ordering {
 		//info!("cmp: {:?} vs {:?}", self, other);
-		//self.variant.cmp(&other.variant)
 		self.size.cmp(&other.size)
 			.then_with(|| self.resolution.0.cmp(&other.resolution.0))
 			.then_with(|| self.resolution.1.cmp(&other.resolution.1))
@@ -368,7 +334,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	//*******************
 
 	/// Reads a tenant profile
-	async fn read_tenant(&self, tn_id: TnId) -> ClResult<Tenant>;
+	async fn read_tenant(&self, tn_id: TnId) -> ClResult<Tenant<Box<str>>>;
 
 	/// Creates a new tenant
 	async fn create_tenant(&self, tn_id: TnId, id_tag: &str) -> ClResult<TnId>;
@@ -380,13 +346,13 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn delete_tenant(&self, tn_id: TnId) -> ClResult<()>;
 
 	/// Lists all profiles matching a set of options
-	async fn list_profiles(&self, tn_id: TnId, opts: &ListProfileOptions) -> ClResult<Vec<Profile>>;
+	async fn list_profiles(&self, tn_id: TnId, opts: &ListProfileOptions) -> ClResult<Vec<Profile<Box<str>>>>;
 
 	/// Reads a profile
 	///
 	/// Returns an `(etag, Profile)` tuple.
-	async fn read_profile(&self, tn_id: TnId, id_tag: &str) -> ClResult<(Box<str>, Profile)>;
-	async fn create_profile(&self, profile: &Profile, etag: &str) -> ClResult<()>;
+	async fn read_profile(&self, tn_id: TnId, id_tag: &str) -> ClResult<(Box<str>, Profile<Box<str>>)>;
+	async fn create_profile(&self, profile: &Profile<&str>, etag: &str) -> ClResult<()>;
 	async fn update_profile(&self, id_tag: &str, profile: &UpdateProfileData) -> ClResult<()>;
 
 	/// Reads the public key of a profile
@@ -406,7 +372,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn list_actions(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<Vec<ActionView>>;
 	async fn list_action_tokens(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<Box<[Box<str>]>>;
 
-	async fn create_action(&self, tn_id: TnId, action: &Action, key: Option<&str>) -> ClResult<()>;
+	async fn create_action(&self, tn_id: TnId, action: &Action<&str>, key: Option<&str>) -> ClResult<()>;
 
 	async fn create_inbound_action(&self, tn_id: TnId, action_id: &str, token: &str, ack_token: Option<&str>) -> ClResult<()>;
 
@@ -430,10 +396,10 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	//*****************
 	async fn get_file_id(&self, tn_id: TnId, f_id: u64) -> ClResult<Box<str>>;
 	async fn list_files(&self, tn_id: TnId, opts: ListFileOptions) -> ClResult<Vec<FileView>>;
-	async fn list_file_variants(&self, tn_id: TnId, file_id: FileId) -> ClResult<Vec<FileVariant>>;
-	async fn read_file_variant(&self, tn_id: TnId, variant_id: &str) -> ClResult<FileVariant>;
-	async fn create_file(&self, tn_id: TnId, opts: CreateFile) -> ClResult<FileId>;
-	async fn create_file_variant<'a>(&'a self, tn_id: TnId, f_id: u64, variant_id: &'a str, opts: CreateFileVariant) -> ClResult<&'a str>;
+	async fn list_file_variants(&self, tn_id: TnId, file_id: FileId<&str>) -> ClResult<Vec<FileVariant<Box<str>>>>;
+	async fn read_file_variant(&self, tn_id: TnId, variant_id: &str) -> ClResult<FileVariant<Box<str>>>;
+	async fn create_file(&self, tn_id: TnId, opts: CreateFile) -> ClResult<FileId<Box<str>>>;
+	async fn create_file_variant<'a>(&'a self, tn_id: TnId, f_id: u64, opts: FileVariant<&'a str>) -> ClResult<&'a str>;
 	async fn update_file_id(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
 
 	// Task scheduler
