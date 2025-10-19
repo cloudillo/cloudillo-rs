@@ -244,9 +244,9 @@ pub struct FileVariant<S: AsRef<str> + Debug> {
 	#[serde(rename = "variantId")]
 	pub variant_id: S,
 	pub variant: S,
-	pub resolution: (u32, u32),
 	pub format: S,
 	pub size: u64,
+	pub resolution: (u32, u32),
 	pub available: bool,
 }
 

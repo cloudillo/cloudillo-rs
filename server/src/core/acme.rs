@@ -1,18 +1,17 @@
 //! ACME subsystem. Handles automatic certificate management using Let's Encrypt.
 
 use std::{
-	collections::HashMap,
 	sync::Arc,
 };
-use axum::extract::{Path, State};
+use axum::extract::{State};
 use axum::http::header::HeaderMap;
 use instant_acme::{self as acme, Account};
 use serde_json;
-use rustls::crypto::{CryptoProvider, aws_lc_rs};
+use rustls::crypto::{CryptoProvider};
 use rustls::sign::CertifiedKey;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use pem;
-use x509_parser::{parse_x509_certificate, pem::Pem};
+use x509_parser::{parse_x509_certificate};
 
 use crate::prelude::*;
 use crate::auth_adapter;
@@ -21,15 +20,7 @@ use crate::auth_adapter;
 struct X509CertData {
 	private_key_pem: Box<str>,
 	certificate_pem: Box<str>,
-	certified_key: Arc<CertifiedKey>,
 	expires_at: Timestamp,
-}
-
-struct TenantCertData {
-	id_tag: Box<str>,
-	tn_id: TnId,
-	app_domain: Option<Box<str>>,
-	cert_data: X509CertData,
 }
 
 pub async fn init(state: App, acme_email: &str, id_tag: &str, app_domain: Option<&str>) -> ClResult<()> {
@@ -137,7 +128,6 @@ async fn renew_domains<'a>(state: &'a App, account: &'a acme::Account, domains: 
 		let cert_data = X509CertData {
 			private_key_pem: private_key_pem.to_string().into_boxed_str(),
 			certificate_pem: cert_chain_pem.to_string().into_boxed_str(),
-			certified_key,
 			expires_at: Timestamp(not_after.timestamp()),
 		};
 

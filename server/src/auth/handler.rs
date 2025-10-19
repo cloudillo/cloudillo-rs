@@ -1,6 +1,4 @@
 use axum::{extract::Query, extract::State, http::StatusCode, Json};
-use std::rc::Rc;
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -42,7 +40,7 @@ pub async fn get_id_tag(State(app): State<App>, req: axum::http::Request<axum::b
 	Ok(Json(IdTagRes { id_tag: cert_data.id_tag }))
 }
 
-pub async fn return_login(app: &App, auth: auth_adapter::AuthLogin) -> ClResult<(StatusCode, Json<Login>)> {
+pub async fn return_login(_app: &App, auth: auth_adapter::AuthLogin) -> ClResult<(StatusCode, Json<Login>)> {
 	let login = Login {
 		tn_id: auth.tn_id,
 		id_tag: auth.id_tag,
@@ -77,8 +75,7 @@ pub async fn post_login(State(app): State<App>, Json(login): Json<LoginReq>)
 }
 
 /// # GET /api/auth/login-token
-pub async fn get_login_token(State(app): State<App>, Auth(auth): Auth, req: axum::http::Request<axum::body::Body>) -> ClResult<(StatusCode, Json<Login>)> {
-	//let token = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|h| h.to_str().ok()).unwrap_or_default();
+pub async fn get_login_token(State(app): State<App>, Auth(auth): Auth) -> ClResult<(StatusCode, Json<Login>)> {
 	info!("login-token for {}", &auth.id_tag);
 	let auth = app.auth_adapter.create_tenant_login(&auth.id_tag).await;
 	if let Ok(auth) = auth {

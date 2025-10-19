@@ -8,9 +8,10 @@ pub use process::verify_action_token;
 
 use crate::prelude::*;
 
-pub fn init(app: &App) {
-	app.scheduler.register::<action::ActionCreatorTask>();
-	app.scheduler.register::<action::ActionVerifierTask>();
+pub fn init(app: &App) -> ClResult<()> {
+	app.scheduler.register::<action::ActionCreatorTask>()?;
+	app.scheduler.register::<action::ActionVerifierTask>()?;
+	Ok(())
 }
 
 // vim: ts=4

@@ -1,7 +1,6 @@
 //! API routes
 
-use axum::{Router, Extension, middleware, http::{header, StatusCode}, response::IntoResponse, routing::{any, get, post}};
-use std::sync::Arc;
+use axum::{Router, middleware, http::header, routing::{any, get, post}};
 use tower_http::{
 	services::{ServeDir, ServeFile},
 	set_header::SetResponseHeaderLayer,

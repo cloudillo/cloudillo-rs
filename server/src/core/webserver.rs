@@ -1,26 +1,16 @@
 // Webserver implementation
 
-use axum::{extract::{
-		WebSocketUpgrade,
-		ws::{Message as WsMessage, WebSocket},
-	},
-	Router,
-	ServiceExt,
-};
+use axum::ServiceExt;
 use rustls::{
 	sign::CertifiedKey,
 	server::{ResolvesServerCert, ClientHello}
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use std::{collections::HashMap, net::{SocketAddr, SocketAddrV4}, str::FromStr, sync::{Arc, Mutex}, fs::File, io::BufReader};
-use tokio::{net::TcpListener, io::{AsyncReadExt, AsyncWriteExt}};
-use tokio_rustls::TlsAcceptor;
-use tower::{Service, /*util::ServiceExt*/};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
+use tower::Service;
 
 use crate::prelude::*;
-use crate::auth_adapter;
 use crate::core;
-use crate::types::{Timestamp};
 
 pub struct CertResolver {
 	state: App,
@@ -88,7 +78,7 @@ impl ResolvesServerCert for CertResolver {
 	}
 }
 
-pub async fn create_https_server(mut state: App, listen: &str, api_router: axum::Router, app_router: axum::Router)
+pub async fn create_https_server(state: App, listen: &str, api_router: axum::Router, app_router: axum::Router)
 	-> Result<tokio::task::JoinHandle<Result<(), std::io::Error>>, std::io::Error> {
 	let cert_resolver = Arc::new(CertResolver::new(state.clone()));
 	let mut server_config = rustls::ServerConfig::builder()
@@ -105,7 +95,7 @@ pub async fn create_https_server(mut state: App, listen: &str, api_router: axum:
 		async move {
 			let start = std::time::Instant::now();
 			let span = info_span!("REQ", req = req.uri().path());
-			span.enter();
+			let _ = span.enter();
 			let peer_addr = req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().map(|a| a.to_string()).unwrap_or("-".to_string());
 			let host =
 				req.uri().host()

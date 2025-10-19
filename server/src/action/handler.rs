@@ -1,8 +1,6 @@
-use axum::{extract::Query, extract::State, http::StatusCode, Extension, Json};
-use serde::{Deserialize, Serialize};
+use axum::{extract::Query, extract::State, http::StatusCode, Json};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::rc::Rc;
-use std::sync::Arc;
 
 use crate::{
 	action::action::{self, ActionVerifierTask}, auth_adapter, core::{hasher::hash, IdTag}, meta_adapter, prelude::*
@@ -16,7 +14,6 @@ pub async fn create_key(State(app): State<App>) -> (StatusCode, Json<auth_adapte
 pub async fn list_actions(
 	State(app): State<App>,
 	Query(opts): Query<meta_adapter::ListActionOptions>,
-//) -> ClResult<(StatusCode, Json<Vec<meta_adapter::ActionView>>)> {
 ) -> ClResult<(StatusCode, Json<Value>)> {
 	info!("list_actions");
 	let actions = app.meta_adapter.list_actions(TnId(1), &opts).await?;
@@ -43,26 +40,6 @@ pub async fn post_action(
 		return Err(Error::NotFound);
 	}
 
-
-
-
-
-
-	/*
-	//let token = action::create_token(&action);
-	let public = app.auth_adapter.create_profile_key(1, None).await.unwrap();
-	let token = app
-		.auth_adapter
-		.create_access_token(1,
-			&auth_adapter::AccessToken {
-				t: "a@a",
-				u: "zizi",
-				..Default::default()
-			},
-		)
-		.await
-		.unwrap();
-	*/
 	Ok((StatusCode::CREATED, Json(list[0].clone())))
 }
 
@@ -76,13 +53,12 @@ pub struct Inbox {
 pub async fn post_inbox(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(id_tag): IdTag,
 	Json(action): Json<Inbox>,
 ) -> ClResult<(StatusCode, Json<Value>)> {
-	let action_id = hash("a", action.token.as_bytes());
+	let _action_id = hash("a", action.token.as_bytes());
 
 	let task = ActionVerifierTask::new(tn_id, action.token);
-	let task_id = app.scheduler.add_with_deps(task, None).await?;
+	let _task_id = app.scheduler.add_with_deps(task, None).await?;
 
 	/*
 	app.meta_adapter.create_inbound_action(tn_id, &action_id, &action.token, None).await?;

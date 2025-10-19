@@ -18,7 +18,7 @@
 //!	- Application platform
 //!		- Third party apps can be implemented
 
-#![allow(unused)]
+#![allow(unused_attributes, dead_code)]
 #![forbid(unsafe_code)]
 
 pub mod error;

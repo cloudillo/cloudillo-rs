@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use itertools::Itertools;
-//use jsonwebtoken::{self as jwt, Algorithm, DecodingKey, EncodingKey, Validation};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::sync::Arc;
 
@@ -10,9 +9,7 @@ use crate::{
 	action::process,
 	file::file,
 	core::hasher,
-	core::request,
 	core::scheduler::{Task, TaskId},
-	auth_adapter,
 	meta_adapter,
 };
 
@@ -47,7 +44,7 @@ pub async fn create_action(app: &App, tn_id: TnId, id_tag: &str, action: CreateA
 	info!("Dependencies: {:?}", deps);
 
 	let task = ActionCreatorTask::new(tn_id, Box::from(id_tag), action);
-	let task_id = app.scheduler.add_with_deps(task, Some(deps)).await?;
+	app.scheduler.add_with_deps(task, Some(deps)).await?;
 
 	Ok(Box::from("FIXME"))
 }
@@ -71,7 +68,7 @@ impl Task<App> for ActionCreatorTask {
 	fn kind() -> &'static str { "action.create" }
 	fn kind_of(&self) -> &'static str { Self::kind() }
 
-	fn build(id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
+	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
 		let task: ActionCreatorTask = serde_json::from_str(ctx)?;
 		Ok(Arc::new(task))
 	}
@@ -148,7 +145,7 @@ impl Task<App> for ActionVerifierTask {
 	fn kind() -> &'static str { "action.verify" }
 	fn kind_of(&self) -> &'static str { Self::kind() }
 
-	fn build(id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
+	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
 		let (tn_id, token) = ctx.split(',').collect_tuple().ok_or(Error::Unknown)?;
 		let task = ActionVerifierTask::new(TnId(tn_id.parse()?), token.into());
 		Ok(task)
@@ -164,37 +161,6 @@ impl Task<App> for ActionVerifierTask {
 
 		process::process_inbound_action_token(&app, self.tn_id, &action_id, &self.token).await?;
 
-		/*
-		let action_not_validated: auth_adapter::ActionToken = decode_jwt_no_verify(&self.token)?;
-		info!("  from: {}", action_not_validated.iss);
-
-		let key_data: crate::profile::handler::Profile = app.request.get(&action_not_validated.iss, "/me/keys").await?;
-		info!("  keys: {:#?}", key_data.keys);
-		let public_key: Option<Box<str>> = if let Some(key) = key_data.keys.iter().find(|k| k.key_id == action_not_validated.k) {
-			let (public_key, expires_at) = (key.public_key.clone(), key.expires_at);
-			Some(public_key)
-		} else {
-			None
-		};
-
-		if let Some(public_key) = public_key {
-			let public_key_pem = format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----", public_key);
-
-			let mut validation = Validation::new(Algorithm::ES384);
-			validation.set_required_spec_claims(&["iss"]);
-
-			let action: auth_adapter::ActionToken = jwt::decode(
-				&self.token,
-				&jwt::DecodingKey::from_ec_pem(&public_key_pem.as_bytes()).inspect_err(|err| error!("from_ec_pem err: {}", err))?,
-				&validation
-			)?.claims;
-
-
-			info!("Finished task action.verify {}", action_id);
-		} else {
-			return Err(Error::NotFound);
-		}
-		*/
 		info!("Finished task action.verify {}", action_id);
 		Ok(())
 	}

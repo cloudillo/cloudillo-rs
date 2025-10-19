@@ -23,6 +23,30 @@ pub enum ImageFormat {
 	Png,
 }
 
+impl AsRef<str> for ImageFormat {
+	fn as_ref(&self) -> &str {
+		match self {
+			ImageFormat::Avif => "avif",
+			ImageFormat::Webp => "webp",
+			ImageFormat::Jpeg => "jpeg",
+			ImageFormat::Png => "png",
+		}
+	}
+}
+
+impl std::str::FromStr for ImageFormat {
+	type Err = Error;
+	fn from_str(s: &str) -> Result<Self, Error> {
+		Ok(match s {
+			"avif" => ImageFormat::Avif,
+			"webp" => ImageFormat::Webp,
+			"jpeg" => ImageFormat::Jpeg,
+			"png" => ImageFormat::Png,
+			_ => return Err(Error::Unknown),
+		})
+	}
+}
+
 // Sync image resizer
 fn resize_image_sync<'a>(orig_buf: impl AsRef<[u8]> + 'a, format: ImageFormat, resize: (u32, u32)) -> Result<Box<[u8]>, image::error::ImageError> {
 	let now = std::time::Instant::now();
@@ -99,26 +123,15 @@ impl Task<App> for ImageResizerTask {
 	fn kind() -> &'static str { "image.resize" }
 	fn kind_of(&self) -> &'static str { Self::kind() }
 
-	fn build(id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
+	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
 		let (tn_id, f_id, format, variant, x_res, y_res, path) = ctx.split(',').collect_tuple().ok_or(Error::Unknown)?;
-		let format = match format {
-			"avif" => ImageFormat::Avif,
-			"webp" => ImageFormat::Webp,
-			"jpeg" => ImageFormat::Jpeg,
-			"png" => ImageFormat::Png,
-			_ => return Err(Error::Unknown),
-		};
+		let format: ImageFormat = format.parse()?;
 		let task = ImageResizerTask::new(TnId(tn_id.parse()?), f_id.parse()?, Box::from(Path::new(path)), variant, format, (x_res.parse()?, y_res.parse()?));
 		Ok(task)
 	}
 
 	fn serialize(&self) -> String {
-		let format = match self.format {
-			ImageFormat::Avif => "avif",
-			ImageFormat::Webp => "webp",
-			ImageFormat::Jpeg => "jpeg",
-			ImageFormat::Png => "png",
-		};
+		let format: &str = self.format.as_ref();
 
 		format!("{},{},{},{},{},{},{}", self.tn_id, self.f_id, format, self.variant, self.res.0, self.res.1, self.path.to_string_lossy())
 	}

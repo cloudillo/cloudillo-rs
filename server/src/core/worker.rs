@@ -90,7 +90,7 @@ impl WorkerPool {
 
 		let job = Box::new(move || {
 			let result = f();
-			res_tx.send(result);
+			let _ignore = res_tx.send(result);
 		});
 
 		self.tx_med.send(job).unwrap();
@@ -108,7 +108,7 @@ impl WorkerPool {
 
 		let job = Box::new(move || {
 			let result = f();
-			res_tx.send(result);
+			let _ignore = res_tx.send(result);
 		});
 
 		self.tx_high.send(job).unwrap();
@@ -126,7 +126,7 @@ impl WorkerPool {
 
 		let job = Box::new(move || {
 			let result = f();
-			res_tx.send(result);
+			let _ignore = res_tx.send(result);
 		});
 
 		self.tx_low.send(job).unwrap();

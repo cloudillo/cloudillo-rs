@@ -9,6 +9,7 @@ use tokio_util::{bytes::Bytes, io::{ReaderStream}};
 use cloudillo::{
 	prelude::*,
 	blob_adapter,
+	core::hasher,
 	types::TnId,
 };
 
@@ -32,6 +33,16 @@ fn obj_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBu
 		.join(&file_id[hash_start..hash_start + 2])
 		.join(&file_id[hash_start + 2..hash_start + 4])
 		.join(&file_id))
+}
+
+fn obj_tmp_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
+	let tmp_id = format!("tmp-{}", cloudillo::core::utils::random_id()?);
+	let hash_start = file_id.find('~').ok_or(Error::Unknown)? + 1;
+	if file_id.len() < hash_start + 5 { Err(Error::Unknown)? };
+
+	Ok(PathBuf::from(base_dir)
+		.join(tn_id.to_string())
+		.join(&tmp_id))
 }
 
 #[derive(Debug)]
@@ -61,12 +72,41 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 
 	/// Creates a new blob using a stream
 	async fn create_blob_stream(&self, tn_id: TnId, file_id: &str, stream: &mut (dyn AsyncRead + Send + Unpin)) -> ClResult<()> {
-		tokio::fs::create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
+		tokio::fs::create_dir_all(obj_dir(&self.base_dir, tn_id, &file_id)?).await?;
 
-		let mut file = File::create(obj_file_path(&self.base_dir, tn_id, file_id)?).await?;
-		tokio::io::copy(stream, &mut file).await?;
+		let tmp_path = obj_tmp_file_path(&self.base_dir, tn_id, &file_id)?;
+		info!("  attachment tmpfile: {:?}", &tmp_path);
+		let mut file = File::create(&tmp_path).await?;
+		let mut hasher = hasher::Hasher::new();
+		let mut buf = [0u8; 8192];
+
+		//let res = (async || -> Result<(), Error> {
+		let res = (async || -> Result<(), Error> {
+			loop {
+				let n = stream.read(&mut buf).await?;
+				if n == 0 { break; }
+				file.write_all(&buf[0..n]).await?;
+				hasher.update(&buf[0..n]);
+			}
+			let id = hasher.finalize("b");
+
+			tokio::fs::rename(&tmp_path, obj_file_path(&self.base_dir, tn_id, &id)?).await?;
+			info!("  attachment downloaded, check: {} ?= {}", &id, &file_id);
+			Ok(())
+		})().await;
+		if res.is_err() {
+			info!("  attachment download failed, removing tmpfile: {:?}", &tmp_path);
+			tokio::fs::remove_file(&tmp_path).await?;
+		}
 
 		Ok(())
+	}
+
+	/// Checks if a blob exists, returns its size
+	async fn stat_blob(&self, tn_id: TnId, blob_id: &str) -> Option<u64> {
+		let path = obj_file_path(&self.base_dir, tn_id, blob_id).ok()?;
+		let metadata = tokio::fs::metadata(&path).await.ok()?;
+		Some(metadata.len())
 	}
 
 	/// Reads a blob

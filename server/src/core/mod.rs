@@ -7,6 +7,7 @@ pub mod hasher;
 pub mod request;
 pub mod middleware;
 pub mod scheduler;
+pub mod utils;
 pub mod webserver;
 pub mod websocket;
 pub mod worker;

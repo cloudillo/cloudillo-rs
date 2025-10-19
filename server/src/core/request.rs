@@ -1,18 +1,19 @@
 //! Request client implementation
 
+use futures::TryStreamExt;
 use futures_core::stream::Stream;
 use hyper::http::StatusCode;
-use http_body_util::{BodyDataStream, BodyExt, Empty, Full, StreamBody, combinators::BoxBody};
+use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::BoxBody};
 use hyper::{body::Body, body::Bytes, Method};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::io::AsyncRead;
 
 use crate::prelude::*;
 use crate::auth_adapter::AuthAdapter;
-use crate::meta_adapter;
 use crate::action::action;
 
 fn to_boxed<B>(body: B) -> BoxBody<Bytes, Error>
@@ -20,7 +21,7 @@ where
 	B: Body<Data = Bytes> + Send + Sync + 'static,
 	B::Error: Send + 'static,
 {
-	body.map_err(|err| { Error::Unknown }).boxed()
+	body.map_err(|_err| { Error::Unknown }).boxed()
 }
 
 #[derive(Deserialize)]
@@ -94,7 +95,12 @@ impl Request {
 		}
 	}
 
-	pub async fn get_stream(&self, id_tag: &str, path: &str) -> ClResult<BodyDataStream<hyper::body::Incoming>> {
+	//pub async fn get_stream(&self, id_tag: &str, path: &str) -> ClResult<BodyDataStream<hyper::body::Incoming>> {
+	//pub async fn get_stream(&self, id_tag: &str, path: &str) -> ClResult<BodyDataStream<ClResult<Bytes>>> {
+	//pub async fn get_stream(&self, id_tag: &str, path: &str) -> ClResult<impl Stream<Item = ClResult<Bytes>>> {
+	//pub async fn get_stream(&self, id_tag: &str, path: &str) -> ClResult<TokioIo<BodyDataStream<hyper::body::Incoming>>> {
+	//pub async fn get_stream(&self, id_tag: &str, path: &str) -> ClResult<StreamReader<BodyDataStream<hyper::body::Incoming>, Bytes>> {
+	pub async fn get_stream(&self, id_tag: &str, path: &str) -> ClResult<impl AsyncRead + Send + Unpin> {
 		// FIXME
 		let token = self.create_proxy_token(TnId(1), id_tag, None).await?;
 		info!("Got proxy token: {}", token);
@@ -105,7 +111,15 @@ impl Request {
 			.body(to_boxed(Empty::new()))?;
 		let res = self.client.request(req).await?;
 		match res.status() {
-			StatusCode::OK => Ok(res.into_body().into_data_stream()),
+			//StatusCode::OK => Ok(res.into_body().into_data_stream().map(|stream| stream.map_err(|err| Error::Unknown))),
+			//StatusCode::OK => Ok(res.into_body().into_data_stream().map(|res| res.map_err(|err| Error::Unknown))),
+			//StatusCode::OK => Ok(hyper_util::rt::TokioIo::new(res.into_body().into_data_stream())),
+			StatusCode::OK => {
+				let stream = res.into_body().into_data_stream()
+					//.map_ok(|f| f.into_data().unwrap_or_defailt())
+					.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+				Ok(tokio_util::io::StreamReader::new(stream))
+			},
 			StatusCode::NOT_FOUND => Err(Error::NotFound),
 			StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
 			_ => Err(Error::Unknown),

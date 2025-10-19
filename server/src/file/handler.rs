@@ -1,15 +1,15 @@
-use axum::{extract::{self, Query, State}, response, body::{Body, to_bytes}, http::StatusCode, Json};
+use axum::{extract::{self, Query, State}, response, body::{Body, to_bytes}, Json};
 use futures_core::Stream;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
-use std::{any::Any, fmt::Debug, path::Path, pin::Pin, rc::Rc, sync::Arc};
+use std::{fmt::Debug, pin::Pin};
 
 use crate::prelude::*;
 use crate::blob_adapter;
 use crate::meta_adapter;
 use crate::types::{self, Timestamp};
 use crate::file::{file, image, store};
-use crate::core::{hasher, Auth};
+use crate::core::hasher;
 
 // Utility functions //
 //*******************//
@@ -51,8 +51,7 @@ fn serve_file<S: AsRef<str> + Debug>(descriptor: Option<&str>, variant: &meta_ad
 
 /// GET /api/file
 pub async fn get_file_list(
-	State(app): State<App>,
-	body: Body,
+	State(_app): State<App>,
 ) -> ClResult<Json<Vec<meta_adapter::FileView>>> {
 	Ok(Json(vec![]))
 }
@@ -61,7 +60,6 @@ pub async fn get_file_list(
 pub async fn get_file_variant(
 	State(app): State<App>,
 	tn_id: TnId,
-	header: axum::http::HeaderMap,
 	extract::Path(variant_id): extract::Path<Box<str>>,
 ) -> ClResult<impl response::IntoResponse> {
 	let variant = app.meta_adapter.read_file_variant(tn_id, &variant_id).await?;
@@ -82,8 +80,7 @@ pub struct GetFileVariantSelector {
 pub async fn get_file_variant_file_id(
 	State(app): State<App>,
 	tn_id: TnId,
-	header: axum::http::HeaderMap,
-	extract::Path((file_id)): extract::Path<Box<str>>,
+	extract::Path(file_id): extract::Path<Box<str>>,
 	extract::Query(selector): extract::Query<GetFileVariantSelector>,
 ) -> ClResult<impl response::IntoResponse> {
 
@@ -101,9 +98,7 @@ pub async fn get_file_variant_file_id(
 pub async fn get_file_descriptor(
 	State(app): State<App>,
 	tn_id: TnId,
-	header: axum::http::HeaderMap,
-	extract::Path((file_id)): extract::Path<Box<str>>,
-	extract::Query(selector): extract::Query<GetFileVariantSelector>,
+	extract::Path(file_id): extract::Path<Box<str>>,
 ) -> ClResult<impl response::IntoResponse> {
 
 	let mut variants = app.meta_adapter.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id)).await?;
@@ -120,7 +115,7 @@ pub struct PostFileQuery {
 	tags: Option<String>,
 }
 
-async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, content_type: &str, bytes: &[u8]) -> ClResult<Json<serde_json::Value>> {
+async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, _content_type: &str, bytes: &[u8]) -> ClResult<Json<serde_json::Value>> {
 	let file_id_orig = store::create_blob_buf(&app, tn_id, &bytes, blob_adapter::CreateBlobOptions::default()).await?;
 	app.meta_adapter.create_file_variant(tn_id, f_id, meta_adapter::FileVariant {
 		variant_id: file_id_orig.as_ref(),
@@ -152,7 +147,7 @@ async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, content_typ
 
 	let task_sd_id = app.scheduler.add(task_sd).await?;
 	let task_hd_id = app.scheduler.add(task_hd).await?;
-	let task_id = app.scheduler.add_full(file::FileIdGeneratorTask::new(tn_id, f_id), Some(format!("{},{}", tn_id, f_id).as_str()), None, Some(vec![task_sd_id, task_hd_id])).await?;
+	app.scheduler.add_full(file::FileIdGeneratorTask::new(tn_id, f_id), Some(format!("{},{}", tn_id, f_id).as_str()), None, Some(vec![task_sd_id, task_hd_id])).await?;
 
 	Ok(Json(json!({"fileId": format!("@{}", f_id), "thumbnailVariantId": variant_id_tn })))
 }
@@ -160,7 +155,6 @@ async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, content_typ
 pub async fn post_file(
 	State(app): State<App>,
 	tn_id: TnId,
-	auth: Auth,
 	extract::Path((preset, file_name)): extract::Path<(Box<str>, Box<str>)>,
 	query: Query<PostFileQuery>,
 	header: axum::http::HeaderMap,

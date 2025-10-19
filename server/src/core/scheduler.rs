@@ -2,8 +2,7 @@
 
 use async_trait::async_trait;
 use flume;
-use std::{collections::{BTreeMap, HashMap}, fmt::Debug, future::Future, pin::Pin, sync::{Arc, Mutex, RwLock}};
-use serde::{Serialize, Deserialize, de::DeserializeOwned};
+use std::{collections::{BTreeMap, HashMap}, fmt::Debug, sync::{Arc, Mutex, RwLock}};
 
 use crate::{
 	prelude::*,
@@ -66,13 +65,13 @@ impl InMemoryTaskStore {
 
 #[async_trait]
 impl<S: Clone> TaskStore<S> for InMemoryTaskStore {
-	async fn add(&self, task: &TaskMeta<S>, key: Option<&str>) -> ClResult<TaskId> {
+	async fn add(&self, _task: &TaskMeta<S>, _key: Option<&str>) -> ClResult<TaskId> {
 		let mut last_id = self.last_id.lock().map_err(|_| Error::Unknown)?;
 		*last_id += 1;
 		Ok(*last_id)
 	}
 
-	async fn finished(&self, id: TaskId, output: &str) -> ClResult<()> {
+	async fn finished(&self, _id: TaskId, _output: &str) -> ClResult<()> {
 		Ok(())
 	}
 
@@ -200,7 +199,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					info!("NOTIFY: tasks_scheduled");
 				}
 				let time = Timestamp::now();
-				if let Some((timestamp, id)) = loop {
+				if let Some((timestamp, _id)) = loop {
 					//info!("first task: {:?}", schedule.tasks_scheduled.lock().unwrap().first_key_value());
 					let mut tasks_scheduled = schedule.tasks_scheduled.lock().unwrap();
 					if let Some((&(timestamp, id), _)) = tasks_scheduled.first_key_value() {
@@ -229,7 +228,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 		let schedule = self.clone();
 		tokio::spawn(async move {
-			schedule.load().await;
+			let _ignore_err = schedule.load().await;
 		});
 	}
 

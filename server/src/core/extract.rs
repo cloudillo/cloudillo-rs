@@ -1,13 +1,9 @@
 //! Custom extractors for Cloudillo-specific data
 
-use async_trait::async_trait;
 use axum::{
-	body::Body,
-	extract::{FromRequestParts, State},
-	http::{request::Parts, response::Response, Request, header, StatusCode},
+	extract::FromRequestParts,
+	http::request::Parts,
 };
-use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time};
 
 use crate::prelude::*;
 use crate::{auth_adapter};

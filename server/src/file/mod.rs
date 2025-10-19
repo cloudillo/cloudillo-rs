@@ -7,9 +7,10 @@ pub mod store;
 
 use crate::prelude::*;
 
-pub fn init(app: &App) {
-	app.scheduler.register::<image::ImageResizerTask>();
-	app.scheduler.register::<file::FileIdGeneratorTask>();
+pub fn init(app: &App) -> ClResult<()> {
+	app.scheduler.register::<image::ImageResizerTask>()?;
+	app.scheduler.register::<file::FileIdGeneratorTask>()?;
+	Ok(())
 }
 
 // vim: ts=4

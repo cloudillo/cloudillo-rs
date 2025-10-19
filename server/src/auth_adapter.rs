@@ -7,8 +7,6 @@ use serde_with::skip_serializing_none;
 
 use crate::{
 	prelude::*,
-	auth_adapter,
-	meta_adapter,
 	action::action,
 };
 

@@ -5,7 +5,7 @@ use axum::{
 	extract::{
 		Path,
 		State,
-		ws::{Message as WsMessage, WebSocketUpgrade, WebSocket},
+		ws::{WebSocketUpgrade, WebSocket},
 	},
 	response::Response,
 };
@@ -52,12 +52,10 @@ async fn handle_ws_bus(mut ws: WebSocket, app: App) {
 }
 */
 
-pub async fn get_ws_doc(ws: WebSocketUpgrade, Path(doc_id): Path<String>, State(state): State<App>) -> ClResult<()> {
-	ws.on_upgrade(async move |socket| {
+pub async fn get_ws_doc(ws: WebSocketUpgrade, Path(_doc_id): Path<String>, State(_app): State<App>) -> Response {
+	ws.on_upgrade(async move |_socket| {
 		info!("Websocket upgrade");
-	});
-
-	Ok(())
+	})
 }
 
 // vim: ts=4

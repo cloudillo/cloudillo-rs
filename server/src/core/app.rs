@@ -1,13 +1,6 @@
 //! App state type
 
-use axum::{
-	extract::{State, Query},
-	http::StatusCode,
-	response::Result as HttpResult,
-	Router,
-};
 use rustls::sign::CertifiedKey;
-use serde::Deserialize;
 use std::{
 	collections::HashMap,
 	path::Path,
@@ -18,7 +11,7 @@ use std::{
 use crate::prelude::*;
 use crate::core::{acme, request, scheduler, webserver, worker};
 
-use crate::auth_adapter::{self, AuthAdapter};
+use crate::auth_adapter::AuthAdapter;
 use crate::meta_adapter::MetaAdapter;
 use crate::blob_adapter::BlobAdapter;
 
@@ -143,7 +136,7 @@ impl AppBuilder {
 		rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider()).expect("FATAL: Failed to install default crypto provider");
 		let auth_adapter = self.adapters.auth_adapter.expect("FATAL: No auth adapter");
 		let meta_adapter = self.adapters.meta_adapter.expect("FATAL: No meta adapter");
-		let mut task_store: Arc<dyn scheduler::TaskStore<App>> = scheduler::MetaAdapterTaskStore::new(meta_adapter.clone());
+		let task_store: Arc<dyn scheduler::TaskStore<App>> = scheduler::MetaAdapterTaskStore::new(meta_adapter.clone());
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker: self.worker.expect("FATAL: No worker pool defined"),
@@ -159,9 +152,9 @@ impl AppBuilder {
 		tokio::fs::create_dir_all(&app.opts.tmp_dir).await.expect("Cannot create tmp dir");
 
 		// Init modules
-		action::init(&app);
-		file::init(&app);
-		let (mut api_router, mut app_router, mut http_router) = routes::init(app.clone());
+		action::init(&app)?;
+		file::init(&app)?;
+		let (api_router, app_router, http_router) = routes::init(app.clone());
 
 		// Start scheduler
 		app.scheduler.start(app.clone());
@@ -184,9 +177,9 @@ impl AppBuilder {
 		});
 
 		if let Some(http_server) = http_server {
-			tokio::try_join!(https_server, http_server)?;
+			let _ = tokio::try_join!(https_server, http_server)?;
 		} else {
-			https_server.await?;
+			let _ = https_server.await?;
 		}
 
 		Ok(())
