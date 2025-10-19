@@ -167,7 +167,30 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	}
 
 	async fn read_profile(&self, tn_id: TnId, id_tag: &str) -> ClResult<(Box<str>, meta_adapter::Profile)> {
-		Err(Error::NotFound)
+		let res = sqlx::query("SELECT id_tag, type, name, profile_pic, status, perm, following, connected, etag
+			FROM profiles WHERE tn_id=? AND id_tag=?")
+			.bind(tn_id.0).bind(id_tag).fetch_one(&self.dbr).await;
+
+		map_res(res, |row| {
+			let id_tag = row.try_get("id_tag")?;
+			let typ = match row.try_get("type")? {
+				"P" => meta_adapter::ProfileType::Person,
+				"C" => meta_adapter::ProfileType::Community,
+				_ => return Err(sqlx::Error::RowNotFound),
+			};
+			let etag = row.try_get("etag")?;
+			let profile = meta_adapter::Profile {
+				id_tag,
+				typ,
+				name: row.try_get("name")?,
+				profile_pic: row.try_get("profile_pic")?,
+				//status: row.try_get("status"),
+				//perm: row.try_get("perm"),
+				following: row.try_get("following")?,
+				connected: row.try_get("connected")?,
+			};
+			Ok((etag, profile))
+		})
 	}
 	async fn create_profile(&self, profile: &meta_adapter::Profile, etag: &str) -> ClResult<()> {
 		Ok(())
@@ -177,11 +200,22 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	}
 
 	async fn read_profile_public_key(&self, id_tag: &str, key_id: &str) -> ClResult<(Box<str>, Timestamp)> {
-		Err(Error::NotFound)
+		let res = sqlx::query("SELECT public_key, expire FROM key_cache WHERE id_tag=? AND key_id=?")
+			.bind(id_tag).bind(key_id).fetch_one(&self.dbr).await;
+
+		map_res(res, |row| {
+			let public_key = row.try_get("public_key")?;
+			let expire = row.try_get("expire").map(Timestamp)?;
+			Ok((public_key, expire))
+		})
 	}
+
 	async fn add_profile_public_key(&self, id_tag: &str, key_id: &str, public_key: &str) -> ClResult<()> {
+		sqlx::query("INSERT INTO key_cache (id_tag, key_id, public_key) VALUES (?, ?, ?)")
+			.bind(id_tag).bind(key_id).bind(public_key).execute(&self.dbr).await.map_err(|_| Error::DbError)?;
 		Ok(())
 	}
+
 	//async fn process_profile_refresh<'a, F>(&self, callback: F)
 	//	where F: FnOnce(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send {
 	async fn process_profile_refresh<'a>(&self, callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>) {
@@ -354,6 +388,18 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		Ok(())
 	}
 
+	async fn create_inbound_action(&self, tn_id: TnId, action_id: &str, token: &str, ack_token: Option<&str>) -> ClResult<()> {
+		let res = sqlx::query("INSERT OR IGNORE INTO action_tokens (tn_id, action_id, token, status, ack)
+			VALUES (?, ?, ?, ?, ?)")
+			.bind(tn_id.0)
+			.bind(action_id)
+			.bind(token)
+			.bind("P")
+			.bind(ack_token)
+			.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		Ok(())
+	}
+
 	// File management
 	//*****************
 	async fn get_file_id(&self, tn_id: TnId, f_id: u64) -> ClResult<Box<str>> {
@@ -509,7 +555,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			WHERE status IN ('P') AND kind=");
 		query.push_bind(&kind)
 			//FIXME .push(" AND key IN ");
-			.push(" AND input IN ");
+			.push(" AND key IN ");
 		query = push_in(query, keys);
 
 		let res = query.build().fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
@@ -703,7 +749,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	//*************
 	sqlx::query("CREATE TABLE IF NOT EXISTS key_cache (
 		id_tag text,
-		keY_id text,
+		key_id text,
 		tn_id integer,
 		expire integer,
 		public_key text,

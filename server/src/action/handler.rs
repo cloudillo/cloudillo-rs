@@ -5,11 +5,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::{
-	prelude::*,
-	action::action,
-	core::IdTag,
-	auth_adapter,
-	meta_adapter,
+	action::action::{self, ActionVerifierTask}, auth_adapter, core::{hasher::hash, IdTag}, meta_adapter, prelude::*
 };
 
 pub async fn create_key(State(app): State<App>) -> (StatusCode, Json<auth_adapter::AuthKey>) {
@@ -68,6 +64,37 @@ pub async fn post_action(
 		.unwrap();
 	*/
 	Ok((StatusCode::CREATED, Json(list[0].clone())))
+}
+
+#[derive(Deserialize)]
+pub struct Inbox {
+	token: Box<str>,
+	related: Option<Vec<Box<str>>>,
+}
+
+#[axum::debug_handler]
+pub async fn post_inbox(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(id_tag): IdTag,
+	Json(action): Json<Inbox>,
+) -> ClResult<(StatusCode, Json<Value>)> {
+	let action_id = hash("a", action.token.as_bytes());
+
+	let task = ActionVerifierTask::new(tn_id, action.token);
+	let task_id = app.scheduler.add_with_deps(task, None).await?;
+
+	/*
+	app.meta_adapter.create_inbound_action(tn_id, &action_id, &action.token, None).await?;
+	if let Some(related) = action.related {
+		for rel_token in related {
+			let rel_id = hash("a", rel_token.as_bytes());
+			app.meta_adapter.create_inbound_action(tn_id, &rel_id, &rel_token, None).await?;
+		}
+	}
+	*/
+
+	Ok((StatusCode::CREATED, Json(json!({}))))
 }
 
 // vim: ts=4

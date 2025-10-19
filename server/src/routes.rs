@@ -31,6 +31,7 @@ fn init_api_service(app: App) -> Router {
 		// File API
 		.route("/api/file", get(file::handler::get_file_list))
 		.route("/api/file/variant/{variant_id}", get(file::handler::get_file_variant))
+		.route("/api/file/{file_id}/descriptor", get(file::handler::get_file_descriptor))
 		.route("/api/file/{file_id}", get(file::handler::get_file_variant_file_id))
 		.route("/api/file/{preset}/{file_name}", post(file::handler::post_file))
 
@@ -50,6 +51,10 @@ fn init_api_service(app: App) -> Router {
 		// Auth API
 		.route("/api/auth/login", post(auth::handler::post_login))
 		.route("/api/auth/password", post(auth::handler::post_password))
+		.route("/api/auth/access-token", get(auth::handler::get_access_token))
+
+		// Inbox
+		.route("/api/inbox", post(action::handler::post_inbox))
 
 		// Websocket bus API
 		.route("/ws/bus", any(websocket::get_ws_bus))

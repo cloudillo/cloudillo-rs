@@ -98,6 +98,22 @@ pub async fn get_file_variant_file_id(
 	serve_file(Some(&descriptor), variant, stream)
 }
 
+pub async fn get_file_descriptor(
+	State(app): State<App>,
+	tn_id: TnId,
+	header: axum::http::HeaderMap,
+	extract::Path((file_id)): extract::Path<Box<str>>,
+	extract::Query(selector): extract::Query<GetFileVariantSelector>,
+) -> ClResult<impl response::IntoResponse> {
+
+	let mut variants = app.meta_adapter.list_file_variants(tn_id, meta_adapter::FileId::FileId(file_id)).await?;
+	variants.sort();
+
+	let descriptor = file::get_file_descriptor(&variants);
+
+	Ok(Json(json!({ "file": descriptor })))
+}
+
 #[derive(Deserialize)]
 pub struct PostFileQuery {
 	created_at: Option<Timestamp>,

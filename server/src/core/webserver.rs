@@ -8,7 +8,6 @@ use axum::{extract::{
 	ServiceExt,
 };
 use rustls::{
-	crypto::{CryptoProvider, aws_lc_rs},
 	sign::CertifiedKey,
 	server::{ResolvesServerCert, ClientHello}
 };
@@ -70,7 +69,7 @@ impl ResolvesServerCert for CertResolver {
 					let certified_key = CertifiedKey::from_der(
 						CertificateDer::pem_slice_iter(&cert_data.cert.as_bytes()).filter_map(Result::ok).collect(),
 						PrivateKeyDer::from_pem_slice(&cert_data.key.as_bytes()).ok()?,
-						CryptoProvider::get_default()?
+						rustls::crypto::CryptoProvider::get_default()?
 					).ok()?;
 					let certified_key = Arc::new(certified_key);
 					let mut cache = self.state.certs.write().ok()?;
@@ -91,7 +90,6 @@ impl ResolvesServerCert for CertResolver {
 
 pub async fn create_https_server(mut state: App, listen: &str, api_router: axum::Router, app_router: axum::Router)
 	-> Result<tokio::task::JoinHandle<Result<(), std::io::Error>>, std::io::Error> {
-	CryptoProvider::install_default(aws_lc_rs::default_provider()).map_err(|_| std::io::ErrorKind::Other)?;
 	let cert_resolver = Arc::new(CertResolver::new(state.clone()));
 	let mut server_config = rustls::ServerConfig::builder()
 		.with_no_client_auth()

@@ -73,7 +73,7 @@ impl Task<App> for FileIdGeneratorTask {
 		format!("{},{}", self.tn_id, self.f_id)
 	}
 
-	async fn run(&self, app: App) -> ClResult<()> {
+	async fn run(&self, app: &App) -> ClResult<()> {
 		info!("Running task file.id-generator {}", self.f_id);
 		let mut variants = app.meta_adapter.list_file_variants(self.tn_id, meta_adapter::FileId::FId(self.f_id)).await?;
 		variants.sort();

@@ -329,10 +329,14 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 	}
 
 	async fn create_access_token(&self, tn_id: TnId, data: &auth_adapter::AccessToken) -> ClResult<Box<str>> {
-		let key = crypto::generate_key(&self.worker).await.or(Err(Error::DbError))?;
-		// TODO
+		let res = sqlx::query(
+			"SELECT tn_id, id_tag, password, roles FROM tenants WHERE tn_id = ?"
+		).bind(tn_id.0).fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
-		Ok(key.public_key)
+		let roles: Option<&str> = res.try_get("roles").or(Err(Error::DbError))?;
+		let token = crypto::generate_access_token(&self.worker, tn_id, roles.map(|s| s.into())).await?;
+
+		Ok(token)
 	}
 
 	async fn create_action_token(&self, tn_id: TnId, action: meta_adapter::CreateAction) -> ClResult<Box<str>> {

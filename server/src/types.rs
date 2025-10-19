@@ -47,6 +47,18 @@ impl<'de> Deserialize<'de> for TnId {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Timestamp(pub i64);
 
+impl Timestamp {
+	pub fn now() -> Timestamp {
+		let res = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+		Timestamp(res.as_secs() as i64)
+	}
+
+	pub fn from_now(delta: i64) -> Timestamp {
+		let res = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+		Timestamp(res.as_secs() as i64 + delta)
+	}
+}
+
 impl std::fmt::Display for Timestamp {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}", self.0)

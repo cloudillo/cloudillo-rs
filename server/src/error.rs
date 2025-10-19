@@ -106,6 +106,13 @@ impl From<pem::PemError> for Error {
 	}
 }
 
+impl From<jsonwebtoken::errors::Error> for Error {
+	fn from(_err: jsonwebtoken::errors::Error) -> Self {
+		warn!("jwt error: {}", _err);
+		Error::PermissionDenied
+	}
+}
+
 impl From<x509_parser::asn1_rs::Err<x509_parser::error::X509Error>> for Error {
 	fn from(_err: x509_parser::asn1_rs::Err<x509_parser::error::X509Error>) -> Self {
 		warn!("x509 error: {}", _err);
@@ -124,6 +131,20 @@ impl From<rustls_pki_types::pem::Error> for Error {
 	fn from(_err: rustls_pki_types::pem::Error) -> Self {
 		warn!("pem error: {}", _err);
 		Error::PermissionDenied
+	}
+}
+
+impl From<hyper::Error> for Error {
+	fn from(_err: hyper::Error) -> Self {
+		warn!("hyper error: {}", _err);
+		Error::Unknown
+	}
+}
+
+impl From<hyper_util::client::legacy::Error> for Error {
+	fn from(_err: hyper_util::client::legacy::Error) -> Self {
+		warn!("hyper error: {}", _err);
+		Error::Unknown
 	}
 }
 

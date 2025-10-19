@@ -2,6 +2,9 @@
 
 pub mod action;
 pub mod handler;
+mod process;
+
+pub use process::verify_action_token;
 
 use crate::prelude::*;
 

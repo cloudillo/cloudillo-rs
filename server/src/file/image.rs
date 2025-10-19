@@ -123,7 +123,7 @@ impl Task<App> for ImageResizerTask {
 		format!("{},{},{},{},{},{},{}", self.tn_id, self.f_id, format, self.variant, self.res.0, self.res.1, self.path.to_string_lossy())
 	}
 
-	async fn run(&self, app: App) -> ClResult<()> {
+	async fn run(&self, app: &App) -> ClResult<()> {
 		info!("Running task image.resize {:?} {:?}", self.path, self.res);
 		let bytes = tokio::fs::read(self.path.clone()).await?;
 		let res = self.res;

@@ -25,7 +25,7 @@ pub trait Task<S: Clone>: Send + Sync + Debug {
 	fn build(id: TaskId, context: &str) -> ClResult<Arc<dyn Task<S>>>
 		where Self: Sized;
 	fn serialize(&self) -> String;
-	async fn run(&self, state: S) -> ClResult<()>;
+	async fn run(&self, state: &S) -> ClResult<()>;
 
 	fn kind_of(&self) -> &'static str;
 }
@@ -308,7 +308,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		let tx_finish = self.tx_finish.clone();
 		//let state = self.state.clone();
 		tokio::spawn(async move {
-			let _ = task.run(state).await;
+			let _ = task.run(&state).await;
 			tx_finish.send(id).unwrap_or(());
 		});
 	}
@@ -341,7 +341,7 @@ mod tests {
 			Ok(task)
 		}
 
-		async fn run(&self, state: State) -> ClResult<()> {
+		async fn run(&self, state: &State) -> ClResult<()> {
 			info!("Running task {}", self.num);
 			tokio::time::sleep(std::time::Duration::from_millis(200 * self.num as u64)).await;
 			info!("Finished task {}", self.num);

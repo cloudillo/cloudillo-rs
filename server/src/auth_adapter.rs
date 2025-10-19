@@ -14,7 +14,7 @@ use crate::{
 
 /// Action tokens represent user actions
 #[skip_serializing_none]
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ActionToken {
 	pub iss: Box<str>,
 	pub k: Box<str>,
@@ -56,7 +56,7 @@ pub struct ProxyToken<'a> {
 
 /// Represents a profile key
 #[skip_serializing_none]
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AuthKey {
 	#[serde(rename = "keyId")]
 	pub key_id: Box<str>,

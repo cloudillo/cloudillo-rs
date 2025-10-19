@@ -38,8 +38,11 @@ pub async fn require_auth(State(state): State<App>, tn_id: TnId, mut req: Reques
 
 pub async fn optional_auth(State(state): State<App>, tn_id: TnId, mut req: Request<Body>, next: Next) -> ClResult<Response<Body>> {
 	if let Some(auth_header) = req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()) {
+		info!("Got auth header: {}", auth_header);
 		if auth_header.starts_with("Bearer ") {
 			let token = &auth_header[7..].trim();
+			let claims = state.auth_adapter.validate_token(token).await;
+			info!("Got claims: {:#?}", claims);
 			let claims = state.auth_adapter.validate_token(token).await?;
 
 			if claims.tn_id != tn_id {

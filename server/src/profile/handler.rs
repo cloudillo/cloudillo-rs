@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use std::rc::Rc;
 use std::sync::Arc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 use crate::action::action;
@@ -9,14 +9,14 @@ use crate::auth_adapter;
 use crate::core::IdTag;
 
 /// # Profile
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct Profile {
 	#[serde(rename = "idTag")]
-	id_tag: Box<str>,
-	name: Box<str>,
+	pub id_tag: Box<str>,
+	pub name: Box<str>,
 	#[serde(rename = "type")]
-	profile_type: Box<str>,
-	keys: Vec<auth_adapter::AuthKey>,
+	pub profile_type: Box<str>,
+	pub keys: Vec<auth_adapter::AuthKey>,
 }
 
 pub async fn get_tenant_profile(

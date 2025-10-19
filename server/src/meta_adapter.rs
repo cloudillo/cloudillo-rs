@@ -70,21 +70,14 @@ pub struct UpdateTenantData {
 	typ: ProfileType,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct Profile {
-	#[serde(rename = "id")]
-	pub tn_id: TnId,
-	#[serde(rename = "idTag")]
 	pub id_tag: Box<str>,
 	pub name: Box<str>,
-	#[serde(rename = "type")]
 	pub typ: ProfileType,
-	#[serde(rename = "profilePic")]
 	pub profile_pic: Option<Box<str>>,
-	#[serde(rename = "coverPic")]
-	pub cover_pic: Option<Box<str>>,
-	#[serde(rename = "createdAt")]
-	pub created_at: Timestamp,
+	pub following: bool,
+	pub connected: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,7 +149,7 @@ pub struct ProfileInfo {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CreateAction {
 	#[serde(rename = "type")]
 	pub typ: Box<str>,
@@ -414,6 +407,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn list_action_tokens(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<Box<[Box<str>]>>;
 
 	async fn create_action(&self, tn_id: TnId, action: &Action, key: Option<&str>) -> ClResult<()>;
+
+	async fn create_inbound_action(&self, tn_id: TnId, action_id: &str, token: &str, ack_token: Option<&str>) -> ClResult<()>;
 
 	/*
 	getActionRootId: (tnId: number, actionId: string) => Promise<string>
