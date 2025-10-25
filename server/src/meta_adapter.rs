@@ -320,6 +320,7 @@ pub struct Task {
 	pub input: Box<str>,
 	pub output: Box<str>,
 	pub deps: Box<[u64]>,
+	pub retry: Option<Box<str>>,
 }
 
 #[derive(Debug, Default)]

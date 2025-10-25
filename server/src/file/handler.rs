@@ -147,7 +147,7 @@ async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, _content_ty
 
 	let task_sd_id = app.scheduler.add(task_sd).await?;
 	let task_hd_id = app.scheduler.add(task_hd).await?;
-	app.scheduler.add_full(file::FileIdGeneratorTask::new(tn_id, f_id), Some(format!("{},{}", tn_id, f_id).as_str()), None, Some(vec![task_sd_id, task_hd_id])).await?;
+	app.scheduler.add_full(file::FileIdGeneratorTask::new(tn_id, f_id), Some(format!("{},{}", tn_id, f_id).as_str()), None, Some(vec![task_sd_id, task_hd_id]), None).await?;
 
 	Ok(Json(json!({"fileId": format!("@{}", f_id), "thumbnailVariantId": variant_id_tn })))
 }

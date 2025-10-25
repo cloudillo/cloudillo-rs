@@ -109,6 +109,16 @@ impl MetaAdapterSqlite {
 			.inspect_err(|err| println!("DbError: {:#?}", err))
 			.or(Err(Error::DbError))?;
 
+		// Debug PRAGMA compiler_options
+		let res = sqlx::query("PRAGMA compile_options")
+			.fetch_all(&db).await
+			.inspect_err(|err| println!("DbError: {:#?}", err))
+			.or(Err(Error::DbError))?;
+		//let max_attached = res.iter().map(|row| row.get::<&str, _>(0)).filter(|s| s.starts_with("MAX_ATTACHED=")).collect::<Vec<_>>().iter().split("=").last()?;
+		let max_attached = res.iter().map(|row| row.get::<&str, _>(0)).filter(|s| s.starts_with("MAX_ATTACHED=")).last().unwrap_or("").split("=").last();
+		println!("MAX_ATTACHED: {:?}", max_attached);
+		//println!("PRAGMA compile_options: {:#?}", res.iter().map(|row| row.get::<&str, _>(0)).filter(|s| s.starts_with("MAX_ATTACHED=")).collect::<Vec<_>>());
+
 		Ok(Self { worker, db, dbr })
 	}
 }
@@ -523,7 +533,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	// Task scheduler
 	//****************
 	async fn list_tasks(&self, opts: meta_adapter::ListTaskOptions) -> ClResult<Vec<meta_adapter::Task>> {
-		let res = sqlx::query("SELECT t.task_id, t.tn_id, t.kind, t.status, t.created_at, t.next_at,
+		let res = sqlx::query("SELECT t.task_id, t.tn_id, t.kind, t.status, t.created_at, t.next_at, t.retry,
 			t.input, t.output, string_agg(td.dep_id, ',') as deps
 			FROM tasks t
 			LEFT JOIN task_dependencies td ON td.task_id=t.task_id
@@ -541,6 +551,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				status: status.chars().next().unwrap_or('E'),
 				created_at: row.try_get("created_at").map(|ts| Timestamp(ts))?,
 				next_at: row.try_get::<Option<i64>, _>("next_at")?.map(|ts| Timestamp(ts)),
+				retry: row.try_get("retry")?,
 				input: row.try_get("input")?,
 				output: row.try_get("output")?,
 				deps: deps.map(|s| parse_u64_list(&s)).unwrap_or_default(),
@@ -806,6 +817,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		status char(1),			-- 'P': pending, 'F': finished, 'E': error
 		created_at datetime DEFAULT (unixepoch()),
 		next_at datetime,
+		retry text,
 		input text,
 		output text,
 		error text,

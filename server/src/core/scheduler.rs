@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use flume;
+use itertools::Itertools;
 use std::{collections::{BTreeMap, HashMap}, fmt::Debug, sync::{Arc, Mutex, RwLock}};
 
 use crate::{
@@ -41,6 +42,7 @@ pub struct TaskData {
 	status: TaskStatus,
 	input: Box<str>,
 	deps: Box<[TaskId]>,
+	retry_data: Option<Box<str>>,
 	next_at: Option<Timestamp>,
 }
 
@@ -116,21 +118,42 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 			},
 			input: t.input,
 			deps: t.deps,
+			retry_data: t.retry,
 			next_at: t.next_at,
 		}).collect();
 		Ok(tasks)
 	}
 }
 
+// Task metadata
 type TaskBuilder<S> = dyn Fn(TaskId, &str) -> ClResult<Arc<dyn Task<S>>> + Send + Sync;
+
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+	wait_min_max: (u64, u64),
+	times: u16,
+}
+
+impl RetryPolicy {
+	pub fn default() -> Self {
+		Self {
+			wait_min_max: (60, 3600),
+			times: 10,
+		}
+	}
+}
 
 #[derive(Debug, Clone)]
 pub struct TaskMeta<S: Clone> {
 	pub task: Arc<dyn Task<S>>,
 	pub next_at: Option<Timestamp>,
 	pub deps: Vec<TaskId>,
+	retry_count: u16,
+	pub retry: Option<RetryPolicy>,
 }
 
+// Scheduler
+//***********
 #[derive(Clone)]
 pub struct Scheduler<S: Clone> {
 	task_builders: Arc<RwLock<HashMap<&'static str, Box<TaskBuilder<S>>>>>,
@@ -246,18 +269,24 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		Ok(self)
 	}
 
-	pub async fn add_full(&self, task: Arc<dyn Task<S>>, key: Option<&str>, next_at: Option<Timestamp>, deps: Option<Vec<TaskId>>) -> ClResult<TaskId> {
-		let task_meta = TaskMeta { task: task.clone(), next_at, deps: deps.clone().unwrap_or_default() };
+	pub async fn add_full(&self, task: Arc<dyn Task<S>>, key: Option<&str>, next_at: Option<Timestamp>, deps: Option<Vec<TaskId>>, retry: Option<RetryPolicy>) -> ClResult<TaskId> {
+		let task_meta = TaskMeta {
+			task: task.clone(),
+			next_at,
+			deps: deps.clone().unwrap_or_default(),
+			retry_count: 0,
+			retry,
+		};
 		let id = self.store.add(&task_meta, key).await?;
 		self.add_queue(id, task_meta).await
 	}
 
 	pub async fn add(&self, task: Arc<dyn Task<S>>) -> ClResult<TaskId> {
-		self.add_full(task, None, None, None).await
+		self.add_full(task, None, None, None, None).await
 	}
 
 	pub async fn add_with_deps(&self, task: Arc<dyn Task<S>>, deps: Option<Vec<TaskId>>) -> ClResult<TaskId> {
-		self.add_full(task, None, None, deps).await
+		self.add_full(task, None, None, deps, None).await
 	}
 
 	pub async fn add_queue(&self, id: TaskId, task_meta: TaskMeta<S>) -> ClResult<TaskId> {
@@ -293,7 +322,23 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 						let builder = builder_map.get(t.kind.as_ref()).ok_or(Error::Unknown)?;
 						builder(t.id, &t.input)?
 					};
-					let task_meta = TaskMeta { task, next_at: t.next_at, deps: t.deps.into() };
+					let (retry_count, retry) = match t.retry_data {
+						Some(retry_str) => {
+							let (retry_count, retry_min, retry_max, retry_times) = retry_str.split(',').collect_tuple().ok_or(Error::Unknown)?;
+							let retry_count: u16 = retry_count.parse().map_err(|_| Error::Unknown)?;
+							let retry = RetryPolicy {
+								wait_min_max: (
+									retry_min.parse().map_err(|_| Error::Unknown)?,
+									retry_max.parse().map_err(|_| Error::Unknown)?,
+								),
+								times: retry_times.parse().map_err(|_| Error::Unknown)?,
+							};
+							info!("Loaded retry policy: {:?}", retry);
+							(retry_count, Some(retry))
+						}
+						_ => (0, None)
+					};
+					let task_meta = TaskMeta { task, next_at: t.next_at, deps: t.deps.into(), retry_count, retry };
 					self.add_queue(t.id, task_meta).await?;
 				},
 				_ => (),

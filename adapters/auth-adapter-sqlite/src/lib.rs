@@ -282,7 +282,6 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 	}
 
 	async fn read_cert_by_domain(&self, domain: &str) -> ClResult<auth_adapter::CertData> {
-		println!("read_cert_by_domain {}", &domain);
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, domain, cert, key, expires_at FROM certs WHERE domain = ?1"
 		).bind(domain).fetch_one(&self.db).await;
