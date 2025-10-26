@@ -146,7 +146,8 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn create_tenant_registration(&self, email: &str) -> ClResult<()>;
 
 	/// Creates a new tenant
-	async fn create_tenant(&self, id_tag: &str, email: Option<&str>) -> ClResult<TnId>;
+	/// If vfy_code is provided, validates it against the email in user_vfy table
+	async fn create_tenant(&self, id_tag: &str, email: Option<&str>, vfy_code: Option<&str>) -> ClResult<TnId>;
 
 	/// Deletes a tenant
 	async fn delete_tenant(&self, id_tag: &str) -> ClResult<()>;
@@ -194,6 +195,19 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn create_webauthn_credential(&self, tn_id: TnId, data: &Webauthn) -> ClResult<()>;
 	async fn update_webauthn_credential_counter(&self, tn_id: TnId, credential_id: &str, counter: u32) -> ClResult<()>;
 	async fn delete_webauthn_credential(&self, tn_id: TnId, credential_id: &str) -> ClResult<()>;
+
+	// Phase 1: Registration & Session Management
+	/// Generate a verification token for email verification (registration workflow)
+	async fn create_registration_verification(&self, email: &str) -> ClResult<Box<str>>;
+
+	/// Validate a registration verification token
+	async fn validate_registration_verification(&self, email: &str, vfy_code: &str) -> ClResult<()>;
+
+	/// Invalidate an access token (logout)
+	async fn invalidate_token(&self, token: &str) -> ClResult<()>;
+
+	/// Clean up expired verification tokens (runs periodically)
+	async fn cleanup_expired_verifications(&self) -> ClResult<()>;
 }
 
 #[cfg(test)]

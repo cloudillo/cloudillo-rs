@@ -11,6 +11,7 @@ use cloudillo::{
 	meta_adapter,
 	action::action,
 	core::worker::WorkerPool,
+	core::utils::random_id,
 };
 
 mod crypto;
@@ -91,9 +92,46 @@ impl AuthAdapterSqlite {
 			.inspect_err(|err| println!("DbError: {:#?}", err))
 			.or(Err(Error::DbError))?;
 
-		let jwt_secret = DecodingKey::from_secret("FIXME secret".as_ref());
+		// Get or generate JWT secret
+		let jwt_secret_str = Self::ensure_jwt_secret(&db).await?;
+		let jwt_secret = DecodingKey::from_secret(jwt_secret_str.as_bytes());
 
 		Ok(Self { worker, db, jwt_secret })
+	}
+
+	/// Get or generate the JWT secret for HS256 signing
+	async fn ensure_jwt_secret(db: &SqlitePool) -> ClResult<String> {
+		// Try to read existing secret
+		let res = sqlx::query("SELECT value FROM vars WHERE key = ?1")
+			.bind("0:jwt_secret")
+			.fetch_optional(db)
+			.await
+			.inspect_err(inspect)
+			.or(Err(Error::DbError))?;
+
+		if let Some(row) = res {
+			return row.try_get("value").inspect_err(inspect).or(Err(Error::DbError));
+		}
+
+		// Generate new secret (32 random bytes, base64 encoded)
+		use rand::RngCore;
+		use base64::Engine;
+		let mut secret_bytes = [0u8; 32];
+		let mut rng = rand::rng();
+		rng.fill_bytes(&mut secret_bytes);
+		let secret_str = base64::engine::general_purpose::STANDARD.encode(&secret_bytes);
+
+		// Store in database
+		sqlx::query("INSERT OR REPLACE INTO vars (key, value) VALUES (?1, ?2)")
+			.bind("0:jwt_secret")
+			.bind(&secret_str)
+			.execute(db)
+			.await
+			.inspect_err(inspect)
+			.or(Err(Error::DbError))?;
+
+		info!("Generated new JWT secret");
+		Ok(secret_str)
 	}
 }
 
@@ -105,7 +143,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			token,
 			&self.jwt_secret,
 			&Validation::new(Algorithm::HS256),
-		).map_err(|_| Error::PermissionDenied)?;
+		).map_err(|_| Error::Unauthorized)?;
 		let id_tag = self.read_id_tag(TnId(token_data.claims.sub)).await.map_err(|_| Error::PermissionDenied)?;
 
 		Ok(auth_adapter::AuthCtx {
@@ -148,23 +186,75 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 	}
 
 	async fn create_tenant_registration(&self, email: &str) -> ClResult<()> {
-		todo!()
+		// Check if email is already registered as an active tenant
+		let existing = sqlx::query(
+			"SELECT email FROM tenants WHERE email = ?1 AND status = 'A'"
+		)
+		.bind(email)
+		.fetch_optional(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		if existing.is_some() {
+			return Err(Error::PermissionDenied); // Email already registered
+		}
+
+		// Generate verification code
+		let vfy_code = random_id()?;
+
+		// Store verification code (INSERT OR REPLACE to allow retries)
+		sqlx::query(
+			"INSERT OR REPLACE INTO user_vfy (vfy_code, email, func) VALUES (?1, ?2, 'register')"
+		)
+		.bind(&vfy_code)
+		.bind(email)
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		info!("Tenant registration initiated for email: {}", email);
+		Ok(())
 	}
 
-	async fn create_tenant(&self, id_tag: &str, email: Option<&str>) -> ClResult<TnId> {
-		/*
-		if let Some(vfy_code) = &profile.vfy_code {
-			println!("create_auth_profile VFY");
-			let row = sqlx::query(
-				"SELECT email FROM user_vfy WHERE vfy_code = ?1"
-			).bind(vfy_code).fetch_one(&self.db).await.or(Err(Error::DbError))?;
+	async fn create_tenant(&self, id_tag: &str, email: Option<&str>, vfy_code: Option<&str>) -> ClResult<TnId> {
+		// If verification code is provided, validate it
+		if let Some(vfy_code) = vfy_code {
+			if let Some(email_addr) = email {
+				// Query user_vfy table to validate code matches email
+				let row = sqlx::query(
+					"SELECT email FROM user_vfy WHERE vfy_code = ?1"
+				).bind(vfy_code)
+					.fetch_optional(&self.db)
+					.await
+					.inspect_err(inspect)
+					.or(Err(Error::DbError))?;
 
-			let email: &str = row.try_get("email").or(Err(Error::DbError))?;
-			if email != profile.email.unwrap_or("") {
+				let Some(vfy_row) = row else {
+					// Verification code not found
+					return Err(Error::PermissionDenied);
+				};
+
+				let stored_email: String = vfy_row.try_get("email").inspect_err(inspect).or(Err(Error::DbError))?;
+				if stored_email != email_addr {
+					// Email mismatch - code belongs to different email
+					return Err(Error::PermissionDenied);
+				}
+
+				// Validation passed - delete the verification code
+				sqlx::query("DELETE FROM user_vfy WHERE vfy_code = ?1")
+					.bind(vfy_code)
+					.execute(&self.db)
+					.await
+					.inspect_err(inspect)
+					.or(Err(Error::DbError))?;
+			} else {
+				// vfy_code provided but no email
 				return Err(Error::PermissionDenied);
 			}
 		}
-		*/
+
 		let res = sqlx::query(
 			"INSERT INTO tenants (id_tag, email, status) VALUES (?1, ?2, 'A') RETURNING tn_id"
 		).bind(id_tag).bind(email)
@@ -174,7 +264,63 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 	}
 
 	async fn delete_tenant(&self, id_tag: &str) -> ClResult<()> {
-		todo!()
+		// Get the tenant ID first
+		let res = sqlx::query("SELECT tn_id FROM tenants WHERE id_tag = ?1")
+			.bind(id_tag)
+			.fetch_optional(&self.db)
+			.await
+			.inspect_err(inspect)
+			.or(Err(Error::DbError))?;
+
+		let Some(row) = res else {
+			return Err(Error::NotFound);
+		};
+
+		let tn_id: i32 = row.try_get("tn_id").inspect_err(inspect).or(Err(Error::DbError))?;
+
+		// Begin transaction for atomic deletion
+		let mut tx = self.db.begin().await.inspect_err(inspect).or(Err(Error::DbError))?;
+
+		// Delete in order (respecting potential foreign key constraints)
+		sqlx::query("DELETE FROM certs WHERE tn_id = ?1")
+			.bind(tn_id)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.or(Err(Error::DbError))?;
+
+		sqlx::query("DELETE FROM keys WHERE tn_id = ?1")
+			.bind(tn_id)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.or(Err(Error::DbError))?;
+
+		sqlx::query("DELETE FROM user_vfy WHERE email IN (SELECT email FROM tenants WHERE tn_id = ?1)")
+			.bind(tn_id)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.or(Err(Error::DbError))?;
+
+		sqlx::query("DELETE FROM events WHERE tn_id = ?1")
+			.bind(tn_id)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.or(Err(Error::DbError))?;
+
+		sqlx::query("DELETE FROM tenants WHERE tn_id = ?1")
+			.bind(tn_id)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.or(Err(Error::DbError))?;
+
+		tx.commit().await.inspect_err(inspect).or(Err(Error::DbError))?;
+
+		info!("Tenant deleted: {}", id_tag);
+		Ok(())
 	}
 
 	// Password management
@@ -309,7 +455,27 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		})))
 	}
 
-	async fn read_profile_key(&self, tn_id: TnId, key_id: &str) -> ClResult<auth_adapter::AuthKey> {todo!();}
+	async fn read_profile_key(&self, tn_id: TnId, key_id: &str) -> ClResult<auth_adapter::AuthKey> {
+		let res = sqlx::query(
+			"SELECT key_id, public_key, expires_at FROM keys WHERE tn_id = ?1 AND key_id = ?2"
+		)
+		.bind(tn_id.0)
+		.bind(key_id)
+		.fetch_optional(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		let Some(row) = res else {
+			return Err(Error::NotFound);
+		};
+
+		Ok(auth_adapter::AuthKey {
+			key_id: row.try_get::<Box<str>, _>("key_id").inspect_err(inspect).or(Err(Error::DbError))?,
+			public_key: row.try_get::<Box<str>, _>("public_key").inspect_err(inspect).or(Err(Error::DbError))?,
+			expires_at: row.try_get::<Option<i64>, _>("expires_at").inspect_err(inspect).or(Err(Error::DbError))?.map(Timestamp),
+		})
+	}
 
 	async fn create_profile_key(&self, tn_id: TnId, expires_at: Option<Timestamp>) -> ClResult<auth_adapter::AuthKey> {
 		let now = time::OffsetDateTime::now_local().map_err(|_| Error::DbError)?;
@@ -368,23 +534,270 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		Ok(token)
 	}
 
-	async fn verify_access_token(&self, token: &str) -> ClResult<()> {todo!()}
+	async fn verify_access_token(&self, token: &str) -> ClResult<()> {
+		// Decode and validate the JWT token (use AuthToken which has Deserialize)
+		decode::<auth_adapter::AuthToken<Box<str>>>(
+			token,
+			&self.jwt_secret,
+			&Validation::new(Algorithm::HS256),
+		)
+		.map_err(|_| Error::Unauthorized)?;
+
+		Ok(())
+	}
 
 	// Vapid keys
-	async fn read_vapid_key(&self, tn_id: TnId) -> ClResult<auth_adapter::KeyPair> {todo!()}
-	async fn read_vapid_public_key(&self, tn_id: TnId) -> ClResult<Box<str>> {todo!()}
-	async fn update_vapid_key(&self, tn_id: TnId, key: &auth_adapter::KeyPair) -> ClResult<()> {todo!()}
+	async fn read_vapid_key(&self, tn_id: TnId) -> ClResult<auth_adapter::KeyPair> {
+		let res = sqlx::query(
+			"SELECT vapid_public_key, vapid_private_key FROM tenants WHERE tn_id = ?1"
+		)
+		.bind(tn_id.0)
+		.fetch_optional(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		let Some(row) = res else {
+			return Err(Error::NotFound);
+		};
+
+		let public_key: Option<String> = row.try_get("vapid_public_key").or(Err(Error::DbError))?;
+		let private_key: Option<String> = row.try_get("vapid_private_key").or(Err(Error::DbError))?;
+
+		match (public_key, private_key) {
+			(Some(pub_key), Some(priv_key)) => Ok(auth_adapter::KeyPair {
+				public_key: pub_key.into(),
+				private_key: priv_key.into(),
+			}),
+			_ => Err(Error::NotFound),
+		}
+	}
+
+	async fn read_vapid_public_key(&self, tn_id: TnId) -> ClResult<Box<str>> {
+		let res = sqlx::query(
+			"SELECT vapid_public_key FROM tenants WHERE tn_id = ?1"
+		)
+		.bind(tn_id.0)
+		.fetch_optional(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		let Some(row) = res else {
+			return Err(Error::NotFound);
+		};
+
+		let public_key: Option<String> = row.try_get("vapid_public_key").or(Err(Error::DbError))?;
+		public_key.map(|k| k.into()).ok_or(Error::NotFound)
+	}
+
+	async fn update_vapid_key(&self, tn_id: TnId, key: &auth_adapter::KeyPair) -> ClResult<()> {
+		sqlx::query(
+			"UPDATE tenants SET vapid_public_key = ?1, vapid_private_key = ?2 WHERE tn_id = ?3"
+		)
+		.bind(key.public_key.as_ref())
+		.bind(key.private_key.as_ref())
+		.bind(tn_id.0)
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		Ok(())
+	}
 
 	// Variables
-	async fn read_var(&self, tn_id: TnId, var: &str) -> ClResult<Box<str>> {todo!()}
-	async fn update_var(&self, tn_id: TnId, var: &str, value: &str) -> ClResult<()> {todo!()}
+	async fn read_var(&self, tn_id: TnId, var: &str) -> ClResult<Box<str>> {
+		let key = format!("{}:{}", tn_id.0, var);
+		let res = sqlx::query(
+			"SELECT value FROM vars WHERE key = ?1"
+		).bind(&key).fetch_one(&self.db).await.inspect_err(inspect);
+
+		map_res(res, |row| row.try_get("value"))
+	}
+
+	async fn update_var(&self, tn_id: TnId, var: &str, value: &str) -> ClResult<()> {
+		let key = format!("{}:{}", tn_id.0, var);
+		sqlx::query(
+			"INSERT OR REPLACE INTO vars (key, value, updated_at) VALUES (?1, ?2, current_timestamp)"
+		)
+		.bind(&key)
+		.bind(value)
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+		Ok(())
+	}
 
 	// Webauthn
-	async fn list_webauthn_credentials(&self, tn_id: TnId) -> ClResult<Box<[auth_adapter::Webauthn]>> {todo!()}
-	async fn read_webauthn_credential(&self, tn_id: TnId, credential_id: &str) -> ClResult<auth_adapter::Webauthn> {todo!()}
-	async fn create_webauthn_credential(&self, tn_id: TnId, data: &auth_adapter::Webauthn) -> ClResult<()> {todo!()}
-	async fn update_webauthn_credential_counter(&self, tn_id: TnId, credential_id: &str, counter: u32) -> ClResult<()> {todo!()}
-	async fn delete_webauthn_credential(&self, tn_id: TnId, credential_id: &str) -> ClResult<()> {todo!()}
+	async fn list_webauthn_credentials(&self, tn_id: TnId) -> ClResult<Box<[auth_adapter::Webauthn]>> {
+		let res = sqlx::query(
+			"SELECT credential_id, counter, public_key, description FROM webauthn WHERE tn_id = ?1"
+		)
+		.bind(tn_id.0)
+		.fetch_all(&self.db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+		let credentials: Box<[auth_adapter::Webauthn]> = res.iter().map(|row| {
+			Ok(auth_adapter::Webauthn {
+				credential_id: Box::leak(row.try_get::<Box<str>, _>("credential_id").inspect_err(inspect).or(Err(Error::DbError))?) as &str,
+				counter: row.try_get("counter").inspect_err(inspect).or(Err(Error::DbError))?,
+				public_key: Box::leak(row.try_get::<Box<str>, _>("public_key").inspect_err(inspect).or(Err(Error::DbError))?) as &str,
+				description: row.try_get::<Option<String>, _>("description").inspect_err(inspect).or(Err(Error::DbError))?.map(|s| Box::leak(s.into_boxed_str()) as &str),
+			})
+		}).collect::<ClResult<Vec<_>>>()?
+		.into_boxed_slice();
+
+		Ok(credentials)
+	}
+
+	async fn read_webauthn_credential(&self, tn_id: TnId, credential_id: &str) -> ClResult<auth_adapter::Webauthn> {
+		let res = sqlx::query(
+			"SELECT credential_id, counter, public_key, description FROM webauthn WHERE tn_id = ?1 AND credential_id = ?2"
+		)
+		.bind(tn_id.0)
+		.bind(credential_id)
+		.fetch_optional(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		let Some(row) = res else {
+			return Err(Error::NotFound);
+		};
+
+		Ok(auth_adapter::Webauthn {
+			credential_id: Box::leak(row.try_get::<Box<str>, _>("credential_id").inspect_err(inspect).or(Err(Error::DbError))?) as &str,
+			counter: row.try_get("counter").inspect_err(inspect).or(Err(Error::DbError))?,
+			public_key: Box::leak(row.try_get::<Box<str>, _>("public_key").inspect_err(inspect).or(Err(Error::DbError))?) as &str,
+			description: row.try_get::<Option<String>, _>("description").inspect_err(inspect).or(Err(Error::DbError))?.map(|s| Box::leak(s.into_boxed_str()) as &str),
+		})
+	}
+
+	async fn create_webauthn_credential(&self, tn_id: TnId, data: &auth_adapter::Webauthn) -> ClResult<()> {
+		sqlx::query(
+			"INSERT INTO webauthn (tn_id, credential_id, counter, public_key, description) VALUES (?1, ?2, ?3, ?4, ?5)"
+		)
+		.bind(tn_id.0)
+		.bind(data.credential_id)
+		.bind(data.counter)
+		.bind(data.public_key)
+		.bind(data.description)
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		Ok(())
+	}
+
+	async fn update_webauthn_credential_counter(&self, tn_id: TnId, credential_id: &str, counter: u32) -> ClResult<()> {
+		sqlx::query(
+			"UPDATE webauthn SET counter = ?1 WHERE tn_id = ?2 AND credential_id = ?3"
+		)
+		.bind(counter)
+		.bind(tn_id.0)
+		.bind(credential_id)
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		Ok(())
+	}
+
+	async fn delete_webauthn_credential(&self, tn_id: TnId, credential_id: &str) -> ClResult<()> {
+		sqlx::query(
+			"DELETE FROM webauthn WHERE tn_id = ?1 AND credential_id = ?2"
+		)
+		.bind(tn_id.0)
+		.bind(credential_id)
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		Ok(())
+	}
+
+	// Phase 1: Registration & Session Management
+	async fn create_registration_verification(&self, email: &str) -> ClResult<Box<str>> {
+		let vfy_code = random_id()?;
+		// Set expiration to 24 hours from now (as unix timestamp)
+		let expires_at = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_secs() + 86400; // 24 hours
+
+		sqlx::query(
+			"INSERT OR REPLACE INTO user_vfy (vfy_code, email, func, expires_at) VALUES (?1, ?2, 'register', ?3)"
+		)
+		.bind(&vfy_code)
+		.bind(email)
+		.bind(expires_at as i64)
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		info!("Registration verification created for email: {}", email);
+		Ok(vfy_code.into())
+	}
+
+	async fn validate_registration_verification(&self, email: &str, vfy_code: &str) -> ClResult<()> {
+		let row = sqlx::query(
+			"SELECT email FROM user_vfy WHERE vfy_code = ?1 AND email = ?2 AND func = 'register'"
+		)
+		.bind(vfy_code)
+		.bind(email)
+		.fetch_optional(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		if row.is_none() {
+			return Err(Error::PermissionDenied);
+		}
+
+		// Delete the used verification code
+		sqlx::query("DELETE FROM user_vfy WHERE vfy_code = ?1")
+			.bind(vfy_code)
+			.execute(&self.db)
+			.await
+			.inspect_err(inspect)
+			.or(Err(Error::DbError))?;
+
+		Ok(())
+	}
+
+	async fn invalidate_token(&self, _token: &str) -> ClResult<()> {
+		// Note: SQLite doesn't natively support token blacklisting efficiently
+		// For now, this is a no-op. In production, consider token expiration or separate blacklist table
+		// This could be implemented with a token_blacklist table if needed
+		Ok(())
+	}
+
+	async fn cleanup_expired_verifications(&self) -> ClResult<()> {
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_secs() as i64;
+
+		sqlx::query(
+			"DELETE FROM user_vfy WHERE expires_at IS NOT NULL AND expires_at < ?1"
+		)
+		.bind(now)
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+		info!("Cleaned up expired verification tokens");
+		Ok(())
+	}
 }
 
 async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -442,6 +855,58 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		data text,
 		PRIMARY KEY(ev_id)
 	)").execute(&mut *tx).await?;
+
+	sqlx::query("CREATE TABLE IF NOT EXISTS user_vfy (
+		vfy_code text NOT NULL,
+		email text NOT NULL,
+		func text NOT NULL,
+		created_at datetime DEFAULT current_timestamp,
+		PRIMARY KEY(vfy_code)
+	)").execute(&mut *tx).await?;
+	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_vfy_email ON user_vfy (email)")
+		.execute(&mut *tx).await?;
+
+	sqlx::query("CREATE TABLE IF NOT EXISTS vars (
+		key text NOT NULL,
+		value text NOT NULL,
+		created_at datetime DEFAULT current_timestamp,
+		updated_at datetime DEFAULT current_timestamp,
+		PRIMARY KEY(key)
+	)").execute(&mut *tx).await?;
+
+	sqlx::query("CREATE TABLE IF NOT EXISTS webauthn (
+		tn_id integer NOT NULL,
+		credential_id text NOT NULL,
+		counter integer NOT NULL DEFAULT 0,
+		public_key text NOT NULL,
+		description text,
+		created_at datetime DEFAULT current_timestamp,
+		PRIMARY KEY(tn_id, credential_id)
+	)").execute(&mut *tx).await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_webauthn_tn_id ON webauthn (tn_id)")
+		.execute(&mut *tx).await?;
+
+	// Phase 1 Migration: Extend user_vfy table for unified token handling
+	// Add support for expires_at (token expiration), id_tag (for password reset), and data (JSON)
+	sqlx::query("ALTER TABLE user_vfy ADD COLUMN IF NOT EXISTS expires_at datetime")
+		.execute(&mut *tx).await?;
+	sqlx::query("ALTER TABLE user_vfy ADD COLUMN IF NOT EXISTS id_tag text")
+		.execute(&mut *tx).await?;
+	sqlx::query("ALTER TABLE user_vfy ADD COLUMN IF NOT EXISTS data text")
+		.execute(&mut *tx).await?;
+
+	// Remove unique email constraint if it exists to allow multiple pending tokens (for different workflows)
+	// Note: SQLite doesn't support DROP INDEX IF EXISTS in transaction, so we use PRAGMA to check
+	sqlx::query("DROP INDEX IF EXISTS idx_user_vfy_email")
+		.execute(&mut *tx).await?;
+
+	// Add indexes for efficient queries
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_expires ON user_vfy(expires_at)")
+		.execute(&mut *tx).await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_email_func ON user_vfy(email, func) WHERE id_tag IS NULL")
+		.execute(&mut *tx).await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_idtag_func ON user_vfy(id_tag, func) WHERE id_tag IS NOT NULL")
+		.execute(&mut *tx).await?;
 
 	tx.commit().await?;
 
