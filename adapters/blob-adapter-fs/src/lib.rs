@@ -15,8 +15,8 @@ use cloudillo::{
 
 /// Calculates the path of the directory for a blob
 fn obj_dir(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
-	let hash_start = file_id.find('~').ok_or(Error::Unknown)? + 1;
-	if file_id.len() < hash_start + 4 { Err(Error::Unknown)? };
+	let hash_start = file_id.find('~').ok_or(Error::Parse)? + 1;
+	if file_id.len() < hash_start + 4 { Err(Error::Parse)? };
 
 	Ok(PathBuf::from(base_dir)
 		.join(tn_id.to_string())
@@ -25,8 +25,8 @@ fn obj_dir(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
 }
 
 fn obj_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
-	let hash_start = file_id.find('~').ok_or(Error::Unknown)? + 1;
-	if file_id.len() < hash_start + 5 { Err(Error::Unknown)? };
+	let hash_start = file_id.find('~').ok_or(Error::Parse)? + 1;
+	if file_id.len() < hash_start + 5 { Err(Error::Parse)? };
 
 	Ok(PathBuf::from(base_dir)
 		.join(tn_id.to_string())
@@ -37,8 +37,8 @@ fn obj_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBu
 
 fn obj_tmp_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
 	let tmp_id = format!("tmp-{}", cloudillo::core::utils::random_id()?);
-	let hash_start = file_id.find('~').ok_or(Error::Unknown)? + 1;
-	if file_id.len() < hash_start + 5 { Err(Error::Unknown)? };
+	let hash_start = file_id.find('~').ok_or(Error::Parse)? + 1;
+	if file_id.len() < hash_start + 5 { Err(Error::Parse)? };
 
 	Ok(PathBuf::from(base_dir)
 		.join(tn_id.to_string())
