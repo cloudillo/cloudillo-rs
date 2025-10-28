@@ -78,4 +78,22 @@ where
 	}
 }
 
+// OptionalAuth //
+//***************//
+/// Optional auth extractor that doesn't fail if auth is missing
+#[derive(Debug, Clone)]
+pub struct OptionalAuth(pub Option<auth_adapter::AuthCtx>);
+
+impl<S> FromRequestParts<S> for OptionalAuth
+where
+	S: Send + Sync,
+{
+	type Rejection = Error;
+
+	async fn from_request_parts(parts: &mut Parts, _state: &S,) -> Result<Self, Self::Rejection> {
+		let auth = parts.extensions.get::<Auth>().cloned().map(|a| a.0);
+		Ok(OptionalAuth(auth))
+	}
+}
+
 // vim: ts=4

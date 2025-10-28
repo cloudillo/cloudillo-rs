@@ -19,7 +19,7 @@ pub struct CertResolver {
 impl CertResolver {
 	pub fn new(state: App) -> CertResolver {
 		CertResolver {
-			state: state,
+			state,
 		}
 	}
 
@@ -57,15 +57,15 @@ impl ResolvesServerCert for CertResolver {
 				if let Ok(cert_data) = cert_data {
 					//debug!("[found in DB]");
 					let certified_key = CertifiedKey::from_der(
-						CertificateDer::pem_slice_iter(&cert_data.cert.as_bytes()).filter_map(Result::ok).collect(),
-						PrivateKeyDer::from_pem_slice(&cert_data.key.as_bytes()).ok()?,
+						CertificateDer::pem_slice_iter(cert_data.cert.as_bytes()).filter_map(Result::ok).collect(),
+						PrivateKeyDer::from_pem_slice(cert_data.key.as_bytes()).ok()?,
 						rustls::crypto::CryptoProvider::get_default()?
 					).ok()?;
 					let certified_key = Arc::new(certified_key);
 					let mut cache = self.state.certs.write().ok()?;
 					//debug!("[inserting into cache]");
 					cache.insert(("cl-o.".to_string() + &cert_data.id_tag).into_boxed_str(), certified_key.clone());
-					cache.insert(cert_data.domain.into(), certified_key.clone());
+					cache.insert(cert_data.domain, certified_key.clone());
 					Some(certified_key)
 				} else {
 					error!("ERROR: Certificate not found for {}", name);

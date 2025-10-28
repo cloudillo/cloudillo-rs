@@ -9,6 +9,12 @@ pub enum Hasher {
 	V1(Sha256)
 }
 
+impl Default for Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Hasher {
 	pub fn new() -> Self {
 		Self::V1(Sha256::new())

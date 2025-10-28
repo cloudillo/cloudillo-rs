@@ -9,11 +9,13 @@ use std::{
 };
 
 use crate::prelude::*;
-use crate::core::{acme, request, scheduler, webserver, worker};
+use crate::core::{acme, request, scheduler, webserver, worker, abac};
 
 use crate::auth_adapter::AuthAdapter;
 use crate::meta_adapter::MetaAdapter;
 use crate::blob_adapter::BlobAdapter;
+use crate::crdt_adapter::CrdtAdapter;
+use crate::rtdb_adapter::RtdbAdapter;
 
 use crate::{action, file, routes};
 
@@ -33,10 +35,14 @@ pub struct AppState {
 	pub acme_challenge_map: RwLock<HashMap<Box<str>, Box<str>>>,
 	pub certs: RwLock<HashMap<Box<str>, Arc<CertifiedKey>>>,
 	pub opts: AppBuilderOpts,
+	pub broadcast: super::BroadcastManager,
+	pub permission_checker: Arc<tokio::sync::RwLock<abac::PermissionChecker>>,
 
 	pub auth_adapter: Arc<dyn AuthAdapter>,
 	pub meta_adapter: Arc<dyn MetaAdapter>,
 	pub blob_adapter: Arc<dyn BlobAdapter>,
+	pub crdt_adapter: Arc<dyn CrdtAdapter>,
+	pub rtdb_adapter: Arc<dyn RtdbAdapter>,
 }
 
 pub type App = Arc<AppState>;
@@ -45,6 +51,8 @@ pub struct Adapters {
 	pub auth_adapter: Option<Arc<dyn AuthAdapter>>,
 	pub meta_adapter: Option<Arc<dyn MetaAdapter>>,
 	pub blob_adapter: Option<Arc<dyn BlobAdapter>>,
+	pub crdt_adapter: Option<Arc<dyn CrdtAdapter>>,
+	pub rtdb_adapter: Option<Arc<dyn RtdbAdapter>>,
 }
 
 #[derive(Debug)]
@@ -70,6 +78,11 @@ pub struct AppBuilder {
 
 impl AppBuilder {
 	pub fn new() -> Self {
+		tracing_subscriber::fmt()
+			.with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+			.with_target(false)
+			//.with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
+			.init();
 		AppBuilder {
 			opts: AppBuilderOpts {
 				mode: ServerMode::Standalone,
@@ -89,6 +102,8 @@ impl AppBuilder {
 				auth_adapter: None,
 				meta_adapter: None,
 				blob_adapter: None,
+				crdt_adapter: None,
+				rtdb_adapter: None,
 			},
 		}
 	}
@@ -117,13 +132,10 @@ impl AppBuilder {
 	pub fn auth_adapter(&mut self, auth_adapter: Arc<dyn AuthAdapter>) -> &mut Self { self.adapters.auth_adapter = Some(auth_adapter); self }
 	pub fn meta_adapter(&mut self, meta_adapter: Arc<dyn MetaAdapter>) -> &mut Self { self.adapters.meta_adapter = Some(meta_adapter); self }
 	pub fn blob_adapter(&mut self, blob_adapter: Arc<dyn BlobAdapter>) -> &mut Self { self.adapters.blob_adapter = Some(blob_adapter); self }
+	pub fn crdt_adapter(&mut self, crdt_adapter: Arc<dyn CrdtAdapter>) -> &mut Self { self.adapters.crdt_adapter = Some(crdt_adapter); self }
+	pub fn rtdb_adapter(&mut self, rtdb_adapter: Arc<dyn RtdbAdapter>) -> &mut Self { self.adapters.rtdb_adapter = Some(rtdb_adapter); self }
 
 	pub async fn run(self) -> ClResult<()> {
-		tracing_subscriber::fmt()
-			.with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-			.with_target(false)
-			//.with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
-			.init();
 		info!("     ______");
 		info!("    /  __  \\ ___        ____ _                 _ _ _ _");
 		info!("  _|  (  )  V _ \\__    / ___| | ___  _   _  __| (_) | | ___");
@@ -140,14 +152,18 @@ impl AppBuilder {
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker: self.worker.expect("FATAL: No worker pool defined"),
-			request: request::Request::new(auth_adapter.clone()),
+			request: request::Request::new(auth_adapter.clone())?,
 			acme_challenge_map: RwLock::new(HashMap::new()),
 			certs: RwLock::new(HashMap::new()),
 			opts: self.opts,
+			broadcast: super::BroadcastManager::new(),
+			permission_checker: Arc::new(tokio::sync::RwLock::new(abac::PermissionChecker::new())),
 
 			auth_adapter,
 			meta_adapter,
 			blob_adapter: self.adapters.blob_adapter.expect("FATAL: No blob adapter"),
+			crdt_adapter: self.adapters.crdt_adapter.expect("FATAL: No CRDT adapter"),
+			rtdb_adapter: self.adapters.rtdb_adapter.expect("FATAL: No RTDB adapter"),
 		});
 		tokio::fs::create_dir_all(&app.opts.tmp_dir).await.expect("Cannot create tmp dir");
 
@@ -158,6 +174,33 @@ impl AppBuilder {
 
 		// Start scheduler
 		app.scheduler.start(app.clone());
+
+		// Start periodic scheduler health check (every 30 seconds)
+		{
+			let scheduler = app.scheduler.clone();
+			tokio::spawn(async move {
+				loop {
+					tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+					match scheduler.health_check().await {
+						Ok(health) => {
+							debug!(
+								"Scheduler health: waiting={}, scheduled={}, running={}, dependents={}",
+								health.waiting, health.scheduled, health.running, health.dependents
+							);
+							if !health.stuck_tasks.is_empty() {
+								error!("SCHEDULER: {} stuck tasks detected: {:?}", health.stuck_tasks.len(), health.stuck_tasks);
+							}
+							if !health.tasks_with_missing_deps.is_empty() {
+								error!("SCHEDULER: {} tasks with missing dependencies: {:?}", health.tasks_with_missing_deps.len(), health.tasks_with_missing_deps);
+							}
+						},
+						Err(e) => {
+							warn!("Scheduler health check failed: {}", e);
+						}
+					}
+				}
+			});
+		}
 
 		let https_server = webserver::create_https_server(app.clone(), &app.opts.listen, api_router, app_router).await?;
 
@@ -203,14 +246,14 @@ async fn bootstrap(app: Arc<AppState>, opts: &AppBuilderOpts) -> ClResult<()> {
 			let base_password = opts.base_password.clone().expect("FATAL: No base password");
 
 			info!("Creating tenant {}", base_id_tag);
-			let tn_id = auth.create_tenant(base_id_tag, None).await?;
+			let tn_id = auth.create_tenant(base_id_tag, None, None).await?;
 			auth.update_tenant_password(base_id_tag, base_password).await?;
 			auth.create_profile_key(tn_id, None).await?;
 		}
 		if let Some(ref acme_email) = opts.acme_email {
 			let cert_data = auth.read_cert_by_tn_id(TnId(1)).await;
 			if let Err(Error::NotFound) = cert_data {
-				acme::init(app.clone(), &acme_email, &base_id_tag, opts.base_app_domain.as_deref()).await?;
+				acme::init(app.clone(), acme_email, base_id_tag, opts.base_app_domain.as_deref()).await?;
 			}
 		}
 	}
