@@ -12,6 +12,8 @@ use cloudillo::{auth_adapter, meta_adapter, core::worker};
 use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_blob_adapter_fs::BlobAdapterFs;
+use crdt_adapter_redb::{CrdtAdapterRedb, AdapterConfig as CrdtConfig};
+use rtdb_adapter_redb::{RtdbAdapterRedb, AdapterConfig as RtdbConfig};
 
 pub struct Config {
 	pub mode: cloudillo::ServerMode,
@@ -66,6 +68,24 @@ async fn main() {
 	let meta_adapter = Arc::new(MetaAdapterSqlite::new(worker.clone(), config.db_dir.join("meta.db")).await.unwrap());
 	let blob_adapter = Arc::new(BlobAdapterFs::new(config.data_dir.into()).await.unwrap());
 
+	// CRDT adapter for collaborative editing
+	let crdt_config = CrdtConfig {
+		max_instances: 100,
+		idle_timeout_secs: 3600,
+		broadcast_capacity: 128,
+		auto_evict: true,
+	};
+	let crdt_adapter = Arc::new(CrdtAdapterRedb::new(config.db_dir.join("crdt"), false, crdt_config).await.unwrap());
+
+	// RTDB adapter for real-time database
+	let rtdb_config = RtdbConfig {
+		max_instances: 100,
+		idle_timeout_secs: 3600,
+		broadcast_capacity: 128,
+		auto_evict: true,
+	};
+	let rtdb_adapter = Arc::new(RtdbAdapterRedb::new(config.db_dir.join("rtdb"), false, rtdb_config).await.unwrap());
+
 	let mut cloudillo = cloudillo::AppBuilder::new();
 	cloudillo.mode(config.mode)
 		.listen(config.listen)
@@ -77,6 +97,8 @@ async fn main() {
 		.auth_adapter(auth_adapter)
 		.meta_adapter(meta_adapter)
 		.blob_adapter(blob_adapter)
+		.crdt_adapter(crdt_adapter)
+		.rtdb_adapter(rtdb_adapter)
 		.worker(worker);
 	if let Some(listen_http) = config.listen_http {
 		cloudillo.listen_http(listen_http);
