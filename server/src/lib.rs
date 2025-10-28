@@ -23,13 +23,19 @@
 
 pub mod error;
 pub mod core;
+pub mod crdt;
+pub mod rtdb;
 pub mod action;
 pub mod auth;
 pub mod file;
 pub mod profile;
+pub mod settings;
+pub mod r#ref;
 pub mod auth_adapter;
 pub mod blob_adapter;
 pub mod meta_adapter;
+pub mod rtdb_adapter;
+pub mod crdt_adapter;
 pub mod prelude;
 pub mod types;
 pub mod routes;

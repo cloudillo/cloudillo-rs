@@ -6,6 +6,8 @@ members = [
 	"adapters/auth-adapter-sqlite",
 	"adapters/blob-adapter-fs",
 	"adapters/meta-adapter-sqlite",
+	"adapters/rtdb-adapter-redb",
+	"adapters/crdt-adapter-redb",
 ]
 [profile.release]
 opt-level = "s"
