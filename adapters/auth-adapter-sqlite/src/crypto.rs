@@ -38,27 +38,22 @@ pub async fn check_password(worker: &worker::WorkerPool, password: Box<str>, pas
 	}).await.map_err(|_| Error::PermissionDenied)
 }
 
-fn generate_access_token_sync(tn_id: TnId, roles: Option<Box<str>>) -> ClResult<Box<str>> {
+fn generate_access_token_sync(access_token: auth_adapter::AccessToken<Box<str>>, jwt_secret: Box<str>) -> ClResult<Box<str>> {
 	let expire = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH).map_err(|_| Error::PermissionDenied)?
 		.as_secs() + 3600 * TOKEN_EXPIRE;
 
 	let token = jsonwebtoken::encode(
-		&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-		&auth_adapter::AuthToken::<&str> {
-			sub: tn_id.0,
-			exp: expire as u32,
-			r: roles.as_deref(),
-		},
-		&jsonwebtoken::EncodingKey::from_secret("FIXME secret".as_bytes()),
+		&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256), &access_token,
+			&jsonwebtoken::EncodingKey::from_secret(jwt_secret.as_bytes()),
 	).map_err(|_| Error::PermissionDenied)?.into();
 
 	Ok(token)
 }
 
-pub async fn generate_access_token(worker: &worker::WorkerPool, tn_id: TnId, roles: Option<Box<str>>) -> ClResult<Box<str>> {
+pub async fn generate_access_token(worker: &worker::WorkerPool, access_token: auth_adapter::AccessToken<Box<str>>, jwt_secret: Box<str>) -> ClResult<Box<str>> {
 	worker.run_immed(move || {
-		generate_access_token_sync(tn_id, roles)
+		generate_access_token_sync(access_token, jwt_secret)
 	}).await.map_err(|_| Error::PermissionDenied)
 }
 

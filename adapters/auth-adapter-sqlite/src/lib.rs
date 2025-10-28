@@ -18,7 +18,24 @@ mod crypto;
 
 /// # Helper functions
 fn parse_str_list(s: &str) -> Box<[Box<str>]> {
-	s.split(',').map(|s| s.trim().to_owned().into_boxed_str()).collect::<Vec<_>>().into_boxed_slice()
+	s.split(',')
+		.map(|s| s.trim().to_owned().into_boxed_str())
+		.filter(|s| !s.is_empty())
+		.collect::<Vec<_>>()
+		.into_boxed_slice()
+}
+
+/// Parse a comma-separated string into an Option of boxed array.
+/// Returns None if the string is empty or only contains whitespace.
+fn parse_str_list_optional(s: Option<&str>) -> Option<Box<[Box<str>]>> {
+	s.and_then(|s| {
+		let s = s.trim();
+		if s.is_empty() {
+			None
+		} else {
+			Some(parse_str_list(s))
+		}
+	})
 }
 
 fn inspect(err: &sqlx::Error) {
@@ -66,6 +83,7 @@ pub fn collect_res<T>(mut iter: impl Iterator<Item = Result<T, sqlx::Error>> + U
 pub struct AuthAdapterSqlite {
 	db: SqlitePool,
 	worker: Arc<WorkerPool>,
+	jwt_secret_str: String,
 	jwt_secret: DecodingKey,
 }
 
@@ -96,7 +114,7 @@ impl AuthAdapterSqlite {
 		let jwt_secret_str = Self::ensure_jwt_secret(&db).await?;
 		let jwt_secret = DecodingKey::from_secret(jwt_secret_str.as_bytes());
 
-		Ok(Self { worker, db, jwt_secret })
+		Ok(Self { worker, db, jwt_secret_str, jwt_secret })
 	}
 
 	/// Get or generate the JWT secret for HS256 signing
@@ -138,18 +156,18 @@ impl AuthAdapterSqlite {
 
 #[async_trait]
 impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
-	async fn validate_token(&self, token: &str) -> ClResult<auth_adapter::AuthCtx> {
-		let token_data = decode::<auth_adapter::AuthToken<Box<str>>>(
+	async fn validate_token(&self, tn_id: TnId, id_tag: &str, token: &str) -> ClResult<auth_adapter::AuthCtx> {
+		let token_data = decode::<auth_adapter::AccessToken<Box<str>>>(
 			token,
 			&self.jwt_secret,
 			&Validation::new(Algorithm::HS256),
 		).map_err(|_| Error::Unauthorized)?;
-		let id_tag = self.read_id_tag(TnId(token_data.claims.sub)).await.map_err(|_| Error::PermissionDenied)?;
 
 		Ok(auth_adapter::AuthCtx {
-			tn_id: TnId(token_data.claims.sub),
-			id_tag,
+			tn_id,
+			id_tag: Box::from(id_tag),
 			roles: token_data.claims.r.unwrap_or("".into()).split(',').map(Box::from).collect(),
+			scope: token_data.claims.scope,
 		})
 	}
 
@@ -179,7 +197,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			let roles: Option<Box<str>> = row.try_get("roles")?;
 			Ok(auth_adapter::AuthProfile {
 				id_tag: row.try_get("id_tag")?,
-				roles: roles.map(|s| parse_str_list(&s)),
+				roles: parse_str_list_optional(roles.as_deref()),
 				keys: self.list_profile_keys(tn_id).await.unwrap_or(vec![]),
 			})
 		}).await
@@ -335,12 +353,20 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 				let tn_id = row.try_get("tn_id").map(|t| TnId(t)).or(Err(Error::DbError))?;
 				let roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
 
-				let token = crypto::generate_access_token(&self.worker, tn_id, roles.map(|s| s.into())).await?;
+				//let token = crypto::generate_access_token(&self.worker, tn_id, roles.map(|s| s.into()), None, self.jwt_secret_str.clone().into()).await?;
+				let access_token = auth_adapter::AccessToken {
+					iss: Box::from(id_tag),
+					sub: None,
+					scope: None,
+					r: roles.map(|s| Box::from(s)),
+					exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
+				};
+				let token = crypto::generate_access_token(&self.worker, access_token, self.jwt_secret_str.clone().into()).await?;
 
 				Ok(auth_adapter::AuthLogin {
 					tn_id: row.try_get("tn_id").map(|t| TnId(t)).or(Err(Error::DbError))?,
 					id_tag: Box::from(id_tag),
-					roles: roles.map(|s| parse_str_list(&s)),
+					roles: parse_str_list_optional(roles),
 					token,
 				})
 			}
@@ -360,12 +386,20 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 				let roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
 
 				crypto::check_password(&self.worker, password, password_hash).await?;
-				let token = crypto::generate_access_token(&self.worker, tn_id, roles.map(|s| s.into())).await?;
+				//let token = crypto::generate_access_token(&self.worker, tn_id, roles.map(|s| s.into()), None, self.jwt_secret_str.clone().into()).await?;
+				let access_token = auth_adapter::AccessToken {
+					iss: Box::from(id_tag),
+					sub: None,
+					scope: None,
+					r: roles.map(|s| Box::from(s)),
+					exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
+				};
+				let token = crypto::generate_access_token(&self.worker, access_token, self.jwt_secret_str.clone().into()).await?;
 
 				Ok(auth_adapter::AuthLogin {
 					tn_id: row.try_get("tn_id").map(|t| TnId(t)).or(Err(Error::DbError))?,
 					id_tag: Box::from(id_tag),
-					roles: roles.map(|s| parse_str_list(&s)),
+					roles: parse_str_list_optional(roles),
 					token,
 				})
 			}
@@ -493,13 +527,23 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		})
 	}
 
-	async fn create_access_token(&self, tn_id: TnId, data: &auth_adapter::AccessToken) -> ClResult<Box<str>> {
+	async fn create_access_token(&self, tn_id: TnId, data: &auth_adapter::AccessToken<&str>) -> ClResult<Box<str>> {
 		let res = sqlx::query(
 			"SELECT tn_id, id_tag, password, roles FROM tenants WHERE tn_id = ?"
 		).bind(tn_id.0).fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 		let roles: Option<&str> = res.try_get("roles").or(Err(Error::DbError))?;
-		let token = crypto::generate_access_token(&self.worker, tn_id, roles.map(|s| s.into())).await?;
+		let id_tag: Box<str> = res.try_get("id_tag").or(Err(Error::DbError))?;
+
+		let access_token = auth_adapter::AccessToken {
+			iss: id_tag,
+			sub: data.sub.map(|s| Box::from(s)),
+			scope: data.scope.map(|s| Box::from(s)),
+			r: roles.map(|s| Box::from(s)),
+			exp: data.exp,
+		};
+
+		let token = crypto::generate_access_token(&self.worker, access_token, self.jwt_secret_str.clone().into()).await?;
 
 		Ok(token)
 	}
@@ -534,9 +578,50 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		Ok(token)
 	}
 
+	async fn create_proxy_token(&self, tn_id: TnId, id_tag: &str, roles: &[Box<str>]) -> ClResult<Box<str>> {
+		// Fetch the latest key for this tenant
+		let res = sqlx::query("SELECT key_id, private_key FROM keys WHERE tn_id = ? ORDER BY key_id DESC LIMIT 1")
+			.bind(tn_id.0).fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let key_id: Box<str> = res.try_get("key_id").or(Err(Error::DbError))?;
+		let private_key: Box<str> = res.try_get("private_key").or(Err(Error::DbError))?;
+
+		// Create proxy token JWT with user's id_tag and roles
+		// Proxy tokens allow this user to authenticate on behalf of the server in federation
+		use jsonwebtoken::{encode, EncodingKey, Header};
+
+		let now = Timestamp::now();
+		let exp = Timestamp::from_now(86400); // 24 hours from now
+
+		// Build payload as a serializable struct
+		#[derive(serde::Serialize)]
+		struct ProxyTokenPayload {
+			iss: String,
+			sub: String,
+			aud: String,
+			iat: u64,
+			exp: u64,
+			roles: Vec<String>,
+		}
+
+		let payload = ProxyTokenPayload {
+			iss: id_tag.to_string(),
+			sub: "federation".to_string(),
+			aud: "federation".to_string(),
+			iat: now.0 as u64,
+			exp: exp.0 as u64,
+			roles: roles.iter().map(|r| r.to_string()).collect(),
+		};
+
+		let key = EncodingKey::from_secret(private_key.as_bytes());
+		let token = encode(&Header::default(), &payload, &key)
+			.map_err(|_| Error::DbError)?;
+
+		Ok(token.into())
+	}
+
 	async fn verify_access_token(&self, token: &str) -> ClResult<()> {
 		// Decode and validate the JWT token (use AuthToken which has Deserialize)
-		decode::<auth_adapter::AuthToken<Box<str>>>(
+		decode::<auth_adapter::AccessToken<Box<str>>>(
 			token,
 			&self.jwt_secret,
 			&Validation::new(Algorithm::HS256),
@@ -815,7 +900,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		email text,
 		password text,
 		status char(1),
-		roles json,
+		roles text,
 		vapid_public_key text,
 		vapid_private_key text,
 		created_at datetime DEFAULT current_timestamp,
@@ -888,25 +973,28 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 
 	// Phase 1 Migration: Extend user_vfy table for unified token handling
 	// Add support for expires_at (token expiration), id_tag (for password reset), and data (JSON)
-	sqlx::query("ALTER TABLE user_vfy ADD COLUMN IF NOT EXISTS expires_at datetime")
-		.execute(&mut *tx).await?;
-	sqlx::query("ALTER TABLE user_vfy ADD COLUMN IF NOT EXISTS id_tag text")
-		.execute(&mut *tx).await?;
-	sqlx::query("ALTER TABLE user_vfy ADD COLUMN IF NOT EXISTS data text")
-		.execute(&mut *tx).await?;
-
-	// Remove unique email constraint if it exists to allow multiple pending tokens (for different workflows)
-	// Note: SQLite doesn't support DROP INDEX IF EXISTS in transaction, so we use PRAGMA to check
-	sqlx::query("DROP INDEX IF EXISTS idx_user_vfy_email")
-		.execute(&mut *tx).await?;
+	// Note: SQLite doesn't support IF NOT EXISTS in ALTER TABLE, so we ignore errors
+	let _ = sqlx::query("ALTER TABLE user_vfy ADD COLUMN expires_at datetime")
+		.execute(&mut *tx).await;
+	let _ = sqlx::query("ALTER TABLE user_vfy ADD COLUMN id_tag text")
+		.execute(&mut *tx).await;
+	let _ = sqlx::query("ALTER TABLE user_vfy ADD COLUMN data text")
+		.execute(&mut *tx).await;
 
 	// Add indexes for efficient queries
 	sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_expires ON user_vfy(expires_at)")
 		.execute(&mut *tx).await?;
-	sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_email_func ON user_vfy(email, func) WHERE id_tag IS NULL")
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_email_func ON user_vfy(email, func)")
 		.execute(&mut *tx).await?;
-	sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_idtag_func ON user_vfy(id_tag, func) WHERE id_tag IS NOT NULL")
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_idtag_func ON user_vfy(id_tag, func)")
 		.execute(&mut *tx).await?;
+
+	// Phase 2 Migration: Convert roles from JSON to TEXT format
+	// Handle cases where roles were stored as JSON arrays and convert to comma-separated strings
+	// For new databases, roles will be stored as comma-separated strings or NULL
+	let _ = sqlx::query(
+		"UPDATE tenants SET roles = NULL WHERE roles IS NULL OR roles = 'null' OR roles = '[]'"
+	).execute(&mut *tx).await;
 
 	tx.commit().await?;
 

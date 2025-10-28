@@ -27,20 +27,14 @@ pub struct ActionToken {
 }
 
 /// Access tokens are used to authenticate users
-#[derive(Default)]
-pub struct AccessToken<'a> {
-	pub t: &'a str,
-	pub u: &'a str,
-	pub r: Option<&'a [&'a str]>,
-	pub sub: Option<&'a str>,
-}
-
 #[skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct AuthToken<S> {
-	pub sub: u32,
-	pub exp: u32,
+pub struct AccessToken<S> {
+	pub iss: S,
+	pub sub: Option<S>,
+	pub scope: Option<S>,
 	pub r: Option<S>,
+	pub exp: Timestamp,
 }
 
 pub struct ProxyToken<'a> {
@@ -78,6 +72,7 @@ pub struct AuthCtx {
 	pub tn_id: TnId,
 	pub id_tag: Box<str>,
 	pub roles: Box<[Box<str>]>,
+	pub scope: Option<Box<str>>
 }
 
 #[derive(Debug)]
@@ -130,7 +125,7 @@ pub struct CertData {
 #[async_trait]
 pub trait AuthAdapter: Debug + Send + Sync {
 	/// Validates a token and returns the user context
-	async fn validate_token(&self, token: &str) -> ClResult<AuthCtx>;
+	async fn validate_token(&self, tn_id: TnId, id_tag: &str, token: &str) -> ClResult<AuthCtx>;
 
 	/// # Profiles
 	/// Reads the ID tag of the given tenant, referenced by its ID
@@ -172,9 +167,13 @@ pub trait AuthAdapter: Debug + Send + Sync {
 		-> ClResult<AuthKey>;
 
 	/// Creates an access token for the given tenant
-	async fn create_access_token(&self, tn_id: TnId, data: &AccessToken)
+	async fn create_access_token(&self, tn_id: TnId, data: &AccessToken<&str>)
 		-> ClResult<Box<str>>;
 	async fn create_action_token(&self, tn_id: TnId, data: action::CreateAction)
+		-> ClResult<Box<str>>;
+
+	/// Creates a proxy token for federation - allows this user to act as a proxy
+	async fn create_proxy_token(&self, tn_id: TnId, id_tag: &str, roles: &[Box<str>])
 		-> ClResult<Box<str>>;
 
 	/// Verifies that the given access token is valid
