@@ -36,10 +36,10 @@ pub fn parse_file_descriptor(descriptor: &str) -> ClResult<Vec<meta_adapter::Fil
 			}
 			if let (Some(resolution), Some(format), Some(size)) = (resolution, format, size) {
 				Ok(meta_adapter::FileVariant {
-					variant: variant,
-					variant_id: variant_id,
+					variant,
+					variant_id,
 					resolution,
-					format: format,
+					format,
 					size,
 					available: false,
 				})

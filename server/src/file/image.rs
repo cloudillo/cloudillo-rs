@@ -11,6 +11,13 @@ use crate::core::scheduler::{Task, TaskId};
 use crate::file::store;
 use crate::types::TnId;
 
+/// Result of image resizing: encoded bytes and actual dimensions
+pub struct ResizeResult {
+	pub bytes: Box<[u8]>,
+	pub width: u32,
+	pub height: u32,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ImageFormat {
 	#[serde(rename = "avif")]
@@ -42,13 +49,13 @@ impl std::str::FromStr for ImageFormat {
 			"webp" => ImageFormat::Webp,
 			"jpeg" => ImageFormat::Jpeg,
 			"png" => ImageFormat::Png,
-			_ => return Err(Error::Unknown),
+			_ => return Err(Error::ValidationError(format!("unsupported image format: {}", s))),
 		})
 	}
 }
 
 // Sync image resizer
-fn resize_image_sync<'a>(orig_buf: impl AsRef<[u8]> + 'a, format: ImageFormat, resize: (u32, u32)) -> Result<Box<[u8]>, image::error::ImageError> {
+fn resize_image_sync<'a>(orig_buf: impl AsRef<[u8]> + 'a, format: ImageFormat, resize: (u32, u32)) -> Result<ResizeResult, image::error::ImageError> {
 	let now = std::time::Instant::now();
 	let original = ImageReader::new(Cursor::new(&orig_buf.as_ref()))
 		.with_guessed_format()?
@@ -57,6 +64,8 @@ fn resize_image_sync<'a>(orig_buf: impl AsRef<[u8]> + 'a, format: ImageFormat, r
 
 	let now = std::time::Instant::now();
 	let resized = original.resize(resize.0, resize.1, image::imageops::FilterType::Lanczos3);
+	let actual_width = resized.width();
+	let actual_height = resized.height();
 	debug!("resized [{:.2}ms]", now.elapsed().as_millis());
 
 	let mut output = Cursor::new(Vec::new());
@@ -81,10 +90,14 @@ fn resize_image_sync<'a>(orig_buf: impl AsRef<[u8]> + 'a, format: ImageFormat, r
 		},
 	};
 	debug!("written [{:.2}ms]", now.elapsed().as_millis());
-	Ok(output.into_inner().into())
+	Ok(ResizeResult {
+		bytes: output.into_inner().into(),
+		width: actual_width,
+		height: actual_height,
+	})
 }
 
-pub async fn resize_image(app: App, orig_buf: Vec<u8>, format: ImageFormat, resize: (u32, u32)) -> Result<Box<[u8]>, image::error::ImageError> {
+pub async fn resize_image(app: App, orig_buf: Vec<u8>, format: ImageFormat, resize: (u32, u32)) -> Result<ResizeResult, image::error::ImageError> {
 	app.worker.run_immed(move || {
 		info!("Resizing image");
 		resize_image_sync(orig_buf, format, resize)
@@ -124,7 +137,7 @@ impl Task<App> for ImageResizerTask {
 	fn kind_of(&self) -> &'static str { Self::kind() }
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
-		let (tn_id, f_id, format, variant, x_res, y_res, path) = ctx.split(',').collect_tuple().ok_or(Error::Unknown)?;
+		let (tn_id, f_id, format, variant, x_res, y_res, path) = ctx.split(',').collect_tuple().ok_or(Error::Parse)?;
 		let format: ImageFormat = format.parse()?;
 		let task = ImageResizerTask::new(TnId(tn_id.parse()?), f_id.parse()?, Box::from(Path::new(path)), variant, format, (x_res.parse()?, y_res.parse()?));
 		Ok(task)
@@ -141,11 +154,13 @@ impl Task<App> for ImageResizerTask {
 		let bytes = tokio::fs::read(self.path.clone()).await?;
 		let res = self.res;
 		let format = self.format;
-		let resized = app.worker.run(move || {
+		let resize_result = app.worker.run(move || {
 			resize_image_sync(bytes, format, res)
 		}).await?;
-		info!("Finished task image.resize {:?} {}", self.path, resized.len());
-		let variant_id = store::create_blob_buf(&app, self.tn_id, &resized, blob_adapter::CreateBlobOptions::default()).await?;
+		info!("Finished task image.resize {:?} {} ({}x{})", self.path, resize_result.bytes.len(), resize_result.width, resize_result.height);
+
+		let actual_dimensions = (resize_result.width, resize_result.height);
+		let variant_id = store::create_blob_buf(app, self.tn_id, &resize_result.bytes, blob_adapter::CreateBlobOptions::default()).await?;
 		app.meta_adapter.create_file_variant(self.tn_id, self.f_id, meta_adapter::FileVariant {
 			variant_id: &variant_id,
 			variant: &self.variant,
@@ -154,9 +169,9 @@ impl Task<App> for ImageResizerTask {
 				ImageFormat::Webp => "webp",
 				ImageFormat::Jpeg => "jpeg",
 				ImageFormat::Png => "png",
-			}.into(),
-			resolution: res,
-			size: resized.len() as u64,
+			},
+			resolution: actual_dimensions,
+			size: resize_result.bytes.len() as u64,
 			available: true,
 		}).await?;
 		Ok(())
