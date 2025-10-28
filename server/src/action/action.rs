@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 use crate::{
 	prelude::*,
-	action::process,
+	action::{process, ACTION_TYPES, delivery::ActionDeliveryTask},
 	file::file,
 	core::hasher,
-	core::scheduler::{Task, TaskId},
+	core::scheduler::{Task, TaskId, RetryPolicy},
 	meta_adapter,
 };
+
+pub const ACCESS_TOKEN_EXPIRY: i64 = 3600;
 
 #[skip_serializing_none]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -43,10 +45,18 @@ pub async fn create_action(app: &App, tn_id: TnId, id_tag: &str, action: CreateA
 	let deps = app.meta_adapter.list_task_ids(file::FileIdGeneratorTask::kind(), &attachments_to_wait.into_boxed_slice()).await?;
 	info!("Dependencies: {:?}", deps);
 
-	let task = ActionCreatorTask::new(tn_id, Box::from(id_tag), action);
-	app.scheduler.add_with_deps(task, Some(deps)).await?;
+	// Generate action token and action_id deterministically before queuing the task
+	let action_token = app.auth_adapter.create_action_token(tn_id, action.clone()).await?;
+	let action_id = hasher::hash("a", action_token.as_bytes());
 
-	Ok(Box::from("FIXME"))
+	let task = ActionCreatorTask::new(tn_id, Box::from(id_tag), action, action_token, action_id.clone());
+	app.scheduler
+		.task(task)
+		.depend_on(deps)
+		.schedule()
+		.await?;
+
+	Ok(action_id)
 }
 
 /// Action creator Task
@@ -55,11 +65,13 @@ pub struct ActionCreatorTask {
 	tn_id: TnId,
 	id_tag: Box<str>,
 	action: CreateAction,
+	action_token: Box<str>,
+	action_id: Box<str>,
 }
 
 impl ActionCreatorTask {
-	pub fn new(tn_id: TnId, id_tag: Box<str>, action: CreateAction) -> Arc<Self> {
-		Arc::new(Self { tn_id, id_tag, action })
+	pub fn new(tn_id: TnId, id_tag: Box<str>, action: CreateAction, action_token: Box<str>, action_id: Box<str>) -> Arc<Self> {
+		Arc::new(Self { tn_id, id_tag, action, action_token, action_id })
 	}
 }
 
@@ -79,9 +91,8 @@ impl Task<App> for ActionCreatorTask {
 
 	async fn run(&self, app: &App) -> ClResult<()> {
 		info!("Running task action.create {:?} {:?}", self.tn_id, &self.action);
-		let action_token = app.auth_adapter.create_action_token(self.tn_id, self.action.clone()).await?;
-		let action_id = hasher::hash("a", action_token.as_bytes());
 
+		// Resolve file attachments
 		let attachments: Option<Vec<Box<str>>> = if let Some(attachments) = &self.action.attachments {
 			let mut attachment_vec: Vec<Box<str>> = Vec::new();
 			for a in attachments {
@@ -97,8 +108,9 @@ impl Task<App> for ActionCreatorTask {
 			None
 		};
 
+		// Create action in database
 		let action = meta_adapter::Action {
-			action_id: action_id.as_ref(),
+			action_id: self.action_id.as_ref(),
 			issuer_tag: self.id_tag.as_ref(),
 			typ: self.action.typ.as_ref(),
 			sub_typ: self.action.sub_typ.as_deref(),
@@ -112,15 +124,80 @@ impl Task<App> for ActionCreatorTask {
 			created_at: Timestamp::now(),
 		};
 
-		let key = Some(action.action_id.as_ref());
+		let key = Some(action.action_id);
 		app.meta_adapter.create_action(self.tn_id, &action, key).await?;
 
-		// FIXME
-		let mut map = std::collections::HashMap::new();
-		map.insert("token", action_token);
-		//app.request.post::<serde_json::Value>(&app, "/api/inbox", &map).await?;
-		app.request.post::<serde_json::Value>(&self.id_tag, "/api/inbox", &map).await?;
-		// / FIXME
+		// Store action token for federation
+		app.meta_adapter.store_action_token(self.tn_id, &self.action_id, &self.action_token).await?;
+
+		// Determine delivery strategy based on action type
+		let action_config = ACTION_TYPES.get(self.action.typ.as_ref());
+
+		if let Some(config) = action_config {
+			let mut recipients: Vec<Box<str>> = Vec::new();
+
+			if config.broadcast && self.action.audience_tag.is_none() {
+				// Broadcast mode: query for followers using list_actions
+				info!("Broadcasting action {} - querying for followers", self.action_id);
+
+				// Query for FLLW and CONN actions (same as TypeScript implementation)
+				// The issuer of these actions is the follower
+				let follower_actions = app.meta_adapter.list_actions(
+					self.tn_id,
+					&meta_adapter::ListActionOptions {
+						typ: Some(vec!["FLLW".into(), "CONN".into()]),
+						..Default::default()
+					}
+				).await?;
+
+				// Extract unique follower id_tags (the issuers of FLLW/CONN actions)
+				// Exclude self (issuer_tag != id_tag)
+				use std::collections::HashSet;
+				let mut follower_set = HashSet::new();
+				for action_view in follower_actions {
+					if action_view.issuer.id_tag.as_ref() != self.id_tag.as_ref() {
+						follower_set.insert(action_view.issuer.id_tag.clone());
+					}
+				}
+
+				recipients = follower_set.into_iter().collect();
+				info!("Broadcasting to {} followers", recipients.len());
+
+			} else if let Some(audience_tag) = &self.action.audience_tag {
+				// Audience mode: send to specific recipient
+				if audience_tag.as_ref() != self.id_tag.as_ref() {
+					info!("Sending action {} to audience {}", self.action_id, audience_tag);
+					recipients.push(audience_tag.clone());
+				}
+			}
+
+			// Create delivery task for each recipient
+			for recipient_tag in recipients {
+				info!("Creating delivery task for action {} to {}", self.action_id, recipient_tag);
+
+				let delivery_task = ActionDeliveryTask::new(
+					self.tn_id,
+					self.action_id.clone(),
+					recipient_tag.clone(),  // target_instance
+					recipient_tag.clone(),  // target_id_tag
+				);
+
+				// Use unique key to prevent duplicate delivery tasks
+				// Format: "delivery:{action_id}:{recipient_tag}"
+				let task_key = format!("delivery:{}:{}", self.action_id, recipient_tag);
+
+				// Create retry policy: exponential backoff from 10 sec to 1 hours, max 5 retries
+				let retry_policy = RetryPolicy::new((10, 43200), 50);
+
+				// Add delivery task to scheduler with key for deduplication and retry policy
+				app.scheduler
+					.task(delivery_task)
+					.key(&task_key)
+					.with_retry(retry_policy)
+					.schedule()
+					.await?;
+			}
+		}
 
 		info!("Finished task action.create {}", action.action_id);
 		Ok(())
@@ -152,17 +229,69 @@ impl Task<App> for ActionVerifierTask {
 	}
 
 	fn serialize(&self) -> String {
-		self.token.to_string()
+		format!("{},{}", self.tn_id.0, self.token)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
 		let action_id = hasher::hash("a", self.token.as_bytes());
 		info!("Running task action.verify {}", action_id);
 
-		process::process_inbound_action_token(&app, self.tn_id, &action_id, &self.token).await?;
+		process::process_inbound_action_token(app, self.tn_id, &action_id, &self.token).await?;
 
 		info!("Finished task action.verify {}", action_id);
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::action::ACTION_TYPES;
+
+	#[test]
+	fn test_create_action_struct() {
+		let action = CreateAction {
+			typ: "POST".into(),
+			sub_typ: Some("TEXT".into()),
+			parent_id: None,
+			root_id: None,
+			audience_tag: None,
+			content: Some("Hello world".into()),
+			attachments: None,
+			subject: None,
+			expires_at: None,
+		};
+
+		assert_eq!(action.typ.as_ref(), "POST");
+		assert_eq!(action.content.as_ref().map(|s| s.as_ref()), Some("Hello world"));
+		assert!(action.audience_tag.is_none());
+	}
+
+	#[test]
+	fn test_broadcast_action_determination() {
+		// POST should broadcast
+		let post_config = ACTION_TYPES.get("POST").unwrap();
+		assert!(post_config.broadcast);
+
+		// MSG should not broadcast
+		let msg_config = ACTION_TYPES.get("MSG").unwrap();
+		assert!(!msg_config.broadcast);
+
+		// FLLW should not broadcast
+		let fllw_config = ACTION_TYPES.get("FLLW").unwrap();
+		assert!(!fllw_config.broadcast);
+	}
+
+	#[test]
+	fn test_audience_vs_broadcast() {
+		let post_config = ACTION_TYPES.get("POST").unwrap();
+		let msg_config = ACTION_TYPES.get("MSG").unwrap();
+
+		// POST broadcasts to followers
+		assert!(post_config.broadcast);
+
+		// MSG is direct (audience-specific)
+		assert!(!msg_config.broadcast);
 	}
 }
 
