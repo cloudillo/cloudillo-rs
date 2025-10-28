@@ -133,8 +133,8 @@ mod test {
 
 	#[test]
 	fn test_obj_dir() {
-		let file_id = "1234567890";
-		let dir = obj_dir("some_dir", 42, &file_id).unwrap_or_default();
+		let file_id = "f1~1234567890";
+		let dir = obj_dir(Path::new("some_dir"), TnId(42), &file_id).unwrap_or_default();
 		assert_eq!(dir, PathBuf::from("some_dir/42/12/34"));
 	}
 }
