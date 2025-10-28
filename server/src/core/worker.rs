@@ -72,12 +72,32 @@ impl WorkerPool {
 		});
 
 		match priority {
-			Priority::High => self.tx_high.send(job).unwrap(),
-			Priority::Medium => self.tx_med.send(job).unwrap(),
-			Priority::Low => self.tx_low.send(job).unwrap(),
+			Priority::High => {
+				if let Err(_) = self.tx_high.send(job) {
+					error!("Failed to send job to high priority worker queue");
+				}
+			},
+			Priority::Medium => {
+				if let Err(_) = self.tx_med.send(job) {
+					error!("Failed to send job to medium priority worker queue");
+				}
+			},
+			Priority::Low => {
+				if let Err(_) = self.tx_low.send(job) {
+					error!("Failed to send job to low priority worker queue");
+				}
+			},
 		}
 
-		async move { res_rx.await.expect("worker dropped result") }
+		async move {
+			match res_rx.await {
+				Ok(result) => result,
+				Err(_) => {
+					error!("Worker dropped result channel without sending");
+					panic!("Critical: worker pool lost result");
+				}
+			}
+		}
 	}
 
 	pub fn run<F, T>(&self, f: F) -> impl std::future::Future<Output = T>
@@ -93,9 +113,19 @@ impl WorkerPool {
 			let _ignore = res_tx.send(result);
 		});
 
-		self.tx_med.send(job).unwrap();
+		if let Err(_) = self.tx_med.send(job) {
+			error!("Failed to send job to medium priority worker queue");
+		}
 
-		async move { res_rx.await.expect("worker dropped result") }
+		async move {
+			match res_rx.await {
+				Ok(result) => result,
+				Err(_) => {
+					error!("Worker dropped result channel without sending");
+					panic!("Critical: worker pool lost result");
+				}
+			}
+		}
 	}
 
 	pub fn run_immed<F, T>(&self, f: F) -> impl std::future::Future<Output = T>
@@ -111,9 +141,19 @@ impl WorkerPool {
 			let _ignore = res_tx.send(result);
 		});
 
-		self.tx_high.send(job).unwrap();
+		if let Err(_) = self.tx_high.send(job) {
+			error!("Failed to send job to high priority worker queue");
+		}
 
-		async move { res_rx.await.expect("worker dropped result") }
+		async move {
+			match res_rx.await {
+				Ok(result) => result,
+				Err(_) => {
+					error!("Worker dropped result channel without sending");
+					panic!("Critical: worker pool lost result");
+				}
+			}
+		}
 	}
 
 	pub fn run_slow<F, T>(&self, f: F) -> impl std::future::Future<Output = T>
@@ -129,9 +169,19 @@ impl WorkerPool {
 			let _ignore = res_tx.send(result);
 		});
 
-		self.tx_low.send(job).unwrap();
+		if let Err(_) = self.tx_low.send(job) {
+			error!("Failed to send job to low priority worker queue");
+		}
 
-		async move { res_rx.await.expect("worker dropped result") }
+		async move {
+			match res_rx.await {
+				Ok(result) => result,
+				Err(_) => {
+					error!("Worker dropped result channel without sending");
+					panic!("Critical: worker pool lost result");
+				}
+			}
+		}
 	}
 }
 
