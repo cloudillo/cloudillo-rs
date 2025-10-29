@@ -202,6 +202,7 @@ where
 
 /// Registration request
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RegisterRequest {
 	pub id_tag: String,
 	pub email: Option<String>,
@@ -211,6 +212,7 @@ pub struct RegisterRequest {
 
 /// Registration verification request
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RegisterVerifyRequest {
 	pub id_tag: String,
 	pub verify_token: String,
@@ -218,6 +220,7 @@ pub struct RegisterVerifyRequest {
 
 /// Profile patch for PATCH /me endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProfilePatch {
 	pub name: Patch<String>,
 	pub description: Patch<Option<String>>,
@@ -227,6 +230,7 @@ pub struct ProfilePatch {
 
 /// Profile information response
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProfileInfo {
 	pub id_tag: String,
 	pub name: String,
@@ -241,6 +245,7 @@ pub struct ProfileInfo {
 
 /// Profile list response
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProfileListResponse {
 	pub profiles: Vec<ProfileInfo>,
 	pub total: usize,
@@ -253,7 +258,9 @@ pub struct ProfileListResponse {
 
 /// Action creation request
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateActionRequest {
+	#[serde(rename = "type")]
 	pub r#type: String,              // "Create", "Update", etc
 	pub sub_type: Option<String>,    // "Note", "Image", etc
 	pub parent_id: Option<String>,
@@ -265,9 +272,11 @@ pub struct CreateActionRequest {
 
 /// Action response (API layer)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActionResponse {
 	pub action_id: String,
 	pub action_token: String,
+	#[serde(rename = "type")]
 	pub r#type: String,
 	pub sub_type: Option<String>,
 	pub parent_id: Option<String>,
@@ -281,7 +290,9 @@ pub struct ActionResponse {
 
 /// List actions query parameters
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListActionsQuery {
+	#[serde(rename = "type")]
 	pub r#type: Option<String>,
 	pub parent_id: Option<String>,
 	pub offset: Option<usize>,
@@ -290,17 +301,21 @@ pub struct ListActionsQuery {
 
 /// Reaction request
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReactionRequest {
+	#[serde(rename = "type")]
 	pub r#type: String,           // "Like", "Emoji", etc
 	pub content: Option<String>,  // For emoji: "👍"
 }
 
 /// Reaction response
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReactionResponse {
 	pub id: String,
 	pub action_id: String,
 	pub reactor_id_tag: String,
+	#[serde(rename = "type")]
 	pub r#type: String,
 	pub content: Option<String>,
 	pub created_at: u64,
@@ -308,6 +323,7 @@ pub struct ReactionResponse {
 
 /// File upload response
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileUploadResponse {
 	pub file_id: String,
 	pub descriptor: String,
@@ -316,11 +332,100 @@ pub struct FileUploadResponse {
 
 /// File variant information
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileVariantInfo {
 	pub variant_id: String,
 	pub format: String,
 	pub size: u64,
 	pub resolution: Option<(u32, u32)>,
+}
+
+// Phase 1: API Response Envelope & Error Types
+//***********************************************
+
+/// Pagination information for list responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaginationInfo {
+	pub offset: usize,
+	pub limit: usize,
+	pub total: usize,
+}
+
+/// Success response envelope for single objects
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiResponse<T> {
+	pub data: T,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub pagination: Option<PaginationInfo>,
+	pub time: Timestamp,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub req_id: Option<String>,
+}
+
+impl<T> ApiResponse<T> {
+	/// Create a new response with data and current time
+	pub fn new(data: T) -> Self {
+		Self {
+			data,
+			pagination: None,
+			time: Timestamp::now(),
+			req_id: None,
+		}
+	}
+
+	/// Create a response with pagination info
+	pub fn with_pagination(data: T, offset: usize, limit: usize, total: usize) -> Self {
+		Self {
+			data,
+			pagination: Some(PaginationInfo { offset, limit, total }),
+			time: Timestamp::now(),
+			req_id: None,
+		}
+	}
+
+	/// Add request ID to response
+	pub fn with_req_id(mut self, req_id: String) -> Self {
+		self.req_id = Some(req_id);
+		self
+	}
+}
+
+/// Error response format
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorResponse {
+	pub error: ErrorDetails,
+}
+
+/// Error details with structured code and message
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorDetails {
+	pub code: String,
+	pub message: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub details: Option<serde_json::Value>,
+}
+
+impl ErrorResponse {
+	/// Create a new error response with code and message
+	pub fn new(code: String, message: String) -> Self {
+		Self {
+			error: ErrorDetails {
+				code,
+				message,
+				details: None,
+			},
+		}
+	}
+
+	/// Add additional details to error
+	pub fn with_details(mut self, details: serde_json::Value) -> Self {
+		self.error.details = Some(details);
+		self
+	}
 }
 
 // ABAC Permission System Types

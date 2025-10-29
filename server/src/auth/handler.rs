@@ -1,13 +1,14 @@
 use axum::{extract::Query, extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 use serde_with::skip_serializing_none;
 
 use crate::{
 	prelude::*,
 	auth_adapter,
 	action::action,
-	core::{Auth, extract::IdTag},
+	core::{Auth, extract::{IdTag, OptionalRequestId}},
+	types::ApiResponse,
 };
 
 /// # Login
@@ -34,13 +35,18 @@ pub struct IdTagRes {
 	id_tag: Box<str>,
 }
 
-pub async fn get_id_tag(State(app): State<App>, req: axum::http::Request<axum::body::Body>) -> ClResult<Json<IdTagRes>> {
+pub async fn get_id_tag(
+	State(app): State<App>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	req: axum::http::Request<axum::body::Body>,
+) -> ClResult<(StatusCode, Json<IdTagRes>)> {
 	let host =
 		req.uri().host()
 		.or_else(|| req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()))
 		.unwrap_or_default();
 	let cert_data = app.auth_adapter.read_cert_by_domain(host).await?;
-	Ok(Json(IdTagRes { id_tag: cert_data.id_tag }))
+
+	Ok((StatusCode::OK, Json(IdTagRes { id_tag: cert_data.id_tag })))
 }
 
 pub async fn return_login(app: &App, auth: auth_adapter::AuthLogin) -> ClResult<(StatusCode, Json<Login>)> {
@@ -79,12 +85,18 @@ pub struct LoginReq {
 	password: Box<str>,
 }
 
-pub async fn post_login(State(app): State<App>, Json(login): Json<LoginReq>)
--> ClResult<(StatusCode, Json<Login>)> {
+pub async fn post_login(
+	State(app): State<App>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(login): Json<LoginReq>,
+) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
 	let auth = app.auth_adapter.check_tenant_password(&login.id_tag, login.password).await;
 
 	if let Ok(auth) = auth {
-		return_login(&app, auth).await
+		let (_status, Json(login_data)) = return_login(&app, auth).await?;
+		let response = ApiResponse::new(login_data)
+			.with_req_id(req_id.unwrap_or_default());
+		Ok((StatusCode::OK, Json(response)))
 	} else {
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		Err(Error::PermissionDenied)
@@ -92,12 +104,19 @@ pub async fn post_login(State(app): State<App>, Json(login): Json<LoginReq>)
 }
 
 /// # GET /api/auth/login-token
-pub async fn get_login_token(State(app): State<App>, Auth(auth): Auth) -> ClResult<(StatusCode, Json<Login>)> {
+pub async fn get_login_token(
+	State(app): State<App>,
+	Auth(auth): Auth,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
 	info!("login-token for {}", &auth.id_tag);
 	let auth = app.auth_adapter.create_tenant_login(&auth.id_tag).await;
 	if let Ok(auth) = auth {
 		info!("token: {}", &auth.token);
-		return_login(&app, auth).await
+		let (_status, Json(login_data)) = return_login(&app, auth).await?;
+		let response = ApiResponse::new(login_data)
+			.with_req_id(req_id.unwrap_or_default());
+		Ok((StatusCode::OK, Json(response)))
 	} else {
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		Err(Error::PermissionDenied)
@@ -108,13 +127,18 @@ pub async fn get_login_token(State(app): State<App>, Auth(auth): Auth) -> ClResu
 pub async fn post_logout(
 	State(app): State<App>,
 	Auth(auth): Auth,
-) -> ClResult<StatusCode> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	// For now, invalidate the token
 	// Note: This is a no-op in SQLite adapter but can be improved with token blacklist
 	app.auth_adapter.invalidate_token("").await?;
 
 	info!("User {} logged out", auth.id_tag);
-	Ok(StatusCode::OK)
+
+	let response = ApiResponse::new(())
+		.with_req_id(req_id.unwrap_or_default());
+
+	Ok((StatusCode::OK, Json(response)))
 }
 
 /// # POST /api/auth/password
@@ -127,9 +151,17 @@ pub struct PasswordReq {
 	new_password: Box<str>,
 }
 
-pub async fn post_password(State(app): State<App>, Json(req): Json<PasswordReq>) -> ClResult<StatusCode> {
+pub async fn post_password(
+	State(app): State<App>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(req): Json<PasswordReq>,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	app.auth_adapter.update_tenant_password(&req.id_tag, req.new_password).await?;
-	Ok(StatusCode::OK)
+
+	let response = ApiResponse::new(())
+		.with_req_id(req_id.unwrap_or_default());
+
+	Ok((StatusCode::OK, Json(response)))
 }
 
 /// # GET /api/auth/access-token
@@ -150,7 +182,8 @@ pub async fn get_access_token(
 	id_tag: IdTag,
 	Auth(auth): Auth,
 	Query(query): Query<GetAccessTokenQuery>,
-) -> ClResult<Json<Value>> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	use tracing::warn;
 
 	info!("Got access token request for id_tag={} with scope={:?}", id_tag.0, query.scope);
@@ -175,7 +208,9 @@ pub async fn get_access_token(
 			exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
 		}).await?;
 		info!("Got access token: {}", &token_result);
-		Ok(Json(json!({ "token": token_result })))
+		let response = ApiResponse::new(json!({ "token": token_result }))
+			.with_req_id(req_id.unwrap_or_default());
+		Ok((StatusCode::OK, Json(response)))
 	} else {
 		// Use authenticated session token
 		info!("Using authenticated session for id_tag={}, scope={:?}", auth.id_tag, query.scope.as_deref());
@@ -188,7 +223,9 @@ pub async fn get_access_token(
 			exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
 		}).await?;
 		info!("Got access token from session: {}", &token_result);
-		Ok(Json(json!({ "token": token_result })))
+		let response = ApiResponse::new(json!({ "token": token_result }))
+			.with_req_id(req_id.unwrap_or_default());
+		Ok((StatusCode::OK, Json(response)))
 	}
 }
 
@@ -199,10 +236,18 @@ pub struct ProxyTokenRes {
 	token: Box<str>,
 }
 
-pub async fn get_proxy_token(State(app): State<App>, Auth(auth): Auth) -> ClResult<Json<ProxyTokenRes>> {
+pub async fn get_proxy_token(
+	State(app): State<App>,
+	Auth(auth): Auth,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<ProxyTokenRes>>)> {
 	info!("Generating proxy token for {}", &auth.id_tag);
 	let token = app.auth_adapter.create_proxy_token(auth.tn_id, &auth.id_tag, &auth.roles).await?;
-	Ok(Json(ProxyTokenRes { token }))
+
+	let response = ApiResponse::new(ProxyTokenRes { token })
+		.with_req_id(req_id.unwrap_or_default());
+
+	Ok((StatusCode::OK, Json(response)))
 }
 
 // vim: ts=4

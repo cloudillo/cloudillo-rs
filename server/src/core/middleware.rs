@@ -6,9 +6,10 @@ use axum::{
 	http::{response::Response, Request, header},
 	middleware::Next,
 };
+use uuid::Uuid;
 
 use crate::prelude::*;
-use crate::core::{Auth, IdTag};
+use crate::core::{Auth, IdTag, extract::RequestId};
 
 /// Extract token from query parameters
 fn extract_token_from_query(query: &str) -> Option<String> {
@@ -109,6 +110,30 @@ pub async fn optional_auth(State(state): State<App>, mut req: Request<Body>, nex
 	}
 
 	Ok(next.run(req).await)
+}
+
+/// Add or generate request ID and store in extensions
+pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Response<Body> {
+	// Extract X-Request-ID header if present, otherwise generate new one
+	let request_id = req.headers()
+		.get("X-Request-ID")
+		.and_then(|h| h.to_str().ok())
+		.map(|s| s.to_string())
+		.unwrap_or_else(|| format!("req_{}", Uuid::new_v4().simple()));
+
+	// Store in extensions for handlers to access
+	req.extensions_mut().insert(RequestId(request_id.clone()));
+
+	// Run the request
+	let mut response = next.run(req).await;
+
+	// Add request ID to response headers
+	response.headers_mut().insert(
+		"X-Request-ID",
+		request_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()),
+	);
+
+	response
 }
 
 // vim: ts=4

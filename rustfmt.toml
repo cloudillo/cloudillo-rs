@@ -1,1 +1,64 @@
+# Cloudillo-RS Rust formatting configuration
+# Generated from analysis of existing codebase style
+
+# Core formatting
 hard_tabs = true
+edition = "2021"
+max_width = 140
+
+# Allow more code to fit on single lines
+use_small_heuristics = "Max"
+fn_single_line = true
+
+# Import organization
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+reorder_imports = true
+
+# Trailing commas everywhere (matches current style)
+trailing_comma = "Always"
+match_arm_trailing_comma = "Always"
+
+# Where clause formatting
+where_single_line = false
+
+# Use modern Rust idioms
+use_field_init_shorthand = true
+use_try_shorthand = true
+
+# Struct and enum formatting
+struct_lit_single_line = false
+
+# Chain formatting
+chain_width = 80
+overflow_delimited_expr = true
+
+# Array formatting
+array_width = 100
+
+# Function and closure formatting
+fn_args_layout = "Tall"
+brace_style = "SameLineWhere"
+
+# Control flow
+control_brace_style = "AlwaysSameLine"
+match_block_trailing_comma = true
+
+# Blank lines
+blank_lines_upper_bound = 2
+blank_lines_lower_bound = 0
+
+# Comments
+normalize_comments = false
+wrap_comments = false
+comment_width = 140
+
+# String formatting
+format_strings = true
+format_macro_matchers = true
+format_macro_bodies = true
+
+# Misc
+newline_style = "Unix"
+remove_nested_parens = true
+reorder_impl_items = false

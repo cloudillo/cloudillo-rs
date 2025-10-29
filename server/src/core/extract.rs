@@ -96,4 +96,26 @@ where
 	}
 }
 
+// RequestId //
+//***********//
+/// Request ID for tracing and debugging
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
+/// Optional Request ID extractor - always succeeds, returns None if not available
+#[derive(Clone, Debug)]
+pub struct OptionalRequestId(pub Option<String>);
+
+impl<S> FromRequestParts<S> for OptionalRequestId
+where
+	S: Send + Sync,
+{
+	type Rejection = Error;
+
+	async fn from_request_parts(parts: &mut Parts, _state: &S,) -> Result<Self, Self::Rejection> {
+		let req_id = parts.extensions.get::<RequestId>().map(|r| r.0.clone());
+		Ok(OptionalRequestId(req_id))
+	}
+}
+
 // vim: ts=4

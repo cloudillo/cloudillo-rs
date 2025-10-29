@@ -214,30 +214,17 @@ mod tests {
 	use super::*;
 
 	#[test]
-	pub fn test_action_token() {
-		let token = AccessToken {
-			//t: "a@a".into(),
-			t: &Box::new("a@a"),
-			u: "b@b".into(),
-			..Default::default()
+	pub fn test_access_token() {
+		let token: AccessToken<String> = AccessToken {
+			iss: "a@a".into(),
+			sub: Some("b@b".into()),
+			scope: None,
+			r: None,
+			exp: Timestamp::now(),
 		};
 
-		assert_eq!(token.t, "a@a");
-	}
-
-	#[test]
-	pub fn test_action_token_box() {
-		let token: AccessToken;
-		{
-			let t = &Box::new("a@a");
-			token = AccessToken {
-				t: t,
-				u: "b@b".into(),
-				..Default::default()
-			}
-		};
-
-		assert_eq!(token.t, "a@a");
+		assert_eq!(token.iss, "a@a");
+		assert_eq!(token.sub.as_ref().unwrap(), "b@b");
 	}
 }
 

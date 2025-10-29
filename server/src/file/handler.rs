@@ -1,15 +1,15 @@
-use axum::{extract::{self, Query, State}, response, body::{Body, to_bytes}, Json};
+use axum::{extract::{self, Query, State}, response, body::{Body, to_bytes}, Json, http::StatusCode};
 use futures_core::Stream;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::{fmt::Debug, pin::Pin};
 
 use crate::prelude::*;
 use crate::blob_adapter;
 use crate::meta_adapter;
-use crate::types::{self, Timestamp};
+use crate::types::{self, Timestamp, ApiResponse};
 use crate::file::{file, image, store};
-use crate::core::{hasher, utils};
+use crate::core::{hasher, utils, extract::OptionalRequestId};
 
 // Utility functions //
 //*******************//
@@ -54,9 +54,15 @@ pub async fn get_file_list(
 	State(app): State<App>,
 	tn_id: TnId,
 	Query(opts): Query<meta_adapter::ListFileOptions>,
-) -> ClResult<Json<Value>> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<Vec<meta_adapter::FileView>>>)> {
 	let files = app.meta_adapter.list_files(tn_id, opts).await?;
-	Ok(Json(json!({ "files": files })))
+	let total = files.len();
+
+	let response = ApiResponse::with_pagination(files, 0, 20, total)
+		.with_req_id(req_id.unwrap_or_default());
+
+	Ok((StatusCode::OK, Json(response)))
 }
 
 /// GET /api/file/variant/{variant_id}
@@ -102,14 +108,18 @@ pub async fn get_file_descriptor(
 	State(app): State<App>,
 	tn_id: TnId,
 	extract::Path(file_id): extract::Path<Box<str>>,
-) -> ClResult<impl response::IntoResponse> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<String>>)> {
 
 	let mut variants = app.meta_adapter.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id)).await?;
 	variants.sort();
 
 	let descriptor = file::get_file_descriptor(&variants);
 
-	Ok(Json(json!({ "file": descriptor })))
+	let response = ApiResponse::new(descriptor)
+		.with_req_id(req_id.unwrap_or_default());
+
+	Ok((StatusCode::OK, Json(response)))
 }
 
 #[derive(Deserialize)]
@@ -128,7 +138,7 @@ pub struct PostFileRequest {
 	tags: Option<String>,
 }
 
-async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, _content_type: &str, bytes: &[u8]) -> ClResult<Json<serde_json::Value>> {
+async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, _content_type: &str, bytes: &[u8]) -> ClResult<serde_json::Value> {
 	let file_id_orig = store::create_blob_buf(app, tn_id, bytes, blob_adapter::CreateBlobOptions::default()).await?;
 
 	// Get actual original image dimensions
@@ -215,7 +225,7 @@ async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, _content_ty
 	}
 	builder.schedule().await?;
 
-	Ok(Json(json!({"fileId": format!("@{}", f_id), "thumbnailVariantId": variant_id_tn })))
+	Ok(json!({"fileId": format!("@{}", f_id), "thumbnailVariantId": variant_id_tn }))
 }
 
 /// POST /api/file - File creation for non-blob types (CRDT, RTDB, etc.)
@@ -228,8 +238,9 @@ async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, _content_ty
 pub async fn post_file(
 	State(app): State<App>,
 	tn_id: TnId,
+	OptionalRequestId(req_id): OptionalRequestId,
 	extract::Json(req): extract::Json<PostFileRequest>,
-) -> ClResult<impl response::IntoResponse> {
+) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	use tracing::info;
 
 	info!("POST /api/file - Creating file with fileTp={}", req.file_tp);
@@ -259,16 +270,21 @@ pub async fn post_file(
 
 	info!("Created file metadata for fileTp={}", req.file_tp);
 
-	match f_id {
+	let data = match f_id {
 		meta_adapter::FileId::FId(f_id) => {
 			info!("File created with FId: {}", f_id);
-			Ok(Json(json!({"fileId": format!("@{}", f_id)})))
+			json!({"fileId": format!("@{}", f_id)})
 		},
 		meta_adapter::FileId::FileId(file_id) => {
 			info!("File created with FileId: {}", file_id);
-			Ok(Json(json!({"fileId": file_id})))
+			json!({"fileId": file_id})
 		},
-	}
+	};
+
+	let response = ApiResponse::new(data)
+		.with_req_id(req_id.unwrap_or_default());
+
+	Ok((StatusCode::CREATED, Json(response)))
 }
 
 pub async fn post_file_blob(
@@ -277,8 +293,9 @@ pub async fn post_file_blob(
 	extract::Path((preset, file_name)): extract::Path<(Box<str>, Box<str>)>,
 	query: Query<PostFileQuery>,
 	header: axum::http::HeaderMap,
+	OptionalRequestId(req_id): OptionalRequestId,
 	body: Body,
-) -> ClResult<impl response::IntoResponse> {
+) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	let content_type = header.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream");
 	//info!("content_type: {} {:?}", content_type, header.get(axum::http::header::CONTENT_TYPE));
 
@@ -302,8 +319,18 @@ pub async fn post_file_blob(
 				x: Some(json!({ "dim": dim })),
 			}).await?;
 			match f_id {
-				meta_adapter::FileId::FId(f_id) => handle_post_image(&app, tn_id, f_id, content_type, &bytes).await,
-				meta_adapter::FileId::FileId(file_id) => Ok(Json(json!({"fileId": file_id}))),
+				meta_adapter::FileId::FId(f_id) => {
+					let data = handle_post_image(&app, tn_id, f_id, content_type, &bytes).await?;
+					let response = ApiResponse::new(data)
+						.with_req_id(req_id.unwrap_or_default());
+					Ok((StatusCode::CREATED, Json(response)))
+				},
+				meta_adapter::FileId::FileId(file_id) => {
+					let data = json!({"fileId": file_id});
+					let response = ApiResponse::new(data)
+						.with_req_id(req_id.unwrap_or_default());
+					Ok((StatusCode::CREATED, Json(response)))
+				},
 			}
 		},
 		_ => Err(Error::Unknown),

@@ -1,8 +1,9 @@
 //! Error handling subsystem. Implements a custom Error type.
 
-use axum::{response::IntoResponse, http::StatusCode};
+use axum::{response::IntoResponse, http::StatusCode, Json};
 
 use crate::prelude::*;
+use crate::types::ErrorResponse;
 
 pub type ClResult<T> = std::result::Result<T, Error>;
 
@@ -53,20 +54,87 @@ impl std::error::Error for Error {}
 
 impl IntoResponse for Error {
 	fn into_response(self) -> axum::response::Response {
-		match self {
-			Error::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
-			Error::PermissionDenied => (StatusCode::FORBIDDEN, "permission denied").into_response(),
-			Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-			Error::ValidationError(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
-			Error::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
-			Error::Timeout => (StatusCode::REQUEST_TIMEOUT, "request timeout").into_response(),
-			Error::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg).into_response(),
+		let (status, code, message) = match self {
+			Error::NotFound => (
+				StatusCode::NOT_FOUND,
+				"E-CORE-NOTFOUND".to_string(),
+				"Resource not found".to_string(),
+			),
+			Error::PermissionDenied => (
+				StatusCode::FORBIDDEN,
+				"E-AUTH-NOPERM".to_string(),
+				"You do not have permission to access this resource".to_string(),
+			),
+			Error::Unauthorized => (
+				StatusCode::UNAUTHORIZED,
+				"E-AUTH-UNAUTH".to_string(),
+				"Authentication required or invalid token".to_string(),
+			),
+			Error::ValidationError(msg) => (
+				StatusCode::BAD_REQUEST,
+				"E-VAL-INVALID".to_string(),
+				format!("Request validation failed: {}", msg),
+			),
+			Error::Conflict(msg) => (
+				StatusCode::CONFLICT,
+				"E-CORE-CONFLICT".to_string(),
+				format!("Resource conflict: {}", msg),
+			),
+			Error::Timeout => (
+				StatusCode::REQUEST_TIMEOUT,
+				"E-NET-TIMEOUT".to_string(),
+				"Request timeout".to_string(),
+			),
+			Error::ServiceUnavailable(msg) => (
+				StatusCode::SERVICE_UNAVAILABLE,
+				"E-SYS-UNAVAIL".to_string(),
+				format!("Service temporarily unavailable: {}", msg),
+			),
 			// Server errors (5xx) - no message exposure for security
-			Error::DbError | Error::Unknown | Error::Parse | Error::Io(_) |
-			Error::NetworkError(_) | Error::ImageError(_) | Error::CryptoError(_) |
-			Error::ConfigError(_)
-				=> StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-		}
+			Error::DbError => (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"E-CORE-DBERR".to_string(),
+				"Internal server error".to_string(),
+			),
+			Error::Unknown => (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"E-CORE-UNKNOWN".to_string(),
+				"Internal server error".to_string(),
+			),
+			Error::Parse => (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"E-CORE-PARSE".to_string(),
+				"Internal server error".to_string(),
+			),
+			Error::Io(_) => (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"E-SYS-IO".to_string(),
+				"Internal server error".to_string(),
+			),
+			Error::NetworkError(_) => (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"E-NET-ERROR".to_string(),
+				"Internal server error".to_string(),
+			),
+			Error::ImageError(_) => (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"E-IMG-PROCFAIL".to_string(),
+				"Internal server error".to_string(),
+			),
+			Error::CryptoError(_) => (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"E-CRYPT-FAIL".to_string(),
+				"Internal server error".to_string(),
+			),
+			Error::ConfigError(_) => (
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"E-CONF-CFGERR".to_string(),
+				"Internal server error".to_string(),
+			),
+		};
+
+		let error_response = ErrorResponse::new(code, message);
+		(status, Json(error_response)).into_response()
 	}
 }
 

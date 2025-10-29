@@ -4,11 +4,12 @@ use axum::{Router, middleware, http::header, routing::{any, get, post, put, patc
 use tower_http::{
 	services::{ServeDir, ServeFile},
 	set_header::SetResponseHeaderLayer,
+	compression::CompressionLayer,
 };
 
 use crate::prelude::*;
 use crate::core::acme;
-use crate::core::middleware::{require_auth, optional_auth};
+use crate::core::middleware::{require_auth, optional_auth, request_id_middleware};
 use crate::core::websocket;
 use crate::action;
 use crate::auth;
@@ -142,6 +143,8 @@ fn init_api_service(app: App) -> Router {
 		.merge(public_router)
 		.merge(protected_router)
 		.layer(cors_layer)
+		.layer(middleware::from_fn(request_id_middleware))
+		.layer(CompressionLayer::new())
 		.with_state(app)
 }
 

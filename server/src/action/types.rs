@@ -30,6 +30,10 @@ lazy_static! {
 			broadcast: true,
 			allow_unknown: false,
 		});
+		m.insert("ACK", ActionTypeConfig {
+			broadcast: true,
+			allow_unknown: false,
+		});
 		m.insert("ENDR", ActionTypeConfig {
 			broadcast: true,
 			allow_unknown: false,
