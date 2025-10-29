@@ -37,7 +37,7 @@ pub struct IdTagRes {
 
 pub async fn get_id_tag(
 	State(app): State<App>,
-	OptionalRequestId(req_id): OptionalRequestId,
+	OptionalRequestId(_req_id): OptionalRequestId,
 	req: axum::http::Request<axum::body::Body>,
 ) -> ClResult<(StatusCode, Json<IdTagRes>)> {
 	let host =

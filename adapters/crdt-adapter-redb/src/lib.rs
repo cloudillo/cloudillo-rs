@@ -129,6 +129,7 @@ impl DocumentInstance {
 			.store(Timestamp::now().0 as u64, Ordering::Relaxed);
 	}
 
+	#[allow(dead_code)]
 	fn last_accessed(&self) -> u64 {
 		self.last_accessed.load(Ordering::Relaxed)
 	}

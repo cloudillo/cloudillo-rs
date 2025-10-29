@@ -21,7 +21,6 @@ pub use instance::DatabaseInstance;
 pub use transaction::RedbTransaction;
 
 pub use error::Error;
-type Result<T> = std::result::Result<T, error::Error>;
 
 use cloudillo::prelude::*;
 use cloudillo::rtdb_adapter::*;
@@ -43,7 +42,7 @@ pub struct RtdbAdapterRedb {
 
 /// Unique key for a database instance
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct InstanceKey {
+pub struct InstanceKey {
 	tn_id: u32,
 	db_id: Box<str>,
 }
@@ -152,6 +151,7 @@ impl RtdbAdapterRedb {
 	}
 
 	/// Build the full key with tenant prefix if needed
+	#[allow(dead_code)]
 	fn build_key(&self, tn_id: TnId, db_id: &str, path: &str) -> String {
 		if self.per_tenant_files {
 			format!("{}/{}", db_id, path)
@@ -161,6 +161,7 @@ impl RtdbAdapterRedb {
 	}
 
 	/// Build a collection prefix for range scans
+	#[allow(dead_code)]
 	fn build_collection_prefix(&self, tn_id: TnId, db_id: &str, path: &str) -> String {
 		if self.per_tenant_files {
 			format!("{}/{}/", db_id, path)
@@ -170,6 +171,7 @@ impl RtdbAdapterRedb {
 	}
 
 	/// Build an index key
+	#[allow(dead_code)]
 	fn build_index_key(
 		&self,
 		tn_id: TnId,
@@ -189,6 +191,7 @@ impl RtdbAdapterRedb {
 	}
 
 	/// Build a metadata key
+	#[allow(dead_code)]
 	fn build_metadata_key(&self, tn_id: TnId, _db_id: &str, path: &str, meta_key: &str) -> String {
 		if self.per_tenant_files {
 			format!("{}/_meta/{}", path, meta_key)
@@ -198,6 +201,7 @@ impl RtdbAdapterRedb {
 	}
 
 	/// Parse a key to extract db_id and path
+	#[allow(dead_code)]
 	fn parse_key(&self, tn_id: TnId, key: &str) -> Option<(String, String)> {
 		if self.per_tenant_files {
 			let parts: Vec<&str> = key.splitn(2, '/').collect();

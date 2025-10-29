@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 #[derive(Debug)]
 pub struct DatabaseInstance {
 	/// Unique identifier for this instance
+	#[allow(dead_code)]
 	pub(crate) key: InstanceKey,
 
 	/// redb database file
