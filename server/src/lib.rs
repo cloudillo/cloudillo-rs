@@ -20,7 +20,6 @@
 
 #![allow(unused_attributes, dead_code)]
 #![forbid(unsafe_code)]
-#[allow(clippy::all)]
 
 pub mod action;
 pub mod auth;
