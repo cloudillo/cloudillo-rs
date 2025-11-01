@@ -2,31 +2,31 @@
 
 use futures::TryStreamExt;
 use futures_core::stream::Stream;
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full, StreamBody};
 use hyper::http::StatusCode;
-use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::BoxBody};
 use hyper::{body::Body, body::Bytes, Method};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::rt::TokioExecutor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::io::AsyncRead;
 
-use crate::prelude::*;
-use crate::auth_adapter::AuthAdapter;
 use crate::action::action;
+use crate::auth_adapter::AuthAdapter;
+use crate::prelude::*;
 
 fn to_boxed<B>(body: B) -> BoxBody<Bytes, Error>
 where
 	B: Body<Data = Bytes> + Send + Sync + 'static,
 	B::Error: Send + 'static,
 {
-	body.map_err(|_err| { Error::Unknown }).boxed()
+	body.map_err(|_err| Error::Unknown).boxed()
 }
 
 #[derive(Deserialize)]
 struct TokenRes {
-	token: Box<str>
+	token: Box<str>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,22 +44,26 @@ impl Request {
 			.enable_http1()
 			.build();
 
-		Ok(Request {
-			auth_adapter,
-			client: Client::builder(TokioExecutor::new()).build(client),
-		})
+		Ok(Request { auth_adapter, client: Client::builder(TokioExecutor::new()).build(client) })
 	}
 
 	async fn create_proxy_token(&self, tn_id: TnId, id_tag: &str, subject: Option<&str>) -> ClResult<Box<str>> {
-		let auth_token = self.auth_adapter.create_action_token(tn_id, action::CreateAction {
-			typ: "PROXY".into(),
-			audience_tag: Some(id_tag.into()),
-			expires_at: Some(Timestamp::from_now(60)), // 1 min
-			..Default::default()
-		}).await?;
+		let auth_token = self
+			.auth_adapter
+			.create_action_token(
+				tn_id,
+				action::CreateAction {
+					typ: "PROXY".into(),
+					audience_tag: Some(id_tag.into()),
+					expires_at: Some(Timestamp::from_now(60)), // 1 min
+					..Default::default()
+				},
+			)
+			.await?;
 		let req = hyper::Request::builder()
 			.method(Method::GET)
-			.uri(format!("https://cl-o.{}/api/auth/access-token?token={}{}",
+			.uri(format!(
+				"https://cl-o.{}/api/auth/access-token?token={}{}",
 				id_tag,
 				auth_token,
 				if let Some(subject) = subject { format!("&subject={}", subject) } else { "".into() }
@@ -78,11 +82,8 @@ impl Request {
 		let req = hyper::Request::builder()
 			.method(Method::GET)
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path));
-		let req = if auth {
-			req.header("Authorization", format!("Bearer {}", self.create_proxy_token(tn_id, id_tag, None).await?))
-		} else {
-			req
-		};
+		let req =
+			if auth { req.header("Authorization", format!("Bearer {}", self.create_proxy_token(tn_id, id_tag, None).await?)) } else { req };
 		let req = req.body(to_boxed(Empty::new()))?;
 		let res = self.client.request(req).await?;
 		info!("Got response: {}", res.status());
@@ -125,14 +126,18 @@ impl Request {
 	}
 
 	pub async fn get<Res>(&self, tn_id: TnId, id_tag: &str, path: &str) -> ClResult<Res>
-	where Res: DeserializeOwned {
+	where
+		Res: DeserializeOwned,
+	{
 		let res = self.get_bin(tn_id, id_tag, path, true).await?;
 		let parsed: Res = serde_json::from_slice(&res)?;
 		Ok(parsed)
 	}
 
 	pub async fn get_noauth<Res>(&self, tn_id: TnId, id_tag: &str, path: &str) -> ClResult<Res>
-	where Res: DeserializeOwned {
+	where
+		Res: DeserializeOwned,
+	{
 		let res = self.get_bin(tn_id, id_tag, path, false).await?;
 		let parsed: Res = serde_json::from_slice(&res)?;
 		Ok(parsed)
@@ -150,7 +155,7 @@ impl Request {
 
 	pub async fn post_stream<S>(&self, _tn_id: TnId, id_tag: &str, path: &str, stream: S) -> ClResult<Bytes>
 	where
-		S: Stream<Item = Result<hyper::body::Frame<Bytes>, hyper::Error>> + Send + Sync + 'static
+		S: Stream<Item = Result<hyper::body::Frame<Bytes>, hyper::Error>> + Send + Sync + 'static,
 	{
 		let req = hyper::Request::builder()
 			.method(Method::POST)
@@ -162,7 +167,9 @@ impl Request {
 	}
 
 	pub async fn post<Res>(&self, tn_id: TnId, id_tag: &str, path: &str, data: &impl Serialize) -> ClResult<Res>
-	where Res: DeserializeOwned {
+	where
+		Res: DeserializeOwned,
+	{
 		let res = self.post_bin(tn_id, id_tag, path, serde_json::to_vec(data)?.into()).await?;
 		let parsed: Res = serde_json::from_slice(&res)?;
 		Ok(parsed)

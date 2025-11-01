@@ -1,14 +1,11 @@
 //! Adapter that manages and stores authentication, authorization and other sensitive data.
 
 use async_trait::async_trait;
-use std::fmt::Debug;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
+use std::fmt::Debug;
 
-use crate::{
-	prelude::*,
-	action::action,
-};
+use crate::{action::action, prelude::*};
 
 /// Action tokens represent user actions
 #[skip_serializing_none]
@@ -72,7 +69,7 @@ pub struct AuthCtx {
 	pub tn_id: TnId,
 	pub id_tag: Box<str>,
 	pub roles: Box<[Box<str>]>,
-	pub scope: Option<Box<str>>
+	pub scope: Option<Box<str>>,
 }
 
 #[derive(Debug)]
@@ -163,18 +160,14 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn read_profile_key(&self, tn_id: TnId, key_id: &str) -> ClResult<AuthKey>;
 
 	/// Create a new key pair for the given tenant
-	async fn create_profile_key(&self, tn_id: TnId, expires_at: Option<Timestamp>)
-		-> ClResult<AuthKey>;
+	async fn create_profile_key(&self, tn_id: TnId, expires_at: Option<Timestamp>) -> ClResult<AuthKey>;
 
 	/// Creates an access token for the given tenant
-	async fn create_access_token(&self, tn_id: TnId, data: &AccessToken<&str>)
-		-> ClResult<Box<str>>;
-	async fn create_action_token(&self, tn_id: TnId, data: action::CreateAction)
-		-> ClResult<Box<str>>;
+	async fn create_access_token(&self, tn_id: TnId, data: &AccessToken<&str>) -> ClResult<Box<str>>;
+	async fn create_action_token(&self, tn_id: TnId, data: action::CreateAction) -> ClResult<Box<str>>;
 
 	/// Creates a proxy token for federation - allows this user to act as a proxy
-	async fn create_proxy_token(&self, tn_id: TnId, id_tag: &str, roles: &[Box<str>])
-		-> ClResult<Box<str>>;
+	async fn create_proxy_token(&self, tn_id: TnId, id_tag: &str, roles: &[Box<str>]) -> ClResult<Box<str>>;
 
 	/// Verifies that the given access token is valid
 	async fn verify_access_token(&self, token: &str) -> ClResult<()>;
@@ -215,13 +208,8 @@ mod tests {
 
 	#[test]
 	pub fn test_access_token() {
-		let token: AccessToken<String> = AccessToken {
-			iss: "a@a".into(),
-			sub: Some("b@b".into()),
-			scope: None,
-			r: None,
-			exp: Timestamp::now(),
-		};
+		let token: AccessToken<String> =
+			AccessToken { iss: "a@a".into(), sub: Some("b@b".into()), scope: None, r: None, exp: Timestamp::now() };
 
 		assert_eq!(token.iss, "a@a");
 		assert_eq!(token.sub.as_ref().unwrap(), "b@b");

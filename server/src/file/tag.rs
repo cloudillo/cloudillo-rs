@@ -1,15 +1,12 @@
 //! File tag management handlers
 
 use axum::{
-	extract::{State, Path, Query},
+	extract::{Path, Query, State},
 	Json,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{
-	prelude::*,
-	core::extract::Auth,
-};
+use crate::{core::extract::Auth, prelude::*};
 
 const TAG_FORBIDDEN_CHARS: &[char] = &[' ', ',', '#', '\t', '\n'];
 
@@ -19,11 +16,7 @@ pub struct ListTagsQuery {
 	pub prefix: Option<String>,
 }
 
-pub async fn list_tags(
-	State(app): State<App>,
-	Auth(auth): Auth,
-	Query(q): Query<ListTagsQuery>,
-) -> ClResult<Json<serde_json::Value>> {
+pub async fn list_tags(State(app): State<App>, Auth(auth): Auth, Query(q): Query<ListTagsQuery>) -> ClResult<Json<serde_json::Value>> {
 	let tags = app.meta_adapter.list_tags(auth.tn_id, q.prefix.as_deref()).await?;
 
 	Ok(Json(serde_json::json!({

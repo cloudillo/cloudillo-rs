@@ -10,20 +10,16 @@ use crate::core::ws_bus;
 use crate::crdt;
 use crate::rtdb;
 use axum::{
-	extract::{Path, State},
-	response::{Response, IntoResponse},
 	extract::ws::WebSocketUpgrade,
+	extract::{Path, State},
 	http::StatusCode,
+	response::{IntoResponse, Response},
 };
 
 /// WebSocket upgrade handler for the notification bus
 ///
 /// Requires authentication. Routes to ws_bus handler.
-pub async fn get_ws_bus(
-	ws: WebSocketUpgrade,
-	State(app): State<crate::core::app::App>,
-	OptionalAuth(auth): OptionalAuth,
-) -> Response {
+pub async fn get_ws_bus(ws: WebSocketUpgrade, State(app): State<crate::core::app::App>, OptionalAuth(auth): OptionalAuth) -> Response {
 	use tracing::{info, warn};
 
 	info!("WebSocket bus request");
@@ -32,15 +28,13 @@ pub async fn get_ws_bus(
 		Some(auth_ctx) => {
 			let user_id = auth_ctx.id_tag.to_string();
 			info!("Bus WebSocket authenticated: user_id={}", user_id);
-			ws.on_upgrade(move |socket| {
-				ws_bus::handle_bus_connection(socket, user_id, app)
-			})
-		}
+			ws.on_upgrade(move |socket| ws_bus::handle_bus_connection(socket, user_id, app))
+		},
 		None => {
 			warn!("Bus WebSocket rejected - no authentication");
 			// Return 401 Unauthorized for WebSocket
 			StatusCode::UNAUTHORIZED.into_response()
-		}
+		},
 	}
 }
 
@@ -64,14 +58,12 @@ pub async fn get_ws_rtdb(
 			let user_id = auth_ctx.id_tag.to_string();
 			let tn_id = auth_ctx.tn_id;
 			info!("RTDB WebSocket authenticated: user_id={}, tn_id={}", user_id, tn_id.0);
-			ws.on_upgrade(move |socket| {
-				rtdb::handle_rtdb_connection(socket, user_id, file_id, app, tn_id)
-			})
-		}
+			ws.on_upgrade(move |socket| rtdb::handle_rtdb_connection(socket, user_id, file_id, app, tn_id))
+		},
 		None => {
 			warn!("RTDB WebSocket rejected - no authentication");
 			StatusCode::UNAUTHORIZED.into_response()
-		}
+		},
 	}
 }
 
@@ -89,10 +81,8 @@ pub async fn get_ws_crdt(
 		Some(auth_ctx) => {
 			let user_id = auth_ctx.id_tag.to_string();
 			let tn_id = auth_ctx.tn_id;
-			ws.on_upgrade(move |socket| {
-				crdt::handle_crdt_connection(socket, user_id, doc_id, app, tn_id)
-			})
-		}
+			ws.on_upgrade(move |socket| crdt::handle_crdt_connection(socket, user_id, doc_id, app, tn_id))
+		},
 		None => StatusCode::UNAUTHORIZED.into_response(),
 	}
 }

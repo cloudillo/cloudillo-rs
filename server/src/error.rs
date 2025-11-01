@@ -1,6 +1,6 @@
 //! Error handling subsystem. Implements a custom Error type.
 
-use axum::{response::IntoResponse, http::StatusCode, Json};
+use axum::{http::StatusCode, response::IntoResponse, Json};
 
 use crate::prelude::*;
 use crate::types::ErrorResponse;
@@ -12,26 +12,26 @@ pub enum Error {
 	// Core errors
 	NotFound,
 	PermissionDenied,
-	Unauthorized,                 // 401 - missing/invalid auth token
+	Unauthorized, // 401 - missing/invalid auth token
 	DbError,
 	Unknown,
 	Parse,
 
 	// Input validation and constraints
-	ValidationError(String),      // 400 - invalid input data
-	Conflict(String),             // 409 - constraint violation (unique, foreign key, etc)
+	ValidationError(String), // 400 - invalid input data
+	Conflict(String),        // 409 - constraint violation (unique, foreign key, etc)
 
 	// Network and external services
-	NetworkError(String),         // Network/federation failures
-	Timeout,                      // Operation timeout
+	NetworkError(String), // Network/federation failures
+	Timeout,              // Operation timeout
 
 	// System and configuration
-	ConfigError(String),          // Missing or invalid configuration
-	ServiceUnavailable(String),   // 503 - temporary system failures
+	ConfigError(String),        // Missing or invalid configuration
+	ServiceUnavailable(String), // 503 - temporary system failures
 
 	// Processing
-	ImageError(String),           // Image processing failures
-	CryptoError(String),          // Cryptography/TLS configuration errors
+	ImageError(String),  // Image processing failures
+	CryptoError(String), // Cryptography/TLS configuration errors
 
 	// externals
 	Io(std::io::Error),
@@ -55,82 +55,30 @@ impl std::error::Error for Error {}
 impl IntoResponse for Error {
 	fn into_response(self) -> axum::response::Response {
 		let (status, code, message) = match self {
-			Error::NotFound => (
-				StatusCode::NOT_FOUND,
-				"E-CORE-NOTFOUND".to_string(),
-				"Resource not found".to_string(),
-			),
-			Error::PermissionDenied => (
-				StatusCode::FORBIDDEN,
-				"E-AUTH-NOPERM".to_string(),
-				"You do not have permission to access this resource".to_string(),
-			),
-			Error::Unauthorized => (
-				StatusCode::UNAUTHORIZED,
-				"E-AUTH-UNAUTH".to_string(),
-				"Authentication required or invalid token".to_string(),
-			),
-			Error::ValidationError(msg) => (
-				StatusCode::BAD_REQUEST,
-				"E-VAL-INVALID".to_string(),
-				format!("Request validation failed: {}", msg),
-			),
-			Error::Conflict(msg) => (
-				StatusCode::CONFLICT,
-				"E-CORE-CONFLICT".to_string(),
-				format!("Resource conflict: {}", msg),
-			),
-			Error::Timeout => (
-				StatusCode::REQUEST_TIMEOUT,
-				"E-NET-TIMEOUT".to_string(),
-				"Request timeout".to_string(),
-			),
-			Error::ServiceUnavailable(msg) => (
-				StatusCode::SERVICE_UNAVAILABLE,
-				"E-SYS-UNAVAIL".to_string(),
-				format!("Service temporarily unavailable: {}", msg),
-			),
+			Error::NotFound => (StatusCode::NOT_FOUND, "E-CORE-NOTFOUND".to_string(), "Resource not found".to_string()),
+			Error::PermissionDenied => {
+				(StatusCode::FORBIDDEN, "E-AUTH-NOPERM".to_string(), "You do not have permission to access this resource".to_string())
+			},
+			Error::Unauthorized => {
+				(StatusCode::UNAUTHORIZED, "E-AUTH-UNAUTH".to_string(), "Authentication required or invalid token".to_string())
+			},
+			Error::ValidationError(msg) => {
+				(StatusCode::BAD_REQUEST, "E-VAL-INVALID".to_string(), format!("Request validation failed: {}", msg))
+			},
+			Error::Conflict(msg) => (StatusCode::CONFLICT, "E-CORE-CONFLICT".to_string(), format!("Resource conflict: {}", msg)),
+			Error::Timeout => (StatusCode::REQUEST_TIMEOUT, "E-NET-TIMEOUT".to_string(), "Request timeout".to_string()),
+			Error::ServiceUnavailable(msg) => {
+				(StatusCode::SERVICE_UNAVAILABLE, "E-SYS-UNAVAIL".to_string(), format!("Service temporarily unavailable: {}", msg))
+			},
 			// Server errors (5xx) - no message exposure for security
-			Error::DbError => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-CORE-DBERR".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::Unknown => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-CORE-UNKNOWN".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::Parse => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-CORE-PARSE".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::Io(_) => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-SYS-IO".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::NetworkError(_) => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-NET-ERROR".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::ImageError(_) => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-IMG-PROCFAIL".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::CryptoError(_) => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-CRYPT-FAIL".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::ConfigError(_) => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-CONF-CFGERR".to_string(),
-				"Internal server error".to_string(),
-			),
+			Error::DbError => (StatusCode::INTERNAL_SERVER_ERROR, "E-CORE-DBERR".to_string(), "Internal server error".to_string()),
+			Error::Unknown => (StatusCode::INTERNAL_SERVER_ERROR, "E-CORE-UNKNOWN".to_string(), "Internal server error".to_string()),
+			Error::Parse => (StatusCode::INTERNAL_SERVER_ERROR, "E-CORE-PARSE".to_string(), "Internal server error".to_string()),
+			Error::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "E-SYS-IO".to_string(), "Internal server error".to_string()),
+			Error::NetworkError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "E-NET-ERROR".to_string(), "Internal server error".to_string()),
+			Error::ImageError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "E-IMG-PROCFAIL".to_string(), "Internal server error".to_string()),
+			Error::CryptoError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "E-CRYPT-FAIL".to_string(), "Internal server error".to_string()),
+			Error::ConfigError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "E-CONF-CFGERR".to_string(), "Internal server error".to_string()),
 		};
 
 		let error_response = ErrorResponse::new(code, message);

@@ -89,11 +89,7 @@ fn test_patch_map() {
 
 #[test]
 fn test_patch_serialize() {
-	let test = TestStruct {
-		name: Patch::Value("Charlie".to_string()),
-		age: Patch::Null,
-		email: Patch::Undefined,
-	};
+	let test = TestStruct { name: Patch::Value("Charlie".to_string()), age: Patch::Null, email: Patch::Undefined };
 
 	let json = serde_json::to_string(&test).unwrap();
 	// Undefined and Null both serialize to null, Value serializes to the value

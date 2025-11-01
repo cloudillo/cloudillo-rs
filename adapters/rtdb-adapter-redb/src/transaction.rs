@@ -32,15 +32,7 @@ impl RedbTransaction {
 		instance: std::sync::Arc<DatabaseInstance>,
 		tx: redb::WriteTransaction,
 	) -> Self {
-		Self {
-			per_tenant_files,
-			tn_id,
-			db_id,
-			instance,
-			tx: Some(tx),
-			pending_events: Vec::new(),
-			write_cache: HashMap::new(),
-		}
+		Self { per_tenant_files, tn_id, db_id, instance, tx: Some(tx), pending_events: Vec::new(), write_cache: HashMap::new() }
 	}
 
 	/// Get a mutable reference to the transaction
@@ -69,13 +61,7 @@ impl RedbTransaction {
 	}
 
 	/// Update indexes for a document
-	async fn update_indexes_for_document(
-		&mut self,
-		collection: &str,
-		doc_id: &str,
-		data: &Value,
-		insert: bool,
-	) -> ClResult<()> {
+	async fn update_indexes_for_document(&mut self, collection: &str, doc_id: &str, data: &Value, insert: bool) -> ClResult<()> {
 		use crate::error::from_redb_error;
 
 		// Get indexed fields
@@ -139,10 +125,7 @@ impl Transaction for RedbTransaction {
 		self.update_indexes_for_document(path, &doc_id, &data, true).await?;
 
 		// Buffer change event
-		self.pending_events.push(ChangeEvent::Create {
-			path: full_path.into(),
-			data,
-		});
+		self.pending_events.push(ChangeEvent::Create { path: full_path.into(), data });
 
 		Ok(doc_id.into())
 	}
@@ -164,7 +147,7 @@ impl Transaction for RedbTransaction {
 				Ok(Some(v)) => {
 					let json_str = v.value().to_string();
 					Some(serde_json::from_str::<Value>(&json_str)?)
-				}
+				},
 				Ok(None) => None,
 				Err(e) => return Err(from_redb_error(e).into()),
 			};
@@ -190,10 +173,7 @@ impl Transaction for RedbTransaction {
 		self.update_indexes_for_document(&collection, &doc_id, &data, true).await?;
 
 		// Buffer change event
-		self.pending_events.push(ChangeEvent::Update {
-			path: path.into(),
-			data,
-		});
+		self.pending_events.push(ChangeEvent::Update { path: path.into(), data });
 
 		Ok(())
 	}
@@ -214,7 +194,7 @@ impl Transaction for RedbTransaction {
 				Ok(Some(v)) => {
 					let json_str = v.value().to_string();
 					Some(serde_json::from_str::<Value>(&json_str)?)
-				}
+				},
 				Ok(None) => None,
 				Err(e) => return Err(from_redb_error(e).into()),
 			};
@@ -237,9 +217,7 @@ impl Transaction for RedbTransaction {
 		}
 
 		// Buffer change event
-		self.pending_events.push(ChangeEvent::Delete {
-			path: path.into(),
-		});
+		self.pending_events.push(ChangeEvent::Delete { path: path.into() });
 
 		Ok(())
 	}

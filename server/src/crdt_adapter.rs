@@ -44,20 +44,12 @@ pub struct CrdtUpdate {
 impl CrdtUpdate {
 	/// Create a new CRDT update from raw bytes.
 	pub fn new(data: Vec<u8>) -> Self {
-		Self {
-			data,
-			timestamp: Timestamp::now(),
-			client_id: None,
-		}
+		Self { data, timestamp: Timestamp::now(), client_id: None }
 	}
 
 	/// Create a new CRDT update with client ID.
 	pub fn with_client(data: Vec<u8>, client_id: impl Into<Box<str>>) -> Self {
-		Self {
-			data,
-			timestamp: Timestamp::now(),
-			client_id: Some(client_id.into()),
-		}
+		Self { data, timestamp: Timestamp::now(), client_id: Some(client_id.into()) }
 	}
 }
 
@@ -112,18 +104,12 @@ pub struct CrdtSubscriptionOptions {
 impl CrdtSubscriptionOptions {
 	/// Create a subscription to a document with snapshot.
 	pub fn with_snapshot(doc_id: impl Into<Box<str>>) -> Self {
-		Self {
-			doc_id: doc_id.into(),
-			send_snapshot: true,
-		}
+		Self { doc_id: doc_id.into(), send_snapshot: true }
 	}
 
 	/// Create a subscription to future updates only (no snapshot).
 	pub fn updates_only(doc_id: impl Into<Box<str>>) -> Self {
-		Self {
-			doc_id: doc_id.into(),
-			send_snapshot: false,
-		}
+		Self { doc_id: doc_id.into(), send_snapshot: false }
 	}
 }
 
@@ -188,12 +174,7 @@ pub trait CrdtAdapter: Debug + Send + Sync {
 	///
 	/// Convenience method for getting a single field from custom metadata.
 	/// Returns None if the key doesn't exist.
-	async fn get_meta_field(
-		&self,
-		tn_id: TnId,
-		doc_id: &str,
-		key: &str,
-	) -> ClResult<Option<Value>> {
+	async fn get_meta_field(&self, tn_id: TnId, doc_id: &str, key: &str) -> ClResult<Option<Value>> {
 		let meta = self.get_meta(tn_id, doc_id).await?;
 		Ok(meta.custom.get(key).cloned())
 	}
@@ -201,13 +182,7 @@ pub trait CrdtAdapter: Debug + Send + Sync {
 	/// Set a specific metadata field as JSON.
 	///
 	/// Convenience method for updating a single field in custom metadata.
-	async fn set_meta_field(
-		&self,
-		tn_id: TnId,
-		doc_id: &str,
-		key: &str,
-		value: Value,
-	) -> ClResult<()> {
+	async fn set_meta_field(&self, tn_id: TnId, doc_id: &str, key: &str, value: Value) -> ClResult<()> {
 		let mut meta = self.get_meta(tn_id, doc_id).await?;
 		meta.custom[key] = value;
 		self.set_meta(tn_id, doc_id, meta).await
@@ -217,21 +192,12 @@ pub trait CrdtAdapter: Debug + Send + Sync {
 	///
 	/// Returns a stream of updates. Depending on subscription options,
 	/// may include a snapshot of existing updates followed by new updates.
-	async fn subscribe(
-		&self,
-		tn_id: TnId,
-		opts: CrdtSubscriptionOptions,
-	) -> ClResult<Pin<Box<dyn Stream<Item = CrdtChangeEvent> + Send>>>;
+	async fn subscribe(&self, tn_id: TnId, opts: CrdtSubscriptionOptions) -> ClResult<Pin<Box<dyn Stream<Item = CrdtChangeEvent> + Send>>>;
 
 	/// Get statistics for a document.
 	async fn stats(&self, tn_id: TnId, doc_id: &str) -> ClResult<CrdtDocStats> {
 		let meta = self.get_meta(tn_id, doc_id).await?;
-		Ok(CrdtDocStats {
-			doc_id: doc_id.into(),
-			size_bytes: meta.size_bytes,
-			update_count: meta.update_count,
-			meta,
-		})
+		Ok(CrdtDocStats { doc_id: doc_id.into(), size_bytes: meta.size_bytes, update_count: meta.update_count, meta })
 	}
 
 	/// Delete a document and all its updates.

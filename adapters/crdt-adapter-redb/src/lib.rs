@@ -34,11 +34,9 @@
 //! - In-memory document instance caching with LRU eviction
 //! - Transaction-safe atomic updates
 
-use cloudillo::prelude::*;
-use cloudillo::crdt_adapter::{
-	CrdtAdapter, CrdtChangeEvent, CrdtDocMeta, CrdtSubscriptionOptions, CrdtUpdate,
-};
+use cloudillo::crdt_adapter::{CrdtAdapter, CrdtChangeEvent, CrdtDocMeta, CrdtSubscriptionOptions, CrdtUpdate};
 use cloudillo::error::{ClResult, Error as ClError};
+use cloudillo::prelude::*;
 use cloudillo::types::TnId;
 use dashmap::DashMap;
 use futures_core::Stream;
@@ -72,12 +70,7 @@ pub struct AdapterConfig {
 
 impl Default for AdapterConfig {
 	fn default() -> Self {
-		Self {
-			max_instances: 100,
-			idle_timeout_secs: 300,
-			broadcast_capacity: 1000,
-			auto_evict: true,
-		}
+		Self { max_instances: 100, idle_timeout_secs: 300, broadcast_capacity: 1000, auto_evict: true }
 	}
 }
 
@@ -86,12 +79,10 @@ mod tables {
 	use redb::TableDefinition;
 
 	/// Stores binary CRDT updates: (doc_id:update_seq) -> update_bytes
-	pub const TABLE_UPDATES: TableDefinition<&str, &[u8]> =
-		TableDefinition::new("crdt_updates");
+	pub const TABLE_UPDATES: TableDefinition<&str, &[u8]> = TableDefinition::new("crdt_updates");
 
 	/// Stores document metadata: doc_id -> metadata_json
-	pub const TABLE_METADATA: TableDefinition<&str, &str> =
-		TableDefinition::new("crdt_metadata");
+	pub const TABLE_METADATA: TableDefinition<&str, &str> = TableDefinition::new("crdt_metadata");
 
 	/// Stores update counts and sizes: doc_id -> stats_json
 	pub const TABLE_STATS: TableDefinition<&str, &str> = TableDefinition::new("crdt_stats");
@@ -117,16 +108,11 @@ struct DocumentInstance {
 
 impl DocumentInstance {
 	fn new(broadcaster: DocBroadcaster) -> Self {
-		Self {
-			broadcaster,
-			last_accessed: AtomicU64::new(Timestamp::now().0 as u64),
-			update_count: AtomicU64::new(0),
-		}
+		Self { broadcaster, last_accessed: AtomicU64::new(Timestamp::now().0 as u64), update_count: AtomicU64::new(0) }
 	}
 
 	fn touch(&self) {
-		self.last_accessed
-			.store(Timestamp::now().0 as u64, Ordering::Relaxed);
+		self.last_accessed.store(Timestamp::now().0 as u64, Ordering::Relaxed);
 	}
 
 	#[allow(dead_code)]
@@ -155,22 +141,14 @@ pub struct CrdtAdapterRedb {
 
 impl CrdtAdapterRedb {
 	/// Create a new CRDT adapter with redb storage
-	pub async fn new(
-		storage_path: impl AsRef<Path>,
-		per_tenant_files: bool,
-		config: AdapterConfig,
-	) -> ClResult<Self> {
+	pub async fn new(storage_path: impl AsRef<Path>, per_tenant_files: bool, config: AdapterConfig) -> ClResult<Self> {
 		let storage_path = storage_path.as_ref().to_path_buf();
 
 		// Create storage directory if it doesn't exist
-		std::fs::create_dir_all(&storage_path).map_err(|e| {
-			ClError::from(Error::IoError(format!("Failed to create storage directory: {}", e)))
-		})?;
+		std::fs::create_dir_all(&storage_path)
+			.map_err(|e| ClError::from(Error::IoError(format!("Failed to create storage directory: {}", e))))?;
 
-		debug!(
-			"Initializing CRDT adapter at {:?} (per_tenant_files={})",
-			storage_path, per_tenant_files
-		);
+		debug!("Initializing CRDT adapter at {:?} (per_tenant_files={})", storage_path, per_tenant_files);
 
 		Ok(Self {
 			storage_path,
@@ -192,20 +170,18 @@ impl CrdtAdapterRedb {
 		}
 
 		// Open database
-		let db = redb::Database::create(db_path.clone()).map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to open database: {}", e)))
-		})?;
+		let db = redb::Database::create(db_path.clone())
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to open database: {}", e))))?;
 
 		// Create tables if they don't exist
-		let tx = db.begin_write().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e)))
-		})?;
+		let tx = db
+			.begin_write()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e))))?;
 		let _ = tx.open_table(TABLE_UPDATES);
 		let _ = tx.open_table(TABLE_METADATA);
 		let _ = tx.open_table(TABLE_STATS);
-		tx.commit().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to commit table creation: {}", e)))
-		})?;
+		tx.commit()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to commit table creation: {}", e))))?;
 
 		let db = Arc::new(db);
 
@@ -228,10 +204,7 @@ impl CrdtAdapterRedb {
 	}
 
 	/// Get or create a document instance (with broadcaster)
-	async fn get_or_create_instance(
-		&self,
-		doc_id: &str,
-	) -> ClResult<Arc<DocumentInstance>> {
+	async fn get_or_create_instance(&self, doc_id: &str) -> ClResult<Arc<DocumentInstance>> {
 		if let Some(instance) = self.doc_instances.get(doc_id) {
 			instance.touch();
 			return Ok(Arc::clone(&instance));
@@ -241,8 +214,7 @@ impl CrdtAdapterRedb {
 		let (tx, _) = tokio::sync::broadcast::channel(self.config.broadcast_capacity);
 		let instance = Arc::new(DocumentInstance::new(tx));
 
-		self.doc_instances
-			.insert(doc_id.to_string(), Arc::clone(&instance));
+		self.doc_instances.insert(doc_id.to_string(), Arc::clone(&instance));
 
 		Ok(instance)
 	}
@@ -259,26 +231,22 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		let db_path = self.get_db_path(tn_id, doc_id);
 		let db = self.get_or_open_db_file(db_path).await?;
 
-		let tx = db.begin_read().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e)))
-		})?;
+		let tx = db
+			.begin_read()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e))))?;
 
-		let updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
-		})?;
+		let updates_table = tx
+			.open_table(TABLE_UPDATES)
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to open updates table: {}", e))))?;
 
 		let mut updates = Vec::new();
 		let prefix = format!("{}:", doc_id);
 		let range = updates_table
 			.range(prefix.as_str()..)
-			.map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to read updates: {}", e)))
-			})?;
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to read updates: {}", e))))?;
 
 		for item in range {
-			let (key, value) = item.map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
-			})?;
+			let (key, value) = item.map_err(|e| ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e))))?;
 
 			let key_str = key.value();
 			if !key_str.starts_with(&prefix) {
@@ -302,32 +270,26 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		let seq = instance.update_count.fetch_add(1, Ordering::SeqCst);
 
 		// Write update to database
-		let tx = db.begin_write().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e)))
-		})?;
+		let tx = db
+			.begin_write()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e))))?;
 
 		{
-			let mut updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
-			})?;
+			let mut updates_table = tx
+				.open_table(TABLE_UPDATES)
+				.map_err(|e| ClError::from(Error::DbError(format!("Failed to open updates table: {}", e))))?;
 
 			let key = Self::make_update_key(doc_id, seq);
 			updates_table
 				.insert(key.as_str(), update.data.as_slice())
-				.map_err(|e| {
-					ClError::from(Error::DbError(format!("Failed to insert update: {}", e)))
-				})?;
+				.map_err(|e| ClError::from(Error::DbError(format!("Failed to insert update: {}", e))))?;
 		}
 
-		tx.commit().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to commit update: {}", e)))
-		})?;
+		tx.commit()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to commit update: {}", e))))?;
 
 		// Broadcast to subscribers
-		let event = CrdtChangeEvent {
-			doc_id: doc_id.into(),
-			update: CrdtUpdate::new(update.data),
-		};
+		let event = CrdtChangeEvent { doc_id: doc_id.into(), update: CrdtUpdate::new(update.data) };
 		let _ = instance.broadcaster.send(event);
 
 		trace!("Stored update for doc {} (seq={})", doc_id, seq);
@@ -338,22 +300,23 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		let db_path = self.get_db_path(tn_id, doc_id);
 		let db = self.get_or_open_db_file(db_path).await?;
 
-		let tx = db.begin_read().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e)))
-		})?;
+		let tx = db
+			.begin_read()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e))))?;
 
-		let metadata_table = tx.open_table(TABLE_METADATA).map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e)))
-		})?;
+		let metadata_table = tx
+			.open_table(TABLE_METADATA)
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e))))?;
 
-		match metadata_table.get(doc_id).map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to read metadata: {}", e)))
-		})? {
+		match metadata_table
+			.get(doc_id)
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to read metadata: {}", e))))?
+		{
 			Some(value) => {
 				let meta_json = value.value();
 				let meta: CrdtDocMeta = serde_json::from_str(meta_json)?;
 				Ok(meta)
-			}
+			},
 			None => Ok(CrdtDocMeta::default()),
 		}
 	}
@@ -362,33 +325,28 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		let db_path = self.get_db_path(tn_id, doc_id);
 		let db = self.get_or_open_db_file(db_path).await?;
 
-		let tx = db.begin_write().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e)))
-		})?;
+		let tx = db
+			.begin_write()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e))))?;
 
 		{
-			let mut metadata_table = tx.open_table(TABLE_METADATA).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e)))
-			})?;
+			let mut metadata_table = tx
+				.open_table(TABLE_METADATA)
+				.map_err(|e| ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e))))?;
 
 			let meta_json = serde_json::to_string(&meta)?;
-			metadata_table.insert(doc_id, meta_json.as_str()).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to insert metadata: {}", e)))
-			})?;
+			metadata_table
+				.insert(doc_id, meta_json.as_str())
+				.map_err(|e| ClError::from(Error::DbError(format!("Failed to insert metadata: {}", e))))?;
 		}
 
-		tx.commit().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to commit metadata: {}", e)))
-		})?;
+		tx.commit()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to commit metadata: {}", e))))?;
 
 		Ok(())
 	}
 
-	async fn subscribe(
-		&self,
-		tn_id: TnId,
-		opts: CrdtSubscriptionOptions,
-	) -> ClResult<Pin<Box<dyn Stream<Item = CrdtChangeEvent> + Send>>> {
+	async fn subscribe(&self, tn_id: TnId, opts: CrdtSubscriptionOptions) -> ClResult<Pin<Box<dyn Stream<Item = CrdtChangeEvent> + Send>>> {
 		let doc_id = opts.doc_id.clone();
 		let instance = self.get_or_create_instance(&doc_id).await?;
 
@@ -432,18 +390,18 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		let db_path = self.get_db_path(tn_id, doc_id);
 		let db = self.get_or_open_db_file(db_path).await?;
 
-		let tx = db.begin_write().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e)))
-		})?;
+		let tx = db
+			.begin_write()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e))))?;
 
 		{
-			let mut updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
-			})?;
+			let mut updates_table = tx
+				.open_table(TABLE_UPDATES)
+				.map_err(|e| ClError::from(Error::DbError(format!("Failed to open updates table: {}", e))))?;
 
-			let mut metadata_table = tx.open_table(TABLE_METADATA).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e)))
-			})?;
+			let mut metadata_table = tx
+				.open_table(TABLE_METADATA)
+				.map_err(|e| ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e))))?;
 
 			// Delete all updates for this document
 			// First collect keys to avoid borrow conflicts
@@ -452,14 +410,10 @@ impl CrdtAdapter for CrdtAdapterRedb {
 			{
 				let range = updates_table
 					.range(prefix.as_str()..)
-					.map_err(|e| {
-						ClError::from(Error::DbError(format!("Failed to read updates: {}", e)))
-					})?;
+					.map_err(|e| ClError::from(Error::DbError(format!("Failed to read updates: {}", e))))?;
 
 				for item in range {
-					let (key, _) = item.map_err(|e| {
-						ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
-					})?;
+					let (key, _) = item.map_err(|e| ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e))))?;
 
 					let key_str = key.value();
 					if !key_str.starts_with(&prefix) {
@@ -471,20 +425,19 @@ impl CrdtAdapter for CrdtAdapterRedb {
 
 			// Now delete the collected keys
 			for key_str in keys_to_delete {
-				updates_table.remove(key_str.as_str()).map_err(|e| {
-					ClError::from(Error::DbError(format!("Failed to delete update: {}", e)))
-				})?;
+				updates_table
+					.remove(key_str.as_str())
+					.map_err(|e| ClError::from(Error::DbError(format!("Failed to delete update: {}", e))))?;
 			}
 
 			// Delete metadata
-			metadata_table.remove(doc_id).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to delete metadata: {}", e)))
-			})?;
+			metadata_table
+				.remove(doc_id)
+				.map_err(|e| ClError::from(Error::DbError(format!("Failed to delete metadata: {}", e))))?;
 		}
 
-		tx.commit().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to commit deletion: {}", e)))
-		})?;
+		tx.commit()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to commit deletion: {}", e))))?;
 
 		// Remove from instance cache
 		self.doc_instances.remove(doc_id);
@@ -496,23 +449,21 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		let db_path = self.get_db_path(tn_id, "");
 		let db = self.get_or_open_db_file(db_path).await?;
 
-		let tx = db.begin_read().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e)))
-		})?;
+		let tx = db
+			.begin_read()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e))))?;
 
-		let metadata_table = tx.open_table(TABLE_METADATA).map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e)))
-		})?;
+		let metadata_table = tx
+			.open_table(TABLE_METADATA)
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e))))?;
 
 		let mut doc_ids = Vec::new();
-		let range = metadata_table.iter().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to read metadata: {}", e)))
-		})?;
+		let range = metadata_table
+			.iter()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to read metadata: {}", e))))?;
 
 		for item in range {
-			let (key, _) = item.map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to iterate metadata: {}", e)))
-			})?;
+			let (key, _) = item.map_err(|e| ClError::from(Error::DbError(format!("Failed to iterate metadata: {}", e))))?;
 
 			doc_ids.push(key.value().into());
 		}

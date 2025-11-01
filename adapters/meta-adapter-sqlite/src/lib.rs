@@ -1,18 +1,14 @@
 #![allow(unused)]
 
-use std::{borrow::Cow, fmt::Debug, sync::Arc, path::Path, collections::HashMap};
 use async_trait::async_trait;
 use sqlx::{
-	sqlite::{self, SqlitePool, SqliteRow},
 	query_builder::Separated,
-	Row
+	sqlite::{self, SqlitePool, SqliteRow},
+	Row,
 };
+use std::{borrow::Cow, collections::HashMap, fmt::Debug, path::Path, sync::Arc};
 
-use cloudillo::{
-	prelude::*,
-	core::worker::WorkerPool,
-	meta_adapter,
-};
+use cloudillo::{core::worker::WorkerPool, meta_adapter, prelude::*};
 
 // Helper functions
 //******************
@@ -25,12 +21,16 @@ macro_rules! push_patch {
 		match $patch {
 			Patch::Undefined => $has_updates,
 			Patch::Null => {
-				if $has_updates { $query.push(", "); }
+				if $has_updates {
+					$query.push(", ");
+				}
 				$query.push(concat!($field, "=NULL"));
 				true
 			},
 			Patch::Value(v) => {
-				if $has_updates { $query.push(", "); }
+				if $has_updates {
+					$query.push(", ");
+				}
 				$query.push(concat!($field, "=")).push_bind(v);
 				true
 			},
@@ -41,12 +41,16 @@ macro_rules! push_patch {
 		match $patch {
 			Patch::Undefined => $has_updates,
 			Patch::Null => {
-				if $has_updates { $query.push(", "); }
+				if $has_updates {
+					$query.push(", ");
+				}
 				$query.push(concat!($field, "=NULL"));
 				true
 			},
 			Patch::Value($v) => {
-				if $has_updates { $query.push(", "); }
+				if $has_updates {
+					$query.push(", ");
+				}
 				$query.push(concat!($field, "=")).push_bind($convert);
 				true
 			},
@@ -57,13 +61,17 @@ macro_rules! push_patch {
 		match $patch {
 			Patch::Undefined => $has_updates,
 			Patch::Null => {
-				if $has_updates { $query.push(", "); }
+				if $has_updates {
+					$query.push(", ");
+				}
 				$query.push(concat!($field, "=NULL"));
 				true
 			},
 			Patch::Value($v) => {
 				if let Some(sql_expr) = $convert {
-					if $has_updates { $query.push(", "); }
+					if $has_updates {
+						$query.push(", ");
+					}
 					$query.push(concat!($field, "=")).push(sql_expr);
 					true
 				} else {
@@ -74,8 +82,7 @@ macro_rules! push_patch {
 	}};
 }
 
-fn push_in<'a>(mut query: sqlx::QueryBuilder<'a, sqlx::Sqlite>, values: &'a [impl AsRef<str>])
-	-> sqlx::QueryBuilder<'a, sqlx::Sqlite> {
+fn push_in<'a>(mut query: sqlx::QueryBuilder<'a, sqlx::Sqlite>, values: &'a [impl AsRef<str>]) -> sqlx::QueryBuilder<'a, sqlx::Sqlite> {
 	query.push("(");
 	for (i, value) in values.iter().enumerate() {
 		if i > 0 {
@@ -88,11 +95,17 @@ fn push_in<'a>(mut query: sqlx::QueryBuilder<'a, sqlx::Sqlite>, values: &'a [imp
 }
 
 fn parse_str_list(s: &str) -> Box<[Box<str>]> {
-	s.split(',').map(|s| s.trim().to_owned().into_boxed_str()).collect::<Vec<_>>().into_boxed_slice()
+	s.split(',')
+		.map(|s| s.trim().to_owned().into_boxed_str())
+		.collect::<Vec<_>>()
+		.into_boxed_slice()
 }
 
 fn parse_u64_list(s: &str) -> Box<[u64]> {
-	s.split(',').map(|s| s.trim().parse().unwrap()).collect::<Vec<_>>().into_boxed_slice()
+	s.split(',')
+		.map(|s| s.trim().parse().unwrap())
+		.collect::<Vec<_>>()
+		.into_boxed_slice()
 }
 
 fn inspect(err: &sqlx::Error) {
@@ -101,7 +114,7 @@ fn inspect(err: &sqlx::Error) {
 
 pub fn map_res<T, F>(row: Result<SqliteRow, sqlx::Error>, f: F) -> ClResult<T>
 where
-	F: FnOnce(SqliteRow) -> Result<T, sqlx::Error>
+	F: FnOnce(SqliteRow) -> Result<T, sqlx::Error>,
 {
 	match row {
 		Ok(row) => f(row).inspect_err(inspect).map_err(|_| Error::DbError),
@@ -109,13 +122,13 @@ where
 		Err(err) => {
 			inspect(&err);
 			Err(Error::DbError)
-		}
+		},
 	}
 }
 
 pub async fn async_map_res<T, F>(row: Result<SqliteRow, sqlx::Error>, f: F) -> ClResult<T>
 where
-	F: AsyncFnOnce(SqliteRow) -> Result<T, sqlx::Error>
+	F: AsyncFnOnce(SqliteRow) -> Result<T, sqlx::Error>,
 {
 	match row {
 		Ok(row) => f(row).await.inspect_err(inspect).map_err(|_| Error::DbError),
@@ -123,17 +136,16 @@ where
 		Err(err) => {
 			inspect(&err);
 			Err(Error::DbError)
-		}
+		},
 	}
 }
 
-pub fn collect_res<T>(mut iter: impl Iterator<Item = Result<T, sqlx::Error>> + Unpin) -> ClResult<Vec<T>>
-{
-    let mut items = Vec::new();
-    while let Some(item) = iter.next() {
-        items.push(item.inspect_err(inspect).map_err(|_| Error::DbError)?);
-    }
-    Ok(items)
+pub fn collect_res<T>(mut iter: impl Iterator<Item = Result<T, sqlx::Error>> + Unpin) -> ClResult<Vec<T>> {
+	let mut items = Vec::new();
+	while let Some(item) = iter.next() {
+		items.push(item.inspect_err(inspect).map_err(|_| Error::DbError)?);
+	}
+	Ok(items)
 }
 
 #[derive(Debug)]
@@ -163,17 +175,26 @@ impl MetaAdapterSqlite {
 			.inspect_err(|err| println!("DbError: {:#?}", err))
 			.or(Err(Error::DbError))?;
 
-		init_db(&db).await
+		init_db(&db)
+			.await
 			.inspect_err(|err| println!("DbError: {:#?}", err))
 			.or(Err(Error::DbError))?;
 
 		// Debug PRAGMA compiler_options
 		let res = sqlx::query("PRAGMA compile_options")
-			.fetch_all(&db).await
+			.fetch_all(&db)
+			.await
 			.inspect_err(|err| println!("DbError: {:#?}", err))
 			.or(Err(Error::DbError))?;
 		//let max_attached = res.iter().map(|row| row.get::<&str, _>(0)).filter(|s| s.starts_with("MAX_ATTACHED=")).collect::<Vec<_>>().iter().split("=").last()?;
-		let max_attached = res.iter().map(|row| row.get::<&str, _>(0)).filter(|s| s.starts_with("MAX_ATTACHED=")).last().unwrap_or("").split("=").last();
+		let max_attached = res
+			.iter()
+			.map(|row| row.get::<&str, _>(0))
+			.filter(|s| s.starts_with("MAX_ATTACHED="))
+			.last()
+			.unwrap_or("")
+			.split("=")
+			.last();
 		println!("MAX_ATTACHED: {:?}", max_attached);
 		//println!("PRAGMA compile_options: {:#?}", res.iter().map(|row| row.get::<&str, _>(0)).filter(|s| s.starts_with("MAX_ATTACHED=")).collect::<Vec<_>>());
 
@@ -186,15 +207,16 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	// Tenant management
 	//*******************
 	async fn read_tenant(&self, tn_id: TnId) -> ClResult<meta_adapter::Tenant<Box<str>>> {
-		let res = sqlx::query(
-			"SELECT tn_id, id_tag, name, type, profile_pic, cover_pic, created_at, x FROM tenants WHERE tn_id = ?1"
-		).bind(tn_id.0).fetch_one(&self.dbr).await;
+		let res = sqlx::query("SELECT tn_id, id_tag, name, type, profile_pic, cover_pic, created_at, x FROM tenants WHERE tn_id = ?1")
+			.bind(tn_id.0)
+			.fetch_one(&self.dbr)
+			.await;
 
 		match res {
 			Err(sqlx::Error::RowNotFound) => return Err(Error::NotFound),
 			Err(err) => {
 				println!("DbError: {:#?}", err);
-				return Err(Error::DbError)
+				return Err(Error::DbError);
 			},
 			Ok(row) => {
 				let xs: &str = row.try_get("x").or(Err(Error::DbError))?;
@@ -214,7 +236,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 					//x: row.try_get("x").map(serde_json::from_str).or(Err(Error::DbError))?,
 					x,
 				})
-			}
+			},
 		}
 	}
 
@@ -251,7 +273,10 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 		query.push(" WHERE tn_id=").push_bind(tn_id.0);
 
-		let res = query.build().execute(&self.db).await
+		let res = query
+			.build()
+			.execute(&self.db)
+			.await
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
@@ -266,46 +291,102 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 		// Delete in order: dependencies first, then parent records
 		sqlx::query("DELETE FROM task_dependencies WHERE task_id IN (SELECT task_id FROM tasks WHERE tn_id=?)")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM tasks WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM action_tokens WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM action_outbox_queue WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM actions WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM file_variants WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM files WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM refs WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM profiles WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM tags WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM settings WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM subscriptions WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		sqlx::query("DELETE FROM tenant_data WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		let res = sqlx::query("DELETE FROM tenants WHERE tn_id=?")
-			.bind(tn_id.0).execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		if res.rows_affected() == 0 {
 			return Err(Error::NotFound);
@@ -318,7 +399,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	async fn list_profiles(&self, tn_id: TnId, opts: &meta_adapter::ListProfileOptions) -> ClResult<Vec<meta_adapter::Profile<Box<str>>>> {
 		let mut query = sqlx::QueryBuilder::new(
 			"SELECT id_tag, name, type, profile_pic, following, connected
-			 FROM profiles WHERE tn_id="
+			 FROM profiles WHERE tn_id=",
 		);
 		query.push_bind(tn_id.0);
 
@@ -365,8 +446,12 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		}
 
 		if let Some(q) = &opts.q {
-			query.push(" AND (name LIKE ").push_bind(format!("%{}%", q))
-				.push(" OR id_tag LIKE ").push_bind(format!("%{}%", q)).push(")");
+			query
+				.push(" AND (name LIKE ")
+				.push_bind(format!("%{}%", q))
+				.push(" OR id_tag LIKE ")
+				.push_bind(format!("%{}%", q))
+				.push(")");
 		}
 
 		if let Some(id_tag) = &opts.id_tag {
@@ -375,8 +460,12 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 		query.push(" ORDER BY name LIMIT 100");
 
-		let res = query.build().fetch_all(&self.dbr).await
-			.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let res = query
+			.build()
+			.fetch_all(&self.dbr)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		collect_res(res.iter().map(|row| {
 			let typ = match row.try_get("type")? {
@@ -397,9 +486,14 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	}
 
 	async fn read_profile(&self, tn_id: TnId, id_tag: &str) -> ClResult<(Box<str>, meta_adapter::Profile<Box<str>>)> {
-		let res = sqlx::query("SELECT id_tag, type, name, profile_pic, status, perm, following, connected, etag
-			FROM profiles WHERE tn_id=? AND id_tag=?")
-			.bind(tn_id.0).bind(id_tag).fetch_one(&self.dbr).await;
+		let res = sqlx::query(
+			"SELECT id_tag, type, name, profile_pic, status, perm, following, connected, etag
+			FROM profiles WHERE tn_id=? AND id_tag=?",
+		)
+		.bind(tn_id.0)
+		.bind(id_tag)
+		.fetch_one(&self.dbr)
+		.await;
 
 		map_res(res, |row| {
 			let id_tag = row.try_get("id_tag")?;
@@ -428,20 +522,22 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			meta_adapter::ProfileType::Community => "C",
 		};
 
-		sqlx::query("INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, following, connected, etag, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())")
-			.bind(tn_id.0)
-			.bind(profile.id_tag)
-			.bind(profile.name)
-			.bind(typ)
-			.bind(profile.profile_pic)
-			.bind(profile.following)
-			.bind(profile.connected)
-			.bind(etag)
-			.execute(&self.db)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+		sqlx::query(
+			"INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, following, connected, etag, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())",
+		)
+		.bind(tn_id.0)
+		.bind(profile.id_tag)
+		.bind(profile.name)
+		.bind(typ)
+		.bind(profile.profile_pic)
+		.bind(profile.following)
+		.bind(profile.connected)
+		.bind(etag)
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 
 		Ok(())
 	}
@@ -464,15 +560,25 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		});
 
 		// synced is special - true means set to now, false means don't update
-		has_updates = push_patch!(query, has_updates, "synced_at", &profile.synced, expr |v| {
-			if *v { Some("unixepoch()") } else { None }
-		});
+		has_updates = push_patch!(
+			query,
+			has_updates,
+			"synced_at",
+			&profile.synced,
+			expr | v | {
+				if *v {
+					Some("unixepoch()")
+				} else {
+					None
+				}
+			}
+		);
 
 		has_updates = push_patch!(query, has_updates, "following", &profile.following);
 
 		has_updates = push_patch!(query, has_updates, "connected", &profile.connected, |v| match v {
 			meta_adapter::ProfileConnectionStatus::Disconnected => "0",
-			meta_adapter::ProfileConnectionStatus::RequestPending => "2",  // Use 2 for 'R'
+			meta_adapter::ProfileConnectionStatus::RequestPending => "2", // Use 2 for 'R'
 			meta_adapter::ProfileConnectionStatus::Connected => "1",
 		});
 
@@ -481,10 +587,18 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			return Ok(());
 		}
 
-		query.push(" WHERE tn_id=").push_bind(tn_id.0).push(" AND id_tag=").push_bind(id_tag);
+		query
+			.push(" WHERE tn_id=")
+			.push_bind(tn_id.0)
+			.push(" AND id_tag=")
+			.push_bind(id_tag);
 
-		let res = query.build().execute(&self.db).await
-			.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let res = query
+			.build()
+			.execute(&self.db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		if res.rows_affected() == 0 {
 			return Err(Error::NotFound);
@@ -495,7 +609,10 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 	async fn read_profile_public_key(&self, id_tag: &str, key_id: &str) -> ClResult<(Box<str>, Timestamp)> {
 		let res = sqlx::query("SELECT public_key, expire FROM key_cache WHERE id_tag=? AND key_id=?")
-			.bind(id_tag).bind(key_id).fetch_one(&self.dbr).await;
+			.bind(id_tag)
+			.bind(key_id)
+			.fetch_one(&self.dbr)
+			.await;
 
 		map_res(res, |row| {
 			let public_key = row.try_get("public_key")?;
@@ -506,24 +623,30 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 	async fn add_profile_public_key(&self, id_tag: &str, key_id: &str, public_key: &str) -> ClResult<()> {
 		sqlx::query("INSERT INTO key_cache (id_tag, key_id, public_key) VALUES (?, ?, ?)")
-			.bind(id_tag).bind(key_id).bind(public_key).execute(&self.dbr).await.map_err(|_| Error::DbError)?;
+			.bind(id_tag)
+			.bind(key_id)
+			.bind(public_key)
+			.execute(&self.dbr)
+			.await
+			.map_err(|_| Error::DbError)?;
 		Ok(())
 	}
 
 	async fn process_profile_refresh<'a>(&self, callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>) {
 		// Query profiles that need refreshing (e.g., synced_at is old or NULL)
-		let res = sqlx::query("SELECT tn_id, id_tag, etag FROM profiles
+		let res = sqlx::query(
+			"SELECT tn_id, id_tag, etag FROM profiles
 			WHERE synced_at IS NULL OR synced_at < unixepoch() - 3600
-			LIMIT 100")
-			.fetch_all(&self.dbr).await;
+			LIMIT 100",
+		)
+		.fetch_all(&self.dbr)
+		.await;
 
 		if let Ok(rows) = res {
 			for row in rows {
-				if let (Ok(tn_id_val), Ok(id_tag), Ok(etag)) = (
-					row.try_get::<i64, _>("tn_id"),
-					row.try_get::<Box<str>, _>("id_tag"),
-					row.try_get::<Option<Box<str>>, _>("etag")
-				) {
+				if let (Ok(tn_id_val), Ok(id_tag), Ok(etag)) =
+					(row.try_get::<i64, _>("tn_id"), row.try_get::<Box<str>, _>("id_tag"), row.try_get::<Option<Box<str>>, _>("etag"))
+				{
 					let tn_id = TnId(tn_id_val as u32);
 					// Use Box::leak to extend lifetime - profile data is long-lived
 					let id_tag_static: &'static str = Box::leak(id_tag);
@@ -548,8 +671,10 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			FROM actions a
 			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
-			LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.parent_id=a.action_id AND own.issuer_tag=");
-		query.push_bind("")
+			LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.parent_id=a.action_id AND own.issuer_tag=",
+		);
+		query
+			.push_bind("")
 			.push("AND own.type='REACT' AND coalesce(own.status, 'A') NOT IN ('D') WHERE a.tn_id=")
 			.push_bind(tn_id.0);
 
@@ -587,7 +712,12 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		query.push(" ORDER BY a.created_at DESC LIMIT 100");
 		info!("SQL: {}", query.sql());
 
-		let res = query.build().fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let res = query
+			.build()
+			.fetch_all(&self.dbr)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		let mut actions = Vec::new();
 		let mut iter = res.iter();
@@ -599,13 +729,25 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			let audience_tag = row.try_get::<Option<Box<str>>, _>("audience").map_err(|_| Error::DbError)?;
 
 			// collect attachments
-			let attachments = row.try_get::<Option<Box<str>>, _>("attachments").inspect_err(inspect).map_err(|_| Error::DbError)?;
+			let attachments = row
+				.try_get::<Option<Box<str>>, _>("attachments")
+				.inspect_err(inspect)
+				.map_err(|_| Error::DbError)?;
 			let attachments = if let Some(attachments) = &attachments {
 				info!("attachments: {:?}", attachments);
-				let mut attachments = parse_str_list(attachments).iter().map(|a| meta_adapter::AttachmentView { file_id: a.clone(), dim: None }).collect::<Vec<_>>();
+				let mut attachments = parse_str_list(attachments)
+					.iter()
+					.map(|a| meta_adapter::AttachmentView { file_id: a.clone(), dim: None })
+					.collect::<Vec<_>>();
 				info!("attachments: {:?}", attachments);
 				for a in attachments.iter_mut() {
-					if let Ok(file_res) = sqlx::query("SELECT x->>'dim' as dim FROM files WHERE tn_id=? AND file_id=?").bind(tn_id.0).bind(&a.file_id).fetch_one(&self.dbr).await.inspect_err(inspect) {
+					if let Ok(file_res) = sqlx::query("SELECT x->>'dim' as dim FROM files WHERE tn_id=? AND file_id=?")
+						.bind(tn_id.0)
+						.bind(&a.file_id)
+						.fetch_one(&self.dbr)
+						.await
+						.inspect_err(inspect)
+					{
 						a.dim = serde_json::from_str(file_res.try_get("dim").inspect_err(inspect).map_err(|_| Error::DbError)?)?;
 					}
 					info!("attachment: {:?}", a);
@@ -635,7 +777,9 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 						Some("C") => meta_adapter::ProfileType::Community,
 						_ => meta_adapter::ProfileType::Person,
 					},
-					profile_pic: row.try_get::<Option<Box<str>>, _>("issuer_profile_pic").map_err(|_| Error::DbError)?,
+					profile_pic: row
+						.try_get::<Option<Box<str>>, _>("issuer_profile_pic")
+						.map_err(|_| Error::DbError)?,
 				},
 				audience: if let Some(audience_tag) = audience_tag {
 					Some(meta_adapter::ProfileInfo {
@@ -645,14 +789,21 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 							Some("C") => meta_adapter::ProfileType::Community,
 							_ => meta_adapter::ProfileType::Person,
 						},
-						profile_pic: row.try_get::<Option<Box<str>>, _>("audience_profile_pic").map_err(|_| Error::DbError)?,
+						profile_pic: row
+							.try_get::<Option<Box<str>>, _>("audience_profile_pic")
+							.map_err(|_| Error::DbError)?,
 					})
-				} else { None },
+				} else {
+					None
+				},
 				subject: row.try_get("subject").map_err(|_| Error::DbError)?,
 				content: row.try_get("content").map_err(|_| Error::DbError)?,
 				attachments,
 				created_at: row.try_get("created_at").map(|ts| Timestamp(ts)).map_err(|_| Error::DbError)?,
-				expires_at: row.try_get("expires_at").map(|ts: Option<i64>| ts.map(|t| Timestamp(t))).map_err(|_| Error::DbError)?,
+				expires_at: row
+					.try_get("expires_at")
+					.map(|ts: Option<i64>| ts.map(|t| Timestamp(t)))
+					.map_err(|_| Error::DbError)?,
 				status: row.try_get("status").map_err(|_| Error::DbError)?,
 				stat,
 				//own_reaction: row.try_get("own_reaction")?,
@@ -666,7 +817,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		let mut query = sqlx::QueryBuilder::new(
 			"SELECT at.token FROM action_tokens at
 			 JOIN actions a ON a.tn_id=at.tn_id AND a.action_id=at.action_id
-			 WHERE at.tn_id="
+			 WHERE at.tn_id=",
 		);
 		query.push_bind(tn_id.0);
 
@@ -688,12 +839,14 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 		query.push(" ORDER BY a.created_at DESC LIMIT 100");
 
-		let res = query.build().fetch_all(&self.dbr).await
-			.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let res = query
+			.build()
+			.fetch_all(&self.dbr)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
-		let tokens = collect_res(res.iter().map(|row| {
-			Ok(row.try_get("token")?)
-		}))?;
+		let tokens = collect_res(res.iter().map(|row| Ok(row.try_get("token")?)))?;
 
 		Ok(tokens.into_boxed_slice())
 	}
@@ -722,9 +875,16 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		let mut add_reactions = if action.content == None { 0 } else { 1 };
 		if let Some(key) = &key {
 			info!("update with key: {}", key);
-			let res = sqlx::query("UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND action_id!=? AND coalesce(status, '')!='D' RETURNING content")
-				.bind(tn_id.0).bind(key).bind(&action.action_id)
-				.fetch_all(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			let res = sqlx::query(
+				"UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND action_id!=? AND coalesce(status, '')!='D' RETURNING content",
+			)
+			.bind(tn_id.0)
+			.bind(key)
+			.bind(&action.action_id)
+			.fetch_all(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 			if res.len() > 0 && res[0].try_get::<Option<&str>, _>("content").map_err(|_| Error::DbError)? != None {
 				add_reactions -= 1;
 			}
@@ -732,22 +892,33 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		if action.typ == "REACT" && action.content != None {
 			info!("update with reaction: {}", action.content.unwrap());
 			sqlx::query("UPDATE actions SET reactions=coalesce(reactions, 0)+? WHERE tn_id=? AND action_id IN (?, ?)")
-				.bind(add_reactions).bind(tn_id.0).bind(&action.parent_id).bind(&action.root_id)
-				.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+				.bind(add_reactions)
+				.bind(tn_id.0)
+				.bind(&action.parent_id)
+				.bind(&action.root_id)
+				.execute(&mut *tx)
+				.await
+				.inspect_err(inspect)
+				.map_err(|_| Error::DbError)?;
 		}
 		tx.commit().await;
 		Ok(())
 	}
 
 	async fn create_inbound_action(&self, tn_id: TnId, action_id: &str, token: &str, ack_token: Option<&str>) -> ClResult<()> {
-		let res = sqlx::query("INSERT OR IGNORE INTO action_tokens (tn_id, action_id, token, status, ack)
-			VALUES (?, ?, ?, ?, ?)")
-			.bind(tn_id.0)
-			.bind(action_id)
-			.bind(token)
-			.bind("P")
-			.bind(ack_token)
-			.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let res = sqlx::query(
+			"INSERT OR IGNORE INTO action_tokens (tn_id, action_id, token, status, ack)
+			VALUES (?, ?, ?, ?, ?)",
+		)
+		.bind(tn_id.0)
+		.bind(action_id)
+		.bind(token)
+		.bind("P")
+		.bind(ack_token)
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 		Ok(())
 	}
 
@@ -755,7 +926,8 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		let res = sqlx::query("SELECT root_id FROM actions WHERE tn_id=? AND action_id=?")
 			.bind(tn_id.0)
 			.bind(action_id)
-			.fetch_one(&self.dbr).await;
+			.fetch_one(&self.dbr)
+			.await;
 
 		map_res(res, |row| Ok(row.try_get("root_id")?))
 	}
@@ -764,19 +936,18 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		let res = sqlx::query("SELECT subject, reactions, comments FROM actions WHERE tn_id=? AND action_id=?")
 			.bind(tn_id.0)
 			.bind(action_id)
-			.fetch_optional(&self.dbr).await
+			.fetch_optional(&self.dbr)
+			.await
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
 		match res {
-			Some(row) => {
-				Ok(Some(meta_adapter::ActionData {
-					subject: row.try_get("subject").ok(),
-					reactions: row.try_get("reactions").ok(),
-					comments: row.try_get("comments").ok(),
-				}))
-			},
-			None => Ok(None)
+			Some(row) => Ok(Some(meta_adapter::ActionData {
+				subject: row.try_get("subject").ok(),
+				reactions: row.try_get("reactions").ok(),
+				comments: row.try_get("comments").ok(),
+			})),
+			None => Ok(None),
 		}
 	}
 
@@ -808,20 +979,22 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				}))
 			},
 			Ok(None) => Ok(None),
-			Err(_) => Err(Error::DbError)
+			Err(_) => Err(Error::DbError),
 		}
 	}
 
 	async fn store_action_token(&self, tn_id: TnId, action_id: &str, token: &str) -> ClResult<()> {
-		sqlx::query("INSERT OR REPLACE INTO action_tokens (tn_id, action_id, token, status)
-			VALUES (?, ?, ?, 'L')")
-			.bind(tn_id.0)
-			.bind(action_id)
-			.bind(token)
-			.execute(&self.db)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+		sqlx::query(
+			"INSERT OR REPLACE INTO action_tokens (tn_id, action_id, token, status)
+			VALUES (?, ?, ?, 'L')",
+		)
+		.bind(tn_id.0)
+		.bind(action_id)
+		.bind(token)
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 
 		Ok(())
 	}
@@ -830,12 +1003,13 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		let res = sqlx::query("SELECT token FROM action_tokens WHERE tn_id=? AND action_id=?")
 			.bind(tn_id.0)
 			.bind(action_id)
-			.fetch_optional(&self.dbr).await;
+			.fetch_optional(&self.dbr)
+			.await;
 
 		match res {
 			Ok(Some(row)) => Ok(Some(row.try_get("token").map_err(|_| Error::DbError)?)),
 			Ok(None) => Ok(None),
-			Err(_) => Err(Error::DbError)
+			Err(_) => Err(Error::DbError),
 		}
 	}
 
@@ -844,25 +1018,33 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		let mut has_updates = false;
 
 		if let Some(subject) = &opts.subject {
-			if has_updates { query.push(", "); }
+			if has_updates {
+				query.push(", ");
+			}
 			query.push("subject=").push_bind(subject.as_ref());
 			has_updates = true;
 		}
 
 		if let Some(reactions) = opts.reactions {
-			if has_updates { query.push(", "); }
+			if has_updates {
+				query.push(", ");
+			}
 			query.push("reactions=").push_bind(reactions);
 			has_updates = true;
 		}
 
 		if let Some(comments) = opts.comments {
-			if has_updates { query.push(", "); }
+			if has_updates {
+				query.push(", ");
+			}
 			query.push("comments=").push_bind(comments);
 			has_updates = true;
 		}
 
 		if let Some(status) = &opts.status {
-			if has_updates { query.push(", "); }
+			if has_updates {
+				query.push(", ");
+			}
 			query.push("status=").push_bind(status.as_ref());
 			has_updates = true;
 		}
@@ -871,9 +1053,16 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			return Ok(());
 		}
 
-		query.push(" WHERE tn_id=").push_bind(tn_id.0).push(" AND action_id=").push_bind(action_id);
+		query
+			.push(" WHERE tn_id=")
+			.push_bind(tn_id.0)
+			.push(" AND action_id=")
+			.push_bind(action_id);
 
-		let res = query.build().execute(&self.db).await
+		let res = query
+			.build()
+			.execute(&self.db)
+			.await
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
@@ -884,19 +1073,21 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		Ok(())
 	}
 
-	async fn process_pending_inbound_actions(&self, callback: Box<dyn Fn(TnId, Box<str>, Box<str>) -> ClResult<bool> + Send>) -> ClResult<u32> {
+	async fn process_pending_inbound_actions(
+		&self,
+		callback: Box<dyn Fn(TnId, Box<str>, Box<str>) -> ClResult<bool> + Send>,
+	) -> ClResult<u32> {
 		let res = sqlx::query("SELECT tn_id, action_id, token FROM action_tokens WHERE status='P' LIMIT 100")
-			.fetch_all(&self.dbr).await
+			.fetch_all(&self.dbr)
+			.await
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
 		let mut count = 0u32;
 		for row in res {
-			if let (Ok(tn_id_val), Ok(action_id), Ok(token)) = (
-				row.try_get::<i64, _>("tn_id"),
-				row.try_get::<Box<str>, _>("action_id"),
-				row.try_get::<Box<str>, _>("token")
-			) {
+			if let (Ok(tn_id_val), Ok(action_id), Ok(token)) =
+				(row.try_get::<i64, _>("tn_id"), row.try_get::<Box<str>, _>("action_id"), row.try_get::<Box<str>, _>("token"))
+			{
 				let tn_id = TnId(tn_id_val as u32);
 				if callback(tn_id, action_id, token).unwrap_or(false) {
 					count += 1;
@@ -913,7 +1104,8 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			.bind(status_str.as_deref())
 			.bind(tn_id.0)
 			.bind(action_id)
-			.execute(&self.db).await
+			.execute(&self.db)
+			.await
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
@@ -924,24 +1116,37 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		Ok(())
 	}
 
-	async fn create_outbound_action(&self, tn_id: TnId, action_id: &str, token: &str, opts: &meta_adapter::CreateOutboundActionOptions) -> ClResult<()> {
-		sqlx::query("INSERT INTO action_outbox_queue (tn_id, action_id, type, token, recipient_tag, status, created_at)
-			VALUES (?, ?, ?, ?, ?, 'P', unixepoch())")
-			.bind(tn_id.0)
-			.bind(action_id)
-			.bind(opts.typ.as_ref())
-			.bind(token)
-			.bind(opts.recipient_tag.as_ref())
-			.execute(&self.db).await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+	async fn create_outbound_action(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		token: &str,
+		opts: &meta_adapter::CreateOutboundActionOptions,
+	) -> ClResult<()> {
+		sqlx::query(
+			"INSERT INTO action_outbox_queue (tn_id, action_id, type, token, recipient_tag, status, created_at)
+			VALUES (?, ?, ?, ?, ?, 'P', unixepoch())",
+		)
+		.bind(tn_id.0)
+		.bind(action_id)
+		.bind(opts.typ.as_ref())
+		.bind(token)
+		.bind(opts.recipient_tag.as_ref())
+		.execute(&self.db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 
 		Ok(())
 	}
 
-	async fn process_pending_outbound_actions(&self, callback: Box<dyn Fn(TnId, Box<str>, Box<str>, Box<str>, Box<str>) -> ClResult<bool> + Send>) -> ClResult<u32> {
+	async fn process_pending_outbound_actions(
+		&self,
+		callback: Box<dyn Fn(TnId, Box<str>, Box<str>, Box<str>, Box<str>) -> ClResult<bool> + Send>,
+	) -> ClResult<u32> {
 		let res = sqlx::query("SELECT tn_id, action_id, type, token, recipient_tag FROM action_outbox_queue WHERE status='P' LIMIT 100")
-			.fetch_all(&self.dbr).await
+			.fetch_all(&self.dbr)
+			.await
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
@@ -952,7 +1157,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				row.try_get::<Box<str>, _>("action_id"),
 				row.try_get::<Box<str>, _>("type"),
 				row.try_get::<Box<str>, _>("token"),
-				row.try_get::<Box<str>, _>("recipient_tag")
+				row.try_get::<Box<str>, _>("recipient_tag"),
 			) {
 				let tn_id = TnId(tn_id_val as u32);
 				if callback(tn_id, action_id, typ, token, recipient_tag).unwrap_or(false) {
@@ -968,12 +1173,12 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	//*****************
 	async fn get_file_id(&self, tn_id: TnId, f_id: u64) -> ClResult<Box<str>> {
 		let res = sqlx::query("SELECT file_id FROM files WHERE tn_id=? AND f_id=?")
-			.bind(tn_id.0).bind(f_id as i64)
-			.fetch_one(&self.dbr).await;
+			.bind(tn_id.0)
+			.bind(f_id as i64)
+			.fetch_one(&self.dbr)
+			.await;
 
-		map_res(res, |row| {
-			Ok(row.try_get("file_id")?)
-		})
+		map_res(res, |row| Ok(row.try_get("file_id")?))
 	}
 
 	async fn list_files(&self, tn_id: TnId, opts: meta_adapter::ListFileOptions) -> ClResult<Vec<meta_adapter::FileView>> {
@@ -982,7 +1187,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			        p.id_tag, p.name, p.type, p.profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
-			 WHERE f.tn_id="
+			 WHERE f.tn_id=",
 		);
 		query.push_bind(tn_id.0);
 
@@ -1015,8 +1220,12 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		query.push(" ORDER BY f.created_at DESC LIMIT ");
 		query.push_bind(opts._limit.unwrap_or(100) as i64);
 
-		let res = query.build().fetch_all(&self.dbr).await
-			.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let res = query
+			.build()
+			.fetch_all(&self.dbr)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		collect_res(res.iter().map(|row| {
 			let status = match row.try_get("status")? {
@@ -1031,22 +1240,14 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			let tags = tags_str.map(|s| parse_str_list(&s).to_vec());
 
 			// Build owner profile info if owner_tag exists
-			let owner = if let (Ok(id_tag), Ok(name)) = (
-				row.try_get::<Box<str>, _>("id_tag"),
-				row.try_get::<Box<str>, _>("name")
-			) {
+			let owner = if let (Ok(id_tag), Ok(name)) = (row.try_get::<Box<str>, _>("id_tag"), row.try_get::<Box<str>, _>("name")) {
 				let typ = match row.try_get::<&str, _>("type").ok() {
 					Some("P") => meta_adapter::ProfileType::Person,
 					Some("C") => meta_adapter::ProfileType::Community,
 					_ => meta_adapter::ProfileType::Person, // Default fallback
 				};
 
-				Some(meta_adapter::ProfileInfo {
-					id_tag,
-					name,
-					typ,
-					profile_pic: row.try_get("profile_pic").ok(),
-				})
+				Some(meta_adapter::ProfileInfo { id_tag, name, typ, profile_pic: row.try_get("profile_pic").ok() })
 			} else {
 				None
 			};
@@ -1064,27 +1265,49 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		}))
 	}
 
-	async fn list_file_variants(&self, tn_id: TnId, file_id: meta_adapter::FileId<&str>) -> ClResult<Vec<meta_adapter::FileVariant<Box<str>>>> {
+	async fn list_file_variants(
+		&self,
+		tn_id: TnId,
+		file_id: meta_adapter::FileId<&str>,
+	) -> ClResult<Vec<meta_adapter::FileVariant<Box<str>>>> {
 		let res = match file_id {
-			meta_adapter::FileId::FId(f_id) => sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size, available
-				FROM file_variants WHERE tn_id=? AND f_id=?")
-				.bind(tn_id.0).bind(f_id as i64)
-				.fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?,
+			meta_adapter::FileId::FId(f_id) => sqlx::query(
+				"SELECT variant_id, variant, res_x, res_y, format, size, available
+				FROM file_variants WHERE tn_id=? AND f_id=?",
+			)
+			.bind(tn_id.0)
+			.bind(f_id as i64)
+			.fetch_all(&self.dbr)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?,
 			meta_adapter::FileId::FileId(file_id) => {
 				if file_id.starts_with("@") {
-					sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size, available
-						FROM file_variants WHERE tn_id=? AND f_id=?")
-						.bind(tn_id.0).bind(&file_id[1..])
-						.fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?
+					sqlx::query(
+						"SELECT variant_id, variant, res_x, res_y, format, size, available
+						FROM file_variants WHERE tn_id=? AND f_id=?",
+					)
+					.bind(tn_id.0)
+					.bind(&file_id[1..])
+					.fetch_all(&self.dbr)
+					.await
+					.inspect_err(inspect)
+					.map_err(|_| Error::DbError)?
 				} else {
-					sqlx::query("SELECT fv.variant_id, fv.variant, fv.res_x, fv.res_y, fv.format, fv.size, fv.available
+					sqlx::query(
+						"SELECT fv.variant_id, fv.variant, fv.res_x, fv.res_y, fv.format, fv.size, fv.available
 						FROM files f
 						JOIN file_variants fv ON fv.tn_id=f.tn_id AND fv.f_id=f.f_id
-						WHERE f.tn_id=? AND f.file_id=?")
-						.bind(tn_id.0).bind(file_id)
-						.fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?
+						WHERE f.tn_id=? AND f.file_id=?",
+					)
+					.bind(tn_id.0)
+					.bind(file_id)
+					.fetch_all(&self.dbr)
+					.await
+					.inspect_err(inspect)
+					.map_err(|_| Error::DbError)?
 				}
-			}
+			},
 		};
 
 		collect_res(res.iter().map(|row| {
@@ -1103,10 +1326,14 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 	async fn read_file_variant(&self, tn_id: TnId, variant_id: &str) -> ClResult<meta_adapter::FileVariant<Box<str>>> {
 		info!("read_file_variant: {} {}", tn_id, &variant_id);
-		let res =sqlx::query("SELECT variant_id, variant, res_x, res_y, format, size, available
-				FROM file_variants WHERE tn_id=? AND variant_id=?")
-			.bind(tn_id.0).bind(variant_id)
-			.fetch_one(&self.dbr).await;
+		let res = sqlx::query(
+			"SELECT variant_id, variant, res_x, res_y, format, size, available
+				FROM file_variants WHERE tn_id=? AND variant_id=?",
+		)
+		.bind(tn_id.0)
+		.bind(variant_id)
+		.fetch_one(&self.dbr)
+		.await;
 
 		map_res(res, |row| {
 			let res_x = row.try_get("res_x")?;
@@ -1124,11 +1351,19 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 	async fn create_file(&self, tn_id: TnId, opts: meta_adapter::CreateFile) -> ClResult<meta_adapter::FileId<Box<str>>> {
 		info!("Exists?: {:?} {:?} {:?}", &opts.preset, tn_id, &opts.orig_variant_id);
-		let file_id_exists = sqlx::query("SELECT min(f.file_id) FROM file_variants fv
+		let file_id_exists = sqlx::query(
+			"SELECT min(f.file_id) FROM file_variants fv
 			JOIN files f ON f.tn_id=fv.tn_id AND f.f_id=fv.f_id AND f.preset=? AND f.file_id IS NOT NULL
-			WHERE fv.tn_id=? AND fv.variant_id=? AND fv.variant='orig'")
-			.bind(&opts.preset).bind(tn_id.0).bind(&opts.orig_variant_id)
-			.fetch_one(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?.get(0);
+			WHERE fv.tn_id=? AND fv.variant_id=? AND fv.variant='orig'",
+		)
+		.bind(&opts.preset)
+		.bind(tn_id.0)
+		.bind(&opts.orig_variant_id)
+		.fetch_one(&self.db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?
+		.get(0);
 
 		info!("Exists: {:?}", file_id_exists);
 		if let Some(file_id) = file_id_exists {
@@ -1149,8 +1384,12 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		info!("START create_file_variant: {} {} {}", tn_id, f_id, &opts.variant_id);
 		let mut tx = self.db.begin().await.map_err(|_| Error::DbError)?;
 		let res = sqlx::query("SELECT f_id FROM files WHERE tn_id=? AND f_id=? AND file_id IS NULL")
-			.bind(tn_id.0).bind(f_id as i64)
-			.fetch_one(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(tn_id.0)
+			.bind(f_id as i64)
+			.fetch_one(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		let res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
 			.bind(tn_id.0).bind(f_id as i64).bind(&opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64)
@@ -1162,8 +1401,13 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 	async fn update_file_id(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()> {
 		let res = sqlx::query("UPDATE files SET file_id=? WHERE tn_id=? AND f_id=? AND file_id IS NULL")
-			.bind(file_id).bind(tn_id.0).bind(f_id as i64)
-			.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(file_id)
+			.bind(tn_id.0)
+			.bind(f_id as i64)
+			.execute(&self.db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 		if res.rows_affected() == 0 {
 			return Err(Error::NotFound);
 		}
@@ -1174,13 +1418,18 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	// Task scheduler
 	//****************
 	async fn list_tasks(&self, opts: meta_adapter::ListTaskOptions) -> ClResult<Vec<meta_adapter::Task>> {
-		let res = sqlx::query("SELECT t.task_id, t.tn_id, t.kind, t.status, t.created_at, t.next_at, t.retry, t.cron,
+		let res = sqlx::query(
+			"SELECT t.task_id, t.tn_id, t.kind, t.status, t.created_at, t.next_at, t.retry, t.cron,
 			t.input, t.output, string_agg(td.dep_id, ',') as deps
 			FROM tasks t
 			LEFT JOIN task_dependencies td ON td.task_id=t.task_id
 			WHERE status IN ('P')
-			GROUP BY t.task_id")
-			.fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			GROUP BY t.task_id",
+		)
+		.fetch_all(&self.dbr)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 
 		collect_res(res.iter().map(|row| {
 			let deps: Option<Box<str>> = row.try_get("deps")?;
@@ -1202,31 +1451,49 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	}
 
 	async fn list_task_ids(&self, kind: &str, keys: &[Box<str>]) -> ClResult<Vec<u64>> {
-		let mut query = sqlx::QueryBuilder::new("SELECT t.task_id FROM tasks t
-			WHERE status IN ('P') AND kind=");
+		let mut query = sqlx::QueryBuilder::new(
+			"SELECT t.task_id FROM tasks t
+			WHERE status IN ('P') AND kind=",
+		);
 		query.push_bind(&kind).push(" AND key IN ");
 		query = push_in(query, keys);
 
-		let res = query.build().fetch_all(&self.dbr).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let res = query
+			.build()
+			.fetch_all(&self.dbr)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
-		collect_res(res.iter().map(|row| {
-			Ok(row.try_get("task_id")?)
-		}))
+		collect_res(res.iter().map(|row| Ok(row.try_get("task_id")?)))
 	}
 
 	async fn create_task(&self, kind: &'static str, key: Option<&str>, input: &str, deps: &[u64]) -> ClResult<u64> {
 		let mut tx = self.db.begin().await.map_err(|_| Error::DbError)?;
 
-		let res = sqlx::query("INSERT INTO tasks (tn_id, kind, key, status, input)
-			VALUES (?, ?, ?, ?, ?) RETURNING task_id")
-			.bind(0).bind(&kind).bind(&key).bind("P").bind(&input)
-			.fetch_one(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		let res = sqlx::query(
+			"INSERT INTO tasks (tn_id, kind, key, status, input)
+			VALUES (?, ?, ?, ?, ?) RETURNING task_id",
+		)
+		.bind(0)
+		.bind(&kind)
+		.bind(&key)
+		.bind("P")
+		.bind(&input)
+		.fetch_one(&mut *tx)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 		let task_id = res.get(0);
 
 		for dep in deps {
 			sqlx::query("INSERT INTO task_dependencies (task_id, dep_id) VALUES (?, ?)")
-				.bind(task_id as i64).bind(*dep as i64)
-				.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+				.bind(task_id as i64)
+				.bind(*dep as i64)
+				.execute(&mut *tx)
+				.await
+				.inspect_err(inspect)
+				.map_err(|_| Error::DbError)?;
 		}
 		tx.commit().await;
 
@@ -1235,11 +1502,18 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 	async fn update_task_finished(&self, task_id: u64, output: &str) -> ClResult<()> {
 		sqlx::query("UPDATE tasks SET status='F', output=?, next_at=NULL WHERE task_id=? AND status='P'")
-			.bind(output).bind(task_id as i64)
-			.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(output)
+			.bind(task_id as i64)
+			.execute(&self.db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 		sqlx::query("DELETE FROM task_dependencies WHERE dep_id=?")
 			.bind(task_id as i64)
-			.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.execute(&self.db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		Ok(())
 	}
@@ -1248,14 +1522,23 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		match next_at {
 			Some(next_at) => {
 				sqlx::query("UPDATE tasks SET error=?, next_at=? WHERE task_id=? AND status='P'")
-					.bind(output).bind(next_at.0).bind(task_id as i64)
-					.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+					.bind(output)
+					.bind(next_at.0)
+					.bind(task_id as i64)
+					.execute(&self.db)
+					.await
+					.inspect_err(inspect)
+					.map_err(|_| Error::DbError)?;
 			},
 			None => {
 				sqlx::query("UPDATE tasks SET error=?, status='E', next_at=NULL WHERE task_id=? AND status='P'")
-					.bind(output).bind(task_id as i64)
-					.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
-			}
+					.bind(output)
+					.bind(task_id as i64)
+					.execute(&self.db)
+					.await
+					.inspect_err(inspect)
+					.map_err(|_| Error::DbError)?;
+			},
 		}
 
 		Ok(())
@@ -1263,14 +1546,26 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 	async fn update_task_cron(&self, task_id: u64, cron: Option<&str>) -> ClResult<()> {
 		sqlx::query("UPDATE tasks SET cron=? WHERE task_id=?")
-			.bind(cron).bind(task_id as i64)
-			.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			.bind(cron)
+			.bind(task_id as i64)
+			.execute(&self.db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		Ok(())
 	}
 
 	// Phase 1: Profile Management
-	async fn update_profile_fields(&self, tn_id: TnId, id_tag: &str, name: Option<&str>, description: Option<&str>, location: Option<&str>, website: Option<&str>) -> ClResult<()> {
+	async fn update_profile_fields(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		name: Option<&str>,
+		description: Option<&str>,
+		location: Option<&str>,
+		website: Option<&str>,
+	) -> ClResult<()> {
 		// Build UPDATE query based on which fields are provided
 		let mut query = String::from("UPDATE profiles SET ");
 		let mut field_count = 0;
@@ -1320,7 +1615,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		}
 
 		if field_count == 0 {
-			return Ok(());  // No fields to update
+			return Ok(()); // No fields to update
 		}
 
 		query.push_str(" WHERE tn_id = ? AND id_tag = ?");
@@ -1349,7 +1644,11 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 		sql_query = sql_query.bind(tn_id.0).bind(id_tag);
 
-		sql_query.execute(&self.db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		sql_query
+			.execute(&self.db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 
 		Ok(())
 	}
@@ -1385,7 +1684,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			"SELECT id_tag, name, type, profile_pic, cover, description, location, website, created_at
 			 FROM profiles WHERE tn_id = ?
 			 ORDER BY created_at DESC
-			 LIMIT ? OFFSET ?"
+			 LIMIT ? OFFSET ?",
 		)
 		.bind(tn_id.0)
 		.bind(limit as i32)
@@ -1395,22 +1694,25 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
-		let profiles = rows.iter().map(|row| {
-			let profile_type: String = row.get("type");
-			let created_at: i64 = row.get("created_at");
+		let profiles = rows
+			.iter()
+			.map(|row| {
+				let profile_type: String = row.get("type");
+				let created_at: i64 = row.get("created_at");
 
-			meta_adapter::ProfileData {
-				id_tag: row.get("id_tag"),
-				name: row.get("name"),
-				profile_type: profile_type.into(),
-				profile_pic: row.get("profile_pic"),
-				cover: row.get("cover"),
-				description: row.get("description"),
-				location: row.get("location"),
-				website: row.get("website"),
-				created_at: created_at as u64,
-			}
-		}).collect();
+				meta_adapter::ProfileData {
+					id_tag: row.get("id_tag"),
+					name: row.get("name"),
+					profile_type: profile_type.into(),
+					profile_pic: row.get("profile_pic"),
+					cover: row.get("cover"),
+					description: row.get("description"),
+					location: row.get("location"),
+					website: row.get("website"),
+					created_at: created_at as u64,
+				}
+			})
+			.collect();
 
 		Ok(profiles)
 	}
@@ -1418,7 +1720,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	async fn get_profile_info(&self, tn_id: TnId, id_tag: &str) -> ClResult<meta_adapter::ProfileData> {
 		let row = sqlx::query(
 			"SELECT id_tag, name, type, profile_pic, cover, description, location, website, created_at
-			 FROM profiles WHERE tn_id = ? AND id_tag = ?"
+			 FROM profiles WHERE tn_id = ? AND id_tag = ?",
 		)
 		.bind(tn_id.0)
 		.bind(id_tag)
@@ -1453,7 +1755,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			"SELECT DISTINCT id_tag, name, type, profile_pic, cover, description, location, website, created_at
 			 FROM profiles
 			 ORDER BY created_at DESC
-			 LIMIT ? OFFSET ?"
+			 LIMIT ? OFFSET ?",
 		)
 		.bind(limit as i32)
 		.bind(offset as i32)
@@ -1462,22 +1764,25 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
-		let profiles = rows.iter().map(|row| {
-			let profile_type: String = row.get("type");
-			let created_at: i64 = row.get("created_at");
+		let profiles = rows
+			.iter()
+			.map(|row| {
+				let profile_type: String = row.get("type");
+				let created_at: i64 = row.get("created_at");
 
-			meta_adapter::ProfileData {
-				id_tag: row.get("id_tag"),
-				name: row.get("name"),
-				profile_type: profile_type.into(),
-				profile_pic: row.get("profile_pic"),
-				cover: row.get("cover"),
-				description: row.get("description"),
-				location: row.get("location"),
-				website: row.get("website"),
-				created_at: created_at as u64,
-			}
-		}).collect();
+				meta_adapter::ProfileData {
+					id_tag: row.get("id_tag"),
+					name: row.get("name"),
+					profile_type: profile_type.into(),
+					profile_pic: row.get("profile_pic"),
+					cover: row.get("cover"),
+					description: row.get("description"),
+					location: row.get("location"),
+					website: row.get("website"),
+					created_at: created_at as u64,
+				}
+			})
+			.collect();
 
 		Ok(profiles)
 	}
@@ -1491,7 +1796,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			 FROM profiles
 			 WHERE LOWER(id_tag) LIKE LOWER(?) OR LOWER(name) LIKE LOWER(?)
 			 ORDER BY created_at DESC
-			 LIMIT ? OFFSET ?"
+			 LIMIT ? OFFSET ?",
 		)
 		.bind(&search_pattern)
 		.bind(&search_pattern)
@@ -1502,22 +1807,25 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
-		let profiles = rows.iter().map(|row| {
-			let profile_type: String = row.get("type");
-			let created_at: i64 = row.get("created_at");
+		let profiles = rows
+			.iter()
+			.map(|row| {
+				let profile_type: String = row.get("type");
+				let created_at: i64 = row.get("created_at");
 
-			meta_adapter::ProfileData {
-				id_tag: row.get("id_tag"),
-				name: row.get("name"),
-				profile_type: profile_type.into(),
-				profile_pic: row.get("profile_pic"),
-				cover: row.get("cover"),
-				description: row.get("description"),
-				location: row.get("location"),
-				website: row.get("website"),
-				created_at: created_at as u64,
-			}
-		}).collect();
+				meta_adapter::ProfileData {
+					id_tag: row.get("id_tag"),
+					name: row.get("name"),
+					profile_type: profile_type.into(),
+					profile_pic: row.get("profile_pic"),
+					cover: row.get("cover"),
+					description: row.get("description"),
+					location: row.get("location"),
+					website: row.get("website"),
+					created_at: created_at as u64,
+				}
+			})
+			.collect();
 
 		Ok(profiles)
 	}
@@ -1564,7 +1872,14 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		Ok(())
 	}
 
-	async fn add_reaction(&self, tn_id: TnId, action_id: &str, reactor_id_tag: &str, reaction_type: &str, content: Option<&str>) -> ClResult<()> {
+	async fn add_reaction(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		reactor_id_tag: &str,
+		reaction_type: &str,
+		content: Option<&str>,
+	) -> ClResult<()> {
 		// TODO: Implement reaction storage (probably in JSON column)
 		let _ = (tn_id, action_id, reactor_id_tag, reaction_type, content);
 		Ok(())
@@ -1608,7 +1923,11 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	// Settings Management
 	//*********************
 
-	async fn list_settings(&self, tn_id: TnId, prefix: Option<&[String]>) -> ClResult<std::collections::HashMap<String, serde_json::Value>> {
+	async fn list_settings(
+		&self,
+		tn_id: TnId,
+		prefix: Option<&[String]>,
+	) -> ClResult<std::collections::HashMap<String, serde_json::Value>> {
 		let rows = if let Some(prefixes) = prefix {
 			// Filter by prefixes: only include settings that start with one of the prefixes
 			let mut conditions = Vec::new();
@@ -1695,7 +2014,8 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	//********************************
 
 	async fn list_refs(&self, tn_id: TnId, opts: &meta_adapter::ListRefsOptions) -> ClResult<Vec<meta_adapter::RefData>> {
-		let mut query = sqlx::QueryBuilder::new("SELECT ref_id, type, description, created_at, expires_at, count FROM refs WHERE tn_id = ?");
+		let mut query =
+			sqlx::QueryBuilder::new("SELECT ref_id, type, description, created_at, expires_at, count FROM refs WHERE tn_id = ?");
 		query.push_bind(tn_id.0);
 
 		if let Some(ref typ) = opts.typ {
@@ -1710,16 +2030,16 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 					query.push(" AND (expires_at IS NULL OR expires_at > ");
 					query.push_bind(now.0);
 					query.push(")");
-				}
+				},
 				"used" => {
 					query.push(" AND count > 0");
-				}
+				},
 				"expired" => {
 					query.push(" AND expires_at IS NOT NULL AND expires_at <= ");
 					query.push_bind(now.0);
 					query.push(")");
-				}
-				_ => {} // 'all' - no filter
+				},
+				_ => {}, // 'all' - no filter
 			}
 		}
 
@@ -1730,20 +2050,23 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
-		Ok(rows.iter().map(|row| {
-			let created_at: i64 = row.get("created_at");
-			let expires_at: Option<i64> = row.get("expires_at");
-			let count: Option<i32> = row.get("count");
+		Ok(rows
+			.iter()
+			.map(|row| {
+				let created_at: i64 = row.get("created_at");
+				let expires_at: Option<i64> = row.get("expires_at");
+				let count: Option<i32> = row.get("count");
 
-			meta_adapter::RefData {
-				ref_id: row.get("ref_id"),
-				r#type: row.get("type"),
-				description: row.get("description"),
-				created_at: cloudillo::types::Timestamp(created_at),
-				expires_at: expires_at.map(cloudillo::types::Timestamp),
-				count: count.unwrap_or(0) as u32,
-			}
-		}).collect())
+				meta_adapter::RefData {
+					ref_id: row.get("ref_id"),
+					r#type: row.get("type"),
+					description: row.get("description"),
+					created_at: cloudillo::types::Timestamp(created_at),
+					expires_at: expires_at.map(cloudillo::types::Timestamp),
+					count: count.unwrap_or(0) as u32,
+				}
+			})
+			.collect())
 	}
 
 	async fn get_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<Option<(Box<str>, Box<str>)>> {
@@ -1765,9 +2088,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	async fn create_ref(&self, tn_id: TnId, ref_id: &str, opts: &meta_adapter::CreateRefOptions) -> ClResult<meta_adapter::RefData> {
 		let now = cloudillo::types::Timestamp::now();
 
-		sqlx::query(
-			"INSERT INTO refs (tn_id, ref_id, type, description, created_at, expires_at, count) VALUES (?, ?, ?, ?, ?, ?, ?)"
-		)
+		sqlx::query("INSERT INTO refs (tn_id, ref_id, type, description, created_at, expires_at, count) VALUES (?, ?, ?, ?, ?, ?, ?)")
 			.bind(tn_id.0)
 			.bind(ref_id)
 			.bind(opts.typ.as_ref())
@@ -1823,10 +2144,13 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				.map_err(|_| Error::DbError)?
 		};
 
-		Ok(rows.iter().map(|row| {
-			let tag: String = row.get("tag");
-			tag
-		}).collect())
+		Ok(rows
+			.iter()
+			.map(|row| {
+				let tag: String = row.get("tag");
+				tag
+			})
+			.collect())
 	}
 
 	async fn add_tag(&self, tn_id: TnId, file_id: &str, tag: &str) -> ClResult<Vec<String>> {
@@ -1951,11 +2275,15 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	let mut tx = db.begin().await?;
 
-	sqlx::query("CREATE TABLE IF NOT EXISTS globals (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS globals (
 			key text NOT NULL,
 			value text,
 			PRIMARY KEY(key)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 
 	/***********/
 	/* Init DB */
@@ -1963,7 +2291,8 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 
 	// Tenants
 	//*********
-	sqlx::query("CREATE TABLE IF NOT EXISTS tenants (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS tenants (
 		tn_id integer NOT NULL,
 		id_tag text NOT NULL,
 		type char(1),
@@ -1973,35 +2302,52 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		x json,
 		created_at datetime DEFAULT (unixepoch()),
 		PRIMARY KEY(tn_id)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 
-	sqlx::query("CREATE TABLE IF NOT EXISTS tenant_data (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS tenant_data (
 		tn_id integer NOT NULL,
 		name text NOT NULL,
 		value text,
 		PRIMARY KEY(tn_id, name)
-	)").execute(&mut *tx).await?;
-		
-	sqlx::query("CREATE TABLE IF NOT EXISTS settings (
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS settings (
 		tn_id integer NOT NULL,
 		name text NOT NULL,
 		value text,
 		PRIMARY KEY(tn_id, name)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 
-	sqlx::query("CREATE TABLE IF NOT EXISTS subscriptions (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS subscriptions (
 		tn_id integer NOT NULL,
 		subs_id integer NOT NULL,
 		created_at datetime DEFAULT (unixepoch()),
 		subscription json,
 		PRIMARY KEY(subs_id)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 	sqlx::query("CREATE INDEX IF NOT EXISTS idx_subscriptions_tnid ON subscriptions(tn_id)")
-		.execute(&mut *tx).await?;
+		.execute(&mut *tx)
+		.await?;
 
 	// Profiles
 	//**********
-	sqlx::query("CREATE TABLE IF NOT EXISTS profiles (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS profiles (
 		tn_id integer NOT NULL,
 		id_tag text,
 		name text NOT NULL,
@@ -2016,22 +2362,31 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		synced_at datetime,
 		etag text,
 		PRIMARY KEY(tn_id, id_tag)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_tnid_idtag ON profiles(tn_id, id_tag)")
-		.execute(&mut *tx).await?;
+		.execute(&mut *tx)
+		.await?;
 
 	// Metadata
 	//**********
-	sqlx::query("CREATE TABLE IF NOT EXISTS tags (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS tags (
 		tn_id integer NOT NULL,
 		tag text,
 		perms json,
 		PRIMARY KEY(tn_id, tag)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 
 	// Files
 	//*******
-	sqlx::query("CREATE TABLE IF NOT EXISTS files (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS files (
 		f_id integer NOT NULL,
 		tn_id integer NOT NULL,
 		file_id text,
@@ -2047,11 +2402,16 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		tags json,
 		x json,
 		PRIMARY KEY(f_id)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_fileid ON files(file_id, tn_id)")
-		.execute(&mut *tx).await?;
+		.execute(&mut *tx)
+		.await?;
 
-	sqlx::query("CREATE TABLE IF NOT EXISTS file_variants (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS file_variants (
 		tn_id integer NOT NULL,
 		f_id integer NOT NULL,
 		variant_id text,
@@ -2063,13 +2423,18 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		available boolean,
 		global boolean,				-- true: stored in global cache
 		PRIMARY KEY(f_id, variant_id, tn_id)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_file_variants_fileid ON file_variants(f_id, variant, tn_id)")
-		.execute(&mut *tx).await?;
+		.execute(&mut *tx)
+		.await?;
 
 	// Refs
 	//******
-	sqlx::query("CREATE TABLE IF NOT EXISTS refs (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS refs (
 		tn_id integer NOT NULL,
 		ref_id text NOT NULL,
 		type text NOT NULL,
@@ -2078,20 +2443,28 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		expires_at datetime,
 		count integer,
 		PRIMARY KEY(tn_id, ref_id)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 
 	// Event store
 	//*************
-	sqlx::query("CREATE TABLE IF NOT EXISTS key_cache (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS key_cache (
 		id_tag text,
 		key_id text,
 		tn_id integer,
 		expire integer,
 		public_key text,
 		PRIMARY KEY(id_tag, key_id)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 
-	sqlx::query("CREATE TABLE IF NOT EXISTS actions (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS actions (
 		tn_id integer NOT NULL,
 		action_id text NOT NULL,
 		key text,
@@ -2111,11 +2484,16 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		comments integer,
 		comments_read integer,
 		PRIMARY KEY(tn_id, action_id)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 	sqlx::query("CREATE INDEX IF NOT EXISTS idx_actions_key ON actions(key, tn_id) WHERE key NOT NULL")
-		.execute(&mut *tx).await?;
+		.execute(&mut *tx)
+		.await?;
 
-	sqlx::query("CREATE TABLE IF NOT EXISTS action_tokens (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS action_tokens (
 		tn_id integer NOT NULL,
 		action_id text NOT NULL,
 		token text NOT NULL,
@@ -2123,19 +2501,27 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		ack text,
 		next integer,
 		PRIMARY KEY(action_id, tn_id)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 
-	sqlx::query("CREATE TABLE IF NOT EXISTS action_outbox_queue (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS action_outbox_queue (
 		tn_id integer NOT NULL,
 		action_id text NOT NULL,
 		id_tag text NOT NULL,
 		next datetime,
 		PRIMARY KEY(action_id, tn_id, id_tag)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 
 	// Task scheduler
 	//****************
-	sqlx::query("CREATE TABLE IF NOT EXISTS tasks (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS tasks (
 		task_id integer NOT NULL,
 		tn_id integer NOT NULL,
 		kind text NOT NULL,
@@ -2149,45 +2535,64 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		output text,
 		error text,
 		PRIMARY KEY(task_id)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_task_kind_key ON tasks(kind, key)")
-		.execute(&mut *tx).await?;
+		.execute(&mut *tx)
+		.await?;
 
-	sqlx::query("CREATE TABLE IF NOT EXISTS task_dependencies (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS task_dependencies (
 		task_id integer NOT NULL,
 		dep_id integer NOT NULL,
 		PRIMARY KEY(task_id, dep_id)
-	) WITHOUT ROWID").execute(&mut *tx).await?;
+	) WITHOUT ROWID",
+	)
+	.execute(&mut *tx)
+	.await?;
 	sqlx::query("CREATE INDEX IF NOT EXISTS idx_task_dependencies_dep_id ON task_dependencies(dep_id)")
-		.execute(&mut *tx).await?;
+		.execute(&mut *tx)
+		.await?;
 
 	// Phase 1 Migration: Extend profiles table with additional metadata
 	let _ = sqlx::query("ALTER TABLE profiles ADD COLUMN description TEXT")
-		.execute(&mut *tx).await;
+		.execute(&mut *tx)
+		.await;
 	let _ = sqlx::query("ALTER TABLE profiles ADD COLUMN location TEXT")
-		.execute(&mut *tx).await;
+		.execute(&mut *tx)
+		.await;
 	let _ = sqlx::query("ALTER TABLE profiles ADD COLUMN website TEXT")
-		.execute(&mut *tx).await;
+		.execute(&mut *tx)
+		.await;
 	let _ = sqlx::query("ALTER TABLE profiles ADD COLUMN cover TEXT")
-		.execute(&mut *tx).await;
+		.execute(&mut *tx)
+		.await;
 
 	// Phase 2 Migration: Action metadata enhancements
 	let _ = sqlx::query("ALTER TABLE actions ADD COLUMN updated_at datetime DEFAULT NULL")
-		.execute(&mut *tx).await;
+		.execute(&mut *tx)
+		.await;
 	let _ = sqlx::query("ALTER TABLE actions ADD COLUMN federation_status TEXT DEFAULT 'draft'")
-		.execute(&mut *tx).await;
+		.execute(&mut *tx)
+		.await;
 
 	// Phase 2 Migration: File lifecycle management
 	let _ = sqlx::query("ALTER TABLE files ADD COLUMN deleted_at datetime DEFAULT NULL")
-		.execute(&mut *tx).await;
+		.execute(&mut *tx)
+		.await;
 	let _ = sqlx::query("ALTER TABLE files ADD COLUMN ref_count INTEGER DEFAULT 1")
-		.execute(&mut *tx).await;
+		.execute(&mut *tx)
+		.await;
 	let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(deleted_at) WHERE deleted_at IS NOT NULL")
-		.execute(&mut *tx).await;
+		.execute(&mut *tx)
+		.await;
 
 	// Update file_tp to have a default value if it's NULL
 	let _ = sqlx::query("UPDATE files SET file_tp = 'BLOB' WHERE file_tp IS NULL")
-		.execute(&mut *tx).await;
+		.execute(&mut *tx)
+		.await;
 
 	tx.commit().await?;
 

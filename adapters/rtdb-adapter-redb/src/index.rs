@@ -16,11 +16,7 @@ pub async fn create_index_impl(
 ) -> ClResult<()> {
 	use crate::error::from_redb_error;
 
-	let meta_key = if per_tenant_files {
-		format!("{}/_meta/indexes", path)
-	} else {
-		format!("{}/{}/_meta/indexes", tn_id.0, path)
-	};
+	let meta_key = if per_tenant_files { format!("{}/_meta/indexes", path) } else { format!("{}/{}/_meta/indexes", tn_id.0, path) };
 
 	let tx = instance.db.begin_write().map_err(from_redb_error)?;
 
@@ -31,7 +27,7 @@ pub async fn create_index_impl(
 			Ok(Some(v)) => {
 				let json_str = v.value().to_string();
 				serde_json::from_str(&json_str)?
-			}
+			},
 			Ok(None) => Vec::new(),
 			Err(e) => return Err(from_redb_error(e).into()),
 		};
@@ -55,18 +51,10 @@ pub async fn create_index_impl(
 		let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 		let mut index_table = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
 
-		let _prefix = if per_tenant_files {
-			format!("{}/", db_id)
-		} else {
-			format!("{}/{}/", tn_id.0, db_id)
-		};
+		let _prefix = if per_tenant_files { format!("{}/", db_id) } else { format!("{}/{}/", tn_id.0, db_id) };
 
 		// First pass: scan documents in this collection
-		let doc_prefix = if per_tenant_files {
-			format!("{}/{}/", db_id, path)
-		} else {
-			format!("{}/{}/{}/", tn_id.0, db_id, path)
-		};
+		let doc_prefix = if per_tenant_files { format!("{}/{}/", db_id, path) } else { format!("{}/{}/{}/", tn_id.0, db_id, path) };
 
 		let range = doc_table.range(doc_prefix.as_str()..).map_err(from_redb_error)?;
 
@@ -106,10 +94,7 @@ pub async fn create_index_impl(
 	// Update in-memory cache
 	{
 		let mut indexed_fields = instance.indexed_fields.write().await;
-		indexed_fields
-			.entry(path.into())
-			.or_insert_with(Vec::new)
-			.push(field.into());
+		indexed_fields.entry(path.into()).or_insert_with(Vec::new).push(field.into());
 	}
 
 	Ok(())

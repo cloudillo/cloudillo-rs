@@ -1,25 +1,30 @@
 //! API routes
 
-use axum::{Router, middleware, http::header, routing::{any, get, post, put, patch, delete}};
+use axum::{
+	http::header,
+	middleware,
+	routing::{any, delete, get, patch, post, put},
+	Router,
+};
 use tower_http::{
+	compression::CompressionLayer,
 	services::{ServeDir, ServeFile},
 	set_header::SetResponseHeaderLayer,
-	compression::CompressionLayer,
 };
 
-use crate::prelude::*;
-use crate::core::acme;
-use crate::core::middleware::{require_auth, optional_auth, request_id_middleware};
-use crate::core::websocket;
 use crate::action;
-use crate::auth;
-use crate::file;
-use crate::profile;
-use crate::settings;
-use crate::r#ref;
 use crate::action::perm::check_perm_action;
+use crate::auth;
+use crate::core::acme;
+use crate::core::middleware::{optional_auth, request_id_middleware, require_auth};
+use crate::core::websocket;
+use crate::file;
 use crate::file::perm::check_perm_file;
+use crate::prelude::*;
+use crate::profile;
 use crate::profile::perm::check_perm_profile;
+use crate::r#ref;
+use crate::settings;
 
 //fn init_api_service(state: App) -> Router {
 fn init_api_service(app: App) -> Router {

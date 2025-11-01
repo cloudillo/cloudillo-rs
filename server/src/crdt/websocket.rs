@@ -15,13 +15,13 @@
 
 use crate::prelude::*;
 use axum::extract::ws::{Message, WebSocket};
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::collections::HashMap;
-use tokio::sync::RwLock;
-use futures::stream::StreamExt;
 use futures::sink::SinkExt;
 use futures::stream::SplitSink;
+use futures::stream::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Message types for the CRDT protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,13 +84,7 @@ lazy_static::lazy_static! {
 }
 
 /// Handle a CRDT connection
-pub async fn handle_crdt_connection(
-	ws: WebSocket,
-	user_id: String,
-	doc_id: String,
-	app: crate::core::app::App,
-	tn_id: crate::types::TnId,
-) {
+pub async fn handle_crdt_connection(ws: WebSocket, user_id: String, doc_id: String, app: crate::core::app::App, tn_id: crate::types::TnId) {
 	info!("CRDT connection: {} / {} (tn_id={})", user_id, doc_id, tn_id.0);
 
 	// Get or create broadcast channel for this document
@@ -140,18 +134,18 @@ pub async fn handle_crdt_connection(
 						Ok(Some((msg_type, payload))) => {
 							// Handle message
 							handle_crdt_message(&conn_clone, msg_type, &payload, &ws_tx_clone, &app_clone, tn_id).await;
-						}
+						},
 						Ok(None) => continue, // Skip non-binary messages
 						Err(e) => {
 							warn!("Failed to parse CRDT message: {}", e);
 							continue;
-						}
+						},
 					}
-				}
+				},
 				Err(e) => {
 					warn!("CRDT connection error: {}", e);
 					break;
-				}
+				},
 			}
 		}
 	});
@@ -181,15 +175,15 @@ pub async fn handle_crdt_connection(
 							return;
 						}
 					}
-				}
+				},
 				Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
 					// Lost some messages, continue anyway
 					continue;
-				}
+				},
 				Err(tokio::sync::broadcast::error::RecvError::Closed) => {
 					// Broadcast channel closed
 					return;
-				}
+				},
 			}
 		}
 	});
@@ -224,17 +218,16 @@ fn parse_crdt_message(msg: &Message) -> Result<Option<(CrdtMessageType, Vec<u8>)
 			if data.is_empty() {
 				return Err("Empty binary message".to_string());
 			}
-			let msg_type = CrdtMessageType::from_u8(data[0])
-				.ok_or_else(|| format!("Invalid message type: {}", data[0]))?;
+			let msg_type = CrdtMessageType::from_u8(data[0]).ok_or_else(|| format!("Invalid message type: {}", data[0]))?;
 			let payload = data[1..].to_vec();
 			Ok(Some((msg_type, payload)))
-		}
+		},
 		Message::Close(_) => Ok(None),
 		Message::Ping(_) | Message::Pong(_) => Ok(None),
 		_ => {
 			// Text messages not supported in CRDT protocol
 			Err("CRDT protocol expects binary messages".to_string())
-		}
+		},
 	}
 }
 
@@ -256,10 +249,10 @@ async fn handle_crdt_message(
 			match app.crdt_adapter.store_update(tn_id, &conn.doc_id, update.clone()).await {
 				Ok(_) => {
 					debug!("CRDT update stored for doc {} from user {}", conn.doc_id, conn.user_id);
-				}
+				},
 				Err(e) => {
 					warn!("Failed to store CRDT update for doc {}: {}", conn.doc_id, e);
-				}
+				},
 			}
 
 			// Send the update back to the client to confirm receipt (echo)
@@ -272,12 +265,12 @@ async fn handle_crdt_message(
 			match tx.send(ws_msg).await {
 				Ok(_) => {
 					debug!("CRDT SYNC echo sent back to user {} for doc {} ({} bytes)", conn.user_id, conn.doc_id, payload.len());
-				}
+				},
 				Err(e) => {
 					warn!("Failed to send CRDT SYNC echo to user {}: {}", conn.user_id, e);
-				}
+				},
 			}
-		}
+		},
 
 		CrdtMessageType::Awareness => {
 			// Awareness payload format: binary data that may be Yjs awareness format
@@ -298,7 +291,7 @@ async fn handle_crdt_message(
 				// The actual Yjs library on the client handles this format
 				debug!("CRDT AWARENESS from {} is binary Yjs format ({} bytes)", conn.user_id, payload.len());
 			}
-		}
+		},
 	}
 }
 
