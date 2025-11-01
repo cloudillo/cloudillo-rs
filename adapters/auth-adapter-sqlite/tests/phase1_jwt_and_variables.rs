@@ -7,10 +7,10 @@
 
 #[cfg(test)]
 mod tests {
-	use cloudillo::prelude::*;
 	use cloudillo::auth_adapter::AuthAdapter;
-	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use cloudillo::core::worker::WorkerPool;
+	use cloudillo::prelude::*;
+	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use std::sync::Arc;
 	use tempfile::TempDir;
 
@@ -62,14 +62,13 @@ mod tests {
 		let var_value = "test_value_12345";
 
 		// Update a variable
-		adapter.update_var(tn_id, var_name, var_value)
+		adapter
+			.update_var(tn_id, var_name, var_value)
 			.await
 			.expect("Failed to update variable");
 
 		// Read it back
-		let retrieved = adapter.read_var(tn_id, var_name)
-			.await
-			.expect("Failed to read variable");
+		let retrieved = adapter.read_var(tn_id, var_name).await.expect("Failed to read variable");
 
 		assert_eq!(retrieved.as_ref(), var_value);
 		println!("✅ Variables can be stored and retrieved");
@@ -83,19 +82,19 @@ mod tests {
 		let var_name = "config";
 
 		// Set initial value
-		adapter.update_var(tn_id, var_name, "value1")
+		adapter
+			.update_var(tn_id, var_name, "value1")
 			.await
 			.expect("Failed to set initial value");
 
 		// Overwrite with new value
-		adapter.update_var(tn_id, var_name, "value2")
+		adapter
+			.update_var(tn_id, var_name, "value2")
 			.await
 			.expect("Failed to update value");
 
 		// Verify new value
-		let retrieved = adapter.read_var(tn_id, var_name)
-			.await
-			.expect("Failed to read variable");
+		let retrieved = adapter.read_var(tn_id, var_name).await.expect("Failed to read variable");
 
 		assert_eq!(retrieved.as_ref(), "value2");
 		println!("✅ Variables can be updated and overwritten");
@@ -110,20 +109,24 @@ mod tests {
 		let var_name = "config";
 
 		// Set different values for different tenants
-		adapter.update_var(tn_id_1, var_name, "value_for_tenant_1")
+		adapter
+			.update_var(tn_id_1, var_name, "value_for_tenant_1")
 			.await
 			.expect("Failed to set tenant 1 variable");
 
-		adapter.update_var(tn_id_2, var_name, "value_for_tenant_2")
+		adapter
+			.update_var(tn_id_2, var_name, "value_for_tenant_2")
 			.await
 			.expect("Failed to set tenant 2 variable");
 
 		// Verify isolation
-		let val1 = adapter.read_var(tn_id_1, var_name)
+		let val1 = adapter
+			.read_var(tn_id_1, var_name)
 			.await
 			.expect("Failed to read tenant 1 variable");
 
-		let val2 = adapter.read_var(tn_id_2, var_name)
+		let val2 = adapter
+			.read_var(tn_id_2, var_name)
 			.await
 			.expect("Failed to read tenant 2 variable");
 
@@ -153,7 +156,8 @@ mod tests {
 
 		// The JWT secret should be stored with key "0:jwt_secret"
 		// This ensures it's a global variable (tenant_id = 0)
-		let secret_var = adapter.read_var(TnId(0), "jwt_secret")
+		let secret_var = adapter
+			.read_var(TnId(0), "jwt_secret")
 			.await
 			.expect("Failed to read JWT secret variable");
 

@@ -1,8 +1,8 @@
 //! Worker pool. Handles synchronous tasks with 3 priority levels, configurable worker threads.
 
-use std::{sync::Arc, thread};
 use flume::{Receiver, Sender};
 use futures::channel::oneshot;
+use std::{sync::Arc, thread};
 
 use crate::prelude::*;
 
@@ -51,11 +51,7 @@ impl WorkerPool {
 			thread::spawn(move || worker_loop(vec![rx_high, rx_med, rx_low]));
 		}
 
-		Self {
-			tx_high,
-			tx_med,
-			tx_low,
-		}
+		Self { tx_high, tx_med, tx_low }
 	}
 
 	/// Submit a closure with arguments → returns a Future for the result
@@ -95,7 +91,7 @@ impl WorkerPool {
 				Err(_) => {
 					error!("Worker dropped result channel without sending");
 					panic!("Critical: worker pool lost result");
-				}
+				},
 			}
 		}
 	}
@@ -123,7 +119,7 @@ impl WorkerPool {
 				Err(_) => {
 					error!("Worker dropped result channel without sending");
 					panic!("Critical: worker pool lost result");
-				}
+				},
 			}
 		}
 	}
@@ -151,7 +147,7 @@ impl WorkerPool {
 				Err(_) => {
 					error!("Worker dropped result channel without sending");
 					panic!("Critical: worker pool lost result");
-				}
+				},
 			}
 		}
 	}
@@ -179,7 +175,7 @@ impl WorkerPool {
 				Err(_) => {
 					error!("Worker dropped result channel without sending");
 					panic!("Critical: worker pool lost result");
-				}
+				},
 			}
 		}
 	}

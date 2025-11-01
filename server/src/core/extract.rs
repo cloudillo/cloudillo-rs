@@ -1,12 +1,9 @@
 //! Custom extractors for Cloudillo-specific data
 
-use axum::{
-	extract::FromRequestParts,
-	http::request::Parts,
-};
+use axum::{extract::FromRequestParts, http::request::Parts};
 
+use crate::auth_adapter;
 use crate::prelude::*;
-use crate::{auth_adapter};
 
 // Extractors //
 //************//
@@ -28,7 +25,7 @@ where
 {
 	type Rejection = Error;
 
-	async fn from_request_parts(parts: &mut Parts, _state: &S,) -> Result<Self, Self::Rejection> {
+	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
 		if let Some(id_tag) = parts.extensions.get::<IdTag>().cloned() {
 			Ok(id_tag)
 		} else {
@@ -39,16 +36,17 @@ where
 
 // TnId //
 //******//
-impl FromRequestParts<App> for TnId
-
-where
-{
+impl FromRequestParts<App> for TnId {
 	type Rejection = Error;
 
 	async fn from_request_parts(parts: &mut Parts, state: &App) -> Result<Self, Self::Rejection> {
 		if let Some(id_tag) = parts.extensions.get::<IdTag>().cloned() {
 			//info!("idTag: {}", &id_tag.0);
-			let tn_id = state.auth_adapter.read_tn_id(&id_tag.0).await.map_err(|_| Error::PermissionDenied)?;
+			let tn_id = state
+				.auth_adapter
+				.read_tn_id(&id_tag.0)
+				.await
+				.map_err(|_| Error::PermissionDenied)?;
 			//info!("tnId: {:?}", &tn_id);
 			Ok(tn_id)
 		} else {
@@ -68,7 +66,7 @@ where
 {
 	type Rejection = Error;
 
-	async fn from_request_parts(parts: &mut Parts, _state: &S,) -> Result<Self, Self::Rejection> {
+	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
 		info!("Auth extractor: {:?}", &parts.extensions.get::<Auth>());
 		if let Some(auth) = parts.extensions.get::<Auth>().cloned() {
 			Ok(auth)
@@ -90,7 +88,7 @@ where
 {
 	type Rejection = Error;
 
-	async fn from_request_parts(parts: &mut Parts, _state: &S,) -> Result<Self, Self::Rejection> {
+	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
 		let auth = parts.extensions.get::<Auth>().cloned().map(|a| a.0);
 		Ok(OptionalAuth(auth))
 	}
@@ -112,7 +110,7 @@ where
 {
 	type Rejection = Error;
 
-	async fn from_request_parts(parts: &mut Parts, _state: &S,) -> Result<Self, Self::Rejection> {
+	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
 		let req_id = parts.extensions.get::<RequestId>().map(|r| r.0.clone());
 		Ok(OptionalRequestId(req_id))
 	}

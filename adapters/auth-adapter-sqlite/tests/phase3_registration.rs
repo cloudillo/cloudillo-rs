@@ -8,13 +8,13 @@
 
 #[cfg(test)]
 mod tests {
-	use cloudillo::prelude::*;
 	use cloudillo::auth_adapter::AuthAdapter;
-	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use cloudillo::core::worker::WorkerPool;
+	use cloudillo::prelude::*;
+	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
+	use sqlx::Row;
 	use std::sync::Arc;
 	use tempfile::TempDir;
-	use sqlx::Row;
 
 	/// Helper to create a test auth adapter with temporary database
 	async fn create_test_adapter() -> ClResult<(AuthAdapterSqlite, TempDir)> {
@@ -44,7 +44,8 @@ mod tests {
 		let id_tag = "test_user";
 
 		// Step 1: Register the email
-		adapter.create_tenant_registration(email)
+		adapter
+			.create_tenant_registration(email)
 			.await
 			.expect("Failed to create registration");
 
@@ -70,7 +71,8 @@ mod tests {
 		};
 
 		// Step 3: Create tenant with valid verification code
-		let tn_id = adapter.create_tenant(id_tag, Some(email), Some(&vfy_code))
+		let tn_id = adapter
+			.create_tenant(id_tag, Some(email), Some(&vfy_code))
 			.await
 			.expect("Failed to create tenant with verification code");
 
@@ -87,7 +89,8 @@ mod tests {
 		let invalid_code = "invalid_code_xyz_123";
 
 		// Register email
-		adapter.create_tenant_registration(email)
+		adapter
+			.create_tenant_registration(email)
 			.await
 			.expect("Failed to create registration");
 
@@ -108,7 +111,8 @@ mod tests {
 		let id_tag = "test_user_mismatch";
 
 		// Register email1
-		adapter.create_tenant_registration(email1)
+		adapter
+			.create_tenant_registration(email1)
 			.await
 			.expect("Failed to create registration");
 
@@ -144,7 +148,8 @@ mod tests {
 		let id_tag = "test_consumed";
 
 		// Register email
-		adapter.create_tenant_registration(email)
+		adapter
+			.create_tenant_registration(email)
 			.await
 			.expect("Failed to create registration");
 
@@ -165,13 +170,13 @@ mod tests {
 		};
 
 		// Create tenant with code
-		adapter.create_tenant(id_tag, Some(email), Some(&vfy_code))
+		adapter
+			.create_tenant(id_tag, Some(email), Some(&vfy_code))
 			.await
 			.expect("Failed to create tenant");
 
 		// Try to reuse the same code
-		let result = adapter.create_tenant("test_user_2", Some(email), Some(&vfy_code))
-			.await;
+		let result = adapter.create_tenant("test_user_2", Some(email), Some(&vfy_code)).await;
 
 		// Should fail - code was consumed
 		assert!(result.is_err());
@@ -186,7 +191,8 @@ mod tests {
 		let id_tag = "delete_test";
 
 		// Register and create tenant
-		adapter.create_tenant_registration(email)
+		adapter
+			.create_tenant_registration(email)
 			.await
 			.expect("Failed to create registration");
 
@@ -205,19 +211,19 @@ mod tests {
 			row.try_get::<String, _>("vfy_code").expect("Failed to get vfy_code")
 		};
 
-		let _tn_id = adapter.create_tenant(id_tag, Some(email), Some(&vfy_code))
+		let _tn_id = adapter
+			.create_tenant(id_tag, Some(email), Some(&vfy_code))
 			.await
 			.expect("Failed to create tenant");
 
 		// Create a profile key for the tenant (if applicable)
-		adapter.create_profile_key(_tn_id, None)
+		adapter
+			.create_profile_key(_tn_id, None)
 			.await
 			.expect("Failed to create profile key");
 
 		// Delete the tenant
-		adapter.delete_tenant(id_tag)
-			.await
-			.expect("Failed to delete tenant");
+		adapter.delete_tenant(id_tag).await.expect("Failed to delete tenant");
 
 		// Verify tenant is deleted
 		let result = adapter.read_id_tag(_tn_id).await;
@@ -244,7 +250,8 @@ mod tests {
 		let id_tag = "duplicate_test";
 
 		// Create first tenant
-		adapter.create_tenant_registration(email)
+		adapter
+			.create_tenant_registration(email)
 			.await
 			.expect("Failed to create registration");
 
@@ -263,7 +270,8 @@ mod tests {
 			row.try_get::<String, _>("vfy_code").expect("Failed to get vfy_code")
 		};
 
-		adapter.create_tenant(id_tag, Some(email), Some(&vfy_code))
+		adapter
+			.create_tenant(id_tag, Some(email), Some(&vfy_code))
 			.await
 			.expect("Failed to create first tenant");
 

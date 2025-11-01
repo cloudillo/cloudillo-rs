@@ -16,16 +16,16 @@
 //! }
 //! ```
 
+use crate::core::ws_broadcast::BroadcastMessage;
 use crate::prelude::*;
 use axum::extract::ws::{Message, WebSocket};
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
-use crate::core::ws_broadcast::BroadcastMessage;
-use futures::stream::StreamExt;
-use futures::sink::SinkExt;
 
 /// A message in the bus protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,20 +43,12 @@ pub struct BusMessage {
 impl BusMessage {
 	/// Create a new bus message
 	pub fn new(cmd: impl Into<String>, data: Value) -> Self {
-		Self {
-			id: Uuid::new_v4().to_string(),
-			cmd: cmd.into(),
-			data,
-		}
+		Self { id: Uuid::new_v4().to_string(), cmd: cmd.into(), data }
 	}
 
 	/// Create an ack response
 	pub fn ack(id: String, status: &str) -> Self {
-		Self {
-			id,
-			cmd: "ack".to_string(),
-			data: json!({ "status": status }),
-		}
+		Self { id, cmd: "ack".to_string(), data: json!({ "status": status }) }
 	}
 
 	/// Serialize to JSON and wrap in WebSocket message
@@ -71,7 +63,7 @@ impl BusMessage {
 			Message::Text(text) => {
 				let parsed = serde_json::from_str::<BusMessage>(text)?;
 				Ok(Some(parsed))
-			}
+			},
 			Message::Close(_) => Ok(None),
 			Message::Ping(_) | Message::Pong(_) => Ok(None),
 			_ => Ok(None),
@@ -125,11 +117,7 @@ struct BusConnection {
 use std::collections::HashMap;
 
 /// Handle a bus connection
-pub async fn handle_bus_connection(
-	ws: WebSocket,
-	user_id: String,
-	app: crate::core::app::App,
-) {
+pub async fn handle_bus_connection(ws: WebSocket, user_id: String, app: crate::core::app::App) {
 	info!("Bus connection: {}", user_id);
 
 	let conn = Arc::new(BusConnection {
@@ -190,7 +178,7 @@ pub async fn handle_bus_connection(
 						Err(e) => {
 							warn!("Failed to parse bus message: {}", e);
 							continue;
-						}
+						},
 					};
 
 					// Handle command
@@ -204,11 +192,11 @@ pub async fn handle_bus_connection(
 							break;
 						}
 					}
-				}
+				},
 				Err(e) => {
 					warn!("Bus connection error: {}", e);
 					break;
-				}
+				},
 			}
 		}
 	});
@@ -243,16 +231,16 @@ pub async fn handle_bus_connection(
 							received_msg = Some((channel.clone(), msg));
 							drop(rx); // Release lock before sending
 							break;
-						}
+						},
 						Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
 							drop(rx);
 							continue;
-						}
+						},
 						Err(_) => {
 							// Receiver dropped, will be refreshed on next loop
 							drop(rx);
 							break;
-						}
+						},
 					}
 				}
 
@@ -332,7 +320,7 @@ async fn handle_bus_command(conn: &Arc<BusConnection>, msg: &BusMessage, app: &c
 				}
 			}
 			BusMessage::ack(msg.id.clone(), "ok")
-		}
+		},
 
 		"unsubscribe" => {
 			// Remove channels from subscription
@@ -348,15 +336,11 @@ async fn handle_bus_command(conn: &Arc<BusConnection>, msg: &BusMessage, app: &c
 				}
 			}
 			BusMessage::ack(msg.id.clone(), "ok")
-		}
+		},
 
 		"setPresence" => {
 			// Update user presence and broadcast
-			let status = msg
-				.data
-				.get("status")
-				.and_then(|v| v.as_str())
-				.unwrap_or("online");
+			let status = msg.data.get("status").and_then(|v| v.as_str()).unwrap_or("online");
 
 			let presence = PresenceState {
 				user_id: conn.user_id.clone(),
@@ -372,48 +356,37 @@ async fn handle_bus_command(conn: &Arc<BusConnection>, msg: &BusMessage, app: &c
 			debug!("User {} presence: {:?}", conn.user_id, presence);
 
 			// Broadcast presence update to all subscribers
-			let broadcast_msg = BroadcastMessage::new(
-				"presence",
-				serde_json::to_value(&presence).unwrap_or(json!({})),
-				conn.user_id.clone(),
-			);
+			let broadcast_msg =
+				BroadcastMessage::new("presence", serde_json::to_value(&presence).unwrap_or(json!({})), conn.user_id.clone());
 			let _ = app.broadcast.broadcast("presence", broadcast_msg).await;
 
 			BusMessage::ack(msg.id.clone(), "ok")
-		}
+		},
 
 		"sendTyping" => {
 			// Broadcast typing indicator
 			if let Some(path) = msg.data.get("path").and_then(|v| v.as_str()) {
 				let active = msg.data.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
 
-				let typing = TypingState {
-					user_id: conn.user_id.clone(),
-					path: path.to_string(),
-					active,
-					timestamp: now_timestamp(),
-				};
+				let typing = TypingState { user_id: conn.user_id.clone(), path: path.to_string(), active, timestamp: now_timestamp() };
 
 				debug!("User {} typing at {}: {}", conn.user_id, path, active);
 
 				// Broadcast typing indicator to subscribers on this path
 				let channel = format!("typing:{}", path);
-				let broadcast_msg = BroadcastMessage::new(
-					"typing",
-					serde_json::to_value(&typing).unwrap_or(json!({})),
-					conn.user_id.clone(),
-				);
+				let broadcast_msg =
+					BroadcastMessage::new("typing", serde_json::to_value(&typing).unwrap_or(json!({})), conn.user_id.clone());
 				let _ = app.broadcast.broadcast(&channel, broadcast_msg).await;
 			}
 
 			BusMessage::ack(msg.id.clone(), "ok")
-		}
+		},
 
 		_ => {
 			// Unknown command
 			warn!("Unknown bus command: {}", msg.cmd);
 			BusMessage::ack(msg.id.clone(), "error")
-		}
+		},
 	}
 }
 

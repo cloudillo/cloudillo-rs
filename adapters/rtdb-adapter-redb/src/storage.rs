@@ -15,10 +15,7 @@ pub const TABLE_METADATA: redb::TableDefinition<&str, &str> = redb::TableDefinit
 
 /// Get current Unix timestamp
 pub fn now_timestamp() -> u64 {
-	SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.unwrap_or_default()
-		.as_secs()
+	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 /// Convert a JSON value to a sortable string for indexing
@@ -53,9 +50,7 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 	// Greater-than checks
 	for (field, threshold) in &filter.greater_than {
 		match doc.get(field) {
-			Some(actual) if compare_values(Some(actual), Some(threshold)) == Ordering::Greater => {
-				continue
-			}
+			Some(actual) if compare_values(Some(actual), Some(threshold)) == Ordering::Greater => continue,
 			_ => return false,
 		}
 	}
@@ -69,7 +64,7 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 					continue;
 				}
 				return false;
-			}
+			},
 			_ => return false,
 		}
 	}
@@ -77,9 +72,7 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 	// Less-than checks
 	for (field, threshold) in &filter.less_than {
 		match doc.get(field) {
-			Some(actual) if compare_values(Some(actual), Some(threshold)) == Ordering::Less => {
-				continue
-			}
+			Some(actual) if compare_values(Some(actual), Some(threshold)) == Ordering::Less => continue,
 			_ => return false,
 		}
 	}
@@ -93,7 +86,7 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 					continue;
 				}
 				return false;
-			}
+			},
 			_ => return false,
 		}
 	}
@@ -163,11 +156,7 @@ pub fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
 		(None, None) => Ordering::Equal,
 		(None, Some(_)) => Ordering::Less,
 		(Some(_), None) => Ordering::Greater,
-		(Some(Value::Number(a)), Some(Value::Number(b))) => {
-			a.as_f64()
-				.partial_cmp(&b.as_f64())
-				.unwrap_or(Ordering::Equal)
-		}
+		(Some(Value::Number(a)), Some(Value::Number(b))) => a.as_f64().partial_cmp(&b.as_f64()).unwrap_or(Ordering::Equal),
 		(Some(Value::String(a)), Some(Value::String(b))) => a.cmp(b),
 		(Some(Value::Bool(a)), Some(Value::Bool(b))) => a.cmp(b),
 		(Some(a), Some(b)) => a.to_string().cmp(&b.to_string()),

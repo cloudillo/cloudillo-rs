@@ -2,15 +2,15 @@
 
 use axum::ServiceExt;
 use rustls::{
+	server::{ClientHello, ResolvesServerCert},
 	sign::CertifiedKey,
-	server::{ResolvesServerCert, ClientHello}
 };
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tower::Service;
 
-use crate::prelude::*;
 use crate::core;
+use crate::prelude::*;
 
 pub struct CertResolver {
 	state: App,
@@ -18,9 +18,7 @@ pub struct CertResolver {
 
 impl CertResolver {
 	pub fn new(state: App) -> CertResolver {
-		CertResolver {
-			state,
-		}
+		CertResolver { state }
 	}
 
 	pub fn get(&self, name: &str) -> Option<Arc<CertifiedKey>> {
@@ -49,18 +47,19 @@ impl ResolvesServerCert for CertResolver {
 			} else {
 				let domain = if name.starts_with("cl-o.") { &name[5..] } else { name };
 				// FIXME: Should not block
-				let cert_data = tokio::task::block_in_place(||
-					tokio::runtime::Handle::current().block_on(async {
-						self.state.auth_adapter.read_cert_by_domain(domain).await
-					})
-				);
+				let cert_data = tokio::task::block_in_place(|| {
+					tokio::runtime::Handle::current().block_on(async { self.state.auth_adapter.read_cert_by_domain(domain).await })
+				});
 				if let Ok(cert_data) = cert_data {
 					//debug!("[found in DB]");
 					let certified_key = CertifiedKey::from_der(
-						CertificateDer::pem_slice_iter(cert_data.cert.as_bytes()).filter_map(Result::ok).collect(),
+						CertificateDer::pem_slice_iter(cert_data.cert.as_bytes())
+							.filter_map(Result::ok)
+							.collect(),
 						PrivateKeyDer::from_pem_slice(cert_data.key.as_bytes()).ok()?,
-						rustls::crypto::CryptoProvider::get_default()?
-					).ok()?;
+						rustls::crypto::CryptoProvider::get_default()?,
+					)
+					.ok()?;
 					let certified_key = Arc::new(certified_key);
 					let mut cache = self.state.certs.write().ok()?;
 					//debug!("[inserting into cache]");
@@ -78,8 +77,12 @@ impl ResolvesServerCert for CertResolver {
 	}
 }
 
-pub async fn create_https_server(state: App, listen: &str, api_router: axum::Router, app_router: axum::Router)
-	-> Result<tokio::task::JoinHandle<Result<(), std::io::Error>>, std::io::Error> {
+pub async fn create_https_server(
+	state: App,
+	listen: &str,
+	api_router: axum::Router,
+	app_router: axum::Router,
+) -> Result<tokio::task::JoinHandle<Result<(), std::io::Error>>, std::io::Error> {
 	let cert_resolver = Arc::new(CertResolver::new(state.clone()));
 	let mut server_config = rustls::ServerConfig::builder()
 		.with_no_client_auth()
@@ -96,9 +99,14 @@ pub async fn create_https_server(state: App, listen: &str, api_router: axum::Rou
 			let start = std::time::Instant::now();
 			let span = info_span!("REQ", req = req.uri().path());
 			let _ = span.enter();
-			let peer_addr = req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().map(|a| a.to_string()).unwrap_or("-".to_string());
-			let host =
-				req.uri().host()
+			let peer_addr = req
+				.extensions()
+				.get::<axum::extract::ConnectInfo<SocketAddr>>()
+				.map(|a| a.to_string())
+				.unwrap_or("-".to_string());
+			let host = req
+				.uri()
+				.host()
 				.or_else(|| req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()))
 				.unwrap_or_default();
 
@@ -112,7 +120,10 @@ pub async fn create_https_server(state: App, listen: &str, api_router: axum::Rou
 				app_router.clone().call(req).await
 			};
 
-			let status = res.as_ref().map(|r| r.status()).unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+			let status = res
+				.as_ref()
+				.map(|r| r.status())
+				.unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 			if status.is_client_error() || status.is_server_error() {
 				warn!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
 			} else {
@@ -122,10 +133,13 @@ pub async fn create_https_server(state: App, listen: &str, api_router: axum::Rou
 			res
 		}
 	});
-		
 
 	info!("Listening on HTTPS {}", &listen);
-	let handle = tokio::spawn(async move { https_server.serve(svc.into_make_service_with_connect_info::<SocketAddr>()).await });
+	let handle = tokio::spawn(async move {
+		https_server
+			.serve(svc.into_make_service_with_connect_info::<SocketAddr>())
+			.await
+	});
 
 	Ok(handle)
 }

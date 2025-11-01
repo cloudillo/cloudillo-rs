@@ -1,10 +1,7 @@
 pub use crate::core::app::App;
-pub use crate::error::{Error, ClResult};
-pub use crate::types::{TnId, Timestamp, Patch};
+pub use crate::error::{ClResult, Error};
+pub use crate::types::{Patch, Timestamp, TnId};
 
-pub use tracing::{
-	debug_span, info_span, warn_span, error_span,
-	debug, info, warn, error,
-};
+pub use tracing::{debug, debug_span, error, error_span, info, info_span, warn, warn_span};
 
 // vim: ts=4

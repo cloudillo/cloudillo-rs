@@ -1,13 +1,9 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use itertools::Itertools;
 use jsonwebtoken::{self as jwt, Algorithm, Validation};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize};
 
-use crate::{
-	prelude::*,
-	auth_adapter::ActionToken,
-	file::file,
-};
+use crate::{auth_adapter::ActionToken, file::file, prelude::*};
 
 /// Decodes a JWT without verifying the signature
 pub fn decode_jwt_no_verify<T: DeserializeOwned>(jwt: &str) -> ClResult<T> {
@@ -41,8 +37,9 @@ pub async fn verify_action_token(app: &App, tn_id: TnId, token: &str) -> ClResul
 		let action: ActionToken = jwt::decode(
 			token,
 			&jwt::DecodingKey::from_ec_pem(public_key_pem.as_bytes()).inspect_err(|err| error!("from_ec_pem err: {}", err))?,
-			&validation
-		)?.claims;
+			&validation,
+		)?
+		.claims;
 		info!("  validated {:?}", action);
 		Ok(action)
 	} else {
@@ -57,11 +54,8 @@ pub trait ActionType {
 pub async fn process_inbound_action_token(app: &App, tn_id: TnId, _action_id: &str, token: &str) -> ClResult<()> {
 	let action = verify_action_token(app, tn_id, token).await?;
 
-	let issuer_profile = if let Ok((_etag, profile)) = app.meta_adapter.read_profile(tn_id, &action.iss).await {
-		Some(profile)
-	} else {
-		None
-	};
+	let issuer_profile =
+		if let Ok((_etag, profile)) = app.meta_adapter.read_profile(tn_id, &action.iss).await { Some(profile) } else { None };
 	info!("  profile: {:?}", issuer_profile);
 
 	let mut allowed = false;
@@ -96,17 +90,28 @@ struct Descriptor {
 async fn process_inbound_action_attachments(app: &App, tn_id: TnId, id_tag: &str, attachments: Vec<Box<str>>) -> ClResult<()> {
 	for attachment in attachments {
 		info!("  syncing attachment: {}", attachment);
-		if let Ok(descriptor) = app.request.get::<Descriptor>(tn_id, id_tag, format!("/file/{}/descriptor", attachment).as_str()).await {
+		if let Ok(descriptor) = app
+			.request
+			.get::<Descriptor>(tn_id, id_tag, format!("/file/{}/descriptor", attachment).as_str())
+			.await
+		{
 			info!("  attachment descriptor: {:?}", descriptor.file);
 			let variants = file::parse_file_descriptor(&descriptor.file)?;
 			info!("  attachment variants: {:?}", variants);
 			for variant in variants {
 				if app.blob_adapter.stat_blob(tn_id, variant.variant_id).await.is_none() {
-					if variant.variant != "hd" { // FIXME settings
+					if variant.variant != "hd" {
+						// FIXME settings
 						info!("  downloading attachment: {}", variant.variant_id);
 
-						let mut stream = app.request.get_stream(tn_id, id_tag, &format!("/file/variant/{}", variant.variant_id)).await?;
-						let _res = app.blob_adapter.create_blob_stream(tn_id, variant.variant_id, &mut stream).await;
+						let mut stream = app
+							.request
+							.get_stream(tn_id, id_tag, &format!("/file/variant/{}", variant.variant_id))
+							.await?;
+						let _res = app
+							.blob_adapter
+							.create_blob_stream(tn_id, variant.variant_id, &mut stream)
+							.await;
 						info!("  attachment downloaded: {}", variant.variant_id);
 					} else {
 						info!("  skipping attachment: {} {}", variant.variant, variant.variant_id);

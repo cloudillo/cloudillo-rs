@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
 mod error;
-mod instance;
-mod transaction;
-mod query;
 mod index;
+mod instance;
+mod query;
 pub mod storage;
+mod transaction;
 
 use async_trait::async_trait;
 use futures_core::Stream;
@@ -65,12 +65,7 @@ pub struct AdapterConfig {
 
 impl Default for AdapterConfig {
 	fn default() -> Self {
-		Self {
-			max_instances: 100,
-			idle_timeout_secs: 600,
-			broadcast_capacity: 1000,
-			auto_evict: true,
-		}
+		Self { max_instances: 100, idle_timeout_secs: 600, broadcast_capacity: 1000, auto_evict: true }
 	}
 }
 
@@ -82,11 +77,7 @@ impl RtdbAdapterRedb {
 	/// * `storage_dir` - Directory where database files are stored
 	/// * `per_tenant_files` - If true, create separate files per tenant; if false, use single shared file
 	/// * `config` - Adapter configuration
-	pub async fn new(
-		storage_dir: PathBuf,
-		per_tenant_files: bool,
-		config: AdapterConfig,
-	) -> ClResult<Self> {
+	pub async fn new(storage_dir: PathBuf, per_tenant_files: bool, config: AdapterConfig) -> ClResult<Self> {
 		tokio::fs::create_dir_all(&storage_dir).await?;
 
 		let auto_evict = config.auto_evict;
@@ -172,15 +163,7 @@ impl RtdbAdapterRedb {
 
 	/// Build an index key
 	#[allow(dead_code)]
-	fn build_index_key(
-		&self,
-		tn_id: TnId,
-		_db_id: &str,
-		collection: &str,
-		field: &str,
-		value: &Value,
-		doc_id: &str,
-	) -> String {
+	fn build_index_key(&self, tn_id: TnId, _db_id: &str, collection: &str, field: &str, value: &Value, doc_id: &str) -> String {
 		let value_str = storage::value_to_string(value);
 
 		if self.per_tenant_files {
@@ -227,10 +210,7 @@ impl RtdbAdapterRedb {
 
 	/// Get or open a database instance
 	async fn get_or_open_instance(&self, tn_id: TnId, db_id: &str) -> ClResult<Arc<DatabaseInstance>> {
-		let key = InstanceKey {
-			tn_id: tn_id.0,
-			db_id: db_id.into(),
-		};
+		let key = InstanceKey { tn_id: tn_id.0, db_id: db_id.into() };
 
 		// Fast path: already open
 		{
@@ -262,14 +242,7 @@ impl RtdbAdapterRedb {
 		// Create broadcast channel
 		let (change_tx, _) = tokio::sync::broadcast::channel(self.config.broadcast_capacity);
 
-		let instance = Arc::new(DatabaseInstance::new(
-			InstanceKey {
-				tn_id: tn_id.0,
-				db_id: db_id.into(),
-			},
-			db,
-			change_tx,
-		));
+		let instance = Arc::new(DatabaseInstance::new(InstanceKey { tn_id: tn_id.0, db_id: db_id.into() }, db, change_tx));
 
 		// Load indexed fields from metadata
 		instance.load_indexed_fields().await?;
@@ -331,20 +304,11 @@ impl RtdbAdapter for RtdbAdapterRedb {
 
 		let tx = instance.db.begin_write().map_err(error::from_redb_error)?;
 
-		Ok(Box::new(RedbTransaction::new(
-			self.per_tenant_files,
-			tn_id,
-			db_id.into(),
-			instance,
-			tx,
-		)))
+		Ok(Box::new(RedbTransaction::new(self.per_tenant_files, tn_id, db_id.into(), instance, tx)))
 	}
 
 	async fn close_db(&self, tn_id: TnId, db_id: &str) -> ClResult<()> {
-		let key = InstanceKey {
-			tn_id: tn_id.0,
-			db_id: db_id.into(),
-		};
+		let key = InstanceKey { tn_id: tn_id.0, db_id: db_id.into() };
 
 		let mut instances = self.instances.write().await;
 		if instances.remove(&key).is_some() {
@@ -354,22 +318,14 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		Ok(())
 	}
 
-	async fn query(
-		&self,
-		tn_id: TnId,
-		db_id: &str,
-		path: &str,
-		opts: QueryOptions,
-	) -> ClResult<Vec<Value>> {
+	async fn query(&self, tn_id: TnId, db_id: &str, path: &str, opts: QueryOptions) -> ClResult<Vec<Value>> {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 		let per_tenant_files = self.per_tenant_files;
 		let db_id_owned = db_id.to_string();
 		let path_owned = path.to_string();
 
-		tokio::task::spawn_blocking(move || {
-			query::execute_query(&instance, tn_id, &db_id_owned, &path_owned, opts, per_tenant_files)
-		})
-		.await?
+		tokio::task::spawn_blocking(move || query::execute_query(&instance, tn_id, &db_id_owned, &path_owned, opts, per_tenant_files))
+			.await?
 	}
 
 	async fn get(&self, tn_id: TnId, db_id: &str, path: &str) -> ClResult<Option<Value>> {
@@ -462,24 +418,10 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		Ok(Box::pin(stream))
 	}
 
-	async fn create_index(
-		&self,
-		tn_id: TnId,
-		db_id: &str,
-		path: &str,
-		field: &str,
-	) -> ClResult<()> {
+	async fn create_index(&self, tn_id: TnId, db_id: &str, path: &str, field: &str) -> ClResult<()> {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 
-		index::create_index_impl(
-			&instance,
-			tn_id,
-			db_id,
-			path,
-			field,
-			self.per_tenant_files,
-		)
-		.await
+		index::create_index_impl(&instance, tn_id, db_id, path, field, self.per_tenant_files).await
 	}
 
 	async fn stats(&self, tn_id: TnId, db_id: &str) -> ClResult<DbStats> {

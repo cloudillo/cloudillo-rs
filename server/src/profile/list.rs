@@ -1,16 +1,16 @@
 //! Profile listing and retrieval handlers
 
 use axum::{
-	extract::{State, Path, Query},
+	extract::{Path, Query, State},
 	http::StatusCode,
 	Json,
 };
 use serde::Deserialize;
 
 use crate::{
-	prelude::*,
 	core::extract::OptionalRequestId,
-	types::{ProfileInfo, ApiResponse},
+	prelude::*,
+	types::{ApiResponse, ProfileInfo},
 };
 
 #[derive(Debug, Deserialize)]
@@ -30,22 +30,25 @@ pub async fn list_profiles(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Query(params): Query<ListProfilesQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ProfileInfo>>>)> {
-	let limit = params.limit.unwrap_or(20).min(100);  // Max 100 per page
+	let limit = params.limit.unwrap_or(20).min(100); // Max 100 per page
 	let offset = params.offset.unwrap_or(0);
 
 	// Fetch profiles from cache (all tenants' local copies of remote profiles)
 	// If search term provided, filter by id_tag or name
 	let profiles_data = if let Some(search_term) = &params.search {
 		// Search mode: find profiles matching search term
-		app.meta_adapter.search_profiles(&search_term.to_lowercase(), limit, offset).await?
+		app.meta_adapter
+			.search_profiles(&search_term.to_lowercase(), limit, offset)
+			.await?
 	} else {
 		// List mode: get all cached profiles
 		app.meta_adapter.list_all_remote_profiles(limit, offset).await?
 	};
 
 	// Convert ProfileData to ProfileInfo
-	let profiles: Vec<ProfileInfo> = profiles_data.into_iter().map(|pd| {
-		ProfileInfo {
+	let profiles: Vec<ProfileInfo> = profiles_data
+		.into_iter()
+		.map(|pd| ProfileInfo {
 			id_tag: pd.id_tag.to_string(),
 			name: pd.name.to_string(),
 			profile_type: pd.profile_type.to_string(),
@@ -55,13 +58,12 @@ pub async fn list_profiles(
 			location: pd.location.map(|s| s.to_string()),
 			website: pd.website.map(|s| s.to_string()),
 			created_at: pd.created_at,
-		}
-	}).collect();
+		})
+		.collect();
 
 	let total = profiles.len();
 
-	let response = ApiResponse::new(profiles)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(profiles).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -75,7 +77,7 @@ pub async fn get_profile_by_id_tag(
 	// Get tenant ID for the requested profile (use TnId(0) as a placeholder for reading from cache)
 	// In production, this would need to handle cross-tenant profile lookups
 	// For now, use MetaAdapter's method that handles this
-	let tn_id = crate::types::TnId(0);  // Use default tenant for cross-tenant lookups
+	let tn_id = crate::types::TnId(0); // Use default tenant for cross-tenant lookups
 	let profile_data = app.meta_adapter.get_profile_info(tn_id, &id_tag).await?;
 
 	let profile = ProfileInfo {
@@ -90,8 +92,7 @@ pub async fn get_profile_by_id_tag(
 		created_at: profile_data.created_at,
 	};
 
-	let response = ApiResponse::new(profile)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(profile).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }

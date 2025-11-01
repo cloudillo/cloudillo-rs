@@ -23,26 +23,13 @@ pub fn execute_query(
 
 	// Try index-based query first
 	if let Some(ref filter) = opts.filter {
-		if let Some(docs) = try_index_query(
-			instance,
-			&tx,
-			tn_id,
-			db_id,
-			path,
-			filter,
-			&opts,
-			per_tenant_files,
-		)? {
+		if let Some(docs) = try_index_query(instance, &tx, tn_id, db_id, path, filter, &opts, per_tenant_files)? {
 			return Ok(apply_sort_limit(docs, &opts));
 		}
 	}
 
 	// Fall back to collection scan
-	let prefix = if per_tenant_files {
-		format!("{}/{}/", db_id, path)
-	} else {
-		format!("{}/{}/{}/", tn_id.0, db_id, path)
-	};
+	let prefix = if per_tenant_files { format!("{}/{}/", db_id, path) } else { format!("{}/{}/{}/", tn_id.0, db_id, path) };
 
 	let mut results = Vec::new();
 	let range = doc_table.range(prefix.as_str()..).map_err(from_redb_error)?;
@@ -105,9 +92,7 @@ fn try_index_query(
 	// Check if any filter field is indexed
 	for (field, value) in &filter.equals {
 		if indexed.iter().any(|f| f.as_ref() == field.as_str()) {
-			return Ok(Some(execute_index_query(
-				tx, tn_id, db_id, path, field, value, filter, per_tenant_files,
-			)?));
+			return Ok(Some(execute_index_query(tx, tn_id, db_id, path, field, value, filter, per_tenant_files)?));
 		}
 	}
 
@@ -186,10 +171,7 @@ fn apply_sort_limit(mut docs: Vec<Value>, opts: &QueryOptions) -> Vec<Value> {
 	}
 
 	// Apply limit
-	let end = opts
-		.limit
-		.map(|l| (start + l as usize).min(docs.len()))
-		.unwrap_or(docs.len());
+	let end = opts.limit.map(|l| (start + l as usize).min(docs.len())).unwrap_or(docs.len());
 
 	docs[start..end].to_vec()
 }

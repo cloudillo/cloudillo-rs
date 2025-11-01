@@ -3,13 +3,13 @@
 use axum::{
 	body::Body,
 	extract::State,
-	http::{response::Response, Request, header},
+	http::{header, response::Response, Request},
 	middleware::Next,
 };
 use uuid::Uuid;
 
+use crate::core::{extract::RequestId, Auth, IdTag};
 use crate::prelude::*;
-use crate::core::{Auth, IdTag, extract::RequestId};
 
 /// Extract token from query parameters
 fn extract_token_from_query(query: &str) -> Option<String> {
@@ -30,7 +30,9 @@ pub async fn require_auth(State(state): State<App>, mut req: Request<Body>, next
 	use tracing::warn;
 
 	// Extract IdTag from request extensions (inserted by webserver)
-	let id_tag = req.extensions().get::<IdTag>()
+	let id_tag = req
+		.extensions()
+		.get::<IdTag>()
 		.ok_or_else(|| {
 			warn!("IdTag not found in request extensions");
 			Error::PermissionDenied
@@ -38,11 +40,10 @@ pub async fn require_auth(State(state): State<App>, mut req: Request<Body>, next
 		.clone();
 
 	// Convert IdTag to TnId via database lookup
-	let tn_id = state.auth_adapter.read_tn_id(&id_tag.0).await
-		.map_err(|_| {
-			warn!("Failed to resolve tenant ID for id_tag: {}", id_tag.0);
-			Error::PermissionDenied
-		})?;
+	let tn_id = state.auth_adapter.read_tn_id(&id_tag.0).await.map_err(|_| {
+		warn!("Failed to resolve tenant ID for id_tag: {}", id_tag.0);
+		Error::PermissionDenied
+	})?;
 
 	// Try to get token from Authorization header first
 	let token = if let Some(auth_header) = req.headers().get("Authorization").and_then(|h| h.to_str().ok()) {
@@ -97,15 +98,15 @@ pub async fn optional_auth(State(state): State<App>, mut req: Request<Body>, nex
 				match state.auth_adapter.validate_token(tn_id, &id_tag.0, &token).await {
 					Ok(claims) => {
 						req.extensions_mut().insert(Auth(claims));
-					}
+					},
 					Err(e) => {
 						warn!("Token validation failed: {:?}", e);
-					}
+					},
 				}
-			}
+			},
 			Err(e) => {
 				warn!("Failed to resolve tenant ID: {:?}", e);
-			}
+			},
 		}
 	}
 
@@ -115,7 +116,8 @@ pub async fn optional_auth(State(state): State<App>, mut req: Request<Body>, nex
 /// Add or generate request ID and store in extensions
 pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Response<Body> {
 	// Extract X-Request-ID header if present, otherwise generate new one
-	let request_id = req.headers()
+	let request_id = req
+		.headers()
 		.get("X-Request-ID")
 		.and_then(|h| h.to_str().ok())
 		.map(|s| s.to_string())
@@ -128,10 +130,9 @@ pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Respon
 	let mut response = next.run(req).await;
 
 	// Add request ID to response headers
-	response.headers_mut().insert(
-		"X-Request-ID",
-		request_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()),
-	);
+	response
+		.headers_mut()
+		.insert("X-Request-ID", request_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()));
 
 	response
 }

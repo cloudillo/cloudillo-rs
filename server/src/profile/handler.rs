@@ -1,9 +1,9 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::prelude::*;
 use crate::auth_adapter;
-use crate::core::{IdTag, extract::OptionalRequestId};
+use crate::core::{extract::OptionalRequestId, IdTag};
+use crate::prelude::*;
 use crate::types::ApiResponse;
 
 /// # Profile
@@ -31,12 +31,8 @@ pub async fn get_tenant_profile(
 		crate::meta_adapter::ProfileType::Community => "community",
 	};
 
-	let profile = Profile {
-		id_tag: auth_profile.id_tag,
-		name: tenant_meta.name,
-		profile_type: profile_type.into(),
-		keys: auth_profile.keys,
-	};
+	let profile =
+		Profile { id_tag: auth_profile.id_tag, name: tenant_meta.name, profile_type: profile_type.into(), keys: auth_profile.keys };
 
 	let mut response = ApiResponse::new(profile);
 	if let Some(id) = req_id {

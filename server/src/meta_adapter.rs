@@ -1,13 +1,13 @@
 //! Adapter that manages metadata. Everything including tenants, profiles, actions, file metadata, etc.
 
 use async_trait::async_trait;
-use std::{cmp::Ordering, fmt::Debug, collections::HashMap};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
+use std::{cmp::Ordering, collections::HashMap, fmt::Debug};
 
 use crate::{
 	prelude::*,
-	types::{Timestamp, TnId, Patch},
+	types::{Patch, Timestamp, TnId},
 };
 
 // Tenants, profiles
@@ -38,7 +38,7 @@ pub enum ProfileConnectionStatus {
 pub enum ProfilePerm {
 	Moderated,
 	Write,
-	Admin
+	Admin,
 }
 
 // Reference / Bookmark types
@@ -127,7 +127,7 @@ pub struct ListProfileOptions {
 pub struct ProfileData {
 	pub id_tag: Box<str>,
 	pub name: Box<str>,
-	pub profile_type: Box<str>,  // "person" or "community"
+	pub profile_type: Box<str>, // "person" or "community"
 	pub profile_pic: Option<Box<str>>,
 	pub cover: Option<Box<str>>,
 	pub description: Option<Box<str>>,
@@ -186,7 +186,7 @@ pub struct CreateOutboundActionOptions {
 
 fn deserialize_split<'de, D>(deserializer: D) -> Result<Option<Vec<Box<str>>>, D::Error>
 where
-    D: serde::Deserializer<'de>,
+	D: serde::Deserializer<'de>,
 {
 	let s = String::deserialize(deserializer)?;
 	Ok(Some(s.split(',').map(|v| v.trim().into()).collect()))
@@ -195,7 +195,7 @@ where
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListActionOptions {
-	#[serde(default, rename="type", deserialize_with = "deserialize_split")]
+	#[serde(default, rename = "type", deserialize_with = "deserialize_split")]
 	pub typ: Option<Vec<Box<str>>>,
 	#[serde(default, deserialize_with = "deserialize_split")]
 	pub status: Option<Vec<Box<str>>>,
@@ -350,7 +350,8 @@ impl<S: AsRef<str> + Debug + Ord> PartialOrd for FileVariant<S> {
 impl<S: AsRef<str> + Debug + Ord> Ord for FileVariant<S> {
 	fn cmp(&self, other: &Self) -> Ordering {
 		//info!("cmp: {:?} vs {:?}", self, other);
-		self.size.cmp(&other.size)
+		self.size
+			.cmp(&other.size)
 			.then_with(|| self.resolution.0.cmp(&other.resolution.0))
 			.then_with(|| self.resolution.1.cmp(&other.resolution.1))
 			.then_with(|| self.size.cmp(&other.size))
@@ -391,7 +392,7 @@ pub struct CreateFileVariant {
 	pub format: Box<str>,
 	pub resolution: (u32, u32),
 	pub size: u64,
-	pub	available: bool,
+	pub available: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -493,7 +494,10 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Process pending inbound actions
 	/// callback(tn_id, action_id, token) -> bool (true if processed successfully)
 	/// Returns number of actions processed
-	async fn process_pending_inbound_actions(&self, callback: Box<dyn Fn(TnId, Box<str>, Box<str>) -> ClResult<bool> + Send>) -> ClResult<u32>;
+	async fn process_pending_inbound_actions(
+		&self,
+		callback: Box<dyn Fn(TnId, Box<str>, Box<str>) -> ClResult<bool> + Send>,
+	) -> ClResult<u32>;
 
 	/// Update inbound action status
 	async fn update_inbound_action(&self, tn_id: TnId, action_id: &str, status: Option<char>) -> ClResult<()>;
@@ -504,7 +508,10 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Process pending outbound actions
 	/// callback(tn_id, action_id, typ, token, recipient_tag) -> bool (true if processed successfully)
 	/// Returns number of actions processed
-	async fn process_pending_outbound_actions(&self, callback: Box<dyn Fn(TnId, Box<str>, Box<str>, Box<str>, Box<str>) -> ClResult<bool> + Send>) -> ClResult<u32>;
+	async fn process_pending_outbound_actions(
+		&self,
+		callback: Box<dyn Fn(TnId, Box<str>, Box<str>, Box<str>, Box<str>) -> ClResult<bool> + Send>,
+	) -> ClResult<u32>;
 
 	// File management
 	//*****************
@@ -528,7 +535,15 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	// Phase 1: Profile Management
 	//****************************
 	/// Update profile fields (name, description, location, website)
-	async fn update_profile_fields(&self, tn_id: TnId, id_tag: &str, name: Option<&str>, description: Option<&str>, location: Option<&str>, website: Option<&str>) -> ClResult<()>;
+	async fn update_profile_fields(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		name: Option<&str>,
+		description: Option<&str>,
+		location: Option<&str>,
+		website: Option<&str>,
+	) -> ClResult<()>;
 
 	/// Update profile image (profile picture file_id)
 	async fn update_profile_image(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()>;
@@ -563,7 +578,14 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn set_action_federation_status(&self, tn_id: TnId, action_id: &str, status: &str) -> ClResult<()>;
 
 	/// Add a reaction to an action
-	async fn add_reaction(&self, tn_id: TnId, action_id: &str, reactor_id_tag: &str, reaction_type: &str, content: Option<&str>) -> ClResult<()>;
+	async fn add_reaction(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		reactor_id_tag: &str,
+		reaction_type: &str,
+		content: Option<&str>,
+	) -> ClResult<()>;
 
 	/// List all reactions for an action
 	async fn list_reactions(&self, tn_id: TnId, action_id: &str) -> ClResult<Vec<ReactionData>>;
@@ -579,7 +601,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	// Settings Management
 	//*********************
 	/// List all settings for a tenant, optionally filtered by prefix
-	async fn list_settings(&self, tn_id: TnId, prefix: Option<&[String]>) -> ClResult<std::collections::HashMap<String, serde_json::Value>>;
+	async fn list_settings(&self, tn_id: TnId, prefix: Option<&[String]>)
+		-> ClResult<std::collections::HashMap<String, serde_json::Value>>;
 
 	/// Read a single setting by name
 	async fn read_setting(&self, tn_id: TnId, name: &str) -> ClResult<Option<serde_json::Value>>;

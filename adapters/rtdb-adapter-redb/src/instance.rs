@@ -3,8 +3,8 @@ use cloudillo::prelude::*;
 use cloudillo::rtdb_adapter::ChangeEvent;
 use redb::ReadableDatabase;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// An active database instance with real-time subscription support
@@ -29,11 +29,7 @@ pub struct DatabaseInstance {
 
 impl DatabaseInstance {
 	/// Create a new database instance
-	pub fn new(
-		key: InstanceKey,
-		db: Arc<redb::Database>,
-		change_tx: tokio::sync::broadcast::Sender<ChangeEvent>,
-	) -> Self {
+	pub fn new(key: InstanceKey, db: Arc<redb::Database>, change_tx: tokio::sync::broadcast::Sender<ChangeEvent>) -> Self {
 		Self {
 			key,
 			db,
@@ -77,10 +73,7 @@ impl DatabaseInstance {
 				let collection = &key_str[..key_str.len() - 14]; // Remove "/_meta/indexes"
 
 				if let Ok(fields) = serde_json::from_str::<Vec<String>>(value.value()) {
-					indexed_fields.insert(
-						collection.into(),
-						fields.into_iter().map(|f| f.into()).collect(),
-					);
+					indexed_fields.insert(collection.into(), fields.into_iter().map(|f| f.into()).collect());
 				}
 			}
 		}

@@ -23,13 +23,7 @@ pub struct BroadcastMessage {
 impl BroadcastMessage {
 	/// Create a new broadcast message
 	pub fn new(cmd: impl Into<String>, data: Value, sender: impl Into<String>) -> Self {
-		Self {
-			id: Uuid::new_v4().to_string(),
-			cmd: cmd.into(),
-			data,
-			sender: sender.into(),
-			timestamp: now_timestamp(),
-		}
+		Self { id: Uuid::new_v4().to_string(), cmd: cmd.into(), data, sender: sender.into(), timestamp: now_timestamp() }
 	}
 }
 
@@ -60,11 +54,7 @@ pub struct BroadcastConfig {
 
 impl Default for BroadcastConfig {
 	fn default() -> Self {
-		Self {
-			buffer_size: 128,
-			max_channel_name: 256,
-			max_channels: 10000,
-		}
+		Self { buffer_size: 128, max_channel_name: 256, max_channels: 10000 }
 	}
 }
 
@@ -76,10 +66,7 @@ impl BroadcastManager {
 
 	/// Create with custom config
 	pub fn with_config(config: BroadcastConfig) -> Self {
-		Self {
-			channels: Arc::new(RwLock::new(HashMap::new())),
-			config,
-		}
+		Self { channels: Arc::new(RwLock::new(HashMap::new())), config }
 	}
 
 	/// Subscribe to a channel, creating it if needed
@@ -109,11 +96,7 @@ impl BroadcastManager {
 	}
 
 	/// Broadcast a message to a channel
-	pub async fn broadcast(
-		&self,
-		channel: &str,
-		msg: BroadcastMessage,
-	) -> ClResult<()> {
+	pub async fn broadcast(&self, channel: &str, msg: BroadcastMessage) -> ClResult<()> {
 		let channels = self.channels.read().await;
 
 		if let Some(sender) = channels.get(channel) {
@@ -140,11 +123,7 @@ impl BroadcastManager {
 			channel_stats.insert(channel.clone(), subscriber_count);
 		}
 
-		ChannelStats {
-			active_channels: channels.len(),
-			total_subscribers,
-			channels: channel_stats,
-		}
+		ChannelStats { active_channels: channels.len(), total_subscribers, channels: channel_stats }
 	}
 
 	/// Cleanup empty channels (channels with no receivers)
@@ -156,10 +135,7 @@ impl BroadcastManager {
 	/// Get number of receivers on a channel
 	pub async fn receiver_count(&self, channel: &str) -> usize {
 		let channels = self.channels.read().await;
-		channels
-			.get(channel)
-			.map(|sender| sender.receiver_count())
-			.unwrap_or(0)
+		channels.get(channel).map(|sender| sender.receiver_count()).unwrap_or(0)
 	}
 }
 
@@ -204,11 +180,7 @@ mod tests {
 		let manager = BroadcastManager::new();
 		let mut rx = manager.subscribe("test-channel").await.unwrap();
 
-		let msg = BroadcastMessage::new(
-			"test",
-			serde_json::json!({ "data": "test" }),
-			"sender-1",
-		);
+		let msg = BroadcastMessage::new("test", serde_json::json!({ "data": "test" }), "sender-1");
 
 		manager.broadcast("test-channel", msg.clone()).await.unwrap();
 		let received = rx.recv().await.unwrap();
@@ -221,11 +193,7 @@ mod tests {
 		let mut rx1 = manager.subscribe("test-channel").await.unwrap();
 		let mut rx2 = manager.subscribe("test-channel").await.unwrap();
 
-		let msg = BroadcastMessage::new(
-			"test",
-			serde_json::json!({ "data": "test" }),
-			"sender-1",
-		);
+		let msg = BroadcastMessage::new("test", serde_json::json!({ "data": "test" }), "sender-1");
 
 		manager.broadcast("test-channel", msg.clone()).await.unwrap();
 
