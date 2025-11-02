@@ -156,8 +156,8 @@ pub trait Task<S: Clone>: Send + Sync + Debug {
 #[derive(Debug)]
 pub enum TaskStatus {
 	Pending,
-	Finished,
-	Error,
+	Completed,
+	Failed,
 }
 
 pub struct TaskData {
@@ -249,9 +249,9 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 			kind: t.kind,
 			status: match t.status {
 				'P' => TaskStatus::Pending,
-				'F' => TaskStatus::Finished,
-				'E' => TaskStatus::Error,
-				_ => TaskStatus::Error,
+				'F' => TaskStatus::Completed,
+				'E' => TaskStatus::Failed,
+				_ => TaskStatus::Failed,
 			},
 			input: t.input,
 			deps: t.deps,
@@ -503,7 +503,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 		tokio::spawn(async move {
 			while let Ok(id) = rx_finish.recv_async().await {
-				info!("Finished task {}", id);
+				info!("Completed task {}", id);
 
 				// Check if this is a recurring task with cron schedule
 				let is_recurring = {
@@ -920,7 +920,7 @@ mod tests {
 		async fn run(&self, state: &State) -> ClResult<()> {
 			info!("Running task {}", self.num);
 			tokio::time::sleep(std::time::Duration::from_millis(200 * self.num as u64)).await;
-			info!("Finished task {}", self.num);
+			info!("Completed task {}", self.num);
 			state.lock().unwrap().push(self.num);
 			Ok(())
 		}
