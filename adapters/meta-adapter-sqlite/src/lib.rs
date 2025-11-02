@@ -2189,13 +2189,11 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		tn_id: TnId,
 		opts: &meta_adapter::ListRefsOptions,
 	) -> ClResult<Vec<meta_adapter::RefData>> {
-		let mut query = sqlx::QueryBuilder::new("SELECT ref_id, type, description, created_at, expires_at, count FROM refs WHERE tn_id = ?");
+		let mut query = sqlx::QueryBuilder::new("SELECT ref_id, type, description, created_at, expires_at, count FROM refs WHERE tn_id = ");
 		query.push_bind(tn_id.0);
 
-		if let Some(ref typ) = opts.typ {
-			query.push(" AND type = ");
-			query.push_bind(typ.as_ref());
-		}
+		query.push(" AND type = ");
+		query.push_bind(opts.typ.as_deref());
 
 		if let Some(ref filter) = opts.filter {
 			let now = cloudillo::types::Timestamp::now();
@@ -2211,11 +2209,12 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				"expired" => {
 					query.push(" AND expires_at IS NOT NULL AND expires_at <= ");
 					query.push_bind(now.0);
-					query.push(")");
 				}
 				_ => {} // 'all' - no filter
 			}
 		}
+
+		query.push(" ORDER BY created_at DESC, description");
 
 		let rows = query
 			.build()

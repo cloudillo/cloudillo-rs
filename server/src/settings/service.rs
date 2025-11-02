@@ -130,26 +130,33 @@ impl SettingsService {
 		}
 
 		// Check scope validity
-		match (def.scope, tn_id.0) {
+		// Determine the actual tn_id to use for storage
+		let storage_tn_id = match (def.scope, tn_id.0) {
 			(SettingScope::System, _) => {
 				return Err(Error::PermissionDenied);
 			}
 			(SettingScope::Global, 0) => {
 				// OK: Setting global value
+				TnId(0)
 			}
 			(SettingScope::Global, _) => {
-				return Err(Error::ValidationError(
-					"This setting has Global scope and must be set with tn_id=0".into(),
-				));
+				// Admin users can update global settings from their tenant context
+				// The setting is stored with tn_id=0 to be global
+				if !roles.iter().any(|r| r.as_ref() == "SADM") {
+					return Err(Error::PermissionDenied);
+				}
+				TnId(0)
 			}
 			(SettingScope::Tenant, 0) => {
 				// Setting global default for tenant-scoped setting
 				// This is OK - acts as default for all tenants
+				TnId(0)
 			}
 			(SettingScope::Tenant, _) => {
 				// OK: Setting tenant-specific value
+				tn_id
 			}
-		}
+		};
 
 		// Validate type matches definition (if default exists)
 		if let Some(default) = &def.default {
@@ -171,10 +178,10 @@ impl SettingsService {
 		// Convert to JSON and save to database
 		let json_value = serde_json::to_value(&value)
 			.map_err(|e| Error::ValidationError(format!("Failed to serialize setting: {}", e)))?;
-		self.meta.update_setting(tn_id, key, Some(json_value)).await?;
+		self.meta.update_setting(storage_tn_id, key, Some(json_value)).await?;
 
 		// Invalidate cache
-		if tn_id.0 == 0 {
+		if storage_tn_id.0 == 0 {
 			// Global setting changed, invalidate all tenants for this key
 			self.cache.invalidate_key(key);
 		} else {
@@ -182,13 +189,13 @@ impl SettingsService {
 			self.cache.clear();
 		}
 
-		info!("Setting '{}' updated for tn_id={}", key, tn_id.0);
+		info!("Setting '{}' updated for tn_id={}", key, storage_tn_id.0);
 
 		// Return the setting (note: the current adapter doesn't track updated_at, so we use now)
 		Ok(Setting {
 			key: key.to_string(),
 			value,
-			tn_id,
+			tn_id: storage_tn_id,
 			updated_at: crate::types::Timestamp::now(),
 		})
 	}

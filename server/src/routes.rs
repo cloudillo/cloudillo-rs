@@ -89,10 +89,10 @@ fn init_api_service(app: App) -> Router {
 		.route("/api/settings/{name}", put(settings::handler::update_setting))
 
 		// Reference API
-		.route("/api/ref", get(r#ref::handler::list_refs))
-		.route("/api/ref", post(r#ref::handler::create_ref))
-		.route("/api/ref/{ref_id}", get(r#ref::handler::get_ref))
-		.route("/api/ref/{ref_id}", delete(r#ref::handler::delete_ref))
+		.route("/api/refs", get(r#ref::handler::list_refs))
+		.route("/api/refs", post(r#ref::handler::create_ref))
+		.route("/api/refs/{ref_id}", get(r#ref::handler::get_ref))
+		.route("/api/refs/{ref_id}", delete(r#ref::handler::delete_ref))
 
 		// Action API
 		.route("/api/action", get(action::handler::list_actions))

@@ -43,7 +43,7 @@ impl PermissionLevel {
 	pub fn check<S: AsRef<str>>(&self, roles: &[S]) -> bool {
 		match self {
 			PermissionLevel::System => false, // Never changeable
-			PermissionLevel::Admin => roles.iter().any(|r| r.as_ref() == "admin"),
+			PermissionLevel::Admin => roles.iter().any(|r| r.as_ref() == "SADM"),
 			PermissionLevel::User => true, // Any authenticated user
 		}
 	}
