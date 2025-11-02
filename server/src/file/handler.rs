@@ -209,10 +209,28 @@ async fn handle_post_image(
 		)
 		.await?;
 
+	// Get maximum variant size to generate
+	let max_generate_variant = app
+		.settings
+		.get_string(tn_id, "file.max_generate_variant")
+		.await
+		.unwrap_or_else(|_| "hd".to_string()); // Default to hd if setting not found
+
+	// Map variant name to index to limit generation
+	let max_variant_index = match max_generate_variant.as_str() {
+		"tn" => 0,
+		"sd" => 0, // sd is index 0 in variant_configs
+		"md" => 1,
+		"hd" => 2,
+		"xd" => 3,
+		_ => 2, // Default to hd (index 2) for unknown values
+	};
+
 	// Smart variant creation: skip creating variants if image is too small or too close in size
 	const SKIP_THRESHOLD: f32 = 0.10; // Skip variant if it's less than 10% larger than previous
 	let original_max = orig_dim.0.max(orig_dim.1) as f32;
 	info!("Image dimensions: {}x{}, max: {}", orig_dim.0, orig_dim.1, original_max);
+	info!("Max variant to generate: {}", max_generate_variant);
 
 	// Variant configurations: (name, bounding_box_size)
 	let variant_configs = [("sd", 720_u32), ("md", 1280_u32), ("hd", 1920_u32), ("xd", 3840_u32)];
@@ -220,7 +238,14 @@ async fn handle_post_image(
 	let mut variant_task_ids = Vec::new();
 	let mut last_created_size = 128_f32; // Start after tn (128px)
 
-	for (variant_name, variant_bbox) in &variant_configs {
+	for (idx, (variant_name, variant_bbox)) in variant_configs.iter().enumerate() {
+		if idx > max_variant_index {
+			info!(
+				"Skipping variant {} - exceeds max_generate_variant setting ({})",
+				variant_name, max_generate_variant
+			);
+			break;
+		}
 		let variant_bbox_f = *variant_bbox as f32;
 
 		// Determine actual size: cap at original to avoid upscaling
@@ -351,9 +376,14 @@ pub async fn post_file_blob(
 		.unwrap_or("application/octet-stream");
 	//info!("content_type: {} {:?}", content_type, header.get(axum::http::header::CONTENT_TYPE));
 
+	// Get max file size from settings
+	let max_size_mb = app.settings.get_int(tn_id, "file.max_file_size_mb").await
+		.map(|v| v as usize * 1_000_000) // Convert MB to bytes
+		.unwrap_or(50_000_000); // Default to 50MB if setting not found
+
 	match content_type {
 		"image/jpeg" | "image/png" | "image/webp" | "image/avif" => {
-			let bytes = to_bytes(body, 50000000).await?;
+			let bytes = to_bytes(body, max_size_mb).await?;
 			let orig_variant_id = hasher::hash("b", &bytes);
 			let dim = image::get_image_dimensions(&bytes).await?;
 			info!("dimensions: {}/{}", dim.0, dim.1);

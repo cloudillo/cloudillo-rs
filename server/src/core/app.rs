@@ -16,6 +16,8 @@ use crate::blob_adapter::BlobAdapter;
 use crate::crdt_adapter::CrdtAdapter;
 use crate::meta_adapter::MetaAdapter;
 use crate::rtdb_adapter::RtdbAdapter;
+use crate::settings::service::SettingsService;
+use crate::settings::{FrozenSettingsRegistry, SettingsRegistry};
 
 use crate::{action, file, routes};
 
@@ -43,6 +45,10 @@ pub struct AppState {
 	pub blob_adapter: Arc<dyn BlobAdapter>,
 	pub crdt_adapter: Arc<dyn CrdtAdapter>,
 	pub rtdb_adapter: Arc<dyn RtdbAdapter>,
+
+	// Settings subsystem
+	pub settings: Arc<SettingsService>,
+	pub settings_registry: Arc<FrozenSettingsRegistry>,
 }
 
 pub type App = Arc<AppState>;
@@ -204,6 +210,37 @@ impl AppBuilder {
 		let meta_adapter = self.adapters.meta_adapter.expect("FATAL: No meta adapter");
 		let task_store: Arc<dyn scheduler::TaskStore<App>> =
 			scheduler::MetaAdapterTaskStore::new(meta_adapter.clone());
+		// Initialize settings registry and service
+		let mut settings_registry = SettingsRegistry::new();
+
+		// Register settings from core module
+		crate::core::settings::register_settings(&mut settings_registry)?;
+
+		// Register settings from auth module
+		crate::auth::settings::register_settings(&mut settings_registry)?;
+
+		// Register settings from action/federation module
+		crate::action::settings::register_settings(&mut settings_registry)?;
+
+		// Register settings from file module
+		crate::file::settings::register_settings(&mut settings_registry)?;
+
+		info!("Registered {} settings", settings_registry.len());
+
+		// Freeze the registry
+		let frozen_registry = Arc::new(settings_registry.freeze());
+
+		// Create settings service
+		let settings_service = Arc::new(SettingsService::new(
+			frozen_registry.clone(),
+			meta_adapter.clone(),
+			1000, // LRU cache size
+		));
+
+		// Validate required settings are configured
+		settings_service.validate_required_settings().await?;
+		info!("Settings subsystem initialized and validated");
+
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker: self.worker.expect("FATAL: No worker pool defined"),
@@ -219,6 +256,10 @@ impl AppBuilder {
 			blob_adapter: self.adapters.blob_adapter.expect("FATAL: No blob adapter"),
 			crdt_adapter: self.adapters.crdt_adapter.expect("FATAL: No CRDT adapter"),
 			rtdb_adapter: self.adapters.rtdb_adapter.expect("FATAL: No RTDB adapter"),
+
+			// Settings
+			settings: settings_service,
+			settings_registry: frozen_registry,
 		});
 		tokio::fs::create_dir_all(&app.opts.tmp_dir)
 			.await

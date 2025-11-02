@@ -76,6 +76,14 @@ pub async fn post_inbox(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(action): Json<Inbox>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+	// Check if federation is enabled
+	let federation_enabled =
+		app.settings.get_bool(tn_id, "federation.enabled").await.unwrap_or(true); // Default to true if setting not found
+
+	if !federation_enabled {
+		return Err(Error::PermissionDenied);
+	}
+
 	let _action_id = hash("a", action.token.as_bytes());
 
 	let task = ActionVerifierTask::new(tn_id, action.token);

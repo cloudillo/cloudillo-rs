@@ -4,6 +4,7 @@ pub mod delivery;
 pub mod handler;
 pub mod perm;
 mod process;
+pub mod settings;
 pub mod task;
 pub mod types;
 

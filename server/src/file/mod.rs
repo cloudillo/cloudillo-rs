@@ -5,6 +5,7 @@ pub mod handler;
 pub mod image;
 pub mod management;
 pub mod perm;
+pub mod settings;
 pub mod store;
 pub mod tag;
 
