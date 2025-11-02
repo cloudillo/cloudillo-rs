@@ -100,7 +100,8 @@ pub struct Webauthn<'a> {
 pub struct CreateTenantData<'a> {
 	pub vfy_code: Option<&'a str>,
 	pub email: Option<&'a str>,
-	pub password: &'a str,
+	pub password: Option<&'a str>,
+	pub roles: Option<&'a [&'a str]>,
 }
 
 /// Certificate associated with a tenant
@@ -139,12 +140,9 @@ pub trait AuthAdapter: Debug + Send + Sync {
 
 	/// Creates a new tenant
 	/// If vfy_code is provided, validates it against the email in user_vfy table
-	async fn create_tenant(
-		&self,
-		id_tag: &str,
-		email: Option<&str>,
-		vfy_code: Option<&str>,
-	) -> ClResult<TnId>;
+	/// If password is provided, sets the tenant password
+	/// If roles are provided, assigns them to the tenant
+	async fn create_tenant(&self, id_tag: &str, data: CreateTenantData<'_>) -> ClResult<TnId>;
 
 	/// Deletes a tenant
 	async fn delete_tenant(&self, id_tag: &str) -> ClResult<()>;

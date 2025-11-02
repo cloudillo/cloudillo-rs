@@ -8,7 +8,7 @@
 
 #[cfg(test)]
 mod tests {
-	use cloudillo::auth_adapter::AuthAdapter;
+	use cloudillo::auth_adapter::{AuthAdapter, CreateTenantData};
 	use cloudillo::core::worker::WorkerPool;
 	use cloudillo::prelude::*;
 	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
@@ -72,7 +72,15 @@ mod tests {
 
 		// Step 3: Create tenant with valid verification code
 		let tn_id = adapter
-			.create_tenant(id_tag, Some(email), Some(&vfy_code))
+			.create_tenant(
+				id_tag,
+				CreateTenantData {
+					vfy_code: Some(&vfy_code),
+					email: Some(email),
+					password: None,
+					roles: None,
+				},
+			)
 			.await
 			.expect("Failed to create tenant with verification code");
 
@@ -95,7 +103,17 @@ mod tests {
 			.expect("Failed to create registration");
 
 		// Try to create tenant with invalid code
-		let result = adapter.create_tenant(id_tag, Some(email), Some(invalid_code)).await;
+		let result = adapter
+			.create_tenant(
+				id_tag,
+				CreateTenantData {
+					vfy_code: Some(invalid_code),
+					email: Some(email),
+					password: None,
+					roles: None,
+				},
+			)
+			.await;
 
 		// Should fail with PermissionDenied
 		assert!(result.is_err());
@@ -133,7 +151,17 @@ mod tests {
 		};
 
 		// Try to create tenant with email2 using code for email1
-		let result = adapter.create_tenant(id_tag, Some(email2), Some(&vfy_code)).await;
+		let result = adapter
+			.create_tenant(
+				id_tag,
+				CreateTenantData {
+					vfy_code: Some(&vfy_code),
+					email: Some(email2),
+					password: None,
+					roles: None,
+				},
+			)
+			.await;
 
 		// Should fail - code doesn't match email
 		assert!(result.is_err());
@@ -171,12 +199,30 @@ mod tests {
 
 		// Create tenant with code
 		adapter
-			.create_tenant(id_tag, Some(email), Some(&vfy_code))
+			.create_tenant(
+				id_tag,
+				CreateTenantData {
+					vfy_code: Some(&vfy_code),
+					email: Some(email),
+					password: None,
+					roles: None,
+				},
+			)
 			.await
 			.expect("Failed to create tenant");
 
 		// Try to reuse the same code
-		let result = adapter.create_tenant("test_user_2", Some(email), Some(&vfy_code)).await;
+		let result = adapter
+			.create_tenant(
+				"test_user_2",
+				CreateTenantData {
+					vfy_code: Some(&vfy_code),
+					email: Some(email),
+					password: None,
+					roles: None,
+				},
+			)
+			.await;
 
 		// Should fail - code was consumed
 		assert!(result.is_err());
@@ -212,7 +258,15 @@ mod tests {
 		};
 
 		let _tn_id = adapter
-			.create_tenant(id_tag, Some(email), Some(&vfy_code))
+			.create_tenant(
+				id_tag,
+				CreateTenantData {
+					vfy_code: Some(&vfy_code),
+					email: Some(email),
+					password: None,
+					roles: None,
+				},
+			)
 			.await
 			.expect("Failed to create tenant");
 
@@ -271,7 +325,15 @@ mod tests {
 		};
 
 		adapter
-			.create_tenant(id_tag, Some(email), Some(&vfy_code))
+			.create_tenant(
+				id_tag,
+				CreateTenantData {
+					vfy_code: Some(&vfy_code),
+					email: Some(email),
+					password: None,
+					roles: None,
+				},
+			)
 			.await
 			.expect("Failed to create first tenant");
 

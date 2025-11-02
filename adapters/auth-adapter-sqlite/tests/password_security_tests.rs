@@ -10,7 +10,7 @@
 
 #[cfg(test)]
 mod tests {
-	use cloudillo::auth_adapter::AuthAdapter;
+	use cloudillo::auth_adapter::{AuthAdapter, CreateTenantData};
 	use cloudillo::core::worker::WorkerPool;
 	use cloudillo::prelude::*;
 	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
@@ -32,8 +32,17 @@ mod tests {
 		id_tag: &str,
 		password: &str,
 	) -> ClResult<TnId> {
-		let tn_id = adapter.create_tenant(id_tag, None, None).await?;
-		adapter.update_tenant_password(id_tag, password.into()).await?;
+		let tn_id = adapter
+			.create_tenant(
+				id_tag,
+				CreateTenantData {
+					vfy_code: None,
+					email: None,
+					password: Some(password),
+					roles: None,
+				},
+			)
+			.await?;
 		Ok(tn_id)
 	}
 
@@ -189,7 +198,10 @@ mod tests {
 
 		// Create tenant
 		let _tn_id = adapter
-			.create_tenant(id_tag, None, None)
+			.create_tenant(
+				id_tag,
+				CreateTenantData { vfy_code: None, email: None, password: None, roles: None },
+			)
 			.await
 			.expect("Failed to create tenant");
 

@@ -248,12 +248,11 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 	async fn create_tenant(
 		&self,
 		id_tag: &str,
-		email: Option<&str>,
-		vfy_code: Option<&str>,
+		data: auth_adapter::CreateTenantData<'_>,
 	) -> ClResult<TnId> {
 		// If verification code is provided, validate it
-		if let Some(vfy_code) = vfy_code {
-			if let Some(email_addr) = email {
+		if let Some(vfy_code) = data.vfy_code {
+			if let Some(email_addr) = data.email {
 				// Query user_vfy table to validate code matches email
 				let row = sqlx::query("SELECT email FROM user_vfy WHERE vfy_code = ?1")
 					.bind(vfy_code)
@@ -287,15 +286,27 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			}
 		}
 
+		// Convert roles slice to comma-separated string if provided
+		let roles_str = data.roles.map(|roles| roles.join(","));
+
 		let res = sqlx::query(
-			"INSERT INTO tenants (id_tag, email, status) VALUES (?1, ?2, 'A') RETURNING tn_id",
+			"INSERT INTO tenants (id_tag, email, roles, status) VALUES (?1, ?2, ?3, 'A') RETURNING tn_id",
 		)
 		.bind(id_tag)
-		.bind(email)
+		.bind(data.email)
+		.bind(roles_str.as_deref())
 		.fetch_one(&self.db)
 		.await;
 
-		map_res(res, |row| row.try_get("tn_id").map(TnId))
+		let tn_id = map_res(res, |row| row.try_get("tn_id").map(TnId))?;
+
+		// Set password if provided
+		if let Some(password) = data.password {
+			self.update_tenant_password(id_tag, password.to_string().into_boxed_str())
+				.await?;
+		}
+
+		Ok(tn_id)
 	}
 
 	async fn delete_tenant(&self, id_tag: &str) -> ClResult<()> {

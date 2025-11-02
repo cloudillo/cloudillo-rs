@@ -9,7 +9,7 @@
 
 #[cfg(test)]
 mod tests {
-	use cloudillo::auth_adapter::AuthAdapter;
+	use cloudillo::auth_adapter::{AuthAdapter, CreateTenantData};
 	use cloudillo::core::worker::WorkerPool;
 	use cloudillo::prelude::*;
 	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
@@ -34,7 +34,10 @@ mod tests {
 
 		// Create a tenant first
 		adapter
-			.create_tenant(id_tag, None, None)
+			.create_tenant(
+				id_tag,
+				CreateTenantData { vfy_code: None, email: None, password: None, roles: None },
+			)
 			.await
 			.expect("Failed to create tenant");
 
@@ -63,7 +66,10 @@ mod tests {
 
 		// Create a tenant
 		adapter
-			.create_tenant(id_tag, None, None)
+			.create_tenant(
+				id_tag,
+				CreateTenantData { vfy_code: None, email: None, password: None, roles: None },
+			)
 			.await
 			.expect("Failed to create tenant");
 
@@ -117,7 +123,10 @@ mod tests {
 
 		// Create a tenant
 		adapter
-			.create_tenant(id_tag, None, None)
+			.create_tenant(
+				id_tag,
+				CreateTenantData { vfy_code: None, email: None, password: None, roles: None },
+			)
 			.await
 			.expect("Failed to create tenant");
 
@@ -206,7 +215,10 @@ mod tests {
 
 		// Create a tenant
 		adapter
-			.create_tenant(id_tag, None, None)
+			.create_tenant(
+				id_tag,
+				CreateTenantData { vfy_code: None, email: None, password: None, roles: None },
+			)
 			.await
 			.expect("Failed to create tenant");
 
@@ -249,7 +261,10 @@ mod tests {
 
 		// Create a tenant
 		adapter
-			.create_tenant(id_tag, None, None)
+			.create_tenant(
+				id_tag,
+				CreateTenantData { vfy_code: None, email: None, password: None, roles: None },
+			)
 			.await
 			.expect("Failed to create tenant");
 
@@ -294,12 +309,18 @@ mod tests {
 
 		// Create two tenants
 		adapter
-			.create_tenant("tenant1_webauthn", None, None)
+			.create_tenant(
+				"tenant1_webauthn",
+				CreateTenantData { vfy_code: None, email: None, password: None, roles: None },
+			)
 			.await
 			.expect("Failed to create tenant 1");
 
 		adapter
-			.create_tenant("tenant2_webauthn", None, None)
+			.create_tenant(
+				"tenant2_webauthn",
+				CreateTenantData { vfy_code: None, email: None, password: None, roles: None },
+			)
 			.await
 			.expect("Failed to create tenant 2");
 
@@ -354,7 +375,10 @@ mod tests {
 
 		// Create a tenant
 		adapter
-			.create_tenant(id_tag, None, None)
+			.create_tenant(
+				id_tag,
+				CreateTenantData { vfy_code: None, email: None, password: None, roles: None },
+			)
 			.await
 			.expect("Failed to create tenant");
 
@@ -392,7 +416,10 @@ mod tests {
 
 		// Create a tenant
 		adapter
-			.create_tenant(id_tag, None, None)
+			.create_tenant(
+				id_tag,
+				CreateTenantData { vfy_code: None, email: None, password: None, roles: None },
+			)
 			.await
 			.expect("Failed to create tenant");
 

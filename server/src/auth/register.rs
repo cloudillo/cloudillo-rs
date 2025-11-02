@@ -7,6 +7,7 @@ use axum::{
 use serde_json::json;
 
 use crate::{
+	auth_adapter::CreateTenantData,
 	meta_adapter::{Profile, ProfileType},
 	prelude::*,
 	types::{RegisterRequest, RegisterVerifyRequest, TnId},
@@ -113,14 +114,17 @@ pub async fn post_register_verify(
 	}
 
 	// Create tenant with verification code
-	// Note: The create_tenant method expects email + vfy_code to validate
-	// We need to find the email associated with the verify token
-	// For now, we'll create the tenant without the vfy_code
-	// This will be improved when auth_adapter has a method to get email from token
-
 	let tn_id = app
 		.auth_adapter
-		.create_tenant(&req.id_tag, None, Some(&req.verify_token))
+		.create_tenant(
+			&req.id_tag,
+			CreateTenantData {
+				vfy_code: Some(&req.verify_token),
+				email: None,
+				password: None,
+				roles: None,
+			},
+		)
 		.await?;
 
 	// Create initial profile

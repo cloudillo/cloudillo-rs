@@ -369,8 +369,17 @@ async fn bootstrap(app: Arc<AppState>, opts: &AppBuilderOpts) -> ClResult<()> {
 			let base_password = opts.base_password.clone().expect("FATAL: No base password");
 
 			info!("Creating tenant {}", base_id_tag);
-			let tn_id = auth.create_tenant(base_id_tag, None, None).await?;
-			auth.update_tenant_password(base_id_tag, base_password).await?;
+			let tn_id = auth
+				.create_tenant(
+					base_id_tag,
+					crate::auth_adapter::CreateTenantData {
+						vfy_code: None,
+						email: None,
+						password: Some(&base_password),
+						roles: Some(&["SADM"]),
+					},
+				)
+				.await?;
 			auth.create_profile_key(tn_id, None).await?;
 		}
 		if let Some(ref acme_email) = opts.acme_email {
