@@ -34,9 +34,6 @@ pub struct CrdtUpdate {
 	/// Raw bytes of the update in Yjs sync protocol format
 	pub data: Vec<u8>,
 
-	/// Timestamp when this update was stored (Unix seconds)
-	pub timestamp: Timestamp,
-
 	/// Optional user/client ID that created this update
 	pub client_id: Option<Box<str>>,
 }
@@ -44,12 +41,12 @@ pub struct CrdtUpdate {
 impl CrdtUpdate {
 	/// Create a new CRDT update from raw bytes.
 	pub fn new(data: Vec<u8>) -> Self {
-		Self { data, timestamp: Timestamp::now(), client_id: None }
+		Self { data, client_id: None }
 	}
 
 	/// Create a new CRDT update with client ID.
 	pub fn with_client(data: Vec<u8>, client_id: impl Into<Box<str>>) -> Self {
-		Self { data, timestamp: Timestamp::now(), client_id: Some(client_id.into()) }
+		Self { data, client_id: Some(client_id.into()) }
 	}
 }
 

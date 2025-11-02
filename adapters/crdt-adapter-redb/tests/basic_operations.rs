@@ -33,7 +33,6 @@ async fn test_create_and_store_update() {
 
 	let update = CrdtUpdate {
 		data: vec![0x01, 0x02, 0x03],
-		timestamp: 1698499200,
 		client_id: Some("client1".into()),
 	};
 
@@ -46,8 +45,6 @@ async fn test_create_and_store_update() {
 
 	assert_eq!(updates.len(), 1);
 	assert_eq!(updates[0].data, vec![0x01, 0x02, 0x03]);
-	// Adapter preserves timestamp and data
-	assert!(updates[0].timestamp > 0);
 	// Note: client_id may not be persisted depending on adapter implementation
 	assert!(updates[0].client_id.is_some() || updates[0].client_id.is_none());
 }
@@ -71,8 +68,7 @@ async fn test_multiple_updates() {
 
 	// Store 3 updates
 	for i in 1..=3 {
-		let update =
-			CrdtUpdate { data: vec![i as u8], timestamp: 1698499200 + i as u64, client_id: None };
+		let update = CrdtUpdate { data: vec![i as u8], client_id: None };
 
 		adapter
 			.store_update(tn_id, doc_id, update)
@@ -122,7 +118,7 @@ async fn test_delete_document() {
 	let doc_id = "doc4";
 
 	// Store an update
-	let update = CrdtUpdate { data: vec![0xFF], timestamp: 1698499200, client_id: None };
+	let update = CrdtUpdate { data: vec![0xFF], client_id: None };
 
 	adapter
 		.store_update(tn_id, doc_id, update)
@@ -146,9 +142,9 @@ async fn test_per_tenant_isolation() {
 	let (adapter, _temp) = create_test_adapter().await;
 	let doc_id = "shared-doc";
 
-	let update1 = CrdtUpdate { data: vec![0x11], timestamp: 1698499200, client_id: None };
+	let update1 = CrdtUpdate { data: vec![0x11], client_id: None };
 
-	let update2 = CrdtUpdate { data: vec![0x22], timestamp: 1698499300, client_id: None };
+	let update2 = CrdtUpdate { data: vec![0x22], client_id: None };
 
 	adapter.store_update(TnId(1), doc_id, update1).await.expect("Failed to store");
 
@@ -185,7 +181,7 @@ async fn test_large_binary_update() {
 	// Create 100KB update
 	let large_data = vec![0xAB; 102400];
 
-	let update = CrdtUpdate { data: large_data.clone(), timestamp: 1698499200, client_id: None };
+	let update = CrdtUpdate { data: large_data.clone(), client_id: None };
 
 	adapter.store_update(tn_id, doc_id, update).await.expect("Failed to store");
 
