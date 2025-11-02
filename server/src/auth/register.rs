@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::{
 	meta_adapter::{Profile, ProfileType},
 	prelude::*,
-	types::{RegisterRequest, RegisterVerifyRequest},
+	types::{RegisterRequest, RegisterVerifyRequest, TnId},
 };
 
 /// POST /auth/register - Register new user with email
@@ -40,15 +40,41 @@ pub async fn post_register(
 		let token = app.auth_adapter.create_registration_verification(email).await?;
 
 		// Send verification email to user
-		// In production, this would send a real email via SMTP
-		// For now, we log the verification information
 		let verification_link = format!("https://{}/auth/register-verify", &req.id_tag);
 
 		info!("Registration verification initiated for email: {}", email);
 		info!("Verification link (for manual testing): {}", verification_link);
-
-		// Log the actual token for development/testing
 		debug!("Verification token: {}", token);
+
+		// Queue verification email with template rendering
+		// Note: This will fail silently if email is not configured (email.enabled = false)
+		// Template will be rendered at execution time, not now
+		let template_vars = serde_json::json!({
+			"user_name": req.id_tag,
+			"verification_token": token,
+			"verification_link": verification_link,
+			"instance_name": "Cloudillo",
+		});
+
+		match crate::email::EmailModule::schedule_email_task(
+			&app.scheduler,
+			&app.settings,
+			TnId(0), // Use instance-level settings for registration emails
+			email.to_string(),
+			"Verify your email address".to_string(),
+			"verification".to_string(),
+			template_vars,
+		)
+		.await
+		{
+			Ok(_) => {
+				info!("Verification email queued for {}", email);
+			}
+			Err(e) => {
+				warn!("Failed to queue verification email: {}", e);
+				// Don't fail registration if email queueing fails
+			}
+		}
 
 		Some(token)
 	} else {

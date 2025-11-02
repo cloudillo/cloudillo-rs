@@ -28,6 +28,7 @@ pub mod blob_adapter;
 pub mod core;
 pub mod crdt;
 pub mod crdt_adapter;
+pub mod email;
 pub mod error;
 pub mod file;
 pub mod meta_adapter;

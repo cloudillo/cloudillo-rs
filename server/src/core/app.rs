@@ -49,6 +49,9 @@ pub struct AppState {
 	// Settings subsystem
 	pub settings: Arc<SettingsService>,
 	pub settings_registry: Arc<FrozenSettingsRegistry>,
+
+	// Email module
+	pub email_module: Arc<crate::email::EmailModule>,
 }
 
 pub type App = Arc<AppState>;
@@ -225,6 +228,9 @@ impl AppBuilder {
 		// Register settings from file module
 		crate::file::settings::register_settings(&mut settings_registry)?;
 
+		// Register settings from email module
+		crate::email::settings::register_settings(&mut settings_registry)?;
+
 		info!("Registered {} settings", settings_registry.len());
 
 		// Freeze the registry
@@ -240,6 +246,9 @@ impl AppBuilder {
 		// Validate required settings are configured
 		settings_service.validate_required_settings().await?;
 		info!("Settings subsystem initialized and validated");
+
+		// Initialize email module
+		let email_module = Arc::new(crate::email::EmailModule::new(settings_service.clone())?);
 
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
@@ -260,6 +269,9 @@ impl AppBuilder {
 			// Settings
 			settings: settings_service,
 			settings_registry: frozen_registry,
+
+			// Email module
+			email_module,
 		});
 		tokio::fs::create_dir_all(&app.opts.tmp_dir)
 			.await
@@ -268,6 +280,7 @@ impl AppBuilder {
 		// Init modules
 		action::init(&app)?;
 		file::init(&app)?;
+		crate::email::init(&app)?;
 		let (api_router, app_router, http_router) = routes::init(app.clone());
 
 		// Start scheduler
