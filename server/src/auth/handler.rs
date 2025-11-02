@@ -160,10 +160,46 @@ pub struct PasswordReq {
 
 pub async fn post_password(
 	State(app): State<App>,
+	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<PasswordReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+	// Authorization: Users can only change their own password
+	if auth.id_tag.as_ref() != req.id_tag.as_ref() {
+		warn!("User {} attempted to change password for {}", auth.id_tag, req.id_tag);
+		return Err(Error::PermissionDenied);
+	}
+
+	// Validate new password strength
+	if req.new_password.len() < 8 {
+		return Err(Error::ValidationError("Password must be at least 8 characters".into()));
+	}
+
+	if req.new_password.trim().is_empty() {
+		return Err(Error::ValidationError("Password cannot be empty or only whitespace".into()));
+	}
+
+	if req.new_password == req.password {
+		return Err(Error::ValidationError(
+			"New password must be different from current password".into(),
+		));
+	}
+
+	// Verify current password
+	let verification =
+		app.auth_adapter.check_tenant_password(&req.id_tag, req.password.clone()).await;
+
+	if verification.is_err() {
+		// Delay to prevent timing attacks
+		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+		warn!("Failed password verification for user {}", req.id_tag);
+		return Err(Error::PermissionDenied);
+	}
+
+	// Update to new password
 	app.auth_adapter.update_tenant_password(&req.id_tag, req.new_password).await?;
+
+	info!("User {} successfully changed their password", auth.id_tag);
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 

@@ -115,6 +115,9 @@ fn init_api_service(app: App) -> Router {
 		// Tag API
 		.route("/api/tag", get(file::tag::list_tags))
 
+		// Password change (requires authentication)
+		.route("/api/auth/password", post(auth::handler::post_password))
+
 		.route_layer(middleware::from_fn_with_state(app.clone(), require_auth))
 		.layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-cache")))
 		.layer(SetResponseHeaderLayer::if_not_present(header::EXPIRES, header::HeaderValue::from_static("0")));
@@ -129,7 +132,6 @@ fn init_api_service(app: App) -> Router {
 		.route("/api/auth/register", post(auth::register::post_register))
 		.route("/api/auth/register-verify", post(auth::register::post_register_verify))
 		.route("/api/auth/login", post(auth::handler::post_login))
-		.route("/api/auth/password", post(auth::handler::post_password))
 		.route("/api/auth/access-token", get(auth::handler::get_access_token))
 
 		// Inbox
