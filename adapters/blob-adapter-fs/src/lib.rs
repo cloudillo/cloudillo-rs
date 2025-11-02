@@ -97,7 +97,7 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		let mut hasher = hasher::Hasher::new();
 		let mut buf = [0u8; 8192];
 
-		let res = (async || -> Result<(), Error> {
+		let res = async {
 			loop {
 				let n = stream.read(&mut buf).await?;
 				if n == 0 {
@@ -110,8 +110,8 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 
 			tokio::fs::rename(&tmp_path, obj_file_path(&self.base_dir, tn_id, &id)?).await?;
 			info!("  attachment downloaded, check: {} ?= {}", &id, &file_id);
-			Ok(())
-		})()
+			Ok::<(), Error>(())
+		}
 		.await;
 		if res.is_err() {
 			info!("  attachment download failed, removing tmpfile: {:?}", &tmp_path);
@@ -159,7 +159,7 @@ mod test {
 	#[test]
 	fn test_obj_dir() {
 		let file_id = "f1~1234567890";
-		let dir = obj_dir(Path::new("some_dir"), TnId(42), &file_id).unwrap_or_default();
+		let dir = obj_dir(Path::new("some_dir"), TnId(42), file_id).unwrap_or_default();
 		assert_eq!(dir, PathBuf::from("some_dir/42/12/34"));
 	}
 }

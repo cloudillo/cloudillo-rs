@@ -1394,7 +1394,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 						FROM file_variants WHERE tn_id=? AND f_id=?",
 					)
 					.bind(tn_id.0)
-					.bind(&f_id)
+					.bind(f_id)
 					.fetch_all(&self.dbr)
 					.await
 					.inspect_err(inspect)
@@ -1706,11 +1706,11 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			field_count += 1;
 		}
 
-		if description.is_some() {
+		if let Some(desc) = description {
 			if field_count > 0 {
 				query.push_str(", ");
 			}
-			if description.is_some() && !description.unwrap().is_empty() {
+			if !desc.is_empty() {
 				query.push_str("description = ?");
 			} else {
 				query.push_str("description = NULL");
@@ -1718,11 +1718,11 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			field_count += 1;
 		}
 
-		if location.is_some() {
+		if let Some(loc) = location {
 			if field_count > 0 {
 				query.push_str(", ");
 			}
-			if location.is_some() && !location.unwrap().is_empty() {
+			if !loc.is_empty() {
 				query.push_str("location = ?");
 			} else {
 				query.push_str("location = NULL");
@@ -1730,11 +1730,11 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			field_count += 1;
 		}
 
-		if website.is_some() {
+		if let Some(site) = website {
 			if field_count > 0 {
 				query.push_str(", ");
 			}
-			if website.is_some() && !website.unwrap().is_empty() {
+			if !site.is_empty() {
 				query.push_str("website = ?");
 			} else {
 				query.push_str("website = NULL");
@@ -2097,10 +2097,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 	) -> ClResult<std::collections::HashMap<String, serde_json::Value>> {
 		let rows = if let Some(prefixes) = prefix {
 			// Filter by prefixes: only include settings that start with one of the prefixes
-			let mut conditions = Vec::new();
-			for _ in prefixes {
-				conditions.push("name LIKE ? || '%'");
-			}
+			let conditions = vec!["name LIKE ? || '%'"; prefixes.len()];
 			let where_clause = conditions.join(" OR ");
 			let query_str =
 				format!("SELECT name, value FROM settings WHERE tn_id = ? AND ({})", where_clause);

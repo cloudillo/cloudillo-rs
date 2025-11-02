@@ -77,10 +77,14 @@ struct CrdtConnection {
 	connected_at: u64,
 }
 
+/// Type alias for the CRDT document registry
+type CrdtDocRegistry = tokio::sync::RwLock<
+	HashMap<String, Arc<tokio::sync::broadcast::Sender<(String, AwarenessState)>>>,
+>;
+
 // Global registry of CRDT documents and their connections
-#[allow(clippy::type_complexity)]
 lazy_static::lazy_static! {
-	static ref CRDT_DOCS: tokio::sync::RwLock<HashMap<String, Arc<tokio::sync::broadcast::Sender<(String, AwarenessState)>>>> =
+	static ref CRDT_DOCS: CrdtDocRegistry =
 		tokio::sync::RwLock::new(HashMap::new());
 }
 

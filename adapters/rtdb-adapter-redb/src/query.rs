@@ -6,6 +6,15 @@ use serde_json::Value;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+/// Query context grouping related parameters
+struct QueryContext<'a> {
+	tn_id: TnId,
+	db_id: &'a str,
+	path: &'a str,
+	filter: &'a QueryFilter,
+	per_tenant_files: bool,
+}
+
 /// Execute a query against a collection
 pub fn execute_query(
 	instance: &Arc<DatabaseInstance>,
@@ -23,9 +32,8 @@ pub fn execute_query(
 
 	// Try index-based query first
 	if let Some(ref filter) = opts.filter {
-		if let Some(docs) =
-			try_index_query(instance, &tx, tn_id, db_id, path, filter, &opts, per_tenant_files)?
-		{
+		let ctx = QueryContext { tn_id, db_id, path, filter, per_tenant_files };
+		if let Some(docs) = try_index_query(instance, &tx, &ctx)? {
 			return Ok(apply_sort_limit(docs, &opts));
 		}
 	}
@@ -80,15 +88,10 @@ pub fn execute_query(
 fn try_index_query(
 	instance: &Arc<DatabaseInstance>,
 	tx: &redb::ReadTransaction,
-	tn_id: TnId,
-	db_id: &str,
-	path: &str,
-	filter: &QueryFilter,
-	_opts: &QueryOptions,
-	per_tenant_files: bool,
+	ctx: &QueryContext,
 ) -> ClResult<Option<Vec<Value>>> {
 	let indexed_fields = instance.indexed_fields.blocking_read();
-	let indexed = match indexed_fields.get(path) {
+	let indexed = match indexed_fields.get(ctx.path) {
 		Some(f) => f.clone(),
 		None => return Ok(None),
 	};
@@ -96,18 +99,9 @@ fn try_index_query(
 	drop(indexed_fields);
 
 	// Check if any filter field is indexed
-	for (field, value) in &filter.equals {
+	for (field, value) in &ctx.filter.equals {
 		if indexed.iter().any(|f| f.as_ref() == field.as_str()) {
-			return Ok(Some(execute_index_query(
-				tx,
-				tn_id,
-				db_id,
-				path,
-				field,
-				value,
-				filter,
-				per_tenant_files,
-			)?));
+			return Ok(Some(execute_index_query(tx, ctx, field, value)?));
 		}
 	}
 
@@ -117,13 +111,9 @@ fn try_index_query(
 /// Execute a query using an index
 fn execute_index_query(
 	tx: &redb::ReadTransaction,
-	tn_id: TnId,
-	_db_id: &str,
-	path: &str,
+	ctx: &QueryContext,
 	field: &str,
 	value: &Value,
-	filter: &QueryFilter,
-	per_tenant_files: bool,
 ) -> ClResult<Vec<Value>> {
 	use crate::error::from_redb_error;
 
@@ -131,10 +121,10 @@ fn execute_index_query(
 	let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 
 	let value_str = storage::value_to_string(value);
-	let index_prefix = if per_tenant_files {
-		format!("{}/_idx/{}/{}/", path, field, value_str)
+	let index_prefix = if ctx.per_tenant_files {
+		format!("{}/_idx/{}/{}/", ctx.path, field, value_str)
 	} else {
-		format!("{}/{}/_idx/{}/{}/", tn_id.0, path, field, value_str)
+		format!("{}/{}/_idx/{}/{}/", ctx.tn_id.0, ctx.path, field, value_str)
 	};
 
 	let mut results = Vec::new();
@@ -152,10 +142,10 @@ fn execute_index_query(
 		let doc_id = extract_doc_id_from_index_key(key_str);
 
 		// Build document key - must match the key format used in create/update
-		let doc_key = if per_tenant_files {
-			format!("{}/{}/{}", _db_id, path, doc_id)
+		let doc_key = if ctx.per_tenant_files {
+			format!("{}/{}/{}", ctx.db_id, ctx.path, doc_id)
 		} else {
-			format!("{}/{}/{}/{}", tn_id.0, _db_id, path, doc_id)
+			format!("{}/{}/{}/{}", ctx.tn_id.0, ctx.db_id, ctx.path, doc_id)
 		};
 
 		// Fetch document
@@ -163,7 +153,7 @@ fn execute_index_query(
 			let doc: Value = serde_json::from_str(json.value())?;
 
 			// Apply full filter
-			if storage::matches_filter(&doc, filter) {
+			if storage::matches_filter(&doc, ctx.filter) {
 				results.push(doc);
 			}
 		}

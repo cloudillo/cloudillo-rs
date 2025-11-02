@@ -1204,16 +1204,19 @@ mod tests {
 
 		// Should not have executed yet
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-		let st = state.lock().unwrap();
-		assert_eq!(st.len(), 0, "Task should not execute yet");
-		drop(st);
+		{
+			let st = state.lock().unwrap();
+			assert_eq!(st.len(), 0, "Task should not execute yet");
+		}
 
 		// Wait for execution (1 sec delay + 200ms task sleep + buffer)
 		tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
-		let st = state.lock().unwrap();
-		assert_eq!(st.len(), 1, "Task should have executed");
-		assert_eq!(st[0], 1);
+		{
+			let st = state.lock().unwrap();
+			assert_eq!(st.len(), 1, "Task should have executed");
+			assert_eq!(st[0], 1);
+		}
 	}
 
 	#[tokio::test]
@@ -1429,16 +1432,19 @@ mod tests {
 
 		// Wait for dependency to complete but before scheduled time
 		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-		let st = state.lock().unwrap();
-		assert_eq!(st.len(), 1); // Only dependency executed
-		drop(st);
+		{
+			let st = state.lock().unwrap();
+			assert_eq!(st.len(), 1); // Only dependency executed
+		}
 
 		// Wait for scheduled time (1s total from initial schedule)
 		tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
-		let st = state.lock().unwrap();
-		let str_vec = st.iter().map(|x| x.to_string()).collect::<Vec<String>>();
-		assert_eq!(str_vec.join(":"), "1:1");
+		{
+			let st = state.lock().unwrap();
+			let str_vec = st.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+			assert_eq!(str_vec.join(":"), "1:1");
+		}
 	}
 
 	#[tokio::test]

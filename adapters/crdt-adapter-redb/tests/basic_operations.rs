@@ -195,12 +195,14 @@ async fn test_custom_metadata() {
 	let tn_id = TnId(1);
 	let doc_id = "meta-doc";
 
-	let mut meta = CrdtDocMeta::default();
-	meta.custom = serde_json::json!({
-		"title": "Collaborative Document",
-		"author": "alice",
-		"tags": ["important", "shared"]
-	});
+	let meta = CrdtDocMeta {
+		custom: serde_json::json!({
+			"title": "Collaborative Document",
+			"author": "alice",
+			"tags": ["important", "shared"]
+		}),
+		..Default::default()
+	};
 
 	adapter.set_meta(tn_id, doc_id, meta).await.expect("Failed to set metadata");
 

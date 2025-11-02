@@ -51,7 +51,7 @@ pub async fn check_password(
 
 fn generate_access_token_sync(
 	access_token: auth_adapter::AccessToken<Box<str>>,
-	jwt_secret: Box<str>,
+	jwt_secret: &str,
 ) -> ClResult<Box<str>> {
 	let expire = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
@@ -76,7 +76,7 @@ pub async fn generate_access_token(
 	jwt_secret: Box<str>,
 ) -> ClResult<Box<str>> {
 	worker
-		.run_immed(move || generate_access_token_sync(access_token, jwt_secret))
+		.run_immed(move || generate_access_token_sync(access_token, &jwt_secret))
 		.await
 		.map_err(|_| Error::PermissionDenied)
 }
