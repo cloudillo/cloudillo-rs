@@ -31,10 +31,7 @@ async fn test_create_and_store_update() {
 	let tn_id = TnId(1);
 	let doc_id = "doc1";
 
-	let update = CrdtUpdate {
-		data: vec![0x01, 0x02, 0x03],
-		client_id: Some("client1".into()),
-	};
+	let update = CrdtUpdate { data: vec![0x01, 0x02, 0x03], client_id: Some("client1".into()) };
 
 	adapter
 		.store_update(tn_id, doc_id, update.clone())
