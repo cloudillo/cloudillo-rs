@@ -14,7 +14,7 @@ use crate::prelude::*;
 use crate::auth_adapter::AuthAdapter;
 use crate::blob_adapter::BlobAdapter;
 use crate::crdt_adapter::CrdtAdapter;
-use crate::meta_adapter::MetaAdapter;
+use crate::meta_adapter::{MetaAdapter, UpdateTenantData};
 use crate::rtdb_adapter::RtdbAdapter;
 use crate::settings::service::SettingsService;
 use crate::settings::{FrozenSettingsRegistry, SettingsRegistry};
@@ -358,6 +358,7 @@ impl Default for AppBuilder {
 
 async fn bootstrap(app: Arc<AppState>, opts: &AppBuilderOpts) -> ClResult<()> {
 	let auth = &app.auth_adapter;
+	let meta = &app.meta_adapter;
 
 	if true {
 		let base_id_tag = &opts.base_id_tag.as_ref().expect("FATAL: No base id tag");
@@ -381,6 +382,16 @@ async fn bootstrap(app: Arc<AppState>, opts: &AppBuilderOpts) -> ClResult<()> {
 				)
 				.await?;
 			auth.create_profile_key(tn_id, None).await?;
+			meta.create_tenant(tn_id, base_id_tag).await?;
+			meta.update_tenant(
+				tn_id,
+				&UpdateTenantData {
+					//name: Patch::Value(base_id_tag.split_once('.').unwrap_or(("Unknown", "")).0.into()),
+					name: Patch::Value(base_id_tag.split('.').next().unwrap_or("Unknown").into()),
+					..Default::default()
+				},
+			)
+			.await?;
 		}
 		if let Some(ref acme_email) = opts.acme_email {
 			let cert_data = auth.read_cert_by_tn_id(TnId(1)).await;

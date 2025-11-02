@@ -11,12 +11,11 @@ use tempfile::TempDir;
 
 async fn create_test_adapter() -> (MetaAdapterSqlite, TempDir) {
 	let temp_dir = TempDir::new().expect("Failed to create temp directory");
-	let db_path = temp_dir.path().join("test.db");
 
 	// Create a simple worker pool for the adapter
 	let worker_pool = Arc::new(WorkerPool::new(1, 1, 1));
 
-	let adapter = MetaAdapterSqlite::new(worker_pool, &db_path)
+	let adapter = MetaAdapterSqlite::new(worker_pool, temp_dir.path())
 		.await
 		.expect("Failed to create adapter");
 

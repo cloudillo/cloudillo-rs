@@ -19,9 +19,8 @@ mod tests {
 	/// Helper to create a test auth adapter with temporary database
 	async fn create_test_adapter() -> ClResult<(AuthAdapterSqlite, TempDir)> {
 		let tmp_dir = TempDir::new().unwrap();
-		let db_path = tmp_dir.path().join("auth.db");
 		let worker = Arc::new(WorkerPool::new(1, 1, 1));
-		let adapter = AuthAdapterSqlite::new(worker, db_path).await?;
+		let adapter = AuthAdapterSqlite::new(worker, tmp_dir.path()).await?;
 		Ok((adapter, tmp_dir))
 	}
 
@@ -191,7 +190,10 @@ mod tests {
 
 		// Create a tenant with no credentials
 		adapter
-			.create_tenant(id_tag, None, None)
+			.create_tenant(
+				id_tag,
+				CreateTenantData { vfy_code: None, email: None, password: None, roles: None },
+			)
 			.await
 			.expect("Failed to create tenant");
 

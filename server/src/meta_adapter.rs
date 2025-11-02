@@ -89,10 +89,8 @@ pub struct Tenant<S: AsRef<str>> {
 	pub x: HashMap<S, S>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct UpdateTenantData {
-	#[serde(rename = "id")]
-	pub tn_id: TnId,
 	#[serde(rename = "idTag", default)]
 	pub id_tag: Patch<Box<str>>,
 	#[serde(default)]

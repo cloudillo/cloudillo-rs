@@ -17,9 +17,8 @@ mod tests {
 	/// Helper to create a test auth adapter with temporary database
 	async fn create_test_adapter() -> ClResult<(AuthAdapterSqlite, TempDir)> {
 		let tmp_dir = TempDir::new().unwrap();
-		let db_path = tmp_dir.path().join("auth.db");
 		let worker = Arc::new(WorkerPool::new(1, 1, 1));
-		let adapter = AuthAdapterSqlite::new(worker, db_path).await?;
+		let adapter = AuthAdapterSqlite::new(worker, tmp_dir.path()).await?;
 		Ok((adapter, tmp_dir))
 	}
 
@@ -35,16 +34,15 @@ mod tests {
 	#[tokio::test]
 	async fn test_jwt_secret_persistence() {
 		let tmp_dir = TempDir::new().unwrap();
-		let db_path = tmp_dir.path().join("auth.db");
 		let worker = Arc::new(WorkerPool::new(1, 1, 1));
 
 		// Create first adapter instance - generates secret
-		let _adapter1 = AuthAdapterSqlite::new(worker.clone(), &db_path)
+		let _adapter1 = AuthAdapterSqlite::new(worker.clone(), tmp_dir.path())
 			.await
 			.expect("Failed to create first adapter");
 
 		// Create second adapter instance - should load the same secret
-		let _adapter2 = AuthAdapterSqlite::new(worker, &db_path)
+		let _adapter2 = AuthAdapterSqlite::new(worker, tmp_dir.path())
 			.await
 			.expect("Failed to create second adapter");
 

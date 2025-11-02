@@ -162,8 +162,9 @@ pub struct MetaAdapterSqlite {
 
 impl MetaAdapterSqlite {
 	pub async fn new(worker: Arc<WorkerPool>, path: impl AsRef<Path>) -> ClResult<Self> {
+		let db_path = path.as_ref().join("meta.db");
 		let opts = sqlite::SqliteConnectOptions::new()
-			.filename(path.as_ref())
+			.filename(&db_path)
 			.create_if_missing(true)
 			.journal_mode(sqlite::SqliteJournalMode::Wal);
 

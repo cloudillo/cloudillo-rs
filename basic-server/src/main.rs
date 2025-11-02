@@ -80,16 +80,10 @@ async fn main() {
 	//tracing_subscriber::fmt::init();
 
 	let worker = Arc::new(worker::WorkerPool::new(1, 2, 1));
-	let auth_adapter = Arc::new(
-		AuthAdapterSqlite::new(worker.clone(), config.db_dir.join("auth.db"))
-			.await
-			.unwrap(),
-	);
-	let meta_adapter = Arc::new(
-		MetaAdapterSqlite::new(worker.clone(), config.db_dir.join("meta.db"))
-			.await
-			.unwrap(),
-	);
+	let auth_adapter =
+		Arc::new(AuthAdapterSqlite::new(worker.clone(), &config.db_dir).await.unwrap());
+	let meta_adapter =
+		Arc::new(MetaAdapterSqlite::new(worker.clone(), &config.db_dir).await.unwrap());
 	let blob_adapter = Arc::new(BlobAdapterFs::new(config.data_dir.into()).await.unwrap());
 
 	// CRDT adapter for collaborative editing
