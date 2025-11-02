@@ -91,7 +91,7 @@ pub struct SettingDefinition {
 	pub description: String,
 
 	/// Optional default value
-	/// If None, the setting MUST be configured (globally or per-tenant)
+	/// If None and optional=false, the setting MUST be configured (globally or per-tenant)
 	pub default: Option<SettingValue>,
 
 	/// Scope where this setting can be configured
@@ -99,6 +99,10 @@ pub struct SettingDefinition {
 
 	/// Permission level required to modify this setting
 	pub permission: PermissionLevel,
+
+	/// Whether this setting is optional (can be unconfigured even without a default)
+	/// If true, the setting can be None and won't fail validation
+	pub optional: bool,
 
 	/// Optional validation function
 	pub validator: Option<SettingValidator>,
@@ -112,6 +116,7 @@ impl Clone for SettingDefinition {
 			default: self.default.clone(),
 			scope: self.scope,
 			permission: self.permission,
+			optional: self.optional,
 			validator: None, // Don't clone the validator function
 		}
 	}
@@ -125,6 +130,7 @@ impl Debug for SettingDefinition {
 			.field("default", &self.default)
 			.field("scope", &self.scope)
 			.field("permission", &self.permission)
+			.field("optional", &self.optional)
 			.field("validator", &self.validator.is_some())
 			.finish()
 	}
@@ -144,6 +150,7 @@ pub struct SettingDefinitionBuilder {
 	default: Option<SettingValue>,
 	scope: SettingScope,
 	permission: PermissionLevel,
+	optional: bool,
 	validator: Option<SettingValidator>,
 }
 
@@ -155,6 +162,7 @@ impl SettingDefinitionBuilder {
 			default: None,
 			scope: SettingScope::Tenant,        // Default to most flexible
 			permission: PermissionLevel::Admin, // Default to admin-only for safety
+			optional: false,                    // Default to required for safety
 			validator: None,
 		}
 	}
@@ -180,6 +188,13 @@ impl SettingDefinitionBuilder {
 	/// Set the permission level (defaults to Admin for safety)
 	pub fn permission(mut self, permission: PermissionLevel) -> Self {
 		self.permission = permission;
+		self
+	}
+
+	/// Mark this setting as optional (can be unconfigured)
+	/// Use this for settings that should not fail validation if missing
+	pub fn optional(mut self, optional: bool) -> Self {
+		self.optional = optional;
 		self
 	}
 
@@ -224,6 +239,7 @@ impl SettingDefinitionBuilder {
 			default: self.default,
 			scope: self.scope,
 			permission: self.permission,
+			optional: self.optional,
 			validator: self.validator,
 		})
 	}

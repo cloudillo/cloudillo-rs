@@ -22,10 +22,11 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 	// SMTP host
 	registry.register(
 		SettingDefinition::builder("email.smtp.host")
-			.description("SMTP server hostname (e.g., smtp.gmail.com)")
+			.description("SMTP server hostname (e.g., smtp.gmail.com). If not set, emails will be silently skipped.")
 			.scope(SettingScope::Global)
 			.permission(PermissionLevel::Admin)
-			.build()?, // No default - required
+			.optional(true)
+			.build()?, // No default - optional, silently skip if not configured
 	)?;
 
 	// SMTP port
@@ -52,7 +53,8 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.description("SMTP authentication username")
 			.scope(SettingScope::Global)
 			.permission(PermissionLevel::Admin)
-			.build()?, // No default - required
+			.optional(true)
+			.build()?, // No default - optional
 	)?;
 
 	// SMTP password
@@ -61,7 +63,8 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.description("SMTP authentication password")
 			.scope(SettingScope::Global)
 			.permission(PermissionLevel::Admin)
-			.build()?, // No default - required
+			.optional(true)
+			.build()?, // No default - optional
 	)?;
 
 	// From address
@@ -70,6 +73,7 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.description("Email sender address (e.g., noreply@example.com)")
 			.scope(SettingScope::Global)
 			.permission(PermissionLevel::Admin)
+			.optional(true)
 			.validator(|v| {
 				if let SettingValue::String(email) = v {
 					// Basic email validation

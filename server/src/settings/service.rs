@@ -202,23 +202,26 @@ impl SettingsService {
 		Ok(true)
 	}
 
-	/// Validate that all required settings (no default) are configured
+	/// Validate that all required settings (no default and not optional) are configured
 	pub async fn validate_required_settings(&self) -> ClResult<()> {
 		for def in self.registry.list() {
-			if def.default.is_none() {
-				// This setting is required - check if it's configured globally
-				if self.meta.read_setting(TnId(0), &def.key).await?.is_none() {
-					return Err(Error::ValidationError(format!(
-						"Required setting '{}' is not configured",
-						def.key
-					)));
-				}
+			// Skip optional settings and settings with defaults
+			if def.optional || def.default.is_some() {
+				continue;
+			}
+
+			// This setting is required - check if it's configured globally
+			if self.meta.read_setting(TnId(0), &def.key).await?.is_none() {
+				return Err(Error::ValidationError(format!(
+					"Required setting '{}' is not configured",
+					def.key
+				)));
 			}
 		}
 		Ok(())
 	}
 
-	/// Type-safe getters
+	/// Type-safe getters (required - returns error if not found)
 	pub async fn get_string(&self, tn_id: TnId, key: &str) -> ClResult<String> {
 		match self.get(tn_id, key).await? {
 			SettingValue::String(s) => Ok(s),
@@ -260,6 +263,68 @@ impl SettingsService {
 				key,
 				v.type_name()
 			))),
+		}
+	}
+
+	/// Type-safe optional getters (returns None if not found or has no default)
+	/// Still returns error if setting exists but has wrong type
+	pub async fn get_string_opt(&self, tn_id: TnId, key: &str) -> ClResult<Option<String>> {
+		match self.get(tn_id, key).await {
+			Ok(SettingValue::String(s)) => Ok(Some(s)),
+			Ok(v) => Err(Error::ValidationError(format!(
+				"Setting '{}' is not a string, got {}",
+				key,
+				v.type_name()
+			))),
+			Err(Error::ValidationError(msg)) if msg.contains("has no default") => Ok(None),
+			Err(Error::ValidationError(msg)) if msg.contains("Unknown setting") => Ok(None),
+			Err(e) => Err(e),
+		}
+	}
+
+	pub async fn get_int_opt(&self, tn_id: TnId, key: &str) -> ClResult<Option<i64>> {
+		match self.get(tn_id, key).await {
+			Ok(SettingValue::Int(i)) => Ok(Some(i)),
+			Ok(v) => Err(Error::ValidationError(format!(
+				"Setting '{}' is not an integer, got {}",
+				key,
+				v.type_name()
+			))),
+			Err(Error::ValidationError(msg)) if msg.contains("has no default") => Ok(None),
+			Err(Error::ValidationError(msg)) if msg.contains("Unknown setting") => Ok(None),
+			Err(e) => Err(e),
+		}
+	}
+
+	pub async fn get_bool_opt(&self, tn_id: TnId, key: &str) -> ClResult<Option<bool>> {
+		match self.get(tn_id, key).await {
+			Ok(SettingValue::Bool(b)) => Ok(Some(b)),
+			Ok(v) => Err(Error::ValidationError(format!(
+				"Setting '{}' is not a boolean, got {}",
+				key,
+				v.type_name()
+			))),
+			Err(Error::ValidationError(msg)) if msg.contains("has no default") => Ok(None),
+			Err(Error::ValidationError(msg)) if msg.contains("Unknown setting") => Ok(None),
+			Err(e) => Err(e),
+		}
+	}
+
+	pub async fn get_json_opt(
+		&self,
+		tn_id: TnId,
+		key: &str,
+	) -> ClResult<Option<serde_json::Value>> {
+		match self.get(tn_id, key).await {
+			Ok(SettingValue::Json(j)) => Ok(Some(j)),
+			Ok(v) => Err(Error::ValidationError(format!(
+				"Setting '{}' is not JSON, got {}",
+				key,
+				v.type_name()
+			))),
+			Err(Error::ValidationError(msg)) if msg.contains("has no default") => Ok(None),
+			Err(Error::ValidationError(msg)) if msg.contains("Unknown setting") => Ok(None),
+			Err(e) => Err(e),
 		}
 	}
 

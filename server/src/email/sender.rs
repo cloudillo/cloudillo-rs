@@ -5,7 +5,6 @@
 use crate::email::EmailMessage;
 use crate::error::{ClResult, Error};
 use crate::settings::service::SettingsService;
-use crate::settings::SettingValue;
 use crate::types::TnId;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::SmtpTransport;
@@ -28,22 +27,37 @@ impl EmailSender {
 	/// Send email using SMTP settings from database
 	pub async fn send(&self, tn_id: TnId, message: EmailMessage) -> ClResult<()> {
 		// Check if email is enabled
-		let enabled = self.settings_service.get(tn_id, "email.enabled").await?;
-		if let SettingValue::Bool(false) = enabled {
+		if !self.settings_service.get_bool(tn_id, "email.enabled").await? {
 			info!("Email sending disabled, skipping send to {}", message.to);
 			return Ok(());
 		}
 
-		// Fetch SMTP settings (validates they are configured)
-		let host = self.get_string_setting(tn_id, "email.smtp.host").await?;
-		let port = self.get_int_setting(tn_id, "email.smtp.port").await? as u16;
-		let username = self.get_string_setting(tn_id, "email.smtp.username").await?;
-		let password = self.get_string_setting(tn_id, "email.smtp.password").await?;
-		let from_address = self.get_string_setting(tn_id, "email.from.address").await?;
-		let from_name = self.get_string_setting(tn_id, "email.from.name").await?;
-		let tls_mode = self.get_string_setting(tn_id, "email.smtp.tls_mode").await?;
+		// Check if SMTP host is configured - if not, silently skip
+		let host = match self.settings_service.get_string_opt(tn_id, "email.smtp.host").await? {
+			Some(h) if !h.is_empty() => h,
+			_ => {
+				debug!("SMTP host not configured, silently skipping email to {}", message.to);
+				return Ok(());
+			}
+		};
+
+		// Fetch remaining SMTP settings
+		let port = self.settings_service.get_int(tn_id, "email.smtp.port").await? as u16;
+		let username = self
+			.settings_service
+			.get_string_opt(tn_id, "email.smtp.username")
+			.await?
+			.unwrap_or_default();
+		let password = self
+			.settings_service
+			.get_string_opt(tn_id, "email.smtp.password")
+			.await?
+			.unwrap_or_default();
+		let from_address = self.settings_service.get_string(tn_id, "email.from.address").await?;
+		let from_name = self.settings_service.get_string(tn_id, "email.from.name").await?;
+		let tls_mode = self.settings_service.get_string(tn_id, "email.smtp.tls_mode").await?;
 		let timeout_seconds =
-			self.get_int_setting(tn_id, "email.smtp.timeout_seconds").await? as u64;
+			self.settings_service.get_int(tn_id, "email.smtp.timeout_seconds").await? as u64;
 
 		debug!("Sending email to {} via {}:{} with TLS mode: {}", message.to, host, port, tls_mode);
 
@@ -134,22 +148,6 @@ impl EmailSender {
 				warn!("Failed to send email to {}: {}", message.to, e);
 				Err(Error::ServiceUnavailable(format!("SMTP send failed: {}", e)))
 			}
-		}
-	}
-
-	/// Get string setting with error handling
-	async fn get_string_setting(&self, tn_id: TnId, key: &str) -> ClResult<String> {
-		match self.settings_service.get(tn_id, key).await? {
-			SettingValue::String(s) => Ok(s),
-			_ => Err(Error::ConfigError(format!("Setting {} is not a string", key))),
-		}
-	}
-
-	/// Get int setting with error handling
-	async fn get_int_setting(&self, tn_id: TnId, key: &str) -> ClResult<i64> {
-		match self.settings_service.get(tn_id, key).await? {
-			SettingValue::Int(i) => Ok(i),
-			_ => Err(Error::ConfigError(format!("Setting {} is not an int", key))),
 		}
 	}
 }
