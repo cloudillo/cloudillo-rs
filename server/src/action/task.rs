@@ -8,7 +8,7 @@ use crate::{
 	action::{delivery::ActionDeliveryTask, process, ACTION_TYPES},
 	core::hasher,
 	core::scheduler::{RetryPolicy, Task, TaskId},
-	file::file,
+	file::descriptor,
 	meta_adapter,
 	prelude::*,
 };
@@ -53,7 +53,10 @@ pub async fn create_action(
 	info!("Dependencies: {:?}", attachments_to_wait);
 	let deps = app
 		.meta_adapter
-		.list_task_ids(file::FileIdGeneratorTask::kind(), &attachments_to_wait.into_boxed_slice())
+		.list_task_ids(
+			descriptor::FileIdGeneratorTask::kind(),
+			&attachments_to_wait.into_boxed_slice(),
+		)
 		.await?;
 	info!("Dependencies: {:?}", deps);
 

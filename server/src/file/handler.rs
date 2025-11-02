@@ -11,7 +11,7 @@ use std::{fmt::Debug, pin::Pin};
 
 use crate::blob_adapter;
 use crate::core::{extract::OptionalRequestId, hasher, utils};
-use crate::file::{file, image, store};
+use crate::file::{descriptor, image, store};
 use crate::meta_adapter;
 use crate::prelude::*;
 use crate::types::{self, ApiResponse, Timestamp};
@@ -107,9 +107,9 @@ pub async fn get_file_variant_file_id(
 	variants.sort();
 	info!("variants: {:?}", variants);
 
-	let variant = file::get_best_file_variant(&variants, &selector)?;
+	let variant = descriptor::get_best_file_variant(&variants, &selector)?;
 	let stream = app.blob_adapter.read_blob_stream(tn_id, &variant.variant_id).await?;
-	let descriptor = file::get_file_descriptor(&variants);
+	let descriptor = descriptor::get_file_descriptor(&variants);
 
 	serve_file(Some(&descriptor), variant, stream)
 }
@@ -126,7 +126,7 @@ pub async fn get_file_descriptor(
 		.await?;
 	variants.sort();
 
-	let descriptor = file::get_file_descriptor(&variants);
+	let descriptor = descriptor::get_file_descriptor(&variants);
 
 	let response = ApiResponse::new(descriptor).with_req_id(req_id.unwrap_or_default());
 
@@ -260,7 +260,7 @@ async fn handle_post_image(
 	// FileIdGeneratorTask depends on all created variant tasks
 	let mut builder = app
 		.scheduler
-		.task(file::FileIdGeneratorTask::new(tn_id, f_id))
+		.task(descriptor::FileIdGeneratorTask::new(tn_id, f_id))
 		.key(format!("{},{}", tn_id, f_id));
 	if !variant_task_ids.is_empty() {
 		builder = builder.depend_on(variant_task_ids);

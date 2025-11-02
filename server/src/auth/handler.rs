@@ -4,7 +4,7 @@ use serde_json::json;
 use serde_with::skip_serializing_none;
 
 use crate::{
-	action::action,
+	action::task,
 	auth_adapter,
 	core::{
 		extract::{IdTag, OptionalRequestId},
@@ -256,7 +256,7 @@ pub async fn get_access_token(
 					// FIXME
 					r: None,
 					scope: query.scope.as_deref(),
-					exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
+					exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
 				},
 			)
 			.await?;
@@ -281,7 +281,7 @@ pub async fn get_access_token(
 					// FIXME
 					r: None,
 					scope: query.scope.as_deref(),
-					exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
+					exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
 				},
 			)
 			.await?;

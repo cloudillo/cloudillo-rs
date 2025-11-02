@@ -6,7 +6,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::{
-	action::action::{self, ActionVerifierTask},
+	action::task::{self, ActionVerifierTask, CreateAction},
 	core::{
 		extract::{Auth, OptionalRequestId},
 		hasher::hash,
@@ -39,9 +39,9 @@ pub async fn post_action(
 	tn_id: TnId,
 	IdTag(id_tag): IdTag,
 	OptionalRequestId(req_id): OptionalRequestId,
-	Json(action): Json<action::CreateAction>,
+	Json(action): Json<CreateAction>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
-	let action_id = action::create_action(&app, tn_id, &id_tag, action).await?;
+	let action_id = task::create_action(&app, tn_id, &id_tag, action).await?;
 	info!("actionId {:?}", &action_id);
 
 	let list = app

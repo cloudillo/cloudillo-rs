@@ -9,7 +9,7 @@ use sqlx::{
 use std::{fmt::Debug, path::Path, sync::Arc};
 
 use cloudillo::{
-	action::action, auth_adapter, core::utils::random_id, core::worker::WorkerPool, meta_adapter,
+	action::task, auth_adapter, core::utils::random_id, core::worker::WorkerPool, meta_adapter,
 	prelude::*,
 };
 
@@ -379,7 +379,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 					sub: None,
 					scope: None,
 					r: roles.map(Box::from),
-					exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
+					exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
 				};
 				let token = crypto::generate_access_token(
 					&self.worker,
@@ -423,7 +423,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 					sub: None,
 					scope: None,
 					r: roles.map(Box::from),
-					exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
+					exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
 				};
 				let token = crypto::generate_access_token(
 					&self.worker,
@@ -637,7 +637,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 	async fn create_action_token(
 		&self,
 		tn_id: TnId,
-		action: action::CreateAction,
+		action: task::CreateAction,
 	) -> ClResult<Box<str>> {
 		let res = sqlx::query(
 			"SELECT t.id_tag, k.key_id, k.private_key FROM tenants t

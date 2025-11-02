@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::fmt::Debug;
 
-use crate::{action::action, prelude::*};
+use crate::{action::task, prelude::*};
 
 /// Action tokens represent user actions
 #[skip_serializing_none]
@@ -180,7 +180,7 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn create_action_token(
 		&self,
 		tn_id: TnId,
-		data: action::CreateAction,
+		data: task::CreateAction,
 	) -> ClResult<Box<str>>;
 
 	/// Creates a proxy token for federation - allows this user to act as a proxy

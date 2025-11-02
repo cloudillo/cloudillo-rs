@@ -12,7 +12,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::io::AsyncRead;
 
-use crate::action::action;
+use crate::action::task;
 use crate::auth_adapter::AuthAdapter;
 use crate::prelude::*;
 
@@ -57,7 +57,7 @@ impl Request {
 			.auth_adapter
 			.create_action_token(
 				tn_id,
-				action::CreateAction {
+				task::CreateAction {
 					typ: "PROXY".into(),
 					audience_tag: Some(id_tag.into()),
 					expires_at: Some(Timestamp::from_now(60)), // 1 min

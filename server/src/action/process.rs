@@ -3,7 +3,7 @@ use itertools::Itertools;
 use jsonwebtoken::{self as jwt, Algorithm, Validation};
 use serde::{de::DeserializeOwned, Deserialize};
 
-use crate::{auth_adapter::ActionToken, file::file, prelude::*};
+use crate::{auth_adapter::ActionToken, file::descriptor, prelude::*};
 
 /// Decodes a JWT without verifying the signature
 pub fn decode_jwt_no_verify<T: DeserializeOwned>(jwt: &str) -> ClResult<T> {
@@ -114,7 +114,7 @@ async fn process_inbound_action_attachments(
 			.await
 		{
 			info!("  attachment descriptor: {:?}", descriptor.file);
-			let variants = file::parse_file_descriptor(&descriptor.file)?;
+			let variants = descriptor::parse_file_descriptor(&descriptor.file)?;
 			info!("  attachment variants: {:?}", variants);
 			for variant in variants {
 				if app.blob_adapter.stat_blob(tn_id, variant.variant_id).await.is_none() {
