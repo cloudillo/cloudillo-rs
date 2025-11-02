@@ -49,13 +49,13 @@ async fn test_sequential_blob_creation() {
 		adapter
 			.create_blob_buf(tn_id, &file_id, &test_data, &opts)
 			.await
-			.expect(&format!("Failed to create blob {}", i));
+			.unwrap_or_else(|_| panic!("Failed to create blob {}", i));
 
 		// Verify blob exists
 		let size = adapter
 			.stat_blob(tn_id, &file_id)
 			.await
-			.expect(&format!("Blob {} should exist", i));
+			.unwrap_or_else(|| panic!("Blob {} should exist", i));
 		assert!(size > 0, "Blob {} should have content", i);
 	}
 }

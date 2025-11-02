@@ -1,5 +1,6 @@
 //! Action subsystem. Actions are small signed documents representing a user action (e.g. post, comment, connection request).
 
+#[allow(clippy::module_inception)]
 pub mod action;
 pub mod delivery;
 pub mod handler;

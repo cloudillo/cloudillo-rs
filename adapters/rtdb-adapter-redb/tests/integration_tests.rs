@@ -46,7 +46,7 @@ async fn test_query_all_documents() {
 		.await
 		.expect("Failed to query");
 
-	assert!(results.len() > 0, "Should have created documents");
+	assert!(!results.is_empty(), "Should have created documents");
 }
 
 #[tokio::test]
@@ -73,7 +73,7 @@ async fn test_query_with_filter() {
 		.await
 		.expect("Failed to query");
 
-	assert!(results.len() > 0, "Should find active documents");
+	assert!(!results.is_empty(), "Should find active documents");
 	for doc in &results {
 		if let Some(status) = doc.get("status") {
 			assert_eq!(status, "active");

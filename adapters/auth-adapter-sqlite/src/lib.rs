@@ -73,7 +73,7 @@ pub fn collect_res<T>(
 	mut iter: impl Iterator<Item = Result<T, sqlx::Error>> + Unpin,
 ) -> ClResult<Vec<T>> {
 	let mut items = Vec::new();
-	while let Some(item) = iter.next() {
+	for item in iter {
 		items.push(item.inspect_err(inspect).map_err(|_| Error::DbError)?);
 	}
 	Ok(items)
@@ -137,7 +137,7 @@ impl AuthAdapterSqlite {
 		let mut secret_bytes = [0u8; 32];
 		let mut rng = rand::rng();
 		rng.fill_bytes(&mut secret_bytes);
-		let secret_str = base64::engine::general_purpose::STANDARD.encode(&secret_bytes);
+		let secret_str = base64::engine::general_purpose::STANDARD.encode(secret_bytes);
 
 		// Store in database
 		sqlx::query("INSERT OR REPLACE INTO vars (key, value) VALUES (?1, ?2)")
@@ -193,7 +193,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 			.await
 			.inspect_err(inspect);
 
-		map_res(res, |row| row.try_get("tn_id").map(|t| TnId(t)))
+		map_res(res, |row| row.try_get("tn_id").map(TnId))
 	}
 
 	async fn read_tenant(&self, id_tag: &str) -> ClResult<auth_adapter::AuthProfile> {
@@ -295,7 +295,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		.fetch_one(&self.db)
 		.await;
 
-		map_res(res, |row| row.try_get("tn_id").map(|t| TnId(t)))
+		map_res(res, |row| row.try_get("tn_id").map(TnId))
 	}
 
 	async fn delete_tenant(&self, id_tag: &str) -> ClResult<()> {
@@ -370,7 +370,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		match res {
 			Err(err) => Err(Error::PermissionDenied),
 			Ok(row) => {
-				let tn_id = row.try_get("tn_id").map(|t| TnId(t)).or(Err(Error::DbError))?;
+				let tn_id = row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?;
 				let roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
 
 				//let token = crypto::generate_access_token(&self.worker, tn_id, roles.map(|s| s.into()), None, self.jwt_secret_str.clone().into()).await?;
@@ -378,7 +378,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 					iss: Box::from(id_tag),
 					sub: None,
 					scope: None,
-					r: roles.map(|s| Box::from(s)),
+					r: roles.map(Box::from),
 					exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
 				};
 				let token = crypto::generate_access_token(
@@ -389,7 +389,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 				.await?;
 
 				Ok(auth_adapter::AuthLogin {
-					tn_id: row.try_get("tn_id").map(|t| TnId(t)).or(Err(Error::DbError))?,
+					tn_id: row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?,
 					id_tag: Box::from(id_tag),
 					roles: parse_str_list_optional(roles),
 					token,
@@ -412,7 +412,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 		match res {
 			Err(err) => Err(Error::PermissionDenied),
 			Ok(row) => {
-				let tn_id: TnId = row.try_get("tn_id").map(|t| TnId(t)).or(Err(Error::DbError))?;
+				let tn_id: TnId = row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?;
 				let password_hash: Box<str> = row.try_get("password").or(Err(Error::DbError))?;
 				let roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
 
@@ -422,7 +422,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 					iss: Box::from(id_tag),
 					sub: None,
 					scope: None,
-					r: roles.map(|s| Box::from(s)),
+					r: roles.map(Box::from),
 					exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
 				};
 				let token = crypto::generate_access_token(
@@ -433,7 +433,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 				.await?;
 
 				Ok(auth_adapter::AuthLogin {
-					tn_id: row.try_get("tn_id").map(|t| TnId(t)).or(Err(Error::DbError))?,
+					tn_id: row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?,
 					id_tag: Box::from(id_tag),
 					roles: parse_str_list_optional(roles),
 					token,
@@ -618,9 +618,9 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 
 		let access_token = auth_adapter::AccessToken {
 			iss: id_tag,
-			sub: data.sub.map(|s| Box::from(s)),
-			scope: data.scope.map(|s| Box::from(s)),
-			r: roles.map(|s| Box::from(s)),
+			sub: data.sub.map(Box::from),
+			scope: data.scope.map(Box::from),
+			r: roles.map(Box::from),
 			exp: data.exp,
 		};
 
@@ -655,7 +655,7 @@ impl auth_adapter::AuthAdapter for AuthAdapterSqlite {
 
 		let mut typ = action.typ.to_string();
 		if let Some(sub_typ) = &action.sub_typ {
-			typ = typ + ":" + &sub_typ;
+			typ = typ + ":" + sub_typ;
 		}
 		let action_data = auth_adapter::ActionToken {
 			t: typ.into(),

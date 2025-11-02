@@ -109,6 +109,7 @@ pub struct TypingState {
 struct BusConnection {
 	user_id: String,
 	subscriptions: Arc<RwLock<Vec<String>>>, // "actions", "presence", "typing", etc.
+	#[allow(clippy::type_complexity)]
 	// Broadcast receivers for each subscribed channel (wrapped in Mutex for interior mutability)
 	broadcast_rxs: Arc<
 		RwLock<

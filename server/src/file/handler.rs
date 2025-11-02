@@ -161,7 +161,7 @@ async fn handle_post_image(
 			.await?;
 
 	// Get actual original image dimensions
-	let orig_dim = image::get_image_dimensions(&bytes).await?;
+	let orig_dim = image::get_image_dimensions(bytes).await?;
 	info!("Original image dimensions: {}x{}", orig_dim.0, orig_dim.1);
 
 	app.meta_adapter
@@ -261,7 +261,7 @@ async fn handle_post_image(
 	let mut builder = app
 		.scheduler
 		.task(file::FileIdGeneratorTask::new(tn_id, f_id))
-		.key(&format!("{},{}", tn_id, f_id));
+		.key(format!("{},{}", tn_id, f_id));
 	if !variant_task_ids.is_empty() {
 		builder = builder.depend_on(variant_task_ids);
 	}

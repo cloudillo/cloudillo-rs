@@ -34,7 +34,7 @@ async fn test_concurrent_blob_creation() {
 			adapter_clone
 				.create_blob_buf(tn_id, &file_id, &test_data, &opts)
 				.await
-				.expect(&format!("Failed to create blob {}", i))
+				.unwrap_or_else(|_| panic!("Failed to create blob {}", i))
 		});
 		handles.push(handle);
 	}
@@ -50,7 +50,7 @@ async fn test_concurrent_blob_creation() {
 		let size = adapter
 			.stat_blob(tn_id, &file_id)
 			.await
-			.expect(&format!("Blob {} should exist", i));
+			.unwrap_or_else(|| panic!("Blob {} should exist", i));
 		assert!(size > 0);
 	}
 }
@@ -78,7 +78,7 @@ async fn test_concurrent_read_write() {
 			let size = adapter_clone
 				.stat_blob(tn_id, file_id)
 				.await
-				.expect(&format!("Read {} failed", i));
+				.unwrap_or_else(|| panic!("Read {} failed", i));
 			assert!(size > 0);
 		});
 		handles.push(handle);
@@ -108,7 +108,7 @@ async fn test_concurrent_multi_tenant_isolation() {
 				adapter_clone
 					.create_blob_buf(TnId(tn), &file_id, &test_data, &opts)
 					.await
-					.expect(&format!("Failed to create blob in tenant {}", tn))
+					.unwrap_or_else(|_| panic!("Failed to create blob in tenant {}", tn))
 			});
 			handles.push(handle);
 		}
@@ -126,7 +126,7 @@ async fn test_concurrent_multi_tenant_isolation() {
 			let size = adapter
 				.stat_blob(TnId(tn), &file_id)
 				.await
-				.expect(&format!("Tenant {} blob {} should exist", tn, i));
+				.unwrap_or_else(|| panic!("Tenant {} blob {} should exist", tn, i));
 			assert!(size > 0);
 		}
 	}

@@ -49,7 +49,8 @@ impl ResolvesServerCert for CertResolver {
 				//debug!("[found in cache]");
 				Some(cert)
 			} else {
-				let domain = if name.starts_with("cl-o.") { &name[5..] } else { name };
+				let domain =
+					if let Some(id_tag) = name.strip_prefix("cl-o.") { id_tag } else { name };
 				// FIXME: Should not block
 				let cert_data = tokio::task::block_in_place(|| {
 					tokio::runtime::Handle::current().block_on(async {
@@ -124,8 +125,8 @@ pub async fn create_https_server(
 				})
 				.unwrap_or_default();
 
-			let res = if host.starts_with("cl-o.") {
-				let id_tag = Box::from(&host[5..]);
+			let res = if let Some(id_tag) = host.strip_prefix("cl-o.") {
+				let id_tag = Box::from(id_tag);
 				info!(
 					"REQ [{}] API: {} {} {}",
 					&peer_addr,

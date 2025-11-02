@@ -16,4 +16,7 @@ pub mod ws_broadcast;
 pub mod ws_bus;
 
 pub use crate::core::extract::{Auth, IdTag, OptionalAuth};
+pub use crate::core::middleware::{
+	PermissionCheckFactory, PermissionCheckInput, PermissionCheckOutput,
+};
 pub use crate::core::ws_broadcast::BroadcastManager;

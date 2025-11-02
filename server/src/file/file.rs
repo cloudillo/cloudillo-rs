@@ -14,7 +14,7 @@ use crate::types::TnId;
 
 /// Get file variant descriptor
 pub fn get_file_descriptor<S: AsRef<str> + Debug + Eq>(
-	variants: &Vec<meta_adapter::FileVariant<S>>,
+	variants: &[meta_adapter::FileVariant<S>],
 ) -> String {
 	"d1~".to_owned()
 		+ &variants
@@ -34,8 +34,8 @@ pub fn get_file_descriptor<S: AsRef<str> + Debug + Eq>(
 }
 
 pub fn parse_file_descriptor(descriptor: &str) -> ClResult<Vec<meta_adapter::FileVariant<&str>>> {
-	if descriptor.starts_with("d1~") {
-		let variants: ClResult<Vec<meta_adapter::FileVariant<&str>>> = descriptor[3..]
+	if let Some(body) = descriptor.strip_prefix("d1~") {
+		let variants: ClResult<Vec<meta_adapter::FileVariant<&str>>> = body
 			.split(',')
 			.map(|v| {
 				let v_vec: Vec<&str> = v.split(':').collect();
@@ -48,13 +48,13 @@ pub fn parse_file_descriptor(descriptor: &str) -> ClResult<Vec<meta_adapter::Fil
 				let mut size: Option<u64> = None;
 
 				for v in v_vec[2..].iter() {
-					if v.starts_with("f=") {
-						format = Some(&v[2..]);
-					} else if v.starts_with("s=") {
-						size = Some(v[2..].parse().ok().ok_or(Error::Parse)?);
-					} else if v.starts_with("r=") {
+					if let Some(format_str) = v.strip_prefix("f=") {
+						format = Some(format_str);
+					} else if let Some(size_str) = v.strip_prefix("s=") {
+						size = Some(size_str.parse().ok().ok_or(Error::Parse)?);
+					} else if let Some(resolution_str) = v.strip_prefix("r=") {
 						let res_str: (&str, &str) =
-							v[2..].split('x').collect_tuple().ok_or(Error::Parse)?;
+							resolution_str.split('x').collect_tuple().ok_or(Error::Parse)?;
 						resolution = Some((res_str.0.parse()?, res_str.1.parse()?));
 					}
 				}

@@ -123,7 +123,7 @@ impl Transaction for RedbTransaction {
 	async fn create(&mut self, path: &str, mut data: Value) -> ClResult<Box<str>> {
 		use crate::error::from_redb_error;
 
-		let doc_id = storage::generate_doc_id().map_err(|e| crate::Error::from(e))?;
+		let doc_id = storage::generate_doc_id().map_err(crate::Error::from)?;
 
 		if let Value::Object(ref mut obj) = data {
 			obj.insert("id".to_string(), Value::String(doc_id.clone()));

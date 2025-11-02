@@ -103,7 +103,7 @@ async fn test_metadata_operations() {
 
 	let retrieved = adapter.get_meta(tn_id, doc_id).await.expect("Failed to get metadata");
 
-	assert_eq!(retrieved.initialized, true);
+	assert!(retrieved.initialized);
 	assert_eq!(retrieved.created_at, 1698499200);
 	assert_eq!(retrieved.custom["title"], serde_json::json!("My Document"));
 }

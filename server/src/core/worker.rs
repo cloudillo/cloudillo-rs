@@ -69,17 +69,17 @@ impl WorkerPool {
 
 		match priority {
 			Priority::High => {
-				if let Err(_) = self.tx_high.send(job) {
+				if self.tx_high.send(job).is_err() {
 					error!("Failed to send job to high priority worker queue");
 				}
 			}
 			Priority::Medium => {
-				if let Err(_) = self.tx_med.send(job) {
+				if self.tx_med.send(job).is_err() {
 					error!("Failed to send job to medium priority worker queue");
 				}
 			}
 			Priority::Low => {
-				if let Err(_) = self.tx_low.send(job) {
+				if self.tx_low.send(job).is_err() {
 					error!("Failed to send job to low priority worker queue");
 				}
 			}
@@ -109,7 +109,7 @@ impl WorkerPool {
 			let _ignore = res_tx.send(result);
 		});
 
-		if let Err(_) = self.tx_med.send(job) {
+		if self.tx_med.send(job).is_err() {
 			error!("Failed to send job to medium priority worker queue");
 		}
 
@@ -137,7 +137,7 @@ impl WorkerPool {
 			let _ignore = res_tx.send(result);
 		});
 
-		if let Err(_) = self.tx_high.send(job) {
+		if self.tx_high.send(job).is_err() {
 			error!("Failed to send job to high priority worker queue");
 		}
 
@@ -165,7 +165,7 @@ impl WorkerPool {
 			let _ignore = res_tx.send(result);
 		});
 
-		if let Err(_) = self.tx_low.send(job) {
+		if self.tx_low.send(job).is_err() {
 			error!("Failed to send job to low priority worker queue");
 		}
 
@@ -181,6 +181,7 @@ impl WorkerPool {
 	}
 }
 
+#[allow(clippy::type_complexity)]
 fn worker_loop(queues: Vec<Arc<Receiver<Box<dyn FnOnce() + Send>>>>) {
 	loop {
 		// Try higher-priority queues first (non-blocking)

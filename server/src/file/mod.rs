@@ -1,5 +1,6 @@
 //! File subsystem. File storage, metadata, documents, etc.
 
+#[allow(clippy::module_inception)]
 pub mod file;
 pub mod handler;
 pub mod image;

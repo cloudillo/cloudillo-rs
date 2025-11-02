@@ -297,11 +297,13 @@ pub struct RetryPolicy {
 	times: u16,
 }
 
-impl RetryPolicy {
-	pub fn default() -> Self {
+impl Default for RetryPolicy {
+	fn default() -> Self {
 		Self { wait_min_max: (60, 3600), times: 10 }
 	}
+}
 
+impl RetryPolicy {
 	/// Create a new RetryPolicy with custom min/max backoff and number of retries
 	pub fn new(wait_min_max: (u64, u64), times: u16) -> Self {
 		Self { wait_min_max, times }
@@ -479,7 +481,7 @@ pub struct TaskMeta<S: Clone> {
 }
 
 // Scheduler
-//***********
+#[allow(clippy::type_complexity)]
 #[derive(Clone)]
 pub struct Scheduler<S: Clone> {
 	task_builders: Arc<RwLock<HashMap<&'static str, Box<TaskBuilder<S>>>>>,

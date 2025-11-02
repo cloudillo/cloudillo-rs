@@ -3,20 +3,20 @@
 //! # Features
 //!
 //! - Self-contained
-//!		- one binary, no dependencies
-//!		- everything integrated (HTTPS, ACME, databases, etc.)
-//!	- Multi-tenant (users can be invited to the instance)
-//!	- File storage
-//!	- Documents with collaborative editing
-//!		- real-time collaboration
-//!		- generic CRDT API
-//!		- word processor, spreadsheet, whiteboard app included
-//!	- Social/community features
-//!		- profiles
-//!		- posts, comments, reactions, etc.
-//!	- Messaging
-//!	- Application platform
-//!		- Third party apps can be implemented
+//!     - one binary, no dependencies
+//!     - everything integrated (HTTPS, ACME, databases, etc.)
+//! - Multi-tenant (users can be invited to the instance)
+//! - File storage
+//! - Documents with collaborative editing
+//!     - real-time collaboration
+//!     - generic CRDT API
+//!     - word processor, spreadsheet, whiteboard app included
+//! - Social/community features
+//!     - profiles
+//!     - posts, comments, reactions, etc.
+//! - Messaging
+//! - Application platform
+//!     - Third party apps can be implemented
 
 #![allow(unused_attributes, dead_code)]
 #![forbid(unsafe_code)]

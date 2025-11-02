@@ -6,10 +6,68 @@ use axum::{
 	http::{header, response::Response, Request},
 	middleware::Next,
 };
+use std::future::Future;
+use std::pin::Pin;
 use uuid::Uuid;
 
 use crate::core::{extract::RequestId, Auth, IdTag};
 use crate::prelude::*;
+
+// Type aliases for permission check middleware components
+pub type PermissionCheckInput =
+	(State<App>, Auth, axum::extract::Path<String>, Request<Body>, Next);
+pub type PermissionCheckOutput =
+	Pin<Box<dyn Future<Output = Result<axum::response::Response, Error>> + Send>>;
+
+/// Wrapper struct for permission check middleware factories
+///
+/// This struct wraps a closure that implements the permission check middleware pattern.
+/// It takes a static permission action string and returns a middleware factory function.
+#[derive(Clone)]
+pub struct PermissionCheckFactory<F>
+where
+	F: Fn(
+			State<App>,
+			Auth,
+			axum::extract::Path<String>,
+			Request<Body>,
+			Next,
+		) -> PermissionCheckOutput
+		+ Clone
+		+ Send
+		+ Sync,
+{
+	handler: F,
+}
+
+impl<F> PermissionCheckFactory<F>
+where
+	F: Fn(
+			State<App>,
+			Auth,
+			axum::extract::Path<String>,
+			Request<Body>,
+			Next,
+		) -> PermissionCheckOutput
+		+ Clone
+		+ Send
+		+ Sync,
+{
+	pub fn new(handler: F) -> Self {
+		Self { handler }
+	}
+
+	pub fn call(
+		&self,
+		state: State<App>,
+		auth: Auth,
+		path: axum::extract::Path<String>,
+		req: Request<Body>,
+		next: Next,
+	) -> PermissionCheckOutput {
+		(self.handler)(state, auth, path, req, next)
+	}
+}
 
 /// Extract token from query parameters
 fn extract_token_from_query(query: &str) -> Option<String> {
@@ -53,8 +111,8 @@ pub async fn require_auth(
 	let token = if let Some(auth_header) =
 		req.headers().get("Authorization").and_then(|h| h.to_str().ok())
 	{
-		if auth_header.starts_with("Bearer ") {
-			auth_header[7..].trim().to_string()
+		if let Some(token) = auth_header.strip_prefix("Bearer ") {
+			token.trim().to_string()
 		} else {
 			warn!("Authorization header present but doesn't start with 'Bearer ': {}", auth_header);
 			return Err(Error::PermissionDenied);
@@ -90,11 +148,7 @@ pub async fn optional_auth(
 	let token = if let Some(auth_header) =
 		req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok())
 	{
-		if auth_header.starts_with("Bearer ") {
-			Some(auth_header[7..].trim().to_string())
-		} else {
-			None
-		}
+		auth_header.strip_prefix("Bearer ").map(|token| token.trim().to_string())
 	} else {
 		// Fallback: try to get token from query parameter (for WebSocket)
 		let query = req.uri().query().unwrap_or("");

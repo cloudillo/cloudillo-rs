@@ -408,7 +408,7 @@ mod tests {
 			adapter
 				.create_webauthn_credential(tn_id, &credential)
 				.await
-				.expect(&format!("Failed to create credential {}", i));
+				.unwrap_or_else(|_| panic!("Failed to create credential {}", i));
 		}
 
 		// List all credentials
@@ -424,7 +424,7 @@ mod tests {
 			let cred = credentials
 				.iter()
 				.find(|c| c.credential_id == format!("cred_{}", i))
-				.expect(&format!("Credential {} not found", i));
+				.unwrap_or_else(|| panic!("Credential {} not found", i));
 			assert_eq!(cred.counter, i as u32);
 		}
 

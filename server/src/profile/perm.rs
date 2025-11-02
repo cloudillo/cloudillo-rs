@@ -5,26 +5,25 @@ use axum::{
 	middleware::Next,
 	response::Response,
 };
-use std::future::Future;
-use std::pin::Pin;
 
 use crate::{
-	core::{abac::Environment, extract::Auth},
+	core::{abac::Environment, extract::Auth, middleware::PermissionCheckOutput},
 	prelude::*,
 	types::ProfileAttrs,
 };
 
 /// Middleware factory for profile permission checks
+///
+/// Returns a middleware function that validates profile permissions via ABAC
+///
+/// # Arguments
+/// * `action` - The permission action to check (e.g., "read", "write")
+///
+/// # Returns
+/// A cloneable middleware function with return type `PermissionCheckOutput`
 pub fn check_perm_profile(
 	action: &'static str,
-) -> impl Fn(
-	State<App>,
-	Auth,
-	Path<String>,
-	Request,
-	Next,
-) -> Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>>
-       + Clone {
+) -> impl Fn(State<App>, Auth, Path<String>, Request, Next) -> PermissionCheckOutput + Clone {
 	move |state, auth, path, req, next| {
 		Box::pin(check_profile_permission(state, auth, path, req, next, action))
 	}

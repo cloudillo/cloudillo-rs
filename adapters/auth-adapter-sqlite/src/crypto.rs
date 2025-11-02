@@ -107,10 +107,7 @@ fn generate_key_sync() -> ClResult<auth_adapter::KeyPair> {
 
 /// Generate a keypair
 pub async fn generate_key(worker: &worker::WorkerPool) -> ClResult<auth_adapter::KeyPair> {
-	worker
-		.run_immed(move || generate_key_sync())
-		.await
-		.map_err(|_| Error::PermissionDenied)
+	worker.run_immed(generate_key_sync).await.map_err(|_| Error::PermissionDenied)
 }
 
 fn generate_action_token_sync(
@@ -122,7 +119,7 @@ fn generate_action_token_sync(
 	let token = jsonwebtoken::encode(
 		&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES384),
 		&action_data,
-		&jsonwebtoken::EncodingKey::from_ec_pem(&private_key_pem.as_bytes())
+		&jsonwebtoken::EncodingKey::from_ec_pem(private_key_pem.as_bytes())
 			.inspect_err(|err| error!("from_ec_pem err: {}", err))
 			.map_err(|_| Error::PermissionDenied)?,
 	)

@@ -112,6 +112,7 @@ struct RtdbConnection {
 	file_id: String,
 	subscriptions: Arc<RwLock<HashSet<String>>>, // Subscribed collection patterns
 	// Active subscription streams (path -> ChangeEvent stream)
+	#[allow(clippy::type_complexity)]
 	subscription_streams:
 		Arc<RwLock<Vec<(String, tokio::sync::mpsc::UnboundedReceiver<ChangeEvent>)>>>,
 	tn_id: crate::types::TnId,
@@ -342,9 +343,9 @@ async fn handle_rtdb_command(
 										// Store reference if provided (e.g., { ref: "$post" })
 										if let Some(ref_value) = op.get("ref") {
 											if let Some(ref_name) = ref_value.as_str() {
-												if ref_name.starts_with('$') {
+												if let Some(ref_name) = ref_name.strip_prefix('$') {
 													references.insert(
-														ref_name[1..].to_string(),
+														ref_name.to_string(),
 														doc_id.to_string(),
 													);
 													debug!(

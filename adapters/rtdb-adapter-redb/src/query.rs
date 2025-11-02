@@ -213,7 +213,7 @@ fn compare_documents(a: &Value, b: &Value, sort_fields: &[SortField]) -> Orderin
 fn extract_doc_id_from_index_key(key: &str) -> String {
 	// Index key format: "path/_idx/field/value/doc_id"
 	// We need the last segment after the last '/'
-	key.split('/').last().unwrap_or("").to_string()
+	key.split('/').next_back().unwrap_or("").to_string()
 }
 
 // vim: ts=4

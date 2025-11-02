@@ -38,7 +38,7 @@ fn obj_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBu
 		.join(tn_id.to_string())
 		.join(&file_id[hash_start..hash_start + 2])
 		.join(&file_id[hash_start + 2..hash_start + 4])
-		.join(&file_id))
+		.join(file_id))
 }
 
 fn obj_tmp_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
@@ -73,7 +73,7 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		data: &[u8],
 		opts: &blob_adapter::CreateBlobOptions,
 	) -> ClResult<()> {
-		info!("create_blob_buf: {:?}", obj_file_path(&self.base_dir, tn_id, &file_id)?);
+		info!("create_blob_buf: {:?}", obj_file_path(&self.base_dir, tn_id, file_id)?);
 		tokio::fs::create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
 
 		let mut file = File::create(obj_file_path(&self.base_dir, tn_id, file_id)?).await?;
@@ -89,15 +89,14 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		file_id: &str,
 		stream: &mut (dyn AsyncRead + Send + Unpin),
 	) -> ClResult<()> {
-		tokio::fs::create_dir_all(obj_dir(&self.base_dir, tn_id, &file_id)?).await?;
+		tokio::fs::create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
 
-		let tmp_path = obj_tmp_file_path(&self.base_dir, tn_id, &file_id)?;
+		let tmp_path = obj_tmp_file_path(&self.base_dir, tn_id, file_id)?;
 		info!("  attachment tmpfile: {:?}", &tmp_path);
 		let mut file = File::create(&tmp_path).await?;
 		let mut hasher = hasher::Hasher::new();
 		let mut buf = [0u8; 8192];
 
-		//let res = (async || -> Result<(), Error> {
 		let res = (async || -> Result<(), Error> {
 			loop {
 				let n = stream.read(&mut buf).await?;

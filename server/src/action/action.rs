@@ -116,8 +116,8 @@ impl Task<App> for ActionCreatorTask {
 		{
 			let mut attachment_vec: Vec<Box<str>> = Vec::new();
 			for a in attachments {
-				if a.starts_with("@") {
-					let file_id = app.meta_adapter.get_file_id(self.tn_id, a[1..].parse()?).await?;
+				if let Some(f_id) = a.strip_prefix('@') {
+					let file_id = app.meta_adapter.get_file_id(self.tn_id, f_id.parse()?).await?;
 					attachment_vec.push(file_id.clone());
 				} else {
 					attachment_vec.push(a.clone());

@@ -78,6 +78,7 @@ struct CrdtConnection {
 }
 
 // Global registry of CRDT documents and their connections
+#[allow(clippy::type_complexity)]
 lazy_static::lazy_static! {
 	static ref CRDT_DOCS: tokio::sync::RwLock<HashMap<String, Arc<tokio::sync::broadcast::Sender<(String, AwarenessState)>>>> =
 		tokio::sync::RwLock::new(HashMap::new());

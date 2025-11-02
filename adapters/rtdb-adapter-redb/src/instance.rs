@@ -23,6 +23,7 @@ pub struct DatabaseInstance {
 	/// Last access timestamp (Unix seconds)
 	pub(crate) last_accessed: Arc<AtomicU64>,
 
+	#[allow(clippy::type_complexity)]
 	/// Cached indexed fields per collection
 	pub(crate) indexed_fields: Arc<RwLock<HashMap<Box<str>, Vec<Box<str>>>>>,
 }
@@ -74,8 +75,8 @@ impl DatabaseInstance {
 			}
 
 			// Extract collection path from key like "collection/_meta/indexes"
-			if key_str.ends_with("/_meta/indexes") {
-				let collection = &key_str[..key_str.len() - 14]; // Remove "/_meta/indexes"
+			if let Some(collection) = key_str.strip_suffix("/_meta/indexes") {
+				// Remove "/_meta/indexes"
 
 				if let Ok(fields) = serde_json::from_str::<Vec<String>>(value.value()) {
 					indexed_fields

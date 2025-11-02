@@ -178,28 +178,26 @@ async fn test_concurrent_increment_no_race_condition() {
 			barrier.wait().await;
 
 			// Simulate increment operation
-			loop {
-				let mut tx = adapter.transaction(tn_id, db_id).await.unwrap();
 
-				// Read current value using transaction-local read
-				let doc = tx.get(&counter_path).await.unwrap().unwrap();
-				let current = doc["lastNumber"].as_i64().unwrap();
+			let mut tx = adapter.transaction(tn_id, db_id).await.unwrap();
 
-				// Increment
-				let new_value = current + 1;
+			// Read current value using transaction-local read
+			let doc = tx.get(&counter_path).await.unwrap().unwrap();
+			let current = doc["lastNumber"].as_i64().unwrap();
 
-				// Write back
-				match tx.update(&counter_path, json!({"year": 2025, "lastNumber": new_value})).await
-				{
-					Ok(_) => {
-						// Commit via drop (auto-commit on success)
-						drop(tx);
-						return new_value;
-					}
-					Err(e) => {
-						eprintln!("Task {}: Update failed: {}", i, e);
-						panic!("Update should not fail");
-					}
+			// Increment
+			let new_value = current + 1;
+
+			// Write back
+			match tx.update(&counter_path, json!({"year": 2025, "lastNumber": new_value})).await {
+				Ok(_) => {
+					// Commit via drop (auto-commit on success)
+					drop(tx);
+					new_value
+				}
+				Err(e) => {
+					eprintln!("Task {}: Update failed: {}", i, e);
+					panic!("Update should not fail");
 				}
 			}
 		});
@@ -278,37 +276,36 @@ async fn test_invoice_numbering_simulation() {
 			barrier.wait().await;
 
 			// Finalize invoice (increment counter and create invoice)
-			loop {
-				let mut tx = adapter.transaction(tn_id, db_id).await.unwrap();
 
-				// Read current counter
-				let counter_doc = tx.get(&counter_path).await.unwrap().unwrap();
-				let current_number = counter_doc["lastNumber"].as_i64().unwrap();
-				let next_number = current_number + 1;
+			let mut tx = adapter.transaction(tn_id, db_id).await.unwrap();
 
-				// Update counter
-				tx.update(&counter_path, json!({"year": 2025, "lastNumber": next_number}))
-					.await
-					.unwrap();
+			// Read current counter
+			let counter_doc = tx.get(&counter_path).await.unwrap().unwrap();
+			let current_number = counter_doc["lastNumber"].as_i64().unwrap();
+			let next_number = current_number + 1;
 
-				// Create invoice with this number
-				let invoice_number = format!("2025/{:02}", next_number);
-				let invoice_id = tx
-					.create(
-						"invoices",
-						json!({
-							"invoiceNumber": invoice_number,
-							"status": "finalized",
-							"amount": 1000.0 + (i as f64)
-						}),
-					)
-					.await
-					.unwrap();
+			// Update counter
+			tx.update(&counter_path, json!({"year": 2025, "lastNumber": next_number}))
+				.await
+				.unwrap();
 
-				// Commit via drop (auto-commit)
-				drop(tx);
-				return (next_number, invoice_id.to_string());
-			}
+			// Create invoice with this number
+			let invoice_number = format!("2025/{:02}", next_number);
+			let invoice_id = tx
+				.create(
+					"invoices",
+					json!({
+						"invoiceNumber": invoice_number,
+						"status": "finalized",
+						"amount": 1000.0 + (i as f64)
+					}),
+				)
+				.await
+				.unwrap();
+
+			// Commit via drop (auto-commit)
+			drop(tx);
+			(next_number, invoice_id.to_string())
 		});
 
 		handles.push(handle);
@@ -334,24 +331,18 @@ async fn test_invoice_numbering_simulation() {
 
 	// Verify all invoice numbers are unique
 	invoice_numbers.sort();
-	for i in 0..invoice_numbers.len() - 1 {
+	for (i, num) in invoice_numbers.iter().enumerate().take(invoice_numbers.len() - 1) {
 		assert_ne!(
-			invoice_numbers[i],
-			invoice_numbers[i + 1],
+			num,
+			&invoice_numbers[i + 1],
 			"CRITICAL: Duplicate invoice number detected: {}",
-			invoice_numbers[i]
+			num
 		);
 	}
 
 	// Verify sequential (no gaps)
-	for i in 0..invoice_numbers.len() {
-		assert_eq!(
-			invoice_numbers[i],
-			(i + 1) as i64,
-			"CRITICAL: Gap detected! Expected {}, got {}",
-			i + 1,
-			invoice_numbers[i]
-		);
+	for (i, num) in invoice_numbers.iter().enumerate() {
+		assert_eq!(*num, (i + 1) as i64, "CRITICAL: Gap detected! Expected {}, got {}", i + 1, num);
 	}
 
 	println!("✅ SUCCESS: {} invoices finalized with no duplicates and no gaps!", num_invoices);

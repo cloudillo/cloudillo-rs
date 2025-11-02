@@ -129,8 +129,7 @@ mod tests {
 		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let id_tag = "test_user_4";
-		let passwords =
-			vec!["password_1_abc", "password_2_def", "password_3_ghi", "password_4_jkl"];
+		let passwords = ["password_1_abc", "password_2_def", "password_3_ghi", "password_4_jkl"];
 
 		// Create tenant with first password
 		create_test_tenant(&adapter, id_tag, passwords[0])

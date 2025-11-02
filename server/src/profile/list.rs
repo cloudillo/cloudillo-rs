@@ -61,8 +61,6 @@ pub async fn list_profiles(
 		})
 		.collect();
 
-	let total = profiles.len();
-
 	let response = ApiResponse::new(profiles).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))

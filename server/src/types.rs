@@ -71,7 +71,7 @@ impl std::cmp::PartialEq for Timestamp {
 
 impl std::cmp::PartialOrd for Timestamp {
 	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-		self.0.partial_cmp(&other.0)
+		Some(self.cmp(other))
 	}
 }
 

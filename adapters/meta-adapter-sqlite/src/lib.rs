@@ -147,7 +147,7 @@ pub fn collect_res<T>(
 	mut iter: impl Iterator<Item = Result<T, sqlx::Error>> + Unpin,
 ) -> ClResult<Vec<T>> {
 	let mut items = Vec::new();
-	while let Some(item) = iter.next() {
+	for item in iter {
 		items.push(item.inspect_err(inspect).map_err(|_| Error::DbError)?);
 	}
 	Ok(items)
@@ -196,7 +196,7 @@ impl MetaAdapterSqlite {
 			.iter()
 			.map(|row| row.get::<&str, _>(0))
 			.filter(|s| s.starts_with("MAX_ATTACHED="))
-			.last()
+			.next_back()
 			.unwrap_or("")
 			.split("=")
 			.last();
@@ -722,7 +722,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 		if let Some(status) = &opts.status {
 			query.push(" AND coalesce(a.status, 'A') IN ");
-			query = push_in(query, &status);
+			query = push_in(query, status);
 		} else {
 			query.push(" AND coalesce(a.status, 'A') NOT IN ('D')");
 		}
@@ -763,7 +763,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 
 		let mut actions = Vec::new();
 		let mut iter = res.iter();
-		while let Some(row) = iter.next() {
+		for row in iter {
 			let action_id = row.try_get::<Box<str>, _>("action_id").map_err(|_| Error::DbError)?;
 			info!("row: {:?}", action_id);
 
@@ -861,13 +861,10 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				subject: row.try_get("subject").map_err(|_| Error::DbError)?,
 				content: row.try_get("content").map_err(|_| Error::DbError)?,
 				attachments,
-				created_at: row
-					.try_get("created_at")
-					.map(|ts| Timestamp(ts))
-					.map_err(|_| Error::DbError)?,
+				created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
 				expires_at: row
 					.try_get("expires_at")
-					.map(|ts: Option<i64>| ts.map(|t| Timestamp(t)))
+					.map(|ts: Option<i64>| ts.map(Timestamp))
 					.map_err(|_| Error::DbError)?,
 				status: row.try_get("status").map_err(|_| Error::DbError)?,
 				stat,
@@ -915,7 +912,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
-		let tokens = collect_res(res.iter().map(|row| Ok(row.try_get("token")?)))?;
+		let tokens = collect_res(res.iter().map(|row| row.try_get("token")))?;
 
 		Ok(tokens.into_boxed_slice())
 	}
@@ -930,38 +927,39 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 		let mut query = sqlx::QueryBuilder::new(
 			"INSERT OR IGNORE INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, expires_at, attachments) VALUES(")
 			.push_bind(tn_id.0).push(", ")
-			.push_bind(&action.action_id).push(", ")
+			.push_bind(action.action_id).push(", ")
 			.push_bind(key).push(", ")
-			.push_bind(&action.typ).push(", ")
-			.push_bind(&action.sub_typ).push(", ")
-			.push_bind(&action.parent_id).push(", ")
-			.push_bind(&action.root_id).push(", ")
-			.push_bind(&action.issuer_tag).push(", ")
-			.push_bind(&action.audience_tag).push(", ")
-			.push_bind(&action.subject).push(", ")
-			.push_bind(&action.content).push(", ")
+			.push_bind(action.typ).push(", ")
+			.push_bind(action.sub_typ).push(", ")
+			.push_bind(action.parent_id).push(", ")
+			.push_bind(action.root_id).push(", ")
+			.push_bind(action.issuer_tag).push(", ")
+			.push_bind(action.audience_tag).push(", ")
+			.push_bind(action.subject).push(", ")
+			.push_bind(action.content).push(", ")
 			.push_bind(action.created_at.0).push(", ")
 			.push_bind(action.expires_at.map(|t| t.0)).push(", ")
 			.push_bind(action.attachments.as_ref().map(|s| s.join(",")))
 			.push(")")
 			.build().execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
-		let mut add_reactions = if action.content == None { 0 } else { 1 };
+		let mut add_reactions = if action.content.is_none() { 0 } else { 1 };
 		if let Some(key) = &key {
 			info!("update with key: {}", key);
 			let res = sqlx::query("UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND action_id!=? AND coalesce(status, '')!='D' RETURNING content")
-				.bind(tn_id.0).bind(key).bind(&action.action_id)
+				.bind(tn_id.0).bind(key).bind(action.action_id)
 				.fetch_all(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
-			if res.len() > 0
-				&& res[0].try_get::<Option<&str>, _>("content").map_err(|_| Error::DbError)? != None
+			if !res.is_empty()
+				&& (res[0].try_get::<Option<&str>, _>("content").map_err(|_| Error::DbError)?)
+					.is_some()
 			{
 				add_reactions -= 1;
 			}
 		}
-		if action.typ == "REACT" && action.content != None {
+		if action.typ == "REACT" && action.content.is_some() {
 			info!("update with reaction: {}", action.content.unwrap());
 			sqlx::query("UPDATE actions SET reactions=coalesce(reactions, 0)+? WHERE tn_id=? AND action_id IN (?, ?)")
-				.bind(add_reactions).bind(tn_id.0).bind(&action.parent_id).bind(&action.root_id)
+				.bind(add_reactions).bind(tn_id.0).bind(action.parent_id).bind(action.root_id)
 				.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 		}
 		tx.commit().await;
@@ -998,7 +996,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			.fetch_one(&self.dbr)
 			.await;
 
-		map_res(res, |row| Ok(row.try_get("root_id")?))
+		map_res(res, |row| row.try_get("root_id"))
 	}
 
 	async fn get_action_data(
@@ -1275,7 +1273,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			.fetch_one(&self.dbr)
 			.await;
 
-		map_res(res, |row| Ok(row.try_get("file_id")?))
+		map_res(res, |row| row.try_get("file_id"))
 	}
 
 	async fn list_files(
@@ -1390,13 +1388,13 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?,
 			meta_adapter::FileId::FileId(file_id) => {
-				if file_id.starts_with("@") {
+				if let Some(f_id) = file_id.strip_prefix("@") {
 					sqlx::query(
 						"SELECT variant_id, variant, res_x, res_y, format, size, available
 						FROM file_variants WHERE tn_id=? AND f_id=?",
 					)
 					.bind(tn_id.0)
-					.bind(&file_id[1..])
+					.bind(&f_id)
 					.fetch_all(&self.dbr)
 					.await
 					.inspect_err(inspect)
@@ -1509,7 +1507,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				.map_err(|_| Error::DbError)?;
 
 		let res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-			.bind(tn_id.0).bind(f_id as i64).bind(&opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64)
+			.bind(tn_id.0).bind(f_id as i64).bind(opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64)
 			.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 		tx.commit().await;
 
@@ -1560,8 +1558,8 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				tn_id: TnId(row.try_get("tn_id")?),
 				kind: row.try_get::<Box<str>, _>("kind")?,
 				status: status.chars().next().unwrap_or('E'),
-				created_at: row.try_get("created_at").map(|ts| Timestamp(ts))?,
-				next_at: row.try_get::<Option<i64>, _>("next_at")?.map(|ts| Timestamp(ts)),
+				created_at: row.try_get("created_at").map(Timestamp)?,
+				next_at: row.try_get::<Option<i64>, _>("next_at")?.map(Timestamp),
 				retry: row.try_get("retry")?,
 				cron: row.try_get("cron")?,
 				input: row.try_get("input")?,
@@ -1576,7 +1574,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			"SELECT t.task_id FROM tasks t
 			WHERE status IN ('P') AND kind=",
 		);
-		query.push_bind(&kind).push(" AND key IN ");
+		query.push_bind(kind).push(" AND key IN ");
 		query = push_in(query, keys);
 
 		let res = query
@@ -1586,7 +1584,7 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
-		collect_res(res.iter().map(|row| Ok(row.try_get("task_id")?)))
+		collect_res(res.iter().map(|row| row.try_get("task_id")))
 	}
 
 	async fn create_task(
@@ -1603,10 +1601,10 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 			VALUES (?, ?, ?, ?, ?) RETURNING task_id",
 		)
 		.bind(0)
-		.bind(&kind)
-		.bind(&key)
+		.bind(kind)
+		.bind(key)
 		.bind("P")
-		.bind(&input)
+		.bind(input)
 		.fetch_one(&mut *tx)
 		.await
 		.inspect_err(inspect)
