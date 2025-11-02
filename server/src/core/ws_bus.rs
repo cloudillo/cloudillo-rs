@@ -72,18 +72,13 @@ impl BusMessage {
 }
 
 /// Online status for presence tracking
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OnlineStatus {
+	#[default]
 	Online,
 	Away,
 	Offline,
-}
-
-impl Default for OnlineStatus {
-	fn default() -> Self {
-		Self::Online
-	}
 }
 
 /// User presence state
