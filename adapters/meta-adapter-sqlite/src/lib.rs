@@ -2203,10 +2203,10 @@ impl meta_adapter::MetaAdapter for MetaAdapterSqlite {
 				"active" => {
 					query.push(" AND (expires_at IS NULL OR expires_at > ");
 					query.push_bind(now.0);
-					query.push(")");
+					query.push(") AND count > 0");
 				}
 				"used" => {
-					query.push(" AND count > 0");
+					query.push(" AND count = 0");
 				}
 				"expired" => {
 					query.push(" AND expires_at IS NOT NULL AND expires_at <= ");

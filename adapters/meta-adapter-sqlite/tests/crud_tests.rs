@@ -63,7 +63,6 @@ async fn test_update_tenant() {
 
 	// Update tenant with name change
 	let update_data = UpdateTenantData {
-		tn_id,
 		id_tag: Patch::Undefined,
 		name: Patch::Value("Robert".into()),
 		typ: Patch::Undefined,
