@@ -1,15 +1,12 @@
 //! File tag management handlers
 
 use axum::{
-	extract::{State, Path, Query},
+	extract::{Path, Query, State},
 	Json,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{
-	prelude::*,
-	core::extract::Auth,
-};
+use crate::{core::extract::Auth, prelude::*};
 
 const TAG_FORBIDDEN_CHARS: &[char] = &[' ', ',', '#', '\t', '\n'];
 

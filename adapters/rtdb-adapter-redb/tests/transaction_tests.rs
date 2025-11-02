@@ -35,9 +35,7 @@ async fn test_transaction_read_your_own_writes() {
 	// Create a document
 	let doc_id = {
 		let mut tx = adapter.transaction(tn_id, db_id).await.unwrap();
-		tx.create("counters", json!({"value": 10}))
-			.await
-			.unwrap()
+		tx.create("counters", json!({"value": 10})).await.unwrap()
 	};
 
 	let doc_path = format!("counters/{}", doc_id);
@@ -51,18 +49,14 @@ async fn test_transaction_read_your_own_writes() {
 		assert_eq!(doc["value"], 10);
 
 		// Update within transaction
-		tx.update(&doc_path, json!({"value": 20}))
-			.await
-			.unwrap();
+		tx.update(&doc_path, json!({"value": 20})).await.unwrap();
 
 		// Should see own write! (transaction-local read)
 		let doc = tx.get(&doc_path).await.unwrap().unwrap();
 		assert_eq!(doc["value"], 20, "Should see own uncommitted write");
 
 		// Update again
-		tx.update(&doc_path, json!({"value": 30}))
-			.await
-			.unwrap();
+		tx.update(&doc_path, json!({"value": 30})).await.unwrap();
 
 		// Should see latest write!
 		let doc = tx.get(&doc_path).await.unwrap().unwrap();
@@ -72,11 +66,7 @@ async fn test_transaction_read_your_own_writes() {
 	}
 
 	// Verify committed with final value
-	let doc = adapter
-		.get(tn_id, db_id, &doc_path)
-		.await
-		.unwrap()
-		.unwrap();
+	let doc = adapter.get(tn_id, db_id, &doc_path).await.unwrap().unwrap();
 	assert_eq!(doc["value"], 30, "Changes should be committed");
 }
 
@@ -128,10 +118,7 @@ async fn test_transaction_read_created_document() {
 		let mut tx = adapter.transaction(tn_id, db_id).await.unwrap();
 
 		// Create document
-		let doc_id = tx
-			.create("items", json!({"status": "pending"}))
-			.await
-			.unwrap();
+		let doc_id = tx.create("items", json!({"status": "pending"})).await.unwrap();
 
 		let doc_path = format!("items/{}", doc_id);
 
@@ -170,9 +157,7 @@ async fn test_concurrent_increment_no_race_condition() {
 	// Create initial counter
 	let counter_id = {
 		let mut tx = adapter.transaction(tn_id, db_id).await.unwrap();
-		tx.create("counters", json!({"year": 2025, "lastNumber": 0}))
-			.await
-			.unwrap()
+		tx.create("counters", json!({"year": 2025, "lastNumber": 0})).await.unwrap()
 	};
 
 	let counter_path = format!("counters/{}", counter_id);
@@ -204,12 +189,7 @@ async fn test_concurrent_increment_no_race_condition() {
 				let new_value = current + 1;
 
 				// Write back
-				match tx
-					.update(
-						&counter_path,
-						json!({"year": 2025, "lastNumber": new_value}),
-					)
-					.await
+				match tx.update(&counter_path, json!({"year": 2025, "lastNumber": new_value})).await
 				{
 					Ok(_) => {
 						// Commit via drop (auto-commit on success)
@@ -235,11 +215,7 @@ async fn test_concurrent_increment_no_race_condition() {
 	}
 
 	// Verify final value is exactly num_increments
-	let final_doc = adapter
-		.get(tn_id, db_id, &counter_path)
-		.await
-		.unwrap()
-		.unwrap();
+	let final_doc = adapter.get(tn_id, db_id, &counter_path).await.unwrap().unwrap();
 	let final_value = final_doc["lastNumber"].as_i64().unwrap();
 
 	println!("Final counter value: {}", final_value);
@@ -255,11 +231,7 @@ async fn test_concurrent_increment_no_race_condition() {
 	// Verify all results are unique (no duplicates)
 	results.sort();
 	for i in 0..results.len() - 1 {
-		assert_ne!(
-			results[i], results[i + 1],
-			"Found duplicate value: {}",
-			results[i]
-		);
+		assert_ne!(results[i], results[i + 1], "Found duplicate value: {}", results[i]);
 	}
 
 	// Verify sequential (no gaps)
@@ -315,12 +287,9 @@ async fn test_invoice_numbering_simulation() {
 				let next_number = current_number + 1;
 
 				// Update counter
-				tx.update(
-					&counter_path,
-					json!({"year": 2025, "lastNumber": next_number}),
-				)
-				.await
-				.unwrap();
+				tx.update(&counter_path, json!({"year": 2025, "lastNumber": next_number}))
+					.await
+					.unwrap();
 
 				// Create invoice with this number
 				let invoice_number = format!("2025/{:02}", next_number);
@@ -353,11 +322,7 @@ async fn test_invoice_numbering_simulation() {
 	}
 
 	// Verify counter
-	let final_counter = adapter
-		.get(tn_id, db_id, &counter_path)
-		.await
-		.unwrap()
-		.unwrap();
+	let final_counter = adapter.get(tn_id, db_id, &counter_path).await.unwrap().unwrap();
 	let final_number = final_counter["lastNumber"].as_i64().unwrap();
 
 	println!("Final invoice number: {}", final_number);
@@ -371,7 +336,8 @@ async fn test_invoice_numbering_simulation() {
 	invoice_numbers.sort();
 	for i in 0..invoice_numbers.len() - 1 {
 		assert_ne!(
-			invoice_numbers[i], invoice_numbers[i + 1],
+			invoice_numbers[i],
+			invoice_numbers[i + 1],
 			"CRITICAL: Duplicate invoice number detected: {}",
 			invoice_numbers[i]
 		);

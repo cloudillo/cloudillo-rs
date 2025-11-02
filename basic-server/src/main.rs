@@ -5,15 +5,15 @@
 
 #![allow(unused)]
 
-use std::{sync::Arc, env, path::PathBuf};
+use std::{env, path::PathBuf, sync::Arc};
 use tokio::fs;
 
-use cloudillo::{auth_adapter, meta_adapter, core::worker};
+use cloudillo::{auth_adapter, core::worker, meta_adapter};
 use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
-use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_blob_adapter_fs::BlobAdapterFs;
-use crdt_adapter_redb::{CrdtAdapterRedb, AdapterConfig as CrdtConfig};
-use rtdb_adapter_redb::{RtdbAdapterRedb, AdapterConfig as RtdbConfig};
+use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
+use crdt_adapter_redb::{AdapterConfig as CrdtConfig, CrdtAdapterRedb};
+use rtdb_adapter_redb::{AdapterConfig as RtdbConfig, RtdbAdapterRedb};
 
 pub struct Config {
 	pub mode: cloudillo::ServerMode,
@@ -44,28 +44,52 @@ async fn main() {
 			Ok("proxy") => cloudillo::ServerMode::Proxy,
 			Ok("stream-proxy") => cloudillo::ServerMode::StreamProxy,
 			Ok(&_) => panic!("Unknown mode"),
-			Err(_) => cloudillo::ServerMode::Standalone
+			Err(_) => cloudillo::ServerMode::Standalone,
 		},
 		listen: env::var("LISTEN").unwrap_or("127.0.0.1:8080".to_string()),
 		listen_http: env::var("LISTEN_HTTP").ok(),
 		base_app_domain: env::var("BASE_APP_DOMAIN").unwrap_or_else(|_| base_id_tag.clone()),
 		base_id_tag,
 		base_password: env::var("BASE_PASSWORD").ok(),
-		data_dir: env::var("DATA_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./data")),
-		priv_data_dir: env::var("PRIVATE_DATA_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./data")),
-		pub_data_dir: env::var("PUBLIC_DATA_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./data")),
-		dist_dir: env::var("DIST_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./dist")),
+		data_dir: env::var("DATA_DIR")
+			.map(PathBuf::from)
+			.unwrap_or_else(|_| PathBuf::from("./data")),
+		priv_data_dir: env::var("PRIVATE_DATA_DIR")
+			.map(PathBuf::from)
+			.unwrap_or_else(|_| PathBuf::from("./data")),
+		pub_data_dir: env::var("PUBLIC_DATA_DIR")
+			.map(PathBuf::from)
+			.unwrap_or_else(|_| PathBuf::from("./data")),
+		dist_dir: env::var("DIST_DIR")
+			.map(PathBuf::from)
+			.unwrap_or_else(|_| PathBuf::from("./dist")),
 		acme_email: env::var("ACME_EMAIL").ok(),
-		local_ips: env::var("LOCAL_IPS").ok().map(|s| s.split(',').map(|s| s.to_string()).collect()).unwrap_or_default(),
-		identity_providers: env::var("IDENTITY_PROVIDERS").ok().map(|s| s.split(',').map(|s| s.to_string()).collect()).unwrap_or_default(),
-		db_dir: env::var("DB_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./data")),
+		local_ips: env::var("LOCAL_IPS")
+			.ok()
+			.map(|s| s.split(',').map(|s| s.to_string()).collect())
+			.unwrap_or_default(),
+		identity_providers: env::var("IDENTITY_PROVIDERS")
+			.ok()
+			.map(|s| s.split(',').map(|s| s.to_string()).collect())
+			.unwrap_or_default(),
+		db_dir: env::var("DB_DIR")
+			.map(PathBuf::from)
+			.unwrap_or_else(|_| PathBuf::from("./data")),
 	};
 	fs::create_dir_all(&config.db_dir).await.expect("Cannot create db dir");
 	//tracing_subscriber::fmt::init();
 
 	let worker = Arc::new(worker::WorkerPool::new(1, 2, 1));
-	let auth_adapter = Arc::new(AuthAdapterSqlite::new(worker.clone(), config.db_dir.join("auth.db")).await.unwrap());
-	let meta_adapter = Arc::new(MetaAdapterSqlite::new(worker.clone(), config.db_dir.join("meta.db")).await.unwrap());
+	let auth_adapter = Arc::new(
+		AuthAdapterSqlite::new(worker.clone(), config.db_dir.join("auth.db"))
+			.await
+			.unwrap(),
+	);
+	let meta_adapter = Arc::new(
+		MetaAdapterSqlite::new(worker.clone(), config.db_dir.join("meta.db"))
+			.await
+			.unwrap(),
+	);
 	let blob_adapter = Arc::new(BlobAdapterFs::new(config.data_dir.into()).await.unwrap());
 
 	// CRDT adapter for collaborative editing
@@ -75,7 +99,11 @@ async fn main() {
 		broadcast_capacity: 128,
 		auto_evict: true,
 	};
-	let crdt_adapter = Arc::new(CrdtAdapterRedb::new(config.db_dir.join("crdt"), false, crdt_config).await.unwrap());
+	let crdt_adapter = Arc::new(
+		CrdtAdapterRedb::new(config.db_dir.join("crdt"), false, crdt_config)
+			.await
+			.unwrap(),
+	);
 
 	// RTDB adapter for real-time database
 	let rtdb_config = RtdbConfig {
@@ -84,10 +112,15 @@ async fn main() {
 		broadcast_capacity: 128,
 		auto_evict: true,
 	};
-	let rtdb_adapter = Arc::new(RtdbAdapterRedb::new(config.db_dir.join("rtdb"), false, rtdb_config).await.unwrap());
+	let rtdb_adapter = Arc::new(
+		RtdbAdapterRedb::new(config.db_dir.join("rtdb"), false, rtdb_config)
+			.await
+			.unwrap(),
+	);
 
 	let mut cloudillo = cloudillo::AppBuilder::new();
-	cloudillo.mode(config.mode)
+	cloudillo
+		.mode(config.mode)
 		.listen(config.listen)
 		.base_id_tag(config.base_id_tag)
 		.base_app_domain(config.base_app_domain)

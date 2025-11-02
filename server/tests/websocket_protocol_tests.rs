@@ -13,9 +13,12 @@ mod tests {
 		use serde_json::json;
 
 		// Test creating a bus message
-		let msg = cloudillo::core::ws_bus::BusMessage::new("subscribe", json!({
-			"channels": ["actions", "presence"]
-		}));
+		let msg = cloudillo::core::ws_bus::BusMessage::new(
+			"subscribe",
+			json!({
+				"channels": ["actions", "presence"]
+			}),
+		);
 
 		assert_eq!(msg.cmd, "subscribe");
 		assert_eq!(msg.data.get("channels").map(|v| v.as_array().is_some()), Some(true));
@@ -29,28 +32,25 @@ mod tests {
 
 		assert_eq!(msg.cmd, "ack");
 		assert_eq!(msg.id, "msg-123");
-		assert_eq!(
-			msg.data.get("status").and_then(|v| v.as_str()),
-			Some("ok")
-		);
+		assert_eq!(msg.data.get("status").and_then(|v| v.as_str()), Some("ok"));
 	}
 
 	/// Test that RTDB message parsing works correctly
 	#[test]
 	fn test_rtdb_message_parsing() {
-		use serde_json::json;
 		use cloudillo::rtdb::websocket::RtdbMessage;
+		use serde_json::json;
 
 		// Test creating an RTDB message
-		let msg = RtdbMessage::new("subscribe", json!({
-			"collections": ["users", "posts"]
-		}));
+		let msg = RtdbMessage::new(
+			"subscribe",
+			json!({
+				"collections": ["users", "posts"]
+			}),
+		);
 
 		assert_eq!(msg.msg_type, "subscribe");
-		assert_eq!(
-			msg.payload.get("collections").map(|v| v.as_array().is_some()),
-			Some(true)
-		);
+		assert_eq!(msg.payload.get("collections").map(|v| v.as_array().is_some()), Some(true));
 	}
 
 	/// Test that RTDB acknowledgment messages are created correctly
@@ -64,17 +64,14 @@ mod tests {
 
 		assert_eq!(msg.msg_type, "ack");
 		assert_eq!(msg.id.as_str(), Some("msg-456"));
-		assert_eq!(
-			msg.payload.get("status").and_then(|v| v.as_str()),
-			Some("ok")
-		);
+		assert_eq!(msg.payload.get("status").and_then(|v| v.as_str()), Some("ok"));
 	}
 
 	/// Test that RTDB database change messages are created correctly
 	#[test]
 	fn test_rtdb_db_change_message() {
-		use serde_json::json;
 		use cloudillo::rtdb::websocket::RtdbMessage;
+		use serde_json::json;
 
 		// Test creating a database change message
 		let msg = RtdbMessage::db_change(
@@ -85,18 +82,9 @@ mod tests {
 		);
 
 		assert_eq!(msg.msg_type, "dbChange");
-		assert_eq!(
-			msg.payload.get("collection").and_then(|v| v.as_str()),
-			Some("users")
-		);
-		assert_eq!(
-			msg.payload.get("docId").and_then(|v| v.as_str()),
-			Some("user-123")
-		);
-		assert_eq!(
-			msg.payload.get("operation").and_then(|v| v.as_str()),
-			Some("create")
-		);
+		assert_eq!(msg.payload.get("collection").and_then(|v| v.as_str()), Some("users"));
+		assert_eq!(msg.payload.get("docId").and_then(|v| v.as_str()), Some("user-123"));
+		assert_eq!(msg.payload.get("operation").and_then(|v| v.as_str()), Some("create"));
 	}
 
 	/// Test that CRDT message types parse correctly
@@ -141,7 +129,7 @@ mod tests {
 	#[test]
 	fn test_bus_online_status() {
 		use cloudillo::core::ws_bus::OnlineStatus;
-		use serde_json::{to_value, from_value};
+		use serde_json::{from_value, to_value};
 
 		// Test Online status
 		let online = OnlineStatus::Online;

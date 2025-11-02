@@ -1,6 +1,6 @@
 //! Error handling subsystem. Implements a custom Error type.
 
-use axum::{response::IntoResponse, http::StatusCode, Json};
+use axum::{http::StatusCode, response::IntoResponse, Json};
 
 use crate::prelude::*;
 use crate::types::ErrorResponse;
@@ -12,26 +12,26 @@ pub enum Error {
 	// Core errors
 	NotFound,
 	PermissionDenied,
-	Unauthorized,                 // 401 - missing/invalid auth token
+	Unauthorized, // 401 - missing/invalid auth token
 	DbError,
 	Unknown,
 	Parse,
 
 	// Input validation and constraints
-	ValidationError(String),      // 400 - invalid input data
-	Conflict(String),             // 409 - constraint violation (unique, foreign key, etc)
+	ValidationError(String), // 400 - invalid input data
+	Conflict(String),        // 409 - constraint violation (unique, foreign key, etc)
 
 	// Network and external services
-	NetworkError(String),         // Network/federation failures
-	Timeout,                      // Operation timeout
+	NetworkError(String), // Network/federation failures
+	Timeout,              // Operation timeout
 
 	// System and configuration
-	ConfigError(String),          // Missing or invalid configuration
-	ServiceUnavailable(String),   // 503 - temporary system failures
+	ConfigError(String),        // Missing or invalid configuration
+	ServiceUnavailable(String), // 503 - temporary system failures
 
 	// Processing
-	ImageError(String),           // Image processing failures
-	CryptoError(String),          // Cryptography/TLS configuration errors
+	ImageError(String),  // Image processing failures
+	CryptoError(String), // Cryptography/TLS configuration errors
 
 	// externals
 	Io(std::io::Error),

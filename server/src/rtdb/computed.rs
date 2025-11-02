@@ -30,7 +30,9 @@ pub async fn process_computed_values(
 			if let Value::Object(inner) = value {
 				// Check for $op (field operation) - NOW USES TRANSACTION READS
 				if let Some(op_type) = inner.get("$op").and_then(|v| v.as_str()) {
-					match process_field_operation(txn, tn_id, db_id, path, key, op_type, inner).await {
+					match process_field_operation(txn, tn_id, db_id, path, key, op_type, inner)
+						.await
+					{
 						Ok(computed) => replacements.push((key.clone(), computed)),
 						Err(e) => {
 							warn!("Field operation failed for {}: {}", key, e);
@@ -85,8 +87,7 @@ async fn process_field_operation(
 ) -> ClResult<Value> {
 	// Uses transaction-local read instead of adapter.get()
 	// This ensures we read our own uncommitted writes (read-your-own-writes semantics)
-	let doc = txn.get(path).await?
-		.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+	let doc = txn.get(path).await?.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
 	let current_value = doc.get(field).cloned().unwrap_or(Value::Null);
 
@@ -107,11 +108,7 @@ async fn process_field_operation(
 			Ok(Value::Number((current * by).into()))
 		}
 		"append" => {
-			let mut arr = if let Value::Array(a) = current_value {
-				a
-			} else {
-				Vec::new()
-			};
+			let mut arr = if let Value::Array(a) = current_value { a } else { Vec::new() };
 			if let Some(Value::Array(values)) = params.get("values") {
 				arr.extend(values.clone());
 			}
@@ -150,15 +147,12 @@ async fn process_field_operation(
 			let current = current_value.as_i64().unwrap_or(i64::MIN);
 			Ok(Value::Number(current.max(new_val).into()))
 		}
-		_ => Err(Error::ValidationError(format!("Unknown field operation: {}", op_type)))
+		_ => Err(Error::ValidationError(format!("Unknown field operation: {}", op_type))),
 	}
 }
 
 /// Process function calls ($fn)
-fn process_function(
-	fn_name: &str,
-	params: &serde_json::Map<String, Value>,
-) -> ClResult<Value> {
+fn process_function(fn_name: &str, params: &serde_json::Map<String, Value>) -> ClResult<Value> {
 	match fn_name {
 		"now" => {
 			let timestamp = std::time::SystemTime::now()
@@ -167,9 +161,7 @@ fn process_function(
 				.as_millis() as u64;
 			Ok(Value::Number(timestamp.into()))
 		}
-		"uuid" => {
-			Ok(Value::String(uuid::Uuid::new_v4().to_string()))
-		}
+		"uuid" => Ok(Value::String(uuid::Uuid::new_v4().to_string())),
 		"slugify" => {
 			if let Some(Value::Array(args)) = params.get("args") {
 				if let Some(Value::String(text)) = args.first() {
@@ -229,13 +221,15 @@ fn process_function(
 				match args.first() {
 					Some(Value::String(text)) => Ok(Value::Number((text.len() as u64).into())),
 					Some(Value::Array(arr)) => Ok(Value::Number((arr.len() as u64).into())),
-					_ => Err(Error::ValidationError("length requires string or array argument".into()))
+					_ => Err(Error::ValidationError(
+						"length requires string or array argument".into(),
+					)),
 				}
 			} else {
 				Err(Error::ValidationError("length requires argument".into()))
 			}
 		}
-		_ => Err(Error::ValidationError(format!("Unknown function: {}", fn_name)))
+		_ => Err(Error::ValidationError(format!("Unknown function: {}", fn_name))),
 	}
 }
 
@@ -247,7 +241,9 @@ async fn process_query_operation(
 	query_type: &str,
 	params: &serde_json::Map<String, Value>,
 ) -> ClResult<Value> {
-	let path = params.get("path").and_then(|v| v.as_str())
+	let path = params
+		.get("path")
+		.and_then(|v| v.as_str())
 		.ok_or_else(|| Error::ValidationError("Query operation requires path".into()))?;
 
 	match query_type {
@@ -257,22 +253,25 @@ async fn process_query_operation(
 			Ok(Value::Number((results.len() as u64).into()))
 		}
 		"sum" => {
-			let field = params.get("field").and_then(|v| v.as_str())
+			let field = params
+				.get("field")
+				.and_then(|v| v.as_str())
 				.ok_or_else(|| Error::ValidationError("sum requires field".into()))?;
 			let opts = QueryOptions::new();
 			let results = adapter.query(tn_id, db_id, path, opts).await?;
-			let sum: f64 = results.iter()
-				.filter_map(|doc| doc.get(field))
-				.filter_map(|v| v.as_f64())
-				.sum();
+			let sum: f64 =
+				results.iter().filter_map(|doc| doc.get(field)).filter_map(|v| v.as_f64()).sum();
 			Ok(serde_json::json!(sum))
 		}
 		"avg" => {
-			let field = params.get("field").and_then(|v| v.as_str())
+			let field = params
+				.get("field")
+				.and_then(|v| v.as_str())
 				.ok_or_else(|| Error::ValidationError("avg requires field".into()))?;
 			let opts = QueryOptions::new();
 			let results = adapter.query(tn_id, db_id, path, opts).await?;
-			let values: Vec<f64> = results.iter()
+			let values: Vec<f64> = results
+				.iter()
 				.filter_map(|doc| doc.get(field))
 				.filter_map(|v| v.as_f64())
 				.collect();
@@ -284,22 +283,28 @@ async fn process_query_operation(
 			}
 		}
 		"min" => {
-			let field = params.get("field").and_then(|v| v.as_str())
+			let field = params
+				.get("field")
+				.and_then(|v| v.as_str())
 				.ok_or_else(|| Error::ValidationError("min requires field".into()))?;
 			let opts = QueryOptions::new();
 			let results = adapter.query(tn_id, db_id, path, opts).await?;
-			let min = results.iter()
+			let min = results
+				.iter()
 				.filter_map(|doc| doc.get(field))
 				.filter_map(|v| v.as_f64())
 				.min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 			Ok(min.map(|v| serde_json::json!(v)).unwrap_or(Value::Null))
 		}
 		"max" => {
-			let field = params.get("field").and_then(|v| v.as_str())
+			let field = params
+				.get("field")
+				.and_then(|v| v.as_str())
 				.ok_or_else(|| Error::ValidationError("max requires field".into()))?;
 			let opts = QueryOptions::new();
 			let results = adapter.query(tn_id, db_id, path, opts).await?;
-			let max = results.iter()
+			let max = results
+				.iter()
 				.filter_map(|doc| doc.get(field))
 				.filter_map(|v| v.as_f64())
 				.max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -319,7 +324,7 @@ async fn process_query_operation(
 			let results = adapter.query(tn_id, db_id, path, opts).await?;
 			Ok(results.last().cloned().unwrap_or(Value::Null))
 		}
-		_ => Err(Error::ValidationError(format!("Unknown query operation: {}", query_type)))
+		_ => Err(Error::ValidationError(format!("Unknown query operation: {}", query_type))),
 	}
 }
 

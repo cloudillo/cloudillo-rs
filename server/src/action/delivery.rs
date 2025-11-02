@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{
-	prelude::*,
 	core::scheduler::{Task, TaskId},
+	prelude::*,
 };
 
 /// Task for delivering federated actions
@@ -15,8 +15,8 @@ use crate::{
 pub struct ActionDeliveryTask {
 	pub tn_id: TnId,
 	pub action_id: Box<str>,
-	pub target_instance: Box<str>,  // Base domain of target instance
-	pub target_id_tag: Box<str>,    // User on target instance to deliver to
+	pub target_instance: Box<str>, // Base domain of target instance
+	pub target_id_tag: Box<str>,   // User on target instance to deliver to
 }
 
 impl ActionDeliveryTask {
@@ -26,12 +26,7 @@ impl ActionDeliveryTask {
 		target_instance: Box<str>,
 		target_id_tag: Box<str>,
 	) -> Arc<Self> {
-		Arc::new(Self {
-			tn_id,
-			action_id,
-			target_instance,
-			target_id_tag,
-		})
+		Arc::new(Self { tn_id, action_id, target_instance, target_id_tag })
 	}
 }
 
@@ -57,33 +52,23 @@ impl Task<App> for ActionDeliveryTask {
 	async fn run(&self, app: &App) -> ClResult<()> {
 		info!(
 			"Running ActionDeliveryTask to {} for action {}",
-			self.target_instance,
-			self.action_id
+			self.target_instance, self.action_id
 		);
 
 		// Fetch action from database
-		let action = app
-			.meta_adapter
-			.get_action(self.tn_id, &self.action_id)
-			.await?;
+		let action = app.meta_adapter.get_action(self.tn_id, &self.action_id).await?;
 
 		let _action = match action {
 			Some(a) => a,
 			None => {
 				// Action was deleted, mark delivery task as complete
-				warn!(
-					"Action {} not found for delivery task, marking as complete",
-					self.action_id
-				);
+				warn!("Action {} not found for delivery task, marking as complete", self.action_id);
 				return Ok(());
 			}
 		};
 
 		// Get action token
-		let action_token = app
-			.meta_adapter
-			.get_action_token(self.tn_id, &self.action_id)
-			.await?;
+		let action_token = app.meta_adapter.get_action_token(self.tn_id, &self.action_id).await?;
 
 		let action_token = match action_token {
 			Some(token) => token,

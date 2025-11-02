@@ -1,11 +1,11 @@
 //! Action subsystem. Actions are small signed documents representing a user action (e.g. post, comment, connection request).
 
 pub mod action;
-pub mod handler;
 pub mod delivery;
+pub mod handler;
 pub mod perm;
-pub mod types;
 mod process;
+pub mod types;
 
 pub use process::verify_action_token;
 pub use types::ACTION_TYPES;

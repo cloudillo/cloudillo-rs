@@ -15,10 +15,7 @@ pub const TABLE_METADATA: redb::TableDefinition<&str, &str> = redb::TableDefinit
 
 /// Get current Unix timestamp
 pub fn now_timestamp() -> u64 {
-	SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.unwrap_or_default()
-		.as_secs()
+	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 /// Convert a JSON value to a sortable string for indexing
@@ -164,9 +161,7 @@ pub fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
 		(None, Some(_)) => Ordering::Less,
 		(Some(_), None) => Ordering::Greater,
 		(Some(Value::Number(a)), Some(Value::Number(b))) => {
-			a.as_f64()
-				.partial_cmp(&b.as_f64())
-				.unwrap_or(Ordering::Equal)
+			a.as_f64().partial_cmp(&b.as_f64()).unwrap_or(Ordering::Equal)
 		}
 		(Some(Value::String(a)), Some(Value::String(b))) => a.cmp(b),
 		(Some(Value::Bool(a)), Some(Value::Bool(b))) => a.cmp(b),

@@ -2,9 +2,9 @@
 //!
 //! Tests concurrent access patterns and thread safety
 
-use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use cloudillo::blob_adapter::{BlobAdapter, CreateBlobOptions};
 use cloudillo::types::TnId;
+use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use std::sync::Arc;
 use tempfile::TempDir;
 

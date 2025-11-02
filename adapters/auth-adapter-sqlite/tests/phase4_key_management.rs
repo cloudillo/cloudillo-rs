@@ -6,10 +6,10 @@
 
 #[cfg(test)]
 mod tests {
-	use cloudillo::prelude::*;
 	use cloudillo::auth_adapter::AuthAdapter;
-	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use cloudillo::core::worker::WorkerPool;
+	use cloudillo::prelude::*;
+	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use std::sync::Arc;
 	use tempfile::TempDir;
 
@@ -29,12 +29,14 @@ mod tests {
 		let tn_id = TnId(1);
 
 		// Create a profile key first
-		let created_key = adapter.create_profile_key(tn_id, None)
+		let created_key = adapter
+			.create_profile_key(tn_id, None)
 			.await
 			.expect("Failed to create profile key");
 
 		// Now read it back using read_profile_key
-		let read_key = adapter.read_profile_key(tn_id, &created_key.key_id)
+		let read_key = adapter
+			.read_profile_key(tn_id, &created_key.key_id)
 			.await
 			.expect("Failed to read profile key");
 
@@ -67,20 +69,24 @@ mod tests {
 		let tn_id_2 = TnId(2);
 
 		// Create keys for two different tenants
-		let key1 = adapter.create_profile_key(tn_id_1, None)
+		let key1 = adapter
+			.create_profile_key(tn_id_1, None)
 			.await
 			.expect("Failed to create key for tenant 1");
 
-		let key2 = adapter.create_profile_key(tn_id_2, None)
+		let key2 = adapter
+			.create_profile_key(tn_id_2, None)
 			.await
 			.expect("Failed to create key for tenant 2");
 
 		// Verify each can read their own key
-		let read_key1 = adapter.read_profile_key(tn_id_1, &key1.key_id)
+		let read_key1 = adapter
+			.read_profile_key(tn_id_1, &key1.key_id)
 			.await
 			.expect("Failed to read tenant 1 key");
 
-		let read_key2 = adapter.read_profile_key(tn_id_2, &key2.key_id)
+		let read_key2 = adapter
+			.read_profile_key(tn_id_2, &key2.key_id)
 			.await
 			.expect("Failed to read tenant 2 key");
 
@@ -112,7 +118,8 @@ mod tests {
 		let test_private_key = "test-private-key-12345";
 
 		// Create a tenant first
-		adapter.create_tenant(id_tag, None, None)
+		adapter
+			.create_tenant(id_tag, None, None)
 			.await
 			.expect("Failed to create tenant");
 
@@ -122,12 +129,14 @@ mod tests {
 		};
 
 		// Update VAPID key
-		adapter.update_vapid_key(tn_id, &keypair)
+		adapter
+			.update_vapid_key(tn_id, &keypair)
 			.await
 			.expect("Failed to update VAPID key");
 
 		// Read public key
-		let public_key = adapter.read_vapid_public_key(tn_id)
+		let public_key = adapter
+			.read_vapid_public_key(tn_id)
 			.await
 			.expect("Failed to read VAPID public key");
 
@@ -145,7 +154,8 @@ mod tests {
 		let test_private_key = "another-private-key";
 
 		// Create a tenant first
-		adapter.create_tenant(id_tag, None, None)
+		adapter
+			.create_tenant(id_tag, None, None)
 			.await
 			.expect("Failed to create tenant");
 
@@ -155,14 +165,14 @@ mod tests {
 		};
 
 		// Update VAPID key
-		adapter.update_vapid_key(tn_id, &keypair)
+		adapter
+			.update_vapid_key(tn_id, &keypair)
 			.await
 			.expect("Failed to update VAPID key");
 
 		// Read full key pair
-		let read_keypair = adapter.read_vapid_key(tn_id)
-			.await
-			.expect("Failed to read VAPID key pair");
+		let read_keypair =
+			adapter.read_vapid_key(tn_id).await.expect("Failed to read VAPID key pair");
 
 		assert_eq!(read_keypair.public_key.as_ref(), test_public_key);
 		assert_eq!(read_keypair.private_key.as_ref(), test_private_key);
@@ -177,7 +187,8 @@ mod tests {
 		let id_tag = "test_vapid_overwrite_user";
 
 		// Create a tenant first
-		adapter.create_tenant(id_tag, None, None)
+		adapter
+			.create_tenant(id_tag, None, None)
 			.await
 			.expect("Failed to create tenant");
 
@@ -187,7 +198,8 @@ mod tests {
 			private_key: "key1-private".into(),
 		};
 
-		adapter.update_vapid_key(tn_id, &keypair1)
+		adapter
+			.update_vapid_key(tn_id, &keypair1)
 			.await
 			.expect("Failed to update VAPID key");
 
@@ -197,14 +209,14 @@ mod tests {
 			private_key: "key2-private".into(),
 		};
 
-		adapter.update_vapid_key(tn_id, &keypair2)
+		adapter
+			.update_vapid_key(tn_id, &keypair2)
 			.await
 			.expect("Failed to update VAPID key");
 
 		// Verify new key is stored
-		let read_keypair = adapter.read_vapid_key(tn_id)
-			.await
-			.expect("Failed to read VAPID key pair");
+		let read_keypair =
+			adapter.read_vapid_key(tn_id).await.expect("Failed to read VAPID key pair");
 
 		assert_eq!(read_keypair.public_key.as_ref(), "key2-public");
 		assert_eq!(read_keypair.private_key.as_ref(), "key2-private");
@@ -245,11 +257,13 @@ mod tests {
 		let tn_id_2 = TnId(2);
 
 		// Create both tenants first
-		adapter.create_tenant("tenant1_vapid", None, None)
+		adapter
+			.create_tenant("tenant1_vapid", None, None)
 			.await
 			.expect("Failed to create tenant 1");
 
-		adapter.create_tenant("tenant2_vapid", None, None)
+		adapter
+			.create_tenant("tenant2_vapid", None, None)
 			.await
 			.expect("Failed to create tenant 2");
 
@@ -264,22 +278,20 @@ mod tests {
 			private_key: "tenant2-private".into(),
 		};
 
-		adapter.update_vapid_key(tn_id_1, &keypair1)
+		adapter
+			.update_vapid_key(tn_id_1, &keypair1)
 			.await
 			.expect("Failed to update tenant 1 VAPID key");
 
-		adapter.update_vapid_key(tn_id_2, &keypair2)
+		adapter
+			.update_vapid_key(tn_id_2, &keypair2)
 			.await
 			.expect("Failed to update tenant 2 VAPID key");
 
 		// Verify isolation
-		let read_key1 = adapter.read_vapid_key(tn_id_1)
-			.await
-			.expect("Failed to read tenant 1 key");
+		let read_key1 = adapter.read_vapid_key(tn_id_1).await.expect("Failed to read tenant 1 key");
 
-		let read_key2 = adapter.read_vapid_key(tn_id_2)
-			.await
-			.expect("Failed to read tenant 2 key");
+		let read_key2 = adapter.read_vapid_key(tn_id_2).await.expect("Failed to read tenant 2 key");
 
 		assert_eq!(read_key1.public_key.as_ref(), "tenant1-public");
 		assert_eq!(read_key2.public_key.as_ref(), "tenant2-public");

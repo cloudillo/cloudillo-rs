@@ -44,20 +44,12 @@ pub struct CrdtUpdate {
 impl CrdtUpdate {
 	/// Create a new CRDT update from raw bytes.
 	pub fn new(data: Vec<u8>) -> Self {
-		Self {
-			data,
-			timestamp: Timestamp::now(),
-			client_id: None,
-		}
+		Self { data, timestamp: Timestamp::now(), client_id: None }
 	}
 
 	/// Create a new CRDT update with client ID.
 	pub fn with_client(data: Vec<u8>, client_id: impl Into<Box<str>>) -> Self {
-		Self {
-			data,
-			timestamp: Timestamp::now(),
-			client_id: Some(client_id.into()),
-		}
+		Self { data, timestamp: Timestamp::now(), client_id: Some(client_id.into()) }
 	}
 }
 
@@ -112,18 +104,12 @@ pub struct CrdtSubscriptionOptions {
 impl CrdtSubscriptionOptions {
 	/// Create a subscription to a document with snapshot.
 	pub fn with_snapshot(doc_id: impl Into<Box<str>>) -> Self {
-		Self {
-			doc_id: doc_id.into(),
-			send_snapshot: true,
-		}
+		Self { doc_id: doc_id.into(), send_snapshot: true }
 	}
 
 	/// Create a subscription to future updates only (no snapshot).
 	pub fn updates_only(doc_id: impl Into<Box<str>>) -> Self {
-		Self {
-			doc_id: doc_id.into(),
-			send_snapshot: false,
-		}
+		Self { doc_id: doc_id.into(), send_snapshot: false }
 	}
 }
 

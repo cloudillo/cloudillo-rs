@@ -1,9 +1,9 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::prelude::*;
 use crate::auth_adapter;
-use crate::core::{IdTag, extract::OptionalRequestId};
+use crate::core::{extract::OptionalRequestId, IdTag};
+use crate::prelude::*;
 use crate::types::ApiResponse;
 
 /// # Profile

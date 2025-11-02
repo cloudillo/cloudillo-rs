@@ -3,12 +3,13 @@
 use async_trait::async_trait;
 use flume;
 use itertools::Itertools;
-use std::{collections::{BTreeMap, HashMap}, fmt::Debug, sync::{Arc, Mutex, RwLock}};
-
-use crate::{
-	prelude::*,
-	meta_adapter,
+use std::{
+	collections::{BTreeMap, HashMap},
+	fmt::Debug,
+	sync::{Arc, Mutex, RwLock},
 };
+
+use crate::{meta_adapter, prelude::*};
 
 pub type TaskId = u64;
 
@@ -50,13 +51,7 @@ impl CronSchedule {
 		let month = Self::parse_field(parts[3], 1, 12)?;
 		let weekday = Self::parse_field(parts[4], 0, 6)?;
 
-		Ok(Self {
-			minute,
-			hour,
-			day,
-			month,
-			weekday,
-		})
+		Ok(Self { minute, hour, day, month, weekday })
 	}
 
 	/// Parse a single cron field
@@ -144,9 +139,11 @@ impl CronSchedule {
 #[async_trait]
 pub trait Task<S: Clone>: Send + Sync + Debug {
 	fn kind() -> &'static str
-		where Self: Sized;
+	where
+		Self: Sized;
 	fn build(id: TaskId, context: &str) -> ClResult<Arc<dyn Task<S>>>
-		where Self: Sized;
+	where
+		Self: Sized;
 	fn serialize(&self) -> String;
 	async fn run(&self, state: &S) -> ClResult<()>;
 
@@ -176,7 +173,12 @@ pub trait TaskStore<S: Clone>: Send + Sync {
 	async fn add(&self, task: &TaskMeta<S>, key: Option<&str>) -> ClResult<TaskId>;
 	async fn finished(&self, id: TaskId, output: &str) -> ClResult<()>;
 	async fn load(&self) -> ClResult<Vec<TaskData>>;
-	async fn update_task_error(&self, task_id: TaskId, output: &str, next_at: Option<Timestamp>) -> ClResult<()>;
+	async fn update_task_error(
+		&self,
+		task_id: TaskId,
+		output: &str,
+		next_at: Option<Timestamp>,
+	) -> ClResult<()>;
 }
 
 // InMemoryTaskStore
@@ -207,7 +209,12 @@ impl<S: Clone> TaskStore<S> for InMemoryTaskStore {
 		Ok(vec![])
 	}
 
-	async fn update_task_error(&self, _task_id: TaskId, _output: &str, _next_at: Option<Timestamp>) -> ClResult<()> {
+	async fn update_task_error(
+		&self,
+		_task_id: TaskId,
+		_output: &str,
+		_next_at: Option<Timestamp>,
+	) -> ClResult<()> {
 		Ok(())
 	}
 }
@@ -227,11 +234,17 @@ impl MetaAdapterTaskStore {
 #[async_trait]
 impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 	async fn add(&self, task: &TaskMeta<S>, key: Option<&str>) -> ClResult<TaskId> {
-		let id = self.meta_adapter.create_task(task.task.kind_of(), key, &task.task.serialize(), &task.deps).await?;
+		let id = self
+			.meta_adapter
+			.create_task(task.task.kind_of(), key, &task.task.serialize(), &task.deps)
+			.await?;
 
 		// Store cron schedule if present
 		if let Some(cron) = &task.cron {
-			let cron_str = format!("{} {} {} {} {}", cron.minute, cron.hour, cron.day, cron.month, cron.weekday);
+			let cron_str = format!(
+				"{} {} {} {} {}",
+				cron.minute, cron.hour, cron.day, cron.month, cron.weekday
+			);
 			self.meta_adapter.update_task_cron(id, Some(&cron_str)).await?;
 		}
 
@@ -244,25 +257,33 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 
 	async fn load(&self) -> ClResult<Vec<TaskData>> {
 		let tasks = self.meta_adapter.list_tasks(meta_adapter::ListTaskOptions::default()).await?;
-		let tasks = tasks.into_iter().map(|t| TaskData {
-			id: t.task_id,
-			kind: t.kind,
-			status: match t.status {
-				'P' => TaskStatus::Pending,
-				'F' => TaskStatus::Completed,
-				'E' => TaskStatus::Failed,
-				_ => TaskStatus::Failed,
-			},
-			input: t.input,
-			deps: t.deps,
-			retry_data: t.retry,
-			cron_data: t.cron,
-			next_at: t.next_at,
-		}).collect();
+		let tasks = tasks
+			.into_iter()
+			.map(|t| TaskData {
+				id: t.task_id,
+				kind: t.kind,
+				status: match t.status {
+					'P' => TaskStatus::Pending,
+					'F' => TaskStatus::Completed,
+					'E' => TaskStatus::Failed,
+					_ => TaskStatus::Failed,
+				},
+				input: t.input,
+				deps: t.deps,
+				retry_data: t.retry,
+				cron_data: t.cron,
+				next_at: t.next_at,
+			})
+			.collect();
 		Ok(tasks)
 	}
 
-	async fn update_task_error(&self, task_id: TaskId, output: &str, next_at: Option<Timestamp>) -> ClResult<()> {
+	async fn update_task_error(
+		&self,
+		task_id: TaskId,
+		output: &str,
+		next_at: Option<Timestamp>,
+	) -> ClResult<()> {
 		self.meta_adapter.update_task_error(task_id, output, next_at).await
 	}
 }
@@ -278,10 +299,7 @@ pub struct RetryPolicy {
 
 impl RetryPolicy {
 	pub fn default() -> Self {
-		Self {
-			wait_min_max: (60, 3600),
-			times: 10,
-		}
+		Self { wait_min_max: (60, 3600), times: 10 }
 	}
 
 	/// Create a new RetryPolicy with custom min/max backoff and number of retries
@@ -437,14 +455,16 @@ impl<'a, S: Clone + Send + Sync + 'static> TaskSchedulerBuilder<'a, S> {
 
 	/// Execute the task with all configured options - main terminal method
 	pub async fn schedule(self) -> ClResult<TaskId> {
-		self.scheduler._schedule_task(
-			self.task,
-			self.key.as_deref(),
-			self.next_at,
-			if self.deps.is_empty() { None } else { Some(self.deps) },
-			self.retry,
-			self.cron,
-		).await
+		self.scheduler
+			._schedule_task(
+				self.task,
+				self.key.as_deref(),
+				self.next_at,
+				if self.deps.is_empty() { None } else { Some(self.deps) },
+				self.retry,
+				self.cron,
+			)
+			.await
 	}
 }
 
@@ -495,7 +515,6 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 	}
 
 	pub fn start(&self, state: S) {
-
 		// Handle finished tasks and dependencies
 		let schedule = self.clone();
 		let stat = state.clone();
@@ -526,9 +545,14 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				match schedule.release_dependents(id) {
 					Ok(ready_to_spawn) => {
 						for (dep_id, task_meta) in ready_to_spawn {
-							schedule.spawn_task(stat.clone(), task_meta.task.clone(), dep_id, task_meta);
+							schedule.spawn_task(
+								stat.clone(),
+								task_meta.task.clone(),
+								dep_id,
+								task_meta,
+							);
 						}
-					},
+					}
 					Err(e) => {
 						error!("Failed to release dependents of task {}: {}", id, e);
 					}
@@ -582,7 +606,11 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		});
 	}
 
-	fn register_builder(&self, name: &'static str, builder: &'static TaskBuilder<S>) -> ClResult<&Self> {
+	fn register_builder(
+		&self,
+		name: &'static str,
+		builder: &'static TaskBuilder<S>,
+	) -> ClResult<&Self> {
 		let mut task_builders = self.task_builders.write().map_err(|_| Error::Unknown)?;
 		task_builders.insert(name, Box::new(builder));
 		Ok(self)
@@ -590,9 +618,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 	pub fn register<T: Task<S>>(&self) -> ClResult<&Self> {
 		info!("Registering task type {}", T::kind());
-		self.register_builder(T::kind(), &|id: TaskId, params: &str| {
-			T::build(id, params)
-		})?;
+		self.register_builder(T::kind(), &|id: TaskId, params: &str| T::build(id, params))?;
 		Ok(self)
 	}
 
@@ -603,7 +629,15 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 	/// Internal method to schedule a task with all options
 	/// This is the core implementation used by the builder pattern
-	async fn _schedule_task(&self, task: Arc<dyn Task<S>>, key: Option<&str>, next_at: Option<Timestamp>, deps: Option<Vec<TaskId>>, retry: Option<RetryPolicy>, cron: Option<CronSchedule>) -> ClResult<TaskId> {
+	async fn _schedule_task(
+		&self,
+		task: Arc<dyn Task<S>>,
+		key: Option<&str>,
+		next_at: Option<Timestamp>,
+		deps: Option<Vec<TaskId>>,
+		retry: Option<RetryPolicy>,
+		cron: Option<CronSchedule>,
+	) -> ClResult<TaskId> {
 		let task_meta = TaskMeta {
 			task: task.clone(),
 			next_at,
@@ -630,24 +664,40 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			self.tasks_waiting.lock().map_err(|_| Error::Unknown)?.insert(id, task_meta);
 			info!("Task {} is waiting for {:?}", id, &deps);
 			for dep in deps {
-				self.task_dependents.lock().map_err(|_| Error::Unknown)?.entry(dep).or_default().push(id);
+				self.task_dependents
+					.lock()
+					.map_err(|_| Error::Unknown)?
+					.entry(dep)
+					.or_default()
+					.push(id);
 			}
 			return Ok(id);
 		}
 
 		if deps.is_empty() && task_meta.next_at.unwrap_or(Timestamp(0)) < Timestamp::now() {
 			info!("Spawning task {}", id);
-			self.tasks_scheduled.lock().map_err(|_| Error::Unknown)?.insert((Timestamp(0), id), task_meta);
+			self.tasks_scheduled
+				.lock()
+				.map_err(|_| Error::Unknown)?
+				.insert((Timestamp(0), id), task_meta);
 			self.notify_schedule.notify_one();
 		} else if let Some(next_at) = task_meta.next_at {
 			info!("Scheduling task {} for {}", id, next_at);
-			self.tasks_scheduled.lock().map_err(|_| Error::Unknown)?.insert((next_at, id), task_meta);
+			self.tasks_scheduled
+				.lock()
+				.map_err(|_| Error::Unknown)?
+				.insert((next_at, id), task_meta);
 			self.notify_schedule.notify_one();
 		} else {
 			self.tasks_waiting.lock().map_err(|_| Error::Unknown)?.insert(id, task_meta);
 			info!("Task {} is waiting for {:?}", id, &deps);
 			for dep in deps {
-				self.task_dependents.lock().map_err(|_| Error::Unknown)?.entry(dep).or_default().push(id);
+				self.task_dependents
+					.lock()
+					.map_err(|_| Error::Unknown)?
+					.entry(dep)
+					.or_default()
+					.push(id);
 			}
 		}
 		Ok(id)
@@ -655,7 +705,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 	/// Release all dependent tasks of a completed task
 	/// This method safely handles dependency cleanup and spawning
-	fn release_dependents(&self, completed_task_id: TaskId) -> ClResult<Vec<(TaskId, TaskMeta<S>)>> {
+	fn release_dependents(
+		&self,
+		completed_task_id: TaskId,
+	) -> ClResult<Vec<(TaskId, TaskMeta<S>)>> {
 		// Get list of dependents (atomic removal to prevent re-processing)
 		let dependents = {
 			let mut deps_map = self.task_dependents.lock().map_err(|_| Error::Unknown)?;
@@ -663,7 +716,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		};
 
 		if dependents.is_empty() {
-			return Ok(Vec::new());  // No dependents to release
+			return Ok(Vec::new()); // No dependents to release
 		}
 
 		info!("Releasing {} dependents of completed task {}", dependents.len(), completed_task_id);
@@ -682,11 +735,18 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					// If all dependencies are cleared, remove and queue for spawning
 					if task_meta.deps.is_empty() {
 						if let Some(task_to_spawn) = waiting.remove(&dependent_id) {
-							info!("Dependent task {} ready to spawn (all dependencies cleared)", dependent_id);
+							info!(
+								"Dependent task {} ready to spawn (all dependencies cleared)",
+								dependent_id
+							);
 							ready_to_spawn.push((dependent_id, task_to_spawn));
 						}
 					} else {
-						info!("Task {} still has {} remaining dependencies", dependent_id, task_meta.deps.len());
+						info!(
+							"Task {} still has {} remaining dependencies",
+							dependent_id,
+							task_meta.deps.len()
+						);
 					}
 					continue;
 				}
@@ -695,7 +755,8 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			// Try tasks_scheduled if not in waiting (shouldn't happen with validation, but be defensive)
 			{
 				let mut scheduled = self.tasks_scheduled.lock().map_err(|_| Error::Unknown)?;
-				if let Some(scheduled_key) = scheduled.iter()
+				if let Some(scheduled_key) = scheduled
+					.iter()
 					.find(|((_, id), _)| *id == dependent_id)
 					.map(|((ts, id), _)| (*ts, *id))
 				{
@@ -703,9 +764,15 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 						task_meta.deps.retain(|x| *x != completed_task_id);
 						let remaining = task_meta.deps.len();
 						if remaining == 0 {
-							info!("Task {} in scheduled queue has no remaining dependencies", dependent_id);
+							info!(
+								"Task {} in scheduled queue has no remaining dependencies",
+								dependent_id
+							);
 						} else {
-							info!("Task {} in scheduled queue has {} remaining dependencies", dependent_id, remaining);
+							info!(
+								"Task {} in scheduled queue has {} remaining dependencies",
+								dependent_id, remaining
+							);
 						}
 					}
 					continue;
@@ -713,7 +780,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			}
 
 			// Task not found in any queue
-			warn!("Dependent task {} of completed task {} not found in any queue", dependent_id, completed_task_id);
+			warn!(
+				"Dependent task {} of completed task {} not found in any queue",
+				dependent_id, completed_task_id
+			);
 		}
 
 		Ok(ready_to_spawn)
@@ -732,7 +802,8 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				};
 				let (retry_count, retry) = match t.retry_data {
 					Some(retry_str) => {
-						let (retry_count, retry_min, retry_max, retry_times) = retry_str.split(',').collect_tuple().ok_or(Error::Unknown)?;
+						let (retry_count, retry_min, retry_max, retry_times) =
+							retry_str.split(',').collect_tuple().ok_or(Error::Unknown)?;
 						let retry_count: u16 = retry_count.parse().map_err(|_| Error::Unknown)?;
 						let retry = RetryPolicy {
 							wait_min_max: (
@@ -744,12 +815,20 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 						info!("Loaded retry policy: {:?}", retry);
 						(retry_count, Some(retry))
 					}
-					_ => (0, None)
+					_ => (0, None),
 				};
 				// Parse cron data if present
-				let cron = t.cron_data.as_ref().and_then(|cron_str| CronSchedule::parse(cron_str).ok());
+				let cron =
+					t.cron_data.as_ref().and_then(|cron_str| CronSchedule::parse(cron_str).ok());
 
-				let task_meta = TaskMeta { task, next_at: t.next_at, deps: t.deps.into(), retry_count, retry, cron };
+				let task_meta = TaskMeta {
+					task,
+					next_at: t.next_at,
+					deps: t.deps.into(),
+					retry_count,
+					retry,
+					cron,
+				};
 				self.add_queue(t.id, task_meta).await?;
 			}
 		}
@@ -779,7 +858,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 							);
 
 							// Update database with error and reschedule
-							store.update_task_error(id, &e.to_string(), Some(next_at)).await.unwrap_or(());
+							store
+								.update_task_error(id, &e.to_string(), Some(next_at))
+								.await
+								.unwrap_or(());
 
 							// Remove from running tasks (we're not sending finish event)
 							scheduler.tasks_running.lock().unwrap().remove(&id);
@@ -834,19 +916,29 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					// Check if all dependencies still exist
 					for dep in &task_meta.deps {
 						// Check if dependency is in any queue or dependents map
-						let dep_exists = self.tasks_running.lock().ok()
+						let dep_exists = self
+							.tasks_running
+							.lock()
+							.ok()
 							.map(|r| r.contains_key(dep))
-							.unwrap_or(false)
-							|| self.tasks_waiting.lock().ok()
-								.map(|w| w.contains_key(dep))
-								.unwrap_or(false)
-							|| self.tasks_scheduled.lock().ok()
-								.map(|s| s.iter().any(|((_, task_id), _)| task_id == dep))
-								.unwrap_or(false);
+							.unwrap_or(false) || self
+							.tasks_waiting
+							.lock()
+							.ok()
+							.map(|w| w.contains_key(dep))
+							.unwrap_or(false) || self
+							.tasks_scheduled
+							.lock()
+							.ok()
+							.map(|s| s.iter().any(|((_, task_id), _)| task_id == dep))
+							.unwrap_or(false);
 
 						if !dep_exists {
 							tasks_with_missing_deps.push((*id, *dep));
-							warn!("SCHEDULER HEALTH: Task {} depends on non-existent task {}", id, dep);
+							warn!(
+								"SCHEDULER HEALTH: Task {} depends on non-existent task {}",
+								id, dep
+							);
 						}
 					}
 				}
@@ -884,7 +976,7 @@ pub struct SchedulerHealth {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use serde::{Serialize, Deserialize};
+	use serde::{Deserialize, Serialize};
 
 	type State = Arc<Mutex<Vec<u8>>>;
 
@@ -901,7 +993,9 @@ mod tests {
 
 	#[async_trait]
 	impl Task<State> for TestTask {
-		fn kind() -> &'static str { "test" }
+		fn kind() -> &'static str {
+			"test"
+		}
 
 		fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<State>>> {
 			let num: u8 = ctx.parse().map_err(|_| Error::Unknown)?;
@@ -935,17 +1029,15 @@ mod tests {
 
 	impl FailingTask {
 		pub fn new(id: u8, fail_count: u8) -> Arc<Self> {
-			Arc::new(Self {
-				id,
-				fail_count,
-				attempt: Arc::new(Mutex::new(0)),
-			})
+			Arc::new(Self { id, fail_count, attempt: Arc::new(Mutex::new(0)) })
 		}
 	}
 
 	#[async_trait]
 	impl Task<State> for FailingTask {
-		fn kind() -> &'static str { "failing" }
+		fn kind() -> &'static str {
+			"failing"
+		}
 
 		fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<State>>> {
 			let parts: Vec<&str> = ctx.split(',').collect();
@@ -985,8 +1077,7 @@ mod tests {
 
 	#[tokio::test]
 	pub async fn test_scheduler() {
-		let _ = tracing_subscriber::fmt()
-			.try_init();
+		let _ = tracing_subscriber::fmt().try_init();
 
 		let task_store: Arc<dyn TaskStore<State>> = InMemoryTaskStore::new();
 		let state: State = Arc::new(Mutex::new(Vec::new()));
@@ -1023,8 +1114,7 @@ mod tests {
 
 	#[tokio::test]
 	pub async fn test_retry_with_backoff() {
-		let _ = tracing_subscriber::fmt()
-			.try_init();
+		let _ = tracing_subscriber::fmt().try_init();
 
 		let task_store: Arc<dyn TaskStore<State>> = InMemoryTaskStore::new();
 		let state: State = Arc::new(Mutex::new(Vec::new()));
@@ -1035,17 +1125,9 @@ mod tests {
 		// Create a task that fails twice, then succeeds
 		// With retry policy: min=1s, max=3600s, max_attempts=3
 		let failing_task = FailingTask::new(42, 2);
-		let retry_policy = RetryPolicy {
-			wait_min_max: (1, 3600),
-			times: 3,
-		};
+		let retry_policy = RetryPolicy { wait_min_max: (1, 3600), times: 3 };
 
-		scheduler
-			.task(failing_task)
-			.with_retry(retry_policy)
-			.schedule()
-			.await
-			.unwrap();
+		scheduler.task(failing_task).with_retry(retry_policy).schedule().await.unwrap();
 
 		// Wait for retries: 1s (1st fail) + 1s (2nd fail) + time for success
 		// First attempt: immediate fail
@@ -1072,11 +1154,7 @@ mod tests {
 
 		// Test basic builder usage: .now()
 		let task = TestTask::new(1);
-		let id = scheduler
-			.task(task)
-			.now()
-			.await
-			.unwrap();
+		let id = scheduler.task(task).now().await.unwrap();
 
 		assert!(id > 0, "Task ID should be positive");
 
@@ -1097,12 +1175,7 @@ mod tests {
 
 		// Test builder with key
 		let task = TestTask::new(1);
-		let _id = scheduler
-			.task(task)
-			.key("my-task-key")
-			.now()
-			.await
-			.unwrap();
+		let _id = scheduler.task(task).key("my-task-key").now().await.unwrap();
 
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -1159,12 +1232,7 @@ mod tests {
 
 		// Create third task that depends on first two (sleeps 600ms)
 		let task3 = TestTask::new(1);
-		let _id3 = scheduler
-			.task(task3)
-			.depend_on(vec![id1, id2])
-			.schedule()
-			.await
-			.unwrap();
+		let _id3 = scheduler.task(task3).depend_on(vec![id1, id2]).schedule().await.unwrap();
 
 		// Wait for all tasks: task1 200ms, task2 400ms, task3 600ms = ~1200ms
 		tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
@@ -1184,18 +1252,10 @@ mod tests {
 		scheduler.register::<FailingTask>().unwrap();
 
 		// Create task using builder with retry policy
-		let failing_task = FailingTask::new(55, 1);  // Fails once, succeeds second time
-		let retry_policy = RetryPolicy {
-			wait_min_max: (1, 3600),
-			times: 3,
-		};
+		let failing_task = FailingTask::new(55, 1); // Fails once, succeeds second time
+		let retry_policy = RetryPolicy { wait_min_max: (1, 3600), times: 3 };
 
-		let _id = scheduler
-			.task(failing_task)
-			.with_retry(retry_policy)
-			.schedule()
-			.await
-			.unwrap();
+		let _id = scheduler.task(failing_task).with_retry(retry_policy).schedule().await.unwrap();
 
 		// Wait for retry cycle: 1 fail + 1s wait + 1 success
 		tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -1215,11 +1275,7 @@ mod tests {
 
 		// Create task using builder with automatic retry (default policy)
 		let failing_task = FailingTask::new(66, 1);
-		let _id = scheduler
-			.task(failing_task)
-			.with_automatic_retry()
-			.await
-			.unwrap();
+		let _id = scheduler.task(failing_task).with_automatic_retry().await.unwrap();
 
 		// Wait for retry cycle with default policy (min=60s would be too long for test)
 		// but we already tested retry logic thoroughly, just verify builder integration
@@ -1229,7 +1285,7 @@ mod tests {
 		let st = state.lock().unwrap();
 		// With default policy (min=60s), task shouldn't succeed in test timeframe
 		// Just verify builder chaining works
-		let _ = st.len();  // Verify state is accessible, but don't assert on timeout-dependent result
+		let _ = st.len(); // Verify state is accessible, but don't assert on timeout-dependent result
 	}
 
 	#[tokio::test]
@@ -1245,10 +1301,7 @@ mod tests {
 		let dep2 = scheduler.task(TestTask::new(1)).now().await.unwrap();
 
 		// Test fluent chaining with multiple methods
-		let retry_policy = RetryPolicy {
-			wait_min_max: (1, 3600),
-			times: 3,
-		};
+		let retry_policy = RetryPolicy { wait_min_max: (1, 3600), times: 3 };
 
 		let task = TestTask::new(1);
 		let _id = scheduler
@@ -1304,28 +1357,13 @@ mod tests {
 		scheduler.register::<TestTask>().unwrap();
 
 		// Stage 1: Create initial task
-		let id1 = scheduler
-			.task(TestTask::new(1))
-			.key("stage-1")
-			.now()
-			.await
-			.unwrap();
+		let id1 = scheduler.task(TestTask::new(1)).key("stage-1").now().await.unwrap();
 
 		// Stage 2: Create task that depends on stage 1
-		let id2 = scheduler
-			.task(TestTask::new(1))
-			.key("stage-2")
-			.after_task(id1)
-			.await
-			.unwrap();
+		let id2 = scheduler.task(TestTask::new(1)).key("stage-2").after_task(id1).await.unwrap();
 
 		// Stage 3: Create task that depends on stage 2
-		let _id3 = scheduler
-			.task(TestTask::new(1))
-			.key("stage-3")
-			.after_task(id2)
-			.await
-			.unwrap();
+		let _id3 = scheduler.task(TestTask::new(1)).key("stage-3").after_task(id2).await.unwrap();
 
 		// Wait for pipeline: 1(200ms) + 2(200ms) + 3(200ms) = 600ms
 		tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
@@ -1390,7 +1428,7 @@ mod tests {
 		// Wait for dependency to complete but before scheduled time
 		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 		let st = state.lock().unwrap();
-		assert_eq!(st.len(), 1);  // Only dependency executed
+		assert_eq!(st.len(), 1); // Only dependency executed
 		drop(st);
 
 		// Wait for scheduled time (1s total from initial schedule)
@@ -1477,12 +1515,7 @@ mod tests {
 		scheduler.register::<FailingTask>().unwrap();
 
 		// Mix of different task types
-		let _id1 = scheduler
-			.task(TestTask::new(1))
-			.key("test-task")
-			.now()
-			.await
-			.unwrap();
+		let _id1 = scheduler.task(TestTask::new(1)).key("test-task").now().await.unwrap();
 
 		let _id2 = scheduler
 			.task(FailingTask::new(1, 0))  // Won't fail
@@ -1491,11 +1524,7 @@ mod tests {
 			.await
 			.unwrap();
 
-		let _id3 = scheduler
-			.task(TestTask::new(1))
-			.now()
-			.await
-			.unwrap();
+		let _id3 = scheduler.task(TestTask::new(1)).now().await.unwrap();
 
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -1537,7 +1566,7 @@ mod tests {
 		let st = state.lock().unwrap();
 		// Task is scheduled for future (9 AM), so it won't have executed yet
 		// The important thing is that the cron methods compile and integrate
-		assert_eq!(st.len(), 0);  // Not executed yet since scheduled for future
+		assert_eq!(st.len(), 0); // Not executed yet since scheduled for future
 	}
 
 	#[tokio::test]

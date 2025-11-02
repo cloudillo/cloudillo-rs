@@ -23,16 +23,9 @@ pub fn execute_query(
 
 	// Try index-based query first
 	if let Some(ref filter) = opts.filter {
-		if let Some(docs) = try_index_query(
-			instance,
-			&tx,
-			tn_id,
-			db_id,
-			path,
-			filter,
-			&opts,
-			per_tenant_files,
-		)? {
+		if let Some(docs) =
+			try_index_query(instance, &tx, tn_id, db_id, path, filter, &opts, per_tenant_files)?
+		{
 			return Ok(apply_sort_limit(docs, &opts));
 		}
 	}
@@ -106,7 +99,14 @@ fn try_index_query(
 	for (field, value) in &filter.equals {
 		if indexed.iter().any(|f| f.as_ref() == field.as_str()) {
 			return Ok(Some(execute_index_query(
-				tx, tn_id, db_id, path, field, value, filter, per_tenant_files,
+				tx,
+				tn_id,
+				db_id,
+				path,
+				field,
+				value,
+				filter,
+				per_tenant_files,
 			)?));
 		}
 	}
@@ -186,10 +186,7 @@ fn apply_sort_limit(mut docs: Vec<Value>, opts: &QueryOptions) -> Vec<Value> {
 	}
 
 	// Apply limit
-	let end = opts
-		.limit
-		.map(|l| (start + l as usize).min(docs.len()))
-		.unwrap_or(docs.len());
+	let end = opts.limit.map(|l| (start + l as usize).min(docs.len())).unwrap_or(docs.len());
 
 	docs[start..end].to_vec()
 }

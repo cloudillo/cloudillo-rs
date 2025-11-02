@@ -1,13 +1,9 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use itertools::Itertools;
 use jsonwebtoken::{self as jwt, Algorithm, Validation};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize};
 
-use crate::{
-	prelude::*,
-	auth_adapter::ActionToken,
-	file::file,
-};
+use crate::{auth_adapter::ActionToken, file::file, prelude::*};
 
 /// Decodes a JWT without verifying the signature
 pub fn decode_jwt_no_verify<T: DeserializeOwned>(jwt: &str) -> ClResult<T> {
@@ -22,16 +18,19 @@ pub async fn verify_action_token(app: &App, tn_id: TnId, token: &str) -> ClResul
 	let action_not_validated: ActionToken = decode_jwt_no_verify(token)?;
 	info!("  from: {}", action_not_validated.iss);
 
-	let key_data: crate::profile::handler::Profile = app.request.get_noauth(tn_id, &action_not_validated.iss, "/me/keys").await?;
-	let public_key: Option<Box<str>> = if let Some(key) = key_data.keys.iter().find(|k| k.key_id == action_not_validated.k) {
-		let (public_key, _expires_at) = (key.public_key.clone(), key.expires_at);
-		Some(public_key)
-	} else {
-		None
-	};
+	let key_data: crate::profile::handler::Profile =
+		app.request.get_noauth(tn_id, &action_not_validated.iss, "/me/keys").await?;
+	let public_key: Option<Box<str>> =
+		if let Some(key) = key_data.keys.iter().find(|k| k.key_id == action_not_validated.k) {
+			let (public_key, _expires_at) = (key.public_key.clone(), key.expires_at);
+			Some(public_key)
+		} else {
+			None
+		};
 
 	if let Some(public_key) = public_key {
-		let public_key_pem = format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----", public_key);
+		let public_key_pem =
+			format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----", public_key);
 
 		let mut validation = Validation::new(Algorithm::ES384);
 		validation.validate_aud = false;
@@ -40,9 +39,11 @@ pub async fn verify_action_token(app: &App, tn_id: TnId, token: &str) -> ClResul
 
 		let action: ActionToken = jwt::decode(
 			token,
-			&jwt::DecodingKey::from_ec_pem(public_key_pem.as_bytes()).inspect_err(|err| error!("from_ec_pem err: {}", err))?,
-			&validation
-		)?.claims;
+			&jwt::DecodingKey::from_ec_pem(public_key_pem.as_bytes())
+				.inspect_err(|err| error!("from_ec_pem err: {}", err))?,
+			&validation,
+		)?
+		.claims;
 		info!("  validated {:?}", action);
 		Ok(action)
 	} else {
@@ -54,14 +55,20 @@ pub trait ActionType {
 	fn allow_unknown() -> bool;
 }
 
-pub async fn process_inbound_action_token(app: &App, tn_id: TnId, _action_id: &str, token: &str) -> ClResult<()> {
+pub async fn process_inbound_action_token(
+	app: &App,
+	tn_id: TnId,
+	_action_id: &str,
+	token: &str,
+) -> ClResult<()> {
 	let action = verify_action_token(app, tn_id, token).await?;
 
-	let issuer_profile = if let Ok((_etag, profile)) = app.meta_adapter.read_profile(tn_id, &action.iss).await {
-		Some(profile)
-	} else {
-		None
-	};
+	let issuer_profile =
+		if let Ok((_etag, profile)) = app.meta_adapter.read_profile(tn_id, &action.iss).await {
+			Some(profile)
+		} else {
+			None
+		};
 	info!("  profile: {:?}", issuer_profile);
 
 	let mut allowed = false;
@@ -93,26 +100,49 @@ struct Descriptor {
 	file: Box<str>,
 }
 
-async fn process_inbound_action_attachments(app: &App, tn_id: TnId, id_tag: &str, attachments: Vec<Box<str>>) -> ClResult<()> {
+async fn process_inbound_action_attachments(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	attachments: Vec<Box<str>>,
+) -> ClResult<()> {
 	for attachment in attachments {
 		info!("  syncing attachment: {}", attachment);
-		if let Ok(descriptor) = app.request.get::<Descriptor>(tn_id, id_tag, format!("/file/{}/descriptor", attachment).as_str()).await {
+		if let Ok(descriptor) = app
+			.request
+			.get::<Descriptor>(tn_id, id_tag, format!("/file/{}/descriptor", attachment).as_str())
+			.await
+		{
 			info!("  attachment descriptor: {:?}", descriptor.file);
 			let variants = file::parse_file_descriptor(&descriptor.file)?;
 			info!("  attachment variants: {:?}", variants);
 			for variant in variants {
 				if app.blob_adapter.stat_blob(tn_id, variant.variant_id).await.is_none() {
-					if variant.variant != "hd" { // FIXME settings
+					if variant.variant != "hd" {
+						// FIXME settings
 						info!("  downloading attachment: {}", variant.variant_id);
 
-						let mut stream = app.request.get_stream(tn_id, id_tag, &format!("/file/variant/{}", variant.variant_id)).await?;
-						let _res = app.blob_adapter.create_blob_stream(tn_id, variant.variant_id, &mut stream).await;
+						let mut stream = app
+							.request
+							.get_stream(
+								tn_id,
+								id_tag,
+								&format!("/file/variant/{}", variant.variant_id),
+							)
+							.await?;
+						let _res = app
+							.blob_adapter
+							.create_blob_stream(tn_id, variant.variant_id, &mut stream)
+							.await;
 						info!("  attachment downloaded: {}", variant.variant_id);
 					} else {
 						info!("  skipping attachment: {} {}", variant.variant, variant.variant_id);
 					}
 				} else {
-					info!("  attachment already downloaded: {} {}", variant.variant, variant.variant_id);
+					info!(
+						"  attachment already downloaded: {} {}",
+						variant.variant, variant.variant_id
+					);
 				}
 			}
 		}

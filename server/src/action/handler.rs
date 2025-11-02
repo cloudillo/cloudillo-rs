@@ -1,12 +1,20 @@
-use axum::{extract::{Query, State, Path}, http::StatusCode, Json};
+use axum::{
+	extract::{Path, Query, State},
+	http::StatusCode,
+	Json,
+};
 use serde::Deserialize;
 
 use crate::{
 	action::action::{self, ActionVerifierTask},
-	core::{hasher::hash, IdTag, extract::{Auth, OptionalRequestId}},
+	core::{
+		extract::{Auth, OptionalRequestId},
+		hasher::hash,
+		IdTag,
+	},
 	meta_adapter,
+	prelude::*,
 	types::{self, ApiResponse},
-	prelude::*
 };
 
 pub async fn list_actions(
@@ -19,8 +27,8 @@ pub async fn list_actions(
 	let actions = app.meta_adapter.list_actions(tn_id, &opts).await?;
 
 	let total = actions.len(); // TODO: Add proper pagination tracking to MetaAdapter
-	let response = ApiResponse::with_pagination(actions, 0, 20, total)
-		.with_req_id(req_id.unwrap_or_default());
+	let response =
+		ApiResponse::with_pagination(actions, 0, 20, total).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -33,14 +41,16 @@ pub async fn post_action(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(action): Json<action::CreateAction>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
-
 	let action_id = action::create_action(&app, tn_id, &id_tag, action).await?;
 	info!("actionId {:?}", &action_id);
 
-	let list = app.meta_adapter.list_actions(tn_id, &meta_adapter::ListActionOptions {
-		action_id: Some(action_id),
-		..Default::default()
-	}).await?;
+	let list = app
+		.meta_adapter
+		.list_actions(
+			tn_id,
+			&meta_adapter::ListActionOptions { action_id: Some(action_id), ..Default::default() },
+		)
+		.await?;
 	if list.len() != 1 {
 		return Err(Error::NotFound);
 	}
@@ -71,8 +81,7 @@ pub async fn post_inbox(
 	let task = ActionVerifierTask::new(tn_id, action.token);
 	let _task_id = app.scheduler.task(task).now().await?;
 
-	let response = ApiResponse::new(())
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::CREATED, Json(response)))
 }
@@ -88,10 +97,9 @@ pub async fn get_action_by_id(
 
 	match action {
 		Some(a) => {
-			let response = ApiResponse::new(a)
-				.with_req_id(req_id.unwrap_or_default());
+			let response = ApiResponse::new(a).with_req_id(req_id.unwrap_or_default());
 			Ok((StatusCode::OK, Json(response)))
-		},
+		}
 		None => Err(Error::NotFound),
 	}
 }
@@ -127,8 +135,7 @@ pub async fn delete_action(
 	app.meta_adapter.delete_action(_tn_id, &action_id).await?;
 	info!("Deleted action {}", action_id);
 
-	let response = ApiResponse::new(())
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::NO_CONTENT, Json(response)))
 }
@@ -143,8 +150,7 @@ pub async fn post_action_accept(
 	// TODO: Implement action acceptance logic
 	info!("User {} accepted action {}", auth.id_tag, action_id);
 
-	let response = ApiResponse::new(())
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -159,8 +165,7 @@ pub async fn post_action_reject(
 	// TODO: Implement action rejection logic
 	info!("User {} rejected action {}", auth.id_tag, action_id);
 
-	let response = ApiResponse::new(())
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -191,8 +196,7 @@ pub async fn post_action_stat(
 
 	info!("User {} updated stats for action {}", auth.id_tag, action_id);
 
-	let response = ApiResponse::new(())
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -207,19 +211,22 @@ pub async fn post_action_reaction(
 	Json(reaction): Json<types::ReactionRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<types::ReactionResponse>>)> {
 	// Verify action exists
-	let _action = app
-		.meta_adapter
-		.get_action(tn_id, &action_id)
-		.await?
-		.ok_or(Error::NotFound)?;
+	let _action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
 	// Add reaction
 	app.meta_adapter
-		.add_reaction(tn_id, &action_id, &reactor_id_tag, &reaction.r#type, reaction.content.as_deref())
+		.add_reaction(
+			tn_id,
+			&action_id,
+			&reactor_id_tag,
+			&reaction.r#type,
+			reaction.content.as_deref(),
+		)
 		.await?;
 
 	// Generate reaction ID (simple hash)
-	let reaction_id = hash("r", format!("{}:{}:{}", action_id, reactor_id_tag, reaction.r#type).as_bytes());
+	let reaction_id =
+		hash("r", format!("{}:{}:{}", action_id, reactor_id_tag, reaction.r#type).as_bytes());
 
 	let reaction_response = types::ReactionResponse {
 		id: reaction_id.to_string(),
@@ -230,8 +237,7 @@ pub async fn post_action_reaction(
 		created_at: crate::types::Timestamp::now().0 as u64,
 	};
 
-	let response = ApiResponse::new(reaction_response)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(reaction_response).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::CREATED, Json(response)))
 }

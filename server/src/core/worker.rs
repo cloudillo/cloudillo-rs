@@ -1,8 +1,8 @@
 //! Worker pool. Handles synchronous tasks with 3 priority levels, configurable worker threads.
 
-use std::{sync::Arc, thread};
 use flume::{Receiver, Sender};
 use futures::channel::oneshot;
+use std::{sync::Arc, thread};
 
 use crate::prelude::*;
 
@@ -51,11 +51,7 @@ impl WorkerPool {
 			thread::spawn(move || worker_loop(vec![rx_high, rx_med, rx_low]));
 		}
 
-		Self {
-			tx_high,
-			tx_med,
-			tx_low,
-		}
+		Self { tx_high, tx_med, tx_low }
 	}
 
 	/// Submit a closure with arguments → returns a Future for the result
@@ -76,17 +72,17 @@ impl WorkerPool {
 				if let Err(_) = self.tx_high.send(job) {
 					error!("Failed to send job to high priority worker queue");
 				}
-			},
+			}
 			Priority::Medium => {
 				if let Err(_) = self.tx_med.send(job) {
 					error!("Failed to send job to medium priority worker queue");
 				}
-			},
+			}
 			Priority::Low => {
 				if let Err(_) = self.tx_low.send(job) {
 					error!("Failed to send job to low priority worker queue");
 				}
-			},
+			}
 		}
 
 		async move {

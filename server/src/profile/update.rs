@@ -1,15 +1,15 @@
 //! Profile update handlers
 
 use axum::{
-	extract::{State, Path},
+	extract::{Path, State},
 	http::StatusCode,
 	Json,
 };
 
 use crate::{
-	prelude::*,
 	core::extract::Auth,
-	types::{ProfilePatch, ProfileInfo},
+	prelude::*,
+	types::{ProfileInfo, ProfilePatch},
 };
 
 /// PATCH /me - Update own profile
@@ -21,15 +21,12 @@ pub async fn patch_own_profile(
 	let tn_id = auth.tn_id;
 
 	// Extract fields from patch (only include if Value is set)
-	let name = if let crate::types::Patch::Value(n) = &patch.name {
-		Some(n.as_str())
-	} else {
-		None
-	};
+	let name =
+		if let crate::types::Patch::Value(n) = &patch.name { Some(n.as_str()) } else { None };
 
 	let description = match &patch.description {
 		crate::types::Patch::Value(Some(d)) => Some(d.as_str()),
-		crate::types::Patch::Null => Some(""),  // Empty string to clear
+		crate::types::Patch::Null => Some(""), // Empty string to clear
 		_ => None,
 	};
 
@@ -46,7 +43,9 @@ pub async fn patch_own_profile(
 	};
 
 	// Apply the patch
-	app.meta_adapter.update_profile_fields(tn_id, &auth.id_tag, name, description, location, website).await?;
+	app.meta_adapter
+		.update_profile_fields(tn_id, &auth.id_tag, name, description, location, website)
+		.await?;
 
 	// Fetch updated profile
 	let profile_data = app.meta_adapter.get_profile_info(tn_id, &auth.id_tag).await?;
@@ -85,11 +84,8 @@ pub async fn patch_profile_admin(
 
 	if let Some(tn_id) = tn_id {
 		// Extract fields from patch
-		let name = if let crate::types::Patch::Value(n) = &patch.name {
-			Some(n.as_str())
-		} else {
-			None
-		};
+		let name =
+			if let crate::types::Patch::Value(n) = &patch.name { Some(n.as_str()) } else { None };
 
 		let description = match &patch.description {
 			crate::types::Patch::Value(Some(d)) => Some(d.as_str()),
@@ -109,7 +105,9 @@ pub async fn patch_profile_admin(
 			_ => None,
 		};
 
-		app.meta_adapter.update_profile_fields(tn_id, &id_tag, name, description, location, website).await?;
+		app.meta_adapter
+			.update_profile_fields(tn_id, &id_tag, name, description, location, website)
+			.await?;
 
 		// Fetch updated profile
 		let profile_data = app.meta_adapter.get_profile_info(tn_id, &id_tag).await?;

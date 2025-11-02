@@ -9,10 +9,10 @@
 
 #[cfg(test)]
 mod tests {
-	use cloudillo::prelude::*;
 	use cloudillo::auth_adapter::AuthAdapter;
-	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use cloudillo::core::worker::WorkerPool;
+	use cloudillo::prelude::*;
+	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use std::sync::Arc;
 	use tempfile::TempDir;
 
@@ -33,7 +33,8 @@ mod tests {
 		let id_tag = "test_webauthn_user";
 
 		// Create a tenant first
-		adapter.create_tenant(id_tag, None, None)
+		adapter
+			.create_tenant(id_tag, None, None)
 			.await
 			.expect("Failed to create tenant");
 
@@ -45,7 +46,8 @@ mod tests {
 		};
 
 		// Create WebAuthn credential
-		adapter.create_webauthn_credential(tn_id, &credential)
+		adapter
+			.create_webauthn_credential(tn_id, &credential)
 			.await
 			.expect("Failed to create WebAuthn credential");
 
@@ -60,7 +62,8 @@ mod tests {
 		let id_tag = "test_read_webauthn_user";
 
 		// Create a tenant
-		adapter.create_tenant(id_tag, None, None)
+		adapter
+			.create_tenant(id_tag, None, None)
 			.await
 			.expect("Failed to create tenant");
 
@@ -72,12 +75,14 @@ mod tests {
 		};
 
 		// Create credential
-		adapter.create_webauthn_credential(tn_id, &credential)
+		adapter
+			.create_webauthn_credential(tn_id, &credential)
 			.await
 			.expect("Failed to create WebAuthn credential");
 
 		// Read it back
-		let read_cred = adapter.read_webauthn_credential(tn_id, "cred_read_test")
+		let read_cred = adapter
+			.read_webauthn_credential(tn_id, "cred_read_test")
 			.await
 			.expect("Failed to read WebAuthn credential");
 
@@ -111,7 +116,8 @@ mod tests {
 		let id_tag = "test_list_webauthn_user";
 
 		// Create a tenant
-		adapter.create_tenant(id_tag, None, None)
+		adapter
+			.create_tenant(id_tag, None, None)
 			.await
 			.expect("Failed to create tenant");
 
@@ -137,12 +143,22 @@ mod tests {
 			description: None,
 		};
 
-		adapter.create_webauthn_credential(tn_id, &cred1).await.expect("Failed to create cred1");
-		adapter.create_webauthn_credential(tn_id, &cred2).await.expect("Failed to create cred2");
-		adapter.create_webauthn_credential(tn_id, &cred3).await.expect("Failed to create cred3");
+		adapter
+			.create_webauthn_credential(tn_id, &cred1)
+			.await
+			.expect("Failed to create cred1");
+		adapter
+			.create_webauthn_credential(tn_id, &cred2)
+			.await
+			.expect("Failed to create cred2");
+		adapter
+			.create_webauthn_credential(tn_id, &cred3)
+			.await
+			.expect("Failed to create cred3");
 
 		// List all credentials
-		let credentials = adapter.list_webauthn_credentials(tn_id)
+		let credentials = adapter
+			.list_webauthn_credentials(tn_id)
 			.await
 			.expect("Failed to list WebAuthn credentials");
 
@@ -165,12 +181,14 @@ mod tests {
 		let id_tag = "test_empty_webauthn_user";
 
 		// Create a tenant with no credentials
-		adapter.create_tenant(id_tag, None, None)
+		adapter
+			.create_tenant(id_tag, None, None)
 			.await
 			.expect("Failed to create tenant");
 
 		// List credentials (should be empty)
-		let credentials = adapter.list_webauthn_credentials(tn_id)
+		let credentials = adapter
+			.list_webauthn_credentials(tn_id)
 			.await
 			.expect("Failed to list WebAuthn credentials");
 
@@ -187,7 +205,8 @@ mod tests {
 		let id_tag = "test_counter_webauthn_user";
 
 		// Create a tenant
-		adapter.create_tenant(id_tag, None, None)
+		adapter
+			.create_tenant(id_tag, None, None)
 			.await
 			.expect("Failed to create tenant");
 
@@ -199,17 +218,20 @@ mod tests {
 		};
 
 		// Create credential
-		adapter.create_webauthn_credential(tn_id, &credential)
+		adapter
+			.create_webauthn_credential(tn_id, &credential)
 			.await
 			.expect("Failed to create WebAuthn credential");
 
 		// Update counter (simulating a use)
-		adapter.update_webauthn_credential_counter(tn_id, "cred_counter_test", 11)
+		adapter
+			.update_webauthn_credential_counter(tn_id, "cred_counter_test", 11)
 			.await
 			.expect("Failed to update credential counter");
 
 		// Verify counter was updated
-		let updated_cred = adapter.read_webauthn_credential(tn_id, "cred_counter_test")
+		let updated_cred = adapter
+			.read_webauthn_credential(tn_id, "cred_counter_test")
 			.await
 			.expect("Failed to read updated credential");
 
@@ -226,7 +248,8 @@ mod tests {
 		let id_tag = "test_delete_webauthn_user";
 
 		// Create a tenant
-		adapter.create_tenant(id_tag, None, None)
+		adapter
+			.create_tenant(id_tag, None, None)
 			.await
 			.expect("Failed to create tenant");
 
@@ -238,17 +261,20 @@ mod tests {
 		};
 
 		// Create credential
-		adapter.create_webauthn_credential(tn_id, &credential)
+		adapter
+			.create_webauthn_credential(tn_id, &credential)
 			.await
 			.expect("Failed to create WebAuthn credential");
 
 		// Verify it exists
-		let _ = adapter.read_webauthn_credential(tn_id, "cred_to_delete")
+		let _ = adapter
+			.read_webauthn_credential(tn_id, "cred_to_delete")
 			.await
 			.expect("Credential should exist before deletion");
 
 		// Delete the credential
-		adapter.delete_webauthn_credential(tn_id, "cred_to_delete")
+		adapter
+			.delete_webauthn_credential(tn_id, "cred_to_delete")
 			.await
 			.expect("Failed to delete WebAuthn credential");
 
@@ -267,11 +293,13 @@ mod tests {
 		let tn_id_2 = TnId(2);
 
 		// Create two tenants
-		adapter.create_tenant("tenant1_webauthn", None, None)
+		adapter
+			.create_tenant("tenant1_webauthn", None, None)
 			.await
 			.expect("Failed to create tenant 1");
 
-		adapter.create_tenant("tenant2_webauthn", None, None)
+		adapter
+			.create_tenant("tenant2_webauthn", None, None)
 			.await
 			.expect("Failed to create tenant 2");
 
@@ -290,20 +318,24 @@ mod tests {
 			description: Some("Tenant 2 credential"),
 		};
 
-		adapter.create_webauthn_credential(tn_id_1, &cred1)
+		adapter
+			.create_webauthn_credential(tn_id_1, &cred1)
 			.await
 			.expect("Failed to create tenant 1 credential");
 
-		adapter.create_webauthn_credential(tn_id_2, &cred2)
+		adapter
+			.create_webauthn_credential(tn_id_2, &cred2)
 			.await
 			.expect("Failed to create tenant 2 credential");
 
 		// Verify each tenant sees only their credential
-		let tn1_cred = adapter.read_webauthn_credential(tn_id_1, "shared_id")
+		let tn1_cred = adapter
+			.read_webauthn_credential(tn_id_1, "shared_id")
 			.await
 			.expect("Failed to read tenant 1 credential");
 
-		let tn2_cred = adapter.read_webauthn_credential(tn_id_2, "shared_id")
+		let tn2_cred = adapter
+			.read_webauthn_credential(tn_id_2, "shared_id")
 			.await
 			.expect("Failed to read tenant 2 credential");
 
@@ -321,7 +353,8 @@ mod tests {
 		let id_tag = "test_no_desc_webauthn_user";
 
 		// Create a tenant
-		adapter.create_tenant(id_tag, None, None)
+		adapter
+			.create_tenant(id_tag, None, None)
 			.await
 			.expect("Failed to create tenant");
 
@@ -333,12 +366,14 @@ mod tests {
 			description: None,
 		};
 
-		adapter.create_webauthn_credential(tn_id, &credential)
+		adapter
+			.create_webauthn_credential(tn_id, &credential)
 			.await
 			.expect("Failed to create WebAuthn credential");
 
 		// Read it back
-		let read_cred = adapter.read_webauthn_credential(tn_id, "cred_no_desc")
+		let read_cred = adapter
+			.read_webauthn_credential(tn_id, "cred_no_desc")
 			.await
 			.expect("Failed to read WebAuthn credential");
 
@@ -356,7 +391,8 @@ mod tests {
 		let id_tag = "test_multi_cred_user";
 
 		// Create a tenant
-		adapter.create_tenant(id_tag, None, None)
+		adapter
+			.create_tenant(id_tag, None, None)
 			.await
 			.expect("Failed to create tenant");
 
@@ -369,13 +405,15 @@ mod tests {
 				description: Some(&format!("Credential {}", i)),
 			};
 
-			adapter.create_webauthn_credential(tn_id, &credential)
+			adapter
+				.create_webauthn_credential(tn_id, &credential)
 				.await
 				.expect(&format!("Failed to create credential {}", i));
 		}
 
 		// List all credentials
-		let credentials = adapter.list_webauthn_credentials(tn_id)
+		let credentials = adapter
+			.list_webauthn_credentials(tn_id)
 			.await
 			.expect("Failed to list credentials");
 
@@ -383,7 +421,8 @@ mod tests {
 
 		// Verify counters
 		for i in 0..5 {
-			let cred = credentials.iter()
+			let cred = credentials
+				.iter()
 				.find(|c| c.credential_id == format!("cred_{}", i))
 				.expect(&format!("Credential {} not found", i));
 			assert_eq!(cred.counter, i as u32);

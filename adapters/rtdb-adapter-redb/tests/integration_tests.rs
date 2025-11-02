@@ -1,6 +1,6 @@
 use cloudillo::rtdb_adapter::{QueryFilter, QueryOptions, RtdbAdapter};
 use cloudillo::types::TnId;
-use rtdb_adapter_redb::{RtdbAdapterRedb, AdapterConfig};
+use rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -33,16 +33,10 @@ async fn test_query_all_documents() {
 
 	// Create multiple documents directly in transactions that will auto-commit on drop
 	for i in 0..5 {
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		let data = json!({"name": format!("User{}", i), "age": 20 + i});
-		let _doc_id = tx
-			.create(path, data)
-			.await
-			.expect("Failed to create document");
+		let _doc_id = tx.create(path, data).await.expect("Failed to create document");
 		// Transaction auto-commits/rolls back on drop
 	}
 
@@ -64,16 +58,10 @@ async fn test_query_with_filter() {
 
 	// Create documents with different statuses
 	for (name, status) in &[("Alice", "active"), ("Bob", "inactive"), ("Charlie", "active")] {
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		let data = json!({"name": name, "status": status});
-		let _doc_id = tx
-			.create(path, data)
-			.await
-			.expect("Failed to create document");
+		let _doc_id = tx.create(path, data).await.expect("Failed to create document");
 	}
 
 	// Query with filter
@@ -81,15 +69,7 @@ async fn test_query_with_filter() {
 	filter.equals.insert("status".to_string(), Value::String("active".to_string()));
 
 	let results = adapter
-		.query(
-			tn_id,
-			db_id,
-			path,
-			QueryOptions {
-				filter: Some(filter),
-				..Default::default()
-			},
-		)
+		.query(tn_id, db_id, path, QueryOptions { filter: Some(filter), ..Default::default() })
 		.await
 		.expect("Failed to query");
 
@@ -110,29 +90,15 @@ async fn test_query_with_limit() {
 
 	// Create 10 documents
 	for i in 0..10 {
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		let data = json!({"index": i, "value": format!("item{}", i)});
-		let _doc_id = tx
-			.create(path, data)
-			.await
-			.expect("Failed to create document");
+		let _doc_id = tx.create(path, data).await.expect("Failed to create document");
 	}
 
 	// Query with limit
 	let results = adapter
-		.query(
-			tn_id,
-			db_id,
-			path,
-			QueryOptions {
-				limit: Some(5),
-				..Default::default()
-			},
-		)
+		.query(tn_id, db_id, path, QueryOptions { limit: Some(5), ..Default::default() })
 		.await
 		.expect("Failed to query");
 
@@ -154,16 +120,10 @@ async fn test_create_index() {
 
 	// Create documents with the indexed field
 	for (name, status) in &[("Alice", "active"), ("Bob", "inactive")] {
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		let data = json!({"name": name, "status": status});
-		let _doc_id = tx
-			.create(path, data)
-			.await
-			.expect("Failed to create document");
+		let _doc_id = tx.create(path, data).await.expect("Failed to create document");
 	}
 
 	// Query using the indexed field should work
@@ -171,15 +131,7 @@ async fn test_create_index() {
 	filter.equals.insert("status".to_string(), Value::String("active".to_string()));
 
 	let results = adapter
-		.query(
-			tn_id,
-			db_id,
-			path,
-			QueryOptions {
-				filter: Some(filter),
-				..Default::default()
-			},
-		)
+		.query(tn_id, db_id, path, QueryOptions { filter: Some(filter), ..Default::default() })
 		.await
 		.expect("Failed to query");
 
@@ -193,10 +145,7 @@ async fn test_multiple_databases() {
 
 	// Create document in db1
 	{
-		let mut tx = adapter
-			.transaction(tn_id, "db1")
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, "db1").await.expect("Failed to create transaction");
 
 		let _doc_id = tx
 			.create("users", json!({"name": "Alice"}))
@@ -206,10 +155,7 @@ async fn test_multiple_databases() {
 
 	// Create document in db2
 	{
-		let mut tx = adapter
-			.transaction(tn_id, "db2")
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, "db2").await.expect("Failed to create transaction");
 
 		let _doc_id = tx
 			.create("users", json!({"name": "Bob"}))
@@ -238,10 +184,8 @@ async fn test_multiple_tenants() {
 
 	// Create document in tenant 1
 	{
-		let mut tx = adapter
-			.transaction(TnId(1), "db1")
-			.await
-			.expect("Failed to create transaction");
+		let mut tx =
+			adapter.transaction(TnId(1), "db1").await.expect("Failed to create transaction");
 
 		let _doc_id = tx
 			.create("users", json!({"name": "Alice"}))
@@ -251,10 +195,8 @@ async fn test_multiple_tenants() {
 
 	// Create document in tenant 2
 	{
-		let mut tx = adapter
-			.transaction(TnId(2), "db2")
-			.await
-			.expect("Failed to create transaction");
+		let mut tx =
+			adapter.transaction(TnId(2), "db2").await.expect("Failed to create transaction");
 
 		let _doc_id = tx
 			.create("users", json!({"name": "Bob"}))
@@ -285,10 +227,7 @@ async fn test_close_db() {
 
 	// Create a document
 	{
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		let _doc_id = tx
 			.create("users", json!({"name": "Alice"}))
@@ -297,10 +236,7 @@ async fn test_close_db() {
 	}
 
 	// Close the database
-	adapter
-		.close_db(tn_id, db_id)
-		.await
-		.expect("Failed to close db");
+	adapter.close_db(tn_id, db_id).await.expect("Failed to close db");
 
 	// We can still query it after closing (it will be reopened)
 	let results = adapter
@@ -319,23 +255,14 @@ async fn test_stats() {
 
 	// Create some documents
 	for i in 0..3 {
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		let data = json!({"index": i});
-		let _doc_id = tx
-			.create("items", data)
-			.await
-			.expect("Failed to create document");
+		let _doc_id = tx.create("items", data).await.expect("Failed to create document");
 	}
 
 	// Get stats
-	let stats = adapter
-		.stats(tn_id, db_id)
-		.await
-		.expect("Failed to get stats");
+	let stats = adapter.stats(tn_id, db_id).await.expect("Failed to get stats");
 
 	assert!(stats.record_count > 0, "Should have records");
 	assert!(stats.size_bytes > 0, "Size should be greater than 0");
@@ -349,10 +276,7 @@ async fn test_per_tenant_files_mode() {
 
 	// Create a document
 	{
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		let _doc_id = tx
 			.create("data", json!({"key": "value"}))
@@ -378,10 +302,7 @@ async fn test_single_file_mode() {
 
 	// Create a document
 	{
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		let _doc_id = tx
 			.create("data", json!({"key": "value"}))
@@ -408,10 +329,7 @@ async fn test_update_document() {
 
 	// Create a document
 	let doc_id = {
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		tx.create(path, json!({"name": "Alice", "age": 30}))
 			.await
@@ -420,10 +338,7 @@ async fn test_update_document() {
 
 	// Update the document
 	{
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		let update_path = format!("{}/{}", path, doc_id);
 		tx.update(&update_path, json!({"name": "Alice", "age": 31}))
@@ -451,10 +366,7 @@ async fn test_delete_document() {
 
 	// Create a document
 	let doc_id = {
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		tx.create(path, json!({"name": "Bob"}))
 			.await
@@ -470,15 +382,10 @@ async fn test_delete_document() {
 
 	// Delete the document
 	{
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		let delete_path = format!("{}/{}", path, doc_id);
-		tx.delete(&delete_path)
-			.await
-			.expect("Failed to delete document");
+		tx.delete(&delete_path).await.expect("Failed to delete document");
 	}
 
 	// Query to verify deletion
@@ -499,10 +406,7 @@ async fn test_get_document() {
 
 	// Create a document
 	let doc_id = {
-		let mut tx = adapter
-			.transaction(tn_id, db_id)
-			.await
-			.expect("Failed to create transaction");
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		tx.create(path, json!({"name": "Charlie", "age": 25}))
 			.await
@@ -536,18 +440,30 @@ async fn test_advanced_filter_operators() {
 	}
 	{
 		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
-		tx.create(path, json!({"name": "Bob", "age": 30, "score": 92, "role": "user", "tags": ["verified"]}))
-			.await.expect("Failed to create document");
+		tx.create(
+			path,
+			json!({"name": "Bob", "age": 30, "score": 92, "role": "user", "tags": ["verified"]}),
+		)
+		.await
+		.expect("Failed to create document");
 	}
 	{
 		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
-		tx.create(path, json!({"name": "Charlie", "age": 35, "score": 78, "role": "moderator", "tags": ["premium"]}))
-			.await.expect("Failed to create document");
+		tx.create(
+			path,
+			json!({"name": "Charlie", "age": 35, "score": 78, "role": "moderator", "tags": ["premium"]}),
+		)
+		.await
+		.expect("Failed to create document");
 	}
 	{
 		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
-		tx.create(path, json!({"name": "Diana", "age": 28, "score": 88, "role": "user", "tags": []}))
-			.await.expect("Failed to create document");
+		tx.create(
+			path,
+			json!({"name": "Diana", "age": 28, "score": 88, "role": "user", "tags": []}),
+		)
+		.await
+		.expect("Failed to create document");
 	}
 
 	// Test 1: Greater-than operator
@@ -578,19 +494,24 @@ async fn test_advanced_filter_operators() {
 	let filter = QueryFilter::new().with_not_equals("role", Value::String("user".to_string()));
 	let opts = QueryOptions::new().with_filter(filter);
 	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
-	assert_eq!(results.len(), 2, "Should find 2 users with role != 'user' (Alice=admin, Charlie=moderator)");
+	assert_eq!(
+		results.len(),
+		2,
+		"Should find 2 users with role != 'user' (Alice=admin, Charlie=moderator)"
+	);
 
 	// Test 6: In-array operator
 	let filter = QueryFilter::new().with_in_array(
 		"role",
-		vec![Value::String("admin".to_string()), Value::String("moderator".to_string())]
+		vec![Value::String("admin".to_string()), Value::String("moderator".to_string())],
 	);
 	let opts = QueryOptions::new().with_filter(filter);
 	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
 	assert_eq!(results.len(), 2, "Should find 2 users with role in ['admin', 'moderator']");
 
 	// Test 7: Array-contains operator
-	let filter = QueryFilter::new().with_array_contains("tags", Value::String("premium".to_string()));
+	let filter =
+		QueryFilter::new().with_array_contains("tags", Value::String("premium".to_string()));
 	let opts = QueryOptions::new().with_filter(filter);
 	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
 	assert_eq!(results.len(), 2, "Should find 2 users with 'premium' tag (Alice, Charlie)");
@@ -610,12 +531,21 @@ async fn test_advanced_filter_operators() {
 		.with_array_contains("tags", Value::String("verified".to_string()));
 	let opts = QueryOptions::new().with_filter(filter);
 	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
-	assert_eq!(results.len(), 2, "Should find 2 users: 25 <= age < 35 AND has 'verified' tag (Alice=25, Bob=30)");
+	assert_eq!(
+		results.len(),
+		2,
+		"Should find 2 users: 25 <= age < 35 AND has 'verified' tag (Alice=25, Bob=30)"
+	);
 
 	// Test 10: Array-contains with empty array should not match
-	let filter = QueryFilter::new().with_array_contains("tags", Value::String("verified".to_string()));
+	let filter =
+		QueryFilter::new().with_array_contains("tags", Value::String("verified".to_string()));
 	let opts = QueryOptions::new().with_filter(filter);
 	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
 	// Diana has empty tags array, should not match
-	assert_eq!(results.len(), 2, "Should only find users with non-empty tags containing 'verified' (Alice, Bob)");
+	assert_eq!(
+		results.len(),
+		2,
+		"Should only find users with non-empty tags containing 'verified' (Alice, Bob)"
+	);
 }

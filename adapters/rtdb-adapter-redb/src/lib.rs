@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
 mod error;
-mod instance;
-mod transaction;
-mod query;
 mod index;
+mod instance;
+mod query;
 pub mod storage;
+mod transaction;
 
 use async_trait::async_trait;
 use futures_core::Stream;
@@ -226,11 +226,12 @@ impl RtdbAdapterRedb {
 	}
 
 	/// Get or open a database instance
-	async fn get_or_open_instance(&self, tn_id: TnId, db_id: &str) -> ClResult<Arc<DatabaseInstance>> {
-		let key = InstanceKey {
-			tn_id: tn_id.0,
-			db_id: db_id.into(),
-		};
+	async fn get_or_open_instance(
+		&self,
+		tn_id: TnId,
+		db_id: &str,
+	) -> ClResult<Arc<DatabaseInstance>> {
+		let key = InstanceKey { tn_id: tn_id.0, db_id: db_id.into() };
 
 		// Fast path: already open
 		{
@@ -263,10 +264,7 @@ impl RtdbAdapterRedb {
 		let (change_tx, _) = tokio::sync::broadcast::channel(self.config.broadcast_capacity);
 
 		let instance = Arc::new(DatabaseInstance::new(
-			InstanceKey {
-				tn_id: tn_id.0,
-				db_id: db_id.into(),
-			},
+			InstanceKey { tn_id: tn_id.0, db_id: db_id.into() },
 			db,
 			change_tx,
 		));
@@ -281,7 +279,10 @@ impl RtdbAdapterRedb {
 	}
 
 	/// Evict least recently used instance
-	fn evict_lru(&self, instances: &mut HashMap<InstanceKey, Arc<DatabaseInstance>>) -> ClResult<()> {
+	fn evict_lru(
+		&self,
+		instances: &mut HashMap<InstanceKey, Arc<DatabaseInstance>>,
+	) -> ClResult<()> {
 		if let Some(key) = instances
 			.iter()
 			.min_by_key(|(_, inst)| inst.last_accessed())
@@ -331,20 +332,11 @@ impl RtdbAdapter for RtdbAdapterRedb {
 
 		let tx = instance.db.begin_write().map_err(error::from_redb_error)?;
 
-		Ok(Box::new(RedbTransaction::new(
-			self.per_tenant_files,
-			tn_id,
-			db_id.into(),
-			instance,
-			tx,
-		)))
+		Ok(Box::new(RedbTransaction::new(self.per_tenant_files, tn_id, db_id.into(), instance, tx)))
 	}
 
 	async fn close_db(&self, tn_id: TnId, db_id: &str) -> ClResult<()> {
-		let key = InstanceKey {
-			tn_id: tn_id.0,
-			db_id: db_id.into(),
-		};
+		let key = InstanceKey { tn_id: tn_id.0, db_id: db_id.into() };
 
 		let mut instances = self.instances.write().await;
 		if instances.remove(&key).is_some() {
@@ -367,7 +359,14 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		let path_owned = path.to_string();
 
 		tokio::task::spawn_blocking(move || {
-			query::execute_query(&instance, tn_id, &db_id_owned, &path_owned, opts, per_tenant_files)
+			query::execute_query(
+				&instance,
+				tn_id,
+				&db_id_owned,
+				&path_owned,
+				opts,
+				per_tenant_files,
+			)
 		})
 		.await?
 	}
@@ -471,15 +470,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 	) -> ClResult<()> {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 
-		index::create_index_impl(
-			&instance,
-			tn_id,
-			db_id,
-			path,
-			field,
-			self.per_tenant_files,
-		)
-		.await
+		index::create_index_impl(&instance, tn_id, db_id, path, field, self.per_tenant_files).await
 	}
 
 	async fn stats(&self, tn_id: TnId, db_id: &str) -> ClResult<DbStats> {

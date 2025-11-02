@@ -106,10 +106,7 @@ pub async fn create_index_impl(
 	// Update in-memory cache
 	{
 		let mut indexed_fields = instance.indexed_fields.write().await;
-		indexed_fields
-			.entry(path.into())
-			.or_insert_with(Vec::new)
-			.push(field.into());
+		indexed_fields.entry(path.into()).or_insert_with(Vec::new).push(field.into());
 	}
 
 	Ok(())

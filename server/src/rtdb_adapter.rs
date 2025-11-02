@@ -39,11 +39,7 @@ pub struct QueryFilter {
 	pub greater_than: HashMap<String, Value>,
 
 	/// Field greater-than-or-equal constraints: field_name -> threshold_value
-	#[serde(
-		default,
-		skip_serializing_if = "HashMap::is_empty",
-		rename = "greaterThanOrEqual"
-	)]
+	#[serde(default, skip_serializing_if = "HashMap::is_empty", rename = "greaterThanOrEqual")]
 	pub greater_than_or_equal: HashMap<String, Value>,
 
 	/// Field less-than constraints: field_name -> threshold_value
@@ -51,11 +47,7 @@ pub struct QueryFilter {
 	pub less_than: HashMap<String, Value>,
 
 	/// Field less-than-or-equal constraints: field_name -> threshold_value
-	#[serde(
-		default,
-		skip_serializing_if = "HashMap::is_empty",
-		rename = "lessThanOrEqual"
-	)]
+	#[serde(default, skip_serializing_if = "HashMap::is_empty", rename = "lessThanOrEqual")]
 	pub less_than_or_equal: HashMap<String, Value>,
 
 	/// Field in-array constraints: field_name -> array of allowed values
@@ -77,10 +69,7 @@ impl QueryFilter {
 	pub fn equals_one(field: impl Into<String>, value: Value) -> Self {
 		let mut equals = HashMap::new();
 		equals.insert(field.into(), value);
-		Self {
-			equals,
-			..Default::default()
-		}
+		Self { equals, ..Default::default() }
 	}
 
 	/// Add an equality constraint to this filter (builder pattern).
@@ -157,18 +146,12 @@ pub struct SortField {
 impl SortField {
 	/// Create ascending sort order.
 	pub fn asc(field: impl Into<String>) -> Self {
-		Self {
-			field: field.into(),
-			ascending: true,
-		}
+		Self { field: field.into(), ascending: true }
 	}
 
 	/// Create descending sort order.
 	pub fn desc(field: impl Into<String>) -> Self {
-		Self {
-			field: field.into(),
-			ascending: false,
-		}
+		Self { field: field.into(), ascending: false }
 	}
 }
 
@@ -232,18 +215,12 @@ pub struct SubscriptionOptions {
 impl SubscriptionOptions {
 	/// Create a subscription to all changes at a path.
 	pub fn all(path: impl Into<Box<str>>) -> Self {
-		Self {
-			path: path.into(),
-			filter: None,
-		}
+		Self { path: path.into(), filter: None }
 	}
 
 	/// Create a subscription with a filter.
 	pub fn filtered(path: impl Into<Box<str>>, filter: QueryFilter) -> Self {
-		Self {
-			path: path.into(),
-			filter: Some(filter),
-		}
+		Self { path: path.into(), filter: Some(filter) }
 	}
 }
 
@@ -379,15 +356,24 @@ pub trait RtdbAdapter: Debug + Send + Sync {
 	async fn close_db(&self, tn_id: TnId, db_id: &str) -> ClResult<()>;
 
 	/// Query documents at a path with optional filtering, sorting, and pagination.
-	async fn query(&self, tn_id: TnId, db_id: &str, path: &str, opts: QueryOptions)
-		-> ClResult<Vec<Value>>;
+	async fn query(
+		&self,
+		tn_id: TnId,
+		db_id: &str,
+		path: &str,
+		opts: QueryOptions,
+	) -> ClResult<Vec<Value>>;
 
 	/// Get a document at a specific path. Returns None if not found.
 	async fn get(&self, tn_id: TnId, db_id: &str, path: &str) -> ClResult<Option<Value>>;
 
 	/// Subscribe to real-time changes at a path. Returns a stream of ChangeEvents.
-	async fn subscribe(&self, tn_id: TnId, db_id: &str, opts: SubscriptionOptions)
-		-> ClResult<Pin<Box<dyn Stream<Item = ChangeEvent> + Send>>>;
+	async fn subscribe(
+		&self,
+		tn_id: TnId,
+		db_id: &str,
+		opts: SubscriptionOptions,
+	) -> ClResult<Pin<Box<dyn Stream<Item = ChangeEvent> + Send>>>;
 
 	/// Create an index on a field to improve query performance.
 	async fn create_index(&self, tn_id: TnId, db_id: &str, path: &str, field: &str)

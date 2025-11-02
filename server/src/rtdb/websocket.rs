@@ -13,16 +13,16 @@
 //! ```
 
 use crate::prelude::*;
+use crate::rtdb_adapter::ChangeEvent;
 use axum::extract::ws::{Message, WebSocket};
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
-use crate::rtdb_adapter::ChangeEvent;
-use futures::stream::StreamExt;
-use futures::sink::SinkExt;
 
 /// A message in the RTDB protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,11 +58,7 @@ impl RtdbMessage {
 		let mut map = serde_json::Map::new();
 		map.insert("status".to_string(), Value::String(status.to_string()));
 		map.insert("timestamp".to_string(), Value::Number(now_timestamp().into()));
-		Self {
-			id,
-			msg_type: "ack".to_string(),
-			payload: map,
-		}
+		Self { id, msg_type: "ack".to_string(), payload: map }
 	}
 
 	/// Create a database change message
@@ -81,12 +77,12 @@ impl RtdbMessage {
 	}
 
 	/// Create a response message with explicit fields
-	pub fn response(id: Value, msg_type: impl Into<String>, fields: serde_json::Map<String, Value>) -> Self {
-		Self {
-			id,
-			msg_type: msg_type.into(),
-			payload: fields,
-		}
+	pub fn response(
+		id: Value,
+		msg_type: impl Into<String>,
+		fields: serde_json::Map<String, Value>,
+	) -> Self {
+		Self { id, msg_type: msg_type.into(), payload: fields }
 	}
 
 	/// Serialize to JSON and wrap in WebSocket message
@@ -116,7 +112,8 @@ struct RtdbConnection {
 	file_id: String,
 	subscriptions: Arc<RwLock<HashSet<String>>>, // Subscribed collection patterns
 	// Active subscription streams (path -> ChangeEvent stream)
-	subscription_streams: Arc<RwLock<Vec<(String, tokio::sync::mpsc::UnboundedReceiver<ChangeEvent>)>>>,
+	subscription_streams:
+		Arc<RwLock<Vec<(String, tokio::sync::mpsc::UnboundedReceiver<ChangeEvent>)>>>,
 	tn_id: crate::types::TnId,
 	connected_at: u64,
 }
@@ -232,7 +229,12 @@ pub async fn handle_rtdb_connection(
 					ChangeEvent::Delete { path: _ } => ("delete", None),
 				};
 
-				debug!("RTDB change event: action={}, path={}, subscription_id={}", action, event.path(), subscription_id);
+				debug!(
+					"RTDB change event: action={}, path={}, subscription_id={}",
+					action,
+					event.path(),
+					subscription_id
+				);
 
 				let msg = RtdbMessage::new(
 					"change",
@@ -275,7 +277,11 @@ pub async fn handle_rtdb_connection(
 }
 
 /// Handle an RTDB command
-async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app: &crate::core::app::App) -> RtdbMessage {
+async fn handle_rtdb_command(
+	conn: &Arc<RtdbConnection>,
+	msg: &RtdbMessage,
+	app: &crate::core::app::App,
+) -> RtdbMessage {
 	match msg.msg_type.as_str() {
 		"transaction" => {
 			// Handle atomic batch operations (create/update/delete)
@@ -287,19 +293,24 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 					Ok(t) => t,
 					Err(e) => {
 						warn!("Failed to start transaction: {}", e);
-						return RtdbMessage::new("error", json!({
-							"code": 500,
-							"message": format!("Failed to start transaction: {}", e)
-						}));
+						return RtdbMessage::new(
+							"error",
+							json!({
+								"code": 500,
+								"message": format!("Failed to start transaction: {}", e)
+							}),
+						);
 					}
 				};
 				let mut results = Vec::new();
-				let mut references: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+				let mut references: std::collections::HashMap<String, String> =
+					std::collections::HashMap::new();
 
 				// Process all operations in the same transaction
 				for op in operations.iter() {
 					let op_type = op.get("type").and_then(|v| v.as_str()).unwrap_or("");
-					let mut path = op.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+					let mut path =
+						op.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
 					// Substitute references in path (e.g., "posts/${$post}/comments")
 					for (ref_name, ref_value) in &references {
@@ -319,8 +330,10 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 								conn.tn_id,
 								&conn.file_id,
 								&path,
-								&mut data
-							).await {
+								&mut data,
+							)
+							.await
+							{
 								warn!("Failed to process computed values: {}", e);
 								Err(e)
 							} else {
@@ -330,14 +343,20 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 										if let Some(ref_value) = op.get("ref") {
 											if let Some(ref_name) = ref_value.as_str() {
 												if ref_name.starts_with('$') {
-													references.insert(ref_name[1..].to_string(), doc_id.to_string());
-													debug!("Stored reference: {} = {}", ref_name, doc_id);
+													references.insert(
+														ref_name[1..].to_string(),
+														doc_id.to_string(),
+													);
+													debug!(
+														"Stored reference: {} = {}",
+														ref_name, doc_id
+													);
 												}
 											}
 										}
 										Ok(json!({ "ref": op.get("ref").cloned(), "id": doc_id }))
 									}
-									Err(e) => Err(e)
+									Err(e) => Err(e),
 								}
 							}
 						}
@@ -352,36 +371,35 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 								conn.tn_id,
 								&conn.file_id,
 								&path,
-								&mut data
-							).await {
+								&mut data,
+							)
+							.await
+							{
 								warn!("Failed to process computed values: {}", e);
 								Err(e)
 							} else {
 								match txn.update(&path, data).await {
-									Ok(_) => {
-										Ok(json!({ "ref": Value::Null, "id": Value::Null }))
-									}
-									Err(e) => Err(e)
+									Ok(_) => Ok(json!({ "ref": Value::Null, "id": Value::Null })),
+									Err(e) => Err(e),
 								}
 							}
 						}
-						"delete" => {
-							match txn.delete(&path).await {
-								Ok(_) => {
-									Ok(json!({ "ref": Value::Null, "id": Value::Null }))
-								}
-								Err(e) => Err(e)
-							}
-						}
+						"delete" => match txn.delete(&path).await {
+							Ok(_) => Ok(json!({ "ref": Value::Null, "id": Value::Null })),
+							Err(e) => Err(e),
+						},
 						_ => {
 							// Invalid operation type - abort transaction (will rollback on drop)
 							warn!("Unknown transaction operation type: {}", op_type);
 							// Explicitly drop transaction to trigger rollback
 							drop(txn);
-							return RtdbMessage::new("error", json!({
-								"code": 400,
-								"message": "Invalid operation type"
-							}));
+							return RtdbMessage::new(
+								"error",
+								json!({
+									"code": 400,
+									"message": "Invalid operation type"
+								}),
+							);
 						}
 					};
 
@@ -392,16 +410,22 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 							warn!("Transaction operation failed: {}", e);
 							// Explicitly drop transaction to trigger rollback
 							drop(txn);
-							return RtdbMessage::new("error", json!({
-								"code": 500,
-								"message": format!("Transaction failed: {}", e)
-							}));
+							return RtdbMessage::new(
+								"error",
+								json!({
+									"code": 500,
+									"message": format!("Transaction failed: {}", e)
+								}),
+							);
 						}
 					}
 				}
 
 				// All operations succeeded - transaction will auto-commit on drop
-				debug!("Transaction completed successfully with {} operations, auto-committing", results.len());
+				debug!(
+					"Transaction completed successfully with {} operations, auto-committing",
+					results.len()
+				);
 				drop(txn); // Explicitly drop to trigger commit via Drop implementation
 
 				let mut result_map = serde_json::Map::new();
@@ -415,7 +439,7 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 
 		"query" => {
 			// Fetch documents with optional filtering/sorting
-			use crate::rtdb_adapter::{QueryOptions, QueryFilter, SortField};
+			use crate::rtdb_adapter::{QueryFilter, QueryOptions, SortField};
 			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			debug!("RTDB query: path={}", path);
 
@@ -436,15 +460,12 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 				for item in sort_arr {
 					if let (Some(field), Some(asc)) = (
 						item.get("field").and_then(|v| v.as_str()),
-						item.get("ascending").and_then(|v| v.as_bool())
+						item.get("ascending").and_then(|v| v.as_bool()),
 					) {
-						sort_fields.push(SortField {
-							field: field.to_string(),
-							ascending: asc
-						});
+						sort_fields.push(SortField { field: field.to_string(), ascending: asc });
 					}
 				}
-					if !sort_fields.is_empty() {
+				if !sort_fields.is_empty() {
 					let sort_count = sort_fields.len();
 					opts = opts.with_sort(sort_fields);
 					debug!("RTDB query sort: {} fields", sort_count);
@@ -489,14 +510,17 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 				}
 				Err(e) => {
 					warn!("Get failed: {}", e);
-					RtdbMessage::new("error", json!({ "code": 404, "message": "Document not found" }))
+					RtdbMessage::new(
+						"error",
+						json!({ "code": 404, "message": "Document not found" }),
+					)
 				}
 			}
 		}
 
 		"subscribe" => {
 			// Start real-time updates for a path
-			use crate::rtdb_adapter::{SubscriptionOptions, QueryFilter};
+			use crate::rtdb_adapter::{QueryFilter, SubscriptionOptions};
 			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			debug!("RTDB subscribe: path={}", path);
 			let subscription_id = format!("sub-{}", Uuid::new_v4());
@@ -530,15 +554,22 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 
 						subs.insert(path.to_string());
 						streams.push((subscription_id.clone(), rx));
-						debug!("User {} subscribed to path: {} (id: {})", conn.user_id, path, subscription_id);
+						debug!(
+							"User {} subscribed to path: {} (id: {})",
+							conn.user_id, path, subscription_id
+						);
 
 						let mut result_map = serde_json::Map::new();
-						result_map.insert("subscriptionId".to_string(), Value::String(subscription_id));
+						result_map
+							.insert("subscriptionId".to_string(), Value::String(subscription_id));
 						RtdbMessage::response(msg.id.clone(), "subscribeResult", result_map)
 					}
 					Err(e) => {
 						warn!("Subscribe failed: {}", e);
-						RtdbMessage::new("error", json!({ "code": 500, "message": format!("Subscribe failed: {}", e) }))
+						RtdbMessage::new(
+							"error",
+							json!({ "code": 500, "message": format!("Subscribe failed: {}", e) }),
+						)
 					}
 				}
 			} else {
@@ -551,7 +582,8 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 
 		"unsubscribe" => {
 			// Stop real-time updates
-			let subscription_id = msg.payload.get("subscriptionId").and_then(|v| v.as_str()).unwrap_or("");
+			let subscription_id =
+				msg.payload.get("subscriptionId").and_then(|v| v.as_str()).unwrap_or("");
 
 			let mut streams = conn.subscription_streams.write().await;
 			streams.retain(|(id, _)| id != subscription_id);
@@ -566,10 +598,13 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 			let field = msg.payload.get("field").and_then(|v| v.as_str()).unwrap_or("");
 
 			if path.is_empty() || field.is_empty() {
-				return RtdbMessage::new("error", json!({
-					"code": 400,
-					"message": "Missing path or field for index creation"
-				}));
+				return RtdbMessage::new(
+					"error",
+					json!({
+						"code": 400,
+						"message": "Missing path or field for index creation"
+					}),
+				);
 			}
 
 			debug!("RTDB createIndex: path={}, field={}", path, field);
@@ -577,14 +612,21 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 			match app.rtdb_adapter.create_index(conn.tn_id, &conn.file_id, path, field).await {
 				Ok(_) => {
 					debug!("Index created successfully: {} on {}", field, path);
-					RtdbMessage::response(msg.id.clone(), "createIndexResult", serde_json::Map::new())
+					RtdbMessage::response(
+						msg.id.clone(),
+						"createIndexResult",
+						serde_json::Map::new(),
+					)
 				}
 				Err(e) => {
 					warn!("Create index failed: {}", e);
-					RtdbMessage::new("error", json!({
-						"code": 500,
-						"message": format!("Create index failed: {}", e)
-					}))
+					RtdbMessage::new(
+						"error",
+						json!({
+							"code": 500,
+							"message": format!("Create index failed: {}", e)
+						}),
+					)
 				}
 			}
 		}
@@ -597,7 +639,10 @@ async fn handle_rtdb_command(conn: &Arc<RtdbConnection>, msg: &RtdbMessage, app:
 		_ => {
 			// Unknown command
 			warn!("Unknown RTDB command: {}", msg.msg_type);
-			RtdbMessage::new("error", json!({ "code": 400, "message": format!("Unknown command: {}", msg.msg_type) }))
+			RtdbMessage::new(
+				"error",
+				json!({ "code": 400, "message": format!("Unknown command: {}", msg.msg_type) }),
+			)
 		}
 	}
 }

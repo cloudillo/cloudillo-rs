@@ -6,13 +6,13 @@ use sha2::{Digest, Sha256};
 use crate::prelude::*;
 
 pub enum Hasher {
-	V1(Sha256)
+	V1(Sha256),
 }
 
 impl Default for Hasher {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl Hasher {
@@ -26,14 +26,17 @@ impl Hasher {
 
 	pub fn update(&mut self, data: &[u8]) {
 		match self {
-			Self::V1(hasher) => hasher.update(data)
+			Self::V1(hasher) => hasher.update(data),
 		}
 	}
 
 	pub fn finalize(self, prefix: &str) -> String {
 		match self {
 			//Self::V2(hasher) => "2.".to_string() + &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
-			Self::V1(hasher) => prefix.to_string() + "1~" + &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+			Self::V1(hasher) => {
+				prefix.to_string()
+					+ "1~" + &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+			}
 		}
 	}
 }

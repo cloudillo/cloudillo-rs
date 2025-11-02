@@ -10,10 +10,10 @@ use crate::core::ws_bus;
 use crate::crdt;
 use crate::rtdb;
 use axum::{
-	extract::{Path, State},
-	response::{Response, IntoResponse},
 	extract::ws::WebSocketUpgrade,
+	extract::{Path, State},
 	http::StatusCode,
+	response::{IntoResponse, Response},
 };
 
 /// WebSocket upgrade handler for the notification bus
@@ -32,9 +32,7 @@ pub async fn get_ws_bus(
 		Some(auth_ctx) => {
 			let user_id = auth_ctx.id_tag.to_string();
 			info!("Bus WebSocket authenticated: user_id={}", user_id);
-			ws.on_upgrade(move |socket| {
-				ws_bus::handle_bus_connection(socket, user_id, app)
-			})
+			ws.on_upgrade(move |socket| ws_bus::handle_bus_connection(socket, user_id, app))
 		}
 		None => {
 			warn!("Bus WebSocket rejected - no authentication");

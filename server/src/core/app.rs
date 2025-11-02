@@ -8,13 +8,13 @@ use std::{
 	sync::{Arc, RwLock},
 };
 
+use crate::core::{abac, acme, request, scheduler, webserver, worker};
 use crate::prelude::*;
-use crate::core::{acme, request, scheduler, webserver, worker, abac};
 
 use crate::auth_adapter::AuthAdapter;
-use crate::meta_adapter::MetaAdapter;
 use crate::blob_adapter::BlobAdapter;
 use crate::crdt_adapter::CrdtAdapter;
+use crate::meta_adapter::MetaAdapter;
 use crate::rtdb_adapter::RtdbAdapter;
 
 use crate::{action, file, routes};
@@ -109,31 +109,82 @@ impl AppBuilder {
 	}
 
 	// Opts
-	pub fn mode(&mut self, mode: ServerMode) -> &mut Self { self.opts.mode = mode; self }
-	pub fn listen(&mut self, listen: impl Into<Box<str>>) -> &mut Self { self.opts.listen = listen.into(); self }
-	pub fn listen_http(&mut self, listen_http: impl Into<Box<str>>) -> &mut Self { self.opts.listen_http = Some(listen_http.into()); self }
-	pub fn base_id_tag(&mut self, base_id_tag: impl Into<Box<str>>) -> &mut Self { self.opts.base_id_tag = Some(base_id_tag.into()); self }
-	pub fn base_app_domain(&mut self, base_app_domain: impl Into<Box<str>>) -> &mut Self { self.opts.base_app_domain = Some(base_app_domain.into()); self }
-	pub fn base_password(&mut self, base_password: impl Into<Box<str>>) -> &mut Self { self.opts.base_password = Some(base_password.into()); self }
-	pub fn dist_dir(&mut self, dist_dir: impl Into<Box<Path>>) -> &mut Self { self.opts.dist_dir = dist_dir.into(); self }
-	pub fn tmp_dir(&mut self, tmp_dir: impl Into<Box<Path>>) -> &mut Self { self.opts.tmp_dir = tmp_dir.into(); self }
-	pub fn acme_email(&mut self, acme_email: impl Into<Box<str>>) -> &mut Self { self.opts.acme_email = Some(acme_email.into()); self }
-	pub fn local_ips(&mut self, local_ips: impl IntoIterator<Item = impl Into<Box<str>>>) -> &mut Self {
+	pub fn mode(&mut self, mode: ServerMode) -> &mut Self {
+		self.opts.mode = mode;
+		self
+	}
+	pub fn listen(&mut self, listen: impl Into<Box<str>>) -> &mut Self {
+		self.opts.listen = listen.into();
+		self
+	}
+	pub fn listen_http(&mut self, listen_http: impl Into<Box<str>>) -> &mut Self {
+		self.opts.listen_http = Some(listen_http.into());
+		self
+	}
+	pub fn base_id_tag(&mut self, base_id_tag: impl Into<Box<str>>) -> &mut Self {
+		self.opts.base_id_tag = Some(base_id_tag.into());
+		self
+	}
+	pub fn base_app_domain(&mut self, base_app_domain: impl Into<Box<str>>) -> &mut Self {
+		self.opts.base_app_domain = Some(base_app_domain.into());
+		self
+	}
+	pub fn base_password(&mut self, base_password: impl Into<Box<str>>) -> &mut Self {
+		self.opts.base_password = Some(base_password.into());
+		self
+	}
+	pub fn dist_dir(&mut self, dist_dir: impl Into<Box<Path>>) -> &mut Self {
+		self.opts.dist_dir = dist_dir.into();
+		self
+	}
+	pub fn tmp_dir(&mut self, tmp_dir: impl Into<Box<Path>>) -> &mut Self {
+		self.opts.tmp_dir = tmp_dir.into();
+		self
+	}
+	pub fn acme_email(&mut self, acme_email: impl Into<Box<str>>) -> &mut Self {
+		self.opts.acme_email = Some(acme_email.into());
+		self
+	}
+	pub fn local_ips(
+		&mut self,
+		local_ips: impl IntoIterator<Item = impl Into<Box<str>>>,
+	) -> &mut Self {
 		self.opts.local_ips = local_ips.into_iter().map(|ip| ip.into()).collect();
 		self
 	}
-	pub fn identity_providers(&mut self, identity_providers: impl IntoIterator<Item = impl Into<Box<str>>>) -> &mut Self {
+	pub fn identity_providers(
+		&mut self,
+		identity_providers: impl IntoIterator<Item = impl Into<Box<str>>>,
+	) -> &mut Self {
 		self.opts.identity_providers = identity_providers.into_iter().map(|ip| ip.into()).collect();
 		self
 	}
-	pub fn worker(&mut self, worker: Arc<worker::WorkerPool>) -> &mut Self { self.worker = Some(worker); self }
+	pub fn worker(&mut self, worker: Arc<worker::WorkerPool>) -> &mut Self {
+		self.worker = Some(worker);
+		self
+	}
 
 	// Adapters
-	pub fn auth_adapter(&mut self, auth_adapter: Arc<dyn AuthAdapter>) -> &mut Self { self.adapters.auth_adapter = Some(auth_adapter); self }
-	pub fn meta_adapter(&mut self, meta_adapter: Arc<dyn MetaAdapter>) -> &mut Self { self.adapters.meta_adapter = Some(meta_adapter); self }
-	pub fn blob_adapter(&mut self, blob_adapter: Arc<dyn BlobAdapter>) -> &mut Self { self.adapters.blob_adapter = Some(blob_adapter); self }
-	pub fn crdt_adapter(&mut self, crdt_adapter: Arc<dyn CrdtAdapter>) -> &mut Self { self.adapters.crdt_adapter = Some(crdt_adapter); self }
-	pub fn rtdb_adapter(&mut self, rtdb_adapter: Arc<dyn RtdbAdapter>) -> &mut Self { self.adapters.rtdb_adapter = Some(rtdb_adapter); self }
+	pub fn auth_adapter(&mut self, auth_adapter: Arc<dyn AuthAdapter>) -> &mut Self {
+		self.adapters.auth_adapter = Some(auth_adapter);
+		self
+	}
+	pub fn meta_adapter(&mut self, meta_adapter: Arc<dyn MetaAdapter>) -> &mut Self {
+		self.adapters.meta_adapter = Some(meta_adapter);
+		self
+	}
+	pub fn blob_adapter(&mut self, blob_adapter: Arc<dyn BlobAdapter>) -> &mut Self {
+		self.adapters.blob_adapter = Some(blob_adapter);
+		self
+	}
+	pub fn crdt_adapter(&mut self, crdt_adapter: Arc<dyn CrdtAdapter>) -> &mut Self {
+		self.adapters.crdt_adapter = Some(crdt_adapter);
+		self
+	}
+	pub fn rtdb_adapter(&mut self, rtdb_adapter: Arc<dyn RtdbAdapter>) -> &mut Self {
+		self.adapters.rtdb_adapter = Some(rtdb_adapter);
+		self
+	}
 
 	pub async fn run(self) -> ClResult<()> {
 		info!("     ______");
@@ -145,10 +196,14 @@ impl AppBuilder {
 		info!("V{}", VERSION);
 		info!("");
 
-		rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider()).expect("FATAL: Failed to install default crypto provider");
+		rustls::crypto::CryptoProvider::install_default(
+			rustls::crypto::aws_lc_rs::default_provider(),
+		)
+		.expect("FATAL: Failed to install default crypto provider");
 		let auth_adapter = self.adapters.auth_adapter.expect("FATAL: No auth adapter");
 		let meta_adapter = self.adapters.meta_adapter.expect("FATAL: No meta adapter");
-		let task_store: Arc<dyn scheduler::TaskStore<App>> = scheduler::MetaAdapterTaskStore::new(meta_adapter.clone());
+		let task_store: Arc<dyn scheduler::TaskStore<App>> =
+			scheduler::MetaAdapterTaskStore::new(meta_adapter.clone());
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker: self.worker.expect("FATAL: No worker pool defined"),
@@ -165,7 +220,9 @@ impl AppBuilder {
 			crdt_adapter: self.adapters.crdt_adapter.expect("FATAL: No CRDT adapter"),
 			rtdb_adapter: self.adapters.rtdb_adapter.expect("FATAL: No RTDB adapter"),
 		});
-		tokio::fs::create_dir_all(&app.opts.tmp_dir).await.expect("Cannot create tmp dir");
+		tokio::fs::create_dir_all(&app.opts.tmp_dir)
+			.await
+			.expect("Cannot create tmp dir");
 
 		// Init modules
 		action::init(&app)?;
@@ -188,12 +245,20 @@ impl AppBuilder {
 								health.waiting, health.scheduled, health.running, health.dependents
 							);
 							if !health.stuck_tasks.is_empty() {
-								error!("SCHEDULER: {} stuck tasks detected: {:?}", health.stuck_tasks.len(), health.stuck_tasks);
+								error!(
+									"SCHEDULER: {} stuck tasks detected: {:?}",
+									health.stuck_tasks.len(),
+									health.stuck_tasks
+								);
 							}
 							if !health.tasks_with_missing_deps.is_empty() {
-								error!("SCHEDULER: {} tasks with missing dependencies: {:?}", health.tasks_with_missing_deps.len(), health.tasks_with_missing_deps);
+								error!(
+									"SCHEDULER: {} tasks with missing dependencies: {:?}",
+									health.tasks_with_missing_deps.len(),
+									health.tasks_with_missing_deps
+								);
 							}
-						},
+						}
 						Err(e) => {
 							warn!("Scheduler health check failed: {}", e);
 						}
@@ -202,7 +267,9 @@ impl AppBuilder {
 			});
 		}
 
-		let https_server = webserver::create_https_server(app.clone(), &app.opts.listen, api_router, app_router).await?;
+		let https_server =
+			webserver::create_https_server(app.clone(), &app.opts.listen, api_router, app_router)
+				.await?;
 
 		let http_server = if let Some(listen_http) = &app.opts.listen_http {
 			let http_listener = tokio::net::TcpListener::bind(listen_http.as_ref()).await?;
@@ -230,7 +297,9 @@ impl AppBuilder {
 }
 
 impl Default for AppBuilder {
-	fn default() -> Self { Self::new() }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 async fn bootstrap(app: Arc<AppState>, opts: &AppBuilderOpts) -> ClResult<()> {
@@ -253,7 +322,8 @@ async fn bootstrap(app: Arc<AppState>, opts: &AppBuilderOpts) -> ClResult<()> {
 		if let Some(ref acme_email) = opts.acme_email {
 			let cert_data = auth.read_cert_by_tn_id(TnId(1)).await;
 			if let Err(Error::NotFound) = cert_data {
-				acme::init(app.clone(), acme_email, base_id_tag, opts.base_app_domain.as_deref()).await?;
+				acme::init(app.clone(), acme_email, base_id_tag, opts.base_app_domain.as_deref())
+					.await?;
 			}
 		}
 	}

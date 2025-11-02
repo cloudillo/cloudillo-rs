@@ -2,9 +2,9 @@
 //!
 //! Tests streaming I/O, large files, and partial uploads
 
-use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use cloudillo::blob_adapter::{BlobAdapter, CreateBlobOptions};
 use cloudillo::types::TnId;
+use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use std::io::Cursor;
 use tempfile::TempDir;
 
@@ -29,9 +29,7 @@ async fn test_create_blob_from_stream() {
 	// Create blob from stream
 	// Note: create_blob_stream will create directories but may not complete
 	// due to the tmp file handling in the current implementation
-	let result = adapter
-		.create_blob_stream(tn_id, file_id, &mut cursor)
-		.await;
+	let result = adapter.create_blob_stream(tn_id, file_id, &mut cursor).await;
 
 	// Just verify the call completes without panicking
 	assert!(result.is_ok() || result.is_err()); // Either outcome is acceptable for this test

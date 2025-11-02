@@ -4,10 +4,13 @@ use serde_json::json;
 use serde_with::skip_serializing_none;
 
 use crate::{
-	prelude::*,
-	auth_adapter,
 	action::action,
-	core::{Auth, extract::{IdTag, OptionalRequestId}},
+	auth_adapter,
+	core::{
+		extract::{IdTag, OptionalRequestId},
+		Auth,
+	},
+	prelude::*,
 	types::ApiResponse,
 };
 
@@ -40,8 +43,9 @@ pub async fn get_id_tag(
 	OptionalRequestId(_req_id): OptionalRequestId,
 	req: axum::http::Request<axum::body::Body>,
 ) -> ClResult<(StatusCode, Json<IdTagRes>)> {
-	let host =
-		req.uri().host()
+	let host = req
+		.uri()
+		.host()
 		.or_else(|| req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()))
 		.unwrap_or_default();
 	let cert_data = app.auth_adapter.read_cert_by_domain(host).await?;
@@ -49,9 +53,15 @@ pub async fn get_id_tag(
 	Ok((StatusCode::OK, Json(IdTagRes { id_tag: cert_data.id_tag })))
 }
 
-pub async fn return_login(app: &App, auth: auth_adapter::AuthLogin) -> ClResult<(StatusCode, Json<Login>)> {
+pub async fn return_login(
+	app: &App,
+	auth: auth_adapter::AuthLogin,
+) -> ClResult<(StatusCode, Json<Login>)> {
 	// Fetch profile data for name and profile_pic
-	let profile_data = app.meta_adapter.get_profile_info(auth.tn_id, &auth.id_tag).await
+	let profile_data = app
+		.meta_adapter
+		.get_profile_info(auth.tn_id, &auth.id_tag)
+		.await
 		.unwrap_or_else(|_| crate::meta_adapter::ProfileData {
 			id_tag: auth.id_tag.clone(),
 			name: auth.id_tag.clone(),
@@ -94,8 +104,7 @@ pub async fn post_login(
 
 	if let Ok(auth) = auth {
 		let (_status, Json(login_data)) = return_login(&app, auth).await?;
-		let response = ApiResponse::new(login_data)
-			.with_req_id(req_id.unwrap_or_default());
+		let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else {
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -114,8 +123,7 @@ pub async fn get_login_token(
 	if let Ok(auth) = auth {
 		info!("token: {}", &auth.token);
 		let (_status, Json(login_data)) = return_login(&app, auth).await?;
-		let response = ApiResponse::new(login_data)
-			.with_req_id(req_id.unwrap_or_default());
+		let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else {
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -135,8 +143,7 @@ pub async fn post_logout(
 
 	info!("User {} logged out", auth.id_tag);
 
-	let response = ApiResponse::new(())
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -158,8 +165,7 @@ pub async fn post_password(
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	app.auth_adapter.update_tenant_password(&req.id_tag, req.new_password).await?;
 
-	let response = ApiResponse::new(())
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -198,30 +204,51 @@ pub async fn get_access_token(
 		}
 		info!("Got auth action: {:?}", &auth_action);
 
-		info!("Creating access token with t={}, u={}, scope={:?}", id_tag.0, auth_action.iss, query.scope.as_deref());
-		let token_result = app.auth_adapter.create_access_token(tn_id, &auth_adapter::AccessToken {
-			iss: &id_tag.0,
-			sub: Some(&auth_action.iss),
-			// FIXME
-			r: None,
-			scope: query.scope.as_deref(),
-			exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
-		}).await?;
+		info!(
+			"Creating access token with t={}, u={}, scope={:?}",
+			id_tag.0,
+			auth_action.iss,
+			query.scope.as_deref()
+		);
+		let token_result = app
+			.auth_adapter
+			.create_access_token(
+				tn_id,
+				&auth_adapter::AccessToken {
+					iss: &id_tag.0,
+					sub: Some(&auth_action.iss),
+					// FIXME
+					r: None,
+					scope: query.scope.as_deref(),
+					exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
+				},
+			)
+			.await?;
 		info!("Got access token: {}", &token_result);
 		let response = ApiResponse::new(json!({ "token": token_result }))
 			.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else {
 		// Use authenticated session token
-		info!("Using authenticated session for id_tag={}, scope={:?}", auth.id_tag, query.scope.as_deref());
-		let token_result = app.auth_adapter.create_access_token(tn_id, &auth_adapter::AccessToken {
-			iss: &id_tag.0,
-			sub: Some(&auth.id_tag),
-			// FIXME
-			r: None,
-			scope: query.scope.as_deref(),
-			exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
-		}).await?;
+		info!(
+			"Using authenticated session for id_tag={}, scope={:?}",
+			auth.id_tag,
+			query.scope.as_deref()
+		);
+		let token_result = app
+			.auth_adapter
+			.create_access_token(
+				tn_id,
+				&auth_adapter::AccessToken {
+					iss: &id_tag.0,
+					sub: Some(&auth.id_tag),
+					// FIXME
+					r: None,
+					scope: query.scope.as_deref(),
+					exp: Timestamp::from_now(action::ACCESS_TOKEN_EXPIRY),
+				},
+			)
+			.await?;
 		info!("Got access token from session: {}", &token_result);
 		let response = ApiResponse::new(json!({ "token": token_result }))
 			.with_req_id(req_id.unwrap_or_default());
@@ -242,10 +269,13 @@ pub async fn get_proxy_token(
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxyTokenRes>>)> {
 	info!("Generating proxy token for {}", &auth.id_tag);
-	let token = app.auth_adapter.create_proxy_token(auth.tn_id, &auth.id_tag, &auth.roles).await?;
+	let token = app
+		.auth_adapter
+		.create_proxy_token(auth.tn_id, &auth.id_tag, &auth.roles)
+		.await?;
 
-	let response = ApiResponse::new(ProxyTokenRes { token })
-		.with_req_id(req_id.unwrap_or_default());
+	let response =
+		ApiResponse::new(ProxyTokenRes { token }).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }

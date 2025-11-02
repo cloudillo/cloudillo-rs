@@ -1,14 +1,11 @@
 //! Adapter that manages and stores authentication, authorization and other sensitive data.
 
 use async_trait::async_trait;
-use std::fmt::Debug;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
+use std::fmt::Debug;
 
-use crate::{
-	prelude::*,
-	action::action,
-};
+use crate::{action::action, prelude::*};
 
 /// Action tokens represent user actions
 #[skip_serializing_none]
@@ -72,7 +69,7 @@ pub struct AuthCtx {
 	pub tn_id: TnId,
 	pub id_tag: Box<str>,
 	pub roles: Box<[Box<str>]>,
-	pub scope: Option<Box<str>>
+	pub scope: Option<Box<str>>,
 }
 
 #[derive(Debug)]
@@ -142,7 +139,12 @@ pub trait AuthAdapter: Debug + Send + Sync {
 
 	/// Creates a new tenant
 	/// If vfy_code is provided, validates it against the email in user_vfy table
-	async fn create_tenant(&self, id_tag: &str, email: Option<&str>, vfy_code: Option<&str>) -> ClResult<TnId>;
+	async fn create_tenant(
+		&self,
+		id_tag: &str,
+		email: Option<&str>,
+		vfy_code: Option<&str>,
+	) -> ClResult<TnId>;
 
 	/// Deletes a tenant
 	async fn delete_tenant(&self, id_tag: &str) -> ClResult<()>;
@@ -163,18 +165,31 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn read_profile_key(&self, tn_id: TnId, key_id: &str) -> ClResult<AuthKey>;
 
 	/// Create a new key pair for the given tenant
-	async fn create_profile_key(&self, tn_id: TnId, expires_at: Option<Timestamp>)
-		-> ClResult<AuthKey>;
+	async fn create_profile_key(
+		&self,
+		tn_id: TnId,
+		expires_at: Option<Timestamp>,
+	) -> ClResult<AuthKey>;
 
 	/// Creates an access token for the given tenant
-	async fn create_access_token(&self, tn_id: TnId, data: &AccessToken<&str>)
-		-> ClResult<Box<str>>;
-	async fn create_action_token(&self, tn_id: TnId, data: action::CreateAction)
-		-> ClResult<Box<str>>;
+	async fn create_access_token(
+		&self,
+		tn_id: TnId,
+		data: &AccessToken<&str>,
+	) -> ClResult<Box<str>>;
+	async fn create_action_token(
+		&self,
+		tn_id: TnId,
+		data: action::CreateAction,
+	) -> ClResult<Box<str>>;
 
 	/// Creates a proxy token for federation - allows this user to act as a proxy
-	async fn create_proxy_token(&self, tn_id: TnId, id_tag: &str, roles: &[Box<str>])
-		-> ClResult<Box<str>>;
+	async fn create_proxy_token(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		roles: &[Box<str>],
+	) -> ClResult<Box<str>>;
 
 	/// Verifies that the given access token is valid
 	async fn verify_access_token(&self, token: &str) -> ClResult<()>;
@@ -190,9 +205,18 @@ pub trait AuthAdapter: Debug + Send + Sync {
 
 	// Webauthn
 	async fn list_webauthn_credentials(&self, tn_id: TnId) -> ClResult<Box<[Webauthn]>>;
-	async fn read_webauthn_credential(&self, tn_id: TnId, credential_id: &str) -> ClResult<Webauthn>;
+	async fn read_webauthn_credential(
+		&self,
+		tn_id: TnId,
+		credential_id: &str,
+	) -> ClResult<Webauthn>;
 	async fn create_webauthn_credential(&self, tn_id: TnId, data: &Webauthn) -> ClResult<()>;
-	async fn update_webauthn_credential_counter(&self, tn_id: TnId, credential_id: &str, counter: u32) -> ClResult<()>;
+	async fn update_webauthn_credential_counter(
+		&self,
+		tn_id: TnId,
+		credential_id: &str,
+		counter: u32,
+	) -> ClResult<()>;
 	async fn delete_webauthn_credential(&self, tn_id: TnId, credential_id: &str) -> ClResult<()>;
 
 	// Phase 1: Registration & Session Management
@@ -200,7 +224,8 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn create_registration_verification(&self, email: &str) -> ClResult<Box<str>>;
 
 	/// Validate a registration verification token
-	async fn validate_registration_verification(&self, email: &str, vfy_code: &str) -> ClResult<()>;
+	async fn validate_registration_verification(&self, email: &str, vfy_code: &str)
+		-> ClResult<()>;
 
 	/// Invalidate an access token (logout)
 	async fn invalidate_token(&self, token: &str) -> ClResult<()>;

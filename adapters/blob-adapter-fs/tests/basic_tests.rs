@@ -2,9 +2,9 @@
 //!
 //! Tests core CRUD operations for blob storage
 
-use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use cloudillo::blob_adapter::{BlobAdapter, CreateBlobOptions};
 use cloudillo::types::TnId;
+use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use tempfile::TempDir;
 
 async fn create_test_adapter() -> (BlobAdapterFs, TempDir) {
@@ -30,10 +30,7 @@ async fn test_create_and_retrieve_blob() {
 		.expect("Failed to create blob");
 
 	// Verify blob exists via stat
-	let size = adapter
-		.stat_blob(tn_id, file_id)
-		.await
-		.expect("Failed to stat blob");
+	let size = adapter.stat_blob(tn_id, file_id).await.expect("Failed to stat blob");
 	assert_eq!(size as usize, test_data.len());
 }
 
@@ -52,10 +49,7 @@ async fn test_create_blob_empty_data() {
 		.expect("Failed to create empty blob");
 
 	// Verify empty blob exists
-	let size = adapter
-		.stat_blob(tn_id, file_id)
-		.await
-		.expect("Failed to stat blob");
+	let size = adapter.stat_blob(tn_id, file_id).await.expect("Failed to stat blob");
 	assert_eq!(size, 0);
 }
 
@@ -80,14 +74,8 @@ async fn test_per_tenant_isolation() {
 		.expect("Failed to create blob for tenant 2");
 
 	// Verify both exist with correct sizes
-	let size1 = adapter
-		.stat_blob(TnId(1), file_id)
-		.await
-		.expect("Tenant 1 blob should exist");
-	let size2 = adapter
-		.stat_blob(TnId(2), file_id)
-		.await
-		.expect("Tenant 2 blob should exist");
+	let size1 = adapter.stat_blob(TnId(1), file_id).await.expect("Tenant 1 blob should exist");
+	let size2 = adapter.stat_blob(TnId(2), file_id).await.expect("Tenant 2 blob should exist");
 
 	assert_eq!(size1 as usize, data1.len());
 	assert_eq!(size2 as usize, data2.len());

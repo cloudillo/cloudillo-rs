@@ -1,7 +1,7 @@
 //! Action type configuration for federated delivery
 
-use std::collections::HashMap;
 use lazy_static::lazy_static;
+use std::collections::HashMap;
 
 /// Configuration for each action type
 #[derive(Debug, Clone)]

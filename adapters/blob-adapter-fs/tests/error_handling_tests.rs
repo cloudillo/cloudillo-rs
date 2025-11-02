@@ -2,9 +2,9 @@
 //!
 //! Tests error conditions and edge cases
 
-use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use cloudillo::blob_adapter::{BlobAdapter, CreateBlobOptions};
 use cloudillo::types::TnId;
+use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use tempfile::TempDir;
 
 async fn create_test_adapter() -> (BlobAdapterFs, TempDir) {
@@ -25,9 +25,7 @@ async fn test_invalid_file_id_format() {
 	let test_data = b"test";
 	let opts = CreateBlobOptions::default();
 
-	let result = adapter
-		.create_blob_buf(tn_id, invalid_id, test_data, &opts)
-		.await;
+	let result = adapter.create_blob_buf(tn_id, invalid_id, test_data, &opts).await;
 
 	assert!(result.is_err());
 }
@@ -42,9 +40,7 @@ async fn test_file_id_too_short() {
 	let test_data = b"test";
 	let opts = CreateBlobOptions::default();
 
-	let result = adapter
-		.create_blob_buf(tn_id, short_id, test_data, &opts)
-		.await;
+	let result = adapter.create_blob_buf(tn_id, short_id, test_data, &opts).await;
 
 	assert!(result.is_err());
 }
@@ -56,9 +52,7 @@ async fn test_read_nonexistent_blob_buf() {
 	let nonexistent_id = "b1~nonexistent00000";
 
 	// Reading a nonexistent blob should error
-	let result = adapter
-		.read_blob_buf(tn_id, nonexistent_id)
-		.await;
+	let result = adapter.read_blob_buf(tn_id, nonexistent_id).await;
 
 	assert!(result.is_err());
 }
@@ -70,9 +64,7 @@ async fn test_read_nonexistent_blob_stream() {
 	let nonexistent_id = "b1~nonexistent11111";
 
 	// Reading a nonexistent blob stream should error
-	let result = adapter
-		.read_blob_stream(tn_id, nonexistent_id)
-		.await;
+	let result = adapter.read_blob_stream(tn_id, nonexistent_id).await;
 
 	assert!(result.is_err());
 }

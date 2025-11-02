@@ -16,16 +16,16 @@
 //! }
 //! ```
 
+use crate::core::ws_broadcast::BroadcastMessage;
 use crate::prelude::*;
 use axum::extract::ws::{Message, WebSocket};
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
-use crate::core::ws_broadcast::BroadcastMessage;
-use futures::stream::StreamExt;
-use futures::sink::SinkExt;
 
 /// A message in the bus protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,20 +43,12 @@ pub struct BusMessage {
 impl BusMessage {
 	/// Create a new bus message
 	pub fn new(cmd: impl Into<String>, data: Value) -> Self {
-		Self {
-			id: Uuid::new_v4().to_string(),
-			cmd: cmd.into(),
-			data,
-		}
+		Self { id: Uuid::new_v4().to_string(), cmd: cmd.into(), data }
 	}
 
 	/// Create an ack response
 	pub fn ack(id: String, status: &str) -> Self {
-		Self {
-			id,
-			cmd: "ack".to_string(),
-			data: json!({ "status": status }),
-		}
+		Self { id, cmd: "ack".to_string(), data: json!({ "status": status }) }
 	}
 
 	/// Serialize to JSON and wrap in WebSocket message
@@ -118,18 +110,21 @@ struct BusConnection {
 	user_id: String,
 	subscriptions: Arc<RwLock<Vec<String>>>, // "actions", "presence", "typing", etc.
 	// Broadcast receivers for each subscribed channel (wrapped in Mutex for interior mutability)
-	broadcast_rxs: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<BroadcastMessage>>>>>>,
+	broadcast_rxs: Arc<
+		RwLock<
+			HashMap<
+				String,
+				Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<BroadcastMessage>>>,
+			>,
+		>,
+	>,
 	connected_at: u64,
 }
 
 use std::collections::HashMap;
 
 /// Handle a bus connection
-pub async fn handle_bus_connection(
-	ws: WebSocket,
-	user_id: String,
-	app: crate::core::app::App,
-) {
+pub async fn handle_bus_connection(ws: WebSocket, user_id: String, app: crate::core::app::App) {
 	info!("Bus connection: {}", user_id);
 
 	let conn = Arc::new(BusConnection {
@@ -311,7 +306,11 @@ pub async fn handle_bus_connection(
 }
 
 /// Handle a bus command
-async fn handle_bus_command(conn: &Arc<BusConnection>, msg: &BusMessage, app: &crate::core::app::App) -> BusMessage {
+async fn handle_bus_command(
+	conn: &Arc<BusConnection>,
+	msg: &BusMessage,
+	app: &crate::core::app::App,
+) -> BusMessage {
 	match msg.cmd.as_str() {
 		"subscribe" => {
 			// Extract channels from data
@@ -352,11 +351,7 @@ async fn handle_bus_command(conn: &Arc<BusConnection>, msg: &BusMessage, app: &c
 
 		"setPresence" => {
 			// Update user presence and broadcast
-			let status = msg
-				.data
-				.get("status")
-				.and_then(|v| v.as_str())
-				.unwrap_or("online");
+			let status = msg.data.get("status").and_then(|v| v.as_str()).unwrap_or("online");
 
 			let presence = PresenceState {
 				user_id: conn.user_id.clone(),

@@ -1,15 +1,15 @@
 //! Reference / Bookmark handlers
 
 use axum::{
-	extract::{State, Path, Query},
+	extract::{Path, Query, State},
 	http::StatusCode,
 	Json,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	prelude::*,
 	core::extract::{Auth, OptionalRequestId},
+	prelude::*,
 	types::ApiResponse,
 };
 
@@ -20,16 +20,13 @@ pub async fn list_refs(
 	Query(q): Query<ListRefsQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<crate::meta_adapter::RefData>>>)> {
-	let opts = crate::meta_adapter::ListRefsOptions {
-		typ: q.r#type,
-		filter: q.filter,
-	};
+	let opts = crate::meta_adapter::ListRefsOptions { typ: q.r#type, filter: q.filter };
 
 	let refs = app.meta_adapter.list_refs(auth.tn_id, &opts).await?;
 	let total = refs.len();
 
-	let response = ApiResponse::with_pagination(refs, 0, 20, total)
-		.with_req_id(req_id.unwrap_or_default());
+	let response =
+		ApiResponse::with_pagination(refs, 0, 20, total).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -48,11 +45,13 @@ pub async fn get_ref(
 	Path(ref_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<(Box<str>, Box<str>)>>)> {
-	let ref_data = app.meta_adapter.get_ref(auth.tn_id, &ref_id).await?
+	let ref_data = app
+		.meta_adapter
+		.get_ref(auth.tn_id, &ref_id)
+		.await?
 		.ok_or(crate::error::Error::NotFound)?;
 
-	let response = ApiResponse::new(ref_data)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(ref_data).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -87,10 +86,7 @@ pub async fn create_ref(
 	Json(req): Json<CreateRefRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CreateRefResponse>>)> {
 	// Generate a random ref ID using uuid v4 (shortened)
-	let ref_id = uuid::Uuid::new_v4()
-		.to_string()
-		.replace("-", "")[..12]
-		.to_string();
+	let ref_id = uuid::Uuid::new_v4().to_string().replace("-", "")[..12].to_string();
 
 	let opts = crate::meta_adapter::CreateRefOptions {
 		typ: req.r#type.into(),
@@ -112,8 +108,7 @@ pub async fn create_ref(
 		count: ref_data.count,
 	};
 
-	let response = ApiResponse::new(create_ref_response)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(create_ref_response).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::CREATED, Json(response)))
 }
@@ -129,8 +124,7 @@ pub async fn delete_ref(
 
 	info!("User {} deleted reference {}", auth.id_tag, ref_id);
 
-	let response = ApiResponse::new(())
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }

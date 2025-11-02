@@ -1,15 +1,20 @@
-use axum::{extract::{self, Query, State}, response, body::{Body, to_bytes}, Json, http::StatusCode};
+use axum::{
+	body::{to_bytes, Body},
+	extract::{self, Query, State},
+	http::StatusCode,
+	response, Json,
+};
 use futures_core::Stream;
 use serde::Deserialize;
 use serde_json::json;
 use std::{fmt::Debug, pin::Pin};
 
-use crate::prelude::*;
 use crate::blob_adapter;
-use crate::meta_adapter;
-use crate::types::{self, Timestamp, ApiResponse};
+use crate::core::{extract::OptionalRequestId, hasher, utils};
 use crate::file::{file, image, store};
-use crate::core::{hasher, utils, extract::OptionalRequestId};
+use crate::meta_adapter;
+use crate::prelude::*;
+use crate::types::{self, ApiResponse, Timestamp};
 
 // Utility functions //
 //*******************//
@@ -33,8 +38,11 @@ pub fn content_type_from_format(format: &str) -> &str {
 	}
 }
 
-fn serve_file<S: AsRef<str> + Debug>(descriptor: Option<&str>, variant: &meta_adapter::FileVariant<S>, stream: Pin<Box<dyn Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>>)
--> ClResult<response::Response<axum::body::Body>> {
+fn serve_file<S: AsRef<str> + Debug>(
+	descriptor: Option<&str>,
+	variant: &meta_adapter::FileVariant<S>,
+	stream: Pin<Box<dyn Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>>,
+) -> ClResult<response::Response<axum::body::Body>> {
 	let content_type = content_type_from_format(variant.format.as_ref());
 
 	let mut response = axum::response::Response::builder()
@@ -59,8 +67,8 @@ pub async fn get_file_list(
 	let files = app.meta_adapter.list_files(tn_id, opts).await?;
 	let total = files.len();
 
-	let response = ApiResponse::with_pagination(files, 0, 20, total)
-		.with_req_id(req_id.unwrap_or_default());
+	let response =
+		ApiResponse::with_pagination(files, 0, 20, total).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -92,8 +100,10 @@ pub async fn get_file_variant_file_id(
 	extract::Path(file_id): extract::Path<Box<str>>,
 	extract::Query(selector): extract::Query<GetFileVariantSelector>,
 ) -> ClResult<impl response::IntoResponse> {
-
-	let mut variants = app.meta_adapter.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id)).await?;
+	let mut variants = app
+		.meta_adapter
+		.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id))
+		.await?;
 	variants.sort();
 	info!("variants: {:?}", variants);
 
@@ -110,14 +120,15 @@ pub async fn get_file_descriptor(
 	extract::Path(file_id): extract::Path<Box<str>>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<String>>)> {
-
-	let mut variants = app.meta_adapter.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id)).await?;
+	let mut variants = app
+		.meta_adapter
+		.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id))
+		.await?;
 	variants.sort();
 
 	let descriptor = file::get_file_descriptor(&variants);
 
-	let response = ApiResponse::new(descriptor)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(descriptor).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -131,60 +142,83 @@ pub struct PostFileQuery {
 #[derive(Deserialize)]
 pub struct PostFileRequest {
 	#[serde(rename = "fileTp")]
-	file_tp: String,  // Required parameter
+	file_tp: String, // Required parameter
 	#[serde(rename = "contentType")]
-	content_type: Option<String>,  // Optional, defaults to application/json
+	content_type: Option<String>, // Optional, defaults to application/json
 	created_at: Option<Timestamp>,
 	tags: Option<String>,
 }
 
-async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, _content_type: &str, bytes: &[u8]) -> ClResult<serde_json::Value> {
-	let file_id_orig = store::create_blob_buf(app, tn_id, bytes, blob_adapter::CreateBlobOptions::default()).await?;
+async fn handle_post_image(
+	app: &App,
+	tn_id: types::TnId,
+	f_id: u64,
+	_content_type: &str,
+	bytes: &[u8],
+) -> ClResult<serde_json::Value> {
+	let file_id_orig =
+		store::create_blob_buf(app, tn_id, bytes, blob_adapter::CreateBlobOptions::default())
+			.await?;
 
 	// Get actual original image dimensions
 	let orig_dim = image::get_image_dimensions(&bytes).await?;
 	info!("Original image dimensions: {}x{}", orig_dim.0, orig_dim.1);
 
-	app.meta_adapter.create_file_variant(tn_id, f_id, meta_adapter::FileVariant {
-		variant_id: file_id_orig.as_ref(),
-		variant: "orig",
-		format: "avif",
-		resolution: orig_dim,
-		size: bytes.len() as u64,
-		available: true,
-	}).await?;
+	app.meta_adapter
+		.create_file_variant(
+			tn_id,
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: file_id_orig.as_ref(),
+				variant: "orig",
+				format: "avif",
+				resolution: orig_dim,
+				size: bytes.len() as u64,
+				available: true,
+			},
+		)
+		.await?;
 
 	let orig_file = app.opts.tmp_dir.join::<&str>(&file_id_orig);
 	tokio::fs::write(&orig_file, &bytes).await?;
 
 	// Generate thumbnail
-	let resized_tn = image::resize_image(app.clone(), bytes.into(), image::ImageFormat::Avif, (128, 128)).await?;
+	let resized_tn =
+		image::resize_image(app.clone(), bytes.into(), image::ImageFormat::Avif, (128, 128))
+			.await?;
 	debug!("resized {:?}", resized_tn.bytes.len());
-	let variant_id_tn = store::create_blob_buf(app, tn_id, &resized_tn.bytes, blob_adapter::CreateBlobOptions::default()).await?;
-	app.meta_adapter.create_file_variant(tn_id, f_id, meta_adapter::FileVariant {
-		variant_id: variant_id_tn.as_ref(),
-		variant: "tn",
-		format: "avif",
-		resolution: (resized_tn.width, resized_tn.height),
-		size: resized_tn.bytes.len() as u64,
-		available: true,
-	}).await?;
+	let variant_id_tn = store::create_blob_buf(
+		app,
+		tn_id,
+		&resized_tn.bytes,
+		blob_adapter::CreateBlobOptions::default(),
+	)
+	.await?;
+	app.meta_adapter
+		.create_file_variant(
+			tn_id,
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: variant_id_tn.as_ref(),
+				variant: "tn",
+				format: "avif",
+				resolution: (resized_tn.width, resized_tn.height),
+				size: resized_tn.bytes.len() as u64,
+				available: true,
+			},
+		)
+		.await?;
 
 	// Smart variant creation: skip creating variants if image is too small or too close in size
-	const SKIP_THRESHOLD: f32 = 0.10;  // Skip variant if it's less than 10% larger than previous
+	const SKIP_THRESHOLD: f32 = 0.10; // Skip variant if it's less than 10% larger than previous
 	let original_max = orig_dim.0.max(orig_dim.1) as f32;
 	info!("Image dimensions: {}x{}, max: {}", orig_dim.0, orig_dim.1, original_max);
 
 	// Variant configurations: (name, bounding_box_size)
-	let variant_configs = [
-		("sd", 720_u32),
-		("md", 1280_u32),
-		("hd", 1920_u32),
-		("xd", 3840_u32),
-	];
+	let variant_configs = [("sd", 720_u32), ("md", 1280_u32), ("hd", 1920_u32), ("xd", 3840_u32)];
 
 	let mut variant_task_ids = Vec::new();
-	let mut last_created_size = 128_f32;  // Start after tn (128px)
+	let mut last_created_size = 128_f32; // Start after tn (128px)
 
 	for (variant_name, variant_bbox) in &variant_configs {
 		let variant_bbox_f = *variant_bbox as f32;
@@ -196,8 +230,10 @@ async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, _content_ty
 		let min_required_increase = last_created_size * (1.0 + SKIP_THRESHOLD);
 		if actual_size > min_required_increase {
 			// This variant provides meaningful size increase - create it
-			info!("Creating variant {} with bounding box {}x{} (capped from {})",
-				variant_name, actual_size as u32, actual_size as u32, variant_bbox);
+			info!(
+				"Creating variant {} with bounding box {}x{} (capped from {})",
+				variant_name, actual_size as u32, actual_size as u32, variant_bbox
+			);
 
 			let task = image::ImageResizerTask::new(
 				tn_id,
@@ -205,19 +241,25 @@ async fn handle_post_image(app: &App, tn_id: types::TnId, f_id: u64, _content_ty
 				orig_file.clone(),
 				*variant_name,
 				image::ImageFormat::Avif,
-				(actual_size as u32, actual_size as u32)
+				(actual_size as u32, actual_size as u32),
 			);
 			let task_id = app.scheduler.add(task).await?;
 			variant_task_ids.push(task_id);
 			last_created_size = actual_size;
 		} else {
-			info!("Skipping variant {} - would be {}, only {:.0}% larger than last ({})",
-				variant_name, actual_size as u32, (actual_size / last_created_size - 1.0) * 100.0, last_created_size as u32);
+			info!(
+				"Skipping variant {} - would be {}, only {:.0}% larger than last ({})",
+				variant_name,
+				actual_size as u32,
+				(actual_size / last_created_size - 1.0) * 100.0,
+				last_created_size as u32
+			);
 		}
 	}
 
 	// FileIdGeneratorTask depends on all created variant tasks
-	let mut builder = app.scheduler
+	let mut builder = app
+		.scheduler
 		.task(file::FileIdGeneratorTask::new(tn_id, f_id))
 		.key(&format!("{},{}", tn_id, f_id));
 	if !variant_task_ids.is_empty() {
@@ -247,7 +289,9 @@ pub async fn post_file(
 
 	// Create empty blob for metadata-only files (CRDT, RTDB)
 	let bytes = Vec::new();
-	let blob_id = store::create_blob_buf(&app, tn_id, &bytes, blob_adapter::CreateBlobOptions::default()).await?;
+	let blob_id =
+		store::create_blob_buf(&app, tn_id, &bytes, blob_adapter::CreateBlobOptions::default())
+			.await?;
 	info!("Created empty blob with ID: {}", blob_id);
 
 	// Generate file_id
@@ -255,18 +299,24 @@ pub async fn post_file(
 
 	// Create file metadata with specified fileTp
 	let content_type = req.content_type.clone().unwrap_or_else(|| "application/json".to_string());
-	let f_id = app.meta_adapter.create_file(tn_id, meta_adapter::CreateFile {
-		preset: "default".into(),
-		orig_variant_id: blob_id.clone(),
-		file_id: Some(file_id.clone().into()),
-		owner_tag: None,
-		content_type: content_type.into(),
-		file_name: "file".into(),
-		file_tp: Some(req.file_tp.clone().into()),
-		created_at: req.created_at,
-		tags: req.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
-		x: None,
-	}).await?;
+	let f_id = app
+		.meta_adapter
+		.create_file(
+			tn_id,
+			meta_adapter::CreateFile {
+				preset: "default".into(),
+				orig_variant_id: blob_id.clone(),
+				file_id: Some(file_id.clone().into()),
+				owner_tag: None,
+				content_type: content_type.into(),
+				file_name: "file".into(),
+				file_tp: Some(req.file_tp.clone().into()),
+				created_at: req.created_at,
+				tags: req.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+				x: None,
+			},
+		)
+		.await?;
 
 	info!("Created file metadata for fileTp={}", req.file_tp);
 
@@ -274,15 +324,14 @@ pub async fn post_file(
 		meta_adapter::FileId::FId(f_id) => {
 			info!("File created with FId: {}", f_id);
 			json!({"fileId": format!("@{}", f_id)})
-		},
+		}
 		meta_adapter::FileId::FileId(file_id) => {
 			info!("File created with FileId: {}", file_id);
 			json!({"fileId": file_id})
-		},
+		}
 	};
 
-	let response = ApiResponse::new(data)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::CREATED, Json(response)))
 }
@@ -296,7 +345,10 @@ pub async fn post_file_blob(
 	OptionalRequestId(req_id): OptionalRequestId,
 	body: Body,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
-	let content_type = header.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream");
+	let content_type = header
+		.get(axum::http::header::CONTENT_TYPE)
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or("application/octet-stream");
 	//info!("content_type: {} {:?}", content_type, header.get(axum::http::header::CONTENT_TYPE));
 
 	match content_type {
@@ -306,36 +358,39 @@ pub async fn post_file_blob(
 			let dim = image::get_image_dimensions(&bytes).await?;
 			info!("dimensions: {}/{}", dim.0, dim.1);
 			// Don't set file_id here - it will be computed by FileIdGeneratorTask after variants are created
-			let f_id = app.meta_adapter.create_file(tn_id, meta_adapter::CreateFile {
-				preset,
-				orig_variant_id,
-				file_id: None,
-				owner_tag: None,
-				content_type: content_type.into(),
-				file_name,
-				file_tp: Some("BLOB".into()),
-				created_at: query.created_at,
-				tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
-				x: Some(json!({ "dim": dim })),
-			}).await?;
+			let f_id = app
+				.meta_adapter
+				.create_file(
+					tn_id,
+					meta_adapter::CreateFile {
+						preset,
+						orig_variant_id,
+						file_id: None,
+						owner_tag: None,
+						content_type: content_type.into(),
+						file_name,
+						file_tp: Some("BLOB".into()),
+						created_at: query.created_at,
+						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+						x: Some(json!({ "dim": dim })),
+					},
+				)
+				.await?;
 			match f_id {
 				meta_adapter::FileId::FId(f_id) => {
 					let data = handle_post_image(&app, tn_id, f_id, content_type, &bytes).await?;
-					let response = ApiResponse::new(data)
-						.with_req_id(req_id.unwrap_or_default());
+					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 					Ok((StatusCode::CREATED, Json(response)))
-				},
+				}
 				meta_adapter::FileId::FileId(file_id) => {
 					let data = json!({"fileId": file_id});
-					let response = ApiResponse::new(data)
-						.with_req_id(req_id.unwrap_or_default());
+					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 					Ok((StatusCode::CREATED, Json(response)))
-				},
+				}
 			}
-		},
+		}
 		_ => Err(Error::Unknown),
 	}
-
 }
 
 // vim: ts=4

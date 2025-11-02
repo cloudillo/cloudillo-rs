@@ -54,10 +54,8 @@ fn test_value_to_string() {
 fn test_event_matches_path() {
 	use cloudillo::rtdb_adapter::ChangeEvent;
 
-	let create_event = ChangeEvent::Create {
-		path: "users/doc1".into(),
-		data: Value::Object(Default::default()),
-	};
+	let create_event =
+		ChangeEvent::Create { path: "users/doc1".into(), data: Value::Object(Default::default()) };
 
 	// Exact match
 	assert!(event_matches_path(&create_event, "users/doc1"));
@@ -114,29 +112,20 @@ fn test_matches_filter() {
 
 	// Test greater-than
 	let filter = QueryFilter {
-		greater_than: [("age".to_string(), Value::Number(25.into()))]
-			.iter()
-			.cloned()
-			.collect(),
+		greater_than: [("age".to_string(), Value::Number(25.into()))].iter().cloned().collect(),
 		..Default::default()
 	};
 	assert!(matches_filter(&doc, &filter));
 
 	let filter = QueryFilter {
-		greater_than: [("age".to_string(), Value::Number(35.into()))]
-			.iter()
-			.cloned()
-			.collect(),
+		greater_than: [("age".to_string(), Value::Number(35.into()))].iter().cloned().collect(),
 		..Default::default()
 	};
 	assert!(!matches_filter(&doc, &filter));
 
 	// Test less-than
 	let filter = QueryFilter {
-		less_than: [("age".to_string(), Value::Number(40.into()))]
-			.iter()
-			.cloned()
-			.collect(),
+		less_than: [("age".to_string(), Value::Number(40.into()))].iter().cloned().collect(),
 		..Default::default()
 	};
 	assert!(matches_filter(&doc, &filter));
@@ -145,10 +134,7 @@ fn test_matches_filter() {
 	let filter = QueryFilter {
 		in_array: [(
 			"role".to_string(),
-			vec![
-				Value::String("admin".to_string()),
-				Value::String("developer".to_string()),
-			],
+			vec![Value::String("admin".to_string()), Value::String("developer".to_string())],
 		)]
 		.iter()
 		.cloned()
@@ -158,13 +144,10 @@ fn test_matches_filter() {
 	assert!(matches_filter(&doc, &filter));
 
 	let filter = QueryFilter {
-		in_array: [(
-			"role".to_string(),
-			vec![Value::String("manager".to_string())],
-		)]
-		.iter()
-		.cloned()
-		.collect(),
+		in_array: [("role".to_string(), vec![Value::String("manager".to_string())])]
+			.iter()
+			.cloned()
+			.collect(),
 		..Default::default()
 	};
 	assert!(!matches_filter(&doc, &filter));
@@ -194,10 +177,7 @@ fn test_matches_filter() {
 			.iter()
 			.cloned()
 			.collect(),
-		greater_than: [("age".to_string(), Value::Number(25.into()))]
-			.iter()
-			.cloned()
-			.collect(),
+		greater_than: [("age".to_string(), Value::Number(25.into()))].iter().cloned().collect(),
 		array_contains: [("tags".to_string(), Value::String("admin".to_string()))]
 			.iter()
 			.cloned()
@@ -211,10 +191,7 @@ fn test_matches_filter() {
 fn test_compare_values() {
 	// Numbers
 	assert_eq!(
-		compare_values(
-			Some(&Value::Number(10.into())),
-			Some(&Value::Number(20.into()))
-		),
+		compare_values(Some(&Value::Number(10.into())), Some(&Value::Number(20.into()))),
 		Ordering::Less
 	);
 
@@ -229,12 +206,6 @@ fn test_compare_values() {
 
 	// None comparisons
 	assert_eq!(compare_values(None, None), Ordering::Equal);
-	assert_eq!(
-		compare_values(None, Some(&Value::Number(1.into()))),
-		Ordering::Less
-	);
-	assert_eq!(
-		compare_values(Some(&Value::Number(1.into())), None),
-		Ordering::Greater
-	);
+	assert_eq!(compare_values(None, Some(&Value::Number(1.into()))), Ordering::Less);
+	assert_eq!(compare_values(Some(&Value::Number(1.into())), None), Ordering::Greater);
 }

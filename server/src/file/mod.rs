@@ -3,10 +3,10 @@
 pub mod file;
 pub mod handler;
 pub mod image;
-pub mod store;
-pub mod tag;
 pub mod management;
 pub mod perm;
+pub mod store;
+pub mod tag;
 
 use crate::prelude::*;
 

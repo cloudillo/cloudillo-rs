@@ -1,15 +1,12 @@
 //! File management (PATCH, DELETE) handlers
 
 use axum::{
-	extract::{State, Path},
+	extract::{Path, State},
 	Json,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{
-	prelude::*,
-	core::extract::Auth,
-};
+use crate::{core::extract::Auth, prelude::*};
 
 /// PATCH /file/:fileId - Update file metadata
 #[derive(Deserialize)]
@@ -39,10 +36,7 @@ pub async fn patch_file(
 
 	info!("User {} patched file {}", auth.id_tag, file_id);
 
-	Ok(Json(PatchFileResponse {
-		file_id,
-		file_name: req.file_name,
-	}))
+	Ok(Json(PatchFileResponse { file_id, file_name: req.file_name }))
 }
 
 /// DELETE /file/:fileId - Delete a file
@@ -68,9 +62,7 @@ pub async fn delete_file(
 
 	info!("User {} deleted file {}", auth.id_tag, file_id);
 
-	Ok(Json(DeleteFileResponse {
-		file_id,
-	}))
+	Ok(Json(DeleteFileResponse { file_id }))
 }
 
 // vim: ts=4

@@ -2,12 +2,12 @@
 //!
 //! Tests Create, Read, Update, Delete operations for tenants and profiles
 
-use cloudillo::meta_adapter::{MetaAdapter, ListProfileOptions, UpdateTenantData};
-use cloudillo::types::{TnId, Patch};
 use cloudillo::core::worker::WorkerPool;
+use cloudillo::meta_adapter::{ListProfileOptions, MetaAdapter, UpdateTenantData};
+use cloudillo::types::{Patch, TnId};
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
-use tempfile::TempDir;
 use std::sync::Arc;
+use tempfile::TempDir;
 
 async fn create_test_adapter() -> (MetaAdapterSqlite, TempDir) {
 	let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -29,16 +29,12 @@ async fn test_create_and_read_tenant() {
 	let tn_id = TnId(1);
 
 	// Create a tenant
-	let result = adapter
-		.create_tenant(tn_id, "alice")
-		.await;
+	let result = adapter.create_tenant(tn_id, "alice").await;
 
 	assert!(result.is_ok(), "Should successfully create tenant");
 
 	// Try to read the tenant back
-	let result = adapter
-		.read_tenant(tn_id)
-		.await;
+	let result = adapter.read_tenant(tn_id).await;
 
 	// May succeed or fail depending on database initialization
 	// The important thing is that the methods are callable
@@ -52,9 +48,7 @@ async fn test_create_multiple_tenants() {
 	// Create multiple tenants
 	for i in 1..=3 {
 		let tn_id = TnId(i);
-		let result = adapter
-			.create_tenant(tn_id, &format!("user{}", i))
-			.await;
+		let result = adapter.create_tenant(tn_id, &format!("user{}", i)).await;
 
 		assert!(result.is_ok(), "Should create tenant {}", i);
 	}
@@ -66,10 +60,7 @@ async fn test_update_tenant() {
 	let tn_id = TnId(1);
 
 	// Create a tenant
-	adapter
-		.create_tenant(tn_id, "bob")
-		.await
-		.expect("Should create tenant");
+	adapter.create_tenant(tn_id, "bob").await.expect("Should create tenant");
 
 	// Update tenant with name change
 	let update_data = UpdateTenantData {
@@ -79,9 +70,7 @@ async fn test_update_tenant() {
 		typ: Patch::Undefined,
 	};
 
-	let updated = adapter
-		.update_tenant(tn_id, &update_data)
-		.await;
+	let updated = adapter.update_tenant(tn_id, &update_data).await;
 
 	// Operation should complete
 	assert!(updated.is_ok() || updated.is_err());
@@ -93,15 +82,10 @@ async fn test_read_profile() {
 	let tn_id = TnId(1);
 
 	// Create a tenant first
-	adapter
-		.create_tenant(tn_id, "alice")
-		.await
-		.expect("Should create tenant");
+	adapter.create_tenant(tn_id, "alice").await.expect("Should create tenant");
 
 	// Try to read a profile using the tenant's id_tag
-	let result = adapter
-		.read_profile(tn_id, "alice")
-		.await;
+	let result = adapter.read_profile(tn_id, "alice").await;
 
 	// Should return a tuple or error
 	assert!(result.is_ok() || result.is_err());
@@ -113,10 +97,7 @@ async fn test_list_profiles() {
 	let tn_id = TnId(1);
 
 	// Create a tenant first
-	adapter
-		.create_tenant(tn_id, "alice")
-		.await
-		.expect("Should create tenant");
+	adapter.create_tenant(tn_id, "alice").await.expect("Should create tenant");
 
 	// List profiles for a tenant
 	let opts = ListProfileOptions {
@@ -127,9 +108,7 @@ async fn test_list_profiles() {
 		q: None,
 		id_tag: None,
 	};
-	let result = adapter
-		.list_profiles(tn_id, &opts)
-		.await;
+	let result = adapter.list_profiles(tn_id, &opts).await;
 
 	// Should execute successfully
 	assert!(result.is_ok(), "Should list profiles");
@@ -146,9 +125,7 @@ async fn test_read_nonexistent_tenant() {
 	let nonexistent_id = TnId(9999);
 
 	// Reading nonexistent tenant should error or return error
-	let result = adapter
-		.read_tenant(nonexistent_id)
-		.await;
+	let result = adapter.read_tenant(nonexistent_id).await;
 
 	// Should error since tenant doesn't exist
 	assert!(result.is_err(), "Nonexistent tenant should error");

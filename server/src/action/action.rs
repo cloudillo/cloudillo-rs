@@ -5,12 +5,12 @@ use serde_with::skip_serializing_none;
 use std::sync::Arc;
 
 use crate::{
-	prelude::*,
-	action::{process, ACTION_TYPES, delivery::ActionDeliveryTask},
-	file::file,
+	action::{delivery::ActionDeliveryTask, process, ACTION_TYPES},
 	core::hasher,
-	core::scheduler::{Task, TaskId, RetryPolicy},
+	core::scheduler::{RetryPolicy, Task, TaskId},
+	file::file,
 	meta_adapter,
+	prelude::*,
 };
 
 pub const ACCESS_TOKEN_EXPIRY: i64 = 3600;
@@ -35,26 +35,35 @@ pub struct CreateAction {
 	pub expires_at: Option<Timestamp>,
 }
 
-pub async fn create_action(app: &App, tn_id: TnId, id_tag: &str, action: CreateAction) -> ClResult<Box<str>>{
+pub async fn create_action(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	action: CreateAction,
+) -> ClResult<Box<str>> {
 	let attachments_to_wait = if let Some(attachments) = &action.attachments {
-		attachments.iter().filter(|a| a.starts_with("@")).map(|a| format!("{},{}", tn_id, &a[1..]).into_boxed_str()).collect::<Vec<_>>()
+		attachments
+			.iter()
+			.filter(|a| a.starts_with("@"))
+			.map(|a| format!("{},{}", tn_id, &a[1..]).into_boxed_str())
+			.collect::<Vec<_>>()
 	} else {
 		Vec::new()
 	};
 	info!("Dependencies: {:?}", attachments_to_wait);
-	let deps = app.meta_adapter.list_task_ids(file::FileIdGeneratorTask::kind(), &attachments_to_wait.into_boxed_slice()).await?;
+	let deps = app
+		.meta_adapter
+		.list_task_ids(file::FileIdGeneratorTask::kind(), &attachments_to_wait.into_boxed_slice())
+		.await?;
 	info!("Dependencies: {:?}", deps);
 
 	// Generate action token and action_id deterministically before queuing the task
 	let action_token = app.auth_adapter.create_action_token(tn_id, action.clone()).await?;
 	let action_id = hasher::hash("a", action_token.as_bytes());
 
-	let task = ActionCreatorTask::new(tn_id, Box::from(id_tag), action, action_token, action_id.clone());
-	app.scheduler
-		.task(task)
-		.depend_on(deps)
-		.schedule()
-		.await?;
+	let task =
+		ActionCreatorTask::new(tn_id, Box::from(id_tag), action, action_token, action_id.clone());
+	app.scheduler.task(task).depend_on(deps).schedule().await?;
 
 	Ok(action_id)
 }
@@ -70,15 +79,25 @@ pub struct ActionCreatorTask {
 }
 
 impl ActionCreatorTask {
-	pub fn new(tn_id: TnId, id_tag: Box<str>, action: CreateAction, action_token: Box<str>, action_id: Box<str>) -> Arc<Self> {
+	pub fn new(
+		tn_id: TnId,
+		id_tag: Box<str>,
+		action: CreateAction,
+		action_token: Box<str>,
+		action_id: Box<str>,
+	) -> Arc<Self> {
 		Arc::new(Self { tn_id, id_tag, action, action_token, action_id })
 	}
 }
 
 #[async_trait]
 impl Task<App> for ActionCreatorTask {
-	fn kind() -> &'static str { "action.create" }
-	fn kind_of(&self) -> &'static str { Self::kind() }
+	fn kind() -> &'static str {
+		"action.create"
+	}
+	fn kind_of(&self) -> &'static str {
+		Self::kind()
+	}
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
 		let task: ActionCreatorTask = serde_json::from_str(ctx)?;
@@ -93,7 +112,8 @@ impl Task<App> for ActionCreatorTask {
 		info!("Running task action.create {:?} {:?}", self.tn_id, &self.action);
 
 		// Resolve file attachments
-		let attachments: Option<Vec<Box<str>>> = if let Some(attachments) = &self.action.attachments {
+		let attachments: Option<Vec<Box<str>>> = if let Some(attachments) = &self.action.attachments
+		{
 			let mut attachment_vec: Vec<Box<str>> = Vec::new();
 			for a in attachments {
 				if a.starts_with("@") {
@@ -128,7 +148,9 @@ impl Task<App> for ActionCreatorTask {
 		app.meta_adapter.create_action(self.tn_id, &action, key).await?;
 
 		// Store action token for federation
-		app.meta_adapter.store_action_token(self.tn_id, &self.action_id, &self.action_token).await?;
+		app.meta_adapter
+			.store_action_token(self.tn_id, &self.action_id, &self.action_token)
+			.await?;
 
 		// Determine delivery strategy based on action type
 		let action_config = ACTION_TYPES.get(self.action.typ.as_ref());
@@ -142,13 +164,16 @@ impl Task<App> for ActionCreatorTask {
 
 				// Query for FLLW and CONN actions (same as TypeScript implementation)
 				// The issuer of these actions is the follower
-				let follower_actions = app.meta_adapter.list_actions(
-					self.tn_id,
-					&meta_adapter::ListActionOptions {
-						typ: Some(vec!["FLLW".into(), "CONN".into()]),
-						..Default::default()
-					}
-				).await?;
+				let follower_actions = app
+					.meta_adapter
+					.list_actions(
+						self.tn_id,
+						&meta_adapter::ListActionOptions {
+							typ: Some(vec!["FLLW".into(), "CONN".into()]),
+							..Default::default()
+						},
+					)
+					.await?;
 
 				// Extract unique follower id_tags (the issuers of FLLW/CONN actions)
 				// Exclude self (issuer_tag != id_tag)
@@ -162,7 +187,6 @@ impl Task<App> for ActionCreatorTask {
 
 				recipients = follower_set.into_iter().collect();
 				info!("Broadcasting to {} followers", recipients.len());
-
 			} else if let Some(audience_tag) = &self.action.audience_tag {
 				// Audience mode: send to specific recipient
 				if audience_tag.as_ref() != self.id_tag.as_ref() {
@@ -178,8 +202,8 @@ impl Task<App> for ActionCreatorTask {
 				let delivery_task = ActionDeliveryTask::new(
 					self.tn_id,
 					self.action_id.clone(),
-					recipient_tag.clone(),  // target_instance
-					recipient_tag.clone(),  // target_id_tag
+					recipient_tag.clone(), // target_instance
+					recipient_tag.clone(), // target_id_tag
 				);
 
 				// Use unique key to prevent duplicate delivery tasks
@@ -219,8 +243,12 @@ impl ActionVerifierTask {
 
 #[async_trait]
 impl Task<App> for ActionVerifierTask {
-	fn kind() -> &'static str { "action.verify" }
-	fn kind_of(&self) -> &'static str { Self::kind() }
+	fn kind() -> &'static str {
+		"action.verify"
+	}
+	fn kind_of(&self) -> &'static str {
+		Self::kind()
+	}
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
 		let (tn_id, token) = ctx.split(',').collect_tuple().ok_or(Error::Unknown)?;

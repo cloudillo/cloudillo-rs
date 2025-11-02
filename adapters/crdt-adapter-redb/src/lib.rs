@@ -34,11 +34,11 @@
 //! - In-memory document instance caching with LRU eviction
 //! - Transaction-safe atomic updates
 
-use cloudillo::prelude::*;
 use cloudillo::crdt_adapter::{
 	CrdtAdapter, CrdtChangeEvent, CrdtDocMeta, CrdtSubscriptionOptions, CrdtUpdate,
 };
 use cloudillo::error::{ClResult, Error as ClError};
+use cloudillo::prelude::*;
 use cloudillo::types::TnId;
 use dashmap::DashMap;
 use futures_core::Stream;
@@ -86,12 +86,10 @@ mod tables {
 	use redb::TableDefinition;
 
 	/// Stores binary CRDT updates: (doc_id:update_seq) -> update_bytes
-	pub const TABLE_UPDATES: TableDefinition<&str, &[u8]> =
-		TableDefinition::new("crdt_updates");
+	pub const TABLE_UPDATES: TableDefinition<&str, &[u8]> = TableDefinition::new("crdt_updates");
 
 	/// Stores document metadata: doc_id -> metadata_json
-	pub const TABLE_METADATA: TableDefinition<&str, &str> =
-		TableDefinition::new("crdt_metadata");
+	pub const TABLE_METADATA: TableDefinition<&str, &str> = TableDefinition::new("crdt_metadata");
 
 	/// Stores update counts and sizes: doc_id -> stats_json
 	pub const TABLE_STATS: TableDefinition<&str, &str> = TableDefinition::new("crdt_stats");
@@ -125,8 +123,7 @@ impl DocumentInstance {
 	}
 
 	fn touch(&self) {
-		self.last_accessed
-			.store(Timestamp::now().0 as u64, Ordering::Relaxed);
+		self.last_accessed.store(Timestamp::now().0 as u64, Ordering::Relaxed);
 	}
 
 	#[allow(dead_code)]
@@ -228,10 +225,7 @@ impl CrdtAdapterRedb {
 	}
 
 	/// Get or create a document instance (with broadcaster)
-	async fn get_or_create_instance(
-		&self,
-		doc_id: &str,
-	) -> ClResult<Arc<DocumentInstance>> {
+	async fn get_or_create_instance(&self, doc_id: &str) -> ClResult<Arc<DocumentInstance>> {
 		if let Some(instance) = self.doc_instances.get(doc_id) {
 			instance.touch();
 			return Ok(Arc::clone(&instance));
@@ -241,8 +235,7 @@ impl CrdtAdapterRedb {
 		let (tx, _) = tokio::sync::broadcast::channel(self.config.broadcast_capacity);
 		let instance = Arc::new(DocumentInstance::new(tx));
 
-		self.doc_instances
-			.insert(doc_id.to_string(), Arc::clone(&instance));
+		self.doc_instances.insert(doc_id.to_string(), Arc::clone(&instance));
 
 		Ok(instance)
 	}
@@ -271,9 +264,7 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		let prefix = format!("{}:", doc_id);
 		let range = updates_table
 			.range(prefix.as_str()..)
-			.map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to read updates: {}", e)))
-			})?;
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to read updates: {}", e))))?;
 
 		for item in range {
 			let (key, value) = item.map_err(|e| {
@@ -312,11 +303,9 @@ impl CrdtAdapter for CrdtAdapterRedb {
 			})?;
 
 			let key = Self::make_update_key(doc_id, seq);
-			updates_table
-				.insert(key.as_str(), update.data.as_slice())
-				.map_err(|e| {
-					ClError::from(Error::DbError(format!("Failed to insert update: {}", e)))
-				})?;
+			updates_table.insert(key.as_str(), update.data.as_slice()).map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to insert update: {}", e)))
+			})?;
 		}
 
 		tx.commit().map_err(|e| {
@@ -324,10 +313,7 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		})?;
 
 		// Broadcast to subscribers
-		let event = CrdtChangeEvent {
-			doc_id: doc_id.into(),
-			update: CrdtUpdate::new(update.data),
-		};
+		let event = CrdtChangeEvent { doc_id: doc_id.into(), update: CrdtUpdate::new(update.data) };
 		let _ = instance.broadcaster.send(event);
 
 		trace!("Stored update for doc {} (seq={})", doc_id, seq);
@@ -346,9 +332,10 @@ impl CrdtAdapter for CrdtAdapterRedb {
 			ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e)))
 		})?;
 
-		match metadata_table.get(doc_id).map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to read metadata: {}", e)))
-		})? {
+		match metadata_table
+			.get(doc_id)
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to read metadata: {}", e))))?
+		{
 			Some(value) => {
 				let meta_json = value.value();
 				let meta: CrdtDocMeta = serde_json::from_str(meta_json)?;
@@ -450,11 +437,9 @@ impl CrdtAdapter for CrdtAdapterRedb {
 			let prefix = format!("{}:", doc_id);
 			let mut keys_to_delete = Vec::new();
 			{
-				let range = updates_table
-					.range(prefix.as_str()..)
-					.map_err(|e| {
-						ClError::from(Error::DbError(format!("Failed to read updates: {}", e)))
-					})?;
+				let range = updates_table.range(prefix.as_str()..).map_err(|e| {
+					ClError::from(Error::DbError(format!("Failed to read updates: {}", e)))
+				})?;
 
 				for item in range {
 					let (key, _) = item.map_err(|e| {

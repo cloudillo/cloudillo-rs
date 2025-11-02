@@ -15,13 +15,13 @@
 
 use crate::prelude::*;
 use axum::extract::ws::{Message, WebSocket};
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::collections::HashMap;
-use tokio::sync::RwLock;
-use futures::stream::StreamExt;
 use futures::sink::SinkExt;
 use futures::stream::SplitSink;
+use futures::stream::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Message types for the CRDT protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +139,15 @@ pub async fn handle_crdt_connection(
 					match parse_crdt_message(&ws_msg) {
 						Ok(Some((msg_type, payload))) => {
 							// Handle message
-							handle_crdt_message(&conn_clone, msg_type, &payload, &ws_tx_clone, &app_clone, tn_id).await;
+							handle_crdt_message(
+								&conn_clone,
+								msg_type,
+								&payload,
+								&ws_tx_clone,
+								&app_clone,
+								tn_id,
+							)
+							.await;
 						}
 						Ok(None) => continue, // Skip non-binary messages
 						Err(e) => {
@@ -249,10 +257,18 @@ async fn handle_crdt_message(
 ) {
 	match msg_type {
 		CrdtMessageType::Sync => {
-			debug!("CRDT SYNC message from user {} for doc {} ({} bytes)", conn.user_id, conn.doc_id, payload.len());
+			debug!(
+				"CRDT SYNC message from user {} for doc {} ({} bytes)",
+				conn.user_id,
+				conn.doc_id,
+				payload.len()
+			);
 
 			// Store the update to the CRDT adapter
-			let update = crate::crdt_adapter::CrdtUpdate::with_client(payload.to_vec(), conn.user_id.clone());
+			let update = crate::crdt_adapter::CrdtUpdate::with_client(
+				payload.to_vec(),
+				conn.user_id.clone(),
+			);
 			match app.crdt_adapter.store_update(tn_id, &conn.doc_id, update.clone()).await {
 				Ok(_) => {
 					debug!("CRDT update stored for doc {} from user {}", conn.doc_id, conn.user_id);
@@ -271,7 +287,12 @@ async fn handle_crdt_message(
 			let mut tx = ws_tx.lock().await;
 			match tx.send(ws_msg).await {
 				Ok(_) => {
-					debug!("CRDT SYNC echo sent back to user {} for doc {} ({} bytes)", conn.user_id, conn.doc_id, payload.len());
+					debug!(
+						"CRDT SYNC echo sent back to user {} for doc {} ({} bytes)",
+						conn.user_id,
+						conn.doc_id,
+						payload.len()
+					);
 				}
 				Err(e) => {
 					warn!("Failed to send CRDT SYNC echo to user {}: {}", conn.user_id, e);
@@ -291,12 +312,19 @@ async fn handle_crdt_message(
 					// Update local awareness state if JSON format
 					let mut awareness = conn.awareness.write().await;
 					*awareness = Some(state.clone());
-					debug!("CRDT AWARENESS parsed as JSON from {}: cursor={:?}", conn.user_id, state.cursor);
+					debug!(
+						"CRDT AWARENESS parsed as JSON from {}: cursor={:?}",
+						conn.user_id, state.cursor
+					);
 				}
 			} else {
 				// Binary awareness data that's not UTF-8 - this is normal for Yjs
 				// The actual Yjs library on the client handles this format
-				debug!("CRDT AWARENESS from {} is binary Yjs format ({} bytes)", conn.user_id, payload.len());
+				debug!(
+					"CRDT AWARENESS from {} is binary Yjs format ({} bytes)",
+					conn.user_id,
+					payload.len()
+				);
 			}
 		}
 	}

@@ -2,12 +2,12 @@
 //!
 //! Tests querying and filtering metadata
 
-use cloudillo::meta_adapter::{MetaAdapter, ListActionOptions};
-use cloudillo::types::TnId;
 use cloudillo::core::worker::WorkerPool;
+use cloudillo::meta_adapter::{ListActionOptions, MetaAdapter};
+use cloudillo::types::TnId;
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
-use tempfile::TempDir;
 use std::sync::Arc;
+use tempfile::TempDir;
 
 async fn create_test_adapter() -> (MetaAdapterSqlite, TempDir) {
 	let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -29,16 +29,11 @@ async fn test_list_actions_basic() {
 	let tn_id = TnId(1);
 
 	// Create test tenant
-	adapter
-		.create_tenant(tn_id, "test_user")
-		.await
-		.ok();
+	adapter.create_tenant(tn_id, "test_user").await.ok();
 
 	// List actions with default options
 	let opts = ListActionOptions::default();
-	let result = adapter
-		.list_actions(tn_id, &opts)
-		.await;
+	let result = adapter.list_actions(tn_id, &opts).await;
 
 	// Should execute successfully
 	assert!(result.is_ok(), "Should list actions");
@@ -55,20 +50,12 @@ async fn test_list_actions_with_issuer_filter() {
 	let tn_id = TnId(1);
 
 	// Create test tenant
-	adapter
-		.create_tenant(tn_id, "test_user")
-		.await
-		.ok();
+	adapter.create_tenant(tn_id, "test_user").await.ok();
 
 	// List actions filtered by issuer
-	let opts = ListActionOptions {
-		issuer: Some("alice".into()),
-		..Default::default()
-	};
+	let opts = ListActionOptions { issuer: Some("alice".into()), ..Default::default() };
 
-	let result = adapter
-		.list_actions(tn_id, &opts)
-		.await;
+	let result = adapter.list_actions(tn_id, &opts).await;
 
 	assert!(result.is_ok(), "Should list actions with issuer filter");
 }
@@ -79,20 +66,12 @@ async fn test_list_actions_with_type_filter() {
 	let tn_id = TnId(1);
 
 	// Create test tenant
-	adapter
-		.create_tenant(tn_id, "test_user")
-		.await
-		.ok();
+	adapter.create_tenant(tn_id, "test_user").await.ok();
 
 	// List actions filtered by type
-	let opts = ListActionOptions {
-		typ: Some(vec!["POST".into()]),
-		..Default::default()
-	};
+	let opts = ListActionOptions { typ: Some(vec!["POST".into()]), ..Default::default() };
 
-	let result = adapter
-		.list_actions(tn_id, &opts)
-		.await;
+	let result = adapter.list_actions(tn_id, &opts).await;
 
 	assert!(result.is_ok(), "Should list actions with type filter");
 }
@@ -103,16 +82,11 @@ async fn test_list_action_tokens() {
 	let tn_id = TnId(1);
 
 	// Create test tenant
-	adapter
-		.create_tenant(tn_id, "test_user")
-		.await
-		.ok();
+	adapter.create_tenant(tn_id, "test_user").await.ok();
 
 	// List action tokens
 	let opts = ListActionOptions::default();
-	let result = adapter
-		.list_action_tokens(tn_id, &opts)
-		.await;
+	let result = adapter.list_action_tokens(tn_id, &opts).await;
 
 	// Should execute successfully
 	assert!(result.is_ok(), "Should list action tokens");
@@ -131,9 +105,7 @@ async fn test_list_tasks() {
 	use cloudillo::meta_adapter::ListTaskOptions;
 	let opts = ListTaskOptions::default();
 
-	let result = adapter
-		.list_tasks(opts)
-		.await;
+	let result = adapter.list_tasks(opts).await;
 
 	// Should execute successfully
 	assert!(result.is_ok(), "Should list tasks");

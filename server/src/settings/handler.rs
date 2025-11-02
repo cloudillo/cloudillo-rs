@@ -1,15 +1,15 @@
 //! Settings management handlers
 
 use axum::{
-	extract::{State, Path},
+	extract::{Path, State},
 	http::StatusCode,
 	Json,
 };
 use serde::Deserialize;
 
 use crate::{
-	prelude::*,
 	core::extract::{Auth, OptionalRequestId},
+	prelude::*,
 	types::ApiResponse,
 };
 
@@ -23,8 +23,8 @@ pub async fn list_settings(
 	let items: Vec<_> = settings.into_iter().collect();
 	let total = items.len();
 
-	let response = ApiResponse::with_pagination(items, 0, 20, total)
-		.with_req_id(req_id.unwrap_or_default());
+	let response =
+		ApiResponse::with_pagination(items, 0, 20, total).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -39,8 +39,7 @@ pub async fn get_setting(
 	let setting = app.meta_adapter.read_setting(auth.tn_id, &name).await?;
 	let value = setting.unwrap_or(serde_json::Value::Null);
 
-	let response = ApiResponse::new(value)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(value).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -61,8 +60,7 @@ pub async fn update_setting(
 	app.meta_adapter.update_setting(auth.tn_id, &name, req.value).await?;
 	info!("User {} updated setting {}", auth.id_tag, name);
 
-	let response = ApiResponse::new(())
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }

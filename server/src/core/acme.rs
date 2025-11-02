@@ -1,20 +1,18 @@
 //! ACME subsystem. Handles automatic certificate management using Let's Encrypt.
 
-use std::{
-	sync::Arc,
-};
-use axum::extract::{State};
+use axum::extract::State;
 use axum::http::header::HeaderMap;
 use instant_acme::{self as acme, Account};
-use serde_json;
-use rustls::crypto::{CryptoProvider};
-use rustls::sign::CertifiedKey;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use pem;
-use x509_parser::{parse_x509_certificate};
+use rustls::crypto::CryptoProvider;
+use rustls::sign::CertifiedKey;
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use serde_json;
+use std::sync::Arc;
+use x509_parser::parse_x509_certificate;
 
-use crate::prelude::*;
 use crate::auth_adapter;
+use crate::prelude::*;
 
 #[derive(Debug)]
 struct X509CertData {
@@ -23,19 +21,26 @@ struct X509CertData {
 	expires_at: Timestamp,
 }
 
-pub async fn init(state: App, acme_email: &str, id_tag: &str, app_domain: Option<&str>) -> ClResult<()> {
+pub async fn init(
+	state: App,
+	acme_email: &str,
+	id_tag: &str,
+	app_domain: Option<&str>,
+) -> ClResult<()> {
 	info!("ACME init {}", acme_email);
 
-	let (account, credentials) = Account::builder()?.create(
-		&acme::NewAccount {
-			contact: &[],
-			terms_of_service_agreed: true,
-			only_return_existing: false,
-		},
-		//acme::LetsEncrypt::Staging.url().to_owned(),
-		acme::LetsEncrypt::Production.url().to_owned(),
-		None,
-	).await?;
+	let (account, credentials) = Account::builder()?
+		.create(
+			&acme::NewAccount {
+				contact: &[],
+				terms_of_service_agreed: true,
+				only_return_existing: false,
+			},
+			//acme::LetsEncrypt::Staging.url().to_owned(),
+			acme::LetsEncrypt::Production.url().to_owned(),
+			None,
+		)
+		.await?;
 	info!("ACME credentials {}", serde_json::to_string_pretty(&credentials)?);
 
 	renew_tenant(state, &account, id_tag, 1, app_domain).await?;
@@ -43,7 +48,13 @@ pub async fn init(state: App, acme_email: &str, id_tag: &str, app_domain: Option
 	Ok(())
 }
 
-pub async fn renew_tenant<'a>(state: App, account: &'a acme::Account, id_tag: &'a str, tn_id: u32, app_domain: Option<&'a str>) -> ClResult<()> {
+pub async fn renew_tenant<'a>(
+	state: App,
+	account: &'a acme::Account,
+	id_tag: &'a str,
+	tn_id: u32,
+	app_domain: Option<&'a str>,
+) -> ClResult<()> {
 	let mut domains: Vec<String> = vec!["cl-o.".to_string() + id_tag];
 	if let Some(app_domain) = app_domain {
 		domains.push(app_domain.to_string());
@@ -54,22 +65,32 @@ pub async fn renew_tenant<'a>(state: App, account: &'a acme::Account, id_tag: &'
 
 	let cert = renew_domains(&state, account, domains).await?;
 	info!("ACME cert {}", &cert.expires_at);
-	state.auth_adapter.create_cert(&auth_adapter::CertData {
-		tn_id: TnId(tn_id),
-		id_tag: id_tag.into(),
-		domain: app_domain.unwrap_or(id_tag).into(),
-		key: cert.private_key_pem,
-		cert: cert.certificate_pem,
-		expires_at: cert.expires_at,
-	}).await?;
-	
+	state
+		.auth_adapter
+		.create_cert(&auth_adapter::CertData {
+			tn_id: TnId(tn_id),
+			id_tag: id_tag.into(),
+			domain: app_domain.unwrap_or(id_tag).into(),
+			key: cert.private_key_pem,
+			cert: cert.certificate_pem,
+			expires_at: cert.expires_at,
+		})
+		.await?;
+
 	Ok(())
 }
 
 //async fn renew_domains<'a>(state: &'a App, account: &'a acme::Account, domains: Vec<String>) -> Result<X509CertData, Box<dyn std::error::Error + 'a>> {
-async fn renew_domains<'a>(state: &'a App, account: &'a acme::Account, domains: Vec<String>) -> ClResult<X509CertData> {
+async fn renew_domains<'a>(
+	state: &'a App,
+	account: &'a acme::Account,
+	domains: Vec<String>,
+) -> ClResult<X509CertData> {
 	info!("ACME {:?}", &domains);
-	let identifiers = domains.iter().map(|domain| acme::Identifier::Dns(domain.to_string())).collect::<Vec<_>>();
+	let identifiers = domains
+		.iter()
+		.map(|domain| acme::Identifier::Dns(domain.to_string()))
+		.collect::<Vec<_>>();
 
 	let mut order = account.new_order(&acme::NewOrder::new(identifiers.as_slice())).await?;
 
@@ -89,11 +110,19 @@ async fn renew_domains<'a>(state: &'a App, account: &'a acme::Account, domains: 
 				}
 			}
 
-			let mut challenge = authz.challenge(acme::ChallengeType::Http01).ok_or(acme::Error::Str("no challenge"))?;
+			let mut challenge = authz
+				.challenge(acme::ChallengeType::Http01)
+				.ok_or(acme::Error::Str("no challenge"))?;
 			let identifier = challenge.identifier().to_string().into_boxed_str();
 			let token: Box<str> = challenge.key_authorization().as_str().into();
 			info!("ACME challenge {} {}", identifier, token);
-			state.acme_challenge_map.write().map_err(|_| Error::ServiceUnavailable("failed to access ACME challenge map".into()))?.insert(identifier, token);
+			state
+				.acme_challenge_map
+				.write()
+				.map_err(|_| {
+					Error::ServiceUnavailable("failed to access ACME challenge map".into())
+				})?
+				.insert(identifier, token);
 
 			challenge.set_ready().await?;
 		}
@@ -112,7 +141,13 @@ async fn renew_domains<'a>(state: &'a App, account: &'a acme::Account, domains: 
 
 		// Clean up ACME challenges
 		for domain in domains.iter() {
-			state.acme_challenge_map.write().map_err(|_| Error::ServiceUnavailable("failed to access ACME challenge map".into()))?.remove(domain.as_str());
+			state
+				.acme_challenge_map
+				.write()
+				.map_err(|_| {
+					Error::ServiceUnavailable("failed to access ACME challenge map".into())
+				})?
+				.remove(domain.as_str());
 		}
 
 		let pem = &pem::parse(&cert_chain_pem)?;
@@ -126,7 +161,11 @@ async fn renew_domains<'a>(state: &'a App, account: &'a acme::Account, domains: 
 			CryptoProvider::get_default().ok_or(acme::Error::Str("no crypto provider"))?,
 		)?);
 		for domain in domains.iter() {
-			state.certs.write().map_err(|_| Error::ServiceUnavailable("failed to access cert cache".into()))?.insert(domain.clone().into_boxed_str(), certified_key.clone());
+			state
+				.certs
+				.write()
+				.map_err(|_| Error::ServiceUnavailable("failed to access cert cache".into()))?
+				.insert(domain.clone().into_boxed_str(), certified_key.clone());
 		}
 
 		let cert_data = X509CertData {
@@ -145,10 +184,18 @@ pub async fn get_acme_challenge(
 	State(state): State<App>,
 	headers: HeaderMap,
 ) -> ClResult<Box<str>> {
-	let domain = headers.get("host").ok_or(Error::ValidationError("missing host header".into()))?.to_str()?;
+	let domain = headers
+		.get("host")
+		.ok_or(Error::ValidationError("missing host header".into()))?
+		.to_str()?;
 	info!("ACME challenge for domain {:?}", domain);
 
-	if let Some(token) = state.acme_challenge_map.read().map_err(|_| Error::ServiceUnavailable("failed to access ACME challenge map".into()))?.get(domain) {
+	if let Some(token) = state
+		.acme_challenge_map
+		.read()
+		.map_err(|_| Error::ServiceUnavailable("failed to access ACME challenge map".into()))?
+		.get(domain)
+	{
 		println!("    -> {:?}", &token);
 		Ok(token.clone())
 	} else {

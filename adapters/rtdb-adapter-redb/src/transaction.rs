@@ -58,7 +58,13 @@ impl RedbTransaction {
 	}
 
 	/// Build an index key
-	fn build_index_key(&self, collection: &str, field: &str, value: &Value, doc_id: &str) -> String {
+	fn build_index_key(
+		&self,
+		collection: &str,
+		field: &str,
+		value: &Value,
+		doc_id: &str,
+	) -> String {
 		let value_str = storage::value_to_string(value);
 
 		if self.per_tenant_files {
@@ -97,7 +103,8 @@ impl RedbTransaction {
 		}
 
 		// Now update the indexes
-		let mut index_table = self.tx_mut().open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
+		let mut index_table =
+			self.tx_mut().open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
 
 		for index_key in index_keys {
 			if insert {
@@ -128,7 +135,8 @@ impl Transaction for RedbTransaction {
 
 		// Write document
 		{
-			let mut table = self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+			let mut table =
+				self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 			table.insert(key.as_str(), json.as_str()).map_err(from_redb_error)?;
 		}
 
@@ -139,10 +147,7 @@ impl Transaction for RedbTransaction {
 		self.update_indexes_for_document(path, &doc_id, &data, true).await?;
 
 		// Buffer change event
-		self.pending_events.push(ChangeEvent::Create {
-			path: full_path.into(),
-			data,
-		});
+		self.pending_events.push(ChangeEvent::Create { path: full_path.into(), data });
 
 		Ok(doc_id.into())
 	}
@@ -159,7 +164,8 @@ impl Transaction for RedbTransaction {
 			cached.clone()
 		} else {
 			// Fall back to reading from database
-			let table = self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+			let table =
+				self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 			let result = match table.get(key.as_str()) {
 				Ok(Some(v)) => {
 					let json_str = v.value().to_string();
@@ -173,7 +179,8 @@ impl Transaction for RedbTransaction {
 
 		// Write updated document
 		{
-			let mut table = self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+			let mut table =
+				self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 			table.insert(key.as_str(), json.as_str()).map_err(from_redb_error)?;
 		}
 
@@ -190,10 +197,7 @@ impl Transaction for RedbTransaction {
 		self.update_indexes_for_document(&collection, &doc_id, &data, true).await?;
 
 		// Buffer change event
-		self.pending_events.push(ChangeEvent::Update {
-			path: path.into(),
-			data,
-		});
+		self.pending_events.push(ChangeEvent::Update { path: path.into(), data });
 
 		Ok(())
 	}
@@ -209,7 +213,8 @@ impl Transaction for RedbTransaction {
 			cached.clone()
 		} else {
 			// Fall back to reading from database
-			let table = self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+			let table =
+				self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 			let result = match table.get(key.as_str()) {
 				Ok(Some(v)) => {
 					let json_str = v.value().to_string();
@@ -223,7 +228,8 @@ impl Transaction for RedbTransaction {
 
 		// Delete document
 		{
-			let mut table = self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+			let mut table =
+				self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 			table.remove(key.as_str()).map_err(from_redb_error)?;
 		}
 
@@ -237,9 +243,7 @@ impl Transaction for RedbTransaction {
 		}
 
 		// Buffer change event
-		self.pending_events.push(ChangeEvent::Delete {
-			path: path.into(),
-		});
+		self.pending_events.push(ChangeEvent::Delete { path: path.into() });
 
 		Ok(())
 	}

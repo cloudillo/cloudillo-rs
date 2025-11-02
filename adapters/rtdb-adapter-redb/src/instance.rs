@@ -3,8 +3,8 @@ use cloudillo::prelude::*;
 use cloudillo::rtdb_adapter::ChangeEvent;
 use redb::ReadableDatabase;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// An active database instance with real-time subscription support
@@ -56,7 +56,8 @@ impl DatabaseInstance {
 	/// Load indexed fields from database metadata
 	pub async fn load_indexed_fields(&self) -> ClResult<()> {
 		let tx = self.db.begin_read().map_err(crate::error::from_redb_error)?;
-		let meta_table = tx.open_table(storage::TABLE_METADATA).map_err(crate::error::from_redb_error)?;
+		let meta_table =
+			tx.open_table(storage::TABLE_METADATA).map_err(crate::error::from_redb_error)?;
 
 		let mut indexed_fields = self.indexed_fields.write().await;
 
@@ -77,10 +78,8 @@ impl DatabaseInstance {
 				let collection = &key_str[..key_str.len() - 14]; // Remove "/_meta/indexes"
 
 				if let Ok(fields) = serde_json::from_str::<Vec<String>>(value.value()) {
-					indexed_fields.insert(
-						collection.into(),
-						fields.into_iter().map(|f| f.into()).collect(),
-					);
+					indexed_fields
+						.insert(collection.into(), fields.into_iter().map(|f| f.into()).collect());
 				}
 			}
 		}

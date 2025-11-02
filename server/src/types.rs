@@ -1,8 +1,8 @@
 //! Common types used throughout the Cloudillo platform.
 
+use crate::core::abac::AttrSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::time::SystemTime;
-use crate::core::abac::AttrSet;
 
 // TnId //
 //******//
@@ -107,18 +107,16 @@ impl<'de> Deserialize<'de> for Timestamp {
 /// - `Undefined`: Field not present in JSON - don't change existing value
 /// - `Null`: Field present with null value - set to NULL in database
 /// - `Value(T)`: Field present with value - update to this value
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Patch<T> {
 	/// Field not present in request - no change
 	#[default]
- Undefined,
+	Undefined,
 	/// Field present with null value - delete/set to NULL
 	Null,
 	/// Field present with value - update to this value
 	Value(T),
 }
-
 
 impl<T> Patch<T> {
 	/// Returns true if this is `Undefined`
@@ -261,8 +259,8 @@ pub struct ProfileListResponse {
 #[serde(rename_all = "camelCase")]
 pub struct CreateActionRequest {
 	#[serde(rename = "type")]
-	pub r#type: String,              // "Create", "Update", etc
-	pub sub_type: Option<String>,    // "Note", "Image", etc
+	pub r#type: String, // "Create", "Update", etc
+	pub sub_type: Option<String>, // "Note", "Image", etc
 	pub parent_id: Option<String>,
 	pub root_id: Option<String>,
 	pub content: String,
@@ -304,8 +302,8 @@ pub struct ListActionsQuery {
 #[serde(rename_all = "camelCase")]
 pub struct ReactionRequest {
 	#[serde(rename = "type")]
-	pub r#type: String,           // "Like", "Emoji", etc
-	pub content: Option<String>,  // For emoji: "👍"
+	pub r#type: String, // "Like", "Emoji", etc
+	pub content: Option<String>, // For emoji: "👍"
 }
 
 /// Reaction response
@@ -367,12 +365,7 @@ pub struct ApiResponse<T> {
 impl<T> ApiResponse<T> {
 	/// Create a new response with data and current time
 	pub fn new(data: T) -> Self {
-		Self {
-			data,
-			pagination: None,
-			time: Timestamp::now(),
-			req_id: None,
-		}
+		Self { data, pagination: None, time: Timestamp::now(), req_id: None }
 	}
 
 	/// Create a response with pagination info
@@ -412,13 +405,7 @@ pub struct ErrorDetails {
 impl ErrorResponse {
 	/// Create a new error response with code and message
 	pub fn new(code: String, message: String) -> Self {
-		Self {
-			error: ErrorDetails {
-				code,
-				message,
-				details: None,
-			},
-		}
+		Self { error: ErrorDetails { code, message, details: None } }
 	}
 
 	/// Add additional details to error

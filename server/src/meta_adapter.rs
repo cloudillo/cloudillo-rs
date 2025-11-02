@@ -1,13 +1,13 @@
 //! Adapter that manages metadata. Everything including tenants, profiles, actions, file metadata, etc.
 
 use async_trait::async_trait;
-use std::{cmp::Ordering, fmt::Debug, collections::HashMap};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
+use std::{cmp::Ordering, collections::HashMap, fmt::Debug};
 
 use crate::{
 	prelude::*,
-	types::{Timestamp, TnId, Patch},
+	types::{Patch, Timestamp, TnId},
 };
 
 // Tenants, profiles
@@ -38,7 +38,7 @@ pub enum ProfileConnectionStatus {
 pub enum ProfilePerm {
 	Moderated,
 	Write,
-	Admin
+	Admin,
 }
 
 // Reference / Bookmark types
@@ -127,7 +127,7 @@ pub struct ListProfileOptions {
 pub struct ProfileData {
 	pub id_tag: Box<str>,
 	pub name: Box<str>,
-	pub profile_type: Box<str>,  // "person" or "community"
+	pub profile_type: Box<str>, // "person" or "community"
 	pub profile_pic: Option<Box<str>>,
 	pub cover: Option<Box<str>>,
 	pub description: Option<Box<str>>,
@@ -186,7 +186,7 @@ pub struct CreateOutboundActionOptions {
 
 fn deserialize_split<'de, D>(deserializer: D) -> Result<Option<Vec<Box<str>>>, D::Error>
 where
-    D: serde::Deserializer<'de>,
+	D: serde::Deserializer<'de>,
 {
 	let s = String::deserialize(deserializer)?;
 	Ok(Some(s.split(',').map(|v| v.trim().into()).collect()))
@@ -195,7 +195,7 @@ where
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListActionOptions {
-	#[serde(default, rename="type", deserialize_with = "deserialize_split")]
+	#[serde(default, rename = "type", deserialize_with = "deserialize_split")]
 	pub typ: Option<Vec<Box<str>>>,
 	#[serde(default, deserialize_with = "deserialize_split")]
 	pub status: Option<Vec<Box<str>>>,
@@ -350,7 +350,8 @@ impl<S: AsRef<str> + Debug + Ord> PartialOrd for FileVariant<S> {
 impl<S: AsRef<str> + Debug + Ord> Ord for FileVariant<S> {
 	fn cmp(&self, other: &Self) -> Ordering {
 		//info!("cmp: {:?} vs {:?}", self, other);
-		self.size.cmp(&other.size)
+		self.size
+			.cmp(&other.size)
 			.then_with(|| self.resolution.0.cmp(&other.resolution.0))
 			.then_with(|| self.resolution.1.cmp(&other.resolution.1))
 			.then_with(|| self.size.cmp(&other.size))
@@ -391,7 +392,7 @@ pub struct CreateFileVariant {
 	pub format: Box<str>,
 	pub resolution: (u32, u32),
 	pub size: u64,
-	pub	available: bool,
+	pub available: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -442,35 +443,84 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn delete_tenant(&self, tn_id: TnId) -> ClResult<()>;
 
 	/// Lists all profiles matching a set of options
-	async fn list_profiles(&self, tn_id: TnId, opts: &ListProfileOptions) -> ClResult<Vec<Profile<Box<str>>>>;
+	async fn list_profiles(
+		&self,
+		tn_id: TnId,
+		opts: &ListProfileOptions,
+	) -> ClResult<Vec<Profile<Box<str>>>>;
 
 	/// Reads a profile
 	///
 	/// Returns an `(etag, Profile)` tuple.
-	async fn read_profile(&self, tn_id: TnId, id_tag: &str) -> ClResult<(Box<str>, Profile<Box<str>>)>;
-	async fn create_profile(&self, tn_id: TnId, profile: &Profile<&str>, etag: &str) -> ClResult<()>;
-	async fn update_profile(&self, tn_id: TnId, id_tag: &str, profile: &UpdateProfileData) -> ClResult<()>;
+	async fn read_profile(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+	) -> ClResult<(Box<str>, Profile<Box<str>>)>;
+	async fn create_profile(
+		&self,
+		tn_id: TnId,
+		profile: &Profile<&str>,
+		etag: &str,
+	) -> ClResult<()>;
+	async fn update_profile(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		profile: &UpdateProfileData,
+	) -> ClResult<()>;
 
 	/// Reads the public key of a profile
 	///
 	/// Returns a `(public key, expiration)` tuple.
-	async fn read_profile_public_key(&self, id_tag: &str, key_id: &str) -> ClResult<(Box<str>, Timestamp)>;
-	async fn add_profile_public_key(&self, id_tag: &str, key_id: &str, public_key: &str) -> ClResult<()>;
+	async fn read_profile_public_key(
+		&self,
+		id_tag: &str,
+		key_id: &str,
+	) -> ClResult<(Box<str>, Timestamp)>;
+	async fn add_profile_public_key(
+		&self,
+		id_tag: &str,
+		key_id: &str,
+		public_key: &str,
+	) -> ClResult<()>;
 	/// Process profile refresh
 	/// callback(tn_id: TnId, id_tag: &str, etag: Option<&str>)
 	//async fn process_profile_refresh(&self, callback: FnOnce<(TnId, &str, Option<&str>)>);
 	//async fn process_profile_refresh<'a, F>(&self, callback: F)
 	//	where F: FnOnce(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send;
-	async fn process_profile_refresh<'a>(&self, callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>);
+	async fn process_profile_refresh<'a>(
+		&self,
+		callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>,
+	);
 
 	// Action management
 	//*******************
-	async fn list_actions(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<Vec<ActionView>>;
-	async fn list_action_tokens(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<Box<[Box<str>]>>;
+	async fn list_actions(
+		&self,
+		tn_id: TnId,
+		opts: &ListActionOptions,
+	) -> ClResult<Vec<ActionView>>;
+	async fn list_action_tokens(
+		&self,
+		tn_id: TnId,
+		opts: &ListActionOptions,
+	) -> ClResult<Box<[Box<str>]>>;
 
-	async fn create_action(&self, tn_id: TnId, action: &Action<&str>, key: Option<&str>) -> ClResult<()>;
+	async fn create_action(
+		&self,
+		tn_id: TnId,
+		action: &Action<&str>,
+		key: Option<&str>,
+	) -> ClResult<()>;
 
-	async fn create_inbound_action(&self, tn_id: TnId, action_id: &str, token: &str, ack_token: Option<&str>) -> ClResult<()>;
+	async fn create_inbound_action(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		token: &str,
+		ack_token: Option<&str>,
+	) -> ClResult<()>;
 
 	/// Get the root_id of an action
 	async fn get_action_root_id(&self, tn_id: TnId, action_id: &str) -> ClResult<Box<str>>;
@@ -479,7 +529,11 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn get_action_data(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<ActionData>>;
 
 	/// Get action by key
-	async fn get_action_by_key(&self, tn_id: TnId, action_key: &str) -> ClResult<Option<Action<Box<str>>>>;
+	async fn get_action_by_key(
+		&self,
+		tn_id: TnId,
+		action_key: &str,
+	) -> ClResult<Option<Action<Box<str>>>>;
 
 	/// Store action token for federation (called when action is created)
 	async fn store_action_token(&self, tn_id: TnId, action_id: &str, token: &str) -> ClResult<()>;
@@ -488,47 +542,103 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn get_action_token(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<Box<str>>>;
 
 	/// Update action data (subject, reactions, comments, status)
-	async fn update_action_data(&self, tn_id: TnId, action_id: &str, opts: &UpdateActionDataOptions) -> ClResult<()>;
+	async fn update_action_data(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		opts: &UpdateActionDataOptions,
+	) -> ClResult<()>;
 
 	/// Process pending inbound actions
 	/// callback(tn_id, action_id, token) -> bool (true if processed successfully)
 	/// Returns number of actions processed
-	async fn process_pending_inbound_actions(&self, callback: Box<dyn Fn(TnId, Box<str>, Box<str>) -> ClResult<bool> + Send>) -> ClResult<u32>;
+	async fn process_pending_inbound_actions(
+		&self,
+		callback: Box<dyn Fn(TnId, Box<str>, Box<str>) -> ClResult<bool> + Send>,
+	) -> ClResult<u32>;
 
 	/// Update inbound action status
-	async fn update_inbound_action(&self, tn_id: TnId, action_id: &str, status: Option<char>) -> ClResult<()>;
+	async fn update_inbound_action(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		status: Option<char>,
+	) -> ClResult<()>;
 
 	/// Create outbound action
-	async fn create_outbound_action(&self, tn_id: TnId, action_id: &str, token: &str, opts: &CreateOutboundActionOptions) -> ClResult<()>;
+	async fn create_outbound_action(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		token: &str,
+		opts: &CreateOutboundActionOptions,
+	) -> ClResult<()>;
 
 	/// Process pending outbound actions
 	/// callback(tn_id, action_id, typ, token, recipient_tag) -> bool (true if processed successfully)
 	/// Returns number of actions processed
-	async fn process_pending_outbound_actions(&self, callback: Box<dyn Fn(TnId, Box<str>, Box<str>, Box<str>, Box<str>) -> ClResult<bool> + Send>) -> ClResult<u32>;
+	async fn process_pending_outbound_actions(
+		&self,
+		callback: Box<
+			dyn Fn(TnId, Box<str>, Box<str>, Box<str>, Box<str>) -> ClResult<bool> + Send,
+		>,
+	) -> ClResult<u32>;
 
 	// File management
 	//*****************
 	async fn get_file_id(&self, tn_id: TnId, f_id: u64) -> ClResult<Box<str>>;
 	async fn list_files(&self, tn_id: TnId, opts: ListFileOptions) -> ClResult<Vec<FileView>>;
-	async fn list_file_variants(&self, tn_id: TnId, file_id: FileId<&str>) -> ClResult<Vec<FileVariant<Box<str>>>>;
-	async fn read_file_variant(&self, tn_id: TnId, variant_id: &str) -> ClResult<FileVariant<Box<str>>>;
+	async fn list_file_variants(
+		&self,
+		tn_id: TnId,
+		file_id: FileId<&str>,
+	) -> ClResult<Vec<FileVariant<Box<str>>>>;
+	async fn read_file_variant(
+		&self,
+		tn_id: TnId,
+		variant_id: &str,
+	) -> ClResult<FileVariant<Box<str>>>;
 	async fn create_file(&self, tn_id: TnId, opts: CreateFile) -> ClResult<FileId<Box<str>>>;
-	async fn create_file_variant<'a>(&'a self, tn_id: TnId, f_id: u64, opts: FileVariant<&'a str>) -> ClResult<&'a str>;
+	async fn create_file_variant<'a>(
+		&'a self,
+		tn_id: TnId,
+		f_id: u64,
+		opts: FileVariant<&'a str>,
+	) -> ClResult<&'a str>;
 	async fn update_file_id(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
 
 	// Task scheduler
 	//****************
 	async fn list_tasks(&self, opts: ListTaskOptions) -> ClResult<Vec<Task>>;
 	async fn list_task_ids(&self, kind: &str, keys: &[Box<str>]) -> ClResult<Vec<u64>>;
-	async fn create_task(&self, kind: &'static str, key: Option<&str>, input: &str, deps: &[u64]) -> ClResult<u64>;
+	async fn create_task(
+		&self,
+		kind: &'static str,
+		key: Option<&str>,
+		input: &str,
+		deps: &[u64],
+	) -> ClResult<u64>;
 	async fn update_task_finished(&self, task_id: u64, output: &str) -> ClResult<()>;
-	async fn update_task_error(&self, task_id: u64, output: &str, next_at: Option<Timestamp>) -> ClResult<()>;
+	async fn update_task_error(
+		&self,
+		task_id: u64,
+		output: &str,
+		next_at: Option<Timestamp>,
+	) -> ClResult<()>;
 	async fn update_task_cron(&self, task_id: u64, cron: Option<&str>) -> ClResult<()>;
 
 	// Phase 1: Profile Management
 	//****************************
 	/// Update profile fields (name, description, location, website)
-	async fn update_profile_fields(&self, tn_id: TnId, id_tag: &str, name: Option<&str>, description: Option<&str>, location: Option<&str>, website: Option<&str>) -> ClResult<()>;
+	async fn update_profile_fields(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		name: Option<&str>,
+		description: Option<&str>,
+		location: Option<&str>,
+		website: Option<&str>,
+	) -> ClResult<()>;
 
 	/// Update profile image (profile picture file_id)
 	async fn update_profile_image(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()>;
@@ -537,13 +647,27 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn update_profile_cover(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()>;
 
 	/// List all profiles for a tenant (paginated)
-	async fn list_all_profiles(&self, tn_id: TnId, limit: usize, offset: usize) -> ClResult<Vec<ProfileData>>;
+	async fn list_all_profiles(
+		&self,
+		tn_id: TnId,
+		limit: usize,
+		offset: usize,
+	) -> ClResult<Vec<ProfileData>>;
 
 	/// List all remote profiles in the cache (for profile discovery)
-	async fn list_all_remote_profiles(&self, limit: usize, offset: usize) -> ClResult<Vec<ProfileData>>;
+	async fn list_all_remote_profiles(
+		&self,
+		limit: usize,
+		offset: usize,
+	) -> ClResult<Vec<ProfileData>>;
 
 	/// Search profiles by id_tag or name (case-insensitive partial match)
-	async fn search_profiles(&self, query: &str, limit: usize, offset: usize) -> ClResult<Vec<ProfileData>>;
+	async fn search_profiles(
+		&self,
+		query: &str,
+		limit: usize,
+		offset: usize,
+	) -> ClResult<Vec<ProfileData>>;
 
 	/// Get a single profile by id_tag
 	async fn get_profile_info(&self, tn_id: TnId, id_tag: &str) -> ClResult<ProfileData>;
@@ -554,16 +678,34 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn get_action(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<ActionView>>;
 
 	/// Update action content and attachments (if not yet federated)
-	async fn update_action(&self, tn_id: TnId, action_id: &str, content: Option<&str>, attachments: Option<&[&str]>) -> ClResult<()>;
+	async fn update_action(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		content: Option<&str>,
+		attachments: Option<&[&str]>,
+	) -> ClResult<()>;
 
 	/// Delete an action (soft delete with cleanup)
 	async fn delete_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()>;
 
 	/// Set federation status for an action
-	async fn set_action_federation_status(&self, tn_id: TnId, action_id: &str, status: &str) -> ClResult<()>;
+	async fn set_action_federation_status(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		status: &str,
+	) -> ClResult<()>;
 
 	/// Add a reaction to an action
-	async fn add_reaction(&self, tn_id: TnId, action_id: &str, reactor_id_tag: &str, reaction_type: &str, content: Option<&str>) -> ClResult<()>;
+	async fn add_reaction(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		reactor_id_tag: &str,
+		reaction_type: &str,
+		content: Option<&str>,
+	) -> ClResult<()>;
 
 	/// List all reactions for an action
 	async fn list_reactions(&self, tn_id: TnId, action_id: &str) -> ClResult<Vec<ReactionData>>;
@@ -579,13 +721,22 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	// Settings Management
 	//*********************
 	/// List all settings for a tenant, optionally filtered by prefix
-	async fn list_settings(&self, tn_id: TnId, prefix: Option<&[String]>) -> ClResult<std::collections::HashMap<String, serde_json::Value>>;
+	async fn list_settings(
+		&self,
+		tn_id: TnId,
+		prefix: Option<&[String]>,
+	) -> ClResult<std::collections::HashMap<String, serde_json::Value>>;
 
 	/// Read a single setting by name
 	async fn read_setting(&self, tn_id: TnId, name: &str) -> ClResult<Option<serde_json::Value>>;
 
 	/// Update or delete a setting (None = delete)
-	async fn update_setting(&self, tn_id: TnId, name: &str, value: Option<serde_json::Value>) -> ClResult<()>;
+	async fn update_setting(
+		&self,
+		tn_id: TnId,
+		name: &str,
+		value: Option<serde_json::Value>,
+	) -> ClResult<()>;
 
 	// Reference / Bookmark Management
 	//********************************
@@ -596,7 +747,12 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn get_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<Option<(Box<str>, Box<str>)>>;
 
 	/// Create a new reference
-	async fn create_ref(&self, tn_id: TnId, ref_id: &str, opts: &CreateRefOptions) -> ClResult<RefData>;
+	async fn create_ref(
+		&self,
+		tn_id: TnId,
+		ref_id: &str,
+		opts: &CreateRefOptions,
+	) -> ClResult<RefData>;
 
 	/// Delete a reference
 	async fn delete_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<()>;

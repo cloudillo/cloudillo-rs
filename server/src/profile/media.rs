@@ -1,18 +1,18 @@
 //! Profile image/media handlers
 
 use axum::{
-	extract::{State, Multipart},
+	extract::{Multipart, State},
 	http::StatusCode,
 	Json,
 };
 use serde_json::json;
 
 use crate::{
-	prelude::*,
 	core::{extract::Auth, hasher},
 	error::Error,
-	meta_adapter,
 	file::image,
+	meta_adapter,
+	prelude::*,
 };
 
 /// PUT /me/image - Upload profile picture
@@ -25,12 +25,16 @@ pub async fn put_profile_image(
 	let mut image_data = Vec::new();
 	let mut content_type = String::new();
 
-	while let Some(field) = multipart.next_field().await
+	while let Some(field) = multipart
+		.next_field()
+		.await
 		.map_err(|_| Error::NetworkError("multipart error".into()))?
 	{
 		if field.name() == Some("image") {
 			content_type = field.content_type().unwrap_or("image/jpeg").to_string();
-			image_data = field.bytes().await
+			image_data = field
+				.bytes()
+				.await
 				.map_err(|_| Error::NetworkError("failed to read field bytes".into()))?
 				.to_vec();
 			break;
@@ -54,18 +58,24 @@ pub async fn put_profile_image(
 	info!("Profile image dimensions: {}x{}", dim.0, dim.1);
 
 	// Create file metadata
-	let f_id = app.meta_adapter.create_file(auth.tn_id, meta_adapter::CreateFile {
-		preset: "profile-pic".into(),
-		orig_variant_id,
-		file_id: None,
-		owner_tag: Some(auth.id_tag.as_ref().into()),
-		content_type: content_type.into(),
-		file_name: format!("{}-profile-pic.jpg", auth.id_tag).into(),
-		file_tp: Some("BLOB".into()),
-		created_at: None,
-		tags: Some(vec!["profile".into()]),
-		x: Some(json!({ "dim": dim })),
-	}).await?;
+	let f_id = app
+		.meta_adapter
+		.create_file(
+			auth.tn_id,
+			meta_adapter::CreateFile {
+				preset: "profile-pic".into(),
+				orig_variant_id,
+				file_id: None,
+				owner_tag: Some(auth.id_tag.as_ref().into()),
+				content_type: content_type.into(),
+				file_name: format!("{}-profile-pic.jpg", auth.id_tag).into(),
+				file_tp: Some("BLOB".into()),
+				created_at: None,
+				tags: Some(vec!["profile".into()]),
+				x: Some(json!({ "dim": dim })),
+			},
+		)
+		.await?;
 
 	// Extract file ID
 	let file_id = match f_id {
@@ -77,14 +87,19 @@ pub async fn put_profile_image(
 	};
 
 	// Update profile with new image
-	app.meta_adapter.update_profile_image(auth.tn_id, &auth.id_tag, &file_id).await?;
+	app.meta_adapter
+		.update_profile_image(auth.tn_id, &auth.id_tag, &file_id)
+		.await?;
 
 	info!("User {} uploaded profile image: {}", auth.id_tag, file_id);
 
-	Ok((StatusCode::OK, Json(json!({
-		"fileId": file_id,
-		"type": "profile-pic"
-	}))))
+	Ok((
+		StatusCode::OK,
+		Json(json!({
+			"fileId": file_id,
+			"type": "profile-pic"
+		})),
+	))
 }
 
 /// PUT /me/cover - Upload cover image
@@ -97,12 +112,16 @@ pub async fn put_cover_image(
 	let mut image_data = Vec::new();
 	let mut content_type = String::new();
 
-	while let Some(field) = multipart.next_field().await
+	while let Some(field) = multipart
+		.next_field()
+		.await
 		.map_err(|_| Error::NetworkError("multipart error".into()))?
 	{
 		if field.name() == Some("image") {
 			content_type = field.content_type().unwrap_or("image/jpeg").to_string();
-			image_data = field.bytes().await
+			image_data = field
+				.bytes()
+				.await
 				.map_err(|_| Error::NetworkError("failed to read field bytes".into()))?
 				.to_vec();
 			break;
@@ -126,18 +145,24 @@ pub async fn put_cover_image(
 	info!("Cover image dimensions: {}x{}", dim.0, dim.1);
 
 	// Create file metadata
-	let f_id = app.meta_adapter.create_file(auth.tn_id, meta_adapter::CreateFile {
-		preset: "cover".into(),
-		orig_variant_id,
-		file_id: None,
-		owner_tag: Some(auth.id_tag.as_ref().into()),
-		content_type: content_type.into(),
-		file_name: format!("{}-cover.jpg", auth.id_tag).into(),
-		file_tp: Some("BLOB".into()),
-		created_at: None,
-		tags: Some(vec!["cover".into()]),
-		x: Some(json!({ "dim": dim })),
-	}).await?;
+	let f_id = app
+		.meta_adapter
+		.create_file(
+			auth.tn_id,
+			meta_adapter::CreateFile {
+				preset: "cover".into(),
+				orig_variant_id,
+				file_id: None,
+				owner_tag: Some(auth.id_tag.as_ref().into()),
+				content_type: content_type.into(),
+				file_name: format!("{}-cover.jpg", auth.id_tag).into(),
+				file_tp: Some("BLOB".into()),
+				created_at: None,
+				tags: Some(vec!["cover".into()]),
+				x: Some(json!({ "dim": dim })),
+			},
+		)
+		.await?;
 
 	// Extract file ID
 	let file_id = match f_id {
@@ -149,14 +174,19 @@ pub async fn put_cover_image(
 	};
 
 	// Update profile with new cover
-	app.meta_adapter.update_profile_cover(auth.tn_id, &auth.id_tag, &file_id).await?;
+	app.meta_adapter
+		.update_profile_cover(auth.tn_id, &auth.id_tag, &file_id)
+		.await?;
 
 	info!("User {} uploaded cover image: {}", auth.id_tag, file_id);
 
-	Ok((StatusCode::OK, Json(json!({
-		"fileId": file_id,
-		"type": "cover"
-	}))))
+	Ok((
+		StatusCode::OK,
+		Json(json!({
+			"fileId": file_id,
+			"type": "cover"
+		})),
+	))
 }
 
 // vim: ts=4
