@@ -1,0 +1,148 @@
+//! File tagging system
+//!
+//! Manages tags associated with files for organization and categorization.
+
+use sqlx::{Row, SqlitePool};
+
+use cloudillo::prelude::*;
+
+/// List all tags with optional prefix filtering
+pub(crate) async fn list(
+	db: &SqlitePool,
+	tn_id: TnId,
+	prefix: Option<&str>,
+) -> ClResult<Vec<String>> {
+	let rows = if let Some(p) = prefix {
+		sqlx::query(
+			"SELECT DISTINCT tag FROM tags WHERE tn_id = ? AND tag LIKE ? || '%' ORDER BY tag",
+		)
+		.bind(tn_id.0)
+		.bind(p)
+		.fetch_all(db)
+		.await
+		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.map_err(|_| Error::DbError)?
+	} else {
+		sqlx::query("SELECT DISTINCT tag FROM tags WHERE tn_id = ? ORDER BY tag")
+			.bind(tn_id.0)
+			.fetch_all(db)
+			.await
+			.inspect_err(|err| warn!("DB: {:#?}", err))
+			.map_err(|_| Error::DbError)?
+	};
+
+	Ok(rows
+		.iter()
+		.map(|row| {
+			let tag: String = row.get("tag");
+			tag
+		})
+		.collect())
+}
+
+/// Add a tag to a file
+pub(crate) async fn add(
+	db: &SqlitePool,
+	tn_id: TnId,
+	file_id: &str,
+	tag: &str,
+) -> ClResult<Vec<String>> {
+	// Fetch current tags
+	let row = sqlx::query("SELECT tags FROM files WHERE tn_id = ? AND file_id = ?")
+		.bind(tn_id.0)
+		.bind(file_id)
+		.fetch_optional(db)
+		.await
+		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.map_err(|_| Error::DbError)?;
+
+	if row.is_none() {
+		return Err(Error::NotFound);
+	}
+
+	let row = row.unwrap();
+	let tags_str: Option<String> = row.get("tags");
+	let mut tags: Vec<String> = tags_str
+		.map(|s| s.split(',').map(|t| t.to_string()).collect())
+		.unwrap_or_default();
+
+	// Add tag if not already present
+	if !tags.contains(&tag.to_string()) {
+		tags.push(tag.to_string());
+	}
+
+	// Update file tags
+	let tags_str = tags.join(",");
+	sqlx::query("UPDATE files SET tags = ? WHERE tn_id = ? AND file_id = ?")
+		.bind(&tags_str)
+		.bind(tn_id.0)
+		.bind(file_id)
+		.execute(db)
+		.await
+		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.map_err(|_| Error::DbError)?;
+
+	// Ensure tag exists in global tags table
+	sqlx::query("INSERT OR IGNORE INTO tags (tn_id, tag) VALUES (?, ?)")
+		.bind(tn_id.0)
+		.bind(tag)
+		.execute(db)
+		.await
+		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.map_err(|_| Error::DbError)?;
+
+	Ok(tags)
+}
+
+/// Remove a tag from a file
+pub(crate) async fn remove(
+	db: &SqlitePool,
+	tn_id: TnId,
+	file_id: &str,
+	tag: &str,
+) -> ClResult<Vec<String>> {
+	// Fetch current tags
+	let row = sqlx::query("SELECT tags FROM files WHERE tn_id = ? AND file_id = ?")
+		.bind(tn_id.0)
+		.bind(file_id)
+		.fetch_optional(db)
+		.await
+		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.map_err(|_| Error::DbError)?;
+
+	if row.is_none() {
+		return Err(Error::NotFound);
+	}
+
+	let row = row.unwrap();
+	let tags_str: Option<String> = row.get("tags");
+	let mut tags: Vec<String> = tags_str
+		.map(|s| s.split(',').map(|t| t.to_string()).collect())
+		.unwrap_or_default();
+
+	// Remove tag
+	tags.retain(|t| t != tag);
+
+	// Update file tags (or set to NULL if empty)
+	if tags.is_empty() {
+		sqlx::query("UPDATE files SET tags = NULL WHERE tn_id = ? AND file_id = ?")
+			.bind(tn_id.0)
+			.bind(file_id)
+			.execute(db)
+			.await
+			.inspect_err(|err| warn!("DB: {:#?}", err))
+			.map_err(|_| Error::DbError)?;
+	} else {
+		let tags_str = tags.join(",");
+		sqlx::query("UPDATE files SET tags = ? WHERE tn_id = ? AND file_id = ?")
+			.bind(&tags_str)
+			.bind(tn_id.0)
+			.bind(file_id)
+			.execute(db)
+			.await
+			.inspect_err(|err| warn!("DB: {:#?}", err))
+			.map_err(|_| Error::DbError)?;
+	}
+
+	Ok(tags)
+}

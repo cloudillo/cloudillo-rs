@@ -547,14 +547,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		opts: &UpdateActionDataOptions,
 	) -> ClResult<()>;
 
-	/// Process pending inbound actions
-	/// callback(tn_id, action_id, token) -> bool (true if processed successfully)
-	/// Returns number of actions processed
-	async fn process_pending_inbound_actions(
-		&self,
-		callback: Box<dyn Fn(TnId, Box<str>, Box<str>) -> ClResult<bool> + Send>,
-	) -> ClResult<u32>;
-
 	/// Update inbound action status
 	async fn update_inbound_action(
 		&self,
@@ -571,16 +563,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		token: &str,
 		opts: &CreateOutboundActionOptions,
 	) -> ClResult<()>;
-
-	/// Process pending outbound actions
-	/// callback(tn_id, action_id, typ, token, recipient_tag) -> bool (true if processed successfully)
-	/// Returns number of actions processed
-	async fn process_pending_outbound_actions(
-		&self,
-		callback: Box<
-			dyn Fn(TnId, Box<str>, Box<str>, Box<str>, Box<str>) -> ClResult<bool> + Send,
-		>,
-	) -> ClResult<u32>;
 
 	// File management
 	//*****************
