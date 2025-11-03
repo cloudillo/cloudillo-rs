@@ -1,14 +1,13 @@
-#![allow(unused)]
-
-use async_trait::async_trait;
-use futures_core::Stream;
 use std::{
 	fmt::Debug,
 	path::{Path, PathBuf},
 	pin::Pin,
 };
+
+use async_trait::async_trait;
+use futures_core::Stream;
 use tokio::{
-	fs::{File, *},
+	fs::{create_dir_all, metadata, remove_file, rename, File},
 	io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
 };
 use tokio_util::{bytes::Bytes, io::ReaderStream};
@@ -58,7 +57,7 @@ pub struct BlobAdapterFs {
 
 impl BlobAdapterFs {
 	pub async fn new(base_dir: Box<Path>) -> Result<Self, Error> {
-		tokio::fs::create_dir_all(&base_dir).await?;
+		create_dir_all(&base_dir).await?;
 		Ok(Self { base_dir })
 	}
 }
@@ -71,13 +70,14 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		tn_id: TnId,
 		file_id: &str,
 		data: &[u8],
-		opts: &blob_adapter::CreateBlobOptions,
+		_opts: &blob_adapter::CreateBlobOptions,
 	) -> ClResult<()> {
 		info!("create_blob_buf: {:?}", obj_file_path(&self.base_dir, tn_id, file_id)?);
-		tokio::fs::create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
+		create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
 
 		let mut file = File::create(obj_file_path(&self.base_dir, tn_id, file_id)?).await?;
 		file.write_all(data).await?;
+		file.sync_all().await?;
 
 		Ok(())
 	}
@@ -89,7 +89,7 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		file_id: &str,
 		stream: &mut (dyn AsyncRead + Send + Unpin),
 	) -> ClResult<()> {
-		tokio::fs::create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
+		create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
 
 		let tmp_path = obj_tmp_file_path(&self.base_dir, tn_id, file_id)?;
 		info!("  attachment tmpfile: {:?}", &tmp_path);
@@ -108,14 +108,14 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 			}
 			let id = hasher.finalize("b");
 
-			tokio::fs::rename(&tmp_path, obj_file_path(&self.base_dir, tn_id, &id)?).await?;
+			rename(&tmp_path, obj_file_path(&self.base_dir, tn_id, &id)?).await?;
 			info!("  attachment downloaded, check: {} ?= {}", &id, &file_id);
 			Ok::<(), Error>(())
 		}
 		.await;
 		if res.is_err() {
 			info!("  attachment download failed, removing tmpfile: {:?}", &tmp_path);
-			tokio::fs::remove_file(&tmp_path).await?;
+			remove_file(&tmp_path).await?;
 		}
 
 		Ok(())
@@ -124,17 +124,17 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 	/// Checks if a blob exists, returns its size
 	async fn stat_blob(&self, tn_id: TnId, blob_id: &str) -> Option<u64> {
 		let path = obj_file_path(&self.base_dir, tn_id, blob_id).ok()?;
-		let metadata = tokio::fs::metadata(&path).await.ok()?;
-		Some(metadata.len())
+		let file_metadata = metadata(&path).await.ok()?;
+		Some(file_metadata.len())
 	}
 
 	/// Reads a blob
 	async fn read_blob_buf(&self, tn_id: TnId, blob_id: &str) -> ClResult<Box<[u8]>> {
 		let mut file = File::open(obj_file_path(&self.base_dir, tn_id, blob_id)?).await?;
 		let mut buf: Vec<u8> = Vec::new();
-		file.read_to_end(&mut buf).await;
+		file.read_to_end(&mut buf).await?;
 
-		Ok(Box::from([]))
+		Ok(buf.into_boxed_slice())
 	}
 
 	/// Reads a blob
@@ -153,8 +153,12 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 	}
 }
 
+#[cfg(test)]
 mod test {
-	use super::*;
+	use std::path::{Path, PathBuf};
+
+	use crate::obj_dir;
+	use cloudillo::types::TnId;
 
 	#[test]
 	fn test_obj_dir() {
