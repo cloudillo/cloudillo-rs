@@ -48,7 +48,10 @@ pub async fn post_action(
 		.meta_adapter
 		.list_actions(
 			tn_id,
-			&meta_adapter::ListActionOptions { action_id: Some(action_id), ..Default::default() },
+			&meta_adapter::ListActionOptions {
+				action_id: Some(action_id.to_string()),
+				..Default::default()
+			},
 		)
 		.await?;
 	if list.len() != 1 {
@@ -65,8 +68,8 @@ pub async fn post_action(
 
 #[derive(Deserialize)]
 pub struct Inbox {
-	token: Box<str>,
-	related: Option<Vec<Box<str>>>,
+	token: String,
+	related: Option<Vec<String>>,
 }
 
 #[axum::debug_handler]
@@ -86,7 +89,7 @@ pub async fn post_inbox(
 
 	let _action_id = hash("a", action.token.as_bytes());
 
-	let task = ActionVerifierTask::new(tn_id, action.token);
+	let task = ActionVerifierTask::new(tn_id, action.token.into());
 	let _task_id = app.scheduler.task(task).now().await?;
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());

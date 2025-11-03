@@ -149,8 +149,8 @@ pub trait AuthAdapter: Debug + Send + Sync {
 
 	// Password management
 	async fn create_tenant_login(&self, id_tag: &str) -> ClResult<AuthLogin>;
-	async fn check_tenant_password(&self, id_tag: &str, password: Box<str>) -> ClResult<AuthLogin>;
-	async fn update_tenant_password(&self, id_tag: &str, password: Box<str>) -> ClResult<()>;
+	async fn check_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<AuthLogin>;
+	async fn update_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<()>;
 
 	// Certificate management
 	async fn create_cert(&self, cert_data: &CertData) -> ClResult<()>;

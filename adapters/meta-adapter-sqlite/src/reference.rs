@@ -103,7 +103,7 @@ pub(crate) async fn create(
 	)
 		.bind(tn_id.0)
 		.bind(ref_id)
-		.bind(opts.typ.as_ref())
+		.bind(opts.typ.as_str())
 		.bind(opts.description.as_deref())
 		.bind(now.0)
 		.bind(opts.expires_at.map(|t| t.0))
@@ -115,8 +115,8 @@ pub(crate) async fn create(
 
 	Ok(RefData {
 		ref_id: ref_id.into(),
-		r#type: opts.typ.clone(),
-		description: opts.description.clone(),
+		r#type: opts.typ.clone().into(),
+		description: opts.description.clone().map(|d| d.into()),
 		created_at: now,
 		expires_at: opts.expires_at,
 		count: opts.count.unwrap_or(0),

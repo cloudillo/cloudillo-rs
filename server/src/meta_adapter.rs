@@ -59,13 +59,13 @@ pub struct RefData {
 }
 
 pub struct ListRefsOptions {
-	pub typ: Option<Box<str>>,
-	pub filter: Option<Box<str>>, // 'active', 'used', 'expired', 'all'
+	pub typ: Option<String>,
+	pub filter: Option<String>, // 'active', 'used', 'expired', 'all'
 }
 
 pub struct CreateRefOptions {
-	pub typ: Box<str>,
-	pub description: Option<Box<str>>,
+	pub typ: String,
+	pub description: Option<String>,
 	pub expires_at: Option<Timestamp>,
 	pub count: Option<u32>,
 }
@@ -92,9 +92,9 @@ pub struct Tenant<S: AsRef<str>> {
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateTenantData {
 	#[serde(rename = "idTag", default)]
-	pub id_tag: Patch<Box<str>>,
+	pub id_tag: Patch<String>,
 	#[serde(default)]
-	pub name: Patch<Box<str>>,
+	pub name: Patch<String>,
 	#[serde(rename = "type", default)]
 	pub typ: Patch<ProfileType>,
 }
@@ -116,8 +116,8 @@ pub struct ListProfileOptions {
 	pub status: Option<Box<[ProfileStatus]>>,
 	pub connected: Option<ProfileConnectionStatus>,
 	pub following: Option<bool>,
-	pub q: Option<Box<str>>,
-	pub id_tag: Option<Box<str>>,
+	pub q: Option<String>,
+	pub id_tag: Option<String>,
 }
 
 /// Profile data returned from adapter queries
@@ -170,44 +170,44 @@ pub struct ActionData {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateActionDataOptions {
-	pub subject: Option<Box<str>>,
+	pub subject: Option<String>,
 	pub reactions: Option<u32>,
 	pub comments: Option<u32>,
-	pub status: Option<Box<str>>,
+	pub status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CreateOutboundActionOptions {
-	pub recipient_tag: Box<str>,
-	pub typ: Box<str>,
+	pub recipient_tag: String,
+	pub typ: String,
 }
 
-fn deserialize_split<'de, D>(deserializer: D) -> Result<Option<Vec<Box<str>>>, D::Error>
+fn deserialize_split<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
 	D: serde::Deserializer<'de>,
 {
 	let s = String::deserialize(deserializer)?;
-	Ok(Some(s.split(',').map(|v| v.trim().into()).collect()))
+	Ok(Some(s.split(',').map(|v| v.trim().to_string()).collect()))
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListActionOptions {
 	#[serde(default, rename = "type", deserialize_with = "deserialize_split")]
-	pub typ: Option<Vec<Box<str>>>,
+	pub typ: Option<Vec<String>>,
 	#[serde(default, deserialize_with = "deserialize_split")]
-	pub status: Option<Vec<Box<str>>>,
-	pub tag: Option<Box<str>>,
-	pub issuer: Option<Box<str>>,
-	pub audience: Option<Box<str>>,
-	pub involved: Option<Box<str>>,
+	pub status: Option<Vec<String>>,
+	pub tag: Option<String>,
+	pub issuer: Option<String>,
+	pub audience: Option<String>,
+	pub involved: Option<String>,
 	#[serde(rename = "actionId")]
-	pub action_id: Option<Box<str>>,
+	pub action_id: Option<String>,
 	#[serde(rename = "parentId")]
-	pub parent_id: Option<Box<str>>,
+	pub parent_id: Option<String>,
 	#[serde(rename = "rootId")]
-	pub root_id: Option<Box<str>>,
-	pub subject: Option<Box<str>>,
+	pub root_id: Option<String>,
+	pub subject: Option<String>,
 	#[serde(rename = "createdAfter")]
 	pub created_after: Option<Timestamp>,
 	pub _limit: Option<u32>,
@@ -361,13 +361,13 @@ impl<S: AsRef<str> + Debug + Ord> Ord for FileVariant<S> {
 pub struct ListFileOptions {
 	pub _limit: Option<u32>,
 	#[serde(rename = "fileId")]
-	pub file_id: Option<Box<str>>,
-	pub tag: Option<Box<str>>,
-	pub preset: Option<Box<str>>,
-	pub variant: Option<Box<str>>,
+	pub file_id: Option<String>,
+	pub tag: Option<String>,
+	pub preset: Option<String>,
+	pub variant: Option<String>,
 	pub status: Option<FileStatus>,
 	#[serde(rename = "fileTp")]
-	pub file_type: Option<Box<str>>,
+	pub file_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -396,9 +396,9 @@ pub struct CreateFileVariant {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateFileOptions {
 	#[serde(rename = "fileName")]
-	file_name: Option<Box<str>>,
+	file_name: Option<String>,
 	created_at: Option<Timestamp>,
-	status: Option<Box<str>>,
+	status: Option<String>,
 }
 
 // Tasks
@@ -567,7 +567,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	// File management
 	//*****************
 	async fn get_file_id(&self, tn_id: TnId, f_id: u64) -> ClResult<Box<str>>;
-	async fn list_files(&self, tn_id: TnId, opts: ListFileOptions) -> ClResult<Vec<FileView>>;
+	async fn list_files(&self, tn_id: TnId, opts: &ListFileOptions) -> ClResult<Vec<FileView>>;
 	async fn list_file_variants(
 		&self,
 		tn_id: TnId,
@@ -770,14 +770,14 @@ mod tests {
 		assert!(opts.status.is_some());
 		let statuses = opts.status.unwrap();
 		assert_eq!(statuses.len(), 2);
-		assert_eq!(statuses[0].as_ref(), "C");
-		assert_eq!(statuses[1].as_ref(), "N");
+		assert_eq!(statuses[0].as_str(), "C");
+		assert_eq!(statuses[1].as_str(), "N");
 
 		assert!(opts.typ.is_some());
 		let types = opts.typ.unwrap();
 		assert_eq!(types.len(), 2);
-		assert_eq!(types[0].as_ref(), "POST");
-		assert_eq!(types[1].as_ref(), "REPLY");
+		assert_eq!(types[0].as_str(), "POST");
+		assert_eq!(types[1].as_str(), "REPLY");
 	}
 
 	#[test]
@@ -798,7 +798,7 @@ mod tests {
 		assert!(opts.status.is_some());
 		let statuses = opts.status.unwrap();
 		assert_eq!(statuses.len(), 1);
-		assert_eq!(statuses[0].as_ref(), "C");
+		assert_eq!(statuses[0].as_str(), "C");
 	}
 }
 

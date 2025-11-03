@@ -21,7 +21,7 @@ pub(crate) async fn get_id(db: &SqlitePool, tn_id: TnId, f_id: u64) -> ClResult<
 pub(crate) async fn list(
 	db: &SqlitePool,
 	tn_id: TnId,
-	opts: ListFileOptions,
+	opts: &ListFileOptions,
 ) -> ClResult<Vec<FileView>> {
 	let mut query = sqlx::QueryBuilder::new(
 		"SELECT f.file_id, f.file_name, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type,
@@ -33,7 +33,7 @@ pub(crate) async fn list(
 	query.push_bind(tn_id.0);
 
 	if let Some(file_id) = &opts.file_id {
-		query.push(" AND f.file_id=").push_bind(file_id.as_ref());
+		query.push(" AND f.file_id=").push_bind(file_id.as_str());
 	}
 
 	if let Some(tag) = &opts.tag {
@@ -41,11 +41,11 @@ pub(crate) async fn list(
 	}
 
 	if let Some(preset) = &opts.preset {
-		query.push(" AND f.preset=").push_bind(preset.as_ref());
+		query.push(" AND f.preset=").push_bind(preset.as_str());
 	}
 
 	if let Some(file_type) = &opts.file_type {
-		query.push(" AND f.file_tp=").push_bind(file_type.as_ref());
+		query.push(" AND f.file_tp=").push_bind(file_type.as_str());
 	}
 
 	if let Some(status) = opts.status {
@@ -218,9 +218,9 @@ pub(crate) async fn create(
 	let status = "P";
 	let created_at =
 		if let Some(created_at) = opts.created_at { created_at } else { Timestamp::now() };
-	let file_tp = opts.file_tp.unwrap_or_else(|| "BLOB".into()); // Default to BLOB if not specified
+	let file_tp = opts.file_tp.as_deref().unwrap_or("BLOB"); // Default to BLOB if not specified
 	let res = sqlx::query("INSERT OR IGNORE INTO files (tn_id, file_id, status, owner_tag, preset, content_type, file_name, file_tp, created_at, tags, x) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
-		.bind(tn_id.0).bind(opts.file_id).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(file_tp.as_ref()).bind(created_at.0).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x)
+		.bind(tn_id.0).bind(opts.file_id).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x)
 		.fetch_one(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 	Ok(FileId::FId(res.get(0)))

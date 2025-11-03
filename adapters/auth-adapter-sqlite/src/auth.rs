@@ -69,7 +69,7 @@ pub(crate) async fn check_tenant_password(
 	db: &SqlitePool,
 	worker: &Arc<WorkerPool>,
 	id_tag: &str,
-	password: Box<str>,
+	password: &str,
 	jwt_secret_str: &str,
 ) -> ClResult<AuthLogin> {
 	let res = sqlx::query("SELECT tn_id, id_tag, password, roles FROM tenants WHERE id_tag = ?1")
@@ -114,7 +114,7 @@ pub(crate) async fn update_tenant_password(
 	db: &SqlitePool,
 	worker: &Arc<WorkerPool>,
 	id_tag: &str,
-	password: Box<str>,
+	password: &str,
 ) -> ClResult<()> {
 	let password_hash = crypto::generate_password_hash(worker, password).await?;
 	let _res = sqlx::query("UPDATE tenants SET password=?2 WHERE id_tag = ?1")

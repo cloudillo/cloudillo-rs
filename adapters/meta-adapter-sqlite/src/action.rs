@@ -196,7 +196,7 @@ pub(crate) async fn list_tokens(
 	}
 
 	if let Some(action_id) = &opts.action_id {
-		query.push(" AND a.action_id=").push_bind(action_id.as_ref());
+		query.push(" AND a.action_id=").push_bind(action_id.as_str());
 	}
 
 	query.push(" ORDER BY a.created_at DESC LIMIT 100");
@@ -422,7 +422,7 @@ pub(crate) async fn update_data(
 		if has_updates {
 			query.push(", ");
 		}
-		query.push("subject=").push_bind(subject.as_ref());
+		query.push("subject=").push_bind(subject.as_str());
 		has_updates = true;
 	}
 
@@ -446,7 +446,7 @@ pub(crate) async fn update_data(
 		if has_updates {
 			query.push(", ");
 		}
-		query.push("status=").push_bind(status.as_ref());
+		query.push("status=").push_bind(status.as_str());
 		has_updates = true;
 	}
 
@@ -510,9 +510,9 @@ pub(crate) async fn create_outbound(
 		VALUES (?, ?, ?, ?, ?, 'P', unixepoch())")
 		.bind(tn_id.0)
 		.bind(action_id)
-		.bind(opts.typ.as_ref())
+		.bind(opts.typ.as_str())
 		.bind(token)
-		.bind(opts.recipient_tag.as_ref())
+		.bind(opts.recipient_tag.as_str())
 		.execute(db).await
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;

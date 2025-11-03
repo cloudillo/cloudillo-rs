@@ -34,8 +34,8 @@ pub async fn list_refs(
 #[derive(Deserialize)]
 pub struct ListRefsQuery {
 	#[serde(rename = "type")]
-	pub r#type: Option<Box<str>>,
-	pub filter: Option<Box<str>>,
+	pub r#type: Option<String>,
+	pub filter: Option<String>,
 }
 
 /// GET /ref/:refId - Get a reference and redirect
@@ -69,9 +69,9 @@ pub struct CreateRefRequest {
 #[derive(Serialize)]
 pub struct CreateRefResponse {
 	#[serde(rename = "refId")]
-	pub ref_id: Box<str>,
-	pub r#type: Box<str>,
-	pub description: Option<Box<str>>,
+	pub ref_id: String,
+	pub r#type: String,
+	pub description: Option<String>,
 	#[serde(rename = "createdAt")]
 	pub created_at: i64,
 	#[serde(rename = "expiresAt")]
@@ -89,8 +89,8 @@ pub async fn create_ref(
 	let ref_id = uuid::Uuid::new_v4().to_string().replace("-", "")[..12].to_string();
 
 	let opts = crate::meta_adapter::CreateRefOptions {
-		typ: req.r#type.into(),
-		description: req.description.map(Into::into),
+		typ: req.r#type,
+		description: req.description,
 		expires_at: req.expires_at,
 		count: req.count,
 	};
@@ -100,9 +100,9 @@ pub async fn create_ref(
 	info!("User {} created reference {}", auth.id_tag, ref_id);
 
 	let create_ref_response = CreateRefResponse {
-		ref_id: ref_data.ref_id,
-		r#type: ref_data.r#type,
-		description: ref_data.description,
+		ref_id: ref_data.ref_id.to_string(),
+		r#type: ref_data.r#type.to_string(),
+		description: ref_data.description.map(|d| d.to_string()),
 		created_at: ref_data.created_at.0,
 		expires_at: ref_data.expires_at.map(|t| t.0),
 		count: ref_data.count,

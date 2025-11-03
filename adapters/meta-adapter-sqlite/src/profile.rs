@@ -70,7 +70,7 @@ pub(crate) async fn list(
 	}
 
 	if let Some(id_tag) = &opts.id_tag {
-		query.push(" AND id_tag=").push_bind(id_tag.as_ref());
+		query.push(" AND id_tag=").push_bind(id_tag.as_str());
 	}
 
 	query.push(" ORDER BY name LIMIT 100");

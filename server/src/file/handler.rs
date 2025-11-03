@@ -64,7 +64,7 @@ pub async fn get_file_list(
 	Query(opts): Query<meta_adapter::ListFileOptions>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<meta_adapter::FileView>>>)> {
-	let files = app.meta_adapter.list_files(tn_id, opts).await?;
+	let files = app.meta_adapter.list_files(tn_id, &opts).await?;
 	let total = files.len();
 
 	let response =
@@ -77,7 +77,7 @@ pub async fn get_file_list(
 pub async fn get_file_variant(
 	State(app): State<App>,
 	tn_id: TnId,
-	extract::Path(variant_id): extract::Path<Box<str>>,
+	extract::Path(variant_id): extract::Path<String>,
 ) -> ClResult<impl response::IntoResponse> {
 	let variant = app.meta_adapter.read_file_variant(tn_id, &variant_id).await?;
 	info!("variant: {:?}", variant);
@@ -88,7 +88,7 @@ pub async fn get_file_variant(
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GetFileVariantSelector {
-	pub variant: Option<Box<str>>,
+	pub variant: Option<String>,
 	pub min_x: Option<u32>,
 	pub min_y: Option<u32>,
 	pub min_res: Option<u32>, // min resolution in kpx
@@ -97,7 +97,7 @@ pub struct GetFileVariantSelector {
 pub async fn get_file_variant_file_id(
 	State(app): State<App>,
 	tn_id: TnId,
-	extract::Path(file_id): extract::Path<Box<str>>,
+	extract::Path(file_id): extract::Path<String>,
 	extract::Query(selector): extract::Query<GetFileVariantSelector>,
 ) -> ClResult<impl response::IntoResponse> {
 	let mut variants = app
@@ -117,7 +117,7 @@ pub async fn get_file_variant_file_id(
 pub async fn get_file_descriptor(
 	State(app): State<App>,
 	tn_id: TnId,
-	extract::Path(file_id): extract::Path<Box<str>>,
+	extract::Path(file_id): extract::Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<String>>)> {
 	let mut variants = app
@@ -364,7 +364,7 @@ pub async fn post_file(
 pub async fn post_file_blob(
 	State(app): State<App>,
 	tn_id: TnId,
-	extract::Path((preset, file_name)): extract::Path<(Box<str>, Box<str>)>,
+	extract::Path((preset, file_name)): extract::Path<(String, String)>,
 	query: Query<PostFileQuery>,
 	header: axum::http::HeaderMap,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -393,12 +393,12 @@ pub async fn post_file_blob(
 				.create_file(
 					tn_id,
 					meta_adapter::CreateFile {
-						preset,
+						preset: preset.into(),
 						orig_variant_id,
 						file_id: None,
 						owner_tag: None,
 						content_type: content_type.into(),
-						file_name,
+						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),

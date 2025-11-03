@@ -22,20 +22,20 @@ pub struct Login {
 	#[serde(rename = "tnId")]
 	tn_id: TnId,
 	#[serde(rename = "idTag")]
-	id_tag: Box<str>,
-	roles: Option<Box<[Box<str>]>>,
-	token: Box<str>,
+	id_tag: String,
+	roles: Option<Vec<String>>,
+	token: String,
 	// profile data
-	name: Box<str>,
+	name: String,
 	#[serde(rename = "profilePic")]
-	profile_pic: Box<str>,
-	settings: Box<[(Box<str>, Box<str>)]>,
+	profile_pic: String,
+	settings: Vec<(String, String)>,
 }
 
 #[derive(Serialize)]
 pub struct IdTagRes {
 	#[serde(rename = "idTag")]
-	id_tag: Box<str>,
+	id_tag: String,
 }
 
 pub async fn get_id_tag(
@@ -50,7 +50,7 @@ pub async fn get_id_tag(
 		.unwrap_or_default();
 	let cert_data = app.auth_adapter.read_cert_by_domain(host).await?;
 
-	Ok((StatusCode::OK, Json(IdTagRes { id_tag: cert_data.id_tag })))
+	Ok((StatusCode::OK, Json(IdTagRes { id_tag: cert_data.id_tag.to_string() })))
 }
 
 pub async fn return_login(
@@ -76,12 +76,12 @@ pub async fn return_login(
 
 	let login = Login {
 		tn_id: auth.tn_id,
-		id_tag: auth.id_tag,
-		roles: auth.roles,
-		token: auth.token,
-		name: profile_data.name,
-		profile_pic: profile_data.profile_pic.unwrap_or_else(|| "".into()),
-		settings: Box::from([]),
+		id_tag: auth.id_tag.to_string(),
+		roles: auth.roles.map(|roles| roles.iter().map(|r| r.to_string()).collect()),
+		token: auth.token.to_string(),
+		name: profile_data.name.to_string(),
+		profile_pic: profile_data.profile_pic.map(|p| p.to_string()).unwrap_or_default(),
+		settings: vec![],
 	};
 
 	Ok((StatusCode::OK, Json(login)))
@@ -91,8 +91,8 @@ pub async fn return_login(
 #[derive(Deserialize)]
 pub struct LoginReq {
 	#[serde(rename = "idTag")]
-	id_tag: Box<str>,
-	password: Box<str>,
+	id_tag: String,
+	password: String,
 }
 
 pub async fn post_login(
@@ -100,7 +100,7 @@ pub async fn post_login(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(login): Json<LoginReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
-	let auth = app.auth_adapter.check_tenant_password(&login.id_tag, login.password).await;
+	let auth = app.auth_adapter.check_tenant_password(&login.id_tag, &login.password).await;
 
 	if let Ok(auth) = auth {
 		let (_status, Json(login_data)) = return_login(&app, auth).await?;
@@ -152,10 +152,10 @@ pub async fn post_logout(
 #[derive(Deserialize)]
 pub struct PasswordReq {
 	#[serde(rename = "idTag")]
-	id_tag: Box<str>,
-	password: Box<str>,
+	id_tag: String,
+	password: String,
 	#[serde(rename = "newPassword")]
-	new_password: Box<str>,
+	new_password: String,
 }
 
 pub async fn post_password(
@@ -165,7 +165,7 @@ pub async fn post_password(
 	Json(req): Json<PasswordReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	// Authorization: Users can only change their own password
-	if auth.id_tag.as_ref() != req.id_tag.as_ref() {
+	if auth.id_tag.as_ref() != req.id_tag.as_str() {
 		warn!("User {} attempted to change password for {}", auth.id_tag, req.id_tag);
 		return Err(Error::PermissionDenied);
 	}
@@ -186,8 +186,7 @@ pub async fn post_password(
 	}
 
 	// Verify current password
-	let verification =
-		app.auth_adapter.check_tenant_password(&req.id_tag, req.password.clone()).await;
+	let verification = app.auth_adapter.check_tenant_password(&req.id_tag, &req.password).await;
 
 	if verification.is_err() {
 		// Delay to prevent timing attacks
@@ -197,7 +196,7 @@ pub async fn post_password(
 	}
 
 	// Update to new password
-	app.auth_adapter.update_tenant_password(&req.id_tag, req.new_password).await?;
+	app.auth_adapter.update_tenant_password(&req.id_tag, &req.new_password).await?;
 
 	info!("User {} successfully changed their password", auth.id_tag);
 
@@ -214,8 +213,8 @@ pub async fn post_password(
 #[derive(Deserialize)]
 pub struct GetAccessTokenQuery {
 	#[serde(default)]
-	token: Option<Box<str>>,
-	scope: Option<Box<str>>,
+	token: Option<String>,
+	scope: Option<String>,
 }
 
 pub async fn get_access_token(
@@ -296,7 +295,7 @@ pub async fn get_access_token(
 /// Generate a proxy token for federation (allows this user to authenticate on behalf of the server)
 #[derive(Serialize)]
 pub struct ProxyTokenRes {
-	token: Box<str>,
+	token: String,
 }
 
 pub async fn get_proxy_token(
@@ -310,8 +309,8 @@ pub async fn get_proxy_token(
 		.create_proxy_token(auth.tn_id, &auth.id_tag, &auth.roles)
 		.await?;
 
-	let response =
-		ApiResponse::new(ProxyTokenRes { token }).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(ProxyTokenRes { token: token.to_string() })
+		.with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }

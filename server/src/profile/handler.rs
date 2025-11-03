@@ -10,9 +10,9 @@ use crate::types::ApiResponse;
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
-	pub id_tag: Box<str>,
-	pub name: Box<str>,
-	pub profile_type: Box<str>,
+	pub id_tag: String,
+	pub name: String,
+	pub profile_type: String,
 	pub keys: Vec<auth_adapter::AuthKey>,
 }
 
@@ -32,9 +32,9 @@ pub async fn get_tenant_profile(
 	};
 
 	let profile = Profile {
-		id_tag: auth_profile.id_tag,
-		name: tenant_meta.name,
-		profile_type: profile_type.into(),
+		id_tag: auth_profile.id_tag.to_string(),
+		name: tenant_meta.name.to_string(),
+		profile_type: profile_type.to_string(),
 		keys: auth_profile.keys,
 	};
 

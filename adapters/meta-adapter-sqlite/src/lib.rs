@@ -244,7 +244,7 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::get_id(&self.dbr, tn_id, f_id).await
 	}
 
-	async fn list_files(&self, tn_id: TnId, opts: ListFileOptions) -> ClResult<Vec<FileView>> {
+	async fn list_files(&self, tn_id: TnId, opts: &ListFileOptions) -> ClResult<Vec<FileView>> {
 		file::list(&self.dbr, tn_id, opts).await
 	}
 

@@ -71,8 +71,8 @@ pub(crate) async fn update(
 	let mut has_updates = false;
 
 	// Apply each patch field - macro handles parameter binding safely
-	has_updates = push_patch!(query, has_updates, "id_tag", &tenant.id_tag, |v| v.as_ref());
-	has_updates = push_patch!(query, has_updates, "name", &tenant.name, |v| v.as_ref());
+	has_updates = push_patch!(query, has_updates, "id_tag", &tenant.id_tag, |v| v.as_str());
+	has_updates = push_patch!(query, has_updates, "name", &tenant.name, |v| v.as_str());
 	has_updates = push_patch!(query, has_updates, "type", &tenant.typ, |v| match v {
 		ProfileType::Person => "P",
 		ProfileType::Community => "C",

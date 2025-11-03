@@ -139,13 +139,7 @@ pub(crate) async fn create_tenant(
 
 	// Set password if provided (with proper hashing)
 	if let Some(password) = data.password {
-		crate::auth::update_tenant_password(
-			db,
-			worker,
-			id_tag,
-			password.to_string().into_boxed_str(),
-		)
-		.await?;
+		crate::auth::update_tenant_password(db, worker, id_tag, password).await?;
 	}
 
 	Ok(tn_id)

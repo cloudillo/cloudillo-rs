@@ -58,7 +58,7 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Verify password works
-		let result = adapter.check_tenant_password(id_tag, password.into()).await;
+		let result = adapter.check_tenant_password(id_tag, password).await;
 
 		assert!(result.is_ok(), "Password verification should succeed with correct password");
 		let auth_login = result.unwrap();
@@ -80,7 +80,7 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Verify with wrong password
-		let result = adapter.check_tenant_password(id_tag, wrong_password.into()).await;
+		let result = adapter.check_tenant_password(id_tag, wrong_password).await;
 
 		assert!(result.is_err(), "Password verification should fail with wrong password");
 		assert!(matches!(result, Err(Error::PermissionDenied)));
@@ -101,21 +101,21 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Verify old password works
-		let result = adapter.check_tenant_password(id_tag, old_password.into()).await;
+		let result = adapter.check_tenant_password(id_tag, old_password).await;
 		assert!(result.is_ok(), "Old password should work before change");
 
 		// Change password
 		adapter
-			.update_tenant_password(id_tag, new_password.into())
+			.update_tenant_password(id_tag, new_password)
 			.await
 			.expect("Password change should succeed");
 
 		// Verify old password no longer works
-		let old_result = adapter.check_tenant_password(id_tag, old_password.into()).await;
+		let old_result = adapter.check_tenant_password(id_tag, old_password).await;
 		assert!(old_result.is_err(), "Old password should not work after change");
 
 		// Verify new password works
-		let new_result = adapter.check_tenant_password(id_tag, new_password.into()).await;
+		let new_result = adapter.check_tenant_password(id_tag, new_password).await;
 		assert!(new_result.is_ok(), "New password should work after change");
 
 		println!("✅ Password change successfully updates password");
@@ -125,7 +125,7 @@ mod tests {
 	async fn test_password_verification_with_nonexistent_user() {
 		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
-		let result = adapter.check_tenant_password("nonexistent_user", "password".into()).await;
+		let result = adapter.check_tenant_password("nonexistent_user", "password").await;
 
 		assert!(result.is_err(), "Should fail for nonexistent user");
 		assert!(matches!(result, Err(Error::PermissionDenied)));
@@ -147,18 +147,17 @@ mod tests {
 		// Change password multiple times
 		for (i, password) in passwords.iter().enumerate().skip(1) {
 			adapter
-				.update_tenant_password(id_tag, (*password).into())
+				.update_tenant_password(id_tag, password)
 				.await
 				.expect("Password change should succeed");
 
 			// Verify new password works
-			let result = adapter.check_tenant_password(id_tag, (*password).into()).await;
+			let result = adapter.check_tenant_password(id_tag, password).await;
 			assert!(result.is_ok(), "New password {} should work", i);
 
 			// Verify previous password doesn't work
 			if i > 0 {
-				let old_result =
-					adapter.check_tenant_password(id_tag, passwords[i - 1].into()).await;
+				let old_result = adapter.check_tenant_password(id_tag, passwords[i - 1]).await;
 				assert!(old_result.is_err(), "Previous password {} should not work", i - 1);
 			}
 		}
@@ -178,12 +177,11 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Try with different case
-		let wrong_case_result =
-			adapter.check_tenant_password(id_tag, "casesensitive123".into()).await;
+		let wrong_case_result = adapter.check_tenant_password(id_tag, "casesensitive123").await;
 		assert!(wrong_case_result.is_err(), "Password should be case-sensitive");
 
 		// Try with correct case
-		let correct_result = adapter.check_tenant_password(id_tag, password.into()).await;
+		let correct_result = adapter.check_tenant_password(id_tag, password).await;
 		assert!(correct_result.is_ok(), "Correct case should work");
 
 		println!("✅ Passwords are case-sensitive");
@@ -205,7 +203,7 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Try to set empty password
-		let result = adapter.update_tenant_password(id_tag, "".into()).await;
+		let result = adapter.update_tenant_password(id_tag, "").await;
 
 		// Empty password should be processed (bcrypt hashes it)
 		// But it won't match anything useful
@@ -227,7 +225,7 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Verify it works
-		let result = adapter.check_tenant_password(id_tag, long_password.into()).await;
+		let result = adapter.check_tenant_password(id_tag, &long_password).await;
 		assert!(result.is_ok(), "Very long password should work");
 
 		println!("✅ Very long passwords are handled correctly");
@@ -245,7 +243,7 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Verify special characters work
-		let result = adapter.check_tenant_password(id_tag, special_password.into()).await;
+		let result = adapter.check_tenant_password(id_tag, special_password).await;
 		assert!(result.is_ok(), "Password with special characters should work");
 
 		println!("✅ Special characters in passwords are handled correctly");
@@ -263,7 +261,7 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Verify unicode works
-		let result = adapter.check_tenant_password(id_tag, unicode_password.into()).await;
+		let result = adapter.check_tenant_password(id_tag, unicode_password).await;
 		assert!(result.is_ok(), "Password with Unicode should work");
 
 		println!("✅ Unicode characters in passwords are handled correctly");
@@ -281,11 +279,11 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Verify password with spaces works
-		let result = adapter.check_tenant_password(id_tag, password_with_spaces.into()).await;
+		let result = adapter.check_tenant_password(id_tag, password_with_spaces).await;
 		assert!(result.is_ok(), "Password with spaces should work");
 
 		// Verify without spaces doesn't work
-		let wrong_result = adapter.check_tenant_password(id_tag, "passwordwithspaces".into()).await;
+		let wrong_result = adapter.check_tenant_password(id_tag, "passwordwithspaces").await;
 		assert!(wrong_result.is_err(), "Password without spaces should not work");
 
 		println!("✅ Whitespace in passwords is preserved");
@@ -308,7 +306,7 @@ mod tests {
 			let id_tag_clone = id_tag.to_string();
 			let handle = tokio::spawn(async move {
 				let password = format!("password_{}", i);
-				adapter_clone.update_tenant_password(&id_tag_clone, password.into()).await
+				adapter_clone.update_tenant_password(&id_tag_clone, &password).await
 			});
 			handles.push(handle);
 		}
@@ -322,7 +320,7 @@ mod tests {
 		let mut found_working_password = false;
 		for i in 0..5 {
 			let password = format!("password_{}", i);
-			if adapter.check_tenant_password(id_tag, password.into()).await.is_ok() {
+			if adapter.check_tenant_password(id_tag, &password).await.is_ok() {
 				found_working_password = true;
 				break;
 			}

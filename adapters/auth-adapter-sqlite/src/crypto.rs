@@ -14,8 +14,9 @@ fn generate_password_hash_sync(password: Box<str>) -> ClResult<Box<str>> {
 
 pub async fn generate_password_hash(
 	worker: &worker::WorkerPool,
-	password: Box<str>,
+	password: &str,
 ) -> ClResult<Box<str>> {
+	let password = password.to_string().into_boxed_str();
 	worker
 		.run_immed(move || generate_password_hash_sync(password))
 		.await
@@ -34,9 +35,10 @@ fn check_password_sync(password: Box<str>, password_hash: Box<str>) -> ClResult<
 
 pub async fn check_password(
 	worker: &worker::WorkerPool,
-	password: Box<str>,
+	password: &str,
 	password_hash: Box<str>,
 ) -> ClResult<()> {
+	let password = password.to_string().into_boxed_str();
 	worker
 		.run_immed(move || check_password_sync(password, password_hash))
 		.await

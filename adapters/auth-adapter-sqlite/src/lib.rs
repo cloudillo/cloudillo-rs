@@ -92,12 +92,12 @@ impl AuthAdapter for AuthAdapterSqlite {
 		auth::create_tenant_login(&self.db, &self.worker, id_tag, &self.jwt_secret_str).await
 	}
 
-	async fn check_tenant_password(&self, id_tag: &str, password: Box<str>) -> ClResult<AuthLogin> {
+	async fn check_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<AuthLogin> {
 		auth::check_tenant_password(&self.db, &self.worker, id_tag, password, &self.jwt_secret_str)
 			.await
 	}
 
-	async fn update_tenant_password(&self, id_tag: &str, password: Box<str>) -> ClResult<()> {
+	async fn update_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<()> {
 		auth::update_tenant_password(&self.db, &self.worker, id_tag, password).await
 	}
 
