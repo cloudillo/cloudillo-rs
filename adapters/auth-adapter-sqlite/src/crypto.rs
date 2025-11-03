@@ -2,15 +2,9 @@ const TOKEN_EXPIRE: u64 = 8; /* hours */
 const BCRYPT_COST: u32 = 10;
 
 use p384::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-use p384::{
-	elliptic_curve::rand_core::{CryptoRngCore, OsRng},
-	SecretKey,
-};
-use zeroize::Zeroizing;
+use p384::{elliptic_curve::rand_core::OsRng, SecretKey};
 
-use serde::{Deserialize, Serialize};
-
-use cloudillo::{auth_adapter, core::worker, prelude::*};
+use cloudillo::{auth_adapter::*, core::worker, prelude::*};
 
 fn generate_password_hash_sync(password: Box<str>) -> ClResult<Box<str>> {
 	let hash = bcrypt::hash(password.as_ref(), BCRYPT_COST).map_err(|_| Error::PermissionDenied)?;
@@ -31,11 +25,11 @@ pub async fn generate_password_hash(
 fn check_password_sync(password: Box<str>, password_hash: Box<str>) -> ClResult<()> {
 	let res =
 		bcrypt::verify(password.as_ref(), &password_hash).map_err(|_| Error::PermissionDenied)?;
-	if (!res) {
-		return Err(Error::PermissionDenied);
+	if !res {
+		Err(Error::PermissionDenied)
+	} else {
+		Ok(())
 	}
-
-	Ok(())
 }
 
 pub async fn check_password(
@@ -50,10 +44,10 @@ pub async fn check_password(
 }
 
 fn generate_access_token_sync(
-	access_token: auth_adapter::AccessToken<Box<str>>,
+	access_token: AccessToken<Box<str>>,
 	jwt_secret: &str,
 ) -> ClResult<Box<str>> {
-	let expire = std::time::SystemTime::now()
+	let _expire = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.map_err(|_| Error::PermissionDenied)?
 		.as_secs()
@@ -72,7 +66,7 @@ fn generate_access_token_sync(
 
 pub async fn generate_access_token(
 	worker: &worker::WorkerPool,
-	access_token: auth_adapter::AccessToken<Box<str>>,
+	access_token: AccessToken<Box<str>>,
 	jwt_secret: Box<str>,
 ) -> ClResult<Box<str>> {
 	worker
@@ -84,7 +78,7 @@ pub async fn generate_access_token(
 /// Generate a keypair (sync)
 ///
 /// Must be run on a worker thread!
-fn generate_key_sync() -> ClResult<auth_adapter::KeyPair> {
+fn generate_key_sync() -> ClResult<KeyPair> {
 	let private = SecretKey::random(&mut OsRng);
 	let public = private.public_key();
 
@@ -102,16 +96,16 @@ fn generate_key_sync() -> ClResult<auth_adapter::KeyPair> {
 		.map(|s| if s.starts_with(char::is_alphanumeric) { s.trim() } else { "" })
 		.collect();
 
-	Ok(auth_adapter::KeyPair { private_key, public_key })
+	Ok(KeyPair { private_key, public_key })
 }
 
 /// Generate a keypair
-pub async fn generate_key(worker: &worker::WorkerPool) -> ClResult<auth_adapter::KeyPair> {
+pub async fn generate_key(worker: &worker::WorkerPool) -> ClResult<KeyPair> {
 	worker.run_immed(generate_key_sync).await.map_err(|_| Error::PermissionDenied)
 }
 
 fn generate_action_token_sync(
-	action_data: auth_adapter::ActionToken,
+	action_data: ActionToken,
 	private_key: Box<str>,
 ) -> ClResult<Box<str>> {
 	let private_key_pem =
@@ -132,7 +126,7 @@ fn generate_action_token_sync(
 
 pub async fn generate_action_token(
 	worker: &worker::WorkerPool,
-	action_data: auth_adapter::ActionToken,
+	action_data: ActionToken,
 	private_key: Box<str>,
 ) -> ClResult<Box<str>> {
 	worker
