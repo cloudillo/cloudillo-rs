@@ -46,6 +46,7 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 lru = "0.12.4"
 parking_lot = "0.12.1"
 lettre = { version = "0.11.19", default-features = false, features = ["builder", "rustls-tls", "tokio1", "tokio1-rustls", "smtp-transport"] }
+regex = "1.11.3"
 
 [dev-dependencies]
 serde_urlencoded = "0.7"

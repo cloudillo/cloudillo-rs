@@ -153,13 +153,69 @@ pub async fn delete_action(
 
 /// POST /api/action/:action_id/accept - Accept an action
 pub async fn post_action_accept(
-	State(_app): State<App>,
+	State(app): State<App>,
+	tn_id: TnId,
 	Auth(auth): Auth,
+	IdTag(id_tag): IdTag,
 	Path(action_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	// TODO: Implement action acceptance logic
-	info!("User {} accepted action {}", auth.id_tag, action_id);
+	info!("User {} accepting action {}", auth.id_tag, action_id);
+
+	// Fetch the action from database
+	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+
+	// Execute DSL on_accept hook if action type has one
+	if app.dsl_engine.has_definition(&action.typ) {
+		use crate::action::hooks::{HookContext, HookType};
+		use std::collections::HashMap;
+
+		let hook_context = HookContext {
+			action_id: action.action_id.to_string(),
+			r#type: action.typ.to_string(),
+			subtype: action.sub_typ.clone().map(|s| s.to_string()),
+			issuer: action.issuer.id_tag.to_string(),
+			audience: action.audience.as_ref().map(|a| a.id_tag.to_string()),
+			parent: action.parent_id.clone().map(|s| s.to_string()),
+			subject: action.subject.clone().map(|s| s.to_string()),
+			content: action.content.as_ref().and_then(|c| serde_json::from_str(c).ok()),
+			attachments: action
+				.attachments
+				.clone()
+				.map(|v| v.iter().map(|a| a.file_id.to_string()).collect()),
+			created_at: format!("{}", action.created_at.0),
+			expires_at: action.expires_at.map(|ts| format!("{}", ts.0)),
+			tenant_id: tn_id.0 as i64,
+			tenant_tag: id_tag.to_string(),
+			tenant_type: "person".to_string(),
+			is_inbound: true, // This is an inbound action being accepted
+			is_outbound: false,
+			vars: HashMap::new(),
+		};
+
+		if let Err(e) = app
+			.dsl_engine
+			.execute_hook(&app, &action.typ, HookType::OnAccept, hook_context)
+			.await
+		{
+			warn!(
+				action_id = %action_id,
+				action_type = %action.typ,
+				user = %auth.id_tag,
+				tenant_id = %tn_id.0,
+				error = %e,
+				"DSL on_accept hook failed"
+			);
+			// Don't fail the request if hook fails - log and continue
+		}
+	}
+
+	info!(
+		action_id = %action_id,
+		action_type = %action.typ,
+		user = %auth.id_tag,
+		"Action accepted"
+	);
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
@@ -168,13 +224,69 @@ pub async fn post_action_accept(
 
 /// POST /api/action/:action_id/reject - Reject an action
 pub async fn post_action_reject(
-	State(_app): State<App>,
+	State(app): State<App>,
+	tn_id: TnId,
 	Auth(auth): Auth,
+	IdTag(id_tag): IdTag,
 	Path(action_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	// TODO: Implement action rejection logic
-	info!("User {} rejected action {}", auth.id_tag, action_id);
+	info!("User {} rejecting action {}", auth.id_tag, action_id);
+
+	// Fetch the action from database
+	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+
+	// Execute DSL on_reject hook if action type has one
+	if app.dsl_engine.has_definition(&action.typ) {
+		use crate::action::hooks::{HookContext, HookType};
+		use std::collections::HashMap;
+
+		let hook_context = HookContext {
+			action_id: action.action_id.to_string(),
+			r#type: action.typ.to_string(),
+			subtype: action.sub_typ.clone().map(|s| s.to_string()),
+			issuer: action.issuer.id_tag.to_string(),
+			audience: action.audience.as_ref().map(|a| a.id_tag.to_string()),
+			parent: action.parent_id.clone().map(|s| s.to_string()),
+			subject: action.subject.clone().map(|s| s.to_string()),
+			content: action.content.as_ref().and_then(|c| serde_json::from_str(c).ok()),
+			attachments: action
+				.attachments
+				.clone()
+				.map(|v| v.iter().map(|a| a.file_id.to_string()).collect()),
+			created_at: format!("{}", action.created_at.0),
+			expires_at: action.expires_at.map(|ts| format!("{}", ts.0)),
+			tenant_id: tn_id.0 as i64,
+			tenant_tag: id_tag.to_string(),
+			tenant_type: "person".to_string(),
+			is_inbound: true, // This is an inbound action being rejected
+			is_outbound: false,
+			vars: HashMap::new(),
+		};
+
+		if let Err(e) = app
+			.dsl_engine
+			.execute_hook(&app, &action.typ, HookType::OnReject, hook_context)
+			.await
+		{
+			warn!(
+				action_id = %action_id,
+				action_type = %action.typ,
+				user = %auth.id_tag,
+				tenant_id = %tn_id.0,
+				error = %e,
+				"DSL on_reject hook failed"
+			);
+			// Don't fail the request if hook fails - log and continue
+		}
+	}
+
+	info!(
+		action_id = %action_id,
+		action_type = %action.typ,
+		user = %auth.id_tag,
+		"Action rejected"
+	);
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 

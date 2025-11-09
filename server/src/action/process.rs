@@ -88,8 +88,58 @@ pub async fn process_inbound_action_token(
 		//profile::sync_profile(&app, tn_id, &action.iss).await?;
 	}
 
-	if let Some(attachments) = action.a {
-		process_inbound_action_attachments(app, tn_id, &action.iss, attachments).await?;
+	if let Some(ref attachments) = action.a {
+		process_inbound_action_attachments(app, tn_id, &action.iss, attachments.clone()).await?;
+	}
+
+	// Execute DSL on_receive hook if action type has one
+	if app.dsl_engine.has_definition(&action.t) {
+		use crate::action::hooks::{HookContext, HookType};
+		use std::collections::HashMap;
+
+		// Extract subtype from action type (e.g., "CONN:DEL" → type="CONN", subtype="DEL")
+		let (action_type, subtype) = if let Some(colon_pos) = action.t.find(':') {
+			let (t, st) = action.t.split_at(colon_pos);
+			(t.to_string(), Some(st[1..].to_string()))
+		} else {
+			(action.t.to_string(), None)
+		};
+
+		let hook_context = HookContext {
+			action_id: _action_id.to_string(),
+			r#type: action_type,
+			subtype,
+			issuer: action.iss.to_string(),
+			audience: action.aud.as_ref().map(|s| s.to_string()),
+			parent: action.p.as_ref().map(|s| s.to_string()),
+			subject: action.sub.as_ref().map(|s| s.to_string()),
+			content: action.c.as_ref().and_then(|c| serde_json::from_str(c).ok()),
+			attachments: action.a.as_ref().map(|v| v.iter().map(|s| s.to_string()).collect()),
+			created_at: format!("{}", action.iat.0), // Simple timestamp conversion
+			expires_at: action.exp.map(|ts| format!("{}", ts.0)),
+			tenant_id: tn_id.0 as i64,
+			tenant_tag: action.aud.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+			tenant_type: "person".to_string(),
+			is_inbound: true,
+			is_outbound: false,
+			vars: HashMap::new(),
+		};
+
+		if let Err(e) = app
+			.dsl_engine
+			.execute_hook(app, &action.t, HookType::OnReceive, hook_context)
+			.await
+		{
+			warn!(
+				action_id = %_action_id,
+				action_type = %action.t,
+				issuer = %action.iss,
+				tenant_id = %tn_id.0,
+				error = %e,
+				"DSL on_receive hook failed"
+			);
+			// Continue execution - hook errors shouldn't fail the action processing
+		}
 	}
 
 	Ok(())

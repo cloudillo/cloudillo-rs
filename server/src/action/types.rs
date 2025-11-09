@@ -34,10 +34,6 @@ lazy_static! {
 			broadcast: true,
 			allow_unknown: false,
 		});
-		m.insert("ENDR", ActionTypeConfig {
-			broadcast: true,
-			allow_unknown: false,
-		});
 
 		// Direct types - sent to specific audience only
 		m.insert("MSG", ActionTypeConfig {

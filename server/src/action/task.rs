@@ -155,6 +155,50 @@ impl Task<App> for ActionCreatorTask {
 			.store_action_token(self.tn_id, &self.action_id, &self.action_token)
 			.await?;
 
+		// Execute DSL on_create hook if action type has one
+		if app.dsl_engine.has_definition(self.action.typ.as_ref()) {
+			use crate::action::hooks::{HookContext, HookType};
+			use std::collections::HashMap;
+
+			let hook_context = HookContext {
+				action_id: self.action_id.to_string(),
+				r#type: self.action.typ.to_string(),
+				subtype: self.action.sub_typ.as_ref().map(|s| s.to_string()),
+				issuer: self.id_tag.to_string(),
+				audience: self.action.audience_tag.as_ref().map(|s| s.to_string()),
+				parent: self.action.parent_id.as_ref().map(|s| s.to_string()),
+				subject: self.action.subject.as_ref().map(|s| s.to_string()),
+				content: self.action.content.as_ref().and_then(|c| serde_json::from_str(c).ok()),
+				attachments: attachments
+					.as_ref()
+					.map(|v| v.iter().map(|s| s.to_string()).collect()),
+				created_at: format!("{}", action.created_at.0),
+				expires_at: self.action.expires_at.map(|ts| format!("{}", ts.0)),
+				tenant_id: self.tn_id.0 as i64,
+				tenant_tag: self.id_tag.to_string(),
+				tenant_type: "person".to_string(),
+				is_inbound: false,
+				is_outbound: true,
+				vars: HashMap::new(),
+			};
+
+			if let Err(e) = app
+				.dsl_engine
+				.execute_hook(app, self.action.typ.as_ref(), HookType::OnCreate, hook_context)
+				.await
+			{
+				warn!(
+					action_id = %self.action_id,
+					action_type = %self.action.typ,
+					issuer = %self.id_tag,
+					tenant_id = %self.tn_id.0,
+					error = %e,
+					"DSL on_create hook failed"
+				);
+				// Continue execution - hook errors shouldn't fail the action creation
+			}
+		}
+
 		// Determine delivery strategy based on action type
 		let action_config = ACTION_TYPES.get(self.action.typ.as_ref());
 

@@ -19,6 +19,8 @@ use crate::rtdb_adapter::RtdbAdapter;
 use crate::settings::service::SettingsService;
 use crate::settings::{FrozenSettingsRegistry, SettingsRegistry};
 
+use crate::action::dsl::DslEngine;
+use crate::action::hooks::HookRegistry;
 use crate::{action, file, routes};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -52,6 +54,12 @@ pub struct AppState {
 
 	// Email module
 	pub email_module: Arc<crate::email::EmailModule>,
+
+	// DSL engine for action types
+	pub dsl_engine: Arc<DslEngine>,
+
+	// Hook registry for native hook functions
+	pub hook_registry: Arc<tokio::sync::RwLock<HookRegistry>>,
 }
 
 pub type App = Arc<AppState>;
@@ -250,6 +258,26 @@ impl AppBuilder {
 		// Initialize email module
 		let email_module = Arc::new(crate::email::EmailModule::new(settings_service.clone())?);
 
+		// Initialize DSL engine with built-in action type definitions
+		info!("Initializing DSL engine with built-in action type definitions");
+		let dsl_engine = {
+			let mut engine = DslEngine::new();
+			let definitions = action::dsl::definitions::get_definitions();
+			for def in definitions {
+				engine.load_definition(def);
+			}
+			let stats = engine.stats();
+			info!(
+				"DSL engine initialized: {} definitions, {} on_create, {} on_receive, {} on_accept, {} on_reject hooks",
+				stats.total_definitions,
+				stats.hook_counts.on_create,
+				stats.hook_counts.on_receive,
+				stats.hook_counts.on_accept,
+				stats.hook_counts.on_reject,
+			);
+			Arc::new(engine)
+		};
+
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker: self.worker.expect("FATAL: No worker pool defined"),
@@ -272,6 +300,12 @@ impl AppBuilder {
 
 			// Email module
 			email_module,
+
+			// DSL engine
+			dsl_engine,
+
+			// Hook registry
+			hook_registry: Arc::new(tokio::sync::RwLock::new(HookRegistry::new())),
 		});
 		tokio::fs::create_dir_all(&app.opts.tmp_dir)
 			.await
@@ -282,6 +316,9 @@ impl AppBuilder {
 		file::init(&app)?;
 		crate::email::init(&app)?;
 		let (api_router, app_router, http_router) = routes::init(app.clone());
+
+		// Register native hooks for core action types
+		action::native_hooks::register_native_hooks(&app).await?;
 
 		// Start scheduler
 		app.scheduler.start(app.clone());
