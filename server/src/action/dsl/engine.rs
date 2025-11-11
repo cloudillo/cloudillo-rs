@@ -6,7 +6,7 @@
 use super::operations::{OperationExecutor, EARLY_RETURN_MARKER};
 use super::types::*;
 use super::validator;
-use crate::action::hooks::{HookContext, HookType};
+use crate::action::hooks::{HookContext, HookResult, HookType};
 use crate::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
@@ -274,6 +274,148 @@ impl DslEngine {
 				} else {
 					drop(registry);
 					Ok(())
+				}
+			}
+		}
+	}
+
+	/// Execute a hook for an action type and return the HookResult
+	/// This is useful for synchronous endpoints that need to return the hook's response
+	pub async fn execute_hook_with_result(
+		&self,
+		app: &App,
+		action_type: &str,
+		hook_type: HookType,
+		mut context: HookContext,
+	) -> ClResult<HookResult> {
+		use crate::action::hooks::HookImplementation;
+
+		let definition = self.definitions.get(action_type).ok_or_else(|| {
+			Error::ValidationError(format!("Action definition not found: {}", action_type))
+		})?;
+
+		let implementation = match hook_type {
+			HookType::OnCreate => &definition.hooks.on_create,
+			HookType::OnReceive => &definition.hooks.on_receive,
+			HookType::OnAccept => &definition.hooks.on_accept,
+			HookType::OnReject => &definition.hooks.on_reject,
+		};
+
+		// Execute hook based on implementation type
+		match implementation {
+			HookImplementation::None => {
+				// Check if there's a native hook registered for this action type
+				let registry = app.hook_registry.read().await;
+				if let Some(hook_fn) = registry.get_hook(action_type, hook_type) {
+					let hook_fn = hook_fn.clone();
+					drop(registry);
+					match timeout(HOOK_TIMEOUT, hook_fn(app.clone(), context)).await {
+						Ok(Ok(hook_result)) => Ok(hook_result),
+						Ok(Err(e)) => Err(e),
+						Err(_) => Err(Error::Timeout),
+					}
+				} else {
+					drop(registry);
+					Ok(HookResult::default())
+				}
+			}
+
+			HookImplementation::Dsl(operations) => {
+				if operations.is_empty() {
+					return Ok(HookResult::default());
+				}
+
+				// Execute DSL operations with timeout
+				let execution = async {
+					let mut executor = OperationExecutor::new(app);
+
+					for operation in operations {
+						match executor.execute(operation, &mut context).await {
+							Ok(()) => {}
+							Err(Error::ValidationError(ref msg)) if msg == EARLY_RETURN_MARKER => {
+								tracing::debug!("DSL hook early return");
+								break;
+							}
+							Err(e) => return Err(e),
+						}
+					}
+
+					Ok(HookResult {
+						vars: context.vars.clone(),
+						continue_processing: true,
+						return_value: None,
+					})
+				};
+
+				match timeout(HOOK_TIMEOUT, execution).await {
+					Ok(result) => result,
+					Err(_) => Err(Error::Timeout),
+				}
+			}
+
+			HookImplementation::Native(_) => {
+				// Look up and execute native hook from registry
+				let registry = app.hook_registry.read().await;
+				if let Some(hook_fn) = registry.get_hook(action_type, hook_type) {
+					let hook_fn = hook_fn.clone();
+					drop(registry);
+					match timeout(HOOK_TIMEOUT, hook_fn(app.clone(), context)).await {
+						Ok(Ok(hook_result)) => Ok(hook_result),
+						Ok(Err(e)) => Err(e),
+						Err(_) => Err(Error::Timeout),
+					}
+				} else {
+					drop(registry);
+					tracing::warn!(
+						"Native hook not found in registry for {} hook on action type: {}",
+						hook_type.as_str(),
+						action_type
+					);
+					Ok(HookResult::default())
+				}
+			}
+
+			HookImplementation::Hybrid { dsl, .. } => {
+				// Execute DSL operations first
+				if !dsl.is_empty() {
+					let execution = async {
+						let mut executor = OperationExecutor::new(app);
+
+						for operation in dsl {
+							match executor.execute(operation, &mut context).await {
+								Ok(()) => {}
+								Err(Error::ValidationError(ref msg))
+									if msg == EARLY_RETURN_MARKER =>
+								{
+									tracing::debug!("DSL hook early return");
+									break;
+								}
+								Err(e) => return Err(e),
+							}
+						}
+
+						Ok(())
+					};
+
+					match timeout(HOOK_TIMEOUT, execution).await {
+						Ok(result) => result?,
+						Err(_) => return Err(Error::Timeout),
+					}
+				}
+
+				// Then execute native function
+				let registry = app.hook_registry.read().await;
+				if let Some(hook_fn) = registry.get_hook(action_type, hook_type) {
+					let hook_fn = hook_fn.clone();
+					drop(registry);
+					match timeout(HOOK_TIMEOUT, hook_fn(app.clone(), context)).await {
+						Ok(Ok(hook_result)) => Ok(hook_result),
+						Ok(Err(e)) => Err(e),
+						Err(_) => Err(Error::Timeout),
+					}
+				} else {
+					drop(registry);
+					Ok(HookResult::default())
 				}
 			}
 		}

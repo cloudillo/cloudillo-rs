@@ -31,6 +31,8 @@ pub mod crdt_adapter;
 pub mod email;
 pub mod error;
 pub mod file;
+pub mod identity_provider_adapter;
+pub mod idp;
 pub mod meta_adapter;
 pub mod prelude;
 pub mod profile;

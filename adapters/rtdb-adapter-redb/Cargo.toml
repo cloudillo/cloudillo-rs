@@ -1,5 +1,5 @@
 [package]
-name = "rtdb-adapter-redb"
+name = "cloudillo-rtdb-adapter-redb"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"

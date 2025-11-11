@@ -39,10 +39,11 @@ pub(crate) async fn read_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<AuthP
 	async_map_res(res, async |row| {
 		let tn_id = TnId(row.try_get("tn_id")?);
 		let roles: Option<Box<str>> = row.try_get("roles")?;
+		let keys = crate::profile_key::list_profile_keys(db, tn_id).await.unwrap_or(vec![]);
 		Ok(AuthProfile {
 			id_tag: row.try_get("id_tag")?,
 			roles: parse_str_list_optional(roles.as_deref()),
-			keys: crate::profile_key::list_profile_keys(db, tn_id).await.unwrap_or(vec![]),
+			keys,
 		})
 	})
 	.await

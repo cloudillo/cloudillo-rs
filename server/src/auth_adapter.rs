@@ -56,7 +56,8 @@ pub struct AuthKey {
 }
 
 /// Represents an auth profile
-#[derive(Debug)]
+#[skip_serializing_none]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AuthProfile {
 	pub id_tag: Box<str>,
 	pub roles: Option<Box<[Box<str>]>>,

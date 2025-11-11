@@ -1,5 +1,5 @@
 [package]
-name = "crdt-adapter-redb"
+name = "cloudillo-crdt-adapter-redb"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"

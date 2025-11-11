@@ -29,6 +29,7 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		repost_definition(),
 		ack_definition(),
 		stat_definition(),
+		idp_reg_definition(),
 	]
 }
 
@@ -530,6 +531,85 @@ fn stat_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{parent}".to_string()),
+	}
+}
+
+/// IDP:REG - Identity Provider Registration
+fn idp_reg_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "IDP:REG".to_string(),
+		version: "1.0".to_string(),
+		description: "Identity provider registration request - creates a new identity on the receiving IdP instance".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("identity-provider".to_string()),
+			tags: Some(vec!["registration".to_string(), "identity".to_string(), "federation".to_string()]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: None,
+		fields: FieldConstraints {
+			content: Some(FieldConstraint::Required),
+			audience: Some(FieldConstraint::Required),
+			parent: Some(FieldConstraint::Forbidden),
+			attachments: Some(FieldConstraint::Forbidden),
+			subject: Some(FieldConstraint::Forbidden),
+		},
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Object,
+				min_length: None,
+				max_length: None,
+				pattern: None,
+				r#enum: None,
+				properties: Some({
+					let mut props = std::collections::HashMap::new();
+					props.insert("id_tag".to_string(), SchemaField {
+						field_type: FieldType::String,
+						min_length: Some(1),
+						max_length: Some(255),
+						r#enum: None,
+						items: None,
+					});
+					props.insert("email".to_string(), SchemaField {
+						field_type: FieldType::String,
+						min_length: None,
+						max_length: Some(255),
+						r#enum: None,
+						items: None,
+					});
+					props.insert("expires_at".to_string(), SchemaField {
+						field_type: FieldType::Number,
+						min_length: None,
+						max_length: None,
+						r#enum: None,
+						items: None,
+					});
+					props
+				}),
+				required: Some(vec!["id_tag".to_string(), "email".to_string(), "expires_at".to_string()]),
+				description: Some("Identity registration content with id_tag, email, and expiration".to_string()),
+			}),
+		}),
+		behavior: BehaviorFlags {
+			broadcast: Some(false),
+			allow_unknown: Some(true),
+			requires_acceptance: Some(false),
+			ttl: None,
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None,
+			on_receive: HookImplementation::None, // Native hook registered via registry
+			on_accept: HookImplementation::None,
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("any".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(false),
+		}),
+		key_pattern: Some("{type}:{issuer}:{audience}:{content.id_tag}".to_string()),
 	}
 }
 

@@ -1,6 +1,6 @@
 use cloudillo::rtdb_adapter::RtdbAdapter;
 use cloudillo::types::TnId;
-use rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
+use cloudillo_rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -149,7 +149,7 @@ async fn test_transaction_read_created_document() {
 
 #[tokio::test]
 async fn test_concurrent_increment_no_race_condition() {
-	let (adapter, _temp) = create_test_adapter(true).await;
+	let (adapter, _temp): (RtdbAdapterRedb, TempDir) = create_test_adapter(true).await;
 	let adapter = Arc::new(adapter);
 	let tn_id = TnId(1);
 	let db_id = "test_db";
@@ -169,7 +169,7 @@ async fn test_concurrent_increment_no_race_condition() {
 	let mut handles = vec![];
 
 	for i in 0..num_increments {
-		let adapter = Arc::clone(&adapter);
+		let adapter: Arc<RtdbAdapterRedb> = Arc::clone(&adapter);
 		let barrier = Arc::clone(&barrier);
 		let counter_path = counter_path.clone();
 
@@ -245,7 +245,7 @@ async fn test_concurrent_increment_no_race_condition() {
 #[tokio::test]
 async fn test_invoice_numbering_simulation() {
 	// This simulates the exact invoice finalization scenario
-	let (adapter, _temp) = create_test_adapter(true).await;
+	let (adapter, _temp): (RtdbAdapterRedb, TempDir) = create_test_adapter(true).await;
 	let adapter = Arc::new(adapter);
 	let tn_id = TnId(1);
 	let db_id = "invoices_db";
@@ -267,7 +267,7 @@ async fn test_invoice_numbering_simulation() {
 	let mut handles = vec![];
 
 	for i in 0..num_invoices {
-		let adapter = Arc::clone(&adapter);
+		let adapter: Arc<RtdbAdapterRedb> = Arc::clone(&adapter);
 		let barrier = Arc::clone(&barrier);
 		let counter_path = counter_path.clone();
 

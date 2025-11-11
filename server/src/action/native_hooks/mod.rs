@@ -1,13 +1,21 @@
-//! Native hook implementations for core action types (CONN, FLLW)
+//! Native hook implementations for core action types
 //!
-//! These are high-performance, security-hardened implementations of connection and follow
-//! lifecycle hooks, replacing the DSL versions for better control and validation.
+//! This module contains high-performance, security-hardened implementations of action lifecycle hooks,
+//! replacing DSL versions where higher control and validation are needed.
+//!
+//! Includes implementations for:
+//! - CONN: Connection lifecycle management
+//! - FLLW: Follow relationship management
+//! - IDP:REG: Identity provider registration
 
-use crate::action::hooks::{HookContext, HookResult};
+pub mod idp;
+
+use crate::action::hooks::{ActionTypeHooks, HookContext, HookResult};
 use crate::core::app::App;
 use crate::meta_adapter::{ProfileConnectionStatus, UpdateProfileData};
 use crate::prelude::*;
 use crate::types::Patch;
+use std::sync::Arc;
 
 /// CONN on_create hook - Handle connection request creation
 ///
@@ -173,9 +181,6 @@ pub async fn fllw_on_create(app: App, context: HookContext) -> ClResult<HookResu
 
 /// Register all native hooks into the app's hook registry
 pub async fn register_native_hooks(app: &App) -> ClResult<()> {
-	use crate::action::hooks::ActionTypeHooks;
-	use std::sync::Arc;
-
 	let mut registry = app.hook_registry.write().await;
 
 	// CONN hooks
@@ -202,6 +207,19 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 
 		registry.register_type("FLLW", fllw_hooks);
 		tracing::info!("Registered native hooks for FLLW action type");
+	}
+
+	// IDP:REG hooks
+	{
+		let idp_reg_hooks = ActionTypeHooks {
+			on_create: None,
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(idp::idp_reg_on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("IDP:REG", idp_reg_hooks);
+		tracing::info!("Registered native hooks for IDP:REG action type");
 	}
 
 	Ok(())

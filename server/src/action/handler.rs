@@ -72,6 +72,27 @@ pub struct Inbox {
 	related: Option<Vec<String>>,
 }
 
+/// Request structure for synchronous action processing (e.g., IDP:REG)
+#[derive(Deserialize)]
+pub struct SyncActionRequest {
+	/// Action type (e.g., "IDP:REG")
+	r#type: String,
+	/// Optional subtype for action variants
+	subtype: Option<String>,
+	/// Issuer ID tag (who is sending this action)
+	issuer: String,
+	/// Target audience (who should receive this action)
+	audience: Option<String>,
+	/// Action content (structure depends on action type)
+	content: serde_json::Value,
+	/// Optional parent action ID (for threading)
+	parent: Option<String>,
+	/// Optional subject
+	subject: Option<String>,
+	/// Optional attachments
+	attachments: Option<Vec<String>>,
+}
+
 #[axum::debug_handler]
 pub async fn post_inbox(
 	State(app): State<App>,
@@ -93,6 +114,84 @@ pub async fn post_inbox(
 	let _task_id = app.scheduler.task(task).now().await?;
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
+
+	Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// POST /api/inbox/sync - Synchronously process incoming action (e.g., IDP:REG)
+///
+/// This endpoint processes certain action types synchronously and returns the hook's response.
+/// Used for action types like IDP:REG that need immediate feedback.
+#[axum::debug_handler]
+pub async fn post_inbox_sync(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(id_tag): IdTag,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(sync_request): Json<SyncActionRequest>,
+) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+	use crate::action::hooks::{HookContext, HookType};
+	use std::collections::HashMap;
+
+	info!(
+		action_type = %sync_request.r#type,
+		issuer = %sync_request.issuer,
+		audience = ?sync_request.audience,
+		"POST /api/inbox/sync - Processing synchronous action"
+	);
+
+	// Check if the action type is defined
+	if !app.dsl_engine.has_definition(&sync_request.r#type) {
+		return Err(Error::ValidationError(format!(
+			"Action type not supported: {}",
+			sync_request.r#type
+		)));
+	}
+
+	// Create a unique action ID for this sync action
+	let action_id_box = hash(
+		"a",
+		format!("{}:{}:{}", sync_request.r#type, sync_request.issuer, Timestamp::now().0)
+			.as_bytes(),
+	);
+	let action_id = action_id_box.to_string();
+
+	// Construct the HookContext
+	let hook_context = HookContext {
+		action_id,
+		r#type: sync_request.r#type.clone(),
+		subtype: sync_request.subtype.clone(),
+		issuer: sync_request.issuer.clone(),
+		audience: sync_request.audience.clone(),
+		parent: sync_request.parent.clone(),
+		subject: sync_request.subject.clone(),
+		content: Some(sync_request.content),
+		attachments: sync_request.attachments.clone(),
+		created_at: format!("{}", Timestamp::now().0),
+		expires_at: None,
+		tenant_id: tn_id.0 as i64,
+		tenant_tag: id_tag.to_string(),
+		tenant_type: "person".to_string(),
+		is_inbound: true,
+		is_outbound: false,
+		vars: HashMap::new(),
+	};
+
+	// Execute the on_receive hook synchronously and get the result
+	let hook_result = app
+		.dsl_engine
+		.execute_hook_with_result(&app, &sync_request.r#type, HookType::OnReceive, hook_context)
+		.await?;
+
+	// Extract the return value from the hook result
+	let response_data = hook_result.return_value.unwrap_or(serde_json::json!({}));
+
+	info!(
+		action_type = %sync_request.r#type,
+		"POST /api/inbox/sync - Synchronous action processed successfully"
+	);
+
+	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::CREATED, Json(response)))
 }

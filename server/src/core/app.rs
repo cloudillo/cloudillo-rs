@@ -14,6 +14,7 @@ use crate::prelude::*;
 use crate::auth_adapter::AuthAdapter;
 use crate::blob_adapter::BlobAdapter;
 use crate::crdt_adapter::CrdtAdapter;
+use crate::identity_provider_adapter::IdentityProviderAdapter;
 use crate::meta_adapter::{MetaAdapter, UpdateTenantData};
 use crate::rtdb_adapter::RtdbAdapter;
 use crate::settings::service::SettingsService;
@@ -47,6 +48,7 @@ pub struct AppState {
 	pub blob_adapter: Arc<dyn BlobAdapter>,
 	pub crdt_adapter: Arc<dyn CrdtAdapter>,
 	pub rtdb_adapter: Arc<dyn RtdbAdapter>,
+	pub idp_adapter: Option<Arc<dyn IdentityProviderAdapter>>,
 
 	// Settings subsystem
 	pub settings: Arc<SettingsService>,
@@ -70,6 +72,7 @@ pub struct Adapters {
 	pub blob_adapter: Option<Arc<dyn BlobAdapter>>,
 	pub crdt_adapter: Option<Arc<dyn CrdtAdapter>>,
 	pub rtdb_adapter: Option<Arc<dyn RtdbAdapter>>,
+	pub idp_adapter: Option<Arc<dyn IdentityProviderAdapter>>,
 }
 
 #[derive(Debug)]
@@ -82,9 +85,9 @@ pub struct AppBuilderOpts {
 	base_password: Option<Box<str>>,
 	pub dist_dir: Box<Path>,
 	pub tmp_dir: Box<Path>,
-	acme_email: Option<Box<str>>,
-	local_ips: Box<[Box<str>]>,
-	identity_providers: Box<[Box<str>]>,
+	pub acme_email: Option<Box<str>>,
+	pub local_ips: Box<[Box<str>]>,
+	pub identity_providers: Box<[Box<str>]>,
 }
 
 pub struct AppBuilder {
@@ -121,6 +124,7 @@ impl AppBuilder {
 				blob_adapter: None,
 				crdt_adapter: None,
 				rtdb_adapter: None,
+				idp_adapter: None,
 			},
 		}
 	}
@@ -200,6 +204,10 @@ impl AppBuilder {
 	}
 	pub fn rtdb_adapter(&mut self, rtdb_adapter: Arc<dyn RtdbAdapter>) -> &mut Self {
 		self.adapters.rtdb_adapter = Some(rtdb_adapter);
+		self
+	}
+	pub fn idp_adapter(&mut self, idp_adapter: Arc<dyn IdentityProviderAdapter>) -> &mut Self {
+		self.adapters.idp_adapter = Some(idp_adapter);
 		self
 	}
 
@@ -293,6 +301,7 @@ impl AppBuilder {
 			blob_adapter: self.adapters.blob_adapter.expect("FATAL: No blob adapter"),
 			crdt_adapter: self.adapters.crdt_adapter.expect("FATAL: No CRDT adapter"),
 			rtdb_adapter: self.adapters.rtdb_adapter.expect("FATAL: No RTDB adapter"),
+			idp_adapter: self.adapters.idp_adapter.clone(),
 
 			// Settings
 			settings: settings_service,

@@ -24,9 +24,11 @@ pub(crate) async fn read(dbr: &SqlitePool, tn_id: TnId) -> ClResult<Tenant<Box<s
 			Err(Error::DbError)
 		}
 		Ok(row) => {
-			let xs: &str = row.try_get("x").or(Err(Error::DbError))?;
-			let x: HashMap<Box<str>, Box<str>> =
-				serde_json::from_str(xs).or(Err(Error::DbError))?;
+			let xs: Option<String> = row.try_get("x").or(Err(Error::DbError))?;
+			let x: HashMap<Box<str>, Box<str>> = match xs {
+				Some(json_str) => serde_json::from_str(&json_str).or(Err(Error::DbError))?,
+				None => HashMap::new(),
+			};
 			Ok(Tenant {
 				tn_id,
 				id_tag: row.try_get("id_tag").or(Err(Error::DbError))?,
@@ -48,7 +50,7 @@ pub(crate) async fn read(dbr: &SqlitePool, tn_id: TnId) -> ClResult<Tenant<Box<s
 /// Create a new tenant
 pub(crate) async fn create(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClResult<TnId> {
 	sqlx::query("INSERT INTO tenants (tn_id, id_tag, type, name, x, created_at)
-		VALUES (?, 'P', ?, ?, '{}', unixepoch())")
+		VALUES (?, ?, 'P', ?, '{}', unixepoch())")
 		.bind(tn_id.0)
 		.bind(id_tag)
 		.bind(id_tag)  // Default name = id_tag

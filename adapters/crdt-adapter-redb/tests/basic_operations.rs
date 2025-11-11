@@ -4,7 +4,7 @@
 
 use cloudillo::crdt_adapter::{CrdtAdapter, CrdtDocMeta, CrdtUpdate};
 use cloudillo::types::TnId;
-use crdt_adapter_redb::{AdapterConfig, CrdtAdapterRedb};
+use cloudillo_crdt_adapter_redb::{AdapterConfig, CrdtAdapterRedb};
 use tempfile::TempDir;
 
 async fn create_test_adapter() -> (CrdtAdapterRedb, TempDir) {

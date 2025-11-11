@@ -20,7 +20,7 @@ pub type HookFunction = Arc<
 >;
 
 /// Represents how a hook is implemented
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum HookImplementation {
 	/// DSL-based hook (declarative JSON operations)
 	Dsl(Vec<Operation>),
@@ -32,6 +32,7 @@ pub enum HookImplementation {
 	Hybrid { dsl: Vec<Operation>, native: HookFunction },
 
 	/// No hook defined
+	#[default]
 	None,
 }
 
@@ -83,12 +84,6 @@ impl std::fmt::Debug for HookImplementation {
 				.finish(),
 			Self::None => write!(f, "None"),
 		}
-	}
-}
-
-impl Default for HookImplementation {
-	fn default() -> Self {
-		Self::None
 	}
 }
 

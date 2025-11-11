@@ -198,17 +198,31 @@ where
 // Phase 1: Authentication & Profile Types
 //******************************************
 
-/// Registration request
+/// Registration type and verification request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterVerifyCheckRequest {
+	#[serde(rename = "type")]
+	pub typ: String, // "local" or "domain"
+	pub id_tag: String,
+	pub app_domain: Option<String>,
+	pub register_token: String,
+}
+
+/// Registration request with account creation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterRequest {
+	#[serde(rename = "type")]
+	pub typ: String, // "local" or "domain"
 	pub id_tag: String,
-	pub email: Option<String>,
+	pub app_domain: Option<String>,
 	pub password: String,
-	pub verify_url: Option<String>, // Callback URL for verification
+	pub email: String,
+	pub register_token: String,
 }
 
-/// Registration verification request
+/// Registration verification request (legacy, kept for compatibility)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterVerifyRequest {

@@ -20,6 +20,7 @@ use crate::core::middleware::{optional_auth, request_id_middleware, require_auth
 use crate::core::websocket;
 use crate::file;
 use crate::file::perm::check_perm_file;
+use crate::idp;
 use crate::prelude::*;
 use crate::profile;
 use crate::profile::perm::check_perm_profile;
@@ -115,6 +116,19 @@ fn init_api_service(app: App) -> Router {
 		// Tag API
 		.route("/api/tag", get(file::tag::list_tags))
 
+		// IDP API
+		.route("/api/idp/identities", get(idp::handler::list_identities))
+		.route("/api/idp/identities", post(idp::handler::create_identity))
+		.route("/api/idp/identities/{id}", get(idp::handler::get_identity_by_id))
+		.route("/api/idp/identities/{id}", delete(idp::handler::delete_identity))
+		.route("/api/idp/identities/{id}/address", put(idp::handler::update_identity_address))
+
+		// API Keys
+		.route("/api/api-keys", post(idp::api_keys::create_api_key))
+		.route("/api/api-keys", get(idp::api_keys::list_api_keys))
+		.route("/api/api-keys/{id}", get(idp::api_keys::get_api_key))
+		.route("/api/api-keys/{id}", delete(idp::api_keys::delete_api_key))
+
 		// Password change (requires authentication)
 		.route("/api/auth/password", post(auth::handler::post_password))
 
@@ -136,6 +150,7 @@ fn init_api_service(app: App) -> Router {
 
 		// Inbox
 		.route("/api/inbox", post(action::handler::post_inbox))
+		.route("/api/inbox/sync", post(action::handler::post_inbox_sync))
 
 		// WebSocket APIs
 		.route("/ws/bus", any(websocket::get_ws_bus))

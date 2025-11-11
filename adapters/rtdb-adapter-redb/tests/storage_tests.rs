@@ -11,7 +11,7 @@
 //! test organization pattern (integration tests in separate tests/ directory).
 
 use cloudillo::rtdb_adapter::QueryFilter;
-use rtdb_adapter_redb::storage::*;
+use cloudillo_rtdb_adapter_redb::storage::*;
 use serde_json::Value;
 use std::cmp::Ordering;
 

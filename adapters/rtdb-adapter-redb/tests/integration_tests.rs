@@ -1,6 +1,6 @@
 use cloudillo::rtdb_adapter::{QueryFilter, QueryOptions, RtdbAdapter};
 use cloudillo::types::TnId;
-use rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
+use cloudillo_rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use tempfile::TempDir;
