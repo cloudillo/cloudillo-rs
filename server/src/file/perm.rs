@@ -62,20 +62,39 @@ async fn check_file_permission(
 	Ok(next.run(req).await)
 }
 
-// STUB IMPLEMENTATION - Phase 3 will replace with real adapter calls
+// Load file attributes from MetaAdapter
 async fn load_file_attrs(
-	_app: &App,
-	_tn_id: TnId,
-	_file_id: &str,
+	app: &App,
+	tn_id: TnId,
+	file_id: &str,
 	_subject_id_tag: &str,
 ) -> ClResult<FileAttrs> {
-	// TODO: Call app.meta_adapter.get_file_attrs(tn_id, file_id, subject_id_tag).await
+	// Get file view from MetaAdapter
+	let file_view = app.meta_adapter.read_file(tn_id, file_id).await?;
+
+	let file_view = file_view.ok_or(Error::NotFound)?;
+
+	// Extract owner from nested ProfileInfo
+	let owner_id_tag = file_view
+		.owner
+		.as_ref()
+		.map(|p| p.id_tag.clone())
+		.unwrap_or_else(|| "unknown".into());
+
+	// Determine access level based on file status and file content type
+	// Default to Read for now - can be enhanced with granular permissions
+	let access_level = crate::types::AccessLevel::Read;
+
+	// Get visibility from file metadata
+	// TODO: Add visibility field to FileView in meta_adapter
+	let visibility = "public".into(); // Default to public for now
+
 	Ok(FileAttrs {
-		file_id: "stub".into(),
-		owner_id_tag: "stub_user".into(),
-		mime_type: "application/octet-stream".into(),
-		tags: vec![],
-		visibility: "public".into(),
-		access_level: crate::types::AccessLevel::Read,
+		file_id: file_view.file_id,
+		owner_id_tag,
+		mime_type: file_view.content_type.unwrap_or_else(|| "application/octet-stream".into()),
+		tags: file_view.tags.unwrap_or_default(),
+		visibility,
+		access_level,
 	})
 }

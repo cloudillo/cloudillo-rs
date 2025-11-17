@@ -312,25 +312,18 @@ pub async fn post_file(
 
 	info!("POST /api/file - Creating file with fileTp={}", req.file_tp);
 
-	// Create empty blob for metadata-only files (CRDT, RTDB)
-	let bytes = Vec::new();
-	let blob_id =
-		store::create_blob_buf(&app, tn_id, &bytes, blob_adapter::CreateBlobOptions::default())
-			.await?;
-	info!("Created empty blob with ID: {}", blob_id);
-
 	// Generate file_id
 	let file_id = utils::random_id()?;
 
 	// Create file metadata with specified fileTp
 	let content_type = req.content_type.clone().unwrap_or_else(|| "application/json".to_string());
-	let f_id = app
+	let _f_id = app
 		.meta_adapter
 		.create_file(
 			tn_id,
 			meta_adapter::CreateFile {
 				preset: "default".into(),
-				orig_variant_id: blob_id.clone(),
+				orig_variant_id: file_id.clone().into(),
 				file_id: Some(file_id.clone().into()),
 				owner_tag: None,
 				content_type: content_type.into(),
@@ -345,16 +338,7 @@ pub async fn post_file(
 
 	info!("Created file metadata for fileTp={}", req.file_tp);
 
-	let data = match f_id {
-		meta_adapter::FileId::FId(f_id) => {
-			info!("File created with FId: {}", f_id);
-			json!({"fileId": format!("@{}", f_id)})
-		}
-		meta_adapter::FileId::FileId(file_id) => {
-			info!("File created with FileId: {}", file_id);
-			json!({"fileId": file_id})
-		}
-	};
+	let data = json!({"fileId": file_id});
 
 	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 

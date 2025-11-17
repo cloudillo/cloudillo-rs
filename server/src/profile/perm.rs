@@ -63,21 +63,28 @@ async fn check_profile_permission(
 	Ok(next.run(req).await)
 }
 
-// STUB IMPLEMENTATION - Phase 3 will replace with real adapter calls
+// Load profile attributes from MetaAdapter
 async fn load_profile_attrs(
-	_app: &App,
-	_tn_id: TnId,
-	_id_tag: &str,
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
 	_subject_id_tag: &str,
 ) -> ClResult<ProfileAttrs> {
-	// TODO: Call app.meta_adapter.get_profile_attrs(tn_id, id_tag, subject_id_tag).await
+	// Get profile data from MetaAdapter
+	let profile_data = app.meta_adapter.get_profile_info(tn_id, id_tag).await?;
+
+	// Determine if subject is following or connected to target
+	// For now, default to false - in Phase 4 this will query relationship metadata
+	let following = false;
+	let connected = false;
+
 	Ok(ProfileAttrs {
-		id_tag: "stub".into(),
-		profile_type: "person".into(),
-		tenant_tag: "tenant1".into(),
-		roles: vec!["member".into()],
-		status: "active".into(),
-		following: false,
-		connected: false,
+		id_tag: profile_data.id_tag,
+		profile_type: profile_data.profile_type,
+		tenant_tag: id_tag.into(), // tenant_tag refers to the profile owner
+		roles: vec![],             // TODO: Query actual roles from relationship metadata in Phase 4
+		status: "active".into(),   // TODO: Query actual profile status from MetaAdapter
+		following,
+		connected,
 	})
 }

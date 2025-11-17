@@ -212,19 +212,52 @@ pub struct ProfilePolicy {
 	pub bottom_policy: Policy, // Minimum permissions (guarantees)
 }
 
+/// Collection-level policy configuration
+///
+/// Used for CREATE operations where no specific object exists yet.
+/// Evaluates permissions based on subject attributes only.
+///
+/// Example: User wants to upload a file
+///   - Can evaluate "can user create files?" without the file existing
+///   - Checks: quota_remaining > 0, role == "creator", !banned, email_verified
+#[derive(Debug, Clone)]
+pub struct CollectionPolicy {
+	pub resource_type: String, // "files", "actions", "profiles"
+	pub action: String,        // "create", "list"
+	pub top_policy: Policy,    // Denials/constraints
+	pub bottom_policy: Policy, // Guarantees
+}
+
 /// Main permission checker
 pub struct PermissionChecker {
 	profile_policies: HashMap<TnId, ProfilePolicy>,
+	collection_policies: HashMap<String, CollectionPolicy>, // key: "resource:action"
 }
 
 impl PermissionChecker {
 	pub fn new() -> Self {
-		Self { profile_policies: HashMap::new() }
+		Self { profile_policies: HashMap::new(), collection_policies: HashMap::new() }
 	}
 
-	/// Load policy for tenant (called during bootstrap)
+	/// Load profile policy for tenant (called during bootstrap)
 	pub fn load_policy(&mut self, policy: ProfilePolicy) {
 		self.profile_policies.insert(policy.tn_id, policy);
+	}
+
+	/// Load collection policy for resource type + action
+	pub fn load_collection_policy(&mut self, policy: CollectionPolicy) {
+		let key = format!("{}:{}", policy.resource_type, policy.action);
+		self.collection_policies.insert(key, policy);
+	}
+
+	/// Get collection policy for resource type and action
+	pub fn get_collection_policy(
+		&self,
+		resource_type: &str,
+		action: &str,
+	) -> Option<&CollectionPolicy> {
+		let key = format!("{}:{}", resource_type, action);
+		self.collection_policies.get(&key)
 	}
 
 	/// Core permission check function
@@ -375,6 +408,71 @@ impl PermissionChecker {
 				false
 			}
 		}
+	}
+
+	/// Evaluate collection policy (for CREATE operations)
+	///
+	/// Collection policies check subject attributes without an object existing.
+	/// Used for operations like "can user upload files?" or "can user create posts?"
+	pub fn has_collection_permission(
+		&self,
+		subject: &AuthCtx,
+		subject_attrs: &dyn AttrSet,
+		resource_type: &str,
+		action: &str,
+		environment: &Environment,
+	) -> bool {
+		use tracing::debug;
+
+		// Get collection policy
+		let policy = match self.get_collection_policy(resource_type, action) {
+			Some(p) => p,
+			None => {
+				// No policy defined → allow by default
+				debug!(
+					subject = %subject.id_tag,
+					resource_type = resource_type,
+					action = action,
+					"No collection policy found - allowing by default"
+				);
+				return true;
+			}
+		};
+
+		// Step 1: Check TOP policy (denials/constraints)
+		if let Some(Effect::Deny) =
+			policy.top_policy.evaluate(subject, action, subject_attrs, environment)
+		{
+			debug!(
+				subject = %subject.id_tag,
+				resource_type = resource_type,
+				action = action,
+				"Collection TOP policy denied"
+			);
+			return false;
+		}
+
+		// Step 2: Check BOTTOM policy (guarantees)
+		if let Some(Effect::Allow) =
+			policy.bottom_policy.evaluate(subject, action, subject_attrs, environment)
+		{
+			debug!(
+				subject = %subject.id_tag,
+				resource_type = resource_type,
+				action = action,
+				"Collection BOTTOM policy allowed"
+			);
+			return true;
+		}
+
+		// Step 3: Default deny (no policies matched)
+		debug!(
+			subject = %subject.id_tag,
+			resource_type = resource_type,
+			action = action,
+			"No matching collection policies - default deny"
+		);
+		false
 	}
 }
 

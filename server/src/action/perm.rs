@@ -62,22 +62,41 @@ async fn check_action_permission(
 	Ok(next.run(req).await)
 }
 
-// STUB IMPLEMENTATION - Phase 3 will replace with real adapter calls
+// Load action attributes from MetaAdapter
 async fn load_action_attrs(
-	_app: &App,
-	_tn_id: TnId,
-	_action_id: &str,
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
 	_subject_id_tag: &str,
 ) -> ClResult<ActionAttrs> {
-	// TODO: Call app.meta_adapter.get_action_attrs(tn_id, action_id).await
+	// Get action view from MetaAdapter
+	let action_view = app.meta_adapter.get_action(tn_id, action_id).await?;
+
+	let action_view = action_view.ok_or(Error::NotFound)?;
+
+	// Extract audience as list of profile id_tags
+	let audience_tag = action_view
+		.audience
+		.as_ref()
+		.map(|p| vec![p.id_tag.clone()])
+		.unwrap_or_default();
+
+	// Determine visibility based on audience and action properties
+	// TODO: Add explicit visibility field to ActionView for more fine-grained control
+	let visibility = if audience_tag.is_empty() {
+		"public".into()
+	} else {
+		"direct".into() // Has specific audience
+	};
+
 	Ok(ActionAttrs {
-		typ: "post".into(),
-		sub_typ: None,
-		issuer_id_tag: "stub_user".into(),
-		parent_id: None,
-		root_id: None,
-		audience_tag: vec![],
-		tags: vec![],
-		visibility: "public".into(),
+		typ: action_view.typ,
+		sub_typ: action_view.sub_typ,
+		issuer_id_tag: action_view.issuer.id_tag,
+		parent_id: action_view.parent_id,
+		root_id: action_view.root_id,
+		audience_tag,
+		tags: vec![], // TODO: Extract tags from action metadata when available
+		visibility,
 	})
 }

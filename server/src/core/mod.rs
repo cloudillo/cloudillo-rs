@@ -3,6 +3,7 @@
 pub mod abac;
 pub mod acme;
 pub mod app;
+pub mod create_perm;
 pub mod extract;
 pub mod hasher;
 pub mod middleware;

@@ -203,10 +203,10 @@ where
 #[serde(rename_all = "camelCase")]
 pub struct RegisterVerifyCheckRequest {
 	#[serde(rename = "type")]
-	pub typ: String, // "local" or "domain"
+	pub typ: String, // "idp" or "domain"
 	pub id_tag: String,
 	pub app_domain: Option<String>,
-	pub register_token: String,
+	pub token: String,
 }
 
 /// Registration request with account creation
@@ -214,12 +214,11 @@ pub struct RegisterVerifyCheckRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RegisterRequest {
 	#[serde(rename = "type")]
-	pub typ: String, // "local" or "domain"
+	pub typ: String, // "idp" or "domain"
 	pub id_tag: String,
 	pub app_domain: Option<String>,
-	pub password: String,
 	pub email: String,
-	pub register_token: String,
+	pub token: String,
 }
 
 /// Registration verification request (legacy, kept for compatibility)
@@ -227,7 +226,7 @@ pub struct RegisterRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RegisterVerifyRequest {
 	pub id_tag: String,
-	pub verify_token: String,
+	pub token: String,
 }
 
 /// Profile patch for PATCH /me endpoint
@@ -546,6 +545,43 @@ impl AttrSet for FileAttrs {
 	fn get_list(&self, key: &str) -> Option<Vec<&str>> {
 		match key {
 			"tags" => Some(self.tags.iter().map(|s| s.as_ref()).collect()),
+			_ => None,
+		}
+	}
+}
+
+/// Subject attributes for ABAC (CREATE operations)
+///
+/// Used to evaluate collection-level permissions for operations
+/// that don't yet have a specific object (like file upload, post creation).
+#[derive(Debug, Clone)]
+pub struct SubjectAttrs {
+	pub id_tag: Box<str>,
+	pub roles: Vec<Box<str>>,
+	pub tier: Box<str>,                  // "free", "standard", "premium"
+	pub quota_remaining_bytes: Box<str>, // in bytes, as string for ABAC
+	pub rate_limit_remaining: Box<str>,  // per hour, as string for ABAC
+	pub banned: bool,
+	pub email_verified: bool,
+}
+
+impl AttrSet for SubjectAttrs {
+	fn get(&self, key: &str) -> Option<&str> {
+		match key {
+			"id_tag" => Some(&self.id_tag),
+			"tier" => Some(&self.tier),
+			"quota_remaining" => Some(&self.quota_remaining_bytes),
+			"quota_remaining_bytes" => Some(&self.quota_remaining_bytes),
+			"rate_limit_remaining" => Some(&self.rate_limit_remaining),
+			"banned" => Some(if self.banned { "true" } else { "false" }),
+			"email_verified" => Some(if self.email_verified { "true" } else { "false" }),
+			_ => None,
+		}
+	}
+
+	fn get_list(&self, key: &str) -> Option<Vec<&str>> {
+		match key {
+			"roles" => Some(self.roles.iter().map(|r| r.as_ref()).collect()),
 			_ => None,
 		}
 	}
