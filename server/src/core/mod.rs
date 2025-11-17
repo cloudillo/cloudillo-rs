@@ -2,8 +2,10 @@
 
 pub mod abac;
 pub mod acme;
+pub mod address;
 pub mod app;
 pub mod create_perm;
+pub mod dns;
 pub mod extract;
 pub mod hasher;
 pub mod middleware;

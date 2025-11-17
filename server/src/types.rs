@@ -247,10 +247,6 @@ pub struct ProfileInfo {
 	pub name: String,
 	pub profile_type: String,
 	pub profile_pic: Option<String>, // file_id
-	pub cover: Option<String>,       // file_id (new)
-	pub description: Option<String>,
-	pub location: Option<String>,
-	pub website: Option<String>,
 	pub created_at: u64,
 }
 

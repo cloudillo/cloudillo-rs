@@ -170,6 +170,56 @@ impl Request {
 		Ok(parsed)
 	}
 
+	/// Make a public GET request without authentication or tenant context
+	pub async fn get_public<Res>(&self, id_tag: &str, path: &str) -> ClResult<Res>
+	where
+		Res: DeserializeOwned,
+	{
+		let req = hyper::Request::builder()
+			.method(Method::GET)
+			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
+			.body(to_boxed(Empty::new()))?;
+		let res = self.client.request(req).await?;
+		match res.status() {
+			StatusCode::OK => {
+				let bytes = res.into_body().collect().await?.to_bytes();
+				let parsed: Res = serde_json::from_slice(&bytes)?;
+				Ok(parsed)
+			}
+			StatusCode::NOT_FOUND => Err(Error::NotFound),
+			StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
+			_ => Err(Error::Unknown),
+		}
+	}
+
+	/// Make a public POST request without authentication or tenant context
+	pub async fn post_public<Req, Res>(&self, id_tag: &str, path: &str, data: &Req) -> ClResult<Res>
+	where
+		Req: Serialize,
+		Res: DeserializeOwned,
+	{
+		let json_data = serde_json::to_vec(data)?;
+		let req = hyper::Request::builder()
+			.method(Method::POST)
+			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
+			.header("Content-Type", "application/json")
+			.body(to_boxed(Full::from(json_data)))?;
+		let res = self.client.request(req).await?;
+		match res.status() {
+			StatusCode::OK | StatusCode::CREATED => {
+				let bytes = res.into_body().collect().await?.to_bytes();
+				let parsed: Res = serde_json::from_slice(&bytes)?;
+				Ok(parsed)
+			}
+			StatusCode::NOT_FOUND => Err(Error::NotFound),
+			StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
+			StatusCode::UNPROCESSABLE_ENTITY => Err(Error::ValidationError(
+				"IDP registration failed - validation error".to_string(),
+			)),
+			_ => Err(Error::Unknown),
+		}
+	}
+
 	pub async fn post_bin(
 		&self,
 		_tn_id: TnId,

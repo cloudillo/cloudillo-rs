@@ -53,10 +53,6 @@ pub async fn list_profiles(
 			name: pd.name.to_string(),
 			profile_type: pd.profile_type.to_string(),
 			profile_pic: pd.profile_pic.map(|s| s.to_string()),
-			cover: pd.cover.map(|s| s.to_string()),
-			description: pd.description.map(|s| s.to_string()),
-			location: pd.location.map(|s| s.to_string()),
-			website: pd.website.map(|s| s.to_string()),
 			created_at: pd.created_at,
 		})
 		.collect();
@@ -83,10 +79,6 @@ pub async fn get_profile_by_id_tag(
 		name: profile_data.name.to_string(),
 		profile_type: profile_data.profile_type.to_string(),
 		profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
-		cover: profile_data.cover.map(|s| s.to_string()),
-		description: profile_data.description.map(|s| s.to_string()),
-		location: profile_data.location.map(|s| s.to_string()),
-		website: profile_data.website.map(|s| s.to_string()),
 		created_at: profile_data.created_at,
 	};
 

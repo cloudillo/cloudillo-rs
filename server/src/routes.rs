@@ -124,10 +124,10 @@ fn init_api_service(app: App) -> Router {
 		.route("/api/idp/identities/{id}/address", put(idp::handler::update_identity_address))
 
 		// API Keys
-		.route("/api/api-keys", post(idp::api_keys::create_api_key))
-		.route("/api/api-keys", get(idp::api_keys::list_api_keys))
-		.route("/api/api-keys/{id}", get(idp::api_keys::get_api_key))
-		.route("/api/api-keys/{id}", delete(idp::api_keys::delete_api_key))
+		.route("/api/idp/api-keys", post(idp::api_keys::create_api_key))
+		.route("/api/idp/api-keys", get(idp::api_keys::list_api_keys))
+		.route("/api/idp/api-keys/{id}", get(idp::api_keys::get_api_key))
+		.route("/api/idp/api-keys/{id}", delete(idp::api_keys::delete_api_key))
 
 		// Password change (requires authentication)
 		.route("/api/auth/password", post(auth::handler::post_password))
@@ -147,6 +147,9 @@ fn init_api_service(app: App) -> Router {
 		.route("/api/auth/register-verify", post(auth::register::post_register_verify))
 		.route("/api/auth/login", post(auth::handler::post_login))
 		.route("/api/auth/access-token", get(auth::handler::get_access_token))
+
+		// IDP Public API
+		.route("/api/idp/check-availability", get(idp::handler::check_identity_availability))
 
 		// Inbox
 		.route("/api/inbox", post(action::handler::post_inbox))

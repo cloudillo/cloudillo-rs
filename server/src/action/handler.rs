@@ -3,7 +3,7 @@ use axum::{
 	http::StatusCode,
 	Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
 	action::task::{self, ActionVerifierTask, CreateAction},
@@ -73,24 +73,24 @@ pub struct Inbox {
 }
 
 /// Request structure for synchronous action processing (e.g., IDP:REG)
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SyncActionRequest {
 	/// Action type (e.g., "IDP:REG")
-	r#type: String,
+	pub r#type: String,
 	/// Optional subtype for action variants
-	subtype: Option<String>,
+	pub subtype: Option<String>,
 	/// Issuer ID tag (who is sending this action)
-	issuer: String,
+	pub issuer: String,
 	/// Target audience (who should receive this action)
-	audience: Option<String>,
+	pub audience: Option<String>,
 	/// Action content (structure depends on action type)
-	content: serde_json::Value,
+	pub content: serde_json::Value,
 	/// Optional parent action ID (for threading)
-	parent: Option<String>,
+	pub parent: Option<String>,
 	/// Optional subject
-	subject: Option<String>,
+	pub subject: Option<String>,
 	/// Optional attachments
-	attachments: Option<Vec<String>>,
+	pub attachments: Option<Vec<String>>,
 }
 
 #[axum::debug_handler]
@@ -122,72 +122,44 @@ pub async fn post_inbox(
 ///
 /// This endpoint processes certain action types synchronously and returns the hook's response.
 /// Used for action types like IDP:REG that need immediate feedback.
+/// Uses token-based authentication like /inbox but processes synchronously and returns the hook result.
 #[axum::debug_handler]
 pub async fn post_inbox_sync(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(id_tag): IdTag,
+	IdTag(_id_tag): IdTag,
 	OptionalRequestId(req_id): OptionalRequestId,
-	Json(sync_request): Json<SyncActionRequest>,
+	Json(inbox): Json<Inbox>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
-	use crate::action::hooks::{HookContext, HookType};
-	use std::collections::HashMap;
+	use crate::action::process::process_inbound_action_token;
 
-	info!(
-		action_type = %sync_request.r#type,
-		issuer = %sync_request.issuer,
-		audience = ?sync_request.audience,
-		"POST /api/inbox/sync - Processing synchronous action"
-	);
+	info!("POST /api/inbox/sync - Processing synchronous action");
 
-	// Check if the action type is defined
-	if !app.dsl_engine.has_definition(&sync_request.r#type) {
-		return Err(Error::ValidationError(format!(
-			"Action type not supported: {}",
-			sync_request.r#type
-		)));
+	// Check if federation is enabled
+	let federation_enabled =
+		app.settings.get_bool(tn_id, "federation.enabled").await.unwrap_or(true);
+
+	if !federation_enabled {
+		return Err(Error::PermissionDenied);
 	}
 
-	// Create a unique action ID for this sync action
-	let action_id_box = hash(
-		"a",
-		format!("{}:{}:{}", sync_request.r#type, sync_request.issuer, Timestamp::now().0)
-			.as_bytes(),
-	);
+	// Create action ID from token hash
+	let action_id_box = hash("a", inbox.token.as_bytes());
 	let action_id = action_id_box.to_string();
 
-	// Construct the HookContext
-	let hook_context = HookContext {
-		action_id,
-		r#type: sync_request.r#type.clone(),
-		subtype: sync_request.subtype.clone(),
-		issuer: sync_request.issuer.clone(),
-		audience: sync_request.audience.clone(),
-		parent: sync_request.parent.clone(),
-		subject: sync_request.subject.clone(),
-		content: Some(sync_request.content),
-		attachments: sync_request.attachments.clone(),
-		created_at: format!("{}", Timestamp::now().0),
-		expires_at: None,
-		tenant_id: tn_id.0 as i64,
-		tenant_tag: id_tag.to_string(),
-		tenant_type: "person".to_string(),
-		is_inbound: true,
-		is_outbound: false,
-		vars: HashMap::new(),
-	};
+	// Process the action synchronously and get the hook result
+	let hook_result = process_inbound_action_token(&app, tn_id, &action_id, &inbox.token, true)
+		.await
+		.map_err(|e| {
+			warn!(error = %e, "Failed to process synchronous action");
+			e
+		})?;
 
-	// Execute the on_receive hook synchronously and get the result
-	let hook_result = app
-		.dsl_engine
-		.execute_hook_with_result(&app, &sync_request.r#type, HookType::OnReceive, hook_context)
-		.await?;
-
-	// Extract the return value from the hook result
-	let response_data = hook_result.return_value.unwrap_or(serde_json::json!({}));
+	// Extract the return value from the hook result (or empty object if no return value)
+	let response_data = hook_result.unwrap_or(serde_json::json!({}));
 
 	info!(
-		action_type = %sync_request.r#type,
+		action_id = %action_id,
 		"POST /api/inbox/sync - Synchronous action processed successfully"
 	);
 

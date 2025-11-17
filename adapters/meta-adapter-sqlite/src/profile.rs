@@ -312,9 +312,6 @@ pub(crate) async fn update_fields(
 	tn_id: TnId,
 	id_tag: &str,
 	name: Option<&str>,
-	description: Option<&str>,
-	location: Option<&str>,
-	website: Option<&str>,
 ) -> ClResult<()> {
 	// Build UPDATE query based on which fields are provided
 	let mut query = String::from("UPDATE profiles SET ");
@@ -325,42 +322,6 @@ pub(crate) async fn update_fields(
 			query.push_str(", ");
 		}
 		query.push_str("name = ?1");
-		field_count += 1;
-	}
-
-	if let Some(desc) = description {
-		if field_count > 0 {
-			query.push_str(", ");
-		}
-		if !desc.is_empty() {
-			query.push_str("description = ?");
-		} else {
-			query.push_str("description = NULL");
-		}
-		field_count += 1;
-	}
-
-	if let Some(loc) = location {
-		if field_count > 0 {
-			query.push_str(", ");
-		}
-		if !loc.is_empty() {
-			query.push_str("location = ?");
-		} else {
-			query.push_str("location = NULL");
-		}
-		field_count += 1;
-	}
-
-	if let Some(site) = website {
-		if field_count > 0 {
-			query.push_str(", ");
-		}
-		if !site.is_empty() {
-			query.push_str("website = ?");
-		} else {
-			query.push_str("website = NULL");
-		}
 		field_count += 1;
 	}
 
@@ -375,21 +336,6 @@ pub(crate) async fn update_fields(
 
 	if let Some(n) = name {
 		sql_query = sql_query.bind(n);
-	}
-	if let Some(d) = description {
-		if !d.is_empty() {
-			sql_query = sql_query.bind(d);
-		}
-	}
-	if let Some(l) = location {
-		if !l.is_empty() {
-			sql_query = sql_query.bind(l);
-		}
-	}
-	if let Some(w) = website {
-		if !w.is_empty() {
-			sql_query = sql_query.bind(w);
-		}
 	}
 
 	sql_query = sql_query.bind(tn_id.0).bind(id_tag);
@@ -418,25 +364,6 @@ pub(crate) async fn update_image(
 	Ok(())
 }
 
-/// Update profile cover
-pub(crate) async fn update_cover(
-	db: &SqlitePool,
-	tn_id: TnId,
-	id_tag: &str,
-	file_id: &str,
-) -> ClResult<()> {
-	sqlx::query("UPDATE profiles SET cover = ? WHERE tn_id = ? AND id_tag = ?")
-		.bind(file_id)
-		.bind(tn_id.0)
-		.bind(id_tag)
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-
-	Ok(())
-}
-
 /// List all profiles with pagination
 pub(crate) async fn list_all(
 	db: &SqlitePool,
@@ -445,7 +372,7 @@ pub(crate) async fn list_all(
 	offset: usize,
 ) -> ClResult<Vec<ProfileData>> {
 	let rows = sqlx::query(
-		"SELECT id_tag, name, type, profile_pic, cover, description, location, website, created_at
+		"SELECT id_tag, name, type, profile_pic, created_at
 		 FROM profiles WHERE tn_id = ?
 		 ORDER BY created_at DESC
 		 LIMIT ? OFFSET ?",
@@ -469,10 +396,6 @@ pub(crate) async fn list_all(
 				name: row.get("name"),
 				profile_type: profile_type.into(),
 				profile_pic: row.get("profile_pic"),
-				cover: row.get("cover"),
-				description: row.get("description"),
-				location: row.get("location"),
-				website: row.get("website"),
 				created_at: created_at as u64,
 			}
 		})
@@ -484,7 +407,7 @@ pub(crate) async fn list_all(
 /// Get profile info
 pub(crate) async fn get_info(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClResult<ProfileData> {
 	let row = sqlx::query(
-		"SELECT id_tag, name, type, profile_pic, cover, description, location, website, created_at
+		"SELECT id_tag, name, type, profile_pic, created_at
 		 FROM profiles WHERE tn_id = ? AND id_tag = ?",
 	)
 	.bind(tn_id.0)
@@ -505,10 +428,6 @@ pub(crate) async fn get_info(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClRe
 		name: row.get("name"),
 		profile_type: profile_type.into(),
 		profile_pic: row.get("profile_pic"),
-		cover: row.get("cover"),
-		description: row.get("description"),
-		location: row.get("location"),
-		website: row.get("website"),
 		created_at: created_at as u64,
 	})
 }
@@ -522,10 +441,10 @@ pub(crate) async fn list_all_remote(
 	// List all profiles from cache (across all tenants)
 	// This is for public profile discovery - no tenant filtering
 	let rows = sqlx::query(
-		"SELECT DISTINCT id_tag, name, type, profile_pic, cover, description, location, website, created_at
+		"SELECT DISTINCT id_tag, name, type, profile_pic, created_at
 		 FROM profiles
 		 ORDER BY created_at DESC
-		 LIMIT ? OFFSET ?"
+		 LIMIT ? OFFSET ?",
 	)
 	.bind(limit as i32)
 	.bind(offset as i32)
@@ -545,10 +464,6 @@ pub(crate) async fn list_all_remote(
 				name: row.get("name"),
 				profile_type: profile_type.into(),
 				profile_pic: row.get("profile_pic"),
-				cover: row.get("cover"),
-				description: row.get("description"),
-				location: row.get("location"),
-				website: row.get("website"),
 				created_at: created_at as u64,
 			}
 		})
@@ -568,11 +483,11 @@ pub(crate) async fn search(
 	let search_pattern = format!("%{}%", query_str);
 
 	let rows = sqlx::query(
-		"SELECT DISTINCT id_tag, name, type, profile_pic, cover, description, location, website, created_at
+		"SELECT DISTINCT id_tag, name, type, profile_pic, created_at
 		 FROM profiles
 		 WHERE LOWER(id_tag) LIKE LOWER(?) OR LOWER(name) LIKE LOWER(?)
 		 ORDER BY created_at DESC
-		 LIMIT ? OFFSET ?"
+		 LIMIT ? OFFSET ?",
 	)
 	.bind(&search_pattern)
 	.bind(&search_pattern)
@@ -594,10 +509,6 @@ pub(crate) async fn search(
 				name: row.get("name"),
 				profile_type: profile_type.into(),
 				profile_pic: row.get("profile_pic"),
-				cover: row.get("cover"),
-				description: row.get("description"),
-				location: row.get("location"),
-				website: row.get("website"),
 				created_at: created_at as u64,
 			}
 		})

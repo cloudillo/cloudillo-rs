@@ -6,16 +6,40 @@ use axum::{
 	Json,
 };
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::str::FromStr;
+use std::net::SocketAddr;
 
+use crate::core::address::parse_address_type;
+use crate::core::app::App;
 use crate::core::extract::{IdTag, OptionalRequestId};
 use crate::core::utils::parse_and_validate_identity_id_tag;
 use crate::identity_provider_adapter::{
-	AddressType, CreateIdentityOptions, Identity, IdentityStatus, ListIdentityOptions,
+	CreateIdentityOptions, Identity, IdentityStatus, ListIdentityOptions,
 };
 use crate::prelude::*;
+use crate::settings::SettingValue;
 use crate::types::{ApiResponse, Timestamp};
+
+/// Check if IDP functionality is enabled for a tenant
+async fn check_idp_enabled(app: &App, tn_id: TnId) -> ClResult<()> {
+	match app.settings.get(tn_id, "idp.enabled").await {
+		Ok(SettingValue::Bool(true)) => {
+			debug!(tn_id = tn_id.0, "IDP enabled for tenant");
+			Ok(())
+		}
+		Ok(SettingValue::Bool(false)) => {
+			warn!(tn_id = tn_id.0, "IDP not enabled for tenant");
+			Err(Error::NotFound)
+		}
+		Ok(_) => {
+			warn!(tn_id = tn_id.0, "Invalid idp.enabled setting value");
+			Err(Error::ConfigError("Invalid idp.enabled setting value (expected boolean)".into()))
+		}
+		Err(e) => {
+			warn!(tn_id = tn_id.0, error = ?e, "Failed to check idp.enabled setting");
+			Err(e)
+		}
+	}
+}
 
 /// Response structure for identity details
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,60 +71,6 @@ impl From<Identity> for IdentityResponse {
 			expires_at: identity.expires_at.0,
 		}
 	}
-}
-
-/// Parse and determine the type of an address (IPv4, IPv6, or hostname)
-///
-/// Returns the AddressType if the address is valid, otherwise returns an error
-fn parse_address_type(address: &str) -> ClResult<AddressType> {
-	// Try to parse as IPv4
-	if Ipv4Addr::from_str(address).is_ok() {
-		return Ok(AddressType::Ipv4);
-	}
-
-	// Try to parse as IPv6
-	if Ipv6Addr::from_str(address).is_ok() {
-		return Ok(AddressType::Ipv6);
-	}
-
-	// Validate as hostname
-	// Basic hostname validation: must be non-empty, contain only alphanumeric, dots, hyphens, underscores
-	// and must not start or end with a hyphen or dot
-	if address.is_empty() {
-		return Err(Error::ValidationError("Address cannot be empty".to_string()));
-	}
-
-	if address.len() > 253 {
-		return Err(Error::ValidationError("Hostname too long (max 253 characters)".to_string()));
-	}
-
-	// Check valid hostname characters and structure
-	let valid_chars = |c: char| c.is_alphanumeric() || c == '.' || c == '-' || c == '_';
-	if !address.chars().all(valid_chars) {
-		return Err(Error::ValidationError(
-			"Invalid hostname characters (allowed: alphanumeric, dot, hyphen, underscore)"
-				.to_string(),
-		));
-	}
-
-	// Check labels (parts between dots)
-	for label in address.split('.') {
-		if label.is_empty() {
-			return Err(Error::ValidationError("Hostname labels cannot be empty".to_string()));
-		}
-		if label.starts_with('-') || label.ends_with('-') {
-			return Err(Error::ValidationError(
-				"Hostname labels cannot start or end with hyphen".to_string(),
-			));
-		}
-		if label.len() > 63 {
-			return Err(Error::ValidationError(
-				"Hostname label too long (max 63 characters)".to_string(),
-			));
-		}
-	}
-
-	Ok(AddressType::Hostname)
 }
 
 /// Request structure for creating a new identity
@@ -146,6 +116,7 @@ pub struct ListIdentitiesQuery {
 #[axum::debug_handler]
 pub async fn get_identity_by_id(
 	State(app): State<App>,
+	tn_id: TnId,
 	IdTag(registrar_id_tag): IdTag,
 	Path(identity_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -155,6 +126,9 @@ pub async fn get_identity_by_id(
 		registrar_id_tag = %registrar_id_tag,
 		"GET /api/idp/identities/:id"
 	);
+
+	// Check if IDP is enabled for this tenant
+	check_idp_enabled(&app, tn_id).await?;
 
 	// Verify Identity Provider adapter is available
 	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
@@ -196,6 +170,7 @@ pub async fn get_identity_by_id(
 #[axum::debug_handler]
 pub async fn list_identities(
 	State(app): State<App>,
+	tn_id: TnId,
 	IdTag(registrar_id_tag): IdTag,
 	Query(query_params): Query<ListIdentitiesQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -204,6 +179,9 @@ pub async fn list_identities(
 		registrar_id_tag = %registrar_id_tag,
 		"GET /api/idp/identities"
 	);
+
+	// Check if IDP is enabled for this tenant
+	check_idp_enabled(&app, tn_id).await?;
 
 	// Verify Identity Provider adapter is available
 	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
@@ -240,6 +218,7 @@ pub async fn list_identities(
 #[axum::debug_handler]
 pub async fn create_identity(
 	State(app): State<App>,
+	tn_id: TnId,
 	IdTag(registrar_id_tag): IdTag,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(create_req): Json<CreateIdentityRequest>,
@@ -250,6 +229,9 @@ pub async fn create_identity(
 		email = %create_req.email,
 		"POST /api/idp/identities - Creating new identity"
 	);
+
+	// Check if IDP is enabled for this tenant
+	check_idp_enabled(&app, tn_id).await?;
 
 	// Verify Identity Provider adapter is available
 	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
@@ -317,6 +299,7 @@ pub async fn create_identity(
 #[axum::debug_handler]
 pub async fn update_identity_address(
 	State(app): State<App>,
+	tn_id: TnId,
 	IdTag(registrar_id_tag): IdTag,
 	Path(identity_id): Path<String>,
 	ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
@@ -328,6 +311,9 @@ pub async fn update_identity_address(
 		registrar_id_tag = %registrar_id_tag,
 		"PUT /api/idp/identities/:id/address - Updating identity address"
 	);
+
+	// Check if IDP is enabled for this tenant
+	check_idp_enabled(&app, tn_id).await?;
 
 	// Verify Identity Provider adapter is available
 	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
@@ -418,6 +404,7 @@ pub async fn update_identity_address(
 #[axum::debug_handler]
 pub async fn delete_identity(
 	State(app): State<App>,
+	tn_id: TnId,
 	IdTag(registrar_id_tag): IdTag,
 	Path(identity_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -427,6 +414,9 @@ pub async fn delete_identity(
 		registrar_id_tag = %registrar_id_tag,
 		"DELETE /api/idp/identities/:id - Deleting identity"
 	);
+
+	// Check if IDP is enabled for this tenant
+	check_idp_enabled(&app, tn_id).await?;
 
 	// Verify Identity Provider adapter is available
 	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
@@ -469,6 +459,116 @@ pub async fn delete_identity(
 	}
 
 	Ok((StatusCode::OK, Json(response)))
+}
+
+/// Response structure for identity availability check
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvailabilityResponse {
+	pub available: bool,
+	pub id_tag: String,
+}
+
+/// Query parameters for checking identity availability
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckAvailabilityQuery {
+	/// The identity id_tag to check (e.g., "alice.cloudillo.net")
+	pub id_tag: String,
+}
+
+/// GET /api/idp/check-availability - Check if an identity id_tag is available
+///
+/// This endpoint checks if an identity is available for registration within the
+/// authenticated tenant's domain. The identity must belong to the same domain as
+/// the authenticated tenant.
+#[axum::debug_handler]
+pub async fn check_identity_availability(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(my_id_tag): IdTag,
+	Query(query): Query<CheckAvailabilityQuery>,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<AvailabilityResponse>>)> {
+	let id_tag = query.id_tag.trim().to_lowercase();
+
+	info!(
+		id_tag = %id_tag,
+		registrar_id_tag = %my_id_tag,
+		"GET /api/idp/check-availability - Checking identity availability"
+	);
+
+	// Check if IDP is enabled for this tenant
+	check_idp_enabled(&app, tn_id).await?;
+
+	// Verify Identity Provider adapter is available
+	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
+		"Identity Provider not available on this instance".to_string(),
+	))?;
+
+	// Validate id_tag format - must contain at least one dot
+	if !id_tag.contains('.') {
+		return Err(Error::ValidationError(
+			"Identity id_tag must be in format 'prefix.domain' (e.g., 'alice.cloudillo.net')"
+				.to_string(),
+		));
+	}
+
+	// Split at the FIRST dot: "alice.cloudillo.net" -> prefix: "alice", domain: "cloudillo.net"
+	if let Some(first_dot_pos) = id_tag.find('.') {
+		let id_tag_prefix = &id_tag[..first_dot_pos];
+		let id_tag_domain = &id_tag[first_dot_pos + 1..];
+
+		// Validate prefix is not empty
+		if id_tag_prefix.is_empty() {
+			return Err(Error::ValidationError(
+				"Identity prefix cannot be empty (id_tag must be in format 'prefix.domain')"
+					.to_string(),
+			));
+		}
+
+		// Validate domain is not empty
+		if id_tag_domain.is_empty() {
+			return Err(Error::ValidationError(
+				"Identity domain cannot be empty (id_tag must be in format 'prefix.domain')"
+					.to_string(),
+			));
+		}
+
+		// Validate that the requested identity domain matches the registrar's domain
+		if id_tag_domain != my_id_tag.as_ref() {
+			warn!(
+				requested_domain = %id_tag_domain,
+				registrar_domain = %my_id_tag,
+				"Domain mismatch in availability check"
+			);
+			return Err(Error::PermissionDenied);
+		}
+
+		debug!(
+			id_tag = %id_tag,
+			prefix = %id_tag_prefix,
+			domain = %id_tag_domain,
+			"Parsed identity id_tag for availability check"
+		);
+
+		// Check if the identity exists
+		let identity_exists =
+			idp_adapter.read_identity(id_tag_prefix, id_tag_domain).await?.is_some();
+
+		let response_data =
+			AvailabilityResponse { available: !identity_exists, id_tag: id_tag.clone() };
+
+		let mut response = ApiResponse::new(response_data);
+		if let Some(id) = req_id {
+			response = response.with_req_id(id);
+		}
+
+		Ok((StatusCode::OK, Json(response)))
+	} else {
+		Err(Error::ValidationError(
+			"Identity id_tag must contain at least one dot separator".to_string(),
+		))
+	}
 }
 
 // vim: ts=4

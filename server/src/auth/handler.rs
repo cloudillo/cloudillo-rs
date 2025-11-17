@@ -67,10 +67,6 @@ pub async fn return_login(
 			name: auth.id_tag.clone(),
 			profile_type: "person".into(),
 			profile_pic: None,
-			cover: None,
-			description: None,
-			location: None,
-			website: None,
 			created_at: 0,
 		});
 

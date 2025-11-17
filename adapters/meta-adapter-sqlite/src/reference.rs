@@ -18,8 +18,10 @@ pub(crate) async fn list(
 	);
 	query.push_bind(tn_id.0);
 
-	query.push(" AND type = ");
-	query.push_bind(opts.typ.as_deref());
+	if let Some(ref typ) = opts.typ {
+		query.push(" AND type = ");
+		query.push_bind(typ.as_str());
+	}
 
 	if let Some(ref filter) = opts.filter {
 		let now = Timestamp::now();

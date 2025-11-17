@@ -66,6 +66,8 @@ async fn test_update_tenant() {
 		id_tag: Patch::Undefined,
 		name: Patch::Value("Robert".into()),
 		typ: Patch::Undefined,
+		profile_pic: Patch::Undefined,
+		cover_pic: Patch::Undefined,
 	};
 
 	let updated = adapter.update_tenant(tn_id, &update_data).await;

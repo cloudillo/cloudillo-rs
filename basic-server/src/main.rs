@@ -27,7 +27,7 @@ pub struct Config {
 	pub pub_data_dir: PathBuf,
 	pub dist_dir: PathBuf,
 	pub acme_email: Option<String>,
-	pub local_ips: Vec<String>,
+	pub local_addresses: Vec<String>,
 	pub identity_providers: Vec<String>,
 	pub db_dir: PathBuf,
 }
@@ -64,13 +64,14 @@ async fn main() {
 			.map(PathBuf::from)
 			.unwrap_or_else(|_| PathBuf::from("./dist")),
 		acme_email: env::var("ACME_EMAIL").ok(),
-		local_ips: env::var("LOCAL_IPS")
+		local_addresses: env::var("LOCAL_ADDRESSES")
+		.or_else(|_| env::var("LOCAL_IPS"))  // Backward compatibility with LOCAL_IPS
 			.ok()
-			.map(|s| s.split(',').map(|s| s.to_string()).collect())
+			.map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
 			.unwrap_or_default(),
 		identity_providers: env::var("IDENTITY_PROVIDERS")
 			.ok()
-			.map(|s| s.split(',').map(|s| s.to_string()).collect())
+			.map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
 			.unwrap_or_default(),
 		db_dir: env::var("DB_DIR")
 			.map(PathBuf::from)
@@ -119,7 +120,7 @@ async fn main() {
 		.base_id_tag(config.base_id_tag)
 		.base_app_domain(config.base_app_domain)
 		.dist_dir(config.dist_dir)
-		.local_ips(config.local_ips)
+		.local_addresses(config.local_addresses)
 		.identity_providers(config.identity_providers)
 		.auth_adapter(auth_adapter)
 		.meta_adapter(meta_adapter)

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
+pub use crate::core::address::AddressType;
 use crate::prelude::*;
 
 /// Status of an identity in the registration lifecycle
@@ -19,27 +20,6 @@ pub enum IdentityStatus {
 	Active,
 	/// Identity is suspended and cannot be used
 	Suspended,
-}
-
-/// Type of address for an identity
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AddressType {
-	/// IPv4 address (e.g., 192.168.1.1)
-	Ipv4,
-	/// IPv6 address (e.g., 2001:db8::1)
-	Ipv6,
-	/// Hostname/domain name (e.g., example.com)
-	Hostname,
-}
-
-impl std::fmt::Display for AddressType {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			AddressType::Ipv4 => write!(f, "ipv4"),
-			AddressType::Ipv6 => write!(f, "ipv6"),
-			AddressType::Hostname => write!(f, "hostname"),
-		}
-	}
 }
 
 impl std::fmt::Display for IdentityStatus {

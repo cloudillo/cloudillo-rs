@@ -97,6 +97,10 @@ pub struct UpdateTenantData {
 	pub name: Patch<String>,
 	#[serde(rename = "type", default)]
 	pub typ: Patch<ProfileType>,
+	#[serde(rename = "profilePic", default)]
+	pub profile_pic: Patch<String>,
+	#[serde(rename = "coverPic", default)]
+	pub cover_pic: Patch<String>,
 }
 
 #[derive(Debug)]
@@ -127,10 +131,6 @@ pub struct ProfileData {
 	pub name: Box<str>,
 	pub profile_type: Box<str>, // "person" or "community"
 	pub profile_pic: Option<Box<str>>,
-	pub cover: Option<Box<str>>,
-	pub description: Option<Box<str>>,
-	pub location: Option<Box<str>>,
-	pub website: Option<Box<str>>,
 	pub created_at: u64,
 }
 
@@ -609,22 +609,16 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// Phase 1: Profile Management
 	//****************************
-	/// Update profile fields (name, description, location, website)
+	/// Update profile fields (name)
 	async fn update_profile_fields(
 		&self,
 		tn_id: TnId,
 		id_tag: &str,
 		name: Option<&str>,
-		description: Option<&str>,
-		location: Option<&str>,
-		website: Option<&str>,
 	) -> ClResult<()>;
 
 	/// Update profile image (profile picture file_id)
 	async fn update_profile_image(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()>;
-
-	/// Update profile cover image (cover file_id)
-	async fn update_profile_cover(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()>;
 
 	/// List all profiles for a tenant (paginated)
 	async fn list_all_profiles(

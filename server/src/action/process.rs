@@ -18,8 +18,11 @@ pub async fn verify_action_token(app: &App, tn_id: TnId, token: &str) -> ClResul
 	let action_not_validated: ActionToken = decode_jwt_no_verify(token)?;
 	info!("  from: {}", action_not_validated.iss);
 
-	let key_data: crate::profile::handler::Profile =
+	// The endpoint returns ApiResponse<Profile>, so we need to deserialize that first
+	let api_response: crate::types::ApiResponse<crate::profile::handler::Profile> =
 		app.request.get_noauth(tn_id, &action_not_validated.iss, "/me/keys").await?;
+	let key_data = api_response.data;
+
 	let public_key: Option<Box<str>> =
 		if let Some(key) = key_data.keys.iter().find(|k| k.key_id == action_not_validated.k) {
 			let (public_key, _expires_at) = (key.public_key.clone(), key.expires_at);
@@ -60,71 +63,101 @@ pub async fn process_inbound_action_token(
 	tn_id: TnId,
 	_action_id: &str,
 	token: &str,
-) -> ClResult<()> {
+	is_sync: bool,
+) -> ClResult<Option<serde_json::Value>> {
 	let action = verify_action_token(app, tn_id, token).await?;
 
-	let issuer_profile =
-		if let Ok((_etag, profile)) = app.meta_adapter.read_profile(tn_id, &action.iss).await {
-			Some(profile)
-		} else {
-			None
-		};
-	info!("  profile: {:?}", issuer_profile);
+	// Check if the action type is defined and get its definition
+	if !app.dsl_engine.has_definition(&action.t) {
+		return Err(Error::ValidationError(format!("Action type not supported: {}", action.t)));
+	}
 
-	let mut allowed = false;
-	// if opts.ack { allowed = true; }
-	// Allow followers and connection requests
+	let definition = app.dsl_engine.get_definition(&action.t).ok_or_else(|| {
+		Error::ValidationError(format!("Action type definition not found: {}", action.t))
+	})?;
 
-	if let Some(ref p) = issuer_profile {
-		if p.following || p.connected {
-			allowed = true;
+	// Check permissions based on action type's allow_unknown setting
+	// Default to false if not specified (require following/connected)
+	if !definition.behavior.allow_unknown.unwrap_or(false) {
+		let issuer_profile =
+			if let Ok((_etag, profile)) = app.meta_adapter.read_profile(tn_id, &action.iss).await {
+				Some(profile)
+			} else {
+				None
+			};
+		info!("  profile: {:?}", issuer_profile);
+
+		let mut allowed = false;
+		if let Some(ref p) = issuer_profile {
+			if p.following || p.connected {
+				allowed = true;
+			}
+		}
+
+		if !allowed {
+			warn!(
+				issuer = %action.iss,
+				action_type = %action.t,
+				"Permission denied - sender not following/connected"
+			);
+			return Err(Error::PermissionDenied);
+		}
+
+		if issuer_profile.is_none() {
+			//profile::sync_profile(&app, tn_id, &action.iss).await?;
 		}
 	}
 
-	if !allowed {
-		return Err(Error::PermissionDenied);
-	}
-	if issuer_profile.is_none() {
-		//profile::sync_profile(&app, tn_id, &action.iss).await?;
-	}
-
-	if let Some(ref attachments) = action.a {
-		process_inbound_action_attachments(app, tn_id, &action.iss, attachments.clone()).await?;
+	// Skip attachment processing for synchronous requests
+	if !is_sync {
+		if let Some(ref attachments) = action.a {
+			process_inbound_action_attachments(app, tn_id, &action.iss, attachments.clone())
+				.await?;
+		}
 	}
 
-	// Execute DSL on_receive hook if action type has one
-	if app.dsl_engine.has_definition(&action.t) {
-		use crate::action::hooks::{HookContext, HookType};
-		use std::collections::HashMap;
+	// Execute DSL on_receive hook
+	use crate::action::hooks::{HookContext, HookType};
+	use std::collections::HashMap;
 
-		// Extract subtype from action type (e.g., "CONN:DEL" → type="CONN", subtype="DEL")
-		let (action_type, subtype) = if let Some(colon_pos) = action.t.find(':') {
-			let (t, st) = action.t.split_at(colon_pos);
-			(t.to_string(), Some(st[1..].to_string()))
-		} else {
-			(action.t.to_string(), None)
-		};
+	// Extract subtype from action type (e.g., "CONN:DEL" → type="CONN", subtype="DEL")
+	let (action_type, subtype) = if let Some(colon_pos) = action.t.find(':') {
+		let (t, st) = action.t.split_at(colon_pos);
+		(t.to_string(), Some(st[1..].to_string()))
+	} else {
+		(action.t.to_string(), None)
+	};
 
-		let hook_context = HookContext {
-			action_id: _action_id.to_string(),
-			r#type: action_type,
-			subtype,
-			issuer: action.iss.to_string(),
-			audience: action.aud.as_ref().map(|s| s.to_string()),
-			parent: action.p.as_ref().map(|s| s.to_string()),
-			subject: action.sub.as_ref().map(|s| s.to_string()),
-			content: action.c.as_ref().and_then(|c| serde_json::from_str(c).ok()),
-			attachments: action.a.as_ref().map(|v| v.iter().map(|s| s.to_string()).collect()),
-			created_at: format!("{}", action.iat.0), // Simple timestamp conversion
-			expires_at: action.exp.map(|ts| format!("{}", ts.0)),
-			tenant_id: tn_id.0 as i64,
-			tenant_tag: action.aud.as_ref().map(|s| s.to_string()).unwrap_or_default(),
-			tenant_type: "person".to_string(),
-			is_inbound: true,
-			is_outbound: false,
-			vars: HashMap::new(),
-		};
+	let hook_context = HookContext {
+		action_id: _action_id.to_string(),
+		r#type: action_type,
+		subtype,
+		issuer: action.iss.to_string(),
+		audience: action.aud.as_ref().map(|s| s.to_string()),
+		parent: action.p.as_ref().map(|s| s.to_string()),
+		subject: action.sub.as_ref().map(|s| s.to_string()),
+		content: action.c.as_ref().and_then(|c| serde_json::from_str(c).ok()),
+		attachments: action.a.as_ref().map(|v| v.iter().map(|s| s.to_string()).collect()),
+		created_at: format!("{}", action.iat.0), // Simple timestamp conversion
+		expires_at: action.exp.map(|ts| format!("{}", ts.0)),
+		tenant_id: tn_id.0 as i64,
+		tenant_tag: action.aud.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+		tenant_type: "person".to_string(),
+		is_inbound: true,
+		is_outbound: false,
+		vars: HashMap::new(),
+	};
 
+	if is_sync {
+		// For synchronous processing, execute hook and return the result
+		let hook_result = app
+			.dsl_engine
+			.execute_hook_with_result(app, &action.t, HookType::OnReceive, hook_context)
+			.await?;
+
+		Ok(hook_result.return_value)
+	} else {
+		// For asynchronous processing, execute hook without capturing result
 		if let Err(e) = app
 			.dsl_engine
 			.execute_hook(app, &action.t, HookType::OnReceive, hook_context)
@@ -140,9 +173,9 @@ pub async fn process_inbound_action_token(
 			);
 			// Continue execution - hook errors shouldn't fail the action processing
 		}
-	}
 
-	Ok(())
+		Ok(None)
+	}
 }
 
 #[derive(Debug, Deserialize)]

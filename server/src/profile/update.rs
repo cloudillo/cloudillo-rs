@@ -24,28 +24,8 @@ pub async fn patch_own_profile(
 	let name =
 		if let crate::types::Patch::Value(n) = &patch.name { Some(n.as_str()) } else { None };
 
-	let description = match &patch.description {
-		crate::types::Patch::Value(Some(d)) => Some(d.as_str()),
-		crate::types::Patch::Null => Some(""), // Empty string to clear
-		_ => None,
-	};
-
-	let location = match &patch.location {
-		crate::types::Patch::Value(Some(l)) => Some(l.as_str()),
-		crate::types::Patch::Null => Some(""),
-		_ => None,
-	};
-
-	let website = match &patch.website {
-		crate::types::Patch::Value(Some(w)) => Some(w.as_str()),
-		crate::types::Patch::Null => Some(""),
-		_ => None,
-	};
-
 	// Apply the patch
-	app.meta_adapter
-		.update_profile_fields(tn_id, &auth.id_tag, name, description, location, website)
-		.await?;
+	app.meta_adapter.update_profile_fields(tn_id, &auth.id_tag, name).await?;
 
 	// Fetch updated profile
 	let profile_data = app.meta_adapter.get_profile_info(tn_id, &auth.id_tag).await?;
@@ -55,10 +35,6 @@ pub async fn patch_own_profile(
 		name: profile_data.name.to_string(),
 		profile_type: profile_data.profile_type.to_string(),
 		profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
-		cover: profile_data.cover.map(|s| s.to_string()),
-		description: profile_data.description.map(|s| s.to_string()),
-		location: profile_data.location.map(|s| s.to_string()),
-		website: profile_data.website.map(|s| s.to_string()),
 		created_at: profile_data.created_at,
 	};
 
@@ -87,27 +63,7 @@ pub async fn patch_profile_admin(
 		let name =
 			if let crate::types::Patch::Value(n) = &patch.name { Some(n.as_str()) } else { None };
 
-		let description = match &patch.description {
-			crate::types::Patch::Value(Some(d)) => Some(d.as_str()),
-			crate::types::Patch::Null => Some(""),
-			_ => None,
-		};
-
-		let location = match &patch.location {
-			crate::types::Patch::Value(Some(l)) => Some(l.as_str()),
-			crate::types::Patch::Null => Some(""),
-			_ => None,
-		};
-
-		let website = match &patch.website {
-			crate::types::Patch::Value(Some(w)) => Some(w.as_str()),
-			crate::types::Patch::Null => Some(""),
-			_ => None,
-		};
-
-		app.meta_adapter
-			.update_profile_fields(tn_id, &id_tag, name, description, location, website)
-			.await?;
+		app.meta_adapter.update_profile_fields(tn_id, &id_tag, name).await?;
 
 		// Fetch updated profile
 		let profile_data = app.meta_adapter.get_profile_info(tn_id, &id_tag).await?;
@@ -117,10 +73,6 @@ pub async fn patch_profile_admin(
 			name: profile_data.name.to_string(),
 			profile_type: profile_data.profile_type.to_string(),
 			profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
-			cover: profile_data.cover.map(|s| s.to_string()),
-			description: profile_data.description.map(|s| s.to_string()),
-			location: profile_data.location.map(|s| s.to_string()),
-			website: profile_data.website.map(|s| s.to_string()),
 			created_at: profile_data.created_at,
 		};
 

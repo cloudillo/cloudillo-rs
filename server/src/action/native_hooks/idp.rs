@@ -13,14 +13,15 @@ use crate::prelude::*;
 
 /// Content structure for IDP:REG actions
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IdpRegContent {
 	pub id_tag: String,
 	pub email: String,
-	pub expires_at: i64,
 }
 
 /// Response structure for IDP:REG registration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IdpRegResponse {
 	pub success: bool,
 	pub message: String,
@@ -49,7 +50,13 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 	);
 
 	// Validate that this is a registration action
-	if context.r#type != "IDP:REG" {
+	// Note: The action type "IDP:REG" is split into type="IDP" and subtype=Some("REG")
+	if context.r#type != "IDP" || context.subtype.as_deref() != Some("REG") {
+		warn!(
+			action_type = %context.r#type,
+			subtype = ?context.subtype,
+			"Hook called with wrong type, expected IDP:REG"
+		);
 		return Err(Error::Unknown); // Should not happen if hooks are called correctly
 	}
 
@@ -65,9 +72,12 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 	};
 
 	// Validate required fields
-	if reg_content.id_tag.is_empty() || reg_content.email.is_empty() || reg_content.expires_at <= 0
-	{
-		warn!("IDP:REG content has invalid fields");
+	if reg_content.id_tag.is_empty() || reg_content.email.is_empty() {
+		warn!(
+			id_tag = %reg_content.id_tag,
+			email = %reg_content.email,
+			"IDP:REG content has invalid fields"
+		);
 		return Err(Error::Unknown);
 	}
 
@@ -88,7 +98,15 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 
 	// Parse and validate identity id_tag against registrar's domain
 	let (id_tag_prefix, id_tag_domain) =
-		parse_and_validate_identity_id_tag(&reg_content.id_tag, registrar_id_tag)?;
+		parse_and_validate_identity_id_tag(&reg_content.id_tag, registrar_id_tag).map_err(|e| {
+			warn!(
+				error = %e,
+				id_tag = %reg_content.id_tag,
+				registrar = %registrar_id_tag,
+				"Failed to parse/validate identity id_tag"
+			);
+			e
+		})?;
 
 	// Check registrar quota
 	let quota = idp_adapter.get_quota(registrar_id_tag).await.ok();
@@ -118,7 +136,7 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 	}
 
 	// Create the identity with Pending status
-	let expires_at = Timestamp(reg_content.expires_at);
+	let expires_at = Timestamp::now().add_seconds(24 * 60 * 60);
 	let create_opts = crate::identity_provider_adapter::CreateIdentityOptions {
 		id_tag_prefix: &id_tag_prefix,
 		id_tag_domain: &id_tag_domain,
@@ -261,15 +279,13 @@ mod tests {
 	#[test]
 	fn test_idp_reg_content_parse() {
 		let json = serde_json::json!({
-			"id_tag": "alice",
-			"email": "alice@example.com",
-			"expires_at": 1704067200
+			"idTag": "alice",
+			"email": "alice@example.com"
 		});
 
 		let content: IdpRegContent = serde_json::from_value(json).unwrap();
 		assert_eq!(content.id_tag, "alice");
 		assert_eq!(content.email, "alice@example.com");
-		assert_eq!(content.expires_at, 1704067200);
 	}
 
 	#[test]

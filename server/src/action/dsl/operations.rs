@@ -164,26 +164,11 @@ impl<'a> OperationExecutor<'a> {
 
 		// Extract fields from profile_updates
 		let name = profile_updates.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
-		let description = profile_updates
-			.get("description")
-			.and_then(|v| v.as_str())
-			.map(|s| s.to_string());
-		let location =
-			profile_updates.get("location").and_then(|v| v.as_str()).map(|s| s.to_string());
-		let website =
-			profile_updates.get("website").and_then(|v| v.as_str()).map(|s| s.to_string());
 
 		// Update profile via meta adapter
 		self.app
 			.meta_adapter
-			.update_profile_fields(
-				tn_id,
-				&target_tag,
-				name.as_deref(),
-				description.as_deref(),
-				location.as_deref(),
-				website.as_deref(),
-			)
+			.update_profile_fields(tn_id, &target_tag, name.as_deref())
 			.await?;
 
 		tracing::info!(

@@ -79,6 +79,9 @@ pub(crate) async fn update(
 		ProfileType::Person => "P",
 		ProfileType::Community => "C",
 	});
+	has_updates =
+		push_patch!(query, has_updates, "profile_pic", &tenant.profile_pic, |v| v.as_str());
+	has_updates = push_patch!(query, has_updates, "cover_pic", &tenant.cover_pic, |v| v.as_str());
 
 	if !has_updates {
 		// No fields to update, but not an error

@@ -7,13 +7,16 @@ use axum::{
 use regex::Regex;
 use serde_json::json;
 use serde_with::skip_serializing_none;
-use trust_dns_resolver::TokioAsyncResolver;
 
 use crate::{
-	auth_adapter::CreateTenantData,
+	core::{
+		address::parse_address_type,
+		dns::{create_recursive_resolver, resolve_domain_addresses, validate_domain_address},
+	},
 	meta_adapter::{Profile, ProfileType},
 	prelude::*,
-	types::{RegisterRequest, RegisterVerifyCheckRequest},
+	settings::SettingValue,
+	types::{ApiResponse, RegisterRequest, RegisterVerifyCheckRequest},
 };
 
 /// Domain validation response
@@ -21,30 +24,72 @@ use crate::{
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainValidationResponse {
-	pub ip: Vec<String>,
-	pub id_tag_error: Option<String>, // false, 'invalid', 'used', 'nodns', 'ip'
-	pub app_domain_error: Option<String>,
+	pub address: Vec<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub api_ip: Option<String>,
+	pub address_type: Option<String>,
+	pub id_tag_error: String, // '' if no error, else 'invalid', 'used', 'nodns', 'address'
+	pub app_domain_error: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub app_ip: Option<String>,
+	pub api_address: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub app_address: Option<String>,
+	pub identity_providers: Vec<String>,
+}
+
+/// IDP availability check response
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct IdpAvailabilityResponse {
+	pub available: bool,
+	pub id_tag: String,
+}
+
+/// Get list of trusted identity providers from settings
+async fn get_identity_providers(app: &crate::core::app::App, tn_id: TnId) -> Vec<String> {
+	match app.settings.get(tn_id, "idp.list").await {
+		Ok(SettingValue::String(list)) => {
+			// Parse comma-separated list and filter out empty strings
+			list.split(',')
+				.map(|s| s.trim().to_string())
+				.filter(|s| !s.is_empty())
+				.collect::<Vec<String>>()
+		}
+		Ok(_) => {
+			warn!("Invalid idp.list setting value (expected string)");
+			Vec::new()
+		}
+		Err(_) => {
+			// Setting not found or error, return empty list
+			Vec::new()
+		}
+	}
 }
 
 /// Verify domain and id_tag before registration
 async fn verify_register_data(
+	app: &crate::core::app::App,
 	typ: &str,
 	id_tag: &str,
 	app_domain: Option<&str>,
-	local_ips: &[Box<str>],
-	auth_adapter: &std::sync::Arc<dyn crate::auth_adapter::AuthAdapter>,
-	_meta_adapter: &std::sync::Arc<dyn crate::meta_adapter::MetaAdapter>,
+	identity_providers: Vec<String>,
 ) -> ClResult<DomainValidationResponse> {
+	// Determine address type from local addresses (all same type, guaranteed by startup validation)
+	let address_type = if app.opts.local_addresses.is_empty() {
+		None
+	} else {
+		match parse_address_type(app.opts.local_addresses[0].as_ref()) {
+			Ok(addr_type) => Some(addr_type.to_string()),
+			Err(_) => None, // Should not happen due to startup validation
+		}
+	};
+
 	let mut response = DomainValidationResponse {
-		ip: local_ips.iter().map(|s| s.to_string()).collect(),
-		id_tag_error: None,
-		app_domain_error: None,
-		api_ip: None,
-		app_ip: None,
+		address: app.opts.local_addresses.iter().map(|s| s.to_string()).collect(),
+		address_type,
+		id_tag_error: String::new(),
+		app_domain_error: String::new(),
+		api_address: None,
+		app_address: None,
+		identity_providers,
 	};
 
 	// Validate format
@@ -55,32 +100,32 @@ async fn verify_register_data(
 				Regex::new(r"^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$").map_err(|_| Error::Unknown)?;
 
 			if !domain_regex.is_match(id_tag) {
-				response.id_tag_error = Some("invalid".to_string());
+				response.id_tag_error = "invalid".to_string();
 			}
 
 			if let Some(app_domain) = app_domain {
 				if app_domain.starts_with("cl-o.") || !domain_regex.is_match(app_domain) {
-					response.app_domain_error = Some("invalid".to_string());
+					response.app_domain_error = "invalid".to_string();
 				}
 			}
 
-			if response.id_tag_error.is_some() || response.app_domain_error.is_some() {
+			if !response.id_tag_error.is_empty() || !response.app_domain_error.is_empty() {
 				return Ok(response);
 			}
 
-			// DNS validation
-			let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
-				Ok(resolver) => resolver,
+			// DNS validation - use recursive resolver from root nameservers
+			let resolver = match create_recursive_resolver() {
+				Ok(r) => r,
 				Err(_) => {
-					// If we can't get system config, return nodns error
-					response.id_tag_error = Some("nodns".to_string());
+					// If we can't create resolver, return nodns error
+					response.id_tag_error = "nodns".to_string();
 					return Ok(response);
 				}
 			};
 
 			// Check if id_tag already registered
-			match auth_adapter.read_tn_id(id_tag).await {
-				Ok(_) => response.id_tag_error = Some("used".to_string()),
+			match app.auth_adapter.read_tn_id(id_tag).await {
+				Ok(_) => response.id_tag_error = "used".to_string(),
 				Err(Error::NotFound) => {}
 				Err(e) => return Err(e),
 			}
@@ -93,41 +138,45 @@ async fn verify_register_data(
 
 			// DNS lookups for API domain (cl-o.<id_tag>)
 			let api_domain = format!("cl-o.{}", id_tag);
-			match resolver.lookup_ip(api_domain.as_str()).await {
-				Ok(lookup) => {
-					if let Some(addr) = lookup.iter().next() {
-						let api_ip_str = addr.to_string();
-						if !local_ips.iter().any(|ip| ip.as_ref() == api_ip_str) {
-							response.id_tag_error = Some("ip".to_string());
-						}
-						response.api_ip = Some(api_ip_str);
-					} else {
-						response.id_tag_error = Some("nodns".to_string());
+			match validate_domain_address(&api_domain, &app.opts.local_addresses, &resolver).await {
+				Ok((address, _addr_type)) => {
+					response.api_address = Some(address);
+				}
+				Err(Error::ValidationError(err_code)) => {
+					response.id_tag_error = err_code;
+					// Still show what was resolved so user can debug
+					if let Ok(Some(address)) =
+						resolve_domain_addresses(&api_domain, &resolver).await
+					{
+						response.api_address = Some(address);
 					}
 				}
-				Err(_) => {
-					response.id_tag_error = Some("nodns".to_string());
-				}
+				Err(e) => return Err(e),
 			}
 
 			// DNS lookups for app domain
-			if let Some(app_domain) = app_domain {
-				match resolver.lookup_ip(app_domain).await {
-					Ok(lookup) => {
-						if let Some(addr) = lookup.iter().next() {
-							let app_ip_str = addr.to_string();
-							if !local_ips.iter().any(|ip| ip.as_ref() == app_ip_str) {
-								response.app_domain_error = Some("ip".to_string());
-							}
-							response.app_ip = Some(app_ip_str);
-						} else {
-							response.app_domain_error = Some("nodns".to_string());
-						}
-					}
-					Err(_) => {
-						response.app_domain_error = Some("nodns".to_string());
+			// Use provided app_domain or default to id_tag if not provided
+			let app_domain_to_validate = app_domain.unwrap_or(id_tag);
+			match validate_domain_address(
+				app_domain_to_validate,
+				&app.opts.local_addresses,
+				&resolver,
+			)
+			.await
+			{
+				Ok((address, _addr_type)) => {
+					response.app_address = Some(address);
+				}
+				Err(Error::ValidationError(err_code)) => {
+					response.app_domain_error = err_code;
+					// Still show what was resolved so user can debug
+					if let Ok(Some(address)) =
+						resolve_domain_addresses(app_domain_to_validate, &resolver).await
+					{
+						response.app_address = Some(address);
 					}
 				}
+				Err(e) => return Err(e),
 			}
 		}
 		"idp" => {
@@ -136,14 +185,50 @@ async fn verify_register_data(
 				Regex::new(r"^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)*$").map_err(|_| Error::Unknown)?;
 
 			if !idp_regex.is_match(id_tag) {
-				response.id_tag_error = Some("invalid".to_string());
+				response.id_tag_error = "invalid".to_string();
+				return Ok(response);
 			}
 
-			// Check if id_tag already registered
-			match auth_adapter.read_tn_id(id_tag).await {
-				Ok(_) => response.id_tag_error = Some("used".to_string()),
+			// Check if id_tag already registered locally
+			match app.auth_adapter.read_tn_id(id_tag).await {
+				Ok(_) => {
+					response.id_tag_error = "used".to_string();
+					return Ok(response);
+				}
 				Err(Error::NotFound) => {}
 				Err(e) => return Err(e),
+			}
+
+			// Extract the IDP domain from id_tag
+			// Format: "alice.cloudillo.net" -> domain is "cloudillo.net"
+			if let Some(first_dot_pos) = id_tag.find('.') {
+				let idp_domain = &id_tag[first_dot_pos + 1..];
+
+				if idp_domain.is_empty() {
+					response.id_tag_error = "invalid".to_string();
+					return Ok(response);
+				}
+
+				// Make network request to IDP server to check availability
+				let check_path = format!("/idp/check-availability?idTag={}", id_tag);
+
+				match app
+					.request
+					.get_public::<ApiResponse<IdpAvailabilityResponse>>(idp_domain, &check_path)
+					.await
+				{
+					Ok(idp_response) => {
+						if !idp_response.data.available {
+							response.id_tag_error = "used".to_string();
+						}
+					}
+					Err(e) => {
+						warn!("Failed to check IDP availability for {}: {}", id_tag, e);
+						response.id_tag_error = "nodns".to_string();
+					}
+				}
+			} else {
+				response.id_tag_error = "invalid".to_string();
 			}
 		}
 		_ => {
@@ -161,32 +246,320 @@ pub async fn post_register_verify(
 ) -> ClResult<(StatusCode, Json<DomainValidationResponse>)> {
 	let id_tag_lower = req.id_tag.to_lowercase();
 
+	// Get identity providers list (use TnId(1) as default for global settings)
+	let providers = get_identity_providers(&app, TnId(1)).await;
+
 	// For "ref" type, just return identity providers
 	if req.typ == "ref" {
+		// Determine address type from local addresses
+		let address_type = if app.opts.local_addresses.is_empty() {
+			None
+		} else {
+			match parse_address_type(app.opts.local_addresses[0].as_ref()) {
+				Ok(addr_type) => Some(addr_type.to_string()),
+				Err(_) => None,
+			}
+		};
+
 		return Ok((
 			StatusCode::OK,
 			Json(DomainValidationResponse {
-				ip: app.opts.local_ips.iter().map(|s| s.to_string()).collect(),
-				id_tag_error: None,
-				app_domain_error: None,
-				api_ip: None,
-				app_ip: None,
+				address: app.opts.local_addresses.iter().map(|s| s.to_string()).collect(),
+				address_type,
+				id_tag_error: String::new(),
+				app_domain_error: String::new(),
+				api_address: None,
+				app_address: None,
+				identity_providers: providers,
 			}),
 		));
 	}
 
 	// Validate domain/local and get validation errors
-	let validation_result = verify_register_data(
-		&req.typ,
-		&id_tag_lower,
-		req.app_domain.as_deref(),
-		&app.opts.local_ips,
-		&app.auth_adapter,
-		&app.meta_adapter,
+	let validation_result =
+		verify_register_data(&app, &req.typ, &id_tag_lower, req.app_domain.as_deref(), providers)
+			.await?;
+
+	Ok((StatusCode::OK, Json(validation_result)))
+}
+
+/// Create tenant and profile with automatic cleanup on failure
+///
+/// This helper creates a tenant and initial profile, deriving the display name
+/// from the id_tag. If profile creation fails, it automatically cleans up the
+/// tenant before returning an error. Also handles ACME certificate creation
+/// and sends a welcome email.
+///
+/// # Arguments
+/// * `app` - Application state
+/// * `id_tag` - User's identity tag
+/// * `email` - User's email address
+/// * `welcome_link` - Optional welcome link for IDP registrations
+async fn create_tenant_and_profile(
+	app: &crate::core::app::App,
+	id_tag: &str,
+	email: &str,
+	welcome_link: Option<String>,
+) -> ClResult<TnId> {
+	use crate::core::app::{create_complete_tenant, CreateCompleteTenantOptions};
+
+	// Derive display name from id_tag (capitalize first letter of prefix)
+	let display_name = if id_tag.contains('.') {
+		let parts: Vec<&str> = id_tag.split('.').collect();
+		if !parts.is_empty() {
+			let name = parts[0];
+			format!("{}{}", name.chars().next().unwrap_or('U').to_uppercase(), &name[1..])
+		} else {
+			id_tag.to_string()
+		}
+	} else {
+		id_tag.to_string()
+	};
+
+	// Use the unified tenant creation function
+	let tn_id = create_complete_tenant(
+		app,
+		CreateCompleteTenantOptions {
+			id_tag,
+			email: Some(email),
+			password: None,
+			roles: None,
+			display_name: Some(&display_name),
+			create_acme_cert: app.opts.acme_email.is_some(),
+			acme_email: app.opts.acme_email.as_deref(),
+			app_domain: None, // Use id_tag as domain
+		},
 	)
 	.await?;
 
-	Ok((StatusCode::OK, Json(validation_result)))
+	info!(
+		id_tag = %id_tag,
+		tn_id = ?tn_id,
+		"Complete tenant created successfully"
+	);
+
+	// Create initial profile in meta adapter
+	let profile = Profile {
+		id_tag,
+		name: &display_name,
+		typ: ProfileType::Person,
+		profile_pic: None,
+		following: false,
+		connected: false,
+	};
+
+	if let Err(e) = app.meta_adapter.create_profile(tn_id, &profile, "").await {
+		// Profile creation failed - this is not critical as tenant exists
+		warn!(
+			error = %e,
+			id_tag = %id_tag,
+			tn_id = ?tn_id,
+			"Failed to create profile (tenant exists but profile missing)"
+		);
+		// Don't clean up tenant - user can still use the account
+	}
+
+	// Send welcome email
+	let mut template_vars = serde_json::json!({
+		"user_name": id_tag,
+		"instance_name": "Cloudillo",
+	});
+
+	// Add welcome link if provided (IDP registrations)
+	if let Some(link) = welcome_link {
+		template_vars["welcome_link"] = serde_json::json!(link);
+	}
+
+	match crate::email::EmailModule::schedule_email_task(
+		&app.scheduler,
+		&app.settings,
+		tn_id,
+		email.to_string(),
+		"Welcome to Cloudillo".to_string(),
+		"welcome".to_string(),
+		template_vars,
+	)
+	.await
+	{
+		Ok(_) => {
+			info!(
+				email = %email,
+				id_tag = %id_tag,
+				"Welcome email queued"
+			);
+		}
+		Err(e) => {
+			warn!(
+				error = %e,
+				email = %email,
+				id_tag = %id_tag,
+				"Failed to queue welcome email, continuing registration"
+			);
+			// Don't fail registration if email queueing fails
+		}
+	}
+
+	Ok(tn_id)
+}
+
+/// Handle IDP registration flow
+async fn handle_idp_registration(
+	app: &crate::core::app::App,
+	id_tag_lower: String,
+	email: String,
+) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
+	// Extract the IDP domain from id_tag (e.g., "alice.cloudillo.net" -> "cloudillo.net")
+	let idp_domain = match id_tag_lower.find('.') {
+		Some(pos) => &id_tag_lower[pos + 1..],
+		None => {
+			return Err(Error::ValidationError("Invalid IDP id_tag format".to_string()));
+		}
+	};
+
+	// Get the BASE_ID_TAG (this host's identifier)
+	let base_id_tag = app
+		.opts
+		.base_id_tag
+		.as_ref()
+		.ok_or_else(|| Error::ConfigError("BASE_ID_TAG not configured".into()))?;
+
+	// Create IDP:REG action
+	use crate::action::native_hooks::idp::IdpRegContent;
+	use crate::action::task::CreateAction;
+
+	let expires_at = Timestamp::now().add_seconds(86400 * 30); // 30 days
+	let reg_content = IdpRegContent { id_tag: id_tag_lower.clone(), email: email.clone() };
+
+	// Create action to generate JWT token
+	let tn_id = TnId(1); // Use base tenant for creating the action
+	let action = CreateAction {
+		typ: "IDP:REG".into(),
+		sub_typ: None,
+		parent_id: None,
+		root_id: None,
+		audience_tag: Some(idp_domain.to_string().into()),
+		content: Some(serde_json::to_string(&reg_content)?.into()),
+		attachments: None,
+		subject: None,
+		expires_at: Some(expires_at),
+	};
+
+	// Generate action JWT token
+	let action_token = app.auth_adapter.create_action_token(tn_id, action).await?;
+
+	// Prepare inbox request with token
+	#[derive(serde::Serialize)]
+	struct InboxRequest {
+		token: String,
+	}
+
+	let inbox_request = InboxRequest { token: action_token.to_string() };
+
+	// POST to IDP provider's /inbox/sync endpoint
+	info!(
+		id_tag = %id_tag_lower,
+		idp_domain = %idp_domain,
+		base_id_tag = %base_id_tag,
+		"Posting IDP:REG action token to identity provider"
+	);
+
+	let idp_response: crate::types::ApiResponse<serde_json::Value> = app
+		.request
+		.post_public(idp_domain, "/inbox/sync", &inbox_request)
+		.await
+		.map_err(|e| {
+			warn!(
+				error = %e,
+				idp_domain = %idp_domain,
+				"Failed to register with identity provider"
+			);
+			Error::ValidationError(
+				"Identity provider registration failed - please try again later".to_string(),
+			)
+		})?;
+
+	// Parse the IDP response
+	use crate::action::native_hooks::idp::IdpRegResponse;
+	let idp_reg_result: IdpRegResponse =
+		serde_json::from_value(idp_response.data).map_err(|e| {
+			warn!(
+				error = %e,
+				"Failed to parse IDP registration response"
+			);
+			Error::Unknown
+		})?;
+
+	// Check if registration was successful
+	if !idp_reg_result.success {
+		warn!(
+			id_tag = %id_tag_lower,
+			message = %idp_reg_result.message,
+			"IDP registration failed"
+		);
+		return Err(Error::ValidationError(idp_reg_result.message));
+	}
+
+	info!(
+		id_tag = %id_tag_lower,
+		activation_ref = ?idp_reg_result.activation_ref,
+		"IDP registration successful, creating local tenant"
+	);
+
+	// Create welcome reference first (generates the ref_id for the link)
+	let ref_id = crate::core::utils::random_id()?;
+	let welcome_link = format!("https://{}/welcome/{}", id_tag_lower, ref_id);
+
+	// Create local tenant and profile (includes ACME and email sending)
+	let tn_id = create_tenant_and_profile(app, &id_tag_lower, &email, Some(welcome_link)).await?;
+
+	// Store the welcome reference in database
+	let ref_opts = crate::meta_adapter::CreateRefOptions {
+		typ: "welcome".to_string(),
+		description: Some("Welcome to Cloudillo".to_string()),
+		expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
+		count: None,
+	};
+
+	if let Err(e) = app.meta_adapter.create_ref(tn_id, &ref_id, &ref_opts).await {
+		warn!(
+			error = %e,
+			tn_id = ?tn_id,
+			ref_id = %ref_id,
+			"Failed to create welcome reference"
+		);
+		// Continue anyway - this is not critical
+	}
+
+	// Return empty response
+	let response = json!({});
+	Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Handle domain registration flow
+async fn handle_domain_registration(
+	app: &crate::core::app::App,
+	id_tag_lower: String,
+	app_domain: Option<String>,
+	email: String,
+	providers: Vec<String>,
+) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
+	// Validate domain again before creating account
+	let validation_result =
+		verify_register_data(app, "domain", &id_tag_lower, app_domain.as_deref(), providers)
+			.await?;
+
+	// Check for validation errors
+	if !validation_result.id_tag_error.is_empty() || !validation_result.app_domain_error.is_empty()
+	{
+		return Err(Error::Unknown); // 422 in TypeScript
+	}
+
+	// Create tenant and profile (includes ACME and email sending)
+	let _tn_id = create_tenant_and_profile(app, &id_tag_lower, &email, None).await?;
+
+	// Return empty response (user must login separately)
+	let response = json!({});
+	Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// POST /auth/register - Create account after validation
@@ -202,109 +575,15 @@ pub async fn post_register(
 	let id_tag_lower = req.id_tag.to_lowercase();
 	let app_domain = req.app_domain.map(|d| d.to_lowercase());
 
-	// Validate domain/local again before creating account
-	let validation_result = verify_register_data(
-		&req.typ,
-		&id_tag_lower,
-		app_domain.as_deref(),
-		&app.opts.local_ips,
-		&app.auth_adapter,
-		&app.meta_adapter,
-	)
-	.await?;
+	// Get identity providers list (use TnId(1) as default for global settings)
+	let providers = get_identity_providers(&app, TnId(1)).await;
 
-	// Check for validation errors
-	if validation_result.id_tag_error.is_some() || validation_result.app_domain_error.is_some() {
-		return Err(Error::Unknown); // 422 in TypeScript
-	}
-
-	// Create tenant with email
-	let tn_id = match app
-		.auth_adapter
-		.create_tenant(
-			&id_tag_lower,
-			CreateTenantData {
-				vfy_code: None,
-				email: Some(&req.email),
-				password: None,
-				roles: None,
-			},
-		)
-		.await
-	{
-		Ok(tn_id) => tn_id,
-		Err(_) => {
-			return Err(Error::Unknown); // 422 in TypeScript
-		}
-	};
-
-	// Create initial profile
-	// Derive display name from id_tag (remove domain suffix and capitalize)
-	let display_name = if id_tag_lower.contains('.') {
-		let parts: Vec<&str> = id_tag_lower.split('.').collect();
-		if !parts.is_empty() {
-			let name = parts[0];
-			format!("{}{}", name.chars().next().unwrap_or('U').to_uppercase(), &name[1..])
-		} else {
-			id_tag_lower.clone()
-		}
+	// Route to appropriate registration handler
+	if req.typ == "idp" {
+		handle_idp_registration(&app, id_tag_lower, req.email).await
 	} else {
-		id_tag_lower.clone()
-	};
-
-	let profile = Profile {
-		id_tag: id_tag_lower.as_str(),
-		name: display_name.as_str(),
-		typ: ProfileType::Person,
-		profile_pic: None,
-		following: false,
-		connected: false,
-	};
-
-	if app.meta_adapter.create_profile(tn_id, &profile, "").await.is_err() {
-		// Try to clean up tenant if profile creation fails
-		let _ = app.auth_adapter.delete_tenant(&id_tag_lower).await;
-		let _ = app.meta_adapter.delete_tenant(tn_id).await;
-		return Err(Error::Unknown); // 422 in TypeScript
+		handle_domain_registration(&app, id_tag_lower, app_domain, req.email, providers).await
 	}
-
-	// Create ACME certificate if configured
-	if let Some(acme_email) = &app.opts.acme_email {
-		// TODO: Implement ACME certificate creation
-		// This would call app.core.acme.create_cert() with appropriate parameters
-		debug!("ACME email configured: {}", acme_email);
-	}
-
-	// Send verification email if email is provided
-	let template_vars = serde_json::json!({
-		"user_name": id_tag_lower,
-		"instance_name": "Cloudillo",
-	});
-
-	match crate::email::EmailModule::schedule_email_task(
-		&app.scheduler,
-		&app.settings,
-		tn_id,
-		req.email.clone(),
-		"Welcome to Cloudillo".to_string(),
-		"welcome".to_string(),
-		template_vars,
-	)
-	.await
-	{
-		Ok(_) => {
-			info!("Welcome email queued for {}", req.email);
-		}
-		Err(e) => {
-			warn!("Failed to queue welcome email: {}", e);
-			// Don't fail registration if email queueing fails
-		}
-	}
-
-	// Return empty response (user must login separately)
-	let response = json!({});
-
-	Ok((StatusCode::CREATED, Json(response)))
 }
 
 // vim: ts=4

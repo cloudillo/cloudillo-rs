@@ -324,19 +324,12 @@ impl MetaAdapter for MetaAdapterSqlite {
 		tn_id: TnId,
 		id_tag: &str,
 		name: Option<&str>,
-		description: Option<&str>,
-		location: Option<&str>,
-		website: Option<&str>,
 	) -> ClResult<()> {
-		profile::update_fields(&self.db, tn_id, id_tag, name, description, location, website).await
+		profile::update_fields(&self.db, tn_id, id_tag, name).await
 	}
 
 	async fn update_profile_image(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()> {
 		profile::update_image(&self.db, tn_id, id_tag, file_id).await
-	}
-
-	async fn update_profile_cover(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()> {
-		profile::update_cover(&self.db, tn_id, id_tag, file_id).await
 	}
 
 	async fn list_all_profiles(

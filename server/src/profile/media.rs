@@ -86,9 +86,15 @@ pub async fn put_profile_image(
 		meta_adapter::FileId::FileId(fid) => fid,
 	};
 
-	// Update profile with new image
+	// Update tenant with new profile picture
 	app.meta_adapter
-		.update_profile_image(auth.tn_id, &auth.id_tag, &file_id)
+		.update_tenant(
+			auth.tn_id,
+			&meta_adapter::UpdateTenantData {
+				profile_pic: Patch::Value(file_id.to_string()),
+				..Default::default()
+			},
+		)
 		.await?;
 
 	info!("User {} uploaded profile image: {}", auth.id_tag, file_id);
@@ -173,9 +179,15 @@ pub async fn put_cover_image(
 		meta_adapter::FileId::FileId(fid) => fid,
 	};
 
-	// Update profile with new cover
+	// Update tenant with new cover picture
 	app.meta_adapter
-		.update_profile_cover(auth.tn_id, &auth.id_tag, &file_id)
+		.update_tenant(
+			auth.tn_id,
+			&meta_adapter::UpdateTenantData {
+				cover_pic: Patch::Value(file_id.to_string()),
+				..Default::default()
+			},
+		)
 		.await?;
 
 	info!("User {} uploaded cover image: {}", auth.id_tag, file_id);

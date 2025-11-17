@@ -311,7 +311,8 @@ impl Task<App> for ActionVerifierTask {
 		let action_id = hasher::hash("a", self.token.as_bytes());
 		info!("Running task action.verify {}", action_id);
 
-		process::process_inbound_action_token(app, self.tn_id, &action_id, &self.token).await?;
+		process::process_inbound_action_token(app, self.tn_id, &action_id, &self.token, false)
+			.await?;
 
 		info!("Finished task action.verify {}", action_id);
 		Ok(())
