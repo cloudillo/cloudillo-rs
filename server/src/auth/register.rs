@@ -130,12 +130,12 @@ async fn verify_register_data(
 				}
 			}
 		}
-		"local" => {
-			// Regex for local: alphanumeric, hyphens, and dots, but must end with .cloudillo.net or similar
-			let local_regex =
+		"idp" => {
+			// Regex for idp: alphanumeric, hyphens, and dots, but must end with .cloudillo.net or similar
+			let idp_regex =
 				Regex::new(r"^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)*$").map_err(|_| Error::Unknown)?;
 
-			if !local_regex.is_match(id_tag) {
+			if !idp_regex.is_match(id_tag) {
 				response.id_tag_error = Some("invalid".to_string());
 			}
 
@@ -195,11 +195,7 @@ pub async fn post_register(
 	Json(req): Json<RegisterRequest>,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
 	// Validate request fields
-	if req.id_tag.is_empty()
-		|| req.register_token.is_empty()
-		|| req.password.is_empty()
-		|| req.email.is_empty()
-	{
+	if req.id_tag.is_empty() || req.token.is_empty() || req.email.is_empty() {
 		return Err(Error::Unknown);
 	}
 
@@ -222,7 +218,7 @@ pub async fn post_register(
 		return Err(Error::Unknown); // 422 in TypeScript
 	}
 
-	// Create tenant with password and email
+	// Create tenant with email
 	let tn_id = match app
 		.auth_adapter
 		.create_tenant(
@@ -230,7 +226,7 @@ pub async fn post_register(
 			CreateTenantData {
 				vfy_code: None,
 				email: Some(&req.email),
-				password: Some(&req.password),
+				password: None,
 				roles: None,
 			},
 		)
