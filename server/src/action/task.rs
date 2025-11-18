@@ -298,7 +298,10 @@ impl Task<App> for ActionVerifierTask {
 	}
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
-		let (tn_id, token) = ctx.split(',').collect_tuple().ok_or(Error::Unknown)?;
+		let (tn_id, token) = ctx
+			.split(',')
+			.collect_tuple()
+			.ok_or(Error::Internal("invalid ActionVerifier context format".into()))?;
 		let task = ActionVerifierTask::new(TnId(tn_id.parse()?), token.into());
 		Ok(task)
 	}

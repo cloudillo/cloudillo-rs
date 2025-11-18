@@ -14,7 +14,6 @@ pub enum Error {
 	PermissionDenied,
 	Unauthorized, // 401 - missing/invalid auth token
 	DbError,
-	Unknown,
 	Parse,
 
 	// Input validation and constraints
@@ -28,6 +27,7 @@ pub enum Error {
 	// System and configuration
 	ConfigError(String),        // Missing or invalid configuration
 	ServiceUnavailable(String), // 503 - temporary system failures
+	Internal(String),           // Internal invariant violations, for debugging
 
 	// Processing
 	ImageError(String),  // Image processing failures
@@ -96,11 +96,14 @@ impl IntoResponse for Error {
 				"E-CORE-DBERR".to_string(),
 				"Internal server error".to_string(),
 			),
-			Error::Unknown => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-CORE-UNKNOWN".to_string(),
-				"Internal server error".to_string(),
-			),
+			Error::Internal(msg) => {
+				warn!("internal error: {}", msg);
+				(
+					StatusCode::INTERNAL_SERVER_ERROR,
+					"E-CORE-INTERNAL".to_string(),
+					"Internal server error".to_string(),
+				)
+			}
 			Error::Parse => (
 				StatusCode::INTERNAL_SERVER_ERROR,
 				"E-CORE-PARSE".to_string(),
@@ -248,6 +251,45 @@ impl From<image::error::ImageError> for Error {
 		warn!("image error: {:?}", _err);
 		Error::ImageError("Image processing failed".into())
 	}
+}
+
+/// Helper macro for locking mutexes with automatic internal error handling.
+///
+/// This macro simplifies the common pattern of locking a mutex and converting
+/// poisoning errors to `Error::Internal`. It automatically adds context about
+/// which mutex was poisoned.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Without macro:
+/// let mut data = my_mutex.lock().map_err(|_| Error::Internal("mutex poisoned".into()))?;
+///
+/// // With macro:
+/// let mut data = lock!(my_mutex)?;
+/// ```
+///
+/// The macro also supports adding context information:
+///
+/// ```ignore
+/// // With context:
+/// let mut data = lock!(my_mutex, "task_queue")?;
+/// // Produces: Error::Internal("mutex poisoned: task_queue")
+/// ```
+#[macro_export]
+macro_rules! lock {
+	// Simple version without context
+	($mutex:expr) => {
+		$mutex
+			.lock()
+			.map_err(|_| $crate::error::Error::Internal("mutex poisoned".into()))
+	};
+	// Version with context description
+	($mutex:expr, $context:expr) => {
+		$mutex
+			.lock()
+			.map_err(|_| $crate::error::Error::Internal(format!("mutex poisoned: {}", $context)))
+	};
 }
 
 // vim: ts=4

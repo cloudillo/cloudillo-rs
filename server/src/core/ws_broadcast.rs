@@ -82,14 +82,14 @@ impl BroadcastManager {
 	) -> ClResult<broadcast::Receiver<BroadcastMessage>> {
 		// Validate channel name
 		if channel.is_empty() || channel.len() > self.config.max_channel_name {
-			return Err(Error::Unknown);
+			return Err(Error::ValidationError("channel name empty or exceeds max length".into()));
 		}
 
 		let mut channels = self.channels.write().await;
 
 		// Check channel limit
 		if !channels.contains_key(channel) && channels.len() >= self.config.max_channels {
-			return Err(Error::Unknown);
+			return Err(Error::ValidationError("channel limit exceeded".into()));
 		}
 
 		// Get or create channel

@@ -74,7 +74,10 @@ impl Task<App> for ActionDeliveryTask {
 			Some(token) => token,
 			None => {
 				error!("No action token found for action {}", self.action_id);
-				return Err(Error::Unknown);
+				return Err(Error::Internal(format!(
+					"action token not found for action {}",
+					self.action_id
+				)));
 			}
 		};
 

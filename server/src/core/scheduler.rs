@@ -9,7 +9,7 @@ use std::{
 	sync::{Arc, Mutex, RwLock},
 };
 
-use crate::{meta_adapter, prelude::*};
+use crate::{lock, meta_adapter, prelude::*};
 
 pub type TaskId = u64;
 
@@ -38,11 +38,13 @@ impl CronSchedule {
 	/// Parse a cron expression (5 fields: minute hour day month weekday)
 	///
 	/// # Errors
-	/// Returns `Error::Unknown` if the expression is invalid
+	/// Returns `Error::ValidationError` if the expression is invalid
 	pub fn parse(expr: &str) -> ClResult<Self> {
 		let parts: Vec<&str> = expr.split_whitespace().collect();
 		if parts.len() != 5 {
-			return Err(Error::Unknown);
+			return Err(Error::ValidationError(
+				"invalid cron expression: must have 5 fields".into(),
+			));
 		}
 
 		let minute = Self::parse_field(parts[0], 0, 59)?;
@@ -61,11 +63,19 @@ impl CronSchedule {
 			return Ok(max + 1);
 		}
 
-		let val: u8 = field.parse().map_err(|_| Error::Unknown)?;
+		let val: u8 = field.parse().map_err(|_| {
+			Error::ValidationError(format!(
+				"invalid cron field: {} must be between {} and {}",
+				field, min, max
+			))
+		})?;
 		if val >= min && val <= max {
 			Ok(val)
 		} else {
-			Err(Error::Unknown)
+			Err(Error::ValidationError(format!(
+				"cron field out of range: {} (expected {}-{})",
+				val, min, max
+			)))
 		}
 	}
 
@@ -196,7 +206,7 @@ impl InMemoryTaskStore {
 #[async_trait]
 impl<S: Clone> TaskStore<S> for InMemoryTaskStore {
 	async fn add(&self, _task: &TaskMeta<S>, _key: Option<&str>) -> ClResult<TaskId> {
-		let mut last_id = self.last_id.lock().map_err(|_| Error::Unknown)?;
+		let mut last_id = lock!(self.last_id)?;
 		*last_id += 1;
 		Ok(*last_id)
 	}
@@ -613,7 +623,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		name: &'static str,
 		builder: &'static TaskBuilder<S>,
 	) -> ClResult<&Self> {
-		let mut task_builders = self.task_builders.write().map_err(|_| Error::Unknown)?;
+		let mut task_builders = self
+			.task_builders
+			.write()
+			.map_err(|_| Error::Internal("task_builders RwLock poisoned".into()))?;
 		task_builders.insert(name, Box::new(builder));
 		Ok(self)
 	}
@@ -663,43 +676,27 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		if !deps.is_empty() && task_meta.next_at.is_some() {
 			warn!("Task {} has both dependencies and scheduled time - ignoring next_at, placing in waiting queue", id);
 			// Force to tasks_waiting instead
-			self.tasks_waiting.lock().map_err(|_| Error::Unknown)?.insert(id, task_meta);
+			lock!(self.tasks_waiting, "tasks_waiting")?.insert(id, task_meta);
 			info!("Task {} is waiting for {:?}", id, &deps);
 			for dep in deps {
-				self.task_dependents
-					.lock()
-					.map_err(|_| Error::Unknown)?
-					.entry(dep)
-					.or_default()
-					.push(id);
+				lock!(self.task_dependents, "task_dependents")?.entry(dep).or_default().push(id);
 			}
 			return Ok(id);
 		}
 
 		if deps.is_empty() && task_meta.next_at.unwrap_or(Timestamp(0)) < Timestamp::now() {
 			info!("Spawning task {}", id);
-			self.tasks_scheduled
-				.lock()
-				.map_err(|_| Error::Unknown)?
-				.insert((Timestamp(0), id), task_meta);
+			lock!(self.tasks_scheduled, "tasks_scheduled")?.insert((Timestamp(0), id), task_meta);
 			self.notify_schedule.notify_one();
 		} else if let Some(next_at) = task_meta.next_at {
 			info!("Scheduling task {} for {}", id, next_at);
-			self.tasks_scheduled
-				.lock()
-				.map_err(|_| Error::Unknown)?
-				.insert((next_at, id), task_meta);
+			lock!(self.tasks_scheduled, "tasks_scheduled")?.insert((next_at, id), task_meta);
 			self.notify_schedule.notify_one();
 		} else {
-			self.tasks_waiting.lock().map_err(|_| Error::Unknown)?.insert(id, task_meta);
+			lock!(self.tasks_waiting, "tasks_waiting")?.insert(id, task_meta);
 			info!("Task {} is waiting for {:?}", id, &deps);
 			for dep in deps {
-				self.task_dependents
-					.lock()
-					.map_err(|_| Error::Unknown)?
-					.entry(dep)
-					.or_default()
-					.push(id);
+				lock!(self.task_dependents, "task_dependents")?.entry(dep).or_default().push(id);
 			}
 		}
 		Ok(id)
@@ -713,7 +710,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 	) -> ClResult<Vec<(TaskId, TaskMeta<S>)>> {
 		// Get list of dependents (atomic removal to prevent re-processing)
 		let dependents = {
-			let mut deps_map = self.task_dependents.lock().map_err(|_| Error::Unknown)?;
+			let mut deps_map = lock!(self.task_dependents, "task_dependents")?;
 			deps_map.remove(&completed_task_id).unwrap_or_default()
 		};
 
@@ -729,7 +726,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		for dependent_id in dependents {
 			// Try tasks_waiting first (most common case for dependent tasks)
 			{
-				let mut waiting = self.tasks_waiting.lock().map_err(|_| Error::Unknown)?;
+				let mut waiting = lock!(self.tasks_waiting, "tasks_waiting")?;
 				if let Some(task_meta) = waiting.get_mut(&dependent_id) {
 					// Remove the completed task from dependencies
 					task_meta.deps.retain(|x| *x != completed_task_id);
@@ -756,7 +753,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 			// Try tasks_scheduled if not in waiting (shouldn't happen with validation, but be defensive)
 			{
-				let mut scheduled = self.tasks_scheduled.lock().map_err(|_| Error::Unknown)?;
+				let mut scheduled = lock!(self.tasks_scheduled, "tasks_scheduled")?;
 				if let Some(scheduled_key) = scheduled
 					.iter()
 					.find(|((_, id), _)| *id == dependent_id)
@@ -798,21 +795,36 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			if let TaskStatus::Pending = t.status {
 				info!("Loading task {} {}", t.id, t.kind);
 				let task = {
-					let builder_map = self.task_builders.read().map_err(|_| Error::Unknown)?;
-					let builder = builder_map.get(t.kind.as_ref()).ok_or(Error::Unknown)?;
+					let builder_map = self
+						.task_builders
+						.read()
+						.map_err(|_| Error::Internal("task_builders RwLock poisoned".into()))?;
+					let builder = builder_map.get(t.kind.as_ref()).ok_or(Error::Internal(
+						format!("task builder not registered: {}", t.kind),
+					))?;
 					builder(t.id, &t.input)?
 				};
 				let (retry_count, retry) = match t.retry_data {
 					Some(retry_str) => {
-						let (retry_count, retry_min, retry_max, retry_times) =
-							retry_str.split(',').collect_tuple().ok_or(Error::Unknown)?;
-						let retry_count: u16 = retry_count.parse().map_err(|_| Error::Unknown)?;
+						let (retry_count, retry_min, retry_max, retry_times) = retry_str
+							.split(',')
+							.collect_tuple()
+							.ok_or(Error::Internal("invalid retry policy format".into()))?;
+						let retry_count: u16 = retry_count
+							.parse()
+							.map_err(|_| Error::Internal("retry count must be u16".into()))?;
 						let retry = RetryPolicy {
 							wait_min_max: (
-								retry_min.parse().map_err(|_| Error::Unknown)?,
-								retry_max.parse().map_err(|_| Error::Unknown)?,
+								retry_min
+									.parse()
+									.map_err(|_| Error::Internal("retry_min must be u64".into()))?,
+								retry_max
+									.parse()
+									.map_err(|_| Error::Internal("retry_max must be u64".into()))?,
 							),
-							times: retry_times.parse().map_err(|_| Error::Unknown)?,
+							times: retry_times
+								.parse()
+								.map_err(|_| Error::Internal("retry times must be u64".into()))?,
 						};
 						info!("Loaded retry policy: {:?}", retry);
 						(retry_count, Some(retry))
@@ -896,10 +908,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 	/// Get health status of the scheduler
 	/// Returns information about tasks in each queue and detects anomalies
 	pub async fn health_check(&self) -> ClResult<SchedulerHealth> {
-		let waiting_count = self.tasks_waiting.lock().map_err(|_| Error::Unknown)?.len();
-		let scheduled_count = self.tasks_scheduled.lock().map_err(|_| Error::Unknown)?.len();
-		let running_count = self.tasks_running.lock().map_err(|_| Error::Unknown)?.len();
-		let dependents_count = self.task_dependents.lock().map_err(|_| Error::Unknown)?.len();
+		let waiting_count = lock!(self.tasks_waiting, "tasks_waiting")?.len();
+		let scheduled_count = lock!(self.tasks_scheduled, "tasks_scheduled")?.len();
+		let running_count = lock!(self.tasks_running, "tasks_running")?.len();
+		let dependents_count = lock!(self.task_dependents, "task_dependents")?.len();
 
 		// Check for anomalies
 		let mut stuck_tasks = Vec::new();
@@ -907,8 +919,8 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 		// Check tasks_waiting for tasks with no dependencies (stuck)
 		{
-			let waiting = self.tasks_waiting.lock().map_err(|_| Error::Unknown)?;
-			let _deps_map = self.task_dependents.lock().map_err(|_| Error::Unknown)?;
+			let waiting = lock!(self.tasks_waiting, "tasks_waiting")?;
+			let _deps_map = lock!(self.task_dependents, "task_dependents")?;
 
 			for (id, task_meta) in waiting.iter() {
 				if task_meta.deps.is_empty() {
@@ -1000,7 +1012,9 @@ mod tests {
 		}
 
 		fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<State>>> {
-			let num: u8 = ctx.parse().map_err(|_| Error::Unknown)?;
+			let num: u8 = ctx
+				.parse()
+				.map_err(|_| Error::Internal("test task context must be u8".into()))?;
 			let task = TestTask::new(num);
 			Ok(task)
 		}
@@ -1044,10 +1058,14 @@ mod tests {
 		fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<State>>> {
 			let parts: Vec<&str> = ctx.split(',').collect();
 			if parts.len() != 2 {
-				return Err(Error::Unknown);
+				return Err(Error::Internal("failing task context must have 2 parts".into()));
 			}
-			let id: u8 = parts[0].parse().map_err(|_| Error::Unknown)?;
-			let fail_count: u8 = parts[1].parse().map_err(|_| Error::Unknown)?;
+			let id: u8 = parts[0]
+				.parse()
+				.map_err(|_| Error::Internal("failing task id must be u8".into()))?;
+			let fail_count: u8 = parts[1]
+				.parse()
+				.map_err(|_| Error::Internal("failing task fail_count must be u8".into()))?;
 			Ok(FailingTask::new(id, fail_count))
 		}
 

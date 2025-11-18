@@ -57,18 +57,18 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 			subtype = ?context.subtype,
 			"Hook called with wrong type, expected IDP:REG"
 		);
-		return Err(Error::Unknown); // Should not happen if hooks are called correctly
+		return Err(Error::Internal("idp hook called with wrong action type".into()));
 	}
 
 	// Parse the registration content
 	let reg_content: IdpRegContent = if let Some(content_value) = &context.content {
 		serde_json::from_value(content_value.clone()).map_err(|e| {
 			warn!("Failed to parse IDP:REG content: {}", e);
-			Error::Unknown
+			Error::Internal(format!("IDP:REG content parsing failed: {}", e))
 		})?
 	} else {
 		warn!("IDP:REG action missing required content field");
-		return Err(Error::Unknown);
+		return Err(Error::ValidationError("IDP:REG action missing content field".into()));
 	};
 
 	// Validate required fields
@@ -78,7 +78,7 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 			email = %reg_content.email,
 			"IDP:REG content has invalid fields"
 		);
-		return Err(Error::Unknown);
+		return Err(Error::ValidationError("IDP:REG content missing id_tag or email".into()));
 	}
 
 	// Verify Identity Provider adapter is available
@@ -90,7 +90,7 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 	// Get the audience (IdP instance) that should receive this registration
 	let _target_idp = context.audience.as_ref().ok_or_else(|| {
 		warn!("IDP:REG action missing audience (target IdP)");
-		Error::Unknown
+		Error::ValidationError("IDP:REG action missing audience (target IdP)".into())
 	})?;
 
 	// Get registrar info (issuer of the registration action)

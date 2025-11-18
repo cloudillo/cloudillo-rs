@@ -21,7 +21,7 @@ where
 	B: Body<Data = Bytes> + Send + Sync + 'static,
 	B::Error: Send + 'static,
 {
-	body.map_err(|_err| Error::Unknown).boxed()
+	body.map_err(|_err| Error::NetworkError("body stream error".into())).boxed()
 }
 
 #[derive(Deserialize)]
@@ -113,7 +113,7 @@ impl Request {
 			StatusCode::OK => Ok(res.into_body().collect().await?.to_bytes()),
 			StatusCode::NOT_FOUND => Err(Error::NotFound),
 			StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
-			_ => Err(Error::Unknown),
+			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
 		}
 	}
 
@@ -148,7 +148,7 @@ impl Request {
 			}
 			StatusCode::NOT_FOUND => Err(Error::NotFound),
 			StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
-			_ => Err(Error::Unknown),
+			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
 		}
 	}
 
@@ -188,7 +188,7 @@ impl Request {
 			}
 			StatusCode::NOT_FOUND => Err(Error::NotFound),
 			StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
-			_ => Err(Error::Unknown),
+			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
 		}
 	}
 
@@ -216,7 +216,7 @@ impl Request {
 			StatusCode::UNPROCESSABLE_ENTITY => Err(Error::ValidationError(
 				"IDP registration failed - validation error".to_string(),
 			)),
-			_ => Err(Error::Unknown),
+			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
 		}
 	}
 

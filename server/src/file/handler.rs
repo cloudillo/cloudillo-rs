@@ -403,7 +403,7 @@ pub async fn post_file_blob(
 				}
 			}
 		}
-		_ => Err(Error::Unknown),
+		_ => Err(Error::ValidationError("unsupported image format".into())),
 	}
 }
 

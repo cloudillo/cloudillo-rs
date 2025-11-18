@@ -204,7 +204,7 @@ pub async fn patch_action(
 	// 2. Update content/attachments
 	// 3. Return updated action
 
-	Err(Error::Unknown)
+	Err(Error::ServiceUnavailable("action updates not yet implemented".into()))
 }
 
 /// DELETE /api/action/:action_id - Delete action

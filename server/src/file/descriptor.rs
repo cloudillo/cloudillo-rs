@@ -146,7 +146,10 @@ impl Task<App> for FileIdGeneratorTask {
 	}
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
-		let (tn_id, f_id) = ctx.split(',').collect_tuple().ok_or(Error::Unknown)?;
+		let (tn_id, f_id) = ctx
+			.split(',')
+			.collect_tuple()
+			.ok_or(Error::Internal("invalid FileIdGenerator context format".into()))?;
 		let task = FileIdGeneratorTask::new(TnId(tn_id.parse()?), f_id.parse()?);
 		Ok(task)
 	}

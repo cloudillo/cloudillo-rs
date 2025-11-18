@@ -39,7 +39,7 @@ impl std::str::FromStr for IdentityStatus {
 			"pending" => Ok(IdentityStatus::Pending),
 			"active" => Ok(IdentityStatus::Active),
 			"suspended" => Ok(IdentityStatus::Suspended),
-			_ => Err(Error::Unknown),
+			_ => Err(Error::ValidationError(format!("invalid identity status: {}", s))),
 		}
 	}
 }

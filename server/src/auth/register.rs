@@ -96,8 +96,8 @@ async fn verify_register_data(
 	match typ {
 		"domain" => {
 			// Regex for domain: alphanumeric and hyphens, with at least one dot
-			let domain_regex =
-				Regex::new(r"^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$").map_err(|_| Error::Unknown)?;
+			let domain_regex = Regex::new(r"^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$")
+				.map_err(|e| Error::Internal(format!("domain regex compilation failed: {}", e)))?;
 
 			if !domain_regex.is_match(id_tag) {
 				response.id_tag_error = "invalid".to_string();
@@ -181,8 +181,8 @@ async fn verify_register_data(
 		}
 		"idp" => {
 			// Regex for idp: alphanumeric, hyphens, and dots, but must end with .cloudillo.net or similar
-			let idp_regex =
-				Regex::new(r"^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)*$").map_err(|_| Error::Unknown)?;
+			let idp_regex = Regex::new(r"^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)*$")
+				.map_err(|e| Error::Internal(format!("idp regex compilation failed: {}", e)))?;
 
 			if !idp_regex.is_match(id_tag) {
 				response.id_tag_error = "invalid".to_string();
@@ -232,7 +232,7 @@ async fn verify_register_data(
 			}
 		}
 		_ => {
-			return Err(Error::Unknown);
+			return Err(Error::ValidationError("invalid registration type".into()));
 		}
 	}
 
@@ -486,7 +486,7 @@ async fn handle_idp_registration(
 				error = %e,
 				"Failed to parse IDP registration response"
 			);
-			Error::Unknown
+			Error::Internal(format!("IDP response parsing failed: {}", e))
 		})?;
 
 	// Check if registration was successful
@@ -551,7 +551,7 @@ async fn handle_domain_registration(
 	// Check for validation errors
 	if !validation_result.id_tag_error.is_empty() || !validation_result.app_domain_error.is_empty()
 	{
-		return Err(Error::Unknown); // 422 in TypeScript
+		return Err(Error::ValidationError("invalid id_tag or app_domain".into()));
 	}
 
 	// Create tenant and profile (includes ACME and email sending)
@@ -569,7 +569,7 @@ pub async fn post_register(
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
 	// Validate request fields
 	if req.id_tag.is_empty() || req.token.is_empty() || req.email.is_empty() {
-		return Err(Error::Unknown);
+		return Err(Error::ValidationError("id_tag, token, and email are required".into()));
 	}
 
 	let id_tag_lower = req.id_tag.to_lowercase();
