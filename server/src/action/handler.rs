@@ -1,5 +1,5 @@
 use axum::{
-	extract::{Path, Query, State},
+	extract::{ConnectInfo, Path, Query, State},
 	http::StatusCode,
 	Json,
 };
@@ -128,6 +128,7 @@ pub async fn post_inbox_sync(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
+	ConnectInfo(socket_addr): ConnectInfo<std::net::SocketAddr>,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(inbox): Json<Inbox>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
@@ -147,13 +148,17 @@ pub async fn post_inbox_sync(
 	let action_id_box = hash("a", inbox.token.as_bytes());
 	let action_id = action_id_box.to_string();
 
+	// Extract client IP address for hooks that need it (e.g., IDP:REG with "auto" address)
+	let client_address = Some(socket_addr.ip().to_string());
+
 	// Process the action synchronously and get the hook result
-	let hook_result = process_inbound_action_token(&app, tn_id, &action_id, &inbox.token, true)
-		.await
-		.map_err(|e| {
-			warn!(error = %e, "Failed to process synchronous action");
-			e
-		})?;
+	let hook_result =
+		process_inbound_action_token(&app, tn_id, &action_id, &inbox.token, true, client_address)
+			.await
+			.map_err(|e| {
+				warn!(error = %e, "Failed to process synchronous action");
+				e
+			})?;
 
 	// Extract the return value from the hook result (or empty object if no return value)
 	let response_data = hook_result.unwrap_or(serde_json::json!({}));
@@ -261,6 +266,7 @@ pub async fn post_action_accept(
 			tenant_type: "person".to_string(),
 			is_inbound: true, // This is an inbound action being accepted
 			is_outbound: false,
+			client_address: None,
 			vars: HashMap::new(),
 		};
 
@@ -332,6 +338,7 @@ pub async fn post_action_reject(
 			tenant_type: "person".to_string(),
 			is_inbound: true, // This is an inbound action being rejected
 			is_outbound: false,
+			client_address: None,
 			vars: HashMap::new(),
 		};
 

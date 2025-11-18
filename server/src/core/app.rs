@@ -8,14 +8,15 @@ use std::{
 	sync::{Arc, RwLock},
 };
 
-use crate::core::{abac, acme, request, scheduler, webserver, worker};
+use crate::bootstrap;
+use crate::core::{abac, request, scheduler, webserver, worker};
 use crate::prelude::*;
 
 use crate::auth_adapter::AuthAdapter;
 use crate::blob_adapter::BlobAdapter;
 use crate::crdt_adapter::CrdtAdapter;
 use crate::identity_provider_adapter::IdentityProviderAdapter;
-use crate::meta_adapter::{MetaAdapter, UpdateTenantData};
+use crate::meta_adapter::MetaAdapter;
 use crate::rtdb_adapter::RtdbAdapter;
 use crate::settings::service::SettingsService;
 use crate::settings::{FrozenSettingsRegistry, SettingsRegistry};
@@ -81,13 +82,12 @@ pub struct AppBuilderOpts {
 	listen: Box<str>,
 	listen_http: Option<Box<str>>,
 	pub base_id_tag: Option<Box<str>>,
-	base_app_domain: Option<Box<str>>,
-	base_password: Option<Box<str>>,
+	pub base_app_domain: Option<Box<str>>,
+	pub base_password: Option<Box<str>>,
 	pub dist_dir: Box<Path>,
 	pub tmp_dir: Box<Path>,
 	pub acme_email: Option<Box<str>>,
-	pub local_addresses: Box<[Box<str>]>,
-	pub identity_providers: Box<[Box<str>]>,
+	pub local_address: Box<[Box<str>]>,
 }
 
 pub struct AppBuilder {
@@ -114,8 +114,7 @@ impl AppBuilder {
 				dist_dir: PathBuf::from("./dist").into(),
 				tmp_dir: PathBuf::from("./tmp").into(),
 				acme_email: None,
-				local_addresses: Box::new([]),
-				identity_providers: Box::new([]),
+				local_address: Box::new([]),
 			},
 			worker: None,
 			adapters: Adapters {
@@ -166,18 +165,11 @@ impl AppBuilder {
 		self.opts.acme_email = Some(acme_email.into());
 		self
 	}
-	pub fn local_addresses(
+	pub fn local_address(
 		&mut self,
-		local_addresses: impl IntoIterator<Item = impl Into<Box<str>>>,
+		local_address: impl IntoIterator<Item = impl Into<Box<str>>>,
 	) -> &mut Self {
-		self.opts.local_addresses = local_addresses.into_iter().map(|addr| addr.into()).collect();
-		self
-	}
-	pub fn identity_providers(
-		&mut self,
-		identity_providers: impl IntoIterator<Item = impl Into<Box<str>>>,
-	) -> &mut Self {
-		self.opts.identity_providers = identity_providers.into_iter().map(|ip| ip.into()).collect();
+		self.opts.local_address = local_address.into_iter().map(|addr| addr.into()).collect();
 		self
 	}
 	pub fn worker(&mut self, worker: Arc<worker::WorkerPool>) -> &mut Self {
@@ -223,9 +215,9 @@ impl AppBuilder {
 
 		// Validate that all local addresses are the same type
 		if let Err(e) =
-			crate::core::address::validate_address_type_consistency(&self.opts.local_addresses)
+			crate::core::address::validate_address_type_consistency(&self.opts.local_address)
 		{
-			error!("FATAL: Invalid local_addresses configuration: {}", e);
+			error!("FATAL: Invalid local_address configuration: {}", e);
 			return Err(e);
 		}
 
@@ -392,10 +384,7 @@ impl AppBuilder {
 		};
 
 		// Run bootstrapper in the background
-		tokio::spawn(async move {
-			info!("Bootstrapping...");
-			bootstrap(app.clone(), &app.opts).await
-		});
+		tokio::spawn(async move { bootstrap::bootstrap(app.clone(), &app.opts).await });
 
 		if let Some(http_server) = http_server {
 			let _ = tokio::try_join!(https_server, http_server)?;
@@ -411,178 +400,5 @@ impl Default for AppBuilder {
 	fn default() -> Self {
 		Self::new()
 	}
-}
-
-/// Options for creating a complete tenant with all necessary setup
-pub struct CreateCompleteTenantOptions<'a> {
-	pub id_tag: &'a str,
-	pub email: Option<&'a str>,
-	pub password: Option<&'a str>,
-	pub roles: Option<&'a [&'a str]>,
-	pub display_name: Option<&'a str>,
-	pub create_acme_cert: bool,
-	pub acme_email: Option<&'a str>,
-	pub app_domain: Option<&'a str>,
-}
-
-/// Create a complete tenant with all necessary setup
-///
-/// This function handles the complete tenant creation process including:
-/// 1. Creating tenant in auth adapter
-/// 2. Creating profile signing key
-/// 3. Creating tenant in meta adapter
-/// 4. Setting display name
-/// 5. Optionally creating ACME certificate
-///
-/// This function is used by both bootstrap and registration flows
-pub async fn create_complete_tenant(
-	app: &Arc<AppState>,
-	opts: CreateCompleteTenantOptions<'_>,
-) -> ClResult<TnId> {
-	let auth = &app.auth_adapter;
-	let meta = &app.meta_adapter;
-
-	info!("Creating complete tenant: {}", opts.id_tag);
-
-	// Create tenant in auth adapter
-	let tn_id = auth
-		.create_tenant(
-			opts.id_tag,
-			crate::auth_adapter::CreateTenantData {
-				vfy_code: None,
-				email: opts.email,
-				password: opts.password,
-				roles: opts.roles,
-			},
-		)
-		.await
-		.map_err(|e| {
-			warn!(
-				error = %e,
-				id_tag = %opts.id_tag,
-				"Failed to create tenant in auth adapter"
-			);
-			e
-		})?;
-
-	info!(tn_id = ?tn_id, "Tenant created in auth adapter");
-
-	// Create profile signing key
-	auth.create_profile_key(tn_id, None).await.map_err(|e| {
-		warn!(
-			error = %e,
-			id_tag = %opts.id_tag,
-			tn_id = ?tn_id,
-			"Failed to create profile key"
-		);
-		e
-	})?;
-
-	info!("Profile key created");
-
-	// Create tenant in meta adapter
-	meta.create_tenant(tn_id, opts.id_tag).await.map_err(|e| {
-		warn!(
-			error = %e,
-			id_tag = %opts.id_tag,
-			tn_id = ?tn_id,
-			"Failed to create tenant in meta adapter"
-		);
-		// Note: Cannot await cleanup here as we're in a non-async closure
-		// The cleanup would need to be handled by the caller if needed
-		e
-	})?;
-
-	info!("Tenant created in meta adapter");
-
-	// Set display name
-	let display_name = opts.display_name.unwrap_or_else(|| {
-		// Derive display name from id_tag (first part before dot)
-		opts.id_tag.split('.').next().unwrap_or(opts.id_tag)
-	});
-
-	meta.update_tenant(
-		tn_id,
-		&UpdateTenantData { name: Patch::Value(display_name.into()), ..Default::default() },
-	)
-	.await
-	.map_err(|e| {
-		warn!(
-			error = %e,
-			id_tag = %opts.id_tag,
-			tn_id = ?tn_id,
-			"Failed to update tenant display name"
-		);
-		e
-	})?;
-
-	info!(display_name = %display_name, "Tenant display name set");
-
-	// Create ACME certificate if requested
-	if opts.create_acme_cert {
-		if let Some(acme_email) = opts.acme_email {
-			info!("Creating ACME certificate for tenant");
-			acme::init(app.clone(), acme_email, opts.id_tag, opts.app_domain)
-				.await
-				.map_err(|e| {
-					warn!(
-						error = %e,
-						id_tag = %opts.id_tag,
-						"Failed to create ACME certificate"
-					);
-					e
-				})?;
-			info!("ACME certificate created successfully");
-		} else {
-			warn!("ACME cert requested but no ACME email provided");
-		}
-	}
-
-	info!(
-		id_tag = %opts.id_tag,
-		tn_id = ?tn_id,
-		"Complete tenant creation finished successfully"
-	);
-
-	Ok(tn_id)
-}
-
-async fn bootstrap(app: Arc<AppState>, opts: &AppBuilderOpts) -> ClResult<()> {
-	let auth = &app.auth_adapter;
-
-	if true {
-		let base_id_tag = &opts.base_id_tag.as_ref().expect("FATAL: No base id tag");
-		let id_tag = auth.read_id_tag(TnId(1)).await;
-		debug!("Got id tag: {:?}", id_tag);
-
-		if let Err(Error::NotFound) = id_tag {
-			info!("======================================\nBootstrapping...\n======================================");
-			let base_password = opts.base_password.clone().expect("FATAL: No base password");
-
-			// Use the unified tenant creation function
-			create_complete_tenant(
-				&app,
-				CreateCompleteTenantOptions {
-					id_tag: base_id_tag,
-					email: None,
-					password: Some(&base_password),
-					roles: Some(&["SADM"]),
-					display_name: None, // Will be derived from id_tag
-					create_acme_cert: opts.acme_email.is_some(),
-					acme_email: opts.acme_email.as_deref(),
-					app_domain: opts.base_app_domain.as_deref(),
-				},
-			)
-			.await?;
-		} else if let Some(ref acme_email) = opts.acme_email {
-			// If tenant exists but cert doesn't, create cert
-			let cert_data = auth.read_cert_by_tn_id(TnId(1)).await;
-			if let Err(Error::NotFound) = cert_data {
-				acme::init(app.clone(), acme_email, base_id_tag, opts.base_app_domain.as_deref())
-					.await?;
-			}
-		}
-	}
-	Ok(())
 }
 // vim: ts=4

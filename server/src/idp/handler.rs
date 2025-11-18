@@ -43,16 +43,20 @@ async fn check_idp_enabled(app: &App, tn_id: TnId) -> ClResult<()> {
 
 /// Response structure for identity details
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IdentityResponse {
 	pub id_tag: String,
 	pub email: String,
 	pub registrar_id_tag: String,
-	pub current_address: Option<String>,
+	pub address: Option<String>,
 	pub address_updated_at: Option<i64>,
 	pub status: String,
 	pub created_at: i64,
 	pub updated_at: i64,
 	pub expires_at: i64,
+	/// API key (only returned during creation, never stored or returned in subsequent reads)
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub api_key: Option<String>,
 }
 
 impl From<Identity> for IdentityResponse {
@@ -63,12 +67,13 @@ impl From<Identity> for IdentityResponse {
 			id_tag,
 			email: identity.email.to_string(),
 			registrar_id_tag: identity.registrar_id_tag.to_string(),
-			current_address: identity.current_address.map(|a| a.to_string()),
+			address: identity.address.map(|a| a.to_string()),
 			address_updated_at: identity.address_updated_at.map(|ts| ts.0),
 			status: identity.status.to_string(),
 			created_at: identity.created_at.0,
 			updated_at: identity.updated_at.0,
 			expires_at: identity.expires_at.0,
+			api_key: None, // Never included in From<Identity>, only set during creation
 		}
 	}
 }
@@ -81,9 +86,7 @@ pub struct CreateIdentityRequest {
 	/// Email address for the identity
 	pub email: String,
 	/// Initial address (optional)
-	pub current_address: Option<String>,
-	/// Expiration timestamp (optional, defaults to current time + 1 year)
-	pub expires_at: Option<i64>,
+	pub address: Option<String>,
 }
 
 /// Request structure for updating identity address
@@ -247,6 +250,18 @@ pub async fn create_identity(
 	let (id_tag_prefix, id_tag_domain) =
 		parse_and_validate_identity_id_tag(&create_req.id_tag, &registrar_id_tag)?;
 
+	// Forbid creation of identities with prefix 'cl-o'
+	if id_tag_prefix == "cl-o" {
+		warn!(
+			id_tag_prefix = %id_tag_prefix,
+			registrar_id_tag = %registrar_id_tag,
+			"Attempted to create identity with forbidden prefix 'cl-o'"
+		);
+		return Err(Error::ValidationError(
+			"Identity prefix 'cl-o' is reserved and cannot be used".to_string(),
+		));
+	}
+
 	// Check registrar quota
 	let quota = idp_adapter.get_quota(&registrar_id_tag).await?;
 	if quota.current_identities >= quota.max_identities {
@@ -259,12 +274,59 @@ pub async fn create_identity(
 		return Err(Error::ValidationError("Registrar quota exceeded".to_string()));
 	}
 
-	// Determine expiration time
-	let expires_at = if let Some(expires_timestamp) = create_req.expires_at {
-		Timestamp(expires_timestamp)
+	// Get renewal interval from settings (in days) and convert to seconds
+	let renewal_interval_days = match app.settings.get(tn_id, "idp.renewal_interval").await {
+		Ok(SettingValue::Int(days)) => days,
+		Ok(_) => {
+			warn!(tn_id = tn_id.0, "Invalid idp.renewal_interval setting value");
+			return Err(Error::ConfigError(
+				"Invalid idp.renewal_interval setting value (expected integer days)".into(),
+			));
+		}
+		Err(e) => {
+			warn!(tn_id = tn_id.0, error = ?e, "Failed to get idp.renewal_interval setting");
+			return Err(e);
+		}
+	};
+
+	let renewal_interval_seconds = renewal_interval_days * 24 * 60 * 60;
+	let expires_at = Timestamp::now().add_seconds(renewal_interval_seconds);
+
+	// Parse address type if address is provided
+	let address_type = if let Some(addr) = &create_req.address {
+		info!(
+			id_tag_prefix = %id_tag_prefix,
+			id_tag_domain = %id_tag_domain,
+			address = %addr,
+			"Creating identity with address"
+		);
+
+		// Parse and log address type
+		match parse_address_type(addr) {
+			Ok(addr_type) => {
+				info!(
+					address = %addr,
+					address_type = ?addr_type,
+					"Parsed address type"
+				);
+				Some(addr_type)
+			}
+			Err(e) => {
+				warn!(
+					address = %addr,
+					error = ?e,
+					"Failed to parse address type"
+				);
+				None
+			}
+		}
 	} else {
-		// Default to 1 year from now
-		Timestamp::now().add_seconds(365 * 24 * 60 * 60)
+		info!(
+			id_tag_prefix = %id_tag_prefix,
+			id_tag_domain = %id_tag_domain,
+			"Creating identity without address"
+		);
+		None
 	};
 
 	// Create the identity with split id_tag components
@@ -274,19 +336,56 @@ pub async fn create_identity(
 		email: &create_req.email,
 		registrar_id_tag: &registrar_id_tag,
 		status: IdentityStatus::Pending,
-		current_address: create_req.current_address.as_deref(),
+		address: create_req.address.as_deref(),
+		address_type,
 		expires_at: Some(expires_at),
 	};
+
+	info!(
+		id_tag_prefix = %id_tag_prefix,
+		id_tag_domain = %id_tag_domain,
+		"Calling IDP adapter create_identity"
+	);
 
 	let identity = idp_adapter.create_identity(opts).await.map_err(|e| {
 		warn!("Failed to create identity: {}", e);
 		e
 	})?;
 
+	info!(
+		id_tag_prefix = %identity.id_tag_prefix,
+		id_tag_domain = %identity.id_tag_domain,
+		address = ?identity.address,
+		"Identity created successfully"
+	);
+
+	// Create API key for the identity
+	let create_key_opts = crate::identity_provider_adapter::CreateApiKeyOptions {
+		id_tag_prefix: &id_tag_prefix,
+		id_tag_domain: &id_tag_domain,
+		name: Some("identity-key"),
+		expires_at: None, // No expiration for identity keys
+	};
+
+	let created_key = idp_adapter.create_api_key(create_key_opts).await.map_err(|e| {
+		warn!("Failed to create API key for identity: {}", e);
+		e
+	})?;
+
+	info!(
+		id_tag_prefix = %id_tag_prefix,
+		id_tag_domain = %id_tag_domain,
+		key_prefix = %created_key.api_key.key_prefix,
+		"API key created for identity"
+	);
+
 	// Update quota
 	let _ = idp_adapter.increment_quota(&registrar_id_tag, 0).await;
 
-	let response_data = IdentityResponse::from(identity);
+	let mut response_data = IdentityResponse::from(identity);
+	// Include the API key in the response (only shown once!)
+	response_data.api_key = Some(created_key.plaintext_key);
+
 	let mut response = ApiResponse::new(response_data);
 	if let Some(id) = req_id {
 		response = response.with_req_id(id);
@@ -342,20 +441,27 @@ pub async fn update_identity_address(
 	}
 
 	// Determine the address to use
-	let address_to_update = if update_req.auto_address || update_req.address.is_none() {
-		// Use peer IP address
+	// Support both "auto" as a string value and the auto_address boolean flag
+	let address_to_update = if update_req.auto_address {
+		// Use peer IP address (legacy auto_address flag)
 		socket_addr.ip().to_string()
 	} else if let Some(addr) = update_req.address {
-		// Use provided address
-		addr
+		if addr == "auto" {
+			// Use peer IP address (new "auto" string value)
+			socket_addr.ip().to_string()
+		} else {
+			// Use provided address
+			addr
+		}
 	} else {
+		// No address provided and auto_address is false
 		return Err(Error::ValidationError(
 			"Address is required when auto_address is false".to_string(),
 		));
 	};
 
 	// Check if the address has actually changed - optimization to avoid unnecessary updates
-	if let Some(current_addr) = &existing.current_address {
+	if let Some(current_addr) = &existing.address {
 		if current_addr.as_ref() == address_to_update {
 			// Address hasn't changed, return the existing identity
 			info!(
@@ -523,6 +629,17 @@ pub async fn check_identity_availability(
 			return Err(Error::ValidationError(
 				"Identity prefix cannot be empty (id_tag must be in format 'prefix.domain')"
 					.to_string(),
+			));
+		}
+
+		// Forbid 'cl-o' prefix (reserved)
+		if id_tag_prefix == "cl-o" {
+			warn!(
+				id_tag_prefix = %id_tag_prefix,
+				"Attempted to check availability for forbidden prefix 'cl-o'"
+			);
+			return Err(Error::ValidationError(
+				"Identity prefix 'cl-o' is reserved and cannot be used".to_string(),
 			));
 		}
 

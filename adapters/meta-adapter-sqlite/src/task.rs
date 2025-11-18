@@ -154,15 +154,156 @@ pub(crate) async fn mark_error(
 	Ok(())
 }
 
-/// Update the cron schedule for a task
-pub(crate) async fn update_cron(db: &SqlitePool, task_id: u64, cron: Option<&str>) -> ClResult<()> {
-	sqlx::query("UPDATE tasks SET cron=? WHERE task_id=?")
-		.bind(cron)
-		.bind(task_id as i64)
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+/// Find a pending task by its key
+pub(crate) async fn find_by_key(db: &SqlitePool, key: &str) -> ClResult<Option<Task>> {
+	let res = sqlx::query(
+		"SELECT t.task_id, t.tn_id, t.kind, t.status, t.created_at, t.next_at, t.retry, t.cron,
+		t.input, t.output, string_agg(td.dep_id, ',') as deps
+		FROM tasks t
+		LEFT JOIN task_dependencies td ON td.task_id=t.task_id
+		WHERE t.status='P' AND t.key=?
+		GROUP BY t.task_id
+		LIMIT 1",
+	)
+	.bind(key)
+	.fetch_optional(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+
+	match res {
+		Some(row) => {
+			let deps: Option<Box<str>> = row.try_get("deps").map_err(|_| Error::DbError)?;
+			let status: &str = row.try_get("status").map_err(|_| Error::DbError)?;
+			Ok(Some(Task {
+				task_id: row.try_get("task_id").map_err(|_| Error::DbError)?,
+				tn_id: TnId(row.try_get("tn_id").map_err(|_| Error::DbError)?),
+				kind: row.try_get::<Box<str>, _>("kind").map_err(|_| Error::DbError)?,
+				status: status.chars().next().unwrap_or('E'),
+				created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
+				next_at: row
+					.try_get::<Option<i64>, _>("next_at")
+					.map_err(|_| Error::DbError)?
+					.map(Timestamp),
+				retry: row.try_get("retry").map_err(|_| Error::DbError)?,
+				cron: row.try_get("cron").map_err(|_| Error::DbError)?,
+				input: row.try_get("input").map_err(|_| Error::DbError)?,
+				output: row.try_get("output").map_err(|_| Error::DbError)?,
+				deps: deps.map(|s| parse_u64_list(&s)).unwrap_or_default(),
+			}))
+		}
+		None => Ok(None),
+	}
+}
+
+/// Update task fields with partial updates using a single query
+pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> ClResult<()> {
+	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
+
+	// Build dynamic UPDATE query
+	let mut query = sqlx::QueryBuilder::new("UPDATE tasks SET ");
+	let mut has_fields = false;
+
+	// Add input if present
+	if let Patch::Value(ref input) = patch.input {
+		if has_fields {
+			query.push(", ");
+		}
+		query.push("input=").push_bind(input);
+		has_fields = true;
+	}
+
+	// Add next_at if present
+	match &patch.next_at {
+		Patch::Value(ref next_at) => {
+			if has_fields {
+				query.push(", ");
+			}
+			query.push("next_at=").push_bind(next_at.0);
+			has_fields = true;
+		}
+		Patch::Null => {
+			if has_fields {
+				query.push(", ");
+			}
+			query.push("next_at=NULL");
+			has_fields = true;
+		}
+		_ => {}
+	}
+
+	// Add retry if present
+	match &patch.retry {
+		Patch::Value(ref retry) => {
+			if has_fields {
+				query.push(", ");
+			}
+			query.push("retry=").push_bind(retry);
+			has_fields = true;
+		}
+		Patch::Null => {
+			if has_fields {
+				query.push(", ");
+			}
+			query.push("retry=NULL");
+			has_fields = true;
+		}
+		_ => {}
+	}
+
+	// Add cron if present
+	match &patch.cron {
+		Patch::Value(ref cron) => {
+			if has_fields {
+				query.push(", ");
+			}
+			query.push("cron=").push_bind(cron);
+			has_fields = true;
+		}
+		Patch::Null => {
+			if has_fields {
+				query.push(", ");
+			}
+			query.push("cron=NULL");
+			has_fields = true;
+		}
+		_ => {}
+	}
+
+	// Execute UPDATE if there are fields to update
+	if has_fields {
+		query.push(" WHERE task_id=").push_bind(task_id as i64);
+		query
+			.build()
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+	}
+
+	// Update dependencies if present (requires separate operations)
+	if let Patch::Value(ref deps) = patch.deps {
+		// Delete existing dependencies
+		sqlx::query("DELETE FROM task_dependencies WHERE task_id=?")
+			.bind(task_id as i64)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+
+		// Insert new dependencies
+		for dep in deps {
+			sqlx::query("INSERT INTO task_dependencies (task_id, dep_id) VALUES (?, ?)")
+				.bind(task_id as i64)
+				.bind(*dep as i64)
+				.execute(&mut *tx)
+				.await
+				.inspect_err(inspect)
+				.map_err(|_| Error::DbError)?;
+		}
+	}
+
+	tx.commit().await.map_err(|_| Error::DbError)?;
 
 	Ok(())
 }

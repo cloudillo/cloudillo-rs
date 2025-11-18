@@ -125,6 +125,20 @@ pub(crate) async fn update_tenant_password(
 	Ok(())
 }
 
+/// Update IDP API key for federated identity
+pub(crate) async fn update_idp_api_key(
+	db: &SqlitePool,
+	id_tag: &str,
+	api_key: &str,
+) -> ClResult<()> {
+	let _res = sqlx::query("UPDATE tenants SET idp_api_key=?2 WHERE id_tag = ?1")
+		.bind(id_tag)
+		.bind(api_key)
+		.execute(db)
+		.await;
+	Ok(())
+}
+
 /// Create a login session and return auth token
 pub(crate) async fn create_tenant_login(
 	db: &SqlitePool,

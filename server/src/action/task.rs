@@ -180,6 +180,7 @@ impl Task<App> for ActionCreatorTask {
 				is_inbound: false,
 				is_outbound: true,
 				vars: HashMap::new(),
+				client_address: None,
 			};
 
 			if let Err(e) = app
@@ -314,8 +315,15 @@ impl Task<App> for ActionVerifierTask {
 		let action_id = hasher::hash("a", self.token.as_bytes());
 		info!("Running task action.verify {}", action_id);
 
-		process::process_inbound_action_token(app, self.tn_id, &action_id, &self.token, false)
-			.await?;
+		process::process_inbound_action_token(
+			app,
+			self.tn_id,
+			&action_id,
+			&self.token,
+			false,
+			None,
+		)
+		.await?;
 
 		info!("Finished task action.verify {}", action_id);
 		Ok(())

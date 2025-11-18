@@ -166,6 +166,10 @@ pub struct HookContext {
 	pub is_inbound: bool,
 	pub is_outbound: bool,
 
+	// Client information
+	/// Client IP address (available for inbound actions)
+	pub client_address: Option<String>,
+
 	// Variables set by operations
 	pub vars: HashMap<String, serde_json::Value>,
 }
@@ -304,6 +308,7 @@ mod tests {
 			tenant_type: "user".to_string(),
 			is_inbound: false,
 			is_outbound: true,
+			client_address: None,
 			vars: HashMap::new(),
 		};
 

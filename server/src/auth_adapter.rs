@@ -153,11 +153,24 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn check_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<AuthLogin>;
 	async fn update_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<()>;
 
+	// IDP API key management
+	/// Store IDP API key for federated identity
+	async fn update_idp_api_key(&self, id_tag: &str, api_key: &str) -> ClResult<()>;
+
 	// Certificate management
 	async fn create_cert(&self, cert_data: &CertData) -> ClResult<()>;
 	async fn read_cert_by_tn_id(&self, tn_id: TnId) -> ClResult<CertData>;
 	async fn read_cert_by_id_tag(&self, id_tag: &str) -> ClResult<CertData>;
 	async fn read_cert_by_domain(&self, domain: &str) -> ClResult<CertData>;
+
+	/// List tenants that need certificate renewal
+	/// Returns (tn_id, id_tag) for tenants where:
+	/// - Certificate doesn't exist, OR
+	/// - Certificate expires within renewal_days
+	async fn list_tenants_needing_cert_renewal(
+		&self,
+		renewal_days: u32,
+	) -> ClResult<Vec<(TnId, Box<str>)>>;
 
 	// Key management
 	async fn list_profile_keys(&self, tn_id: TnId) -> ClResult<Vec<AuthKey>>;

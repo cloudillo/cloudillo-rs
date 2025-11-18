@@ -189,6 +189,8 @@ pub trait TaskStore<S: Clone>: Send + Sync {
 		output: &str,
 		next_at: Option<Timestamp>,
 	) -> ClResult<()>;
+	async fn find_by_key(&self, key: &str) -> ClResult<Option<(TaskId, TaskData)>>;
+	async fn update_task(&self, id: TaskId, task: &TaskMeta<S>) -> ClResult<()>;
 }
 
 // InMemoryTaskStore
@@ -227,6 +229,16 @@ impl<S: Clone> TaskStore<S> for InMemoryTaskStore {
 	) -> ClResult<()> {
 		Ok(())
 	}
+
+	async fn find_by_key(&self, _key: &str) -> ClResult<Option<(TaskId, TaskData)>> {
+		// In-memory store doesn't support persistence or keys
+		Ok(None)
+	}
+
+	async fn update_task(&self, _id: TaskId, _task: &TaskMeta<S>) -> ClResult<()> {
+		// In-memory store doesn't support persistence
+		Ok(())
+	}
 }
 
 // MetaAdapterTaskStore
@@ -255,7 +267,12 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 				"{} {} {} {} {}",
 				cron.minute, cron.hour, cron.day, cron.month, cron.weekday
 			);
-			self.meta_adapter.update_task_cron(id, Some(&cron_str)).await?;
+			self.meta_adapter
+				.update_task(
+					id,
+					&meta_adapter::TaskPatch { cron: Patch::Value(cron_str), ..Default::default() },
+				)
+				.await?;
 		}
 
 		Ok(id)
@@ -295,6 +312,71 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 		next_at: Option<Timestamp>,
 	) -> ClResult<()> {
 		self.meta_adapter.update_task_error(task_id, output, next_at).await
+	}
+
+	async fn find_by_key(&self, key: &str) -> ClResult<Option<(TaskId, TaskData)>> {
+		let task_opt = self.meta_adapter.find_task_by_key(key).await?;
+
+		match task_opt {
+			Some(t) => Ok(Some((
+				t.task_id,
+				TaskData {
+					id: t.task_id,
+					kind: t.kind,
+					status: match t.status {
+						'P' => TaskStatus::Pending,
+						'F' => TaskStatus::Completed,
+						'E' => TaskStatus::Failed,
+						_ => TaskStatus::Failed,
+					},
+					input: t.input,
+					deps: t.deps,
+					retry_data: t.retry,
+					cron_data: t.cron,
+					next_at: t.next_at,
+				},
+			))),
+			None => Ok(None),
+		}
+	}
+
+	async fn update_task(&self, id: TaskId, task: &TaskMeta<S>) -> ClResult<()> {
+		use crate::types::Patch;
+
+		// Build TaskPatch from TaskMeta
+		let mut patch = meta_adapter::TaskPatch {
+			input: Patch::Value(task.task.serialize()),
+			next_at: match task.next_at {
+				Some(ts) => Patch::Value(ts),
+				None => Patch::Null,
+			},
+			..Default::default()
+		};
+
+		// Update deps
+		if !task.deps.is_empty() {
+			patch.deps = Patch::Value(task.deps.clone());
+		}
+
+		// Update retry policy
+		if let Some(ref retry) = task.retry {
+			let retry_str = format!(
+				"{},{},{},{}",
+				task.retry_count, retry.wait_min_max.0, retry.wait_min_max.1, retry.times
+			);
+			patch.retry = Patch::Value(retry_str);
+		}
+
+		// Update cron schedule
+		if let Some(ref cron) = task.cron {
+			let cron_str = format!(
+				"{} {} {} {} {}",
+				cron.minute, cron.hour, cron.day, cron.month, cron.weekday
+			);
+			patch.cron = Patch::Value(cron_str);
+		}
+
+		self.meta_adapter.update_task(id, &patch).await
 	}
 }
 
@@ -536,38 +618,64 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			while let Ok(id) = rx_finish.recv_async().await {
 				info!("Completed task {}", id);
 
-				// Check if this is a recurring task with cron schedule
-				let is_recurring = {
+				// Get task metadata and check if this is a recurring task
+				let task_meta_opt = {
 					let mut tasks_running = schedule.tasks_running.lock().unwrap();
-					if let Some(task_meta) = tasks_running.remove(&id) {
-						task_meta.cron.is_some()
-					} else {
-						false
-					}
+					tasks_running.remove(&id)
 				};
 
-				// Mark task as finished if not recurring (drop lock before await)
-				if !is_recurring {
-					schedule.store.finished(id, "").await.unwrap_or(());
-				} else {
-					info!("Recurring task {} will execute again on next schedule", id);
-				}
+				if let Some(task_meta) = task_meta_opt {
+					// Check if this is a recurring task with cron schedule
+					if let Some(ref cron) = task_meta.cron {
+						// Calculate next execution time
+						let next_at = cron.next_execution(Timestamp::now());
+						info!(
+							"Recurring task {} completed, scheduling next execution at {}",
+							id, next_at
+						);
 
-				// Handle dependencies of finished task using atomic release method
-				match schedule.release_dependents(id) {
-					Ok(ready_to_spawn) => {
-						for (dep_id, task_meta) in ready_to_spawn {
-							schedule.spawn_task(
-								stat.clone(),
-								task_meta.task.clone(),
-								dep_id,
-								task_meta,
-							);
+						// Update task with new next_at
+						let mut updated_meta = task_meta.clone();
+						updated_meta.next_at = Some(next_at);
+
+						// Update database with new next_at (keep status as Pending)
+						if let Err(e) = schedule.store.update_task(id, &updated_meta).await {
+							error!("Failed to update recurring task {} next_at: {}", id, e);
+						}
+
+						// Re-add to scheduler with new execution time
+						if let Err(e) = schedule.add_queue(id, updated_meta).await {
+							error!("Failed to reschedule recurring task {}: {}", id, e);
+						}
+					} else {
+						// One-time task - mark as finished
+						schedule.store.finished(id, "").await.unwrap_or(());
+					}
+
+					// Handle dependencies of finished task using atomic release method
+					match schedule.release_dependents(id) {
+						Ok(ready_to_spawn) => {
+							for (dep_id, dep_task_meta) in ready_to_spawn {
+								// Add to running queue before spawning
+								schedule
+									.tasks_running
+									.lock()
+									.unwrap()
+									.insert(dep_id, dep_task_meta.clone());
+								schedule.spawn_task(
+									stat.clone(),
+									dep_task_meta.task.clone(),
+									dep_id,
+									dep_task_meta,
+								);
+							}
+						}
+						Err(e) => {
+							error!("Failed to release dependents of task {}: {}", id, e);
 						}
 					}
-					Err(e) => {
-						error!("Failed to release dependents of task {}: {}", id, e);
-					}
+				} else {
+					warn!("Completed task {} not found in running queue", id);
 				}
 			}
 		});
@@ -661,6 +769,43 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			retry,
 			cron,
 		};
+
+		// Check if a task with this key already exists (key-based deduplication)
+		if let Some(key) = key {
+			if let Some((existing_id, existing_data)) = self.store.find_by_key(key).await? {
+				let new_serialized = task.serialize();
+				let existing_serialized = existing_data.input.as_ref();
+
+				// Compare serialized parameters
+				if new_serialized == existing_serialized {
+					info!(
+						"Recurring task '{}' already exists with identical parameters (id={})",
+						key, existing_id
+					);
+					return Ok(existing_id);
+				} else {
+					info!(
+						"Updating recurring task '{}' (id={}) - parameters changed",
+						key, existing_id
+					);
+					info!("  Old params: {}", existing_serialized);
+					info!("  New params: {}", new_serialized);
+
+					// Remove from all queues (if present)
+					self.remove_from_queues(existing_id)?;
+
+					// Update the task in database with new parameters
+					self.store.update_task(existing_id, &task_meta).await?;
+
+					// Re-add to appropriate queue with updated parameters
+					self.add_queue(existing_id, task_meta).await?;
+
+					return Ok(existing_id);
+				}
+			}
+		}
+
+		// No existing task - create new one
 		let id = self.store.add(&task_meta, key).await?;
 		self.add_queue(id, task_meta).await
 	}
@@ -700,6 +845,39 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			}
 		}
 		Ok(id)
+	}
+
+	/// Remove a task from all internal queues (waiting, scheduled, running)
+	/// Returns the removed TaskMeta if found
+	fn remove_from_queues(&self, task_id: TaskId) -> ClResult<Option<TaskMeta<S>>> {
+		// Try tasks_waiting
+		if let Some(task_meta) = lock!(self.tasks_waiting, "tasks_waiting")?.remove(&task_id) {
+			info!("Removed task {} from waiting queue for update", task_id);
+			return Ok(Some(task_meta));
+		}
+
+		// Try tasks_scheduled (need to find by task_id in BTreeMap)
+		{
+			let mut scheduled = lock!(self.tasks_scheduled, "tasks_scheduled")?;
+			if let Some(key) = scheduled
+				.iter()
+				.find(|((_, id), _)| *id == task_id)
+				.map(|((ts, id), _)| (*ts, *id))
+			{
+				if let Some(task_meta) = scheduled.remove(&key) {
+					info!("Removed task {} from scheduled queue for update", task_id);
+					return Ok(Some(task_meta));
+				}
+			}
+		}
+
+		// Try tasks_running (should rarely happen, but handle it)
+		if let Some(task_meta) = lock!(self.tasks_running, "tasks_running")?.remove(&task_id) {
+			warn!("Removed task {} from running queue during update", task_id);
+			return Ok(Some(task_meta));
+		}
+
+		Ok(None)
 	}
 
 	/// Release all dependent tasks of a completed task

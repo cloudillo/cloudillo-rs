@@ -72,8 +72,10 @@ pub struct Identity {
 	pub email: Box<str>,
 	/// ID tag of the registrar who created this identity
 	pub registrar_id_tag: Box<str>,
-	/// Current address (DNS record, server address, or other routing info)
-	pub current_address: Option<Box<str>>,
+	/// Address (DNS record, server address, or other routing info)
+	pub address: Option<Box<str>>,
+	/// Type of the address (IPv4, IPv6, or Hostname)
+	pub address_type: Option<AddressType>,
 	/// Timestamp when the address was last updated
 	pub address_updated_at: Option<Timestamp>,
 	/// Status of this identity in its lifecycle
@@ -100,7 +102,9 @@ pub struct CreateIdentityOptions<'a> {
 	/// Initial status of the identity (default: Pending)
 	pub status: IdentityStatus,
 	/// Initial address for this identity (optional)
-	pub current_address: Option<&'a str>,
+	pub address: Option<&'a str>,
+	/// Type of the address being set (if address is provided)
+	pub address_type: Option<AddressType>,
 	/// When the identity should expire (optional, can have default)
 	pub expires_at: Option<Timestamp>,
 }
@@ -111,8 +115,8 @@ pub struct UpdateIdentityOptions {
 	/// New email address (if changing)
 	pub email: Option<Box<str>>,
 	/// New address (if changing)
-	pub current_address: Option<Box<str>>,
-	/// Type of the address being set (if current_address is provided)
+	pub address: Option<Box<str>>,
+	/// Type of the address being set (if address is provided)
 	pub address_type: Option<AddressType>,
 	/// New status (if changing)
 	pub status: Option<IdentityStatus>,
@@ -324,6 +328,10 @@ pub trait IdentityProviderAdapter: Debug + Send + Sync {
 	///
 	/// Returns None if the key is invalid or expired
 	/// Updates the last_used_at timestamp on successful verification
+	///
+	/// # Security Note
+	/// Implementations MUST reject identities with the prefix 'cl-o' as it is reserved
+	/// and should not be allowed to authenticate via API keys.
 	async fn verify_api_key(&self, key: &str) -> ClResult<Option<String>>;
 
 	/// Lists API keys with optional filtering
@@ -459,7 +467,8 @@ mod tests {
 			id_tag_domain: "cloudillo.net".into(),
 			email: "test@example.com".into(),
 			registrar_id_tag: "registrar".into(),
-			current_address: Some("192.168.1.1".into()),
+			address: Some("192.168.1.1".into()),
+			address_type: Some(AddressType::Ipv4),
 			address_updated_at: Some(now),
 			status: IdentityStatus::Active,
 			created_at: now,
@@ -499,7 +508,8 @@ mod tests {
 			email: "test@example.com",
 			registrar_id_tag: "registrar",
 			status: IdentityStatus::Pending,
-			current_address: Some("192.168.1.1"),
+			address: Some("192.168.1.1"),
+			address_type: Some(AddressType::Ipv4),
 			expires_at: Some(Timestamp::now().add_seconds(86400)),
 		};
 

@@ -311,4 +311,70 @@ pub async fn get_proxy_token(
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// # POST /auth/set-password
+/// Set password using a reference (welcome or password reset)
+/// This endpoint is used during registration (welcome ref) and password reset flows
+#[derive(Deserialize)]
+pub struct SetPasswordReq {
+	#[serde(rename = "refId")]
+	ref_id: String,
+	#[serde(rename = "newPassword")]
+	new_password: String,
+}
+
+pub async fn post_set_password(
+	State(app): State<App>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(req): Json<SetPasswordReq>,
+) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
+	// Validate new password strength
+	if req.new_password.len() < 8 {
+		return Err(Error::ValidationError("Password must be at least 8 characters".into()));
+	}
+
+	if req.new_password.trim().is_empty() {
+		return Err(Error::ValidationError("Password cannot be empty or only whitespace".into()));
+	}
+
+	// Use the ref - this validates type, expiration, counter, and decrements it
+	// Returns the tenant ID and id_tag that owns this ref
+	let (tn_id, id_tag) = app
+		.meta_adapter
+		.use_ref(&req.ref_id, &["welcome", "password"])
+		.await
+		.map_err(|e| {
+			warn!("Failed to use ref {}: {}", req.ref_id, e);
+			match e {
+				Error::NotFound => Error::ValidationError("Invalid or expired reference".into()),
+				Error::ValidationError(_) => e,
+				_ => Error::ValidationError("Invalid reference".into()),
+			}
+		})?;
+
+	info!(
+		tn_id = ?tn_id,
+		id_tag = %id_tag,
+		ref_id = %req.ref_id,
+		"Setting password via reference"
+	);
+
+	// Update the password
+	app.auth_adapter.update_tenant_password(&id_tag, &req.new_password).await?;
+
+	info!(
+		tn_id = ?tn_id,
+		id_tag = %id_tag,
+		"Password set successfully, generating login token"
+	);
+
+	// Create a login token for the user
+	let auth = app.auth_adapter.create_tenant_login(&id_tag).await?;
+
+	// Return login info using the existing return_login helper
+	let (_status, Json(login_data)) = return_login(&app, auth).await?;
+	let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
+
+	Ok((StatusCode::OK, Json(response)))
+}
+
 // vim: ts=4

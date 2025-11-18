@@ -31,6 +31,16 @@ pub struct EmailMessage {
 	pub html_body: Option<String>,
 }
 
+/// Email task parameters
+#[derive(Debug, Clone)]
+pub struct EmailTaskParams {
+	pub to: String,
+	pub subject: String,
+	pub template_name: String,
+	pub template_vars: serde_json::Value,
+	pub custom_key: Option<String>,
+}
+
 /// Email module - main orchestrator for email operations
 pub struct EmailModule {
 	pub settings_service: Arc<SettingsService>,
@@ -56,10 +66,17 @@ impl EmailModule {
 		scheduler: &crate::core::scheduler::Scheduler<crate::core::app::App>,
 		settings_service: &crate::settings::service::SettingsService,
 		tn_id: TnId,
-		to: String,
-		subject: String,
-		template_name: String,
-		template_vars: serde_json::Value,
+		params: EmailTaskParams,
+	) -> ClResult<()> {
+		Self::schedule_email_task_with_key(scheduler, settings_service, tn_id, params).await
+	}
+
+	/// Schedule email task with optional custom key for deduplication
+	pub async fn schedule_email_task_with_key(
+		scheduler: &crate::core::scheduler::Scheduler<crate::core::app::App>,
+		settings_service: &crate::settings::service::SettingsService,
+		tn_id: TnId,
+		params: EmailTaskParams,
 	) -> ClResult<()> {
 		// Get max retry attempts from settings (default: 3)
 		let max_retries = match settings_service.get(tn_id, "email.retry_attempts").await {
@@ -73,14 +90,23 @@ impl EmailModule {
 		// - Attempts: 60s, 120s, 240s, 480s, 960s, 1800s, 3600s...
 		let retry_policy = crate::core::scheduler::RetryPolicy::new((60, 3600), max_retries);
 
-		let task = EmailSenderTask::new(tn_id, to.clone(), subject, template_name, template_vars);
+		let task = EmailSenderTask::new(
+			tn_id,
+			params.to.clone(),
+			params.subject,
+			params.template_name,
+			params.template_vars,
+		);
+		let task_key =
+			params.custom_key.unwrap_or_else(|| format!("email:{}:{}", tn_id.0, params.to));
+
 		scheduler
 			.task(std::sync::Arc::new(task))
-			.key(format!("email:{}:{}", tn_id.0, to))
+			.key(task_key)
 			.with_retry(retry_policy)
 			.schedule()
 			.await?;
-		info!("Email task scheduled for {} with {} retry attempts", to, max_retries);
+		info!("Email task scheduled for {} with {} retry attempts", params.to, max_retries);
 		Ok(())
 	}
 

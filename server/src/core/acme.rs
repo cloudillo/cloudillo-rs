@@ -12,7 +12,11 @@ use std::sync::Arc;
 use x509_parser::parse_x509_certificate;
 
 use crate::auth_adapter;
+use crate::core::scheduler::{Task, TaskId};
 use crate::prelude::*;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 struct X509CertData {
@@ -43,7 +47,9 @@ pub async fn init(
 		.await?;
 	info!("ACME credentials {}", serde_json::to_string_pretty(&credentials)?);
 
-	renew_tenant(state, &account, id_tag, 1, app_domain).await?;
+	// Look up the actual tenant ID instead of hardcoding to 1
+	let tn_id = state.auth_adapter.read_tn_id(id_tag).await?;
+	renew_tenant(state, &account, id_tag, tn_id.0, app_domain).await?;
 
 	Ok(())
 }
@@ -122,21 +128,47 @@ async fn renew_domains<'a>(
 				.map_err(|_| {
 					Error::ServiceUnavailable("failed to access ACME challenge map".into())
 				})?
-				.insert(identifier, token);
+				.insert(identifier.clone(), token);
 
 			challenge.set_ready().await?;
 		}
 
 		info!("Start polling...");
-		let status = order.poll_ready(&acme::RetryPolicy::default()).await?;
+		// Create a more patient retry policy for Let's Encrypt validation
+		// Initial delay: 1s, backoff: 1.5x, timeout: 90s
+		// This gives LE plenty of time to validate multiple domains
+		let retry_policy = acme::RetryPolicy::new()
+			.initial_delay(std::time::Duration::from_secs(1))
+			.backoff(1.5)
+			.timeout(std::time::Duration::from_secs(90));
+
+		let status = order.poll_ready(&retry_policy).await?;
 
 		if status != acme::OrderStatus::Ready {
+			// Fetch authorization details to see validation errors
+			let mut authorizations = order.authorizations();
+			while let Some(result) = authorizations.next().await {
+				if let Ok(authz) = result {
+					for challenge in &authz.challenges {
+						if challenge.r#type == acme::ChallengeType::Http01 {
+							if let Some(ref err) = challenge.error {
+								warn!(
+									"ACME validation failed for {}: {}",
+									authz.identifier(),
+									err.detail.as_deref().unwrap_or("unknown error")
+								);
+							}
+						}
+					}
+				}
+			}
 			Err(acme::Error::Str("order not ready"))?;
 		}
 
 		info!("Finalizing...");
 		let private_key_pem = order.finalize().await?;
-		let cert_chain_pem = order.poll_certificate(&acme::RetryPolicy::default()).await?;
+		// Use the same patient retry policy for certificate polling
+		let cert_chain_pem = order.poll_certificate(&retry_policy).await?;
 		info!("Got cert.");
 
 		// Clean up ACME challenges
@@ -201,6 +233,93 @@ pub async fn get_acme_challenge(
 	} else {
 		println!("    -> not found");
 		Err(Error::PermissionDenied)
+	}
+}
+
+// Certificate Renewal Task
+// ========================
+
+/// Certificate renewal task
+///
+/// Checks all tenants for missing or expiring certificates and renews them.
+/// Scheduled to run hourly via cron: "0 * * * *"
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CertRenewalTask {
+	/// Number of days before expiration to trigger renewal (default: 30)
+	pub renewal_days: u32,
+	/// ACME email for account creation
+	pub acme_email: String,
+}
+
+impl CertRenewalTask {
+	/// Create new certificate renewal task
+	pub fn new(acme_email: String, renewal_days: u32) -> Self {
+		Self { acme_email, renewal_days }
+	}
+}
+
+#[async_trait]
+impl Task<App> for CertRenewalTask {
+	fn kind() -> &'static str {
+		"acme.cert_renewal"
+	}
+
+	fn kind_of(&self) -> &'static str {
+		Self::kind()
+	}
+
+	fn build(_id: TaskId, context: &str) -> ClResult<Arc<dyn Task<App>>> {
+		let task: CertRenewalTask = serde_json::from_str(context).map_err(|e| {
+			Error::ValidationError(format!("Failed to deserialize cert renewal task: {}", e))
+		})?;
+		Ok(Arc::new(task))
+	}
+
+	fn serialize(&self) -> String {
+		serde_json::to_string(self)
+			.unwrap_or_else(|_| format!("acme.cert_renewal:{}", self.renewal_days))
+	}
+
+	async fn run(&self, app: &App) -> ClResult<()> {
+		info!("Running certificate renewal check (renewal threshold: {} days)", self.renewal_days);
+
+		// Get list of tenants needing renewal
+		let tenants = app.auth_adapter.list_tenants_needing_cert_renewal(self.renewal_days).await?;
+
+		if tenants.is_empty() {
+			info!("All tenant certificates are valid");
+			return Ok(());
+		}
+
+		info!("Found {} tenant(s) needing certificate renewal", tenants.len());
+
+		// Renew certificates for each tenant
+		for (tn_id, id_tag) in tenants {
+			info!("Renewing certificate for tenant: {} (tn_id={})", id_tag, tn_id.0);
+
+			// Determine app_domain (only base tenant gets custom domain)
+			let app_domain = if tn_id.0 == 1 {
+				// For base tenant, check if there's a custom domain configured
+				// TODO: Get this from app configuration/settings
+				None
+			} else {
+				None
+			};
+
+			// Perform ACME renewal
+			match init(app.clone(), &self.acme_email, &id_tag, app_domain).await {
+				Ok(_) => {
+					info!(tenant = %id_tag, "Certificate renewed successfully");
+				}
+				Err(e) => {
+					error!(tenant = %id_tag, error = %e, "Failed to renew certificate");
+					// Continue with other tenants even if one fails
+				}
+			}
+		}
+
+		info!("Certificate renewal check completed");
+		Ok(())
 	}
 }
 

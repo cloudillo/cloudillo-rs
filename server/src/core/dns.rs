@@ -88,13 +88,13 @@ pub async fn resolve_domain_addresses(
 	Ok(None)
 }
 
-/// Validate a domain against local addresses using DNS
+/// Validate a domain against local address using DNS
 ///
 /// Checks all DNS record types (A, AAAA, CNAME) and returns valid if any resolved
-/// address matches any local address. Local addresses can be IPv4, IPv6, or hostnames.
+/// address matches any local address. Local address can be IPv4, IPv6, or hostnames (comma-separated for multiple).
 pub async fn validate_domain_address(
 	domain: &str,
-	local_addresses: &[Box<str>],
+	local_address: &[Box<str>],
 	resolver: &TokioResolver,
 ) -> ClResult<(String, AddressType)> {
 	// Collect all resolved addresses from all DNS record types
@@ -139,7 +139,7 @@ pub async fn validate_domain_address(
 
 	// Check if any resolved address matches any local address
 	for (resolved_addr, resolved_type) in resolved_addresses {
-		for local_addr in local_addresses {
+		for local_addr in local_address {
 			// Case-insensitive comparison for hostnames, exact for IPs
 			let matches = match resolved_type {
 				AddressType::Ipv4 | AddressType::Ipv6 => resolved_addr == local_addr.as_ref(),

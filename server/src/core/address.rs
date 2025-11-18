@@ -1,11 +1,12 @@
 //! Address type detection and validation for IPv4, IPv6, and hostnames
 
 use crate::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 /// Type of address
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AddressType {
 	/// IPv4 address (e.g., 192.168.1.1)
 	Ipv4,

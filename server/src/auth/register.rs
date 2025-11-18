@@ -73,17 +73,17 @@ async fn verify_register_data(
 	identity_providers: Vec<String>,
 ) -> ClResult<DomainValidationResponse> {
 	// Determine address type from local addresses (all same type, guaranteed by startup validation)
-	let address_type = if app.opts.local_addresses.is_empty() {
+	let address_type = if app.opts.local_address.is_empty() {
 		None
 	} else {
-		match parse_address_type(app.opts.local_addresses[0].as_ref()) {
+		match parse_address_type(app.opts.local_address[0].as_ref()) {
 			Ok(addr_type) => Some(addr_type.to_string()),
 			Err(_) => None, // Should not happen due to startup validation
 		}
 	};
 
 	let mut response = DomainValidationResponse {
-		address: app.opts.local_addresses.iter().map(|s| s.to_string()).collect(),
+		address: app.opts.local_address.iter().map(|s| s.to_string()).collect(),
 		address_type,
 		id_tag_error: String::new(),
 		app_domain_error: String::new(),
@@ -138,7 +138,7 @@ async fn verify_register_data(
 
 			// DNS lookups for API domain (cl-o.<id_tag>)
 			let api_domain = format!("cl-o.{}", id_tag);
-			match validate_domain_address(&api_domain, &app.opts.local_addresses, &resolver).await {
+			match validate_domain_address(&api_domain, &app.opts.local_address, &resolver).await {
 				Ok((address, _addr_type)) => {
 					response.api_address = Some(address);
 				}
@@ -159,7 +159,7 @@ async fn verify_register_data(
 			let app_domain_to_validate = app_domain.unwrap_or(id_tag);
 			match validate_domain_address(
 				app_domain_to_validate,
-				&app.opts.local_addresses,
+				&app.opts.local_address,
 				&resolver,
 			)
 			.await
@@ -252,10 +252,10 @@ pub async fn post_register_verify(
 	// For "ref" type, just return identity providers
 	if req.typ == "ref" {
 		// Determine address type from local addresses
-		let address_type = if app.opts.local_addresses.is_empty() {
+		let address_type = if app.opts.local_address.is_empty() {
 			None
 		} else {
-			match parse_address_type(app.opts.local_addresses[0].as_ref()) {
+			match parse_address_type(app.opts.local_address[0].as_ref()) {
 				Ok(addr_type) => Some(addr_type.to_string()),
 				Err(_) => None,
 			}
@@ -264,7 +264,7 @@ pub async fn post_register_verify(
 		return Ok((
 			StatusCode::OK,
 			Json(DomainValidationResponse {
-				address: app.opts.local_addresses.iter().map(|s| s.to_string()).collect(),
+				address: app.opts.local_address.iter().map(|s| s.to_string()).collect(),
 				address_type,
 				id_tag_error: String::new(),
 				app_domain_error: String::new(),
@@ -301,7 +301,7 @@ async fn create_tenant_and_profile(
 	email: &str,
 	welcome_link: Option<String>,
 ) -> ClResult<TnId> {
-	use crate::core::app::{create_complete_tenant, CreateCompleteTenantOptions};
+	use crate::bootstrap::{create_complete_tenant, CreateCompleteTenantOptions};
 
 	// Derive display name from id_tag (capitalize first letter of prefix)
 	let display_name = if id_tag.contains('.') {
@@ -374,10 +374,13 @@ async fn create_tenant_and_profile(
 		&app.scheduler,
 		&app.settings,
 		tn_id,
-		email.to_string(),
-		"Welcome to Cloudillo".to_string(),
-		"welcome".to_string(),
-		template_vars,
+		crate::email::EmailTaskParams {
+			to: email.to_string(),
+			subject: "Welcome to Cloudillo".to_string(),
+			template_name: "welcome".to_string(),
+			template_vars,
+			custom_key: None,
+		},
 	)
 	.await
 	{
@@ -428,7 +431,13 @@ async fn handle_idp_registration(
 	use crate::action::task::CreateAction;
 
 	let expires_at = Timestamp::now().add_seconds(86400 * 30); // 30 days
-	let reg_content = IdpRegContent { id_tag: id_tag_lower.clone(), email: email.clone() };
+															// Include all local addresses from the app configuration (comma-separated)
+	let address = if app.opts.local_address.is_empty() {
+		None
+	} else {
+		Some(app.opts.local_address.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(","))
+	};
+	let reg_content = IdpRegContent { id_tag: id_tag_lower.clone(), email: email.clone(), address };
 
 	// Create action to generate JWT token
 	let tn_id = TnId(1); // Use base tenant for creating the action
@@ -507,17 +516,33 @@ async fn handle_idp_registration(
 
 	// Create welcome reference first (generates the ref_id for the link)
 	let ref_id = crate::core::utils::random_id()?;
-	let welcome_link = format!("https://{}/welcome/{}", id_tag_lower, ref_id);
+	let welcome_link = format!("https://{}/onboarding/welcome/{}", id_tag_lower, ref_id);
 
 	// Create local tenant and profile (includes ACME and email sending)
 	let tn_id = create_tenant_and_profile(app, &id_tag_lower, &email, Some(welcome_link)).await?;
+
+	// Store IDP API key if provided
+	if let Some(api_key) = &idp_reg_result.api_key {
+		info!(
+			id_tag = %id_tag_lower,
+			"Storing IDP API key for federated identity"
+		);
+		if let Err(e) = app.auth_adapter.update_idp_api_key(&id_tag_lower, api_key).await {
+			warn!(
+				error = %e,
+				id_tag = %id_tag_lower,
+				"Failed to store IDP API key - continuing anyway"
+			);
+			// Continue anyway - this is not critical for basic functionality
+		}
+	}
 
 	// Store the welcome reference in database
 	let ref_opts = crate::meta_adapter::CreateRefOptions {
 		typ: "welcome".to_string(),
 		description: Some("Welcome to Cloudillo".to_string()),
 		expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
-		count: None,
+		count: Some(1),                                             // Can be used once
 	};
 
 	if let Err(e) = app.meta_adapter.create_ref(tn_id, &ref_id, &ref_opts).await {

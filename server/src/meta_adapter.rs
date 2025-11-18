@@ -418,6 +418,15 @@ pub struct Task {
 }
 
 #[derive(Debug, Default)]
+pub struct TaskPatch {
+	pub input: Patch<String>,
+	pub next_at: Patch<Timestamp>,
+	pub deps: Patch<Vec<u64>>,
+	pub retry: Patch<String>,
+	pub cron: Patch<String>,
+}
+
+#[derive(Debug, Default)]
 pub struct ListTaskOptions {
 	status: Option<char>,
 	since: Option<Timestamp>,
@@ -605,7 +614,12 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		output: &str,
 		next_at: Option<Timestamp>,
 	) -> ClResult<()>;
-	async fn update_task_cron(&self, task_id: u64, cron: Option<&str>) -> ClResult<()>;
+
+	/// Find a pending task by its key
+	async fn find_task_by_key(&self, key: &str) -> ClResult<Option<Task>>;
+
+	/// Update task fields with partial updates
+	async fn update_task(&self, task_id: u64, patch: &TaskPatch) -> ClResult<()>;
 
 	// Phase 1: Profile Management
 	//****************************
@@ -730,6 +744,10 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Delete a reference
 	async fn delete_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<()>;
+
+	/// Use/consume a reference - validates type, expiration, counter, decrements counter
+	/// Returns (TnId, id_tag) of the tenant that owns this ref
+	async fn use_ref(&self, ref_id: &str, expected_types: &[&str]) -> ClResult<(TnId, Box<str>)>;
 
 	// Tag Management
 	//***************

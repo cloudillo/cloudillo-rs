@@ -146,6 +146,7 @@ fn init_api_service(app: App) -> Router {
 		.route("/api/auth/register", post(auth::register::post_register))
 		.route("/api/auth/register-verify", post(auth::register::post_register_verify))
 		.route("/api/auth/login", post(auth::handler::post_login))
+		.route("/api/auth/set-password", post(auth::handler::post_set_password))
 		.route("/api/auth/access-token", get(auth::handler::get_access_token))
 
 		// IDP Public API

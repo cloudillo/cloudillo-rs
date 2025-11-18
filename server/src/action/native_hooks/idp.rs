@@ -17,6 +17,9 @@ use crate::prelude::*;
 pub struct IdpRegContent {
 	pub id_tag: String,
 	pub email: String,
+	/// Optional address for the identity. Use "auto" to use the client's IP address
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub address: Option<String>,
 }
 
 /// Response structure for IDP:REG registration
@@ -108,6 +111,47 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 			e
 		})?;
 
+	// Determine the address to use - handle "auto" special value
+	let address = match &reg_content.address {
+		Some(addr) if addr == "auto" => {
+			// Use client IP address from context
+			context.client_address.as_deref()
+		}
+		Some(addr) => Some(addr.as_str()),
+		None => None,
+	};
+
+	info!(
+		id_tag = %reg_content.id_tag,
+		address = ?address,
+		client_address = ?context.client_address,
+		"Resolved address for identity (auto = client IP)"
+	);
+
+	// Parse address type from resolved address
+	let address_type = if let Some(addr_str) = address {
+		match crate::core::address::parse_address_type(addr_str) {
+			Ok(addr_type) => {
+				info!(
+					address = %addr_str,
+					address_type = ?addr_type,
+					"IDP:REG - Parsed address type from resolved address"
+				);
+				Some(addr_type)
+			}
+			Err(e) => {
+				warn!(
+					address = %addr_str,
+					error = ?e,
+					"IDP:REG - Failed to parse address type"
+				);
+				None
+			}
+		}
+	} else {
+		None
+	};
+
 	// Check registrar quota
 	let quota = idp_adapter.get_quota(registrar_id_tag).await.ok();
 	if let Some(quota) = quota {
@@ -143,9 +187,17 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 		email: &reg_content.email,
 		registrar_id_tag,
 		status: IdentityStatus::Pending,
-		current_address: None,
+		address,
+		address_type,
 		expires_at: Some(expires_at),
 	};
+
+	info!(
+		id_tag_prefix = %id_tag_prefix,
+		id_tag_domain = %id_tag_domain,
+		address = ?address,
+		"IDP:REG - Calling IDP adapter create_identity"
+	);
 
 	let identity = idp_adapter.create_identity(create_opts).await.map_err(|e| {
 		warn!("Failed to create identity: {}", e);
@@ -157,7 +209,8 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 		id_tag_domain = %identity.id_tag_domain,
 		registrar = %registrar_id_tag,
 		email = %identity.email,
-		"Identity created with Pending status"
+		address = ?identity.address,
+		"IDP:REG - Identity created with Pending status"
 	);
 
 	// Create API key for identity address updates
@@ -201,14 +254,19 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 	}
 
 	// Schedule the email task with retries
-	match crate::email::EmailModule::schedule_email_task(
+	// Use custom key including identity_id to prevent duplicate tasks for same identity
+	let email_task_key = format!("email:activation:{}:{}", tn_id.0, identity_id);
+	match crate::email::EmailModule::schedule_email_task_with_key(
 		&app.scheduler,
 		&app.settings,
 		tn_id,
-		identity.email.to_string(),
-		"Identity Activation".to_string(),
-		"activation".to_string(),
-		template_vars,
+		crate::email::EmailTaskParams {
+			to: identity.email.to_string(),
+			subject: "Identity Activation".to_string(),
+			template_name: "activation".to_string(),
+			template_vars,
+			custom_key: Some(email_task_key),
+		},
 	)
 	.await
 	{

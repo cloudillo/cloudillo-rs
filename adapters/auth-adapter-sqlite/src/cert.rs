@@ -86,3 +86,36 @@ pub(crate) async fn read_cert_by_domain(db: &SqlitePool, domain: &str) -> ClResu
 		})
 	})
 }
+
+/// List tenants that need certificate renewal
+/// Returns (tn_id, id_tag) for tenants where:
+/// - Certificate doesn't exist, OR
+/// - Certificate expires within renewal_days
+pub(crate) async fn list_tenants_needing_cert_renewal(
+	db: &SqlitePool,
+	renewal_days: u32,
+) -> ClResult<Vec<(TnId, Box<str>)>> {
+	let now = Timestamp::now().0;
+	let renewal_threshold = now + (renewal_days as i64 * 24 * 3600);
+
+	let rows = sqlx::query(
+		"SELECT t.tn_id, t.id_tag
+		FROM tenants t
+		LEFT JOIN certs c ON t.tn_id = c.tn_id
+		WHERE c.tn_id IS NULL OR c.expires_at < ?1
+		ORDER BY t.tn_id",
+	)
+	.bind(renewal_threshold)
+	.fetch_all(db)
+	.await
+	.or(Err(Error::DbError))?;
+
+	let mut tenants = Vec::new();
+	for row in rows {
+		let tn_id: i64 = row.try_get("tn_id").or(Err(Error::DbError))?;
+		let id_tag: String = row.try_get("id_tag").or(Err(Error::DbError))?;
+		tenants.push((TnId(tn_id as u32), id_tag.into_boxed_str()));
+	}
+
+	Ok(tenants)
+}

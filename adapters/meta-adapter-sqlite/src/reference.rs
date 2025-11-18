@@ -137,3 +137,75 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, ref_id: &str) -> ClResu
 
 	Ok(())
 }
+
+/// Use/consume a reference - validates and decrements counter
+/// Performs global lookup across all tenants
+pub(crate) async fn use_ref(
+	db: &SqlitePool,
+	ref_id: &str,
+	expected_types: &[&str],
+) -> ClResult<(TnId, Box<str>)> {
+	// Start a transaction to ensure atomicity
+	let mut tx = db
+		.begin()
+		.await
+		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.map_err(|_| Error::DbError)?;
+
+	// Look up the ref globally (across all tenants) and get tenant info
+	let row = sqlx::query(
+		"SELECT r.tn_id, r.type, r.count, r.expires_at, t.id_tag
+		 FROM refs r
+		 INNER JOIN tenants t ON r.tn_id = t.id
+		 WHERE r.ref_id = ?",
+	)
+	.bind(ref_id)
+	.fetch_optional(&mut *tx)
+	.await
+	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.map_err(|_| Error::DbError)?
+	.ok_or(Error::NotFound)?;
+
+	let tn_id: i64 = row.get("tn_id");
+	let ref_type: String = row.get("type");
+	let count: i32 = row.get("count");
+	let expires_at: Option<i64> = row.get("expires_at");
+	let id_tag: String = row.get("id_tag");
+
+	// Validate ref type
+	if !expected_types.contains(&ref_type.as_str()) {
+		return Err(Error::ValidationError(format!(
+			"Invalid ref type: expected one of {:?}, got {}",
+			expected_types, ref_type
+		)));
+	}
+
+	// Validate not expired
+	if let Some(exp) = expires_at {
+		let now = Timestamp::now();
+		if exp <= now.0 {
+			return Err(Error::ValidationError("Ref has expired".to_string()));
+		}
+	}
+
+	// Validate count > 0
+	if count <= 0 {
+		return Err(Error::ValidationError("Ref has already been used".to_string()));
+	}
+
+	// Decrement counter
+	sqlx::query("UPDATE refs SET count = count - 1 WHERE ref_id = ?")
+		.bind(ref_id)
+		.execute(&mut *tx)
+		.await
+		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.map_err(|_| Error::DbError)?;
+
+	// Commit transaction
+	tx.commit()
+		.await
+		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.map_err(|_| Error::DbError)?;
+
+	Ok((TnId(tn_id as u32), id_tag.into()))
+}

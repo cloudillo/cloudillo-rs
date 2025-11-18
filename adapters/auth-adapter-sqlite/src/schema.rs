@@ -156,6 +156,12 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await;
 
+	// Phase 3 Migration: Add IDP API key field to tenants
+	// Store the API key received from identity provider for federated identities
+	let _ = sqlx::query("ALTER TABLE tenants ADD COLUMN idp_api_key text")
+		.execute(&mut *tx)
+		.await;
+
 	tx.commit().await?;
 
 	Ok(())

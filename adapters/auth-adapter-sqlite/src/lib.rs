@@ -101,6 +101,10 @@ impl AuthAdapter for AuthAdapterSqlite {
 		auth::update_tenant_password(&self.db, &self.worker, id_tag, password).await
 	}
 
+	async fn update_idp_api_key(&self, id_tag: &str, api_key: &str) -> ClResult<()> {
+		auth::update_idp_api_key(&self.db, id_tag, api_key).await
+	}
+
 	async fn create_cert(&self, cert_data: &CertData) -> ClResult<()> {
 		cert::create_cert(&self.db, cert_data).await
 	}
@@ -115,6 +119,13 @@ impl AuthAdapter for AuthAdapterSqlite {
 
 	async fn read_cert_by_domain(&self, domain: &str) -> ClResult<CertData> {
 		cert::read_cert_by_domain(&self.db, domain).await
+	}
+
+	async fn list_tenants_needing_cert_renewal(
+		&self,
+		renewal_days: u32,
+	) -> ClResult<Vec<(TnId, Box<str>)>> {
+		cert::list_tenants_needing_cert_renewal(&self.db, renewal_days).await
 	}
 
 	async fn list_profile_keys(&self, tn_id: TnId) -> ClResult<Vec<AuthKey>> {

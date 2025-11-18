@@ -314,8 +314,12 @@ impl MetaAdapter for MetaAdapterSqlite {
 		task::mark_error(&self.db, task_id, output, next_at).await
 	}
 
-	async fn update_task_cron(&self, task_id: u64, cron: Option<&str>) -> ClResult<()> {
-		task::update_cron(&self.db, task_id, cron).await
+	async fn find_task_by_key(&self, key: &str) -> ClResult<Option<Task>> {
+		task::find_by_key(&self.dbr, key).await
+	}
+
+	async fn update_task(&self, task_id: u64, patch: &TaskPatch) -> ClResult<()> {
+		task::update(&self.db, task_id, patch).await
 	}
 
 	// Phase 1: Profile Management
@@ -465,6 +469,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn delete_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<()> {
 		reference::delete(&self.db, tn_id, ref_id).await
+	}
+
+	async fn use_ref(&self, ref_id: &str, expected_types: &[&str]) -> ClResult<(TnId, Box<str>)> {
+		reference::use_ref(&self.db, ref_id, expected_types).await
 	}
 
 	// Tag Management

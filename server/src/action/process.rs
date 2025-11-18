@@ -64,6 +64,7 @@ pub async fn process_inbound_action_token(
 	_action_id: &str,
 	token: &str,
 	is_sync: bool,
+	client_address: Option<String>,
 ) -> ClResult<Option<serde_json::Value>> {
 	let action = verify_action_token(app, tn_id, token).await?;
 
@@ -145,6 +146,7 @@ pub async fn process_inbound_action_token(
 		tenant_type: "person".to_string(),
 		is_inbound: true,
 		is_outbound: false,
+		client_address,
 		vars: HashMap::new(),
 	};
 
