@@ -10,6 +10,46 @@
 
 use super::types::*;
 use regex::Regex;
+use std::sync::LazyLock;
+
+/// Regex for action type validation: 2-16 uppercase letters/numbers, starting with letter
+static ACTION_TYPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r"^[A-Z][A-Z0-9]{1,15}$").unwrap_or_else(|e| {
+		// This regex is hardcoded and should never fail to compile
+		// If it does, it's a programming error that should be caught in development
+		unreachable!("ACTION_TYPE_RE regex compilation failed: {}", e)
+	})
+});
+
+/// Regex for semver version validation
+static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r"^\d+\.\d+(\.\d+)?$")
+		.unwrap_or_else(|e| unreachable!("VERSION_RE regex compilation failed: {}", e))
+});
+
+/// Regex for key pattern variable references
+static KEY_PATTERN_RE: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r"\{[a-zA-Z_][a-zA-Z0-9_\.]*\}")
+		.unwrap_or_else(|e| unreachable!("KEY_PATTERN_RE regex compilation failed: {}", e))
+});
+
+/// Regex for idTag format
+static ID_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r"^[a-z0-9-][a-z0-9.-]{3,60}[a-z0-9-]$")
+		.unwrap_or_else(|e| unreachable!("ID_TAG_RE regex compilation failed: {}", e))
+});
+
+/// Regex for actionId format (SHA-256 hash)
+static ACTION_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r"^[a-f0-9]{64}$")
+		.unwrap_or_else(|e| unreachable!("ACTION_ID_RE regex compilation failed: {}", e))
+});
+
+/// Regex for fileId format
+static FILE_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r"^f1~[a-zA-Z0-9_-]+$")
+		.unwrap_or_else(|e| unreachable!("FILE_ID_RE regex compilation failed: {}", e))
+});
 
 /// Validation error
 #[derive(Debug, Clone)]
@@ -65,8 +105,7 @@ pub fn validate_definition(def: &ActionDefinition) -> Result<(), Vec<ValidationE
 
 fn validate_action_type(action_type: &str) -> Result<(), String> {
 	// Must be 2-16 uppercase letters/numbers
-	let re = Regex::new(r"^[A-Z][A-Z0-9]{1,15}$").unwrap();
-	if !re.is_match(action_type) {
+	if !ACTION_TYPE_RE.is_match(action_type) {
 		return Err(format!(
 			"Invalid action type '{}': must be 2-16 uppercase letters/numbers, starting with letter",
 			action_type
@@ -77,8 +116,7 @@ fn validate_action_type(action_type: &str) -> Result<(), String> {
 
 fn validate_version(version: &str) -> Result<(), String> {
 	// Must be semver format
-	let re = Regex::new(r"^\d+\.\d+(\.\d+)?$").unwrap();
-	if !re.is_match(version) {
+	if !VERSION_RE.is_match(version) {
 		return Err(format!(
 			"Invalid version '{}': must be semver format (e.g., '1.0' or '1.0.0')",
 			version
@@ -216,8 +254,7 @@ fn validate_operation(op: &Operation, path: &str, errors: &mut Vec<ValidationErr
 
 fn validate_key_pattern(pattern: &str, errors: &mut Vec<ValidationError>) {
 	// Key pattern should contain variable references like {type}, {issuer}, etc.
-	let re = Regex::new(r"\{[a-zA-Z_][a-zA-Z0-9_\.]*\}").unwrap();
-	if !re.is_match(pattern) {
+	if !KEY_PATTERN_RE.is_match(pattern) {
 		errors.push(ValidationError::new(
 			"Key pattern must contain at least one variable reference (e.g., {type}, {issuer})",
 			"key_pattern".to_string(),
@@ -227,20 +264,17 @@ fn validate_key_pattern(pattern: &str, errors: &mut Vec<ValidationError>) {
 
 /// Validate idTag format
 pub fn validate_id_tag(id_tag: &str) -> bool {
-	let re = Regex::new(r"^[a-z0-9-][a-z0-9.-]{3,60}[a-z0-9-]$").unwrap();
-	re.is_match(id_tag)
+	ID_TAG_RE.is_match(id_tag)
 }
 
 /// Validate actionId format (SHA-256 hash)
 pub fn validate_action_id(action_id: &str) -> bool {
-	let re = Regex::new(r"^[a-f0-9]{64}$").unwrap();
-	re.is_match(action_id)
+	ACTION_ID_RE.is_match(action_id)
 }
 
 /// Validate fileId format
 pub fn validate_file_id(file_id: &str) -> bool {
-	let re = Regex::new(r"^f1~[a-zA-Z0-9_-]+$").unwrap();
-	re.is_match(file_id)
+	FILE_ID_RE.is_match(file_id)
 }
 
 #[cfg(test)]

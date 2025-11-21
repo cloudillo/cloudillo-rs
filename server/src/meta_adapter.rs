@@ -777,16 +777,17 @@ mod tests {
 	#[test]
 	fn test_deserialize_list_action_options_with_multiple_statuses() {
 		let query = "status=C,N&type=POST,REPLY";
-		let opts: ListActionOptions = serde_urlencoded::from_str(query).unwrap();
+		let opts: ListActionOptions =
+			serde_urlencoded::from_str(query).expect("should deserialize");
 
 		assert!(opts.status.is_some());
-		let statuses = opts.status.unwrap();
+		let statuses = opts.status.expect("status should be Some");
 		assert_eq!(statuses.len(), 2);
 		assert_eq!(statuses[0].as_str(), "C");
 		assert_eq!(statuses[1].as_str(), "N");
 
 		assert!(opts.typ.is_some());
-		let types = opts.typ.unwrap();
+		let types = opts.typ.expect("type should be Some");
 		assert_eq!(types.len(), 2);
 		assert_eq!(types[0].as_str(), "POST");
 		assert_eq!(types[1].as_str(), "REPLY");
@@ -795,7 +796,8 @@ mod tests {
 	#[test]
 	fn test_deserialize_list_action_options_without_status() {
 		let query = "issuer=alice";
-		let opts: ListActionOptions = serde_urlencoded::from_str(query).unwrap();
+		let opts: ListActionOptions =
+			serde_urlencoded::from_str(query).expect("should deserialize");
 
 		assert!(opts.status.is_none());
 		assert!(opts.typ.is_none());
@@ -805,10 +807,11 @@ mod tests {
 	#[test]
 	fn test_deserialize_list_action_options_single_status() {
 		let query = "status=C";
-		let opts: ListActionOptions = serde_urlencoded::from_str(query).unwrap();
+		let opts: ListActionOptions =
+			serde_urlencoded::from_str(query).expect("should deserialize");
 
 		assert!(opts.status.is_some());
-		let statuses = opts.status.unwrap();
+		let statuses = opts.status.expect("status should be Some");
 		assert_eq!(statuses.len(), 1);
 		assert_eq!(statuses[0].as_str(), "C");
 	}

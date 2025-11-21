@@ -125,10 +125,11 @@ mod tests {
 	fn test_empty_prefix_fails() {
 		let result = parse_and_validate_identity_id_tag("example.com", "example.com");
 		assert!(result.is_err());
-		if let Err(Error::ValidationError(msg)) = result {
-			assert!(msg.contains("prefix cannot be empty"));
-		} else {
-			panic!("Expected ValidationError");
+		match result {
+			Err(Error::ValidationError(msg)) => {
+				assert!(msg.contains("prefix cannot be empty"));
+			}
+			_ => unreachable!("Expected ValidationError"),
 		}
 	}
 
@@ -139,7 +140,7 @@ mod tests {
 		if let Err(Error::ValidationError(msg)) = result {
 			assert!(msg.contains("does not match registrar domain"));
 		} else {
-			panic!("Expected ValidationError");
+			unreachable!("Expected ValidationError");
 		}
 	}
 
@@ -157,7 +158,7 @@ mod tests {
 		if let Err(Error::ValidationError(msg)) = result {
 			assert!(msg.contains("cannot be empty"));
 		} else {
-			panic!("Expected ValidationError");
+			unreachable!("Expected ValidationError");
 		}
 	}
 
@@ -168,7 +169,7 @@ mod tests {
 		if let Err(Error::ValidationError(msg)) = result {
 			assert!(msg.contains("Registrar domain cannot be empty"));
 		} else {
-			panic!("Expected ValidationError");
+			unreachable!("Expected ValidationError");
 		}
 	}
 
@@ -179,7 +180,7 @@ mod tests {
 		if let Err(Error::ValidationError(msg)) = result {
 			assert!(msg.contains("does not match registrar domain"));
 		} else {
-			panic!("Expected ValidationError");
+			unreachable!("Expected ValidationError");
 		}
 	}
 

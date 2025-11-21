@@ -620,7 +620,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 				// Get task metadata and check if this is a recurring task
 				let task_meta_opt = {
-					let mut tasks_running = schedule.tasks_running.lock().unwrap();
+					let Ok(mut tasks_running) = schedule.tasks_running.lock() else {
+						error!("Mutex poisoned: tasks_running");
+						return;
+					};
 					tasks_running.remove(&id)
 				};
 
@@ -657,11 +660,9 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 						Ok(ready_to_spawn) => {
 							for (dep_id, dep_task_meta) in ready_to_spawn {
 								// Add to running queue before spawning
-								schedule
-									.tasks_running
-									.lock()
-									.unwrap()
-									.insert(dep_id, dep_task_meta.clone());
+								if let Ok(mut tasks_running) = schedule.tasks_running.lock() {
+									tasks_running.insert(dep_id, dep_task_meta.clone());
+								}
 								schedule.spawn_task(
 									stat.clone(),
 									dep_task_meta.task.clone(),
@@ -684,20 +685,29 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		let schedule = self.clone();
 		tokio::spawn(async move {
 			loop {
-				if schedule.tasks_scheduled.lock().unwrap().is_empty() {
+				let is_empty =
+					schedule.tasks_scheduled.lock().map(|guard| guard.is_empty()).unwrap_or(true);
+				if is_empty {
 					schedule.notify_schedule.notified().await;
 					info!("NOTIFY: tasks_scheduled");
 				}
 				let time = Timestamp::now();
 				if let Some((timestamp, _id)) = loop {
-					//info!("first task: {:?}", schedule.tasks_scheduled.lock().unwrap().first_key_value());
-					let mut tasks_scheduled = schedule.tasks_scheduled.lock().unwrap();
+					//info!("first task: {:?}", schedule.tasks_scheduled.lock().first_key_value());
+					let Ok(mut tasks_scheduled) = schedule.tasks_scheduled.lock() else {
+						error!("Mutex poisoned: tasks_scheduled");
+						break None;
+					};
 					if let Some((&(timestamp, id), _)) = tasks_scheduled.first_key_value() {
 						let (timestamp, id) = (timestamp, id);
 						if timestamp <= Timestamp::now() {
 							info!("Spawning task id {}", id);
 							if let Some(task) = tasks_scheduled.remove(&(timestamp, id)) {
-								schedule.tasks_running.lock().unwrap().insert(id, task.clone());
+								let Ok(mut tasks_running) = schedule.tasks_running.lock() else {
+									error!("Mutex poisoned: tasks_running");
+									break None;
+								};
+								tasks_running.insert(id, task.clone());
 								schedule.spawn_task(state.clone(), task.task.clone(), id, task);
 							} else {
 								error!("Task disappeared while being removed from schedule");
@@ -1056,7 +1066,9 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 								.unwrap_or(());
 
 							// Remove from running tasks (we're not sending finish event)
-							scheduler.tasks_running.lock().unwrap().remove(&id);
+							if let Ok(mut tasks_running) = scheduler.tasks_running.lock() {
+								tasks_running.remove(&id);
+							}
 
 							// Re-queue task with incremented retry count
 							let mut retry_meta = task_meta.clone();

@@ -196,9 +196,9 @@ pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Respon
 	let mut response = next.run(req).await;
 
 	// Add request ID to response headers
-	response
-		.headers_mut()
-		.insert("X-Request-ID", request_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()));
+	if let Ok(header_value) = request_id.parse() {
+		response.headers_mut().insert("X-Request-ID", header_value);
+	}
 
 	response
 }

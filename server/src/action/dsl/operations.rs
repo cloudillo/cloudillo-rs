@@ -624,7 +624,7 @@ impl<'a> OperationExecutor<'a> {
 			let is_truthy = match condition_value {
 				Value::Bool(b) => b,
 				Value::Null => false,
-				Value::Number(n) => n.as_f64().unwrap() != 0.0,
+				Value::Number(n) => n.as_f64().unwrap_or(0.0) != 0.0,
 				Value::String(s) => !s.is_empty(),
 				_ => true,
 			};

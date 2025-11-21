@@ -283,10 +283,7 @@ mod tests {
 	#[test]
 	fn test_hook_implementation_default() {
 		let impl_hook = HookImplementation::default();
-		match impl_hook {
-			HookImplementation::None => (),
-			_ => panic!("expected None variant"),
-		}
+		assert!(matches!(impl_hook, HookImplementation::None));
 	}
 
 	#[test]

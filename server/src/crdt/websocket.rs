@@ -83,10 +83,8 @@ type CrdtDocRegistry = tokio::sync::RwLock<
 >;
 
 // Global registry of CRDT documents and their connections
-lazy_static::lazy_static! {
-	static ref CRDT_DOCS: CrdtDocRegistry =
-		tokio::sync::RwLock::new(HashMap::new());
-}
+static CRDT_DOCS: std::sync::LazyLock<CrdtDocRegistry> =
+	std::sync::LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
 /// Handle a CRDT connection
 pub async fn handle_crdt_connection(

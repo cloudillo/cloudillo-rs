@@ -494,9 +494,18 @@ mod tests {
 	#[test]
 	fn test_identity_status_from_str() {
 		use std::str::FromStr;
-		assert_eq!(IdentityStatus::from_str("pending").unwrap(), IdentityStatus::Pending);
-		assert_eq!(IdentityStatus::from_str("active").unwrap(), IdentityStatus::Active);
-		assert_eq!(IdentityStatus::from_str("suspended").unwrap(), IdentityStatus::Suspended);
+		assert_eq!(
+			IdentityStatus::from_str("pending").expect("should parse"),
+			IdentityStatus::Pending
+		);
+		assert_eq!(
+			IdentityStatus::from_str("active").expect("should parse"),
+			IdentityStatus::Active
+		);
+		assert_eq!(
+			IdentityStatus::from_str("suspended").expect("should parse"),
+			IdentityStatus::Suspended
+		);
 		assert!(IdentityStatus::from_str("invalid").is_err());
 	}
 

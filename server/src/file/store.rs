@@ -13,7 +13,9 @@ pub async fn create_blob_buf(
 	let mut hasher = hasher::Hasher::new();
 	hasher.update(data);
 	let file_id = hasher.finalize("b");
-	info!("SHA256 elapsed: {}ms", tm.elapsed().unwrap().as_millis());
+	if let Ok(elapsed) = tm.elapsed() {
+		info!("SHA256 elapsed: {}ms", elapsed.as_millis());
+	}
 	app.blob_adapter.create_blob_buf(tn_id, &file_id, data, &opts).await?;
 
 	Ok(file_id.into_boxed_str())

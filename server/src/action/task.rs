@@ -5,7 +5,8 @@ use serde_with::skip_serializing_none;
 use std::sync::Arc;
 
 use crate::{
-	action::{delivery::ActionDeliveryTask, process, ACTION_TYPES},
+	action::delivery::ActionDeliveryTask,
+	action::process,
 	core::hasher,
 	core::scheduler::{RetryPolicy, Task, TaskId},
 	file::descriptor,
@@ -108,7 +109,10 @@ impl Task<App> for ActionCreatorTask {
 	}
 
 	fn serialize(&self) -> String {
-		serde_json::to_string(self).unwrap()
+		serde_json::to_string(self).unwrap_or_else(|e| {
+			error!("Failed to serialize ActionCreatorTask: {}", e);
+			"{}".to_string()
+		})
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -200,13 +204,15 @@ impl Task<App> for ActionCreatorTask {
 			}
 		}
 
-		// Determine delivery strategy based on action type
-		let action_config = ACTION_TYPES.get(self.action.typ.as_ref());
+		// Determine delivery strategy based on action type definition
+		let definition = app.dsl_engine.get_definition(self.action.typ.as_ref());
 
-		if let Some(config) = action_config {
+		if let Some(def) = definition {
 			let mut recipients: Vec<Box<str>> = Vec::new();
 
-			if config.broadcast && self.action.audience_tag.is_none() {
+			// Check if action should be broadcast (broadcast=true and no specific audience)
+			let should_broadcast = def.behavior.broadcast.unwrap_or(false);
+			if should_broadcast && self.action.audience_tag.is_none() {
 				// Broadcast mode: query for followers using list_actions
 				info!("Broadcasting action {} - querying for followers", self.action_id);
 
@@ -333,7 +339,7 @@ impl Task<App> for ActionVerifierTask {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::action::ACTION_TYPES;
+	use crate::action::dsl::definitions::get_definitions;
 
 	#[test]
 	fn test_create_action_struct() {
@@ -356,29 +362,33 @@ mod tests {
 
 	#[test]
 	fn test_broadcast_action_determination() {
+		let definitions = get_definitions();
+
 		// POST should broadcast
-		let post_config = ACTION_TYPES.get("POST").unwrap();
-		assert!(post_config.broadcast);
+		let post_def = definitions.iter().find(|d| d.r#type == "POST").unwrap();
+		assert_eq!(post_def.behavior.broadcast, Some(true));
 
 		// MSG should not broadcast
-		let msg_config = ACTION_TYPES.get("MSG").unwrap();
-		assert!(!msg_config.broadcast);
+		let msg_def = definitions.iter().find(|d| d.r#type == "MSG").unwrap();
+		assert_eq!(msg_def.behavior.broadcast, Some(false));
 
 		// FLLW should not broadcast
-		let fllw_config = ACTION_TYPES.get("FLLW").unwrap();
-		assert!(!fllw_config.broadcast);
+		let fllw_def = definitions.iter().find(|d| d.r#type == "FLLW").unwrap();
+		assert_eq!(fllw_def.behavior.broadcast, Some(false));
 	}
 
 	#[test]
 	fn test_audience_vs_broadcast() {
-		let post_config = ACTION_TYPES.get("POST").unwrap();
-		let msg_config = ACTION_TYPES.get("MSG").unwrap();
+		let definitions = get_definitions();
+
+		let post_def = definitions.iter().find(|d| d.r#type == "POST").unwrap();
+		let msg_def = definitions.iter().find(|d| d.r#type == "MSG").unwrap();
 
 		// POST broadcasts to followers
-		assert!(post_config.broadcast);
+		assert_eq!(post_def.behavior.broadcast, Some(true));
 
 		// MSG is direct (audience-specific)
-		assert!(!msg_config.broadcast);
+		assert_eq!(msg_def.behavior.broadcast, Some(false));
 	}
 }
 

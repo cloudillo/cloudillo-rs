@@ -9,10 +9,8 @@ pub mod perm;
 mod process;
 pub mod settings;
 pub mod task;
-pub mod types;
 
 pub use process::verify_action_token;
-pub use types::ACTION_TYPES;
 
 use crate::prelude::*;
 

@@ -106,7 +106,10 @@ impl ExpressionEvaluator {
 						chars.next(); // consume '}'
 						break;
 					}
-					var_name.push(chars.next().unwrap());
+					// Safe: we just peeked and confirmed there's a character
+					if let Some(ch) = chars.next() {
+						var_name.push(ch);
+					}
 				}
 
 				// Get variable value
@@ -303,14 +306,18 @@ impl ExpressionEvaluator {
 					let val = self.evaluate(expr, context)?;
 					sum += self.to_number(&val)?;
 				}
-				Ok(Value::Number(serde_json::Number::from_f64(sum).unwrap()))
+				serde_json::Number::from_f64(sum).map(Value::Number).ok_or_else(|| {
+					Error::ValidationError("Invalid number result (NaN or infinity)".to_string())
+				})
 			}
 			ArithmeticExpr::Subtract([left, right]) => {
 				let l_val = self.evaluate(left, context)?;
 				let r_val = self.evaluate(right, context)?;
 				let l = self.to_number(&l_val)?;
 				let r = self.to_number(&r_val)?;
-				Ok(Value::Number(serde_json::Number::from_f64(l - r).unwrap()))
+				serde_json::Number::from_f64(l - r).map(Value::Number).ok_or_else(|| {
+					Error::ValidationError("Invalid number result (NaN or infinity)".to_string())
+				})
 			}
 			ArithmeticExpr::Multiply(exprs) => {
 				let mut product = 1.0;
@@ -318,14 +325,18 @@ impl ExpressionEvaluator {
 					let val = self.evaluate(expr, context)?;
 					product *= self.to_number(&val)?;
 				}
-				Ok(Value::Number(serde_json::Number::from_f64(product).unwrap()))
+				serde_json::Number::from_f64(product).map(Value::Number).ok_or_else(|| {
+					Error::ValidationError("Invalid number result (NaN or infinity)".to_string())
+				})
 			}
 			ArithmeticExpr::Divide([left, right]) => {
 				let l_val = self.evaluate(left, context)?;
 				let r_val = self.evaluate(right, context)?;
 				let l = self.to_number(&l_val)?;
 				let r = self.to_number(&r_val)?;
-				Ok(Value::Number(serde_json::Number::from_f64(l / r).unwrap()))
+				serde_json::Number::from_f64(l / r).map(Value::Number).ok_or_else(|| {
+					Error::ValidationError("Invalid number result (NaN or infinity)".to_string())
+				})
 			}
 		}
 	}
@@ -403,7 +414,7 @@ impl ExpressionEvaluator {
 		match value {
 			Value::Null => false,
 			Value::Bool(b) => *b,
-			Value::Number(n) => n.as_f64().unwrap() != 0.0,
+			Value::Number(n) => n.as_f64().unwrap_or(0.0) != 0.0,
 			Value::String(s) => !s.is_empty(),
 			Value::Array(a) => !a.is_empty(),
 			Value::Object(o) => !o.is_empty(),
@@ -424,7 +435,11 @@ impl ExpressionEvaluator {
 	/// Convert value to number
 	fn to_number(&self, value: &Value) -> ClResult<f64> {
 		match value {
-			Value::Number(n) => Ok(n.as_f64().unwrap()),
+			Value::Number(n) => n.as_f64().ok_or_else(|| {
+				Error::ValidationError(
+					"Invalid number value (not representable as f64)".to_string(),
+				)
+			}),
 			Value::String(s) => s.parse::<f64>().map_err(|_| {
 				Error::ValidationError(format!(
 					"Type mismatch: expected number, got string '{}'",
@@ -479,7 +494,7 @@ mod tests {
 		let context = create_test_context();
 		let expr = Expression::String("{issuer}".to_string());
 
-		let result = eval.evaluate(&expr, &context).unwrap();
+		let result = eval.evaluate(&expr, &context).expect("evaluation should succeed");
 		assert_eq!(result, Value::String("alice".to_string()));
 	}
 
@@ -489,7 +504,7 @@ mod tests {
 		let context = create_test_context();
 		let expr = Expression::String("{context.tenant_type}".to_string());
 
-		let result = eval.evaluate(&expr, &context).unwrap();
+		let result = eval.evaluate(&expr, &context).expect("evaluation should succeed");
 		assert_eq!(result, Value::String("person".to_string()));
 	}
 
@@ -499,7 +514,7 @@ mod tests {
 		let context = create_test_context();
 		let expr = Expression::String("{type}:{issuer}:{audience}".to_string());
 
-		let result = eval.evaluate(&expr, &context).unwrap();
+		let result = eval.evaluate(&expr, &context).expect("evaluation should succeed");
 		assert_eq!(result, Value::String("CONN:alice:bob".to_string()));
 	}
 
@@ -512,7 +527,7 @@ mod tests {
 			Expression::Null,
 		])));
 
-		let result = eval.evaluate(&expr, &context).unwrap();
+		let result = eval.evaluate(&expr, &context).expect("evaluation should succeed");
 		assert_eq!(result, Value::Bool(true));
 	}
 
@@ -525,7 +540,7 @@ mod tests {
 			Expression::String("{issuer}".to_string()),
 		])));
 
-		let result = eval.evaluate(&expr, &context).unwrap();
+		let result = eval.evaluate(&expr, &context).expect("evaluation should succeed");
 		assert_eq!(result, Value::Bool(true)); // Both truthy
 	}
 }

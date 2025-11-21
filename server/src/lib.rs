@@ -19,6 +19,7 @@
 //!     - Third party apps can be implemented
 
 #![allow(unused_attributes, dead_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![forbid(unsafe_code)]
 
 pub mod action;

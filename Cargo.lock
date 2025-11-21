@@ -645,7 +645,6 @@ dependencies = [
  "instant-acme",
  "itertools 0.14.0",
  "jsonwebtoken",
- "lazy_static",
  "lettre",
  "lru",
  "parking_lot",

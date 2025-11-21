@@ -224,9 +224,18 @@ impl AppBuilder {
 		rustls::crypto::CryptoProvider::install_default(
 			rustls::crypto::aws_lc_rs::default_provider(),
 		)
-		.expect("FATAL: Failed to install default crypto provider");
-		let auth_adapter = self.adapters.auth_adapter.expect("FATAL: No auth adapter");
-		let meta_adapter = self.adapters.meta_adapter.expect("FATAL: No meta adapter");
+		.map_err(|e| {
+			error!("FATAL: Failed to install default crypto provider: {:?}", e);
+			Error::Internal("Failed to install default crypto provider".to_string())
+		})?;
+		let Some(auth_adapter) = self.adapters.auth_adapter else {
+			error!("FATAL: No auth adapter configured");
+			return Err(Error::Internal("No auth adapter configured".to_string()));
+		};
+		let Some(meta_adapter) = self.adapters.meta_adapter else {
+			error!("FATAL: No meta adapter configured");
+			return Err(Error::Internal("No meta adapter configured".to_string()));
+		};
 		let task_store: Arc<dyn scheduler::TaskStore<App>> =
 			scheduler::MetaAdapterTaskStore::new(meta_adapter.clone());
 		// Initialize settings registry and service
@@ -289,9 +298,26 @@ impl AppBuilder {
 			Arc::new(engine)
 		};
 
+		let Some(worker) = self.worker else {
+			error!("FATAL: No worker pool defined");
+			return Err(Error::Internal("No worker pool defined".to_string()));
+		};
+		let Some(blob_adapter) = self.adapters.blob_adapter else {
+			error!("FATAL: No blob adapter configured");
+			return Err(Error::Internal("No blob adapter configured".to_string()));
+		};
+		let Some(crdt_adapter) = self.adapters.crdt_adapter else {
+			error!("FATAL: No CRDT adapter configured");
+			return Err(Error::Internal("No CRDT adapter configured".to_string()));
+		};
+		let Some(rtdb_adapter) = self.adapters.rtdb_adapter else {
+			error!("FATAL: No RTDB adapter configured");
+			return Err(Error::Internal("No RTDB adapter configured".to_string()));
+		};
+
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
-			worker: self.worker.expect("FATAL: No worker pool defined"),
+			worker,
 			request: request::Request::new(auth_adapter.clone())?,
 			acme_challenge_map: RwLock::new(HashMap::new()),
 			certs: RwLock::new(HashMap::new()),
@@ -301,9 +327,9 @@ impl AppBuilder {
 
 			auth_adapter,
 			meta_adapter,
-			blob_adapter: self.adapters.blob_adapter.expect("FATAL: No blob adapter"),
-			crdt_adapter: self.adapters.crdt_adapter.expect("FATAL: No CRDT adapter"),
-			rtdb_adapter: self.adapters.rtdb_adapter.expect("FATAL: No RTDB adapter"),
+			blob_adapter,
+			crdt_adapter,
+			rtdb_adapter,
 			idp_adapter: self.adapters.idp_adapter.clone(),
 
 			// Settings
@@ -319,9 +345,10 @@ impl AppBuilder {
 			// Hook registry
 			hook_registry: Arc::new(tokio::sync::RwLock::new(HookRegistry::new())),
 		});
-		tokio::fs::create_dir_all(&app.opts.tmp_dir)
-			.await
-			.expect("Cannot create tmp dir");
+		tokio::fs::create_dir_all(&app.opts.tmp_dir).await.map_err(|e| {
+			error!("FATAL: Cannot create tmp dir: {}", e);
+			Error::Internal(format!("Cannot create tmp dir: {}", e))
+		})?;
 
 		// Init modules
 		action::init(&app)?;

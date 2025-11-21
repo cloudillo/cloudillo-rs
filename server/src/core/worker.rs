@@ -89,8 +89,10 @@ impl WorkerPool {
 			match res_rx.await {
 				Ok(result) => result,
 				Err(_) => {
-					error!("Worker dropped result channel without sending");
-					panic!("Critical: worker pool lost result");
+					error!("Critical: Worker dropped result channel without sending - worker pool corrupted");
+					unreachable!(
+						"Worker pool lost result - this should never happen in normal operation"
+					);
 				}
 			}
 		}
@@ -117,8 +119,10 @@ impl WorkerPool {
 			match res_rx.await {
 				Ok(result) => result,
 				Err(_) => {
-					error!("Worker dropped result channel without sending");
-					panic!("Critical: worker pool lost result");
+					error!("Critical: Worker dropped result channel without sending - worker pool corrupted");
+					unreachable!(
+						"Worker pool lost result - this should never happen in normal operation"
+					);
 				}
 			}
 		}
@@ -145,8 +149,10 @@ impl WorkerPool {
 			match res_rx.await {
 				Ok(result) => result,
 				Err(_) => {
-					error!("Worker dropped result channel without sending");
-					panic!("Critical: worker pool lost result");
+					error!("Critical: Worker dropped result channel without sending - worker pool corrupted");
+					unreachable!(
+						"Worker pool lost result - this should never happen in normal operation"
+					);
 				}
 			}
 		}
@@ -173,8 +179,10 @@ impl WorkerPool {
 			match res_rx.await {
 				Ok(result) => result,
 				Err(_) => {
-					error!("Worker dropped result channel without sending");
-					panic!("Critical: worker pool lost result");
+					error!("Critical: Worker dropped result channel without sending - worker pool corrupted");
+					unreachable!(
+						"Worker pool lost result - this should never happen in normal operation"
+					);
 				}
 			}
 		}

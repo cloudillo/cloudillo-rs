@@ -46,7 +46,12 @@ impl Task<App> for ActionDeliveryTask {
 	}
 
 	fn serialize(&self) -> String {
-		serde_json::to_string(self).unwrap()
+		// Safe: ActionDeliveryTask is a simple struct with all serializable fields
+		// This should never fail unless there's a bug in serde
+		serde_json::to_string(self).unwrap_or_else(|e| {
+			error!("Failed to serialize ActionDeliveryTask: {}", e);
+			"{}".to_string()
+		})
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {

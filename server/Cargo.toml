@@ -16,7 +16,6 @@ hmac = "0.12.1"
 image = "0.25.9"
 instant-acme = "0.8.3"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
-lazy_static = "1.5.0"
 pem = "3.0.6"
 rustls = "0.23.35"
 rustls-pki-types = { version = "1.13.0", features = ["alloc"] }

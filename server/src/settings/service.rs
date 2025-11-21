@@ -11,6 +11,12 @@ use crate::types::TnId;
 
 use super::types::{FrozenSettingsRegistry, Setting, SettingScope, SettingValue};
 
+// Compile-time constant for default cache capacity
+const DEFAULT_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(100) {
+	Some(n) => n,
+	None => unreachable!(),
+};
+
 /// LRU cache for settings values
 pub struct SettingsCache {
 	cache: Arc<parking_lot::RwLock<LruCache<(TnId, String), SettingValue>>>,
@@ -18,7 +24,7 @@ pub struct SettingsCache {
 
 impl SettingsCache {
 	pub fn new(capacity: usize) -> Self {
-		let non_zero = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(100).unwrap());
+		let non_zero = NonZeroUsize::new(capacity).unwrap_or(DEFAULT_CACHE_CAPACITY);
 		Self { cache: Arc::new(parking_lot::RwLock::new(LruCache::new(non_zero))) }
 	}
 

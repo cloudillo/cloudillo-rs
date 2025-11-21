@@ -153,13 +153,19 @@ pub async fn bootstrap(
 	let auth = &app.auth_adapter;
 
 	if true {
-		let base_id_tag = &opts.base_id_tag.as_ref().expect("FATAL: No base id tag");
+		let Some(base_id_tag) = opts.base_id_tag.as_ref() else {
+			return Err(Error::Internal("FATAL: No base id tag provided".to_string()));
+		};
 		let id_tag = auth.read_id_tag(TnId(1)).await;
 		debug!("Got id tag: {:?}", id_tag);
 
 		if let Err(Error::NotFound) = id_tag {
 			info!("======================================\nBootstrapping...\n======================================");
-			let base_password = opts.base_password.clone().expect("FATAL: No base password");
+			let Some(base_password) = opts.base_password.clone() else {
+				return Err(Error::Internal(
+					"FATAL: No base password provided for bootstrap".to_string(),
+				));
+			};
 
 			// Use the unified tenant creation function
 			create_complete_tenant(

@@ -157,7 +157,7 @@ fn process_function(fn_name: &str, params: &serde_json::Map<String, Value>) -> C
 		"now" => {
 			let timestamp = std::time::SystemTime::now()
 				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap()
+				.map_err(|e| Error::Internal(format!("System time error: {}", e)))?
 				.as_millis() as u64;
 			Ok(Value::Number(timestamp.into()))
 		}
