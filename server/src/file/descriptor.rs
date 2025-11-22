@@ -86,27 +86,25 @@ pub fn get_best_file_variant<'a, S: AsRef<str> + Debug + Eq>(
 ) -> ClResult<&'a meta_adapter::FileVariant<S>> {
 	debug!("get_best_file_variant: {:?}", selector);
 	let best = match selector.variant.as_deref() {
-		Some("tn") => variants
-			.iter()
-			.find(|v| v.variant.as_ref() == "tn")
-			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "sd"))
-			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "md"))
-			.ok_or(Error::NotFound),
+		Some("tn") => variants.iter().find(|v| v.variant.as_ref() == "tn").ok_or(Error::NotFound),
 		Some("sd") => variants
 			.iter()
 			.find(|v| v.variant.as_ref() == "sd")
 			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "md"))
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "tn"))
 			.ok_or(Error::NotFound),
 		Some("md") => variants
 			.iter()
 			.find(|v| v.variant.as_ref() == "md")
 			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "sd"))
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "tn"))
 			.ok_or(Error::NotFound),
 		Some("hd") => variants
 			.iter()
 			.find(|v| v.variant.as_ref() == "hd")
 			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "md"))
 			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "sd"))
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "tn"))
 			.ok_or(Error::NotFound),
 		Some("xd") => variants
 			.iter()
@@ -114,9 +112,10 @@ pub fn get_best_file_variant<'a, S: AsRef<str> + Debug + Eq>(
 			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "hd"))
 			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "md"))
 			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "sd"))
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "tn"))
 			.ok_or(Error::NotFound),
 		Some(_) => Err(Error::NotFound),
-		None => Err(Error::NotFound),
+		None => variants.iter().find(|v| v.variant.as_ref() == "tn").ok_or(Error::NotFound),
 	};
 	debug!("best variant: {:?} {:?}", best, variants);
 

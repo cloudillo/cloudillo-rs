@@ -298,6 +298,11 @@ pub enum FileId<S: AsRef<str>> {
 	FId(u64),
 }
 
+pub enum ActionId<S: AsRef<str>> {
+	ActionId(S),
+	AId(u64),
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum FileStatus {
 	#[serde(rename = "I")]
@@ -503,6 +508,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// Action management
 	//*******************
+	async fn get_action_id(&self, tn_id: TnId, a_id: u64) -> ClResult<Box<str>>;
 	async fn list_actions(
 		&self,
 		tn_id: TnId,
@@ -519,6 +525,14 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		action: &Action<&str>,
 		key: Option<&str>,
+	) -> ClResult<ActionId<Box<str>>>;
+
+	async fn finalize_action(
+		&self,
+		tn_id: TnId,
+		a_id: u64,
+		action_id: &str,
+		attachments: Option<&[&str]>,
 	) -> ClResult<()>;
 
 	async fn create_inbound_action(

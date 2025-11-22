@@ -42,6 +42,34 @@ pub async fn create_action(
 	id_tag: &str,
 	action: CreateAction,
 ) -> ClResult<Box<str>> {
+	// Create pending action in database with a_id (action_id is NULL at this point)
+	let pending_action = meta_adapter::Action {
+		action_id: "", // Empty action_id for pending actions
+		issuer_tag: id_tag,
+		typ: action.typ.as_ref(),
+		sub_typ: action.sub_typ.as_deref(),
+		parent_id: action.parent_id.as_deref(),
+		root_id: action.root_id.as_deref(),
+		audience_tag: action.audience_tag.as_deref(),
+		content: action.content.as_deref(),
+		attachments: action.attachments.as_ref().map(|v| v.iter().map(|a| a.as_ref()).collect()),
+		subject: action.subject.as_deref(),
+		expires_at: action.expires_at,
+		created_at: Timestamp::now(),
+	};
+
+	let key = None; // No key needed yet - deduplication happens at finalization
+	let action_result = app.meta_adapter.create_action(tn_id, &pending_action, key).await?;
+
+	let a_id = match action_result {
+		meta_adapter::ActionId::AId(a_id) => a_id,
+		meta_adapter::ActionId::ActionId(_) => {
+			// This shouldn't happen for new actions
+			return Err(Error::Internal("Unexpected ActionId result".into()));
+		}
+	};
+
+	// Collect file attachment dependencies
 	let attachments_to_wait = if let Some(attachments) = &action.attachments {
 		attachments
 			.iter()
@@ -51,7 +79,7 @@ pub async fn create_action(
 	} else {
 		Vec::new()
 	};
-	info!("Dependencies: {:?}", attachments_to_wait);
+	info!("Dependencies for a_id={}: {:?}", a_id, attachments_to_wait);
 	let deps = app
 		.meta_adapter
 		.list_task_ids(
@@ -59,38 +87,33 @@ pub async fn create_action(
 			&attachments_to_wait.into_boxed_slice(),
 		)
 		.await?;
-	info!("Dependencies: {:?}", deps);
+	info!("Task dependencies: {:?}", deps);
 
-	// Generate action token and action_id deterministically before queuing the task
-	let action_token = app.auth_adapter.create_action_token(tn_id, action.clone()).await?;
-	let action_id = hasher::hash("a", action_token.as_bytes());
+	// Create ActionCreatorTask to finalize the action
+	let task = ActionCreatorTask::new(tn_id, Box::from(id_tag), a_id, action);
+	app.scheduler
+		.task(task)
+		.key(format!("{},{}", tn_id, a_id))
+		.depend_on(deps)
+		.schedule()
+		.await?;
 
-	let task =
-		ActionCreatorTask::new(tn_id, Box::from(id_tag), action, action_token, action_id.clone());
-	app.scheduler.task(task).depend_on(deps).schedule().await?;
-
-	Ok(action_id)
+	// Return @{a_id} placeholder
+	Ok(format!("@{}", a_id).into_boxed_str())
 }
 
-/// Action creator Task
+/// Action creator Task - finalizes pending actions
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ActionCreatorTask {
 	tn_id: TnId,
 	id_tag: Box<str>,
+	a_id: u64,
 	action: CreateAction,
-	action_token: Box<str>,
-	action_id: Box<str>,
 }
 
 impl ActionCreatorTask {
-	pub fn new(
-		tn_id: TnId,
-		id_tag: Box<str>,
-		action: CreateAction,
-		action_token: Box<str>,
-		action_id: Box<str>,
-	) -> Arc<Self> {
-		Arc::new(Self { tn_id, id_tag, action, action_token, action_id })
+	pub fn new(tn_id: TnId, id_tag: Box<str>, a_id: u64, action: CreateAction) -> Arc<Self> {
+		Arc::new(Self { tn_id, id_tag, a_id, action })
 	}
 }
 
@@ -116,9 +139,9 @@ impl Task<App> for ActionCreatorTask {
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
-		info!("Running task action.create {:?} {:?}", self.tn_id, &self.action);
+		info!("Running task action.create a_id={} {:?}", self.a_id, &self.action);
 
-		// Resolve file attachments
+		// Resolve file attachments (@f_id → file_id)
 		let attachments: Option<Vec<Box<str>>> = if let Some(attachments) = &self.action.attachments
 		{
 			let mut attachment_vec: Vec<Box<str>> = Vec::new();
@@ -135,28 +158,34 @@ impl Task<App> for ActionCreatorTask {
 			None
 		};
 
-		// Create action in database
-		let action = meta_adapter::Action {
-			action_id: self.action_id.as_ref(),
-			issuer_tag: self.id_tag.as_ref(),
-			typ: self.action.typ.as_ref(),
-			sub_typ: self.action.sub_typ.as_deref(),
-			parent_id: self.action.parent_id.as_deref(),
-			root_id: self.action.root_id.as_deref(),
-			audience_tag: self.action.audience_tag.as_deref(),
-			content: self.action.content.as_deref(),
-			attachments: attachments.as_ref().map(|v| v.iter().map(|a| a.as_ref()).collect()),
-			subject: self.action.subject.as_deref(),
+		// Create action structure with resolved attachments for token generation
+		let action_for_token = CreateAction {
+			typ: self.action.typ.clone(),
+			sub_typ: self.action.sub_typ.clone(),
+			parent_id: self.action.parent_id.clone(),
+			root_id: self.action.root_id.clone(),
+			audience_tag: self.action.audience_tag.clone(),
+			content: self.action.content.clone(),
+			attachments: attachments.clone(),
+			subject: self.action.subject.clone(),
 			expires_at: self.action.expires_at,
-			created_at: Timestamp::now(),
 		};
 
-		let key = Some(action.action_id);
-		app.meta_adapter.create_action(self.tn_id, &action, key).await?;
+		// NOW generate the action token with resolved attachment IDs
+		let action_token =
+			app.auth_adapter.create_action_token(self.tn_id, action_for_token).await?;
+		let action_id = hasher::hash("a", action_token.as_bytes());
+
+		// Finalize the action - sets action_id, updates attachments, and transitions status from 'P' to 'I' atomically
+		let attachments_refs: Option<Vec<&str>> =
+			attachments.as_ref().map(|v| v.iter().map(|s| s.as_ref()).collect());
+		app.meta_adapter
+			.finalize_action(self.tn_id, self.a_id, &action_id, attachments_refs.as_deref())
+			.await?;
 
 		// Store action token for federation
 		app.meta_adapter
-			.store_action_token(self.tn_id, &self.action_id, &self.action_token)
+			.store_action_token(self.tn_id, &action_id, &action_token)
 			.await?;
 
 		// Execute DSL on_create hook if action type has one
@@ -165,7 +194,7 @@ impl Task<App> for ActionCreatorTask {
 			use std::collections::HashMap;
 
 			let hook_context = HookContext {
-				action_id: self.action_id.to_string(),
+				action_id: action_id.to_string(),
 				r#type: self.action.typ.to_string(),
 				subtype: self.action.sub_typ.as_ref().map(|s| s.to_string()),
 				issuer: self.id_tag.to_string(),
@@ -176,7 +205,7 @@ impl Task<App> for ActionCreatorTask {
 				attachments: attachments
 					.as_ref()
 					.map(|v| v.iter().map(|s| s.to_string()).collect()),
-				created_at: format!("{}", action.created_at.0),
+				created_at: format!("{}", Timestamp::now().0),
 				expires_at: self.action.expires_at.map(|ts| format!("{}", ts.0)),
 				tenant_id: self.tn_id.0 as i64,
 				tenant_tag: self.id_tag.to_string(),
@@ -193,7 +222,7 @@ impl Task<App> for ActionCreatorTask {
 				.await
 			{
 				warn!(
-					action_id = %self.action_id,
+					action_id = %action_id,
 					action_type = %self.action.typ,
 					issuer = %self.id_tag,
 					tenant_id = %self.tn_id.0,
@@ -214,7 +243,7 @@ impl Task<App> for ActionCreatorTask {
 			let should_broadcast = def.behavior.broadcast.unwrap_or(false);
 			if should_broadcast && self.action.audience_tag.is_none() {
 				// Broadcast mode: query for followers using list_actions
-				info!("Broadcasting action {} - querying for followers", self.action_id);
+				info!("Broadcasting action {} - querying for followers", action_id);
 
 				// Query for FLLW and CONN actions (same as TypeScript implementation)
 				// The issuer of these actions is the follower
@@ -244,25 +273,25 @@ impl Task<App> for ActionCreatorTask {
 			} else if let Some(audience_tag) = &self.action.audience_tag {
 				// Audience mode: send to specific recipient
 				if audience_tag.as_ref() != self.id_tag.as_ref() {
-					info!("Sending action {} to audience {}", self.action_id, audience_tag);
+					info!("Sending action {} to audience {}", action_id, audience_tag);
 					recipients.push(audience_tag.clone());
 				}
 			}
 
 			// Create delivery task for each recipient
 			for recipient_tag in recipients {
-				info!("Creating delivery task for action {} to {}", self.action_id, recipient_tag);
+				info!("Creating delivery task for action {} to {}", action_id, recipient_tag);
 
 				let delivery_task = ActionDeliveryTask::new(
 					self.tn_id,
-					self.action_id.clone(),
+					action_id.clone(),
 					recipient_tag.clone(), // target_instance
 					recipient_tag.clone(), // target_id_tag
 				);
 
 				// Use unique key to prevent duplicate delivery tasks
 				// Format: "delivery:{action_id}:{recipient_tag}"
-				let task_key = format!("delivery:{}:{}", self.action_id, recipient_tag);
+				let task_key = format!("delivery:{}:{}", action_id, recipient_tag);
 
 				// Create retry policy: exponential backoff from 10 sec to 1 hours, max 5 retries
 				let retry_policy = RetryPolicy::new((10, 43200), 50);
@@ -277,7 +306,7 @@ impl Task<App> for ActionCreatorTask {
 			}
 		}
 
-		info!("Finished task action.create {}", action.action_id);
+		info!("Finished task action.create {}", action_id);
 		Ok(())
 	}
 }

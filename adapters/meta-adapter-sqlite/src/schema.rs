@@ -197,14 +197,15 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS actions (
 		tn_id integer NOT NULL,
-		action_id text NOT NULL,
+		a_id integer PRIMARY KEY AUTOINCREMENT,
+		action_id text,
 		key text,
 		type text NOT NULL,
 		sub_type text,
 		parent_id text,
 		root_id text,
 		issuer_tag text NOT NULL,
-		status char(1),				-- 'A' - Active, 'P' - Processing, 'D' - Deleted
+		status char(1) DEFAULT 'P',		-- 'P' - Pending, 'I' - Immutable/finalized, 'D' - Deleted
 		audience text,
 		subject text,
 		content json,
@@ -213,9 +214,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		attachments json,
 		reactions integer,
 		comments integer,
-		comments_read integer,
-		PRIMARY KEY(tn_id, action_id)
+		comments_read integer
 	)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_action_id ON actions(tn_id, action_id) WHERE action_id NOT NULL",
 	)
 	.execute(&mut *tx)
 	.await?;

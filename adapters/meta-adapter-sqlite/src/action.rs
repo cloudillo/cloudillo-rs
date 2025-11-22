@@ -13,7 +13,7 @@ pub(crate) async fn list(
 	opts: &ListActionOptions,
 ) -> ClResult<Vec<ActionView>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
+		"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
 		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic,
 		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic,
 		a.subject, a.content, a.created_at, a.expires_at,
@@ -60,6 +60,21 @@ pub(crate) async fn list(
 	if let Some(created_after) = &opts.created_after {
 		query.push(" AND a.created_at>").push_bind(created_after.0);
 	}
+	if let Some(action_id) = &opts.action_id {
+		// Handle both @{a_id} placeholders and real action_ids
+		if let Some(a_id_str) = action_id.strip_prefix('@') {
+			// Query by a_id
+			if let Ok(a_id) = a_id_str.parse::<i64>() {
+				query.push(" AND a.a_id=").push_bind(a_id);
+			} else {
+				// Invalid a_id format - no results
+				query.push(" AND 1=0");
+			}
+		} else {
+			// Query by action_id
+			query.push(" AND a.action_id=").push_bind(action_id);
+		}
+	}
 	query.push(" ORDER BY a.created_at DESC LIMIT 100");
 	debug!("SQL: {}", query.sql());
 
@@ -72,7 +87,16 @@ pub(crate) async fn list(
 
 	let mut actions = Vec::new();
 	for row in res {
-		let action_id = row.try_get::<Box<str>, _>("action_id").map_err(|_| Error::DbError)?;
+		// action_id might be NULL for pending actions - use @{a_id} placeholder
+		let action_id: Box<str> = row
+			.try_get::<Option<String>, _>("action_id")
+			.map_err(|_| Error::DbError)?
+			.map(|s| s.into_boxed_str())
+			.unwrap_or_else(|| {
+				// NULL action_id - construct @{a_id} placeholder
+				let a_id: i64 = row.try_get("a_id").unwrap_or(0);
+				format!("@{}", a_id).into_boxed_str()
+			});
 		info!("row: {:?}", action_id);
 
 		let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag").map_err(|_| Error::DbError)?;
@@ -92,14 +116,28 @@ pub(crate) async fn list(
 				.collect::<Vec<_>>();
 			info!("attachments: {:?}", attachments);
 			for a in attachments.iter_mut() {
-				if let Ok(file_res) =
+				// Handle both @{f_id} placeholders and real file_ids
+				let query_result = if let Some(f_id_str) = a.file_id.strip_prefix('@') {
+					// Query by f_id
+					if let Ok(f_id) = f_id_str.parse::<i64>() {
+						sqlx::query("SELECT x->>'dim' as dim FROM files WHERE tn_id=? AND f_id=?")
+							.bind(tn_id.0)
+							.bind(f_id)
+							.fetch_one(db)
+							.await
+					} else {
+						Err(sqlx::Error::RowNotFound)
+					}
+				} else {
+					// Query by file_id
 					sqlx::query("SELECT x->>'dim' as dim FROM files WHERE tn_id=? AND file_id=?")
 						.bind(tn_id.0)
 						.bind(&a.file_id)
 						.fetch_one(db)
 						.await
-						.inspect_err(inspect)
-				{
+				};
+
+				if let Ok(file_res) = query_result.inspect_err(inspect) {
 					a.dim = serde_json::from_str(
 						file_res.try_get("dim").inspect_err(inspect).map_err(|_| Error::DbError)?,
 					)?;
@@ -213,38 +251,185 @@ pub(crate) async fn list_tokens(
 	Ok(tokens.into_boxed_slice())
 }
 
-/// Create a new action
+/// Create a new action (creates pending action with a_id, no action_id yet)
 pub(crate) async fn create(
 	db: &SqlitePool,
 	tn_id: TnId,
 	action: &Action<&str>,
 	key: Option<&str>,
-) -> ClResult<()> {
-	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
-	sqlx::QueryBuilder::new(
-		"INSERT OR IGNORE INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, expires_at, attachments) VALUES(")
-		.push_bind(tn_id.0).push(", ")
-		.push_bind(action.action_id).push(", ")
-		.push_bind(key).push(", ")
-		.push_bind(action.typ).push(", ")
-		.push_bind(action.sub_typ).push(", ")
-		.push_bind(action.parent_id).push(", ")
-		.push_bind(action.root_id).push(", ")
-		.push_bind(action.issuer_tag).push(", ")
-		.push_bind(action.audience_tag).push(", ")
-		.push_bind(action.subject).push(", ")
-		.push_bind(action.content).push(", ")
-		.push_bind(action.created_at.0).push(", ")
-		.push_bind(action.expires_at.map(|t| t.0)).push(", ")
-		.push_bind(action.attachments.as_ref().map(|s| s.join(",")))
-		.push(")")
-		.build().execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+) -> ClResult<ActionId<Box<str>>> {
+	// If action already has action_id (inbound federation), check if it exists
+	if !action.action_id.is_empty() {
+		let action_id_exists = sqlx::query(
+			"SELECT action_id FROM actions WHERE tn_id=? AND action_id=? AND status!='D'",
+		)
+		.bind(tn_id.0)
+		.bind(action.action_id)
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?
+		.and_then(|row| row.get(0));
 
-	let mut add_reactions = if action.content.is_none() { 0 } else { 1 };
+		if let Some(action_id) = action_id_exists {
+			return Ok(ActionId::ActionId(action_id));
+		}
+	}
+
+	let status = "P";
+	let res = sqlx::query(
+		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, expires_at, attachments, status)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING a_id"
+	)
+		.bind(tn_id.0)
+		.bind(if action.action_id.is_empty() { None } else { Some(action.action_id) })
+		.bind(key)
+		.bind(action.typ)
+		.bind(action.sub_typ)
+		.bind(action.parent_id)
+		.bind(action.root_id)
+		.bind(action.issuer_tag)
+		.bind(action.audience_tag)
+		.bind(action.subject)
+		.bind(action.content)
+		.bind(action.created_at.0)
+		.bind(action.expires_at.map(|t| t.0))
+		.bind(action.attachments.as_ref().map(|s| s.join(",")))
+		.bind(status)
+		.fetch_one(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+	Ok(ActionId::AId(res.get(0)))
+}
+
+/// Finalize action - atomically set action_id, update attachments, and transition from 'P' to 'I' status
+pub(crate) async fn finalize(
+	db: &SqlitePool,
+	tn_id: TnId,
+	a_id: u64,
+	action_id: &str,
+	attachments: Option<&[&str]>,
+) -> ClResult<()> {
+	// First check if action exists and what its current action_id is
+	let existing = sqlx::query("SELECT action_id, status FROM actions WHERE tn_id=? AND a_id=?")
+		.bind(tn_id.0)
+		.bind(a_id as i64)
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+	match existing {
+		None => {
+			// Action doesn't exist at all
+			return Err(Error::NotFound);
+		}
+		Some(row) => {
+			let existing_action_id: Option<String> = row.try_get("action_id").ok().flatten();
+			let status: Option<String> = row.try_get("status").ok().flatten();
+
+			if let Some(existing_id) = existing_action_id {
+				// Already has an action_id - check if it matches
+				if existing_id == action_id {
+					// Idempotent success - already set to the correct value
+					return Ok(());
+				} else {
+					// Different action_id - this is a conflict
+					let msg = format!(
+						"Attempted to finalize a_id={} to action_id={} but already set to {}",
+						a_id, action_id, existing_id
+					);
+					error!("{}", msg);
+					return Err(Error::Conflict(msg));
+				}
+			}
+
+			// action_id is NULL - verify status is 'P'
+			if status.as_deref() != Some("P") {
+				let msg = format!(
+					"Attempted to finalize a_id={} but status is {:?}, expected 'P'",
+					a_id, status
+				);
+				error!("{}", msg);
+				return Err(Error::Conflict(msg));
+			}
+		}
+	}
+
+	// Update NULL action_id to new value, update attachments, and transition status from 'P' to 'I'
+	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
+
+	let attachments_str = attachments.map(|a| a.join(","));
+	let res = sqlx::query(
+		"UPDATE actions SET action_id=?, attachments=?, status='I' WHERE tn_id=? AND a_id=? AND action_id IS NULL AND status='P'"
+	)
+		.bind(action_id)
+		.bind(attachments_str)
+		.bind(tn_id.0)
+		.bind(a_id as i64)
+		.execute(&mut *tx)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+	if res.rows_affected() == 0 {
+		// Race condition - someone else just set it between our check and update.
+		// Re-check what value was set (idempotent verification)
+		let current = sqlx::query("SELECT action_id FROM actions WHERE tn_id=? AND a_id=?")
+			.bind(tn_id.0)
+			.bind(a_id as i64)
+			.fetch_optional(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+
+		tx.rollback().await.map_err(|_| Error::DbError)?;
+
+		if let Some(row) = current {
+			if let Some(existing_id) = row.try_get::<Option<String>, _>("action_id").ok().flatten()
+			{
+				if existing_id == action_id {
+					// Idempotent success - another task set it to the same value
+					return Ok(());
+				} else {
+					// Conflict - set to different value
+					let msg = format!(
+						"Race condition: a_id={} was set to {} instead of {}",
+						a_id, existing_id, action_id
+					);
+					error!("{}", msg);
+					return Err(Error::Conflict(msg));
+				}
+			}
+		}
+
+		return Err(Error::Internal("Failed to finalize action".into()));
+	}
+
+	// Now handle key-based deduplication and reaction counting for finalized actions
+	let action = sqlx::query(
+		"SELECT key, type, content, parent_id, root_id FROM actions WHERE tn_id=? AND a_id=?",
+	)
+	.bind(tn_id.0)
+	.bind(a_id as i64)
+	.fetch_one(&mut *tx)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+
+	let key: Option<String> = action.try_get("key").ok().flatten();
+	let typ: String = action.try_get("type").map_err(|_| Error::DbError)?;
+	let content: Option<String> = action.try_get("content").ok().flatten();
+	let parent_id: Option<String> = action.try_get("parent_id").ok().flatten();
+	let root_id: Option<String> = action.try_get("root_id").ok().flatten();
+
+	let mut add_reactions = if content.is_none() { 0 } else { 1 };
 	if let Some(key) = &key {
-		info!("update with key: {}", key);
-		let res = sqlx::query("UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND action_id!=? AND coalesce(status, '')!='D' RETURNING content")
-			.bind(tn_id.0).bind(key).bind(action.action_id)
+		info!("Finalizing with key: {}", key);
+		let res = sqlx::query("UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND a_id!=? AND coalesce(status, 'I')!='D' RETURNING content")
+			.bind(tn_id.0).bind(key).bind(a_id as i64)
 			.fetch_all(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 		if !res.is_empty()
 			&& (res[0].try_get::<Option<&str>, _>("content").map_err(|_| Error::DbError)?).is_some()
@@ -252,14 +437,29 @@ pub(crate) async fn create(
 			add_reactions -= 1;
 		}
 	}
-	if action.typ == "REACT" && action.content.is_some() {
-		info!("update with reaction: {}", action.content.unwrap());
+	if typ == "REACT" && content.is_some() {
+		info!("Finalizing with reaction: {:?}", content);
 		sqlx::query("UPDATE actions SET reactions=coalesce(reactions, 0)+? WHERE tn_id=? AND action_id IN (?, ?)")
-			.bind(add_reactions).bind(tn_id.0).bind(action.parent_id).bind(action.root_id)
+			.bind(add_reactions).bind(tn_id.0).bind(parent_id).bind(root_id)
 			.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 	}
+
 	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 	Ok(())
+}
+
+/// Get action_id from a_id
+pub(crate) async fn get_id(db: &SqlitePool, tn_id: TnId, a_id: u64) -> ClResult<Box<str>> {
+	let res = sqlx::query("SELECT action_id FROM actions WHERE tn_id=? AND a_id=?")
+		.bind(tn_id.0)
+		.bind(a_id as i64)
+		.fetch_one(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::NotFound)?;
+
+	let action_id: String = res.try_get("action_id").map_err(|_| Error::NotFound)?;
+	Ok(action_id.into_boxed_str())
 }
 
 /// Create an inbound action

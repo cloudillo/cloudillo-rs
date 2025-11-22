@@ -167,13 +167,27 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::list_tokens(&self.dbr, tn_id, opts).await
 	}
 
+	async fn get_action_id(&self, tn_id: TnId, a_id: u64) -> ClResult<Box<str>> {
+		action::get_id(&self.dbr, tn_id, a_id).await
+	}
+
 	async fn create_action(
 		&self,
 		tn_id: TnId,
 		action: &Action<&str>,
 		key: Option<&str>,
-	) -> ClResult<()> {
+	) -> ClResult<ActionId<Box<str>>> {
 		action::create(&self.db, tn_id, action, key).await
+	}
+
+	async fn finalize_action(
+		&self,
+		tn_id: TnId,
+		a_id: u64,
+		action_id: &str,
+		attachments: Option<&[&str]>,
+	) -> ClResult<()> {
+		action::finalize(&self.db, tn_id, a_id, action_id, attachments).await
 	}
 
 	async fn create_inbound_action(
