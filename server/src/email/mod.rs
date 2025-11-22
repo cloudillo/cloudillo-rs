@@ -15,12 +15,10 @@ pub use sender::EmailSender;
 pub use task::EmailSenderTask;
 pub use template::TemplateEngine;
 
-use crate::error::ClResult;
+use crate::prelude::*;
 use crate::settings::service::SettingsService;
-use crate::types::TnId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::info;
 
 /// Email message to be sent
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3,13 +3,11 @@
 //! Loads HTML and plain text templates from filesystem and renders them
 //! with variable substitution.
 
-use crate::error::{ClResult, Error};
+use crate::prelude::*;
 use crate::settings::service::SettingsService;
 use crate::settings::SettingValue;
-use crate::types::TnId;
 use handlebars::Handlebars;
 use std::sync::Arc;
-use tracing::debug;
 
 /// Template engine for email rendering
 pub struct TemplateEngine {

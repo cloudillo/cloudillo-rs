@@ -1,6 +1,6 @@
 //! Authentication settings registration
 
-use crate::error::ClResult;
+use crate::prelude::*;
 use crate::settings::{
 	PermissionLevel, SettingDefinition, SettingScope, SettingValue, SettingsRegistry,
 };

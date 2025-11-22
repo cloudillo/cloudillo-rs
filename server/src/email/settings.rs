@@ -2,7 +2,7 @@
 //!
 //! Registers global SMTP and email configuration settings.
 
-use crate::error::{ClResult, Error};
+use crate::prelude::*;
 use crate::settings::{
 	PermissionLevel, SettingDefinition, SettingScope, SettingValue, SettingsRegistry,
 };

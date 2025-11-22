@@ -3,11 +3,9 @@
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
 
-use crate::error::{ClResult, Error};
 use crate::meta_adapter::MetaAdapter;
-use crate::types::TnId;
+use crate::prelude::*;
 
 use super::types::{FrozenSettingsRegistry, Setting, SettingScope, SettingValue};
 

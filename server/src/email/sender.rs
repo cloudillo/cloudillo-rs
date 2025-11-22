@@ -3,15 +3,13 @@
 //! Handles SMTP connection and email delivery with settings integration.
 
 use crate::email::EmailMessage;
-use crate::error::{ClResult, Error};
+use crate::prelude::*;
 use crate::settings::service::SettingsService;
-use crate::types::TnId;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::SmtpTransport;
 use lettre::{Message, Transport};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
 
 /// SMTP email sender
 pub struct EmailSender {

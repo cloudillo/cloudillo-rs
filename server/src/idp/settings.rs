@@ -1,6 +1,6 @@
 //! Identity Provider settings registration
 
-use crate::error::{ClResult, Error};
+use crate::prelude::*;
 use crate::settings::{
 	PermissionLevel, SettingDefinition, SettingScope, SettingValue, SettingsRegistry,
 };

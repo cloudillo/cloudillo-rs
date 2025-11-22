@@ -1,7 +1,7 @@
 //! Hook implementation types and registry for hybrid DSL + native execution
 
 use crate::core::app::AppState;
-use crate::error::ClResult;
+use crate::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;

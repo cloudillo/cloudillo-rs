@@ -4,16 +4,13 @@
 //! Templates are rendered at execution time, not scheduling time.
 //! Retry logic is handled by the scheduler's built-in RetryPolicy.
 
-use crate::core::app::App;
 use crate::core::scheduler::Task;
 use crate::email::EmailMessage;
-use crate::error::ClResult;
-use crate::types::TnId;
+use crate::prelude::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::sync::Arc;
-use tracing::info;
 
 pub type TaskId = u64;
 

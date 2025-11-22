@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
-use crate::error::{ClResult, Error};
+use crate::prelude::*;
 
 /// Type alias for setting validator function
 pub type SettingValidator = Box<dyn Fn(&SettingValue) -> ClResult<()> + Send + Sync>;
