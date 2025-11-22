@@ -3,84 +3,46 @@
 //! The CRDT protocol (`/ws/crdt/:doc_id`) provides real-time collaborative editing
 //! using Yjs conflict-free replicated data types.
 //!
-//! **Note**: Full Yjs integration requires additional dependencies (yrs, y-sync, y-awareness).
-//! This implementation provides the connection management and message routing structure.
-//!
 //! Message Format (Binary):
-//! ```text
-//! [msg_type: u8] [payload: bytes]
-//! msg_type: 0 = MSG_SYNC (Yjs protocol)
-//! msg_type: 1 = MSG_AWARENESS (user presence)
-//! ```
+//! Messages use the Yjs sync protocol format directly (lib0 encoding):
+//! - MSG_SYNC (0): Sync protocol messages (SyncStep1, SyncStep2, Update)
+//! - MSG_AWARENESS (1): User presence/cursor updates
+//!
+//! All messages are encoded/decoded using yrs::sync::Message.
 
 use crate::prelude::*;
 use axum::extract::ws::{Message, WebSocket};
 use futures::sink::SinkExt;
 use futures::stream::SplitSink;
 use futures::stream::StreamExt;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-
-/// Message types for the CRDT protocol
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CrdtMessageType {
-	/// Yjs sync protocol message
-	Sync = 0,
-	/// User awareness (presence/cursor) message
-	Awareness = 1,
-}
-
-impl CrdtMessageType {
-	/// Parse from byte
-	pub fn from_u8(b: u8) -> Option<Self> {
-		match b {
-			0 => Some(CrdtMessageType::Sync),
-			1 => Some(CrdtMessageType::Awareness),
-			_ => None,
-		}
-	}
-
-	/// Convert to byte
-	pub fn as_u8(self) -> u8 {
-		self as u8
-	}
-}
-
-/// User awareness state (presence, cursor position, etc.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AwarenessState {
-	/// User identifier
-	pub user: String,
-	/// Cursor position (line, column)
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub cursor: Option<(u32, u32)>,
-	/// Text selection (start, end)
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub selection: Option<(u32, u32)>,
-	/// User display color
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub color: Option<String>,
-	/// Last update timestamp
-	pub timestamp: u64,
-}
+use yrs::sync::{Message as YMessage, SyncMessage};
+use yrs::updates::decoder::Decode;
+use yrs::updates::encoder::Encode;
 
 /// CRDT connection tracking
 #[derive(Debug)]
 struct CrdtConnection {
+	conn_id: String, // Unique connection ID (to distinguish multiple tabs from same user)
 	user_id: String,
 	doc_id: String,
-	awareness: Arc<RwLock<Option<AwarenessState>>>,
-	// Broadcast channel for awareness updates
-	awareness_tx: Arc<tokio::sync::broadcast::Sender<(String, AwarenessState)>>,
+	// Broadcast channel for awareness updates (conn_id, raw_awareness_data)
+	awareness_tx: Arc<tokio::sync::broadcast::Sender<(String, Vec<u8>)>>,
+	// Broadcast channel for sync updates (conn_id, raw_sync_data)
+	sync_tx: Arc<tokio::sync::broadcast::Sender<(String, Vec<u8>)>>,
 	connected_at: u64,
 }
 
+/// Document broadcast channels (awareness and sync)
+/// Both channels use (conn_id, payload) format
+type DocChannels = (
+	Arc<tokio::sync::broadcast::Sender<(String, Vec<u8>)>>, // Awareness: (conn_id, awareness_data)
+	Arc<tokio::sync::broadcast::Sender<(String, Vec<u8>)>>, // Sync: (conn_id, sync_data)
+);
+
 /// Type alias for the CRDT document registry
-type CrdtDocRegistry = tokio::sync::RwLock<
-	HashMap<String, Arc<tokio::sync::broadcast::Sender<(String, AwarenessState)>>>,
->;
+type CrdtDocRegistry = tokio::sync::RwLock<HashMap<String, DocChannels>>;
 
 // Global registry of CRDT documents and their connections
 static CRDT_DOCS: std::sync::LazyLock<CrdtDocRegistry> =
@@ -94,121 +56,64 @@ pub async fn handle_crdt_connection(
 	app: crate::core::app::App,
 	tn_id: crate::types::TnId,
 ) {
-	info!("CRDT connection: {} / {} (tn_id={})", user_id, doc_id, tn_id.0);
+	// Generate unique connection ID
+	let conn_id =
+		crate::core::utils::random_id().unwrap_or_else(|_| format!("conn-{}", now_timestamp()));
+	info!("CRDT connection: {} / {} (tn_id={}, conn_id={})", user_id, doc_id, tn_id.0, conn_id);
 
-	// Get or create broadcast channel for this document
-	let awareness_tx = {
+	// Get or create broadcast channels for this document
+	let (awareness_tx, sync_tx) = {
 		let mut docs = CRDT_DOCS.write().await;
 		docs.entry(doc_id.clone())
 			.or_insert_with(|| {
-				let (tx, _) = tokio::sync::broadcast::channel(256);
-				Arc::new(tx)
+				let (awareness_tx, _) = tokio::sync::broadcast::channel(256);
+				let (sync_tx, _) = tokio::sync::broadcast::channel(256);
+				(Arc::new(awareness_tx), Arc::new(sync_tx))
 			})
 			.clone()
 	};
 
 	let conn = Arc::new(CrdtConnection {
+		conn_id: conn_id.clone(),
 		user_id: user_id.clone(),
 		doc_id: doc_id.clone(),
-		awareness: Arc::new(RwLock::new(None)),
 		awareness_tx,
+		sync_tx,
 		connected_at: now_timestamp(),
-	});
-
-	// Heartbeat task
-	let user_id_clone = user_id.clone();
-	let heartbeat_task = tokio::spawn(async move {
-		let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-		loop {
-			interval.tick().await;
-			debug!("CRDT heartbeat: {}", user_id_clone);
-		}
 	});
 
 	// Split WebSocket for concurrent operations
 	let (ws_tx, ws_rx) = ws.split();
 	let ws_tx: Arc<tokio::sync::Mutex<_>> = Arc::new(tokio::sync::Mutex::new(ws_tx));
 
+	// Send initial document state to the new client
+	send_initial_sync(&app, tn_id, &doc_id, &user_id, &ws_tx).await;
+
+	// Heartbeat task - sends ping frames to keep connection alive
+	let heartbeat_task = spawn_heartbeat_task(user_id.clone(), ws_tx.clone());
+
 	// WebSocket receive task - handles incoming messages
-	let conn_clone = conn.clone();
-	let ws_tx_clone = ws_tx.clone();
-	let app_clone = app.clone();
-	let ws_recv_task = tokio::spawn(async move {
-		let mut ws_rx = ws_rx;
-		while let Some(msg) = ws_rx.next().await {
-			match msg {
-				Ok(ws_msg) => {
-					// Parse message
-					match parse_crdt_message(&ws_msg) {
-						Ok(Some((msg_type, payload))) => {
-							// Handle message
-							handle_crdt_message(
-								&conn_clone,
-								msg_type,
-								&payload,
-								&ws_tx_clone,
-								&app_clone,
-								tn_id,
-							)
-							.await;
-						}
-						Ok(None) => continue, // Skip non-binary messages
-						Err(e) => {
-							warn!("Failed to parse CRDT message: {}", e);
-							continue;
-						}
-					}
-				}
-				Err(e) => {
-					warn!("CRDT connection error: {}", e);
-					break;
-				}
-			}
-		}
-	});
+	let ws_recv_task = spawn_receive_task(conn.clone(), ws_tx.clone(), ws_rx, app.clone(), tn_id);
 
-	// Awareness broadcast task - listens for other users' awareness updates
-	let conn_clone = conn.clone();
-	let ws_tx_clone = ws_tx.clone();
-	let awareness_task = tokio::spawn(async move {
-		let mut awareness_rx = conn_clone.awareness_tx.subscribe();
-		loop {
-			match awareness_rx.recv().await {
-				Ok((user, awareness)) => {
-					// Skip if this is from the current user (echo)
-					if user == conn_clone.user_id {
-						continue;
-					}
+	// Sync broadcast task - forwards CRDT updates to other clients
+	let sync_task =
+		spawn_broadcast_task(conn.clone(), ws_tx.clone(), conn.sync_tx.subscribe(), "SYNC");
 
-					// Send awareness state as binary message
-					let mut msg_data = vec![CrdtMessageType::Awareness.as_u8()];
-					if let Ok(json_str) = serde_json::to_string(&awareness) {
-						msg_data.extend_from_slice(json_str.as_bytes());
+	// Awareness broadcast task - forwards awareness updates to other clients
+	let awareness_task = spawn_broadcast_task(
+		conn.clone(),
+		ws_tx.clone(),
+		conn.awareness_tx.subscribe(),
+		"AWARENESS",
+	);
 
-						let ws_msg = Message::Binary(msg_data.into());
-						let mut tx = ws_tx_clone.lock().await;
-						if tx.send(ws_msg).await.is_err() {
-							debug!("Client disconnected while forwarding awareness");
-							return;
-						}
-					}
-				}
-				Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-					// Lost some messages, continue anyway
-					continue;
-				}
-				Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-					// Broadcast channel closed
-					return;
-				}
-			}
-		}
-	});
-
-	// Wait for either task to complete
+	// Wait for any task to complete
 	tokio::select! {
 		_ = ws_recv_task => {
 			debug!("WebSocket receive task ended");
+		}
+		_ = sync_task => {
+			debug!("Sync broadcast task ended");
 		}
 		_ = awareness_task => {
 			debug!("Awareness broadcast task ended");
@@ -218,119 +123,530 @@ pub async fn handle_crdt_connection(
 	heartbeat_task.abort();
 	info!("CRDT connection closed: {}", user_id);
 
-	// Clean up document registry if no more connections
-	let docs = CRDT_DOCS.read().await;
-	if let Some(tx) = docs.get(&conn.doc_id) {
-		if tx.receiver_count() == 0 {
-			drop(docs);
-			CRDT_DOCS.write().await.remove(&conn.doc_id);
-		}
+	// Always log document statistics on close
+	log_doc_statistics(&app, tn_id, &conn.doc_id).await;
+
+	// Clean up document registry and optimize if this was the last connection
+	let should_optimize = cleanup_registry(&conn.doc_id).await;
+	if should_optimize {
+		info!("Last connection closed for doc {}, optimizing...", conn.doc_id);
+		optimize_document(&app, tn_id, &conn.doc_id).await;
 	}
 }
 
-/// Parse a CRDT message from WebSocket message
-fn parse_crdt_message(msg: &Message) -> Result<Option<(CrdtMessageType, Vec<u8>)>, String> {
-	match msg {
-		Message::Binary(data) => {
-			if data.is_empty() {
-				return Err("Empty binary message".to_string());
+/// Send initial document state to a newly connected client
+async fn send_initial_sync(
+	app: &crate::core::app::App,
+	tn_id: crate::types::TnId,
+	doc_id: &str,
+	user_id: &str,
+	ws_tx: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
+) {
+	match app.crdt_adapter.get_updates(tn_id, doc_id).await {
+		Ok(updates) => {
+			if !updates.is_empty() {
+				info!(
+					"Sending {} initial CRDT updates to {} for doc {} (total: {} bytes)",
+					updates.len(),
+					user_id,
+					doc_id,
+					updates.iter().map(|u| u.data.len()).sum::<usize>()
+				);
+				let mut tx = ws_tx.lock().await;
+				for update in updates.iter() {
+					// Encode as a complete yrs Message
+					let sync_msg = SyncMessage::Update(update.data.clone());
+					let y_msg = YMessage::Sync(sync_msg);
+					let encoded = y_msg.encode_v1();
+					let ws_msg = Message::Binary(encoded.into());
+
+					if let Err(e) = tx.send(ws_msg).await {
+						warn!("Failed to send initial update to {}: {}", user_id, e);
+						break;
+					}
+				}
+			} else {
+				debug!("No initial CRDT updates for doc {}", doc_id);
 			}
-			let msg_type = CrdtMessageType::from_u8(data[0])
-				.ok_or_else(|| format!("Invalid message type: {}", data[0]))?;
-			let payload = data[1..].to_vec();
-			Ok(Some((msg_type, payload)))
 		}
-		Message::Close(_) => Ok(None),
-		Message::Ping(_) | Message::Pong(_) => Ok(None),
-		_ => {
-			// Text messages not supported in CRDT protocol
-			Err("CRDT protocol expects binary messages".to_string())
+		Err(e) => {
+			warn!("Failed to get initial CRDT updates for doc {}: {}", doc_id, e);
 		}
 	}
 }
 
-/// Handle a CRDT message
-async fn handle_crdt_message(
-	conn: &Arc<CrdtConnection>,
-	msg_type: CrdtMessageType,
+/// Spawn heartbeat task that sends ping frames periodically
+fn spawn_heartbeat_task(
+	user_id: String,
+	ws_tx: Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
+) -> tokio::task::JoinHandle<()> {
+	tokio::spawn(async move {
+		let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+		loop {
+			interval.tick().await;
+			debug!("CRDT heartbeat: {}", user_id);
+
+			let mut tx = ws_tx.lock().await;
+			if tx.send(Message::Ping(vec![].into())).await.is_err() {
+				debug!("Client disconnected during heartbeat");
+				return;
+			}
+		}
+	})
+}
+
+/// Spawn WebSocket receive task that handles incoming messages
+fn spawn_receive_task(
+	conn: Arc<CrdtConnection>,
+	ws_tx: Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
+	ws_rx: futures::stream::SplitStream<WebSocket>,
+	app: crate::core::app::App,
+	tn_id: crate::types::TnId,
+) -> tokio::task::JoinHandle<()> {
+	tokio::spawn(async move {
+		let mut ws_rx = ws_rx;
+		while let Some(msg) = ws_rx.next().await {
+			match msg {
+				Ok(Message::Binary(data)) => {
+					// yrs messages are sent directly without our wrapper
+					handle_yrs_message(&conn, &data, &ws_tx, &app, tn_id).await;
+				}
+				Ok(Message::Close(_)) | Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+					// Ignore control frames
+					continue;
+				}
+				Ok(_) => {
+					warn!("Received non-binary WebSocket message");
+					continue;
+				}
+				Err(e) => {
+					warn!("CRDT connection error: {}", e);
+					break;
+				}
+			}
+		}
+	})
+}
+
+/// Spawn a generic broadcast task that forwards updates to other clients
+/// This handles both SYNC and AWARENESS broadcasts with the same logic
+fn spawn_broadcast_task(
+	conn: Arc<CrdtConnection>,
+	ws_tx: Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
+	mut rx: tokio::sync::broadcast::Receiver<(String, Vec<u8>)>,
+	label: &'static str,
+) -> tokio::task::JoinHandle<()> {
+	tokio::spawn(async move {
+		debug!(
+			"Connection {} (user {}) subscribed to {} broadcasts for doc {}",
+			conn.conn_id, conn.user_id, label, conn.doc_id
+		);
+
+		loop {
+			match rx.recv().await {
+				Ok((sender_conn_id, data)) => {
+					debug!(
+						"{} broadcast received by conn {}: from conn {} for doc {} ({} bytes)",
+						label,
+						conn.conn_id,
+						sender_conn_id,
+						conn.doc_id,
+						data.len()
+					);
+
+					// Skip if this is from the current connection (already echoed)
+					if sender_conn_id == conn.conn_id {
+						debug!("Skipping {} echo to self for conn {}", label, conn.conn_id);
+						continue;
+					}
+
+					// Forward update to this client (data is already yrs-encoded, send directly)
+					let ws_msg = Message::Binary(data.into());
+
+					debug!(
+						"Forwarding {} update from conn {} to conn {} (user {}) for doc {}",
+						label, sender_conn_id, conn.conn_id, conn.user_id, conn.doc_id
+					);
+
+					let mut tx = ws_tx.lock().await;
+					if tx.send(ws_msg).await.is_err() {
+						debug!("Client disconnected while forwarding {} update", label);
+						return;
+					}
+					debug!("{} update successfully forwarded to conn {}", label, conn.conn_id);
+				}
+				Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+					if label == "SYNC" {
+						warn!(
+							"Client {} lagged behind on {} updates for doc {}",
+							conn.user_id, label, conn.doc_id
+						);
+					} else {
+						debug!("Connection {} lagged on {} updates", conn.conn_id, label);
+					}
+					continue;
+				}
+				Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+					debug!("{} broadcast channel closed", label);
+					return;
+				}
+			}
+		}
+	})
+}
+
+/// Broadcast a message and log the result
+fn broadcast_message(
+	tx: &Arc<tokio::sync::broadcast::Sender<(String, Vec<u8>)>>,
+	conn_id: &str,
+	user_id: &str,
+	doc_id: &str,
+	payload: Vec<u8>,
+	label: &str,
+) {
+	match tx.send((conn_id.to_string(), payload)) {
+		Ok(receiver_count) => {
+			if label != "AWARENESS" {
+				info!(
+					"CRDT {} broadcast from conn {} (user {}) for doc {}: {} receivers",
+					label, conn_id, user_id, doc_id, receiver_count
+				);
+			}
+		}
+		Err(_) => {
+			debug!("CRDT {} broadcast failed - no receivers for doc {}", label, doc_id);
+		}
+	}
+}
+
+/// Send raw echo response back to the client (yrs-encoded data)
+async fn send_echo_raw(
+	ws_tx: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
+	conn_id: &str,
+	user_id: &str,
+	doc_id: &str,
 	payload: &[u8],
+	label: &str,
+) {
+	let ws_msg = Message::Binary(payload.to_vec().into());
+	let mut tx = ws_tx.lock().await;
+
+	match tx.send(ws_msg).await {
+		Ok(_) => {
+			debug!(
+				"CRDT {} echo sent back to conn {} (user {}) for doc {} ({} bytes)",
+				label,
+				conn_id,
+				user_id,
+				doc_id,
+				payload.len()
+			);
+		}
+		Err(e) => {
+			warn!("Failed to send CRDT {} echo to conn {}: {}", label, conn_id, e);
+		}
+	}
+}
+
+/// Handle a yrs-encoded message
+async fn handle_yrs_message(
+	conn: &Arc<CrdtConnection>,
+	data: &[u8],
 	ws_tx: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
 	app: &crate::core::app::App,
 	tn_id: crate::types::TnId,
 ) {
-	match msg_type {
-		CrdtMessageType::Sync => {
+	if data.is_empty() {
+		warn!("Empty message from conn {}", conn.conn_id);
+		return;
+	}
+
+	// Decode using yrs
+	match YMessage::decode_v1(data) {
+		Ok(YMessage::Sync(sync_msg)) => {
 			debug!(
-				"CRDT SYNC message from user {} for doc {} ({} bytes)",
+				"CRDT SYNC message from conn {} (user {}) for doc {}: {:?}",
+				conn.conn_id,
 				conn.user_id,
 				conn.doc_id,
-				payload.len()
+				match &sync_msg {
+					SyncMessage::SyncStep1(_) => "SyncStep1",
+					SyncMessage::SyncStep2(_) => "SyncStep2",
+					SyncMessage::Update(_) => "Update",
+				}
 			);
 
-			// Store the update to the CRDT adapter
-			let update = crate::crdt_adapter::CrdtUpdate::with_client(
-				payload.to_vec(),
-				conn.user_id.clone(),
-			);
-			match app.crdt_adapter.store_update(tn_id, &conn.doc_id, update.clone()).await {
-				Ok(_) => {
-					debug!("CRDT update stored for doc {} from user {}", conn.doc_id, conn.user_id);
+			// Only store Update messages (actual changes)
+			// SyncStep2 messages are responses during sync and shouldn't be stored
+			let update_data = match &sync_msg {
+				SyncMessage::Update(data) => {
+					if !data.is_empty() {
+						Some(data.clone())
+					} else {
+						debug!("Received empty Update message from conn {}", conn.conn_id);
+						None
+					}
 				}
-				Err(e) => {
-					warn!("Failed to store CRDT update for doc {}: {}", conn.doc_id, e);
-				}
-			}
-
-			// Send the update back to the client to confirm receipt (echo)
-			// This is important for Yjs protocol - clients need to know their updates were received
-			let mut msg_data = vec![CrdtMessageType::Sync.as_u8()];
-			msg_data.extend_from_slice(payload);
-			let ws_msg = Message::Binary(msg_data.into());
-
-			let mut tx = ws_tx.lock().await;
-			match tx.send(ws_msg).await {
-				Ok(_) => {
+				SyncMessage::SyncStep2(data) => {
+					// SyncStep2 is a response message, not a new update
+					// Don't store it, just forward to other clients
 					debug!(
-						"CRDT SYNC echo sent back to user {} for doc {} ({} bytes)",
-						conn.user_id,
-						conn.doc_id,
-						payload.len()
+						"Received SyncStep2 from conn {} ({} bytes) - not storing",
+						conn.conn_id,
+						data.len()
 					);
+					None
 				}
-				Err(e) => {
-					warn!("Failed to send CRDT SYNC echo to user {}: {}", conn.user_id, e);
-				}
-			}
-		}
+				SyncMessage::SyncStep1(_) => None,
+			};
 
-		CrdtMessageType::Awareness => {
-			// Awareness payload format: binary data that may be Yjs awareness format
-			// Yjs sends binary awareness updates, not JSON
-			// Just log receipt and continue - actual awareness sync is handled by Yjs library
-			debug!("CRDT AWARENESS from {} ({} bytes)", conn.user_id, payload.len());
-
-			// Try to parse as JSON for debugging/tracking purposes (optional)
-			if let Ok(json_str) = std::str::from_utf8(payload) {
-				if let Ok(state) = serde_json::from_str::<AwarenessState>(json_str) {
-					// Update local awareness state if JSON format
-					let mut awareness = conn.awareness.write().await;
-					*awareness = Some(state.clone());
-					debug!(
-						"CRDT AWARENESS parsed as JSON from {}: cursor={:?}",
-						conn.user_id, state.cursor
-					);
-				}
-			} else {
-				// Binary awareness data that's not UTF-8 - this is normal for Yjs
-				// The actual Yjs library on the client handles this format
-				debug!(
-					"CRDT AWARENESS from {} is binary Yjs format ({} bytes)",
-					conn.user_id,
-					payload.len()
+			if let Some(data) = update_data {
+				let update = crate::crdt_adapter::CrdtUpdate::with_client(
+					data.clone(),
+					conn.user_id.clone(),
 				);
+				match app.crdt_adapter.store_update(tn_id, &conn.doc_id, update).await {
+					Ok(_) => {
+						info!(
+							"✓ CRDT update stored for doc {} from user {} ({} bytes)",
+							conn.doc_id,
+							conn.user_id,
+							data.len()
+						);
+					}
+					Err(e) => {
+						warn!("Failed to store CRDT update for doc {}: {}", conn.doc_id, e);
+					}
+				}
 			}
+
+			// Broadcast to other clients (send the original yrs-encoded data)
+			broadcast_message(
+				&conn.sync_tx,
+				&conn.conn_id,
+				&conn.user_id,
+				&conn.doc_id,
+				data.to_vec(),
+				"SYNC",
+			);
+
+			// Echo back to sender
+			send_echo_raw(ws_tx, &conn.conn_id, &conn.user_id, &conn.doc_id, data, "SYNC").await;
+		}
+		Ok(YMessage::Awareness(_awareness_update)) => {
+			debug!(
+				"CRDT AWARENESS from conn {} (user {}) for doc {} ({} bytes)",
+				conn.conn_id,
+				conn.user_id,
+				conn.doc_id,
+				data.len()
+			);
+
+			// Broadcast to other clients
+			broadcast_message(
+				&conn.awareness_tx,
+				&conn.conn_id,
+				&conn.user_id,
+				&conn.doc_id,
+				data.to_vec(),
+				"AWARENESS",
+			);
+
+			// Echo back to sender
+			send_echo_raw(ws_tx, &conn.conn_id, &conn.user_id, &conn.doc_id, data, "AWARENESS")
+				.await;
+		}
+		Ok(other) => {
+			debug!("Received non-sync/awareness message: {:?}", other);
+		}
+		Err(e) => {
+			warn!("Failed to decode yrs message from conn {}: {}", conn.conn_id, e);
 		}
 	}
+}
+
+/// Log document statistics (update count and total size)
+async fn log_doc_statistics(app: &crate::core::app::App, tn_id: crate::types::TnId, doc_id: &str) {
+	match app.crdt_adapter.get_updates(tn_id, doc_id).await {
+		Ok(updates) => {
+			let update_count = updates.len();
+			let total_size: usize = updates.iter().map(|u| u.data.len()).sum();
+
+			// Calculate average update size
+			let avg_size = if update_count > 0 { total_size / update_count } else { 0 };
+
+			info!(
+				"CRDT doc stats [{}]: {} updates, {} bytes total, {} bytes avg",
+				doc_id, update_count, total_size, avg_size
+			);
+		}
+		Err(e) => {
+			warn!("Failed to get statistics for doc {}: {}", doc_id, e);
+		}
+	}
+}
+
+/// Optimize document by merging all updates into a single compacted update
+async fn optimize_document(app: &crate::core::app::App, tn_id: crate::types::TnId, doc_id: &str) {
+	// Get all existing updates
+	let updates = match app.crdt_adapter.get_updates(tn_id, doc_id).await {
+		Ok(u) => u,
+		Err(e) => {
+			warn!("Failed to get updates for optimization of doc {}: {}", doc_id, e);
+			return;
+		}
+	};
+
+	// Skip optimization if there's only 0 or 1 update
+	if updates.len() <= 1 {
+		debug!("Skipping optimization for doc {} (only {} updates)", doc_id, updates.len());
+		return;
+	}
+
+	// Calculate sizes before optimization
+	let updates_before = updates.len();
+	let size_before: usize = updates.iter().map(|u| u.data.len()).sum();
+
+	// Merge all updates using Update::merge_updates
+	// This is more efficient than the Doc-based approach as it operates directly on the
+	// Update structures without needing to integrate and re-encode
+	let doc_id_for_task = doc_id.to_string();
+	let (merged_update, skipped_count) = match tokio::task::spawn_blocking(move || {
+		let mut decoded_updates = Vec::new();
+		let mut skipped = 0;
+
+		// Decode all updates first
+		for (idx, update) in updates.iter().enumerate() {
+			// Skip empty updates
+			if update.data.is_empty() {
+				warn!("Skipping empty update #{} for doc {}", idx, &doc_id_for_task);
+				skipped += 1;
+				continue;
+			}
+
+			// Try v2 first, then v1
+			let decoded = match yrs::Update::decode_v2(&update.data)
+				.or_else(|_| yrs::Update::decode_v1(&update.data))
+			{
+				Ok(u) => u,
+				Err(e) => {
+					warn!(
+						"Skipping corrupted update #{} for doc {} (size: {} bytes): {}",
+						idx,
+						&doc_id_for_task,
+						update.data.len(),
+						e
+					);
+					skipped += 1;
+					continue;
+				}
+			};
+
+			decoded_updates.push(decoded);
+		}
+
+		// If no valid updates, return error
+		if decoded_updates.is_empty() {
+			return Err(format!(
+				"No valid updates to merge (all {} updates corrupted)",
+				updates.len()
+			));
+		}
+
+		let update_count = decoded_updates.len();
+		info!(
+			"Merging {} valid updates for doc {} ({} skipped)",
+			update_count, &doc_id_for_task, skipped
+		);
+
+		// Merge all updates using yrs's built-in merge algorithm
+		// This properly deduplicates, squashes, and consolidates blocks
+		let merged = yrs::Update::merge_updates(decoded_updates);
+
+		// Encode the merged update
+		let encoded = merged.encode_v1();
+
+		debug!(
+			"Merged {} updates into {} bytes for doc {}",
+			update_count,
+			encoded.len(),
+			&doc_id_for_task
+		);
+
+		Ok((encoded, skipped))
+	})
+	.await
+	{
+		Ok(Ok(result)) => result,
+		Ok(Err(e)) => {
+			warn!("Failed to merge updates for doc {}: {}", doc_id, e);
+			return;
+		}
+		Err(e) => {
+			warn!("Failed to spawn blocking task for doc {}: {}", doc_id, e);
+			return;
+		}
+	};
+
+	// Calculate size after optimization
+	let size_after = merged_update.len();
+
+	// Only proceed if optimization actually reduces size
+	if size_after >= size_before {
+		debug!(
+			"Skipping optimization for doc {} (no size reduction: {} -> {})",
+			doc_id, size_before, size_after
+		);
+		return;
+	}
+
+	// Delete old document and store merged update
+	if let Err(e) = app.crdt_adapter.delete_doc(tn_id, doc_id).await {
+		warn!("Failed to delete doc {} during optimization: {}", doc_id, e);
+		return;
+	}
+
+	// Store the single merged update
+	let merged_crdt_update = crate::crdt_adapter::CrdtUpdate::with_client(
+		merged_update,
+		"system".to_string(), // Mark as system-generated
+	);
+
+	if let Err(e) = app.crdt_adapter.store_update(tn_id, doc_id, merged_crdt_update).await {
+		warn!("Failed to store optimized update for doc {}: {}", doc_id, e);
+		return;
+	}
+
+	// Log success
+	let size_reduction = size_before - size_after;
+	let reduction_percent = (size_reduction as f64 / size_before as f64) * 100.0;
+
+	let skipped_msg = if skipped_count > 0 {
+		format!(", {} corrupted updates skipped", skipped_count)
+	} else {
+		String::new()
+	};
+
+	info!(
+		"CRDT doc optimized [{}]: {} -> 1 updates, {} -> {} bytes ({:.1}% reduction){}",
+		doc_id, updates_before, size_before, size_after, reduction_percent, skipped_msg
+	);
+}
+
+/// Clean up document registry if no more connections
+/// Returns true if this was the last connection (document should be optimized)
+async fn cleanup_registry(doc_id: &str) -> bool {
+	let docs = CRDT_DOCS.read().await;
+	if let Some((awareness_tx, sync_tx)) = docs.get(doc_id) {
+		// Check if both channels have no more receivers
+		if awareness_tx.receiver_count() == 0 && sync_tx.receiver_count() == 0 {
+			drop(docs);
+			CRDT_DOCS.write().await.remove(doc_id);
+			debug!("Cleaned up CRDT registry for doc {}", doc_id);
+			return true; // This was the last connection
+		}
+	}
+	false
 }
 
 /// Get current timestamp

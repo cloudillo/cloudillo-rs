@@ -148,22 +148,32 @@ pub async fn handle_bus_connection(ws: WebSocket, user_id: String, app: crate::c
 	);
 	let _ = app.broadcast.broadcast("presence", presence_msg).await;
 
-	// Heartbeat task - also cleanup broadcast channels periodically
+	// Split WebSocket into sender and receiver
+	let (ws_tx, ws_rx) = ws.split();
+	let ws_tx: Arc<tokio::sync::Mutex<_>> = Arc::new(tokio::sync::Mutex::new(ws_tx));
+
+	// Heartbeat task - sends ping frames to keep connection alive and cleanup broadcast channels periodically
 	let app_clone = app.clone();
 	let user_id_clone = user_id.clone();
+	let ws_tx_heartbeat = ws_tx.clone();
 	let heartbeat_task = tokio::spawn(async move {
 		let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
 		loop {
 			interval.tick().await;
 			debug!("Bus heartbeat: {}", user_id_clone);
+
+			// Send ping frame to keep connection alive
+			let mut tx = ws_tx_heartbeat.lock().await;
+			if tx.send(Message::Ping(vec![].into())).await.is_err() {
+				debug!("Client disconnected during heartbeat");
+				return;
+			}
+			drop(tx);
+
 			// Cleanup empty broadcast channels
 			app_clone.broadcast.cleanup().await;
 		}
 	});
-
-	// Split WebSocket into sender and receiver
-	let (ws_tx, ws_rx) = ws.split();
-	let ws_tx: Arc<tokio::sync::Mutex<_>> = Arc::new(tokio::sync::Mutex::new(ws_tx));
 
 	// WebSocket receive task
 	let conn_clone = conn.clone();

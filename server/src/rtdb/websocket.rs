@@ -138,19 +138,27 @@ pub async fn handle_rtdb_connection(
 		connected_at: now_timestamp(),
 	});
 
-	// Heartbeat task
+	// Split WebSocket for concurrent read/write
+	let (ws_tx, ws_rx) = ws.split();
+	let ws_tx: Arc<tokio::sync::Mutex<_>> = Arc::new(tokio::sync::Mutex::new(ws_tx));
+
+	// Heartbeat task - sends ping frames to keep connection alive
 	let user_id_clone = user_id.clone();
+	let ws_tx_heartbeat = ws_tx.clone();
 	let heartbeat_task = tokio::spawn(async move {
 		let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
 		loop {
 			interval.tick().await;
 			debug!("RTDB heartbeat: {}", user_id_clone);
+
+			// Send ping frame to keep connection alive
+			let mut tx = ws_tx_heartbeat.lock().await;
+			if tx.send(Message::Ping(vec![].into())).await.is_err() {
+				debug!("Client disconnected during heartbeat");
+				return;
+			}
 		}
 	});
-
-	// Split WebSocket for concurrent read/write
-	let (ws_tx, ws_rx) = ws.split();
-	let ws_tx: Arc<tokio::sync::Mutex<_>> = Arc::new(tokio::sync::Mutex::new(ws_tx));
 
 	// WebSocket receive task - handles incoming commands
 	let conn_clone = conn.clone();

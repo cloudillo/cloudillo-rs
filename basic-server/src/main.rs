@@ -89,7 +89,7 @@ async fn main() {
 		auto_evict: true,
 	};
 	let crdt_adapter = Arc::new(
-		CrdtAdapterRedb::new(config.db_dir.join("crdt"), false, crdt_config)
+		CrdtAdapterRedb::new(config.db_dir.join("crdt"), true, crdt_config)
 			.await
 			.unwrap(),
 	);

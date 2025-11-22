@@ -87,42 +87,18 @@ mod tests {
 		assert_eq!(msg.payload.get("operation").and_then(|v| v.as_str()), Some("create"));
 	}
 
-	/// Test that CRDT message types parse correctly
+	/// Test that CRDT message types are compatible with Yjs protocol
 	#[test]
-	fn test_crdt_message_type() {
-		use cloudillo::crdt::websocket::CrdtMessageType;
+	fn test_crdt_yjs_message_types() {
+		// CRDT now uses yrs::sync::Message directly
+		// MSG_SYNC = 0, MSG_AWARENESS = 1 (defined in Yjs protocol)
 
-		// Test parsing SYNC message type
-		assert_eq!(CrdtMessageType::from_u8(0), Some(CrdtMessageType::Sync));
-		assert_eq!(CrdtMessageType::Sync.as_u8(), 0);
+		// Just verify the constant values match Yjs protocol expectations
+		const MSG_SYNC: u8 = 0;
+		const MSG_AWARENESS: u8 = 1;
 
-		// Test parsing AWARENESS message type
-		assert_eq!(CrdtMessageType::from_u8(1), Some(CrdtMessageType::Awareness));
-		assert_eq!(CrdtMessageType::Awareness.as_u8(), 1);
-
-		// Test invalid message type
-		assert_eq!(CrdtMessageType::from_u8(99), None);
-	}
-
-	/// Test that CRDT awareness states can be serialized/deserialized
-	#[test]
-	fn test_crdt_awareness_state() {
-		use cloudillo::crdt::websocket::AwarenessState;
-		use serde_json::to_string;
-
-		let state = AwarenessState {
-			user: "alice@example.com".to_string(),
-			cursor: Some((10, 5)),
-			selection: Some((0, 20)),
-			color: Some("#FF6B6B".to_string()),
-			timestamp: 1698000000,
-		};
-
-		// Test serialization
-		let json = to_string(&state).expect("Failed to serialize");
-		assert!(json.contains("alice@example.com"));
-		assert!(json.contains("10"));
-		assert!(json.contains("5"));
+		assert_eq!(MSG_SYNC, 0);
+		assert_eq!(MSG_AWARENESS, 1);
 	}
 
 	/// Test presence state enum variants

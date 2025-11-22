@@ -12,9 +12,9 @@ use crate::rtdb;
 use axum::{
 	extract::ws::WebSocketUpgrade,
 	extract::{Path, State},
-	http::StatusCode,
-	response::{IntoResponse, Response},
+	response::Response,
 };
+use futures::SinkExt;
 
 /// WebSocket upgrade handler for the notification bus
 ///
@@ -36,8 +36,17 @@ pub async fn get_ws_bus(
 		}
 		None => {
 			warn!("Bus WebSocket rejected - no authentication");
-			// Return 401 Unauthorized for WebSocket
-			StatusCode::UNAUTHORIZED.into_response()
+			// Upgrade the WebSocket to send a proper close frame
+			ws.on_upgrade(|mut socket| async move {
+				use axum::extract::ws::{CloseFrame, Message};
+				let _ = socket
+					.send(Message::Close(Some(CloseFrame {
+						code: 4401,
+						reason: "Unauthorized - authentication required".into(),
+					})))
+					.await;
+				let _ = socket.close().await;
+			})
 		}
 	}
 }
@@ -68,7 +77,17 @@ pub async fn get_ws_rtdb(
 		}
 		None => {
 			warn!("RTDB WebSocket rejected - no authentication");
-			StatusCode::UNAUTHORIZED.into_response()
+			// Upgrade the WebSocket to send a proper close frame
+			ws.on_upgrade(|mut socket| async move {
+				use axum::extract::ws::{CloseFrame, Message};
+				let _ = socket
+					.send(Message::Close(Some(CloseFrame {
+						code: 4401,
+						reason: "Unauthorized - authentication required".into(),
+					})))
+					.await;
+				let _ = socket.close().await;
+			})
 		}
 	}
 }
@@ -83,6 +102,8 @@ pub async fn get_ws_crdt(
 	State(app): State<crate::core::app::App>,
 	OptionalAuth(auth): OptionalAuth,
 ) -> Response {
+	use tracing::warn;
+
 	match auth {
 		Some(auth_ctx) => {
 			let user_id = auth_ctx.id_tag.to_string();
@@ -91,7 +112,20 @@ pub async fn get_ws_crdt(
 				crdt::handle_crdt_connection(socket, user_id, doc_id, app, tn_id)
 			})
 		}
-		None => StatusCode::UNAUTHORIZED.into_response(),
+		None => {
+			warn!("CRDT WebSocket rejected - no authentication");
+			// Upgrade the WebSocket to send a proper close frame
+			ws.on_upgrade(|mut socket| async move {
+				use axum::extract::ws::{CloseFrame, Message};
+				let _ = socket
+					.send(Message::Close(Some(CloseFrame {
+						code: 4401,
+						reason: "Unauthorized - authentication required".into(),
+					})))
+					.await;
+				let _ = socket.close().await;
+			})
+		}
 	}
 }
 

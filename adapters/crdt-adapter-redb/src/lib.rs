@@ -85,8 +85,11 @@ impl Default for AdapterConfig {
 mod tables {
 	use redb::TableDefinition;
 
-	/// Stores binary CRDT updates: (doc_id:update_seq) -> update_bytes
-	pub const TABLE_UPDATES: TableDefinition<&str, &[u8]> = TableDefinition::new("crdt_updates");
+	/// Stores binary CRDT updates using structured binary keys
+	/// Key format: [version:u8][doc_id:24bytes][type:u8][seq:u64_be]
+	/// Total key size: 1 + 24 + 1 + 8 = 34 bytes
+	pub const TABLE_UPDATES: TableDefinition<&[u8], &[u8]> =
+		TableDefinition::new("crdt_updates_v2");
 
 	/// Stores document metadata: doc_id -> metadata_json
 	pub const TABLE_METADATA: TableDefinition<&str, &str> = TableDefinition::new("crdt_metadata");
@@ -96,6 +99,97 @@ mod tables {
 }
 
 use tables::*;
+
+/// Record types for binary keys
+mod record_type {
+	/// CRDT update record
+	pub const UPDATE: u8 = 0;
+	/// State vector record (reserved for future use)
+	#[allow(dead_code)]
+	pub const STATE_VECTOR: u8 = 1;
+	/// Metadata record (reserved for future use)
+	#[allow(dead_code)]
+	pub const METADATA: u8 = 2;
+}
+
+/// Binary key encoding for CRDT storage
+///
+/// Key structure: [version:u8][doc_id:24bytes][type:u8][seq:u64_be]
+/// - version: Protocol version (currently 1)
+/// - doc_id: Fixed 24-character document ID
+/// - type: Record type (0=update, 1=state_vector, 2=metadata)
+/// - seq: Sequence number in big-endian (for proper sorting)
+mod key_encoding {
+	use super::record_type;
+
+	/// Current protocol version
+	const VERSION: u8 = 1;
+
+	/// Fixed document ID length
+	pub const DOC_ID_LEN: usize = 24;
+
+	/// Total key length: version(1) + doc_id(24) + type(1) + seq(8)
+	pub const KEY_LEN: usize = 1 + DOC_ID_LEN + 1 + 8;
+
+	/// Encode a key for an update record
+	pub fn encode_update_key(doc_id: &str, seq: u64) -> [u8; KEY_LEN] {
+		encode_key(doc_id, record_type::UPDATE, seq)
+	}
+
+	/// Encode a key for any record type
+	fn encode_key(doc_id: &str, record_type: u8, seq: u64) -> [u8; KEY_LEN] {
+		let mut key = [0u8; KEY_LEN];
+
+		// Version byte
+		key[0] = VERSION;
+
+		// Doc ID (24 bytes, pad with zeros if shorter)
+		let doc_bytes = doc_id.as_bytes();
+		let copy_len = doc_bytes.len().min(DOC_ID_LEN);
+		key[1..1 + copy_len].copy_from_slice(&doc_bytes[..copy_len]);
+
+		// Record type
+		key[1 + DOC_ID_LEN] = record_type;
+
+		// Sequence number (big-endian for proper sorting)
+		let seq_bytes = seq.to_be_bytes();
+		key[1 + DOC_ID_LEN + 1..].copy_from_slice(&seq_bytes);
+
+		key
+	}
+
+	/// Create a range key for scanning all updates of a document
+	pub fn make_doc_range(doc_id: &str) -> ([u8; KEY_LEN], [u8; KEY_LEN]) {
+		let start = encode_key(doc_id, record_type::UPDATE, 0);
+		let end = encode_key(doc_id, record_type::UPDATE, u64::MAX);
+		(start, end)
+	}
+
+	/// Extract doc_id from a key (reserved for future use)
+	#[allow(dead_code)]
+	pub fn decode_doc_id(key: &[u8]) -> Option<String> {
+		if key.len() < 1 + DOC_ID_LEN {
+			return None;
+		}
+
+		let doc_bytes = &key[1..1 + DOC_ID_LEN];
+		// Trim trailing zeros (padding)
+		let end = doc_bytes.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+
+		String::from_utf8(doc_bytes[..end].to_vec()).ok()
+	}
+
+	/// Extract sequence number from a key
+	#[allow(dead_code)]
+	pub fn decode_seq(key: &[u8]) -> Option<u64> {
+		if key.len() < KEY_LEN {
+			return None;
+		}
+
+		let seq_bytes: [u8; 8] = key[1 + DOC_ID_LEN + 1..].try_into().ok()?;
+		Some(u64::from_be_bytes(seq_bytes))
+	}
+}
 
 /// Per-document broadcast channel for changes
 type DocBroadcaster = tokio::sync::broadcast::Sender<CrdtChangeEvent>;
@@ -239,11 +333,6 @@ impl CrdtAdapterRedb {
 
 		Ok(instance)
 	}
-
-	/// Build a key for storing updates (doc_id + sequence number)
-	fn make_update_key(doc_id: &str, seq: u64) -> String {
-		format!("{}:{}", doc_id, seq)
-	}
 }
 
 #[async_trait::async_trait]
@@ -261,20 +350,17 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		})?;
 
 		let mut updates = Vec::new();
-		let prefix = format!("{}:", doc_id);
+
+		// Use binary key range for efficient scanning
+		let (range_start, range_end) = key_encoding::make_doc_range(doc_id);
 		let range = updates_table
-			.range(prefix.as_str()..)
+			.range(range_start.as_slice()..=range_end.as_slice())
 			.map_err(|e| ClError::from(Error::DbError(format!("Failed to read updates: {}", e))))?;
 
 		for item in range {
-			let (key, value) = item.map_err(|e| {
+			let (_key, value) = item.map_err(|e| {
 				ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
 			})?;
-
-			let key_str = key.value();
-			if !key_str.starts_with(&prefix) {
-				break;
-			}
 
 			let update_data = value.value().to_vec();
 			updates.push(CrdtUpdate::new(update_data));
@@ -302,8 +388,9 @@ impl CrdtAdapter for CrdtAdapterRedb {
 				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
 			})?;
 
-			let key = Self::make_update_key(doc_id, seq);
-			updates_table.insert(key.as_str(), update.data.as_slice()).map_err(|e| {
+			// Use binary key encoding
+			let key = key_encoding::encode_update_key(doc_id, seq);
+			updates_table.insert(key.as_slice(), update.data.as_slice()).map_err(|e| {
 				ClError::from(Error::DbError(format!("Failed to insert update: {}", e)))
 			})?;
 		}
@@ -434,32 +521,34 @@ impl CrdtAdapter for CrdtAdapterRedb {
 
 			// Delete all updates for this document
 			// First collect keys to avoid borrow conflicts
-			let prefix = format!("{}:", doc_id);
 			let mut keys_to_delete = Vec::new();
 			{
-				let range = updates_table.range(prefix.as_str()..).map_err(|e| {
-					ClError::from(Error::DbError(format!("Failed to read updates: {}", e)))
-				})?;
+				let (range_start, range_end) = key_encoding::make_doc_range(doc_id);
+				let range =
+					updates_table.range(range_start.as_slice()..=range_end.as_slice()).map_err(
+						|e| ClError::from(Error::DbError(format!("Failed to read updates: {}", e))),
+					)?;
 
 				for item in range {
 					let (key, _) = item.map_err(|e| {
 						ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
 					})?;
 
-					let key_str = key.value();
-					if !key_str.starts_with(&prefix) {
-						break;
-					}
-					keys_to_delete.push(key_str.to_string());
+					keys_to_delete.push(key.value().to_vec());
 				}
 			}
 
+			info!("Deleting {} updates for doc {}", keys_to_delete.len(), doc_id);
+
 			// Now delete the collected keys
-			for key_str in keys_to_delete {
-				updates_table.remove(key_str.as_str()).map_err(|e| {
+			for key in &keys_to_delete {
+				trace!("Deleting key for doc {}", doc_id);
+				updates_table.remove(key.as_slice()).map_err(|e| {
 					ClError::from(Error::DbError(format!("Failed to delete update: {}", e)))
 				})?;
 			}
+
+			info!("Deleted {} keys for doc {}", keys_to_delete.len(), doc_id);
 
 			// Delete metadata
 			metadata_table.remove(doc_id).map_err(|e| {
