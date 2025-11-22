@@ -76,7 +76,7 @@ impl SettingsService {
 			return Ok(value);
 		}
 
-		// Get definition
+		// Get definition (supports wildcard patterns like "ui.*")
 		let def = self
 			.registry
 			.get(key)
@@ -123,7 +123,7 @@ impl SettingsService {
 		value: SettingValue,
 		roles: &[S],
 	) -> ClResult<Setting> {
-		// Get definition
+		// Get definition (supports wildcard patterns like "ui.*")
 		let def = self
 			.registry
 			.get(key)

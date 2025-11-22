@@ -7,13 +7,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::core::extract::OptionalRequestId;
+use crate::core::extract::{OptionalAuth, OptionalRequestId};
 use crate::core::utils;
 use crate::meta_adapter::{CreateRefOptions, ListRefsOptions, RefData};
 use crate::prelude::*;
 use crate::types::{ApiResponse, Timestamp};
 
-/// Response structure for ref details
+/// Response structure for ref details (authenticated users get full data)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefResponse {
 	#[serde(rename = "refId")]
@@ -27,6 +27,14 @@ pub struct RefResponse {
 	pub count: u32,
 }
 
+/// Minimal response structure for unauthenticated requests (only refId and type)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefResponseMinimal {
+	#[serde(rename = "refId")]
+	pub ref_id: String,
+	pub r#type: String,
+}
+
 impl From<RefData> for RefResponse {
 	fn from(ref_data: RefData) -> Self {
 		Self {
@@ -37,6 +45,12 @@ impl From<RefData> for RefResponse {
 			expires_at: ref_data.expires_at.map(|ts| ts.0),
 			count: ref_data.count,
 		}
+	}
+}
+
+impl From<RefData> for RefResponseMinimal {
+	fn from(ref_data: RefData) -> Self {
+		Self { ref_id: ref_data.ref_id.to_string(), r#type: ref_data.r#type.to_string() }
 	}
 }
 
@@ -147,16 +161,22 @@ pub async fn create_ref(
 }
 
 /// GET /api/refs/{ref_id} - Get a specific ref by ID
+///
+/// Returns full ref details if authenticated, only refId and type if not authenticated.
 #[axum::debug_handler]
 pub async fn get_ref(
 	State(app): State<App>,
 	tn_id: TnId,
+	OptionalAuth(auth): OptionalAuth,
 	Path(ref_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<RefResponse>>)> {
+) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
+	let is_authenticated = auth.is_some();
+
 	info!(
 		tn_id = ?tn_id,
 		ref_id = %ref_id,
+		authenticated = is_authenticated,
 		"GET /api/refs/:id - Getting ref"
 	);
 
@@ -174,13 +194,26 @@ pub async fn get_ref(
 		.find(|r| r.ref_id.as_ref() == ref_id.as_str())
 		.ok_or(Error::NotFound)?;
 
-	let response_data = RefResponse::from(ref_data);
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	// Return different response based on authentication
+	let response_value = if is_authenticated {
+		// Authenticated: return full details
+		let response_data = RefResponse::from(ref_data);
+		let mut response = ApiResponse::new(response_data);
+		if let Some(id) = req_id {
+			response = response.with_req_id(id);
+		}
+		serde_json::to_value(response)?
+	} else {
+		// Unauthenticated: return only refId and type
+		let response_data = RefResponseMinimal::from(ref_data);
+		let mut response = ApiResponse::new(response_data);
+		if let Some(id) = req_id {
+			response = response.with_req_id(id);
+		}
+		serde_json::to_value(response)?
+	};
 
-	Ok((StatusCode::OK, Json(response)))
+	Ok((StatusCode::OK, Json(response_value)))
 }
 
 /// DELETE /api/refs/{ref_id} - Delete/revoke a ref
@@ -212,6 +245,69 @@ pub async fn delete_ref(
 	}
 
 	Ok((StatusCode::OK, Json(response)))
+}
+
+/// Internal API function to create a ref programmatically
+///
+/// This is a helper function for internal use (not an HTTP endpoint).
+/// It creates a ref with the given parameters and returns the ref_id and full URL.
+///
+/// # Arguments
+/// * `app` - Application state
+/// * `tn_id` - Tenant ID
+/// * `id_tag` - The id_tag for constructing the URL
+/// * `typ` - Type of reference (e.g., "welcome", "email-verify")
+/// * `description` - Optional human-readable description
+/// * `expires_at` - Optional expiration timestamp
+/// * `path_prefix` - URL path prefix (e.g., "/onboarding/welcome")
+///
+/// # Returns
+/// * `ref_id` - The generated reference ID
+/// * `url` - The complete URL for the reference
+pub async fn create_ref_internal(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	typ: &str,
+	description: Option<&str>,
+	expires_at: Option<Timestamp>,
+	path_prefix: &str,
+) -> ClResult<(String, String)> {
+	// Generate random ref_id
+	let ref_id = utils::random_id()?;
+
+	// Create ref options
+	let ref_opts = CreateRefOptions {
+		typ: typ.to_string(),
+		description: description.map(|s| s.to_string()),
+		expires_at,
+		count: Some(1), // Single use by default
+	};
+
+	// Store the reference in database
+	app.meta_adapter.create_ref(tn_id, &ref_id, &ref_opts).await.map_err(|e| {
+		warn!(
+			error = %e,
+			tn_id = ?tn_id,
+			ref_id = %ref_id,
+			typ = %typ,
+			"Failed to create reference"
+		);
+		e
+	})?;
+
+	// Construct the full URL
+	let url = format!("https://{}{}/{}", id_tag, path_prefix, ref_id);
+
+	info!(
+		tn_id = ?tn_id,
+		ref_id = %ref_id,
+		typ = %typ,
+		url = %url,
+		"Created reference successfully"
+	);
+
+	Ok((ref_id, url))
 }
 
 // vim: ts=4

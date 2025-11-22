@@ -156,7 +156,7 @@ pub(crate) async fn use_ref(
 	let row = sqlx::query(
 		"SELECT r.tn_id, r.type, r.count, r.expires_at, t.id_tag
 		 FROM refs r
-		 INNER JOIN tenants t ON r.tn_id = t.id
+		 INNER JOIN tenants t ON r.tn_id = t.tn_id
 		 WHERE r.ref_id = ?",
 	)
 	.bind(ref_id)

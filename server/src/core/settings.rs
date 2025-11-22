@@ -19,6 +19,26 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Wildcard pattern for UI settings - allows storing arbitrary UI preferences
+	registry.register(
+		SettingDefinition::builder("ui.*")
+			.description("User interface settings and preferences")
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.optional(true)
+			.build()?,
+	)?;
+
+	// Wildcard pattern for application settings - allows storing arbitrary app state
+	registry.register(
+		SettingDefinition::builder("app.*")
+			.description("Application-specific settings and state")
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.optional(true)
+			.build()?,
+	)?;
+
 	Ok(())
 }
 

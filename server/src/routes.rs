@@ -80,7 +80,6 @@ fn init_api_service(app: App) -> Router {
 
 	let protected_router = Router::new()
 		//.route("/api/key", post(action::handler::create_key))
-		.route("/api/auth/login-token", get(auth::handler::get_login_token))
 		.route("/api/auth/logout", post(auth::handler::post_logout))
 		.route("/api/auth/proxy-token", get(auth::handler::get_proxy_token))
 
@@ -89,10 +88,9 @@ fn init_api_service(app: App) -> Router {
 		.route("/api/settings/{name}", get(settings::handler::get_setting))
 		.route("/api/settings/{name}", put(settings::handler::update_setting))
 
-		// Reference API
+		// Reference API (authenticated only)
 		.route("/api/refs", get(r#ref::handler::list_refs))
 		.route("/api/refs", post(r#ref::handler::create_ref))
-		.route("/api/refs/{ref_id}", get(r#ref::handler::get_ref))
 		.route("/api/refs/{ref_id}", delete(r#ref::handler::delete_ref))
 
 		// Action API
@@ -146,8 +144,12 @@ fn init_api_service(app: App) -> Router {
 		.route("/api/auth/register", post(auth::register::post_register))
 		.route("/api/auth/register-verify", post(auth::register::post_register_verify))
 		.route("/api/auth/login", post(auth::handler::post_login))
+		.route("/api/auth/login-token", get(auth::handler::get_login_token))
 		.route("/api/auth/set-password", post(auth::handler::post_set_password))
 		.route("/api/auth/access-token", get(auth::handler::get_access_token))
+
+		// Reference API (public GET endpoint - returns limited data without auth)
+		.route("/api/refs/{ref_id}", get(r#ref::handler::get_ref))
 
 		// IDP Public API
 		.route("/api/idp/check-availability", get(idp::handler::check_identity_availability))

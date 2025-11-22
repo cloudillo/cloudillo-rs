@@ -7,7 +7,7 @@ use crate::{
 	action::task,
 	auth_adapter,
 	core::{
-		extract::{IdTag, OptionalRequestId},
+		extract::{IdTag, OptionalAuth, OptionalRequestId},
 		Auth,
 	},
 	prelude::*,
@@ -111,19 +111,27 @@ pub async fn post_login(
 /// # GET /api/auth/login-token
 pub async fn get_login_token(
 	State(app): State<App>,
-	Auth(auth): Auth,
+	OptionalAuth(auth): OptionalAuth,
 	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
-	info!("login-token for {}", &auth.id_tag);
-	let auth = app.auth_adapter.create_tenant_login(&auth.id_tag).await;
-	if let Ok(auth) = auth {
-		info!("token: {}", &auth.token);
-		let (_status, Json(login_data)) = return_login(&app, auth).await?;
-		let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
-		Ok((StatusCode::OK, Json(response)))
+) -> ClResult<(StatusCode, Json<ApiResponse<Option<Login>>>)> {
+	if let Some(auth) = auth {
+		info!("login-token for {}", &auth.id_tag);
+		let auth = app.auth_adapter.create_tenant_login(&auth.id_tag).await;
+		if let Ok(auth) = auth {
+			info!("token: {}", &auth.token);
+			let (_status, Json(login_data)) = return_login(&app, auth).await?;
+			let response =
+				ApiResponse::new(Some(login_data)).with_req_id(req_id.unwrap_or_default());
+			Ok((StatusCode::OK, Json(response)))
+		} else {
+			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+			Err(Error::PermissionDenied)
+		}
 	} else {
-		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-		Err(Error::PermissionDenied)
+		// No authentication - return empty result
+		info!("login-token called without authentication");
+		let response = ApiResponse::new(None).with_req_id(req_id.unwrap_or_default());
+		Ok((StatusCode::OK, Json(response)))
 	}
 }
 

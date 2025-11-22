@@ -305,8 +305,22 @@ pub struct FrozenSettingsRegistry {
 
 impl FrozenSettingsRegistry {
 	/// Get a setting definition by key
+	/// First tries exact match, then tries wildcard pattern "<first_element>.*"
 	pub fn get(&self, key: &str) -> Option<&SettingDefinition> {
-		self.definitions.get(key)
+		// Try exact match first
+		if let Some(def) = self.definitions.get(key) {
+			return Some(def);
+		}
+
+		// Try wildcard pattern: extract first element and append ".*"
+		if let Some(dot_pos) = key.find('.') {
+			let wildcard_key = format!("{}.*", &key[..dot_pos]);
+			if let Some(def) = self.definitions.get(&wildcard_key) {
+				return Some(def);
+			}
+		}
+
+		None
 	}
 
 	/// List all registered settings

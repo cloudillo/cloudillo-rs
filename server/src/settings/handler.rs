@@ -60,7 +60,7 @@ pub async fn get_setting(
 	Path(name): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SettingResponse>>)> {
-	// Get setting definition
+	// Get setting definition (supports wildcard patterns like "ui.*")
 	let definition = app.settings_registry.get(&name).ok_or(Error::NotFound)?;
 
 	// Get current value with three-level resolution

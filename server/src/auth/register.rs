@@ -283,128 +283,6 @@ pub async fn post_register_verify(
 	Ok((StatusCode::OK, Json(validation_result)))
 }
 
-/// Create tenant and profile with automatic cleanup on failure
-///
-/// This helper creates a tenant and initial profile, deriving the display name
-/// from the id_tag. If profile creation fails, it automatically cleans up the
-/// tenant before returning an error. Also handles ACME certificate creation
-/// and sends a welcome email.
-///
-/// # Arguments
-/// * `app` - Application state
-/// * `id_tag` - User's identity tag
-/// * `email` - User's email address
-/// * `welcome_link` - Optional welcome link for IDP registrations
-async fn create_tenant_and_profile(
-	app: &crate::core::app::App,
-	id_tag: &str,
-	email: &str,
-	welcome_link: Option<String>,
-) -> ClResult<TnId> {
-	use crate::bootstrap::{create_complete_tenant, CreateCompleteTenantOptions};
-
-	// Derive display name from id_tag (capitalize first letter of prefix)
-	let display_name = if id_tag.contains('.') {
-		let parts: Vec<&str> = id_tag.split('.').collect();
-		if !parts.is_empty() {
-			let name = parts[0];
-			format!("{}{}", name.chars().next().unwrap_or('U').to_uppercase(), &name[1..])
-		} else {
-			id_tag.to_string()
-		}
-	} else {
-		id_tag.to_string()
-	};
-
-	// Use the unified tenant creation function
-	let tn_id = create_complete_tenant(
-		app,
-		CreateCompleteTenantOptions {
-			id_tag,
-			email: Some(email),
-			password: None,
-			roles: None,
-			display_name: Some(&display_name),
-			create_acme_cert: app.opts.acme_email.is_some(),
-			acme_email: app.opts.acme_email.as_deref(),
-			app_domain: None, // Use id_tag as domain
-		},
-	)
-	.await?;
-
-	info!(
-		id_tag = %id_tag,
-		tn_id = ?tn_id,
-		"Complete tenant created successfully"
-	);
-
-	// Create initial profile in meta adapter
-	let profile = Profile {
-		id_tag,
-		name: &display_name,
-		typ: ProfileType::Person,
-		profile_pic: None,
-		following: false,
-		connected: false,
-	};
-
-	if let Err(e) = app.meta_adapter.create_profile(tn_id, &profile, "").await {
-		// Profile creation failed - this is not critical as tenant exists
-		warn!(
-			error = %e,
-			id_tag = %id_tag,
-			tn_id = ?tn_id,
-			"Failed to create profile (tenant exists but profile missing)"
-		);
-		// Don't clean up tenant - user can still use the account
-	}
-
-	// Send welcome email
-	let mut template_vars = serde_json::json!({
-		"user_name": id_tag,
-		"instance_name": "Cloudillo",
-	});
-
-	// Add welcome link if provided (IDP registrations)
-	if let Some(link) = welcome_link {
-		template_vars["welcome_link"] = serde_json::json!(link);
-	}
-
-	match crate::email::EmailModule::schedule_email_task(
-		&app.scheduler,
-		&app.settings,
-		tn_id,
-		crate::email::EmailTaskParams {
-			to: email.to_string(),
-			subject: "Welcome to Cloudillo".to_string(),
-			template_name: "welcome".to_string(),
-			template_vars,
-			custom_key: None,
-		},
-	)
-	.await
-	{
-		Ok(_) => {
-			info!(
-				email = %email,
-				id_tag = %id_tag,
-				"Welcome email queued"
-			);
-		}
-		Err(e) => {
-			warn!(
-				error = %e,
-				email = %email,
-				id_tag = %id_tag,
-				"Failed to queue welcome email, continuing registration"
-			);
-			// Don't fail registration if email queueing fails
-		}
-	}
-
-	Ok(tn_id)
-}
-
 /// Handle IDP registration flow
 async fn handle_idp_registration(
 	app: &crate::core::app::App,
@@ -440,7 +318,6 @@ async fn handle_idp_registration(
 	let reg_content = IdpRegContent { id_tag: id_tag_lower.clone(), email: email.clone(), address };
 
 	// Create action to generate JWT token
-	let tn_id = TnId(1); // Use base tenant for creating the action
 	let action = CreateAction {
 		typ: "IDP:REG".into(),
 		sub_typ: None,
@@ -454,7 +331,7 @@ async fn handle_idp_registration(
 	};
 
 	// Generate action JWT token
-	let action_token = app.auth_adapter.create_action_token(tn_id, action).await?;
+	let action_token = app.auth_adapter.create_action_token(TnId(1), action).await?;
 
 	// Prepare inbox request with token
 	#[derive(serde::Serialize)]
@@ -514,12 +391,115 @@ async fn handle_idp_registration(
 		"IDP registration successful, creating local tenant"
 	);
 
-	// Create welcome reference first (generates the ref_id for the link)
-	let ref_id = crate::core::utils::random_id()?;
-	let welcome_link = format!("https://{}/onboarding/welcome/{}", id_tag_lower, ref_id);
+	// IMPORTANT: Create tenant first to get the tn_id, then create the welcome ref
+	// We need to do this in two steps because create_ref_internal needs the tn_id
 
-	// Create local tenant and profile (includes ACME and email sending)
-	let tn_id = create_tenant_and_profile(app, &id_tag_lower, &email, Some(welcome_link)).await?;
+	// Temporarily create tenant without welcome link
+	use crate::bootstrap::{create_complete_tenant, CreateCompleteTenantOptions};
+
+	// Derive display name from id_tag (capitalize first letter of prefix)
+	let display_name = if id_tag_lower.contains('.') {
+		let parts: Vec<&str> = id_tag_lower.split('.').collect();
+		if !parts.is_empty() {
+			let name = parts[0];
+			format!("{}{}", name.chars().next().unwrap_or('U').to_uppercase(), &name[1..])
+		} else {
+			id_tag_lower.clone()
+		}
+	} else {
+		id_tag_lower.clone()
+	};
+
+	// Create tenant first
+	let tn_id = create_complete_tenant(
+		app,
+		CreateCompleteTenantOptions {
+			id_tag: &id_tag_lower,
+			email: Some(&email),
+			password: None,
+			roles: None,
+			display_name: Some(&display_name),
+			create_acme_cert: app.opts.acme_email.is_some(),
+			acme_email: app.opts.acme_email.as_deref(),
+			app_domain: None,
+		},
+	)
+	.await?;
+
+	info!(
+		id_tag = %id_tag_lower,
+		tn_id = ?tn_id,
+		"Tenant created successfully for IDP registration"
+	);
+
+	// Now create the welcome reference using the new create_ref_internal function
+	let (_ref_id, welcome_link) = crate::r#ref::handler::create_ref_internal(
+		app,
+		tn_id,
+		&id_tag_lower,
+		"welcome",
+		Some("Welcome to Cloudillo"),
+		Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
+		"/onboarding/welcome",
+	)
+	.await?;
+
+	// Create profile and send welcome email
+	let profile = Profile {
+		id_tag: id_tag_lower.as_str(),
+		name: display_name.as_str(),
+		typ: ProfileType::Person,
+		profile_pic: None,
+		following: false,
+		connected: false,
+	};
+
+	if let Err(e) = app.meta_adapter.create_profile(tn_id, &profile, "").await {
+		warn!(
+			error = %e,
+			id_tag = %id_tag_lower,
+			tn_id = ?tn_id,
+			"Failed to create profile (tenant exists but profile missing)"
+		);
+	}
+
+	// Send welcome email with the welcome link
+	let template_vars = serde_json::json!({
+		"user_name": id_tag_lower,
+		"instance_name": "Cloudillo",
+		"welcome_link": welcome_link,
+	});
+
+	match crate::email::EmailModule::schedule_email_task(
+		&app.scheduler,
+		&app.settings,
+		tn_id,
+		crate::email::EmailTaskParams {
+			to: email.clone(),
+			subject: "Welcome to Cloudillo".to_string(),
+			template_name: "welcome".to_string(),
+			template_vars,
+			custom_key: None,
+		},
+	)
+	.await
+	{
+		Ok(_) => {
+			info!(
+				email = %email,
+				id_tag = %id_tag_lower,
+				"Welcome email queued for IDP registration"
+			);
+		}
+		Err(e) => {
+			warn!(
+				error = %e,
+				email = %email,
+				id_tag = %id_tag_lower,
+				"Failed to queue welcome email, continuing registration"
+			);
+		}
+	}
 
 	// Store IDP API key if provided
 	if let Some(api_key) = &idp_reg_result.api_key {
@@ -535,24 +515,6 @@ async fn handle_idp_registration(
 			);
 			// Continue anyway - this is not critical for basic functionality
 		}
-	}
-
-	// Store the welcome reference in database
-	let ref_opts = crate::meta_adapter::CreateRefOptions {
-		typ: "welcome".to_string(),
-		description: Some("Welcome to Cloudillo".to_string()),
-		expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
-		count: Some(1),                                             // Can be used once
-	};
-
-	if let Err(e) = app.meta_adapter.create_ref(tn_id, &ref_id, &ref_opts).await {
-		warn!(
-			error = %e,
-			tn_id = ?tn_id,
-			ref_id = %ref_id,
-			"Failed to create welcome reference"
-		);
-		// Continue anyway - this is not critical
 	}
 
 	// Return empty response
@@ -579,8 +541,112 @@ async fn handle_domain_registration(
 		return Err(Error::ValidationError("invalid id_tag or app_domain".into()));
 	}
 
-	// Create tenant and profile (includes ACME and email sending)
-	let _tn_id = create_tenant_and_profile(app, &id_tag_lower, &email, None).await?;
+	// Create tenant first to get the tn_id
+	use crate::bootstrap::{create_complete_tenant, CreateCompleteTenantOptions};
+
+	// Derive display name from id_tag (capitalize first letter of prefix)
+	let display_name = if id_tag_lower.contains('.') {
+		let parts: Vec<&str> = id_tag_lower.split('.').collect();
+		if !parts.is_empty() {
+			let name = parts[0];
+			format!("{}{}", name.chars().next().unwrap_or('U').to_uppercase(), &name[1..])
+		} else {
+			id_tag_lower.clone()
+		}
+	} else {
+		id_tag_lower.clone()
+	};
+
+	// Create tenant
+	let tn_id = create_complete_tenant(
+		app,
+		CreateCompleteTenantOptions {
+			id_tag: &id_tag_lower,
+			email: Some(&email),
+			password: None,
+			roles: None,
+			display_name: Some(&display_name),
+			create_acme_cert: app.opts.acme_email.is_some(),
+			acme_email: app.opts.acme_email.as_deref(),
+			app_domain: app_domain.as_deref(),
+		},
+	)
+	.await?;
+
+	info!(
+		id_tag = %id_tag_lower,
+		tn_id = ?tn_id,
+		"Tenant created successfully for domain registration"
+	);
+
+	// Create welcome reference using the new create_ref_internal function
+	let (_ref_id, welcome_link) = crate::r#ref::handler::create_ref_internal(
+		app,
+		tn_id,
+		&id_tag_lower,
+		"welcome",
+		Some("Welcome to Cloudillo"),
+		Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
+		"/onboarding/welcome",
+	)
+	.await?;
+
+	// Create profile
+	let profile = Profile {
+		id_tag: id_tag_lower.as_str(),
+		name: display_name.as_str(),
+		typ: ProfileType::Person,
+		profile_pic: None,
+		following: false,
+		connected: false,
+	};
+
+	if let Err(e) = app.meta_adapter.create_profile(tn_id, &profile, "").await {
+		warn!(
+			error = %e,
+			id_tag = %id_tag_lower,
+			tn_id = ?tn_id,
+			"Failed to create profile (tenant exists but profile missing)"
+		);
+	}
+
+	// Send welcome email with the welcome link
+	let template_vars = serde_json::json!({
+		"user_name": id_tag_lower,
+		"instance_name": "Cloudillo",
+		"welcome_link": welcome_link,
+	});
+
+	match crate::email::EmailModule::schedule_email_task(
+		&app.scheduler,
+		&app.settings,
+		tn_id,
+		crate::email::EmailTaskParams {
+			to: email.clone(),
+			subject: "Welcome to Cloudillo".to_string(),
+			template_name: "welcome".to_string(),
+			template_vars,
+			custom_key: None,
+		},
+	)
+	.await
+	{
+		Ok(_) => {
+			info!(
+				email = %email,
+				id_tag = %id_tag_lower,
+				"Welcome email queued for domain registration"
+			);
+		}
+		Err(e) => {
+			warn!(
+				error = %e,
+				email = %email,
+				id_tag = %id_tag_lower,
+				"Failed to queue welcome email, continuing registration"
+			);
+		}
+	}
 
 	// Return empty response (user must login separately)
 	let response = json!({});
