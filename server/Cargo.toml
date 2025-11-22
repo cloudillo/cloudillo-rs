@@ -14,7 +14,7 @@ hmac = "0.12.1"
 #hyper = "1.7.0"
 #hyper-util = "0.1.17"
 image = "0.25.9"
-instant-acme = "0.8.3"
+instant-acme = "0.8.4"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 pem = "3.0.6"
 rustls = "0.23.35"
@@ -47,7 +47,7 @@ parking_lot = "0.12.5"
 lettre = { version = "0.11.19", default-features = false, features = ["builder", "rustls-tls", "tokio1", "tokio1-rustls", "smtp-transport"] }
 regex = "1.12.2"
 hickory-resolver = "0.25"
-yrs = "0.21"
+yrs = "0.24"
 
 [dev-dependencies]
 serde_urlencoded = "0.7"
