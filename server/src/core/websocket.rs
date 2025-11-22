@@ -24,14 +24,14 @@ pub async fn get_ws_bus(
 	State(app): State<crate::core::app::App>,
 	OptionalAuth(auth): OptionalAuth,
 ) -> Response {
-	use tracing::{info, warn};
+	use tracing::{debug, warn};
 
-	info!("WebSocket bus request");
+	debug!("WebSocket bus request");
 
 	match auth {
 		Some(auth_ctx) => {
 			let user_id = auth_ctx.id_tag.to_string();
-			info!("Bus WebSocket authenticated: user_id={}", user_id);
+			debug!("Bus WebSocket authenticated: user_id={}", user_id);
 			ws.on_upgrade(move |socket| ws_bus::handle_bus_connection(socket, user_id, app))
 		}
 		None => {

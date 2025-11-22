@@ -7,7 +7,12 @@ use axum::{
 };
 
 use crate::{
-	core::{abac::Environment, extract::Auth, middleware::PermissionCheckOutput},
+	auth_adapter::AuthCtx,
+	core::{
+		abac::Environment,
+		extract::{IdTag, OptionalAuth},
+		middleware::PermissionCheckOutput,
+	},
 	prelude::*,
 	types::FileAttrs,
 };
@@ -23,15 +28,17 @@ use crate::{
 /// A cloneable middleware function with return type `PermissionCheckOutput`
 pub fn check_perm_file(
 	action: &'static str,
-) -> impl Fn(State<App>, Auth, Path<String>, Request, Next) -> PermissionCheckOutput + Clone {
-	move |state, auth, path, req, next| {
-		Box::pin(check_file_permission(state, auth, path, req, next, action))
+) -> impl Fn(State<App>, IdTag, OptionalAuth, Path<String>, Request, Next) -> PermissionCheckOutput + Clone
+{
+	move |state, id_tag, auth, path, req, next| {
+		Box::pin(check_file_permission(state, id_tag, auth, path, req, next, action))
 	}
 }
 
 async fn check_file_permission(
 	State(app): State<App>,
-	Auth(auth_ctx): Auth,
+	IdTag(domain_id_tag): IdTag,
+	OptionalAuth(maybe_auth_ctx): OptionalAuth,
 	Path(file_id): Path<String>,
 	req: Request,
 	next: Next,
@@ -39,17 +46,37 @@ async fn check_file_permission(
 ) -> Result<Response, Error> {
 	use tracing::warn;
 
-	// Load file attributes (STUB - Phase 3 will implement)
-	let attrs = load_file_attrs(&app, auth_ctx.tn_id, &file_id, &auth_ctx.id_tag).await?;
+	// Get tenant ID from domain
+	let tn_id = app.auth_adapter.read_tn_id(&domain_id_tag).await.map_err(|_| {
+		warn!("Failed to resolve tenant ID for domain: {}", domain_id_tag);
+		Error::PermissionDenied
+	})?;
+
+	// Create auth context or guest context if not authenticated
+	let (auth_ctx, subject_id_tag) = if let Some(auth_ctx) = maybe_auth_ctx {
+		let id_tag = auth_ctx.id_tag.clone();
+		(auth_ctx, id_tag)
+	} else {
+		// For unauthenticated requests, create a guest context
+		let guest_ctx =
+			AuthCtx { tn_id, id_tag: "guest".into(), roles: vec![].into(), scope: None };
+		(guest_ctx, "guest".into())
+	};
+
+	// Load file attributes
+	let attrs = load_file_attrs(&app, tn_id, &file_id, &subject_id_tag).await?;
 
 	// Check permission
 	let environment = Environment::new();
 	let checker = app.permission_checker.read().await;
 
-	if !checker.has_permission(&auth_ctx, action, &attrs, &environment) {
+	// Format action as "file:operation" for ABAC checker
+	let full_action = format!("file:{}", action);
+
+	if !checker.has_permission(&auth_ctx, &full_action, &attrs, &environment) {
 		warn!(
 			subject = %auth_ctx.id_tag,
-			action = action,
+			action = %full_action,
 			file_id = %file_id,
 			visibility = attrs.visibility,
 			owner_id_tag = %attrs.owner_id_tag,

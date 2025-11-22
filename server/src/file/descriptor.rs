@@ -84,7 +84,7 @@ pub fn get_best_file_variant<'a, S: AsRef<str> + Debug + Eq>(
 	variants: &'a Vec<meta_adapter::FileVariant<S>>,
 	selector: &'_ GetFileVariantSelector,
 ) -> ClResult<&'a meta_adapter::FileVariant<S>> {
-	info!("get_best_file_variant: {:?}", selector);
+	debug!("get_best_file_variant: {:?}", selector);
 	let best = match selector.variant.as_deref() {
 		Some("tn") => variants
 			.iter()
@@ -118,7 +118,7 @@ pub fn get_best_file_variant<'a, S: AsRef<str> + Debug + Eq>(
 		Some(_) => Err(Error::NotFound),
 		None => Err(Error::NotFound),
 	};
-	info!("best variant: {:?} {:?}", best, variants);
+	debug!("best variant: {:?} {:?}", best, variants);
 
 	best
 }
@@ -170,9 +170,11 @@ impl Task<App> for FileIdGeneratorTask {
 		let mut hasher = Hasher::new();
 		hasher.update(descriptor.as_bytes());
 		let file_id = hasher.finalize("f");
-		app.meta_adapter.update_file_id(self.tn_id, self.f_id, &file_id).await?;
 
-		info!("Finished task file.id-generate {} {}", descriptor, file_id);
+		// Finalize the file - sets file_id and transitions status from 'P' to 'I' atomically
+		app.meta_adapter.finalize_file(self.tn_id, self.f_id, &file_id).await?;
+
+		info!("Finished task file.id-generate {} → {}", descriptor, file_id);
 		Ok(())
 	}
 }

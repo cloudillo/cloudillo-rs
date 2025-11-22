@@ -281,6 +281,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::update_id(&self.db, tn_id, f_id, file_id).await
 	}
 
+	async fn finalize_file(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()> {
+		file::finalize_file(&self.db, tn_id, f_id, file_id).await
+	}
+
 	// Task scheduler
 	//****************
 	async fn list_tasks(&self, opts: ListTaskOptions) -> ClResult<Vec<Task>> {

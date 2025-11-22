@@ -250,13 +250,50 @@ pub(crate) async fn create_variant<'a>(
 	Ok(opts.variant_id)
 }
 
-/// Update file_id for a pending file
+/// Update file_id for a pending file (idempotent - succeeds if already set to same value)
 pub(crate) async fn update_id(
 	db: &SqlitePool,
 	tn_id: TnId,
 	f_id: u64,
 	file_id: &str,
 ) -> ClResult<()> {
+	// First check if file exists and what its current file_id is
+	let existing = sqlx::query("SELECT file_id FROM files WHERE tn_id=? AND f_id=?")
+		.bind(tn_id.0)
+		.bind(f_id as i64)
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+	match existing {
+		None => {
+			// File doesn't exist at all
+			return Err(Error::NotFound);
+		}
+		Some(row) => {
+			let existing_file_id: Option<String> = row.try_get("file_id").ok().flatten();
+
+			if let Some(existing_id) = existing_file_id {
+				// Already has a file_id - check if it matches
+				if existing_id == file_id {
+					// Idempotent success - already set to the correct value
+					return Ok(());
+				} else {
+					// Different file_id - this is a conflict
+					let msg = format!(
+						"Attempted to update f_id={} to file_id={} but already set to {}",
+						f_id, file_id, existing_id
+					);
+					error!("{}", msg);
+					return Err(Error::Conflict(msg));
+				}
+			}
+			// file_id is NULL - proceed with update
+		}
+	}
+
+	// Update NULL file_id to new value
 	let res =
 		sqlx::query("UPDATE files SET file_id=? WHERE tn_id=? AND f_id=? AND file_id IS NULL")
 			.bind(file_id)
@@ -266,10 +303,150 @@ pub(crate) async fn update_id(
 			.await
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
+
 	if res.rows_affected() == 0 {
-		return Err(Error::NotFound);
+		// Race condition - someone else just set it between our check and update.
+		// Re-check what value was set (idempotent verification)
+		let current = sqlx::query("SELECT file_id FROM files WHERE tn_id=? AND f_id=?")
+			.bind(tn_id.0)
+			.bind(f_id as i64)
+			.fetch_optional(db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+
+		if let Some(row) = current {
+			if let Some(existing_id) = row.try_get::<Option<String>, _>("file_id").ok().flatten() {
+				if existing_id == file_id {
+					// Race condition resolved - correct value was set
+					return Ok(());
+				} else {
+					// Different value - this is a real conflict
+					let msg = format!(
+						"Race condition: f_id={} was set to {} instead of {}",
+						f_id, existing_id, file_id
+					);
+					error!("{}", msg);
+					return Err(Error::Conflict(msg));
+				}
+			}
+		}
+		// Still NULL somehow - return error
+		return Err(Error::Internal("Unexpected state during file_id update".into()));
 	}
 
+	Ok(())
+}
+
+/// Finalize a pending file - sets file_id and transitions status from 'P' to 'I' atomically
+pub(crate) async fn finalize_file(
+	db: &SqlitePool,
+	tn_id: TnId,
+	f_id: u64,
+	file_id: &str,
+) -> ClResult<()> {
+	// First check if file exists and what its current state is
+	let existing = sqlx::query("SELECT file_id, status FROM files WHERE tn_id=? AND f_id=?")
+		.bind(tn_id.0)
+		.bind(f_id as i64)
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+	match existing {
+		None => {
+			// File doesn't exist at all
+			return Err(Error::NotFound);
+		}
+		Some(row) => {
+			let existing_file_id: Option<String> = row.try_get("file_id").ok().flatten();
+			let status: String = row.try_get("status").map_err(|_| Error::DbError)?;
+
+			if let Some(existing_id) = existing_file_id {
+				// Already has a file_id - check if it matches
+				if existing_id == file_id && status == "I" {
+					// Idempotent success - already finalized with correct value
+					return Ok(());
+				} else if existing_id == file_id && status == "P" {
+					// Has correct file_id but status not updated - fix it
+					sqlx::query("UPDATE files SET status='I' WHERE tn_id=? AND f_id=?")
+						.bind(tn_id.0)
+						.bind(f_id as i64)
+						.execute(db)
+						.await
+						.inspect_err(inspect)
+						.map_err(|_| Error::DbError)?;
+					return Ok(());
+				} else if existing_id != file_id {
+					// Different file_id - this is a conflict
+					let msg = format!(
+						"Attempted to finalize f_id={} to file_id={} but already set to {}",
+						f_id, file_id, existing_id
+					);
+					error!("{}", msg);
+					return Err(Error::Conflict(msg));
+				}
+			}
+			// file_id is NULL - proceed with finalization
+		}
+	}
+
+	// Update NULL file_id to new value and set status to 'I' atomically
+	let res = sqlx::query(
+		"UPDATE files SET file_id=?, status='I' WHERE tn_id=? AND f_id=? AND file_id IS NULL",
+	)
+	.bind(file_id)
+	.bind(tn_id.0)
+	.bind(f_id as i64)
+	.execute(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+
+	if res.rows_affected() == 0 {
+		// Race condition - someone else just set it between our check and update.
+		// Re-check what value was set (idempotent verification)
+		let current = sqlx::query("SELECT file_id, status FROM files WHERE tn_id=? AND f_id=?")
+			.bind(tn_id.0)
+			.bind(f_id as i64)
+			.fetch_optional(db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+
+		if let Some(row) = current {
+			if let Some(existing_id) = row.try_get::<Option<String>, _>("file_id").ok().flatten() {
+				let status: String = row.try_get("status").map_err(|_| Error::DbError)?;
+				if existing_id == file_id && status == "I" {
+					// Race condition resolved - correct value and status were set
+					return Ok(());
+				} else if existing_id == file_id && status == "P" {
+					// Has correct file_id but status not updated - fix it
+					sqlx::query("UPDATE files SET status='I' WHERE tn_id=? AND f_id=?")
+						.bind(tn_id.0)
+						.bind(f_id as i64)
+						.execute(db)
+						.await
+						.inspect_err(inspect)
+						.map_err(|_| Error::DbError)?;
+					return Ok(());
+				} else {
+					// Different value - this is a real conflict
+					let msg = format!(
+						"Race condition: f_id={} was set to {} instead of {}",
+						f_id, existing_id, file_id
+					);
+					error!("{}", msg);
+					return Err(Error::Conflict(msg));
+				}
+			}
+		}
+		// Still NULL somehow - return error
+		return Err(Error::Internal("Unexpected state during file finalization".into()));
+	}
+
+	info!("Finalized file f_id={} → file_id={}, status='I'", f_id, file_id);
 	Ok(())
 }
 
@@ -292,14 +469,97 @@ pub(crate) async fn update_name(
 	Ok(())
 }
 
-/// Read a file by ID
+/// Read a file by ID (supports both @-prefixed f_id and content-addressable file_id)
 pub(crate) async fn read(
-	_db: &SqlitePool,
-	_tn_id: TnId,
-	_file_id: &str,
+	db: &SqlitePool,
+	tn_id: TnId,
+	file_id: &str,
 ) -> ClResult<Option<FileView>> {
-	// Simplified implementation - just return None for now
-	Ok(None)
+	// Handle @-prefixed integer IDs vs content-addressable IDs
+	let row = if let Some(f_id_str) = file_id.strip_prefix("@") {
+		// Integer ID - parse and query by f_id
+		let f_id = f_id_str
+			.parse::<i64>()
+			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
+		sqlx::query(
+			"SELECT f.file_id, f.file_name, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type,
+			        p.id_tag, p.name, p.type, p.profile_pic
+			 FROM files f
+			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
+			 WHERE f.tn_id=? AND f.f_id=?"
+		)
+		.bind(tn_id.0)
+		.bind(f_id)
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?
+	} else {
+		// Content-addressable ID - query by file_id
+		sqlx::query(
+			"SELECT f.file_id, f.file_name, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type,
+			        p.id_tag, p.name, p.type, p.profile_pic
+			 FROM files f
+			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
+			 WHERE f.tn_id=? AND f.file_id=?"
+		)
+		.bind(tn_id.0)
+		.bind(file_id)
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?
+	};
+
+	match row {
+		None => Ok(None),
+		Some(row) => {
+			let status = match row.try_get("status").map_err(|_| Error::DbError)? {
+				"I" => FileStatus::Immutable,
+				"M" => FileStatus::Mutable,
+				"P" => FileStatus::Pending,
+				"D" => FileStatus::Deleted,
+				_ => return Err(Error::DbError),
+			};
+
+			let tags_str: Option<Box<str>> = row.try_get("tags").ok();
+			let tags = tags_str.map(|s| parse_str_list(&s).to_vec());
+
+			// Build owner profile info if owner_tag exists
+			let owner = if let (Ok(id_tag), Ok(name)) =
+				(row.try_get::<Box<str>, _>("id_tag"), row.try_get::<Box<str>, _>("name"))
+			{
+				let typ = match row.try_get::<&str, _>("type").ok() {
+					Some("P") => ProfileType::Person,
+					Some("C") => ProfileType::Community,
+					_ => ProfileType::Person, // Default fallback
+				};
+
+				Some(ProfileInfo {
+					id_tag,
+					name,
+					typ,
+					profile_pic: row.try_get("profile_pic").ok(),
+				})
+			} else {
+				None
+			};
+
+			Ok(Some(FileView {
+				file_id: row.try_get("file_id").map_err(|_| Error::DbError)?,
+				owner,
+				preset: row.try_get("preset").ok(),
+				content_type: row.try_get("content_type").ok(),
+				file_name: row.try_get("file_name").map_err(|_| Error::DbError)?,
+				created_at: row
+					.try_get::<i64, _>("created_at")
+					.map(Timestamp)
+					.map_err(|_| Error::DbError)?,
+				status,
+				tags,
+			}))
+		}
+	}
 }
 
 /// Delete (soft delete) a file

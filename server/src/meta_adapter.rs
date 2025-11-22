@@ -596,6 +596,9 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	) -> ClResult<&'a str>;
 	async fn update_file_id(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
 
+	/// Finalize a pending file - sets file_id and transitions status from 'P' to 'I' atomically
+	async fn finalize_file(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
+
 	// Task scheduler
 	//****************
 	async fn list_tasks(&self, opts: ListTaskOptions) -> ClResult<Vec<Task>>;

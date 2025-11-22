@@ -58,21 +58,21 @@ fn init_api_service(app: App) -> Router {
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_profile("admin")));
 
 	// File routes with permission checks
-	let file_router = Router::new()
+	// Note: We need to separate routes by permission level to avoid middleware conflicts
+	let file_router_read = Router::new()
 		.route("/api/file/variant/{variant_id}", get(file::handler::get_file_variant))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("read")))
 		.route("/api/file/{file_id}/descriptor", get(file::handler::get_file_descriptor))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("read")))
 		.route("/api/file/{file_id}", get(file::handler::get_file_variant_file_id))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("read")))
+		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("read")));
+
+	let file_router_write = Router::new()
 		.route("/api/file/{file_id}", patch(file::management::patch_file))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("write")))
 		.route("/api/file/{file_id}", delete(file::management::delete_file))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("write")))
 		.route("/api/file/{file_id}/tag/{tag}", put(file::tag::put_file_tag))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("write")))
 		.route("/api/file/{file_id}/tag/{tag}", delete(file::tag::delete_file_tag))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("write")));
+
+	let file_router = file_router_read.merge(file_router_write);
 
 	// File POST routes (file creation) - note: uses different path parameters (preset, file_name)
 	// These routes don't use path-based permission checks since they create new files

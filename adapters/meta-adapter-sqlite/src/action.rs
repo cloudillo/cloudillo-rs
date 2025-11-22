@@ -61,7 +61,7 @@ pub(crate) async fn list(
 		query.push(" AND a.created_at>").push_bind(created_after.0);
 	}
 	query.push(" ORDER BY a.created_at DESC LIMIT 100");
-	info!("SQL: {}", query.sql());
+	debug!("SQL: {}", query.sql());
 
 	let res = query
 		.build()

@@ -105,7 +105,7 @@ pub async fn get_file_variant_file_id(
 		.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id))
 		.await?;
 	variants.sort();
-	info!("variants: {:?}", variants);
+	debug!("variants: {:?}", variants);
 
 	let variant = descriptor::get_best_file_variant(&variants, &selector)?;
 	let stream = app.blob_adapter.read_blob_stream(tn_id, &variant.variant_id).await?;

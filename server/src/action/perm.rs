@@ -46,7 +46,10 @@ async fn check_action_permission(
 	let environment = Environment::new();
 	let checker = app.permission_checker.read().await;
 
-	if !checker.has_permission(&auth_ctx, action, &attrs, &environment) {
+	// Format action as "action:operation" for ABAC checker
+	let full_action = format!("action:{}", action);
+
+	if !checker.has_permission(&auth_ctx, &full_action, &attrs, &environment) {
 		warn!(
 			subject = %auth_ctx.id_tag,
 			action = action,
