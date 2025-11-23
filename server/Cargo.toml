@@ -14,6 +14,7 @@ hmac = "0.12.1"
 #hyper = "1.7.0"
 #hyper-util = "0.1.17"
 image = "0.25.9"
+webp = "0.3.1"
 instant-acme = "0.8.4"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 pem = "3.0.6"

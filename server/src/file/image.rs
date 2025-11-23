@@ -2,7 +2,11 @@ use async_trait::async_trait;
 use image::ImageReader;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::{io::Cursor, path::Path, sync::Arc};
+use std::{
+	io::{Cursor, Write},
+	path::Path,
+	sync::Arc,
+};
 
 use crate::blob_adapter;
 use crate::core::scheduler::{Task, TaskId};
@@ -83,8 +87,11 @@ fn resize_image_sync<'a>(
 			resized.write_with_encoder(encoder)?;
 		}
 		ImageFormat::Webp => {
-			let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut output);
-			resized.write_with_encoder(encoder)?;
+			// Use webp crate for lossy encoding with quality 80
+			let rgba = resized.to_rgba8();
+			let encoder = webp::Encoder::from_rgba(rgba.as_raw(), actual_width, actual_height);
+			let webp_data = encoder.encode(80.0); // Quality 0-100
+			output.get_mut().write_all(&webp_data)?;
 		}
 		ImageFormat::Jpeg => {
 			let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 95);

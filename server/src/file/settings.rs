@@ -37,6 +37,28 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?
 	)?;
 
+	// Image format for thumbnails
+	registry.register(
+		SettingDefinition::builder("file.thumbnail_format")
+			.description("Image format for thumbnails: avif, webp, jpeg, or png")
+			.default(SettingValue::String("webp".into()))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
+	// Image format for larger variants
+	registry.register(
+		SettingDefinition::builder("file.image_format")
+			.description(
+				"Image format for larger variants (sd, md, hd, xd): avif, webp, jpeg, or png",
+			)
+			.default(SettingValue::String("webp".into()))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
 	// Storage quota
 	registry.register(
 		SettingDefinition::builder("limits.max_storage_gb")

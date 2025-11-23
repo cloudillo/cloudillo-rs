@@ -156,6 +156,23 @@ async fn handle_post_image(
 	_content_type: &str,
 	bytes: &[u8],
 ) -> ClResult<serde_json::Value> {
+	// Read format settings
+	let thumbnail_format_str = app
+		.settings
+		.get_string(tn_id, "file.thumbnail_format")
+		.await
+		.unwrap_or_else(|_| "webp".to_string());
+	let thumbnail_format: image::ImageFormat =
+		thumbnail_format_str.parse().unwrap_or(image::ImageFormat::Webp);
+
+	let image_format_str = app
+		.settings
+		.get_string(tn_id, "file.image_format")
+		.await
+		.unwrap_or_else(|_| "webp".to_string());
+	let image_format: image::ImageFormat =
+		image_format_str.parse().unwrap_or(image::ImageFormat::Avif);
+
 	let file_id_orig =
 		store::create_blob_buf(app, tn_id, bytes, blob_adapter::CreateBlobOptions::default())
 			.await?;
@@ -171,7 +188,7 @@ async fn handle_post_image(
 			meta_adapter::FileVariant {
 				variant_id: file_id_orig.as_ref(),
 				variant: "orig",
-				format: "avif",
+				format: image_format.as_ref(),
 				resolution: orig_dim,
 				size: bytes.len() as u64,
 				available: true,
@@ -184,8 +201,7 @@ async fn handle_post_image(
 
 	// Generate thumbnail
 	let resized_tn =
-		image::resize_image(app.clone(), bytes.into(), image::ImageFormat::Avif, (128, 128))
-			.await?;
+		image::resize_image(app.clone(), bytes.into(), thumbnail_format, (128, 128)).await?;
 	debug!("resized {:?}", resized_tn.bytes.len());
 	let variant_id_tn = store::create_blob_buf(
 		app,
@@ -201,7 +217,7 @@ async fn handle_post_image(
 			meta_adapter::FileVariant {
 				variant_id: variant_id_tn.as_ref(),
 				variant: "tn",
-				format: "avif",
+				format: thumbnail_format.as_ref(),
 				resolution: (resized_tn.width, resized_tn.height),
 				size: resized_tn.bytes.len() as u64,
 				available: true,
@@ -265,7 +281,7 @@ async fn handle_post_image(
 				f_id,
 				orig_file.clone(),
 				*variant_name,
-				image::ImageFormat::Avif,
+				image_format,
 				(actual_size as u32, actual_size as u32),
 			);
 			let task_id = app.scheduler.add(task).await?;
