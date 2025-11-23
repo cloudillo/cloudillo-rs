@@ -1,5 +1,6 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 
 use crate::auth_adapter;
 use crate::core::{extract::OptionalRequestId, IdTag};
@@ -7,6 +8,7 @@ use crate::prelude::*;
 use crate::types::ApiResponse;
 
 /// # Profile
+#[skip_serializing_none]
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {

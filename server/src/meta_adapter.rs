@@ -661,29 +661,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// Phase 1: Profile Management
 	//****************************
-	/// List all profiles for a tenant (paginated)
-	async fn list_all_profiles(
-		&self,
-		tn_id: TnId,
-		limit: usize,
-		offset: usize,
-	) -> ClResult<Vec<ProfileData>>;
-
-	/// List all remote profiles in the cache (for profile discovery)
-	async fn list_all_remote_profiles(
-		&self,
-		limit: usize,
-		offset: usize,
-	) -> ClResult<Vec<ProfileData>>;
-
-	/// Search profiles by id_tag or name (case-insensitive partial match)
-	async fn search_profiles(
-		&self,
-		query: &str,
-		limit: usize,
-		offset: usize,
-	) -> ClResult<Vec<ProfileData>>;
-
 	/// Get a single profile by id_tag
 	async fn get_profile_info(&self, tn_id: TnId, id_tag: &str) -> ClResult<ProfileData>;
 

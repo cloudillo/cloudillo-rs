@@ -350,34 +350,8 @@ impl MetaAdapter for MetaAdapterSqlite {
 	}
 
 	// Phase 1: Profile Management
-	async fn list_all_profiles(
-		&self,
-		tn_id: TnId,
-		limit: usize,
-		offset: usize,
-	) -> ClResult<Vec<ProfileData>> {
-		profile::list_all(&self.dbr, tn_id, limit, offset).await
-	}
-
 	async fn get_profile_info(&self, tn_id: TnId, id_tag: &str) -> ClResult<ProfileData> {
 		profile::get_info(&self.dbr, tn_id, id_tag).await
-	}
-
-	async fn list_all_remote_profiles(
-		&self,
-		limit: usize,
-		offset: usize,
-	) -> ClResult<Vec<ProfileData>> {
-		profile::list_all_remote(&self.dbr, limit, offset).await
-	}
-
-	async fn search_profiles(
-		&self,
-		query: &str,
-		limit: usize,
-		offset: usize,
-	) -> ClResult<Vec<ProfileData>> {
-		profile::search(&self.dbr, query, limit, offset).await
 	}
 
 	// Phase 2: Action Management

@@ -9,51 +9,60 @@ use serde::Deserialize;
 
 use crate::{
 	core::extract::OptionalRequestId,
+	meta_adapter::ListProfileOptions,
 	prelude::*,
 	types::{ApiResponse, ProfileInfo},
 };
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListProfilesQuery {
 	search: Option<String>,
 	limit: Option<usize>,
 	offset: Option<usize>,
+	#[serde(rename = "type")]
+	typ: Option<crate::meta_adapter::ProfileType>,
 }
 
 /// GET /profile - List all profiles or search profiles
 /// Query parameters:
+///   type: Optional filter by profile type ("person" or "community")
 ///   search: Optional search term to filter profiles by id_tag or name
 ///   limit: Results per page (default 20, max 100)
 ///   offset: Pagination offset (default 0)
 pub async fn list_profiles(
 	State(app): State<App>,
+	tn_id: TnId,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Query(params): Query<ListProfilesQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ProfileInfo>>>)> {
-	let limit = params.limit.unwrap_or(20).min(100); // Max 100 per page
-	let offset = params.offset.unwrap_or(0);
-
-	// Fetch profiles from cache (all tenants' local copies of remote profiles)
-	// If search term provided, filter by id_tag or name
-	let profiles_data = if let Some(search_term) = &params.search {
-		// Search mode: find profiles matching search term
-		app.meta_adapter
-			.search_profiles(&search_term.to_lowercase(), limit, offset)
-			.await?
-	} else {
-		// List mode: get all cached profiles
-		app.meta_adapter.list_all_remote_profiles(limit, offset).await?
+	// Build options for list_profiles
+	let opts = ListProfileOptions {
+		typ: params.typ,
+		status: None,
+		connected: None,
+		following: None,
+		q: params.search.as_ref().map(|s| s.to_lowercase()),
+		id_tag: None,
 	};
 
-	// Convert ProfileData to ProfileInfo
-	let profiles: Vec<ProfileInfo> = profiles_data
+	// Fetch profiles with optional search
+	let profiles_list = app.meta_adapter.list_profiles(tn_id, &opts).await?;
+
+	// Convert Profile to ProfileInfo
+	// Note: We don't have created_at in Profile, so we use 0 as placeholder
+	let profiles: Vec<ProfileInfo> = profiles_list
 		.into_iter()
-		.map(|pd| ProfileInfo {
-			id_tag: pd.id_tag.to_string(),
-			name: pd.name.to_string(),
-			profile_type: pd.profile_type.to_string(),
-			profile_pic: pd.profile_pic.map(|s| s.to_string()),
-			created_at: pd.created_at,
+		.map(|p| ProfileInfo {
+			id_tag: p.id_tag.to_string(),
+			name: p.name.to_string(),
+			profile_type: match p.typ {
+				crate::meta_adapter::ProfileType::Person => "person",
+				crate::meta_adapter::ProfileType::Community => "community",
+			}
+			.to_string(),
+			profile_pic: p.profile_pic.map(|s| s.to_string()),
+			created_at: 0, // Not available in Profile type
 		})
 		.collect();
 
