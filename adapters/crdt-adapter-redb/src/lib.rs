@@ -1,14 +1,11 @@
 //! Redb-based CRDT Document Adapter
 //!
-//! Implements the CrdtAdapter trait using redb for persistent storage of binary CRDT updates
-//! and document metadata.
+//! Implements the CrdtAdapter trait using redb for persistent storage of binary CRDT updates.
 //!
 //! # Storage Layout
 //!
-//! Documents and their updates are stored in redb tables:
+//! Documents and their updates are stored in a redb table:
 //! - `updates` - Stores binary CRDT updates indexed by (doc_id, update_seq)
-//! - `metadata` - Stores document metadata as JSON
-//! - `updates_meta` - Tracks update counts and storage sizes per document
 //!
 //! # Multi-Tenancy
 //!
@@ -29,14 +26,11 @@
 //! # Key Features
 //!
 //! - Efficient binary storage with updates indexed by sequence number
-//! - Metadata as JSON for flexibility
 //! - Subscription support via tokio broadcast channels
 //! - In-memory document instance caching with LRU eviction
 //! - Transaction-safe atomic updates
 
-use cloudillo::crdt_adapter::{
-	CrdtAdapter, CrdtChangeEvent, CrdtDocMeta, CrdtSubscriptionOptions, CrdtUpdate,
-};
+use cloudillo::crdt_adapter::{CrdtAdapter, CrdtChangeEvent, CrdtSubscriptionOptions, CrdtUpdate};
 use cloudillo::error::{ClResult, Error as ClError};
 use cloudillo::prelude::*;
 use cloudillo::types::TnId;
@@ -90,12 +84,6 @@ mod tables {
 	/// Total key size: 1 + 24 + 1 + 8 = 34 bytes
 	pub const TABLE_UPDATES: TableDefinition<&[u8], &[u8]> =
 		TableDefinition::new("crdt_updates_v2");
-
-	/// Stores document metadata: doc_id -> metadata_json
-	pub const TABLE_METADATA: TableDefinition<&str, &str> = TableDefinition::new("crdt_metadata");
-
-	/// Stores update counts and sizes: doc_id -> stats_json
-	pub const TABLE_STATS: TableDefinition<&str, &str> = TableDefinition::new("crdt_stats");
 }
 
 use tables::*;
@@ -292,8 +280,6 @@ impl CrdtAdapterRedb {
 			ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e)))
 		})?;
 		let _ = tx.open_table(TABLE_UPDATES);
-		let _ = tx.open_table(TABLE_METADATA);
-		let _ = tx.open_table(TABLE_STATS);
 		tx.commit().map_err(|e| {
 			ClError::from(Error::DbError(format!("Failed to commit table creation: {}", e)))
 		})?;
@@ -407,57 +393,6 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		Ok(())
 	}
 
-	async fn get_meta(&self, tn_id: TnId, doc_id: &str) -> ClResult<CrdtDocMeta> {
-		let db_path = self.get_db_path(tn_id, doc_id);
-		let db = self.get_or_open_db_file(db_path).await?;
-
-		let tx = db.begin_read().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e)))
-		})?;
-
-		let metadata_table = tx.open_table(TABLE_METADATA).map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e)))
-		})?;
-
-		match metadata_table
-			.get(doc_id)
-			.map_err(|e| ClError::from(Error::DbError(format!("Failed to read metadata: {}", e))))?
-		{
-			Some(value) => {
-				let meta_json = value.value();
-				let meta: CrdtDocMeta = serde_json::from_str(meta_json)?;
-				Ok(meta)
-			}
-			None => Ok(CrdtDocMeta::default()),
-		}
-	}
-
-	async fn set_meta(&self, tn_id: TnId, doc_id: &str, meta: CrdtDocMeta) -> ClResult<()> {
-		let db_path = self.get_db_path(tn_id, doc_id);
-		let db = self.get_or_open_db_file(db_path).await?;
-
-		let tx = db.begin_write().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e)))
-		})?;
-
-		{
-			let mut metadata_table = tx.open_table(TABLE_METADATA).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e)))
-			})?;
-
-			let meta_json = serde_json::to_string(&meta)?;
-			metadata_table.insert(doc_id, meta_json.as_str()).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to insert metadata: {}", e)))
-			})?;
-		}
-
-		tx.commit().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to commit metadata: {}", e)))
-		})?;
-
-		Ok(())
-	}
-
 	async fn subscribe(
 		&self,
 		tn_id: TnId,
@@ -515,10 +450,6 @@ impl CrdtAdapter for CrdtAdapterRedb {
 				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
 			})?;
 
-			let mut metadata_table = tx.open_table(TABLE_METADATA).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e)))
-			})?;
-
 			// Delete all updates for this document
 			// First collect keys to avoid borrow conflicts
 			let mut keys_to_delete = Vec::new();
@@ -549,11 +480,6 @@ impl CrdtAdapter for CrdtAdapterRedb {
 			}
 
 			info!("Deleted {} keys for doc {}", keys_to_delete.len(), doc_id);
-
-			// Delete metadata
-			metadata_table.remove(doc_id).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to delete metadata: {}", e)))
-			})?;
 		}
 
 		tx.commit().map_err(|e| {
@@ -574,24 +500,27 @@ impl CrdtAdapter for CrdtAdapterRedb {
 			ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e)))
 		})?;
 
-		let metadata_table = tx.open_table(TABLE_METADATA).map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to open metadata table: {}", e)))
+		let updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
+			ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
 		})?;
 
-		let mut doc_ids = Vec::new();
-		let range = metadata_table.iter().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to read metadata: {}", e)))
-		})?;
+		let mut doc_ids = std::collections::HashSet::new();
+		let range = updates_table
+			.iter()
+			.map_err(|e| ClError::from(Error::DbError(format!("Failed to read updates: {}", e))))?;
 
 		for item in range {
 			let (key, _) = item.map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to iterate metadata: {}", e)))
+				ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
 			})?;
 
-			doc_ids.push(key.value().into());
+			// Extract doc_id from key
+			if let Some(doc_id) = key_encoding::decode_doc_id(key.value()) {
+				doc_ids.insert(doc_id);
+			}
 		}
 
-		Ok(doc_ids)
+		Ok(doc_ids.into_iter().map(|s| s.into()).collect())
 	}
 }
 

@@ -1,11 +1,10 @@
 //! CRDT Document Adapter
 //!
 //! Trait and types for pluggable CRDT document backends that store binary updates
-//! and metadata for collaborative documents using Yjs/yrs (Rust port of Yjs).
+//! for collaborative documents using Yjs/yrs (Rust port of Yjs).
 //!
 //! The adapter handles:
 //! - Persistence of binary CRDT updates (Yjs sync protocol format)
-//! - Metadata storage (initialization flags, document info, etc.)
 //! - Change subscriptions for real-time updates
 //! - Document lifecycle (creation, deletion)
 //!
@@ -18,7 +17,6 @@
 use async_trait::async_trait;
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fmt::Debug;
 use std::pin::Pin;
 
@@ -48,34 +46,6 @@ impl CrdtUpdate {
 	pub fn with_client(data: Vec<u8>, client_id: impl Into<Box<str>>) -> Self {
 		Self { data, client_id: Some(client_id.into()) }
 	}
-}
-
-/// Metadata about a CRDT document.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CrdtDocMeta {
-	/// Whether the document has been initialized (Y.Doc created)
-	#[serde(default)]
-	pub initialized: bool,
-
-	/// Document creation timestamp (Unix seconds)
-	#[serde(default)]
-	pub created_at: u64,
-
-	/// Last modification timestamp (Unix seconds)
-	#[serde(default)]
-	pub updated_at: u64,
-
-	/// Total size of all stored updates in bytes
-	#[serde(default)]
-	pub size_bytes: u64,
-
-	/// Number of updates stored
-	#[serde(default)]
-	pub update_count: u32,
-
-	/// Custom metadata (application-specific)
-	#[serde(default)]
-	pub custom: Value,
 }
 
 /// Real-time change notification for a CRDT document.
@@ -121,22 +91,18 @@ pub struct CrdtDocStats {
 
 	/// Number of updates stored
 	pub update_count: u32,
-
-	/// Document metadata
-	pub meta: CrdtDocMeta,
 }
 
 /// CRDT Adapter trait.
 ///
-/// Unified interface for CRDT document backends. Handles persistence of binary updates,
-/// metadata storage, and real-time subscriptions.
+/// Unified interface for CRDT document backends. Handles persistence of binary updates
+/// and real-time subscriptions.
 ///
 /// # Multi-Tenancy
 ///
 /// All operations are tenant-aware (tn_id parameter). Adapters must ensure:
 /// - Updates from different tenants are stored separately
 /// - Subscriptions only receive updates for the subscribing tenant
-/// - Metadata is isolated per tenant
 #[async_trait]
 pub trait CrdtAdapter: Debug + Send + Sync {
 	/// Get all stored updates for a document.
@@ -155,47 +121,6 @@ pub trait CrdtAdapter: Debug + Send + Sync {
 	/// If the document doesn't exist, it's implicitly created.
 	async fn store_update(&self, tn_id: TnId, doc_id: &str, update: CrdtUpdate) -> ClResult<()>;
 
-	/// Get metadata for a document.
-	///
-	/// Returns the full metadata structure. Returns default if document
-	/// hasn't been created yet.
-	async fn get_meta(&self, tn_id: TnId, doc_id: &str) -> ClResult<CrdtDocMeta>;
-
-	/// Set metadata for a document.
-	///
-	/// Replaces the entire metadata structure. Use get_meta, modify, then set_meta
-	/// for partial updates.
-	async fn set_meta(&self, tn_id: TnId, doc_id: &str, meta: CrdtDocMeta) -> ClResult<()>;
-
-	/// Get a specific metadata field as JSON.
-	///
-	/// Convenience method for getting a single field from custom metadata.
-	/// Returns None if the key doesn't exist.
-	async fn get_meta_field(
-		&self,
-		tn_id: TnId,
-		doc_id: &str,
-		key: &str,
-	) -> ClResult<Option<Value>> {
-		let meta = self.get_meta(tn_id, doc_id).await?;
-		Ok(meta.custom.get(key).cloned())
-	}
-
-	/// Set a specific metadata field as JSON.
-	///
-	/// Convenience method for updating a single field in custom metadata.
-	async fn set_meta_field(
-		&self,
-		tn_id: TnId,
-		doc_id: &str,
-		key: &str,
-		value: Value,
-	) -> ClResult<()> {
-		let mut meta = self.get_meta(tn_id, doc_id).await?;
-		meta.custom[key] = value;
-		self.set_meta(tn_id, doc_id, meta).await
-	}
-
 	/// Subscribe to updates for a document.
 	///
 	/// Returns a stream of updates. Depending on subscription options,
@@ -208,13 +133,11 @@ pub trait CrdtAdapter: Debug + Send + Sync {
 
 	/// Get statistics for a document.
 	async fn stats(&self, tn_id: TnId, doc_id: &str) -> ClResult<CrdtDocStats> {
-		let meta = self.get_meta(tn_id, doc_id).await?;
-		Ok(CrdtDocStats {
-			doc_id: doc_id.into(),
-			size_bytes: meta.size_bytes,
-			update_count: meta.update_count,
-			meta,
-		})
+		let updates = self.get_updates(tn_id, doc_id).await?;
+		let update_count = updates.len() as u32;
+		let size_bytes: u64 = updates.iter().map(|u| u.data.len() as u64).sum();
+
+		Ok(CrdtDocStats { doc_id: doc_id.into(), size_bytes, update_count })
 	}
 
 	/// Delete a document and all its updates.

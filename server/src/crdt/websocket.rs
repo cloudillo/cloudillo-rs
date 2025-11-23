@@ -20,6 +20,7 @@ use std::sync::Arc;
 use yrs::sync::{Message as YMessage, SyncMessage};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
+use yrs::{Map, ReadTxn, Transact};
 
 /// CRDT connection tracking
 #[derive(Debug)]
@@ -144,7 +145,51 @@ async fn send_initial_sync(
 ) {
 	match app.crdt_adapter.get_updates(tn_id, doc_id).await {
 		Ok(updates) => {
-			if !updates.is_empty() {
+			// Check if document has been initialized (has any updates)
+			if updates.is_empty() {
+				debug!("Document {} not initialized, creating initial structure", doc_id);
+
+				// Create initial Y.Doc with meta map containing initialized flag
+				let initial_update = tokio::task::spawn_blocking(move || {
+					let doc = yrs::Doc::new();
+					let meta = doc.get_or_insert_map("meta");
+					let mut txn = doc.transact_mut();
+					// Set initialized flag in the document's meta map
+					meta.insert(&mut txn, "i", true);
+					drop(txn);
+
+					// Get the update that creates the meta map
+					let state_vector = yrs::StateVector::default();
+					let txn = doc.transact();
+					txn.encode_state_as_update_v1(&state_vector)
+				})
+				.await;
+
+				if let Ok(update_data) = initial_update {
+					if !update_data.is_empty() {
+						let update = crate::crdt_adapter::CrdtUpdate::with_client(
+							update_data.clone(),
+							"system".to_string(),
+						);
+						if let Err(e) = app.crdt_adapter.store_update(tn_id, doc_id, update).await {
+							warn!("Failed to store initial CRDT update for doc {}: {}", doc_id, e);
+						} else {
+							info!("Document {} initialized", doc_id);
+
+							// Send the initial update to the client
+							let sync_msg = SyncMessage::Update(update_data);
+							let y_msg = YMessage::Sync(sync_msg);
+							let encoded = y_msg.encode_v1();
+							let ws_msg = Message::Binary(encoded.into());
+
+							let mut tx = ws_tx.lock().await;
+							if let Err(e) = tx.send(ws_msg).await {
+								warn!("Failed to send initial update to {}: {}", user_id, e);
+							}
+						}
+					}
+				}
+			} else {
 				info!(
 					"Sending {} initial CRDT updates to {} for doc {} (total: {} bytes)",
 					updates.len(),
@@ -165,8 +210,6 @@ async fn send_initial_sync(
 						break;
 					}
 				}
-			} else {
-				debug!("No initial CRDT updates for doc {}", doc_id);
 			}
 		}
 		Err(e) => {

@@ -48,6 +48,7 @@ pub(crate) async fn list(
 		query.push(" AND f.file_tp=").push_bind(file_type.as_str());
 	}
 
+	// Filter by status - if no status specified, exclude deleted files by default
 	if let Some(status) = opts.status {
 		let status_char = match status {
 			FileStatus::Active => "A",
@@ -57,6 +58,9 @@ pub(crate) async fn list(
 			FileStatus::Deleted => "D",
 		};
 		query.push(" AND f.status=").push_bind(status_char);
+	} else {
+		// By default, exclude deleted files
+		query.push(" AND f.status != 'D'");
 	}
 
 	query.push(" ORDER BY f.created_at DESC LIMIT ");

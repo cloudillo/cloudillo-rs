@@ -2,7 +2,7 @@
 //!
 //! Tests core CRUD operations for CRDT documents
 
-use cloudillo::crdt_adapter::{CrdtAdapter, CrdtDocMeta, CrdtUpdate};
+use cloudillo::crdt_adapter::{CrdtAdapter, CrdtUpdate};
 use cloudillo::types::TnId;
 use cloudillo_crdt_adapter_redb::{AdapterConfig, CrdtAdapterRedb};
 use tempfile::TempDir;
@@ -79,33 +79,6 @@ async fn test_multiple_updates() {
 	assert_eq!(updates[0].data, vec![1]);
 	assert_eq!(updates[1].data, vec![2]);
 	assert_eq!(updates[2].data, vec![3]);
-}
-
-#[tokio::test]
-async fn test_metadata_operations() {
-	let (adapter, _temp) = create_test_adapter().await;
-	let tn_id = TnId(1);
-	let doc_id = "doc3";
-
-	let meta = CrdtDocMeta {
-		initialized: true,
-		created_at: 1698499200,
-		updated_at: 1698499200,
-		size_bytes: 0,
-		update_count: 0,
-		custom: serde_json::json!({"title": "My Document"}),
-	};
-
-	adapter
-		.set_meta(tn_id, doc_id, meta.clone())
-		.await
-		.expect("Failed to set metadata");
-
-	let retrieved = adapter.get_meta(tn_id, doc_id).await.expect("Failed to get metadata");
-
-	assert!(retrieved.initialized);
-	assert_eq!(retrieved.created_at, 1698499200);
-	assert_eq!(retrieved.custom["title"], serde_json::json!("My Document"));
 }
 
 #[tokio::test]
@@ -187,28 +160,4 @@ async fn test_large_binary_update() {
 	assert_eq!(updates.len(), 1);
 	assert_eq!(updates[0].data.len(), 102400);
 	assert_eq!(updates[0].data, large_data);
-}
-
-#[tokio::test]
-async fn test_custom_metadata() {
-	let (adapter, _temp) = create_test_adapter().await;
-	let tn_id = TnId(1);
-	let doc_id = "meta-doc";
-
-	let meta = CrdtDocMeta {
-		custom: serde_json::json!({
-			"title": "Collaborative Document",
-			"author": "alice",
-			"tags": ["important", "shared"]
-		}),
-		..Default::default()
-	};
-
-	adapter.set_meta(tn_id, doc_id, meta).await.expect("Failed to set metadata");
-
-	let retrieved = adapter.get_meta(tn_id, doc_id).await.expect("Failed to get metadata");
-
-	assert_eq!(retrieved.custom["title"], "Collaborative Document");
-	assert_eq!(retrieved.custom["author"], "alice");
-	assert!(retrieved.custom["tags"].is_array());
 }

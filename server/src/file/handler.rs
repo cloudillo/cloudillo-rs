@@ -10,7 +10,10 @@ use serde_json::json;
 use std::{fmt::Debug, pin::Pin};
 
 use crate::blob_adapter;
-use crate::core::{extract::OptionalRequestId, hasher, utils};
+use crate::core::{
+	extract::{Auth, OptionalRequestId},
+	hasher, utils,
+};
 use crate::file::{descriptor, image, store};
 use crate::meta_adapter;
 use crate::prelude::*;
@@ -321,6 +324,7 @@ async fn handle_post_image(
 pub async fn post_file(
 	State(app): State<App>,
 	tn_id: TnId,
+	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	extract::Json(req): extract::Json<PostFileRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
@@ -341,7 +345,7 @@ pub async fn post_file(
 				preset: "default".into(),
 				orig_variant_id: file_id.clone().into(),
 				file_id: Some(file_id.clone().into()),
-				owner_tag: None,
+				owner_tag: Some(auth.id_tag.clone()),
 				content_type: content_type.into(),
 				file_name: "file".into(),
 				file_tp: Some(req.file_tp.clone().into()),
@@ -352,7 +356,7 @@ pub async fn post_file(
 		)
 		.await?;
 
-	info!("Created file metadata for fileTp={}", req.file_tp);
+	info!("Created file metadata for fileTp={} by {}", req.file_tp, auth.id_tag);
 
 	let data = json!({"fileId": file_id});
 
@@ -361,9 +365,11 @@ pub async fn post_file(
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn post_file_blob(
 	State(app): State<App>,
 	tn_id: TnId,
+	Auth(auth): Auth,
 	extract::Path((preset, file_name)): extract::Path<(String, String)>,
 	query: Query<PostFileQuery>,
 	header: axum::http::HeaderMap,
@@ -396,7 +402,7 @@ pub async fn post_file_blob(
 						preset: preset.into(),
 						orig_variant_id,
 						file_id: None,
-						owner_tag: None,
+						owner_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),

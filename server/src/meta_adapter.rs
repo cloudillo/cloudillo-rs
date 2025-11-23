@@ -374,6 +374,10 @@ impl<S: AsRef<str> + Debug + Ord> Ord for FileVariant<S> {
 	}
 }
 
+/// Options for listing files
+///
+/// By default (when `status` is `None`), deleted files (status 'D') are excluded.
+/// To include deleted files, explicitly set `status` to `FileStatus::Deleted`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListFileOptions {
@@ -383,6 +387,7 @@ pub struct ListFileOptions {
 	pub tag: Option<String>,
 	pub preset: Option<String>,
 	pub variant: Option<String>,
+	/// File status filter. If None, excludes deleted files by default.
 	pub status: Option<FileStatus>,
 	#[serde(rename = "fileTp")]
 	pub file_type: Option<String>,
