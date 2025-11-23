@@ -34,8 +34,11 @@ pub(crate) async fn list(
 			}
 			let status_char = match s {
 				ProfileStatus::Active => "A",
-				ProfileStatus::Blocked => "B",
 				ProfileStatus::Trusted => "T",
+				ProfileStatus::Blocked => "B",
+				ProfileStatus::Muted => "M",
+				ProfileStatus::Suspended => "S",
+				ProfileStatus::Banned => "X",
 			};
 			query.push_bind(status_char);
 		}
@@ -135,6 +138,30 @@ pub(crate) async fn read(
 	})
 }
 
+/// Read profile roles for access token generation
+pub(crate) async fn read_roles(
+	db: &SqlitePool,
+	tn_id: TnId,
+	id_tag: &str,
+) -> ClResult<Option<Box<[Box<str>]>>> {
+	let res = sqlx::query("SELECT roles FROM profiles WHERE tn_id=? AND id_tag=?")
+		.bind(tn_id.0)
+		.bind(id_tag)
+		.fetch_one(db)
+		.await;
+
+	map_res(res, |row| {
+		let roles_json: Option<String> = row.try_get("roles")?;
+		if let Some(json_str) = roles_json {
+			let roles: Vec<Box<str>> =
+				serde_json::from_str(&json_str).map_err(|_| sqlx::Error::RowNotFound)?;
+			Ok(Some(roles.into_boxed_slice()))
+		} else {
+			Ok(None)
+		}
+	})
+}
+
 /// Create a new profile
 pub(crate) async fn create(
 	db: &SqlitePool,
@@ -176,17 +203,25 @@ pub(crate) async fn update(
 	let mut query = sqlx::QueryBuilder::new("UPDATE profiles SET ");
 	let mut has_updates = false;
 
-	// Apply each patch field using safe macro
-	has_updates = push_patch!(query, has_updates, "status", &profile.status, |v| match v {
-		ProfileStatus::Active => "A",
-		ProfileStatus::Blocked => "B",
-		ProfileStatus::Trusted => "T",
+	// Profile content fields
+	has_updates = push_patch!(query, has_updates, "name", &profile.name, |v| v.as_ref());
+
+	has_updates = push_patch!(query, has_updates, "profile_pic", &profile.profile_pic, |v| {
+		v.as_ref().map(|s| s.as_ref())
 	});
 
-	has_updates = push_patch!(query, has_updates, "perm", &profile.perm, |v| match v {
-		ProfilePerm::Moderated => "M",
-		ProfilePerm::Write => "W",
-		ProfilePerm::Admin => "A",
+	has_updates = push_patch!(query, has_updates, "roles", &profile.roles, |v| {
+		v.as_ref().map(|roles| serde_json::to_string(roles).unwrap())
+	});
+
+	// Status and moderation
+	has_updates = push_patch!(query, has_updates, "status", &profile.status, |v| match v {
+		ProfileStatus::Active => "A",
+		ProfileStatus::Trusted => "T",
+		ProfileStatus::Blocked => "B",
+		ProfileStatus::Muted => "M",
+		ProfileStatus::Suspended => "S",
+		ProfileStatus::Banned => "X",
 	});
 
 	// synced is special - true means set to now, false means don't update
@@ -210,6 +245,19 @@ pub(crate) async fn update(
 		ProfileConnectionStatus::Disconnected => "0",
 		ProfileConnectionStatus::RequestPending => "2", // Use 2 for 'R'
 		ProfileConnectionStatus::Connected => "1",
+	});
+
+	// Ban metadata fields
+	has_updates = push_patch!(query, has_updates, "ban_expires_at", &profile.ban_expires_at, |v| {
+		v.as_ref().map(|t| t.0)
+	});
+
+	has_updates = push_patch!(query, has_updates, "ban_reason", &profile.ban_reason, |v| {
+		v.as_ref().map(|s| s.as_ref())
+	});
+
+	has_updates = push_patch!(query, has_updates, "banned_by", &profile.banned_by, |v| {
+		v.as_ref().map(|s| s.as_ref())
 	});
 
 	if !has_updates {
@@ -304,64 +352,6 @@ pub(crate) async fn process_refresh<'a>(
 			}
 		}
 	}
-}
-
-/// Update specific profile fields
-pub(crate) async fn update_fields(
-	db: &SqlitePool,
-	tn_id: TnId,
-	id_tag: &str,
-	name: Option<&str>,
-) -> ClResult<()> {
-	// Build UPDATE query based on which fields are provided
-	let mut query = String::from("UPDATE profiles SET ");
-	let mut field_count = 0;
-
-	if name.is_some() {
-		if field_count > 0 {
-			query.push_str(", ");
-		}
-		query.push_str("name = ?1");
-		field_count += 1;
-	}
-
-	if field_count == 0 {
-		return Ok(()); // No fields to update
-	}
-
-	query.push_str(" WHERE tn_id = ? AND id_tag = ?");
-
-	// Execute the query with bindings
-	let mut sql_query = sqlx::query(&query);
-
-	if let Some(n) = name {
-		sql_query = sql_query.bind(n);
-	}
-
-	sql_query = sql_query.bind(tn_id.0).bind(id_tag);
-
-	sql_query.execute(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
-
-	Ok(())
-}
-
-/// Update profile image
-pub(crate) async fn update_image(
-	db: &SqlitePool,
-	tn_id: TnId,
-	id_tag: &str,
-	file_id: &str,
-) -> ClResult<()> {
-	sqlx::query("UPDATE profiles SET profile_pic = ? WHERE tn_id = ? AND id_tag = ?")
-		.bind(file_id)
-		.bind(tn_id.0)
-		.bind(id_tag)
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-
-	Ok(())
 }
 
 /// List all profiles with pagination

@@ -304,7 +304,7 @@ pub(crate) async fn create(
 	Ok(ActionId::AId(res.get(0)))
 }
 
-/// Finalize action - atomically set action_id, update attachments, and transition from 'P' to 'I' status
+/// Finalize action - atomically set action_id, update attachments, and transition from 'P' to 'A' status
 pub(crate) async fn finalize(
 	db: &SqlitePool,
 	tn_id: TnId,
@@ -358,12 +358,12 @@ pub(crate) async fn finalize(
 		}
 	}
 
-	// Update NULL action_id to new value, update attachments, and transition status from 'P' to 'I'
+	// Update NULL action_id to new value, update attachments, and transition status from 'P' to 'A'
 	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
 
 	let attachments_str = attachments.map(|a| a.join(","));
 	let res = sqlx::query(
-		"UPDATE actions SET action_id=?, attachments=?, status='I' WHERE tn_id=? AND a_id=? AND action_id IS NULL AND status='P'"
+		"UPDATE actions SET action_id=?, attachments=?, status='A' WHERE tn_id=? AND a_id=? AND action_id IS NULL AND status='P'"
 	)
 		.bind(action_id)
 		.bind(attachments_str)
@@ -428,7 +428,7 @@ pub(crate) async fn finalize(
 	let mut add_reactions = if content.is_none() { 0 } else { 1 };
 	if let Some(key) = &key {
 		info!("Finalizing with key: {}", key);
-		let res = sqlx::query("UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND a_id!=? AND coalesce(status, 'I')!='D' RETURNING content")
+		let res = sqlx::query("UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND a_id!=? AND coalesce(status, 'A')!='D' RETURNING content")
 			.bind(tn_id.0).bind(key).bind(a_id as i64)
 			.fetch_all(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 		if !res.is_empty()
@@ -746,25 +746,6 @@ pub(crate) async fn update(
 pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClResult<()> {
 	// Soft delete action by marking status as 'D'
 	sqlx::query("UPDATE actions SET status = 'D' WHERE tn_id = ? AND action_id = ?")
-		.bind(tn_id.0)
-		.bind(action_id)
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-
-	Ok(())
-}
-
-/// Set action federation status
-pub(crate) async fn set_federation_status(
-	db: &SqlitePool,
-	tn_id: TnId,
-	action_id: &str,
-	status: &str,
-) -> ClResult<()> {
-	sqlx::query("UPDATE actions SET federation_status = ? WHERE tn_id = ? AND action_id = ?")
-		.bind(status)
 		.bind(tn_id.0)
 		.bind(action_id)
 		.execute(db)

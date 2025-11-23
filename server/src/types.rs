@@ -2,6 +2,7 @@
 
 use crate::core::abac::AttrSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_with::skip_serializing_none;
 use std::time::SystemTime;
 
 // TnId //
@@ -234,12 +235,31 @@ pub struct RegisterVerifyRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ProfilePatch {
 	pub name: Patch<String>,
-	pub description: Patch<Option<String>>,
-	pub location: Patch<Option<String>>,
-	pub website: Patch<Option<String>>,
+}
+
+/// Admin profile patch for PATCH /admin/profile/:idTag endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminProfilePatch {
+	// Basic profile fields
+	#[serde(default)]
+	pub name: Patch<String>,
+
+	// Administrative fields
+	#[serde(default)]
+	pub roles: Patch<Option<Vec<String>>>,
+	#[serde(default)]
+	pub status: Patch<crate::meta_adapter::ProfileStatus>,
+
+	// Ban metadata (only when status is set to Banned/Suspended/Muted)
+	#[serde(default)]
+	pub ban_expires_at: Patch<Option<Timestamp>>,
+	#[serde(default)]
+	pub ban_reason: Patch<Option<String>>,
 }
 
 /// Profile information response
+#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileInfo {
@@ -248,16 +268,6 @@ pub struct ProfileInfo {
 	pub profile_type: String,
 	pub profile_pic: Option<String>, // file_id
 	pub created_at: u64,
-}
-
-/// Profile list response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProfileListResponse {
-	pub profiles: Vec<ProfileInfo>,
-	pub total: usize,
-	pub limit: usize,
-	pub offset: usize,
 }
 
 // Phase 2: Action Management & File Integration
@@ -278,6 +288,7 @@ pub struct CreateActionRequest {
 }
 
 /// Action response (API layer)
+#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionResponse {
@@ -291,7 +302,6 @@ pub struct ActionResponse {
 	pub content: String,
 	pub attachments: Vec<String>,
 	pub issuer_tag: String,
-	pub federation_status: String,
 	pub created_at: u64,
 }
 
@@ -316,6 +326,7 @@ pub struct ReactionRequest {
 }
 
 /// Reaction response
+#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReactionResponse {

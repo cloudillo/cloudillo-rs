@@ -170,7 +170,7 @@ impl Task<App> for FileIdGeneratorTask {
 		hasher.update(descriptor.as_bytes());
 		let file_id = hasher.finalize("f");
 
-		// Finalize the file - sets file_id and transitions status from 'P' to 'I' atomically
+		// Finalize the file - sets file_id and transitions status from 'P' to 'A' atomically
 		app.meta_adapter.finalize_file(self.tn_id, self.f_id, &file_id).await?;
 
 		info!("Finished task file.id-generate {} → {}", descriptor, file_id);

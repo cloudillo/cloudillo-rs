@@ -124,6 +124,20 @@ pub async fn get_image_dimensions(buf: &[u8]) -> Result<(u32, u32), image::error
 	Ok(dim)
 }
 
+/// Detect image type from binary data and return MIME type
+pub fn detect_image_type(buf: &[u8]) -> Option<String> {
+	let reader = ImageReader::new(Cursor::new(buf));
+	let format = reader.with_guessed_format().ok()?.format()?;
+
+	Some(match format {
+		image::ImageFormat::Jpeg => "image/jpeg".to_string(),
+		image::ImageFormat::Png => "image/png".to_string(),
+		image::ImageFormat::WebP => "image/webp".to_string(),
+		image::ImageFormat::Avif => "image/avif".to_string(),
+		_ => return None,
+	})
+}
+
 /// Image resizer Task
 ///
 #[derive(Debug, Serialize, Deserialize)]

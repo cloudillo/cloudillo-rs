@@ -160,16 +160,6 @@ impl RtdbAdapterRedb {
 		}
 	}
 
-	/// Build a collection prefix for range scans
-	#[allow(dead_code)]
-	fn build_collection_prefix(&self, tn_id: TnId, db_id: &str, path: &str) -> String {
-		if self.per_tenant_files {
-			format!("{}/{}/", db_id, path)
-		} else {
-			format!("{}/{}/{}/", tn_id.0, db_id, path)
-		}
-	}
-
 	/// Build an index key
 	#[allow(dead_code)]
 	fn build_index_key(
@@ -187,41 +177,6 @@ impl RtdbAdapterRedb {
 			format!("{}/_idx/{}/{}/{}", collection, field, value_str, doc_id)
 		} else {
 			format!("{}/{}/_idx/{}/{}/{}", tn_id.0, collection, field, value_str, doc_id)
-		}
-	}
-
-	/// Build a metadata key
-	#[allow(dead_code)]
-	fn build_metadata_key(&self, tn_id: TnId, _db_id: &str, path: &str, meta_key: &str) -> String {
-		if self.per_tenant_files {
-			format!("{}/_meta/{}", path, meta_key)
-		} else {
-			format!("{}/{}/_meta/{}", tn_id.0, path, meta_key)
-		}
-	}
-
-	/// Parse a key to extract db_id and path
-	#[allow(dead_code)]
-	fn parse_key(&self, tn_id: TnId, key: &str) -> Option<(String, String)> {
-		if self.per_tenant_files {
-			let parts: Vec<&str> = key.splitn(2, '/').collect();
-			if parts.len() == 2 {
-				Some((parts[0].to_string(), parts[1].to_string()))
-			} else {
-				None
-			}
-		} else {
-			let parts: Vec<&str> = key.splitn(3, '/').collect();
-			if parts.len() == 3 {
-				let key_tn_id = parts[0].parse::<u32>().ok()?;
-				if key_tn_id == tn_id.0 {
-					Some((parts[1].to_string(), parts[2].to_string()))
-				} else {
-					None
-				}
-			} else {
-				None
-			}
 		}
 	}
 

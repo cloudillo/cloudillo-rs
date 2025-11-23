@@ -162,13 +162,20 @@ impl<'a> OperationExecutor<'a> {
 		// Convert tenant_id from i64 to TnId
 		let tn_id = TnId(context.tenant_id as u32);
 
-		// Extract fields from profile_updates
+		// Extract fields from profile_updates and build UpdateProfileData
 		let name = profile_updates.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+		let profile_update = crate::meta_adapter::UpdateProfileData {
+			name: name
+				.map(|s| crate::types::Patch::Value(s.into()))
+				.unwrap_or(crate::types::Patch::Undefined),
+			..Default::default()
+		};
 
 		// Update profile via meta adapter
 		self.app
 			.meta_adapter
-			.update_profile_fields(tn_id, &target_tag, name.as_deref())
+			.update_profile(tn_id, &target_tag, &profile_update)
 			.await?;
 
 		tracing::info!(

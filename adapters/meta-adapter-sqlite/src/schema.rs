@@ -31,8 +31,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		id_tag text NOT NULL,
 		type char(1),
 		name text,
-		profile_pic json,
-		cover_pic json,
+		profile_pic text,
+		cover_pic text,
 		x json,
 		created_at datetime DEFAULT (unixepoch()),
 		PRIMARY KEY(tn_id)
@@ -127,7 +127,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		tn_id integer NOT NULL,
 		file_id text,
 		file_tp char(4),			-- 'BLOB', 'CRDT', 'RTDB' file type (storage type)
-		status char(1),				-- 'M' - Mutable, 'I' - Immutable,
+		status char(1),				-- 'M' - Mutable, 'A' - Active/immutable,
 								-- 'P' - immutable under Processing, 'D' - Deleted
 		owner_tag text,
 		preset text,
@@ -205,7 +205,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		parent_id text,
 		root_id text,
 		issuer_tag text NOT NULL,
-		status char(1) DEFAULT 'P',		-- 'P' - Pending, 'I' - Immutable/finalized, 'D' - Deleted
+		status char(1) DEFAULT 'P',		-- 'P' - Pending, 'A' - Active/finalized, 'D' - Deleted
 		audience text,
 		subject text,
 		content json,
@@ -296,37 +296,10 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
-	// Phase 1 Migration: Extend profiles table with additional metadata
-	let _ = sqlx::query("ALTER TABLE profiles ADD COLUMN description TEXT")
-		.execute(&mut *tx)
-		.await;
-	let _ = sqlx::query("ALTER TABLE profiles ADD COLUMN location TEXT")
-		.execute(&mut *tx)
-		.await;
-	let _ = sqlx::query("ALTER TABLE profiles ADD COLUMN website TEXT")
-		.execute(&mut *tx)
-		.await;
-	let _ = sqlx::query("ALTER TABLE profiles ADD COLUMN cover TEXT")
-		.execute(&mut *tx)
-		.await;
-
 	// Phase 2 Migration: Action metadata enhancements
 	let _ = sqlx::query("ALTER TABLE actions ADD COLUMN updated_at datetime DEFAULT NULL")
 		.execute(&mut *tx)
 		.await;
-	let _ = sqlx::query("ALTER TABLE actions ADD COLUMN federation_status TEXT DEFAULT 'draft'")
-		.execute(&mut *tx)
-		.await;
-
-	// Phase 2 Migration: File lifecycle management
-	let _ = sqlx::query("ALTER TABLE files ADD COLUMN deleted_at datetime DEFAULT NULL")
-		.execute(&mut *tx)
-		.await;
-	let _ = sqlx::query("ALTER TABLE files ADD COLUMN ref_count INTEGER DEFAULT 1")
-		.execute(&mut *tx)
-		.await;
-	let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(deleted_at) WHERE deleted_at IS NOT NULL")
-		.execute(&mut *tx).await;
 
 	// Update file_tp to have a default value if it's NULL
 	let _ = sqlx::query("UPDATE files SET file_tp = 'BLOB' WHERE file_tp IS NULL")

@@ -10,6 +10,7 @@ pub mod extract;
 pub mod hasher;
 pub mod middleware;
 pub mod request;
+pub mod roles;
 pub mod scheduler;
 pub mod settings;
 pub mod utils;

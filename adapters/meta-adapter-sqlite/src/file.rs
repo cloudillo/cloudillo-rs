@@ -50,6 +50,7 @@ pub(crate) async fn list(
 
 	if let Some(status) = opts.status {
 		let status_char = match status {
+			FileStatus::Active => "A",
 			FileStatus::Immutable => "I",
 			FileStatus::Mutable => "M",
 			FileStatus::Pending => "P",
@@ -70,6 +71,7 @@ pub(crate) async fn list(
 
 	collect_res(res.iter().map(|row| {
 		let status = match row.try_get("status")? {
+			"A" => FileStatus::Active,
 			"I" => FileStatus::Immutable,
 			"M" => FileStatus::Mutable,
 			"P" => FileStatus::Pending,
@@ -126,7 +128,10 @@ pub(crate) async fn list_variants(
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?,
 		FileId::FileId(file_id) => {
-			if let Some(f_id) = file_id.strip_prefix("@") {
+			if let Some(f_id_str) = file_id.strip_prefix("@") {
+				let f_id = f_id_str
+					.parse::<i64>()
+					.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 				sqlx::query(
 					"SELECT variant_id, variant, res_x, res_y, format, size, available
 					FROM file_variants WHERE tn_id=? AND f_id=?",
@@ -338,7 +343,7 @@ pub(crate) async fn update_id(
 	Ok(())
 }
 
-/// Finalize a pending file - sets file_id and transitions status from 'P' to 'I' atomically
+/// Finalize a pending file - sets file_id and transitions status from 'P' to 'A' atomically
 pub(crate) async fn finalize_file(
 	db: &SqlitePool,
 	tn_id: TnId,
@@ -365,12 +370,12 @@ pub(crate) async fn finalize_file(
 
 			if let Some(existing_id) = existing_file_id {
 				// Already has a file_id - check if it matches
-				if existing_id == file_id && status == "I" {
+				if existing_id == file_id && status == "A" {
 					// Idempotent success - already finalized with correct value
 					return Ok(());
 				} else if existing_id == file_id && status == "P" {
 					// Has correct file_id but status not updated - fix it
-					sqlx::query("UPDATE files SET status='I' WHERE tn_id=? AND f_id=?")
+					sqlx::query("UPDATE files SET status='A' WHERE tn_id=? AND f_id=?")
 						.bind(tn_id.0)
 						.bind(f_id as i64)
 						.execute(db)
@@ -392,9 +397,9 @@ pub(crate) async fn finalize_file(
 		}
 	}
 
-	// Update NULL file_id to new value and set status to 'I' atomically
+	// Update NULL file_id to new value and set status to 'A' atomically
 	let res = sqlx::query(
-		"UPDATE files SET file_id=?, status='I' WHERE tn_id=? AND f_id=? AND file_id IS NULL",
+		"UPDATE files SET file_id=?, status='A' WHERE tn_id=? AND f_id=? AND file_id IS NULL",
 	)
 	.bind(file_id)
 	.bind(tn_id.0)
@@ -418,12 +423,12 @@ pub(crate) async fn finalize_file(
 		if let Some(row) = current {
 			if let Some(existing_id) = row.try_get::<Option<String>, _>("file_id").ok().flatten() {
 				let status: String = row.try_get("status").map_err(|_| Error::DbError)?;
-				if existing_id == file_id && status == "I" {
+				if existing_id == file_id && status == "A" {
 					// Race condition resolved - correct value and status were set
 					return Ok(());
 				} else if existing_id == file_id && status == "P" {
 					// Has correct file_id but status not updated - fix it
-					sqlx::query("UPDATE files SET status='I' WHERE tn_id=? AND f_id=?")
+					sqlx::query("UPDATE files SET status='A' WHERE tn_id=? AND f_id=?")
 						.bind(tn_id.0)
 						.bind(f_id as i64)
 						.execute(db)
@@ -446,7 +451,7 @@ pub(crate) async fn finalize_file(
 		return Err(Error::Internal("Unexpected state during file finalization".into()));
 	}
 
-	info!("Finalized file f_id={} → file_id={}, status='I'", f_id, file_id);
+	info!("Finalized file f_id={} → file_id={}, status='A'", f_id, file_id);
 	Ok(())
 }
 
@@ -515,6 +520,7 @@ pub(crate) async fn read(
 		None => Ok(None),
 		Some(row) => {
 			let status = match row.try_get("status").map_err(|_| Error::DbError)? {
+				"A" => FileStatus::Active,
 				"I" => FileStatus::Immutable,
 				"M" => FileStatus::Mutable,
 				"P" => FileStatus::Pending,
@@ -562,32 +568,16 @@ pub(crate) async fn read(
 	}
 }
 
-/// Delete (soft delete) a file
+/// Delete a file (set status to 'D')
 pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, file_id: &str) -> ClResult<()> {
-	// Soft delete file
-	sqlx::query("UPDATE files SET deleted_at = unixepoch() WHERE tn_id = ? AND file_id = ?")
+	// Set status to 'D' (deleted)
+	sqlx::query("UPDATE files SET status = 'D' WHERE tn_id = ? AND file_id = ?")
 		.bind(tn_id.0)
 		.bind(file_id)
 		.execute(db)
 		.await
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
-
-	Ok(())
-}
-
-/// Decrement file reference count
-pub(crate) async fn decrement_ref(db: &SqlitePool, tn_id: TnId, file_id: &str) -> ClResult<()> {
-	// Decrement reference count
-	sqlx::query(
-		"UPDATE files SET ref_count = MAX(0, ref_count - 1) WHERE tn_id = ? AND file_id = ?",
-	)
-	.bind(tn_id.0)
-	.bind(file_id)
-	.execute(db)
-	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
 
 	Ok(())
 }

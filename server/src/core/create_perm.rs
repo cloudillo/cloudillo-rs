@@ -82,18 +82,40 @@ async fn check_create_permission(
 /// Loads user's tier, quota, roles, and status from authentication/metadata.
 /// These attributes are used to evaluate CREATE operation permissions.
 async fn load_subject_attrs(
-	_app: &App,
+	app: &App,
 	auth_ctx: &crate::auth_adapter::AuthCtx,
 ) -> ClResult<SubjectAttrs> {
-	// TODO: Phase 3.5 - These values should come from actual adapters
-	// For now, using sensible defaults
-	// In Phase 3.5, implement actual queries to auth_adapter and meta_adapter
+	// Check if user is banned by querying profile ban status
+	// Note: We use get_profile_info which returns ProfileData with status information
+	let banned = match app.meta_adapter.get_profile_info(auth_ctx.tn_id, &auth_ctx.id_tag).await {
+		Ok(_profile_data) => {
+			// Check if profile status indicates banned
+			// ProfileData.status is not available in current implementation,
+			// so we need to query more directly. For now, default to false.
+			// TODO: Extend ProfileData or add get_profile_ban_status method to adapter
+			false
+		}
+		Err(_) => {
+			// If profile doesn't exist locally, assume not banned
+			// (user might be from remote instance)
+			false
+		}
+	};
 
-	// Check if user is banned
-	let banned = false; // TODO: Query from auth_adapter
-
-	// Check if email is verified
-	let email_verified = true; // TODO: Query from auth_adapter
+	// Check if email is verified by checking tenant status
+	// If we can successfully read the tenant, they have been created and verified
+	let email_verified = match app.auth_adapter.read_tenant(&auth_ctx.id_tag).await {
+		Ok(_) => {
+			// If tenant exists and we can read it, assume verified
+			// In the current schema, tenant status 'A' means Active/verified
+			// TODO: Add explicit email_verified field to tenants table for better tracking
+			true
+		}
+		Err(_) => {
+			// If we can't read tenant, they may not be local or not verified
+			false
+		}
+	};
 
 	// Determine user tier based on roles
 	let tier: Box<str> = if auth_ctx.roles.iter().any(|r| r.as_ref() == "admin") {
@@ -105,7 +127,7 @@ async fn load_subject_attrs(
 	};
 
 	// Calculate quota remaining (in bytes)
-	// TODO: Query from meta_adapter to get user's used quota
+	// TODO: Query from meta_adapter to get user's actual used quota
 	let quota_bytes = match tier.as_ref() {
 		"premium" => 1024 * 1024 * 1024, // 1GB
 		"standard" => 100 * 1024 * 1024, // 100MB
@@ -113,7 +135,7 @@ async fn load_subject_attrs(
 	};
 
 	// Get rate limit remaining (per hour)
-	// TODO: Query from meta_adapter or time-based tracker
+	// TODO: Query from meta_adapter or time-based tracker for actual rate limit tracking
 	let rate_limit_remaining_val = 100u32; // per hour
 
 	Ok(SubjectAttrs {

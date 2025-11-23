@@ -97,11 +97,7 @@ impl Task<App> for ActionDeliveryTask {
 			.await
 		{
 			Ok(_) => {
-				// Success - update federation status to "sent"
-				app.meta_adapter
-					.set_action_federation_status(self.tn_id, &self.action_id, "sent")
-					.await?;
-
+				// Success - action delivered
 				info!(
 					"Successfully delivered action {} to {}",
 					self.action_id, self.target_instance

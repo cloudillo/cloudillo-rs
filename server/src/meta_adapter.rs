@@ -20,11 +20,14 @@ pub enum ProfileType {
 	Community,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ProfileStatus {
 	Active,
-	Blocked,
 	Trusted,
+	Blocked,
+	Muted,
+	Suspended,
+	Banned,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -32,13 +35,6 @@ pub enum ProfileConnectionStatus {
 	Disconnected,
 	RequestPending,
 	Connected,
-}
-
-#[derive(Debug, Deserialize)]
-pub enum ProfilePerm {
-	Moderated,
-	Write,
-	Admin,
 }
 
 // Reference / Bookmark types
@@ -143,12 +139,27 @@ pub struct ProfileList {
 	pub offset: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct UpdateProfileData {
+	// Profile content fields
+	#[serde(default)]
+	pub name: Patch<Box<str>>,
+	#[serde(default, rename = "profilePic")]
+	pub profile_pic: Patch<Option<Box<str>>>,
+	#[serde(default)]
+	pub roles: Patch<Option<Vec<Box<str>>>>,
+
+	// Status and moderation
 	#[serde(default)]
 	pub status: Patch<ProfileStatus>,
-	#[serde(default)]
-	pub perm: Patch<ProfilePerm>,
+	#[serde(default, rename = "banExpiresAt")]
+	pub ban_expires_at: Patch<Option<Timestamp>>,
+	#[serde(default, rename = "banReason")]
+	pub ban_reason: Patch<Option<Box<str>>>,
+	#[serde(default, rename = "bannedBy")]
+	pub banned_by: Patch<Option<Box<str>>>,
+
+	// Relationship fields
 	#[serde(default)]
 	pub synced: Patch<bool>,
 	#[serde(default)]
@@ -305,6 +316,8 @@ pub enum ActionId<S: AsRef<str>> {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum FileStatus {
+	#[serde(rename = "A")]
+	Active,
 	#[serde(rename = "I")]
 	Immutable,
 	#[serde(rename = "M")]
@@ -469,6 +482,14 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		id_tag: &str,
 	) -> ClResult<(Box<str>, Profile<Box<str>>)>;
+
+	/// Read profile roles for access token generation
+	async fn read_profile_roles(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+	) -> ClResult<Option<Box<[Box<str>]>>>;
+
 	async fn create_profile(
 		&self,
 		tn_id: TnId,
@@ -610,7 +631,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	) -> ClResult<&'a str>;
 	async fn update_file_id(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
 
-	/// Finalize a pending file - sets file_id and transitions status from 'P' to 'I' atomically
+	/// Finalize a pending file - sets file_id and transitions status from 'P' to 'A' atomically
 	async fn finalize_file(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
 
 	// Task scheduler
@@ -640,17 +661,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// Phase 1: Profile Management
 	//****************************
-	/// Update profile fields (name)
-	async fn update_profile_fields(
-		&self,
-		tn_id: TnId,
-		id_tag: &str,
-		name: Option<&str>,
-	) -> ClResult<()>;
-
-	/// Update profile image (profile picture file_id)
-	async fn update_profile_image(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()>;
-
 	/// List all profiles for a tenant (paginated)
 	async fn list_all_profiles(
 		&self,
@@ -694,14 +704,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Delete an action (soft delete with cleanup)
 	async fn delete_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()>;
 
-	/// Set federation status for an action
-	async fn set_action_federation_status(
-		&self,
-		tn_id: TnId,
-		action_id: &str,
-		status: &str,
-	) -> ClResult<()>;
-
 	/// Add a reaction to an action
 	async fn add_reaction(
 		&self,
@@ -717,11 +719,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// Phase 2: File Management Enhancements
 	//**************************************
-	/// Delete a file (soft delete)
+	/// Delete a file (set status to 'D')
 	async fn delete_file(&self, tn_id: TnId, file_id: &str) -> ClResult<()>;
-
-	/// Decrement file reference count
-	async fn decrement_file_ref(&self, tn_id: TnId, file_id: &str) -> ClResult<()>;
 
 	// Settings Management
 	//*********************

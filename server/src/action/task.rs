@@ -176,7 +176,7 @@ impl Task<App> for ActionCreatorTask {
 			app.auth_adapter.create_action_token(self.tn_id, action_for_token).await?;
 		let action_id = hasher::hash("a", action_token.as_bytes());
 
-		// Finalize the action - sets action_id, updates attachments, and transitions status from 'P' to 'I' atomically
+		// Finalize the action - sets action_id, updates attachments, and transitions status from 'P' to 'A' atomically
 		let attachments_refs: Option<Vec<&str>> =
 			attachments.as_ref().map(|v| v.iter().map(|s| s.as_ref()).collect());
 		app.meta_adapter

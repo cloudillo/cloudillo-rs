@@ -205,9 +205,8 @@ pub async fn patch_action(
 	let _action = action.ok_or(Error::NotFound)?;
 
 	// For now, return placeholder. Full implementation would:
-	// 1. Verify federation_status == "draft"
-	// 2. Update content/attachments
-	// 3. Return updated action
+	// 1. Update content/attachments
+	// 2. Return updated action
 
 	Err(Error::ServiceUnavailable("action updates not yet implemented".into()))
 }

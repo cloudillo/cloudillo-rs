@@ -36,11 +36,9 @@ pub async fn conn_on_create(app: App, context: HookContext) -> ClResult<HookResu
 			tracing::info!("CONN: Establishing connection from {} to {}", context.issuer, audience);
 
 			let profile_update = UpdateProfileData {
-				status: Patch::Undefined,
-				perm: Patch::Undefined,
-				synced: Patch::Undefined,
 				following: Patch::Value(true),
 				connected: Patch::Value(ProfileConnectionStatus::RequestPending),
+				..Default::default()
 			};
 
 			app.meta_adapter.update_profile(tn_id, audience, &profile_update).await?;
@@ -52,13 +50,7 @@ pub async fn conn_on_create(app: App, context: HookContext) -> ClResult<HookResu
 		if let Some(audience) = &context.audience {
 			tracing::info!("CONN: Removing connection from {} to {}", context.issuer, audience);
 
-			let profile_update = UpdateProfileData {
-				status: Patch::Undefined,
-				perm: Patch::Undefined,
-				synced: Patch::Undefined,
-				following: Patch::Undefined,
-				connected: Patch::Null,
-			};
+			let profile_update = UpdateProfileData { connected: Patch::Null, ..Default::default() };
 
 			app.meta_adapter.update_profile(tn_id, audience, &profile_update).await?;
 
@@ -91,11 +83,8 @@ pub async fn conn_on_accept(app: App, context: HookContext) -> ClResult<HookResu
 	let tn_id = TnId(context.tenant_id as u32);
 
 	let profile_update = UpdateProfileData {
-		status: Patch::Undefined,
-		perm: Patch::Undefined,
-		synced: Patch::Undefined,
-		following: Patch::Undefined,
 		connected: Patch::Value(ProfileConnectionStatus::Connected),
+		..Default::default()
 	};
 
 	app.meta_adapter.update_profile(tn_id, &context.issuer, &profile_update).await?;
@@ -114,11 +103,9 @@ pub async fn conn_on_reject(app: App, context: HookContext) -> ClResult<HookResu
 	let tn_id = TnId(context.tenant_id as u32);
 
 	let profile_update = UpdateProfileData {
-		status: Patch::Undefined,
-		perm: Patch::Undefined,
-		synced: Patch::Undefined,
 		following: Patch::Value(false),
 		connected: Patch::Value(ProfileConnectionStatus::Disconnected),
+		..Default::default()
 	};
 
 	app.meta_adapter.update_profile(tn_id, &context.issuer, &profile_update).await?;
@@ -145,13 +132,8 @@ pub async fn fllw_on_create(app: App, context: HookContext) -> ClResult<HookResu
 		if let Some(audience) = &context.audience {
 			tracing::info!("FLLW: {} is now following {}", context.issuer, audience);
 
-			let profile_update = UpdateProfileData {
-				status: Patch::Undefined,
-				perm: Patch::Undefined,
-				synced: Patch::Undefined,
-				following: Patch::Value(true),
-				connected: Patch::Undefined,
-			};
+			let profile_update =
+				UpdateProfileData { following: Patch::Value(true), ..Default::default() };
 
 			app.meta_adapter.update_profile(tn_id, audience, &profile_update).await?;
 
@@ -162,13 +144,7 @@ pub async fn fllw_on_create(app: App, context: HookContext) -> ClResult<HookResu
 		if let Some(audience) = &context.audience {
 			tracing::info!("FLLW: {} is no longer following {}", context.issuer, audience);
 
-			let profile_update = UpdateProfileData {
-				status: Patch::Undefined,
-				perm: Patch::Undefined,
-				synced: Patch::Undefined,
-				following: Patch::Null,
-				connected: Patch::Undefined,
-			};
+			let profile_update = UpdateProfileData { following: Patch::Null, ..Default::default() };
 
 			app.meta_adapter.update_profile(tn_id, audience, &profile_update).await?;
 

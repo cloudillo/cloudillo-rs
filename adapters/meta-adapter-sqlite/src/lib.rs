@@ -108,6 +108,15 @@ impl MetaAdapter for MetaAdapterSqlite {
 	) -> ClResult<(Box<str>, Profile<Box<str>>)> {
 		profile::read(&self.dbr, tn_id, id_tag).await
 	}
+
+	async fn read_profile_roles(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+	) -> ClResult<Option<Box<[Box<str>]>>> {
+		profile::read_roles(&self.dbr, tn_id, id_tag).await
+	}
+
 	async fn create_profile(
 		&self,
 		tn_id: TnId,
@@ -341,19 +350,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 	}
 
 	// Phase 1: Profile Management
-	async fn update_profile_fields(
-		&self,
-		tn_id: TnId,
-		id_tag: &str,
-		name: Option<&str>,
-	) -> ClResult<()> {
-		profile::update_fields(&self.db, tn_id, id_tag, name).await
-	}
-
-	async fn update_profile_image(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()> {
-		profile::update_image(&self.db, tn_id, id_tag, file_id).await
-	}
-
 	async fn list_all_profiles(
 		&self,
 		tn_id: TnId,
@@ -405,15 +401,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::delete(&self.db, tn_id, action_id).await
 	}
 
-	async fn set_action_federation_status(
-		&self,
-		tn_id: TnId,
-		action_id: &str,
-		status: &str,
-	) -> ClResult<()> {
-		action::set_federation_status(&self.db, tn_id, action_id, status).await
-	}
-
 	async fn add_reaction(
 		&self,
 		tn_id: TnId,
@@ -435,10 +422,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn delete_file(&self, tn_id: TnId, file_id: &str) -> ClResult<()> {
 		file::delete(&self.db, tn_id, file_id).await
-	}
-
-	async fn decrement_file_ref(&self, tn_id: TnId, file_id: &str) -> ClResult<()> {
-		file::decrement_ref(&self.db, tn_id, file_id).await
 	}
 
 	// Settings Management

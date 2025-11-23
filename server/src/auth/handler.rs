@@ -8,6 +8,7 @@ use crate::{
 	auth_adapter,
 	core::{
 		extract::{IdTag, OptionalAuth, OptionalRequestId},
+		roles::expand_roles,
 		Auth,
 	},
 	prelude::*,
@@ -249,6 +250,20 @@ pub async fn get_access_token(
 			auth_action.iss,
 			query.scope.as_deref()
 		);
+
+		// Fetch profile roles from meta adapter and expand them
+		let profile_roles = app
+			.meta_adapter
+			.read_profile_roles(tn_id, &auth_action.iss)
+			.await
+			.ok()
+			.flatten();
+
+		let expanded_roles = profile_roles
+			.as_ref()
+			.map(|roles| expand_roles(roles))
+			.filter(|s| !s.is_empty());
+
 		let token_result = app
 			.auth_adapter
 			.create_access_token(
@@ -256,8 +271,7 @@ pub async fn get_access_token(
 				&auth_adapter::AccessToken {
 					iss: &id_tag.0,
 					sub: Some(&auth_action.iss),
-					// FIXME
-					r: None,
+					r: expanded_roles.as_deref(),
 					scope: query.scope.as_deref(),
 					exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
 				},
@@ -274,6 +288,16 @@ pub async fn get_access_token(
 			auth.id_tag,
 			query.scope.as_deref()
 		);
+
+		// Fetch profile roles from meta adapter and expand them
+		let profile_roles =
+			app.meta_adapter.read_profile_roles(tn_id, &auth.id_tag).await.ok().flatten();
+
+		let expanded_roles = profile_roles
+			.as_ref()
+			.map(|roles| expand_roles(roles))
+			.filter(|s| !s.is_empty());
+
 		let token_result = app
 			.auth_adapter
 			.create_access_token(
@@ -281,8 +305,7 @@ pub async fn get_access_token(
 				&auth_adapter::AccessToken {
 					iss: &id_tag.0,
 					sub: Some(&auth.id_tag),
-					// FIXME
-					r: None,
+					r: expanded_roles.as_deref(),
 					scope: query.scope.as_deref(),
 					exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
 				},

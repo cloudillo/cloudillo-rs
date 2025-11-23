@@ -8,8 +8,9 @@ use axum::{
 
 use crate::{
 	core::extract::Auth,
+	meta_adapter::UpdateProfileData,
 	prelude::*,
-	types::{ProfileInfo, ProfilePatch},
+	types::{AdminProfilePatch, ProfileInfo, ProfilePatch},
 };
 
 /// PATCH /me - Update own profile
@@ -20,12 +21,12 @@ pub async fn patch_own_profile(
 ) -> ClResult<(StatusCode, Json<ProfileInfo>)> {
 	let tn_id = auth.tn_id;
 
-	// Extract fields from patch (only include if Value is set)
-	let name =
-		if let crate::types::Patch::Value(n) = &patch.name { Some(n.as_str()) } else { None };
+	// Build profile update from patch
+	let profile_update =
+		UpdateProfileData { name: patch.name.map(|s| s.into()), ..Default::default() };
 
 	// Apply the patch
-	app.meta_adapter.update_profile_fields(tn_id, &auth.id_tag, name).await?;
+	app.meta_adapter.update_profile(tn_id, &auth.id_tag, &profile_update).await?;
 
 	// Fetch updated profile
 	let profile_data = app.meta_adapter.get_profile_info(tn_id, &auth.id_tag).await?;
@@ -47,10 +48,13 @@ pub async fn patch_profile_admin(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(id_tag): Path<String>,
-	Json(patch): Json<ProfilePatch>,
+	Json(patch): Json<AdminProfilePatch>,
 ) -> ClResult<(StatusCode, Json<ProfileInfo>)> {
-	// Check admin permission - ensure user has "admin" role
-	let has_admin_role = auth.roles.iter().any(|role| role.as_ref() == "admin");
+	// Check admin permission - ensure user has "admin" or "site-admin" role
+	let has_admin_role = auth
+		.roles
+		.iter()
+		.any(|role| role.as_ref() == "admin" || role.as_ref() == "site-admin");
 	if !has_admin_role {
 		warn!("Non-admin user {} attempted to modify profile {}", auth.id_tag, id_tag);
 		return Err(Error::PermissionDenied);
@@ -59,11 +63,39 @@ pub async fn patch_profile_admin(
 	let tn_id = app.auth_adapter.read_tn_id(&id_tag).await.ok();
 
 	if let Some(tn_id) = tn_id {
-		// Extract fields from patch
-		let name =
-			if let crate::types::Patch::Value(n) = &patch.name { Some(n.as_str()) } else { None };
+		// Check if ban_reason was provided
+		let has_ban_reason = !matches!(patch.ban_reason, crate::types::Patch::Undefined);
 
-		app.meta_adapter.update_profile_fields(tn_id, &id_tag, name).await?;
+		// Build comprehensive profile update
+		let mut profile_update = UpdateProfileData {
+			name: patch.name.map(|s| s.into()),
+			roles: patch.roles.map(|opt_roles| {
+				opt_roles.map(|roles| roles.into_iter().map(|s| s.into()).collect())
+			}),
+			status: patch.status,
+			ban_expires_at: patch.ban_expires_at,
+			ban_reason: patch.ban_reason.map(|opt_reason| opt_reason.map(|s| s.into())),
+			..Default::default()
+		};
+
+		// Automatically set banned_by when setting ban/suspend/mute status
+		if let crate::types::Patch::Value(status) = patch.status {
+			if matches!(
+				status,
+				crate::meta_adapter::ProfileStatus::Banned
+					| crate::meta_adapter::ProfileStatus::Suspended
+					| crate::meta_adapter::ProfileStatus::Muted
+			) {
+				// Set banned_by to current admin if not explicitly provided
+				if !has_ban_reason {
+					profile_update.banned_by =
+						crate::types::Patch::Value(Some(auth.id_tag.to_string().into()));
+				}
+			}
+		}
+
+		// Single update call for all fields
+		app.meta_adapter.update_profile(tn_id, &id_tag, &profile_update).await?;
 
 		// Fetch updated profile
 		let profile_data = app.meta_adapter.get_profile_info(tn_id, &id_tag).await?;

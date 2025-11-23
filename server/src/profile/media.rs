@@ -1,10 +1,6 @@
 //! Profile image/media handlers
 
-use axum::{
-	extract::{Multipart, State},
-	http::StatusCode,
-	Json,
-};
+use axum::{body::Bytes, extract::State, http::StatusCode, Json};
 use serde_json::json;
 
 use crate::{
@@ -19,36 +15,18 @@ use crate::{
 pub async fn put_profile_image(
 	State(app): State<App>,
 	Auth(auth): Auth,
-	mut multipart: Multipart,
+	body: Bytes,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
-	// Extract image from multipart
-	let mut image_data = Vec::new();
-	let mut content_type = String::new();
-
-	while let Some(field) = multipart
-		.next_field()
-		.await
-		.map_err(|_| Error::NetworkError("multipart error".into()))?
-	{
-		if field.name() == Some("image") {
-			content_type = field.content_type().unwrap_or("image/jpeg").to_string();
-			image_data = field
-				.bytes()
-				.await
-				.map_err(|_| Error::NetworkError("failed to read field bytes".into()))?
-				.to_vec();
-			break;
-		}
-	}
+	// Get image data directly from body
+	let image_data = body.to_vec();
 
 	if image_data.is_empty() {
 		return Err(Error::ValidationError("No image data provided".into()));
 	}
 
-	// Validate content type
-	if !matches!(content_type.as_str(), "image/jpeg" | "image/png" | "image/webp" | "image/avif") {
-		return Err(Error::ValidationError("Invalid image content type".into()));
-	}
+	// Detect content type from image data
+	let content_type = image::detect_image_type(&image_data)
+		.ok_or_else(|| Error::ValidationError("Invalid or unsupported image format".into()))?;
 
 	// Hash image to get blob ID
 	let orig_variant_id = hasher::hash("b", &image_data);
@@ -112,36 +90,18 @@ pub async fn put_profile_image(
 pub async fn put_cover_image(
 	State(app): State<App>,
 	Auth(auth): Auth,
-	mut multipart: Multipart,
+	body: Bytes,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
-	// Extract image from multipart
-	let mut image_data = Vec::new();
-	let mut content_type = String::new();
-
-	while let Some(field) = multipart
-		.next_field()
-		.await
-		.map_err(|_| Error::NetworkError("multipart error".into()))?
-	{
-		if field.name() == Some("image") {
-			content_type = field.content_type().unwrap_or("image/jpeg").to_string();
-			image_data = field
-				.bytes()
-				.await
-				.map_err(|_| Error::NetworkError("failed to read field bytes".into()))?
-				.to_vec();
-			break;
-		}
-	}
+	// Get image data directly from body
+	let image_data = body.to_vec();
 
 	if image_data.is_empty() {
 		return Err(Error::ValidationError("No image data provided".into()));
 	}
 
-	// Validate content type
-	if !matches!(content_type.as_str(), "image/jpeg" | "image/png" | "image/webp" | "image/avif") {
-		return Err(Error::ValidationError("Invalid image content type".into()));
-	}
+	// Detect content type from image data
+	let content_type = image::detect_image_type(&image_data)
+		.ok_or_else(|| Error::ValidationError("Invalid or unsupported image format".into()))?;
 
 	// Hash image to get blob ID
 	let orig_variant_id = hasher::hash("b", &image_data);
