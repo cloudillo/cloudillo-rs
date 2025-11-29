@@ -34,6 +34,7 @@ pub struct CreateAction {
 	pub subject: Option<Box<str>>,
 	#[serde(rename = "expiresAt")]
 	pub expires_at: Option<Timestamp>,
+	pub visibility: Option<char>,
 }
 
 pub async fn create_action(
@@ -56,6 +57,7 @@ pub async fn create_action(
 		subject: action.subject.as_deref(),
 		expires_at: action.expires_at,
 		created_at: Timestamp::now(),
+		visibility: action.visibility,
 	};
 
 	let key = None; // No key needed yet - deduplication happens at finalization
@@ -169,6 +171,7 @@ impl Task<App> for ActionCreatorTask {
 			attachments: attachments.clone(),
 			subject: self.action.subject.clone(),
 			expires_at: self.action.expires_at,
+			visibility: self.action.visibility,
 		};
 
 		// NOW generate the action token with resolved attachment IDs
@@ -382,6 +385,7 @@ mod tests {
 			attachments: None,
 			subject: None,
 			expires_at: None,
+			visibility: None,
 		};
 
 		assert_eq!(action.typ.as_ref(), "POST");

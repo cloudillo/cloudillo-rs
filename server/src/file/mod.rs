@@ -1,6 +1,7 @@
 //! File subsystem. File storage, metadata, documents, etc.
 
 pub mod descriptor;
+pub mod filter;
 pub mod handler;
 pub mod image;
 pub mod management;

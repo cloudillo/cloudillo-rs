@@ -24,7 +24,7 @@ use crate::settings::{FrozenSettingsRegistry, SettingsRegistry};
 use crate::action::dsl::DslEngine;
 use crate::action::hooks::HookRegistry;
 use crate::action::key_cache::KeyFetchCache;
-use crate::{action, file, routes};
+use crate::{action, file, profile, routes};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -368,6 +368,7 @@ impl AppBuilder {
 		// Init modules
 		action::init(&app)?;
 		file::init(&app)?;
+		profile::init(&app)?;
 		crate::email::init(&app)?;
 		super::acme::register_tasks(&app)?;
 		let (api_router, app_router, http_router) = routes::init(app.clone());

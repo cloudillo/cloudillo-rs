@@ -328,6 +328,7 @@ async fn handle_idp_registration(
 		attachments: None,
 		subject: None,
 		expires_at: Some(expires_at),
+		visibility: None,
 	};
 
 	// Generate action JWT token

@@ -468,8 +468,13 @@ impl MetaAdapter for MetaAdapterSqlite {
 	// File Management Enhancements
 	//****************************
 
-	async fn update_file_name(&self, tn_id: TnId, file_id: &str, file_name: &str) -> ClResult<()> {
-		file::update_name(&self.db, tn_id, file_id, file_name).await
+	async fn update_file_data(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		opts: &UpdateFileOptions,
+	) -> ClResult<()> {
+		file::update_data(&self.db, tn_id, file_id, opts).await
 	}
 
 	async fn read_file(&self, tn_id: TnId, file_id: &str) -> ClResult<Option<FileView>> {

@@ -98,9 +98,12 @@ async fn load_file_attrs(
 	app: &App,
 	tn_id: TnId,
 	file_id: &str,
-	_subject_id_tag: &str,
+	subject_id_tag: &str,
 	tenant_id_tag: &str,
 ) -> ClResult<FileAttrs> {
+	use crate::core::abac::VisibilityLevel;
+	use tracing::debug;
+
 	// Get file view from MetaAdapter
 	let file_view = app.meta_adapter.read_file(tn_id, file_id).await?;
 
@@ -113,7 +116,6 @@ async fn load_file_attrs(
 		.as_ref()
 		.and_then(|p| if p.id_tag.is_empty() { None } else { Some(p.id_tag.clone()) })
 		.unwrap_or_else(|| {
-			use tracing::debug;
 			debug!("File has no owner, using tenant_id_tag: {}", tenant_id_tag);
 			tenant_id_tag.into()
 		});
@@ -122,9 +124,46 @@ async fn load_file_attrs(
 	// Default to Read for now - can be enhanced with granular permissions
 	let access_level = crate::types::AccessLevel::Read;
 
-	// Get visibility from file metadata
-	// TODO: Add visibility field to FileView in meta_adapter
-	let visibility = "public".into(); // Default to public for now
+	// Get visibility from file metadata - convert char to string representation
+	let visibility: Box<str> = VisibilityLevel::from_char(file_view.visibility).as_str().into();
+
+	// Look up subject's relationship with the file owner
+	let (following, connected) = if subject_id_tag != "guest" && !subject_id_tag.is_empty() {
+		// Get profile to check relationship status using list_profiles with id_tag filter
+		let opts = crate::meta_adapter::ListProfileOptions {
+			id_tag: Some(subject_id_tag.to_string()),
+			..Default::default()
+		};
+		match app.meta_adapter.list_profiles(tn_id, &opts).await {
+			Ok(profiles) => {
+				if let Some(profile) = profiles.first() {
+					let following = profile.following;
+					let connected = profile.connected;
+					debug!(
+						subject = subject_id_tag,
+						owner = %owner_id_tag,
+						following = following,
+						connected = connected,
+						"Loaded relationship status for file permission check"
+					);
+					(following, connected)
+				} else {
+					debug!(subject = subject_id_tag, "Profile not found, assuming no relationship");
+					(false, false)
+				}
+			}
+			Err(e) => {
+				debug!(
+					subject = subject_id_tag,
+					error = %e,
+					"Failed to load profile, assuming no relationship"
+				);
+				(false, false)
+			}
+		}
+	} else {
+		(false, false)
+	};
 
 	Ok(FileAttrs {
 		file_id: file_view.file_id,
@@ -133,6 +172,8 @@ async fn load_file_attrs(
 		tags: file_view.tags.unwrap_or_default(),
 		visibility,
 		access_level,
+		following,
+		connected,
 	})
 }
 

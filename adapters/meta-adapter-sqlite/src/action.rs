@@ -18,7 +18,7 @@ pub(crate) async fn list(
 		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic,
 		a.subject, a.content, a.created_at, a.expires_at,
 		own.content as own_reaction,
-		a.attachments, a.status, a.reactions, a.comments, a.comments_read
+		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility
 		FROM actions a
 		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
@@ -156,6 +156,8 @@ pub(crate) async fn list(
 			"comments": comments_count,
 			"reactions": reactions_count
 		}));
+		let visibility: Option<String> = row.try_get("visibility").ok();
+		let visibility = visibility.and_then(|s| s.chars().next());
 		actions.push(ActionView {
 			action_id: row.try_get::<Box<str>, _>("action_id").map_err(|_| Error::DbError)?,
 			typ: row.try_get::<Box<str>, _>("type").map_err(|_| Error::DbError)?,
@@ -202,6 +204,7 @@ pub(crate) async fn list(
 				.map_err(|_| Error::DbError)?,
 			status: row.try_get("status").map_err(|_| Error::DbError)?,
 			stat,
+			visibility,
 		})
 	}
 
@@ -277,9 +280,10 @@ pub(crate) async fn create(
 	}
 
 	let status = "P";
+	let visibility = action.visibility.map(|c| c.to_string());
 	let res = sqlx::query(
-		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, expires_at, attachments, status)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING a_id"
+		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, expires_at, attachments, status, visibility)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING a_id"
 	)
 		.bind(tn_id.0)
 		.bind(if action.action_id.is_empty() { None } else { Some(action.action_id) })
@@ -296,6 +300,7 @@ pub(crate) async fn create(
 		.bind(action.expires_at.map(|t| t.0))
 		.bind(action.attachments.as_ref().map(|s| s.join(",")))
 		.bind(status)
+		.bind(visibility)
 		.fetch_one(db)
 		.await
 		.inspect_err(inspect)
@@ -533,7 +538,7 @@ pub(crate) async fn get_by_key(
 	tn_id: TnId,
 	action_key: &str,
 ) -> ClResult<Option<Action<Box<str>>>> {
-	let res = sqlx::query("SELECT action_id, type, sub_type, issuer_tag, parent_id, root_id, audience, content, attachments, subject, created_at, expires_at
+	let res = sqlx::query("SELECT action_id, type, sub_type, issuer_tag, parent_id, root_id, audience, content, attachments, subject, created_at, expires_at, visibility
 		FROM actions WHERE tn_id=? AND key=?")
 		.bind(tn_id.0)
 		.bind(action_key)
@@ -543,6 +548,8 @@ pub(crate) async fn get_by_key(
 		Ok(Some(row)) => {
 			let attachments_str: Option<Box<str>> = row.try_get("attachments").ok();
 			let attachments = attachments_str.map(|s| parse_str_list(&s).to_vec());
+			let visibility: Option<String> = row.try_get("visibility").ok();
+			let visibility = visibility.and_then(|s| s.chars().next());
 
 			Ok(Some(Action {
 				action_id: row.try_get("action_id").map_err(|_| Error::DbError)?,
@@ -560,6 +567,7 @@ pub(crate) async fn get_by_key(
 					.try_get("expires_at")
 					.ok()
 					.and_then(|v: Option<i64>| v.map(Timestamp)),
+				visibility,
 			}))
 		}
 		Ok(None) => Ok(None),
@@ -615,57 +623,82 @@ pub(crate) async fn update_data(
 	action_id: &str,
 	opts: &UpdateActionDataOptions,
 ) -> ClResult<()> {
-	let mut query = sqlx::QueryBuilder::new("UPDATE actions SET ");
-	let mut has_updates = false;
+	use cloudillo::types::Patch;
 
-	if let Some(subject) = &opts.subject {
-		if has_updates {
-			query.push(", ");
-		}
-		query.push("subject=").push_bind(subject.as_str());
-		has_updates = true;
+	// Build dynamic UPDATE query based on which fields are set
+	let mut set_clauses = Vec::new();
+
+	if !opts.subject.is_undefined() {
+		set_clauses.push("subject = ?");
+	}
+	if !opts.reactions.is_undefined() {
+		set_clauses.push("reactions = ?");
+	}
+	if !opts.comments.is_undefined() {
+		set_clauses.push("comments = ?");
+	}
+	if !opts.status.is_undefined() {
+		set_clauses.push("status = ?");
+	}
+	if !opts.visibility.is_undefined() {
+		set_clauses.push("visibility = ?");
 	}
 
-	if let Some(reactions) = opts.reactions {
-		if has_updates {
-			query.push(", ");
-		}
-		query.push("reactions=").push_bind(reactions);
-		has_updates = true;
+	if set_clauses.is_empty() {
+		return Ok(()); // Nothing to update
 	}
 
-	if let Some(comments) = opts.comments {
-		if has_updates {
-			query.push(", ");
-		}
-		query.push("comments=").push_bind(comments);
-		has_updates = true;
+	let sql =
+		format!("UPDATE actions SET {} WHERE tn_id = ? AND action_id = ?", set_clauses.join(", "));
+
+	let mut query = sqlx::query(&sql);
+
+	// Bind values in the same order as set_clauses
+	if !opts.subject.is_undefined() {
+		let val: Option<&str> = match &opts.subject {
+			Patch::Null => None,
+			Patch::Value(v) => Some(v.as_str()),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.reactions.is_undefined() {
+		let val: Option<u32> = match &opts.reactions {
+			Patch::Null => None,
+			Patch::Value(v) => Some(*v),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.comments.is_undefined() {
+		let val: Option<u32> = match &opts.comments {
+			Patch::Null => None,
+			Patch::Value(v) => Some(*v),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.status.is_undefined() {
+		let val: Option<String> = match &opts.status {
+			Patch::Null => None,
+			Patch::Value(c) => Some(c.to_string()),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.visibility.is_undefined() {
+		let val: Option<String> = match &opts.visibility {
+			Patch::Null => None,
+			Patch::Value(c) => Some(c.to_string()),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
 	}
 
-	if let Some(status) = &opts.status {
-		if has_updates {
-			query.push(", ");
-		}
-		query.push("status=").push_bind(status.as_str());
-		has_updates = true;
-	}
+	// Bind WHERE clause params
+	query = query.bind(tn_id.0).bind(action_id);
 
-	if !has_updates {
-		return Ok(());
-	}
-
-	query
-		.push(" WHERE tn_id=")
-		.push_bind(tn_id.0)
-		.push(" AND action_id=")
-		.push_bind(action_id);
-
-	let res = query
-		.build()
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let res = query.execute(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 	if res.rows_affected() == 0 {
 		return Err(Error::NotFound);

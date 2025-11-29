@@ -137,6 +137,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		modified_at datetime,
 		tags json,
 		x json,
+		visibility char(1),			-- NULL: Direct (owner only), P: Public, V: Verified,
+								-- 2: 2nd degree, F: Follower, C: Connected
 		PRIMARY KEY(f_id)
 	)",
 	)
@@ -214,7 +216,9 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		attachments json,
 		reactions integer,
 		comments integer,
-		comments_read integer
+		comments_read integer,
+		visibility char(1)			-- NULL: Direct (owner only), P: Public, V: Verified,
+								-- 2: 2nd degree, F: Follower, C: Connected
 	)",
 	)
 	.execute(&mut *tx)
@@ -305,6 +309,15 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 
 	// Update file_tp to have a default value if it's NULL
 	let _ = sqlx::query("UPDATE files SET file_tp = 'BLOB' WHERE file_tp IS NULL")
+		.execute(&mut *tx)
+		.await;
+
+	// Visibility column migration for files and actions
+	// NULL = Direct (most restrictive), P = Public, V = Verified, 2 = 2nd degree, F = Follower, C = Connected
+	let _ = sqlx::query("ALTER TABLE files ADD COLUMN visibility char(1)")
+		.execute(&mut *tx)
+		.await;
+	let _ = sqlx::query("ALTER TABLE actions ADD COLUMN visibility char(1)")
 		.execute(&mut *tx)
 		.await;
 

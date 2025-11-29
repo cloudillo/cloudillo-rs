@@ -313,6 +313,7 @@ impl<'a> OperationExecutor<'a> {
 				})
 			}),
 			expires_at: None,
+			visibility: None,
 		};
 
 		// Call action creation
@@ -458,12 +459,8 @@ impl<'a> OperationExecutor<'a> {
 		let action_data = self.app.meta_adapter.get_action_data(tn_id, &action_id).await?;
 
 		// Evaluate all update expressions
-		let mut update_opts = meta_adapter::UpdateActionDataOptions {
-			subject: None,
-			reactions: None,
-			comments: None,
-			status: None,
-		};
+		use crate::types::Patch;
+		let mut update_opts = meta_adapter::UpdateActionDataOptions::default();
 
 		for (key, update_value) in updates {
 			match key.as_str() {
@@ -478,13 +475,17 @@ impl<'a> OperationExecutor<'a> {
 							))
 						}
 					};
-					update_opts.status = value.as_str().map(|s| s.to_string()).or_else(|| {
-						if value.is_null() {
-							Some(String::new())
+					update_opts.status = if value.is_null() {
+						Patch::Null
+					} else if let Some(s) = value.as_str() {
+						if let Some(c) = s.chars().next() {
+							Patch::Value(c)
 						} else {
-							None
+							Patch::Null
 						}
-					});
+					} else {
+						Patch::Undefined
+					};
 				}
 				"subject" => {
 					let value = match update_value {
@@ -497,7 +498,13 @@ impl<'a> OperationExecutor<'a> {
 							))
 						}
 					};
-					update_opts.subject = value.as_str().map(|s| s.to_string());
+					update_opts.subject = if value.is_null() {
+						Patch::Null
+					} else if let Some(s) = value.as_str() {
+						Patch::Value(s.to_string())
+					} else {
+						Patch::Undefined
+					};
 				}
 				"reactions" => {
 					let value = match update_value {
@@ -529,7 +536,13 @@ impl<'a> OperationExecutor<'a> {
 							Value::from(current.saturating_sub(dec_val))
 						}
 					};
-					update_opts.reactions = value.as_u64().map(|v| v as u32);
+					update_opts.reactions = if value.is_null() {
+						Patch::Null
+					} else if let Some(v) = value.as_u64() {
+						Patch::Value(v as u32)
+					} else {
+						Patch::Undefined
+					};
 				}
 				"comments" => {
 					let value = match update_value {
@@ -561,7 +574,13 @@ impl<'a> OperationExecutor<'a> {
 							Value::from(current.saturating_sub(dec_val))
 						}
 					};
-					update_opts.comments = value.as_u64().map(|v| v as u32);
+					update_opts.comments = if value.is_null() {
+						Patch::Null
+					} else if let Some(v) = value.as_u64() {
+						Patch::Value(v as u32)
+					} else {
+						Patch::Undefined
+					};
 				}
 				_ => {
 					tracing::warn!("DSL: update_action ignoring unknown field '{}'", key);

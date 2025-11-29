@@ -2,6 +2,7 @@
 
 pub mod delivery;
 pub mod dsl;
+pub mod filter;
 pub mod handler;
 pub mod hooks;
 pub mod key_cache;

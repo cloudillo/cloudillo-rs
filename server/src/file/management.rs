@@ -4,39 +4,30 @@ use axum::{
 	extract::{Path, State},
 	Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::{core::extract::Auth, prelude::*};
+use crate::{core::extract::Auth, meta_adapter::UpdateFileOptions, prelude::*};
 
 /// PATCH /file/:fileId - Update file metadata
-#[derive(Deserialize)]
-pub struct PatchFileRequest {
-	#[serde(rename = "fileName")]
-	pub file_name: Option<String>,
-}
+/// Uses UpdateFileOptions with Patch<> fields for proper null/undefined handling
 
 #[derive(Serialize)]
 pub struct PatchFileResponse {
 	#[serde(rename = "fileId")]
 	pub file_id: String,
-	#[serde(rename = "fileName")]
-	pub file_name: Option<String>,
 }
 
 pub async fn patch_file(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(file_id): Path<String>,
-	Json(req): Json<PatchFileRequest>,
+	Json(opts): Json<UpdateFileOptions>,
 ) -> ClResult<Json<PatchFileResponse>> {
-	// Only update fileName if provided
-	if let Some(file_name) = &req.file_name {
-		app.meta_adapter.update_file_name(auth.tn_id, &file_id, file_name).await?;
-	}
+	app.meta_adapter.update_file_data(auth.tn_id, &file_id, &opts).await?;
 
 	info!("User {} patched file {}", auth.id_tag, file_id);
 
-	Ok(Json(PatchFileResponse { file_id, file_name: req.file_name }))
+	Ok(Json(PatchFileResponse { file_id }))
 }
 
 /// DELETE /file/:fileId - Delete a file

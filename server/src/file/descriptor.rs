@@ -92,6 +92,7 @@ pub fn get_best_file_variant<'a, S: AsRef<str> + Debug + Eq>(
 			.find(|v| v.variant.as_ref() == "sd")
 			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "md"))
 			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "tn"))
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "pf"))
 			.ok_or(Error::NotFound),
 		Some("md") => variants
 			.iter()
@@ -114,8 +115,17 @@ pub fn get_best_file_variant<'a, S: AsRef<str> + Debug + Eq>(
 			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "sd"))
 			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "tn"))
 			.ok_or(Error::NotFound),
+		Some("pf") => variants
+			.iter()
+			.find(|v| v.variant.as_ref() == "pf")
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "tn"))
+			.ok_or(Error::NotFound),
 		Some(_) => Err(Error::NotFound),
-		None => variants.iter().find(|v| v.variant.as_ref() == "tn").ok_or(Error::NotFound),
+		None => variants
+			.iter()
+			.find(|v| v.variant.as_ref() == "tn")
+			.or_else(|| variants.iter().find(|v| v.variant.as_ref() == "pf"))
+			.ok_or(Error::NotFound),
 	};
 	debug!("best variant: {:?} {:?}", best, variants);
 

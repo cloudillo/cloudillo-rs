@@ -6,9 +6,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	action::task::{self, ActionVerifierTask, CreateAction},
+	action::{
+		filter::filter_actions_by_visibility,
+		task::{self, ActionVerifierTask, CreateAction},
+	},
 	core::{
-		extract::{Auth, OptionalRequestId},
+		extract::{Auth, OptionalAuth, OptionalRequestId},
 		hasher::hash,
 		IdTag,
 	},
@@ -20,15 +23,26 @@ use crate::{
 pub async fn list_actions(
 	State(app): State<App>,
 	tn_id: TnId,
+	OptionalAuth(maybe_auth): OptionalAuth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Query(opts): Query<meta_adapter::ListActionOptions>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<meta_adapter::ActionView>>>)> {
 	info!("list_actions");
 	let actions = app.meta_adapter.list_actions(tn_id, &opts).await?;
 
-	let total = actions.len(); // TODO: Add proper pagination tracking to MetaAdapter
-	let response =
-		ApiResponse::with_pagination(actions, 0, 20, total).with_req_id(req_id.unwrap_or_default());
+	// Filter actions by visibility based on subject's access level
+	let (subject_id_tag, is_authenticated) = match &maybe_auth {
+		Some(auth) => (auth.id_tag.as_ref(), true),
+		None => ("", false),
+	};
+
+	let filtered =
+		filter_actions_by_visibility(&app, tn_id, subject_id_tag, is_authenticated, actions)
+			.await?;
+
+	let total = filtered.len(); // TODO: Add proper pagination tracking to MetaAdapter
+	let response = ApiResponse::with_pagination(filtered, 0, 20, total)
+		.with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -371,10 +385,12 @@ pub async fn post_action_reject(
 }
 
 /// POST /api/action/:action_id/stat - Update action statistics
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct UpdateActionStatRequest {
-	pub reactions: Option<u32>,
-	pub comments: Option<u32>,
+	#[serde(default)]
+	pub reactions: crate::types::Patch<u32>,
+	#[serde(default)]
+	pub comments: crate::types::Patch<u32>,
 }
 
 pub async fn post_action_stat(
@@ -386,10 +402,9 @@ pub async fn post_action_stat(
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	// Update action statistics
 	let opts = crate::meta_adapter::UpdateActionDataOptions {
-		subject: None,
 		reactions: req.reactions,
 		comments: req.comments,
-		status: None,
+		..Default::default()
 	};
 
 	app.meta_adapter.update_action_data(auth.tn_id, &action_id, &opts).await?;

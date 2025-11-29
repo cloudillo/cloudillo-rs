@@ -10,6 +10,167 @@ use crate::auth_adapter::AuthCtx;
 use crate::prelude::*;
 use std::collections::HashMap;
 
+/// Visibility levels for resources (files, actions, profile fields)
+///
+/// Stored as single char in database:
+/// - None/NULL = Direct (most restrictive, owner + explicit audience only)
+/// - 'P' = Public (anyone, including unauthenticated)
+/// - 'V' = Verified (any authenticated user from any federated instance)
+/// - '2' = 2nd degree (friend of friend, reserved for future voucher token system)
+/// - 'F' = Follower (authenticated user who follows the owner)
+/// - 'C' = Connected (authenticated user who is connected/mutual with owner)
+///
+/// Hierarchy (from most permissive to most restrictive):
+/// Public > Verified > 2nd Degree > Follower > Connected > Direct
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VisibilityLevel {
+	/// Anyone can access, including unauthenticated users
+	Public,
+	/// Any authenticated user from any federated instance
+	Verified,
+	/// Friend of friend (2nd degree connection) - reserved for voucher token system
+	SecondDegree,
+	/// Authenticated user who follows the owner
+	Follower,
+	/// Authenticated user who is connected (mutual) with owner
+	Connected,
+	/// Most restrictive - only owner and explicit audience
+	#[default]
+	Direct,
+}
+
+impl VisibilityLevel {
+	/// Parse from database char value
+	pub fn from_char(c: Option<char>) -> Self {
+		match c {
+			Some('P') => Self::Public,
+			Some('V') => Self::Verified,
+			Some('2') => Self::SecondDegree,
+			Some('F') => Self::Follower,
+			Some('C') => Self::Connected,
+			None => Self::Direct, // NULL = Direct (most restrictive)
+			_ => Self::Direct,    // Unknown = Direct (secure by default)
+		}
+	}
+
+	/// Convert to database char value
+	pub fn to_char(self) -> Option<char> {
+		match self {
+			Self::Public => Some('P'),
+			Self::Verified => Some('V'),
+			Self::SecondDegree => Some('2'),
+			Self::Follower => Some('F'),
+			Self::Connected => Some('C'),
+			Self::Direct => None,
+		}
+	}
+
+	/// Convert to string for attribute lookup
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			Self::Public => "public",
+			Self::Verified => "verified",
+			Self::SecondDegree => "second_degree",
+			Self::Follower => "follower",
+			Self::Connected => "connected",
+			Self::Direct => "direct",
+		}
+	}
+}
+
+/// Subject's access level to a resource based on their relationship with the owner
+///
+/// Used to determine if a subject meets the visibility requirements.
+/// Higher levels grant access to more restrictive visibility settings.
+///
+/// Hierarchy: Owner > Connected > Follower > SecondDegree > Verified > Public > None
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SubjectAccessLevel {
+	/// No authentication or relationship
+	#[default]
+	None,
+	/// Unauthenticated but public access requested
+	Public,
+	/// Authenticated user (has valid JWT from any federated instance)
+	Verified,
+	/// Has voucher token proving 2nd degree connection (future)
+	SecondDegree,
+	/// Follows the resource owner
+	Follower,
+	/// Connected (mutual) with resource owner
+	Connected,
+	/// Is the resource owner
+	Owner,
+}
+
+impl SubjectAccessLevel {
+	/// Check if this access level can view content with given visibility
+	pub fn can_access(self, visibility: VisibilityLevel) -> bool {
+		match visibility {
+			VisibilityLevel::Public => true, // Everyone can access public
+			VisibilityLevel::Verified => self >= Self::Verified,
+			VisibilityLevel::SecondDegree => self >= Self::SecondDegree,
+			VisibilityLevel::Follower => self >= Self::Follower,
+			VisibilityLevel::Connected => self >= Self::Connected,
+			VisibilityLevel::Direct => self >= Self::Owner, // Only owner for direct
+		}
+	}
+}
+
+/// Check if subject can view an item based on visibility and relationship
+///
+/// This is a standalone function for use in list filtering where we don't
+/// have full ABAC context. It evaluates visibility rules directly.
+///
+/// # Arguments
+/// * `subject_id_tag` - The viewer's id_tag (empty string for anonymous)
+/// * `is_authenticated` - Whether the subject is authenticated
+/// * `item_owner_id_tag` - The item owner/issuer's id_tag
+/// * `visibility` - The item's visibility level (None = Direct)
+/// * `subject_following_owner` - Whether the subject follows the owner
+/// * `subject_connected_to_owner` - Whether the subject is connected to owner
+/// * `audience_tags` - Optional list of audience id_tags (for Direct visibility)
+pub fn can_view_item(
+	subject_id_tag: &str,
+	is_authenticated: bool,
+	item_owner_id_tag: &str,
+	visibility: Option<char>,
+	subject_following_owner: bool,
+	subject_connected_to_owner: bool,
+	audience_tags: Option<&[&str]>,
+) -> bool {
+	let visibility = VisibilityLevel::from_char(visibility);
+
+	// Determine subject's access level
+	// Note: "guest" id_tag is used for unauthenticated users - treat as Public
+	let is_real_auth = is_authenticated && !subject_id_tag.is_empty() && subject_id_tag != "guest";
+	let access_level = if subject_id_tag == item_owner_id_tag {
+		SubjectAccessLevel::Owner
+	} else if subject_connected_to_owner {
+		SubjectAccessLevel::Connected
+	} else if subject_following_owner {
+		SubjectAccessLevel::Follower
+	} else if is_real_auth {
+		SubjectAccessLevel::Verified
+	} else {
+		SubjectAccessLevel::Public
+	};
+
+	// Check basic access
+	if access_level.can_access(visibility) {
+		return true;
+	}
+
+	// For Direct visibility, also check explicit audience
+	if visibility == VisibilityLevel::Direct {
+		if let Some(tags) = audience_tags {
+			return tags.contains(&subject_id_tag);
+		}
+	}
+
+	false
+}
+
 /// Attribute set trait - all objects implement this
 pub trait AttrSet: Send + Sync {
 	/// Get a single string attribute
@@ -345,69 +506,75 @@ impl PermissionChecker {
 		false
 	}
 
-	/// Check visibility-based access
+	/// Check visibility-based access using the new VisibilityLevel enum
+	///
+	/// Determines subject's access level and checks against resource visibility.
+	/// Supports both char-based visibility (from DB) and string-based (legacy).
 	fn check_visibility(&self, subject: &AuthCtx, object: &dyn AttrSet) -> bool {
 		use tracing::debug;
 
-		let visibility = object.get("visibility").unwrap_or("private");
+		// Parse visibility from object attributes
+		// Try char-based first (from "visibility_char"), then fall back to string
+		let visibility = if let Some(vis_char) = object.get("visibility_char") {
+			VisibilityLevel::from_char(vis_char.chars().next())
+		} else if let Some(vis_str) = object.get("visibility") {
+			match vis_str {
+				"public" | "P" => VisibilityLevel::Public,
+				"verified" | "V" => VisibilityLevel::Verified,
+				"second_degree" | "2" => VisibilityLevel::SecondDegree,
+				"follower" | "followers" | "F" => VisibilityLevel::Follower,
+				"connected" | "C" => VisibilityLevel::Connected,
+				"direct" | "private" | "D" => VisibilityLevel::Direct,
+				_ => VisibilityLevel::Direct, // Unknown = Direct (secure by default)
+			}
+		} else {
+			VisibilityLevel::Direct // No visibility = Direct (most restrictive)
+		};
 
-		match visibility {
-			"public" => {
-				debug!(subject = %subject.id_tag, visibility = "public", "Public visibility allows access");
-				true
-			}
-			"private" => {
-				// Only owner can access
-				let is_owner = object.get("owner_id_tag") == Some(subject.id_tag.as_ref());
-				if is_owner {
-					debug!(subject = %subject.id_tag, visibility = "private", owner = object.get("owner_id_tag").unwrap_or("unknown"), "Owner can access private content");
-				} else {
-					debug!(subject = %subject.id_tag, visibility = "private", owner = object.get("owner_id_tag").unwrap_or("unknown"), "Non-owner cannot access private content");
-				}
-				is_owner
-			}
-			"followers" => {
-				// Check if subject follows owner
-				let is_owner = object.get("owner_id_tag") == Some(subject.id_tag.as_ref());
-				let is_follower = object.get("following") == Some("true");
-				let allowed = is_follower || is_owner;
-				if allowed {
-					debug!(subject = %subject.id_tag, visibility = "followers", is_owner = is_owner, is_follower = is_follower, "Follower visibility allows access");
-				} else {
-					debug!(subject = %subject.id_tag, visibility = "followers", is_owner = is_owner, is_follower = is_follower, "Not a follower and not owner - denied");
-				}
-				allowed
-			}
-			"connected" => {
-				// Check if subject is connected to owner
-				let is_owner = object.get("owner_id_tag") == Some(subject.id_tag.as_ref());
-				let is_connected = object.get("connected") == Some("true");
-				let allowed = is_connected || is_owner;
-				if allowed {
-					debug!(subject = %subject.id_tag, visibility = "connected", is_owner = is_owner, is_connected = is_connected, "Connected visibility allows access");
-				} else {
-					debug!(subject = %subject.id_tag, visibility = "connected", is_owner = is_owner, is_connected = is_connected, "Not connected and not owner - denied");
-				}
-				allowed
-			}
-			"direct" => {
-				// Check audience list
-				let is_owner = object.get("owner_id_tag") == Some(subject.id_tag.as_ref());
-				let is_issuer = object.get("issuer_id_tag") == Some(subject.id_tag.as_ref());
-				let in_audience = object.contains("audience_tag", subject.id_tag.as_ref());
-				let allowed = in_audience || is_owner || is_issuer;
-				if allowed {
-					debug!(subject = %subject.id_tag, visibility = "direct", in_audience = in_audience, is_owner = is_owner, is_issuer = is_issuer, "Direct audience check allows access");
-				} else {
-					debug!(subject = %subject.id_tag, visibility = "direct", in_audience = in_audience, is_owner = is_owner, is_issuer = is_issuer, "Not in audience - denied");
-				}
-				allowed
-			}
-			_ => {
-				debug!(subject = %subject.id_tag, visibility = visibility, "Unknown visibility level - denied");
-				false
-			}
-		}
+		// Determine subject's access level based on relationship with resource
+		let is_owner = object.get("owner_id_tag") == Some(subject.id_tag.as_ref());
+		let is_issuer = object.get("issuer_id_tag") == Some(subject.id_tag.as_ref());
+		let is_connected = object.get("connected") == Some("true");
+		let is_follower = object.get("following") == Some("true");
+		let in_audience = object.contains("audience_tag", subject.id_tag.as_ref());
+
+		// Calculate subject's effective access level
+		// Note: "guest" id_tag is used for unauthenticated users - treat as Public
+		let is_authenticated = !subject.id_tag.is_empty() && subject.id_tag.as_ref() != "guest";
+		let access_level = if is_owner || is_issuer {
+			SubjectAccessLevel::Owner
+		} else if is_connected {
+			SubjectAccessLevel::Connected
+		} else if is_follower {
+			SubjectAccessLevel::Follower
+		} else if is_authenticated {
+			// Authenticated user without specific relationship
+			SubjectAccessLevel::Verified
+		} else {
+			SubjectAccessLevel::Public
+		};
+
+		// Check if access level meets visibility requirement
+		let allowed = access_level.can_access(visibility);
+
+		// For Direct visibility, also check explicit audience
+		let allowed =
+			if visibility == VisibilityLevel::Direct { allowed || in_audience } else { allowed };
+
+		debug!(
+			subject = %subject.id_tag,
+			visibility = ?visibility,
+			access_level = ?access_level,
+			is_owner = is_owner,
+			is_issuer = is_issuer,
+			is_connected = is_connected,
+			is_follower = is_follower,
+			in_audience = in_audience,
+			allowed = allowed,
+			"Visibility check"
+		);
+
+		allowed
 	}
 
 	/// Evaluate collection policy (for CREATE operations)

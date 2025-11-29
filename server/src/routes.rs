@@ -33,20 +33,20 @@ fn init_api_service(app: App) -> Router {
 
 	// Action routes with permission checks
 	// Note: We need to separate routes by permission level to avoid middleware conflicts
+	// Read routes go to public router (with optional_auth) to support public visibility
 	let action_router_read = Router::new()
 		.route("/api/action/{action_id}", get(action::handler::get_action_by_id))
-		.route("/api/action/{action_id}/stat", post(action::handler::post_action_stat))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("read")));
 
+	// Write routes require authentication
 	let action_router_write = Router::new()
+		.route("/api/action/{action_id}/stat", post(action::handler::post_action_stat))
 		.route("/api/action/{action_id}", patch(action::handler::patch_action))
 		.route("/api/action/{action_id}", delete(action::handler::delete_action))
 		.route("/api/action/{action_id}/accept", post(action::handler::post_action_accept))
 		.route("/api/action/{action_id}/reject", post(action::handler::post_action_reject))
 		.route("/api/action/{action_id}/reaction", post(action::handler::post_action_reaction))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("write")));
-
-	let action_router = action_router_read.merge(action_router_write);
 
 	// Profile routes with permission checks
 	// Note: We need to separate routes by permission level to avoid middleware conflicts
@@ -67,20 +67,20 @@ fn init_api_service(app: App) -> Router {
 
 	// File routes with permission checks
 	// Note: We need to separate routes by permission level to avoid middleware conflicts
+	// Read routes go to public router (with optional_auth) to support public visibility
 	let file_router_read = Router::new()
 		.route("/api/file/variant/{variant_id}", get(file::handler::get_file_variant))
 		.route("/api/file/{file_id}/descriptor", get(file::handler::get_file_descriptor))
 		.route("/api/file/{file_id}", get(file::handler::get_file_variant_file_id))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("read")));
 
+	// Write routes require authentication
 	let file_router_write = Router::new()
 		.route("/api/file/{file_id}", patch(file::management::patch_file))
 		.route("/api/file/{file_id}", delete(file::management::delete_file))
 		.route("/api/file/{file_id}/tag/{tag}", put(file::tag::put_file_tag))
 		.route("/api/file/{file_id}/tag/{tag}", delete(file::tag::delete_file_tag))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("write")));
-
-	let file_router = file_router_read.merge(file_router_write);
 
 	// File POST routes (file creation) - note: uses different path parameters (preset, file_name)
 	// These routes don't use path-based permission checks since they create new files
@@ -101,10 +101,9 @@ fn init_api_service(app: App) -> Router {
 		.route("/api/refs", post(r#ref::handler::create_ref))
 		.route("/api/refs/{ref_id}", delete(r#ref::handler::delete_ref))
 
-		// Action API
-		.route("/api/action", get(action::handler::list_actions))
+		// Action API (write only - read routes in public_router)
 		.route("/api/action", post(action::handler::post_action))
-		.merge(action_router)
+		.merge(action_router_write)
 
 		// Profile API
 		.route("/api/me", patch(profile::update::patch_own_profile))
@@ -113,11 +112,10 @@ fn init_api_service(app: App) -> Router {
 		.route("/api/profile", get(profile::list::list_profiles))
 		.merge(profile_router)
 
-		// File API
-		.route("/api/file", get(file::handler::get_file_list))
+		// File API (write only - read routes in public_router)
 		.route("/api/file", post(file::handler::post_file))
 		.route("/api/file/{preset}/{file_name}", post(file::handler::post_file_blob))
-		.merge(file_router)
+		.merge(file_router_write)
 
 		// Tag API
 		.route("/api/tag", get(file::tag::list_tags))
@@ -165,6 +163,14 @@ fn init_api_service(app: App) -> Router {
 		// Inbox
 		.route("/api/inbox", post(action::handler::post_inbox))
 		.route("/api/inbox/sync", post(action::handler::post_inbox_sync))
+
+		// Action API (read routes with visibility-based access)
+		.route("/api/action", get(action::handler::list_actions))
+		.merge(action_router_read)
+
+		// File API (read routes with visibility-based access)
+		.route("/api/file", get(file::handler::get_file_list))
+		.merge(file_router_read)
 
 		// WebSocket APIs
 		.route("/ws/bus", any(websocket::get_ws_bus))

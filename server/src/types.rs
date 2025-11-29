@@ -504,6 +504,10 @@ pub struct ActionAttrs {
 	pub audience_tag: Vec<Box<str>>,
 	pub tags: Vec<Box<str>>,
 	pub visibility: Box<str>,
+	/// Whether the subject follows the action issuer
+	pub following: bool,
+	/// Whether the subject is connected (mutual) with the action issuer
+	pub connected: bool,
 }
 
 impl AttrSet for ActionAttrs {
@@ -515,6 +519,8 @@ impl AttrSet for ActionAttrs {
 			"parent_id" => self.parent_id.as_deref(),
 			"root_id" => self.root_id.as_deref(),
 			"visibility" => Some(&self.visibility),
+			"following" => Some(if self.following { "true" } else { "false" }),
+			"connected" => Some(if self.connected { "true" } else { "false" }),
 			_ => None,
 		}
 	}
@@ -537,6 +543,10 @@ pub struct FileAttrs {
 	pub tags: Vec<Box<str>>,
 	pub visibility: Box<str>,
 	pub access_level: AccessLevel,
+	/// Whether the subject follows the file owner
+	pub following: bool,
+	/// Whether the subject is connected (mutual) with the file owner
+	pub connected: bool,
 }
 
 impl AttrSet for FileAttrs {
@@ -547,6 +557,8 @@ impl AttrSet for FileAttrs {
 			"mime_type" => Some(&self.mime_type),
 			"visibility" => Some(&self.visibility),
 			"access_level" => Some(self.access_level.as_str()),
+			"following" => Some(if self.following { "true" } else { "false" }),
+			"connected" => Some(if self.connected { "true" } else { "false" }),
 			_ => None,
 		}
 	}

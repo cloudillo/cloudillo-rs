@@ -109,7 +109,7 @@ pub struct Profile<S: AsRef<str>> {
 	pub connected: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ListProfileOptions {
 	#[serde(rename = "type")]
 	pub typ: Option<ProfileType>,
@@ -179,12 +179,14 @@ pub struct ActionData {
 	pub comments: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Options for updating action metadata
+#[derive(Debug, Clone, Default)]
 pub struct UpdateActionDataOptions {
-	pub subject: Option<String>,
-	pub reactions: Option<u32>,
-	pub comments: Option<u32>,
-	pub status: Option<String>,
+	pub subject: Patch<String>,
+	pub reactions: Patch<u32>,
+	pub comments: Patch<u32>,
+	pub status: Patch<char>,
+	pub visibility: Patch<char>,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +251,7 @@ pub struct Action<S: AsRef<str>> {
 	pub subject: Option<S>,
 	pub created_at: Timestamp,
 	pub expires_at: Option<Timestamp>,
+	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -289,6 +292,7 @@ pub struct ActionView {
 	pub status: Option<Box<str>>,
 	#[serde(rename = "stat")]
 	pub stat: Option<serde_json::Value>,
+	pub visibility: Option<char>,
 }
 
 /// Reaction data
@@ -343,6 +347,7 @@ pub struct FileView {
 	pub created_at: Timestamp,
 	pub status: FileStatus,
 	pub tags: Option<Vec<Box<str>>>,
+	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
 }
 
 #[skip_serializing_none]
@@ -405,6 +410,7 @@ pub struct CreateFile {
 	pub created_at: Option<Timestamp>,
 	pub tags: Option<Vec<Box<str>>>,
 	pub x: Option<serde_json::Value>,
+	pub visibility: Option<char>, // None: Direct (default), P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -416,12 +422,15 @@ pub struct CreateFileVariant {
 	pub available: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Options for updating file metadata
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct UpdateFileOptions {
-	#[serde(rename = "fileName")]
-	file_name: Option<String>,
-	created_at: Option<Timestamp>,
-	status: Option<String>,
+	#[serde(default, rename = "fileName")]
+	pub file_name: Patch<String>,
+	#[serde(default)]
+	pub visibility: Patch<char>,
+	#[serde(default)]
+	pub status: Patch<char>,
 }
 
 // Tasks
@@ -760,8 +769,13 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// File Management Enhancements
 	//****************************
-	/// Update file name
-	async fn update_file_name(&self, tn_id: TnId, file_id: &str, file_name: &str) -> ClResult<()>;
+	/// Update file metadata (name, visibility, status)
+	async fn update_file_data(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		opts: &UpdateFileOptions,
+	) -> ClResult<()>;
 
 	/// Read file metadata
 	async fn read_file(&self, tn_id: TnId, file_id: &str) -> ClResult<Option<FileView>>;

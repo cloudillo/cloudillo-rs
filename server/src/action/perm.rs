@@ -84,8 +84,11 @@ async fn load_action_attrs(
 	app: &App,
 	tn_id: TnId,
 	action_id: &str,
-	_subject_id_tag: &str,
+	subject_id_tag: &str,
 ) -> ClResult<ActionAttrs> {
+	use crate::core::abac::VisibilityLevel;
+	use tracing::debug;
+
 	// Get action view from MetaAdapter
 	let action_view = app.meta_adapter.get_action(tn_id, action_id).await?;
 
@@ -98,12 +101,45 @@ async fn load_action_attrs(
 		.map(|p| vec![p.id_tag.clone()])
 		.unwrap_or_default();
 
-	// Determine visibility based on audience and action properties
-	// TODO: Add explicit visibility field to ActionView for more fine-grained control
-	let visibility = if audience_tag.is_empty() {
-		"public".into()
+	// Get visibility from action metadata - convert char to string representation
+	let visibility: Box<str> = VisibilityLevel::from_char(action_view.visibility).as_str().into();
+
+	// Look up subject's relationship with the action issuer
+	let (following, connected) = if subject_id_tag != "guest" && !subject_id_tag.is_empty() {
+		// Get profile to check relationship status using list_profiles with id_tag filter
+		let opts = crate::meta_adapter::ListProfileOptions {
+			id_tag: Some(subject_id_tag.to_string()),
+			..Default::default()
+		};
+		match app.meta_adapter.list_profiles(tn_id, &opts).await {
+			Ok(profiles) => {
+				if let Some(profile) = profiles.first() {
+					let following = profile.following;
+					let connected = profile.connected;
+					debug!(
+						subject = subject_id_tag,
+						issuer = %action_view.issuer.id_tag,
+						following = following,
+						connected = connected,
+						"Loaded relationship status for action permission check"
+					);
+					(following, connected)
+				} else {
+					debug!(subject = subject_id_tag, "Profile not found, assuming no relationship");
+					(false, false)
+				}
+			}
+			Err(e) => {
+				debug!(
+					subject = subject_id_tag,
+					error = %e,
+					"Failed to load profile, assuming no relationship"
+				);
+				(false, false)
+			}
+		}
 	} else {
-		"direct".into() // Has specific audience
+		(false, false)
 	};
 
 	Ok(ActionAttrs {
@@ -115,5 +151,7 @@ async fn load_action_attrs(
 		audience_tag,
 		tags: vec![], // TODO: Extract tags from action metadata when available
 		visibility,
+		following,
+		connected,
 	})
 }
