@@ -120,29 +120,76 @@ impl CronSchedule {
 	/// Calculate the next execution time after the given timestamp
 	///
 	/// # Algorithm
-	/// Searches forward minute by minute from the next minute after `after`
-	/// until it finds a matching datetime. Limited to search 4 years ahead
-	/// to prevent infinite loops on impossible schedules.
+	/// - If minute+hour specified: O(1) direct calculation
+	/// - If minute specified: checks once per hour (max 8,760 iterations/year)
+	/// - If wildcards: checks every minute (max 525,600 iterations/year)
+	///
+	/// This is dramatically more efficient than naive minute-by-minute search.
 	pub fn next_execution(&self, after: Timestamp) -> Timestamp {
-		// Start searching from the next minute
-		let mut ts = after.add_seconds(60);
-		// Zero out the seconds to align to minute boundaries
-		ts = Timestamp(ts.0 - (ts.0 % 60));
+		const SECONDS_PER_MINUTE: i64 = 60;
+		const MINUTES_PER_HOUR: i64 = 60;
+		const HOURS_PER_DAY: i64 = 24;
+		const SECONDS_PER_HOUR: i64 = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;
+		const SECONDS_PER_DAY: i64 = SECONDS_PER_HOUR * HOURS_PER_DAY;
 
-		// Limit search to 4 years (max 2,102,400 minutes)
-		// If we don't find a match by then, something is wrong with the cron
-		let search_limit = ts.0 + (4 * 365 * 24 * 60 * 60);
+		// Special optimization: if both minute and hour are specified,
+		// we can calculate the next occurrence directly in O(1) time
+		if self.minute <= 59 && self.hour <= 23 {
+			// Calculate target time in seconds from start of day
+			let target_sod =
+				(self.hour as i64 * SECONDS_PER_HOUR) + (self.minute as i64 * SECONDS_PER_MINUTE);
 
-		while ts.0 < search_limit {
+			// Find current day and time of day
+			let days_since_epoch = after.0 / SECONDS_PER_DAY;
+			let current_sod = after.0 % SECONDS_PER_DAY;
+
+			// If we haven't reached target time today, schedule for today
+			if current_sod < target_sod {
+				return Timestamp(days_since_epoch * SECONDS_PER_DAY + target_sod);
+			} else {
+				// Otherwise schedule for tomorrow
+				return Timestamp((days_since_epoch + 1) * SECONDS_PER_DAY + target_sod);
+			}
+		}
+
+		// For other patterns, use iterative search with smart increments
+		// Start from next minute boundary
+		let start = ((after.0 / SECONDS_PER_MINUTE) + 1) * SECONDS_PER_MINUTE;
+
+		// Determine increment: hourly if minute is specified, else every minute
+		let increment = if self.minute <= 59 {
+			// Minute specified (e.g., "30 * * * *"): check once per hour
+			SECONDS_PER_HOUR
+		} else {
+			// Wildcards or just hour specified: check every minute
+			SECONDS_PER_MINUTE
+		};
+
+		let mut ts = Timestamp(start);
+		let limit = after.0 + (4 * 365 * SECONDS_PER_DAY);
+
+		while ts.0 < limit {
 			if self.matches(&ts) {
 				return ts;
 			}
-			ts = ts.add_seconds(60); // Advance by 1 minute
+			ts = ts.add_seconds(increment);
 		}
 
-		// If we get here, the cron expression matched nothing in 4 years
-		// Return after + 1 year as a fallback
-		after.add_seconds(365 * 24 * 60 * 60)
+		// Fallback if no match found in 4 years
+		after.add_seconds(365 * SECONDS_PER_DAY)
+	}
+
+	/// Convert back to standard cron format string
+	/// Converts internal encoding (max+1 = "any") back to "*" format
+	pub fn to_cron_string(&self) -> String {
+		let minute_str = if self.minute == 60 { "*".to_string() } else { self.minute.to_string() };
+		let hour_str = if self.hour == 24 { "*".to_string() } else { self.hour.to_string() };
+		let day_str = if self.day == 32 { "*".to_string() } else { self.day.to_string() };
+		let month_str = if self.month == 13 { "*".to_string() } else { self.month.to_string() };
+		let weekday_str =
+			if self.weekday == 7 { "*".to_string() } else { self.weekday.to_string() };
+
+		format!("{} {} {} {} {}", minute_str, hour_str, day_str, month_str, weekday_str)
 	}
 }
 
@@ -263,14 +310,13 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 
 		// Store cron schedule if present
 		if let Some(cron) = &task.cron {
-			let cron_str = format!(
-				"{} {} {} {} {}",
-				cron.minute, cron.hour, cron.day, cron.month, cron.weekday
-			);
 			self.meta_adapter
 				.update_task(
 					id,
-					&meta_adapter::TaskPatch { cron: Patch::Value(cron_str), ..Default::default() },
+					&meta_adapter::TaskPatch {
+						cron: Patch::Value(cron.to_cron_string()),
+						..Default::default()
+					},
 				)
 				.await?;
 		}
@@ -369,11 +415,7 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 
 		// Update cron schedule
 		if let Some(ref cron) = task.cron {
-			let cron_str = format!(
-				"{} {} {} {} {}",
-				cron.minute, cron.hour, cron.day, cron.month, cron.weekday
-			);
-			patch.cron = Patch::Value(cron_str);
+			patch.cron = Patch::Value(cron.to_cron_string());
 		}
 
 		self.meta_adapter.update_task(id, &patch).await
