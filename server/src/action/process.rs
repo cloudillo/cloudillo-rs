@@ -1,9 +1,9 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use itertools::Itertools;
 use jsonwebtoken::{self as jwt, Algorithm, Validation};
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::de::DeserializeOwned;
 
-use crate::{auth_adapter::ActionToken, file::descriptor, meta_adapter, prelude::*};
+use crate::{auth_adapter::ActionToken, meta_adapter, prelude::*};
 
 /// Decodes a JWT without verifying the signature
 pub fn decode_jwt_no_verify<T: DeserializeOwned>(jwt: &str) -> ClResult<T> {
@@ -330,55 +330,28 @@ pub async fn process_inbound_action_token(
 	}
 }
 
-#[derive(Debug, Deserialize)]
-struct Descriptor {
-	file: Box<str>,
-}
-
 async fn process_inbound_action_attachments(
 	app: &App,
 	tn_id: TnId,
 	id_tag: &str,
 	attachments: Vec<Box<str>>,
 ) -> ClResult<()> {
+	use crate::file::sync::sync_file_variants;
+
 	for attachment in attachments {
 		info!("  syncing attachment: {}", attachment);
-		if let Ok(descriptor) = app
-			.request
-			.get::<Descriptor>(tn_id, id_tag, format!("/file/{}/descriptor", attachment).as_str())
-			.await
-		{
-			info!("  attachment descriptor: {:?}", descriptor.file);
-			let variants = descriptor::parse_file_descriptor(&descriptor.file)?;
-			info!("  attachment variants: {:?}", variants);
-			for variant in variants {
-				if app.blob_adapter.stat_blob(tn_id, variant.variant_id).await.is_none() {
-					if variant.variant != "hd" {
-						// FIXME settings
-						info!("  downloading attachment: {}", variant.variant_id);
-
-						let mut stream = app
-							.request
-							.get_stream(
-								tn_id,
-								id_tag,
-								&format!("/file/variant/{}", variant.variant_id),
-							)
-							.await?;
-						let _res = app
-							.blob_adapter
-							.create_blob_stream(tn_id, variant.variant_id, &mut stream)
-							.await;
-						info!("  attachment downloaded: {}", variant.variant_id);
-					} else {
-						info!("  skipping attachment: {} {}", variant.variant, variant.variant_id);
-					}
-				} else {
-					info!(
-						"  attachment already downloaded: {} {}",
-						variant.variant, variant.variant_id
-					);
-				}
+		match sync_file_variants(app, tn_id, id_tag, &attachment, None).await {
+			Ok(result) => {
+				info!(
+					"  attachment {} sync complete: {} synced, {} skipped, {} failed",
+					attachment,
+					result.synced_variants.len(),
+					result.skipped_variants.len(),
+					result.failed_variants.len()
+				);
+			}
+			Err(e) => {
+				warn!("  failed to sync attachment {}: {}", attachment, e);
 			}
 		}
 	}

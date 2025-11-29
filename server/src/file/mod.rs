@@ -8,6 +8,7 @@ pub mod management;
 pub mod perm;
 pub mod settings;
 pub mod store;
+pub mod sync;
 pub mod tag;
 
 use crate::prelude::*;
