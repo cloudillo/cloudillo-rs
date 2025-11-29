@@ -73,21 +73,41 @@ async fn load_profile_attrs(
 	id_tag: &str,
 	_subject_id_tag: &str,
 ) -> ClResult<ProfileAttrs> {
-	// Get profile data from MetaAdapter
-	let profile_data = app.meta_adapter.get_profile_info(tn_id, id_tag).await?;
+	// Get profile data from MetaAdapter - if not found, return default attrs
+	match app.meta_adapter.get_profile_info(tn_id, id_tag).await {
+		Ok(profile_data) => {
+			// Determine if subject is following or connected to target
+			// For now, default to false - in Phase 4 this will query relationship metadata
+			let following = false;
+			let connected = false;
 
-	// Determine if subject is following or connected to target
-	// For now, default to false - in Phase 4 this will query relationship metadata
-	let following = false;
-	let connected = false;
-
-	Ok(ProfileAttrs {
-		id_tag: profile_data.id_tag,
-		profile_type: profile_data.profile_type,
-		tenant_tag: id_tag.into(), // tenant_tag refers to the profile owner
-		roles: vec![],             // TODO: Query actual roles from relationship metadata in Phase 4
-		status: "active".into(),   // TODO: Query actual profile status from MetaAdapter
-		following,
-		connected,
-	})
+			Ok(ProfileAttrs {
+				id_tag: profile_data.id_tag,
+				profile_type: profile_data.profile_type,
+				tenant_tag: id_tag.into(), // tenant_tag refers to the profile owner
+				roles: vec![],             // TODO: Query actual roles from relationship metadata in Phase 4
+				status: "active".into(),   // TODO: Query actual profile status from MetaAdapter
+				following,
+				connected,
+				visibility: "public".into(), // Profiles are publicly readable
+			})
+		}
+		Err(Error::NotFound) => {
+			// Profile doesn't exist locally - return default attrs
+			// This allows read operations to proceed (handler will return empty object)
+			Ok(ProfileAttrs {
+				id_tag: id_tag.into(),
+				profile_type: "person".into(),
+				tenant_tag: id_tag.into(),
+				roles: vec![],
+				status: "unknown".into(),
+				following: false,
+				connected: false,
+				visibility: "public".into(), // Profiles are publicly readable
+			})
+		}
+		Err(e) => Err(e),
+	}
 }
+
+// vim: ts=4

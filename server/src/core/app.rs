@@ -23,6 +23,7 @@ use crate::settings::{FrozenSettingsRegistry, SettingsRegistry};
 
 use crate::action::dsl::DslEngine;
 use crate::action::hooks::HookRegistry;
+use crate::action::key_cache::KeyFetchCache;
 use crate::{action, file, routes};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,6 +64,9 @@ pub struct AppState {
 
 	// Hook registry for native hook functions
 	pub hook_registry: Arc<tokio::sync::RwLock<HookRegistry>>,
+
+	// Federation key fetch failure cache
+	pub key_fetch_cache: Arc<KeyFetchCache>,
 }
 
 pub type App = Arc<AppState>;
@@ -298,6 +302,14 @@ impl AppBuilder {
 			Arc::new(engine)
 		};
 
+		// Initialize key fetch failure cache
+		let key_cache_size = settings_service
+			.get_int(TnId(0), "federation.key_failure_cache_size")
+			.await
+			.unwrap_or(100) as usize;
+		let key_fetch_cache = Arc::new(KeyFetchCache::new(key_cache_size));
+		info!("Key fetch failure cache initialized (capacity: {})", key_cache_size);
+
 		let Some(worker) = self.worker else {
 			error!("FATAL: No worker pool defined");
 			return Err(Error::Internal("No worker pool defined".to_string()));
@@ -344,6 +356,9 @@ impl AppBuilder {
 
 			// Hook registry
 			hook_registry: Arc::new(tokio::sync::RwLock::new(HookRegistry::new())),
+
+			// Key fetch cache
+			key_fetch_cache,
 		});
 		tokio::fs::create_dir_all(&app.opts.tmp_dir).await.map_err(|e| {
 			error!("FATAL: Cannot create tmp dir: {}", e);

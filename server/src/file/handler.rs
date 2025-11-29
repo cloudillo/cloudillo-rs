@@ -382,14 +382,22 @@ pub async fn post_file_blob(
 		.unwrap_or("application/octet-stream");
 	//info!("content_type: {} {:?}", content_type, header.get(axum::http::header::CONTENT_TYPE));
 
-	// Get max file size from settings
-	let max_size_mb = app.settings.get_int(tn_id, "file.max_file_size_mb").await
-		.map(|v| v as usize * 1_000_000) // Convert MB to bytes
-		.unwrap_or(50_000_000); // Default to 50MB if setting not found
+	// Get max file size from settings (in MiB, using binary units)
+	const BYTES_PER_MIB: usize = 1_048_576; // 1024 * 1024
+	const DEFAULT_MAX_SIZE_MIB: i64 = 50;
+
+	let max_size_mib = app
+		.settings
+		.get_int(tn_id, "file.max_file_size_mb")
+		.await
+		.unwrap_or(DEFAULT_MAX_SIZE_MIB)
+		.max(1); // Ensure at least 1 MiB
+
+	let max_size_bytes = (max_size_mib as usize) * BYTES_PER_MIB;
 
 	match content_type {
 		"image/jpeg" | "image/png" | "image/webp" | "image/avif" => {
-			let bytes = to_bytes(body, max_size_mb).await?;
+			let bytes = to_bytes(body, max_size_bytes).await?;
 			let orig_variant_id = hasher::hash("b", &bytes);
 			let dim = image::get_image_dimensions(&bytes).await?;
 			info!("dimensions: {}/{}", dim.0, dim.1);

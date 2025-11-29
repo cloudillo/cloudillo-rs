@@ -4,9 +4,12 @@
 
 use std::collections::HashMap;
 
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use cloudillo::prelude::*;
+
+/// Maximum number of prefixes allowed in a single query to prevent DoS
+const MAX_PREFIXES: usize = 20;
 
 /// List all settings or filter by prefixes
 pub(crate) async fn list(
@@ -14,27 +17,51 @@ pub(crate) async fn list(
 	tn_id: TnId,
 	prefix: Option<&[String]>,
 ) -> ClResult<HashMap<String, serde_json::Value>> {
-	let rows = if let Some(prefixes) = prefix {
-		let conditions = vec!["name LIKE ? || '%'"; prefixes.len()];
-		let where_clause = conditions.join(" OR ");
-		let query_str =
-			format!("SELECT name, value FROM settings WHERE tn_id = ? AND ({})", where_clause);
-		let mut query = sqlx::query(&query_str).bind(tn_id.0);
-		for prefix in prefixes {
-			query = query.bind(prefix);
+	let rows = match prefix {
+		Some(prefixes) if !prefixes.is_empty() => {
+			// Limit the number of prefixes to prevent DoS via query complexity
+			let prefixes = if prefixes.len() > MAX_PREFIXES {
+				warn!(
+					"Too many prefixes requested: {} (max: {}), truncating",
+					prefixes.len(),
+					MAX_PREFIXES
+				);
+				&prefixes[..MAX_PREFIXES]
+			} else {
+				prefixes
+			};
+
+			// Use QueryBuilder for safe dynamic SQL construction
+			let mut builder: QueryBuilder<Sqlite> =
+				QueryBuilder::new("SELECT name, value FROM settings WHERE tn_id = ");
+			builder.push_bind(tn_id.0);
+			builder.push(" AND (");
+
+			for (i, prefix) in prefixes.iter().enumerate() {
+				if i > 0 {
+					builder.push(" OR ");
+				}
+				builder.push("name LIKE ");
+				builder.push_bind(format!("{}%", prefix));
+			}
+			builder.push(")");
+
+			builder
+				.build()
+				.fetch_all(db)
+				.await
+				.inspect_err(|err| warn!("DB: {:#?}", err))
+				.map_err(|_| Error::DbError)?
 		}
-		query
-			.fetch_all(db)
-			.await
-			.inspect_err(|err| warn!("DB: {:#?}", err))
-			.map_err(|_| Error::DbError)?
-	} else {
-		sqlx::query("SELECT name, value FROM settings WHERE tn_id = ?")
-			.bind(tn_id.0)
-			.fetch_all(db)
-			.await
-			.inspect_err(|err| warn!("DB: {:#?}", err))
-			.map_err(|_| Error::DbError)?
+		_ => {
+			// No prefix or empty prefix list - return all settings
+			sqlx::query("SELECT name, value FROM settings WHERE tn_id = ?")
+				.bind(tn_id.0)
+				.fetch_all(db)
+				.await
+				.inspect_err(|err| warn!("DB: {:#?}", err))
+				.map_err(|_| Error::DbError)?
+		}
 	};
 
 	let mut settings = HashMap::new();

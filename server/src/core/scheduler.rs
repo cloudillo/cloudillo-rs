@@ -660,16 +660,19 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			while let Ok(id) = rx_finish.recv_async().await {
 				info!("Completed task {}", id);
 
-				// Get task metadata and check if this is a recurring task
+				// Get task metadata WITHOUT removing - we only remove after successful transition
 				let task_meta_opt = {
-					let Ok(mut tasks_running) = schedule.tasks_running.lock() else {
+					let Ok(tasks_running) = schedule.tasks_running.lock() else {
 						error!("Mutex poisoned: tasks_running");
 						return;
 					};
-					tasks_running.remove(&id)
+					tasks_running.get(&id).cloned()
 				};
 
 				if let Some(task_meta) = task_meta_opt {
+					// Track if transition was successful
+					let mut transition_ok = false;
+
 					// Check if this is a recurring task with cron schedule
 					if let Some(ref cron) = task_meta.cron {
 						// Calculate next execution time
@@ -689,12 +692,33 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 						}
 
 						// Re-add to scheduler with new execution time
-						if let Err(e) = schedule.add_queue(id, updated_meta).await {
-							error!("Failed to reschedule recurring task {}: {}", id, e);
+						match schedule.add_queue(id, updated_meta).await {
+							Ok(_) => transition_ok = true,
+							Err(e) => {
+								error!(
+									"Failed to reschedule recurring task {}: {} - task remains in running queue",
+									id, e
+								);
+							}
 						}
 					} else {
 						// One-time task - mark as finished
-						schedule.store.finished(id, "").await.unwrap_or(());
+						match schedule.store.finished(id, "").await {
+							Ok(_) => transition_ok = true,
+							Err(e) => {
+								error!(
+									"Failed to mark task {} as finished: {} - task remains in running queue",
+									id, e
+								);
+							}
+						}
+					}
+
+					// Only remove from running queue after successful transition
+					if transition_ok {
+						if let Ok(mut tasks_running) = schedule.tasks_running.lock() {
+							tasks_running.remove(&id);
+						}
 					}
 
 					// Handle dependencies of finished task using atomic release method

@@ -14,43 +14,118 @@ pub fn decode_jwt_no_verify<T: DeserializeOwned>(jwt: &str) -> ClResult<T> {
 	Ok(payload)
 }
 
+/// Verify JWT signature with a public key
+fn verify_jwt_signature(token: &str, public_key: &str) -> ClResult<ActionToken> {
+	let public_key_pem =
+		format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----", public_key);
+
+	let mut validation = Validation::new(Algorithm::ES384);
+	validation.validate_aud = false;
+	validation.set_required_spec_claims(&["iss"]);
+
+	let action: ActionToken = jwt::decode(
+		token,
+		&jwt::DecodingKey::from_ec_pem(public_key_pem.as_bytes())
+			.inspect_err(|err| error!("from_ec_pem err: {}", err))?,
+		&validation,
+	)?
+	.claims;
+
+	Ok(action)
+}
+
+/// Verify an action token using 3-tier caching:
+/// 1. Check failure cache (in-memory) - return early if cached failure
+/// 2. Check SQLite key_cache - use if valid
+/// 3. HTTP fetch - cache results (success to DB, failure to memory)
 pub async fn verify_action_token(app: &App, tn_id: TnId, token: &str) -> ClResult<ActionToken> {
 	let action_not_validated: ActionToken = decode_jwt_no_verify(token)?;
-	info!("  from: {}", action_not_validated.iss);
+	let issuer = &action_not_validated.iss;
+	let key_id = &action_not_validated.k;
 
-	// The endpoint returns ApiResponse<Profile>, so we need to deserialize that first
-	let api_response: crate::types::ApiResponse<crate::profile::handler::Profile> =
-		app.request.get_noauth(tn_id, &action_not_validated.iss, "/me/keys").await?;
-	let key_data = api_response.data;
+	info!("  from: {}, key: {}", issuer, key_id);
 
-	let public_key: Option<Box<str>> =
-		if let Some(key) = key_data.keys.iter().find(|k| k.key_id == action_not_validated.k) {
-			let (public_key, _expires_at) = (key.public_key.clone(), key.expires_at);
-			Some(public_key)
-		} else {
-			None
-		};
+	// 1. Check failure cache - return early if we recently failed to fetch this key
+	if let Some(failure) = app.key_fetch_cache.check_failure(issuer, key_id) {
+		debug!(
+			"Key fetch for {}:{} blocked by cache (retry in {} secs)",
+			issuer,
+			key_id,
+			failure.seconds_until_retry()
+		);
+		return Err(Error::ServiceUnavailable(format!(
+			"Key fetch temporarily blocked (retry in {} secs)",
+			failure.seconds_until_retry()
+		)));
+	}
 
-	if let Some(public_key) = public_key {
-		let public_key_pem =
-			format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----", public_key);
+	// 2. Check SQLite key cache - use if we have a cached key
+	match app.meta_adapter.read_profile_public_key(issuer, key_id).await {
+		Ok((public_key, expires_at)) => {
+			// Check if key is still valid (not expired)
+			if expires_at > Timestamp::now() {
+				info!("  using cached key (expires at {})", expires_at);
+				let action = verify_jwt_signature(token, &public_key)?;
+				info!("  validated from cache {:?}", action);
+				return Ok(action);
+			}
+			// Key expired - continue to HTTP fetch
+			debug!("  cached key expired at {}, fetching fresh", expires_at);
+		}
+		Err(Error::NotFound) => {
+			// No cached key - continue to HTTP fetch
+			debug!("  no cached key, fetching from remote");
+		}
+		Err(e) => {
+			// Database error - log but continue to HTTP fetch
+			warn!("  key cache read error: {}, fetching from remote", e);
+		}
+	}
 
-		let mut validation = Validation::new(Algorithm::ES384);
-		validation.validate_aud = false;
-		validation.set_required_spec_claims(&["iss"]);
-		info!("  validating...");
+	// 3. HTTP fetch from remote instance
+	let fetch_result: ClResult<crate::types::ApiResponse<crate::profile::handler::Profile>> =
+		app.request.get_noauth(tn_id, issuer, "/me/keys").await;
 
-		let action: ActionToken = jwt::decode(
-			token,
-			&jwt::DecodingKey::from_ec_pem(public_key_pem.as_bytes())
-				.inspect_err(|err| error!("from_ec_pem err: {}", err))?,
-			&validation,
-		)?
-		.claims;
-		info!("  validated {:?}", action);
-		Ok(action)
-	} else {
-		Err(Error::Unauthorized)
+	match fetch_result {
+		Ok(api_response) => {
+			let key_data = api_response.data;
+
+			// Find the key we need
+			let key = key_data.keys.iter().find(|k| k.key_id.as_ref() == key_id.as_ref());
+
+			if let Some(key) = key {
+				let public_key = &key.public_key;
+
+				// Cache the key in SQLite for future use
+				if let Err(e) =
+					app.meta_adapter.add_profile_public_key(issuer, key_id, public_key).await
+				{
+					warn!("Failed to cache public key for {}:{}: {}", issuer, key_id, e);
+				} else {
+					debug!("Cached public key for {}:{}", issuer, key_id);
+				}
+
+				// Clear any previous failure entry
+				app.key_fetch_cache.clear_failure(issuer, key_id);
+
+				// Verify the signature
+				info!("  validating...");
+				let action = verify_jwt_signature(token, public_key)?;
+				info!("  validated {:?}", action);
+				Ok(action)
+			} else {
+				// Key not found in response - cache this as a failure
+				let err = Error::NotFound;
+				app.key_fetch_cache.record_failure(issuer, key_id, &err);
+				Err(Error::Unauthorized)
+			}
+		}
+		Err(e) => {
+			// HTTP fetch failed - cache the failure
+			warn!("Key fetch failed for {}:{}: {}", issuer, key_id, e);
+			app.key_fetch_cache.record_failure(issuer, key_id, &e);
+			Err(e)
+		}
 	}
 }
 

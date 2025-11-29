@@ -468,6 +468,7 @@ pub struct ProfileAttrs {
 	pub status: Box<str>,
 	pub following: bool,
 	pub connected: bool,
+	pub visibility: Box<str>,
 }
 
 impl AttrSet for ProfileAttrs {
@@ -479,6 +480,7 @@ impl AttrSet for ProfileAttrs {
 			"status" => Some(&self.status),
 			"following" => Some(if self.following { "true" } else { "false" }),
 			"connected" => Some(if self.connected { "true" } else { "false" }),
+			"visibility" => Some(&self.visibility),
 			_ => None,
 		}
 	}

@@ -27,6 +27,16 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Key fetch failure cache size
+	registry.register(
+		SettingDefinition::builder("federation.key_failure_cache_size")
+			.description("Maximum entries in the key fetch failure cache (in-memory LRU)")
+			.default(SettingValue::Int(100))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
 	Ok(())
 }
 

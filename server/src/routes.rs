@@ -32,30 +32,38 @@ fn init_api_service(app: App) -> Router {
 	let cors_layer = tower_http::cors::CorsLayer::very_permissive();
 
 	// Action routes with permission checks
-	let action_router = Router::new()
+	// Note: We need to separate routes by permission level to avoid middleware conflicts
+	let action_router_read = Router::new()
 		.route("/api/action/{action_id}", get(action::handler::get_action_by_id))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("read")))
-		.route("/api/action/{action_id}", patch(action::handler::patch_action))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("write")))
-		.route("/api/action/{action_id}", delete(action::handler::delete_action))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("write")))
-		.route("/api/action/{action_id}/accept", post(action::handler::post_action_accept))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("write")))
-		.route("/api/action/{action_id}/reject", post(action::handler::post_action_reject))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("write")))
 		.route("/api/action/{action_id}/stat", post(action::handler::post_action_stat))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("read")))
+		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("read")));
+
+	let action_router_write = Router::new()
+		.route("/api/action/{action_id}", patch(action::handler::patch_action))
+		.route("/api/action/{action_id}", delete(action::handler::delete_action))
+		.route("/api/action/{action_id}/accept", post(action::handler::post_action_accept))
+		.route("/api/action/{action_id}/reject", post(action::handler::post_action_reject))
 		.route("/api/action/{action_id}/reaction", post(action::handler::post_action_reaction))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("write")));
 
+	let action_router = action_router_read.merge(action_router_write);
+
 	// Profile routes with permission checks
-	let profile_router = Router::new()
+	// Note: We need to separate routes by permission level to avoid middleware conflicts
+	let profile_router_read = Router::new()
 		.route("/api/profile/{id_tag}", get(profile::list::get_profile_by_id_tag))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_profile("read")))
+		.layer(middleware::from_fn_with_state(app.clone(), check_perm_profile("read")));
+
+	let profile_router_write = Router::new()
 		.route("/api/profile/{id_tag}", patch(profile::update::patch_profile_relationship))
-		.layer(middleware::from_fn_with_state(app.clone(), check_perm_profile("write")))
+		.layer(middleware::from_fn_with_state(app.clone(), check_perm_profile("write")));
+
+	let profile_router_admin = Router::new()
 		.route("/api/admin/profile/{id_tag}", patch(profile::update::patch_profile_admin))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_profile("admin")));
+
+	let profile_router =
+		profile_router_read.merge(profile_router_write).merge(profile_router_admin);
 
 	// File routes with permission checks
 	// Note: We need to separate routes by permission level to avoid middleware conflicts

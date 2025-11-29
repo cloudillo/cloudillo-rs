@@ -71,24 +71,26 @@ pub async fn list_profiles(
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// GET /profile/:idTag - Get specific profile
+/// GET /profile/:idTag - Get specific profile's local relationship state
+/// Returns the locally cached relationship data (connected, following, status)
+/// Returns empty/null if the profile is not known locally
 pub async fn get_profile_by_id_tag(
 	State(app): State<App>,
+	tn_id: TnId,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Path(id_tag): Path<String>,
-) -> ClResult<(StatusCode, Json<ApiResponse<ProfileInfo>>)> {
-	// Get tenant ID for the requested profile (use TnId(0) as a placeholder for reading from cache)
-	// In production, this would need to handle cross-tenant profile lookups
-	// For now, use MetaAdapter's method that handles this
-	let tn_id = crate::types::TnId(0); // Use default tenant for cross-tenant lookups
-	let profile_data = app.meta_adapter.get_profile_info(tn_id, &id_tag).await?;
-
-	let profile = ProfileInfo {
-		id_tag: profile_data.id_tag.to_string(),
-		name: profile_data.name.to_string(),
-		profile_type: profile_data.profile_type.to_string(),
-		profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
-		created_at: profile_data.created_at,
+) -> ClResult<(StatusCode, Json<ApiResponse<Option<ProfileInfo>>>)> {
+	// Lookup profile in local profiles table (relationship data)
+	let profile = match app.meta_adapter.get_profile_info(tn_id, &id_tag).await {
+		Ok(profile_data) => Some(ProfileInfo {
+			id_tag: profile_data.id_tag.to_string(),
+			name: profile_data.name.to_string(),
+			profile_type: profile_data.profile_type.to_string(),
+			profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
+			created_at: profile_data.created_at,
+		}),
+		Err(Error::NotFound) => None, // Return empty when not found locally
+		Err(e) => return Err(e),
 	};
 
 	let response = ApiResponse::new(profile).with_req_id(req_id.unwrap_or_default());
