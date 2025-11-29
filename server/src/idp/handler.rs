@@ -567,6 +567,68 @@ pub async fn delete_identity(
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// Response structure for IDP public info
+/// This is returned by GET /api/idp/info - a public endpoint for provider selection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdpInfoResponse {
+	/// The provider domain (e.g., "cloudillo.net")
+	pub domain: String,
+	/// Display name of the provider (e.g., "Cloudillo")
+	pub name: String,
+	/// Short info text (pricing, terms, etc.)
+	pub info: String,
+	/// Optional URL for more information
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub url: Option<String>,
+}
+
+/// GET /api/idp/info - Get public information about this Identity Provider
+///
+/// This endpoint returns public information about the identity provider,
+/// such as its name, pricing info, and a link for more details.
+/// Used by registration UIs to help users choose a provider.
+#[axum::debug_handler]
+pub async fn get_idp_info(
+	State(app): State<App>,
+	tn_id: TnId,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<IdpInfoResponse>>)> {
+	info!(tn_id = tn_id.0, "GET /api/idp/info");
+
+	// Check if IDP is enabled for this tenant
+	check_idp_enabled(&app, tn_id).await?;
+
+	// Get the provider domain from the tenant id_tag
+	let domain = app.auth_adapter.read_id_tag(tn_id).await?.to_string();
+
+	// Get the provider name from settings
+	let name = match app.settings.get(tn_id, "idp.name").await {
+		Ok(SettingValue::String(s)) if !s.is_empty() => s,
+		_ => domain.clone(), // Fallback to domain if name not set
+	};
+
+	// Get the provider info text from settings
+	let info = match app.settings.get(tn_id, "idp.info").await {
+		Ok(SettingValue::String(s)) => s,
+		_ => String::new(),
+	};
+
+	// Get the optional URL from settings
+	let url = match app.settings.get(tn_id, "idp.url").await {
+		Ok(SettingValue::String(s)) if !s.is_empty() => Some(s),
+		_ => None,
+	};
+
+	let response_data = IdpInfoResponse { domain, name, info, url };
+
+	let mut response = ApiResponse::new(response_data);
+	if let Some(id) = req_id {
+		response = response.with_req_id(id);
+	}
+
+	Ok((StatusCode::OK, Json(response)))
+}
+
 /// Response structure for identity availability check
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvailabilityResponse {

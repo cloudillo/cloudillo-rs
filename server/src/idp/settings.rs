@@ -55,6 +55,39 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// IDP public info settings (for /api/idp/info endpoint)
+	// These are displayed to users during registration to help them choose a provider
+
+	// IDP name - Display name of the identity provider
+	registry.register(
+		SettingDefinition::builder("idp.name")
+			.description("Display name of the Identity Provider (e.g., 'Cloudillo')")
+			.default(SettingValue::String(String::new()))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
+	// IDP info - Short description text (pricing, terms, etc.)
+	registry.register(
+		SettingDefinition::builder("idp.info")
+			.description("Short info text about the provider (pricing, terms, etc.)")
+			.default(SettingValue::String(String::new()))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
+	// IDP url - Optional URL for more information
+	registry.register(
+		SettingDefinition::builder("idp.url")
+			.description("Optional URL for more information about the provider")
+			.default(SettingValue::String(String::new()))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
 	Ok(())
 }
 

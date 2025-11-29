@@ -158,6 +158,7 @@ fn init_api_service(app: App) -> Router {
 		.route("/api/refs/{ref_id}", get(r#ref::handler::get_ref))
 
 		// IDP Public API
+		.route("/api/idp/info", get(idp::handler::get_idp_info))
 		.route("/api/idp/check-availability", get(idp::handler::check_identity_availability))
 
 		// Inbox
