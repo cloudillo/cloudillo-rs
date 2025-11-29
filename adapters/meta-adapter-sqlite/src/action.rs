@@ -753,14 +753,134 @@ pub(crate) async fn create_outbound(
 	Ok(())
 }
 
-/// Get action (placeholder)
+/// Get a single action by action_id with issuer and audience profiles
 pub(crate) async fn get(
-	_db: &SqlitePool,
-	_tn_id: TnId,
-	_action_id: &str,
+	db: &SqlitePool,
+	tn_id: TnId,
+	action_id: &str,
 ) -> ClResult<Option<ActionView>> {
-	// TODO: Implement full action view retrieval with issuer and audience profiles
-	Ok(None)
+	let row = sqlx::query(
+		"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
+		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic,
+		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic,
+		a.subject, a.content, a.created_at, a.expires_at,
+		a.attachments, a.status, a.reactions, a.comments, a.visibility
+		FROM actions a
+		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
+		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
+		WHERE a.tn_id=? AND a.action_id=? AND coalesce(a.status, 'A') NOT IN ('D')",
+	)
+	.bind(tn_id.0)
+	.bind(action_id)
+	.fetch_optional(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+
+	let Some(row) = row else {
+		return Ok(None);
+	};
+
+	let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag").map_err(|_| Error::DbError)?;
+	let audience_tag =
+		row.try_get::<Option<Box<str>>, _>("audience").map_err(|_| Error::DbError)?;
+
+	// Parse attachments
+	let attachments = row
+		.try_get::<Option<Box<str>>, _>("attachments")
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+	let attachments = if let Some(attachments) = &attachments {
+		let mut attachments = parse_str_list(attachments)
+			.iter()
+			.map(|a| AttachmentView { file_id: a.clone(), dim: None })
+			.collect::<Vec<_>>();
+		for a in attachments.iter_mut() {
+			// Query file dimensions
+			let query_result = if let Some(f_id_str) = a.file_id.strip_prefix('@') {
+				if let Ok(f_id) = f_id_str.parse::<i64>() {
+					sqlx::query("SELECT x->>'dim' as dim FROM files WHERE tn_id=? AND f_id=?")
+						.bind(tn_id.0)
+						.bind(f_id)
+						.fetch_one(db)
+						.await
+				} else {
+					Err(sqlx::Error::RowNotFound)
+				}
+			} else {
+				sqlx::query("SELECT x->>'dim' as dim FROM files WHERE tn_id=? AND file_id=?")
+					.bind(tn_id.0)
+					.bind(&a.file_id)
+					.fetch_one(db)
+					.await
+			};
+
+			if let Ok(file_res) = query_result.inspect_err(inspect) {
+				a.dim = serde_json::from_str(
+					file_res.try_get("dim").inspect_err(inspect).map_err(|_| Error::DbError)?,
+				)?;
+			}
+		}
+		Some(attachments)
+	} else {
+		None
+	};
+
+	// Build stat from reactions and comments counts
+	let reactions_count: i64 = row.try_get("reactions").unwrap_or(0);
+	let comments_count: i64 = row.try_get("comments").unwrap_or(0);
+	let stat = Some(serde_json::json!({
+		"comments": comments_count,
+		"reactions": reactions_count
+	}));
+
+	let visibility: Option<String> = row.try_get("visibility").ok();
+	let visibility = visibility.and_then(|s| s.chars().next());
+
+	Ok(Some(ActionView {
+		action_id: row.try_get::<Box<str>, _>("action_id").map_err(|_| Error::DbError)?,
+		typ: row.try_get::<Box<str>, _>("type").map_err(|_| Error::DbError)?,
+		sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type").map_err(|_| Error::DbError)?,
+		parent_id: row.try_get::<Option<Box<str>>, _>("parent_id").map_err(|_| Error::DbError)?,
+		root_id: row.try_get::<Option<Box<str>>, _>("root_id").map_err(|_| Error::DbError)?,
+		issuer: ProfileInfo {
+			id_tag: issuer_tag,
+			name: row
+				.try_get::<Option<Box<str>>, _>("issuer_name")
+				.map_err(|_| Error::DbError)?
+				.unwrap_or_else(|| "Unknown".into()),
+			typ: ProfileType::Person,
+			profile_pic: row
+				.try_get::<Option<Box<str>>, _>("issuer_profile_pic")
+				.map_err(|_| Error::DbError)?,
+		},
+		audience: if let Some(audience_tag) = audience_tag {
+			Some(ProfileInfo {
+				id_tag: audience_tag,
+				name: row
+					.try_get::<Option<Box<str>>, _>("audience_name")
+					.map_err(|_| Error::DbError)?
+					.unwrap_or_else(|| "Unknown".into()),
+				typ: ProfileType::Person,
+				profile_pic: row
+					.try_get::<Option<Box<str>>, _>("audience_profile_pic")
+					.map_err(|_| Error::DbError)?,
+			})
+		} else {
+			None
+		},
+		subject: row.try_get("subject").map_err(|_| Error::DbError)?,
+		content: row.try_get("content").map_err(|_| Error::DbError)?,
+		attachments,
+		created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
+		expires_at: row
+			.try_get("expires_at")
+			.map(|ts: Option<i64>| ts.map(Timestamp))
+			.map_err(|_| Error::DbError)?,
+		status: row.try_get("status").map_err(|_| Error::DbError)?,
+		stat,
+		visibility,
+	}))
 }
 
 /// Update action (placeholder)

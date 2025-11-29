@@ -286,6 +286,7 @@ pub(crate) async fn update(
 }
 
 /// Read a public key from the cache
+/// Returns (public_key, expiration). NULL expiration is treated as "never expires".
 pub(crate) async fn read_public_key(
 	db: &SqlitePool,
 	id_tag: &str,
@@ -299,19 +300,21 @@ pub(crate) async fn read_public_key(
 
 	map_res(res, |row| {
 		let public_key = row.try_get("public_key")?;
-		let expire = row.try_get("expire").map(Timestamp)?;
+		// NULL expire means "never expires" - use far-future timestamp
+		let expire: Option<i64> = row.try_get("expire")?;
+		let expire = Timestamp(expire.unwrap_or(i64::MAX));
 		Ok((public_key, expire))
 	})
 }
 
-/// Add a public key to the cache
+/// Add a public key to the cache (upserts if key already exists)
 pub(crate) async fn add_public_key(
 	db: &SqlitePool,
 	id_tag: &str,
 	key_id: &str,
 	public_key: &str,
 ) -> ClResult<()> {
-	sqlx::query("INSERT INTO key_cache (id_tag, key_id, public_key) VALUES (?, ?, ?)")
+	sqlx::query("INSERT OR REPLACE INTO key_cache (id_tag, key_id, public_key) VALUES (?, ?, ?)")
 		.bind(id_tag)
 		.bind(key_id)
 		.bind(public_key)

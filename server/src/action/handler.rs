@@ -300,6 +300,13 @@ pub async fn post_action_accept(
 		}
 	}
 
+	// Update action status to 'A' (Accepted)
+	let update_opts = crate::meta_adapter::UpdateActionDataOptions {
+		status: crate::types::Patch::Value('A'),
+		..Default::default()
+	};
+	app.meta_adapter.update_action_data(tn_id, &action_id, &update_opts).await?;
+
 	info!(
 		action_id = %action_id,
 		action_type = %action.typ,
@@ -371,6 +378,13 @@ pub async fn post_action_reject(
 			// Don't fail the request if hook fails - log and continue
 		}
 	}
+
+	// Update action status to 'D' (Deleted)
+	let update_opts = crate::meta_adapter::UpdateActionDataOptions {
+		status: crate::types::Patch::Value('D'),
+		..Default::default()
+	};
+	app.meta_adapter.update_action_data(tn_id, &action_id, &update_opts).await?;
 
 	info!(
 		action_id = %action_id,

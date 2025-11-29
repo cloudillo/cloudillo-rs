@@ -3,7 +3,7 @@ use itertools::Itertools;
 use jsonwebtoken::{self as jwt, Algorithm, Validation};
 use serde::{de::DeserializeOwned, Deserialize};
 
-use crate::{auth_adapter::ActionToken, file::descriptor, prelude::*};
+use crate::{auth_adapter::ActionToken, file::descriptor, meta_adapter, prelude::*};
 
 /// Decodes a JWT without verifying the signature
 pub fn decode_jwt_no_verify<T: DeserializeOwned>(jwt: &str) -> ClResult<T> {
@@ -143,14 +143,20 @@ pub async fn process_inbound_action_token(
 ) -> ClResult<Option<serde_json::Value>> {
 	let action = verify_action_token(app, tn_id, token).await?;
 
-	// Check if the action type is defined and get its definition
-	if !app.dsl_engine.has_definition(&action.t) {
-		return Err(Error::ValidationError(format!("Action type not supported: {}", action.t)));
-	}
-
-	let definition = app.dsl_engine.get_definition(&action.t).ok_or_else(|| {
-		Error::ValidationError(format!("Action type definition not found: {}", action.t))
-	})?;
+	// Check for definition: first try full type (e.g., "FLLW:DEL"), then fall back to base type ("FLLW")
+	// This allows separate definitions for subtypes when the use case differs significantly
+	let (definition_type, definition) = if let Some(def) = app.dsl_engine.get_definition(&action.t)
+	{
+		(action.t.as_ref(), def)
+	} else {
+		// Try base type (before colon)
+		let base_type = action.t.find(':').map(|pos| &action.t[..pos]).unwrap_or(action.t.as_ref());
+		if let Some(def) = app.dsl_engine.get_definition(base_type) {
+			(base_type, def)
+		} else {
+			return Err(Error::ValidationError(format!("Action type not supported: {}", action.t)));
+		}
+	};
 
 	// Check permissions based on action type's allow_unknown setting
 	// Default to false if not specified (require following/connected)
@@ -181,6 +187,75 @@ pub async fn process_inbound_action_token(
 
 		if issuer_profile.is_none() {
 			//profile::sync_profile(&app, tn_id, &action.iss).await?;
+		}
+	}
+
+	// Store the inbound action in the database before running hooks
+	// This ensures DSL operations like update_action can find the action
+	{
+		// Extract action type and subtype
+		let (action_type, sub_type) = if let Some(colon_pos) = action.t.find(':') {
+			let (t, st) = action.t.split_at(colon_pos);
+			(t, Some(&st[1..]))
+		} else {
+			(action.t.as_ref(), None)
+		};
+
+		// Generate key from key_pattern if available
+		let key = if let Some(pattern) = definition.key_pattern.as_deref() {
+			let key = pattern
+				.replace("{type}", action_type)
+				.replace("{issuer}", &action.iss)
+				.replace("{audience}", action.aud.as_deref().unwrap_or(""))
+				.replace("{parent}", action.p.as_deref().unwrap_or(""))
+				.replace("{subject}", action.sub.as_deref().unwrap_or(""));
+			Some(key)
+		} else {
+			None
+		};
+
+		// Create action struct for storage
+		let inbound_action = meta_adapter::Action {
+			action_id: _action_id,
+			typ: action_type,
+			sub_typ: sub_type,
+			issuer_tag: &action.iss,
+			parent_id: action.p.as_deref(),
+			root_id: action.p.as_deref(), // Use parent as root for now, could be improved
+			audience_tag: action.aud.as_deref(),
+			content: action.c.as_deref(),
+			attachments: action.a.as_ref().map(|v| v.iter().map(|s| s.as_ref()).collect()),
+			subject: action.sub.as_deref(),
+			created_at: action.iat,
+			expires_at: action.exp,
+			visibility: None, // Inbound actions don't have visibility in the token
+		};
+
+		// Store in actions table (handles deduplication via key)
+		match app.meta_adapter.create_action(tn_id, &inbound_action, key.as_deref()).await {
+			Ok(_) => {
+				info!("  stored inbound action {} in actions table", _action_id);
+				// Set status to 'A' (active) for inbound actions - create_action defaults to 'P'
+				let update_opts = meta_adapter::UpdateActionDataOptions {
+					status: crate::types::Patch::Value('A'),
+					..Default::default()
+				};
+				if let Err(e) =
+					app.meta_adapter.update_action_data(tn_id, _action_id, &update_opts).await
+				{
+					warn!("  failed to set inbound action status to active: {}", e);
+				}
+			}
+			Err(e) => {
+				// Log but don't fail - action might already exist (duplicate delivery)
+				debug!("  failed to store inbound action: {} (may be duplicate)", e);
+			}
+		}
+
+		// Store token in action_tokens table
+		if let Err(e) = app.meta_adapter.create_inbound_action(tn_id, _action_id, token, None).await
+		{
+			debug!("  failed to store inbound action token: {} (may be duplicate)", e);
 		}
 	}
 
@@ -229,7 +304,7 @@ pub async fn process_inbound_action_token(
 		// For synchronous processing, execute hook and return the result
 		let hook_result = app
 			.dsl_engine
-			.execute_hook_with_result(app, &action.t, HookType::OnReceive, hook_context)
+			.execute_hook_with_result(app, definition_type, HookType::OnReceive, hook_context)
 			.await?;
 
 		Ok(hook_result.return_value)
@@ -237,7 +312,7 @@ pub async fn process_inbound_action_token(
 		// For asynchronous processing, execute hook without capturing result
 		if let Err(e) = app
 			.dsl_engine
-			.execute_hook(app, &action.t, HookType::OnReceive, hook_context)
+			.execute_hook(app, definition_type, HookType::OnReceive, hook_context)
 			.await
 		{
 			warn!(

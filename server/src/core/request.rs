@@ -230,6 +230,7 @@ impl Request {
 		let req = hyper::Request::builder()
 			.method(Method::POST)
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
+			.header("Content-Type", "application/json")
 			.body(to_boxed(Full::from(data)))?;
 		let res = self.client.request(req).await?;
 		let body = res.into_body().collect().await?.to_bytes();

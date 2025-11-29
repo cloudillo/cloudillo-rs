@@ -8,7 +8,11 @@ use axum::{
 
 use crate::{
 	auth_adapter::AuthCtx,
-	core::{abac::Environment, extract::OptionalAuth, middleware::PermissionCheckOutput},
+	core::{
+		abac::Environment,
+		extract::{IdTag, OptionalAuth},
+		middleware::PermissionCheckOutput,
+	},
 	prelude::*,
 	types::ActionAttrs,
 };
@@ -24,16 +28,26 @@ use crate::{
 /// A cloneable middleware function with return type `PermissionCheckOutput`
 pub fn check_perm_action(
 	action: &'static str,
-) -> impl Fn(State<App>, TnId, OptionalAuth, Path<String>, Request, Next) -> PermissionCheckOutput + Clone
-{
-	move |state, tn_id, auth, path, req, next| {
-		Box::pin(check_action_permission(state, tn_id, auth, path, req, next, action))
+) -> impl Fn(
+	State<App>,
+	TnId,
+	IdTag,
+	OptionalAuth,
+	Path<String>,
+	Request,
+	Next,
+) -> PermissionCheckOutput
+       + Clone {
+	move |state, tn_id, id_tag, auth, path, req, next| {
+		Box::pin(check_action_permission(state, tn_id, id_tag, auth, path, req, next, action))
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn check_action_permission(
 	State(app): State<App>,
 	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth_ctx): OptionalAuth,
 	Path(action_id): Path<String>,
 	req: Request,
@@ -54,7 +68,7 @@ async fn check_action_permission(
 	};
 
 	// Load action attributes
-	let attrs = load_action_attrs(&app, tn_id, &action_id, &subject_id_tag).await?;
+	let attrs = load_action_attrs(&app, tn_id, &action_id, &subject_id_tag, &tenant_id_tag).await?;
 
 	// Check permission
 	let environment = Environment::new();
@@ -85,6 +99,7 @@ async fn load_action_attrs(
 	tn_id: TnId,
 	action_id: &str,
 	subject_id_tag: &str,
+	tenant_id_tag: &str,
 ) -> ClResult<ActionAttrs> {
 	use crate::core::abac::VisibilityLevel;
 	use tracing::debug;
@@ -145,6 +160,7 @@ async fn load_action_attrs(
 	Ok(ActionAttrs {
 		typ: action_view.typ,
 		sub_typ: action_view.sub_typ,
+		owner_id_tag: tenant_id_tag.into(), // Tenant owns actions on their instance
 		issuer_id_tag: action_view.issuer.id_tag,
 		parent_id: action_view.parent_id,
 		root_id: action_view.root_id,

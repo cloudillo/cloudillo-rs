@@ -478,11 +478,16 @@ impl<'a> OperationExecutor<'a> {
 					update_opts.status = if value.is_null() {
 						Patch::Null
 					} else if let Some(s) = value.as_str() {
-						if let Some(c) = s.chars().next() {
-							Patch::Value(c)
-						} else {
-							Patch::Null
-						}
+						// Map human-readable status names to single-char codes
+						let status_char = match s {
+							"confirmation" => 'C',
+							"notification" => 'N',
+							"active" => 'A',
+							"pending" => 'P',
+							"deleted" => 'D',
+							_ => s.chars().next().unwrap_or('A'),
+						};
+						Patch::Value(status_char)
 					} else {
 						Patch::Undefined
 					};

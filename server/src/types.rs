@@ -498,6 +498,9 @@ impl AttrSet for ProfileAttrs {
 pub struct ActionAttrs {
 	pub typ: Box<str>,
 	pub sub_typ: Option<Box<str>>,
+	/// The tenant who owns this action (the instance where it's stored)
+	pub owner_id_tag: Box<str>,
+	/// The original creator/sender of the action
 	pub issuer_id_tag: Box<str>,
 	pub parent_id: Option<Box<str>>,
 	pub root_id: Option<Box<str>>,
@@ -515,7 +518,8 @@ impl AttrSet for ActionAttrs {
 		match key {
 			"type" => Some(&self.typ),
 			"sub_type" => self.sub_typ.as_deref(),
-			"issuer_id_tag" | "owner_id_tag" => Some(&self.issuer_id_tag),
+			"owner_id_tag" => Some(&self.owner_id_tag),
+			"issuer_id_tag" => Some(&self.issuer_id_tag),
 			"parent_id" => self.parent_id.as_deref(),
 			"root_id" => self.root_id.as_deref(),
 			"visibility" => Some(&self.visibility),

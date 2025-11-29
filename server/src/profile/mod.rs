@@ -4,6 +4,7 @@ pub mod handler;
 pub mod list;
 pub mod media;
 pub mod perm;
+pub mod sync;
 pub mod update;
 
 use crate::prelude::*;
