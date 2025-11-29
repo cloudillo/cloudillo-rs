@@ -277,9 +277,11 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	)
 	.execute(&mut *tx)
 	.await?;
-	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_task_kind_key ON tasks(kind, key)")
-		.execute(&mut *tx)
-		.await?;
+	sqlx::query(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_task_kind_key ON tasks(kind, key) WHERE status='P'",
+	)
+	.execute(&mut *tx)
+	.await?;
 
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS task_dependencies (

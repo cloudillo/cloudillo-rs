@@ -354,6 +354,7 @@ impl AppBuilder {
 		action::init(&app)?;
 		file::init(&app)?;
 		crate::email::init(&app)?;
+		super::acme::register_tasks(&app)?;
 		let (api_router, app_router, http_router) = routes::init(app.clone());
 
 		// Register native hooks for core action types

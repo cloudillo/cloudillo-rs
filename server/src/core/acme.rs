@@ -323,4 +323,12 @@ impl Task<App> for CertRenewalTask {
 	}
 }
 
+/// Register ACME-related tasks with the scheduler
+///
+/// Must be called during app initialization before the scheduler starts loading tasks
+pub fn register_tasks(app: &App) -> ClResult<()> {
+	app.scheduler.register::<CertRenewalTask>()?;
+	Ok(())
+}
+
 // vim: ts=4
