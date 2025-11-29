@@ -19,19 +19,19 @@ instant-acme = "0.8.4"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 pem = "3.0.6"
 rustls = "0.23.35"
-rustls-pki-types = { version = "1.13.0", features = ["alloc"] }
+rustls-pki-types = { version = "1.13.1", features = ["alloc"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 tokio = { version = "1.48.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }
 tokio-rustls = "0.26.4"
 tower = { version = "0.5.2", features = ["util"] }
-tower-http = { version = "0.6.6", features = ["cors", "fs", "set-header", "trace", "compression-gzip", "compression-br"] }
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tower-http = { version = "0.6.7", features = ["cors", "fs", "set-header", "trace", "compression-gzip", "compression-br"] }
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 x509-parser = "0.18.0"
 sqlx = "0.8.6"
-serde_with = "3.16.0"
+serde_with = "3.16.1"
 croner = "3.0.1"
 axum-server = { version = "0.7.3", features = ["tls-rustls"] }
 hyper = "1.8.1"
