@@ -7,7 +7,8 @@ use axum::{
 };
 
 use crate::{
-	core::{abac::Environment, extract::Auth, middleware::PermissionCheckOutput},
+	auth_adapter::AuthCtx,
+	core::{abac::Environment, extract::OptionalAuth, middleware::PermissionCheckOutput},
 	prelude::*,
 	types::ActionAttrs,
 };
@@ -23,15 +24,17 @@ use crate::{
 /// A cloneable middleware function with return type `PermissionCheckOutput`
 pub fn check_perm_action(
 	action: &'static str,
-) -> impl Fn(State<App>, Auth, Path<String>, Request, Next) -> PermissionCheckOutput + Clone {
-	move |state, auth, path, req, next| {
-		Box::pin(check_action_permission(state, auth, path, req, next, action))
+) -> impl Fn(State<App>, TnId, OptionalAuth, Path<String>, Request, Next) -> PermissionCheckOutput + Clone
+{
+	move |state, tn_id, auth, path, req, next| {
+		Box::pin(check_action_permission(state, tn_id, auth, path, req, next, action))
 	}
 }
 
 async fn check_action_permission(
 	State(app): State<App>,
-	Auth(auth_ctx): Auth,
+	tn_id: TnId,
+	OptionalAuth(maybe_auth_ctx): OptionalAuth,
 	Path(action_id): Path<String>,
 	req: Request,
 	next: Next,
@@ -39,8 +42,19 @@ async fn check_action_permission(
 ) -> Result<Response, Error> {
 	use tracing::warn;
 
-	// Load action attributes (STUB - Phase 3 will implement)
-	let attrs = load_action_attrs(&app, auth_ctx.tn_id, &action_id, &auth_ctx.id_tag).await?;
+	// Create auth context or guest context if not authenticated
+	let (auth_ctx, subject_id_tag) = if let Some(auth_ctx) = maybe_auth_ctx {
+		let id_tag = auth_ctx.id_tag.clone();
+		(auth_ctx, id_tag)
+	} else {
+		// For unauthenticated requests, create a guest context
+		let guest_ctx =
+			AuthCtx { tn_id, id_tag: "guest".into(), roles: vec![].into(), scope: None };
+		(guest_ctx, "guest".into())
+	};
+
+	// Load action attributes
+	let attrs = load_action_attrs(&app, tn_id, &action_id, &subject_id_tag).await?;
 
 	// Check permission
 	let environment = Environment::new();

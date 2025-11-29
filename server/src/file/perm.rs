@@ -28,16 +28,26 @@ use crate::{
 /// A cloneable middleware function with return type `PermissionCheckOutput`
 pub fn check_perm_file(
 	action: &'static str,
-) -> impl Fn(State<App>, IdTag, OptionalAuth, Path<String>, Request, Next) -> PermissionCheckOutput + Clone
-{
-	move |state, id_tag, auth, path, req, next| {
-		Box::pin(check_file_permission(state, id_tag, auth, path, req, next, action))
+) -> impl Fn(
+	State<App>,
+	IdTag,
+	TnId,
+	OptionalAuth,
+	Path<String>,
+	Request,
+	Next,
+) -> PermissionCheckOutput
+       + Clone {
+	move |state, id_tag, tn_id, auth, path, req, next| {
+		Box::pin(check_file_permission(state, id_tag, tn_id, auth, path, req, next, action))
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn check_file_permission(
 	State(app): State<App>,
-	IdTag(domain_id_tag): IdTag,
+	IdTag(tenant_id_tag): IdTag,
+	tn_id: TnId,
 	OptionalAuth(maybe_auth_ctx): OptionalAuth,
 	Path(file_id): Path<String>,
 	req: Request,
@@ -45,12 +55,6 @@ async fn check_file_permission(
 	action: &str,
 ) -> Result<Response, Error> {
 	use tracing::warn;
-
-	// Get tenant ID from domain
-	let tn_id = app.auth_adapter.read_tn_id(&domain_id_tag).await.map_err(|_| {
-		warn!("Failed to resolve tenant ID for domain: {}", domain_id_tag);
-		Error::PermissionDenied
-	})?;
 
 	// Create auth context or guest context if not authenticated
 	let (auth_ctx, subject_id_tag) = if let Some(auth_ctx) = maybe_auth_ctx {
@@ -64,7 +68,7 @@ async fn check_file_permission(
 	};
 
 	// Load file attributes
-	let attrs = load_file_attrs(&app, tn_id, &file_id, &subject_id_tag).await?;
+	let attrs = load_file_attrs(&app, tn_id, &file_id, &subject_id_tag, &tenant_id_tag).await?;
 
 	// Check permission
 	let environment = Environment::new();
@@ -95,6 +99,7 @@ async fn load_file_attrs(
 	tn_id: TnId,
 	file_id: &str,
 	_subject_id_tag: &str,
+	tenant_id_tag: &str,
 ) -> ClResult<FileAttrs> {
 	// Get file view from MetaAdapter
 	let file_view = app.meta_adapter.read_file(tn_id, file_id).await?;
@@ -102,11 +107,16 @@ async fn load_file_attrs(
 	let file_view = file_view.ok_or(Error::NotFound)?;
 
 	// Extract owner from nested ProfileInfo
+	// If no owner or owner has empty id_tag, file is owned by the tenant itself
 	let owner_id_tag = file_view
 		.owner
 		.as_ref()
-		.map(|p| p.id_tag.clone())
-		.unwrap_or_else(|| "unknown".into());
+		.and_then(|p| if p.id_tag.is_empty() { None } else { Some(p.id_tag.clone()) })
+		.unwrap_or_else(|| {
+			use tracing::debug;
+			debug!("File has no owner, using tenant_id_tag: {}", tenant_id_tag);
+			tenant_id_tag.into()
+		});
 
 	// Determine access level based on file status and file content type
 	// Default to Read for now - can be enhanced with granular permissions
@@ -125,3 +135,5 @@ async fn load_file_attrs(
 		access_level,
 	})
 }
+
+// vim: ts=4
