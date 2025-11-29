@@ -34,7 +34,7 @@ pub struct Config {
 //#[tokio::main(flavor = "current_thread")]
 // This is needed for task::block_in_place() which is used in SNI certificate resolver
 #[tokio::main(flavor = "multi_thread", worker_threads = 1)]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let base_id_tag = env::var("BASE_ID_TAG").expect("BASE_ID_TAG must be set");
 
 	let config = Config {
@@ -130,7 +130,8 @@ async fn main() {
 	if let Some(acme_email) = config.acme_email {
 		cloudillo.acme_email(acme_email);
 	}
-	cloudillo.run().await.expect("Internal error");
+	cloudillo.run().await?;
+	Ok(())
 }
 
 // vim: ts=4
