@@ -196,11 +196,11 @@ struct DocumentInstance {
 }
 
 impl DocumentInstance {
-	fn new(broadcaster: DocBroadcaster) -> Self {
+	fn new_with_seq(broadcaster: DocBroadcaster, initial_seq: u64) -> Self {
 		Self {
 			broadcaster,
 			last_accessed: AtomicU64::new(Timestamp::now().0 as u64),
-			update_count: AtomicU64::new(0),
+			update_count: AtomicU64::new(initial_seq),
 		}
 	}
 
@@ -305,7 +305,11 @@ impl CrdtAdapterRedb {
 	}
 
 	/// Get or create a document instance (with broadcaster)
-	async fn get_or_create_instance(&self, doc_id: &str) -> ClResult<Arc<DocumentInstance>> {
+	async fn get_or_create_instance(
+		&self,
+		doc_id: &str,
+		tn_id: TnId,
+	) -> ClResult<Arc<DocumentInstance>> {
 		if let Some(instance) = self.doc_instances.get(doc_id) {
 			instance.touch();
 			return Ok(Arc::clone(&instance));
@@ -313,7 +317,45 @@ impl CrdtAdapterRedb {
 
 		// Create new instance with broadcaster
 		let (tx, _) = tokio::sync::broadcast::channel(self.config.broadcast_capacity);
-		let instance = Arc::new(DocumentInstance::new(tx));
+
+		// Initialize sequence counter from maximum existing sequence number
+		let max_seq = {
+			let db_path = self.get_db_path(tn_id, doc_id);
+			let db = self.get_or_open_db_file(db_path).await?;
+
+			let read_tx = db.begin_read().map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e)))
+			})?;
+
+			let updates_table = read_tx.open_table(TABLE_UPDATES).map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
+			})?;
+
+			// Get the last (highest) key in the range for this document
+			let (range_start, range_end) = key_encoding::make_doc_range(doc_id);
+			let mut max_seq: Option<u64> = None;
+
+			for item in
+				updates_table
+					.range(range_start.as_slice()..=range_end.as_slice())
+					.map_err(|e| {
+						ClError::from(Error::DbError(format!("Failed to read updates: {}", e)))
+					})? {
+				let (key, _) = item.map_err(|e| {
+					ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
+				})?;
+
+				// Decode sequence number from key
+				if let Some(seq) = key_encoding::decode_seq(key.value()) {
+					max_seq = Some(max_seq.map_or(seq, |current| current.max(seq)));
+				}
+			}
+
+			// If updates exist, next seq is max + 1; otherwise start at 0
+			max_seq.map_or(0, |seq| seq + 1)
+		};
+
+		let instance = Arc::new(DocumentInstance::new_with_seq(tx, max_seq));
 
 		self.doc_instances.insert(doc_id.to_string(), Arc::clone(&instance));
 
@@ -360,8 +402,8 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		let db_path = self.get_db_path(tn_id, doc_id);
 		let db = self.get_or_open_db_file(db_path).await?;
 
-		// Get or create instance
-		let instance = self.get_or_create_instance(doc_id).await?;
+		// Get or create instance (initializes seq from DB if new)
+		let instance = self.get_or_create_instance(doc_id, tn_id).await?;
 		let seq = instance.update_count.fetch_add(1, Ordering::SeqCst);
 
 		// Write update to database
@@ -399,7 +441,7 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		opts: CrdtSubscriptionOptions,
 	) -> ClResult<Pin<Box<dyn Stream<Item = CrdtChangeEvent> + Send>>> {
 		let doc_id = opts.doc_id.clone();
-		let instance = self.get_or_create_instance(&doc_id).await?;
+		let instance = self.get_or_create_instance(&doc_id, tn_id).await?;
 
 		// If snapshot requested, send existing updates first
 		if opts.send_snapshot {

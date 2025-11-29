@@ -20,7 +20,7 @@ use std::sync::Arc;
 use yrs::sync::{Message as YMessage, SyncMessage};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Map, ReadTxn, Transact};
+use yrs::{Map, ReadTxn, Transact, Update};
 
 /// CRDT connection tracking
 #[derive(Debug)]
@@ -108,21 +108,21 @@ pub async fn handle_crdt_connection(
 		"AWARENESS",
 	);
 
-	// Wait for any task to complete
-	tokio::select! {
-		_ = ws_recv_task => {
-			debug!("WebSocket receive task ended");
-		}
-		_ = sync_task => {
-			debug!("Sync broadcast task ended");
-		}
-		_ = awareness_task => {
-			debug!("Awareness broadcast task ended");
-		}
-	}
+	// Wait for WebSocket receive task to complete (client disconnected)
+	// We don't need to select on all tasks - the ws_recv_task is the one that matters
+	let _ = ws_recv_task.await;
+	debug!("WebSocket receive task ended");
 
+	// Abort all other tasks to ensure cleanup
+	info!("CRDT connection closing for {}, aborting tasks...", user_id);
 	heartbeat_task.abort();
-	info!("CRDT connection closed: {}", user_id);
+	sync_task.abort();
+	awareness_task.abort();
+
+	// Wait for aborted tasks to fully clean up (drop their receivers)
+	// We can ignore the JoinError since we just aborted them
+	let _ = tokio::join!(heartbeat_task, sync_task, awareness_task);
+	info!("CRDT connection closed: {} (all tasks cleaned up)", user_id);
 
 	// Always log document statistics on close
 	log_doc_statistics(&app, tn_id, &conn.doc_id).await;
@@ -130,8 +130,37 @@ pub async fn handle_crdt_connection(
 	// Clean up document registry and optimize if this was the last connection
 	let should_optimize = cleanup_registry(&conn.doc_id).await;
 	if should_optimize {
-		info!("Last connection closed for doc {}, optimizing...", conn.doc_id);
-		optimize_document(&app, tn_id, &conn.doc_id).await;
+		info!("Last connection closed for doc {}, waiting before optimization...", conn.doc_id);
+
+		// Wait a grace period to ensure:
+		// 1. No new connections are in the process of being established
+		// 2. All concurrent disconnections have completed
+		// 3. No pending updates are still being processed
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+		// Double-check that there are still no active connections
+		// (a new connection might have been established during the grace period)
+		let still_no_connections = {
+			let docs = CRDT_DOCS.read().await;
+			docs.get(&conn.doc_id)
+				.map(|(awareness_tx, sync_tx)| {
+					awareness_tx.receiver_count() == 0 && sync_tx.receiver_count() == 0
+				})
+				.unwrap_or(true) // Doc removed = definitely no connections
+		};
+
+		if still_no_connections {
+			info!(
+				"Confirmed no active connections for doc {}, proceeding with optimization",
+				conn.doc_id
+			);
+			optimize_document(&app, tn_id, &conn.doc_id).await;
+		} else {
+			info!(
+				"New connection established for doc {} during grace period, skipping optimization",
+				conn.doc_id
+			);
+		}
 	}
 }
 
@@ -147,7 +176,7 @@ async fn send_initial_sync(
 		Ok(updates) => {
 			// Check if document has been initialized (has any updates)
 			if updates.is_empty() {
-				debug!("Document {} not initialized, creating initial structure", doc_id);
+				info!("Document {} not initialized, creating initial structure", doc_id);
 
 				// Create initial Y.Doc with meta map containing initialized flag
 				let initial_update = tokio::task::spawn_blocking(move || {
@@ -197,12 +226,28 @@ async fn send_initial_sync(
 					doc_id,
 					updates.iter().map(|u| u.data.len()).sum::<usize>()
 				);
+
+				// DEBUG: Log update metadata (decode disabled as it causes hangs)
+				for (idx, update) in updates.iter().enumerate() {
+					info!(
+						"  Update #{}: {} bytes, client_id={:?}, first 40 bytes: {:?}",
+						idx,
+						update.data.len(),
+						update.client_id,
+						&update.data[..40.min(update.data.len())]
+					);
+				}
+
 				let mut tx = ws_tx.lock().await;
-				for update in updates.iter() {
+				for (idx, update) in updates.iter().enumerate() {
 					// Encode as a complete yrs Message
 					let sync_msg = SyncMessage::Update(update.data.clone());
 					let y_msg = YMessage::Sync(sync_msg);
 					let encoded = y_msg.encode_v1();
+
+					info!("  Sending update #{}: raw={} bytes, encoded={} bytes, first 20 bytes: {:?}",
+						idx, update.data.len(), encoded.len(), &encoded[..20.min(encoded.len())]);
+
 					let ws_msg = Message::Binary(encoded.into());
 
 					if let Err(e) = tx.send(ws_msg).await {
@@ -444,6 +489,17 @@ async fn handle_yrs_message(
 			};
 
 			if let Some(data) = update_data {
+				// Validate the update can be decoded (catches corruption early)
+				// Note: Valid delete-only updates have 0 structs and start with byte 0.
+				// The yrs decoder already validated this is a raw update (not a wrapped message).
+				if let Err(e) = Update::decode_v1(&data) {
+					warn!(
+						"Rejecting malformed update from conn {} - decode failed: {}",
+						conn.conn_id, e
+					);
+					return;
+				}
+
 				let update = crate::crdt_adapter::CrdtUpdate::with_client(
 					data.clone(),
 					conn.user_id.clone(),
@@ -458,7 +514,9 @@ async fn handle_yrs_message(
 						);
 					}
 					Err(e) => {
-						warn!("Failed to store CRDT update for doc {}: {}", conn.doc_id, e);
+						warn!("❌ CRDT update FAILED to store for doc {} from user {}: {} - NOT broadcasting to prevent data loss", conn.doc_id, conn.user_id, e);
+						// Skip broadcasting by returning early
+						return;
 					}
 				}
 			}
@@ -567,17 +625,16 @@ async fn optimize_document(app: &crate::core::app::App, tn_id: crate::types::TnI
 				continue;
 			}
 
-			// Try v2 first, then v1
-			let decoded = match yrs::Update::decode_v2(&update.data)
-				.or_else(|_| yrs::Update::decode_v1(&update.data))
-			{
+			// Decode as v1 (Yjs clients use v1 by default)
+			let decoded = match yrs::Update::decode_v1(&update.data) {
 				Ok(u) => u,
 				Err(e) => {
 					warn!(
-						"Skipping corrupted update #{} for doc {} (size: {} bytes): {}",
+						"Failed to decode update #{} for doc {} (size: {} bytes, first 20 bytes: {:?}): {}",
 						idx,
 						&doc_id_for_task,
 						update.data.len(),
+						&update.data[..20.min(update.data.len())],
 						e
 					);
 					skipped += 1;
@@ -602,19 +659,64 @@ async fn optimize_document(app: &crate::core::app::App, tn_id: crate::types::TnI
 			update_count, &doc_id_for_task, skipped
 		);
 
-		// Merge all updates using yrs's built-in merge algorithm
-		// This properly deduplicates, squashes, and consolidates blocks
-		let merged = yrs::Update::merge_updates(decoded_updates);
+		// CHANGED: Use Doc-based merging instead of Update::merge_updates
+		// Update::merge_updates was producing corrupted updates that hang on transact()
+		// Doc-based approach applies all updates and extracts clean state
+		info!("Using Doc-based merge for {} updates", update_count);
 
-		// Encode the merged update
-		let encoded = merged.encode_v1();
+		let doc = yrs::Doc::new();
+		let mut failed_count = 0;
+		{
+			let mut txn = doc.transact_mut();
+			for (idx, decoded_update) in decoded_updates.into_iter().enumerate() {
+				match txn.apply_update(decoded_update) {
+					Ok(_) => {
+						debug!(
+							"Applied update #{} successfully during merge for doc {}",
+							idx, &doc_id_for_task
+						);
+					}
+					Err(e) => {
+						warn!(
+							"Failed to apply update #{} during merge for doc {}: {}",
+							idx, &doc_id_for_task, e
+						);
+						failed_count += 1;
+					}
+				}
+			}
+			// Transaction drops here
+		}
 
-		debug!(
-			"Merged {} updates into {} bytes for doc {}",
+		if failed_count > 0 {
+			warn!(
+				"Optimization warning for doc {}: {} out of {} updates failed to apply",
+				&doc_id_for_task, failed_count, update_count
+			);
+		}
+
+		// Extract the complete state as a single update
+		let state_vector = yrs::StateVector::default();
+		let txn = doc.transact();
+		let encoded = txn.encode_state_as_update_v1(&state_vector);
+
+		// Log document contents before encoding
+		info!(
+			"Doc-based merge complete for {}: {} updates merged into {} bytes",
+			&doc_id_for_task,
 			update_count,
-			encoded.len(),
-			&doc_id_for_task
+			encoded.len()
 		);
+
+		// Verify the merged update is not empty
+		if encoded.is_empty() {
+			return Err(format!(
+				"Merged update for {} is empty (0 bytes)! This would cause data loss. Aborting optimization.",
+				&doc_id_for_task
+			));
+		}
+
+		info!("Merged update validation passed, proceeding with optimization");
 
 		Ok((encoded, skipped))
 	})
@@ -634,14 +736,24 @@ async fn optimize_document(app: &crate::core::app::App, tn_id: crate::types::TnI
 	// Calculate size after optimization
 	let size_after = merged_update.len();
 
+	info!(
+		"Optimization size check for doc {}: before={} bytes, after={} bytes, reduction={} bytes",
+		doc_id,
+		size_before,
+		size_after,
+		size_before.saturating_sub(size_after)
+	);
+
 	// Only proceed if optimization actually reduces size
 	if size_after >= size_before {
-		debug!(
+		info!(
 			"Skipping optimization for doc {} (no size reduction: {} -> {})",
 			doc_id, size_before, size_after
 		);
 		return;
 	}
+
+	info!("Proceeding with optimization for doc {} (delete + store)", doc_id);
 
 	// Delete old document and store merged update
 	if let Err(e) = app.crdt_adapter.delete_doc(tn_id, doc_id).await {
@@ -681,13 +793,28 @@ async fn optimize_document(app: &crate::core::app::App, tn_id: crate::types::TnI
 async fn cleanup_registry(doc_id: &str) -> bool {
 	let docs = CRDT_DOCS.read().await;
 	if let Some((awareness_tx, sync_tx)) = docs.get(doc_id) {
+		let awareness_count = awareness_tx.receiver_count();
+		let sync_count = sync_tx.receiver_count();
+
+		info!(
+			"Checking CRDT registry cleanup for doc {}: {} awareness receivers, {} sync receivers",
+			doc_id, awareness_count, sync_count
+		);
+
 		// Check if both channels have no more receivers
-		if awareness_tx.receiver_count() == 0 && sync_tx.receiver_count() == 0 {
+		if awareness_count == 0 && sync_count == 0 {
 			drop(docs);
 			CRDT_DOCS.write().await.remove(doc_id);
-			debug!("Cleaned up CRDT registry for doc {}", doc_id);
+			info!("✓ Cleaned up CRDT registry for doc {} - triggering optimization", doc_id);
 			return true; // This was the last connection
+		} else {
+			info!(
+				"✗ Not cleaning up doc {} - still has active receivers (awareness: {}, sync: {})",
+				doc_id, awareness_count, sync_count
+			);
 		}
+	} else {
+		info!("✗ Doc {} not found in registry during cleanup", doc_id);
 	}
 	false
 }
