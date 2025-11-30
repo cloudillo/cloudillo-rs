@@ -1,2 +1,7 @@
 [env]
 LIBSQLITE3_FLAGS="-DSQLITE_MAX_ATTACHED=125"
+
+[build]
+incremental = true
+rustflags = ["-C", "codegen-units=4"]
+rustc-wrapper = "sccache"

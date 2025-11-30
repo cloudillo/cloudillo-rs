@@ -37,6 +37,34 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Privacy: Default post visibility
+	registry.register(
+		SettingDefinition::builder("privacy.default_visibility")
+			.description("Default visibility for new posts (P=Public, C=Connected, F=Followers)")
+			.default(SettingValue::String("F".into()))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.validator(|v| {
+				if let SettingValue::String(s) = v {
+					if ["P", "C", "F"].contains(&s.as_str()) {
+						return Ok(());
+					}
+				}
+				Err(Error::ValidationError("Visibility must be P, C, or F".into()))
+			})
+			.build()?,
+	)?;
+
+	// Privacy: Allow followers
+	registry.register(
+		SettingDefinition::builder("privacy.allow_followers")
+			.description("Allow others to follow you")
+			.default(SettingValue::Bool(true))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
 	Ok(())
 }
 

@@ -10,6 +10,7 @@ use crate::{
 	core::hasher,
 	core::scheduler::{RetryPolicy, Task, TaskId},
 	file::descriptor,
+	file::management::upgrade_file_visibility,
 	meta_adapter,
 	prelude::*,
 };
@@ -46,7 +47,7 @@ pub async fn create_action(
 	// Serialize content Value to string for storage (always JSON-encode)
 	let content_str = helpers::serialize_content(action.content.as_ref());
 
-	// Inherit visibility from parent if not explicitly set
+	// Resolve visibility: explicit > parent inheritance > user default > 'F'
 	let visibility = helpers::inherit_visibility(
 		app.meta_adapter.as_ref(),
 		tn_id,
@@ -54,6 +55,17 @@ pub async fn create_action(
 		action.parent_id.as_deref(),
 	)
 	.await;
+
+	// If no visibility from explicit or parent, use user's default setting
+	let visibility = if visibility.is_some() {
+		visibility
+	} else {
+		// Get user's default visibility setting
+		match app.settings.get_string(tn_id, "privacy.default_visibility").await {
+			Ok(default_vis) => default_vis.chars().next(),
+			Err(_) => Some('F'), // Fallback to Followers
+		}
+	};
 
 	// Create pending action in database with a_id (action_id is NULL at this point)
 	let pending_action = meta_adapter::Action {
@@ -168,6 +180,21 @@ impl Task<App> for ActionCreatorTask {
 
 		// 1. Resolve file attachments
 		let attachments = resolve_attachments(app, self.tn_id, &self.action.attachments).await?;
+
+		// 1b. Upgrade attachment visibility to match action visibility
+		if let Some(ref attachment_ids) = attachments {
+			for file_id in attachment_ids {
+				if let Err(e) =
+					upgrade_file_visibility(app, self.tn_id, file_id, self.action.visibility).await
+				{
+					warn!(
+						"Failed to upgrade visibility for file {}: {} - continuing anyway",
+						file_id, e
+					);
+					// Continue - don't fail action creation due to visibility upgrade
+				}
+			}
+		}
 
 		// 2. Generate action token and get action_id
 		let (action_id, action_token) =
@@ -341,17 +368,26 @@ async fn determine_recipients(
 	);
 
 	if should_broadcast && action.audience_tag.is_none() {
-		// Broadcast mode: query for followers
-		info!("Broadcasting action {} - querying for followers", action_id);
+		// Broadcast mode: query for followers/connections
+		info!("Broadcasting action {} - querying for recipients", action_id);
+
+		// Check if user allows followers
+		let allow_followers =
+			app.settings.get_bool(tn_id, "privacy.allow_followers").await.unwrap_or(true);
+
+		// Query FLLW + CONN if followers allowed, otherwise only CONN
+		let action_types = if allow_followers {
+			vec!["FLLW".into(), "CONN".into()]
+		} else {
+			info!("Broadcasting: Followers disabled, sending only to connections");
+			vec!["CONN".into()]
+		};
 
 		let follower_actions = app
 			.meta_adapter
 			.list_actions(
 				tn_id,
-				&meta_adapter::ListActionOptions {
-					typ: Some(vec!["FLLW".into(), "CONN".into()]),
-					..Default::default()
-				},
+				&meta_adapter::ListActionOptions { typ: Some(action_types), ..Default::default() },
 			)
 			.await?;
 

@@ -6,7 +6,10 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{core::extract::Auth, meta_adapter::UpdateFileOptions, prelude::*};
+use crate::{
+	core::abac::VisibilityLevel, core::extract::Auth, meta_adapter::UpdateFileOptions, prelude::*,
+	types::Patch,
+};
 
 /// PATCH /file/:fileId - Update file metadata
 /// Uses UpdateFileOptions with Patch<> fields for proper null/undefined handling
@@ -54,6 +57,55 @@ pub async fn delete_file(
 	info!("User {} deleted file {}", auth.id_tag, file_id);
 
 	Ok(Json(DeleteFileResponse { file_id }))
+}
+
+/// Upgrade file visibility to match target visibility (only if more permissive)
+///
+/// This function is used when attaching files to posts. If a file has more
+/// restrictive visibility than the post, we upgrade the file's visibility
+/// so recipients can access it.
+///
+/// Returns true if upgrade was performed, false if no change needed.
+pub async fn upgrade_file_visibility(
+	app: &App,
+	tn_id: TnId,
+	file_id: &str,
+	target_visibility: Option<char>,
+) -> ClResult<bool> {
+	// Get current file data
+	let file = app.meta_adapter.read_file(tn_id, file_id).await?.ok_or_else(|| {
+		warn!("upgrade_file_visibility: File {} not found", file_id);
+		Error::NotFound
+	})?;
+
+	let current = VisibilityLevel::from_char(file.visibility);
+	let target = VisibilityLevel::from_char(target_visibility);
+
+	// VisibilityLevel ordering: Public < Verified < ... < Connected < Direct
+	// Smaller value = more permissive
+	// Only upgrade if target is MORE permissive (smaller Ord value)
+	if target < current {
+		info!("Upgrading file {} visibility from {:?} to {:?}", file_id, current, target);
+
+		app.meta_adapter
+			.update_file_data(
+				tn_id,
+				file_id,
+				&UpdateFileOptions {
+					visibility: Patch::Value(target_visibility.unwrap_or('F')),
+					..Default::default()
+				},
+			)
+			.await?;
+
+		Ok(true)
+	} else {
+		debug!(
+			"File {} visibility {:?} already meets or exceeds target {:?}",
+			file_id, current, target
+		);
+		Ok(false)
+	}
 }
 
 // vim: ts=4
