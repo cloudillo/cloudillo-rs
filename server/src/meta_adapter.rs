@@ -215,6 +215,9 @@ pub struct ListActionOptions {
 	pub issuer: Option<String>,
 	pub audience: Option<String>,
 	pub involved: Option<String>,
+	/// The authenticated user's id_tag (set by handler, not from query params)
+	#[serde(skip)]
+	pub viewer_id_tag: Option<String>,
 	#[serde(rename = "actionId")]
 	pub action_id: Option<String>,
 	#[serde(rename = "parentId")]

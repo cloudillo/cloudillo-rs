@@ -46,7 +46,36 @@ pub(crate) async fn list(
 		query.push(" AND a.audience=").push_bind(audience);
 	}
 	if let Some(involved) = &opts.involved {
-		query.push(" AND a.audience=").push_bind(involved);
+		if let Some(viewer) = &opts.viewer_id_tag {
+			if viewer == involved {
+				// Self-messages: both issuer and audience must be the user
+				query
+					.push(" AND a.issuer_tag=")
+					.push_bind(involved)
+					.push(" AND a.audience=")
+					.push_bind(involved);
+			} else {
+				// Conversation between viewer and involved person
+				query
+					.push(" AND ((a.issuer_tag=")
+					.push_bind(viewer)
+					.push(" AND a.audience=")
+					.push_bind(involved)
+					.push(") OR (a.issuer_tag=")
+					.push_bind(involved)
+					.push(" AND a.audience=")
+					.push_bind(viewer)
+					.push("))");
+			}
+		} else {
+			// No viewer (unauthenticated): fall back to simple OR
+			query
+				.push(" AND (a.audience=")
+				.push_bind(involved)
+				.push(" OR a.issuer_tag=")
+				.push_bind(involved)
+				.push(")");
+		}
 	}
 	if let Some(parent_id) = &opts.parent_id {
 		query.push(" AND a.parent_id=").push_bind(parent_id);

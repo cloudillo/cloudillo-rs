@@ -30,16 +30,20 @@ pub async fn list_actions(
 	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth): OptionalAuth,
 	OptionalRequestId(req_id): OptionalRequestId,
-	Query(opts): Query<meta_adapter::ListActionOptions>,
+	Query(mut opts): Query<meta_adapter::ListActionOptions>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<meta_adapter::ActionView>>>)> {
-	info!("list_actions");
-	let actions = app.meta_adapter.list_actions(tn_id, &opts).await?;
-
 	// Filter actions by visibility based on subject's access level
 	let (subject_id_tag, is_authenticated) = match &maybe_auth {
 		Some(auth) => (auth.id_tag.as_ref(), true),
 		None => ("", false),
 	};
+
+	// Set viewer_id_tag for involved filter (conversation filtering)
+	if is_authenticated {
+		opts.viewer_id_tag = Some(subject_id_tag.to_string());
+	}
+
+	let actions = app.meta_adapter.list_actions(tn_id, &opts).await?;
 
 	let filtered = filter_actions_by_visibility(
 		&app,
