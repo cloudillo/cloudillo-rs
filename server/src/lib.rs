@@ -38,6 +38,7 @@ pub mod idp;
 pub mod meta_adapter;
 pub mod prelude;
 pub mod profile;
+pub mod push;
 pub mod r#ref;
 pub mod routes;
 pub mod rtdb;

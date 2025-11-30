@@ -31,8 +31,9 @@ pub async fn get_ws_bus(
 	match auth {
 		Some(auth_ctx) => {
 			let user_id = auth_ctx.id_tag.to_string();
-			debug!("Bus WebSocket authenticated: user_id={}", user_id);
-			ws.on_upgrade(move |socket| ws_bus::handle_bus_connection(socket, user_id, app))
+			let tn_id = auth_ctx.tn_id;
+			debug!("Bus WebSocket authenticated: user_id={}, tn_id={}", user_id, tn_id.0);
+			ws.on_upgrade(move |socket| ws_bus::handle_bus_connection(socket, user_id, tn_id, app))
 		}
 		None => {
 			warn!("Bus WebSocket rejected - no authentication");

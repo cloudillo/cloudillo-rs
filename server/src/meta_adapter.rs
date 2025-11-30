@@ -439,6 +439,43 @@ pub struct UpdateFileOptions {
 	pub status: Patch<char>,
 }
 
+// Push Subscriptions
+//********************
+
+/// Web Push subscription data (RFC 8030)
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushSubscriptionData {
+	/// Push endpoint URL
+	pub endpoint: String,
+	/// Expiration time (Unix timestamp, if provided by browser)
+	#[serde(rename = "expirationTime")]
+	pub expiration_time: Option<i64>,
+	/// Subscription keys (p256dh and auth)
+	pub keys: PushSubscriptionKeys,
+}
+
+/// Subscription keys for Web Push encryption
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushSubscriptionKeys {
+	/// P-256 public key for encryption (base64url encoded)
+	pub p256dh: String,
+	/// Authentication secret (base64url encoded)
+	pub auth: String,
+}
+
+/// Full push subscription record stored in database
+#[derive(Debug, Clone, Serialize)]
+pub struct PushSubscription {
+	/// Unique subscription ID
+	pub id: u64,
+	/// The subscription data (endpoint, keys, etc.)
+	pub subscription: PushSubscriptionData,
+	/// When this subscription was created
+	#[serde(rename = "createdAt")]
+	pub created_at: Timestamp,
+}
+
 // Tasks
 //*******
 pub struct Task {
@@ -785,6 +822,32 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Read file metadata
 	async fn read_file(&self, tn_id: TnId, file_id: &str) -> ClResult<Option<FileView>>;
+
+	// Push Subscription Management
+	//*****************************
+
+	/// List all push subscriptions for a tenant (user)
+	///
+	/// Returns all active push subscriptions for this tenant.
+	/// Each tenant represents a user, so this returns all their device subscriptions.
+	async fn list_push_subscriptions(&self, tn_id: TnId) -> ClResult<Vec<PushSubscription>>;
+
+	/// Create a new push subscription
+	///
+	/// Stores a Web Push subscription for a tenant. The subscription contains
+	/// the endpoint URL and encryption keys needed to send push notifications.
+	/// Returns the generated subscription ID.
+	async fn create_push_subscription(
+		&self,
+		tn_id: TnId,
+		subscription: &PushSubscriptionData,
+	) -> ClResult<u64>;
+
+	/// Delete a push subscription by ID
+	///
+	/// Removes a push subscription. Called when a subscription becomes invalid
+	/// (e.g., 410 Gone response from push service) or when user unsubscribes.
+	async fn delete_push_subscription(&self, tn_id: TnId, subscription_id: u64) -> ClResult<()>;
 }
 
 #[cfg(test)]

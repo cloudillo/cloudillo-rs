@@ -228,7 +228,7 @@ pub async fn process_inbound_action_token(
 	}
 
 	// 7. Execute DSL on_receive hook
-	execute_on_receive_hook(
+	let hook_result = execute_on_receive_hook(
 		app,
 		tn_id,
 		action_id,
@@ -237,7 +237,12 @@ pub async fn process_inbound_action_token(
 		is_sync,
 		client_address,
 	)
-	.await
+	.await?;
+
+	// 8. Forward action to connected WebSocket clients
+	forward_inbound_action_to_websocket(app, tn_id, action_id, &action).await;
+
+	Ok(hook_result)
 }
 
 /// Verify PoW for CONN actions before signature verification
@@ -509,6 +514,143 @@ async fn process_inbound_action_attachments(
 	}
 
 	Ok(())
+}
+
+/// Forward inbound action to connected WebSocket clients
+async fn forward_inbound_action_to_websocket(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	action: &crate::auth_adapter::ActionToken,
+) {
+	use crate::action::forward::{self, ForwardActionParams};
+
+	let (action_type, subtype) = helpers::extract_type_and_subtype(&action.t);
+
+	let attachments: Option<Vec<Box<str>>> = action.a.as_ref().map(|v| v.to_vec());
+
+	let params = ForwardActionParams {
+		action_id,
+		issuer_tag: &action.iss,
+		audience_tag: action.aud.as_deref(),
+		action_type: &action_type,
+		sub_type: subtype.as_deref(),
+		content: action.c.as_ref(),
+		attachments: attachments.as_deref(),
+	};
+
+	let result = forward::forward_inbound_action(app, tn_id, &params).await;
+
+	if result.delivered {
+		debug!(
+			action_id = %action_id,
+			action_type = %action.t,
+			connections = %result.connection_count,
+			"Inbound action forwarded to WebSocket clients"
+		);
+	} else if result.user_offline {
+		debug!(
+			action_id = %action_id,
+			action_type = %action.t,
+			audience = ?action.aud,
+			"User offline - sending push notification"
+		);
+		// Send push notification for offline user
+		send_push_notification(app, tn_id, action_id, action, &action_type, subtype.as_deref())
+			.await;
+	}
+}
+
+/// Send push notification for an action
+async fn send_push_notification(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	action: &crate::auth_adapter::ActionToken,
+	action_type: &str,
+	subtype: Option<&str>,
+) {
+	use crate::action::forward::{get_push_setting_key, should_push_notify};
+	use crate::push::{send_to_tenant, NotificationPayload};
+
+	// Check if this action type should trigger push notifications
+	if !should_push_notify(action_type, subtype) {
+		debug!(
+			action_id = %action_id,
+			action_type = %action_type,
+			"Action type does not trigger push notifications"
+		);
+		return;
+	}
+
+	// Check if user has push notifications enabled for this action type
+	let setting_key = get_push_setting_key(action_type);
+	let push_enabled = app.settings.get_bool(tn_id, setting_key).await.unwrap_or(true);
+	if !push_enabled {
+		debug!(
+			action_id = %action_id,
+			action_type = %action_type,
+			setting_key = %setting_key,
+			"Push notifications disabled for this action type"
+		);
+		return;
+	}
+
+	// Also check master switch
+	let master_enabled = app.settings.get_bool(tn_id, "notify.push").await.unwrap_or(true);
+	if !master_enabled {
+		debug!(
+			action_id = %action_id,
+			"Push notifications disabled (master switch)"
+		);
+		return;
+	}
+
+	// Build notification payload
+	let title = match action_type {
+		"MSG" => format!("Message from {}", action.iss),
+		"CONN" => format!("Connection request from {}", action.iss),
+		"FSHR" => format!("{} shared a file", action.iss),
+		"CMNT" => format!("{} commented", action.iss),
+		_ => format!("Notification from {}", action.iss),
+	};
+
+	let body = action
+		.c
+		.as_ref()
+		.and_then(|c| c.as_str())
+		.map(|s| s.chars().take(100).collect::<String>())
+		.unwrap_or_default();
+
+	let payload = NotificationPayload {
+		title,
+		body,
+		path: Some(format!("/action/{}", action_id)),
+		image: None,
+		tag: Some(action_type.to_string()),
+	};
+
+	// Send to all subscriptions for this tenant
+	match send_to_tenant(app, tn_id, &payload).await {
+		Ok(count) => {
+			info!(
+				action_id = %action_id,
+				action_type = %action_type,
+				tn_id = %tn_id.0,
+				sent_count = %count,
+				"Push notification sent"
+			);
+		}
+		Err(e) => {
+			warn!(
+				action_id = %action_id,
+				action_type = %action_type,
+				tn_id = %tn_id.0,
+				error = %e,
+				"Failed to send push notification"
+			);
+		}
+	}
 }
 
 // vim: ts=4

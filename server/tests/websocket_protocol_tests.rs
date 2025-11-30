@@ -100,31 +100,6 @@ mod tests {
 		assert_eq!(MSG_SYNC, 0);
 		assert_eq!(MSG_AWARENESS, 1);
 	}
-
-	/// Test presence state enum variants
-	#[test]
-	fn test_bus_online_status() {
-		use cloudillo::core::ws_bus::OnlineStatus;
-		use serde_json::{from_value, to_value};
-
-		// Test Online status
-		let online = OnlineStatus::Online;
-		let val = to_value(online).expect("Failed to serialize");
-		let deserialized: OnlineStatus = from_value(val).expect("Failed to deserialize");
-		assert_eq!(deserialized, OnlineStatus::Online);
-
-		// Test Away status
-		let away = OnlineStatus::Away;
-		let val = to_value(away).expect("Failed to serialize");
-		let deserialized: OnlineStatus = from_value(val).expect("Failed to deserialize");
-		assert_eq!(deserialized, OnlineStatus::Away);
-
-		// Test Offline status
-		let offline = OnlineStatus::Offline;
-		let val = to_value(offline).expect("Failed to serialize");
-		let deserialized: OnlineStatus = from_value(val).expect("Failed to deserialize");
-		assert_eq!(deserialized, OnlineStatus::Offline);
-	}
 }
 
 // vim: ts=4

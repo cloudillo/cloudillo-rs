@@ -209,6 +209,7 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	// Vapid keys
 	async fn read_vapid_key(&self, tn_id: TnId) -> ClResult<KeyPair>;
 	async fn read_vapid_public_key(&self, tn_id: TnId) -> ClResult<Box<str>>;
+	async fn create_vapid_key(&self, tn_id: TnId) -> ClResult<KeyPair>;
 	async fn update_vapid_key(&self, tn_id: TnId, key: &KeyPair) -> ClResult<()>;
 
 	// Variables

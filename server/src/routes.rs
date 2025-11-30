@@ -25,6 +25,7 @@ use crate::idp;
 use crate::prelude::*;
 use crate::profile;
 use crate::profile::perm::check_perm_profile;
+use crate::push;
 use crate::r#ref;
 use crate::settings;
 
@@ -76,6 +77,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/auth/logout", post(auth::handler::post_logout))
 		.route("/api/auth/proxy-token", get(auth::handler::get_proxy_token))
 		.route("/api/auth/password", post(auth::handler::post_password))
+		.route("/api/auth/vapid", get(push::handler::get_vapid_public_key))
 
 		// --- Settings API ---
 		.route("/api/settings", get(settings::handler::list_settings))
@@ -124,6 +126,11 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/idp/api-keys", get(idp::api_keys::list_api_keys))
 		.route("/api/idp/api-keys/{id}", get(idp::api_keys::get_api_key))
 		.route("/api/idp/api-keys/{id}", delete(idp::api_keys::delete_api_key))
+
+		// --- Push Notification Management ---
+		.route("/api/notification/subscription", post(push::handler::post_subscription))
+		.route("/api/notification/subscription/{id}", delete(push::handler::delete_subscription))
+		.route("/api/notification/vapid-public-key", get(push::handler::get_vapid_public_key))
 
 		.route_layer(middleware::from_fn_with_state(app, require_auth))
 		.layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-cache")))

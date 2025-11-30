@@ -181,6 +181,12 @@ impl AuthAdapter for AuthAdapterSqlite {
 		vapid::read_vapid_public_key(&self.db, tn_id).await
 	}
 
+	async fn create_vapid_key(&self, tn_id: TnId) -> ClResult<KeyPair> {
+		let keypair = crypto::generate_vapid_key(&self.worker).await?;
+		vapid::update_vapid_key(&self.db, tn_id, &keypair).await?;
+		Ok(keypair)
+	}
+
 	async fn update_vapid_key(&self, tn_id: TnId, key: &KeyPair) -> ClResult<()> {
 		vapid::update_vapid_key(&self.db, tn_id, key).await
 	}

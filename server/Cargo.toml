@@ -50,6 +50,9 @@ regex = "1.12.2"
 hickory-resolver = "0.25"
 yrs = "0.24"
 governor = "0.10.2"
+ece = "2.3"
+p256 = { version = "0.13.2", features = ["pkcs8", "pem"] }
+url = "2"
 
 [dev-dependencies]
 serde_urlencoded = "0.7"

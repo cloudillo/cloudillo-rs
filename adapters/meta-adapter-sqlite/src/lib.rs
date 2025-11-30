@@ -3,6 +3,7 @@ use std::{path::Path, sync::Arc};
 mod action;
 mod file;
 mod profile;
+mod push;
 mod reference;
 mod schema;
 mod setting;
@@ -479,5 +480,24 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn read_file(&self, tn_id: TnId, file_id: &str) -> ClResult<Option<FileView>> {
 		file::read(&self.dbr, tn_id, file_id).await
+	}
+
+	// Push Subscription Management
+	//*****************************
+
+	async fn list_push_subscriptions(&self, tn_id: TnId) -> ClResult<Vec<PushSubscription>> {
+		push::list(&self.dbr, tn_id).await
+	}
+
+	async fn create_push_subscription(
+		&self,
+		tn_id: TnId,
+		subscription: &PushSubscriptionData,
+	) -> ClResult<u64> {
+		push::create(&self.db, tn_id, subscription).await
+	}
+
+	async fn delete_push_subscription(&self, tn_id: TnId, subscription_id: u64) -> ClResult<()> {
+		push::delete(&self.db, tn_id, subscription_id).await
 	}
 }

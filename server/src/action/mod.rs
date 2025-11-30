@@ -3,6 +3,7 @@
 pub mod delivery;
 pub mod dsl;
 pub mod filter;
+pub mod forward;
 pub mod handler;
 pub mod helpers;
 pub mod hooks;

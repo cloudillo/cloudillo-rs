@@ -215,7 +215,18 @@ impl Task<App> for ActionCreatorTask {
 		)
 		.await;
 
-		// 5. Determine recipients and schedule delivery
+		// 5. Forward action to connected WebSocket clients
+		forward_action_to_websocket(
+			app,
+			self.tn_id,
+			&action_id,
+			&self.id_tag,
+			&self.action,
+			&attachments,
+		)
+		.await;
+
+		// 6. Determine recipients and schedule delivery
 		schedule_delivery(app, self.tn_id, &self.id_tag, &action_id, &self.action).await?;
 
 		info!("Finished task action.create {}", action_id);
@@ -339,71 +350,60 @@ async fn execute_on_create_hook(
 	}
 }
 
-/// Determine delivery recipients based on action type definition
-async fn determine_recipients(
+/// Forward action to connected WebSocket clients (direct messaging only)
+async fn forward_action_to_websocket(
 	app: &App,
 	tn_id: TnId,
+	action_id: &str,
+	id_tag: &str,
+	action: &CreateAction,
+	attachments: &Option<Vec<Box<str>>>,
+) {
+	use crate::action::forward::{self, ForwardActionParams};
+
+	let attachments_slice: Option<Vec<Box<str>>> = attachments.clone();
+
+	let params = ForwardActionParams {
+		action_id,
+		issuer_tag: id_tag,
+		audience_tag: action.audience_tag.as_deref(),
+		action_type: action.typ.as_ref(),
+		sub_type: action.sub_typ.as_deref(),
+		content: action.content.as_ref(),
+		attachments: attachments_slice.as_deref(),
+	};
+
+	let result = forward::forward_outbound_action(app, tn_id, &params).await;
+
+	if result.delivered {
+		debug!(
+			action_id = %action_id,
+			action_type = %action.typ,
+			connections = %result.connection_count,
+			"Action forwarded to WebSocket clients"
+		);
+	} else if result.user_offline {
+		debug!(
+			action_id = %action_id,
+			action_type = %action.typ,
+			audience = ?action.audience_tag,
+			"User offline - may need push notification"
+		);
+		// TODO: Schedule push notification task when push module is ready
+	}
+}
+
+/// Determine delivery recipients for federation (direct messaging only)
+async fn determine_recipients(
+	_app: &App,
+	_tn_id: TnId,
 	id_tag: &str,
 	action_id: &str,
 	action: &CreateAction,
 ) -> ClResult<Vec<Box<str>>> {
-	let definition = app.dsl_engine.get_definition(action.typ.as_ref());
-	info!(
-		"Delivery: type={}, definition_found={}, audience={:?}",
-		action.typ,
-		definition.is_some(),
-		action.audience_tag
-	);
-
-	let Some(def) = definition else {
-		warn!("Delivery: No definition found for action type '{}' - skipping delivery", action.typ);
-		return Ok(Vec::new());
-	};
-
-	let should_broadcast = def.behavior.broadcast.unwrap_or(false);
-	info!(
-		"Delivery: should_broadcast={}, audience_is_none={}",
-		should_broadcast,
-		action.audience_tag.is_none()
-	);
-
-	if should_broadcast && action.audience_tag.is_none() {
-		// Broadcast mode: query for followers/connections
-		info!("Broadcasting action {} - querying for recipients", action_id);
-
-		// Check if user allows followers
-		let allow_followers =
-			app.settings.get_bool(tn_id, "privacy.allow_followers").await.unwrap_or(true);
-
-		// Query FLLW + CONN if followers allowed, otherwise only CONN
-		let action_types = if allow_followers {
-			vec!["FLLW".into(), "CONN".into()]
-		} else {
-			info!("Broadcasting: Followers disabled, sending only to connections");
-			vec!["CONN".into()]
-		};
-
-		let follower_actions = app
-			.meta_adapter
-			.list_actions(
-				tn_id,
-				&meta_adapter::ListActionOptions { typ: Some(action_types), ..Default::default() },
-			)
-			.await?;
-
-		use std::collections::HashSet;
-		let mut follower_set = HashSet::new();
-		for action_view in follower_actions {
-			if action_view.issuer.id_tag.as_ref() != id_tag {
-				follower_set.insert(action_view.issuer.id_tag.clone());
-			}
-		}
-
-		let recipients: Vec<Box<str>> = follower_set.into_iter().collect();
-		info!("Broadcasting to {} followers", recipients.len());
-		Ok(recipients)
-	} else if let Some(audience_tag) = &action.audience_tag {
-		// Audience mode: send to specific recipient
+	// Only deliver to specific audience (no broadcast to followers)
+	if let Some(audience_tag) = &action.audience_tag {
+		// Don't send to self
 		if audience_tag.as_ref() != id_tag {
 			info!("Sending action {} to audience {}", action_id, audience_tag);
 			Ok(vec![audience_tag.clone()])
@@ -411,6 +411,7 @@ async fn determine_recipients(
 			Ok(Vec::new())
 		}
 	} else {
+		// No audience - nothing to deliver
 		Ok(Vec::new())
 	}
 }
@@ -427,7 +428,25 @@ async fn schedule_delivery(
 
 	info!("Delivery: {} recipients to send to", recipients.len());
 
+	// Extract tenant domain from id_tag (e.g., "alice.home.w9.hu" -> "home.w9.hu")
+	let tenant_domain = id_tag.split_once('.').map(|(_, domain)| domain).unwrap_or(id_tag);
+
 	for recipient_tag in recipients {
+		// Extract recipient domain (e.g., "bob.home.w9.hu" -> "home.w9.hu")
+		let recipient_domain = recipient_tag
+			.split_once('.')
+			.map(|(_, domain)| domain)
+			.unwrap_or(recipient_tag.as_ref());
+
+		// Skip local recipients - they already received via forward_outbound_action
+		if recipient_domain == tenant_domain {
+			info!(
+				"Skipping local delivery for action {} to {} (same domain: {})",
+				action_id, recipient_tag, tenant_domain
+			);
+			continue;
+		}
+
 		info!("Creating delivery task for action {} to {}", action_id, recipient_tag);
 
 		let delivery_task = ActionDeliveryTask::new(
@@ -517,10 +536,29 @@ impl Task<App> for ActionVerifierTask {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::action::dsl::definitions::get_definitions;
 
 	#[test]
 	fn test_create_action_struct() {
+		let action = CreateAction {
+			typ: "MSG".into(),
+			sub_typ: None,
+			parent_id: None,
+			root_id: None,
+			audience_tag: Some("bob.example.com".into()),
+			content: Some(serde_json::Value::String("Hello".to_string())),
+			attachments: None,
+			subject: None,
+			expires_at: None,
+			visibility: None,
+		};
+
+		assert_eq!(action.typ.as_ref(), "MSG");
+		assert_eq!(action.content, Some(serde_json::Value::String("Hello".to_string())));
+		assert_eq!(action.audience_tag.as_deref(), Some("bob.example.com"));
+	}
+
+	#[test]
+	fn test_create_action_without_audience() {
 		let action = CreateAction {
 			typ: "POST".into(),
 			sub_typ: Some("TEXT".into()),
@@ -535,39 +573,7 @@ mod tests {
 		};
 
 		assert_eq!(action.typ.as_ref(), "POST");
-		assert_eq!(action.content, Some(serde_json::Value::String("Hello world".to_string())));
 		assert!(action.audience_tag.is_none());
-	}
-
-	#[test]
-	fn test_broadcast_action_determination() {
-		let definitions = get_definitions();
-
-		// POST should broadcast
-		let post_def = definitions.iter().find(|d| d.r#type == "POST").unwrap();
-		assert_eq!(post_def.behavior.broadcast, Some(true));
-
-		// MSG should not broadcast
-		let msg_def = definitions.iter().find(|d| d.r#type == "MSG").unwrap();
-		assert_eq!(msg_def.behavior.broadcast, Some(false));
-
-		// FLLW should not broadcast
-		let fllw_def = definitions.iter().find(|d| d.r#type == "FLLW").unwrap();
-		assert_eq!(fllw_def.behavior.broadcast, Some(false));
-	}
-
-	#[test]
-	fn test_audience_vs_broadcast() {
-		let definitions = get_definitions();
-
-		let post_def = definitions.iter().find(|d| d.r#type == "POST").unwrap();
-		let msg_def = definitions.iter().find(|d| d.r#type == "MSG").unwrap();
-
-		// POST broadcasts to followers
-		assert_eq!(post_def.behavior.broadcast, Some(true));
-
-		// MSG is direct (audience-specific)
-		assert_eq!(msg_def.behavior.broadcast, Some(false));
 	}
 }
 

@@ -1,42 +1,36 @@
-//! WebSocket Bus Handler - Extensible notification system
+//! WebSocket Bus Handler - Direct user messaging
 //!
-//! The bus protocol (`/ws/bus`) provides a general notification system for:
-//! - Presence tracking (online/offline status)
-//! - Typing indicators
-//! - Action updates (posts, comments, reactions)
-//! - Profile updates
-//! - Custom extensible messages
+//! The bus protocol (`/ws/bus`) provides direct user-to-user messaging.
 //!
 //! Message Format:
 //! ```json
 //! {
 //!   "id": "msg-123",
-//!   "cmd": "subscribe|presence|typing|...",
+//!   "cmd": "ACTION|presence|typing|...",
 //!   "data": { ... }
 //! }
 //! ```
 
-use crate::core::ws_broadcast::BroadcastMessage;
 use crate::prelude::*;
+use crate::types::TnId;
 use axum::extract::ws::{Message, WebSocket};
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 /// A message in the bus protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BusMessage {
-	/// Unique message ID (for acking)
+	/// Unique message ID
 	pub id: String,
 
-	/// Command type (subscribe, presence, typing, action, etc.)
+	/// Command type (ACTION, presence, typing, etc.)
 	pub cmd: String,
 
-	/// Command data (schema depends on cmd)
+	/// Command data
 	pub data: Value,
 }
 
@@ -71,89 +65,25 @@ impl BusMessage {
 	}
 }
 
-/// Online status for presence tracking
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum OnlineStatus {
-	#[default]
-	Online,
-	Away,
-	Offline,
-}
-
-/// User presence state
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PresenceState {
-	pub user_id: String,
-	pub status: OnlineStatus,
-	pub timestamp: u64,
-	pub idle: bool,
-}
-
-/// Typing state for a path
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TypingState {
-	pub user_id: String,
-	pub path: String,
-	pub active: bool,
-	pub timestamp: u64,
-}
-
-/// Bus connection tracking
-#[derive(Debug)]
-struct BusConnection {
-	user_id: String,
-	subscriptions: Arc<RwLock<Vec<String>>>, // "actions", "presence", "typing", etc.
-	#[allow(clippy::type_complexity)]
-	// Broadcast receivers for each subscribed channel (wrapped in Mutex for interior mutability)
-	broadcast_rxs: Arc<
-		RwLock<
-			HashMap<
-				String,
-				Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<BroadcastMessage>>>,
-			>,
-		>,
-	>,
-	connected_at: u64,
-}
-
-use std::collections::HashMap;
-
 /// Handle a bus connection
-pub async fn handle_bus_connection(ws: WebSocket, user_id: String, app: crate::core::app::App) {
-	info!("Bus connection: {}", user_id);
+pub async fn handle_bus_connection(
+	ws: WebSocket,
+	user_id: String,
+	tn_id: TnId,
+	app: crate::core::app::App,
+) {
+	let connection_id = Uuid::new_v4().to_string();
+	info!("Bus connection: {} (tn_id={}, conn={})", user_id, tn_id.0, &connection_id[..8]);
 
-	let conn = Arc::new(BusConnection {
-		user_id: user_id.clone(),
-		subscriptions: Arc::new(RwLock::new(vec!["presence".to_string()])), // Default to presence
-		broadcast_rxs: Arc::new(RwLock::new(HashMap::new())),
-		connected_at: now_timestamp(),
-	});
-
-	// Subscribe to default channels
-	if let Ok(rx) = app.broadcast.subscribe("presence").await {
-		let mut rxs = conn.broadcast_rxs.write().await;
-		rxs.insert("presence".to_string(), Arc::new(tokio::sync::Mutex::new(rx)));
-	}
-
-	// Broadcast user presence
-	let presence_msg = BroadcastMessage::new(
-		"presence",
-		json!({
-			"user_id": user_id.clone(),
-			"status": "online",
-			"timestamp": now_timestamp()
-		}),
-		user_id.clone(),
-	);
-	let _ = app.broadcast.broadcast("presence", presence_msg).await;
+	// Register user for direct messaging
+	let user_rx = app.broadcast.register_user(tn_id, &user_id, &connection_id).await;
+	let user_rx = Arc::new(tokio::sync::Mutex::new(user_rx));
 
 	// Split WebSocket into sender and receiver
 	let (ws_tx, ws_rx) = ws.split();
 	let ws_tx: Arc<tokio::sync::Mutex<_>> = Arc::new(tokio::sync::Mutex::new(ws_tx));
 
-	// Heartbeat task - sends ping frames to keep connection alive and cleanup broadcast channels periodically
-	let app_clone = app.clone();
+	// Heartbeat task - sends ping frames to keep connection alive
 	let user_id_clone = user_id.clone();
 	let ws_tx_heartbeat = ws_tx.clone();
 	let heartbeat_task = tokio::spawn(async move {
@@ -162,42 +92,33 @@ pub async fn handle_bus_connection(ws: WebSocket, user_id: String, app: crate::c
 			interval.tick().await;
 			debug!("Bus heartbeat: {}", user_id_clone);
 
-			// Send ping frame to keep connection alive
 			let mut tx = ws_tx_heartbeat.lock().await;
 			if tx.send(Message::Ping(vec![].into())).await.is_err() {
 				debug!("Client disconnected during heartbeat");
 				return;
 			}
-			drop(tx);
-
-			// Cleanup empty broadcast channels
-			app_clone.broadcast.cleanup().await;
 		}
 	});
 
-	// WebSocket receive task
-	let conn_clone = conn.clone();
-	let app_clone = app.clone();
+	// WebSocket receive task - handles incoming messages
+	let user_id_clone = user_id.clone();
 	let ws_tx_clone = ws_tx.clone();
 	let ws_recv_task = tokio::spawn(async move {
 		let mut ws_rx = ws_rx;
 		while let Some(msg) = ws_rx.next().await {
 			match msg {
 				Ok(ws_msg) => {
-					// Parse message
 					let msg = match BusMessage::from_ws_message(&ws_msg) {
 						Ok(Some(m)) => m,
-						Ok(None) => continue, // Skip non-text messages
+						Ok(None) => continue,
 						Err(e) => {
 							warn!("Failed to parse bus message: {}", e);
 							continue;
 						}
 					};
 
-					// Handle command
-					let response = handle_bus_command(&conn_clone, &msg, &app_clone).await;
-
-					// Send response
+					// Handle command and send ack
+					let response = handle_bus_command(&user_id_clone, &msg).await;
 					if let Ok(ws_response) = response.to_ws_message() {
 						let mut tx = ws_tx_clone.lock().await;
 						if tx.send(ws_response).await.is_err() {
@@ -214,216 +135,66 @@ pub async fn handle_bus_connection(ws: WebSocket, user_id: String, app: crate::c
 		}
 	});
 
-	// Broadcast receive task - listens on all subscribed channels
-	let conn_clone = conn.clone();
+	// Message receive task - forwards messages to WebSocket
 	let ws_tx_clone = ws_tx.clone();
-	let broadcast_task = tokio::spawn(async move {
+	let message_task = tokio::spawn(async move {
 		loop {
-			// Get current broadcast receivers
-			let receiver_handles = {
-				let rxs = conn_clone.broadcast_rxs.read().await;
-				rxs.iter().map(|(ch, rx_arc)| (ch.clone(), rx_arc.clone())).collect::<Vec<_>>()
+			// Check for user-targeted messages
+			let msg = {
+				let mut rx = user_rx.lock().await;
+				match rx.try_recv() {
+					Ok(msg) => Some(msg),
+					Err(tokio::sync::broadcast::error::TryRecvError::Empty) => None,
+					Err(_) => {
+						debug!("User receiver dropped");
+						return;
+					}
+				}
 			};
 
-			if receiver_handles.is_empty() {
-				// No subscriptions, wait and check again
-				tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-				continue;
-			}
+			if let Some(bcast_msg) = msg {
+				// Forward message directly to WebSocket
+				let response = BusMessage::new(bcast_msg.cmd, bcast_msg.data);
 
-			// Poll all receivers for messages
-			loop {
-				// We need to handle variable number of branches at runtime
-				// Use a simple polling approach with small sleeps
-				let mut received_msg = None;
-
-				for (channel, rx_arc) in receiver_handles.iter() {
-					let mut rx = rx_arc.lock().await;
-					match rx.try_recv() {
-						Ok(msg) => {
-							received_msg = Some((channel.clone(), msg));
-							drop(rx); // Release lock before sending
-							break;
-						}
-						Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
-							drop(rx);
-							continue;
-						}
-						Err(_) => {
-							// Receiver dropped, will be refreshed on next loop
-							drop(rx);
-							break;
-						}
+				if let Ok(ws_response) = response.to_ws_message() {
+					let mut tx = ws_tx_clone.lock().await;
+					if tx.send(ws_response).await.is_err() {
+						debug!("Client disconnected while forwarding message");
+						return;
 					}
 				}
-
-				if let Some((channel, bcast_msg)) = received_msg {
-					// Send broadcast message to WebSocket client
-					let response = BusMessage::new(
-						bcast_msg.cmd.clone(),
-						json!({
-							"channel": channel,
-							"data": bcast_msg.data,
-							"sender": bcast_msg.sender,
-							"timestamp": bcast_msg.timestamp,
-						}),
-					);
-
-					if let Ok(ws_response) = response.to_ws_message() {
-						let mut tx = ws_tx_clone.lock().await;
-						if tx.send(ws_response).await.is_err() {
-							debug!("Client disconnected while forwarding broadcast");
-							return;
-						}
-					}
-				} else {
-					// No message available, yield and check again
-					tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-					break; // Re-fetch receivers in case subscriptions changed
-				}
+			} else {
+				// No message, yield
+				tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 			}
 		}
 	});
 
-	// Wait for either receive or broadcast task to complete
+	// Wait for any task to complete
 	tokio::select! {
 		_ = ws_recv_task => {
 			debug!("WebSocket receive task ended");
 		}
-		_ = broadcast_task => {
-			debug!("Broadcast task ended");
+		_ = message_task => {
+			debug!("Message task ended");
 		}
 	}
 
-	// Broadcast user offline
-	let offline_msg = BroadcastMessage::new(
-		"presence",
-		json!({
-			"user_id": user_id.clone(),
-			"status": "offline",
-			"timestamp": now_timestamp()
-		}),
-		user_id.clone(),
-	);
-	let _ = app.broadcast.broadcast("presence", offline_msg).await;
-
+	// Cleanup
+	app.broadcast.unregister_user(tn_id, &user_id, &connection_id).await;
 	heartbeat_task.abort();
-	info!("Bus connection closed: {}", user_id);
+	info!("Bus connection closed: {} (conn={})", user_id, &connection_id[..8]);
 }
 
 /// Handle a bus command
-async fn handle_bus_command(
-	conn: &Arc<BusConnection>,
-	msg: &BusMessage,
-	app: &crate::core::app::App,
-) -> BusMessage {
+async fn handle_bus_command(user_id: &str, msg: &BusMessage) -> BusMessage {
 	match msg.cmd.as_str() {
-		"subscribe" => {
-			// Extract channels from data
-			if let Some(channels) = msg.data.get("channels").and_then(|v| v.as_array()) {
-				let mut subs = conn.subscriptions.write().await;
-				let mut rxs = conn.broadcast_rxs.write().await;
-				for channel in channels {
-					if let Some(ch) = channel.as_str() {
-						if !subs.contains(&ch.to_string()) {
-							// Subscribe to broadcast channel
-							if let Ok(rx) = app.broadcast.subscribe(ch).await {
-								rxs.insert(ch.to_string(), Arc::new(tokio::sync::Mutex::new(rx)));
-								subs.push(ch.to_string());
-								debug!("User {} subscribed to: {}", conn.user_id, ch);
-							}
-						}
-					}
-				}
-			}
-			BusMessage::ack(msg.id.clone(), "ok")
-		}
-
-		"unsubscribe" => {
-			// Remove channels from subscription
-			if let Some(channels) = msg.data.get("channels").and_then(|v| v.as_array()) {
-				let mut subs = conn.subscriptions.write().await;
-				let mut rxs = conn.broadcast_rxs.write().await;
-				for channel in channels {
-					if let Some(ch) = channel.as_str() {
-						subs.retain(|s| s != ch);
-						rxs.remove(ch);
-						debug!("User {} unsubscribed from: {}", conn.user_id, ch);
-					}
-				}
-			}
-			BusMessage::ack(msg.id.clone(), "ok")
-		}
-
-		"setPresence" => {
-			// Update user presence and broadcast
-			let status = msg.data.get("status").and_then(|v| v.as_str()).unwrap_or("online");
-
-			let presence = PresenceState {
-				user_id: conn.user_id.clone(),
-				status: match status {
-					"away" => OnlineStatus::Away,
-					"offline" => OnlineStatus::Offline,
-					_ => OnlineStatus::Online,
-				},
-				timestamp: now_timestamp(),
-				idle: msg.data.get("idle").and_then(|v| v.as_bool()).unwrap_or(false),
-			};
-
-			debug!("User {} presence: {:?}", conn.user_id, presence);
-
-			// Broadcast presence update to all subscribers
-			let broadcast_msg = BroadcastMessage::new(
-				"presence",
-				serde_json::to_value(&presence).unwrap_or(json!({})),
-				conn.user_id.clone(),
-			);
-			let _ = app.broadcast.broadcast("presence", broadcast_msg).await;
-
-			BusMessage::ack(msg.id.clone(), "ok")
-		}
-
-		"sendTyping" => {
-			// Broadcast typing indicator
-			if let Some(path) = msg.data.get("path").and_then(|v| v.as_str()) {
-				let active = msg.data.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
-
-				let typing = TypingState {
-					user_id: conn.user_id.clone(),
-					path: path.to_string(),
-					active,
-					timestamp: now_timestamp(),
-				};
-
-				debug!("User {} typing at {}: {}", conn.user_id, path, active);
-
-				// Broadcast typing indicator to subscribers on this path
-				let channel = format!("typing:{}", path);
-				let broadcast_msg = BroadcastMessage::new(
-					"typing",
-					serde_json::to_value(&typing).unwrap_or(json!({})),
-					conn.user_id.clone(),
-				);
-				let _ = app.broadcast.broadcast(&channel, broadcast_msg).await;
-			}
-
-			BusMessage::ack(msg.id.clone(), "ok")
-		}
-
+		"ping" => BusMessage::ack(msg.id.clone(), "pong"),
 		_ => {
-			// Unknown command
-			warn!("Unknown bus command: {}", msg.cmd);
-			BusMessage::ack(msg.id.clone(), "error")
+			debug!("Bus command from {}: {}", user_id, msg.cmd);
+			BusMessage::ack(msg.id.clone(), "ok")
 		}
 	}
-}
-
-/// Get current timestamp
-fn now_timestamp() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.unwrap_or_default()
-		.as_secs()
 }
 
 // vim: ts=4

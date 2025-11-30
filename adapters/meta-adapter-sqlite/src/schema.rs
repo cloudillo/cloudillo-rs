@@ -66,10 +66,9 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS subscriptions (
 		tn_id integer NOT NULL,
-		subs_id integer NOT NULL,
+		subs_id integer PRIMARY KEY AUTOINCREMENT,
 		created_at datetime DEFAULT (unixepoch()),
-		subscription json,
-		PRIMARY KEY(subs_id)
+		subscription json
 	)",
 	)
 	.execute(&mut *tx)

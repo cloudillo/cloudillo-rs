@@ -4,6 +4,9 @@ const BCRYPT_COST: u32 = 10;
 use p384::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use p384::{elliptic_curve::rand_core::OsRng, SecretKey};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use p256::SecretKey as P256SecretKey;
+
 use cloudillo::{auth_adapter::*, core::worker, prelude::*};
 
 fn generate_password_hash_sync(password: Box<str>) -> ClResult<Box<str>> {
@@ -104,6 +107,35 @@ fn generate_key_sync() -> ClResult<KeyPair> {
 /// Generate a keypair
 pub async fn generate_key(worker: &worker::WorkerPool) -> ClResult<KeyPair> {
 	worker.run_immed(generate_key_sync).await.map_err(|_| Error::PermissionDenied)
+}
+
+/// Generate a P-256 keypair for VAPID (sync)
+///
+/// VAPID uses ES256 (P-256 curve). Returns:
+/// - private_key: Raw 32-byte scalar, base64url encoded (compatible with TS version)
+/// - public_key: 65-byte uncompressed point, base64url encoded (for Web Push API)
+fn generate_vapid_key_sync() -> ClResult<KeyPair> {
+	use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+	let private = P256SecretKey::random(&mut OsRng);
+	let public = private.public_key();
+
+	// Private key as raw scalar, base64url encoded (compatible with TypeScript version)
+	let private_key: Box<str> = URL_SAFE_NO_PAD.encode(&private.to_bytes()).into();
+
+	// Public key as uncompressed point, base64url encoded (for Web Push API)
+	let public_point = public.to_encoded_point(false);
+	let public_key: Box<str> = URL_SAFE_NO_PAD.encode(public_point.as_bytes()).into();
+
+	Ok(KeyPair { private_key, public_key })
+}
+
+/// Generate a P-256 keypair for VAPID
+pub async fn generate_vapid_key(worker: &worker::WorkerPool) -> ClResult<KeyPair> {
+	worker
+		.run_immed(generate_vapid_key_sync)
+		.await
+		.map_err(|_| Error::PermissionDenied)
 }
 
 fn generate_action_token_sync(

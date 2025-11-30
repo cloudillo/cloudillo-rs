@@ -267,6 +267,9 @@ impl AppBuilder {
 		// Register settings from IDP module
 		crate::idp::settings::register_settings(&mut settings_registry)?;
 
+		// Register settings from push notification module
+		crate::push::settings::register_settings(&mut settings_registry)?;
+
 		info!("Registered {} settings", settings_registry.len());
 
 		// Freeze the registry

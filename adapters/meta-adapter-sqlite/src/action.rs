@@ -197,7 +197,7 @@ pub(crate) async fn list(
 		let visibility: Option<String> = row.try_get("visibility").ok();
 		let visibility = visibility.and_then(|s| s.chars().next());
 		actions.push(ActionView {
-			action_id: row.try_get::<Box<str>, _>("action_id").map_err(|_| Error::DbError)?,
+			action_id,
 			typ: row.try_get::<Box<str>, _>("type").map_err(|_| Error::DbError)?,
 			sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type").map_err(|_| Error::DbError)?,
 			parent_id: row

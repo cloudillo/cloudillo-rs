@@ -1,16 +1,16 @@
-//! WebSocket Broadcast Manager
+//! WebSocket User Messaging
 //!
-//! Manages message broadcasting across multiple WebSocket connections.
-//! Provides channel-based pub/sub with automatic cleanup.
+//! Manages direct user-to-user messaging via WebSocket connections.
+//! Supports multiple connections per user (multiple tabs/devices).
 
-use crate::prelude::*;
+use crate::types::TnId;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
-/// A message broadcast to all subscribers of a channel
+/// A message to send to a user
 #[derive(Clone, Debug)]
 pub struct BroadcastMessage {
 	pub id: String,
@@ -21,7 +21,7 @@ pub struct BroadcastMessage {
 }
 
 impl BroadcastMessage {
-	/// Create a new broadcast message
+	/// Create a new message
 	pub fn new(cmd: impl Into<String>, data: Value, sender: impl Into<String>) -> Self {
 		Self {
 			id: Uuid::new_v4().to_string(),
@@ -33,118 +33,217 @@ impl BroadcastMessage {
 	}
 }
 
-/// Broadcast channel statistics
+/// A user connection for direct messaging
+#[derive(Debug)]
+pub struct UserConnection {
+	/// User's id_tag
+	pub id_tag: Box<str>,
+	/// Tenant ID
+	pub tn_id: TnId,
+	/// Unique connection ID (UUID) - supports multiple tabs/devices
+	pub connection_id: Box<str>,
+	/// When this connection was established
+	pub connected_at: u64,
+	/// Sender for this connection
+	sender: broadcast::Sender<BroadcastMessage>,
+}
+
+/// Result of sending a message to a user
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryResult {
+	/// Message delivered to N connections
+	Delivered(usize),
+	/// User is not connected (offline)
+	UserOffline,
+}
+
+/// User registry statistics
 #[derive(Debug, Clone)]
-pub struct ChannelStats {
-	pub active_channels: usize,
-	pub total_subscribers: usize,
-	pub channels: HashMap<String, usize>,
+pub struct UserRegistryStats {
+	/// Number of unique online users
+	pub online_users: usize,
+	/// Total number of connections (may be > users if multiple tabs)
+	pub total_connections: usize,
+	/// Users per tenant
+	pub users_per_tenant: HashMap<TnId, usize>,
 }
 
-/// Manages WebSocket broadcasts across channels
-pub struct BroadcastManager {
-	channels: Arc<RwLock<HashMap<String, broadcast::Sender<BroadcastMessage>>>>,
-	config: BroadcastConfig,
-}
+/// Type alias for the user registry map: TnId -> id_tag -> Vec<UserConnection>
+type UserRegistryMap = HashMap<TnId, HashMap<Box<str>, Vec<UserConnection>>>;
 
-/// Broadcast manager configuration
+/// Configuration
 #[derive(Clone, Debug)]
 pub struct BroadcastConfig {
-	/// Maximum number of messages to buffer per channel
+	/// Maximum number of messages to buffer per connection
 	pub buffer_size: usize,
-	/// Maximum channel name length
-	pub max_channel_name: usize,
-	/// Maximum number of channels
-	pub max_channels: usize,
 }
 
 impl Default for BroadcastConfig {
 	fn default() -> Self {
-		Self { buffer_size: 128, max_channel_name: 256, max_channels: 10000 }
+		Self { buffer_size: 128 }
 	}
 }
 
+/// Manages direct user messaging via WebSocket
+pub struct BroadcastManager {
+	/// User registry for direct messaging
+	users: Arc<RwLock<UserRegistryMap>>,
+	config: BroadcastConfig,
+}
+
 impl BroadcastManager {
-	/// Create a new broadcast manager with default config
+	/// Create a new manager with default config
 	pub fn new() -> Self {
 		Self::with_config(BroadcastConfig::default())
 	}
 
 	/// Create with custom config
 	pub fn with_config(config: BroadcastConfig) -> Self {
-		Self { channels: Arc::new(RwLock::new(HashMap::new())), config }
+		Self { users: Arc::new(RwLock::new(HashMap::new())), config }
 	}
 
-	/// Subscribe to a channel, creating it if needed
-	pub async fn subscribe(
+	/// Register a user connection for direct messaging
+	///
+	/// Returns a receiver for messages targeted at this user.
+	/// The connection_id should be a unique identifier (UUID) for this specific
+	/// connection, allowing multiple connections per user (multiple tabs/devices).
+	pub async fn register_user(
 		&self,
-		channel: &str,
-	) -> ClResult<broadcast::Receiver<BroadcastMessage>> {
-		// Validate channel name
-		if channel.is_empty() || channel.len() > self.config.max_channel_name {
-			return Err(Error::ValidationError("channel name empty or exceeds max length".into()));
-		}
+		tn_id: TnId,
+		id_tag: &str,
+		connection_id: &str,
+	) -> broadcast::Receiver<BroadcastMessage> {
+		let (sender, receiver) = broadcast::channel(self.config.buffer_size);
 
-		let mut channels = self.channels.write().await;
+		let connection = UserConnection {
+			id_tag: id_tag.into(),
+			tn_id,
+			connection_id: connection_id.into(),
+			connected_at: now_timestamp(),
+			sender,
+		};
 
-		// Check channel limit
-		if !channels.contains_key(channel) && channels.len() >= self.config.max_channels {
-			return Err(Error::ValidationError("channel limit exceeded".into()));
-		}
+		let mut users = self.users.write().await;
+		users
+			.entry(tn_id)
+			.or_default()
+			.entry(id_tag.into())
+			.or_default()
+			.push(connection);
 
-		// Get or create channel
-		let sender = channels
-			.entry(channel.to_string())
-			.or_insert_with(|| {
-				let (tx, _) = broadcast::channel(self.config.buffer_size);
-				tx
-			})
-			.clone();
-
-		Ok(sender.subscribe())
+		tracing::debug!(tn_id = ?tn_id, id_tag = %id_tag, connection_id = %connection_id, "User registered");
+		receiver
 	}
 
-	/// Broadcast a message to a channel
-	pub async fn broadcast(&self, channel: &str, msg: BroadcastMessage) -> ClResult<()> {
-		let channels = self.channels.read().await;
+	/// Unregister a user connection
+	///
+	/// Removes the specific connection identified by connection_id.
+	/// Other connections for the same user (other tabs) are preserved.
+	pub async fn unregister_user(&self, tn_id: TnId, id_tag: &str, connection_id: &str) {
+		let mut users = self.users.write().await;
 
-		if let Some(sender) = channels.get(channel) {
-			// Ignore if no receivers (channel exists but unused)
-			let _ = sender.send(msg);
-			Ok(())
-		} else {
-			// Channel doesn't exist - silently ignore
-			// Subscribers will be created when needed
-			Ok(())
-		}
-	}
+		if let Some(tenant_users) = users.get_mut(&tn_id) {
+			if let Some(connections) = tenant_users.get_mut(id_tag) {
+				connections.retain(|conn| conn.connection_id.as_ref() != connection_id);
 
-	/// Get broadcast statistics
-	pub async fn stats(&self) -> ChannelStats {
-		let channels = self.channels.read().await;
+				// Clean up empty entries
+				if connections.is_empty() {
+					tenant_users.remove(id_tag);
+				}
+			}
 
-		let mut channel_stats = HashMap::new();
-		let mut total_subscribers = 0;
-
-		for (channel, sender) in channels.iter() {
-			let subscriber_count = sender.receiver_count();
-			total_subscribers += subscriber_count;
-			channel_stats.insert(channel.clone(), subscriber_count);
+			// Clean up empty tenant entries
+			if tenant_users.is_empty() {
+				users.remove(&tn_id);
+			}
 		}
 
-		ChannelStats { active_channels: channels.len(), total_subscribers, channels: channel_stats }
+		tracing::debug!(tn_id = ?tn_id, id_tag = %id_tag, connection_id = %connection_id, "User unregistered");
 	}
 
-	/// Cleanup empty channels (channels with no receivers)
-	pub async fn cleanup(&self) {
-		let mut channels = self.channels.write().await;
-		channels.retain(|_, sender| sender.receiver_count() > 0);
+	/// Send a message to a specific user
+	///
+	/// Delivers the message to all connections for the user (multiple tabs/devices).
+	/// Returns `DeliveryResult::Delivered(n)` with the number of connections that
+	/// received the message, or `DeliveryResult::UserOffline` if the user has no
+	/// active connections.
+	pub async fn send_to_user(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		msg: BroadcastMessage,
+	) -> DeliveryResult {
+		let users = self.users.read().await;
+
+		if let Some(tenant_users) = users.get(&tn_id) {
+			if let Some(connections) = tenant_users.get(id_tag) {
+				let mut delivered = 0;
+				for conn in connections {
+					if conn.sender.send(msg.clone()).is_ok() {
+						delivered += 1;
+					}
+				}
+				if delivered > 0 {
+					return DeliveryResult::Delivered(delivered);
+				}
+			}
+		}
+
+		DeliveryResult::UserOffline
 	}
 
-	/// Get number of receivers on a channel
-	pub async fn receiver_count(&self, channel: &str) -> usize {
-		let channels = self.channels.read().await;
-		channels.get(channel).map(|sender| sender.receiver_count()).unwrap_or(0)
+	/// Check if a user is currently online (has at least one connection)
+	pub async fn is_user_online(&self, tn_id: TnId, id_tag: &str) -> bool {
+		let users = self.users.read().await;
+
+		users
+			.get(&tn_id)
+			.and_then(|tenant_users| tenant_users.get(id_tag))
+			.is_some_and(|connections| !connections.is_empty())
+	}
+
+	/// Get list of all online users for a tenant
+	pub async fn online_users(&self, tn_id: TnId) -> Vec<Box<str>> {
+		let users = self.users.read().await;
+
+		users
+			.get(&tn_id)
+			.map(|tenant_users| tenant_users.keys().cloned().collect())
+			.unwrap_or_default()
+	}
+
+	/// Get user registry statistics
+	pub async fn user_stats(&self) -> UserRegistryStats {
+		let users = self.users.read().await;
+
+		let mut online_users = 0;
+		let mut total_connections = 0;
+		let mut users_per_tenant = HashMap::new();
+
+		for (tn_id, tenant_users) in users.iter() {
+			let tenant_user_count = tenant_users.len();
+			online_users += tenant_user_count;
+			users_per_tenant.insert(*tn_id, tenant_user_count);
+
+			for connections in tenant_users.values() {
+				total_connections += connections.len();
+			}
+		}
+
+		UserRegistryStats { online_users, total_connections, users_per_tenant }
+	}
+
+	/// Cleanup disconnected users (users with no active receivers)
+	pub async fn cleanup_users(&self) {
+		let mut users = self.users.write().await;
+
+		for tenant_users in users.values_mut() {
+			for connections in tenant_users.values_mut() {
+				connections.retain(|conn| conn.sender.receiver_count() > 0);
+			}
+			tenant_users.retain(|_, connections| !connections.is_empty());
+		}
+		users.retain(|_, tenant_users| !tenant_users.is_empty());
 	}
 }
 
@@ -167,50 +266,90 @@ mod tests {
 	use super::*;
 
 	#[tokio::test]
-	async fn test_broadcast_manager_creation() {
+	async fn test_register_user() {
 		let manager = BroadcastManager::new();
-		let stats = manager.stats().await;
-		assert_eq!(stats.active_channels, 0);
-		assert_eq!(stats.total_subscribers, 0);
+		let tn_id = TnId(1);
+
+		let _rx = manager.register_user(tn_id, "alice", "conn-1").await;
+
+		assert!(manager.is_user_online(tn_id, "alice").await);
+		assert!(!manager.is_user_online(tn_id, "bob").await);
+
+		let stats = manager.user_stats().await;
+		assert_eq!(stats.online_users, 1);
+		assert_eq!(stats.total_connections, 1);
 	}
 
 	#[tokio::test]
-	async fn test_subscribe_creates_channel() {
+	async fn test_multiple_connections_per_user() {
 		let manager = BroadcastManager::new();
-		let _rx = manager.subscribe("test-channel").await.unwrap();
+		let tn_id = TnId(1);
 
-		let stats = manager.stats().await;
-		assert_eq!(stats.active_channels, 1);
-		assert_eq!(stats.total_subscribers, 1);
+		let _rx1 = manager.register_user(tn_id, "alice", "conn-1").await;
+		let _rx2 = manager.register_user(tn_id, "alice", "conn-2").await;
+
+		let stats = manager.user_stats().await;
+		assert_eq!(stats.online_users, 1);
+		assert_eq!(stats.total_connections, 2);
 	}
 
 	#[tokio::test]
-	async fn test_broadcast_message() {
+	async fn test_send_to_user() {
 		let manager = BroadcastManager::new();
-		let mut rx = manager.subscribe("test-channel").await.unwrap();
+		let tn_id = TnId(1);
 
-		let msg = BroadcastMessage::new("test", serde_json::json!({ "data": "test" }), "sender-1");
+		let mut rx = manager.register_user(tn_id, "alice", "conn-1").await;
 
-		manager.broadcast("test-channel", msg.clone()).await.unwrap();
+		let msg = BroadcastMessage::new("ACTION", serde_json::json!({ "type": "MSG" }), "system");
+		let result = manager.send_to_user(tn_id, "alice", msg).await;
+
+		assert_eq!(result, DeliveryResult::Delivered(1));
+
 		let received = rx.recv().await.unwrap();
-		assert_eq!(received.cmd, "test");
+		assert_eq!(received.cmd, "ACTION");
 	}
 
 	#[tokio::test]
-	async fn test_multiple_subscribers() {
+	async fn test_send_to_offline_user() {
 		let manager = BroadcastManager::new();
-		let mut rx1 = manager.subscribe("test-channel").await.unwrap();
-		let mut rx2 = manager.subscribe("test-channel").await.unwrap();
+		let tn_id = TnId(1);
 
-		let msg = BroadcastMessage::new("test", serde_json::json!({ "data": "test" }), "sender-1");
+		let msg = BroadcastMessage::new("ACTION", serde_json::json!({ "type": "MSG" }), "system");
+		let result = manager.send_to_user(tn_id, "bob", msg).await;
 
-		manager.broadcast("test-channel", msg.clone()).await.unwrap();
+		assert_eq!(result, DeliveryResult::UserOffline);
+	}
 
-		let received1 = rx1.recv().await.unwrap();
-		let received2 = rx2.recv().await.unwrap();
+	#[tokio::test]
+	async fn test_unregister_user() {
+		let manager = BroadcastManager::new();
+		let tn_id = TnId(1);
 
-		assert_eq!(received1.cmd, "test");
-		assert_eq!(received2.cmd, "test");
+		let _rx = manager.register_user(tn_id, "alice", "conn-1").await;
+		assert!(manager.is_user_online(tn_id, "alice").await);
+
+		manager.unregister_user(tn_id, "alice", "conn-1").await;
+		assert!(!manager.is_user_online(tn_id, "alice").await);
+	}
+
+	#[tokio::test]
+	async fn test_multi_tenant_isolation() {
+		let manager = BroadcastManager::new();
+		let tn1 = TnId(1);
+		let tn2 = TnId(2);
+
+		let _rx1 = manager.register_user(tn1, "alice", "conn-1").await;
+		let _rx2 = manager.register_user(tn2, "alice", "conn-2").await;
+
+		assert!(manager.is_user_online(tn1, "alice").await);
+		assert!(manager.is_user_online(tn2, "alice").await);
+
+		let msg = BroadcastMessage::new("test", serde_json::json!({}), "system");
+		let result = manager.send_to_user(tn1, "alice", msg).await;
+		assert_eq!(result, DeliveryResult::Delivered(1));
+
+		let stats = manager.user_stats().await;
+		assert_eq!(stats.online_users, 2);
 	}
 }
 

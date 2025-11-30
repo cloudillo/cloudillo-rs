@@ -73,6 +73,19 @@ pub async fn create_complete_tenant(
 
 	info!("Profile key created");
 
+	// Create VAPID key for push notifications
+	auth.create_vapid_key(tn_id).await.map_err(|e| {
+		warn!(
+			error = %e,
+			id_tag = %opts.id_tag,
+			tn_id = ?tn_id,
+			"Failed to create VAPID key"
+		);
+		e
+	})?;
+
+	info!("VAPID key created");
+
 	// Create tenant in meta adapter
 	meta.create_tenant(tn_id, opts.id_tag).await.map_err(|e| {
 		warn!(

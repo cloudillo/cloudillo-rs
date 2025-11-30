@@ -1012,12 +1012,12 @@ impl<'a> OperationExecutor<'a> {
 				.as_secs(),
 		});
 
-		// Send notification to user's WebSocket channel
-		let channel = format!("user:{}", user_id);
+		// Send notification to user via direct messaging
+		let tn_id = crate::types::TnId(context.tenant_id as u32);
 		let broadcast_msg =
 			BroadcastMessage::new("notification", notification_data, context.tenant_tag.clone());
 
-		self.app.broadcast.broadcast(&channel, broadcast_msg).await?;
+		let _ = self.app.broadcast.send_to_user(tn_id, &user_id, broadcast_msg).await;
 
 		tracing::info!(
 			tenant_id = %context.tenant_id,
