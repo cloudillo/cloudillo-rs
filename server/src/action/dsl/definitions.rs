@@ -668,10 +668,30 @@ fn fileshare_definition() -> ActionDefinition {
 							items: None,
 						},
 					);
+					props.insert(
+						"fileTp".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: Some(1),
+							max_length: Some(10),
+							r#enum: Some(vec![
+								serde_json::Value::String("BLOB".to_string()),
+								serde_json::Value::String("CRDT".to_string()),
+								serde_json::Value::String("RTDB".to_string()),
+							]),
+							items: None,
+						},
+					);
 					props
 				}),
-				required: Some(vec!["contentType".to_string(), "fileName".to_string()]),
-				description: Some("File share content with contentType and fileName".to_string()),
+				required: Some(vec![
+					"contentType".to_string(),
+					"fileName".to_string(),
+					"fileTp".to_string(),
+				]),
+				description: Some(
+					"File share content with contentType, fileName, and fileTp".to_string(),
+				),
 			}),
 		}),
 		behavior: BehaviorFlags {

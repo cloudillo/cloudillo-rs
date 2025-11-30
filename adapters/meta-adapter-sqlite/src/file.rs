@@ -24,7 +24,7 @@ pub(crate) async fn list(
 	opts: &ListFileOptions,
 ) -> ClResult<Vec<FileView>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT f.file_id, f.file_name, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+		"SELECT f.file_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
 		        p.id_tag, p.name, p.type, p.profile_pic
 		 FROM files f
 		 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
@@ -45,15 +45,24 @@ pub(crate) async fn list(
 	}
 
 	if let Some(file_type) = &opts.file_type {
-		query.push(" AND f.file_tp=").push_bind(file_type.as_str());
+		// Support comma-separated multiple types (e.g., "CRDT,RTDB")
+		let types: Vec<&str> = file_type.split(',').map(|s| s.trim()).collect();
+		if types.len() == 1 {
+			query.push(" AND f.file_tp=").push_bind(types[0]);
+		} else {
+			query.push(" AND f.file_tp IN (");
+			let mut separated = query.separated(", ");
+			for t in types {
+				separated.push_bind(t);
+			}
+			separated.push_unseparated(")");
+		}
 	}
 
 	// Filter by status - if no status specified, exclude deleted files by default
 	if let Some(status) = opts.status {
 		let status_char = match status {
 			FileStatus::Active => "A",
-			FileStatus::Immutable => "I",
-			FileStatus::Mutable => "M",
 			FileStatus::Pending => "P",
 			FileStatus::Deleted => "D",
 		};
@@ -76,8 +85,6 @@ pub(crate) async fn list(
 	collect_res(res.iter().map(|row| {
 		let status = match row.try_get("status")? {
 			"A" => FileStatus::Active,
-			"I" => FileStatus::Immutable,
-			"M" => FileStatus::Mutable,
 			"P" => FileStatus::Pending,
 			"D" => FileStatus::Deleted,
 			_ => return Err(sqlx::Error::RowNotFound),
@@ -110,6 +117,7 @@ pub(crate) async fn list(
 			preset: row.try_get("preset")?,
 			content_type: row.try_get("content_type")?,
 			file_name: row.try_get("file_name")?,
+			file_tp: row.try_get("file_tp")?,
 			created_at: row.try_get("created_at").map(Timestamp)?,
 			status,
 			tags,
@@ -235,8 +243,6 @@ pub(crate) async fn create(
 	// Use provided status or default to 'P' (Pending)
 	let status = match opts.status {
 		Some(FileStatus::Active) => "A",
-		Some(FileStatus::Immutable) => "I",
-		Some(FileStatus::Mutable) => "M",
 		Some(FileStatus::Pending) => "P",
 		Some(FileStatus::Deleted) => "D",
 		None => "P",
@@ -245,7 +251,24 @@ pub(crate) async fn create(
 		if let Some(created_at) = opts.created_at { created_at } else { Timestamp::now() };
 	let file_tp = opts.file_tp.as_deref().unwrap_or("BLOB"); // Default to BLOB if not specified
 	let visibility = opts.visibility.map(|c| c.to_string());
-	let res = sqlx::query("INSERT OR IGNORE INTO files (tn_id, file_id, status, owner_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
+
+	// For shared files (with explicit file_id), check if already exists (idempotent)
+	if let Some(ref file_id) = opts.file_id {
+		let existing: Option<i64> =
+			sqlx::query_scalar("SELECT f_id FROM files WHERE tn_id=? AND file_id=?")
+				.bind(tn_id.0)
+				.bind(file_id)
+				.fetch_optional(db)
+				.await
+				.inspect_err(inspect)
+				.map_err(|_| Error::DbError)?;
+
+		if let Some(f_id) = existing {
+			return Ok(FileId::FId(f_id as u64));
+		}
+	}
+
+	let res = sqlx::query("INSERT INTO files (tn_id, file_id, status, owner_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
 		.bind(tn_id.0).bind(opts.file_id).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility)
 		.fetch_one(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
@@ -554,7 +577,7 @@ pub(crate) async fn read(
 			.parse::<i64>()
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 		sqlx::query(
-			"SELECT f.file_id, f.file_name, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+			"SELECT f.file_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
 			        p.id_tag, p.name, p.type, p.profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
@@ -569,7 +592,7 @@ pub(crate) async fn read(
 	} else {
 		// Content-addressable ID - query by file_id
 		sqlx::query(
-			"SELECT f.file_id, f.file_name, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+			"SELECT f.file_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
 			        p.id_tag, p.name, p.type, p.profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
@@ -588,8 +611,6 @@ pub(crate) async fn read(
 		Some(row) => {
 			let status = match row.try_get("status").map_err(|_| Error::DbError)? {
 				"A" => FileStatus::Active,
-				"I" => FileStatus::Immutable,
-				"M" => FileStatus::Mutable,
 				"P" => FileStatus::Pending,
 				"D" => FileStatus::Deleted,
 				_ => return Err(Error::DbError),
@@ -627,6 +648,7 @@ pub(crate) async fn read(
 				preset: row.try_get("preset").ok(),
 				content_type: row.try_get("content_type").ok(),
 				file_name: row.try_get("file_name").map_err(|_| Error::DbError)?,
+				file_tp: row.try_get("file_tp").ok(),
 				created_at: row
 					.try_get::<i64, _>("created_at")
 					.map(Timestamp)

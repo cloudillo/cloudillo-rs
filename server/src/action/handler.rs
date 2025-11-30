@@ -286,31 +286,27 @@ pub async fn post_action_accept(
 	// Execute DSL on_accept hook if action type has one
 	if app.dsl_engine.has_definition(&action.typ) {
 		use crate::action::hooks::{HookContext, HookType};
-		use std::collections::HashMap;
 
-		let hook_context = HookContext {
-			action_id: action.action_id.to_string(),
-			r#type: action.typ.to_string(),
-			subtype: action.sub_typ.clone().map(|s| s.to_string()),
-			issuer: action.issuer.id_tag.to_string(),
-			audience: action.audience.as_ref().map(|a| a.id_tag.to_string()),
-			parent: action.parent_id.clone().map(|s| s.to_string()),
-			subject: action.subject.clone().map(|s| s.to_string()),
-			content: action.content.clone(),
-			attachments: action
-				.attachments
-				.clone()
-				.map(|v| v.iter().map(|a| a.file_id.to_string()).collect()),
-			created_at: format!("{}", action.created_at.0),
-			expires_at: action.expires_at.map(|ts| format!("{}", ts.0)),
-			tenant_id: tn_id.0 as i64,
-			tenant_tag: id_tag.to_string(),
-			tenant_type: "person".to_string(),
-			is_inbound: true, // This is an inbound action being accepted
-			is_outbound: false,
-			client_address: None,
-			vars: HashMap::new(),
-		};
+		let hook_context = HookContext::builder()
+			.action_id(&*action.action_id)
+			.action_type(&*action.typ)
+			.subtype(action.sub_typ.clone().map(|s| s.to_string()))
+			.issuer(&*action.issuer.id_tag)
+			.audience(action.audience.as_ref().map(|a| a.id_tag.to_string()))
+			.parent(action.parent_id.clone().map(|s| s.to_string()))
+			.subject(action.subject.clone().map(|s| s.to_string()))
+			.content(action.content.clone())
+			.attachments(
+				action
+					.attachments
+					.clone()
+					.map(|v| v.iter().map(|a| a.file_id.to_string()).collect()),
+			)
+			.created_at(format!("{}", action.created_at.0))
+			.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
+			.tenant(tn_id.0 as i64, &*id_tag, "person")
+			.inbound()
+			.build();
 
 		if let Err(e) = app
 			.dsl_engine
@@ -365,31 +361,27 @@ pub async fn post_action_reject(
 	// Execute DSL on_reject hook if action type has one
 	if app.dsl_engine.has_definition(&action.typ) {
 		use crate::action::hooks::{HookContext, HookType};
-		use std::collections::HashMap;
 
-		let hook_context = HookContext {
-			action_id: action.action_id.to_string(),
-			r#type: action.typ.to_string(),
-			subtype: action.sub_typ.clone().map(|s| s.to_string()),
-			issuer: action.issuer.id_tag.to_string(),
-			audience: action.audience.as_ref().map(|a| a.id_tag.to_string()),
-			parent: action.parent_id.clone().map(|s| s.to_string()),
-			subject: action.subject.clone().map(|s| s.to_string()),
-			content: action.content.clone(),
-			attachments: action
-				.attachments
-				.clone()
-				.map(|v| v.iter().map(|a| a.file_id.to_string()).collect()),
-			created_at: format!("{}", action.created_at.0),
-			expires_at: action.expires_at.map(|ts| format!("{}", ts.0)),
-			tenant_id: tn_id.0 as i64,
-			tenant_tag: id_tag.to_string(),
-			tenant_type: "person".to_string(),
-			is_inbound: true, // This is an inbound action being rejected
-			is_outbound: false,
-			client_address: None,
-			vars: HashMap::new(),
-		};
+		let hook_context = HookContext::builder()
+			.action_id(&*action.action_id)
+			.action_type(&*action.typ)
+			.subtype(action.sub_typ.clone().map(|s| s.to_string()))
+			.issuer(&*action.issuer.id_tag)
+			.audience(action.audience.as_ref().map(|a| a.id_tag.to_string()))
+			.parent(action.parent_id.clone().map(|s| s.to_string()))
+			.subject(action.subject.clone().map(|s| s.to_string()))
+			.content(action.content.clone())
+			.attachments(
+				action
+					.attachments
+					.clone()
+					.map(|v| v.iter().map(|a| a.file_id.to_string()).collect()),
+			)
+			.created_at(format!("{}", action.created_at.0))
+			.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
+			.tenant(tn_id.0 as i64, &*id_tag, "person")
+			.inbound()
+			.build();
 
 		if let Err(e) = app
 			.dsl_engine

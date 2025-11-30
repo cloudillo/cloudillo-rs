@@ -4,6 +4,7 @@ pub mod delivery;
 pub mod dsl;
 pub mod filter;
 pub mod handler;
+pub mod helpers;
 pub mod hooks;
 pub mod key_cache;
 pub mod native_hooks;

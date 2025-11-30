@@ -127,8 +127,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		tn_id integer NOT NULL,
 		file_id text,
 		file_tp char(4),			-- 'BLOB', 'CRDT', 'RTDB' file type (storage type)
-		status char(1),				-- 'M' - Mutable, 'A' - Active/immutable,
-								-- 'P' - immutable under Processing, 'D' - Deleted
+		status char(1),				-- 'A' - Active, 'P' - Pending, 'D' - Deleted
+								-- Mutability determined by file_tp (BLOB=immutable, CRDT/RTDB=mutable)
 		owner_tag text,
 		preset text,
 		content_type text,

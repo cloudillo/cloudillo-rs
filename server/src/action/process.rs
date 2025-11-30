@@ -5,6 +5,7 @@ use serde::de::DeserializeOwned;
 use std::net::IpAddr;
 
 use crate::{
+	action::helpers,
 	auth_adapter::ActionToken,
 	core::rate_limit::{PenaltyReason, PowPenaltyReason, RateLimitApi},
 	meta_adapter,
@@ -183,40 +184,99 @@ pub trait ActionType {
 pub async fn process_inbound_action_token(
 	app: &App,
 	tn_id: TnId,
-	_action_id: &str,
+	action_id: &str,
 	token: &str,
 	is_sync: bool,
 	client_address: Option<String>,
 ) -> ClResult<Option<serde_json::Value>> {
-	// Parse client address for rate limiting
 	let client_ip: Option<IpAddr> = client_address.as_ref().and_then(|addr| addr.parse().ok());
 
-	// Pre-decode to check action type for PoW requirement (before signature verification)
+	// 1. Pre-verify PoW for CONN actions
 	let action_preview: ActionToken = decode_jwt_no_verify(token)?;
 	let is_conn_action = action_preview.t.starts_with("CONN");
+	verify_pow_if_conn(app, is_conn_action, client_ip.as_ref(), token, &action_preview.iss)?;
 
-	// For CONN actions, check PoW requirement BEFORE verification
-	// Note: This check also happens in post_inbox handler for synchronous error response
-	if is_conn_action {
-		if let Some(ref ip) = client_ip {
-			// Check PoW requirement
-			if let Err(pow_err) = app.rate_limiter.verify_pow(ip, token) {
-				debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
-				return Err(Error::PreconditionRequired(format!(
-					"Proof of work required: {}",
-					pow_err
-				)));
-			}
+	// 2. Verify action token
+	let action =
+		verify_and_handle_failure(app, tn_id, token, is_conn_action, client_ip.as_ref()).await?;
+
+	// 3. Resolve definition (try full type, then base type)
+	let (definition_type, definition) = resolve_definition(app, &action.t)?;
+
+	// 4. Check permissions
+	check_inbound_permissions(app, tn_id, &action, definition).await?;
+
+	// 5. Store action in database
+	store_inbound_action(
+		app,
+		tn_id,
+		action_id,
+		token,
+		&action,
+		definition,
+		is_conn_action,
+		client_ip.as_ref(),
+	)
+	.await;
+
+	// 6. Process attachments (async only)
+	if !is_sync {
+		if let Some(ref attachments) = action.a {
+			process_inbound_action_attachments(app, tn_id, &action.iss, attachments.clone())
+				.await?;
 		}
 	}
 
-	// Verify the action token (with rate limiting on failure)
-	let action = match verify_action_token(app, tn_id, token, client_ip.as_ref()).await {
-		Ok(action) => action,
+	// 7. Execute DSL on_receive hook
+	execute_on_receive_hook(
+		app,
+		tn_id,
+		action_id,
+		&action,
+		definition_type,
+		is_sync,
+		client_address,
+	)
+	.await
+}
+
+/// Verify PoW for CONN actions before signature verification
+fn verify_pow_if_conn(
+	app: &App,
+	is_conn_action: bool,
+	client_ip: Option<&IpAddr>,
+	token: &str,
+	issuer: &str,
+) -> ClResult<()> {
+	if !is_conn_action {
+		return Ok(());
+	}
+
+	if let Some(ip) = client_ip {
+		if let Err(pow_err) = app.rate_limiter.verify_pow(ip, token) {
+			debug!("CONN action from {} requires PoW: {:?}", issuer, pow_err);
+			return Err(Error::PreconditionRequired(format!(
+				"Proof of work required: {}",
+				pow_err
+			)));
+		}
+	}
+	Ok(())
+}
+
+/// Verify action token, handling failures for CONN actions
+async fn verify_and_handle_failure(
+	app: &App,
+	tn_id: TnId,
+	token: &str,
+	is_conn_action: bool,
+	client_ip: Option<&IpAddr>,
+) -> ClResult<ActionToken> {
+	match verify_action_token(app, tn_id, token, client_ip).await {
+		Ok(action) => Ok(action),
 		Err(e) => {
-			// For CONN actions, increment PoW counter on verification failure
 			if is_conn_action {
-				if let Some(ref ip) = client_ip {
+				if let Some(ip) = client_ip {
 					if let Err(pen_err) = app
 						.rate_limiter
 						.increment_pow_counter(ip, PowPenaltyReason::ConnSignatureFailure)
@@ -225,224 +285,199 @@ pub async fn process_inbound_action_token(
 					}
 				}
 			}
-			return Err(e);
+			Err(e)
 		}
-	};
+	}
+}
 
-	// Check for definition: first try full type (e.g., "FLLW:DEL"), then fall back to base type ("FLLW")
-	// This allows separate definitions for subtypes when the use case differs significantly
-	let (definition_type, definition) = if let Some(def) = app.dsl_engine.get_definition(&action.t)
-	{
-		(action.t.as_ref(), def)
-	} else {
-		// Try base type (before colon)
-		let base_type = action.t.find(':').map(|pos| &action.t[..pos]).unwrap_or(action.t.as_ref());
-		if let Some(def) = app.dsl_engine.get_definition(base_type) {
-			(base_type, def)
+/// Resolve action definition (try full type, then base type)
+fn resolve_definition<'a>(
+	app: &'a App,
+	action_type: &'a str,
+) -> ClResult<(&'a str, &'a crate::action::dsl::types::ActionDefinition)> {
+	if let Some(def) = app.dsl_engine.get_definition(action_type) {
+		return Ok((action_type, def));
+	}
+
+	// Try base type (before colon)
+	let base_type = action_type.find(':').map(|pos| &action_type[..pos]).unwrap_or(action_type);
+	if let Some(def) = app.dsl_engine.get_definition(base_type) {
+		return Ok((base_type, def));
+	}
+
+	Err(Error::ValidationError(format!("Action type not supported: {}", action_type)))
+}
+
+/// Check permissions based on action type's allow_unknown setting
+async fn check_inbound_permissions(
+	app: &App,
+	tn_id: TnId,
+	action: &ActionToken,
+	definition: &crate::action::dsl::types::ActionDefinition,
+) -> ClResult<()> {
+	if definition.behavior.allow_unknown.unwrap_or(false) {
+		return Ok(());
+	}
+
+	let issuer_profile =
+		if let Ok((_etag, profile)) = app.meta_adapter.read_profile(tn_id, &action.iss).await {
+			Some(profile)
 		} else {
-			return Err(Error::ValidationError(format!("Action type not supported: {}", action.t)));
-		}
+			None
+		};
+	info!("  profile: {:?}", issuer_profile);
+
+	let allowed = issuer_profile.as_ref().map(|p| p.following || p.connected).unwrap_or(false);
+
+	if !allowed {
+		warn!(
+			issuer = %action.iss,
+			action_type = %action.t,
+			"Permission denied - sender not following/connected"
+		);
+		return Err(Error::PermissionDenied);
+	}
+
+	Ok(())
+}
+
+/// Store inbound action in database
+#[allow(clippy::too_many_arguments)]
+async fn store_inbound_action(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	token: &str,
+	action: &ActionToken,
+	definition: &crate::action::dsl::types::ActionDefinition,
+	is_conn_action: bool,
+	client_ip: Option<&IpAddr>,
+) {
+	let (action_type, sub_type) = helpers::extract_type_and_subtype(&action.t);
+	let sub_type_ref = sub_type.as_deref();
+
+	let key = definition.key_pattern.as_deref().map(|pattern| {
+		helpers::apply_key_pattern(
+			pattern,
+			&action_type,
+			&action.iss,
+			action.aud.as_deref(),
+			action.p.as_deref(),
+			action.sub.as_deref(),
+		)
+	});
+
+	let content_str = helpers::serialize_content(action.c.as_ref());
+	let visibility =
+		helpers::inherit_visibility(app.meta_adapter.as_ref(), tn_id, None, action.p.as_deref())
+			.await;
+
+	let inbound_action = meta_adapter::Action {
+		action_id,
+		typ: &action_type,
+		sub_typ: sub_type_ref,
+		issuer_tag: &action.iss,
+		parent_id: action.p.as_deref(),
+		root_id: action.p.as_deref(),
+		audience_tag: action.aud.as_deref(),
+		content: content_str.as_deref(),
+		attachments: action.a.as_ref().map(|v| v.iter().map(|s| s.as_ref()).collect()),
+		subject: action.sub.as_deref(),
+		created_at: action.iat,
+		expires_at: action.exp,
+		visibility,
 	};
 
-	// Check permissions based on action type's allow_unknown setting
-	// Default to false if not specified (require following/connected)
-	if !definition.behavior.allow_unknown.unwrap_or(false) {
-		let issuer_profile =
-			if let Ok((_etag, profile)) = app.meta_adapter.read_profile(tn_id, &action.iss).await {
-				Some(profile)
-			} else {
-				None
+	match app.meta_adapter.create_action(tn_id, &inbound_action, key.as_deref()).await {
+		Ok(_) => {
+			info!("  stored inbound action {} in actions table", action_id);
+			let update_opts = meta_adapter::UpdateActionDataOptions {
+				status: crate::types::Patch::Value('A'),
+				..Default::default()
 			};
-		info!("  profile: {:?}", issuer_profile);
-
-		let mut allowed = false;
-		if let Some(ref p) = issuer_profile {
-			if p.following || p.connected {
-				allowed = true;
+			if let Err(e) =
+				app.meta_adapter.update_action_data(tn_id, action_id, &update_opts).await
+			{
+				warn!("  failed to set inbound action status to active: {}", e);
 			}
 		}
-
-		if !allowed {
-			warn!(
-				issuer = %action.iss,
-				action_type = %action.t,
-				"Permission denied - sender not following/connected"
-			);
-			return Err(Error::PermissionDenied);
-		}
-
-		if issuer_profile.is_none() {
-			//profile::sync_profile(&app, tn_id, &action.iss).await?;
-		}
-	}
-
-	// Store the inbound action in the database before running hooks
-	// This ensures DSL operations like update_action can find the action
-	{
-		// Extract action type and subtype
-		let (action_type, sub_type) = if let Some(colon_pos) = action.t.find(':') {
-			let (t, st) = action.t.split_at(colon_pos);
-			(t, Some(&st[1..]))
-		} else {
-			(action.t.as_ref(), None)
-		};
-
-		// Generate key from key_pattern if available
-		let key = if let Some(pattern) = definition.key_pattern.as_deref() {
-			let key = pattern
-				.replace("{type}", action_type)
-				.replace("{issuer}", &action.iss)
-				.replace("{audience}", action.aud.as_deref().unwrap_or(""))
-				.replace("{parent}", action.p.as_deref().unwrap_or(""))
-				.replace("{subject}", action.sub.as_deref().unwrap_or(""));
-			Some(key)
-		} else {
-			None
-		};
-
-		// Serialize content Value to string for storage (always JSON-encode)
-		let content_str: Option<String> =
-			action.c.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default());
-
-		// Inherit visibility from parent action if available
-		let visibility = if let Some(parent_id) = action.p.as_deref() {
-			match app.meta_adapter.get_action(tn_id, parent_id).await {
-				Ok(Some(parent)) => parent.visibility,
-				_ => None, // Parent not found locally or error - use default
-			}
-		} else {
-			None
-		};
-
-		// Create action struct for storage
-		let inbound_action = meta_adapter::Action {
-			action_id: _action_id,
-			typ: action_type,
-			sub_typ: sub_type,
-			issuer_tag: &action.iss,
-			parent_id: action.p.as_deref(),
-			root_id: action.p.as_deref(), // Use parent as root for now, could be improved
-			audience_tag: action.aud.as_deref(),
-			content: content_str.as_deref(),
-			attachments: action.a.as_ref().map(|v| v.iter().map(|s| s.as_ref()).collect()),
-			subject: action.sub.as_deref(),
-			created_at: action.iat,
-			expires_at: action.exp,
-			visibility, // Inherit from parent if available
-		};
-
-		// Store in actions table (handles deduplication via key)
-		match app.meta_adapter.create_action(tn_id, &inbound_action, key.as_deref()).await {
-			Ok(_) => {
-				info!("  stored inbound action {} in actions table", _action_id);
-				// Set status to 'A' (active) for inbound actions - create_action defaults to 'P'
-				let update_opts = meta_adapter::UpdateActionDataOptions {
-					status: crate::types::Patch::Value('A'),
-					..Default::default()
-				};
-				if let Err(e) =
-					app.meta_adapter.update_action_data(tn_id, _action_id, &update_opts).await
-				{
-					warn!("  failed to set inbound action status to active: {}", e);
-				}
-			}
-			Err(e) => {
-				// For CONN actions, increment PoW counter on duplicate pending
-				if is_conn_action {
-					if let Some(ref ip) = client_ip {
-						// Check if there's already a pending CONN from this issuer
-						// (duplicate detection by key constraint failure)
-						if let Err(pen_err) = app
-							.rate_limiter
-							.increment_pow_counter(ip, PowPenaltyReason::ConnDuplicatePending)
-						{
-							warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
-						}
-						debug!(
-							"CONN duplicate detected from {} - PoW counter incremented",
-							action.iss
-						);
+		Err(e) => {
+			if is_conn_action {
+				if let Some(ip) = client_ip {
+					if let Err(pen_err) = app
+						.rate_limiter
+						.increment_pow_counter(ip, PowPenaltyReason::ConnDuplicatePending)
+					{
+						warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
 					}
+					debug!("CONN duplicate detected from {} - PoW counter incremented", action.iss);
 				}
-				// Log but don't fail - action might already exist (duplicate delivery)
-				debug!("  failed to store inbound action: {} (may be duplicate)", e);
 			}
-		}
-
-		// Store token in action_tokens table
-		if let Err(e) = app.meta_adapter.create_inbound_action(tn_id, _action_id, token, None).await
-		{
-			debug!("  failed to store inbound action token: {} (may be duplicate)", e);
+			debug!("  failed to store inbound action: {} (may be duplicate)", e);
 		}
 	}
 
-	// Skip attachment processing for synchronous requests
-	if !is_sync {
-		if let Some(ref attachments) = action.a {
-			process_inbound_action_attachments(app, tn_id, &action.iss, attachments.clone())
-				.await?;
-		}
+	if let Err(e) = app.meta_adapter.create_inbound_action(tn_id, action_id, token, None).await {
+		debug!("  failed to store inbound action token: {} (may be duplicate)", e);
 	}
+}
 
-	// Execute DSL on_receive hook
+/// Execute DSL on_receive hook
+async fn execute_on_receive_hook(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	action: &ActionToken,
+	definition_type: &str,
+	is_sync: bool,
+	client_address: Option<String>,
+) -> ClResult<Option<serde_json::Value>> {
 	use crate::action::hooks::{HookContext, HookType};
-	use std::collections::HashMap;
 
-	// Extract subtype from action type (e.g., "CONN:DEL" → type="CONN", subtype="DEL")
-	let (action_type, subtype) = if let Some(colon_pos) = action.t.find(':') {
-		let (t, st) = action.t.split_at(colon_pos);
-		(t.to_string(), Some(st[1..].to_string()))
-	} else {
-		(action.t.to_string(), None)
-	};
+	let (action_type, subtype) = helpers::extract_type_and_subtype(&action.t);
 
-	let hook_context = HookContext {
-		action_id: _action_id.to_string(),
-		r#type: action_type,
-		subtype,
-		issuer: action.iss.to_string(),
-		audience: action.aud.as_ref().map(|s| s.to_string()),
-		parent: action.p.as_ref().map(|s| s.to_string()),
-		subject: action.sub.as_ref().map(|s| s.to_string()),
-		content: action.c.clone(),
-		attachments: action.a.as_ref().map(|v| v.iter().map(|s| s.to_string()).collect()),
-		created_at: format!("{}", action.iat.0), // Simple timestamp conversion
-		expires_at: action.exp.map(|ts| format!("{}", ts.0)),
-		tenant_id: tn_id.0 as i64,
-		tenant_tag: action.aud.as_ref().map(|s| s.to_string()).unwrap_or_default(),
-		tenant_type: "person".to_string(),
-		is_inbound: true,
-		is_outbound: false,
-		client_address,
-		vars: HashMap::new(),
-	};
+	let hook_context = HookContext::builder()
+		.action_id(action_id)
+		.action_type(action_type)
+		.subtype(subtype)
+		.issuer(&*action.iss)
+		.audience(action.aud.as_ref().map(|s| s.to_string()))
+		.parent(action.p.as_ref().map(|s| s.to_string()))
+		.subject(action.sub.as_ref().map(|s| s.to_string()))
+		.content(action.c.clone())
+		.attachments(action.a.as_ref().map(|v| v.iter().map(|s| s.to_string()).collect()))
+		.created_at(format!("{}", action.iat.0))
+		.expires_at(action.exp.map(|ts| format!("{}", ts.0)))
+		.tenant(
+			tn_id.0 as i64,
+			action.aud.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+			"person",
+		)
+		.inbound()
+		.client_address(client_address)
+		.build();
 
 	if is_sync {
-		// For synchronous processing, execute hook and return the result
 		let hook_result = app
 			.dsl_engine
 			.execute_hook_with_result(app, definition_type, HookType::OnReceive, hook_context)
 			.await?;
-
 		Ok(hook_result.return_value)
 	} else {
-		// For asynchronous processing, execute hook without capturing result
 		if let Err(e) = app
 			.dsl_engine
 			.execute_hook(app, definition_type, HookType::OnReceive, hook_context)
 			.await
 		{
 			warn!(
-				action_id = %_action_id,
+				action_id = %action_id,
 				action_type = %action.t,
 				issuer = %action.iss,
 				tenant_id = %tn_id.0,
 				error = %e,
 				"DSL on_receive hook failed"
 			);
-			// Continue execution - hook errors shouldn't fail the action processing
 		}
-
 		Ok(None)
 	}
 }

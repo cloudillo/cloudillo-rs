@@ -174,6 +174,162 @@ pub struct HookContext {
 	pub vars: HashMap<String, serde_json::Value>,
 }
 
+impl HookContext {
+	/// Create a new HookContext builder
+	pub fn builder() -> HookContextBuilder {
+		HookContextBuilder::default()
+	}
+}
+
+/// Builder for HookContext with fluent API
+#[derive(Default)]
+pub struct HookContextBuilder {
+	action_id: String,
+	r#type: String,
+	subtype: Option<String>,
+	issuer: String,
+	audience: Option<String>,
+	parent: Option<String>,
+	subject: Option<String>,
+	content: Option<serde_json::Value>,
+	attachments: Option<Vec<String>>,
+	created_at: String,
+	expires_at: Option<String>,
+	tenant_id: i64,
+	tenant_tag: String,
+	tenant_type: String,
+	is_inbound: bool,
+	is_outbound: bool,
+	client_address: Option<String>,
+	vars: HashMap<String, serde_json::Value>,
+}
+
+impl HookContextBuilder {
+	/// Set action ID
+	pub fn action_id(mut self, id: impl Into<String>) -> Self {
+		self.action_id = id.into();
+		self
+	}
+
+	/// Set action type
+	pub fn action_type(mut self, t: impl Into<String>) -> Self {
+		self.r#type = t.into();
+		self
+	}
+
+	/// Set subtype
+	pub fn subtype(mut self, st: Option<String>) -> Self {
+		self.subtype = st;
+		self
+	}
+
+	/// Set issuer
+	pub fn issuer(mut self, i: impl Into<String>) -> Self {
+		self.issuer = i.into();
+		self
+	}
+
+	/// Set audience
+	pub fn audience(mut self, a: Option<String>) -> Self {
+		self.audience = a;
+		self
+	}
+
+	/// Set parent action ID
+	pub fn parent(mut self, p: Option<String>) -> Self {
+		self.parent = p;
+		self
+	}
+
+	/// Set subject
+	pub fn subject(mut self, s: Option<String>) -> Self {
+		self.subject = s;
+		self
+	}
+
+	/// Set content
+	pub fn content(mut self, c: Option<serde_json::Value>) -> Self {
+		self.content = c;
+		self
+	}
+
+	/// Set attachments
+	pub fn attachments(mut self, a: Option<Vec<String>>) -> Self {
+		self.attachments = a;
+		self
+	}
+
+	/// Set created_at timestamp
+	pub fn created_at(mut self, ts: impl Into<String>) -> Self {
+		self.created_at = ts.into();
+		self
+	}
+
+	/// Set expires_at timestamp
+	pub fn expires_at(mut self, ts: Option<String>) -> Self {
+		self.expires_at = ts;
+		self
+	}
+
+	/// Set tenant info
+	pub fn tenant(mut self, id: i64, tag: impl Into<String>, typ: impl Into<String>) -> Self {
+		self.tenant_id = id;
+		self.tenant_tag = tag.into();
+		self.tenant_type = typ.into();
+		self
+	}
+
+	/// Mark as inbound action
+	pub fn inbound(mut self) -> Self {
+		self.is_inbound = true;
+		self.is_outbound = false;
+		self
+	}
+
+	/// Mark as outbound action
+	pub fn outbound(mut self) -> Self {
+		self.is_inbound = false;
+		self.is_outbound = true;
+		self
+	}
+
+	/// Set client address
+	pub fn client_address(mut self, addr: Option<String>) -> Self {
+		self.client_address = addr;
+		self
+	}
+
+	/// Set variables
+	pub fn vars(mut self, vars: HashMap<String, serde_json::Value>) -> Self {
+		self.vars = vars;
+		self
+	}
+
+	/// Build the HookContext
+	pub fn build(self) -> HookContext {
+		HookContext {
+			action_id: self.action_id,
+			r#type: self.r#type,
+			subtype: self.subtype,
+			issuer: self.issuer,
+			audience: self.audience,
+			parent: self.parent,
+			subject: self.subject,
+			content: self.content,
+			attachments: self.attachments,
+			created_at: self.created_at,
+			expires_at: self.expires_at,
+			tenant_id: self.tenant_id,
+			tenant_tag: self.tenant_tag,
+			tenant_type: self.tenant_type,
+			is_inbound: self.is_inbound,
+			is_outbound: self.is_outbound,
+			client_address: self.client_address,
+			vars: self.vars,
+		}
+	}
+}
+
 /// All hooks for a specific action type
 pub struct ActionTypeHooks {
 	pub on_create: Option<HookFunction>,

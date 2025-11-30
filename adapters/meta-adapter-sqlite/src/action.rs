@@ -13,7 +13,7 @@ pub(crate) async fn list(
 	opts: &ListActionOptions,
 ) -> ClResult<Vec<ActionView>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
+		"SELECT DISTINCT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
 		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic,
 		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic,
 		a.subject, a.content, a.created_at, a.expires_at,
@@ -22,12 +22,12 @@ pub(crate) async fn list(
 		FROM actions a
 		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
-		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.parent_id=a.action_id AND own.issuer_tag=",
+		LEFT JOIN tenants t ON t.tn_id=a.tn_id
+		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.parent_id=a.action_id AND own.issuer_tag=t.id_tag
+			AND own.type='REACT' AND coalesce(own.status, 'A') NOT IN ('D')
+		WHERE a.tn_id=",
 	);
-	query
-		.push_bind("")
-		.push("AND own.type='REACT' AND coalesce(own.status, 'A') NOT IN ('D') WHERE a.tn_id=")
-		.push_bind(tn_id.0);
+	query.push_bind(tn_id.0);
 
 	if let Some(status) = &opts.status {
 		query.push(" AND coalesce(a.status, 'A') IN ");
@@ -153,11 +153,18 @@ pub(crate) async fn list(
 		let reactions_count: i64 = row.try_get("reactions").unwrap_or(0);
 		let comments_count: i64 = row.try_get("comments").unwrap_or(0);
 		let comments_read: i64 = row.try_get("comments_read").unwrap_or(0);
-		let stat = Some(serde_json::json!({
+		let own_reaction: Option<String> = row.try_get("own_reaction").ok().flatten();
+		let own_reaction_json: Option<serde_json::Value> =
+			own_reaction.as_ref().and_then(|s| serde_json::from_str(s).ok());
+		let mut stat_obj = serde_json::json!({
 			"comments": comments_count,
 			"commentsRead": comments_read,
 			"reactions": reactions_count
-		}));
+		});
+		if let Some(own_reaction) = own_reaction_json {
+			stat_obj["ownReaction"] = own_reaction;
+		}
+		let stat = Some(stat_obj);
 		let visibility: Option<String> = row.try_get("visibility").ok();
 		let visibility = visibility.and_then(|s| s.chars().next());
 		actions.push(ActionView {

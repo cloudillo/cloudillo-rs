@@ -320,14 +320,12 @@ pub enum ActionId<S: AsRef<str>> {
 	AId(u64),
 }
 
+/// File status enum
+/// Note: Mutability is determined by fileTp (BLOB=immutable, CRDT/RTDB=mutable)
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum FileStatus {
 	#[serde(rename = "A")]
 	Active,
-	#[serde(rename = "I")]
-	Immutable,
-	#[serde(rename = "M")]
-	Mutable,
 	#[serde(rename = "P")]
 	Pending,
 	#[serde(rename = "D")]
@@ -345,6 +343,8 @@ pub struct FileView {
 	pub content_type: Option<Box<str>>,
 	#[serde(rename = "fileName")]
 	pub file_name: Box<str>,
+	#[serde(rename = "fileTp")]
+	pub file_tp: Option<Box<str>>, // 'BLOB', 'CRDT', 'RTDB'
 	#[serde(rename = "createdAt")]
 	pub created_at: Timestamp,
 	pub status: FileStatus,
@@ -413,7 +413,7 @@ pub struct CreateFile {
 	pub tags: Option<Vec<Box<str>>>,
 	pub x: Option<serde_json::Value>,
 	pub visibility: Option<char>, // None: Direct (default), P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
-	pub status: Option<FileStatus>, // None defaults to Pending, can set to Mutable for shared files
+	pub status: Option<FileStatus>, // None defaults to Pending, can set to Active for shared files
 }
 
 #[derive(Debug, Clone, Deserialize)]

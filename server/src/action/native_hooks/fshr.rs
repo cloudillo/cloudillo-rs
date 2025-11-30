@@ -89,8 +89,13 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 		}
 	};
 
-	// Extract file type from content (optional, defaults to BLOB if not present)
-	let file_tp = content.get("type").and_then(|v| v.as_str());
+	let file_tp = match content.get("fileTp").and_then(|v| v.as_str()) {
+		Some(ft) => ft,
+		None => {
+			tracing::warn!("FSHR on_accept: Missing fileTp in content");
+			return Ok(HookResult::default());
+		}
+	};
 
 	// Subject contains the file_id
 	let file_id = match &context.subject {
@@ -102,10 +107,10 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 	};
 
 	tracing::info!(
-		"FSHR: Accepting file share - creating file entry for {} from {} (type: {:?})",
+		"FSHR: Accepting file share - creating file entry for {} from {} (type: {})",
 		file_id,
 		context.issuer,
-		file_tp.unwrap_or("BLOB")
+		file_tp
 	);
 
 	// Create file entry with status 'A' (active) and visibility direct (most restricted - owner and tenant can see)
@@ -116,7 +121,7 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 		preset: None,
 		content_type: content_type.into(),
 		file_name: file_name.into(),
-		file_tp: file_tp.map(|t| t.into()),
+		file_tp: Some(file_tp.into()),
 		created_at: None,
 		tags: None,
 		x: None,
