@@ -167,9 +167,8 @@ pub async fn post_logout(
 /// # POST /api/auth/password
 #[derive(Deserialize)]
 pub struct PasswordReq {
-	#[serde(rename = "idTag")]
-	id_tag: String,
-	password: String,
+	#[serde(rename = "currentPassword")]
+	current_password: String,
 	#[serde(rename = "newPassword")]
 	new_password: String,
 }
@@ -181,12 +180,6 @@ pub async fn post_password(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<PasswordReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	// Authorization: Users can only change their own password
-	if auth.id_tag.as_ref() != req.id_tag.as_str() {
-		warn!("User {} attempted to change password for {}", auth.id_tag, req.id_tag);
-		return Err(Error::PermissionDenied);
-	}
-
 	// Validate new password strength
 	if req.new_password.len() < 8 {
 		return Err(Error::ValidationError("Password must be at least 8 characters".into()));
@@ -196,14 +189,17 @@ pub async fn post_password(
 		return Err(Error::ValidationError("Password cannot be empty or only whitespace".into()));
 	}
 
-	if req.new_password == req.password {
+	if req.new_password == req.current_password {
 		return Err(Error::ValidationError(
 			"New password must be different from current password".into(),
 		));
 	}
 
-	// Verify current password
-	let verification = app.auth_adapter.check_tenant_password(&req.id_tag, &req.password).await;
+	// Verify current password using authenticated user's id_tag
+	let verification = app
+		.auth_adapter
+		.check_tenant_password(&auth.id_tag, &req.current_password)
+		.await;
 
 	if verification.is_err() {
 		// Penalize rate limit for failed password verification
@@ -212,12 +208,12 @@ pub async fn post_password(
 		}
 		// Delay to prevent timing attacks
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-		warn!("Failed password verification for user {}", req.id_tag);
+		warn!("Failed password verification for user {}", auth.id_tag);
 		return Err(Error::PermissionDenied);
 	}
 
 	// Update to new password
-	app.auth_adapter.update_tenant_password(&req.id_tag, &req.new_password).await?;
+	app.auth_adapter.update_tenant_password(&auth.id_tag, &req.new_password).await?;
 
 	info!("User {} successfully changed their password", auth.id_tag);
 
