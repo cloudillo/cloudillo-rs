@@ -2,8 +2,14 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use itertools::Itertools;
 use jsonwebtoken::{self as jwt, Algorithm, Validation};
 use serde::de::DeserializeOwned;
+use std::net::IpAddr;
 
-use crate::{auth_adapter::ActionToken, meta_adapter, prelude::*};
+use crate::{
+	auth_adapter::ActionToken,
+	core::rate_limit::{PenaltyReason, PowPenaltyReason, RateLimitApi},
+	meta_adapter,
+	prelude::*,
+};
 
 /// Decodes a JWT without verifying the signature
 pub fn decode_jwt_no_verify<T: DeserializeOwned>(jwt: &str) -> ClResult<T> {
@@ -38,7 +44,14 @@ fn verify_jwt_signature(token: &str, public_key: &str) -> ClResult<ActionToken> 
 /// 1. Check failure cache (in-memory) - return early if cached failure
 /// 2. Check SQLite key_cache - use if valid
 /// 3. HTTP fetch - cache results (success to DB, failure to memory)
-pub async fn verify_action_token(app: &App, tn_id: TnId, token: &str) -> ClResult<ActionToken> {
+///
+/// If client_ip is provided and verification fails, rate limiting penalties are applied.
+pub async fn verify_action_token(
+	app: &App,
+	tn_id: TnId,
+	token: &str,
+	client_ip: Option<&IpAddr>,
+) -> ClResult<ActionToken> {
 	let action_not_validated: ActionToken = decode_jwt_no_verify(token)?;
 	let issuer = &action_not_validated.iss;
 	let key_id = &action_not_validated.k;
@@ -65,9 +78,26 @@ pub async fn verify_action_token(app: &App, tn_id: TnId, token: &str) -> ClResul
 			// Check if key is still valid (not expired)
 			if expires_at > Timestamp::now() {
 				info!("  using cached key (expires at {})", expires_at);
-				let action = verify_jwt_signature(token, &public_key)?;
-				info!("  validated from cache {:?}", action);
-				return Ok(action);
+				match verify_jwt_signature(token, &public_key) {
+					Ok(action) => {
+						info!("  validated from cache {:?}", action);
+						return Ok(action);
+					}
+					Err(e) => {
+						// Signature verification failed - penalize
+						if let Some(ip) = client_ip {
+							if let Err(pen_err) = app.rate_limiter.penalize(
+								ip,
+								PenaltyReason::TokenVerificationFailure,
+								1,
+							) {
+								warn!("Failed to record token penalty for {}: {}", ip, pen_err);
+							}
+						}
+						warn!("  signature verification failed (cached key): {}", e);
+						return Err(e);
+					}
+				}
 			}
 			// Key expired - continue to HTTP fetch
 			debug!("  cached key expired at {}, fetching fresh", expires_at);
@@ -110,9 +140,26 @@ pub async fn verify_action_token(app: &App, tn_id: TnId, token: &str) -> ClResul
 
 				// Verify the signature
 				info!("  validating...");
-				let action = verify_jwt_signature(token, public_key)?;
-				info!("  validated {:?}", action);
-				Ok(action)
+				match verify_jwt_signature(token, public_key) {
+					Ok(action) => {
+						info!("  validated {:?}", action);
+						Ok(action)
+					}
+					Err(e) => {
+						// Signature verification failed - penalize
+						if let Some(ip) = client_ip {
+							if let Err(pen_err) = app.rate_limiter.penalize(
+								ip,
+								PenaltyReason::TokenVerificationFailure,
+								1,
+							) {
+								warn!("Failed to record token penalty for {}: {}", ip, pen_err);
+							}
+						}
+						warn!("  signature verification failed: {}", e);
+						Err(e)
+					}
+				}
 			} else {
 				// Key not found in response - cache this as a failure
 				let err = Error::NotFound;
@@ -141,7 +188,46 @@ pub async fn process_inbound_action_token(
 	is_sync: bool,
 	client_address: Option<String>,
 ) -> ClResult<Option<serde_json::Value>> {
-	let action = verify_action_token(app, tn_id, token).await?;
+	// Parse client address for rate limiting
+	let client_ip: Option<IpAddr> = client_address.as_ref().and_then(|addr| addr.parse().ok());
+
+	// Pre-decode to check action type for PoW requirement (before signature verification)
+	let action_preview: ActionToken = decode_jwt_no_verify(token)?;
+	let is_conn_action = action_preview.t.starts_with("CONN");
+
+	// For CONN actions, check PoW requirement BEFORE verification
+	// Note: This check also happens in post_inbox handler for synchronous error response
+	if is_conn_action {
+		if let Some(ref ip) = client_ip {
+			// Check PoW requirement
+			if let Err(pow_err) = app.rate_limiter.verify_pow(ip, token) {
+				debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
+				return Err(Error::PreconditionRequired(format!(
+					"Proof of work required: {}",
+					pow_err
+				)));
+			}
+		}
+	}
+
+	// Verify the action token (with rate limiting on failure)
+	let action = match verify_action_token(app, tn_id, token, client_ip.as_ref()).await {
+		Ok(action) => action,
+		Err(e) => {
+			// For CONN actions, increment PoW counter on verification failure
+			if is_conn_action {
+				if let Some(ref ip) = client_ip {
+					if let Err(pen_err) = app
+						.rate_limiter
+						.increment_pow_counter(ip, PowPenaltyReason::ConnSignatureFailure)
+					{
+						warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
+					}
+				}
+			}
+			return Err(e);
+		}
+	};
 
 	// Check for definition: first try full type (e.g., "FLLW:DEL"), then fall back to base type ("FLLW")
 	// This allows separate definitions for subtypes when the use case differs significantly
@@ -247,6 +333,23 @@ pub async fn process_inbound_action_token(
 				}
 			}
 			Err(e) => {
+				// For CONN actions, increment PoW counter on duplicate pending
+				if is_conn_action {
+					if let Some(ref ip) = client_ip {
+						// Check if there's already a pending CONN from this issuer
+						// (duplicate detection by key constraint failure)
+						if let Err(pen_err) = app
+							.rate_limiter
+							.increment_pow_counter(ip, PowPenaltyReason::ConnDuplicatePending)
+						{
+							warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
+						}
+						debug!(
+							"CONN duplicate detected from {} - PoW counter incremented",
+							action.iss
+						);
+					}
+				}
 				// Log but don't fail - action might already exist (duplicate delivery)
 				debug!("  failed to store inbound action: {} (may be duplicate)", e);
 			}

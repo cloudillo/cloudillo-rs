@@ -1,13 +1,19 @@
-use axum::{extract::Query, extract::State, http::StatusCode, Json};
+use axum::{
+	extract::{ConnectInfo, Query, State},
+	http::StatusCode,
+	Json,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_with::skip_serializing_none;
+use std::net::SocketAddr;
 
 use crate::{
 	action::task,
 	auth_adapter,
 	core::{
 		extract::{IdTag, OptionalAuth, OptionalRequestId},
+		rate_limit::{PenaltyReason, RateLimitApi},
 		roles::expand_roles,
 		Auth,
 	},
@@ -94,6 +100,7 @@ pub struct LoginReq {
 
 pub async fn post_login(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(login): Json<LoginReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
@@ -104,6 +111,10 @@ pub async fn post_login(
 		let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else {
+		// Penalize rate limit for failed login attempt
+		if let Err(e) = app.rate_limiter.penalize(&addr.ip(), PenaltyReason::AuthFailure, 1) {
+			warn!("Failed to record auth penalty for {}: {}", addr.ip(), e);
+		}
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		Err(Error::PermissionDenied)
 	}
@@ -165,6 +176,7 @@ pub struct PasswordReq {
 
 pub async fn post_password(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<PasswordReq>,
@@ -194,6 +206,10 @@ pub async fn post_password(
 	let verification = app.auth_adapter.check_tenant_password(&req.id_tag, &req.password).await;
 
 	if verification.is_err() {
+		// Penalize rate limit for failed password verification
+		if let Err(e) = app.rate_limiter.penalize(&addr.ip(), PenaltyReason::AuthFailure, 1) {
+			warn!("Failed to record auth penalty for {}: {}", addr.ip(), e);
+		}
 		// Delay to prevent timing attacks
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		warn!("Failed password verification for user {}", req.id_tag);
@@ -226,6 +242,7 @@ pub async fn get_access_token(
 	State(app): State<App>,
 	tn_id: TnId,
 	id_tag: IdTag,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	Query(query): Query<GetAccessTokenQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -237,7 +254,8 @@ pub async fn get_access_token(
 	// If token is provided in query, verify it; otherwise use authenticated session
 	if let Some(token_param) = query.token {
 		info!("Verifying action token from query parameter");
-		let auth_action = crate::action::verify_action_token(&app, tn_id, &token_param).await?;
+		let auth_action =
+			crate::action::verify_action_token(&app, tn_id, &token_param, Some(&addr.ip())).await?;
 		if *auth_action.aud.as_ref().ok_or(Error::PermissionDenied)?.as_ref() != *id_tag.0 {
 			warn!("Auth action issuer {} doesn't match id_tag {}", auth_action.iss, id_tag.0);
 			return Err(Error::PermissionDenied);

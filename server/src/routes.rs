@@ -17,6 +17,7 @@ use crate::action::perm::check_perm_action;
 use crate::auth;
 use crate::core::acme;
 use crate::core::middleware::{optional_auth, request_id_middleware, require_auth};
+use crate::core::rate_limit::RateLimitLayer;
 use crate::core::websocket;
 use crate::file;
 use crate::file::perm::check_perm_file;
@@ -140,19 +141,35 @@ fn init_api_service(app: App) -> Router {
 		.layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-cache")))
 		.layer(SetResponseHeaderLayer::if_not_present(header::EXPIRES, header::HeaderValue::from_static("0")));
 
-	let public_router = Router::new()
-		// Tenant API
-		.route("/api/me", get(profile::handler::get_tenant_profile))
-		.route("/api/me/keys", get(profile::handler::get_tenant_profile))
-		.route("/api/me/full", get(profile::handler::get_tenant_profile))
-
-		// Auth API
+	// Auth routes with strict rate limiting
+	let auth_public_router = Router::new()
 		.route("/api/auth/register", post(auth::register::post_register))
 		.route("/api/auth/register-verify", post(auth::register::post_register_verify))
 		.route("/api/auth/login", post(auth::handler::post_login))
 		.route("/api/auth/login-token", get(auth::handler::get_login_token))
 		.route("/api/auth/set-password", post(auth::handler::post_set_password))
 		.route("/api/auth/access-token", get(auth::handler::get_access_token))
+		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "auth", app.opts.mode));
+
+	// Federation routes (inbox) with moderate rate limiting
+	let federation_router = Router::new()
+		.route("/api/inbox", post(action::handler::post_inbox))
+		.route("/api/inbox/sync", post(action::handler::post_inbox_sync))
+		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "federation", app.opts.mode));
+
+	// WebSocket routes with separate rate limiting
+	let websocket_router = Router::new()
+		.route("/ws/bus", any(websocket::get_ws_bus))
+		.route("/ws/rtdb/{file_id}", any(websocket::get_ws_rtdb))
+		.route("/ws/crdt/{doc_id}", any(websocket::get_ws_crdt))
+		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "websocket", app.opts.mode));
+
+	// General public routes with relaxed rate limiting
+	let general_public_router = Router::new()
+		// Tenant API
+		.route("/api/me", get(profile::handler::get_tenant_profile))
+		.route("/api/me/keys", get(profile::handler::get_tenant_profile))
+		.route("/api/me/full", get(profile::handler::get_tenant_profile))
 
 		// Reference API (public GET endpoint - returns limited data without auth)
 		.route("/api/refs/{ref_id}", get(r#ref::handler::get_ref))
@@ -161,10 +178,6 @@ fn init_api_service(app: App) -> Router {
 		.route("/api/idp/info", get(idp::handler::get_idp_info))
 		.route("/api/idp/check-availability", get(idp::handler::check_identity_availability))
 
-		// Inbox
-		.route("/api/inbox", post(action::handler::post_inbox))
-		.route("/api/inbox/sync", post(action::handler::post_inbox_sync))
-
 		// Action API (read routes with visibility-based access)
 		.route("/api/action", get(action::handler::list_actions))
 		.merge(action_router_read)
@@ -172,15 +185,22 @@ fn init_api_service(app: App) -> Router {
 		// File API (read routes with visibility-based access)
 		.route("/api/file", get(file::handler::get_file_list))
 		.merge(file_router_read)
+		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "general", app.opts.mode));
 
-		// WebSocket APIs
-		.route("/ws/bus", any(websocket::get_ws_bus))
-		.route("/ws/rtdb/{file_id}", any(websocket::get_ws_rtdb))
-		.route("/ws/crdt/{doc_id}", any(websocket::get_ws_crdt))
-
+	let public_router = Router::new()
+		.merge(auth_public_router)
+		.merge(federation_router)
+		.merge(websocket_router)
+		.merge(general_public_router)
 		.route_layer(middleware::from_fn_with_state(app.clone(), optional_auth))
-		.layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-cache")))
-		.layer(SetResponseHeaderLayer::if_not_present(header::EXPIRES, header::HeaderValue::from_static("0")));
+		.layer(SetResponseHeaderLayer::if_not_present(
+			header::CACHE_CONTROL,
+			header::HeaderValue::from_static("no-store, no-cache"),
+		))
+		.layer(SetResponseHeaderLayer::if_not_present(
+			header::EXPIRES,
+			header::HeaderValue::from_static("0"),
+		));
 
 	Router::new()
 		.merge(public_router)

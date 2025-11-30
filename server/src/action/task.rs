@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::sync::Arc;
@@ -319,11 +318,13 @@ impl Task<App> for ActionCreatorTask {
 pub struct ActionVerifierTask {
 	tn_id: TnId,
 	token: Box<str>,
+	/// Optional client IP address for rate limiting (stored as string for serialization)
+	client_address: Option<Box<str>>,
 }
 
 impl ActionVerifierTask {
-	pub fn new(tn_id: TnId, token: Box<str>) -> Arc<Self> {
-		Arc::new(Self { tn_id, token })
+	pub fn new(tn_id: TnId, token: Box<str>, client_address: Option<Box<str>>) -> Arc<Self> {
+		Arc::new(Self { tn_id, token, client_address })
 	}
 }
 
@@ -337,16 +338,23 @@ impl Task<App> for ActionVerifierTask {
 	}
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
-		let (tn_id, token) = ctx
-			.split(',')
-			.collect_tuple()
-			.ok_or(Error::Internal("invalid ActionVerifier context format".into()))?;
-		let task = ActionVerifierTask::new(TnId(tn_id.parse()?), token.into());
+		// Format: "tn_id,token" or "tn_id,token,client_address"
+		let parts: Vec<&str> = ctx.splitn(3, ',').collect();
+		if parts.len() < 2 {
+			return Err(Error::Internal("invalid ActionVerifier context format".into()));
+		}
+		let tn_id = TnId(parts[0].parse()?);
+		let token = parts[1].into();
+		let client_address = parts.get(2).map(|&s| s.into());
+		let task = ActionVerifierTask::new(tn_id, token, client_address);
 		Ok(task)
 	}
 
 	fn serialize(&self) -> String {
-		format!("{},{}", self.tn_id.0, self.token)
+		match &self.client_address {
+			Some(addr) => format!("{},{},{}", self.tn_id.0, self.token, addr),
+			None => format!("{},{}", self.tn_id.0, self.token),
+		}
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -359,7 +367,7 @@ impl Task<App> for ActionVerifierTask {
 			&action_id,
 			&self.token,
 			false,
-			None,
+			self.client_address.as_ref().map(|s| s.to_string()),
 		)
 		.await?;
 

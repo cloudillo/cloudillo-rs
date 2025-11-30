@@ -17,8 +17,9 @@ pub enum Error {
 	Parse,
 
 	// Input validation and constraints
-	ValidationError(String), // 400 - invalid input data
-	Conflict(String),        // 409 - constraint violation (unique, foreign key, etc)
+	ValidationError(String),      // 400 - invalid input data
+	Conflict(String),             // 409 - constraint violation (unique, foreign key, etc)
+	PreconditionRequired(String), // 428 - precondition required (e.g., PoW)
 
 	// Network and external services
 	NetworkError(String), // Network/federation failures
@@ -79,6 +80,11 @@ impl IntoResponse for Error {
 				StatusCode::CONFLICT,
 				"E-CORE-CONFLICT".to_string(),
 				format!("Resource conflict: {}", msg),
+			),
+			Error::PreconditionRequired(msg) => (
+				StatusCode::PRECONDITION_REQUIRED,
+				"E-POW-REQUIRED".to_string(),
+				format!("Precondition required: {}", msg),
 			),
 			Error::Timeout => (
 				StatusCode::REQUEST_TIMEOUT,

@@ -4,15 +4,19 @@ use axum::{
 	Json,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::{
 	action::{
 		filter::filter_actions_by_visibility,
+		process::decode_jwt_no_verify,
 		task::{self, ActionVerifierTask, CreateAction},
 	},
+	auth_adapter::ActionToken,
 	core::{
 		extract::{Auth, OptionalAuth, OptionalRequestId},
 		hasher::hash,
+		rate_limit::RateLimitApi,
 		IdTag,
 	},
 	meta_adapter,
@@ -111,6 +115,7 @@ pub struct SyncActionRequest {
 pub async fn post_inbox(
 	State(app): State<App>,
 	tn_id: TnId,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(action): Json<Inbox>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
@@ -122,9 +127,26 @@ pub async fn post_inbox(
 		return Err(Error::PermissionDenied);
 	}
 
+	// Pre-decode to check action type for PoW requirement
+	// This check happens here so the error is returned synchronously to the client
+	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&action.token) {
+		if action_preview.t.starts_with("CONN") {
+			// Check PoW requirement for CONN actions
+			if let Err(pow_err) = app.rate_limiter.verify_pow(&addr.ip(), &action.token) {
+				debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
+				return Err(Error::PreconditionRequired(format!(
+					"Proof of work required: {}",
+					pow_err
+				)));
+			}
+		}
+	}
+
 	let _action_id = hash("a", action.token.as_bytes());
 
-	let task = ActionVerifierTask::new(tn_id, action.token.into());
+	// Pass client address for rate limiting integration
+	let client_address = Some(addr.ip().to_string().into());
+	let task = ActionVerifierTask::new(tn_id, action.token.into(), client_address);
 	let _task_id = app.scheduler.task(task).now().await?;
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());

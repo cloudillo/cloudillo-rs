@@ -9,6 +9,7 @@ pub mod dns;
 pub mod extract;
 pub mod hasher;
 pub mod middleware;
+pub mod rate_limit;
 pub mod request;
 pub mod roles;
 pub mod scheduler;

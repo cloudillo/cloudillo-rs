@@ -7,6 +7,7 @@ use crate::blob_adapter::CreateBlobOptions;
 use crate::core::hasher;
 use crate::meta_adapter::{CreateFile, FileId, FileVariant};
 use crate::prelude::*;
+use crate::types::ApiResponse;
 
 /// Result of a file sync operation
 #[derive(Debug, Default)]
@@ -51,12 +52,6 @@ fn verify_content_hash(data: &[u8], expected_id: &str) -> ClResult<()> {
 	Ok(())
 }
 
-/// Descriptor response from remote
-#[derive(Debug, serde::Deserialize)]
-struct DescriptorResponse {
-	file: Box<str>,
-}
-
 /// Sync file variants from a remote instance
 ///
 /// # Arguments
@@ -81,9 +76,9 @@ pub async fn sync_file_variants(
 
 	// 1. Fetch file descriptor from remote
 	let descriptor_path = format!("/file/{}/descriptor", file_id);
-	let descriptor_response: DescriptorResponse =
+	let descriptor_response: ApiResponse<String> =
 		app.request.get_noauth(tn_id, remote_id_tag, &descriptor_path).await?;
-	let descriptor = &descriptor_response.file;
+	let descriptor = &descriptor_response.data;
 
 	debug!("  fetched descriptor: {}", descriptor);
 

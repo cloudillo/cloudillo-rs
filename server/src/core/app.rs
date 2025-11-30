@@ -24,11 +24,12 @@ use crate::settings::{FrozenSettingsRegistry, SettingsRegistry};
 use crate::action::dsl::DslEngine;
 use crate::action::hooks::HookRegistry;
 use crate::action::key_cache::KeyFetchCache;
+use crate::core::rate_limit::RateLimitManager;
 use crate::{action, file, profile, routes};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum ServerMode {
 	Standalone,
 	Proxy,
@@ -67,6 +68,9 @@ pub struct AppState {
 
 	// Federation key fetch failure cache
 	pub key_fetch_cache: Arc<KeyFetchCache>,
+
+	// Rate limiter
+	pub rate_limiter: Arc<RateLimitManager>,
 }
 
 pub type App = Arc<AppState>;
@@ -82,7 +86,7 @@ pub struct Adapters {
 
 #[derive(Debug)]
 pub struct AppBuilderOpts {
-	mode: ServerMode,
+	pub mode: ServerMode,
 	listen: Box<str>,
 	listen_http: Option<Box<str>>,
 	pub base_id_tag: Option<Box<str>>,
@@ -359,6 +363,9 @@ impl AppBuilder {
 
 			// Key fetch cache
 			key_fetch_cache,
+
+			// Rate limiter
+			rate_limiter: Arc::new(RateLimitManager::default()),
 		});
 		tokio::fs::create_dir_all(&app.opts.tmp_dir).await.map_err(|e| {
 			error!("FATAL: Cannot create tmp dir: {}", e);
