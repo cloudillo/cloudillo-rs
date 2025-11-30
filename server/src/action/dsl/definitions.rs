@@ -30,6 +30,7 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		ack_definition(),
 		stat_definition(),
 		idp_reg_definition(),
+		fileshare_definition(),
 	]
 }
 
@@ -610,6 +611,88 @@ fn idp_reg_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{issuer}:{audience}:{content.id_tag}".to_string()),
+	}
+}
+
+/// FSHR - File share action
+fn fileshare_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "FSHR".to_string(),
+		version: "1.0".to_string(),
+		description: "Share a file with another user".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("file".to_string()),
+			tags: Some(vec!["file".to_string(), "share".to_string()]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: Some({
+			let mut map = HashMap::new();
+			map.insert("DEL".to_string(), "Revoke file share".to_string());
+			map.insert("WRITE".to_string(), "Grant write permission".to_string());
+			map
+		}),
+		fields: FieldConstraints {
+			content: Some(FieldConstraint::Required),
+			audience: Some(FieldConstraint::Required),
+			parent: Some(FieldConstraint::Forbidden),
+			attachments: Some(FieldConstraint::Forbidden),
+			subject: Some(FieldConstraint::Required), // file_id
+		},
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Object,
+				min_length: None,
+				max_length: None,
+				pattern: None,
+				r#enum: None,
+				properties: Some({
+					let mut props = HashMap::new();
+					props.insert(
+						"contentType".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: Some(1),
+							max_length: Some(255),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props.insert(
+						"fileName".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: Some(1),
+							max_length: Some(255),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props
+				}),
+				required: Some(vec!["contentType".to_string(), "fileName".to_string()]),
+				description: Some("File share content with contentType and fileName".to_string()),
+			}),
+		}),
+		behavior: BehaviorFlags {
+			broadcast: Some(false),
+			allow_unknown: Some(false),
+			requires_acceptance: Some(true),
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None,
+			on_receive: HookImplementation::None, // Native hook registered via registry
+			on_accept: HookImplementation::None,  // Native hook registered via registry
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("any".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(false),
+		}),
+		key_pattern: Some("{type}:{subject}:{audience}".to_string()),
 	}
 }
 

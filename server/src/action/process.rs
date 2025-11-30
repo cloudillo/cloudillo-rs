@@ -300,6 +300,20 @@ pub async fn process_inbound_action_token(
 			None
 		};
 
+		// Serialize content Value to string for storage (always JSON-encode)
+		let content_str: Option<String> =
+			action.c.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default());
+
+		// Inherit visibility from parent action if available
+		let visibility = if let Some(parent_id) = action.p.as_deref() {
+			match app.meta_adapter.get_action(tn_id, parent_id).await {
+				Ok(Some(parent)) => parent.visibility,
+				_ => None, // Parent not found locally or error - use default
+			}
+		} else {
+			None
+		};
+
 		// Create action struct for storage
 		let inbound_action = meta_adapter::Action {
 			action_id: _action_id,
@@ -309,12 +323,12 @@ pub async fn process_inbound_action_token(
 			parent_id: action.p.as_deref(),
 			root_id: action.p.as_deref(), // Use parent as root for now, could be improved
 			audience_tag: action.aud.as_deref(),
-			content: action.c.as_deref(),
+			content: content_str.as_deref(),
 			attachments: action.a.as_ref().map(|v| v.iter().map(|s| s.as_ref()).collect()),
 			subject: action.sub.as_deref(),
 			created_at: action.iat,
 			expires_at: action.exp,
-			visibility: None, // Inbound actions don't have visibility in the token
+			visibility, // Inherit from parent if available
 		};
 
 		// Store in actions table (handles deduplication via key)
@@ -390,7 +404,7 @@ pub async fn process_inbound_action_token(
 		audience: action.aud.as_ref().map(|s| s.to_string()),
 		parent: action.p.as_ref().map(|s| s.to_string()),
 		subject: action.sub.as_ref().map(|s| s.to_string()),
-		content: action.c.as_ref().and_then(|c| serde_json::from_str(c).ok()),
+		content: action.c.clone(),
 		attachments: action.a.as_ref().map(|v| v.iter().map(|s| s.to_string()).collect()),
 		created_at: format!("{}", action.iat.0), // Simple timestamp conversion
 		expires_at: action.exp.map(|ts| format!("{}", ts.0)),

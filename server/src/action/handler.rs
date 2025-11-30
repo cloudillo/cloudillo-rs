@@ -27,6 +27,7 @@ use crate::{
 pub async fn list_actions(
 	State(app): State<App>,
 	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth): OptionalAuth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Query(opts): Query<meta_adapter::ListActionOptions>,
@@ -40,9 +41,15 @@ pub async fn list_actions(
 		None => ("", false),
 	};
 
-	let filtered =
-		filter_actions_by_visibility(&app, tn_id, subject_id_tag, is_authenticated, actions)
-			.await?;
+	let filtered = filter_actions_by_visibility(
+		&app,
+		tn_id,
+		subject_id_tag,
+		is_authenticated,
+		&tenant_id_tag,
+		actions,
+	)
+	.await?;
 
 	let total = filtered.len(); // TODO: Add proper pagination tracking to MetaAdapter
 	let response = ApiResponse::with_pagination(filtered, 0, 20, total)
@@ -289,7 +296,7 @@ pub async fn post_action_accept(
 			audience: action.audience.as_ref().map(|a| a.id_tag.to_string()),
 			parent: action.parent_id.clone().map(|s| s.to_string()),
 			subject: action.subject.clone().map(|s| s.to_string()),
-			content: action.content.as_ref().and_then(|c| serde_json::from_str(c).ok()),
+			content: action.content.clone(),
 			attachments: action
 				.attachments
 				.clone()
@@ -368,7 +375,7 @@ pub async fn post_action_reject(
 			audience: action.audience.as_ref().map(|a| a.id_tag.to_string()),
 			parent: action.parent_id.clone().map(|s| s.to_string()),
 			subject: action.subject.clone().map(|s| s.to_string()),
-			content: action.content.as_ref().and_then(|c| serde_json::from_str(c).ok()),
+			content: action.content.clone(),
 			attachments: action
 				.attachments
 				.clone()
@@ -423,14 +430,13 @@ pub async fn post_action_reject(
 /// POST /api/action/:action_id/stat - Update action statistics
 #[derive(Default, Deserialize)]
 pub struct UpdateActionStatRequest {
-	#[serde(default)]
-	pub reactions: crate::types::Patch<u32>,
-	#[serde(default)]
-	pub comments: crate::types::Patch<u32>,
+	#[serde(default, rename = "commentsRead")]
+	pub comments_read: crate::types::Patch<u32>,
 }
 
 pub async fn post_action_stat(
 	State(app): State<App>,
+	tn_id: TnId,
 	Auth(auth): Auth,
 	Path(action_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -438,12 +444,11 @@ pub async fn post_action_stat(
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	// Update action statistics
 	let opts = crate::meta_adapter::UpdateActionDataOptions {
-		reactions: req.reactions,
-		comments: req.comments,
+		comments_read: req.comments_read,
 		..Default::default()
 	};
 
-	app.meta_adapter.update_action_data(auth.tn_id, &action_id, &opts).await?;
+	app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
 
 	info!("User {} updated stats for action {}", auth.id_tag, action_id);
 

@@ -248,7 +248,7 @@ pub(crate) async fn create_action_token(
 		k: key_id,
 		p: action.parent_id,
 		aud: action.audience_tag,
-		c: action.content,
+		c: action.content.clone(),
 		a: action.attachments,
 		sub: action.subject,
 		exp: action.expires_at,

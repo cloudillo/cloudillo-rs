@@ -128,10 +128,10 @@ pub async fn sync_file_variants(
 	// Use first variant as orig_variant_id
 	let first_variant = &variants_to_sync[0];
 	let create_opts = CreateFile {
-		orig_variant_id: first_variant.variant_id.into(),
+		orig_variant_id: Some(first_variant.variant_id.into()),
 		file_id: Some(file_id.into()),
 		owner_tag: Some(remote_id_tag.into()),
-		preset: "sync".into(),
+		preset: Some("sync".into()),
 		content_type: format_to_content_type(first_variant.format).into(),
 		file_name: format!("synced.{}", format_to_extension(first_variant.format)).into(),
 		file_tp: None,
@@ -139,6 +139,7 @@ pub async fn sync_file_variants(
 		tags: None,
 		x: None,
 		visibility: Some('P'), // Public for synced files
+		status: None,
 	};
 
 	// f_id is Some if we created a new file entry, None if file already exists

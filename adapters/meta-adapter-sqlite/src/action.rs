@@ -152,8 +152,10 @@ pub(crate) async fn list(
 		// stat - build from reactions and comments counts
 		let reactions_count: i64 = row.try_get("reactions").unwrap_or(0);
 		let comments_count: i64 = row.try_get("comments").unwrap_or(0);
+		let comments_read: i64 = row.try_get("comments_read").unwrap_or(0);
 		let stat = Some(serde_json::json!({
 			"comments": comments_count,
+			"commentsRead": comments_read,
 			"reactions": reactions_count
 		}));
 		let visibility: Option<String> = row.try_get("visibility").ok();
@@ -195,7 +197,10 @@ pub(crate) async fn list(
 				None
 			},
 			subject: row.try_get("subject").map_err(|_| Error::DbError)?,
-			content: row.try_get("content").map_err(|_| Error::DbError)?,
+			content: row
+				.try_get::<Option<String>, _>("content")
+				.map_err(|_| Error::DbError)?
+				.and_then(|s| serde_json::from_str(&s).ok()),
 			attachments,
 			created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
 			expires_at: row
@@ -276,6 +281,24 @@ pub(crate) async fn create(
 
 		if let Some(action_id) = action_id_exists {
 			return Ok(ActionId::ActionId(action_id));
+		}
+	}
+
+	// For inbound actions with a key, delete old actions with the same key first
+	// This handles key-based deduplication for inbound actions (outbound actions
+	// handle this in finalize())
+	if !action.action_id.is_empty() {
+		if let Some(key) = key {
+			info!("Inbound action with key: {}, deleting old entries", key);
+			sqlx::query(
+				"UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND coalesce(status, 'A')!='D'",
+			)
+			.bind(tn_id.0)
+			.bind(key)
+			.execute(db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 		}
 	}
 
@@ -413,40 +436,30 @@ pub(crate) async fn finalize(
 		return Err(Error::Internal("Failed to finalize action".into()));
 	}
 
-	// Now handle key-based deduplication and reaction counting for finalized actions
-	let action = sqlx::query(
-		"SELECT key, type, content, parent_id, root_id FROM actions WHERE tn_id=? AND a_id=?",
-	)
-	.bind(tn_id.0)
-	.bind(a_id as i64)
-	.fetch_one(&mut *tx)
-	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	// Handle key-based deduplication for finalized actions
+	let action = sqlx::query("SELECT key FROM actions WHERE tn_id=? AND a_id=?")
+		.bind(tn_id.0)
+		.bind(a_id as i64)
+		.fetch_one(&mut *tx)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 
 	let key: Option<String> = action.try_get("key").ok().flatten();
-	let typ: String = action.try_get("type").map_err(|_| Error::DbError)?;
-	let content: Option<String> = action.try_get("content").ok().flatten();
-	let parent_id: Option<String> = action.try_get("parent_id").ok().flatten();
-	let root_id: Option<String> = action.try_get("root_id").ok().flatten();
 
-	let mut add_reactions = if content.is_none() { 0 } else { 1 };
 	if let Some(key) = &key {
 		info!("Finalizing with key: {}", key);
-		let res = sqlx::query("UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND a_id!=? AND coalesce(status, 'A')!='D' RETURNING content")
-			.bind(tn_id.0).bind(key).bind(a_id as i64)
-			.fetch_all(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
-		if !res.is_empty()
-			&& (res[0].try_get::<Option<&str>, _>("content").map_err(|_| Error::DbError)?).is_some()
-		{
-			add_reactions -= 1;
-		}
-	}
-	if typ == "REACT" && content.is_some() {
-		info!("Finalizing with reaction: {:?}", content);
-		sqlx::query("UPDATE actions SET reactions=coalesce(reactions, 0)+? WHERE tn_id=? AND action_id IN (?, ?)")
-			.bind(add_reactions).bind(tn_id.0).bind(parent_id).bind(root_id)
-			.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		// Delete old entries with the same key (key-based deduplication)
+		sqlx::query(
+			"UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND a_id!=? AND coalesce(status, 'A')!='D'",
+		)
+		.bind(tn_id.0)
+		.bind(key)
+		.bind(a_id as i64)
+		.execute(&mut *tx)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 	}
 
 	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
@@ -637,6 +650,9 @@ pub(crate) async fn update_data(
 	if !opts.comments.is_undefined() {
 		set_clauses.push("comments = ?");
 	}
+	if !opts.comments_read.is_undefined() {
+		set_clauses.push("comments_read = ?");
+	}
 	if !opts.status.is_undefined() {
 		set_clauses.push("status = ?");
 	}
@@ -672,6 +688,14 @@ pub(crate) async fn update_data(
 	}
 	if !opts.comments.is_undefined() {
 		let val: Option<u32> = match &opts.comments {
+			Patch::Null => None,
+			Patch::Value(v) => Some(*v),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.comments_read.is_undefined() {
+		let val: Option<u32> = match &opts.comments_read {
 			Patch::Null => None,
 			Patch::Value(v) => Some(*v),
 			Patch::Undefined => unreachable!(),
@@ -764,7 +788,7 @@ pub(crate) async fn get(
 		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic,
 		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic,
 		a.subject, a.content, a.created_at, a.expires_at,
-		a.attachments, a.status, a.reactions, a.comments, a.visibility
+		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility
 		FROM actions a
 		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
@@ -829,8 +853,10 @@ pub(crate) async fn get(
 	// Build stat from reactions and comments counts
 	let reactions_count: i64 = row.try_get("reactions").unwrap_or(0);
 	let comments_count: i64 = row.try_get("comments").unwrap_or(0);
+	let comments_read: i64 = row.try_get("comments_read").unwrap_or(0);
 	let stat = Some(serde_json::json!({
 		"comments": comments_count,
+		"commentsRead": comments_read,
 		"reactions": reactions_count
 	}));
 
@@ -870,7 +896,10 @@ pub(crate) async fn get(
 			None
 		},
 		subject: row.try_get("subject").map_err(|_| Error::DbError)?,
-		content: row.try_get("content").map_err(|_| Error::DbError)?,
+		content: row
+			.try_get::<Option<String>, _>("content")
+			.map_err(|_| Error::DbError)?
+			.and_then(|s| serde_json::from_str(&s).ok()),
 		attachments,
 		created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
 		expires_at: row

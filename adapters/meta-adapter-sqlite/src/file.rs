@@ -210,25 +210,37 @@ pub(crate) async fn create(
 	tn_id: TnId,
 	opts: CreateFile,
 ) -> ClResult<FileId<Box<str>>> {
-	let file_id_exists = sqlx::query(
-		"SELECT min(f.file_id) FROM file_variants fv
-		JOIN files f ON f.tn_id=fv.tn_id AND f.f_id=fv.f_id AND f.preset=? AND f.file_id IS NOT NULL
-		WHERE fv.tn_id=? AND fv.variant_id=? AND fv.variant='orig'",
-	)
-	.bind(&opts.preset)
-	.bind(tn_id.0)
-	.bind(&opts.orig_variant_id)
-	.fetch_one(db)
-	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?
-	.get(0);
+	// Only check for existing file if we have preset and orig_variant_id (normal file creation)
+	// For shared files (FSHR), these are None so we skip the dedup check
+	if let (Some(preset), Some(orig_variant_id)) = (&opts.preset, &opts.orig_variant_id) {
+		let file_id_exists: Option<Box<str>> = sqlx::query(
+			"SELECT min(f.file_id) FROM file_variants fv
+			JOIN files f ON f.tn_id=fv.tn_id AND f.f_id=fv.f_id AND f.preset=? AND f.file_id IS NOT NULL
+			WHERE fv.tn_id=? AND fv.variant_id=? AND fv.variant='orig'",
+		)
+		.bind(preset)
+		.bind(tn_id.0)
+		.bind(orig_variant_id)
+		.fetch_one(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?
+		.get(0);
 
-	if let Some(file_id) = file_id_exists {
-		return Ok(FileId::FileId(file_id));
+		if let Some(file_id) = file_id_exists {
+			return Ok(FileId::FileId(file_id));
+		}
 	}
 
-	let status = "P";
+	// Use provided status or default to 'P' (Pending)
+	let status = match opts.status {
+		Some(FileStatus::Active) => "A",
+		Some(FileStatus::Immutable) => "I",
+		Some(FileStatus::Mutable) => "M",
+		Some(FileStatus::Pending) => "P",
+		Some(FileStatus::Deleted) => "D",
+		None => "P",
+	};
 	let created_at =
 		if let Some(created_at) = opts.created_at { created_at } else { Timestamp::now() };
 	let file_tp = opts.file_tp.as_deref().unwrap_or("BLOB"); // Default to BLOB if not specified

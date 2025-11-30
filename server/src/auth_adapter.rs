@@ -14,7 +14,7 @@ pub struct ActionToken {
 	pub iss: Box<str>,
 	pub k: Box<str>,
 	pub t: Box<str>,
-	pub c: Option<Box<str>>,
+	pub c: Option<serde_json::Value>,
 	pub p: Option<Box<str>>,
 	pub a: Option<Vec<Box<str>>>,
 	pub aud: Option<Box<str>>,

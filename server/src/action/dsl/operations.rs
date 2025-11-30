@@ -297,14 +297,7 @@ impl<'a> OperationExecutor<'a> {
 			parent_id: parent_val.and_then(|v| v.as_str().map(|s| s.to_string().into_boxed_str())),
 			root_id: None, // Will be determined by action system
 			subject: subject_val.and_then(|v| v.as_str().map(|s| s.to_string().into_boxed_str())),
-			content: content_val.and_then(|v| {
-				if v.is_string() {
-					v.as_str().map(|s| s.to_string().into_boxed_str())
-				} else {
-					// If not a string, serialize JSON
-					Some(serde_json::to_string(&v).unwrap_or_default().into_boxed_str())
-				}
-			}),
+			content: content_val,
 			attachments: attachments_val.and_then(|v| {
 				v.as_array().map(|arr| {
 					arr.iter()

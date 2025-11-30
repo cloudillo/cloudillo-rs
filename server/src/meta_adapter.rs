@@ -185,6 +185,7 @@ pub struct UpdateActionDataOptions {
 	pub subject: Patch<String>,
 	pub reactions: Patch<u32>,
 	pub comments: Patch<u32>,
+	pub comments_read: Patch<u32>,
 	pub status: Patch<char>,
 	pub visibility: Patch<char>,
 }
@@ -279,7 +280,7 @@ pub struct ActionView {
 	#[serde(rename = "audience")]
 	pub audience: Option<ProfileInfo>,
 	#[serde(rename = "content")]
-	pub content: Option<Box<str>>,
+	pub content: Option<serde_json::Value>,
 	#[serde(rename = "attachments")]
 	pub attachments: Option<Vec<AttachmentView>>,
 	#[serde(rename = "subject")]
@@ -308,6 +309,7 @@ pub struct ReactionData {
 
 // Files
 //*******
+#[derive(Debug)]
 pub enum FileId<S: AsRef<str>> {
 	FileId(S),
 	FId(u64),
@@ -400,10 +402,10 @@ pub struct ListFileOptions {
 
 #[derive(Debug, Clone, Default)]
 pub struct CreateFile {
-	pub orig_variant_id: Box<str>,
+	pub orig_variant_id: Option<Box<str>>,
 	pub file_id: Option<Box<str>>,
 	pub owner_tag: Option<Box<str>>,
-	pub preset: Box<str>,
+	pub preset: Option<Box<str>>,
 	pub content_type: Box<str>,
 	pub file_name: Box<str>,
 	pub file_tp: Option<Box<str>>, // 'BLOB', 'CRDT', 'RTDB' - defaults to 'BLOB'
@@ -411,6 +413,7 @@ pub struct CreateFile {
 	pub tags: Option<Vec<Box<str>>>,
 	pub x: Option<serde_json::Value>,
 	pub visibility: Option<char>, // None: Direct (default), P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
+	pub status: Option<FileStatus>, // None defaults to Pending, can set to Mutable for shared files
 }
 
 #[derive(Debug, Clone, Deserialize)]

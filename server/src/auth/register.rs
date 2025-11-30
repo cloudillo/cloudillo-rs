@@ -324,7 +324,7 @@ async fn handle_idp_registration(
 		parent_id: None,
 		root_id: None,
 		audience_tag: Some(idp_domain.to_string().into()),
-		content: Some(serde_json::to_string(&reg_content)?.into()),
+		content: Some(serde_json::to_value(&reg_content)?),
 		attachments: None,
 		subject: None,
 		expires_at: Some(expires_at),

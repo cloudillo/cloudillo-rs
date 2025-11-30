@@ -51,6 +51,7 @@ pub async fn filter_files_by_visibility(
 				subject_id_tag,
 				is_authenticated,
 				owner_tag,
+				tenant_id_tag,
 				file.visibility,
 				following,
 				connected,

@@ -28,7 +28,7 @@ pub struct CreateAction {
 	pub root_id: Option<Box<str>>,
 	#[serde(rename = "audienceTag")]
 	pub audience_tag: Option<Box<str>>,
-	pub content: Option<Box<str>>,
+	pub content: Option<serde_json::Value>,
 	pub attachments: Option<Vec<Box<str>>>,
 	pub subject: Option<Box<str>>,
 	#[serde(rename = "expiresAt")]
@@ -42,6 +42,23 @@ pub async fn create_action(
 	id_tag: &str,
 	action: CreateAction,
 ) -> ClResult<Box<str>> {
+	// Serialize content Value to string for storage (always JSON-encode)
+	let content_str: Option<String> =
+		action.content.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default());
+
+	// Inherit visibility from parent if not explicitly set
+	let visibility = if action.visibility.is_some() {
+		action.visibility
+	} else if let Some(parent_id) = &action.parent_id {
+		// Try to get parent action's visibility
+		match app.meta_adapter.get_action(tn_id, parent_id).await {
+			Ok(Some(parent)) => parent.visibility,
+			_ => None, // Parent not found locally or error - use default
+		}
+	} else {
+		None
+	};
+
 	// Create pending action in database with a_id (action_id is NULL at this point)
 	let pending_action = meta_adapter::Action {
 		action_id: "", // Empty action_id for pending actions
@@ -51,12 +68,12 @@ pub async fn create_action(
 		parent_id: action.parent_id.as_deref(),
 		root_id: action.root_id.as_deref(),
 		audience_tag: action.audience_tag.as_deref(),
-		content: action.content.as_deref(),
+		content: content_str.as_deref(),
 		attachments: action.attachments.as_ref().map(|v| v.iter().map(|a| a.as_ref()).collect()),
 		subject: action.subject.as_deref(),
 		expires_at: action.expires_at,
 		created_at: Timestamp::now(),
-		visibility: action.visibility,
+		visibility,
 	};
 
 	let key = None; // No key needed yet - deduplication happens at finalization
@@ -203,7 +220,7 @@ impl Task<App> for ActionCreatorTask {
 				audience: self.action.audience_tag.as_ref().map(|s| s.to_string()),
 				parent: self.action.parent_id.as_ref().map(|s| s.to_string()),
 				subject: self.action.subject.as_ref().map(|s| s.to_string()),
-				content: self.action.content.as_ref().and_then(|c| serde_json::from_str(c).ok()),
+				content: self.action.content.clone(),
 				attachments: attachments
 					.as_ref()
 					.map(|v| v.iter().map(|s| s.to_string()).collect()),
@@ -237,12 +254,23 @@ impl Task<App> for ActionCreatorTask {
 
 		// Determine delivery strategy based on action type definition
 		let definition = app.dsl_engine.get_definition(self.action.typ.as_ref());
+		info!(
+			"Delivery: type={}, definition_found={}, audience={:?}",
+			self.action.typ,
+			definition.is_some(),
+			self.action.audience_tag
+		);
 
 		if let Some(def) = definition {
 			let mut recipients: Vec<Box<str>> = Vec::new();
 
 			// Check if action should be broadcast (broadcast=true and no specific audience)
 			let should_broadcast = def.behavior.broadcast.unwrap_or(false);
+			info!(
+				"Delivery: should_broadcast={}, audience_is_none={}",
+				should_broadcast,
+				self.action.audience_tag.is_none()
+			);
 			if should_broadcast && self.action.audience_tag.is_none() {
 				// Broadcast mode: query for followers using list_actions
 				info!("Broadcasting action {} - querying for followers", action_id);
@@ -280,6 +308,7 @@ impl Task<App> for ActionCreatorTask {
 				}
 			}
 
+			info!("Delivery: {} recipients to send to", recipients.len());
 			// Create delivery task for each recipient
 			for recipient_tag in recipients {
 				info!("Creating delivery task for action {} to {}", action_id, recipient_tag);
@@ -306,6 +335,11 @@ impl Task<App> for ActionCreatorTask {
 					.schedule()
 					.await?;
 			}
+		} else {
+			warn!(
+				"Delivery: No definition found for action type '{}' - skipping delivery",
+				self.action.typ
+			);
 		}
 
 		info!("Finished task action.create {}", action_id);
@@ -389,7 +423,7 @@ mod tests {
 			parent_id: None,
 			root_id: None,
 			audience_tag: None,
-			content: Some("Hello world".into()),
+			content: Some(serde_json::Value::String("Hello world".to_string())),
 			attachments: None,
 			subject: None,
 			expires_at: None,
@@ -397,7 +431,7 @@ mod tests {
 		};
 
 		assert_eq!(action.typ.as_ref(), "POST");
-		assert_eq!(action.content.as_ref().map(|s| s.as_ref()), Some("Hello world"));
+		assert_eq!(action.content, Some(serde_json::Value::String("Hello world".to_string())));
 		assert!(action.audience_tag.is_none());
 	}
 

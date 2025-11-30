@@ -364,8 +364,8 @@ pub async fn post_file(
 		.create_file(
 			tn_id,
 			meta_adapter::CreateFile {
-				preset: "default".into(),
-				orig_variant_id: file_id.clone().into(),
+				preset: Some("default".into()),
+				orig_variant_id: Some(file_id.clone().into()),
 				file_id: Some(file_id.clone().into()),
 				owner_tag: Some(auth.id_tag.clone()),
 				content_type: content_type.into(),
@@ -375,6 +375,7 @@ pub async fn post_file(
 				tags: req.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
 				x: None,
 				visibility: req.visibility,
+				status: None,
 			},
 		)
 		.await?;
@@ -430,8 +431,8 @@ pub async fn post_file_blob(
 				.create_file(
 					tn_id,
 					meta_adapter::CreateFile {
-						preset: preset.into(),
-						orig_variant_id,
+						preset: Some(preset.into()),
+						orig_variant_id: Some(orig_variant_id),
 						file_id: None,
 						owner_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
@@ -441,6 +442,7 @@ pub async fn post_file_blob(
 						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
 						x: Some(json!({ "dim": dim })),
 						visibility: query.visibility,
+						status: None,
 					},
 				)
 				.await?;

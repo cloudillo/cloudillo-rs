@@ -20,6 +20,7 @@ pub async fn filter_actions_by_visibility(
 	tn_id: TnId,
 	subject_id_tag: &str,
 	is_authenticated: bool,
+	tenant_id_tag: &str,
 	actions: Vec<ActionView>,
 ) -> ClResult<Vec<ActionView>> {
 	// If no actions, return early
@@ -34,6 +35,13 @@ pub async fn filter_actions_by_visibility(
 	let relationships = load_relationships(app, tn_id, subject_id_tag, &issuer_tags).await?;
 
 	// Filter actions based on visibility
+	info!(
+		"filter_actions_by_visibility: subject={}, is_auth={}, tenant={}, action_count={}",
+		subject_id_tag,
+		is_authenticated,
+		tenant_id_tag,
+		actions.len()
+	);
 	let filtered = actions
 		.into_iter()
 		.filter(|action| {
@@ -45,15 +53,23 @@ pub async fn filter_actions_by_visibility(
 			let audience: Vec<&str> =
 				action.audience.as_ref().map(|a| vec![a.id_tag.as_ref()]).unwrap_or_default();
 
-			can_view_item(
+			let allowed = can_view_item(
 				subject_id_tag,
 				is_authenticated,
 				issuer_tag,
+				tenant_id_tag,
 				action.visibility,
 				following,
 				connected,
 				Some(&audience),
-			)
+			);
+			if !allowed {
+				info!(
+					"FILTERED OUT action={}: subject={}, issuer={}, tenant={}, visibility={:?}, audience={:?}",
+					action.action_id, subject_id_tag, issuer_tag, tenant_id_tag, action.visibility, audience
+				);
+			}
+			allowed
 		})
 		.collect();
 

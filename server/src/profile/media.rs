@@ -128,8 +128,8 @@ pub async fn put_profile_image(
 		.create_file(
 			auth.tn_id,
 			meta_adapter::CreateFile {
-				preset: "profile-pic".into(),
-				orig_variant_id: orig_variant_id.clone(),
+				preset: Some("profile-pic".into()),
+				orig_variant_id: Some(orig_variant_id.clone()),
 				file_id: None,
 				owner_tag: Some(auth.id_tag.as_ref().into()),
 				content_type: content_type.into(),
@@ -139,6 +139,7 @@ pub async fn put_profile_image(
 				tags: Some(vec!["profile".into()]),
 				x: Some(json!({ "dim": dim })),
 				visibility: Some('P'), // Profile pics are always public
+				status: None,
 			},
 		)
 		.await?;
@@ -275,8 +276,8 @@ pub async fn put_cover_image(
 		.create_file(
 			auth.tn_id,
 			meta_adapter::CreateFile {
-				preset: "cover".into(),
-				orig_variant_id: orig_variant_id.clone(),
+				preset: Some("cover".into()),
+				orig_variant_id: Some(orig_variant_id.clone()),
 				file_id: None,
 				owner_tag: Some(auth.id_tag.as_ref().into()),
 				content_type: content_type.into(),
@@ -286,6 +287,7 @@ pub async fn put_cover_image(
 				tags: Some(vec!["cover".into()]),
 				x: Some(json!({ "dim": dim })),
 				visibility: Some('P'), // Cover images are always public
+				status: None,
 			},
 		)
 		.await?;

@@ -6,11 +6,15 @@
 //! Modules:
 //! - conn: Connection lifecycle management (CONN)
 //! - fllw: Follow relationship management (FLLW)
+//! - fshr: File sharing lifecycle management (FSHR)
 //! - idp: Identity provider operations (IDP:REG)
+//! - react: Reaction management (REACT)
 
 pub mod conn;
 pub mod fllw;
+pub mod fshr;
 pub mod idp;
+pub mod react;
 
 use crate::action::hooks::ActionTypeHooks;
 use crate::core::app::App;
@@ -60,6 +64,32 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		tracing::info!("Registered native hooks for IDP:REG action type");
 	}
 
+	// FSHR hooks
+	{
+		let fshr_hooks = ActionTypeHooks {
+			on_create: None,
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(fshr::on_receive(app, ctx)))),
+			on_accept: Some(Arc::new(|app, ctx| Box::pin(fshr::on_accept(app, ctx)))),
+			on_reject: None,
+		};
+
+		registry.register_type("FSHR", fshr_hooks);
+		tracing::info!("Registered native hooks for FSHR action type");
+	}
+
+	// REACT hooks
+	{
+		let react_hooks = ActionTypeHooks {
+			on_create: Some(Arc::new(|app, ctx| Box::pin(react::on_create(app, ctx)))),
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(react::on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("REACT", react_hooks);
+		tracing::info!("Registered native hooks for REACT action type");
+	}
+
 	Ok(())
 }
 
@@ -77,6 +107,10 @@ mod tests {
 		let _ = fllw::on_create;
 		let _ = fllw::on_receive;
 		let _ = idp::idp_reg_on_receive;
+		let _ = fshr::on_receive;
+		let _ = fshr::on_accept;
+		let _ = react::on_create;
+		let _ = react::on_receive;
 	}
 }
 

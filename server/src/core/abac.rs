@@ -126,14 +126,17 @@ impl SubjectAccessLevel {
 /// * `subject_id_tag` - The viewer's id_tag (empty string for anonymous)
 /// * `is_authenticated` - Whether the subject is authenticated
 /// * `item_owner_id_tag` - The item owner/issuer's id_tag
+/// * `tenant_id_tag` - The tenant's id_tag (owner of the node where item is stored)
 /// * `visibility` - The item's visibility level (None = Direct)
 /// * `subject_following_owner` - Whether the subject follows the owner
 /// * `subject_connected_to_owner` - Whether the subject is connected to owner
 /// * `audience_tags` - Optional list of audience id_tags (for Direct visibility)
+#[allow(clippy::too_many_arguments)]
 pub fn can_view_item(
 	subject_id_tag: &str,
 	is_authenticated: bool,
 	item_owner_id_tag: &str,
+	tenant_id_tag: &str,
 	visibility: Option<char>,
 	subject_following_owner: bool,
 	subject_connected_to_owner: bool,
@@ -144,8 +147,9 @@ pub fn can_view_item(
 	// Determine subject's access level
 	// Note: "guest" id_tag is used for unauthenticated users - treat as Public
 	let is_real_auth = is_authenticated && !subject_id_tag.is_empty() && subject_id_tag != "guest";
-	let access_level = if subject_id_tag == item_owner_id_tag {
-		SubjectAccessLevel::Owner
+	let is_tenant = subject_id_tag == tenant_id_tag;
+	let access_level = if subject_id_tag == item_owner_id_tag || is_tenant {
+		SubjectAccessLevel::Owner // Tenant has same access as owner
 	} else if subject_connected_to_owner {
 		SubjectAccessLevel::Connected
 	} else if subject_following_owner {
