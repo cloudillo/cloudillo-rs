@@ -121,7 +121,7 @@ fn generate_vapid_key_sync() -> ClResult<KeyPair> {
 	let public = private.public_key();
 
 	// Private key as raw scalar, base64url encoded (compatible with TypeScript version)
-	let private_key: Box<str> = URL_SAFE_NO_PAD.encode(&private.to_bytes()).into();
+	let private_key: Box<str> = URL_SAFE_NO_PAD.encode(private.to_bytes()).into();
 
 	// Public key as uncompressed point, base64url encoded (for Web Push API)
 	let public_point = public.to_encoded_point(false);
