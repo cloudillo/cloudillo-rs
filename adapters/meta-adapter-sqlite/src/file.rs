@@ -189,6 +189,7 @@ pub(crate) async fn read_variant(
 	tn_id: TnId,
 	variant_id: &str,
 ) -> ClResult<FileVariant<Box<str>>> {
+	debug!("read_variant: tn_id={}, variant_id={}", tn_id.0, variant_id);
 	let res = sqlx::query(
 		"SELECT variant_id, variant, res_x, res_y, format, size, available
 			FROM file_variants WHERE tn_id=? AND variant_id=?",
@@ -197,6 +198,7 @@ pub(crate) async fn read_variant(
 	.bind(variant_id)
 	.fetch_one(db)
 	.await;
+	debug!("read_variant result: {:?}", res.is_ok());
 
 	map_res(res, |row| {
 		let res_x = row.try_get("res_x")?;
@@ -209,6 +211,44 @@ pub(crate) async fn read_variant(
 			size: row.try_get("size")?,
 			available: row.try_get("available")?,
 		})
+	})
+}
+
+/// Look up the file_id for a given variant_id
+pub(crate) async fn read_file_id_by_variant(
+	db: &SqlitePool,
+	tn_id: TnId,
+	variant_id: &str,
+) -> ClResult<Box<str>> {
+	let res = sqlx::query(
+		"SELECT f.file_id
+			FROM files f
+			JOIN file_variants fv ON f.tn_id=fv.tn_id AND f.f_id=fv.f_id
+			WHERE fv.tn_id=? AND fv.variant_id=?",
+	)
+	.bind(tn_id.0)
+	.bind(variant_id)
+	.fetch_one(db)
+	.await;
+
+	map_res(res, |row| row.try_get("file_id"))
+}
+
+/// Look up the internal f_id for a given file_id
+pub(crate) async fn read_f_id_by_file_id(
+	db: &SqlitePool,
+	tn_id: TnId,
+	file_id: &str,
+) -> ClResult<u64> {
+	let res = sqlx::query("SELECT f_id FROM files WHERE tn_id=? AND file_id=?")
+		.bind(tn_id.0)
+		.bind(file_id)
+		.fetch_one(db)
+		.await;
+
+	map_res(res, |row| {
+		let f_id: i64 = row.try_get("f_id")?;
+		Ok(f_id as u64)
 	})
 }
 
@@ -276,6 +316,7 @@ pub(crate) async fn create(
 }
 
 /// Create a file variant
+/// Note: Only works for pending files (status='P') to preserve content-based ID integrity
 pub(crate) async fn create_variant<'a>(
 	db: &SqlitePool,
 	tn_id: TnId,
@@ -283,7 +324,7 @@ pub(crate) async fn create_variant<'a>(
 	opts: FileVariant<&'a str>,
 ) -> ClResult<&'a str> {
 	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
-	let _res = sqlx::query("SELECT f_id FROM files WHERE tn_id=? AND f_id=? AND file_id IS NULL")
+	let _res = sqlx::query("SELECT f_id FROM files WHERE tn_id=? AND f_id=? AND status='P'")
 		.bind(tn_id.0)
 		.bind(f_id as i64)
 		.fetch_one(&mut *tx)
@@ -342,16 +383,15 @@ pub(crate) async fn update_id(
 		}
 	}
 
-	// Update NULL file_id to new value
-	let res =
-		sqlx::query("UPDATE files SET file_id=? WHERE tn_id=? AND f_id=? AND file_id IS NULL")
-			.bind(file_id)
-			.bind(tn_id.0)
-			.bind(f_id as i64)
-			.execute(db)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+	// Update file_id for pending files
+	let res = sqlx::query("UPDATE files SET file_id=? WHERE tn_id=? AND f_id=? AND status='P'")
+		.bind(file_id)
+		.bind(tn_id.0)
+		.bind(f_id as i64)
+		.execute(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 
 	if res.rows_affected() == 0 {
 		// Race condition - someone else just set it between our check and update.
@@ -441,9 +481,9 @@ pub(crate) async fn finalize_file(
 		}
 	}
 
-	// Update NULL file_id to new value and set status to 'A' atomically
+	// Set file_id and status='A' atomically for pending files
 	let res = sqlx::query(
-		"UPDATE files SET file_id=?, status='A' WHERE tn_id=? AND f_id=? AND file_id IS NULL",
+		"UPDATE files SET file_id=?, status='A' WHERE tn_id=? AND f_id=? AND status='P'",
 	)
 	.bind(file_id)
 	.bind(tn_id.0)

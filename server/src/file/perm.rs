@@ -97,15 +97,27 @@ async fn check_file_permission(
 async fn load_file_attrs(
 	app: &App,
 	tn_id: TnId,
-	file_id: &str,
+	file_or_variant_id: &str,
 	subject_id_tag: &str,
 	tenant_id_tag: &str,
 ) -> ClResult<FileAttrs> {
 	use crate::core::abac::VisibilityLevel;
+	use std::borrow::Cow;
 	use tracing::debug;
 
+	// Detect if this is a variant_id (starts with 'b') and look up the file_id
+	let file_id: Cow<str> = if file_or_variant_id.starts_with('b') {
+		// This is a variant_id, look up the file_id
+		debug!("Looking up file_id for variant_id: {}", file_or_variant_id);
+		let fid = app.meta_adapter.read_file_id_by_variant(tn_id, file_or_variant_id).await?;
+		debug!("Found file_id: {} for variant_id: {}", fid, file_or_variant_id);
+		Cow::Owned(fid.to_string())
+	} else {
+		Cow::Borrowed(file_or_variant_id)
+	};
+
 	// Get file view from MetaAdapter
-	let file_view = app.meta_adapter.read_file(tn_id, file_id).await?;
+	let file_view = app.meta_adapter.read_file(tn_id, &file_id).await?;
 
 	let file_view = file_view.ok_or(Error::NotFound)?;
 

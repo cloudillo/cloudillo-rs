@@ -166,6 +166,10 @@ pub struct UpdateProfileData {
 	pub following: Patch<bool>,
 	#[serde(default)]
 	pub connected: Patch<ProfileConnectionStatus>,
+
+	// Sync metadata
+	#[serde(default)]
+	pub etag: Patch<Box<str>>,
 }
 
 // Actions
@@ -584,6 +588,16 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>,
 	);
 
+	/// List stale profiles that need refreshing
+	///
+	/// Returns profiles where `synced_at IS NULL OR synced_at < now - max_age_secs`.
+	/// Returns `Vec<(tn_id, id_tag, etag)>` tuples for conditional refresh requests.
+	async fn list_stale_profiles(
+		&self,
+		max_age_secs: i64,
+		limit: u32,
+	) -> ClResult<Vec<(TnId, Box<str>, Option<Box<str>>)>>;
+
 	// Action management
 	//*******************
 	async fn get_action_id(&self, tn_id: TnId, a_id: u64) -> ClResult<Box<str>>;
@@ -679,6 +693,10 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		variant_id: &str,
 	) -> ClResult<FileVariant<Box<str>>>;
+	/// Look up the file_id for a given variant_id
+	async fn read_file_id_by_variant(&self, tn_id: TnId, variant_id: &str) -> ClResult<Box<str>>;
+	/// Look up the internal f_id for a given file_id (for adding variants to existing files)
+	async fn read_f_id_by_file_id(&self, tn_id: TnId, file_id: &str) -> ClResult<u64>;
 	async fn create_file(&self, tn_id: TnId, opts: CreateFile) -> ClResult<FileId<Box<str>>>;
 	async fn create_file_variant<'a>(
 		&'a self,

@@ -497,7 +497,7 @@ async fn process_inbound_action_attachments(
 
 	for attachment in attachments {
 		info!("  syncing attachment: {}", attachment);
-		match sync_file_variants(app, tn_id, id_tag, &attachment, None).await {
+		match sync_file_variants(app, tn_id, id_tag, &attachment, None, true).await {
 			Ok(result) => {
 				info!(
 					"  attachment {} sync complete: {} synced, {} skipped, {} failed",

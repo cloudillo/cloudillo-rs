@@ -276,7 +276,18 @@ async fn generate_action_token(
 		visibility: action.visibility,
 	};
 
-	let action_token = app.auth_adapter.create_action_token(tn_id, action_for_token).await?;
+	// Try to create action token, if it fails due to missing key, create one and retry
+	let action_token =
+		match app.auth_adapter.create_action_token(tn_id, action_for_token.clone()).await {
+			Ok(token) => token,
+			Err(Error::DbError) => {
+				// Key might be missing - create one and retry
+				info!("No signing key found for tenant {}, creating one automatically", tn_id.0);
+				app.auth_adapter.create_profile_key(tn_id, None).await?;
+				app.auth_adapter.create_action_token(tn_id, action_for_token).await?
+			}
+			Err(e) => return Err(e),
+		};
 	let action_id = hasher::hash("a", action_token.as_bytes());
 
 	Ok((action_id, action_token))

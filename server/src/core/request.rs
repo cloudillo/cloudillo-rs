@@ -29,6 +29,15 @@ struct TokenRes {
 	token: Box<str>,
 }
 
+/// Result of a conditional GET request
+#[derive(Debug)]
+pub enum ConditionalResult<T> {
+	/// 200 OK - new data with new etag
+	Modified { data: T, etag: Option<Box<str>> },
+	/// 304 Not Modified - etag unchanged
+	NotModified,
+}
+
 #[derive(Debug, Clone)]
 pub struct Request {
 	pub auth_adapter: Arc<dyn AuthAdapter>,
@@ -185,6 +194,51 @@ impl Request {
 				let bytes = res.into_body().collect().await?.to_bytes();
 				let parsed: Res = serde_json::from_slice(&bytes)?;
 				Ok(parsed)
+			}
+			StatusCode::NOT_FOUND => Err(Error::NotFound),
+			StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
+			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
+		}
+	}
+
+	/// Make a conditional GET request with If-None-Match header for etag support
+	///
+	/// Returns `ConditionalResult::NotModified` if server returns 304,
+	/// or `ConditionalResult::Modified` with data and new etag if content changed.
+	pub async fn get_conditional<Res>(
+		&self,
+		id_tag: &str,
+		path: &str,
+		etag: Option<&str>,
+	) -> ClResult<ConditionalResult<Res>>
+	where
+		Res: DeserializeOwned,
+	{
+		let mut builder = hyper::Request::builder()
+			.method(Method::GET)
+			.uri(format!("https://cl-o.{}/api{}", id_tag, path));
+
+		// Add If-None-Match header if we have an etag
+		if let Some(etag) = etag {
+			builder = builder.header("If-None-Match", etag);
+		}
+
+		let req = builder.body(to_boxed(Empty::new()))?;
+		let res = self.client.request(req).await?;
+
+		match res.status() {
+			StatusCode::NOT_MODIFIED => Ok(ConditionalResult::NotModified),
+			StatusCode::OK => {
+				// Extract ETag from response headers
+				let new_etag = res
+					.headers()
+					.get("etag")
+					.and_then(|v| v.to_str().ok())
+					.map(|s| s.trim_matches('"').into());
+
+				let bytes = res.into_body().collect().await?.to_bytes();
+				let parsed: Res = serde_json::from_slice(&bytes)?;
+				Ok(ConditionalResult::Modified { data: parsed, etag: new_etag })
 			}
 			StatusCode::NOT_FOUND => Err(Error::NotFound),
 			StatusCode::FORBIDDEN => Err(Error::PermissionDenied),

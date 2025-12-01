@@ -11,6 +11,7 @@ use crate::prelude::*;
 
 pub fn init(app: &App) -> ClResult<()> {
 	app.scheduler.register::<media::TenantImageUpdaterTask>()?;
+	app.scheduler.register::<sync::ProfileRefreshBatchTask>()?;
 	Ok(())
 }
 

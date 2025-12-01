@@ -60,6 +60,7 @@ fn verify_content_hash(data: &[u8], expected_id: &str) -> ClResult<()> {
 /// * `remote_id_tag` - Remote instance id_tag to fetch from
 /// * `file_id` - The file ID to sync
 /// * `variants` - Optional list of specific variants to sync (None = all up to max setting)
+/// * `auth` - Whether to use authenticated requests (true for direct-visibility files, false for public)
 ///
 /// # Returns
 /// Ok(SyncResult) with details of what was synced
@@ -69,6 +70,7 @@ pub async fn sync_file_variants(
 	remote_id_tag: &str,
 	file_id: &str,
 	variants: Option<&[&str]>,
+	auth: bool,
 ) -> ClResult<SyncResult> {
 	let mut result = SyncResult { file_id: file_id.to_string(), ..Default::default() };
 
@@ -76,8 +78,11 @@ pub async fn sync_file_variants(
 
 	// 1. Fetch file descriptor from remote
 	let descriptor_path = format!("/file/{}/descriptor", file_id);
-	let descriptor_response: ApiResponse<String> =
-		app.request.get_noauth(tn_id, remote_id_tag, &descriptor_path).await?;
+	let descriptor_response: ApiResponse<String> = if auth {
+		app.request.get(tn_id, remote_id_tag, &descriptor_path).await?
+	} else {
+		app.request.get_noauth(tn_id, remote_id_tag, &descriptor_path).await?
+	};
 	let descriptor = &descriptor_response.data;
 
 	debug!("  fetched descriptor: {}", descriptor);
@@ -124,37 +129,54 @@ pub async fn sync_file_variants(
 		return Ok(result);
 	}
 
-	// 6. Create file entry in MetaAdapter (if doesn't exist)
-	// Use first variant as orig_variant_id
-	let first_variant = &variants_to_sync[0];
-	let create_opts = CreateFile {
-		orig_variant_id: Some(first_variant.variant_id.into()),
-		file_id: Some(file_id.into()),
-		owner_tag: Some(remote_id_tag.into()),
-		preset: Some("sync".into()),
-		content_type: format_to_content_type(first_variant.format).into(),
-		file_name: format!("synced.{}", format_to_extension(first_variant.format)).into(),
-		file_tp: None,
-		created_at: Some(Timestamp::now()),
-		tags: None,
-		x: None,
-		visibility: Some('P'), // Public for synced files
-		status: None,
+	// 6. Check if file already exists by file_id and get its f_id
+	let existing_f_id = app.meta_adapter.read_f_id_by_file_id(tn_id, file_id).await.ok();
+
+	// Also get existing variant records to know which ones need to be created
+	let existing_variants: Vec<String> = if existing_f_id.is_some() {
+		app.meta_adapter
+			.list_file_variants(tn_id, crate::meta_adapter::FileId::FileId(file_id))
+			.await
+			.map(|v| v.iter().map(|fv| fv.variant.to_string()).collect())
+			.unwrap_or_default()
+	} else {
+		vec![]
 	};
 
-	// f_id is Some if we created a new file entry, None if file already exists
-	// We only create variant metadata for new files
-	let f_id: Option<u64> = match app.meta_adapter.create_file(tn_id, create_opts).await {
-		Ok(FileId::FId(f_id)) => Some(f_id),
-		Ok(FileId::FileId(_)) => {
-			// File already exists - that's fine, we'll still sync blobs
-			// but skip variant metadata creation (it should already exist)
-			debug!("File {} already exists, syncing missing blobs only", file_id);
-			None
-		}
-		Err(e) => {
-			warn!("Failed to create file entry for {}: {}", file_id, e);
-			return Err(e);
+	let (f_id, is_new_file): (Option<u64>, bool) = if let Some(f_id) = existing_f_id {
+		// File already exists - use its f_id to add missing variants
+		debug!("File {} already exists (f_id={}), syncing missing variants", file_id, f_id);
+		(Some(f_id), false)
+	} else {
+		// Create file entry with file_id and status='P' (pending)
+		// Variants can be added to pending files, then finalize sets status='A'
+		let first_variant = &variants_to_sync[0];
+		let create_opts = CreateFile {
+			orig_variant_id: Some(first_variant.variant_id.into()),
+			file_id: Some(file_id.into()), // Set file_id (enables deduplication)
+			owner_tag: None,               // Owned by tenant, not remote user
+			preset: Some("sync".into()),
+			content_type: format_to_content_type(first_variant.format).into(),
+			file_name: format!("synced.{}", format_to_extension(first_variant.format)).into(),
+			file_tp: None,
+			created_at: Some(Timestamp::now()),
+			tags: None,
+			x: None,
+			visibility: Some('D'), // Direct visibility for synced files
+			status: None,          // Default to 'P' (pending)
+		};
+
+		match app.meta_adapter.create_file(tn_id, create_opts).await {
+			Ok(FileId::FId(f_id)) => (Some(f_id), true),
+			Ok(FileId::FileId(_)) => {
+				// Matched by orig_variant_id - shouldn't happen often but handle it
+				debug!("File {} matched existing by orig_variant_id", file_id);
+				(None, false)
+			}
+			Err(e) => {
+				warn!("Failed to create file entry for {}: {}", file_id, e);
+				return Err(e);
+			}
 		}
 	};
 
@@ -163,46 +185,61 @@ pub async fn sync_file_variants(
 		let variant_id = variant.variant_id;
 		let variant_name = variant.variant;
 
+		// Check if this variant record already exists in the database
+		let variant_record_exists = existing_variants.iter().any(|v| v == variant_name);
+
 		// Check if blob already exists
-		if app.blob_adapter.stat_blob(tn_id, variant_id).await.is_some() {
-			debug!("  variant {} already exists, skipping", variant_name);
+		let blob_exists = app.blob_adapter.stat_blob(tn_id, variant_id).await.is_some();
+		let blob_size: u64;
+
+		if blob_exists && variant_record_exists {
+			// Both blob and variant record exist - nothing to do
+			debug!("  variant {} already complete, skipping", variant_name);
 			result.skipped_variants.push(variant_name.to_string());
 			continue;
 		}
 
-		// Fetch variant data from remote
-		let variant_path = format!("/file/variant/{}", variant_id);
-		let bytes = match app.request.get_bin(tn_id, remote_id_tag, &variant_path, false).await {
-			Ok(bytes) => bytes,
-			Err(e) => {
-				warn!("  failed to fetch variant {}: {}", variant_name, e);
+		if blob_exists {
+			// Blob exists but variant record doesn't - need to create metadata
+			blob_size = app.blob_adapter.stat_blob(tn_id, variant_id).await.unwrap_or(0);
+			debug!("  variant {} blob exists, creating metadata", variant_name);
+		} else {
+			// Fetch variant data from remote
+			let variant_path = format!("/file/variant/{}", variant_id);
+			let bytes = match app.request.get_bin(tn_id, remote_id_tag, &variant_path, auth).await {
+				Ok(bytes) => bytes,
+				Err(e) => {
+					warn!("  failed to fetch variant {}: {}", variant_name, e);
+					result.failed_variants.push(variant_name.to_string());
+					continue;
+				}
+			};
+
+			if bytes.is_empty() {
+				warn!("  variant {} returned empty data", variant_name);
 				result.failed_variants.push(variant_name.to_string());
 				continue;
 			}
-		};
 
-		if bytes.is_empty() {
-			warn!("  variant {} returned empty data", variant_name);
-			result.failed_variants.push(variant_name.to_string());
-			continue;
-		}
+			// Verify blob hash matches variant_id
+			if let Err(e) = verify_content_hash(&bytes, variant_id) {
+				error!("  variant {} hash mismatch: {}", variant_name, e);
+				result.failed_variants.push(variant_name.to_string());
+				continue;
+			}
 
-		// Verify blob hash matches variant_id
-		if let Err(e) = verify_content_hash(&bytes, variant_id) {
-			error!("  variant {} hash mismatch: {}", variant_name, e);
-			result.failed_variants.push(variant_name.to_string());
-			continue;
-		}
+			blob_size = bytes.len() as u64;
 
-		// Store blob
-		if let Err(e) = app
-			.blob_adapter
-			.create_blob_buf(tn_id, variant_id, &bytes, &CreateBlobOptions::default())
-			.await
-		{
-			warn!("  failed to store blob for variant {}: {}", variant_name, e);
-			result.failed_variants.push(variant_name.to_string());
-			continue;
+			// Store blob
+			if let Err(e) = app
+				.blob_adapter
+				.create_blob_buf(tn_id, variant_id, &bytes, &CreateBlobOptions::default())
+				.await
+			{
+				warn!("  failed to store blob for variant {}: {}", variant_name, e);
+				result.failed_variants.push(variant_name.to_string());
+				continue;
+			}
 		}
 
 		// Create file variant record in MetaAdapter (only if we created a new file entry)
@@ -212,7 +249,7 @@ pub async fn sync_file_variants(
 				variant: variant_name,
 				format: variant.format,
 				resolution: variant.resolution,
-				size: bytes.len() as u64,
+				size: blob_size,
 				available: true,
 			};
 
@@ -222,8 +259,23 @@ pub async fn sync_file_variants(
 			}
 		}
 
-		info!("  synced variant {} ({})", variant_name, variant_id);
-		result.synced_variants.push(variant_name.to_string());
+		if blob_exists {
+			debug!("  variant {} metadata created (blob already existed)", variant_name);
+			result.skipped_variants.push(variant_name.to_string());
+		} else {
+			info!("  synced variant {} ({})", variant_name, variant_id);
+			result.synced_variants.push(variant_name.to_string());
+		}
+	}
+
+	// 8. Finalize the file by setting file_id (only if we created a new file entry)
+	if is_new_file {
+		if let Some(f_id) = f_id {
+			if let Err(e) = app.meta_adapter.finalize_file(tn_id, f_id, file_id).await {
+				warn!("Failed to finalize file {}: {}", file_id, e);
+				// Variants are synced, just finalization failed
+			}
+		}
 	}
 
 	info!(

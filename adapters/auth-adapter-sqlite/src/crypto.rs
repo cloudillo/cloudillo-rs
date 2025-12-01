@@ -92,13 +92,15 @@ fn generate_key_sync() -> ClResult<KeyPair> {
 		.to_pkcs8_pem(LineEnding::LF)
 		.map_err(|_| Error::PermissionDenied)?
 		.lines()
-		.map(|s| if s.starts_with(char::is_alphanumeric) { s.trim() } else { "" })
+		.filter(|s| !s.starts_with('-'))
+		.map(|s| s.trim())
 		.collect();
 	let public_key: Box<str> = public
 		.to_public_key_pem(LineEnding::LF)
 		.map_err(|_| Error::PermissionDenied)?
 		.lines()
-		.map(|s| if s.starts_with(char::is_alphanumeric) { s.trim() } else { "" })
+		.filter(|s| !s.starts_with('-'))
+		.map(|s| s.trim())
 		.collect();
 
 	Ok(KeyPair { private_key, public_key })

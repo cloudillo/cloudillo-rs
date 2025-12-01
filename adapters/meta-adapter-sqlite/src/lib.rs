@@ -161,6 +161,14 @@ impl MetaAdapter for MetaAdapterSqlite {
 		profile::process_refresh(&self.dbr, callback).await
 	}
 
+	async fn list_stale_profiles(
+		&self,
+		max_age_secs: i64,
+		limit: u32,
+	) -> ClResult<Vec<(TnId, Box<str>, Option<Box<str>>)>> {
+		profile::list_stale_profiles(&self.dbr, max_age_secs, limit).await
+	}
+
 	// Action management
 	//*******************
 	async fn list_actions(
@@ -288,6 +296,14 @@ impl MetaAdapter for MetaAdapterSqlite {
 		variant_id: &str,
 	) -> ClResult<FileVariant<Box<str>>> {
 		file::read_variant(&self.dbr, tn_id, variant_id).await
+	}
+
+	async fn read_file_id_by_variant(&self, tn_id: TnId, variant_id: &str) -> ClResult<Box<str>> {
+		file::read_file_id_by_variant(&self.dbr, tn_id, variant_id).await
+	}
+
+	async fn read_f_id_by_file_id(&self, tn_id: TnId, file_id: &str) -> ClResult<u64> {
+		file::read_f_id_by_file_id(&self.dbr, tn_id, file_id).await
 	}
 
 	async fn create_file(&self, tn_id: TnId, opts: CreateFile) -> ClResult<FileId<Box<str>>> {

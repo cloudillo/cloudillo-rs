@@ -274,6 +274,31 @@ pub async fn bootstrap(
 			info!("ACME not configured (no ACME_EMAIL), skipping certificate check");
 		}
 	}
+
+	// Schedule profile refresh batch task
+	// This runs every 5 minutes for debugging, change to "0 * * * *" (hourly) for production
+	{
+		let app_clone = app.clone();
+		tokio::spawn(async move {
+			let refresh_task = Arc::new(crate::profile::sync::ProfileRefreshBatchTask);
+			match app_clone
+				.scheduler
+				.task(refresh_task)
+				.key("profile.refresh_batch")
+				.cron("*/5 * * * *") // Every 5 minutes for debugging
+				.schedule()
+				.await
+			{
+				Ok(task_id) => {
+					info!("Profile refresh batch task scheduled (task_id={})", task_id);
+				}
+				Err(e) => {
+					error!(error = %e, "Failed to schedule profile refresh batch task");
+				}
+			}
+		});
+	}
+
 	Ok(())
 }
 // vim: ts=4

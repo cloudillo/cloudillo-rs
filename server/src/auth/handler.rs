@@ -64,26 +64,22 @@ pub async fn return_login(
 	app: &App,
 	auth: auth_adapter::AuthLogin,
 ) -> ClResult<(StatusCode, Json<Login>)> {
-	// Fetch profile data for name and profile_pic
-	let profile_data = app
-		.meta_adapter
-		.get_profile_info(auth.tn_id, &auth.id_tag)
-		.await
-		.unwrap_or_else(|_| crate::meta_adapter::ProfileData {
-			id_tag: auth.id_tag.clone(),
-			name: auth.id_tag.clone(),
-			profile_type: "person".into(),
-			profile_pic: None,
-			created_at: 0,
-		});
+	// Fetch tenant data for name and profile_pic
+	// Use read_tenant since the user is logging into their own tenant
+	let tenant = app.meta_adapter.read_tenant(auth.tn_id).await.ok();
+
+	let (name, profile_pic) = match tenant {
+		Some(t) => (t.name.to_string(), t.profile_pic.map(|p| p.to_string())),
+		None => (auth.id_tag.to_string(), None),
+	};
 
 	let login = Login {
 		tn_id: auth.tn_id,
 		id_tag: auth.id_tag.to_string(),
 		roles: auth.roles.map(|roles| roles.iter().map(|r| r.to_string()).collect()),
 		token: auth.token.to_string(),
-		name: profile_data.name.to_string(),
-		profile_pic: profile_data.profile_pic.map(|p| p.to_string()).unwrap_or_default(),
+		name,
+		profile_pic: profile_pic.unwrap_or_default(),
 		settings: vec![],
 	};
 

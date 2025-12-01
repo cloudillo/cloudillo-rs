@@ -260,6 +260,9 @@ pub(crate) async fn update(
 		v.as_ref().map(|s| s.as_ref())
 	});
 
+	// Sync metadata
+	has_updates = push_patch!(query, has_updates, "etag", &profile.etag, |v| v.as_ref());
+
 	if !has_updates {
 		// No fields to update, but not an error
 		return Ok(());
@@ -355,6 +358,38 @@ pub(crate) async fn process_refresh<'a>(
 			}
 		}
 	}
+}
+
+/// List stale profiles that need refreshing
+///
+/// Returns profiles where `synced_at IS NULL OR synced_at < now - max_age_secs`.
+pub(crate) async fn list_stale_profiles(
+	db: &SqlitePool,
+	max_age_secs: i64,
+	limit: u32,
+) -> ClResult<Vec<(TnId, Box<str>, Option<Box<str>>)>> {
+	let rows = sqlx::query(
+		"SELECT tn_id, id_tag, etag FROM profiles
+		WHERE synced_at IS NULL OR synced_at < unixepoch() - ?1
+		LIMIT ?2",
+	)
+	.bind(max_age_secs)
+	.bind(limit)
+	.fetch_all(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+
+	let mut results = Vec::with_capacity(rows.len());
+	for row in rows {
+		let tn_id_val: i64 = row.try_get("tn_id").map_err(|_| Error::DbError)?;
+		let id_tag: Box<str> = row.try_get("id_tag").map_err(|_| Error::DbError)?;
+		let etag: Option<Box<str>> = row.try_get("etag").map_err(|_| Error::DbError)?;
+
+		results.push((TnId(tn_id_val as u32), id_tag, etag));
+	}
+
+	Ok(results)
 }
 
 /// Get profile info
