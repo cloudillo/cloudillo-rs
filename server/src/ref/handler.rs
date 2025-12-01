@@ -63,6 +63,8 @@ pub struct CreateRefRequest {
 	pub description: Option<String>,
 	/// Optional expiration timestamp
 	pub expires_at: Option<i64>,
+	/// Number of times this ref can be used (default: 1)
+	pub count: Option<u32>,
 }
 
 /// Query parameters for listing refs
@@ -143,7 +145,7 @@ pub async fn create_ref(
 		typ: create_req.r#type.clone(),
 		description: create_req.description.clone(),
 		expires_at: create_req.expires_at.map(Timestamp),
-		count: None,
+		count: Some(create_req.count.unwrap_or(1)),
 	};
 
 	let ref_data = app.meta_adapter.create_ref(tn_id, &ref_id, &opts).await.map_err(|e| {
