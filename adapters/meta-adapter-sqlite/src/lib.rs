@@ -16,6 +16,7 @@ use sqlx::{
 	sqlite::{self, SqlitePool},
 	Row,
 };
+use tokio::fs;
 
 use cloudillo::{core::worker::WorkerPool, meta_adapter::*, prelude::*};
 
@@ -30,6 +31,7 @@ pub struct MetaAdapterSqlite {
 impl MetaAdapterSqlite {
 	pub async fn new(worker: Arc<WorkerPool>, path: impl AsRef<Path>) -> ClResult<Self> {
 		let db_path = path.as_ref().join("meta.db");
+		fs::create_dir_all(&path).await.expect("Cannot create meta-adapter dir");
 		let opts = sqlite::SqliteConnectOptions::new()
 			.filename(&db_path)
 			.create_if_missing(true)

@@ -3,6 +3,7 @@ use std::{fmt::Debug, path::Path, sync::Arc};
 use async_trait::async_trait;
 use jsonwebtoken::DecodingKey;
 use sqlx::sqlite::{self, SqlitePool};
+use tokio::fs;
 
 use cloudillo::{auth_adapter::*, core::worker::WorkerPool, prelude::*};
 
@@ -34,6 +35,7 @@ impl Debug for AuthAdapterSqlite {
 impl AuthAdapterSqlite {
 	pub async fn new(worker: Arc<WorkerPool>, path: impl AsRef<Path>) -> ClResult<Self> {
 		let db_path = path.as_ref().join("auth.db");
+		fs::create_dir_all(&path).await.expect("Cannot create auth-adapter dir");
 		let opts = sqlite::SqliteConnectOptions::new()
 			.filename(&db_path)
 			.create_if_missing(true)
