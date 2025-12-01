@@ -89,8 +89,6 @@ pub async fn require_auth(
 	mut req: Request<Body>,
 	next: Next,
 ) -> ClResult<Response<Body>> {
-	use tracing::warn;
-
 	// Extract IdTag from request extensions (inserted by webserver)
 	let id_tag = req
 		.extensions()
@@ -139,8 +137,6 @@ pub async fn optional_auth(
 	mut req: Request<Body>,
 	next: Next,
 ) -> ClResult<Response<Body>> {
-	use tracing::warn;
-
 	// Try to extract IdTag (optional for this middleware)
 	let id_tag = req.extensions().get::<IdTag>().cloned();
 
@@ -149,10 +145,12 @@ pub async fn optional_auth(
 		req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok())
 	{
 		auth_header.strip_prefix("Bearer ").map(|token| token.trim().to_string())
-	} else {
-		// Fallback: try to get token from query parameter (for WebSocket)
+	} else if req.uri().path().starts_with("/ws/") {
+		// Fallback: try to get token from query parameter (only for WebSocket endpoints)
 		let query = req.uri().query().unwrap_or("");
 		extract_token_from_query(query)
+	} else {
+		None
 	};
 
 	// Only validate if both id_tag and token are present

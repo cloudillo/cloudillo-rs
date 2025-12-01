@@ -25,8 +25,13 @@ where
 }
 
 #[derive(Deserialize)]
-struct TokenRes {
+struct TokenData {
 	token: Box<str>,
+}
+
+#[derive(Deserialize)]
+struct TokenRes {
+	data: TokenData,
 }
 
 /// Result of a conditional GET request
@@ -94,7 +99,7 @@ impl Request {
 		let parsed: TokenRes =
 			serde_json::from_slice(&res.into_body().collect().await?.to_bytes())?;
 
-		Ok(parsed.token)
+		Ok(parsed.data.token)
 	}
 
 	pub async fn get_bin(

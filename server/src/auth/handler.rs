@@ -235,7 +235,7 @@ pub async fn get_access_token(
 	tn_id: TnId,
 	id_tag: IdTag,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	Auth(auth): Auth,
+	OptionalAuth(maybe_auth): OptionalAuth,
 	Query(query): Query<GetAccessTokenQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
@@ -292,7 +292,9 @@ pub async fn get_access_token(
 			.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else {
-		// Use authenticated session token
+		// Use authenticated session token - requires auth
+		let auth = maybe_auth.ok_or(Error::PermissionDenied)?;
+
 		info!(
 			"Using authenticated session for id_tag={}, scope={:?}",
 			auth.id_tag,
