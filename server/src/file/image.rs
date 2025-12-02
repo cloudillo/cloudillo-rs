@@ -247,6 +247,9 @@ impl Task<App> for ImageResizerTask {
 					resolution: actual_dimensions,
 					size: resize_result.bytes.len() as u64,
 					available: true,
+					duration: None,
+					bitrate: None,
+					page_count: None,
 				},
 			)
 			.await?;

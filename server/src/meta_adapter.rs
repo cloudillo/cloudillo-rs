@@ -262,11 +262,14 @@ pub struct Action<S: AsRef<str>> {
 	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
 }
 
+#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachmentView {
 	#[serde(rename = "fileId")]
 	pub file_id: Box<str>,
 	pub dim: Option<(u32, u32)>,
+	#[serde(rename = "localVariants")]
+	pub local_variants: Option<Vec<Box<str>>>,
 }
 
 #[skip_serializing_none]
@@ -360,7 +363,7 @@ pub struct FileView {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FileVariant<S: AsRef<str> + Debug> {
 	#[serde(rename = "variantId")]
 	pub variant_id: S,
@@ -369,7 +372,30 @@ pub struct FileVariant<S: AsRef<str> + Debug> {
 	pub size: u64,
 	pub resolution: (u32, u32),
 	pub available: bool,
+	/// Duration in seconds (for video/audio)
+	pub duration: Option<f64>,
+	/// Bitrate in kbps (for video/audio)
+	pub bitrate: Option<u32>,
+	/// Page count (for documents like PDF)
+	#[serde(rename = "pageCount")]
+	pub page_count: Option<u32>,
 }
+
+impl<S: AsRef<str> + Debug> PartialEq for FileVariant<S> {
+	fn eq(&self, other: &Self) -> bool {
+		self.variant_id.as_ref() == other.variant_id.as_ref()
+			&& self.variant.as_ref() == other.variant.as_ref()
+			&& self.format.as_ref() == other.format.as_ref()
+			&& self.size == other.size
+			&& self.resolution == other.resolution
+			&& self.available == other.available
+			&& self.duration == other.duration
+			&& self.bitrate == other.bitrate
+			&& self.page_count == other.page_count
+	}
+}
+
+impl<S: AsRef<str> + Debug> Eq for FileVariant<S> {}
 
 impl<S: AsRef<str> + Debug + Ord> PartialOrd for FileVariant<S> {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -688,6 +714,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		file_id: FileId<&str>,
 	) -> ClResult<Vec<FileVariant<Box<str>>>>;
+	/// List locally available variant names for a file (only those marked available)
+	async fn list_available_variants(&self, tn_id: TnId, file_id: &str) -> ClResult<Vec<Box<str>>>;
 	async fn read_file_variant(
 		&self,
 		tn_id: TnId,

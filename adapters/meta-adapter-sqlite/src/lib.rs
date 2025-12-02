@@ -290,6 +290,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::list_variants(&self.dbr, tn_id, file_id).await
 	}
 
+	async fn list_available_variants(&self, tn_id: TnId, file_id: &str) -> ClResult<Vec<Box<str>>> {
+		file::list_available_variants(&self.dbr, tn_id, file_id).await
+	}
+
 	async fn read_file_variant(
 		&self,
 		tn_id: TnId,

@@ -147,21 +147,40 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-	sqlx::query("CREATE TABLE IF NOT EXISTS file_variants (
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS file_variants (
 		tn_id integer NOT NULL,
 		f_id integer NOT NULL,
 		variant_id text,
-		variant text,				-- 'orig' - original, 'hd' - high density, 'sd' - small density, 'tn' - thumbnail, 'ic' - icon
+		variant text,				-- 'vis.sd' - visual small density, 'vid.hd' - video high density, etc.
 		res_x integer,
 		res_y integer,
 		format text,
 		size integer,
 		available boolean,
 		global boolean,				-- true: stored in global cache
+		duration real,				-- duration in seconds (for video/audio)
+		bitrate integer,			-- bitrate in kbps (for video/audio)
+		page_count integer,			-- page count (for documents)
 		PRIMARY KEY(f_id, variant_id, tn_id)
-	)").execute(&mut *tx).await?;
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
 	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_file_variants_fileid ON file_variants(f_id, variant, tn_id)")
 		.execute(&mut *tx).await?;
+
+	// Migration: Add new columns if they don't exist (for existing databases)
+	// SQLite doesn't have IF NOT EXISTS for ALTER TABLE, so we ignore errors
+	let _ = sqlx::query("ALTER TABLE file_variants ADD COLUMN duration real")
+		.execute(&mut *tx)
+		.await;
+	let _ = sqlx::query("ALTER TABLE file_variants ADD COLUMN bitrate integer")
+		.execute(&mut *tx)
+		.await;
+	let _ = sqlx::query("ALTER TABLE file_variants ADD COLUMN page_count integer")
+		.execute(&mut *tx)
+		.await;
 
 	// Refs
 	//******

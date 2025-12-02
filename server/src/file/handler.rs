@@ -7,14 +7,25 @@ use axum::{
 use futures_core::Stream;
 use serde::Deserialize;
 use serde_json::json;
-use std::{fmt::Debug, pin::Pin};
+use std::{fmt::Debug, path::PathBuf, pin::Pin};
+use tokio::io::AsyncWriteExt;
 
 use crate::blob_adapter;
 use crate::core::{
 	extract::{Auth, IdTag, OptionalAuth, OptionalRequestId},
 	hasher, utils,
 };
-use crate::file::{descriptor, filter, image, store};
+use crate::file::{
+	audio::AudioExtractorTask,
+	descriptor::{self, FileIdGeneratorTask},
+	ffmpeg, filter, image,
+	image::ImageResizerTask,
+	pdf::PdfProcessorTask,
+	preset::{self, get_audio_tier, get_image_tier, get_video_tier, presets},
+	store,
+	variant::VariantClass,
+	video::VideoTranscoderTask,
+};
 use crate::meta_adapter;
 use crate::prelude::*;
 use crate::types::{self, ApiResponse, Timestamp};
@@ -23,12 +34,45 @@ use crate::types::{self, ApiResponse, Timestamp};
 //*******************//
 pub fn format_from_content_type(content_type: &str) -> Option<&str> {
 	Some(match content_type {
+		// Image
 		"image/jpeg" => "jpeg",
 		"image/png" => "png",
 		"image/webp" => "webp",
 		"image/avif" => "avif",
+		"image/gif" => "gif",
+		// Video
+		"video/mp4" | "video/quicktime" => "mp4",
+		"video/webm" => "webm",
+		"video/x-matroska" => "mkv",
+		"video/x-msvideo" => "avi",
+		// Audio
+		"audio/mpeg" => "mp3",
+		"audio/wav" => "wav",
+		"audio/ogg" => "ogg",
+		"audio/flac" => "flac",
+		"audio/aac" => "aac",
+		"audio/webm" => "weba",
+		// Document
+		"application/pdf" => "pdf",
 		_ => None?,
 	})
+}
+
+/// Stream request body directly to a temp file (for large uploads)
+async fn stream_body_to_file(body: Body, path: &PathBuf) -> ClResult<u64> {
+	let mut file = tokio::fs::File::create(path).await?;
+	let mut body_stream = body.into_data_stream();
+	let mut total_size: u64 = 0;
+
+	use futures::StreamExt;
+	while let Some(chunk) = body_stream.next().await {
+		let chunk = chunk.map_err(|e| Error::Internal(format!("body read error: {}", e)))?;
+		total_size += chunk.len() as u64;
+		file.write_all(&chunk).await?;
+	}
+	file.flush().await?;
+
+	Ok(total_size)
 }
 
 pub fn content_type_from_format(format: &str) -> &str {
@@ -180,6 +224,7 @@ async fn handle_post_image(
 	f_id: u64,
 	_content_type: &str,
 	bytes: &[u8],
+	preset: &preset::FilePreset,
 ) -> ClResult<serde_json::Value> {
 	// Read format settings
 	let thumbnail_format_str = app
@@ -212,11 +257,14 @@ async fn handle_post_image(
 			f_id,
 			meta_adapter::FileVariant {
 				variant_id: file_id_orig.as_ref(),
-				variant: "orig",
+				variant: "vis.orig",
 				format: image_format.as_ref(),
 				resolution: orig_dim,
 				size: bytes.len() as u64,
 				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
 			},
 		)
 		.await?;
@@ -224,9 +272,9 @@ async fn handle_post_image(
 	let orig_file = app.opts.tmp_dir.join::<&str>(&file_id_orig);
 	tokio::fs::write(&orig_file, &bytes).await?;
 
-	// Generate thumbnail
+	// Generate thumbnail synchronously (vis.tn)
 	let resized_tn =
-		image::resize_image(app.clone(), bytes.into(), thumbnail_format, (128, 128)).await?;
+		image::resize_image(app.clone(), bytes.into(), thumbnail_format, (256, 256)).await?;
 	debug!("resized {:?}", resized_tn.bytes.len());
 	let variant_id_tn = store::create_blob_buf(
 		app,
@@ -241,85 +289,66 @@ async fn handle_post_image(
 			f_id,
 			meta_adapter::FileVariant {
 				variant_id: variant_id_tn.as_ref(),
-				variant: "tn",
+				variant: "vis.tn",
 				format: thumbnail_format.as_ref(),
 				resolution: (resized_tn.width, resized_tn.height),
 				size: resized_tn.bytes.len() as u64,
 				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
 			},
 		)
 		.await?;
-
-	// Get maximum variant size to generate
-	let max_generate_variant = app
-		.settings
-		.get_string(tn_id, "file.max_generate_variant")
-		.await
-		.unwrap_or_else(|_| "hd".to_string()); // Default to hd if setting not found
-
-	// Map variant name to index to limit generation
-	let max_variant_index = match max_generate_variant.as_str() {
-		"tn" => 0,
-		"sd" => 0, // sd is index 0 in variant_configs
-		"md" => 1,
-		"hd" => 2,
-		"xd" => 3,
-		_ => 2, // Default to hd (index 2) for unknown values
-	};
 
 	// Smart variant creation: skip creating variants if image is too small or too close in size
 	const SKIP_THRESHOLD: f32 = 0.10; // Skip variant if it's less than 10% larger than previous
 	let original_max = orig_dim.0.max(orig_dim.1) as f32;
 	info!("Image dimensions: {}x{}, max: {}", orig_dim.0, orig_dim.1, original_max);
-	info!("Max variant to generate: {}", max_generate_variant);
-
-	// Variant configurations: (name, bounding_box_size)
-	let variant_configs = [("sd", 720_u32), ("md", 1280_u32), ("hd", 1920_u32), ("xd", 3840_u32)];
 
 	let mut variant_task_ids = Vec::new();
-	let mut last_created_size = 128_f32; // Start after tn (128px)
+	let mut last_created_size = 256_f32; // Start after tn (256px)
 
-	for (idx, (variant_name, variant_bbox)) in variant_configs.iter().enumerate() {
-		if idx > max_variant_index {
-			info!(
-				"Skipping variant {} - exceeds max_generate_variant setting ({})",
-				variant_name, max_generate_variant
-			);
-			break;
+	// Create visual variants from preset's image_variants
+	for variant_name in &preset.image_variants {
+		if variant_name == "vis.tn" {
+			continue; // Already created thumbnail synchronously
 		}
-		let variant_bbox_f = *variant_bbox as f32;
+		if let Some(tier) = get_image_tier(variant_name) {
+			let variant_bbox_f = tier.max_dim as f32;
 
-		// Determine actual size: cap at original to avoid upscaling
-		let actual_size = variant_bbox_f.min(original_max);
+			// Determine actual size: cap at original to avoid upscaling
+			let actual_size = variant_bbox_f.min(original_max);
 
-		// Check if size is significantly different from last created variant
-		let min_required_increase = last_created_size * (1.0 + SKIP_THRESHOLD);
-		if actual_size > min_required_increase {
-			// This variant provides meaningful size increase - create it
-			info!(
-				"Creating variant {} with bounding box {}x{} (capped from {})",
-				variant_name, actual_size as u32, actual_size as u32, variant_bbox
-			);
+			// Check if size is significantly different from last created variant
+			let min_required_increase = last_created_size * (1.0 + SKIP_THRESHOLD);
+			if actual_size > min_required_increase {
+				// This variant provides meaningful size increase - create it
+				info!(
+					"Creating variant {} with bounding box {}x{} (capped from {})",
+					variant_name, actual_size as u32, actual_size as u32, tier.max_dim
+				);
 
-			let task = image::ImageResizerTask::new(
-				tn_id,
-				f_id,
-				orig_file.clone(),
-				*variant_name,
-				image_format,
-				(actual_size as u32, actual_size as u32),
-			);
-			let task_id = app.scheduler.add(task).await?;
-			variant_task_ids.push(task_id);
-			last_created_size = actual_size;
-		} else {
-			info!(
-				"Skipping variant {} - would be {}, only {:.0}% larger than last ({})",
-				variant_name,
-				actual_size as u32,
-				(actual_size / last_created_size - 1.0) * 100.0,
-				last_created_size as u32
-			);
+				let task = image::ImageResizerTask::new(
+					tn_id,
+					f_id,
+					orig_file.clone(),
+					variant_name.clone(),
+					image_format,
+					(actual_size as u32, actual_size as u32),
+				);
+				let task_id = app.scheduler.add(task).await?;
+				variant_task_ids.push(task_id);
+				last_created_size = actual_size;
+			} else {
+				info!(
+					"Skipping variant {} - would be {}, only {:.0}% larger than last ({})",
+					variant_name,
+					actual_size as u32,
+					(actual_size / last_created_size - 1.0) * 100.0,
+					last_created_size as u32
+				);
+			}
 		}
 	}
 
@@ -334,6 +363,368 @@ async fn handle_post_image(
 	builder.schedule().await?;
 
 	Ok(json!({"fileId": format!("@{}", f_id), "thumbnailVariantId": variant_id_tn }))
+}
+
+/// Handle video upload - streams body to temp file, probes, creates transcode tasks
+async fn handle_post_video_stream(
+	app: &App,
+	tn_id: types::TnId,
+	f_id: u64,
+	content_type: &str,
+	body: Body,
+	preset: &preset::FilePreset,
+) -> ClResult<serde_json::Value> {
+	// 1. Stream body directly to temp file (no memory buffering!)
+	let temp_path = app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
+	let total_size = stream_body_to_file(body, &temp_path).await?;
+	info!("Video upload streamed to {:?}, size: {} bytes", temp_path, total_size);
+
+	// 2. Probe with FFmpeg to get duration/resolution
+	let media_info = ffmpeg::FFmpeg::probe(&temp_path)
+		.map_err(|e| Error::Internal(format!("ffprobe failed: {}", e)))?;
+	let duration = media_info.duration;
+	let resolution = media_info.video_resolution().unwrap_or((0, 0));
+	info!("Video info: duration={:.2}s, resolution={}x{}", duration, resolution.0, resolution.1);
+
+	// 3. Optionally store original variant (based on setting)
+	if app.settings.get_bool(tn_id, "file.store_original_vid").await.unwrap_or(false) {
+		let orig_blob_id = store::create_blob_from_file(
+			app,
+			tn_id,
+			&temp_path,
+			blob_adapter::CreateBlobOptions::default(),
+		)
+		.await?;
+		app.meta_adapter
+			.create_file_variant(
+				tn_id,
+				f_id,
+				meta_adapter::FileVariant {
+					variant_id: &orig_blob_id,
+					variant: "vid.orig",
+					format: format_from_content_type(content_type).unwrap_or("mp4"),
+					resolution,
+					size: total_size,
+					available: true,
+					duration: Some(duration),
+					bitrate: None,
+					page_count: None,
+				},
+			)
+			.await?;
+	}
+
+	// 4. Extract thumbnail synchronously (like images)
+	let frame_path = app.opts.tmp_dir.join(format!("frame_{}.jpg", f_id));
+
+	// Calculate smart seek time (10% of duration, min 3s for long videos)
+	let seek_time = if duration > 10.0 {
+		(duration * 0.1).max(3.0).min(duration - 1.0)
+	} else if duration > 1.0 {
+		duration / 2.0
+	} else {
+		0.0
+	};
+
+	// Extract frame using FFmpeg
+	ffmpeg::FFmpeg::extract_frame(&temp_path, &frame_path, seek_time)
+		.map_err(|e| Error::Internal(format!("thumbnail extraction failed: {}", e)))?;
+
+	// Read frame and resize to thumbnail (keep frame file for other vis.* variants)
+	let frame_bytes = tokio::fs::read(&frame_path).await?;
+
+	let thumbnail_result =
+		image::resize_image(app.clone(), frame_bytes, image::ImageFormat::Webp, (256, 256))
+			.await
+			.map_err(|e| Error::Internal(format!("thumbnail resize failed: {}", e)))?;
+
+	// Store thumbnail blob
+	let thumbnail_variant_id = store::create_blob_buf(
+		app,
+		tn_id,
+		&thumbnail_result.bytes,
+		blob_adapter::CreateBlobOptions::default(),
+	)
+	.await?;
+
+	// Create thumbnail variant record
+	app.meta_adapter
+		.create_file_variant(
+			tn_id,
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: &thumbnail_variant_id,
+				variant: "vis.tn",
+				format: "webp",
+				resolution: (thumbnail_result.width, thumbnail_result.height),
+				size: thumbnail_result.bytes.len() as u64,
+				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+		)
+		.await?;
+
+	info!(
+		"Video thumbnail extracted: {}x{} ({} bytes)",
+		thumbnail_result.width,
+		thumbnail_result.height,
+		thumbnail_result.bytes.len()
+	);
+
+	// 5. Create tasks based on preset (async)
+	let mut task_ids = Vec::new();
+
+	// 5a. Create visual variants from extracted frame (sized frames approach)
+	for variant_name in &preset.image_variants {
+		if variant_name == "vis.tn" {
+			continue; // Already created thumbnail synchronously
+		}
+		if let Some(tier) = get_image_tier(variant_name) {
+			let task = ImageResizerTask::new(
+				tn_id,
+				f_id,
+				frame_path.clone(),
+				variant_name.clone(),
+				image::ImageFormat::Webp,
+				(tier.max_dim, tier.max_dim),
+			);
+			task_ids.push(app.scheduler.add(task).await?);
+		}
+	}
+
+	// 5b. Create video transcode tasks
+	for variant_name in &preset.video_variants {
+		if let Some(tier) = get_video_tier(variant_name) {
+			let task = VideoTranscoderTask::new(
+				tn_id,
+				f_id,
+				temp_path.clone(),
+				variant_name.as_str(),
+				tier.max_dim,
+				tier.bitrate,
+			);
+			task_ids.push(app.scheduler.add(task).await?);
+		}
+	}
+
+	// 6. Optionally extract audio
+	if preset.extract_audio {
+		for variant_name in &preset.audio_variants {
+			if let Some(tier) = get_audio_tier(variant_name) {
+				let task = AudioExtractorTask::new(
+					tn_id,
+					f_id,
+					temp_path.clone(),
+					variant_name.as_str(),
+					tier.bitrate,
+				);
+				task_ids.push(app.scheduler.add(task).await?);
+			}
+		}
+	}
+
+	// 7. Create FileIdGeneratorTask depending on transcode tasks
+	let mut builder = app
+		.scheduler
+		.task(FileIdGeneratorTask::new(tn_id, f_id))
+		.key(format!("{},{}", tn_id, f_id));
+	if !task_ids.is_empty() {
+		builder = builder.depend_on(task_ids);
+	}
+	builder.schedule().await?;
+
+	Ok(json!({
+		"fileId": format!("@{}", f_id),
+		"duration": duration,
+		"resolution": [resolution.0, resolution.1],
+		"thumbnailVariantId": thumbnail_variant_id
+	}))
+}
+
+/// Handle audio upload - streams body to temp file, probes, creates transcode tasks
+async fn handle_post_audio_stream(
+	app: &App,
+	tn_id: types::TnId,
+	f_id: u64,
+	content_type: &str,
+	body: Body,
+	preset: &preset::FilePreset,
+) -> ClResult<serde_json::Value> {
+	// 1. Stream body to temp file
+	let temp_path = app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
+	let total_size = stream_body_to_file(body, &temp_path).await?;
+	info!("Audio upload streamed to {:?}, size: {} bytes", temp_path, total_size);
+
+	// 2. Probe for duration
+	let media_info = ffmpeg::FFmpeg::probe(&temp_path)
+		.map_err(|e| Error::Internal(format!("ffprobe failed: {}", e)))?;
+	let duration = media_info.duration;
+	info!("Audio info: duration={:.2}s", duration);
+
+	// 3. Optionally store aud.orig
+	if app.settings.get_bool(tn_id, "file.store_original_aud").await.unwrap_or(false) {
+		let orig_blob_id = store::create_blob_from_file(
+			app,
+			tn_id,
+			&temp_path,
+			blob_adapter::CreateBlobOptions::default(),
+		)
+		.await?;
+		app.meta_adapter
+			.create_file_variant(
+				tn_id,
+				f_id,
+				meta_adapter::FileVariant {
+					variant_id: &orig_blob_id,
+					variant: "aud.orig",
+					format: format_from_content_type(content_type).unwrap_or("mp3"),
+					resolution: (0, 0),
+					size: total_size,
+					available: true,
+					duration: Some(duration),
+					bitrate: None,
+					page_count: None,
+				},
+			)
+			.await?;
+	}
+
+	// 4. Create AudioExtractorTask for each variant
+	let mut task_ids = Vec::new();
+	for variant_name in &preset.audio_variants {
+		if let Some(tier) = get_audio_tier(variant_name) {
+			let task = AudioExtractorTask::new(
+				tn_id,
+				f_id,
+				temp_path.clone(),
+				variant_name.as_str(),
+				tier.bitrate,
+			);
+			task_ids.push(app.scheduler.add(task).await?);
+		}
+	}
+
+	// 5. Create FileIdGeneratorTask
+	let mut builder = app
+		.scheduler
+		.task(FileIdGeneratorTask::new(tn_id, f_id))
+		.key(format!("{},{}", tn_id, f_id));
+	if !task_ids.is_empty() {
+		builder = builder.depend_on(task_ids);
+	}
+	builder.schedule().await?;
+
+	Ok(json!({
+		"fileId": format!("@{}", f_id),
+		"duration": duration
+	}))
+}
+
+/// Handle PDF upload - in-memory processing (PDFs are typically smaller)
+async fn handle_post_pdf(
+	app: &App,
+	tn_id: types::TnId,
+	f_id: u64,
+	bytes: &[u8],
+) -> ClResult<serde_json::Value> {
+	// 1. Store original blob as doc.orig (PDFs always need original)
+	let orig_blob_id =
+		store::create_blob_buf(app, tn_id, bytes, blob_adapter::CreateBlobOptions::default())
+			.await?;
+
+	app.meta_adapter
+		.create_file_variant(
+			tn_id,
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: &orig_blob_id,
+				variant: "doc.orig",
+				format: "pdf",
+				resolution: (0, 0),
+				size: bytes.len() as u64,
+				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None, // Will be updated by PdfProcessorTask
+			},
+		)
+		.await?;
+
+	// 2. Write to temp file for processing
+	let temp_path = app.opts.tmp_dir.join(format!("pdf_{}_{}", tn_id.0, f_id));
+	tokio::fs::write(&temp_path, bytes).await?;
+
+	// 3. Create PdfProcessorTask (extracts page count + thumbnail)
+	let pdf_task = PdfProcessorTask::new(tn_id, f_id, temp_path.clone(), 256);
+	let task_id = app.scheduler.add(pdf_task).await?;
+
+	// 4. Create FileIdGeneratorTask
+	app.scheduler
+		.task(FileIdGeneratorTask::new(tn_id, f_id))
+		.key(format!("{},{}", tn_id, f_id))
+		.depend_on(vec![task_id])
+		.schedule()
+		.await?;
+
+	Ok(json!({"fileId": format!("@{}", f_id)}))
+}
+
+/// Handle raw file upload - streams body to temp file, stores as-is
+async fn handle_post_raw_stream(
+	app: &App,
+	tn_id: types::TnId,
+	f_id: u64,
+	content_type: &str,
+	body: Body,
+) -> ClResult<serde_json::Value> {
+	// 1. Stream body to temp file
+	let temp_path = app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
+	let total_size = stream_body_to_file(body, &temp_path).await?;
+	info!("Raw upload streamed to {:?}, size: {} bytes", temp_path, total_size);
+
+	// 2. Store original blob as raw.orig
+	let orig_blob_id = store::create_blob_from_file(
+		app,
+		tn_id,
+		&temp_path,
+		blob_adapter::CreateBlobOptions::default(),
+	)
+	.await?;
+
+	// Determine format from content-type or use generic extension
+	let format = format_from_content_type(content_type).unwrap_or("bin");
+
+	app.meta_adapter
+		.create_file_variant(
+			tn_id,
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: &orig_blob_id,
+				variant: "raw.orig",
+				format,
+				resolution: (0, 0),
+				size: total_size,
+				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+		)
+		.await?;
+
+	// 3. Clean up temp file
+	let _ = tokio::fs::remove_file(&temp_path).await;
+
+	// 4. Create FileIdGeneratorTask (no variants, just the original)
+	app.scheduler
+		.task(FileIdGeneratorTask::new(tn_id, f_id))
+		.key(format!("{},{}", tn_id, f_id))
+		.schedule()
+		.await?;
+
+	Ok(json!({"fileId": format!("@{}", f_id)}))
 }
 
 /// POST /api/file - File creation for non-blob types (CRDT, RTDB, etc.)
@@ -394,7 +785,7 @@ pub async fn post_file_blob(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	extract::Path((preset, file_name)): extract::Path<(String, String)>,
+	extract::Path((preset_name, file_name)): extract::Path<(String, String)>,
 	query: Query<PostFileQuery>,
 	header: axum::http::HeaderMap,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -404,7 +795,28 @@ pub async fn post_file_blob(
 		.get(axum::http::header::CONTENT_TYPE)
 		.and_then(|v| v.to_str().ok())
 		.unwrap_or("application/octet-stream");
-	//info!("content_type: {} {:?}", content_type, header.get(axum::http::header::CONTENT_TYPE));
+	info!("post_file_blob: preset={}, content_type={}", preset_name, content_type);
+
+	// 1. Get preset (or default)
+	let preset = presets::get(&preset_name).unwrap_or_else(presets::default);
+
+	// 2. Map content-type to media class
+	let media_class = VariantClass::from_content_type(content_type);
+
+	// 3. Validate against preset's allowed classes
+	let media_class = match media_class {
+		Some(class) if preset.allowed_media_classes.contains(&class) => class,
+		Some(class) => {
+			return Err(Error::ValidationError(format!(
+				"preset '{}' does not allow {:?} uploads",
+				preset.name, class
+			)))
+		}
+		None if preset.allowed_media_classes.contains(&VariantClass::Raw) => VariantClass::Raw,
+		None => return Err(Error::ValidationError("unsupported media type".into())),
+	};
+
+	info!("Media class: {:?}", media_class);
 
 	// Get max file size from settings (in MiB, using binary units)
 	const BYTES_PER_MIB: usize = 1_048_576; // 1024 * 1024
@@ -419,19 +831,21 @@ pub async fn post_file_blob(
 
 	let max_size_bytes = (max_size_mib as usize) * BYTES_PER_MIB;
 
-	match content_type {
-		"image/jpeg" | "image/png" | "image/webp" | "image/avif" => {
+	// 4. Route to handler - some need bytes (in-memory), some need streaming Body
+	match media_class {
+		// In-memory processing (small files)
+		VariantClass::Visual => {
 			let bytes = to_bytes(body, max_size_bytes).await?;
 			let orig_variant_id = hasher::hash("b", &bytes);
 			let dim = image::get_image_dimensions(&bytes).await?;
-			info!("dimensions: {}/{}", dim.0, dim.1);
-			// Don't set file_id here - it will be computed by FileIdGeneratorTask after variants are created
+			info!("Image dimensions: {}/{}", dim.0, dim.1);
+
 			let f_id = app
 				.meta_adapter
 				.create_file(
 					tn_id,
 					meta_adapter::CreateFile {
-						preset: Some(preset.into()),
+						preset: Some(preset_name.clone().into()),
 						orig_variant_id: Some(orig_variant_id),
 						file_id: None,
 						owner_tag: Some(auth.id_tag.clone()),
@@ -446,9 +860,11 @@ pub async fn post_file_blob(
 					},
 				)
 				.await?;
+
 			match f_id {
 				meta_adapter::FileId::FId(f_id) => {
-					let data = handle_post_image(&app, tn_id, f_id, content_type, &bytes).await?;
+					let data =
+						handle_post_image(&app, tn_id, f_id, content_type, &bytes, &preset).await?;
 					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 					Ok((StatusCode::CREATED, Json(response)))
 				}
@@ -459,7 +875,159 @@ pub async fn post_file_blob(
 				}
 			}
 		}
-		_ => Err(Error::ValidationError("unsupported image format".into())),
+
+		VariantClass::Document => {
+			let bytes = to_bytes(body, max_size_bytes).await?;
+			let orig_variant_id = hasher::hash("b", &bytes);
+
+			let f_id = app
+				.meta_adapter
+				.create_file(
+					tn_id,
+					meta_adapter::CreateFile {
+						preset: Some(preset_name.clone().into()),
+						orig_variant_id: Some(orig_variant_id),
+						file_id: None,
+						owner_tag: Some(auth.id_tag.clone()),
+						content_type: content_type.into(),
+						file_name: file_name.into(),
+						file_tp: Some("BLOB".into()),
+						created_at: query.created_at,
+						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+						x: None,
+						visibility: query.visibility,
+						status: None,
+					},
+				)
+				.await?;
+
+			match f_id {
+				meta_adapter::FileId::FId(f_id) => {
+					let data = handle_post_pdf(&app, tn_id, f_id, &bytes).await?;
+					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+					Ok((StatusCode::CREATED, Json(response)))
+				}
+				meta_adapter::FileId::FileId(file_id) => {
+					let data = json!({"fileId": file_id});
+					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+					Ok((StatusCode::CREATED, Json(response)))
+				}
+			}
+		}
+
+		// Streaming to disk (large files) - create file metadata first, then stream
+		VariantClass::Video => {
+			let f_id = app
+				.meta_adapter
+				.create_file(
+					tn_id,
+					meta_adapter::CreateFile {
+						preset: Some(preset_name.clone().into()),
+						orig_variant_id: None,
+						file_id: None,
+						owner_tag: Some(auth.id_tag.clone()),
+						content_type: content_type.into(),
+						file_name: file_name.into(),
+						file_tp: Some("BLOB".into()),
+						created_at: query.created_at,
+						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+						x: None,
+						visibility: query.visibility,
+						status: None,
+					},
+				)
+				.await?;
+
+			match f_id {
+				meta_adapter::FileId::FId(f_id) => {
+					let data =
+						handle_post_video_stream(&app, tn_id, f_id, content_type, body, &preset)
+							.await?;
+					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+					Ok((StatusCode::CREATED, Json(response)))
+				}
+				meta_adapter::FileId::FileId(file_id) => {
+					let data = json!({"fileId": file_id});
+					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+					Ok((StatusCode::CREATED, Json(response)))
+				}
+			}
+		}
+
+		VariantClass::Audio => {
+			let f_id = app
+				.meta_adapter
+				.create_file(
+					tn_id,
+					meta_adapter::CreateFile {
+						preset: Some(preset_name.clone().into()),
+						orig_variant_id: None,
+						file_id: None,
+						owner_tag: Some(auth.id_tag.clone()),
+						content_type: content_type.into(),
+						file_name: file_name.into(),
+						file_tp: Some("BLOB".into()),
+						created_at: query.created_at,
+						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+						x: None,
+						visibility: query.visibility,
+						status: None,
+					},
+				)
+				.await?;
+
+			match f_id {
+				meta_adapter::FileId::FId(f_id) => {
+					let data =
+						handle_post_audio_stream(&app, tn_id, f_id, content_type, body, &preset)
+							.await?;
+					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+					Ok((StatusCode::CREATED, Json(response)))
+				}
+				meta_adapter::FileId::FileId(file_id) => {
+					let data = json!({"fileId": file_id});
+					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+					Ok((StatusCode::CREATED, Json(response)))
+				}
+			}
+		}
+
+		VariantClass::Raw => {
+			let f_id = app
+				.meta_adapter
+				.create_file(
+					tn_id,
+					meta_adapter::CreateFile {
+						preset: Some(preset_name.clone().into()),
+						orig_variant_id: None,
+						file_id: None,
+						owner_tag: Some(auth.id_tag.clone()),
+						content_type: content_type.into(),
+						file_name: file_name.into(),
+						file_tp: Some("BLOB".into()),
+						created_at: query.created_at,
+						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+						x: None,
+						visibility: query.visibility,
+						status: None,
+					},
+				)
+				.await?;
+
+			match f_id {
+				meta_adapter::FileId::FId(f_id) => {
+					let data =
+						handle_post_raw_stream(&app, tn_id, f_id, content_type, body).await?;
+					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+					Ok((StatusCode::CREATED, Json(response)))
+				}
+				meta_adapter::FileId::FileId(file_id) => {
+					let data = json!({"fileId": file_id});
+					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+					Ok((StatusCode::CREATED, Json(response)))
+				}
+			}
+		}
 	}
 }
 

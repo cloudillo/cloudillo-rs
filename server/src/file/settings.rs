@@ -37,6 +37,34 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?
 	)?;
 
+	// Per-class sync settings for action attachments
+	registry.register(
+		SettingDefinition::builder("file.sync_max_vis")
+			.description("Maximum visual variant to sync: tn, sd, md, hd, xd")
+			.default(SettingValue::String("md".into()))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("file.sync_max_vid")
+			.description("Maximum video variant to sync: tn, sd, md, hd, xd")
+			.default(SettingValue::String("sd".into()))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("file.sync_max_aud")
+			.description("Maximum audio variant to sync: sd, md, hd")
+			.default(SettingValue::String("md".into()))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
 	// Image format for thumbnails
 	registry.register(
 		SettingDefinition::builder("file.thumbnail_format")

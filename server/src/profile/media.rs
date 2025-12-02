@@ -181,6 +181,9 @@ pub async fn put_profile_image(
 				resolution: dim,
 				size: image_data.len() as u64,
 				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
 			},
 		)
 		.await?;
@@ -207,6 +210,9 @@ pub async fn put_profile_image(
 				resolution: (resized.width, resized.height),
 				size: resized.bytes.len() as u64,
 				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
 			},
 		)
 		.await?;
@@ -346,6 +352,9 @@ pub async fn put_cover_image(
 				resolution: dim,
 				size: image_data.len() as u64,
 				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
 			},
 		)
 		.await?;
@@ -376,6 +385,9 @@ pub async fn put_cover_image(
 				resolution: (resized_tn.width, resized_tn.height),
 				size: resized_tn.bytes.len() as u64,
 				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
 			},
 		)
 		.await?;

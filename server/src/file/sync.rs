@@ -3,8 +3,11 @@
 //! Provides unified file sync functionality for both action attachments
 //! and profile picture synchronization.
 
+use std::collections::HashMap;
+
 use crate::blob_adapter::CreateBlobOptions;
 use crate::core::hasher;
+use crate::file::variant::{Variant, VariantClass};
 use crate::meta_adapter::{CreateFile, FileId, FileVariant};
 use crate::prelude::*;
 use crate::types::ApiResponse;
@@ -26,6 +29,46 @@ fn should_sync_variant(variant: &str, max_variant: &str) -> bool {
 	let max_idx = VARIANT_ORDER.iter().position(|&v| v == max_variant).unwrap_or(usize::MAX);
 	let var_idx = VARIANT_ORDER.iter().position(|&v| v == variant).unwrap_or(usize::MAX);
 	var_idx <= max_idx
+}
+
+/// Get the sync setting key for a variant class (returns None for doc/raw - always sync)
+pub fn get_sync_setting_key(class: VariantClass) -> Option<&'static str> {
+	match class {
+		VariantClass::Visual => Some("file.sync_max_vis"),
+		VariantClass::Video => Some("file.sync_max_vid"),
+		VariantClass::Audio => Some("file.sync_max_aud"),
+		VariantClass::Document | VariantClass::Raw => None, // Always sync
+	}
+}
+
+/// Get the default sync max for a variant class
+pub fn get_default_sync_max(class: VariantClass) -> &'static str {
+	match class {
+		VariantClass::Visual => "md",
+		VariantClass::Video => "sd",
+		VariantClass::Audio => "md",
+		VariantClass::Document | VariantClass::Raw => "orig", // Always sync all
+	}
+}
+
+/// Determine sync source based on action context
+///
+/// If audienceTag is set and we're not the audience, sync from audience.
+/// Otherwise sync from issuer.
+pub fn get_sync_source<'a>(
+	tenant_tag: &str,
+	audience_tag: Option<&'a str>,
+	issuer_tag: &'a str,
+) -> &'a str {
+	match audience_tag {
+		Some(aud) if aud != tenant_tag => aud,
+		_ => issuer_tag,
+	}
+}
+
+/// Check if we are the audience (must sync ALL variants)
+pub fn is_audience(tenant_tag: &str, audience_tag: Option<&str>) -> bool {
+	audience_tag.map(|aud| aud == tenant_tag).unwrap_or(false)
 }
 
 /// Verify that content hash matches expected ID
@@ -101,28 +144,56 @@ pub async fn sync_file_variants(
 		return Ok(result);
 	}
 
-	// 4. Determine max variant from settings (default: "md")
-	let max_variant = app
-		.settings
-		.get_string_opt(tn_id, "file.max_cache_variant")
-		.await
-		.ok()
-		.flatten()
-		.unwrap_or_else(|| "md".to_string());
+	// 4. Filter variants to sync using per-class settings
+	let variants_to_sync: Vec<_> = if let Some(explicit_variants) = variants {
+		// Explicit variant list provided - only sync those
+		parsed_variants
+			.iter()
+			.filter(|v| explicit_variants.contains(&v.variant))
+			.collect()
+	} else {
+		// Use per-class sync settings
+		let mut class_max_variants: HashMap<VariantClass, String> = HashMap::new();
 
-	// 5. Filter variants to sync
-	let variants_to_sync: Vec<_> = parsed_variants
-		.iter()
-		.filter(|v| {
-			if let Some(explicit_variants) = variants {
-				// Explicit variant list provided - only sync those
-				explicit_variants.contains(&v.variant)
-			} else {
-				// Use max_cache_variant setting
-				should_sync_variant(v.variant, &max_variant)
+		// Build map of class -> max_variant from settings
+		for variant in &parsed_variants {
+			let class =
+				Variant::parse(variant.variant).map(|v| v.class).unwrap_or(VariantClass::Visual);
+
+			if let std::collections::hash_map::Entry::Vacant(e) = class_max_variants.entry(class) {
+				if let Some(setting_key) = get_sync_setting_key(class) {
+					let max_variant = app
+						.settings
+						.get_string_opt(tn_id, setting_key)
+						.await
+						.ok()
+						.flatten()
+						.unwrap_or_else(|| get_default_sync_max(class).to_string());
+					e.insert(max_variant);
+				}
+				// For doc/raw, no entry = sync all
 			}
-		})
-		.collect();
+		}
+
+		// Filter variants using per-class max settings
+		parsed_variants
+			.iter()
+			.filter(|v| {
+				let class =
+					Variant::parse(v.variant).map(|vp| vp.class).unwrap_or(VariantClass::Visual);
+
+				// Doc/Raw always sync (no setting key)
+				let Some(max_variant) = class_max_variants.get(&class).map(|s| s.as_str()) else {
+					return true; // No limit = sync all
+				};
+
+				let quality =
+					Variant::parse(v.variant).map(|vp| vp.quality.as_str()).unwrap_or(v.variant);
+
+				should_sync_variant(quality, max_variant)
+			})
+			.collect()
+	};
 
 	if variants_to_sync.is_empty() {
 		debug!("No variants to sync for {} after filtering", file_id);
@@ -251,6 +322,9 @@ pub async fn sync_file_variants(
 				resolution: variant.resolution,
 				size: blob_size,
 				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
 			};
 
 			if let Err(e) = app.meta_adapter.create_file_variant(tn_id, f_id, file_variant).await {

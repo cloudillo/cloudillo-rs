@@ -141,7 +141,7 @@ pub(crate) async fn list(
 			info!("attachments: {:?}", attachments);
 			let mut attachments = parse_str_list(attachments)
 				.iter()
-				.map(|a| AttachmentView { file_id: a.clone(), dim: None })
+				.map(|a| AttachmentView { file_id: a.clone(), dim: None, local_variants: None })
 				.collect::<Vec<_>>();
 			info!("attachments: {:?}", attachments);
 			for a in attachments.iter_mut() {
@@ -167,9 +167,29 @@ pub(crate) async fn list(
 				};
 
 				if let Ok(file_res) = query_result.inspect_err(inspect) {
-					a.dim = serde_json::from_str(
-						file_res.try_get("dim").inspect_err(inspect).map_err(|_| Error::DbError)?,
-					)?;
+					if let Ok(Some(dim_str)) = file_res.try_get::<Option<&str>, _>("dim") {
+						if !dim_str.is_empty() {
+							a.dim = serde_json::from_str(dim_str)?;
+						}
+					}
+				}
+
+				// Query local variants
+				let variants = if let Some(f_id_str) = a.file_id.strip_prefix('@') {
+					// Query by f_id for placeholder IDs
+					if let Ok(f_id) = f_id_str.parse::<i64>() {
+						crate::file::list_available_variants_by_fid(db, tn_id, f_id).await.ok()
+					} else {
+						None
+					}
+				} else {
+					// Query by file_id for real IDs
+					crate::file::list_available_variants(db, tn_id, &a.file_id).await.ok()
+				};
+				if let Some(variants) = variants {
+					if !variants.is_empty() {
+						a.local_variants = Some(variants);
+					}
 				}
 				info!("attachment: {:?}", a);
 			}
@@ -853,7 +873,7 @@ pub(crate) async fn get(
 	let attachments = if let Some(attachments) = &attachments {
 		let mut attachments = parse_str_list(attachments)
 			.iter()
-			.map(|a| AttachmentView { file_id: a.clone(), dim: None })
+			.map(|a| AttachmentView { file_id: a.clone(), dim: None, local_variants: None })
 			.collect::<Vec<_>>();
 		for a in attachments.iter_mut() {
 			// Query file dimensions
@@ -876,9 +896,29 @@ pub(crate) async fn get(
 			};
 
 			if let Ok(file_res) = query_result.inspect_err(inspect) {
-				a.dim = serde_json::from_str(
-					file_res.try_get("dim").inspect_err(inspect).map_err(|_| Error::DbError)?,
-				)?;
+				if let Ok(Some(dim_str)) = file_res.try_get::<Option<&str>, _>("dim") {
+					if !dim_str.is_empty() {
+						a.dim = serde_json::from_str(dim_str)?;
+					}
+				}
+			}
+
+			// Query local variants
+			let variants = if let Some(f_id_str) = a.file_id.strip_prefix('@') {
+				// Query by f_id for placeholder IDs
+				if let Ok(f_id) = f_id_str.parse::<i64>() {
+					crate::file::list_available_variants_by_fid(db, tn_id, f_id).await.ok()
+				} else {
+					None
+				}
+			} else {
+				// Query by file_id for real IDs
+				crate::file::list_available_variants(db, tn_id, &a.file_id).await.ok()
+			};
+			if let Some(variants) = variants {
+				if !variants.is_empty() {
+					a.local_variants = Some(variants);
+				}
 			}
 		}
 		Some(attachments)

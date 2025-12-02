@@ -134,7 +134,7 @@ pub(crate) async fn list_variants(
 ) -> ClResult<Vec<FileVariant<Box<str>>>> {
 	let res = match file_id {
 		FileId::FId(f_id) => sqlx::query(
-			"SELECT variant_id, variant, res_x, res_y, format, size, available
+			"SELECT variant_id, variant, res_x, res_y, format, size, available, duration, bitrate, page_count
 			FROM file_variants WHERE tn_id=? AND f_id=?",
 		)
 		.bind(tn_id.0)
@@ -149,7 +149,7 @@ pub(crate) async fn list_variants(
 					.parse::<i64>()
 					.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 				sqlx::query(
-					"SELECT variant_id, variant, res_x, res_y, format, size, available
+					"SELECT variant_id, variant, res_x, res_y, format, size, available, duration, bitrate, page_count
 					FROM file_variants WHERE tn_id=? AND f_id=?",
 				)
 				.bind(tn_id.0)
@@ -159,7 +159,7 @@ pub(crate) async fn list_variants(
 				.inspect_err(inspect)
 				.map_err(|_| Error::DbError)?
 			} else {
-				sqlx::query("SELECT fv.variant_id, fv.variant, fv.res_x, fv.res_y, fv.format, fv.size, fv.available
+				sqlx::query("SELECT fv.variant_id, fv.variant, fv.res_x, fv.res_y, fv.format, fv.size, fv.available, fv.duration, fv.bitrate, fv.page_count
 					FROM files f
 					JOIN file_variants fv ON fv.tn_id=f.tn_id AND fv.f_id=f.f_id
 					WHERE f.tn_id=? AND f.file_id=?")
@@ -179,8 +179,54 @@ pub(crate) async fn list_variants(
 			format: row.try_get("format")?,
 			size: row.try_get("size")?,
 			available: row.try_get("available")?,
+			duration: row.try_get("duration").ok(),
+			bitrate: row.try_get("bitrate").ok(),
+			page_count: row.try_get("page_count").ok(),
 		})
 	}))
+}
+
+/// List available (locally present) variant names for a file by file_id
+pub(crate) async fn list_available_variants(
+	db: &SqlitePool,
+	tn_id: TnId,
+	file_id: &str,
+) -> ClResult<Vec<Box<str>>> {
+	let res = sqlx::query(
+		"SELECT fv.variant
+		 FROM files f
+		 JOIN file_variants fv ON fv.tn_id=f.tn_id AND fv.f_id=f.f_id
+		 WHERE f.tn_id=? AND f.file_id=? AND fv.available=1",
+	)
+	.bind(tn_id.0)
+	.bind(file_id)
+	.fetch_all(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+
+	collect_res(res.iter().map(|row| row.try_get("variant")))
+}
+
+/// List available (locally present) variant names for a file by f_id
+pub(crate) async fn list_available_variants_by_fid(
+	db: &SqlitePool,
+	tn_id: TnId,
+	f_id: i64,
+) -> ClResult<Vec<Box<str>>> {
+	let res = sqlx::query(
+		"SELECT fv.variant
+		 FROM file_variants fv
+		 WHERE fv.tn_id=? AND fv.f_id=? AND fv.available=1",
+	)
+	.bind(tn_id.0)
+	.bind(f_id)
+	.fetch_all(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+
+	collect_res(res.iter().map(|row| row.try_get("variant")))
 }
 
 /// Read a single file variant by ID
@@ -191,7 +237,7 @@ pub(crate) async fn read_variant(
 ) -> ClResult<FileVariant<Box<str>>> {
 	debug!("read_variant: tn_id={}, variant_id={}", tn_id.0, variant_id);
 	let res = sqlx::query(
-		"SELECT variant_id, variant, res_x, res_y, format, size, available
+		"SELECT variant_id, variant, res_x, res_y, format, size, available, duration, bitrate, page_count
 			FROM file_variants WHERE tn_id=? AND variant_id=?",
 	)
 	.bind(tn_id.0)
@@ -210,6 +256,9 @@ pub(crate) async fn read_variant(
 			format: row.try_get("format")?,
 			size: row.try_get("size")?,
 			available: row.try_get("available")?,
+			duration: row.try_get("duration").ok(),
+			bitrate: row.try_get("bitrate").ok(),
+			page_count: row.try_get("page_count").ok(),
 		})
 	})
 }
@@ -332,8 +381,8 @@ pub(crate) async fn create_variant<'a>(
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
-	let _res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-		.bind(tn_id.0).bind(f_id as i64).bind(opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64)
+	let _res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size, duration, bitrate, page_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		.bind(tn_id.0).bind(f_id as i64).bind(opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64).bind(opts.duration).bind(opts.bitrate.map(|b| b as i64)).bind(opts.page_count.map(|p| p as i64))
 		.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 	tx.commit().await.map_err(|_| Error::DbError)?;
 
