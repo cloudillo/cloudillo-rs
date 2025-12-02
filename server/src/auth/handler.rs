@@ -222,12 +222,16 @@ pub async fn post_password(
 /// Gets an access token for a subject.
 /// Can be called with either:
 /// 1. A token query parameter (action token to exchange)
-/// 2. Just subject parameter (uses authenticated session)
+/// 2. A refId query parameter (share link to exchange for scoped token)
+/// 3. Just subject parameter (uses authenticated session)
 #[derive(Deserialize)]
 pub struct GetAccessTokenQuery {
 	#[serde(default)]
 	token: Option<String>,
 	scope: Option<String>,
+	/// Share link ref_id to exchange for a scoped access token
+	#[serde(rename = "refId")]
+	ref_id: Option<String>,
 }
 
 pub async fn get_access_token(
@@ -290,6 +294,66 @@ pub async fn get_access_token(
 		info!("Got access token: {}", &token_result);
 		let response = ApiResponse::new(json!({ "token": token_result }))
 			.with_req_id(req_id.unwrap_or_default());
+		Ok((StatusCode::OK, Json(response)))
+	} else if let Some(ref_id) = query.ref_id {
+		// Exchange share link ref for scoped access token (no auth required)
+		info!("Exchanging ref_id {} for scoped access token", ref_id);
+
+		// Use the ref - validates type, expiration, counter, and decrements it
+		let (ref_tn_id, _ref_id_tag, ref_data) =
+			app.meta_adapter.use_ref(&ref_id, &["share.file"]).await.map_err(|e| {
+				warn!("Failed to use ref {}: {}", ref_id, e);
+				match e {
+					Error::NotFound => {
+						Error::ValidationError("Invalid or expired share link".into())
+					}
+					Error::ValidationError(_) => e,
+					_ => Error::ValidationError("Invalid share link".into()),
+				}
+			})?;
+
+		// Validate ref belongs to this tenant
+		if ref_tn_id != tn_id {
+			warn!(
+				"Ref tenant mismatch: ref belongs to {:?} but request is for {:?}",
+				ref_tn_id, tn_id
+			);
+			return Err(Error::PermissionDenied);
+		}
+
+		// Extract resource_id (file_id) and access_level
+		let file_id = ref_data
+			.resource_id
+			.ok_or_else(|| Error::ValidationError("Share link missing resource_id".into()))?;
+		let access_level = ref_data.access_level.unwrap_or('R');
+
+		// Create scoped access token
+		// scope format: "file:{file_id}:{R|W}"
+		let scope = format!("file:{}:{}", file_id, access_level);
+		info!("Creating scoped access token with scope={}", scope);
+
+		let token_result = app
+			.auth_adapter
+			.create_access_token(
+				tn_id,
+				&auth_adapter::AccessToken {
+					iss: &id_tag.0,
+					sub: None, // Anonymous/guest access
+					r: None,   // No roles for share link access
+					scope: Some(&scope),
+					exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
+				},
+			)
+			.await?;
+
+		info!("Got scoped access token for share link");
+		let response = ApiResponse::new(json!({
+			"token": token_result,
+			"scope": scope,
+			"resourceId": file_id.to_string(),
+			"accessLevel": if access_level == 'W' { "write" } else { "read" }
+		}))
+		.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else {
 		// Use authenticated session token - requires auth
@@ -380,8 +444,8 @@ pub async fn post_set_password(
 	}
 
 	// Use the ref - this validates type, expiration, counter, and decrements it
-	// Returns the tenant ID and id_tag that owns this ref
-	let (tn_id, id_tag) = app
+	// Returns the tenant ID, id_tag, and ref data that owns this ref
+	let (tn_id, id_tag, _ref_data) = app
 		.meta_adapter
 		.use_ref(&req.ref_id, &["welcome", "password"])
 		.await

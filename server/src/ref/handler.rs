@@ -14,6 +14,7 @@ use crate::prelude::*;
 use crate::types::{ApiResponse, Timestamp};
 
 /// Response structure for ref details (authenticated users get full data)
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefResponse {
 	#[serde(rename = "refId")]
@@ -24,7 +25,14 @@ pub struct RefResponse {
 	pub created_at: i64,
 	#[serde(rename = "expiresAt")]
 	pub expires_at: Option<i64>,
-	pub count: u32,
+	/// Usage count: None = unlimited, Some(n) = n uses remaining
+	pub count: Option<u32>,
+	/// Resource ID for share links (e.g., file_id for share.file type)
+	#[serde(rename = "resourceId")]
+	pub resource_id: Option<String>,
+	/// Access level for share links ("read" or "write")
+	#[serde(rename = "accessLevel")]
+	pub access_level: Option<String>,
 }
 
 /// Minimal response structure for unauthenticated requests (only refId and type)
@@ -44,6 +52,10 @@ impl From<RefData> for RefResponse {
 			created_at: ref_data.created_at.0,
 			expires_at: ref_data.expires_at.map(|ts| ts.0),
 			count: ref_data.count,
+			resource_id: ref_data.resource_id.map(|s| s.to_string()),
+			access_level: ref_data
+				.access_level
+				.map(|c| if c == 'W' { "write" } else { "read" }.to_string()),
 		}
 	}
 }
@@ -57,14 +69,20 @@ impl From<RefData> for RefResponseMinimal {
 /// Request structure for creating a new ref
 #[derive(Debug, Deserialize)]
 pub struct CreateRefRequest {
-	/// Type of reference (e.g., "email-verify", "password-reset", "invite", "share-link")
+	/// Type of reference (e.g., "email-verify", "password-reset", "invite", "share.file")
 	pub r#type: String,
 	/// Human-readable description
 	pub description: Option<String>,
 	/// Optional expiration timestamp
 	pub expires_at: Option<i64>,
-	/// Number of times this ref can be used (default: 1)
+	/// Number of times this ref can be used (omit for unlimited)
 	pub count: Option<u32>,
+	/// Resource ID for share links (e.g., file_id for share.file type)
+	#[serde(rename = "resourceId")]
+	pub resource_id: Option<String>,
+	/// Access level for share links ("read" or "write", default: "read")
+	#[serde(rename = "accessLevel")]
+	pub access_level: Option<String>,
 }
 
 /// Query parameters for listing refs
@@ -74,6 +92,9 @@ pub struct ListRefsQuery {
 	pub r#type: Option<String>,
 	/// Filter by status: 'active', 'used', 'expired', 'all' (default: 'active')
 	pub filter: Option<String>,
+	/// Filter by resource_id (for listing share links for a specific resource)
+	#[serde(rename = "resourceId")]
+	pub resource_id: Option<String>,
 }
 
 /// GET /api/refs - List refs for the current tenant
@@ -88,12 +109,14 @@ pub async fn list_refs(
 		tn_id = ?tn_id,
 		r#type = ?query_params.r#type,
 		filter = ?query_params.filter,
+		resource_id = ?query_params.resource_id,
 		"GET /api/refs - Listing refs"
 	);
 
 	let opts = ListRefsOptions {
 		typ: query_params.r#type,
 		filter: query_params.filter.or(Some("active".to_string())),
+		resource_id: query_params.resource_id,
 	};
 
 	let refs = app.meta_adapter.list_refs(tn_id, &opts).await?;
@@ -121,6 +144,8 @@ pub async fn create_ref(
 		tn_id = ?tn_id,
 		ref_type = %create_req.r#type,
 		description = ?create_req.description,
+		resource_id = ?create_req.resource_id,
+		access_level = ?create_req.access_level,
 		"POST /api/refs - Creating new ref"
 	);
 
@@ -139,13 +164,41 @@ pub async fn create_ref(
 		}
 	}
 
+	// Parse and validate access_level
+	let access_level_char = match create_req.access_level.as_deref() {
+		Some("write") | Some("W") => Some('W'),
+		Some("read") | Some("R") | None => {
+			// Default to read if resource_id is present
+			if create_req.resource_id.is_some() {
+				Some('R')
+			} else {
+				None
+			}
+		}
+		Some(other) => {
+			return Err(Error::ValidationError(format!(
+				"Invalid access_level '{}': must be 'read' or 'write'",
+				other
+			)));
+		}
+	};
+
+	// Validate share.file type requires resource_id
+	if create_req.r#type == "share.file" && create_req.resource_id.is_none() {
+		return Err(Error::ValidationError(
+			"resource_id is required for share.file type".to_string(),
+		));
+	}
+
 	let ref_id = utils::random_id()?;
 
 	let opts = CreateRefOptions {
 		typ: create_req.r#type.clone(),
 		description: create_req.description.clone(),
 		expires_at: create_req.expires_at.map(Timestamp),
-		count: Some(create_req.count.unwrap_or(1)),
+		count: create_req.count, // None = unlimited
+		resource_id: create_req.resource_id.clone(),
+		access_level: access_level_char,
 	};
 
 	let ref_data = app.meta_adapter.create_ref(tn_id, &ref_id, &opts).await.map_err(|e| {
@@ -188,7 +241,7 @@ pub async fn get_ref(
 	// Reconstruct RefData from tuple (we have ref_type, ref_description)
 	// Note: The return type is Option<(Box<str>, Box<str>)> which contains (type, description)
 	// We need to use list_refs to get the full RefData with timestamps and count
-	let opts = ListRefsOptions { typ: None, filter: Some("all".to_string()) };
+	let opts = ListRefsOptions { typ: None, filter: Some("all".to_string()), resource_id: None };
 
 	let refs = app.meta_adapter.list_refs(tn_id, &opts).await?;
 	let ref_data = refs
@@ -284,6 +337,8 @@ pub async fn create_ref_internal(
 		description: description.map(|s| s.to_string()),
 		expires_at,
 		count: Some(1), // Single use by default
+		resource_id: None,
+		access_level: None,
 	};
 
 	// Store the reference in database

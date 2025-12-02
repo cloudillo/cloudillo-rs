@@ -469,7 +469,11 @@ impl MetaAdapter for MetaAdapterSqlite {
 		reference::delete(&self.db, tn_id, ref_id).await
 	}
 
-	async fn use_ref(&self, ref_id: &str, expected_types: &[&str]) -> ClResult<(TnId, Box<str>)> {
+	async fn use_ref(
+		&self,
+		ref_id: &str,
+		expected_types: &[&str],
+	) -> ClResult<(TnId, Box<str>, RefData)> {
 		reference::use_ref(&self.db, ref_id, expected_types).await
 	}
 

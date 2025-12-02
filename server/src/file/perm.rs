@@ -68,8 +68,16 @@ async fn check_file_permission(
 		(guest_ctx, "guest".into())
 	};
 
-	// Load file attributes
-	let attrs = load_file_attrs(&app, tn_id, &file_id, &subject_id_tag, &tenant_id_tag).await?;
+	// Load file attributes (pass scope from auth context for scoped token access)
+	let attrs = load_file_attrs(
+		&app,
+		tn_id,
+		&file_id,
+		&subject_id_tag,
+		&tenant_id_tag,
+		auth_ctx.scope.as_deref(),
+	)
+	.await?;
 
 	// Check permission
 	let environment = Environment::new();
@@ -101,6 +109,7 @@ async fn load_file_attrs(
 	file_or_variant_id: &str,
 	subject_id_tag: &str,
 	tenant_id_tag: &str,
+	scope: Option<&str>,
 ) -> ClResult<FileAttrs> {
 	use crate::core::abac::VisibilityLevel;
 	use std::borrow::Cow;
@@ -133,9 +142,16 @@ async fn load_file_attrs(
 			tenant_id_tag.into()
 		});
 
-	// Determine access level by looking up FSHR action grants
-	let access_level =
-		file_access::get_access_level(app, tn_id, &file_id, subject_id_tag, &owner_id_tag).await;
+	// Determine access level by looking up scoped tokens, FSHR action grants
+	let access_level = file_access::get_access_level_with_scope(
+		app,
+		tn_id,
+		&file_id,
+		subject_id_tag,
+		&owner_id_tag,
+		scope,
+	)
+	.await;
 
 	// Get visibility from file metadata - convert char to string representation
 	let visibility: Box<str> = VisibilityLevel::from_char(file_view.visibility).as_str().into();

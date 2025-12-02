@@ -14,7 +14,7 @@ pub(crate) async fn list(
 	opts: &ListRefsOptions,
 ) -> ClResult<Vec<RefData>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT ref_id, type, description, created_at, expires_at, count FROM refs WHERE tn_id = ",
+		"SELECT ref_id, type, description, created_at, expires_at, count, resource_id, access_level FROM refs WHERE tn_id = ",
 	);
 	query.push_bind(tn_id.0);
 
@@ -23,16 +23,21 @@ pub(crate) async fn list(
 		query.push_bind(typ.as_str());
 	}
 
+	if let Some(ref resource_id) = opts.resource_id {
+		query.push(" AND resource_id = ");
+		query.push_bind(resource_id.as_str());
+	}
+
 	if let Some(ref filter) = opts.filter {
 		let now = Timestamp::now();
 		match filter.as_ref() {
 			"active" => {
 				query.push(" AND (expires_at IS NULL OR expires_at > ");
 				query.push_bind(now.0);
-				query.push(") AND count > 0");
+				query.push(") AND (count IS NULL OR count > 0)");
 			}
 			"used" => {
-				query.push(" AND count = 0");
+				query.push(" AND count IS NOT NULL AND count = 0");
 			}
 			"expired" => {
 				query.push(" AND expires_at IS NOT NULL AND expires_at <= ");
@@ -57,6 +62,7 @@ pub(crate) async fn list(
 			let created_at: i64 = row.get("created_at");
 			let expires_at: Option<i64> = row.get("expires_at");
 			let count: Option<i32> = row.get("count");
+			let access_level: Option<String> = row.get("access_level");
 
 			RefData {
 				ref_id: row.get("ref_id"),
@@ -64,7 +70,9 @@ pub(crate) async fn list(
 				description: row.get("description"),
 				created_at: Timestamp(created_at),
 				expires_at: expires_at.map(Timestamp),
-				count: count.unwrap_or(0) as u32,
+				count: count.map(|c| c as u32), // None = unlimited
+				resource_id: row.get("resource_id"),
+				access_level: access_level.and_then(|s| s.chars().next()),
 			}
 		})
 		.collect())
@@ -100,8 +108,11 @@ pub(crate) async fn create(
 ) -> ClResult<RefData> {
 	let now = Timestamp::now();
 
+	// Convert access_level char to string for storage
+	let access_level_str = opts.access_level.map(|c| c.to_string());
+
 	sqlx::query(
-		"INSERT INTO refs (tn_id, ref_id, type, description, created_at, expires_at, count) VALUES (?, ?, ?, ?, ?, ?, ?)"
+		"INSERT INTO refs (tn_id, ref_id, type, description, created_at, expires_at, count, resource_id, access_level) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
 	)
 		.bind(tn_id.0)
 		.bind(ref_id)
@@ -109,7 +120,9 @@ pub(crate) async fn create(
 		.bind(opts.description.as_deref())
 		.bind(now.0)
 		.bind(opts.expires_at.map(|t| t.0))
-		.bind(opts.count.unwrap_or(0) as i32)
+		.bind(opts.count.map(|c| c as i32)) // None = unlimited (NULL in DB)
+		.bind(opts.resource_id.as_deref())
+		.bind(access_level_str.as_deref())
 		.execute(db)
 		.await
 		.inspect_err(|err| warn!("DB: {:#?}", err))
@@ -121,7 +134,9 @@ pub(crate) async fn create(
 		description: opts.description.clone().map(|d| d.into()),
 		created_at: now,
 		expires_at: opts.expires_at,
-		count: opts.count.unwrap_or(0),
+		count: opts.count, // None = unlimited
+		resource_id: opts.resource_id.clone().map(|s| s.into()),
+		access_level: opts.access_level,
 	})
 }
 
@@ -140,11 +155,12 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, ref_id: &str) -> ClResu
 
 /// Use/consume a reference - validates and decrements counter
 /// Performs global lookup across all tenants
+/// Returns (TnId, id_tag, RefData) on success
 pub(crate) async fn use_ref(
 	db: &SqlitePool,
 	ref_id: &str,
 	expected_types: &[&str],
-) -> ClResult<(TnId, Box<str>)> {
+) -> ClResult<(TnId, Box<str>, RefData)> {
 	// Start a transaction to ensure atomicity
 	let mut tx = db
 		.begin()
@@ -154,7 +170,7 @@ pub(crate) async fn use_ref(
 
 	// Look up the ref globally (across all tenants) and get tenant info
 	let row = sqlx::query(
-		"SELECT r.tn_id, r.type, r.count, r.expires_at, t.id_tag
+		"SELECT r.tn_id, r.ref_id, r.type, r.description, r.created_at, r.count, r.expires_at, r.resource_id, r.access_level, t.id_tag
 		 FROM refs r
 		 INNER JOIN tenants t ON r.tn_id = t.tn_id
 		 WHERE r.ref_id = ?",
@@ -168,9 +184,13 @@ pub(crate) async fn use_ref(
 
 	let tn_id: i64 = row.get("tn_id");
 	let ref_type: String = row.get("type");
-	let count: i32 = row.get("count");
+	let count: Option<i32> = row.get("count"); // None = unlimited
 	let expires_at: Option<i64> = row.get("expires_at");
 	let id_tag: String = row.get("id_tag");
+	let created_at: i64 = row.get("created_at");
+	let description: Option<Box<str>> = row.get("description");
+	let resource_id: Option<Box<str>> = row.get("resource_id");
+	let access_level_str: Option<String> = row.get("access_level");
 
 	// Validate ref type
 	if !expected_types.contains(&ref_type.as_str()) {
@@ -188,18 +208,25 @@ pub(crate) async fn use_ref(
 		}
 	}
 
-	// Validate count > 0
-	if count <= 0 {
-		return Err(Error::ValidationError("Ref has already been used".to_string()));
+	// Validate count > 0 (skip if NULL = unlimited)
+	if let Some(c) = count {
+		if c <= 0 {
+			return Err(Error::ValidationError("Ref has already been used".to_string()));
+		}
 	}
 
-	// Decrement counter
-	sqlx::query("UPDATE refs SET count = count - 1 WHERE ref_id = ?")
-		.bind(ref_id)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+	// Decrement counter only if count is not NULL (unlimited)
+	let new_count = if count.is_some() {
+		sqlx::query("UPDATE refs SET count = count - 1 WHERE ref_id = ?")
+			.bind(ref_id)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(|err| warn!("DB: {:#?}", err))
+			.map_err(|_| Error::DbError)?;
+		count.map(|c| (c - 1).max(0) as u32)
+	} else {
+		None // Still unlimited
+	};
 
 	// Commit transaction
 	tx.commit()
@@ -207,5 +234,16 @@ pub(crate) async fn use_ref(
 		.inspect_err(|err| warn!("DB: {:#?}", err))
 		.map_err(|_| Error::DbError)?;
 
-	Ok((TnId(tn_id as u32), id_tag.into()))
+	let ref_data = RefData {
+		ref_id: ref_id.into(),
+		r#type: ref_type.into(),
+		description,
+		created_at: Timestamp(created_at),
+		expires_at: expires_at.map(Timestamp),
+		count: new_count, // None = unlimited
+		resource_id,
+		access_level: access_level_str.and_then(|s| s.chars().next()),
+	};
+
+	Ok((TnId(tn_id as u32), id_tag.into(), ref_data))
 }

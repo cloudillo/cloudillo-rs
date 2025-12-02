@@ -583,8 +583,35 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, 2).await;
 	}
 
+	// Version 3: Share link support - add resource_id and access_level to refs
+	if version < 3 {
+		// Add resource_id column for linking refs to resources (e.g., files)
+		sqlx::query("ALTER TABLE refs ADD COLUMN resource_id TEXT")
+			.execute(&mut *tx)
+			.await?;
+
+		// Add access_level column for share permissions ('R'=Read, 'W'=Write)
+		sqlx::query("ALTER TABLE refs ADD COLUMN access_level CHAR(1)")
+			.execute(&mut *tx)
+			.await?;
+
+		// Index for efficient resource_id lookups (only for refs with resource_id)
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_refs_resource_id ON refs(resource_id) WHERE resource_id IS NOT NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		// Global unique index on ref_id for unauthenticated lookups
+		sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_refs_ref_id ON refs(ref_id)")
+			.execute(&mut *tx)
+			.await?;
+
+		set_db_version(&mut tx, 3).await;
+	}
+
 	// Future migrations:
-	// if version < 3 { ... migration 3 ...; set_db_version(&mut tx, 3).await; }
+	// if version < 4 { ... migration 4 ...; set_db_version(&mut tx, 4).await; }
 
 	tx.commit().await?;
 

@@ -95,7 +95,7 @@ impl Default for RateLimitConfig {
 			websocket: EndpointCategoryConfig {
 				name: "websocket",
 				// WebSocket: moderate limits (connections are long-lived)
-				ipv4_individual: RateLimitTierConfig::new(5, 10, 100, 50),
+				ipv4_individual: RateLimitTierConfig::new(10, 20, 200, 100),
 				ipv4_network: RateLimitTierConfig::new(50, 100, 1000, 500),
 				ipv6_subnet: RateLimitTierConfig::new(50, 100, 1000, 500),
 				ipv6_provider: RateLimitTierConfig::new(200, 400, 5000, 2000),

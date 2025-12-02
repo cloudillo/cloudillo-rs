@@ -51,12 +51,21 @@ pub struct RefData {
 	pub created_at: Timestamp,
 	#[serde(rename = "expiresAt")]
 	pub expires_at: Option<Timestamp>,
-	pub count: u32,
+	/// Usage count: None = unlimited, Some(n) = n uses remaining
+	pub count: Option<u32>,
+	/// Resource ID for share links (e.g., file_id for share.file type)
+	#[serde(rename = "resourceId")]
+	pub resource_id: Option<Box<str>>,
+	/// Access level for share links ('R'=Read, 'W'=Write)
+	#[serde(rename = "accessLevel")]
+	pub access_level: Option<char>,
 }
 
 pub struct ListRefsOptions {
 	pub typ: Option<String>,
 	pub filter: Option<String>, // 'active', 'used', 'expired', 'all'
+	/// Filter by resource_id (for listing share links for a specific resource)
+	pub resource_id: Option<String>,
 }
 
 pub struct CreateRefOptions {
@@ -64,6 +73,10 @@ pub struct CreateRefOptions {
 	pub description: Option<String>,
 	pub expires_at: Option<Timestamp>,
 	pub count: Option<u32>,
+	/// Resource ID for share links (e.g., file_id for share.file type)
+	pub resource_id: Option<String>,
+	/// Access level for share links ('R'=Read, 'W'=Write)
+	pub access_level: Option<char>,
 }
 
 #[skip_serializing_none]
@@ -844,8 +857,12 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn delete_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<()>;
 
 	/// Use/consume a reference - validates type, expiration, counter, decrements counter
-	/// Returns (TnId, id_tag) of the tenant that owns this ref
-	async fn use_ref(&self, ref_id: &str, expected_types: &[&str]) -> ClResult<(TnId, Box<str>)>;
+	/// Returns (TnId, id_tag, RefData) of the tenant that owns this ref
+	async fn use_ref(
+		&self,
+		ref_id: &str,
+		expected_types: &[&str],
+	) -> ClResult<(TnId, Box<str>, RefData)>;
 
 	// Tag Management
 	//***************
