@@ -1,7 +1,7 @@
 //! Settings management handlers
 
 use axum::{
-	extract::{Path, State},
+	extract::{Path, Query, State},
 	http::StatusCode,
 	Json,
 };
@@ -24,25 +24,48 @@ pub struct SettingResponse {
 	pub description: String,
 }
 
+/// Query parameters for listing settings
+#[derive(Deserialize, Default)]
+pub struct ListSettingsQuery {
+	/// Filter settings by key prefix (e.g., "ui", "notify")
+	pub prefix: Option<String>,
+}
+
 /// GET /settings - List all settings for authenticated tenant
 /// Returns metadata about available settings and their current values
+/// Supports optional `prefix` query parameter to filter settings by key prefix
 pub async fn list_settings(
 	State(app): State<App>,
 	Auth(auth): Auth,
+	Query(query): Query<ListSettingsQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<SettingResponse>>>)> {
-	// Collect all settings with their values
 	let mut settings_response = Vec::new();
 
-	for definition in app.settings_registry.list() {
-		if let Ok(value) = app.settings.get(auth.tn_id, &definition.key).await {
+	if let Some(ref prefix) = query.prefix {
+		// Query stored settings from database matching prefix
+		// Uses wildcard pattern matching (e.g., "ui.theme" matches "ui.*" definition)
+		for (key, value, definition) in app.settings.list_by_prefix(auth.tn_id, prefix).await? {
 			settings_response.push(SettingResponse {
-				key: definition.key.clone(),
+				key,
 				value,
 				scope: format!("{:?}", definition.scope),
 				permission: format!("{:?}", definition.permission),
 				description: definition.description.clone(),
 			});
+		}
+	} else {
+		// No prefix: iterate over all definitions and get their values
+		for definition in app.settings_registry.list() {
+			if let Ok(value) = app.settings.get(auth.tn_id, &definition.key).await {
+				settings_response.push(SettingResponse {
+					key: definition.key.clone(),
+					value,
+					scope: format!("{:?}", definition.scope),
+					permission: format!("{:?}", definition.permission),
+					description: definition.description.clone(),
+				});
+			}
 		}
 	}
 

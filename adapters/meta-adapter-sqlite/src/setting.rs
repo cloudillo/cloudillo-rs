@@ -68,12 +68,14 @@ pub(crate) async fn list(
 	for row in rows {
 		let name: String = row.get("name");
 		let value: Option<String> = row.get("value");
-		settings.insert(
-			name,
-			value
-				.and_then(|v| serde_json::from_str(&v).ok())
-				.unwrap_or(serde_json::Value::Null),
-		);
+		// Only include settings that have valid non-null values
+		if let Some(json_value) =
+			value.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+		{
+			if !json_value.is_null() {
+				settings.insert(name, json_value);
+			}
+		}
 	}
 
 	Ok(settings)

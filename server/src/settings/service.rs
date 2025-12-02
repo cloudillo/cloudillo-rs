@@ -7,7 +7,9 @@ use std::sync::Arc;
 use crate::meta_adapter::MetaAdapter;
 use crate::prelude::*;
 
-use super::types::{FrozenSettingsRegistry, Setting, SettingScope, SettingValue};
+use super::types::{
+	FrozenSettingsRegistry, Setting, SettingDefinition, SettingScope, SettingValue,
+};
 
 // Compile-time constant for default cache capacity
 const DEFAULT_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(100) {
@@ -342,6 +344,44 @@ impl SettingsService {
 	/// Get reference to registry (for listing all settings)
 	pub fn registry(&self) -> &Arc<FrozenSettingsRegistry> {
 		&self.registry
+	}
+
+	/// List stored settings by prefix with definition metadata
+	///
+	/// This queries the database for actual stored settings matching the prefix,
+	/// then resolves each against the registry (supporting wildcard patterns like "ui.*").
+	/// Global settings are merged with tenant-specific settings (tenant overrides global).
+	pub async fn list_by_prefix(
+		&self,
+		tn_id: TnId,
+		prefix: &str,
+	) -> ClResult<Vec<(String, SettingValue, &SettingDefinition)>> {
+		let prefixes = vec![format!("{}.", prefix)]; // "ui" -> "ui."
+
+		// Get global settings first (tn_id=0)
+		let global_settings = self.meta.list_settings(TnId(0), Some(&prefixes)).await?;
+
+		// Get tenant-specific settings (override global)
+		let tenant_settings = if tn_id.0 != 0 {
+			self.meta.list_settings(tn_id, Some(&prefixes)).await?
+		} else {
+			std::collections::HashMap::new()
+		};
+
+		// Merge: tenant overrides global
+		let mut merged = global_settings;
+		merged.extend(tenant_settings);
+
+		let mut result = Vec::new();
+		for (key, json_value) in merged {
+			if let Some(definition) = self.registry.get(&key) {
+				let value = serde_json::from_value::<SettingValue>(json_value)
+					.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
+				result.push((key, value, definition));
+			}
+		}
+
+		Ok(result)
 	}
 }
 
