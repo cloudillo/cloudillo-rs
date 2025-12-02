@@ -7,6 +7,7 @@ pub mod app;
 pub mod create_perm;
 pub mod dns;
 pub mod extract;
+pub mod file_access;
 pub mod hasher;
 pub mod middleware;
 pub mod rate_limit;

@@ -360,6 +360,8 @@ pub struct FileView {
 	pub status: FileStatus,
 	pub tags: Option<Vec<Box<str>>>,
 	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
+	#[serde(rename = "accessLevel")]
+	pub access_level: Option<crate::types::AccessLevel>, // User's access level to this file (R/W)
 }
 
 #[skip_serializing_none]

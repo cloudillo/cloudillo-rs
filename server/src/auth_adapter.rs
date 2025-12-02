@@ -124,7 +124,7 @@ pub struct CertData {
 #[async_trait]
 pub trait AuthAdapter: Debug + Send + Sync {
 	/// Validates a token and returns the user context
-	async fn validate_token(&self, tn_id: TnId, id_tag: &str, token: &str) -> ClResult<AuthCtx>;
+	async fn validate_token(&self, tn_id: TnId, token: &str) -> ClResult<AuthCtx>;
 
 	/// # Profiles
 	/// Reads the ID tag of the given tenant, referenced by its ID

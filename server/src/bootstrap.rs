@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::core::{acme, app::AppState};
 use crate::meta_adapter::UpdateTenantData;
 use crate::prelude::*;
+use crate::utils::derive_name_from_id_tag;
 
 /// Options for creating a complete tenant with all necessary setup
 pub struct CreateCompleteTenantOptions<'a> {
@@ -101,15 +102,15 @@ pub async fn create_complete_tenant(
 
 	info!("Tenant created in meta adapter");
 
-	// Set display name
-	let display_name = opts.display_name.unwrap_or_else(|| {
-		// Derive display name from id_tag (first part before dot)
-		opts.id_tag.split('.').next().unwrap_or(opts.id_tag)
-	});
+	// Set display name (use provided or derive from id_tag with capitalization)
+	let display_name = opts
+		.display_name
+		.map(|s| s.to_string())
+		.unwrap_or_else(|| derive_name_from_id_tag(opts.id_tag));
 
 	meta.update_tenant(
 		tn_id,
-		&UpdateTenantData { name: Patch::Value(display_name.into()), ..Default::default() },
+		&UpdateTenantData { name: Patch::Value(display_name.clone()), ..Default::default() },
 	)
 	.await
 	.map_err(|e| {

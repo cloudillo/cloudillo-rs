@@ -45,6 +45,7 @@ pub mod rtdb;
 pub mod rtdb_adapter;
 pub mod settings;
 pub mod types;
+pub mod utils;
 
 pub use crate::core::app::{App, AppBuilder, ServerMode};
 

@@ -14,16 +14,18 @@ use cloudillo::{action::task, auth_adapter::*, prelude::*};
 pub(crate) async fn validate_token(
 	jwt_secret: &DecodingKey,
 	tn_id: TnId,
-	id_tag: &str,
 	token: &str,
 ) -> ClResult<AuthCtx> {
 	let token_data =
 		decode::<AccessToken<Box<str>>>(token, jwt_secret, &Validation::new(Algorithm::HS256))
 			.map_err(|_| Error::Unauthorized)?;
 
+	// Use the token's issuer as the authenticated user identity
+	// This ensures that a token from alice.home.w9.hu identifies as alice.home.w9.hu
+	// even when used on a different tenant (e.g., home.w9.hu for accessing shared files)
 	Ok(AuthCtx {
 		tn_id,
-		id_tag: Box::from(id_tag),
+		id_tag: token_data.claims.iss,
 		roles: token_data.claims.r.unwrap_or("".into()).split(',').map(Box::from).collect(),
 		scope: token_data.claims.scope,
 	})

@@ -548,8 +548,43 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, 1).await;
 	}
 
+	if version < 2 {
+		// Version 2: Fix tenant names and create profile entries for existing tenants
+
+		// Step 1: Update tenant names where NULL
+		// Derives name from first part of id_tag, capitalized
+		// SQLite: UPPER(SUBSTR(x,1,1)) || SUBSTR(x,2) for capitalize
+		sqlx::query(
+			"UPDATE tenants SET name =
+			 UPPER(SUBSTR(
+				 CASE WHEN INSTR(id_tag, '.') > 0
+					  THEN SUBSTR(id_tag, 1, INSTR(id_tag, '.') - 1)
+					  ELSE id_tag
+				 END, 1, 1)) ||
+			 SUBSTR(
+				 CASE WHEN INSTR(id_tag, '.') > 0
+					  THEN SUBSTR(id_tag, 1, INSTR(id_tag, '.') - 1)
+					  ELSE id_tag
+				 END, 2)
+			 WHERE name IS NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		// Step 2: Create profile entries for existing tenants that don't have one
+		sqlx::query(
+			"INSERT OR IGNORE INTO profiles (tn_id, id_tag, name, type, created_at)
+			 SELECT tn_id, id_tag, name, COALESCE(type, 'P'), unixepoch()
+			 FROM tenants",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 2).await;
+	}
+
 	// Future migrations:
-	// if version < 2 { ... migration 2 ...; set_db_version(&mut tx, 2).await; }
+	// if version < 3 { ... migration 3 ...; set_db_version(&mut tx, 3).await; }
 
 	tx.commit().await?;
 

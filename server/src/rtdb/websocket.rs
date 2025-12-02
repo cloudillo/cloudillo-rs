@@ -117,17 +117,24 @@ struct RtdbConnection {
 		Arc<RwLock<Vec<(String, tokio::sync::mpsc::UnboundedReceiver<ChangeEvent>)>>>,
 	tn_id: crate::types::TnId,
 	connected_at: u64,
+	/// Whether this connection is read-only (cannot execute transactions)
+	read_only: bool,
 }
 
 /// Handle an RTDB connection
+///
+/// The `read_only` parameter controls whether this connection can execute transactions.
+/// Read-only connections can subscribe to changes and query data,
+/// but their transaction requests will be rejected.
 pub async fn handle_rtdb_connection(
 	ws: WebSocket,
 	user_id: String,
 	file_id: String,
 	app: crate::core::app::App,
 	tn_id: crate::types::TnId,
+	read_only: bool,
 ) {
-	info!("RTDB connection: {} / file_id={}", user_id, file_id);
+	info!("RTDB connection: {} / file_id={} (read_only={})", user_id, file_id, read_only);
 
 	let conn = Arc::new(RtdbConnection {
 		user_id: user_id.clone(),
@@ -136,6 +143,7 @@ pub async fn handle_rtdb_connection(
 		subscription_streams: Arc::new(RwLock::new(Vec::new())),
 		tn_id,
 		connected_at: now_timestamp(),
+		read_only,
 	});
 
 	// Split WebSocket for concurrent read/write
@@ -293,6 +301,21 @@ async fn handle_rtdb_command(
 ) -> RtdbMessage {
 	match msg.msg_type.as_str() {
 		"transaction" => {
+			// Block transactions from read-only users
+			if conn.read_only {
+				warn!(
+					"Rejecting RTDB transaction from read-only user {} for file {}",
+					conn.user_id, conn.file_id
+				);
+				return RtdbMessage::new(
+					"error",
+					json!({
+						"code": 403,
+						"message": "Write access denied - read-only connection"
+					}),
+				);
+			}
+
 			// Handle atomic batch operations (create/update/delete)
 			if let Some(operations) = msg.payload.get("operations").and_then(|v| v.as_array()) {
 				debug!("RTDB transaction: {} operations", operations.len());

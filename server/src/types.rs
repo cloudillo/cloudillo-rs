@@ -439,7 +439,8 @@ impl ErrorResponse {
 //*****************************
 
 /// Access level enum for files
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AccessLevel {
 	None,
 	Read,

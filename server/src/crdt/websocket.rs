@@ -50,12 +50,17 @@ static CRDT_DOCS: std::sync::LazyLock<CrdtDocRegistry> =
 	std::sync::LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
 /// Handle a CRDT connection
+///
+/// The `read_only` parameter controls whether this connection can send updates.
+/// Read-only connections can receive sync messages and awareness updates,
+/// but their Update messages will be rejected.
 pub async fn handle_crdt_connection(
 	ws: WebSocket,
 	user_id: String,
 	doc_id: String,
 	app: crate::core::app::App,
 	tn_id: crate::types::TnId,
+	read_only: bool,
 ) {
 	// Generate unique connection ID
 	let conn_id =
@@ -94,7 +99,8 @@ pub async fn handle_crdt_connection(
 	let heartbeat_task = spawn_heartbeat_task(user_id.clone(), ws_tx.clone());
 
 	// WebSocket receive task - handles incoming messages
-	let ws_recv_task = spawn_receive_task(conn.clone(), ws_tx.clone(), ws_rx, app.clone(), tn_id);
+	let ws_recv_task =
+		spawn_receive_task(conn.clone(), ws_tx.clone(), ws_rx, app.clone(), tn_id, read_only);
 
 	// Sync broadcast task - forwards CRDT updates to other clients
 	let sync_task =
@@ -290,6 +296,7 @@ fn spawn_receive_task(
 	ws_rx: futures::stream::SplitStream<WebSocket>,
 	app: crate::core::app::App,
 	tn_id: crate::types::TnId,
+	read_only: bool,
 ) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
 		let mut ws_rx = ws_rx;
@@ -297,7 +304,7 @@ fn spawn_receive_task(
 			match msg {
 				Ok(Message::Binary(data)) => {
 					// yrs messages are sent directly without our wrapper
-					handle_yrs_message(&conn, &data, &ws_tx, &app, tn_id).await;
+					handle_yrs_message(&conn, &data, &ws_tx, &app, tn_id, read_only).await;
 				}
 				Ok(Message::Close(_)) | Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
 					// Ignore control frames
@@ -437,12 +444,17 @@ async fn send_echo_raw(
 }
 
 /// Handle a yrs-encoded message
+///
+/// The `read_only` parameter controls whether Update messages are accepted.
+/// Read-only connections can still receive SyncStep1/2 for initial sync,
+/// but their Update messages (actual edits) will be rejected.
 async fn handle_yrs_message(
 	conn: &Arc<CrdtConnection>,
 	data: &[u8],
 	ws_tx: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
 	app: &crate::core::app::App,
 	tn_id: crate::types::TnId,
+	read_only: bool,
 ) {
 	if data.is_empty() {
 		warn!("Empty message from conn {}", conn.conn_id);
@@ -466,27 +478,39 @@ async fn handle_yrs_message(
 
 			// Only store Update messages (actual changes)
 			// SyncStep2 messages are responses during sync and shouldn't be stored
-			let update_data = match &sync_msg {
-				SyncMessage::Update(data) => {
-					if !data.is_empty() {
-						Some(data.clone())
-					} else {
-						debug!("Received empty Update message from conn {}", conn.conn_id);
+			let update_data =
+				match &sync_msg {
+					SyncMessage::Update(data) => {
+						// Block updates from read-only users
+						if read_only {
+							warn!(
+							"Rejecting CRDT Update from read-only user {} for doc {} ({} bytes)",
+							conn.user_id, conn.doc_id, data.len()
+						);
+							// Silently ignore - don't store, don't broadcast
+							// User will see their changes rejected on next sync
+							return;
+						}
+
+						if !data.is_empty() {
+							Some(data.clone())
+						} else {
+							debug!("Received empty Update message from conn {}", conn.conn_id);
+							None
+						}
+					}
+					SyncMessage::SyncStep2(data) => {
+						// SyncStep2 is a response message, not a new update
+						// Don't store it, just forward to other clients
+						debug!(
+							"Received SyncStep2 from conn {} ({} bytes) - not storing",
+							conn.conn_id,
+							data.len()
+						);
 						None
 					}
-				}
-				SyncMessage::SyncStep2(data) => {
-					// SyncStep2 is a response message, not a new update
-					// Don't store it, just forward to other clients
-					debug!(
-						"Received SyncStep2 from conn {} ({} bytes) - not storing",
-						conn.conn_id,
-						data.len()
-					);
-					None
-				}
-				SyncMessage::SyncStep1(_) => None,
-			};
+					SyncMessage::SyncStep1(_) => None,
+				};
 
 			if let Some(data) = update_data {
 				// Validate the update can be decoded (catches corruption early)

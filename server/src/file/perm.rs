@@ -11,6 +11,7 @@ use crate::{
 	core::{
 		abac::Environment,
 		extract::{IdTag, OptionalAuth},
+		file_access,
 		middleware::PermissionCheckOutput,
 	},
 	prelude::*,
@@ -132,9 +133,9 @@ async fn load_file_attrs(
 			tenant_id_tag.into()
 		});
 
-	// Determine access level based on file status and file content type
-	// Default to Read for now - can be enhanced with granular permissions
-	let access_level = crate::types::AccessLevel::Read;
+	// Determine access level by looking up FSHR action grants
+	let access_level =
+		file_access::get_access_level(app, tn_id, &file_id, subject_id_tag, &owner_id_tag).await;
 
 	// Get visibility from file metadata - convert char to string representation
 	let visibility: Box<str> = VisibilityLevel::from_char(file_view.visibility).as_str().into();

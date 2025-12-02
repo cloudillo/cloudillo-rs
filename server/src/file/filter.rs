@@ -4,16 +4,20 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
 	core::abac::can_view_item,
+	core::file_access,
 	meta_adapter::{FileView, ListProfileOptions},
 	prelude::*,
+	types::AccessLevel,
 };
 
-/// Filter files by visibility based on the subject's access level
+/// Filter files by visibility and compute access_level for each file
 ///
 /// This function filters a list of files to only include those the subject
 /// is allowed to see based on:
 /// - The file's visibility level
 /// - The subject's relationship with the owner (following/connected)
+///
+/// For each visible file, it also computes the user's access level (Read/Write).
 pub async fn filter_files_by_visibility(
 	app: &App,
 	tn_id: TnId,
@@ -37,11 +41,15 @@ pub async fn filter_files_by_visibility(
 	let relationships = load_relationships(app, tn_id, subject_id_tag, &owner_tags).await?;
 
 	// Filter files based on visibility
-	let filtered = files
+	let visible_files: Vec<FileView> = files
 		.into_iter()
 		.filter(|file| {
-			// Get owner id_tag, defaulting to tenant if no owner
-			let owner_tag = file.owner.as_ref().map(|o| o.id_tag.as_ref()).unwrap_or(tenant_id_tag);
+			// Get owner id_tag, filtering out empty strings (from failed profile JOINs)
+			let owner_tag = file
+				.owner
+				.as_ref()
+				.and_then(|o| if o.id_tag.is_empty() { None } else { Some(o.id_tag.as_ref()) })
+				.unwrap_or(tenant_id_tag);
 
 			let (following, connected) =
 				relationships.get(owner_tag).copied().unwrap_or((false, false));
@@ -60,7 +68,36 @@ pub async fn filter_files_by_visibility(
 		})
 		.collect();
 
-	Ok(filtered)
+	// For anonymous users, access_level is Read for all visible files
+	if !is_authenticated || subject_id_tag.is_empty() {
+		return Ok(visible_files
+			.into_iter()
+			.map(|mut file| {
+				file.access_level = Some(AccessLevel::Read);
+				file
+			})
+			.collect());
+	}
+
+	// For authenticated users, compute access level for each file
+	let mut result = Vec::with_capacity(visible_files.len());
+	for mut file in visible_files {
+		// Get owner id_tag, filtering out empty strings (from failed profile JOINs)
+		let owner_tag = file
+			.owner
+			.as_ref()
+			.and_then(|o| if o.id_tag.is_empty() { None } else { Some(o.id_tag.as_ref()) })
+			.unwrap_or(tenant_id_tag);
+
+		let access_level =
+			file_access::get_access_level(app, tn_id, &file.file_id, subject_id_tag, owner_tag)
+				.await;
+
+		file.access_level = Some(access_level);
+		result.push(file);
+	}
+
+	Ok(result)
 }
 
 /// Load relationship status between subject and multiple targets

@@ -49,15 +49,29 @@ pub(crate) async fn read(dbr: &SqlitePool, tn_id: TnId) -> ClResult<Tenant<Box<s
 
 /// Create a new tenant
 pub(crate) async fn create(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClResult<TnId> {
-	sqlx::query("INSERT INTO tenants (tn_id, id_tag, type, name, x, created_at)
-		VALUES (?, ?, 'P', ?, '{}', unixepoch())")
-		.bind(tn_id.0)
-		.bind(id_tag)
-		.bind(id_tag)  // Default name = id_tag
-		.execute(db)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+	sqlx::query(
+		"INSERT INTO tenants (tn_id, id_tag, type, name, x, created_at)
+		VALUES (?, ?, 'P', ?, '{}', unixepoch())",
+	)
+	.bind(tn_id.0)
+	.bind(id_tag)
+	.bind(id_tag) // Default name = id_tag (will be updated by bootstrap)
+	.execute(db)
+	.await
+	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.map_err(|_| Error::DbError)?;
+
+	// Create corresponding profile entry for the tenant
+	// Uses tenant's name and type from the just-inserted row
+	sqlx::query(
+		"INSERT OR IGNORE INTO profiles (tn_id, id_tag, name, type, created_at)
+		 SELECT tn_id, id_tag, name, type, unixepoch() FROM tenants WHERE tn_id = ?",
+	)
+	.bind(tn_id.0)
+	.execute(db)
+	.await
+	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.map_err(|_| Error::DbError)?;
 
 	Ok(tn_id)
 }
@@ -68,6 +82,14 @@ pub(crate) async fn update(
 	tn_id: TnId,
 	tenant: &UpdateTenantData,
 ) -> ClResult<()> {
+	// Get current id_tag for profile sync (before potential id_tag change)
+	let current_id_tag: Box<str> = sqlx::query_scalar("SELECT id_tag FROM tenants WHERE tn_id = ?")
+		.bind(tn_id.0)
+		.fetch_one(db)
+		.await
+		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.map_err(|_| Error::DbError)?;
+
 	// Build dynamic UPDATE query based on what fields are present
 	let mut query = sqlx::QueryBuilder::new("UPDATE tenants SET ");
 	let mut has_updates = false;
@@ -99,6 +121,42 @@ pub(crate) async fn update(
 
 	if res.rows_affected() == 0 {
 		return Err(Error::NotFound);
+	}
+
+	// Sync relevant changes to the tenant's profile
+	let mut profile_query = sqlx::QueryBuilder::new("UPDATE profiles SET ");
+	let mut has_profile_updates = false;
+
+	// Sync name changes
+	has_profile_updates =
+		push_patch!(profile_query, has_profile_updates, "name", &tenant.name, |v| v.as_str());
+
+	// Sync profile_pic changes
+	has_profile_updates =
+		push_patch!(profile_query, has_profile_updates, "profile_pic", &tenant.profile_pic, |v| v
+			.as_str());
+
+	// Sync type changes
+	has_profile_updates =
+		push_patch!(profile_query, has_profile_updates, "type", &tenant.typ, |v| match v {
+			ProfileType::Person => "P",
+			ProfileType::Community => "C",
+		});
+
+	// Sync id_tag changes (profile's id_tag must match tenant's)
+	has_profile_updates =
+		push_patch!(profile_query, has_profile_updates, "id_tag", &tenant.id_tag, |v| v.as_str());
+
+	if has_profile_updates {
+		profile_query.push(" WHERE tn_id=").push_bind(tn_id.0);
+		profile_query.push(" AND id_tag=").push_bind(current_id_tag.as_ref());
+
+		profile_query
+			.build()
+			.execute(db)
+			.await
+			.inspect_err(|err| warn!("DB profile sync: {:#?}", err))
+			.map_err(|_| Error::DbError)?;
 	}
 
 	Ok(())

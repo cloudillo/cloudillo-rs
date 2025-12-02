@@ -137,7 +137,17 @@ pub async fn create_https_server(
 				req.extensions_mut().insert(core::IdTag(id_tag));
 				api_router.clone().call(req).await
 			} else {
-				info!("REQ [{}] App: {} {} {}", &peer_addr, req.method(), &host, req.uri().path());
+				// Clone host before logging (to avoid borrow issue)
+				let host_owned = host.to_string();
+				info!(
+					"REQ [{}] App: {} {} {}",
+					&peer_addr,
+					req.method(),
+					&host_owned,
+					req.uri().path()
+				);
+				// Insert IdTag for app routes too (host is the id_tag)
+				req.extensions_mut().insert(core::IdTag(host_owned.into_boxed_str()));
 				app_router.clone().call(req).await
 			};
 

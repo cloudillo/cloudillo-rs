@@ -62,8 +62,8 @@ impl AuthAdapterSqlite {
 
 #[async_trait]
 impl AuthAdapter for AuthAdapterSqlite {
-	async fn validate_token(&self, tn_id: TnId, id_tag: &str, token: &str) -> ClResult<AuthCtx> {
-		auth::validate_token(&self.jwt_secret, tn_id, id_tag, token).await
+	async fn validate_token(&self, tn_id: TnId, token: &str) -> ClResult<AuthCtx> {
+		auth::validate_token(&self.jwt_secret, tn_id, token).await
 	}
 
 	async fn read_id_tag(&self, tn_id: TnId) -> ClResult<Box<str>> {

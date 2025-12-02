@@ -25,7 +25,7 @@ pub(crate) async fn list(
 ) -> ClResult<Vec<FileView>> {
 	let mut query = sqlx::QueryBuilder::new(
 		"SELECT f.file_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
-		        p.id_tag, p.name, p.type, p.profile_pic
+		        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
 		 FROM files f
 		 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
 		 WHERE f.tn_id="
@@ -122,6 +122,7 @@ pub(crate) async fn list(
 			status,
 			tags,
 			visibility,
+			access_level: None, // Computed later by filter_files_by_visibility
 		})
 	}))
 }
@@ -667,7 +668,7 @@ pub(crate) async fn read(
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 		sqlx::query(
 			"SELECT f.file_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
-			        p.id_tag, p.name, p.type, p.profile_pic
+			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
 			 WHERE f.tn_id=? AND f.f_id=?"
@@ -682,7 +683,7 @@ pub(crate) async fn read(
 		// Content-addressable ID - query by file_id
 		sqlx::query(
 			"SELECT f.file_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
-			        p.id_tag, p.name, p.type, p.profile_pic
+			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
 			 WHERE f.tn_id=? AND f.file_id=?"
@@ -745,6 +746,7 @@ pub(crate) async fn read(
 				status,
 				tags,
 				visibility,
+				access_level: None, // Computed later by filter_files_by_visibility
 			}))
 		}
 	}

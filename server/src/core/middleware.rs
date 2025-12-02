@@ -124,8 +124,8 @@ pub async fn require_auth(
 		query_token.ok_or(Error::PermissionDenied)?
 	};
 
-	// Validate token with tn_id and id_tag
-	let claims = state.auth_adapter.validate_token(tn_id, &id_tag.0, &token).await?;
+	// Validate token with tn_id
+	let claims = state.auth_adapter.validate_token(tn_id, &token).await?;
 
 	req.extensions_mut().insert(Auth(claims));
 
@@ -159,7 +159,7 @@ pub async fn optional_auth(
 		match state.auth_adapter.read_tn_id(&id_tag.0).await {
 			Ok(tn_id) => {
 				// Try to validate token
-				match state.auth_adapter.validate_token(tn_id, &id_tag.0, &token).await {
+				match state.auth_adapter.validate_token(tn_id, &token).await {
 					Ok(claims) => {
 						req.extensions_mut().insert(Auth(claims));
 					}
