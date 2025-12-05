@@ -11,7 +11,7 @@ use crate::core::extract::{OptionalAuth, OptionalRequestId};
 use crate::core::utils;
 use crate::meta_adapter::{CreateRefOptions, ListRefsOptions, RefData};
 use crate::prelude::*;
-use crate::types::{ApiResponse, Timestamp};
+use crate::types::{ApiResponse, Patch, Timestamp};
 
 /// Response structure for ref details (authenticated users get full data)
 #[serde_with::skip_serializing_none]
@@ -75,8 +75,12 @@ pub struct CreateRefRequest {
 	pub description: Option<String>,
 	/// Optional expiration timestamp
 	pub expires_at: Option<i64>,
-	/// Number of times this ref can be used (omit for unlimited)
-	pub count: Option<u32>,
+	/// Number of times this ref can be used:
+	/// - Omit field: defaults to 1 (single use)
+	/// - null: unlimited uses
+	/// - number: that many uses
+	#[serde(default)]
+	pub count: Patch<u32>,
 	/// Resource ID for share links (e.g., file_id for share.file type)
 	#[serde(rename = "resourceId")]
 	pub resource_id: Option<String>,
@@ -192,11 +196,21 @@ pub async fn create_ref(
 
 	let ref_id = utils::random_id()?;
 
+	// Convert Patch<u32> to Option<u32>:
+	// - Undefined (field omitted): default to 1 (single use)
+	// - Null (explicit null): unlimited uses
+	// - Value(n): use that count
+	let count = match create_req.count {
+		Patch::Undefined => Some(1),
+		Patch::Null => None,
+		Patch::Value(n) => Some(n),
+	};
+
 	let opts = CreateRefOptions {
 		typ: create_req.r#type.clone(),
 		description: create_req.description.clone(),
 		expires_at: create_req.expires_at.map(Timestamp),
-		count: create_req.count, // None = unlimited
+		count,
 		resource_id: create_req.resource_id.clone(),
 		access_level: access_level_char,
 	};
