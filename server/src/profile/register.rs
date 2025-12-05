@@ -14,7 +14,6 @@ use crate::{
 		dns::{create_recursive_resolver, resolve_domain_addresses, validate_domain_address},
 		extract::OptionalAuth,
 	},
-	meta_adapter::{Profile, ProfileType},
 	prelude::*,
 	settings::SettingValue,
 	types::{ApiResponse, RegisterRequest, RegisterVerifyCheckRequest},
@@ -466,25 +465,7 @@ async fn handle_idp_registration(
 	)
 	.await?;
 
-	// Create profile and send welcome email
-	let profile = Profile {
-		id_tag: id_tag_lower.as_str(),
-		name: display_name.as_str(),
-		typ: ProfileType::Person,
-		profile_pic: None,
-		following: false,
-		connected: false,
-	};
-
-	if let Err(e) = app.meta_adapter.create_profile(tn_id, &profile, "").await {
-		warn!(
-			error = %e,
-			id_tag = %id_tag_lower,
-			tn_id = ?tn_id,
-			"Failed to create profile (tenant exists but profile missing)"
-		);
-	}
-
+	// Profile is already created by create_tenant in meta adapter
 	// Send welcome email with the welcome link
 	let template_vars = serde_json::json!({
 		"user_name": id_tag_lower,
@@ -613,25 +594,7 @@ async fn handle_domain_registration(
 	)
 	.await?;
 
-	// Create profile
-	let profile = Profile {
-		id_tag: id_tag_lower.as_str(),
-		name: display_name.as_str(),
-		typ: ProfileType::Person,
-		profile_pic: None,
-		following: false,
-		connected: false,
-	};
-
-	if let Err(e) = app.meta_adapter.create_profile(tn_id, &profile, "").await {
-		warn!(
-			error = %e,
-			id_tag = %id_tag_lower,
-			tn_id = ?tn_id,
-			"Failed to create profile (tenant exists but profile missing)"
-		);
-	}
-
+	// Profile is already created by create_tenant in meta adapter
 	// Send welcome email with the welcome link
 	let template_vars = serde_json::json!({
 		"user_name": id_tag_lower,
