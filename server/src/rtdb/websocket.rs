@@ -393,10 +393,66 @@ async fn handle_rtdb_command(
 							}
 						}
 						"update" => {
+							// Firebase-style shallow merge: patch only provided fields
 							let mut data = op.get("data").cloned().unwrap_or(Value::Null);
 
 							// Process computed values in data ($op, $fn, $query)
 							// CRITICAL: Pass transaction for atomic read-your-own-writes
+							if let Err(e) = crate::rtdb::computed::process_computed_values(
+								txn.as_ref(),
+								app.rtdb_adapter.as_ref(),
+								conn.tn_id,
+								&conn.file_id,
+								&path,
+								&mut data,
+							)
+							.await
+							{
+								warn!("Failed to process computed values: {}", e);
+								Err(e)
+							} else {
+								// Fetch existing document and merge with patch data
+								match txn.get(&path).await {
+									Ok(existing_opt) => {
+										let final_data = match existing_opt {
+											Some(mut existing) => {
+												match crate::rtdb::merge::shallow_merge(
+													&mut existing,
+													&data,
+												) {
+													Ok(_) => Ok(existing),
+													Err(e) => {
+														Err(Error::ValidationError(e.message))
+													}
+												}
+											}
+											None => {
+												// Document doesn't exist - use patch data as-is
+												Ok(data)
+											}
+										};
+										match final_data {
+											Ok(data) => match txn.update(&path, data).await {
+												Ok(_) => Ok(
+													json!({ "ref": Value::Null, "id": Value::Null }),
+												),
+												Err(e) => Err(e),
+											},
+											Err(e) => Err(e),
+										}
+									}
+									Err(e) => {
+										warn!("Failed to read document for merge: {}", e);
+										Err(e)
+									}
+								}
+							}
+						}
+						"replace" => {
+							// Full document replacement (no merge)
+							let mut data = op.get("data").cloned().unwrap_or(Value::Null);
+
+							// Process computed values in data ($op, $fn, $query)
 							if let Err(e) = crate::rtdb::computed::process_computed_values(
 								txn.as_ref(),
 								app.rtdb_adapter.as_ref(),

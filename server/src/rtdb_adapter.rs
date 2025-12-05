@@ -317,7 +317,10 @@ pub trait Transaction: Send + Sync {
 	/// Create a new document with auto-generated ID. Returns the generated ID.
 	async fn create(&mut self, path: &str, data: Value) -> ClResult<Box<str>>;
 
-	/// Update an existing document (replaces entire document).
+	/// Update an existing document (stores the provided data as-is).
+	///
+	/// Note: This method performs a full document replacement at the storage level.
+	/// Merge/PATCH semantics should be handled by the caller before invoking this method.
 	async fn update(&mut self, path: &str, data: Value) -> ClResult<()>;
 
 	/// Delete a document at a path.

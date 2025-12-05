@@ -4,6 +4,7 @@
 //! WebSocket connections, computed values, and database operations.
 
 pub mod computed;
+pub mod merge;
 pub mod websocket;
 
 pub use websocket::handle_rtdb_connection;
