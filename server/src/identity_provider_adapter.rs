@@ -68,10 +68,13 @@ pub struct Identity {
 	pub id_tag_prefix: Box<str>,
 	/// Domain part of the identity (e.g., cloudillo.net)
 	pub id_tag_domain: Box<str>,
-	/// Email address associated with this identity
-	pub email: Box<str>,
+	/// Email address associated with this identity (optional for community-owned identities)
+	pub email: Option<Box<str>>,
 	/// ID tag of the registrar who created this identity
 	pub registrar_id_tag: Box<str>,
+	/// ID tag of the owner who controls this identity (if different from registrar)
+	/// When set, the owner has permanent control; registrar only has control while Pending
+	pub owner_id_tag: Option<Box<str>>,
 	/// Address (DNS record, server address, or other routing info)
 	pub address: Option<Box<str>>,
 	/// Type of the address (IPv4, IPv6, or Hostname)
@@ -95,10 +98,13 @@ pub struct CreateIdentityOptions<'a> {
 	pub id_tag_prefix: &'a str,
 	/// The domain part of the identity identifier
 	pub id_tag_domain: &'a str,
-	/// Email address to associate with this identity
-	pub email: &'a str,
+	/// Email address to associate with this identity (optional for community-owned identities)
+	pub email: Option<&'a str>,
 	/// The id_tag of the registrar creating this identity
 	pub registrar_id_tag: &'a str,
+	/// The id_tag of the owner who will control this identity (optional)
+	/// When issuer="owner" in the registration token, this is set from the token issuer
+	pub owner_id_tag: Option<&'a str>,
 	/// Initial status of the identity (default: Pending)
 	pub status: IdentityStatus,
 	/// Initial address for this identity (optional)
@@ -114,6 +120,8 @@ pub struct CreateIdentityOptions<'a> {
 pub struct UpdateIdentityOptions {
 	/// New email address (if changing)
 	pub email: Option<Box<str>>,
+	/// New owner id_tag (for ownership transfer)
+	pub owner_id_tag: Option<Box<str>>,
 	/// New address (if changing)
 	pub address: Option<Box<str>>,
 	/// Type of the address being set (if address is provided)
@@ -131,6 +139,8 @@ pub struct ListIdentityOptions {
 	pub email: Option<String>,
 	/// Filter by registrar id_tag
 	pub registrar_id_tag: Option<String>,
+	/// Filter by owner id_tag
+	pub owner_id_tag: Option<String>,
 	/// Filter by identity status
 	pub status: Option<IdentityStatus>,
 	/// Only include identities that expire after this timestamp
@@ -465,8 +475,9 @@ mod tests {
 		let identity = Identity {
 			id_tag_prefix: "test_user".into(),
 			id_tag_domain: "cloudillo.net".into(),
-			email: "test@example.com".into(),
+			email: Some("test@example.com".into()),
 			registrar_id_tag: "registrar".into(),
+			owner_id_tag: None,
 			address: Some("192.168.1.1".into()),
 			address_type: Some(AddressType::Ipv4),
 			address_updated_at: Some(now),
@@ -478,10 +489,34 @@ mod tests {
 
 		assert_eq!(identity.id_tag_prefix.as_ref(), "test_user");
 		assert_eq!(identity.id_tag_domain.as_ref(), "cloudillo.net");
-		assert_eq!(identity.email.as_ref(), "test@example.com");
+		assert_eq!(identity.email.as_deref(), Some("test@example.com"));
 		assert_eq!(identity.registrar_id_tag.as_ref(), "registrar");
 		assert_eq!(identity.status, IdentityStatus::Active);
 		assert!(identity.expires_at > identity.created_at);
+	}
+
+	#[test]
+	fn test_identity_with_owner() {
+		let now = Timestamp::now();
+		let identity = Identity {
+			id_tag_prefix: "community_member".into(),
+			id_tag_domain: "cloudillo.net".into(),
+			email: None, // No email for community-owned identity
+			registrar_id_tag: "registrar".into(),
+			owner_id_tag: Some("community.cloudillo.net".into()),
+			address: None,
+			address_type: None,
+			address_updated_at: None,
+			status: IdentityStatus::Pending,
+			created_at: now,
+			updated_at: now,
+			expires_at: now.add_seconds(86400),
+		};
+
+		assert_eq!(identity.id_tag_prefix.as_ref(), "community_member");
+		assert!(identity.email.is_none());
+		assert_eq!(identity.owner_id_tag.as_deref(), Some("community.cloudillo.net"));
+		assert_eq!(identity.status, IdentityStatus::Pending);
 	}
 
 	#[test]
@@ -514,8 +549,9 @@ mod tests {
 		let opts = CreateIdentityOptions {
 			id_tag_prefix: "test_user",
 			id_tag_domain: "cloudillo.net",
-			email: "test@example.com",
+			email: Some("test@example.com"),
 			registrar_id_tag: "registrar",
+			owner_id_tag: None,
 			status: IdentityStatus::Pending,
 			address: Some("192.168.1.1"),
 			address_type: Some(AddressType::Ipv4),
@@ -524,10 +560,29 @@ mod tests {
 
 		assert_eq!(opts.id_tag_prefix, "test_user");
 		assert_eq!(opts.id_tag_domain, "cloudillo.net");
-		assert_eq!(opts.email, "test@example.com");
+		assert_eq!(opts.email, Some("test@example.com"));
 		assert_eq!(opts.registrar_id_tag, "registrar");
 		assert_eq!(opts.status, IdentityStatus::Pending);
 		assert!(opts.expires_at.is_some());
+	}
+
+	#[test]
+	fn test_create_identity_options_with_owner() {
+		let opts = CreateIdentityOptions {
+			id_tag_prefix: "member",
+			id_tag_domain: "cloudillo.net",
+			email: None, // No email for owner-managed identity
+			registrar_id_tag: "registrar",
+			owner_id_tag: Some("owner.cloudillo.net"),
+			status: IdentityStatus::Pending,
+			address: None,
+			address_type: None,
+			expires_at: None,
+		};
+
+		assert_eq!(opts.id_tag_prefix, "member");
+		assert!(opts.email.is_none());
+		assert_eq!(opts.owner_id_tag, Some("owner.cloudillo.net"));
 	}
 
 	#[test]

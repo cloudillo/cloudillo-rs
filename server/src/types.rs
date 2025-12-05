@@ -207,7 +207,7 @@ pub struct RegisterVerifyCheckRequest {
 	pub typ: String, // "idp" or "domain"
 	pub id_tag: String,
 	pub app_domain: Option<String>,
-	pub token: String,
+	pub token: Option<String>, // Optional: Required for unauthenticated requests
 }
 
 /// Registration request with account creation
@@ -268,6 +268,30 @@ pub struct ProfileInfo {
 	pub profile_type: String,
 	pub profile_pic: Option<String>, // file_id
 	pub created_at: u64,
+}
+
+/// Request body for community profile creation
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCommunityRequest {
+	#[serde(rename = "type")]
+	pub typ: String, // "idp" or "domain" - identity type
+	pub name: Option<String>,
+	pub profile_pic: Option<String>,
+	pub app_domain: Option<String>, // For domain type
+	                                // No token field - community creation requires authentication instead
+}
+
+/// Response for community profile creation
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityProfileResponse {
+	pub id_tag: String,
+	pub name: String,
+	pub profile_type: String,
+	pub profile_pic: Option<String>,
+	pub created_at: Timestamp,
 }
 
 // Phase 2: Action Management & File Integration

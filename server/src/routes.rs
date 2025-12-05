@@ -95,6 +95,9 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/me/cover", put(profile::media::put_cover_image))
 		.route("/api/profile", get(profile::list::list_profiles))
 
+		// --- Community Profile Creation ---
+		.route("/api/profile/{id_tag}", put(profile::community::put_community_profile))
+
 		// --- Action API (Write) ---
 		.route("/api/action", post(action::handler::post_action))
 		.merge(action_router_write)
@@ -161,12 +164,17 @@ fn init_public_routes(app: App) -> Router<App> {
 	// --- CRITICAL: Authentication Endpoints (strict rate limiting) ---
 	// Attack surface: credential stuffing, brute force, account enumeration
 	let auth_public_router = Router::new()
-		.route("/api/auth/register", post(auth::register::post_register))
-		.route("/api/auth/register-verify", post(auth::register::post_register_verify))
 		.route("/api/auth/login", post(auth::handler::post_login))
 		.route("/api/auth/login-token", get(auth::handler::get_login_token))
 		.route("/api/auth/set-password", post(auth::handler::post_set_password))
 		.route("/api/auth/access-token", get(auth::handler::get_access_token))
+		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "auth", app.opts.mode));
+
+	// --- CRITICAL: Profile Creation Endpoints (strict rate limiting) ---
+	// Attack surface: account enumeration, spam registration
+	let profile_creation_router = Router::new()
+		.route("/api/profile/register", post(profile::register::post_register))
+		.route("/api/profile/verify", post(profile::register::post_verify_profile))
 		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "auth", app.opts.mode));
 
 	// --- CRITICAL: Federation Inbox (moderate rate limiting) ---
@@ -195,9 +203,10 @@ fn init_public_routes(app: App) -> Router<App> {
 		// Public References
 		.route("/api/refs/{ref_id}", get(r#ref::handler::get_ref))
 
-		// IDP Discovery
+		// IDP Discovery and Activation
 		.route("/api/idp/info", get(idp::handler::get_idp_info))
 		.route("/api/idp/check-availability", get(idp::handler::check_identity_availability))
+		.route("/api/idp/activate", post(idp::handler::activate_identity))
 
 		// Content with Visibility Checks (uses OptionalAuth/guest context)
 		.route("/api/action", get(action::handler::list_actions))
@@ -208,6 +217,7 @@ fn init_public_routes(app: App) -> Router<App> {
 
 	Router::new()
 		.merge(auth_public_router)
+		.merge(profile_creation_router)
 		.merge(federation_router)
 		.merge(websocket_router)
 		.merge(general_public_router)
@@ -225,11 +235,16 @@ fn init_public_routes(app: App) -> Router<App> {
 // ============================================================================
 // API SERVICE - Aggregates protected and public routes with global middleware
 // ============================================================================
+async fn api_not_found() -> Error {
+	Error::NotFound
+}
+
 fn init_api_service(app: App) -> Router {
 	let cors_layer = tower_http::cors::CorsLayer::very_permissive();
 
 	init_public_routes(app.clone())
 		.merge(init_protected_routes(app.clone()))
+		.fallback(api_not_found)
 		.layer(cors_layer)
 		.layer(middleware::from_fn(request_id_middleware))
 		.layer(CompressionLayer::new())

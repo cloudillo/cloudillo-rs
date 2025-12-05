@@ -864,6 +864,14 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		expected_types: &[&str],
 	) -> ClResult<(TnId, Box<str>, RefData)>;
 
+	/// Validate a reference without consuming it - checks type, expiration, counter
+	/// Returns (TnId, id_tag, RefData) of the tenant that owns this ref if valid
+	async fn validate_ref(
+		&self,
+		ref_id: &str,
+		expected_types: &[&str],
+	) -> ClResult<(TnId, Box<str>, RefData)>;
+
 	// Tag Management
 	//***************
 	/// List all tags for a tenant, optionally filtered by prefix

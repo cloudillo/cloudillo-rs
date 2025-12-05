@@ -382,8 +382,8 @@ pub(crate) async fn create_variant<'a>(
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
-	let _res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size, duration, bitrate, page_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		.bind(tn_id.0).bind(f_id as i64).bind(opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64).bind(opts.duration).bind(opts.bitrate.map(|b| b as i64)).bind(opts.page_count.map(|p| p as i64))
+	let _res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size, available, duration, bitrate, page_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		.bind(tn_id.0).bind(f_id as i64).bind(opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64).bind(opts.available).bind(opts.duration).bind(opts.bitrate.map(|b| b as i64)).bind(opts.page_count.map(|p| p as i64))
 		.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 	tx.commit().await.map_err(|_| Error::DbError)?;
 

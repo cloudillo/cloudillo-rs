@@ -477,6 +477,14 @@ impl MetaAdapter for MetaAdapterSqlite {
 		reference::use_ref(&self.db, ref_id, expected_types).await
 	}
 
+	async fn validate_ref(
+		&self,
+		ref_id: &str,
+		expected_types: &[&str],
+	) -> ClResult<(TnId, Box<str>, RefData)> {
+		reference::validate_ref(&self.dbr, ref_id, expected_types).await
+	}
+
 	// Tag Management
 	//***************
 

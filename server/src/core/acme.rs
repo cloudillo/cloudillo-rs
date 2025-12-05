@@ -188,7 +188,9 @@ async fn renew_domains<'a>(
 		let not_after = parsed_cert.validity().not_after;
 
 		let certified_key = Arc::new(CertifiedKey::from_der(
-			vec![CertificateDer::from_pem_slice(cert_chain_pem.as_bytes())?],
+			CertificateDer::pem_slice_iter(cert_chain_pem.as_bytes())
+				.filter_map(Result::ok)
+				.collect(),
 			PrivateKeyDer::from_pem_slice(private_key_pem.as_bytes())?,
 			CryptoProvider::get_default().ok_or(acme::Error::Str("no crypto provider"))?,
 		)?);

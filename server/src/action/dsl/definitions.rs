@@ -578,6 +578,25 @@ fn idp_reg_definition() -> ActionDefinition {
 						r#enum: None,
 						items: None,
 					});
+					// Owner id_tag for community ownership
+					props.insert("owner_id_tag".to_string(), SchemaField {
+						field_type: FieldType::String,
+						min_length: None,
+						max_length: Some(255),
+						r#enum: None,
+						items: None,
+					});
+					// Issuer role: "registrar" (default) or "owner"
+					props.insert("issuer".to_string(), SchemaField {
+						field_type: FieldType::String,
+						min_length: None,
+						max_length: Some(20),
+						r#enum: Some(vec![
+							serde_json::Value::String("registrar".to_string()),
+							serde_json::Value::String("owner".to_string()),
+						]),
+						items: None,
+					});
 					props.insert("expires_at".to_string(), SchemaField {
 						field_type: FieldType::Number,
 						min_length: None,
@@ -587,8 +606,9 @@ fn idp_reg_definition() -> ActionDefinition {
 					});
 					props
 				}),
-				required: Some(vec!["id_tag".to_string(), "email".to_string(), "expires_at".to_string()]),
-				description: Some("Identity registration content with id_tag, email, and expiration".to_string()),
+				// Only id_tag is required; email is optional when owner_id_tag is provided
+				required: Some(vec!["id_tag".to_string()]),
+				description: Some("Identity registration content with id_tag, optional email/owner, and expiration".to_string()),
 			}),
 		}),
 		behavior: BehaviorFlags {

@@ -13,7 +13,7 @@ use crate::core::app::App;
 use crate::core::extract::{IdTag, OptionalRequestId};
 use crate::core::utils::parse_and_validate_identity_id_tag;
 use crate::identity_provider_adapter::{
-	CreateIdentityOptions, Identity, IdentityStatus, ListIdentityOptions,
+	CreateIdentityOptions, Identity, IdentityStatus, ListIdentityOptions, UpdateIdentityOptions,
 };
 use crate::prelude::*;
 use crate::settings::SettingValue;
@@ -41,13 +41,68 @@ async fn check_idp_enabled(app: &App, tn_id: TnId) -> ClResult<()> {
 	}
 }
 
+/// Authorization result for IDP operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdpAuthResult {
+	/// Full access as owner
+	Owner,
+	/// Limited access as registrar (only while Pending)
+	Registrar,
+	/// No access
+	Denied,
+}
+
+/// Check if the requesting user has access to an identity
+///
+/// Authorization rules:
+/// - Owner always has full access (permanent)
+/// - Registrar has access only while identity status is Pending
+/// - After activation (Pending → Active), registrar loses control
+fn check_identity_access(identity: &Identity, requester_id_tag: &str) -> IdpAuthResult {
+	// Owner check - owner always has full access
+	if let Some(ref owner) = identity.owner_id_tag {
+		if owner.as_ref() == requester_id_tag {
+			return IdpAuthResult::Owner;
+		}
+	}
+
+	// Registrar check - only valid while Pending
+	if identity.registrar_id_tag.as_ref() == requester_id_tag {
+		if identity.status == IdentityStatus::Pending {
+			return IdpAuthResult::Registrar;
+		}
+		// Registrar loses access after activation
+		debug!(
+			identity = %format!("{}.{}", identity.id_tag_prefix, identity.id_tag_domain),
+			registrar = %identity.registrar_id_tag,
+			status = ?identity.status,
+			"Registrar denied access - identity no longer Pending"
+		);
+	}
+
+	IdpAuthResult::Denied
+}
+
+/// Check if requester can access an identity (view, update, delete)
+fn can_access_identity(identity: &Identity, requester_id_tag: &str) -> bool {
+	matches!(
+		check_identity_access(identity, requester_id_tag),
+		IdpAuthResult::Owner | IdpAuthResult::Registrar
+	)
+}
+
 /// Response structure for identity details
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityResponse {
 	pub id_tag: String,
-	pub email: String,
+	/// Email address (optional for community-owned identities)
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub email: Option<String>,
 	pub registrar_id_tag: String,
+	/// Owner id_tag (for community ownership)
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub owner_id_tag: Option<String>,
 	pub address: Option<String>,
 	pub address_updated_at: Option<i64>,
 	pub status: String,
@@ -65,8 +120,9 @@ impl From<Identity> for IdentityResponse {
 		let id_tag = format!("{}.{}", identity.id_tag_prefix, identity.id_tag_domain);
 		Self {
 			id_tag,
-			email: identity.email.to_string(),
+			email: identity.email.map(|e| e.to_string()),
 			registrar_id_tag: identity.registrar_id_tag.to_string(),
+			owner_id_tag: identity.owner_id_tag.map(|o| o.to_string()),
 			address: identity.address.map(|a| a.to_string()),
 			address_updated_at: identity.address_updated_at.map(|ts| ts.0),
 			status: identity.status.to_string(),
@@ -80,11 +136,14 @@ impl From<Identity> for IdentityResponse {
 
 /// Request structure for creating a new identity
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateIdentityRequest {
 	/// Unique identifier tag for the identity
 	pub id_tag: String,
-	/// Email address for the identity
-	pub email: String,
+	/// Email address for the identity (optional when owner_id_tag is provided)
+	pub email: Option<String>,
+	/// Owner id_tag for community ownership (optional)
+	pub owner_id_tag: Option<String>,
 	/// Initial address (optional)
 	pub address: Option<String>,
 }
@@ -102,11 +161,14 @@ pub struct UpdateAddressRequest {
 
 /// Query parameters for listing identities
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ListIdentitiesQuery {
 	/// Filter by email (partial match)
 	pub email: Option<String>,
 	/// Filter by registrar id_tag
 	pub registrar_id_tag: Option<String>,
+	/// Filter by owner id_tag
+	pub owner_id_tag: Option<String>,
 	/// Filter by status (pending, active, suspended)
 	pub status: Option<String>,
 	/// Limit results
@@ -148,13 +210,14 @@ pub async fn get_identity_by_id(
 		.await?
 		.ok_or(Error::NotFound)?;
 
-	// Verify the requesting registrar owns this identity or is authorized
-	// For now, only the registrar who created it can view it
-	if identity.registrar_id_tag != registrar_id_tag {
+	// Check authorization using new helper (owner or registrar while Pending)
+	if !can_access_identity(&identity, &registrar_id_tag) {
 		warn!(
 			identity_id = %identity_id,
 			requested_by = %registrar_id_tag,
-			owned_by = %identity.registrar_id_tag,
+			registrar = %identity.registrar_id_tag,
+			owner = ?identity.owner_id_tag,
+			status = ?identity.status,
 			"Unauthorized access to identity"
 		);
 		return Err(Error::PermissionDenied);
@@ -194,6 +257,7 @@ pub async fn list_identities(
 	let opts = ListIdentityOptions {
 		email: query_params.email.clone(),
 		registrar_id_tag: Some(registrar_id_tag.to_string()),
+		owner_id_tag: query_params.owner_id_tag.clone(),
 		status: query_params.status.as_ref().and_then(|s| s.parse().ok()),
 		expires_after: None,
 		expired_only: false,
@@ -229,7 +293,8 @@ pub async fn create_identity(
 	info!(
 		identity_id = %create_req.id_tag,
 		registrar_id_tag = %registrar_id_tag,
-		email = %create_req.email,
+		email = ?create_req.email,
+		owner_id_tag = ?create_req.owner_id_tag,
 		"POST /api/idp/identities - Creating new identity"
 	);
 
@@ -241,9 +306,16 @@ pub async fn create_identity(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
 
-	// Validate inputs
-	if create_req.id_tag.is_empty() || create_req.email.is_empty() {
-		return Err(Error::ValidationError("id_tag and email are required".to_string()));
+	// Validate inputs - id_tag is always required
+	if create_req.id_tag.is_empty() {
+		return Err(Error::ValidationError("id_tag is required".to_string()));
+	}
+
+	// Email is required only if no owner_id_tag is provided
+	if create_req.owner_id_tag.is_none() && create_req.email.as_ref().is_none_or(|e| e.is_empty()) {
+		return Err(Error::ValidationError(
+			"email is required when no owner_id_tag is provided".to_string(),
+		));
 	}
 
 	// Parse and validate identity id_tag against registrar's domain
@@ -333,8 +405,9 @@ pub async fn create_identity(
 	let opts = CreateIdentityOptions {
 		id_tag_prefix: &id_tag_prefix,
 		id_tag_domain: &id_tag_domain,
-		email: &create_req.email,
+		email: create_req.email.as_deref(),
 		registrar_id_tag: &registrar_id_tag,
+		owner_id_tag: create_req.owner_id_tag.as_deref(),
 		status: IdentityStatus::Pending,
 		address: create_req.address.as_deref(),
 		address_type,
@@ -429,12 +502,14 @@ pub async fn update_identity_address(
 		.await?
 		.ok_or(Error::NotFound)?;
 
-	// Verify the requesting registrar owns this identity
-	if existing.registrar_id_tag != registrar_id_tag {
+	// Check authorization using new helper (owner or registrar while Pending)
+	if !can_access_identity(&existing, &registrar_id_tag) {
 		warn!(
 			identity_id = %identity_id,
 			requested_by = %registrar_id_tag,
-			owned_by = %existing.registrar_id_tag,
+			registrar = %existing.registrar_id_tag,
+			owner = ?existing.owner_id_tag,
+			status = ?existing.status,
 			"Unauthorized update to identity address"
 		);
 		return Err(Error::PermissionDenied);
@@ -539,12 +614,14 @@ pub async fn delete_identity(
 		.await?
 		.ok_or(Error::NotFound)?;
 
-	// Verify the requesting registrar owns this identity
-	if existing.registrar_id_tag != registrar_id_tag {
+	// Check authorization using new helper (owner or registrar while Pending)
+	if !can_access_identity(&existing, &registrar_id_tag) {
 		warn!(
 			identity_id = %identity_id,
 			requested_by = %registrar_id_tag,
-			owned_by = %existing.registrar_id_tag,
+			registrar = %existing.registrar_id_tag,
+			owner = ?existing.owner_id_tag,
+			status = ?existing.status,
 			"Unauthorized deletion of identity"
 		);
 		return Err(Error::PermissionDenied);
@@ -748,6 +825,110 @@ pub async fn check_identity_availability(
 			"Identity id_tag must contain at least one dot separator".to_string(),
 		))
 	}
+}
+
+/// Request structure for identity activation
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivateIdentityRequest {
+	/// The activation reference ID
+	pub ref_id: String,
+}
+
+/// POST /api/idp/activate - Activate an identity using a ref token
+///
+/// This endpoint activates a pending identity by consuming an activation ref.
+/// After activation:
+/// - Identity status changes from Pending to Active
+/// - Registrar loses control (only owner can manage)
+#[axum::debug_handler]
+pub async fn activate_identity(
+	State(app): State<App>,
+	tn_id: TnId,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(activate_req): Json<ActivateIdentityRequest>,
+) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
+	info!(
+		ref_id = %activate_req.ref_id,
+		"POST /api/idp/activate - Activating identity"
+	);
+
+	// Check if IDP is enabled for this tenant
+	check_idp_enabled(&app, tn_id).await?;
+
+	// Verify Identity Provider adapter is available
+	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
+		"Identity Provider not available on this instance".to_string(),
+	))?;
+
+	// Use and validate the activation ref
+	let (_ref_tn_id, _ref_id_tag, ref_data) = app
+		.meta_adapter
+		.use_ref(&activate_req.ref_id, &["idp.activation"])
+		.await
+		.map_err(|e| {
+			warn!(ref_id = %activate_req.ref_id, error = ?e, "Invalid activation ref");
+			e
+		})?;
+
+	// Get the identity id_tag from the ref's resource_id
+	let identity_id = ref_data
+		.resource_id
+		.ok_or_else(|| Error::Internal("Activation ref missing resource_id".to_string()))?
+		.to_string();
+
+	// Parse identity id_tag into prefix and domain
+	let (id_tag_prefix, id_tag_domain) = if let Some(dot_pos) = identity_id.find('.') {
+		(identity_id[..dot_pos].to_string(), identity_id[dot_pos + 1..].to_string())
+	} else {
+		return Err(Error::ValidationError("Invalid identity id_tag format".to_string()));
+	};
+
+	// Get the identity
+	let existing = idp_adapter
+		.read_identity(&id_tag_prefix, &id_tag_domain)
+		.await?
+		.ok_or(Error::NotFound)?;
+
+	// Verify identity is in Pending status
+	if existing.status != IdentityStatus::Pending {
+		warn!(
+			identity_id = %identity_id,
+			status = ?existing.status,
+			"Cannot activate identity - not in Pending status"
+		);
+		return Err(Error::ValidationError(format!(
+			"Identity is not in Pending status (current: {})",
+			existing.status
+		)));
+	}
+
+	// Update identity status to Active
+	let update_opts =
+		UpdateIdentityOptions { status: Some(IdentityStatus::Active), ..Default::default() };
+
+	let updated_identity = idp_adapter
+		.update_identity(&id_tag_prefix, &id_tag_domain, update_opts)
+		.await
+		.map_err(|e| {
+			warn!(identity_id = %identity_id, error = ?e, "Failed to activate identity");
+			e
+		})?;
+
+	info!(
+		identity_id = %identity_id,
+		registrar = %updated_identity.registrar_id_tag,
+		owner = ?updated_identity.owner_id_tag,
+		"Identity activated successfully - registrar access revoked"
+	);
+
+	let response_data = IdentityResponse::from(updated_identity);
+	let mut response = ApiResponse::new(response_data);
+	if let Some(id) = req_id {
+		response = response.with_req_id(id);
+	}
+
+	Ok((StatusCode::OK, Json(response)))
 }
 
 // vim: ts=4

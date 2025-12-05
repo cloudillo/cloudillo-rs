@@ -12,6 +12,7 @@ use crate::{
 	core::{
 		address::parse_address_type,
 		dns::{create_recursive_resolver, resolve_domain_addresses, validate_domain_address},
+		extract::OptionalAuth,
 	},
 	meta_adapter::{Profile, ProfileType},
 	prelude::*,
@@ -19,9 +20,9 @@ use crate::{
 	types::{ApiResponse, RegisterRequest, RegisterVerifyCheckRequest},
 };
 
-/// Domain validation response
+/// Domain validation response (public for reuse in community profile creation)
 #[skip_serializing_none]
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainValidationResponse {
 	pub address: Vec<String>,
@@ -44,7 +45,7 @@ pub struct IdpAvailabilityResponse {
 }
 
 /// Get list of trusted identity providers from settings
-async fn get_identity_providers(app: &crate::core::app::App, tn_id: TnId) -> Vec<String> {
+pub async fn get_identity_providers(app: &crate::core::app::App, tn_id: TnId) -> Vec<String> {
 	match app.settings.get(tn_id, "idp.list").await {
 		Ok(SettingValue::String(list)) => {
 			// Parse comma-separated list and filter out empty strings
@@ -65,7 +66,7 @@ async fn get_identity_providers(app: &crate::core::app::App, tn_id: TnId) -> Vec
 }
 
 /// Verify domain and id_tag before registration
-async fn verify_register_data(
+pub async fn verify_register_data(
 	app: &crate::core::app::App,
 	typ: &str,
 	id_tag: &str,
@@ -239,14 +240,28 @@ async fn verify_register_data(
 	Ok(response)
 }
 
-/// POST /auth/register-verify - Validate domain before creating account
-pub async fn post_register_verify(
+/// POST /api/profile/verify - Validate domain/id_tag before profile creation
+/// Requires either authentication OR a valid registration token
+pub async fn post_verify_profile(
 	State(app): State<crate::core::app::App>,
+	OptionalAuth(auth): OptionalAuth,
 	Json(req): Json<RegisterVerifyCheckRequest>,
 ) -> ClResult<(StatusCode, Json<DomainValidationResponse>)> {
+	// Require either authentication OR valid token
+	let is_authenticated = auth.is_some();
+
+	if !is_authenticated {
+		// Token required for unauthenticated requests
+		let token = req.token.as_ref().ok_or_else(|| {
+			Error::ValidationError("Token required for unauthenticated requests".into())
+		})?;
+		// Validate the ref without consuming it
+		app.meta_adapter.validate_ref(token, &["register"]).await?;
+	}
+
 	let id_tag_lower = req.id_tag.to_lowercase();
 
-	// Get identity providers list (use TnId(1) as default for global settings)
+	// Get identity providers list (use TnId(1) for base tenant settings)
 	let providers = get_identity_providers(&app, TnId(1)).await;
 
 	// For "ref" type, just return identity providers
@@ -315,7 +330,13 @@ async fn handle_idp_registration(
 	} else {
 		Some(app.opts.local_address.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(","))
 	};
-	let reg_content = IdpRegContent { id_tag: id_tag_lower.clone(), email: email.clone(), address };
+	let reg_content = IdpRegContent {
+		id_tag: id_tag_lower.clone(),
+		email: Some(email.clone()),
+		owner_id_tag: None,
+		issuer: None, // Default to registrar
+		address,
+	};
 
 	// Create action to generate JWT token
 	let action = CreateAction {
@@ -654,7 +675,8 @@ async fn handle_domain_registration(
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// POST /auth/register - Create account after validation
+/// POST /api/profile/register - Create profile after validation
+/// Requires a valid registration token (invitation ref)
 pub async fn post_register(
 	State(app): State<crate::core::app::App>,
 	Json(req): Json<RegisterRequest>,
@@ -664,6 +686,9 @@ pub async fn post_register(
 		return Err(Error::ValidationError("id_tag, token, and email are required".into()));
 	}
 
+	// Validate the registration token (ref) before processing
+	app.meta_adapter.validate_ref(&req.token, &["register"]).await?;
+
 	let id_tag_lower = req.id_tag.to_lowercase();
 	let app_domain = req.app_domain.map(|d| d.to_lowercase());
 
@@ -671,11 +696,24 @@ pub async fn post_register(
 	let providers = get_identity_providers(&app, TnId(1)).await;
 
 	// Route to appropriate registration handler
-	if req.typ == "idp" {
+	let result = if req.typ == "idp" {
 		handle_idp_registration(&app, id_tag_lower, req.email).await
 	} else {
 		handle_domain_registration(&app, id_tag_lower, app_domain, req.email, providers).await
+	};
+
+	// If registration succeeded, consume the token
+	if result.is_ok() {
+		if let Err(e) = app.meta_adapter.use_ref(&req.token, &["register"]).await {
+			warn!(
+				error = %e,
+				"Failed to consume registration token after successful registration"
+			);
+			// Continue anyway - registration already succeeded
+		}
 	}
+
+	result
 }
 
 // vim: ts=4

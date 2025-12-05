@@ -16,7 +16,16 @@ use crate::prelude::*;
 #[serde(rename_all = "camelCase")]
 pub struct IdpRegContent {
 	pub id_tag: String,
-	pub email: String,
+	/// Email address (optional when owner_id_tag is provided)
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub email: Option<String>,
+	/// ID tag of the owner who will control this identity (optional)
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub owner_id_tag: Option<String>,
+	/// Role of the token issuer: "registrar" (default) or "owner"
+	/// When "owner", the token issuer becomes the owner_id_tag
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub issuer: Option<String>,
 	/// Optional address for the identity. Use "auto" to use the client's IP address
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub address: Option<String>,
@@ -74,15 +83,63 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 		return Err(Error::ValidationError("IDP:REG action missing content field".into()));
 	};
 
-	// Validate required fields
-	if reg_content.id_tag.is_empty() || reg_content.email.is_empty() {
+	// Validate id_tag is present
+	if reg_content.id_tag.is_empty() {
 		warn!(
 			id_tag = %reg_content.id_tag,
-			email = %reg_content.email,
-			"IDP:REG content has invalid fields"
+			"IDP:REG content has empty id_tag"
 		);
-		return Err(Error::ValidationError("IDP:REG content missing id_tag or email".into()));
+		return Err(Error::ValidationError("IDP:REG content missing id_tag".into()));
 	}
+
+	// Determine issuer role - defaults to "registrar" if not specified
+	let issuer_role = reg_content.issuer.as_deref().unwrap_or("registrar");
+
+	// Validate issuer role
+	if issuer_role != "registrar" && issuer_role != "owner" {
+		warn!(
+			issuer_role = %issuer_role,
+			"IDP:REG content has invalid issuer role"
+		);
+		return Err(Error::ValidationError(format!(
+			"Invalid issuer role '{}': must be 'registrar' or 'owner'",
+			issuer_role
+		)));
+	}
+
+	// Determine owner_id_tag based on issuer role
+	// When issuer="owner", the token issuer becomes the owner
+	// When issuer="registrar", use explicit owner_id_tag if provided
+	let owner_id_tag: Option<&str> = match issuer_role {
+		"owner" => {
+			// Token issuer is the owner
+			Some(context.issuer.as_str())
+		}
+		"registrar" => {
+			// Use explicit owner_id_tag from content if provided
+			reg_content.owner_id_tag.as_deref()
+		}
+		_ => None, // Already validated above, won't reach here
+	};
+
+	// Email validation: required only if no owner_id_tag
+	if owner_id_tag.is_none() && reg_content.email.as_ref().is_none_or(|e| e.is_empty()) {
+		warn!(
+			id_tag = %reg_content.id_tag,
+			"IDP:REG content missing email (required when no owner specified)"
+		);
+		return Err(Error::ValidationError(
+			"IDP:REG content missing email (required when no owner_id_tag is provided)".into(),
+		));
+	}
+
+	info!(
+		id_tag = %reg_content.id_tag,
+		issuer_role = %issuer_role,
+		owner_id_tag = ?owner_id_tag,
+		email = ?reg_content.email,
+		"IDP:REG - Parsed ownership model"
+	);
 
 	// Verify Identity Provider adapter is available
 	let idp_adapter = app.idp_adapter.as_ref().ok_or_else(|| {
@@ -184,8 +241,9 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 	let create_opts = crate::identity_provider_adapter::CreateIdentityOptions {
 		id_tag_prefix: &id_tag_prefix,
 		id_tag_domain: &id_tag_domain,
-		email: &reg_content.email,
+		email: reg_content.email.as_deref(),
 		registrar_id_tag,
+		owner_id_tag,
 		status: IdentityStatus::Pending,
 		address,
 		address_type,
@@ -208,7 +266,8 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 		id_tag_prefix = %identity.id_tag_prefix,
 		id_tag_domain = %identity.id_tag_domain,
 		registrar = %registrar_id_tag,
-		email = %identity.email,
+		owner = ?identity.owner_id_tag,
+		email = ?identity.email,
 		address = ?identity.address,
 		"IDP:REG - Identity created with Pending status"
 	);
@@ -236,57 +295,68 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 	// Create activation reference (can be a hash of the API key + timestamp)
 	let activation_ref = format!("{}~{}", &created_key.api_key.key_prefix, context.action_id);
 
-	// Schedule activation email with credentials
+	// Schedule activation email with credentials (only if email is provided)
 	let tn_id = crate::types::TnId(context.tenant_id as u32);
 	let identity_id = format!("{}.{}", identity.id_tag_prefix, identity.id_tag_domain);
-	let mut template_vars = serde_json::json!({
-		"identity_id": identity_id,
-		"api_key": created_key.plaintext_key.clone(),
-		"activation_ref": activation_ref.clone(),
-		"instance_name": context.tenant_tag,
-	});
 
-	// Try to add instance name from settings if available
-	if let Ok(crate::settings::SettingValue::String(name)) =
-		app.settings.get(tn_id, "instance.name").await
-	{
-		template_vars["instance_name"] = serde_json::json!(name);
-	}
+	if let Some(ref email) = identity.email {
+		let mut template_vars = serde_json::json!({
+			"identity_id": identity_id,
+			"api_key": created_key.plaintext_key.clone(),
+			"activation_ref": activation_ref.clone(),
+			"instance_name": context.tenant_tag,
+		});
 
-	// Schedule the email task with retries
-	// Use custom key including identity_id to prevent duplicate tasks for same identity
-	let email_task_key = format!("email:activation:{}:{}", tn_id.0, identity_id);
-	match crate::email::EmailModule::schedule_email_task_with_key(
-		&app.scheduler,
-		&app.settings,
-		tn_id,
-		crate::email::EmailTaskParams {
-			to: identity.email.to_string(),
-			subject: "Identity Activation".to_string(),
-			template_name: "activation".to_string(),
-			template_vars,
-			custom_key: Some(email_task_key),
-		},
-	)
-	.await
-	{
-		Ok(_) => {
-			info!(
-				id_tag_prefix = %identity.id_tag_prefix,
-				id_tag_domain = %identity.id_tag_domain,
-				email = %identity.email,
-				"Activation email scheduled successfully"
-			);
+		// Try to add instance name from settings if available
+		if let Ok(crate::settings::SettingValue::String(name)) =
+			app.settings.get(tn_id, "instance.name").await
+		{
+			template_vars["instance_name"] = serde_json::json!(name);
 		}
-		Err(e) => {
-			warn!(
-				id_tag_prefix = %identity.id_tag_prefix,
-				id_tag_domain = %identity.id_tag_domain,
-				email = %identity.email,
-				error = %e,
-				"Failed to schedule activation email, continuing registration"
-			);
+
+		// Schedule the email task with retries
+		// Use custom key including identity_id to prevent duplicate tasks for same identity
+		let email_task_key = format!("email:activation:{}:{}", tn_id.0, identity_id);
+		match crate::email::EmailModule::schedule_email_task_with_key(
+			&app.scheduler,
+			&app.settings,
+			tn_id,
+			crate::email::EmailTaskParams {
+				to: email.to_string(),
+				subject: "Identity Activation".to_string(),
+				template_name: "activation".to_string(),
+				template_vars,
+				custom_key: Some(email_task_key),
+			},
+		)
+		.await
+		{
+			Ok(_) => {
+				info!(
+					id_tag_prefix = %identity.id_tag_prefix,
+					id_tag_domain = %identity.id_tag_domain,
+					email = %email,
+					"Activation email scheduled successfully"
+				);
+			}
+			Err(e) => {
+				warn!(
+					id_tag_prefix = %identity.id_tag_prefix,
+					id_tag_domain = %identity.id_tag_domain,
+					email = %email,
+					error = %e,
+					"Failed to schedule activation email, continuing registration"
+				);
+			}
 		}
+	} else {
+		// No email - owner-based activation required
+		info!(
+			id_tag_prefix = %identity.id_tag_prefix,
+			id_tag_domain = %identity.id_tag_domain,
+			owner = ?identity.owner_id_tag,
+			"Identity created without email - activation via owner required"
+		);
 	}
 
 	// Update quota counts
@@ -295,12 +365,20 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 	}
 
 	// Build success response
+	let message = if let Some(ref email) = identity.email {
+		format!(
+			"Identity '{}' created successfully. Activation email sent to {}",
+			reg_content.id_tag, email
+		)
+	} else {
+		format!(
+			"Identity '{}' created successfully. Activation via owner required.",
+			reg_content.id_tag
+		)
+	};
 	let response = IdpRegResponse {
 		success: true,
-		message: format!(
-			"Identity '{}' created successfully. Activation email sent to {}",
-			reg_content.id_tag, reg_content.email
-		),
+		message,
 		identity_status: identity.status.to_string(),
 		activation_ref: Some(activation_ref.clone()),
 		api_key: Some(created_key.plaintext_key.clone()), // Only shown once!
@@ -335,7 +413,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn test_idp_reg_content_parse() {
+	fn test_idp_reg_content_parse_with_email() {
 		let json = serde_json::json!({
 			"idTag": "alice",
 			"email": "alice@example.com"
@@ -343,7 +421,38 @@ mod tests {
 
 		let content: IdpRegContent = serde_json::from_value(json).unwrap();
 		assert_eq!(content.id_tag, "alice");
-		assert_eq!(content.email, "alice@example.com");
+		assert_eq!(content.email.as_deref(), Some("alice@example.com"));
+		assert!(content.owner_id_tag.is_none());
+		assert!(content.issuer.is_none());
+	}
+
+	#[test]
+	fn test_idp_reg_content_parse_with_owner() {
+		let json = serde_json::json!({
+			"idTag": "member",
+			"ownerIdTag": "community.cloudillo.net",
+			"issuer": "registrar"
+		});
+
+		let content: IdpRegContent = serde_json::from_value(json).unwrap();
+		assert_eq!(content.id_tag, "member");
+		assert!(content.email.is_none());
+		assert_eq!(content.owner_id_tag.as_deref(), Some("community.cloudillo.net"));
+		assert_eq!(content.issuer.as_deref(), Some("registrar"));
+	}
+
+	#[test]
+	fn test_idp_reg_content_parse_issuer_owner() {
+		let json = serde_json::json!({
+			"idTag": "member",
+			"issuer": "owner"
+		});
+
+		let content: IdpRegContent = serde_json::from_value(json).unwrap();
+		assert_eq!(content.id_tag, "member");
+		assert!(content.email.is_none());
+		assert!(content.owner_id_tag.is_none()); // owner comes from token issuer when issuer="owner"
+		assert_eq!(content.issuer.as_deref(), Some("owner"));
 	}
 
 	#[test]

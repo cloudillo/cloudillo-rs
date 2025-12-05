@@ -77,7 +77,7 @@ impl ResolvesServerCert for CertResolver {
 					cache.insert(cert_data.domain, certified_key.clone());
 					Some(certified_key)
 				} else {
-					error!("ERROR: Certificate not found for {}", name);
+					warn!("Certificate not found for {}", name);
 					None
 				}
 			}

@@ -153,6 +153,76 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, ref_id: &str) -> ClResu
 	Ok(())
 }
 
+/// Validate a reference without consuming it
+/// Performs global lookup across all tenants
+/// Returns (TnId, id_tag, RefData) on success
+pub(crate) async fn validate_ref(
+	db: &SqlitePool,
+	ref_id: &str,
+	expected_types: &[&str],
+) -> ClResult<(TnId, Box<str>, RefData)> {
+	// Look up the ref globally (across all tenants) and get tenant info
+	let row = sqlx::query(
+		"SELECT r.tn_id, r.ref_id, r.type, r.description, r.created_at, r.count, r.expires_at, r.resource_id, r.access_level, t.id_tag
+		 FROM refs r
+		 INNER JOIN tenants t ON r.tn_id = t.tn_id
+		 WHERE r.ref_id = ?",
+	)
+	.bind(ref_id)
+	.fetch_optional(db)
+	.await
+	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.map_err(|_| Error::DbError)?
+	.ok_or(Error::NotFound)?;
+
+	let tn_id: i64 = row.get("tn_id");
+	let ref_type: String = row.get("type");
+	let count: Option<i32> = row.get("count"); // None = unlimited
+	let expires_at: Option<i64> = row.get("expires_at");
+	let id_tag: String = row.get("id_tag");
+	let created_at: i64 = row.get("created_at");
+	let description: Option<Box<str>> = row.get("description");
+	let resource_id: Option<Box<str>> = row.get("resource_id");
+	let access_level_str: Option<String> = row.get("access_level");
+
+	// Validate ref type
+	if !expected_types.contains(&ref_type.as_str()) {
+		return Err(Error::ValidationError(format!(
+			"Invalid ref type: expected one of {:?}, got {}",
+			expected_types, ref_type
+		)));
+	}
+
+	// Validate not expired
+	if let Some(exp) = expires_at {
+		let now = Timestamp::now();
+		if exp <= now.0 {
+			return Err(Error::ValidationError("Ref has expired".to_string()));
+		}
+	}
+
+	// Validate count > 0 (skip if NULL = unlimited)
+	if let Some(c) = count {
+		if c <= 0 {
+			return Err(Error::ValidationError("Ref has already been used".to_string()));
+		}
+	}
+
+	// Return ref data without decrementing count
+	let ref_data = RefData {
+		ref_id: ref_id.into(),
+		r#type: ref_type.into(),
+		description,
+		created_at: Timestamp(created_at),
+		expires_at: expires_at.map(Timestamp),
+		count: count.map(|c| c as u32),
+		resource_id,
+		access_level: access_level_str.and_then(|s| s.chars().next()),
+	};
+
+	Ok((TnId(tn_id as u32), id_tag.into(), ref_data))
+}
+
 /// Use/consume a reference - validates and decrements counter
 /// Performs global lookup across all tenants
 /// Returns (TnId, id_tag, RefData) on success
