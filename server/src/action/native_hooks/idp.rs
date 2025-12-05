@@ -148,22 +148,27 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 	})?;
 
 	// Get the audience (IdP instance) that should receive this registration
-	let _target_idp = context.audience.as_ref().ok_or_else(|| {
+	// The identity domain must match the audience, not the issuer
+	let target_idp = context.audience.as_ref().ok_or_else(|| {
 		warn!("IDP:REG action missing audience (target IdP)");
 		Error::ValidationError("IDP:REG action missing audience (target IdP)".into())
 	})?;
 
 	// Get registrar info (issuer of the registration action)
+	// This is the IDP that's sponsoring/requesting the registration (used for quota tracking)
 	let registrar_id_tag = &context.issuer;
 
-	// Parse and validate identity id_tag against registrar's domain
+	// Parse and validate identity id_tag against the TARGET domain (audience), not the issuer
+	// In federated identity, any IDP can register identities on any server,
+	// but the identity's domain suffix must match the target server
 	let (id_tag_prefix, id_tag_domain) =
-		parse_and_validate_identity_id_tag(&reg_content.id_tag, registrar_id_tag).map_err(|e| {
+		parse_and_validate_identity_id_tag(&reg_content.id_tag, target_idp).map_err(|e| {
 			warn!(
 				error = %e,
 				id_tag = %reg_content.id_tag,
+				target_idp = %target_idp,
 				registrar = %registrar_id_tag,
-				"Failed to parse/validate identity id_tag"
+				"Failed to parse/validate identity id_tag against target IdP domain"
 			);
 			e
 		})?;
