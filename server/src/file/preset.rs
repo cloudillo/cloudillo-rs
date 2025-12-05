@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::image::ImageFormat;
 use super::variant::VariantClass;
 
 /// File processing preset configuration
@@ -26,6 +27,10 @@ pub struct FilePreset {
 	pub generate_thumbnail: bool,
 	/// Maximum variant to generate (caps generation at this level)
 	pub max_variant: Option<String>,
+	/// Variant to create synchronously for immediate thumbnail response (e.g., "vis.pf" or "vis.tn")
+	pub thumbnail_variant: Option<String>,
+	/// Store original blob (file_variant record is always created, but blob storage is optional)
+	pub store_original: bool,
 }
 
 impl Default for FilePreset {
@@ -49,6 +54,8 @@ impl Default for FilePreset {
 			extract_audio: false,
 			generate_thumbnail: true,
 			max_variant: Some("vid.hd".into()),
+			thumbnail_variant: Some("vis.tn".into()),
+			store_original: true,
 		}
 	}
 }
@@ -73,6 +80,8 @@ pub mod presets {
 			extract_audio: true,
 			generate_thumbnail: true,
 			max_variant: Some("vid.sd".into()),
+			thumbnail_variant: Some("vis.tn".into()),
+			store_original: true,
 		}
 	}
 
@@ -93,6 +102,8 @@ pub mod presets {
 			extract_audio: false,
 			generate_thumbnail: true,
 			max_variant: None, // Keep original only
+			thumbnail_variant: Some("vis.tn".into()),
+			store_original: true, // Archive always stores original
 		}
 	}
 
@@ -122,6 +133,8 @@ pub mod presets {
 			extract_audio: false,
 			generate_thumbnail: true,
 			max_variant: Some("vid.xd".into()),
+			thumbnail_variant: Some("vis.tn".into()),
+			store_original: true,
 		}
 	}
 
@@ -140,6 +153,8 @@ pub mod presets {
 			extract_audio: false,
 			generate_thumbnail: true,
 			max_variant: Some("vid.md".into()),
+			thumbnail_variant: Some("vis.tn".into()),
+			store_original: false, // Mobile optimization - minimize storage
 		}
 	}
 
@@ -148,12 +163,62 @@ pub mod presets {
 		FilePreset {
 			name: "video".to_string(),
 			allowed_media_classes: vec![VariantClass::Video],
-			image_variants: vec!["vis.sd".into(), "vis.md".into(), "vis.hd".into()], // Match video tiers
+			image_variants: vec![
+				"vis.tn".into(),
+				"vis.sd".into(),
+				"vis.md".into(),
+				"vis.hd".into(),
+			],
 			video_variants: vec!["vid.sd".into(), "vid.md".into(), "vid.hd".into()],
 			audio_variants: vec![], // No separate audio variants
 			extract_audio: false,   // Don't extract audio track
 			generate_thumbnail: true,
 			max_variant: Some("vid.hd".into()),
+			thumbnail_variant: Some("vis.tn".into()),
+			store_original: true,
+		}
+	}
+
+	/// Profile picture preset - includes vis.pf variant for small profile thumbnails
+	pub fn profile_picture() -> FilePreset {
+		FilePreset {
+			name: "profile-picture".to_string(),
+			allowed_media_classes: vec![VariantClass::Visual],
+			image_variants: vec![
+				"vis.pf".into(),
+				"vis.tn".into(),
+				"vis.sd".into(),
+				"vis.md".into(),
+				"vis.hd".into(),
+			],
+			video_variants: vec![],
+			audio_variants: vec![],
+			extract_audio: false,
+			generate_thumbnail: false, // vis.pf serves as thumbnail
+			max_variant: Some("vis.hd".into()),
+			thumbnail_variant: Some("vis.pf".into()),
+			store_original: false, // Generated variants are sufficient
+		}
+	}
+
+	/// Cover image preset - standard image variants without vis.pf
+	pub fn cover() -> FilePreset {
+		FilePreset {
+			name: "cover".to_string(),
+			allowed_media_classes: vec![VariantClass::Visual],
+			image_variants: vec![
+				"vis.tn".into(),
+				"vis.sd".into(),
+				"vis.md".into(),
+				"vis.hd".into(),
+			],
+			video_variants: vec![],
+			audio_variants: vec![],
+			extract_audio: false,
+			generate_thumbnail: false, // vis.tn serves as thumbnail
+			max_variant: Some("vis.hd".into()),
+			thumbnail_variant: Some("vis.tn".into()),
+			store_original: false, // Generated variants are sufficient
 		}
 	}
 
@@ -166,13 +231,24 @@ pub mod presets {
 			"high_quality" => Some(high_quality()),
 			"mobile" => Some(mobile()),
 			"video" => Some(video()),
+			"profile-picture" => Some(profile_picture()),
+			"cover" => Some(cover()),
 			_ => None,
 		}
 	}
 
 	/// List all available preset names
 	pub fn list() -> Vec<&'static str> {
-		vec!["default", "podcast", "archive", "high_quality", "mobile", "video"]
+		vec![
+			"default",
+			"podcast",
+			"archive",
+			"high_quality",
+			"mobile",
+			"video",
+			"profile-picture",
+			"cover",
+		]
 	}
 }
 
@@ -196,6 +272,8 @@ pub struct AudioQualityTier {
 pub struct ImageQualityTier {
 	pub name: &'static str,
 	pub max_dim: u32,
+	/// Optional format override (None = use setting, Some = override)
+	pub format: Option<ImageFormat>,
 }
 
 /// Video quality tiers
@@ -215,11 +293,12 @@ pub const AUDIO_TIERS: &[AudioQualityTier] = &[
 
 /// Image quality tiers
 pub const IMAGE_TIERS: &[ImageQualityTier] = &[
-	ImageQualityTier { name: "vis.tn", max_dim: 256 },
-	ImageQualityTier { name: "vis.sd", max_dim: 720 },
-	ImageQualityTier { name: "vis.md", max_dim: 1280 },
-	ImageQualityTier { name: "vis.hd", max_dim: 1920 },
-	ImageQualityTier { name: "vis.xd", max_dim: 3840 },
+	ImageQualityTier { name: "vis.pf", max_dim: 80, format: Some(ImageFormat::Avif) },
+	ImageQualityTier { name: "vis.tn", max_dim: 256, format: None },
+	ImageQualityTier { name: "vis.sd", max_dim: 720, format: None },
+	ImageQualityTier { name: "vis.md", max_dim: 1280, format: None },
+	ImageQualityTier { name: "vis.hd", max_dim: 1920, format: None },
+	ImageQualityTier { name: "vis.xd", max_dim: 3840, format: None },
 ];
 
 /// Get video tier by variant name

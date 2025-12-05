@@ -23,7 +23,7 @@ use crate::file::{
 	pdf::PdfProcessorTask,
 	preset::{self, get_audio_tier, get_image_tier, get_video_tier, presets},
 	store,
-	variant::VariantClass,
+	variant::{self, VariantClass},
 	video::VideoTranscoderTask,
 };
 use crate::meta_adapter;
@@ -226,143 +226,9 @@ async fn handle_post_image(
 	bytes: &[u8],
 	preset: &preset::FilePreset,
 ) -> ClResult<serde_json::Value> {
-	// Read format settings
-	let thumbnail_format_str = app
-		.settings
-		.get_string(tn_id, "file.thumbnail_format")
-		.await
-		.unwrap_or_else(|_| "webp".to_string());
-	let thumbnail_format: image::ImageFormat =
-		thumbnail_format_str.parse().unwrap_or(image::ImageFormat::Webp);
+	let result = image::generate_image_variants(app, tn_id, f_id, bytes, preset).await?;
 
-	let image_format_str = app
-		.settings
-		.get_string(tn_id, "file.image_format")
-		.await
-		.unwrap_or_else(|_| "webp".to_string());
-	let image_format: image::ImageFormat =
-		image_format_str.parse().unwrap_or(image::ImageFormat::Avif);
-
-	let file_id_orig =
-		store::create_blob_buf(app, tn_id, bytes, blob_adapter::CreateBlobOptions::default())
-			.await?;
-
-	// Get actual original image dimensions
-	let orig_dim = image::get_image_dimensions(bytes).await?;
-	info!("Original image dimensions: {}x{}", orig_dim.0, orig_dim.1);
-
-	app.meta_adapter
-		.create_file_variant(
-			tn_id,
-			f_id,
-			meta_adapter::FileVariant {
-				variant_id: file_id_orig.as_ref(),
-				variant: "vis.orig",
-				format: image_format.as_ref(),
-				resolution: orig_dim,
-				size: bytes.len() as u64,
-				available: true,
-				duration: None,
-				bitrate: None,
-				page_count: None,
-			},
-		)
-		.await?;
-
-	let orig_file = app.opts.tmp_dir.join::<&str>(&file_id_orig);
-	tokio::fs::write(&orig_file, &bytes).await?;
-
-	// Generate thumbnail synchronously (vis.tn)
-	let resized_tn =
-		image::resize_image(app.clone(), bytes.into(), thumbnail_format, (256, 256)).await?;
-	debug!("resized {:?}", resized_tn.bytes.len());
-	let variant_id_tn = store::create_blob_buf(
-		app,
-		tn_id,
-		&resized_tn.bytes,
-		blob_adapter::CreateBlobOptions::default(),
-	)
-	.await?;
-	app.meta_adapter
-		.create_file_variant(
-			tn_id,
-			f_id,
-			meta_adapter::FileVariant {
-				variant_id: variant_id_tn.as_ref(),
-				variant: "vis.tn",
-				format: thumbnail_format.as_ref(),
-				resolution: (resized_tn.width, resized_tn.height),
-				size: resized_tn.bytes.len() as u64,
-				available: true,
-				duration: None,
-				bitrate: None,
-				page_count: None,
-			},
-		)
-		.await?;
-
-	// Smart variant creation: skip creating variants if image is too small or too close in size
-	const SKIP_THRESHOLD: f32 = 0.10; // Skip variant if it's less than 10% larger than previous
-	let original_max = orig_dim.0.max(orig_dim.1) as f32;
-	info!("Image dimensions: {}x{}, max: {}", orig_dim.0, orig_dim.1, original_max);
-
-	let mut variant_task_ids = Vec::new();
-	let mut last_created_size = 256_f32; // Start after tn (256px)
-
-	// Create visual variants from preset's image_variants
-	for variant_name in &preset.image_variants {
-		if variant_name == "vis.tn" {
-			continue; // Already created thumbnail synchronously
-		}
-		if let Some(tier) = get_image_tier(variant_name) {
-			let variant_bbox_f = tier.max_dim as f32;
-
-			// Determine actual size: cap at original to avoid upscaling
-			let actual_size = variant_bbox_f.min(original_max);
-
-			// Check if size is significantly different from last created variant
-			let min_required_increase = last_created_size * (1.0 + SKIP_THRESHOLD);
-			if actual_size > min_required_increase {
-				// This variant provides meaningful size increase - create it
-				info!(
-					"Creating variant {} with bounding box {}x{} (capped from {})",
-					variant_name, actual_size as u32, actual_size as u32, tier.max_dim
-				);
-
-				let task = image::ImageResizerTask::new(
-					tn_id,
-					f_id,
-					orig_file.clone(),
-					variant_name.clone(),
-					image_format,
-					(actual_size as u32, actual_size as u32),
-				);
-				let task_id = app.scheduler.add(task).await?;
-				variant_task_ids.push(task_id);
-				last_created_size = actual_size;
-			} else {
-				info!(
-					"Skipping variant {} - would be {}, only {:.0}% larger than last ({})",
-					variant_name,
-					actual_size as u32,
-					(actual_size / last_created_size - 1.0) * 100.0,
-					last_created_size as u32
-				);
-			}
-		}
-	}
-
-	// FileIdGeneratorTask depends on all created variant tasks
-	let mut builder = app
-		.scheduler
-		.task(descriptor::FileIdGeneratorTask::new(tn_id, f_id))
-		.key(format!("{},{}", tn_id, f_id));
-	if !variant_task_ids.is_empty() {
-		builder = builder.depend_on(variant_task_ids);
-	}
-	builder.schedule().await?;
-
-	Ok(json!({"fileId": format!("@{}", f_id), "thumbnailVariantId": variant_id_tn }))
+	Ok(json!({"fileId": format!("@{}", f_id), "thumbnailVariantId": result.thumbnail_variant_id }))
 }
 
 /// Handle video upload - streams body to temp file, probes, creates transcode tasks
@@ -385,6 +251,15 @@ async fn handle_post_video_stream(
 	let duration = media_info.duration;
 	let resolution = media_info.video_resolution().unwrap_or((0, 0));
 	info!("Video info: duration={:.2}s, resolution={}x{}", duration, resolution.0, resolution.1);
+
+	// Read max_generate_variant setting
+	let max_quality_str = app
+		.settings
+		.get_string(tn_id, "file.max_generate_variant")
+		.await
+		.unwrap_or_else(|_| "hd".to_string());
+	let max_quality =
+		variant::parse_quality(&max_quality_str).unwrap_or(variant::VariantQuality::High);
 
 	// 3. Optionally store original variant (based on setting)
 	if app.settings.get_bool(tn_id, "file.store_original_vid").await.unwrap_or(false) {
@@ -481,6 +356,12 @@ async fn handle_post_video_stream(
 		if variant_name == "vis.tn" {
 			continue; // Already created thumbnail synchronously
 		}
+		// Skip variants exceeding max_generate_variant setting
+		if let Some(parsed) = variant::Variant::parse(variant_name) {
+			if parsed.quality > max_quality {
+				continue;
+			}
+		}
 		if let Some(tier) = get_image_tier(variant_name) {
 			let task = ImageResizerTask::new(
 				tn_id,
@@ -496,6 +377,12 @@ async fn handle_post_video_stream(
 
 	// 5b. Create video transcode tasks
 	for variant_name in &preset.video_variants {
+		// Skip variants exceeding max_generate_variant setting
+		if let Some(parsed) = variant::Variant::parse(variant_name) {
+			if parsed.quality > max_quality {
+				continue;
+			}
+		}
 		if let Some(tier) = get_video_tier(variant_name) {
 			let task = VideoTranscoderTask::new(
 				tn_id,
@@ -512,6 +399,12 @@ async fn handle_post_video_stream(
 	// 6. Optionally extract audio
 	if preset.extract_audio {
 		for variant_name in &preset.audio_variants {
+			// Skip variants exceeding max_generate_variant setting
+			if let Some(parsed) = variant::Variant::parse(variant_name) {
+				if parsed.quality > max_quality {
+					continue;
+				}
+			}
 			if let Some(tier) = get_audio_tier(variant_name) {
 				let task = AudioExtractorTask::new(
 					tn_id,
@@ -563,6 +456,15 @@ async fn handle_post_audio_stream(
 	let duration = media_info.duration;
 	info!("Audio info: duration={:.2}s", duration);
 
+	// Read max_generate_variant setting
+	let max_quality_str = app
+		.settings
+		.get_string(tn_id, "file.max_generate_variant")
+		.await
+		.unwrap_or_else(|_| "hd".to_string());
+	let max_quality =
+		variant::parse_quality(&max_quality_str).unwrap_or(variant::VariantQuality::High);
+
 	// 3. Optionally store aud.orig
 	if app.settings.get_bool(tn_id, "file.store_original_aud").await.unwrap_or(false) {
 		let orig_blob_id = store::create_blob_from_file(
@@ -594,6 +496,12 @@ async fn handle_post_audio_stream(
 	// 4. Create AudioExtractorTask for each variant
 	let mut task_ids = Vec::new();
 	for variant_name in &preset.audio_variants {
+		// Skip variants exceeding max_generate_variant setting
+		if let Some(parsed) = variant::Variant::parse(variant_name) {
+			if parsed.quality > max_quality {
+				continue;
+			}
+		}
 		if let Some(tier) = get_audio_tier(variant_name) {
 			let task = AudioExtractorTask::new(
 				tn_id,

@@ -91,14 +91,14 @@ pub fn get_file_descriptor_versioned<S: AsRef<str> + Debug + Eq>(
 					v.resolution.1
 				);
 
-				// Add optional properties
-				if let Some(dur) = v.duration {
+				// Add optional properties (skip zero values - semantically equivalent to unset)
+				if let Some(dur) = v.duration.filter(|&d| d != 0.0) {
 					parts.push_str(&format!(":dur={}", dur));
 				}
-				if let Some(br) = v.bitrate {
+				if let Some(br) = v.bitrate.filter(|&b| b != 0) {
 					parts.push_str(&format!(":br={}", br));
 				}
-				if let Some(pg) = v.page_count {
+				if let Some(pg) = v.page_count.filter(|&p| p != 0) {
 					parts.push_str(&format!(":pg={}", pg));
 				}
 

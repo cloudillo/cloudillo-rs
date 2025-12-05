@@ -1,0 +1,174 @@
+# BUILD ARGUMENTS #
+###################
+
+ARG RS_REF=main
+ARG FRONTEND_REF=main
+
+# RUST BUILDER STAGE #
+######################
+
+FROM rust:1-slim-trixie AS rust-builder
+ARG RS_REF
+WORKDIR /app
+RUN apt-get update && apt-get install -y libssl-dev pkg-config git
+RUN git clone --depth 1 --branch ${RS_REF} https://github.com/cloudillo/cloudillo-rs.git .
+# Disable sccache wrapper (not available in Docker)
+ENV RUSTC_WRAPPER=""
+RUN cargo build --release
+RUN strip /app/target/release/cloudillo-basic-server
+
+# FRONTEND BUILDER STAGE #
+##########################
+
+FROM node:22-slim AS frontend-builder
+ARG FRONTEND_REF
+WORKDIR /app
+RUN apt-get update && apt-get install -y git
+RUN npm install -g pnpm
+RUN git clone --depth 1 --branch ${FRONTEND_REF} https://github.com/cloudillo/cloudillo.git .
+RUN pnpm install --frozen-lockfile
+RUN pnpm -r --filter '!@cloudillo/storybook' build
+
+# Assemble final dist structure: shell/dist/* + apps/*/dist as subdirs
+RUN mkdir -p /dist \
+    && cp -r shell/dist/* /dist/ \
+    && for app in apps/*/; do \
+         name=$(basename "$app"); \
+         if [ -d "$app/dist" ]; then \
+           cp -r "$app/dist" "/dist/$name"; \
+         fi; \
+       done
+
+# FFMPEG STATIC BUILD STAGE #
+#############################
+
+FROM debian:trixie-slim AS ffmpeg-builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    nasm \
+    yasm \
+    pkg-config \
+    libssl-dev \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Build x264 (static)
+RUN curl -fsSL https://code.videolan.org/videolan/x264/-/archive/master/x264-master.tar.gz | tar xz \
+    && cd x264-master \
+    && ./configure \
+        --prefix=/usr/local \
+        --enable-static \
+        --disable-shared \
+        --enable-pic \
+        --disable-cli \
+    && make -j$(nproc) \
+    && make install
+
+# Build opus (static)
+RUN curl -fsSL https://downloads.xiph.org/releases/opus/opus-1.4.tar.gz | tar xz \
+    && cd opus-1.4 \
+    && ./configure \
+        --prefix=/usr/local \
+        --enable-static \
+        --disable-shared \
+        --disable-doc \
+        --disable-extra-programs \
+    && make -j$(nproc) \
+    && make install
+
+# Build ffmpeg (static, minimal codecs)
+RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-7.0.2.tar.xz | tar xJ \
+    && cd ffmpeg-7.0.2 \
+    && PKG_CONFIG_PATH="/usr/local/lib/pkgconfig" ./configure \
+        --prefix=/usr/local \
+        --enable-static \
+        --disable-shared \
+        --disable-debug \
+        --disable-doc \
+        --disable-ffplay \
+        --disable-network \
+        --disable-autodetect \
+        \
+        --enable-gpl \
+        --enable-libx264 \
+        --enable-libopus \
+        \
+        --enable-demuxer=mov,mp4,m4a,matroska,webm,mp3,ogg,flac,wav,aac,image2,image2pipe,png_pipe,jpeg_pipe,webp_pipe \
+        --enable-muxer=mp4,webm,matroska,opus,image2,mjpeg,png \
+        --enable-decoder=h264,hevc,vp8,vp9,av1,aac,mp3,opus,flac,vorbis,pcm_s16le,png,mjpeg,webp \
+        --enable-encoder=libx264,libopus,mjpeg,png \
+        --enable-parser=h264,hevc,vp8,vp9,av1,aac,opus,png,mjpeg \
+        --enable-filter=scale,thumbnail,select,fps,aresample,volume,anull \
+        --enable-protocol=file,pipe \
+        \
+        --extra-cflags="-I/usr/local/include -static" \
+        --extra-ldflags="-L/usr/local/lib -static" \
+        --extra-libs="-lpthread -lm" \
+        --pkg-config-flags="--static" \
+    && make -j$(nproc) \
+    && make install \
+    && strip /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+
+# Verify static linking
+RUN file /usr/local/bin/ffmpeg && ldd /usr/local/bin/ffmpeg || echo "Static binary - no dynamic deps"
+RUN /usr/local/bin/ffmpeg -version
+RUN ls -lh /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+
+# POPPLER EXTRACT STAGE #
+#########################
+
+FROM debian:trixie-slim AS poppler-extractor
+RUN apt-get update && apt-get install -y poppler-utils
+
+# Create staging directory
+RUN mkdir -p /staging/usr/bin /staging/lib /staging/lib64
+
+# Copy the binaries
+RUN cp -L $(which pdftoppm) $(which pdfinfo) /staging/usr/bin/
+
+# Copy all shared library dependencies
+RUN for bin in /staging/usr/bin/*; do \
+        ldd "$bin" 2>/dev/null | grep '=>' | awk '{print $3}' | while read lib; do \
+            [ -n "$lib" ] && [ -f "$lib" ] && cp -Ln "$lib" /staging/lib/ 2>/dev/null || true; \
+        done; \
+    done
+
+# Copy the dynamic linker
+RUN cp -L /lib64/ld-linux-x86-64.so.2 /staging/lib64/
+
+# Verify
+RUN echo "=== Poppler binaries ===" && ls -la /staging/usr/bin/
+RUN echo "=== Poppler libs: $(ls /staging/lib/ | wc -l) ==="
+
+# FINAL STAGE #
+###############
+
+FROM scratch
+WORKDIR /data
+
+# Copy cloudillo binary and its dependencies
+COPY --from=rust-builder /app/target/release/cloudillo-basic-server /usr/bin/cloudillo
+COPY --from=rust-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=rust-builder /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+COPY --from=rust-builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libm.so.6 /lib/x86_64-linux-gnu/
+
+# Copy static ffmpeg binaries (no library dependencies needed!)
+COPY --from=ffmpeg-builder /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/bin/
+
+# Copy poppler with all its dependencies
+COPY --from=poppler-extractor /staging/usr/bin/ /usr/bin/
+COPY --from=poppler-extractor /staging/lib/ /lib/
+COPY --from=poppler-extractor /staging/lib64/ /lib64/
+
+# Copy assembled frontend dist
+COPY --from=frontend-builder /dist /dist
+
+ENV LD_LIBRARY_PATH=/lib
+
+CMD ["/usr/bin/cloudillo"]

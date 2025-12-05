@@ -150,12 +150,9 @@ pub async fn refresh_profile(
 				if let Some(ref file_id) = remote.profile_pic {
 					match sync_profile_pic_variant(app, tn_id, id_tag, file_id).await {
 						Ok(_) => true,
-						Err(e) => {
-							tracing::warn!(
-								"Failed to sync profile picture for {}: {} (keeping old value)",
-								id_tag,
-								e
-							);
+						Err(_) => {
+							// Error already logged in sync_file_variants
+							tracing::debug!("Keeping old profile picture for {}", id_tag);
 							false
 						}
 					}
@@ -215,22 +212,30 @@ async fn sync_profile_pic_variant(
 ) -> ClResult<()> {
 	use crate::file::sync::sync_file_variants;
 
-	tracing::debug!("Syncing profile picture variant 'pf' for {} (file_id: {})", id_tag, file_id);
+	tracing::debug!(
+		"Syncing profile picture variant 'vis.pf' for {} (file_id: {})",
+		id_tag,
+		file_id
+	);
 
-	// Sync only the 'pf' variant for profile pictures (public, no auth needed)
-	let result = sync_file_variants(app, tn_id, id_tag, file_id, Some(&["pf"]), false).await?;
+	// Sync only the 'vis.pf' variant for profile pictures (public, no auth needed)
+	let result = sync_file_variants(app, tn_id, id_tag, file_id, Some(&["vis.pf"]), false).await?;
 
 	if !result.synced_variants.is_empty() {
-		tracing::info!("Synced profile picture variant 'pf' for {} (file_id: {})", id_tag, file_id);
+		tracing::info!(
+			"Synced profile picture variant 'vis.pf' for {} (file_id: {})",
+			id_tag,
+			file_id
+		);
 	} else if !result.skipped_variants.is_empty() {
 		tracing::debug!(
-			"Profile picture variant 'pf' already exists for {} (file_id: {})",
+			"Profile picture variant 'vis.pf' already exists for {} (file_id: {})",
 			id_tag,
 			file_id
 		);
 	} else {
 		tracing::warn!(
-			"No 'pf' variant found for profile picture {} (file_id: {})",
+			"No 'vis.pf' variant found for profile picture {} (file_id: {})",
 			id_tag,
 			file_id
 		);

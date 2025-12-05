@@ -130,14 +130,20 @@ pub async fn sync_file_variants(
 
 	debug!("  fetched descriptor: {}", descriptor);
 
-	// 2. Verify descriptor hash matches file_id
-	verify_content_hash(descriptor.as_bytes(), file_id).map_err(|e| {
-		error!("Descriptor hash mismatch for {}: {}", file_id, e);
-		e
-	})?;
+	// 3. Parse descriptor to get variant info (parse first for debugging)
+	let mut parsed_variants = super::descriptor::parse_file_descriptor(descriptor)?;
 
-	// 3. Parse descriptor to get variant info
-	let parsed_variants = super::descriptor::parse_file_descriptor(descriptor)?;
+	// 2. Verify descriptor hash matches file_id
+	if let Err(e) = verify_content_hash(descriptor.as_bytes(), file_id) {
+		// Generate local descriptor from parsed variants to compare
+		parsed_variants.sort();
+		let local_descriptor = super::descriptor::get_file_descriptor(&parsed_variants);
+		warn!(
+			"Descriptor hash mismatch for {}:\n  fetched:   {}\n  generated: {}\n  error: {}",
+			file_id, descriptor, local_descriptor, e
+		);
+		return Err(e);
+	}
 
 	if parsed_variants.is_empty() {
 		warn!("No variants found in descriptor for {}", file_id);

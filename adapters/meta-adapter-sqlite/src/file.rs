@@ -180,9 +180,13 @@ pub(crate) async fn list_variants(
 			format: row.try_get("format")?,
 			size: row.try_get("size")?,
 			available: row.try_get("available")?,
-			duration: row.try_get("duration").ok(),
-			bitrate: row.try_get("bitrate").ok(),
-			page_count: row.try_get("page_count").ok(),
+			duration: row.try_get::<Option<f64>, _>("duration").ok().flatten(),
+			bitrate: row.try_get::<Option<i64>, _>("bitrate").ok().flatten().map(|v| v as u32),
+			page_count: row
+				.try_get::<Option<i64>, _>("page_count")
+				.ok()
+				.flatten()
+				.map(|v| v as u32),
 		})
 	}))
 }
@@ -257,9 +261,13 @@ pub(crate) async fn read_variant(
 			format: row.try_get("format")?,
 			size: row.try_get("size")?,
 			available: row.try_get("available")?,
-			duration: row.try_get("duration").ok(),
-			bitrate: row.try_get("bitrate").ok(),
-			page_count: row.try_get("page_count").ok(),
+			duration: row.try_get::<Option<f64>, _>("duration").ok().flatten(),
+			bitrate: row.try_get::<Option<i64>, _>("bitrate").ok().flatten().map(|v| v as u32),
+			page_count: row
+				.try_get::<Option<i64>, _>("page_count")
+				.ok()
+				.flatten()
+				.map(|v| v as u32),
 		})
 	})
 }

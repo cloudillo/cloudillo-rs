@@ -10,7 +10,7 @@ use std::{
 
 use crate::blob_adapter;
 use crate::core::scheduler::{Task, TaskId};
-use crate::file::store;
+use crate::file::{descriptor::FileIdGeneratorTask, preset, store, variant};
 use crate::meta_adapter;
 use crate::prelude::*;
 use crate::types::TnId;
@@ -143,6 +143,220 @@ pub fn detect_image_type(buf: &[u8]) -> Option<String> {
 		image::ImageFormat::Avif => "image/avif".to_string(),
 		_ => return None,
 	})
+}
+
+/// Result of image variant generation
+pub struct ImageVariantResult {
+	/// Variant ID for the thumbnail variant (created synchronously)
+	pub thumbnail_variant_id: String,
+	/// TaskId of the FileIdGeneratorTask (for chaining dependencies)
+	pub file_id_task: TaskId,
+}
+
+/// Generate image variants based on preset configuration.
+///
+/// This is the main helper function for image processing. It:
+/// 1. Creates "orig" variant record (blob stored only if preset.store_original is true)
+/// 2. Creates the thumbnail variant synchronously (from preset.thumbnail_variant)
+/// 3. Schedules tasks for remaining variants
+/// 4. Schedules FileIdGeneratorTask depending on all variant tasks
+///
+/// Returns the thumbnail_variant_id for immediate response and the file_id_task
+/// for chaining additional dependent tasks.
+pub async fn generate_image_variants(
+	app: &App,
+	tn_id: TnId,
+	f_id: u64,
+	bytes: &[u8],
+	preset: &preset::FilePreset,
+) -> ClResult<ImageVariantResult> {
+	// Read format settings
+	let thumbnail_format_str = app
+		.settings
+		.get_string(tn_id, "file.thumbnail_format")
+		.await
+		.unwrap_or_else(|_| "webp".to_string());
+	let thumbnail_format: ImageFormat = thumbnail_format_str.parse().unwrap_or(ImageFormat::Webp);
+
+	let image_format_str = app
+		.settings
+		.get_string(tn_id, "file.image_format")
+		.await
+		.unwrap_or_else(|_| "webp".to_string());
+	let image_format: ImageFormat = image_format_str.parse().unwrap_or(ImageFormat::Avif);
+
+	// Read max_generate_variant setting
+	let max_quality_str = app
+		.settings
+		.get_string(tn_id, "file.max_generate_variant")
+		.await
+		.unwrap_or_else(|_| "hd".to_string());
+	let max_quality =
+		variant::parse_quality(&max_quality_str).unwrap_or(variant::VariantQuality::High);
+
+	// Detect original format from content
+	let orig_format = detect_image_type(bytes)
+		.map(|ct| match ct.as_str() {
+			"image/jpeg" => "jpeg",
+			"image/png" => "png",
+			"image/webp" => "webp",
+			"image/avif" => "avif",
+			_ => "jpeg",
+		})
+		.unwrap_or("jpeg");
+
+	// Get original image dimensions
+	let orig_dim = get_image_dimensions(bytes).await?;
+	info!("Original image dimensions: {}x{}", orig_dim.0, orig_dim.1);
+
+	// Conditionally store original blob based on preset
+	let (orig_variant_id, orig_available) = if preset.store_original {
+		// Store original blob
+		let variant_id =
+			store::create_blob_buf(app, tn_id, bytes, blob_adapter::CreateBlobOptions::default())
+				.await?;
+		(variant_id, true)
+	} else {
+		// Don't store blob, but compute content hash for the variant_id
+		use crate::core::hasher;
+		let variant_id = hasher::hash("b", bytes);
+		(variant_id, false)
+	};
+
+	// Create "orig" variant record (always created, but available depends on store_original)
+	app.meta_adapter
+		.create_file_variant(
+			tn_id,
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: orig_variant_id.as_ref(),
+				variant: "orig",
+				format: orig_format,
+				resolution: orig_dim,
+				size: bytes.len() as u64,
+				available: orig_available,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+		)
+		.await?;
+
+	// Save original to temp file for async variant tasks
+	let orig_file = app.opts.tmp_dir.join::<&str>(&orig_variant_id);
+	tokio::fs::write(&orig_file, bytes).await?;
+
+	// Determine thumbnail variant to create synchronously
+	let thumbnail_variant = preset.thumbnail_variant.as_deref().unwrap_or("vis.tn");
+	let thumbnail_tier = preset::get_image_tier(thumbnail_variant);
+
+	// Determine format for thumbnail variant
+	let tn_format = thumbnail_tier.and_then(|t| t.format).unwrap_or(thumbnail_format);
+	let tn_max_dim = thumbnail_tier.map(|t| t.max_dim).unwrap_or(256);
+
+	// Generate thumbnail variant synchronously
+	let resized_tn =
+		resize_image(app.clone(), bytes.to_vec(), tn_format, (tn_max_dim, tn_max_dim)).await?;
+
+	let thumbnail_variant_id = store::create_blob_buf(
+		app,
+		tn_id,
+		&resized_tn.bytes,
+		blob_adapter::CreateBlobOptions::default(),
+	)
+	.await?;
+
+	app.meta_adapter
+		.create_file_variant(
+			tn_id,
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: thumbnail_variant_id.as_ref(),
+				variant: thumbnail_variant,
+				format: tn_format.as_ref(),
+				resolution: (resized_tn.width, resized_tn.height),
+				size: resized_tn.bytes.len() as u64,
+				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+		)
+		.await?;
+
+	// Smart variant creation: skip creating variants if image is too small or too close in size
+	const SKIP_THRESHOLD: f32 = 0.10; // Skip variant if it's less than 10% larger than previous
+	let original_max = orig_dim.0.max(orig_dim.1) as f32;
+	let mut variant_task_ids = Vec::new();
+	let mut last_created_size = tn_max_dim as f32;
+
+	// Create visual variants from preset's image_variants
+	for variant_name in &preset.image_variants {
+		// Skip the thumbnail variant (already created synchronously)
+		if variant_name == thumbnail_variant {
+			continue;
+		}
+		// Skip variants exceeding max_generate_variant setting
+		if let Some(parsed) = variant::Variant::parse(variant_name) {
+			if parsed.quality > max_quality {
+				info!(
+					"Skipping variant {} - exceeds max_generate_variant {}",
+					variant_name, max_quality_str
+				);
+				continue;
+			}
+		}
+		if let Some(tier) = preset::get_image_tier(variant_name) {
+			let variant_bbox_f = tier.max_dim as f32;
+
+			// Determine actual size: cap at original to avoid upscaling
+			let actual_size = variant_bbox_f.min(original_max);
+
+			// Check if size is significantly different from last created variant
+			let min_required_increase = last_created_size * (1.0 + SKIP_THRESHOLD);
+			if actual_size > min_required_increase {
+				// Determine format for this variant (tier override or setting)
+				let variant_format = tier.format.unwrap_or(image_format);
+
+				info!(
+					"Creating variant {} with bounding box {}x{} (capped from {})",
+					variant_name, actual_size as u32, actual_size as u32, tier.max_dim
+				);
+
+				let task = ImageResizerTask::new(
+					tn_id,
+					f_id,
+					orig_file.clone(),
+					variant_name.clone(),
+					variant_format,
+					(actual_size as u32, actual_size as u32),
+				);
+				let task_id = app.scheduler.add(task).await?;
+				variant_task_ids.push(task_id);
+				last_created_size = actual_size;
+			} else {
+				info!(
+					"Skipping variant {} - would be {}, only {:.0}% larger than last ({})",
+					variant_name,
+					actual_size as u32,
+					(actual_size / last_created_size - 1.0) * 100.0,
+					last_created_size as u32
+				);
+			}
+		}
+	}
+
+	// FileIdGeneratorTask depends on all created variant tasks
+	let mut builder = app
+		.scheduler
+		.task(FileIdGeneratorTask::new(tn_id, f_id))
+		.key(format!("{},{}", tn_id, f_id));
+	if !variant_task_ids.is_empty() {
+		builder = builder.depend_on(variant_task_ids);
+	}
+	let file_id_task = builder.schedule().await?;
+
+	Ok(ImageVariantResult { thumbnail_variant_id: thumbnail_variant_id.into(), file_id_task })
 }
 
 /// Image resizer Task

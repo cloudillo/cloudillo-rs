@@ -86,6 +86,8 @@ impl FromStr for VariantClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VariantQuality {
+	/// Profile - special variant for profile pictures (fallback to thumbnail)
+	Profile,
 	/// Thumbnail - tiny preview (128px for images, static frame for video)
 	Thumbnail,
 	/// Small/Standard Definition - 720px images, 480p video, 64kbps audio
@@ -98,34 +100,32 @@ pub enum VariantQuality {
 	Extra,
 	/// Original - unprocessed source file
 	Original,
-	/// Profile - special variant for profile pictures (fallback to thumbnail)
-	Profile,
 }
 
 impl VariantQuality {
 	/// Get the short string representation (e.g., "tn", "sd", "md")
 	pub fn as_str(&self) -> &'static str {
 		match self {
+			Self::Profile => "pf",
 			Self::Thumbnail => "tn",
 			Self::Small => "sd",
 			Self::Medium => "md",
 			Self::High => "hd",
 			Self::Extra => "xd",
 			Self::Original => "orig",
-			Self::Profile => "pf",
 		}
 	}
 
 	/// Parse from short string representation
 	pub fn from_str_opt(s: &str) -> Option<Self> {
 		match s {
+			"pf" => Some(Self::Profile),
 			"tn" => Some(Self::Thumbnail),
 			"sd" => Some(Self::Small),
 			"md" => Some(Self::Medium),
 			"hd" => Some(Self::High),
 			"xd" => Some(Self::Extra),
 			"orig" => Some(Self::Original),
-			"pf" => Some(Self::Profile),
 			_ => None,
 		}
 	}
@@ -133,39 +133,39 @@ impl VariantQuality {
 	/// Get the bounding box size for this quality tier (for images/video)
 	pub fn bounding_box(&self) -> Option<u32> {
 		match self {
+			Self::Profile => Some(80),
 			Self::Thumbnail => Some(128),
 			Self::Small => Some(720),
 			Self::Medium => Some(1280),
 			Self::High => Some(1920),
 			Self::Extra => Some(3840),
 			Self::Original => None,
-			Self::Profile => Some(128),
 		}
 	}
 
 	/// Get the audio bitrate in kbps for this quality tier
 	pub fn audio_bitrate(&self) -> Option<u32> {
 		match self {
+			Self::Profile => None,
 			Self::Thumbnail => None,
 			Self::Small => Some(64),
 			Self::Medium => Some(128),
 			Self::High => Some(256),
 			Self::Extra => Some(320),
 			Self::Original => None,
-			Self::Profile => None,
 		}
 	}
 
 	/// Get the video bitrate in kbps for this quality tier
 	pub fn video_bitrate(&self) -> Option<u32> {
 		match self {
+			Self::Profile => None,
 			Self::Thumbnail => None,
 			Self::Small => Some(1500),
 			Self::Medium => Some(3000),
 			Self::High => Some(5000),
 			Self::Extra => Some(15000),
 			Self::Original => None,
-			Self::Profile => None,
 		}
 	}
 
@@ -202,8 +202,14 @@ impl Variant {
 	}
 
 	/// Parse from string in format "class.quality" (e.g., "vis.sd")
+	/// Special case: "orig" has no class prefix and uses Raw class internally
 	/// Also supports legacy single-level format (e.g., "sd") which defaults to Visual class
 	pub fn parse(s: &str) -> Option<Self> {
+		// Special case: "orig" is always stored without class prefix
+		if s == "orig" {
+			return Some(Self { class: VariantClass::Raw, quality: VariantQuality::Original });
+		}
+
 		if let Some((class_str, quality_str)) = s.split_once('.') {
 			// New two-level format: "vis.sd"
 			let class = VariantClass::from_str_opt(class_str)?;
@@ -217,8 +223,9 @@ impl Variant {
 	}
 
 	/// Check if this is a legacy (single-level) variant name
+	/// Note: "orig" is NOT legacy - it's the canonical format for originals
 	pub fn is_legacy_format(s: &str) -> bool {
-		!s.contains('.') && VariantQuality::from_str_opt(s).is_some()
+		s != "orig" && !s.contains('.') && VariantQuality::from_str_opt(s).is_some()
 	}
 
 	/// Convert legacy variant name to new format
@@ -259,7 +266,12 @@ impl Variant {
 
 impl fmt::Display for Variant {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "{}.{}", self.class, self.quality)
+		// Special case: "orig" is always displayed without class prefix
+		if self.quality == VariantQuality::Original {
+			write!(f, "orig")
+		} else {
+			write!(f, "{}.{}", self.class, self.quality)
+		}
 	}
 }
 
@@ -268,6 +280,16 @@ impl FromStr for Variant {
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		Self::parse(s).ok_or(())
+	}
+}
+
+/// Parse quality tier from variant name or quality string.
+/// Handles both "hd" (quality only) and "vis.hd" (class.quality) formats.
+pub fn parse_quality(s: &str) -> Option<VariantQuality> {
+	if let Some(v) = Variant::parse(s) {
+		Some(v.quality)
+	} else {
+		VariantQuality::from_str_opt(s)
 	}
 }
 
@@ -364,6 +386,9 @@ mod tests {
 		assert_eq!(Variant::VIS_SD.to_string(), "vis.sd");
 		assert_eq!(Variant::VID_HD.to_string(), "vid.hd");
 		assert_eq!(Variant::AUD_MD.to_string(), "aud.md");
+		// Original variants always display as just "orig" regardless of class
+		assert_eq!(Variant::VIS_ORIG.to_string(), "orig");
+		assert_eq!(Variant::RAW_ORIG.to_string(), "orig");
 	}
 
 	#[test]
@@ -373,6 +398,8 @@ mod tests {
 		assert!(Variant::is_legacy_format("hd"));
 		assert!(!Variant::is_legacy_format("vis.sd"));
 		assert!(!Variant::is_legacy_format("invalid"));
+		// "orig" is NOT legacy - it's the canonical format for originals
+		assert!(!Variant::is_legacy_format("orig"));
 	}
 
 	#[test]
@@ -380,6 +407,23 @@ mod tests {
 		assert_eq!(Variant::upgrade_legacy("sd"), Some("vis.sd".to_string()));
 		assert_eq!(Variant::upgrade_legacy("tn"), Some("vis.tn".to_string()));
 		assert_eq!(Variant::upgrade_legacy("vis.sd"), None);
+		// "orig" should NOT be upgraded - it's already canonical
+		assert_eq!(Variant::upgrade_legacy("orig"), None);
+	}
+
+	#[test]
+	fn test_orig_special_case() {
+		// "orig" parses to Raw class with Original quality
+		let v = Variant::parse("orig").unwrap();
+		assert_eq!(v.class, VariantClass::Raw);
+		assert_eq!(v.quality, VariantQuality::Original);
+
+		// Display always outputs just "orig"
+		assert_eq!(v.to_string(), "orig");
+
+		// Any variant with Original quality displays as "orig"
+		let vis_orig = Variant::new(VariantClass::Visual, VariantQuality::Original);
+		assert_eq!(vis_orig.to_string(), "orig");
 	}
 
 	#[test]
