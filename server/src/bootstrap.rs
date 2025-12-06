@@ -5,7 +5,33 @@ use std::sync::Arc;
 use crate::core::{acme, app::AppState};
 use crate::meta_adapter::UpdateTenantData;
 use crate::prelude::*;
+use crate::settings::SettingValue;
 use crate::utils::derive_name_from_id_tag;
+
+/// Default identity provider domain
+const DEFAULT_IDP_PROVIDER: &str = "cloudillo.net";
+
+/// Initialize IDP settings with default values if not already configured
+async fn initialize_idp_settings(app: &Arc<AppState>) -> ClResult<()> {
+	// Check if idp.list is already configured (globally)
+	let existing = app.meta_adapter.read_setting(TnId(0), "idp.list").await?;
+
+	if existing.is_none() {
+		info!("Initializing IDP settings with default provider: {}", DEFAULT_IDP_PROVIDER);
+
+		// Set the global idp.list setting
+		let value = serde_json::to_value(SettingValue::String(DEFAULT_IDP_PROVIDER.to_string()))
+			.map_err(|e| Error::Internal(format!("Failed to serialize IDP setting: {}", e)))?;
+
+		app.meta_adapter.update_setting(TnId(0), "idp.list", Some(value)).await?;
+
+		info!("IDP settings initialized successfully");
+	} else {
+		debug!("IDP settings already configured, skipping initialization");
+	}
+
+	Ok(())
+}
 
 /// Options for creating a complete tenant with all necessary setup
 pub struct CreateCompleteTenantOptions<'a> {
@@ -196,6 +222,8 @@ pub async fn bootstrap(
 				},
 			)
 			.await?;
+			// Initialize IDP list with cloudillo.net as default provider
+			initialize_idp_settings(&app).await?;
 		} else if let Some(ref acme_email) = opts.acme_email {
 			// Schedule hourly certificate renewal task
 			info!("Scheduling automatic certificate renewal task (runs hourly)");
