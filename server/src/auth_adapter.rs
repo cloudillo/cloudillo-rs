@@ -137,6 +137,49 @@ pub struct CertData {
 	pub expires_at: Timestamp,
 }
 
+/// API key information (without the secret key)
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ApiKeyInfo {
+	#[serde(rename = "keyId")]
+	pub key_id: i64,
+	#[serde(rename = "keyPrefix")]
+	pub key_prefix: Box<str>,
+	pub name: Option<Box<str>>,
+	pub scopes: Option<Box<str>>,
+	#[serde(rename = "expiresAt")]
+	pub expires_at: Option<Timestamp>,
+	#[serde(rename = "lastUsedAt")]
+	pub last_used_at: Option<Timestamp>,
+	#[serde(rename = "createdAt")]
+	pub created_at: Timestamp,
+}
+
+/// Options for creating an API key
+#[derive(Debug)]
+pub struct CreateApiKeyOptions<'a> {
+	pub name: Option<&'a str>,
+	pub scopes: Option<&'a str>,
+	pub expires_at: Option<Timestamp>,
+}
+
+/// Result of creating an API key (includes plaintext key shown only once)
+#[derive(Debug)]
+pub struct CreatedApiKey {
+	pub info: ApiKeyInfo,
+	pub plaintext_key: Box<str>,
+}
+
+/// Result of validating an API key
+#[derive(Debug)]
+pub struct ApiKeyValidation {
+	pub tn_id: TnId,
+	pub id_tag: Box<str>,
+	pub key_id: i64,
+	pub scopes: Option<Box<str>>,
+	pub roles: Option<Box<str>>,
+}
+
 /// A `Cloudillo` auth adapter
 ///
 /// Every `AuthAdapter` implementation is required to implement this trait.
@@ -269,6 +312,40 @@ pub trait AuthAdapter: Debug + Send + Sync {
 
 	/// Clean up expired verification tokens (runs periodically)
 	async fn cleanup_expired_verifications(&self) -> ClResult<()>;
+
+	// API Key management
+	/// Create a new API key for a tenant
+	async fn create_api_key(
+		&self,
+		tn_id: TnId,
+		opts: CreateApiKeyOptions<'_>,
+	) -> ClResult<CreatedApiKey>;
+
+	/// Validate an API key and return associated tenant info
+	/// Updates last_used_at on successful validation
+	async fn validate_api_key(&self, key: &str) -> ClResult<ApiKeyValidation>;
+
+	/// List API keys for a tenant (without exposing hashes)
+	async fn list_api_keys(&self, tn_id: TnId) -> ClResult<Vec<ApiKeyInfo>>;
+
+	/// Read a specific API key by ID
+	async fn read_api_key(&self, tn_id: TnId, key_id: i64) -> ClResult<ApiKeyInfo>;
+
+	/// Update an API key (name, scopes, expiration)
+	async fn update_api_key(
+		&self,
+		tn_id: TnId,
+		key_id: i64,
+		name: Option<&str>,
+		scopes: Option<&str>,
+		expires_at: Option<Timestamp>,
+	) -> ClResult<ApiKeyInfo>;
+
+	/// Delete an API key
+	async fn delete_api_key(&self, tn_id: TnId, key_id: i64) -> ClResult<()>;
+
+	/// Cleanup expired API keys (for scheduler)
+	async fn cleanup_expired_api_keys(&self) -> ClResult<u32>;
 }
 
 #[cfg(test)]

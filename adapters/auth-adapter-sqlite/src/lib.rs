@@ -7,6 +7,7 @@ use tokio::fs;
 
 use cloudillo::{auth_adapter::*, core::worker::WorkerPool, prelude::*};
 
+mod api_key;
 mod auth;
 mod cert;
 mod crypto;
@@ -252,6 +253,46 @@ impl AuthAdapter for AuthAdapterSqlite {
 
 	async fn cleanup_expired_verifications(&self) -> ClResult<()> {
 		verification::cleanup_expired_verifications(&self.db).await
+	}
+
+	// API Key management
+	async fn create_api_key(
+		&self,
+		tn_id: TnId,
+		opts: CreateApiKeyOptions<'_>,
+	) -> ClResult<CreatedApiKey> {
+		api_key::create_api_key(&self.db, &self.worker, tn_id, opts).await
+	}
+
+	async fn validate_api_key(&self, key: &str) -> ClResult<ApiKeyValidation> {
+		api_key::validate_api_key(&self.db, &self.worker, key).await
+	}
+
+	async fn list_api_keys(&self, tn_id: TnId) -> ClResult<Vec<ApiKeyInfo>> {
+		api_key::list_api_keys(&self.db, tn_id).await
+	}
+
+	async fn read_api_key(&self, tn_id: TnId, key_id: i64) -> ClResult<ApiKeyInfo> {
+		api_key::read_api_key(&self.db, tn_id, key_id).await
+	}
+
+	async fn update_api_key(
+		&self,
+		tn_id: TnId,
+		key_id: i64,
+		name: Option<&str>,
+		scopes: Option<&str>,
+		expires_at: Option<Timestamp>,
+	) -> ClResult<ApiKeyInfo> {
+		api_key::update_api_key(&self.db, tn_id, key_id, name, scopes, expires_at).await
+	}
+
+	async fn delete_api_key(&self, tn_id: TnId, key_id: i64) -> ClResult<()> {
+		api_key::delete_api_key(&self.db, tn_id, key_id).await
+	}
+
+	async fn cleanup_expired_api_keys(&self) -> ClResult<u32> {
+		api_key::cleanup_expired_api_keys(&self.db).await
 	}
 }
 

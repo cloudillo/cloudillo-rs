@@ -223,7 +223,8 @@ pub async fn post_password(
 /// Can be called with either:
 /// 1. A token query parameter (action token to exchange)
 /// 2. A refId query parameter (share link to exchange for scoped token)
-/// 3. Just subject parameter (uses authenticated session)
+/// 3. An apiKey query parameter (API key to exchange for access token)
+/// 4. Just subject parameter (uses authenticated session)
 #[derive(Deserialize)]
 pub struct GetAccessTokenQuery {
 	#[serde(default)]
@@ -232,6 +233,9 @@ pub struct GetAccessTokenQuery {
 	/// Share link ref_id to exchange for a scoped access token
 	#[serde(rename = "refId")]
 	ref_id: Option<String>,
+	/// API key to exchange for an access token
+	#[serde(rename = "apiKey")]
+	api_key: Option<String>,
 }
 
 pub async fn get_access_token(
@@ -352,6 +356,52 @@ pub async fn get_access_token(
 			"scope": scope,
 			"resourceId": file_id.to_string(),
 			"accessLevel": if access_level == 'W' { "write" } else { "read" }
+		}))
+		.with_req_id(req_id.unwrap_or_default());
+		Ok((StatusCode::OK, Json(response)))
+	} else if let Some(api_key) = query.api_key {
+		// Exchange API key for access token (no auth required)
+		info!("Exchanging API key for access token");
+
+		// Validate the API key
+		let validation = app.auth_adapter.validate_api_key(&api_key).await.map_err(|e| {
+			warn!("API key validation failed: {:?}", e);
+			Error::PermissionDenied
+		})?;
+
+		// Verify API key belongs to this tenant
+		if validation.tn_id != tn_id {
+			warn!(
+				"API key tenant mismatch: key belongs to {:?} but request is for {:?}",
+				validation.tn_id, tn_id
+			);
+			return Err(Error::PermissionDenied);
+		}
+
+		info!(
+			"Creating access token from API key for id_tag={}, scopes={:?}",
+			validation.id_tag, validation.scopes
+		);
+
+		// Create access token with API key's scopes
+		let token_result = app
+			.auth_adapter
+			.create_access_token(
+				tn_id,
+				&auth_adapter::AccessToken {
+					iss: &id_tag.0,
+					sub: Some(&validation.id_tag),
+					r: validation.roles.as_deref(),
+					scope: validation.scopes.as_deref(),
+					exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
+				},
+			)
+			.await?;
+
+		info!("Got access token from API key: {}", &token_result);
+		let response = ApiResponse::new(json!({
+			"token": token_result,
+			"scopes": validation.scopes
 		}))
 		.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))

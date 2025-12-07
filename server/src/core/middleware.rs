@@ -10,8 +10,17 @@ use std::future::Future;
 use std::pin::Pin;
 use uuid::Uuid;
 
+use crate::auth_adapter::AuthCtx;
 use crate::core::{extract::RequestId, Auth, IdTag};
 use crate::prelude::*;
+
+/// API key prefix for detection
+const API_KEY_PREFIX: &str = "cl_";
+
+/// Check if a token is an API key (starts with cl_)
+fn is_api_key(token: &str) -> bool {
+	token.starts_with(API_KEY_PREFIX)
+}
 
 // Type aliases for permission check middleware components
 pub type PermissionCheckInput =
@@ -124,8 +133,36 @@ pub async fn require_auth(
 		query_token.ok_or(Error::PermissionDenied)?
 	};
 
-	// Validate token with tn_id
-	let claims = state.auth_adapter.validate_token(tn_id, &token).await?;
+	// Validate token or API key
+	let claims = if is_api_key(&token) {
+		// Validate API key
+		let validation = state.auth_adapter.validate_api_key(&token).await.map_err(|e| {
+			warn!("API key validation failed: {:?}", e);
+			Error::PermissionDenied
+		})?;
+
+		// Verify API key belongs to requested tenant
+		if validation.tn_id != tn_id {
+			warn!(
+				"API key tenant mismatch: key belongs to {:?} but request is for {:?}",
+				validation.tn_id, tn_id
+			);
+			return Err(Error::PermissionDenied);
+		}
+
+		AuthCtx {
+			tn_id: validation.tn_id,
+			id_tag: validation.id_tag,
+			roles: validation
+				.roles
+				.map(|r| r.split(',').map(Box::from).collect())
+				.unwrap_or_default(),
+			scope: validation.scopes,
+		}
+	} else {
+		// Validate JWT token (existing flow)
+		state.auth_adapter.validate_token(tn_id, &token).await?
+	};
 
 	req.extensions_mut().insert(Auth(claims));
 
@@ -154,14 +191,39 @@ pub async fn optional_auth(
 	};
 
 	// Only validate if both id_tag and token are present
-	if let (Some(id_tag), Some(token)) = (id_tag, token) {
+	if let (Some(id_tag), Some(ref token)) = (id_tag, token) {
 		// Try to get tn_id
 		match state.auth_adapter.read_tn_id(&id_tag.0).await {
 			Ok(tn_id) => {
-				// Try to validate token
-				match state.auth_adapter.validate_token(tn_id, &token).await {
-					Ok(claims) => {
+				// Try to validate token or API key
+				let claims_result = if is_api_key(token) {
+					// Validate API key
+					state.auth_adapter.validate_api_key(token).await.map(|validation| {
+						// Verify API key belongs to requested tenant
+						if validation.tn_id != tn_id {
+							return Err(Error::PermissionDenied);
+						}
+						Ok(AuthCtx {
+							tn_id: validation.tn_id,
+							id_tag: validation.id_tag,
+							roles: validation
+								.roles
+								.map(|r| r.split(',').map(Box::from).collect())
+								.unwrap_or_default(),
+							scope: validation.scopes,
+						})
+					})
+				} else {
+					// Validate JWT token
+					state.auth_adapter.validate_token(tn_id, token).await.map(Ok)
+				};
+
+				match claims_result {
+					Ok(Ok(claims)) => {
 						req.extensions_mut().insert(Auth(claims));
+					}
+					Ok(Err(e)) => {
+						warn!("Token validation failed (tenant mismatch): {:?}", e);
 					}
 					Err(e) => {
 						warn!("Token validation failed: {:?}", e);

@@ -259,8 +259,57 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, 1).await;
 	}
 
+	// Migration 2: API Keys table
+	if version < 2 {
+		// API Keys table
+		sqlx::query(
+			"CREATE TABLE IF NOT EXISTS api_keys (
+			key_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			tn_id INTEGER NOT NULL,
+			key_prefix TEXT NOT NULL,
+			key_hash TEXT NOT NULL,
+			name TEXT,
+			scopes TEXT,
+			expires_at INTEGER,
+			last_used_at INTEGER,
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			FOREIGN KEY (tn_id) REFERENCES tenants(tn_id) ON DELETE CASCADE
+		)",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		// Indexes for api_keys
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_tn_id ON api_keys (tn_id)")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys (key_prefix)")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_expires ON api_keys (expires_at)")
+			.execute(&mut *tx)
+			.await?;
+
+		// Triggers for api_keys
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS api_keys_insert_at AFTER INSERT ON api_keys FOR EACH ROW \
+			BEGIN UPDATE api_keys SET updated_at = unixepoch() WHERE key_id = NEW.key_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS api_keys_updated_at AFTER UPDATE ON api_keys FOR EACH ROW \
+			BEGIN UPDATE api_keys SET updated_at = unixepoch() WHERE key_id = NEW.key_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 2).await;
+	}
+
 	// Future migrations:
-	// if version < 2 { ... migration 2 ...; set_db_version(&mut tx, 2).await; }
+	// if version < 3 { ... migration 3 ...; set_db_version(&mut tx, 3).await; }
 
 	tx.commit().await?;
 

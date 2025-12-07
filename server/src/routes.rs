@@ -89,6 +89,19 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/auth/password", post(auth::handler::post_password))
 		.route("/api/auth/vapid", get(push::handler::get_vapid_public_key))
 
+		// --- WebAuthn (Passkey) Management ---
+		.route("/api/auth/wa/reg", get(auth::webauthn::list_reg))
+		.route("/api/auth/wa/reg/challenge", get(auth::webauthn::get_reg_challenge))
+		.route("/api/auth/wa/reg", post(auth::webauthn::post_reg))
+		.route("/api/auth/wa/reg/{key_id}", delete(auth::webauthn::delete_reg))
+
+		// --- API Key Management ---
+		.route("/api/auth/api-keys", get(auth::api_key::list_api_keys))
+		.route("/api/auth/api-keys", post(auth::api_key::create_api_key))
+		.route("/api/auth/api-keys/{key_id}", get(auth::api_key::get_api_key))
+		.route("/api/auth/api-keys/{key_id}", patch(auth::api_key::update_api_key))
+		.route("/api/auth/api-keys/{key_id}", delete(auth::api_key::delete_api_key))
+
 		// --- Settings API ---
 		.route("/api/settings", get(settings::handler::list_settings))
 		.route("/api/settings/{name}", get(settings::handler::get_setting))
@@ -179,6 +192,9 @@ fn init_public_routes(app: App) -> Router<App> {
 		.route("/api/auth/login-token", get(auth::handler::get_login_token))
 		.route("/api/auth/set-password", post(auth::handler::post_set_password))
 		.route("/api/auth/access-token", get(auth::handler::get_access_token))
+		// WebAuthn login endpoints
+		.route("/api/auth/wa/login/challenge", get(auth::webauthn::get_login_challenge))
+		.route("/api/auth/wa/login", post(auth::webauthn::post_login))
 		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "auth", app.opts.mode));
 
 	// --- CRITICAL: Profile Creation Endpoints (strict rate limiting) ---

@@ -140,6 +140,44 @@ pub async fn generate_vapid_key(worker: &worker::WorkerPool) -> ClResult<KeyPair
 		.map_err(|_| Error::PermissionDenied)
 }
 
+/// API key prefix
+pub const API_KEY_PREFIX: &str = "cl_";
+/// Number of random bytes for API key (256 bits of entropy)
+const API_KEY_RANDOM_BYTES: usize = 32;
+
+/// Generate a new API key
+///
+/// Returns (full_key, prefix_for_display)
+/// - full_key: The complete API key to give to the user (shown only once)
+/// - key_prefix: First 8 chars after prefix for identification in logs/UI
+pub fn generate_api_key() -> (String, String) {
+	use rand::RngCore;
+
+	let mut random_bytes = [0u8; API_KEY_RANDOM_BYTES];
+	rand::rng().fill_bytes(&mut random_bytes);
+
+	let random_part = URL_SAFE_NO_PAD.encode(random_bytes);
+	let full_key = format!("{}{}", API_KEY_PREFIX, random_part);
+	// Key prefix: cl_ + first 8 chars of random part
+	let key_prefix = format!("{}{}", API_KEY_PREFIX, &random_part[..8]);
+
+	(full_key, key_prefix)
+}
+
+/// Hash an API key for storage (using bcrypt like passwords)
+pub async fn hash_api_key(worker: &worker::WorkerPool, key: &str) -> ClResult<Box<str>> {
+	generate_password_hash(worker, key).await
+}
+
+/// Verify an API key against its hash
+pub async fn verify_api_key(
+	worker: &worker::WorkerPool,
+	key: &str,
+	key_hash: Box<str>,
+) -> ClResult<()> {
+	check_password(worker, key, key_hash).await
+}
+
 fn generate_action_token_sync(
 	action_data: ActionToken,
 	private_key: Box<str>,
