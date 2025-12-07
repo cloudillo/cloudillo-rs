@@ -105,6 +105,27 @@ pub struct CreateTenantData<'a> {
 	pub roles: Option<&'a [&'a str]>,
 }
 
+/// Tenant list item from auth adapter
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TenantListItem {
+	pub tn_id: TnId,
+	pub id_tag: Box<str>,
+	pub email: Option<Box<str>>,
+	pub roles: Option<Box<[Box<str>]>>,
+	pub status: Option<Box<str>>,
+	pub created_at: Timestamp,
+}
+
+/// Options for listing tenants
+#[derive(Debug, Default)]
+pub struct ListTenantsOptions<'a> {
+	pub status: Option<&'a str>,
+	pub q: Option<&'a str>,
+	pub limit: Option<u32>,
+	pub offset: Option<u32>,
+}
+
 /// Certificate associated with a tenant
 #[derive(Debug)]
 pub struct CertData {
@@ -147,6 +168,9 @@ pub trait AuthAdapter: Debug + Send + Sync {
 
 	/// Deletes a tenant
 	async fn delete_tenant(&self, id_tag: &str) -> ClResult<()>;
+
+	/// Lists all tenants (for admin use)
+	async fn list_tenants(&self, opts: &ListTenantsOptions<'_>) -> ClResult<Vec<TenantListItem>>;
 
 	// Password management
 	async fn create_tenant_login(&self, id_tag: &str) -> ClResult<AuthLogin>;

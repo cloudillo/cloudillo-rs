@@ -14,6 +14,7 @@ use tower_http::{
 
 use crate::action;
 use crate::action::perm::check_perm_action;
+use crate::admin;
 use crate::auth;
 use crate::core::acme;
 use crate::core::middleware::{optional_auth, request_id_middleware, require_auth};
@@ -61,6 +62,15 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/admin/profile/{id_tag}", patch(profile::update::patch_profile_admin))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_profile("admin")));
 
+	// Admin tenant routes (require_admin - checks for SADM role)
+	let admin_tenant_router = Router::new()
+		.route("/api/admin/tenants", get(admin::tenant::list_tenants))
+		.route(
+			"/api/admin/tenants/{id_tag}/password-reset",
+			post(admin::tenant::send_password_reset),
+		)
+		.layer(middleware::from_fn_with_state(app.clone(), admin::perm::require_admin));
+
 	// File write routes (check_perm_file("write"))
 	let file_router_write = Router::new()
 		.route("/api/file/{file_id}", patch(file::management::patch_file))
@@ -107,6 +117,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.merge(profile_router_read)
 		.merge(profile_router_write)
 		.merge(profile_router_admin)
+		.merge(admin_tenant_router)
 
 		// --- File API (Write) ---
 		// File creation routes - permission controlled at quota/limits level

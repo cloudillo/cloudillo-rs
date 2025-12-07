@@ -90,6 +90,10 @@ impl AuthAdapter for AuthAdapterSqlite {
 		tenant::delete_tenant(&self.db, id_tag).await
 	}
 
+	async fn list_tenants(&self, opts: &ListTenantsOptions<'_>) -> ClResult<Vec<TenantListItem>> {
+		tenant::list_tenants(&self.db, opts).await
+	}
+
 	async fn create_tenant_login(&self, id_tag: &str) -> ClResult<AuthLogin> {
 		auth::create_tenant_login(&self.db, &self.worker, id_tag, &self.jwt_secret_str).await
 	}

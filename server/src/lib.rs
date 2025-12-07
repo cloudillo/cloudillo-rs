@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod action;
+pub mod admin;
 pub mod auth;
 pub mod auth_adapter;
 pub mod blob_adapter;

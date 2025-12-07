@@ -206,3 +206,59 @@ pub(crate) async fn delete_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<()>
 	info!("Tenant deleted: {}", id_tag);
 	Ok(())
 }
+
+/// List all tenants (for admin use)
+pub(crate) async fn list_tenants(
+	db: &SqlitePool,
+	opts: &ListTenantsOptions<'_>,
+) -> ClResult<Vec<TenantListItem>> {
+	// Build dynamic query based on options
+	let mut query = String::from(
+		"SELECT tn_id, id_tag, email, roles, status, created_at FROM tenants WHERE 1=1",
+	);
+
+	if let Some(status) = opts.status {
+		query.push_str(&format!(" AND status = '{}'", status.replace('\'', "''")));
+	}
+
+	if let Some(q) = opts.q {
+		let escaped_q = q.replace('\'', "''");
+		query.push_str(&format!(
+			" AND (id_tag LIKE '%{}%' OR email LIKE '%{}%')",
+			escaped_q, escaped_q
+		));
+	}
+
+	query.push_str(" ORDER BY created_at DESC");
+
+	if let Some(limit) = opts.limit {
+		query.push_str(&format!(" LIMIT {}", limit));
+	}
+
+	if let Some(offset) = opts.offset {
+		query.push_str(&format!(" OFFSET {}", offset));
+	}
+
+	let rows = sqlx::query(&query)
+		.fetch_all(db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+
+	let tenants: Vec<TenantListItem> = rows
+		.into_iter()
+		.map(|row| {
+			let roles_str: Option<Box<str>> = row.try_get("roles").unwrap_or(None);
+			TenantListItem {
+				tn_id: TnId(row.try_get("tn_id").unwrap_or(0)),
+				id_tag: row.try_get("id_tag").unwrap_or_else(|_| "".into()),
+				email: row.try_get("email").unwrap_or(None),
+				roles: parse_str_list_optional(roles_str.as_deref()),
+				status: row.try_get("status").unwrap_or(None),
+				created_at: Timestamp(row.try_get("created_at").unwrap_or(0)),
+			}
+		})
+		.collect();
+
+	Ok(tenants)
+}

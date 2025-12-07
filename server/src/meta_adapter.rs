@@ -98,6 +98,28 @@ pub struct Tenant<S: AsRef<str>> {
 	pub x: HashMap<S, S>,
 }
 
+/// Options for listing tenants in meta adapter
+#[derive(Debug, Default)]
+pub struct ListTenantsMetaOptions {
+	pub limit: Option<u32>,
+	pub offset: Option<u32>,
+}
+
+/// Tenant list item from meta adapter (without cover_pic and x fields)
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize)]
+pub struct TenantListMeta {
+	pub tn_id: TnId,
+	pub id_tag: Box<str>,
+	pub name: Box<str>,
+	#[serde(rename = "type")]
+	pub typ: ProfileType,
+	#[serde(rename = "profilePic")]
+	pub profile_pic: Option<Box<str>>,
+	#[serde(rename = "createdAt")]
+	pub created_at: Timestamp,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateTenantData {
 	#[serde(rename = "idTag", default)]
@@ -568,6 +590,9 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Deletes a tenant
 	async fn delete_tenant(&self, tn_id: TnId) -> ClResult<()>;
+
+	/// Lists all tenants (for admin use)
+	async fn list_tenants(&self, opts: &ListTenantsMetaOptions) -> ClResult<Vec<TenantListMeta>>;
 
 	/// Lists all profiles matching a set of options
 	async fn list_profiles(

@@ -274,3 +274,50 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId) -> ClResult<()> {
 	tx.commit().await.map_err(|_| Error::DbError)?;
 	Ok(())
 }
+
+/// List all tenants (for admin use)
+pub(crate) async fn list(
+	dbr: &SqlitePool,
+	opts: &ListTenantsMetaOptions,
+) -> ClResult<Vec<TenantListMeta>> {
+	let mut query =
+		String::from("SELECT tn_id, id_tag, name, type, profile_pic, created_at FROM tenants");
+
+	query.push_str(" ORDER BY created_at DESC");
+
+	if let Some(limit) = opts.limit {
+		query.push_str(&format!(" LIMIT {}", limit));
+	}
+
+	if let Some(offset) = opts.offset {
+		query.push_str(&format!(" OFFSET {}", offset));
+	}
+
+	let rows = sqlx::query(&query)
+		.fetch_all(dbr)
+		.await
+		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.map_err(|_| Error::DbError)?;
+
+	let tenants: Vec<TenantListMeta> = rows
+		.into_iter()
+		.filter_map(|row| {
+			let typ_str: &str = row.try_get("type").ok()?;
+			let typ = match typ_str {
+				"P" => ProfileType::Person,
+				"C" => ProfileType::Community,
+				_ => return None,
+			};
+			Some(TenantListMeta {
+				tn_id: TnId(row.try_get("tn_id").ok()?),
+				id_tag: row.try_get("id_tag").ok()?,
+				name: row.try_get("name").ok()?,
+				typ,
+				profile_pic: row.try_get("profile_pic").ok()?,
+				created_at: Timestamp(row.try_get("created_at").ok()?),
+			})
+		})
+		.collect();
+
+	Ok(tenants)
+}

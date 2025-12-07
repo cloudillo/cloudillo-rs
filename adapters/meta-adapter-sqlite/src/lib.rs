@@ -96,6 +96,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		tenant::delete(&self.db, tn_id).await
 	}
 
+	async fn list_tenants(&self, opts: &ListTenantsMetaOptions) -> ClResult<Vec<TenantListMeta>> {
+		tenant::list(&self.dbr, opts).await
+	}
+
 	async fn list_profiles(
 		&self,
 		tn_id: TnId,
