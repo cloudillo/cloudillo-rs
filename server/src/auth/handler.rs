@@ -399,11 +399,17 @@ pub async fn get_access_token(
 			.await?;
 
 		info!("Got access token from API key: {}", &token_result);
-		let response = ApiResponse::new(json!({
-			"token": token_result,
-			"scopes": validation.scopes
-		}))
-		.with_req_id(req_id.unwrap_or_default());
+
+		// Create AuthLogin and use return_login for consistent response
+		let auth_login = auth_adapter::AuthLogin {
+			tn_id,
+			id_tag: validation.id_tag.into(),
+			roles: validation.roles.map(|r| r.split(',').map(|s| s.into()).collect()),
+			token: token_result.into(),
+		};
+		let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
+		let response = ApiResponse::new(serde_json::to_value(login_data).unwrap())
+			.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else {
 		// Use authenticated session token - requires auth
