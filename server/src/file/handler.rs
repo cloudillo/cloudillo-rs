@@ -89,12 +89,22 @@ fn serve_file<S: AsRef<str> + Debug>(
 	descriptor: Option<&str>,
 	variant: &meta_adapter::FileVariant<S>,
 	stream: Pin<Box<dyn Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>>,
+	disable_cache: bool,
 ) -> ClResult<response::Response<axum::body::Body>> {
 	let content_type = content_type_from_format(variant.format.as_ref());
 
 	let mut response = axum::response::Response::builder()
 		.header(axum::http::header::CONTENT_TYPE, content_type)
 		.header(axum::http::header::CONTENT_LENGTH, variant.size);
+
+	// Add cache headers for content-addressed (immutable) files
+	if disable_cache {
+		response = response.header(axum::http::header::CACHE_CONTROL, "no-store, no-cache");
+	} else {
+		// Content-addressed files never change - use immutable caching
+		response = response
+			.header(axum::http::header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+	}
 
 	response = response.header("X-Cloudillo-Variant", variant.variant_id.as_ref());
 	if let Some(descriptor) = descriptor {
@@ -148,7 +158,7 @@ pub async fn get_file_variant(
 	info!("variant: {:?}", variant);
 	let stream = app.blob_adapter.read_blob_stream(tn_id, &variant_id).await?;
 
-	serve_file(None, &variant, stream)
+	serve_file(None, &variant, stream, app.opts.disable_cache)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -176,7 +186,7 @@ pub async fn get_file_variant_file_id(
 	let stream = app.blob_adapter.read_blob_stream(tn_id, &variant.variant_id).await?;
 	let descriptor = descriptor::get_file_descriptor(&variants);
 
-	serve_file(Some(&descriptor), variant, stream)
+	serve_file(Some(&descriptor), variant, stream, app.opts.disable_cache)
 }
 
 pub async fn get_file_descriptor(

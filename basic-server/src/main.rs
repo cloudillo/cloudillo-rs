@@ -137,6 +137,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	if let Some(acme_email) = config.acme_email {
 		cloudillo.acme_email(acme_email);
 	}
+	if env::var("DISABLE_CACHE").is_ok() {
+		cloudillo.disable_cache(true);
+	}
 	cloudillo.run().await?;
 	Ok(())
 }

@@ -1,11 +1,13 @@
 //! API routes
 
 use axum::{
-	http::header,
+	body::Body,
+	http::{header, HeaderValue, Request},
 	middleware,
 	routing::{any, delete, get, patch, post, put},
 	Router,
 };
+use tower::Service;
 use tower_http::{
 	compression::CompressionLayer,
 	services::{ServeDir, ServeFile},
@@ -278,11 +280,47 @@ fn init_api_service(app: App) -> Router {
 		.with_state(app)
 }
 
+/// Middleware to add cache headers to static file responses
+async fn static_cache_middleware(
+	disable_cache: bool,
+	request: Request<Body>,
+	mut serve_dir: ServeDir<ServeFile>,
+) -> Result<axum::response::Response, std::convert::Infallible> {
+	let mut response = serve_dir.call(request).await.unwrap();
+
+	// Determine cache policy based on content type
+	let cache_value = if disable_cache {
+		HeaderValue::from_static("no-store, no-cache")
+	} else {
+		// Check content type to determine cache policy
+		let is_html = response
+			.headers()
+			.get(header::CONTENT_TYPE)
+			.and_then(|v| v.to_str().ok())
+			.map(|ct| ct.starts_with("text/html"))
+			.unwrap_or(false);
+
+		if is_html {
+			// index.html: ETag-only, must revalidate on every request
+			HeaderValue::from_static("no-cache, must-revalidate")
+		} else {
+			// Assets (JS, CSS, images): long cache with immutable
+			HeaderValue::from_static("public, max-age=31536000, immutable")
+		}
+	};
+
+	response.headers_mut().insert(header::CACHE_CONTROL, cache_value);
+	Ok(response.map(Body::new))
+}
+
 fn init_app_service(app: App) -> Router {
-	let serve_dir = ServeDir::new(&app.opts.dist_dir)
+	let disable_cache = app.opts.disable_cache;
+	let dist_dir = app.opts.dist_dir.clone();
+
+	let serve_dir = ServeDir::new(&dist_dir)
 		.precompressed_gzip()
 		.precompressed_br()
-		.fallback(ServeFile::new(app.opts.dist_dir.join("index.html")));
+		.fallback(ServeFile::new(dist_dir.join("index.html")));
 
 	let ws_router = Router::new()
 		.route("/ws/bus", any(websocket::get_ws_bus))
@@ -293,7 +331,9 @@ fn init_app_service(app: App) -> Router {
 	Router::new()
 		.route("/.well-known/cloudillo/id-tag", get(auth::handler::get_id_tag))
 		.merge(ws_router)
-		.fallback_service(serve_dir)
+		.fallback(move |request: Request<Body>| {
+			static_cache_middleware(disable_cache, request, serve_dir.clone())
+		})
 		.with_state(app)
 }
 

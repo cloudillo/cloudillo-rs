@@ -96,6 +96,8 @@ pub struct AppBuilderOpts {
 	pub tmp_dir: Box<Path>,
 	pub acme_email: Option<Box<str>>,
 	pub local_address: Box<[Box<str>]>,
+	/// Disable HTTP caching (for development)
+	pub disable_cache: bool,
 }
 
 pub struct AppBuilder {
@@ -120,9 +122,10 @@ impl AppBuilder {
 				base_app_domain: None,
 				base_password: None,
 				dist_dir: PathBuf::from("./dist").into(),
-				tmp_dir: PathBuf::from("./tmp").into(),
+				tmp_dir: PathBuf::from("./data/tmp").into(),
 				acme_email: None,
 				local_address: Box::new([]),
+				disable_cache: false,
 			},
 			worker: None,
 			adapters: Adapters {
@@ -178,6 +181,10 @@ impl AppBuilder {
 		local_address: impl IntoIterator<Item = impl Into<Box<str>>>,
 	) -> &mut Self {
 		self.opts.local_address = local_address.into_iter().map(|addr| addr.into()).collect();
+		self
+	}
+	pub fn disable_cache(&mut self, disable: bool) -> &mut Self {
+		self.opts.disable_cache = disable;
 		self
 	}
 	pub fn worker(&mut self, worker: Arc<worker::WorkerPool>) -> &mut Self {
