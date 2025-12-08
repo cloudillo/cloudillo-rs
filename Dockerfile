@@ -3,6 +3,8 @@
 
 ARG RS_REF=main
 ARG FRONTEND_REF=main
+ARG UID=10001
+ARG GID=10001
 
 # RUST BUILDER STAGE #
 ######################
@@ -16,6 +18,13 @@ RUN git clone --depth 1 --branch ${RS_REF} https://github.com/cloudillo/cloudill
 ENV RUSTC_WRAPPER=""
 RUN cargo build --release
 RUN strip /app/target/release/cloudillo-basic-server
+ARG UID
+ARG GID
+# Create non-root user files for scratch image
+RUN echo "cloudillo:x:${UID}:${GID}::/cloudillo/data:/sbin/nologin" > /etc/passwd.scratch && \
+    echo "cloudillo:x:${GID}:" > /etc/group.scratch
+# Create data directory for scratch image (with placeholder since COPY can't copy empty dirs)
+RUN mkdir -p /cloudillo-data && touch /cloudillo-data/.keep && chmod 0700 /cloudillo-data
 
 # FRONTEND BUILDER STAGE #
 ##########################
@@ -150,10 +159,21 @@ RUN echo "=== Poppler libs: $(ls /staging/lib/ | wc -l) ==="
 ###############
 
 FROM scratch
-WORKDIR /data
+
+# Copy user/group files for non-root execution
+COPY --from=rust-builder /etc/passwd.scratch /etc/passwd
+COPY --from=rust-builder /etc/group.scratch /etc/group
+
+# Copy data directory with correct ownership and preserved permissions
+ARG UID
+ARG GID
+COPY --from=rust-builder --chown=${UID}:${GID} /cloudillo-data /cloudillo/data
+
+WORKDIR /cloudillo
 
 # Copy cloudillo binary and its dependencies
 COPY --from=rust-builder /app/target/release/cloudillo-basic-server /usr/bin/cloudillo
+COPY --from=rust-builder /app/templates /cloudillo/templates
 COPY --from=rust-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=rust-builder /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
 COPY --from=rust-builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libm.so.6 /lib/x86_64-linux-gnu/
@@ -167,8 +187,10 @@ COPY --from=poppler-extractor /staging/lib/ /lib/
 COPY --from=poppler-extractor /staging/lib64/ /lib64/
 
 # Copy assembled frontend dist
-COPY --from=frontend-builder /dist /dist
+COPY --from=frontend-builder /dist /cloudillo/dist
 
 ENV LD_LIBRARY_PATH=/lib
+
+USER cloudillo
 
 CMD ["/usr/bin/cloudillo"]
