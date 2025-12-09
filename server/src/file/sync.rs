@@ -236,7 +236,8 @@ pub async fn sync_file_variants(
 		let create_opts = CreateFile {
 			orig_variant_id: Some(first_variant.variant_id.into()),
 			file_id: Some(file_id.into()), // Set file_id (enables deduplication)
-			owner_tag: None,               // Owned by tenant, not remote user
+			parent_id: None,
+			owner_tag: None, // Owned by tenant, not remote user
 			preset: Some("sync".into()),
 			content_type: format_to_content_type(first_variant.format).into(),
 			file_name: format!("synced.{}", format_to_extension(first_variant.format)).into(),

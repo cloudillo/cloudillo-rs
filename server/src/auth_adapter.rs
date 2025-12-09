@@ -5,7 +5,11 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::fmt::Debug;
 
-use crate::{action::task, prelude::*};
+use crate::{
+	action::task,
+	prelude::*,
+	types::{serialize_timestamp_iso, serialize_timestamp_iso_opt},
+};
 
 /// Action tokens represent user actions
 #[skip_serializing_none]
@@ -51,7 +55,7 @@ pub struct AuthKey {
 	pub key_id: Box<str>,
 	#[serde(rename = "publicKey")]
 	pub public_key: Box<str>,
-	#[serde(rename = "expiresAt")]
+	#[serde(rename = "expiresAt", serialize_with = "serialize_timestamp_iso_opt")]
 	pub expires_at: Option<Timestamp>,
 }
 
@@ -108,12 +112,14 @@ pub struct CreateTenantData<'a> {
 /// Tenant list item from auth adapter
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TenantListItem {
 	pub tn_id: TnId,
 	pub id_tag: Box<str>,
 	pub email: Option<Box<str>>,
 	pub roles: Option<Box<[Box<str>]>>,
 	pub status: Option<Box<str>>,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 }
 
@@ -140,18 +146,17 @@ pub struct CertData {
 /// API key information (without the secret key)
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiKeyInfo {
-	#[serde(rename = "keyId")]
 	pub key_id: i64,
-	#[serde(rename = "keyPrefix")]
 	pub key_prefix: Box<str>,
 	pub name: Option<Box<str>>,
 	pub scopes: Option<Box<str>>,
-	#[serde(rename = "expiresAt")]
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
 	pub expires_at: Option<Timestamp>,
-	#[serde(rename = "lastUsedAt")]
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
 	pub last_used_at: Option<Timestamp>,
-	#[serde(rename = "createdAt")]
+	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 }
 

@@ -98,7 +98,58 @@ impl<'de> Deserialize<'de> for Timestamp {
 	where
 		D: serde::Deserializer<'de>,
 	{
-		Ok(Timestamp(i64::deserialize(deserializer)?))
+		use serde::de::{Error, Visitor};
+
+		struct TimestampVisitor;
+
+		impl<'de> Visitor<'de> for TimestampVisitor {
+			type Value = Timestamp;
+
+			fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+				write!(f, "an integer timestamp or ISO 8601 string")
+			}
+
+			fn visit_i64<E: Error>(self, v: i64) -> Result<Self::Value, E> {
+				Ok(Timestamp(v))
+			}
+
+			fn visit_u64<E: Error>(self, v: u64) -> Result<Self::Value, E> {
+				Ok(Timestamp(v as i64))
+			}
+
+			fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+				use chrono::DateTime;
+				DateTime::parse_from_rfc3339(v)
+					.map(|dt| Timestamp(dt.timestamp()))
+					.map_err(|_| E::custom("invalid ISO 8601 timestamp"))
+			}
+		}
+
+		deserializer.deserialize_any(TimestampVisitor)
+	}
+}
+
+/// Serialize Timestamp as ISO 8601 string for API responses
+pub fn serialize_timestamp_iso<S>(ts: &Timestamp, serializer: S) -> Result<S::Ok, S::Error>
+where
+	S: Serializer,
+{
+	use chrono::DateTime;
+	let dt = DateTime::from_timestamp(ts.0, 0).unwrap_or_default();
+	serializer.serialize_str(&dt.to_rfc3339())
+}
+
+/// Serialize Option<Timestamp> as ISO 8601 string for API responses
+pub fn serialize_timestamp_iso_opt<S>(
+	ts: &Option<Timestamp>,
+	serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+	S: Serializer,
+{
+	match ts {
+		Some(ts) => serialize_timestamp_iso(ts, serializer),
+		None => serializer.serialize_none(),
 	}
 }
 
@@ -267,7 +318,8 @@ pub struct ProfileInfo {
 	pub name: String,
 	pub profile_type: String,
 	pub profile_pic: Option<String>, // file_id
-	pub created_at: u64,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
 }
 
 /// Request body for community profile creation
@@ -291,6 +343,7 @@ pub struct CommunityProfileResponse {
 	pub name: String,
 	pub profile_type: String,
 	pub profile_pic: Option<String>,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 }
 
@@ -326,7 +379,8 @@ pub struct ActionResponse {
 	pub content: String,
 	pub attachments: Vec<String>,
 	pub issuer_tag: String,
-	pub created_at: u64,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
 }
 
 /// List actions query parameters
@@ -360,7 +414,8 @@ pub struct ReactionResponse {
 	#[serde(rename = "type")]
 	pub r#type: String,
 	pub content: Option<String>,
-	pub created_at: u64,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
 }
 
 /// File upload response
@@ -382,6 +437,14 @@ pub struct FileVariantInfo {
 	pub resolution: Option<(u32, u32)>,
 }
 
+/// Tag information with optional usage count
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagInfo {
+	pub tag: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub count: Option<u32>,
+}
+
 // Phase 1: API Response Envelope & Error Types
 //***********************************************
 
@@ -401,6 +464,7 @@ pub struct ApiResponse<T> {
 	pub data: T,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub pagination: Option<PaginationInfo>,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub time: Timestamp,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub req_id: Option<String>,

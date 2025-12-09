@@ -239,7 +239,7 @@ pub async fn verify_register_data(
 	Ok(response)
 }
 
-/// POST /api/profile/verify - Validate domain/id_tag before profile creation
+/// POST /api/profiles/verify - Validate domain/id_tag before profile creation
 /// Requires either authentication OR a valid registration token
 pub async fn post_verify_profile(
 	State(app): State<crate::core::app::App>,
@@ -638,7 +638,7 @@ async fn handle_domain_registration(
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// POST /api/profile/register - Create profile after validation
+/// POST /api/profiles/register - Create profile after validation
 /// Requires a valid registration token (invitation ref)
 pub async fn post_register(
 	State(app): State<crate::core::app::App>,

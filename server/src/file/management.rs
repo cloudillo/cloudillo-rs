@@ -1,15 +1,18 @@
-//! File management (PATCH, DELETE) handlers
+//! File management (PATCH, DELETE, restore) handlers
 
 use axum::{
-	extract::{Path, State},
+	extract::{Path, Query, State},
 	Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
 	core::abac::VisibilityLevel, core::extract::Auth, meta_adapter::UpdateFileOptions, prelude::*,
 	types::Patch,
 };
+
+/// Special folder ID for trash
+const TRASH_FOLDER_ID: &str = "__trash__";
 
 /// PATCH /file/:fileId - Update file metadata
 /// Uses UpdateFileOptions with Patch<> fields for proper null/undefined handling
@@ -33,30 +36,152 @@ pub async fn patch_file(
 	Ok(Json(PatchFileResponse { file_id }))
 }
 
-/// DELETE /file/:fileId - Delete a file
+/// DELETE /file/:fileId - Move file to trash (soft delete)
+/// DELETE /file/:fileId?permanent=true - Permanently delete file (only from trash)
+#[derive(Debug, Deserialize)]
+pub struct DeleteFileQuery {
+	/// If true, permanently delete the file (only works for files already in trash)
+	#[serde(default)]
+	pub permanent: bool,
+}
+
 #[derive(Serialize)]
 pub struct DeleteFileResponse {
 	#[serde(rename = "fileId")]
 	pub file_id: String,
+	/// True if file was permanently deleted, false if moved to trash
+	pub permanent: bool,
 }
 
 pub async fn delete_file(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(file_id): Path<String>,
+	Query(query): Query<DeleteFileQuery>,
 ) -> ClResult<Json<DeleteFileResponse>> {
 	// Check if file exists
-	if let Some(_file) = app.meta_adapter.read_file(auth.tn_id, &file_id).await? {
-		// TODO: If it's a metadata-only document ('M' status), clear CRDT content
-		// For now, just delete the file entry
+	let file = app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or_else(|| {
+		warn!("delete_file: File {} not found", file_id);
+		Error::NotFound
+	})?;
+
+	if query.permanent {
+		// Permanent delete - only allowed if file is in trash
+		if file.parent_id.as_deref() != Some(TRASH_FOLDER_ID) {
+			return Err(Error::ValidationError(
+				"Permanent delete only allowed for files in trash. Move to trash first.".into(),
+			));
+		}
+
+		// Actually delete from database
+		app.meta_adapter.delete_file(auth.tn_id, &file_id).await?;
+		info!("User {} permanently deleted file {}", auth.id_tag, file_id);
+
+		Ok(Json(DeleteFileResponse { file_id, permanent: true }))
+	} else {
+		// Soft delete - move to trash folder
+		app.meta_adapter
+			.update_file_data(
+				auth.tn_id,
+				&file_id,
+				&UpdateFileOptions {
+					parent_id: Patch::Value(TRASH_FOLDER_ID.to_string()),
+					..Default::default()
+				},
+			)
+			.await?;
+
+		info!("User {} moved file {} to trash", auth.id_tag, file_id);
+
+		Ok(Json(DeleteFileResponse { file_id, permanent: false }))
+	}
+}
+
+/// POST /file/:fileId/restore - Restore file from trash
+#[derive(Debug, Deserialize)]
+pub struct RestoreFileRequest {
+	/// Target folder to restore to. If null/missing, restores to root.
+	#[serde(rename = "parentId")]
+	pub parent_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RestoreFileResponse {
+	#[serde(rename = "fileId")]
+	pub file_id: String,
+	#[serde(rename = "parentId")]
+	pub parent_id: Option<String>,
+}
+
+pub async fn restore_file(
+	State(app): State<App>,
+	Auth(auth): Auth,
+	Path(file_id): Path<String>,
+	Json(req): Json<RestoreFileRequest>,
+) -> ClResult<Json<RestoreFileResponse>> {
+	// Check if file exists and is in trash
+	let file = app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or_else(|| {
+		warn!("restore_file: File {} not found", file_id);
+		Error::NotFound
+	})?;
+
+	if file.parent_id.as_deref() != Some(TRASH_FOLDER_ID) {
+		return Err(Error::ValidationError("File is not in trash".into()));
 	}
 
-	// Delete the file
-	app.meta_adapter.delete_file(auth.tn_id, &file_id).await?;
+	// Move file to target folder (or root if not specified)
+	let target_parent_id = req.parent_id.clone();
+	app.meta_adapter
+		.update_file_data(
+			auth.tn_id,
+			&file_id,
+			&UpdateFileOptions {
+				parent_id: match &target_parent_id {
+					Some(id) => Patch::Value(id.clone()),
+					None => Patch::Null, // Move to root
+				},
+				..Default::default()
+			},
+		)
+		.await?;
 
-	info!("User {} deleted file {}", auth.id_tag, file_id);
+	info!("User {} restored file {} to {:?}", auth.id_tag, file_id, target_parent_id);
 
-	Ok(Json(DeleteFileResponse { file_id }))
+	Ok(Json(RestoreFileResponse { file_id, parent_id: target_parent_id }))
+}
+
+/// DELETE /trash - Empty trash (permanently delete all files in trash)
+#[derive(Serialize)]
+pub struct EmptyTrashResponse {
+	/// Number of files permanently deleted
+	pub deleted_count: usize,
+}
+
+pub async fn empty_trash(
+	State(app): State<App>,
+	Auth(auth): Auth,
+) -> ClResult<Json<EmptyTrashResponse>> {
+	// List all files in trash
+	let trash_files = app
+		.meta_adapter
+		.list_files(
+			auth.tn_id,
+			&crate::meta_adapter::ListFileOptions {
+				parent_id: Some(TRASH_FOLDER_ID.to_string()),
+				..Default::default()
+			},
+		)
+		.await?;
+
+	let mut deleted_count = 0;
+	for file in &trash_files {
+		app.meta_adapter.delete_file(auth.tn_id, &file.file_id).await?;
+		deleted_count += 1;
+	}
+
+	info!("User {} emptied trash ({} files deleted)", auth.id_tag, deleted_count);
+
+	Ok(Json(EmptyTrashResponse { deleted_count }))
 }
 
 /// Upgrade file visibility to match target visibility (only if more permissive)

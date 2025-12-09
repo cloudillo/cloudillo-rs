@@ -187,22 +187,22 @@ pub async fn list_api_keys(
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// GET /api/api-keys/{id} - Get a specific API key by ID
+/// GET /api/idp/api-keys/{api_key_id} - Get a specific API key by ID
 #[axum::debug_handler]
 pub async fn get_api_key(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
-	Path(key_id): Path<i32>,
+	Path(api_key_id): Path<i32>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ApiKeyResponse>>)> {
 	// Parse id_tag into prefix and domain
 	let (id_tag_prefix, id_tag_domain) = parse_id_tag(&id_tag)?;
 
 	info!(
-		key_id = %key_id,
+		api_key_id = %api_key_id,
 		id_tag_prefix = %id_tag_prefix,
 		id_tag_domain = %id_tag_domain,
-		"GET /api/api-keys/:id - Getting API key"
+		"GET /api/idp/api-keys/:api_key_id - Getting API key"
 	);
 
 	// Verify Identity Provider adapter is available
@@ -219,7 +219,7 @@ pub async fn get_api_key(
 	};
 
 	let keys = idp_adapter.list_api_keys(opts).await?;
-	let key = keys.into_iter().find(|k| k.id == key_id).ok_or(Error::NotFound)?;
+	let key = keys.into_iter().find(|k| k.id == api_key_id).ok_or(Error::NotFound)?;
 
 	let response_data = ApiKeyResponse::from(key);
 	let mut response = ApiResponse::new(response_data);
@@ -230,22 +230,22 @@ pub async fn get_api_key(
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// DELETE /api/api-keys/{id} - Revoke/delete an API key
+/// DELETE /api/idp/api-keys/{api_key_id} - Revoke/delete an API key
 #[axum::debug_handler]
 pub async fn delete_api_key(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
-	Path(key_id): Path<i32>,
+	Path(api_key_id): Path<i32>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	// Parse id_tag into prefix and domain for logging
 	let (id_tag_prefix, id_tag_domain) = parse_id_tag(&id_tag)?;
 
 	info!(
-		key_id = %key_id,
+		api_key_id = %api_key_id,
 		id_tag_prefix = %id_tag_prefix,
 		id_tag_domain = %id_tag_domain,
-		"DELETE /api/api-keys/:id - Deleting API key"
+		"DELETE /api/idp/api-keys/:api_key_id - Deleting API key"
 	);
 
 	// Verify Identity Provider adapter is available
@@ -255,7 +255,7 @@ pub async fn delete_api_key(
 
 	// Use the ownership-scoped deletion to ensure the key belongs to this identity
 	let deleted = idp_adapter
-		.delete_api_key_for_identity(key_id, &id_tag_prefix, &id_tag_domain)
+		.delete_api_key_for_identity(api_key_id, &id_tag_prefix, &id_tag_domain)
 		.await
 		.map_err(|e| {
 			warn!("Failed to delete API key: {}", e);
@@ -264,7 +264,7 @@ pub async fn delete_api_key(
 
 	if !deleted {
 		warn!(
-			key_id = %key_id,
+			api_key_id = %api_key_id,
 			id_tag_prefix = %id_tag_prefix,
 			id_tag_domain = %id_tag_domain,
 			"Attempted to delete non-existent or unowned API key"

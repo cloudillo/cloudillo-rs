@@ -115,6 +115,7 @@ pub async fn put_profile_image(
 				preset: Some("profile-picture".into()),
 				orig_variant_id: None, // Will be set by generate_image_variants
 				file_id: None,
+				parent_id: None,
 				owner_tag: Some(auth.id_tag.as_ref().into()),
 				content_type: content_type.into(),
 				file_name: format!("{}-profile-pic.jpg", auth.id_tag).into(),
@@ -211,6 +212,7 @@ pub async fn put_cover_image(
 				preset: Some("cover".into()),
 				orig_variant_id: None, // Will be set by generate_image_variants
 				file_id: None,
+				parent_id: None,
 				owner_tag: Some(auth.id_tag.as_ref().into()),
 				content_type: content_type.into(),
 				file_name: format!("{}-cover.jpg", auth.id_tag).into(),

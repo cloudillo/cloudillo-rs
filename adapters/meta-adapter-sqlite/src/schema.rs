@@ -610,8 +610,64 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, 3).await;
 	}
 
+	// Version 4: Folder hierarchy and collections support
+	if version < 4 {
+		// Add parent_id column to files table for folder hierarchy
+		// parent_id references file_id of a folder (file_tp = 'FLDR')
+		// NULL means root level
+		sqlx::query("ALTER TABLE files ADD COLUMN parent_id TEXT")
+			.execute(&mut *tx)
+			.await?;
+
+		// Index for efficient folder listing queries
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(tn_id, parent_id)")
+			.execute(&mut *tx)
+			.await?;
+
+		// Collections table for favorites, recent files, bookmarks, pins
+		// Unified table for all user item references across entity types
+		// Item IDs encode their type via prefix (f1~, a1~, etc.)
+		sqlx::query(
+			"CREATE TABLE IF NOT EXISTS collections (
+			tn_id INTEGER NOT NULL,
+			coll_type CHAR(4) NOT NULL,		-- 'FAVR', 'RCNT', 'BKMK', 'PIND'
+			item_id TEXT NOT NULL,			-- Entity ID with built-in type prefix
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			PRIMARY KEY (tn_id, coll_type, item_id)
+		)",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		// Index for listing collections by type with ordering
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_collections ON collections(tn_id, coll_type, created_at DESC)",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		// Trigger for automatic updated_at on INSERT
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS collections_insert_at AFTER INSERT ON collections FOR EACH ROW \
+			BEGIN UPDATE collections SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND coll_type = NEW.coll_type AND item_id = NEW.item_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		// Trigger for automatic updated_at on UPDATE
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS collections_updated_at AFTER UPDATE ON collections FOR EACH ROW \
+			BEGIN UPDATE collections SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND coll_type = NEW.coll_type AND item_id = NEW.item_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 4).await;
+	}
+
 	// Future migrations:
-	// if version < 4 { ... migration 4 ...; set_db_version(&mut tx, 4).await; }
+	// if version < 5 { ... migration 5 ...; set_db_version(&mut tx, 5).await; }
 
 	tx.commit().await?;
 

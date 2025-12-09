@@ -62,7 +62,7 @@ pub async fn list_profiles(
 			}
 			.to_string(),
 			profile_pic: p.profile_pic.map(|s| s.to_string()),
-			created_at: 0, // Not available in Profile type
+			created_at: crate::types::Timestamp::default(), // Not available in Profile type
 		})
 		.collect();
 

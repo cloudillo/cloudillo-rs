@@ -23,18 +23,42 @@ pub(crate) async fn list(
 	tn_id: TnId,
 	opts: &ListFileOptions,
 ) -> ClResult<Vec<FileView>> {
+	// When collection filter is set, we JOIN with collections table
+	let has_collection = opts.collection.is_some();
+
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT f.file_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+		"SELECT f.f_id, f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
 		        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
 		 FROM files f
-		 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
-		 WHERE f.tn_id="
+		 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag",
 	);
+
+	// Add collection JOIN if needed
+	if let Some(coll_type) = &opts.collection {
+		query.push(
+			" INNER JOIN collections c ON c.tn_id=f.tn_id AND c.item_id=f.file_id AND c.coll_type=",
+		);
+		query.push_bind(coll_type.as_str());
+	}
+
+	query.push(" WHERE f.tn_id=");
 	query.push_bind(tn_id.0);
 
 	if let Some(file_id) = &opts.file_id {
 		query.push(" AND f.file_id=").push_bind(file_id.as_str());
 	}
+
+	// Filter by parent folder
+	if let Some(parent_id) = &opts.parent_id {
+		if parent_id == "__root__" {
+			// Explicit root: files with no parent (not in any folder, not in trash)
+			query.push(" AND f.parent_id IS NULL");
+		} else {
+			// Specific folder (including "__trash__" for trash contents)
+			query.push(" AND f.parent_id=").push_bind(parent_id.as_str());
+		}
+	}
+	// Note: If parent_id is not specified, return all files (for search, etc.)
 
 	if let Some(tag) = &opts.tag {
 		query.push(" AND f.tags LIKE ").push_bind(format!("%{}%", tag));
@@ -72,7 +96,12 @@ pub(crate) async fn list(
 		query.push(" AND f.status != 'D'");
 	}
 
-	query.push(" ORDER BY f.created_at DESC LIMIT ");
+	// Order by collection updated_at when filtering by collection, otherwise by file created_at
+	if has_collection {
+		query.push(" ORDER BY c.updated_at DESC LIMIT ");
+	} else {
+		query.push(" ORDER BY f.created_at DESC LIMIT ");
+	}
 	query.push_bind(opts._limit.unwrap_or(100) as i64);
 
 	let res = query
@@ -111,8 +140,14 @@ pub(crate) async fn list(
 		let visibility: Option<String> = row.try_get("visibility").ok();
 		let visibility = visibility.and_then(|s| s.chars().next());
 
+		// Use @{f_id} as fallback when file_id is NULL (for pending files)
+		let f_id: i64 = row.try_get("f_id")?;
+		let file_id: Option<Box<str>> = row.try_get("file_id").ok().flatten();
+		let file_id = file_id.unwrap_or_else(|| format!("@{}", f_id).into());
+
 		Ok(FileView {
-			file_id: row.try_get("file_id")?,
+			file_id,
+			parent_id: row.try_get("parent_id").ok(),
 			owner,
 			preset: row.try_get("preset")?,
 			content_type: row.try_get("content_type")?,
@@ -366,8 +401,8 @@ pub(crate) async fn create(
 		}
 	}
 
-	let res = sqlx::query("INSERT INTO files (tn_id, file_id, status, owner_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
-		.bind(tn_id.0).bind(opts.file_id).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility)
+	let res = sqlx::query("INSERT INTO files (tn_id, file_id, parent_id, status, owner_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
+		.bind(tn_id.0).bind(opts.file_id).bind(opts.parent_id).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility)
 		.fetch_one(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 	Ok(FileId::FId(res.get(0)))
@@ -597,7 +632,7 @@ pub(crate) async fn finalize_file(
 	Ok(())
 }
 
-/// Update file metadata (name, visibility, status)
+/// Update file metadata (name, parent folder, visibility, status)
 pub(crate) async fn update_data(
 	db: &SqlitePool,
 	tn_id: TnId,
@@ -611,6 +646,9 @@ pub(crate) async fn update_data(
 
 	if !opts.file_name.is_undefined() {
 		set_clauses.push("file_name = ?");
+	}
+	if !opts.parent_id.is_undefined() {
+		set_clauses.push("parent_id = ?");
 	}
 	if !opts.visibility.is_undefined() {
 		set_clauses.push("visibility = ?");
@@ -631,6 +669,14 @@ pub(crate) async fn update_data(
 	// Bind values in the same order as set_clauses
 	if !opts.file_name.is_undefined() {
 		let val: Option<&str> = match &opts.file_name {
+			Patch::Null => None,
+			Patch::Value(v) => Some(v.as_str()),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.parent_id.is_undefined() {
+		let val: Option<&str> = match &opts.parent_id {
 			Patch::Null => None,
 			Patch::Value(v) => Some(v.as_str()),
 			Patch::Undefined => unreachable!(),
@@ -675,7 +721,7 @@ pub(crate) async fn read(
 			.parse::<i64>()
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 		sqlx::query(
-			"SELECT f.file_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
 			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
@@ -690,7 +736,7 @@ pub(crate) async fn read(
 	} else {
 		// Content-addressable ID - query by file_id
 		sqlx::query(
-			"SELECT f.file_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
 			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
@@ -742,6 +788,7 @@ pub(crate) async fn read(
 
 			Ok(Some(FileView {
 				file_id: row.try_get("file_id").map_err(|_| Error::DbError)?,
+				parent_id: row.try_get("parent_id").ok(),
 				owner,
 				preset: row.try_get("preset").ok(),
 				content_type: row.try_get("content_type").ok(),

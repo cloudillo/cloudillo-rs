@@ -117,6 +117,7 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 	let create_opts = CreateFile {
 		orig_variant_id: None,
 		file_id: Some(file_id.clone().into()),
+		parent_id: None,
 		owner_tag: Some(context.issuer.clone().into()),
 		preset: None,
 		content_type: content_type.into(),

@@ -416,6 +416,6 @@ pub(crate) async fn get_info(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClRe
 		name: row.get("name"),
 		profile_type: profile_type.into(),
 		profile_pic: row.get("profile_pic"),
-		created_at: created_at as u64,
+		created_at: Timestamp(created_at),
 	})
 }

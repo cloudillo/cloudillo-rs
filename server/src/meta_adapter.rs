@@ -7,7 +7,7 @@ use std::{cmp::Ordering, collections::HashMap, fmt::Debug};
 
 use crate::{
 	prelude::*,
-	types::{Patch, Timestamp, TnId},
+	types::{serialize_timestamp_iso, serialize_timestamp_iso_opt, Patch, Timestamp, TnId},
 };
 
 // Tenants, profiles
@@ -42,22 +42,20 @@ pub enum ProfileConnectionStatus {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RefData {
-	#[serde(rename = "refId")]
 	pub ref_id: Box<str>,
 	pub r#type: Box<str>,
 	pub description: Option<Box<str>>,
-	#[serde(rename = "createdAt")]
+	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
-	#[serde(rename = "expiresAt")]
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
 	pub expires_at: Option<Timestamp>,
 	/// Usage count: None = unlimited, Some(n) = n uses remaining
 	pub count: Option<u32>,
 	/// Resource ID for share links (e.g., file_id for share.file type)
-	#[serde(rename = "resourceId")]
 	pub resource_id: Option<Box<str>>,
 	/// Access level for share links ('R'=Read, 'W'=Write)
-	#[serde(rename = "accessLevel")]
 	pub access_level: Option<char>,
 }
 
@@ -81,19 +79,17 @@ pub struct CreateRefOptions {
 
 #[skip_serializing_none]
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Tenant<S: AsRef<str>> {
 	#[serde(rename = "id")]
 	pub tn_id: TnId,
-	#[serde(rename = "idTag")]
 	pub id_tag: S,
 	pub name: S,
 	#[serde(rename = "type")]
 	pub typ: ProfileType,
-	#[serde(rename = "profilePic")]
 	pub profile_pic: Option<S>,
-	#[serde(rename = "coverPic")]
 	pub cover_pic: Option<S>,
-	#[serde(rename = "createdAt")]
+	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 	pub x: HashMap<S, S>,
 }
@@ -108,15 +104,15 @@ pub struct ListTenantsMetaOptions {
 /// Tenant list item from meta adapter (without cover_pic and x fields)
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TenantListMeta {
 	pub tn_id: TnId,
 	pub id_tag: Box<str>,
 	pub name: Box<str>,
 	#[serde(rename = "type")]
 	pub typ: ProfileType,
-	#[serde(rename = "profilePic")]
 	pub profile_pic: Option<Box<str>>,
-	#[serde(rename = "createdAt")]
+	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 }
 
@@ -157,12 +153,14 @@ pub struct ListProfileOptions {
 
 /// Profile data returned from adapter queries
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProfileData {
 	pub id_tag: Box<str>,
 	pub name: Box<str>,
 	pub profile_type: Box<str>, // "person" or "community"
 	pub profile_pic: Option<Box<str>>,
-	pub created_at: u64,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
 }
 
 /// List of profiles response
@@ -309,46 +307,38 @@ pub struct AttachmentView {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActionView {
-	#[serde(rename = "actionId")]
 	pub action_id: Box<str>,
 	#[serde(rename = "type")]
 	pub typ: Box<str>,
-	#[serde(rename = "subType")]
 	pub sub_typ: Option<Box<str>>,
-	#[serde(rename = "parentId")]
 	pub parent_id: Option<Box<str>>,
-	#[serde(rename = "rootId")]
 	pub root_id: Option<Box<str>>,
-	#[serde(rename = "issuer")]
 	pub issuer: ProfileInfo,
-	#[serde(rename = "audience")]
 	pub audience: Option<ProfileInfo>,
-	#[serde(rename = "content")]
 	pub content: Option<serde_json::Value>,
-	#[serde(rename = "attachments")]
 	pub attachments: Option<Vec<AttachmentView>>,
-	#[serde(rename = "subject")]
 	pub subject: Option<Box<str>>,
-	#[serde(rename = "createdAt")]
+	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
-	#[serde(rename = "expiresAt")]
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
 	pub expires_at: Option<Timestamp>,
-	#[serde(rename = "status")]
 	pub status: Option<Box<str>>,
-	#[serde(rename = "stat")]
 	pub stat: Option<serde_json::Value>,
 	pub visibility: Option<char>,
 }
 
 /// Reaction data
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReactionData {
 	pub id: Box<str>,
 	pub action_id: Box<str>,
 	pub reactor_id_tag: Box<str>,
 	pub r#type: Box<str>,
 	pub content: Option<Box<str>>,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 }
 
@@ -379,23 +369,20 @@ pub enum FileStatus {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileView {
-	#[serde(rename = "fileId")]
 	pub file_id: Box<str>,
+	pub parent_id: Option<Box<str>>, // Parent folder file_id (None = root)
 	pub owner: Option<ProfileInfo>,
 	pub preset: Option<Box<str>>,
-	#[serde(rename = "contentType")]
 	pub content_type: Option<Box<str>>,
-	#[serde(rename = "fileName")]
 	pub file_name: Box<str>,
-	#[serde(rename = "fileTp")]
-	pub file_tp: Option<Box<str>>, // 'BLOB', 'CRDT', 'RTDB'
-	#[serde(rename = "createdAt")]
+	pub file_tp: Option<Box<str>>, // 'BLOB', 'CRDT', 'RTDB', 'FLDR'
+	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 	pub status: FileStatus,
 	pub tags: Option<Vec<Box<str>>>,
 	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
-	#[serde(rename = "accessLevel")]
 	pub access_level: Option<crate::types::AccessLevel>, // User's access level to this file (R/W)
 }
 
@@ -461,6 +448,8 @@ pub struct ListFileOptions {
 	pub _limit: Option<u32>,
 	#[serde(rename = "fileId")]
 	pub file_id: Option<String>,
+	#[serde(rename = "parentId")]
+	pub parent_id: Option<String>, // Filter by parent folder (None = root, "__trash__" = trash)
 	pub tag: Option<String>,
 	pub preset: Option<String>,
 	pub variant: Option<String>,
@@ -468,17 +457,20 @@ pub struct ListFileOptions {
 	pub status: Option<FileStatus>,
 	#[serde(rename = "fileTp")]
 	pub file_type: Option<String>,
+	/// Collection filter: 'FAVR', 'RCNT', 'BKMK', 'PIND'
+	pub collection: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct CreateFile {
 	pub orig_variant_id: Option<Box<str>>,
 	pub file_id: Option<Box<str>>,
+	pub parent_id: Option<Box<str>>, // Parent folder file_id (None = root)
 	pub owner_tag: Option<Box<str>>,
 	pub preset: Option<Box<str>>,
 	pub content_type: Box<str>,
 	pub file_name: Box<str>,
-	pub file_tp: Option<Box<str>>, // 'BLOB', 'CRDT', 'RTDB' - defaults to 'BLOB'
+	pub file_tp: Option<Box<str>>, // 'BLOB', 'CRDT', 'RTDB', 'FLDR' - defaults to 'BLOB'
 	pub created_at: Option<Timestamp>,
 	pub tags: Option<Vec<Box<str>>>,
 	pub x: Option<serde_json::Value>,
@@ -500,10 +492,40 @@ pub struct CreateFileVariant {
 pub struct UpdateFileOptions {
 	#[serde(default, rename = "fileName")]
 	pub file_name: Patch<String>,
+	#[serde(default, rename = "parentId")]
+	pub parent_id: Patch<String>, // Move file to different folder (null = root)
 	#[serde(default)]
 	pub visibility: Patch<char>,
 	#[serde(default)]
 	pub status: Patch<char>,
+}
+
+// Collections (Favorites, Recent, Bookmarks, Pins)
+//**************************************************
+
+/// Collection types
+/// - FAVR: Favorites (starred items)
+/// - RCNT: Recent (recently accessed, rolling limit 50)
+/// - BKMK: Bookmarks (saved for later)
+/// - PIND: Pinned (pinned to top)
+pub const COLLECTION_TYPES: [&str; 4] = ["FAVR", "RCNT", "BKMK", "PIND"];
+
+/// Rolling limit for recent items collection
+pub const RECENT_COLLECTION_LIMIT: u32 = 50;
+
+/// Item in a collection
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionItem {
+	/// Entity ID with type prefix (f1~..., a1~..., etc.)
+	pub item_id: Box<str>,
+	/// When item was added to collection
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+	/// When item was last updated in collection
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub updated_at: Timestamp,
 }
 
 // Push Subscriptions
@@ -533,13 +555,14 @@ pub struct PushSubscriptionKeys {
 
 /// Full push subscription record stored in database
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PushSubscription {
 	/// Unique subscription ID
 	pub id: u64,
 	/// The subscription data (endpoint, keys, etc.)
 	pub subscription: PushSubscriptionData,
 	/// When this subscription was created
-	#[serde(rename = "createdAt")]
+	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 }
 
@@ -899,8 +922,20 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// Tag Management
 	//***************
-	/// List all tags for a tenant, optionally filtered by prefix
-	async fn list_tags(&self, tn_id: TnId, prefix: Option<&str>) -> ClResult<Vec<String>>;
+	/// List all tags for a tenant
+	///
+	/// # Arguments
+	/// * `tn_id` - Tenant ID
+	/// * `prefix` - Optional prefix filter
+	/// * `with_counts` - If true, include file counts per tag
+	/// * `limit` - Optional limit on number of tags returned
+	async fn list_tags(
+		&self,
+		tn_id: TnId,
+		prefix: Option<&str>,
+		with_counts: bool,
+		limit: Option<u32>,
+	) -> ClResult<Vec<TagInfo>>;
 
 	/// Add a tag to a file
 	async fn add_tag(&self, tn_id: TnId, file_id: &str, tag: &str) -> ClResult<Vec<String>>;
@@ -946,6 +981,33 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Removes a push subscription. Called when a subscription becomes invalid
 	/// (e.g., 410 Gone response from push service) or when user unsubscribes.
 	async fn delete_push_subscription(&self, tn_id: TnId, subscription_id: u64) -> ClResult<()>;
+
+	// Collection Management (Favorites, Recent, Bookmarks, Pins)
+	//**********************************************************
+
+	/// List items in a collection (FAVR, RCNT, BKMK, PIND)
+	async fn list_collection(
+		&self,
+		tn_id: TnId,
+		coll_type: &str,
+		limit: Option<u32>,
+	) -> ClResult<Vec<CollectionItem>>;
+
+	/// Add an item to a collection
+	/// For RCNT (recent), this should also maintain the rolling limit (e.g., 50 items)
+	async fn add_to_collection(&self, tn_id: TnId, coll_type: &str, item_id: &str) -> ClResult<()>;
+
+	/// Remove an item from a collection
+	async fn remove_from_collection(
+		&self,
+		tn_id: TnId,
+		coll_type: &str,
+		item_id: &str,
+	) -> ClResult<()>;
+
+	/// Check if an item is in a collection
+	async fn is_in_collection(&self, tn_id: TnId, coll_type: &str, item_id: &str)
+		-> ClResult<bool>;
 }
 
 #[cfg(test)]

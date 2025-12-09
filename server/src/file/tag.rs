@@ -12,20 +12,31 @@ const TAG_FORBIDDEN_CHARS: &[char] = &[' ', ',', '#', '\t', '\n'];
 
 /// GET /tag - List all tags for the tenant
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListTagsQuery {
 	pub prefix: Option<String>,
+	pub with_counts: Option<bool>,
+	pub limit: Option<u32>,
+}
+
+/// Response for list tags endpoint
+#[derive(Serialize)]
+pub struct ListTagsResponse {
+	pub tags: Vec<TagInfo>,
 }
 
 pub async fn list_tags(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Query(q): Query<ListTagsQuery>,
-) -> ClResult<Json<serde_json::Value>> {
-	let tags = app.meta_adapter.list_tags(auth.tn_id, q.prefix.as_deref()).await?;
+) -> ClResult<Json<ListTagsResponse>> {
+	let with_counts = q.with_counts.unwrap_or(false);
+	let tags = app
+		.meta_adapter
+		.list_tags(auth.tn_id, q.prefix.as_deref(), with_counts, q.limit)
+		.await?;
 
-	Ok(Json(serde_json::json!({
-		"tags": tags
-	})))
+	Ok(Json(ListTagsResponse { tags }))
 }
 
 /// PUT /file/:fileId/tag/:tag - Add a tag to a file

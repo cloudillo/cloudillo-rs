@@ -19,7 +19,7 @@ use crate::{
 	utils::derive_name_from_id_tag,
 };
 
-/// PUT /api/profile/{id_tag} - Create a new community profile
+/// PUT /api/profiles/{id_tag} - Create a new community profile
 pub async fn put_community_profile(
 	State(app): State<App>,
 	Auth(auth): Auth,

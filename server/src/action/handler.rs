@@ -220,7 +220,7 @@ pub async fn post_inbox_sync(
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// GET /api/action/:action_id - Get a single action
+/// GET /api/actions/:action_id - Get a single action
 pub async fn get_action_by_id(
 	State(app): State<App>,
 	_tn_id: TnId,
@@ -238,7 +238,7 @@ pub async fn get_action_by_id(
 	}
 }
 
-/// PATCH /api/action/:action_id - Update action (if not yet federated)
+/// PATCH /api/actions/:action_id - Update action (if not yet federated)
 pub async fn patch_action(
 	State(app): State<App>,
 	_tn_id: TnId,
@@ -258,7 +258,7 @@ pub async fn patch_action(
 	Err(Error::ServiceUnavailable("action updates not yet implemented".into()))
 }
 
-/// DELETE /api/action/:action_id - Delete action
+/// DELETE /api/actions/:action_id - Delete action
 pub async fn delete_action(
 	State(app): State<App>,
 	_tn_id: TnId,
@@ -273,7 +273,7 @@ pub async fn delete_action(
 	Ok((StatusCode::NO_CONTENT, Json(response)))
 }
 
-/// POST /api/action/:action_id/accept - Accept an action
+/// POST /api/actions/:action_id/accept - Accept an action
 pub async fn post_action_accept(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -348,7 +348,7 @@ pub async fn post_action_accept(
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// POST /api/action/:action_id/reject - Reject an action
+/// POST /api/actions/:action_id/reject - Reject an action
 pub async fn post_action_reject(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -423,7 +423,7 @@ pub async fn post_action_reject(
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// POST /api/action/:action_id/stat - Update action statistics
+/// POST /api/actions/:action_id/stat - Update action statistics
 #[derive(Default, Deserialize)]
 pub struct UpdateActionStatRequest {
 	#[serde(default, rename = "commentsRead")]
@@ -453,7 +453,7 @@ pub async fn post_action_stat(
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// POST /api/action/:action_id/reaction - Add reaction to action
+/// POST /api/actions/:action_id/reaction - Add reaction to action
 pub async fn post_action_reaction(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -486,7 +486,7 @@ pub async fn post_action_reaction(
 		reactor_id_tag: reactor_id_tag.into(),
 		r#type: reaction.r#type,
 		content: reaction.content,
-		created_at: crate::types::Timestamp::now().0 as u64,
+		created_at: crate::types::Timestamp::now(),
 	};
 
 	let response = ApiResponse::new(reaction_response).with_req_id(req_id.unwrap_or_default());

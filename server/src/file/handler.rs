@@ -114,7 +114,7 @@ fn serve_file<S: AsRef<str> + Debug>(
 	Ok(response.body(axum::body::Body::from_stream(stream))?)
 }
 
-/// GET /api/file
+/// GET /api/files
 pub async fn get_file_list(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -148,7 +148,7 @@ pub async fn get_file_list(
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// GET /api/file/variant/{variant_id}
+/// GET /api/files/variant/{variant_id}
 pub async fn get_file_variant(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -645,7 +645,7 @@ async fn handle_post_raw_stream(
 	Ok(json!({"fileId": format!("@{}", f_id)}))
 }
 
-/// POST /api/file - File creation for non-blob types (CRDT, RTDB, etc.)
+/// POST /api/files - File creation for non-blob types (CRDT, RTDB, etc.)
 /// Accepts JSON body with metadata:
 /// {
 ///   "fileTp": "CRDT" | "RTDB" | etc.,
@@ -661,7 +661,7 @@ pub async fn post_file(
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	use tracing::info;
 
-	info!("POST /api/file - Creating file with fileTp={}", req.file_tp);
+	info!("POST /api/files - Creating file with fileTp={}", req.file_tp);
 
 	// Generate file_id
 	let file_id = utils::random_id()?;
@@ -676,6 +676,7 @@ pub async fn post_file(
 				preset: Some("default".into()),
 				orig_variant_id: Some(file_id.clone().into()),
 				file_id: Some(file_id.clone().into()),
+				parent_id: None, // TODO: Add parent_id support for CRDT/RTDB files
 				owner_tag: Some(auth.id_tag.clone()),
 				content_type: content_type.into(),
 				file_name: "file".into(),
@@ -766,6 +767,7 @@ pub async fn post_file_blob(
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: Some(orig_variant_id),
 						file_id: None,
+						parent_id: None,
 						owner_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
@@ -806,6 +808,7 @@ pub async fn post_file_blob(
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: Some(orig_variant_id),
 						file_id: None,
+						parent_id: None,
 						owner_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
@@ -843,6 +846,7 @@ pub async fn post_file_blob(
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: None,
 						file_id: None,
+						parent_id: None,
 						owner_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
@@ -881,6 +885,7 @@ pub async fn post_file_blob(
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: None,
 						file_id: None,
+						parent_id: None,
 						owner_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
@@ -919,6 +924,7 @@ pub async fn post_file_blob(
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: None,
 						file_id: None,
+						parent_id: None,
 						owner_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
