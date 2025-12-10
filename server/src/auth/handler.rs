@@ -10,14 +10,17 @@ use std::net::SocketAddr;
 
 use crate::{
 	action::task,
-	auth_adapter,
+	auth_adapter::{self, ListTenantsOptions},
 	core::{
 		extract::{IdTag, OptionalAuth, OptionalRequestId},
 		rate_limit::{PenaltyReason, RateLimitApi},
 		roles::expand_roles,
 		Auth,
 	},
+	email::{get_tenant_lang, EmailModule, EmailTaskParams},
+	meta_adapter::ListRefsOptions,
 	prelude::*,
+	r#ref::handler::{create_ref_internal, CreateRefInternalParams},
 	types::ApiResponse,
 };
 
@@ -145,13 +148,12 @@ pub async fn get_login_token(
 
 /// POST /auth/logout - Invalidate current access token
 pub async fn post_logout(
-	State(app): State<App>,
+	State(_app): State<App>,
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	// For now, invalidate the token
-	// Note: This is a no-op in SQLite adapter but can be improved with token blacklist
-	app.auth_adapter.invalidate_token("").await?;
+	// Note: Token invalidation could be implemented with a token blacklist table
+	// For now, tokens remain valid until expiration (short-lived access tokens)
 
 	info!("User {} logged out", auth.id_tag);
 
@@ -452,17 +454,42 @@ pub async fn get_access_token(
 
 /// # GET /api/auth/proxy-token
 /// Generate a proxy token for federation (allows this user to authenticate on behalf of the server)
+/// If `idTag` query parameter is provided and different from the current server, this will
+/// perform a federated token exchange with the target server.
 #[derive(Serialize)]
 pub struct ProxyTokenRes {
 	token: String,
 }
 
+#[derive(Deserialize)]
+pub struct ProxyTokenQuery {
+	#[serde(rename = "idTag")]
+	id_tag: Option<String>,
+}
+
 pub async fn get_proxy_token(
 	State(app): State<App>,
+	IdTag(own_id_tag): IdTag,
 	Auth(auth): Auth,
+	Query(query): Query<ProxyTokenQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxyTokenRes>>)> {
-	info!("Generating proxy token for {}", &auth.id_tag);
+	// If target idTag is specified and different from own server, use federation
+	if let Some(ref target_id_tag) = query.id_tag {
+		if target_id_tag != own_id_tag.as_ref() {
+			info!("Getting federated proxy token for {} -> {}", &auth.id_tag, target_id_tag);
+
+			// Use federation flow: create action token and exchange at target
+			let token = app.request.create_proxy_token(auth.tn_id, target_id_tag, None).await?;
+
+			let response = ApiResponse::new(ProxyTokenRes { token: token.to_string() })
+				.with_req_id(req_id.unwrap_or_default());
+			return Ok((StatusCode::OK, Json(response)));
+		}
+	}
+
+	// Default: create local proxy token (for outgoing federation identity)
+	info!("Generating local proxy token for {}", &auth.id_tag);
 	let token = app
 		.auth_adapter
 		.create_proxy_token(auth.tn_id, &auth.id_tag, &auth.roles)
@@ -538,6 +565,157 @@ pub async fn post_set_password(
 	let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
+}
+
+/// # POST /api/auth/forgot-password
+/// Request a password reset email (user-initiated)
+/// Always returns success to prevent email enumeration
+#[derive(Deserialize)]
+pub struct ForgotPasswordReq {
+	email: String,
+}
+
+#[derive(Serialize)]
+pub struct ForgotPasswordRes {
+	message: String,
+}
+
+pub async fn post_forgot_password(
+	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(req): Json<ForgotPasswordReq>,
+) -> ClResult<(StatusCode, Json<ApiResponse<ForgotPasswordRes>>)> {
+	let email = req.email.trim().to_lowercase();
+
+	info!(email = %email, ip = %addr.ip(), "Password reset requested");
+
+	// Success response (always returned for security)
+	let success_response = || {
+		ApiResponse::new(ForgotPasswordRes {
+			message: "If an account with this email exists, a password reset link has been sent."
+				.to_string(),
+		})
+		.with_req_id(req_id.clone().unwrap_or_default())
+	};
+
+	// Basic email validation
+	if !email.contains('@') || email.len() < 5 {
+		return Ok((StatusCode::OK, Json(success_response())));
+	}
+
+	// Look up tenant by email
+	let auth_opts =
+		ListTenantsOptions { status: None, q: Some(&email), limit: Some(10), offset: None };
+	let tenants = match app.auth_adapter.list_tenants(&auth_opts).await {
+		Ok(t) => t,
+		Err(e) => {
+			warn!(email = %email, error = ?e, "Failed to look up tenant by email");
+			return Ok((StatusCode::OK, Json(success_response())));
+		}
+	};
+
+	// Find exact email match
+	let tenant = tenants.into_iter().find(|t| t.email.as_deref() == Some(email.as_str()));
+
+	let Some(tenant) = tenant else {
+		info!(email = %email, "No tenant found for email (not revealing)");
+		return Ok((StatusCode::OK, Json(success_response())));
+	};
+
+	let tn_id = tenant.tn_id;
+	let id_tag = tenant.id_tag.to_string();
+
+	// Rate limiting: check recent password reset refs for this tenant
+	// Allow max 1 per hour, 3 per day
+	let opts = ListRefsOptions {
+		typ: Some("password".to_string()),
+		filter: Some("all".to_string()),
+		resource_id: None,
+	};
+	let recent_refs = app.meta_adapter.list_refs(tn_id, &opts).await.unwrap_or_default();
+
+	let now = Timestamp::now().0;
+	let one_hour_ago = now - 3600;
+	let one_day_ago = now - 86400;
+
+	let hourly_count = recent_refs.iter().filter(|r| r.created_at.0 > one_hour_ago).count();
+	let daily_count = recent_refs.iter().filter(|r| r.created_at.0 > one_day_ago).count();
+
+	if hourly_count >= 1 {
+		info!(tn_id = ?tn_id, id_tag = %id_tag, "Password reset rate limited (hourly)");
+		return Ok((StatusCode::OK, Json(success_response())));
+	}
+
+	if daily_count >= 3 {
+		info!(tn_id = ?tn_id, id_tag = %id_tag, "Password reset rate limited (daily)");
+		return Ok((StatusCode::OK, Json(success_response())));
+	}
+
+	// Get tenant meta data for the name
+	let user_name = app
+		.meta_adapter
+		.read_tenant(tn_id)
+		.await
+		.map(|t| t.name.to_string())
+		.unwrap_or_else(|_| id_tag.clone());
+
+	// Create password reset ref
+	let expires_at = Some(Timestamp(now + 86400)); // 24 hours
+	let (ref_id, reset_url) = match create_ref_internal(
+		&app,
+		tn_id,
+		CreateRefInternalParams {
+			id_tag: &id_tag,
+			typ: "password",
+			description: Some("User-initiated password reset"),
+			expires_at,
+			path_prefix: "/reset-password",
+			resource_id: None,
+		},
+	)
+	.await
+	{
+		Ok(result) => result,
+		Err(e) => {
+			warn!(tn_id = ?tn_id, id_tag = %id_tag, error = ?e, "Failed to create password reset ref");
+			return Ok((StatusCode::OK, Json(success_response())));
+		}
+	};
+
+	// Get tenant's preferred language
+	let lang = get_tenant_lang(&app.settings, tn_id).await;
+
+	// Schedule email
+	let email_params = EmailTaskParams {
+		to: email.clone(),
+		subject: None,
+		template_name: "password_reset".to_string(),
+		template_vars: serde_json::json!({
+			"user_name": user_name,
+			"instance_name": "Cloudillo",
+			"reset_link": reset_url,
+			"expire_hours": 24,
+		}),
+		lang,
+		custom_key: Some(format!("pw-reset:{}:{}", tn_id.0, now)),
+	};
+
+	if let Err(e) =
+		EmailModule::schedule_email_task(&app.scheduler, &app.settings, tn_id, email_params).await
+	{
+		warn!(tn_id = ?tn_id, id_tag = %id_tag, error = ?e, "Failed to schedule password reset email");
+		// Still return success to not reveal anything
+	} else {
+		info!(
+			tn_id = ?tn_id,
+			id_tag = %id_tag,
+			ref_id = %ref_id,
+			"Password reset email scheduled"
+		);
+	}
+
+	Ok((StatusCode::OK, Json(success_response())))
 }
 
 // vim: ts=4

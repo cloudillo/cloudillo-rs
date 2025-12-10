@@ -10,10 +10,10 @@ use serde_with::skip_serializing_none;
 use std::collections::HashMap;
 
 use crate::auth_adapter::ListTenantsOptions;
-use crate::email::{EmailModule, EmailTaskParams};
+use crate::email::{get_tenant_lang, EmailModule, EmailTaskParams};
 use crate::meta_adapter::{ListTenantsMetaOptions, ProfileType};
 use crate::prelude::*;
-use crate::r#ref::handler::create_ref_internal;
+use crate::r#ref::handler::{create_ref_internal, CreateRefInternalParams};
 use crate::types::{ApiResponse, Timestamp};
 
 /// Combined tenant view response (auth + meta data)
@@ -142,29 +142,36 @@ pub async fn send_password_reset(
 
 	// Create password reset ref with type "password" (compatible with /auth/set-password)
 	let expires_at = Some(Timestamp(Timestamp::now().0 + 86400)); // 24 hours
-	let (ref_id, reset_url) = create_ref_internal(
+	let (_ref_id, reset_url) = create_ref_internal(
 		&app,
 		tn_id,
-		&id_tag,
-		"password", // CRITICAL: must be "password" for /auth/set-password to accept it
-		Some("Admin-initiated password reset"),
-		expires_at,
-		"/reset-password", // Frontend route (must match AuthRoutes in shell)
+		CreateRefInternalParams {
+			id_tag: &id_tag,
+			typ: "password", // CRITICAL: must be "password" for /auth/set-password to accept it
+			description: Some("Admin-initiated password reset"),
+			expires_at,
+			path_prefix: "/reset-password", // Frontend route (must match AuthRoutes in shell)
+			resource_id: None,
+		},
 	)
 	.await?;
 
+	// Get tenant's preferred language
+	let lang = get_tenant_lang(&app.settings, tn_id).await;
+
 	// Schedule email with password_reset template
+	// Subject is defined in the template frontmatter for multi-language support
 	let email_params = EmailTaskParams {
 		to: email.to_string(),
-		subject: "Reset Your Password".to_string(),
+		subject: None,
 		template_name: "password_reset".to_string(),
 		template_vars: serde_json::json!({
 			"user_name": user_name,
 			"instance_name": "Cloudillo",
 			"reset_link": reset_url,
-			"reset_token": ref_id,
 			"expire_hours": 24,
 		}),
+		lang,
 		custom_key: Some(format!("pw-reset:{}:{}", tn_id.0, Timestamp::now().0)),
 	};
 

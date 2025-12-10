@@ -17,7 +17,6 @@ mod tenant;
 mod utils;
 mod vapid;
 mod variable;
-mod verification;
 mod webauthn;
 
 pub struct AuthAdapterSqlite {
@@ -233,26 +232,6 @@ impl AuthAdapter for AuthAdapterSqlite {
 
 	async fn delete_webauthn_credential(&self, tn_id: TnId, credential_id: &str) -> ClResult<()> {
 		webauthn::delete_webauthn_credential(&self.db, tn_id, credential_id).await
-	}
-
-	async fn create_registration_verification(&self, email: &str) -> ClResult<Box<str>> {
-		verification::create_registration_verification(&self.db, email).await
-	}
-
-	async fn validate_registration_verification(
-		&self,
-		email: &str,
-		vfy_code: &str,
-	) -> ClResult<()> {
-		verification::validate_registration_verification(&self.db, email, vfy_code).await
-	}
-
-	async fn invalidate_token(&self, token: &str) -> ClResult<()> {
-		verification::invalidate_token(token).await
-	}
-
-	async fn cleanup_expired_verifications(&self) -> ClResult<()> {
-		verification::cleanup_expired_verifications(&self.db).await
 	}
 
 	// API Key management

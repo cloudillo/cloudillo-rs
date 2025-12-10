@@ -5,15 +5,14 @@
 
 #![allow(unused)]
 
-use std::{env, path::PathBuf, sync::Arc};
-use tokio::fs;
-
 use cloudillo::{auth_adapter, core::worker, meta_adapter};
 use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use cloudillo_crdt_adapter_redb::{AdapterConfig as CrdtConfig, CrdtAdapterRedb};
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_rtdb_adapter_redb::{AdapterConfig as RtdbConfig, RtdbAdapterRedb};
+use std::{env, path::PathBuf, sync::Arc};
+use tokio::fs;
 
 pub struct Config {
 	pub mode: cloudillo::ServerMode,

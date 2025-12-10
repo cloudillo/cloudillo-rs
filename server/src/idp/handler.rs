@@ -411,6 +411,7 @@ pub async fn create_identity(
 		status: IdentityStatus::Pending,
 		address: create_req.address.as_deref(),
 		address_type,
+		lang: None,
 		expires_at: Some(expires_at),
 	};
 

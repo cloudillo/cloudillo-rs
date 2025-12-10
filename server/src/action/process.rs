@@ -115,7 +115,7 @@ pub async fn verify_action_token(
 
 	// 3. HTTP fetch from remote instance
 	let fetch_result: ClResult<crate::types::ApiResponse<crate::profile::handler::Profile>> =
-		app.request.get_noauth(tn_id, issuer, "/me/keys").await;
+		app.request.get_noauth(tn_id, issuer, "/me").await;
 
 	match fetch_result {
 		Ok(api_response) => {

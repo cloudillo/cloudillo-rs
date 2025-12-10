@@ -18,13 +18,19 @@ pub type TaskId = u64;
 ///
 /// Stores template name and variables instead of rendered content.
 /// Template is rendered at execution time for fresh content.
+/// Subject can be provided explicitly or extracted from template frontmatter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EmailSenderTask {
 	pub tn_id: TnId,
 	pub to: String,
-	pub subject: String,
+	/// Optional subject - if None, will be extracted from template frontmatter
+	#[serde(default)]
+	pub subject: Option<String>,
 	pub template_name: String,
 	pub template_vars: serde_json::Value,
+	/// Optional language code for localized templates (e.g., "hu", "de")
+	#[serde(default)]
+	pub lang: Option<String>,
 }
 
 impl EmailSenderTask {
@@ -32,11 +38,12 @@ impl EmailSenderTask {
 	pub fn new(
 		tn_id: TnId,
 		to: String,
-		subject: String,
+		subject: Option<String>,
 		template_name: String,
 		template_vars: serde_json::Value,
+		lang: Option<String>,
 	) -> Self {
-		Self { tn_id, to, subject, template_name, template_vars }
+		Self { tn_id, to, subject, template_name, template_vars, lang }
 	}
 }
 
@@ -64,21 +71,32 @@ impl Task<App> for EmailSenderTask {
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
-		info!("Executing email task for {} (template: {})", self.to, self.template_name);
+		info!(
+			"Executing email task for {} (template: {}, lang: {:?})",
+			self.to, self.template_name, self.lang
+		);
 
 		// Render template at execution time
-		let (html_body, text_body) = app
+		let render_result = app
 			.email_module
 			.template_engine
-			.render(self.tn_id, &self.template_name, &self.template_vars)
+			.render(self.tn_id, &self.template_name, &self.template_vars, self.lang.as_deref())
 			.await?;
+
+		// Use provided subject or extract from template
+		let subject = self.subject.clone().or(render_result.subject).ok_or_else(|| {
+			Error::ConfigError(format!(
+				"No subject provided and template '{}' has no subject in frontmatter",
+				self.template_name
+			))
+		})?;
 
 		// Build email message
 		let message = EmailMessage {
 			to: self.to.clone(),
-			subject: self.subject.clone(),
-			text_body,
-			html_body: Some(html_body),
+			subject,
+			text_body: render_result.text_body,
+			html_body: Some(render_result.html_body),
 		};
 
 		// Send email
@@ -97,22 +115,43 @@ mod tests {
 	fn test_email_task_creation() {
 		let vars = serde_json::json!({
 			"user_name": "Alice",
-			"verification_token": "abc123",
+			"instance_name": "Cloudillo",
 		});
 
 		let task = EmailSenderTask::new(
 			TnId(1),
 			"user@example.com".to_string(),
-			"Test Email".to_string(),
-			"verification".to_string(),
+			Some("Test Email".to_string()),
+			"welcome".to_string(),
 			vars.clone(),
+			None,
 		);
 
 		assert_eq!(task.tn_id.0, 1);
 		assert_eq!(task.to, "user@example.com");
-		assert_eq!(task.subject, "Test Email");
-		assert_eq!(task.template_name, "verification");
+		assert_eq!(task.subject, Some("Test Email".to_string()));
+		assert_eq!(task.template_name, "welcome");
 		assert_eq!(task.template_vars, vars);
+		assert_eq!(task.lang, None);
+	}
+
+	#[test]
+	fn test_email_task_with_lang() {
+		let vars = serde_json::json!({
+			"user_name": "Béla",
+		});
+
+		let task = EmailSenderTask::new(
+			TnId(1),
+			"user@example.com".to_string(),
+			None, // Subject from template frontmatter
+			"welcome".to_string(),
+			vars.clone(),
+			Some("hu".to_string()),
+		);
+
+		assert_eq!(task.lang, Some("hu".to_string()));
+		assert!(task.subject.is_none());
 	}
 
 	#[test]
@@ -124,9 +163,10 @@ mod tests {
 		let task = EmailSenderTask::new(
 			TnId(1),
 			"user@example.com".to_string(),
-			"Test".to_string(),
+			Some("Test".to_string()),
 			"notification".to_string(),
 			vars,
+			Some("de".to_string()),
 		);
 
 		// Use Task trait's serialize method
@@ -135,6 +175,7 @@ mod tests {
 		// Should be valid JSON
 		assert!(serialized.contains("user@example.com"));
 		assert!(serialized.contains("notification"));
+		assert!(serialized.contains("de"));
 		let deserialized: Result<EmailSenderTask, _> = serde_json::from_str(&serialized);
 		assert!(deserialized.is_ok());
 	}
@@ -147,9 +188,10 @@ mod tests {
 		let task = EmailSenderTask::new(
 			TnId(1),
 			"test@example.com".to_string(),
-			"Test".to_string(),
+			Some("Test".to_string()),
 			"test".to_string(),
 			vars,
+			None,
 		);
 		assert_eq!(task.kind_of(), "email.send");
 	}
@@ -157,23 +199,43 @@ mod tests {
 	#[test]
 	fn test_email_task_template_vars() {
 		let vars = serde_json::json!({
-			"name": "Charlie",
-			"code": "xyz789",
-			"link": "https://example.com/verify",
+			"user_name": "Charlie",
+			"instance_name": "Cloudillo",
+			"welcome_link": "https://example.com/welcome",
 		});
 
 		let task = EmailSenderTask::new(
 			TnId(1),
 			"user@example.com".to_string(),
-			"Verification".to_string(),
-			"verification".to_string(),
+			None, // Subject from frontmatter
+			"welcome".to_string(),
 			vars.clone(),
+			None,
 		);
 
-		assert_eq!(task.template_name, "verification");
-		assert_eq!(task.template_vars["name"], "Charlie");
-		assert_eq!(task.template_vars["code"], "xyz789");
-		assert_eq!(task.template_vars["link"], "https://example.com/verify");
+		assert_eq!(task.template_name, "welcome");
+		assert_eq!(task.template_vars["user_name"], "Charlie");
+		assert_eq!(task.template_vars["instance_name"], "Cloudillo");
+		assert_eq!(task.template_vars["welcome_link"], "https://example.com/welcome");
+	}
+
+	#[test]
+	fn test_email_task_backward_compat() {
+		// Test that old serialized tasks without lang field still deserialize
+		let json = r#"{
+			"tn_id": 1,
+			"to": "user@example.com",
+			"subject": "Test",
+			"template_name": "test",
+			"template_vars": {}
+		}"#;
+
+		let task: Result<EmailSenderTask, _> = serde_json::from_str(json);
+		assert!(task.is_ok());
+		let task = task.unwrap();
+		assert!(task.lang.is_none());
+		// Subject should deserialize from string value
+		assert_eq!(task.subject, Some("Test".to_string()));
 	}
 }
 

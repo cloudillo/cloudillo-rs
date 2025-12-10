@@ -271,6 +271,7 @@ pub struct RegisterRequest {
 	pub app_domain: Option<String>,
 	pub email: String,
 	pub token: String,
+	pub lang: Option<String>,
 }
 
 /// Registration verification request (legacy, kept for compatibility)

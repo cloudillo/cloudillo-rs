@@ -200,6 +200,7 @@ fn init_public_routes(app: App) -> Router<App> {
 		.route("/api/auth/login", post(auth::handler::post_login))
 		.route("/api/auth/login-token", get(auth::handler::get_login_token))
 		.route("/api/auth/set-password", post(auth::handler::post_set_password))
+		.route("/api/auth/forgot-password", post(auth::handler::post_forgot_password))
 		.route("/api/auth/access-token", get(auth::handler::get_access_token))
 		// WebAuthn login endpoints
 		.route("/api/auth/wa/login/challenge", get(auth::webauthn::get_login_challenge))

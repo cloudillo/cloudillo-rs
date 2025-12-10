@@ -33,9 +33,12 @@ pub struct EmailMessage {
 #[derive(Debug, Clone)]
 pub struct EmailTaskParams {
 	pub to: String,
-	pub subject: String,
+	/// Optional subject - if None, will be extracted from template frontmatter
+	pub subject: Option<String>,
 	pub template_name: String,
 	pub template_vars: serde_json::Value,
+	/// Optional language code for localized templates (e.g., "hu", "de")
+	pub lang: Option<String>,
 	pub custom_key: Option<String>,
 }
 
@@ -94,6 +97,7 @@ impl EmailModule {
 			params.subject,
 			params.template_name,
 			params.template_vars,
+			params.lang,
 		);
 		let task_key =
 			params.custom_key.unwrap_or_else(|| format!("email:{}:{}", tn_id.0, params.to));
@@ -118,6 +122,16 @@ impl EmailModule {
 pub fn init(app: &crate::core::app::App) -> ClResult<()> {
 	app.scheduler.register::<EmailSenderTask>()?;
 	Ok(())
+}
+
+/// Get tenant's preferred language from settings
+///
+/// Returns None if no language preference is set.
+pub async fn get_tenant_lang(settings: &SettingsService, tn_id: TnId) -> Option<String> {
+	match settings.get(tn_id, "profile.lang").await {
+		Ok(crate::settings::SettingValue::String(lang)) => Some(lang),
+		_ => None,
+	}
 }
 
 // vim: ts=4

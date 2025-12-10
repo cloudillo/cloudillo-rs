@@ -1,0 +1,42 @@
+---
+layout: default
+subject: Identitás aktiválása
+---
+<p style="font-size: 16px; color: #1f2937; margin: 0 0 20px 0;">Kedves Felhasználó,</p>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
+	Új Cloudillo identitás jött létre számodra a <strong style="color: #008cb6;">{{identity_provider}}</strong> identitásszolgáltatónál.
+	Kattints az alábbi gombra az identitásod aktiválásához és a föderált hálózathoz való csatlakozáshoz.
+</p>
+
+<!-- Identity Box -->
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0;">
+	<tr>
+		<td style="background-color: #e6f4f8; border-left: 4px solid #008cb6; border-radius: 4px; padding: 20px; text-align: center;">
+			<div style="font-size: 12px; color: #4b5563; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px;">Az identitásod</div>
+			<div style="font-family: 'Courier New', monospace; font-size: 16px; color: #008cb6; font-weight: 600;">{{identity_id}}</div>
+		</td>
+	</tr>
+</table>
+
+<!-- CTA Button -->
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 30px 0;">
+	<tr>
+		<td style="text-align: center;">
+			<a href="{{activation_link}}" style="display: inline-block; background-color: #008cb6; color: #ffffff; padding: 14px 36px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px;">Identitás aktiválása</a>
+		</td>
+	</tr>
+</table>
+
+<p style="text-align: center; font-size: 12px; color: #6b7280; margin: 15px 0; word-break: break-all;">
+	Vagy másold be ezt a linket: <a href="{{activation_link}}" style="color: #008cb6;">{{activation_link}}</a>
+</p>
+
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 25px 0 20px 0;">
+	<strong>Mi történik ezután:</strong><br>
+	1. Kattints a fenti aktiválási linkre<br>
+	2. Kezdd el használni a föderált Cloudillo identitásodat!
+</p>
+
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0;">
+	Ez az aktiválási link {{expire_hours}} óráig érvényes. Ha nem te kérted ezt az identitást, nyugodtan hagyd figyelmen kívül ezt az emailt.
+</p>

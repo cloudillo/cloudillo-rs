@@ -81,6 +81,8 @@ pub struct Identity {
 	pub address_type: Option<AddressType>,
 	/// Timestamp when the address was last updated
 	pub address_updated_at: Option<Timestamp>,
+	/// Preferred language for emails and notifications (e.g., "hu", "de")
+	pub lang: Option<Box<str>>,
 	/// Status of this identity in its lifecycle
 	pub status: IdentityStatus,
 	/// Timestamp when the identity was created
@@ -111,6 +113,8 @@ pub struct CreateIdentityOptions<'a> {
 	pub address: Option<&'a str>,
 	/// Type of the address being set (if address is provided)
 	pub address_type: Option<AddressType>,
+	/// Preferred language for emails and notifications (e.g., "hu", "de")
+	pub lang: Option<&'a str>,
 	/// When the identity should expire (optional, can have default)
 	pub expires_at: Option<Timestamp>,
 }
@@ -126,6 +130,8 @@ pub struct UpdateIdentityOptions {
 	pub address: Option<Box<str>>,
 	/// Type of the address being set (if address is provided)
 	pub address_type: Option<AddressType>,
+	/// New preferred language (if changing)
+	pub lang: Option<Option<Box<str>>>,
 	/// New status (if changing)
 	pub status: Option<IdentityStatus>,
 	/// New expiration timestamp (if changing)
@@ -481,6 +487,7 @@ mod tests {
 			address: Some("192.168.1.1".into()),
 			address_type: Some(AddressType::Ipv4),
 			address_updated_at: Some(now),
+			lang: Some("hu".into()),
 			status: IdentityStatus::Active,
 			created_at: now,
 			updated_at: now,
@@ -491,6 +498,7 @@ mod tests {
 		assert_eq!(identity.id_tag_domain.as_ref(), "cloudillo.net");
 		assert_eq!(identity.email.as_deref(), Some("test@example.com"));
 		assert_eq!(identity.registrar_id_tag.as_ref(), "registrar");
+		assert_eq!(identity.lang.as_deref(), Some("hu"));
 		assert_eq!(identity.status, IdentityStatus::Active);
 		assert!(identity.expires_at > identity.created_at);
 	}
@@ -507,6 +515,7 @@ mod tests {
 			address: None,
 			address_type: None,
 			address_updated_at: None,
+			lang: None,
 			status: IdentityStatus::Pending,
 			created_at: now,
 			updated_at: now,
@@ -555,6 +564,7 @@ mod tests {
 			status: IdentityStatus::Pending,
 			address: Some("192.168.1.1"),
 			address_type: Some(AddressType::Ipv4),
+			lang: Some("de"),
 			expires_at: Some(Timestamp::now().add_seconds(86400)),
 		};
 
@@ -562,6 +572,7 @@ mod tests {
 		assert_eq!(opts.id_tag_domain, "cloudillo.net");
 		assert_eq!(opts.email, Some("test@example.com"));
 		assert_eq!(opts.registrar_id_tag, "registrar");
+		assert_eq!(opts.lang, Some("de"));
 		assert_eq!(opts.status, IdentityStatus::Pending);
 		assert!(opts.expires_at.is_some());
 	}
@@ -577,6 +588,7 @@ mod tests {
 			status: IdentityStatus::Pending,
 			address: None,
 			address_type: None,
+			lang: None,
 			expires_at: None,
 		};
 

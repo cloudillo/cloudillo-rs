@@ -101,6 +101,22 @@ pub struct ListRefsQuery {
 	pub resource_id: Option<String>,
 }
 
+/// Parameters for creating a ref internally
+pub struct CreateRefInternalParams<'a> {
+	/// The id_tag for constructing the URL
+	pub id_tag: &'a str,
+	/// Type of reference (e.g., "welcome", "email-verify")
+	pub typ: &'a str,
+	/// Optional human-readable description
+	pub description: Option<&'a str>,
+	/// Optional expiration timestamp
+	pub expires_at: Option<Timestamp>,
+	/// URL path prefix (e.g., "/onboarding/welcome")
+	pub path_prefix: &'a str,
+	/// Optional resource identifier to store with the ref
+	pub resource_id: Option<&'a str>,
+}
+
 /// GET /api/refs - List refs for the current tenant
 #[axum::debug_handler]
 pub async fn list_refs(
@@ -324,11 +340,7 @@ pub async fn delete_ref(
 /// # Arguments
 /// * `app` - Application state
 /// * `tn_id` - Tenant ID
-/// * `id_tag` - The id_tag for constructing the URL
-/// * `typ` - Type of reference (e.g., "welcome", "email-verify")
-/// * `description` - Optional human-readable description
-/// * `expires_at` - Optional expiration timestamp
-/// * `path_prefix` - URL path prefix (e.g., "/onboarding/welcome")
+/// * `params` - Parameters for creating the reference
 ///
 /// # Returns
 /// * `ref_id` - The generated reference ID
@@ -336,22 +348,18 @@ pub async fn delete_ref(
 pub async fn create_ref_internal(
 	app: &App,
 	tn_id: TnId,
-	id_tag: &str,
-	typ: &str,
-	description: Option<&str>,
-	expires_at: Option<Timestamp>,
-	path_prefix: &str,
+	params: CreateRefInternalParams<'_>,
 ) -> ClResult<(String, String)> {
 	// Generate random ref_id
 	let ref_id = utils::random_id()?;
 
 	// Create ref options
 	let ref_opts = CreateRefOptions {
-		typ: typ.to_string(),
-		description: description.map(|s| s.to_string()),
-		expires_at,
+		typ: params.typ.to_string(),
+		description: params.description.map(|s| s.to_string()),
+		expires_at: params.expires_at,
 		count: Some(1), // Single use by default
-		resource_id: None,
+		resource_id: params.resource_id.map(|s| s.to_string()),
 		access_level: None,
 	};
 
@@ -361,19 +369,19 @@ pub async fn create_ref_internal(
 			error = %e,
 			tn_id = ?tn_id,
 			ref_id = %ref_id,
-			typ = %typ,
+			typ = %params.typ,
 			"Failed to create reference"
 		);
 		e
 	})?;
 
 	// Construct the full URL
-	let url = format!("https://{}{}/{}", id_tag, path_prefix, ref_id);
+	let url = format!("https://{}{}/{}", params.id_tag, params.path_prefix, ref_id);
 
 	info!(
 		tn_id = ?tn_id,
 		ref_id = %ref_id,
-		typ = %typ,
+		typ = %params.typ,
 		url = %url,
 		"Created reference successfully"
 	);

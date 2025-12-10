@@ -312,6 +312,7 @@ pub struct ActionView {
 	pub action_id: Box<str>,
 	#[serde(rename = "type")]
 	pub typ: Box<str>,
+	#[serde(rename = "subType")]
 	pub sub_typ: Option<Box<str>>,
 	pub parent_id: Option<Box<str>>,
 	pub root_id: Option<Box<str>>,

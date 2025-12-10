@@ -302,6 +302,7 @@ async fn handle_idp_registration(
 	app: &crate::core::app::App,
 	id_tag_lower: String,
 	email: String,
+	lang: Option<String>,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
 	// Extract the IDP domain from id_tag (e.g., "alice.cloudillo.net" -> "cloudillo.net")
 	let idp_domain = match id_tag_lower.find('.') {
@@ -319,8 +320,8 @@ async fn handle_idp_registration(
 		.ok_or_else(|| Error::ConfigError("BASE_ID_TAG not configured".into()))?;
 
 	// Create IDP:REG action
-	use crate::action::native_hooks::idp::IdpRegContent;
 	use crate::action::task::CreateAction;
+	use crate::idp::registration::IdpRegContent;
 
 	let expires_at = Timestamp::now().add_seconds(86400 * 30); // 30 days
 															// Include all local addresses from the app configuration (comma-separated)
@@ -335,6 +336,7 @@ async fn handle_idp_registration(
 		owner_id_tag: None,
 		issuer: None, // Default to registrar
 		address,
+		lang: lang.clone(), // Pass language preference to IDP
 	};
 
 	// Create action to generate JWT token
@@ -386,7 +388,7 @@ async fn handle_idp_registration(
 		})?;
 
 	// Parse the IDP response
-	use crate::action::native_hooks::idp::IdpRegResponse;
+	use crate::idp::registration::IdpRegResponse;
 	let idp_reg_result: IdpRegResponse =
 		serde_json::from_value(idp_response.data).map_err(|e| {
 			warn!(
@@ -453,15 +455,36 @@ async fn handle_idp_registration(
 		"Tenant created successfully for IDP registration"
 	);
 
+	// Save language preference if provided
+	if let Some(ref lang_code) = lang {
+		// Use empty roles - PermissionLevel::User always allows any authenticated user
+		let empty_roles: &[&str] = &[];
+		if let Err(e) = app
+			.settings
+			.set(tn_id, "profile.lang", SettingValue::String(lang_code.clone()), empty_roles)
+			.await
+		{
+			warn!(
+				error = %e,
+				tn_id = ?tn_id,
+				lang = %lang_code,
+				"Failed to save language preference, continuing registration"
+			);
+		}
+	}
+
 	// Now create the welcome reference using the new create_ref_internal function
 	let (_ref_id, welcome_link) = crate::r#ref::handler::create_ref_internal(
 		app,
 		tn_id,
-		&id_tag_lower,
-		"welcome",
-		Some("Welcome to Cloudillo"),
-		Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
-		"/onboarding/welcome",
+		crate::r#ref::handler::CreateRefInternalParams {
+			id_tag: &id_tag_lower,
+			typ: "welcome",
+			description: Some("Welcome to Cloudillo"),
+			expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
+			path_prefix: "/onboarding/welcome",
+			resource_id: None,
+		},
 	)
 	.await?;
 
@@ -479,9 +502,10 @@ async fn handle_idp_registration(
 		tn_id,
 		crate::email::EmailTaskParams {
 			to: email.clone(),
-			subject: "Welcome to Cloudillo".to_string(),
+			subject: None, // Subject is defined in the template frontmatter
 			template_name: "welcome".to_string(),
 			template_vars,
+			lang: lang.clone(),
 			custom_key: None,
 		},
 	)
@@ -491,6 +515,7 @@ async fn handle_idp_registration(
 			info!(
 				email = %email,
 				id_tag = %id_tag_lower,
+				lang = ?lang,
 				"Welcome email queued for IDP registration"
 			);
 		}
@@ -532,6 +557,7 @@ async fn handle_domain_registration(
 	app_domain: Option<String>,
 	email: String,
 	providers: Vec<String>,
+	lang: Option<String>,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
 	// Validate domain again before creating account
 	let validation_result =
@@ -582,15 +608,36 @@ async fn handle_domain_registration(
 		"Tenant created successfully for domain registration"
 	);
 
+	// Save language preference if provided
+	if let Some(ref lang_code) = lang {
+		// Use empty roles - PermissionLevel::User always allows any authenticated user
+		let empty_roles: &[&str] = &[];
+		if let Err(e) = app
+			.settings
+			.set(tn_id, "profile.lang", SettingValue::String(lang_code.clone()), empty_roles)
+			.await
+		{
+			warn!(
+				error = %e,
+				tn_id = ?tn_id,
+				lang = %lang_code,
+				"Failed to save language preference, continuing registration"
+			);
+		}
+	}
+
 	// Create welcome reference using the new create_ref_internal function
 	let (_ref_id, welcome_link) = crate::r#ref::handler::create_ref_internal(
 		app,
 		tn_id,
-		&id_tag_lower,
-		"welcome",
-		Some("Welcome to Cloudillo"),
-		Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
-		"/onboarding/welcome",
+		crate::r#ref::handler::CreateRefInternalParams {
+			id_tag: &id_tag_lower,
+			typ: "welcome",
+			description: Some("Welcome to Cloudillo"),
+			expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
+			path_prefix: "/onboarding/welcome",
+			resource_id: None,
+		},
 	)
 	.await?;
 
@@ -608,9 +655,10 @@ async fn handle_domain_registration(
 		tn_id,
 		crate::email::EmailTaskParams {
 			to: email.clone(),
-			subject: "Welcome to Cloudillo".to_string(),
+			subject: None, // Subject is defined in the template frontmatter
 			template_name: "welcome".to_string(),
 			template_vars,
+			lang: lang.clone(),
 			custom_key: None,
 		},
 	)
@@ -620,6 +668,7 @@ async fn handle_domain_registration(
 			info!(
 				email = %email,
 				id_tag = %id_tag_lower,
+				lang = ?lang,
 				"Welcome email queued for domain registration"
 			);
 		}
@@ -660,9 +709,10 @@ pub async fn post_register(
 
 	// Route to appropriate registration handler
 	let result = if req.typ == "idp" {
-		handle_idp_registration(&app, id_tag_lower, req.email).await
+		handle_idp_registration(&app, id_tag_lower, req.email, req.lang).await
 	} else {
-		handle_domain_registration(&app, id_tag_lower, app_domain, req.email, providers).await
+		handle_domain_registration(&app, id_tag_lower, app_domain, req.email, providers, req.lang)
+			.await
 	};
 
 	// If registration succeeded, consume the token

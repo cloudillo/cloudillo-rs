@@ -1,0 +1,42 @@
+---
+layout: default
+subject: Activate Your Identity
+---
+<p style="font-size: 16px; color: #1f2937; margin: 0 0 20px 0;">Hello,</p>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
+	A new Cloudillo identity has been created for you on the <strong style="color: #008cb6;">{{identity_provider}}</strong> identity provider.
+	Click the button below to activate your identity and start connecting with the federated network.
+</p>
+
+<!-- Identity Box -->
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0;">
+	<tr>
+		<td style="background-color: #e6f4f8; border-left: 4px solid #008cb6; border-radius: 4px; padding: 20px; text-align: center;">
+			<div style="font-size: 12px; color: #4b5563; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px;">Your Identity</div>
+			<div style="font-family: 'Courier New', monospace; font-size: 16px; color: #008cb6; font-weight: 600;">{{identity_id}}</div>
+		</td>
+	</tr>
+</table>
+
+<!-- CTA Button -->
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 30px 0;">
+	<tr>
+		<td style="text-align: center;">
+			<a href="{{activation_link}}" style="display: inline-block; background-color: #008cb6; color: #ffffff; padding: 14px 36px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px;">Activate Your Identity</a>
+		</td>
+	</tr>
+</table>
+
+<p style="text-align: center; font-size: 12px; color: #6b7280; margin: 15px 0; word-break: break-all;">
+	Or copy this link: <a href="{{activation_link}}" style="color: #008cb6;">{{activation_link}}</a>
+</p>
+
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 25px 0 20px 0;">
+	<strong>What happens next:</strong><br>
+	1. Click the activation link above<br>
+	2. Start using your federated Cloudillo identity!
+</p>
+
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0;">
+	This activation link is valid for {{expire_hours}} hours. If you did not request this identity, you can safely ignore this email.
+</p>

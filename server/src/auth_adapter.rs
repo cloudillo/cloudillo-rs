@@ -304,20 +304,6 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	) -> ClResult<()>;
 	async fn delete_webauthn_credential(&self, tn_id: TnId, credential_id: &str) -> ClResult<()>;
 
-	// Phase 1: Registration & Session Management
-	/// Generate a verification token for email verification (registration workflow)
-	async fn create_registration_verification(&self, email: &str) -> ClResult<Box<str>>;
-
-	/// Validate a registration verification token
-	async fn validate_registration_verification(&self, email: &str, vfy_code: &str)
-		-> ClResult<()>;
-
-	/// Invalidate an access token (logout)
-	async fn invalidate_token(&self, token: &str) -> ClResult<()>;
-
-	/// Clean up expired verification tokens (runs periodically)
-	async fn cleanup_expired_verifications(&self) -> ClResult<()>;
-
 	// API Key management
 	/// Create a new API key for a tenant
 	async fn create_api_key(

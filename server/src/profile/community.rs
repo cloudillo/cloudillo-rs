@@ -7,10 +7,10 @@ use axum::{
 };
 
 use crate::{
-	action::native_hooks::idp::{IdpRegContent, IdpRegResponse},
 	action::task::{create_action, CreateAction},
 	bootstrap::{create_complete_tenant, CreateCompleteTenantOptions},
 	core::extract::Auth,
+	idp::registration::{IdpRegContent, IdpRegResponse},
 	meta_adapter::{
 		Profile, ProfileConnectionStatus, ProfileType, UpdateProfileData, UpdateTenantData,
 	},
@@ -83,6 +83,7 @@ pub async fn put_community_profile(
 			owner_id_tag: Some(creator_id_tag.to_string()), // Creator owns the community
 			issuer: None,
 			address,
+			lang: None, // Communities don't have language preference
 		};
 
 		// Create IDP:REG action

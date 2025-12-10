@@ -1,13 +1,50 @@
 //! Email template rendering with Handlebars
 //!
 //! Loads HTML and plain text templates from filesystem and renders them
-//! with variable substitution.
+//! with variable substitution. Supports:
+//! - YAML frontmatter for metadata (subject, layout)
+//! - Layout templates for consistent email structure
+//! - Language-specific template variants
 
 use crate::prelude::*;
 use crate::settings::service::SettingsService;
 use crate::settings::SettingValue;
 use handlebars::Handlebars;
+use serde::Deserialize;
 use std::sync::Arc;
+
+/// Metadata extracted from template frontmatter
+#[derive(Debug, Default, Deserialize)]
+pub struct TemplateMetadata {
+	/// Layout template name (e.g., "default" -> layouts/default.html.hbs)
+	#[serde(default)]
+	pub layout: Option<String>,
+	/// Email subject line
+	#[serde(default)]
+	pub subject: Option<String>,
+}
+
+/// Result of template rendering
+#[derive(Debug)]
+pub struct RenderResult {
+	/// Subject extracted from template frontmatter
+	pub subject: Option<String>,
+	/// Rendered HTML body
+	pub html_body: String,
+	/// Rendered plain text body
+	pub text_body: String,
+}
+
+/// Parameters for rendering a layout template
+struct LayoutRenderParams<'a> {
+	template_dir: &'a str,
+	layout_name: &'a str,
+	extension: &'a str,
+	lang: Option<&'a str>,
+	body: &'a str,
+	title: Option<&'a str>,
+	vars: &'a serde_json::Value,
+}
 
 /// Template engine for email rendering
 pub struct TemplateEngine {
@@ -26,15 +63,148 @@ impl TemplateEngine {
 		Ok(Self { handlebars, settings_service })
 	}
 
-	/// Render email template with variables
+	/// Parse YAML frontmatter from template content
 	///
-	/// Returns (html_body, text_body) tuple
+	/// Frontmatter is delimited by `---` at the start of the file:
+	/// ```text
+	/// ---
+	/// layout: default
+	/// subject: Email Subject
+	/// ---
+	/// Template content here...
+	/// ```
+	///
+	/// Returns (metadata, content_without_frontmatter)
+	fn parse_frontmatter(content: &str) -> (TemplateMetadata, &str) {
+		let content = content.trim_start();
+
+		// Check if content starts with frontmatter delimiter
+		if !content.starts_with("---") {
+			return (TemplateMetadata::default(), content);
+		}
+
+		// Find the closing delimiter
+		let after_first = &content[3..];
+		if let Some(end_pos) = after_first.find("\n---") {
+			let yaml_content = &after_first[..end_pos];
+			let template_content = &after_first[end_pos + 4..]; // Skip "\n---"
+
+			// Parse YAML frontmatter
+			match serde_yaml::from_str(yaml_content) {
+				Ok(metadata) => (metadata, template_content.trim_start_matches('\n')),
+				Err(e) => {
+					warn!("Failed to parse frontmatter YAML: {}", e);
+					(TemplateMetadata::default(), content)
+				}
+			}
+		} else {
+			// No closing delimiter found
+			(TemplateMetadata::default(), content)
+		}
+	}
+
+	/// Try to load a template file, returning None if it doesn't exist
+	fn try_load_template(path: &str) -> Option<String> {
+		std::fs::read_to_string(path).ok()
+	}
+
+	/// Resolve template path with language fallback
+	///
+	/// For template "verification" with lang "hu":
+	/// 1. Try: verification.hu.html.hbs
+	/// 2. Fallback: verification.html.hbs
+	fn resolve_template_path(
+		template_dir: &str,
+		template_name: &str,
+		extension: &str,
+		lang: Option<&str>,
+	) -> ClResult<(String, String)> {
+		// Try language-specific template first
+		if let Some(lang) = lang {
+			let lang_path = format!("{}/{}.{}.{}", template_dir, template_name, lang, extension);
+			if let Some(content) = Self::try_load_template(&lang_path) {
+				debug!("Loaded language-specific template: {}", lang_path);
+				return Ok((lang_path, content));
+			}
+		}
+
+		// Fallback to default template
+		let default_path = format!("{}/{}.{}", template_dir, template_name, extension);
+		match Self::try_load_template(&default_path) {
+			Some(content) => {
+				debug!("Loaded default template: {}", default_path);
+				Ok((default_path, content))
+			}
+			None => Err(Error::ConfigError(format!(
+				"Template not found: {} (tried language: {:?})",
+				default_path, lang
+			))),
+		}
+	}
+
+	/// Load and render a layout template with the given body content
+	fn render_layout(&self, params: LayoutRenderParams<'_>) -> ClResult<String> {
+		let layouts_dir = format!("{}/layouts", params.template_dir);
+
+		// Try language-specific layout first
+		let layout_content = if let Some(lang) = params.lang {
+			let lang_path =
+				format!("{}/{}.{}.{}", layouts_dir, params.layout_name, lang, params.extension);
+			Self::try_load_template(&lang_path)
+		} else {
+			None
+		};
+
+		// Fallback to default layout
+		let layout_content = layout_content.or_else(|| {
+			let default_path =
+				format!("{}/{}.{}", layouts_dir, params.layout_name, params.extension);
+			Self::try_load_template(&default_path)
+		});
+
+		let layout_content = layout_content.ok_or_else(|| {
+			Error::ConfigError(format!(
+				"Layout template not found: {}/{}.{} (lang: {:?})",
+				layouts_dir, params.layout_name, params.extension, params.lang
+			))
+		})?;
+
+		// Merge layout variables with provided vars
+		let mut layout_vars = params.vars.clone();
+		if let serde_json::Value::Object(ref mut map) = layout_vars {
+			map.insert("body".to_string(), serde_json::Value::String(params.body.to_string()));
+			if let Some(title) = params.title {
+				map.insert("title".to_string(), serde_json::Value::String(title.to_string()));
+			}
+		}
+
+		self.handlebars.render_template(&layout_content, &layout_vars).map_err(|e| {
+			Error::ValidationError(format!(
+				"Failed to render layout '{}': {}",
+				params.layout_name, e
+			))
+		})
+	}
+
+	/// Render email template with variables and optional language
+	///
+	/// Returns RenderResult containing subject (if defined in frontmatter),
+	/// HTML body, and plain text body.
+	///
+	/// Template resolution order for lang="hu":
+	/// 1. verification.hu.html.hbs (language-specific)
+	/// 2. verification.html.hbs (fallback)
+	///
+	/// Layout resolution (if layout specified in frontmatter):
+	/// 1. layouts/default.hu.html.hbs (language-specific)
+	/// 2. layouts/default.html.hbs (fallback)
 	pub async fn render(
 		&self,
 		tn_id: TnId,
 		template_name: &str,
 		vars: &serde_json::Value,
-	) -> ClResult<(String, String)> {
+		lang: Option<&str>,
+	) -> ClResult<RenderResult> {
 		// Get template directory from settings
 		let template_dir = self.settings_service.get(tn_id, "email.template_dir").await?;
 
@@ -43,43 +213,151 @@ impl TemplateEngine {
 			_ => return Err(Error::ConfigError("Invalid template_dir setting".into())),
 		};
 
-		// Load and render HTML template
-		let html_path = format!("{}/{}.html.hbs", template_dir, template_name);
-		debug!("Loading HTML template from {}", html_path);
+		// Load HTML template with language fallback
+		let (html_path, html_content) =
+			Self::resolve_template_path(&template_dir, template_name, "html.hbs", lang)?;
 
-		let html_template = std::fs::read_to_string(&html_path).map_err(|e| {
-			Error::ConfigError(format!("Failed to load HTML template '{}': {}", html_path, e))
+		// Parse frontmatter from HTML template
+		let (html_metadata, html_template) = Self::parse_frontmatter(&html_content);
+
+		// Render HTML content
+		let html_rendered = self.handlebars.render_template(html_template, vars).map_err(|e| {
+			Error::ValidationError(format!("Failed to render HTML template '{}': {}", html_path, e))
 		})?;
 
-		let html_body = self.handlebars.render_template(&html_template, vars).map_err(|e| {
-			Error::ValidationError(format!(
-				"Failed to render HTML template '{}': {}",
-				template_name, e
-			))
+		// Apply layout if specified
+		let html_body = if let Some(ref layout) = html_metadata.layout {
+			self.render_layout(LayoutRenderParams {
+				template_dir: &template_dir,
+				layout_name: layout,
+				extension: "html.hbs",
+				lang,
+				body: &html_rendered,
+				title: html_metadata.subject.as_deref(),
+				vars,
+			})?
+		} else {
+			html_rendered
+		};
+
+		// Load text template with language fallback
+		let (text_path, text_content) =
+			Self::resolve_template_path(&template_dir, template_name, "txt.hbs", lang)?;
+
+		// Parse frontmatter from text template
+		let (text_metadata, text_template) = Self::parse_frontmatter(&text_content);
+
+		// Render text content
+		let text_rendered = self.handlebars.render_template(text_template, vars).map_err(|e| {
+			Error::ValidationError(format!("Failed to render text template '{}': {}", text_path, e))
 		})?;
 
-		// Load and render text template
-		let text_path = format!("{}/{}.txt.hbs", template_dir, template_name);
-		debug!("Loading text template from {}", text_path);
+		// Apply layout if specified (use text metadata layout, fallback to html metadata)
+		let text_layout = text_metadata.layout.as_ref().or(html_metadata.layout.as_ref());
+		let text_body = if let Some(layout) = text_layout {
+			self.render_layout(LayoutRenderParams {
+				template_dir: &template_dir,
+				layout_name: layout,
+				extension: "txt.hbs",
+				lang,
+				body: &text_rendered,
+				title: text_metadata.subject.as_deref().or(html_metadata.subject.as_deref()),
+				vars,
+			})?
+		} else {
+			text_rendered
+		};
 
-		let text_template = std::fs::read_to_string(&text_path).map_err(|e| {
-			Error::ConfigError(format!("Failed to load text template '{}': {}", text_path, e))
-		})?;
+		// Use subject from HTML metadata (primary) or text metadata (fallback)
+		let subject = html_metadata.subject.or(text_metadata.subject);
 
-		let text_body = self.handlebars.render_template(&text_template, vars).map_err(|e| {
-			Error::ValidationError(format!(
-				"Failed to render text template '{}': {}",
-				template_name, e
-			))
-		})?;
-
-		Ok((html_body, text_body))
+		Ok(RenderResult { subject, html_body, text_body })
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_parse_frontmatter_basic() {
+		let content = r#"---
+layout: default
+subject: Test Subject
+---
+Hello {{name}}!"#;
+
+		let (metadata, template) = TemplateEngine::parse_frontmatter(content);
+		assert_eq!(metadata.layout, Some("default".to_string()));
+		assert_eq!(metadata.subject, Some("Test Subject".to_string()));
+		assert_eq!(template, "Hello {{name}}!");
+	}
+
+	#[test]
+	fn test_parse_frontmatter_no_frontmatter() {
+		let content = "Hello {{name}}!";
+
+		let (metadata, template) = TemplateEngine::parse_frontmatter(content);
+		assert!(metadata.layout.is_none());
+		assert!(metadata.subject.is_none());
+		assert_eq!(template, "Hello {{name}}!");
+	}
+
+	#[test]
+	fn test_parse_frontmatter_layout_only() {
+		let content = r#"---
+layout: minimal
+---
+Content here"#;
+
+		let (metadata, template) = TemplateEngine::parse_frontmatter(content);
+		assert_eq!(metadata.layout, Some("minimal".to_string()));
+		assert!(metadata.subject.is_none());
+		assert_eq!(template, "Content here");
+	}
+
+	#[test]
+	fn test_parse_frontmatter_subject_only() {
+		let content = r#"---
+subject: Email Subject Line
+---
+Content here"#;
+
+		let (metadata, template) = TemplateEngine::parse_frontmatter(content);
+		assert!(metadata.layout.is_none());
+		assert_eq!(metadata.subject, Some("Email Subject Line".to_string()));
+		assert_eq!(template, "Content here");
+	}
+
+	#[test]
+	fn test_parse_frontmatter_with_whitespace() {
+		let content = r#"
+---
+layout: default
+subject: Test
+---
+
+Hello!"#;
+
+		let (metadata, template) = TemplateEngine::parse_frontmatter(content);
+		assert_eq!(metadata.layout, Some("default".to_string()));
+		assert_eq!(metadata.subject, Some("Test".to_string()));
+		// Leading newlines after frontmatter are trimmed
+		assert_eq!(template, "Hello!");
+	}
+
+	#[test]
+	fn test_parse_frontmatter_unclosed() {
+		let content = r#"---
+layout: default
+subject: Test
+Hello!"#;
+
+		let (metadata, _template) = TemplateEngine::parse_frontmatter(content);
+		// Should return original content since frontmatter is not properly closed
+		assert!(metadata.layout.is_none());
+		assert!(metadata.subject.is_none());
+	}
 
 	#[test]
 	fn test_template_rendering() {
@@ -106,6 +384,18 @@ mod tests {
 		let result = handlebars.render_template(template, &data).unwrap();
 		assert!(result.contains("&lt;script&gt;"));
 		assert!(!result.contains("<script>"));
+	}
+
+	#[test]
+	fn test_triple_brace_no_escaping() {
+		let handlebars = Handlebars::new();
+		let template = "<div>{{{body}}}</div>";
+		let data = serde_json::json!({
+			"body": "<p>HTML content</p>"
+		});
+
+		let result = handlebars.render_template(template, &data).unwrap();
+		assert!(result.contains("<p>HTML content</p>"));
 	}
 
 	#[test]

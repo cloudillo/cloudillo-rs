@@ -277,6 +277,9 @@ impl AppBuilder {
 		// Register settings from push notification module
 		crate::push::settings::register_settings(&mut settings_registry)?;
 
+		// Register settings from profile module
+		crate::profile::register_settings(&mut settings_registry)?;
+
 		info!("Registered {} settings", settings_registry.len());
 
 		// Freeze the registry

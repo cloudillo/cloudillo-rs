@@ -61,7 +61,7 @@ impl Request {
 		Ok(Request { auth_adapter, client: Client::builder(TokioExecutor::new()).build(client) })
 	}
 
-	async fn create_proxy_token(
+	pub async fn create_proxy_token(
 		&self,
 		tn_id: TnId,
 		id_tag: &str,
