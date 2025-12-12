@@ -335,8 +335,13 @@ fn init_app_service(app: App) -> Router {
 		.route("/ws/crdt/{doc_id}", any(websocket::get_ws_crdt))
 		.route_layer(middleware::from_fn_with_state(app.clone(), optional_auth));
 
-	Router::new()
+	// Add CORS layer only to the id-tag discovery endpoint
+	let well_known_router = Router::new()
 		.route("/.well-known/cloudillo/id-tag", get(auth::handler::get_id_tag))
+		.layer(tower_http::cors::CorsLayer::very_permissive());
+
+	Router::new()
+		.merge(well_known_router)
 		.merge(ws_router)
 		.fallback(move |request: Request<Body>| {
 			static_cache_middleware(disable_cache, request, serve_dir.clone())
