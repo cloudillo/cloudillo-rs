@@ -52,7 +52,11 @@ impl EmailSender {
 			.await?
 			.unwrap_or_default();
 		let from_address = self.settings_service.get_string(tn_id, "email.from.address").await?;
-		let from_name = self.settings_service.get_string(tn_id, "email.from.name").await?;
+		// Use override sender name if provided, otherwise use default from settings
+		let from_name = match &message.from_name_override {
+			Some(name) => name.clone(),
+			None => self.settings_service.get_string(tn_id, "email.from.name").await?,
+		};
 		let tls_mode = self.settings_service.get_string(tn_id, "email.smtp.tls_mode").await?;
 		let timeout_seconds =
 			self.settings_service.get_int(tn_id, "email.smtp.timeout_seconds").await? as u64;
@@ -161,6 +165,7 @@ mod tests {
 			subject: "Test Email".to_string(),
 			text_body: "This is a test".to_string(),
 			html_body: Some("<p>This is a test</p>".to_string()),
+			from_name_override: None,
 		};
 
 		assert_eq!(message.to, "user@example.com");

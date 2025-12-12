@@ -269,7 +269,16 @@ impl TemplateEngine {
 		};
 
 		// Use subject from HTML metadata (primary) or text metadata (fallback)
-		let subject = html_metadata.subject.or(text_metadata.subject);
+		// Render subject through Handlebars to support variables like {{base_id_tag}}
+		let subject = match html_metadata.subject.or(text_metadata.subject) {
+			Some(subj) => {
+				let rendered = self.handlebars.render_template(&subj, vars).map_err(|e| {
+					Error::ValidationError(format!("Failed to render email subject: {}", e))
+				})?;
+				Some(rendered)
+			}
+			None => None,
+		};
 
 		Ok(RenderResult { subject, html_body, text_body })
 	}

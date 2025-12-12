@@ -1,6 +1,6 @@
 ---
 layout: default
-subject: Activate Your Identity
+subject: "[{{identity_provider}}] Activate Your Cloudillo Identity"
 ---
 Activate Your Cloudillo Identity
 ================================
@@ -12,7 +12,7 @@ identity provider.
 
 === YOUR IDENTITY ===
 
-{{identity_id}}
+{{identity_tag}}
 
 === ACTIVATE NOW ===
 
@@ -21,8 +21,12 @@ Click the link below to activate your identity:
 
 === WHAT HAPPENS NEXT ===
 
-1. Click the activation link above
-2. Start using your federated Cloudillo identity!
+1. Click the activation link above to activate your identity
+2. You will also receive a separate onboarding email from your Cloudillo
+   instance — complete that activation too!
+
+NOTE: You need to complete both activations (this one and the onboarding
+email) to fully set up your account.
 
 This activation link is valid for {{expire_hours}} hours.
 

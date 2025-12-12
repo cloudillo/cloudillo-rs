@@ -27,6 +27,9 @@ pub struct EmailMessage {
 	pub subject: String,
 	pub text_body: String,
 	pub html_body: Option<String>,
+	/// Optional sender name override (e.g., "Cloudillo (myinstance)")
+	#[serde(default)]
+	pub from_name_override: Option<String>,
 }
 
 /// Email task parameters
@@ -40,6 +43,8 @@ pub struct EmailTaskParams {
 	/// Optional language code for localized templates (e.g., "hu", "de")
 	pub lang: Option<String>,
 	pub custom_key: Option<String>,
+	/// Optional sender name override (e.g., "Cloudillo (myinstance)" or identity_provider)
+	pub from_name_override: Option<String>,
 }
 
 /// Email module - main orchestrator for email operations
@@ -98,6 +103,7 @@ impl EmailModule {
 			params.template_name,
 			params.template_vars,
 			params.lang,
+			params.from_name_override,
 		);
 		let task_key =
 			params.custom_key.unwrap_or_else(|| format!("email:{}:{}", tn_id.0, params.to));

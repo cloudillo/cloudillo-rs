@@ -686,19 +686,24 @@ pub async fn post_forgot_password(
 	// Get tenant's preferred language
 	let lang = get_tenant_lang(&app.settings, tn_id).await;
 
+	// Get base_id_tag for sender name
+	let base_id_tag = app.opts.base_id_tag.as_ref().map(|s| s.as_ref()).unwrap_or("cloudillo");
+
 	// Schedule email
 	let email_params = EmailTaskParams {
 		to: email.clone(),
 		subject: None,
 		template_name: "password_reset".to_string(),
 		template_vars: serde_json::json!({
-			"user_name": user_name,
+			"identity_tag": user_name,
+			"base_id_tag": base_id_tag,
 			"instance_name": "Cloudillo",
 			"reset_link": reset_url,
 			"expire_hours": 24,
 		}),
 		lang,
 		custom_key: Some(format!("pw-reset:{}:{}", tn_id.0, now)),
+		from_name_override: Some(format!("Cloudillo ({})", base_id_tag.to_uppercase())),
 	};
 
 	if let Err(e) =

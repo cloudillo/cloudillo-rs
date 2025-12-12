@@ -1,16 +1,22 @@
 ---
 layout: default
-subject: Welcome to Cloudillo
+subject: "[{{base_id_tag}}] Welcome to Cloudillo!"
 ---
 Welcome to {{instance_name}}!
 =============================
 
-Hello {{user_name}},
+Hello {{identity_tag}},
 
 Your account on {{instance_name}} has been successfully created!
 We're excited to have you here. You can now log in and start exploring
 all that Cloudillo has to offer.
 
+{{#if is_idp_registration}}
+NOTE: You will also receive a separate activation email from your Identity
+Provider ({{identity_provider}}). Please complete both activations to fully
+set up your account.
+
+{{/if}}
 === WHAT YOU CAN DO NOW ===
 
 * Set up your password and complete your profile

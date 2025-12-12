@@ -1,6 +1,6 @@
 ---
 layout: default
-subject: Identitás aktiválása
+subject: "[{{identity_provider}}] Cloudillo identitás aktiválása"
 ---
 <p style="font-size: 16px; color: #1f2937; margin: 0 0 20px 0;">Kedves Felhasználó,</p>
 <p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
@@ -13,7 +13,7 @@ subject: Identitás aktiválása
 	<tr>
 		<td style="background-color: #e6f4f8; border-left: 4px solid #008cb6; border-radius: 4px; padding: 20px; text-align: center;">
 			<div style="font-size: 12px; color: #4b5563; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px;">Az identitásod</div>
-			<div style="font-family: 'Courier New', monospace; font-size: 16px; color: #008cb6; font-weight: 600;">{{identity_id}}</div>
+			<div style="font-family: 'Courier New', monospace; font-size: 16px; color: #008cb6; font-weight: 600;">{{identity_tag}}</div>
 		</td>
 	</tr>
 </table>
@@ -33,9 +33,20 @@ subject: Identitás aktiválása
 
 <p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 25px 0 20px 0;">
 	<strong>Mi történik ezután:</strong><br>
-	1. Kattints a fenti aktiválási linkre<br>
-	2. Kezdd el használni a föderált Cloudillo identitásodat!
+	1. Kattints a fenti aktiválási linkre az identitásod aktiválásához<br>
+	2. Egy külön üdvözlő emailt is kapsz a Cloudillo példányodtól — azt az aktiválást is végezd el!
 </p>
+
+<!-- Note Box -->
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0;">
+	<tr>
+		<td style="background-color: #f3f4f6; border-radius: 4px; padding: 15px;">
+			<p style="font-size: 12px; color: #6b7280; margin: 0;">
+				<strong>Megjegyzés:</strong> A fiókod teljes beállításához mindkét aktiválást el kell végezned (ezt és az üdvözlő emailben lévőt is).
+			</p>
+		</td>
+	</tr>
+</table>
 
 <p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0;">
 	Ez az aktiválási link {{expire_hours}} óráig érvényes. Ha nem te kérted ezt az identitást, nyugodtan hagyd figyelmen kívül ezt az emailt.

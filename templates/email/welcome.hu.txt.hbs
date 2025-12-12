@@ -1,16 +1,22 @@
 ---
 layout: default
-subject: Üdvözlünk a Cloudillo-n
+subject: "[{{base_id_tag}}] Üdvözlünk a Cloudillo-n!"
 ---
 Üdvözlünk a {{instance_name}} oldalon!
 ======================================
 
-Kedves {{user_name}},
+Kedves {{identity_tag}},
 
 A fiókod a {{instance_name}} oldalon sikeresen létrejött!
 Örülünk, hogy itt vagy. Most már bejelentkezhetsz és felfedezheted
 a Cloudillo összes funkcióját.
 
+{{#if is_idp_registration}}
+MEGJEGYZÉS: Egy külön aktiválási emailt is kapsz az identitásszolgáltatódtól
+({{identity_provider}}). A fiókod teljes beállításához mindkét aktiválást
+el kell végezned.
+
+{{/if}}
 === MIT TEHETSZ MOST ===
 
 * Állítsd be a jelszavadat és töltsd ki a profilodat

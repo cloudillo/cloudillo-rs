@@ -1,6 +1,6 @@
 ---
 layout: default
-subject: Identitás aktiválása
+subject: "[{{identity_provider}}] Cloudillo identitás aktiválása"
 ---
 Cloudillo identitás aktiválása
 ==============================
@@ -12,7 +12,7 @@ identitásszolgáltatónál.
 
 === AZ IDENTITÁSOD ===
 
-{{identity_id}}
+{{identity_tag}}
 
 === AKTIVÁLÁS ===
 
@@ -21,8 +21,12 @@ Kattints az alábbi linkre az identitásod aktiválásához:
 
 === MI TÖRTÉNIK EZUTÁN ===
 
-1. Kattints a fenti aktiválási linkre
-2. Kezdd el használni a föderált Cloudillo identitásodat!
+1. Kattints a fenti aktiválási linkre az identitásod aktiválásához
+2. Egy külön üdvözlő emailt is kapsz a Cloudillo példányodtól — azt az
+   aktiválást is végezd el!
+
+MEGJEGYZÉS: A fiókod teljes beállításához mindkét aktiválást el kell
+végezned (ezt és az üdvözlő emailben lévőt is).
 
 Ez az aktiválási link {{expire_hours}} óráig érvényes.
 

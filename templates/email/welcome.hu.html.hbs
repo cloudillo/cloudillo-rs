@@ -1,12 +1,26 @@
 ---
 layout: default
-subject: Üdvözlünk a Cloudillo-n
+subject: "[{{base_id_tag}}] Üdvözlünk a Cloudillo-n!"
 ---
-<p style="font-size: 16px; color: #1f2937; margin: 0 0 20px 0;">Kedves {{user_name}},</p>
+<p style="font-size: 16px; color: #1f2937; margin: 0 0 20px 0;">Kedves {{identity_tag}},</p>
 <p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
 	A fiókod a <strong style="color: #008cb6;">{{instance_name}}</strong> oldalon sikeresen létrejött!
 	Örülünk, hogy itt vagy. Most már bejelentkezhetsz és felfedezheted a Cloudillo összes funkcióját.
 </p>
+
+{{#if is_idp_registration}}
+<!-- IDP Note Box -->
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0;">
+	<tr>
+		<td style="background-color: #e6f4f8; border-left: 4px solid #008cb6; border-radius: 4px; padding: 15px;">
+			<p style="font-size: 14px; color: #1f2937; margin: 0;">
+				<strong>Megjegyzés:</strong> Egy külön aktiválási emailt is kapsz az identitásszolgáltatódtól ({{identity_provider}}).
+				A fiókod teljes beállításához mindkét aktiválást el kell végezned.
+			</p>
+		</td>
+	</tr>
+</table>
+{{/if}}
 
 <p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
 	<strong>Mit tehetsz most:</strong>

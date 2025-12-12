@@ -491,7 +491,8 @@ async fn handle_idp_registration(
 	// Profile is already created by create_tenant in meta adapter
 	// Send welcome email with the welcome link
 	let template_vars = serde_json::json!({
-		"user_name": id_tag_lower,
+		"identity_tag": id_tag_lower,
+		"base_id_tag": base_id_tag.as_ref(),
 		"instance_name": "Cloudillo",
 		"welcome_link": welcome_link,
 	});
@@ -507,6 +508,7 @@ async fn handle_idp_registration(
 			template_vars,
 			lang: lang.clone(),
 			custom_key: None,
+			from_name_override: Some(format!("Cloudillo ({})", base_id_tag.to_uppercase())),
 		},
 	)
 	.await
@@ -643,8 +645,15 @@ async fn handle_domain_registration(
 
 	// Profile is already created by create_tenant in meta adapter
 	// Send welcome email with the welcome link
+	let base_id_tag = app
+		.opts
+		.base_id_tag
+		.as_ref()
+		.ok_or_else(|| Error::ConfigError("BASE_ID_TAG not configured".into()))?;
+
 	let template_vars = serde_json::json!({
-		"user_name": id_tag_lower,
+		"identity_tag": id_tag_lower,
+		"base_id_tag": base_id_tag.as_ref(),
 		"instance_name": "Cloudillo",
 		"welcome_link": welcome_link,
 	});
@@ -660,6 +669,7 @@ async fn handle_domain_registration(
 			template_vars,
 			lang: lang.clone(),
 			custom_key: None,
+			from_name_override: Some(format!("Cloudillo ({})", base_id_tag.to_uppercase())),
 		},
 	)
 	.await

@@ -1,12 +1,26 @@
 ---
 layout: default
-subject: Welcome to Cloudillo
+subject: "[{{base_id_tag}}] Welcome to Cloudillo!"
 ---
-<p style="font-size: 18px; color: #1f2937; margin: 0 0 20px 0; font-weight: 500;">Hello {{user_name}},</p>
+<p style="font-size: 18px; color: #1f2937; margin: 0 0 20px 0; font-weight: 500;">Hello {{identity_tag}},</p>
 <p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
 	Your account on <strong style="color: #008cb6;">{{instance_name}}</strong> has been successfully created!
 	We're excited to have you here. You can now log in and start exploring all that Cloudillo has to offer.
 </p>
+
+{{#if is_idp_registration}}
+<!-- IDP Note Box -->
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0;">
+	<tr>
+		<td style="background-color: #e6f4f8; border-left: 4px solid #008cb6; border-radius: 4px; padding: 15px;">
+			<p style="font-size: 14px; color: #1f2937; margin: 0;">
+				<strong>Note:</strong> You will also receive a separate activation email from your Identity Provider ({{identity_provider}}).
+				Please complete both activations to fully set up your account.
+			</p>
+		</td>
+	</tr>
+</table>
+{{/if}}
 
 <!-- Feature Box -->
 <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0;">

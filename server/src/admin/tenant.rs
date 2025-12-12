@@ -159,6 +159,9 @@ pub async fn send_password_reset(
 	// Get tenant's preferred language
 	let lang = get_tenant_lang(&app.settings, tn_id).await;
 
+	// Get base_id_tag for sender name
+	let base_id_tag = app.opts.base_id_tag.as_ref().map(|s| s.as_ref()).unwrap_or("cloudillo");
+
 	// Schedule email with password_reset template
 	// Subject is defined in the template frontmatter for multi-language support
 	let email_params = EmailTaskParams {
@@ -166,13 +169,15 @@ pub async fn send_password_reset(
 		subject: None,
 		template_name: "password_reset".to_string(),
 		template_vars: serde_json::json!({
-			"user_name": user_name,
+			"identity_tag": user_name,
+			"base_id_tag": base_id_tag,
 			"instance_name": "Cloudillo",
 			"reset_link": reset_url,
 			"expire_hours": 24,
 		}),
 		lang,
 		custom_key: Some(format!("pw-reset:{}:{}", tn_id.0, Timestamp::now().0)),
+		from_name_override: Some(format!("Cloudillo ({})", base_id_tag.to_uppercase())),
 	};
 
 	EmailModule::schedule_email_task(&app.scheduler, &app.settings, tn_id, email_params).await?;

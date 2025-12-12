@@ -319,7 +319,7 @@ pub async fn process_registration(
 		let identity_provider = &identity.id_tag_domain;
 
 		let template_vars = serde_json::json!({
-			"identity_id": identity_id,
+			"identity_tag": identity_id,
 			"activation_link": activation_link,
 			"identity_provider": identity_provider,
 			"expire_hours": 24,
@@ -339,6 +339,10 @@ pub async fn process_registration(
 				template_vars,
 				lang: reg_content.lang.clone(),
 				custom_key: Some(email_task_key),
+				from_name_override: Some(format!(
+					"{} Identity Provider",
+					identity_provider.to_uppercase()
+				)),
 			},
 		)
 		.await

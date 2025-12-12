@@ -31,6 +31,9 @@ pub struct EmailSenderTask {
 	/// Optional language code for localized templates (e.g., "hu", "de")
 	#[serde(default)]
 	pub lang: Option<String>,
+	/// Optional sender name override (e.g., "Cloudillo (myinstance)" or identity_provider)
+	#[serde(default)]
+	pub from_name_override: Option<String>,
 }
 
 impl EmailSenderTask {
@@ -42,8 +45,9 @@ impl EmailSenderTask {
 		template_name: String,
 		template_vars: serde_json::Value,
 		lang: Option<String>,
+		from_name_override: Option<String>,
 	) -> Self {
-		Self { tn_id, to, subject, template_name, template_vars, lang }
+		Self { tn_id, to, subject, template_name, template_vars, lang, from_name_override }
 	}
 }
 
@@ -97,6 +101,7 @@ impl Task<App> for EmailSenderTask {
 			subject,
 			text_body: render_result.text_body,
 			html_body: Some(render_result.html_body),
+			from_name_override: self.from_name_override.clone(),
 		};
 
 		// Send email
@@ -125,6 +130,7 @@ mod tests {
 			"welcome".to_string(),
 			vars.clone(),
 			None,
+			None,
 		);
 
 		assert_eq!(task.tn_id.0, 1);
@@ -148,6 +154,7 @@ mod tests {
 			"welcome".to_string(),
 			vars.clone(),
 			Some("hu".to_string()),
+			None,
 		);
 
 		assert_eq!(task.lang, Some("hu".to_string()));
@@ -167,6 +174,7 @@ mod tests {
 			"notification".to_string(),
 			vars,
 			Some("de".to_string()),
+			None,
 		);
 
 		// Use Task trait's serialize method
@@ -192,6 +200,7 @@ mod tests {
 			"test".to_string(),
 			vars,
 			None,
+			None,
 		);
 		assert_eq!(task.kind_of(), "email.send");
 	}
@@ -210,6 +219,7 @@ mod tests {
 			None, // Subject from frontmatter
 			"welcome".to_string(),
 			vars.clone(),
+			None,
 			None,
 		);
 
