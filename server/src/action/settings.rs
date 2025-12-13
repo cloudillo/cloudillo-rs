@@ -27,6 +27,18 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Federation auto-approve incoming actions
+	registry.register(
+		SettingDefinition::builder("federation.auto_approve")
+			.description(
+				"Automatically approve incoming actions (POST, MSG, REPOST) from trusted sources",
+			)
+			.default(SettingValue::Bool(false))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
 	// Key fetch failure cache size
 	registry.register(
 		SettingDefinition::builder("federation.key_failure_cache_size")
@@ -62,6 +74,28 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.default(SettingValue::Bool(true))
 			.scope(SettingScope::Tenant)
 			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	// Privacy: Connection mode (auto-handling for incoming connection requests)
+	registry.register(
+		SettingDefinition::builder("privacy.connection_mode")
+			.description(
+				"Auto-handling for incoming connection requests: empty=manual, A=auto-accept, I=ignore",
+			)
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.optional(true)
+			.validator(|v| {
+				if let SettingValue::String(s) = v {
+					if ["A", "I"].contains(&s.as_str()) {
+						return Ok(());
+					}
+				}
+				Err(Error::ValidationError(
+					"privacy.connection_mode must be 'A' (auto-accept) or 'I' (ignore)".into(),
+				))
+			})
 			.build()?,
 	)?;
 

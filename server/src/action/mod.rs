@@ -14,6 +14,25 @@ mod process;
 pub mod settings;
 pub mod task;
 
+/// Action status codes for tracking action lifecycle state
+pub mod status {
+	/// Active/Accepted/Approved - Unified status for actions in good standing
+	/// Used for: new actions, manually accepted actions, auto-approved actions
+	pub const ACTIVE: char = 'A';
+
+	/// Confirmation required - Action awaits user decision (accept/reject)
+	/// Used for: CONN requests without mutual, FSHR file shares
+	pub const CONFIRMATION: char = 'C';
+
+	/// Notification - Auto-processed, informational only
+	/// Used for: mutual CONN auto-accepted, REACT notifications
+	pub const NOTIFICATION: char = 'N';
+
+	/// Deleted/Rejected - Action was rejected or deleted
+	/// Used for: rejected requests, deleted content
+	pub const DELETED: char = 'D';
+}
+
 pub use process::verify_action_token;
 
 use crate::prelude::*;

@@ -4,12 +4,14 @@
 //! replacing DSL versions where higher control and validation are needed.
 //!
 //! Modules:
+//! - aprv: Approval action handling (APRV)
 //! - conn: Connection lifecycle management (CONN)
 //! - fllw: Follow relationship management (FLLW)
 //! - fshr: File sharing lifecycle management (FSHR)
 //! - idp: Identity provider operations (IDP:REG)
 //! - react: Reaction management (REACT)
 
+pub mod aprv;
 pub mod conn;
 pub mod fllw;
 pub mod fshr;
@@ -90,6 +92,19 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		tracing::info!("Registered native hooks for REACT action type");
 	}
 
+	// APRV hooks
+	{
+		let aprv_hooks = ActionTypeHooks {
+			on_create: None,
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(aprv::on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("APRV", aprv_hooks);
+		tracing::info!("Registered native hooks for APRV action type");
+	}
+
 	Ok(())
 }
 
@@ -100,6 +115,7 @@ mod tests {
 	#[test]
 	fn test_hook_functions_exist() {
 		// Verify module exports compile correctly
+		let _ = aprv::on_receive;
 		let _ = conn::on_create;
 		let _ = conn::on_receive;
 		let _ = conn::on_accept;

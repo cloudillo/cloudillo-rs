@@ -235,11 +235,16 @@ pub async fn process_inbound_action_token(
 		&action,
 		definition_type,
 		is_sync,
-		client_address,
+		client_address.clone(),
 	)
 	.await?;
 
-	// 8. Forward action to connected WebSocket clients
+	// 8. Auto-approve approvable actions from trusted sources (if enabled)
+	if !is_sync {
+		try_auto_approve(app, tn_id, action_id, &action, definition).await;
+	}
+
+	// 9. Forward action to connected WebSocket clients
 	forward_inbound_action_to_websocket(app, tn_id, action_id, &action).await;
 
 	Ok(hook_result)
@@ -648,6 +653,140 @@ async fn send_push_notification(
 				tn_id = %tn_id.0,
 				error = %e,
 				"Failed to send push notification"
+			);
+		}
+	}
+}
+
+/// Try to auto-approve an approvable action from a trusted source
+///
+/// Conditions for auto-approve:
+/// 1. Action type must be approvable (POST, MSG, REPOST)
+/// 2. Action must be addressed to us (audience = our id_tag)
+/// 3. Issuer must be different from us
+/// 4. Issuer must be trusted (profile status 'T' or 'A')
+/// 5. federation.auto_approve setting must be enabled
+async fn try_auto_approve(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	action: &crate::auth_adapter::ActionToken,
+	definition: &crate::action::dsl::types::ActionDefinition,
+) {
+	use crate::action::status;
+	use crate::action::task::{self, CreateAction};
+
+	// 1. Check if action type is approvable
+	if !definition.behavior.approvable.unwrap_or(false) {
+		return;
+	}
+
+	// 2. Get our tenant's id_tag
+	let tenant = match app.meta_adapter.read_tenant(tn_id).await {
+		Ok(tenant) => tenant,
+		Err(_) => {
+			debug!("Auto-approve: Could not get tenant info");
+			return;
+		}
+	};
+	let our_id_tag = tenant.id_tag.as_ref();
+
+	// 3. Check if action is addressed to us (audience = our id_tag)
+	let audience = action.aud.as_deref();
+	if audience != Some(our_id_tag) {
+		debug!(
+			action_id = %action_id,
+			audience = ?audience,
+			our_id_tag = %our_id_tag,
+			"Auto-approve skipped: not addressed to us"
+		);
+		return;
+	}
+
+	// 4. Check issuer is not us
+	if action.iss.as_ref() == our_id_tag {
+		return;
+	}
+
+	// 5. Check if auto-approve setting is enabled
+	let auto_approve_enabled =
+		app.settings.get_bool(tn_id, "federation.auto_approve").await.unwrap_or(false);
+	if !auto_approve_enabled {
+		debug!(
+			action_id = %action_id,
+			"Auto-approve skipped: setting disabled"
+		);
+		return;
+	}
+
+	// 6. Check if issuer is trusted (connected = bidirectional connection established)
+	let issuer_profile = match app.meta_adapter.read_profile(tn_id, &action.iss).await {
+		Ok((_etag, profile)) => profile,
+		Err(e) => {
+			debug!(
+				action_id = %action_id,
+				issuer = %action.iss,
+				error = %e,
+				"Auto-approve skipped: issuer profile not found or error"
+			);
+			return;
+		}
+	};
+
+	// Trust = bidirectional connection (CONN handshake completed)
+	if !issuer_profile.connected {
+		debug!(
+			action_id = %action_id,
+			issuer = %action.iss,
+			connected = %issuer_profile.connected,
+			"Auto-approve skipped: issuer not connected"
+		);
+		return;
+	}
+
+	// All conditions met - auto-approve by setting status and creating APRV
+	info!(
+		action_id = %action_id,
+		issuer = %action.iss,
+		action_type = %action.t,
+		"Auto-approving action from trusted source"
+	);
+
+	// Update action status to 'A' (Active/Approved)
+	let update_opts = crate::meta_adapter::UpdateActionDataOptions {
+		status: crate::types::Patch::Value(status::ACTIVE),
+		..Default::default()
+	};
+	if let Err(e) = app.meta_adapter.update_action_data(tn_id, action_id, &update_opts).await {
+		warn!(
+			action_id = %action_id,
+			error = %e,
+			"Auto-approve: Failed to update action status"
+		);
+		return;
+	}
+
+	// Create APRV action to signal approval to the issuer
+	let aprv_action = CreateAction {
+		typ: "APRV".into(),
+		audience_tag: Some(action.iss.clone()),
+		subject: Some(action_id.into()),
+		..Default::default()
+	};
+
+	match task::create_action(app, tn_id, our_id_tag, aprv_action).await {
+		Ok(_) => {
+			info!(
+				action_id = %action_id,
+				issuer = %action.iss,
+				"Auto-approve: APRV action created"
+			);
+		}
+		Err(e) => {
+			warn!(
+				action_id = %action_id,
+				error = %e,
+				"Auto-approve: Failed to create APRV action"
 			);
 		}
 	}

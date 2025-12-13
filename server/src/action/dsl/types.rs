@@ -166,6 +166,9 @@ pub struct BehaviorFlags {
 	pub local_only: Option<bool>,
 	/// Don't persist?
 	pub ephemeral: Option<bool>,
+	/// Can this action receive APRV (approval) from audience?
+	/// When true, accepting this action will generate an APRV federated signal
+	pub approvable: Option<bool>,
 }
 
 /// Lifecycle hooks for action processing

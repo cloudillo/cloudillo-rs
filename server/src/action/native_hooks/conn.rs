@@ -7,6 +7,7 @@
 //! - on_reject: Handles rejection of connection request
 
 use crate::action::hooks::{HookContext, HookResult};
+use crate::action::task::{create_action, CreateAction};
 use crate::core::app::App;
 use crate::meta_adapter::{ProfileConnectionStatus, UpdateActionDataOptions, UpdateProfileData};
 use crate::prelude::*;
@@ -153,21 +154,100 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				}
 			}
 
-			// No mutual request - requires user confirmation
-			tracing::info!(
-				"CONN: Connection request from {} requires confirmation",
-				context.issuer
-			);
-
-			// Set action status to 'C' (confirmation) - user needs to accept/reject
-			let update_opts =
-				UpdateActionDataOptions { status: Patch::Value('C'), ..Default::default() };
-			if let Err(e) = app
-				.meta_adapter
-				.update_action_data(tn_id, &context.action_id, &update_opts)
+			// No mutual request - check connection_mode setting
+			let connection_mode = app
+				.settings
+				.get_string_opt(tn_id, "privacy.connection_mode")
 				.await
-			{
-				tracing::warn!("CONN: Failed to update action status to C: {}", e);
+				.ok()
+				.flatten();
+
+			match connection_mode.as_deref() {
+				Some("I") => {
+					// IGNORE mode: Auto-delete/reject the connection request
+					tracing::info!(
+						"CONN: Ignoring connection request from {} (connection_mode=I)",
+						context.issuer
+					);
+
+					// Set action status to 'D' (deleted)
+					let update_opts =
+						UpdateActionDataOptions { status: Patch::Value('D'), ..Default::default() };
+					if let Err(e) = app
+						.meta_adapter
+						.update_action_data(tn_id, &context.action_id, &update_opts)
+						.await
+					{
+						tracing::warn!("CONN: Failed to update action status to D: {}", e);
+					}
+				}
+				Some("A") => {
+					// AUTO-ACCEPT mode: Create response CONN action and connect
+					tracing::info!(
+						"CONN: Auto-accepting connection from {} (connection_mode=A)",
+						context.issuer
+					);
+
+					// Create response CONN action
+					let response_action = CreateAction {
+						typ: "CONN".into(),
+						audience_tag: Some(context.issuer.clone().into()),
+						..Default::default()
+					};
+
+					if let Err(e) =
+						create_action(&app, tn_id, &context.tenant_tag, response_action).await
+					{
+						tracing::warn!("CONN: Failed to create auto-accept response: {}", e);
+					}
+
+					// Update issuer's profile to connected
+					let profile_update = UpdateProfileData {
+						connected: Patch::Value(ProfileConnectionStatus::Connected),
+						following: Patch::Value(true),
+						..Default::default()
+					};
+					if let Err(e) = app
+						.meta_adapter
+						.update_profile(tn_id, &context.issuer, &profile_update)
+						.await
+					{
+						tracing::warn!(
+							"CONN: Failed to update issuer profile {}: {}",
+							context.issuer,
+							e
+						);
+					}
+
+					// Set action status to 'N' (notification - auto-processed)
+					let update_opts =
+						UpdateActionDataOptions { status: Patch::Value('N'), ..Default::default() };
+					if let Err(e) = app
+						.meta_adapter
+						.update_action_data(tn_id, &context.action_id, &update_opts)
+						.await
+					{
+						tracing::warn!("CONN: Failed to update action status to N: {}", e);
+					}
+				}
+				_ => {
+					// Normal behavior: requires user confirmation
+					tracing::info!(
+						"CONN: Connection request from {} requires confirmation",
+						context.issuer
+					);
+
+					// Set action status to 'C' (confirmation) - user needs to accept/reject
+					let update_opts =
+						UpdateActionDataOptions { status: Patch::Value('C'), ..Default::default() };
+					if let Err(e) = app
+						.meta_adapter
+						.update_action_data(tn_id, &context.action_id, &update_opts)
+						.await
+					{
+						tracing::warn!("CONN: Failed to update action status to C: {}", e);
+					}
+				}
 			}
 		}
 		Some("DEL") => {

@@ -331,10 +331,47 @@ pub async fn post_action_accept(
 
 	// Update action status to 'A' (Accepted)
 	let update_opts = crate::meta_adapter::UpdateActionDataOptions {
-		status: crate::types::Patch::Value('A'),
+		status: crate::types::Patch::Value(crate::action::status::ACTIVE),
 		..Default::default()
 	};
 	app.meta_adapter.update_action_data(tn_id, &action_id, &update_opts).await?;
+
+	// If action type is approvable, create APRV action to signal approval to the issuer
+	let is_approvable = app
+		.dsl_engine
+		.get_definition(&action.typ)
+		.map(|d| d.behavior.approvable.unwrap_or(false))
+		.unwrap_or(false);
+
+	if is_approvable {
+		// Create APRV action with:
+		// - audience = action.issuer_tag (original sender receives the approval)
+		// - subject = action_id (the action being approved)
+		let aprv_action = CreateAction {
+			typ: "APRV".into(),
+			audience_tag: Some(action.issuer.id_tag.clone()),
+			subject: Some(action_id.clone().into()),
+			..Default::default()
+		};
+
+		match task::create_action(&app, tn_id, &id_tag, aprv_action).await {
+			Ok(_) => {
+				info!(
+					action_id = %action_id,
+					issuer = %action.issuer.id_tag,
+					"APRV action created for accepted action"
+				);
+			}
+			Err(e) => {
+				warn!(
+					action_id = %action_id,
+					error = %e,
+					"Failed to create APRV action for accepted action"
+				);
+				// Don't fail the accept request if APRV creation fails
+			}
+		}
+	}
 
 	info!(
 		action_id = %action_id,
@@ -406,7 +443,7 @@ pub async fn post_action_reject(
 
 	// Update action status to 'D' (Deleted)
 	let update_opts = crate::meta_adapter::UpdateActionDataOptions {
-		status: crate::types::Patch::Value('D'),
+		status: crate::types::Patch::Value(crate::action::status::DELETED),
 		..Default::default()
 	};
 	app.meta_adapter.update_action_data(tn_id, &action_id, &update_opts).await?;

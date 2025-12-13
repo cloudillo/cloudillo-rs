@@ -62,7 +62,7 @@ Complete DSL definitions created for all action types:
 - **CMNT.json** - Comments on posts/actions
 - **MSG.json** - Direct messages
 - **REPOST.json** - Repost/share actions
-- **ACK.json** - Acknowledgment receipts
+- **APRV.json** - Approval actions (trust/federation permission)
 - **STAT.json** - Statistics updates (reactions, comments)
 
 ## Key Features
@@ -228,7 +228,7 @@ server/src/action/
     ├── CMNT.json        - Comment action
     ├── MSG.json         - Message action
     ├── REPOST.json      - Repost action
-    ├── ACK.json         - Acknowledgment action
+    ├── APRV.json        - Approval action
     └── STAT.json        - Statistics action
 ```
 
@@ -240,7 +240,7 @@ server/src/action/
 - All operations implemented
 - DSL engine with timeout enforcement
 - Comprehensive validator
-- 9 action type definitions (CONN, FLLW, POST, REACT, CMNT, MSG, REPOST, ACK, STAT)
+- 9 action type definitions (CONN, FLLW, POST, REACT, CMNT, MSG, REPOST, APRV, STAT)
 - All compilation errors fixed
 - Code compiles successfully
 

@@ -27,7 +27,7 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		comment_definition(),
 		message_definition(),
 		repost_definition(),
-		ack_definition(),
+		aprv_definition(),
 		stat_definition(),
 		idp_reg_definition(),
 		fileshare_definition(),
@@ -189,12 +189,12 @@ fn post_definition() -> ActionDefinition {
 			broadcast: Some(true),
 			allow_unknown: Some(false),
 			requires_acceptance: Some(false),
-
+			approvable: Some(true),
 			..Default::default()
 		},
 		hooks: ActionHooks {
 			on_create: HookImplementation::None, // Broadcasting is handled automatically by the system
-			on_receive: HookImplementation::None, // TODO: Add profile check and conditional ACK creation from JSON
+			on_receive: HookImplementation::None, // Auto-approve handled in process.rs based on approvable flag
 			on_accept: HookImplementation::None,
 			on_reject: HookImplementation::None,
 		},
@@ -358,12 +358,13 @@ fn message_definition() -> ActionDefinition {
 			broadcast: Some(false),
 			allow_unknown: Some(false),
 			requires_acceptance: Some(false),
+			approvable: Some(true),
 			ttl: None,
 			..Default::default()
 		},
 		hooks: ActionHooks {
 			on_create: HookImplementation::None,
-			on_receive: HookImplementation::None, // TODO: Check subtype != DEL, create notification with type=message, priority=high
+			on_receive: HookImplementation::None, // Auto-approve handled in process.rs; TODO: notification for new messages
 			on_accept: HookImplementation::None,
 			on_reject: HookImplementation::None,
 		},
@@ -417,12 +418,12 @@ fn repost_definition() -> ActionDefinition {
 			broadcast: Some(true),
 			allow_unknown: Some(false),
 			requires_acceptance: Some(false),
-
+			approvable: Some(true),
 			..Default::default()
 		},
 		hooks: ActionHooks {
 			on_create: HookImplementation::None, // TODO: Get parent action and log
-			on_receive: HookImplementation::None, // TODO: Check subtype != DEL, get parent, create notification if parent issuer is tenant
+			on_receive: HookImplementation::None, // Auto-approve handled in process.rs; TODO: notification if parent issuer is tenant
 			on_accept: HookImplementation::None,
 			on_reject: HookImplementation::None,
 		},
@@ -436,15 +437,16 @@ fn repost_definition() -> ActionDefinition {
 	}
 }
 
-/// ACK - Acknowledgment receipt
-fn ack_definition() -> ActionDefinition {
+/// APRV - Approval action
+/// Sent to signal trust and acceptance of an action, allowing further federation
+fn aprv_definition() -> ActionDefinition {
 	ActionDefinition {
-		r#type: "ACK".to_string(),
+		r#type: "APRV".to_string(),
 		version: "1.0".to_string(),
-		description: "Acknowledge receipt of an action".to_string(),
+		description: "Approve an action for federation to user's network".to_string(),
 		metadata: Some(ActionMetadata {
 			category: Some("system".to_string()),
-			tags: Some(vec!["acknowledgment".to_string(), "receipt".to_string()]),
+			tags: Some(vec!["approval".to_string(), "trust".to_string(), "federation".to_string()]),
 			deprecated: None,
 			experimental: None,
 		}),
