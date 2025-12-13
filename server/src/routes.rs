@@ -2,8 +2,10 @@
 
 use axum::{
 	body::Body,
-	http::{header, HeaderValue, Request},
+	extract::State,
+	http::{header, HeaderMap, HeaderValue, Request, StatusCode},
 	middleware,
+	response::Response,
 	routing::{any, delete, get, patch, post, put},
 	Router,
 };
@@ -287,12 +289,163 @@ fn init_api_service(app: App) -> Router {
 		.with_state(app)
 }
 
-/// Middleware to add cache headers to static file responses
-async fn static_cache_middleware(
-	disable_cache: bool,
+// ============================================================================
+// DYNAMIC SERVICE WORKER - Serves SW with tenant-specific encryption key
+// ============================================================================
+
+/// Encryption key variable name for tenant
+const SW_ENCRYPTION_KEY_VAR: &str = "sw_encryption_key";
+
+/// Placeholder in SW template that gets replaced with the actual key
+const SW_ENCRYPTION_KEY_PLACEHOLDER: &str = "__CLOUDILLO_SW_ENCRYPTION_KEY__";
+
+/// Check if a path is a service worker file (sw-*.js pattern)
+fn is_sw_file(path: &str) -> bool {
+	let filename = path.trim_start_matches('/');
+	filename.starts_with("sw-") && filename.ends_with(".js") && !filename.contains('/')
+}
+
+/// Check if a path is in an app directory (microfrontend assets)
+/// Apps are served from /apps/ directory and need CORS for sandboxed iframes
+fn is_app_directory(path: &str) -> bool {
+	let path = path.trim_start_matches('/');
+	path.starts_with("apps/")
+}
+
+/// Serve the service worker with tenant-specific encryption key embedded
+/// Key is only injected if:
+/// 1. Service-Worker: script header is present (browser sets this, JS cannot fake it)
+/// 2. Key in URL query matches the tenant's stored key
+async fn serve_dynamic_sw(
+	app: &App,
+	sw_file: &str,
+	host: &str,
+	headers: &HeaderMap,
+	query: Option<&str>,
+) -> Result<Response, Error> {
+	// 1. Check for Service-Worker header (browser sets this automatically, JS cannot fake it)
+	let sw_header = headers.get("Service-Worker").and_then(|v| v.to_str().ok());
+	let is_sw_registration = sw_header.map(|v| v == "script").unwrap_or(false);
+	info!("[SW] Service-Worker header: {:?}, is_registration: {}", sw_header, is_sw_registration);
+
+	// 2. Extract key from query string (URL-safe base64, no decoding needed)
+	let provided_key = query
+		.and_then(|q| q.split('&').find(|p| p.starts_with("key=")).map(|p| p[4..].to_string()));
+	info!(
+		"[SW] Query: {:?}, provided_key: {:?}",
+		query,
+		provided_key.as_ref().map(|k| &k[..8.min(k.len())])
+	);
+
+	// 3. Determine if we should inject the key
+	let should_inject_key = if is_sw_registration {
+		if let Some(ref key) = provided_key {
+			// Look up tenant and validate key
+			match app.auth_adapter.read_cert_by_domain(host).await {
+				Ok(cert_data) => {
+					let tn_id = cert_data.tn_id;
+					info!("[SW] Found tenant {} for host {}", tn_id.0, host);
+					match app.auth_adapter.read_var(tn_id, SW_ENCRYPTION_KEY_VAR).await {
+						Ok(stored_key) => {
+							let matches = &*stored_key == key;
+							info!(
+								"[SW] Key validation: stored={}, provided={}, matches={}",
+								&stored_key[..8.min(stored_key.len())],
+								&key[..8.min(key.len())],
+								matches
+							);
+							matches
+						}
+						Err(e) => {
+							warn!("[SW] Failed to read stored key: {:?}", e);
+							false
+						}
+					}
+				}
+				Err(e) => {
+					warn!("[SW] Failed to lookup tenant for host {}: {:?}", host, e);
+					false
+				}
+			}
+		} else {
+			false
+		}
+	} else {
+		false
+	};
+
+	// 4. Read SW template from dist directory
+	let sw_path = app.opts.dist_dir.join(sw_file);
+	let sw_content = tokio::fs::read_to_string(&sw_path).await.map_err(|e| {
+		warn!("Failed to read SW template {}: {}", sw_path.display(), e);
+		Error::NotFound
+	})?;
+
+	// 5. Conditionally inject the key
+	let modified_content = match (should_inject_key, provided_key.as_ref()) {
+		(true, Some(key)) => {
+			info!("Serving SW with encryption key for authenticated registration");
+			sw_content.replace(SW_ENCRYPTION_KEY_PLACEHOLDER, key)
+		}
+		_ => sw_content,
+	};
+
+	// Build response with appropriate headers
+	Ok(Response::builder()
+		.status(StatusCode::OK)
+		.header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
+		.header(header::CACHE_CONTROL, "private, no-store, no-cache")
+		.header(header::EXPIRES, "0")
+		.body(Body::from(modified_content))?)
+}
+
+/// Fallback handler for static files with SW interception
+async fn static_fallback_handler(
+	State(app): State<App>,
 	request: Request<Body>,
-	mut serve_dir: ServeDir<ServeFile>,
-) -> Result<axum::response::Response, std::convert::Infallible> {
+) -> axum::response::Response {
+	let path = request.uri().path();
+	let query = request.uri().query();
+	let disable_cache = app.opts.disable_cache;
+
+	// Check if this is a service worker request (sw-*.js)
+	if is_sw_file(path) {
+		// Extract host from request
+		let host = request
+			.uri()
+			.host()
+			.or_else(|| {
+				request
+					.headers()
+					.get(header::HOST)
+					.and_then(|h| h.to_str().ok())
+					.map(|h| h.split(':').next().unwrap_or(h))
+			})
+			.unwrap_or_default();
+
+		let sw_file = path.trim_start_matches('/');
+		let headers = request.headers();
+
+		// Try to serve dynamic SW, fall back to static if it fails
+		match serve_dynamic_sw(&app, sw_file, host, headers, query).await {
+			Ok(response) => return response,
+			Err(e) => {
+				warn!("Failed to serve dynamic SW {}: {:?}, falling back to static", sw_file, e);
+				// Fall through to static file serving
+			}
+		}
+	}
+
+	// Check if this is an app directory (microfrontend assets need CORS for sandboxed iframes)
+	let is_app_asset = is_app_directory(path);
+
+	// Serve static files with cache headers
+	let dist_dir = &app.opts.dist_dir;
+	let mut serve_dir = ServeDir::new(dist_dir)
+		.precompressed_gzip()
+		.precompressed_br()
+		.fallback(ServeFile::new(dist_dir.join("index.html")));
+
 	let mut response = serve_dir.call(request).await.unwrap();
 
 	// Determine cache policy based on content type
@@ -317,18 +470,18 @@ async fn static_cache_middleware(
 	};
 
 	response.headers_mut().insert(header::CACHE_CONTROL, cache_value);
-	Ok(response.map(Body::new))
+
+	// Add CORS headers for app directories (sandboxed iframes have opaque 'null' origin)
+	if is_app_asset {
+		response
+			.headers_mut()
+			.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+	}
+
+	response.map(Body::new)
 }
 
 fn init_app_service(app: App) -> Router {
-	let disable_cache = app.opts.disable_cache;
-	let dist_dir = app.opts.dist_dir.clone();
-
-	let serve_dir = ServeDir::new(&dist_dir)
-		.precompressed_gzip()
-		.precompressed_br()
-		.fallback(ServeFile::new(dist_dir.join("index.html")));
-
 	let ws_router = Router::new()
 		.route("/ws/bus", any(websocket::get_ws_bus))
 		.route("/ws/rtdb/{file_id}", any(websocket::get_ws_rtdb))
@@ -343,9 +496,7 @@ fn init_app_service(app: App) -> Router {
 	Router::new()
 		.merge(well_known_router)
 		.merge(ws_router)
-		.fallback(move |request: Request<Body>| {
-			static_cache_middleware(disable_cache, request, serve_dir.clone())
-		})
+		.fallback(static_fallback_handler)
 		.with_state(app)
 }
 

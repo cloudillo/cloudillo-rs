@@ -3,6 +3,8 @@ use axum::{
 	http::StatusCode,
 	Json,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_with::skip_serializing_none;
@@ -24,6 +26,16 @@ use crate::{
 	types::ApiResponse,
 };
 
+/// Service worker encryption key variable name
+const SW_ENCRYPTION_KEY_VAR: &str = "sw_encryption_key";
+
+/// Generate a new 256-bit encryption key for SW token protection
+/// Uses URL-safe base64 encoding (no padding) for safe inclusion in URLs
+fn generate_sw_encryption_key() -> String {
+	let key: [u8; 32] = rand::rng().random();
+	BASE64_URL.encode(key)
+}
+
 /// # Login
 #[skip_serializing_none]
 #[derive(Serialize)]
@@ -40,6 +52,9 @@ pub struct Login {
 	#[serde(rename = "profilePic")]
 	profile_pic: String,
 	settings: Vec<(String, String)>,
+	// SW encryption key for secure token storage
+	#[serde(rename = "swEncryptionKey")]
+	sw_encryption_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -76,6 +91,29 @@ pub async fn return_login(
 		None => (auth.id_tag.to_string(), None),
 	};
 
+	// Get or create SW encryption key for this tenant
+	let sw_encryption_key = match app.auth_adapter.read_var(auth.tn_id, SW_ENCRYPTION_KEY_VAR).await
+	{
+		Ok(key) => Some(key.to_string()),
+		Err(Error::NotFound) => {
+			// Generate new key
+			let key = generate_sw_encryption_key();
+			if let Err(e) =
+				app.auth_adapter.update_var(auth.tn_id, SW_ENCRYPTION_KEY_VAR, &key).await
+			{
+				warn!("Failed to store SW encryption key: {}", e);
+				None
+			} else {
+				info!("Generated new SW encryption key for tenant {}", auth.tn_id.0);
+				Some(key)
+			}
+		}
+		Err(e) => {
+			warn!("Failed to read SW encryption key: {}", e);
+			None
+		}
+	};
+
 	let login = Login {
 		tn_id: auth.tn_id,
 		id_tag: auth.id_tag.to_string(),
@@ -84,6 +122,7 @@ pub async fn return_login(
 		name,
 		profile_pic: profile_pic.unwrap_or_default(),
 		settings: vec![],
+		sw_encryption_key,
 	};
 
 	Ok((StatusCode::OK, Json(login)))

@@ -38,13 +38,13 @@ RUN git clone --depth 1 --branch ${FRONTEND_REF} https://github.com/cloudillo/cl
 RUN pnpm install --frozen-lockfile
 RUN pnpm -r --filter '!@cloudillo/storybook' build
 
-# Assemble final dist structure: shell/dist/* + apps/*/dist as subdirs
-RUN mkdir -p /dist \
+# Assemble final dist structure: shell/dist/* + apps under /dist/apps/
+RUN mkdir -p /dist/apps \
     && cp -r shell/dist/* /dist/ \
     && for app in apps/*/; do \
          name=$(basename "$app"); \
          if [ -d "$app/dist" ]; then \
-           cp -r "$app/dist" "/dist/$name"; \
+           cp -r "$app/dist" "/dist/apps/$name"; \
          fi; \
        done
 
