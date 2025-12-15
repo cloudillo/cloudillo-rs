@@ -10,7 +10,12 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncRead;
+use tokio::time::timeout;
+
+/// Default HTTP request timeout (10 seconds)
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::action::task;
 use crate::auth_adapter::AuthAdapter;
@@ -61,6 +66,26 @@ impl Request {
 		Ok(Request { auth_adapter, client: Client::builder(TokioExecutor::new()).build(client) })
 	}
 
+	/// Execute an HTTP request with timeout wrapper
+	async fn timed_request(
+		&self,
+		req: hyper::Request<BoxBody<Bytes, Error>>,
+	) -> ClResult<hyper::Response<hyper::body::Incoming>> {
+		timeout(REQUEST_TIMEOUT, self.client.request(req))
+			.await
+			.map_err(|_| Error::Timeout)?
+			.map_err(Error::from)
+	}
+
+	/// Collect response body with timeout
+	async fn collect_body(body: hyper::body::Incoming) -> ClResult<Bytes> {
+		timeout(REQUEST_TIMEOUT, body.collect())
+			.await
+			.map_err(|_| Error::Timeout)?
+			.map_err(|_| Error::NetworkError("body collection error".into()))
+			.map(|collected| collected.to_bytes())
+	}
+
 	pub async fn create_proxy_token(
 		&self,
 		tn_id: TnId,
@@ -92,12 +117,11 @@ impl Request {
 				}
 			))
 			.body(to_boxed(Empty::new()))?;
-		let res = self.client.request(req).await?;
+		let res = self.timed_request(req).await?;
 		if !res.status().is_success() {
 			return Err(Error::PermissionDenied);
 		}
-		let parsed: TokenRes =
-			serde_json::from_slice(&res.into_body().collect().await?.to_bytes())?;
+		let parsed: TokenRes = serde_json::from_slice(&Self::collect_body(res.into_body()).await?)?;
 
 		Ok(parsed.data.token)
 	}
@@ -121,10 +145,10 @@ impl Request {
 			req
 		};
 		let req = req.body(to_boxed(Empty::new()))?;
-		let res = self.client.request(req).await?;
+		let res = self.timed_request(req).await?;
 		info!("Got response: {}", res.status());
 		match res.status() {
-			StatusCode::OK => Ok(res.into_body().collect().await?.to_bytes()),
+			StatusCode::OK => Self::collect_body(res.into_body()).await,
 			StatusCode::NOT_FOUND => Err(Error::NotFound),
 			StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
 			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
@@ -149,7 +173,7 @@ impl Request {
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
 			.header("Authorization", format!("Bearer {}", token))
 			.body(to_boxed(Empty::new()))?;
-		let res = self.client.request(req).await?;
+		let res = self.timed_request(req).await?;
 		match res.status() {
 			//StatusCode::OK => Ok(res.into_body().into_data_stream().map(|stream| stream.map_err(|err| Error::Unknown))),
 			//StatusCode::OK => Ok(res.into_body().into_data_stream().map(|res| res.map_err(|err| Error::Unknown))),
@@ -193,10 +217,10 @@ impl Request {
 			.method(Method::GET)
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
 			.body(to_boxed(Empty::new()))?;
-		let res = self.client.request(req).await?;
+		let res = self.timed_request(req).await?;
 		match res.status() {
 			StatusCode::OK => {
-				let bytes = res.into_body().collect().await?.to_bytes();
+				let bytes = Self::collect_body(res.into_body()).await?;
 				let parsed: Res = serde_json::from_slice(&bytes)?;
 				Ok(parsed)
 			}
@@ -229,7 +253,7 @@ impl Request {
 		}
 
 		let req = builder.body(to_boxed(Empty::new()))?;
-		let res = self.client.request(req).await?;
+		let res = self.timed_request(req).await?;
 
 		match res.status() {
 			StatusCode::NOT_MODIFIED => Ok(ConditionalResult::NotModified),
@@ -241,7 +265,7 @@ impl Request {
 					.and_then(|v| v.to_str().ok())
 					.map(|s| s.trim_matches('"').into());
 
-				let bytes = res.into_body().collect().await?.to_bytes();
+				let bytes = Self::collect_body(res.into_body()).await?;
 				let parsed: Res = serde_json::from_slice(&bytes)?;
 				Ok(ConditionalResult::Modified { data: parsed, etag: new_etag })
 			}
@@ -263,10 +287,10 @@ impl Request {
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
 			.header("Content-Type", "application/json")
 			.body(to_boxed(Full::from(json_data)))?;
-		let res = self.client.request(req).await?;
+		let res = self.timed_request(req).await?;
 		match res.status() {
 			StatusCode::OK | StatusCode::CREATED => {
-				let bytes = res.into_body().collect().await?.to_bytes();
+				let bytes = Self::collect_body(res.into_body()).await?;
 				let parsed: Res = serde_json::from_slice(&bytes)?;
 				Ok(parsed)
 			}
@@ -291,9 +315,8 @@ impl Request {
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
 			.header("Content-Type", "application/json")
 			.body(to_boxed(Full::from(data)))?;
-		let res = self.client.request(req).await?;
-		let body = res.into_body().collect().await?.to_bytes();
-		Ok(body)
+		let res = self.timed_request(req).await?;
+		Self::collect_body(res.into_body()).await
 	}
 
 	pub async fn post_stream<S>(
@@ -310,9 +333,8 @@ impl Request {
 			.method(Method::POST)
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
 			.body(to_boxed(StreamBody::new(stream)))?;
-		let res = self.client.request(req).await?;
-		let body = res.into_body().collect().await?.to_bytes();
-		Ok(body)
+		let res = self.timed_request(req).await?;
+		Self::collect_body(res.into_body()).await
 	}
 
 	pub async fn post<Res>(
