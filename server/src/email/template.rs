@@ -220,12 +220,31 @@ impl TemplateEngine {
 		// Parse frontmatter from HTML template
 		let (html_metadata, html_template) = Self::parse_frontmatter(&html_content);
 
+		// Load text template with language fallback
+		let (text_path, text_content) =
+			Self::resolve_template_path(&template_dir, template_name, "txt.hbs", lang)?;
+
+		// Parse frontmatter from text template
+		let (text_metadata, text_template) = Self::parse_frontmatter(&text_content);
+
+		// Render subject FIRST (before layouts) so it can be used as title
+		// Use subject from HTML metadata (primary) or text metadata (fallback)
+		let subject = match html_metadata.subject.as_ref().or(text_metadata.subject.as_ref()) {
+			Some(subj) => {
+				let rendered = self.handlebars.render_template(subj, vars).map_err(|e| {
+					Error::ValidationError(format!("Failed to render email subject: {}", e))
+				})?;
+				Some(rendered)
+			}
+			None => None,
+		};
+
 		// Render HTML content
 		let html_rendered = self.handlebars.render_template(html_template, vars).map_err(|e| {
 			Error::ValidationError(format!("Failed to render HTML template '{}': {}", html_path, e))
 		})?;
 
-		// Apply layout if specified
+		// Apply layout if specified (use rendered subject as title)
 		let html_body = if let Some(ref layout) = html_metadata.layout {
 			self.render_layout(LayoutRenderParams {
 				template_dir: &template_dir,
@@ -233,19 +252,12 @@ impl TemplateEngine {
 				extension: "html.hbs",
 				lang,
 				body: &html_rendered,
-				title: html_metadata.subject.as_deref(),
+				title: subject.as_deref(),
 				vars,
 			})?
 		} else {
 			html_rendered
 		};
-
-		// Load text template with language fallback
-		let (text_path, text_content) =
-			Self::resolve_template_path(&template_dir, template_name, "txt.hbs", lang)?;
-
-		// Parse frontmatter from text template
-		let (text_metadata, text_template) = Self::parse_frontmatter(&text_content);
 
 		// Render text content
 		let text_rendered = self.handlebars.render_template(text_template, vars).map_err(|e| {
@@ -261,23 +273,11 @@ impl TemplateEngine {
 				extension: "txt.hbs",
 				lang,
 				body: &text_rendered,
-				title: text_metadata.subject.as_deref().or(html_metadata.subject.as_deref()),
+				title: subject.as_deref(),
 				vars,
 			})?
 		} else {
 			text_rendered
-		};
-
-		// Use subject from HTML metadata (primary) or text metadata (fallback)
-		// Render subject through Handlebars to support variables like {{base_id_tag}}
-		let subject = match html_metadata.subject.or(text_metadata.subject) {
-			Some(subj) => {
-				let rendered = self.handlebars.render_template(&subj, vars).map_err(|e| {
-					Error::ValidationError(format!("Failed to render email subject: {}", e))
-				})?;
-				Some(rendered)
-			}
-			None => None,
 		};
 
 		Ok(RenderResult { subject, html_body, text_body })
