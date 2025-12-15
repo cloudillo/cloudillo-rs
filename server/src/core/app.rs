@@ -447,8 +447,11 @@ impl AppBuilder {
 			None
 		};
 
-		// Run bootstrapper in the background
-		tokio::spawn(async move { bootstrap::bootstrap(app.clone(), &app.opts).await });
+		// Run bootstrapper synchronously - fail if bootstrap fails
+		bootstrap::bootstrap(app.clone(), &app.opts).await.map_err(|e| {
+			error!("FATAL: Bootstrap failed: {}", e);
+			e
+		})?;
 
 		if let Some(http_server) = http_server {
 			let _ = tokio::try_join!(https_server, http_server)?;

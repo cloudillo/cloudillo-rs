@@ -199,108 +199,127 @@ pub async fn bootstrap(
 		let id_tag = auth.read_id_tag(TnId(1)).await;
 		debug!("Got id tag: {:?}", id_tag);
 
-		if let Err(Error::NotFound) = id_tag {
-			info!("======================================\nBootstrapping...\n======================================");
-			let Some(base_password) = opts.base_password.clone() else {
-				return Err(Error::Internal(
-					"FATAL: No base password provided for bootstrap".to_string(),
-				));
-			};
+		match id_tag {
+			Err(Error::NotFound) => {
+				// Base tenant doesn't exist, create it
+				info!("======================================\nBootstrapping...\n======================================");
+				let Some(base_password) = opts.base_password.clone() else {
+					return Err(Error::Internal(
+						"FATAL: No base password provided for bootstrap".to_string(),
+					));
+				};
 
-			// Use the unified tenant creation function
-			create_complete_tenant(
-				&app,
-				CreateCompleteTenantOptions {
-					id_tag: base_id_tag,
-					email: None,
-					password: Some(&base_password),
-					roles: Some(&["SADM"]),
-					display_name: None, // Will be derived from id_tag
-					create_acme_cert: opts.acme_email.is_some(),
-					acme_email: opts.acme_email.as_deref(),
-					app_domain: opts.base_app_domain.as_deref(),
-				},
-			)
-			.await?;
-			// Initialize IDP list with cloudillo.net as default provider
-			initialize_idp_settings(&app).await?;
-		} else if let Some(ref acme_email) = opts.acme_email {
-			// Schedule hourly certificate renewal task
-			info!("Scheduling automatic certificate renewal task (runs hourly)");
+				// Use the unified tenant creation function
+				create_complete_tenant(
+					&app,
+					CreateCompleteTenantOptions {
+						id_tag: base_id_tag,
+						email: None,
+						password: Some(&base_password),
+						roles: Some(&["SADM"]),
+						display_name: None, // Will be derived from id_tag
+						create_acme_cert: opts.acme_email.is_some(),
+						acme_email: opts.acme_email.as_deref(),
+						app_domain: opts.base_app_domain.as_deref(),
+					},
+				)
+				.await?;
+				// Initialize IDP list with cloudillo.net as default provider
+				initialize_idp_settings(&app).await?;
+			}
+			Err(e) => {
+				// Database error or other failure - cannot proceed
+				error!("FATAL: Cannot check if base tenant exists: {}", e);
+				return Err(e);
+			}
+			Ok(_) => {
+				if let Some(acme_email) = opts.acme_email.as_ref() {
+					// Base tenant exists, schedule certificate renewal if ACME is configured
+					// Schedule hourly certificate renewal task
+					info!("Scheduling automatic certificate renewal task (runs hourly)");
 
-			// TODO: Make renewal_days configurable via admin settings, default 30 days
-			let renewal_days = 30;
+					// TODO: Make renewal_days configurable via admin settings, default 30 days
+					let renewal_days = 30;
 
-			let renewal_task =
-				Arc::new(acme::CertRenewalTask::new(acme_email.to_string(), renewal_days));
+					let renewal_task =
+						Arc::new(acme::CertRenewalTask::new(acme_email.to_string(), renewal_days));
 
-			// Schedule to run every hour at minute 0 using cron with a unique key for deduplication
-			let app_clone = app.clone();
-			let acme_email = acme_email.clone();
-			tokio::spawn(async move {
-				match app_clone
+					// Schedule to run every hour at minute 0 using cron with a unique key for deduplication
+					let app_clone = app.clone();
+					let acme_email = acme_email.clone();
+					tokio::spawn(async move {
+						match app_clone
 					.scheduler
 					.task(renewal_task)
 					.key("acme.cert_renewal") // Unique key prevents duplicates on restart
 					.cron("0 0 * * *") // Every day
 					.schedule()
 					.await
-				{
-					Ok(task_id) => {
-						info!("Certificate renewal task scheduled (task_id={})", task_id);
-					}
-					Err(e) => {
-						error!(error = %e, "Failed to schedule certificate renewal task");
-					}
-				}
+						{
+							Ok(task_id) => {
+								info!("Certificate renewal task scheduled (task_id={})", task_id);
+							}
+							Err(e) => {
+								error!(error = %e, "Failed to schedule certificate renewal task");
+							}
+						}
 
-				// Also run renewal check immediately on startup in background
-				info!("Running initial certificate check on startup...");
-				match app_clone.auth_adapter.list_tenants_needing_cert_renewal(renewal_days).await {
-					Ok(tenants) => {
-						if tenants.is_empty() {
-							info!("All tenant certificates are valid");
-						} else {
-							info!("Found {} tenant(s) needing certificate renewal", tenants.len());
-
-							for (tn_id, id_tag) in tenants {
-								info!(
-									"Renewing certificate for tenant: {} (tn_id={})",
-									id_tag, tn_id.0
-								);
-
-								let app_domain = if tn_id.0 == 1 {
-									// TODO: Get from configuration
-									None
+						// Also run renewal check immediately on startup in background
+						info!("Running initial certificate check on startup...");
+						match app_clone
+							.auth_adapter
+							.list_tenants_needing_cert_renewal(renewal_days)
+							.await
+						{
+							Ok(tenants) => {
+								if tenants.is_empty() {
+									info!("All tenant certificates are valid");
 								} else {
-									None
-								};
+									info!(
+										"Found {} tenant(s) needing certificate renewal",
+										tenants.len()
+									);
 
-								match acme::init(
-									app_clone.clone(),
-									&acme_email,
-									&id_tag,
-									app_domain,
-								)
-								.await
-								{
-									Ok(_) => {
-										info!(tenant = %id_tag, "Certificate renewed successfully");
-									}
-									Err(e) => {
-										error!(tenant = %id_tag, error = %e, "Failed to renew certificate");
+									for (tn_id, id_tag) in tenants {
+										info!(
+											"Renewing certificate for tenant: {} (tn_id={})",
+											id_tag, tn_id.0
+										);
+
+										let app_domain = if tn_id.0 == 1 {
+											// TODO: Get from configuration
+											None
+										} else {
+											None
+										};
+
+										match acme::init(
+											app_clone.clone(),
+											&acme_email,
+											&id_tag,
+											app_domain,
+										)
+										.await
+										{
+											Ok(_) => {
+												info!(tenant = %id_tag, "Certificate renewed successfully");
+											}
+											Err(e) => {
+												error!(tenant = %id_tag, error = %e, "Failed to renew certificate");
+											}
+										}
 									}
 								}
 							}
+							Err(e) => {
+								warn!(error = %e, "Failed to check certificates on startup");
+							}
 						}
-					}
-					Err(e) => {
-						warn!(error = %e, "Failed to check certificates on startup");
-					}
+					});
+				} else {
+					info!("ACME not configured (no ACME_EMAIL), skipping certificate check");
 				}
-			});
-		} else {
-			info!("ACME not configured (no ACME_EMAIL), skipping certificate check");
+			}
 		}
 	}
 
