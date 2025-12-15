@@ -7,6 +7,7 @@ use crate::prelude::*;
 use crate::types::{ApiResponse, Patch};
 
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -286,12 +287,26 @@ impl Task<App> for ProfileRefreshBatchTask {
 
 		info!("Found {} stale profiles to refresh", total);
 
+		// Process profiles concurrently (up to 10 at a time)
+		let results: Vec<_> = stream::iter(stale_profiles)
+			.map(|(tn_id, id_tag, etag)| {
+				let app = app.clone();
+				async move {
+					let result = refresh_profile(&app, tn_id, &id_tag, etag.as_deref()).await;
+					(id_tag, result)
+				}
+			})
+			.buffer_unordered(10)
+			.collect()
+			.await;
+
+		// Count results
 		let mut refreshed = 0;
 		let mut not_modified = 0;
 		let mut errors = 0;
 
-		for (tn_id, id_tag, etag) in stale_profiles {
-			match refresh_profile(app, tn_id, &id_tag, etag.as_deref()).await {
+		for (id_tag, result) in results {
+			match result {
 				Ok(true) => refreshed += 1,
 				Ok(false) => not_modified += 1,
 				Err(e) => {
