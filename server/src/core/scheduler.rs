@@ -9,9 +9,9 @@ use std::{
 	sync::{Arc, Mutex, RwLock},
 };
 
-use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use croner::Cron;
+use std::str::FromStr;
 
 use crate::{lock, meta_adapter, prelude::*};
 
@@ -51,11 +51,7 @@ impl CronSchedule {
 			.find_next_occurrence(&dt, false)
 			.map(|next| Timestamp(next.timestamp()))
 			.map_err(|e| {
-				tracing::error!(
-					"Failed to find next cron occurrence for '{}': {}",
-					self.expr,
-					e
-				);
+				tracing::error!("Failed to find next cron occurrence for '{}': {}", self.expr, e);
 				Error::ValidationError(format!("cron next_execution failed: {}", e))
 			})
 	}
