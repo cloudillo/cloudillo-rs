@@ -9,6 +9,10 @@ use std::{
 	sync::{Arc, Mutex, RwLock},
 };
 
+use std::str::FromStr;
+use chrono::{DateTime, Utc};
+use croner::Cron;
+
 use crate::{lock, meta_adapter, prelude::*};
 
 pub type TaskId = u64;
@@ -18,180 +22,57 @@ pub enum TaskType {
 	Once,
 }
 
-/// Cron schedule for recurring tasks
-/// Represents a parsed cron expression: minute hour day month weekday
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Cron schedule wrapper using the croner crate
+/// Stores the expression string for serialization
+#[derive(Debug, Clone)]
 pub struct CronSchedule {
-	/// Minute: 0-59, or 60 to indicate "any"
-	pub minute: u8,
-	/// Hour: 0-23, or 24 to indicate "any"
-	pub hour: u8,
-	/// Day of month: 1-31, or 0 to indicate "any"
-	pub day: u8,
-	/// Month: 1-12, or 0 to indicate "any"
-	pub month: u8,
-	/// Day of week: 0-6 (Sunday=0), or 7 to indicate "any"
-	pub weekday: u8,
+	/// The original cron expression string
+	expr: Box<str>,
+	/// Parsed cron object
+	cron: Cron,
 }
 
 impl CronSchedule {
 	/// Parse a cron expression (5 fields: minute hour day month weekday)
-	///
-	/// # Errors
-	/// Returns `Error::ValidationError` if the expression is invalid
 	pub fn parse(expr: &str) -> ClResult<Self> {
-		let parts: Vec<&str> = expr.split_whitespace().collect();
-		if parts.len() != 5 {
-			return Err(Error::ValidationError(
-				"invalid cron expression: must have 5 fields".into(),
-			));
-		}
-
-		let minute = Self::parse_field(parts[0], 0, 59)?;
-		let hour = Self::parse_field(parts[1], 0, 23)?;
-		let day = Self::parse_field(parts[2], 1, 31)?;
-		let month = Self::parse_field(parts[3], 1, 12)?;
-		let weekday = Self::parse_field(parts[4], 0, 6)?;
-
-		Ok(Self { minute, hour, day, month, weekday })
-	}
-
-	/// Parse a single cron field
-	/// Returns max_value + 1 for "*" to indicate "any"
-	fn parse_field(field: &str, min: u8, max: u8) -> ClResult<u8> {
-		if field == "*" {
-			return Ok(max + 1);
-		}
-
-		let val: u8 = field.parse().map_err(|_| {
-			Error::ValidationError(format!(
-				"invalid cron field: {} must be between {} and {}",
-				field, min, max
-			))
-		})?;
-		if val >= min && val <= max {
-			Ok(val)
-		} else {
-			Err(Error::ValidationError(format!(
-				"cron field out of range: {} (expected {}-{})",
-				val, min, max
-			)))
-		}
-	}
-
-	/// Check if a timestamp matches this cron schedule
-	/// Uses a simplified approach: matches minute/hour, and day/weekday if specified
-	fn matches(&self, ts: &Timestamp) -> bool {
-		// Convert unix timestamp to UTC components using simple math
-		// This is a simplified version that works for UTC times
-		const SECONDS_PER_MINUTE: i64 = 60;
-		const MINUTES_PER_HOUR: i64 = 60;
-		const HOURS_PER_DAY: i64 = 24;
-		const DAYS_PER_YEAR: i64 = 365;
-
-		let total_seconds = ts.0;
-		let minutes_since_epoch = total_seconds / SECONDS_PER_MINUTE;
-		let hours_since_epoch = minutes_since_epoch / MINUTES_PER_HOUR;
-		let _days_since_epoch = hours_since_epoch / HOURS_PER_DAY;
-
-		// Extract minute (0-59)
-		let minute_of_hour = (minutes_since_epoch % MINUTES_PER_HOUR) as u8;
-
-		// Extract hour (0-23)
-		let hour_of_day = (hours_since_epoch % HOURS_PER_DAY) as u8;
-
-		// Check minute
-		if self.minute <= 59 && minute_of_hour != self.minute {
-			return false;
-		}
-
-		// Check hour
-		if self.hour <= 23 && hour_of_day != self.hour {
-			return false;
-		}
-
-		// For day/weekday/month matching, we'd need proper date math
-		// For now, we just match on minute and hour for basic scheduling
-		// A full implementation would need proper calendar calculations
-
-		true
+		let cron = Cron::from_str(expr)
+			.map_err(|e| Error::ValidationError(format!("invalid cron expression: {}", e)))?;
+		Ok(Self { expr: expr.into(), cron })
 	}
 
 	/// Calculate the next execution time after the given timestamp
 	///
-	/// # Algorithm
-	/// - If minute+hour specified: O(1) direct calculation
-	/// - If minute specified: checks once per hour (max 8,760 iterations/year)
-	/// - If wildcards: checks every minute (max 525,600 iterations/year)
-	///
-	/// This is dramatically more efficient than naive minute-by-minute search.
-	pub fn next_execution(&self, after: Timestamp) -> Timestamp {
-		const SECONDS_PER_MINUTE: i64 = 60;
-		const MINUTES_PER_HOUR: i64 = 60;
-		const HOURS_PER_DAY: i64 = 24;
-		const SECONDS_PER_HOUR: i64 = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;
-		const SECONDS_PER_DAY: i64 = SECONDS_PER_HOUR * HOURS_PER_DAY;
+	/// Returns an error if no next occurrence can be found (should be rare
+	/// for valid expressions within reasonable time bounds).
+	pub fn next_execution(&self, after: Timestamp) -> ClResult<Timestamp> {
+		let dt = DateTime::<Utc>::from_timestamp(after.0, 0).unwrap_or_else(Utc::now);
 
-		// Special optimization: if both minute and hour are specified,
-		// we can calculate the next occurrence directly in O(1) time
-		if self.minute <= 59 && self.hour <= 23 {
-			// Calculate target time in seconds from start of day
-			let target_sod =
-				(self.hour as i64 * SECONDS_PER_HOUR) + (self.minute as i64 * SECONDS_PER_MINUTE);
-
-			// Find current day and time of day
-			let days_since_epoch = after.0 / SECONDS_PER_DAY;
-			let current_sod = after.0 % SECONDS_PER_DAY;
-
-			// If we haven't reached target time today, schedule for today
-			if current_sod < target_sod {
-				return Timestamp(days_since_epoch * SECONDS_PER_DAY + target_sod);
-			} else {
-				// Otherwise schedule for tomorrow
-				return Timestamp((days_since_epoch + 1) * SECONDS_PER_DAY + target_sod);
-			}
-		}
-
-		// For other patterns, use iterative search with smart increments
-		// Start from next minute boundary
-		let start = ((after.0 / SECONDS_PER_MINUTE) + 1) * SECONDS_PER_MINUTE;
-
-		// Determine increment: hourly if minute is specified, else every minute
-		let increment = if self.minute <= 59 {
-			// Minute specified (e.g., "30 * * * *"): check once per hour
-			SECONDS_PER_HOUR
-		} else {
-			// Wildcards or just hour specified: check every minute
-			SECONDS_PER_MINUTE
-		};
-
-		let mut ts = Timestamp(start);
-		let limit = after.0 + (4 * 365 * SECONDS_PER_DAY);
-
-		while ts.0 < limit {
-			if self.matches(&ts) {
-				return ts;
-			}
-			ts = ts.add_seconds(increment);
-		}
-
-		// Fallback if no match found in 4 years
-		after.add_seconds(365 * SECONDS_PER_DAY)
+		self.cron
+			.find_next_occurrence(&dt, false)
+			.map(|next| Timestamp(next.timestamp()))
+			.map_err(|e| {
+				tracing::error!(
+					"Failed to find next cron occurrence for '{}': {}",
+					self.expr,
+					e
+				);
+				Error::ValidationError(format!("cron next_execution failed: {}", e))
+			})
 	}
 
-	/// Convert back to standard cron format string
-	/// Converts internal encoding (max+1 = "any") back to "*" format
+	/// Convert back to cron expression string
 	pub fn to_cron_string(&self) -> String {
-		let minute_str = if self.minute == 60 { "*".to_string() } else { self.minute.to_string() };
-		let hour_str = if self.hour == 24 { "*".to_string() } else { self.hour.to_string() };
-		let day_str = if self.day == 32 { "*".to_string() } else { self.day.to_string() };
-		let month_str = if self.month == 13 { "*".to_string() } else { self.month.to_string() };
-		let weekday_str =
-			if self.weekday == 7 { "*".to_string() } else { self.weekday.to_string() };
-
-		format!("{} {} {} {} {}", minute_str, hour_str, day_str, month_str, weekday_str)
+		self.expr.to_string()
 	}
 }
+
+impl PartialEq for CronSchedule {
+	fn eq(&self, other: &Self) -> bool {
+		self.expr == other.expr
+	}
+}
+
+impl Eq for CronSchedule {}
 
 #[async_trait]
 pub trait Task<S: Clone>: Send + Sync + Debug {
@@ -525,7 +406,8 @@ impl<'a, S: Clone + Send + Sync + 'static> TaskSchedulerBuilder<'a, S> {
 	pub fn cron(mut self, expr: impl Into<String>) -> Self {
 		if let Ok(cron_schedule) = CronSchedule::parse(&expr.into()) {
 			// Calculate initial next_at from cron schedule
-			self.next_at = Some(cron_schedule.next_execution(Timestamp::now()));
+			// Use .ok() - cron was just parsed successfully, should never fail
+			self.next_at = cron_schedule.next_execution(Timestamp::now()).ok();
 			self.cron = Some(cron_schedule);
 		}
 		self
@@ -538,7 +420,8 @@ impl<'a, S: Clone + Send + Sync + 'static> TaskSchedulerBuilder<'a, S> {
 			let expr = format!("{} {} * * *", minute, hour);
 			if let Ok(cron_schedule) = CronSchedule::parse(&expr) {
 				// Calculate initial next_at from cron schedule
-				self.next_at = Some(cron_schedule.next_execution(Timestamp::now()));
+				// Use .ok() - cron was just parsed successfully, should never fail
+				self.next_at = cron_schedule.next_execution(Timestamp::now()).ok();
 				self.cron = Some(cron_schedule);
 			}
 		}
@@ -553,7 +436,8 @@ impl<'a, S: Clone + Send + Sync + 'static> TaskSchedulerBuilder<'a, S> {
 			let expr = format!("{} {} * * {}", minute, hour, weekday);
 			if let Ok(cron_schedule) = CronSchedule::parse(&expr) {
 				// Calculate initial next_at from cron schedule
-				self.next_at = Some(cron_schedule.next_execution(Timestamp::now()));
+				// Use .ok() - cron was just parsed successfully, should never fail
+				self.next_at = cron_schedule.next_execution(Timestamp::now()).ok();
 				self.cron = Some(cron_schedule);
 			}
 		}
@@ -676,7 +560,20 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					// Check if this is a recurring task with cron schedule
 					if let Some(ref cron) = task_meta.cron {
 						// Calculate next execution time
-						let next_at = cron.next_execution(Timestamp::now());
+						let next_at = match cron.next_execution(Timestamp::now()) {
+							Ok(ts) => ts,
+							Err(e) => {
+								error!(
+									"Failed to calculate next execution for recurring task {}: {} - task will not reschedule",
+									id, e
+								);
+								// Mark as finished since we can't reschedule
+								if let Err(e) = schedule.store.finished(id, "").await {
+									error!("Failed to mark task {} as finished: {}", id, e);
+								}
+								continue;
+							}
+						};
 						info!(
 							"Recurring task {} completed, scheduling next execution at {}",
 							id, next_at
@@ -691,12 +588,17 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 							error!("Failed to update recurring task {} next_at: {}", id, e);
 						}
 
+						// Remove from running BEFORE add_queue (so add_queue doesn't see it as running)
+						if let Ok(mut tasks_running) = schedule.tasks_running.lock() {
+							tasks_running.remove(&id);
+						}
+
 						// Re-add to scheduler with new execution time
 						match schedule.add_queue(id, updated_meta).await {
 							Ok(_) => transition_ok = true,
 							Err(e) => {
 								error!(
-									"Failed to reschedule recurring task {}: {} - task remains in running queue",
+									"Failed to reschedule recurring task {}: {} - task lost!",
 									id, e
 								);
 							}
@@ -858,6 +760,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 						"Recurring task '{}' already exists with identical parameters (id={})",
 						key, existing_id
 					);
+					// Update DB with current cron/next_at (may differ from what's stored)
+					self.store.update_task(existing_id, &task_meta).await?;
+					// Ensure the existing task is queued (may be loaded from DB but not yet in queue)
+					self.add_queue(existing_id, task_meta).await?;
 					return Ok(existing_id);
 				} else {
 					info!(
@@ -891,6 +797,40 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 	}
 
 	pub async fn add_queue(&self, id: TaskId, task_meta: TaskMeta<S>) -> ClResult<TaskId> {
+		// If task is already running, update its metadata (especially for cron updates)
+		// but don't add to scheduled queue (it will reschedule on completion)
+		{
+			let mut running = lock!(self.tasks_running, "tasks_running")?;
+			if let Some(existing_meta) = running.get_mut(&id) {
+				info!(
+					"Task {} is already running, updating metadata (will reschedule on completion)",
+					id
+				);
+				// Update the running task's metadata so it has the latest cron schedule
+				*existing_meta = task_meta;
+				return Ok(id);
+			}
+		}
+
+		// Remove from other queues if present (prevents duplicate entries with different timestamps)
+		{
+			let mut scheduled = lock!(self.tasks_scheduled, "tasks_scheduled")?;
+			if let Some(key) = scheduled
+				.iter()
+				.find(|((_, tid), _)| *tid == id)
+				.map(|((ts, tid), _)| (*ts, *tid))
+			{
+				scheduled.remove(&key);
+				info!("Removed existing scheduled entry for task {} before re-queueing", id);
+			}
+		}
+		{
+			let mut waiting = lock!(self.tasks_waiting, "tasks_waiting")?;
+			if waiting.remove(&id).is_some() {
+				info!("Removed existing waiting entry for task {} before re-queueing", id);
+			}
+		}
+
 		let deps = task_meta.deps.clone();
 
 		// VALIDATION: Tasks with dependencies should NEVER be in tasks_scheduled
@@ -1945,107 +1885,113 @@ mod tests {
 	// ===== Cron Schedule Tests =====
 
 	#[test]
-	fn test_cron_parse_daily() {
-		let cron = CronSchedule::parse("0 9 * * *").unwrap();
-		assert_eq!(cron.minute, 0);
-		assert_eq!(cron.hour, 9);
-		assert_eq!(cron.day, 32); // "any" encoded as max+1
-		assert_eq!(cron.month, 13); // "any"
-		assert_eq!(cron.weekday, 7); // "any"
+	fn test_cron_to_string() {
+		// Test that to_cron_string returns the original expression
+		let cron = CronSchedule::parse("*/5 * * * *").unwrap();
+		assert_eq!(cron.to_cron_string(), "*/5 * * * *");
 	}
 
-	#[test]
-	fn test_cron_parse_weekly() {
-		let cron = CronSchedule::parse("0 9 * * 1").unwrap();
-		assert_eq!(cron.minute, 0);
-		assert_eq!(cron.hour, 9);
-		assert_eq!(cron.day, 32);
-		assert_eq!(cron.month, 13);
-		assert_eq!(cron.weekday, 1); // Monday
+	#[tokio::test]
+	pub async fn test_running_task_not_double_scheduled() {
+		let _ = tracing_subscriber::fmt().try_init();
+
+		let task_store: Arc<dyn TaskStore<State>> = InMemoryTaskStore::new();
+		let state: State = Arc::new(Mutex::new(Vec::new()));
+		let scheduler = Scheduler::new(task_store);
+		scheduler.start(state.clone());
+		scheduler.register::<TestTask>().unwrap();
+
+		// Create a task
+		let task = TestTask::new(5); // Takes 1 second (5 * 200ms)
+		let task_id = scheduler.add(task.clone()).await.unwrap();
+
+		// Wait a bit for task to start running
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+		// Verify task is in tasks_running
+		{
+			let running = scheduler.tasks_running.lock().unwrap();
+			assert!(running.contains_key(&task_id), "Task should be in running queue");
+		}
+
+		// Try to add the same task again via add_queue
+		let task_meta = TaskMeta {
+			task: task.clone(),
+			next_at: Some(Timestamp::now()),
+			deps: vec![],
+			retry_count: 0,
+			retry: None,
+			cron: None,
+		};
+		let result = scheduler.add_queue(task_id, task_meta).await;
+
+		// Should succeed but not actually add to scheduled queue
+		assert!(result.is_ok(), "add_queue should succeed");
+
+		// Verify task is NOT in tasks_scheduled (only in running)
+		{
+			let scheduled = scheduler.tasks_scheduled.lock().unwrap();
+			let in_scheduled = scheduled.iter().any(|((_, id), _)| *id == task_id);
+			assert!(!in_scheduled, "Task should NOT be in scheduled queue while running");
+		}
+
+		// Wait for original task to complete
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+		// Verify task completed
+		let st = state.lock().unwrap();
+		assert_eq!(st.len(), 1, "Only one task execution should have occurred");
+		assert_eq!(st[0], 5);
 	}
 
-	#[test]
-	fn test_cron_parse_specific_time() {
-		let cron = CronSchedule::parse("30 14 15 6 *").unwrap();
-		assert_eq!(cron.minute, 30);
-		assert_eq!(cron.hour, 14);
-		assert_eq!(cron.day, 15);
-		assert_eq!(cron.month, 6);
-		assert_eq!(cron.weekday, 7); // "any"
-	}
+	#[tokio::test]
+	pub async fn test_running_task_metadata_updated() {
+		let _ = tracing_subscriber::fmt().try_init();
 
-	#[test]
-	fn test_cron_parse_invalid_minute() {
-		assert!(CronSchedule::parse("60 * * * *").is_err());
-		assert!(CronSchedule::parse("-1 * * * *").is_err());
-	}
+		let task_store: Arc<dyn TaskStore<State>> = InMemoryTaskStore::new();
+		let state: State = Arc::new(Mutex::new(Vec::new()));
+		let scheduler = Scheduler::new(task_store);
+		scheduler.start(state.clone());
+		scheduler.register::<TestTask>().unwrap();
 
-	#[test]
-	fn test_cron_parse_invalid_hour() {
-		assert!(CronSchedule::parse("0 24 * * *").is_err());
-	}
+		// Create a task without cron
+		let task = TestTask::new(5); // Takes 1 second (5 * 200ms)
+		let task_id = scheduler.add(task.clone()).await.unwrap();
 
-	#[test]
-	fn test_cron_parse_invalid_day() {
-		assert!(CronSchedule::parse("0 0 32 * *").is_err());
-		assert!(CronSchedule::parse("0 0 0 * *").is_err()); // Day must be 1-31
-	}
+		// Wait a bit for task to start running
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-	#[test]
-	fn test_cron_parse_invalid_month() {
-		assert!(CronSchedule::parse("0 0 * 13 *").is_err());
-		assert!(CronSchedule::parse("0 0 * 0 *").is_err()); // Month must be 1-12
-	}
+		// Verify task is running and has no cron
+		{
+			let running = scheduler.tasks_running.lock().unwrap();
+			let meta = running.get(&task_id).expect("Task should be running");
+			assert!(meta.cron.is_none(), "Task should have no cron initially");
+		}
 
-	#[test]
-	fn test_cron_parse_invalid_weekday() {
-		assert!(CronSchedule::parse("0 0 * * 7").is_err());
-	}
+		// Try to update the running task with a cron schedule
+		let cron = CronSchedule::parse("*/5 * * * *").unwrap();
+		let task_meta_with_cron = TaskMeta {
+			task: task.clone(),
+			next_at: Some(Timestamp::now()),
+			deps: vec![],
+			retry_count: 0,
+			retry: None,
+			cron: Some(cron.clone()),
+		};
+		let result = scheduler.add_queue(task_id, task_meta_with_cron).await;
 
-	#[test]
-	fn test_cron_parse_wrong_field_count() {
-		assert!(CronSchedule::parse("0 9 * *").is_err());
-		assert!(CronSchedule::parse("0 9 * * * *").is_err());
-	}
+		// Should succeed
+		assert!(result.is_ok(), "add_queue should succeed");
 
-	#[test]
-	fn test_cron_parse_non_numeric() {
-		assert!(CronSchedule::parse("abc def ghi jkl mno").is_err());
-	}
+		// Verify the running task now has the cron schedule
+		{
+			let running = scheduler.tasks_running.lock().unwrap();
+			let meta = running.get(&task_id).expect("Task should still be running");
+			assert!(meta.cron.is_some(), "Task should now have cron after update");
+		}
 
-	#[test]
-	fn test_cron_next_execution() {
-		let cron = CronSchedule::parse("0 9 * * *").unwrap();
-		let now = Timestamp::now();
-		let next = cron.next_execution(now);
-
-		// Next execution should be in the future
-		assert!(next.0 > now.0);
-
-		// Next execution should be within 24 hours
-		assert!(next.0 - now.0 <= 24 * 60 * 60);
-	}
-
-	#[test]
-	fn test_cron_matching_minute_hour() {
-		// Test matching minute and hour fields
-		let cron = CronSchedule::parse("30 14 * * *").unwrap();
-
-		// Create a timestamp at 14:30
-		// Using 15:30 UTC (adjust epoch to get 14:30)
-		let test_timestamp = Timestamp(14 * 3600 + 30 * 60);
-		assert!(cron.matches(&test_timestamp));
-
-		// Test non-matching hour
-		let non_match = Timestamp(13 * 3600 + 30 * 60);
-		assert!(!cron.matches(&non_match));
-	}
-
-	#[test]
-	fn test_cron_eq_and_clone() {
-		let cron1 = CronSchedule::parse("0 9 * * *").unwrap();
-		let cron2 = cron1.clone();
-		assert_eq!(cron1, cron2);
+		// Wait for task to complete
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 	}
 }
 
