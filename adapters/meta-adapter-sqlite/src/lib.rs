@@ -66,8 +66,7 @@ impl MetaAdapterSqlite {
 		let max_attached = res
 			.iter()
 			.map(|row| row.get::<&str, _>(0))
-			.filter(|s| s.starts_with("MAX_ATTACHED="))
-			.next_back()
+			.rfind(|s| s.starts_with("MAX_ATTACHED="))
 			.unwrap_or("")
 			.split("=")
 			.last();
