@@ -73,9 +73,11 @@ impl EmailSender {
 		}
 
 		// Build email message with both text and HTML bodies
+		// Quote the display name and escape internal quotes to handle RFC 5322 special characters
+		let escaped_name = from_name.replace('\\', "\\\\").replace('"', "\\\"");
 		let email_builder = Message::builder()
 			.from(
-				format!("{} <{}>", from_name, from_address)
+				format!("\"{}\" <{}>", escaped_name, from_address)
 					.parse()
 					.map_err(|_| Error::ValidationError("Invalid from email format".into()))?,
 			)

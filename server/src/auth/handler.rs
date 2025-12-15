@@ -742,7 +742,7 @@ pub async fn post_forgot_password(
 		}),
 		lang,
 		custom_key: Some(format!("pw-reset:{}:{}", tn_id.0, now)),
-		from_name_override: Some(format!("Cloudillo ({})", base_id_tag.to_uppercase())),
+		from_name_override: Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
 	};
 
 	if let Err(e) =

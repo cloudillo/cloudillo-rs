@@ -508,7 +508,7 @@ async fn handle_idp_registration(
 			template_vars,
 			lang: lang.clone(),
 			custom_key: None,
-			from_name_override: Some(format!("Cloudillo ({})", base_id_tag.to_uppercase())),
+			from_name_override: Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
 		},
 	)
 	.await
@@ -669,7 +669,7 @@ async fn handle_domain_registration(
 			template_vars,
 			lang: lang.clone(),
 			custom_key: None,
-			from_name_override: Some(format!("Cloudillo ({})", base_id_tag.to_uppercase())),
+			from_name_override: Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
 		},
 	)
 	.await
