@@ -16,15 +16,16 @@ RUN apt-get update && apt-get install -y libssl-dev pkg-config git
 RUN git clone --depth 1 --branch ${RS_REF} https://github.com/cloudillo/cloudillo-rs.git .
 # Disable sccache wrapper (not available in Docker)
 ENV RUSTC_WRAPPER=""
-RUN cargo build --release
+RUN cargo build --profile release-lto
 RUN strip /app/target/release/cloudillo-basic-server
 ARG UID
 ARG GID
 # Create non-root user files for scratch image
 RUN echo "cloudillo:x:${UID}:${GID}::/cloudillo/data:/sbin/nologin" > /etc/passwd.scratch && \
     echo "cloudillo:x:${GID}:" > /etc/group.scratch
-# Create data directory for scratch image (with placeholder since COPY can't copy empty dirs)
-RUN mkdir -p /cloudillo-data && touch /cloudillo-data/.keep && chmod 0700 /cloudillo-data
+# Create data directory for scratch image (root-owned, so app fails without volume mount)
+# The directory must be mounted with proper permissions for the app to work
+RUN mkdir -p /cloudillo-data && touch /cloudillo-data/.keep && chmod 0755 /cloudillo-data
 
 # FRONTEND BUILDER STAGE #
 ##########################
@@ -164,10 +165,9 @@ FROM scratch
 COPY --from=rust-builder /etc/passwd.scratch /etc/passwd
 COPY --from=rust-builder /etc/group.scratch /etc/group
 
-# Copy data directory with correct ownership and preserved permissions
-ARG UID
-ARG GID
-COPY --from=rust-builder --chown=${UID}:${GID} /cloudillo-data /cloudillo/data
+# Copy data directory as root-owned - app will fail to write without proper volume mount
+# Mount /cloudillo/data with a volume that has correct permissions for the cloudillo user
+COPY --from=rust-builder /cloudillo-data /cloudillo/data
 
 WORKDIR /cloudillo
 

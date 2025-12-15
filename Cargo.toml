@@ -9,5 +9,10 @@ members = [
 	"adapters/rtdb-adapter-redb",
 	"adapters/crdt-adapter-redb",
 ]
-[profile.release]
+
+[profile.release-lto]
 opt-level = "s"
+inherits = "release"
+lto = true
+codegen-units = 1
+strip = true
