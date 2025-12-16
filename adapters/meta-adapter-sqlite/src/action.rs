@@ -18,7 +18,7 @@ pub(crate) async fn list(
 		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic,
 		a.subject, a.content, a.created_at, a.expires_at,
 		own.content as own_reaction,
-		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility
+		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
 		FROM actions a
 		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
@@ -126,7 +126,6 @@ pub(crate) async fn list(
 				let a_id: i64 = row.try_get("a_id").unwrap_or(0);
 				format!("@{}", a_id).into_boxed_str()
 			});
-		info!("row: {:?}", action_id);
 
 		let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag").map_err(|_| Error::DbError)?;
 		let audience_tag =
@@ -138,12 +137,10 @@ pub(crate) async fn list(
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 		let attachments = if let Some(attachments) = &attachments {
-			info!("attachments: {:?}", attachments);
 			let mut attachments = parse_str_list(attachments)
 				.iter()
 				.map(|a| AttachmentView { file_id: a.clone(), dim: None, local_variants: None })
 				.collect::<Vec<_>>();
-			info!("attachments: {:?}", attachments);
 			for a in attachments.iter_mut() {
 				// Handle both @{f_id} placeholders and real file_ids
 				let query_result = if let Some(f_id_str) = a.file_id.strip_prefix('@') {
@@ -266,6 +263,11 @@ pub(crate) async fn list(
 			status: row.try_get("status").map_err(|_| Error::DbError)?,
 			stat,
 			visibility,
+			flags: row.try_get("flags").map_err(|_| Error::DbError)?,
+			x: row
+				.try_get::<Option<String>, _>("x")
+				.map_err(|_| Error::DbError)?
+				.and_then(|s| serde_json::from_str(&s).ok()),
 		})
 	}
 
@@ -360,9 +362,10 @@ pub(crate) async fn create(
 
 	let status = "P";
 	let visibility = action.visibility.map(|c| c.to_string());
+	let x_json = action.x.as_ref().and_then(|v| serde_json::to_string(v).ok());
 	let res = sqlx::query(
-		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, expires_at, attachments, status, visibility)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING a_id"
+		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, expires_at, attachments, status, visibility, flags, x)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING a_id"
 	)
 		.bind(tn_id.0)
 		.bind(if action.action_id.is_empty() { None } else { Some(action.action_id) })
@@ -380,6 +383,8 @@ pub(crate) async fn create(
 		.bind(action.attachments.as_ref().map(|s| s.join(",")))
 		.bind(status)
 		.bind(visibility)
+		.bind(action.flags)
+		.bind(x_json)
 		.fetch_one(db)
 		.await
 		.inspect_err(inspect)
@@ -388,13 +393,13 @@ pub(crate) async fn create(
 	Ok(ActionId::AId(res.get(0)))
 }
 
-/// Finalize action - atomically set action_id, update attachments, and transition from 'P' to 'A' status
+/// Finalize action - atomically set action_id, update attachments/subject/audience/key, and transition from 'P' to 'A' status
 pub(crate) async fn finalize(
 	db: &SqlitePool,
 	tn_id: TnId,
 	a_id: u64,
 	action_id: &str,
-	attachments: Option<&[&str]>,
+	options: FinalizeActionOptions<'_>,
 ) -> ClResult<()> {
 	// First check if action exists and what its current action_id is
 	let existing = sqlx::query("SELECT action_id, status FROM actions WHERE tn_id=? AND a_id=?")
@@ -442,15 +447,18 @@ pub(crate) async fn finalize(
 		}
 	}
 
-	// Update NULL action_id to new value, update attachments, and transition status from 'P' to 'A'
+	// Update NULL action_id to new value, update attachments/subject/audience/key, and transition status from 'P' to 'A'
 	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
 
-	let attachments_str = attachments.map(|a| a.join(","));
+	let attachments_str = options.attachments.map(|a| a.join(","));
 	let res = sqlx::query(
-		"UPDATE actions SET action_id=?, attachments=?, status='A' WHERE tn_id=? AND a_id=? AND action_id IS NULL AND status='P'"
+		"UPDATE actions SET action_id=?, attachments=?, subject=COALESCE(?, subject), audience=COALESCE(?, audience), key=COALESCE(?, key), status='A' WHERE tn_id=? AND a_id=? AND action_id IS NULL AND status='P'"
 	)
 		.bind(action_id)
 		.bind(attachments_str)
+		.bind(options.subject)
+		.bind(options.audience_tag)
+		.bind(options.key)
 		.bind(tn_id.0)
 		.bind(a_id as i64)
 		.execute(&mut *tx)
@@ -560,6 +568,32 @@ pub(crate) async fn create_inbound(
 	Ok(())
 }
 
+/// Get related action tokens by APRV action_id
+/// Returns (action_id, token) pairs for actions that have ack = aprv_action_id
+pub(crate) async fn get_related_tokens(
+	db: &SqlitePool,
+	tn_id: TnId,
+	aprv_action_id: &str,
+) -> ClResult<Vec<(Box<str>, Box<str>)>> {
+	let rows =
+		sqlx::query("SELECT action_id, token FROM action_tokens WHERE tn_id = ? AND ack = ?")
+			.bind(tn_id.0)
+			.bind(aprv_action_id)
+			.fetch_all(db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+
+	let mut result = Vec::with_capacity(rows.len());
+	for row in rows {
+		let action_id: String = row.try_get("action_id").map_err(|_| Error::DbError)?;
+		let token: String = row.try_get("token").map_err(|_| Error::DbError)?;
+		result.push((action_id.into_boxed_str(), token.into_boxed_str()));
+	}
+
+	Ok(result)
+}
+
 /// Get action root ID
 pub(crate) async fn get_root_id(
 	db: &SqlitePool,
@@ -607,7 +641,7 @@ pub(crate) async fn get_by_key(
 	tn_id: TnId,
 	action_key: &str,
 ) -> ClResult<Option<Action<Box<str>>>> {
-	let res = sqlx::query("SELECT action_id, type, sub_type, issuer_tag, parent_id, root_id, audience, content, attachments, subject, created_at, expires_at, visibility
+	let res = sqlx::query("SELECT action_id, type, sub_type, issuer_tag, parent_id, root_id, audience, content, attachments, subject, created_at, expires_at, visibility, flags, x
 		FROM actions WHERE tn_id=? AND key=?")
 		.bind(tn_id.0)
 		.bind(action_key)
@@ -637,6 +671,12 @@ pub(crate) async fn get_by_key(
 					.ok()
 					.and_then(|v: Option<i64>| v.map(Timestamp)),
 				visibility,
+				flags: row.try_get("flags").ok(),
+				x: row
+					.try_get::<Option<String>, _>("x")
+					.ok()
+					.flatten()
+					.and_then(|s| serde_json::from_str(&s).ok()),
 			}))
 		}
 		Ok(None) => Ok(None),
@@ -715,6 +755,9 @@ pub(crate) async fn update_data(
 	if !opts.visibility.is_undefined() {
 		set_clauses.push("visibility = ?");
 	}
+	if !opts.x.is_undefined() {
+		set_clauses.push("x = ?");
+	}
 
 	if set_clauses.is_empty() {
 		return Ok(()); // Nothing to update
@@ -770,6 +813,14 @@ pub(crate) async fn update_data(
 		let val: Option<String> = match &opts.visibility {
 			Patch::Null => None,
 			Patch::Value(c) => Some(c.to_string()),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.x.is_undefined() {
+		let val: Option<String> = match &opts.x {
+			Patch::Null => None,
+			Patch::Value(v) => serde_json::to_string(v).ok(),
 			Patch::Undefined => unreachable!(),
 		};
 		query = query.bind(val);
@@ -844,7 +895,7 @@ pub(crate) async fn get(
 		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic,
 		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic,
 		a.subject, a.content, a.created_at, a.expires_at,
-		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility
+		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
 		FROM actions a
 		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
@@ -985,6 +1036,11 @@ pub(crate) async fn get(
 		status: row.try_get("status").map_err(|_| Error::DbError)?,
 		stat,
 		visibility,
+		flags: row.try_get("flags").map_err(|_| Error::DbError)?,
+		x: row
+			.try_get::<Option<String>, _>("x")
+			.map_err(|_| Error::DbError)?
+			.and_then(|s| serde_json::from_str(&s).ok()),
 	}))
 }
 

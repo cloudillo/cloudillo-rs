@@ -91,13 +91,14 @@ pub async fn put_community_profile(
 			typ: "IDP:REG".into(),
 			sub_typ: None,
 			parent_id: None,
-			root_id: None,
 			audience_tag: Some(idp_domain.to_string().into()),
 			content: Some(serde_json::to_value(&reg_content)?),
 			attachments: None,
 			subject: None,
 			expires_at: Some(Timestamp::now().add_seconds(86400 * 30)),
 			visibility: None,
+			flags: None,
+			x: None,
 		};
 
 		// Generate and send token to IDP
@@ -201,6 +202,15 @@ pub async fn put_community_profile(
 		)
 		.await?;
 
+	// 5a. Enable auto-approve for incoming posts from connected users
+	app.meta_adapter
+		.update_setting(
+			community_tn_id,
+			"federation.auto_approve",
+			Some(serde_json::Value::Bool(true)),
+		)
+		.await?;
+
 	// 6. Create CONN: creator → community (in creator's tenant)
 	info!(
 		creator = %creator_id_tag,
@@ -252,7 +262,7 @@ pub async fn put_community_profile(
 		typ: ProfileType::Person,
 		profile_pic: None,
 		following: true,
-		connected: true,
+		connected: ProfileConnectionStatus::Connected,
 	};
 	app.meta_adapter.create_profile(community_tn_id, &creator_profile, "").await?;
 

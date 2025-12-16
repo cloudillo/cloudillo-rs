@@ -8,6 +8,7 @@
 //! - `forward_action`: Called after an action is created or received to notify connected users
 
 use crate::core::ws_broadcast::{BroadcastMessage, DeliveryResult};
+use crate::meta_adapter::AttachmentView;
 use crate::prelude::*;
 use crate::types::TnId;
 use serde_json::json;
@@ -27,12 +28,13 @@ pub struct ForwardResult {
 #[derive(Debug, Clone)]
 pub struct ForwardActionParams<'a> {
 	pub action_id: &'a str,
+	pub temp_id: Option<&'a str>,
 	pub issuer_tag: &'a str,
 	pub audience_tag: Option<&'a str>,
 	pub action_type: &'a str,
 	pub sub_type: Option<&'a str>,
 	pub content: Option<&'a serde_json::Value>,
-	pub attachments: Option<&'a [Box<str>]>,
+	pub attachments: Option<&'a [AttachmentView]>,
 }
 
 /// Forward an action to WebSocket clients
@@ -69,13 +71,21 @@ pub async fn forward_outbound_action(
 
 /// Forward an inbound action (received from federation) to WebSocket clients
 ///
-/// This forwards actions to the local user who is the audience.
+/// Broadcasts to all connected clients in the tenant.
+/// Any client can filter what they're interested in.
 pub async fn forward_inbound_action(
 	app: &App,
 	tn_id: TnId,
 	params: &ForwardActionParams<'_>,
 ) -> ForwardResult {
-	forward_action(app, tn_id, params).await
+	let action_msg = build_action_message(params);
+	let delivered = app.broadcast.send_to_tenant(tn_id, action_msg).await;
+
+	ForwardResult {
+		delivered: delivered > 0,
+		connection_count: delivered,
+		user_offline: delivered == 0,
+	}
 }
 
 /// Forward a message to a specific user
@@ -103,6 +113,7 @@ fn build_action_message(params: &ForwardActionParams<'_>) -> BroadcastMessage {
 		"ACTION",
 		json!({
 			"actionId": params.action_id,
+			"tempId": params.temp_id,
 			"type": params.action_type,
 			"subType": params.sub_type,
 			"issuer": {

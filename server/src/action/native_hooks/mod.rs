@@ -5,18 +5,26 @@
 //!
 //! Modules:
 //! - aprv: Approval action handling (APRV)
+//! - cmnt: Comment counter management (CMNT)
 //! - conn: Connection lifecycle management (CONN)
+//! - conv: Conversation management (CONV)
 //! - fllw: Follow relationship management (FLLW)
 //! - fshr: File sharing lifecycle management (FSHR)
 //! - idp: Identity provider operations (IDP:REG)
+//! - invt: Invitation management (INVT)
 //! - react: Reaction management (REACT)
+//! - subs: Subscription management (SUBS)
 
 pub mod aprv;
+pub mod cmnt;
 pub mod conn;
+pub mod conv;
 pub mod fllw;
 pub mod fshr;
 pub mod idp;
+pub mod invt;
 pub mod react;
+pub mod subs;
 
 use crate::action::hooks::ActionTypeHooks;
 use crate::core::app::App;
@@ -92,6 +100,19 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		tracing::info!("Registered native hooks for REACT action type");
 	}
 
+	// CMNT hooks
+	{
+		let cmnt_hooks = ActionTypeHooks {
+			on_create: Some(Arc::new(|app, ctx| Box::pin(cmnt::on_create(app, ctx)))),
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(cmnt::on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("CMNT", cmnt_hooks);
+		tracing::info!("Registered native hooks for CMNT action type");
+	}
+
 	// APRV hooks
 	{
 		let aprv_hooks = ActionTypeHooks {
@@ -105,6 +126,45 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		tracing::info!("Registered native hooks for APRV action type");
 	}
 
+	// SUBS hooks
+	{
+		let subs_hooks = ActionTypeHooks {
+			on_create: Some(Arc::new(|app, ctx| Box::pin(subs::on_create(app, ctx)))),
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(subs::on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("SUBS", subs_hooks);
+		tracing::info!("Registered native hooks for SUBS action type");
+	}
+
+	// CONV hooks
+	{
+		let conv_hooks = ActionTypeHooks {
+			on_create: Some(Arc::new(|app, ctx| Box::pin(conv::on_create(app, ctx)))),
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(conv::on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("CONV", conv_hooks);
+		tracing::info!("Registered native hooks for CONV action type");
+	}
+
+	// INVT hooks
+	{
+		let invt_hooks = ActionTypeHooks {
+			on_create: Some(Arc::new(|app, ctx| Box::pin(invt::on_create(app, ctx)))),
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(invt::on_receive(app, ctx)))),
+			on_accept: Some(Arc::new(|app, ctx| Box::pin(invt::on_accept(app, ctx)))),
+			on_reject: None,
+		};
+
+		registry.register_type("INVT", invt_hooks);
+		tracing::info!("Registered native hooks for INVT action type");
+	}
+
 	Ok(())
 }
 
@@ -116,6 +176,8 @@ mod tests {
 	fn test_hook_functions_exist() {
 		// Verify module exports compile correctly
 		let _ = aprv::on_receive;
+		let _ = cmnt::on_create;
+		let _ = cmnt::on_receive;
 		let _ = conn::on_create;
 		let _ = conn::on_receive;
 		let _ = conn::on_accept;
@@ -127,6 +189,13 @@ mod tests {
 		let _ = fshr::on_accept;
 		let _ = react::on_create;
 		let _ = react::on_receive;
+		let _ = subs::on_create;
+		let _ = subs::on_receive;
+		let _ = conv::on_create;
+		let _ = conv::on_receive;
+		let _ = invt::on_create;
+		let _ = invt::on_receive;
+		let _ = invt::on_accept;
 	}
 }
 

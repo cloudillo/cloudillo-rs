@@ -57,7 +57,7 @@ pub async fn verify_action_token(
 	let issuer = &action_not_validated.iss;
 	let key_id = &action_not_validated.k;
 
-	info!("  from: {}, key: {}", issuer, key_id);
+	info!("→ VERIFY: from={} key={}", issuer, key_id);
 
 	// 1. Check failure cache - return early if we recently failed to fetch this key
 	if let Some(failure) = app.key_fetch_cache.check_failure(issuer, key_id) {
@@ -78,10 +78,10 @@ pub async fn verify_action_token(
 		Ok((public_key, expires_at)) => {
 			// Check if key is still valid (not expired)
 			if expires_at > Timestamp::now() {
-				info!("  using cached key (expires at {})", expires_at);
+				debug!("  using cached key (expires at {})", expires_at);
 				match verify_jwt_signature(token, &public_key) {
 					Ok(action) => {
-						info!("  validated from cache {:?}", action);
+						info!("← VERIFIED: type={} from={}", action.t, action.iss);
 						return Ok(action);
 					}
 					Err(e) => {
@@ -140,10 +140,9 @@ pub async fn verify_action_token(
 				app.key_fetch_cache.clear_failure(issuer, key_id);
 
 				// Verify the signature
-				info!("  validating...");
 				match verify_jwt_signature(token, public_key) {
 					Ok(action) => {
-						info!("  validated {:?}", action);
+						info!("← VERIFIED: type={} from={}", action.t, action.iss);
 						Ok(action)
 					}
 					Err(e) => {
@@ -181,6 +180,10 @@ pub trait ActionType {
 	fn allow_unknown() -> bool;
 }
 
+/// Process an inbound action token
+///
+/// # Parameters
+/// - `skip_permission_check`: If true, skip permission/relation checks (used for pre-approved related actions)
 pub async fn process_inbound_action_token(
 	app: &App,
 	tn_id: TnId,
@@ -189,6 +192,44 @@ pub async fn process_inbound_action_token(
 	is_sync: bool,
 	client_address: Option<String>,
 ) -> ClResult<Option<serde_json::Value>> {
+	let result = process_inbound_action_token_inner(
+		app,
+		tn_id,
+		action_id,
+		token,
+		is_sync,
+		client_address,
+		false,
+	)
+	.await?;
+
+	// Process any related actions that came with this action
+	// (only for regular inbound actions, not for pre-approved/related ones to avoid recursion)
+	process_related_actions(app, tn_id, action_id).await;
+
+	Ok(result)
+}
+
+/// Process an inbound action token that is pre-approved (related action from APRV)
+/// Skips permission checks since the action was already approved by the APRV issuer
+pub async fn process_preapproved_action_token(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	token: &str,
+) -> ClResult<Option<serde_json::Value>> {
+	process_inbound_action_token_inner(app, tn_id, action_id, token, false, None, true).await
+}
+
+async fn process_inbound_action_token_inner(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	token: &str,
+	is_sync: bool,
+	client_address: Option<String>,
+	skip_permission_check: bool,
+) -> ClResult<Option<serde_json::Value>> {
 	let client_ip: Option<IpAddr> = client_address.as_ref().and_then(|addr| addr.parse().ok());
 
 	// 1. Pre-verify PoW for CONN actions
@@ -196,15 +237,44 @@ pub async fn process_inbound_action_token(
 	let is_conn_action = action_preview.t.starts_with("CONN");
 	verify_pow_if_conn(app, is_conn_action, client_ip.as_ref(), token, &action_preview.iss)?;
 
-	// 2. Verify action token
+	// 2. Verify action token (signature verification - always required!)
 	let action =
 		verify_and_handle_failure(app, tn_id, token, is_conn_action, client_ip.as_ref()).await?;
 
 	// 3. Resolve definition (try full type, then base type)
 	let (definition_type, definition) = resolve_definition(app, &action.t)?;
 
-	// 4. Check permissions
-	check_inbound_permissions(app, tn_id, &action, definition).await?;
+	// 4. Check permissions (skip for pre-approved related actions)
+	if !skip_permission_check {
+		check_inbound_permissions(app, tn_id, &action, definition).await?;
+	} else {
+		debug!(
+			action_id = %action_id,
+			action_type = %action.t,
+			issuer = %action.iss,
+			"Skipping permission check for pre-approved related action"
+		);
+	}
+
+	// 5. Check subscription-based permissions (skip for pre-approved related actions)
+	if !skip_permission_check {
+		check_subscription_permissions(app, tn_id, &action, definition).await?;
+	}
+
+	// Check if this is an ephemeral action (forward only, don't persist)
+	let is_ephemeral = definition.behavior.ephemeral.unwrap_or(false);
+
+	if is_ephemeral {
+		// Ephemeral actions: forward to WebSocket but don't persist
+		debug!(
+			action_id = %action_id,
+			action_type = %action.t,
+			issuer = %action.iss,
+			"Processing ephemeral action (forward only, no persistence)"
+		);
+		forward_inbound_action_to_websocket(app, tn_id, action_id, &action).await;
+		return Ok(None);
+	}
 
 	// 5. Store action in database
 	store_inbound_action(
@@ -246,6 +316,17 @@ pub async fn process_inbound_action_token(
 
 	// 9. Forward action to connected WebSocket clients
 	forward_inbound_action_to_websocket(app, tn_id, action_id, &action).await;
+
+	// 10. Fan-out to subscribers if we own a subscribable parent
+	// This handles re-delivery when CONV owner receives MSG from a subscriber
+	let _ = crate::action::task::schedule_subscriber_fanout(
+		app,
+		tn_id,
+		action_id,
+		action.p.as_deref(),
+		action.iss.as_ref(),
+	)
+	.await;
 
 	Ok(hook_result)
 }
@@ -335,15 +416,138 @@ async fn check_inbound_permissions(
 		} else {
 			None
 		};
-	info!("  profile: {:?}", issuer_profile);
+	debug!(
+		"  profile: {} following={} connected={}",
+		action.iss,
+		issuer_profile.as_ref().map(|p| p.following).unwrap_or(false),
+		issuer_profile.as_ref().map(|p| p.connected.is_connected()).unwrap_or(false)
+	);
 
-	let allowed = issuer_profile.as_ref().map(|p| p.following || p.connected).unwrap_or(false);
+	let allowed = issuer_profile
+		.as_ref()
+		.map(|p| p.following || p.connected.is_connected())
+		.unwrap_or(false);
 
 	if !allowed {
 		warn!(
 			issuer = %action.iss,
 			action_type = %action.t,
 			"Permission denied - sender not following/connected"
+		);
+		return Err(Error::PermissionDenied);
+	}
+
+	Ok(())
+}
+
+/// Check subscription-based permissions for actions that require active subscriptions
+/// This validates that:
+/// 1. The action type requires subscription (via requires_subscription flag)
+/// 2. The issuer has an active SUBS to the target action (or is the target's creator)
+/// 3. The issuer's subscription role permits the action
+async fn check_subscription_permissions(
+	app: &App,
+	tn_id: TnId,
+	action: &ActionToken,
+	definition: &crate::action::dsl::types::ActionDefinition,
+) -> ClResult<()> {
+	// Check if this action type requires subscription
+	if !definition.behavior.requires_subscription.unwrap_or(false) {
+		return Ok(());
+	}
+
+	// Get the target action (subject or parent)
+	let target_id = action.sub.as_deref().or(action.p.as_deref());
+
+	let Some(target_id) = target_id else {
+		// No target to validate against
+		return Ok(());
+	};
+
+	// Get the target action to check the issuer
+	let target_action = app.meta_adapter.get_action(tn_id, target_id).await?;
+
+	let Some(target_action) = target_action else {
+		warn!(
+			action_type = %action.t,
+			target_id = %target_id,
+			"Subscription check: target action not found"
+		);
+		return Err(Error::NotFound);
+	};
+
+	// If issuer is the target action's creator, they always have permission
+	if action.iss.as_ref() == target_action.issuer.id_tag.as_ref() {
+		debug!(
+			issuer = %action.iss,
+			target_id = %target_id,
+			"Subscription check: issuer is target creator, permission granted"
+		);
+		return Ok(());
+	}
+
+	// Check for active subscription
+	let subs_key = format!("SUBS:{}:{}", target_id, action.iss);
+	let subscription = app.meta_adapter.get_action_by_key(tn_id, &subs_key).await?;
+
+	let Some(subscription) = subscription else {
+		// No subscription - check if there's one for the root action
+		if let Some(root_id) = &target_action.root_id {
+			let root_subs_key = format!("SUBS:{}:{}", root_id, action.iss);
+			let root_subscription =
+				app.meta_adapter.get_action_by_key(tn_id, &root_subs_key).await?;
+
+			let Some(root_sub) = root_subscription else {
+				warn!(
+					issuer = %action.iss,
+					target_id = %target_id,
+					action_type = %action.t,
+					"Permission denied - no active subscription"
+				);
+				return Err(Error::PermissionDenied);
+			};
+			// Found root subscription - use it for role checking
+			return check_subscription_role_permission(action, &root_sub);
+		}
+
+		warn!(
+			issuer = %action.iss,
+			target_id = %target_id,
+			action_type = %action.t,
+			"Permission denied - no active subscription"
+		);
+		return Err(Error::PermissionDenied);
+	};
+
+	// Check role permissions
+	check_subscription_role_permission(action, &subscription)
+}
+
+/// Check if the subscription's role permits the action
+fn check_subscription_role_permission(
+	action: &ActionToken,
+	subscription: &meta_adapter::Action<Box<str>>,
+) -> ClResult<()> {
+	// Get role from x.role (with fallback to content.role for migration)
+	let content_json = subscription
+		.content
+		.as_ref()
+		.and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
+	let user_role = helpers::get_subscription_role(subscription.x.as_ref(), content_json.as_ref());
+
+	// Extract action type and subtype
+	let (action_type, subtype) = helpers::extract_type_and_subtype(&action.t);
+	let subtype_ref = subtype.as_deref();
+
+	// Check role permission
+	let required = helpers::SubscriptionRole::required_for_action(&action_type, subtype_ref);
+	if user_role < required {
+		warn!(
+			issuer = %action.iss,
+			action_type = %action.t,
+			role = ?user_role,
+			required = ?required,
+			"Permission denied - insufficient role"
 		);
 		return Err(Error::PermissionDenied);
 	}
@@ -382,13 +586,17 @@ async fn store_inbound_action(
 		helpers::inherit_visibility(app.meta_adapter.as_ref(), tn_id, None, action.p.as_deref())
 			.await;
 
+	// Resolve root_id from parent chain (not just parent_id)
+	let root_id =
+		helpers::resolve_root_id(app.meta_adapter.as_ref(), tn_id, action.p.as_deref()).await;
+
 	let inbound_action = meta_adapter::Action {
 		action_id,
 		typ: &action_type,
 		sub_typ: sub_type_ref,
 		issuer_tag: &action.iss,
 		parent_id: action.p.as_deref(),
-		root_id: action.p.as_deref(),
+		root_id: root_id.as_deref(),
 		audience_tag: action.aud.as_deref(),
 		content: content_str.as_deref(),
 		attachments: action.a.as_ref().map(|v| v.iter().map(|s| s.as_ref()).collect()),
@@ -396,11 +604,13 @@ async fn store_inbound_action(
 		created_at: action.iat,
 		expires_at: action.exp,
 		visibility,
+		flags: action.f.as_deref(),
+		x: None,
 	};
 
 	match app.meta_adapter.create_action(tn_id, &inbound_action, key.as_deref()).await {
 		Ok(_) => {
-			info!("  stored inbound action {} in actions table", action_id);
+			info!("← STORED: {}", action_id);
 			let update_opts = meta_adapter::UpdateActionDataOptions {
 				status: crate::types::Patch::Value('A'),
 				..Default::default()
@@ -500,22 +710,33 @@ async fn process_inbound_action_attachments(
 ) -> ClResult<()> {
 	use crate::file::sync::sync_file_variants;
 
-	for attachment in attachments {
-		info!("  syncing attachment: {}", attachment);
-		match sync_file_variants(app, tn_id, id_tag, &attachment, None, true).await {
+	let mut total_synced = 0;
+	let mut total_skipped = 0;
+	let mut total_failed = 0;
+
+	for attachment in &attachments {
+		debug!("  syncing attachment: {}", attachment);
+		match sync_file_variants(app, tn_id, id_tag, attachment, None, true).await {
 			Ok(result) => {
-				info!(
-					"  attachment {} sync complete: {} synced, {} skipped, {} failed",
-					attachment,
-					result.synced_variants.len(),
-					result.skipped_variants.len(),
-					result.failed_variants.len()
-				);
+				total_synced += result.synced_variants.len();
+				total_skipped += result.skipped_variants.len();
+				total_failed += result.failed_variants.len();
 			}
 			Err(e) => {
 				warn!("  failed to sync attachment {}: {}", attachment, e);
+				total_failed += 1;
 			}
 		}
+	}
+
+	if !attachments.is_empty() {
+		info!(
+			"ATTACHMENTS: {} files - synced={} skipped={} failed={}",
+			attachments.len(),
+			total_synced,
+			total_skipped,
+			total_failed
+		);
 	}
 
 	Ok(())
@@ -529,13 +750,24 @@ async fn forward_inbound_action_to_websocket(
 	action: &crate::auth_adapter::ActionToken,
 ) {
 	use crate::action::forward::{self, ForwardActionParams};
+	use crate::meta_adapter::AttachmentView;
 
 	let (action_type, subtype) = helpers::extract_type_and_subtype(&action.t);
 
-	let attachments: Option<Vec<Box<str>>> = action.a.as_ref().map(|v| v.to_vec());
+	// Convert file IDs to AttachmentView (no dimensions for federated actions)
+	let attachments: Option<Vec<AttachmentView>> = action.a.as_ref().map(|v| {
+		v.iter()
+			.map(|file_id| AttachmentView {
+				file_id: file_id.clone(),
+				dim: None,
+				local_variants: None,
+			})
+			.collect()
+	});
 
 	let params = ForwardActionParams {
 		action_id,
+		temp_id: None,
 		issuer_tag: &action.iss,
 		audience_tag: action.aud.as_deref(),
 		action_type: &action_type,
@@ -734,7 +966,7 @@ async fn try_auto_approve(
 	};
 
 	// Trust = bidirectional connection (CONN handshake completed)
-	if !issuer_profile.connected {
+	if !issuer_profile.connected.is_connected() {
 		debug!(
 			action_id = %action_id,
 			issuer = %action.iss,
@@ -745,12 +977,7 @@ async fn try_auto_approve(
 	}
 
 	// All conditions met - auto-approve by setting status and creating APRV
-	info!(
-		action_id = %action_id,
-		issuer = %action.iss,
-		action_type = %action.t,
-		"Auto-approving action from trusted source"
-	);
+	info!("AUTO-APPROVE: {} from={} (trusted)", action_id, action.iss);
 
 	// Update action status to 'A' (Active/Approved)
 	let update_opts = crate::meta_adapter::UpdateActionDataOptions {
@@ -776,11 +1003,7 @@ async fn try_auto_approve(
 
 	match task::create_action(app, tn_id, our_id_tag, aprv_action).await {
 		Ok(_) => {
-			info!(
-				action_id = %action_id,
-				issuer = %action.iss,
-				"Auto-approve: APRV action created"
-			);
+			debug!("Auto-approve: APRV action created for {}", action_id);
 		}
 		Err(e) => {
 			warn!(
@@ -789,6 +1012,47 @@ async fn try_auto_approve(
 				"Auto-approve: Failed to create APRV action"
 			);
 		}
+	}
+}
+
+/// Process related actions that came with any action
+///
+/// Related actions are stored in action_tokens with ack = main_action_id.
+/// This verifies and stores them (skipping permission checks as they're pre-approved).
+async fn process_related_actions(app: &App, tn_id: TnId, action_id: &str) {
+	// Get related action tokens that were waiting for this action
+	let related_tokens = match app.meta_adapter.get_related_action_tokens(tn_id, action_id).await {
+		Ok(tokens) => tokens,
+		Err(_) => return,
+	};
+
+	if related_tokens.is_empty() {
+		return;
+	}
+
+	info!("Processing {} related actions for {}", related_tokens.len(), action_id);
+
+	let mut success_count = 0;
+	let mut fail_count = 0;
+
+	for (related_action_id, related_token) in &related_tokens {
+		debug!("Processing related action {}", related_action_id);
+
+		match process_preapproved_action_token(app, tn_id, related_action_id, related_token).await {
+			Ok(_) => {
+				success_count += 1;
+			}
+			Err(e) => {
+				fail_count += 1;
+				warn!("Failed to process related action {}: {}", related_action_id, e);
+			}
+		}
+	}
+
+	if fail_count > 0 {
+		info!("{} related actions processed, {} failed", success_count, fail_count);
+	} else {
+		debug!("{} related actions processed successfully", success_count);
 	}
 }
 

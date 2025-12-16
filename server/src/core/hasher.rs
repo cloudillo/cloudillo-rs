@@ -3,8 +3,6 @@
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
-use crate::prelude::*;
-
 pub enum Hasher {
 	V1(Sha256),
 }
@@ -42,13 +40,9 @@ impl Hasher {
 }
 
 pub fn hash_v1(prefix: &str, data: &[u8]) -> Box<str> {
-	let tm = std::time::SystemTime::now();
 	let mut hasher = Hasher::new();
 	hasher.update(data);
 	let result = hasher.finalize(prefix);
-	if let Ok(elapsed) = tm.elapsed() {
-		info!("elapsed: {}ms", elapsed.as_millis());
-	}
 
 	result.into()
 }

@@ -538,7 +538,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 		tokio::spawn(async move {
 			while let Ok(id) = rx_finish.recv_async().await {
-				info!("Completed task {}", id);
+				debug!("Completed task {} (notified)", id);
 
 				// Get task metadata WITHOUT removing - we only remove after successful transition
 				let task_meta_opt = {
@@ -653,7 +653,6 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					schedule.tasks_scheduled.lock().map(|guard| guard.is_empty()).unwrap_or(true);
 				if is_empty {
 					schedule.notify_schedule.notified().await;
-					info!("NOTIFY: tasks_scheduled");
 				}
 				let time = Timestamp::now();
 				if let Some((timestamp, _id)) = loop {
@@ -665,7 +664,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					if let Some((&(timestamp, id), _)) = tasks_scheduled.first_key_value() {
 						let (timestamp, id) = (timestamp, id);
 						if timestamp <= Timestamp::now() {
-							info!("Spawning task id {}", id);
+							debug!("Spawning task id {} (from schedule)", id);
 							if let Some(task) = tasks_scheduled.remove(&(timestamp, id)) {
 								let Ok(mut tasks_running) = schedule.tasks_running.lock() else {
 									error!("Mutex poisoned: tasks_running");
@@ -685,11 +684,9 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					}
 				} {
 					let wait = tokio::time::Duration::from_secs((timestamp.0 - time.0) as u64);
-					info!("wait: {}", wait.as_secs());
 					tokio::select! {
 						_ = tokio::time::sleep(wait) => (), _ = schedule.notify_schedule.notified() => ()
 					};
-					info!("wait finished");
 				}
 			}
 		});
@@ -798,7 +795,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		{
 			let mut running = lock!(self.tasks_running, "tasks_running")?;
 			if let Some(existing_meta) = running.get_mut(&id) {
-				info!(
+				debug!(
 					"Task {} is already running, updating metadata (will reschedule on completion)",
 					id
 				);
@@ -817,13 +814,13 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				.map(|((ts, tid), _)| (*ts, *tid))
 			{
 				scheduled.remove(&key);
-				info!("Removed existing scheduled entry for task {} before re-queueing", id);
+				debug!("Removed existing scheduled entry for task {} before re-queueing", id);
 			}
 		}
 		{
 			let mut waiting = lock!(self.tasks_waiting, "tasks_waiting")?;
 			if waiting.remove(&id).is_some() {
-				info!("Removed existing waiting entry for task {} before re-queueing", id);
+				debug!("Removed existing waiting entry for task {} before re-queueing", id);
 			}
 		}
 
@@ -834,7 +831,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			warn!("Task {} has both dependencies and scheduled time - ignoring next_at, placing in waiting queue", id);
 			// Force to tasks_waiting instead
 			lock!(self.tasks_waiting, "tasks_waiting")?.insert(id, task_meta);
-			info!("Task {} is waiting for {:?}", id, &deps);
+			debug!("Task {} is waiting for {:?}", id, &deps);
 			for dep in deps {
 				lock!(self.task_dependents, "task_dependents")?.entry(dep).or_default().push(id);
 			}
@@ -842,16 +839,16 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		}
 
 		if deps.is_empty() && task_meta.next_at.unwrap_or(Timestamp(0)) < Timestamp::now() {
-			info!("Spawning task {}", id);
+			debug!("Spawning task {}", id);
 			lock!(self.tasks_scheduled, "tasks_scheduled")?.insert((Timestamp(0), id), task_meta);
 			self.notify_schedule.notify_one();
 		} else if let Some(next_at) = task_meta.next_at {
-			info!("Scheduling task {} for {}", id, next_at);
+			debug!("Scheduling task {} for {}", id, next_at);
 			lock!(self.tasks_scheduled, "tasks_scheduled")?.insert((next_at, id), task_meta);
 			self.notify_schedule.notify_one();
 		} else {
 			lock!(self.tasks_waiting, "tasks_waiting")?.insert(id, task_meta);
-			info!("Task {} is waiting for {:?}", id, &deps);
+			debug!("Task {} is waiting for {:?}", id, &deps);
 			for dep in deps {
 				lock!(self.task_dependents, "task_dependents")?.entry(dep).or_default().push(id);
 			}
@@ -864,7 +861,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 	fn remove_from_queues(&self, task_id: TaskId) -> ClResult<Option<TaskMeta<S>>> {
 		// Try tasks_waiting
 		if let Some(task_meta) = lock!(self.tasks_waiting, "tasks_waiting")?.remove(&task_id) {
-			info!("Removed task {} from waiting queue for update", task_id);
+			debug!("Removed task {} from waiting queue for update", task_id);
 			return Ok(Some(task_meta));
 		}
 
@@ -877,7 +874,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				.map(|((ts, id), _)| (*ts, *id))
 			{
 				if let Some(task_meta) = scheduled.remove(&key) {
-					info!("Removed task {} from scheduled queue for update", task_id);
+					debug!("Removed task {} from scheduled queue for update", task_id);
 					return Ok(Some(task_meta));
 				}
 			}
@@ -908,7 +905,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			return Ok(Vec::new()); // No dependents to release
 		}
 
-		info!("Releasing {} dependents of completed task {}", dependents.len(), completed_task_id);
+		debug!("Releasing {} dependents of completed task {}", dependents.len(), completed_task_id);
 
 		let mut ready_to_spawn = Vec::new();
 
@@ -924,14 +921,14 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					// If all dependencies are cleared, remove and queue for spawning
 					if task_meta.deps.is_empty() {
 						if let Some(task_to_spawn) = waiting.remove(&dependent_id) {
-							info!(
+							debug!(
 								"Dependent task {} ready to spawn (all dependencies cleared)",
 								dependent_id
 							);
 							ready_to_spawn.push((dependent_id, task_to_spawn));
 						}
 					} else {
-						info!(
+						debug!(
 							"Task {} still has {} remaining dependencies",
 							dependent_id,
 							task_meta.deps.len()
@@ -953,12 +950,12 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 						task_meta.deps.retain(|x| *x != completed_task_id);
 						let remaining = task_meta.deps.len();
 						if remaining == 0 {
-							info!(
+							debug!(
 								"Task {} in scheduled queue has no remaining dependencies",
 								dependent_id
 							);
 						} else {
-							info!(
+							debug!(
 								"Task {} in scheduled queue has {} remaining dependencies",
 								dependent_id, remaining
 							);
@@ -980,10 +977,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 	async fn load(&self) -> ClResult<()> {
 		let tasks = self.store.load().await?;
-		info!("Loaded {} tasks from store", tasks.len());
+		debug!("Loaded {} tasks from store", tasks.len());
 		for t in tasks {
 			if let TaskStatus::Pending = t.status {
-				info!("Loading task {} {}", t.id, t.kind);
+				debug!("Loading task {} {}", t.id, t.kind);
 				let task = {
 					let builder_map = self
 						.task_builders
@@ -1016,7 +1013,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 								.parse()
 								.map_err(|_| Error::Internal("retry times must be u64".into()))?,
 						};
-						info!("Loaded retry policy: {:?}", retry);
+						debug!("Loaded retry policy: {:?}", retry);
 						(retry_count, Some(retry))
 					}
 					_ => (0, None),
@@ -1047,7 +1044,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		tokio::spawn(async move {
 			match task.run(&state).await {
 				Ok(()) => {
-					info!("Task {} completed successfully", id);
+					debug!("Task {} completed successfully", id);
 					tx_finish.send(id).unwrap_or(());
 				}
 				Err(e) => {

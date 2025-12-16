@@ -359,7 +359,7 @@ pub struct CreateActionRequest {
 	pub r#type: String, // "Create", "Update", etc
 	pub sub_type: Option<String>, // "Note", "Image", etc
 	pub parent_id: Option<String>,
-	pub root_id: Option<String>,
+	// Note: root_id is auto-populated from parent chain, not specified by clients
 	pub content: String,
 	pub attachments: Option<Vec<String>>, // file_ids
 	pub audience: Option<Vec<String>>,

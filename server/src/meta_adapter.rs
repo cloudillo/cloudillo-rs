@@ -30,11 +30,28 @@ pub enum ProfileStatus {
 	Banned,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum ProfileConnectionStatus {
+	#[default]
 	Disconnected,
 	RequestPending,
 	Connected,
+}
+
+impl ProfileConnectionStatus {
+	pub fn is_connected(&self) -> bool {
+		matches!(self, ProfileConnectionStatus::Connected)
+	}
+}
+
+impl std::fmt::Display for ProfileConnectionStatus {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			ProfileConnectionStatus::Disconnected => write!(f, "disconnected"),
+			ProfileConnectionStatus::RequestPending => write!(f, "pending"),
+			ProfileConnectionStatus::Connected => write!(f, "connected"),
+		}
+	}
 }
 
 // Reference / Bookmark types
@@ -137,7 +154,7 @@ pub struct Profile<S: AsRef<str>> {
 	pub typ: ProfileType,
 	pub profile_pic: Option<S>,
 	pub following: bool,
-	pub connected: bool,
+	pub connected: ProfileConnectionStatus,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -225,6 +242,16 @@ pub struct UpdateActionDataOptions {
 	pub comments_read: Patch<u32>,
 	pub status: Patch<char>,
 	pub visibility: Patch<char>,
+	pub x: Patch<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
+}
+
+/// Options for finalizing an action (resolved fields from ActionCreatorTask)
+#[derive(Debug, Clone, Default)]
+pub struct FinalizeActionOptions<'a> {
+	pub attachments: Option<&'a [&'a str]>,
+	pub subject: Option<&'a str>,
+	pub audience_tag: Option<&'a str>,
+	pub key: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +320,8 @@ pub struct Action<S: AsRef<str>> {
 	pub created_at: Timestamp,
 	pub expires_at: Option<Timestamp>,
 	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
+	pub flags: Option<S>,         // Action flags: R/r (reactions), C/c (comments), O/o (open)
+	pub x: Option<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
 }
 
 #[skip_serializing_none]
@@ -328,6 +357,8 @@ pub struct ActionView {
 	pub status: Option<Box<str>>,
 	pub stat: Option<serde_json::Value>,
 	pub visibility: Option<char>,
+	pub flags: Option<Box<str>>, // Action flags: R/r (reactions), C/c (comments), O/o (open)
+	pub x: Option<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
 }
 
 /// Reaction data
@@ -714,7 +745,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		a_id: u64,
 		action_id: &str,
-		attachments: Option<&[&str]>,
+		options: FinalizeActionOptions<'_>,
 	) -> ClResult<()>;
 
 	async fn create_inbound_action(
@@ -759,6 +790,14 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		action_id: &str,
 		status: Option<char>,
 	) -> ClResult<()>;
+
+	/// Get related action tokens by APRV action_id
+	/// Returns list of (action_id, token) pairs for actions that have ack = aprv_action_id
+	async fn get_related_action_tokens(
+		&self,
+		tn_id: TnId,
+		aprv_action_id: &str,
+	) -> ClResult<Vec<(Box<str>, Box<str>)>>;
 
 	/// Create outbound action
 	async fn create_outbound_action(

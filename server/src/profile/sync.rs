@@ -2,7 +2,7 @@
 
 use crate::core::request::ConditionalResult;
 use crate::core::scheduler::Task;
-use crate::meta_adapter::{Profile, ProfileType, UpdateProfileData};
+use crate::meta_adapter::{Profile, ProfileConnectionStatus, ProfileType, UpdateProfileData};
 use crate::prelude::*;
 use crate::types::{ApiResponse, Patch};
 
@@ -58,31 +58,38 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 				_ => ProfileType::Person,
 			};
 
-			// Create local profile record
+			// Sync profile picture FIRST if present, before creating profile
+			// Only include profile_pic in the profile if sync succeeds
+			let synced_profile_pic = if let Some(ref file_id) = remote.profile_pic {
+				match sync_profile_pic_variant(app, tn_id, id_tag, file_id).await {
+					Ok(_) => Some(file_id.as_str()),
+					Err(e) => {
+						tracing::warn!(
+							"Failed to sync profile picture for {}: {} (continuing without profile_pic)",
+							id_tag,
+							e
+						);
+						None
+					}
+				}
+			} else {
+				None
+			};
+
+			// Create local profile record (with profile_pic only if sync succeeded)
 			let profile = Profile {
 				id_tag: remote.id_tag.as_str(),
 				name: remote.name.as_str(),
 				typ,
-				profile_pic: remote.profile_pic.as_deref(),
+				profile_pic: synced_profile_pic,
 				following: false, // Will be set by the calling hook
-				connected: false,
+				connected: ProfileConnectionStatus::Disconnected,
 			};
 
 			// Generate a simple etag
 			let etag = format!("sync-{}", Timestamp::now().0);
 
 			app.meta_adapter.create_profile(tn_id, &profile, &etag).await?;
-
-			// Sync profile picture 'pf' variant if present
-			if let Some(ref file_id) = remote.profile_pic {
-				if let Err(e) = sync_profile_pic_variant(app, tn_id, id_tag, file_id).await {
-					tracing::warn!(
-						"Failed to sync profile picture for {}: {} (continuing anyway)",
-						id_tag,
-						e
-					);
-				}
-			}
 
 			tracing::info!("Successfully synced profile {} from remote", id_tag);
 			Ok(true)
@@ -205,6 +212,9 @@ pub async fn refresh_profile(
 ///
 /// Uses the unified file sync helper to fetch the file descriptor,
 /// verify hashes, and sync only the 'pf' variant.
+///
+/// Returns Ok(()) if vis.pf was successfully synced or already exists locally.
+/// Returns Err if vis.pf variant doesn't exist in the remote descriptor or sync failed.
 async fn sync_profile_pic_variant(
 	app: &App,
 	tn_id: TnId,
@@ -222,27 +232,41 @@ async fn sync_profile_pic_variant(
 	// Sync only the 'vis.pf' variant for profile pictures (public, no auth needed)
 	let result = sync_file_variants(app, tn_id, id_tag, file_id, Some(&["vis.pf"]), false).await?;
 
-	if !result.synced_variants.is_empty() {
+	// Check if vis.pf was specifically synced or skipped (already exists)
+	let vis_pf_synced = result.synced_variants.iter().any(|v| v == "vis.pf");
+	let vis_pf_skipped = result.skipped_variants.iter().any(|v| v == "vis.pf");
+	let vis_pf_failed = result.failed_variants.iter().any(|v| v == "vis.pf");
+
+	if vis_pf_synced {
 		tracing::info!(
 			"Synced profile picture variant 'vis.pf' for {} (file_id: {})",
 			id_tag,
 			file_id
 		);
-	} else if !result.skipped_variants.is_empty() {
+		Ok(())
+	} else if vis_pf_skipped {
 		tracing::debug!(
 			"Profile picture variant 'vis.pf' already exists for {} (file_id: {})",
 			id_tag,
 			file_id
 		);
-	} else {
+		Ok(())
+	} else if vis_pf_failed {
 		tracing::warn!(
-			"No 'vis.pf' variant found for profile picture {} (file_id: {})",
+			"Failed to sync profile picture variant 'vis.pf' for {} (file_id: {})",
 			id_tag,
 			file_id
 		);
+		Err(Error::NetworkError("vis.pf variant sync failed".into()))
+	} else {
+		// vis.pf wasn't in synced, skipped, or failed - means it doesn't exist in the descriptor
+		tracing::warn!(
+			"No 'vis.pf' variant found in descriptor for profile picture {} (file_id: {})",
+			id_tag,
+			file_id
+		);
+		Err(Error::NotFound)
 	}
-
-	Ok(())
 }
 
 /// Batch task for refreshing stale profiles

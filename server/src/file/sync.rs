@@ -120,7 +120,7 @@ pub async fn sync_file_variants(
 	debug!("Syncing file {} from {}", file_id, remote_id_tag);
 
 	// 1. Fetch file descriptor from remote
-	let descriptor_path = format!("/file/{}/descriptor", file_id);
+	let descriptor_path = format!("/files/{}/descriptor", file_id);
 	let descriptor_response: ApiResponse<String> = if auth {
 		app.request.get(tn_id, remote_id_tag, &descriptor_path).await?
 	} else {
@@ -374,7 +374,7 @@ async fn fetch_and_store_blob(
 	variant_name: &str,
 	auth: bool,
 ) -> ClResult<u64> {
-	let variant_path = format!("/file/variant/{}", variant_id);
+	let variant_path = format!("/files/variant/{}", variant_id);
 	let bytes = app.request.get_bin(tn_id, remote_id_tag, &variant_path, auth).await?;
 
 	if bytes.is_empty() {

@@ -124,7 +124,10 @@ async fn load_relationships(
 
 		if let Ok(profiles) = app.meta_adapter.list_profiles(tn_id, &opts).await {
 			if let Some(profile) = profiles.first() {
-				result.insert((*target_tag).to_string(), (profile.following, profile.connected));
+				result.insert(
+					(*target_tag).to_string(),
+					(profile.following, profile.connected.is_connected()),
+				);
 			}
 		}
 	}

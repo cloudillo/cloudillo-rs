@@ -5,7 +5,8 @@ use axum::{
 	http::StatusCode,
 	Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 
 use crate::{
 	core::extract::OptionalRequestId,
@@ -13,6 +14,21 @@ use crate::{
 	prelude::*,
 	types::{ApiResponse, ProfileInfo},
 };
+
+/// Profile with relationship status (for GET /api/profiles/:idTag)
+#[skip_serializing_none]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileWithStatus {
+	pub id_tag: String,
+	pub name: String,
+	#[serde(rename = "type")]
+	pub profile_type: Option<String>,
+	pub profile_pic: Option<String>,
+	pub status: Option<String>,
+	pub connected: Option<bool>,
+	pub following: Option<bool>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,16 +95,24 @@ pub async fn get_profile_by_id_tag(
 	tn_id: TnId,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Path(id_tag): Path<String>,
-) -> ClResult<(StatusCode, Json<ApiResponse<Option<ProfileInfo>>>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<Option<ProfileWithStatus>>>)> {
 	// Lookup profile in local profiles table (relationship data)
-	let profile = match app.meta_adapter.get_profile_info(tn_id, &id_tag).await {
-		Ok(profile_data) => Some(ProfileInfo {
-			id_tag: profile_data.id_tag.to_string(),
-			name: profile_data.name.to_string(),
-			profile_type: profile_data.profile_type.to_string(),
-			profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
-			created_at: profile_data.created_at,
-		}),
+	let profile = match app.meta_adapter.read_profile(tn_id, &id_tag).await {
+		Ok((_etag, p)) => {
+			let profile_type = match p.typ {
+				crate::meta_adapter::ProfileType::Person => None,
+				crate::meta_adapter::ProfileType::Community => Some("community".to_string()),
+			};
+			Some(ProfileWithStatus {
+				id_tag: p.id_tag.to_string(),
+				name: p.name.to_string(),
+				profile_type,
+				profile_pic: p.profile_pic.map(|s| s.to_string()),
+				status: None, // TODO: Add status to Profile struct
+				connected: Some(p.connected.is_connected()),
+				following: Some(p.following),
+			})
+		}
 		Err(Error::NotFound) => None, // Return empty when not found locally
 		Err(e) => return Err(e),
 	};

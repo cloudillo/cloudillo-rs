@@ -133,7 +133,6 @@ impl WorkerPool {
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
 	{
-		info!("[RUN immed]");
 		let (res_tx, res_rx) = oneshot::channel();
 
 		let job = Box::new(move || {

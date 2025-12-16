@@ -1,5 +1,6 @@
 //! Action subsystem. Actions are small signed documents representing a user action (e.g. post, comment, connection request).
 
+pub mod audience;
 pub mod delivery;
 pub mod dsl;
 pub mod filter;

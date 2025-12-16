@@ -21,6 +21,9 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 		.await;
 }
 
+// Current schema version - update this when adding new migrations
+const CURRENT_DB_VERSION: i64 = 2;
+
 /// Initialize the database schema and run migrations
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	let mut tx = db.begin().await?;
@@ -38,14 +41,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
-	let version = get_db_version(&mut tx).await;
+	let mut version = get_db_version(&mut tx).await;
 
-	if version < 1 {
-		// Version 1: Initial schema
+	// Schema creation - safe to run every time (uses IF NOT EXISTS)
 
-		// Tenants
-		sqlx::query(
-			"CREATE TABLE IF NOT EXISTS tenants (
+	// Tenants
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS tenants (
 			tn_id integer NOT NULL,
 			id_tag text,
 			email text,
@@ -59,13 +61,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id)
 		)",
-		)
-		.execute(&mut *tx)
-		.await?;
+	)
+	.execute(&mut *tx)
+	.await?;
 
-		// Keys
-		sqlx::query(
-			"CREATE TABLE IF NOT EXISTS keys (
+	// Keys
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS keys (
 			tn_id integer NOT NULL,
 			key_id text NOT NULL,
 			status char(1),
@@ -76,13 +78,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id, key_id)
 		)",
-		)
-		.execute(&mut *tx)
-		.await?;
+	)
+	.execute(&mut *tx)
+	.await?;
 
-		// Certs
-		sqlx::query(
-			"CREATE TABLE IF NOT EXISTS certs (
+	// Certs
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS certs (
 			tn_id integer NOT NULL,
 			status char(1),
 			id_tag text,
@@ -94,19 +96,19 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id)
 		)",
-		)
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_certs_idTag ON certs (id_tag)")
 		.execute(&mut *tx)
 		.await?;
-		sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_certs_idTag ON certs (id_tag)")
-			.execute(&mut *tx)
-			.await?;
-		sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_certs_domain ON certs (domain)")
-			.execute(&mut *tx)
-			.await?;
+	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_certs_domain ON certs (domain)")
+		.execute(&mut *tx)
+		.await?;
 
-		// Events
-		sqlx::query(
-			"CREATE TABLE IF NOT EXISTS events (
+	// Events
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS events (
 			ev_id integer NOT NULL,
 			tn_id integer NOT NULL,
 			type text NOT NULL,
@@ -116,13 +118,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(ev_id)
 		)",
-		)
-		.execute(&mut *tx)
-		.await?;
+	)
+	.execute(&mut *tx)
+	.await?;
 
-		// User verification
-		sqlx::query(
-			"CREATE TABLE IF NOT EXISTS user_vfy (
+	// User verification
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS user_vfy (
 			vfy_code text NOT NULL,
 			email text NOT NULL,
 			func text NOT NULL,
@@ -133,25 +135,25 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(vfy_code)
 		)",
-		)
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_vfy_email ON user_vfy (email)")
 		.execute(&mut *tx)
 		.await?;
-		sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_vfy_email ON user_vfy (email)")
-			.execute(&mut *tx)
-			.await?;
-		sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_expires ON user_vfy(expires_at)")
-			.execute(&mut *tx)
-			.await?;
-		sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_email_func ON user_vfy(email, func)")
-			.execute(&mut *tx)
-			.await?;
-		sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_idtag_func ON user_vfy(id_tag, func)")
-			.execute(&mut *tx)
-			.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_expires ON user_vfy(expires_at)")
+		.execute(&mut *tx)
+		.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_email_func ON user_vfy(email, func)")
+		.execute(&mut *tx)
+		.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_vfy_idtag_func ON user_vfy(id_tag, func)")
+		.execute(&mut *tx)
+		.await?;
 
-		// WebAuthn
-		sqlx::query(
-			"CREATE TABLE IF NOT EXISTS webauthn (
+	// WebAuthn
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS webauthn (
 			tn_id integer NOT NULL,
 			credential_id text NOT NULL,
 			counter integer NOT NULL DEFAULT 0,
@@ -161,153 +163,156 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id, credential_id)
 		)",
-		)
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_webauthn_tn_id ON webauthn (tn_id)")
 		.execute(&mut *tx)
 		.await?;
-		sqlx::query("CREATE INDEX IF NOT EXISTS idx_webauthn_tn_id ON webauthn (tn_id)")
-			.execute(&mut *tx)
-			.await?;
 
-		// Triggers for automatic updated_at on INSERT
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS vars_insert_at AFTER INSERT ON vars FOR EACH ROW \
+	// Triggers for automatic updated_at on INSERT
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS vars_insert_at AFTER INSERT ON vars FOR EACH ROW \
 			BEGIN UPDATE vars SET updated_at = unixepoch() WHERE key = NEW.key; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS tenants_insert_at AFTER INSERT ON tenants FOR EACH ROW \
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS tenants_insert_at AFTER INSERT ON tenants FOR EACH ROW \
 			BEGIN UPDATE tenants SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
 			"CREATE TRIGGER IF NOT EXISTS keys_insert_at AFTER INSERT ON keys FOR EACH ROW \
 			BEGIN UPDATE keys SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND key_id = NEW.key_id; END",
 		)
 		.execute(&mut *tx)
 		.await?;
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS certs_insert_at AFTER INSERT ON certs FOR EACH ROW \
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS certs_insert_at AFTER INSERT ON certs FOR EACH ROW \
 			BEGIN UPDATE certs SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS events_insert_at AFTER INSERT ON events FOR EACH ROW \
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS events_insert_at AFTER INSERT ON events FOR EACH ROW \
 			BEGIN UPDATE events SET updated_at = unixepoch() WHERE ev_id = NEW.ev_id; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS user_vfy_insert_at AFTER INSERT ON user_vfy FOR EACH ROW \
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS user_vfy_insert_at AFTER INSERT ON user_vfy FOR EACH ROW \
 			BEGIN UPDATE user_vfy SET updated_at = unixepoch() WHERE vfy_code = NEW.vfy_code; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
 			"CREATE TRIGGER IF NOT EXISTS webauthn_insert_at AFTER INSERT ON webauthn FOR EACH ROW \
 			BEGIN UPDATE webauthn SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND credential_id = NEW.credential_id; END",
 		)
 		.execute(&mut *tx)
 		.await?;
 
-		// Triggers for automatic updated_at on UPDATE
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS vars_updated_at AFTER UPDATE ON vars FOR EACH ROW \
+	// Triggers for automatic updated_at on UPDATE
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS vars_updated_at AFTER UPDATE ON vars FOR EACH ROW \
 			BEGIN UPDATE vars SET updated_at = unixepoch() WHERE key = NEW.key; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS tenants_updated_at AFTER UPDATE ON tenants FOR EACH ROW \
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS tenants_updated_at AFTER UPDATE ON tenants FOR EACH ROW \
 			BEGIN UPDATE tenants SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
 			"CREATE TRIGGER IF NOT EXISTS keys_updated_at AFTER UPDATE ON keys FOR EACH ROW \
 			BEGIN UPDATE keys SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND key_id = NEW.key_id; END",
 		)
 		.execute(&mut *tx)
 		.await?;
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS certs_updated_at AFTER UPDATE ON certs FOR EACH ROW \
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS certs_updated_at AFTER UPDATE ON certs FOR EACH ROW \
 			BEGIN UPDATE certs SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS events_updated_at AFTER UPDATE ON events FOR EACH ROW \
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS events_updated_at AFTER UPDATE ON events FOR EACH ROW \
 			BEGIN UPDATE events SET updated_at = unixepoch() WHERE ev_id = NEW.ev_id; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS user_vfy_updated_at AFTER UPDATE ON user_vfy FOR EACH ROW \
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS user_vfy_updated_at AFTER UPDATE ON user_vfy FOR EACH ROW \
 			BEGIN UPDATE user_vfy SET updated_at = unixepoch() WHERE vfy_code = NEW.vfy_code; END",
-		)
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS webauthn_updated_at AFTER UPDATE ON webauthn FOR EACH ROW \
+		BEGIN UPDATE webauthn SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND credential_id = NEW.credential_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// API Keys table
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS api_keys (
+		key_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		tn_id INTEGER NOT NULL,
+		key_prefix TEXT NOT NULL,
+		key_hash TEXT NOT NULL,
+		name TEXT,
+		scopes TEXT,
+		expires_at INTEGER,
+		last_used_at INTEGER,
+		created_at INTEGER DEFAULT (unixepoch()),
+		updated_at INTEGER DEFAULT (unixepoch()),
+		FOREIGN KEY (tn_id) REFERENCES tenants(tn_id) ON DELETE CASCADE
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// Indexes for api_keys
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_tn_id ON api_keys (tn_id)")
 		.execute(&mut *tx)
 		.await?;
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS webauthn_updated_at AFTER UPDATE ON webauthn FOR EACH ROW \
-			BEGIN UPDATE webauthn SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND credential_id = NEW.credential_id; END",
-		)
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys (key_prefix)")
+		.execute(&mut *tx)
+		.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_expires ON api_keys (expires_at)")
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 1).await;
+	// Triggers for api_keys
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS api_keys_insert_at AFTER INSERT ON api_keys FOR EACH ROW \
+		BEGIN UPDATE api_keys SET updated_at = unixepoch() WHERE key_id = NEW.key_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS api_keys_updated_at AFTER UPDATE ON api_keys FOR EACH ROW \
+		BEGIN UPDATE api_keys SET updated_at = unixepoch() WHERE key_id = NEW.key_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// Fresh database: skip migrations (schema already has all columns)
+	if version == 0 {
+		set_db_version(&mut tx, CURRENT_DB_VERSION).await;
+		#[allow(unused_assignments)]
+		{
+			version = CURRENT_DB_VERSION;
+		}
 	}
 
-	// Migration 2: API Keys table
-	if version < 2 {
-		// API Keys table
-		sqlx::query(
-			"CREATE TABLE IF NOT EXISTS api_keys (
-			key_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			tn_id INTEGER NOT NULL,
-			key_prefix TEXT NOT NULL,
-			key_hash TEXT NOT NULL,
-			name TEXT,
-			scopes TEXT,
-			expires_at INTEGER,
-			last_used_at INTEGER,
-			created_at INTEGER DEFAULT (unixepoch()),
-			updated_at INTEGER DEFAULT (unixepoch()),
-			FOREIGN KEY (tn_id) REFERENCES tenants(tn_id) ON DELETE CASCADE
-		)",
-		)
-		.execute(&mut *tx)
-		.await?;
-
-		// Indexes for api_keys
-		sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_tn_id ON api_keys (tn_id)")
-			.execute(&mut *tx)
-			.await?;
-		sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys (key_prefix)")
-			.execute(&mut *tx)
-			.await?;
-		sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_expires ON api_keys (expires_at)")
-			.execute(&mut *tx)
-			.await?;
-
-		// Triggers for api_keys
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS api_keys_insert_at AFTER INSERT ON api_keys FOR EACH ROW \
-			BEGIN UPDATE api_keys SET updated_at = unixepoch() WHERE key_id = NEW.key_id; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS api_keys_updated_at AFTER UPDATE ON api_keys FOR EACH ROW \
-			BEGIN UPDATE api_keys SET updated_at = unixepoch() WHERE key_id = NEW.key_id; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-
-		set_db_version(&mut tx, 2).await;
-	}
-
+	// Migrations for existing databases (ALTER TABLE only)
+	// if version < 2 { ... ALTER TABLE ...; set_db_version(&mut tx, 2).await; }
 	// Future migrations:
 	// if version < 3 { ... migration 3 ...; set_db_version(&mut tx, 3).await; }
 

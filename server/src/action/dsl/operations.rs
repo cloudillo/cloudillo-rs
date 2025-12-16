@@ -219,7 +219,7 @@ impl<'a> OperationExecutor<'a> {
 				},
 				"profile_pic": profile.profile_pic,
 				"following": profile.following,
-				"connected": profile.connected,
+				"connected": profile.connected.is_connected(),
 			});
 			context.vars.insert(var_name.clone(), profile_json);
 
@@ -295,7 +295,6 @@ impl<'a> OperationExecutor<'a> {
 			audience_tag: audience_val
 				.and_then(|v| v.as_str().map(|s| s.to_string().into_boxed_str())),
 			parent_id: parent_val.and_then(|v| v.as_str().map(|s| s.to_string().into_boxed_str())),
-			root_id: None, // Will be determined by action system
 			subject: subject_val.and_then(|v| v.as_str().map(|s| s.to_string().into_boxed_str())),
 			content: content_val,
 			attachments: attachments_val.and_then(|v| {
@@ -307,6 +306,8 @@ impl<'a> OperationExecutor<'a> {
 			}),
 			expires_at: None,
 			visibility: None,
+			flags: None, // Will use default_flags from action type definition
+			x: None,
 		};
 
 		// Call action creation

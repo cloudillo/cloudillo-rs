@@ -17,6 +17,10 @@ pub struct ActionDeliveryTask {
 	pub action_id: Box<str>,
 	pub target_instance: Box<str>, // Base domain of target instance
 	pub target_id_tag: Box<str>,   // User on target instance to deliver to
+	/// Optional related action ID (e.g., for APRV, this is the subject action being approved)
+	/// When set, the related action's token is included in the `related` field of the inbox payload
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub related_action_id: Option<Box<str>>,
 }
 
 impl ActionDeliveryTask {
@@ -26,7 +30,18 @@ impl ActionDeliveryTask {
 		target_instance: Box<str>,
 		target_id_tag: Box<str>,
 	) -> Arc<Self> {
-		Arc::new(Self { tn_id, action_id, target_instance, target_id_tag })
+		Arc::new(Self { tn_id, action_id, target_instance, target_id_tag, related_action_id: None })
+	}
+
+	/// Create a delivery task with a related action (used for APRV fan-out to include the approved action)
+	pub fn new_with_related(
+		tn_id: TnId,
+		action_id: Box<str>,
+		target_instance: Box<str>,
+		target_id_tag: Box<str>,
+		related_action_id: Option<Box<str>>,
+	) -> Arc<Self> {
+		Arc::new(Self { tn_id, action_id, target_instance, target_id_tag, related_action_id })
 	}
 }
 
@@ -55,10 +70,7 @@ impl Task<App> for ActionDeliveryTask {
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
-		info!(
-			"Running ActionDeliveryTask to {} for action {}",
-			self.target_instance, self.action_id
-		);
+		debug!("→ DELIVER: {} to {}", self.action_id, self.target_instance);
 
 		// Fetch action from database
 		let action = app.meta_adapter.get_action(self.tn_id, &self.action_id).await?;
@@ -86,9 +98,25 @@ impl Task<App> for ActionDeliveryTask {
 			}
 		};
 
-		// Prepare inbox request
-		let mut payload = std::collections::HashMap::new();
-		payload.insert("token", action_token.clone());
+		// Prepare inbox request payload
+		let mut payload = serde_json::json!({
+			"token": action_token.clone()
+		});
+
+		// If there's a related action (e.g., for APRV fan-out), include its token
+		if let Some(ref related_id) = self.related_action_id {
+			if let Ok(Some(related_token)) =
+				app.meta_adapter.get_action_token(self.tn_id, related_id).await
+			{
+				payload["related"] = serde_json::json!([related_token]);
+				debug!(
+					"Including related action {} token in delivery to {}",
+					related_id, self.target_instance
+				);
+			} else {
+				warn!("Related action {} token not found, delivering without it", related_id);
+			}
+		}
 
 		// POST to remote instance inbox
 		match app
@@ -98,10 +126,7 @@ impl Task<App> for ActionDeliveryTask {
 		{
 			Ok(_) => {
 				// Success - action delivered
-				info!(
-					"Successfully delivered action {} to {}",
-					self.action_id, self.target_instance
-				);
+				info!("← DELIVERED: {} to {}", self.action_id, self.target_instance);
 				Ok(())
 			}
 			Err(e) => {
@@ -123,6 +148,7 @@ impl Clone for ActionDeliveryTask {
 			action_id: self.action_id.clone(),
 			target_instance: self.target_instance.clone(),
 			target_id_tag: self.target_id_tag.clone(),
+			related_action_id: self.related_action_id.clone(),
 		}
 	}
 }

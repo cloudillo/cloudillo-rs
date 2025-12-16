@@ -192,6 +192,26 @@ impl BroadcastManager {
 		DeliveryResult::UserOffline
 	}
 
+	/// Send a message to all users in a tenant
+	///
+	/// Broadcasts the message to all connections for all users in the tenant.
+	/// Returns the total number of connections that received the message.
+	pub async fn send_to_tenant(&self, tn_id: TnId, msg: BroadcastMessage) -> usize {
+		let users = self.users.read().await;
+
+		let mut delivered = 0;
+		if let Some(tenant_users) = users.get(&tn_id) {
+			for connections in tenant_users.values() {
+				for conn in connections {
+					if conn.sender.send(msg.clone()).is_ok() {
+						delivered += 1;
+					}
+				}
+			}
+		}
+		delivered
+	}
+
 	/// Check if a user is currently online (has at least one connection)
 	pub async fn is_user_online(&self, tn_id: TnId, id_tag: &str) -> bool {
 		let users = self.users.read().await;

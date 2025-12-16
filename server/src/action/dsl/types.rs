@@ -169,6 +169,18 @@ pub struct BehaviorFlags {
 	/// Can this action receive APRV (approval) from audience?
 	/// When true, accepting this action will generate an APRV federated signal
 	pub approvable: Option<bool>,
+	/// Default flags for this action type (R/r=reactions, C/c=comments, O/o=open)
+	pub default_flags: Option<String>,
+	/// Child actions require SUBS (subscription) validation
+	pub requires_subscription: Option<bool>,
+	/// Deliver subject action along with this action to recipients
+	pub deliver_subject: Option<bool>,
+	/// This action type can have SUBS (subscriptions) pointing to it
+	/// When true, subscribers are included in visibility checks for Direct visibility
+	pub subscribable: Option<bool>,
+	/// Also deliver to subject's owner (in addition to audience)
+	/// Used by INVT to deliver to both invitee and CONV home for validation
+	pub deliver_to_subject_owner: Option<bool>,
 }
 
 /// Lifecycle hooks for action processing

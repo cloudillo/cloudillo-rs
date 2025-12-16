@@ -71,24 +71,24 @@ impl Default for RateLimitConfig {
 			auth: EndpointCategoryConfig {
 				name: "auth",
 				// Auth: strict limits to prevent credential stuffing
-				ipv4_individual: RateLimitTierConfig::new(2, 5, 30, 30),
-				ipv4_network: RateLimitTierConfig::new(10, 20, 300, 100),
-				ipv6_subnet: RateLimitTierConfig::new(20, 40, 600, 200),
-				ipv6_provider: RateLimitTierConfig::new(50, 100, 3000, 1000),
+				ipv4_individual: RateLimitTierConfig::new(20, 50, 100, 200),
+				ipv4_network: RateLimitTierConfig::new(50, 100, 300, 500),
+				ipv6_subnet: RateLimitTierConfig::new(20, 50, 100, 200),
+				ipv6_provider: RateLimitTierConfig::new(50, 100, 300, 500),
 			},
 			federation: EndpointCategoryConfig {
 				name: "federation",
 				// Federation: moderate limits for inter-instance communication
-				ipv4_individual: RateLimitTierConfig::new(5, 15, 1000, 100),
-				ipv4_network: RateLimitTierConfig::new(50, 75, 5000, 500),
-				ipv6_subnet: RateLimitTierConfig::new(10, 30, 5000, 500),
-				ipv6_provider: RateLimitTierConfig::new(200, 300, 20000, 2000),
+				ipv4_individual: RateLimitTierConfig::new(100, 200, 1000, 100),
+				ipv4_network: RateLimitTierConfig::new(500, 750, 5000, 500),
+				ipv6_subnet: RateLimitTierConfig::new(100, 200, 5000, 500),
+				ipv6_provider: RateLimitTierConfig::new(500, 750, 20000, 2000),
 			},
 			general: EndpointCategoryConfig {
 				name: "general",
 				// General: relaxed limits for normal browsing
-				ipv4_individual: RateLimitTierConfig::new(20, 50, 5000, 500),
-				ipv4_network: RateLimitTierConfig::new(100, 200, 50000, 5000),
+				ipv4_individual: RateLimitTierConfig::new(100, 200, 5000, 500),
+				ipv4_network: RateLimitTierConfig::new(500, 1000, 50000, 5000),
 				ipv6_subnet: RateLimitTierConfig::new(100, 200, 50000, 5000),
 				ipv6_provider: RateLimitTierConfig::new(500, 1000, 200000, 20000),
 			},
@@ -97,8 +97,8 @@ impl Default for RateLimitConfig {
 				// WebSocket: moderate limits (connections are long-lived)
 				ipv4_individual: RateLimitTierConfig::new(10, 20, 200, 100),
 				ipv4_network: RateLimitTierConfig::new(50, 100, 1000, 500),
-				ipv6_subnet: RateLimitTierConfig::new(50, 100, 1000, 500),
-				ipv6_provider: RateLimitTierConfig::new(200, 400, 5000, 2000),
+				ipv6_subnet: RateLimitTierConfig::new(10, 20, 1000, 500),
+				ipv6_provider: RateLimitTierConfig::new(50, 100, 5000, 2000),
 			},
 			max_tracked_ips: 100_000,
 			entry_ttl: Duration::from_secs(3600), // 1 hour

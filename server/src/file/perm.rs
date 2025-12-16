@@ -167,7 +167,7 @@ async fn load_file_attrs(
 			Ok(profiles) => {
 				if let Some(profile) = profiles.first() {
 					let following = profile.following;
-					let connected = profile.connected;
+					let connected = profile.connected.is_connected();
 					debug!(
 						subject = subject_id_tag,
 						owner = %owner_id_tag,

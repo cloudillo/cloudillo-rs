@@ -143,7 +143,7 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		tn_id: TnId,
 		blob_id: &str,
 	) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>> {
-		info!("path: {:?}", obj_file_path(&self.base_dir, tn_id, blob_id)?);
+		debug!("path: {:?}", obj_file_path(&self.base_dir, tn_id, blob_id)?);
 		let file = File::open(obj_file_path(&self.base_dir, tn_id, blob_id)?)
 			.await
 			.map_err(|_| Error::NotFound)?;

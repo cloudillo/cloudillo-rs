@@ -71,7 +71,7 @@ pub async fn post_action(
 	Json(action): Json<CreateAction>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
 	let action_id = task::create_action(&app, tn_id, &id_tag, action).await?;
-	info!("actionId {:?}", &action_id);
+	debug!("actionId {:?}", &action_id);
 
 	let list = app
 		.meta_adapter
@@ -128,7 +128,7 @@ pub async fn post_inbox(
 	tn_id: TnId,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	OptionalRequestId(req_id): OptionalRequestId,
-	Json(action): Json<Inbox>,
+	Json(inbox): Json<Inbox>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	// Check if federation is enabled
 	let federation_enabled =
@@ -140,10 +140,10 @@ pub async fn post_inbox(
 
 	// Pre-decode to check action type for PoW requirement
 	// This check happens here so the error is returned synchronously to the client
-	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&action.token) {
+	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&inbox.token) {
 		if action_preview.t.starts_with("CONN") {
 			// Check PoW requirement for CONN actions
-			if let Err(pow_err) = app.rate_limiter.verify_pow(&addr.ip(), &action.token) {
+			if let Err(pow_err) = app.rate_limiter.verify_pow(&addr.ip(), &inbox.token) {
 				debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
 				return Err(Error::PreconditionRequired(format!(
 					"Proof of work required: {}",
@@ -153,11 +153,38 @@ pub async fn post_inbox(
 		}
 	}
 
-	let _action_id = hash("a", action.token.as_bytes());
+	let action_id = hash("a", inbox.token.as_bytes());
 
 	// Pass client address for rate limiting integration
-	let client_address = Some(addr.ip().to_string().into());
-	let task = ActionVerifierTask::new(tn_id, action.token.into(), client_address);
+	let client_address: Option<Box<str>> = Some(addr.ip().to_string().into());
+
+	// Store related actions first (they wait for APRV verification before being processed)
+	// Related actions are stored with ack_token pointing to the main action
+	// They will be processed AFTER the main action (APRV) is verified
+	if let Some(related_tokens) = inbox.related {
+		for related_token in related_tokens {
+			let related_id = hash("a", related_token.as_bytes());
+			debug!(
+				"Storing related action {} (waiting for {} verification)",
+				related_id, action_id
+			);
+
+			// Store the related action token with ack_token linking to the APRV
+			// Status 'W' = waiting for APRV verification
+			// The APRV on_receive hook will process these after verifying the APRV
+			if let Err(e) = app
+				.meta_adapter
+				.create_inbound_action(tn_id, &related_id, &related_token, Some(&action_id))
+				.await
+			{
+				// Ignore duplicate errors - action may already exist
+				debug!("Related action {} storage: {} (may be duplicate)", related_id, e);
+			}
+		}
+	}
+
+	// Process main action (APRV) - its on_receive hook will trigger related action processing
+	let task = ActionVerifierTask::new(tn_id, inbox.token.into(), client_address.clone());
 	let _task_id = app.scheduler.task(task).now().await?;
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
@@ -181,7 +208,7 @@ pub async fn post_inbox_sync(
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	use crate::action::process::process_inbound_action_token;
 
-	info!("POST /api/inbox/sync - Processing synchronous action");
+	debug!("POST /api/inbox/sync - Processing synchronous action");
 
 	// Check if federation is enabled
 	let federation_enabled =
@@ -210,10 +237,7 @@ pub async fn post_inbox_sync(
 	// Extract the return value from the hook result (or empty object if no return value)
 	let response_data = hook_result.unwrap_or(serde_json::json!({}));
 
-	info!(
-		action_id = %action_id,
-		"POST /api/inbox/sync - Synchronous action processed successfully"
-	);
+	debug!("POST /api/inbox/sync - Synchronous action {} processed successfully", action_id);
 
 	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
 

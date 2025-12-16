@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::{
@@ -26,8 +27,6 @@ pub struct CreateAction {
 	pub sub_typ: Option<Box<str>>,
 	#[serde(rename = "parentId")]
 	pub parent_id: Option<Box<str>>,
-	#[serde(rename = "rootId")]
-	pub root_id: Option<Box<str>>,
 	#[serde(rename = "audienceTag")]
 	pub audience_tag: Option<Box<str>>,
 	pub content: Option<serde_json::Value>,
@@ -36,6 +35,11 @@ pub struct CreateAction {
 	#[serde(rename = "expiresAt")]
 	pub expires_at: Option<Timestamp>,
 	pub visibility: Option<char>,
+	/// Action flags (R/r=reactions, C/c=comments, O/o=open)
+	pub flags: Option<Box<str>>,
+	/// Extensible metadata (stored in x column, not in JWT)
+	/// Used for server-side data like x.role for SUBS actions
+	pub x: Option<serde_json::Value>,
 }
 
 pub async fn create_action(
@@ -44,6 +48,17 @@ pub async fn create_action(
 	id_tag: &str,
 	action: CreateAction,
 ) -> ClResult<Box<str>> {
+	// Check if this is an ephemeral action type
+	let is_ephemeral = app
+		.dsl_engine
+		.get_behavior(action.typ.as_ref())
+		.map(|b| b.ephemeral.unwrap_or(false))
+		.unwrap_or(false);
+
+	if is_ephemeral {
+		return create_ephemeral_action(app, tn_id, id_tag, action).await;
+	}
+
 	// Serialize content Value to string for storage (always JSON-encode)
 	let content_str = helpers::serialize_content(action.content.as_ref());
 
@@ -67,6 +82,18 @@ pub async fn create_action(
 		}
 	};
 
+	// Open actions (uppercase 'O' flag) should be Connected visibility for discoverability
+	let visibility = if helpers::is_open(action.flags.as_deref()) {
+		Some('C') // Connected visibility for open groups
+	} else {
+		visibility
+	};
+
+	// Resolve root_id from parent chain (auto-populated, not client-specified)
+	let root_id =
+		helpers::resolve_root_id(app.meta_adapter.as_ref(), tn_id, action.parent_id.as_deref())
+			.await;
+
 	// Create pending action in database with a_id (action_id is NULL at this point)
 	let pending_action = meta_adapter::Action {
 		action_id: "", // Empty action_id for pending actions
@@ -74,7 +101,7 @@ pub async fn create_action(
 		typ: action.typ.as_ref(),
 		sub_typ: action.sub_typ.as_deref(),
 		parent_id: action.parent_id.as_deref(),
-		root_id: action.root_id.as_deref(),
+		root_id: root_id.as_deref(),
 		audience_tag: action.audience_tag.as_deref(),
 		content: content_str.as_deref(),
 		attachments: action.attachments.as_ref().map(|v| v.iter().map(|a| a.as_ref()).collect()),
@@ -82,6 +109,8 @@ pub async fn create_action(
 		expires_at: action.expires_at,
 		created_at: Timestamp::now(),
 		visibility,
+		flags: action.flags.as_deref(),
+		x: action.x.clone(),
 	};
 
 	// Generate key from key_pattern for deduplication (e.g., REACT uses {type}:{parent}:{issuer})
@@ -116,15 +145,39 @@ pub async fn create_action(
 	} else {
 		Vec::new()
 	};
-	info!("Dependencies for a_id={}: {:?}", a_id, attachments_to_wait);
-	let deps = app
+
+	// Collect subject dependency if it references a pending action
+	let subject_key = action.subject.as_ref().and_then(|s| {
+		s.strip_prefix('@')
+			.map(|a_id_str| format!("{},{}", tn_id, a_id_str).into_boxed_str())
+	});
+
+	debug!(
+		"Dependencies for a_id={}: attachments={:?}, subject={:?}",
+		a_id, attachments_to_wait, subject_key
+	);
+
+	// Get file task dependencies
+	let file_deps = app
 		.meta_adapter
 		.list_task_ids(
 			descriptor::FileIdGeneratorTask::kind(),
 			&attachments_to_wait.into_boxed_slice(),
 		)
 		.await?;
-	info!("Task dependencies: {:?}", deps);
+
+	// Get subject action task dependencies
+	let subject_deps = if let Some(ref key) = subject_key {
+		let keys = vec![key.clone()];
+		app.meta_adapter.list_task_ids(ActionCreatorTask::kind(), &keys).await?
+	} else {
+		Vec::new()
+	};
+
+	// Combine all dependencies
+	let mut deps = file_deps;
+	deps.extend(subject_deps);
+	debug!("Task dependencies: {:?}", deps);
 
 	// Create ActionCreatorTask to finalize the action
 	let task = ActionCreatorTask::new(tn_id, Box::from(id_tag), a_id, action);
@@ -137,6 +190,71 @@ pub async fn create_action(
 
 	// Return @{a_id} placeholder
 	Ok(format!("@{}", a_id).into_boxed_str())
+}
+
+/// Create an ephemeral action (forward only, no persistence)
+/// Used for PRES (presence), CSIG (call signaling), and other transient actions
+async fn create_ephemeral_action(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	action: CreateAction,
+) -> ClResult<Box<str>> {
+	use crate::action::forward::{self, ForwardActionParams};
+	use crate::core::hasher;
+
+	debug!(
+		action_type = %action.typ,
+		issuer = %id_tag,
+		"Creating ephemeral action (no persistence)"
+	);
+
+	// Resolve flags: explicit > default_flags from action type definition
+	let flags = action.flags.clone().or_else(|| {
+		app.dsl_engine
+			.get_behavior(action.typ.as_ref())
+			.and_then(|b| b.default_flags.as_ref())
+			.map(|f: &String| Box::from(f.as_str()))
+	});
+
+	let action_for_token = CreateAction {
+		typ: action.typ.clone(),
+		sub_typ: action.sub_typ.clone(),
+		parent_id: action.parent_id.clone(),
+		audience_tag: action.audience_tag.clone(),
+		content: action.content.clone(),
+		attachments: None, // Ephemeral actions shouldn't have attachments
+		subject: action.subject.clone(),
+		expires_at: action.expires_at,
+		visibility: action.visibility,
+		flags,
+		x: None, // Ephemeral actions don't use x metadata
+	};
+
+	// Generate action token
+	let action_token = app.auth_adapter.create_action_token(tn_id, action_for_token).await?;
+	let action_id = hasher::hash("a", action_token.as_bytes());
+
+	// Forward to connected WebSocket clients
+	let params = ForwardActionParams {
+		action_id: &action_id,
+		temp_id: None,
+		issuer_tag: id_tag,
+		audience_tag: action.audience_tag.as_deref(),
+		action_type: action.typ.as_ref(),
+		sub_type: action.sub_typ.as_deref(),
+		content: action.content.as_ref(),
+		attachments: None,
+	};
+	let _result = forward::forward_outbound_action(app, tn_id, &params).await;
+
+	// Schedule delivery to remote recipients (if any)
+	schedule_delivery(app, tn_id, id_tag, &action_id, &action).await?;
+
+	info!(action_id = %action_id, "Ephemeral action created and forwarded");
+
+	// Return the action_id directly (not a placeholder)
+	Ok(action_id)
 }
 
 /// Action creator Task - finalizes pending actions
@@ -176,7 +294,12 @@ impl Task<App> for ActionCreatorTask {
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
-		info!("Running task action.create a_id={} {:?}", self.a_id, &self.action);
+		info!(
+			"→ ACTION.CREATE: a_id={} type={} audience={}",
+			self.a_id,
+			self.action.typ,
+			self.action.audience_tag.as_deref().unwrap_or("-")
+		);
 
 		// 1. Resolve file attachments
 		let attachments = resolve_attachments(app, self.tn_id, &self.action.attachments).await?;
@@ -196,13 +319,71 @@ impl Task<App> for ActionCreatorTask {
 			}
 		}
 
+		// 1c. Resolve subject reference (@a_id → action_id)
+		let subject = resolve_subject(app, self.tn_id, &self.action.subject).await?;
+
+		// 1d. Resolve audience from parent action if not explicitly set
+		// This enables federation for conversation messages (MSG in CONV) and similar hierarchical actions
+		let resolved_audience = if self.action.audience_tag.is_none() {
+			helpers::resolve_parent_audience(
+				app.meta_adapter.as_ref(),
+				self.tn_id,
+				self.action.parent_id.as_deref(),
+			)
+			.await
+		} else {
+			None
+		};
+		let effective_audience = self.action.audience_tag.clone().or(resolved_audience);
+
+		// 1e. Regenerate key if subject was resolved (changed from @xxx to a1~xxx)
+		let resolved_key = if subject.is_some()
+			&& self.action.subject.as_ref().is_some_and(|s| s.starts_with('@'))
+		{
+			// Subject was a reference that got resolved - regenerate the key
+			app.dsl_engine.get_key_pattern(self.action.typ.as_ref()).map(|pattern| {
+				helpers::apply_key_pattern(
+					pattern,
+					self.action.typ.as_ref(),
+					&self.id_tag,
+					effective_audience.as_deref(),
+					self.action.parent_id.as_deref(),
+					subject.as_deref(),
+				)
+			})
+		} else {
+			None
+		};
+
+		// Create a modified action with resolved audience and subject for token generation and delivery
+		let action_with_resolved = CreateAction {
+			audience_tag: effective_audience.clone(),
+			subject: subject.clone(),
+			..self.action.clone()
+		};
+
 		// 2. Generate action token and get action_id
 		let (action_id, action_token) =
-			generate_action_token(app, self.tn_id, &self.action, &attachments).await?;
+			generate_action_token(app, self.tn_id, &action_with_resolved, &attachments, &subject)
+				.await?;
 
-		// 3. Finalize action in database
-		finalize_action(app, self.tn_id, self.a_id, &action_id, &action_token, &attachments)
-			.await?;
+		// 3. Finalize action in database (including resolved audience)
+		let attachments_refs: Option<Vec<&str>> =
+			attachments.as_ref().map(|v| v.iter().map(|s| s.as_ref()).collect());
+		finalize_action(
+			app,
+			self.tn_id,
+			self.a_id,
+			&action_id,
+			&action_token,
+			meta_adapter::FinalizeActionOptions {
+				attachments: attachments_refs.as_deref(),
+				subject: subject.as_deref(),
+				audience_tag: effective_audience.as_deref(),
+				key: resolved_key.as_deref(),
+			},
+		)
+		.await?;
 
 		// 4. Execute DSL on_create hook
 		execute_on_create_hook(
@@ -210,26 +391,40 @@ impl Task<App> for ActionCreatorTask {
 			self.tn_id,
 			&self.id_tag,
 			&action_id,
-			&self.action,
+			&action_with_resolved,
 			&attachments,
+			&subject,
 		)
 		.await;
 
 		// 5. Forward action to connected WebSocket clients
+		let temp_id = format!("@{}", self.a_id);
+		// Only fetch full action if there are attachments (to get dimensions)
+		let attachment_views = if attachments.is_some() {
+			app.meta_adapter
+				.get_action(self.tn_id, &action_id)
+				.await
+				.ok()
+				.flatten()
+				.and_then(|a| a.attachments)
+		} else {
+			None
+		};
 		forward_action_to_websocket(
 			app,
 			self.tn_id,
 			&action_id,
+			Some(&temp_id),
 			&self.id_tag,
-			&self.action,
-			&attachments,
+			&action_with_resolved,
+			attachment_views.as_deref(),
 		)
 		.await;
 
 		// 6. Determine recipients and schedule delivery
-		schedule_delivery(app, self.tn_id, &self.id_tag, &action_id, &self.action).await?;
+		schedule_delivery(app, self.tn_id, &self.id_tag, &action_id, &action_with_resolved).await?;
 
-		info!("Finished task action.create {}", action_id);
+		info!("← ACTION.CREATED: {} type={}", action_id, self.action.typ);
 		Ok(())
 	}
 }
@@ -256,24 +451,54 @@ async fn resolve_attachments(
 	Ok(Some(resolved))
 }
 
+/// Resolve subject reference (@a_id → action_id)
+async fn resolve_subject(
+	app: &App,
+	tn_id: TnId,
+	subject: &Option<Box<str>>,
+) -> ClResult<Option<Box<str>>> {
+	let Some(subject) = subject else {
+		return Ok(None);
+	};
+
+	if let Some(a_id_str) = subject.strip_prefix('@') {
+		let a_id: u64 = a_id_str.parse()?;
+		let action_id = app.meta_adapter.get_action_id(tn_id, a_id).await?;
+		Ok(Some(action_id))
+	} else {
+		// Already resolved or external action ID
+		Ok(Some(subject.clone()))
+	}
+}
+
 /// Generate action token and compute action_id
 async fn generate_action_token(
 	app: &App,
 	tn_id: TnId,
 	action: &CreateAction,
 	attachments: &Option<Vec<Box<str>>>,
+	subject: &Option<Box<str>>,
 ) -> ClResult<(Box<str>, Box<str>)> {
+	// Resolve flags: explicit > default_flags from action type definition
+	let flags = action.flags.clone().or_else(|| {
+		app.dsl_engine
+			.get_behavior(action.typ.as_ref())
+			.and_then(|b| b.default_flags.as_ref())
+			.map(|f: &String| Box::from(f.as_str()))
+	});
+
 	let action_for_token = CreateAction {
 		typ: action.typ.clone(),
 		sub_typ: action.sub_typ.clone(),
 		parent_id: action.parent_id.clone(),
-		root_id: action.root_id.clone(),
 		audience_tag: action.audience_tag.clone(),
 		content: action.content.clone(),
 		attachments: attachments.clone(),
-		subject: action.subject.clone(),
+		subject: subject.clone(), // Use resolved subject
 		expires_at: action.expires_at,
 		visibility: action.visibility,
+		flags,
+		x: None, // x is stored in DB but not in JWT token
 	};
 
 	// Try to create action token, if it fails due to missing key, create one and retry
@@ -300,14 +525,9 @@ async fn finalize_action(
 	a_id: u64,
 	action_id: &str,
 	action_token: &str,
-	attachments: &Option<Vec<Box<str>>>,
+	options: meta_adapter::FinalizeActionOptions<'_>,
 ) -> ClResult<()> {
-	let attachments_refs: Option<Vec<&str>> =
-		attachments.as_ref().map(|v| v.iter().map(|s| s.as_ref()).collect());
-
-	app.meta_adapter
-		.finalize_action(tn_id, a_id, action_id, attachments_refs.as_deref())
-		.await?;
+	app.meta_adapter.finalize_action(tn_id, a_id, action_id, options).await?;
 	app.meta_adapter.store_action_token(tn_id, action_id, action_token).await?;
 
 	Ok(())
@@ -321,6 +541,7 @@ async fn execute_on_create_hook(
 	action_id: &str,
 	action: &CreateAction,
 	attachments: &Option<Vec<Box<str>>>,
+	subject: &Option<Box<str>>,
 ) {
 	if !app.dsl_engine.has_definition(action.typ.as_ref()) {
 		return;
@@ -335,7 +556,7 @@ async fn execute_on_create_hook(
 		.issuer(id_tag)
 		.audience(action.audience_tag.as_ref().map(|s| s.to_string()))
 		.parent(action.parent_id.as_ref().map(|s| s.to_string()))
-		.subject(action.subject.as_ref().map(|s| s.to_string()))
+		.subject(subject.as_ref().map(|s| s.to_string())) // Use resolved subject
 		.content(action.content.clone())
 		.attachments(attachments.as_ref().map(|v| v.iter().map(|s| s.to_string()).collect()))
 		.created_at(format!("{}", Timestamp::now().0))
@@ -366,22 +587,22 @@ async fn forward_action_to_websocket(
 	app: &App,
 	tn_id: TnId,
 	action_id: &str,
+	temp_id: Option<&str>,
 	id_tag: &str,
 	action: &CreateAction,
-	attachments: &Option<Vec<Box<str>>>,
+	attachments: Option<&[meta_adapter::AttachmentView]>,
 ) {
 	use crate::action::forward::{self, ForwardActionParams};
 
-	let attachments_slice: Option<Vec<Box<str>>> = attachments.clone();
-
 	let params = ForwardActionParams {
 		action_id,
+		temp_id,
 		issuer_tag: id_tag,
 		audience_tag: action.audience_tag.as_deref(),
 		action_type: action.typ.as_ref(),
 		sub_type: action.sub_typ.as_deref(),
 		content: action.content.as_ref(),
-		attachments: attachments_slice.as_deref(),
+		attachments,
 	};
 
 	let result = forward::forward_outbound_action(app, tn_id, &params).await;
@@ -409,14 +630,13 @@ async fn determine_recipients(
 	_app: &App,
 	_tn_id: TnId,
 	id_tag: &str,
-	action_id: &str,
+	_action_id: &str,
 	action: &CreateAction,
 ) -> ClResult<Vec<Box<str>>> {
 	// Only deliver to specific audience (no broadcast to followers)
 	if let Some(audience_tag) = &action.audience_tag {
 		// Don't send to self
 		if audience_tag.as_ref() != id_tag {
-			info!("Sending action {} to audience {}", action_id, audience_tag);
 			Ok(vec![audience_tag.clone()])
 		} else {
 			Ok(Vec::new())
@@ -435,36 +655,117 @@ async fn schedule_delivery(
 	action_id: &str,
 	action: &CreateAction,
 ) -> ClResult<()> {
-	let recipients = determine_recipients(app, tn_id, id_tag, action_id, action).await?;
+	// For APRV actions: check if the subject action should be broadcast to followers
+	if action.typ.as_ref() == "APRV" {
+		if let Some(ref subject_id) = action.subject {
+			// Get the subject action to check its broadcast behavior
+			if let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await {
+				let subject_broadcast = app
+					.dsl_engine
+					.get_behavior(&subject_action.typ)
+					.and_then(|b| b.broadcast)
+					.unwrap_or(false);
 
-	info!("Delivery: {} recipients to send to", recipients.len());
+				if subject_broadcast {
+					debug!(
+						"APRV {} subject {} has broadcast=true, fanning out to followers",
+						action_id, subject_id
+					);
+					// Fan-out APRV to followers with related action (the approved POST)
+					// Also send to author (audience) who may not be a follower
+					return schedule_broadcast_delivery(
+						app,
+						tn_id,
+						id_tag,
+						action_id,
+						Some(subject_id.as_ref()),
+						action.audience_tag.as_deref(),
+					)
+					.await;
+				}
+			}
+		}
+	}
 
-	// Extract tenant domain from id_tag (e.g., "alice.home.w9.hu" -> "home.w9.hu")
-	let tenant_domain = id_tag.split_once('.').map(|(_, domain)| domain).unwrap_or(id_tag);
+	// Standard delivery: send to specific audience only
+	let mut recipients = determine_recipients(app, tn_id, id_tag, action_id, action).await?;
+
+	// Get behavior flags
+	let behavior = app.dsl_engine.get_behavior(action.typ.as_ref());
+
+	// Check if this action type should also deliver to subject's owner
+	// This is used by INVT to deliver to both invitee AND the CONV home
+	let deliver_to_subject_owner =
+		behavior.as_ref().and_then(|b| b.deliver_to_subject_owner).unwrap_or(false);
+
+	if deliver_to_subject_owner {
+		if let Some(ref subject_id) = action.subject {
+			// Look up the subject action to find its owner
+			if let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await {
+				let subject_owner = &subject_action.issuer.id_tag;
+				// Add subject owner if not already in recipients and not self
+				if subject_owner.as_ref() != id_tag
+					&& !recipients.iter().any(|r| r.as_ref() == subject_owner.as_ref())
+				{
+					info!(
+						"→ DUAL DELIVERY: Adding subject owner {} for {} (deliver_to_subject_owner)",
+						subject_owner, action_id
+					);
+					recipients.push(subject_owner.clone());
+				}
+			}
+		}
+	}
+
+	// Fan-out to subscribers of subscribable parent chain (e.g., MSG in CONV)
+	// This schedules its own delivery tasks and returns the list for logging
+	let fanout_recipients = schedule_subscriber_fanout(
+		app,
+		tn_id,
+		action_id,
+		action.parent_id.as_deref(),
+		id_tag, // issuer = ourselves for outbound
+	)
+	.await?;
+
+	// Add fanout recipients to the list for logging purposes
+	// (delivery tasks were already scheduled by schedule_subscriber_fanout)
+	for r in fanout_recipients {
+		if !recipients.iter().any(|existing| existing.as_ref() == r.as_ref()) {
+			recipients.push(r);
+		}
+	}
+
+	if !recipients.is_empty() {
+		// Log summary with up to 3 recipient names
+		let recipient_preview: Vec<&str> = recipients.iter().take(3).map(|s| s.as_ref()).collect();
+		if recipients.len() <= 3 {
+			info!("→ DELIVERY: {} → [{}]", action_id, recipient_preview.join(", "));
+		} else {
+			info!(
+				"→ DELIVERY: {} → {} recipients [{}...]",
+				action_id,
+				recipients.len(),
+				recipient_preview.join(", ")
+			);
+		}
+	}
+
+	// Check if this action type should deliver its subject along with it
+	let deliver_subject = behavior.as_ref().and_then(|b| b.deliver_subject).unwrap_or(false);
+
+	let related_action_id =
+		if deliver_subject { action.subject.as_deref().map(|s| s.into()) } else { None };
 
 	for recipient_tag in recipients {
-		// Extract recipient domain (e.g., "bob.home.w9.hu" -> "home.w9.hu")
-		let recipient_domain = recipient_tag
-			.split_once('.')
-			.map(|(_, domain)| domain)
-			.unwrap_or(recipient_tag.as_ref());
+		debug!("Creating delivery task for action {} to {}", action_id, recipient_tag);
 
-		// Skip local recipients - they already received via forward_outbound_action
-		if recipient_domain == tenant_domain {
-			info!(
-				"Skipping local delivery for action {} to {} (same domain: {})",
-				action_id, recipient_tag, tenant_domain
-			);
-			continue;
-		}
-
-		info!("Creating delivery task for action {} to {}", action_id, recipient_tag);
-
-		let delivery_task = ActionDeliveryTask::new(
+		let delivery_task = ActionDeliveryTask::new_with_related(
 			tn_id,
 			action_id.into(),
 			recipient_tag.clone(),
 			recipient_tag.clone(),
+			related_action_id.clone(),
 		);
 
 		let task_key = format!("delivery:{}:{}", action_id, recipient_tag);
@@ -479,6 +780,212 @@ async fn schedule_delivery(
 	}
 
 	Ok(())
+}
+
+/// Schedule broadcast delivery to followers (used for APRV fan-out)
+///
+/// This delivers an action to all followers (entities that have FLLW or CONN actions pointing to us),
+/// with an optional related action token included (for APRV, this is the approved action).
+///
+/// Also sends a direct delivery to the author if specified (they may not be a follower).
+async fn schedule_broadcast_delivery(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	action_id: &str,
+	related_action_id: Option<&str>,
+	author_id_tag: Option<&str>,
+) -> ClResult<()> {
+	// Query for followers (entities that issued FLLW or CONN actions to us)
+	let follower_actions = app
+		.meta_adapter
+		.list_actions(
+			tn_id,
+			&meta_adapter::ListActionOptions {
+				typ: Some(vec!["FLLW".into(), "CONN".into()]),
+				// Don't filter by status - we'll exclude deleted ('D') in the loop
+				..Default::default()
+			},
+		)
+		.await?;
+
+	// Extract unique follower id_tags (excluding self and deleted connections)
+	// Anyone who sent us a CONN/FLLW request is a follower (unless deleted)
+	let mut recipients: HashSet<Box<str>> = HashSet::new();
+	for action_view in follower_actions {
+		// Skip deleted connections
+		if action_view.status.as_deref() == Some("D") {
+			continue;
+		}
+		if action_view.issuer.id_tag.as_ref() != id_tag {
+			recipients.insert(action_view.issuer.id_tag.clone());
+		}
+	}
+
+	// Always send to author (they need to know their action was approved, even if not a follower)
+	if let Some(author) = author_id_tag {
+		if author != id_tag {
+			recipients.insert(author.into());
+		}
+	}
+
+	// Log summary with up to 3 recipient names
+	let recipients_vec: Vec<&str> = recipients.iter().map(|s| s.as_ref()).collect();
+	let recipient_preview: Vec<&str> = recipients_vec.iter().take(3).copied().collect();
+	if !recipients.is_empty() {
+		if recipients.len() <= 3 {
+			info!("→ BROADCAST: {} → [{}]", action_id, recipient_preview.join(", "));
+		} else {
+			info!(
+				"→ BROADCAST: {} → {} recipients [{}...]",
+				action_id,
+				recipients.len(),
+				recipient_preview.join(", ")
+			);
+		}
+	}
+
+	let retry_policy = RetryPolicy::new((10, 43200), 50);
+	let related_box: Option<Box<str>> = related_action_id.map(|s| s.into());
+
+	for recipient_tag in recipients {
+		debug!("Creating broadcast delivery task for action {} to {}", action_id, recipient_tag);
+
+		let delivery_task = ActionDeliveryTask::new_with_related(
+			tn_id,
+			action_id.into(),
+			recipient_tag.clone(),
+			recipient_tag.clone(),
+			related_box.clone(),
+		);
+
+		let task_key = format!("delivery:{}:{}", action_id, recipient_tag);
+
+		app.scheduler
+			.task(delivery_task)
+			.key(&task_key)
+			.with_retry(retry_policy.clone())
+			.schedule()
+			.await?;
+	}
+
+	Ok(())
+}
+
+/// Schedule fan-out delivery to subscribers of a subscribable parent chain.
+///
+/// Used by both:
+/// - Outbound: `schedule_delivery()` for locally created actions
+/// - Inbound: `process.rs` for received actions that need re-delivery
+///
+/// Walks up the parent chain until finding a subscribable action (e.g., CONV).
+/// If that action is "local" (we own it), fans out to all subscribers.
+///
+/// # Arguments
+/// * `app` - Application state
+/// * `tn_id` - Tenant ID
+/// * `action_id` - The action being delivered
+/// * `parent_id` - Starting point for parent chain walk (may be None)
+/// * `issuer` - Action issuer to exclude from delivery (they already have it)
+///
+/// # Returns
+/// List of recipients that delivery tasks were scheduled for
+pub async fn schedule_subscriber_fanout(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	parent_id: Option<&str>,
+	issuer: &str,
+) -> ClResult<Vec<Box<str>>> {
+	let Some(starting_parent) = parent_id else {
+		return Ok(Vec::new());
+	};
+
+	// Get our id_tag to check for local ownership
+	let our_id_tag: Box<str> = app.auth_adapter.read_id_tag(tn_id).await?;
+
+	// Walk parent chain to find subscribable root
+	// Use owned String to avoid borrow checker issues across loop iterations
+	let mut current_parent_id: Option<String> = Some(starting_parent.to_string());
+	let mut recipients = Vec::new();
+
+	while let Some(p_id) = current_parent_id.take() {
+		let Some(parent_action) = app.meta_adapter.get_action(tn_id, &p_id).await? else {
+			break; // Parent not found locally
+		};
+
+		let subscribable = app
+			.dsl_engine
+			.get_behavior(&parent_action.typ)
+			.and_then(|b| b.subscribable)
+			.unwrap_or(false);
+
+		if subscribable {
+			// Check if this subscribable parent is local:
+			// (audience=null & issuer=us) | audience=us
+			let is_local = match &parent_action.audience {
+				None => parent_action.issuer.id_tag.as_ref() == our_id_tag.as_ref(),
+				Some(aud) => aud.id_tag.as_ref() == our_id_tag.as_ref(),
+			};
+
+			if is_local {
+				// Get all subscribers, excluding ourselves and the issuer
+				let subs = app
+					.meta_adapter
+					.list_actions(
+						tn_id,
+						&meta_adapter::ListActionOptions {
+							typ: Some(vec!["SUBS".into()]),
+							subject: Some(p_id.clone()),
+							status: Some(vec!["A".into()]),
+							..Default::default()
+						},
+					)
+					.await?;
+
+				for sub in subs {
+					let sub_tag = sub.issuer.id_tag.as_ref();
+					// Exclude ourselves and the issuer (they already have it)
+					if sub_tag != our_id_tag.as_ref() && sub_tag != issuer {
+						recipients.push(sub.issuer.id_tag.clone());
+					}
+				}
+
+				// Schedule delivery tasks
+				if !recipients.is_empty() {
+					info!(
+						"→ SUBSCRIBER FAN-OUT: {} → {} recipients (root: {})",
+						action_id,
+						recipients.len(),
+						p_id
+					);
+
+					let retry_policy = RetryPolicy::new((10, 43200), 50);
+					for recipient_tag in &recipients {
+						let delivery_task = ActionDeliveryTask::new(
+							tn_id,
+							action_id.into(),
+							recipient_tag.clone(),
+							recipient_tag.clone(),
+						);
+						let task_key = format!("fanout:{}:{}", action_id, recipient_tag);
+						app.scheduler
+							.task(delivery_task)
+							.key(&task_key)
+							.with_retry(retry_policy.clone())
+							.schedule()
+							.await?;
+					}
+				}
+			}
+			break; // Found subscribable root, done walking
+		}
+
+		// Continue up the chain
+		current_parent_id = parent_action.parent_id.map(|p| p.to_string());
+	}
+
+	Ok(recipients)
 }
 
 /// Action verifier generator Task
@@ -527,7 +1034,7 @@ impl Task<App> for ActionVerifierTask {
 
 	async fn run(&self, app: &App) -> ClResult<()> {
 		let action_id = hasher::hash("a", self.token.as_bytes());
-		info!("Running task action.verify {}", action_id);
+		debug!("Running task action.verify {}", action_id);
 
 		process::process_inbound_action_token(
 			app,
@@ -539,7 +1046,7 @@ impl Task<App> for ActionVerifierTask {
 		)
 		.await?;
 
-		info!("Finished task action.verify {}", action_id);
+		debug!("Finished task action.verify {}", action_id);
 		Ok(())
 	}
 }
@@ -552,15 +1059,9 @@ mod tests {
 	fn test_create_action_struct() {
 		let action = CreateAction {
 			typ: "MSG".into(),
-			sub_typ: None,
-			parent_id: None,
-			root_id: None,
 			audience_tag: Some("bob.example.com".into()),
 			content: Some(serde_json::Value::String("Hello".to_string())),
-			attachments: None,
-			subject: None,
-			expires_at: None,
-			visibility: None,
+			..Default::default()
 		};
 
 		assert_eq!(action.typ.as_ref(), "MSG");
@@ -573,18 +1074,14 @@ mod tests {
 		let action = CreateAction {
 			typ: "POST".into(),
 			sub_typ: Some("TEXT".into()),
-			parent_id: None,
-			root_id: None,
-			audience_tag: None,
 			content: Some(serde_json::Value::String("Hello world".to_string())),
-			attachments: None,
-			subject: None,
-			expires_at: None,
-			visibility: None,
+			flags: Some("RC".into()), // Reactions and comments allowed
+			..Default::default()
 		};
 
 		assert_eq!(action.typ.as_ref(), "POST");
 		assert!(action.audience_tag.is_none());
+		assert_eq!(action.flags.as_deref(), Some("RC"));
 	}
 }
 

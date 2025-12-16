@@ -209,9 +209,9 @@ impl MetaAdapter for MetaAdapterSqlite {
 		tn_id: TnId,
 		a_id: u64,
 		action_id: &str,
-		attachments: Option<&[&str]>,
+		options: FinalizeActionOptions<'_>,
 	) -> ClResult<()> {
-		action::finalize(&self.db, tn_id, a_id, action_id, attachments).await
+		action::finalize(&self.db, tn_id, a_id, action_id, options).await
 	}
 
 	async fn create_inbound_action(
@@ -264,6 +264,14 @@ impl MetaAdapter for MetaAdapterSqlite {
 		status: Option<char>,
 	) -> ClResult<()> {
 		action::update_inbound(&self.db, tn_id, action_id, status).await
+	}
+
+	async fn get_related_action_tokens(
+		&self,
+		tn_id: TnId,
+		aprv_action_id: &str,
+	) -> ClResult<Vec<(Box<str>, Box<str>)>> {
+		action::get_related_tokens(&self.db, tn_id, aprv_action_id).await
 	}
 
 	async fn create_outbound_action(

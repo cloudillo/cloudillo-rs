@@ -11,20 +11,94 @@ use crate::{
 	types::{serialize_timestamp_iso, serialize_timestamp_iso_opt},
 };
 
-/// Action tokens represent user actions
+/// Action tokens represent federated user actions as signed JWTs (ES384/P-384).
+///
+/// Actions are content-addressed: `action_id = "a1~" + SHA256(token)`.
+/// Field names are short (JWT claims) to minimize token size.
+///
+/// ## Field Semantics
+///
+/// | Field | Meaning | Used By |
+/// |-------|---------|---------|
+/// | `iss` | Issuer - id_tag of action creator | All actions |
+/// | `k` | Key ID - signing key identifier | All actions |
+/// | `t` | Type - action type (e.g., "POST", "CONN:DEL") | All actions |
+/// | `c` | Content - action payload (JSON) | POST, CMNT, MSG, CONV, FSHR, IDP:REG |
+/// | `p` | Parent - creates visible hierarchy (threading) | CMNT only |
+/// | `sub` | Subject - references without hierarchy | REACT, APRV, SUBS, INVT, FSHR, STAT, PRES |
+/// | `a` | Attachments - file IDs (content-addressed) | POST, MSG, CONV |
+/// | `aud` | Audience - target recipient id_tag | CONN, FLLW, MSG(DM), APRV, FSHR, SUBS, INVT |
+/// | `iat` | Issued At - creation timestamp | All actions |
+/// | `exp` | Expires At - optional expiration | Time-limited actions |
+/// | `f` | Flags - capabilities (R=reactions, C=comments, O=open) | POST, CONV |
+/// | `_` | Nonce - PoW for rate limiting | CONN only |
+///
+/// ## Key Semantic Rules
+///
+/// - **`p` (parent)**: Use ONLY for true threading where the child action is displayed
+///   as a reply/child of the parent (e.g., CMNT replying to POST).
+/// - **`sub` (subject)**: Use for references that don't create visible hierarchy
+///   (e.g., REACT on a POST, APRV approving an action, SUBS subscribing to CONV).
+/// - **`aud` (audience)**: The recipient who should receive/process this action.
+///   For bidirectional actions (CONN), both parties are involved.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ActionToken {
+	/// Issuer - id_tag of the action creator (e.g., "alice.example.com")
 	pub iss: Box<str>,
+
+	/// Key ID - identifier of the signing key used (for key rotation support)
 	pub k: Box<str>,
+
+	/// Type - action type with optional subtype (e.g., "POST", "REACT:LIKE", "CONN:DEL")
 	pub t: Box<str>,
+
+	/// Content - action-specific payload as JSON. Schema varies by action type:
+	/// - POST/CMNT/MSG: string (message text)
+	/// - CONV: {name: string, description?: string}
+	/// - FSHR: {contentType: string, fileName: string, fileTp: "BLOB"|"CRDT"|"RTDB"}
+	/// - IDP:REG: {id_tag: string, email?: string, owner_id_tag?: string}
+	/// - SUBS/INVT: {role?: string, message?: string}
 	pub c: Option<serde_json::Value>,
+
+	/// Parent - action_id of parent action for TRUE HIERARCHY (threading).
+	/// Use ONLY for CMNT where the comment is displayed as a child of the parent.
+	/// Do NOT use for reactions, approvals, or other references.
 	pub p: Option<Box<str>>,
+
+	/// Attachments - array of file IDs (content-addressed, e.g., "f1~abc123...")
 	pub a: Option<Vec<Box<str>>>,
+
+	/// Audience - id_tag of the target recipient. Used for:
+	/// - CONN/FLLW: User being connected/followed
+	/// - MSG (DM): Direct message recipient
+	/// - APRV: Original action issuer receiving approval
+	/// - FSHR: User receiving file share
+	/// - SUBS/INVT: Owner of the subject action
 	pub aud: Option<Box<str>>,
+
+	/// Subject - action_id or resource_id being referenced WITHOUT creating hierarchy.
+	/// Use for REACT, APRV, SUBS, INVT, FSHR, STAT, PRES where the action
+	/// references something but isn't displayed as a child of it.
 	pub sub: Option<Box<str>>,
+
+	/// Issued At - Unix timestamp of action creation
 	pub iat: Timestamp,
+
+	/// Expires At - optional Unix timestamp for action expiration
 	pub exp: Option<Timestamp>,
+
+	/// Flags - capability flags for this action:
+	/// - R/r: Reactions allowed/forbidden
+	/// - C/c: Comments allowed/forbidden
+	/// - O/o: Open (anyone can join) / Closed (invite-only)
+	/// Uppercase = enabled, lowercase = disabled. Default varies by type.
+	pub f: Option<Box<str>>,
+
+	/// Nonce - Proof-of-work nonce for rate limiting (CONN actions only).
+	/// Allows changing token hash without changing content.
+	#[serde(rename = "_", default, skip_serializing_if = "Option::is_none")]
+	pub nonce: Option<Box<str>>,
 }
 
 /// Access tokens are used to authenticate users

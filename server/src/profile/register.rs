@@ -344,13 +344,14 @@ async fn handle_idp_registration(
 		typ: "IDP:REG".into(),
 		sub_typ: None,
 		parent_id: None,
-		root_id: None,
 		audience_tag: Some(idp_domain.to_string().into()),
 		content: Some(serde_json::to_value(&reg_content)?),
 		attachments: None,
 		subject: None,
 		expires_at: Some(expires_at),
 		visibility: None,
+		flags: None,
+		x: None,
 	};
 
 	// Generate action JWT token

@@ -436,6 +436,251 @@ impl DslEngine {
 		self.definitions.get(action_type).and_then(|d| d.key_pattern.as_deref())
 	}
 
+	/// Validate action content against the schema defined for an action type.
+	///
+	/// Returns Ok(()) if content is valid or no schema is defined.
+	/// Returns Err with validation details if content violates the schema.
+	pub fn validate_content(
+		&self,
+		action_type: &str,
+		content: Option<&serde_json::Value>,
+	) -> ClResult<()> {
+		// Try full type first, then base type (e.g., "REACT:LIKE" -> "REACT")
+		let definition = self
+			.definitions
+			.get(action_type)
+			.or_else(|| action_type.split(':').next().and_then(|base| self.definitions.get(base)))
+			.ok_or_else(|| {
+				Error::ValidationError(format!("Unknown action type: {}", action_type))
+			})?;
+
+		// Check field constraints for content
+		if let Some(FieldConstraint::Required) = definition.fields.content {
+			if content.is_none() || matches!(content, Some(serde_json::Value::Null)) {
+				return Err(Error::ValidationError(format!(
+					"Content is required for action type {}",
+					action_type
+				)));
+			}
+		}
+
+		if let Some(FieldConstraint::Forbidden) = definition.fields.content {
+			if content.is_some() && !matches!(content, Some(serde_json::Value::Null)) {
+				return Err(Error::ValidationError(format!(
+					"Content is forbidden for action type {}",
+					action_type
+				)));
+			}
+		}
+
+		// If no schema defined or no content, validation passes
+		let Some(schema_wrapper) = &definition.schema else {
+			return Ok(());
+		};
+		let Some(schema) = &schema_wrapper.content else {
+			return Ok(());
+		};
+		let Some(content) = content else {
+			return Ok(());
+		};
+
+		// Validate content against schema
+		self.validate_value_against_schema(content, schema, "content")
+	}
+
+	/// Validate a value against a content schema
+	fn validate_value_against_schema(
+		&self,
+		value: &serde_json::Value,
+		schema: &ContentSchema,
+		path: &str,
+	) -> ClResult<()> {
+		match schema.content_type {
+			ContentType::String => {
+				let s = value
+					.as_str()
+					.ok_or_else(|| Error::ValidationError(format!("{}: expected string", path)))?;
+
+				// Check min_length
+				if let Some(min) = schema.min_length {
+					if s.len() < min {
+						return Err(Error::ValidationError(format!(
+							"{}: string too short (min {})",
+							path, min
+						)));
+					}
+				}
+
+				// Check max_length
+				if let Some(max) = schema.max_length {
+					if s.len() > max {
+						return Err(Error::ValidationError(format!(
+							"{}: string too long (max {})",
+							path, max
+						)));
+					}
+				}
+
+				// Check pattern
+				if let Some(ref pattern) = schema.pattern {
+					let re = regex::Regex::new(pattern).map_err(|e| {
+						Error::ValidationError(format!("{}: invalid pattern: {}", path, e))
+					})?;
+					if !re.is_match(s) {
+						return Err(Error::ValidationError(format!(
+							"{}: string does not match pattern",
+							path
+						)));
+					}
+				}
+
+				// Check enum
+				if let Some(ref allowed) = schema.r#enum {
+					let string_val = serde_json::Value::String(s.to_string());
+					if !allowed.contains(&string_val) {
+						return Err(Error::ValidationError(format!(
+							"{}: value not in allowed enum",
+							path
+						)));
+					}
+				}
+			}
+
+			ContentType::Number => {
+				if !value.is_number() {
+					return Err(Error::ValidationError(format!("{}: expected number", path)));
+				}
+
+				// Check enum
+				if let Some(ref allowed) = schema.r#enum {
+					if !allowed.contains(value) {
+						return Err(Error::ValidationError(format!(
+							"{}: value not in allowed enum",
+							path
+						)));
+					}
+				}
+			}
+
+			ContentType::Boolean => {
+				if !value.is_boolean() {
+					return Err(Error::ValidationError(format!("{}: expected boolean", path)));
+				}
+			}
+
+			ContentType::Object => {
+				let obj = value
+					.as_object()
+					.ok_or_else(|| Error::ValidationError(format!("{}: expected object", path)))?;
+
+				// Check required properties
+				if let Some(ref required) = schema.required {
+					for prop in required {
+						if !obj.contains_key(prop) {
+							return Err(Error::ValidationError(format!(
+								"{}: missing required property '{}'",
+								path, prop
+							)));
+						}
+					}
+				}
+
+				// Validate individual properties
+				if let Some(ref properties) = schema.properties {
+					for (prop_name, prop_schema) in properties {
+						if let Some(prop_value) = obj.get(prop_name) {
+							self.validate_field_value(
+								prop_value,
+								prop_schema,
+								&format!("{}.{}", path, prop_name),
+							)?;
+						}
+					}
+				}
+			}
+
+			ContentType::Json => {
+				// Json type accepts any valid JSON - no further validation
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Validate a field value against a schema field definition
+	fn validate_field_value(
+		&self,
+		value: &serde_json::Value,
+		schema: &SchemaField,
+		path: &str,
+	) -> ClResult<()> {
+		match schema.field_type {
+			FieldType::String => {
+				let s = value
+					.as_str()
+					.ok_or_else(|| Error::ValidationError(format!("{}: expected string", path)))?;
+
+				if let Some(min) = schema.min_length {
+					if s.len() < min {
+						return Err(Error::ValidationError(format!(
+							"{}: string too short (min {})",
+							path, min
+						)));
+					}
+				}
+
+				if let Some(max) = schema.max_length {
+					if s.len() > max {
+						return Err(Error::ValidationError(format!(
+							"{}: string too long (max {})",
+							path, max
+						)));
+					}
+				}
+
+				if let Some(ref allowed) = schema.r#enum {
+					let string_val = serde_json::Value::String(s.to_string());
+					if !allowed.contains(&string_val) {
+						return Err(Error::ValidationError(format!(
+							"{}: value '{}' not in allowed enum",
+							path, s
+						)));
+					}
+				}
+			}
+
+			FieldType::Number => {
+				if !value.is_number() {
+					return Err(Error::ValidationError(format!("{}: expected number", path)));
+				}
+			}
+
+			FieldType::Boolean => {
+				if !value.is_boolean() {
+					return Err(Error::ValidationError(format!("{}: expected boolean", path)));
+				}
+			}
+
+			FieldType::Array => {
+				let arr = value
+					.as_array()
+					.ok_or_else(|| Error::ValidationError(format!("{}: expected array", path)))?;
+
+				if let Some(ref item_schema) = schema.items {
+					for (i, item) in arr.iter().enumerate() {
+						self.validate_field_value(item, item_schema, &format!("{}[{}]", path, i))?;
+					}
+				}
+			}
+
+			FieldType::Json => {
+				// Json type accepts any valid JSON
+			}
+		}
+
+		Ok(())
+	}
+
 	/// List all loaded action types
 	pub fn list_action_types(&self) -> Vec<String> {
 		self.definitions.keys().cloned().collect()

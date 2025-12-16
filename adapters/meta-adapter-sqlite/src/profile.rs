@@ -6,6 +6,70 @@ use crate::utils::*;
 use cloudillo::meta_adapter::*;
 use cloudillo::prelude::*;
 
+/// Parse connected column value to ProfileConnectionStatus
+/// Handles both TEXT ("0", "R", "1") and INTEGER (0, 1) values from SQLite
+fn parse_connected(row: &sqlx::sqlite::SqliteRow) -> Result<ProfileConnectionStatus, sqlx::Error> {
+	// Try as String first (for "0", "R", "1" values)
+	if let Ok(val) = row.try_get::<Option<String>, _>("connected") {
+		return Ok(match val.as_deref() {
+			Some("1") => ProfileConnectionStatus::Connected,
+			Some("R") => ProfileConnectionStatus::RequestPending,
+			_ => ProfileConnectionStatus::Disconnected,
+		});
+	}
+	// Fall back to integer (for legacy 0/1 values)
+	if let Ok(val) = row.try_get::<Option<i64>, _>("connected") {
+		return Ok(match val {
+			Some(1) => ProfileConnectionStatus::Connected,
+			_ => ProfileConnectionStatus::Disconnected,
+		});
+	}
+	// Default to disconnected if nothing works
+	Ok(ProfileConnectionStatus::Disconnected)
+}
+
+/// Database value for connected column - can be integer (0, 1) or text ('R')
+enum ConnectedDbValue {
+	Int(i64),
+	Text(&'static str),
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for ConnectedDbValue {
+	fn encode_by_ref(
+		&self,
+		buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+	) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+		match self {
+			ConnectedDbValue::Int(i) => {
+				<i64 as sqlx::Encode<'q, sqlx::Sqlite>>::encode_by_ref(i, buf)
+			}
+			ConnectedDbValue::Text(s) => {
+				<&str as sqlx::Encode<'q, sqlx::Sqlite>>::encode_by_ref(s, buf)
+			}
+		}
+	}
+}
+
+impl sqlx::Type<sqlx::Sqlite> for ConnectedDbValue {
+	fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
+		<i64 as sqlx::Type<sqlx::Sqlite>>::type_info()
+	}
+
+	fn compatible(ty: &<sqlx::Sqlite as sqlx::Database>::TypeInfo) -> bool {
+		<i64 as sqlx::Type<sqlx::Sqlite>>::compatible(ty)
+			|| <&str as sqlx::Type<sqlx::Sqlite>>::compatible(ty)
+	}
+}
+
+/// Convert ProfileConnectionStatus to database value
+fn connected_to_db(status: ProfileConnectionStatus) -> ConnectedDbValue {
+	match status {
+		ProfileConnectionStatus::Disconnected => ConnectedDbValue::Int(0),
+		ProfileConnectionStatus::RequestPending => ConnectedDbValue::Text("R"),
+		ProfileConnectionStatus::Connected => ConnectedDbValue::Int(1),
+	}
+}
+
 /// List profiles with filtering options
 pub(crate) async fn list(
 	db: &SqlitePool,
@@ -98,7 +162,7 @@ pub(crate) async fn list(
 			typ,
 			profile_pic: row.try_get("profile_pic")?,
 			following: row.try_get("following")?,
-			connected: row.try_get("connected")?,
+			connected: parse_connected(row)?,
 		})
 	}))
 }
@@ -132,7 +196,7 @@ pub(crate) async fn read(
 			name: row.try_get("name")?,
 			profile_pic: row.try_get("profile_pic")?,
 			following: row.try_get("following")?,
-			connected: row.try_get("connected")?,
+			connected: parse_connected(&row)?,
 		};
 		Ok((etag, profile))
 	})
@@ -182,7 +246,7 @@ pub(crate) async fn create(
 		.bind(typ)
 		.bind(profile.profile_pic)
 		.bind(profile.following)
-		.bind(profile.connected)
+		.bind(connected_to_db(profile.connected))
 		.bind(etag)
 		.execute(db)
 		.await
@@ -242,9 +306,9 @@ pub(crate) async fn update(
 	has_updates = push_patch!(query, has_updates, "following", &profile.following);
 
 	has_updates = push_patch!(query, has_updates, "connected", &profile.connected, |v| match v {
-		ProfileConnectionStatus::Disconnected => "0",
-		ProfileConnectionStatus::RequestPending => "2", // Use 2 for 'R'
-		ProfileConnectionStatus::Connected => "1",
+		ProfileConnectionStatus::Disconnected => ConnectedDbValue::Int(0),
+		ProfileConnectionStatus::RequestPending => ConnectedDbValue::Text("R"),
+		ProfileConnectionStatus::Connected => ConnectedDbValue::Int(1),
 	});
 
 	// Ban metadata fields

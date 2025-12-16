@@ -31,6 +31,10 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		stat_definition(),
 		idp_reg_definition(),
 		fileshare_definition(),
+		pres_definition(),
+		subs_definition(),
+		conv_definition(),
+		invt_definition(),
 	]
 }
 
@@ -234,9 +238,9 @@ fn react_definition() -> ActionDefinition {
 		fields: FieldConstraints {
 			content: Some(FieldConstraint::Forbidden),
 			audience: None,
-			parent: Some(FieldConstraint::Required),
+			parent: Some(FieldConstraint::Forbidden), // Use subject instead for non-hierarchical reference
 			attachments: None,
-			..Default::default()
+			subject: Some(FieldConstraint::Required), // The action being reacted to
 		},
 		schema: None,
 		behavior: BehaviorFlags {
@@ -247,8 +251,8 @@ fn react_definition() -> ActionDefinition {
 			..Default::default()
 		},
 		hooks: ActionHooks {
-			on_create: HookImplementation::None,
-			on_receive: HookImplementation::None, // TODO: Get parent, check if owner, update counters, create STAT
+			on_create: HookImplementation::None, // Native hook registered via registry
+			on_receive: HookImplementation::None, // Native hook registered via registry
 			on_accept: HookImplementation::None,
 			on_reject: HookImplementation::None,
 		},
@@ -258,7 +262,7 @@ fn react_definition() -> ActionDefinition {
 			requires_following: Some(false),
 			requires_connected: Some(false),
 		}),
-		key_pattern: Some("{type}:{parent}:{issuer}".to_string()),
+		key_pattern: Some("{type}:{subject}:{issuer}".to_string()), // One reaction per user per action
 	}
 }
 
@@ -320,15 +324,20 @@ fn comment_definition() -> ActionDefinition {
 	}
 }
 
-/// MSG - Direct message
+/// MSG - Direct message or conversation message
 fn message_definition() -> ActionDefinition {
 	ActionDefinition {
 		r#type: "MSG".to_string(),
 		version: "1.0".to_string(),
-		description: "Direct message to another user".to_string(),
+		description: "Direct message to another user or within a conversation".to_string(),
 		metadata: Some(ActionMetadata {
 			category: Some("communication".to_string()),
-			tags: Some(vec!["message".to_string(), "dm".to_string(), "direct".to_string()]),
+			tags: Some(vec![
+				"message".to_string(),
+				"dm".to_string(),
+				"direct".to_string(),
+				"conversation".to_string(),
+			]),
 			deprecated: None,
 			experimental: None,
 		}),
@@ -339,7 +348,9 @@ fn message_definition() -> ActionDefinition {
 		}),
 		fields: FieldConstraints {
 			content: Some(FieldConstraint::Required),
-			audience: Some(FieldConstraint::Required),
+			audience: None, // Optional: for DMs. For CONV messages, inherits from CONV.
+			parent: None,   // Optional: CONV_id for first message, MSG_id for replies
+			subject: None,  // Optional: Reserved for future use
 			..Default::default()
 		},
 		schema: Some(ContentSchemaWrapper {
@@ -359,6 +370,7 @@ fn message_definition() -> ActionDefinition {
 			allow_unknown: Some(false),
 			requires_acceptance: Some(false),
 			approvable: Some(true),
+			requires_subscription: Some(true), // When subject is present, requires subscription
 			ttl: None,
 			..Default::default()
 		},
@@ -636,6 +648,181 @@ fn idp_reg_definition() -> ActionDefinition {
 	}
 }
 
+/// PRES - Presence indication (ephemeral)
+/// Used for typing indicators, online status, etc. - NOT persisted to database
+fn pres_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "PRES".to_string(),
+		version: "1.0".to_string(),
+		description: "Presence indication - ephemeral, not persisted".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("ephemeral".to_string()),
+			tags: Some(vec!["presence".to_string(), "typing".to_string(), "status".to_string()]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: Some({
+			let mut map = HashMap::new();
+			map.insert("TYPING".to_string(), "User is typing".to_string());
+			map.insert("ONLINE".to_string(), "User is online".to_string());
+			map.insert("AWAY".to_string(), "User is away".to_string());
+			map.insert("OFFLINE".to_string(), "User went offline".to_string());
+			map
+		}),
+		fields: FieldConstraints {
+			content: None,  // Optional presence data
+			audience: None, // Optional specific target
+			parent: None,
+			attachments: Some(FieldConstraint::Forbidden),
+			subject: Some(FieldConstraint::Required), // What context (conversation, document, etc.)
+		},
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Object,
+				min_length: None,
+				max_length: None,
+				pattern: None,
+				r#enum: None,
+				properties: None, // Flexible presence data
+				required: None,
+				description: Some("Optional presence metadata".to_string()),
+			}),
+		}),
+		behavior: BehaviorFlags {
+			broadcast: Some(false),
+			allow_unknown: Some(true),
+			requires_acceptance: Some(false),
+			ephemeral: Some(true), // NOT persisted
+			ttl: Some(30),         // Short TTL for presence info
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None,
+			on_receive: HookImplementation::None,
+			on_accept: HookImplementation::None,
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("any".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(false),
+		}),
+		key_pattern: None, // Ephemeral actions don't need deduplication keys
+	}
+}
+
+/// SUBS - Subscribe to an action
+/// Universal subscription mechanism for conversations, posts, events, etc.
+fn subs_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "SUBS".to_string(),
+		version: "1.0".to_string(),
+		description: "Subscribe to an action's updates".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("subscription".to_string()),
+			tags: Some(vec![
+				"subscribe".to_string(),
+				"membership".to_string(),
+				"follow".to_string(),
+			]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: Some({
+			let mut map = HashMap::new();
+			map.insert(
+				"UPD".to_string(),
+				"Update subscription (role change, preferences)".to_string(),
+			);
+			map.insert("DEL".to_string(), "Unsubscribe / leave".to_string());
+			map
+		}),
+		fields: FieldConstraints {
+			content: None,                             // Optional: role info, preferences
+			audience: Some(FieldConstraint::Required), // Owner of the target action
+			parent: Some(FieldConstraint::Forbidden),
+			attachments: Some(FieldConstraint::Forbidden),
+			subject: Some(FieldConstraint::Required), // The action being subscribed to
+		},
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Object,
+				min_length: None,
+				max_length: None,
+				pattern: None,
+				r#enum: None,
+				properties: Some({
+					let mut props = HashMap::new();
+					// Role in the subscription: observer, member, moderator, admin
+					props.insert(
+						"role".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(20),
+							r#enum: Some(vec![
+								serde_json::Value::String("observer".to_string()),
+								serde_json::Value::String("member".to_string()),
+								serde_json::Value::String("moderator".to_string()),
+								serde_json::Value::String("admin".to_string()),
+							]),
+							items: None,
+						},
+					);
+					// Who invited this user (for closed subscriptions)
+					props.insert(
+						"invitedBy".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(255),
+							r#enum: None,
+							items: None,
+						},
+					);
+					// Optional join/subscription message
+					props.insert(
+						"message".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(500),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props
+				}),
+				required: None, // All fields are optional
+				description: Some(
+					"Subscription content with role, invitedBy, and optional message".to_string(),
+				),
+			}),
+		}),
+		behavior: BehaviorFlags {
+			broadcast: Some(false),
+			allow_unknown: Some(true),          // Anyone can attempt to subscribe
+			requires_acceptance: Some(false),   // Auto-accept for open; moderated via hooks
+			requires_subscription: Some(false), // SUBS itself doesn't require subscription
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None,
+			on_receive: HookImplementation::None, // TODO: Native hook for open/closed check, INVT validation
+			on_accept: HookImplementation::None,
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("any".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(false),
+		}),
+		key_pattern: Some("{type}:{subject}:{issuer}".to_string()), // One subscription per user per action
+	}
+}
+
 /// FSHR - File share action
 fn fileshare_definition() -> ActionDefinition {
 	ActionDefinition {
@@ -735,6 +922,197 @@ fn fileshare_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{subject}:{audience}".to_string()),
+	}
+}
+
+/// CONV - Conversation container action
+/// Groups messages and enables subscription-based access control
+fn conv_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "CONV".to_string(),
+		version: "1.0".to_string(),
+		description: "Create a conversation for group messaging".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("communication".to_string()),
+			tags: Some(vec![
+				"conversation".to_string(),
+				"group".to_string(),
+				"messaging".to_string(),
+			]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: Some({
+			let mut map = HashMap::new();
+			map.insert("UPD".to_string(), "Update conversation settings".to_string());
+			map.insert("DEL".to_string(), "Archive/delete conversation".to_string());
+			map
+		}),
+		fields: FieldConstraints {
+			content: Some(FieldConstraint::Required), // name, description
+			audience: None, // Optional: community conversations have community as audience
+			parent: Some(FieldConstraint::Forbidden),
+			attachments: None,                         // Optional cover image
+			subject: Some(FieldConstraint::Forbidden), // CONV is the root
+		},
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Object,
+				min_length: None,
+				max_length: None,
+				pattern: None,
+				r#enum: None,
+				properties: Some({
+					let mut props = HashMap::new();
+					// Conversation name (required)
+					props.insert(
+						"name".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: Some(1),
+							max_length: Some(100),
+							r#enum: None,
+							items: None,
+						},
+					);
+					// Optional description
+					props.insert(
+						"description".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(500),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props
+				}),
+				required: Some(vec!["name".to_string()]),
+				description: Some(
+					"Conversation settings with name and optional description".to_string(),
+				),
+			}),
+		}),
+		behavior: BehaviorFlags {
+			broadcast: Some(false),
+			allow_unknown: Some(false),
+			requires_acceptance: Some(false),
+			requires_subscription: Some(false), // Creating CONV doesn't require subscription
+			default_flags: Some("rco".to_string()), // Default: closed, no reactions/comments on CONV itself
+			subscribable: Some(true),           // CONV can have SUBS pointing to it
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None, // Native hook creates admin SUBS
+			on_receive: HookImplementation::None,
+			on_accept: HookImplementation::None,
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("any".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(false),
+		}),
+		key_pattern: None, // Each conversation is unique
+	}
+}
+
+/// INVT - Invitation to subscribe to an action
+/// Used to invite users to conversations, channels, or other subscribable content
+fn invt_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "INVT".to_string(),
+		version: "1.0".to_string(),
+		description: "Invite a user to subscribe to an action".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("invitation".to_string()),
+			tags: Some(vec![
+				"invite".to_string(),
+				"subscription".to_string(),
+				"conversation".to_string(),
+			]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: Some({
+			let mut map = HashMap::new();
+			map.insert("DEL".to_string(), "Revoke invitation".to_string());
+			map
+		}),
+		fields: FieldConstraints {
+			content: None,                             // Optional invitation message, role
+			audience: Some(FieldConstraint::Required), // Who is being invited
+			parent: Some(FieldConstraint::Forbidden),
+			attachments: Some(FieldConstraint::Forbidden),
+			subject: Some(FieldConstraint::Required), // The action being invited to (e.g., CONV action_id)
+		},
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Object,
+				min_length: None,
+				max_length: None,
+				pattern: None,
+				r#enum: None,
+				properties: Some({
+					let mut props = HashMap::new();
+					// Assigned role for the invitee
+					props.insert(
+						"role".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(20),
+							r#enum: Some(vec![
+								serde_json::Value::String("observer".to_string()),
+								serde_json::Value::String("member".to_string()),
+								serde_json::Value::String("moderator".to_string()),
+								serde_json::Value::String("admin".to_string()),
+							]),
+							items: None,
+						},
+					);
+					// Optional message
+					props.insert(
+						"message".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(500),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props
+				}),
+				required: None,
+				description: Some("Invitation content with optional role and message".to_string()),
+			}),
+		}),
+		behavior: BehaviorFlags {
+			broadcast: Some(false),
+			allow_unknown: Some(false),       // Only send to known profiles
+			requires_acceptance: Some(false), // Doesn't require user to accept INVT itself
+			// Note: Subscription check is done by on_create hook on sender side, not on receiver
+			requires_subscription: Some(false),
+			deliver_subject: Some(true), // Deliver the target action (CONV) with the invitation
+			deliver_to_subject_owner: Some(true), // Also deliver to CONV home for SUBS validation
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None, // Native hook validates inviter permission
+			on_receive: HookImplementation::None, // Native hook sends notification
+			on_accept: HookImplementation::None,
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("any".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(false),
+		}),
+		key_pattern: Some("{type}:{subject}:{audience}".to_string()), // One invitation per user per action
 	}
 }
 

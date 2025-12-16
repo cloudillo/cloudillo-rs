@@ -130,7 +130,7 @@ async fn load_action_attrs(
 			Ok(profiles) => {
 				if let Some(profile) = profiles.first() {
 					let following = profile.following;
-					let connected = profile.connected;
+					let connected = profile.connected.is_connected();
 					debug!(
 						subject = subject_id_tag,
 						issuer = %action_view.issuer.id_tag,
