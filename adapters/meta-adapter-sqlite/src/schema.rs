@@ -293,11 +293,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	)
 	.execute(&mut *tx)
 	.await?;
-	sqlx::query(
-			"CREATE INDEX IF NOT EXISTS idx_actions_subject_role ON actions(subject, json_extract(x, '$.role')) WHERE type = 'SUBS'",
-		)
-		.execute(&mut *tx)
-		.await?;
+	// Note: idx_actions_subject_role is created in migration 6 after the x column is added
+	// Do NOT add it here as it would fail for existing databases being migrated
 
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS action_tokens (
@@ -602,6 +599,14 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 
 	// Fresh database: skip migrations (schema already has all columns)
 	if version == 0 {
+		// Create indexes that depend on columns added in migrations
+		// For existing databases, these indexes are created in the respective migrations
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_actions_subject_role ON actions(subject, json_extract(x, '$.role')) WHERE type = 'SUBS'",
+		)
+		.execute(&mut *tx)
+		.await?;
+
 		set_db_version(&mut tx, CURRENT_DB_VERSION).await;
 		version = CURRENT_DB_VERSION;
 	}
