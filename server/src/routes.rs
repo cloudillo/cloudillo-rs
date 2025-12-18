@@ -22,6 +22,7 @@ use crate::admin;
 use crate::auth;
 use crate::collection;
 use crate::core::acme;
+use crate::core::create_perm::check_perm_create;
 use crate::core::middleware::{optional_auth, request_id_middleware, require_auth};
 use crate::core::rate_limit::RateLimitLayer;
 use crate::core::websocket;
@@ -42,10 +43,15 @@ fn init_protected_routes(app: App) -> Router<App> {
 	// --- Permission-Checked Routes (ABAC) ---
 	// These routes use attribute-based access control beyond basic auth
 
+	// Action create routes (check_perm_create for quota/tier checking)
+	let action_router_create = Router::new()
+		.route("/api/actions", post(action::handler::post_action))
+		.layer(middleware::from_fn_with_state(app.clone(), check_perm_create("action", "create")));
+
 	// Action write routes (check_perm_action("write"))
+	// Note: PATCH removed - actions are immutable federated content (signed JWTs)
 	let action_router_write = Router::new()
 		.route("/api/actions/{action_id}/stat", post(action::handler::post_action_stat))
-		.route("/api/actions/{action_id}", patch(action::handler::patch_action))
 		.route("/api/actions/{action_id}", delete(action::handler::delete_action))
 		.route("/api/actions/{action_id}/accept", post(action::handler::post_action_accept))
 		.route("/api/actions/{action_id}/reject", post(action::handler::post_action_reject))
@@ -75,6 +81,12 @@ fn init_protected_routes(app: App) -> Router<App> {
 			post(admin::tenant::send_password_reset),
 		)
 		.layer(middleware::from_fn_with_state(app.clone(), admin::perm::require_admin));
+
+	// File create routes (check_perm_create for quota/tier checking)
+	let file_router_create = Router::new()
+		.route("/api/files", post(file::handler::post_file))
+		.route("/api/files/{preset}/{file_name}", post(file::handler::post_file_blob))
+		.layer(middleware::from_fn_with_state(app.clone(), check_perm_create("file", "create")));
 
 	// File write routes (check_perm_file("write"))
 	let file_router_write = Router::new()
@@ -128,8 +140,8 @@ fn init_protected_routes(app: App) -> Router<App> {
 		// --- Community Profile Creation ---
 		.route("/api/profiles/{id_tag}", put(profile::community::put_community_profile))
 
-		// --- Action API (Write) ---
-		.route("/api/actions", post(action::handler::post_action))
+		// --- Action API (Create + Write) ---
+		.merge(action_router_create)
 		.merge(action_router_write)
 
 		// --- Profile API (Permission-Checked) ---
@@ -139,10 +151,8 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.merge(profile_router_admin)
 		.merge(admin_tenant_router)
 
-		// --- File API (Write) ---
-		// File creation routes - permission controlled at quota/limits level
-		.route("/api/files", post(file::handler::post_file))
-		.route("/api/files/{preset}/{file_name}", post(file::handler::post_file_blob))
+		// --- File API (Create + Write) ---
+		.merge(file_router_create)
 		.merge(file_router_write)
 
 		// --- Tag API ---

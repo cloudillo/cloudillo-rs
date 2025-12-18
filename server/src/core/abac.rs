@@ -53,18 +53,6 @@ impl VisibilityLevel {
 		}
 	}
 
-	/// Convert to database char value
-	pub fn to_char(self) -> Option<char> {
-		match self {
-			Self::Public => Some('P'),
-			Self::Verified => Some('V'),
-			Self::SecondDegree => Some('2'),
-			Self::Follower => Some('F'),
-			Self::Connected => Some('C'),
-			Self::Direct => None,
-		}
-	}
-
 	/// Convert to string for attribute lookup
 	pub fn as_str(&self) -> &'static str {
 		match self {
@@ -526,9 +514,9 @@ impl PermissionChecker {
 				"public" | "P" => VisibilityLevel::Public,
 				"verified" | "V" => VisibilityLevel::Verified,
 				"second_degree" | "2" => VisibilityLevel::SecondDegree,
-				"follower" | "followers" | "F" => VisibilityLevel::Follower,
+				"follower" | "F" => VisibilityLevel::Follower,
 				"connected" | "C" => VisibilityLevel::Connected,
-				"direct" | "private" | "D" => VisibilityLevel::Direct,
+				"direct" => VisibilityLevel::Direct,
 				_ => VisibilityLevel::Direct, // Unknown = Direct (secure by default)
 			}
 		} else {

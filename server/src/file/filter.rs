@@ -3,10 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-	core::abac::can_view_item,
-	core::file_access,
-	meta_adapter::{FileView, ListProfileOptions},
-	prelude::*,
+	core::abac::can_view_item, core::file_access, meta_adapter::FileView, prelude::*,
 	types::AccessLevel,
 };
 
@@ -103,6 +100,7 @@ pub async fn filter_files_by_visibility(
 /// Load relationship status between subject and multiple targets
 ///
 /// Returns a map of target_id_tag -> (following, connected)
+/// Uses batch query to avoid N+1 problem
 async fn load_relationships(
 	app: &App,
 	tn_id: TnId,
@@ -114,25 +112,11 @@ async fn load_relationships(
 		return Ok(HashMap::new());
 	}
 
-	let mut result = HashMap::new();
+	// Convert HashSet to Vec for batch query
+	let targets: Vec<&str> = target_id_tags.iter().copied().collect();
 
-	// Query profiles for relationship status
-	// Note: This could be optimized with a batch query in the future
-	for target_tag in target_id_tags {
-		let opts =
-			ListProfileOptions { id_tag: Some((*target_tag).to_string()), ..Default::default() };
-
-		if let Ok(profiles) = app.meta_adapter.list_profiles(tn_id, &opts).await {
-			if let Some(profile) = profiles.first() {
-				result.insert(
-					(*target_tag).to_string(),
-					(profile.following, profile.connected.is_connected()),
-				);
-			}
-		}
-	}
-
-	Ok(result)
+	// Single batch query instead of N+1 queries
+	app.meta_adapter.get_relationships(tn_id, &targets).await
 }
 
 // vim: ts=4

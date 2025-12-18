@@ -54,6 +54,11 @@ static CRDT_DOCS: std::sync::LazyLock<CrdtDocRegistry> =
 /// The `read_only` parameter controls whether this connection can send updates.
 /// Read-only connections can receive sync messages and awareness updates,
 /// but their Update messages will be rejected.
+///
+/// SECURITY TODO: Access level is checked once at connection time but not re-validated.
+/// If a user's access is revoked (e.g., FSHR action deleted), they keep their original
+/// access level until reconnection. Consider adding periodic re-validation (every 30s
+/// or 100 messages) to enforce access revocation mid-session.
 pub async fn handle_crdt_connection(
 	ws: WebSocket,
 	user_id: String,

@@ -262,26 +262,6 @@ pub async fn get_action_by_id(
 	}
 }
 
-/// PATCH /api/actions/:action_id - Update action (if not yet federated)
-pub async fn patch_action(
-	State(app): State<App>,
-	_tn_id: TnId,
-	Path(_action_id): Path<String>,
-	OptionalRequestId(_req_id): OptionalRequestId,
-	Json(_patch): Json<types::Patch<serde_json::Value>>,
-) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
-	// Check action federation status - only allow updates if status is "draft"
-	let action = app.meta_adapter.get_action(_tn_id, &_action_id).await?;
-
-	let _action = action.ok_or(Error::NotFound)?;
-
-	// For now, return placeholder. Full implementation would:
-	// 1. Update content/attachments
-	// 2. Return updated action
-
-	Err(Error::ServiceUnavailable("action updates not yet implemented".into()))
-}
-
 /// DELETE /api/actions/:action_id - Delete action
 pub async fn delete_action(
 	State(app): State<App>,

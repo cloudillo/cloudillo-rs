@@ -1,7 +1,6 @@
 //! Shared helper functions for action processing
 
 use std::convert::Infallible;
-use std::fmt;
 use std::str::FromStr;
 
 use crate::meta_adapter::MetaAdapter;
@@ -129,36 +128,6 @@ pub fn can_comment(flags: Option<&str>) -> bool {
 /// Returns true if 'O' is present in flags, false otherwise
 pub fn is_open(flags: Option<&str>) -> bool {
 	flags.map(|f| f.contains('O')).unwrap_or(false)
-}
-
-/// Parse flags string and return individual flag states
-pub struct ActionFlags {
-	pub reactions_allowed: bool,
-	pub comments_allowed: bool,
-	pub is_open: bool,
-}
-
-impl ActionFlags {
-	/// Parse flags string into structured format
-	pub fn parse(flags: Option<&str>) -> Self {
-		Self {
-			reactions_allowed: can_react(flags),
-			comments_allowed: can_comment(flags),
-			is_open: is_open(flags),
-		}
-	}
-}
-
-impl fmt::Display for ActionFlags {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(
-			f,
-			"{}{}{}",
-			if self.reactions_allowed { 'R' } else { 'r' },
-			if self.comments_allowed { 'C' } else { 'c' },
-			if self.is_open { 'O' } else { 'o' }
-		)
-	}
 }
 
 // =============================================================================
@@ -389,20 +358,6 @@ mod tests {
 	fn test_is_open_lowercase() {
 		assert!(!is_open(Some("RCo")));
 		assert!(!is_open(Some("rc")));
-	}
-
-	#[test]
-	fn test_action_flags_parse() {
-		let flags = ActionFlags::parse(Some("RCo"));
-		assert!(flags.reactions_allowed);
-		assert!(flags.comments_allowed);
-		assert!(!flags.is_open);
-	}
-
-	#[test]
-	fn test_action_flags_to_string() {
-		let flags = ActionFlags { reactions_allowed: true, comments_allowed: false, is_open: true };
-		assert_eq!(flags.to_string(), "RcO");
 	}
 
 	// Role-based permission tests

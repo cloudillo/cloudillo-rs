@@ -160,7 +160,7 @@ async fn load_action_attrs(
 	Ok(ActionAttrs {
 		typ: action_view.typ,
 		sub_typ: action_view.sub_typ,
-		owner_id_tag: tenant_id_tag.into(), // Tenant owns actions on their instance
+		tenant_id_tag: tenant_id_tag.into(),
 		issuer_id_tag: action_view.issuer.id_tag,
 		parent_id: action_view.parent_id,
 		root_id: action_view.root_id,

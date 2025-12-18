@@ -548,6 +548,56 @@ impl AccessLevel {
 	}
 }
 
+/// Token scope for scoped access tokens (e.g., share links)
+///
+/// Format in JWT: "file:{file_id}:{R|W}"
+/// This enum provides type-safe parsing instead of manual string splitting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenScope {
+	/// File-scoped access with specific access level
+	File { file_id: String, access: AccessLevel },
+}
+
+impl TokenScope {
+	/// Parse a scope string into a typed TokenScope
+	///
+	/// Supported formats:
+	/// - "file:{file_id}:R" -> File scope with Read access
+	/// - "file:{file_id}:W" -> File scope with Write access
+	pub fn parse(s: &str) -> Option<Self> {
+		let parts: Vec<&str> = s.split(':').collect();
+		if parts.len() >= 3 && parts[0] == "file" {
+			let access = match parts[2] {
+				"W" => AccessLevel::Write,
+				_ => AccessLevel::Read, // "R" or any other value defaults to Read
+			};
+			return Some(Self::File { file_id: parts[1].to_string(), access });
+		}
+		None
+	}
+
+	/// Get file ID if this is a file scope
+	pub fn file_id(&self) -> Option<&str> {
+		match self {
+			Self::File { file_id, .. } => Some(file_id),
+		}
+	}
+
+	/// Get access level if this is a file scope
+	pub fn file_access(&self) -> Option<AccessLevel> {
+		match self {
+			Self::File { access, .. } => Some(*access),
+		}
+	}
+
+	/// Check if scope matches a specific file
+	pub fn matches_file(&self, target_file_id: &str) -> bool {
+		match self {
+			Self::File { file_id, .. } => file_id == target_file_id,
+		}
+	}
+}
+
 /// Profile attributes for ABAC
 #[derive(Debug, Clone)]
 pub struct ProfileAttrs {
@@ -588,8 +638,8 @@ impl AttrSet for ProfileAttrs {
 pub struct ActionAttrs {
 	pub typ: Box<str>,
 	pub sub_typ: Option<Box<str>>,
-	/// The tenant who owns this action (the instance where it's stored)
-	pub owner_id_tag: Box<str>,
+	/// The tenant/instance where this action is stored (NOT the creator - see issuer_id_tag)
+	pub tenant_id_tag: Box<str>,
 	/// The original creator/sender of the action
 	pub issuer_id_tag: Box<str>,
 	pub parent_id: Option<Box<str>>,
@@ -608,7 +658,8 @@ impl AttrSet for ActionAttrs {
 		match key {
 			"type" => Some(&self.typ),
 			"sub_type" => self.sub_typ.as_deref(),
-			"owner_id_tag" => Some(&self.owner_id_tag),
+			// Support both old and new names for backward compat with ABAC rules
+			"tenant_id_tag" | "owner_id_tag" => Some(&self.tenant_id_tag),
 			"issuer_id_tag" => Some(&self.issuer_id_tag),
 			"parent_id" => self.parent_id.as_deref(),
 			"root_id" => self.root_id.as_deref(),

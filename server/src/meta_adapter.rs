@@ -656,6 +656,18 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		opts: &ListProfileOptions,
 	) -> ClResult<Vec<Profile<Box<str>>>>;
 
+	/// Get relationships between the current user and multiple target profiles
+	///
+	/// Efficiently queries relationship status (following, connected) for multiple profiles
+	/// in a single database call, avoiding N+1 query patterns.
+	///
+	/// Returns: HashMap<target_id_tag, (following: bool, connected: bool)>
+	async fn get_relationships(
+		&self,
+		tn_id: TnId,
+		target_id_tags: &[&str],
+	) -> ClResult<HashMap<String, (bool, bool)>>;
+
 	/// Reads a profile
 	///
 	/// Returns an `(etag, Profile)` tuple.

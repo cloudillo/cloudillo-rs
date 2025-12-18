@@ -167,6 +167,54 @@ pub(crate) async fn list(
 	}))
 }
 
+/// Get relationships for multiple target profiles in a single query
+///
+/// Returns a HashMap of target_id_tag -> (following, connected)
+pub(crate) async fn get_relationships(
+	db: &SqlitePool,
+	tn_id: TnId,
+	target_id_tags: &[&str],
+) -> ClResult<std::collections::HashMap<String, (bool, bool)>> {
+	use std::collections::HashMap;
+
+	if target_id_tags.is_empty() {
+		return Ok(HashMap::new());
+	}
+
+	// Build query with IN clause for batch lookup
+	let mut query =
+		sqlx::QueryBuilder::new("SELECT id_tag, following, connected FROM profiles WHERE tn_id=");
+	query.push_bind(tn_id.0);
+	query.push(" AND id_tag IN (");
+
+	for (i, id_tag) in target_id_tags.iter().enumerate() {
+		if i > 0 {
+			query.push(", ");
+		}
+		query.push_bind(*id_tag);
+	}
+	query.push(")");
+
+	let rows = query
+		.build()
+		.fetch_all(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+	let mut result = HashMap::with_capacity(rows.len());
+	for row in rows {
+		let id_tag: String = row.try_get("id_tag").map_err(|_| Error::DbError)?;
+		let following: bool = row.try_get("following").unwrap_or(false);
+		let connected_status =
+			parse_connected(&row).unwrap_or(ProfileConnectionStatus::Disconnected);
+		let connected = connected_status.is_connected();
+		result.insert(id_tag, (following, connected));
+	}
+
+	Ok(result)
+}
+
 /// Read a single profile by id_tag
 pub(crate) async fn read(
 	db: &SqlitePool,

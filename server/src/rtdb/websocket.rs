@@ -126,6 +126,11 @@ struct RtdbConnection {
 /// The `read_only` parameter controls whether this connection can execute transactions.
 /// Read-only connections can subscribe to changes and query data,
 /// but their transaction requests will be rejected.
+///
+/// SECURITY TODO: Access level is checked once at connection time but not re-validated.
+/// If a user's access is revoked (e.g., FSHR action deleted), they keep their original
+/// access level until reconnection. Consider adding periodic re-validation (every 30s
+/// or 100 messages) to enforce access revocation mid-session.
 pub async fn handle_rtdb_connection(
 	ws: WebSocket,
 	user_id: String,

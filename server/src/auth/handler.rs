@@ -185,14 +185,47 @@ pub async fn get_login_token(
 	}
 }
 
+/// Request body for logout endpoint
+#[derive(Deserialize, Default)]
+pub struct LogoutReq {
+	/// Optional API key to delete on logout (for "stay logged in" cleanup)
+	#[serde(rename = "apiKey")]
+	api_key: Option<String>,
+}
+
 /// POST /auth/logout - Invalidate current access token
 pub async fn post_logout(
-	State(_app): State<App>,
+	State(app): State<App>,
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
+	Json(req): Json<LogoutReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	// Note: Token invalidation could be implemented with a token blacklist table
 	// For now, tokens remain valid until expiration (short-lived access tokens)
+
+	// If API key provided, validate it belongs to this user and delete it
+	if let Some(ref api_key) = req.api_key {
+		match app.auth_adapter.validate_api_key(api_key).await {
+			Ok(validation) if validation.tn_id == auth.tn_id => {
+				if let Err(e) = app.auth_adapter.delete_api_key(auth.tn_id, validation.key_id).await
+				{
+					warn!("Failed to delete API key {} on logout: {:?}", validation.key_id, e);
+				} else {
+					info!(
+						"Deleted API key {} for user {} on logout",
+						validation.key_id, auth.id_tag
+					);
+				}
+			}
+			Ok(_) => {
+				warn!("API key provided at logout does not belong to user {}", auth.id_tag);
+			}
+			Err(e) => {
+				// Invalid/expired key, ignore silently (might already be deleted)
+				debug!("API key validation failed on logout: {:?}", e);
+			}
+		}
+	}
 
 	info!("User {} logged out", auth.id_tag);
 

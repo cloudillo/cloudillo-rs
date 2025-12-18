@@ -108,6 +108,14 @@ impl MetaAdapter for MetaAdapterSqlite {
 		profile::list(&self.dbr, tn_id, opts).await
 	}
 
+	async fn get_relationships(
+		&self,
+		tn_id: TnId,
+		target_id_tags: &[&str],
+	) -> ClResult<std::collections::HashMap<String, (bool, bool)>> {
+		profile::get_relationships(&self.dbr, tn_id, target_id_tags).await
+	}
+
 	async fn read_profile(
 		&self,
 		tn_id: TnId,

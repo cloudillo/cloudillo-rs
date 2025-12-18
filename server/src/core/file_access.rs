@@ -7,7 +7,7 @@
 
 use crate::meta_adapter::FileView;
 use crate::prelude::*;
-use crate::types::AccessLevel;
+use crate::types::{AccessLevel, TokenScope};
 
 /// Result of checking file access
 pub struct FileAccessResult {
@@ -79,22 +79,22 @@ pub async fn get_access_level_with_scope(
 	scope: Option<&str>,
 ) -> AccessLevel {
 	// Check scope-based access first (for share links)
-	if let Some(scope) = scope {
-		// Format: "file:{file_id}:{R|W}"
-		let parts: Vec<&str> = scope.split(':').collect();
-		if parts.len() >= 3 && parts[0] == "file" {
-			// Check if scope matches this file_id
-			if parts[1] == file_id {
-				return match parts[2] {
-					"W" => AccessLevel::Write,
-					_ => AccessLevel::Read,
-				};
+	if let Some(scope_str) = scope {
+		// Use typed TokenScope for safe parsing
+		if let Some(token_scope) = TokenScope::parse(scope_str) {
+			match &token_scope {
+				TokenScope::File { file_id: scope_file_id, access } => {
+					// Check if scope matches this file_id
+					if scope_file_id == file_id {
+						return *access;
+					}
+					// Scope exists for a different file - deny access to this file
+					// This prevents using a token scoped to file A to access file B
+					return AccessLevel::None;
+				}
 			}
-			// Scope exists for a different file - deny access to this file
-			// This prevents using a token scoped to file A to access file B
-			return AccessLevel::None;
 		}
-		// Non-file scope, fall through to normal access check
+		// Non-file scope or parse failure, fall through to normal access check
 	}
 
 	// Fall back to existing logic (ownership, FSHR actions)
@@ -105,21 +105,9 @@ pub async fn get_access_level_with_scope(
 ///
 /// This is the main helper for WebSocket handlers. It:
 /// 1. Loads file metadata
-/// 2. Determines access level
+/// 2. Determines access level (considering scoped tokens for share links)
 /// 3. Returns combined result or error
-pub async fn check_file_access(
-	app: &App,
-	tn_id: TnId,
-	file_id: &str,
-	user_id_tag: &str,
-	tenant_id_tag: &str,
-) -> Result<FileAccessResult, FileAccessError> {
-	check_file_access_with_scope(app, tn_id, file_id, user_id_tag, tenant_id_tag, None).await
-}
-
-/// Check file access with scoped token support
 ///
-/// Like check_file_access but also considers scoped tokens (e.g., share links).
 /// The scope parameter should be auth_ctx.scope.as_deref().
 pub async fn check_file_access_with_scope(
 	app: &App,
