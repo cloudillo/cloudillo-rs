@@ -184,6 +184,67 @@ pub async fn empty_trash(
 	Ok(Json(EmptyTrashResponse { deleted_count }))
 }
 
+/// PATCH /file/:fileId/user - Update user-specific file data (pinned/starred)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchFileUserDataRequest {
+	/// Pin file for quick access
+	pub pinned: Option<bool>,
+	/// Star/favorite file
+	pub starred: Option<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchFileUserDataResponse {
+	#[serde(rename = "fileId")]
+	pub file_id: String,
+	#[serde(
+		serialize_with = "crate::types::serialize_timestamp_iso_opt",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub accessed_at: Option<crate::types::Timestamp>,
+	#[serde(
+		serialize_with = "crate::types::serialize_timestamp_iso_opt",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub modified_at: Option<crate::types::Timestamp>,
+	pub pinned: bool,
+	pub starred: bool,
+}
+
+pub async fn patch_file_user_data(
+	State(app): State<App>,
+	Auth(auth): Auth,
+	Path(file_id): Path<String>,
+	Json(req): Json<PatchFileUserDataRequest>,
+) -> ClResult<Json<PatchFileUserDataResponse>> {
+	// Check if file exists
+	let _file = app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or_else(|| {
+		warn!("patch_file_user_data: File {} not found", file_id);
+		Error::NotFound
+	})?;
+
+	// Update user-specific data
+	let user_data = app
+		.meta_adapter
+		.update_file_user_data(auth.tn_id, &auth.id_tag, &file_id, req.pinned, req.starred)
+		.await?;
+
+	info!(
+		"User {} updated file {} user data: pinned={}, starred={}",
+		auth.id_tag, file_id, user_data.pinned, user_data.starred
+	);
+
+	Ok(Json(PatchFileUserDataResponse {
+		file_id,
+		accessed_at: user_data.accessed_at,
+		modified_at: user_data.modified_at,
+		pinned: user_data.pinned,
+		starred: user_data.starred,
+	}))
+}
+
 /// Upgrade file visibility to match target visibility (only if more permissive)
 ///
 /// This function is used when attaching files to posts. If a file has more

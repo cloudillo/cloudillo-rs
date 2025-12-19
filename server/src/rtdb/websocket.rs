@@ -20,9 +20,14 @@ use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Instant;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
+
+/// Throttle interval for access/modification tracking (60 seconds)
+const TRACKING_THROTTLE_SECS: u64 = 60;
 
 /// A message in the RTDB protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +111,6 @@ impl RtdbMessage {
 }
 
 /// RTDB connection tracking
-#[derive(Debug)]
 struct RtdbConnection {
 	user_id: String,
 	file_id: String,
@@ -119,6 +123,10 @@ struct RtdbConnection {
 	connected_at: u64,
 	/// Whether this connection is read-only (cannot execute transactions)
 	read_only: bool,
+	// User activity tracking state (throttled)
+	last_access_update: Mutex<Option<Instant>>,
+	last_modify_update: Mutex<Option<Instant>>,
+	has_modified: AtomicBool,
 }
 
 /// Handle an RTDB connection
@@ -149,7 +157,13 @@ pub async fn handle_rtdb_connection(
 		tn_id,
 		connected_at: now_timestamp(),
 		read_only,
+		last_access_update: Mutex::new(None),
+		last_modify_update: Mutex::new(None),
+		has_modified: AtomicBool::new(false),
 	});
+
+	// Record initial file access (throttled)
+	record_file_access_throttled(&app, &conn).await;
 
 	// Split WebSocket for concurrent read/write
 	let (ws_tx, ws_rx) = ws.split();
@@ -293,6 +307,9 @@ pub async fn handle_rtdb_connection(
 			debug!("Forward task ended");
 		}
 	}
+
+	// Record final file activity before closing
+	record_final_activity(&app, &conn).await;
 
 	heartbeat_task.abort();
 	info!("RTDB connection closed: {}", user_id);
@@ -521,6 +538,9 @@ async fn handle_rtdb_command(
 				);
 				drop(txn); // Explicitly drop to trigger commit via Drop implementation
 
+				// Record file modification (throttled)
+				record_file_modification_throttled(app, conn).await;
+
 				let mut result_map = serde_json::Map::new();
 				result_map.insert("results".to_string(), Value::Array(results));
 				RtdbMessage::response(msg.id.clone(), "transactionResult", result_map)
@@ -746,6 +766,84 @@ fn now_timestamp() -> u64 {
 		.duration_since(std::time::UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_secs()
+}
+
+/// Record file access with throttling (max once per TRACKING_THROTTLE_SECS)
+async fn record_file_access_throttled(app: &crate::core::app::App, conn: &RtdbConnection) {
+	let should_update = {
+		let mut last_update = conn.last_access_update.lock().await;
+		let now = Instant::now();
+		let should = match *last_update {
+			Some(last) => now.duration_since(last).as_secs() >= TRACKING_THROTTLE_SECS,
+			None => true,
+		};
+		if should {
+			*last_update = Some(now);
+		}
+		should
+	};
+
+	if should_update {
+		if let Err(e) = app
+			.meta_adapter
+			.record_file_access(conn.tn_id, &conn.user_id, &conn.file_id)
+			.await
+		{
+			debug!("Failed to record file access for file {}: {}", conn.file_id, e);
+		}
+	}
+}
+
+/// Record file modification with throttling (max once per TRACKING_THROTTLE_SECS)
+async fn record_file_modification_throttled(app: &crate::core::app::App, conn: &RtdbConnection) {
+	// Mark that this session has modifications
+	conn.has_modified.store(true, Ordering::Relaxed);
+
+	let should_update = {
+		let mut last_update = conn.last_modify_update.lock().await;
+		let now = Instant::now();
+		let should = match *last_update {
+			Some(last) => now.duration_since(last).as_secs() >= TRACKING_THROTTLE_SECS,
+			None => true,
+		};
+		if should {
+			*last_update = Some(now);
+		}
+		should
+	};
+
+	if should_update {
+		if let Err(e) = app
+			.meta_adapter
+			.record_file_modification(conn.tn_id, &conn.user_id, &conn.file_id)
+			.await
+		{
+			debug!("Failed to record file modification for file {}: {}", conn.file_id, e);
+		}
+	}
+}
+
+/// Record final access and modification on connection close
+async fn record_final_activity(app: &crate::core::app::App, conn: &RtdbConnection) {
+	// Always record final access time
+	if let Err(e) = app
+		.meta_adapter
+		.record_file_access(conn.tn_id, &conn.user_id, &conn.file_id)
+		.await
+	{
+		debug!("Failed to record final file access for file {}: {}", conn.file_id, e);
+	}
+
+	// Record final modification if any changes were made
+	if conn.has_modified.load(Ordering::Relaxed) {
+		if let Err(e) = app
+			.meta_adapter
+			.record_file_modification(conn.tn_id, &conn.user_id, &conn.file_id)
+			.await
+		{
+			debug!("Failed to record final file modification for file {}: {}", conn.file_id, e);
+		}
+	}
 }
 
 // vim: ts=4

@@ -23,22 +23,38 @@ pub(crate) async fn list(
 	tn_id: TnId,
 	opts: &ListFileOptions,
 ) -> ClResult<Vec<FileView>> {
-	// When collection filter is set, we JOIN with collections table
-	let has_collection = opts.collection.is_some();
+	// Check if we need user-specific data (JOIN with file_user_data)
+	let has_user = opts.user_id_tag.is_some();
+	let needs_user_join = has_user
+		&& (opts.pinned.is_some()
+			|| opts.starred.is_some()
+			|| matches!(opts.sort.as_deref(), Some("recent" | "modified")));
 
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT f.f_id, f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
-		        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
-		 FROM files f
+		"SELECT f.f_id, f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+		        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic",
+	);
+
+	// Add user data columns if user is authenticated
+	if has_user {
+		query.push(", fud.accessed_at as fud_accessed_at, fud.modified_at as fud_modified_at, fud.pinned as fud_pinned, fud.starred as fud_starred");
+	}
+
+	query.push(
+		" FROM files f
 		 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag",
 	);
 
-	// Add collection JOIN if needed
-	if let Some(coll_type) = &opts.collection {
-		query.push(
-			" INNER JOIN collections c ON c.tn_id=f.tn_id AND c.item_id=f.file_id AND c.coll_type=",
-		);
-		query.push_bind(coll_type.as_str());
+	// Add file_user_data JOIN if needed for filtering/sorting or to include user data
+	if has_user {
+		if needs_user_join && (opts.pinned == Some(true) || opts.starred == Some(true)) {
+			// INNER JOIN when filtering by pinned/starred (must have the data)
+			query.push(" INNER JOIN file_user_data fud ON fud.tn_id=f.tn_id AND fud.f_id=f.f_id AND fud.id_tag=");
+		} else {
+			// LEFT JOIN to include user data when available
+			query.push(" LEFT JOIN file_user_data fud ON fud.tn_id=f.tn_id AND fud.f_id=f.f_id AND fud.id_tag=");
+		}
+		query.push_bind(opts.user_id_tag.as_deref().unwrap_or(""));
 	}
 
 	query.push(" WHERE f.tn_id=");
@@ -96,12 +112,51 @@ pub(crate) async fn list(
 		query.push(" AND f.status != 'D'");
 	}
 
-	// Order by collection updated_at when filtering by collection, otherwise by file created_at
-	if has_collection {
-		query.push(" ORDER BY c.updated_at DESC LIMIT ");
-	} else {
-		query.push(" ORDER BY f.created_at DESC LIMIT ");
+	// Filter by pinned/starred (user-specific)
+	if opts.pinned == Some(true) {
+		query.push(" AND fud.pinned = 1");
 	}
+	if opts.starred == Some(true) {
+		query.push(" AND fud.starred = 1");
+	}
+
+	// Determine sort order
+	let sort_dir = match opts.sort_dir.as_deref() {
+		Some("asc") => "ASC",
+		Some("desc") => "DESC",
+		_ => match opts.sort.as_deref() {
+			Some("name") => "ASC",
+			_ => "DESC", // Default DESC for date-based sorts
+		},
+	};
+
+	match opts.sort.as_deref() {
+		Some("recent") if has_user => {
+			// Sort by user's access time (NULLs last)
+			query.push(
+				" ORDER BY CASE WHEN fud.accessed_at IS NULL THEN 1 ELSE 0 END, fud.accessed_at ",
+			);
+			query.push(sort_dir);
+		}
+		Some("modified") if has_user => {
+			// Sort by user's modification time (NULLs last)
+			query.push(
+				" ORDER BY CASE WHEN fud.modified_at IS NULL THEN 1 ELSE 0 END, fud.modified_at ",
+			);
+			query.push(sort_dir);
+		}
+		Some("name") => {
+			query.push(" ORDER BY f.file_name ");
+			query.push(sort_dir);
+		}
+		_ => {
+			// Default (including "created"): sort by file creation time
+			query.push(" ORDER BY f.created_at ");
+			query.push(sort_dir);
+		}
+	}
+
+	query.push(" LIMIT ");
 	query.push_bind(opts._limit.unwrap_or(100) as i64);
 
 	let res = query
@@ -145,6 +200,36 @@ pub(crate) async fn list(
 		let file_id: Option<Box<str>> = row.try_get("file_id").ok().flatten();
 		let file_id = file_id.unwrap_or_else(|| format!("@{}", f_id).into());
 
+		// Build user data if available
+		let user_data = if has_user {
+			let accessed_at: Option<i64> = row.try_get("fud_accessed_at").ok().flatten();
+			let modified_at: Option<i64> = row.try_get("fud_modified_at").ok().flatten();
+			let pinned: Option<i64> = row.try_get("fud_pinned").ok().flatten();
+			let starred: Option<i64> = row.try_get("fud_starred").ok().flatten();
+
+			// Only include user_data if there's at least some data
+			if accessed_at.is_some()
+				|| modified_at.is_some()
+				|| pinned.is_some()
+				|| starred.is_some()
+			{
+				Some(FileUserData {
+					accessed_at: accessed_at.map(Timestamp),
+					modified_at: modified_at.map(Timestamp),
+					pinned: pinned.unwrap_or(0) != 0,
+					starred: starred.unwrap_or(0) != 0,
+				})
+			} else {
+				None
+			}
+		} else {
+			None
+		};
+
+		// Global file activity timestamps
+		let accessed_at: Option<i64> = row.try_get("accessed_at").ok().flatten();
+		let modified_at: Option<i64> = row.try_get("modified_at").ok().flatten();
+
 		Ok(FileView {
 			file_id,
 			parent_id: row.try_get("parent_id").ok(),
@@ -154,10 +239,13 @@ pub(crate) async fn list(
 			file_name: row.try_get("file_name")?,
 			file_tp: row.try_get("file_tp")?,
 			created_at: row.try_get("created_at").map(Timestamp)?,
+			accessed_at: accessed_at.map(Timestamp),
+			modified_at: modified_at.map(Timestamp),
 			status,
 			tags,
 			visibility,
 			access_level: None, // Computed later by filter_files_by_visibility
+			user_data,
 		})
 	}))
 }
@@ -721,7 +809,7 @@ pub(crate) async fn read(
 			.parse::<i64>()
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
 			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
@@ -736,7 +824,7 @@ pub(crate) async fn read(
 	} else {
 		// Content-addressable ID - query by file_id
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
 			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
@@ -786,6 +874,10 @@ pub(crate) async fn read(
 			let visibility: Option<String> = row.try_get("visibility").ok();
 			let visibility = visibility.and_then(|s| s.chars().next());
 
+			// Global file activity timestamps
+			let accessed_at: Option<i64> = row.try_get("accessed_at").ok().flatten();
+			let modified_at: Option<i64> = row.try_get("modified_at").ok().flatten();
+
 			Ok(Some(FileView {
 				file_id: row.try_get("file_id").map_err(|_| Error::DbError)?,
 				parent_id: row.try_get("parent_id").ok(),
@@ -798,10 +890,13 @@ pub(crate) async fn read(
 					.try_get::<i64, _>("created_at")
 					.map(Timestamp)
 					.map_err(|_| Error::DbError)?,
+				accessed_at: accessed_at.map(Timestamp),
+				modified_at: modified_at.map(Timestamp),
 				status,
 				tags,
 				visibility,
 				access_level: None, // Computed later by filter_files_by_visibility
+				user_data: None,    // Not fetched in single-file read
 			}))
 		}
 	}

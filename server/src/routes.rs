@@ -98,6 +98,11 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/trash", delete(file::management::empty_trash))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("write")));
 
+	// File user data routes (authentication only, no file write permission needed)
+	// Users can pin/star any file they have read access to
+	let file_user_router = Router::new()
+		.route("/api/files/{file_id}/user", patch(file::management::patch_file_user_data));
+
 	// --- Standard Protected Routes ---
 	// These routes only require authentication, no additional permission checks
 
@@ -151,9 +156,10 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.merge(profile_router_admin)
 		.merge(admin_tenant_router)
 
-		// --- File API (Create + Write) ---
+		// --- File API (Create + Write + User Data) ---
 		.merge(file_router_create)
 		.merge(file_router_write)
+		.merge(file_user_router)
 
 		// --- Tag API ---
 		.route("/api/tags", get(file::tag::list_tags))

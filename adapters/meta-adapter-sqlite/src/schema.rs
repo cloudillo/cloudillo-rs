@@ -44,7 +44,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	let mut version = get_db_version(&mut tx).await;
 
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 6;
+	const CURRENT_DB_VERSION: i64 = 7;
 
 	// Schema creation - safe to run every time (uses IF NOT EXISTS)
 	// New tables, indexes, triggers are added here
@@ -167,6 +167,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			visibility char(1),			-- NULL: Direct (owner only), P: Public, V: Verified,
 										-- 2: 2nd degree, F: Follower, C: Connected
 			parent_id text,				-- Folder hierarchy: references file_id of parent folder
+			accessed_at INTEGER,		-- Global: when anyone last accessed this file
+			modified_at INTEGER,		-- Global: when anyone last modified this file
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(f_id)
@@ -389,6 +391,46 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
+	// File user data (per-user file activity tracking)
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS file_user_data (
+			tn_id INTEGER NOT NULL,
+			id_tag TEXT NOT NULL,
+			f_id INTEGER NOT NULL,
+			accessed_at INTEGER,
+			modified_at INTEGER,
+			pinned INTEGER DEFAULT 0,
+			starred INTEGER DEFAULT 0,
+			created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+			updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+			PRIMARY KEY (tn_id, id_tag, f_id)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_fud_recent ON file_user_data(tn_id, id_tag, accessed_at DESC) \
+		WHERE accessed_at IS NOT NULL",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_fud_modified ON file_user_data(tn_id, id_tag, modified_at DESC) \
+		WHERE modified_at IS NOT NULL",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_fud_pinned ON file_user_data(tn_id, id_tag) WHERE pinned = 1",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_fud_starred ON file_user_data(tn_id, id_tag) WHERE starred = 1",
+	)
+	.execute(&mut *tx)
+	.await?;
+
 	// Triggers for automatic updated_at on INSERT
 	sqlx::query(
 		"CREATE TRIGGER IF NOT EXISTS vars_insert_at AFTER INSERT ON vars FOR EACH ROW \
@@ -489,6 +531,12 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query(
 			"CREATE TRIGGER IF NOT EXISTS collections_insert_at AFTER INSERT ON collections FOR EACH ROW \
 			BEGIN UPDATE collections SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND coll_type = NEW.coll_type AND item_id = NEW.item_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+	sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS file_user_data_insert_at AFTER INSERT ON file_user_data FOR EACH ROW \
+			BEGIN UPDATE file_user_data SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND id_tag = NEW.id_tag AND f_id = NEW.f_id; END",
 		)
 		.execute(&mut *tx)
 		.await?;
@@ -593,6 +641,12 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query(
 		"CREATE TRIGGER IF NOT EXISTS collections_updated_at AFTER UPDATE ON collections FOR EACH ROW \
 		BEGIN UPDATE collections SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND coll_type = NEW.coll_type AND item_id = NEW.item_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS file_user_data_updated_at AFTER UPDATE ON file_user_data FOR EACH ROW \
+		BEGIN UPDATE file_user_data SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND id_tag = NEW.id_tag AND f_id = NEW.f_id; END",
 	)
 	.execute(&mut *tx)
 	.await?;
@@ -758,8 +812,23 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, 6).await;
 	}
 
+	// Version 7: Add global activity timestamps to files table
+	// (file_user_data table is created in schema descriptor section above)
+	if version < 7 {
+		// Add global accessed_at and modified_at columns to files table
+		// These track when ANY user last accessed or modified the file
+		sqlx::query("ALTER TABLE files ADD COLUMN accessed_at INTEGER")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("ALTER TABLE files ADD COLUMN modified_at INTEGER")
+			.execute(&mut *tx)
+			.await?;
+
+		set_db_version(&mut tx, 7).await;
+	}
+
 	// Future migrations:
-	// if version < 7 { ... migration 7 ...; set_db_version(&mut tx, 7).await; }
+	// if version < 8 { ... migration 8 ...; set_db_version(&mut tx, 8).await; }
 
 	tx.commit().await?;
 

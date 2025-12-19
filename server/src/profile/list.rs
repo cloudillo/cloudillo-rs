@@ -66,19 +66,23 @@ pub async fn list_profiles(
 	let profiles_list = app.meta_adapter.list_profiles(tn_id, &opts).await?;
 
 	// Convert Profile to ProfileInfo
-	// Note: We don't have created_at in Profile, so we use 0 as placeholder
 	let profiles: Vec<ProfileInfo> = profiles_list
 		.into_iter()
 		.map(|p| ProfileInfo {
 			id_tag: p.id_tag.to_string(),
 			name: p.name.to_string(),
-			profile_type: match p.typ {
-				crate::meta_adapter::ProfileType::Person => "person",
-				crate::meta_adapter::ProfileType::Community => "community",
-			}
-			.to_string(),
+			profile_type: Some(
+				match p.typ {
+					crate::meta_adapter::ProfileType::Person => "person",
+					crate::meta_adapter::ProfileType::Community => "community",
+				}
+				.to_string(),
+			),
 			profile_pic: p.profile_pic.map(|s| s.to_string()),
-			created_at: crate::types::Timestamp::default(), // Not available in Profile type
+			status: None, // Not available in Profile type
+			connected: Some(p.connected.is_connected()),
+			following: Some(p.following),
+			created_at: None, // Not available in Profile type
 		})
 		.collect();
 

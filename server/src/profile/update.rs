@@ -34,9 +34,12 @@ pub async fn patch_own_profile(
 	let profile = ProfileInfo {
 		id_tag: profile_data.id_tag.to_string(),
 		name: profile_data.name.to_string(),
-		profile_type: profile_data.profile_type.to_string(),
+		profile_type: Some(profile_data.profile_type.to_string()),
 		profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
-		created_at: profile_data.created_at,
+		status: None,
+		connected: None,
+		following: None,
+		created_at: Some(profile_data.created_at),
 	};
 
 	info!("User {} updated their profile", auth.id_tag);
@@ -103,9 +106,12 @@ pub async fn patch_profile_admin(
 		let profile = ProfileInfo {
 			id_tag: profile_data.id_tag.to_string(),
 			name: profile_data.name.to_string(),
-			profile_type: profile_data.profile_type.to_string(),
+			profile_type: Some(profile_data.profile_type.to_string()),
 			profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
-			created_at: profile_data.created_at,
+			status: None,
+			connected: None,
+			following: None,
+			created_at: Some(profile_data.created_at),
 		};
 
 		info!("Admin {} updated profile {}", auth.id_tag, id_tag);

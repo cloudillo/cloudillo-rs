@@ -16,23 +16,33 @@ use futures::sink::SinkExt;
 use futures::stream::SplitSink;
 use futures::stream::StreamExt;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::Mutex;
 use yrs::sync::{Message as YMessage, SyncMessage};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Map, ReadTxn, Transact, Update};
 
+/// Throttle interval for access/modification tracking (60 seconds)
+const TRACKING_THROTTLE_SECS: u64 = 60;
+
 /// CRDT connection tracking
-#[derive(Debug)]
 struct CrdtConnection {
 	conn_id: String, // Unique connection ID (to distinguish multiple tabs from same user)
 	user_id: String,
 	doc_id: String,
+	tn_id: crate::types::TnId,
 	// Broadcast channel for awareness updates (conn_id, raw_awareness_data)
 	awareness_tx: Arc<tokio::sync::broadcast::Sender<(String, Vec<u8>)>>,
 	// Broadcast channel for sync updates (conn_id, raw_sync_data)
 	sync_tx: Arc<tokio::sync::broadcast::Sender<(String, Vec<u8>)>>,
 	connected_at: u64,
+	// User activity tracking state (throttled)
+	last_access_update: Mutex<Option<Instant>>,
+	last_modify_update: Mutex<Option<Instant>>,
+	has_modified: AtomicBool,
 }
 
 /// Document broadcast channels (awareness and sync)
@@ -88,10 +98,17 @@ pub async fn handle_crdt_connection(
 		conn_id: conn_id.clone(),
 		user_id: user_id.clone(),
 		doc_id: doc_id.clone(),
+		tn_id,
 		awareness_tx,
 		sync_tx,
 		connected_at: now_timestamp(),
+		last_access_update: Mutex::new(None),
+		last_modify_update: Mutex::new(None),
+		has_modified: AtomicBool::new(false),
 	});
+
+	// Record initial file access (throttled)
+	record_file_access_throttled(&app, &conn).await;
 
 	// Split WebSocket for concurrent operations
 	let (ws_tx, ws_rx) = ws.split();
@@ -123,6 +140,9 @@ pub async fn handle_crdt_connection(
 	// We don't need to select on all tasks - the ws_recv_task is the one that matters
 	let _ = ws_recv_task.await;
 	debug!("WebSocket receive task ended");
+
+	// Record final file activity before closing
+	record_final_activity(&app, &conn).await;
 
 	// Abort all other tasks to ensure cleanup
 	info!("CRDT connection closing for {}, aborting tasks...", user_id);
@@ -541,6 +561,8 @@ async fn handle_yrs_message(
 							conn.user_id,
 							data.len()
 						);
+						// Record file modification (throttled)
+						record_file_modification_throttled(app, conn).await;
 					}
 					Err(e) => {
 						warn!("❌ CRDT update FAILED to store for doc {} from user {}: {} - NOT broadcasting to prevent data loss", conn.doc_id, conn.user_id, e);
@@ -854,6 +876,84 @@ fn now_timestamp() -> u64 {
 		.duration_since(std::time::UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_secs()
+}
+
+/// Record file access with throttling (max once per TRACKING_THROTTLE_SECS)
+async fn record_file_access_throttled(app: &crate::core::app::App, conn: &CrdtConnection) {
+	let should_update = {
+		let mut last_update = conn.last_access_update.lock().await;
+		let now = Instant::now();
+		let should = match *last_update {
+			Some(last) => now.duration_since(last).as_secs() >= TRACKING_THROTTLE_SECS,
+			None => true,
+		};
+		if should {
+			*last_update = Some(now);
+		}
+		should
+	};
+
+	if should_update {
+		if let Err(e) = app
+			.meta_adapter
+			.record_file_access(conn.tn_id, &conn.user_id, &conn.doc_id)
+			.await
+		{
+			debug!("Failed to record file access for doc {}: {}", conn.doc_id, e);
+		}
+	}
+}
+
+/// Record file modification with throttling (max once per TRACKING_THROTTLE_SECS)
+async fn record_file_modification_throttled(app: &crate::core::app::App, conn: &CrdtConnection) {
+	// Mark that this session has modifications
+	conn.has_modified.store(true, Ordering::Relaxed);
+
+	let should_update = {
+		let mut last_update = conn.last_modify_update.lock().await;
+		let now = Instant::now();
+		let should = match *last_update {
+			Some(last) => now.duration_since(last).as_secs() >= TRACKING_THROTTLE_SECS,
+			None => true,
+		};
+		if should {
+			*last_update = Some(now);
+		}
+		should
+	};
+
+	if should_update {
+		if let Err(e) = app
+			.meta_adapter
+			.record_file_modification(conn.tn_id, &conn.user_id, &conn.doc_id)
+			.await
+		{
+			debug!("Failed to record file modification for doc {}: {}", conn.doc_id, e);
+		}
+	}
+}
+
+/// Record final access and modification on connection close
+async fn record_final_activity(app: &crate::core::app::App, conn: &CrdtConnection) {
+	// Always record final access time
+	if let Err(e) = app
+		.meta_adapter
+		.record_file_access(conn.tn_id, &conn.user_id, &conn.doc_id)
+		.await
+	{
+		debug!("Failed to record final file access for doc {}: {}", conn.doc_id, e);
+	}
+
+	// Record final modification if any changes were made
+	if conn.has_modified.load(Ordering::Relaxed) {
+		if let Err(e) = app
+			.meta_adapter
+			.record_file_modification(conn.tn_id, &conn.user_id, &conn.doc_id)
+			.await
+		{
+			debug!("Failed to record final file modification for doc {}: {}", conn.doc_id, e);
+		}
+	}
 }
 
 // vim: ts=4

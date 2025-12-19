@@ -399,6 +399,19 @@ pub enum FileStatus {
 	Deleted,
 }
 
+/// User-specific file metadata (access tracking, pinned/starred status)
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileUserData {
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	pub accessed_at: Option<Timestamp>,
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	pub modified_at: Option<Timestamp>,
+	pub pinned: bool,
+	pub starred: bool,
+}
+
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -412,10 +425,15 @@ pub struct FileView {
 	pub file_tp: Option<Box<str>>, // 'BLOB', 'CRDT', 'RTDB', 'FLDR'
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
+	#[serde(serialize_with = "crate::types::serialize_timestamp_iso_opt")]
+	pub accessed_at: Option<Timestamp>, // Global: when anyone last accessed
+	#[serde(serialize_with = "crate::types::serialize_timestamp_iso_opt")]
+	pub modified_at: Option<Timestamp>, // Global: when anyone last modified
 	pub status: FileStatus,
 	pub tags: Option<Vec<Box<str>>>,
 	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
 	pub access_level: Option<crate::types::AccessLevel>, // User's access level to this file (R/W)
+	pub user_data: Option<FileUserData>, // User-specific data (only when authenticated)
 }
 
 #[skip_serializing_none]
@@ -489,8 +507,18 @@ pub struct ListFileOptions {
 	pub status: Option<FileStatus>,
 	#[serde(rename = "fileTp")]
 	pub file_type: Option<String>,
-	/// Collection filter: 'FAVR', 'RCNT', 'BKMK', 'PIND'
-	pub collection: Option<String>,
+	/// Filter by pinned status (user-specific)
+	pub pinned: Option<bool>,
+	/// Filter by starred status (user-specific)
+	pub starred: Option<bool>,
+	/// Sort order: 'recent' (accessed_at), 'modified' (modified_at), 'name', 'created'
+	pub sort: Option<String>,
+	/// Sort direction: 'asc' or 'desc' (default: desc for dates, asc for name)
+	#[serde(rename = "sortDir")]
+	pub sort_dir: Option<String>,
+	/// User id_tag for user-specific data (set by handler, not from query)
+	#[serde(skip)]
+	pub user_id_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1007,6 +1035,38 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Read file metadata
 	async fn read_file(&self, tn_id: TnId, file_id: &str) -> ClResult<Option<FileView>>;
+
+	// File User Data (per-user file activity tracking)
+	//**************************************************
+
+	/// Record file access for a user (upserts record, updates accessed_at timestamp)
+	async fn record_file_access(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()>;
+
+	/// Record file modification for a user (upserts record, updates modified_at timestamp)
+	async fn record_file_modification(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		file_id: &str,
+	) -> ClResult<()>;
+
+	/// Update file user data (pinned/starred status)
+	async fn update_file_user_data(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		file_id: &str,
+		pinned: Option<bool>,
+		starred: Option<bool>,
+	) -> ClResult<FileUserData>;
+
+	/// Get file user data for a specific file
+	async fn get_file_user_data(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		file_id: &str,
+	) -> ClResult<Option<FileUserData>>;
 
 	// Push Subscription Management
 	//*****************************

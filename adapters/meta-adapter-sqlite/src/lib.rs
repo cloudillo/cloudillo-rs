@@ -3,6 +3,7 @@ use std::{path::Path, sync::Arc};
 mod action;
 mod collection;
 mod file;
+mod file_user_data;
 mod profile;
 mod push;
 mod reference;
@@ -540,6 +541,42 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn read_file(&self, tn_id: TnId, file_id: &str) -> ClResult<Option<FileView>> {
 		file::read(&self.dbr, tn_id, file_id).await
+	}
+
+	// File User Data (per-user file activity tracking)
+	//**************************************************
+
+	async fn record_file_access(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()> {
+		file_user_data::record_access(&self.db, tn_id, id_tag, file_id).await
+	}
+
+	async fn record_file_modification(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		file_id: &str,
+	) -> ClResult<()> {
+		file_user_data::record_modification(&self.db, tn_id, id_tag, file_id).await
+	}
+
+	async fn update_file_user_data(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		file_id: &str,
+		pinned: Option<bool>,
+		starred: Option<bool>,
+	) -> ClResult<FileUserData> {
+		file_user_data::update(&self.db, tn_id, id_tag, file_id, pinned, starred).await
+	}
+
+	async fn get_file_user_data(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		file_id: &str,
+	) -> ClResult<Option<FileUserData>> {
+		file_user_data::get(&self.dbr, tn_id, id_tag, file_id).await
 	}
 
 	// Push Subscription Management

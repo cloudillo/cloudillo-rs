@@ -120,17 +120,21 @@ pub async fn get_file_list(
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth): OptionalAuth,
-	Query(opts): Query<meta_adapter::ListFileOptions>,
+	Query(mut opts): Query<meta_adapter::ListFileOptions>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<meta_adapter::FileView>>>)> {
-	let files = app.meta_adapter.list_files(tn_id, &opts).await?;
-
-	// Filter files by visibility based on subject's access level
+	// Set user_id_tag for user-specific data (pinned, starred, sorting by recent/modified)
 	let (subject_id_tag, is_authenticated) = match &maybe_auth {
-		Some(auth) => (auth.id_tag.as_ref(), true),
+		Some(auth) => {
+			opts.user_id_tag = Some(auth.id_tag.to_string());
+			(auth.id_tag.as_ref(), true)
+		}
 		None => ("", false),
 	};
 
+	let files = app.meta_adapter.list_files(tn_id, &opts).await?;
+
+	// Filter files by visibility based on subject's access level
 	let filtered = filter::filter_files_by_visibility(
 		&app,
 		tn_id,

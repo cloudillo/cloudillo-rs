@@ -317,10 +317,17 @@ pub struct AdminProfilePatch {
 pub struct ProfileInfo {
 	pub id_tag: String,
 	pub name: String,
-	pub profile_type: String,
+	#[serde(rename = "type")]
+	pub profile_type: Option<String>,
 	pub profile_pic: Option<String>, // file_id
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
+	pub status: Option<String>,
+	pub connected: Option<bool>,
+	pub following: Option<bool>,
+	#[serde(
+		serialize_with = "serialize_timestamp_iso_opt",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub created_at: Option<Timestamp>,
 }
 
 /// Request body for community profile creation
