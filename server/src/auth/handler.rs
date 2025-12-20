@@ -11,7 +11,7 @@ use serde_with::skip_serializing_none;
 use std::net::SocketAddr;
 
 use crate::{
-	action::task,
+	action::{decode_jwt_no_verify, task},
 	auth_adapter::{self, ListTenantsOptions},
 	core::{
 		extract::{IdTag, OptionalAuth, OptionalRequestId},
@@ -344,17 +344,30 @@ pub async fn get_access_token(
 		);
 
 		// Fetch profile roles from meta adapter and expand them
-		let profile_roles = app
-			.meta_adapter
-			.read_profile_roles(tn_id, &auth_action.iss)
-			.await
-			.ok()
-			.flatten();
+		let profile_roles = match app.meta_adapter.read_profile_roles(tn_id, &auth_action.iss).await
+		{
+			Ok(roles) => {
+				info!(
+					"Found profile roles for {} in tn_id {:?}: {:?}",
+					auth_action.iss, tn_id, roles
+				);
+				roles
+			}
+			Err(e) => {
+				warn!(
+					"Failed to read profile roles for {} in tn_id {:?}: {}",
+					auth_action.iss, tn_id, e
+				);
+				None
+			}
+		};
 
 		let expanded_roles = profile_roles
 			.as_ref()
 			.map(|roles| expand_roles(roles))
 			.filter(|s| !s.is_empty());
+
+		info!("Expanded roles for access token: {:?}", expanded_roles);
 
 		let token_result = app
 			.auth_adapter
@@ -528,9 +541,12 @@ pub async fn get_access_token(
 /// Generate a proxy token for federation (allows this user to authenticate on behalf of the server)
 /// If `idTag` query parameter is provided and different from the current server, this will
 /// perform a federated token exchange with the target server.
+#[skip_serializing_none]
 #[derive(Serialize)]
 pub struct ProxyTokenRes {
 	token: String,
+	/// User's roles in this context (extracted from JWT for federated tokens)
+	roles: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -554,7 +570,25 @@ pub async fn get_proxy_token(
 			// Use federation flow: create action token and exchange at target
 			let token = app.request.create_proxy_token(auth.tn_id, target_id_tag, None).await?;
 
-			let response = ApiResponse::new(ProxyTokenRes { token: token.to_string() })
+			// Decode the JWT to extract the roles (r claim) for the frontend
+			#[derive(Deserialize)]
+			struct AccessTokenClaims {
+				r: Option<String>,
+			}
+
+			let roles: Option<Vec<String>> = match decode_jwt_no_verify::<AccessTokenClaims>(&token)
+			{
+				Ok(claims) => {
+					info!("Decoded federated token, roles claim: {:?}", claims.r);
+					claims.r.map(|r| r.split(',').map(String::from).collect())
+				}
+				Err(e) => {
+					warn!("Failed to decode federated token for roles: {:?}", e);
+					None
+				}
+			};
+
+			let response = ApiResponse::new(ProxyTokenRes { token: token.to_string(), roles })
 				.with_req_id(req_id.unwrap_or_default());
 			return Ok((StatusCode::OK, Json(response)));
 		}
@@ -567,7 +601,9 @@ pub async fn get_proxy_token(
 		.create_proxy_token(auth.tn_id, &auth.id_tag, &auth.roles)
 		.await?;
 
-	let response = ApiResponse::new(ProxyTokenRes { token: token.to_string() })
+	// Return roles alongside token for local context
+	let roles: Vec<String> = auth.roles.iter().map(|r| r.to_string()).collect();
+	let response = ApiResponse::new(ProxyTokenRes { token: token.to_string(), roles: Some(roles) })
 		.with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))

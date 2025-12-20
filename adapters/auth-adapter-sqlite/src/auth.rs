@@ -191,21 +191,22 @@ pub(crate) async fn create_access_token(
 	data: &AccessToken<&str>,
 	jwt_secret_str: &str,
 ) -> ClResult<Box<str>> {
-	let res = sqlx::query("SELECT tn_id, id_tag, password, roles FROM tenants WHERE tn_id = ?")
+	let res = sqlx::query("SELECT tn_id, id_tag FROM tenants WHERE tn_id = ?")
 		.bind(tn_id.0)
 		.fetch_one(db)
 		.await
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
-	let roles: Option<&str> = res.try_get("roles").or(Err(Error::DbError))?;
 	let id_tag: Box<str> = res.try_get("id_tag").or(Err(Error::DbError))?;
 
+	// Use roles from data parameter (user's roles in this context),
+	// NOT from tenants table (which is the tenant's system roles)
 	let access_token = AccessToken {
 		iss: id_tag,
 		sub: data.sub.map(Box::from),
 		scope: data.scope.map(Box::from),
-		r: roles.map(Box::from),
+		r: data.r.map(Box::from),
 		exp: data.exp,
 	};
 
