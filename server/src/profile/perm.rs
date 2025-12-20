@@ -83,7 +83,7 @@ async fn load_profile_attrs(
 
 			Ok(ProfileAttrs {
 				id_tag: profile_data.id_tag,
-				profile_type: profile_data.profile_type,
+				profile_type: profile_data.r#type,
 				tenant_tag: id_tag.into(), // tenant_tag refers to the profile owner
 				roles: vec![],             // TODO: Query actual roles from relationship metadata in Phase 4
 				status: "active".into(),   // TODO: Query actual profile status from MetaAdapter

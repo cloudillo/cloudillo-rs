@@ -290,7 +290,7 @@ pub async fn put_community_profile(
 	let response = CommunityProfileResponse {
 		id_tag: id_tag_lower,
 		name: display_name,
-		profile_type: "community".to_string(),
+		r#type: "community".to_string(),
 		profile_pic: req.profile_pic,
 		created_at: Timestamp::now(),
 	};

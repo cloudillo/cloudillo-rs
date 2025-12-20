@@ -22,7 +22,8 @@ const BATCH_SIZE: u32 = 100;
 pub struct RemoteProfile {
 	pub id_tag: String,
 	pub name: String,
-	pub profile_type: String,
+	#[serde(rename = "type")]
+	pub r#type: String,
 	pub profile_pic: Option<String>,
 	pub cover_pic: Option<String>,
 }
@@ -53,7 +54,7 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 			let remote = api_response.data;
 
 			// Determine profile type
-			let typ = match remote.profile_type.as_str() {
+			let typ = match remote.r#type.as_str() {
 				"community" => ProfileType::Community,
 				_ => ProfileType::Person,
 			};

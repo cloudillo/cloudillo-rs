@@ -15,7 +15,7 @@ pub struct Profile {
 	pub id_tag: String,
 	pub name: String,
 	#[serde(rename = "type")]
-	pub profile_type: String,
+	pub r#type: String,
 	pub profile_pic: Option<String>,
 	pub cover_pic: Option<String>,
 	pub keys: Vec<auth_adapter::AuthKey>,
@@ -31,7 +31,7 @@ pub async fn get_tenant_profile(
 	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
 
 	// Convert ProfileType enum to string
-	let profile_type = match tenant_meta.typ {
+	let typ = match tenant_meta.typ {
 		crate::meta_adapter::ProfileType::Person => "person",
 		crate::meta_adapter::ProfileType::Community => "community",
 	};
@@ -39,7 +39,7 @@ pub async fn get_tenant_profile(
 	let profile = Profile {
 		id_tag: auth_profile.id_tag.to_string(),
 		name: tenant_meta.name.to_string(),
-		profile_type: profile_type.to_string(),
+		r#type: typ.to_string(),
 		profile_pic: tenant_meta.profile_pic.map(|s| s.to_string()),
 		cover_pic: tenant_meta.cover_pic.map(|s| s.to_string()),
 		keys: auth_profile.keys,

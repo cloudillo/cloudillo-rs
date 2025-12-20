@@ -520,13 +520,13 @@ pub(crate) async fn get_info(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClRe
 		_ => Error::DbError,
 	})?;
 
-	let profile_type: String = row.get("type");
+	let typ: String = row.get("type");
 	let created_at: i64 = row.get("created_at");
 
 	Ok(ProfileData {
 		id_tag: row.get("id_tag"),
 		name: row.get("name"),
-		profile_type: profile_type.into(),
+		r#type: typ.into(),
 		profile_pic: row.get("profile_pic"),
 		created_at: Timestamp(created_at),
 	})

@@ -174,7 +174,8 @@ pub struct ListProfileOptions {
 pub struct ProfileData {
 	pub id_tag: Box<str>,
 	pub name: Box<str>,
-	pub profile_type: Box<str>, // "person" or "community"
+	#[serde(rename = "type")]
+	pub r#type: Box<str>, // "person" or "community"
 	pub profile_pic: Option<Box<str>>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,

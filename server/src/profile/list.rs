@@ -23,7 +23,7 @@ pub struct ProfileWithStatus {
 	pub id_tag: String,
 	pub name: String,
 	#[serde(rename = "type")]
-	pub profile_type: Option<String>,
+	pub r#type: Option<String>,
 	pub profile_pic: Option<String>,
 	pub status: Option<String>,
 	pub connected: Option<bool>,
@@ -71,7 +71,7 @@ pub async fn list_profiles(
 		.map(|p| ProfileInfo {
 			id_tag: p.id_tag.to_string(),
 			name: p.name.to_string(),
-			profile_type: Some(
+			r#type: Some(
 				match p.typ {
 					crate::meta_adapter::ProfileType::Person => "person",
 					crate::meta_adapter::ProfileType::Community => "community",
@@ -103,14 +103,14 @@ pub async fn get_profile_by_id_tag(
 	// Lookup profile in local profiles table (relationship data)
 	let profile = match app.meta_adapter.read_profile(tn_id, &id_tag).await {
 		Ok((_etag, p)) => {
-			let profile_type = match p.typ {
+			let typ = match p.typ {
 				crate::meta_adapter::ProfileType::Person => None,
 				crate::meta_adapter::ProfileType::Community => Some("community".to_string()),
 			};
 			Some(ProfileWithStatus {
 				id_tag: p.id_tag.to_string(),
 				name: p.name.to_string(),
-				profile_type,
+				r#type: typ,
 				profile_pic: p.profile_pic.map(|s| s.to_string()),
 				status: None, // TODO: Add status to Profile struct
 				connected: Some(p.connected.is_connected()),

@@ -34,7 +34,7 @@ pub async fn patch_own_profile(
 	let profile = ProfileInfo {
 		id_tag: profile_data.id_tag.to_string(),
 		name: profile_data.name.to_string(),
-		profile_type: Some(profile_data.profile_type.to_string()),
+		r#type: Some(profile_data.r#type.to_string()),
 		profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
 		status: None,
 		connected: None,
@@ -106,7 +106,7 @@ pub async fn patch_profile_admin(
 		let profile = ProfileInfo {
 			id_tag: profile_data.id_tag.to_string(),
 			name: profile_data.name.to_string(),
-			profile_type: Some(profile_data.profile_type.to_string()),
+			r#type: Some(profile_data.r#type.to_string()),
 			profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
 			status: None,
 			connected: None,

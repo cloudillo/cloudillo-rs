@@ -318,7 +318,7 @@ pub struct ProfileInfo {
 	pub id_tag: String,
 	pub name: String,
 	#[serde(rename = "type")]
-	pub profile_type: Option<String>,
+	pub r#type: Option<String>,
 	pub profile_pic: Option<String>, // file_id
 	pub status: Option<String>,
 	pub connected: Option<bool>,
@@ -349,7 +349,8 @@ pub struct CreateCommunityRequest {
 pub struct CommunityProfileResponse {
 	pub id_tag: String,
 	pub name: String,
-	pub profile_type: String,
+	#[serde(rename = "type")]
+	pub r#type: String,
 	pub profile_pic: Option<String>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
