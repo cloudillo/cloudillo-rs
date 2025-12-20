@@ -34,7 +34,7 @@ pub mod status {
 	pub const DELETED: char = 'D';
 }
 
-pub use process::verify_action_token;
+pub use process::{decode_jwt_no_verify, verify_action_token};
 
 use crate::prelude::*;
 
