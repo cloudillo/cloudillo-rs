@@ -14,6 +14,7 @@ use crate::types::ApiResponse;
 pub struct Profile {
 	pub id_tag: String,
 	pub name: String,
+	#[serde(rename = "type")]
 	pub profile_type: String,
 	pub profile_pic: Option<String>,
 	pub cover_pic: Option<String>,
