@@ -157,7 +157,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			// No mutual request - check connection_mode setting
 			let connection_mode = app
 				.settings
-				.get_string_opt(tn_id, "privacy.connection_mode")
+				.get_string_opt(tn_id, "profile.connection_mode")
 				.await
 				.ok()
 				.flatten();
