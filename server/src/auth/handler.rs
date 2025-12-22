@@ -310,6 +310,9 @@ pub struct GetAccessTokenQuery {
 	/// API key to exchange for an access token
 	#[serde(rename = "apiKey")]
 	api_key: Option<String>,
+	/// If true with refId, use validate_ref instead of use_ref (for token refresh)
+	#[serde(default)]
+	refresh: Option<bool>,
 }
 
 pub async fn get_access_token(
@@ -388,20 +391,29 @@ pub async fn get_access_token(
 		Ok((StatusCode::OK, Json(response)))
 	} else if let Some(ref_id) = query.ref_id {
 		// Exchange share link ref for scoped access token (no auth required)
-		info!("Exchanging ref_id {} for scoped access token", ref_id);
+		let is_refresh = query.refresh.unwrap_or(false);
+		info!("Exchanging ref_id {} for scoped access token (refresh={})", ref_id, is_refresh);
 
-		// Use the ref - validates type, expiration, counter, and decrements it
-		let (ref_tn_id, _ref_id_tag, ref_data) =
-			app.meta_adapter.use_ref(&ref_id, &["share.file"]).await.map_err(|e| {
-				warn!("Failed to use ref {}: {}", ref_id, e);
-				match e {
-					Error::NotFound => {
-						Error::ValidationError("Invalid or expired share link".into())
-					}
-					Error::ValidationError(_) => e,
-					_ => Error::ValidationError("Invalid share link".into()),
-				}
-			})?;
+		// For refresh: validate without decrementing counter
+		// For initial access: validate and decrement counter
+		let (ref_tn_id, _ref_id_tag, ref_data) = if is_refresh {
+			app.meta_adapter.validate_ref(&ref_id, &["share.file"]).await
+		} else {
+			app.meta_adapter.use_ref(&ref_id, &["share.file"]).await
+		}
+		.map_err(|e| {
+			warn!(
+				"Failed to {} ref {}: {}",
+				if is_refresh { "validate" } else { "use" },
+				ref_id,
+				e
+			);
+			match e {
+				Error::NotFound => Error::ValidationError("Invalid or expired share link".into()),
+				Error::ValidationError(_) => e,
+				_ => Error::ValidationError("Invalid share link".into()),
+			}
+		})?;
 
 		// Validate ref belongs to this tenant
 		if ref_tn_id != tn_id {
