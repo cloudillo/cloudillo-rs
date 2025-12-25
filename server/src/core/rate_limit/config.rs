@@ -81,24 +81,24 @@ impl Default for RateLimitConfig {
 				// Federation: moderate limits for inter-instance communication
 				ipv4_individual: RateLimitTierConfig::new(100, 200, 1000, 100),
 				ipv4_network: RateLimitTierConfig::new(500, 750, 5000, 500),
-				ipv6_subnet: RateLimitTierConfig::new(100, 200, 5000, 500),
-				ipv6_provider: RateLimitTierConfig::new(500, 750, 20000, 2000),
+				ipv6_subnet: RateLimitTierConfig::new(100, 200, 1000, 100),
+				ipv6_provider: RateLimitTierConfig::new(500, 750, 5000, 500),
 			},
 			general: EndpointCategoryConfig {
 				name: "general",
 				// General: relaxed limits for normal browsing
-				ipv4_individual: RateLimitTierConfig::new(100, 200, 5000, 500),
-				ipv4_network: RateLimitTierConfig::new(500, 1000, 50000, 5000),
-				ipv6_subnet: RateLimitTierConfig::new(100, 200, 50000, 5000),
-				ipv6_provider: RateLimitTierConfig::new(500, 1000, 200000, 20000),
+				ipv4_individual: RateLimitTierConfig::new(300, 500, 5000, 500),
+				ipv4_network: RateLimitTierConfig::new(600, 1000, 50000, 5000),
+				ipv6_subnet: RateLimitTierConfig::new(300, 500, 5000, 500),
+				ipv6_provider: RateLimitTierConfig::new(600, 1000, 50000, 5000),
 			},
 			websocket: EndpointCategoryConfig {
 				name: "websocket",
 				// WebSocket: moderate limits (connections are long-lived)
 				ipv4_individual: RateLimitTierConfig::new(10, 20, 200, 100),
 				ipv4_network: RateLimitTierConfig::new(50, 100, 1000, 500),
-				ipv6_subnet: RateLimitTierConfig::new(10, 20, 1000, 500),
-				ipv6_provider: RateLimitTierConfig::new(50, 100, 5000, 2000),
+				ipv6_subnet: RateLimitTierConfig::new(10, 20, 200, 100),
+				ipv6_provider: RateLimitTierConfig::new(50, 100, 1000, 500),
 			},
 			max_tracked_ips: 100_000,
 			entry_ttl: Duration::from_secs(3600), // 1 hour
