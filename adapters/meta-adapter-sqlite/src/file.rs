@@ -31,7 +31,7 @@ pub(crate) async fn list(
 			|| matches!(opts.sort.as_deref(), Some("recent" | "modified")));
 
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT f.f_id, f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+		"SELECT f.f_id, f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility, f.x,
 		        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic",
 	);
 
@@ -230,6 +230,9 @@ pub(crate) async fn list(
 		let accessed_at: Option<i64> = row.try_get("accessed_at").ok().flatten();
 		let modified_at: Option<i64> = row.try_get("modified_at").ok().flatten();
 
+		// Parse x field as JSON
+		let x: Option<serde_json::Value> = row.try_get("x").ok().flatten();
+
 		Ok(FileView {
 			file_id,
 			parent_id: row.try_get("parent_id").ok(),
@@ -246,6 +249,7 @@ pub(crate) async fn list(
 			visibility,
 			access_level: None, // Computed later by filter_files_by_visibility
 			user_data,
+			x,
 		})
 	}))
 }
@@ -749,8 +753,19 @@ pub(crate) async fn update_data(
 		return Ok(()); // Nothing to update
 	}
 
-	let sql =
-		format!("UPDATE files SET {} WHERE tn_id = ? AND file_id = ?", set_clauses.join(", "));
+	// Handle @-prefixed integer IDs vs content-addressable IDs
+	let (where_clause, file_id_bind): (&str, &str) =
+		if let Some(f_id_str) = file_id.strip_prefix("@") {
+			("f_id", f_id_str)
+		} else {
+			("file_id", file_id)
+		};
+
+	let sql = format!(
+		"UPDATE files SET {} WHERE tn_id = ? AND {} = ?",
+		set_clauses.join(", "),
+		where_clause
+	);
 
 	let mut query = sqlx::query(&sql);
 
@@ -789,7 +804,7 @@ pub(crate) async fn update_data(
 	}
 
 	// Bind WHERE clause params
-	query = query.bind(tn_id.0).bind(file_id);
+	query = query.bind(tn_id.0).bind(file_id_bind);
 
 	query.execute(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
@@ -809,7 +824,7 @@ pub(crate) async fn read(
 			.parse::<i64>()
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility, f.x,
 			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
@@ -824,7 +839,7 @@ pub(crate) async fn read(
 	} else {
 		// Content-addressable ID - query by file_id
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility,
+			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility, f.x,
 			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
@@ -878,6 +893,9 @@ pub(crate) async fn read(
 			let accessed_at: Option<i64> = row.try_get("accessed_at").ok().flatten();
 			let modified_at: Option<i64> = row.try_get("modified_at").ok().flatten();
 
+			// Parse x field as JSON
+			let x: Option<serde_json::Value> = row.try_get("x").ok().flatten();
+
 			Ok(Some(FileView {
 				file_id: row.try_get("file_id").map_err(|_| Error::DbError)?,
 				parent_id: row.try_get("parent_id").ok(),
@@ -897,6 +915,7 @@ pub(crate) async fn read(
 				visibility,
 				access_level: None, // Computed later by filter_files_by_visibility
 				user_data: None,    // Not fetched in single-file read
+				x,
 			}))
 		}
 	}

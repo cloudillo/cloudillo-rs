@@ -435,6 +435,7 @@ pub struct FileView {
 	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
 	pub access_level: Option<crate::types::AccessLevel>, // User's access level to this file (R/W)
 	pub user_data: Option<FileUserData>, // User-specific data (only when authenticated)
+	pub x: Option<serde_json::Value>, // Extensible metadata (e.g., {"dim": [width, height]} for images)
 }
 
 #[skip_serializing_none]
