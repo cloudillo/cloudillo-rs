@@ -3,6 +3,7 @@
 
 ARG RS_REF=main
 ARG FRONTEND_REF=main
+ARG OPALUI_REF=
 ARG UID=10001
 ARG GID=10001
 
@@ -17,7 +18,7 @@ RUN git clone --depth 1 --branch ${RS_REF} https://github.com/cloudillo/cloudill
 # Disable sccache wrapper (not available in Docker)
 ENV RUSTC_WRAPPER=""
 RUN cargo build --profile release-lto
-RUN strip /app/target/release/cloudillo-basic-server
+RUN strip /app/target/release-lto/cloudillo-basic-server
 ARG UID
 ARG GID
 # Create non-root user files for scratch image
@@ -32,11 +33,18 @@ RUN mkdir -p /cloudillo-data && touch /cloudillo-data/.keep && chmod 0755 /cloud
 
 FROM node:22-slim AS frontend-builder
 ARG FRONTEND_REF
+ARG OPALUI_REF
 WORKDIR /app
 RUN apt-get update && apt-get install -y git
 RUN npm install -g pnpm
 RUN git clone --depth 1 --branch ${FRONTEND_REF} https://github.com/cloudillo/cloudillo.git .
-RUN pnpm install --frozen-lockfile
+RUN if [ -n "${OPALUI_REF}" ]; then \
+        git clone --depth 1 --branch ${OPALUI_REF} https://github.com/szilu/opalui.git local/opalui; \
+        pnpm install --no-frozen-lockfile; \
+    else \
+        pnpm install --frozen-lockfile; \
+    fi
+#RUN pnpm install --frozen-lockfile
 RUN pnpm -r --filter '!@cloudillo/storybook' build
 
 # Assemble final dist structure: shell/dist/* + apps under /dist/apps/
@@ -172,7 +180,7 @@ COPY --from=rust-builder /cloudillo-data /cloudillo/data
 WORKDIR /cloudillo
 
 # Copy cloudillo binary and its dependencies
-COPY --from=rust-builder /app/target/release/cloudillo-basic-server /usr/bin/cloudillo
+COPY --from=rust-builder /app/target/release-lto/cloudillo-basic-server /usr/bin/cloudillo
 COPY --from=rust-builder /app/templates /cloudillo/templates
 COPY --from=rust-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=rust-builder /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
