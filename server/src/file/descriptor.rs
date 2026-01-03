@@ -350,6 +350,19 @@ impl Task<App> for FileIdGeneratorTask {
 		// Finalize the file - sets file_id and transitions status from 'P' to 'A' atomically
 		app.meta_adapter.finalize_file(self.tn_id, self.f_id, &file_id).await?;
 
+		// Broadcast FILE_ID_GENERATED event to all connections on this tenant
+		// Frontend clients will filter based on whether they're tracking this temp ID
+		let msg = crate::core::ws_broadcast::BroadcastMessage::new(
+			"FILE_ID_GENERATED",
+			serde_json::json!({
+				"tempId": format!("@{}", self.f_id),
+				"fileId": file_id
+			}),
+			"system",
+		);
+		let delivered = app.broadcast.send_to_tenant(self.tn_id, msg).await;
+		debug!("FILE_ID_GENERATED broadcast delivered to {} connections", delivered);
+
 		info!("Finished task file.id-generate {} → {}", descriptor, file_id);
 		Ok(())
 	}

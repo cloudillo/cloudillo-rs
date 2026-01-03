@@ -242,7 +242,11 @@ async fn handle_post_image(
 ) -> ClResult<serde_json::Value> {
 	let result = image::generate_image_variants(app, tn_id, f_id, bytes, preset).await?;
 
-	Ok(json!({"fileId": format!("@{}", f_id), "thumbnailVariantId": result.thumbnail_variant_id }))
+	Ok(json!({
+		"fileId": format!("@{}", f_id),
+		"thumbnailVariantId": result.thumbnail_variant_id,
+		"dim": [result.dim.0, result.dim.1]
+	}))
 }
 
 /// Handle video upload - streams body to temp file, probes, creates transcode tasks

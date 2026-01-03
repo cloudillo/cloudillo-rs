@@ -151,6 +151,8 @@ pub struct ImageVariantResult {
 	pub thumbnail_variant_id: String,
 	/// TaskId of the FileIdGeneratorTask (for chaining dependencies)
 	pub file_id_task: TaskId,
+	/// Original image dimensions (width, height)
+	pub dim: (u32, u32),
 }
 
 /// Generate image variants based on preset configuration.
@@ -356,7 +358,11 @@ pub async fn generate_image_variants(
 	}
 	let file_id_task = builder.schedule().await?;
 
-	Ok(ImageVariantResult { thumbnail_variant_id: thumbnail_variant_id.into(), file_id_task })
+	Ok(ImageVariantResult {
+		thumbnail_variant_id: thumbnail_variant_id.into(),
+		file_id_task,
+		dim: orig_dim,
+	})
 }
 
 /// Image resizer Task
