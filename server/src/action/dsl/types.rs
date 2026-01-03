@@ -147,40 +147,88 @@ pub enum FieldType {
 }
 
 /// Behavior flags controlling action processing
+///
+/// # Implementation Status
+///
+/// ## Fully Implemented
+/// - `broadcast` - Checked in `schedule_delivery()` for self-posting
+/// - `allow_unknown` - Validated on both inbound (permission check) and outbound (create_action)
+/// - `ephemeral` - Skips persistence, forwards to WebSocket only
+/// - `approvable` - Enables APRV flow, auto-approve for trusted sources
+/// - `requires_subscription` - Validated on both inbound and outbound
+/// - `deliver_subject` - Delivers subject action along with main action
+/// - `subscribable` - Enables SUBS-based permissions and visibility
+/// - `deliver_to_subject_owner` - Dual delivery to subject owner
+/// - `default_flags` - Applied during action creation
+///
+/// ## Reserved (Not Implemented)
+/// - `requires_acceptance` - RESERVED: Would set initial status to CONFIRMATION
+/// - `local_only` - RESERVED: Would skip federation in schedule_delivery
+/// - `ttl` - RESERVED: Time-to-live for action expiration
+/// - `sync` - RESERVED: Synchronous processing mode
+/// - `federated` - RESERVED: Cross-instance federation control
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BehaviorFlags {
-	/// Send to all followers?
+	// === Fully Implemented ===
+	/// Send to all followers when posting to own wall (no audience).
+	/// Checked in `schedule_delivery()` for self-posting.
 	pub broadcast: Option<bool>,
-	/// Accept from non-connected?
+
+	/// Accept actions from non-connected/non-following users.
+	/// Validated on both inbound (permission check) and outbound (create_action).
 	pub allow_unknown: Option<bool>,
-	/// Requires user confirmation?
-	pub requires_acceptance: Option<bool>,
-	/// Time to live in seconds
-	pub ttl: Option<u64>,
-	/// Process synchronously?
-	pub sync: Option<bool>,
-	/// Allow cross-instance federation?
-	pub federated: Option<bool>,
-	/// Never federate?
-	pub local_only: Option<bool>,
-	/// Don't persist?
+
+	/// Don't persist to database, only forward to WebSocket.
+	/// Used for real-time ephemeral actions like typing indicators.
 	pub ephemeral: Option<bool>,
+
 	/// Can this action receive APRV (approval) from audience?
-	/// When true, accepting this action will generate an APRV federated signal
+	/// When true, accepting this action will generate an APRV federated signal.
+	/// Also enables auto-approve for trusted sources.
 	pub approvable: Option<bool>,
-	/// Default flags for this action type (R/r=reactions, C/c=comments, O/o=open)
-	pub default_flags: Option<String>,
-	/// Child actions require SUBS (subscription) validation
+
+	/// Child actions require SUBS (subscription) validation.
+	/// Validated on both inbound and outbound flows.
 	pub requires_subscription: Option<bool>,
-	/// Deliver subject action along with this action to recipients
+
+	/// Deliver subject action along with this action to recipients.
+	/// Used by APRV to include the approved POST when fanning out.
 	pub deliver_subject: Option<bool>,
-	/// This action type can have SUBS (subscriptions) pointing to it
-	/// When true, subscribers are included in visibility checks for Direct visibility
+
+	/// This action type can have SUBS (subscriptions) pointing to it.
+	/// When true, subscribers are included in visibility checks for Direct visibility.
+	/// Also enables fan-out to subscribers in parent chain.
 	pub subscribable: Option<bool>,
-	/// Also deliver to subject's owner (in addition to audience)
-	/// Used by INVT to deliver to both invitee and CONV home for validation
+
+	/// Also deliver to subject's owner (in addition to audience).
+	/// Used by INVT to deliver to both invitee and CONV home for validation.
 	pub deliver_to_subject_owner: Option<bool>,
+
+	/// Default flags for this action type (R/r=reactions, C/c=comments, O/o=open).
+	/// Applied during action creation.
+	pub default_flags: Option<String>,
+
+	// === Reserved (Not Implemented) ===
+	/// RESERVED: Requires user confirmation before activation.
+	/// When implemented, would set initial status to CONFIRMATION.
+	pub requires_acceptance: Option<bool>,
+
+	/// RESERVED: Never federate this action type.
+	/// When implemented, would skip federation in schedule_delivery.
+	pub local_only: Option<bool>,
+
+	/// RESERVED: Time to live in seconds.
+	/// When implemented, would enable automatic action expiration.
+	pub ttl: Option<u64>,
+
+	/// RESERVED: Process synchronously.
+	/// Currently only affects IDP:REG hook execution.
+	pub sync: Option<bool>,
+
+	/// RESERVED: Allow cross-instance federation.
+	/// Default behavior is to federate; this flag is reserved for future use.
+	pub federated: Option<bool>,
 }
 
 /// Lifecycle hooks for action processing

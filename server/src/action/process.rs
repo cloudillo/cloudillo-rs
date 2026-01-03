@@ -5,10 +5,13 @@ use serde::de::DeserializeOwned;
 use std::net::IpAddr;
 
 use crate::{
-	action::helpers,
+	action::{
+		helpers,
+		post_store::{self, ProcessingContext},
+	},
 	auth_adapter::ActionToken,
 	core::rate_limit::{PenaltyReason, PowPenaltyReason, RateLimitApi},
-	meta_adapter,
+	meta_adapter::{self, AttachmentView},
 	prelude::*,
 };
 
@@ -242,7 +245,7 @@ async fn process_inbound_action_token_inner(
 		verify_and_handle_failure(app, tn_id, token, is_conn_action, client_ip.as_ref()).await?;
 
 	// 3. Resolve definition (try full type, then base type)
-	let (definition_type, definition) = resolve_definition(app, &action.t)?;
+	let (_definition_type, definition) = resolve_definition(app, &action.t)?;
 
 	// 4. Check permissions (skip for pre-approved related actions)
 	if !skip_permission_check {
@@ -297,38 +300,58 @@ async fn process_inbound_action_token_inner(
 		}
 	}
 
-	// 7. Execute DSL on_receive hook
-	let hook_result = execute_on_receive_hook(
+	// 7. Unified post-store processing (hooks, WebSocket, fanout, auto-approve)
+	let (action_type, sub_type) = helpers::extract_type_and_subtype(&action.t);
+	let content_str = helpers::serialize_content(action.c.as_ref()).map(|s| s.into_boxed_str());
+	let root_id =
+		helpers::resolve_root_id(app.meta_adapter.as_ref(), tn_id, action.p.as_deref()).await;
+
+	// Build owned Action for unified processing
+	let action_for_processing = meta_adapter::Action {
+		action_id: action_id.into(),
+		typ: action_type.into_boxed_str(),
+		sub_typ: sub_type.map(|s| s.into_boxed_str()),
+		issuer_tag: action.iss.clone(),
+		parent_id: action.p.clone(),
+		root_id,
+		audience_tag: action.aud.clone(),
+		content: content_str,
+		attachments: action.a.clone(),
+		subject: action.sub.clone(),
+		created_at: action.iat,
+		expires_at: action.exp,
+		visibility: helpers::inherit_visibility(
+			app.meta_adapter.as_ref(),
+			tn_id,
+			None,
+			action.p.as_deref(),
+		)
+		.await,
+		flags: action.f.clone(),
+		x: None,
+	};
+
+	// Convert attachments to AttachmentView (no dimensions for federated actions)
+	let attachment_views: Option<Vec<AttachmentView>> = action.a.as_ref().map(|v| {
+		v.iter()
+			.map(|file_id| AttachmentView {
+				file_id: file_id.clone(),
+				dim: None,
+				local_variants: None,
+			})
+			.collect()
+	});
+
+	let result = post_store::process_after_store(
 		app,
 		tn_id,
-		action_id,
-		&action,
-		definition_type,
-		is_sync,
-		client_address.clone(),
+		&action_for_processing,
+		attachment_views.as_deref(),
+		ProcessingContext::Inbound { client_address, is_sync },
 	)
 	.await?;
 
-	// 8. Auto-approve approvable actions from trusted sources (if enabled)
-	if !is_sync {
-		try_auto_approve(app, tn_id, action_id, &action, definition).await;
-	}
-
-	// 9. Forward action to connected WebSocket clients
-	forward_inbound_action_to_websocket(app, tn_id, action_id, &action).await;
-
-	// 10. Fan-out to subscribers if we own a subscribable parent
-	// This handles re-delivery when CONV owner receives MSG from a subscriber
-	let _ = crate::action::task::schedule_subscriber_fanout(
-		app,
-		tn_id,
-		action_id,
-		action.p.as_deref(),
-		action.iss.as_ref(),
-	)
-	.await;
-
-	Ok(hook_result)
+	Ok(result.hook_result)
 }
 
 /// Verify PoW for CONN actions before signature verification
@@ -642,66 +665,6 @@ async fn store_inbound_action(
 	}
 }
 
-/// Execute DSL on_receive hook
-async fn execute_on_receive_hook(
-	app: &App,
-	tn_id: TnId,
-	action_id: &str,
-	action: &ActionToken,
-	definition_type: &str,
-	is_sync: bool,
-	client_address: Option<String>,
-) -> ClResult<Option<serde_json::Value>> {
-	use crate::action::hooks::{HookContext, HookType};
-
-	let (action_type, subtype) = helpers::extract_type_and_subtype(&action.t);
-
-	let hook_context = HookContext::builder()
-		.action_id(action_id)
-		.action_type(action_type)
-		.subtype(subtype)
-		.issuer(&*action.iss)
-		.audience(action.aud.as_ref().map(|s| s.to_string()))
-		.parent(action.p.as_ref().map(|s| s.to_string()))
-		.subject(action.sub.as_ref().map(|s| s.to_string()))
-		.content(action.c.clone())
-		.attachments(action.a.as_ref().map(|v| v.iter().map(|s| s.to_string()).collect()))
-		.created_at(format!("{}", action.iat.0))
-		.expires_at(action.exp.map(|ts| format!("{}", ts.0)))
-		.tenant(
-			tn_id.0 as i64,
-			action.aud.as_ref().map(|s| s.to_string()).unwrap_or_default(),
-			"person",
-		)
-		.inbound()
-		.client_address(client_address)
-		.build();
-
-	if is_sync {
-		let hook_result = app
-			.dsl_engine
-			.execute_hook_with_result(app, definition_type, HookType::OnReceive, hook_context)
-			.await?;
-		Ok(hook_result.return_value)
-	} else {
-		if let Err(e) = app
-			.dsl_engine
-			.execute_hook(app, definition_type, HookType::OnReceive, hook_context)
-			.await
-		{
-			warn!(
-				action_id = %action_id,
-				action_type = %action.t,
-				issuer = %action.iss,
-				tenant_id = %tn_id.0,
-				error = %e,
-				"DSL on_receive hook failed"
-			);
-		}
-		Ok(None)
-	}
-}
-
 async fn process_inbound_action_attachments(
 	app: &App,
 	tn_id: TnId,
@@ -885,131 +848,6 @@ async fn send_push_notification(
 				tn_id = %tn_id.0,
 				error = %e,
 				"Failed to send push notification"
-			);
-		}
-	}
-}
-
-/// Try to auto-approve an approvable action from a trusted source
-///
-/// Conditions for auto-approve:
-/// 1. Action type must be approvable (POST, MSG, REPOST)
-/// 2. Action must be addressed to us (audience = our id_tag)
-/// 3. Issuer must be different from us
-/// 4. Issuer must be trusted (profile status 'T' or 'A')
-/// 5. federation.auto_approve setting must be enabled
-async fn try_auto_approve(
-	app: &App,
-	tn_id: TnId,
-	action_id: &str,
-	action: &crate::auth_adapter::ActionToken,
-	definition: &crate::action::dsl::types::ActionDefinition,
-) {
-	use crate::action::status;
-	use crate::action::task::{self, CreateAction};
-
-	// 1. Check if action type is approvable
-	if !definition.behavior.approvable.unwrap_or(false) {
-		return;
-	}
-
-	// 2. Get our tenant's id_tag
-	let tenant = match app.meta_adapter.read_tenant(tn_id).await {
-		Ok(tenant) => tenant,
-		Err(_) => {
-			debug!("Auto-approve: Could not get tenant info");
-			return;
-		}
-	};
-	let our_id_tag = tenant.id_tag.as_ref();
-
-	// 3. Check if action is addressed to us (audience = our id_tag)
-	let audience = action.aud.as_deref();
-	if audience != Some(our_id_tag) {
-		debug!(
-			action_id = %action_id,
-			audience = ?audience,
-			our_id_tag = %our_id_tag,
-			"Auto-approve skipped: not addressed to us"
-		);
-		return;
-	}
-
-	// 4. Check issuer is not us
-	if action.iss.as_ref() == our_id_tag {
-		return;
-	}
-
-	// 5. Check if auto-approve setting is enabled
-	let auto_approve_enabled =
-		app.settings.get_bool(tn_id, "federation.auto_approve").await.unwrap_or(false);
-	if !auto_approve_enabled {
-		debug!(
-			action_id = %action_id,
-			"Auto-approve skipped: setting disabled"
-		);
-		return;
-	}
-
-	// 6. Check if issuer is trusted (connected = bidirectional connection established)
-	let issuer_profile = match app.meta_adapter.read_profile(tn_id, &action.iss).await {
-		Ok((_etag, profile)) => profile,
-		Err(e) => {
-			debug!(
-				action_id = %action_id,
-				issuer = %action.iss,
-				error = %e,
-				"Auto-approve skipped: issuer profile not found or error"
-			);
-			return;
-		}
-	};
-
-	// Trust = bidirectional connection (CONN handshake completed)
-	if !issuer_profile.connected.is_connected() {
-		debug!(
-			action_id = %action_id,
-			issuer = %action.iss,
-			connected = %issuer_profile.connected,
-			"Auto-approve skipped: issuer not connected"
-		);
-		return;
-	}
-
-	// All conditions met - auto-approve by setting status and creating APRV
-	info!("AUTO-APPROVE: {} from={} (trusted)", action_id, action.iss);
-
-	// Update action status to 'A' (Active/Approved)
-	let update_opts = crate::meta_adapter::UpdateActionDataOptions {
-		status: crate::types::Patch::Value(status::ACTIVE),
-		..Default::default()
-	};
-	if let Err(e) = app.meta_adapter.update_action_data(tn_id, action_id, &update_opts).await {
-		warn!(
-			action_id = %action_id,
-			error = %e,
-			"Auto-approve: Failed to update action status"
-		);
-		return;
-	}
-
-	// Create APRV action to signal approval to the issuer
-	let aprv_action = CreateAction {
-		typ: "APRV".into(),
-		audience_tag: Some(action.iss.clone()),
-		subject: Some(action_id.into()),
-		..Default::default()
-	};
-
-	match task::create_action(app, tn_id, our_id_tag, aprv_action).await {
-		Ok(_) => {
-			debug!("Auto-approve: APRV action created for {}", action_id);
-		}
-		Err(e) => {
-			warn!(
-				action_id = %action_id,
-				error = %e,
-				"Auto-approve: Failed to create APRV action"
 			);
 		}
 	}

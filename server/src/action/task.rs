@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::{
 	action::delivery::ActionDeliveryTask,
 	action::helpers,
+	action::post_store::{self, ProcessingContext},
 	action::process,
 	core::hasher,
 	core::scheduler::{RetryPolicy, Task, TaskId},
@@ -57,6 +58,75 @@ pub async fn create_action(
 
 	if is_ephemeral {
 		return create_ephemeral_action(app, tn_id, id_tag, action).await;
+	}
+
+	// Get behavior flags for validation
+	let behavior = app.dsl_engine.get_behavior(action.typ.as_ref());
+
+	// Outbound validation: allow_unknown
+	// If false, we can only send to recipients we have a relationship with
+	let allow_unknown = behavior.as_ref().and_then(|b| b.allow_unknown).unwrap_or(false);
+	if !allow_unknown {
+		if let Some(ref audience_tag) = action.audience_tag {
+			// Skip validation if audience is ourselves
+			if audience_tag.as_ref() != id_tag {
+				let has_relationship = app
+					.meta_adapter
+					.read_profile(tn_id, audience_tag)
+					.await
+					.ok()
+					.map(|(_, p)| p.following || p.connected.is_connected())
+					.unwrap_or(false);
+
+				if !has_relationship {
+					return Err(Error::ValidationError(format!(
+						"Cannot send {} to unknown recipient {}",
+						action.typ, audience_tag
+					)));
+				}
+			}
+		}
+	}
+
+	// Outbound validation: requires_subscription
+	// If true, we must have an active subscription to the target action (or be the creator)
+	let requires_subscription =
+		behavior.as_ref().and_then(|b| b.requires_subscription).unwrap_or(false);
+	if requires_subscription {
+		let target_id = action.subject.as_deref().or(action.parent_id.as_deref());
+		if let Some(target_id) = target_id {
+			// Skip validation for @temp_id references (will be resolved later)
+			if !target_id.starts_with('@') {
+				// Get the target action to check if we're the creator
+				let target_action = app.meta_adapter.get_action(tn_id, target_id).await?;
+				if let Some(target) = target_action {
+					// If we're the target action's creator, we always have permission
+					if target.issuer.id_tag.as_ref() != id_tag {
+						// Check for active subscription
+						let subs_key = format!("SUBS:{}:{}", target_id, id_tag);
+						let subscription =
+							app.meta_adapter.get_action_by_key(tn_id, &subs_key).await?;
+
+						if subscription.is_none() {
+							// Also check root action subscription if target has a root
+							let root_sub = if let Some(root_id) = &target.root_id {
+								let root_subs_key = format!("SUBS:{}:{}", root_id, id_tag);
+								app.meta_adapter.get_action_by_key(tn_id, &root_subs_key).await?
+							} else {
+								None
+							};
+
+							if root_sub.is_none() {
+								return Err(Error::ValidationError(format!(
+									"Cannot send {} without subscription to {}",
+									action.typ, target_id
+								)));
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// Serialize content Value to string for storage (always JSON-encode)
@@ -385,21 +455,35 @@ impl Task<App> for ActionCreatorTask {
 		)
 		.await?;
 
-		// 4. Execute DSL on_create hook
-		execute_on_create_hook(
-			app,
-			self.tn_id,
-			&self.id_tag,
-			&action_id,
-			&action_with_resolved,
-			&attachments,
-			&subject,
-		)
-		.await;
-
-		// 5. Forward action to connected WebSocket clients
+		// 4. Process after storage (unified: hooks, WebSocket, fanout, delivery)
 		let temp_id = format!("@{}", self.a_id);
-		// Only fetch full action if there are attachments (to get dimensions)
+
+		// Build Action struct for unified processing
+		let action_for_processing = meta_adapter::Action {
+			action_id: action_id.clone(),
+			typ: action_with_resolved.typ.clone(),
+			sub_typ: action_with_resolved.sub_typ.clone(),
+			issuer_tag: self.id_tag.clone(),
+			parent_id: action_with_resolved.parent_id.clone(),
+			root_id: helpers::resolve_root_id(
+				app.meta_adapter.as_ref(),
+				self.tn_id,
+				action_with_resolved.parent_id.as_deref(),
+			)
+			.await,
+			audience_tag: action_with_resolved.audience_tag.clone(),
+			content: helpers::serialize_content(action_with_resolved.content.as_ref())
+				.map(|s| s.into_boxed_str()),
+			attachments: attachments.clone(),
+			subject: subject.clone(),
+			created_at: Timestamp::now(),
+			expires_at: action_with_resolved.expires_at,
+			visibility: action_with_resolved.visibility,
+			flags: action_with_resolved.flags.clone(),
+			x: action_with_resolved.x.clone(),
+		};
+
+		// Fetch attachment views (with dimensions) for WebSocket forwarding
 		let attachment_views = if attachments.is_some() {
 			app.meta_adapter
 				.get_action(self.tn_id, &action_id)
@@ -410,19 +494,15 @@ impl Task<App> for ActionCreatorTask {
 		} else {
 			None
 		};
-		forward_action_to_websocket(
+
+		post_store::process_after_store(
 			app,
 			self.tn_id,
-			&action_id,
-			Some(&temp_id),
-			&self.id_tag,
-			&action_with_resolved,
+			&action_for_processing,
 			attachment_views.as_deref(),
+			ProcessingContext::Outbound { temp_id: Some(temp_id.into()) },
 		)
-		.await;
-
-		// 6. Determine recipients and schedule delivery
-		schedule_delivery(app, self.tn_id, &self.id_tag, &action_id, &action_with_resolved).await?;
+		.await?;
 
 		info!("← ACTION.CREATED: {} type={}", action_id, self.action.typ);
 		Ok(())

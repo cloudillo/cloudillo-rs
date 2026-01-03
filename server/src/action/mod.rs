@@ -11,6 +11,7 @@ pub mod hooks;
 pub mod key_cache;
 pub mod native_hooks;
 pub mod perm;
+pub mod post_store;
 mod process;
 pub mod settings;
 pub mod task;
