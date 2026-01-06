@@ -328,6 +328,13 @@ fn is_app_directory(path: &str) -> bool {
 	path.starts_with("apps/")
 }
 
+/// Check if a path is in the fonts directory
+/// Fonts need CORS headers for sandboxed iframes (apps have opaque 'null' origin)
+fn is_font_file(path: &str) -> bool {
+	let path = path.trim_start_matches('/');
+	path.starts_with("fonts/")
+}
+
 /// Serve the service worker with tenant-specific encryption key embedded
 /// Key is only injected if:
 /// 1. Service-Worker: script header is present (browser sets this, JS cannot fake it)
@@ -452,8 +459,8 @@ async fn static_fallback_handler(
 		}
 	}
 
-	// Check if this is an app directory (microfrontend assets need CORS for sandboxed iframes)
-	let is_app_asset = is_app_directory(path);
+	// Check if this is an app directory or font (need CORS for sandboxed iframes)
+	let needs_cors = is_app_directory(path) || is_font_file(path);
 
 	// Serve static files with cache headers
 	let dist_dir = &app.opts.dist_dir;
@@ -487,8 +494,8 @@ async fn static_fallback_handler(
 
 	response.headers_mut().insert(header::CACHE_CONTROL, cache_value);
 
-	// Add CORS headers for app directories (sandboxed iframes have opaque 'null' origin)
-	if is_app_asset {
+	// Add CORS headers for app directories and fonts (sandboxed iframes have opaque 'null' origin)
+	if needs_cors {
 		response
 			.headers_mut()
 			.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
