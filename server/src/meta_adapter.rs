@@ -509,6 +509,9 @@ pub struct ListFileOptions {
 	pub status: Option<FileStatus>,
 	#[serde(rename = "fileTp")]
 	pub file_type: Option<String>,
+	/// Filter by content type pattern (e.g., "image/*", "video/*")
+	#[serde(rename = "contentType")]
+	pub content_type: Option<String>,
 	/// Filter by pinned status (user-specific)
 	pub pinned: Option<bool>,
 	/// Filter by starred status (user-specific)

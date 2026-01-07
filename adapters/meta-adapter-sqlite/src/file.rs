@@ -99,6 +99,27 @@ pub(crate) async fn list(
 		}
 	}
 
+	// Filter by content type (MIME type pattern, e.g., "image/*" or "image/*,video/*")
+	if let Some(content_type) = &opts.content_type {
+		let patterns: Vec<&str> = content_type.split(',').map(|s| s.trim()).collect();
+		if patterns.len() == 1 {
+			// Convert wildcard pattern to SQL LIKE pattern (e.g., "image/*" -> "image/%")
+			let pattern = patterns[0].replace('*', "%");
+			query.push(" AND f.content_type LIKE ").push_bind(pattern);
+		} else {
+			// Multiple patterns - use OR conditions
+			query.push(" AND (");
+			for (i, p) in patterns.iter().enumerate() {
+				if i > 0 {
+					query.push(" OR ");
+				}
+				let pattern = p.replace('*', "%");
+				query.push("f.content_type LIKE ").push_bind(pattern);
+			}
+			query.push(")");
+		}
+	}
+
 	// Filter by status - if no status specified, exclude deleted files by default
 	if let Some(status) = opts.status {
 		let status_char = match status {
