@@ -45,6 +45,7 @@ RUN if [ -n "${OPALUI_REF}" ]; then \
         pnpm install --frozen-lockfile; \
     fi
 #RUN pnpm install --frozen-lockfile
+ENV COMPRESS=true
 RUN pnpm -r --filter '!@cloudillo/storybook' build
 
 # Assemble final dist structure: shell/dist/* + apps under /dist/apps/
