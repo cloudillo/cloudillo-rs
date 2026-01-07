@@ -142,43 +142,130 @@ pub(crate) async fn list(
 	}
 
 	// Determine sort order
+	let sort_field = opts.sort.as_deref().unwrap_or("created");
 	let sort_dir = match opts.sort_dir.as_deref() {
 		Some("asc") => "ASC",
 		Some("desc") => "DESC",
-		_ => match opts.sort.as_deref() {
-			Some("name") => "ASC",
+		_ => match sort_field {
+			"name" => "ASC",
 			_ => "DESC", // Default DESC for date-based sorts
 		},
 	};
+	let is_desc = sort_dir == "DESC";
 
-	match opts.sort.as_deref() {
-		Some("recent") if has_user => {
-			// Sort by user's access time (NULLs last)
-			query.push(
-				" ORDER BY CASE WHEN fud.accessed_at IS NULL THEN 1 ELSE 0 END, fud.accessed_at ",
-			);
-			query.push(sort_dir);
-		}
-		Some("modified") if has_user => {
-			// Sort by user's modification time (NULLs last)
-			query.push(
-				" ORDER BY CASE WHEN fud.modified_at IS NULL THEN 1 ELSE 0 END, fud.modified_at ",
-			);
-			query.push(sort_dir);
-		}
-		Some("name") => {
-			query.push(" ORDER BY f.file_name ");
-			query.push(sort_dir);
-		}
-		_ => {
-			// Default (including "created"): sort by file creation time
-			query.push(" ORDER BY f.created_at ");
-			query.push(sort_dir);
+	// Parse cursor for keyset pagination
+	if let Some(cursor_str) = &opts.cursor {
+		if let Some(cursor) = cloudillo::types::CursorData::decode(cursor_str) {
+			// Look up internal f_id from cursor's external file_id
+			let cursor_f_id: Option<i64> =
+				sqlx::query_scalar("SELECT f_id FROM files WHERE tn_id=? AND file_id=?")
+					.bind(tn_id.0)
+					.bind(&cursor.id)
+					.fetch_optional(db)
+					.await
+					.ok()
+					.flatten();
+
+			if let Some(cursor_f_id) = cursor_f_id {
+				// Add keyset pagination WHERE clause based on sort field
+				// For DESC: (sort_field, f_id) < (cursor_value, cursor_f_id)
+				// For ASC: (sort_field, f_id) > (cursor_value, cursor_f_id)
+				// Note: push_bind() adds bind placeholders, don't use ? in push() strings
+				let comparison = if is_desc { "<" } else { ">" };
+
+				match sort_field {
+					"recent" if has_user => {
+						if let Some(ts) = cursor.timestamp() {
+							query.push(format!(
+								" AND ((fud.accessed_at IS NULL AND f.f_id {} ",
+								comparison
+							));
+							query.push_bind(cursor_f_id);
+							query.push(format!(
+								") OR (fud.accessed_at IS NOT NULL AND (fud.accessed_at, f.f_id) {} (",
+								comparison
+							));
+							query.push_bind(ts);
+							query.push(", ");
+							query.push_bind(cursor_f_id);
+							query.push(")))");
+						}
+					}
+					"modified" if has_user => {
+						if let Some(ts) = cursor.timestamp() {
+							query.push(format!(
+								" AND ((fud.modified_at IS NULL AND f.f_id {} ",
+								comparison
+							));
+							query.push_bind(cursor_f_id);
+							query.push(format!(
+								") OR (fud.modified_at IS NOT NULL AND (fud.modified_at, f.f_id) {} (",
+								comparison
+							));
+							query.push_bind(ts);
+							query.push(", ");
+							query.push_bind(cursor_f_id);
+							query.push(")))");
+						}
+					}
+					"name" => {
+						if let Some(name) = cursor.string_value() {
+							query.push(format!(" AND (f.file_name, f.f_id) {} (", comparison));
+							query.push_bind(name.to_string());
+							query.push(", ");
+							query.push_bind(cursor_f_id);
+							query.push(")");
+						}
+					}
+					_ => {
+						// "created" or default
+						if let Some(ts) = cursor.timestamp() {
+							query.push(format!(" AND (f.created_at, f.f_id) {} (", comparison));
+							query.push_bind(ts);
+							query.push(", ");
+							query.push_bind(cursor_f_id);
+							query.push(")");
+						}
+					}
+				}
+			}
 		}
 	}
 
-	query.push(" LIMIT ");
-	query.push_bind(opts._limit.unwrap_or(100) as i64);
+	match sort_field {
+		"recent" if has_user => {
+			// Sort by user's access time (NULLs last for DESC, NULLs first for ASC)
+			query.push(format!(
+				" ORDER BY CASE WHEN fud.accessed_at IS NULL THEN {} ELSE {} END, fud.accessed_at {}, f.f_id {}",
+				if is_desc { 1 } else { 0 },
+				if is_desc { 0 } else { 1 },
+				sort_dir, sort_dir
+			));
+		}
+		"modified" if has_user => {
+			// Sort by user's modification time (NULLs last for DESC, NULLs first for ASC)
+			query.push(format!(
+				" ORDER BY CASE WHEN fud.modified_at IS NULL THEN {} ELSE {} END, fud.modified_at {}, f.f_id {}",
+				if is_desc { 1 } else { 0 },
+				if is_desc { 0 } else { 1 },
+				sort_dir, sort_dir
+			));
+		}
+		"name" => {
+			query.push(format!(" ORDER BY f.file_name {}, f.f_id {}", sort_dir, sort_dir));
+		}
+		_ => {
+			// Default (including "created"): sort by file creation time
+			query.push(format!(" ORDER BY f.created_at {}, f.f_id {}", sort_dir, sort_dir));
+		}
+	}
+
+	// Fetch limit+1 to determine hasMore
+	// Note: SQLite doesn't allow bound parameters in LIMIT clause, so we use format!
+	let limit = opts.limit.unwrap_or(30) as i64;
+	query.push(format!(" LIMIT {}", limit + 1));
+
+	debug!("SQL: {}", query.sql());
 
 	let res = query
 		.build()

@@ -104,7 +104,51 @@ pub(crate) async fn list(
 			query.push(" AND a.action_id=").push_bind(action_id);
 		}
 	}
-	query.push(" ORDER BY a.created_at DESC LIMIT 100");
+
+	// Determine sort order (currently only created_at is supported)
+	let _sort_field = opts.sort.as_deref().unwrap_or("created");
+	let sort_dir = match opts.sort_dir.as_deref() {
+		Some("asc") => "ASC",
+		Some("desc") => "DESC",
+		_ => "DESC", // Default DESC for actions
+	};
+	let is_desc = sort_dir == "DESC";
+
+	// Parse cursor for keyset pagination
+	if let Some(cursor_str) = &opts.cursor {
+		if let Some(cursor) = cloudillo::types::CursorData::decode(cursor_str) {
+			// Look up internal a_id from cursor's external action_id
+			let cursor_a_id: Option<i64> =
+				sqlx::query_scalar("SELECT a_id FROM actions WHERE tn_id=? AND action_id=?")
+					.bind(tn_id.0)
+					.bind(&cursor.id)
+					.fetch_optional(db)
+					.await
+					.ok()
+					.flatten();
+
+			if let Some(cursor_a_id) = cursor_a_id {
+				// Keyset pagination: (created_at, a_id) < (cursor_ts, cursor_a_id) for DESC
+				// Note: push_bind() adds bind placeholders, don't use ? in push() strings
+				let comparison = if is_desc { "<" } else { ">" };
+				if let Some(ts) = cursor.timestamp() {
+					query.push(format!(" AND (a.created_at, a.a_id) {} (", comparison));
+					query.push_bind(ts);
+					query.push(", ");
+					query.push_bind(cursor_a_id);
+					query.push(")");
+				}
+			}
+		}
+	}
+
+	query.push(format!(" ORDER BY a.created_at {}, a.a_id {}", sort_dir, sort_dir));
+
+	// Fetch limit+1 to determine hasMore
+	// Note: SQLite doesn't allow bound parameters in LIMIT clause, so we use format!
+	let limit = opts.limit.unwrap_or(20) as i64;
+	query.push(format!(" LIMIT {}", limit + 1));
+
 	debug!("SQL: {}", query.sql());
 
 	let res = query

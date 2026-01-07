@@ -43,9 +43,12 @@ pub async fn list_actions(
 		opts.viewer_id_tag = Some(subject_id_tag.to_string());
 	}
 
+	let limit = opts.limit.unwrap_or(20) as usize;
+	let sort_field = opts.sort.as_deref().unwrap_or("created");
+
 	let actions = app.meta_adapter.list_actions(tn_id, &opts).await?;
 
-	let filtered = filter_actions_by_visibility(
+	let mut filtered = filter_actions_by_visibility(
 		&app,
 		tn_id,
 		subject_id_tag,
@@ -55,8 +58,23 @@ pub async fn list_actions(
 	)
 	.await?;
 
-	let total = filtered.len(); // TODO: Add proper pagination tracking to MetaAdapter
-	let response = ApiResponse::with_pagination(filtered, 0, 20, total)
+	// Check if there are more results (we fetched limit+1)
+	let has_more = filtered.len() > limit;
+	if has_more {
+		filtered.truncate(limit);
+	}
+
+	// Build next cursor from last item
+	let next_cursor = if has_more && !filtered.is_empty() {
+		let last = filtered.last().ok_or(Error::Internal("no last item".into()))?;
+		let sort_value = serde_json::Value::Number(last.created_at.0.into());
+		let cursor = types::CursorData::new(sort_field, sort_value, &last.action_id);
+		Some(cursor.encode())
+	} else {
+		None
+	};
+
+	let response = ApiResponse::with_cursor_pagination(filtered, next_cursor, has_more)
 		.with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))

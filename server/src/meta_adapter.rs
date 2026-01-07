@@ -269,9 +269,19 @@ where
 	Ok(Some(s.split(',').map(|v| v.trim().to_string()).collect()))
 }
 
+/// Options for listing actions
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListActionOptions {
+	/// Maximum number of items to return (default: 20)
+	pub limit: Option<u32>,
+	/// Cursor for pagination (opaque base64-encoded string)
+	pub cursor: Option<String>,
+	/// Sort order: 'created' (default, created_at DESC)
+	pub sort: Option<String>,
+	/// Sort direction: 'asc' or 'desc' (default: desc)
+	#[serde(rename = "sortDir")]
+	pub sort_dir: Option<String>,
 	#[serde(default, rename = "type", deserialize_with = "deserialize_split")]
 	pub typ: Option<Vec<String>>,
 	#[serde(default, deserialize_with = "deserialize_split")]
@@ -292,7 +302,6 @@ pub struct ListActionOptions {
 	pub subject: Option<String>,
 	#[serde(rename = "createdAfter")]
 	pub created_after: Option<Timestamp>,
-	pub _limit: Option<u32>,
 }
 
 #[skip_serializing_none]
@@ -497,7 +506,10 @@ impl<S: AsRef<str> + Debug + Ord> Ord for FileVariant<S> {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListFileOptions {
-	pub _limit: Option<u32>,
+	/// Maximum number of items to return (default: 30)
+	pub limit: Option<u32>,
+	/// Cursor for pagination (opaque base64-encoded string)
+	pub cursor: Option<String>,
 	#[serde(rename = "fileId")]
 	pub file_id: Option<String>,
 	#[serde(rename = "parentId")]

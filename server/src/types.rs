@@ -457,13 +457,69 @@ pub struct TagInfo {
 // Phase 1: API Response Envelope & Error Types
 //***********************************************
 
-/// Pagination information for list responses
+/// Pagination information for list responses (offset-based - deprecated)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaginationInfo {
 	pub offset: usize,
 	pub limit: usize,
 	pub total: usize,
+}
+
+/// Cursor-based pagination information for list responses
+///
+/// Provides stable pagination that handles data changes between requests.
+/// The cursor is an opaque base64-encoded JSON containing sort field, value, and last item ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorPaginationInfo {
+	/// Opaque cursor for fetching next page (None if no more results)
+	pub next_cursor: Option<String>,
+	/// Whether more results are available
+	pub has_more: bool,
+}
+
+/// Cursor data structure (encoded as base64 JSON in API)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorData {
+	/// Sort field: "created", "modified", "recent", "name"
+	pub s: String,
+	/// Sort value (timestamp as i64 or string for name)
+	pub v: serde_json::Value,
+	/// Last item's external ID (file_id or action_id)
+	pub id: String,
+}
+
+impl CursorData {
+	/// Create a new cursor from sort field, value, and item ID
+	pub fn new(sort_field: &str, sort_value: serde_json::Value, item_id: &str) -> Self {
+		Self { s: sort_field.to_string(), v: sort_value, id: item_id.to_string() }
+	}
+
+	/// Encode cursor to base64 string
+	pub fn encode(&self) -> String {
+		use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+		let json = serde_json::to_string(self).unwrap_or_default();
+		URL_SAFE_NO_PAD.encode(json.as_bytes())
+	}
+
+	/// Decode cursor from base64 string
+	pub fn decode(cursor: &str) -> Option<Self> {
+		use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+		let bytes = URL_SAFE_NO_PAD.decode(cursor).ok()?;
+		let json = String::from_utf8(bytes).ok()?;
+		serde_json::from_str(&json).ok()
+	}
+
+	/// Get sort value as i64 timestamp (for date fields)
+	pub fn timestamp(&self) -> Option<i64> {
+		self.v.as_i64()
+	}
+
+	/// Get sort value as string (for name field)
+	pub fn string_value(&self) -> Option<&str> {
+		self.v.as_str()
+	}
 }
 
 /// Success response envelope for single objects
@@ -473,6 +529,8 @@ pub struct ApiResponse<T> {
 	pub data: T,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub pagination: Option<PaginationInfo>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cursor_pagination: Option<CursorPaginationInfo>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub time: Timestamp,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -482,14 +540,32 @@ pub struct ApiResponse<T> {
 impl<T> ApiResponse<T> {
 	/// Create a new response with data and current time
 	pub fn new(data: T) -> Self {
-		Self { data, pagination: None, time: Timestamp::now(), req_id: None }
+		Self {
+			data,
+			pagination: None,
+			cursor_pagination: None,
+			time: Timestamp::now(),
+			req_id: None,
+		}
 	}
 
-	/// Create a response with pagination info
+	/// Create a response with offset-based pagination info (deprecated)
 	pub fn with_pagination(data: T, offset: usize, limit: usize, total: usize) -> Self {
 		Self {
 			data,
 			pagination: Some(PaginationInfo { offset, limit, total }),
+			cursor_pagination: None,
+			time: Timestamp::now(),
+			req_id: None,
+		}
+	}
+
+	/// Create a response with cursor-based pagination
+	pub fn with_cursor_pagination(data: T, next_cursor: Option<String>, has_more: bool) -> Self {
+		Self {
+			data,
+			pagination: None,
+			cursor_pagination: Some(CursorPaginationInfo { next_cursor, has_more }),
 			time: Timestamp::now(),
 			req_id: None,
 		}

@@ -132,10 +132,13 @@ pub async fn get_file_list(
 		None => ("", false),
 	};
 
+	let limit = opts.limit.unwrap_or(30) as usize;
+	let sort_field = opts.sort.as_deref().unwrap_or("created");
+
 	let files = app.meta_adapter.list_files(tn_id, &opts).await?;
 
 	// Filter files by visibility based on subject's access level
-	let filtered = filter::filter_files_by_visibility(
+	let mut filtered = filter::filter_files_by_visibility(
 		&app,
 		tn_id,
 		subject_id_tag,
@@ -145,8 +148,44 @@ pub async fn get_file_list(
 	)
 	.await?;
 
-	let total = filtered.len();
-	let response = ApiResponse::with_pagination(filtered, 0, 20, total)
+	// Check if there are more results (we fetched limit+1)
+	let has_more = filtered.len() > limit;
+	if has_more {
+		filtered.truncate(limit);
+	}
+
+	// Build next cursor from last item
+	let next_cursor = if has_more && !filtered.is_empty() {
+		let last = filtered.last().ok_or(Error::Internal("no last item".into()))?;
+		let sort_value = match sort_field {
+			"recent" => {
+				// Use user's accessed_at if available, otherwise created_at
+				let ts = last
+					.user_data
+					.as_ref()
+					.and_then(|ud| ud.accessed_at)
+					.unwrap_or(last.created_at);
+				serde_json::Value::Number(ts.0.into())
+			}
+			"modified" => {
+				// Use user's modified_at if available, otherwise created_at
+				let ts = last
+					.user_data
+					.as_ref()
+					.and_then(|ud| ud.modified_at)
+					.unwrap_or(last.created_at);
+				serde_json::Value::Number(ts.0.into())
+			}
+			"name" => serde_json::Value::String(last.file_name.to_string()),
+			_ => serde_json::Value::Number(last.created_at.0.into()),
+		};
+		let cursor = types::CursorData::new(sort_field, sort_value, &last.file_id);
+		Some(cursor.encode())
+	} else {
+		None
+	};
+
+	let response = ApiResponse::with_cursor_pagination(filtered, next_cursor, has_more)
 		.with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
