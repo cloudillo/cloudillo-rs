@@ -174,6 +174,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/idp/identities", post(idp::handler::create_identity))
 		.route("/api/idp/identities/{identity_id}", get(idp::handler::get_identity_by_id))
 		.route("/api/idp/identities/{identity_id}", delete(idp::handler::delete_identity))
+		.route("/api/idp/identities/{identity_id}", patch(idp::handler::update_identity_settings))
 		.route("/api/idp/identities/{identity_id}/address", put(idp::handler::update_identity_address))
 
 		// --- IDP API Key Management ---

@@ -246,6 +246,7 @@ pub async fn process_registration(
 		status: IdentityStatus::Pending,
 		address,
 		address_type,
+		dyndns: false,
 		lang: reg_content.lang.as_deref(),
 		expires_at: Some(expires_at),
 	};

@@ -1,6 +1,7 @@
 //! IDP (Identity Provider) REST endpoints for managing identity registrations
 
 use axum::{
+	body::Bytes,
 	extract::{ConnectInfo, Path, Query, State},
 	http::StatusCode,
 	Json,
@@ -17,7 +18,7 @@ use crate::identity_provider_adapter::{
 };
 use crate::prelude::*;
 use crate::settings::SettingValue;
-use crate::types::{ApiResponse, Timestamp};
+use crate::types::{serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse, Timestamp};
 
 /// Check if IDP functionality is enabled for a tenant
 async fn check_idp_enabled(app: &App, tn_id: TnId) -> ClResult<()> {
@@ -103,12 +104,22 @@ pub struct IdentityResponse {
 	/// Owner id_tag (for community ownership)
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub owner_id_tag: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub address: Option<String>,
-	pub address_updated_at: Option<i64>,
+	#[serde(
+		skip_serializing_if = "Option::is_none",
+		serialize_with = "serialize_timestamp_iso_opt"
+	)]
+	pub address_updated_at: Option<Timestamp>,
+	/// Dynamic DNS mode - uses 60s TTL for faster propagation (default: false)
+	pub dyndns: bool,
 	pub status: String,
-	pub created_at: i64,
-	pub updated_at: i64,
-	pub expires_at: i64,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub updated_at: Timestamp,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub expires_at: Timestamp,
 	/// API key (only returned during creation, never stored or returned in subsequent reads)
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub api_key: Option<String>,
@@ -124,11 +135,12 @@ impl From<Identity> for IdentityResponse {
 			registrar_id_tag: identity.registrar_id_tag.to_string(),
 			owner_id_tag: identity.owner_id_tag.map(|o| o.to_string()),
 			address: identity.address.map(|a| a.to_string()),
-			address_updated_at: identity.address_updated_at.map(|ts| ts.0),
+			address_updated_at: identity.address_updated_at,
+			dyndns: identity.dyndns,
 			status: identity.status.to_string(),
-			created_at: identity.created_at.0,
-			updated_at: identity.updated_at.0,
-			expires_at: identity.expires_at.0,
+			created_at: identity.created_at,
+			updated_at: identity.updated_at,
+			expires_at: identity.expires_at,
 			api_key: None, // Never included in From<Identity>, only set during creation
 		}
 	}
@@ -146,10 +158,13 @@ pub struct CreateIdentityRequest {
 	pub owner_id_tag: Option<String>,
 	/// Initial address (optional)
 	pub address: Option<String>,
+	/// Enable dynamic DNS mode (60s TTL) - defaults to false
+	#[serde(default)]
+	pub dyndns: bool,
 }
 
 /// Request structure for updating identity address
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct UpdateAddressRequest {
 	/// New address for the identity (optional, leave empty for automatic peer IP)
 	#[serde(default)]
@@ -157,6 +172,26 @@ pub struct UpdateAddressRequest {
 	/// If true and address is not provided, use the peer IP address
 	#[serde(default)]
 	pub auto_address: bool,
+}
+
+/// Response structure for address update - only returns the updated address
+#[derive(Debug, Clone, Serialize)]
+pub struct AddressUpdateResponse {
+	pub address: String,
+}
+
+/// Normalize identity path parameter - accepts either full id_tag or just prefix
+/// If prefix-only (no dots), appends the registrar's domain
+fn normalize_identity_path(identity_id: &str, registrar_id_tag: &str) -> String {
+	if identity_id.contains('.') {
+		// Full id_tag provided
+		identity_id.to_string()
+	} else {
+		// Prefix only - append registrar's full domain
+		// registrar_id_tag is the domain (e.g., "home.w9.hu")
+		// identity format: "prefix.domain" (e.g., "test8.home.w9.hu")
+		format!("{}.{}", identity_id, registrar_id_tag)
+	}
 }
 
 /// Query parameters for listing identities
@@ -411,6 +446,7 @@ pub async fn create_identity(
 		status: IdentityStatus::Pending,
 		address: create_req.address.as_deref(),
 		address_type,
+		dyndns: create_req.dyndns,
 		lang: None,
 		expires_at: Some(expires_at),
 	};
@@ -477,13 +513,21 @@ pub async fn update_identity_address(
 	Path(identity_id): Path<String>,
 	ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
 	OptionalRequestId(req_id): OptionalRequestId,
-	Json(update_req): Json<UpdateAddressRequest>,
-) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
+	body: Bytes,
+) -> ClResult<(StatusCode, Json<ApiResponse<AddressUpdateResponse>>)> {
 	info!(
 		identity_id = %identity_id,
 		registrar_id_tag = %registrar_id_tag,
 		"PUT /api/idp/identities/:id/address - Updating identity address"
 	);
+
+	// Parse request body - accept empty body as auto mode
+	let update_req: UpdateAddressRequest = if body.is_empty() {
+		UpdateAddressRequest::default()
+	} else {
+		serde_json::from_slice(&body)
+			.map_err(|e| Error::ValidationError(format!("Invalid JSON body: {}", e)))?
+	};
 
 	// Check if IDP is enabled for this tenant
 	check_idp_enabled(&app, tn_id).await?;
@@ -493,9 +537,12 @@ pub async fn update_identity_address(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
 
+	// Normalize path parameter (accept prefix-only or full id_tag)
+	let normalized_id = normalize_identity_path(&identity_id, &registrar_id_tag);
+
 	// Parse and validate identity id_tag against registrar's domain
 	let (id_tag_prefix, id_tag_domain) =
-		parse_and_validate_identity_id_tag(&identity_id, &registrar_id_tag)?;
+		parse_and_validate_identity_id_tag(&normalized_id, &registrar_id_tag)?;
 
 	// Get the identity first to check authorization using split components
 	let existing = idp_adapter
@@ -517,35 +564,34 @@ pub async fn update_identity_address(
 	}
 
 	// Determine the address to use
-	// Support both "auto" as a string value and the auto_address boolean flag
+	// Empty/missing body or address = use peer IP (auto mode)
+	// Supports: auto_address=true, address="auto", address="", address=null, empty body
 	let address_to_update = if update_req.auto_address {
-		// Use peer IP address (legacy auto_address flag)
+		// Explicit auto flag
 		socket_addr.ip().to_string()
-	} else if let Some(addr) = update_req.address {
-		if addr == "auto" {
-			// Use peer IP address (new "auto" string value)
-			socket_addr.ip().to_string()
-		} else {
-			// Use provided address
-			addr
-		}
 	} else {
-		// No address provided and auto_address is false
-		return Err(Error::ValidationError(
-			"Address is required when auto_address is false".to_string(),
-		));
+		match update_req.address {
+			Some(addr) if !addr.is_empty() && addr != "auto" => {
+				// Explicit non-empty address provided
+				addr
+			}
+			_ => {
+				// Empty, missing, or "auto" - use peer IP
+				socket_addr.ip().to_string()
+			}
+		}
 	};
 
 	// Check if the address has actually changed - optimization to avoid unnecessary updates
 	if let Some(current_addr) = &existing.address {
 		if current_addr.as_ref() == address_to_update {
-			// Address hasn't changed, return the existing identity
+			// Address hasn't changed, return early with current address
 			info!(
 				identity_id = %identity_id,
 				address = %address_to_update,
 				"Address unchanged, skipping update"
 			);
-			let response_data = IdentityResponse::from(existing);
+			let response_data = AddressUpdateResponse { address: address_to_update };
 			let mut response = ApiResponse::new(response_data);
 			if let Some(id) = req_id {
 				response = response.with_req_id(id);
@@ -565,7 +611,7 @@ pub async fn update_identity_address(
 	);
 
 	// Use optimized address-only update for better performance
-	let updated_identity = idp_adapter
+	let _updated_identity = idp_adapter
 		.update_identity_address(&id_tag_prefix, &id_tag_domain, &address_to_update, address_type)
 		.await
 		.map_err(|e| {
@@ -573,7 +619,8 @@ pub async fn update_identity_address(
 			e
 		})?;
 
-	let response_data = IdentityResponse::from(updated_identity);
+	// Return only the address in the response
+	let response_data = AddressUpdateResponse { address: address_to_update };
 	let mut response = ApiResponse::new(response_data);
 	if let Some(id) = req_id {
 		response = response.with_req_id(id);
@@ -638,6 +685,83 @@ pub async fn delete_identity(
 	let _ = idp_adapter.decrement_quota(&registrar_id_tag, 0).await;
 
 	let mut response = ApiResponse::new(());
+	if let Some(id) = req_id {
+		response = response.with_req_id(id);
+	}
+
+	Ok((StatusCode::OK, Json(response)))
+}
+
+/// Request structure for updating identity settings
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateIdentitySettingsRequest {
+	/// Enable dynamic DNS mode (60s TTL instead of 3600s)
+	pub dyndns: Option<bool>,
+}
+
+/// PATCH /api/idp/identities/:id - Update identity settings
+#[axum::debug_handler]
+pub async fn update_identity_settings(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(registrar_id_tag): IdTag,
+	Path(identity_id): Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(update_req): Json<UpdateIdentitySettingsRequest>,
+) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
+	info!(
+		identity_id = %identity_id,
+		registrar_id_tag = %registrar_id_tag,
+		dyndns = ?update_req.dyndns,
+		"PATCH /api/idp/identities/:id - Updating identity settings"
+	);
+
+	// Check if IDP is enabled for this tenant
+	check_idp_enabled(&app, tn_id).await?;
+
+	// Verify Identity Provider adapter is available
+	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
+		"Identity Provider not available on this instance".to_string(),
+	))?;
+
+	// Parse and validate identity id_tag against registrar's domain
+	let (id_tag_prefix, id_tag_domain) =
+		parse_and_validate_identity_id_tag(&identity_id, &registrar_id_tag)?;
+
+	// Get the identity first to check authorization
+	let existing = idp_adapter
+		.read_identity(&id_tag_prefix, &id_tag_domain)
+		.await?
+		.ok_or(Error::NotFound)?;
+
+	// Check authorization using new helper (owner or registrar while Pending)
+	if !can_access_identity(&existing, &registrar_id_tag) {
+		warn!(
+			identity_id = %identity_id,
+			requested_by = %registrar_id_tag,
+			registrar = %existing.registrar_id_tag,
+			owner = ?existing.owner_id_tag,
+			status = ?existing.status,
+			"Unauthorized update to identity settings"
+		);
+		return Err(Error::PermissionDenied);
+	}
+
+	// Build update options
+	let update_opts = UpdateIdentityOptions { dyndns: update_req.dyndns, ..Default::default() };
+
+	// Update the identity
+	let updated_identity = idp_adapter
+		.update_identity(&id_tag_prefix, &id_tag_domain, update_opts)
+		.await
+		.map_err(|e| {
+			warn!("Failed to update identity settings: {}", e);
+			e
+		})?;
+
+	let response_data = IdentityResponse::from(updated_identity);
+	let mut response = ApiResponse::new(response_data);
 	if let Some(id) = req_id {
 		response = response.with_req_id(id);
 	}

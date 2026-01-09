@@ -14,12 +14,30 @@ use crate::auth_adapter::AuthCtx;
 use crate::core::{extract::RequestId, Auth, IdTag};
 use crate::prelude::*;
 
-/// API key prefix for detection
-const API_KEY_PREFIX: &str = "cl_";
+/// Tenant API key prefix (validated by auth adapter)
+const TENANT_API_KEY_PREFIX: &str = "cl_";
 
-/// Check if a token is an API key (starts with cl_)
-fn is_api_key(token: &str) -> bool {
-	token.starts_with(API_KEY_PREFIX)
+/// IDP API key prefix (validated by identity provider adapter)
+const IDP_API_KEY_PREFIX: &str = "idp_";
+
+/// API key type for routing to correct validation adapter
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKeyType {
+	/// Tenant API key (cl_ prefix) - validated by auth adapter
+	Tenant,
+	/// IDP API key (idp_ prefix) - validated by identity provider adapter
+	Idp,
+}
+
+/// Check if a token is an API key and return its type
+fn get_api_key_type(token: &str) -> Option<ApiKeyType> {
+	if token.starts_with(TENANT_API_KEY_PREFIX) {
+		Some(ApiKeyType::Tenant)
+	} else if token.starts_with(IDP_API_KEY_PREFIX) {
+		Some(ApiKeyType::Idp)
+	} else {
+		None
+	}
 }
 
 // Type aliases for permission check middleware components
@@ -133,35 +151,64 @@ pub async fn require_auth(
 		query_token.ok_or(Error::PermissionDenied)?
 	};
 
-	// Validate token or API key
-	let claims = if is_api_key(&token) {
-		// Validate API key
-		let validation = state.auth_adapter.validate_api_key(&token).await.map_err(|e| {
-			warn!("API key validation failed: {:?}", e);
-			Error::PermissionDenied
-		})?;
+	// Validate token based on type
+	let claims = match get_api_key_type(&token) {
+		Some(ApiKeyType::Tenant) => {
+			// Validate tenant API key (cl_ prefix)
+			let validation = state.auth_adapter.validate_api_key(&token).await.map_err(|e| {
+				warn!("Tenant API key validation failed: {:?}", e);
+				Error::PermissionDenied
+			})?;
 
-		// Verify API key belongs to requested tenant
-		if validation.tn_id != tn_id {
-			warn!(
-				"API key tenant mismatch: key belongs to {:?} but request is for {:?}",
-				validation.tn_id, tn_id
-			);
-			return Err(Error::PermissionDenied);
-		}
+			// Verify API key belongs to requested tenant
+			if validation.tn_id != tn_id {
+				warn!(
+					"API key tenant mismatch: key belongs to {:?} but request is for {:?}",
+					validation.tn_id, tn_id
+				);
+				return Err(Error::PermissionDenied);
+			}
 
-		AuthCtx {
-			tn_id: validation.tn_id,
-			id_tag: validation.id_tag,
-			roles: validation
-				.roles
-				.map(|r| r.split(',').map(Box::from).collect())
-				.unwrap_or_default(),
-			scope: validation.scopes,
+			AuthCtx {
+				tn_id: validation.tn_id,
+				id_tag: validation.id_tag,
+				roles: validation
+					.roles
+					.map(|r| r.split(',').map(Box::from).collect())
+					.unwrap_or_default(),
+				scope: validation.scopes,
+			}
 		}
-	} else {
-		// Validate JWT token (existing flow)
-		state.auth_adapter.validate_token(tn_id, &token).await?
+		Some(ApiKeyType::Idp) => {
+			// Validate IDP API key (idp_ prefix)
+			let idp_adapter = state.idp_adapter.as_ref().ok_or_else(|| {
+				warn!("IDP API key used but Identity Provider not available");
+				Error::ServiceUnavailable("Identity Provider not available".to_string())
+			})?;
+
+			let auth_id_tag = idp_adapter
+				.verify_api_key(&token)
+				.await
+				.map_err(|e| {
+					warn!("IDP API key validation error: {:?}", e);
+					Error::PermissionDenied
+				})?
+				.ok_or_else(|| {
+					warn!("IDP API key validation failed: key not found or expired");
+					Error::PermissionDenied
+				})?;
+
+			AuthCtx {
+				tn_id, // From request host lookup
+				id_tag: auth_id_tag.into(),
+				roles: Box::new([]), // IDP keys don't have roles
+				scope: None,
+			}
+		}
+		None => {
+			// Validate JWT token (existing flow)
+			state.auth_adapter.validate_token(tn_id, &token).await?
+		}
 	};
 
 	req.extensions_mut().insert(Auth(claims));
@@ -195,28 +242,58 @@ pub async fn optional_auth(
 		// Try to get tn_id
 		match state.auth_adapter.read_tn_id(&id_tag.0).await {
 			Ok(tn_id) => {
-				// Try to validate token or API key
-				let claims_result = if is_api_key(token) {
-					// Validate API key
-					state.auth_adapter.validate_api_key(token).await.map(|validation| {
-						// Verify API key belongs to requested tenant
-						if validation.tn_id != tn_id {
-							return Err(Error::PermissionDenied);
+				// Try to validate token based on type
+				let claims_result: Result<Result<AuthCtx, Error>, Error> =
+					match get_api_key_type(token) {
+						Some(ApiKeyType::Tenant) => {
+							// Validate tenant API key (cl_ prefix)
+							state.auth_adapter.validate_api_key(token).await.map(|validation| {
+								// Verify API key belongs to requested tenant
+								if validation.tn_id != tn_id {
+									return Err(Error::PermissionDenied);
+								}
+								Ok(AuthCtx {
+									tn_id: validation.tn_id,
+									id_tag: validation.id_tag,
+									roles: validation
+										.roles
+										.map(|r| r.split(',').map(Box::from).collect())
+										.unwrap_or_default(),
+									scope: validation.scopes,
+								})
+							})
 						}
-						Ok(AuthCtx {
-							tn_id: validation.tn_id,
-							id_tag: validation.id_tag,
-							roles: validation
-								.roles
-								.map(|r| r.split(',').map(Box::from).collect())
-								.unwrap_or_default(),
-							scope: validation.scopes,
-						})
-					})
-				} else {
-					// Validate JWT token
-					state.auth_adapter.validate_token(tn_id, token).await.map(Ok)
-				};
+						Some(ApiKeyType::Idp) => {
+							// Validate IDP API key (idp_ prefix)
+							if let Some(idp_adapter) = state.idp_adapter.as_ref() {
+								match idp_adapter.verify_api_key(token).await {
+									Ok(Some(auth_id_tag)) => Ok(Ok(AuthCtx {
+										tn_id,
+										id_tag: auth_id_tag.into(),
+										roles: Box::new([]),
+										scope: None,
+									})),
+									Ok(None) => {
+										warn!("IDP API key validation failed: key not found or expired");
+										Err(Error::PermissionDenied)
+									}
+									Err(e) => {
+										warn!("IDP API key validation error: {:?}", e);
+										Err(Error::PermissionDenied)
+									}
+								}
+							} else {
+								warn!("IDP API key used but Identity Provider not available");
+								Err(Error::ServiceUnavailable(
+									"Identity Provider not available".to_string(),
+								))
+							}
+						}
+						None => {
+							// Validate JWT token
+							state.auth_adapter.validate_token(tn_id, token).await.map(Ok)
+						}
+					};
 
 				match claims_result {
 					Ok(Ok(claims)) => {

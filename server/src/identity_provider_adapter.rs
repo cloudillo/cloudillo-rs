@@ -81,6 +81,8 @@ pub struct Identity {
 	pub address_type: Option<AddressType>,
 	/// Timestamp when the address was last updated
 	pub address_updated_at: Option<Timestamp>,
+	/// Whether this identity uses dynamic DNS (60s TTL instead of 3600s)
+	pub dyndns: bool,
 	/// Preferred language for emails and notifications (e.g., "hu", "de")
 	pub lang: Option<Box<str>>,
 	/// Status of this identity in its lifecycle
@@ -113,6 +115,8 @@ pub struct CreateIdentityOptions<'a> {
 	pub address: Option<&'a str>,
 	/// Type of the address being set (if address is provided)
 	pub address_type: Option<AddressType>,
+	/// Whether this identity uses dynamic DNS (60s TTL instead of 3600s)
+	pub dyndns: bool,
 	/// Preferred language for emails and notifications (e.g., "hu", "de")
 	pub lang: Option<&'a str>,
 	/// When the identity should expire (optional, can have default)
@@ -130,6 +134,8 @@ pub struct UpdateIdentityOptions {
 	pub address: Option<Box<str>>,
 	/// Type of the address being set (if address is provided)
 	pub address_type: Option<AddressType>,
+	/// Whether to use dynamic DNS (60s TTL instead of 3600s)
+	pub dyndns: Option<bool>,
 	/// New preferred language (if changing)
 	pub lang: Option<Option<Box<str>>>,
 	/// New status (if changing)
@@ -487,6 +493,7 @@ mod tests {
 			address: Some("192.168.1.1".into()),
 			address_type: Some(AddressType::Ipv4),
 			address_updated_at: Some(now),
+			dyndns: false,
 			lang: Some("hu".into()),
 			status: IdentityStatus::Active,
 			created_at: now,
@@ -500,6 +507,7 @@ mod tests {
 		assert_eq!(identity.registrar_id_tag.as_ref(), "registrar");
 		assert_eq!(identity.lang.as_deref(), Some("hu"));
 		assert_eq!(identity.status, IdentityStatus::Active);
+		assert!(!identity.dyndns);
 		assert!(identity.expires_at > identity.created_at);
 	}
 
@@ -515,6 +523,7 @@ mod tests {
 			address: None,
 			address_type: None,
 			address_updated_at: None,
+			dyndns: false,
 			lang: None,
 			status: IdentityStatus::Pending,
 			created_at: now,
@@ -564,6 +573,7 @@ mod tests {
 			status: IdentityStatus::Pending,
 			address: Some("192.168.1.1"),
 			address_type: Some(AddressType::Ipv4),
+			dyndns: false,
 			lang: Some("de"),
 			expires_at: Some(Timestamp::now().add_seconds(86400)),
 		};
@@ -574,6 +584,7 @@ mod tests {
 		assert_eq!(opts.registrar_id_tag, "registrar");
 		assert_eq!(opts.lang, Some("de"));
 		assert_eq!(opts.status, IdentityStatus::Pending);
+		assert!(!opts.dyndns);
 		assert!(opts.expires_at.is_some());
 	}
 
@@ -588,6 +599,7 @@ mod tests {
 			status: IdentityStatus::Pending,
 			address: None,
 			address_type: None,
+			dyndns: false,
 			lang: None,
 			expires_at: None,
 		};

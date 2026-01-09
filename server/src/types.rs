@@ -134,9 +134,9 @@ pub fn serialize_timestamp_iso<S>(ts: &Timestamp, serializer: S) -> Result<S::Ok
 where
 	S: Serializer,
 {
-	use chrono::DateTime;
+	use chrono::{DateTime, SecondsFormat};
 	let dt = DateTime::from_timestamp(ts.0, 0).unwrap_or_default();
-	serializer.serialize_str(&dt.to_rfc3339())
+	serializer.serialize_str(&dt.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
 /// Serialize Option<Timestamp> as ISO 8601 string for API responses

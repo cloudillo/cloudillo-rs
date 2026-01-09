@@ -10,37 +10,47 @@ use serde::{Deserialize, Serialize};
 use crate::core::extract::{IdTag, OptionalRequestId};
 use crate::identity_provider_adapter::{ApiKey, CreateApiKeyOptions, ListApiKeyOptions};
 use crate::prelude::*;
-use crate::types::{ApiResponse, Timestamp};
+use crate::types::{serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse, Timestamp};
 
-/// Helper function to split id_tag into (prefix, domain)
-/// Format: "prefix.domain" (e.g., "some.user.cloudillo.net" -> prefix: "some.user", domain: "cloudillo.net")
-fn parse_id_tag(id_tag: &str) -> ClResult<(String, String)> {
-	// Use rfind to split on the last dot, since prefix may contain dots
-	if let Some(pos) = id_tag.rfind('.') {
-		let prefix = id_tag[..pos].to_string();
-		let domain = id_tag[pos + 1..].to_string();
-		if !prefix.is_empty() && !domain.is_empty() {
-			Ok((prefix, domain))
+/// Helper function to split id_tag into (prefix, domain) using the tenant domain
+fn split_id_tag_with_tenant(id_tag: &str, tenant_domain: &str) -> ClResult<(String, String)> {
+	let expected_suffix = format!(".{}", tenant_domain);
+	if id_tag.ends_with(&expected_suffix) {
+		let prefix = id_tag[..id_tag.len() - expected_suffix.len()].to_string();
+		if !prefix.is_empty() {
+			Ok((prefix, tenant_domain.to_string()))
 		} else {
-			Err(Error::ValidationError(
-				"Invalid id_tag: prefix and domain cannot be empty".to_string(),
-			))
+			Err(Error::ValidationError("Invalid id_tag: prefix cannot be empty".to_string()))
 		}
 	} else {
-		Err(Error::ValidationError("Invalid id_tag format: expected prefix.domain".to_string()))
+		Err(Error::ValidationError(format!(
+			"Identity {} does not belong to this IDP domain {}",
+			id_tag, tenant_domain
+		)))
 	}
 }
 
 /// Response structure for API key details (metadata only, no plaintext key)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiKeyResponse {
 	pub id: i32,
 	pub id_tag: String,
 	pub key_prefix: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub name: Option<String>,
-	pub created_at: i64,
-	pub last_used_at: Option<i64>,
-	pub expires_at: Option<i64>,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+	#[serde(
+		skip_serializing_if = "Option::is_none",
+		serialize_with = "serialize_timestamp_iso_opt"
+	)]
+	pub last_used_at: Option<Timestamp>,
+	#[serde(
+		skip_serializing_if = "Option::is_none",
+		serialize_with = "serialize_timestamp_iso_opt"
+	)]
+	pub expires_at: Option<Timestamp>,
 }
 
 impl From<ApiKey> for ApiKeyResponse {
@@ -52,15 +62,16 @@ impl From<ApiKey> for ApiKeyResponse {
 			id_tag,
 			key_prefix: key.key_prefix.to_string(),
 			name: key.name.clone(),
-			created_at: key.created_at.0,
-			last_used_at: key.last_used_at.map(|ts| ts.0),
-			expires_at: key.expires_at.map(|ts| ts.0),
+			created_at: key.created_at,
+			last_used_at: key.last_used_at,
+			expires_at: key.expires_at,
 		}
 	}
 }
 
 /// Response structure for newly created API key (includes plaintext key, shown once)
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreatedApiKeyResponse {
 	pub api_key: ApiKeyResponse,
 	pub plaintext_key: String,
@@ -68,7 +79,10 @@ pub struct CreatedApiKeyResponse {
 
 /// Request structure for creating a new API key
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateApiKeyRequest {
+	/// The identity id_tag to create the API key for
+	pub id_tag: String,
 	/// Human-readable name for the API key
 	pub name: Option<String>,
 	/// Expiration timestamp (optional, defaults to no expiration)
@@ -77,23 +91,41 @@ pub struct CreateApiKeyRequest {
 
 /// Query parameters for listing API keys
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ListApiKeysQuery {
+	/// The identity id_tag to list API keys for
+	pub id_tag: Option<String>,
 	/// Limit results
 	pub limit: Option<u32>,
 	/// Offset for pagination
 	pub offset: Option<u32>,
 }
 
-/// POST /api/api-keys - Create a new API key for the authenticated identity
+/// POST /api/api-keys - Create a new API key for a specified identity
 #[axum::debug_handler]
 pub async fn create_api_key(
 	State(app): State<App>,
-	IdTag(id_tag): IdTag,
+	tn_id: TnId,
+	IdTag(_auth_id_tag): IdTag,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(create_req): Json<CreateApiKeyRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CreatedApiKeyResponse>>)> {
-	// Parse id_tag into prefix and domain
-	let (id_tag_prefix, id_tag_domain) = parse_id_tag(&id_tag)?;
+	// Get the tenant domain (IDP domain)
+	let tenant_domain = app.auth_adapter.read_id_tag(tn_id).await?;
+
+	// The id_tag from request must end with the tenant domain
+	let expected_suffix = format!(".{}", tenant_domain);
+	if !create_req.id_tag.ends_with(&expected_suffix) {
+		return Err(Error::ValidationError(format!(
+			"Identity {} does not belong to this IDP domain {}",
+			create_req.id_tag, tenant_domain
+		)));
+	}
+
+	// Extract prefix by removing the domain suffix
+	let id_tag_prefix =
+		create_req.id_tag[..create_req.id_tag.len() - expected_suffix.len()].to_string();
+	let id_tag_domain = tenant_domain.to_string();
 
 	info!(
 		id_tag_prefix = %id_tag_prefix,
@@ -143,16 +175,26 @@ pub async fn create_api_key(
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// GET /api/api-keys - List API keys for the authenticated identity
+/// GET /api/api-keys - List API keys for a specified identity
 #[axum::debug_handler]
 pub async fn list_api_keys(
 	State(app): State<App>,
-	IdTag(id_tag): IdTag,
+	tn_id: TnId,
+	IdTag(_auth_id_tag): IdTag,
 	Query(query_params): Query<ListApiKeysQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ApiKeyResponse>>>)> {
-	// Parse id_tag into prefix and domain
-	let (id_tag_prefix, id_tag_domain) = parse_id_tag(&id_tag)?;
+	// id_tag is required to list API keys
+	let id_tag = query_params
+		.id_tag
+		.as_ref()
+		.ok_or(Error::ValidationError("id_tag query parameter is required".to_string()))?;
+
+	// Get the tenant domain (IDP domain)
+	let tenant_domain = app.auth_adapter.read_id_tag(tn_id).await?;
+
+	// Split id_tag using tenant domain
+	let (id_tag_prefix, id_tag_domain) = split_id_tag_with_tenant(id_tag, &tenant_domain)?;
 
 	info!(
 		id_tag_prefix = %id_tag_prefix,
@@ -187,16 +229,29 @@ pub async fn list_api_keys(
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// Query parameters for get/delete API key endpoints
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyIdTagQuery {
+	/// The identity id_tag the API key belongs to
+	pub id_tag: String,
+}
+
 /// GET /api/idp/api-keys/{api_key_id} - Get a specific API key by ID
 #[axum::debug_handler]
 pub async fn get_api_key(
 	State(app): State<App>,
-	IdTag(id_tag): IdTag,
+	tn_id: TnId,
+	IdTag(_auth_id_tag): IdTag,
 	Path(api_key_id): Path<i32>,
+	Query(query): Query<ApiKeyIdTagQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ApiKeyResponse>>)> {
-	// Parse id_tag into prefix and domain
-	let (id_tag_prefix, id_tag_domain) = parse_id_tag(&id_tag)?;
+	// Get the tenant domain (IDP domain)
+	let tenant_domain = app.auth_adapter.read_id_tag(tn_id).await?;
+
+	// Split id_tag using tenant domain
+	let (id_tag_prefix, id_tag_domain) = split_id_tag_with_tenant(&query.id_tag, &tenant_domain)?;
 
 	info!(
 		api_key_id = %api_key_id,
@@ -234,12 +289,17 @@ pub async fn get_api_key(
 #[axum::debug_handler]
 pub async fn delete_api_key(
 	State(app): State<App>,
-	IdTag(id_tag): IdTag,
+	tn_id: TnId,
+	IdTag(_auth_id_tag): IdTag,
 	Path(api_key_id): Path<i32>,
+	Query(query): Query<ApiKeyIdTagQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	// Parse id_tag into prefix and domain for logging
-	let (id_tag_prefix, id_tag_domain) = parse_id_tag(&id_tag)?;
+	// Get the tenant domain (IDP domain)
+	let tenant_domain = app.auth_adapter.read_id_tag(tn_id).await?;
+
+	// Split id_tag using tenant domain
+	let (id_tag_prefix, id_tag_domain) = split_id_tag_with_tenant(&query.id_tag, &tenant_domain)?;
 
 	info!(
 		api_key_id = %api_key_id,
