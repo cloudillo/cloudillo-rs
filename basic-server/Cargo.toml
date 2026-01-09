@@ -10,4 +10,4 @@ cloudillo-meta-adapter-sqlite = { path = "../adapters/meta-adapter-sqlite" }
 cloudillo-crdt-adapter-redb = { path = "../adapters/crdt-adapter-redb" }
 cloudillo-rtdb-adapter-redb = { path = "../adapters/rtdb-adapter-redb" }
 cloudillo = { path = "../server" }
-tokio = { version = "1.48.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }

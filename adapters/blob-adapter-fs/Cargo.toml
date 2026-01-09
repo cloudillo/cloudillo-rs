@@ -1,15 +1,15 @@
 [package]
 name = "cloudillo-blob-adapter-fs"
-version = "0.8.0"
+version = "0.8.5"
 edition = "2021"
 
 [dependencies]
 async-trait = "0.1.89"
 cloudillo = { path = "../../server" }
 futures-core = "0.3.31"
-tokio = { version = "1.48.0", features = ["fs"] }
-tokio-util = { version = "0.7.17", features = ["io"] }
+tokio = { version = "1.49.0", features = ["fs"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
 
 [dev-dependencies]
-tempfile = "3.23"
-tokio = { version = "1.48.0", features = ["fs", "rt"] }
+tempfile = "3.24"
+tokio = { version = "1.49.0", features = ["fs", "rt"] }
