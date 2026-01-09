@@ -524,10 +524,17 @@ pub async fn get_access_token(
 		let profile_roles =
 			app.meta_adapter.read_profile_roles(tn_id, &auth.id_tag).await.ok().flatten();
 
+		// If user is the tenant owner, they implicitly have leader role
+		let profile_roles: Option<Box<[Box<str>]>> = if auth.id_tag == id_tag.0 {
+			Some(vec!["leader".into()].into_boxed_slice())
+		} else {
+			profile_roles
+		};
+
 		let expanded_roles = profile_roles
 			.as_ref()
 			.map(|roles| expand_roles(roles))
-			.filter(|s| !s.is_empty());
+			.filter(|s: &String| !s.is_empty());
 
 		let token_result = app
 			.auth_adapter

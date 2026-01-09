@@ -66,6 +66,28 @@ pub(crate) async fn ensure_jwt_secret(db: &SqlitePool) -> ClResult<String> {
 	Ok(secret_str)
 }
 
+/// Build tenant owner roles string by merging base leader roles with DB roles
+/// Tenant owners always have the full role hierarchy up to leader,
+/// plus any extra roles from DB (like site-admin)
+fn build_tenant_owner_roles(db_roles: Option<&str>) -> Box<str> {
+	const BASE_ROLES: &str = "public,follower,supporter,contributor,moderator,leader";
+	match db_roles {
+		Some(extra) if !extra.is_empty() => Box::from(format!("{},{}", BASE_ROLES, extra)),
+		_ => Box::from(BASE_ROLES),
+	}
+}
+
+/// Parse roles string into boxed slice for AuthLogin
+fn parse_roles_to_boxed_slice(roles_str: &str) -> Option<Box<[Box<str>]>> {
+	Some(
+		roles_str
+			.split(',')
+			.map(|s| s.into())
+			.collect::<Vec<Box<str>>>()
+			.into_boxed_slice(),
+	)
+}
+
 /// Check tenant password
 pub(crate) async fn check_tenant_password(
 	db: &SqlitePool,
@@ -84,14 +106,16 @@ pub(crate) async fn check_tenant_password(
 		Ok(row) => {
 			let _tn_id: TnId = row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?;
 			let password_hash: Box<str> = row.try_get("password").or(Err(Error::DbError))?;
-			let roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
+			let db_roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
 
 			crypto::check_password(worker, password, password_hash).await?;
+
+			let roles_str = build_tenant_owner_roles(db_roles);
 			let access_token = AccessToken {
 				iss: Box::from(id_tag),
 				sub: None,
 				scope: None,
-				r: roles.map(Box::from),
+				r: Some(roles_str.clone()),
 				exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
 			};
 			let token = crypto::generate_access_token(
@@ -104,7 +128,7 @@ pub(crate) async fn check_tenant_password(
 			Ok(AuthLogin {
 				tn_id: row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?,
 				id_tag: Box::from(id_tag),
-				roles: parse_str_list_optional(roles),
+				roles: parse_roles_to_boxed_slice(&roles_str),
 				token,
 			})
 		}
@@ -157,13 +181,14 @@ pub(crate) async fn create_tenant_login(
 		Err(_) => Err(Error::PermissionDenied),
 		Ok(row) => {
 			let _tn_id = row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?;
-			let roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
+			let db_roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
 
+			let roles_str = build_tenant_owner_roles(db_roles);
 			let access_token = AccessToken {
 				iss: Box::from(id_tag),
 				sub: None,
 				scope: None,
-				r: roles.map(Box::from),
+				r: Some(roles_str.clone()),
 				exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
 			};
 			let token = crypto::generate_access_token(
@@ -176,7 +201,7 @@ pub(crate) async fn create_tenant_login(
 			Ok(AuthLogin {
 				tn_id: row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?,
 				id_tag: Box::from(id_tag),
-				roles: parse_str_list_optional(roles),
+				roles: parse_roles_to_boxed_slice(&roles_str),
 				token,
 			})
 		}
