@@ -60,6 +60,89 @@ pub struct RegistrationResult {
 	pub response: IdpRegResponse,
 }
 
+/// Parameters for sending activation email
+pub struct SendActivationEmailParams<'a> {
+	pub id_tag_prefix: &'a str,
+	pub id_tag_domain: &'a str,
+	pub email: &'a str,
+	pub lang: Option<String>,
+}
+
+/// Send activation email for a newly created identity
+///
+/// Creates an activation reference and schedules the email task.
+/// Returns the activation reference string on success.
+pub async fn send_activation_email(
+	app: &App,
+	tn_id: crate::types::TnId,
+	params: SendActivationEmailParams<'_>,
+) -> ClResult<String> {
+	let identity_id = format!("{}.{}", params.id_tag_prefix, params.id_tag_domain);
+	let idp_domain = params.id_tag_domain;
+
+	// Create activation reference (24 hours validity)
+	let expires_at_ref = Some(Timestamp::now().add_seconds(24 * 60 * 60));
+	let (activation_ref, activation_link) = crate::r#ref::handler::create_ref_internal(
+		app,
+		tn_id,
+		crate::r#ref::handler::CreateRefInternalParams {
+			id_tag: idp_domain,
+			typ: "idp.activation",
+			description: Some("Identity provider activation"),
+			expires_at: expires_at_ref,
+			path_prefix: "/idp/activate",
+			resource_id: Some(&identity_id),
+		},
+	)
+	.await?;
+
+	// Schedule email task
+	let template_vars = serde_json::json!({
+		"identity_tag": identity_id,
+		"activation_link": activation_link,
+		"identity_provider": idp_domain,
+		"expire_hours": 24,
+	});
+
+	let email_task_key = format!("email:idp-activation:{}:{}", tn_id.0, identity_id);
+	match crate::email::EmailModule::schedule_email_task_with_key(
+		&app.scheduler,
+		&app.settings,
+		tn_id,
+		crate::email::EmailTaskParams {
+			to: params.email.to_string(),
+			subject: None,
+			template_name: "idp-activation".to_string(),
+			template_vars,
+			lang: params.lang,
+			custom_key: Some(email_task_key),
+			from_name_override: Some(format!("{} Identity Provider", idp_domain.to_uppercase())),
+		},
+	)
+	.await
+	{
+		Ok(_) => {
+			info!(
+				id_tag_prefix = %params.id_tag_prefix,
+				id_tag_domain = %params.id_tag_domain,
+				email = %params.email,
+				"Activation email scheduled successfully"
+			);
+		}
+		Err(e) => {
+			warn!(
+				id_tag_prefix = %params.id_tag_prefix,
+				id_tag_domain = %params.id_tag_domain,
+				email = %params.email,
+				error = %e,
+				"Failed to schedule activation email"
+			);
+		}
+	}
+
+	Ok(activation_ref)
+}
+
 /// Process an identity registration request
 ///
 /// This function contains the core business logic for IDP:REG processing:
@@ -293,77 +376,31 @@ pub async fn process_registration(
 		"API key created for identity activation"
 	);
 
-	// Schedule activation email with clickable link (only if email is provided)
+	// Send activation email (if email is provided)
 	let tn_id = crate::types::TnId(params.tenant_id as u32);
 	let identity_id = format!("{}.{}", identity.id_tag_prefix, identity.id_tag_domain);
-
-	// Create activation reference with IDP domain in URL and identity_id in resource_id
-	// The activation link points to the IDP server (id_tag_domain), not the identity domain
-	let expires_at_ref = Some(Timestamp::now().add_seconds(24 * 60 * 60)); // 24 hours
-	let idp_domain = &identity.id_tag_domain;
-	let (activation_ref, activation_link) = crate::r#ref::handler::create_ref_internal(
-		app,
-		tn_id,
-		crate::r#ref::handler::CreateRefInternalParams {
-			id_tag: idp_domain, // URL points to IDP domain (e.g., home.w9.hu)
-			typ: "idp.activation",
-			description: Some("Identity provider activation"),
-			expires_at: expires_at_ref,
-			path_prefix: "/idp/activate",
-			resource_id: Some(&identity_id), // Store identity (e.g., test.home.w9.hu) in resource_id
-		},
-	)
-	.await?;
-
-	if let Some(ref email) = identity.email {
-		// Use identity_provider (IDP domain) instead of instance_name for activation emails
-		let identity_provider = &identity.id_tag_domain;
-
-		let template_vars = serde_json::json!({
-			"identity_tag": identity_id,
-			"activation_link": activation_link,
-			"identity_provider": identity_provider,
-			"expire_hours": 24,
-		});
-
-		// Schedule the email task with retries
-		// Use custom key including identity_id to prevent duplicate tasks for same identity
-		let email_task_key = format!("email:idp-activation:{}:{}", tn_id.0, identity_id);
-		match crate::email::EmailModule::schedule_email_task_with_key(
-			&app.scheduler,
-			&app.settings,
+	let activation_ref = if let Some(ref email) = identity.email {
+		match send_activation_email(
+			app,
 			tn_id,
-			crate::email::EmailTaskParams {
-				to: email.to_string(),
-				subject: None, // Subject is defined in the template frontmatter
-				template_name: "idp-activation".to_string(),
-				template_vars,
+			SendActivationEmailParams {
+				id_tag_prefix: &identity.id_tag_prefix,
+				id_tag_domain: &identity.id_tag_domain,
+				email,
 				lang: reg_content.lang.clone(),
-				custom_key: Some(email_task_key),
-				from_name_override: Some(format!(
-					"{} Identity Provider",
-					identity_provider.to_uppercase()
-				)),
 			},
 		)
 		.await
 		{
-			Ok(_) => {
-				info!(
-					id_tag_prefix = %identity.id_tag_prefix,
-					id_tag_domain = %identity.id_tag_domain,
-					email = %email,
-					"Activation email scheduled successfully"
-				);
-			}
+			Ok(ref_id) => ref_id,
 			Err(e) => {
 				warn!(
 					id_tag_prefix = %identity.id_tag_prefix,
 					id_tag_domain = %identity.id_tag_domain,
-					email = %email,
 					error = %e,
-					"Failed to schedule activation email, continuing registration"
+					"Failed to send activation email, continuing registration"
 				);
+				String::new()
 			}
 		}
 	} else {
@@ -374,7 +411,8 @@ pub async fn process_registration(
 			owner = ?identity.owner_id_tag,
 			"Identity created without email - activation via owner required"
 		);
-	}
+		String::new()
+	};
 
 	// Update quota counts
 	if idp_adapter.get_quota(registrar_id_tag).await.is_ok() {

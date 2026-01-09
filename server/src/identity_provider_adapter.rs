@@ -145,8 +145,11 @@ pub struct UpdateIdentityOptions {
 }
 
 /// Options for listing identities
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ListIdentityOptions {
+	/// Filter by identity domain (the domain part of id_tag, e.g., "home.w9.hu")
+	/// This is REQUIRED - only show identities belonging to this domain
+	pub id_tag_domain: String,
 	/// Filter by email address (partial match)
 	pub email: Option<String>,
 	/// Filter by registrar id_tag

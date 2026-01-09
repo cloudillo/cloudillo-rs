@@ -161,6 +161,19 @@ pub struct CreateIdentityRequest {
 	/// Enable dynamic DNS mode (60s TTL) - defaults to false
 	#[serde(default)]
 	pub dyndns: bool,
+	/// Whether to send activation email (default: true)
+	/// If false, identity is created as Active instead of Pending
+	#[serde(default = "default_true")]
+	pub send_activation_email: bool,
+	/// Whether to create an API key for the identity (default: false)
+	#[serde(default)]
+	pub create_api_key: bool,
+	/// Optional name for the API key
+	pub api_key_name: Option<String>,
+}
+
+fn default_true() -> bool {
+	true
 }
 
 /// Request structure for updating identity address
@@ -181,16 +194,16 @@ pub struct AddressUpdateResponse {
 }
 
 /// Normalize identity path parameter - accepts either full id_tag or just prefix
-/// If prefix-only (no dots), appends the registrar's domain
-fn normalize_identity_path(identity_id: &str, registrar_id_tag: &str) -> String {
+/// If prefix-only (no dots), appends the IDP domain
+fn normalize_identity_path(identity_id: &str, idp_domain: &str) -> String {
 	if identity_id.contains('.') {
 		// Full id_tag provided
 		identity_id.to_string()
 	} else {
-		// Prefix only - append registrar's full domain
-		// registrar_id_tag is the domain (e.g., "home.w9.hu")
+		// Prefix only - append IDP domain
+		// idp_domain is the tenant domain (e.g., "home.w9.hu")
 		// identity format: "prefix.domain" (e.g., "test8.home.w9.hu")
-		format!("{}.{}", identity_id, registrar_id_tag)
+		format!("{}.{}", identity_id, idp_domain)
 	}
 }
 
@@ -217,13 +230,13 @@ pub struct ListIdentitiesQuery {
 pub async fn get_identity_by_id(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(registrar_id_tag): IdTag,
+	IdTag(idp_domain): IdTag,
 	Path(identity_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
 	info!(
 		identity_id = %identity_id,
-		registrar_id_tag = %registrar_id_tag,
+		idp_domain = %idp_domain,
 		"GET /api/idp/identities/:id"
 	);
 
@@ -235,9 +248,9 @@ pub async fn get_identity_by_id(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
 
-	// Parse and validate identity id_tag against registrar's domain
+	// Parse and validate identity id_tag against IDP domain
 	let (id_tag_prefix, id_tag_domain) =
-		parse_and_validate_identity_id_tag(&identity_id, &registrar_id_tag)?;
+		parse_and_validate_identity_id_tag(&identity_id, &idp_domain)?;
 
 	// Read the identity using split components
 	let identity = idp_adapter
@@ -246,10 +259,10 @@ pub async fn get_identity_by_id(
 		.ok_or(Error::NotFound)?;
 
 	// Check authorization using new helper (owner or registrar while Pending)
-	if !can_access_identity(&identity, &registrar_id_tag) {
+	if !can_access_identity(&identity, &idp_domain) {
 		warn!(
 			identity_id = %identity_id,
-			requested_by = %registrar_id_tag,
+			requested_by = %idp_domain,
 			registrar = %identity.registrar_id_tag,
 			owner = ?identity.owner_id_tag,
 			status = ?identity.status,
@@ -272,12 +285,12 @@ pub async fn get_identity_by_id(
 pub async fn list_identities(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(registrar_id_tag): IdTag,
+	IdTag(idp_domain): IdTag,
 	Query(query_params): Query<ListIdentitiesQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<IdentityResponse>>>)> {
 	info!(
-		registrar_id_tag = %registrar_id_tag,
+		idp_domain = %idp_domain,
 		"GET /api/idp/identities"
 	);
 
@@ -290,8 +303,9 @@ pub async fn list_identities(
 	))?;
 
 	let opts = ListIdentityOptions {
+		id_tag_domain: idp_domain.to_string(),
 		email: query_params.email.clone(),
-		registrar_id_tag: Some(registrar_id_tag.to_string()),
+		registrar_id_tag: None,
 		owner_id_tag: query_params.owner_id_tag.clone(),
 		status: query_params.status.as_ref().and_then(|s| s.parse().ok()),
 		expires_after: None,
@@ -321,13 +335,13 @@ pub async fn list_identities(
 pub async fn create_identity(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(registrar_id_tag): IdTag,
+	IdTag(idp_domain): IdTag,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(create_req): Json<CreateIdentityRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
 	info!(
 		identity_id = %create_req.id_tag,
-		registrar_id_tag = %registrar_id_tag,
+		idp_domain = %idp_domain,
 		email = ?create_req.email,
 		owner_id_tag = ?create_req.owner_id_tag,
 		"POST /api/idp/identities - Creating new identity"
@@ -353,15 +367,15 @@ pub async fn create_identity(
 		));
 	}
 
-	// Parse and validate identity id_tag against registrar's domain
+	// Parse and validate identity id_tag against IDP domain
 	let (id_tag_prefix, id_tag_domain) =
-		parse_and_validate_identity_id_tag(&create_req.id_tag, &registrar_id_tag)?;
+		parse_and_validate_identity_id_tag(&create_req.id_tag, &idp_domain)?;
 
 	// Forbid creation of identities with prefix 'cl-o'
 	if id_tag_prefix == "cl-o" {
 		warn!(
 			id_tag_prefix = %id_tag_prefix,
-			registrar_id_tag = %registrar_id_tag,
+			idp_domain = %idp_domain,
 			"Attempted to create identity with forbidden prefix 'cl-o'"
 		);
 		return Err(Error::ValidationError(
@@ -369,17 +383,8 @@ pub async fn create_identity(
 		));
 	}
 
-	// Check registrar quota
-	let quota = idp_adapter.get_quota(&registrar_id_tag).await?;
-	if quota.current_identities >= quota.max_identities {
-		warn!(
-			registrar_id_tag = %registrar_id_tag,
-			current = quota.current_identities,
-			max = quota.max_identities,
-			"Registrar quota exceeded"
-		);
-		return Err(Error::ValidationError("Registrar quota exceeded".to_string()));
-	}
+	// Management API: No quota check needed - IDP owner manages their own capacity
+	// Quotas are only for external registrars using REG tokens (handled in registration.rs)
 
 	// Get renewal interval from settings (in days) and convert to seconds
 	let renewal_interval_days = match app.settings.get(tn_id, "idp.renewal_interval").await {
@@ -437,13 +442,20 @@ pub async fn create_identity(
 	};
 
 	// Create the identity with split id_tag components
+	// Status depends on whether activation email will be sent
+	let initial_status = if create_req.send_activation_email {
+		IdentityStatus::Pending // Will be activated via email
+	} else {
+		IdentityStatus::Active // No email, create as active directly
+	};
+
 	let opts = CreateIdentityOptions {
 		id_tag_prefix: &id_tag_prefix,
 		id_tag_domain: &id_tag_domain,
 		email: create_req.email.as_deref(),
-		registrar_id_tag: &registrar_id_tag,
+		registrar_id_tag: &idp_domain,
 		owner_id_tag: create_req.owner_id_tag.as_deref(),
-		status: IdentityStatus::Pending,
+		status: initial_status,
 		address: create_req.address.as_deref(),
 		address_type,
 		dyndns: create_req.dyndns,
@@ -469,32 +481,63 @@ pub async fn create_identity(
 		"Identity created successfully"
 	);
 
-	// Create API key for the identity
-	let create_key_opts = crate::identity_provider_adapter::CreateApiKeyOptions {
-		id_tag_prefix: &id_tag_prefix,
-		id_tag_domain: &id_tag_domain,
-		name: Some("identity-key"),
-		expires_at: None, // No expiration for identity keys
+	// Create API key for the identity (if requested)
+	let created_key = if create_req.create_api_key {
+		let key_name = create_req.api_key_name.as_deref().unwrap_or("identity-key");
+		let create_key_opts = crate::identity_provider_adapter::CreateApiKeyOptions {
+			id_tag_prefix: &id_tag_prefix,
+			id_tag_domain: &id_tag_domain,
+			name: Some(key_name),
+			expires_at: None, // No expiration for identity keys
+		};
+
+		match idp_adapter.create_api_key(create_key_opts).await {
+			Ok(key) => {
+				info!(
+					id_tag_prefix = %id_tag_prefix,
+					id_tag_domain = %id_tag_domain,
+					key_prefix = %key.api_key.key_prefix,
+					"API key created for identity"
+				);
+				Some(key.plaintext_key)
+			}
+			Err(e) => {
+				warn!("Failed to create API key for identity: {}", e);
+				None
+			}
+		}
+	} else {
+		None
 	};
 
-	let created_key = idp_adapter.create_api_key(create_key_opts).await.map_err(|e| {
-		warn!("Failed to create API key for identity: {}", e);
-		e
-	})?;
-
-	info!(
-		id_tag_prefix = %id_tag_prefix,
-		id_tag_domain = %id_tag_domain,
-		key_prefix = %created_key.api_key.key_prefix,
-		"API key created for identity"
-	);
-
-	// Update quota
-	let _ = idp_adapter.increment_quota(&registrar_id_tag, 0).await;
+	// Send activation email (if enabled and email provided)
+	if create_req.send_activation_email {
+		if let Some(ref email) = identity.email {
+			if let Err(e) = crate::idp::registration::send_activation_email(
+				&app,
+				tn_id,
+				crate::idp::registration::SendActivationEmailParams {
+					id_tag_prefix: &identity.id_tag_prefix,
+					id_tag_domain: &identity.id_tag_domain,
+					email,
+					lang: None,
+				},
+			)
+			.await
+			{
+				warn!(
+					id_tag_prefix = %id_tag_prefix,
+					id_tag_domain = %id_tag_domain,
+					error = %e,
+					"Failed to send activation email"
+				);
+			}
+		}
+	}
 
 	let mut response_data = IdentityResponse::from(identity);
 	// Include the API key in the response (only shown once!)
-	response_data.api_key = Some(created_key.plaintext_key);
+	response_data.api_key = created_key;
 
 	let mut response = ApiResponse::new(response_data);
 	if let Some(id) = req_id {
@@ -509,7 +552,7 @@ pub async fn create_identity(
 pub async fn update_identity_address(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(registrar_id_tag): IdTag,
+	IdTag(idp_domain): IdTag,
 	Path(identity_id): Path<String>,
 	ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -517,7 +560,7 @@ pub async fn update_identity_address(
 ) -> ClResult<(StatusCode, Json<ApiResponse<AddressUpdateResponse>>)> {
 	info!(
 		identity_id = %identity_id,
-		registrar_id_tag = %registrar_id_tag,
+		idp_domain = %idp_domain,
 		"PUT /api/idp/identities/:id/address - Updating identity address"
 	);
 
@@ -538,11 +581,11 @@ pub async fn update_identity_address(
 	))?;
 
 	// Normalize path parameter (accept prefix-only or full id_tag)
-	let normalized_id = normalize_identity_path(&identity_id, &registrar_id_tag);
+	let normalized_id = normalize_identity_path(&identity_id, &idp_domain);
 
-	// Parse and validate identity id_tag against registrar's domain
+	// Parse and validate identity id_tag against IDP domain
 	let (id_tag_prefix, id_tag_domain) =
-		parse_and_validate_identity_id_tag(&normalized_id, &registrar_id_tag)?;
+		parse_and_validate_identity_id_tag(&normalized_id, &idp_domain)?;
 
 	// Get the identity first to check authorization using split components
 	let existing = idp_adapter
@@ -551,10 +594,10 @@ pub async fn update_identity_address(
 		.ok_or(Error::NotFound)?;
 
 	// Check authorization using new helper (owner or registrar while Pending)
-	if !can_access_identity(&existing, &registrar_id_tag) {
+	if !can_access_identity(&existing, &idp_domain) {
 		warn!(
 			identity_id = %identity_id,
-			requested_by = %registrar_id_tag,
+			requested_by = %idp_domain,
 			registrar = %existing.registrar_id_tag,
 			owner = ?existing.owner_id_tag,
 			status = ?existing.status,
@@ -634,13 +677,13 @@ pub async fn update_identity_address(
 pub async fn delete_identity(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(registrar_id_tag): IdTag,
+	IdTag(idp_domain): IdTag,
 	Path(identity_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	info!(
 		identity_id = %identity_id,
-		registrar_id_tag = %registrar_id_tag,
+		idp_domain = %idp_domain,
 		"DELETE /api/idp/identities/:id - Deleting identity"
 	);
 
@@ -652,9 +695,9 @@ pub async fn delete_identity(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
 
-	// Parse and validate identity id_tag against registrar's domain
+	// Parse and validate identity id_tag against IDP domain
 	let (id_tag_prefix, id_tag_domain) =
-		parse_and_validate_identity_id_tag(&identity_id, &registrar_id_tag)?;
+		parse_and_validate_identity_id_tag(&identity_id, &idp_domain)?;
 
 	// Get the identity first to check authorization
 	let existing = idp_adapter
@@ -663,10 +706,10 @@ pub async fn delete_identity(
 		.ok_or(Error::NotFound)?;
 
 	// Check authorization using new helper (owner or registrar while Pending)
-	if !can_access_identity(&existing, &registrar_id_tag) {
+	if !can_access_identity(&existing, &idp_domain) {
 		warn!(
 			identity_id = %identity_id,
-			requested_by = %registrar_id_tag,
+			requested_by = %idp_domain,
 			registrar = %existing.registrar_id_tag,
 			owner = ?existing.owner_id_tag,
 			status = ?existing.status,
@@ -680,9 +723,6 @@ pub async fn delete_identity(
 		warn!("Failed to delete identity: {}", e);
 		e
 	})?;
-
-	// Decrement quota
-	let _ = idp_adapter.decrement_quota(&registrar_id_tag, 0).await;
 
 	let mut response = ApiResponse::new(());
 	if let Some(id) = req_id {
@@ -705,14 +745,14 @@ pub struct UpdateIdentitySettingsRequest {
 pub async fn update_identity_settings(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(registrar_id_tag): IdTag,
+	IdTag(idp_domain): IdTag,
 	Path(identity_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(update_req): Json<UpdateIdentitySettingsRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
 	info!(
 		identity_id = %identity_id,
-		registrar_id_tag = %registrar_id_tag,
+		idp_domain = %idp_domain,
 		dyndns = ?update_req.dyndns,
 		"PATCH /api/idp/identities/:id - Updating identity settings"
 	);
@@ -725,9 +765,9 @@ pub async fn update_identity_settings(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
 
-	// Parse and validate identity id_tag against registrar's domain
+	// Parse and validate identity id_tag against IDP domain
 	let (id_tag_prefix, id_tag_domain) =
-		parse_and_validate_identity_id_tag(&identity_id, &registrar_id_tag)?;
+		parse_and_validate_identity_id_tag(&identity_id, &idp_domain)?;
 
 	// Get the identity first to check authorization
 	let existing = idp_adapter
@@ -736,10 +776,10 @@ pub async fn update_identity_settings(
 		.ok_or(Error::NotFound)?;
 
 	// Check authorization using new helper (owner or registrar while Pending)
-	if !can_access_identity(&existing, &registrar_id_tag) {
+	if !can_access_identity(&existing, &idp_domain) {
 		warn!(
 			identity_id = %identity_id,
-			requested_by = %registrar_id_tag,
+			requested_by = %idp_domain,
 			registrar = %existing.registrar_id_tag,
 			owner = ?existing.owner_id_tag,
 			status = ?existing.status,
