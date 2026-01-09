@@ -3,8 +3,10 @@
 use rustls::sign::CertifiedKey;
 use std::{
 	collections::HashMap,
+	future::Future,
 	path::Path,
 	path::PathBuf,
+	pin::Pin,
 	sync::{Arc, RwLock},
 };
 
@@ -84,6 +86,10 @@ pub struct Adapters {
 	pub idp_adapter: Option<Arc<dyn IdentityProviderAdapter>>,
 }
 
+/// Type alias for async initialization callbacks
+type InitCallback =
+	Box<dyn FnOnce(App) -> Pin<Box<dyn Future<Output = ClResult<()>> + Send>> + Send>;
+
 #[derive(Debug)]
 pub struct AppBuilderOpts {
 	pub mode: ServerMode,
@@ -104,6 +110,7 @@ pub struct AppBuilder {
 	opts: AppBuilderOpts,
 	worker: Option<Arc<worker::WorkerPool>>,
 	adapters: Adapters,
+	on_init: Vec<InitCallback>,
 }
 
 impl AppBuilder {
@@ -136,6 +143,7 @@ impl AppBuilder {
 				rtdb_adapter: None,
 				idp_adapter: None,
 			},
+			on_init: Vec::new(),
 		}
 	}
 
@@ -215,6 +223,17 @@ impl AppBuilder {
 	}
 	pub fn idp_adapter(&mut self, idp_adapter: Arc<dyn IdentityProviderAdapter>) -> &mut Self {
 		self.adapters.idp_adapter = Some(idp_adapter);
+		self
+	}
+
+	/// Register an async initialization callback that runs after App is created
+	/// but before the scheduler starts. Use this to register and schedule tasks.
+	pub fn on_init<F, Fut>(&mut self, f: F) -> &mut Self
+	where
+		F: FnOnce(App) -> Fut + Send + 'static,
+		Fut: Future<Output = ClResult<()>> + Send + 'static,
+	{
+		self.on_init.push(Box::new(move |app| Box::pin(f(app))));
 		self
 	}
 
@@ -395,6 +414,11 @@ impl AppBuilder {
 
 		// Register native hooks for core action types
 		action::native_hooks::register_native_hooks(&app).await?;
+
+		// Run custom init callbacks
+		for callback in self.on_init {
+			callback(app.clone()).await?;
+		}
 
 		// Start scheduler
 		app.scheduler.start(app.clone());

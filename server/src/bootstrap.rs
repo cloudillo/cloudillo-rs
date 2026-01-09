@@ -324,7 +324,6 @@ pub async fn bootstrap(
 	}
 
 	// Schedule profile refresh batch task
-	// This runs every 5 minutes for debugging, change to "0 * * * *" (hourly) for production
 	{
 		let app_clone = app.clone();
 		tokio::spawn(async move {
@@ -333,7 +332,7 @@ pub async fn bootstrap(
 				.scheduler
 				.task(refresh_task)
 				.key("profile.refresh_batch")
-				.cron("*/5 * * * *") // Every 5 minutes for debugging
+				.cron("0 */4 * * *") // Every 4 hours
 				.schedule()
 				.await
 			{
