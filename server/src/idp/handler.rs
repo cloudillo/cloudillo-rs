@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 
 use crate::core::address::parse_address_type;
 use crate::core::app::App;
-use crate::core::extract::{IdTag, OptionalRequestId};
+use crate::core::extract::{Auth, IdTag, OptionalRequestId};
 use crate::core::utils::parse_and_validate_identity_id_tag;
 use crate::identity_provider_adapter::{
 	CreateIdentityOptions, Identity, IdentityStatus, ListIdentityOptions, UpdateIdentityOptions,
@@ -548,11 +548,17 @@ pub async fn create_identity(
 }
 
 /// PUT /api/idp/identities/:id/address - Update identity address
+///
+/// Authorization: The authenticated identity (via IDP API key) must match
+/// the identity being updated. This endpoint is designed for self-updates
+/// where each identity uses its own API key to update its address.
+#[allow(clippy::too_many_arguments)]
 #[axum::debug_handler]
 pub async fn update_identity_address(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(idp_domain): IdTag,
+	Auth(auth): Auth,
 	Path(identity_id): Path<String>,
 	ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -561,6 +567,7 @@ pub async fn update_identity_address(
 	info!(
 		identity_id = %identity_id,
 		idp_domain = %idp_domain,
+		auth_id_tag = %auth.id_tag,
 		"PUT /api/idp/identities/:id/address - Updating identity address"
 	);
 
@@ -587,24 +594,25 @@ pub async fn update_identity_address(
 	let (id_tag_prefix, id_tag_domain) =
 		parse_and_validate_identity_id_tag(&normalized_id, &idp_domain)?;
 
-	// Get the identity first to check authorization using split components
+	// Build the full id_tag for the identity being updated
+	let target_id_tag = format!("{}.{}", id_tag_prefix, id_tag_domain);
+
+	// Authorization: authenticated identity must match the identity being updated
+	if auth.id_tag.as_ref() != target_id_tag {
+		warn!(
+			identity_id = %identity_id,
+			target_id_tag = %target_id_tag,
+			auth_id_tag = %auth.id_tag,
+			"Unauthorized update to identity address - identity mismatch"
+		);
+		return Err(Error::PermissionDenied);
+	}
+
+	// Verify the identity exists
 	let existing = idp_adapter
 		.read_identity(&id_tag_prefix, &id_tag_domain)
 		.await?
 		.ok_or(Error::NotFound)?;
-
-	// Check authorization using new helper (owner or registrar while Pending)
-	if !can_access_identity(&existing, &idp_domain) {
-		warn!(
-			identity_id = %identity_id,
-			requested_by = %idp_domain,
-			registrar = %existing.registrar_id_tag,
-			owner = ?existing.owner_id_tag,
-			status = ?existing.status,
-			"Unauthorized update to identity address"
-		);
-		return Err(Error::PermissionDenied);
-	}
 
 	// Determine the address to use
 	// Empty/missing body or address = use peer IP (auto mode)
