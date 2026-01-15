@@ -22,7 +22,7 @@ use crate::file::{
 	image::ImageResizerTask,
 	pdf::PdfProcessorTask,
 	preset::{self, get_audio_tier, get_image_tier, get_video_tier, presets},
-	store,
+	store, svg,
 	variant::{self, VariantClass},
 	video::VideoTranscoderTask,
 };
@@ -40,6 +40,7 @@ pub fn format_from_content_type(content_type: &str) -> Option<&str> {
 		"image/webp" => "webp",
 		"image/avif" => "avif",
 		"image/gif" => "gif",
+		"image/svg+xml" => "svg",
 		// Video
 		"video/mp4" | "video/quicktime" => "mp4",
 		"video/webm" => "webm",
@@ -81,6 +82,7 @@ pub fn content_type_from_format(format: &str) -> &str {
 		"png" => "image/png",
 		"webp" => "image/webp",
 		"avif" => "image/avif",
+		"svg" => "image/svg+xml",
 		_ => "application/octet-stream",
 	}
 }
@@ -110,6 +112,13 @@ fn serve_file<S: AsRef<str> + Debug>(
 	if let Some(descriptor) = descriptor {
 		response = response.header("X-Cloudillo-Variants", descriptor);
 	};
+
+	// Add CSP headers for SVG files to prevent script execution in federated content
+	if content_type == "image/svg+xml" {
+		response = response
+			.header("Content-Security-Policy", "script-src 'none'; object-src 'none'")
+			.header("X-Content-Type-Options", "nosniff");
+	}
 
 	Ok(response.body(axum::body::Body::from_stream(stream))?)
 }
@@ -285,6 +294,118 @@ async fn handle_post_image(
 		"fileId": format!("@{}", f_id),
 		"thumbnailVariantId": result.thumbnail_variant_id,
 		"dim": [result.dim.0, result.dim.1]
+	}))
+}
+
+/// Handle SVG upload - sanitize, rasterize thumbnail, and store
+async fn handle_post_svg(
+	app: &App,
+	tn_id: types::TnId,
+	f_id: u64,
+	bytes: &[u8],
+	preset: &preset::FilePreset,
+) -> ClResult<serde_json::Value> {
+	// 1. Sanitize SVG
+	let sanitized = svg::sanitize_svg(bytes)?;
+	info!("SVG sanitized: {} -> {} bytes", bytes.len(), sanitized.len());
+
+	// 2. Parse dimensions from sanitized SVG
+	let (orig_width, orig_height) = svg::parse_svg_dimensions(&sanitized)?;
+	info!("SVG dimensions: {}x{}", orig_width, orig_height);
+
+	// 3. Read format settings for thumbnail
+	let thumbnail_format_str = app
+		.settings
+		.get_string(tn_id, "file.thumbnail_format")
+		.await
+		.unwrap_or_else(|_| "webp".to_string());
+	let thumbnail_format: image::ImageFormat =
+		thumbnail_format_str.parse().unwrap_or(image::ImageFormat::Webp);
+
+	// 4. Store sanitized SVG as vis.sd (SVG scales infinitely, no need for separate "orig")
+	// Note: We use vis.sd because:
+	// - Apps typically request vis.sd first, then fall back to vis.hd/orig
+	// - SVG is vector-based, any variant serves as highest quality
+	// - Database PRIMARY KEY (f_id, variant_id, tn_id) prevents two variants with same blob
+	let sd_variant_id = if preset.store_original {
+		store::create_blob_buf(app, tn_id, &sanitized, blob_adapter::CreateBlobOptions::default())
+			.await?
+	} else {
+		hasher::hash("b", &sanitized)
+	};
+
+	// Create vis.sd variant with sanitized SVG
+	app.meta_adapter
+		.create_file_variant(
+			tn_id,
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: sd_variant_id.as_ref(),
+				variant: "vis.sd",
+				format: "svg",
+				resolution: (orig_width, orig_height),
+				size: sanitized.len() as u64,
+				available: preset.store_original,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+		)
+		.await?;
+
+	// 6. Determine thumbnail variant
+	let thumbnail_variant = preset.thumbnail_variant.as_deref().unwrap_or("vis.tn");
+	let thumbnail_tier = preset::get_image_tier(thumbnail_variant);
+	let tn_format = thumbnail_tier.and_then(|t| t.format).unwrap_or(thumbnail_format);
+	let tn_max_dim = thumbnail_tier.map(|t| t.max_dim).unwrap_or(256);
+
+	// 7. Rasterize SVG for thumbnail (synchronous)
+	let resized_tn = svg::rasterize_svg_sync(&sanitized, tn_format, (tn_max_dim, tn_max_dim))?;
+
+	let thumbnail_variant_id = store::create_blob_buf(
+		app,
+		tn_id,
+		&resized_tn.bytes,
+		blob_adapter::CreateBlobOptions::default(),
+	)
+	.await?;
+
+	app.meta_adapter
+		.create_file_variant(
+			tn_id,
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: thumbnail_variant_id.as_ref(),
+				variant: thumbnail_variant,
+				format: tn_format.as_ref(),
+				resolution: (resized_tn.width, resized_tn.height),
+				size: resized_tn.bytes.len() as u64,
+				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+		)
+		.await?;
+
+	info!(
+		"SVG thumbnail created: {}x{} ({} bytes)",
+		resized_tn.width,
+		resized_tn.height,
+		resized_tn.bytes.len()
+	);
+
+	// 8. Schedule FileIdGeneratorTask (no additional variant tasks needed)
+	app.scheduler
+		.task(FileIdGeneratorTask::new(tn_id, f_id))
+		.key(format!("{},{}", tn_id, f_id))
+		.schedule()
+		.await?;
+
+	Ok(json!({
+		"fileId": format!("@{}", f_id),
+		"thumbnailVariantId": thumbnail_variant_id,
+		"dim": [orig_width, orig_height]
 	}))
 }
 
@@ -803,8 +924,18 @@ pub async fn post_file_blob(
 		VariantClass::Visual => {
 			let bytes = to_bytes(body, max_size_bytes).await?;
 			let orig_variant_id = hasher::hash("b", &bytes);
-			let dim = image::get_image_dimensions(&bytes).await?;
-			info!("Image dimensions: {}/{}", dim.0, dim.1);
+
+			// Detect if this is an SVG (check content-type or content itself)
+			let is_svg = content_type == "image/svg+xml"
+				|| (content_type == "application/octet-stream" && svg::is_svg(&bytes));
+
+			// Get dimensions - SVG uses different parsing
+			let dim = if is_svg {
+				svg::parse_svg_dimensions(&bytes)?
+			} else {
+				image::get_image_dimensions(&bytes).await?
+			};
+			info!("Image dimensions: {}/{} (SVG: {})", dim.0, dim.1, is_svg);
 
 			let f_id = app
 				.meta_adapter
@@ -816,7 +947,11 @@ pub async fn post_file_blob(
 						file_id: None,
 						parent_id: None,
 						owner_tag: Some(auth.id_tag.clone()),
-						content_type: content_type.into(),
+						content_type: if is_svg {
+							"image/svg+xml".into()
+						} else {
+							content_type.into()
+						},
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
@@ -830,8 +965,12 @@ pub async fn post_file_blob(
 
 			match f_id {
 				meta_adapter::FileId::FId(f_id) => {
-					let data =
-						handle_post_image(&app, tn_id, f_id, content_type, &bytes, &preset).await?;
+					// Route to SVG or raster image handler
+					let data = if is_svg {
+						handle_post_svg(&app, tn_id, f_id, &bytes, &preset).await?
+					} else {
+						handle_post_image(&app, tn_id, f_id, content_type, &bytes, &preset).await?
+					};
 					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 					Ok((StatusCode::CREATED, Json(response)))
 				}

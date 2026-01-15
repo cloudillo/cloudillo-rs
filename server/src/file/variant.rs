@@ -50,10 +50,9 @@ impl VariantClass {
 	/// Determine variant class from content-type MIME string
 	pub fn from_content_type(content_type: &str) -> Option<Self> {
 		match content_type {
-			// Image
-			"image/jpeg" | "image/png" | "image/webp" | "image/avif" | "image/gif" => {
-				Some(Self::Visual)
-			}
+			// Image (including SVG)
+			"image/jpeg" | "image/png" | "image/webp" | "image/avif" | "image/gif"
+			| "image/svg+xml" => Some(Self::Visual),
 			// Video
 			"video/mp4" | "video/quicktime" | "video/webm" | "video/x-msvideo"
 			| "video/x-matroska" => Some(Self::Video),

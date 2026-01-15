@@ -12,6 +12,7 @@ pub mod perm;
 pub mod preset;
 pub mod settings;
 pub mod store;
+pub mod svg;
 pub mod sync;
 pub mod tag;
 pub mod variant;
