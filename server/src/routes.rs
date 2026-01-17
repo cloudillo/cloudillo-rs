@@ -11,9 +11,7 @@ use axum::{
 };
 use tower::Service;
 use tower_http::{
-	compression::CompressionLayer,
-	services::{ServeDir, ServeFile},
-	set_header::SetResponseHeaderLayer,
+	compression::CompressionLayer, services::ServeDir, set_header::SetResponseHeaderLayer,
 };
 
 use crate::action;
@@ -336,6 +334,86 @@ fn is_font_file(path: &str) -> bool {
 	path.starts_with("fonts/")
 }
 
+/// Check if a path should receive SPA fallback (serve shell's index.html for client routing)
+/// Returns false for:
+/// - API routes (start with /api/)
+/// - WebSocket routes (start with /ws/)
+/// - App routes (start with /apps/) - apps run in iframes, use hash fragments, no path routing
+/// - Paths with file extensions (likely static assets that should 404)
+fn should_serve_spa_fallback(path: &str) -> bool {
+	// Never fallback for API routes
+	if path.starts_with("/api/") {
+		return false;
+	}
+
+	// Never fallback for WebSocket routes
+	if path.starts_with("/ws/") {
+		return false;
+	}
+
+	// Never fallback for app assets - apps run in iframes and use hash fragments, not path routing
+	if path.starts_with("/apps/") {
+		return false;
+	}
+
+	// Never fallback for paths that look like static files (have valid file extensions)
+	// File extensions: dot followed by 2-5 alphanumeric characters at the end
+	// This allows resource IDs with dots (e.g., "home.w9.hu:abc123") to get SPA fallback
+	if let Some(last_segment) = path.rsplit('/').next() {
+		if let Some(dot_pos) = last_segment.rfind('.') {
+			let extension = &last_segment[dot_pos + 1..];
+			// Valid file extension: 2-5 alphanumeric chars only
+			if (2..=5).contains(&extension.len())
+				&& extension.chars().all(|c| c.is_ascii_alphanumeric())
+			{
+				return false;
+			}
+		}
+	}
+
+	true
+}
+
+/// Serve shell's index.html for SPA fallback (client-side routing)
+///
+/// Only used for shell routes (e.g., /app/feed, /settings) - apps use iframes with hash fragments.
+async fn serve_shell_index_html(
+	dist_dir: &std::path::Path,
+	disable_cache: bool,
+) -> axum::response::Response {
+	let file_path = dist_dir.join("index.html");
+
+	match tokio::fs::read(&file_path).await {
+		Ok(content) => {
+			let cache_value = if disable_cache {
+				HeaderValue::from_static("no-store, no-cache")
+			} else {
+				// HTML files: ETag-only, must revalidate on every request
+				HeaderValue::from_static("no-cache, must-revalidate")
+			};
+
+			Response::builder()
+				.status(StatusCode::OK)
+				.header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+				.header(header::CACHE_CONTROL, cache_value)
+				.body(Body::from(content))
+				.unwrap_or_else(|_| Response::new(Body::from("Internal Server Error")))
+		}
+		Err(_) => {
+			// Shell index.html doesn't exist - critical deployment error
+			Response::builder()
+				.status(StatusCode::NOT_FOUND)
+				.header(header::CONTENT_TYPE, "text/plain")
+				.body(Body::from("Not Found"))
+				.unwrap_or_else(|_| {
+					let mut res = Response::new(Body::from("Not Found"));
+					*res.status_mut() = StatusCode::NOT_FOUND;
+					res
+				})
+		}
+	}
+}
+
 /// Serve the service worker with tenant-specific encryption key embedded
 /// Key is only injected if:
 /// 1. Service-Worker: script header is present (browser sets this, JS cannot fake it)
@@ -463,14 +541,26 @@ async fn static_fallback_handler(
 	// Check if this is an app directory or font (need CORS for sandboxed iframes)
 	let needs_cors = is_app_directory(path) || is_font_file(path);
 
-	// Serve static files with cache headers
-	let dist_dir = &app.opts.dist_dir;
-	let mut serve_dir = ServeDir::new(dist_dir)
-		.precompressed_gzip()
-		.precompressed_br()
-		.fallback(ServeFile::new(dist_dir.join("index.html")));
+	// Store path for potential SPA fallback (request is moved by serve_dir.call)
+	let path_owned = path.to_string();
 
-	let mut response = serve_dir.call(request).await.unwrap();
+	// Serve static files - NO unconditional fallback; we handle 404s manually
+	let dist_dir = &app.opts.dist_dir;
+	let mut serve_dir = ServeDir::new(dist_dir).precompressed_gzip().precompressed_br();
+
+	let response = serve_dir.call(request).await.unwrap();
+
+	// Check if file was not found - apply smart SPA fallback
+	if response.status() == StatusCode::NOT_FOUND {
+		// Only serve shell's index.html for client routes (not API, WS, apps, or files with extensions)
+		if should_serve_spa_fallback(&path_owned) {
+			return serve_shell_index_html(dist_dir, disable_cache).await;
+		}
+		// Otherwise return the 404 as-is
+		return response.map(Body::new);
+	}
+
+	let mut response = response;
 
 	// Determine cache policy based on content type
 	let cache_value = if disable_cache {

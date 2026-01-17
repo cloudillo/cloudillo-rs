@@ -512,7 +512,7 @@ pub async fn get_access_token(
 		Ok((StatusCode::OK, Json(response)))
 	} else {
 		// Use authenticated session token - requires auth
-		let auth = maybe_auth.ok_or(Error::PermissionDenied)?;
+		let auth = maybe_auth.ok_or(Error::Unauthorized)?;
 
 		info!(
 			"Using authenticated session for id_tag={}, scope={:?}",
