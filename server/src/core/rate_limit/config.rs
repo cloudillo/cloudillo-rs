@@ -94,11 +94,11 @@ impl Default for RateLimitConfig {
 			},
 			websocket: EndpointCategoryConfig {
 				name: "websocket",
-				// WebSocket: moderate limits (connections are long-lived)
-				ipv4_individual: RateLimitTierConfig::new(10, 20, 200, 100),
-				ipv4_network: RateLimitTierConfig::new(50, 100, 1000, 500),
-				ipv6_subnet: RateLimitTierConfig::new(10, 20, 200, 100),
-				ipv6_provider: RateLimitTierConfig::new(50, 100, 1000, 500),
+				// WebSocket: relaxed limits for collaborative scenarios (connections are long-lived)
+				ipv4_individual: RateLimitTierConfig::new(100, 200, 1000, 500),
+				ipv4_network: RateLimitTierConfig::new(100, 200, 1000, 500),
+				ipv6_subnet: RateLimitTierConfig::new(100, 200, 1000, 500),
+				ipv6_provider: RateLimitTierConfig::new(100, 200, 1000, 500),
 			},
 			max_tracked_ips: 100_000,
 			entry_ttl: Duration::from_secs(3600), // 1 hour
