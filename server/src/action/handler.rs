@@ -148,14 +148,6 @@ pub async fn post_inbox(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(inbox): Json<Inbox>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	// Check if federation is enabled
-	let federation_enabled =
-		app.settings.get_bool(tn_id, "federation.enabled").await.unwrap_or(true); // Default to true if setting not found
-
-	if !federation_enabled {
-		return Err(Error::PermissionDenied);
-	}
-
 	// Pre-decode to check action type for PoW requirement
 	// This check happens here so the error is returned synchronously to the client
 	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&inbox.token) {
@@ -227,14 +219,6 @@ pub async fn post_inbox_sync(
 	use crate::action::process::process_inbound_action_token;
 
 	debug!("POST /api/inbox/sync - Processing synchronous action");
-
-	// Check if federation is enabled
-	let federation_enabled =
-		app.settings.get_bool(tn_id, "federation.enabled").await.unwrap_or(true);
-
-	if !federation_enabled {
-		return Err(Error::PermissionDenied);
-	}
 
 	// Create action ID from token hash
 	let action_id_box = hash("a", inbox.token.as_bytes());

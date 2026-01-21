@@ -8,16 +8,6 @@ use crate::settings::{
 /// Register all federation/action settings (admin-only infrastructure)
 /// Note: User-facing settings are in profile/settings.rs under the profile.* prefix
 pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
-	// Federation enabled
-	registry.register(
-		SettingDefinition::builder("federation.enabled")
-			.description("Enable federation with other instances")
-			.default(SettingValue::Bool(true))
-			.scope(SettingScope::Global)
-			.permission(PermissionLevel::Admin)
-			.build()?,
-	)?;
-
 	// Federation auto-accept followers
 	registry.register(
 		SettingDefinition::builder("federation.auto_accept_followers")

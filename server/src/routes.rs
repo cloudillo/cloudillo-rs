@@ -78,6 +78,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 			"/api/admin/tenants/{id_tag}/password-reset",
 			post(admin::tenant::send_password_reset),
 		)
+		.route("/api/admin/email/test", post(admin::email::send_test_email))
 		.layer(middleware::from_fn_with_state(app.clone(), admin::perm::require_admin));
 
 	// File create routes (check_perm_create for quota/tier checking)

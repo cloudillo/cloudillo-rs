@@ -126,13 +126,13 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
-	// Template directory
+	// Template directory (read-only, can only be set in config file)
 	registry.register(
 		SettingDefinition::builder("email.template_dir")
 			.description("Path to email templates directory")
 			.default(SettingValue::String("./templates/email".into()))
-			.scope(SettingScope::Global)
-			.permission(PermissionLevel::Admin)
+			.scope(SettingScope::System)
+			.permission(PermissionLevel::System)
 			.build()?,
 	)?;
 
