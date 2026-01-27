@@ -1,10 +1,15 @@
 //! CONN (Connection) action native hooks
 //!
 //! Handles bidirectional connection lifecycle:
-//! - on_create: Initiates connection request
-//! - on_receive: Handles incoming connection request
-//! - on_accept: Finalizes connection when accepted
+//! - on_create: Initiates connection request (or acceptance with ACC subtype)
+//! - on_receive: Handles incoming connection request (or acceptance with ACC subtype)
+//! - on_accept: Finalizes connection when accepted (creates CONN:ACC response)
 //! - on_reject: Handles rejection of connection request
+//!
+//! Subtypes:
+//! - None: Normal connection request
+//! - ACC: Connection acceptance response
+//! - DEL: Connection deletion/disconnect
 
 use crate::action::hooks::{HookContext, HookResult};
 use crate::action::task::{create_action, CreateAction};
@@ -52,6 +57,27 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				tracing::warn!("CONN: Failed to update audience profile {}: {}", audience, e);
 			} else {
 				tracing::debug!("CONN: Updated audience profile");
+			}
+		}
+		Some("ACC") => {
+			// Acceptance response: set audience's profile to connected
+			tracing::info!(
+				"CONN:ACC: Creating acceptance response from {} to {}",
+				context.issuer,
+				audience
+			);
+
+			let profile_update = UpdateProfileData {
+				following: Patch::Value(true),
+				connected: Patch::Value(ProfileConnectionStatus::Connected),
+				..Default::default()
+			};
+
+			if let Err(e) = app.meta_adapter.update_profile(tn_id, audience, &profile_update).await
+			{
+				tracing::warn!("CONN:ACC: Failed to update audience profile {}: {}", audience, e);
+			} else {
+				tracing::debug!("CONN:ACC: Updated audience profile to Connected");
 			}
 		}
 		Some("DEL") => {
@@ -250,6 +276,44 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				}
 			}
 		}
+		Some("ACC") => {
+			// Connection accepted - update issuer's profile to connected
+			tracing::info!(
+				"CONN:ACC: Connection acceptance received from {} to {}",
+				context.issuer,
+				audience
+			);
+
+			// Update issuer's profile to connected
+			let profile_update = UpdateProfileData {
+				connected: Patch::Value(ProfileConnectionStatus::Connected),
+				following: Patch::Value(true),
+				..Default::default()
+			};
+
+			if let Err(e) =
+				app.meta_adapter.update_profile(tn_id, &context.issuer, &profile_update).await
+			{
+				tracing::warn!(
+					"CONN:ACC: Failed to update issuer profile {}: {}",
+					context.issuer,
+					e
+				);
+			} else {
+				tracing::debug!("CONN:ACC: Updated issuer profile to Connected");
+			}
+
+			// Set action status to 'N' (notification)
+			let update_opts =
+				UpdateActionDataOptions { status: Patch::Value('N'), ..Default::default() };
+			if let Err(e) = app
+				.meta_adapter
+				.update_action_data(tn_id, &context.action_id, &update_opts)
+				.await
+			{
+				tracing::warn!("CONN:ACC: Failed to update action status to N: {}", e);
+			}
+		}
 		Some("DEL") => {
 			tracing::info!(
 				"CONN:DEL: Received disconnect request from {} to {}",
@@ -291,20 +355,30 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 /// CONN on_accept hook - Handle accepting a connection request
 ///
-/// Logic: Update issuer's profile: connected=true
+/// Logic:
+/// - Create reverse CONN:ACC action to notify the sender and establish connection
+/// - The CONN:ACC on_create hook will update the local profile
+/// - The CONN:ACC on_receive hook on the sender's side will update their profile
 pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::info!("CONN: Connection accepted from {}", context.issuer);
 
 	let tn_id = TnId(context.tenant_id as u32);
 
-	let profile_update = UpdateProfileData {
-		connected: Patch::Value(ProfileConnectionStatus::Connected),
+	// Create reverse CONN:ACC action to notify the sender
+	// The ACC subtype signals this is an acceptance, not a new request
+	let response_action = CreateAction {
+		typ: "CONN".into(),
+		sub_typ: Some("ACC".into()),
+		audience_tag: Some(context.issuer.clone().into()),
 		..Default::default()
 	};
 
-	app.meta_adapter.update_profile(tn_id, &context.issuer, &profile_update).await?;
-
-	tracing::debug!("CONN: Updated issuer profile (connected=Connected)");
+	if let Err(e) = create_action(&app, tn_id, &context.tenant_tag, response_action).await {
+		tracing::warn!("CONN: Failed to create response CONN:ACC action: {}", e);
+		// Don't fail the accept if response creation fails
+	} else {
+		tracing::info!("CONN:ACC: Response action created for {}", context.issuer);
+	}
 
 	Ok(HookResult::default())
 }

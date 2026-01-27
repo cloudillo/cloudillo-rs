@@ -128,7 +128,12 @@ async fn execute_hook(
 		return Ok(None);
 	}
 
-	let (action_type, subtype) = helpers::extract_type_and_subtype(&action.typ);
+	// Use the separate sub_typ field if available, otherwise try to extract from combined type string
+	let (action_type, subtype) = if action.sub_typ.is_some() {
+		(action.typ.to_string(), action.sub_typ.as_ref().map(|s| s.to_string()))
+	} else {
+		helpers::extract_type_and_subtype(&action.typ)
+	};
 
 	let hook_type = if ctx.is_outbound() { HookType::OnCreate } else { HookType::OnReceive };
 
