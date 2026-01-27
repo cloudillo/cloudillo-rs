@@ -336,11 +336,13 @@ fn is_font_file(path: &str) -> bool {
 }
 
 /// Check if a path should receive SPA fallback (serve shell's index.html for client routing)
+///
 /// Returns false for:
 /// - API routes (start with /api/)
 /// - WebSocket routes (start with /ws/)
-/// - App routes (start with /apps/) - apps run in iframes, use hash fragments, no path routing
-/// - Paths with file extensions (likely static assets that should 404)
+/// - App routes (start with /apps/) - apps run in iframes, use hash fragments
+/// - Known static asset directories (/fonts/, /sounds/, /assets-*/)
+/// - Root-level files with extensions (e.g., /favicon.ico, /robots.txt)
 fn should_serve_spa_fallback(path: &str) -> bool {
 	// Never fallback for API routes
 	if path.starts_with("/api/") {
@@ -352,26 +354,45 @@ fn should_serve_spa_fallback(path: &str) -> bool {
 		return false;
 	}
 
-	// Never fallback for app assets - apps run in iframes and use hash fragments, not path routing
+	// Never fallback for app assets - apps run in iframes and use hash fragments
 	if path.starts_with("/apps/") {
 		return false;
 	}
 
-	// Never fallback for paths that look like static files (have valid file extensions)
-	// File extensions: dot followed by 2-5 alphanumeric characters at the end
-	// This allows resource IDs with dots (e.g., "home.w9.hu:abc123") to get SPA fallback
-	if let Some(last_segment) = path.rsplit('/').next() {
-		if let Some(dot_pos) = last_segment.rfind('.') {
-			let extension = &last_segment[dot_pos + 1..];
-			// Valid file extension: 2-5 alphanumeric chars only
-			if (2..=5).contains(&extension.len())
-				&& extension.chars().all(|c| c.is_ascii_alphanumeric())
-			{
+	// Never fallback for known static asset directories
+	// These should 404 if the file doesn't exist
+	if path.starts_with("/fonts/") || path.starts_with("/sounds/") {
+		return false;
+	}
+
+	// Never fallback for versioned asset directories (pattern: /assets-{version}/)
+	// The frontend uses versioned directories like /assets-0.8.6/
+	let trimmed = path.trim_start_matches('/');
+	if trimmed.starts_with("assets-") {
+		if let Some(slash_pos) = trimmed.find('/') {
+			// Has a slash after "assets-*", so it's a path into a versioned assets directory
+			if slash_pos > 7 {
+				// "assets-" is 7 chars, need at least one char for version
 				return false;
 			}
 		}
 	}
 
+	// Never fallback for root-level files with extensions
+	// (e.g., /favicon.ico, /robots.txt, /manifest.json, /sw-0.8.6.js)
+	if !trimmed.contains('/') {
+		// It's a root-level path - check for file extension
+		if let Some(dot_pos) = trimmed.rfind('.') {
+			let ext = &trimmed[dot_pos + 1..];
+			// Valid file extension: 2-5 alphanumeric chars
+			if (2..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+				return false;
+			}
+		}
+	}
+
+	// Everything else gets SPA fallback for client-side routing
+	// This includes paths like /profile/home.w9.hu/szilard.hajba.eu
 	true
 }
 
