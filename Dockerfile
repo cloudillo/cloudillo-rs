@@ -35,7 +35,8 @@ FROM node:22-slim AS frontend-builder
 ARG FRONTEND_REF
 ARG OPALUI_REF
 WORKDIR /app
-RUN apt-get update && apt-get install -y git
+RUN apt-get update && apt-get install -y git python3 python3-pip && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --break-system-packages fonttools brotli
 RUN npm install -g pnpm
 RUN git clone --depth 1 --branch ${FRONTEND_REF} https://github.com/cloudillo/cloudillo.git .
 RUN if [ -n "${OPALUI_REF}" ]; then \
@@ -44,7 +45,8 @@ RUN if [ -n "${OPALUI_REF}" ]; then \
     else \
         pnpm install --frozen-lockfile; \
     fi
-#RUN pnpm install --frozen-lockfile
+# Ensure fonts are downloaded with TTF files (postinstall may run before wawoff2 is ready)
+RUN node libs/fonts/scripts/download-fonts.js --force
 ENV COMPRESS=true
 RUN pnpm -r --filter '!@cloudillo/storybook' build
 
@@ -199,6 +201,9 @@ COPY --from=poppler-extractor /staging/lib64/ /lib64/
 COPY --from=frontend-builder /dist /cloudillo/dist
 
 ENV LD_LIBRARY_PATH=/lib
+ENV LISTEN=0.0.0.0:443
+ENV LISTEN_HTTP=0.0.0.0:80
+ENV RUST_LOG=info
 
 USER cloudillo
 
