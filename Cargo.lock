@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-auth-adapter-sqlite"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-blob-adapter-fs"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "async-trait",
  "cloudillo",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-crdt-adapter-redb"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-meta-adapter-sqlite"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "async-trait",
  "cloudillo",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-rtdb-adapter-redb"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "async-stream",
  "async-trait",
