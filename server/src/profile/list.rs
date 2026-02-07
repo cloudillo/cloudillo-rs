@@ -33,6 +33,7 @@ pub struct ProfileWithStatus {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListProfilesQuery {
+	#[serde(alias = "q")]
 	search: Option<String>,
 	limit: Option<usize>,
 	offset: Option<usize>,
