@@ -466,6 +466,41 @@ pub async fn post_action_reject(
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// POST /api/actions/:action_id/dismiss - Dismiss a notification
+pub async fn post_action_dismiss(
+	State(app): State<App>,
+	tn_id: TnId,
+	Auth(auth): Auth,
+	Path(action_id): Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+
+	match action.status.as_deref().unwrap_or("") {
+		"N" => {
+			let update_opts = crate::meta_adapter::UpdateActionDataOptions {
+				status: crate::types::Patch::Value(crate::action::status::ACTIVE),
+				..Default::default()
+			};
+			app.meta_adapter.update_action_data(tn_id, &action_id, &update_opts).await?;
+		}
+		"C" => {
+			return Err(Error::ValidationError(
+				"Cannot dismiss confirmation actions. Use accept or reject.".into(),
+			));
+		}
+		_ => { /* Already 'A' or 'D' — idempotent no-op */ }
+	}
+
+	info!(
+		action_id = %action_id,
+		user = %auth.id_tag,
+		"Action dismissed"
+	);
+
+	Ok((StatusCode::OK, Json(ApiResponse::new(()).with_req_id(req_id.unwrap_or_default()))))
+}
+
 /// POST /api/actions/:action_id/stat - Update action statistics
 #[derive(Default, Deserialize)]
 pub struct UpdateActionStatRequest {

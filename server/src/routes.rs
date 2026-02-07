@@ -53,6 +53,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/actions/{action_id}", delete(action::handler::delete_action))
 		.route("/api/actions/{action_id}/accept", post(action::handler::post_action_accept))
 		.route("/api/actions/{action_id}/reject", post(action::handler::post_action_reject))
+		.route("/api/actions/{action_id}/dismiss", post(action::handler::post_action_dismiss))
 		.route("/api/actions/{action_id}/reaction", post(action::handler::post_action_reaction))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("write")));
 
