@@ -484,6 +484,12 @@ impl PermissionChecker {
 
 		// Visibility check for read operations
 		if matches!(operation, "read") {
+			// Check explicit access grants (e.g., FSHR file shares, scoped tokens)
+			if let Some(al) = object.get("access_level") {
+				if matches!(al, "read" | "write") {
+					return true;
+				}
+			}
 			return self.check_visibility(subject, object);
 		}
 
