@@ -10,8 +10,8 @@ use crate::utils::*;
 use cloudillo::core::worker::WorkerPool;
 use cloudillo::{action::task, auth_adapter::*, prelude::*};
 
-/// Validate a JWT token
-pub(crate) async fn validate_token(
+/// Validate an access token (JWT) and return the authenticated user context
+pub(crate) async fn validate_access_token(
 	jwt_secret: &DecodingKey,
 	tn_id: TnId,
 	token: &str,
@@ -20,12 +20,12 @@ pub(crate) async fn validate_token(
 		decode::<AccessToken<Box<str>>>(token, jwt_secret, &Validation::new(Algorithm::HS256))
 			.map_err(|_| Error::Unauthorized)?;
 
-	// Use the token's issuer as the authenticated user identity
-	// This ensures that a token from alice.home.w9.hu identifies as alice.home.w9.hu
-	// even when used on a different tenant (e.g., home.w9.hu for accessing shared files)
+	// Use `sub` (the actual user identity) when present, fall back to `iss`.
+	// Access tokens always set `iss` to the local tenant; for federated and
+	// external users `sub` carries the real user identity (id_tag).
 	Ok(AuthCtx {
 		tn_id,
-		id_tag: token_data.claims.iss,
+		id_tag: token_data.claims.sub.unwrap_or(token_data.claims.iss),
 		roles: token_data.claims.r.unwrap_or("".into()).split(',').map(Box::from).collect(),
 		scope: token_data.claims.scope,
 	})

@@ -266,8 +266,8 @@ pub struct ApiKeyValidation {
 /// authentication and authorization.
 #[async_trait]
 pub trait AuthAdapter: Debug + Send + Sync {
-	/// Validates a token and returns the user context
-	async fn validate_token(&self, tn_id: TnId, token: &str) -> ClResult<AuthCtx>;
+	/// Validates an access token and returns the user context
+	async fn validate_access_token(&self, tn_id: TnId, token: &str) -> ClResult<AuthCtx>;
 
 	/// # Profiles
 	/// Reads the ID tag of the given tenant, referenced by its ID

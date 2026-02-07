@@ -207,7 +207,7 @@ pub async fn require_auth(
 		}
 		None => {
 			// Validate JWT token (existing flow)
-			state.auth_adapter.validate_token(tn_id, &token).await?
+			state.auth_adapter.validate_access_token(tn_id, &token).await?
 		}
 	};
 
@@ -291,7 +291,7 @@ pub async fn optional_auth(
 						}
 						None => {
 							// Validate JWT token
-							state.auth_adapter.validate_token(tn_id, token).await.map(Ok)
+							state.auth_adapter.validate_access_token(tn_id, token).await.map(Ok)
 						}
 					};
 
