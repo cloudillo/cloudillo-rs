@@ -613,11 +613,21 @@ pub async fn get_proxy_token(
 		}
 	}
 
-	// Default: create local proxy token (for outgoing federation identity)
-	info!("Generating local proxy token for {}", &auth.id_tag);
+	// Default: create local access token (valid on own server)
+	info!("Generating local access token for {}", &auth.id_tag);
+	let roles_str: String = auth.roles.iter().map(|r| r.as_ref()).collect::<Vec<&str>>().join(",");
 	let token = app
 		.auth_adapter
-		.create_proxy_token(auth.tn_id, &auth.id_tag, &auth.roles)
+		.create_access_token(
+			auth.tn_id,
+			&auth_adapter::AccessToken {
+				iss: &own_id_tag,
+				sub: Some(&auth.id_tag),
+				r: if roles_str.is_empty() { None } else { Some(&roles_str) },
+				scope: None,
+				exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
+			},
+		)
 		.await?;
 
 	// Return roles alongside token for local context
