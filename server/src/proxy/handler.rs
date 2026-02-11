@@ -37,8 +37,10 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Build the backend URI from the proxy site entry and the original request URI
 fn build_backend_uri(entry: &ProxySiteEntry, original_uri: &Uri) -> ClResult<Uri> {
 	let mut backend = entry.backend_url.clone();
-	backend.set_path(original_uri.path());
+	let combined_path = format!("{}{}", backend.path().trim_end_matches('/'), original_uri.path());
+	backend.set_path(&combined_path);
 	backend.set_query(original_uri.query());
+	debug!("Proxy backend URI: {} (combined_path={:?})", backend.as_str(), combined_path);
 	backend
 		.as_str()
 		.parse::<Uri>()
@@ -317,7 +319,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_build_backend_uri_with_path_prefix() {
+	fn test_build_backend_uri_root_path() {
 		let entry = ProxySiteEntry {
 			site_id: 1,
 			domain: "test.example.com".into(),
@@ -328,6 +330,32 @@ mod tests {
 		let uri = "/".parse::<Uri>().unwrap();
 		let result = build_backend_uri(&entry, &uri).unwrap();
 		assert_eq!(result.to_string(), "http://localhost:3000/");
+	}
+
+	#[test]
+	fn test_build_backend_uri_with_path_prefix() {
+		let entry = ProxySiteEntry {
+			site_id: 1,
+			domain: "test.example.com".into(),
+			proxy_type: "basic".into(),
+			backend_url: url::Url::parse("http://backend:3000/a/").unwrap(),
+			config: Default::default(),
+		};
+
+		// Root request should preserve the base path
+		let uri = "/".parse::<Uri>().unwrap();
+		let result = build_backend_uri(&entry, &uri).unwrap();
+		assert_eq!(result.to_string(), "http://backend:3000/a/");
+
+		// Subpath request should join with base path
+		let uri = "/foo".parse::<Uri>().unwrap();
+		let result = build_backend_uri(&entry, &uri).unwrap();
+		assert_eq!(result.to_string(), "http://backend:3000/a/foo");
+
+		// Subpath with query should work too
+		let uri = "/api/test?key=val".parse::<Uri>().unwrap();
+		let result = build_backend_uri(&entry, &uri).unwrap();
+		assert_eq!(result.to_string(), "http://backend:3000/a/api/test?key=val");
 	}
 }
 
