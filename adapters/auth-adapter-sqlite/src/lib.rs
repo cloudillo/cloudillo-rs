@@ -12,6 +12,7 @@ mod auth;
 mod cert;
 mod crypto;
 mod profile_key;
+mod proxy_site;
 mod schema;
 mod tenant;
 mod utils;
@@ -272,6 +273,52 @@ impl AuthAdapter for AuthAdapterSqlite {
 
 	async fn cleanup_expired_api_keys(&self) -> ClResult<u32> {
 		api_key::cleanup_expired_api_keys(&self.db).await
+	}
+
+	// Proxy site management
+	async fn create_proxy_site(&self, data: &CreateProxySiteData<'_>) -> ClResult<ProxySiteData> {
+		proxy_site::create_proxy_site(&self.db, data).await
+	}
+
+	async fn read_proxy_site(&self, site_id: i64) -> ClResult<ProxySiteData> {
+		proxy_site::read_proxy_site(&self.db, site_id).await
+	}
+
+	async fn read_proxy_site_by_domain(&self, domain: &str) -> ClResult<ProxySiteData> {
+		proxy_site::read_proxy_site_by_domain(&self.db, domain).await
+	}
+
+	async fn update_proxy_site(
+		&self,
+		site_id: i64,
+		data: &UpdateProxySiteData<'_>,
+	) -> ClResult<ProxySiteData> {
+		proxy_site::update_proxy_site(&self.db, site_id, data).await
+	}
+
+	async fn delete_proxy_site(&self, site_id: i64) -> ClResult<()> {
+		proxy_site::delete_proxy_site(&self.db, site_id).await
+	}
+
+	async fn list_proxy_sites(&self) -> ClResult<Vec<ProxySiteData>> {
+		proxy_site::list_proxy_sites(&self.db).await
+	}
+
+	async fn update_proxy_site_cert(
+		&self,
+		site_id: i64,
+		cert: &str,
+		key: &str,
+		expires_at: Timestamp,
+	) -> ClResult<()> {
+		proxy_site::update_proxy_site_cert(&self.db, site_id, cert, key, expires_at).await
+	}
+
+	async fn list_proxy_sites_needing_cert_renewal(
+		&self,
+		renewal_days: u32,
+	) -> ClResult<Vec<ProxySiteData>> {
+		proxy_site::list_proxy_sites_needing_cert_renewal(&self.db, renewal_days).await
 	}
 }
 

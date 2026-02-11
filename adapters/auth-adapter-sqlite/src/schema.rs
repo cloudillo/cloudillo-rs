@@ -22,7 +22,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 }
 
 // Current schema version - update this when adding new migrations
-const CURRENT_DB_VERSION: i64 = 2;
+const CURRENT_DB_VERSION: i64 = 5;
 
 /// Initialize the database schema and run migrations
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -302,6 +302,44 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
+	// Proxy sites table
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS proxy_sites (
+		site_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		domain TEXT NOT NULL,
+		backend_url TEXT NOT NULL,
+		status CHAR(1) NOT NULL DEFAULT 'A',
+		proxy_type TEXT NOT NULL DEFAULT 'basic',
+		cert TEXT,
+		cert_key TEXT,
+		cert_expires_at INTEGER,
+		config TEXT,
+		created_by INTEGER,
+		created_at INTEGER DEFAULT (unixepoch()),
+		updated_at INTEGER DEFAULT (unixepoch())
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_sites_domain ON proxy_sites (domain)")
+		.execute(&mut *tx)
+		.await?;
+
+	// Triggers for proxy_sites
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS proxy_sites_insert_at AFTER INSERT ON proxy_sites FOR EACH ROW \
+		BEGIN UPDATE proxy_sites SET updated_at = unixepoch() WHERE site_id = NEW.site_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS proxy_sites_updated_at AFTER UPDATE ON proxy_sites FOR EACH ROW \
+		BEGIN UPDATE proxy_sites SET updated_at = unixepoch() WHERE site_id = NEW.site_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+
 	// Fresh database: skip migrations (schema already has all columns)
 	if version == 0 {
 		set_db_version(&mut tx, CURRENT_DB_VERSION).await;
@@ -311,10 +349,34 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		}
 	}
 
-	// Migrations for existing databases (ALTER TABLE only)
-	// if version < 2 { ... ALTER TABLE ...; set_db_version(&mut tx, 2).await; }
-	// Future migrations:
-	// if version < 3 { ... migration 3 ...; set_db_version(&mut tx, 3).await; }
+	// Migrations for existing databases
+	// Version 3: Add proxy_sites table (CREATE TABLE IF NOT EXISTS handles fresh DBs)
+	if version > 0 && version < 3 {
+		// Table was already created above with IF NOT EXISTS, just bump version
+		set_db_version(&mut tx, 3).await;
+		version = 3;
+	}
+
+	// Version 4: Add proxy_type column to proxy_sites
+	if version == 3 {
+		sqlx::query("ALTER TABLE proxy_sites ADD COLUMN proxy_type TEXT NOT NULL DEFAULT 'basic'")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 4).await;
+		version = 4;
+	}
+
+	// Version 5: Remove redundant 'P' (Pending) status from proxy sites
+	if version == 4 {
+		sqlx::query("UPDATE proxy_sites SET status = 'A' WHERE status = 'P'")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 5).await;
+		#[allow(unused_assignments)]
+		{
+			version = 5;
+		}
+	}
 
 	tx.commit().await?;
 

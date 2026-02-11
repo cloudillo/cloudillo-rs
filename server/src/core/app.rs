@@ -27,6 +27,7 @@ use crate::action::dsl::DslEngine;
 use crate::action::hooks::HookRegistry;
 use crate::action::key_cache::KeyFetchCache;
 use crate::core::rate_limit::RateLimitManager;
+use crate::proxy;
 use crate::{action, file, profile, routes};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -73,6 +74,9 @@ pub struct AppState {
 
 	// Rate limiter
 	pub rate_limiter: Arc<RateLimitManager>,
+
+	// Proxy site cache (domain -> proxy site entry)
+	pub proxy_sites: proxy::ProxySiteCache,
 }
 
 pub type App = Arc<AppState>;
@@ -398,6 +402,9 @@ impl AppBuilder {
 
 			// Rate limiter
 			rate_limiter: Arc::new(RateLimitManager::default()),
+
+			// Proxy site cache
+			proxy_sites: proxy::new_proxy_cache(),
 		});
 		tokio::fs::create_dir_all(&app.opts.tmp_dir).await.map_err(|e| {
 			error!("FATAL: Cannot create tmp dir: {}", e);
@@ -476,6 +483,14 @@ impl AppBuilder {
 			error!("FATAL: Bootstrap failed: {}", e);
 			e
 		})?;
+
+		// Load proxy site cache from database
+		match proxy::reload_proxy_cache(&app).await {
+			Ok(()) => {}
+			Err(e) => {
+				warn!("Failed to load proxy site cache: {}", e);
+			}
+		}
 
 		if let Some(http_server) = http_server {
 			let _ = tokio::try_join!(https_server, http_server)?;

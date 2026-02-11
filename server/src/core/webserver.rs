@@ -1,5 +1,6 @@
 // Webserver implementation
 
+use axum::response::IntoResponse;
 use axum::ServiceExt;
 use rustls::{
 	server::{ClientHello, ResolvesServerCert},
@@ -108,6 +109,7 @@ pub async fn create_https_server(
 	let svc = tower::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
 		let api_router = api_router.clone();
 		let app_router = app_router.clone();
+		let proxy_cache = state.proxy_sites.clone();
 		async move {
 			let start = std::time::Instant::now();
 			let span = info_span!("REQ", req = req.uri().path());
@@ -125,7 +127,7 @@ pub async fn create_https_server(
 				})
 				.unwrap_or_default();
 
-			let res = if let Some(id_tag) = host.strip_prefix("cl-o.") {
+			if let Some(id_tag) = host.strip_prefix("cl-o.") {
 				let id_tag = Box::from(id_tag);
 				info!(
 					"REQ [{}] API: {} {} {}",
@@ -135,33 +137,78 @@ pub async fn create_https_server(
 					req.uri().path()
 				);
 				req.extensions_mut().insert(core::IdTag(id_tag));
-				api_router.clone().call(req).await
-			} else {
-				// Clone host before logging (to avoid borrow issue)
-				let host_owned = host.to_string();
-				info!(
-					"REQ [{}] App: {} {} {}",
-					&peer_addr,
-					req.method(),
-					&host_owned,
-					req.uri().path()
-				);
-				// Insert IdTag for app routes too (host is the id_tag)
-				req.extensions_mut().insert(core::IdTag(host_owned.into_boxed_str()));
-				app_router.clone().call(req).await
-			};
+				let res = api_router.clone().call(req).await;
 
-			let status = res
-				.as_ref()
-				.map(|r| r.status())
-				.unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-			if status.is_client_error() || status.is_server_error() {
-				warn!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
+				let status = res
+					.as_ref()
+					.map(|r| r.status())
+					.unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+				if status.is_client_error() || status.is_server_error() {
+					warn!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
+				} else {
+					info!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
+				}
+
+				res
 			} else {
-				info!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
+				// Check proxy site cache
+				let proxy_entry = {
+					let cache = proxy_cache.read().await;
+					cache.get(host).cloned()
+				};
+
+				if let Some(entry) = proxy_entry {
+					info!(
+						"REQ [{}] Proxy: {} {} {}",
+						&peer_addr,
+						req.method(),
+						&entry.domain,
+						req.uri().path()
+					);
+					let res =
+						crate::proxy::handler::handle_proxy_request(entry, req, &peer_addr).await;
+					match res {
+						Ok(resp) => {
+							let status = resp.status();
+							if status.is_client_error() || status.is_server_error() {
+								warn!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
+							} else {
+								info!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
+							}
+							Ok(resp.map(axum::body::Body::new))
+						}
+						Err(e) => {
+							warn!("RES: proxy error: {} tm:{:?}", e, start.elapsed().as_millis());
+							Ok(e.into_response())
+						}
+					}
+				} else {
+					// Clone host before logging (to avoid borrow issue)
+					let host_owned = host.to_string();
+					info!(
+						"REQ [{}] App: {} {} {}",
+						&peer_addr,
+						req.method(),
+						&host_owned,
+						req.uri().path()
+					);
+					// Insert IdTag for app routes too (host is the id_tag)
+					req.extensions_mut().insert(core::IdTag(host_owned.into_boxed_str()));
+					let res = app_router.clone().call(req).await;
+
+					let status = res
+						.as_ref()
+						.map(|r| r.status())
+						.unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+					if status.is_client_error() || status.is_server_error() {
+						warn!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
+					} else {
+						info!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
+					}
+
+					res
+				}
 			}
-
-			res
 		}
 	});
 

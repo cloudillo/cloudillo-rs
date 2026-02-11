@@ -315,6 +315,48 @@ pub async fn bootstrap(
 								warn!(error = %e, "Failed to check certificates on startup");
 							}
 						}
+
+						// Check proxy site certificates on startup
+						match app_clone
+							.auth_adapter
+							.list_proxy_sites_needing_cert_renewal(renewal_days)
+							.await
+						{
+							Ok(sites) => {
+								if sites.is_empty() {
+									info!("All proxy site certificates are valid");
+								} else {
+									info!(
+										"Found {} proxy site(s) needing certificate renewal",
+										sites.len()
+									);
+
+									for site in sites {
+										info!(
+											"Renewing certificate for proxy site: {} (site_id={})",
+											site.domain, site.site_id
+										);
+
+										if let Err(e) = acme::renew_proxy_site_cert(
+											&app_clone,
+											site.site_id,
+											&site.domain,
+										)
+										.await
+										{
+											error!(
+												domain = %site.domain,
+												error = %e,
+												"Failed to renew proxy site certificate"
+											);
+										}
+									}
+								}
+							}
+							Err(e) => {
+								warn!(error = %e, "Failed to check proxy site certificates on startup");
+							}
+						}
 					});
 				} else {
 					info!("ACME not configured (no ACME_EMAIL), skipping certificate check");

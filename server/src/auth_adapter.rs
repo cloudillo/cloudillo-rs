@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::fmt::Debug;
 
+use std::collections::HashMap;
+
 use crate::{
 	action::task,
 	prelude::*,
@@ -259,6 +261,67 @@ pub struct ApiKeyValidation {
 	pub roles: Option<Box<str>>,
 }
 
+// Proxy site types
+// =================
+
+/// Configuration for a proxy site (stored as JSON in the config column)
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxySiteConfig {
+	pub connect_timeout_secs: Option<u32>,
+	pub read_timeout_secs: Option<u32>,
+	pub preserve_host: Option<bool>,
+	pub proxy_protocol: Option<bool>,
+	pub custom_headers: Option<HashMap<String, String>>,
+	pub forward_headers: Option<bool>,
+	pub websocket: Option<bool>,
+}
+
+/// Proxy site data from the database
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxySiteData {
+	pub site_id: i64,
+	pub domain: Box<str>,
+	pub backend_url: Box<str>,
+	pub status: Box<str>,
+	#[serde(rename = "type")]
+	pub proxy_type: Box<str>,
+	#[serde(skip_serializing)]
+	pub cert: Option<Box<str>>,
+	#[serde(skip_serializing)]
+	pub cert_key: Option<Box<str>>,
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	pub cert_expires_at: Option<Timestamp>,
+	pub config: ProxySiteConfig,
+	pub created_by: Option<i64>,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub updated_at: Timestamp,
+}
+
+/// Data needed to create a new proxy site
+#[derive(Debug)]
+pub struct CreateProxySiteData<'a> {
+	pub domain: &'a str,
+	pub backend_url: &'a str,
+	pub proxy_type: &'a str,
+	pub config: &'a ProxySiteConfig,
+	pub created_by: Option<i64>,
+}
+
+/// Data to update an existing proxy site
+#[derive(Debug)]
+pub struct UpdateProxySiteData<'a> {
+	pub backend_url: Option<&'a str>,
+	pub status: Option<&'a str>,
+	pub proxy_type: Option<&'a str>,
+	pub config: Option<&'a ProxySiteConfig>,
+}
+
 /// A `Cloudillo` auth adapter
 ///
 /// Every `AuthAdapter` implementation is required to implement this trait.
@@ -411,6 +474,44 @@ pub trait AuthAdapter: Debug + Send + Sync {
 
 	/// Cleanup expired API keys (for scheduler)
 	async fn cleanup_expired_api_keys(&self) -> ClResult<u32>;
+
+	// Proxy site management
+	/// Create a new proxy site
+	async fn create_proxy_site(&self, data: &CreateProxySiteData<'_>) -> ClResult<ProxySiteData>;
+
+	/// Read a proxy site by ID
+	async fn read_proxy_site(&self, site_id: i64) -> ClResult<ProxySiteData>;
+
+	/// Read a proxy site by domain
+	async fn read_proxy_site_by_domain(&self, domain: &str) -> ClResult<ProxySiteData>;
+
+	/// Update a proxy site
+	async fn update_proxy_site(
+		&self,
+		site_id: i64,
+		data: &UpdateProxySiteData<'_>,
+	) -> ClResult<ProxySiteData>;
+
+	/// Delete a proxy site
+	async fn delete_proxy_site(&self, site_id: i64) -> ClResult<()>;
+
+	/// List all proxy sites
+	async fn list_proxy_sites(&self) -> ClResult<Vec<ProxySiteData>>;
+
+	/// Update a proxy site's certificate
+	async fn update_proxy_site_cert(
+		&self,
+		site_id: i64,
+		cert: &str,
+		key: &str,
+		expires_at: Timestamp,
+	) -> ClResult<()>;
+
+	/// List proxy sites needing certificate renewal
+	async fn list_proxy_sites_needing_cert_renewal(
+		&self,
+		renewal_days: u32,
+	) -> ClResult<Vec<ProxySiteData>>;
 }
 
 #[cfg(test)]

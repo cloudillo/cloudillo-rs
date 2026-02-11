@@ -30,6 +30,7 @@ use crate::idp;
 use crate::prelude::*;
 use crate::profile;
 use crate::profile::perm::check_perm_profile;
+use crate::proxy;
 use crate::push;
 use crate::r#ref;
 use crate::settings;
@@ -80,6 +81,13 @@ fn init_protected_routes(app: App) -> Router<App> {
 			post(admin::tenant::send_password_reset),
 		)
 		.route("/api/admin/email/test", post(admin::email::send_test_email))
+		// Proxy site management
+		.route("/api/admin/proxy-sites", get(proxy::admin::list_proxy_sites))
+		.route("/api/admin/proxy-sites", post(proxy::admin::create_proxy_site))
+		.route("/api/admin/proxy-sites/{site_id}", get(proxy::admin::get_proxy_site))
+		.route("/api/admin/proxy-sites/{site_id}", patch(proxy::admin::update_proxy_site))
+		.route("/api/admin/proxy-sites/{site_id}", delete(proxy::admin::delete_proxy_site))
+		.route("/api/admin/proxy-sites/{site_id}/renew-cert", post(proxy::admin::trigger_cert_renewal))
 		.layer(middleware::from_fn_with_state(app.clone(), admin::perm::require_admin));
 
 	// File create routes (check_perm_create for quota/tier checking)

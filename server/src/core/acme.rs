@@ -238,6 +238,43 @@ pub async fn get_acme_challenge(
 	}
 }
 
+/// Renew the TLS certificate for a single proxy site via ACME.
+///
+/// Creates an ACME account, generates the certificate, stores it in the auth adapter,
+/// and invalidates the cert cache. This is called inline from proxy site creation
+/// and manual renewal endpoints, as well as from the periodic `CertRenewalTask`.
+pub async fn renew_proxy_site_cert(app: &App, site_id: i64, domain: &str) -> ClResult<()> {
+	let (account, _credentials) = Account::builder()?
+		.create(
+			&acme::NewAccount {
+				contact: &[],
+				terms_of_service_agreed: true,
+				only_return_existing: false,
+			},
+			acme::LetsEncrypt::Production.url().to_owned(),
+			None,
+		)
+		.await?;
+
+	let domains = vec![domain.to_string()];
+	let cert = renew_domains(app, &account, domains).await?;
+
+	app.auth_adapter
+		.update_proxy_site_cert(
+			site_id,
+			&cert.certificate_pem,
+			&cert.private_key_pem,
+			cert.expires_at,
+		)
+		.await?;
+
+	// Note: renew_domains() already inserts the fresh cert into app.certs cache,
+	// so no cache invalidation needed here.
+
+	info!(domain = %domain, "Proxy site certificate renewed successfully");
+	Ok(())
+}
+
 // Certificate Renewal Task
 // ========================
 
@@ -290,32 +327,58 @@ impl Task<App> for CertRenewalTask {
 
 		if tenants.is_empty() {
 			info!("All tenant certificates are valid");
-			return Ok(());
 		}
 
-		info!("Found {} tenant(s) needing certificate renewal", tenants.len());
+		if !tenants.is_empty() {
+			info!("Found {} tenant(s) needing certificate renewal", tenants.len());
 
-		// Renew certificates for each tenant
-		for (tn_id, id_tag) in tenants {
-			info!("Renewing certificate for tenant: {} (tn_id={})", id_tag, tn_id.0);
+			// Renew certificates for each tenant
+			for (tn_id, id_tag) in tenants {
+				info!("Renewing certificate for tenant: {} (tn_id={})", id_tag, tn_id.0);
 
-			// Determine app_domain (only base tenant gets custom domain)
-			let app_domain = if tn_id.0 == 1 {
-				// For base tenant, check if there's a custom domain configured
-				// TODO: Get this from app configuration/settings
-				None
-			} else {
-				None
-			};
+				// Determine app_domain (only base tenant gets custom domain)
+				let app_domain = if tn_id.0 == 1 {
+					// For base tenant, check if there's a custom domain configured
+					// TODO: Get this from app configuration/settings
+					None
+				} else {
+					None
+				};
 
-			// Perform ACME renewal
-			match init(app.clone(), &self.acme_email, &id_tag, app_domain).await {
-				Ok(_) => {
-					info!(tenant = %id_tag, "Certificate renewed successfully");
+				// Perform ACME renewal
+				match init(app.clone(), &self.acme_email, &id_tag, app_domain).await {
+					Ok(_) => {
+						info!(tenant = %id_tag, "Certificate renewed successfully");
+					}
+					Err(e) => {
+						error!(tenant = %id_tag, error = %e, "Failed to renew certificate");
+						// Continue with other tenants even if one fails
+					}
 				}
-				Err(e) => {
-					error!(tenant = %id_tag, error = %e, "Failed to renew certificate");
-					// Continue with other tenants even if one fails
+			}
+		}
+
+		// Renew proxy site certificates
+		let proxy_sites = app
+			.auth_adapter
+			.list_proxy_sites_needing_cert_renewal(self.renewal_days)
+			.await?;
+
+		if !proxy_sites.is_empty() {
+			info!("Found {} proxy site(s) needing certificate renewal", proxy_sites.len());
+
+			for site in proxy_sites {
+				info!(
+					"Renewing certificate for proxy site: {} (site_id={})",
+					site.domain, site.site_id
+				);
+
+				if let Err(e) = renew_proxy_site_cert(app, site.site_id, &site.domain).await {
+					error!(
+						domain = %site.domain,
+						error = %e,
+						"Failed to renew proxy site certificate"
+					);
 				}
 			}
 		}
