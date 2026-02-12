@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use rand::Rng;
+use rand::RngExt;
 
 pub const ID_LENGTH: usize = 24;
 pub const SAFE: [char; 62] = [

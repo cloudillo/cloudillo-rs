@@ -151,7 +151,7 @@ const API_KEY_RANDOM_BYTES: usize = 32;
 /// - full_key: The complete API key to give to the user (shown only once)
 /// - key_prefix: First 8 chars after prefix for identification in logs/UI
 pub fn generate_api_key() -> (String, String) {
-	use rand::RngCore;
+	use rand::Rng;
 
 	let mut random_bytes = [0u8; API_KEY_RANDOM_BYTES];
 	rand::rng().fill_bytes(&mut random_bytes);

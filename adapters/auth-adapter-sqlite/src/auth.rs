@@ -47,7 +47,7 @@ pub(crate) async fn ensure_jwt_secret(db: &SqlitePool) -> ClResult<String> {
 
 	// Generate new secret (32 random bytes, base64 encoded)
 	use base64::Engine;
-	use rand::RngCore;
+	use rand::Rng;
 	let mut secret_bytes = [0u8; 32];
 	let mut rng = rand::rng();
 	rng.fill_bytes(&mut secret_bytes);

@@ -4,7 +4,7 @@ use axum::{
 	Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_with::skip_serializing_none;
