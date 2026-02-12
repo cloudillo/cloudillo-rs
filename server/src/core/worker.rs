@@ -89,10 +89,8 @@ impl WorkerPool {
 			match res_rx.await {
 				Ok(result) => result,
 				Err(_) => {
-					error!("Critical: Worker dropped result channel without sending - worker pool corrupted");
-					unreachable!(
-						"Worker pool lost result - this should never happen in normal operation"
-					);
+					error!("Critical: Worker dropped result channel - this should never happen with catch_unwind");
+					std::process::abort();
 				}
 			}
 		}
@@ -119,10 +117,8 @@ impl WorkerPool {
 			match res_rx.await {
 				Ok(result) => result,
 				Err(_) => {
-					error!("Critical: Worker dropped result channel without sending - worker pool corrupted");
-					unreachable!(
-						"Worker pool lost result - this should never happen in normal operation"
-					);
+					error!("Critical: Worker dropped result channel - this should never happen with catch_unwind");
+					std::process::abort();
 				}
 			}
 		}
@@ -148,10 +144,8 @@ impl WorkerPool {
 			match res_rx.await {
 				Ok(result) => result,
 				Err(_) => {
-					error!("Critical: Worker dropped result channel without sending - worker pool corrupted");
-					unreachable!(
-						"Worker pool lost result - this should never happen in normal operation"
-					);
+					error!("Critical: Worker dropped result channel - this should never happen with catch_unwind");
+					std::process::abort();
 				}
 			}
 		}
@@ -178,10 +172,8 @@ impl WorkerPool {
 			match res_rx.await {
 				Ok(result) => result,
 				Err(_) => {
-					error!("Critical: Worker dropped result channel without sending - worker pool corrupted");
-					unreachable!(
-						"Worker pool lost result - this should never happen in normal operation"
-					);
+					error!("Critical: Worker dropped result channel - this should never happen with catch_unwind");
+					std::process::abort();
 				}
 			}
 		}
@@ -201,7 +193,9 @@ fn worker_loop(queues: Vec<Arc<Receiver<Box<dyn FnOnce() + Send>>>>) {
 		}
 
 		if let Some(job) = job {
-			job();
+			if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+				error!("Worker thread caught panic: {:?}", e);
+			}
 			continue;
 		}
 
@@ -213,7 +207,9 @@ fn worker_loop(queues: Vec<Arc<Receiver<Box<dyn FnOnce() + Send>>>>) {
 
 		let job: Result<Box<dyn FnOnce() + Send>, flume::RecvError> = selector.wait();
 		if let Ok(job) = job {
-			job()
+			if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+				error!("Worker thread caught panic: {:?}", e);
+			}
 		}
 	}
 }
