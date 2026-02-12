@@ -167,7 +167,7 @@ impl Request {
 		path: &str,
 	) -> ClResult<impl AsyncRead + Send + Unpin> {
 		let token = self.create_proxy_token(tn_id, id_tag, None).await?;
-		info!("Got proxy token: {}", token);
+		debug!("Got proxy token (len={})", token.len());
 		let req = hyper::Request::builder()
 			.method(Method::GET)
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
