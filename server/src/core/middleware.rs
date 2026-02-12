@@ -211,6 +211,25 @@ pub async fn require_auth(
 		}
 	};
 
+	// Enforce scope restrictions: scoped tokens can only access matching endpoints
+	if let Some(ref scope) = claims.scope {
+		if let Some(token_scope) = crate::types::TokenScope::parse(scope) {
+			let path = req.uri().path();
+			let allowed = match token_scope {
+				crate::types::TokenScope::File { .. } => {
+					path.starts_with("/api/files/")
+						|| path == "/api/files"
+						|| path.starts_with("/ws/rtdb/")
+						|| path.starts_with("/ws/crdt/")
+				}
+			};
+			if !allowed {
+				warn!(scope = %scope, path = %path, "Scoped token denied access to non-matching endpoint");
+				return Err(Error::PermissionDenied);
+			}
+		}
+	}
+
 	req.extensions_mut().insert(Auth(claims));
 
 	Ok(next.run(req).await)
@@ -297,7 +316,28 @@ pub async fn optional_auth(
 
 				match claims_result {
 					Ok(Ok(claims)) => {
-						req.extensions_mut().insert(Auth(claims));
+						// Enforce scope restrictions: scoped tokens can only access matching endpoints
+						let scope_allowed = if let Some(ref scope) = claims.scope {
+							if let Some(token_scope) = crate::types::TokenScope::parse(scope) {
+								let path = req.uri().path();
+								match token_scope {
+									crate::types::TokenScope::File { .. } => {
+										path.starts_with("/api/files/")
+											|| path == "/api/files" || path.starts_with("/ws/rtdb/")
+											|| path.starts_with("/ws/crdt/")
+									}
+								}
+							} else {
+								true
+							}
+						} else {
+							true
+						};
+						if scope_allowed {
+							req.extensions_mut().insert(Auth(claims));
+						} else {
+							warn!("Scoped token denied access in optional_auth, treating as unauthenticated");
+						}
 					}
 					Ok(Err(e)) => {
 						warn!("Token validation failed (tenant mismatch): {:?}", e);
