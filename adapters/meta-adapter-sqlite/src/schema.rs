@@ -372,25 +372,6 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
-	// Collections table for favorites, recent files, bookmarks, pins
-	sqlx::query(
-		"CREATE TABLE IF NOT EXISTS collections (
-			tn_id INTEGER NOT NULL,
-			coll_type CHAR(4) NOT NULL,		-- 'FAVR', 'RCNT', 'BKMK', 'PIND'
-			item_id TEXT NOT NULL,			-- Entity ID with built-in type prefix
-			created_at INTEGER DEFAULT (unixepoch()),
-			updated_at INTEGER DEFAULT (unixepoch()),
-			PRIMARY KEY (tn_id, coll_type, item_id)
-		)",
-	)
-	.execute(&mut *tx)
-	.await?;
-	sqlx::query(
-			"CREATE INDEX IF NOT EXISTS idx_collections ON collections(tn_id, coll_type, created_at DESC)",
-		)
-		.execute(&mut *tx)
-		.await?;
-
 	// File user data (per-user file activity tracking)
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS file_user_data (
@@ -529,12 +510,6 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 	sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS collections_insert_at AFTER INSERT ON collections FOR EACH ROW \
-			BEGIN UPDATE collections SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND coll_type = NEW.coll_type AND item_id = NEW.item_id; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-	sqlx::query(
 			"CREATE TRIGGER IF NOT EXISTS file_user_data_insert_at AFTER INSERT ON file_user_data FOR EACH ROW \
 			BEGIN UPDATE file_user_data SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND id_tag = NEW.id_tag AND f_id = NEW.f_id; END",
 		)
@@ -638,12 +613,6 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		)
 		.execute(&mut *tx)
 		.await?;
-	sqlx::query(
-		"CREATE TRIGGER IF NOT EXISTS collections_updated_at AFTER UPDATE ON collections FOR EACH ROW \
-		BEGIN UPDATE collections SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND coll_type = NEW.coll_type AND item_id = NEW.item_id; END",
-	)
-	.execute(&mut *tx)
-	.await?;
 	sqlx::query(
 		"CREATE TRIGGER IF NOT EXISTS file_user_data_updated_at AFTER UPDATE ON file_user_data FOR EACH ROW \
 		BEGIN UPDATE file_user_data SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND id_tag = NEW.id_tag AND f_id = NEW.f_id; END",

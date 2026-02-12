@@ -28,7 +28,6 @@ pub mod auth;
 pub mod auth_adapter;
 pub mod blob_adapter;
 pub mod bootstrap;
-pub mod collection;
 pub mod core;
 pub mod crdt;
 pub mod crdt_adapter;

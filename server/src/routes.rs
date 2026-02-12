@@ -18,7 +18,6 @@ use crate::action;
 use crate::action::perm::check_perm_action;
 use crate::admin;
 use crate::auth;
-use crate::collection;
 use crate::core::acme;
 use crate::core::create_perm::check_perm_create;
 use crate::core::middleware::{optional_auth, request_id_middleware, require_auth};
@@ -171,11 +170,6 @@ fn init_protected_routes(app: App) -> Router<App> {
 
 		// --- Tag API ---
 		.route("/api/tags", get(file::tag::list_tags))
-
-		// --- Collection API (Favorites, Recent, Bookmarks, Pins) ---
-		.route("/api/collections/{coll_type}", get(collection::handler::list_collection))
-		.route("/api/collections/{coll_type}/{item_id}", post(collection::handler::add_to_collection))
-		.route("/api/collections/{coll_type}/{item_id}", delete(collection::handler::remove_from_collection))
 
 		// --- IDP Management ---
 		.route("/api/idp/identities", get(idp::handler::list_identities))

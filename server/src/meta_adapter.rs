@@ -577,34 +577,6 @@ pub struct UpdateFileOptions {
 	pub status: Patch<char>,
 }
 
-// Collections (Favorites, Recent, Bookmarks, Pins)
-//**************************************************
-
-/// Collection types
-/// - FAVR: Favorites (starred items)
-/// - RCNT: Recent (recently accessed, rolling limit 50)
-/// - BKMK: Bookmarks (saved for later)
-/// - PIND: Pinned (pinned to top)
-pub const COLLECTION_TYPES: [&str; 4] = ["FAVR", "RCNT", "BKMK", "PIND"];
-
-/// Rolling limit for recent items collection
-pub const RECENT_COLLECTION_LIMIT: u32 = 50;
-
-/// Item in a collection
-#[skip_serializing_none]
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CollectionItem {
-	/// Entity ID with type prefix (f1~..., a1~..., etc.)
-	pub item_id: Box<str>,
-	/// When item was added to collection
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	/// When item was last updated in collection
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
-}
-
 // Push Subscriptions
 //********************
 
@@ -1110,33 +1082,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Removes a push subscription. Called when a subscription becomes invalid
 	/// (e.g., 410 Gone response from push service) or when user unsubscribes.
 	async fn delete_push_subscription(&self, tn_id: TnId, subscription_id: u64) -> ClResult<()>;
-
-	// Collection Management (Favorites, Recent, Bookmarks, Pins)
-	//**********************************************************
-
-	/// List items in a collection (FAVR, RCNT, BKMK, PIND)
-	async fn list_collection(
-		&self,
-		tn_id: TnId,
-		coll_type: &str,
-		limit: Option<u32>,
-	) -> ClResult<Vec<CollectionItem>>;
-
-	/// Add an item to a collection
-	/// For RCNT (recent), this should also maintain the rolling limit (e.g., 50 items)
-	async fn add_to_collection(&self, tn_id: TnId, coll_type: &str, item_id: &str) -> ClResult<()>;
-
-	/// Remove an item from a collection
-	async fn remove_from_collection(
-		&self,
-		tn_id: TnId,
-		coll_type: &str,
-		item_id: &str,
-	) -> ClResult<()>;
-
-	/// Check if an item is in a collection
-	async fn is_in_collection(&self, tn_id: TnId, coll_type: &str, item_id: &str)
-		-> ClResult<bool>;
 }
 
 #[cfg(test)]

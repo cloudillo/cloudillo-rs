@@ -1,7 +1,6 @@
 use std::{path::Path, sync::Arc};
 
 mod action;
-mod collection;
 mod file;
 mod file_user_data;
 mod profile;
@@ -596,39 +595,5 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn delete_push_subscription(&self, tn_id: TnId, subscription_id: u64) -> ClResult<()> {
 		push::delete(&self.db, tn_id, subscription_id).await
-	}
-
-	// Collection Management (Favorites, Recent, Bookmarks, Pins)
-	//**********************************************************
-
-	async fn list_collection(
-		&self,
-		tn_id: TnId,
-		coll_type: &str,
-		limit: Option<u32>,
-	) -> ClResult<Vec<CollectionItem>> {
-		collection::list(&self.dbr, tn_id, coll_type, limit).await
-	}
-
-	async fn add_to_collection(&self, tn_id: TnId, coll_type: &str, item_id: &str) -> ClResult<()> {
-		collection::add(&self.db, tn_id, coll_type, item_id).await
-	}
-
-	async fn remove_from_collection(
-		&self,
-		tn_id: TnId,
-		coll_type: &str,
-		item_id: &str,
-	) -> ClResult<()> {
-		collection::remove(&self.db, tn_id, coll_type, item_id).await
-	}
-
-	async fn is_in_collection(
-		&self,
-		tn_id: TnId,
-		coll_type: &str,
-		item_id: &str,
-	) -> ClResult<bool> {
-		collection::contains(&self.dbr, tn_id, coll_type, item_id).await
 	}
 }
