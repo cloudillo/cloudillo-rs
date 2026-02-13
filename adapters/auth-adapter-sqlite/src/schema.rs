@@ -351,10 +351,12 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 
 	// Migrations for existing databases
 	// Version 3: Add proxy_sites table (CREATE TABLE IF NOT EXISTS handles fresh DBs)
+	// Note: We skip to version 4 because the CREATE TABLE above already includes
+	// the proxy_type column that version 4 would add via ALTER TABLE
 	if version > 0 && version < 3 {
-		// Table was already created above with IF NOT EXISTS, just bump version
-		set_db_version(&mut tx, 3).await;
-		version = 3;
+		// Table was already created above with IF NOT EXISTS (including proxy_type), just bump version
+		set_db_version(&mut tx, 4).await;
+		version = 4;
 	}
 
 	// Version 4: Add proxy_type column to proxy_sites
