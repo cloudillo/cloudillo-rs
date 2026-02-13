@@ -73,8 +73,10 @@ pub(crate) async fn list(
 			// Specific folder (including "__trash__" for trash contents)
 			query.push(" AND f.parent_id=").push_bind(parent_id.as_str());
 		}
+	} else {
+		// Exclude trashed files when no specific parent is requested
+		query.push(" AND (f.parent_id IS NULL OR f.parent_id != '__trash__')");
 	}
-	// Note: If parent_id is not specified, return all files (for search, etc.)
 
 	if let Some(tag) = &opts.tag {
 		query.push(" AND f.tags LIKE ").push_bind(format!("%{}%", tag));
