@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod descriptor;
+pub mod duplicate;
 pub mod ffmpeg;
 pub mod filter;
 pub mod handler;

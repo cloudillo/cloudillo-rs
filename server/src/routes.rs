@@ -93,6 +93,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 	let file_router_create = Router::new()
 		.route("/api/files", post(file::handler::post_file))
 		.route("/api/files/{preset}/{file_name}", post(file::handler::post_file_blob))
+		.route("/api/files/{file_id}/duplicate", post(file::management::duplicate_file))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_create("file", "create")));
 
 	// File write routes (check_perm_file("write"))

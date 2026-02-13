@@ -428,6 +428,44 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		index::create_index_impl(&instance, tn_id, db_id, path, field, self.per_tenant_files).await
 	}
 
+	async fn export_all(&self, tn_id: TnId, db_id: &str) -> ClResult<Vec<(Box<str>, Value)>> {
+		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let per_tenant_files = self.per_tenant_files;
+		let db_id_owned = db_id.to_string();
+
+		tokio::task::spawn_blocking(move || {
+			use redb::ReadableDatabase;
+
+			let tx = instance.db.begin_read().map_err(error::from_redb_error)?;
+			let table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(error::from_redb_error)?;
+
+			let prefix = if per_tenant_files {
+				format!("{}/", db_id_owned)
+			} else {
+				format!("{}/{}/", tn_id.0, db_id_owned)
+			};
+
+			let mut results = Vec::new();
+			let range = table.range(prefix.as_str()..).map_err(error::from_redb_error)?;
+
+			for item in range {
+				let (key, value) = item.map_err(error::from_redb_error)?;
+				let key_str = key.value();
+
+				if !key_str.starts_with(&prefix) {
+					break;
+				}
+
+				let relative_path = &key_str[prefix.len()..];
+				let doc: Value = serde_json::from_str(value.value())?;
+				results.push((Box::from(relative_path), doc));
+			}
+
+			Ok(results)
+		})
+		.await?
+	}
+
 	async fn stats(&self, tn_id: TnId, db_id: &str) -> ClResult<DbStats> {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 		let db_path = self.db_file_path(tn_id);

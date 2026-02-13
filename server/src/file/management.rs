@@ -1,14 +1,20 @@
-//! File management (PATCH, DELETE, restore) handlers
+//! File management (PATCH, DELETE, restore, duplicate) handlers
 
 use axum::{
 	extract::{Path, Query, State},
+	http::StatusCode,
 	Json,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::{
-	core::abac::VisibilityLevel, core::extract::Auth, meta_adapter::UpdateFileOptions, prelude::*,
-	types::Patch,
+	core::abac::VisibilityLevel,
+	core::extract::{Auth, OptionalRequestId},
+	core::utils,
+	meta_adapter::{self, UpdateFileOptions},
+	prelude::*,
+	types::{ApiResponse, Patch},
 };
 
 /// Special folder ID for trash
@@ -243,6 +249,90 @@ pub async fn patch_file_user_data(
 		pinned: user_data.pinned,
 		starred: user_data.starred,
 	}))
+}
+
+/// POST /api/files/:fileId/duplicate - Duplicate a CRDT or RTDB file
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateFileRequest {
+	pub file_name: Option<String>,
+	pub parent_id: Option<String>,
+}
+
+pub async fn duplicate_file(
+	State(app): State<App>,
+	tn_id: TnId,
+	Auth(auth): Auth,
+	Path(file_id): Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(req): Json<DuplicateFileRequest>,
+) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+	// 1. Read source file metadata
+	let file = app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or_else(|| {
+		warn!("duplicate_file: File {} not found", file_id);
+		Error::NotFound
+	})?;
+
+	// 2. Validate file type
+	let file_tp = file.file_tp.as_deref().unwrap_or("BLOB");
+	if file_tp != "CRDT" && file_tp != "RTDB" {
+		return Err(Error::ValidationError(format!(
+			"Only CRDT and RTDB files can be duplicated, got '{}'",
+			file_tp
+		)));
+	}
+
+	// 3. Generate new file_id
+	let new_file_id = utils::random_id()?;
+
+	// 4. Determine filename
+	let new_file_name = req.file_name.unwrap_or_else(|| format!("Copy of {}", file.file_name));
+
+	// 5. Copy content based on type
+	match file_tp {
+		"CRDT" => {
+			super::duplicate::duplicate_crdt_content(&app, tn_id, &file_id, &new_file_id).await?;
+		}
+		"RTDB" => {
+			super::duplicate::duplicate_rtdb_content(&app, tn_id, &file_id, &new_file_id).await?;
+		}
+		_ => {
+			return Err(Error::ValidationError(format!(
+				"Unsupported file type for duplication: '{}'",
+				file_tp
+			)));
+		}
+	}
+
+	// 6. Create file metadata for the duplicate
+	let parent_id = req.parent_id.map(Box::from).or(file.parent_id);
+	let _f_id = app
+		.meta_adapter
+		.create_file(
+			tn_id,
+			meta_adapter::CreateFile {
+				preset: file.preset,
+				orig_variant_id: Some(new_file_id.clone().into()),
+				file_id: Some(new_file_id.clone().into()),
+				parent_id,
+				owner_tag: Some(auth.id_tag.clone()),
+				content_type: file.content_type.unwrap_or_else(|| "application/json".into()),
+				file_name: new_file_name.into(),
+				file_tp: file.file_tp,
+				created_at: None,
+				tags: file.tags,
+				x: file.x,
+				visibility: file.visibility,
+				status: None,
+			},
+		)
+		.await?;
+
+	info!("User {} duplicated file {} -> {}", auth.id_tag, file_id, new_file_id);
+
+	let data = json!({"fileId": new_file_id});
+	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// Upgrade file visibility to match target visibility (only if more permissive)

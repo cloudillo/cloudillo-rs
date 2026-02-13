@@ -384,6 +384,12 @@ pub trait RtdbAdapter: Debug + Send + Sync {
 
 	/// Get database statistics (size, record count, table count).
 	async fn stats(&self, tn_id: TnId, db_id: &str) -> ClResult<DbStats>;
+
+	/// Export all documents from a database.
+	///
+	/// Returns all `(path, document)` pairs. The path is relative to the db_id
+	/// (e.g., `posts/abc123`). Used for duplicating RTDB files.
+	async fn export_all(&self, tn_id: TnId, db_id: &str) -> ClResult<Vec<(Box<str>, Value)>>;
 }
 
 // vim: ts=4
