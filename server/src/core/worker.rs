@@ -55,7 +55,11 @@ impl WorkerPool {
 	}
 
 	/// Submit a closure with arguments → returns a Future for the result
-	pub fn spawn<F, T>(&self, priority: Priority, f: F) -> impl std::future::Future<Output = T>
+	pub fn spawn<F, T>(
+		&self,
+		priority: Priority,
+		f: F,
+	) -> impl std::future::Future<Output = ClResult<T>>
 	where
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
@@ -86,17 +90,14 @@ impl WorkerPool {
 		}
 
 		async move {
-			match res_rx.await {
-				Ok(result) => result,
-				Err(_) => {
-					error!("Critical: Worker dropped result channel - this should never happen with catch_unwind");
-					std::process::abort();
-				}
-			}
+			res_rx.await.map_err(|_| {
+				error!("Worker dropped result channel (task may have panicked)");
+				Error::Internal("worker task failed".into())
+			})
 		}
 	}
 
-	pub fn run<F, T>(&self, f: F) -> impl std::future::Future<Output = T>
+	pub fn run<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
 	where
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
@@ -114,17 +115,14 @@ impl WorkerPool {
 		}
 
 		async move {
-			match res_rx.await {
-				Ok(result) => result,
-				Err(_) => {
-					error!("Critical: Worker dropped result channel - this should never happen with catch_unwind");
-					std::process::abort();
-				}
-			}
+			res_rx.await.map_err(|_| {
+				error!("Worker dropped result channel (task may have panicked)");
+				Error::Internal("worker task failed".into())
+			})
 		}
 	}
 
-	pub fn run_immed<F, T>(&self, f: F) -> impl std::future::Future<Output = T>
+	pub fn run_immed<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
 	where
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
@@ -141,17 +139,14 @@ impl WorkerPool {
 		}
 
 		async move {
-			match res_rx.await {
-				Ok(result) => result,
-				Err(_) => {
-					error!("Critical: Worker dropped result channel - this should never happen with catch_unwind");
-					std::process::abort();
-				}
-			}
+			res_rx.await.map_err(|_| {
+				error!("Worker dropped result channel (task may have panicked)");
+				Error::Internal("worker task failed".into())
+			})
 		}
 	}
 
-	pub fn run_slow<F, T>(&self, f: F) -> impl std::future::Future<Output = T>
+	pub fn run_slow<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
 	where
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
@@ -169,14 +164,44 @@ impl WorkerPool {
 		}
 
 		async move {
-			match res_rx.await {
-				Ok(result) => result,
-				Err(_) => {
-					error!("Critical: Worker dropped result channel - this should never happen with catch_unwind");
-					std::process::abort();
-				}
-			}
+			res_rx.await.map_err(|_| {
+				error!("Worker dropped result channel (task may have panicked)");
+				Error::Internal("worker task failed".into())
+			})
 		}
+	}
+
+	/// Like `run`, but flattens `ClResult<ClResult<T>>` into `ClResult<T>`.
+	/// Use when the closure itself returns `ClResult<T>`.
+	pub fn try_run<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
+	where
+		F: FnOnce() -> ClResult<T> + Send + 'static,
+		T: Send + 'static,
+	{
+		let fut = self.run(f);
+		async move { fut.await? }
+	}
+
+	/// Like `run_immed`, but flattens `ClResult<ClResult<T>>` into `ClResult<T>`.
+	/// Use when the closure itself returns `ClResult<T>`.
+	pub fn try_run_immed<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
+	where
+		F: FnOnce() -> ClResult<T> + Send + 'static,
+		T: Send + 'static,
+	{
+		let fut = self.run_immed(f);
+		async move { fut.await? }
+	}
+
+	/// Like `run_slow`, but flattens `ClResult<ClResult<T>>` into `ClResult<T>`.
+	/// Use when the closure itself returns `ClResult<T>`.
+	pub fn try_run_slow<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
+	where
+		F: FnOnce() -> ClResult<T> + Send + 'static,
+		T: Send + 'static,
+	{
+		let fut = self.run_slow(f);
+		async move { fut.await? }
 	}
 }
 

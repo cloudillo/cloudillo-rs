@@ -93,7 +93,7 @@ impl Task<App> for AudioExtractorTask {
 
 		let duration = app
 			.worker
-			.run(move || {
+			.try_run(move || {
 				let opts = ffmpeg::AudioExtractOpts {
 					bitrate,
 					codec: "libopus".to_string(),

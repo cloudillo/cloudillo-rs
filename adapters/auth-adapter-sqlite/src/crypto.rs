@@ -20,10 +20,7 @@ pub async fn generate_password_hash(
 	password: &str,
 ) -> ClResult<Box<str>> {
 	let password = password.to_string().into_boxed_str();
-	worker
-		.run_immed(move || generate_password_hash_sync(password))
-		.await
-		.map_err(|_| Error::PermissionDenied)
+	worker.try_run_immed(move || generate_password_hash_sync(password)).await
 }
 
 fn check_password_sync(password: Box<str>, password_hash: Box<str>) -> ClResult<()> {
@@ -42,10 +39,7 @@ pub async fn check_password(
 	password_hash: Box<str>,
 ) -> ClResult<()> {
 	let password = password.to_string().into_boxed_str();
-	worker
-		.run_immed(move || check_password_sync(password, password_hash))
-		.await
-		.map_err(|_| Error::PermissionDenied)
+	worker.try_run_immed(move || check_password_sync(password, password_hash)).await
 }
 
 fn generate_access_token_sync(
@@ -75,9 +69,8 @@ pub async fn generate_access_token(
 	jwt_secret: Box<str>,
 ) -> ClResult<Box<str>> {
 	worker
-		.run_immed(move || generate_access_token_sync(access_token, &jwt_secret))
+		.try_run_immed(move || generate_access_token_sync(access_token, &jwt_secret))
 		.await
-		.map_err(|_| Error::PermissionDenied)
 }
 
 /// Generate a keypair (sync)
@@ -108,7 +101,7 @@ fn generate_key_sync() -> ClResult<KeyPair> {
 
 /// Generate a keypair
 pub async fn generate_key(worker: &worker::WorkerPool) -> ClResult<KeyPair> {
-	worker.run_immed(generate_key_sync).await.map_err(|_| Error::PermissionDenied)
+	worker.try_run_immed(generate_key_sync).await
 }
 
 /// Generate a P-256 keypair for VAPID (sync)
@@ -134,10 +127,7 @@ fn generate_vapid_key_sync() -> ClResult<KeyPair> {
 
 /// Generate a P-256 keypair for VAPID
 pub async fn generate_vapid_key(worker: &worker::WorkerPool) -> ClResult<KeyPair> {
-	worker
-		.run_immed(generate_vapid_key_sync)
-		.await
-		.map_err(|_| Error::PermissionDenied)
+	worker.try_run_immed(generate_vapid_key_sync).await
 }
 
 /// API key prefix
@@ -204,9 +194,8 @@ pub async fn generate_action_token(
 	private_key: Box<str>,
 ) -> ClResult<Box<str>> {
 	worker
-		.run_immed(move || generate_action_token_sync(action_data, private_key))
+		.try_run_immed(move || generate_action_token_sync(action_data, private_key))
 		.await
-		.map_err(|_| Error::PermissionDenied)
 }
 
 // vim: ts=4

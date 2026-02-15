@@ -122,6 +122,7 @@ pub async fn resize_image(
 			resize_image_sync(orig_buf, format, resize)
 		})
 		.await
+		.map_err(|e| image::error::ImageError::IoError(std::io::Error::other(e.to_string())))?
 }
 
 pub async fn get_image_dimensions(buf: &[u8]) -> Result<(u32, u32), image::error::ImageError> {
@@ -434,7 +435,10 @@ impl Task<App> for ImageResizerTask {
 		let bytes = tokio::fs::read(self.path.clone()).await?;
 		let res = self.res;
 		let format = self.format;
-		let resize_result = app.worker.run(move || resize_image_sync(bytes, format, res)).await?;
+		let resize_result = app
+			.worker
+			.try_run(move || -> ClResult<_> { Ok(resize_image_sync(bytes, format, res)?) })
+			.await?;
 		info!(
 			"Finished task image.resize {:?} {} ({}x{})",
 			self.path,

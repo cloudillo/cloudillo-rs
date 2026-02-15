@@ -101,7 +101,7 @@ impl Task<App> for VideoTranscoderTask {
 
 		let (resolution, duration) = app
 			.worker
-			.run(move || {
+			.try_run(move || {
 				let opts = ffmpeg::VideoTranscodeOpts {
 					max_dim,
 					bitrate,

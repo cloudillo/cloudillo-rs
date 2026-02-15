@@ -163,7 +163,7 @@ impl Task<App> for PdfProcessorTask {
 
 		let pdf_info = app
 			.worker
-			.run(move || {
+			.try_run(move || {
 				// Get page count
 				let info = get_pdf_info(&input_path)?;
 
