@@ -23,7 +23,13 @@ impl CertResolver {
 	}
 
 	pub fn get(&self, name: &str) -> Option<Arc<CertifiedKey>> {
-		self.state.certs.read().ok()?.get(name).cloned()
+		match self.state.certs.read() {
+			Ok(cache) => cache.get(name).cloned(),
+			Err(poisoned) => {
+				error!("RwLock poisoned in cert cache read (recovering)");
+				poisoned.into_inner().get(name).cloned()
+			}
+		}
 	}
 
 	pub fn insert(
@@ -31,7 +37,15 @@ impl CertResolver {
 		name: Box<str>,
 		cert: Arc<CertifiedKey>,
 	) -> Result<(), Box<dyn std::error::Error + '_>> {
-		self.state.certs.write()?.insert(name, cert);
+		match self.state.certs.write() {
+			Ok(mut cache) => {
+				cache.insert(name, cert);
+			}
+			Err(poisoned) => {
+				error!("RwLock poisoned in cert cache write (recovering)");
+				poisoned.into_inner().insert(name, cert);
+			}
+		}
 		Ok(())
 	}
 }
@@ -69,7 +83,13 @@ impl ResolvesServerCert for CertResolver {
 					)
 					.ok()?;
 					let certified_key = Arc::new(certified_key);
-					let mut cache = self.state.certs.write().ok()?;
+					let mut cache = match self.state.certs.write() {
+						Ok(cache) => cache,
+						Err(poisoned) => {
+							error!("RwLock poisoned in cert cache write (recovering)");
+							poisoned.into_inner()
+						}
+					};
 					//debug!("[inserting into cache]");
 					cache.insert(
 						("cl-o.".to_string() + &cert_data.id_tag).into_boxed_str(),
@@ -86,6 +106,43 @@ impl ResolvesServerCert for CertResolver {
 			None
 		}
 	}
+}
+
+/// Pre-populate the TLS cert cache from database to avoid blocking I/O during handshakes
+pub fn prepopulate_cert_cache(app: &App, certs: &[crate::auth_adapter::CertData]) -> usize {
+	let mut loaded = 0;
+	let Ok(mut cache) = app.certs.write() else {
+		error!("Failed to acquire cert cache write lock for pre-population");
+		return 0;
+	};
+
+	for cert_data in certs {
+		let certified_key = match rustls::sign::CertifiedKey::from_der(
+			CertificateDer::pem_slice_iter(cert_data.cert.as_bytes())
+				.filter_map(Result::ok)
+				.collect(),
+			match PrivateKeyDer::from_pem_slice(cert_data.key.as_bytes()) {
+				Ok(k) => k,
+				Err(_) => continue,
+			},
+			match rustls::crypto::CryptoProvider::get_default() {
+				Some(p) => p,
+				None => continue,
+			},
+		) {
+			Ok(k) => Arc::new(k),
+			Err(_) => continue,
+		};
+
+		cache.insert(
+			("cl-o.".to_string() + &cert_data.id_tag).into_boxed_str(),
+			certified_key.clone(),
+		);
+		cache.insert(cert_data.domain.clone(), certified_key);
+		loaded += 1;
+	}
+
+	loaded
 }
 
 pub async fn create_https_server(

@@ -371,6 +371,8 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn read_cert_by_tn_id(&self, tn_id: TnId) -> ClResult<CertData>;
 	async fn read_cert_by_id_tag(&self, id_tag: &str) -> ClResult<CertData>;
 	async fn read_cert_by_domain(&self, domain: &str) -> ClResult<CertData>;
+	/// List all valid certificates for cache pre-population
+	async fn list_all_certs(&self) -> ClResult<Vec<CertData>>;
 
 	/// List tenants that need certificate renewal
 	/// Returns (tn_id, id_tag) for tenants where:
@@ -474,6 +476,9 @@ pub trait AuthAdapter: Debug + Send + Sync {
 
 	/// Cleanup expired API keys (for scheduler)
 	async fn cleanup_expired_api_keys(&self) -> ClResult<u32>;
+
+	/// Cleanup expired verification codes (for scheduler)
+	async fn cleanup_expired_verification_codes(&self) -> ClResult<u32>;
 
 	// Proxy site management
 	/// Create a new proxy site

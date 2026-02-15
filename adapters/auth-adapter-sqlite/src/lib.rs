@@ -128,6 +128,10 @@ impl AuthAdapter for AuthAdapterSqlite {
 		cert::read_cert_by_domain(&self.db, domain).await
 	}
 
+	async fn list_all_certs(&self) -> ClResult<Vec<CertData>> {
+		cert::list_all_certs(&self.db).await
+	}
+
 	async fn list_tenants_needing_cert_renewal(
 		&self,
 		renewal_days: u32,
@@ -273,6 +277,16 @@ impl AuthAdapter for AuthAdapterSqlite {
 
 	async fn cleanup_expired_api_keys(&self) -> ClResult<u32> {
 		api_key::cleanup_expired_api_keys(&self.db).await
+	}
+
+	async fn cleanup_expired_verification_codes(&self) -> ClResult<u32> {
+		let result = sqlx::query(
+			"DELETE FROM user_vfy WHERE expires_at IS NOT NULL AND expires_at < unixepoch()",
+		)
+		.execute(&self.db)
+		.await
+		.or(Err(Error::DbError))?;
+		Ok(result.rows_affected() as u32)
 	}
 
 	// Proxy site management

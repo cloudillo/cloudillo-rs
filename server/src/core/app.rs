@@ -415,6 +415,7 @@ impl AppBuilder {
 		action::init(&app)?;
 		file::init(&app)?;
 		profile::init(&app)?;
+		crate::auth::init(&app)?;
 		crate::email::init(&app)?;
 		super::acme::register_tasks(&app)?;
 		let (api_router, app_router, http_router) = routes::init(app.clone());
@@ -463,6 +464,17 @@ impl AppBuilder {
 					}
 				}
 			});
+		}
+
+		// Pre-populate TLS cert cache to avoid blocking I/O during TLS handshakes
+		match app.auth_adapter.list_all_certs().await {
+			Ok(certs) => {
+				let loaded = webserver::prepopulate_cert_cache(&app, &certs);
+				info!("Pre-populated TLS cert cache with {} certificates", loaded);
+			}
+			Err(e) => {
+				warn!("Failed to pre-populate TLS cert cache: {}", e);
+			}
 		}
 
 		let https_server =

@@ -542,9 +542,12 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 				// Get task metadata WITHOUT removing - we only remove after successful transition
 				let task_meta_opt = {
-					let Ok(tasks_running) = schedule.tasks_running.lock() else {
-						error!("Mutex poisoned: tasks_running");
-						return;
+					let tasks_running = match schedule.tasks_running.lock() {
+						Ok(guard) => guard,
+						Err(poisoned) => {
+							error!("Mutex poisoned: tasks_running (recovering)");
+							poisoned.into_inner()
+						}
 					};
 					tasks_running.get(&id).cloned()
 				};
@@ -585,8 +588,14 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 						}
 
 						// Remove from running BEFORE add_queue (so add_queue doesn't see it as running)
-						if let Ok(mut tasks_running) = schedule.tasks_running.lock() {
-							tasks_running.remove(&id);
+						match schedule.tasks_running.lock() {
+							Ok(mut tasks_running) => {
+								tasks_running.remove(&id);
+							}
+							Err(poisoned) => {
+								error!("Mutex poisoned: tasks_running (recovering)");
+								poisoned.into_inner().remove(&id);
+							}
 						}
 
 						// Re-add to scheduler with new execution time
@@ -614,8 +623,14 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 					// Only remove from running queue after successful transition
 					if transition_ok {
-						if let Ok(mut tasks_running) = schedule.tasks_running.lock() {
-							tasks_running.remove(&id);
+						match schedule.tasks_running.lock() {
+							Ok(mut tasks_running) => {
+								tasks_running.remove(&id);
+							}
+							Err(poisoned) => {
+								error!("Mutex poisoned: tasks_running (recovering)");
+								poisoned.into_inner().remove(&id);
+							}
 						}
 					}
 
@@ -624,8 +639,14 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 						Ok(ready_to_spawn) => {
 							for (dep_id, dep_task_meta) in ready_to_spawn {
 								// Add to running queue before spawning
-								if let Ok(mut tasks_running) = schedule.tasks_running.lock() {
-									tasks_running.insert(dep_id, dep_task_meta.clone());
+								match schedule.tasks_running.lock() {
+									Ok(mut tasks_running) => {
+										tasks_running.insert(dep_id, dep_task_meta.clone());
+									}
+									Err(poisoned) => {
+										error!("Mutex poisoned: tasks_running (recovering)");
+										poisoned.into_inner().insert(dep_id, dep_task_meta.clone());
+									}
 								}
 								schedule.spawn_task(
 									stat.clone(),
@@ -649,26 +670,36 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		let schedule = self.clone();
 		tokio::spawn(async move {
 			loop {
-				let is_empty =
-					schedule.tasks_scheduled.lock().map(|guard| guard.is_empty()).unwrap_or(true);
+				let is_empty = match schedule.tasks_scheduled.lock() {
+					Ok(guard) => guard.is_empty(),
+					Err(poisoned) => {
+						error!("Mutex poisoned: tasks_scheduled (recovering)");
+						poisoned.into_inner().is_empty()
+					}
+				};
 				if is_empty {
 					schedule.notify_schedule.notified().await;
 				}
 				let time = Timestamp::now();
 				if let Some((timestamp, _id)) = loop {
-					//info!("first task: {:?}", schedule.tasks_scheduled.lock().first_key_value());
-					let Ok(mut tasks_scheduled) = schedule.tasks_scheduled.lock() else {
-						error!("Mutex poisoned: tasks_scheduled");
-						break None;
+					let mut tasks_scheduled = match schedule.tasks_scheduled.lock() {
+						Ok(guard) => guard,
+						Err(poisoned) => {
+							error!("Mutex poisoned: tasks_scheduled (recovering)");
+							poisoned.into_inner()
+						}
 					};
 					if let Some((&(timestamp, id), _)) = tasks_scheduled.first_key_value() {
 						let (timestamp, id) = (timestamp, id);
 						if timestamp <= Timestamp::now() {
 							debug!("Spawning task id {} (from schedule)", id);
 							if let Some(task) = tasks_scheduled.remove(&(timestamp, id)) {
-								let Ok(mut tasks_running) = schedule.tasks_running.lock() else {
-									error!("Mutex poisoned: tasks_running");
-									break None;
+								let mut tasks_running = match schedule.tasks_running.lock() {
+									Ok(guard) => guard,
+									Err(poisoned) => {
+										error!("Mutex poisoned: tasks_running (recovering)");
+										poisoned.into_inner()
+									}
 								};
 								tasks_running.insert(id, task.clone());
 								schedule.spawn_task(state.clone(), task.task.clone(), id, task);
@@ -1065,8 +1096,14 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 								.unwrap_or(());
 
 							// Remove from running tasks (we're not sending finish event)
-							if let Ok(mut tasks_running) = scheduler.tasks_running.lock() {
-								tasks_running.remove(&id);
+							match scheduler.tasks_running.lock() {
+								Ok(mut tasks_running) => {
+									tasks_running.remove(&id);
+								}
+								Err(poisoned) => {
+									error!("Mutex poisoned: tasks_running (recovering)");
+									poisoned.into_inner().remove(&id);
+								}
 							}
 
 							// Re-queue task with incremented retry count

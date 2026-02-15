@@ -388,6 +388,29 @@ pub async fn bootstrap(
 		});
 	}
 
+	// Schedule auth cleanup task (expired API keys, verification codes)
+	{
+		let app_clone = app.clone();
+		tokio::spawn(async move {
+			let cleanup_task = Arc::new(crate::auth::cleanup::AuthCleanupTask);
+			match app_clone
+				.scheduler
+				.task(cleanup_task)
+				.key("auth.cleanup")
+				.cron("0 3 * * *") // Daily at 3 AM
+				.schedule()
+				.await
+			{
+				Ok(task_id) => {
+					info!("Auth cleanup task scheduled (task_id={})", task_id);
+				}
+				Err(e) => {
+					error!(error = %e, "Failed to schedule auth cleanup task");
+				}
+			}
+		});
+	}
+
 	Ok(())
 }
 // vim: ts=4

@@ -87,6 +87,31 @@ pub(crate) async fn read_cert_by_domain(db: &SqlitePool, domain: &str) -> ClResu
 	})
 }
 
+/// List all valid certificates for cache pre-population
+pub(crate) async fn list_all_certs(db: &SqlitePool) -> ClResult<Vec<CertData>> {
+	let rows = sqlx::query(
+		"SELECT tn_id, id_tag, domain, cert, key, expires_at FROM certs
+		WHERE cert IS NOT NULL AND key IS NOT NULL",
+	)
+	.fetch_all(db)
+	.await
+	.or(Err(Error::DbError))?;
+
+	let mut certs = Vec::new();
+	for row in rows {
+		let cert_data = CertData {
+			tn_id: TnId(row.try_get("tn_id").or(Err(Error::DbError))?),
+			id_tag: row.try_get("id_tag").or(Err(Error::DbError))?,
+			domain: row.try_get("domain").or(Err(Error::DbError))?,
+			cert: row.try_get("cert").or(Err(Error::DbError))?,
+			key: row.try_get("key").or(Err(Error::DbError))?,
+			expires_at: Timestamp(row.try_get::<i64, _>("expires_at").or(Err(Error::DbError))?),
+		};
+		certs.push(cert_data);
+	}
+	Ok(certs)
+}
+
 /// List tenants that need certificate renewal
 /// Returns (tn_id, id_tag) for tenants where:
 /// - Certificate doesn't exist, OR
