@@ -14,12 +14,21 @@ use tokio_util::{bytes::Bytes, io::ReaderStream};
 
 use cloudillo::{blob_adapter, core::hasher, prelude::*, types::TnId};
 
+/// Validates that a file_id hash portion contains only safe characters (base64url alphabet)
+fn validate_hash(hash: &str) -> ClResult<()> {
+	if !hash.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+		return Err(Error::ValidationError("invalid characters in file_id hash".into()));
+	}
+	Ok(())
+}
+
 /// Calculates the path of the directory for a blob
 fn obj_dir(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
 	let hash_start = file_id.find('~').ok_or(Error::Parse)? + 1;
 	if file_id.len() < hash_start + 4 {
 		Err(Error::Parse)?
 	};
+	validate_hash(&file_id[hash_start..])?;
 
 	Ok(PathBuf::from(base_dir)
 		.join(tn_id.to_string())
@@ -32,6 +41,7 @@ fn obj_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBu
 	if file_id.len() < hash_start + 5 {
 		Err(Error::Parse)?
 	};
+	validate_hash(&file_id[hash_start..])?;
 
 	Ok(PathBuf::from(base_dir)
 		.join(tn_id.to_string())
@@ -46,6 +56,7 @@ fn obj_tmp_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<Pa
 	if file_id.len() < hash_start + 5 {
 		Err(Error::Parse)?
 	};
+	validate_hash(&file_id[hash_start..])?;
 
 	Ok(PathBuf::from(base_dir).join(tn_id.to_string()).join(&tmp_id))
 }
@@ -165,6 +176,18 @@ mod test {
 		let file_id = "f1~1234567890";
 		let dir = obj_dir(Path::new("some_dir"), TnId(42), file_id).unwrap_or_default();
 		assert_eq!(dir, PathBuf::from("some_dir/42/12/34"));
+	}
+
+	#[test]
+	fn test_path_traversal_rejected() {
+		let malicious_id = "f1~../../etc/passwd";
+		assert!(obj_dir(Path::new("some_dir"), TnId(42), malicious_id).is_err());
+	}
+
+	#[test]
+	fn test_slash_in_hash_rejected() {
+		let malicious_id = "f1~ab/cd/evil";
+		assert!(obj_dir(Path::new("some_dir"), TnId(42), malicious_id).is_err());
 	}
 }
 

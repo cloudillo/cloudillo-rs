@@ -35,7 +35,10 @@ pub mod status {
 	pub const DELETED: char = 'D';
 }
 
-pub use process::{decode_jwt_no_verify, verify_action_token};
+/// WARNING: `decode_jwt_no_verify` MUST always be followed by signature verification.
+/// It only peeks at the issuer/key_id to determine which key to fetch.
+pub(crate) use process::decode_jwt_no_verify;
+pub use process::verify_action_token;
 
 use crate::prelude::*;
 
