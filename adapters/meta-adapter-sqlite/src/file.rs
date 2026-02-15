@@ -75,7 +75,10 @@ pub(crate) async fn list(
 		}
 	} else {
 		// Exclude trashed files when no specific parent is requested
-		query.push(" AND (f.parent_id IS NULL OR f.parent_id != '__trash__')");
+		query
+			.push(" AND (f.parent_id IS NULL OR f.parent_id != ")
+			.push_bind(cloudillo::meta_adapter::TRASH_PARENT_ID)
+			.push(")");
 	}
 
 	if let Some(tag) = &opts.tag {

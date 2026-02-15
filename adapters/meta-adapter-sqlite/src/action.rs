@@ -119,13 +119,18 @@ pub(crate) async fn list(
 		if let Some(cursor) = cloudillo::types::CursorData::decode(cursor_str) {
 			// Look up internal a_id from cursor's external action_id
 			let cursor_a_id: Option<i64> =
-				sqlx::query_scalar("SELECT a_id FROM actions WHERE tn_id=? AND action_id=?")
+				match sqlx::query_scalar("SELECT a_id FROM actions WHERE tn_id=? AND action_id=?")
 					.bind(tn_id.0)
 					.bind(&cursor.id)
 					.fetch_optional(db)
 					.await
-					.ok()
-					.flatten();
+				{
+					Ok(v) => v,
+					Err(e) => {
+						warn!("cursor a_id lookup failed: {}", e);
+						None
+					}
+				};
 
 			if let Some(cursor_a_id) = cursor_a_id {
 				// Keyset pagination: (created_at, a_id) < (cursor_ts, cursor_a_id) for DESC

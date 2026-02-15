@@ -1,5 +1,8 @@
 //! Adapter that manages metadata. Everything including tenants, profiles, actions, file metadata, etc.
 
+/// Special parent_id value for trashed files
+pub const TRASH_PARENT_ID: &str = "__trash__";
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;

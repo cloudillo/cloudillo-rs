@@ -18,7 +18,7 @@ use crate::{
 };
 
 /// Special folder ID for trash
-const TRASH_FOLDER_ID: &str = "__trash__";
+const TRASH_FOLDER_ID: &str = crate::meta_adapter::TRASH_PARENT_ID;
 
 /// PATCH /file/:fileId - Update file metadata
 /// Uses UpdateFileOptions with Patch<> fields for proper null/undefined handling
