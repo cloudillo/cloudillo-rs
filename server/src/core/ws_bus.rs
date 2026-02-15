@@ -138,34 +138,28 @@ pub async fn handle_bus_connection(
 	// Message receive task - forwards messages to WebSocket
 	let ws_tx_clone = ws_tx.clone();
 	let message_task = tokio::spawn(async move {
+		let mut rx = user_rx.lock().await;
 		loop {
-			// Check for user-targeted messages
-			let msg = {
-				let mut rx = user_rx.lock().await;
-				match rx.try_recv() {
-					Ok(msg) => Some(msg),
-					Err(tokio::sync::broadcast::error::TryRecvError::Empty) => None,
-					Err(_) => {
-						debug!("User receiver dropped");
-						return;
+			match rx.recv().await {
+				Ok(bcast_msg) => {
+					// Forward message directly to WebSocket
+					let response = BusMessage::new(bcast_msg.cmd, bcast_msg.data);
+
+					if let Ok(ws_response) = response.to_ws_message() {
+						let mut tx = ws_tx_clone.lock().await;
+						if tx.send(ws_response).await.is_err() {
+							debug!("Client disconnected while forwarding message");
+							return;
+						}
 					}
 				}
-			};
-
-			if let Some(bcast_msg) = msg {
-				// Forward message directly to WebSocket
-				let response = BusMessage::new(bcast_msg.cmd, bcast_msg.data);
-
-				if let Ok(ws_response) = response.to_ws_message() {
-					let mut tx = ws_tx_clone.lock().await;
-					if tx.send(ws_response).await.is_err() {
-						debug!("Client disconnected while forwarding message");
-						return;
-					}
+				Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+					warn!("Bus receiver lagged, skipped {} messages", n);
 				}
-			} else {
-				// No message, yield
-				tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+				Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+					debug!("User receiver channel closed");
+					return;
+				}
 			}
 		}
 	});
