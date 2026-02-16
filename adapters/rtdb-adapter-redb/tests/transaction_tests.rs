@@ -35,7 +35,9 @@ async fn test_transaction_read_your_own_writes() {
 	// Create a document
 	let doc_id = {
 		let mut tx = adapter.transaction(tn_id, db_id).await.unwrap();
-		tx.create("counters", json!({"value": 10})).await.unwrap()
+		let id = tx.create("counters", json!({"value": 10})).await.unwrap();
+		tx.commit().await.unwrap();
+		id
 	};
 
 	let doc_path = format!("counters/{}", doc_id);
@@ -62,7 +64,8 @@ async fn test_transaction_read_your_own_writes() {
 		let doc = tx.get(&doc_path).await.unwrap().unwrap();
 		assert_eq!(doc["value"], 30, "Should see latest uncommitted write");
 
-		// Commit via drop
+		// Commit explicitly
+		tx.commit().await.unwrap();
 	}
 
 	// Verify committed with final value
@@ -79,7 +82,9 @@ async fn test_transaction_read_deleted_document() {
 	// Create a document
 	let doc_id = {
 		let mut tx = adapter.transaction(tn_id, db_id).await.unwrap();
-		tx.create("docs", json!({"name": "test"})).await.unwrap()
+		let id = tx.create("docs", json!({"name": "test"})).await.unwrap();
+		tx.commit().await.unwrap();
+		id
 	};
 
 	let doc_path = format!("docs/{}", doc_id);
@@ -99,7 +104,8 @@ async fn test_transaction_read_deleted_document() {
 		let doc = tx.get(&doc_path).await.unwrap();
 		assert!(doc.is_none(), "Should see None for deleted document");
 
-		// Commit via drop (auto-commit)
+		// Commit explicitly
+		tx.commit().await.unwrap();
 	}
 
 	// Verify deleted
@@ -136,7 +142,8 @@ async fn test_transaction_read_created_document() {
 		let doc = tx.get(&doc_path).await.unwrap().unwrap();
 		assert_eq!(doc["status"], "active");
 
-		// Commit via drop
+		// Commit explicitly
+		tx.commit().await.unwrap();
 		doc_id
 	};
 
@@ -157,7 +164,9 @@ async fn test_concurrent_increment_no_race_condition() {
 	// Create initial counter
 	let counter_id = {
 		let mut tx = adapter.transaction(tn_id, db_id).await.unwrap();
-		tx.create("counters", json!({"year": 2025, "lastNumber": 0})).await.unwrap()
+		let id = tx.create("counters", json!({"year": 2025, "lastNumber": 0})).await.unwrap();
+		tx.commit().await.unwrap();
+		id
 	};
 
 	let counter_path = format!("counters/{}", counter_id);
@@ -191,8 +200,8 @@ async fn test_concurrent_increment_no_race_condition() {
 			// Write back
 			match tx.update(&counter_path, json!({"year": 2025, "lastNumber": new_value})).await {
 				Ok(_) => {
-					// Commit via drop (auto-commit on success)
-					drop(tx);
+					// Commit explicitly
+					tx.commit().await.unwrap();
 					new_value
 				}
 				Err(e) => {
@@ -253,9 +262,12 @@ async fn test_invoice_numbering_simulation() {
 	// Create invoice counter for 2025
 	let counter_id = {
 		let mut tx = adapter.transaction(tn_id, db_id).await.unwrap();
-		tx.create("invoice_counters", json!({"year": 2025, "lastNumber": 0}))
+		let id = tx
+			.create("invoice_counters", json!({"year": 2025, "lastNumber": 0}))
 			.await
-			.unwrap()
+			.unwrap();
+		tx.commit().await.unwrap();
+		id
 	};
 
 	let counter_path = format!("invoice_counters/{}", counter_id);
@@ -303,8 +315,8 @@ async fn test_invoice_numbering_simulation() {
 				.await
 				.unwrap();
 
-			// Commit via drop (auto-commit)
-			drop(tx);
+			// Commit explicitly
+			tx.commit().await.unwrap();
 			(next_number, invoice_id.to_string())
 		});
 
@@ -345,5 +357,5 @@ async fn test_invoice_numbering_simulation() {
 		assert_eq!(*num, (i + 1) as i64, "CRITICAL: Gap detected! Expected {}, got {}", i + 1, num);
 	}
 
-	println!("✅ SUCCESS: {} invoices finalized with no duplicates and no gaps!", num_invoices);
+	println!("SUCCESS: {} invoices finalized with no duplicates and no gaps!", num_invoices);
 }

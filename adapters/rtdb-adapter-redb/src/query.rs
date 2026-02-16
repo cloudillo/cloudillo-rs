@@ -62,7 +62,8 @@ pub fn execute_query(
 			continue;
 		}
 
-		let doc: Value = serde_json::from_str(value.value())?;
+		let mut doc: Value = serde_json::from_str(value.value())?;
+		storage::inject_doc_id(&mut doc, remainder);
 
 		// Apply filter
 		if let Some(ref filter) = opts.filter {
@@ -73,10 +74,14 @@ pub fn execute_query(
 
 		results.push(doc);
 
-		// Early exit if we have enough
+		// Early exit if we have enough (only when not sorting, since unseen
+		// docs may sort ahead of what we already have)
 		if let Some(limit) = opts.limit {
-			if results.len() >= (limit as usize) * 2 {
-				break;
+			if opts.sort.is_none() {
+				let needed = opts.offset.unwrap_or(0) as usize + limit as usize;
+				if results.len() >= needed {
+					break;
+				}
 			}
 		}
 	}
@@ -150,7 +155,8 @@ fn execute_index_query(
 
 		// Fetch document
 		if let Some(json) = doc_table.get(doc_key.as_str()).map_err(from_redb_error)? {
-			let doc: Value = serde_json::from_str(json.value())?;
+			let mut doc: Value = serde_json::from_str(json.value())?;
+			storage::inject_doc_id(&mut doc, &doc_id);
 
 			// Apply full filter
 			if storage::matches_filter(&doc, ctx.filter) {

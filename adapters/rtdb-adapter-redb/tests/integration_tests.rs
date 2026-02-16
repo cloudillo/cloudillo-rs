@@ -31,13 +31,13 @@ async fn test_query_all_documents() {
 	let db_id = "test_db";
 	let path = "users";
 
-	// Create multiple documents directly in transactions that will auto-commit on drop
+	// Create multiple documents
 	for i in 0..5 {
 		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
 		let data = json!({"name": format!("User{}", i), "age": 20 + i});
 		let _doc_id = tx.create(path, data).await.expect("Failed to create document");
-		// Transaction auto-commits/rolls back on drop
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Query all documents
@@ -62,6 +62,7 @@ async fn test_query_with_filter() {
 
 		let data = json!({"name": name, "status": status});
 		let _doc_id = tx.create(path, data).await.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Query with filter
@@ -94,6 +95,7 @@ async fn test_query_with_limit() {
 
 		let data = json!({"index": i, "value": format!("item{}", i)});
 		let _doc_id = tx.create(path, data).await.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Query with limit
@@ -124,6 +126,7 @@ async fn test_create_index() {
 
 		let data = json!({"name": name, "status": status});
 		let _doc_id = tx.create(path, data).await.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Query using the indexed field should work
@@ -151,6 +154,7 @@ async fn test_multiple_databases() {
 			.create("users", json!({"name": "Alice"}))
 			.await
 			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Create document in db2
@@ -161,6 +165,7 @@ async fn test_multiple_databases() {
 			.create("users", json!({"name": "Bob"}))
 			.await
 			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Verify both databases have documents
@@ -191,6 +196,7 @@ async fn test_multiple_tenants() {
 			.create("users", json!({"name": "Alice"}))
 			.await
 			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Create document in tenant 2
@@ -202,6 +208,7 @@ async fn test_multiple_tenants() {
 			.create("users", json!({"name": "Bob"}))
 			.await
 			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Verify both tenants have documents
@@ -233,6 +240,7 @@ async fn test_close_db() {
 			.create("users", json!({"name": "Alice"}))
 			.await
 			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Close the database
@@ -259,6 +267,7 @@ async fn test_stats() {
 
 		let data = json!({"index": i});
 		let _doc_id = tx.create("items", data).await.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Get stats
@@ -282,6 +291,7 @@ async fn test_per_tenant_files_mode() {
 			.create("data", json!({"key": "value"}))
 			.await
 			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Query it back
@@ -308,6 +318,7 @@ async fn test_single_file_mode() {
 			.create("data", json!({"key": "value"}))
 			.await
 			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Query it back
@@ -331,9 +342,12 @@ async fn test_update_document() {
 	let doc_id = {
 		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
-		tx.create(path, json!({"name": "Alice", "age": 30}))
+		let id = tx
+			.create(path, json!({"name": "Alice", "age": 30}))
 			.await
-			.expect("Failed to create document")
+			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
+		id
 	};
 
 	// Update the document
@@ -344,6 +358,7 @@ async fn test_update_document() {
 		tx.update(&update_path, json!({"name": "Alice", "age": 31}))
 			.await
 			.expect("Failed to update document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Query to verify update
@@ -368,9 +383,12 @@ async fn test_delete_document() {
 	let doc_id = {
 		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
-		tx.create(path, json!({"name": "Bob"}))
+		let id = tx
+			.create(path, json!({"name": "Bob"}))
 			.await
-			.expect("Failed to create document")
+			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
+		id
 	};
 
 	// Verify document exists
@@ -386,6 +404,7 @@ async fn test_delete_document() {
 
 		let delete_path = format!("{}/{}", path, doc_id);
 		tx.delete(&delete_path).await.expect("Failed to delete document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Query to verify deletion
@@ -408,9 +427,12 @@ async fn test_get_document() {
 	let doc_id = {
 		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 
-		tx.create(path, json!({"name": "Charlie", "age": 25}))
+		let id = tx
+			.create(path, json!({"name": "Charlie", "age": 25}))
 			.await
-			.expect("Failed to create document")
+			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
+		id
 	};
 
 	// Get the document by path
@@ -437,6 +459,7 @@ async fn test_advanced_filter_operators() {
 		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
 		tx.create(path, json!({"name": "Alice", "age": 25, "score": 85, "role": "admin", "tags": ["verified", "premium"]}))
 			.await.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 	{
 		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
@@ -446,6 +469,7 @@ async fn test_advanced_filter_operators() {
 		)
 		.await
 		.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 	{
 		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
@@ -455,6 +479,7 @@ async fn test_advanced_filter_operators() {
 		)
 		.await
 		.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 	{
 		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
@@ -464,6 +489,7 @@ async fn test_advanced_filter_operators() {
 		)
 		.await
 		.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
 	}
 
 	// Test 1: Greater-than operator

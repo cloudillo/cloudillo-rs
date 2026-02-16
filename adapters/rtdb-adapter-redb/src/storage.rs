@@ -39,11 +39,11 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 		}
 	}
 
-	// Not-equal checks
+	// Not-equal checks (missing fields are inherently "not equal")
 	for (field, expected) in &filter.not_equals {
 		match doc.get(field) {
-			Some(actual) if actual != expected => continue,
-			_ => return false,
+			Some(actual) if actual == expected => return false,
+			_ => continue,
 		}
 	}
 
@@ -166,6 +166,16 @@ pub fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
 		(Some(Value::String(a)), Some(Value::String(b))) => a.cmp(b),
 		(Some(Value::Bool(a)), Some(Value::Bool(b))) => a.cmp(b),
 		(Some(a), Some(b)) => a.to_string().cmp(&b.to_string()),
+	}
+}
+
+/// Inject the `id` field into a document if it doesn't already have one.
+///
+/// Documents are stored without an `id` field (the key is the source of truth),
+/// so this must be called at read time to ensure the `id` is present.
+pub fn inject_doc_id(doc: &mut Value, doc_id: &str) {
+	if let Value::Object(ref mut obj) = doc {
+		obj.entry("id").or_insert_with(|| Value::String(doc_id.to_string()));
 	}
 }
 

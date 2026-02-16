@@ -44,8 +44,10 @@ impl RedbTransaction {
 	}
 
 	/// Get a mutable reference to the transaction
-	fn tx_mut(&mut self) -> &mut redb::WriteTransaction {
-		self.tx.as_mut().expect("transaction consumed")
+	fn tx_mut(&mut self) -> ClResult<&mut redb::WriteTransaction> {
+		self.tx
+			.as_mut()
+			.ok_or(cloudillo::error::Error::Internal("transaction already consumed".into()))
 	}
 
 	/// Build a key using the appropriate strategy
@@ -104,7 +106,7 @@ impl RedbTransaction {
 
 		// Now update the indexes
 		let mut index_table =
-			self.tx_mut().open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
+			self.tx_mut()?.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
 
 		for index_key in index_keys {
 			if insert {
@@ -136,7 +138,7 @@ impl Transaction for RedbTransaction {
 		// Write document
 		{
 			let mut table =
-				self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+				self.tx_mut()?.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 			table.insert(key.as_str(), json.as_str()).map_err(from_redb_error)?;
 		}
 
@@ -165,7 +167,7 @@ impl Transaction for RedbTransaction {
 		} else {
 			// Fall back to reading from database
 			let table =
-				self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+				self.tx_mut()?.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 			let result = match table.get(key.as_str()) {
 				Ok(Some(v)) => {
 					let json_str = v.value().to_string();
@@ -180,7 +182,7 @@ impl Transaction for RedbTransaction {
 		// Write updated document
 		{
 			let mut table =
-				self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+				self.tx_mut()?.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 			table.insert(key.as_str(), json.as_str()).map_err(from_redb_error)?;
 		}
 
@@ -214,7 +216,7 @@ impl Transaction for RedbTransaction {
 		} else {
 			// Fall back to reading from database
 			let table =
-				self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+				self.tx_mut()?.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 			let result = match table.get(key.as_str()) {
 				Ok(Some(v)) => {
 					let json_str = v.value().to_string();
@@ -229,7 +231,7 @@ impl Transaction for RedbTransaction {
 		// Delete document
 		{
 			let mut table =
-				self.tx_mut().open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+				self.tx_mut()?.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 			table.remove(key.as_str()).map_err(from_redb_error)?;
 		}
 
@@ -258,7 +260,10 @@ impl Transaction for RedbTransaction {
 
 		// Fall back to reading committed data from transaction view
 		let key = self.build_key(path);
-		let tx = self.tx.as_ref().expect("transaction consumed");
+		let tx = self
+			.tx
+			.as_ref()
+			.ok_or(cloudillo::error::Error::Internal("transaction already consumed".into()))?;
 
 		let table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 		let json_str: Option<String> = match table.get(key.as_str()) {
@@ -277,7 +282,7 @@ impl Transaction for RedbTransaction {
 		}
 	}
 
-	async fn commit(mut self) -> ClResult<()> {
+	async fn commit(&mut self) -> ClResult<()> {
 		use crate::error::from_redb_error;
 
 		// Commit redb transaction
@@ -293,30 +298,14 @@ impl Transaction for RedbTransaction {
 		Ok(())
 	}
 
-	async fn rollback(mut self) -> ClResult<()> {
+	async fn rollback(&mut self) -> ClResult<()> {
 		// redb transaction is automatically rolled back on drop
 		self.tx = None;
 		Ok(())
 	}
 }
 
-impl Drop for RedbTransaction {
-	fn drop(&mut self) {
-		// Auto-commit pending changes if transaction hasn't been explicitly committed/rolled back
-		// Note: redb transactions are rolled back by default on drop, so we need to explicitly
-		// commit if we still have pending changes
-		if !self.pending_events.is_empty() && self.tx.is_some() {
-			// Try to commit the transaction
-			if let Some(tx) = self.tx.take() {
-				if let Ok(()) = tx.commit().map_err(|_| ()) {
-					// Broadcast all changes atomically
-					for event in self.pending_events.drain(..) {
-						let _ = self.instance.change_tx.send(event);
-					}
-				}
-			}
-		}
-	}
-}
+// Note: No Drop impl needed — redb automatically rolls back uncommitted transactions on drop.
+// All callers must explicitly call commit() to persist changes.
 
 // vim: ts=4

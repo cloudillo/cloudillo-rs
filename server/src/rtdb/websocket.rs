@@ -12,19 +12,19 @@
 //! }
 //! ```
 
+use crate::core::utils::random_id;
 use crate::prelude::*;
-use crate::rtdb_adapter::ChangeEvent;
+use crate::rtdb_adapter::{ChangeEvent, LockMode};
 use axum::extract::ws::{Message, WebSocket};
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
-use uuid::Uuid;
 
 /// Throttle interval for access/modification tracking (60 seconds)
 const TRACKING_THROTTLE_SECS: u64 = 60;
@@ -52,7 +52,7 @@ impl RtdbMessage {
 			map = obj;
 		}
 		Self {
-			id: Value::String(Uuid::new_v4().to_string()),
+			id: Value::String(random_id().unwrap_or_default()),
 			msg_type: msg_type.into(),
 			payload: map,
 		}
@@ -75,7 +75,7 @@ impl RtdbMessage {
 		map.insert("data".to_string(), data);
 		map.insert("timestamp".to_string(), Value::Number(now_timestamp().into()));
 		Self {
-			id: Value::String(format!("db-change-{}", Uuid::new_v4())),
+			id: Value::String(format!("db-change-{}", random_id().unwrap_or_default())),
 			msg_type: "dbChange".to_string(),
 			payload: map,
 		}
@@ -114,11 +114,10 @@ impl RtdbMessage {
 struct RtdbConnection {
 	user_id: String,
 	file_id: String,
-	subscriptions: Arc<RwLock<HashSet<String>>>, // Subscribed collection patterns
-	// Active subscription streams (path -> ChangeEvent stream)
-	#[allow(clippy::type_complexity)]
-	subscription_streams:
-		Arc<RwLock<Vec<(String, tokio::sync::mpsc::UnboundedReceiver<ChangeEvent>)>>>,
+	/// Aggregated channel for forwarding events from all subscriptions
+	aggregated_tx: tokio::sync::mpsc::UnboundedSender<(String, ChangeEvent)>,
+	/// Per-subscription forwarding task handles for cleanup on unsubscribe
+	subscription_handles: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
 	tn_id: crate::types::TnId,
 	connected_at: u64,
 	/// Whether this connection is read-only (cannot execute transactions)
@@ -149,11 +148,14 @@ pub async fn handle_rtdb_connection(
 ) {
 	info!("RTDB connection: {} / file_id={} (read_only={})", user_id, file_id, read_only);
 
+	let (aggregated_tx, aggregated_rx) =
+		tokio::sync::mpsc::unbounded_channel::<(String, ChangeEvent)>();
+
 	let conn = Arc::new(RtdbConnection {
 		user_id: user_id.clone(),
 		file_id: file_id.clone(),
-		subscriptions: Arc::new(RwLock::new(HashSet::new())),
-		subscription_streams: Arc::new(RwLock::new(Vec::new())),
+		aggregated_tx,
+		subscription_handles: Arc::new(RwLock::new(HashMap::new())),
 		tn_id,
 		connected_at: now_timestamp(),
 		read_only,
@@ -226,74 +228,46 @@ pub async fn handle_rtdb_connection(
 		}
 	});
 
-	// Database change stream forwarding task
-	let conn_clone = conn.clone();
+	// Database change stream forwarding task — reads from aggregated channel
 	let ws_tx_clone = ws_tx.clone();
 	let forward_task = tokio::spawn(async move {
-		loop {
-			// Poll subscription streams for new events
-			let mut streams = conn_clone.subscription_streams.write().await;
+		let mut aggregated_rx = aggregated_rx;
+		while let Some((subscription_id, event)) = aggregated_rx.recv().await {
+			// Convert ChangeEvent to change message matching TS client expectations
+			let (action, data) = match &event {
+				ChangeEvent::Create { data, .. } => ("create", Some(data.clone())),
+				ChangeEvent::Update { data, .. } => ("update", Some(data.clone())),
+				ChangeEvent::Delete { .. } => ("delete", None),
+				ChangeEvent::Lock { data, .. } => ("lock", Some(data.clone())),
+				ChangeEvent::Unlock { data, .. } => ("unlock", Some(data.clone())),
+				ChangeEvent::Ready { .. } => ("ready", None),
+			};
 
-			let mut received_msg: Option<(String, ChangeEvent)> = None;
-			let mut remove_indices = Vec::new();
+			debug!(
+				"RTDB change event: action={}, path={}, subscription_id={}",
+				action,
+				event.path(),
+				subscription_id
+			);
 
-			for (idx, (sub_id, rx)) in streams.iter_mut().enumerate() {
-				match rx.try_recv() {
-					Ok(event) => {
-						received_msg = Some((sub_id.clone(), event));
-						break;
+			let msg = RtdbMessage::new(
+				"change",
+				json!({
+					"subscriptionId": subscription_id,
+					"event": {
+						"action": action,
+						"path": event.path(),
+						"data": data,
 					}
-					Err(tokio::sync::mpsc::error::TryRecvError::Empty) => continue,
-					Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-						remove_indices.push(idx);
-					}
+				}),
+			);
+
+			if let Ok(ws_response) = msg.to_ws_message() {
+				let mut tx = ws_tx_clone.lock().await;
+				if tx.send(ws_response).await.is_err() {
+					debug!("Client disconnected while forwarding DB change");
+					return;
 				}
-			}
-
-			// Remove disconnected streams
-			for idx in remove_indices.iter().rev() {
-				streams.remove(*idx);
-			}
-
-			drop(streams); // Release lock before sending
-
-			if let Some((subscription_id, event)) = received_msg {
-				// Convert ChangeEvent to change message matching TS client expectations
-				let (action, data) = match &event {
-					ChangeEvent::Create { path: _, data } => ("create", Some(data.clone())),
-					ChangeEvent::Update { path: _, data } => ("update", Some(data.clone())),
-					ChangeEvent::Delete { path: _ } => ("delete", None),
-				};
-
-				debug!(
-					"RTDB change event: action={}, path={}, subscription_id={}",
-					action,
-					event.path(),
-					subscription_id
-				);
-
-				let msg = RtdbMessage::new(
-					"change",
-					json!({
-						"subscriptionId": subscription_id,
-						"event": {
-							"action": action,
-							"path": event.path(),
-							"data": data,
-						}
-					}),
-				);
-
-				if let Ok(ws_response) = msg.to_ws_message() {
-					let mut tx = ws_tx_clone.lock().await;
-					if tx.send(ws_response).await.is_err() {
-						debug!("Client disconnected while forwarding DB change");
-						return;
-					}
-				}
-			} else {
-				// No messages available, yield
-				tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 			}
 		}
 	});
@@ -308,11 +282,43 @@ pub async fn handle_rtdb_connection(
 		}
 	}
 
+	// Abort all subscription forwarding tasks
+	{
+		let handles = conn.subscription_handles.write().await;
+		for (_, handle) in handles.iter() {
+			handle.abort();
+		}
+	}
+
+	// Release all locks held by this user on disconnect
+	if let Err(e) = app
+		.rtdb_adapter
+		.release_all_locks(conn.tn_id, &conn.file_id, &conn.user_id)
+		.await
+	{
+		warn!("Failed to release locks on disconnect: {}", e);
+	}
+
 	// Record final file activity before closing
 	record_final_activity(&app, &conn).await;
 
 	heartbeat_task.abort();
 	info!("RTDB connection closed: {}", user_id);
+}
+
+/// Returns an error response if the connection is read-only, None otherwise.
+fn check_read_only(conn: &RtdbConnection) -> Option<RtdbMessage> {
+	if conn.read_only {
+		Some(RtdbMessage::new(
+			"error",
+			json!({
+				"code": 403,
+				"message": "Write access denied - read-only connection"
+			}),
+		))
+	} else {
+		None
+	}
 }
 
 /// Handle an RTDB command
@@ -323,19 +329,8 @@ async fn handle_rtdb_command(
 ) -> RtdbMessage {
 	match msg.msg_type.as_str() {
 		"transaction" => {
-			// Block transactions from read-only users
-			if conn.read_only {
-				warn!(
-					"Rejecting RTDB transaction from read-only user {} for file {}",
-					conn.user_id, conn.file_id
-				);
-				return RtdbMessage::new(
-					"error",
-					json!({
-						"code": 403,
-						"message": "Write access denied - read-only connection"
-					}),
-				);
+			if let Some(err) = check_read_only(conn) {
+				return err;
 			}
 
 			// Handle atomic batch operations (create/update/delete)
@@ -370,6 +365,29 @@ async fn handle_rtdb_command(
 					for (ref_name, ref_value) in &references {
 						let pattern = format!("${{${}}}", ref_name);
 						path = path.replace(&pattern, ref_value);
+					}
+
+					// Check hard locks for write operations
+					if matches!(op_type, "update" | "replace" | "delete") {
+						if let Ok(Some(lock)) =
+							app.rtdb_adapter.check_lock(conn.tn_id, &conn.file_id, &path).await
+						{
+							if lock.mode == LockMode::Hard
+								&& lock.user_id.as_ref() != conn.user_id.as_str()
+							{
+								drop(txn);
+								return RtdbMessage::new(
+									"error",
+									json!({
+										"code": 423,
+										"message": format!(
+											"Document locked by {}",
+											lock.user_id
+										)
+									}),
+								);
+							}
+						}
 					}
 
 					let result = match op_type {
@@ -531,12 +549,21 @@ async fn handle_rtdb_command(
 					}
 				}
 
-				// All operations succeeded - transaction will auto-commit on drop
+				// All operations succeeded - explicitly commit transaction
 				debug!(
-					"Transaction completed successfully with {} operations, auto-committing",
+					"Transaction completed successfully with {} operations, committing",
 					results.len()
 				);
-				drop(txn); // Explicitly drop to trigger commit via Drop implementation
+				if let Err(e) = txn.commit().await {
+					warn!("Transaction commit failed: {}", e);
+					return RtdbMessage::new(
+						"error",
+						json!({
+							"code": 500,
+							"message": format!("Transaction commit failed: {}", e)
+						}),
+					);
+				}
 
 				// Record file modification (throttled)
 				record_file_modification_throttled(app, conn).await;
@@ -636,60 +663,53 @@ async fn handle_rtdb_command(
 			use crate::rtdb_adapter::{QueryFilter, SubscriptionOptions};
 			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			debug!("RTDB subscribe: path={}", path);
-			let subscription_id = format!("sub-{}", Uuid::new_v4());
+			let subscription_id = format!("sub-{}", random_id().unwrap_or_default());
 
-			let mut subs = conn.subscriptions.write().await;
-			let mut streams = conn.subscription_streams.write().await;
-
-			if !subs.contains(path) {
-				// Parse filter from payload
-				let opts = if let Some(filter_obj) = msg.payload.get("filter") {
-					if let Ok(filter) = serde_json::from_value::<QueryFilter>(filter_obj.clone()) {
-						debug!("RTDB subscribe with filter: {:?}", filter_obj);
-						SubscriptionOptions::filtered(path, filter)
-					} else {
-						SubscriptionOptions::all(path)
-					}
+			// Parse filter from payload
+			let opts = if let Some(filter_obj) = msg.payload.get("filter") {
+				if let Ok(filter) = serde_json::from_value::<QueryFilter>(filter_obj.clone()) {
+					debug!("RTDB subscribe with filter: {:?}", filter_obj);
+					SubscriptionOptions::filtered(path, filter)
 				} else {
 					SubscriptionOptions::all(path)
-				};
-
-				match app.rtdb_adapter.subscribe(conn.tn_id, &conn.file_id, opts).await {
-					Ok(change_stream) => {
-						let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-						let mut stream = change_stream;
-						tokio::spawn(async move {
-							while let Some(event) = stream.next().await {
-								let _ = tx.send(event);
-							}
-						});
-
-						subs.insert(path.to_string());
-						streams.push((subscription_id.clone(), rx));
-						debug!(
-							"User {} subscribed to path: {} (id: {})",
-							conn.user_id, path, subscription_id
-						);
-
-						let mut result_map = serde_json::Map::new();
-						result_map
-							.insert("subscriptionId".to_string(), Value::String(subscription_id));
-						RtdbMessage::response(msg.id.clone(), "subscribeResult", result_map)
-					}
-					Err(e) => {
-						warn!("Subscribe failed: {}", e);
-						RtdbMessage::new(
-							"error",
-							json!({ "code": 500, "message": format!("Subscribe failed: {}", e) }),
-						)
-					}
 				}
 			} else {
-				// Already subscribed
-				let mut result_map = serde_json::Map::new();
-				result_map.insert("subscriptionId".to_string(), Value::String(subscription_id));
-				RtdbMessage::response(msg.id.clone(), "subscribeResult", result_map)
+				SubscriptionOptions::all(path)
+			};
+
+			match app.rtdb_adapter.subscribe(conn.tn_id, &conn.file_id, opts).await {
+				Ok(change_stream) => {
+					// Spawn a per-subscription forwarding task that sends events
+					// to the aggregated channel
+					let agg_tx = conn.aggregated_tx.clone();
+					let sub_id_clone = subscription_id.clone();
+					let mut stream = change_stream;
+					let handle = tokio::spawn(async move {
+						while let Some(event) = stream.next().await {
+							if agg_tx.send((sub_id_clone.clone(), event)).is_err() {
+								break;
+							}
+						}
+					});
+
+					let mut handles = conn.subscription_handles.write().await;
+					handles.insert(subscription_id.clone(), handle);
+					debug!(
+						"User {} subscribed to path: {} (id: {})",
+						conn.user_id, path, subscription_id
+					);
+
+					let mut result_map = serde_json::Map::new();
+					result_map.insert("subscriptionId".to_string(), Value::String(subscription_id));
+					RtdbMessage::response(msg.id.clone(), "subscribeResult", result_map)
+				}
+				Err(e) => {
+					warn!("Subscribe failed: {}", e);
+					RtdbMessage::new(
+						"error",
+						json!({ "code": 500, "message": format!("Subscribe failed: {}", e) }),
+					)
+				}
 			}
 		}
 
@@ -698,14 +718,20 @@ async fn handle_rtdb_command(
 			let subscription_id =
 				msg.payload.get("subscriptionId").and_then(|v| v.as_str()).unwrap_or("");
 
-			let mut streams = conn.subscription_streams.write().await;
-			streams.retain(|(id, _)| id != subscription_id);
+			let mut handles = conn.subscription_handles.write().await;
+			if let Some(handle) = handles.remove(subscription_id) {
+				handle.abort();
+			}
 			debug!("User {} unsubscribed from subscription: {}", conn.user_id, subscription_id);
 
 			RtdbMessage::response(msg.id.clone(), "unsubscribeResult", serde_json::Map::new())
 		}
 
 		"createIndex" => {
+			if let Some(err) = check_read_only(conn) {
+				return err;
+			}
+
 			// Create an index on a field for query optimization
 			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			let field = msg.payload.get("field").and_then(|v| v.as_str()).unwrap_or("");
@@ -739,6 +765,75 @@ async fn handle_rtdb_command(
 							"code": 500,
 							"message": format!("Create index failed: {}", e)
 						}),
+					)
+				}
+			}
+		}
+
+		"lock" => {
+			if let Some(err) = check_read_only(conn) {
+				return err;
+			}
+
+			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+			let mode = match msg.payload.get("mode").and_then(|v| v.as_str()) {
+				Some("hard") => LockMode::Hard,
+				_ => LockMode::Soft,
+			};
+
+			match app
+				.rtdb_adapter
+				.acquire_lock(conn.tn_id, &conn.file_id, path, &conn.user_id, mode)
+				.await
+			{
+				Ok(None) => {
+					// Lock acquired
+					let mut result_map = serde_json::Map::new();
+					result_map.insert("locked".to_string(), Value::Bool(true));
+					RtdbMessage::response(msg.id.clone(), "lockResult", result_map)
+				}
+				Ok(Some(existing)) => {
+					// Lock denied
+					let mut result_map = serde_json::Map::new();
+					result_map.insert("locked".to_string(), Value::Bool(false));
+					result_map
+						.insert("holder".to_string(), Value::String(existing.user_id.to_string()));
+					result_map.insert(
+						"mode".to_string(),
+						serde_json::to_value(&existing.mode).unwrap_or(Value::Null),
+					);
+					RtdbMessage::response(msg.id.clone(), "lockResult", result_map)
+				}
+				Err(e) => {
+					warn!("Lock failed: {}", e);
+					RtdbMessage::new(
+						"error",
+						json!({ "code": 500, "message": format!("Lock failed: {}", e) }),
+					)
+				}
+			}
+		}
+
+		"unlock" => {
+			if let Some(err) = check_read_only(conn) {
+				return err;
+			}
+
+			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+
+			match app
+				.rtdb_adapter
+				.release_lock(conn.tn_id, &conn.file_id, path, &conn.user_id)
+				.await
+			{
+				Ok(()) => {
+					RtdbMessage::response(msg.id.clone(), "unlockResult", serde_json::Map::new())
+				}
+				Err(e) => {
+					warn!("Unlock failed: {}", e);
+					RtdbMessage::new(
+						"error",
+						json!({ "code": 500, "message": format!("Unlock failed: {}", e) }),
 					)
 				}
 			}

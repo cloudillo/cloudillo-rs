@@ -275,6 +275,12 @@ impl RtdbAdapterRedb {
 				if instances.len() < initial_count {
 					debug!("Auto-evicted {} idle databases", initial_count - instances.len());
 				}
+
+				// Clean up expired locks in remaining instances
+				for instance in instances.values() {
+					let mut locks = instance.locks.write().await;
+					locks.retain(|_, lock| now < lock.acquired_at.saturating_add(lock.ttl_secs));
+				}
 			}
 		});
 	}
@@ -345,7 +351,13 @@ impl RtdbAdapter for RtdbAdapterRedb {
 			};
 
 			match table.get(key.as_str()).map_err(error::from_redb_error)? {
-				Some(v) => Ok(Some(serde_json::from_str(v.value())?)),
+				Some(v) => {
+					let mut doc: Value = serde_json::from_str(v.value())?;
+					if let Some(doc_id) = path_owned.rsplit('/').next() {
+						storage::inject_doc_id(&mut doc, doc_id);
+					}
+					Ok(Some(doc))
+				}
 				None => Ok(None),
 			}
 		})
@@ -360,13 +372,17 @@ impl RtdbAdapter for RtdbAdapterRedb {
 	) -> ClResult<Pin<Box<dyn Stream<Item = ChangeEvent> + Send>>> {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 
-		// First, get all existing documents at the path
+		// Subscribe to broadcast FIRST to avoid losing events between query and subscribe
+		let mut rx = instance.change_tx.subscribe();
+
+		// Then get all existing documents at the path
 		let initial_docs = {
-			let query_opts = QueryOptions::new();
+			let mut query_opts = QueryOptions::new();
+			if let Some(ref filter) = opts.filter {
+				query_opts = query_opts.with_filter(filter.clone());
+			}
 			self.query(tn_id, db_id, &opts.path, query_opts).await?
 		};
-
-		let mut rx = instance.change_tx.subscribe();
 		let path = opts.path.clone();
 		let filter = opts.filter.clone();
 
@@ -382,6 +398,11 @@ impl RtdbAdapter for RtdbAdapterRedb {
 				}
 			}
 
+			// Signal that all initial documents have been yielded
+			yield ChangeEvent::Ready {
+				path: path.clone(),
+			};
+
 			// Then continue listening for future changes
 			loop {
 				match rx.recv().await {
@@ -391,11 +412,16 @@ impl RtdbAdapter for RtdbAdapterRedb {
 							continue;
 						}
 
-						// Apply filter if specified
+						// Apply filter if specified (skip for lock/unlock events)
 						if let Some(ref filter) = filter {
-							if let Some(data) = event.data() {
-								if !storage::matches_filter(data, filter) {
-									continue;
+							match &event {
+								ChangeEvent::Lock { .. } | ChangeEvent::Unlock { .. } => {}
+								_ => {
+									if let Some(data) = event.data() {
+										if !storage::matches_filter(data, filter) {
+											continue;
+										}
+									}
 								}
 							}
 						}
@@ -457,6 +483,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 				}
 
 				let relative_path = &key_str[prefix.len()..];
+				// Note: no `id` injection — export returns raw stored data
 				let doc: Value = serde_json::from_str(value.value())?;
 				results.push((Box::from(relative_path), doc));
 			}
@@ -464,6 +491,126 @@ impl RtdbAdapter for RtdbAdapterRedb {
 			Ok(results)
 		})
 		.await?
+	}
+
+	async fn acquire_lock(
+		&self,
+		tn_id: TnId,
+		db_id: &str,
+		path: &str,
+		user_id: &str,
+		mode: LockMode,
+	) -> ClResult<Option<LockInfo>> {
+		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let now = storage::now_timestamp();
+
+		let mut locks = instance.locks.write().await;
+
+		// Check if already locked by another user
+		if let Some(existing) = locks.get(path) {
+			// Check TTL expiry - if active and held by different user, deny
+			if now < existing.acquired_at.saturating_add(existing.ttl_secs)
+				&& existing.user_id.as_ref() != user_id
+			{
+				return Ok(Some(existing.clone()));
+			}
+			// Same user (refresh) or expired lock - fall through to acquire
+		}
+
+		let lock_info = LockInfo {
+			user_id: user_id.into(),
+			mode: mode.clone(),
+			acquired_at: now,
+			ttl_secs: 60,
+		};
+		locks.insert(path.into(), lock_info);
+
+		// Broadcast lock event
+		let _ = instance.change_tx.send(ChangeEvent::Lock {
+			path: path.into(),
+			data: serde_json::json!({
+				"userId": user_id,
+				"mode": mode,
+			}),
+		});
+
+		Ok(None)
+	}
+
+	async fn release_lock(
+		&self,
+		tn_id: TnId,
+		db_id: &str,
+		path: &str,
+		user_id: &str,
+	) -> ClResult<()> {
+		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+
+		let mut locks = instance.locks.write().await;
+
+		// Only release if locked by the same user
+		if let Some(existing) = locks.get(path) {
+			if existing.user_id.as_ref() == user_id {
+				locks.remove(path);
+
+				// Broadcast unlock event
+				let _ = instance.change_tx.send(ChangeEvent::Unlock {
+					path: path.into(),
+					data: serde_json::json!({
+						"userId": user_id,
+					}),
+				});
+			}
+		}
+
+		Ok(())
+	}
+
+	async fn check_lock(&self, tn_id: TnId, db_id: &str, path: &str) -> ClResult<Option<LockInfo>> {
+		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let now = storage::now_timestamp();
+
+		let locks = instance.locks.read().await;
+
+		if let Some(lock) = locks.get(path) {
+			if now < lock.acquired_at.saturating_add(lock.ttl_secs) {
+				return Ok(Some(lock.clone()));
+			}
+			// Lock expired - will be cleaned up on next acquire
+		}
+
+		Ok(None)
+	}
+
+	async fn release_all_locks(&self, tn_id: TnId, db_id: &str, user_id: &str) -> ClResult<()> {
+		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+
+		let paths_to_remove: Vec<Box<str>> = {
+			let mut locks = instance.locks.write().await;
+
+			let paths: Vec<Box<str>> = locks
+				.iter()
+				.filter(|(_, info)| info.user_id.as_ref() == user_id)
+				.map(|(path, _)| path.clone())
+				.collect();
+
+			for path in &paths {
+				locks.remove(path);
+			}
+
+			paths
+		};
+		// Write lock is dropped here — broadcast without holding it
+		for path in &paths_to_remove {
+			let _ = instance.change_tx.send(ChangeEvent::Unlock {
+				path: path.clone(),
+				data: serde_json::json!({
+					"userId": user_id,
+				}),
+			});
+		}
+
+		Ok(())
 	}
 
 	async fn stats(&self, tn_id: TnId, db_id: &str) -> ClResult<DbStats> {

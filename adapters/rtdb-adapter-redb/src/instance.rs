@@ -1,7 +1,7 @@
 use crate::{storage, InstanceKey};
 use cloudillo::prelude::*;
-use cloudillo::rtdb_adapter::ChangeEvent;
-use redb::ReadableDatabase;
+use cloudillo::rtdb_adapter::{ChangeEvent, LockInfo};
+use redb::{ReadableDatabase, ReadableTable};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -26,6 +26,9 @@ pub struct DatabaseInstance {
 	#[allow(clippy::type_complexity)]
 	/// Cached indexed fields per collection
 	pub(crate) indexed_fields: Arc<RwLock<HashMap<Box<str>, Vec<Box<str>>>>>,
+
+	/// In-memory locks on document paths (ephemeral, not persisted)
+	pub(crate) locks: Arc<RwLock<HashMap<Box<str>, LockInfo>>>,
 }
 
 impl DatabaseInstance {
@@ -41,6 +44,7 @@ impl DatabaseInstance {
 			change_tx,
 			last_accessed: Arc::new(AtomicU64::new(storage::now_timestamp())),
 			indexed_fields: Arc::new(RwLock::new(HashMap::new())),
+			locks: Arc::new(RwLock::new(HashMap::new())),
 		}
 	}
 
@@ -62,25 +66,27 @@ impl DatabaseInstance {
 
 		let mut indexed_fields = self.indexed_fields.write().await;
 
-		// Scan for all _meta/indexes keys
-		let prefix = "_meta/indexes";
-		let range = meta_table.range(prefix..).map_err(crate::error::from_redb_error)?;
+		// Iterate all metadata keys looking for ".../_meta/indexes" entries.
+		// Keys have formats like "posts/_meta/indexes" (per_tenant) or
+		// "1/posts/_meta/indexes" (non-per_tenant), so a prefix scan won't work.
+		let range = meta_table.iter().map_err(crate::error::from_redb_error)?;
 
 		for item in range {
 			let (key, value) = item.map_err(crate::error::from_redb_error)?;
 			let key_str = key.value();
 
-			if !key_str.starts_with(prefix) {
-				break;
-			}
-
-			// Extract collection path from key like "collection/_meta/indexes"
 			if let Some(collection) = key_str.strip_suffix("/_meta/indexes") {
-				// Remove "/_meta/indexes"
+				// Strip numeric tenant prefix for non-per_tenant mode
+				// e.g., "1/posts" -> "posts"
+				let path = collection
+					.split_once('/')
+					.filter(|(prefix, _)| prefix.chars().all(|c| c.is_ascii_digit()))
+					.map(|(_, rest)| rest)
+					.unwrap_or(collection);
 
 				if let Ok(fields) = serde_json::from_str::<Vec<String>>(value.value()) {
 					indexed_fields
-						.insert(collection.into(), fields.into_iter().map(|f| f.into()).collect());
+						.insert(path.into(), fields.into_iter().map(|f| f.into()).collect());
 				}
 			}
 		}

@@ -20,6 +20,23 @@ use std::pin::Pin;
 use crate::prelude::*;
 use crate::types::TnId;
 
+/// Lock mode for document locking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LockMode {
+	Soft,
+	Hard,
+}
+
+/// Information about an active lock on a document path.
+#[derive(Debug, Clone)]
+pub struct LockInfo {
+	pub user_id: Box<str>,
+	pub mode: LockMode,
+	pub acquired_at: u64,
+	pub ttl_secs: u64,
+}
+
 /// Query filter for selecting documents.
 ///
 /// Supports multiple filter operations on JSON document fields.
@@ -249,6 +266,28 @@ pub enum ChangeEvent {
 		/// Full path to the document
 		path: Box<str>,
 	},
+
+	/// A lock was acquired on a document path
+	Lock {
+		/// Full path to the locked document
+		path: Box<str>,
+		/// Lock metadata (userId, mode)
+		data: Value,
+	},
+
+	/// A lock was released on a document path
+	Unlock {
+		/// Full path to the unlocked document
+		path: Box<str>,
+		/// Unlock metadata (userId)
+		data: Value,
+	},
+
+	/// Signals that all initial documents have been yielded for a subscription
+	Ready {
+		/// Subscription path
+		path: Box<str>,
+	},
 }
 
 impl ChangeEvent {
@@ -258,6 +297,9 @@ impl ChangeEvent {
 			ChangeEvent::Create { path, .. } => path,
 			ChangeEvent::Update { path, .. } => path,
 			ChangeEvent::Delete { path, .. } => path,
+			ChangeEvent::Lock { path, .. } => path,
+			ChangeEvent::Unlock { path, .. } => path,
+			ChangeEvent::Ready { path } => path,
 		}
 	}
 
@@ -276,7 +318,8 @@ impl ChangeEvent {
 	pub fn data(&self) -> Option<&Value> {
 		match self {
 			ChangeEvent::Create { data, .. } | ChangeEvent::Update { data, .. } => Some(data),
-			ChangeEvent::Delete { .. } => None,
+			ChangeEvent::Lock { data, .. } | ChangeEvent::Unlock { data, .. } => Some(data),
+			ChangeEvent::Delete { .. } | ChangeEvent::Ready { .. } => None,
 		}
 	}
 
@@ -340,10 +383,10 @@ pub trait Transaction: Send + Sync {
 	async fn get(&self, path: &str) -> ClResult<Option<Value>>;
 
 	/// Commit the transaction, applying all changes atomically.
-	async fn commit(self) -> ClResult<()>;
+	async fn commit(&mut self) -> ClResult<()>;
 
 	/// Rollback the transaction, discarding all changes.
-	async fn rollback(self) -> ClResult<()>;
+	async fn rollback(&mut self) -> ClResult<()>;
 }
 
 /// Real-Time Database Adapter trait.
@@ -390,6 +433,34 @@ pub trait RtdbAdapter: Debug + Send + Sync {
 	/// Returns all `(path, document)` pairs. The path is relative to the db_id
 	/// (e.g., `posts/abc123`). Used for duplicating RTDB files.
 	async fn export_all(&self, tn_id: TnId, db_id: &str) -> ClResult<Vec<(Box<str>, Value)>>;
+
+	/// Acquire a lock on a document path.
+	///
+	/// Returns `Ok(None)` if the lock was acquired successfully.
+	/// Returns `Ok(Some(LockInfo))` if the path is already locked by another user (denied).
+	async fn acquire_lock(
+		&self,
+		tn_id: TnId,
+		db_id: &str,
+		path: &str,
+		user_id: &str,
+		mode: LockMode,
+	) -> ClResult<Option<LockInfo>>;
+
+	/// Release a lock on a document path.
+	async fn release_lock(
+		&self,
+		tn_id: TnId,
+		db_id: &str,
+		path: &str,
+		user_id: &str,
+	) -> ClResult<()>;
+
+	/// Check if a path has an active lock. Returns the lock info if locked.
+	async fn check_lock(&self, tn_id: TnId, db_id: &str, path: &str) -> ClResult<Option<LockInfo>>;
+
+	/// Release all locks held by a specific user (called on disconnect).
+	async fn release_all_locks(&self, tn_id: TnId, db_id: &str, user_id: &str) -> ClResult<()>;
 }
 
 // vim: ts=4
