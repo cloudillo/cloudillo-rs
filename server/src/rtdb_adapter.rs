@@ -445,6 +445,7 @@ pub trait RtdbAdapter: Debug + Send + Sync {
 		path: &str,
 		user_id: &str,
 		mode: LockMode,
+		conn_id: &str,
 	) -> ClResult<Option<LockInfo>>;
 
 	/// Release a lock on a document path.
@@ -454,13 +455,20 @@ pub trait RtdbAdapter: Debug + Send + Sync {
 		db_id: &str,
 		path: &str,
 		user_id: &str,
+		conn_id: &str,
 	) -> ClResult<()>;
 
 	/// Check if a path has an active lock. Returns the lock info if locked.
 	async fn check_lock(&self, tn_id: TnId, db_id: &str, path: &str) -> ClResult<Option<LockInfo>>;
 
 	/// Release all locks held by a specific user (called on disconnect).
-	async fn release_all_locks(&self, tn_id: TnId, db_id: &str, user_id: &str) -> ClResult<()>;
+	async fn release_all_locks(
+		&self,
+		tn_id: TnId,
+		db_id: &str,
+		user_id: &str,
+		conn_id: &str,
+	) -> ClResult<()>;
 }
 
 // vim: ts=4

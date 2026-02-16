@@ -112,6 +112,7 @@ impl RtdbMessage {
 
 /// RTDB connection tracking
 struct RtdbConnection {
+	conn_id: String,
 	user_id: String,
 	file_id: String,
 	/// Aggregated channel for forwarding events from all subscriptions
@@ -152,6 +153,7 @@ pub async fn handle_rtdb_connection(
 		tokio::sync::mpsc::unbounded_channel::<(String, ChangeEvent)>();
 
 	let conn = Arc::new(RtdbConnection {
+		conn_id: random_id().unwrap_or_default(),
 		user_id: user_id.clone(),
 		file_id: file_id.clone(),
 		aggregated_tx,
@@ -230,9 +232,23 @@ pub async fn handle_rtdb_connection(
 
 	// Database change stream forwarding task — reads from aggregated channel
 	let ws_tx_clone = ws_tx.clone();
+	let conn_clone2 = conn.clone();
 	let forward_task = tokio::spawn(async move {
 		let mut aggregated_rx = aggregated_rx;
 		while let Some((subscription_id, event)) = aggregated_rx.recv().await {
+			// Skip own lock/unlock events — the originator already has the response.
+			// Other connections from the same user (different tabs/devices) still receive them.
+			match &event {
+				ChangeEvent::Lock { data, .. } | ChangeEvent::Unlock { data, .. } => {
+					if data.get("connId").and_then(|v| v.as_str())
+						== Some(conn_clone2.conn_id.as_str())
+					{
+						continue;
+					}
+				}
+				_ => {}
+			}
+
 			// Convert ChangeEvent to change message matching TS client expectations
 			let (action, data) = match &event {
 				ChangeEvent::Create { data, .. } => ("create", Some(data.clone())),
@@ -293,7 +309,7 @@ pub async fn handle_rtdb_connection(
 	// Release all locks held by this user on disconnect
 	if let Err(e) = app
 		.rtdb_adapter
-		.release_all_locks(conn.tn_id, &conn.file_id, &conn.user_id)
+		.release_all_locks(conn.tn_id, &conn.file_id, &conn.user_id, &conn.conn_id)
 		.await
 	{
 		warn!("Failed to release locks on disconnect: {}", e);
@@ -783,7 +799,7 @@ async fn handle_rtdb_command(
 
 			match app
 				.rtdb_adapter
-				.acquire_lock(conn.tn_id, &conn.file_id, path, &conn.user_id, mode)
+				.acquire_lock(conn.tn_id, &conn.file_id, path, &conn.user_id, mode, &conn.conn_id)
 				.await
 			{
 				Ok(None) => {
@@ -823,7 +839,7 @@ async fn handle_rtdb_command(
 
 			match app
 				.rtdb_adapter
-				.release_lock(conn.tn_id, &conn.file_id, path, &conn.user_id)
+				.release_lock(conn.tn_id, &conn.file_id, path, &conn.user_id, &conn.conn_id)
 				.await
 			{
 				Ok(()) => {

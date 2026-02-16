@@ -500,6 +500,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		path: &str,
 		user_id: &str,
 		mode: LockMode,
+		conn_id: &str,
 	) -> ClResult<Option<LockInfo>> {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 		let now = storage::now_timestamp();
@@ -531,6 +532,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 			data: serde_json::json!({
 				"userId": user_id,
 				"mode": mode,
+				"connId": conn_id,
 			}),
 		});
 
@@ -543,6 +545,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		db_id: &str,
 		path: &str,
 		user_id: &str,
+		conn_id: &str,
 	) -> ClResult<()> {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 
@@ -558,6 +561,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 					path: path.into(),
 					data: serde_json::json!({
 						"userId": user_id,
+						"connId": conn_id,
 					}),
 				});
 			}
@@ -582,7 +586,13 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		Ok(None)
 	}
 
-	async fn release_all_locks(&self, tn_id: TnId, db_id: &str, user_id: &str) -> ClResult<()> {
+	async fn release_all_locks(
+		&self,
+		tn_id: TnId,
+		db_id: &str,
+		user_id: &str,
+		conn_id: &str,
+	) -> ClResult<()> {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 
 		let paths_to_remove: Vec<Box<str>> = {
@@ -606,6 +616,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 				path: path.clone(),
 				data: serde_json::json!({
 					"userId": user_id,
+					"connId": conn_id,
 				}),
 			});
 		}
