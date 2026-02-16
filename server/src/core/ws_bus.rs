@@ -11,6 +11,7 @@
 //! }
 //! ```
 
+use super::utils::random_id;
 use crate::prelude::*;
 use crate::types::TnId;
 use axum::extract::ws::{Message, WebSocket};
@@ -19,7 +20,6 @@ use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// A message in the bus protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,7 +37,7 @@ pub struct BusMessage {
 impl BusMessage {
 	/// Create a new bus message
 	pub fn new(cmd: impl Into<String>, data: Value) -> Self {
-		Self { id: Uuid::new_v4().to_string(), cmd: cmd.into(), data }
+		Self { id: random_id().unwrap_or_default(), cmd: cmd.into(), data }
 	}
 
 	/// Create an ack response
@@ -72,7 +72,7 @@ pub async fn handle_bus_connection(
 	tn_id: TnId,
 	app: crate::core::app::App,
 ) {
-	let connection_id = Uuid::new_v4().to_string();
+	let connection_id = random_id().unwrap_or_default();
 	info!("Bus connection: {} (tn_id={}, conn={})", user_id, tn_id.0, &connection_id[..8]);
 
 	// Register user for direct messaging

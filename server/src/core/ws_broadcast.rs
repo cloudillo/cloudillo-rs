@@ -3,12 +3,12 @@
 //! Manages direct user-to-user messaging via WebSocket connections.
 //! Supports multiple connections per user (multiple tabs/devices).
 
+use super::utils::random_id;
 use crate::types::TnId;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
-use uuid::Uuid;
 
 /// A message to send to a user
 #[derive(Clone, Debug)]
@@ -24,7 +24,7 @@ impl BroadcastMessage {
 	/// Create a new message
 	pub fn new(cmd: impl Into<String>, data: Value, sender: impl Into<String>) -> Self {
 		Self {
-			id: Uuid::new_v4().to_string(),
+			id: random_id().unwrap_or_default(),
 			cmd: cmd.into(),
 			data,
 			sender: sender.into(),

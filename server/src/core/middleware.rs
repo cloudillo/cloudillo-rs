@@ -1,5 +1,8 @@
 //! Custom middlewares
 
+use crate::auth_adapter::AuthCtx;
+use crate::core::{extract::RequestId, utils::random_id, Auth, IdTag};
+use crate::prelude::*;
 use axum::{
 	body::Body,
 	extract::State,
@@ -8,11 +11,6 @@ use axum::{
 };
 use std::future::Future;
 use std::pin::Pin;
-use uuid::Uuid;
-
-use crate::auth_adapter::AuthCtx;
-use crate::core::{extract::RequestId, Auth, IdTag};
-use crate::prelude::*;
 
 /// Tenant API key prefix (validated by auth adapter)
 const TENANT_API_KEY_PREFIX: &str = "cl_";
@@ -364,7 +362,7 @@ pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Respon
 		.get("X-Request-ID")
 		.and_then(|h| h.to_str().ok())
 		.map(|s| s.to_string())
-		.unwrap_or_else(|| format!("req_{}", Uuid::new_v4().simple()));
+		.unwrap_or_else(|| format!("req_{}", random_id().unwrap_or_default()));
 
 	// Store in extensions for handlers to access
 	req.extensions_mut().insert(RequestId(request_id.clone()));

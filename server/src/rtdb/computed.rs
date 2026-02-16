@@ -161,7 +161,6 @@ fn process_function(fn_name: &str, params: &serde_json::Map<String, Value>) -> C
 				.as_millis() as u64;
 			Ok(Value::Number(timestamp.into()))
 		}
-		"uuid" => Ok(Value::String(uuid::Uuid::new_v4().to_string())),
 		"slugify" => {
 			if let Some(Value::Array(args)) = params.get("args") {
 				if let Some(Value::String(text)) = args.first() {
