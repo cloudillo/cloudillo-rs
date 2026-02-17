@@ -37,6 +37,28 @@ pub struct LockInfo {
 	pub ttl_secs: u64,
 }
 
+/// An aggregation operation to compute per group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase")]
+pub enum AggregateOp {
+	Sum { field: String },
+	Avg { field: String },
+	Min { field: String },
+	Max { field: String },
+}
+
+/// Aggregation options: group by a field and compute statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregateOptions {
+	/// Field to group by. For array fields, each element becomes a separate group.
+	pub group_by: String,
+
+	/// Additional operations per group (count is always included implicitly).
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub ops: Vec<AggregateOp>,
+}
+
 /// Query filter for selecting documents.
 ///
 /// Supports multiple filter operations on JSON document fields.
@@ -167,6 +189,125 @@ impl QueryFilter {
 		self
 	}
 
+	/// Check if a document matches this filter (all conditions must be satisfied).
+	pub fn matches(&self, doc: &Value) -> bool {
+		// Equality checks
+		for (field, expected) in &self.equals {
+			match doc.get(field) {
+				Some(actual) if actual == expected => continue,
+				_ => return false,
+			}
+		}
+
+		// Not-equal checks (missing fields are inherently "not equal")
+		for (field, expected) in &self.not_equals {
+			match doc.get(field) {
+				Some(actual) if actual == expected => return false,
+				_ => continue,
+			}
+		}
+
+		// Greater-than checks
+		for (field, threshold) in &self.greater_than {
+			match doc.get(field) {
+				Some(actual)
+					if compare_json_values(Some(actual), Some(threshold))
+						== std::cmp::Ordering::Greater =>
+				{
+					continue
+				}
+				_ => return false,
+			}
+		}
+
+		// Greater-than-or-equal checks
+		for (field, threshold) in &self.greater_than_or_equal {
+			match doc.get(field) {
+				Some(actual) => {
+					let ord = compare_json_values(Some(actual), Some(threshold));
+					if ord == std::cmp::Ordering::Greater || ord == std::cmp::Ordering::Equal {
+						continue;
+					}
+					return false;
+				}
+				_ => return false,
+			}
+		}
+
+		// Less-than checks
+		for (field, threshold) in &self.less_than {
+			match doc.get(field) {
+				Some(actual)
+					if compare_json_values(Some(actual), Some(threshold))
+						== std::cmp::Ordering::Less =>
+				{
+					continue
+				}
+				_ => return false,
+			}
+		}
+
+		// Less-than-or-equal checks
+		for (field, threshold) in &self.less_than_or_equal {
+			match doc.get(field) {
+				Some(actual) => {
+					let ord = compare_json_values(Some(actual), Some(threshold));
+					if ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal {
+						continue;
+					}
+					return false;
+				}
+				_ => return false,
+			}
+		}
+
+		// In-array checks (field value must be in the provided array)
+		for (field, allowed_values) in &self.in_array {
+			match doc.get(field) {
+				Some(actual) if allowed_values.contains(actual) => continue,
+				_ => return false,
+			}
+		}
+
+		// Array-contains checks (field must be an array containing the value)
+		for (field, required_value) in &self.array_contains {
+			match doc.get(field) {
+				Some(Value::Array(arr)) if arr.contains(required_value) => continue,
+				_ => return false,
+			}
+		}
+
+		// Not-in-array checks (field value must NOT be in the provided array; missing fields pass)
+		for (field, excluded_values) in &self.not_in_array {
+			match doc.get(field) {
+				Some(actual) if excluded_values.contains(actual) => return false,
+				_ => continue,
+			}
+		}
+
+		// Array-contains-any checks
+		for (field, candidate_values) in &self.array_contains_any {
+			match doc.get(field) {
+				Some(Value::Array(arr)) if candidate_values.iter().any(|v| arr.contains(v)) => {
+					continue
+				}
+				_ => return false,
+			}
+		}
+
+		// Array-contains-all checks
+		for (field, required_values) in &self.array_contains_all {
+			match doc.get(field) {
+				Some(Value::Array(arr)) if required_values.iter().all(|v| arr.contains(v)) => {
+					continue
+				}
+				_ => return false,
+			}
+		}
+
+		true
+	}
+
 	/// Check if this filter is empty (matches all documents).
 	pub fn is_empty(&self) -> bool {
 		self.equals.is_empty()
@@ -219,6 +360,9 @@ pub struct QueryOptions {
 
 	/// Optional offset for pagination
 	pub offset: Option<u32>,
+
+	/// When set, returns aggregated groups instead of documents.
+	pub aggregate: Option<AggregateOptions>,
 }
 
 impl QueryOptions {
@@ -248,6 +392,12 @@ impl QueryOptions {
 	/// Set the offset.
 	pub fn with_offset(mut self, offset: u32) -> Self {
 		self.offset = Some(offset);
+		self
+	}
+
+	/// Set the aggregation options.
+	pub fn with_aggregate(mut self, aggregate: AggregateOptions) -> Self {
+		self.aggregate = Some(aggregate);
 		self
 	}
 }
@@ -292,12 +442,18 @@ pub enum ChangeEvent {
 		path: Box<str>,
 		/// Full updated document data
 		data: Value,
+		/// Previous document data (for incremental aggregate computation)
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		old_data: Option<Value>,
 	},
 
 	/// A document was deleted
 	Delete {
 		/// Full path to the document
 		path: Box<str>,
+		/// Document data before deletion (for incremental aggregate computation)
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		old_data: Option<Value>,
 	},
 
 	/// A lock was acquired on a document path
@@ -320,6 +476,9 @@ pub enum ChangeEvent {
 	Ready {
 		/// Subscription path
 		path: Box<str>,
+		/// Optional initial dataset
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		data: Option<Value>,
 	},
 }
 
@@ -332,7 +491,7 @@ impl ChangeEvent {
 			ChangeEvent::Delete { path, .. } => path,
 			ChangeEvent::Lock { path, .. } => path,
 			ChangeEvent::Unlock { path, .. } => path,
-			ChangeEvent::Ready { path } => path,
+			ChangeEvent::Ready { path, .. } => path,
 		}
 	}
 
@@ -352,7 +511,8 @@ impl ChangeEvent {
 		match self {
 			ChangeEvent::Create { data, .. } | ChangeEvent::Update { data, .. } => Some(data),
 			ChangeEvent::Lock { data, .. } | ChangeEvent::Unlock { data, .. } => Some(data),
-			ChangeEvent::Delete { .. } | ChangeEvent::Ready { .. } => None,
+			ChangeEvent::Delete { .. } => None,
+			ChangeEvent::Ready { data, .. } => data.as_ref(),
 		}
 	}
 
@@ -369,6 +529,32 @@ impl ChangeEvent {
 	/// Check if this is a Delete event.
 	pub fn is_delete(&self) -> bool {
 		matches!(self, ChangeEvent::Delete { .. })
+	}
+}
+
+/// Compare two JSON values for ordering (used by filter range operators).
+fn compare_json_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+	match (a, b) {
+		(None, None) => std::cmp::Ordering::Equal,
+		(None, Some(_)) => std::cmp::Ordering::Less,
+		(Some(_), None) => std::cmp::Ordering::Greater,
+		(Some(Value::Number(a)), Some(Value::Number(b))) => {
+			a.as_f64().partial_cmp(&b.as_f64()).unwrap_or(std::cmp::Ordering::Equal)
+		}
+		(Some(Value::String(a)), Some(Value::String(b))) => a.cmp(b),
+		(Some(Value::Bool(a)), Some(Value::Bool(b))) => a.cmp(b),
+		(Some(a), Some(b)) => a.to_string().cmp(&b.to_string()),
+	}
+}
+
+/// Convert a JSON value to a string key for aggregate group indexing.
+pub fn value_to_group_string(value: &Value) -> String {
+	match value {
+		Value::String(s) => s.clone(),
+		Value::Number(n) => n.to_string(),
+		Value::Bool(b) => b.to_string(),
+		Value::Null => "null".to_string(),
+		_ => serde_json::to_string(value).unwrap_or_default(),
 	}
 }
 

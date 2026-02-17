@@ -1,4 +1,6 @@
-use cloudillo::rtdb_adapter::{QueryFilter, QueryOptions, RtdbAdapter};
+use cloudillo::rtdb_adapter::{
+	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, RtdbAdapter,
+};
 use cloudillo::types::TnId;
 use cloudillo_rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
 use serde_json::{json, Value};
@@ -967,4 +969,201 @@ async fn test_array_contains_all_indexed() {
 	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
 	assert_eq!(results.len(), 1, "Only Alpha has both 'rust' and 'web' (via index)");
 	assert_eq!(results[0]["name"], "Alpha");
+}
+
+// --- Aggregation Tests ---
+
+/// Helper: create docs with array tags for aggregation tests
+async fn create_tagged_docs(adapter: &cloudillo_rtdb_adapter_redb::RtdbAdapterRedb) {
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "posts";
+
+	let docs = vec![
+		json!({"title": "Rust Basics", "tags": ["rust", "tutorial"], "views": 100, "score": 4.5}),
+		json!({"title": "Rust Web", "tags": ["rust", "web"], "views": 200, "score": 4.0}),
+		json!({"title": "Python ML", "tags": ["python", "ml"], "views": 150, "score": 3.5}),
+		json!({"title": "Web Design", "tags": ["web", "design"], "views": 80, "score": 4.2}),
+		json!({"title": "Rust API", "tags": ["rust", "web", "api"], "views": 300, "score": 4.8}),
+	];
+
+	for doc in docs {
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, doc).await.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
+	}
+}
+
+#[tokio::test]
+async fn test_aggregate_count_only() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	create_tagged_docs(&adapter).await;
+
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "posts";
+
+	// Aggregate by tags (no index — collection scan path)
+	let opts = QueryOptions::new()
+		.with_aggregate(AggregateOptions { group_by: "tags".to_string(), ops: vec![] });
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Aggregate failed");
+
+	// Expected: rust=3, web=3, tutorial=1, ml=1, python=1, design=1, api=1
+	assert!(!results.is_empty(), "Should have aggregate results");
+
+	let rust_group = results.iter().find(|r| r["group"] == "rust");
+	assert!(rust_group.is_some(), "Should have 'rust' group");
+	assert_eq!(rust_group.and_then(|r| r["count"].as_u64()), Some(3));
+
+	let web_group = results.iter().find(|r| r["group"] == "web");
+	assert!(web_group.is_some(), "Should have 'web' group");
+	assert_eq!(web_group.and_then(|r| r["count"].as_u64()), Some(3));
+
+	let tutorial_group = results.iter().find(|r| r["group"] == "tutorial");
+	assert_eq!(tutorial_group.and_then(|r| r["count"].as_u64()), Some(1));
+}
+
+#[tokio::test]
+async fn test_aggregate_index_only() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "posts";
+
+	// Create index FIRST
+	adapter
+		.create_index(tn_id, db_id, path, "tags")
+		.await
+		.expect("Failed to create index");
+
+	create_tagged_docs(&adapter).await;
+
+	// Aggregate by tags (index-only path: no filter, no ops, indexed field)
+	let opts = QueryOptions::new()
+		.with_aggregate(AggregateOptions { group_by: "tags".to_string(), ops: vec![] });
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Aggregate failed");
+
+	let rust_group = results.iter().find(|r| r["group"] == "rust");
+	assert_eq!(rust_group.and_then(|r| r["count"].as_u64()), Some(3));
+
+	let web_group = results.iter().find(|r| r["group"] == "web");
+	assert_eq!(web_group.and_then(|r| r["count"].as_u64()), Some(3));
+
+	// Default sort: count desc, then value asc
+	// rust=3 and web=3 should be first (tied count, "rust" < "web")
+	assert_eq!(results[0]["count"], 3);
+	assert_eq!(results[1]["count"], 3);
+}
+
+#[tokio::test]
+async fn test_aggregate_with_filter() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	create_tagged_docs(&adapter).await;
+
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "posts";
+
+	// Aggregate by tags, but only docs with views > 100
+	let filter = QueryFilter::new().with_greater_than("views", Value::Number(100.into()));
+	let opts = QueryOptions::new()
+		.with_filter(filter)
+		.with_aggregate(AggregateOptions { group_by: "tags".to_string(), ops: vec![] });
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Aggregate failed");
+
+	// Docs with views > 100: "Rust Web" (200), "Python ML" (150), "Rust API" (300)
+	// Tags: rust=2, web=2, python=1, ml=1, api=1
+	let rust_group = results.iter().find(|r| r["group"] == "rust");
+	assert_eq!(rust_group.and_then(|r| r["count"].as_u64()), Some(2));
+
+	// "tutorial" and "design" should not appear (their docs have views <= 100)
+	let tutorial_group = results.iter().find(|r| r["group"] == "tutorial");
+	assert!(tutorial_group.is_none(), "'tutorial' should not appear in filtered results");
+}
+
+#[tokio::test]
+async fn test_aggregate_with_sum() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	create_tagged_docs(&adapter).await;
+
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "posts";
+
+	// Aggregate by tags with sum of views
+	let opts = QueryOptions::new().with_aggregate(AggregateOptions {
+		group_by: "tags".to_string(),
+		ops: vec![AggregateOp::Sum { field: "views".to_string() }],
+	});
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Aggregate failed");
+
+	// "rust" docs: Rust Basics (100) + Rust Web (200) + Rust API (300) = 600
+	let rust_group = results.iter().find(|r| r["group"] == "rust");
+	assert!(rust_group.is_some());
+	assert_eq!(rust_group.and_then(|r| r["sum_views"].as_f64()), Some(600.0));
+
+	// "web" docs: Rust Web (200) + Web Design (80) + Rust API (300) = 580
+	let web_group = results.iter().find(|r| r["group"] == "web");
+	assert!(web_group.is_some());
+	assert_eq!(web_group.and_then(|r| r["sum_views"].as_f64()), Some(580.0));
+}
+
+#[tokio::test]
+async fn test_aggregate_with_limit() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	create_tagged_docs(&adapter).await;
+
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "posts";
+
+	// Aggregate by tags with limit 3
+	let opts = QueryOptions::new()
+		.with_limit(3)
+		.with_aggregate(AggregateOptions { group_by: "tags".to_string(), ops: vec![] });
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Aggregate failed");
+
+	assert_eq!(results.len(), 3, "Should respect limit");
+	// Default sort: count desc — top 3 should include rust(3) and web(3)
+	assert_eq!(results[0]["count"], 3);
+	assert_eq!(results[1]["count"], 3);
+}
+
+#[tokio::test]
+async fn test_aggregate_scalar_field() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "users";
+
+	// Create docs with scalar "role" field
+	for (name, role) in &[
+		("Alice", "admin"),
+		("Bob", "user"),
+		("Charlie", "user"),
+		("Diana", "moderator"),
+		("Eve", "user"),
+	] {
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": name, "role": role}))
+			.await
+			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
+	}
+
+	// Aggregate by role
+	let opts = QueryOptions::new()
+		.with_aggregate(AggregateOptions { group_by: "role".to_string(), ops: vec![] });
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Aggregate failed");
+
+	assert_eq!(results.len(), 3, "Should have 3 distinct roles");
+
+	let user_group = results.iter().find(|r| r["group"] == "user");
+	assert_eq!(user_group.and_then(|r| r["count"].as_u64()), Some(3));
+
+	let admin_group = results.iter().find(|r| r["group"] == "admin");
+	assert_eq!(admin_group.and_then(|r| r["count"].as_u64()), Some(1));
+
+	let mod_group = results.iter().find(|r| r["group"] == "moderator");
+	assert_eq!(mod_group.and_then(|r| r["count"].as_u64()), Some(1));
 }

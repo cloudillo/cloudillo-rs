@@ -404,6 +404,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 			// Signal that all initial documents have been yielded
 			yield ChangeEvent::Ready {
 				path: path.clone(),
+				data: None,
 			};
 
 			// Then continue listening for future changes

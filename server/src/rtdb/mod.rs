@@ -3,6 +3,7 @@
 //! This module handles the real-time database functionality including
 //! WebSocket connections, computed values, and database operations.
 
+pub mod aggregate;
 pub mod computed;
 pub mod merge;
 pub mod websocket;

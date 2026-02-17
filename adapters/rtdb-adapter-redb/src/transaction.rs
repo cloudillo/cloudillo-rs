@@ -199,13 +199,14 @@ impl Transaction for RedbTransaction {
 		let (collection, doc_id) = storage::parse_path(path)?;
 
 		// Update indexes
-		if let Some(old) = old_data {
-			self.update_indexes_for_document(&collection, &doc_id, &old, false).await?;
+		if let Some(ref old) = old_data {
+			self.update_indexes_for_document(&collection, &doc_id, old, false).await?;
 		}
 		self.update_indexes_for_document(&collection, &doc_id, &data, true).await?;
 
 		// Buffer change event
-		self.pending_events.push(ChangeEvent::Update { path: path.into(), data });
+		self.pending_events
+			.push(ChangeEvent::Update { path: path.into(), data, old_data });
 
 		Ok(())
 	}
@@ -245,13 +246,14 @@ impl Transaction for RedbTransaction {
 		self.write_cache.insert(path.to_string(), None);
 
 		// Remove from indexes
-		if let Some(data) = data {
+		if let Some(ref data) = data {
 			let (collection, doc_id) = storage::parse_path(path)?;
-			self.update_indexes_for_document(&collection, &doc_id, &data, false).await?;
+			self.update_indexes_for_document(&collection, &doc_id, data, false).await?;
 		}
 
 		// Buffer change event
-		self.pending_events.push(ChangeEvent::Delete { path: path.into() });
+		self.pending_events
+			.push(ChangeEvent::Delete { path: path.into(), old_data: data });
 
 		Ok(())
 	}

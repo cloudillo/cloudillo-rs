@@ -256,7 +256,7 @@ pub async fn handle_rtdb_connection(
 				ChangeEvent::Delete { .. } => ("delete", None),
 				ChangeEvent::Lock { data, .. } => ("lock", Some(data.clone())),
 				ChangeEvent::Unlock { data, .. } => ("unlock", Some(data.clone())),
-				ChangeEvent::Ready { .. } => ("ready", None),
+				ChangeEvent::Ready { data, .. } => ("ready", data.clone()),
 			};
 
 			debug!(
@@ -266,15 +266,18 @@ pub async fn handle_rtdb_connection(
 				subscription_id
 			);
 
+			let mut event_obj = json!({
+				"action": action,
+				"path": event.path(),
+			});
+			if let Some(d) = &data {
+				event_obj["data"] = d.clone();
+			}
 			let msg = RtdbMessage::new(
 				"change",
 				json!({
 					"subscriptionId": subscription_id,
-					"event": {
-						"action": action,
-						"path": event.path(),
-						"data": data,
-					}
+					"event": event_obj,
 				}),
 			);
 
@@ -594,8 +597,8 @@ async fn handle_rtdb_command(
 		}
 
 		"query" => {
-			// Fetch documents with optional filtering/sorting
-			use crate::rtdb_adapter::{QueryFilter, QueryOptions, SortField};
+			// Fetch documents with optional filtering/sorting/aggregation
+			use crate::rtdb_adapter::{AggregateOptions, QueryFilter, QueryOptions, SortField};
 			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			debug!("RTDB query: path={}", path);
 
@@ -640,6 +643,14 @@ async fn handle_rtdb_command(
 				debug!("RTDB query offset: {}", offset);
 			}
 
+			// Parse aggregate
+			if let Some(agg_obj) = msg.payload.get("aggregate") {
+				if let Ok(agg) = serde_json::from_value::<AggregateOptions>(agg_obj.clone()) {
+					debug!("RTDB query aggregate: groupBy={}", agg.group_by);
+					opts = opts.with_aggregate(agg);
+				}
+			}
+
 			match app.rtdb_adapter.query(conn.tn_id, &conn.file_id, path, opts).await {
 				Ok(documents) => {
 					debug!("RTDB query result: {} documents", documents.len());
@@ -676,37 +687,218 @@ async fn handle_rtdb_command(
 
 		"subscribe" => {
 			// Start real-time updates for a path
-			use crate::rtdb_adapter::{QueryFilter, SubscriptionOptions};
+			use crate::rtdb_adapter::{
+				AggregateOptions, QueryFilter, QueryOptions, SubscriptionOptions,
+			};
 			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			debug!("RTDB subscribe: path={}", path);
 			let subscription_id = format!("sub-{}", random_id().unwrap_or_default());
 
 			// Parse filter from payload
-			let opts = if let Some(filter_obj) = msg.payload.get("filter") {
-				if let Ok(filter) = serde_json::from_value::<QueryFilter>(filter_obj.clone()) {
-					debug!("RTDB subscribe with filter: {:?}", filter_obj);
-					SubscriptionOptions::filtered(path, filter)
-				} else {
-					SubscriptionOptions::all(path)
-				}
-			} else {
+			let filter = msg
+				.payload
+				.get("filter")
+				.and_then(|obj| serde_json::from_value::<QueryFilter>(obj.clone()).ok());
+
+			// Parse aggregate from payload
+			let aggregate = msg
+				.payload
+				.get("aggregate")
+				.and_then(|obj| serde_json::from_value::<AggregateOptions>(obj.clone()).ok());
+
+			// For aggregate subscriptions, subscribe without filter at the adapter level.
+			// The aggregate task applies the filter itself to detect filter transitions
+			// (old doc matched but new doesn't, and vice versa).
+			let sub_opts = if aggregate.is_some() {
 				SubscriptionOptions::all(path)
+			} else {
+				match &filter {
+					Some(f) => {
+						debug!("RTDB subscribe with filter: {:?}", f);
+						SubscriptionOptions::filtered(path, f.clone())
+					}
+					None => SubscriptionOptions::all(path),
+				}
 			};
 
-			match app.rtdb_adapter.subscribe(conn.tn_id, &conn.file_id, opts).await {
+			match app.rtdb_adapter.subscribe(conn.tn_id, &conn.file_id, sub_opts).await {
 				Ok(change_stream) => {
-					// Spawn a per-subscription forwarding task that sends events
-					// to the aggregated channel
 					let agg_tx = conn.aggregated_tx.clone();
 					let sub_id_clone = subscription_id.clone();
-					let mut stream = change_stream;
-					let handle = tokio::spawn(async move {
-						while let Some(event) = stream.next().await {
-							if agg_tx.send((sub_id_clone.clone(), event)).is_err() {
-								break;
+
+					let handle = if let Some(aggregate) = aggregate {
+						// Aggregate subscription: incremental or full-recompute
+						debug!("RTDB aggregate subscribe: groupBy={}", aggregate.group_by);
+						let app = app.clone();
+						let tn_id = conn.tn_id;
+						let file_id = conn.file_id.clone();
+						let path = path.to_string();
+						let filter = filter.clone();
+
+						tokio::spawn(async move {
+							use crate::rtdb::aggregate::IncrementalAggState;
+
+							let mut agg_state =
+								IncrementalAggState::new(aggregate.clone(), filter.clone());
+							let needs_full = agg_state.needs_full_recompute();
+
+							let mut stream = change_stream;
+							let mut initial_done = false;
+
+							while let Some(event) = stream.next().await {
+								if !initial_done {
+									match &event {
+										ChangeEvent::Create { data, .. } if !needs_full => {
+											agg_state.add_doc(data);
+											continue;
+										}
+										ChangeEvent::Create { .. } => {
+											continue;
+										}
+										ChangeEvent::Ready { .. } => {
+											initial_done = true;
+											let groups = if needs_full {
+												let mut qopts = QueryOptions::new()
+													.with_aggregate(aggregate.clone());
+												if let Some(ref f) = filter {
+													qopts = qopts.with_filter(f.clone());
+												}
+												match app
+													.rtdb_adapter
+													.query(tn_id, &file_id, &path, qopts)
+													.await
+												{
+													Ok(g) => g,
+													Err(e) => {
+														warn!(
+															"Aggregate initial query failed: {}",
+															e
+														);
+														continue;
+													}
+												}
+											} else {
+												agg_state.get_full_result()
+											};
+
+											let ready_event = ChangeEvent::Ready {
+												path: path.clone().into(),
+												data: Some(Value::Array(groups)),
+											};
+											if agg_tx
+												.send((sub_id_clone.clone(), ready_event))
+												.is_err()
+											{
+												break;
+											}
+											continue;
+										}
+										_ => continue,
+									}
+								}
+
+								// After initial load: handle live changes
+								match &event {
+									ChangeEvent::Create { .. }
+									| ChangeEvent::Update { .. }
+									| ChangeEvent::Delete { .. } => {
+										if needs_full {
+											// Min/Max: full recompute fallback
+											let mut qopts = QueryOptions::new()
+												.with_aggregate(aggregate.clone());
+											if let Some(ref f) = filter {
+												qopts = qopts.with_filter(f.clone());
+											}
+											match app
+												.rtdb_adapter
+												.query(tn_id, &file_id, &path, qopts)
+												.await
+											{
+												Ok(groups) => {
+													let update_event = ChangeEvent::Update {
+														path: path.clone().into(),
+														data: Value::Array(groups),
+														old_data: None,
+													};
+													if agg_tx
+														.send((sub_id_clone.clone(), update_event))
+														.is_err()
+													{
+														break;
+													}
+												}
+												Err(e) => {
+													warn!("Aggregate recompute failed: {}", e);
+												}
+											}
+										} else if let Some(delta) = agg_state.process_change(&event)
+										{
+											if !delta.is_empty() {
+												let update_event = ChangeEvent::Update {
+													path: path.clone().into(),
+													data: Value::Array(delta),
+													old_data: None,
+												};
+												if agg_tx
+													.send((sub_id_clone.clone(), update_event))
+													.is_err()
+												{
+													break;
+												}
+											}
+										}
+									}
+									_ => {
+										// Forward lock/unlock/ready as-is
+										if agg_tx.send((sub_id_clone.clone(), event)).is_err() {
+											break;
+										}
+									}
+								}
 							}
-						}
-					});
+						})
+					} else {
+						// Normal subscription: batch initial Create events, then forward live
+						let mut stream = change_stream;
+						let path = path.to_string();
+						tokio::spawn(async move {
+							let mut initial_docs: Vec<Value> = Vec::new();
+							let mut initial_done = false;
+
+							while let Some(event) = stream.next().await {
+								if !initial_done {
+									match &event {
+										ChangeEvent::Create { data, .. } => {
+											initial_docs.push(data.clone());
+											continue;
+										}
+										ChangeEvent::Ready { .. } => {
+											initial_done = true;
+											let ready_with_data = ChangeEvent::Ready {
+												path: path.clone().into(),
+												data: Some(Value::Array(initial_docs)),
+											};
+											if agg_tx
+												.send((sub_id_clone.clone(), ready_with_data))
+												.is_err()
+											{
+												break;
+											}
+											initial_docs = Vec::new();
+											continue;
+										}
+										// Forward lock/unlock during initial phase as-is
+										_ => {}
+									}
+								}
+
+								// After initial load or non-create/ready events: forward as-is
+								if agg_tx.send((sub_id_clone.clone(), event)).is_err() {
+									break;
+								}
+							}
+						})
+					};
 
 					let mut handles = conn.subscription_handles.write().await;
 					handles.insert(subscription_id.clone(), handle);

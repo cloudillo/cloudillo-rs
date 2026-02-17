@@ -1,10 +1,12 @@
 use crate::{storage, DatabaseInstance};
 use cloudillo::error::ClResult;
-use cloudillo::rtdb_adapter::{QueryFilter, QueryOptions, SortField};
+use cloudillo::rtdb_adapter::{
+	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, SortField,
+};
 use cloudillo::types::TnId;
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Query context grouping related parameters
@@ -25,6 +27,11 @@ pub fn execute_query(
 	opts: QueryOptions,
 	per_tenant_files: bool,
 ) -> ClResult<Vec<Value>> {
+	// Dispatch to aggregation if requested
+	if let Some(ref aggregate) = opts.aggregate {
+		return execute_aggregate(instance, tn_id, db_id, path, &opts, aggregate, per_tenant_files);
+	}
+
 	use crate::error::from_redb_error;
 	use redb::ReadableDatabase;
 
@@ -291,6 +298,340 @@ fn extract_doc_id_from_index_key(key: &str) -> String {
 	// Index key format: "path/_idx/field/value/doc_id"
 	// We need the last segment after the last '/'
 	key.split('/').next_back().unwrap_or("").to_string()
+}
+
+// --- Aggregation ---
+
+/// Per-group accumulator for aggregation operations.
+struct GroupAccumulator {
+	count: u64,
+	sum: HashMap<String, f64>,
+	avg_sum: HashMap<String, f64>,
+	avg_count: HashMap<String, u64>,
+	min: HashMap<String, Value>,
+	max: HashMap<String, Value>,
+}
+
+impl GroupAccumulator {
+	fn new(ops: &[AggregateOp]) -> Self {
+		let mut acc = Self {
+			count: 0,
+			sum: HashMap::new(),
+			avg_sum: HashMap::new(),
+			avg_count: HashMap::new(),
+			min: HashMap::new(),
+			max: HashMap::new(),
+		};
+		for op in ops {
+			match op {
+				AggregateOp::Sum { field } => {
+					acc.sum.insert(field.clone(), 0.0);
+				}
+				AggregateOp::Avg { field } => {
+					acc.avg_sum.insert(field.clone(), 0.0);
+					acc.avg_count.insert(field.clone(), 0);
+				}
+				AggregateOp::Min { .. } | AggregateOp::Max { .. } => {}
+			}
+		}
+		acc
+	}
+
+	fn add(&mut self, doc: &Value, ops: &[AggregateOp]) {
+		self.count += 1;
+		for op in ops {
+			match op {
+				AggregateOp::Sum { field } => {
+					if let Some(n) = doc.get(field).and_then(|v| v.as_f64()) {
+						*self.sum.entry(field.clone()).or_default() += n;
+					}
+				}
+				AggregateOp::Avg { field } => {
+					if let Some(n) = doc.get(field).and_then(|v| v.as_f64()) {
+						*self.avg_sum.entry(field.clone()).or_default() += n;
+						*self.avg_count.entry(field.clone()).or_default() += 1;
+					}
+				}
+				AggregateOp::Min { field } => {
+					if let Some(val) = doc.get(field) {
+						let entry = self.min.entry(field.clone());
+						match entry {
+							std::collections::hash_map::Entry::Vacant(e) => {
+								e.insert(val.clone());
+							}
+							std::collections::hash_map::Entry::Occupied(mut e) => {
+								if storage::compare_values(Some(val), Some(e.get()))
+									== Ordering::Less
+								{
+									e.insert(val.clone());
+								}
+							}
+						}
+					}
+				}
+				AggregateOp::Max { field } => {
+					if let Some(val) = doc.get(field) {
+						let entry = self.max.entry(field.clone());
+						match entry {
+							std::collections::hash_map::Entry::Vacant(e) => {
+								e.insert(val.clone());
+							}
+							std::collections::hash_map::Entry::Occupied(mut e) => {
+								if storage::compare_values(Some(val), Some(e.get()))
+									== Ordering::Greater
+								{
+									e.insert(val.clone());
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	fn to_value(&self, group_value: &str, ops: &[AggregateOp]) -> Value {
+		let mut obj = serde_json::Map::new();
+		obj.insert("group".to_string(), Value::String(group_value.to_string()));
+		obj.insert("count".to_string(), Value::Number(self.count.into()));
+
+		for op in ops {
+			match op {
+				AggregateOp::Sum { field } => {
+					let key = format!("sum_{}", field);
+					let val = self.sum.get(field).copied().unwrap_or(0.0);
+					if let Some(n) = serde_json::Number::from_f64(val) {
+						obj.insert(key, Value::Number(n));
+					}
+				}
+				AggregateOp::Avg { field } => {
+					let key = format!("avg_{}", field);
+					let sum = self.avg_sum.get(field).copied().unwrap_or(0.0);
+					let count = self.avg_count.get(field).copied().unwrap_or(0);
+					if count > 0 {
+						if let Some(n) = serde_json::Number::from_f64(sum / count as f64) {
+							obj.insert(key, Value::Number(n));
+						}
+					}
+				}
+				AggregateOp::Min { field } => {
+					let key = format!("min_{}", field);
+					if let Some(val) = self.min.get(field) {
+						obj.insert(key, val.clone());
+					}
+				}
+				AggregateOp::Max { field } => {
+					let key = format!("max_{}", field);
+					if let Some(val) = self.max.get(field) {
+						obj.insert(key, val.clone());
+					}
+				}
+			}
+		}
+
+		Value::Object(obj)
+	}
+}
+
+/// Decide aggregation strategy and dispatch.
+fn execute_aggregate(
+	instance: &Arc<DatabaseInstance>,
+	tn_id: TnId,
+	db_id: &str,
+	path: &str,
+	opts: &QueryOptions,
+	aggregate: &AggregateOptions,
+	per_tenant_files: bool,
+) -> ClResult<Vec<Value>> {
+	// Index-only path: no filter, no data-dependent ops (count only), field is indexed
+	let can_use_index =
+		opts.filter.as_ref().is_none_or(|f| f.is_empty()) && aggregate.ops.is_empty() && {
+			let indexed_fields = instance.indexed_fields.blocking_read();
+			indexed_fields
+				.get(path)
+				.is_some_and(|fields| fields.iter().any(|f| f.as_ref() == aggregate.group_by))
+		};
+
+	if can_use_index {
+		execute_aggregate_index_only(instance, tn_id, path, opts, aggregate, per_tenant_files)
+	} else {
+		execute_aggregate_scan(instance, tn_id, db_id, path, opts, aggregate, per_tenant_files)
+	}
+}
+
+/// Pure index scan aggregation — no document fetches needed.
+fn execute_aggregate_index_only(
+	instance: &Arc<DatabaseInstance>,
+	tn_id: TnId,
+	path: &str,
+	opts: &QueryOptions,
+	aggregate: &AggregateOptions,
+	per_tenant_files: bool,
+) -> ClResult<Vec<Value>> {
+	use crate::error::from_redb_error;
+	use redb::ReadableDatabase;
+
+	let tx = instance.db.begin_read().map_err(from_redb_error)?;
+	let index_table = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
+
+	// Index key format: "{path}/_idx/{field}/{value}/{doc_id}"
+	// or with tenant: "{tn_id}/{path}/_idx/{field}/{value}/{doc_id}"
+	let index_prefix = if per_tenant_files {
+		format!("{}/_idx/{}/", path, aggregate.group_by)
+	} else {
+		format!("{}/{}/_idx/{}/", tn_id.0, path, aggregate.group_by)
+	};
+
+	let mut counts: HashMap<String, u64> = HashMap::new();
+	let range = index_table.range(index_prefix.as_str()..).map_err(from_redb_error)?;
+
+	for item in range {
+		let (key, _) = item.map_err(from_redb_error)?;
+		let key_str = key.value();
+
+		if !key_str.starts_with(&index_prefix) {
+			break;
+		}
+
+		// Extract value from key: remainder after prefix is "value/doc_id"
+		let remainder = &key_str[index_prefix.len()..];
+		if let Some(sep) = remainder.rfind('/') {
+			let value = &remainder[..sep];
+			*counts.entry(value.to_string()).or_default() += 1;
+		}
+	}
+
+	let mut groups: Vec<Value> = counts
+		.into_iter()
+		.map(|(value, count)| {
+			serde_json::json!({
+				"group": value,
+				"count": count,
+			})
+		})
+		.collect();
+
+	// Default sort: count desc, then value asc
+	if let Some(ref sort_fields) = opts.sort {
+		groups.sort_by(|a, b| compare_documents(a, b, sort_fields));
+	} else {
+		groups.sort_by(|a, b| {
+			let count_ord = storage::compare_values(b.get("count"), a.get("count"));
+			if count_ord != Ordering::Equal {
+				return count_ord;
+			}
+			storage::compare_values(a.get("group"), b.get("group"))
+		});
+	}
+
+	// Apply offset/limit
+	let start = opts.offset.unwrap_or(0) as usize;
+	if start >= groups.len() {
+		return Ok(Vec::new());
+	}
+	let end = opts
+		.limit
+		.map(|l| (start + l as usize).min(groups.len()))
+		.unwrap_or(groups.len());
+
+	Ok(groups[start..end].to_vec())
+}
+
+/// Collection scan aggregation — supports filters and all ops.
+fn execute_aggregate_scan(
+	instance: &Arc<DatabaseInstance>,
+	tn_id: TnId,
+	db_id: &str,
+	path: &str,
+	opts: &QueryOptions,
+	aggregate: &AggregateOptions,
+	per_tenant_files: bool,
+) -> ClResult<Vec<Value>> {
+	use crate::error::from_redb_error;
+	use redb::ReadableDatabase;
+
+	let tx = instance.db.begin_read().map_err(from_redb_error)?;
+	let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+
+	let prefix = if per_tenant_files {
+		format!("{}/{}/", db_id, path)
+	} else {
+		format!("{}/{}/{}/", tn_id.0, db_id, path)
+	};
+
+	let mut groups: HashMap<String, GroupAccumulator> = HashMap::new();
+	let range = doc_table.range(prefix.as_str()..).map_err(from_redb_error)?;
+
+	for item in range {
+		let (key, value) = item.map_err(from_redb_error)?;
+		let key_str = key.value();
+
+		if !key_str.starts_with(&prefix) {
+			break;
+		}
+
+		// Check it's a direct child (not nested)
+		let remainder = &key_str[prefix.len()..];
+		if remainder.contains('/') {
+			continue;
+		}
+
+		let mut doc: Value = serde_json::from_str(value.value())?;
+		storage::inject_doc_id(&mut doc, remainder);
+
+		// Apply filter
+		if let Some(ref filter) = opts.filter {
+			if !storage::matches_filter(&doc, filter) {
+				continue;
+			}
+		}
+
+		// Extract group_by field value
+		let group_values: Vec<String> = match doc.get(&aggregate.group_by) {
+			Some(Value::Array(arr)) => arr
+				.iter()
+				.filter(|v| !v.is_array() && !v.is_object())
+				.map(storage::value_to_string)
+				.collect(),
+			Some(val) if !val.is_null() => vec![storage::value_to_string(val)],
+			_ => continue, // missing or null — skip doc
+		};
+
+		for gv in group_values {
+			groups
+				.entry(gv)
+				.or_insert_with(|| GroupAccumulator::new(&aggregate.ops))
+				.add(&doc, &aggregate.ops);
+		}
+	}
+
+	let mut results: Vec<Value> =
+		groups.iter().map(|(value, acc)| acc.to_value(value, &aggregate.ops)).collect();
+
+	// Default sort: count desc, then value asc
+	if let Some(ref sort_fields) = opts.sort {
+		results.sort_by(|a, b| compare_documents(a, b, sort_fields));
+	} else {
+		results.sort_by(|a, b| {
+			let count_ord = storage::compare_values(b.get("count"), a.get("count"));
+			if count_ord != Ordering::Equal {
+				return count_ord;
+			}
+			storage::compare_values(a.get("group"), b.get("group"))
+		});
+	}
+
+	// Apply offset/limit
+	let start = opts.offset.unwrap_or(0) as usize;
+	if start >= results.len() {
+		return Ok(Vec::new());
+	}
+	let end = opts
+		.limit
+		.map(|l| (start + l as usize).min(results.len()))
+		.unwrap_or(results.len());
+
+	Ok(results[start..end].to_vec())
 }
 
 // vim: ts=4
