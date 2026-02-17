@@ -29,6 +29,22 @@ pub fn value_to_string(value: &Value) -> String {
 	}
 }
 
+/// Convert a JSON value to index strings, expanding arrays into per-element entries.
+///
+/// - Arrays: one string per scalar element (nested arrays/objects skipped)
+/// - Scalars: single-element Vec
+/// - Empty arrays: empty Vec (no phantom entries)
+pub fn values_to_index_strings(value: &Value) -> Vec<String> {
+	match value {
+		Value::Array(arr) => arr
+			.iter()
+			.filter(|v| !v.is_array() && !v.is_object())
+			.map(value_to_string)
+			.collect(),
+		other => vec![value_to_string(other)],
+	}
+}
+
 /// Check if a document matches a filter
 pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 	// Equality checks
@@ -107,6 +123,30 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 	for (field, required_value) in &filter.array_contains {
 		match doc.get(field) {
 			Some(Value::Array(arr)) if arr.contains(required_value) => continue,
+			_ => return false,
+		}
+	}
+
+	// Not-in-array checks (field value must NOT be in the provided array; missing fields pass)
+	for (field, excluded_values) in &filter.not_in_array {
+		match doc.get(field) {
+			Some(actual) if excluded_values.contains(actual) => return false,
+			_ => continue,
+		}
+	}
+
+	// Array-contains-any checks (field must be an array containing at least one of the values)
+	for (field, candidate_values) in &filter.array_contains_any {
+		match doc.get(field) {
+			Some(Value::Array(arr)) if candidate_values.iter().any(|v| arr.contains(v)) => continue,
+			_ => return false,
+		}
+	}
+
+	// Array-contains-all checks (field must be an array containing all of the values)
+	for (field, required_values) in &filter.array_contains_all {
+		match doc.get(field) {
+			Some(Value::Array(arr)) if required_values.iter().all(|v| arr.contains(v)) => continue,
 			_ => return false,
 		}
 	}

@@ -575,3 +575,396 @@ async fn test_advanced_filter_operators() {
 		"Should only find users with non-empty tags containing 'verified' (Alice, Bob)"
 	);
 }
+
+#[tokio::test]
+async fn test_array_field_indexing() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "projects";
+
+	// Create index on 'tags' field FIRST
+	adapter
+		.create_index(tn_id, db_id, path, "tags")
+		.await
+		.expect("Failed to create index");
+
+	// Create documents with array fields
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Alpha", "tags": ["rust", "web"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Beta", "tags": ["python", "web"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Gamma", "tags": ["rust", "api"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+
+	// Query with arrayContains on indexed field -- should use index
+	let filter = QueryFilter::new().with_array_contains("tags", Value::String("rust".to_string()));
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 2, "Should find 2 projects with 'rust' tag (Alpha, Gamma)");
+
+	let filter = QueryFilter::new().with_array_contains("tags", Value::String("web".to_string()));
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 2, "Should find 2 projects with 'web' tag (Alpha, Beta)");
+
+	let filter = QueryFilter::new().with_array_contains("tags", Value::String("api".to_string()));
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 1, "Should find 1 project with 'api' tag (Gamma)");
+
+	// Non-existent tag should return empty
+	let filter = QueryFilter::new().with_array_contains("tags", Value::String("java".to_string()));
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 0, "Should find no projects with 'java' tag");
+}
+
+#[tokio::test]
+async fn test_array_index_on_existing_documents() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "items";
+
+	// Create documents FIRST (before index exists)
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "A", "labels": ["hot", "new"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "B", "labels": ["hot", "sale"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "C", "labels": ["sale"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+
+	// NOW create index -- should backfill existing array values
+	adapter
+		.create_index(tn_id, db_id, path, "labels")
+		.await
+		.expect("Failed to create index");
+
+	// Query with arrayContains on backfilled index
+	let filter = QueryFilter::new().with_array_contains("labels", Value::String("hot".to_string()));
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 2, "Should find 2 items with 'hot' label (A, B)");
+
+	let filter =
+		QueryFilter::new().with_array_contains("labels", Value::String("sale".to_string()));
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 2, "Should find 2 items with 'sale' label (B, C)");
+
+	let filter = QueryFilter::new().with_array_contains("labels", Value::String("new".to_string()));
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 1, "Should find 1 item with 'new' label (A)");
+}
+
+#[tokio::test]
+async fn test_array_index_update_removes_old_entries() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "docs";
+
+	// Create index
+	adapter
+		.create_index(tn_id, db_id, path, "tags")
+		.await
+		.expect("Failed to create index");
+
+	// Create a document with tags
+	let doc_id = {
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		let id = tx
+			.create(path, json!({"name": "Doc1", "tags": ["alpha", "beta"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+		id
+	};
+
+	// Verify initial tags are indexed
+	let filter = QueryFilter::new().with_array_contains("tags", Value::String("alpha".to_string()));
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 1, "Should find doc with 'alpha' tag initially");
+
+	// Update the document: change tags from ["alpha", "beta"] to ["beta", "gamma"]
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		let update_path = format!("{}/{}", path, doc_id);
+		tx.update(&update_path, json!({"name": "Doc1", "tags": ["beta", "gamma"]}))
+			.await
+			.expect("Failed to update");
+		tx.commit().await.expect("Failed to commit");
+	}
+
+	// "alpha" should no longer match
+	let filter = QueryFilter::new().with_array_contains("tags", Value::String("alpha".to_string()));
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 0, "Should NOT find doc with 'alpha' tag after update");
+
+	// "beta" should still match (present in both old and new)
+	let filter = QueryFilter::new().with_array_contains("tags", Value::String("beta".to_string()));
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 1, "Should still find doc with 'beta' tag after update");
+
+	// "gamma" should now match (new element)
+	let filter = QueryFilter::new().with_array_contains("tags", Value::String("gamma".to_string()));
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 1, "Should find doc with 'gamma' tag after update");
+}
+
+#[tokio::test]
+async fn test_not_in_array_filter() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "users";
+
+	// Create test documents
+	for (name, role) in &[("Alice", "admin"), ("Bob", "user"), ("Charlie", "moderator")] {
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": name, "role": role}))
+			.await
+			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
+	}
+	// Create a document without a role field
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Diana"}))
+			.await
+			.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
+	}
+
+	// notInArray: exclude "admin" and "moderator"
+	let filter = QueryFilter::new().with_not_in_array(
+		"role",
+		vec![Value::String("admin".to_string()), Value::String("moderator".to_string())],
+	);
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	// Bob (user) and Diana (missing field) should pass
+	assert_eq!(results.len(), 2, "Should find Bob and Diana (missing field passes)");
+}
+
+#[tokio::test]
+async fn test_array_contains_any_filter() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "projects";
+
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Alpha", "tags": ["rust", "web"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Beta", "tags": ["python", "ml"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Gamma", "tags": ["go", "api"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+
+	// arrayContainsAny: find projects with "rust" or "python"
+	let filter = QueryFilter::new().with_array_contains_any(
+		"tags",
+		vec![Value::String("rust".to_string()), Value::String("python".to_string())],
+	);
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 2, "Should find Alpha (rust) and Beta (python)");
+
+	// arrayContainsAny: no match
+	let filter =
+		QueryFilter::new().with_array_contains_any("tags", vec![Value::String("java".to_string())]);
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 0, "Should find no projects with 'java'");
+}
+
+#[tokio::test]
+async fn test_array_contains_all_filter() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "projects";
+
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Alpha", "tags": ["rust", "web", "api"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Beta", "tags": ["rust", "cli"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Gamma", "tags": ["web", "api"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+
+	// arrayContainsAll: find projects with both "rust" and "web"
+	let filter = QueryFilter::new().with_array_contains_all(
+		"tags",
+		vec![Value::String("rust".to_string()), Value::String("web".to_string())],
+	);
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 1, "Only Alpha has both 'rust' and 'web'");
+	assert_eq!(results[0]["name"], "Alpha");
+
+	// arrayContainsAll: find projects with both "web" and "api"
+	let filter = QueryFilter::new().with_array_contains_all(
+		"tags",
+		vec![Value::String("web".to_string()), Value::String("api".to_string())],
+	);
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 2, "Alpha and Gamma both have 'web' and 'api'");
+}
+
+#[tokio::test]
+async fn test_array_contains_any_indexed() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "projects";
+
+	// Create index FIRST
+	adapter
+		.create_index(tn_id, db_id, path, "tags")
+		.await
+		.expect("Failed to create index");
+
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Alpha", "tags": ["rust", "web"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Beta", "tags": ["python", "ml"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Gamma", "tags": ["go", "api"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+
+	// arrayContainsAny with index: find projects with "rust" or "python"
+	let filter = QueryFilter::new().with_array_contains_any(
+		"tags",
+		vec![Value::String("rust".to_string()), Value::String("python".to_string())],
+	);
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 2, "Should find Alpha (rust) and Beta (python) via index");
+}
+
+#[tokio::test]
+async fn test_array_contains_all_indexed() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let path = "projects";
+
+	// Create index FIRST
+	adapter
+		.create_index(tn_id, db_id, path, "tags")
+		.await
+		.expect("Failed to create index");
+
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Alpha", "tags": ["rust", "web", "api"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Beta", "tags": ["rust", "cli"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(path, json!({"name": "Gamma", "tags": ["web", "api"]}))
+			.await
+			.expect("Failed to create");
+		tx.commit().await.expect("Failed to commit");
+	}
+
+	// arrayContainsAll with index: find projects with both "rust" and "web"
+	let filter = QueryFilter::new().with_array_contains_all(
+		"tags",
+		vec![Value::String("rust".to_string()), Value::String("web".to_string())],
+	);
+	let opts = QueryOptions::new().with_filter(filter);
+	let results = adapter.query(tn_id, db_id, path, opts).await.expect("Query failed");
+	assert_eq!(results.len(), 1, "Only Alpha has both 'rust' and 'web' (via index)");
+	assert_eq!(results[0]["name"], "Alpha");
+}

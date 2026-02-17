@@ -74,6 +74,18 @@ pub struct QueryFilter {
 	/// Array-contains constraints: field_name -> value that must be in the array field
 	#[serde(default, skip_serializing_if = "HashMap::is_empty", rename = "arrayContains")]
 	pub array_contains: HashMap<String, Value>,
+
+	/// Not-in-array constraints: field_name -> array of excluded values
+	#[serde(default, skip_serializing_if = "HashMap::is_empty", rename = "notInArray")]
+	pub not_in_array: HashMap<String, Vec<Value>>,
+
+	/// Array-contains-any constraints: field_name -> array of values (at least one must be in the array field)
+	#[serde(default, skip_serializing_if = "HashMap::is_empty", rename = "arrayContainsAny")]
+	pub array_contains_any: HashMap<String, Vec<Value>>,
+
+	/// Array-contains-all constraints: field_name -> array of values (all must be in the array field)
+	#[serde(default, skip_serializing_if = "HashMap::is_empty", rename = "arrayContainsAll")]
+	pub array_contains_all: HashMap<String, Vec<Value>>,
 }
 
 impl QueryFilter {
@@ -137,6 +149,24 @@ impl QueryFilter {
 		self
 	}
 
+	/// Add a not-in-array constraint to this filter (builder pattern).
+	pub fn with_not_in_array(mut self, field: impl Into<String>, values: Vec<Value>) -> Self {
+		self.not_in_array.insert(field.into(), values);
+		self
+	}
+
+	/// Add an array-contains-any constraint to this filter (builder pattern).
+	pub fn with_array_contains_any(mut self, field: impl Into<String>, values: Vec<Value>) -> Self {
+		self.array_contains_any.insert(field.into(), values);
+		self
+	}
+
+	/// Add an array-contains-all constraint to this filter (builder pattern).
+	pub fn with_array_contains_all(mut self, field: impl Into<String>, values: Vec<Value>) -> Self {
+		self.array_contains_all.insert(field.into(), values);
+		self
+	}
+
 	/// Check if this filter is empty (matches all documents).
 	pub fn is_empty(&self) -> bool {
 		self.equals.is_empty()
@@ -147,6 +177,9 @@ impl QueryFilter {
 			&& self.less_than_or_equal.is_empty()
 			&& self.in_array.is_empty()
 			&& self.array_contains.is_empty()
+			&& self.not_in_array.is_empty()
+			&& self.array_contains_any.is_empty()
+			&& self.array_contains_all.is_empty()
 	}
 }
 

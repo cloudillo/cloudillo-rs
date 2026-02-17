@@ -59,21 +59,27 @@ impl RedbTransaction {
 		}
 	}
 
-	/// Build an index key
-	fn build_index_key(
+	/// Build index keys for a field value, expanding arrays into per-element entries
+	fn build_index_keys(
 		&self,
 		collection: &str,
 		field: &str,
 		value: &Value,
 		doc_id: &str,
-	) -> String {
-		let value_str = storage::value_to_string(value);
-
-		if self.per_tenant_files {
-			format!("{}/_idx/{}/{}/{}", collection, field, value_str, doc_id)
-		} else {
-			format!("{}/{}/_idx/{}/{}/{}", self.tn_id.0, collection, field, value_str, doc_id)
-		}
+	) -> Vec<String> {
+		storage::values_to_index_strings(value)
+			.into_iter()
+			.map(|value_str| {
+				if self.per_tenant_files {
+					format!("{}/_idx/{}/{}/{}", collection, field, value_str, doc_id)
+				} else {
+					format!(
+						"{}/{}/_idx/{}/{}/{}",
+						self.tn_id.0, collection, field, value_str, doc_id
+					)
+				}
+			})
+			.collect()
 	}
 
 	/// Update indexes for a document
@@ -99,8 +105,8 @@ impl RedbTransaction {
 		let mut index_keys = Vec::new();
 		for field in fields.iter() {
 			if let Some(value) = data.get(field.as_ref()) {
-				let index_key = self.build_index_key(collection, field, value, doc_id);
-				index_keys.push(index_key);
+				let keys = self.build_index_keys(collection, field, value, doc_id);
+				index_keys.extend(keys);
 			}
 		}
 

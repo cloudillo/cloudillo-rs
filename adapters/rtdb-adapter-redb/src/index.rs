@@ -88,15 +88,14 @@ pub async fn create_index_impl(
 
 			if let Some(field_value) = doc.get(field) {
 				let doc_id = remainder.to_string();
-				let index_key = if per_tenant_files {
-					let value_str = storage::value_to_string(field_value);
-					format!("{}/_idx/{}/{}/{}", path, field, value_str, doc_id)
-				} else {
-					let value_str = storage::value_to_string(field_value);
-					format!("{}/{}/_idx/{}/{}/{}", tn_id.0, path, field, value_str, doc_id)
-				};
-
-				index_table.insert(index_key.as_str(), "").map_err(from_redb_error)?;
+				for value_str in storage::values_to_index_strings(field_value) {
+					let index_key = if per_tenant_files {
+						format!("{}/_idx/{}/{}/{}", path, field, value_str, doc_id)
+					} else {
+						format!("{}/{}/_idx/{}/{}/{}", tn_id.0, path, field, value_str, doc_id)
+					};
+					index_table.insert(index_key.as_str(), "").map_err(from_redb_error)?;
+				}
 			}
 		}
 	}

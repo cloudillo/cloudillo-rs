@@ -171,6 +171,57 @@ fn test_matches_filter() {
 	};
 	assert!(!matches_filter(&doc, &filter));
 
+	// Test not-in-array
+	let filter =
+		QueryFilter::new().with_not_in_array("role", vec![Value::String("manager".to_string())]);
+	assert!(matches_filter(&doc, &filter), "role 'developer' is not in ['manager']");
+
+	let filter = QueryFilter::new().with_not_in_array(
+		"role",
+		vec![Value::String("developer".to_string()), Value::String("admin".to_string())],
+	);
+	assert!(!matches_filter(&doc, &filter), "role 'developer' IS in ['developer','admin']");
+
+	// Not-in-array with missing field should pass
+	let filter = QueryFilter::new()
+		.with_not_in_array("missing_field", vec![Value::String("anything".to_string())]);
+	assert!(matches_filter(&doc, &filter), "missing field should pass notInArray");
+
+	// Test array-contains-any
+	let filter = QueryFilter::new().with_array_contains_any(
+		"tags",
+		vec![Value::String("admin".to_string()), Value::String("guest".to_string())],
+	);
+	assert!(matches_filter(&doc, &filter), "tags has 'admin' from ['admin','guest']");
+
+	let filter = QueryFilter::new().with_array_contains_any(
+		"tags",
+		vec![Value::String("guest".to_string()), Value::String("moderator".to_string())],
+	);
+	assert!(!matches_filter(&doc, &filter), "tags has neither 'guest' nor 'moderator'");
+
+	// Array-contains-any with non-array field should fail
+	let filter = QueryFilter::new()
+		.with_array_contains_any("name", vec![Value::String("Alice".to_string())]);
+	assert!(!matches_filter(&doc, &filter), "name is not an array");
+
+	// Test array-contains-all
+	let filter = QueryFilter::new().with_array_contains_all(
+		"tags",
+		vec![Value::String("admin".to_string()), Value::String("user".to_string())],
+	);
+	assert!(matches_filter(&doc, &filter), "tags has both 'admin' and 'user'");
+
+	let filter = QueryFilter::new().with_array_contains_all(
+		"tags",
+		vec![Value::String("admin".to_string()), Value::String("guest".to_string())],
+	);
+	assert!(!matches_filter(&doc, &filter), "tags does not have 'guest'");
+
+	// Array-contains-all with empty required list should pass (vacuously true)
+	let filter = QueryFilter::new().with_array_contains_all("tags", vec![]);
+	assert!(matches_filter(&doc, &filter), "empty required list is vacuously true");
+
 	// Test multiple conditions (AND logic)
 	let filter = QueryFilter {
 		equals: [("name".to_string(), Value::String("Alice".to_string()))]
@@ -208,4 +259,41 @@ fn test_compare_values() {
 	assert_eq!(compare_values(None, None), Ordering::Equal);
 	assert_eq!(compare_values(None, Some(&Value::Number(1.into()))), Ordering::Less);
 	assert_eq!(compare_values(Some(&Value::Number(1.into())), None), Ordering::Greater);
+}
+
+#[test]
+fn test_values_to_index_strings_scalar() {
+	let result = values_to_index_strings(&Value::String("hello".to_string()));
+	assert_eq!(result, vec!["hello"]);
+
+	let result = values_to_index_strings(&Value::Number(42.into()));
+	assert_eq!(result, vec!["42"]);
+
+	let result = values_to_index_strings(&Value::Bool(true));
+	assert_eq!(result, vec!["true"]);
+
+	let result = values_to_index_strings(&Value::Null);
+	assert_eq!(result, vec!["null"]);
+}
+
+#[test]
+fn test_values_to_index_strings_array() {
+	let val = serde_json::json!(["rust", "web", "api"]);
+	let result = values_to_index_strings(&val);
+	assert_eq!(result, vec!["rust", "web", "api"]);
+}
+
+#[test]
+fn test_values_to_index_strings_empty_array() {
+	let val = serde_json::json!([]);
+	let result = values_to_index_strings(&val);
+	assert!(result.is_empty(), "Empty array should produce no index strings");
+}
+
+#[test]
+fn test_values_to_index_strings_mixed_array_with_nested() {
+	// Nested arrays and objects should be skipped
+	let val = serde_json::json!(["rust", 42, true, [1, 2], {"key": "val"}, "web"]);
+	let result = values_to_index_strings(&val);
+	assert_eq!(result, vec!["rust", "42", "true", "web"]);
 }

@@ -4,6 +4,7 @@ use cloudillo::rtdb_adapter::{QueryFilter, QueryOptions, SortField};
 use cloudillo::types::TnId;
 use serde_json::Value;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Query context grouping related parameters
@@ -110,6 +111,27 @@ fn try_index_query(
 		}
 	}
 
+	// Check if any arrayContains field is indexed
+	for (field, value) in &ctx.filter.array_contains {
+		if indexed.iter().any(|f| f.as_ref() == field.as_str()) {
+			return Ok(Some(execute_index_query(tx, ctx, field, value)?));
+		}
+	}
+
+	// Check if any arrayContainsAny field is indexed
+	for (field, values) in &ctx.filter.array_contains_any {
+		if indexed.iter().any(|f| f.as_ref() == field.as_str()) {
+			return Ok(Some(execute_index_query_any(tx, ctx, field, values)?));
+		}
+	}
+
+	// Check if any arrayContainsAll field is indexed (use first value for index scan)
+	for (field, values) in &ctx.filter.array_contains_all {
+		if !values.is_empty() && indexed.iter().any(|f| f.as_ref() == field.as_str()) {
+			return Ok(Some(execute_index_query(tx, ctx, field, &values[0])?));
+		}
+	}
+
 	Ok(None)
 }
 
@@ -161,6 +183,65 @@ fn execute_index_query(
 			// Apply full filter
 			if storage::matches_filter(&doc, ctx.filter) {
 				results.push(doc);
+			}
+		}
+	}
+
+	Ok(results)
+}
+
+/// Execute a query using an index, scanning for any of several values and deduplicating results
+fn execute_index_query_any(
+	tx: &redb::ReadTransaction,
+	ctx: &QueryContext,
+	field: &str,
+	values: &[Value],
+) -> ClResult<Vec<Value>> {
+	use crate::error::from_redb_error;
+
+	let index_table = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
+	let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+
+	let mut seen_ids = HashSet::new();
+	let mut results = Vec::new();
+
+	for value in values {
+		let value_str = storage::value_to_string(value);
+		let index_prefix = if ctx.per_tenant_files {
+			format!("{}/_idx/{}/{}/", ctx.path, field, value_str)
+		} else {
+			format!("{}/{}/_idx/{}/{}/", ctx.tn_id.0, ctx.path, field, value_str)
+		};
+
+		let range = index_table.range(index_prefix.as_str()..).map_err(from_redb_error)?;
+
+		for item in range {
+			let (key, _) = item.map_err(from_redb_error)?;
+			let key_str = key.value();
+
+			if !key_str.starts_with(&index_prefix) {
+				break;
+			}
+
+			let doc_id = extract_doc_id_from_index_key(key_str);
+
+			if !seen_ids.insert(doc_id.clone()) {
+				continue;
+			}
+
+			let doc_key = if ctx.per_tenant_files {
+				format!("{}/{}/{}", ctx.db_id, ctx.path, doc_id)
+			} else {
+				format!("{}/{}/{}/{}", ctx.tn_id.0, ctx.db_id, ctx.path, doc_id)
+			};
+
+			if let Some(json) = doc_table.get(doc_key.as_str()).map_err(from_redb_error)? {
+				let mut doc: Value = serde_json::from_str(json.value())?;
+				storage::inject_doc_id(&mut doc, &doc_id);
+
+				if storage::matches_filter(&doc, ctx.filter) {
+					results.push(doc);
+				}
 			}
 		}
 	}
