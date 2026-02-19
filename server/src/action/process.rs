@@ -737,6 +737,7 @@ async fn forward_inbound_action_to_websocket(
 		sub_type: subtype.as_deref(),
 		content: action.c.as_ref(),
 		attachments: attachments.as_deref(),
+		status: None,
 	};
 
 	let result = forward::forward_inbound_action(app, tn_id, &params).await;

@@ -125,6 +125,22 @@ impl DslEngine {
 		self.definitions.contains_key(action_type)
 	}
 
+	/// Resolve action type for hook lookup.
+	/// Tries full type (typ:sub_typ) first, then falls back to base type.
+	pub fn resolve_action_type(&self, typ: &str, sub_typ: Option<&str>) -> Option<String> {
+		if let Some(st) = sub_typ {
+			let full = format!("{}:{}", typ, st);
+			if self.definitions.contains_key(&full) {
+				return Some(full);
+			}
+		}
+		if self.definitions.contains_key(typ) {
+			Some(typ.to_string())
+		} else {
+			None
+		}
+	}
+
 	/// Execute a hook for an action type
 	pub async fn execute_hook(
 		&self,

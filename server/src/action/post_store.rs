@@ -124,9 +124,11 @@ async fn execute_hook(
 	action: &meta_adapter::Action<Box<str>>,
 	ctx: &ProcessingContext,
 ) -> ClResult<Option<serde_json::Value>> {
-	if !app.dsl_engine.has_definition(&action.typ) {
+	let Some(resolved_type) =
+		app.dsl_engine.resolve_action_type(&action.typ, action.sub_typ.as_deref())
+	else {
 		return Ok(None);
-	}
+	};
 
 	// Use the separate sub_typ field if available, otherwise try to extract from combined type string
 	let (action_type, subtype) = if action.sub_typ.is_some() {
@@ -165,7 +167,7 @@ async fn execute_hook(
 	if is_sync {
 		match app
 			.dsl_engine
-			.execute_hook_with_result(app, &action.typ, hook_type, hook_context)
+			.execute_hook_with_result(app, &resolved_type, hook_type, hook_context)
 			.await
 		{
 			Ok(result) => Ok(result.return_value),
@@ -181,7 +183,8 @@ async fn execute_hook(
 			}
 		}
 	} else {
-		if let Err(e) = app.dsl_engine.execute_hook(app, &action.typ, hook_type, hook_context).await
+		if let Err(e) =
+			app.dsl_engine.execute_hook(app, &resolved_type, hook_type, hook_context).await
 		{
 			warn!(
 				action_id = %action.action_id,
@@ -207,6 +210,10 @@ async fn forward_to_websocket(
 	let content_parsed: Option<serde_json::Value> =
 		action.content.as_ref().and_then(|s| serde_json::from_str(s).ok());
 
+	// Query current status (hooks may have set it)
+	let action_view = app.meta_adapter.get_action(tn_id, &action.action_id).await.ok().flatten();
+	let status_str: Option<String> = action_view.and_then(|a| a.status.map(|s| s.to_string()));
+
 	let params = ForwardActionParams {
 		action_id: &action.action_id,
 		temp_id: ctx.temp_id(),
@@ -216,6 +223,7 @@ async fn forward_to_websocket(
 		sub_type: action.sub_typ.as_deref(),
 		content: content_parsed.as_ref(),
 		attachments: attachment_views,
+		status: status_str.as_deref(),
 	};
 
 	debug!(

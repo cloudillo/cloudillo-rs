@@ -294,7 +294,9 @@ pub async fn post_action_accept(
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
 	// Execute DSL on_accept hook if action type has one
-	if app.dsl_engine.has_definition(&action.typ) {
+	if let Some(resolved_type) =
+		app.dsl_engine.resolve_action_type(&action.typ, action.sub_typ.as_deref())
+	{
 		use crate::action::hooks::{HookContext, HookType};
 
 		let hook_context = HookContext::builder()
@@ -320,7 +322,7 @@ pub async fn post_action_accept(
 
 		if let Err(e) = app
 			.dsl_engine
-			.execute_hook(&app, &action.typ, HookType::OnAccept, hook_context)
+			.execute_hook(&app, &resolved_type, HookType::OnAccept, hook_context)
 			.await
 		{
 			warn!(
@@ -406,7 +408,9 @@ pub async fn post_action_reject(
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
 	// Execute DSL on_reject hook if action type has one
-	if app.dsl_engine.has_definition(&action.typ) {
+	if let Some(resolved_type) =
+		app.dsl_engine.resolve_action_type(&action.typ, action.sub_typ.as_deref())
+	{
 		use crate::action::hooks::{HookContext, HookType};
 
 		let hook_context = HookContext::builder()
@@ -432,7 +436,7 @@ pub async fn post_action_reject(
 
 		if let Err(e) = app
 			.dsl_engine
-			.execute_hook(&app, &action.typ, HookType::OnReject, hook_context)
+			.execute_hook(&app, &resolved_type, HookType::OnReject, hook_context)
 			.await
 		{
 			warn!(

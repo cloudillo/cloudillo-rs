@@ -35,6 +35,7 @@ pub struct ForwardActionParams<'a> {
 	pub sub_type: Option<&'a str>,
 	pub content: Option<&'a serde_json::Value>,
 	pub attachments: Option<&'a [AttachmentView]>,
+	pub status: Option<&'a str>,
 }
 
 /// Forward an action to WebSocket clients
@@ -122,6 +123,7 @@ fn build_action_message(params: &ForwardActionParams<'_>) -> BroadcastMessage {
 			"audience": params.audience_tag.map(|a| json!({"idTag": a})),
 			"content": params.content,
 			"attachments": params.attachments,
+			"status": params.status,
 		}),
 		"system",
 	)

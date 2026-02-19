@@ -315,6 +315,7 @@ async fn create_ephemeral_action(
 		sub_type: action.sub_typ.as_deref(),
 		content: action.content.as_ref(),
 		attachments: None,
+		status: None,
 	};
 	let _result = forward::forward_outbound_action(app, tn_id, &params).await;
 
@@ -623,9 +624,12 @@ async fn execute_on_create_hook(
 	attachments: &Option<Vec<Box<str>>>,
 	subject: &Option<Box<str>>,
 ) {
-	if !app.dsl_engine.has_definition(action.typ.as_ref()) {
+	let Some(resolved_type) = app
+		.dsl_engine
+		.resolve_action_type(action.typ.as_ref(), action.sub_typ.as_deref())
+	else {
 		return;
-	}
+	};
 
 	use crate::action::hooks::{HookContext, HookType};
 
@@ -647,7 +651,7 @@ async fn execute_on_create_hook(
 
 	if let Err(e) = app
 		.dsl_engine
-		.execute_hook(app, action.typ.as_ref(), HookType::OnCreate, hook_context)
+		.execute_hook(app, &resolved_type, HookType::OnCreate, hook_context)
 		.await
 	{
 		warn!(
@@ -683,6 +687,7 @@ async fn forward_action_to_websocket(
 		sub_type: action.sub_typ.as_deref(),
 		content: action.content.as_ref(),
 		attachments,
+		status: None,
 	};
 
 	let result = forward::forward_outbound_action(app, tn_id, &params).await;
