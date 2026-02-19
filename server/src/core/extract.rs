@@ -67,7 +67,6 @@ where
 	type Rejection = Error;
 
 	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-		info!("Auth extractor: {:?}", &parts.extensions.get::<Auth>());
 		if let Some(auth) = parts.extensions.get::<Auth>().cloned() {
 			Ok(auth)
 		} else {
