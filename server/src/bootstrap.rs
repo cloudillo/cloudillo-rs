@@ -151,21 +151,18 @@ pub async fn create_complete_tenant(
 
 	info!(display_name = %display_name, "Tenant display name set");
 
-	// Create ACME certificate if requested
+	// Create ACME certificate if requested (non-fatal — CertRenewalTask handles retries)
 	if opts.create_acme_cert {
 		if let Some(acme_email) = opts.acme_email {
 			info!("Creating ACME certificate for tenant");
-			acme::init(app.clone(), acme_email, opts.id_tag, opts.app_domain)
-				.await
-				.map_err(|e| {
-					warn!(
-						error = %e,
-						id_tag = %opts.id_tag,
-						"Failed to create ACME certificate"
-					);
-					e
-				})?;
-			info!("ACME certificate created successfully");
+			match acme::init(app.clone(), acme_email, opts.id_tag, opts.app_domain).await {
+				Ok(()) => info!("ACME certificate created successfully"),
+				Err(e) => warn!(
+					error = %e,
+					id_tag = %opts.id_tag,
+					"Failed to create ACME certificate, will retry via CertRenewalTask"
+				),
+			}
 		} else {
 			warn!("ACME cert requested but no ACME email provided");
 		}
@@ -233,135 +230,129 @@ pub async fn bootstrap(
 				return Err(e);
 			}
 			Ok(_) => {
-				if let Some(acme_email) = opts.acme_email.as_ref() {
-					// Base tenant exists, schedule certificate renewal if ACME is configured
-					// Schedule hourly certificate renewal task
-					info!("Scheduling automatic certificate renewal task (runs hourly)");
+				// Base tenant already exists, nothing to do
+			}
+		}
 
-					// TODO: Make renewal_days configurable via admin settings, default 30 days
-					let renewal_days = 30;
+		// Always schedule cert renewal when ACME is configured
+		// (both fresh bootstrap and restart)
+		if let Some(acme_email) = opts.acme_email.as_ref() {
+			info!("Scheduling automatic certificate renewal task (runs daily)");
 
-					let renewal_task =
-						Arc::new(acme::CertRenewalTask::new(acme_email.to_string(), renewal_days));
+			// TODO: Make renewal_days configurable via admin settings, default 30 days
+			let renewal_days = 30;
 
-					// Schedule to run every hour at minute 0 using cron with a unique key for deduplication
-					let app_clone = app.clone();
-					let acme_email = acme_email.clone();
-					tokio::spawn(async move {
-						match app_clone
+			let renewal_task =
+				Arc::new(acme::CertRenewalTask::new(acme_email.to_string(), renewal_days));
+
+			let app_clone = app.clone();
+			let acme_email = acme_email.clone();
+			tokio::spawn(async move {
+				match app_clone
 					.scheduler
 					.task(renewal_task)
 					.key("acme.cert_renewal") // Unique key prevents duplicates on restart
 					.cron("0 0 * * *") // Every day
 					.schedule()
 					.await
-						{
-							Ok(task_id) => {
-								info!("Certificate renewal task scheduled (task_id={})", task_id);
-							}
-							Err(e) => {
-								error!(error = %e, "Failed to schedule certificate renewal task");
-							}
-						}
-
-						// Also run renewal check immediately on startup in background
-						info!("Running initial certificate check on startup...");
-						match app_clone
-							.auth_adapter
-							.list_tenants_needing_cert_renewal(renewal_days)
-							.await
-						{
-							Ok(tenants) => {
-								if tenants.is_empty() {
-									info!("All tenant certificates are valid");
-								} else {
-									info!(
-										"Found {} tenant(s) needing certificate renewal",
-										tenants.len()
-									);
-
-									for (tn_id, id_tag) in tenants {
-										info!(
-											"Renewing certificate for tenant: {} (tn_id={})",
-											id_tag, tn_id.0
-										);
-
-										let app_domain = if tn_id.0 == 1 {
-											// TODO: Get from configuration
-											None
-										} else {
-											None
-										};
-
-										match acme::init(
-											app_clone.clone(),
-											&acme_email,
-											&id_tag,
-											app_domain,
-										)
-										.await
-										{
-											Ok(_) => {
-												info!(tenant = %id_tag, "Certificate renewed successfully");
-											}
-											Err(e) => {
-												error!(tenant = %id_tag, error = %e, "Failed to renew certificate");
-											}
-										}
-									}
-								}
-							}
-							Err(e) => {
-								warn!(error = %e, "Failed to check certificates on startup");
-							}
-						}
-
-						// Check proxy site certificates on startup
-						match app_clone
-							.auth_adapter
-							.list_proxy_sites_needing_cert_renewal(renewal_days)
-							.await
-						{
-							Ok(sites) => {
-								if sites.is_empty() {
-									info!("All proxy site certificates are valid");
-								} else {
-									info!(
-										"Found {} proxy site(s) needing certificate renewal",
-										sites.len()
-									);
-
-									for site in sites {
-										info!(
-											"Renewing certificate for proxy site: {} (site_id={})",
-											site.domain, site.site_id
-										);
-
-										if let Err(e) = acme::renew_proxy_site_cert(
-											&app_clone,
-											site.site_id,
-											&site.domain,
-										)
-										.await
-										{
-											error!(
-												domain = %site.domain,
-												error = %e,
-												"Failed to renew proxy site certificate"
-											);
-										}
-									}
-								}
-							}
-							Err(e) => {
-								warn!(error = %e, "Failed to check proxy site certificates on startup");
-							}
-						}
-					});
-				} else {
-					info!("ACME not configured (no ACME_EMAIL), skipping certificate check");
+				{
+					Ok(task_id) => {
+						info!("Certificate renewal task scheduled (task_id={})", task_id);
+					}
+					Err(e) => {
+						error!(error = %e, "Failed to schedule certificate renewal task");
+					}
 				}
-			}
+
+				// Also run renewal check immediately on startup in background
+				info!("Running initial certificate check on startup...");
+				match app_clone.auth_adapter.list_tenants_needing_cert_renewal(renewal_days).await {
+					Ok(tenants) => {
+						if tenants.is_empty() {
+							info!("All tenant certificates are valid");
+						} else {
+							info!("Found {} tenant(s) needing certificate renewal", tenants.len());
+
+							for (tn_id, id_tag) in tenants {
+								info!(
+									"Renewing certificate for tenant: {} (tn_id={})",
+									id_tag, tn_id.0
+								);
+
+								let app_domain = if tn_id.0 == 1 {
+									// TODO: Get from configuration
+									None
+								} else {
+									None
+								};
+
+								match acme::init(
+									app_clone.clone(),
+									&acme_email,
+									&id_tag,
+									app_domain,
+								)
+								.await
+								{
+									Ok(_) => {
+										info!(tenant = %id_tag, "Certificate renewed successfully");
+									}
+									Err(e) => {
+										error!(tenant = %id_tag, error = %e, "Failed to renew certificate");
+									}
+								}
+							}
+						}
+					}
+					Err(e) => {
+						warn!(error = %e, "Failed to check certificates on startup");
+					}
+				}
+
+				// Check proxy site certificates on startup
+				match app_clone
+					.auth_adapter
+					.list_proxy_sites_needing_cert_renewal(renewal_days)
+					.await
+				{
+					Ok(sites) => {
+						if sites.is_empty() {
+							info!("All proxy site certificates are valid");
+						} else {
+							info!(
+								"Found {} proxy site(s) needing certificate renewal",
+								sites.len()
+							);
+
+							for site in sites {
+								info!(
+									"Renewing certificate for proxy site: {} (site_id={})",
+									site.domain, site.site_id
+								);
+
+								if let Err(e) = acme::renew_proxy_site_cert(
+									&app_clone,
+									site.site_id,
+									&site.domain,
+								)
+								.await
+								{
+									error!(
+										domain = %site.domain,
+										error = %e,
+										"Failed to renew proxy site certificate"
+									);
+								}
+							}
+						}
+					}
+					Err(e) => {
+						warn!(error = %e, "Failed to check proxy site certificates on startup");
+					}
+				}
+			});
+		} else {
+			info!("ACME not configured (no ACME_EMAIL), skipping certificate check");
 		}
 	}
 
