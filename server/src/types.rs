@@ -302,12 +302,6 @@ pub struct AdminProfilePatch {
 	pub roles: Patch<Option<Vec<String>>>,
 	#[serde(default)]
 	pub status: Patch<crate::meta_adapter::ProfileStatus>,
-
-	// Ban metadata (only when status is set to Banned/Suspended/Muted)
-	#[serde(default)]
-	pub ban_expires_at: Patch<Option<Timestamp>>,
-	#[serde(default)]
-	pub ban_reason: Patch<Option<String>>,
 }
 
 /// Profile information response
@@ -323,6 +317,7 @@ pub struct ProfileInfo {
 	pub status: Option<String>,
 	pub connected: Option<bool>,
 	pub following: Option<bool>,
+	pub roles: Option<Vec<String>>,
 	#[serde(
 		serialize_with = "serialize_timestamp_iso_opt",
 		skip_serializing_if = "Option::is_none"
@@ -339,7 +334,7 @@ pub struct CreateCommunityRequest {
 	pub name: Option<String>,
 	pub profile_pic: Option<String>,
 	pub app_domain: Option<String>, // For domain type
-	                                // No token field - community creation requires authentication instead
+	pub invite_ref: Option<String>, // Invite ref code for community creation
 }
 
 /// Response for community profile creation

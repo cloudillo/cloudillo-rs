@@ -23,26 +23,51 @@ pub enum FileAccessError {
 	InternalError(String),
 }
 
+/// Context describing the subject requesting file access
+pub struct FileAccessCtx<'a> {
+	pub user_id_tag: &'a str,
+	pub tenant_id_tag: &'a str,
+	pub user_roles: &'a [Box<str>],
+}
+
 /// Get access level for a user on a file
 ///
 /// Determines access level based on:
 /// 1. Ownership - owner has Write access
-/// 2. FSHR action - WRITE subtype grants Write, other subtypes grant Read
-/// 3. No FSHR action - returns None (no access)
+/// 2. Role-based access - for tenant-owned files (no explicit owner), community
+///    roles determine access: leader/moderator/contributor → Write, any role → Read
+/// 3. FSHR action - WRITE subtype grants Write, other subtypes grant Read
+/// 4. No access - returns None
 pub async fn get_access_level(
 	app: &App,
 	tn_id: TnId,
 	file_id: &str,
-	user_id_tag: &str,
 	owner_id_tag: &str,
+	ctx: &FileAccessCtx<'_>,
 ) -> AccessLevel {
 	// Owner always has write access
-	if user_id_tag == owner_id_tag {
+	if ctx.user_id_tag == owner_id_tag {
 		return AccessLevel::Write;
 	}
 
+	// Role-based access for tenant-owned files only (owner_id_tag == tenant_id_tag)
+	// When a file has no explicit owner, it belongs to the tenant.
+	// Community members with roles get access based on their role level.
+	// Files owned by other users are NOT accessible via role-based access.
+	if owner_id_tag == ctx.tenant_id_tag && !ctx.user_roles.is_empty() {
+		if ctx
+			.user_roles
+			.iter()
+			.any(|r| matches!(r.as_ref(), "leader" | "moderator" | "contributor"))
+		{
+			return AccessLevel::Write;
+		}
+		// Any authenticated role on this tenant → at least Read
+		return AccessLevel::Read;
+	}
+
 	// Look up FSHR action: key pattern is "FSHR:{file_id}:{audience}"
-	let action_key = format!("FSHR:{}:{}", file_id, user_id_tag);
+	let action_key = format!("FSHR:{}:{}", file_id, ctx.user_id_tag);
 
 	match app.meta_adapter.get_action_by_key(tn_id, &action_key).await {
 		Ok(Some(action)) => {
@@ -74,8 +99,8 @@ pub async fn get_access_level_with_scope(
 	app: &App,
 	tn_id: TnId,
 	file_id: &str,
-	user_id_tag: &str,
 	owner_id_tag: &str,
+	ctx: &FileAccessCtx<'_>,
 	scope: Option<&str>,
 ) -> AccessLevel {
 	// Check scope-based access first (for share links)
@@ -97,8 +122,8 @@ pub async fn get_access_level_with_scope(
 		// Non-file scope or parse failure, fall through to normal access check
 	}
 
-	// Fall back to existing logic (ownership, FSHR actions)
-	get_access_level(app, tn_id, file_id, user_id_tag, owner_id_tag).await
+	// Fall back to existing logic (ownership, roles, FSHR actions)
+	get_access_level(app, tn_id, file_id, owner_id_tag, ctx).await
 }
 
 /// Check file access and return file view with access level
@@ -113,8 +138,7 @@ pub async fn check_file_access_with_scope(
 	app: &App,
 	tn_id: TnId,
 	file_id: &str,
-	user_id_tag: &str,
-	tenant_id_tag: &str,
+	ctx: &FileAccessCtx<'_>,
 	scope: Option<&str>,
 ) -> Result<FileAccessResult, FileAccessError> {
 	use tracing::debug;
@@ -132,13 +156,13 @@ pub async fn check_file_access_with_scope(
 		.owner
 		.as_ref()
 		.and_then(|p| if p.id_tag.is_empty() { None } else { Some(p.id_tag.as_ref()) })
-		.unwrap_or(tenant_id_tag);
+		.unwrap_or(ctx.tenant_id_tag);
 
-	debug!(file_id = file_id, user = user_id_tag, owner = owner_id_tag, scope = ?scope, "Checking file access");
+	debug!(file_id = file_id, user = ctx.user_id_tag, owner = owner_id_tag, scope = ?scope, "Checking file access");
 
 	// Get access level (considering scope for share links)
 	let access_level =
-		get_access_level_with_scope(app, tn_id, file_id, user_id_tag, owner_id_tag, scope).await;
+		get_access_level_with_scope(app, tn_id, file_id, owner_id_tag, ctx, scope).await;
 
 	if access_level == AccessLevel::None {
 		return Err(FileAccessError::AccessDenied);

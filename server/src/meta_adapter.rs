@@ -25,11 +25,17 @@ pub enum ProfileType {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ProfileStatus {
+	#[serde(rename = "A")]
 	Active,
+	#[serde(rename = "T")]
 	Trusted,
+	#[serde(rename = "B")]
 	Blocked,
+	#[serde(rename = "M")]
 	Muted,
+	#[serde(rename = "S")]
 	Suspended,
+	#[serde(rename = "X")]
 	Banned,
 }
 
@@ -158,6 +164,7 @@ pub struct Profile<S: AsRef<str>> {
 	pub profile_pic: Option<S>,
 	pub following: bool,
 	pub connected: ProfileConnectionStatus,
+	pub roles: Option<Box<[Box<str>]>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -206,12 +213,6 @@ pub struct UpdateProfileData {
 	// Status and moderation
 	#[serde(default)]
 	pub status: Patch<ProfileStatus>,
-	#[serde(default, rename = "banExpiresAt")]
-	pub ban_expires_at: Patch<Option<Timestamp>>,
-	#[serde(default, rename = "banReason")]
-	pub ban_reason: Patch<Option<Box<str>>>,
-	#[serde(default, rename = "bannedBy")]
-	pub banned_by: Patch<Option<Box<str>>>,
 
 	// Relationship fields
 	#[serde(default)]
@@ -432,6 +433,7 @@ pub struct FileView {
 	pub file_id: Box<str>,
 	pub parent_id: Option<Box<str>>, // Parent folder file_id (None = root)
 	pub owner: Option<ProfileInfo>,
+	pub creator: Option<ProfileInfo>,
 	pub preset: Option<Box<str>>,
 	pub content_type: Option<Box<str>>,
 	pub file_name: Box<str>,
@@ -546,7 +548,8 @@ pub struct CreateFile {
 	pub orig_variant_id: Option<Box<str>>,
 	pub file_id: Option<Box<str>>,
 	pub parent_id: Option<Box<str>>, // Parent folder file_id (None = root)
-	pub owner_tag: Option<Box<str>>,
+	pub owner_tag: Option<Box<str>>, // Set only for files owned by someone OTHER than the tenant (e.g., shared files)
+	pub creator_tag: Option<Box<str>>, // The user who actually created the file
 	pub preset: Option<Box<str>>,
 	pub content_type: Box<str>,
 	pub file_name: Box<str>,

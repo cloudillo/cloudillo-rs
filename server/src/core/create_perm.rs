@@ -45,6 +45,19 @@ async fn check_create_permission(
 ) -> Result<Response, Error> {
 	use tracing::warn;
 
+	// Check if user has a role that allows content creation
+	// Minimum role for creating content: "contributor"
+	if !auth_ctx.roles.iter().any(|r| r.as_ref() == "contributor") {
+		warn!(
+			subject = %auth_ctx.id_tag,
+			resource_type = resource_type,
+			action = action,
+			roles = ?auth_ctx.roles,
+			"CREATE permission denied: requires at least 'contributor' role"
+		);
+		return Err(Error::PermissionDenied);
+	}
+
 	// Load subject attributes
 	let subject_attrs = load_subject_attrs(&app, &auth_ctx).await?;
 
@@ -118,7 +131,7 @@ async fn load_subject_attrs(
 	};
 
 	// Determine user tier based on roles
-	let tier: Box<str> = if auth_ctx.roles.iter().any(|r| r.as_ref() == "admin") {
+	let tier: Box<str> = if auth_ctx.roles.iter().any(|r| r.as_ref() == "leader") {
 		"premium".into()
 	} else if auth_ctx.roles.iter().any(|r| r.as_ref() == "creator") {
 		"standard".into()

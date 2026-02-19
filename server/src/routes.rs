@@ -87,6 +87,8 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/admin/proxy-sites/{site_id}", patch(proxy::admin::update_proxy_site))
 		.route("/api/admin/proxy-sites/{site_id}", delete(proxy::admin::delete_proxy_site))
 		.route("/api/admin/proxy-sites/{site_id}/renew-cert", post(proxy::admin::trigger_cert_renewal))
+		// Community invite management
+		.route("/api/admin/invite-community", post(admin::invite::post_invite_community))
 		.layer(middleware::from_fn_with_state(app.clone(), admin::perm::require_admin));
 
 	// File create routes (check_perm_create for quota/tier checking)

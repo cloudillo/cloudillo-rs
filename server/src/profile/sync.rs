@@ -85,6 +85,7 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 				profile_pic: synced_profile_pic,
 				following: false, // Will be set by the calling hook
 				connected: ProfileConnectionStatus::Disconnected,
+				roles: None,
 			};
 
 			// Generate a simple etag

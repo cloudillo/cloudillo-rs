@@ -133,12 +133,12 @@ pub async fn get_file_list(
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<meta_adapter::FileView>>>)> {
 	// Set user_id_tag for user-specific data (pinned, starred, sorting by recent/modified)
-	let (subject_id_tag, is_authenticated) = match &maybe_auth {
+	let (subject_id_tag, is_authenticated, subject_roles) = match &maybe_auth {
 		Some(auth) => {
 			opts.user_id_tag = Some(auth.id_tag.to_string());
-			(auth.id_tag.as_ref(), true)
+			(auth.id_tag.as_ref(), true, &auth.roles[..])
 		}
-		None => ("", false),
+		None => ("", false, &[][..]),
 	};
 
 	let limit = opts.limit.unwrap_or(30) as usize;
@@ -153,6 +153,7 @@ pub async fn get_file_list(
 		subject_id_tag,
 		is_authenticated,
 		&tenant_id_tag,
+		subject_roles,
 		files,
 	)
 	.await?;
@@ -834,6 +835,14 @@ pub async fn post_file(
 	// Generate file_id
 	let file_id = utils::random_id()?;
 
+	// Default visibility to 'C' (Connected) for community tenants
+	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
+	let visibility = match req.visibility {
+		Some(v) => Some(v),
+		None if matches!(tenant_meta.typ, meta_adapter::ProfileType::Community) => Some('C'),
+		None => None,
+	};
+
 	// Create file metadata with specified fileTp
 	let content_type = req.content_type.clone().unwrap_or_else(|| "application/json".to_string());
 	let _f_id = app
@@ -845,14 +854,15 @@ pub async fn post_file(
 				orig_variant_id: Some(file_id.clone().into()),
 				file_id: Some(file_id.clone().into()),
 				parent_id: None, // TODO: Add parent_id support for CRDT/RTDB files
-				owner_tag: Some(auth.id_tag.clone()),
+				owner_tag: None,
+				creator_tag: Some(auth.id_tag.clone()),
 				content_type: content_type.into(),
 				file_name: "file".into(),
 				file_tp: Some(req.file_tp.clone().into()),
 				created_at: req.created_at,
 				tags: req.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
 				x: None,
-				visibility: req.visibility,
+				visibility,
 				status: None,
 			},
 		)
@@ -883,6 +893,14 @@ pub async fn post_file_blob(
 		.and_then(|v| v.to_str().ok())
 		.unwrap_or("application/octet-stream");
 	info!("post_file_blob: preset={}, content_type={}", preset_name, content_type);
+
+	// Default visibility to 'C' (Connected) for community tenants
+	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
+	let visibility = match query.visibility {
+		Some(v) => Some(v),
+		None if matches!(tenant_meta.typ, meta_adapter::ProfileType::Community) => Some('C'),
+		None => None,
+	};
 
 	// 1. Get preset (or default)
 	let preset = presets::get(&preset_name).unwrap_or_else(presets::default);
@@ -946,7 +964,8 @@ pub async fn post_file_blob(
 						orig_variant_id: Some(orig_variant_id),
 						file_id: None,
 						parent_id: None,
-						owner_tag: Some(auth.id_tag.clone()),
+						owner_tag: None,
+						creator_tag: Some(auth.id_tag.clone()),
 						content_type: if is_svg {
 							"image/svg+xml".into()
 						} else {
@@ -957,7 +976,7 @@ pub async fn post_file_blob(
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
 						x: Some(json!({ "dim": dim })),
-						visibility: query.visibility,
+						visibility,
 						status: None,
 					},
 				)
@@ -995,14 +1014,15 @@ pub async fn post_file_blob(
 						orig_variant_id: Some(orig_variant_id),
 						file_id: None,
 						parent_id: None,
-						owner_tag: Some(auth.id_tag.clone()),
+						owner_tag: None,
+						creator_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
 						x: None,
-						visibility: query.visibility,
+						visibility,
 						status: None,
 					},
 				)
@@ -1033,14 +1053,15 @@ pub async fn post_file_blob(
 						orig_variant_id: None,
 						file_id: None,
 						parent_id: None,
-						owner_tag: Some(auth.id_tag.clone()),
+						owner_tag: None,
+						creator_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
 						x: None,
-						visibility: query.visibility,
+						visibility,
 						status: None,
 					},
 				)
@@ -1072,14 +1093,15 @@ pub async fn post_file_blob(
 						orig_variant_id: None,
 						file_id: None,
 						parent_id: None,
-						owner_tag: Some(auth.id_tag.clone()),
+						owner_tag: None,
+						creator_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
 						x: None,
-						visibility: query.visibility,
+						visibility,
 						status: None,
 					},
 				)
@@ -1111,14 +1133,15 @@ pub async fn post_file_blob(
 						orig_variant_id: None,
 						file_id: None,
 						parent_id: None,
-						owner_tag: Some(auth.id_tag.clone()),
+						owner_tag: None,
+						creator_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
 						x: None,
-						visibility: query.visibility,
+						visibility,
 						status: None,
 					},
 				)

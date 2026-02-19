@@ -134,15 +134,20 @@ pub async fn get_ws_rtdb(
 
 	let user_id = auth_ctx.id_tag.to_string();
 	let user_tn_id = auth_ctx.tn_id;
+	let user_roles = auth_ctx.roles.clone();
 	let scope = auth_ctx.scope.as_deref();
 
 	// Check file access (with scope for share links)
+	let ctx = file_access::FileAccessCtx {
+		user_id_tag: &user_id,
+		tenant_id_tag: &tenant_id_tag,
+		user_roles: &user_roles,
+	};
 	let access_result = file_access::check_file_access_with_scope(
 		&app,
 		crate::types::TnId(tn_id),
 		&file_id,
-		&user_id,
-		&tenant_id_tag,
+		&ctx,
 		scope,
 	)
 	.await;
@@ -203,15 +208,20 @@ pub async fn get_ws_crdt(
 
 	let user_id = auth_ctx.id_tag.to_string();
 	let user_tn_id = auth_ctx.tn_id;
+	let user_roles = auth_ctx.roles.clone();
 	let scope = auth_ctx.scope.as_deref();
 
 	// Check file access (with scope for share links)
+	let ctx = file_access::FileAccessCtx {
+		user_id_tag: &user_id,
+		tenant_id_tag: &tenant_id_tag,
+		user_roles: &user_roles,
+	};
 	let access_result = file_access::check_file_access_with_scope(
 		&app,
 		crate::types::TnId(tn_id),
 		&doc_id,
-		&user_id,
-		&tenant_id_tag,
+		&ctx,
 		scope,
 	)
 	.await;

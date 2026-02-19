@@ -44,7 +44,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	let mut version = get_db_version(&mut tx).await;
 
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 7;
+	const CURRENT_DB_VERSION: i64 = 9;
 
 	// Schema creation - safe to run every time (uses IF NOT EXISTS)
 	// New tables, indexes, triggers are added here
@@ -120,7 +120,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			perm char(1),
 			following boolean,
 			connected boolean,
-			roles json,
+			roles text,
 			synced_at INTEGER,
 			etag text,
 			created_at INTEGER DEFAULT (unixepoch()),
@@ -158,7 +158,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			file_id text,
 			file_tp char(4),			-- 'BLOB', 'CRDT', 'RTDB' file type (storage type)
 			status char(1),				-- 'A' - Active, 'P' - Pending, 'D' - Deleted
-			owner_tag text,
+			owner_tag text,				-- Set only for files owned by someone OTHER than the tenant (e.g., shared files)
+			creator_tag text,			-- The user who actually created the file
 			preset text,
 			content_type text,
 			file_name text,
@@ -796,8 +797,41 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, 7).await;
 	}
 
+	// Version 8: Convert roles from JSON array to bare string
+	if version < 8 {
+		// Convert JSON array roles (e.g. '["leader"]') to bare string (e.g. 'leader')
+		// json_extract with '$[0]' extracts the first element from a JSON array
+		sqlx::query(
+			"UPDATE profiles SET roles = json_extract(roles, '$[0]') \
+			 WHERE roles IS NOT NULL AND roles LIKE '[%'",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 8).await;
+	}
+
+	// Version 9: Add creator_tag column to files table
+	// creator_tag tracks who actually created a file, while owner_tag is reserved
+	// for files owned by someone OTHER than the tenant (e.g., shared files via FSHR)
+	if version < 9 {
+		sqlx::query("ALTER TABLE files ADD COLUMN creator_tag text")
+			.execute(&mut *tx)
+			.await?;
+
+		// Backfill: existing files with owner_tag set → copy to creator_tag, clear owner_tag
+		// (except shared files which have no preset — those keep their owner_tag)
+		sqlx::query(
+			"UPDATE files SET creator_tag = owner_tag, owner_tag = NULL WHERE owner_tag IS NOT NULL AND preset IS NOT NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 9).await;
+	}
+
 	// Future migrations:
-	// if version < 8 { ... migration 8 ...; set_db_version(&mut tx, 8).await; }
+	// if version < 10 { ... migration 10 ...; set_db_version(&mut tx, 10).await; }
 
 	tx.commit().await?;
 

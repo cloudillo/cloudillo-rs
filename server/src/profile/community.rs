@@ -30,6 +30,17 @@ pub async fn put_community_profile(
 	let creator_id_tag = &auth.id_tag;
 	let creator_tn_id = auth.tn_id;
 
+	// Community creation requires an invite (unless user has SADM role)
+	let is_admin = auth.roles.iter().any(|r| r.as_ref() == "SADM");
+	let invite_ref = req.invite_ref.as_deref();
+	if !is_admin {
+		let ref_code = invite_ref.ok_or_else(|| {
+			Error::ValidationError("Community creation requires an invite".into())
+		})?;
+		// Validate ref exists, is correct type, not expired, has remaining uses
+		app.meta_adapter.validate_ref(ref_code, &["profile.invite"]).await?;
+	}
+
 	info!(
 		creator = %creator_id_tag,
 		community = %id_tag_lower,
@@ -248,6 +259,20 @@ pub async fn put_community_profile(
 	)
 	.await?;
 
+	// 7b. Directly set community profile in creator's tenant to Connected
+	// (Don't rely on async CONN delivery — the on_receive mutual detection is fragile
+	// for same-server communities because the community's signing key may not be ready)
+	app.meta_adapter
+		.update_profile(
+			creator_tn_id,
+			&id_tag_lower,
+			&UpdateProfileData {
+				connected: Patch::Value(ProfileConnectionStatus::Connected),
+				..Default::default()
+			},
+		)
+		.await?;
+
 	// 8. Get creator's profile name for the community's profile record
 	let creator_name = match app.meta_adapter.get_profile_info(creator_tn_id, creator_id_tag).await
 	{
@@ -261,8 +286,9 @@ pub async fn put_community_profile(
 		name: creator_name.as_str(),
 		typ: ProfileType::Person,
 		profile_pic: None,
-		following: true,
+		following: false,
 		connected: ProfileConnectionStatus::Connected,
+		roles: None,
 	};
 	app.meta_adapter.create_profile(community_tn_id, &creator_profile, "").await?;
 
@@ -274,7 +300,7 @@ pub async fn put_community_profile(
 			&UpdateProfileData {
 				roles: Patch::Value(Some(vec!["leader".to_string().into()])),
 				connected: Patch::Value(ProfileConnectionStatus::Connected),
-				following: Patch::Value(true),
+				following: Patch::Undefined,
 				..Default::default()
 			},
 		)
@@ -286,7 +312,14 @@ pub async fn put_community_profile(
 		"Creator assigned leader role in community"
 	);
 
-	// 10. Return response
+	// 10. Consume the invite ref (if used)
+	if let Some(ref_code) = invite_ref {
+		if let Err(e) = app.meta_adapter.use_ref(ref_code, &["profile.invite"]).await {
+			warn!(error = %e, "Failed to consume invite ref after community creation");
+		}
+	}
+
+	// 11. Return response
 	let response = CommunityProfileResponse {
 		id_tag: id_tag_lower,
 		name: display_name,

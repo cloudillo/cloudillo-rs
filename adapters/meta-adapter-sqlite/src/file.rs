@@ -31,8 +31,9 @@ pub(crate) async fn list(
 			|| matches!(opts.sort.as_deref(), Some("recent" | "modified")));
 
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT f.f_id, f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility, f.x,
-		        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic",
+		"SELECT f.f_id, f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.x,
+		        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic,
+		        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic",
 	);
 
 	// Add user data columns if user is authenticated
@@ -42,7 +43,8 @@ pub(crate) async fn list(
 
 	query.push(
 		" FROM files f
-		 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag",
+		 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
+		 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.creator_tag",
 	);
 
 	// Add file_user_data JOIN if needed for filtering/sorting or to include user data
@@ -305,6 +307,27 @@ pub(crate) async fn list(
 			None
 		};
 
+		// Build creator profile info if creator_tag exists
+		let creator = if let (Ok(id_tag), Ok(name)) = (
+			row.try_get::<Box<str>, _>("creator_id_tag"),
+			row.try_get::<Box<str>, _>("creator_name"),
+		) {
+			let typ = match row.try_get::<&str, _>("creator_type").ok() {
+				Some("P") => ProfileType::Person,
+				Some("C") => ProfileType::Community,
+				_ => ProfileType::Person,
+			};
+
+			Some(ProfileInfo {
+				id_tag,
+				name,
+				typ,
+				profile_pic: row.try_get("creator_profile_pic").ok(),
+			})
+		} else {
+			None
+		};
+
 		let visibility: Option<String> = row.try_get("visibility").ok();
 		let visibility = visibility.and_then(|s| s.chars().next());
 
@@ -350,6 +373,7 @@ pub(crate) async fn list(
 			file_id,
 			parent_id: row.try_get("parent_id").ok(),
 			owner,
+			creator,
 			preset: row.try_get("preset")?,
 			content_type: row.try_get("content_type")?,
 			file_name: row.try_get("file_name")?,
@@ -606,8 +630,8 @@ pub(crate) async fn create(
 		}
 	}
 
-	let res = sqlx::query("INSERT INTO files (tn_id, file_id, parent_id, status, owner_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
-		.bind(tn_id.0).bind(opts.file_id).bind(opts.parent_id).bind(status).bind(opts.owner_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility)
+	let res = sqlx::query("INSERT INTO files (tn_id, file_id, parent_id, status, owner_tag, creator_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
+		.bind(tn_id.0).bind(opts.file_id).bind(opts.parent_id).bind(status).bind(opts.owner_tag).bind(opts.creator_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility)
 		.fetch_one(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 	Ok(FileId::FId(res.get(0)))
@@ -937,10 +961,12 @@ pub(crate) async fn read(
 			.parse::<i64>()
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility, f.x,
-			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
+			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.x,
+			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic,
+			        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
+			 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.creator_tag
 			 WHERE f.tn_id=? AND f.f_id=?"
 		)
 		.bind(tn_id.0)
@@ -952,10 +978,12 @@ pub(crate) async fn read(
 	} else {
 		// Content-addressable ID - query by file_id
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.preset, f.content_type, f.visibility, f.x,
-			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic
+			"SELECT f.file_id, f.parent_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.x,
+			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic,
+			        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic
 			 FROM files f
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
+			 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.creator_tag
 			 WHERE f.tn_id=? AND f.file_id=?"
 		)
 		.bind(tn_id.0)
@@ -999,6 +1027,27 @@ pub(crate) async fn read(
 				None
 			};
 
+			// Build creator profile info if creator_tag exists
+			let creator = if let (Ok(id_tag), Ok(name)) = (
+				row.try_get::<Box<str>, _>("creator_id_tag"),
+				row.try_get::<Box<str>, _>("creator_name"),
+			) {
+				let typ = match row.try_get::<&str, _>("creator_type").ok() {
+					Some("P") => ProfileType::Person,
+					Some("C") => ProfileType::Community,
+					_ => ProfileType::Person,
+				};
+
+				Some(ProfileInfo {
+					id_tag,
+					name,
+					typ,
+					profile_pic: row.try_get("creator_profile_pic").ok(),
+				})
+			} else {
+				None
+			};
+
 			let visibility: Option<String> = row.try_get("visibility").ok();
 			let visibility = visibility.and_then(|s| s.chars().next());
 
@@ -1013,6 +1062,7 @@ pub(crate) async fn read(
 				file_id: row.try_get("file_id").map_err(|_| Error::DbError)?,
 				parent_id: row.try_get("parent_id").ok(),
 				owner,
+				creator,
 				preset: row.try_get("preset").ok(),
 				content_type: row.try_get("content_type").ok(),
 				file_name: row.try_get("file_name").map_err(|_| Error::DbError)?,

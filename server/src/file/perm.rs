@@ -75,6 +75,7 @@ async fn check_file_permission(
 		&file_id,
 		&subject_id_tag,
 		&tenant_id_tag,
+		&auth_ctx.roles,
 		auth_ctx.scope.as_deref(),
 	)
 	.await?;
@@ -109,6 +110,7 @@ async fn load_file_attrs(
 	file_or_variant_id: &str,
 	subject_id_tag: &str,
 	tenant_id_tag: &str,
+	subject_roles: &[Box<str>],
 	scope: Option<&str>,
 ) -> ClResult<FileAttrs> {
 	use crate::core::abac::VisibilityLevel;
@@ -143,15 +145,14 @@ async fn load_file_attrs(
 		});
 
 	// Determine access level by looking up scoped tokens, FSHR action grants
-	let access_level = file_access::get_access_level_with_scope(
-		app,
-		tn_id,
-		&file_id,
-		subject_id_tag,
-		&owner_id_tag,
-		scope,
-	)
-	.await;
+	let ctx = file_access::FileAccessCtx {
+		user_id_tag: subject_id_tag,
+		tenant_id_tag,
+		user_roles: subject_roles,
+	};
+	let access_level =
+		file_access::get_access_level_with_scope(app, tn_id, &file_id, &owner_id_tag, &ctx, scope)
+			.await;
 
 	// Get visibility from file metadata - convert char to string representation
 	let visibility: Box<str> = VisibilityLevel::from_char(file_view.visibility).as_str().into();

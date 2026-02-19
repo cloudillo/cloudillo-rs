@@ -12,6 +12,7 @@
 //! - fshr: File sharing lifecycle management (FSHR)
 //! - idp: Identity provider operations (IDP:REG)
 //! - invt: Invitation management (INVT)
+//! - prinvt: Profile invite notification (PRINVT)
 //! - react: Reaction management (REACT)
 //! - subs: Subscription management (SUBS)
 
@@ -23,6 +24,7 @@ pub mod fllw;
 pub mod fshr;
 pub mod idp;
 pub mod invt;
+pub mod prinvt;
 pub mod react;
 pub mod subs;
 
@@ -165,6 +167,19 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		tracing::info!("Registered native hooks for INVT action type");
 	}
 
+	// PRINVT hooks
+	{
+		let prinvt_hooks = ActionTypeHooks {
+			on_create: None,
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(prinvt::on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("PRINVT", prinvt_hooks);
+		tracing::info!("Registered native hooks for PRINVT action type");
+	}
+
 	Ok(())
 }
 
@@ -196,6 +211,7 @@ mod tests {
 		let _ = invt::on_create;
 		let _ = invt::on_receive;
 		let _ = invt::on_accept;
+		let _ = prinvt::on_receive;
 	}
 }
 

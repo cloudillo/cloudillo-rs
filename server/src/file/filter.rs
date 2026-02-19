@@ -1,7 +1,5 @@
 //! Visibility filtering for files
 
-use std::collections::{HashMap, HashSet};
-
 use crate::{
 	core::abac::can_view_item, core::file_access, meta_adapter::FileView, prelude::*,
 	types::AccessLevel,
@@ -21,6 +19,7 @@ pub async fn filter_files_by_visibility(
 	subject_id_tag: &str,
 	is_authenticated: bool,
 	tenant_id_tag: &str,
+	subject_roles: &[Box<str>],
 	files: Vec<FileView>,
 ) -> ClResult<Vec<FileView>> {
 	// If no files, return early
@@ -28,14 +27,9 @@ pub async fn filter_files_by_visibility(
 		return Ok(files);
 	}
 
-	// Collect unique owner id_tags
-	let owner_tags: HashSet<&str> = files
-		.iter()
-		.filter_map(|f| f.owner.as_ref().map(|o| o.id_tag.as_ref()))
-		.collect();
-
-	// Batch load relationship status for all owners
-	let relationships = load_relationships(app, tn_id, subject_id_tag, &owner_tags).await?;
+	// Look up subject's relationship with the tenant (the only relationship we can check)
+	let rels = app.meta_adapter.get_relationships(tn_id, &[subject_id_tag]).await?;
+	let (following, connected) = rels.get(subject_id_tag).copied().unwrap_or((false, false));
 
 	// Filter files based on visibility
 	let visible_files: Vec<FileView> = files
@@ -47,9 +41,6 @@ pub async fn filter_files_by_visibility(
 				.as_ref()
 				.and_then(|o| if o.id_tag.is_empty() { None } else { Some(o.id_tag.as_ref()) })
 				.unwrap_or(tenant_id_tag);
-
-			let (following, connected) =
-				relationships.get(owner_tag).copied().unwrap_or((false, false));
 
 			// Files don't have audience, so pass None
 			can_view_item(
@@ -86,37 +77,19 @@ pub async fn filter_files_by_visibility(
 			.and_then(|o| if o.id_tag.is_empty() { None } else { Some(o.id_tag.as_ref()) })
 			.unwrap_or(tenant_id_tag);
 
+		let ctx = file_access::FileAccessCtx {
+			user_id_tag: subject_id_tag,
+			tenant_id_tag,
+			user_roles: subject_roles,
+		};
 		let access_level =
-			file_access::get_access_level(app, tn_id, &file.file_id, subject_id_tag, owner_tag)
-				.await;
+			file_access::get_access_level(app, tn_id, &file.file_id, owner_tag, &ctx).await;
 
 		file.access_level = Some(access_level);
 		result.push(file);
 	}
 
 	Ok(result)
-}
-
-/// Load relationship status between subject and multiple targets
-///
-/// Returns a map of target_id_tag -> (following, connected)
-/// Uses batch query to avoid N+1 problem
-async fn load_relationships(
-	app: &App,
-	tn_id: TnId,
-	subject_id_tag: &str,
-	target_id_tags: &HashSet<&str>,
-) -> ClResult<HashMap<String, (bool, bool)>> {
-	// For anonymous users or empty target sets, return empty map
-	if subject_id_tag.is_empty() || target_id_tags.is_empty() {
-		return Ok(HashMap::new());
-	}
-
-	// Convert HashSet to Vec for batch query
-	let targets: Vec<&str> = target_id_tags.iter().copied().collect();
-
-	// Single batch query instead of N+1 queries
-	app.meta_adapter.get_relationships(tn_id, &targets).await
 }
 
 // vim: ts=4

@@ -35,6 +35,7 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		subs_definition(),
 		conv_definition(),
 		invt_definition(),
+		prinvt_definition(),
 	]
 }
 
@@ -1113,6 +1114,96 @@ fn invt_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{subject}:{audience}".to_string()), // One invitation per user per action
+	}
+}
+
+/// PRINVT - Profile Invite notification
+/// Delivers invite refs (for community or personal profile creation) to connected users
+fn prinvt_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "PRINVT".to_string(),
+		version: "1.0".to_string(),
+		description: "Deliver a profile creation invite to a connected user".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("system".to_string()),
+			tags: Some(vec!["invite".to_string(), "profile".to_string(), "community".to_string()]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: None,
+		fields: FieldConstraints {
+			content: Some(FieldConstraint::Required), // Invite details (refId, nodeName, etc.)
+			audience: Some(FieldConstraint::Required), // Target user
+			parent: Some(FieldConstraint::Forbidden),
+			attachments: Some(FieldConstraint::Forbidden),
+			subject: Some(FieldConstraint::Forbidden),
+		},
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Object,
+				min_length: None,
+				max_length: None,
+				pattern: None,
+				r#enum: None,
+				properties: Some({
+					let mut props = HashMap::new();
+					props.insert(
+						"refId".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: Some(1),
+							max_length: Some(255),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props.insert(
+						"nodeName".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(255),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props.insert(
+						"message".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(500),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props
+				}),
+				required: Some(vec!["refId".to_string()]),
+				description: Some(
+					"Profile invite details with ref ID and optional message".to_string(),
+				),
+			}),
+		}),
+		behavior: BehaviorFlags {
+			broadcast: Some(false),
+			allow_unknown: Some(false), // Only send to known connected users
+			requires_acceptance: Some(false),
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None,
+			on_receive: HookImplementation::None, // Native hook registered via registry
+			on_accept: HookImplementation::None,
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("any".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(true),
+		}),
+		key_pattern: Some("{type}:{issuer}:{audience}".to_string()),
 	}
 }
 

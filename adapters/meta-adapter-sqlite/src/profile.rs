@@ -77,7 +77,7 @@ pub(crate) async fn list(
 	opts: &ListProfileOptions,
 ) -> ClResult<Vec<Profile<Box<str>>>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT id_tag, name, type, profile_pic, following, connected
+		"SELECT id_tag, name, type, profile_pic, following, connected, roles
 		 FROM profiles WHERE tn_id=",
 	);
 	query.push_bind(tn_id.0);
@@ -163,6 +163,9 @@ pub(crate) async fn list(
 			profile_pic: row.try_get("profile_pic")?,
 			following: row.try_get("following")?,
 			connected: parse_connected(row)?,
+			roles: row.try_get::<Option<String>, _>("roles")?.map(|s| {
+				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
+			}),
 		})
 	}))
 }
@@ -222,7 +225,7 @@ pub(crate) async fn read(
 	id_tag: &str,
 ) -> ClResult<(Box<str>, Profile<Box<str>>)> {
 	let res = sqlx::query(
-		"SELECT id_tag, type, name, profile_pic, status, perm, following, connected, etag
+		"SELECT id_tag, type, name, profile_pic, status, perm, following, connected, roles, etag
 		FROM profiles WHERE tn_id=? AND id_tag=?",
 	)
 	.bind(tn_id.0)
@@ -245,6 +248,9 @@ pub(crate) async fn read(
 			profile_pic: row.try_get("profile_pic")?,
 			following: row.try_get("following")?,
 			connected: parse_connected(&row)?,
+			roles: row.try_get::<Option<String>, _>("roles")?.map(|s| {
+				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
+			}),
 		};
 		Ok((etag, profile))
 	})
@@ -263,14 +269,10 @@ pub(crate) async fn read_roles(
 		.await;
 
 	map_res(res, |row| {
-		let roles_json: Option<String> = row.try_get("roles")?;
-		if let Some(json_str) = roles_json {
-			let roles: Vec<Box<str>> =
-				serde_json::from_str(&json_str).map_err(|_| sqlx::Error::RowNotFound)?;
-			Ok(Some(roles.into_boxed_slice()))
-		} else {
-			Ok(None)
-		}
+		let roles_str: Option<String> = row.try_get("roles")?;
+		Ok(roles_str.map(|s| {
+			s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
+		}))
 	})
 }
 
@@ -323,7 +325,8 @@ pub(crate) async fn update(
 	});
 
 	has_updates = push_patch!(query, has_updates, "roles", &profile.roles, |v| {
-		v.as_ref().map(|roles| serde_json::to_string(roles).unwrap())
+		v.as_ref()
+			.map(|roles| roles.iter().map(|r| r.as_ref()).collect::<Vec<_>>().join(","))
 	});
 
 	// Status and moderation
@@ -357,19 +360,6 @@ pub(crate) async fn update(
 		ProfileConnectionStatus::Disconnected => ConnectedDbValue::Int(0),
 		ProfileConnectionStatus::RequestPending => ConnectedDbValue::Text("R"),
 		ProfileConnectionStatus::Connected => ConnectedDbValue::Int(1),
-	});
-
-	// Ban metadata fields
-	has_updates = push_patch!(query, has_updates, "ban_expires_at", &profile.ban_expires_at, |v| {
-		v.as_ref().map(|t| t.0)
-	});
-
-	has_updates = push_patch!(query, has_updates, "ban_reason", &profile.ban_reason, |v| {
-		v.as_ref().map(|s| s.as_ref())
-	});
-
-	has_updates = push_patch!(query, has_updates, "banned_by", &profile.banned_by, |v| {
-		v.as_ref().map(|s| s.as_ref())
 	});
 
 	// Sync metadata

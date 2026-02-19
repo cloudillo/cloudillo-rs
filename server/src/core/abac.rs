@@ -453,9 +453,9 @@ impl PermissionChecker {
 	) -> bool {
 		use tracing::debug;
 
-		// Admin override - admins can do everything
-		if subject.roles.iter().any(|r| r.as_ref() == "admin") {
-			debug!(subject = %subject.id_tag, action = action, "Admin role allows access");
+		// Leader override - leaders can do everything
+		if subject.roles.iter().any(|r| r.as_ref() == "leader") {
+			debug!(subject = %subject.id_tag, action = action, "Leader role allows access");
 			return true;
 		}
 
@@ -474,11 +474,15 @@ impl PermissionChecker {
 					debug!(subject = %subject.id_tag, action = action, owner = owner, "Owner access allowed for modify operation");
 					return true;
 				}
-				debug!(subject = %subject.id_tag, action = action, owner = owner, "Non-owner denied for modify operation");
-			} else {
-				debug!(subject = %subject.id_tag, action = action, "No owner_id_tag found for modify operation");
 			}
-			// Non-owners cannot modify
+			// Check pre-computed access level (community roles, FSHR shares, scoped tokens)
+			if let Some(al) = object.get("access_level") {
+				if al == "write" {
+					debug!(subject = %subject.id_tag, action = action, "Write access level allows modify operation");
+					return true;
+				}
+			}
+			debug!(subject = %subject.id_tag, action = action, "Denied: not owner and no write access level");
 			return false;
 		}
 

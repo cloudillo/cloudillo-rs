@@ -47,7 +47,11 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			}
 
 			let profile_update = UpdateProfileData {
-				following: Patch::Value(true),
+				following: if context.tenant_type == "community" {
+					Patch::Undefined
+				} else {
+					Patch::Value(true)
+				},
 				connected: Patch::Value(ProfileConnectionStatus::RequestPending),
 				..Default::default()
 			};
@@ -68,7 +72,11 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			);
 
 			let profile_update = UpdateProfileData {
-				following: Patch::Value(true),
+				following: if context.tenant_type == "community" {
+					Patch::Undefined
+				} else {
+					Patch::Value(true)
+				},
 				connected: Patch::Value(ProfileConnectionStatus::Connected),
 				..Default::default()
 			};
@@ -84,7 +92,11 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			// Deletion: remove connection
 			tracing::info!("CONN:DEL: Removing connection from {} to {}", context.issuer, audience);
 
-			let profile_update = UpdateProfileData { connected: Patch::Null, ..Default::default() };
+			let profile_update = UpdateProfileData {
+				connected: Patch::Null,
+				roles: Patch::Null,
+				..Default::default()
+			};
 
 			if let Err(e) = app.meta_adapter.update_profile(tn_id, audience, &profile_update).await
 			{
@@ -149,7 +161,11 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					// Update issuer's profile to connected
 					let profile_update = UpdateProfileData {
 						connected: Patch::Value(ProfileConnectionStatus::Connected),
-						following: Patch::Value(true),
+						following: if context.tenant_type == "community" {
+							Patch::Undefined
+						} else {
+							Patch::Value(true)
+						},
 						..Default::default()
 					};
 
@@ -217,6 +233,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					// Create response CONN action
 					let response_action = CreateAction {
 						typ: "CONN".into(),
+						sub_typ: Some("ACC".into()),
 						audience_tag: Some(context.issuer.clone().into()),
 						..Default::default()
 					};
@@ -230,7 +247,11 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					// Update issuer's profile to connected
 					let profile_update = UpdateProfileData {
 						connected: Patch::Value(ProfileConnectionStatus::Connected),
-						following: Patch::Value(true),
+						following: if context.tenant_type == "community" {
+							Patch::Undefined
+						} else {
+							Patch::Value(true)
+						},
 						..Default::default()
 					};
 					if let Err(e) = app
@@ -287,7 +308,11 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			// Update issuer's profile to connected
 			let profile_update = UpdateProfileData {
 				connected: Patch::Value(ProfileConnectionStatus::Connected),
-				following: Patch::Value(true),
+				following: if context.tenant_type == "community" {
+					Patch::Undefined
+				} else {
+					Patch::Value(true)
+				},
 				..Default::default()
 			};
 

@@ -118,7 +118,8 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 		orig_variant_id: None,
 		file_id: Some(file_id.clone().into()),
 		parent_id: None,
-		owner_tag: Some(context.issuer.clone().into()),
+		owner_tag: Some(context.issuer.clone().into()), // Shared files: owner is the sharer
+		creator_tag: None,
 		preset: None,
 		content_type: content_type.into(),
 		file_name: file_name.into(),
