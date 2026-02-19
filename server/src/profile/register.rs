@@ -485,6 +485,7 @@ async fn handle_idp_registration(
 			expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
 			path_prefix: "/onboarding/welcome",
 			resource_id: None,
+			count: None,
 		},
 	)
 	.await?;
@@ -640,6 +641,7 @@ async fn handle_domain_registration(
 			expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
 			path_prefix: "/onboarding/welcome",
 			resource_id: None,
+			count: None,
 		},
 	)
 	.await?;

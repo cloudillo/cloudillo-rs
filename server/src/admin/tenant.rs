@@ -152,6 +152,7 @@ pub async fn send_password_reset(
 			expires_at,
 			path_prefix: "/reset-password", // Frontend route (must match AuthRoutes in shell)
 			resource_id: None,
+			count: None,
 		},
 	)
 	.await?;

@@ -809,6 +809,7 @@ pub async fn post_forgot_password(
 			expires_at,
 			path_prefix: "/reset-password",
 			resource_id: None,
+			count: None,
 		},
 	)
 	.await

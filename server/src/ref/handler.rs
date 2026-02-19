@@ -11,7 +11,9 @@ use crate::core::extract::{OptionalAuth, OptionalRequestId};
 use crate::core::utils;
 use crate::meta_adapter::{CreateRefOptions, ListRefsOptions, RefData};
 use crate::prelude::*;
-use crate::types::{ApiResponse, Patch, Timestamp};
+use crate::types::{
+	serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse, Patch, Timestamp,
+};
 
 /// Response structure for ref details (authenticated users get full data)
 #[serde_with::skip_serializing_none]
@@ -21,10 +23,14 @@ pub struct RefResponse {
 	pub ref_id: String,
 	pub r#type: String,
 	pub description: Option<String>,
-	#[serde(rename = "createdAt")]
-	pub created_at: i64,
-	#[serde(rename = "expiresAt")]
-	pub expires_at: Option<i64>,
+	#[serde(rename = "createdAt", serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+	#[serde(
+		rename = "expiresAt",
+		serialize_with = "serialize_timestamp_iso_opt",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub expires_at: Option<Timestamp>,
 	/// Usage count: None = unlimited, Some(n) = n uses remaining
 	pub count: Option<u32>,
 	/// Resource ID for share links (e.g., file_id for share.file type)
@@ -49,8 +55,8 @@ impl From<RefData> for RefResponse {
 			ref_id: ref_data.ref_id.to_string(),
 			r#type: ref_data.r#type.to_string(),
 			description: ref_data.description.map(|d| d.to_string()),
-			created_at: ref_data.created_at.0,
-			expires_at: ref_data.expires_at.map(|ts| ts.0),
+			created_at: ref_data.created_at,
+			expires_at: ref_data.expires_at,
 			count: ref_data.count,
 			resource_id: ref_data.resource_id.map(|s| s.to_string()),
 			access_level: ref_data
@@ -115,6 +121,8 @@ pub struct CreateRefInternalParams<'a> {
 	pub path_prefix: &'a str,
 	/// Optional resource identifier to store with the ref
 	pub resource_id: Option<&'a str>,
+	/// Number of uses allowed (default: 1)
+	pub count: Option<u32>,
 }
 
 /// GET /api/refs - List refs for the current tenant
@@ -358,7 +366,7 @@ pub async fn create_ref_internal(
 		typ: params.typ.to_string(),
 		description: params.description.map(|s| s.to_string()),
 		expires_at: params.expires_at,
-		count: Some(1), // Single use by default
+		count: Some(params.count.unwrap_or(1)),
 		resource_id: params.resource_id.map(|s| s.to_string()),
 		access_level: None,
 	};
