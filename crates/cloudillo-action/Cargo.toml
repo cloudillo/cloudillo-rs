@@ -1,0 +1,23 @@
+[package]
+name = "cloudillo-action"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cloudillo-core = { path = "../cloudillo-core" }
+cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
+cloudillo-file = { path = "../cloudillo-file" }
+cloudillo-idp = { path = "../cloudillo-idp" }
+cloudillo-push = { path = "../cloudillo-push" }
+
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http2", "macros"] }
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+lru = "0.16"
+parking_lot = "0.12"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
+tracing = "0.1"

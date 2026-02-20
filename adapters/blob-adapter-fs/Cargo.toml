@@ -5,8 +5,8 @@ edition.workspace = true
 
 [dependencies]
 async-trait = "0.1.89"
-cloudillo = { path = "../../server" }
-futures-core = "0.3.31"
+cloudillo = { package = "cloudillo-types", path = "../../crates/cloudillo-types" }
+futures-core = "0.3.32"
 tokio = { version = "1.49.0", features = ["fs"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 

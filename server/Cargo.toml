@@ -1,64 +1,13 @@
 [package]
-name = "cloudillo"
+name = "cloudillo-server"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-async-trait = "0.1.89"
-axum = { version = "0.8.8", features = ["http2", "macros", "multipart", "ws"] }
-base64 = "0.22.1"
-flume = { version = "0.12.0", features = ["async"] }
-futures = "0.3.31"
-handlebars = "6.4"
-hmac = "0.12.1"
-#hyper = "1.7.0"
-#hyper-util = "0.1.17"
-image = "0.25.9"
-webp = "0.3.1"
-resvg = "0.47"
-usvg = "0.47"
-instant-acme = "0.8.4"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
-pem = "3.0.6"
-rustls = "0.23.36"
-rustls-pki-types = { version = "1.14.0", features = ["alloc"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-serde_yaml = "0.9"
-sha2 = "0.10.9"
+cloudillo-auth-adapter-sqlite = { path = "../adapters/auth-adapter-sqlite" }
+cloudillo-blob-adapter-fs = { path = "../adapters/blob-adapter-fs" }
+cloudillo-meta-adapter-sqlite = { path = "../adapters/meta-adapter-sqlite" }
+cloudillo-crdt-adapter-redb = { path = "../adapters/crdt-adapter-redb" }
+cloudillo-rtdb-adapter-redb = { path = "../adapters/rtdb-adapter-redb" }
+cloudillo = { path = "../crates/cloudillo" }
 tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }
-tokio-rustls = "0.26.4"
-tower = { version = "0.5.3", features = ["util"] }
-tower-http = { version = "0.6.8", features = ["cors", "fs", "set-header", "trace", "compression-gzip", "compression-br"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-x509-parser = "0.18.1"
-sqlx = "0.8.6"
-serde_with = "3.16.1"
-croner = "3.0.1"
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
-hyper = "1.8.1"
-itertools = "0.14.0"
-tokio-util = { version = "0.7.18", features = ["io"] }
-futures-core = "0.3.31"
-hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2"] }
-http-body-util = "0.1.3"
-hyper-rustls = "0.27.7"
-rand = "0.10.0"
-uuid = { version = "1.20", features = ["v4", "serde"] }
-lru = "0.16.3"
-parking_lot = "0.12.5"
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "rustls-tls", "tokio1", "tokio1-rustls", "smtp-transport"] }
-regex = "1.12.3"
-hickory-resolver = "0.25"
-yrs = "0.25"
-governor = "0.10.4"
-ece = "2.3"
-p256 = { version = "0.13.2", features = ["pkcs8", "pem"] }
-url = "2"
-chrono = "0.4"
-webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
-webauthn-rs-proto = "0.5"
-
-[dev-dependencies]
-serde_urlencoded = "0.7"

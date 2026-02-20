@@ -221,7 +221,7 @@ pub fn inject_doc_id(doc: &mut Value, doc_id: &str) {
 
 /// Generate a random document ID using cloudillo's utility function
 pub fn generate_doc_id() -> ClResult<String> {
-	cloudillo::core::utils::random_id()
+	cloudillo::utils::random_id()
 }
 
 // Tests for this module have been moved to tests/storage_tests.rs

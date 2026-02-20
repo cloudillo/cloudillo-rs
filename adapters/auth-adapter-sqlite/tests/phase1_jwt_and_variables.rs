@@ -8,8 +8,8 @@
 #[cfg(test)]
 mod tests {
 	use cloudillo::auth_adapter::AuthAdapter;
-	use cloudillo::core::worker::WorkerPool;
 	use cloudillo::prelude::*;
+	use cloudillo::worker::WorkerPool;
 	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use std::sync::Arc;
 	use tempfile::TempDir;

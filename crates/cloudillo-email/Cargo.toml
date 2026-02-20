@@ -1,0 +1,16 @@
+[package]
+name = "cloudillo-email"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cloudillo-core = { path = "../cloudillo-core" }
+cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
+
+async-trait = "0.1"
+handlebars = "6.4"
+lettre = { version = "0.11.19", default-features = false, features = ["builder", "rustls-tls", "tokio1", "tokio1-rustls", "smtp-transport"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tracing = "0.1"

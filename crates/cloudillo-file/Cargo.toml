@@ -1,0 +1,33 @@
+[package]
+name = "cloudillo-file"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cloudillo-core = { path = "../cloudillo-core" }
+cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
+
+# HTTP framework
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http2", "macros"] }
+futures = "0.3"
+futures-core = "0.3"
+itertools = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "fs"] }
+
+# Image processing (heavy deps — the whole point of extraction)
+image = "0.25"
+webp = "0.3"
+
+# SVG processing
+resvg = "0.47"
+usvg = "0.47"
+regex = "1.12"
+
+# CRDT support (for file duplication)
+yrs = "0.25"
+
+# Logging
+tracing = "0.1"

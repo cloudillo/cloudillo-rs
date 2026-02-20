@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use cloudillo::{
 	auth_adapter::{ApiKeyInfo, ApiKeyValidation, CreateApiKeyOptions, CreatedApiKey},
-	core::worker::WorkerPool,
 	prelude::*,
+	worker::WorkerPool,
 };
 
 use crate::crypto;

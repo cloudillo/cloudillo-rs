@@ -6,7 +6,7 @@ use sqlx::{Row, SqlitePool};
 
 use crate::crypto;
 use crate::utils::*;
-use cloudillo::core::worker::WorkerPool;
+use cloudillo::worker::WorkerPool;
 use cloudillo::{auth_adapter::*, prelude::*};
 
 /// List all profile keys for a tenant

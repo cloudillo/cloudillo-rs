@@ -5,7 +5,7 @@ use jsonwebtoken::DecodingKey;
 use sqlx::sqlite::{self, SqlitePool};
 use tokio::fs;
 
-use cloudillo::{auth_adapter::*, core::worker::WorkerPool, prelude::*};
+use cloudillo::{auth_adapter::*, prelude::*, worker::WorkerPool};
 
 mod api_key;
 mod auth;
@@ -166,7 +166,7 @@ impl AuthAdapter for AuthAdapterSqlite {
 	async fn create_action_token(
 		&self,
 		tn_id: TnId,
-		action: cloudillo::action::task::CreateAction,
+		action: cloudillo::action_types::CreateAction,
 	) -> ClResult<Box<str>> {
 		auth::create_action_token(&self.db, &self.worker, tn_id, action).await
 	}

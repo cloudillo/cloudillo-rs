@@ -7,8 +7,7 @@ use sqlx::{Row, SqlitePool};
 
 use crate::crypto;
 use crate::utils::*;
-use cloudillo::core::worker::WorkerPool;
-use cloudillo::{action::task, auth_adapter::*, prelude::*};
+use cloudillo::{action_types, auth_adapter::*, prelude::*, worker::WorkerPool};
 
 /// Validate an access token (JWT) and return the authenticated user context
 pub(crate) async fn validate_access_token(
@@ -116,7 +115,7 @@ pub(crate) async fn check_tenant_password(
 				sub: None,
 				scope: None,
 				r: Some(roles_str.clone()),
-				exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
+				exp: Timestamp::from_now(action_types::ACCESS_TOKEN_EXPIRY),
 			};
 			let token = crypto::generate_access_token(
 				worker,
@@ -189,7 +188,7 @@ pub(crate) async fn create_tenant_login(
 				sub: None,
 				scope: None,
 				r: Some(roles_str.clone()),
-				exp: Timestamp::from_now(task::ACCESS_TOKEN_EXPIRY),
+				exp: Timestamp::from_now(action_types::ACCESS_TOKEN_EXPIRY),
 			};
 			let token = crypto::generate_access_token(
 				worker,
@@ -250,7 +249,7 @@ pub(crate) async fn create_action_token(
 	db: &SqlitePool,
 	worker: &Arc<WorkerPool>,
 	tn_id: TnId,
-	action: task::CreateAction,
+	action: action_types::CreateAction,
 ) -> ClResult<Box<str>> {
 	let res = sqlx::query(
 		"SELECT t.id_tag, k.key_id, k.private_key FROM tenants t

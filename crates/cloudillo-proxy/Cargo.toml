@@ -1,0 +1,26 @@
+[package]
+name = "cloudillo-proxy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cloudillo-core = { path = "../cloudillo-core" }
+cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
+
+axum = { version = "0.8", features = ["http2", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3.16"
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+url = "2"
+
+# TLS certificate handling (proxy site cache cert loading)
+rustls = "0.23"
+rustls-pki-types = { version = "1.14", features = ["alloc"] }
+
+# HTTP client for proxying (exclusive to this crate)
+hyper = "1.8"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2"] }
+hyper-rustls = "0.27"
+http-body-util = "0.1"

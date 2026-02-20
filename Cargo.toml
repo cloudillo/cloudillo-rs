@@ -1,8 +1,22 @@
 [workspace]
 resolver = "2"
 members = [
-	"basic-server",
 	"server",
+	"crates/cloudillo",
+	"crates/cloudillo-types",
+	"crates/cloudillo-core",
+	"crates/cloudillo-file",
+	"crates/cloudillo-push",
+	"crates/cloudillo-crdt",
+	"crates/cloudillo-rtdb",
+	"crates/cloudillo-ref",
+	"crates/cloudillo-email",
+	"crates/cloudillo-auth",
+	"crates/cloudillo-proxy",
+	"crates/cloudillo-idp",
+	"crates/cloudillo-admin",
+	"crates/cloudillo-profile",
+	"crates/cloudillo-action",
 	"adapters/auth-adapter-sqlite",
 	"adapters/blob-adapter-fs",
 	"adapters/meta-adapter-sqlite",

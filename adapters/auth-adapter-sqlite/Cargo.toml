@@ -7,7 +7,7 @@ edition.workspace = true
 async-trait = "0.1.89"
 base64 = "0.22.1"
 bcrypt = "0.18.0"
-cloudillo = { path = "../../server" }
+cloudillo = { package = "cloudillo-types", path = "../../crates/cloudillo-types" }
 jsonwebtoken = "10.3.0"
 p256 = { version = "0.13.2", features = ["pkcs8", "pem"] }
 p384 = { version = "0.13.1", features = ["pkcs8", "pem"] }

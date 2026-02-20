@@ -18,7 +18,7 @@ RUN git clone --depth 1 --branch ${RS_REF} https://github.com/cloudillo/cloudill
 # Disable sccache wrapper (not available in Docker)
 ENV RUSTC_WRAPPER=""
 RUN cargo build --profile release-lto
-RUN strip /app/target/release-lto/cloudillo-basic-server
+RUN strip /app/target/release-lto/cloudillo-server
 ARG UID
 ARG GID
 # Create non-root user files for scratch image
@@ -183,7 +183,7 @@ COPY --from=rust-builder /cloudillo-data /cloudillo/data
 WORKDIR /cloudillo
 
 # Copy cloudillo binary and its dependencies
-COPY --from=rust-builder /app/target/release-lto/cloudillo-basic-server /usr/bin/cloudillo
+COPY --from=rust-builder /app/target/release-lto/cloudillo-server /usr/bin/cloudillo
 COPY --from=rust-builder /app/templates /cloudillo/templates
 COPY --from=rust-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=rust-builder /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2

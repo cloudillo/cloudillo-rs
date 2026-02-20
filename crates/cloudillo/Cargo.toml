@@ -1,0 +1,64 @@
+[package]
+name = "cloudillo"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
+cloudillo-core = { path = "../cloudillo-core" }
+cloudillo-file = { path = "../cloudillo-file" }
+cloudillo-push = { path = "../cloudillo-push" }
+cloudillo-crdt = { path = "../cloudillo-crdt" }
+cloudillo-rtdb = { path = "../cloudillo-rtdb" }
+cloudillo-ref = { path = "../cloudillo-ref" }
+cloudillo-email = { path = "../cloudillo-email" }
+cloudillo-auth = { path = "../cloudillo-auth" }
+cloudillo-proxy = { path = "../cloudillo-proxy" }
+cloudillo-idp = { path = "../cloudillo-idp" }
+cloudillo-admin = { path = "../cloudillo-admin" }
+cloudillo-profile = { path = "../cloudillo-profile" }
+cloudillo-action = { path = "../cloudillo-action" }
+async-trait = "0.1.89"
+axum = { version = "0.8.8", features = ["http2", "macros", "multipart", "ws"] }
+base64 = "0.22.1"
+flume = { version = "0.12.0", features = ["async"] }
+futures = "0.3.32"
+#handlebars = "6.4"  # moved to cloudillo-email
+hmac = "0.12.1"
+#hyper = "1.7.0"
+#hyper-util = "0.1.17"
+instant-acme = "0.8.4"
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+pem = "3.0.6"
+rustls = "0.23.36"
+rustls-pki-types = { version = "1.14.0", features = ["alloc"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+#serde_yaml = "0.9"  # moved to cloudillo-email
+sha2 = "0.10.9"
+tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+tokio-rustls = "0.26.4"
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.8", features = ["cors", "fs", "set-header", "trace", "compression-gzip", "compression-br"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+x509-parser = "0.18.1"
+sqlx = "0.8.6"
+serde_with = "3.16.1"
+croner = "3.0.1"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+hyper = "1.8.1"
+itertools = "0.14.0"
+futures-core = "0.3.32"
+rand = "0.10.0"
+uuid = { version = "1.21", features = ["v4", "serde"] }
+lru = "0.16.3"
+parking_lot = "0.12.5"
+#lettre = { version = "0.11.19", default-features = false, features = ["builder", "rustls-tls", "tokio1", "tokio1-rustls", "smtp-transport"] }  # moved to cloudillo-email
+regex = "1.12.3"
+hickory-resolver = "0.25"
+governor = "0.10.4"
+chrono = "0.4"
+
+[dev-dependencies]
+serde_urlencoded = "0.7"
