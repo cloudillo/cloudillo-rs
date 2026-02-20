@@ -275,6 +275,10 @@ pub struct PostFileRequest {
 	file_tp: String, // Required parameter
 	#[serde(rename = "contentType")]
 	content_type: Option<String>, // Optional, defaults to application/json
+	#[serde(rename = "fileName")]
+	file_name: Option<String>,
+	#[serde(rename = "parentId")]
+	parent_id: Option<String>,
 	created_at: Option<Timestamp>,
 	tags: Option<String>,
 	/// Visibility level: P=Public, V=Verified, F=Follower, C=Connected, NULL=Direct
@@ -853,11 +857,11 @@ pub async fn post_file(
 				preset: Some("default".into()),
 				orig_variant_id: Some(file_id.clone().into()),
 				file_id: Some(file_id.clone().into()),
-				parent_id: None, // TODO: Add parent_id support for CRDT/RTDB files
+				parent_id: req.parent_id.map(Into::into),
 				owner_tag: None,
 				creator_tag: Some(auth.id_tag.clone()),
 				content_type: content_type.into(),
-				file_name: "file".into(),
+				file_name: req.file_name.clone().unwrap_or_else(|| "file".into()).into(),
 				file_tp: Some(req.file_tp.clone().into()),
 				created_at: req.created_at,
 				tags: req.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
