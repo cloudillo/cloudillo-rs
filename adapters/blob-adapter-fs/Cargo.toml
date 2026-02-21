@@ -2,10 +2,18 @@
 name = "cloudillo-blob-adapter-fs"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Filesystem-backed content-addressed blob storage adapter for the Cloudillo platform"
+keywords = ["cloudillo", "blob", "filesystem", "content-addressed", "adapter"]
+categories = ["filesystem", "database-implementations"]
+readme = "../../README.md"
 
 [dependencies]
 async-trait = "0.1.89"
-cloudillo = { package = "cloudillo-types", path = "../../crates/cloudillo-types" }
+cloudillo = { package = "cloudillo-types", path = "../../crates/cloudillo-types", version = "0.8.8" }
 futures-core = "0.3.32"
 tokio = { version = "1.49.0", features = ["fs"] }
 tokio-util = { version = "0.7.18", features = ["io"] }

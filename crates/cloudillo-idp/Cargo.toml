@@ -2,12 +2,20 @@
 name = "cloudillo-idp"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Identity provider subsystem for Cloudillo: registration, API keys, and tenant lifecycle"
+keywords = ["cloudillo", "identity", "registration", "api-keys", "federation"]
+categories = ["web-programming", "authentication"]
+readme = "../../README.md"
 
 [dependencies]
-cloudillo-core = { path = "../cloudillo-core" }
-cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
-cloudillo-ref = { path = "../cloudillo-ref" }
-cloudillo-email = { path = "../cloudillo-email" }
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
+cloudillo-ref = { workspace = true }
+cloudillo-email = { workspace = true }
 
 axum = { version = "0.8", features = ["http2", "macros"] }
 serde = { version = "1", features = ["derive"] }

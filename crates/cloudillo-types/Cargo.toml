@@ -2,6 +2,14 @@
 name = "cloudillo-types"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Shared types, adapter traits, and error types for the Cloudillo federated collaboration platform"
+keywords = ["cloudillo", "types", "federation", "adapter", "traits"]
+categories = ["web-programming", "data-structures"]
+readme = "../../README.md"
 
 [features]
 default = []

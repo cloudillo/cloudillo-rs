@@ -2,12 +2,20 @@
 name = "cloudillo-auth"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Authentication subsystem for Cloudillo: login, JWT tokens, and WebAuthn passwordless auth"
+keywords = ["cloudillo", "authentication", "webauthn", "jwt", "passwordless"]
+categories = ["web-programming", "authentication"]
+readme = "../../README.md"
 
 [dependencies]
-cloudillo-core = { path = "../cloudillo-core" }
-cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
-cloudillo-email = { path = "../cloudillo-email" }
-cloudillo-ref = { path = "../cloudillo-ref" }
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
+cloudillo-email = { workspace = true }
+cloudillo-ref = { workspace = true }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2", "macros"] }

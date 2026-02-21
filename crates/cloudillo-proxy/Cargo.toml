@@ -2,10 +2,18 @@
 name = "cloudillo-proxy"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Reverse proxy with TLS for proxying HTTP and WebSocket traffic in the Cloudillo platform"
+keywords = ["cloudillo", "proxy", "reverse-proxy", "tls", "websocket"]
+categories = ["web-programming", "network-programming"]
+readme = "../../README.md"
 
 [dependencies]
-cloudillo-core = { path = "../cloudillo-core" }
-cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
 
 axum = { version = "0.8", features = ["http2", "macros"] }
 serde = { version = "1", features = ["derive"] }

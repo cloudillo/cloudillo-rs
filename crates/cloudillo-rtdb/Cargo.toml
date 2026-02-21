@@ -2,10 +2,18 @@
 name = "cloudillo-rtdb"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Real-time database over WebSocket for Cloudillo with subscriptions, aggregates, and computed values"
+keywords = ["cloudillo", "realtime", "database", "websocket", "pubsub"]
+categories = ["web-programming", "database"]
+readme = "../../README.md"
 
 [dependencies]
-cloudillo-core = { path = "../cloudillo-core" }
-cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
 
 axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"

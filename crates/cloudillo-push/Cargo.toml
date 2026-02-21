@@ -2,10 +2,18 @@
 name = "cloudillo-push"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Web Push notification delivery for the Cloudillo platform using RFC 8291 encryption"
+keywords = ["cloudillo", "web-push", "notifications", "push", "ece"]
+categories = ["web-programming", "network-programming"]
+readme = "../../README.md"
 
 [dependencies]
-cloudillo-core = { path = "../cloudillo-core" }
-cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
 
 # HTTP framework
 axum = { version = "0.8", features = ["http2", "macros"] }

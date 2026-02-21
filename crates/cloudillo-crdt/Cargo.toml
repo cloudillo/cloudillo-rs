@@ -2,10 +2,18 @@
 name = "cloudillo-crdt"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "CRDT collaborative editing over WebSocket for Cloudillo, using the Yjs protocol"
+keywords = ["cloudillo", "crdt", "collaboration", "yjs", "websocket"]
+categories = ["web-programming", "concurrency"]
+readme = "../../README.md"
 
 [dependencies]
-cloudillo-core = { path = "../cloudillo-core" }
-cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
 
 axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"

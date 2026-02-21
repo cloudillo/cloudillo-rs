@@ -2,10 +2,17 @@
 name = "cloudillo-crdt-adapter-redb"
 version.workspace = true
 edition.workspace = true
-license = "MIT"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "redb-backed CRDT document persistence adapter for Cloudillo, storing binary Yjs updates"
+keywords = ["cloudillo", "redb", "crdt", "adapter", "yjs"]
+categories = ["database-implementations", "concurrency"]
+readme = "../../README.md"
 
 [dependencies]
-cloudillo = { package = "cloudillo-types", path = "../../crates/cloudillo-types" }
+cloudillo = { package = "cloudillo-types", path = "../../crates/cloudillo-types", version = "0.8.8" }
 
 # Core dependencies
 redb = "3.1"

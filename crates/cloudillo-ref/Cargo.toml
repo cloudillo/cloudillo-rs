@@ -2,10 +2,18 @@
 name = "cloudillo-ref"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Reference and lookup API endpoints for the Cloudillo platform"
+keywords = ["cloudillo", "reference", "lookup", "api"]
+categories = ["web-programming"]
+readme = "../../README.md"
 
 [dependencies]
-cloudillo-core = { path = "../cloudillo-core" }
-cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
 
 axum = { version = "0.8", features = ["http2", "macros"] }
 serde = { version = "1", features = ["derive"] }

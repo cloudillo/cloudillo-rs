@@ -2,12 +2,20 @@
 name = "cloudillo-auth-adapter-sqlite"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "SQLite-backed authentication adapter for Cloudillo: JWT, signing keys, passwords, WebAuthn, and TLS certificates"
+keywords = ["cloudillo", "sqlite", "authentication", "adapter", "jwt"]
+categories = ["database-implementations", "authentication"]
+readme = "../../README.md"
 
 [dependencies]
 async-trait = "0.1.89"
 base64 = "0.22.1"
 bcrypt = "0.18.0"
-cloudillo = { package = "cloudillo-types", path = "../../crates/cloudillo-types" }
+cloudillo = { package = "cloudillo-types", path = "../../crates/cloudillo-types", version = "0.8.8" }
 jsonwebtoken = "10.3.0"
 p256 = { version = "0.13.2", features = ["pkcs8", "pem"] }
 p384 = { version = "0.13.1", features = ["pkcs8", "pem"] }

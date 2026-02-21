@@ -2,22 +2,30 @@
 name = "cloudillo"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Federated, self-hosted collaboration platform with authentication, file storage, real-time editing, and activity federation"
+keywords = ["cloudillo", "federation", "self-hosted", "collaboration", "decentralized"]
+categories = ["web-programming", "network-programming"]
+readme = "../../README.md"
 
 [dependencies]
-cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
-cloudillo-core = { path = "../cloudillo-core" }
-cloudillo-file = { path = "../cloudillo-file" }
-cloudillo-push = { path = "../cloudillo-push" }
-cloudillo-crdt = { path = "../cloudillo-crdt" }
-cloudillo-rtdb = { path = "../cloudillo-rtdb" }
-cloudillo-ref = { path = "../cloudillo-ref" }
-cloudillo-email = { path = "../cloudillo-email" }
-cloudillo-auth = { path = "../cloudillo-auth" }
-cloudillo-proxy = { path = "../cloudillo-proxy" }
-cloudillo-idp = { path = "../cloudillo-idp" }
-cloudillo-admin = { path = "../cloudillo-admin" }
-cloudillo-profile = { path = "../cloudillo-profile" }
-cloudillo-action = { path = "../cloudillo-action" }
+cloudillo-types = { workspace = true }
+cloudillo-core = { workspace = true }
+cloudillo-file = { workspace = true }
+cloudillo-push = { workspace = true }
+cloudillo-crdt = { workspace = true }
+cloudillo-rtdb = { workspace = true }
+cloudillo-ref = { workspace = true }
+cloudillo-email = { workspace = true }
+cloudillo-auth = { workspace = true }
+cloudillo-proxy = { workspace = true }
+cloudillo-idp = { workspace = true }
+cloudillo-admin = { workspace = true }
+cloudillo-profile = { workspace = true }
+cloudillo-action = { workspace = true }
 async-trait = "0.1.89"
 axum = { version = "0.8.8", features = ["http2", "macros", "multipart", "ws"] }
 base64 = "0.22.1"

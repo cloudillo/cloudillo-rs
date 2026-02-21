@@ -2,12 +2,20 @@
 name = "cloudillo-server"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Reference Cloudillo server binary with SQLite, filesystem, and redb adapters for self-hosted deployment"
+keywords = ["cloudillo", "server", "self-hosted", "federation"]
+categories = ["web-programming", "network-programming"]
+readme = "../README.md"
 
 [dependencies]
-cloudillo-auth-adapter-sqlite = { path = "../adapters/auth-adapter-sqlite" }
-cloudillo-blob-adapter-fs = { path = "../adapters/blob-adapter-fs" }
-cloudillo-meta-adapter-sqlite = { path = "../adapters/meta-adapter-sqlite" }
-cloudillo-crdt-adapter-redb = { path = "../adapters/crdt-adapter-redb" }
-cloudillo-rtdb-adapter-redb = { path = "../adapters/rtdb-adapter-redb" }
-cloudillo = { path = "../crates/cloudillo" }
+cloudillo-auth-adapter-sqlite = { workspace = true }
+cloudillo-blob-adapter-fs = { workspace = true }
+cloudillo-meta-adapter-sqlite = { workspace = true }
+cloudillo-crdt-adapter-redb = { workspace = true }
+cloudillo-rtdb-adapter-redb = { workspace = true }
+cloudillo = { workspace = true }
 tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }

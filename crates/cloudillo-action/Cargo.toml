@@ -2,13 +2,21 @@
 name = "cloudillo-action"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Federated activity system for Cloudillo: signed posts, comments, reactions, and a declarative Action DSL"
+keywords = ["cloudillo", "federation", "activity", "dsl", "social"]
+categories = ["web-programming", "network-programming"]
+readme = "../../README.md"
 
 [dependencies]
-cloudillo-core = { path = "../cloudillo-core" }
-cloudillo-types = { path = "../cloudillo-types", features = ["server"] }
-cloudillo-file = { path = "../cloudillo-file" }
-cloudillo-idp = { path = "../cloudillo-idp" }
-cloudillo-push = { path = "../cloudillo-push" }
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
+cloudillo-file = { workspace = true }
+cloudillo-idp = { workspace = true }
+cloudillo-push = { workspace = true }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2", "macros"] }
