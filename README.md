@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/cloudillo/cloudillo-rs/actions/workflows/general.yaml"><img src="https://github.com/cloudillo/cloudillo-rs/actions/workflows/general.yaml/badge.svg" alt="CI"></a>
   <a href="https://crates.io/crates/cloudillo"><img src="https://img.shields.io/crates/v/cloudillo.svg" alt="crates.io"></a>
-  <a href="https://github.com/cloudillo/cloudillo-rs/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/cloudillo.svg" alt="License: LGPL-3.0-only"></a>
+  <a href="https://github.com/cloudillo/cloudillo-rs/blob/main/LICENSE.LESSER"><img src="https://img.shields.io/crates/l/cloudillo.svg" alt="License: LGPL-3.0-only"></a>
 </p>
 
 ## What is Cloudillo?
