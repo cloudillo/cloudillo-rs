@@ -45,11 +45,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 			Ok(&_) => panic!("Unknown mode"),
 			Err(_) => cloudillo::ServerMode::Standalone,
 		},
-		listen: env::var("LISTEN").unwrap_or("127.0.0.1:1443".to_string()),
+		listen: env::var("LISTEN").unwrap_or("0.0.0.0:1443".to_string()),
 		listen_http: match env::var("LISTEN_HTTP").as_deref() {
 			Ok("") | Ok("none") => None,
 			Ok(addr) => Some(addr.to_string()),
-			Err(_) => Some("127.0.0.1:1080".to_string()),
+			Err(_) => Some("0.0.0.0:1080".to_string()),
 		},
 		base_app_domain: env::var("BASE_APP_DOMAIN").unwrap_or_else(|_| base_id_tag.clone()),
 		base_id_tag,
