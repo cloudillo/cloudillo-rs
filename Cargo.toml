@@ -25,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.8"
+version = "0.8.9"
 edition = "2021"
 license = "LGPL-3.0-only"
 repository = "https://github.com/cloudillo/cloudillo-rs"
@@ -33,26 +33,26 @@ homepage = "https://cloudillo.org"
 authors = ["Szilárd Hajba <szilu@symbion.hu>"]
 
 [workspace.dependencies]
-cloudillo = { version = "0.8.8", path = "crates/cloudillo" }
-cloudillo-types = { version = "0.8.8", path = "crates/cloudillo-types", features = ["server"] }
-cloudillo-core = { version = "0.8.8", path = "crates/cloudillo-core" }
-cloudillo-file = { version = "0.8.8", path = "crates/cloudillo-file" }
-cloudillo-push = { version = "0.8.8", path = "crates/cloudillo-push" }
-cloudillo-crdt = { version = "0.8.8", path = "crates/cloudillo-crdt" }
-cloudillo-rtdb = { version = "0.8.8", path = "crates/cloudillo-rtdb" }
-cloudillo-ref = { version = "0.8.8", path = "crates/cloudillo-ref" }
-cloudillo-email = { version = "0.8.8", path = "crates/cloudillo-email" }
-cloudillo-auth = { version = "0.8.8", path = "crates/cloudillo-auth" }
-cloudillo-proxy = { version = "0.8.8", path = "crates/cloudillo-proxy" }
-cloudillo-idp = { version = "0.8.8", path = "crates/cloudillo-idp" }
-cloudillo-admin = { version = "0.8.8", path = "crates/cloudillo-admin" }
-cloudillo-profile = { version = "0.8.8", path = "crates/cloudillo-profile" }
-cloudillo-action = { version = "0.8.8", path = "crates/cloudillo-action" }
-cloudillo-auth-adapter-sqlite = { version = "0.8.8", path = "adapters/auth-adapter-sqlite" }
-cloudillo-meta-adapter-sqlite = { version = "0.8.8", path = "adapters/meta-adapter-sqlite" }
-cloudillo-blob-adapter-fs = { version = "0.8.8", path = "adapters/blob-adapter-fs" }
-cloudillo-rtdb-adapter-redb = { version = "0.8.8", path = "adapters/rtdb-adapter-redb" }
-cloudillo-crdt-adapter-redb = { version = "0.8.8", path = "adapters/crdt-adapter-redb" }
+cloudillo = { version = "0.8.9", path = "crates/cloudillo" }
+cloudillo-types = { version = "0.8.9", path = "crates/cloudillo-types", features = ["server"] }
+cloudillo-core = { version = "0.8.9", path = "crates/cloudillo-core" }
+cloudillo-file = { version = "0.8.9", path = "crates/cloudillo-file" }
+cloudillo-push = { version = "0.8.9", path = "crates/cloudillo-push" }
+cloudillo-crdt = { version = "0.8.9", path = "crates/cloudillo-crdt" }
+cloudillo-rtdb = { version = "0.8.9", path = "crates/cloudillo-rtdb" }
+cloudillo-ref = { version = "0.8.9", path = "crates/cloudillo-ref" }
+cloudillo-email = { version = "0.8.9", path = "crates/cloudillo-email" }
+cloudillo-auth = { version = "0.8.9", path = "crates/cloudillo-auth" }
+cloudillo-proxy = { version = "0.8.9", path = "crates/cloudillo-proxy" }
+cloudillo-idp = { version = "0.8.9", path = "crates/cloudillo-idp" }
+cloudillo-admin = { version = "0.8.9", path = "crates/cloudillo-admin" }
+cloudillo-profile = { version = "0.8.9", path = "crates/cloudillo-profile" }
+cloudillo-action = { version = "0.8.9", path = "crates/cloudillo-action" }
+cloudillo-auth-adapter-sqlite = { version = "0.8.9", path = "adapters/auth-adapter-sqlite" }
+cloudillo-meta-adapter-sqlite = { version = "0.8.9", path = "adapters/meta-adapter-sqlite" }
+cloudillo-blob-adapter-fs = { version = "0.8.9", path = "adapters/blob-adapter-fs" }
+cloudillo-rtdb-adapter-redb = { version = "0.8.9", path = "adapters/rtdb-adapter-redb" }
+cloudillo-crdt-adapter-redb = { version = "0.8.9", path = "adapters/crdt-adapter-redb" }
 
 [profile.release-lto]
 opt-level = "s"
