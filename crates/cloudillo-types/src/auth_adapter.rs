@@ -55,6 +55,9 @@ pub struct ActionToken {
 	/// Flags - capability flags for this action
 	pub f: Option<Box<str>>,
 
+	/// Visibility - P=Public, V=Verified, 2=2ndDegree, F=Follower, C=Connected, None=Direct
+	pub v: Option<char>,
+
 	/// Nonce - Proof-of-work nonce for rate limiting (CONN actions only).
 	#[serde(rename = "_", default, skip_serializing_if = "Option::is_none")]
 	pub nonce: Option<Box<str>>,

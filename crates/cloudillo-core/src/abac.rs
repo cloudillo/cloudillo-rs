@@ -53,6 +53,18 @@ impl VisibilityLevel {
 		}
 	}
 
+	/// Convert to database char value (inverse of from_char)
+	pub fn to_char(&self) -> Option<char> {
+		match self {
+			Self::Public => Some('P'),
+			Self::Verified => Some('V'),
+			Self::SecondDegree => Some('2'),
+			Self::Follower => Some('F'),
+			Self::Connected => Some('C'),
+			Self::Direct => None,
+		}
+	}
+
 	/// Convert to string for attribute lookup
 	pub fn as_str(&self) -> &'static str {
 		match self {

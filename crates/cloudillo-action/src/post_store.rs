@@ -589,35 +589,65 @@ async fn schedule_broadcast_delivery(
 async fn try_auto_approve(app: &App, tn_id: TnId, action: &meta_adapter::Action<Box<str>>) {
 	use crate::status;
 
+	debug!(
+		action_id = %action.action_id,
+		action_type = %action.typ,
+		issuer = %action.issuer_tag,
+		audience = ?action.audience_tag,
+		"try_auto_approve: checking action"
+	);
+
 	// Get definition for approvable check
 	let dsl = match app.ext::<Arc<DslEngine>>() {
 		Ok(d) => d,
-		Err(_) => return,
+		Err(e) => {
+			debug!("try_auto_approve: DSL engine not available: {}", e);
+			return;
+		}
 	};
 	let definition = match dsl.get_definition(&action.typ) {
 		Some(def) => def,
-		None => return,
+		None => {
+			debug!(
+				action_type = %action.typ,
+				"try_auto_approve: no definition found for type"
+			);
+			return;
+		}
 	};
 
 	// Check if action type is approvable
 	if !definition.behavior.approvable.unwrap_or(false) {
+		debug!(
+			action_type = %action.typ,
+			"try_auto_approve: action type is not approvable"
+		);
 		return;
 	}
 
 	// Get our tenant's id_tag
 	let tenant = match app.meta_adapter.read_tenant(tn_id).await {
 		Ok(tenant) => tenant,
-		Err(_) => return,
+		Err(e) => {
+			debug!("try_auto_approve: read_tenant failed: {}", e);
+			return;
+		}
 	};
 	let our_id_tag = tenant.id_tag.as_ref();
 
 	// Check if action is addressed to us (audience = our id_tag)
 	if action.audience_tag.as_deref() != Some(our_id_tag) {
+		debug!(
+			audience = ?action.audience_tag,
+			our_id_tag = %our_id_tag,
+			"try_auto_approve: audience mismatch"
+		);
 		return;
 	}
 
 	// Check issuer is not us
 	if action.issuer_tag.as_ref() == our_id_tag {
+		debug!("try_auto_approve: issuer is us, skipping");
 		return;
 	}
 
@@ -625,16 +655,29 @@ async fn try_auto_approve(app: &App, tn_id: TnId, action: &meta_adapter::Action<
 	let auto_approve_enabled =
 		app.settings.get_bool(tn_id, "federation.auto_approve").await.unwrap_or(false);
 	if !auto_approve_enabled {
+		debug!("try_auto_approve: federation.auto_approve is not enabled");
 		return;
 	}
 
 	// Check if issuer is trusted (connected = bidirectional connection established)
 	let issuer_profile = match app.meta_adapter.read_profile(tn_id, &action.issuer_tag).await {
 		Ok((_etag, profile)) => profile,
-		Err(_) => return,
+		Err(e) => {
+			debug!(
+				issuer = %action.issuer_tag,
+				error = %e,
+				"try_auto_approve: read_profile failed"
+			);
+			return;
+		}
 	};
 
 	if !issuer_profile.connected.is_connected() {
+		debug!(
+			issuer = %action.issuer_tag,
+			connected = ?issuer_profile.connected,
+			"try_auto_approve: issuer not connected"
+		);
 		return;
 	}
 
@@ -660,10 +703,12 @@ async fn try_auto_approve(app: &App, tn_id: TnId, action: &meta_adapter::Action<
 	}
 
 	// Create APRV action to signal approval to the issuer
+	// APRV gets Follower visibility so it broadcasts to our followers
 	let aprv_action = crate::task::CreateAction {
 		typ: "APRV".into(),
 		audience_tag: Some(action.issuer_tag.clone()),
 		subject: Some(action.action_id.clone()),
+		visibility: Some('F'),
 		..Default::default()
 	};
 

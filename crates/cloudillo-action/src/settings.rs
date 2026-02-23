@@ -18,6 +18,16 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Federation auto-approve actions from trusted (connected) sources
+	registry.register(
+		SettingDefinition::builder("federation.auto_approve")
+			.description("Automatically approve approvable actions from connected sources")
+			.default(SettingValue::Bool(false))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
 	// Key fetch failure cache size
 	registry.register(
 		SettingDefinition::builder("federation.key_failure_cache_size")

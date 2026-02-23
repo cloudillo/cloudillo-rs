@@ -353,10 +353,12 @@ pub async fn post_action_accept(
 		// Create APRV action with:
 		// - audience = action.issuer_tag (original sender receives the approval)
 		// - subject = action_id (the action being approved)
+		// - visibility = 'F' so APRV broadcasts to our followers
 		let aprv_action = CreateAction {
 			typ: "APRV".into(),
 			audience_tag: Some(action.issuer.id_tag.clone()),
 			subject: Some(action_id.clone().into()),
+			visibility: Some('F'),
 			..Default::default()
 		};
 
