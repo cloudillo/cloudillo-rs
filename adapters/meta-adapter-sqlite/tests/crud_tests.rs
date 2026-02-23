@@ -2,10 +2,10 @@
 //!
 //! Tests Create, Read, Update, Delete operations for tenants and profiles
 
+use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{ListProfileOptions, MetaAdapter, UpdateTenantData};
 use cloudillo_types::types::{Patch, TnId};
 use cloudillo_types::worker::WorkerPool;
-use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use std::sync::Arc;
 use tempfile::TempDir;
 

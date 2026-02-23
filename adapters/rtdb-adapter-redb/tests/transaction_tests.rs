@@ -1,6 +1,6 @@
+use cloudillo_rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
 use cloudillo_types::rtdb_adapter::RtdbAdapter;
 use cloudillo_types::types::TnId;
-use cloudillo_rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;

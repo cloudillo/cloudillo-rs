@@ -2,10 +2,10 @@
 //!
 //! Tests querying and filtering metadata
 
+use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{ListActionOptions, MetaAdapter};
 use cloudillo_types::types::TnId;
 use cloudillo_types::worker::WorkerPool;
-use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use std::sync::Arc;
 use tempfile::TempDir;
 

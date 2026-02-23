@@ -6,10 +6,10 @@
 
 #[cfg(test)]
 mod tests {
+	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use cloudillo_types::auth_adapter::{AuthAdapter, CreateTenantData};
 	use cloudillo_types::prelude::*;
 	use cloudillo_types::worker::WorkerPool;
-	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use std::sync::Arc;
 	use tempfile::TempDir;
 

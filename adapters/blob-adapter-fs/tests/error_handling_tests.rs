@@ -2,9 +2,9 @@
 //!
 //! Tests error conditions and edge cases
 
+use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use cloudillo_types::blob_adapter::{BlobAdapter, CreateBlobOptions};
 use cloudillo_types::types::TnId;
-use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use tempfile::TempDir;
 
 async fn create_test_adapter() -> (BlobAdapterFs, TempDir) {

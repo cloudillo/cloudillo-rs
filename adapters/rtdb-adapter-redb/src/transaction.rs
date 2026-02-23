@@ -268,10 +268,9 @@ impl Transaction for RedbTransaction {
 
 		// Fall back to reading committed data from transaction view
 		let key = self.build_key(path);
-		let tx = self
-			.tx
-			.as_ref()
-			.ok_or(cloudillo_types::error::Error::Internal("transaction already consumed".into()))?;
+		let tx = self.tx.as_ref().ok_or(cloudillo_types::error::Error::Internal(
+			"transaction already consumed".into(),
+		))?;
 
 		let table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 		let json_str: Option<String> = match table.get(key.as_str()) {
