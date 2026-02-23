@@ -10,7 +10,7 @@
 //! These tests were moved from src/storage.rs to follow the standard
 //! test organization pattern (integration tests in separate tests/ directory).
 
-use cloudillo::rtdb_adapter::QueryFilter;
+use cloudillo_types::rtdb_adapter::QueryFilter;
 use cloudillo_rtdb_adapter_redb::storage::*;
 use serde_json::Value;
 use std::cmp::Ordering;
@@ -52,7 +52,7 @@ fn test_value_to_string() {
 
 #[test]
 fn test_event_matches_path() {
-	use cloudillo::rtdb_adapter::ChangeEvent;
+	use cloudillo_types::rtdb_adapter::ChangeEvent;
 
 	let create_event =
 		ChangeEvent::Create { path: "users/doc1".into(), data: Value::Object(Default::default()) };

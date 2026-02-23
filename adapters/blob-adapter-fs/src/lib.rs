@@ -12,7 +12,7 @@ use tokio::{
 };
 use tokio_util::{bytes::Bytes, io::ReaderStream};
 
-use cloudillo::{blob_adapter, hasher, prelude::*, types::TnId};
+use cloudillo_types::{blob_adapter, hasher, prelude::*, types::TnId};
 
 /// Validates that a file_id hash portion contains only safe characters (base64url alphabet)
 fn validate_hash(hash: &str) -> ClResult<()> {
@@ -51,7 +51,7 @@ fn obj_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBu
 }
 
 fn obj_tmp_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
-	let tmp_id = format!("tmp-{}", cloudillo::utils::random_id()?);
+	let tmp_id = format!("tmp-{}", cloudillo_types::utils::random_id()?);
 	let hash_start = file_id.find('~').ok_or(Error::Parse)? + 1;
 	if file_id.len() < hash_start + 5 {
 		Err(Error::Parse)?
@@ -169,7 +169,7 @@ mod test {
 	use std::path::{Path, PathBuf};
 
 	use crate::obj_dir;
-	use cloudillo::types::TnId;
+	use cloudillo_types::types::TnId;
 
 	#[test]
 	fn test_obj_dir() {

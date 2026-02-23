@@ -22,8 +22,8 @@ pub use transaction::RedbTransaction;
 
 pub use error::Error;
 
-use cloudillo::prelude::*;
-use cloudillo::rtdb_adapter::*;
+use cloudillo_types::prelude::*;
+use cloudillo_types::rtdb_adapter::*;
 
 /// redb-based implementation of RtdbAdapter.
 ///

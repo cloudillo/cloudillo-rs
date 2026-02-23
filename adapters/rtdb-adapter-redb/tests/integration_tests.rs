@@ -1,7 +1,7 @@
-use cloudillo::rtdb_adapter::{
+use cloudillo_types::rtdb_adapter::{
 	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, RtdbAdapter,
 };
-use cloudillo::types::TnId;
+use cloudillo_types::types::TnId;
 use cloudillo_rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
 use serde_json::{json, Value};
 use std::path::PathBuf;

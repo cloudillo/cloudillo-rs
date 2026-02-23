@@ -30,10 +30,10 @@
 //! - In-memory document instance caching with LRU eviction
 //! - Transaction-safe atomic updates
 
-use cloudillo::crdt_adapter::{CrdtAdapter, CrdtChangeEvent, CrdtSubscriptionOptions, CrdtUpdate};
-use cloudillo::error::{ClResult, Error as ClError};
-use cloudillo::prelude::*;
-use cloudillo::types::TnId;
+use cloudillo_types::crdt_adapter::{CrdtAdapter, CrdtChangeEvent, CrdtSubscriptionOptions, CrdtUpdate};
+use cloudillo_types::error::{ClResult, Error as ClError};
+use cloudillo_types::prelude::*;
+use cloudillo_types::types::TnId;
 use dashmap::DashMap;
 use futures_core::Stream;
 use redb::{ReadableDatabase, ReadableTable};

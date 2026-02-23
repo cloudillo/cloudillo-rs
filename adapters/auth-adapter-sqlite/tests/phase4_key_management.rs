@@ -6,9 +6,9 @@
 
 #[cfg(test)]
 mod tests {
-	use cloudillo::auth_adapter::{AuthAdapter, CreateTenantData};
-	use cloudillo::prelude::*;
-	use cloudillo::worker::WorkerPool;
+	use cloudillo_types::auth_adapter::{AuthAdapter, CreateTenantData};
+	use cloudillo_types::prelude::*;
+	use cloudillo_types::worker::WorkerPool;
 	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use std::sync::Arc;
 	use tempfile::TempDir;
@@ -125,7 +125,7 @@ mod tests {
 			.await
 			.expect("Failed to create tenant");
 
-		let keypair = cloudillo::auth_adapter::KeyPair {
+		let keypair = cloudillo_types::auth_adapter::KeyPair {
 			public_key: test_public_key.into(),
 			private_key: test_private_key.into(),
 		};
@@ -164,7 +164,7 @@ mod tests {
 			.await
 			.expect("Failed to create tenant");
 
-		let keypair = cloudillo::auth_adapter::KeyPair {
+		let keypair = cloudillo_types::auth_adapter::KeyPair {
 			public_key: test_public_key.into(),
 			private_key: test_private_key.into(),
 		};
@@ -201,7 +201,7 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Set initial VAPID key
-		let keypair1 = cloudillo::auth_adapter::KeyPair {
+		let keypair1 = cloudillo_types::auth_adapter::KeyPair {
 			public_key: "key1-public".into(),
 			private_key: "key1-private".into(),
 		};
@@ -212,7 +212,7 @@ mod tests {
 			.expect("Failed to update VAPID key");
 
 		// Update with new key
-		let keypair2 = cloudillo::auth_adapter::KeyPair {
+		let keypair2 = cloudillo_types::auth_adapter::KeyPair {
 			public_key: "key2-public".into(),
 			private_key: "key2-private".into(),
 		};
@@ -282,12 +282,12 @@ mod tests {
 			.expect("Failed to create tenant 2");
 
 		// Set different VAPID keys for two tenants
-		let keypair1 = cloudillo::auth_adapter::KeyPair {
+		let keypair1 = cloudillo_types::auth_adapter::KeyPair {
 			public_key: "tenant1-public".into(),
 			private_key: "tenant1-private".into(),
 		};
 
-		let keypair2 = cloudillo::auth_adapter::KeyPair {
+		let keypair2 = cloudillo_types::auth_adapter::KeyPair {
 			public_key: "tenant2-public".into(),
 			private_key: "tenant2-private".into(),
 		};

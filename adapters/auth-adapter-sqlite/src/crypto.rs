@@ -7,7 +7,7 @@ use p384::{elliptic_curve::rand_core::OsRng, SecretKey};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use p256::SecretKey as P256SecretKey;
 
-use cloudillo::{auth_adapter::*, prelude::*, worker};
+use cloudillo_types::{auth_adapter::*, prelude::*, worker};
 
 fn generate_password_hash_sync(password: Box<str>) -> ClResult<Box<str>> {
 	let hash = bcrypt::hash(password.as_ref(), BCRYPT_COST).map_err(|_| Error::PermissionDenied)?;

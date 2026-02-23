@@ -1,6 +1,6 @@
 use crate::{storage, InstanceKey};
-use cloudillo::prelude::*;
-use cloudillo::rtdb_adapter::{ChangeEvent, LockInfo};
+use cloudillo_types::prelude::*;
+use cloudillo_types::rtdb_adapter::{ChangeEvent, LockInfo};
 use redb::{ReadableDatabase, ReadableTable};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

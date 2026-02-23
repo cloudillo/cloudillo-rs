@@ -3,7 +3,7 @@
 //! This module contains helper functions, macros, and error mapping utilities
 //! used across all domain modules.
 
-use cloudillo::prelude::*;
+use cloudillo_types::prelude::*;
 use sqlx::sqlite::SqliteRow;
 
 /// Simple helper for Patch fields - applies field to query with proper binding

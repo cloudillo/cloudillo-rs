@@ -1,4 +1,4 @@
-use cloudillo::error::Error as CloudilloError;
+use cloudillo_types::error::Error as CloudilloError;
 use std::fmt;
 
 /// Internal error type for rtdb adapter

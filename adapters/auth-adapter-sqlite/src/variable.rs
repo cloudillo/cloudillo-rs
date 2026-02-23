@@ -3,7 +3,7 @@
 use sqlx::{Row, SqlitePool};
 
 use crate::utils::*;
-use cloudillo::prelude::*;
+use cloudillo_types::prelude::*;
 
 /// Read a tenant variable
 pub(crate) async fn read_var(db: &SqlitePool, tn_id: TnId, var: &str) -> ClResult<Box<str>> {

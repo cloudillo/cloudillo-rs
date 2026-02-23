@@ -2,9 +2,9 @@
 //!
 //! Tests querying and filtering metadata
 
-use cloudillo::meta_adapter::{ListActionOptions, MetaAdapter};
-use cloudillo::types::TnId;
-use cloudillo::worker::WorkerPool;
+use cloudillo_types::meta_adapter::{ListActionOptions, MetaAdapter};
+use cloudillo_types::types::TnId;
+use cloudillo_types::worker::WorkerPool;
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -101,7 +101,7 @@ async fn test_list_tasks() {
 	let (adapter, _temp) = create_test_adapter().await;
 
 	// List tasks with default options
-	use cloudillo::meta_adapter::ListTaskOptions;
+	use cloudillo_types::meta_adapter::ListTaskOptions;
 	let opts = ListTaskOptions::default();
 
 	let result = adapter.list_tasks(opts).await;

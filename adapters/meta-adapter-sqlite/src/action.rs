@@ -3,8 +3,8 @@
 use sqlx::{Row, SqlitePool};
 
 use crate::utils::*;
-use cloudillo::meta_adapter::*;
-use cloudillo::prelude::*;
+use cloudillo_types::meta_adapter::*;
+use cloudillo_types::prelude::*;
 
 /// List actions with filtering options
 pub(crate) async fn list(
@@ -116,7 +116,7 @@ pub(crate) async fn list(
 
 	// Parse cursor for keyset pagination
 	if let Some(cursor_str) = &opts.cursor {
-		if let Some(cursor) = cloudillo::types::CursorData::decode(cursor_str) {
+		if let Some(cursor) = cloudillo_types::types::CursorData::decode(cursor_str) {
 			// Look up internal a_id from cursor's external action_id
 			let cursor_a_id: Option<i64> =
 				match sqlx::query_scalar("SELECT a_id FROM actions WHERE tn_id=? AND action_id=?")
@@ -781,7 +781,7 @@ pub(crate) async fn update_data(
 	action_id: &str,
 	opts: &UpdateActionDataOptions,
 ) -> ClResult<()> {
-	use cloudillo::types::Patch;
+	use cloudillo_types::types::Patch;
 
 	// Build dynamic UPDATE query based on which fields are set
 	let mut set_clauses = Vec::new();

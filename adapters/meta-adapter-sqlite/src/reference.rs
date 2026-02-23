@@ -4,8 +4,8 @@
 
 use sqlx::{Row, SqlitePool};
 
-use cloudillo::meta_adapter::*;
-use cloudillo::prelude::*;
+use cloudillo_types::meta_adapter::*;
+use cloudillo_types::prelude::*;
 
 /// List references with optional filtering
 pub(crate) async fn list(

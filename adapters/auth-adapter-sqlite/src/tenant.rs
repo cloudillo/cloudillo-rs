@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sqlx::{Row, SqlitePool};
 
 use crate::utils::*;
-use cloudillo::{auth_adapter::*, prelude::*, utils::random_id, worker::WorkerPool};
+use cloudillo_types::{auth_adapter::*, prelude::*, utils::random_id, worker::WorkerPool};
 
 /// Read tenant id_tag by tn_id
 pub(crate) async fn read_id_tag(db: &SqlitePool, tn_id: TnId) -> ClResult<Box<str>> {

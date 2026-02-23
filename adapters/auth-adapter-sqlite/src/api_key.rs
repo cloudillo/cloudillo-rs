@@ -3,7 +3,7 @@
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
-use cloudillo::{
+use cloudillo_types::{
 	auth_adapter::{ApiKeyInfo, ApiKeyValidation, CreateApiKeyOptions, CreatedApiKey},
 	prelude::*,
 	worker::WorkerPool,

@@ -3,8 +3,8 @@
 use sqlx::SqlitePool;
 
 use crate::utils::*;
-use cloudillo::meta_adapter::*;
-use cloudillo::prelude::*;
+use cloudillo_types::meta_adapter::*;
+use cloudillo_types::prelude::*;
 
 /// Record file access for a user (upserts record, updates accessed_at timestamp)
 /// Also updates the global accessed_at on the files table

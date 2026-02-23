@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use sqlx::{Row, SqlitePool};
 
-use cloudillo::prelude::*;
+use cloudillo_types::prelude::*;
 
 /// List all tags with optional prefix filtering and counts
 ///

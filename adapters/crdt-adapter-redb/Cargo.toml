@@ -12,7 +12,7 @@ categories = ["database-implementations", "concurrency"]
 readme = "../../README.md"
 
 [dependencies]
-cloudillo = { package = "cloudillo-types", path = "../../crates/cloudillo-types", version = "0.8.8" }
+cloudillo-types = { workspace = true }
 
 # Core dependencies
 redb = "3.1"

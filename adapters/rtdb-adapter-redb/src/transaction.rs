@@ -1,8 +1,8 @@
 use crate::{storage, DatabaseInstance};
 use async_trait::async_trait;
-use cloudillo::prelude::*;
-use cloudillo::rtdb_adapter::{ChangeEvent, Transaction};
-use cloudillo::types::TnId;
+use cloudillo_types::prelude::*;
+use cloudillo_types::rtdb_adapter::{ChangeEvent, Transaction};
+use cloudillo_types::types::TnId;
 use redb::ReadableTable;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -47,7 +47,7 @@ impl RedbTransaction {
 	fn tx_mut(&mut self) -> ClResult<&mut redb::WriteTransaction> {
 		self.tx
 			.as_mut()
-			.ok_or(cloudillo::error::Error::Internal("transaction already consumed".into()))
+			.ok_or(cloudillo_types::error::Error::Internal("transaction already consumed".into()))
 	}
 
 	/// Build a key using the appropriate strategy
@@ -271,7 +271,7 @@ impl Transaction for RedbTransaction {
 		let tx = self
 			.tx
 			.as_ref()
-			.ok_or(cloudillo::error::Error::Internal("transaction already consumed".into()))?;
+			.ok_or(cloudillo_types::error::Error::Internal("transaction already consumed".into()))?;
 
 		let table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 		let json_str: Option<String> = match table.get(key.as_str()) {

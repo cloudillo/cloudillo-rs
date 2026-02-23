@@ -1,5 +1,5 @@
-use cloudillo::error::ClResult;
-use cloudillo::rtdb_adapter::{ChangeEvent, QueryFilter};
+use cloudillo_types::error::ClResult;
+use cloudillo_types::rtdb_adapter::{ChangeEvent, QueryFilter};
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -221,7 +221,7 @@ pub fn inject_doc_id(doc: &mut Value, doc_id: &str) {
 
 /// Generate a random document ID using cloudillo's utility function
 pub fn generate_doc_id() -> ClResult<String> {
-	cloudillo::utils::random_id()
+	cloudillo_types::utils::random_id()
 }
 
 // Tests for this module have been moved to tests/storage_tests.rs

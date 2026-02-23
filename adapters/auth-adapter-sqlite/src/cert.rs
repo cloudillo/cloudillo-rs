@@ -3,7 +3,7 @@
 use sqlx::{Row, SqlitePool};
 
 use crate::utils::*;
-use cloudillo::{auth_adapter::*, prelude::*};
+use cloudillo_types::{auth_adapter::*, prelude::*};
 
 /// Create or update a certificate
 pub(crate) async fn create_cert(db: &SqlitePool, cert_data: &CertData) -> ClResult<()> {

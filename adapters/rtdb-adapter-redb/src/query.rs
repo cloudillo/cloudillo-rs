@@ -1,9 +1,9 @@
 use crate::{storage, DatabaseInstance};
-use cloudillo::error::ClResult;
-use cloudillo::rtdb_adapter::{
+use cloudillo_types::error::ClResult;
+use cloudillo_types::rtdb_adapter::{
 	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, SortField,
 };
-use cloudillo::types::TnId;
+use cloudillo_types::types::TnId;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};

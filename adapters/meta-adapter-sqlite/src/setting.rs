@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
-use cloudillo::prelude::*;
+use cloudillo_types::prelude::*;
 
 /// Maximum number of prefixes allowed in a single query to prevent DoS
 const MAX_PREFIXES: usize = 20;

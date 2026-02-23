@@ -19,7 +19,7 @@ use sqlx::{
 };
 use tokio::fs;
 
-use cloudillo::{meta_adapter::*, prelude::*, worker::WorkerPool};
+use cloudillo_types::{meta_adapter::*, prelude::*, worker::WorkerPool};
 
 #[derive(Debug)]
 pub struct MetaAdapterSqlite {

@@ -2,8 +2,8 @@
 //!
 //! Tests core CRUD operations for CRDT documents
 
-use cloudillo::crdt_adapter::{CrdtAdapter, CrdtUpdate};
-use cloudillo::types::TnId;
+use cloudillo_types::crdt_adapter::{CrdtAdapter, CrdtUpdate};
+use cloudillo_types::types::TnId;
 use cloudillo_crdt_adapter_redb::{AdapterConfig, CrdtAdapterRedb};
 use tempfile::TempDir;
 

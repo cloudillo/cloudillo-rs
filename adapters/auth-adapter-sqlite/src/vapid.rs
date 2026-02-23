@@ -3,7 +3,7 @@
 use sqlx::{Row, SqlitePool};
 
 use crate::utils::*;
-use cloudillo::{auth_adapter::*, prelude::*};
+use cloudillo_types::{auth_adapter::*, prelude::*};
 
 /// Read VAPID key pair (public and private keys)
 pub(crate) async fn read_vapid_key(db: &SqlitePool, tn_id: TnId) -> ClResult<KeyPair> {

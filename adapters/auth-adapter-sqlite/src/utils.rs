@@ -2,7 +2,7 @@
 
 use sqlx::sqlite::SqliteRow;
 
-use cloudillo::prelude::*;
+use cloudillo_types::prelude::*;
 
 /// Parse a comma-separated string into a boxed array of boxed strings
 pub(crate) fn parse_str_list(s: &str) -> Box<[Box<str>]> {

@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use sqlx::{Row, SqlitePool};
 
 use crate::utils::*;
-use cloudillo::meta_adapter::*;
-use cloudillo::prelude::*;
+use cloudillo_types::meta_adapter::*;
+use cloudillo_types::prelude::*;
 
 /// Read a single tenant by ID
 pub(crate) async fn read(dbr: &SqlitePool, tn_id: TnId) -> ClResult<Tenant<Box<str>>> {

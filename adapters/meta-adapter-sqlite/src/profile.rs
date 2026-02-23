@@ -3,8 +3,8 @@
 use sqlx::{Row, SqlitePool};
 
 use crate::utils::*;
-use cloudillo::meta_adapter::*;
-use cloudillo::prelude::*;
+use cloudillo_types::meta_adapter::*;
+use cloudillo_types::prelude::*;
 
 /// Parse connected column value to ProfileConnectionStatus
 /// Handles both TEXT ("0", "R", "1") and INTEGER (0, 1) values from SQLite

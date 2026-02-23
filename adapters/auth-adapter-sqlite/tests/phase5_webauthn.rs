@@ -9,9 +9,9 @@
 
 #[cfg(test)]
 mod tests {
-	use cloudillo::auth_adapter::{AuthAdapter, CreateTenantData};
-	use cloudillo::prelude::*;
-	use cloudillo::worker::WorkerPool;
+	use cloudillo_types::auth_adapter::{AuthAdapter, CreateTenantData};
+	use cloudillo_types::prelude::*;
+	use cloudillo_types::worker::WorkerPool;
 	use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 	use std::sync::Arc;
 	use tempfile::TempDir;
@@ -40,7 +40,7 @@ mod tests {
 			.await
 			.expect("Failed to create tenant");
 
-		let credential = cloudillo::auth_adapter::Webauthn {
+		let credential = cloudillo_types::auth_adapter::Webauthn {
 			credential_id: "cred_12345",
 			counter: 0,
 			public_key: "test-public-key-xyz",
@@ -72,7 +72,7 @@ mod tests {
 			.await
 			.expect("Failed to create tenant");
 
-		let credential = cloudillo::auth_adapter::Webauthn {
+		let credential = cloudillo_types::auth_adapter::Webauthn {
 			credential_id: "cred_read_test",
 			counter: 5,
 			public_key: "public-key-abc-123",
@@ -130,21 +130,21 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Create multiple credentials
-		let cred1 = cloudillo::auth_adapter::Webauthn {
+		let cred1 = cloudillo_types::auth_adapter::Webauthn {
 			credential_id: "cred_list_1",
 			counter: 0,
 			public_key: "pubkey1",
 			description: Some("First credential"),
 		};
 
-		let cred2 = cloudillo::auth_adapter::Webauthn {
+		let cred2 = cloudillo_types::auth_adapter::Webauthn {
 			credential_id: "cred_list_2",
 			counter: 0,
 			public_key: "pubkey2",
 			description: Some("Second credential"),
 		};
 
-		let cred3 = cloudillo::auth_adapter::Webauthn {
+		let cred3 = cloudillo_types::auth_adapter::Webauthn {
 			credential_id: "cred_list_3",
 			counter: 0,
 			public_key: "pubkey3",
@@ -224,7 +224,7 @@ mod tests {
 			.await
 			.expect("Failed to create tenant");
 
-		let credential = cloudillo::auth_adapter::Webauthn {
+		let credential = cloudillo_types::auth_adapter::Webauthn {
 			credential_id: "cred_counter_test",
 			counter: 10,
 			public_key: "pubkey-counter",
@@ -270,7 +270,7 @@ mod tests {
 			.await
 			.expect("Failed to create tenant");
 
-		let credential = cloudillo::auth_adapter::Webauthn {
+		let credential = cloudillo_types::auth_adapter::Webauthn {
 			credential_id: "cred_to_delete",
 			counter: 0,
 			public_key: "pubkey-delete",
@@ -327,14 +327,14 @@ mod tests {
 			.expect("Failed to create tenant 2");
 
 		// Create credentials for each tenant
-		let cred1 = cloudillo::auth_adapter::Webauthn {
+		let cred1 = cloudillo_types::auth_adapter::Webauthn {
 			credential_id: "shared_id", // Same ID on different tenants
 			counter: 0,
 			public_key: "tenant1-pubkey",
 			description: Some("Tenant 1 credential"),
 		};
 
-		let cred2 = cloudillo::auth_adapter::Webauthn {
+		let cred2 = cloudillo_types::auth_adapter::Webauthn {
 			credential_id: "shared_id", // Same ID on different tenants
 			counter: 0,
 			public_key: "tenant2-pubkey",
@@ -385,7 +385,7 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Create credential without description
-		let credential = cloudillo::auth_adapter::Webauthn {
+		let credential = cloudillo_types::auth_adapter::Webauthn {
 			credential_id: "cred_no_desc",
 			counter: 0,
 			public_key: "pubkey-no-desc",
@@ -427,7 +427,7 @@ mod tests {
 
 		// Create 5 credentials
 		for i in 0..5 {
-			let credential = cloudillo::auth_adapter::Webauthn {
+			let credential = cloudillo_types::auth_adapter::Webauthn {
 				credential_id: &format!("cred_{}", i),
 				counter: i as u32,
 				public_key: &format!("pubkey_{}", i),

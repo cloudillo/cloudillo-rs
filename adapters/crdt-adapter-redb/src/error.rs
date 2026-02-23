@@ -33,9 +33,9 @@ impl From<serde_json::Error> for Error {
 	}
 }
 
-impl From<Error> for cloudillo::error::Error {
+impl From<Error> for cloudillo_types::error::Error {
 	fn from(_err: Error) -> Self {
-		cloudillo::error::Error::DbError
+		cloudillo_types::error::Error::DbError
 	}
 }
 

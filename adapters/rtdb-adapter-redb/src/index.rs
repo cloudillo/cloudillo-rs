@@ -1,6 +1,6 @@
 use crate::{storage, DatabaseInstance};
-use cloudillo::error::ClResult;
-use cloudillo::types::TnId;
+use cloudillo_types::error::ClResult;
+use cloudillo_types::types::TnId;
 use redb::ReadableTable;
 use serde_json::Value;
 use std::sync::Arc;

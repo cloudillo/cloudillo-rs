@@ -6,8 +6,8 @@ use sqlx::{Row, SqlitePool};
 
 use crate::crypto;
 use crate::utils::*;
-use cloudillo::worker::WorkerPool;
-use cloudillo::{auth_adapter::*, prelude::*};
+use cloudillo_types::worker::WorkerPool;
+use cloudillo_types::{auth_adapter::*, prelude::*};
 
 /// List all profile keys for a tenant
 pub(crate) async fn list_profile_keys(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<AuthKey>> {

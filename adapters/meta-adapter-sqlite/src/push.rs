@@ -1,6 +1,6 @@
 //! Push subscription database operations
 
-use cloudillo::{
+use cloudillo_types::{
 	meta_adapter::{PushSubscription, PushSubscriptionData},
 	prelude::*,
 };

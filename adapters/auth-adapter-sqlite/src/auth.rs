@@ -7,7 +7,7 @@ use sqlx::{Row, SqlitePool};
 
 use crate::crypto;
 use crate::utils::*;
-use cloudillo::{action_types, auth_adapter::*, prelude::*, worker::WorkerPool};
+use cloudillo_types::{action_types, auth_adapter::*, prelude::*, worker::WorkerPool};
 
 /// Validate an access token (JWT) and return the authenticated user context
 pub(crate) async fn validate_access_token(

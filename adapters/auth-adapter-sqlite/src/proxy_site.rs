@@ -3,7 +3,7 @@
 use sqlx::{Row, SqlitePool};
 
 use crate::utils::*;
-use cloudillo::{auth_adapter::*, prelude::*};
+use cloudillo_types::{auth_adapter::*, prelude::*};
 
 /// Parse a proxy site row from the database
 fn parse_proxy_site_row(row: sqlx::sqlite::SqliteRow) -> Result<ProxySiteData, sqlx::Error> {

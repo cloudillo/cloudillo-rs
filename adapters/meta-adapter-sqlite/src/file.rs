@@ -3,8 +3,8 @@
 use sqlx::{Row, SqlitePool};
 
 use crate::utils::*;
-use cloudillo::meta_adapter::*;
-use cloudillo::prelude::*;
+use cloudillo_types::meta_adapter::*;
+use cloudillo_types::prelude::*;
 
 /// Get file_id by numeric f_id
 pub(crate) async fn get_id(db: &SqlitePool, tn_id: TnId, f_id: u64) -> ClResult<Box<str>> {
@@ -79,7 +79,7 @@ pub(crate) async fn list(
 		// Exclude trashed files when no specific parent is requested
 		query
 			.push(" AND (f.parent_id IS NULL OR f.parent_id != ")
-			.push_bind(cloudillo::meta_adapter::TRASH_PARENT_ID)
+			.push_bind(cloudillo_types::meta_adapter::TRASH_PARENT_ID)
 			.push(")");
 	}
 
@@ -162,7 +162,7 @@ pub(crate) async fn list(
 
 	// Parse cursor for keyset pagination
 	if let Some(cursor_str) = &opts.cursor {
-		if let Some(cursor) = cloudillo::types::CursorData::decode(cursor_str) {
+		if let Some(cursor) = cloudillo_types::types::CursorData::decode(cursor_str) {
 			// Look up internal f_id from cursor's external file_id
 			let cursor_f_id: Option<i64> =
 				sqlx::query_scalar("SELECT f_id FROM files WHERE tn_id=? AND file_id=?")
@@ -868,7 +868,7 @@ pub(crate) async fn update_data(
 	file_id: &str,
 	opts: &UpdateFileOptions,
 ) -> ClResult<()> {
-	use cloudillo::types::Patch;
+	use cloudillo_types::types::Patch;
 
 	// Build dynamic UPDATE query based on which fields are set
 	let mut set_clauses = Vec::new();
