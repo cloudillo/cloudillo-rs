@@ -4,6 +4,7 @@ use std::net::IpAddr;
 
 use std::sync::Arc;
 
+use cloudillo_core::abac::VisibilityLevel;
 use cloudillo_core::rate_limit::{PenaltyReason, PowPenaltyReason, RateLimitApi};
 use cloudillo_types::auth_adapter::ActionToken;
 use cloudillo_types::meta_adapter::{self, AttachmentView};
@@ -255,6 +256,11 @@ async fn process_inbound_action_token_inner(
 		check_subscription_permissions(app, tn_id, &action, definition).await?;
 	}
 
+	// 5b. Check flag-based permissions (comments/reactions disabled)
+	if !skip_permission_check {
+		check_inbound_flags(app, tn_id, &action, definition).await?;
+	}
+
 	// Check if this is an ephemeral action (forward only, don't persist)
 	let is_ephemeral = definition.behavior.ephemeral.unwrap_or(false);
 
@@ -270,7 +276,36 @@ async fn process_inbound_action_token_inner(
 		return Ok(None);
 	}
 
-	// 5. Store action in database
+	// 5. Resolve visibility once for both store and processing
+	let resolved_visibility = if skip_permission_check {
+		None // Pre-approved APRV-related actions get Direct visibility
+	} else {
+		let visibility = helpers::inherit_visibility(
+			app.meta_adapter.as_ref(),
+			tn_id,
+			action.v,
+			action.p.as_deref(),
+		)
+		.await;
+
+		// Get tenant's default visibility (fallback for missing + cap for explicit)
+		let default_visibility =
+			match app.settings.get_string(tn_id, "privacy.default_visibility").await {
+				Ok(default_vis) => default_vis.chars().next().unwrap_or('F'),
+				Err(_) => 'F',
+			};
+
+		// Use action visibility (or default if not set),
+		// capped at tenant's default (more restrictive wins)
+		let vis = visibility.unwrap_or(default_visibility);
+		let vis_level = VisibilityLevel::from_char(Some(vis));
+		let default_level = VisibilityLevel::from_char(Some(default_visibility));
+		// VisibilityLevel Ord: Public < ... < Connected < Direct
+		// "more restrictive" = higher Ord value → use max()
+		Some(vis_level.max(default_level).to_char().unwrap_or(vis))
+	};
+
+	// 6. Store action in database
 	store_inbound_action(
 		app,
 		tn_id,
@@ -280,10 +315,11 @@ async fn process_inbound_action_token_inner(
 		definition,
 		is_conn_action,
 		client_ip.as_ref(),
+		resolved_visibility,
 	)
 	.await;
 
-	// 6. Process attachments (async only)
+	// 7. Process attachments (async only)
 	if !is_sync {
 		if let Some(ref attachments) = action.a {
 			process_inbound_action_attachments(app, tn_id, &action.iss, attachments.clone())
@@ -291,7 +327,7 @@ async fn process_inbound_action_token_inner(
 		}
 	}
 
-	// 7. Unified post-store processing (hooks, WebSocket, fanout, auto-approve)
+	// 8. Unified post-store processing (hooks, WebSocket, fanout, auto-approve)
 	let (action_type, sub_type) = helpers::extract_type_and_subtype(&action.t);
 	let content_str = helpers::serialize_content(action.c.as_ref()).map(|s| s.into_boxed_str());
 	let root_id =
@@ -311,13 +347,7 @@ async fn process_inbound_action_token_inner(
 		subject: action.sub.clone(),
 		created_at: action.iat,
 		expires_at: action.exp,
-		visibility: helpers::inherit_visibility(
-			app.meta_adapter.as_ref(),
-			tn_id,
-			None,
-			action.p.as_deref(),
-		)
-		.await,
+		visibility: resolved_visibility,
 		flags: action.f.clone(),
 		x: None,
 	};
@@ -571,6 +601,68 @@ fn check_subscription_role_permission(
 	Ok(())
 }
 
+/// Check flag-based permissions for inbound actions using definition's gating config
+async fn check_inbound_flags(
+	app: &App,
+	tn_id: TnId,
+	action: &ActionToken,
+	definition: &crate::dsl::types::ActionDefinition,
+) -> ClResult<()> {
+	let (_action_type, sub_type) = helpers::extract_type_and_subtype(&action.t);
+	let is_delete = sub_type.as_deref() == Some("DEL");
+
+	// DEL subtypes should not be gated (deletions must always be allowed through)
+	if is_delete {
+		return Ok(());
+	}
+
+	// Check parent flag gating
+	if let Some(flag) = definition.behavior.gated_by_parent_flag {
+		if let Some(ref parent_id) = action.p {
+			if let Ok(Some(parent)) = app.meta_adapter.get_action(tn_id, parent_id).await {
+				if !helpers::is_capability_enabled(parent.flags.as_deref(), flag) {
+					warn!(
+						issuer = %action.iss,
+						parent_id = %parent_id,
+						flag = %flag,
+						"Rejecting inbound {}: capability disabled on parent",
+						action.t
+					);
+					return Err(Error::ValidationError(format!(
+						"{} is disabled on the parent action",
+						action.t
+					)));
+				}
+			}
+			// Parent not found locally — allow through (sender should have validated)
+		}
+	}
+
+	// Check subject flag gating
+	if let Some(flag) = definition.behavior.gated_by_subject_flag {
+		if let Some(ref subject_id) = action.sub {
+			if let Ok(Some(subject)) = app.meta_adapter.get_action(tn_id, subject_id).await {
+				if !helpers::is_capability_enabled(subject.flags.as_deref(), flag) {
+					warn!(
+						issuer = %action.iss,
+						subject_id = %subject_id,
+						flag = %flag,
+						"Rejecting inbound {}: capability disabled on subject",
+						action.t
+					);
+					return Err(Error::ValidationError(format!(
+						"{} is disabled on the subject action",
+						action.t
+					)));
+				}
+			}
+			// Subject not found locally — allow through (sender should have validated)
+		}
+	}
+
+	Ok(())
+}
+
 /// Store inbound action in database
 #[allow(clippy::too_many_arguments)]
 async fn store_inbound_action(
@@ -582,6 +674,7 @@ async fn store_inbound_action(
 	definition: &crate::dsl::types::ActionDefinition,
 	is_conn_action: bool,
 	client_ip: Option<&IpAddr>,
+	visibility: Option<char>,
 ) {
 	let (action_type, sub_type) = helpers::extract_type_and_subtype(&action.t);
 	let sub_type_ref = sub_type.as_deref();
@@ -598,9 +691,6 @@ async fn store_inbound_action(
 	});
 
 	let content_str = helpers::serialize_content(action.c.as_ref());
-	let visibility =
-		helpers::inherit_visibility(app.meta_adapter.as_ref(), tn_id, None, action.p.as_deref())
-			.await;
 
 	// Resolve root_id from parent chain (not just parent_id)
 	let root_id =

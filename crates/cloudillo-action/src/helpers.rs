@@ -107,21 +107,26 @@ pub async fn resolve_root_id<M: MetaAdapter + ?Sized>(
 // =============================================================================
 // Action Flags
 // =============================================================================
-// Flags use uppercase for enabled, lowercase for disabled:
-// - R/r: Reactions allowed/forbidden
-// - C/c: Comments allowed/forbidden
-// - O/o: Open (anyone can subscribe) / Closed (invite-only)
+// Flags use lowercase to disable capabilities:
+// - r: Reactions disabled (absence = enabled)
+// - c: Comments disabled (absence = enabled)
+// - O/o: Open (anyone can subscribe) / Closed (invite-only) — opt-in semantics
 
-/// Check if reactions (REACT) are allowed on this action
-/// Returns true if 'R' is present in flags, false otherwise
-pub fn can_react(flags: Option<&str>) -> bool {
-	flags.map(|f| f.contains('R')).unwrap_or(false)
+/// Check if a capability flag is enabled (not disabled by lowercase).
+/// Capabilities are enabled by default; a lowercase flag character disables them.
+pub fn is_capability_enabled(flags: Option<&str>, capability: char) -> bool {
+	let disabled_char = capability.to_ascii_lowercase();
+	!flags.map(|f| f.contains(disabled_char)).unwrap_or(false)
 }
 
-/// Check if comments (CMNT) are allowed on this action
-/// Returns true if 'C' is present in flags, false otherwise
+/// Reactions enabled unless explicitly disabled with lowercase 'r'
+pub fn can_react(flags: Option<&str>) -> bool {
+	is_capability_enabled(flags, 'R')
+}
+
+/// Comments enabled unless explicitly disabled with lowercase 'c'
 pub fn can_comment(flags: Option<&str>) -> bool {
-	flags.map(|f| f.contains('C')).unwrap_or(false)
+	is_capability_enabled(flags, 'C')
 }
 
 /// Check if the action is open (anyone can subscribe without invitation)
@@ -320,32 +325,56 @@ mod tests {
 
 	// Flag tests
 	#[test]
-	fn test_can_react_uppercase() {
-		assert!(can_react(Some("RCo")));
-		assert!(can_react(Some("R")));
-	}
-
-	#[test]
-	fn test_can_react_lowercase() {
-		assert!(!can_react(Some("rCo")));
-		assert!(!can_react(Some("co")));
-	}
-
-	#[test]
 	fn test_can_react_none() {
-		assert!(!can_react(None));
+		// None = enabled (no flags means all capabilities on)
+		assert!(can_react(None));
 	}
 
 	#[test]
-	fn test_can_comment_uppercase() {
+	fn test_can_react_enabled() {
+		// No lowercase 'r' = reactions enabled
+		assert!(can_react(Some("RCo")));
+		assert!(can_react(Some("co")));
+		assert!(can_react(Some("")));
+	}
+
+	#[test]
+	fn test_can_react_disabled() {
+		// Lowercase 'r' = reactions disabled
+		assert!(!can_react(Some("rCo")));
+		assert!(!can_react(Some("rco")));
+		assert!(!can_react(Some("r")));
+	}
+
+	#[test]
+	fn test_can_comment_none() {
+		// None = enabled
+		assert!(can_comment(None));
+	}
+
+	#[test]
+	fn test_can_comment_enabled() {
+		// No lowercase 'c' = comments enabled
 		assert!(can_comment(Some("RCo")));
-		assert!(can_comment(Some("C")));
+		assert!(can_comment(Some("ro")));
+		assert!(can_comment(Some("")));
 	}
 
 	#[test]
-	fn test_can_comment_lowercase() {
+	fn test_can_comment_disabled() {
+		// Lowercase 'c' = comments disabled
 		assert!(!can_comment(Some("Rco")));
-		assert!(!can_comment(Some("ro")));
+		assert!(!can_comment(Some("rco")));
+		assert!(!can_comment(Some("c")));
+	}
+
+	#[test]
+	fn test_is_capability_enabled() {
+		// Generic helper tests
+		assert!(is_capability_enabled(None, 'R'));
+		assert!(is_capability_enabled(Some(""), 'R'));
+		assert!(!is_capability_enabled(Some("r"), 'R'));
+		assert!(is_capability_enabled(Some("c"), 'R')); // 'c' doesn't affect 'R'
 	}
 
 	#[test]

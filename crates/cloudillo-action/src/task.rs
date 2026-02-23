@@ -108,6 +108,47 @@ pub async fn create_action(
 		}
 	}
 
+	// Outbound validation: generic flag gating from BehaviorFlags
+	{
+		let (_action_type, sub_type) = helpers::extract_type_and_subtype(&action.typ);
+		let is_delete = sub_type.as_deref() == Some("DEL");
+
+		if !is_delete {
+			if let Some(flag) = behavior.as_ref().and_then(|b| b.gated_by_parent_flag) {
+				if let Some(ref parent_id) = action.parent_id {
+					if !parent_id.starts_with('@') {
+						if let Ok(Some(parent)) =
+							app.meta_adapter.get_action(tn_id, parent_id).await
+						{
+							if !helpers::is_capability_enabled(parent.flags.as_deref(), flag) {
+								return Err(Error::ValidationError(format!(
+									"{} is disabled on the parent action",
+									action.typ
+								)));
+							}
+						}
+					}
+				}
+			}
+			if let Some(flag) = behavior.as_ref().and_then(|b| b.gated_by_subject_flag) {
+				if let Some(ref subject_id) = action.subject {
+					if !subject_id.starts_with('@') {
+						if let Ok(Some(subject)) =
+							app.meta_adapter.get_action(tn_id, subject_id).await
+						{
+							if !helpers::is_capability_enabled(subject.flags.as_deref(), flag) {
+								return Err(Error::ValidationError(format!(
+									"{} is disabled on the subject action",
+									action.typ
+								)));
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Serialize content Value to string for storage (always JSON-encode)
 	let content_str = helpers::serialize_content(action.content.as_ref());
 

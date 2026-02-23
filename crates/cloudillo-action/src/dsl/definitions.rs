@@ -237,6 +237,7 @@ fn react_definition() -> ActionDefinition {
 			broadcast: Some(false),
 			allow_unknown: Some(true),
 			requires_acceptance: Some(false),
+			gated_by_subject_flag: Some('R'),
 
 			..Default::default()
 		},
@@ -295,6 +296,7 @@ fn comment_definition() -> ActionDefinition {
 			broadcast: Some(false),
 			allow_unknown: Some(true),
 			requires_acceptance: Some(false),
+			gated_by_parent_flag: Some('C'),
 
 			..Default::default()
 		},

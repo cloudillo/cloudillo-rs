@@ -209,6 +209,16 @@ pub struct BehaviorFlags {
 	/// Applied during action creation.
 	pub default_flags: Option<String>,
 
+	/// Flag character that gates this action on the PARENT action's flags.
+	/// If set and the parent has the lowercase version, this action is rejected.
+	/// E.g., 'C' for CMNT: if parent has 'c' (comments disabled), reject.
+	pub gated_by_parent_flag: Option<char>,
+
+	/// Flag character that gates this action on the SUBJECT action's flags.
+	/// Same logic but checks the subject action.
+	/// E.g., 'R' for REACT: if subject has 'r' (reactions disabled), reject.
+	pub gated_by_subject_flag: Option<char>,
+
 	// === Reserved (Not Implemented) ===
 	/// RESERVED: Requires user confirmation before activation.
 	/// When implemented, would set initial status to CONFIRMATION.
