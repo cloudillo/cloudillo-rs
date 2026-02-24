@@ -413,8 +413,37 @@ fn should_serve_spa_fallback(path: &str) -> bool {
 async fn serve_shell_index_html(
 	dist_dir: &std::path::Path,
 	disable_cache: bool,
+	if_none_match: Option<&str>,
 ) -> axum::response::Response {
 	let file_path = dist_dir.join("index.html");
+
+	// Read file metadata for ETag computation (length + mtime)
+	let metadata = tokio::fs::metadata(&file_path).await.ok();
+	let etag = metadata.as_ref().and_then(|m| {
+		let len = m.len();
+		let mtime = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+		Some(format!("\"{}{}\"", len, mtime.as_secs()))
+	});
+
+	// Check If-None-Match for conditional response
+	if let (Some(etag), Some(inm)) = (&etag, if_none_match) {
+		// Strip surrounding quotes and whitespace for comparison
+		let inm_trimmed = inm.trim().trim_matches('"');
+		let etag_trimmed = etag.trim_matches('"');
+		if inm_trimmed == etag_trimmed {
+			let cache_value = if disable_cache {
+				HeaderValue::from_static("no-store, no-cache")
+			} else {
+				HeaderValue::from_static("no-cache, must-revalidate")
+			};
+			return Response::builder()
+				.status(StatusCode::NOT_MODIFIED)
+				.header(header::CACHE_CONTROL, cache_value)
+				.header(header::ETAG, etag.as_str())
+				.body(Body::empty())
+				.unwrap_or_else(|_| Response::new(Body::empty()));
+		}
+	}
 
 	match tokio::fs::read(&file_path).await {
 		Ok(content) => {
@@ -425,10 +454,14 @@ async fn serve_shell_index_html(
 				HeaderValue::from_static("no-cache, must-revalidate")
 			};
 
-			Response::builder()
+			let mut builder = Response::builder()
 				.status(StatusCode::OK)
 				.header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-				.header(header::CACHE_CONTROL, cache_value)
+				.header(header::CACHE_CONTROL, cache_value);
+			if let Some(etag) = &etag {
+				builder = builder.header(header::ETAG, etag.as_str());
+			}
+			builder
 				.body(Body::from(content))
 				.unwrap_or_else(|_| Response::new(Body::from("Internal Server Error")))
 		}
@@ -509,8 +542,9 @@ async fn serve_dynamic_sw(
 		false
 	};
 
-	// 4. Read SW template from dist directory
-	let sw_path = app.opts.dist_dir.join(sw_file);
+	// 4. Read sw.js template — all versioned sw-*.js URLs map to the same file on disk
+	info!("[SW] Serving sw.js for requested {}", sw_file);
+	let sw_path = app.opts.dist_dir.join("sw.js");
 	let sw_content = tokio::fs::read_to_string(&sw_path).await.map_err(|e| {
 		warn!("Failed to read SW template {}: {}", sw_path.display(), e);
 		Error::NotFound
@@ -577,6 +611,13 @@ async fn static_fallback_handler(
 	// Store path for potential SPA fallback (request is moved by serve_dir.call)
 	let path_owned = path.to_string();
 
+	// Extract If-None-Match before request is consumed (needed for SPA fallback ETag)
+	let if_none_match = request
+		.headers()
+		.get(header::IF_NONE_MATCH)
+		.and_then(|v| v.to_str().ok())
+		.map(|s| s.to_string());
+
 	// Serve static files - NO unconditional fallback; we handle 404s manually
 	let dist_dir = &app.opts.dist_dir;
 	let mut serve_dir = ServeDir::new(dist_dir).precompressed_gzip().precompressed_br();
@@ -587,7 +628,7 @@ async fn static_fallback_handler(
 	if response.status() == StatusCode::NOT_FOUND {
 		// Only serve shell's index.html for client routes (not API, WS, apps, or files with extensions)
 		if should_serve_spa_fallback(&path_owned) {
-			return serve_shell_index_html(dist_dir, disable_cache).await;
+			return serve_shell_index_html(dist_dir, disable_cache, if_none_match.as_deref()).await;
 		}
 		// Otherwise return the 404 as-is
 		return response.map(Body::new);
@@ -607,7 +648,10 @@ async fn static_fallback_handler(
 			.map(|ct| ct.starts_with("text/html"))
 			.unwrap_or(false);
 
-		if is_html {
+		if is_sw_file(&path_owned) {
+			// SW files must never be long-cached even via static fallback
+			HeaderValue::from_static("private, no-store, no-cache")
+		} else if is_html {
 			// index.html: ETag-only, must revalidate on every request
 			HeaderValue::from_static("no-cache, must-revalidate")
 		} else {
