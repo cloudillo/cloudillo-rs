@@ -5,6 +5,11 @@
 
 #![allow(unused)]
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use std::{env, path::PathBuf, sync::Arc};
 use tokio::fs;
 
@@ -34,46 +39,38 @@ pub struct Config {
 //#[tokio::main(flavor = "current_thread")]
 // This is needed for task::block_in_place() which is used in SNI certificate resolver
 #[tokio::main(flavor = "multi_thread", worker_threads = 1)]
+#[expect(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let base_id_tag = env::var("BASE_ID_TAG").expect("BASE_ID_TAG must be set");
 
 	let config = Config {
 		mode: match env::var("MODE").as_deref() {
-			Ok("standalone") => cloudillo::ServerMode::Standalone,
+			Ok("standalone") | Err(_) => cloudillo::ServerMode::Standalone,
 			Ok("proxy") => cloudillo::ServerMode::Proxy,
 			Ok("stream-proxy") => cloudillo::ServerMode::StreamProxy,
-			Ok(&_) => panic!("Unknown mode"),
-			Err(_) => cloudillo::ServerMode::Standalone,
+			Ok(_) => panic!("Unknown mode"),
 		},
-		listen: env::var("LISTEN").unwrap_or("0.0.0.0:1443".to_string()),
+		listen: env::var("LISTEN").unwrap_or_else(|_| "0.0.0.0:1443".to_string()),
 		listen_http: match env::var("LISTEN_HTTP").as_deref() {
-			Ok("") | Ok("none") => None,
+			Ok("" | "none") => None,
 			Ok(addr) => Some(addr.to_string()),
 			Err(_) => Some("0.0.0.0:1080".to_string()),
 		},
 		base_app_domain: env::var("BASE_APP_DOMAIN").unwrap_or_else(|_| base_id_tag.clone()),
 		base_id_tag,
 		base_password: env::var("BASE_PASSWORD").ok(),
-		data_dir: env::var("DATA_DIR")
-			.map(PathBuf::from)
-			.unwrap_or_else(|_| PathBuf::from("./data")),
+		data_dir: env::var("DATA_DIR").map_or_else(|_| PathBuf::from("./data"), PathBuf::from),
 		priv_data_dir: env::var("PRIVATE_DATA_DIR")
-			.map(PathBuf::from)
-			.unwrap_or_else(|_| PathBuf::from("./data")),
+			.map_or_else(|_| PathBuf::from("./data"), PathBuf::from),
 		pub_data_dir: env::var("PUBLIC_DATA_DIR")
-			.map(PathBuf::from)
-			.unwrap_or_else(|_| PathBuf::from("./data")),
-		dist_dir: env::var("DIST_DIR")
-			.map(PathBuf::from)
-			.unwrap_or_else(|_| PathBuf::from("./dist")),
+			.map_or_else(|_| PathBuf::from("./data"), PathBuf::from),
+		dist_dir: env::var("DIST_DIR").map_or_else(|_| PathBuf::from("./dist"), PathBuf::from),
 		acme_email: env::var("ACME_EMAIL").ok(),
 		local_address: env::var("LOCAL_ADDRESS")
 			.ok()
 			.map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
 			.unwrap_or_default(),
-		db_dir: env::var("DB_DIR")
-			.map(PathBuf::from)
-			.unwrap_or_else(|_| PathBuf::from("./data")),
+		db_dir: env::var("DB_DIR").map_or_else(|_| PathBuf::from("./data"), PathBuf::from),
 	};
 	fs::create_dir_all(&config.db_dir).await.expect("Cannot create db dir");
 	//tracing_subscriber::fmt::init();
@@ -94,9 +91,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	// CRDT adapter for collaborative editing
 	let crdt_config = CrdtConfig {
-		max_instances: 100,
-		idle_timeout_secs: 3600,
-		broadcast_capacity: 128,
+		max_instances: 100,      // max concurrent open documents
+		idle_timeout_secs: 3600, // evict after 1 hour of inactivity
+		broadcast_capacity: 128, // channel buffer for sync broadcasts
 		auto_evict: true,
 	};
 	let crdt_adapter = Arc::new(
@@ -107,9 +104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	// RTDB adapter for real-time database
 	let rtdb_config = RtdbConfig {
-		max_instances: 100,
-		idle_timeout_secs: 3600,
-		broadcast_capacity: 128,
+		max_instances: 100,      // max concurrent open databases
+		idle_timeout_secs: 3600, // evict after 1 hour of inactivity
+		broadcast_capacity: 128, // channel buffer for change broadcasts
 		auto_evict: true,
 	};
 	let rtdb_adapter = Arc::new(
