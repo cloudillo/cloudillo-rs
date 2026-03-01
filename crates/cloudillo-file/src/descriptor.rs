@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, fmt::Write, sync::Arc};
 
 use crate::handler::GetFileVariantSelector;
 use crate::prelude::*;
@@ -19,7 +19,6 @@ use crate::variant::{Variant, VariantClass};
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_types::hasher::Hasher;
 use cloudillo_types::meta_adapter;
-use cloudillo_types::types::TnId;
 
 /// Descriptor format version
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,13 +90,13 @@ pub fn get_file_descriptor_versioned<S: AsRef<str> + Debug + Eq>(
 
 				// Add optional properties (skip zero values - semantically equivalent to unset)
 				if let Some(dur) = v.duration.filter(|&d| d != 0.0) {
-					parts.push_str(&format!(":dur={}", dur));
+					let _ = write!(parts, ":dur={}", dur);
 				}
 				if let Some(br) = v.bitrate.filter(|&b| b != 0) {
-					parts.push_str(&format!(":br={}", br));
+					let _ = write!(parts, ":br={}", br);
 				}
 				if let Some(pg) = v.page_count.filter(|&p| p != 0) {
-					parts.push_str(&format!(":pg={}", pg));
+					let _ = write!(parts, ":pg={}", pg);
 				}
 
 				parts
@@ -125,7 +124,7 @@ fn parse_variant_entry(
 	let mut bitrate: Option<u32> = None;
 	let mut page_count: Option<u32> = None;
 
-	for prop in v_vec[2..].iter() {
+	for prop in &v_vec[2..] {
 		if let Some(val) = prop.strip_prefix("f=") {
 			format = Some(val);
 		} else if let Some(val) = prop.strip_prefix("s=") {

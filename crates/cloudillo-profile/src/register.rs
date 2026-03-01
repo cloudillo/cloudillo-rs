@@ -16,6 +16,7 @@ use cloudillo_core::{
 	extract::OptionalAuth,
 	CreateCompleteTenantFn,
 };
+use cloudillo_idp::registration::{IdpRegContent, IdpRegResponse};
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::address::parse_address_type;
 use cloudillo_types::types::{ApiResponse, RegisterRequest, RegisterVerifyCheckRequest};
@@ -84,7 +85,7 @@ pub async fn verify_register_data(
 	};
 
 	let mut response = DomainValidationResponse {
-		address: app.opts.local_address.iter().map(|s| s.to_string()).collect(),
+		address: app.opts.local_address.iter().map(ToString::to_string).collect(),
 		address_type,
 		id_tag_error: String::new(),
 		app_domain_error: String::new(),
@@ -115,13 +116,10 @@ pub async fn verify_register_data(
 			}
 
 			// DNS validation - use recursive resolver from root nameservers
-			let resolver = match create_recursive_resolver() {
-				Ok(r) => r,
-				Err(_) => {
-					// If we can't create resolver, return nodns error
-					response.id_tag_error = "nodns".to_string();
-					return Ok(response);
-				}
+			let Ok(resolver) = create_recursive_resolver() else {
+				// If we can't create resolver, return nodns error
+				response.id_tag_error = "nodns".to_string();
+				return Ok(response);
 			};
 
 			// Check if id_tag already registered
@@ -279,7 +277,7 @@ pub async fn post_verify_profile(
 		return Ok((
 			StatusCode::OK,
 			Json(DomainValidationResponse {
-				address: app.opts.local_address.iter().map(|s| s.to_string()).collect(),
+				address: app.opts.local_address.iter().map(ToString::to_string).collect(),
 				address_type,
 				id_tag_error: String::new(),
 				app_domain_error: String::new(),
@@ -305,6 +303,11 @@ async fn handle_idp_registration(
 	email: String,
 	lang: Option<String>,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
+	#[derive(serde::Serialize)]
+	struct InboxRequest {
+		token: String,
+	}
+
 	// Extract the IDP domain from id_tag (e.g., "alice.cloudillo.net" -> "cloudillo.net")
 	let idp_domain = match id_tag_lower.find('.') {
 		Some(pos) => &id_tag_lower[pos + 1..],
@@ -320,15 +323,12 @@ async fn handle_idp_registration(
 		.as_ref()
 		.ok_or_else(|| Error::ConfigError("BASE_ID_TAG not configured".into()))?;
 
-	// Create IDP:REG action
-	use cloudillo_idp::registration::IdpRegContent;
-
 	let expires_at = Timestamp::now().add_seconds(86400 * 30); // 30 days
 															// Include all local addresses from the app configuration (comma-separated)
 	let address = if app.opts.local_address.is_empty() {
 		None
 	} else {
-		Some(app.opts.local_address.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(","))
+		Some(app.opts.local_address.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(","))
 	};
 	let reg_content = IdpRegContent {
 		id_tag: id_tag_lower.clone(),
@@ -357,12 +357,6 @@ async fn handle_idp_registration(
 	// Generate action JWT token
 	let action_token = app.auth_adapter.create_action_token(TnId(1), action).await?;
 
-	// Prepare inbox request with token
-	#[derive(serde::Serialize)]
-	struct InboxRequest {
-		token: String,
-	}
-
 	let inbox_request = InboxRequest { token: action_token.to_string() };
 
 	// POST to IDP provider's /inbox/sync endpoint
@@ -389,7 +383,6 @@ async fn handle_idp_registration(
 		})?;
 
 	// Parse the IDP response
-	use cloudillo_idp::registration::IdpRegResponse;
 	let idp_reg_result: IdpRegResponse =
 		serde_json::from_value(idp_response.data).map_err(|e| {
 			warn!(
@@ -421,11 +414,11 @@ async fn handle_idp_registration(
 	// Derive display name from id_tag (capitalize first letter of prefix)
 	let display_name = if id_tag_lower.contains('.') {
 		let parts: Vec<&str> = id_tag_lower.split('.').collect();
-		if !parts.is_empty() {
+		if parts.is_empty() {
+			id_tag_lower.clone()
+		} else {
 			let name = parts[0];
 			format!("{}{}", name.chars().next().unwrap_or('U').to_uppercase(), &name[1..])
-		} else {
-			id_tag_lower.clone()
 		}
 	} else {
 		id_tag_lower.clone()
@@ -513,7 +506,7 @@ async fn handle_idp_registration(
 	)
 	.await
 	{
-		Ok(_) => {
+		Ok(()) => {
 			info!(
 				email = %email,
 				id_tag = %id_tag_lower,
@@ -575,11 +568,11 @@ async fn handle_domain_registration(
 	// Derive display name from id_tag (capitalize first letter of prefix)
 	let display_name = if id_tag_lower.contains('.') {
 		let parts: Vec<&str> = id_tag_lower.split('.').collect();
-		if !parts.is_empty() {
+		if parts.is_empty() {
+			id_tag_lower.clone()
+		} else {
 			let name = parts[0];
 			format!("{}{}", name.chars().next().unwrap_or('U').to_uppercase(), &name[1..])
-		} else {
-			id_tag_lower.clone()
 		}
 	} else {
 		id_tag_lower.clone()
@@ -673,7 +666,7 @@ async fn handle_domain_registration(
 	)
 	.await
 	{
-		Ok(_) => {
+		Ok(()) => {
 			info!(
 				email = %email,
 				id_tag = %id_tag_lower,

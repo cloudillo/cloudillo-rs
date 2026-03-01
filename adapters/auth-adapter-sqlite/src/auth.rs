@@ -6,8 +6,13 @@ use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use sqlx::{Row, SqlitePool};
 
 use crate::crypto;
-use crate::utils::*;
-use cloudillo_types::{action_types, auth_adapter::*, prelude::*, worker::WorkerPool};
+use crate::utils::inspect;
+use cloudillo_types::{
+	action_types,
+	auth_adapter::{AccessToken, ActionToken, AuthCtx, AuthLogin},
+	prelude::*,
+	worker::WorkerPool,
+};
 
 /// Validate an access token (JWT) and return the authenticated user context
 pub(crate) async fn validate_access_token(
@@ -32,6 +37,9 @@ pub(crate) async fn validate_access_token(
 
 /// Get or generate the JWT secret for HS256 signing
 pub(crate) async fn ensure_jwt_secret(db: &SqlitePool) -> ClResult<String> {
+	use base64::Engine;
+	use rand::Rng;
+
 	// Try to read existing secret
 	let res = sqlx::query("SELECT value FROM vars WHERE key = ?1")
 		.bind("0:jwt_secret")
@@ -45,8 +53,6 @@ pub(crate) async fn ensure_jwt_secret(db: &SqlitePool) -> ClResult<String> {
 	}
 
 	// Generate new secret (32 random bytes, base64 encoded)
-	use base64::Engine;
-	use rand::Rng;
 	let mut secret_bytes = [0u8; 32];
 	let mut rng = rand::rng();
 	rng.fill_bytes(&mut secret_bytes);
@@ -77,14 +83,12 @@ fn build_tenant_owner_roles(db_roles: Option<&str>) -> Box<str> {
 }
 
 /// Parse roles string into boxed slice for AuthLogin
-fn parse_roles_to_boxed_slice(roles_str: &str) -> Option<Box<[Box<str>]>> {
-	Some(
-		roles_str
-			.split(',')
-			.map(|s| s.into())
-			.collect::<Vec<Box<str>>>()
-			.into_boxed_slice(),
-	)
+fn parse_roles_to_boxed_slice(roles_str: &str) -> Box<[Box<str>]> {
+	roles_str
+		.split(',')
+		.map(Into::into)
+		.collect::<Vec<Box<str>>>()
+		.into_boxed_slice()
 }
 
 /// Check tenant password
@@ -127,7 +131,7 @@ pub(crate) async fn check_tenant_password(
 			Ok(AuthLogin {
 				tn_id: row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?,
 				id_tag: Box::from(id_tag),
-				roles: parse_roles_to_boxed_slice(&roles_str),
+				roles: Some(parse_roles_to_boxed_slice(&roles_str)),
 				token,
 			})
 		}
@@ -200,7 +204,7 @@ pub(crate) async fn create_tenant_login(
 			Ok(AuthLogin {
 				tn_id: row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?,
 				id_tag: Box::from(id_tag),
-				roles: parse_roles_to_boxed_slice(&roles_str),
+				roles: Some(parse_roles_to_boxed_slice(&roles_str)),
 				token,
 			})
 		}
@@ -296,6 +300,19 @@ pub(crate) async fn create_proxy_token(
 	id_tag: &str,
 	roles: &[Box<str>],
 ) -> ClResult<Box<str>> {
+	use jsonwebtoken::{encode, EncodingKey, Header};
+
+	// Build payload as a serializable struct
+	#[derive(serde::Serialize)]
+	struct ProxyTokenPayload {
+		iss: String,
+		sub: String,
+		aud: String,
+		iat: u64,
+		exp: u64,
+		roles: Vec<String>,
+	}
+
 	// Fetch the latest key for this tenant
 	let res = sqlx::query(
 		"SELECT key_id, private_key FROM keys WHERE tn_id = ? ORDER BY key_id DESC LIMIT 1",
@@ -310,29 +327,16 @@ pub(crate) async fn create_proxy_token(
 
 	// Create proxy token JWT with user's id_tag and roles
 	// Proxy tokens allow this user to authenticate on behalf of the server in federation
-	use jsonwebtoken::{encode, EncodingKey, Header};
-
 	let now = Timestamp::now();
 	let exp = Timestamp::from_now(86400); // 24 hours from now
-
-	// Build payload as a serializable struct
-	#[derive(serde::Serialize)]
-	struct ProxyTokenPayload {
-		iss: String,
-		sub: String,
-		aud: String,
-		iat: u64,
-		exp: u64,
-		roles: Vec<String>,
-	}
 
 	let payload = ProxyTokenPayload {
 		iss: id_tag.to_string(),
 		sub: "federation".to_string(),
 		aud: "federation".to_string(),
-		iat: now.0 as u64,
-		exp: exp.0 as u64,
-		roles: roles.iter().map(|r| r.to_string()).collect(),
+		iat: u64::try_from(now.0).unwrap_or_default(),
+		exp: u64::try_from(exp.0).unwrap_or_default(),
+		roles: roles.iter().map(ToString::to_string).collect(),
 	};
 
 	let key = EncodingKey::from_secret(private_key.as_bytes());

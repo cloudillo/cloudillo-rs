@@ -157,7 +157,7 @@ pub async fn create_proxy_site(
 		backend_url: &body.backend_url,
 		proxy_type: &body.typ,
 		config: &body.config,
-		created_by: Some(auth_ctx.tn_id.0 as i64),
+		created_by: Some(i64::from(auth_ctx.tn_id.0)),
 	};
 
 	let site = app.auth_adapter.create_proxy_site(&data).await?;

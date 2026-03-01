@@ -4,6 +4,7 @@
 //! 1. JWT secret generation and persistence
 //! 2. Global variables storage (read_var, update_var)
 //! 3. Access token verification
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 #[cfg(test)]
 mod tests {

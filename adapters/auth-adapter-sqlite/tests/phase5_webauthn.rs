@@ -6,6 +6,7 @@
 //! 3. create_webauthn_credential - Register new credential
 //! 4. update_webauthn_credential_counter - Update usage counter (replay protection)
 //! 5. delete_webauthn_credential - Revoke credential
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 #[cfg(test)]
 mod tests {
@@ -426,10 +427,10 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		// Create 5 credentials
-		for i in 0..5 {
+		for i in 0u32..5 {
 			let credential = cloudillo_types::auth_adapter::Webauthn {
 				credential_id: &format!("cred_{}", i),
-				counter: i as u32,
+				counter: i,
 				public_key: &format!("pubkey_{}", i),
 				description: Some(&format!("Credential {}", i)),
 			};
@@ -449,12 +450,12 @@ mod tests {
 		assert_eq!(credentials.len(), 5);
 
 		// Verify counters
-		for i in 0..5 {
+		for i in 0u32..5 {
 			let cred = credentials
 				.iter()
 				.find(|c| c.credential_id == format!("cred_{}", i))
 				.unwrap_or_else(|| panic!("Credential {} not found", i));
-			assert_eq!(cred.counter, i as u32);
+			assert_eq!(cred.counter, i);
 		}
 
 		println!("✅ Multiple WebAuthn credentials per tenant works correctly");

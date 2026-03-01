@@ -5,7 +5,16 @@ use jsonwebtoken::DecodingKey;
 use sqlx::sqlite::{self, SqlitePool};
 use tokio::fs;
 
-use cloudillo_types::{auth_adapter::*, prelude::*, worker::WorkerPool};
+use cloudillo_types::{
+	auth_adapter::{
+		AccessToken, ApiKeyInfo, ApiKeyValidation, AuthAdapter, AuthCtx, AuthKey, AuthLogin,
+		AuthProfile, CertData, CreateApiKeyOptions, CreateProxySiteData, CreateTenantData,
+		CreatedApiKey, KeyPair, ListTenantsOptions, ProxySiteData, TenantListItem,
+		UpdateProxySiteData, Webauthn,
+	},
+	prelude::*,
+	worker::WorkerPool,
+};
 
 mod api_key;
 mod auth;
@@ -36,7 +45,9 @@ impl Debug for AuthAdapterSqlite {
 impl AuthAdapterSqlite {
 	pub async fn new(worker: Arc<WorkerPool>, path: impl AsRef<Path>) -> ClResult<Self> {
 		let db_path = path.as_ref().join("auth.db");
-		fs::create_dir_all(&path).await.expect("Cannot create auth-adapter dir");
+		fs::create_dir_all(&path)
+			.await
+			.map_err(|e| Error::Internal(format!("Cannot create auth-adapter dir: {e}")))?;
 		let opts = sqlite::SqliteConnectOptions::new()
 			.filename(&db_path)
 			.create_if_missing(true)
@@ -57,7 +68,7 @@ impl AuthAdapterSqlite {
 		let jwt_secret_str = auth::ensure_jwt_secret(&db).await?;
 		let jwt_secret = DecodingKey::from_secret(jwt_secret_str.as_bytes());
 
-		Ok(Self { worker, db, jwt_secret_str, jwt_secret })
+		Ok(Self { db, worker, jwt_secret_str, jwt_secret })
 	}
 }
 
@@ -286,7 +297,7 @@ impl AuthAdapter for AuthAdapterSqlite {
 		.execute(&self.db)
 		.await
 		.or(Err(Error::DbError))?;
-		Ok(result.rows_affected() as u32)
+		Ok(u32::try_from(result.rows_affected()).unwrap_or_default())
 	}
 
 	// Proxy site management

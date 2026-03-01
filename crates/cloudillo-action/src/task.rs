@@ -32,8 +32,7 @@ pub async fn create_action(
 	// Check if this is an ephemeral action type
 	let is_ephemeral = dsl
 		.get_behavior(action.typ.as_ref())
-		.map(|b| b.ephemeral.unwrap_or(false))
-		.unwrap_or(false);
+		.is_some_and(|b| b.ephemeral.unwrap_or(false));
 
 	if is_ephemeral {
 		return create_ephemeral_action(app, tn_id, id_tag, action).await;
@@ -54,8 +53,7 @@ pub async fn create_action(
 					.read_profile(tn_id, audience_tag)
 					.await
 					.ok()
-					.map(|(_, p)| p.following || p.connected.is_connected())
-					.unwrap_or(false);
+					.is_some_and(|(_, p)| p.following || p.connected.is_connected());
 
 				if !has_relationship {
 					return Err(Error::ValidationError(format!(
@@ -194,7 +192,7 @@ pub async fn create_action(
 		root_id: root_id.as_deref(),
 		audience_tag: action.audience_tag.as_deref(),
 		content: content_str.as_deref(),
-		attachments: action.attachments.as_ref().map(|v| v.iter().map(|a| a.as_ref()).collect()),
+		attachments: action.attachments.as_ref().map(|v| v.iter().map(AsRef::as_ref).collect()),
 		subject: action.subject.as_deref(),
 		expires_at: action.expires_at,
 		created_at: Timestamp::now(),
@@ -229,7 +227,7 @@ pub async fn create_action(
 	let attachments_to_wait = if let Some(attachments) = &action.attachments {
 		attachments
 			.iter()
-			.filter(|a| a.starts_with("@"))
+			.filter(|a| a.starts_with('@'))
 			.map(|a| format!("{},{}", tn_id, &a[1..]).into_boxed_str())
 			.collect::<Vec<_>>()
 	} else {
@@ -393,7 +391,8 @@ impl Task<App> for ActionCreatorTask {
 		);
 
 		// 1. Resolve file attachments
-		let attachments = resolve_attachments(app, self.tn_id, &self.action.attachments).await?;
+		let attachments =
+			resolve_attachments(app, self.tn_id, self.action.attachments.as_ref()).await?;
 
 		// 1b. Upgrade attachment visibility to match action visibility
 		if let Some(ref attachment_ids) = attachments {
@@ -411,7 +410,7 @@ impl Task<App> for ActionCreatorTask {
 		}
 
 		// 1c. Resolve subject reference (@a_id → action_id)
-		let subject = resolve_subject(app, self.tn_id, &self.action.subject).await?;
+		let subject = resolve_subject(app, self.tn_id, self.action.subject.as_deref()).await?;
 
 		// 1d. Resolve audience from parent action if not explicitly set
 		// This enables federation for conversation messages (MSG in CONV) and similar hierarchical actions
@@ -456,13 +455,18 @@ impl Task<App> for ActionCreatorTask {
 		};
 
 		// 2. Generate action token and get action_id
-		let (action_id, action_token) =
-			generate_action_token(app, self.tn_id, &action_with_resolved, &attachments, &subject)
-				.await?;
+		let (action_id, action_token) = generate_action_token(
+			app,
+			self.tn_id,
+			&action_with_resolved,
+			attachments.as_ref(),
+			subject.as_deref(),
+		)
+		.await?;
 
 		// 3. Finalize action in database (including resolved audience)
 		let attachments_refs: Option<Vec<&str>> =
-			attachments.as_ref().map(|v| v.iter().map(|s| s.as_ref()).collect());
+			attachments.as_ref().map(|v| v.iter().map(AsRef::as_ref).collect());
 		finalize_action(
 			app,
 			self.tn_id,
@@ -496,7 +500,7 @@ impl Task<App> for ActionCreatorTask {
 			.await,
 			audience_tag: action_with_resolved.audience_tag.clone(),
 			content: helpers::serialize_content(action_with_resolved.content.as_ref())
-				.map(|s| s.into_boxed_str()),
+				.map(String::into_boxed_str),
 			attachments: attachments.clone(),
 			subject: subject.clone(),
 			created_at: Timestamp::now(),
@@ -536,7 +540,7 @@ impl Task<App> for ActionCreatorTask {
 async fn resolve_attachments(
 	app: &App,
 	tn_id: TnId,
-	attachments: &Option<Vec<Box<str>>>,
+	attachments: Option<&Vec<Box<str>>>,
 ) -> ClResult<Option<Vec<Box<str>>>> {
 	let Some(attachments) = attachments else {
 		return Ok(None);
@@ -558,7 +562,7 @@ async fn resolve_attachments(
 async fn resolve_subject(
 	app: &App,
 	tn_id: TnId,
-	subject: &Option<Box<str>>,
+	subject: Option<&str>,
 ) -> ClResult<Option<Box<str>>> {
 	let Some(subject) = subject else {
 		return Ok(None);
@@ -570,7 +574,7 @@ async fn resolve_subject(
 		Ok(Some(action_id))
 	} else {
 		// Already resolved or external action ID
-		Ok(Some(subject.clone()))
+		Ok(Some(subject.into()))
 	}
 }
 
@@ -579,8 +583,8 @@ async fn generate_action_token(
 	app: &App,
 	tn_id: TnId,
 	action: &CreateAction,
-	attachments: &Option<Vec<Box<str>>>,
-	subject: &Option<Box<str>>,
+	attachments: Option<&Vec<Box<str>>>,
+	subject: Option<&str>,
 ) -> ClResult<(Box<str>, Box<str>)> {
 	let dsl = app.ext::<Arc<DslEngine>>()?;
 
@@ -597,8 +601,8 @@ async fn generate_action_token(
 		parent_id: action.parent_id.clone(),
 		audience_tag: action.audience_tag.clone(),
 		content: action.content.clone(),
-		attachments: attachments.clone(),
-		subject: subject.clone(), // Use resolved subject
+		attachments: attachments.cloned(),
+		subject: subject.map(Into::into), // Use resolved subject
 		expires_at: action.expires_at,
 		visibility: action.visibility,
 		flags,
@@ -647,11 +651,10 @@ async fn determine_recipients(
 ) -> ClResult<Vec<Box<str>>> {
 	// Only deliver to specific audience (no broadcast to followers)
 	if let Some(audience_tag) = &action.audience_tag {
-		// Don't send to self
-		if audience_tag.as_ref() != id_tag {
-			Ok(vec![audience_tag.clone()])
-		} else {
+		if audience_tag.as_ref() == id_tag {
 			Ok(Vec::new())
+		} else {
+			Ok(vec![audience_tag.clone()])
 		}
 	} else {
 		// No audience - nothing to deliver
@@ -751,7 +754,7 @@ async fn schedule_delivery(
 
 	if !recipients.is_empty() {
 		// Log summary with up to 3 recipient names
-		let recipient_preview: Vec<&str> = recipients.iter().take(3).map(|s| s.as_ref()).collect();
+		let recipient_preview: Vec<&str> = recipients.iter().take(3).map(AsRef::as_ref).collect();
 		if recipients.len() <= 3 {
 			info!("→ DELIVERY: {} → [{}]", action_id, recipient_preview.join(", "));
 		} else {
@@ -768,7 +771,7 @@ async fn schedule_delivery(
 	let deliver_subject = behavior.as_ref().and_then(|b| b.deliver_subject).unwrap_or(false);
 
 	let related_action_id =
-		if deliver_subject { action.subject.as_deref().map(|s| s.into()) } else { None };
+		if deliver_subject { action.subject.as_deref().map(Into::into) } else { None };
 
 	for recipient_tag in recipients {
 		debug!("Creating delivery task for action {} to {}", action_id, recipient_tag);
@@ -843,7 +846,7 @@ async fn schedule_broadcast_delivery(
 	}
 
 	// Log summary with up to 3 recipient names
-	let recipients_vec: Vec<&str> = recipients.iter().map(|s| s.as_ref()).collect();
+	let recipients_vec: Vec<&str> = recipients.iter().map(AsRef::as_ref).collect();
 	let recipient_preview: Vec<&str> = recipients_vec.iter().take(3).copied().collect();
 	if !recipients.is_empty() {
 		if recipients.len() <= 3 {
@@ -859,7 +862,7 @@ async fn schedule_broadcast_delivery(
 	}
 
 	let retry_policy = RetryPolicy::new((10, 43200), 50);
-	let related_box: Option<Box<str>> = related_action_id.map(|s| s.into());
+	let related_box: Option<Box<str>> = related_action_id.map(Into::into);
 
 	for recipient_tag in recipients {
 		debug!("Creating broadcast delivery task for action {} to {}", action_id, recipient_tag);
@@ -1055,7 +1058,7 @@ impl Task<App> for ActionVerifierTask {
 			&action_id,
 			&self.token,
 			false,
-			self.client_address.as_ref().map(|s| s.to_string()),
+			self.client_address.as_ref().map(ToString::to_string),
 		)
 		.await?;
 

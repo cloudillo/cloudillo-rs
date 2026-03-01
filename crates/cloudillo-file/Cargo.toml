@@ -39,3 +39,6 @@ yrs = "0.25"
 
 # Logging
 tracing = "0.1"
+
+[lints]
+workspace = true

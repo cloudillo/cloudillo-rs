@@ -118,14 +118,13 @@ pub(crate) async fn add(
 		.inspect_err(|err| warn!("DB: {:#?}", err))
 		.map_err(|_| Error::DbError)?;
 
-	if row.is_none() {
+	let Some(row) = row else {
 		return Err(Error::NotFound);
-	}
+	};
 
-	let row = row.unwrap();
 	let tags_str: Option<String> = row.get("tags");
 	let mut tags: Vec<String> = tags_str
-		.map(|s| s.split(',').map(|t| t.to_string()).collect())
+		.map(|s| s.split(',').map(ToString::to_string).collect())
 		.unwrap_or_default();
 
 	// Add tag if not already present
@@ -172,14 +171,13 @@ pub(crate) async fn remove(
 		.inspect_err(|err| warn!("DB: {:#?}", err))
 		.map_err(|_| Error::DbError)?;
 
-	if row.is_none() {
+	let Some(row) = row else {
 		return Err(Error::NotFound);
-	}
+	};
 
-	let row = row.unwrap();
 	let tags_str: Option<String> = row.get("tags");
 	let mut tags: Vec<String> = tags_str
-		.map(|s| s.split(',').map(|t| t.to_string()).collect())
+		.map(|s| s.split(',').map(ToString::to_string).collect())
 		.unwrap_or_default();
 
 	// Remove tag

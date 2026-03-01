@@ -89,7 +89,7 @@ fn merge_objects_shallow(
 /// Apply a dot notation key to update nested fields
 ///
 /// Example: apply_dot_notation(target, "profile.age", 31)
-/// will set target["profile"]["age"] = 31, creating intermediate objects if needed.
+/// will set `target["profile"]["age"]` = 31, creating intermediate objects if needed.
 ///
 /// # Errors
 /// Returns error if an intermediate field exists but is not an object.
@@ -289,7 +289,7 @@ mod tests {
 		});
 		let result = shallow_merge(&mut target, &patch);
 		assert!(result.is_err());
-		assert!(result.err().map(|e| e.message.contains("not an object")).unwrap_or(false));
+		assert!(result.err().is_some_and(|e| e.message.contains("not an object")));
 	}
 
 	#[test]

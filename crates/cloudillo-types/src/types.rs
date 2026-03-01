@@ -44,12 +44,12 @@ pub struct Timestamp(pub i64);
 impl Timestamp {
 	pub fn now() -> Timestamp {
 		let res = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-		Timestamp(res.as_secs() as i64)
+		Timestamp(res.as_secs().cast_signed())
 	}
 
 	pub fn from_now(delta: i64) -> Timestamp {
 		let res = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-		Timestamp(res.as_secs() as i64 + delta)
+		Timestamp(res.as_secs().cast_signed() + delta)
 	}
 
 	/// Add seconds to this timestamp
@@ -102,7 +102,7 @@ impl<'de> Deserialize<'de> for Timestamp {
 
 		struct TimestampVisitor;
 
-		impl<'de> Visitor<'de> for TimestampVisitor {
+		impl Visitor<'_> for TimestampVisitor {
 			type Value = Timestamp;
 
 			fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -114,7 +114,7 @@ impl<'de> Deserialize<'de> for Timestamp {
 			}
 
 			fn visit_u64<E: Error>(self, v: u64) -> Result<Self::Value, E> {
-				Ok(Timestamp(v as i64))
+				Ok(Timestamp(v.cast_signed()))
 			}
 
 			fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
@@ -225,8 +225,7 @@ where
 		S: Serializer,
 	{
 		match self {
-			Patch::Undefined => serializer.serialize_none(),
-			Patch::Null => serializer.serialize_none(),
+			Patch::Undefined | Patch::Null => serializer.serialize_none(),
 			Patch::Value(v) => v.serialize(serializer),
 		}
 	}
@@ -720,7 +719,7 @@ impl AttrSet for ProfileAttrs {
 
 	fn get_list(&self, key: &str) -> Option<Vec<&str>> {
 		match key {
-			"roles" => Some(self.roles.iter().map(|s| s.as_ref()).collect()),
+			"roles" => Some(self.roles.iter().map(AsRef::as_ref).collect()),
 			_ => None,
 		}
 	}
@@ -765,8 +764,8 @@ impl AttrSet for ActionAttrs {
 
 	fn get_list(&self, key: &str) -> Option<Vec<&str>> {
 		match key {
-			"audience_tag" => Some(self.audience_tag.iter().map(|s| s.as_ref()).collect()),
-			"tags" => Some(self.tags.iter().map(|s| s.as_ref()).collect()),
+			"audience_tag" => Some(self.audience_tag.iter().map(AsRef::as_ref).collect()),
+			"tags" => Some(self.tags.iter().map(AsRef::as_ref).collect()),
 			_ => None,
 		}
 	}
@@ -803,7 +802,7 @@ impl AttrSet for FileAttrs {
 
 	fn get_list(&self, key: &str) -> Option<Vec<&str>> {
 		match key {
-			"tags" => Some(self.tags.iter().map(|s| s.as_ref()).collect()),
+			"tags" => Some(self.tags.iter().map(AsRef::as_ref).collect()),
 			_ => None,
 		}
 	}
@@ -829,8 +828,7 @@ impl AttrSet for SubjectAttrs {
 		match key {
 			"id_tag" => Some(&self.id_tag),
 			"tier" => Some(&self.tier),
-			"quota_remaining" => Some(&self.quota_remaining_bytes),
-			"quota_remaining_bytes" => Some(&self.quota_remaining_bytes),
+			"quota_remaining" | "quota_remaining_bytes" => Some(&self.quota_remaining_bytes),
 			"rate_limit_remaining" => Some(&self.rate_limit_remaining),
 			"banned" => Some(if self.banned { "true" } else { "false" }),
 			"email_verified" => Some(if self.email_verified { "true" } else { "false" }),
@@ -840,7 +838,7 @@ impl AttrSet for SubjectAttrs {
 
 	fn get_list(&self, key: &str) -> Option<Vec<&str>> {
 		match key {
-			"roles" => Some(self.roles.iter().map(|r| r.as_ref()).collect()),
+			"roles" => Some(self.roles.iter().map(AsRef::as_ref).collect()),
 			_ => None,
 		}
 	}

@@ -98,7 +98,8 @@ pub async fn validate_api_key(
 			let now = std::time::SystemTime::now()
 				.duration_since(std::time::UNIX_EPOCH)
 				.map_err(|_| Error::Unauthorized)?
-				.as_secs() as i64;
+				.as_secs()
+				.cast_signed();
 			if exp < now {
 				continue; // Expired, try next candidate
 			}
@@ -120,11 +121,11 @@ pub async fn validate_api_key(
 				.map_err(|_| Error::Unauthorized)?;
 
 			return Ok(ApiKeyValidation {
-				tn_id: TnId(tn_id as u32),
+				tn_id: TnId(u32::try_from(tn_id).unwrap_or_default()),
 				id_tag: id_tag.into(),
 				key_id,
-				scopes: scopes.map(|s| s.into()),
-				roles: roles.map(|r| r.into()),
+				scopes: scopes.map(Into::into),
+				roles: roles.map(Into::into),
 			});
 		}
 	}
@@ -154,8 +155,8 @@ pub async fn list_api_keys(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<ApiKeyI
 			ApiKeyInfo {
 				key_id,
 				key_prefix: key_prefix.into(),
-				name: name.map(|s| s.into()),
-				scopes: scopes.map(|s| s.into()),
+				name: name.map(Into::into),
+				scopes: scopes.map(Into::into),
 				expires_at: expires_at.map(Timestamp),
 				last_used_at: last_used_at.map(Timestamp),
 				created_at: Timestamp(created_at),
@@ -186,8 +187,8 @@ pub async fn read_api_key(db: &SqlitePool, tn_id: TnId, key_id: i64) -> ClResult
 	Ok(ApiKeyInfo {
 		key_id,
 		key_prefix: key_prefix.into(),
-		name: name.map(|s| s.into()),
-		scopes: scopes.map(|s| s.into()),
+		name: name.map(Into::into),
+		scopes: scopes.map(Into::into),
 		expires_at: expires_at.map(Timestamp),
 		last_used_at: last_used_at.map(Timestamp),
 		created_at: Timestamp(created_at),
@@ -270,7 +271,7 @@ pub async fn cleanup_expired_api_keys(db: &SqlitePool) -> ClResult<u32> {
 		Error::DbError
 	})?;
 
-	Ok(result.rows_affected() as u32)
+	Ok(u32::try_from(result.rows_affected()).unwrap_or_default())
 }
 
 // vim: ts=4

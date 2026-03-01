@@ -9,9 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use cloudillo_core::extract::{IdTag, OptionalRequestId};
 use cloudillo_types::identity_provider_adapter::{ApiKey, CreateApiKeyOptions, ListApiKeyOptions};
-use cloudillo_types::types::{
-	serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse, Timestamp,
-};
+use cloudillo_types::types::{serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse};
 
 use crate::prelude::*;
 
@@ -20,10 +18,10 @@ fn split_id_tag_with_tenant(id_tag: &str, tenant_domain: &str) -> ClResult<(Stri
 	let expected_suffix = format!(".{}", tenant_domain);
 	if id_tag.ends_with(&expected_suffix) {
 		let prefix = id_tag[..id_tag.len() - expected_suffix.len()].to_string();
-		if !prefix.is_empty() {
-			Ok((prefix, tenant_domain.to_string()))
-		} else {
+		if prefix.is_empty() {
 			Err(Error::ValidationError("Invalid id_tag: prefix cannot be empty".to_string()))
+		} else {
+			Ok((prefix, tenant_domain.to_string()))
 		}
 	} else {
 		Err(Error::ValidationError(format!(
@@ -63,7 +61,7 @@ impl From<ApiKey> for ApiKeyResponse {
 		Self {
 			id: key.id,
 			id_tag,
-			key_prefix: key.key_prefix.to_string(),
+			key_prefix: key.key_prefix.clone(),
 			name: key.name.clone(),
 			created_at: key.created_at,
 			last_used_at: key.last_used_at,

@@ -1,9 +1,10 @@
 //! Meta adapter query and filter tests
 //!
 //! Tests querying and filtering metadata
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
-use cloudillo_types::meta_adapter::{ListActionOptions, MetaAdapter};
+use cloudillo_types::meta_adapter::{ListActionOptions, ListTaskOptions, MetaAdapter};
 use cloudillo_types::types::TnId;
 use cloudillo_types::worker::WorkerPool;
 use std::sync::Arc;
@@ -101,7 +102,6 @@ async fn test_list_tasks() {
 	let (adapter, _temp) = create_test_adapter().await;
 
 	// List tasks with default options
-	use cloudillo_types::meta_adapter::ListTaskOptions;
 	let opts = ListTaskOptions::default();
 
 	let result = adapter.list_tasks(opts).await;

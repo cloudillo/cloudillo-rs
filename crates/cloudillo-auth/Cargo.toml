@@ -34,3 +34,6 @@ uuid = { version = "1.21", features = ["v4"] }
 # Auth-specific (exclusive to this crate)
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 webauthn-rs-proto = "0.5"
+
+[lints]
+workspace = true

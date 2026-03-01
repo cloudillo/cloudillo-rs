@@ -5,7 +5,6 @@ use tokio::io::AsyncReadExt;
 use crate::prelude::*;
 use cloudillo_types::blob_adapter;
 use cloudillo_types::hasher;
-use cloudillo_types::types::TnId;
 
 pub async fn create_blob_buf(
 	app: &App,

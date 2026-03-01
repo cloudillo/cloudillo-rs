@@ -33,9 +33,8 @@
 use cloudillo_types::crdt_adapter::{
 	CrdtAdapter, CrdtChangeEvent, CrdtSubscriptionOptions, CrdtUpdate,
 };
-use cloudillo_types::error::{ClResult, Error as ClError};
+use cloudillo_types::error::Error as ClError;
 use cloudillo_types::prelude::*;
-use cloudillo_types::types::TnId;
 use dashmap::DashMap;
 use futures_core::Stream;
 use redb::{ReadableDatabase, ReadableTable};
@@ -88,7 +87,7 @@ mod tables {
 		TableDefinition::new("crdt_updates_v2");
 }
 
-use tables::*;
+use tables::TABLE_UPDATES;
 
 /// Record types for binary keys
 mod record_type {
@@ -136,7 +135,7 @@ mod key_encoding {
 		// Doc ID (24 bytes, pad with zeros if shorter)
 		let doc_bytes = doc_id.as_bytes();
 		let copy_len = doc_bytes.len().min(DOC_ID_LEN);
-		key[1..1 + copy_len].copy_from_slice(&doc_bytes[..copy_len]);
+		key[1..=copy_len].copy_from_slice(&doc_bytes[..copy_len]);
 
 		// Record type
 		key[1 + DOC_ID_LEN] = record_type;
@@ -162,9 +161,9 @@ mod key_encoding {
 			return None;
 		}
 
-		let doc_bytes = &key[1..1 + DOC_ID_LEN];
+		let doc_bytes = &key[1..=DOC_ID_LEN];
 		// Trim trailing zeros (padding)
-		let end = doc_bytes.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+		let end = doc_bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
 
 		String::from_utf8(doc_bytes[..end].to_vec()).ok()
 	}
@@ -201,13 +200,13 @@ impl DocumentInstance {
 	fn new_with_seq(broadcaster: DocBroadcaster, initial_seq: u64) -> Self {
 		Self {
 			broadcaster,
-			last_accessed: AtomicU64::new(Timestamp::now().0 as u64),
+			last_accessed: AtomicU64::new(Timestamp::now().0.cast_unsigned()),
 			update_count: AtomicU64::new(initial_seq),
 		}
 	}
 
 	fn touch(&self) {
-		self.last_accessed.store(Timestamp::now().0 as u64, Ordering::Relaxed);
+		self.last_accessed.store(Timestamp::now().0.cast_unsigned(), Ordering::Relaxed);
 	}
 
 	#[allow(dead_code)]
@@ -564,7 +563,7 @@ impl CrdtAdapter for CrdtAdapterRedb {
 			}
 		}
 
-		Ok(doc_ids.into_iter().map(|s| s.into()).collect())
+		Ok(doc_ids.into_iter().map(Into::into).collect())
 	}
 }
 
@@ -574,7 +573,7 @@ impl std::fmt::Debug for CrdtAdapterRedb {
 			.field("storage_path", &self.storage_path)
 			.field("per_tenant_files", &self.per_tenant_files)
 			.field("config", &self.config)
-			.finish()
+			.finish_non_exhaustive()
 	}
 }
 

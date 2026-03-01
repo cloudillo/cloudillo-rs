@@ -134,8 +134,9 @@ impl PowCounterStore {
 	/// Apply time-based decay to counter
 	fn apply_decay(&self, entry: &PowCounterEntry) -> u32 {
 		let now = Timestamp::now();
-		let elapsed_secs = (now.0 - entry.last_incremented.0).max(0) as u64;
-		let decay = (elapsed_secs / self.config.decay_interval_secs) as u32;
+		let elapsed_secs = u64::try_from((now.0 - entry.last_incremented.0).max(0)).unwrap_or(0);
+		let decay =
+			u32::try_from(elapsed_secs / self.config.decay_interval_secs).unwrap_or(u32::MAX);
 		entry.counter.saturating_sub(decay)
 	}
 

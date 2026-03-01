@@ -5,9 +5,9 @@ use std::sync::Arc;
 use sqlx::{Row, SqlitePool};
 
 use crate::crypto;
-use crate::utils::*;
+use crate::utils::{collect_res, inspect};
 use cloudillo_types::worker::WorkerPool;
-use cloudillo_types::{auth_adapter::*, prelude::*};
+use cloudillo_types::{auth_adapter::AuthKey, prelude::*};
 
 /// List all profile keys for a tenant
 pub(crate) async fn list_profile_keys(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<AuthKey>> {

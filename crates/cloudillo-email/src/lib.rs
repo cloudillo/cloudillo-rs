@@ -6,9 +6,6 @@
 //! - Email sender task for async/persistent sending via scheduler
 //! - Configuration via global settings module
 
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
-
 pub mod sender;
 pub mod settings;
 pub mod task;
@@ -91,7 +88,7 @@ impl EmailModule {
 	) -> ClResult<()> {
 		// Get max retry attempts from settings (default: 3)
 		let max_retries = match settings_service.get(tn_id, "email.retry_attempts").await {
-			Ok(cloudillo_core::settings::SettingValue::Int(n)) => n as u16,
+			Ok(cloudillo_core::settings::SettingValue::Int(n)) => u16::try_from(n).unwrap_or(3),
 			_ => 3,
 		};
 

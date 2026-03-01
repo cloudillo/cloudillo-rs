@@ -2,8 +2,8 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::*;
-use cloudillo_types::{auth_adapter::*, prelude::*};
+use crate::utils::map_res;
+use cloudillo_types::{auth_adapter::CertData, prelude::*};
 
 /// Create or update a certificate
 pub(crate) async fn create_cert(db: &SqlitePool, cert_data: &CertData) -> ClResult<()> {
@@ -121,7 +121,7 @@ pub(crate) async fn list_tenants_needing_cert_renewal(
 	renewal_days: u32,
 ) -> ClResult<Vec<(TnId, Box<str>)>> {
 	let now = Timestamp::now().0;
-	let renewal_threshold = now + (renewal_days as i64 * 24 * 3600);
+	let renewal_threshold = now + (i64::from(renewal_days) * 24 * 3600);
 
 	let rows = sqlx::query(
 		"SELECT t.tn_id, t.id_tag
@@ -139,7 +139,7 @@ pub(crate) async fn list_tenants_needing_cert_renewal(
 	for row in rows {
 		let tn_id: i64 = row.try_get("tn_id").or(Err(Error::DbError))?;
 		let id_tag: String = row.try_get("id_tag").or(Err(Error::DbError))?;
-		tenants.push((TnId(tn_id as u32), id_tag.into_boxed_str()));
+		tenants.push((TnId(u32::try_from(tn_id).unwrap_or_default()), id_tag.into_boxed_str()));
 	}
 
 	Ok(tenants)

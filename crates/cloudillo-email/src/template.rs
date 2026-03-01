@@ -143,7 +143,7 @@ impl TemplateEngine {
 	}
 
 	/// Load and render a layout template with the given body content
-	fn render_layout(&self, params: LayoutRenderParams<'_>) -> ClResult<String> {
+	fn render_layout(&self, params: &LayoutRenderParams<'_>) -> ClResult<String> {
 		let layouts_dir = format!("{}/layouts", params.template_dir);
 
 		// Try language-specific layout first
@@ -208,9 +208,8 @@ impl TemplateEngine {
 		// Get template directory from settings
 		let template_dir = self.settings_service.get(tn_id, "email.template_dir").await?;
 
-		let template_dir = match template_dir {
-			SettingValue::String(dir) => dir,
-			_ => return Err(Error::ConfigError("Invalid template_dir setting".into())),
+		let SettingValue::String(template_dir) = template_dir else {
+			return Err(Error::ConfigError("Invalid template_dir setting".into()));
 		};
 
 		// Load HTML template with language fallback
@@ -246,7 +245,7 @@ impl TemplateEngine {
 
 		// Apply layout if specified (use rendered subject as title)
 		let html_body = if let Some(ref layout) = html_metadata.layout {
-			self.render_layout(LayoutRenderParams {
+			self.render_layout(&LayoutRenderParams {
 				template_dir: &template_dir,
 				layout_name: layout,
 				extension: "html.hbs",
@@ -267,7 +266,7 @@ impl TemplateEngine {
 		// Apply layout if specified (use text metadata layout, fallback to html metadata)
 		let text_layout = text_metadata.layout.as_ref().or(html_metadata.layout.as_ref());
 		let text_body = if let Some(layout) = text_layout {
-			self.render_layout(LayoutRenderParams {
+			self.render_layout(&LayoutRenderParams {
 				template_dir: &template_dir,
 				layout_name: layout,
 				extension: "txt.hbs",
@@ -290,11 +289,11 @@ mod tests {
 
 	#[test]
 	fn test_parse_frontmatter_basic() {
-		let content = r#"---
+		let content = r"---
 layout: default
 subject: Test Subject
 ---
-Hello {{name}}!"#;
+Hello {{name}}!";
 
 		let (metadata, template) = TemplateEngine::parse_frontmatter(content);
 		assert_eq!(metadata.layout, Some("default".to_string()));
@@ -314,10 +313,10 @@ Hello {{name}}!"#;
 
 	#[test]
 	fn test_parse_frontmatter_layout_only() {
-		let content = r#"---
+		let content = r"---
 layout: minimal
 ---
-Content here"#;
+Content here";
 
 		let (metadata, template) = TemplateEngine::parse_frontmatter(content);
 		assert_eq!(metadata.layout, Some("minimal".to_string()));
@@ -327,10 +326,10 @@ Content here"#;
 
 	#[test]
 	fn test_parse_frontmatter_subject_only() {
-		let content = r#"---
+		let content = r"---
 subject: Email Subject Line
 ---
-Content here"#;
+Content here";
 
 		let (metadata, template) = TemplateEngine::parse_frontmatter(content);
 		assert!(metadata.layout.is_none());
@@ -340,13 +339,13 @@ Content here"#;
 
 	#[test]
 	fn test_parse_frontmatter_with_whitespace() {
-		let content = r#"
+		let content = r"
 ---
 layout: default
 subject: Test
 ---
 
-Hello!"#;
+Hello!";
 
 		let (metadata, template) = TemplateEngine::parse_frontmatter(content);
 		assert_eq!(metadata.layout, Some("default".to_string()));
@@ -357,10 +356,10 @@ Hello!"#;
 
 	#[test]
 	fn test_parse_frontmatter_unclosed() {
-		let content = r#"---
+		let content = r"---
 layout: default
 subject: Test
-Hello!"#;
+Hello!";
 
 		let (metadata, _template) = TemplateEngine::parse_frontmatter(content);
 		// Should return original content since frontmatter is not properly closed
@@ -436,12 +435,12 @@ Hello!"#;
 	#[test]
 	fn test_verification_email_variables() {
 		let handlebars = Handlebars::new();
-		let template = r#"
+		let template = r"
 Welcome {{user_name}}!
 Verify: {{verification_link}}
 Token: {{verification_token}}
 Expires: {{expire_hours}} hours
-"#;
+";
 
 		let data = serde_json::json!({
 			"user_name": "Alice",
@@ -459,11 +458,11 @@ Expires: {{expire_hours}} hours
 	#[test]
 	fn test_password_reset_email_variables() {
 		let handlebars = Handlebars::new();
-		let template = r#"
+		let template = r"
 Hello {{user_name}},
 Reset password: {{reset_link}}
 Token: {{reset_token}}
-"#;
+";
 
 		let data = serde_json::json!({
 			"user_name": "Bob",
@@ -492,7 +491,7 @@ Token: {{reset_token}}
 	#[test]
 	fn test_multiline_template() {
 		let handlebars = Handlebars::new();
-		let template = r#"
+		let template = r"
 <!DOCTYPE html>
 <html>
 <body>
@@ -500,7 +499,7 @@ Token: {{reset_token}}
 <p>{{message}}</p>
 </body>
 </html>
-"#;
+";
 
 		let data = serde_json::json!({
 			"name": "Charlie",

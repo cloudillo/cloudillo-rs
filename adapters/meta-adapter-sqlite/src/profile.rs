@@ -2,30 +2,33 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::*;
-use cloudillo_types::meta_adapter::*;
+use crate::utils::{collect_res, inspect, map_res, push_patch};
+use cloudillo_types::meta_adapter::{
+	ListProfileOptions, Profile, ProfileConnectionStatus, ProfileData, ProfileStatus, ProfileType,
+	UpdateProfileData,
+};
 use cloudillo_types::prelude::*;
 
 /// Parse connected column value to ProfileConnectionStatus
 /// Handles both TEXT ("0", "R", "1") and INTEGER (0, 1) values from SQLite
-fn parse_connected(row: &sqlx::sqlite::SqliteRow) -> Result<ProfileConnectionStatus, sqlx::Error> {
+fn parse_connected(row: &sqlx::sqlite::SqliteRow) -> ProfileConnectionStatus {
 	// Try as String first (for "0", "R", "1" values)
 	if let Ok(val) = row.try_get::<Option<String>, _>("connected") {
-		return Ok(match val.as_deref() {
+		return match val.as_deref() {
 			Some("1") => ProfileConnectionStatus::Connected,
 			Some("R") => ProfileConnectionStatus::RequestPending,
 			_ => ProfileConnectionStatus::Disconnected,
-		});
+		};
 	}
 	// Fall back to integer (for legacy 0/1 values)
 	if let Ok(val) = row.try_get::<Option<i64>, _>("connected") {
-		return Ok(match val {
+		return match val {
 			Some(1) => ProfileConnectionStatus::Connected,
 			_ => ProfileConnectionStatus::Disconnected,
-		});
+		};
 	}
 	// Default to disconnected if nothing works
-	Ok(ProfileConnectionStatus::Disconnected)
+	ProfileConnectionStatus::Disconnected
 }
 
 /// Database value for connected column - can be integer (0, 1) or text ('R')
@@ -162,7 +165,7 @@ pub(crate) async fn list(
 			typ,
 			profile_pic: row.try_get("profile_pic")?,
 			following: row.try_get("following")?,
-			connected: parse_connected(row)?,
+			connected: parse_connected(row),
 			roles: row.try_get::<Option<String>, _>("roles")?.map(|s| {
 				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
 			}),
@@ -209,8 +212,7 @@ pub(crate) async fn get_relationships(
 	for row in rows {
 		let id_tag: String = row.try_get("id_tag").map_err(|_| Error::DbError)?;
 		let following: bool = row.try_get("following").unwrap_or(false);
-		let connected_status =
-			parse_connected(&row).unwrap_or(ProfileConnectionStatus::Disconnected);
+		let connected_status = parse_connected(&row);
 		let connected = connected_status.is_connected();
 		result.insert(id_tag, (following, connected));
 	}
@@ -247,7 +249,7 @@ pub(crate) async fn read(
 			name: row.try_get("name")?,
 			profile_pic: row.try_get("profile_pic")?,
 			following: row.try_get("following")?,
-			connected: parse_connected(&row)?,
+			connected: parse_connected(&row),
 			roles: row.try_get::<Option<String>, _>("roles")?.map(|s| {
 				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
 			}),
@@ -321,12 +323,12 @@ pub(crate) async fn update(
 	has_updates = push_patch!(query, has_updates, "name", &profile.name, |v| v.as_ref());
 
 	has_updates = push_patch!(query, has_updates, "profile_pic", &profile.profile_pic, |v| {
-		v.as_ref().map(|s| s.as_ref())
+		v.as_ref().map(AsRef::as_ref)
 	});
 
 	has_updates = push_patch!(query, has_updates, "roles", &profile.roles, |v| {
 		v.as_ref()
-			.map(|roles| roles.iter().map(|r| r.as_ref()).collect::<Vec<_>>().join(","))
+			.map(|roles| roles.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(","))
 	});
 
 	// Status and moderation
@@ -429,12 +431,10 @@ pub(crate) async fn add_public_key(
 	Ok(())
 }
 
+type RefreshCallback<'a> = Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>;
+
 /// Process profiles that need refreshing
-#[allow(clippy::type_complexity)]
-pub(crate) async fn process_refresh<'a>(
-	db: &SqlitePool,
-	callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>,
-) {
+pub(crate) async fn process_refresh(db: &SqlitePool, callback: RefreshCallback<'_>) {
 	// Query profiles that need refreshing (e.g., synced_at is old or NULL)
 	let res = sqlx::query(
 		"SELECT tn_id, id_tag, etag FROM profiles
@@ -451,7 +451,7 @@ pub(crate) async fn process_refresh<'a>(
 				row.try_get::<Box<str>, _>("id_tag"),
 				row.try_get::<Option<Box<str>>, _>("etag"),
 			) {
-				let tn_id = TnId(tn_id_val as u32);
+				let tn_id = TnId(u32::try_from(tn_id_val).unwrap_or_default());
 				// Use Box::leak to extend lifetime - profile data is long-lived
 				let id_tag_static: &'static str = Box::leak(id_tag);
 				let etag_static: Option<&'static str> = etag.map(|s| Box::leak(s) as &'static str);
@@ -488,7 +488,7 @@ pub(crate) async fn list_stale_profiles(
 		let id_tag: Box<str> = row.try_get("id_tag").map_err(|_| Error::DbError)?;
 		let etag: Option<Box<str>> = row.try_get("etag").map_err(|_| Error::DbError)?;
 
-		results.push((TnId(tn_id_val as u32), id_tag, etag));
+		results.push((TnId(u32::try_from(tn_id_val).unwrap_or_default()), id_tag, etag));
 	}
 
 	Ok(results)

@@ -13,7 +13,7 @@ use cloudillo_email::{get_tenant_lang, EmailModule, EmailTaskParams};
 use cloudillo_ref::service::{create_ref_internal, CreateRefInternalParams};
 use cloudillo_types::auth_adapter::ListTenantsOptions;
 use cloudillo_types::meta_adapter::{ListTenantsMetaOptions, ProfileType};
-use cloudillo_types::types::{ApiResponse, Timestamp};
+use cloudillo_types::types::ApiResponse;
 
 use crate::prelude::*;
 
@@ -91,12 +91,12 @@ pub async fn list_tenants(
 			TenantView {
 				tn_id: auth.tn_id.0,
 				id_tag: auth.id_tag.to_string(),
-				name: meta.map(|m| m.name.to_string()).unwrap_or_else(|| auth.id_tag.to_string()),
-				typ: meta.map(|m| m.typ).unwrap_or(ProfileType::Person),
+				name: meta.map_or_else(|| auth.id_tag.to_string(), |m| m.name.to_string()),
+				typ: meta.map_or(ProfileType::Person, |m| m.typ),
 				email: auth.email.map(|e| e.to_string()),
 				status: auth.status.map(|s| s.to_string()),
-				roles: auth.roles.map(|r| r.iter().map(|s| s.to_string()).collect()),
-				profile_pic: meta.and_then(|m| m.profile_pic.as_ref().map(|p| p.to_string())),
+				roles: auth.roles.map(|r| r.iter().map(ToString::to_string).collect()),
+				profile_pic: meta.and_then(|m| m.profile_pic.as_ref().map(ToString::to_string)),
 				created_at,
 			}
 		})
@@ -162,7 +162,7 @@ pub async fn send_password_reset(
 	let lang = get_tenant_lang(&app.settings, tn_id).await;
 
 	// Get base_id_tag for sender name
-	let base_id_tag = app.opts.base_id_tag.as_ref().map(|s| s.as_ref()).unwrap_or("cloudillo");
+	let base_id_tag = app.opts.base_id_tag.as_ref().map_or("cloudillo", AsRef::as_ref);
 
 	// Schedule email with password_reset template
 	// Subject is defined in the template frontmatter for multi-language support

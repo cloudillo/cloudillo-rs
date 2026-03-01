@@ -22,9 +22,6 @@
 //! - `notify.push.mention` - @mentions
 //! - `notify.push.post` - Posts from followed users
 
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
-
 pub mod handler;
 pub mod send;
 pub mod settings;

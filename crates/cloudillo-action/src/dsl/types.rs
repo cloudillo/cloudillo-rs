@@ -277,7 +277,6 @@ impl<'de> Deserialize<'de> for ActionHooks {
 		D: serde::Deserializer<'de>,
 	{
 		use serde::de::{self, MapAccess, Visitor};
-		#[allow(unused_imports)]
 		use std::fmt;
 
 		enum Field {
@@ -294,7 +293,7 @@ impl<'de> Deserialize<'de> for ActionHooks {
 			{
 				struct FieldVisitor;
 
-				impl<'de> Visitor<'de> for FieldVisitor {
+				impl Visitor<'_> for FieldVisitor {
 					type Value = Field;
 
 					fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {

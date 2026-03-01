@@ -1,6 +1,3 @@
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
-
 pub(crate) mod aggregate;
 pub(crate) mod computed;
 pub(crate) mod merge;

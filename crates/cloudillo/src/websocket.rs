@@ -39,7 +39,7 @@ async fn close_with_error(mut socket: WebSocket, code: u16, reason: &'static str
 }
 
 /// Create WebSocket close response for file access errors
-fn ws_close_for_error(ws: WebSocketUpgrade, error: FileAccessError) -> Response {
+fn ws_close_for_error(ws: WebSocketUpgrade, error: &FileAccessError) -> Response {
 	match error {
 		FileAccessError::NotFound => {
 			ws.on_upgrade(|socket| close_with_error(socket, 4404, "File not found"))
@@ -92,18 +92,15 @@ pub async fn get_ws_bus(
 
 	debug!("WebSocket bus request");
 
-	match auth {
-		Some(auth_ctx) => {
-			let user_id = auth_ctx.id_tag.to_string();
-			let tn_id = auth_ctx.tn_id;
-			debug!("Bus WebSocket authenticated: user_id={}, tn_id={}", user_id, tn_id.0);
-			ws.on_upgrade(move |socket| ws_bus::handle_bus_connection(socket, user_id, tn_id, app))
-		}
-		None => {
-			warn!("Bus WebSocket rejected - no authentication");
-			ws_close_unauthenticated(ws)
-		}
-	}
+	let Some(auth_ctx) = auth else {
+		warn!("Bus WebSocket rejected - no authentication");
+		return ws_close_unauthenticated(ws);
+	};
+
+	let user_id = auth_ctx.id_tag.to_string();
+	let tn_id = auth_ctx.tn_id;
+	debug!("Bus WebSocket authenticated: user_id={}, tn_id={}", user_id, tn_id.0);
+	ws.on_upgrade(move |socket| ws_bus::handle_bus_connection(socket, user_id, tn_id, app))
 }
 
 /// WebSocket upgrade handler for RTDB subscriptions
@@ -126,12 +123,9 @@ pub async fn get_ws_rtdb(
 
 	info!("WebSocket RTDB request for file_id: {}, access={:?}", file_id, query.access);
 
-	let auth_ctx = match auth {
-		Some(ctx) => ctx,
-		None => {
-			warn!("RTDB WebSocket rejected - no authentication");
-			return ws_close_unauthenticated(ws);
-		}
+	let Some(auth_ctx) = auth else {
+		warn!("RTDB WebSocket rejected - no authentication");
+		return ws_close_unauthenticated(ws);
 	};
 
 	let user_id = auth_ctx.id_tag.to_string();
@@ -157,12 +151,9 @@ pub async fn get_ws_rtdb(
 	match access_result {
 		Ok(result) => {
 			// Resolve final read_only based on query parameter
-			let read_only = match resolve_access(&query, result.read_only) {
-				Ok(ro) => ro,
-				Err(()) => {
-					warn!("RTDB WebSocket rejected - write access requested but not available: user={}, file={}", user_id, file_id);
-					return ws_close_write_denied(ws);
-				}
+			let Ok(read_only) = resolve_access(&query, result.read_only) else {
+				warn!("RTDB WebSocket rejected - write access requested but not available: user={}, file={}", user_id, file_id);
+				return ws_close_write_denied(ws);
 			};
 			info!(
 				"RTDB WebSocket ({}): user={}, file={}",
@@ -176,7 +167,7 @@ pub async fn get_ws_rtdb(
 		}
 		Err(e) => {
 			warn!("RTDB WebSocket rejected: user={}, file={}", user_id, file_id);
-			ws_close_for_error(ws, e)
+			ws_close_for_error(ws, &e)
 		}
 	}
 }
@@ -200,12 +191,9 @@ pub async fn get_ws_crdt(
 
 	info!("WebSocket CRDT request for doc_id: {}, access={:?}", doc_id, query.access);
 
-	let auth_ctx = match auth {
-		Some(ctx) => ctx,
-		None => {
-			warn!("CRDT WebSocket rejected - no authentication");
-			return ws_close_unauthenticated(ws);
-		}
+	let Some(auth_ctx) = auth else {
+		warn!("CRDT WebSocket rejected - no authentication");
+		return ws_close_unauthenticated(ws);
 	};
 
 	let user_id = auth_ctx.id_tag.to_string();
@@ -231,12 +219,9 @@ pub async fn get_ws_crdt(
 	match access_result {
 		Ok(result) => {
 			// Resolve final read_only based on query parameter
-			let read_only = match resolve_access(&query, result.read_only) {
-				Ok(ro) => ro,
-				Err(()) => {
-					warn!("CRDT WebSocket rejected - write access requested but not available: user={}, doc={}", user_id, doc_id);
-					return ws_close_write_denied(ws);
-				}
+			let Ok(read_only) = resolve_access(&query, result.read_only) else {
+				warn!("CRDT WebSocket rejected - write access requested but not available: user={}, doc={}", user_id, doc_id);
+				return ws_close_write_denied(ws);
 			};
 			info!(
 				"CRDT WebSocket ({}): user={}, doc={}",
@@ -250,7 +235,7 @@ pub async fn get_ws_crdt(
 		}
 		Err(e) => {
 			warn!("CRDT WebSocket rejected: user={}, doc={}", user_id, doc_id);
-			ws_close_for_error(ws, e)
+			ws_close_for_error(ws, &e)
 		}
 	}
 }

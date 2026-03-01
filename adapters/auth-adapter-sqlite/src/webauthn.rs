@@ -2,8 +2,8 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::*;
-use cloudillo_types::{auth_adapter::*, prelude::*};
+use crate::utils::inspect;
+use cloudillo_types::{auth_adapter::Webauthn, prelude::*};
 
 /// List all WebAuthn credentials for a tenant
 pub(crate) async fn list_webauthn_credentials(

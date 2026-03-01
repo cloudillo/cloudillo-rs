@@ -40,7 +40,8 @@ impl EmailSender {
 		};
 
 		// Fetch remaining SMTP settings
-		let port = self.settings_service.get_int(tn_id, "email.smtp.port").await? as u16;
+		let port = u16::try_from(self.settings_service.get_int(tn_id, "email.smtp.port").await?)
+			.unwrap_or_default();
 		let username = self
 			.settings_service
 			.get_string_opt(tn_id, "email.smtp.username")
@@ -58,8 +59,10 @@ impl EmailSender {
 			None => self.settings_service.get_string(tn_id, "email.from.name").await?,
 		};
 		let tls_mode = self.settings_service.get_string(tn_id, "email.smtp.tls_mode").await?;
-		let timeout_seconds =
-			self.settings_service.get_int(tn_id, "email.smtp.timeout_seconds").await? as u64;
+		let timeout_seconds = u64::try_from(
+			self.settings_service.get_int(tn_id, "email.smtp.timeout_seconds").await?,
+		)
+		.unwrap_or_default();
 
 		debug!("Sending email to {} via {}:{} with TLS mode: {}", message.to, host, port, tls_mode);
 

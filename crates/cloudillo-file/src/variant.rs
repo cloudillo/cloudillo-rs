@@ -25,7 +25,7 @@ pub enum VariantClass {
 
 impl VariantClass {
 	/// Get the short string representation (e.g., "vis", "vid", "aud")
-	pub fn as_str(&self) -> &'static str {
+	pub fn as_str(self) -> &'static str {
 		match self {
 			Self::Visual => "vis",
 			Self::Video => "vid",
@@ -103,7 +103,7 @@ pub enum VariantQuality {
 
 impl VariantQuality {
 	/// Get the short string representation (e.g., "tn", "sd", "md")
-	pub fn as_str(&self) -> &'static str {
+	pub fn as_str(self) -> &'static str {
 		match self {
 			Self::Profile => "pf",
 			Self::Thumbnail => "tn",
@@ -130,7 +130,7 @@ impl VariantQuality {
 	}
 
 	/// Get the bounding box size for this quality tier (for images/video)
-	pub fn bounding_box(&self) -> Option<u32> {
+	pub fn bounding_box(self) -> Option<u32> {
 		match self {
 			Self::Profile => Some(80),
 			Self::Thumbnail => Some(128),
@@ -143,28 +143,24 @@ impl VariantQuality {
 	}
 
 	/// Get the audio bitrate in kbps for this quality tier
-	pub fn audio_bitrate(&self) -> Option<u32> {
+	pub fn audio_bitrate(self) -> Option<u32> {
 		match self {
-			Self::Profile => None,
-			Self::Thumbnail => None,
 			Self::Small => Some(64),
 			Self::Medium => Some(128),
 			Self::High => Some(256),
 			Self::Extra => Some(320),
-			Self::Original => None,
+			Self::Profile | Self::Thumbnail | Self::Original => None,
 		}
 	}
 
 	/// Get the video bitrate in kbps for this quality tier
-	pub fn video_bitrate(&self) -> Option<u32> {
+	pub fn video_bitrate(self) -> Option<u32> {
 		match self {
-			Self::Profile => None,
-			Self::Thumbnail => None,
 			Self::Small => Some(1500),
 			Self::Medium => Some(3000),
 			Self::High => Some(5000),
 			Self::Extra => Some(15000),
-			Self::Original => None,
+			Self::Profile | Self::Thumbnail | Self::Original => None,
 		}
 	}
 
@@ -293,7 +289,7 @@ pub fn parse_quality(s: &str) -> Option<VariantQuality> {
 }
 
 /// Get the fallback chain for a given variant (within the same class)
-pub fn get_fallback_chain(variant: &Variant) -> Vec<Variant> {
+pub fn get_fallback_chain(variant: Variant) -> Vec<Variant> {
 	let class = variant.class;
 	match variant.quality {
 		VariantQuality::Thumbnail => vec![],
@@ -437,7 +433,7 @@ mod tests {
 
 	#[test]
 	fn test_fallback_chain() {
-		let chain = get_fallback_chain(&Variant::VIS_HD);
+		let chain = get_fallback_chain(Variant::VIS_HD);
 		assert_eq!(chain.len(), 3);
 		assert_eq!(chain[0], Variant::VIS_MD);
 		assert_eq!(chain[1], Variant::VIS_SD);

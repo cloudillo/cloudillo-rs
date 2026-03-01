@@ -3,11 +3,9 @@
 use axum::extract::State;
 use axum::http::header::HeaderMap;
 use instant_acme::{self as acme, Account};
-use pem;
 use rustls::crypto::CryptoProvider;
 use rustls::sign::CertifiedKey;
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
-use serde_json;
 use std::sync::Arc;
 use x509_parser::parse_x509_certificate;
 
@@ -95,7 +93,7 @@ async fn renew_domains<'a>(
 	info!("ACME {:?}", &domains);
 	let identifiers = domains
 		.iter()
-		.map(|domain| acme::Identifier::Dns(domain.to_string()))
+		.map(|domain| acme::Identifier::Dns(domain.clone()))
 		.collect::<Vec<_>>();
 
 	let mut order = account.new_order(&acme::NewOrder::new(identifiers.as_slice())).await?;
@@ -172,7 +170,7 @@ async fn renew_domains<'a>(
 		info!("Got cert.");
 
 		// Clean up ACME challenges
-		for domain in domains.iter() {
+		for domain in &domains {
 			state
 				.acme_challenge_map
 				.write()
@@ -194,7 +192,7 @@ async fn renew_domains<'a>(
 			PrivateKeyDer::from_pem_slice(private_key_pem.as_bytes())?,
 			CryptoProvider::get_default().ok_or(acme::Error::Str("no crypto provider"))?,
 		)?);
-		for domain in domains.iter() {
+		for domain in &domains {
 			state
 				.certs
 				.write()
@@ -203,8 +201,8 @@ async fn renew_domains<'a>(
 		}
 
 		let cert_data = X509CertData {
-			private_key_pem: private_key_pem.to_string().into_boxed_str(),
-			certificate_pem: cert_chain_pem.to_string().into_boxed_str(),
+			private_key_pem: private_key_pem.clone().into_boxed_str(),
+			certificate_pem: cert_chain_pem.clone().into_boxed_str(),
 			expires_at: Timestamp(not_after.timestamp()),
 		};
 
@@ -293,7 +291,7 @@ pub struct CertRenewalTask {
 impl CertRenewalTask {
 	/// Create new certificate renewal task
 	pub fn new(acme_email: String, renewal_days: u32) -> Self {
-		Self { acme_email, renewal_days }
+		Self { renewal_days, acme_email }
 	}
 }
 
@@ -347,7 +345,7 @@ impl Task<App> for CertRenewalTask {
 
 				// Perform ACME renewal
 				match init(app.clone(), &self.acme_email, &id_tag, app_domain).await {
-					Ok(_) => {
+					Ok(()) => {
 						info!(tenant = %id_tag, "Certificate renewed successfully");
 					}
 					Err(e) => {

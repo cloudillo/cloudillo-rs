@@ -10,7 +10,7 @@
 //! - Utility operations (log, abort)
 
 use super::expression::ExpressionEvaluator;
-use super::types::*;
+use super::types::{Expression, Operation, UpdateValue};
 use cloudillo_core::{scheduler::RetryPolicy, ws_broadcast::BroadcastMessage};
 use cloudillo_types::meta_adapter;
 
@@ -24,13 +24,16 @@ pub const EARLY_RETURN_MARKER: &str = "EARLY_RETURN";
 /// Parameters for creating an action
 struct CreateActionParams<'a> {
 	action_type: &'a str,
-	subtype: &'a Option<Expression>,
-	audience: &'a Option<Expression>,
-	parent: &'a Option<Expression>,
-	subject: &'a Option<Expression>,
-	content: &'a Option<Expression>,
-	attachments: &'a Option<Expression>,
+	subtype: Option<&'a Expression>,
+	audience: Option<&'a Expression>,
+	parent: Option<&'a Expression>,
+	subject: Option<&'a Expression>,
+	content: Option<&'a Expression>,
+	attachments: Option<&'a Expression>,
 }
+
+/// Maximum number of operations per DSL execution to prevent resource exhaustion
+const MAX_OPERATIONS: usize = 100;
 
 /// Operation executor
 pub struct OperationExecutor<'a> {
@@ -40,10 +43,24 @@ pub struct OperationExecutor<'a> {
 	operation_count: usize,
 }
 
+impl std::fmt::Debug for OperationExecutor<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("OperationExecutor")
+			.field("max_operations", &self.max_operations)
+			.field("operation_count", &self.operation_count)
+			.finish_non_exhaustive()
+	}
+}
+
 impl<'a> OperationExecutor<'a> {
 	/// Create a new operation executor
 	pub fn new(app: &'a App) -> Self {
-		Self { evaluator: ExpressionEvaluator::new(), app, max_operations: 100, operation_count: 0 }
+		Self {
+			evaluator: ExpressionEvaluator::new(),
+			app,
+			max_operations: MAX_OPERATIONS,
+			operation_count: 0,
+		}
 	}
 
 	/// Execute an operation
@@ -62,7 +79,7 @@ impl<'a> OperationExecutor<'a> {
 				self.execute_update_profile(target, set, context).await
 			}
 			Operation::GetProfile { target, r#as } => {
-				self.execute_get_profile(target, r#as, context).await
+				self.execute_get_profile(target, r#as.as_ref(), context).await
 			}
 
 			// Action operations
@@ -77,17 +94,18 @@ impl<'a> OperationExecutor<'a> {
 			} => {
 				let params = CreateActionParams {
 					action_type: r#type,
-					subtype,
-					audience,
-					parent,
-					subject,
-					content,
-					attachments,
+					subtype: subtype.as_ref(),
+					audience: audience.as_ref(),
+					parent: parent.as_ref(),
+					subject: subject.as_ref(),
+					content: content.as_ref(),
+					attachments: attachments.as_ref(),
 				};
 				self.execute_create_action(params, context).await
 			}
 			Operation::GetAction { key, action_id, r#as } => {
-				self.execute_get_action(key, action_id, r#as, context).await
+				self.execute_get_action(key.as_ref(), action_id.as_ref(), r#as.as_ref(), context)
+					.await
 			}
 			Operation::UpdateAction { target, set } => {
 				self.execute_update_action(target, set, context).await
@@ -96,13 +114,13 @@ impl<'a> OperationExecutor<'a> {
 
 			// Control flow operations
 			Operation::If { condition, then, r#else } => {
-				self.execute_if(condition, then, r#else, context).await
+				self.execute_if(condition, then, r#else.as_ref(), context).await
 			}
 			Operation::Switch { value, cases, default } => {
-				self.execute_switch(value, cases, default, context).await
+				self.execute_switch(value, cases, default.as_ref(), context).await
 			}
 			Operation::Foreach { array, r#as, r#do } => {
-				self.execute_foreach(array, r#as, r#do, context).await
+				self.execute_foreach(array, r#as.as_ref(), r#do, context).await
 			}
 			Operation::Return { value: _ } => {
 				// Early return mechanism - use special marker
@@ -124,13 +142,23 @@ impl<'a> OperationExecutor<'a> {
 
 			// Notification operations
 			Operation::CreateNotification { user, r#type, action_id, priority } => {
-				self.execute_create_notification(user, r#type, action_id, priority, context)
-					.await
+				self.execute_create_notification(
+					user,
+					r#type,
+					action_id,
+					priority.as_ref(),
+					context,
+				)
+				.await
 			}
 
 			// Utility operations
-			Operation::Log { level, message } => self.execute_log(level, message, context).await,
-			Operation::Abort { error, code } => self.execute_abort(error, code, context).await,
+			Operation::Log { level, message } => {
+				self.execute_log(level.as_ref(), message, context).await
+			}
+			Operation::Abort { error, code } => {
+				self.execute_abort(error, code.as_ref(), context).await
+			}
 		}
 	}
 
@@ -143,9 +171,8 @@ impl<'a> OperationExecutor<'a> {
 		context: &mut HookContext,
 	) -> ClResult<()> {
 		let target = self.evaluator.evaluate(target_expr, context)?;
-		let target_tag = match target {
-			Value::String(s) => s,
-			_ => return Err(Error::ValidationError("target must be a string (idTag)".to_string())),
+		let Value::String(target_tag) = target else {
+			return Err(Error::ValidationError("target must be a string (idTag)".to_string()));
 		};
 
 		// Evaluate all update expressions
@@ -158,15 +185,18 @@ impl<'a> OperationExecutor<'a> {
 		tracing::debug!("DSL: update_profile target={} updates={:?}", target_tag, profile_updates);
 
 		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(context.tenant_id as u32);
+		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 		// Extract fields from profile_updates and build UpdateProfileData
-		let name = profile_updates.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+		let name = profile_updates
+			.get("name")
+			.and_then(|v| v.as_str())
+			.map(std::string::ToString::to_string);
 
 		let profile_update = cloudillo_types::meta_adapter::UpdateProfileData {
-			name: name
-				.map(|s| cloudillo_types::types::Patch::Value(s.into()))
-				.unwrap_or(cloudillo_types::types::Patch::Undefined),
+			name: name.map_or(cloudillo_types::types::Patch::Undefined, |s| {
+				cloudillo_types::types::Patch::Value(s.into())
+			}),
 			..Default::default()
 		};
 
@@ -189,19 +219,18 @@ impl<'a> OperationExecutor<'a> {
 	async fn execute_get_profile(
 		&mut self,
 		target_expr: &Expression,
-		as_var: &Option<String>,
+		as_var: Option<&String>,
 		context: &mut HookContext,
 	) -> ClResult<()> {
 		let target = self.evaluator.evaluate(target_expr, context)?;
-		let target_tag = match target {
-			Value::String(s) => s,
-			_ => return Err(Error::ValidationError("target must be a string (idTag)".to_string())),
+		let Value::String(target_tag) = target else {
+			return Err(Error::ValidationError("target must be a string (idTag)".to_string()));
 		};
 
 		tracing::debug!("DSL: get_profile target={}", target_tag);
 
 		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(context.tenant_id as u32);
+		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 		// Get profile via meta adapter
 		let (_etag, profile) = self.app.meta_adapter.read_profile(tn_id, &target_tag).await?;
@@ -284,16 +313,19 @@ impl<'a> OperationExecutor<'a> {
 		);
 
 		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(context.tenant_id as u32);
+		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 		// Build CreateAction struct
 		let create_action = crate::task::CreateAction {
 			typ: params.action_type.to_string().into_boxed_str(),
-			sub_typ: subtype_val.and_then(|v| v.as_str().map(|s| s.to_string().into_boxed_str())),
+			sub_typ: subtype_val
+				.and_then(|v| v.as_str().map(|s| String::into_boxed_str(s.to_string()))),
 			audience_tag: audience_val
-				.and_then(|v| v.as_str().map(|s| s.to_string().into_boxed_str())),
-			parent_id: parent_val.and_then(|v| v.as_str().map(|s| s.to_string().into_boxed_str())),
-			subject: subject_val.and_then(|v| v.as_str().map(|s| s.to_string().into_boxed_str())),
+				.and_then(|v| v.as_str().map(|s| String::into_boxed_str(s.to_string()))),
+			parent_id: parent_val
+				.and_then(|v| v.as_str().map(|s| String::into_boxed_str(s.to_string()))),
+			subject: subject_val
+				.and_then(|v| v.as_str().map(|s| String::into_boxed_str(s.to_string()))),
 			content: content_val,
 			attachments: attachments_val.and_then(|v| {
 				v.as_array().map(|arr| {
@@ -324,9 +356,9 @@ impl<'a> OperationExecutor<'a> {
 
 	async fn execute_get_action(
 		&mut self,
-		key: &Option<Expression>,
-		action_id: &Option<Expression>,
-		as_var: &Option<String>,
+		key: Option<&Expression>,
+		action_id: Option<&Expression>,
+		as_var: Option<&String>,
 		context: &mut HookContext,
 	) -> ClResult<()> {
 		let key_val =
@@ -341,7 +373,7 @@ impl<'a> OperationExecutor<'a> {
 		tracing::debug!("DSL: get_action key={:?} action_id={:?}", key_val, action_id_val);
 
 		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(context.tenant_id as u32);
+		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 		// Retrieve action by key or action_id
 		let action_result = if let Some(key) = key_val {
@@ -407,17 +439,17 @@ impl<'a> OperationExecutor<'a> {
 			let value = action_result.unwrap_or(Value::Null);
 			context.vars.insert(var_name.clone(), value.clone());
 
-			if !value.is_null() {
-				tracing::info!(
-					tenant_id = %tn_id.0,
-					var = %var_name,
-					"DSL: fetched action"
-				);
-			} else {
+			if value.is_null() {
 				tracing::debug!(
 					tenant_id = %tn_id.0,
 					var = %var_name,
 					"DSL: action not found"
+				);
+			} else {
+				tracing::info!(
+					tenant_id = %tn_id.0,
+					var = %var_name,
+					"DSL: fetched action"
 				);
 			}
 		}
@@ -432,25 +464,19 @@ impl<'a> OperationExecutor<'a> {
 		context: &mut HookContext,
 	) -> ClResult<()> {
 		let target = self.evaluator.evaluate(target_expr, context)?;
-		let action_id = match target {
-			Value::String(s) => s,
-			_ => {
-				return Err(Error::ValidationError(
-					"target must be a string (actionId)".to_string(),
-				))
-			}
+		let Value::String(action_id) = target else {
+			return Err(Error::ValidationError("target must be a string (actionId)".to_string()));
 		};
 
 		tracing::debug!("DSL: update_action target={}", action_id);
 
 		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(context.tenant_id as u32);
+		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 		// Fetch current action data for increment/decrement operations
 		let action_data = self.app.meta_adapter.get_action_data(tn_id, &action_id).await?;
 
 		// Evaluate all update expressions
-		use cloudillo_types::types::Patch;
 		let mut update_opts = meta_adapter::UpdateActionDataOptions::default();
 
 		for (key, update_value) in updates {
@@ -509,11 +535,12 @@ impl<'a> OperationExecutor<'a> {
 						}
 						UpdateValue::Increment { increment } => {
 							let inc = self.evaluator.evaluate(increment, context)?;
-							let inc_val = inc.as_u64().ok_or_else(|| {
+							let inc_val = u32::try_from(inc.as_u64().ok_or_else(|| {
 								Error::ValidationError(
 									"increment value must be a number".to_string(),
 								)
-							})? as u32;
+							})?)
+							.unwrap_or_default();
 
 							let current =
 								action_data.as_ref().and_then(|d| d.reactions).unwrap_or(0);
@@ -521,11 +548,12 @@ impl<'a> OperationExecutor<'a> {
 						}
 						UpdateValue::Decrement { decrement } => {
 							let dec = self.evaluator.evaluate(decrement, context)?;
-							let dec_val = dec.as_u64().ok_or_else(|| {
+							let dec_val = u32::try_from(dec.as_u64().ok_or_else(|| {
 								Error::ValidationError(
 									"decrement value must be a number".to_string(),
 								)
-							})? as u32;
+							})?)
+							.unwrap_or_default();
 
 							let current =
 								action_data.as_ref().and_then(|d| d.reactions).unwrap_or(0);
@@ -535,7 +563,7 @@ impl<'a> OperationExecutor<'a> {
 					update_opts.reactions = if value.is_null() {
 						Patch::Null
 					} else if let Some(v) = value.as_u64() {
-						Patch::Value(v as u32)
+						Patch::Value(u32::try_from(v).unwrap_or_default())
 					} else {
 						Patch::Undefined
 					};
@@ -547,11 +575,12 @@ impl<'a> OperationExecutor<'a> {
 						}
 						UpdateValue::Increment { increment } => {
 							let inc = self.evaluator.evaluate(increment, context)?;
-							let inc_val = inc.as_u64().ok_or_else(|| {
+							let inc_val = u32::try_from(inc.as_u64().ok_or_else(|| {
 								Error::ValidationError(
 									"increment value must be a number".to_string(),
 								)
-							})? as u32;
+							})?)
+							.unwrap_or_default();
 
 							let current =
 								action_data.as_ref().and_then(|d| d.comments).unwrap_or(0);
@@ -559,11 +588,12 @@ impl<'a> OperationExecutor<'a> {
 						}
 						UpdateValue::Decrement { decrement } => {
 							let dec = self.evaluator.evaluate(decrement, context)?;
-							let dec_val = dec.as_u64().ok_or_else(|| {
+							let dec_val = u32::try_from(dec.as_u64().ok_or_else(|| {
 								Error::ValidationError(
 									"decrement value must be a number".to_string(),
 								)
-							})? as u32;
+							})?)
+							.unwrap_or_default();
 
 							let current =
 								action_data.as_ref().and_then(|d| d.comments).unwrap_or(0);
@@ -573,7 +603,7 @@ impl<'a> OperationExecutor<'a> {
 					update_opts.comments = if value.is_null() {
 						Patch::Null
 					} else if let Some(v) = value.as_u64() {
-						Patch::Value(v as u32)
+						Patch::Value(u32::try_from(v).unwrap_or_default())
 					} else {
 						Patch::Undefined
 					};
@@ -606,19 +636,14 @@ impl<'a> OperationExecutor<'a> {
 		context: &mut HookContext,
 	) -> ClResult<()> {
 		let target = self.evaluator.evaluate(target_expr, context)?;
-		let action_id = match target {
-			Value::String(s) => s,
-			_ => {
-				return Err(Error::ValidationError(
-					"target must be a string (actionId)".to_string(),
-				))
-			}
+		let Value::String(action_id) = target else {
+			return Err(Error::ValidationError("target must be a string (actionId)".to_string()));
 		};
 
 		tracing::debug!("DSL: delete_action target={}", action_id);
 
 		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(context.tenant_id as u32);
+		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 		// Delete action via meta adapter
 		self.app.meta_adapter.delete_action(tn_id, &action_id).await?;
@@ -638,7 +663,7 @@ impl<'a> OperationExecutor<'a> {
 		&'b mut self,
 		condition: &'b Expression,
 		then_ops: &'b [Operation],
-		else_ops: &'b Option<Vec<Operation>>,
+		else_ops: Option<&'b Vec<Operation>>,
 		context: &'b mut HookContext,
 	) -> std::pin::Pin<Box<dyn std::future::Future<Output = ClResult<()>> + Send + 'b>> {
 		Box::pin(async move {
@@ -669,7 +694,7 @@ impl<'a> OperationExecutor<'a> {
 		&'b mut self,
 		value_expr: &'b Expression,
 		cases: &'b HashMap<String, Vec<Operation>>,
-		default: &'b Option<Vec<Operation>>,
+		default: Option<&'b Vec<Operation>>,
 		context: &'b mut HookContext,
 	) -> std::pin::Pin<Box<dyn std::future::Future<Output = ClResult<()>> + Send + 'b>> {
 		Box::pin(async move {
@@ -699,15 +724,14 @@ impl<'a> OperationExecutor<'a> {
 	fn execute_foreach<'b>(
 		&'b mut self,
 		array_expr: &'b Expression,
-		as_var: &'b Option<String>,
+		as_var: Option<&'b String>,
 		do_ops: &'b [Operation],
 		context: &'b mut HookContext,
 	) -> std::pin::Pin<Box<dyn std::future::Future<Output = ClResult<()>> + Send + 'b>> {
 		Box::pin(async move {
 			let array_value = self.evaluator.evaluate(array_expr, context)?;
-			let array = match array_value {
-				Value::Array(arr) => arr,
-				_ => return Err(Error::ValidationError("foreach requires an array".to_string())),
+			let Value::Array(array) = array_value else {
+				return Err(Error::ValidationError("foreach requires an array".to_string()));
 			};
 
 			// Limit to 100 iterations
@@ -788,15 +812,13 @@ impl<'a> OperationExecutor<'a> {
 		context: &mut HookContext,
 	) -> ClResult<()> {
 		let action_id_val = self.evaluator.evaluate(action_id, context)?;
-		let action_id_str = match action_id_val {
-			Value::String(s) => s,
-			_ => return Err(Error::ValidationError("action_id must be a string".to_string())),
+		let Value::String(action_id_str) = action_id_val else {
+			return Err(Error::ValidationError("action_id must be a string".to_string()));
 		};
 
 		let token_val = self.evaluator.evaluate(token, context)?;
-		let _token_str = match token_val {
-			Value::String(s) => s,
-			_ => return Err(Error::ValidationError("token must be a string".to_string())),
+		let Value::String(_token_str) = token_val else {
+			return Err(Error::ValidationError("token must be a string".to_string()));
 		};
 
 		tracing::debug!(
@@ -805,7 +827,7 @@ impl<'a> OperationExecutor<'a> {
 		);
 
 		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(context.tenant_id as u32);
+		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 		// Query for FLLW and CONN actions to find followers
 		let follower_actions = self
@@ -879,23 +901,18 @@ impl<'a> OperationExecutor<'a> {
 		context: &mut HookContext,
 	) -> ClResult<()> {
 		let action_id_val = self.evaluator.evaluate(action_id, context)?;
-		let action_id_str = match action_id_val {
-			Value::String(s) => s,
-			_ => return Err(Error::ValidationError("action_id must be a string".to_string())),
+		let Value::String(action_id_str) = action_id_val else {
+			return Err(Error::ValidationError("action_id must be a string".to_string()));
 		};
 
 		let token_val = self.evaluator.evaluate(token, context)?;
-		let _token_str = match token_val {
-			Value::String(s) => s,
-			_ => return Err(Error::ValidationError("token must be a string".to_string())),
+		let Value::String(_token_str) = token_val else {
+			return Err(Error::ValidationError("token must be a string".to_string()));
 		};
 
 		let audience_val = self.evaluator.evaluate(audience, context)?;
-		let audience_tag = match audience_val {
-			Value::String(s) => s,
-			_ => {
-				return Err(Error::ValidationError("audience must be a string (idTag)".to_string()))
-			}
+		let Value::String(audience_tag) = audience_val else {
+			return Err(Error::ValidationError("audience must be a string (idTag)".to_string()));
 		};
 
 		tracing::debug!(
@@ -905,7 +922,7 @@ impl<'a> OperationExecutor<'a> {
 		);
 
 		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(context.tenant_id as u32);
+		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 		// Don't send to self
 		if audience_tag.as_str() == context.tenant_tag.as_str() {
@@ -959,7 +976,7 @@ impl<'a> OperationExecutor<'a> {
 		user: &Expression,
 		notification_type: &Expression,
 		action_id: &Expression,
-		priority: &Option<Expression>,
+		priority: Option<&Expression>,
 		context: &mut HookContext,
 	) -> ClResult<()> {
 		let user_val = self.evaluator.evaluate(user, context)?;
@@ -973,23 +990,16 @@ impl<'a> OperationExecutor<'a> {
 		};
 
 		// Extract string values
-		let user_id = match user_val {
-			Value::String(s) => s,
-			_ => return Err(Error::ValidationError("user must be a string".to_string())),
+		let Value::String(user_id) = user_val else {
+			return Err(Error::ValidationError("user must be a string".to_string()));
 		};
 
-		let notification_type = match type_val {
-			Value::String(s) => s,
-			_ => {
-				return Err(Error::ValidationError(
-					"notification_type must be a string".to_string(),
-				))
-			}
+		let Value::String(notification_type) = type_val else {
+			return Err(Error::ValidationError("notification_type must be a string".to_string()));
 		};
 
-		let action_id_str = match action_id_val {
-			Value::String(s) => s,
-			_ => return Err(Error::ValidationError("action_id must be a string".to_string())),
+		let Value::String(action_id_str) = action_id_val else {
+			return Err(Error::ValidationError("action_id must be a string".to_string()));
 		};
 
 		tracing::debug!(
@@ -1011,7 +1021,8 @@ impl<'a> OperationExecutor<'a> {
 		});
 
 		// Send notification to user via direct messaging
-		let tn_id = cloudillo_types::types::TnId(context.tenant_id as u32);
+		let tn_id =
+			cloudillo_types::types::TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 		let broadcast_msg =
 			BroadcastMessage::new("notification", notification_data, context.tenant_tag.clone());
 
@@ -1032,7 +1043,7 @@ impl<'a> OperationExecutor<'a> {
 
 	async fn execute_log(
 		&mut self,
-		level: &Option<String>,
+		level: Option<&String>,
 		message: &Expression,
 		context: &mut HookContext,
 	) -> ClResult<()> {
@@ -1042,7 +1053,7 @@ impl<'a> OperationExecutor<'a> {
 			v => v.to_string(),
 		};
 
-		match level.as_deref() {
+		match level.map(String::as_str) {
 			Some("error") => tracing::error!("DSL: {}", message_str),
 			Some("warn") => tracing::warn!("DSL: {}", message_str),
 			Some("debug") => tracing::debug!("DSL: {}", message_str),
@@ -1056,7 +1067,7 @@ impl<'a> OperationExecutor<'a> {
 	async fn execute_abort(
 		&mut self,
 		error: &Expression,
-		code: &Option<String>,
+		code: Option<&String>,
 		context: &mut HookContext,
 	) -> ClResult<()> {
 		let error_val = self.evaluator.evaluate(error, context)?;

@@ -1,8 +1,5 @@
 //! Identity Provider subsystem. Manages identity registration and lifecycle.
 
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
-
 pub mod api_keys;
 pub mod handler;
 pub mod registration;

@@ -158,11 +158,7 @@ impl FFmpeg {
 			.unwrap_or("unknown")
 			.to_string();
 
-		let streams = json
-			.get("streams")
-			.and_then(|v| v.as_array())
-			.map(|arr| arr.as_slice())
-			.unwrap_or(&[]);
+		let streams = json.get("streams").and_then(|v| v.as_array()).map_or(&[][..], Vec::as_slice);
 
 		let mut video_streams = Vec::new();
 		let mut audio_streams = Vec::new();
@@ -190,10 +186,10 @@ impl FFmpeg {
 
 	/// Parse a video stream from ffprobe output
 	fn parse_video_stream(stream: &serde_json::Value) -> Option<VideoStream> {
-		let index = stream.get("index")?.as_u64()? as u32;
+		let index = u32::try_from(stream.get("index")?.as_u64()?).unwrap_or_default();
 		let codec = stream.get("codec_name")?.as_str()?.to_string();
-		let width = stream.get("width")?.as_u64()? as u32;
-		let height = stream.get("height")?.as_u64()? as u32;
+		let width = u32::try_from(stream.get("width")?.as_u64()?).unwrap_or_default();
+		let height = u32::try_from(stream.get("height")?.as_u64()?).unwrap_or_default();
 
 		// Parse frame rate from "30/1" or "30000/1001" format
 		let frame_rate = stream
@@ -215,16 +211,16 @@ impl FFmpeg {
 			.get("bit_rate")
 			.and_then(|v| v.as_str())
 			.and_then(|s| s.parse::<u64>().ok())
-			.map(|b| (b / 1000) as u32);
+			.map(|b| u32::try_from(b / 1000).unwrap_or_default());
 
 		Some(VideoStream { index, codec, width, height, frame_rate, bitrate })
 	}
 
 	/// Parse an audio stream from ffprobe output
 	fn parse_audio_stream(stream: &serde_json::Value) -> Option<AudioStream> {
-		let index = stream.get("index")?.as_u64()? as u32;
+		let index = u32::try_from(stream.get("index")?.as_u64()?).unwrap_or_default();
 		let codec = stream.get("codec_name")?.as_str()?.to_string();
-		let channels = stream.get("channels")?.as_u64()? as u32;
+		let channels = u32::try_from(stream.get("channels")?.as_u64()?).unwrap_or_default();
 		let sample_rate = stream
 			.get("sample_rate")
 			.and_then(|v| v.as_str())
@@ -235,7 +231,7 @@ impl FFmpeg {
 			.get("bit_rate")
 			.and_then(|v| v.as_str())
 			.and_then(|s| s.parse::<u64>().ok())
-			.map(|b| (b / 1000) as u32);
+			.map(|b| u32::try_from(b / 1000).unwrap_or_default());
 
 		Some(AudioStream { index, codec, channels, sample_rate, bitrate })
 	}
@@ -415,7 +411,7 @@ impl FFmpeg {
 
 /// Video quality presets using bounding box approach
 pub mod presets {
-	use super::*;
+	use super::{AudioExtractOpts, VideoTranscodeOpts};
 
 	pub const VIDEO_SD: VideoTranscodeOpts = VideoTranscodeOpts {
 		max_dim: 480,
@@ -462,7 +458,6 @@ pub mod presets {
 		let base = match quality {
 			"sd" => VIDEO_SD,
 			"md" => VIDEO_MD,
-			"hd" => VIDEO_HD,
 			"xd" => VIDEO_XD,
 			_ => VIDEO_HD,
 		};
@@ -479,7 +474,6 @@ pub mod presets {
 	pub fn audio_opts(quality: &str) -> AudioExtractOpts {
 		let base = match quality {
 			"sd" => AUDIO_SD,
-			"md" => AUDIO_MD,
 			"hd" => AUDIO_HD,
 			_ => AUDIO_MD,
 		};

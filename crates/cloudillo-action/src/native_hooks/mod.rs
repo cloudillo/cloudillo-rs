@@ -30,7 +30,6 @@ pub mod subs;
 
 use crate::hooks::{ActionTypeHooks, HookRegistry};
 use crate::prelude::*;
-use cloudillo_core::app::App;
 use std::sync::Arc;
 
 /// Register all native hooks into the app's hook registry

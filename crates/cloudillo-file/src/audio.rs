@@ -13,7 +13,6 @@ use crate::{ffmpeg, store};
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_types::blob_adapter;
 use cloudillo_types::meta_adapter;
-use cloudillo_types::types::TnId;
 
 /// Audio extractor task - extracts audio from video or transcodes audio to a specific quality tier
 #[derive(Debug, Serialize, Deserialize)]
@@ -147,7 +146,6 @@ impl Task<App> for AudioExtractorTask {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use cloudillo_core::scheduler::Task;
 
 	#[test]
 	fn test_audio_extractor_serialize_deserialize() {

@@ -10,6 +10,29 @@ use std::io::{Cursor, Write};
 use crate::image::{ImageFormat, ResizeResult};
 use crate::prelude::*;
 
+/// Convert `u32` to `f32`, accepting minor precision loss for large values.
+///
+/// Pixel dimensions in image processing are always well within `f32` precision.
+#[allow(clippy::cast_precision_loss)]
+fn u32_to_f32(v: u32) -> f32 {
+	v as f32
+}
+
+/// Convert a non-negative `f32` to `u32` using Rust's saturating cast semantics.
+///
+/// Negative values become 0, values above `u32::MAX` saturate to `u32::MAX`, NaN becomes 0.
+/// Used for pixel dimensions from SVG/image processing where values are always non-negative.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn f32_to_u32(v: f32) -> u32 {
+	v.max(0.0) as u32
+}
+
+/// Convert a non-negative `f32` to `u8`, clamping to 0..=255.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn f32_to_u8(v: f32) -> u8 {
+	v.clamp(0.0, 255.0) as u8
+}
+
 /// Check if data appears to be SVG content.
 ///
 /// Looks for XML declaration or <svg> element in the first 1024 bytes.
@@ -109,8 +132,8 @@ pub fn parse_svg_dimensions(data: &[u8]) -> ClResult<(u32, u32)> {
 		.map_err(|e| Error::ValidationError(format!("Invalid SVG: {}", e)))?;
 
 	let size = tree.size();
-	let width = size.width() as u32;
-	let height = size.height() as u32;
+	let width = f32_to_u32(size.width());
+	let height = f32_to_u32(size.height());
 
 	// Ensure we have valid dimensions (at least 1x1)
 	if width == 0 || height == 0 {
@@ -143,12 +166,12 @@ pub fn rasterize_svg_sync(
 	debug!("SVG parsed: {}x{} [{:.2}ms]", svg_width, svg_height, now.elapsed().as_millis());
 
 	// Calculate scale to fit within target_size while preserving aspect ratio
-	let scale_x = target_size.0 as f32 / svg_width;
-	let scale_y = target_size.1 as f32 / svg_height;
+	let scale_x = u32_to_f32(target_size.0) / svg_width;
+	let scale_y = u32_to_f32(target_size.1) / svg_height;
 	let scale = scale_x.min(scale_y);
 
-	let actual_width = (svg_width * scale).ceil() as u32;
-	let actual_height = (svg_height * scale).ceil() as u32;
+	let actual_width = f32_to_u32((svg_width * scale).ceil());
+	let actual_height = f32_to_u32((svg_height * scale).ceil());
 
 	// Ensure at least 1x1 pixel
 	let actual_width = actual_width.max(1);
@@ -188,11 +211,11 @@ fn encode_pixmap(pixmap: &resvg::tiny_skia::Pixmap, format: ImageFormat) -> ClRe
 	// We need to unpremultiply the alpha channel
 	let mut rgba_data = pixmap.data().to_vec();
 	for pixel in rgba_data.chunks_exact_mut(4) {
-		let a = pixel[3] as f32 / 255.0;
+		let a = f32::from(pixel[3]) / 255.0;
 		if a > 0.0 {
-			pixel[0] = (pixel[0] as f32 / a).min(255.0) as u8;
-			pixel[1] = (pixel[1] as f32 / a).min(255.0) as u8;
-			pixel[2] = (pixel[2] as f32 / a).min(255.0) as u8;
+			pixel[0] = f32_to_u8(f32::from(pixel[0]) / a);
+			pixel[1] = f32_to_u8(f32::from(pixel[1]) / a);
+			pixel[2] = f32_to_u8(f32::from(pixel[2]) / a);
 		}
 	}
 

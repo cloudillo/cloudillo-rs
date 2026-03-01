@@ -10,7 +10,10 @@
 //! - Ternary expressions
 //! - Null coalescing
 
-use super::types::*;
+use super::types::{
+	ArithmeticExpr, CoalesceExpr, ComparisonExpr, Expression, LogicalExpr, StringOpExpr,
+	TernaryExpr,
+};
 use crate::hooks::HookContext;
 use crate::prelude::*;
 use serde_json::Value;
@@ -21,6 +24,7 @@ const MAX_DEPTH: usize = 50;
 const MAX_NODES: usize = 100;
 
 /// Expression evaluator with depth and node count tracking
+#[derive(Debug)]
 pub struct ExpressionEvaluator {
 	depth: usize,
 	node_count: usize,
@@ -66,7 +70,7 @@ impl ExpressionEvaluator {
 					Error::ValidationError("Invalid number (NaN or infinity)".to_string())
 				})
 			}
-			Expression::String(s) => self.evaluate_template(s, context),
+			Expression::String(s) => Self::evaluate_template(s, context),
 
 			// Complex expressions
 			Expression::Comparison(c) => self.evaluate_comparison(c, context),
@@ -83,14 +87,14 @@ impl ExpressionEvaluator {
 	/// - Simple variables: "{variable}"
 	/// - Nested paths: "{context.tenant.type}"
 	/// - Template strings: "Key: {type}:{issuer}:{audience}"
-	fn evaluate_template(&mut self, template: &str, context: &HookContext) -> ClResult<Value> {
+	fn evaluate_template(template: &str, context: &HookContext) -> ClResult<Value> {
 		// Check if it's a simple variable reference: "{variable}"
 		if template.starts_with('{')
 			&& template.ends_with('}')
 			&& template.matches('{').count() == 1
 		{
 			let var_name = &template[1..template.len() - 1];
-			return self.get_variable(var_name, context);
+			return Self::get_variable(var_name, context);
 		}
 
 		// Template with embedded variables: "Key: {type}:{issuer}"
@@ -113,7 +117,7 @@ impl ExpressionEvaluator {
 				}
 
 				// Get variable value
-				let value = self.get_variable(&var_name, context)?;
+				let value = Self::get_variable(&var_name, context)?;
 				let replacement = match value {
 					Value::Null => String::new(),
 					Value::String(s) => s,
@@ -133,7 +137,7 @@ impl ExpressionEvaluator {
 	/// - Direct fields: "issuer", "type", "subtype"
 	/// - Nested paths: "context.tenant.type"
 	/// - User variables: any name set by Set operation
-	fn get_variable(&self, path: &str, context: &HookContext) -> ClResult<Value> {
+	fn get_variable(path: &str, context: &HookContext) -> ClResult<Value> {
 		let parts: Vec<&str> = path.split('.').collect();
 
 		// Start with the root value
@@ -141,39 +145,23 @@ impl ExpressionEvaluator {
 			// Action fields
 			"action_id" => Value::String(context.action_id.clone()),
 			"type" => Value::String(context.r#type.clone()),
-			"subtype" => context
-				.subtype
-				.as_ref()
-				.map(|s| Value::String(s.clone()))
-				.unwrap_or(Value::Null),
+			"subtype" => context.subtype.as_ref().map_or(Value::Null, |s| Value::String(s.clone())),
 			"issuer" => Value::String(context.issuer.clone()),
-			"audience" => context
-				.audience
-				.as_ref()
-				.map(|s| Value::String(s.clone()))
-				.unwrap_or(Value::Null),
-			"parent" => {
-				context.parent.as_ref().map(|s| Value::String(s.clone())).unwrap_or(Value::Null)
+			"audience" => {
+				context.audience.as_ref().map_or(Value::Null, |s| Value::String(s.clone()))
 			}
-			"subject" => context
-				.subject
-				.as_ref()
-				.map(|s| Value::String(s.clone()))
-				.unwrap_or(Value::Null),
+			"parent" => context.parent.as_ref().map_or(Value::Null, |s| Value::String(s.clone())),
+			"subject" => context.subject.as_ref().map_or(Value::Null, |s| Value::String(s.clone())),
 			"content" => context.content.clone().unwrap_or(Value::Null),
-			"attachments" => context
-				.attachments
-				.as_ref()
-				.map(|a| Value::Array(a.iter().map(|s| Value::String(s.clone())).collect()))
-				.unwrap_or(Value::Null),
+			"attachments" => context.attachments.as_ref().map_or(Value::Null, |a| {
+				Value::Array(a.iter().map(|s| Value::String(s.clone())).collect())
+			}),
 
 			// Timestamps
 			"created_at" => Value::String(context.created_at.clone()),
-			"expires_at" => context
-				.expires_at
-				.as_ref()
-				.map(|s| Value::String(s.clone()))
-				.unwrap_or(Value::Null),
+			"expires_at" => {
+				context.expires_at.as_ref().map_or(Value::Null, |s| Value::String(s.clone()))
+			}
 
 			// Context object
 			"context" => {
@@ -233,29 +221,29 @@ impl ExpressionEvaluator {
 			ComparisonExpr::Gt([left, right]) => {
 				let l_val = self.evaluate(left, context)?;
 				let r_val = self.evaluate(right, context)?;
-				let l = self.to_number(&l_val)?;
-				let r = self.to_number(&r_val)?;
+				let l = Self::to_number(&l_val)?;
+				let r = Self::to_number(&r_val)?;
 				Ok(Value::Bool(l > r))
 			}
 			ComparisonExpr::Gte([left, right]) => {
 				let l_val = self.evaluate(left, context)?;
 				let r_val = self.evaluate(right, context)?;
-				let l = self.to_number(&l_val)?;
-				let r = self.to_number(&r_val)?;
+				let l = Self::to_number(&l_val)?;
+				let r = Self::to_number(&r_val)?;
 				Ok(Value::Bool(l >= r))
 			}
 			ComparisonExpr::Lt([left, right]) => {
 				let l_val = self.evaluate(left, context)?;
 				let r_val = self.evaluate(right, context)?;
-				let l = self.to_number(&l_val)?;
-				let r = self.to_number(&r_val)?;
+				let l = Self::to_number(&l_val)?;
+				let r = Self::to_number(&r_val)?;
 				Ok(Value::Bool(l < r))
 			}
 			ComparisonExpr::Lte([left, right]) => {
 				let l_val = self.evaluate(left, context)?;
 				let r_val = self.evaluate(right, context)?;
-				let l = self.to_number(&l_val)?;
-				let r = self.to_number(&r_val)?;
+				let l = Self::to_number(&l_val)?;
+				let r = Self::to_number(&r_val)?;
 				Ok(Value::Bool(l <= r))
 			}
 		}
@@ -271,7 +259,7 @@ impl ExpressionEvaluator {
 			LogicalExpr::And(exprs) => {
 				for expr in exprs {
 					let value = self.evaluate(expr, context)?;
-					if !self.to_bool(&value) {
+					if !Self::to_bool(&value) {
 						return Ok(Value::Bool(false));
 					}
 				}
@@ -280,7 +268,7 @@ impl ExpressionEvaluator {
 			LogicalExpr::Or(exprs) => {
 				for expr in exprs {
 					let value = self.evaluate(expr, context)?;
-					if self.to_bool(&value) {
+					if Self::to_bool(&value) {
 						return Ok(Value::Bool(true));
 					}
 				}
@@ -288,7 +276,7 @@ impl ExpressionEvaluator {
 			}
 			LogicalExpr::Not(expr) => {
 				let value = self.evaluate(expr, context)?;
-				Ok(Value::Bool(!self.to_bool(&value)))
+				Ok(Value::Bool(!Self::to_bool(&value)))
 			}
 		}
 	}
@@ -304,7 +292,7 @@ impl ExpressionEvaluator {
 				let mut sum = 0.0;
 				for expr in exprs {
 					let val = self.evaluate(expr, context)?;
-					sum += self.to_number(&val)?;
+					sum += Self::to_number(&val)?;
 				}
 				serde_json::Number::from_f64(sum).map(Value::Number).ok_or_else(|| {
 					Error::ValidationError("Invalid number result (NaN or infinity)".to_string())
@@ -313,8 +301,8 @@ impl ExpressionEvaluator {
 			ArithmeticExpr::Subtract([left, right]) => {
 				let l_val = self.evaluate(left, context)?;
 				let r_val = self.evaluate(right, context)?;
-				let l = self.to_number(&l_val)?;
-				let r = self.to_number(&r_val)?;
+				let l = Self::to_number(&l_val)?;
+				let r = Self::to_number(&r_val)?;
 				serde_json::Number::from_f64(l - r).map(Value::Number).ok_or_else(|| {
 					Error::ValidationError("Invalid number result (NaN or infinity)".to_string())
 				})
@@ -323,7 +311,7 @@ impl ExpressionEvaluator {
 				let mut product = 1.0;
 				for expr in exprs {
 					let val = self.evaluate(expr, context)?;
-					product *= self.to_number(&val)?;
+					product *= Self::to_number(&val)?;
 				}
 				serde_json::Number::from_f64(product).map(Value::Number).ok_or_else(|| {
 					Error::ValidationError("Invalid number result (NaN or infinity)".to_string())
@@ -332,8 +320,8 @@ impl ExpressionEvaluator {
 			ArithmeticExpr::Divide([left, right]) => {
 				let l_val = self.evaluate(left, context)?;
 				let r_val = self.evaluate(right, context)?;
-				let l = self.to_number(&l_val)?;
-				let r = self.to_number(&r_val)?;
+				let l = Self::to_number(&l_val)?;
+				let r = Self::to_number(&r_val)?;
 				serde_json::Number::from_f64(l / r).map(Value::Number).ok_or_else(|| {
 					Error::ValidationError("Invalid number result (NaN or infinity)".to_string())
 				})
@@ -352,29 +340,29 @@ impl ExpressionEvaluator {
 				let mut result = String::new();
 				for expr in exprs {
 					let value = self.evaluate(expr, context)?;
-					result.push_str(&self.to_string(&value));
+					result.push_str(&Self::to_string(&value));
 				}
 				Ok(Value::String(result))
 			}
 			StringOpExpr::Contains([haystack, needle]) => {
 				let h_val = self.evaluate(haystack, context)?;
 				let n_val = self.evaluate(needle, context)?;
-				let h = self.to_string(&h_val);
-				let n = self.to_string(&n_val);
+				let h = Self::to_string(&h_val);
+				let n = Self::to_string(&n_val);
 				Ok(Value::Bool(h.contains(&n)))
 			}
 			StringOpExpr::StartsWith([string, prefix]) => {
 				let s_val = self.evaluate(string, context)?;
 				let p_val = self.evaluate(prefix, context)?;
-				let s = self.to_string(&s_val);
-				let p = self.to_string(&p_val);
+				let s = Self::to_string(&s_val);
+				let p = Self::to_string(&p_val);
 				Ok(Value::Bool(s.starts_with(&p)))
 			}
 			StringOpExpr::EndsWith([string, suffix]) => {
 				let s_val = self.evaluate(string, context)?;
 				let suf_val = self.evaluate(suffix, context)?;
-				let s = self.to_string(&s_val);
-				let suf = self.to_string(&suf_val);
+				let s = Self::to_string(&s_val);
+				let suf = Self::to_string(&suf_val);
 				Ok(Value::Bool(s.ends_with(&suf)))
 			}
 		}
@@ -387,7 +375,7 @@ impl ExpressionEvaluator {
 		context: &HookContext,
 	) -> ClResult<Value> {
 		let condition = self.evaluate(&ternary.r#if, context)?;
-		if self.to_bool(&condition) {
+		if Self::to_bool(&condition) {
 			self.evaluate(&ternary.then, context)
 		} else {
 			self.evaluate(&ternary.r#else, context)
@@ -410,7 +398,7 @@ impl ExpressionEvaluator {
 	}
 
 	/// Convert value to boolean (truthy/falsy)
-	fn to_bool(&self, value: &Value) -> bool {
+	fn to_bool(value: &Value) -> bool {
 		match value {
 			Value::Null => false,
 			Value::Bool(b) => *b,
@@ -422,7 +410,7 @@ impl ExpressionEvaluator {
 	}
 
 	/// Convert value to string
-	fn to_string(&self, value: &Value) -> String {
+	fn to_string(value: &Value) -> String {
 		match value {
 			Value::Null => String::new(),
 			Value::Bool(b) => b.to_string(),
@@ -433,7 +421,7 @@ impl ExpressionEvaluator {
 	}
 
 	/// Convert value to number
-	fn to_number(&self, value: &Value) -> ClResult<f64> {
+	fn to_number(value: &Value) -> ClResult<f64> {
 		match value {
 			Value::Number(n) => n.as_f64().ok_or_else(|| {
 				Error::ValidationError(

@@ -140,7 +140,7 @@ fn encrypt_payload(
 
 	// The encrypted result is already in aes128gcm format
 	// Format: salt (16 bytes) || rs (4 bytes) || keyid_len (1 byte) || keyid || ciphertext
-	let body = encrypted.to_vec();
+	let body = encrypted.clone();
 
 	// Extract salt (first 16 bytes)
 	let salt = body.get(0..16).ok_or("Encrypted data too short")?.to_vec();
@@ -161,6 +161,14 @@ fn create_vapid_jwt(endpoint: &str, id_tag: &str, private_key_raw: &str) -> Resu
 	use p256::pkcs8::EncodePrivateKey;
 	use p256::pkcs8::LineEnding;
 
+	// JWT claims for VAPID
+	#[derive(Serialize)]
+	struct VapidClaims {
+		aud: String,
+		exp: u64,
+		sub: String,
+	}
+
 	// Decode the raw private key scalar from base64url
 	let private_key_bytes = URL_SAFE_NO_PAD
 		.decode(private_key_raw)
@@ -178,14 +186,6 @@ fn create_vapid_jwt(endpoint: &str, id_tag: &str, private_key_raw: &str) -> Resu
 	// Parse endpoint to get the audience (origin)
 	let url = url::Url::parse(endpoint).map_err(|e| format!("Invalid endpoint URL: {}", e))?;
 	let audience = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
-
-	// JWT claims for VAPID
-	#[derive(Serialize)]
-	struct VapidClaims {
-		aud: String,
-		exp: u64,
-		sub: String,
-	}
 
 	let exp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs()
 		+ 12 * 3600; // 12 hours
@@ -250,7 +250,12 @@ async fn send_push_request(
 				PushResult::SubscriptionGone
 			} else if status.is_client_error() {
 				// 4xx (except 404/410) = permanent error
-				let body_bytes = response.into_body().collect().await.ok().map(|b| b.to_bytes());
+				let body_bytes = response
+					.into_body()
+					.collect()
+					.await
+					.ok()
+					.map(http_body_util::Collected::to_bytes);
 				let body_str =
 					body_bytes.as_ref().and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
 				PushResult::PermanentError(format!("HTTP {}: {}", status, body_str))

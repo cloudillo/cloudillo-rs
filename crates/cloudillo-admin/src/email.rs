@@ -82,7 +82,7 @@ pub async fn send_test_email(
 
 	// Check if SMTP host is configured
 	let smtp_host = app.settings.get_string_opt(tn_id, "email.smtp.host").await.unwrap_or(None);
-	if smtp_host.is_none() || smtp_host.as_ref().is_some_and(|h| h.is_empty()) {
+	if smtp_host.is_none() || smtp_host.as_ref().is_some_and(String::is_empty) {
 		return Ok((
 			StatusCode::PRECONDITION_FAILED,
 			Json(ErrorResponse::new(
@@ -94,7 +94,7 @@ pub async fn send_test_email(
 	}
 
 	// Get base_id_tag for sender name
-	let base_id_tag = app.opts.base_id_tag.as_ref().map(|s| s.as_ref()).unwrap_or("cloudillo");
+	let base_id_tag = app.opts.base_id_tag.as_ref().map_or("cloudillo", AsRef::as_ref);
 
 	// Create test email message
 	let message = EmailMessage {

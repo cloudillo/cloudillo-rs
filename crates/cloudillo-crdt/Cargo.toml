@@ -22,3 +22,6 @@ tracing = "0.1"
 
 # CRDT (exclusive to this crate)
 yrs = "0.25"
+
+[lints]
+workspace = true

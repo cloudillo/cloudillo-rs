@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::prelude::*;
 
-/// Default cache capacity if not configured
+/// Limits memory for failed key fetch entries (one entry per remote instance)
 const DEFAULT_CACHE_CAPACITY: usize = 100;
 
 /// TTL for network errors (transient, may recover quickly)
@@ -33,24 +33,23 @@ pub enum FailureType {
 
 impl FailureType {
 	/// Get the TTL in seconds for this failure type
-	pub fn ttl_secs(&self) -> i64 {
+	pub fn ttl_secs(self) -> i64 {
 		match self {
 			FailureType::NetworkError => TTL_NETWORK_ERROR_SECS,
-			FailureType::NotFound => TTL_PERSISTENT_ERROR_SECS,
-			FailureType::Unauthorized => TTL_PERSISTENT_ERROR_SECS,
-			FailureType::ParseError => TTL_PERSISTENT_ERROR_SECS,
+			FailureType::NotFound | FailureType::Unauthorized | FailureType::ParseError => {
+				TTL_PERSISTENT_ERROR_SECS
+			}
 		}
 	}
 
 	/// Convert from Error to FailureType
 	pub fn from_error(error: &Error) -> Self {
 		match error {
-			Error::NetworkError(_) => FailureType::NetworkError,
-			Error::NotFound => FailureType::NotFound,
-			Error::PermissionDenied | Error::Unauthorized => FailureType::Unauthorized,
-			Error::Parse => FailureType::ParseError,
+			Error::NotFound => Self::NotFound,
+			Error::PermissionDenied | Error::Unauthorized => Self::Unauthorized,
+			Error::Parse => Self::ParseError,
 			// Default to NetworkError for unknown errors (shorter TTL)
-			_ => FailureType::NetworkError,
+			_ => Self::NetworkError,
 		}
 	}
 }

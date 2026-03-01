@@ -12,7 +12,7 @@ use tokio::{
 };
 use tokio_util::{bytes::Bytes, io::ReaderStream};
 
-use cloudillo_types::{blob_adapter, hasher, prelude::*, types::TnId};
+use cloudillo_types::{blob_adapter, hasher, prelude::*};
 
 /// Validates that a file_id hash portion contains only safe characters (base64url alphabet)
 fn validate_hash(hash: &str) -> ClResult<()> {
@@ -26,8 +26,8 @@ fn validate_hash(hash: &str) -> ClResult<()> {
 fn obj_dir(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
 	let hash_start = file_id.find('~').ok_or(Error::Parse)? + 1;
 	if file_id.len() < hash_start + 4 {
-		Err(Error::Parse)?
-	};
+		Err(Error::Parse)?;
+	}
 	validate_hash(&file_id[hash_start..])?;
 
 	Ok(PathBuf::from(base_dir)
@@ -39,8 +39,8 @@ fn obj_dir(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
 fn obj_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<PathBuf> {
 	let hash_start = file_id.find('~').ok_or(Error::Parse)? + 1;
 	if file_id.len() < hash_start + 5 {
-		Err(Error::Parse)?
-	};
+		Err(Error::Parse)?;
+	}
 	validate_hash(&file_id[hash_start..])?;
 
 	Ok(PathBuf::from(base_dir)
@@ -54,8 +54,8 @@ fn obj_tmp_file_path(base_dir: &Path, tn_id: TnId, file_id: &str) -> ClResult<Pa
 	let tmp_id = format!("tmp-{}", cloudillo_types::utils::random_id()?);
 	let hash_start = file_id.find('~').ok_or(Error::Parse)? + 1;
 	if file_id.len() < hash_start + 5 {
-		Err(Error::Parse)?
-	};
+		Err(Error::Parse)?;
+	}
 	validate_hash(&file_id[hash_start..])?;
 
 	Ok(PathBuf::from(base_dir).join(tn_id.to_string()).join(&tmp_id))

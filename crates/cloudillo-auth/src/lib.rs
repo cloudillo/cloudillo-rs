@@ -1,8 +1,5 @@
 //! Authentication subsystem.
 
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
-
 pub mod api_key;
 pub mod cleanup;
 pub mod handler;

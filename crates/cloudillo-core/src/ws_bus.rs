@@ -57,9 +57,9 @@ impl BusMessage {
 				let parsed = serde_json::from_str::<BusMessage>(text)?;
 				Ok(Some(parsed))
 			}
-			Message::Close(_) => Ok(None),
-			Message::Ping(_) | Message::Pong(_) => Ok(None),
-			_ => Ok(None),
+			Message::Close(_) | Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => {
+				Ok(None)
+			}
 		}
 	}
 }
@@ -181,12 +181,11 @@ pub async fn handle_bus_connection(
 
 /// Handle a bus command
 async fn handle_bus_command(user_id: &str, msg: &BusMessage) -> BusMessage {
-	match msg.cmd.as_str() {
-		"ping" => BusMessage::ack(msg.id.clone(), "pong"),
-		_ => {
-			debug!("Bus command from {}: {}", user_id, msg.cmd);
-			BusMessage::ack(msg.id.clone(), "ok")
-		}
+	if msg.cmd.as_str() == "ping" {
+		BusMessage::ack(msg.id.clone(), "pong")
+	} else {
+		debug!("Bus command from {}: {}", user_id, msg.cmd);
+		BusMessage::ack(msg.id.clone(), "ok")
 	}
 }
 

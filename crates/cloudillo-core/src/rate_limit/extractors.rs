@@ -145,7 +145,7 @@ fn extract_from_xff<B>(req: &Request<B>) -> Option<IpAddr> {
 		.and_then(|s| {
 			// X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2"
 			// Take the first (leftmost) IP as the original client
-			s.split(',').next().map(|ip| ip.trim()).and_then(|ip| ip.parse().ok())
+			s.split(',').next().map(str::trim).and_then(|ip| ip.parse().ok())
 		})
 }
 

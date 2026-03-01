@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use cloudillo_core::abac::can_view_item;
+use cloudillo_core::abac::{can_view_item, ViewCheckContext};
 use cloudillo_types::meta_adapter::{ActionView, ListActionOptions};
 
 use crate::{dsl::DslEngine, prelude::*};
@@ -73,16 +73,16 @@ pub async fn filter_actions_by_visibility(
 				}
 			}
 
-			let allowed = can_view_item(
+			let allowed = can_view_item(&ViewCheckContext {
 				subject_id_tag,
 				is_authenticated,
-				issuer_tag,
+				item_owner_id_tag: issuer_tag,
 				tenant_id_tag,
-				action.visibility,
-				following,
-				connected,
-				Some(&audience),
-			);
+				visibility: action.visibility,
+				subject_following_owner: following,
+				subject_connected_to_owner: connected,
+				audience_tags: Some(&audience),
+			});
 			if !allowed {
 				info!(
 					"FILTERED OUT action={}: subject={}, issuer={}, tenant={}, visibility={:?}, audience={:?}",

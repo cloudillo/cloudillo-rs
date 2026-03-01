@@ -4,7 +4,7 @@
 //! resolution starting from root nameservers.
 
 use hickory_resolver::{
-	config::*,
+	config::{NameServerConfig, ResolverConfig},
 	name_server::TokioConnectionProvider,
 	proto::{rr::RecordType, xfer::Protocol},
 	TokioResolver,
@@ -45,6 +45,11 @@ impl DnsResolver {
 	}
 
 	/// Create a resolver configured to query specific nameservers
+	#[expect(
+		clippy::unused_self,
+		clippy::unnecessary_wraps,
+		reason = "method for consistency; Result for future error handling"
+	)]
 	fn create_resolver_for_ns(&self, ns_ips: &[IpAddr]) -> ClResult<TokioResolver> {
 		let mut config = ResolverConfig::new();
 		for ip in ns_ips {

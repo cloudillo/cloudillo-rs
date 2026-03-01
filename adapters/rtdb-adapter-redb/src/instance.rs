@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+type IndexedFieldsMap = HashMap<Box<str>, Vec<Box<str>>>;
+
 /// An active database instance with real-time subscription support
 #[derive(Debug)]
 pub struct DatabaseInstance {
@@ -23,9 +25,8 @@ pub struct DatabaseInstance {
 	/// Last access timestamp (Unix seconds)
 	pub(crate) last_accessed: Arc<AtomicU64>,
 
-	#[allow(clippy::type_complexity)]
 	/// Cached indexed fields per collection
-	pub(crate) indexed_fields: Arc<RwLock<HashMap<Box<str>, Vec<Box<str>>>>>,
+	pub(crate) indexed_fields: Arc<RwLock<IndexedFieldsMap>>,
 
 	/// In-memory locks on document paths (ephemeral, not persisted)
 	pub(crate) locks: Arc<RwLock<HashMap<Box<str>, LockInfo>>>,
@@ -81,12 +82,11 @@ impl DatabaseInstance {
 				let path = collection
 					.split_once('/')
 					.filter(|(prefix, _)| prefix.chars().all(|c| c.is_ascii_digit()))
-					.map(|(_, rest)| rest)
-					.unwrap_or(collection);
+					.map_or(collection, |(_, rest)| rest);
 
 				if let Ok(fields) = serde_json::from_str::<Vec<String>>(value.value()) {
 					indexed_fields
-						.insert(path.into(), fields.into_iter().map(|f| f.into()).collect());
+						.insert(path.into(), fields.into_iter().map(Into::into).collect());
 				}
 			}
 		}

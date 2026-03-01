@@ -80,7 +80,7 @@ async fn load_profile_attrs(
 		.await
 		.ok()
 		.flatten()
-		.map(|roles| roles.into_vec())
+		.map(Vec::from)
 		.unwrap_or_default();
 
 	// Get profile data from MetaAdapter - if not found, return default attrs

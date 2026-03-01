@@ -106,7 +106,7 @@ impl AppBuilder {
 		&mut self,
 		local_address: impl IntoIterator<Item = impl Into<Box<str>>>,
 	) -> &mut Self {
-		self.opts.local_address = local_address.into_iter().map(|addr| addr.into()).collect();
+		self.opts.local_address = local_address.into_iter().map(Into::into).collect();
 		self
 	}
 	pub fn disable_cache(&mut self, disable: bool) -> &mut Self {
@@ -243,10 +243,12 @@ impl AppBuilder {
 		};
 
 		// Initialize key fetch failure cache
-		let key_cache_size = settings_service
+		let key_cache_size: usize = settings_service
 			.get_int(TnId(0), "federation.key_failure_cache_size")
 			.await
-			.unwrap_or(100) as usize;
+			.unwrap_or(100)
+			.try_into()
+			.unwrap_or(100);
 		let key_fetch_cache = Arc::new(KeyFetchCache::new(key_cache_size));
 		info!("Key fetch failure cache initialized (capacity: {})", key_cache_size);
 

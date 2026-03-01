@@ -115,14 +115,14 @@ pub async fn post_action(
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Inbox {
 	token: String,
 	related: Option<Vec<String>>,
 }
 
 /// Request structure for synchronous action processing (e.g., IDP:REG)
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SyncActionRequest {
 	/// Action type (e.g., "IDP:REG")
 	pub r#type: String,
@@ -251,11 +251,11 @@ pub async fn post_inbox_sync(
 /// GET /api/actions/:action_id - Get a single action
 pub async fn get_action_by_id(
 	State(app): State<App>,
-	_tn_id: TnId,
+	tn_id: TnId,
 	Path(action_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
-	let action = app.meta_adapter.get_action(_tn_id, &action_id).await?;
+	let action = app.meta_adapter.get_action(tn_id, &action_id).await?;
 
 	match action {
 		Some(a) => {
@@ -269,11 +269,11 @@ pub async fn get_action_by_id(
 /// DELETE /api/actions/:action_id - Delete action
 pub async fn delete_action(
 	State(app): State<App>,
-	_tn_id: TnId,
+	tn_id: TnId,
 	Path(action_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	app.meta_adapter.delete_action(_tn_id, &action_id).await?;
+	app.meta_adapter.delete_action(tn_id, &action_id).await?;
 	info!("Deleted action {}", action_id);
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
@@ -317,7 +317,7 @@ pub async fn post_action_accept(
 			)
 			.created_at(format!("{}", action.created_at.0))
 			.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
-			.tenant(tn_id.0 as i64, &*id_tag, "person")
+			.tenant(i64::from(tn_id.0), &*id_tag, "person")
 			.inbound()
 			.build();
 
@@ -346,8 +346,7 @@ pub async fn post_action_accept(
 	// If action type is approvable, create APRV action to signal approval to the issuer
 	let is_approvable = dsl
 		.get_definition(&action.typ)
-		.map(|d| d.behavior.approvable.unwrap_or(false))
-		.unwrap_or(false);
+		.is_some_and(|d| d.behavior.approvable.unwrap_or(false));
 
 	if is_approvable {
 		// Create APRV action with:
@@ -429,7 +428,7 @@ pub async fn post_action_reject(
 			)
 			.created_at(format!("{}", action.created_at.0))
 			.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
-			.tenant(tn_id.0 as i64, &*id_tag, "person")
+			.tenant(i64::from(tn_id.0), &*id_tag, "person")
 			.inbound()
 			.build();
 
@@ -503,7 +502,7 @@ pub async fn post_action_dismiss(
 }
 
 /// POST /api/actions/:action_id/stat - Update action statistics
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct UpdateActionStatRequest {
 	#[serde(default, rename = "commentsRead")]
 	pub comments_read: cloudillo_types::types::Patch<u32>,

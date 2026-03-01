@@ -10,9 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::prelude::*;
 use cloudillo_core::extract::{OptionalAuth, OptionalRequestId};
 use cloudillo_types::meta_adapter::{CreateRefOptions, ListRefsOptions, RefData};
-use cloudillo_types::types::{
-	serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse, Patch, Timestamp,
-};
+use cloudillo_types::types::{serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse};
 use cloudillo_types::utils;
 
 /// Response structure for ref details (authenticated users get full data)
@@ -179,8 +177,8 @@ pub async fn create_ref(
 
 	// Parse and validate access_level
 	let access_level_char = match create_req.access_level.as_deref() {
-		Some("write") | Some("W") => Some('W'),
-		Some("read") | Some("R") | None => {
+		Some("write" | "W") => Some('W'),
+		Some("read" | "R") | None => {
 			// Default to read if resource_id is present
 			if create_req.resource_id.is_some() {
 				Some('R')

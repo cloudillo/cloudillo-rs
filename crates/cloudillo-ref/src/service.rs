@@ -2,7 +2,6 @@
 
 use crate::prelude::*;
 use cloudillo_types::meta_adapter::CreateRefOptions;
-use cloudillo_types::types::Timestamp;
 use cloudillo_types::utils;
 
 /// Parameters for creating a ref internally
@@ -47,10 +46,10 @@ pub async fn create_ref_internal(
 	// Create ref options
 	let ref_opts = CreateRefOptions {
 		typ: params.typ.to_string(),
-		description: params.description.map(|s| s.to_string()),
+		description: params.description.map(ToString::to_string),
 		expires_at: params.expires_at,
 		count: Some(params.count.unwrap_or(1)),
-		resource_id: params.resource_id.map(|s| s.to_string()),
+		resource_id: params.resource_id.map(ToString::to_string),
 		access_level: None,
 	};
 

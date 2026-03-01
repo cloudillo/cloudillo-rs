@@ -28,6 +28,14 @@ use yrs::{Map, ReadTxn, Transact, Update};
 /// Throttle interval for access/modification tracking (60 seconds)
 const TRACKING_THROTTLE_SECS: u64 = 60;
 
+/// Convert `usize` to `f64`, accepting minor precision loss for values above 2^53.
+///
+/// Used for byte-size percentages where exact precision is not critical.
+#[allow(clippy::cast_precision_loss)]
+fn usize_to_f64(v: usize) -> f64 {
+	v as f64
+}
+
 /// CRDT connection tracking
 struct CrdtConnection {
 	conn_id: String, // Unique connection ID (to distinguish multiple tabs from same user)
@@ -171,11 +179,9 @@ pub async fn handle_crdt_connection(
 		// (a new connection might have been established during the grace period)
 		let still_no_connections = {
 			let docs = CRDT_DOCS.read().await;
-			docs.get(&conn.doc_id)
-				.map(|(awareness_tx, sync_tx)| {
-					awareness_tx.receiver_count() == 0 && sync_tx.receiver_count() == 0
-				})
-				.unwrap_or(true) // Doc removed = definitely no connections
+			docs.get(&conn.doc_id).is_none_or(|(awareness_tx, sync_tx)| {
+				awareness_tx.receiver_count() == 0 && sync_tx.receiver_count() == 0
+			})
 		};
 
 		if still_no_connections {
@@ -329,13 +335,11 @@ fn spawn_receive_task(
 					// yrs messages are sent directly without our wrapper
 					handle_yrs_message(&conn, &data, &ws_tx, &app, tn_id, read_only).await;
 				}
-				Ok(Message::Close(_)) | Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+				Ok(Message::Close(_) | Message::Ping(_) | Message::Pong(_)) => {
 					// Ignore control frames
-					continue;
 				}
 				Ok(_) => {
 					warn!("Received non-binary WebSocket message");
-					continue;
 				}
 				Err(e) => {
 					warn!("CRDT connection error: {}", e);
@@ -402,7 +406,6 @@ fn spawn_broadcast_task(
 					} else {
 						debug!("Connection {} lagged on {} updates", conn.conn_id, label);
 					}
-					continue;
 				}
 				Err(tokio::sync::broadcast::error::RecvError::Closed) => {
 					debug!("{} broadcast channel closed", label);
@@ -450,7 +453,7 @@ async fn send_echo_raw(
 	let mut tx = ws_tx.lock().await;
 
 	match tx.send(ws_msg).await {
-		Ok(_) => {
+		Ok(()) => {
 			debug!(
 				"CRDT {} echo sent back to conn {} (user {}) for doc {} ({} bytes)",
 				label,
@@ -515,11 +518,11 @@ async fn handle_yrs_message(
 							return;
 						}
 
-						if !data.is_empty() {
-							Some(data.clone())
-						} else {
+						if data.is_empty() {
 							debug!("Received empty Update message from conn {}", conn.conn_id);
 							None
+						} else {
+							Some(data.clone())
 						}
 					}
 					SyncMessage::SyncStep2(data) => {
@@ -552,7 +555,7 @@ async fn handle_yrs_message(
 					conn.user_id.clone(),
 				);
 				match app.crdt_adapter.store_update(tn_id, &conn.doc_id, update).await {
-					Ok(_) => {
+					Ok(()) => {
 						info!(
 							"✓ CRDT update stored for doc {} from user {} ({} bytes)",
 							conn.doc_id,
@@ -719,7 +722,7 @@ async fn optimize_document(app: &App, tn_id: TnId, doc_id: &str) {
 			let mut txn = doc.transact_mut();
 			for (idx, decoded_update) in decoded_updates.into_iter().enumerate() {
 				match txn.apply_update(decoded_update) {
-					Ok(_) => {
+					Ok(()) => {
 						debug!(
 							"Applied update #{} successfully during merge for doc {}",
 							idx, &doc_id_for_task
@@ -823,7 +826,7 @@ async fn optimize_document(app: &App, tn_id: TnId, doc_id: &str) {
 
 	// Log success
 	let size_reduction = size_before - size_after;
-	let reduction_percent = (size_reduction as f64 / size_before as f64) * 100.0;
+	let reduction_percent = (usize_to_f64(size_reduction) / usize_to_f64(size_before)) * 100.0;
 
 	let skipped_msg = if skipped_count > 0 {
 		format!(", {} corrupted updates skipped", skipped_count)
@@ -856,12 +859,11 @@ async fn cleanup_registry(doc_id: &str) -> bool {
 			CRDT_DOCS.write().await.remove(doc_id);
 			info!("✓ Cleaned up CRDT registry for doc {} - triggering optimization", doc_id);
 			return true; // This was the last connection
-		} else {
-			info!(
-				"✗ Not cleaning up doc {} - still has active receivers (awareness: {}, sync: {})",
-				doc_id, awareness_count, sync_count
-			);
 		}
+		info!(
+			"✗ Not cleaning up doc {} - still has active receivers (awareness: {}, sync: {})",
+			doc_id, awareness_count, sync_count
+		);
 	} else {
 		info!("✗ Doc {} not found in registry during cleanup", doc_id);
 	}

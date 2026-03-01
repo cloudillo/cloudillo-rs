@@ -12,7 +12,7 @@ use crate::prelude::*;
 use cloudillo_core::abac::VisibilityLevel;
 use cloudillo_core::extract::{Auth, OptionalRequestId};
 use cloudillo_types::meta_adapter::{self, UpdateFileOptions};
-use cloudillo_types::types::{ApiResponse, Patch};
+use cloudillo_types::types::ApiResponse;
 use cloudillo_types::utils;
 
 /// Special folder ID for trash

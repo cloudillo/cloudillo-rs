@@ -79,7 +79,7 @@ pub async fn list_profiles(
 			status: None, // Not available in Profile type
 			connected: Some(p.connected.is_connected()),
 			following: Some(p.following),
-			roles: p.roles.map(|r| r.iter().map(|s| s.to_string()).collect()),
+			roles: p.roles.map(|r| r.iter().map(ToString::to_string).collect()),
 			created_at: None, // Not available in Profile type
 		})
 		.collect();

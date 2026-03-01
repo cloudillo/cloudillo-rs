@@ -2,6 +2,8 @@
 //!
 //! Tests error conditions and edge cases
 
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
+
 use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use cloudillo_types::blob_adapter::{BlobAdapter, CreateBlobOptions};
 use cloudillo_types::types::TnId;

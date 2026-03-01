@@ -18,7 +18,6 @@ use std::fmt::Debug;
 use std::pin::Pin;
 
 use crate::prelude::*;
-use crate::types::TnId;
 
 /// Lock mode for document locking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,17 +192,15 @@ impl QueryFilter {
 	pub fn matches(&self, doc: &Value) -> bool {
 		// Equality checks
 		for (field, expected) in &self.equals {
-			match doc.get(field) {
-				Some(actual) if actual == expected => continue,
-				_ => return false,
+			if doc.get(field) != Some(expected) {
+				return false;
 			}
 		}
 
 		// Not-equal checks (missing fields are inherently "not equal")
 		for (field, expected) in &self.not_equals {
-			match doc.get(field) {
-				Some(actual) if actual == expected => return false,
-				_ => continue,
+			if doc.get(field) == Some(expected) {
+				return false;
 			}
 		}
 
@@ -212,10 +209,7 @@ impl QueryFilter {
 			match doc.get(field) {
 				Some(actual)
 					if compare_json_values(Some(actual), Some(threshold))
-						== std::cmp::Ordering::Greater =>
-				{
-					continue
-				}
+						== std::cmp::Ordering::Greater => {}
 				_ => return false,
 			}
 		}
@@ -225,10 +219,9 @@ impl QueryFilter {
 			match doc.get(field) {
 				Some(actual) => {
 					let ord = compare_json_values(Some(actual), Some(threshold));
-					if ord == std::cmp::Ordering::Greater || ord == std::cmp::Ordering::Equal {
-						continue;
+					if ord != std::cmp::Ordering::Greater && ord != std::cmp::Ordering::Equal {
+						return false;
 					}
-					return false;
 				}
 				_ => return false,
 			}
@@ -239,10 +232,7 @@ impl QueryFilter {
 			match doc.get(field) {
 				Some(actual)
 					if compare_json_values(Some(actual), Some(threshold))
-						== std::cmp::Ordering::Less =>
-				{
-					continue
-				}
+						== std::cmp::Ordering::Less => {}
 				_ => return false,
 			}
 		}
@@ -252,10 +242,9 @@ impl QueryFilter {
 			match doc.get(field) {
 				Some(actual) => {
 					let ord = compare_json_values(Some(actual), Some(threshold));
-					if ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal {
-						continue;
+					if ord != std::cmp::Ordering::Less && ord != std::cmp::Ordering::Equal {
+						return false;
 					}
-					return false;
 				}
 				_ => return false,
 			}
@@ -264,7 +253,7 @@ impl QueryFilter {
 		// In-array checks (field value must be in the provided array)
 		for (field, allowed_values) in &self.in_array {
 			match doc.get(field) {
-				Some(actual) if allowed_values.contains(actual) => continue,
+				Some(actual) if allowed_values.contains(actual) => {}
 				_ => return false,
 			}
 		}
@@ -272,25 +261,24 @@ impl QueryFilter {
 		// Array-contains checks (field must be an array containing the value)
 		for (field, required_value) in &self.array_contains {
 			match doc.get(field) {
-				Some(Value::Array(arr)) if arr.contains(required_value) => continue,
+				Some(Value::Array(arr)) if arr.contains(required_value) => {}
 				_ => return false,
 			}
 		}
 
 		// Not-in-array checks (field value must NOT be in the provided array; missing fields pass)
 		for (field, excluded_values) in &self.not_in_array {
-			match doc.get(field) {
-				Some(actual) if excluded_values.contains(actual) => return false,
-				_ => continue,
+			if let Some(actual) = doc.get(field) {
+				if excluded_values.contains(actual) {
+					return false;
+				}
 			}
 		}
 
 		// Array-contains-any checks
 		for (field, candidate_values) in &self.array_contains_any {
 			match doc.get(field) {
-				Some(Value::Array(arr)) if candidate_values.iter().any(|v| arr.contains(v)) => {
-					continue
-				}
+				Some(Value::Array(arr)) if candidate_values.iter().any(|v| arr.contains(v)) => {}
 				_ => return false,
 			}
 		}
@@ -298,9 +286,7 @@ impl QueryFilter {
 		// Array-contains-all checks
 		for (field, required_values) in &self.array_contains_all {
 			match doc.get(field) {
-				Some(Value::Array(arr)) if required_values.iter().all(|v| arr.contains(v)) => {
-					continue
-				}
+				Some(Value::Array(arr)) if required_values.iter().all(|v| arr.contains(v)) => {}
 				_ => return false,
 			}
 		}
@@ -486,12 +472,12 @@ impl ChangeEvent {
 	/// Get the full path from this event.
 	pub fn path(&self) -> &str {
 		match self {
-			ChangeEvent::Create { path, .. } => path,
-			ChangeEvent::Update { path, .. } => path,
-			ChangeEvent::Delete { path, .. } => path,
-			ChangeEvent::Lock { path, .. } => path,
-			ChangeEvent::Unlock { path, .. } => path,
-			ChangeEvent::Ready { path, .. } => path,
+			ChangeEvent::Create { path, .. }
+			| ChangeEvent::Update { path, .. }
+			| ChangeEvent::Delete { path, .. }
+			| ChangeEvent::Lock { path, .. }
+			| ChangeEvent::Unlock { path, .. }
+			| ChangeEvent::Ready { path, .. } => path,
 		}
 	}
 
@@ -509,8 +495,10 @@ impl ChangeEvent {
 	/// Get the document data if this is a Create or Update event.
 	pub fn data(&self) -> Option<&Value> {
 		match self {
-			ChangeEvent::Create { data, .. } | ChangeEvent::Update { data, .. } => Some(data),
-			ChangeEvent::Lock { data, .. } | ChangeEvent::Unlock { data, .. } => Some(data),
+			ChangeEvent::Create { data, .. }
+			| ChangeEvent::Update { data, .. }
+			| ChangeEvent::Lock { data, .. }
+			| ChangeEvent::Unlock { data, .. } => Some(data),
 			ChangeEvent::Delete { .. } => None,
 			ChangeEvent::Ready { data, .. } => data.as_ref(),
 		}

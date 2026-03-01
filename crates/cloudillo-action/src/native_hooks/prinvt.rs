@@ -5,13 +5,11 @@
 
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use cloudillo_core::app::App;
 use cloudillo_types::meta_adapter::UpdateActionDataOptions;
-use cloudillo_types::types::Patch;
 
 /// PRINVT on_receive - Store invite notification for user
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 	tracing::info!(
 		"PRINVT: Received profile invite for {} from {}",

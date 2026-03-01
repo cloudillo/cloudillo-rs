@@ -30,3 +30,6 @@ rustls-pki-types = { version = "1.14", features = ["alloc"] }
 hyper = "1.8"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2"] }
 hyper-rustls = "0.27"
+
+[lints]
+workspace = true

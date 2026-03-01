@@ -37,6 +37,12 @@ struct TierLimiters {
 }
 
 impl TierLimiters {
+	// SAFETY: 1 is non-zero
+	const ONE: NonZeroU32 = match NonZeroU32::new(1) {
+		Some(v) => v,
+		None => unreachable!(),
+	};
+
 	fn new(config: &RateLimitTierConfig) -> Self {
 		// Short-term: per-second with burst
 		let short_quota =
@@ -44,16 +50,11 @@ impl TierLimiters {
 		let short_term = Arc::new(RateLimiter::keyed(short_quota));
 
 		// Long-term: per-hour with burst
-		// Convert RPH to rate per second for governor
-		let rps = config.long_term_rph.get() as f64 / 3600.0;
-		let period_nanos = (1_000_000_000.0 / rps) as u64;
-		// SAFETY: 1 is non-zero
-		const ONE: NonZeroU32 = match NonZeroU32::new(1) {
-			Some(v) => v,
-			None => unreachable!(),
-		};
+		// Convert RPH to nanosecond period using integer math:
+		// period_nanos = 3_600_000_000_000 / rph
+		let period_nanos = 3_600_000_000_000_u64 / u64::from(config.long_term_rph.get());
 		let long_quota = Quota::with_period(Duration::from_nanos(period_nanos))
-			.unwrap_or_else(|| Quota::per_second(ONE))
+			.unwrap_or_else(|| Quota::per_second(Self::ONE))
 			.allow_burst(config.long_term_burst);
 		let long_term = Arc::new(RateLimiter::keyed(long_quota));
 
@@ -145,8 +146,18 @@ pub struct RateLimitManager {
 }
 
 impl RateLimitManager {
+	// SAFETY: These are non-zero constants
+	const TEN_THOUSAND: NonZeroUsize = match NonZeroUsize::new(10_000) {
+		Some(v) => v,
+		None => unreachable!(),
+	};
+	const TWENTY_THOUSAND: NonZeroUsize = match NonZeroUsize::new(20_000) {
+		Some(v) => v,
+		None => unreachable!(),
+	};
+
 	/// Create a new rate limit manager
-	pub fn new(config: RateLimitConfig) -> Self {
+	pub fn new(config: &RateLimitConfig) -> Self {
 		let mut categories = HashMap::new();
 
 		// Initialize category limiters
@@ -155,17 +166,9 @@ impl RateLimitManager {
 		categories.insert("general".to_string(), CategoryLimiters::new(&config.general));
 		categories.insert("websocket".to_string(), CategoryLimiters::new(&config.websocket));
 
-		// SAFETY: These are non-zero constants
-		const TEN_THOUSAND: NonZeroUsize = match NonZeroUsize::new(10_000) {
-			Some(v) => v,
-			None => unreachable!(),
-		};
-		const TWENTY_THOUSAND: NonZeroUsize = match NonZeroUsize::new(20_000) {
-			Some(v) => v,
-			None => unreachable!(),
-		};
-		let ban_cap = NonZeroUsize::new(config.max_tracked_ips / 10).unwrap_or(TEN_THOUSAND);
-		let penalty_cap = NonZeroUsize::new(config.max_tracked_ips / 5).unwrap_or(TWENTY_THOUSAND);
+		let ban_cap = NonZeroUsize::new(config.max_tracked_ips / 10).unwrap_or(Self::TEN_THOUSAND);
+		let penalty_cap =
+			NonZeroUsize::new(config.max_tracked_ips / 5).unwrap_or(Self::TWENTY_THOUSAND);
 
 		Self {
 			categories,
@@ -178,7 +181,7 @@ impl RateLimitManager {
 	}
 
 	/// Create with custom PoW config
-	pub fn with_pow_config(config: RateLimitConfig, pow_config: PowConfig) -> Self {
+	pub fn with_pow_config(config: &RateLimitConfig, pow_config: PowConfig) -> Self {
 		let mut manager = Self::new(config);
 		manager.pow_store = PowCounterStore::new(pow_config);
 		manager
@@ -245,7 +248,7 @@ impl RateLimitManager {
 
 impl Default for RateLimitManager {
 	fn default() -> Self {
-		Self::new(RateLimitConfig::default())
+		Self::new(&RateLimitConfig::default())
 	}
 }
 

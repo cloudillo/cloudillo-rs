@@ -10,7 +10,6 @@
 use crate::prelude::*;
 use cloudillo_core::ws_broadcast::{BroadcastMessage, DeliveryResult};
 use cloudillo_types::meta_adapter::AttachmentView;
-use cloudillo_types::types::TnId;
 use serde_json::json;
 
 /// Result of forwarding an action
@@ -135,7 +134,7 @@ fn build_action_message(params: &ForwardActionParams<'_>) -> BroadcastMessage {
 /// when the user is offline.
 pub fn should_push_notify(action_type: &str, sub_type: Option<&str>) -> bool {
 	// DEL subtypes don't trigger notifications
-	if sub_type.map(|s| s == "DEL").unwrap_or(false) {
+	if sub_type.is_some_and(|s| s == "DEL") {
 		return false;
 	}
 

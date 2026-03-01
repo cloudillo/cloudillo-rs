@@ -65,7 +65,7 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 			// Only include profile_pic in the profile if sync succeeds
 			let synced_profile_pic = if let Some(ref file_id) = remote.profile_pic {
 				match sync_profile_pic_variant(app, tn_id, id_tag, file_id).await {
-					Ok(_) => Some(file_id.as_str()),
+					Ok(()) => Some(file_id.as_str()),
 					Err(e) => {
 						tracing::warn!(
 							"Failed to sync profile picture for {}: {} (continuing without profile_pic)",
@@ -160,13 +160,12 @@ pub async fn refresh_profile(
 				remote.profile_pic.as_deref() != current_profile_pic.as_deref();
 			let profile_pic_synced = if profile_pic_changed {
 				if let Some(ref file_id) = remote.profile_pic {
-					match sync_profile_pic_variant(app, tn_id, id_tag, file_id).await {
-						Ok(_) => true,
-						Err(_) => {
-							// Error already logged in sync_file_variants
-							tracing::debug!("Keeping old profile picture for {}", id_tag);
-							false
-						}
+					if sync_profile_pic_variant(app, tn_id, id_tag, file_id).await.is_ok() {
+						true
+					} else {
+						// Error already logged in sync_file_variants
+						tracing::debug!("Keeping old profile picture for {}", id_tag);
+						false
 					}
 				} else {
 					// Remote has no profile pic - that's a valid sync
@@ -186,7 +185,7 @@ pub async fn refresh_profile(
 
 			// Only update profile_pic if we successfully synced it (or it was removed)
 			if profile_pic_synced {
-				update.profile_pic = Patch::Value(remote.profile_pic.clone().map(|s| s.into()));
+				update.profile_pic = Patch::Value(remote.profile_pic.clone().map(Into::into));
 			}
 
 			// Only update etag if profile_pic sync succeeded (or wasn't needed)

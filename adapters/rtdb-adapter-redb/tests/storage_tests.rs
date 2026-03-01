@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 //! Tests for RTDB storage utilities
 //!
 //! Tests for the storage layer functions that handle:
@@ -23,8 +24,8 @@ fn test_generate_doc_id() {
 	assert_eq!(id1.len(), 24, "ID should be 24 characters");
 	assert_eq!(id2.len(), 24, "ID should be 24 characters");
 	assert_ne!(id1, id2, "Generated IDs should be unique");
-	assert!(id1.chars().all(|c| c.is_alphanumeric()), "ID should be alphanumeric");
-	assert!(id2.chars().all(|c| c.is_alphanumeric()), "ID should be alphanumeric");
+	assert!(id1.chars().all(char::is_alphanumeric), "ID should be alphanumeric");
+	assert!(id2.chars().all(char::is_alphanumeric), "ID should be alphanumeric");
 }
 
 #[test]
@@ -54,8 +55,10 @@ fn test_value_to_string() {
 fn test_event_matches_path() {
 	use cloudillo_types::rtdb_adapter::ChangeEvent;
 
-	let create_event =
-		ChangeEvent::Create { path: "users/doc1".into(), data: Value::Object(Default::default()) };
+	let create_event = ChangeEvent::Create {
+		path: "users/doc1".into(),
+		data: Value::Object(serde_json::Map::default()),
+	};
 
 	// Exact match
 	assert!(event_matches_path(&create_event, "users/doc1"));

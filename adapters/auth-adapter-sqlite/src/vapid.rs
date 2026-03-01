@@ -2,8 +2,8 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::*;
-use cloudillo_types::{auth_adapter::*, prelude::*};
+use crate::utils::inspect;
+use cloudillo_types::{auth_adapter::KeyPair, prelude::*};
 
 /// Read VAPID key pair (public and private keys)
 pub(crate) async fn read_vapid_key(db: &SqlitePool, tn_id: TnId) -> ClResult<KeyPair> {
@@ -44,7 +44,7 @@ pub(crate) async fn read_vapid_public_key(db: &SqlitePool, tn_id: TnId) -> ClRes
 	};
 
 	let public_key: Option<String> = row.try_get("vapid_public_key").or(Err(Error::DbError))?;
-	public_key.map(|k| k.into()).ok_or(Error::NotFound)
+	public_key.map(Into::into).ok_or(Error::NotFound)
 }
 
 /// Update VAPID key pair

@@ -177,8 +177,7 @@ pub async fn create_https_server(
 			let peer_addr = req
 				.extensions()
 				.get::<axum::extract::ConnectInfo<SocketAddr>>()
-				.map(|a| a.to_string())
-				.unwrap_or("-".to_string());
+				.map_or_else(|| "-".to_string(), |a| a.to_string());
 			let host = req
 				.uri()
 				.host()
@@ -199,10 +198,10 @@ pub async fn create_https_server(
 				req.extensions_mut().insert(IdTag(id_tag));
 				let res = api_router.clone().call(req).await;
 
-				let status = res
-					.as_ref()
-					.map(|r| r.status())
-					.unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+				let status = res.as_ref().map_or(
+					axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+					axum::http::Response::status,
+				);
 				if status.is_client_error() || status.is_server_error() {
 					warn!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
 				} else {
@@ -256,10 +255,10 @@ pub async fn create_https_server(
 					req.extensions_mut().insert(IdTag(host_owned.into_boxed_str()));
 					let res = app_router.clone().call(req).await;
 
-					let status = res
-						.as_ref()
-						.map(|r| r.status())
-						.unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+					let status = res.as_ref().map_or(
+						axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+						axum::http::Response::status,
+					);
 					if status.is_client_error() || status.is_server_error() {
 						warn!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
 					} else {

@@ -1,3 +1,11 @@
+#![allow(
+	clippy::expect_used,
+	clippy::unwrap_used,
+	clippy::panic,
+	clippy::cast_possible_wrap,
+	clippy::cast_precision_loss
+)]
+
 use cloudillo_rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
 use cloudillo_types::rtdb_adapter::RtdbAdapter;
 use cloudillo_types::types::TnId;
@@ -199,7 +207,7 @@ async fn test_concurrent_increment_no_race_condition() {
 
 			// Write back
 			match tx.update(&counter_path, json!({"year": 2025, "lastNumber": new_value})).await {
-				Ok(_) => {
+				Ok(()) => {
 					// Commit explicitly
 					tx.commit().await.unwrap();
 					new_value
@@ -236,9 +244,9 @@ async fn test_concurrent_increment_no_race_condition() {
 	);
 
 	// Verify all results are unique (no duplicates)
-	results.sort();
-	for i in 0..results.len() - 1 {
-		assert_ne!(results[i], results[i + 1], "Found duplicate value: {}", results[i]);
+	results.sort_unstable();
+	for pair in results.windows(2) {
+		assert_ne!(pair[0], pair[1], "Found duplicate value: {}", pair[0]);
 	}
 
 	// Verify sequential (no gaps)
@@ -342,7 +350,7 @@ async fn test_invoice_numbering_simulation() {
 	);
 
 	// Verify all invoice numbers are unique
-	invoice_numbers.sort();
+	invoice_numbers.sort_unstable();
 	for (i, num) in invoice_numbers.iter().enumerate().take(invoice_numbers.len() - 1) {
 		assert_ne!(
 			num,

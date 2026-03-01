@@ -15,7 +15,6 @@ use crate::{ffmpeg, store};
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_types::blob_adapter;
 use cloudillo_types::meta_adapter;
-use cloudillo_types::types::TnId;
 
 /// Video transcoder task - transcodes video to a specific quality tier
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,7 +161,6 @@ impl Task<App> for VideoTranscoderTask {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use cloudillo_core::scheduler::Task;
 
 	#[test]
 	fn test_video_transcoder_serialize_deserialize() {

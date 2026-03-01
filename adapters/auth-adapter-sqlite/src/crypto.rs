@@ -7,10 +7,14 @@ use p384::{elliptic_curve::rand_core::OsRng, SecretKey};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use p256::SecretKey as P256SecretKey;
 
-use cloudillo_types::{auth_adapter::*, prelude::*, worker};
+use cloudillo_types::{
+	auth_adapter::{AccessToken, ActionToken, KeyPair},
+	prelude::*,
+	worker,
+};
 
-fn generate_password_hash_sync(password: Box<str>) -> ClResult<Box<str>> {
-	let hash = bcrypt::hash(password.as_ref(), BCRYPT_COST).map_err(|_| Error::PermissionDenied)?;
+fn generate_password_hash_sync(password: &str) -> ClResult<Box<str>> {
+	let hash = bcrypt::hash(password, BCRYPT_COST).map_err(|_| Error::PermissionDenied)?;
 
 	Ok(hash.into())
 }
@@ -20,16 +24,15 @@ pub async fn generate_password_hash(
 	password: &str,
 ) -> ClResult<Box<str>> {
 	let password = password.to_string().into_boxed_str();
-	worker.try_run_immed(move || generate_password_hash_sync(password)).await
+	worker.try_run_immed(move || generate_password_hash_sync(&password)).await
 }
 
-fn check_password_sync(password: Box<str>, password_hash: Box<str>) -> ClResult<()> {
-	let res =
-		bcrypt::verify(password.as_ref(), &password_hash).map_err(|_| Error::PermissionDenied)?;
-	if !res {
-		Err(Error::PermissionDenied)
-	} else {
+fn check_password_sync(password: &str, password_hash: &str) -> ClResult<()> {
+	let res = bcrypt::verify(password, password_hash).map_err(|_| Error::PermissionDenied)?;
+	if res {
 		Ok(())
+	} else {
+		Err(Error::PermissionDenied)
 	}
 }
 
@@ -39,11 +42,13 @@ pub async fn check_password(
 	password_hash: Box<str>,
 ) -> ClResult<()> {
 	let password = password.to_string().into_boxed_str();
-	worker.try_run_immed(move || check_password_sync(password, password_hash)).await
+	worker
+		.try_run_immed(move || check_password_sync(&password, &password_hash))
+		.await
 }
 
 fn generate_access_token_sync(
-	access_token: AccessToken<Box<str>>,
+	access_token: &AccessToken<Box<str>>,
 	jwt_secret: &str,
 ) -> ClResult<Box<str>> {
 	let _expire = std::time::SystemTime::now()
@@ -69,7 +74,7 @@ pub async fn generate_access_token(
 	jwt_secret: Box<str>,
 ) -> ClResult<Box<str>> {
 	worker
-		.try_run_immed(move || generate_access_token_sync(access_token, &jwt_secret))
+		.try_run_immed(move || generate_access_token_sync(&access_token, &jwt_secret))
 		.await
 }
 
@@ -86,14 +91,14 @@ fn generate_key_sync() -> ClResult<KeyPair> {
 		.map_err(|_| Error::PermissionDenied)?
 		.lines()
 		.filter(|s| !s.starts_with('-'))
-		.map(|s| s.trim())
+		.map(str::trim)
 		.collect();
 	let public_key: Box<str> = public
 		.to_public_key_pem(LineEnding::LF)
 		.map_err(|_| Error::PermissionDenied)?
 		.lines()
 		.filter(|s| !s.starts_with('-'))
-		.map(|s| s.trim())
+		.map(str::trim)
 		.collect();
 
 	Ok(KeyPair { private_key, public_key })
@@ -109,7 +114,7 @@ pub async fn generate_key(worker: &worker::WorkerPool) -> ClResult<KeyPair> {
 /// VAPID uses ES256 (P-256 curve). Returns:
 /// - private_key: Raw 32-byte scalar, base64url encoded (compatible with TS version)
 /// - public_key: 65-byte uncompressed point, base64url encoded (for Web Push API)
-fn generate_vapid_key_sync() -> ClResult<KeyPair> {
+fn generate_vapid_key_sync() -> KeyPair {
 	use p256::elliptic_curve::sec1::ToEncodedPoint;
 
 	let private = P256SecretKey::random(&mut OsRng);
@@ -122,12 +127,12 @@ fn generate_vapid_key_sync() -> ClResult<KeyPair> {
 	let public_point = public.to_encoded_point(false);
 	let public_key: Box<str> = URL_SAFE_NO_PAD.encode(public_point.as_bytes()).into();
 
-	Ok(KeyPair { private_key, public_key })
+	KeyPair { private_key, public_key }
 }
 
 /// Generate a P-256 keypair for VAPID
 pub async fn generate_vapid_key(worker: &worker::WorkerPool) -> ClResult<KeyPair> {
-	worker.try_run_immed(generate_vapid_key_sync).await
+	worker.try_run_immed(|| Ok(generate_vapid_key_sync())).await
 }
 
 /// API key prefix
@@ -168,10 +173,7 @@ pub async fn verify_api_key(
 	check_password(worker, key, key_hash).await
 }
 
-fn generate_action_token_sync(
-	action_data: ActionToken,
-	private_key: Box<str>,
-) -> ClResult<Box<str>> {
+fn generate_action_token_sync(action_data: &ActionToken, private_key: &str) -> ClResult<Box<str>> {
 	let private_key_pem =
 		format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----", private_key);
 	let token = jsonwebtoken::encode(
@@ -194,7 +196,7 @@ pub async fn generate_action_token(
 	private_key: Box<str>,
 ) -> ClResult<Box<str>> {
 	worker
-		.try_run_immed(move || generate_action_token_sync(action_data, private_key))
+		.try_run_immed(move || generate_action_token_sync(&action_data, &private_key))
 		.await
 }
 

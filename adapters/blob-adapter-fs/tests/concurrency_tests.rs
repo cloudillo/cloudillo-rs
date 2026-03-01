@@ -2,6 +2,8 @@
 //!
 //! Tests concurrent access patterns and thread safety
 
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
+
 use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use cloudillo_types::blob_adapter::{BlobAdapter, CreateBlobOptions};
 use cloudillo_types::types::TnId;
@@ -34,7 +36,7 @@ async fn test_concurrent_blob_creation() {
 			adapter_clone
 				.create_blob_buf(tn_id, &file_id, &test_data, &opts)
 				.await
-				.unwrap_or_else(|_| panic!("Failed to create blob {}", i))
+				.unwrap_or_else(|_| panic!("Failed to create blob {}", i));
 		});
 		handles.push(handle);
 	}
@@ -108,7 +110,7 @@ async fn test_concurrent_multi_tenant_isolation() {
 				adapter_clone
 					.create_blob_buf(TnId(tn), &file_id, &test_data, &opts)
 					.await
-					.unwrap_or_else(|_| panic!("Failed to create blob in tenant {}", tn))
+					.unwrap_or_else(|_| panic!("Failed to create blob in tenant {}", tn));
 			});
 			handles.push(handle);
 		}

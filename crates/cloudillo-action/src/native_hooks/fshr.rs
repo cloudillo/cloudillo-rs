@@ -6,9 +6,7 @@
 
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use cloudillo_core::app::App;
 use cloudillo_types::meta_adapter::{CreateFile, FileStatus, UpdateActionDataOptions};
-use cloudillo_types::types::Patch;
 
 /// FSHR on_receive hook - Handle incoming file share request
 ///
@@ -16,7 +14,7 @@ use cloudillo_types::types::Patch;
 /// - If we are the audience and subType is not DEL, set status to 'C' (confirmation required)
 /// - DEL subtype doesn't require confirmation
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 	tracing::debug!(
 		"Native hook: FSHR on_receive for action {} from {} to {:?}",
@@ -56,7 +54,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 /// - Parse content to get fileName and contentType
 /// - Create file entry with status 'M' (mutable/shared) and owner_tag from issuer
 pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 	tracing::debug!(
 		"Native hook: FSHR on_accept for action {} from {}",
@@ -65,45 +63,30 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 	);
 
 	// Parse content
-	let content = match &context.content {
-		Some(c) => c,
-		None => {
-			tracing::warn!("FSHR on_accept: Missing content");
-			return Ok(HookResult::default());
-		}
+	let Some(content) = &context.content else {
+		tracing::warn!("FSHR on_accept: Missing content");
+		return Ok(HookResult::default());
 	};
 
-	let content_type = match content.get("contentType").and_then(|v| v.as_str()) {
-		Some(ct) => ct,
-		None => {
-			tracing::warn!("FSHR on_accept: Missing contentType in content");
-			return Ok(HookResult::default());
-		}
+	let Some(content_type) = content.get("contentType").and_then(|v| v.as_str()) else {
+		tracing::warn!("FSHR on_accept: Missing contentType in content");
+		return Ok(HookResult::default());
 	};
 
-	let file_name = match content.get("fileName").and_then(|v| v.as_str()) {
-		Some(fn_) => fn_,
-		None => {
-			tracing::warn!("FSHR on_accept: Missing fileName in content");
-			return Ok(HookResult::default());
-		}
+	let Some(file_name) = content.get("fileName").and_then(|v| v.as_str()) else {
+		tracing::warn!("FSHR on_accept: Missing fileName in content");
+		return Ok(HookResult::default());
 	};
 
-	let file_tp = match content.get("fileTp").and_then(|v| v.as_str()) {
-		Some(ft) => ft,
-		None => {
-			tracing::warn!("FSHR on_accept: Missing fileTp in content");
-			return Ok(HookResult::default());
-		}
+	let Some(file_tp) = content.get("fileTp").and_then(|v| v.as_str()) else {
+		tracing::warn!("FSHR on_accept: Missing fileTp in content");
+		return Ok(HookResult::default());
 	};
 
 	// Subject contains the file_id
-	let file_id = match &context.subject {
-		Some(s) => s,
-		None => {
-			tracing::warn!("FSHR on_accept: Missing subject (file_id)");
-			return Ok(HookResult::default());
-		}
+	let Some(file_id) = &context.subject else {
+		tracing::warn!("FSHR on_accept: Missing subject (file_id)");
+		return Ok(HookResult::default());
 	};
 
 	tracing::info!(

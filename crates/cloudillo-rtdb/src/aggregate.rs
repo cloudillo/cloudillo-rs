@@ -10,6 +10,12 @@ use cloudillo_types::rtdb_adapter::{
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
+/// Convert `u64` to `f64`, accepting minor precision loss for values above 2^53.
+#[allow(clippy::cast_precision_loss)]
+fn u64_to_f64(v: u64) -> f64 {
+	v as f64
+}
+
 /// Per-group aggregate accumulator.
 #[derive(Debug, Clone)]
 struct GroupState {
@@ -54,7 +60,7 @@ impl GroupState {
 					if let (Some(&sum), Some(&cnt)) =
 						(self.avg_sums.get(field), self.avg_counts.get(field))
 					{
-						let avg = if cnt > 0 { sum / cnt as f64 } else { 0.0 };
+						let avg = if cnt > 0 { sum / u64_to_f64(cnt) } else { 0.0 };
 						obj.insert(format!("avg_{}", field), json!(avg));
 					}
 				}
@@ -110,7 +116,7 @@ impl GroupState {
 
 /// Extract an f64 value from a JSON document field.
 fn extract_f64(data: &Value, field: &str) -> Option<f64> {
-	data.get(field).and_then(|v| v.as_f64())
+	data.get(field).and_then(Value::as_f64)
 }
 
 /// Extract group key strings from a document's group_by field.
@@ -177,8 +183,8 @@ impl IncrementalAggState {
 			.map(|(key, gs)| gs.to_value(key, &self.aggregate.ops))
 			.collect();
 		result.sort_by(|a, b| {
-			let ca = a.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-			let cb = b.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+			let ca = a.get("count").and_then(Value::as_u64).unwrap_or(0);
+			let cb = b.get("count").and_then(Value::as_u64).unwrap_or(0);
 			cb.cmp(&ca)
 		});
 		result
@@ -195,7 +201,9 @@ impl IncrementalAggState {
 				self.handle_update(data, old_data.as_ref())
 			}
 			ChangeEvent::Delete { old_data, .. } => self.handle_delete(old_data.as_ref()),
-			_ => None,
+			ChangeEvent::Ready { .. } | ChangeEvent::Lock { .. } | ChangeEvent::Unlock { .. } => {
+				None
+			}
 		}
 	}
 
@@ -224,9 +232,8 @@ impl IncrementalAggState {
 	}
 
 	fn handle_update(&mut self, data: &Value, old_data: Option<&Value>) -> Option<Vec<Value>> {
-		let old_match = old_data
-			.map(|od| self.filter.as_ref().is_none_or(|f| f.matches(od)))
-			.unwrap_or(false);
+		let old_match =
+			old_data.is_some_and(|od| self.filter.as_ref().is_none_or(|f| f.matches(od)));
 		let new_match = self.filter.as_ref().is_none_or(|f| f.matches(data));
 
 		if !old_match && !new_match {
@@ -345,7 +352,6 @@ impl IncrementalAggState {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use cloudillo_types::rtdb_adapter::{AggregateOp, AggregateOptions, QueryFilter};
 	use serde_json::json;
 
 	fn count_only_agg(group_by: &str) -> AggregateOptions {
@@ -383,11 +389,11 @@ mod tests {
 
 		let rust = find_group(&result, "rust");
 		assert!(rust.is_some());
-		assert_eq!(rust.and_then(|v| v.get("count")).and_then(|v| v.as_u64()), Some(2));
+		assert_eq!(rust.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(2));
 
 		let go = find_group(&result, "go");
 		assert!(go.is_some());
-		assert_eq!(go.and_then(|v| v.get("count")).and_then(|v| v.as_u64()), Some(1));
+		assert_eq!(go.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(1));
 	}
 
 	#[test]
@@ -409,10 +415,10 @@ mod tests {
 		assert_eq!(delta.len(), 2); // rust affected, go affected
 
 		let rust = find_group(&delta, "rust");
-		assert_eq!(rust.and_then(|v| v.get("count")).and_then(|v| v.as_u64()), Some(1));
+		assert_eq!(rust.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(1));
 
 		let go = find_group(&delta, "go");
-		assert_eq!(go.and_then(|v| v.get("count")).and_then(|v| v.as_u64()), Some(1));
+		assert_eq!(go.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(1));
 	}
 
 	#[test]
@@ -433,7 +439,7 @@ mod tests {
 		assert!(delta.is_some());
 		let delta = delta.unwrap_or_default();
 		let rust = find_group(&delta, "rust");
-		assert_eq!(rust.and_then(|v| v.get("count")).and_then(|v| v.as_u64()), Some(1));
+		assert_eq!(rust.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(1));
 	}
 
 	#[test]
@@ -453,7 +459,7 @@ mod tests {
 		assert!(delta.is_some());
 		let delta = delta.unwrap_or_default();
 		let rust = find_group(&delta, "rust");
-		assert_eq!(rust.and_then(|v| v.get("count")).and_then(|v| v.as_u64()), Some(2));
+		assert_eq!(rust.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(2));
 	}
 
 	#[test]
@@ -471,7 +477,7 @@ mod tests {
 		assert!(delta.is_some());
 		let delta = delta.unwrap_or_default();
 		let rust = find_group(&delta, "rust");
-		assert_eq!(rust.and_then(|v| v.get("count")).and_then(|v| v.as_u64()), Some(1));
+		assert_eq!(rust.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(1));
 	}
 
 	#[test]
@@ -494,13 +500,11 @@ mod tests {
 		let result = state.get_full_result();
 		assert_eq!(result.len(), 2);
 		assert_eq!(
-			find_group(&result, "rust")
-				.and_then(|v| v.get("count"))
-				.and_then(|v| v.as_u64()),
+			find_group(&result, "rust").and_then(|v| v.get("count")).and_then(Value::as_u64),
 			Some(1)
 		);
 		assert_eq!(
-			find_group(&result, "web").and_then(|v| v.get("count")).and_then(|v| v.as_u64()),
+			find_group(&result, "web").and_then(|v| v.get("count")).and_then(Value::as_u64),
 			Some(1)
 		);
 	}
@@ -523,10 +527,10 @@ mod tests {
 
 		// "web" should have count=0, "cli" should have count=1
 		let web = find_group(&delta, "web");
-		assert_eq!(web.and_then(|v| v.get("count")).and_then(|v| v.as_u64()), Some(0));
+		assert_eq!(web.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(0));
 
 		let cli = find_group(&delta, "cli");
-		assert_eq!(cli.and_then(|v| v.get("count")).and_then(|v| v.as_u64()), Some(1));
+		assert_eq!(cli.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(1));
 	}
 
 	#[test]
@@ -543,7 +547,7 @@ mod tests {
 		assert!(delta.is_some());
 		let delta = delta.unwrap_or_default();
 		let go = find_group(&delta, "go");
-		assert_eq!(go.and_then(|v| v.get("count")).and_then(|v| v.as_u64()), Some(0));
+		assert_eq!(go.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(0));
 	}
 
 	#[test]
@@ -555,7 +559,7 @@ mod tests {
 
 		let result = state.get_full_result();
 		let a = find_group(&result, "a");
-		assert_eq!(a.and_then(|v| v.get("sum_price")).and_then(|v| v.as_f64()), Some(30.0));
+		assert_eq!(a.and_then(|v| v.get("sum_price")).and_then(Value::as_f64), Some(30.0));
 
 		// Update doc 1 price from 10 to 15
 		let delta = state.process_change(&ChangeEvent::Update {
@@ -567,7 +571,7 @@ mod tests {
 		assert!(delta.is_some());
 		let delta = delta.unwrap_or_default();
 		let a = find_group(&delta, "a");
-		assert_eq!(a.and_then(|v| v.get("sum_price")).and_then(|v| v.as_f64()), Some(35.0));
+		assert_eq!(a.and_then(|v| v.get("sum_price")).and_then(Value::as_f64), Some(35.0));
 	}
 
 	#[test]
@@ -579,7 +583,7 @@ mod tests {
 
 		let result = state.get_full_result();
 		let a = find_group(&result, "a");
-		assert_eq!(a.and_then(|v| v.get("avg_score")).and_then(|v| v.as_f64()), Some(15.0));
+		assert_eq!(a.and_then(|v| v.get("avg_score")).and_then(Value::as_f64), Some(15.0));
 
 		// Update doc 1 score from 10 to 30
 		let delta = state.process_change(&ChangeEvent::Update {
@@ -591,7 +595,7 @@ mod tests {
 		assert!(delta.is_some());
 		let delta = delta.unwrap_or_default();
 		let a = find_group(&delta, "a");
-		assert_eq!(a.and_then(|v| v.get("avg_score")).and_then(|v| v.as_f64()), Some(25.0));
+		assert_eq!(a.and_then(|v| v.get("avg_score")).and_then(Value::as_f64), Some(25.0));
 	}
 
 	#[test]
@@ -642,7 +646,7 @@ mod tests {
 		assert!(delta.is_some());
 		let delta = delta.unwrap_or_default();
 		let rust = find_group(&delta, "rust");
-		assert_eq!(rust.and_then(|v| v.get("count")).and_then(|v| v.as_u64()), Some(2));
+		assert_eq!(rust.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(2));
 	}
 
 	#[test]

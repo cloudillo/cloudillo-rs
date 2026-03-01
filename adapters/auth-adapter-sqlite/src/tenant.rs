@@ -4,8 +4,15 @@ use std::sync::Arc;
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::*;
-use cloudillo_types::{auth_adapter::*, prelude::*, utils::random_id, worker::WorkerPool};
+use std::fmt::Write;
+
+use crate::utils::{async_map_res, inspect, map_res, parse_str_list_optional};
+use cloudillo_types::{
+	auth_adapter::{AuthProfile, CreateTenantData, ListTenantsOptions, TenantListItem},
+	prelude::*,
+	utils::random_id,
+	worker::WorkerPool,
+};
 
 /// Read tenant id_tag by tn_id
 pub(crate) async fn read_id_tag(db: &SqlitePool, tn_id: TnId) -> ClResult<Box<str>> {
@@ -224,25 +231,23 @@ pub(crate) async fn list_tenants(
 	);
 
 	if let Some(status) = opts.status {
-		query.push_str(&format!(" AND status = '{}'", status.replace('\'', "''")));
+		let _ = write!(query, " AND status = '{}'", status.replace('\'', "''"));
 	}
 
 	if let Some(q) = opts.q {
 		let escaped_q = q.replace('\'', "''");
-		query.push_str(&format!(
-			" AND (id_tag LIKE '%{}%' OR email LIKE '%{}%')",
-			escaped_q, escaped_q
-		));
+		let _ =
+			write!(query, " AND (id_tag LIKE '%{}%' OR email LIKE '%{}%')", escaped_q, escaped_q);
 	}
 
 	query.push_str(" ORDER BY created_at DESC");
 
 	if let Some(limit) = opts.limit {
-		query.push_str(&format!(" LIMIT {}", limit));
+		let _ = write!(query, " LIMIT {}", limit);
 	}
 
 	if let Some(offset) = opts.offset {
-		query.push_str(&format!(" OFFSET {}", offset));
+		let _ = write!(query, " OFFSET {}", offset);
 	}
 
 	let rows = sqlx::query(&query)

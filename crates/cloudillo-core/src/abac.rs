@@ -48,8 +48,8 @@ impl VisibilityLevel {
 			Some('2') => Self::SecondDegree,
 			Some('F') => Self::Follower,
 			Some('C') => Self::Connected,
-			None => Self::Direct, // NULL = Direct (most restrictive)
-			_ => Self::Direct,    // Unknown = Direct (secure by default)
+			// NULL or unknown = Direct (most restrictive, secure by default)
+			None | Some(_) => Self::Direct,
 		}
 	}
 
@@ -117,42 +117,35 @@ impl SubjectAccessLevel {
 	}
 }
 
+/// Context for checking whether a subject can view an item
+pub struct ViewCheckContext<'a> {
+	pub subject_id_tag: &'a str,
+	pub is_authenticated: bool,
+	pub item_owner_id_tag: &'a str,
+	pub tenant_id_tag: &'a str,
+	pub visibility: Option<char>,
+	pub subject_following_owner: bool,
+	pub subject_connected_to_owner: bool,
+	pub audience_tags: Option<&'a [&'a str]>,
+}
+
 /// Check if subject can view an item based on visibility and relationship
 ///
 /// This is a standalone function for use in list filtering where we don't
 /// have full ABAC context. It evaluates visibility rules directly.
-///
-/// # Arguments
-/// * `subject_id_tag` - The viewer's id_tag (empty string for anonymous)
-/// * `is_authenticated` - Whether the subject is authenticated
-/// * `item_owner_id_tag` - The item owner/issuer's id_tag
-/// * `tenant_id_tag` - The tenant's id_tag (owner of the node where item is stored)
-/// * `visibility` - The item's visibility level (None = Direct)
-/// * `subject_following_owner` - Whether the subject follows the owner
-/// * `subject_connected_to_owner` - Whether the subject is connected to owner
-/// * `audience_tags` - Optional list of audience id_tags (for Direct visibility)
-#[allow(clippy::too_many_arguments)]
-pub fn can_view_item(
-	subject_id_tag: &str,
-	is_authenticated: bool,
-	item_owner_id_tag: &str,
-	tenant_id_tag: &str,
-	visibility: Option<char>,
-	subject_following_owner: bool,
-	subject_connected_to_owner: bool,
-	audience_tags: Option<&[&str]>,
-) -> bool {
-	let visibility = VisibilityLevel::from_char(visibility);
+pub fn can_view_item(ctx: &ViewCheckContext<'_>) -> bool {
+	let visibility = VisibilityLevel::from_char(ctx.visibility);
 
 	// Determine subject's access level
 	// Note: "guest" id_tag is used for unauthenticated users - treat as Public
-	let is_real_auth = is_authenticated && !subject_id_tag.is_empty() && subject_id_tag != "guest";
-	let is_tenant = subject_id_tag == tenant_id_tag;
-	let access_level = if subject_id_tag == item_owner_id_tag || is_tenant {
+	let is_real_auth =
+		ctx.is_authenticated && !ctx.subject_id_tag.is_empty() && ctx.subject_id_tag != "guest";
+	let is_tenant = ctx.subject_id_tag == ctx.tenant_id_tag;
+	let access_level = if ctx.subject_id_tag == ctx.item_owner_id_tag || is_tenant {
 		SubjectAccessLevel::Owner // Tenant has same access as owner
-	} else if subject_connected_to_owner {
+	} else if ctx.subject_connected_to_owner {
 		SubjectAccessLevel::Connected
-	} else if subject_following_owner {
+	} else if ctx.subject_following_owner {
 		SubjectAccessLevel::Follower
 	} else if is_real_auth {
 		SubjectAccessLevel::Verified
@@ -167,8 +160,8 @@ pub fn can_view_item(
 
 	// For Direct visibility, also check explicit audience
 	if visibility == VisibilityLevel::Direct {
-		if let Some(tags) = audience_tags {
-			return tags.contains(&subject_id_tag);
+		if let Some(tags) = ctx.audience_tags {
+			return tags.contains(&ctx.subject_id_tag);
 		}
 	}
 
@@ -286,7 +279,7 @@ impl Condition {
 					false
 				}
 			}
-			_ => false,
+			Operator::In | Operator::HasRole => false,
 		}
 	}
 }
@@ -508,6 +501,7 @@ impl PermissionChecker {
 	///
 	/// Determines subject's access level and checks against resource visibility.
 	/// Supports both char-based visibility (from DB) and string-based (legacy).
+	#[expect(clippy::unused_self, reason = "method may use self in future policy checks")]
 	fn check_visibility(&self, subject: &AuthCtx, object: &dyn AttrSet) -> bool {
 		use tracing::debug;
 
@@ -522,8 +516,8 @@ impl PermissionChecker {
 				"second_degree" | "2" => VisibilityLevel::SecondDegree,
 				"follower" | "F" => VisibilityLevel::Follower,
 				"connected" | "C" => VisibilityLevel::Connected,
-				"direct" => VisibilityLevel::Direct,
-				_ => VisibilityLevel::Direct, // Unknown = Direct (secure by default)
+				// "direct" or unknown = Direct (secure by default)
+				_ => VisibilityLevel::Direct,
 			}
 		} else {
 			VisibilityLevel::Direct // No visibility = Direct (most restrictive)
@@ -590,18 +584,15 @@ impl PermissionChecker {
 		use tracing::debug;
 
 		// Get collection policy
-		let policy = match self.get_collection_policy(resource_type, action) {
-			Some(p) => p,
-			None => {
-				// No policy defined → allow by default
-				debug!(
-					subject = %subject.id_tag,
-					resource_type = resource_type,
-					action = action,
-					"No collection policy found - allowing by default"
-				);
-				return true;
-			}
+		let Some(policy) = self.get_collection_policy(resource_type, action) else {
+			// No policy defined → allow by default
+			debug!(
+				subject = %subject.id_tag,
+				resource_type = resource_type,
+				action = action,
+				"No collection policy found - allowing by default"
+			);
+			return true;
 		};
 
 		// Step 1: Check TOP policy (denials/constraints)

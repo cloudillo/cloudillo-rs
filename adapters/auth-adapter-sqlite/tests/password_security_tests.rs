@@ -7,6 +7,7 @@
 //! 4. Password validation (length, strength)
 //! 5. Timing attack prevention
 //! 6. Successful password change flow
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 #[cfg(test)]
 mod tests {

@@ -119,7 +119,7 @@ pub async fn return_login(
 	let login = Login {
 		tn_id: auth.tn_id,
 		id_tag: auth.id_tag.to_string(),
-		roles: auth.roles.map(|roles| roles.iter().map(|r| r.to_string()).collect()),
+		roles: auth.roles.map(|roles| roles.iter().map(ToString::to_string).collect()),
 		token: auth.token.to_string(),
 		name,
 		profile_pic: profile_pic.unwrap_or_default(),
@@ -505,7 +505,7 @@ pub async fn get_access_token(
 		let auth_login = auth_adapter::AuthLogin {
 			tn_id,
 			id_tag: validation.id_tag,
-			roles: validation.roles.map(|r| r.split(',').map(|s| s.into()).collect()),
+			roles: validation.roles.map(|r| r.split(',').map(Into::into).collect()),
 			token: token_result,
 		};
 		let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
@@ -586,16 +586,15 @@ pub async fn get_proxy_token(
 	// If target idTag is specified and different from own server, use federation
 	if let Some(ref target_id_tag) = query.id_tag {
 		if target_id_tag != own_id_tag.as_ref() {
-			info!("Getting federated proxy token for {} -> {}", &auth.id_tag, target_id_tag);
-
-			// Use federation flow: create action token and exchange at target
-			let token = app.request.create_proxy_token(auth.tn_id, target_id_tag, None).await?;
-
-			// Decode the JWT to extract the roles (r claim) for the frontend
 			#[derive(Deserialize)]
 			struct AccessTokenClaims {
 				r: Option<String>,
 			}
+
+			info!("Getting federated proxy token for {} -> {}", &auth.id_tag, target_id_tag);
+
+			// Use federation flow: create action token and exchange at target
+			let token = app.request.create_proxy_token(auth.tn_id, target_id_tag, None).await?;
 
 			let roles: Option<Vec<String>> = match decode_jwt_no_verify::<AccessTokenClaims>(&token)
 			{
@@ -617,7 +616,7 @@ pub async fn get_proxy_token(
 
 	// Default: create local access token (valid on own server)
 	info!("Generating local access token for {}", &auth.id_tag);
-	let roles_str: String = auth.roles.iter().map(|r| r.as_ref()).collect::<Vec<&str>>().join(",");
+	let roles_str: String = auth.roles.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(",");
 	let token = app
 		.auth_adapter
 		.create_access_token(
@@ -633,7 +632,7 @@ pub async fn get_proxy_token(
 		.await?;
 
 	// Return roles alongside token for local context
-	let roles: Vec<String> = auth.roles.iter().map(|r| r.to_string()).collect();
+	let roles: Vec<String> = auth.roles.iter().map(ToString::to_string).collect();
 	let response = ApiResponse::new(ProxyTokenRes { token: token.to_string(), roles: Some(roles) })
 		.with_req_id(req_id.unwrap_or_default());
 
@@ -796,8 +795,7 @@ pub async fn post_forgot_password(
 		.meta_adapter
 		.read_tenant(tn_id)
 		.await
-		.map(|t| t.name.to_string())
-		.unwrap_or_else(|_| id_tag.clone());
+		.map_or_else(|_| id_tag.clone(), |t| t.name.to_string());
 
 	// Create password reset ref
 	let expires_at = Some(Timestamp(now + 86400)); // 24 hours
@@ -827,7 +825,7 @@ pub async fn post_forgot_password(
 	let lang = get_tenant_lang(&app.settings, tn_id).await;
 
 	// Get base_id_tag for sender name
-	let base_id_tag = app.opts.base_id_tag.as_ref().map(|s| s.as_ref()).unwrap_or("cloudillo");
+	let base_id_tag = app.opts.base_id_tag.as_ref().map_or("cloudillo", AsRef::as_ref);
 
 	// Schedule email
 	let email_params = EmailTaskParams {

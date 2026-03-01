@@ -26,7 +26,7 @@ use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
 use cloudillo_types::blob_adapter;
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter;
-use cloudillo_types::types::{self, ApiResponse, Timestamp};
+use cloudillo_types::types::{self, ApiResponse};
 use cloudillo_types::utils;
 
 // Utility functions //
@@ -60,11 +60,12 @@ pub fn format_from_content_type(content_type: &str) -> Option<&str> {
 
 /// Stream request body directly to a temp file (for large uploads)
 async fn stream_body_to_file(body: Body, path: &PathBuf) -> ClResult<u64> {
+	use futures::StreamExt;
+
 	let mut file = tokio::fs::File::create(path).await?;
 	let mut body_stream = body.into_data_stream();
 	let mut total_size: u64 = 0;
 
-	use futures::StreamExt;
 	while let Some(chunk) = body_stream.next().await {
 		let chunk = chunk.map_err(|e| Error::Internal(format!("body read error: {}", e)))?;
 		total_size += chunk.len() as u64;
@@ -110,7 +111,7 @@ fn serve_file<S: AsRef<str> + Debug>(
 	response = response.header("X-Cloudillo-Variant", variant.variant_id.as_ref());
 	if let Some(descriptor) = descriptor {
 		response = response.header("X-Cloudillo-Variants", descriptor);
-	};
+	}
 
 	// Add CSP headers for SVG files to prevent script execution in federated content
 	if content_type == "image/svg+xml" {
@@ -361,7 +362,7 @@ async fn handle_post_svg(
 	let thumbnail_variant = preset.thumbnail_variant.as_deref().unwrap_or("vis.tn");
 	let thumbnail_tier = preset::get_image_tier(thumbnail_variant);
 	let tn_format = thumbnail_tier.and_then(|t| t.format).unwrap_or(thumbnail_format);
-	let tn_max_dim = thumbnail_tier.map(|t| t.max_dim).unwrap_or(256);
+	let tn_max_dim = thumbnail_tier.map_or(256, |t| t.max_dim);
 
 	// 7. Rasterize SVG for thumbnail (synchronous)
 	let resized_tn = svg::rasterize_svg_sync(&sanitized, tn_format, (tn_max_dim, tn_max_dim))?;
@@ -831,8 +832,6 @@ pub async fn post_file(
 	OptionalRequestId(req_id): OptionalRequestId,
 	extract::Json(req): extract::Json<PostFileRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
-	use tracing::info;
-
 	info!("POST /api/files - Creating file with fileTp={}", req.file_tp);
 
 	// Generate file_id
@@ -863,7 +862,7 @@ pub async fn post_file(
 				file_name: req.file_name.clone().unwrap_or_else(|| "file".into()).into(),
 				file_tp: Some(req.file_tp.clone().into()),
 				created_at: req.created_at,
-				tags: req.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+				tags: req.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 				x: None,
 				visibility,
 				status: None,
@@ -880,7 +879,7 @@ pub async fn post_file(
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "file processing requires multiple parameters")]
 pub async fn post_file_blob(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -891,6 +890,10 @@ pub async fn post_file_blob(
 	OptionalRequestId(req_id): OptionalRequestId,
 	body: Body,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+	// Max file size constants (in MiB, using binary units)
+	const BYTES_PER_MIB: usize = 1_048_576; // 1024 * 1024
+	const DEFAULT_MAX_SIZE_MIB: i64 = 50;
+
 	let content_type = header
 		.get(axum::http::header::CONTENT_TYPE)
 		.and_then(|v| v.to_str().ok())
@@ -926,10 +929,6 @@ pub async fn post_file_blob(
 
 	info!("Media class: {:?}", media_class);
 
-	// Get max file size from settings (in MiB, using binary units)
-	const BYTES_PER_MIB: usize = 1_048_576; // 1024 * 1024
-	const DEFAULT_MAX_SIZE_MIB: i64 = 50;
-
 	let max_size_mib = app
 		.settings
 		.get_int(tn_id, "file.max_file_size_mb")
@@ -937,7 +936,7 @@ pub async fn post_file_blob(
 		.unwrap_or(DEFAULT_MAX_SIZE_MIB)
 		.max(1); // Ensure at least 1 MiB
 
-	let max_size_bytes = (max_size_mib as usize) * BYTES_PER_MIB;
+	let max_size_bytes = usize::try_from(max_size_mib).unwrap_or(50) * BYTES_PER_MIB;
 
 	// 4. Route to handler - some need bytes (in-memory), some need streaming Body
 	match media_class {
@@ -977,7 +976,7 @@ pub async fn post_file_blob(
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
-						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						x: Some(json!({ "dim": dim })),
 						visibility,
 						status: None,
@@ -1023,7 +1022,7 @@ pub async fn post_file_blob(
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
-						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						x: None,
 						visibility,
 						status: None,
@@ -1062,7 +1061,7 @@ pub async fn post_file_blob(
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
-						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						x: None,
 						visibility,
 						status: None,
@@ -1102,7 +1101,7 @@ pub async fn post_file_blob(
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
-						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						x: None,
 						visibility,
 						status: None,
@@ -1142,7 +1141,7 @@ pub async fn post_file_blob(
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
-						tags: query.tags.as_ref().map(|s| s.split(",").map(|s| s.into()).collect()),
+						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						x: None,
 						visibility,
 						status: None,

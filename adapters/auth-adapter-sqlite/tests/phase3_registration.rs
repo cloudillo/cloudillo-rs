@@ -5,6 +5,7 @@
 //! 2. create_tenant with vfy_code - Verified tenant creation
 //! 3. delete_tenant - Atomic deletion with cascade cleanup
 //! 4. Verification code validation and reuse prevention
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 #[cfg(test)]
 mod tests {
@@ -37,7 +38,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_create_tenant_with_valid_verification_code() {
-		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
+		let (adapter, tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let email = "verified@example.com";
 		let id_tag = "test_user";
@@ -55,7 +56,7 @@ mod tests {
 			// For now, we'll trust that it was created and test the flow
 			// The actual code would be stored by create_tenant_registration
 			// We can extract it by reading from the database
-			let db_path = _tmp.path().join("auth.db");
+			let db_path = tmp.path().join("auth.db");
 			let db = sqlx::sqlite::SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
 				.await
 				.expect("Failed to connect to database");
@@ -121,7 +122,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_create_tenant_with_mismatched_email() {
-		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
+		let (adapter, tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let email1 = "user1@example.com";
 		let email2 = "user2@example.com";
@@ -135,7 +136,7 @@ mod tests {
 
 		// Get verification code for email1
 		let vfy_code = {
-			let db_path = _tmp.path().join("auth.db");
+			let db_path = tmp.path().join("auth.db");
 			let db = sqlx::sqlite::SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
 				.await
 				.expect("Failed to connect to database");
@@ -169,7 +170,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_verification_code_consumed_after_creation() {
-		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
+		let (adapter, tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let email = "consumed@example.com";
 		let id_tag = "test_consumed";
@@ -182,7 +183,7 @@ mod tests {
 
 		// Get verification code
 		let vfy_code = {
-			let db_path = _tmp.path().join("auth.db");
+			let db_path = tmp.path().join("auth.db");
 			let db = sqlx::sqlite::SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
 				.await
 				.expect("Failed to connect to database");
@@ -230,7 +231,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_delete_tenant_cleans_up_data() {
-		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
+		let (adapter, tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let email = "delete_test@example.com";
 		let id_tag = "delete_test";
@@ -242,7 +243,7 @@ mod tests {
 			.expect("Failed to create registration");
 
 		let vfy_code = {
-			let db_path = _tmp.path().join("auth.db");
+			let db_path = tmp.path().join("auth.db");
 			let db = sqlx::sqlite::SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
 				.await
 				.expect("Failed to connect to database");
@@ -256,7 +257,7 @@ mod tests {
 			row.try_get::<String, _>("vfy_code").expect("Failed to get vfy_code")
 		};
 
-		let _tn_id = adapter
+		let tn_id = adapter
 			.create_tenant(
 				id_tag,
 				CreateTenantData {
@@ -271,7 +272,7 @@ mod tests {
 
 		// Create a profile key for the tenant (if applicable)
 		adapter
-			.create_profile_key(_tn_id, None)
+			.create_profile_key(tn_id, None)
 			.await
 			.expect("Failed to create profile key");
 
@@ -279,7 +280,7 @@ mod tests {
 		adapter.delete_tenant(id_tag).await.expect("Failed to delete tenant");
 
 		// Verify tenant is deleted
-		let result = adapter.read_id_tag(_tn_id).await;
+		let result = adapter.read_id_tag(tn_id).await;
 		assert!(result.is_err(), "Tenant should be deleted");
 		println!("✅ Tenant deleted successfully with cascade cleanup");
 	}
@@ -297,7 +298,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_duplicate_email_registration_prevented() {
-		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
+		let (adapter, tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let email = "duplicate@example.com";
 		let id_tag = "duplicate_test";
@@ -309,7 +310,7 @@ mod tests {
 			.expect("Failed to create registration");
 
 		let vfy_code = {
-			let db_path = _tmp.path().join("auth.db");
+			let db_path = tmp.path().join("auth.db");
 			let db = sqlx::sqlite::SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
 				.await
 				.expect("Failed to connect to database");

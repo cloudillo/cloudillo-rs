@@ -1,8 +1,6 @@
 //! File subsystem. File storage, metadata, documents, etc.
 
 #![allow(dead_code)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
 
 pub(crate) mod audio;
 pub mod descriptor;

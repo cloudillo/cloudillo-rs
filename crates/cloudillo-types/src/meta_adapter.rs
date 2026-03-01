@@ -10,7 +10,7 @@ use std::{cmp::Ordering, collections::HashMap, fmt::Debug};
 
 use crate::{
 	prelude::*,
-	types::{serialize_timestamp_iso, serialize_timestamp_iso_opt, Patch, Timestamp, TnId},
+	types::{serialize_timestamp_iso, serialize_timestamp_iso_opt},
 };
 
 // Tenants, profiles
@@ -1090,8 +1090,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use serde_urlencoded;
-
 	#[test]
 	fn test_deserialize_list_action_options_with_multiple_statuses() {
 		let query = "status=C,N&type=POST,REPLY";

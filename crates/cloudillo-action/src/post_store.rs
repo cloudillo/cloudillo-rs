@@ -135,7 +135,7 @@ async fn execute_hook(
 
 	// Use the separate sub_typ field if available, otherwise try to extract from combined type string
 	let (action_type, subtype) = if action.sub_typ.is_some() {
-		(action.typ.to_string(), action.sub_typ.as_ref().map(|s| s.to_string()))
+		(action.typ.to_string(), action.sub_typ.as_ref().map(std::string::ToString::to_string))
 	} else {
 		helpers::extract_type_and_subtype(&action.typ)
 	};
@@ -147,16 +147,24 @@ async fn execute_hook(
 		.action_type(&action_type)
 		.subtype(subtype)
 		.issuer(&*action.issuer_tag)
-		.audience(action.audience_tag.as_ref().map(|s| s.to_string()))
-		.parent(action.parent_id.as_ref().map(|s| s.to_string()))
-		.subject(action.subject.as_ref().map(|s| s.to_string()))
+		.audience(action.audience_tag.as_ref().map(std::string::ToString::to_string))
+		.parent(action.parent_id.as_ref().map(std::string::ToString::to_string))
+		.subject(action.subject.as_ref().map(std::string::ToString::to_string))
 		.content(action.content.as_ref().and_then(|s| serde_json::from_str(s).ok()))
-		.attachments(action.attachments.as_ref().map(|v| v.iter().map(|s| s.to_string()).collect()))
+		.attachments(
+			action
+				.attachments
+				.as_ref()
+				.map(|v| v.iter().map(std::string::ToString::to_string).collect()),
+		)
 		.created_at(format!("{}", action.created_at.0))
 		.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
 		.tenant(
-			tn_id.0 as i64,
-			action.audience_tag.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+			i64::from(tn_id.0),
+			action
+				.audience_tag
+				.as_ref()
+				.map_or(String::new(), std::string::ToString::to_string),
 			"person",
 		)
 		.client_address(ctx.client_address().map(String::from));
@@ -190,7 +198,6 @@ async fn execute_hook(
 				error = %e,
 				"DSL hook failed"
 			);
-			// Continue processing - hook errors shouldn't fail the action
 		}
 		Ok(None)
 	}
@@ -463,7 +470,7 @@ async fn schedule_delivery(
 	// Don't add to recipients list - they're already handled by schedule_subscriber_fanout
 
 	if !recipients.is_empty() {
-		let recipient_preview: Vec<&str> = recipients.iter().take(3).map(|s| s.as_ref()).collect();
+		let recipient_preview: Vec<&str> = recipients.iter().take(3).map(AsRef::as_ref).collect();
 		if recipients.len() <= 3 {
 			info!("→ DELIVERY: {} → [{}]", action.action_id, recipient_preview.join(", "));
 		} else {
@@ -479,7 +486,7 @@ async fn schedule_delivery(
 	// Check if this action type should deliver its subject along with it
 	let deliver_subject = behavior.as_ref().and_then(|b| b.deliver_subject).unwrap_or(false);
 	let related_action_id =
-		if deliver_subject { action.subject.as_deref().map(|s| s.into()) } else { None };
+		if deliver_subject { action.subject.as_deref().map(Into::into) } else { None };
 
 	let retry_policy = RetryPolicy::new((10, 43200), 50);
 
@@ -545,7 +552,7 @@ async fn schedule_broadcast_delivery(
 	}
 
 	// Log summary
-	let recipients_vec: Vec<&str> = recipients.iter().map(|s| s.as_ref()).collect();
+	let recipients_vec: Vec<&str> = recipients.iter().map(AsRef::as_ref).collect();
 	let recipient_preview: Vec<&str> = recipients_vec.iter().take(3).copied().collect();
 	if recipients.len() <= 3 {
 		info!("→ BROADCAST: {} → [{}]", action_id, recipient_preview.join(", "));
@@ -559,7 +566,7 @@ async fn schedule_broadcast_delivery(
 	}
 
 	let retry_policy = RetryPolicy::new((10, 43200), 50);
-	let related_box: Option<Box<str>> = related_action_id.map(|s| s.into());
+	let related_box: Option<Box<str>> = related_action_id.map(Into::into);
 
 	for recipient_tag in recipients {
 		debug!("Creating broadcast delivery task for action {} to {}", action_id, recipient_tag);
@@ -598,22 +605,16 @@ async fn try_auto_approve(app: &App, tn_id: TnId, action: &meta_adapter::Action<
 	);
 
 	// Get definition for approvable check
-	let dsl = match app.ext::<Arc<DslEngine>>() {
-		Ok(d) => d,
-		Err(e) => {
-			debug!("try_auto_approve: DSL engine not available: {}", e);
-			return;
-		}
+	let Ok(dsl) = app.ext::<Arc<DslEngine>>() else {
+		debug!("try_auto_approve: DSL engine not available");
+		return;
 	};
-	let definition = match dsl.get_definition(&action.typ) {
-		Some(def) => def,
-		None => {
-			debug!(
-				action_type = %action.typ,
-				"try_auto_approve: no definition found for type"
-			);
-			return;
-		}
+	let Some(definition) = dsl.get_definition(&action.typ) else {
+		debug!(
+			action_type = %action.typ,
+			"try_auto_approve: no definition found for type"
+		);
+		return;
 	};
 
 	// Check if action type is approvable

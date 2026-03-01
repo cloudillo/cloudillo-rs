@@ -1,9 +1,9 @@
 //! File user data management (per-user file activity tracking)
 
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 
-use crate::utils::*;
-use cloudillo_types::meta_adapter::*;
+use crate::utils::inspect;
+use cloudillo_types::meta_adapter::FileUserData;
 use cloudillo_types::prelude::*;
 
 /// Record file access for a user (upserts record, updates accessed_at timestamp)
@@ -14,8 +14,6 @@ pub(crate) async fn record_access(
 	id_tag: &str,
 	file_id: &str,
 ) -> ClResult<()> {
-	use sqlx::Row;
-
 	// Update global access timestamp on files table first, get f_id via RETURNING
 	let row = sqlx::query(
 		"UPDATE files SET accessed_at = unixepoch() WHERE tn_id = ? AND file_id = ? RETURNING f_id",
@@ -58,8 +56,6 @@ pub(crate) async fn record_modification(
 	id_tag: &str,
 	file_id: &str,
 ) -> ClResult<()> {
-	use sqlx::Row;
-
 	// Update global modification timestamp on files table first, get f_id via RETURNING
 	let row = sqlx::query(
 		"UPDATE files SET modified_at = unixepoch() WHERE tn_id = ? AND file_id = ? RETURNING f_id",
@@ -105,12 +101,12 @@ pub(crate) async fn update(
 ) -> ClResult<FileUserData> {
 	if pinned.is_none() && starred.is_none() {
 		// Nothing to update, just return current data
-		return get(db, tn_id, id_tag, file_id).await.map(|opt| opt.unwrap_or_default());
+		return get(db, tn_id, id_tag, file_id).await.map(Option::unwrap_or_default);
 	}
 
 	// Build dynamic update query using f_id via subquery
-	let pinned_val = pinned.map(|p| if p { 1i64 } else { 0 }).unwrap_or(0);
-	let starred_val = starred.map(|s| if s { 1i64 } else { 0 }).unwrap_or(0);
+	let pinned_val = pinned.map_or(0, i64::from);
+	let starred_val = starred.map_or(0, i64::from);
 
 	let mut updates = Vec::new();
 	if pinned.is_some() {
@@ -142,7 +138,7 @@ pub(crate) async fn update(
 		.map_err(|_| Error::DbError)?;
 
 	// Return the updated data
-	get(db, tn_id, id_tag, file_id).await.map(|opt| opt.unwrap_or_default())
+	get(db, tn_id, id_tag, file_id).await.map(Option::unwrap_or_default)
 }
 
 /// Get file user data for a specific file
@@ -152,8 +148,6 @@ pub(crate) async fn get(
 	id_tag: &str,
 	file_id: &str,
 ) -> ClResult<Option<FileUserData>> {
-	use sqlx::Row;
-
 	let res = sqlx::query(
 		"SELECT fud.accessed_at, fud.modified_at, fud.pinned, fud.starred
 		 FROM file_user_data fud

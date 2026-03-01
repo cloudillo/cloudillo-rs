@@ -116,7 +116,7 @@ pub async fn resolve_root_id<M: MetaAdapter + ?Sized>(
 /// Capabilities are enabled by default; a lowercase flag character disables them.
 pub fn is_capability_enabled(flags: Option<&str>, capability: char) -> bool {
 	let disabled_char = capability.to_ascii_lowercase();
-	!flags.map(|f| f.contains(disabled_char)).unwrap_or(false)
+	!flags.is_some_and(|f| f.contains(disabled_char))
 }
 
 /// Reactions enabled unless explicitly disabled with lowercase 'r'
@@ -132,7 +132,7 @@ pub fn can_comment(flags: Option<&str>) -> bool {
 /// Check if the action is open (anyone can subscribe without invitation)
 /// Returns true if 'O' is present in flags, false otherwise
 pub fn is_open(flags: Option<&str>) -> bool {
-	flags.map(|f| f.contains('O')).unwrap_or(false)
+	flags.is_some_and(|f| f.contains('O'))
 }
 
 // =============================================================================
@@ -167,24 +167,16 @@ impl SubscriptionRole {
 	/// Get the minimum role required for an action type
 	pub fn required_for_action(action_type: &str, subtype: Option<&str>) -> Self {
 		match (action_type, subtype) {
-			// Moderator-level actions
-			("SUBS", Some("DEL")) => Self::Moderator, // Kick users
-
 			// Admin-level actions
-			("SUBS", Some("UPD")) => Self::Admin, // Role changes
-			("CONV", Some("UPD")) => Self::Admin, // Update conversation
-			("INVT", _) => Self::Moderator,       // Invite users
+			("SUBS" | "CONV", Some("UPD")) => Self::Admin,
 
-			// Member-level actions (participation)
-			("MSG", _) => Self::Member,
-			("REACT", _) => Self::Member,
-			("PRES", _) => Self::Member,
-			("CMNT", _) => Self::Member,
+			// Moderator-level actions
+			("SUBS", Some("DEL")) | ("INVT", _) => Self::Moderator,
 
 			// Observer can only view (SUBS without subtype is creating subscription)
 			("SUBS", None) => Self::Observer,
 
-			// Default to member for unknown action types
+			// Member-level actions (participation) and default for unknown action types
 			_ => Self::Member,
 		}
 	}
@@ -229,8 +221,7 @@ pub fn get_subscription_role(
 	content
 		.and_then(|c| c.get("role"))
 		.and_then(|r| r.as_str())
-		.map(|s| s.parse().unwrap_or(SubscriptionRole::Member))
-		.unwrap_or(SubscriptionRole::Member)
+		.map_or(SubscriptionRole::Member, |s| s.parse().unwrap_or(SubscriptionRole::Member))
 }
 
 /// Check if the user is the issuer (creator) of an action

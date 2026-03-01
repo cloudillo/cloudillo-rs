@@ -11,9 +11,7 @@
 use crate::helpers;
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use cloudillo_core::app::App;
 use cloudillo_types::meta_adapter::UpdateActionDataOptions;
-use cloudillo_types::types::Patch;
 
 /// SUBS on_receive hook - Handle incoming subscription request
 ///
@@ -22,7 +20,7 @@ use cloudillo_types::types::Patch;
 /// - Closed: check for INVT (invitation) action -> accept if invited
 /// - Otherwise: reject
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 	// Get the target action (subject)
 	let Some(subject_id) = &context.subject else {
@@ -193,7 +191,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 /// Logic:
 /// - Auto-subscribe creator to their own actions
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 	tracing::debug!("SUBS on_create: {} subscribing to {:?}", context.issuer, context.subject);
 

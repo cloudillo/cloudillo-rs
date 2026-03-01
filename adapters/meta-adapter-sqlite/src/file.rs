@@ -2,15 +2,18 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::*;
-use cloudillo_types::meta_adapter::*;
+use crate::utils::{collect_res, inspect, map_res, parse_str_list};
+use cloudillo_types::meta_adapter::{
+	CreateFile, FileId, FileStatus, FileUserData, FileVariant, FileView, ListFileOptions,
+	ProfileInfo, ProfileType, UpdateFileOptions,
+};
 use cloudillo_types::prelude::*;
 
 /// Get file_id by numeric f_id
 pub(crate) async fn get_id(db: &SqlitePool, tn_id: TnId, f_id: u64) -> ClResult<Box<str>> {
 	let res = sqlx::query("SELECT file_id FROM files WHERE tn_id=? AND f_id=?")
 		.bind(tn_id.0)
-		.bind(f_id as i64)
+		.bind(f_id.cast_signed())
 		.fetch_one(db)
 		.await;
 
@@ -93,7 +96,7 @@ pub(crate) async fn list(
 
 	if let Some(file_type) = &opts.file_type {
 		// Support comma-separated multiple types (e.g., "CRDT,RTDB")
-		let types: Vec<&str> = file_type.split(',').map(|s| s.trim()).collect();
+		let types: Vec<&str> = file_type.split(',').map(str::trim).collect();
 		if types.len() == 1 {
 			query.push(" AND f.file_tp=").push_bind(types[0]);
 		} else {
@@ -108,7 +111,7 @@ pub(crate) async fn list(
 
 	// Filter by content type (MIME type pattern, e.g., "image/*" or "image/*,video/*")
 	if let Some(content_type) = &opts.content_type {
-		let patterns: Vec<&str> = content_type.split(',').map(|s| s.trim()).collect();
+		let patterns: Vec<&str> = content_type.split(',').map(str::trim).collect();
 		if patterns.len() == 1 {
 			// Convert wildcard pattern to SQL LIKE pattern (e.g., "image/*" -> "image/%")
 			let pattern = patterns[0].replace('*', "%");
@@ -244,8 +247,8 @@ pub(crate) async fn list(
 			// Sort by user's access time (NULLs last for DESC, NULLs first for ASC)
 			query.push(format!(
 				" ORDER BY CASE WHEN fud.accessed_at IS NULL THEN {} ELSE {} END, fud.accessed_at {}, f.f_id {}",
-				if is_desc { 1 } else { 0 },
-				if is_desc { 0 } else { 1 },
+				i32::from(is_desc),
+				i32::from(!is_desc),
 				sort_dir, sort_dir
 			));
 		}
@@ -253,8 +256,8 @@ pub(crate) async fn list(
 			// Sort by user's modification time (NULLs last for DESC, NULLs first for ASC)
 			query.push(format!(
 				" ORDER BY CASE WHEN fud.modified_at IS NULL THEN {} ELSE {} END, fud.modified_at {}, f.f_id {}",
-				if is_desc { 1 } else { 0 },
-				if is_desc { 0 } else { 1 },
+				i32::from(is_desc),
+				i32::from(!is_desc),
 				sort_dir, sort_dir
 			));
 		}
@@ -269,7 +272,7 @@ pub(crate) async fn list(
 
 	// Fetch limit+1 to determine hasMore
 	// Note: SQLite doesn't allow bound parameters in LIMIT clause, so we use format!
-	let limit = opts.limit.unwrap_or(30) as i64;
+	let limit = i64::from(opts.limit.unwrap_or(30));
 	query.push(format!(" LIMIT {}", limit + 1));
 
 	debug!("SQL: {}", query.sql());
@@ -297,7 +300,6 @@ pub(crate) async fn list(
 			(row.try_get::<Box<str>, _>("id_tag"), row.try_get::<Box<str>, _>("name"))
 		{
 			let typ = match row.try_get::<&str, _>("type").ok() {
-				Some("P") => ProfileType::Person,
 				Some("C") => ProfileType::Community,
 				_ => ProfileType::Person, // Default fallback
 			};
@@ -313,7 +315,6 @@ pub(crate) async fn list(
 			row.try_get::<Box<str>, _>("creator_name"),
 		) {
 			let typ = match row.try_get::<&str, _>("creator_type").ok() {
-				Some("P") => ProfileType::Person,
 				Some("C") => ProfileType::Community,
 				_ => ProfileType::Person,
 			};
@@ -403,13 +404,13 @@ pub(crate) async fn list_variants(
 			FROM file_variants WHERE tn_id=? AND f_id=?",
 		)
 		.bind(tn_id.0)
-		.bind(f_id as i64)
+		.bind(f_id.cast_signed())
 		.fetch_all(db)
 		.await
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?,
 		FileId::FileId(file_id) => {
-			if let Some(f_id_str) = file_id.strip_prefix("@") {
+			if let Some(f_id_str) = file_id.strip_prefix('@') {
 				let f_id = f_id_str
 					.parse::<i64>()
 					.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
@@ -445,12 +446,16 @@ pub(crate) async fn list_variants(
 			size: row.try_get("size")?,
 			available: row.try_get("available")?,
 			duration: row.try_get::<Option<f64>, _>("duration").ok().flatten(),
-			bitrate: row.try_get::<Option<i64>, _>("bitrate").ok().flatten().map(|v| v as u32),
+			bitrate: row
+				.try_get::<Option<i64>, _>("bitrate")
+				.ok()
+				.flatten()
+				.map(|v| u32::try_from(v).unwrap_or_default()),
 			page_count: row
 				.try_get::<Option<i64>, _>("page_count")
 				.ok()
 				.flatten()
-				.map(|v| v as u32),
+				.map(|v| u32::try_from(v).unwrap_or_default()),
 		})
 	}))
 }
@@ -526,12 +531,16 @@ pub(crate) async fn read_variant(
 			size: row.try_get("size")?,
 			available: row.try_get("available")?,
 			duration: row.try_get::<Option<f64>, _>("duration").ok().flatten(),
-			bitrate: row.try_get::<Option<i64>, _>("bitrate").ok().flatten().map(|v| v as u32),
+			bitrate: row
+				.try_get::<Option<i64>, _>("bitrate")
+				.ok()
+				.flatten()
+				.map(|v| u32::try_from(v).unwrap_or_default()),
 			page_count: row
 				.try_get::<Option<i64>, _>("page_count")
 				.ok()
 				.flatten()
-				.map(|v| v as u32),
+				.map(|v| u32::try_from(v).unwrap_or_default()),
 		})
 	})
 }
@@ -570,7 +579,7 @@ pub(crate) async fn read_f_id_by_file_id(
 
 	map_res(res, |row| {
 		let f_id: i64 = row.try_get("f_id")?;
-		Ok(f_id as u64)
+		Ok(u64::try_from(f_id).unwrap_or_default())
 	})
 }
 
@@ -605,12 +614,10 @@ pub(crate) async fn create(
 	// Use provided status or default to 'P' (Pending)
 	let status = match opts.status {
 		Some(FileStatus::Active) => "A",
-		Some(FileStatus::Pending) => "P",
 		Some(FileStatus::Deleted) => "D",
-		None => "P",
+		Some(FileStatus::Pending) | None => "P",
 	};
-	let created_at =
-		if let Some(created_at) = opts.created_at { created_at } else { Timestamp::now() };
+	let created_at = opts.created_at.unwrap_or_else(Timestamp::now);
 	let file_tp = opts.file_tp.as_deref().unwrap_or("BLOB"); // Default to BLOB if not specified
 	let visibility = opts.visibility.map(|c| c.to_string());
 
@@ -626,7 +633,7 @@ pub(crate) async fn create(
 				.map_err(|_| Error::DbError)?;
 
 		if let Some(f_id) = existing {
-			return Ok(FileId::FId(f_id as u64));
+			return Ok(FileId::FId(u64::try_from(f_id).unwrap_or_default()));
 		}
 	}
 
@@ -648,14 +655,14 @@ pub(crate) async fn create_variant<'a>(
 	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
 	let _res = sqlx::query("SELECT f_id FROM files WHERE tn_id=? AND f_id=? AND status='P'")
 		.bind(tn_id.0)
-		.bind(f_id as i64)
+		.bind(f_id.cast_signed())
 		.fetch_one(&mut *tx)
 		.await
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
 	let _res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size, available, duration, bitrate, page_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		.bind(tn_id.0).bind(f_id as i64).bind(opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size as i64).bind(opts.available).bind(opts.duration).bind(opts.bitrate.map(|b| b as i64)).bind(opts.page_count.map(|p| p as i64))
+		.bind(tn_id.0).bind(f_id.cast_signed()).bind(opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size.cast_signed()).bind(opts.available).bind(opts.duration).bind(opts.bitrate.map(i64::from)).bind(opts.page_count.map(i64::from))
 		.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 	tx.commit().await.map_err(|_| Error::DbError)?;
 
@@ -672,7 +679,7 @@ pub(crate) async fn update_id(
 	// First check if file exists and what its current file_id is
 	let existing = sqlx::query("SELECT file_id FROM files WHERE tn_id=? AND f_id=?")
 		.bind(tn_id.0)
-		.bind(f_id as i64)
+		.bind(f_id.cast_signed())
 		.fetch_optional(db)
 		.await
 		.inspect_err(inspect)
@@ -691,15 +698,14 @@ pub(crate) async fn update_id(
 				if existing_id == file_id {
 					// Idempotent success - already set to the correct value
 					return Ok(());
-				} else {
-					// Different file_id - this is a conflict
-					let msg = format!(
-						"Attempted to update f_id={} to file_id={} but already set to {}",
-						f_id, file_id, existing_id
-					);
-					error!("{}", msg);
-					return Err(Error::Conflict(msg));
 				}
+				// Different file_id - this is a conflict
+				let msg = format!(
+					"Attempted to update f_id={} to file_id={} but already set to {}",
+					f_id, file_id, existing_id
+				);
+				error!("{}", msg);
+				return Err(Error::Conflict(msg));
 			}
 			// file_id is NULL - proceed with update
 		}
@@ -709,7 +715,7 @@ pub(crate) async fn update_id(
 	let res = sqlx::query("UPDATE files SET file_id=? WHERE tn_id=? AND f_id=? AND status='P'")
 		.bind(file_id)
 		.bind(tn_id.0)
-		.bind(f_id as i64)
+		.bind(f_id.cast_signed())
 		.execute(db)
 		.await
 		.inspect_err(inspect)
@@ -720,7 +726,7 @@ pub(crate) async fn update_id(
 		// Re-check what value was set (idempotent verification)
 		let current = sqlx::query("SELECT file_id FROM files WHERE tn_id=? AND f_id=?")
 			.bind(tn_id.0)
-			.bind(f_id as i64)
+			.bind(f_id.cast_signed())
 			.fetch_optional(db)
 			.await
 			.inspect_err(inspect)
@@ -731,15 +737,14 @@ pub(crate) async fn update_id(
 				if existing_id == file_id {
 					// Race condition resolved - correct value was set
 					return Ok(());
-				} else {
-					// Different value - this is a real conflict
-					let msg = format!(
-						"Race condition: f_id={} was set to {} instead of {}",
-						f_id, existing_id, file_id
-					);
-					error!("{}", msg);
-					return Err(Error::Conflict(msg));
 				}
+				// Different value - this is a real conflict
+				let msg = format!(
+					"Race condition: f_id={} was set to {} instead of {}",
+					f_id, existing_id, file_id
+				);
+				error!("{}", msg);
+				return Err(Error::Conflict(msg));
 			}
 		}
 		// Still NULL somehow - return error
@@ -759,7 +764,7 @@ pub(crate) async fn finalize_file(
 	// First check if file exists and what its current state is
 	let existing = sqlx::query("SELECT file_id, status FROM files WHERE tn_id=? AND f_id=?")
 		.bind(tn_id.0)
-		.bind(f_id as i64)
+		.bind(f_id.cast_signed())
 		.fetch_optional(db)
 		.await
 		.inspect_err(inspect)
@@ -783,7 +788,7 @@ pub(crate) async fn finalize_file(
 					// Has correct file_id but status not updated - fix it
 					sqlx::query("UPDATE files SET status='A' WHERE tn_id=? AND f_id=?")
 						.bind(tn_id.0)
-						.bind(f_id as i64)
+						.bind(f_id.cast_signed())
 						.execute(db)
 						.await
 						.inspect_err(inspect)
@@ -809,7 +814,7 @@ pub(crate) async fn finalize_file(
 	)
 	.bind(file_id)
 	.bind(tn_id.0)
-	.bind(f_id as i64)
+	.bind(f_id.cast_signed())
 	.execute(db)
 	.await
 	.inspect_err(inspect)
@@ -820,7 +825,7 @@ pub(crate) async fn finalize_file(
 		// Re-check what value was set (idempotent verification)
 		let current = sqlx::query("SELECT file_id, status FROM files WHERE tn_id=? AND f_id=?")
 			.bind(tn_id.0)
-			.bind(f_id as i64)
+			.bind(f_id.cast_signed())
 			.fetch_optional(db)
 			.await
 			.inspect_err(inspect)
@@ -836,21 +841,20 @@ pub(crate) async fn finalize_file(
 					// Has correct file_id but status not updated - fix it
 					sqlx::query("UPDATE files SET status='A' WHERE tn_id=? AND f_id=?")
 						.bind(tn_id.0)
-						.bind(f_id as i64)
+						.bind(f_id.cast_signed())
 						.execute(db)
 						.await
 						.inspect_err(inspect)
 						.map_err(|_| Error::DbError)?;
 					return Ok(());
-				} else {
-					// Different value - this is a real conflict
-					let msg = format!(
-						"Race condition: f_id={} was set to {} instead of {}",
-						f_id, existing_id, file_id
-					);
-					error!("{}", msg);
-					return Err(Error::Conflict(msg));
 				}
+				// Different value - this is a real conflict
+				let msg = format!(
+					"Race condition: f_id={} was set to {} instead of {}",
+					f_id, existing_id, file_id
+				);
+				error!("{}", msg);
+				return Err(Error::Conflict(msg));
 			}
 		}
 		// Still NULL somehow - return error
@@ -868,8 +872,6 @@ pub(crate) async fn update_data(
 	file_id: &str,
 	opts: &UpdateFileOptions,
 ) -> ClResult<()> {
-	use cloudillo_types::types::Patch;
-
 	// Build dynamic UPDATE query based on which fields are set
 	let mut set_clauses = Vec::new();
 
@@ -892,7 +894,7 @@ pub(crate) async fn update_data(
 
 	// Handle @-prefixed integer IDs vs content-addressable IDs
 	let (where_clause, file_id_bind): (&str, &str) =
-		if let Some(f_id_str) = file_id.strip_prefix("@") {
+		if let Some(f_id_str) = file_id.strip_prefix('@') {
 			("f_id", f_id_str)
 		} else {
 			("file_id", file_id)
@@ -955,7 +957,7 @@ pub(crate) async fn read(
 	file_id: &str,
 ) -> ClResult<Option<FileView>> {
 	// Handle @-prefixed integer IDs vs content-addressable IDs
-	let row = if let Some(f_id_str) = file_id.strip_prefix("@") {
+	let row = if let Some(f_id_str) = file_id.strip_prefix('@') {
 		// Integer ID - parse and query by f_id
 		let f_id = f_id_str
 			.parse::<i64>()
@@ -1012,7 +1014,6 @@ pub(crate) async fn read(
 				(row.try_get::<Box<str>, _>("id_tag"), row.try_get::<Box<str>, _>("name"))
 			{
 				let typ = match row.try_get::<&str, _>("type").ok() {
-					Some("P") => ProfileType::Person,
 					Some("C") => ProfileType::Community,
 					_ => ProfileType::Person, // Default fallback
 				};
@@ -1033,7 +1034,6 @@ pub(crate) async fn read(
 				row.try_get::<Box<str>, _>("creator_name"),
 			) {
 				let typ = match row.try_get::<&str, _>("creator_type").ok() {
-					Some("P") => ProfileType::Person,
 					Some("C") => ProfileType::Community,
 					_ => ProfileType::Person,
 				};

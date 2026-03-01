@@ -2,7 +2,6 @@ use crate::{storage, DatabaseInstance};
 use async_trait::async_trait;
 use cloudillo_types::prelude::*;
 use cloudillo_types::rtdb_adapter::{ChangeEvent, Transaction};
-use cloudillo_types::types::TnId;
 use redb::ReadableTable;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -103,7 +102,7 @@ impl RedbTransaction {
 
 		// Build all index keys first before acquiring table lock
 		let mut index_keys = Vec::new();
-		for field in fields.iter() {
+		for field in &fields {
 			if let Some(value) = data.get(field.as_ref()) {
 				let keys = self.build_index_keys(collection, field, value, doc_id);
 				index_keys.extend(keys);

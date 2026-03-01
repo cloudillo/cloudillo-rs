@@ -44,9 +44,8 @@ pub fn get_sync_setting_key(class: VariantClass) -> Option<&'static str> {
 /// Get the default sync max for a variant class
 pub fn get_default_sync_max(class: VariantClass) -> &'static str {
 	match class {
-		VariantClass::Visual => "md",
 		VariantClass::Video => "sd",
-		VariantClass::Audio => "md",
+		VariantClass::Visual | VariantClass::Audio => "md",
 		VariantClass::Document | VariantClass::Raw => "orig", // Always sync all
 	}
 }
@@ -68,7 +67,7 @@ pub fn get_sync_source<'a>(
 
 /// Check if we are the audience (must sync ALL variants)
 pub fn is_audience(tenant_tag: &str, audience_tag: Option<&str>) -> bool {
-	audience_tag.map(|aud| aud == tenant_tag).unwrap_or(false)
+	audience_tag.is_some_and(|aud| aud == tenant_tag)
 }
 
 /// Verify that content hash matches expected ID
@@ -163,8 +162,7 @@ pub async fn sync_file_variants(
 
 		// Build map of class -> max_variant from settings
 		for variant in &parsed_variants {
-			let class =
-				Variant::parse(variant.variant).map(|v| v.class).unwrap_or(VariantClass::Visual);
+			let class = Variant::parse(variant.variant).map_or(VariantClass::Visual, |v| v.class);
 
 			if let std::collections::hash_map::Entry::Vacant(e) = class_max_variants.entry(class) {
 				if let Some(setting_key) = get_sync_setting_key(class) {
@@ -185,16 +183,14 @@ pub async fn sync_file_variants(
 		parsed_variants
 			.iter()
 			.filter(|v| {
-				let class =
-					Variant::parse(v.variant).map(|vp| vp.class).unwrap_or(VariantClass::Visual);
+				let class = Variant::parse(v.variant).map_or(VariantClass::Visual, |vp| vp.class);
 
 				// Doc/Raw always sync (no setting key)
-				let Some(max_variant) = class_max_variants.get(&class).map(|s| s.as_str()) else {
+				let Some(max_variant) = class_max_variants.get(&class).map(String::as_str) else {
 					return true; // No limit = sync all
 				};
 
-				let quality =
-					Variant::parse(v.variant).map(|vp| vp.quality.as_str()).unwrap_or(v.variant);
+				let quality = Variant::parse(v.variant).map_or(v.variant, |vp| vp.quality.as_str());
 
 				should_sync_variant(quality, max_variant)
 			})

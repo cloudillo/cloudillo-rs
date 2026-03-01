@@ -338,7 +338,19 @@ pub struct ActionTypeHooks {
 	pub on_reject: Option<HookFunction>,
 }
 
+impl std::fmt::Debug for ActionTypeHooks {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("ActionTypeHooks")
+			.field("on_create", &self.on_create.as_ref().map(|_| ".."))
+			.field("on_receive", &self.on_receive.as_ref().map(|_| ".."))
+			.field("on_accept", &self.on_accept.as_ref().map(|_| ".."))
+			.field("on_reject", &self.on_reject.as_ref().map(|_| ".."))
+			.finish()
+	}
+}
+
 /// Registry of native hook implementations
+#[derive(Debug)]
 pub struct HookRegistry {
 	hooks: HashMap<String, ActionTypeHooks>,
 }
@@ -388,7 +400,7 @@ impl HookRegistry {
 
 	/// Get all registered action types
 	pub fn registered_types(&self) -> Vec<&str> {
-		self.hooks.keys().map(|s| s.as_str()).collect()
+		self.hooks.keys().map(String::as_str).collect()
 	}
 }
 

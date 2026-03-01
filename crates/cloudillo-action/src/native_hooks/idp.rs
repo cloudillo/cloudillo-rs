@@ -7,7 +7,6 @@ use std::collections::HashMap;
 
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use cloudillo_core::app::App;
 use cloudillo_idp::registration::{self, ProcessRegistrationParams};
 
 // Re-export types for backward compatibility

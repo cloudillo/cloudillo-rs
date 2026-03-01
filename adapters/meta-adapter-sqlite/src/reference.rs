@@ -4,7 +4,7 @@
 
 use sqlx::{Row, SqlitePool};
 
-use cloudillo_types::meta_adapter::*;
+use cloudillo_types::meta_adapter::{CreateRefOptions, ListRefsOptions, RefData};
 use cloudillo_types::prelude::*;
 
 /// List references with optional filtering
@@ -70,7 +70,7 @@ pub(crate) async fn list(
 				description: row.get("description"),
 				created_at: Timestamp(created_at),
 				expires_at: expires_at.map(Timestamp),
-				count: count.map(|c| c as u32), // None = unlimited
+				count: count.and_then(|c| u32::try_from(c).ok()), // None = unlimited
 				resource_id: row.get("resource_id"),
 				access_level: access_level.and_then(|s| s.chars().next()),
 			}
@@ -120,7 +120,7 @@ pub(crate) async fn create(
 		.bind(opts.description.as_deref())
 		.bind(now.0)
 		.bind(opts.expires_at.map(|t| t.0))
-		.bind(opts.count.map(|c| c as i32)) // None = unlimited (NULL in DB)
+		.bind(opts.count.map(u32::cast_signed)) // None = unlimited (NULL in DB)
 		.bind(opts.resource_id.as_deref())
 		.bind(access_level_str.as_deref())
 		.execute(db)
@@ -131,11 +131,11 @@ pub(crate) async fn create(
 	Ok(RefData {
 		ref_id: ref_id.into(),
 		r#type: opts.typ.clone().into(),
-		description: opts.description.clone().map(|d| d.into()),
+		description: opts.description.clone().map(Into::into),
 		created_at: now,
 		expires_at: opts.expires_at,
 		count: opts.count, // None = unlimited
-		resource_id: opts.resource_id.clone().map(|s| s.into()),
+		resource_id: opts.resource_id.clone().map(Into::into),
 		access_level: opts.access_level,
 	})
 }
@@ -215,12 +215,12 @@ pub(crate) async fn validate_ref(
 		description,
 		created_at: Timestamp(created_at),
 		expires_at: expires_at.map(Timestamp),
-		count: count.map(|c| c as u32),
+		count: count.and_then(|c| u32::try_from(c).ok()),
 		resource_id,
 		access_level: access_level_str.and_then(|s| s.chars().next()),
 	};
 
-	Ok((TnId(tn_id as u32), id_tag.into(), ref_data))
+	Ok((TnId(u32::try_from(tn_id).unwrap_or_default()), id_tag.into(), ref_data))
 }
 
 /// Use/consume a reference - validates and decrements counter
@@ -293,7 +293,7 @@ pub(crate) async fn use_ref(
 			.await
 			.inspect_err(|err| warn!("DB: {:#?}", err))
 			.map_err(|_| Error::DbError)?;
-		count.map(|c| (c - 1).max(0) as u32)
+		count.and_then(|c| u32::try_from((c - 1).max(0)).ok())
 	} else {
 		None // Still unlimited
 	};
@@ -315,5 +315,5 @@ pub(crate) async fn use_ref(
 		access_level: access_level_str.and_then(|s| s.chars().next()),
 	};
 
-	Ok((TnId(tn_id as u32), id_tag.into(), ref_data))
+	Ok((TnId(u32::try_from(tn_id).unwrap_or_default()), id_tag.into(), ref_data))
 }

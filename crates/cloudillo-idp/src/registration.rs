@@ -123,7 +123,7 @@ pub async fn send_activation_email(
 	)
 	.await
 	{
-		Ok(_) => {
+		Ok(()) => {
 			info!(
 				id_tag_prefix = %params.id_tag_prefix,
 				id_tag_domain = %params.id_tag_domain,
@@ -211,7 +211,7 @@ pub async fn process_registration(
 	};
 
 	// Email validation: required only if no owner_id_tag
-	if owner_id_tag.is_none() && reg_content.email.as_ref().is_none_or(|e| e.is_empty()) {
+	if owner_id_tag.is_none() && reg_content.email.as_ref().is_none_or(String::is_empty) {
 		warn!(
 			id_tag = %reg_content.id_tag,
 			"IDP:REG content missing email (required when no owner specified)"
@@ -379,7 +379,7 @@ pub async fn process_registration(
 	);
 
 	// Send activation email (if email is provided)
-	let tn_id = TnId(params.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(params.tenant_id).unwrap_or_default());
 	let identity_id = format!("{}.{}", identity.id_tag_prefix, identity.id_tag_domain);
 	let activation_ref = if let Some(ref email) = identity.email {
 		match send_activation_email(
@@ -451,7 +451,7 @@ pub async fn process_registration(
 	Ok(RegistrationResult {
 		identity_id,
 		activation_ref,
-		api_key_prefix: created_key.api_key.key_prefix.to_string(),
+		api_key_prefix: created_key.api_key.key_prefix.clone(),
 		plaintext_key: created_key.plaintext_key,
 		response,
 	})

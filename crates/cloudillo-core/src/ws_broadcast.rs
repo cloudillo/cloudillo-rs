@@ -80,6 +80,7 @@ pub struct BroadcastConfig {
 
 impl Default for BroadcastConfig {
 	fn default() -> Self {
+		// Enough for typical WebSocket message bursts without excessive memory
 		Self { buffer_size: 128 }
 	}
 }

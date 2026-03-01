@@ -329,7 +329,11 @@ const SW_ENCRYPTION_KEY_PLACEHOLDER: &str = "__CLOUDILLO_SW_ENCRYPTION_KEY__";
 /// Check if a path is a service worker file (sw-*.js pattern)
 fn is_sw_file(path: &str) -> bool {
 	let filename = path.trim_start_matches('/');
-	filename.starts_with("sw-") && filename.ends_with(".js") && !filename.contains('/')
+	filename.starts_with("sw-")
+		&& std::path::Path::new(filename)
+			.extension()
+			.is_some_and(|ext| ext.eq_ignore_ascii_case("js"))
+		&& !filename.contains('/')
 }
 
 /// Check if a path is in an app directory (microfrontend assets)
@@ -493,7 +497,7 @@ async fn serve_dynamic_sw(
 ) -> Result<Response, Error> {
 	// 1. Check for Service-Worker header (browser sets this automatically, JS cannot fake it)
 	let sw_header = headers.get("Service-Worker").and_then(|v| v.to_str().ok());
-	let is_sw_registration = sw_header.map(|v| v == "script").unwrap_or(false);
+	let is_sw_registration = sw_header.is_some_and(|v| v == "script");
 	info!("[SW] Service-Worker header: {:?}, is_registration: {}", sw_header, is_sw_registration);
 
 	// 2. Extract key from query string (URL-safe base64, no decoding needed)
@@ -616,7 +620,7 @@ async fn static_fallback_handler(
 		.headers()
 		.get(header::IF_NONE_MATCH)
 		.and_then(|v| v.to_str().ok())
-		.map(|s| s.to_string());
+		.map(ToString::to_string);
 
 	// Serve static files - NO unconditional fallback; we handle 404s manually
 	let dist_dir = &app.opts.dist_dir;
@@ -645,8 +649,7 @@ async fn static_fallback_handler(
 			.headers()
 			.get(header::CONTENT_TYPE)
 			.and_then(|v| v.to_str().ok())
-			.map(|ct| ct.starts_with("text/html"))
-			.unwrap_or(false);
+			.is_some_and(|ct| ct.starts_with("text/html"));
 
 		if is_sw_file(&path_owned) {
 			// SW files must never be long-cached even via static fallback

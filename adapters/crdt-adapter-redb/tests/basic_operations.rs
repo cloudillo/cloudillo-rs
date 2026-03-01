@@ -2,6 +2,8 @@
 //!
 //! Tests core CRUD operations for CRDT documents
 
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
+
 use cloudillo_crdt_adapter_redb::{AdapterConfig, CrdtAdapterRedb};
 use cloudillo_types::crdt_adapter::{CrdtAdapter, CrdtUpdate};
 use cloudillo_types::types::TnId;
@@ -33,12 +35,9 @@ async fn test_create_and_store_update() {
 
 	let update = CrdtUpdate { data: vec![0x01, 0x02, 0x03], client_id: Some("client1".into()) };
 
-	adapter
-		.store_update(tn_id, doc_id, update.clone())
-		.await
-		.expect("Failed to store update");
+	adapter.store_update(tn_id, doc_id, update.clone()).await.expect("test failed");
 
-	let updates = adapter.get_updates(tn_id, doc_id).await.expect("Failed to get updates");
+	let updates = adapter.get_updates(tn_id, doc_id).await.expect("test failed");
 
 	assert_eq!(updates.len(), 1);
 	assert_eq!(updates[0].data, vec![0x01, 0x02, 0x03]);
@@ -52,7 +51,7 @@ async fn test_empty_document() {
 	let tn_id = TnId(1);
 	let doc_id = "nonexistent";
 
-	let updates = adapter.get_updates(tn_id, doc_id).await.expect("Failed to get updates");
+	let updates = adapter.get_updates(tn_id, doc_id).await.expect("test failed");
 
 	assert_eq!(updates.len(), 0);
 }
@@ -65,15 +64,13 @@ async fn test_multiple_updates() {
 
 	// Store 3 updates
 	for i in 1..=3 {
+		#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 		let update = CrdtUpdate { data: vec![i as u8], client_id: None };
 
-		adapter
-			.store_update(tn_id, doc_id, update)
-			.await
-			.expect("Failed to store update");
+		adapter.store_update(tn_id, doc_id, update).await.expect("test failed");
 	}
 
-	let updates = adapter.get_updates(tn_id, doc_id).await.expect("Failed to get updates");
+	let updates = adapter.get_updates(tn_id, doc_id).await.expect("test failed");
 
 	assert_eq!(updates.len(), 3);
 	assert_eq!(updates[0].data, vec![1]);
@@ -90,20 +87,17 @@ async fn test_delete_document() {
 	// Store an update
 	let update = CrdtUpdate { data: vec![0xFF], client_id: None };
 
-	adapter
-		.store_update(tn_id, doc_id, update)
-		.await
-		.expect("Failed to store update");
+	adapter.store_update(tn_id, doc_id, update).await.expect("test failed");
 
 	// Verify it exists
-	let updates = adapter.get_updates(tn_id, doc_id).await.expect("Failed to get updates");
+	let updates = adapter.get_updates(tn_id, doc_id).await.expect("test failed");
 	assert_eq!(updates.len(), 1);
 
 	// Delete
-	adapter.delete_doc(tn_id, doc_id).await.expect("Failed to delete");
+	adapter.delete_doc(tn_id, doc_id).await.expect("test failed");
 
 	// Verify it's gone
-	let updates = adapter.get_updates(tn_id, doc_id).await.expect("Failed to get updates");
+	let updates = adapter.get_updates(tn_id, doc_id).await.expect("test failed");
 	assert_eq!(updates.len(), 0);
 }
 
@@ -112,22 +106,22 @@ async fn test_per_tenant_isolation() {
 	let (adapter, _temp) = create_test_adapter().await;
 	let doc_id = "shared-doc";
 
-	let update1 = CrdtUpdate { data: vec![0x11], client_id: None };
+	let upd_tn1 = CrdtUpdate { data: vec![0x11], client_id: None };
 
-	let update2 = CrdtUpdate { data: vec![0x22], client_id: None };
+	let upd_tn2 = CrdtUpdate { data: vec![0x22], client_id: None };
 
-	adapter.store_update(TnId(1), doc_id, update1).await.expect("Failed to store");
+	adapter.store_update(TnId(1), doc_id, upd_tn1).await.expect("test failed");
 
-	adapter.store_update(TnId(2), doc_id, update2).await.expect("Failed to store");
+	adapter.store_update(TnId(2), doc_id, upd_tn2).await.expect("test failed");
 
-	let updates1 = adapter.get_updates(TnId(1), doc_id).await.expect("Failed to get");
+	let result_tn1 = adapter.get_updates(TnId(1), doc_id).await.expect("test failed");
 
-	let updates2 = adapter.get_updates(TnId(2), doc_id).await.expect("Failed to get");
+	let result_tn2 = adapter.get_updates(TnId(2), doc_id).await.expect("test failed");
 
-	assert_eq!(updates1.len(), 1);
-	assert_eq!(updates2.len(), 1);
-	assert_eq!(updates1[0].data[0], 0x11);
-	assert_eq!(updates2[0].data[0], 0x22);
+	assert_eq!(result_tn1.len(), 1);
+	assert_eq!(result_tn2.len(), 1);
+	assert_eq!(result_tn1[0].data[0], 0x11);
+	assert_eq!(result_tn2[0].data[0], 0x22);
 }
 
 #[tokio::test]
@@ -136,7 +130,7 @@ async fn test_list_documents() {
 	let tn_id = TnId(1);
 
 	// List documents on new adapter (should be empty or work)
-	let docs = adapter.list_docs(tn_id).await.expect("Failed to list documents");
+	let docs = adapter.list_docs(tn_id).await.expect("test failed");
 
 	// Should not error - returns empty or populated list depending on implementation
 	let _ = docs; // Suppresses warning - just verify it doesn't error
@@ -149,15 +143,15 @@ async fn test_large_binary_update() {
 	let doc_id = "large-doc";
 
 	// Create 100KB update
-	let large_data = vec![0xAB; 102400];
+	let large_data = vec![0xAB; 102_400];
 
 	let update = CrdtUpdate { data: large_data.clone(), client_id: None };
 
-	adapter.store_update(tn_id, doc_id, update).await.expect("Failed to store");
+	adapter.store_update(tn_id, doc_id, update).await.expect("test failed");
 
-	let updates = adapter.get_updates(tn_id, doc_id).await.expect("Failed to get");
+	let updates = adapter.get_updates(tn_id, doc_id).await.expect("test failed");
 
 	assert_eq!(updates.len(), 1);
-	assert_eq!(updates[0].data.len(), 102400);
+	assert_eq!(updates[0].data.len(), 102_400);
 	assert_eq!(updates[0].data, large_data);
 }

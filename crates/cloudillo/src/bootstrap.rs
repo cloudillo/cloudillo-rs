@@ -123,8 +123,7 @@ pub async fn create_complete_tenant(
 	// Set display name (use provided or derive from id_tag with capitalization)
 	let display_name = opts
 		.display_name
-		.map(|s| s.to_string())
-		.unwrap_or_else(|| derive_name_from_id_tag(opts.id_tag));
+		.map_or_else(|| derive_name_from_id_tag(opts.id_tag), ToString::to_string);
 
 	meta.update_tenant(
 		tn_id,
@@ -283,7 +282,7 @@ pub async fn bootstrap(app: Arc<AppState>, opts: &crate::app::AppBuilderOpts) ->
 								)
 								.await
 								{
-									Ok(_) => {
+									Ok(()) => {
 										info!(tenant = %id_tag, "Certificate renewed successfully");
 									}
 									Err(e) => {

@@ -15,9 +15,7 @@ use cloudillo_types::address::parse_address_type;
 use cloudillo_types::identity_provider_adapter::{
 	CreateIdentityOptions, Identity, IdentityStatus, ListIdentityOptions, UpdateIdentityOptions,
 };
-use cloudillo_types::types::{
-	serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse, Timestamp,
-};
+use cloudillo_types::types::{serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse};
 use cloudillo_types::utils::parse_and_validate_identity_id_tag;
 
 use crate::prelude::*;
@@ -363,7 +361,7 @@ pub async fn create_identity(
 	}
 
 	// Email is required only if no owner_id_tag is provided
-	if create_req.owner_id_tag.is_none() && create_req.email.as_ref().is_none_or(|e| e.is_empty()) {
+	if create_req.owner_id_tag.is_none() && create_req.email.as_ref().is_none_or(String::is_empty) {
 		return Err(Error::ValidationError(
 			"email is required when no owner_id_tag is provided".to_string(),
 		));
@@ -554,7 +552,7 @@ pub async fn create_identity(
 /// Authorization: The authenticated identity (via IDP API key) must match
 /// the identity being updated. This endpoint is designed for self-updates
 /// where each identity uses its own API key to update its address.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "IdP registration requires all fields")]
 #[axum::debug_handler]
 pub async fn update_identity_address(
 	State(app): State<App>,

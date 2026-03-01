@@ -4,9 +4,6 @@
 //! crate and potentially by future feature crates. Extracting these into a separate
 //! crate enables better build parallelism and clearer module boundaries.
 
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
-
 pub mod abac;
 pub mod acme;
 pub mod app;

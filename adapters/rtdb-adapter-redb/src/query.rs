@@ -1,13 +1,21 @@
+use crate::error::from_redb_error;
 use crate::{storage, DatabaseInstance};
 use cloudillo_types::error::ClResult;
 use cloudillo_types::rtdb_adapter::{
 	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, SortField,
 };
 use cloudillo_types::types::TnId;
+use redb::ReadableDatabase;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Convert `u64` to `f64`, accepting minor precision loss for values above 2^53.
+#[allow(clippy::cast_precision_loss)]
+fn u64_to_f64(v: u64) -> f64 {
+	v as f64
+}
 
 /// Query context grouping related parameters
 struct QueryContext<'a> {
@@ -24,16 +32,13 @@ pub fn execute_query(
 	tn_id: TnId,
 	db_id: &str,
 	path: &str,
-	opts: QueryOptions,
+	opts: &QueryOptions,
 	per_tenant_files: bool,
 ) -> ClResult<Vec<Value>> {
 	// Dispatch to aggregation if requested
 	if let Some(ref aggregate) = opts.aggregate {
-		return execute_aggregate(instance, tn_id, db_id, path, &opts, aggregate, per_tenant_files);
+		return execute_aggregate(instance, tn_id, db_id, path, opts, aggregate, per_tenant_files);
 	}
-
-	use crate::error::from_redb_error;
-	use redb::ReadableDatabase;
 
 	let tx = instance.db.begin_read().map_err(from_redb_error)?;
 	let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
@@ -42,7 +47,7 @@ pub fn execute_query(
 	if let Some(ref filter) = opts.filter {
 		let ctx = QueryContext { tn_id, db_id, path, filter, per_tenant_files };
 		if let Some(docs) = try_index_query(instance, &tx, &ctx)? {
-			return Ok(apply_sort_limit(docs, &opts));
+			return Ok(apply_sort_limit(docs, opts));
 		}
 	}
 
@@ -94,7 +99,7 @@ pub fn execute_query(
 		}
 	}
 
-	Ok(apply_sort_limit(results, &opts))
+	Ok(apply_sort_limit(results, opts))
 }
 
 /// Try to execute a query using an index if available
@@ -149,8 +154,6 @@ fn execute_index_query(
 	field: &str,
 	value: &Value,
 ) -> ClResult<Vec<Value>> {
-	use crate::error::from_redb_error;
-
 	let index_table = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
 	let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 
@@ -204,8 +207,6 @@ fn execute_index_query_any(
 	field: &str,
 	values: &[Value],
 ) -> ClResult<Vec<Value>> {
-	use crate::error::from_redb_error;
-
 	let index_table = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
 	let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 
@@ -270,7 +271,7 @@ fn apply_sort_limit(mut docs: Vec<Value>, opts: &QueryOptions) -> Vec<Value> {
 	}
 
 	// Apply limit
-	let end = opts.limit.map(|l| (start + l as usize).min(docs.len())).unwrap_or(docs.len());
+	let end = opts.limit.map_or(docs.len(), |l| (start + l as usize).min(docs.len()));
 
 	docs[start..end].to_vec()
 }
@@ -342,12 +343,12 @@ impl GroupAccumulator {
 		for op in ops {
 			match op {
 				AggregateOp::Sum { field } => {
-					if let Some(n) = doc.get(field).and_then(|v| v.as_f64()) {
+					if let Some(n) = doc.get(field).and_then(Value::as_f64) {
 						*self.sum.entry(field.clone()).or_default() += n;
 					}
 				}
 				AggregateOp::Avg { field } => {
-					if let Some(n) = doc.get(field).and_then(|v| v.as_f64()) {
+					if let Some(n) = doc.get(field).and_then(Value::as_f64) {
 						*self.avg_sum.entry(field.clone()).or_default() += n;
 						*self.avg_count.entry(field.clone()).or_default() += 1;
 					}
@@ -409,7 +410,7 @@ impl GroupAccumulator {
 					let sum = self.avg_sum.get(field).copied().unwrap_or(0.0);
 					let count = self.avg_count.get(field).copied().unwrap_or(0);
 					if count > 0 {
-						if let Some(n) = serde_json::Number::from_f64(sum / count as f64) {
+						if let Some(n) = serde_json::Number::from_f64(sum / u64_to_f64(count)) {
 							obj.insert(key, Value::Number(n));
 						}
 					}
@@ -445,7 +446,7 @@ fn execute_aggregate(
 ) -> ClResult<Vec<Value>> {
 	// Index-only path: no filter, no data-dependent ops (count only), field is indexed
 	let can_use_index =
-		opts.filter.as_ref().is_none_or(|f| f.is_empty()) && aggregate.ops.is_empty() && {
+		opts.filter.as_ref().is_none_or(QueryFilter::is_empty) && aggregate.ops.is_empty() && {
 			let indexed_fields = instance.indexed_fields.blocking_read();
 			indexed_fields
 				.get(path)
@@ -468,9 +469,6 @@ fn execute_aggregate_index_only(
 	aggregate: &AggregateOptions,
 	per_tenant_files: bool,
 ) -> ClResult<Vec<Value>> {
-	use crate::error::from_redb_error;
-	use redb::ReadableDatabase;
-
 	let tx = instance.db.begin_read().map_err(from_redb_error)?;
 	let index_table = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
 
@@ -529,10 +527,7 @@ fn execute_aggregate_index_only(
 	if start >= groups.len() {
 		return Ok(Vec::new());
 	}
-	let end = opts
-		.limit
-		.map(|l| (start + l as usize).min(groups.len()))
-		.unwrap_or(groups.len());
+	let end = opts.limit.map_or(groups.len(), |l| (start + l as usize).min(groups.len()));
 
 	Ok(groups[start..end].to_vec())
 }
@@ -547,9 +542,6 @@ fn execute_aggregate_scan(
 	aggregate: &AggregateOptions,
 	per_tenant_files: bool,
 ) -> ClResult<Vec<Value>> {
-	use crate::error::from_redb_error;
-	use redb::ReadableDatabase;
-
 	let tx = instance.db.begin_read().map_err(from_redb_error)?;
 	let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 
@@ -626,10 +618,7 @@ fn execute_aggregate_scan(
 	if start >= results.len() {
 		return Ok(Vec::new());
 	}
-	let end = opts
-		.limit
-		.map(|l| (start + l as usize).min(results.len()))
-		.unwrap_or(results.len());
+	let end = opts.limit.map_or(results.len(), |l| (start + l as usize).min(results.len()));
 
 	Ok(results[start..end].to_vec())
 }

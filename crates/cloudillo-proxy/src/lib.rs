@@ -1,8 +1,5 @@
 //! Reverse proxy module for proxying HTTP and WebSocket traffic to backend servers.
 
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
-
 pub mod admin;
 pub mod handler;
 pub mod protocol;

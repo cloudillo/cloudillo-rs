@@ -2,8 +2,12 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::*;
-use cloudillo_types::meta_adapter::*;
+use crate::utils::{collect_res, inspect, map_res, parse_str_list, push_in};
+use cloudillo_types::meta_adapter::{
+	Action, ActionData, ActionId, ActionView, AttachmentView, CreateOutboundActionOptions,
+	FinalizeActionOptions, ListActionOptions, ProfileInfo, ProfileType, ReactionData,
+	UpdateActionDataOptions,
+};
 use cloudillo_types::prelude::*;
 
 /// List actions with filtering options
@@ -109,7 +113,6 @@ pub(crate) async fn list(
 	let _sort_field = opts.sort.as_deref().unwrap_or("created");
 	let sort_dir = match opts.sort_dir.as_deref() {
 		Some("asc") => "ASC",
-		Some("desc") => "DESC",
 		_ => "DESC", // Default DESC for actions
 	};
 	let is_desc = sort_dir == "DESC";
@@ -151,7 +154,7 @@ pub(crate) async fn list(
 
 	// Fetch limit+1 to determine hasMore
 	// Note: SQLite doesn't allow bound parameters in LIMIT clause, so we use format!
-	let limit = opts.limit.unwrap_or(20) as i64;
+	let limit = i64::from(opts.limit.unwrap_or(20));
 	query.push(format!(" LIMIT {}", limit + 1));
 
 	debug!("SQL: {}", query.sql());
@@ -169,12 +172,14 @@ pub(crate) async fn list(
 		let action_id: Box<str> = row
 			.try_get::<Option<String>, _>("action_id")
 			.map_err(|_| Error::DbError)?
-			.map(|s| s.into_boxed_str())
-			.unwrap_or_else(|| {
-				// NULL action_id - construct @{a_id} placeholder
-				let a_id: i64 = row.try_get("a_id").unwrap_or(0);
-				format!("@{}", a_id).into_boxed_str()
-			});
+			.map_or_else(
+				|| {
+					// NULL action_id - construct @{a_id} placeholder
+					let a_id: i64 = row.try_get("a_id").unwrap_or(0);
+					format!("@{}", a_id).into_boxed_str()
+				},
+				String::into_boxed_str,
+			);
 
 		let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag").map_err(|_| Error::DbError)?;
 		let audience_tag =
@@ -190,7 +195,7 @@ pub(crate) async fn list(
 				.iter()
 				.map(|a| AttachmentView { file_id: a.clone(), dim: None, local_variants: None })
 				.collect::<Vec<_>>();
-			for a in attachments.iter_mut() {
+			for a in &mut attachments {
 				// Handle both @{f_id} placeholders and real file_ids
 				let query_result = if let Some(f_id_str) = a.file_id.strip_prefix('@') {
 					// Query by f_id
@@ -317,7 +322,7 @@ pub(crate) async fn list(
 				.try_get::<Option<String>, _>("x")
 				.map_err(|_| Error::DbError)?
 				.and_then(|s| serde_json::from_str(&s).ok()),
-		})
+		});
 	}
 
 	Ok(actions)
@@ -453,7 +458,7 @@ pub(crate) async fn finalize(
 	// First check if action exists and what its current action_id is
 	let existing = sqlx::query("SELECT action_id, status FROM actions WHERE tn_id=? AND a_id=?")
 		.bind(tn_id.0)
-		.bind(a_id as i64)
+		.bind(a_id.cast_signed())
 		.fetch_optional(db)
 		.await
 		.inspect_err(inspect)
@@ -473,15 +478,14 @@ pub(crate) async fn finalize(
 				if existing_id == action_id {
 					// Idempotent success - already set to the correct value
 					return Ok(());
-				} else {
-					// Different action_id - this is a conflict
-					let msg = format!(
-						"Attempted to finalize a_id={} to action_id={} but already set to {}",
-						a_id, action_id, existing_id
-					);
-					error!("{}", msg);
-					return Err(Error::Conflict(msg));
 				}
+				// Different action_id - this is a conflict
+				let msg = format!(
+					"Attempted to finalize a_id={} to action_id={} but already set to {}",
+					a_id, action_id, existing_id
+				);
+				error!("{}", msg);
+				return Err(Error::Conflict(msg));
 			}
 
 			// action_id is NULL - verify status is 'P'
@@ -509,7 +513,7 @@ pub(crate) async fn finalize(
 		.bind(options.audience_tag)
 		.bind(options.key)
 		.bind(tn_id.0)
-		.bind(a_id as i64)
+		.bind(a_id.cast_signed())
 		.execute(&mut *tx)
 		.await
 		.inspect_err(inspect)
@@ -520,7 +524,7 @@ pub(crate) async fn finalize(
 		// Re-check what value was set (idempotent verification)
 		let current = sqlx::query("SELECT action_id FROM actions WHERE tn_id=? AND a_id=?")
 			.bind(tn_id.0)
-			.bind(a_id as i64)
+			.bind(a_id.cast_signed())
 			.fetch_optional(&mut *tx)
 			.await
 			.inspect_err(inspect)
@@ -534,15 +538,14 @@ pub(crate) async fn finalize(
 				if existing_id == action_id {
 					// Idempotent success - another task set it to the same value
 					return Ok(());
-				} else {
-					// Conflict - set to different value
-					let msg = format!(
-						"Race condition: a_id={} was set to {} instead of {}",
-						a_id, existing_id, action_id
-					);
-					error!("{}", msg);
-					return Err(Error::Conflict(msg));
 				}
+				// Conflict - set to different value
+				let msg = format!(
+					"Race condition: a_id={} was set to {} instead of {}",
+					a_id, existing_id, action_id
+				);
+				error!("{}", msg);
+				return Err(Error::Conflict(msg));
 			}
 		}
 
@@ -552,7 +555,7 @@ pub(crate) async fn finalize(
 	// Handle key-based deduplication for finalized actions
 	let action = sqlx::query("SELECT key FROM actions WHERE tn_id=? AND a_id=?")
 		.bind(tn_id.0)
-		.bind(a_id as i64)
+		.bind(a_id.cast_signed())
 		.fetch_one(&mut *tx)
 		.await
 		.inspect_err(inspect)
@@ -568,7 +571,7 @@ pub(crate) async fn finalize(
 		)
 		.bind(tn_id.0)
 		.bind(key)
-		.bind(a_id as i64)
+		.bind(a_id.cast_signed())
 		.execute(&mut *tx)
 		.await
 		.inspect_err(inspect)
@@ -583,7 +586,7 @@ pub(crate) async fn finalize(
 pub(crate) async fn get_id(db: &SqlitePool, tn_id: TnId, a_id: u64) -> ClResult<Box<str>> {
 	let res = sqlx::query("SELECT action_id FROM actions WHERE tn_id=? AND a_id=?")
 		.bind(tn_id.0)
-		.bind(a_id as i64)
+		.bind(a_id.cast_signed())
 		.fetch_one(db)
 		.await
 		.inspect_err(inspect)
@@ -781,8 +784,6 @@ pub(crate) async fn update_data(
 	action_id: &str,
 	opts: &UpdateActionDataOptions,
 ) -> ClResult<()> {
-	use cloudillo_types::types::Patch;
-
 	// Build dynamic UPDATE query based on which fields are set
 	let mut set_clauses = Vec::new();
 
@@ -975,7 +976,7 @@ pub(crate) async fn get(
 			.iter()
 			.map(|a| AttachmentView { file_id: a.clone(), dim: None, local_variants: None })
 			.collect::<Vec<_>>();
-		for a in attachments.iter_mut() {
+		for a in &mut attachments {
 			// Query file dimensions
 			let query_result = if let Some(f_id_str) = a.file_id.strip_prefix('@') {
 				if let Ok(f_id) = f_id_str.parse::<i64>() {

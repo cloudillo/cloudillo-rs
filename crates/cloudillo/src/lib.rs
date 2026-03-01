@@ -18,9 +18,6 @@
 //! - Application platform
 //!     - Third party apps can be implemented
 
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
-
 // Re-export shared types and adapter traits from cloudillo-types
 pub use cloudillo_types::auth_adapter;
 pub use cloudillo_types::blob_adapter;

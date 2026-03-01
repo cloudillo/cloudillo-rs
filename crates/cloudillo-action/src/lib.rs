@@ -1,8 +1,6 @@
 //! Action subsystem. Actions are small signed documents representing a user action (e.g. post, comment, connection request).
 
 #![allow(dead_code)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
 
 pub(crate) mod audience;
 pub mod delivery;

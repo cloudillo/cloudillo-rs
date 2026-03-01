@@ -21,7 +21,6 @@ use std::fmt::Debug;
 use std::pin::Pin;
 
 use crate::prelude::*;
-use crate::types::TnId;
 
 /// A binary CRDT update (serialized Yjs sync protocol message).
 ///
@@ -134,7 +133,7 @@ pub trait CrdtAdapter: Debug + Send + Sync {
 	/// Get statistics for a document.
 	async fn stats(&self, tn_id: TnId, doc_id: &str) -> ClResult<CrdtDocStats> {
 		let updates = self.get_updates(tn_id, doc_id).await?;
-		let update_count = updates.len() as u32;
+		let update_count = u32::try_from(updates.len()).unwrap_or_default();
 		let size_bytes: u64 = updates.iter().map(|u| u.data.len() as u64).sum();
 
 		Ok(CrdtDocStats { doc_id: doc_id.into(), size_bytes, update_count })

@@ -4,11 +4,14 @@
 //! and cascading deletion of all tenant-related data.
 
 use std::collections::HashMap;
+use std::fmt::Write;
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::*;
-use cloudillo_types::meta_adapter::*;
+use crate::utils::push_patch;
+use cloudillo_types::meta_adapter::{
+	ListTenantsMetaOptions, ProfileType, Tenant, TenantListMeta, UpdateTenantData,
+};
 use cloudillo_types::prelude::*;
 
 /// Read a single tenant by ID
@@ -286,11 +289,11 @@ pub(crate) async fn list(
 	query.push_str(" ORDER BY created_at DESC");
 
 	if let Some(limit) = opts.limit {
-		query.push_str(&format!(" LIMIT {}", limit));
+		let _ = write!(query, " LIMIT {}", limit);
 	}
 
 	if let Some(offset) = opts.offset {
-		query.push_str(&format!(" OFFSET {}", offset));
+		let _ = write!(query, " OFFSET {}", offset);
 	}
 
 	let rows = sqlx::query(&query)

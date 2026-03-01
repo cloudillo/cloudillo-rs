@@ -34,10 +34,10 @@ pub(crate) fn inspect(err: &sqlx::Error) {
 /// Map a query result to a value using a closure
 pub(crate) fn map_res<T, F>(row: Result<SqliteRow, sqlx::Error>, f: F) -> ClResult<T>
 where
-	F: FnOnce(SqliteRow) -> Result<T, sqlx::Error>,
+	F: FnOnce(&SqliteRow) -> Result<T, sqlx::Error>,
 {
 	match row {
-		Ok(row) => f(row).inspect_err(inspect).map_err(|_| Error::DbError),
+		Ok(ref row) => f(row).inspect_err(inspect).map_err(|_| Error::DbError),
 		Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
 		Err(err) => {
 			inspect(&err);

@@ -2,10 +2,10 @@
 
 use sqlx::{Row, SqlitePool};
 
-use cloudillo_types::meta_adapter::*;
+use cloudillo_types::meta_adapter::{ListTaskOptions, Task, TaskPatch};
 use cloudillo_types::prelude::*;
 
-use crate::utils::*;
+use crate::utils::{collect_res, inspect, parse_u64_list, push_in};
 
 /// List all pending tasks with their dependencies
 pub(crate) async fn list(db: &SqlitePool, _opts: &ListTaskOptions) -> ClResult<Vec<Task>> {
@@ -83,12 +83,12 @@ pub(crate) async fn create(
 	.await
 	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?;
-	let task_id = res.get(0);
+	let task_id: u64 = res.get(0);
 
 	for dep in deps {
 		sqlx::query("INSERT INTO task_dependencies (task_id, dep_id) VALUES (?, ?)")
-			.bind(task_id as i64)
-			.bind(*dep as i64)
+			.bind(task_id.cast_signed())
+			.bind((*dep).cast_signed())
 			.execute(&mut *tx)
 			.await
 			.inspect_err(inspect)
@@ -105,13 +105,13 @@ pub(crate) async fn mark_finished(db: &SqlitePool, task_id: u64, output: &str) -
 		"UPDATE tasks SET status='F', output=?, next_at=NULL WHERE task_id=? AND status='P'",
 	)
 	.bind(output)
-	.bind(task_id as i64)
+	.bind(task_id.cast_signed())
 	.execute(db)
 	.await
 	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?;
 	sqlx::query("DELETE FROM task_dependencies WHERE dep_id=?")
-		.bind(task_id as i64)
+		.bind(task_id.cast_signed())
 		.execute(db)
 		.await
 		.inspect_err(inspect)
@@ -132,7 +132,7 @@ pub(crate) async fn mark_error(
 			sqlx::query("UPDATE tasks SET error=?, next_at=? WHERE task_id=? AND status='P'")
 				.bind(output)
 				.bind(next_at.0)
-				.bind(task_id as i64)
+				.bind(task_id.cast_signed())
 				.execute(db)
 				.await
 				.inspect_err(inspect)
@@ -143,7 +143,7 @@ pub(crate) async fn mark_error(
 				"UPDATE tasks SET error=?, status='E', next_at=NULL WHERE task_id=? AND status='P'",
 			)
 			.bind(output)
-			.bind(task_id as i64)
+			.bind(task_id.cast_signed())
 			.execute(db)
 			.await
 			.inspect_err(inspect)
@@ -229,7 +229,7 @@ pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> 
 			query.push("next_at=NULL");
 			has_fields = true;
 		}
-		_ => {}
+		Patch::Undefined => {}
 	}
 
 	// Add retry if present
@@ -248,7 +248,7 @@ pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> 
 			query.push("retry=NULL");
 			has_fields = true;
 		}
-		_ => {}
+		Patch::Undefined => {}
 	}
 
 	// Add cron if present
@@ -267,12 +267,12 @@ pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> 
 			query.push("cron=NULL");
 			has_fields = true;
 		}
-		_ => {}
+		Patch::Undefined => {}
 	}
 
 	// Execute UPDATE if there are fields to update
 	if has_fields {
-		query.push(" WHERE task_id=").push_bind(task_id as i64);
+		query.push(" WHERE task_id=").push_bind(task_id.cast_signed());
 		query
 			.build()
 			.execute(&mut *tx)
@@ -285,7 +285,7 @@ pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> 
 	if let Patch::Value(ref deps) = patch.deps {
 		// Delete existing dependencies
 		sqlx::query("DELETE FROM task_dependencies WHERE task_id=?")
-			.bind(task_id as i64)
+			.bind(task_id.cast_signed())
 			.execute(&mut *tx)
 			.await
 			.inspect_err(inspect)
@@ -294,8 +294,8 @@ pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> 
 		// Insert new dependencies
 		for dep in deps {
 			sqlx::query("INSERT INTO task_dependencies (task_id, dep_id) VALUES (?, ?)")
-				.bind(task_id as i64)
-				.bind(*dep as i64)
+				.bind(task_id.cast_signed())
+				.bind((*dep).cast_signed())
 				.execute(&mut *tx)
 				.await
 				.inspect_err(inspect)

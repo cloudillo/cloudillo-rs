@@ -9,7 +9,7 @@ use cloudillo_core::extract::Auth;
 use cloudillo_core::CreateActionFn;
 use cloudillo_ref::service::{create_ref_internal, CreateRefInternalParams};
 use cloudillo_types::action_types::CreateAction;
-use cloudillo_types::types::{ApiResponse, Timestamp};
+use cloudillo_types::types::ApiResponse;
 
 /// Request body for creating a community invite
 #[derive(Debug, Deserialize)]
@@ -55,7 +55,7 @@ pub async fn post_invite_community(
 	let node_id_tag = admin_tenant.id_tag.to_string();
 
 	// Calculate expiration
-	let expires_at = Some(Timestamp::now().add_seconds(expires_in_days as i64 * 86400));
+	let expires_at = Some(Timestamp::now().add_seconds(i64::from(expires_in_days) * 86400));
 
 	// 1. Create single-use ref with type "profile.invite"
 	let (ref_id, invite_url) = create_ref_internal(

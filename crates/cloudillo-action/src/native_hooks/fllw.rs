@@ -6,9 +6,7 @@
 
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use cloudillo_core::app::App;
 use cloudillo_types::meta_adapter::UpdateProfileData;
-use cloudillo_types::types::Patch;
 
 /// FLLW on_create hook - Handle follow action creation
 ///
@@ -18,7 +16,7 @@ use cloudillo_types::types::Patch;
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: FLLW on_create for action {}", context.action_id);
 
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 	let Some(audience) = &context.audience else {
 		tracing::warn!("FLLW on_create: No audience specified");
 		return Ok(HookResult::default());
@@ -84,7 +82,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 ///
 /// Note: Unlike CONN, FLLW doesn't require acceptance - it's a one-way relationship
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 	let audience = context.audience.as_deref().unwrap_or("unknown");
 
 	// Check if target user allows followers

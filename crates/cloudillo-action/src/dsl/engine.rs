@@ -4,7 +4,10 @@
 //! (on_create, on_receive, on_accept, on_reject) with proper resource limits and error handling.
 
 use super::operations::{OperationExecutor, EARLY_RETURN_MARKER};
-use super::types::*;
+use super::types::{
+	ActionDefinition, BehaviorFlags, ContentSchema, ContentType, FieldConstraint, FieldConstraints,
+	FieldType, SchemaField,
+};
 use super::validator;
 use crate::hooks::{HookContext, HookResult, HookType};
 use crate::prelude::*;
@@ -18,7 +21,7 @@ use tokio::time::timeout;
 const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// DSL Engine - loads and executes action type definitions
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct DslEngine {
 	definitions: HashMap<String, ActionDefinition>,
 }
@@ -631,6 +634,7 @@ impl DslEngine {
 	}
 
 	/// Validate a field value against a schema field definition
+	#[expect(clippy::self_only_used_in_recursion)]
 	fn validate_field_value(
 		&self,
 		value: &serde_json::Value,
@@ -753,7 +757,7 @@ pub struct HookCounts {
 mod tests {
 	#[test]
 	fn test_load_definition_from_json() {
-		let _json = r#"
+		let _ = r#"
 		{
 			"type": "TEST",
 			"version": "1.0",

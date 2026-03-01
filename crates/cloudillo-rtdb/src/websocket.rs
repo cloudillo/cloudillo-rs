@@ -103,9 +103,9 @@ impl RtdbMessage {
 				let parsed = serde_json::from_str::<RtdbMessage>(text)?;
 				Ok(Some(parsed))
 			}
-			Message::Close(_) => Ok(None),
-			Message::Ping(_) | Message::Pong(_) => Ok(None),
-			_ => Ok(None),
+			Message::Close(_) | Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => {
+				Ok(None)
+			}
 		}
 	}
 }
@@ -302,7 +302,7 @@ pub async fn handle_rtdb_connection(
 	// Abort all subscription forwarding tasks
 	{
 		let handles = conn.subscription_handles.write().await;
-		for (_, handle) in handles.iter() {
+		for handle in (*handles).values() {
 			handle.abort();
 		}
 	}
@@ -373,7 +373,7 @@ async fn handle_rtdb_command(
 					std::collections::HashMap::new();
 
 				// Process all operations in the same transaction
-				for op in operations.iter() {
+				for op in operations {
 					let op_type = op.get("type").and_then(|v| v.as_str()).unwrap_or("");
 					let mut path =
 						op.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -490,7 +490,7 @@ async fn handle_rtdb_command(
 										};
 										match final_data {
 											Ok(data) => match txn.update(&path, data).await {
-												Ok(_) => Ok(
+												Ok(()) => Ok(
 													json!({ "ref": Value::Null, "id": Value::Null }),
 												),
 												Err(e) => Err(e),
@@ -524,13 +524,13 @@ async fn handle_rtdb_command(
 								Err(e)
 							} else {
 								match txn.update(&path, data).await {
-									Ok(_) => Ok(json!({ "ref": Value::Null, "id": Value::Null })),
+									Ok(()) => Ok(json!({ "ref": Value::Null, "id": Value::Null })),
 									Err(e) => Err(e),
 								}
 							}
 						}
 						"delete" => match txn.delete(&path).await {
-							Ok(_) => Ok(json!({ "ref": Value::Null, "id": Value::Null })),
+							Ok(()) => Ok(json!({ "ref": Value::Null, "id": Value::Null })),
 							Err(e) => Err(e),
 						},
 						_ => {
@@ -619,7 +619,7 @@ async fn handle_rtdb_command(
 				for item in sort_arr {
 					if let (Some(field), Some(asc)) = (
 						item.get("field").and_then(|v| v.as_str()),
-						item.get("ascending").and_then(|v| v.as_bool()),
+						item.get("ascending").and_then(Value::as_bool),
 					) {
 						sort_fields.push(SortField { field: field.to_string(), ascending: asc });
 					}
@@ -632,14 +632,16 @@ async fn handle_rtdb_command(
 			}
 
 			// Parse limit
-			if let Some(limit) = msg.payload.get("limit").and_then(|v| v.as_u64()) {
-				opts = opts.with_limit(limit as u32);
+			if let Some(limit) = msg.payload.get("limit").and_then(Value::as_u64) {
+				let limit_u32 = u32::try_from(limit).unwrap_or_default();
+				opts = opts.with_limit(limit_u32);
 				debug!("RTDB query limit: {}", limit);
 			}
 
 			// Parse offset
-			if let Some(offset) = msg.payload.get("offset").and_then(|v| v.as_u64()) {
-				opts = opts.with_offset(offset as u32);
+			if let Some(offset) = msg.payload.get("offset").and_then(Value::as_u64) {
+				let offset_u32 = u32::try_from(offset).unwrap_or_default();
+				opts = opts.with_offset(offset_u32);
 				debug!("RTDB query offset: {}", offset);
 			}
 
@@ -957,7 +959,7 @@ async fn handle_rtdb_command(
 			debug!("RTDB createIndex: path={}, field={}", path, field);
 
 			match app.rtdb_adapter.create_index(conn.tn_id, &conn.file_id, path, field).await {
-				Ok(_) => {
+				Ok(()) => {
 					debug!("Index created successfully: {} on {}", field, path);
 					RtdbMessage::response(
 						msg.id.clone(),

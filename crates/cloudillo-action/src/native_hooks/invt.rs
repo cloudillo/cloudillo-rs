@@ -11,9 +11,7 @@ use crate::helpers::{self, SubscriptionRole};
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 use crate::task::{create_action, CreateAction};
-use cloudillo_core::app::App;
 use cloudillo_types::meta_adapter::UpdateActionDataOptions;
-use cloudillo_types::types::Patch;
 
 /// INVT on_create hook - Validate inviter permission
 ///
@@ -21,7 +19,7 @@ use cloudillo_types::types::Patch;
 /// - Check inviter has active SUBS on target with moderator+ role
 /// - Creator of target action can always invite
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 	let Some(subject_id) = &context.subject else {
 		tracing::warn!("INVT on_create: No subject specified");
@@ -89,7 +87,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// - CONV home: Store for SUBS validation (status stays 'A')
 /// - Invitee: Set status to 'C' (confirmation) so user can accept/reject
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 	tracing::info!(
 		"INVT: Received invitation for {} from {} to action {:?}",
@@ -160,7 +158,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 /// - SUBS targets the subject (group/action) from the invitation
 /// - SUBS will auto-accept because INVT exists (see subs.rs on_receive)
 pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 	// INVT structure:
 	// - issuer = person who invited (Alice)

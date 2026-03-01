@@ -2,7 +2,7 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::*;
+use crate::utils::{inspect, map_res};
 use cloudillo_types::prelude::*;
 
 /// Read a tenant variable

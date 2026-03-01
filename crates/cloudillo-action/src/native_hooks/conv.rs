@@ -10,7 +10,6 @@
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 use crate::task::{create_action, CreateAction};
-use cloudillo_core::app::App;
 
 /// CONV on_create hook - Auto-subscribe creator as admin
 ///
@@ -20,7 +19,7 @@ use cloudillo_core::app::App;
 /// - If CONV has an audience (community), SUBS federates to the community
 /// - SUBS issuer is the creator (self-issued) ensuring proper ownership
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 	tracing::info!(
 		"CONV: Creating conversation {} by {}, audience={:?}",
@@ -38,8 +37,8 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 		audience_tag: context
 			.audience
 			.clone()
-			.map(|a| a.into_boxed_str())
-			.or_else(|| Some(context.issuer.clone().into_boxed_str())),
+			.map(String::into_boxed_str)
+			.or(Some(context.issuer.clone().into_boxed_str())),
 		subject: Some(context.action_id.clone().into()),
 		// x.role stores the subscription role (server-side, not in JWT)
 		x: Some(serde_json::json!({ "role": "admin" })),

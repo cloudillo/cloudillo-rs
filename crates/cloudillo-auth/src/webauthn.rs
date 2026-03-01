@@ -7,7 +7,6 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
-use url::Url;
 use webauthn_rs::prelude::*;
 
 use cloudillo_core::extract::IdTag;
@@ -207,10 +206,7 @@ pub async fn list_reg(
 		.iter()
 		.map(|c| CredentialInfo {
 			credential_id: c.credential_id.to_string(),
-			description: c
-				.description
-				.map(|s| s.to_string())
-				.unwrap_or_else(|| "Passkey".to_string()),
+			description: c.description.map_or_else(|| "Passkey".to_string(), ToString::to_string),
 		})
 		.collect();
 
@@ -235,7 +231,7 @@ pub async fn get_reg_challenge(
 		.collect();
 
 	// Create user unique ID from tn_id
-	let user_id = Uuid::from_u128(auth.tn_id.0 as u128);
+	let user_id = Uuid::from_u128(u128::from(auth.tn_id.0));
 
 	// Start passkey registration
 	let (ccr, reg_state) = webauthn

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use cloudillo_rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
 use cloudillo_types::rtdb_adapter::{
 	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, RtdbAdapter,

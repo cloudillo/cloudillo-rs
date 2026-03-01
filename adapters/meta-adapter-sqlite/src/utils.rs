@@ -105,7 +105,7 @@ pub(crate) fn parse_str_list(s: &str) -> Box<[Box<str>]> {
 /// Parse comma-separated numeric list into boxed array of u64
 pub(crate) fn parse_u64_list(s: &str) -> Box<[u64]> {
 	s.split(',')
-		.map(|s| s.trim().parse().unwrap())
+		.filter_map(|s| s.trim().parse().ok())
 		.collect::<Vec<_>>()
 		.into_boxed_slice()
 }

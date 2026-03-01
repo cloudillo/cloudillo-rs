@@ -15,7 +15,7 @@ pub trait AttrSet: Send + Sync {
 
 	/// Check if list attribute contains value
 	fn contains(&self, key: &str, value: &str) -> bool {
-		self.get_list(key).map(|list| list.contains(&value)).unwrap_or(false)
+		self.get_list(key).is_some_and(|list| list.contains(&value))
 	}
 }
 

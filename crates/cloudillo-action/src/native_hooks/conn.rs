@@ -14,11 +14,9 @@
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 use crate::task::{create_action, CreateAction};
-use cloudillo_core::app::App;
 use cloudillo_types::meta_adapter::{
 	ProfileConnectionStatus, UpdateActionDataOptions, UpdateProfileData,
 };
-use cloudillo_types::types::Patch;
 
 /// CONN on_create hook - Handle connection request creation
 ///
@@ -28,7 +26,7 @@ use cloudillo_types::types::Patch;
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: CONN on_create for action {}", context.action_id);
 
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 	let Some(audience) = &context.audience else {
 		tracing::warn!("CONN on_create: No audience specified");
 		return Ok(HookResult::default());
@@ -125,7 +123,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// - None: Check for mutual connection request, set status to 'N' (notification) or 'C' (confirmation)
 /// - DEL: Update profile, set status to 'N'
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 	let audience = context.audience.as_deref().unwrap_or("unknown");
 
 	match context.subtype.as_deref() {
@@ -396,7 +394,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::info!("CONN: Connection accepted from {}", context.issuer);
 
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 	// Create reverse CONN:ACC action to notify the sender
 	// The ACC subtype signals this is an acceptance, not a new request
@@ -423,7 +421,7 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 pub async fn on_reject(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::info!("CONN: Connection rejected from {}", context.issuer);
 
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 
 	let profile_update = UpdateProfileData {
 		following: Patch::Value(false),

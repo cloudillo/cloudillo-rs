@@ -3,6 +3,7 @@
 //! Tests for:
 //! 1. read_profile_key - Reading historical profile keys
 //! 2. VAPID key management - Reading and updating VAPID keys for push notifications
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 #[cfg(test)]
 mod tests {
@@ -103,7 +104,7 @@ mod tests {
 		match cross_tenant_result {
 			Ok(_) => println!("✅ Same key_id across tenants readable (created on same day)"),
 			Err(Error::NotFound) => println!("✅ Different key_id isolation works correctly"),
-			Err(_) => panic!("Unexpected error"),
+			Err(e) => panic!("Unexpected error: {e}"),
 		}
 	}
 

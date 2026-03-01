@@ -15,16 +15,16 @@ pub enum Priority {
 
 #[derive(Debug)]
 pub struct WorkerPool {
-	tx_high: Sender<Box<dyn FnOnce() + Send>>,
-	tx_med: Sender<Box<dyn FnOnce() + Send>>,
-	tx_low: Sender<Box<dyn FnOnce() + Send>>,
+	high: Sender<Box<dyn FnOnce() + Send>>,
+	med: Sender<Box<dyn FnOnce() + Send>>,
+	low: Sender<Box<dyn FnOnce() + Send>>,
 }
 
 impl WorkerPool {
 	pub fn new(n1: usize, n2: usize, n3: usize) -> Self {
-		let (tx_high, rx_high) = flume::unbounded();
-		let (tx_med, rx_med) = flume::unbounded();
-		let (tx_low, rx_low) = flume::unbounded();
+		let (high, rx_high) = flume::unbounded();
+		let (med, rx_med) = flume::unbounded();
+		let (low, rx_low) = flume::unbounded();
 
 		let rx_high = Arc::new(rx_high);
 		let rx_med = Arc::new(rx_med);
@@ -33,14 +33,14 @@ impl WorkerPool {
 		// Workers dedicated to High only
 		for _ in 0..n1 {
 			let rx_high = Arc::clone(&rx_high);
-			thread::spawn(move || worker_loop(vec![rx_high]));
+			thread::spawn(move || worker_loop(&[rx_high]));
 		}
 
 		// Workers for High + Medium
 		for _ in 0..n2 {
 			let rx_high = Arc::clone(&rx_high);
 			let rx_med = Arc::clone(&rx_med);
-			thread::spawn(move || worker_loop(vec![rx_high, rx_med]));
+			thread::spawn(move || worker_loop(&[rx_high, rx_med]));
 		}
 
 		// Workers for High + Medium + Low
@@ -48,10 +48,10 @@ impl WorkerPool {
 			let rx_high = Arc::clone(&rx_high);
 			let rx_med = Arc::clone(&rx_med);
 			let rx_low = Arc::clone(&rx_low);
-			thread::spawn(move || worker_loop(vec![rx_high, rx_med, rx_low]));
+			thread::spawn(move || worker_loop(&[rx_high, rx_med, rx_low]));
 		}
 
-		Self { tx_high, tx_med, tx_low }
+		Self { high, med, low }
 	}
 
 	/// Submit a closure with arguments → returns a Future for the result
@@ -73,17 +73,17 @@ impl WorkerPool {
 
 		match priority {
 			Priority::High => {
-				if self.tx_high.send(job).is_err() {
+				if self.high.send(job).is_err() {
 					error!("Failed to send job to high priority worker queue");
 				}
 			}
 			Priority::Medium => {
-				if self.tx_med.send(job).is_err() {
+				if self.med.send(job).is_err() {
 					error!("Failed to send job to medium priority worker queue");
 				}
 			}
 			Priority::Low => {
-				if self.tx_low.send(job).is_err() {
+				if self.low.send(job).is_err() {
 					error!("Failed to send job to low priority worker queue");
 				}
 			}
@@ -110,7 +110,7 @@ impl WorkerPool {
 			let _ignore = res_tx.send(result);
 		});
 
-		if self.tx_med.send(job).is_err() {
+		if self.med.send(job).is_err() {
 			error!("Failed to send job to medium priority worker queue");
 		}
 
@@ -134,7 +134,7 @@ impl WorkerPool {
 			let _ignore = res_tx.send(result);
 		});
 
-		if self.tx_high.send(job).is_err() {
+		if self.high.send(job).is_err() {
 			error!("Failed to send job to high priority worker queue");
 		}
 
@@ -159,7 +159,7 @@ impl WorkerPool {
 			let _ignore = res_tx.send(result);
 		});
 
-		if self.tx_low.send(job).is_err() {
+		if self.low.send(job).is_err() {
 			error!("Failed to send job to low priority worker queue");
 		}
 
@@ -205,12 +205,13 @@ impl WorkerPool {
 	}
 }
 
-#[allow(clippy::type_complexity)]
-fn worker_loop(queues: Vec<Arc<Receiver<Box<dyn FnOnce() + Send>>>>) {
+type JobQueue = Arc<Receiver<Box<dyn FnOnce() + Send>>>;
+
+fn worker_loop(queues: &[JobQueue]) {
 	loop {
 		// Try higher-priority queues first (non-blocking)
 		let mut job = None;
-		for rx in &queues {
+		for rx in queues {
 			if let Ok(j) = rx.try_recv() {
 				job = Some(j);
 				break;
@@ -226,7 +227,7 @@ fn worker_loop(queues: Vec<Arc<Receiver<Box<dyn FnOnce() + Send>>>>) {
 
 		// Wait for next job
 		let mut selector = flume::Selector::new();
-		for rx in &queues {
+		for rx in queues {
 			selector = selector.recv(rx, |res| res);
 		}
 

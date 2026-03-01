@@ -25,7 +25,7 @@ pub async fn list(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<PushSubscription
 			.map_err(|e| Error::Internal(format!("Invalid subscription JSON: {}", e)))?;
 
 		subscriptions.push(PushSubscription {
-			id: row.get::<i64, _>("subs_id") as u64,
+			id: u64::try_from(row.get::<i64, _>("subs_id")).unwrap_or_default(),
 			subscription: subscription_data,
 			created_at: Timestamp(row.get::<i64, _>("created_at")),
 		});
@@ -53,14 +53,14 @@ pub async fn create(
 	.await
 	.or(Err(Error::DbError))?;
 
-	Ok(result.last_insert_rowid() as u64)
+	Ok(u64::try_from(result.last_insert_rowid()).unwrap_or_default())
 }
 
 /// Delete a push subscription by ID
 pub async fn delete(db: &SqlitePool, tn_id: TnId, subscription_id: u64) -> ClResult<()> {
 	sqlx::query("DELETE FROM subscriptions WHERE tn_id = ? AND subs_id = ?")
 		.bind(tn_id.0)
-		.bind(subscription_id as i64)
+		.bind(subscription_id.cast_signed())
 		.execute(db)
 		.await
 		.or(Err(Error::DbError))?;

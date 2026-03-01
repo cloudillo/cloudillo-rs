@@ -6,9 +6,7 @@
 
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use cloudillo_core::app::App;
 use cloudillo_types::meta_adapter::UpdateActionDataOptions;
-use cloudillo_types::types::Patch;
 
 /// CMNT on_create hook - Handle local comment creation
 ///
@@ -18,7 +16,7 @@ use cloudillo_types::types::Patch;
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: CMNT on_create for action {}", context.action_id);
 
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 	let Some(parent_id) = &context.parent else {
 		tracing::warn!("CMNT on_create: No parent specified");
 		return Ok(HookResult::default());
@@ -28,21 +26,14 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	let parent_data = app.meta_adapter.get_action_data(tn_id, parent_id).await?;
 	let current_comments = parent_data.as_ref().and_then(|d| d.comments).unwrap_or(0);
 
-	let new_comments = match context.subtype.as_deref() {
-		Some("DEL") => {
-			// Delete comment: decrement (minimum 0)
-			tracing::info!(
-				"CMNT:DEL on_create: {} deleting comment on {}",
-				context.issuer,
-				parent_id
-			);
-			current_comments.saturating_sub(1)
-		}
-		_ => {
-			// Add comment: increment
-			tracing::info!("CMNT on_create: {} commenting on {}", context.issuer, parent_id);
-			current_comments.saturating_add(1)
-		}
+	let new_comments = if let Some("DEL") = context.subtype.as_deref() {
+		// Delete comment: decrement (minimum 0)
+		tracing::info!("CMNT:DEL on_create: {} deleting comment on {}", context.issuer, parent_id);
+		current_comments.saturating_sub(1)
+	} else {
+		// Add comment: increment
+		tracing::info!("CMNT on_create: {} commenting on {}", context.issuer, parent_id);
+		current_comments.saturating_add(1)
 	};
 
 	// Update parent action's comment count
@@ -71,7 +62,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: CMNT on_receive for action {}", context.action_id);
 
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 	let Some(parent_id) = &context.parent else {
 		tracing::warn!("CMNT on_receive: No parent specified");
 		return Ok(HookResult::default());
@@ -98,25 +89,22 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 	let parent_data = app.meta_adapter.get_action_data(tn_id, parent_id).await?;
 	let current_comments = parent_data.as_ref().and_then(|d| d.comments).unwrap_or(0);
 
-	let new_comments = match context.subtype.as_deref() {
-		Some("DEL") => {
-			// Delete comment: decrement (minimum 0)
-			tracing::info!(
-				"CMNT:DEL on_receive: {} deleting comment on our action {}",
-				context.issuer,
-				parent_id
-			);
-			current_comments.saturating_sub(1)
-		}
-		_ => {
-			// Add comment: increment
-			tracing::info!(
-				"CMNT on_receive: {} commenting on our action {}",
-				context.issuer,
-				parent_id
-			);
-			current_comments.saturating_add(1)
-		}
+	let new_comments = if let Some("DEL") = context.subtype.as_deref() {
+		// Delete comment: decrement (minimum 0)
+		tracing::info!(
+			"CMNT:DEL on_receive: {} deleting comment on our action {}",
+			context.issuer,
+			parent_id
+		);
+		current_comments.saturating_sub(1)
+	} else {
+		// Add comment: increment
+		tracing::info!(
+			"CMNT on_receive: {} commenting on our action {}",
+			context.issuer,
+			parent_id
+		);
+		current_comments.saturating_add(1)
 	};
 
 	// Update parent action's comment count

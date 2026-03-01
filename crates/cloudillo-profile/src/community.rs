@@ -28,6 +28,11 @@ pub async fn put_community_profile(
 	Path(id_tag): Path<String>,
 	Json(req): Json<CreateCommunityRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CommunityProfileResponse>>)> {
+	#[derive(serde::Serialize)]
+	struct InboxRequest {
+		token: String,
+	}
+
 	let id_tag_lower = id_tag.to_lowercase();
 	let creator_id_tag = &auth.id_tag;
 	let creator_tn_id = auth.tn_id;
@@ -87,7 +92,7 @@ pub async fn put_community_profile(
 		let address = if app.opts.local_address.is_empty() {
 			None
 		} else {
-			Some(app.opts.local_address.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(","))
+			Some(app.opts.local_address.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(","))
 		};
 
 		let reg_content = IdpRegContent {
@@ -116,11 +121,6 @@ pub async fn put_community_profile(
 
 		// Generate and send token to IDP
 		let action_token = app.auth_adapter.create_action_token(TnId(1), action).await?;
-
-		#[derive(serde::Serialize)]
-		struct InboxRequest {
-			token: String,
-		}
 
 		info!(
 			community = %id_tag_lower,

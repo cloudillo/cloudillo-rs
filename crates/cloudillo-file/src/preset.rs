@@ -15,11 +15,11 @@ pub struct FilePreset {
 	pub name: String,
 	/// Allowed media classes for upload (e.g., [Visual, Video, Audio])
 	pub allowed_media_classes: Vec<VariantClass>,
-	/// Image/visual variants to generate (e.g., ["vis.tn", "vis.sd", "vis.md", "vis.hd"])
+	/// Image/visual variants to generate (e.g., `["vis.tn", "vis.sd", "vis.md", "vis.hd"]`)
 	pub image_variants: Vec<String>,
-	/// Video variants to generate (e.g., ["vid.sd", "vid.md", "vid.hd"])
+	/// Video variants to generate (e.g., `["vid.sd", "vid.md", "vid.hd"]`)
 	pub video_variants: Vec<String>,
-	/// Audio variants to generate (e.g., ["aud.md"])
+	/// Audio variants to generate (e.g., `["aud.md"]`)
 	pub audio_variants: Vec<String>,
 	/// Extract audio track from video files
 	pub extract_audio: bool,
@@ -276,7 +276,7 @@ pub struct ImageQualityTier {
 	pub format: Option<ImageFormat>,
 }
 
-/// Video quality tiers
+/// Video quality tiers: sd=720p, md=1280p, hd=1080p, xd=4K. Bitrates in kbps.
 pub const VIDEO_TIERS: &[VideoQualityTier] = &[
 	VideoQualityTier { name: "vid.sd", max_dim: 720, bitrate: 1500 },
 	VideoQualityTier { name: "vid.md", max_dim: 1280, bitrate: 3000 },
@@ -284,14 +284,15 @@ pub const VIDEO_TIERS: &[VideoQualityTier] = &[
 	VideoQualityTier { name: "vid.xd", max_dim: 3840, bitrate: 15000 },
 ];
 
-/// Audio quality tiers
+/// Audio quality tiers: sd=64kbps, md=128kbps, hd=256kbps.
 pub const AUDIO_TIERS: &[AudioQualityTier] = &[
 	AudioQualityTier { name: "aud.sd", bitrate: 64 },
 	AudioQualityTier { name: "aud.md", bitrate: 128 },
 	AudioQualityTier { name: "aud.hd", bitrate: 256 },
 ];
 
-/// Image quality tiers
+/// Image quality tiers: pf=80px profile icon (always AVIF), tn=256px thumbnail,
+/// sd/md/hd/xd scale from 720px to 4K. Format follows settings unless overridden.
 pub const IMAGE_TIERS: &[ImageQualityTier] = &[
 	ImageQualityTier { name: "vis.pf", max_dim: 80, format: Some(ImageFormat::Avif) },
 	ImageQualityTier { name: "vis.tn", max_dim: 256, format: None },

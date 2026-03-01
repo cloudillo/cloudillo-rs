@@ -74,27 +74,21 @@ impl Task<App> for ActionDeliveryTask {
 		// Fetch action from database
 		let action = app.meta_adapter.get_action(self.tn_id, &self.action_id).await?;
 
-		let _action = match action {
-			Some(a) => a,
-			None => {
-				// Action was deleted, mark delivery task as complete
-				warn!("Action {} not found for delivery task, marking as complete", self.action_id);
-				return Ok(());
-			}
+		let Some(_action) = action else {
+			// Action was deleted, mark delivery task as complete
+			warn!("Action {} not found for delivery task, marking as complete", self.action_id);
+			return Ok(());
 		};
 
 		// Get action token
 		let action_token = app.meta_adapter.get_action_token(self.tn_id, &self.action_id).await?;
 
-		let action_token = match action_token {
-			Some(token) => token,
-			None => {
-				error!("No action token found for action {}", self.action_id);
-				return Err(Error::Internal(format!(
-					"action token not found for action {}",
-					self.action_id
-				)));
-			}
+		let Some(action_token) = action_token else {
+			error!("No action token found for action {}", self.action_id);
+			return Err(Error::Internal(format!(
+				"action token not found for action {}",
+				self.action_id
+			)));
 		};
 
 		// Prepare inbox request payload

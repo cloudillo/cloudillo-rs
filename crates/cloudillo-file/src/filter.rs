@@ -1,7 +1,7 @@
 //! Visibility filtering for files
 
 use crate::prelude::*;
-use cloudillo_core::abac::can_view_item;
+use cloudillo_core::abac::{can_view_item, ViewCheckContext};
 use cloudillo_core::file_access;
 use cloudillo_types::meta_adapter::FileView;
 use cloudillo_types::types::AccessLevel;
@@ -44,16 +44,16 @@ pub async fn filter_files_by_visibility(
 				.unwrap_or(tenant_id_tag);
 
 			// Files don't have audience, so pass None
-			can_view_item(
+			can_view_item(&ViewCheckContext {
 				subject_id_tag,
 				is_authenticated,
-				owner_tag,
+				item_owner_id_tag: owner_tag,
 				tenant_id_tag,
-				file.visibility,
-				following,
-				connected,
-				None,
-			)
+				visibility: file.visibility,
+				subject_following_owner: following,
+				subject_connected_to_owner: connected,
+				audience_tags: None,
+			})
 		})
 		.collect();
 

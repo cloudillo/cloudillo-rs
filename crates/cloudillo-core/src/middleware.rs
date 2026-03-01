@@ -365,8 +365,7 @@ pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Respon
 		.headers()
 		.get("X-Request-ID")
 		.and_then(|h| h.to_str().ok())
-		.map(|s| s.to_string())
-		.unwrap_or_else(|| format!("req_{}", random_id().unwrap_or_default()));
+		.map_or_else(|| format!("req_{}", random_id().unwrap_or_default()), ToString::to_string);
 
 	// Store in extensions for handlers to access
 	req.extensions_mut().insert(RequestId(request_id.clone()));

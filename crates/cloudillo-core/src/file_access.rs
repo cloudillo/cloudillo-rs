@@ -74,7 +74,7 @@ pub async fn get_access_level(
 			// Check if action is FSHR type and active
 			if action.typ.as_ref() == "FSHR" {
 				// WRITE subtype grants write access, others grant read
-				if action.sub_typ.as_ref().map(|s| s.as_ref()) == Some("WRITE") {
+				if action.sub_typ.as_ref().map(AsRef::as_ref) == Some("WRITE") {
 					AccessLevel::Write
 				} else {
 					AccessLevel::Read
@@ -83,8 +83,7 @@ pub async fn get_access_level(
 				AccessLevel::None
 			}
 		}
-		Ok(None) => AccessLevel::None,
-		Err(_) => AccessLevel::None,
+		Ok(None) | Err(_) => AccessLevel::None,
 	}
 }
 

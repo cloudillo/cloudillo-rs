@@ -5,9 +5,6 @@
 //! separate crate allows adapter crates to compile in parallel with the
 //! server's feature modules.
 
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
-
 pub mod abac;
 pub mod action_types;
 pub mod address;

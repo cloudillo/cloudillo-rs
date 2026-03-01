@@ -26,6 +26,9 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
+	// Current schema version - update this when adding new migrations
+	const CURRENT_DB_VERSION: i64 = 9;
+
 	let mut tx = db.begin().await?;
 
 	// Create vars table first (needed for version tracking)
@@ -42,9 +45,6 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.await?;
 
 	let mut version = get_db_version(&mut tx).await;
-
-	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 9;
 
 	// Schema creation - safe to run every time (uses IF NOT EXISTS)
 	// New tables, indexes, triggers are added here

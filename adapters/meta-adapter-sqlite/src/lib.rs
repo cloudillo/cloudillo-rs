@@ -19,7 +19,18 @@ use sqlx::{
 };
 use tokio::fs;
 
-use cloudillo_types::{meta_adapter::*, prelude::*, worker::WorkerPool};
+use cloudillo_types::{
+	meta_adapter::{
+		Action, ActionData, ActionId, ActionView, CreateFile, CreateOutboundActionOptions,
+		CreateRefOptions, FileId, FileUserData, FileVariant, FileView, FinalizeActionOptions,
+		ListActionOptions, ListFileOptions, ListProfileOptions, ListRefsOptions, ListTaskOptions,
+		ListTenantsMetaOptions, MetaAdapter, Profile, ProfileData, PushSubscription,
+		PushSubscriptionData, ReactionData, RefData, Task, TaskPatch, Tenant, TenantListMeta,
+		UpdateActionDataOptions, UpdateFileOptions, UpdateProfileData, UpdateTenantData,
+	},
+	prelude::*,
+	worker::WorkerPool,
+};
 
 #[derive(Debug)]
 pub struct MetaAdapterSqlite {
@@ -32,7 +43,9 @@ pub struct MetaAdapterSqlite {
 impl MetaAdapterSqlite {
 	pub async fn new(worker: Arc<WorkerPool>, path: impl AsRef<Path>) -> ClResult<Self> {
 		let db_path = path.as_ref().join("meta.db");
-		fs::create_dir_all(&path).await.expect("Cannot create meta-adapter dir");
+		fs::create_dir_all(&path)
+			.await
+			.map_err(|_| Error::Internal("Cannot create meta-adapter dir".into()))?;
 		let opts = sqlite::SqliteConnectOptions::new()
 			.filename(&db_path)
 			.create_if_missing(true)
@@ -68,12 +81,12 @@ impl MetaAdapterSqlite {
 			.map(|row| row.get::<&str, _>(0))
 			.rfind(|s| s.starts_with("MAX_ATTACHED="))
 			.unwrap_or("")
-			.split("=")
-			.last();
+			.split('=')
+			.next_back();
 		println!("MAX_ATTACHED: {:?}", max_attached);
 		//println!("PRAGMA compile_options: {:#?}", res.iter().map(|row| row.get::<&str, _>(0)).filter(|s| s.starts_with("MAX_ATTACHED=")).collect::<Vec<_>>());
 
-		Ok(Self { worker, db, dbr })
+		Ok(Self { db, dbr, worker })
 	}
 }
 
@@ -170,7 +183,7 @@ impl MetaAdapter for MetaAdapterSqlite {
 		&self,
 		callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>,
 	) {
-		profile::process_refresh(&self.dbr, callback).await
+		profile::process_refresh(&self.dbr, callback).await;
 	}
 
 	async fn list_stale_profiles(

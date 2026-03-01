@@ -83,7 +83,7 @@ impl Request {
 			.await
 			.map_err(|_| Error::Timeout)?
 			.map_err(|_| Error::NetworkError("body collection error".into()))
-			.map(|collected| collected.to_bytes())
+			.map(http_body_util::Collected::to_bytes)
 	}
 
 	pub async fn create_proxy_token(
@@ -113,7 +113,7 @@ impl Request {
 				if let Some(subject) = subject {
 					format!("&subject={}", subject)
 				} else {
-					"".into()
+					String::new()
 				}
 			))
 			.body(to_boxed(Empty::new()))?;

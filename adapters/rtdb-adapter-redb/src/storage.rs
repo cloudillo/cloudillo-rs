@@ -49,26 +49,22 @@ pub fn values_to_index_strings(value: &Value) -> Vec<String> {
 pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 	// Equality checks
 	for (field, expected) in &filter.equals {
-		match doc.get(field) {
-			Some(actual) if actual == expected => continue,
-			_ => return false,
+		if doc.get(field) != Some(expected) {
+			return false;
 		}
 	}
 
 	// Not-equal checks (missing fields are inherently "not equal")
 	for (field, expected) in &filter.not_equals {
-		match doc.get(field) {
-			Some(actual) if actual == expected => return false,
-			_ => continue,
+		if doc.get(field) == Some(expected) {
+			return false;
 		}
 	}
 
 	// Greater-than checks
 	for (field, threshold) in &filter.greater_than {
 		match doc.get(field) {
-			Some(actual) if compare_values(Some(actual), Some(threshold)) == Ordering::Greater => {
-				continue
-			}
+			Some(actual) if compare_values(Some(actual), Some(threshold)) == Ordering::Greater => {}
 			_ => return false,
 		}
 	}
@@ -78,10 +74,9 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 		match doc.get(field) {
 			Some(actual) => {
 				let ord = compare_values(Some(actual), Some(threshold));
-				if ord == Ordering::Greater || ord == Ordering::Equal {
-					continue;
+				if ord != Ordering::Greater && ord != Ordering::Equal {
+					return false;
 				}
-				return false;
 			}
 			_ => return false,
 		}
@@ -90,9 +85,7 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 	// Less-than checks
 	for (field, threshold) in &filter.less_than {
 		match doc.get(field) {
-			Some(actual) if compare_values(Some(actual), Some(threshold)) == Ordering::Less => {
-				continue
-			}
+			Some(actual) if compare_values(Some(actual), Some(threshold)) == Ordering::Less => {}
 			_ => return false,
 		}
 	}
@@ -102,10 +95,9 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 		match doc.get(field) {
 			Some(actual) => {
 				let ord = compare_values(Some(actual), Some(threshold));
-				if ord == Ordering::Less || ord == Ordering::Equal {
-					continue;
+				if ord != Ordering::Less && ord != Ordering::Equal {
+					return false;
 				}
-				return false;
 			}
 			_ => return false,
 		}
@@ -114,7 +106,7 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 	// In-array checks (field value must be in the provided array)
 	for (field, allowed_values) in &filter.in_array {
 		match doc.get(field) {
-			Some(actual) if allowed_values.contains(actual) => continue,
+			Some(actual) if allowed_values.contains(actual) => {}
 			_ => return false,
 		}
 	}
@@ -122,23 +114,24 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 	// Array-contains checks (field must be an array containing the value)
 	for (field, required_value) in &filter.array_contains {
 		match doc.get(field) {
-			Some(Value::Array(arr)) if arr.contains(required_value) => continue,
+			Some(Value::Array(arr)) if arr.contains(required_value) => {}
 			_ => return false,
 		}
 	}
 
 	// Not-in-array checks (field value must NOT be in the provided array; missing fields pass)
 	for (field, excluded_values) in &filter.not_in_array {
-		match doc.get(field) {
-			Some(actual) if excluded_values.contains(actual) => return false,
-			_ => continue,
+		if let Some(actual) = doc.get(field) {
+			if excluded_values.contains(actual) {
+				return false;
+			}
 		}
 	}
 
 	// Array-contains-any checks (field must be an array containing at least one of the values)
 	for (field, candidate_values) in &filter.array_contains_any {
 		match doc.get(field) {
-			Some(Value::Array(arr)) if candidate_values.iter().any(|v| arr.contains(v)) => continue,
+			Some(Value::Array(arr)) if candidate_values.iter().any(|v| arr.contains(v)) => {}
 			_ => return false,
 		}
 	}
@@ -146,7 +139,7 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 	// Array-contains-all checks (field must be an array containing all of the values)
 	for (field, required_values) in &filter.array_contains_all {
 		match doc.get(field) {
-			Some(Value::Array(arr)) if required_values.iter().all(|v| arr.contains(v)) => continue,
+			Some(Value::Array(arr)) if required_values.iter().all(|v| arr.contains(v)) => {}
 			_ => return false,
 		}
 	}

@@ -53,8 +53,10 @@ impl PenaltyReason {
 	/// Get the default ban duration for this reason
 	pub fn ban_duration(&self) -> Duration {
 		match self {
-			PenaltyReason::AuthFailure => Duration::from_secs(3600), // 1 hour
-			PenaltyReason::TokenVerificationFailure => Duration::from_secs(3600), // 1 hour
+			// 1 hour
+			PenaltyReason::AuthFailure | PenaltyReason::TokenVerificationFailure => {
+				Duration::from_secs(3600)
+			}
 			PenaltyReason::SuspiciousActivity => Duration::from_secs(7200), // 2 hours
 			PenaltyReason::RepeatedViolation => Duration::from_secs(86400), // 24 hours
 		}
@@ -78,10 +80,11 @@ impl PowPenaltyReason {
 	/// Whether this reason should affect network-level counter too
 	pub fn affects_network(&self) -> bool {
 		match self {
-			PowPenaltyReason::ConnSignatureFailure => true,
-			PowPenaltyReason::ConnDuplicatePending => true,
 			PowPenaltyReason::ConnRejected => false, // Individual only
-			PowPenaltyReason::ConnPowCheckFailed => true, // Repeated PoW failures affect network
+			// Network-affecting reasons
+			PowPenaltyReason::ConnSignatureFailure
+			| PowPenaltyReason::ConnDuplicatePending
+			| PowPenaltyReason::ConnPowCheckFailed => true,
 		}
 	}
 }

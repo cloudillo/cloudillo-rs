@@ -240,15 +240,15 @@ async fn process_inbound_action_token_inner(
 	let (_definition_type, definition) = resolve_definition(app, &action.t)?;
 
 	// 4. Check permissions (skip for pre-approved related actions)
-	if !skip_permission_check {
-		check_inbound_permissions(app, tn_id, &action, definition).await?;
-	} else {
+	if skip_permission_check {
 		debug!(
 			action_id = %action_id,
 			action_type = %action.t,
 			issuer = %action.iss,
 			"Skipping permission check for pre-approved related action"
 		);
+	} else {
+		check_inbound_permissions(app, tn_id, &action, definition).await?;
 	}
 
 	// 5. Check subscription-based permissions (skip for pre-approved related actions)
@@ -308,14 +308,16 @@ async fn process_inbound_action_token_inner(
 	// 6. Store action in database
 	store_inbound_action(
 		app,
-		tn_id,
-		action_id,
-		token,
-		&action,
-		definition,
-		is_conn_action,
-		client_ip.as_ref(),
-		resolved_visibility,
+		&InboundActionContext {
+			tn_id,
+			action_id,
+			token,
+			action: &action,
+			definition,
+			is_conn_action,
+			client_ip: client_ip.as_ref(),
+			visibility: resolved_visibility,
+		},
 	)
 	.await;
 
@@ -329,7 +331,7 @@ async fn process_inbound_action_token_inner(
 
 	// 8. Unified post-store processing (hooks, WebSocket, fanout, auto-approve)
 	let (action_type, sub_type) = helpers::extract_type_and_subtype(&action.t);
-	let content_str = helpers::serialize_content(action.c.as_ref()).map(|s| s.into_boxed_str());
+	let content_str = helpers::serialize_content(action.c.as_ref()).map(String::into_boxed_str);
 	let root_id =
 		helpers::resolve_root_id(app.meta_adapter.as_ref(), tn_id, action.p.as_deref()).await;
 
@@ -337,7 +339,7 @@ async fn process_inbound_action_token_inner(
 	let action_for_processing = meta_adapter::Action {
 		action_id: action_id.into(),
 		typ: action_type.into_boxed_str(),
-		sub_typ: sub_type.map(|s| s.into_boxed_str()),
+		sub_typ: sub_type.map(String::into_boxed_str),
 		issuer_tag: action.iss.clone(),
 		parent_id: action.p.clone(),
 		root_id,
@@ -437,7 +439,7 @@ fn resolve_definition<'a>(
 	}
 
 	// Try base type (before colon)
-	let base_type = action_type.find(':').map(|pos| &action_type[..pos]).unwrap_or(action_type);
+	let base_type = action_type.find(':').map_or(action_type, |pos| &action_type[..pos]);
 	if let Some(def) = dsl.get_definition(base_type) {
 		return Ok((base_type, def));
 	}
@@ -465,14 +467,13 @@ async fn check_inbound_permissions(
 	debug!(
 		"  profile: {} following={} connected={}",
 		action.iss,
-		issuer_profile.as_ref().map(|p| p.following).unwrap_or(false),
-		issuer_profile.as_ref().map(|p| p.connected.is_connected()).unwrap_or(false)
+		issuer_profile.as_ref().is_some_and(|p| p.following),
+		issuer_profile.as_ref().is_some_and(|p| p.connected.is_connected())
 	);
 
 	let allowed = issuer_profile
 		.as_ref()
-		.map(|p| p.following || p.connected.is_connected())
-		.unwrap_or(false);
+		.is_some_and(|p| p.following || p.connected.is_connected());
 
 	if !allowed {
 		warn!(
@@ -663,23 +664,25 @@ async fn check_inbound_flags(
 	Ok(())
 }
 
-/// Store inbound action in database
-#[allow(clippy::too_many_arguments)]
-async fn store_inbound_action(
-	app: &App,
+/// Context for storing an inbound action
+struct InboundActionContext<'a> {
 	tn_id: TnId,
-	action_id: &str,
-	token: &str,
-	action: &ActionToken,
-	definition: &crate::dsl::types::ActionDefinition,
+	action_id: &'a str,
+	token: &'a str,
+	action: &'a ActionToken,
+	definition: &'a crate::dsl::types::ActionDefinition,
 	is_conn_action: bool,
-	client_ip: Option<&IpAddr>,
+	client_ip: Option<&'a IpAddr>,
 	visibility: Option<char>,
-) {
+}
+
+/// Store inbound action in database
+async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) {
+	let action = ctx.action;
 	let (action_type, sub_type) = helpers::extract_type_and_subtype(&action.t);
 	let sub_type_ref = sub_type.as_deref();
 
-	let key = definition.key_pattern.as_deref().map(|pattern| {
+	let key = ctx.definition.key_pattern.as_deref().map(|pattern| {
 		helpers::apply_key_pattern(
 			pattern,
 			&action_type,
@@ -694,10 +697,10 @@ async fn store_inbound_action(
 
 	// Resolve root_id from parent chain (not just parent_id)
 	let root_id =
-		helpers::resolve_root_id(app.meta_adapter.as_ref(), tn_id, action.p.as_deref()).await;
+		helpers::resolve_root_id(app.meta_adapter.as_ref(), ctx.tn_id, action.p.as_deref()).await;
 
 	let inbound_action = meta_adapter::Action {
-		action_id,
+		action_id: ctx.action_id,
 		typ: &action_type,
 		sub_typ: sub_type_ref,
 		issuer_tag: &action.iss,
@@ -705,31 +708,33 @@ async fn store_inbound_action(
 		root_id: root_id.as_deref(),
 		audience_tag: action.aud.as_deref(),
 		content: content_str.as_deref(),
-		attachments: action.a.as_ref().map(|v| v.iter().map(|s| s.as_ref()).collect()),
+		attachments: action.a.as_ref().map(|v| v.iter().map(AsRef::as_ref).collect()),
 		subject: action.sub.as_deref(),
 		created_at: action.iat,
 		expires_at: action.exp,
-		visibility,
+		visibility: ctx.visibility,
 		flags: action.f.as_deref(),
 		x: None,
 	};
 
-	match app.meta_adapter.create_action(tn_id, &inbound_action, key.as_deref()).await {
+	match app.meta_adapter.create_action(ctx.tn_id, &inbound_action, key.as_deref()).await {
 		Ok(_) => {
-			info!("← STORED: {}", action_id);
+			info!("← STORED: {}", ctx.action_id);
 			let update_opts = meta_adapter::UpdateActionDataOptions {
 				status: cloudillo_types::types::Patch::Value('A'),
 				..Default::default()
 			};
-			if let Err(e) =
-				app.meta_adapter.update_action_data(tn_id, action_id, &update_opts).await
+			if let Err(e) = app
+				.meta_adapter
+				.update_action_data(ctx.tn_id, ctx.action_id, &update_opts)
+				.await
 			{
 				warn!("  failed to set inbound action status to active: {}", e);
 			}
 		}
 		Err(e) => {
-			if is_conn_action {
-				if let Some(ip) = client_ip {
+			if ctx.is_conn_action {
+				if let Some(ip) = ctx.client_ip {
 					if let Err(pen_err) = app
 						.rate_limiter
 						.increment_pow_counter(ip, PowPenaltyReason::ConnDuplicatePending)
@@ -743,7 +748,11 @@ async fn store_inbound_action(
 		}
 	}
 
-	if let Err(e) = app.meta_adapter.create_inbound_action(tn_id, action_id, token, None).await {
+	if let Err(e) = app
+		.meta_adapter
+		.create_inbound_action(ctx.tn_id, ctx.action_id, ctx.token, None)
+		.await
+	{
 		debug!("  failed to store inbound action token: {} (may be duplicate)", e);
 	}
 }
@@ -796,7 +805,6 @@ async fn forward_inbound_action_to_websocket(
 	action: &cloudillo_types::auth_adapter::ActionToken,
 ) {
 	use crate::forward::{self, ForwardActionParams};
-	use cloudillo_types::meta_adapter::AttachmentView;
 
 	let (action_type, subtype) = helpers::extract_type_and_subtype(&action.t);
 
@@ -943,9 +951,9 @@ async fn send_push_notification(
 /// This verifies and stores them (skipping permission checks as they're pre-approved).
 async fn process_related_actions(app: &App, tn_id: TnId, action_id: &str) {
 	// Get related action tokens that were waiting for this action
-	let related_tokens = match app.meta_adapter.get_related_action_tokens(tn_id, action_id).await {
-		Ok(tokens) => tokens,
-		Err(_) => return,
+	let Ok(related_tokens) = app.meta_adapter.get_related_action_tokens(tn_id, action_id).await
+	else {
+		return;
 	};
 
 	if related_tokens.is_empty() {

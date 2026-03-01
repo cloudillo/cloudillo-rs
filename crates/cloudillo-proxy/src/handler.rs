@@ -30,8 +30,7 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 	headers
 		.get(header::UPGRADE)
 		.and_then(|v| v.to_str().ok())
-		.map(|v| v.eq_ignore_ascii_case("websocket"))
-		.unwrap_or(false)
+		.is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
 }
 
 /// Build the backend URI from the proxy site entry and the original request URI
@@ -49,7 +48,7 @@ fn build_backend_uri(entry: &ProxySiteEntry, original_uri: &Uri) -> ClResult<Uri
 
 /// Copy non-hop-by-hop headers from source to destination
 fn copy_headers(src: &HeaderMap, dst: &mut HeaderMap, is_websocket: bool) {
-	for (name, value) in src.iter() {
+	for (name, value) in src {
 		// Skip hop-by-hop headers (but keep Upgrade for WebSocket)
 		if is_hop_by_hop(name) {
 			if is_websocket && name == header::UPGRADE {
@@ -145,8 +144,8 @@ pub async fn handle_proxy_request(
 
 	// Set up timeouts
 	let connect_timeout =
-		Duration::from_secs(entry.config.connect_timeout_secs.unwrap_or(5) as u64);
-	let read_timeout = Duration::from_secs(entry.config.read_timeout_secs.unwrap_or(30) as u64);
+		Duration::from_secs(u64::from(entry.config.connect_timeout_secs.unwrap_or(5)));
+	let read_timeout = Duration::from_secs(u64::from(entry.config.read_timeout_secs.unwrap_or(30)));
 
 	// Send the request to the backend
 	let scheme = entry.backend_url.scheme();
@@ -187,7 +186,7 @@ async fn handle_websocket_proxy(
 
 	let mut backend_headers = HeaderMap::new();
 	// Copy all headers including WebSocket-specific ones
-	for (name, value) in req.headers().iter() {
+	for (name, value) in req.headers() {
 		if is_hop_by_hop(name) && name != header::UPGRADE {
 			continue;
 		}
@@ -243,7 +242,7 @@ async fn handle_websocket_proxy(
 
 	// Connect to backend
 	let connect_timeout =
-		Duration::from_secs(entry.config.connect_timeout_secs.unwrap_or(5) as u64);
+		Duration::from_secs(u64::from(entry.config.connect_timeout_secs.unwrap_or(5)));
 
 	let scheme = entry.backend_url.scheme();
 	match send_backend_request(scheme, connect_timeout, connect_timeout, backend_req).await {
@@ -294,6 +293,7 @@ async fn send_backend_request(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::ProxySiteConfig;
 
 	#[test]
 	fn test_is_hop_by_hop() {
@@ -311,7 +311,7 @@ mod tests {
 			domain: "test.example.com".into(),
 			proxy_type: "basic".into(),
 			backend_url: url::Url::parse("http://localhost:3000").unwrap(),
-			config: Default::default(),
+			config: ProxySiteConfig::default(),
 		};
 		let uri = "/api/test?foo=bar".parse::<Uri>().unwrap();
 		let result = build_backend_uri(&entry, &uri).unwrap();
@@ -325,7 +325,7 @@ mod tests {
 			domain: "test.example.com".into(),
 			proxy_type: "basic".into(),
 			backend_url: url::Url::parse("http://localhost:3000").unwrap(),
-			config: Default::default(),
+			config: ProxySiteConfig::default(),
 		};
 		let uri = "/".parse::<Uri>().unwrap();
 		let result = build_backend_uri(&entry, &uri).unwrap();
@@ -339,7 +339,7 @@ mod tests {
 			domain: "test.example.com".into(),
 			proxy_type: "basic".into(),
 			backend_url: url::Url::parse("http://backend:3000/a/").unwrap(),
-			config: Default::default(),
+			config: ProxySiteConfig::default(),
 		};
 
 		// Root request should preserve the base path

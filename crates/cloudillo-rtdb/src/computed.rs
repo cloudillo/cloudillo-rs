@@ -7,6 +7,12 @@ use crate::prelude::*;
 use cloudillo_types::rtdb_adapter::{QueryOptions, RtdbAdapter, Transaction};
 use serde_json::Value;
 
+/// Convert `usize` to `f64`, accepting minor precision loss for values above 2^53.
+#[allow(clippy::cast_precision_loss)]
+fn usize_to_f64(v: usize) -> f64 {
+	v as f64
+}
+
 /// Process computed values in data before writing to database
 ///
 /// Scans the data object for special computed value expressions and replaces them
@@ -92,17 +98,17 @@ async fn process_field_operation(
 
 	match op_type {
 		"increment" => {
-			let by = params.get("by").and_then(|v| v.as_i64()).unwrap_or(1);
+			let by = params.get("by").and_then(Value::as_i64).unwrap_or(1);
 			let current = current_value.as_i64().unwrap_or(0);
 			Ok(Value::Number((current + by).into()))
 		}
 		"decrement" => {
-			let by = params.get("by").and_then(|v| v.as_i64()).unwrap_or(1);
+			let by = params.get("by").and_then(Value::as_i64).unwrap_or(1);
 			let current = current_value.as_i64().unwrap_or(0);
 			Ok(Value::Number((current - by).into()))
 		}
 		"multiply" => {
-			let by = params.get("by").and_then(|v| v.as_i64()).unwrap_or(1);
+			let by = params.get("by").and_then(Value::as_i64).unwrap_or(1);
 			let current = current_value.as_i64().unwrap_or(0);
 			Ok(Value::Number((current * by).into()))
 		}
@@ -114,9 +120,7 @@ async fn process_field_operation(
 			Ok(Value::Array(arr))
 		}
 		"remove" => {
-			let mut arr = if let Value::Array(a) = current_value {
-				a
-			} else {
+			let Value::Array(mut arr) = current_value else {
 				return Ok(Value::Array(Vec::new()));
 			};
 			if let Some(Value::Array(values)) = params.get("values") {
@@ -137,12 +141,12 @@ async fn process_field_operation(
 			}
 		}
 		"min" => {
-			let new_val = params.get("value").and_then(|v| v.as_i64()).unwrap_or(0);
+			let new_val = params.get("value").and_then(Value::as_i64).unwrap_or(0);
 			let current = current_value.as_i64().unwrap_or(i64::MAX);
 			Ok(Value::Number(current.min(new_val).into()))
 		}
 		"max" => {
-			let new_val = params.get("value").and_then(|v| v.as_i64()).unwrap_or(0);
+			let new_val = params.get("value").and_then(Value::as_i64).unwrap_or(0);
 			let current = current_value.as_i64().unwrap_or(i64::MIN);
 			Ok(Value::Number(current.max(new_val).into()))
 		}
@@ -154,10 +158,13 @@ async fn process_field_operation(
 fn process_function(fn_name: &str, params: &serde_json::Map<String, Value>) -> ClResult<Value> {
 	match fn_name {
 		"now" => {
-			let timestamp = std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.map_err(|e| Error::Internal(format!("System time error: {}", e)))?
-				.as_millis() as u64;
+			let timestamp = u64::try_from(
+				std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.map_err(|e| Error::Internal(format!("System time error: {}", e)))?
+					.as_millis(),
+			)
+			.unwrap_or_default();
 			Ok(Value::Number(timestamp.into()))
 		}
 		"slugify" => {
@@ -248,7 +255,8 @@ async fn process_query_operation(
 		"count" => {
 			let opts = QueryOptions::new();
 			let results = adapter.query(tn_id, db_id, path, opts).await?;
-			Ok(Value::Number((results.len() as u64).into()))
+			let count = results.len() as u64;
+			Ok(Value::Number(count.into()))
 		}
 		"sum" => {
 			let field = params
@@ -258,7 +266,7 @@ async fn process_query_operation(
 			let opts = QueryOptions::new();
 			let results = adapter.query(tn_id, db_id, path, opts).await?;
 			let sum: f64 =
-				results.iter().filter_map(|doc| doc.get(field)).filter_map(|v| v.as_f64()).sum();
+				results.iter().filter_map(|doc| doc.get(field)).filter_map(Value::as_f64).sum();
 			Ok(serde_json::json!(sum))
 		}
 		"avg" => {
@@ -271,12 +279,12 @@ async fn process_query_operation(
 			let values: Vec<f64> = results
 				.iter()
 				.filter_map(|doc| doc.get(field))
-				.filter_map(|v| v.as_f64())
+				.filter_map(Value::as_f64)
 				.collect();
 			if values.is_empty() {
 				Ok(Value::Null)
 			} else {
-				let avg = values.iter().sum::<f64>() / values.len() as f64;
+				let avg = values.iter().sum::<f64>() / usize_to_f64(values.len());
 				Ok(serde_json::json!(avg))
 			}
 		}
@@ -290,9 +298,9 @@ async fn process_query_operation(
 			let min = results
 				.iter()
 				.filter_map(|doc| doc.get(field))
-				.filter_map(|v| v.as_f64())
+				.filter_map(Value::as_f64)
 				.min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-			Ok(min.map(|v| serde_json::json!(v)).unwrap_or(Value::Null))
+			Ok(min.map_or(Value::Null, |v| serde_json::json!(v)))
 		}
 		"max" => {
 			let field = params
@@ -304,9 +312,9 @@ async fn process_query_operation(
 			let max = results
 				.iter()
 				.filter_map(|doc| doc.get(field))
-				.filter_map(|v| v.as_f64())
+				.filter_map(Value::as_f64)
 				.max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-			Ok(max.map(|v| serde_json::json!(v)).unwrap_or(Value::Null))
+			Ok(max.map_or(Value::Null, |v| serde_json::json!(v)))
 		}
 		"exists" => {
 			let doc = adapter.get(tn_id, db_id, path).await?;

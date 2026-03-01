@@ -1,7 +1,6 @@
 //! Scheduler subsystem. Handles async tasks, dependencies, fallbacks, repetitions, persistence..
 
 use async_trait::async_trait;
-use flume;
 use itertools::Itertools;
 use std::{
 	collections::{BTreeMap, HashMap},
@@ -216,7 +215,7 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 				status: match t.status {
 					'P' => TaskStatus::Pending,
 					'F' => TaskStatus::Completed,
-					'E' => TaskStatus::Failed,
+					// 'E' or unknown status = Failed
 					_ => TaskStatus::Failed,
 				},
 				input: t.input,
@@ -250,7 +249,7 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 					status: match t.status {
 						'P' => TaskStatus::Pending,
 						'F' => TaskStatus::Completed,
-						'E' => TaskStatus::Failed,
+						// 'E' or unknown status = Failed
 						_ => TaskStatus::Failed,
 					},
 					input: t.input,
@@ -324,7 +323,7 @@ impl RetryPolicy {
 	/// Calculate exponential backoff in seconds: min * (2^attempt), capped at max
 	pub fn calculate_backoff(&self, attempt_count: u16) -> u64 {
 		let (min, max) = self.wait_min_max;
-		let backoff = min * (1u64 << attempt_count as u64);
+		let backoff = min * (1u64 << u64::from(attempt_count));
 		backoff.min(max)
 	}
 
@@ -473,7 +472,7 @@ impl<'a, S: Clone + Send + Sync + 'static> TaskSchedulerBuilder<'a, S> {
 	/// Execute the task with all configured options - main terminal method
 	pub async fn schedule(self) -> ClResult<TaskId> {
 		self.scheduler
-			._schedule_task(
+			.schedule_task_impl(
 				self.task,
 				self.key.as_deref(),
 				self.next_at,
@@ -495,16 +494,18 @@ pub struct TaskMeta<S: Clone> {
 	pub cron: Option<CronSchedule>,
 }
 
+type TaskBuilderRegistry<S> = HashMap<&'static str, Box<TaskBuilder<S>>>;
+type ScheduledTaskMap<S> = BTreeMap<(Timestamp, TaskId), TaskMeta<S>>;
+
 // Scheduler
-#[allow(clippy::type_complexity)]
 #[derive(Clone)]
 pub struct Scheduler<S: Clone> {
-	task_builders: Arc<RwLock<HashMap<&'static str, Box<TaskBuilder<S>>>>>,
+	task_builders: Arc<RwLock<TaskBuilderRegistry<S>>>,
 	store: Arc<dyn TaskStore<S>>,
 	tasks_running: Arc<Mutex<HashMap<TaskId, TaskMeta<S>>>>,
 	tasks_waiting: Arc<Mutex<HashMap<TaskId, TaskMeta<S>>>>,
 	task_dependents: Arc<Mutex<HashMap<TaskId, Vec<TaskId>>>>,
-	tasks_scheduled: Arc<Mutex<BTreeMap<(Timestamp, TaskId), TaskMeta<S>>>>,
+	tasks_scheduled: Arc<Mutex<ScheduledTaskMap<S>>>,
 	tx_finish: flume::Sender<TaskId>,
 	rx_finish: flume::Receiver<TaskId>,
 	notify_schedule: Arc<tokio::sync::Notify>,
@@ -612,7 +613,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					} else {
 						// One-time task - mark as finished
 						match schedule.store.finished(id, "").await {
-							Ok(_) => transition_ok = true,
+							Ok(()) => transition_ok = true,
 							Err(e) => {
 								error!(
 									"Failed to mark task {} as finished: {} - task remains in running queue",
@@ -715,9 +716,11 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 						break None;
 					}
 				} {
-					let wait = tokio::time::Duration::from_secs((timestamp.0 - time.0) as u64);
+					let diff = timestamp.0 - time.0;
+					let wait =
+						tokio::time::Duration::from_secs(u64::try_from(diff).unwrap_or_default());
 					tokio::select! {
-						_ = tokio::time::sleep(wait) => (), _ = schedule.notify_schedule.notified() => ()
+						() = tokio::time::sleep(wait) => (), () = schedule.notify_schedule.notified() => ()
 					};
 				}
 			}
@@ -755,7 +758,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 	/// Internal method to schedule a task with all options
 	/// This is the core implementation used by the builder pattern
-	async fn _schedule_task(
+	async fn schedule_task_impl(
 		&self,
 		task: Arc<dyn Task<S>>,
 		key: Option<&str>,
@@ -790,25 +793,24 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					// Ensure the existing task is queued (may be loaded from DB but not yet in queue)
 					self.add_queue(existing_id, task_meta).await?;
 					return Ok(existing_id);
-				} else {
-					info!(
-						"Updating recurring task '{}' (id={}) - parameters changed",
-						key, existing_id
-					);
-					info!("  Old params: {}", existing_serialized);
-					info!("  New params: {}", new_serialized);
-
-					// Remove from all queues (if present)
-					self.remove_from_queues(existing_id)?;
-
-					// Update the task in database with new parameters
-					self.store.update_task(existing_id, &task_meta).await?;
-
-					// Re-add to appropriate queue with updated parameters
-					self.add_queue(existing_id, task_meta).await?;
-
-					return Ok(existing_id);
 				}
+				info!(
+					"Updating recurring task '{}' (id={}) - parameters changed",
+					key, existing_id
+				);
+				info!("  Old params: {}", existing_serialized);
+				info!("  New params: {}", new_serialized);
+
+				// Remove from all queues (if present)
+				self.remove_from_queues(existing_id)?;
+
+				// Update the task in database with new parameters
+				self.store.update_task(existing_id, &task_meta).await?;
+
+				// Re-add to appropriate queue with updated parameters
+				self.add_queue(existing_id, task_meta).await?;
+
+				return Ok(existing_id);
 			}
 		}
 
@@ -1083,7 +1085,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					if let Some(retry_policy) = &task_meta.retry {
 						if retry_policy.should_retry(task_meta.retry_count) {
 							let backoff = retry_policy.calculate_backoff(task_meta.retry_count);
-							let next_at = Timestamp::from_now(backoff as i64);
+							let next_at = Timestamp::from_now(backoff.cast_signed());
 
 							info!(
 								"Task {} failed (attempt {}/{}). Scheduling retry in {} seconds: {}",
@@ -1157,22 +1159,16 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					// Check if all dependencies still exist
 					for dep in &task_meta.deps {
 						// Check if dependency is in any queue or dependents map
-						let dep_exists = self
-							.tasks_running
-							.lock()
-							.ok()
-							.map(|r| r.contains_key(dep))
-							.unwrap_or(false) || self
-							.tasks_waiting
-							.lock()
-							.ok()
-							.map(|w| w.contains_key(dep))
-							.unwrap_or(false) || self
-							.tasks_scheduled
-							.lock()
-							.ok()
-							.map(|s| s.iter().any(|((_, task_id), _)| task_id == dep))
-							.unwrap_or(false);
+						let dep_exists =
+							self.tasks_running.lock().ok().is_some_and(|r| r.contains_key(dep))
+								|| self
+									.tasks_waiting
+									.lock()
+									.ok()
+									.is_some_and(|w| w.contains_key(dep))
+								|| self.tasks_scheduled.lock().ok().is_some_and(|s| {
+									s.iter().any(|((_, task_id), _)| task_id == dep)
+								});
 
 						if !dep_exists {
 							tasks_with_missing_deps.push((*id, *dep));
@@ -1256,14 +1252,14 @@ mod tests {
 
 		async fn run(&self, state: &State) -> ClResult<()> {
 			info!("Running task {}", self.num);
-			tokio::time::sleep(std::time::Duration::from_millis(200 * self.num as u64)).await;
+			tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(self.num))).await;
 			info!("Completed task {}", self.num);
 			state.lock().unwrap().push(self.num);
 			Ok(())
 		}
 	}
 
-	#[derive(Debug, Serialize, Deserialize, Clone)]
+	#[derive(Debug, Clone)]
 	struct FailingTask {
 		id: u8,
 		fail_count: u8,
@@ -1355,7 +1351,7 @@ mod tests {
 
 		let st = state.lock().unwrap();
 		info!("res: {}", st.len());
-		let str_vec = st.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1:1:1");
 	}
 
@@ -1489,7 +1485,7 @@ mod tests {
 
 		let st = state.lock().unwrap();
 		// Should have all three tasks in execution order: 1 finishes first (200ms), then 2 (200ms), then 3 (200ms after both)
-		let str_vec = st.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1");
 	}
 
@@ -1568,7 +1564,7 @@ mod tests {
 
 		let st = state.lock().unwrap();
 		// Should have all tasks: 20:10 (immediate deps) then 30 (after deps)
-		let str_vec = st.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1");
 	}
 
@@ -1591,7 +1587,7 @@ mod tests {
 		let st = state.lock().unwrap();
 		// Both old and new API should have executed
 		assert_eq!(st.len(), 2);
-		let str_vec = st.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1");
 	}
 
@@ -1620,7 +1616,7 @@ mod tests {
 
 		let st = state.lock().unwrap();
 		// Should execute in order: 1, 2, 3
-		let str_vec = st.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1");
 	}
 
@@ -1649,7 +1645,7 @@ mod tests {
 
 		let st = state.lock().unwrap();
 		// 1 and 2 execute in parallel, then 3 executes after both
-		let str_vec = st.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1");
 	}
 
@@ -1687,7 +1683,7 @@ mod tests {
 
 		{
 			let st = state.lock().unwrap();
-			let str_vec = st.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+			let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 			assert_eq!(str_vec.join(":"), "1:1");
 		}
 	}
@@ -1732,7 +1728,7 @@ mod tests {
 
 		let st = state.lock().unwrap();
 		// All three tasks should execute
-		let str_vec = st.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1");
 	}
 
@@ -1783,7 +1779,7 @@ mod tests {
 
 		let st = state.lock().unwrap();
 		assert_eq!(st.len(), 3);
-		let str_vec = st.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		// All three tasks should execute
 		assert_eq!(str_vec.join(":"), "1:1:1");
 	}
@@ -1961,8 +1957,8 @@ mod tests {
 
 		// Verify task is NOT in tasks_scheduled (only in running)
 		{
-			let scheduled = scheduler.tasks_scheduled.lock().unwrap();
-			let in_scheduled = scheduled.iter().any(|((_, id), _)| *id == task_id);
+			let sched_queue = scheduler.tasks_scheduled.lock().unwrap();
+			let in_scheduled = sched_queue.iter().any(|((_, id), _)| *id == task_id);
 			assert!(!in_scheduled, "Task should NOT be in scheduled queue while running");
 		}
 

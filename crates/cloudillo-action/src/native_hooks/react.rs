@@ -9,9 +9,7 @@
 
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use cloudillo_core::app::App;
 use cloudillo_types::meta_adapter::UpdateActionDataOptions;
-use cloudillo_types::types::Patch;
 
 /// REACT on_create hook - Handle local reaction creation
 ///
@@ -21,7 +19,7 @@ use cloudillo_types::types::Patch;
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: REACT on_create for action {}", context.action_id);
 
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 	let Some(subject_id) = &context.subject else {
 		tracing::warn!("REACT on_create: No subject specified");
 		return Ok(HookResult::default());
@@ -31,26 +29,23 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	let subject_data = app.meta_adapter.get_action_data(tn_id, subject_id).await?;
 	let current_reactions = subject_data.as_ref().and_then(|d| d.reactions).unwrap_or(0);
 
-	let new_reactions = match context.subtype.as_deref() {
-		Some("DEL") => {
-			// Remove reaction: decrement (minimum 0)
-			tracing::info!(
-				"REACT:DEL on_create: {} removing reaction from {}",
-				context.issuer,
-				subject_id
-			);
-			current_reactions.saturating_sub(1)
-		}
-		_ => {
-			// Add reaction: increment
-			tracing::info!(
-				"REACT:{:?} on_create: {} reacting to {}",
-				context.subtype,
-				context.issuer,
-				subject_id
-			);
-			current_reactions.saturating_add(1)
-		}
+	let new_reactions = if let Some("DEL") = context.subtype.as_deref() {
+		// Remove reaction: decrement (minimum 0)
+		tracing::info!(
+			"REACT:DEL on_create: {} removing reaction from {}",
+			context.issuer,
+			subject_id
+		);
+		current_reactions.saturating_sub(1)
+	} else {
+		// Add reaction: increment
+		tracing::info!(
+			"REACT:{:?} on_create: {} reacting to {}",
+			context.subtype,
+			context.issuer,
+			subject_id
+		);
+		current_reactions.saturating_add(1)
 	};
 
 	// Update subject action's reaction count
@@ -79,7 +74,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: REACT on_receive for action {}", context.action_id);
 
-	let tn_id = TnId(context.tenant_id as u32);
+	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
 	let Some(subject_id) = &context.subject else {
 		tracing::warn!("REACT on_receive: No subject specified");
 		return Ok(HookResult::default());
@@ -106,26 +101,23 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 	let subject_data = app.meta_adapter.get_action_data(tn_id, subject_id).await?;
 	let current_reactions = subject_data.as_ref().and_then(|d| d.reactions).unwrap_or(0);
 
-	let new_reactions = match context.subtype.as_deref() {
-		Some("DEL") => {
-			// Remove reaction: decrement (minimum 0)
-			tracing::info!(
-				"REACT:DEL on_receive: {} removing reaction from our action {}",
-				context.issuer,
-				subject_id
-			);
-			current_reactions.saturating_sub(1)
-		}
-		_ => {
-			// Add reaction: increment
-			tracing::info!(
-				"REACT:{:?} on_receive: {} reacting to our action {}",
-				context.subtype,
-				context.issuer,
-				subject_id
-			);
-			current_reactions.saturating_add(1)
-		}
+	let new_reactions = if let Some("DEL") = context.subtype.as_deref() {
+		// Remove reaction: decrement (minimum 0)
+		tracing::info!(
+			"REACT:DEL on_receive: {} removing reaction from our action {}",
+			context.issuer,
+			subject_id
+		);
+		current_reactions.saturating_sub(1)
+	} else {
+		// Add reaction: increment
+		tracing::info!(
+			"REACT:{:?} on_receive: {} reacting to our action {}",
+			context.subtype,
+			context.issuer,
+			subject_id
+		);
+		current_reactions.saturating_add(1)
 	};
 
 	// Update subject action's reaction count

@@ -16,7 +16,6 @@ use crate::{image, store};
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_types::blob_adapter;
 use cloudillo_types::meta_adapter;
-use cloudillo_types::types::TnId;
 
 /// PDF metadata extracted from pdfinfo
 #[derive(Debug, Clone)]
@@ -237,7 +236,6 @@ impl Task<App> for PdfProcessorTask {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use cloudillo_core::scheduler::Task;
 
 	#[test]
 	fn test_pdf_tools_availability() {

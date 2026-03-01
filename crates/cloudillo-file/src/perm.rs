@@ -40,7 +40,7 @@ pub fn check_perm_file(
 	}
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "permission check requires all context fields")]
 async fn check_file_permission(
 	State(app): State<App>,
 	IdTag(tenant_id_tag): IdTag,

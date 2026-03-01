@@ -1,6 +1,7 @@
 //! Meta adapter CRUD operation tests
 //!
 //! Tests Create, Read, Update, Delete operations for tenants and profiles
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{ListProfileOptions, MetaAdapter, UpdateTenantData};

@@ -2,11 +2,14 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::*;
-use cloudillo_types::{auth_adapter::*, prelude::*};
+use crate::utils::{inspect, map_res};
+use cloudillo_types::{
+	auth_adapter::{CreateProxySiteData, ProxySiteConfig, ProxySiteData, UpdateProxySiteData},
+	prelude::*,
+};
 
 /// Parse a proxy site row from the database
-fn parse_proxy_site_row(row: sqlx::sqlite::SqliteRow) -> Result<ProxySiteData, sqlx::Error> {
+fn parse_proxy_site_row(row: &sqlx::sqlite::SqliteRow) -> Result<ProxySiteData, sqlx::Error> {
 	let config_str: Option<String> = row.try_get("config")?;
 	let config: ProxySiteConfig = match config_str.as_deref() {
 		Some(s) => serde_json::from_str(s).map_err(|e| {
@@ -183,7 +186,7 @@ pub(crate) async fn list_proxy_sites(db: &SqlitePool) -> ClResult<Vec<ProxySiteD
 
 	let mut sites = Vec::new();
 	for row in rows {
-		sites.push(parse_proxy_site_row(row).inspect_err(inspect).map_err(|_| Error::DbError)?);
+		sites.push(parse_proxy_site_row(&row).inspect_err(inspect).map_err(|_| Error::DbError)?);
 	}
 	Ok(sites)
 }
@@ -223,7 +226,7 @@ pub(crate) async fn list_proxy_sites_needing_cert_renewal(
 	renewal_days: u32,
 ) -> ClResult<Vec<ProxySiteData>> {
 	let now = Timestamp::now().0;
-	let renewal_threshold = now + (renewal_days as i64 * 24 * 3600);
+	let renewal_threshold = now + (i64::from(renewal_days) * 24 * 3600);
 
 	let rows = sqlx::query(
 		"SELECT site_id, domain, backend_url, status, proxy_type, cert, cert_key, cert_expires_at,
@@ -240,7 +243,7 @@ pub(crate) async fn list_proxy_sites_needing_cert_renewal(
 
 	let mut sites = Vec::new();
 	for row in rows {
-		sites.push(parse_proxy_site_row(row).inspect_err(inspect).map_err(|_| Error::DbError)?);
+		sites.push(parse_proxy_site_row(&row).inspect_err(inspect).map_err(|_| Error::DbError)?);
 	}
 	Ok(sites)
 }

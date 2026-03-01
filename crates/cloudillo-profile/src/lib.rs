@@ -1,8 +1,5 @@
 //! Profile subsystem. Manages profile information, profile sync, etc.
 
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![forbid(unsafe_code)]
-
 pub mod community;
 pub mod handler;
 pub mod list;

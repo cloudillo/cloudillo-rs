@@ -36,7 +36,7 @@ pub async fn patch_own_profile(
 
 	// Build profile update from patch
 	let profile_update =
-		UpdateProfileData { name: patch.name.map(|s| s.into()), ..Default::default() };
+		UpdateProfileData { name: patch.name.map(Into::into), ..Default::default() };
 
 	// Apply the patch
 	app.meta_adapter.update_profile(tn_id, &auth.id_tag, &profile_update).await?;
@@ -84,10 +84,10 @@ pub async fn patch_profile_admin(
 	};
 
 	let profile_update = UpdateProfileData {
-		name: patch.name.map(|s| s.into()),
+		name: patch.name.map(Into::into),
 		roles: patch
 			.roles
-			.map(|opt_roles| opt_roles.map(|roles| roles.into_iter().map(|s| s.into()).collect())),
+			.map(|opt_roles| opt_roles.map(|roles| roles.into_iter().map(Into::into).collect())),
 		status: patch.status,
 		..Default::default()
 	};

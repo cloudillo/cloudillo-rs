@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 mod error;
 mod index;
 mod instance;
@@ -23,7 +21,10 @@ pub use transaction::RedbTransaction;
 pub use error::Error;
 
 use cloudillo_types::prelude::*;
-use cloudillo_types::rtdb_adapter::*;
+use cloudillo_types::rtdb_adapter::{
+	ChangeEvent, DbStats, LockInfo, LockMode, QueryOptions, RtdbAdapter, SubscriptionOptions,
+	Transaction,
+};
 
 /// redb-based implementation of RtdbAdapter.
 ///
@@ -211,7 +212,7 @@ impl RtdbAdapterRedb {
 
 		// Check instance limit and evict if needed
 		if instances.len() >= self.config.max_instances {
-			self.evict_lru(&mut instances)?;
+			Self::evict_lru(&mut instances);
 		}
 
 		// Get or open the redb database file (shared across all databases in per_tenant_files mode)
@@ -237,10 +238,7 @@ impl RtdbAdapterRedb {
 	}
 
 	/// Evict least recently used instance
-	fn evict_lru(
-		&self,
-		instances: &mut HashMap<InstanceKey, Arc<DatabaseInstance>>,
-	) -> ClResult<()> {
+	fn evict_lru(instances: &mut HashMap<InstanceKey, Arc<DatabaseInstance>>) {
 		if let Some(key) = instances
 			.iter()
 			.min_by_key(|(_, inst)| inst.last_accessed())
@@ -249,8 +247,6 @@ impl RtdbAdapterRedb {
 			instances.remove(&key);
 			info!("Evicted database instance: {:?}", key);
 		}
-
-		Ok(())
 	}
 
 	/// Spawn background eviction task
@@ -328,7 +324,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 				tn_id,
 				&db_id_owned,
 				&path_owned,
-				opts,
+				&opts,
 				per_tenant_files,
 			)
 		})
@@ -434,7 +430,6 @@ impl RtdbAdapter for RtdbAdapterRedb {
 					}
 					Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
 						warn!("Subscription lagged, missed {} events", n);
-						continue;
 					}
 					Err(tokio::sync::broadcast::error::RecvError::Closed) => {
 						break;
@@ -638,7 +633,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 			let tx = instance.db.begin_read().map_err(error::from_redb_error)?;
 			let table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(error::from_redb_error)?;
 
-			let record_count = table.len().map_err(error::from_redb_error)? as u64;
+			let record_count = table.len().map_err(error::from_redb_error)?;
 
 			// Get database file size
 			let size_bytes = std::fs::metadata(&db_path)?.len();

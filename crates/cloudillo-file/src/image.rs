@@ -13,7 +13,23 @@ use crate::{descriptor::FileIdGeneratorTask, preset, store, variant};
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_types::blob_adapter;
 use cloudillo_types::meta_adapter;
-use cloudillo_types::types::TnId;
+
+/// Convert `u32` to `f32`, accepting minor precision loss for large values.
+///
+/// Pixel dimensions in image processing are always well within `f32` precision.
+#[allow(clippy::cast_precision_loss)]
+fn u32_to_f32(v: u32) -> f32 {
+	v as f32
+}
+
+/// Convert a non-negative `f32` to `u32` using Rust's saturating cast semantics.
+///
+/// Negative values become 0, values above `u32::MAX` saturate to `u32::MAX`, NaN becomes 0.
+/// Used for pixel dimensions from image processing where values are always non-negative.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn f32_to_u32(v: f32) -> u32 {
+	v.max(0.0) as u32
+}
 
 /// Result of image resizing: encoded bytes and actual dimensions
 pub struct ResizeResult {
@@ -101,7 +117,7 @@ fn resize_image_sync<'a>(
 			let encoder = image::codecs::png::PngEncoder::new(&mut output);
 			resized.write_with_encoder(encoder)?;
 		}
-	};
+	}
 	debug!("written [{:.2}ms]", now.elapsed().as_millis());
 	Ok(ResizeResult {
 		bytes: output.into_inner().into(),
@@ -173,6 +189,9 @@ pub async fn generate_image_variants(
 	bytes: &[u8],
 	preset: &preset::FilePreset,
 ) -> ClResult<ImageVariantResult> {
+	// Skip variant if it's less than 10% larger than previous
+	const SKIP_THRESHOLD: f32 = 0.10;
+
 	// Read format settings
 	let thumbnail_format_str = app
 		.settings
@@ -198,15 +217,12 @@ pub async fn generate_image_variants(
 		variant::parse_quality(&max_quality_str).unwrap_or(variant::VariantQuality::High);
 
 	// Detect original format from content
-	let orig_format = detect_image_type(bytes)
-		.map(|ct| match ct.as_str() {
-			"image/jpeg" => "jpeg",
-			"image/png" => "png",
-			"image/webp" => "webp",
-			"image/avif" => "avif",
-			_ => "jpeg",
-		})
-		.unwrap_or("jpeg");
+	let orig_format = detect_image_type(bytes).map_or("jpeg", |ct| match ct.as_str() {
+		"image/png" => "png",
+		"image/webp" => "webp",
+		"image/avif" => "avif",
+		_ => "jpeg",
+	});
 
 	// Get original image dimensions
 	let orig_dim = get_image_dimensions(bytes).await?;
@@ -255,7 +271,7 @@ pub async fn generate_image_variants(
 
 	// Determine format for thumbnail variant
 	let tn_format = thumbnail_tier.and_then(|t| t.format).unwrap_or(thumbnail_format);
-	let tn_max_dim = thumbnail_tier.map(|t| t.max_dim).unwrap_or(256);
+	let tn_max_dim = thumbnail_tier.map_or(256, |t| t.max_dim);
 
 	// Generate thumbnail variant synchronously
 	let resized_tn =
@@ -288,10 +304,9 @@ pub async fn generate_image_variants(
 		.await?;
 
 	// Smart variant creation: skip creating variants if image is too small or too close in size
-	const SKIP_THRESHOLD: f32 = 0.10; // Skip variant if it's less than 10% larger than previous
-	let original_max = orig_dim.0.max(orig_dim.1) as f32;
+	let original_max = u32_to_f32(orig_dim.0.max(orig_dim.1));
 	let mut variant_task_ids = Vec::new();
-	let mut last_created_size = tn_max_dim as f32;
+	let mut last_created_size = u32_to_f32(tn_max_dim);
 
 	// Create visual variants from preset's image_variants
 	for variant_name in &preset.image_variants {
@@ -310,7 +325,7 @@ pub async fn generate_image_variants(
 			}
 		}
 		if let Some(tier) = preset::get_image_tier(variant_name) {
-			let variant_bbox_f = tier.max_dim as f32;
+			let variant_bbox_f = u32_to_f32(tier.max_dim);
 
 			// Determine actual size: cap at original to avoid upscaling
 			let actual_size = variant_bbox_f.min(original_max);
@@ -321,9 +336,10 @@ pub async fn generate_image_variants(
 				// Determine format for this variant (tier override or setting)
 				let variant_format = tier.format.unwrap_or(image_format);
 
+				let actual_dim = f32_to_u32(actual_size);
 				info!(
 					"Creating variant {} with bounding box {}x{} (capped from {})",
-					variant_name, actual_size as u32, actual_size as u32, tier.max_dim
+					variant_name, actual_dim, actual_dim, tier.max_dim
 				);
 
 				let task = ImageResizerTask::new(
@@ -332,7 +348,7 @@ pub async fn generate_image_variants(
 					orig_file.clone(),
 					variant_name.clone(),
 					variant_format,
-					(actual_size as u32, actual_size as u32),
+					(actual_dim, actual_dim),
 				);
 				let task_id = app.scheduler.add(task).await?;
 				variant_task_ids.push(task_id);
@@ -341,9 +357,9 @@ pub async fn generate_image_variants(
 				info!(
 					"Skipping variant {} - would be {}, only {:.0}% larger than last ({})",
 					variant_name,
-					actual_size as u32,
+					f32_to_u32(actual_size),
 					(actual_size / last_created_size - 1.0) * 100.0,
-					last_created_size as u32
+					f32_to_u32(last_created_size)
 				);
 			}
 		}
