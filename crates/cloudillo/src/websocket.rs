@@ -19,6 +19,7 @@ use cloudillo_core::extract::IdTag;
 use cloudillo_core::file_access::{self, FileAccessError};
 use cloudillo_core::ws_bus;
 use cloudillo_core::OptionalAuth;
+use cloudillo_types::meta_adapter::{CreateFile, FileStatus};
 
 /// Query parameters for WebSocket file access endpoints
 #[derive(Debug, Deserialize, Default)]
@@ -80,6 +81,109 @@ fn resolve_access(query: &AccessQuery, computed_read_only: bool) -> Result<bool,
 	}
 }
 
+/// Validate a store file_id (`s~{app_id}` format)
+///
+/// Returns:
+/// - `Ok(Some(app_id))` — valid store ID
+/// - `Ok(None)` — not a store ID (no `s~` prefix)
+/// - `Err(())` — has `s~` prefix but invalid app_id
+fn validate_store_id(file_id: &str) -> Result<Option<&str>, ()> {
+	let Some(app_id) = file_id.strip_prefix("s~") else {
+		return Ok(None);
+	};
+
+	if app_id.is_empty() || app_id.len() > 64 {
+		return Err(());
+	}
+
+	// External app format: name@domain
+	if app_id.contains('@') {
+		let parts: Vec<&str> = app_id.splitn(2, '@').collect();
+		if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+			return Err(());
+		}
+		// Name part: alphanumeric + hyphens/underscores, starts with letter
+		let name = parts[0];
+		let first = name.as_bytes()[0];
+		if !first.is_ascii_lowercase() {
+			return Err(());
+		}
+		if !name
+			.bytes()
+			.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+		{
+			return Err(());
+		}
+		// Domain part: basic check for valid hostname chars
+		if !parts[1]
+			.bytes()
+			.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+		{
+			return Err(());
+		}
+		return Ok(Some(app_id));
+	}
+
+	// Internal app format: alphanumeric + hyphens/underscores, starts with letter or `_`
+	let first = app_id.as_bytes()[0];
+	if !first.is_ascii_lowercase() && first != b'_' {
+		return Err(());
+	}
+	if !app_id
+		.bytes()
+		.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+	{
+		return Err(());
+	}
+
+	Ok(Some(app_id))
+}
+
+/// Auto-create a store file record if it does not already exist
+///
+/// Store files (`s~{app_id}`) are lazily created on first WebSocket connection.
+/// The `file_tp` is set based on the endpoint ("RTDB" or "CRDT").
+/// Creation is idempotent — concurrent calls for the same file_id are safe.
+async fn ensure_store_file(
+	app: &crate::app::App,
+	tn_id: crate::types::TnId,
+	store_file_id: &str,
+	file_tp: &str,
+	app_id: &str,
+) -> Result<(), FileAccessError> {
+	// Check if file already exists
+	match app.meta_adapter.read_file(tn_id, store_file_id).await {
+		Ok(Some(_)) => return Ok(()),
+		Ok(None) => {} // Proceed to create
+		Err(e) => return Err(FileAccessError::InternalError(e.to_string())),
+	}
+
+	// Create store file — idempotent (create_file with explicit file_id)
+	let create_opts = CreateFile {
+		file_id: Some(store_file_id.into()),
+		file_tp: Some(file_tp.into()),
+		content_type: "application/json".into(),
+		file_name: app_id.into(),
+		status: Some(FileStatus::Active),
+		..Default::default()
+	};
+
+	match app.meta_adapter.create_file(tn_id, create_opts).await {
+		Ok(_) => Ok(()),
+		Err(e) => Err(FileAccessError::InternalError(e.to_string())),
+	}
+}
+
+/// Create WebSocket close response for invalid store ID
+fn ws_close_invalid_store(ws: WebSocketUpgrade) -> Response {
+	ws.on_upgrade(|socket| close_with_error(socket, 4400, "Invalid store ID"))
+}
+
+/// Create WebSocket close response for store type mismatch
+fn ws_close_type_mismatch(ws: WebSocketUpgrade) -> Response {
+	ws.on_upgrade(|socket| close_with_error(socket, 4409, "Store type mismatch"))
+}
+
 /// WebSocket upgrade handler for the notification bus
 ///
 /// Requires authentication. Routes to ws_bus handler.
@@ -133,6 +237,22 @@ pub async fn get_ws_rtdb(
 	let user_roles = auth_ctx.roles.clone();
 	let scope = auth_ctx.scope.as_deref();
 
+	// Auto-create store file if s~ prefix
+	match validate_store_id(&file_id) {
+		Ok(Some(app_id)) => {
+			if let Err(e) =
+				ensure_store_file(&app, crate::types::TnId(tn_id), &file_id, "RTDB", app_id).await
+			{
+				return ws_close_for_error(ws, &e);
+			}
+		}
+		Ok(None) => {} // Not a store ID, proceed normally
+		Err(()) => {
+			warn!("RTDB WebSocket rejected - invalid store ID: {}", file_id);
+			return ws_close_invalid_store(ws);
+		}
+	}
+
 	// Check file access (with scope for share links)
 	let ctx = file_access::FileAccessCtx {
 		user_id_tag: &user_id,
@@ -150,6 +270,12 @@ pub async fn get_ws_rtdb(
 
 	match access_result {
 		Ok(result) => {
+			// Verify store type matches endpoint
+			if file_id.starts_with("s~") && result.file_view.file_tp.as_deref() != Some("RTDB") {
+				warn!("Store type mismatch: {} is not RTDB", file_id);
+				return ws_close_type_mismatch(ws);
+			}
+
 			// Resolve final read_only based on query parameter
 			let Ok(read_only) = resolve_access(&query, result.read_only) else {
 				warn!("RTDB WebSocket rejected - write access requested but not available: user={}, file={}", user_id, file_id);
@@ -201,6 +327,22 @@ pub async fn get_ws_crdt(
 	let user_roles = auth_ctx.roles.clone();
 	let scope = auth_ctx.scope.as_deref();
 
+	// Auto-create store file if s~ prefix
+	match validate_store_id(&doc_id) {
+		Ok(Some(app_id)) => {
+			if let Err(e) =
+				ensure_store_file(&app, crate::types::TnId(tn_id), &doc_id, "CRDT", app_id).await
+			{
+				return ws_close_for_error(ws, &e);
+			}
+		}
+		Ok(None) => {} // Not a store ID, proceed normally
+		Err(()) => {
+			warn!("CRDT WebSocket rejected - invalid store ID: {}", doc_id);
+			return ws_close_invalid_store(ws);
+		}
+	}
+
 	// Check file access (with scope for share links)
 	let ctx = file_access::FileAccessCtx {
 		user_id_tag: &user_id,
@@ -218,6 +360,12 @@ pub async fn get_ws_crdt(
 
 	match access_result {
 		Ok(result) => {
+			// Verify store type matches endpoint
+			if doc_id.starts_with("s~") && result.file_view.file_tp.as_deref() != Some("CRDT") {
+				warn!("Store type mismatch: {} is not CRDT", doc_id);
+				return ws_close_type_mismatch(ws);
+			}
+
 			// Resolve final read_only based on query parameter
 			let Ok(read_only) = resolve_access(&query, result.read_only) else {
 				warn!("CRDT WebSocket rejected - write access requested but not available: user={}, doc={}", user_id, doc_id);
