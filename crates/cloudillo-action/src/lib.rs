@@ -5,6 +5,7 @@
 pub(crate) mod audience;
 pub mod delivery;
 pub mod dsl;
+pub mod fanout;
 pub mod filter;
 pub mod forward;
 pub mod handler;
