@@ -77,13 +77,26 @@ pub async fn delete_file(
 			));
 		}
 
+		// Cascade delete to document tree children
+		let children = app.meta_adapter.list_children_by_root(auth.tn_id, &file_id).await?;
+		for child_id in &children {
+			app.meta_adapter.delete_file(auth.tn_id, child_id).await?;
+		}
+
 		// Actually delete from database
 		app.meta_adapter.delete_file(auth.tn_id, &file_id).await?;
-		info!("User {} permanently deleted file {}", auth.id_tag, file_id);
+		info!(
+			"User {} permanently deleted file {} (+ {} children)",
+			auth.id_tag,
+			file_id,
+			children.len()
+		);
 
 		Ok(Json(DeleteFileResponse { file_id, permanent: true }))
 	} else {
 		// Soft delete - move to trash folder
+		// No cascade to document tree children: they follow the root implicitly
+		// via root_id. Restoring the root restores the whole tree.
 		app.meta_adapter
 			.update_file_data(
 				auth.tn_id,
@@ -313,16 +326,14 @@ pub async fn duplicate_file(
 				orig_variant_id: Some(new_file_id.clone().into()),
 				file_id: Some(new_file_id.clone().into()),
 				parent_id,
-				owner_tag: None,
 				creator_tag: Some(auth.id_tag.clone()),
 				content_type: file.content_type.unwrap_or_else(|| "application/json".into()),
 				file_name: new_file_name.into(),
 				file_tp: file.file_tp,
-				created_at: None,
 				tags: file.tags,
 				x: file.x,
 				visibility: file.visibility,
-				status: None,
+				..Default::default()
 			},
 		)
 		.await?;

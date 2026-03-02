@@ -59,13 +59,22 @@ impl DescriptorVersion {
 pub fn get_file_descriptor<S: AsRef<str> + Debug + Eq>(
 	variants: &[meta_adapter::FileVariant<S>],
 ) -> String {
-	get_file_descriptor_versioned(variants, DescriptorVersion::V2)
+	get_file_descriptor_versioned(variants, DescriptorVersion::V2, None)
 }
 
-/// Generate file descriptor with explicit version
+/// Generate file descriptor in the new d2 format with optional root_id
+pub fn get_file_descriptor_with_root<S: AsRef<str> + Debug + Eq>(
+	variants: &[meta_adapter::FileVariant<S>],
+	root_id: Option<&str>,
+) -> String {
+	get_file_descriptor_versioned(variants, DescriptorVersion::V2, root_id)
+}
+
+/// Generate file descriptor with explicit version and optional root_id
 pub fn get_file_descriptor_versioned<S: AsRef<str> + Debug + Eq>(
 	variants: &[meta_adapter::FileVariant<S>],
 	version: DescriptorVersion,
+	root_id: Option<&str>,
 ) -> String {
 	let sep = version.variant_separator();
 	let id_sep = version.id_separator();
@@ -74,7 +83,16 @@ pub fn get_file_descriptor_versioned<S: AsRef<str> + Debug + Eq>(
 	// The d2, prefix differentiates descriptors from hashed IDs
 	let _ = id_sep; // Unused but kept for API consistency
 
-	version.prefix().to_owned()
+	let mut result = version.prefix().to_owned();
+
+	// Add root_id marker if present (R= field before variant entries)
+	if let Some(root) = root_id {
+		result.push_str("R=");
+		result.push_str(root);
+		result.push(sep);
+	}
+
+	result
 		+ &variants
 			.iter()
 			.map(|v| {
@@ -164,11 +182,12 @@ fn parse_variant_entry(
 }
 
 /// Parse file descriptor (supports both d1 and d2 formats)
+/// Skips the R= root_id marker if present.
 pub fn parse_file_descriptor(descriptor: &str) -> ClResult<Vec<meta_adapter::FileVariant<&str>>> {
 	if let Some(body) = descriptor.strip_prefix("d2,") {
 		// New format: d2, with ; variant separator and , ID separator
 		body.split(';')
-			.filter(|s| !s.is_empty())
+			.filter(|s| !s.is_empty() && !s.starts_with("R="))
 			.map(|entry| parse_variant_entry(entry, ','))
 			.collect()
 	} else if let Some(body) = descriptor.strip_prefix("d1~") {
@@ -338,7 +357,16 @@ impl Task<App> for FileIdGeneratorTask {
 			.list_file_variants(self.tn_id, meta_adapter::FileId::FId(self.f_id))
 			.await?;
 		variants.sort();
-		let descriptor = get_file_descriptor(&variants);
+
+		// Read root_id from file metadata (for document tree support)
+		let file_id_str = format!("@{}", self.f_id);
+		let root_id = app
+			.meta_adapter
+			.read_file(self.tn_id, &file_id_str)
+			.await?
+			.and_then(|f| f.root_id);
+
+		let descriptor = get_file_descriptor_with_root(&variants, root_id.as_deref());
 
 		let mut hasher = Hasher::new();
 		hasher.update(descriptor.as_bytes());
@@ -441,6 +469,33 @@ mod tests {
 		assert!(desc.contains(":br=5000"));
 		// Variants are separated by ;
 		assert!(desc.contains(";vid.hd"));
+	}
+
+	#[test]
+	fn test_generate_d2_descriptor_with_root() {
+		let variants = vec![meta_adapter::FileVariant {
+			variant: "vis.tn",
+			variant_id: "b1~abc123",
+			format: "webp",
+			size: 2048,
+			resolution: (128, 128),
+			available: true,
+			duration: None,
+			bitrate: None,
+			page_count: None,
+		}];
+
+		let desc = get_file_descriptor_with_root(&variants, Some("f1~rootid"));
+		assert!(desc.starts_with("d2,R=f1~rootid;"));
+		assert!(desc.contains("vis.tn:b1~abc123"));
+	}
+
+	#[test]
+	fn test_parse_d2_descriptor_with_root() {
+		let desc = "d2,R=f1~rootid;vis.tn:b1~abc123:f=webp:s=2048:r=128x128";
+		let variants = parse_file_descriptor(desc).unwrap();
+		assert_eq!(variants.len(), 1);
+		assert_eq!(variants[0].variant, "vis.tn");
 	}
 
 	#[test]

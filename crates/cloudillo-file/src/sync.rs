@@ -232,18 +232,12 @@ pub async fn sync_file_variants(
 		let create_opts = CreateFile {
 			orig_variant_id: Some(first_variant.variant_id.into()),
 			file_id: Some(file_id.into()), // Set file_id (enables deduplication)
-			parent_id: None,
-			owner_tag: None, // Owned by tenant, not remote user
-			creator_tag: None,
 			preset: Some("sync".into()),
 			content_type: format_to_content_type(first_variant.format).into(),
 			file_name: format!("synced.{}", format_to_extension(first_variant.format)).into(),
-			file_tp: None,
 			created_at: Some(Timestamp::now()),
-			tags: None,
-			x: None,
 			visibility: Some('D'), // Direct visibility for synced files
-			status: None,          // Default to 'P' (pending)
+			..Default::default()
 		};
 
 		match app.meta_adapter.create_file(tn_id, create_opts).await {

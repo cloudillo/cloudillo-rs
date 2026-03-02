@@ -27,7 +27,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 9;
+	const CURRENT_DB_VERSION: i64 = 10;
 
 	let mut tx = db.begin().await?;
 
@@ -168,6 +168,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			visibility char(1),			-- NULL: Direct (owner only), P: Public, V: Verified,
 										-- 2: 2nd degree, F: Follower, C: Connected
 			parent_id text,				-- Folder hierarchy: references file_id of parent folder
+			root_id text,				-- Document tree: access control root file_id
 			accessed_at INTEGER,		-- Global: when anyone last accessed this file
 			modified_at INTEGER,		-- Global: when anyone last modified this file
 			created_at INTEGER DEFAULT (unixepoch()),
@@ -183,6 +184,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(tn_id, parent_id)")
 		.execute(&mut *tx)
 		.await?;
+	// Note: idx_files_root is created in migration 10 after the root_id column is added
+	// Do NOT add it here as it would fail for existing databases being migrated
 
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS file_variants (
@@ -630,6 +633,12 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		)
 		.execute(&mut *tx)
 		.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_files_root ON files(tn_id, root_id) \
+			 WHERE root_id IS NOT NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
 
 		set_db_version(&mut tx, CURRENT_DB_VERSION).await;
 		version = CURRENT_DB_VERSION;
@@ -830,8 +839,23 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, 9).await;
 	}
 
+	// Version 10: Document tree root_id on files
+	if version < 10 {
+		sqlx::query("ALTER TABLE files ADD COLUMN root_id TEXT")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_files_root ON files(tn_id, root_id) \
+			 WHERE root_id IS NOT NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 10).await;
+	}
+
 	// Future migrations:
-	// if version < 10 { ... migration 10 ...; set_db_version(&mut tx, 10).await; }
+	// if version < 11 { ... migration 11 ...; set_db_version(&mut tx, 11).await; }
 
 	tx.commit().await?;
 

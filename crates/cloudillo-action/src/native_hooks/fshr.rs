@@ -98,20 +98,13 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 
 	// Create file entry with status 'A' (active) and visibility direct (most restricted - owner and tenant can see)
 	let create_opts = CreateFile {
-		orig_variant_id: None,
 		file_id: Some(file_id.clone().into()),
-		parent_id: None,
 		owner_tag: Some(context.issuer.clone().into()), // Shared files: owner is the sharer
-		creator_tag: None,
-		preset: None,
 		content_type: content_type.into(),
 		file_name: file_name.into(),
 		file_tp: Some(file_tp.into()),
-		created_at: None,
-		tags: None,
-		x: None,
-		visibility: None, // Direct - owner and tenant can see
 		status: Some(FileStatus::Active),
+		..Default::default()
 	};
 
 	match app.meta_adapter.create_file(tn_id, create_opts).await {

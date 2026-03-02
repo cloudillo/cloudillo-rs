@@ -432,6 +432,7 @@ pub struct FileUserData {
 pub struct FileView {
 	pub file_id: Box<str>,
 	pub parent_id: Option<Box<str>>, // Parent folder file_id (None = root)
+	pub root_id: Option<Box<str>>,   // Document tree root file_id (None = standalone)
 	pub owner: Option<ProfileInfo>,
 	pub creator: Option<ProfileInfo>,
 	pub preset: Option<Box<str>>,
@@ -519,6 +520,8 @@ pub struct ListFileOptions {
 	pub file_id: Option<String>,
 	#[serde(rename = "parentId")]
 	pub parent_id: Option<String>, // Filter by parent folder (None = root, "__trash__" = trash)
+	#[serde(rename = "rootId")]
+	pub root_id: Option<String>, // Filter by document tree root
 	pub tag: Option<String>,
 	pub preset: Option<String>,
 	pub variant: Option<String>,
@@ -548,6 +551,7 @@ pub struct CreateFile {
 	pub orig_variant_id: Option<Box<str>>,
 	pub file_id: Option<Box<str>>,
 	pub parent_id: Option<Box<str>>, // Parent folder file_id (None = root)
+	pub root_id: Option<Box<str>>,   // Document tree root file_id (None = standalone)
 	pub owner_tag: Option<Box<str>>, // Set only for files owned by someone OTHER than the tenant (e.g., shared files)
 	pub creator_tag: Option<Box<str>>, // The user who actually created the file
 	pub preset: Option<Box<str>>,
@@ -936,6 +940,9 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	//**************************************
 	/// Delete a file (set status to 'D')
 	async fn delete_file(&self, tn_id: TnId, file_id: &str) -> ClResult<()>;
+
+	/// List all child files in a document tree (files with the given root_id)
+	async fn list_children_by_root(&self, tn_id: TnId, root_id: &str) -> ClResult<Vec<Box<str>>>;
 
 	// Settings Management
 	//*********************

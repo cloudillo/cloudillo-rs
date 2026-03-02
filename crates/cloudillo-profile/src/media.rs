@@ -106,19 +106,14 @@ pub async fn put_profile_image(
 			auth.tn_id,
 			meta_adapter::CreateFile {
 				preset: Some("profile-picture".into()),
-				orig_variant_id: None, // Will be set by generate_image_variants
-				file_id: None,
-				parent_id: None,
-				owner_tag: None,
 				creator_tag: Some(auth.id_tag.as_ref().into()),
 				content_type: content_type.into(),
 				file_name: format!("{}-profile-pic.jpg", auth.id_tag).into(),
 				file_tp: Some("BLOB".into()),
-				created_at: None,
 				tags: Some(vec!["profile".into()]),
 				x: Some(json!({ "dim": dim })),
 				visibility: Some('P'), // Profile pics are always public
-				status: None,
+				..Default::default()
 			},
 		)
 		.await?;
@@ -204,19 +199,14 @@ pub async fn put_cover_image(
 			auth.tn_id,
 			meta_adapter::CreateFile {
 				preset: Some("cover".into()),
-				orig_variant_id: None, // Will be set by generate_image_variants
-				file_id: None,
-				parent_id: None,
-				owner_tag: None,
 				creator_tag: Some(auth.id_tag.as_ref().into()),
 				content_type: content_type.into(),
 				file_name: format!("{}-cover.jpg", auth.id_tag).into(),
 				file_tp: Some("BLOB".into()),
-				created_at: None,
 				tags: Some(vec!["cover".into()]),
 				x: Some(json!({ "dim": dim })),
 				visibility: Some('P'), // Cover images are always public
-				status: None,
+				..Default::default()
 			},
 		)
 		.await?;

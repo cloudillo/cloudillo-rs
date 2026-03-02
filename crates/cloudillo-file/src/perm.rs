@@ -146,9 +146,16 @@ async fn load_file_attrs(
 		tenant_id_tag,
 		user_roles: subject_roles,
 	};
-	let access_level =
-		file_access::get_access_level_with_scope(app, tn_id, &file_id, &owner_id_tag, &ctx, scope)
-			.await;
+	let access_level = file_access::get_access_level_with_scope(
+		app,
+		tn_id,
+		&file_id,
+		&owner_id_tag,
+		&ctx,
+		scope,
+		file_view.root_id.as_deref(),
+	)
+	.await;
 
 	// Get visibility from file metadata - convert char to string representation
 	let visibility: Box<str> = VisibilityLevel::from_char(file_view.visibility).as_str().into();

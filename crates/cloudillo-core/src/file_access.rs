@@ -91,6 +91,7 @@ pub async fn get_access_level(
 ///
 /// Determines access level based on:
 /// 1. Scoped token - file:{file_id}:{R|W} grants Read/Write access
+///    (also checks document tree: a token for a root grants access to children)
 /// 2. Ownership - owner has Write access
 /// 3. FSHR action - WRITE subtype grants Write, other subtypes grant Read
 /// 4. No access - returns None
@@ -101,6 +102,7 @@ pub async fn get_access_level_with_scope(
 	owner_id_tag: &str,
 	ctx: &FileAccessCtx<'_>,
 	scope: Option<&str>,
+	root_id: Option<&str>,
 ) -> AccessLevel {
 	// Check scope-based access first (for share links)
 	if let Some(scope_str) = scope {
@@ -108,12 +110,20 @@ pub async fn get_access_level_with_scope(
 		if let Some(token_scope) = TokenScope::parse(scope_str) {
 			match &token_scope {
 				TokenScope::File { file_id: scope_file_id, access } => {
-					// Check if scope matches this file_id
+					// Direct match: scope matches this file_id
 					if scope_file_id == file_id {
 						return *access;
 					}
-					// Scope exists for a different file - deny access to this file
-					// This prevents using a token scoped to file A to access file B
+
+					// Document tree check: scope is for a root, this file is a child
+					// Depth-1 invariant: root_id always points directly to a top-level file
+					if let Some(root) = root_id {
+						if scope_file_id.as_str() == root {
+							return *access;
+						}
+					}
+
+					// Scope exists for a different file - deny access
 					return AccessLevel::None;
 				}
 			}
@@ -159,9 +169,17 @@ pub async fn check_file_access_with_scope(
 
 	debug!(file_id = file_id, user = ctx.user_id_tag, owner = owner_id_tag, scope = ?scope, "Checking file access");
 
-	// Get access level (considering scope for share links)
-	let access_level =
-		get_access_level_with_scope(app, tn_id, file_id, owner_id_tag, ctx, scope).await;
+	// Get access level (considering scope for share links and document trees)
+	let access_level = get_access_level_with_scope(
+		app,
+		tn_id,
+		file_id,
+		owner_id_tag,
+		ctx,
+		scope,
+		file_view.root_id.as_deref(),
+	)
+	.await;
 
 	if access_level == AccessLevel::None {
 		return Err(FileAccessError::AccessDenied);

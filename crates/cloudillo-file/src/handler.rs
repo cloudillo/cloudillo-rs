@@ -279,6 +279,9 @@ pub struct PostFileRequest {
 	file_name: Option<String>,
 	#[serde(rename = "parentId")]
 	parent_id: Option<String>,
+	/// Document tree root file_id (makes this a child in a document tree)
+	#[serde(rename = "rootId")]
+	root_id: Option<String>,
 	created_at: Option<Timestamp>,
 	tags: Option<String>,
 	/// Visibility level: P=Public, V=Verified, F=Follower, C=Connected, NULL=Direct
@@ -837,6 +840,20 @@ pub async fn post_file(
 	// Generate file_id
 	let file_id = utils::random_id()?;
 
+	// Validate root_id if provided - the root file must exist and be a top-level file
+	if let Some(ref root_id) = req.root_id {
+		let root_file =
+			app.meta_adapter.read_file(tn_id, root_id).await?.ok_or_else(|| {
+				Error::ValidationError(format!("root file '{}' not found", root_id))
+			})?;
+		if root_file.root_id.is_some() {
+			return Err(Error::ValidationError(
+				"root_id must reference a top-level file (not a file that itself has a root_id)"
+					.into(),
+			));
+		}
+	}
+
 	// Default visibility to 'C' (Connected) for community tenants
 	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
 	let visibility = match req.visibility {
@@ -856,16 +873,15 @@ pub async fn post_file(
 				orig_variant_id: Some(file_id.clone().into()),
 				file_id: Some(file_id.clone().into()),
 				parent_id: req.parent_id.map(Into::into),
-				owner_tag: None,
+				root_id: req.root_id.map(Into::into),
 				creator_tag: Some(auth.id_tag.clone()),
 				content_type: content_type.into(),
 				file_name: req.file_name.clone().unwrap_or_else(|| "file".into()).into(),
 				file_tp: Some(req.file_tp.clone().into()),
 				created_at: req.created_at,
 				tags: req.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
-				x: None,
 				visibility,
-				status: None,
+				..Default::default()
 			},
 		)
 		.await?;
@@ -964,9 +980,6 @@ pub async fn post_file_blob(
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: Some(orig_variant_id),
-						file_id: None,
-						parent_id: None,
-						owner_tag: None,
 						creator_tag: Some(auth.id_tag.clone()),
 						content_type: if is_svg {
 							"image/svg+xml".into()
@@ -979,7 +992,7 @@ pub async fn post_file_blob(
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						x: Some(json!({ "dim": dim })),
 						visibility,
-						status: None,
+						..Default::default()
 					},
 				)
 				.await?;
@@ -1014,18 +1027,14 @@ pub async fn post_file_blob(
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: Some(orig_variant_id),
-						file_id: None,
-						parent_id: None,
-						owner_tag: None,
 						creator_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
-						x: None,
 						visibility,
-						status: None,
+						..Default::default()
 					},
 				)
 				.await?;
@@ -1052,19 +1061,14 @@ pub async fn post_file_blob(
 					tn_id,
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
-						orig_variant_id: None,
-						file_id: None,
-						parent_id: None,
-						owner_tag: None,
 						creator_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
-						x: None,
 						visibility,
-						status: None,
+						..Default::default()
 					},
 				)
 				.await?;
@@ -1092,19 +1096,14 @@ pub async fn post_file_blob(
 					tn_id,
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
-						orig_variant_id: None,
-						file_id: None,
-						parent_id: None,
-						owner_tag: None,
 						creator_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
-						x: None,
 						visibility,
-						status: None,
+						..Default::default()
 					},
 				)
 				.await?;
@@ -1132,19 +1131,14 @@ pub async fn post_file_blob(
 					tn_id,
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
-						orig_variant_id: None,
-						file_id: None,
-						parent_id: None,
-						owner_tag: None,
 						creator_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
-						x: None,
 						visibility,
-						status: None,
+						..Default::default()
 					},
 				)
 				.await?;

@@ -454,6 +454,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::delete(&self.db, tn_id, file_id).await
 	}
 
+	async fn list_children_by_root(&self, tn_id: TnId, root_id: &str) -> ClResult<Vec<Box<str>>> {
+		file::list_children_by_root(&self.dbr, tn_id, root_id).await
+	}
+
 	// Settings Management
 	//*********************
 
