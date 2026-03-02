@@ -587,6 +587,35 @@ pub struct UpdateFileOptions {
 	pub status: Patch<char>,
 }
 
+// Share Entries
+//**************
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareEntry {
+	pub id: i64,
+	pub resource_type: char,
+	pub resource_id: Box<str>,
+	pub subject_type: char,
+	pub subject_id: Box<str>,
+	pub permission: char,
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	pub expires_at: Option<Timestamp>,
+	pub created_by: Box<str>,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateShareEntry {
+	pub subject_type: char,
+	pub subject_id: String,
+	pub permission: char,
+	pub expires_at: Option<Timestamp>,
+}
+
 // Push Subscriptions
 //********************
 
@@ -1092,6 +1121,44 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Removes a push subscription. Called when a subscription becomes invalid
 	/// (e.g., 410 Gone response from push service) or when user unsubscribes.
 	async fn delete_push_subscription(&self, tn_id: TnId, subscription_id: u64) -> ClResult<()>;
+
+	// Share Entry Management
+	//***********************
+
+	/// Create a share entry (idempotent on unique constraint)
+	async fn create_share_entry(
+		&self,
+		tn_id: TnId,
+		resource_type: char,
+		resource_id: &str,
+		created_by: &str,
+		entry: &CreateShareEntry,
+	) -> ClResult<ShareEntry>;
+
+	/// Delete a share entry by ID
+	async fn delete_share_entry(&self, tn_id: TnId, id: i64) -> ClResult<()>;
+
+	/// List share entries for a resource
+	async fn list_share_entries(
+		&self,
+		tn_id: TnId,
+		resource_type: char,
+		resource_id: &str,
+	) -> ClResult<Vec<ShareEntry>>;
+
+	/// Check if a subject has share access to a resource
+	/// Returns the permission char if access exists, None otherwise
+	async fn check_share_access(
+		&self,
+		tn_id: TnId,
+		resource_type: char,
+		resource_id: &str,
+		subject_type: char,
+		subject_id: &str,
+	) -> ClResult<Option<char>>;
+
+	/// Read a single share entry by ID (for delete validation)
+	async fn read_share_entry(&self, tn_id: TnId, id: i64) -> ClResult<Option<ShareEntry>>;
 }
 
 #[cfg(test)]

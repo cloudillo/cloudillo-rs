@@ -638,6 +638,15 @@ impl AccessLevel {
 			Self::Admin => "admin",
 		}
 	}
+
+	/// Convert a share permission char ('R', 'W', 'A') to an access level.
+	/// Unknown chars default to Read.
+	pub fn from_perm_char(c: char) -> Self {
+		match c {
+			'W' | 'A' => Self::Write,
+			_ => Self::Read,
+		}
+	}
 }
 
 /// Token scope for scoped access tokens (e.g., share links)

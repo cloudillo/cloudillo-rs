@@ -8,6 +8,7 @@ mod push;
 mod reference;
 mod schema;
 mod setting;
+mod share;
 mod tag;
 mod task;
 mod tenant;
@@ -22,11 +23,12 @@ use tokio::fs;
 use cloudillo_types::{
 	meta_adapter::{
 		Action, ActionData, ActionId, ActionView, CreateFile, CreateOutboundActionOptions,
-		CreateRefOptions, FileId, FileUserData, FileVariant, FileView, FinalizeActionOptions,
-		ListActionOptions, ListFileOptions, ListProfileOptions, ListRefsOptions, ListTaskOptions,
-		ListTenantsMetaOptions, MetaAdapter, Profile, ProfileData, PushSubscription,
-		PushSubscriptionData, ReactionData, RefData, Task, TaskPatch, Tenant, TenantListMeta,
-		UpdateActionDataOptions, UpdateFileOptions, UpdateProfileData, UpdateTenantData,
+		CreateRefOptions, CreateShareEntry, FileId, FileUserData, FileVariant, FileView,
+		FinalizeActionOptions, ListActionOptions, ListFileOptions, ListProfileOptions,
+		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
+		ProfileData, PushSubscription, PushSubscriptionData, ReactionData, RefData, ShareEntry,
+		Task, TaskPatch, Tenant, TenantListMeta, UpdateActionDataOptions, UpdateFileOptions,
+		UpdateProfileData, UpdateTenantData,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -612,5 +614,48 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn delete_push_subscription(&self, tn_id: TnId, subscription_id: u64) -> ClResult<()> {
 		push::delete(&self.db, tn_id, subscription_id).await
+	}
+
+	// Share Entry Management
+	//***********************
+
+	async fn create_share_entry(
+		&self,
+		tn_id: TnId,
+		resource_type: char,
+		resource_id: &str,
+		created_by: &str,
+		entry: &CreateShareEntry,
+	) -> ClResult<ShareEntry> {
+		share::create(&self.db, tn_id, resource_type, resource_id, created_by, entry).await
+	}
+
+	async fn delete_share_entry(&self, tn_id: TnId, id: i64) -> ClResult<()> {
+		share::delete(&self.db, tn_id, id).await
+	}
+
+	async fn list_share_entries(
+		&self,
+		tn_id: TnId,
+		resource_type: char,
+		resource_id: &str,
+	) -> ClResult<Vec<ShareEntry>> {
+		share::list_by_resource(&self.dbr, tn_id, resource_type, resource_id).await
+	}
+
+	async fn check_share_access(
+		&self,
+		tn_id: TnId,
+		resource_type: char,
+		resource_id: &str,
+		subject_type: char,
+		subject_id: &str,
+	) -> ClResult<Option<char>> {
+		share::check_access(&self.dbr, tn_id, resource_type, resource_id, subject_type, subject_id)
+			.await
+	}
+
+	async fn read_share_entry(&self, tn_id: TnId, id: i64) -> ClResult<Option<ShareEntry>> {
+		share::read(&self.dbr, tn_id, id).await
 	}
 }

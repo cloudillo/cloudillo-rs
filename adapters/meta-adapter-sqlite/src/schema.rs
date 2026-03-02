@@ -27,7 +27,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 10;
+	const CURRENT_DB_VERSION: i64 = 12;
 
 	let mut tx = db.begin().await?;
 
@@ -416,6 +416,38 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
+	// Share entries (unified sharing: user shares, link shares, file-to-file links)
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS share_entries (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			tn_id INTEGER NOT NULL,
+			resource_type CHAR(1) NOT NULL,
+			resource_id TEXT NOT NULL,
+			subject_type CHAR(1) NOT NULL,
+			subject_id TEXT NOT NULL,
+			permission CHAR(1) NOT NULL,
+			expires_at INTEGER,
+			created_by TEXT NOT NULL,
+			created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			UNIQUE(tn_id, resource_type, resource_id, subject_type, subject_id)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_share_entries_resource \
+		 ON share_entries(tn_id, resource_type, resource_id)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_share_entries_subject \
+		 ON share_entries(tn_id, subject_type, subject_id)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
 	// Triggers for automatic updated_at on INSERT
 	sqlx::query(
 		"CREATE TRIGGER IF NOT EXISTS vars_insert_at AFTER INSERT ON vars FOR EACH ROW \
@@ -519,6 +551,12 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		)
 		.execute(&mut *tx)
 		.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS share_entries_insert_at AFTER INSERT ON share_entries FOR EACH ROW \
+			BEGIN UPDATE share_entries SET updated_at = unixepoch() WHERE id = NEW.id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
 
 	// Triggers for automatic updated_at on UPDATE
 	sqlx::query(
@@ -620,6 +658,12 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query(
 		"CREATE TRIGGER IF NOT EXISTS file_user_data_updated_at AFTER UPDATE ON file_user_data FOR EACH ROW \
 		BEGIN UPDATE file_user_data SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND id_tag = NEW.id_tag AND f_id = NEW.f_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS share_entries_updated_at AFTER UPDATE ON share_entries FOR EACH ROW \
+			BEGIN UPDATE share_entries SET updated_at = unixepoch() WHERE id = NEW.id; END",
 	)
 	.execute(&mut *tx)
 	.await?;
@@ -854,8 +898,78 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, 10).await;
 	}
 
-	// Future migrations:
-	// if version < 11 { ... migration 11 ...; set_db_version(&mut tx, 11).await; }
+	// Version 11: Share entries table
+	if version < 11 {
+		sqlx::query(
+			"CREATE TABLE IF NOT EXISTS share_entries (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				tn_id INTEGER NOT NULL,
+				resource_type CHAR(1) NOT NULL,
+				resource_id TEXT NOT NULL,
+				subject_type CHAR(1) NOT NULL,
+				subject_id TEXT NOT NULL,
+				permission CHAR(1) NOT NULL,
+				expires_at INTEGER,
+				created_by TEXT NOT NULL,
+				created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+				updated_at INTEGER DEFAULT (unixepoch()),
+				UNIQUE(tn_id, resource_type, resource_id, subject_type, subject_id)
+			)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_share_entries_resource \
+			 ON share_entries(tn_id, resource_type, resource_id)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_share_entries_subject \
+			 ON share_entries(tn_id, subject_type, subject_id)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS share_entries_insert_at AFTER INSERT ON share_entries FOR EACH ROW \
+				BEGIN UPDATE share_entries SET updated_at = unixepoch() WHERE id = NEW.id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS share_entries_updated_at AFTER UPDATE ON share_entries FOR EACH ROW \
+				BEGIN UPDATE share_entries SET updated_at = unixepoch() WHERE id = NEW.id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 11).await;
+	}
+
+	// Version 12: Migrate existing FSHR actions into share_entries (sender side only)
+	if version < 12 {
+		// Only where issuer_tag matches the tenant's own id_tag
+		// (receiver-side FSHR actions have a foreign issuer — skip those)
+		sqlx::query(
+			"INSERT OR IGNORE INTO share_entries \
+				(tn_id, resource_type, resource_id, subject_type, subject_id, \
+				 permission, created_by, created_at) \
+			 SELECT a.tn_id, 'F', a.subject, 'U', a.audience, \
+				CASE WHEN a.sub_type = 'WRITE' THEN 'W' ELSE 'R' END, \
+				a.issuer_tag, a.created_at \
+			 FROM actions a \
+			 INNER JOIN tenants t ON a.tn_id = t.tn_id AND a.issuer_tag = t.id_tag \
+			 WHERE a.type = 'FSHR' \
+				AND a.subject IS NOT NULL \
+				AND a.audience IS NOT NULL \
+				AND (a.sub_type IS NULL OR a.sub_type != 'DEL') \
+				AND (a.status IS NULL OR a.status != 'D')",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 12).await;
+	}
 
 	tx.commit().await?;
 

@@ -50,6 +50,15 @@ pub async fn get_access_level(
 		return AccessLevel::Write;
 	}
 
+	// User share entry ('U') check — explicit per-file grants take priority
+	if let Ok(Some(perm)) = app
+		.meta_adapter
+		.check_share_access(tn_id, 'F', file_id, 'U', ctx.user_id_tag)
+		.await
+	{
+		return AccessLevel::from_perm_char(perm);
+	}
+
 	// Role-based access for tenant-owned files only (owner_id_tag == tenant_id_tag)
 	// When a file has no explicit owner, it belongs to the tenant.
 	// Community members with roles get access based on their role level.
@@ -121,6 +130,24 @@ pub async fn get_access_level_with_scope(
 						if scope_file_id.as_str() == root {
 							return *access;
 						}
+					}
+
+					// Cross-document link: file-type share entry ('F')
+					// If scope grants access to file A, check if there's a share entry
+					// linking file A → target file
+					if let Ok(Some(perm)) = app
+						.meta_adapter
+						.check_share_access(tn_id, 'F', file_id, 'F', scope_file_id)
+						.await
+					{
+						// Cap at min(scope_access, share_permission)
+						let share_access = AccessLevel::from_perm_char(perm);
+						return if *access == AccessLevel::Read || share_access == AccessLevel::Read
+						{
+							AccessLevel::Read
+						} else {
+							AccessLevel::Write
+						};
 					}
 
 					// Scope exists for a different file - deny access

@@ -14,6 +14,7 @@ pub(crate) mod pdf;
 pub mod perm;
 pub mod preset;
 pub mod settings;
+pub mod share;
 pub(crate) mod store;
 pub(crate) mod svg;
 pub mod sync;

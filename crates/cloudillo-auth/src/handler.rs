@@ -300,7 +300,8 @@ pub async fn post_password(
 /// 1. A token query parameter (action token to exchange)
 /// 2. A refId query parameter (share link to exchange for scoped token)
 /// 3. An apiKey query parameter (API key to exchange for access token)
-/// 4. Just subject parameter (uses authenticated session)
+/// 4. A via parameter (cross-document link: get token for target file via source file)
+/// 5. Just subject parameter (uses authenticated session)
 #[derive(Deserialize)]
 pub struct GetAccessTokenQuery {
 	#[serde(default)]
@@ -315,6 +316,8 @@ pub struct GetAccessTokenQuery {
 	/// If true with refId, use validate_ref instead of use_ref (for token refresh)
 	#[serde(default)]
 	refresh: Option<bool>,
+	/// Source file_id for cross-document link access (requires scope param with target file)
+	via: Option<String>,
 }
 
 pub async fn get_access_token(
@@ -329,6 +332,106 @@ pub async fn get_access_token(
 	use tracing::warn;
 
 	info!("Got access token request for id_tag={} with scope={:?}", id_tag.0, query.scope);
+
+	// Cross-document link: get scoped token for target file via source file
+	if let Some(ref via_file_id) = query.via {
+		use cloudillo_types::types::{AccessLevel, TokenScope};
+
+		// Requires scope param: "file:{target_file_id}:{R|W}"
+		let scope_str = query
+			.scope
+			.as_deref()
+			.ok_or_else(|| Error::ValidationError("scope parameter required with via".into()))?;
+
+		let token_scope = TokenScope::parse(scope_str)
+			.ok_or_else(|| Error::ValidationError("Invalid scope format".into()))?;
+
+		let TokenScope::File { file_id: ref target_file_id, access: requested_access } =
+			token_scope;
+
+		info!(
+			"Via token request: via={}, target={}, access={:?}",
+			via_file_id, target_file_id, requested_access
+		);
+
+		// Caller must be authenticated (either session or scoped token)
+		let auth = maybe_auth.as_ref().ok_or(Error::Unauthorized)?;
+
+		// Check caller has access to the via (source) file
+		let caller_has_via_access = if let Some(ref caller_scope) = auth.scope {
+			// Scoped token: must be scoped to the via file
+			if let Some(TokenScope::File { file_id: ref scope_fid, access: scope_access }) =
+				TokenScope::parse(caller_scope)
+			{
+				scope_fid == via_file_id && scope_access != AccessLevel::None
+			} else {
+				false
+			}
+		} else {
+			// Session-authenticated user: verify actual file access
+			use cloudillo_core::file_access::{self, FileAccessCtx};
+			let ctx = FileAccessCtx {
+				user_id_tag: &auth.id_tag,
+				tenant_id_tag: &id_tag.0,
+				user_roles: &auth.roles,
+			};
+			file_access::check_file_access_with_scope(&app, tn_id, via_file_id, &ctx, None)
+				.await
+				.is_ok()
+		};
+
+		if !caller_has_via_access {
+			warn!("Via token denied: caller has no access to source file {}", via_file_id);
+			return Err(Error::PermissionDenied);
+		}
+
+		// Look up share entry: resource=target, subject_type='F', subject_id=via
+		let link_perm = app
+			.meta_adapter
+			.check_share_access(tn_id, 'F', target_file_id, 'F', via_file_id)
+			.await?
+			.ok_or_else(|| {
+				warn!("Via token denied: no file link from {} to {}", via_file_id, target_file_id);
+				Error::PermissionDenied
+			})?;
+
+		// Determine effective access: min(requested, link_permission)
+		let link_access = AccessLevel::from_perm_char(link_perm);
+		let effective_access =
+			if requested_access == AccessLevel::Read || link_access == AccessLevel::Read {
+				AccessLevel::Read
+			} else {
+				AccessLevel::Write
+			};
+
+		// Create scoped token for the target file
+		let access_char = if effective_access == AccessLevel::Write { 'W' } else { 'R' };
+		let target_scope = format!("file:{}:{}", target_file_id, access_char);
+
+		let token_result = app
+			.auth_adapter
+			.create_access_token(
+				tn_id,
+				&auth_adapter::AccessToken {
+					iss: &id_tag.0,
+					sub: auth.scope.as_ref().map_or(Some(&*auth.id_tag), |_| None),
+					r: None,
+					scope: Some(&target_scope),
+					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
+				},
+			)
+			.await?;
+
+		info!("Created via token for {} with scope {}", target_file_id, target_scope);
+		let response = ApiResponse::new(json!({
+			"token": token_result,
+			"scope": target_scope,
+			"resourceId": target_file_id,
+			"accessLevel": effective_access.as_str(),
+		}))
+		.with_req_id(req_id.unwrap_or_default());
+		return Ok((StatusCode::OK, Json(response)));
+	}
 
 	// If token is provided in query, verify it; otherwise use authenticated session
 	if let Some(token_param) = query.token {
