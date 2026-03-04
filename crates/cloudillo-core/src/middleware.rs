@@ -248,8 +248,8 @@ pub async fn optional_auth(
 		req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok())
 	{
 		auth_header.strip_prefix("Bearer ").map(|token| token.trim().to_string())
-	} else if req.uri().path().starts_with("/ws/") {
-		// Fallback: try to get token from query parameter (only for WebSocket endpoints)
+	} else if req.uri().path().starts_with("/ws/") || req.uri().path().starts_with("/api/files") {
+		// Fallback: try to get token from query parameter (for WebSocket and file endpoints)
 		let query = req.uri().query().unwrap_or("");
 		extract_token_from_query(query)
 	} else {

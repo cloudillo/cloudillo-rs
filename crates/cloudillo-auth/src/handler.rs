@@ -357,25 +357,29 @@ pub async fn get_access_token(
 		// Caller must be authenticated (either session or scoped token)
 		let auth = maybe_auth.as_ref().ok_or(Error::Unauthorized)?;
 
+		// Parse via reference: could be "id_tag:file_id" or just "file_id"
+		let via_bare_file_id =
+			via_file_id.rsplit_once(':').map_or(via_file_id.as_str(), |(_, fid)| fid);
+
 		// Check caller has access to the via (source) file
 		let caller_has_via_access = if let Some(ref caller_scope) = auth.scope {
-			// Scoped token: must be scoped to the via file
+			// Scoped token: must be scoped to the via file (bare id)
 			if let Some(TokenScope::File { file_id: ref scope_fid, access: scope_access }) =
 				TokenScope::parse(caller_scope)
 			{
-				scope_fid == via_file_id && scope_access != AccessLevel::None
+				scope_fid == via_bare_file_id && scope_access != AccessLevel::None
 			} else {
 				false
 			}
 		} else {
-			// Session-authenticated user: verify actual file access
+			// Session-authenticated user: verify actual file access using bare file_id
 			use cloudillo_core::file_access::{self, FileAccessCtx};
 			let ctx = FileAccessCtx {
 				user_id_tag: &auth.id_tag,
 				tenant_id_tag: &id_tag.0,
 				user_roles: &auth.roles,
 			};
-			file_access::check_file_access_with_scope(&app, tn_id, via_file_id, &ctx, None)
+			file_access::check_file_access_with_scope(&app, tn_id, via_bare_file_id, &ctx, None)
 				.await
 				.is_ok()
 		};
@@ -385,13 +389,16 @@ pub async fn get_access_token(
 			return Err(Error::PermissionDenied);
 		}
 
-		// Look up share entry: resource=target, subject_type='F', subject_id=via
+		// Look up share entry: resource=target, subject_type='F', subject_id=via (bare)
 		let link_perm = app
 			.meta_adapter
-			.check_share_access(tn_id, 'F', target_file_id, 'F', via_file_id)
+			.check_share_access(tn_id, 'F', target_file_id, 'F', via_bare_file_id)
 			.await?
 			.ok_or_else(|| {
-				warn!("Via token denied: no file link from {} to {}", via_file_id, target_file_id);
+				warn!(
+					"Via token denied: no file link from {} to {}",
+					via_bare_file_id, target_file_id
+				);
 				Error::PermissionDenied
 			})?;
 
