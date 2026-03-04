@@ -643,6 +643,15 @@ impl MetaAdapter for MetaAdapterSqlite {
 		share::list_by_resource(&self.dbr, tn_id, resource_type, resource_id).await
 	}
 
+	async fn list_share_entries_by_subject(
+		&self,
+		tn_id: TnId,
+		subject_type: Option<char>,
+		subject_id: &str,
+	) -> ClResult<Vec<ShareEntry>> {
+		share::list_by_subject(&self.dbr, tn_id, subject_type, subject_id).await
+	}
+
 	async fn check_share_access(
 		&self,
 		tn_id: TnId,

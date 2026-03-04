@@ -5,10 +5,11 @@
 //! Creating user shares ('U') also generates FSHR actions for federation.
 
 use axum::{
-	extract::{Path, State},
+	extract::{Path, Query, State},
 	http::StatusCode,
 	Json,
 };
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::prelude::*;
@@ -68,7 +69,7 @@ pub async fn create_share(
 	tn_id: TnId,
 	Path(file_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
-	Json(input): Json<CreateShareEntry>,
+	Json(mut input): Json<CreateShareEntry>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ShareEntry>>)> {
 	// Validate input
 	if !matches!(input.subject_type, 'U' | 'L' | 'F') {
@@ -83,6 +84,19 @@ pub async fn create_share(
 	}
 	if input.subject_id.is_empty() {
 		return Err(Error::ValidationError("subjectId cannot be empty".into()));
+	}
+
+	// For file subjects, validate and strip tenant prefix (e.g. "host:fileId" → "fileId")
+	if input.subject_type == 'F' {
+		if let Some(pos) = input.subject_id.find(':') {
+			let prefix = &input.subject_id[..pos];
+			if prefix != &*tenant_id_tag {
+				return Err(Error::ValidationError(
+					"cross-tenant file references are not supported".into(),
+				));
+			}
+			input.subject_id = input.subject_id[pos + 1..].to_string();
+		}
 	}
 
 	let file_access = require_write_access(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
@@ -186,6 +200,33 @@ pub async fn delete_share(
 	}
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
+}
+
+// ========================================================================
+// Share entry queries (not scoped to a single file)
+// ========================================================================
+
+#[derive(Deserialize)]
+pub struct ListSharesBySubjectQuery {
+	pub subject_type: Option<char>,
+	pub subject_id: String,
+}
+
+/// GET /api/shares?subject_id={id}[&subject_type=F] — List share entries by subject
+pub async fn list_shares_by_subject(
+	State(app): State<App>,
+	Auth(_auth): Auth,
+	tn_id: TnId,
+	Query(query): Query<ListSharesBySubjectQuery>,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ShareEntry>>>)> {
+	let entries = app
+		.meta_adapter
+		.list_share_entries_by_subject(tn_id, query.subject_type, &query.subject_id)
+		.await?;
+
+	let response = ApiResponse::new(entries).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::OK, Json(response)))
 }
 

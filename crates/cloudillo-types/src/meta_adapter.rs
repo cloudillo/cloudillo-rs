@@ -605,6 +605,10 @@ pub struct ShareEntry {
 	pub created_by: Box<str>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
+	// Enrichment fields (populated by JOINs in list_by_resource)
+	pub subject_file_name: Option<Box<str>>,
+	pub subject_content_type: Option<Box<str>>,
+	pub subject_file_tp: Option<Box<str>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1144,6 +1148,15 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		resource_type: char,
 		resource_id: &str,
+	) -> ClResult<Vec<ShareEntry>>;
+
+	/// List share entries by subject (reverse lookup).
+	/// If `subject_type` is None, matches all subject types.
+	async fn list_share_entries_by_subject(
+		&self,
+		tn_id: TnId,
+		subject_type: Option<char>,
+		subject_id: &str,
 	) -> ClResult<Vec<ShareEntry>>;
 
 	/// Check if a subject has share access to a resource

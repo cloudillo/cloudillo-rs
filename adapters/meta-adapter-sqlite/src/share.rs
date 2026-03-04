@@ -25,6 +25,9 @@ fn row_to_share_entry(row: &SqliteRow) -> ShareEntry {
 		expires_at: expires_at.map(Timestamp),
 		created_by: row.get("created_by"),
 		created_at: Timestamp(created_at),
+		subject_file_name: row.try_get("subject_file_name").ok(),
+		subject_content_type: row.try_get("subject_content_type").ok(),
+		subject_file_tp: row.try_get("subject_file_tp").ok(),
 	}
 }
 
@@ -80,6 +83,9 @@ pub(crate) async fn create(
 		expires_at: entry.expires_at,
 		created_by: created_by.into(),
 		created_at: Timestamp(created_at),
+		subject_file_name: None,
+		subject_content_type: None,
+		subject_file_tp: None,
 	})
 }
 
@@ -106,16 +112,50 @@ pub(crate) async fn list_by_resource(
 	let resource_type_str = resource_type.to_string();
 
 	let rows = sqlx::query(
-		"SELECT id, resource_type, resource_id, subject_type, subject_id, \
-			permission, expires_at, created_by, created_at \
-		 FROM share_entries \
-		 WHERE tn_id = ? AND resource_type = ? AND resource_id = ? \
-			AND (expires_at IS NULL OR expires_at > unixepoch()) \
-		 ORDER BY created_at DESC",
+		"SELECT se.id, se.resource_type, se.resource_id, se.subject_type, se.subject_id, \
+			se.permission, se.expires_at, se.created_by, se.created_at, \
+			f.file_name AS subject_file_name, \
+			f.content_type AS subject_content_type, \
+			f.file_tp AS subject_file_tp \
+		 FROM share_entries se \
+		 LEFT JOIN files f ON se.subject_type = 'F' AND f.tn_id = se.tn_id AND f.file_id = se.subject_id \
+		 WHERE se.tn_id = ? AND se.resource_type = ? AND se.resource_id = ? \
+			AND (se.expires_at IS NULL OR se.expires_at > unixepoch()) \
+		 ORDER BY se.created_at DESC",
 	)
 	.bind(tn_id.0)
 	.bind(&resource_type_str)
 	.bind(resource_id)
+	.fetch_all(db)
+	.await
+	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.map_err(|_| Error::DbError)?;
+
+	Ok(rows.iter().map(row_to_share_entry).collect())
+}
+
+/// List share entries by subject (reverse lookup), excluding expired entries.
+/// If `subject_type` is None, matches all subject types.
+pub(crate) async fn list_by_subject(
+	db: &SqlitePool,
+	tn_id: TnId,
+	subject_type: Option<char>,
+	subject_id: &str,
+) -> ClResult<Vec<ShareEntry>> {
+	let subject_type_str = subject_type.map(|c| c.to_string());
+
+	let rows = sqlx::query(
+		"SELECT id, resource_type, resource_id, subject_type, subject_id, \
+			permission, expires_at, created_by, created_at \
+		 FROM share_entries \
+		 WHERE tn_id = ? AND (? IS NULL OR subject_type = ?) AND subject_id = ? \
+			AND (expires_at IS NULL OR expires_at > unixepoch()) \
+		 ORDER BY created_at DESC",
+	)
+	.bind(tn_id.0)
+	.bind(&subject_type_str)
+	.bind(&subject_type_str)
+	.bind(subject_id)
 	.fetch_all(db)
 	.await
 	.inspect_err(|err| warn!("DB: {:#?}", err))

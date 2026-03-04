@@ -176,6 +176,9 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.merge(trash_router)
 		.merge(file_user_router)
 
+		// --- Share Entry Queries ---
+		.route("/api/shares", get(file::share::list_shares_by_subject))
+
 		// --- File Share Management ---
 		.route("/api/files/{file_id}/shares", get(file::share::list_shares))
 		.route("/api/files/{file_id}/shares", post(file::share::create_share))
