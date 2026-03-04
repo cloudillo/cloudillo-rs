@@ -145,12 +145,17 @@ pub(crate) async fn list_by_subject(
 	let subject_type_str = subject_type.map(|c| c.to_string());
 
 	let rows = sqlx::query(
-		"SELECT id, resource_type, resource_id, subject_type, subject_id, \
-			permission, expires_at, created_by, created_at \
-		 FROM share_entries \
-		 WHERE tn_id = ? AND (? IS NULL OR subject_type = ?) AND subject_id = ? \
-			AND (expires_at IS NULL OR expires_at > unixepoch()) \
-		 ORDER BY created_at DESC",
+		"SELECT se.id, se.resource_type, se.resource_id, se.subject_type, se.subject_id, \
+			se.permission, se.expires_at, se.created_by, se.created_at, \
+			f.file_name AS subject_file_name, \
+			f.content_type AS subject_content_type, \
+			f.file_tp AS subject_file_tp \
+		 FROM share_entries se \
+		 LEFT JOIN files f ON se.subject_type = 'F' \
+			AND f.tn_id = se.tn_id AND f.file_id = se.subject_id \
+		 WHERE se.tn_id = ? AND (? IS NULL OR se.subject_type = ?) AND se.subject_id = ? \
+			AND (se.expires_at IS NULL OR se.expires_at > unixepoch()) \
+		 ORDER BY se.created_at DESC",
 	)
 	.bind(tn_id.0)
 	.bind(&subject_type_str)

@@ -31,9 +31,15 @@ async fn require_write_access(
 	tenant_id_tag: &str,
 ) -> ClResult<FileAccessResult> {
 	let ctx = FileAccessCtx { user_id_tag: &auth.id_tag, tenant_id_tag, user_roles: &auth.roles };
-	let result =
-		file_access::check_file_access_with_scope(app, tn_id, file_id, &ctx, auth.scope.as_deref())
-			.await;
+	let result = file_access::check_file_access_with_scope(
+		app,
+		tn_id,
+		file_id,
+		&ctx,
+		auth.scope.as_deref(),
+		None,
+	)
+	.await;
 
 	match result {
 		Err(file_access::FileAccessError::NotFound) => Err(Error::NotFound),
@@ -88,14 +94,18 @@ pub async fn create_share(
 
 	// For file subjects, validate and strip tenant prefix (e.g. "host:fileId" → "fileId")
 	if input.subject_type == 'F' {
-		if let Some(pos) = input.subject_id.find(':') {
-			let prefix = &input.subject_id[..pos];
+		if let Some((prefix, bare_id)) = input.subject_id.split_once(':') {
 			if prefix != &*tenant_id_tag {
 				return Err(Error::ValidationError(
 					"cross-tenant file references are not supported".into(),
 				));
 			}
-			input.subject_id = input.subject_id[pos + 1..].to_string();
+			if bare_id.contains(':') {
+				return Err(Error::ValidationError(
+					"invalid subject_id format: unexpected extra colon".into(),
+				));
+			}
+			input.subject_id = bare_id.to_string();
 		}
 	}
 
@@ -216,11 +226,38 @@ pub struct ListSharesBySubjectQuery {
 /// GET /api/shares?subject_id={id}[&subject_type=F] — List share entries by subject
 pub async fn list_shares_by_subject(
 	State(app): State<App>,
-	Auth(_auth): Auth,
+	Auth(auth): Auth,
+	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
 	Query(query): Query<ListSharesBySubjectQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ShareEntry>>>)> {
+	// When looking up by file subject, verify caller has at least read access
+	if query.subject_type.is_none() || query.subject_type == Some('F') {
+		let ctx = FileAccessCtx {
+			user_id_tag: &auth.id_tag,
+			tenant_id_tag: &tenant_id_tag,
+			user_roles: &auth.roles,
+		};
+		match file_access::check_file_access_with_scope(
+			&app,
+			tn_id,
+			&query.subject_id,
+			&ctx,
+			auth.scope.as_deref(),
+			None,
+		)
+		.await
+		{
+			Err(file_access::FileAccessError::NotFound) => return Err(Error::NotFound),
+			Err(file_access::FileAccessError::AccessDenied) => return Err(Error::PermissionDenied),
+			Err(file_access::FileAccessError::InternalError(msg)) => {
+				return Err(Error::Internal(msg))
+			}
+			Ok(_) => {}
+		}
+	}
+
 	let entries = app
 		.meta_adapter
 		.list_share_entries_by_subject(tn_id, query.subject_type, &query.subject_id)
