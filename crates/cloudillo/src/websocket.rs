@@ -29,6 +29,8 @@ pub struct AccessQuery {
 	/// - "write": Require write permission (reject if user only has read)
 	/// - None: Use computed access level based on permissions
 	pub access: Option<String>,
+	/// Container file_id when opening an embedded file (caps access by share entry)
+	pub via: Option<String>,
 }
 
 /// Helper to close WebSocket with error code
@@ -265,6 +267,7 @@ pub async fn get_ws_rtdb(
 		&file_id,
 		&ctx,
 		scope,
+		query.via.as_deref(),
 	)
 	.await;
 
@@ -355,6 +358,7 @@ pub async fn get_ws_crdt(
 		&doc_id,
 		&ctx,
 		scope,
+		query.via.as_deref(),
 	)
 	.await;
 

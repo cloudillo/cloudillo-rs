@@ -135,19 +135,14 @@ pub async fn get_access_level_with_scope(
 					// Cross-document link: file-type share entry ('F')
 					// If scope grants access to file A, check if there's a share entry
 					// linking file A → target file
+					// resource=container (scope_file_id), subject=target (file_id)
 					if let Ok(Some(perm)) = app
 						.meta_adapter
-						.check_share_access(tn_id, 'F', file_id, 'F', scope_file_id)
+						.check_share_access(tn_id, 'F', scope_file_id, 'F', file_id)
 						.await
 					{
 						// Cap at min(scope_access, share_permission)
-						let share_access = AccessLevel::from_perm_char(perm);
-						return if *access == AccessLevel::Read || share_access == AccessLevel::Read
-						{
-							AccessLevel::Read
-						} else {
-							AccessLevel::Write
-						};
+						return (*access).min(AccessLevel::from_perm_char(perm));
 					}
 
 					// Scope exists for a different file - deny access
@@ -176,6 +171,7 @@ pub async fn check_file_access_with_scope(
 	file_id: &str,
 	ctx: &FileAccessCtx<'_>,
 	scope: Option<&str>,
+	via: Option<&str>,
 ) -> Result<FileAccessResult, FileAccessError> {
 	use tracing::debug;
 
@@ -197,7 +193,7 @@ pub async fn check_file_access_with_scope(
 	debug!(file_id = file_id, user = ctx.user_id_tag, owner = owner_id_tag, scope = ?scope, "Checking file access");
 
 	// Get access level (considering scope for share links and document trees)
-	let access_level = get_access_level_with_scope(
+	let mut access_level = get_access_level_with_scope(
 		app,
 		tn_id,
 		file_id,
@@ -207,6 +203,21 @@ pub async fn check_file_access_with_scope(
 		file_view.root_id.as_deref(),
 	)
 	.await;
+
+	// Cap access by file-to-file share entry when opened via embedding
+	if let Some(via_file_id) = via {
+		if scope.is_none() && access_level != AccessLevel::None {
+			match app.meta_adapter.check_share_access(tn_id, 'F', via_file_id, 'F', file_id).await {
+				Ok(Some(perm)) => {
+					access_level = access_level.min(AccessLevel::from_perm_char(perm));
+				}
+				Ok(None) | Err(_) => {
+					// No file-to-file share entry — embedding doesn't exist, deny
+					access_level = AccessLevel::None;
+				}
+			}
+		}
+	}
 
 	if access_level == AccessLevel::None {
 		return Err(FileAccessError::AccessDenied);

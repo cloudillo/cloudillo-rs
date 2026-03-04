@@ -359,7 +359,7 @@ pub async fn get_access_token(
 
 		// Parse via reference: could be "id_tag:file_id" or just "file_id"
 		let via_bare_file_id =
-			via_file_id.rsplit_once(':').map_or(via_file_id.as_str(), |(_, fid)| fid);
+			via_file_id.split_once(':').map_or(via_file_id.as_str(), |(_, fid)| fid);
 
 		// Check caller has access to the via (source) file
 		let caller_has_via_access = if let Some(ref caller_scope) = auth.scope {
@@ -379,9 +379,16 @@ pub async fn get_access_token(
 				tenant_id_tag: &id_tag.0,
 				user_roles: &auth.roles,
 			};
-			file_access::check_file_access_with_scope(&app, tn_id, via_bare_file_id, &ctx, None)
-				.await
-				.is_ok()
+			file_access::check_file_access_with_scope(
+				&app,
+				tn_id,
+				via_bare_file_id,
+				&ctx,
+				None,
+				None,
+			)
+			.await
+			.is_ok()
 		};
 
 		if !caller_has_via_access {
@@ -389,7 +396,7 @@ pub async fn get_access_token(
 			return Err(Error::PermissionDenied);
 		}
 
-		// Look up share entry: resource=target, subject_type='F', subject_id=via (bare)
+		// Look up share entry: resource=target/embedded, subject=via/container
 		let link_perm = app
 			.meta_adapter
 			.check_share_access(tn_id, 'F', target_file_id, 'F', via_bare_file_id)
@@ -403,13 +410,7 @@ pub async fn get_access_token(
 			})?;
 
 		// Determine effective access: min(requested, link_permission)
-		let link_access = AccessLevel::from_perm_char(link_perm);
-		let effective_access =
-			if requested_access == AccessLevel::Read || link_access == AccessLevel::Read {
-				AccessLevel::Read
-			} else {
-				AccessLevel::Write
-			};
+		let effective_access = requested_access.min(AccessLevel::from_perm_char(link_perm));
 
 		// Create scoped token for the target file
 		let access_char = if effective_access == AccessLevel::Write { 'W' } else { 'R' };

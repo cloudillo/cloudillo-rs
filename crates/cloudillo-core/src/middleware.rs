@@ -221,6 +221,7 @@ pub async fn require_auth(
 						|| path == "/api/files"
 						|| path.starts_with("/ws/rtdb/")
 						|| path.starts_with("/ws/crdt/")
+						|| path == "/api/auth/access-token"
 				}
 			};
 			if !allowed {
@@ -248,7 +249,7 @@ pub async fn optional_auth(
 		req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok())
 	{
 		auth_header.strip_prefix("Bearer ").map(|token| token.trim().to_string())
-	} else if req.uri().path().starts_with("/ws/") || req.uri().path().starts_with("/api/files") {
+	} else if req.uri().path().starts_with("/ws/") || req.uri().path().starts_with("/api/files/") {
 		// Fallback: try to get token from query parameter (for WebSocket and file endpoints)
 		let query = req.uri().query().unwrap_or("");
 		extract_token_from_query(query)
@@ -326,7 +327,8 @@ pub async fn optional_auth(
 									cloudillo_types::types::TokenScope::File { .. } => {
 										path.starts_with("/api/files/")
 											|| path == "/api/files" || path.starts_with("/ws/rtdb/")
-											|| path.starts_with("/ws/crdt/")
+											|| path.starts_with("/ws/crdt/") || path
+											== "/api/auth/access-token"
 									}
 								}
 							} else {

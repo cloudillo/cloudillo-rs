@@ -639,6 +639,16 @@ impl AccessLevel {
 		}
 	}
 
+	/// Return the lesser of two access levels.
+	pub fn min(self, other: Self) -> Self {
+		match (self, other) {
+			(Self::None, _) | (_, Self::None) => Self::None,
+			(Self::Read, _) | (_, Self::Read) => Self::Read,
+			(Self::Write, _) | (_, Self::Write) => Self::Write,
+			(Self::Admin, Self::Admin) => Self::Admin,
+		}
+	}
+
 	/// Convert a share permission char ('R', 'W', 'A') to an access level.
 	/// Unknown chars default to Read.
 	pub fn from_perm_char(c: char) -> Self {
