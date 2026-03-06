@@ -15,12 +15,12 @@ readme = "../../README.md"
 async-trait = "0.1.89"
 cloudillo-types = { workspace = true }
 futures-core = "0.3.32"
-tokio = { version = "1.49.0", features = ["fs"] }
+tokio = { version = "1.50.0", features = ["fs"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 
 [dev-dependencies]
-tempfile = "3.25"
-tokio = { version = "1.49.0", features = ["fs", "rt", "macros"] }
+tempfile = "3.26"
+tokio = { version = "1.50.0", features = ["fs", "rt", "macros"] }
 
 [lints]
 workspace = true
