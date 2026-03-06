@@ -60,6 +60,14 @@ impl Task<App> for AuthCleanupTask {
 			}
 		}
 
+		// Cleanup expired QR login sessions
+		if let Ok(store) = app.ext::<crate::qr_login::QrLoginStore>() {
+			let count = store.cleanup_expired();
+			if count > 0 {
+				info!("Cleaned up {} expired QR login sessions", count);
+			}
+		}
+
 		Ok(())
 	}
 }

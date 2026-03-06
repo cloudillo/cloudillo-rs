@@ -70,11 +70,11 @@ impl Default for RateLimitConfig {
 		Self {
 			auth: EndpointCategoryConfig {
 				name: "auth",
-				// Auth: strict limits to prevent credential stuffing
-				ipv4_individual: RateLimitTierConfig::new(20, 50, 100, 200),
-				ipv4_network: RateLimitTierConfig::new(50, 100, 300, 500),
-				ipv6_subnet: RateLimitTierConfig::new(20, 50, 100, 200),
-				ipv6_provider: RateLimitTierConfig::new(50, 100, 300, 500),
+				// Auth: strict limits but allow a few rapid page refreshes
+				ipv4_individual: RateLimitTierConfig::new(5, 10, 60, 60),
+				ipv4_network: RateLimitTierConfig::new(15, 30, 200, 200),
+				ipv6_subnet: RateLimitTierConfig::new(5, 10, 60, 60),
+				ipv6_provider: RateLimitTierConfig::new(15, 30, 200, 200),
 			},
 			federation: EndpointCategoryConfig {
 				name: "federation",

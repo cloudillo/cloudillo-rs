@@ -3,6 +3,7 @@
 pub mod api_key;
 pub mod cleanup;
 pub mod handler;
+pub mod qr_login;
 pub mod settings;
 pub mod webauthn;
 
@@ -19,4 +20,9 @@ pub fn register_settings(
 pub fn init(app: &App) -> ClResult<()> {
 	app.scheduler.register::<cleanup::AuthCleanupTask>()?;
 	Ok(())
+}
+
+/// Create the QR login store (call during app building, insert into extensions)
+pub fn new_qr_login_store() -> qr_login::QrLoginStore {
+	qr_login::QrLoginStore::new()
 }

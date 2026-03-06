@@ -160,7 +160,7 @@ pub struct RegChallengeRes {
 
 /// Login challenge response
 /// Note: options is serialized as JSON Value to extract just the publicKey contents
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginChallengeRes {
 	options: serde_json::Value,
@@ -356,18 +356,17 @@ pub async fn delete_reg(
 	Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /api/auth/wa/login/challenge - Get login challenge
-pub async fn get_login_challenge(
-	State(app): State<App>,
-	id_tag: IdTag,
+/// Try to create a login challenge, returning `None` instead of an error when no passkeys exist.
+/// Extracted for reuse by `post_login_init`.
+pub async fn try_login_challenge(
+	app: &App,
+	id_tag: &IdTag,
 	tn_id: TnId,
-) -> ClResult<(StatusCode, Json<ApiResponse<LoginChallengeRes>>)> {
-	info!("Getting WebAuthn login challenge for {}", id_tag.0);
-
+) -> Option<LoginChallengeRes> {
 	// Get credentials for this tenant
-	let credentials = app.auth_adapter.list_webauthn_credentials(tn_id).await?;
+	let credentials = app.auth_adapter.list_webauthn_credentials(tn_id).await.ok()?;
 	if credentials.is_empty() {
-		return Err(Error::NotFound);
+		return None;
 	}
 
 	// Convert to Passkey format
@@ -376,22 +375,32 @@ pub async fn get_login_challenge(
 
 	if passkeys.is_empty() {
 		warn!("No valid passkeys found for {}", id_tag.0);
-		return Err(Error::NotFound);
+		return None;
 	}
 
 	// Build webauthn and start authentication
-	let webauthn = build_webauthn(&id_tag.0)?;
-	let (rcr, auth_state) = webauthn.start_passkey_authentication(&passkeys).map_err(|e| {
-		warn!("WebAuthn start_passkey_authentication error: {:?}", e);
-		Error::Internal("WebAuthn authentication error".into())
-	})?;
+	let webauthn = build_webauthn(&id_tag.0)
+		.map_err(|e| warn!("WebAuthn build_webauthn error: {:?}", e))
+		.ok()?;
+	let (rcr, auth_state) = webauthn
+		.start_passkey_authentication(&passkeys)
+		.map_err(|e| {
+			warn!("WebAuthn start_passkey_authentication error: {:?}", e);
+		})
+		.ok()?;
 
 	// Serialize authentication state
 	let state_json = serde_json::to_string(&auth_state)
-		.map_err(|_| Error::Internal("Failed to serialize auth state".into()))?;
+		.map_err(|e| warn!("WebAuthn state serialization error: {:?}", e))
+		.ok()?;
 
 	// Get JWT secret
-	let jwt_secret = app.auth_adapter.read_var(TnId(0), "jwt_secret").await?;
+	let jwt_secret = app
+		.auth_adapter
+		.read_var(TnId(0), "jwt_secret")
+		.await
+		.map_err(|e| warn!("WebAuthn jwt_secret read error: {:?}", e))
+		.ok()?;
 
 	// Create challenge token
 	let claims = LoginChallengeToken {
@@ -400,14 +409,30 @@ pub async fn get_login_challenge(
 		state: state_json,
 		exp: now_secs() + CHALLENGE_EXPIRY_SECS,
 	};
-	let token = create_challenge_jwt(&claims, &jwt_secret)?;
+	let token = create_challenge_jwt(&claims, &jwt_secret)
+		.map_err(|e| warn!("WebAuthn challenge JWT creation error: {:?}", e))
+		.ok()?;
 
 	// Extract publicKey contents for @simplewebauthn/browser compatibility
 	let rcr_json = serde_json::to_value(&rcr)
-		.map_err(|_| Error::Internal("Failed to serialize challenge".into()))?;
+		.map_err(|e| warn!("WebAuthn rcr serialization error: {:?}", e))
+		.ok()?;
 	let options = rcr_json.get("publicKey").cloned().unwrap_or(rcr_json);
 
-	Ok((StatusCode::OK, Json(ApiResponse::new(LoginChallengeRes { options, token }))))
+	Some(LoginChallengeRes { options, token })
+}
+
+/// GET /api/auth/wa/login/challenge - Get login challenge
+pub async fn get_login_challenge(
+	State(app): State<App>,
+	id_tag: IdTag,
+	tn_id: TnId,
+) -> ClResult<(StatusCode, Json<ApiResponse<LoginChallengeRes>>)> {
+	info!("Getting WebAuthn login challenge for {}", id_tag.0);
+
+	let result = try_login_challenge(&app, &id_tag, tn_id).await.ok_or(Error::NotFound)?;
+
+	Ok((StatusCode::OK, Json(ApiResponse::new(result))))
 }
 
 /// POST /api/auth/wa/login - Authenticate with WebAuthn

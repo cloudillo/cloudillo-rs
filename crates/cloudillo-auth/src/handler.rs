@@ -1,6 +1,6 @@
 use axum::{
 	extract::{ConnectInfo, Query, State},
-	http::StatusCode,
+	http::{HeaderMap, StatusCode},
 	Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
@@ -40,7 +40,7 @@ fn generate_sw_encryption_key() -> String {
 
 /// # Login
 #[skip_serializing_none]
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Login {
 	// auth data
 	#[serde(rename = "tnId")]
@@ -970,6 +970,55 @@ pub async fn post_forgot_password(
 	}
 
 	Ok((StatusCode::OK, Json(success_response())))
+}
+
+// ============================================================================
+// POST /api/auth/login-init — Combined login initialization endpoint
+// ============================================================================
+
+#[derive(Serialize)]
+#[serde(tag = "status")]
+pub enum LoginInitResponse {
+	#[serde(rename = "authenticated")]
+	Authenticated { login: Login },
+	#[serde(rename = "unauthenticated")]
+	Unauthenticated {
+		#[serde(rename = "qrLogin")]
+		qr_login: crate::qr_login::InitResponse,
+		#[serde(rename = "webAuthn")]
+		web_authn: Option<crate::webauthn::LoginChallengeRes>,
+	},
+}
+
+pub async fn post_login_init(
+	State(app): State<App>,
+	OptionalAuth(auth): OptionalAuth,
+	tn_id: TnId,
+	id_tag: IdTag,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	headers: HeaderMap,
+) -> ClResult<(StatusCode, Json<ApiResponse<LoginInitResponse>>)> {
+	if let Some(auth) = auth {
+		// Authenticated path: create fresh login token (replaces login-token)
+		info!("login-init for authenticated user {}", &auth.id_tag);
+		let auth_login = app.auth_adapter.create_tenant_login(&auth.id_tag).await?;
+		let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
+		let response = ApiResponse::new(LoginInitResponse::Authenticated { login: login_data })
+			.with_req_id(req_id.unwrap_or_default());
+		Ok((StatusCode::OK, Json(response)))
+	} else {
+		// Unauthenticated path: return QR + WebAuthn init data
+		debug!("login-init for unauthenticated user");
+		let qr_result = crate::qr_login::create_session(&app, tn_id, &addr, &headers)?;
+		let wa_result = crate::webauthn::try_login_challenge(&app, &id_tag, tn_id).await;
+		let response = ApiResponse::new(LoginInitResponse::Unauthenticated {
+			qr_login: qr_result,
+			web_authn: wa_result,
+		})
+		.with_req_id(req_id.unwrap_or_default());
+		Ok((StatusCode::OK, Json(response)))
+	}
 }
 
 // vim: ts=4

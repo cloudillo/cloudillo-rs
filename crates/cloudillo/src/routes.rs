@@ -127,6 +127,10 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/auth/password", post(auth::handler::post_password))
 		.route("/api/auth/vapid", get(push::handler::get_vapid_public_key))
 
+		// --- QR Login (Protected) ---
+		.route("/api/auth/qr-login/{session_id}/details", get(auth::qr_login::get_details))
+		.route("/api/auth/qr-login/{session_id}/respond", post(auth::qr_login::post_respond))
+
 		// --- WebAuthn (Passkey) Management ---
 		.route("/api/auth/wa/reg", get(auth::webauthn::list_reg))
 		.route("/api/auth/wa/reg/challenge", get(auth::webauthn::get_reg_challenge))
@@ -238,10 +242,15 @@ fn init_public_routes(app: App) -> Router<App> {
 		.route("/api/auth/login-token", get(auth::handler::get_login_token))
 		.route("/api/auth/set-password", post(auth::handler::post_set_password))
 		.route("/api/auth/forgot-password", post(auth::handler::post_forgot_password))
-		.route("/api/auth/access-token", get(auth::handler::get_access_token))
 		// WebAuthn login endpoints
 		.route("/api/auth/wa/login/challenge", get(auth::webauthn::get_login_challenge))
 		.route("/api/auth/wa/login", post(auth::webauthn::post_login))
+		// Combined login init (replaces separate login-token + QR init + WebAuthn challenge)
+		.route("/api/auth/login-init", post(auth::handler::post_login_init))
+		// QR login init (public endpoint, kept for manual refresh)
+		.route("/api/auth/qr-login/init", post(auth::qr_login::post_init))
+		// QR login status (long-poll)
+		.route("/api/auth/qr-login/{session_id}/status", get(auth::qr_login::get_status))
 		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "auth", app.opts.mode));
 
 	// --- CRITICAL: Profile Creation Endpoints (strict rate limiting) ---
@@ -250,6 +259,12 @@ fn init_public_routes(app: App) -> Router<App> {
 		.route("/api/profiles/register", post(profile::register::post_register))
 		.route("/api/profiles/verify", post(profile::register::post_verify_profile))
 		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "auth", app.opts.mode));
+
+	// --- Token Exchange (federation rate limiting) ---
+	// access-token is called in batches during federation, needs higher limits than auth
+	let token_exchange_router = Router::new()
+		.route("/api/auth/access-token", get(auth::handler::get_access_token))
+		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "federation", app.opts.mode));
 
 	// --- CRITICAL: Federation Inbox (moderate rate limiting) ---
 	// Attack surface: spam, malicious payloads, resource exhaustion
@@ -291,6 +306,7 @@ fn init_public_routes(app: App) -> Router<App> {
 	Router::new()
 		.merge(auth_public_router)
 		.merge(profile_creation_router)
+		.merge(token_exchange_router)
 		.merge(federation_router)
 		.merge(websocket_router)
 		.merge(general_public_router)
