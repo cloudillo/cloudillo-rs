@@ -89,6 +89,8 @@ pub(crate) async fn list(
 	// Filter by document tree root
 	if let Some(root_id) = &opts.root_id {
 		query.push(" AND f.root_id=").push_bind(root_id.as_str());
+	} else {
+		query.push(" AND f.root_id IS NULL");
 	}
 
 	if let Some(tag) = &opts.tag {

@@ -215,6 +215,7 @@ pub async fn get_file_variant(
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetFileVariantSelector {
 	pub variant: Option<String>,
 	pub min_x: Option<u32>,
@@ -263,6 +264,11 @@ pub async fn get_file_descriptor(
 
 #[derive(Deserialize)]
 pub struct PostFileQuery {
+	#[serde(rename = "parentId")]
+	parent_id: Option<String>,
+	#[serde(rename = "rootId")]
+	root_id: Option<String>,
+	#[serde(rename = "createdAt")]
 	created_at: Option<Timestamp>,
 	tags: Option<String>,
 	/// Visibility level: P=Public, V=Verified, F=Follower, C=Connected, NULL=Direct
@@ -282,6 +288,7 @@ pub struct PostFileRequest {
 	/// Document tree root file_id (makes this a child in a document tree)
 	#[serde(rename = "rootId")]
 	root_id: Option<String>,
+	#[serde(rename = "createdAt")]
 	created_at: Option<Timestamp>,
 	tags: Option<String>,
 	/// Visibility level: P=Public, V=Verified, F=Follower, C=Connected, NULL=Direct
@@ -914,7 +921,10 @@ pub async fn post_file_blob(
 		.get(axum::http::header::CONTENT_TYPE)
 		.and_then(|v| v.to_str().ok())
 		.unwrap_or("application/octet-stream");
-	info!("post_file_blob: preset={}, content_type={}", preset_name, content_type);
+	info!(
+		"post_file_blob: preset={}, content_type={}, root_id={:?}, parent_id={:?}",
+		preset_name, content_type, query.root_id, query.parent_id
+	);
 
 	// Default visibility to 'C' (Connected) for community tenants
 	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
@@ -923,6 +933,20 @@ pub async fn post_file_blob(
 		None if matches!(tenant_meta.typ, meta_adapter::ProfileType::Community) => Some('C'),
 		None => None,
 	};
+
+	// Validate root_id if provided - the root file must exist and be a top-level file
+	if let Some(ref root_id) = query.root_id {
+		let root_file =
+			app.meta_adapter.read_file(tn_id, root_id).await?.ok_or_else(|| {
+				Error::ValidationError(format!("root file '{}' not found", root_id))
+			})?;
+		if root_file.root_id.is_some() {
+			return Err(Error::ValidationError(
+				"root_id must reference a top-level file (not a file that itself has a root_id)"
+					.into(),
+			));
+		}
+	}
 
 	// 1. Get preset (or default)
 	let preset = presets::get(&preset_name).unwrap_or_else(presets::default);
@@ -991,6 +1015,8 @@ pub async fn post_file_blob(
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						x: Some(json!({ "dim": dim })),
+						root_id: query.root_id.clone().map(Into::into),
+						parent_id: query.parent_id.clone().map(Into::into),
 						visibility,
 						..Default::default()
 					},
@@ -1033,6 +1059,8 @@ pub async fn post_file_blob(
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
+						root_id: query.root_id.clone().map(Into::into),
+						parent_id: query.parent_id.clone().map(Into::into),
 						visibility,
 						..Default::default()
 					},
@@ -1067,6 +1095,8 @@ pub async fn post_file_blob(
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
+						root_id: query.root_id.clone().map(Into::into),
+						parent_id: query.parent_id.clone().map(Into::into),
 						visibility,
 						..Default::default()
 					},
@@ -1102,6 +1132,8 @@ pub async fn post_file_blob(
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
+						root_id: query.root_id.clone().map(Into::into),
+						parent_id: query.parent_id.clone().map(Into::into),
 						visibility,
 						..Default::default()
 					},
@@ -1137,6 +1169,8 @@ pub async fn post_file_blob(
 						file_tp: Some("BLOB".into()),
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
+						root_id: query.root_id.clone().map(Into::into),
+						parent_id: query.parent_id.clone().map(Into::into),
 						visibility,
 						..Default::default()
 					},

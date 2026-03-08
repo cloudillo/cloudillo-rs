@@ -219,7 +219,9 @@ pub async fn delete_share(
 
 #[derive(Deserialize)]
 pub struct ListSharesBySubjectQuery {
+	#[serde(rename = "subjectType")]
 	pub subject_type: Option<char>,
+	#[serde(rename = "subjectId")]
 	pub subject_id: String,
 }
 
