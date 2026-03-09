@@ -23,10 +23,11 @@ use crate::{
 	video::VideoTranscoderTask,
 };
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
+use cloudillo_core::file_access;
 use cloudillo_types::blob_adapter;
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter;
-use cloudillo_types::types::{self, ApiResponse};
+use cloudillo_types::types::{self, ApiResponse, TokenScope};
 use cloudillo_types::utils;
 
 // Utility functions //
@@ -133,13 +134,20 @@ pub async fn get_file_list(
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<meta_adapter::FileView>>>)> {
 	// Set user_id_tag for user-specific data (pinned, starred, sorting by recent/modified)
-	let (subject_id_tag, is_authenticated, subject_roles) = match &maybe_auth {
+	let (subject_id_tag, is_authenticated, subject_roles, scope) = match &maybe_auth {
 		Some(auth) => {
 			opts.user_id_tag = Some(auth.id_tag.to_string());
-			(auth.id_tag.as_ref(), true, &auth.roles[..])
+			(auth.id_tag.as_ref(), true, &auth.roles[..], auth.scope.as_deref())
 		}
-		None => ("", false, &[][..]),
+		None => ("", false, &[][..], None),
 	};
+
+	// For scoped tokens, push scope constraint into the DB query
+	if let Some(scope_fid) = scope.and_then(TokenScope::parse).map(|ts| match ts {
+		TokenScope::File { file_id, .. } => file_id,
+	}) {
+		opts.scope_file_id = Some(scope_fid);
+	}
 
 	let limit = opts.limit.unwrap_or(30) as usize;
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
@@ -305,11 +313,14 @@ async fn handle_post_image(
 ) -> ClResult<serde_json::Value> {
 	let result = image::generate_image_variants(app, tn_id, f_id, bytes, preset).await?;
 
-	Ok(json!({
+	let mut data = json!({
 		"fileId": format!("@{}", f_id),
-		"thumbnailVariantId": result.thumbnail_variant_id,
 		"dim": [result.dim.0, result.dim.1]
-	}))
+	});
+	if let Some(thumb_id) = result.thumbnail_variant_id {
+		data["thumbnailVariantId"] = serde_json::Value::String(thumb_id);
+	}
+	Ok(data)
 }
 
 /// Handle SVG upload - sanitize, rasterize thumbnail, and store
@@ -844,6 +855,9 @@ pub async fn post_file(
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	info!("POST /api/files - Creating file with fileTp={}", req.file_tp);
 
+	// Scope check: scoped tokens can only create children under the scoped root
+	file_access::check_scope_allows_create(auth.scope.as_deref(), req.root_id.as_deref())?;
+
 	// Generate file_id
 	let file_id = utils::random_id()?;
 
@@ -916,6 +930,9 @@ pub async fn post_file_blob(
 	// Max file size constants (in MiB, using binary units)
 	const BYTES_PER_MIB: usize = 1_048_576; // 1024 * 1024
 	const DEFAULT_MAX_SIZE_MIB: i64 = 50;
+
+	// Scope check: scoped tokens can only create children under the scoped root
+	file_access::check_scope_allows_create(auth.scope.as_deref(), query.root_id.as_deref())?;
 
 	let content_type = header
 		.get(axum::http::header::CONTENT_TYPE)

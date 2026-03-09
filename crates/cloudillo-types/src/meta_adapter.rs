@@ -544,6 +544,10 @@ pub struct ListFileOptions {
 	/// User id_tag for user-specific data (set by handler, not from query)
 	#[serde(skip)]
 	pub user_id_tag: Option<String>,
+	/// Scope file_id filter: returns files matching this file_id OR having this root_id.
+	/// Overrides the normal root_id IS NULL constraint. Set by handler for scoped tokens.
+	#[serde(skip)]
+	pub scope_file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

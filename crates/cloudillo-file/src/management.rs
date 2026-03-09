@@ -11,8 +11,9 @@ use serde_json::json;
 use crate::prelude::*;
 use cloudillo_core::abac::VisibilityLevel;
 use cloudillo_core::extract::{Auth, OptionalRequestId};
+use cloudillo_core::file_access;
 use cloudillo_types::meta_adapter::{self, UpdateFileOptions};
-use cloudillo_types::types::ApiResponse;
+use cloudillo_types::types::{AccessLevel, ApiResponse};
 use cloudillo_types::utils;
 
 /// Special folder ID for trash
@@ -237,10 +238,22 @@ pub async fn patch_file_user_data(
 	Json(req): Json<PatchFileUserDataRequest>,
 ) -> ClResult<Json<PatchFileUserDataResponse>> {
 	// Check if file exists
-	let _file = app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or_else(|| {
+	let file = app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or_else(|| {
 		warn!("patch_file_user_data: File {} not found", file_id);
 		Error::NotFound
 	})?;
+
+	// Scope check: file must be within scope
+	if matches!(
+		file_access::check_scope_allows_file(
+			auth.scope.as_deref(),
+			&file_id,
+			file.root_id.as_deref()
+		),
+		file_access::ScopeCheck::Denied
+	) {
+		return Err(Error::PermissionDenied);
+	}
 
 	// Update user-specific data
 	let user_data = app
@@ -283,6 +296,20 @@ pub async fn duplicate_file(
 		warn!("duplicate_file: File {} not found", file_id);
 		Error::NotFound
 	})?;
+
+	// Scope check: source file must be within scope and scope must grant Write
+	let scope_check = file_access::check_scope_allows_file(
+		auth.scope.as_deref(),
+		&file_id,
+		file.root_id.as_deref(),
+	);
+	match scope_check {
+		// No scope restriction or scope grants Write — allow duplication
+		file_access::ScopeCheck::NoScope | file_access::ScopeCheck::Allowed(AccessLevel::Write) => {
+		}
+		// Read-only scope, Denied, or any other level — reject
+		_ => return Err(Error::PermissionDenied),
+	}
 
 	// 2. Validate file type
 	let file_tp = file.file_tp.as_deref().unwrap_or("BLOB");

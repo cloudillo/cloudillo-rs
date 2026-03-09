@@ -150,7 +150,8 @@ pub async fn get_access_level_with_scope(
 				}
 			}
 		}
-		// Non-file scope or parse failure, fall through to normal access check
+		// Scope string present but unparseable — deny access (least privilege)
+		return AccessLevel::None;
 	}
 
 	// Fall back to existing logic (ownership, roles, FSHR actions)
@@ -226,6 +227,73 @@ pub async fn check_file_access_with_scope(
 	let read_only = access_level == AccessLevel::Read;
 
 	Ok(FileAccessResult { file_view, access_level, read_only })
+}
+
+/// Result of checking whether a file is allowed by scope
+pub enum ScopeCheck {
+	/// No scope restriction — fall through to normal access checks
+	NoScope,
+	/// File is within scope with this access level
+	Allowed(AccessLevel),
+	/// File is outside scope — deny access
+	Denied,
+}
+
+/// Check if a file operation is allowed by scope.
+///
+/// Returns `ScopeCheck::NoScope` when there is no scope restriction,
+/// `ScopeCheck::Allowed(level)` when the file is within scope,
+/// or `ScopeCheck::Denied` when the file is outside scope.
+pub fn check_scope_allows_file(
+	scope: Option<&str>,
+	file_id: &str,
+	root_id: Option<&str>,
+) -> ScopeCheck {
+	let Some(scope_str) = scope else { return ScopeCheck::NoScope };
+	// If a scope string is present but can't be parsed, deny access (least privilege)
+	let Some(token_scope) = TokenScope::parse(scope_str) else { return ScopeCheck::Denied };
+	match &token_scope {
+		TokenScope::File { file_id: scope_file_id, access } => {
+			// Direct match: scope matches this file_id
+			if scope_file_id == file_id {
+				return ScopeCheck::Allowed(*access);
+			}
+			// Document tree check: scope is for a root, this file is a child
+			if let Some(root) = root_id {
+				if scope_file_id.as_str() == root {
+					return ScopeCheck::Allowed(*access);
+				}
+			}
+			ScopeCheck::Denied
+		}
+	}
+}
+
+/// Check if a scoped token allows write access for file creation.
+///
+/// For scoped tokens, file creation is only allowed when:
+/// - The scope grants Write access
+/// - The file has a root_id that matches the scope's file_id
+///   (i.e., the new file is a child in the scoped document tree)
+///
+/// Returns Ok(()) if allowed, Err if denied.
+pub fn check_scope_allows_create(scope: Option<&str>, root_id: Option<&str>) -> Result<(), Error> {
+	let Some(scope_str) = scope else { return Ok(()) };
+	// If a scope string is present but can't be parsed, deny access (least privilege)
+	let Some(token_scope) = TokenScope::parse(scope_str) else {
+		return Err(Error::PermissionDenied);
+	};
+	match &token_scope {
+		TokenScope::File { file_id: scope_file_id, access } => {
+			if *access != AccessLevel::Write {
+				return Err(Error::PermissionDenied);
+			}
+			match root_id {
+				Some(root) if root == scope_file_id => Ok(()),
+				_ => Err(Error::PermissionDenied),
+			}
+		}
+	}
 }
 
 // vim: ts=4

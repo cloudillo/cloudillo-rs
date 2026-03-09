@@ -381,7 +381,8 @@ impl Task<App> for FileIdGeneratorTask {
 			"FILE_ID_GENERATED",
 			serde_json::json!({
 				"tempId": format!("@{}", self.f_id),
-				"fileId": file_id
+				"fileId": file_id,
+				"rootId": root_id
 			}),
 			"system",
 		);

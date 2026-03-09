@@ -66,7 +66,16 @@ pub(crate) async fn list(
 	query.push_bind(tn_id.0);
 
 	if let Some(file_id) = &opts.file_id {
-		query.push(" AND f.file_id=").push_bind(file_id.as_str());
+		if let Some(f_id_str) = file_id.strip_prefix('@') {
+			if let Ok(f_id) = f_id_str.parse::<i64>() {
+				query.push(" AND f.f_id=").push_bind(f_id);
+			} else {
+				// Invalid @-prefixed ID: ensure no results are returned
+				query.push(" AND 1=0");
+			}
+		} else {
+			query.push(" AND f.file_id=").push_bind(file_id.as_str());
+		}
 	}
 
 	// Filter by parent folder
@@ -86,8 +95,17 @@ pub(crate) async fn list(
 			.push(")");
 	}
 
-	// Filter by document tree root
-	if let Some(root_id) = &opts.root_id {
+	// Scope filter: file_id matches OR root_id matches (for scoped tokens)
+	// This overrides the normal root_id filter since scoped access spans the tree
+	if let Some(scope_fid) = &opts.scope_file_id {
+		query
+			.push(" AND (f.file_id=")
+			.push_bind(scope_fid.as_str())
+			.push(" OR f.root_id=")
+			.push_bind(scope_fid.as_str())
+			.push(")");
+	} else if let Some(root_id) = &opts.root_id {
+		// Filter by document tree root
 		query.push(" AND f.root_id=").push_bind(root_id.as_str());
 	} else {
 		query.push(" AND f.root_id IS NULL");
