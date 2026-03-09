@@ -164,8 +164,8 @@ pub fn detect_image_type(buf: &[u8]) -> Option<String> {
 
 /// Result of image variant generation
 pub struct ImageVariantResult {
-	/// Variant ID for the thumbnail variant (created synchronously)
-	pub thumbnail_variant_id: String,
+	/// Variant ID for the thumbnail variant (created synchronously), None if no thumbnail
+	pub thumbnail_variant_id: Option<String>,
 	/// TaskId of the FileIdGeneratorTask (for chaining dependencies)
 	pub file_id_task: TaskId,
 	/// Original image dimensions (width, height)
@@ -228,90 +228,103 @@ pub async fn generate_image_variants(
 	let orig_dim = get_image_dimensions(bytes).await?;
 	info!("Original image dimensions: {}x{}", orig_dim.0, orig_dim.1);
 
-	// Conditionally store original blob based on preset
-	let (orig_variant_id, orig_available) = if preset.store_original {
+	// Conditionally store original blob and create variant record
+	if preset.store_original {
 		// Store original blob
 		let variant_id =
 			store::create_blob_buf(app, tn_id, bytes, blob_adapter::CreateBlobOptions::default())
 				.await?;
-		(variant_id, true)
-	} else {
-		// Don't store blob, but compute content hash for the variant_id
+
+		// Create "orig" variant record
+		app.meta_adapter
+			.create_file_variant(
+				tn_id,
+				f_id,
+				meta_adapter::FileVariant {
+					variant_id: variant_id.as_ref(),
+					variant: "orig",
+					format: orig_format,
+					resolution: orig_dim,
+					size: bytes.len() as u64,
+					available: true,
+					duration: None,
+					bitrate: None,
+					page_count: None,
+				},
+			)
+			.await?;
+	}
+
+	// Compute content hash and temp file path for async variant tasks
+	let orig_content_id = {
 		use cloudillo_types::hasher;
-		let variant_id = hasher::hash("b", bytes);
-		(variant_id, false)
+		hasher::hash("b", bytes)
 	};
+	let orig_file = app.opts.tmp_dir.join::<&str>(&orig_content_id);
 
-	// Create "orig" variant record (always created, but available depends on store_original)
-	app.meta_adapter
-		.create_file_variant(
+	// Only write temp file if there are async variant tasks that need it
+	if !preset.image_variants.is_empty() {
+		tokio::fs::write(&orig_file, bytes).await?;
+	}
+
+	// Conditionally create thumbnail variant synchronously
+	let thumbnail_variant_id = if let Some(ref tn_variant_name) = preset.thumbnail_variant {
+		let thumbnail_tier = preset::get_image_tier(tn_variant_name);
+
+		// Determine format for thumbnail variant
+		let tn_format = thumbnail_tier.and_then(|t| t.format).unwrap_or(thumbnail_format);
+		let tn_max_dim = thumbnail_tier.map_or(256, |t| t.max_dim);
+
+		// Generate thumbnail variant synchronously
+		let resized_tn =
+			resize_image(app.clone(), bytes.to_vec(), tn_format, (tn_max_dim, tn_max_dim)).await?;
+
+		let thumb_variant_id = store::create_blob_buf(
+			app,
 			tn_id,
-			f_id,
-			meta_adapter::FileVariant {
-				variant_id: orig_variant_id.as_ref(),
-				variant: "orig",
-				format: orig_format,
-				resolution: orig_dim,
-				size: bytes.len() as u64,
-				available: orig_available,
-				duration: None,
-				bitrate: None,
-				page_count: None,
-			},
+			&resized_tn.bytes,
+			blob_adapter::CreateBlobOptions::default(),
 		)
 		.await?;
 
-	// Save original to temp file for async variant tasks
-	let orig_file = app.opts.tmp_dir.join::<&str>(&orig_variant_id);
-	tokio::fs::write(&orig_file, bytes).await?;
-
-	// Determine thumbnail variant to create synchronously
-	let thumbnail_variant = preset.thumbnail_variant.as_deref().unwrap_or("vis.tn");
-	let thumbnail_tier = preset::get_image_tier(thumbnail_variant);
-
-	// Determine format for thumbnail variant
-	let tn_format = thumbnail_tier.and_then(|t| t.format).unwrap_or(thumbnail_format);
-	let tn_max_dim = thumbnail_tier.map_or(256, |t| t.max_dim);
-
-	// Generate thumbnail variant synchronously
-	let resized_tn =
-		resize_image(app.clone(), bytes.to_vec(), tn_format, (tn_max_dim, tn_max_dim)).await?;
-
-	let thumbnail_variant_id = store::create_blob_buf(
-		app,
-		tn_id,
-		&resized_tn.bytes,
-		blob_adapter::CreateBlobOptions::default(),
-	)
-	.await?;
-
-	app.meta_adapter
-		.create_file_variant(
-			tn_id,
-			f_id,
-			meta_adapter::FileVariant {
-				variant_id: thumbnail_variant_id.as_ref(),
-				variant: thumbnail_variant,
-				format: tn_format.as_ref(),
-				resolution: (resized_tn.width, resized_tn.height),
-				size: resized_tn.bytes.len() as u64,
-				available: true,
-				duration: None,
-				bitrate: None,
-				page_count: None,
-			},
-		)
-		.await?;
+		app.meta_adapter
+			.create_file_variant(
+				tn_id,
+				f_id,
+				meta_adapter::FileVariant {
+					variant_id: thumb_variant_id.as_ref(),
+					variant: tn_variant_name,
+					format: tn_format.as_ref(),
+					resolution: (resized_tn.width, resized_tn.height),
+					size: resized_tn.bytes.len() as u64,
+					available: true,
+					duration: None,
+					bitrate: None,
+					page_count: None,
+				},
+			)
+			.await?;
+		Some(String::from(thumb_variant_id))
+	} else {
+		None
+	};
 
 	// Smart variant creation: skip creating variants if image is too small or too close in size
 	let original_max = u32_to_f32(orig_dim.0.max(orig_dim.1));
 	let mut variant_task_ids = Vec::new();
+	let tn_max_dim = preset
+		.thumbnail_variant
+		.as_deref()
+		.and_then(preset::get_image_tier)
+		.map_or(0, |t| t.max_dim);
+	// When no thumbnail was created (tn_max_dim=0), last_created_size=0.0 is safe:
+	// min_required_increase will be 0.0, so any positive variant size passes the `>` check.
 	let mut last_created_size = u32_to_f32(tn_max_dim);
 
 	// Create visual variants from preset's image_variants
 	for variant_name in &preset.image_variants {
 		// Skip the thumbnail variant (already created synchronously)
-		if variant_name == thumbnail_variant {
+		if preset.thumbnail_variant.as_deref() == Some(variant_name.as_str()) {
 			continue;
 		}
 		// Skip variants exceeding max_generate_variant setting
@@ -375,11 +388,7 @@ pub async fn generate_image_variants(
 	}
 	let file_id_task = builder.schedule().await?;
 
-	Ok(ImageVariantResult {
-		thumbnail_variant_id: thumbnail_variant_id.into(),
-		file_id_task,
-		dim: orig_dim,
-	})
+	Ok(ImageVariantResult { thumbnail_variant_id, file_id_task, dim: orig_dim })
 }
 
 /// Image resizer Task

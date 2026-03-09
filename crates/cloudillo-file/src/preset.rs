@@ -222,6 +222,44 @@ pub mod presets {
 		}
 	}
 
+	/// Original-only preset - store original as-is, no processing at all
+	pub fn orig_only() -> FilePreset {
+		FilePreset {
+			name: "orig-only".to_string(),
+			allowed_media_classes: vec![
+				VariantClass::Visual,
+				VariantClass::Video,
+				VariantClass::Audio,
+				VariantClass::Document,
+				VariantClass::Raw,
+			],
+			image_variants: vec![],
+			video_variants: vec![],
+			audio_variants: vec![],
+			extract_audio: false,
+			generate_thumbnail: false,
+			max_variant: None,
+			thumbnail_variant: None,
+			store_original: true,
+		}
+	}
+
+	/// Thumbnail-only preset - generate only a thumbnail, don't store original
+	pub fn thumbnail_only() -> FilePreset {
+		FilePreset {
+			name: "thumbnail-only".to_string(),
+			allowed_media_classes: vec![VariantClass::Visual],
+			image_variants: vec![],
+			video_variants: vec![],
+			audio_variants: vec![],
+			extract_audio: false,
+			generate_thumbnail: true,
+			max_variant: None,
+			thumbnail_variant: Some("vis.tn".into()),
+			store_original: false,
+		}
+	}
+
 	/// Get preset by name
 	pub fn get(name: &str) -> Option<FilePreset> {
 		match name {
@@ -233,6 +271,8 @@ pub mod presets {
 			"video" => Some(video()),
 			"profile-picture" => Some(profile_picture()),
 			"cover" => Some(cover()),
+			"orig-only" => Some(orig_only()),
+			"thumbnail-only" => Some(thumbnail_only()),
 			_ => None,
 		}
 	}
@@ -248,6 +288,8 @@ pub mod presets {
 			"video",
 			"profile-picture",
 			"cover",
+			"orig-only",
+			"thumbnail-only",
 		]
 	}
 }
@@ -342,6 +384,28 @@ mod tests {
 		assert!(presets::get("default").is_some());
 		assert!(presets::get("podcast").is_some());
 		assert!(presets::get("nonexistent").is_none());
+	}
+
+	#[test]
+	fn test_orig_only_preset() {
+		let preset = presets::orig_only();
+		assert_eq!(preset.name, "orig-only");
+		assert!(preset.image_variants.is_empty());
+		assert!(preset.video_variants.is_empty());
+		assert!(preset.audio_variants.is_empty());
+		assert!(preset.thumbnail_variant.is_none());
+		assert!(preset.store_original);
+		assert!(!preset.generate_thumbnail);
+	}
+
+	#[test]
+	fn test_thumbnail_only_preset() {
+		let preset = presets::thumbnail_only();
+		assert_eq!(preset.name, "thumbnail-only");
+		assert!(preset.image_variants.is_empty());
+		assert!(!preset.store_original);
+		assert_eq!(preset.thumbnail_variant.as_deref(), Some("vis.tn"));
+		assert!(preset.generate_thumbnail);
 	}
 
 	#[test]
