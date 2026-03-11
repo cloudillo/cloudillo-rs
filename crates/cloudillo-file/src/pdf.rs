@@ -78,6 +78,95 @@ pub fn generate_pdf_thumbnail(input: &Path, output: &Path, dpi: u32) -> ClResult
 	Ok(())
 }
 
+/// Result of PDF thumbnail generation
+#[derive(Debug)]
+pub struct PdfThumbnailResult {
+	pub page_count: u32,
+	pub variant_id: String,
+}
+
+/// Generate PDF thumbnail synchronously during upload.
+///
+/// Extracts PDF info, renders first page, resizes to webp, stores blob + variant.
+pub async fn generate_pdf_thumbnail_variant(
+	app: &App,
+	tn_id: TnId,
+	f_id: u64,
+	input_path: &Path,
+	thumbnail_size: u32,
+) -> ClResult<PdfThumbnailResult> {
+	// Create temp file for thumbnail in app's tmp_dir
+	let thumb_name = format!("pdf_thumb_{}.png", f_id);
+	let thumb_path = app.opts.tmp_dir.join(&thumb_name);
+
+	// Get PDF info and generate thumbnail in worker thread
+	let input_path_owned = input_path.to_path_buf();
+	let thumb_path_clone = thumb_path.clone();
+
+	let pdf_info = app
+		.worker
+		.try_run(move || {
+			let info = get_pdf_info(&input_path_owned)?;
+			generate_pdf_thumbnail(&input_path_owned, &thumb_path_clone, 150)?;
+			Ok::<_, Error>(info)
+		})
+		.await?;
+
+	info!("Extracted PDF info: {} pages from {:?}", pdf_info.page_count, input_path);
+
+	// Read the generated thumbnail PNG and resize it
+	let thumb_bytes = tokio::fs::read(&thumb_path).await?;
+	let _ = tokio::fs::remove_file(&thumb_path).await;
+
+	let resize_result = image::resize_image(
+		app.clone(),
+		thumb_bytes,
+		image::ImageFormat::Webp,
+		(thumbnail_size, thumbnail_size),
+	)
+	.await
+	.map_err(|e| Error::Internal(format!("thumbnail resize failed: {}", e)))?;
+
+	info!(
+		"PDF thumbnail {:?} → {}x{} ({}bytes), {} pages",
+		input_path,
+		resize_result.width,
+		resize_result.height,
+		resize_result.bytes.len(),
+		pdf_info.page_count
+	);
+
+	// Create blob from thumbnail
+	let variant_id = store::create_blob_buf(
+		app,
+		tn_id,
+		&resize_result.bytes,
+		blob_adapter::CreateBlobOptions::default(),
+	)
+	.await?;
+
+	// Store thumbnail variant metadata
+	app.meta_adapter
+		.create_file_variant(
+			tn_id,
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: &variant_id,
+				variant: "vis.tn",
+				format: "webp",
+				resolution: (resize_result.width, resize_result.height),
+				size: resize_result.bytes.len() as u64,
+				available: true,
+				duration: None,
+				bitrate: None,
+				page_count: Some(pdf_info.page_count),
+			},
+		)
+		.await?;
+
+	Ok(PdfThumbnailResult { page_count: pdf_info.page_count, variant_id: variant_id.to_string() })
+}
+
 /// Check if PDF tools are available
 pub fn is_available() -> bool {
 	let pdfinfo = Command::new("pdfinfo")
@@ -152,82 +241,14 @@ impl Task<App> for PdfProcessorTask {
 			self.input_path, self.thumbnail_size
 		);
 
-		// Create temp file for thumbnail in app's tmp_dir
-		let thumb_name = format!("pdf_thumb_{}.png", self.f_id);
-		let thumb_path = app.opts.tmp_dir.join(&thumb_name);
-
-		// Get PDF info and generate thumbnail in worker thread
-		let input_path = self.input_path.clone();
-		let thumb_path_clone = thumb_path.clone();
-
-		let pdf_info = app
-			.worker
-			.try_run(move || {
-				// Get page count
-				let info = get_pdf_info(&input_path)?;
-
-				// Generate thumbnail at 150 DPI (good balance of quality vs size)
-				generate_pdf_thumbnail(&input_path, &thumb_path_clone, 150)?;
-
-				Ok::<_, Error>(info)
-			})
-			.await?;
-
-		info!("Extracted PDF info: {} pages from {:?}", pdf_info.page_count, self.input_path);
-
-		// Read the generated thumbnail PNG and resize it
-		let thumb_bytes = tokio::fs::read(&thumb_path).await?;
-
-		// Clean up temp thumbnail file
-		let _ = tokio::fs::remove_file(&thumb_path).await;
-
-		// Resize to final thumbnail size using image module
-		let thumbnail_size = self.thumbnail_size;
-		let resize_result = image::resize_image(
-			app.clone(),
-			thumb_bytes,
-			image::ImageFormat::Webp,
-			(thumbnail_size, thumbnail_size),
-		)
-		.await
-		.map_err(|e| Error::Internal(format!("thumbnail resize failed: {}", e)))?;
-
-		info!(
-			"Finished task pdf.process {:?} → {}x{} ({}bytes), {} pages",
-			self.input_path,
-			resize_result.width,
-			resize_result.height,
-			resize_result.bytes.len(),
-			pdf_info.page_count
-		);
-
-		// Create blob from thumbnail
-		let variant_id = store::create_blob_buf(
+		generate_pdf_thumbnail_variant(
 			app,
 			self.tn_id,
-			&resize_result.bytes,
-			blob_adapter::CreateBlobOptions::default(),
+			self.f_id,
+			&self.input_path,
+			self.thumbnail_size,
 		)
 		.await?;
-
-		// Store thumbnail variant metadata
-		app.meta_adapter
-			.create_file_variant(
-				self.tn_id,
-				self.f_id,
-				meta_adapter::FileVariant {
-					variant_id: &variant_id,
-					variant: "vis.tn",
-					format: "webp",
-					resolution: (resize_result.width, resize_result.height),
-					size: resize_result.bytes.len() as u64,
-					available: true,
-					duration: None,
-					bitrate: None,
-					page_count: Some(pdf_info.page_count),
-				},
-			)
-			.await?;
 
 		Ok(())
 	}

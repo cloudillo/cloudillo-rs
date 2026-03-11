@@ -16,7 +16,7 @@ use crate::{
 	descriptor::{self, FileIdGeneratorTask},
 	ffmpeg, filter, image,
 	image::ImageResizerTask,
-	pdf::PdfProcessorTask,
+	pdf,
 	preset::{self, get_audio_tier, get_image_tier, get_video_tier, presets},
 	store, svg,
 	variant::{self, VariantClass},
@@ -741,11 +741,22 @@ async fn handle_post_pdf(
 	f_id: u64,
 	bytes: &[u8],
 ) -> ClResult<serde_json::Value> {
-	// 1. Store original blob as doc.orig (PDFs always need original)
+	// 1. Store original blob
 	let orig_blob_id =
 		store::create_blob_buf(app, tn_id, bytes, blob_adapter::CreateBlobOptions::default())
 			.await?;
 
+	// 2. Write to temp file for thumbnail generation
+	let temp_path = app.opts.tmp_dir.join(format!("pdf_{}_{}", tn_id.0, f_id));
+	tokio::fs::write(&temp_path, bytes).await?;
+
+	// 3. Generate thumbnail synchronously (so vis.tn is available immediately)
+	let pdf_result = pdf::generate_pdf_thumbnail_variant(app, tn_id, f_id, &temp_path, 256).await?;
+
+	// 4. Clean up temp file
+	let _ = tokio::fs::remove_file(&temp_path).await;
+
+	// 5. Create doc.orig variant with page count (now known from PDF info)
 	app.meta_adapter
 		.create_file_variant(
 			tn_id,
@@ -759,28 +770,22 @@ async fn handle_post_pdf(
 				available: true,
 				duration: None,
 				bitrate: None,
-				page_count: None, // Will be updated by PdfProcessorTask
+				page_count: Some(pdf_result.page_count),
 			},
 		)
 		.await?;
 
-	// 2. Write to temp file for processing
-	let temp_path = app.opts.tmp_dir.join(format!("pdf_{}_{}", tn_id.0, f_id));
-	tokio::fs::write(&temp_path, bytes).await?;
-
-	// 3. Create PdfProcessorTask (extracts page count + thumbnail)
-	let pdf_task = PdfProcessorTask::new(tn_id, f_id, temp_path.clone(), 256);
-	let task_id = app.scheduler.add(pdf_task).await?;
-
-	// 4. Create FileIdGeneratorTask
+	// 6. Create FileIdGeneratorTask (no dependencies needed)
 	app.scheduler
 		.task(FileIdGeneratorTask::new(tn_id, f_id))
 		.key(format!("{},{}", tn_id, f_id))
-		.depend_on(vec![task_id])
 		.schedule()
 		.await?;
 
-	Ok(json!({"fileId": format!("@{}", f_id)}))
+	Ok(json!({
+		"fileId": format!("@{}", f_id),
+		"thumbnailVariantId": pdf_result.variant_id
+	}))
 }
 
 /// Handle raw file upload - streams body to temp file, stores as-is
