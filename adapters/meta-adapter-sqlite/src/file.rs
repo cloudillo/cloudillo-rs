@@ -620,7 +620,7 @@ pub(crate) async fn create(
 	if let (Some(preset), Some(orig_variant_id)) = (&opts.preset, &opts.orig_variant_id) {
 		let file_id_exists: Option<Box<str>> = sqlx::query(
 			"SELECT min(f.file_id) FROM file_variants fv
-			JOIN files f ON f.tn_id=fv.tn_id AND f.f_id=fv.f_id AND f.preset=? AND f.file_id IS NOT NULL
+			JOIN files f ON f.tn_id=fv.tn_id AND f.f_id=fv.f_id AND f.preset=? AND f.file_id IS NOT NULL AND f.status != 'D'
 			WHERE fv.tn_id=? AND fv.variant_id=? AND fv.variant='orig'",
 		)
 		.bind(preset)
@@ -833,6 +833,29 @@ pub(crate) async fn finalize_file(
 			// file_id is NULL - proceed with finalization
 		}
 	}
+
+	// Remove soft-deleted file with same file_id to prevent UNIQUE constraint violation
+	// when re-uploading a file with identical content after deletion.
+	// Also remove associated file_variants for the deleted file.
+	sqlx::query(
+		"DELETE FROM file_variants WHERE tn_id = ? AND f_id IN \
+		 (SELECT f_id FROM files WHERE tn_id = ? AND file_id = ? AND status = 'D')",
+	)
+	.bind(tn_id.0)
+	.bind(tn_id.0)
+	.bind(file_id)
+	.execute(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+
+	sqlx::query("DELETE FROM files WHERE tn_id = ? AND file_id = ? AND status = 'D'")
+		.bind(tn_id.0)
+		.bind(file_id)
+		.execute(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 
 	// Set file_id and status='A' atomically for pending files
 	let res = sqlx::query(
@@ -1113,10 +1136,16 @@ pub(crate) async fn read(
 
 /// Delete a file (set status to 'D')
 pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, file_id: &str) -> ClResult<()> {
-	// Set status to 'D' (deleted)
-	sqlx::query("UPDATE files SET status = 'D' WHERE tn_id = ? AND file_id = ?")
+	let (where_col, id_bind) = if let Some(f_id_str) = file_id.strip_prefix('@') {
+		("f_id", f_id_str)
+	} else {
+		("file_id", file_id)
+	};
+
+	let sql = format!("UPDATE files SET status = 'D' WHERE tn_id = ? AND {} = ?", where_col);
+	sqlx::query(&sql)
 		.bind(tn_id.0)
-		.bind(file_id)
+		.bind(id_bind)
 		.execute(db)
 		.await
 		.inspect_err(inspect)
