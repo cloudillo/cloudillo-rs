@@ -79,11 +79,27 @@ async fn stream_body_to_file(body: Body, path: &PathBuf) -> ClResult<u64> {
 
 pub fn content_type_from_format(format: &str) -> &str {
 	match format {
+		// Image
 		"jpeg" => "image/jpeg",
 		"png" => "image/png",
 		"webp" => "image/webp",
 		"avif" => "image/avif",
+		"gif" => "image/gif",
 		"svg" => "image/svg+xml",
+		// Video
+		"mp4" => "video/mp4",
+		"webm" => "video/webm",
+		"mkv" => "video/x-matroska",
+		"avi" => "video/x-msvideo",
+		// Audio
+		"mp3" => "audio/mpeg",
+		"wav" => "audio/wav",
+		"ogg" => "audio/ogg",
+		"flac" => "audio/flac",
+		"aac" => "audio/aac",
+		"weba" => "audio/webm",
+		// Document
+		"pdf" => "application/pdf",
 		_ => "application/octet-stream",
 	}
 }
@@ -1214,6 +1230,17 @@ pub async fn post_file_blob(
 			}
 		}
 	}
+}
+
+/// GET /api/files/{file_id}/metadata
+pub async fn get_file_metadata(
+	State(app): State<App>,
+	tn_id: TnId,
+	extract::Path(file_id): extract::Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::FileView>>)> {
+	let file = app.meta_adapter.read_file(tn_id, &file_id).await?.ok_or(Error::NotFound)?;
+	Ok((StatusCode::OK, Json(ApiResponse::new(file).with_req_id(req_id.unwrap_or_default()))))
 }
 
 // vim: ts=4

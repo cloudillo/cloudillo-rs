@@ -232,6 +232,7 @@ fn init_public_routes(app: App) -> Router<App> {
 	let file_router_read = Router::new()
 		.route("/api/files/variant/{variant_id}", get(file::handler::get_file_variant))
 		.route("/api/files/{file_id}/descriptor", get(file::handler::get_file_descriptor))
+		.route("/api/files/{file_id}/metadata", get(file::handler::get_file_metadata))
 		.route("/api/files/{file_id}", get(file::handler::get_file_variant_file_id))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("read")));
 

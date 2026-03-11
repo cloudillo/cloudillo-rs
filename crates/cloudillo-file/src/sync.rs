@@ -5,12 +5,23 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::Deserialize;
+
 use crate::prelude::*;
 use crate::variant::{Variant, VariantClass};
 use cloudillo_types::blob_adapter::CreateBlobOptions;
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter::{CreateFile, FileId, FileVariant};
 use cloudillo_types::types::ApiResponse;
+
+/// Lightweight struct for deserializing remote file metadata
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteFileMetadata {
+	content_type: Option<String>,
+	file_name: String,
+	created_at: Timestamp,
+}
 
 /// Result of a file sync operation
 #[derive(Debug, Default)]
@@ -225,17 +236,28 @@ pub async fn sync_file_variants(
 		debug!("File {} already exists (f_id={}), syncing missing variants", file_id, f_id);
 		(Some(f_id), false)
 	} else {
+		// Fetch file metadata from remote to get correct content_type and file_name
+		let metadata_path = format!("/files/{}/metadata", file_id);
+		let remote_meta: ApiResponse<RemoteFileMetadata> = if auth {
+			app.request.get(tn_id, remote_id_tag, &metadata_path).await?
+		} else {
+			app.request.get_noauth(tn_id, remote_id_tag, &metadata_path).await?
+		};
+		let remote_file = remote_meta.data;
+
 		// Create file entry with file_id and status='P' (pending)
 		// Variants can be added to pending files, then finalize sets status='A'
-		// Use first variant from parsed_variants (always available) for file creation
 		let first_variant = &parsed_variants[0];
 		let create_opts = CreateFile {
 			orig_variant_id: Some(first_variant.variant_id.into()),
-			file_id: Some(file_id.into()), // Set file_id (enables deduplication)
+			file_id: Some(file_id.into()),
 			preset: Some("sync".into()),
-			content_type: format_to_content_type(first_variant.format).into(),
-			file_name: format!("synced.{}", format_to_extension(first_variant.format)).into(),
-			created_at: Some(Timestamp::now()),
+			content_type: remote_file
+				.content_type
+				.unwrap_or_else(|| "application/octet-stream".into())
+				.into(),
+			file_name: remote_file.file_name.into(),
+			created_at: Some(remote_file.created_at),
 			visibility: Some('D'), // Direct visibility for synced files
 			..Default::default()
 		};
@@ -391,30 +413,6 @@ async fn fetch_and_store_blob(
 		})?;
 
 	Ok(blob_size)
-}
-
-/// Convert format string to content type
-fn format_to_content_type(format: &str) -> &'static str {
-	match format.to_lowercase().as_str() {
-		"webp" => "image/webp",
-		"avif" => "image/avif",
-		"jpeg" | "jpg" => "image/jpeg",
-		"png" => "image/png",
-		"gif" => "image/gif",
-		_ => "application/octet-stream",
-	}
-}
-
-/// Convert format string to file extension
-fn format_to_extension(format: &str) -> &'static str {
-	match format.to_lowercase().as_str() {
-		"webp" => "webp",
-		"avif" => "avif",
-		"jpeg" | "jpg" => "jpg",
-		"png" => "png",
-		"gif" => "gif",
-		_ => "bin",
-	}
 }
 
 // vim: ts=4
