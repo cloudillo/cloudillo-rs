@@ -332,9 +332,15 @@ async fn create_ephemeral_action(
 		audience_tag: action.audience_tag.as_deref(),
 		action_type: action.typ.as_ref(),
 		sub_type: action.sub_typ.as_deref(),
+		parent_id: action.parent_id.as_deref(),
 		content: action.content.as_ref(),
 		attachments: None,
+		subject: action.subject.as_deref(),
+		created_at: Timestamp::now(),
 		status: None,
+		visibility: action.visibility,
+		flags: action.flags.as_deref(),
+		x: action.x.as_ref(),
 	};
 	let _result = forward::forward_outbound_action(app, tn_id, &params).await;
 

@@ -56,6 +56,14 @@ impl Timestamp {
 	pub fn add_seconds(&self, seconds: i64) -> Timestamp {
 		Timestamp(self.0 + seconds)
 	}
+
+	/// Format as ISO 8601 string (e.g. "2024-01-15T12:00:00Z")
+	pub fn to_iso_string(&self) -> String {
+		use chrono::{DateTime, SecondsFormat};
+		DateTime::from_timestamp(self.0, 0)
+			.unwrap_or_default()
+			.to_rfc3339_opts(SecondsFormat::Secs, true)
+	}
 }
 
 impl std::fmt::Display for Timestamp {

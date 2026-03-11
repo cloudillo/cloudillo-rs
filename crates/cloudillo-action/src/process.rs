@@ -826,9 +826,15 @@ async fn forward_inbound_action_to_websocket(
 		audience_tag: action.aud.as_deref(),
 		action_type: &action_type,
 		sub_type: subtype.as_deref(),
+		parent_id: action.p.as_deref(),
 		content: action.c.as_ref(),
 		attachments: attachments.as_deref(),
+		subject: action.sub.as_deref(),
+		created_at: action.iat,
 		status: None,
+		visibility: action.v,
+		flags: action.f.as_deref(),
+		x: None,
 	};
 
 	let result = forward::forward_inbound_action(app, tn_id, &params).await;

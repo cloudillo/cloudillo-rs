@@ -13,8 +13,7 @@ use crate::{
 	delivery::ActionDeliveryTask,
 	dsl::DslEngine,
 	fanout::schedule_subscriber_fanout,
-	forward::{self, ForwardActionParams},
-	helpers,
+	forward, helpers,
 	hooks::{HookContext, HookType},
 	prelude::*,
 };
@@ -205,32 +204,17 @@ async fn execute_hook(
 }
 
 /// Forward action to connected WebSocket clients
+///
+/// Fetches the full ActionView from the database so that WebSocket messages
+/// contain all fields (createdAt, issuer name/profilePic, etc.) matching
+/// the API response format.
 async fn forward_to_websocket(
 	app: &App,
 	tn_id: TnId,
 	action: &meta_adapter::Action<Box<str>>,
-	attachment_views: Option<&[AttachmentView]>,
+	_attachment_views: Option<&[AttachmentView]>,
 	ctx: &ProcessingContext,
 ) {
-	let content_parsed: Option<serde_json::Value> =
-		action.content.as_ref().and_then(|s| serde_json::from_str(s).ok());
-
-	// Query current status (hooks may have set it)
-	let action_view = app.meta_adapter.get_action(tn_id, &action.action_id).await.ok().flatten();
-	let status_str: Option<String> = action_view.and_then(|a| a.status.map(|s| s.to_string()));
-
-	let params = ForwardActionParams {
-		action_id: &action.action_id,
-		temp_id: ctx.temp_id(),
-		issuer_tag: &action.issuer_tag,
-		audience_tag: action.audience_tag.as_deref(),
-		action_type: &action.typ,
-		sub_type: action.sub_typ.as_deref(),
-		content: content_parsed.as_ref(),
-		attachments: attachment_views,
-		status: status_str.as_deref(),
-	};
-
 	debug!(
 		action_id = %action.action_id,
 		action_type = %action.typ,
@@ -240,10 +224,21 @@ async fn forward_to_websocket(
 		"WS forward preparing"
 	);
 
-	let result = if ctx.is_outbound() {
-		forward::forward_outbound_action(app, tn_id, &params).await
+	// Fetch the full ActionView so WS messages match the API response format
+	let action_view = app.meta_adapter.get_action(tn_id, &action.action_id).await.ok().flatten();
+
+	let result = if let Some(ref view) = action_view {
+		if ctx.is_outbound() {
+			forward::forward_action_view(app, tn_id, view, ctx.temp_id()).await
+		} else {
+			forward::forward_inbound_action_view(app, tn_id, view, ctx.temp_id()).await
+		}
 	} else {
-		forward::forward_inbound_action(app, tn_id, &params).await
+		warn!(
+			action_id = %action.action_id,
+			"ActionView not found for WS forwarding, skipping"
+		);
+		return;
 	};
 
 	debug!(

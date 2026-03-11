@@ -9,7 +9,7 @@
 
 use crate::prelude::*;
 use cloudillo_core::ws_broadcast::{BroadcastMessage, DeliveryResult};
-use cloudillo_types::meta_adapter::AttachmentView;
+use cloudillo_types::meta_adapter::{ActionView, AttachmentView};
 use serde_json::json;
 
 /// Result of forwarding an action
@@ -32,9 +32,15 @@ pub struct ForwardActionParams<'a> {
 	pub audience_tag: Option<&'a str>,
 	pub action_type: &'a str,
 	pub sub_type: Option<&'a str>,
+	pub parent_id: Option<&'a str>,
 	pub content: Option<&'a serde_json::Value>,
 	pub attachments: Option<&'a [AttachmentView]>,
+	pub subject: Option<&'a str>,
+	pub created_at: Timestamp,
 	pub status: Option<&'a str>,
+	pub visibility: Option<char>,
+	pub flags: Option<&'a str>,
+	pub x: Option<&'a serde_json::Value>,
 }
 
 /// Forward an action to WebSocket clients
@@ -107,7 +113,52 @@ async fn forward_to_user(
 	}
 }
 
-/// Build a BroadcastMessage for an action
+/// Build a BroadcastMessage from a full ActionView
+///
+/// Used by post_store when the full ActionView is available from the database.
+fn build_action_view_message(action_view: &ActionView, temp_id: Option<&str>) -> BroadcastMessage {
+	let mut data = serde_json::to_value(action_view).unwrap_or_default();
+	if let Some(tid) = temp_id {
+		data["tempId"] = json!(tid);
+	}
+	BroadcastMessage::new("ACTION", data, "system")
+}
+
+/// Forward a full ActionView to the audience user via WebSocket
+pub async fn forward_action_view(
+	app: &App,
+	tn_id: TnId,
+	action_view: &ActionView,
+	temp_id: Option<&str>,
+) -> ForwardResult {
+	let msg = build_action_view_message(action_view, temp_id);
+	if let Some(ref audience) = action_view.audience {
+		forward_to_user(app, tn_id, &audience.id_tag, msg).await
+	} else {
+		ForwardResult { delivered: false, connection_count: 0, user_offline: false }
+	}
+}
+
+/// Forward a full ActionView as an inbound action (broadcast to tenant)
+pub async fn forward_inbound_action_view(
+	app: &App,
+	tn_id: TnId,
+	action_view: &ActionView,
+	temp_id: Option<&str>,
+) -> ForwardResult {
+	let msg = build_action_view_message(action_view, temp_id);
+	let delivered = app.broadcast.send_to_tenant(tn_id, msg).await;
+
+	ForwardResult {
+		delivered: delivered > 0,
+		connection_count: delivered,
+		user_offline: delivered == 0,
+	}
+}
+
+/// Build a BroadcastMessage for an action from params
+///
+/// Used by process.rs and task.rs when a full ActionView is not available.
 fn build_action_message(params: &ForwardActionParams<'_>) -> BroadcastMessage {
 	BroadcastMessage::new(
 		"ACTION",
@@ -116,13 +167,19 @@ fn build_action_message(params: &ForwardActionParams<'_>) -> BroadcastMessage {
 			"tempId": params.temp_id,
 			"type": params.action_type,
 			"subType": params.sub_type,
+			"parentId": params.parent_id,
 			"issuer": {
 				"idTag": params.issuer_tag
 			},
 			"audience": params.audience_tag.map(|a| json!({"idTag": a})),
 			"content": params.content,
 			"attachments": params.attachments,
+			"subject": params.subject,
+			"createdAt": params.created_at.to_iso_string(),
 			"status": params.status,
+			"visibility": params.visibility,
+			"flags": params.flags,
+			"x": params.x,
 		}),
 		"system",
 	)
