@@ -480,7 +480,7 @@ async fn handle_post_video_stream(
 				f_id,
 				meta_adapter::FileVariant {
 					variant_id: &orig_blob_id,
-					variant: "vid.orig",
+					variant: "orig",
 					format: format_from_content_type(content_type).unwrap_or("mp4"),
 					resolution,
 					size: total_size,
@@ -684,7 +684,7 @@ async fn handle_post_audio_stream(
 				f_id,
 				meta_adapter::FileVariant {
 					variant_id: &orig_blob_id,
-					variant: "aud.orig",
+					variant: "orig",
 					format: format_from_content_type(content_type).unwrap_or("mp3"),
 					resolution: (0, 0),
 					size: total_size,
@@ -763,7 +763,7 @@ async fn handle_post_pdf(
 			f_id,
 			meta_adapter::FileVariant {
 				variant_id: &orig_blob_id,
-				variant: "doc.orig",
+				variant: "orig",
 				format: "pdf",
 				resolution: (0, 0),
 				size: bytes.len() as u64,
@@ -819,7 +819,7 @@ async fn handle_post_raw_stream(
 			f_id,
 			meta_adapter::FileVariant {
 				variant_id: &orig_blob_id,
-				variant: "raw.orig",
+				variant: "orig",
 				format,
 				resolution: (0, 0),
 				size: total_size,

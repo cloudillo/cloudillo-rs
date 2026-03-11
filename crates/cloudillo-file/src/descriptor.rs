@@ -257,22 +257,8 @@ pub fn get_best_file_variant<'a, S: AsRef<str> + Debug + Eq>(
 			(None, variant_str.as_str())
 		}
 	} else {
-		// No variant specified: documents, raw files, and audio originals
-		// should serve the original content, not a visual thumbnail.
-		// Note: bare "orig" (used for image originals) is excluded — images
-		// should still default to thumbnail for display contexts.
-		let has_typed_orig = variants.iter().any(|v| {
-			let name = v.variant.as_ref();
-			std::path::Path::new(name)
-				.extension()
-				.is_some_and(|ext| ext.eq_ignore_ascii_case("orig"))
-				&& name != "orig"
-		});
-		if has_typed_orig {
-			(None, "orig")
-		} else {
-			(None, "tn")
-		}
+		// No variant specified: default to original
+		(None, "orig")
 	};
 
 	// Filter variants by class if specified
