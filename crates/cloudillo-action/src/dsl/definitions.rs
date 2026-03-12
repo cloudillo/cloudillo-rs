@@ -29,6 +29,7 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		conv_definition(),
 		invt_definition(),
 		prinvt_definition(),
+		apkg_definition(),
 	]
 }
 
@@ -1199,6 +1200,155 @@ fn prinvt_definition() -> ActionDefinition {
 			requires_connected: Some(true),
 		}),
 		key_pattern: Some("{type}:{issuer}:{audience}".to_string()),
+	}
+}
+
+/// APKG - App package release action
+/// Signed JWT carrying app metadata + package attachment for federated app distribution
+fn apkg_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "APKG".to_string(),
+		version: "1.0".to_string(),
+		description: "Publish an app package for federated distribution".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("app-store".to_string()),
+			tags: Some(vec!["app".to_string(), "package".to_string(), "distribution".to_string()]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: Some({
+			let mut map = HashMap::new();
+			map.insert("DEL".to_string(), "Unpublish app package".to_string());
+			map
+		}),
+		fields: FieldConstraints {
+			content: Some(FieldConstraint::Required),
+			audience: Some(FieldConstraint::Forbidden),
+			parent: Some(FieldConstraint::Forbidden),
+			attachments: Some(FieldConstraint::Required),
+			subject: Some(FieldConstraint::Forbidden),
+		},
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Object,
+				min_length: None,
+				max_length: None,
+				pattern: None,
+				r#enum: None,
+				properties: Some({
+					let mut props = HashMap::new();
+					props.insert(
+						"name".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: Some(1),
+							max_length: Some(100),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props.insert(
+						"version".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: Some(1),
+							max_length: Some(50),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props.insert(
+						"description".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(1000),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props.insert(
+						"changelog".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(5000),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props.insert(
+						"minPlatformVersion".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(50),
+							r#enum: None,
+							items: None,
+						},
+					);
+					props.insert(
+						"tags".to_string(),
+						SchemaField {
+							field_type: FieldType::Array,
+							min_length: None,
+							max_length: None,
+							r#enum: None,
+							items: Some(Box::new(SchemaField {
+								field_type: FieldType::String,
+								min_length: Some(1),
+								max_length: Some(50),
+								r#enum: None,
+								items: None,
+							})),
+						},
+					);
+					props.insert(
+						"capabilities".to_string(),
+						SchemaField {
+							field_type: FieldType::Array,
+							min_length: None,
+							max_length: None,
+							r#enum: None,
+							items: Some(Box::new(SchemaField {
+								field_type: FieldType::String,
+								min_length: Some(1),
+								max_length: Some(50),
+								r#enum: None,
+								items: None,
+							})),
+						},
+					);
+					props
+				}),
+				required: Some(vec!["name".to_string(), "version".to_string()]),
+				description: Some(
+					"App package metadata with name, version, description, and capabilities"
+						.to_string(),
+				),
+			}),
+		}),
+		behavior: BehaviorFlags {
+			broadcast: Some(false),
+			allow_unknown: Some(true),
+			requires_acceptance: Some(false),
+			approvable: Some(true),
+			local_only: Some(true),
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None,
+			on_receive: HookImplementation::None,
+			on_accept: HookImplementation::None,
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("any".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(false),
+		}),
+		key_pattern: Some("{type}:{content.name}".to_string()),
 	}
 }
 

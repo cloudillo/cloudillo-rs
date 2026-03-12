@@ -27,7 +27,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 12;
+	const CURRENT_DB_VERSION: i64 = 13;
 
 	let mut tx = db.begin().await?;
 
@@ -318,20 +318,6 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
-	sqlx::query(
-		"CREATE TABLE IF NOT EXISTS action_outbox_queue (
-			tn_id integer NOT NULL,
-			action_id text NOT NULL,
-			id_tag text NOT NULL,
-			next INTEGER,
-			created_at INTEGER DEFAULT (unixepoch()),
-			updated_at INTEGER DEFAULT (unixepoch()),
-			PRIMARY KEY(action_id, tn_id, id_tag)
-		)",
-	)
-	.execute(&mut *tx)
-	.await?;
-
 	// Task scheduler
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS tasks (
@@ -528,12 +514,6 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 	sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS action_outbox_queue_insert_at AFTER INSERT ON action_outbox_queue FOR EACH ROW \
-			BEGIN UPDATE action_outbox_queue SET updated_at = unixepoch() WHERE action_id = NEW.action_id AND tn_id = NEW.tn_id AND id_tag = NEW.id_tag; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-	sqlx::query(
 		"CREATE TRIGGER IF NOT EXISTS tasks_insert_at AFTER INSERT ON tasks FOR EACH ROW \
 			BEGIN UPDATE tasks SET updated_at = unixepoch() WHERE task_id = NEW.task_id; END",
 	)
@@ -638,12 +618,6 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 	sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS action_outbox_queue_updated_at AFTER UPDATE ON action_outbox_queue FOR EACH ROW \
-			BEGIN UPDATE action_outbox_queue SET updated_at = unixepoch() WHERE action_id = NEW.action_id AND tn_id = NEW.tn_id AND id_tag = NEW.id_tag; END",
-		)
-		.execute(&mut *tx)
-		.await?;
-	sqlx::query(
 		"CREATE TRIGGER IF NOT EXISTS tasks_updated_at AFTER UPDATE ON tasks FOR EACH ROW \
 			BEGIN UPDATE tasks SET updated_at = unixepoch() WHERE task_id = NEW.task_id; END",
 	)
@@ -664,6 +638,41 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query(
 		"CREATE TRIGGER IF NOT EXISTS share_entries_updated_at AFTER UPDATE ON share_entries FOR EACH ROW \
 			BEGIN UPDATE share_entries SET updated_at = unixepoch() WHERE id = NEW.id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// Installed apps (app store)
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS installed_apps (
+			tn_id INTEGER NOT NULL,
+			app_name TEXT NOT NULL,
+			publisher_tag TEXT NOT NULL,
+			version TEXT NOT NULL,
+			action_id TEXT NOT NULL,
+			file_id TEXT NOT NULL,
+			blob_id TEXT NOT NULL,
+			status CHAR(1) DEFAULT 'A',
+			capabilities TEXT,
+			auto_update INTEGER DEFAULT 0,
+			installed_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			PRIMARY KEY(tn_id, app_name, publisher_tag)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// Triggers for installed_apps
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS installed_apps_insert_at AFTER INSERT ON installed_apps FOR EACH ROW \
+		BEGIN UPDATE installed_apps SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND app_name = NEW.app_name AND publisher_tag = NEW.publisher_tag; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS installed_apps_updated_at AFTER UPDATE ON installed_apps FOR EACH ROW \
+		BEGIN UPDATE installed_apps SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND app_name = NEW.app_name AND publisher_tag = NEW.publisher_tag; END",
 	)
 	.execute(&mut *tx)
 	.await?;
@@ -969,6 +978,55 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.await?;
 
 		set_db_version(&mut tx, 12).await;
+	}
+
+	// Version 13: Installed apps table + drop orphaned action_outbox_queue
+	if version < 13 {
+		// Drop orphaned action_outbox_queue table and its triggers from earlier development
+		sqlx::query("DROP TRIGGER IF EXISTS action_outbox_queue_insert_at")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("DROP TRIGGER IF EXISTS action_outbox_queue_updated_at")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("DROP TABLE IF EXISTS action_outbox_queue")
+			.execute(&mut *tx)
+			.await?;
+
+		sqlx::query(
+			"CREATE TABLE IF NOT EXISTS installed_apps (
+				tn_id INTEGER NOT NULL,
+				app_name TEXT NOT NULL,
+				publisher_tag TEXT NOT NULL,
+				version TEXT NOT NULL,
+				action_id TEXT NOT NULL,
+				file_id TEXT NOT NULL,
+				blob_id TEXT NOT NULL,
+				status CHAR(1) DEFAULT 'A',
+				capabilities TEXT,
+				auto_update INTEGER DEFAULT 0,
+				installed_at INTEGER DEFAULT (unixepoch()),
+				updated_at INTEGER DEFAULT (unixepoch()),
+				PRIMARY KEY(tn_id, app_name, publisher_tag)
+			)",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS installed_apps_insert_at AFTER INSERT ON installed_apps FOR EACH ROW \
+			BEGIN UPDATE installed_apps SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND app_name = NEW.app_name AND publisher_tag = NEW.publisher_tag; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS installed_apps_updated_at AFTER UPDATE ON installed_apps FOR EACH ROW \
+			BEGIN UPDATE installed_apps SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND app_name = NEW.app_name AND publisher_tag = NEW.publisher_tag; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 13).await;
 	}
 
 	tx.commit().await?;

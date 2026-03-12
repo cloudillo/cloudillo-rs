@@ -6,7 +6,7 @@ use crate::prelude::*;
 use axum::{
 	body::Body,
 	extract::State,
-	http::{header, response::Response, Request},
+	http::{header, response::Response, Method, Request},
 	middleware::Next,
 };
 use cloudillo_types::auth_adapter::AuthCtx;
@@ -215,6 +215,7 @@ pub async fn require_auth(
 	if let Some(ref scope) = claims.scope {
 		if let Some(token_scope) = cloudillo_types::types::TokenScope::parse(scope) {
 			let path = req.uri().path();
+			let method = req.method().clone();
 			let allowed = match token_scope {
 				cloudillo_types::types::TokenScope::File { .. } => {
 					path.starts_with("/api/files/")
@@ -222,6 +223,11 @@ pub async fn require_auth(
 						|| path.starts_with("/ws/rtdb/")
 						|| path.starts_with("/ws/crdt/")
 						|| path == "/api/auth/access-token"
+				}
+				cloudillo_types::types::TokenScope::ApkgPublish => {
+					path.starts_with("/api/files/apkg/")
+						|| (path == "/api/actions" && method == Method::POST)
+						|| path.starts_with("/api/apps")
 				}
 			};
 			if !allowed {
@@ -323,6 +329,7 @@ pub async fn optional_auth(
 								cloudillo_types::types::TokenScope::parse(scope)
 							{
 								let path = req.uri().path();
+								let method = req.method().clone();
 								match token_scope {
 									cloudillo_types::types::TokenScope::File { .. } => {
 										path.starts_with("/api/files/")
@@ -330,9 +337,17 @@ pub async fn optional_auth(
 											|| path.starts_with("/ws/crdt/") || path
 											== "/api/auth/access-token"
 									}
+									// ApkgPublish scope: intentionally restrictive allowlist.
+									// Only permits the exact endpoints needed for app publishing
+									// to limit blast radius of a compromised scoped token.
+									cloudillo_types::types::TokenScope::ApkgPublish => {
+										path.starts_with("/api/files/apkg/")
+											|| (path == "/api/actions" && method == Method::POST)
+											|| path.starts_with("/api/apps")
+									}
 								}
 							} else {
-								true
+								false
 							}
 						} else {
 							true

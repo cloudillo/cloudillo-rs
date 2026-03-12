@@ -279,6 +279,7 @@ impl AppBuilder {
 		extensions.insert(email_module);
 		extensions.insert(proxy::new_proxy_cache());
 		extensions.insert(crate::auth::new_qr_login_store());
+		extensions.insert(cloudillo_file::new_container_cache());
 
 		// Register action token verifier for use by auth module
 		let action_verify_fn: cloudillo_core::ActionVerifyFn = Box::new(|app, tn_id, token, ip| {

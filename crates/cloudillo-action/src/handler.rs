@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use cloudillo_types::hasher::hash;
 use cloudillo_types::utils::decode_jwt_no_verify;
 
 use cloudillo_core::{
@@ -15,7 +16,6 @@ use cloudillo_core::{
 	IdTag,
 };
 use cloudillo_types::auth_adapter::ActionToken;
-use cloudillo_types::hasher::hash;
 use cloudillo_types::meta_adapter;
 use cloudillo_types::types::{self, ApiResponse};
 
@@ -87,9 +87,17 @@ pub async fn post_action(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(id_tag): IdTag,
+	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(action): Json<CreateAction>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
+	// Defense-in-depth: apkg:publish scoped keys can only create APKG actions
+	if let Some(ref scope) = auth.scope {
+		if scope.as_ref() == "apkg:publish" && action.typ.as_ref() != "APKG" {
+			return Err(Error::PermissionDenied);
+		}
+	}
+
 	let action_id = task::create_action(&app, tn_id, &id_tag, action).await?;
 	debug!("actionId {:?}", &action_id);
 
@@ -222,6 +230,19 @@ pub async fn post_inbox_sync(
 
 	debug!("POST /api/inbox/sync - Processing synchronous action");
 
+	// Pre-decode to check action type for PoW requirement (same as post_inbox)
+	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&inbox.token) {
+		if action_preview.t.starts_with("CONN") {
+			if let Err(pow_err) = app.rate_limiter.verify_pow(&socket_addr.ip(), &inbox.token) {
+				debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
+				return Err(Error::PreconditionRequired(format!(
+					"Proof of work required: {}",
+					pow_err
+				)));
+			}
+		}
+	}
+
 	// Create action ID from token hash
 	let action_id_box = hash("a", inbox.token.as_bytes());
 	let action_id = action_id_box.to_string();
@@ -294,6 +315,13 @@ pub async fn post_action_accept(
 
 	// Fetch the action from database
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+
+	// Verify the caller is the action's audience (or the tenant owner)
+	if let Some(ref aud) = action.audience {
+		if aud.id_tag.as_ref() != auth.id_tag.as_ref() && id_tag.as_ref() != auth.id_tag.as_ref() {
+			return Err(Error::PermissionDenied);
+		}
+	}
 
 	// Execute DSL on_accept hook if action type has one
 	let dsl = app.ext::<Arc<DslEngine>>()?;
@@ -405,6 +433,13 @@ pub async fn post_action_reject(
 
 	// Fetch the action from database
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+
+	// Verify the caller is the action's audience (or the tenant owner)
+	if let Some(ref aud) = action.audience {
+		if aud.id_tag.as_ref() != auth.id_tag.as_ref() && id_tag.as_ref() != auth.id_tag.as_ref() {
+			return Err(Error::PermissionDenied);
+		}
+	}
 
 	// Execute DSL on_reject hook if action type has one
 	let dsl = app.ext::<Arc<DslEngine>>()?;
@@ -529,47 +564,6 @@ pub async fn post_action_stat(
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
-}
-
-/// POST /api/actions/:action_id/reaction - Add reaction to action
-pub async fn post_action_reaction(
-	State(app): State<App>,
-	tn_id: TnId,
-	IdTag(reactor_id_tag): IdTag,
-	Path(action_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
-	Json(reaction): Json<types::ReactionRequest>,
-) -> ClResult<(StatusCode, Json<ApiResponse<types::ReactionResponse>>)> {
-	// Verify action exists
-	let _action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
-
-	// Add reaction
-	app.meta_adapter
-		.add_reaction(
-			tn_id,
-			&action_id,
-			&reactor_id_tag,
-			&reaction.r#type,
-			reaction.content.as_deref(),
-		)
-		.await?;
-
-	// Generate reaction ID (simple hash)
-	let reaction_id =
-		hash("r", format!("{}:{}:{}", action_id, reactor_id_tag, reaction.r#type).as_bytes());
-
-	let reaction_response = types::ReactionResponse {
-		id: reaction_id.to_string(),
-		action_id,
-		reactor_id_tag: reactor_id_tag.into(),
-		r#type: reaction.r#type,
-		content: reaction.content,
-		created_at: cloudillo_types::types::Timestamp::now(),
-	};
-
-	let response = ApiResponse::new(reaction_response).with_req_id(req_id.unwrap_or_default());
-
-	Ok((StatusCode::CREATED, Json(response)))
 }
 
 // vim: ts=4

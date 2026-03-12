@@ -343,12 +343,6 @@ pub trait AuthAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		data: action_types::CreateAction,
 	) -> ClResult<Box<str>>;
-	async fn create_proxy_token(
-		&self,
-		tn_id: TnId,
-		id_tag: &str,
-		roles: &[Box<str>],
-	) -> ClResult<Box<str>>;
 	async fn verify_access_token(&self, token: &str) -> ClResult<()>;
 
 	// Vapid keys

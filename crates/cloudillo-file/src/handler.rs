@@ -159,8 +159,9 @@ pub async fn get_file_list(
 	};
 
 	// For scoped tokens, push scope constraint into the DB query
-	if let Some(scope_fid) = scope.and_then(TokenScope::parse).map(|ts| match ts {
-		TokenScope::File { file_id, .. } => file_id,
+	if let Some(scope_fid) = scope.and_then(TokenScope::parse).and_then(|ts| match ts {
+		TokenScope::File { file_id, .. } => Some(file_id),
+		TokenScope::ApkgPublish => None,
 	}) {
 		opts.scope_file_id = Some(scope_fid);
 	}

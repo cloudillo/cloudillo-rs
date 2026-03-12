@@ -679,6 +679,11 @@ async fn schedule_delivery(
 ) -> ClResult<()> {
 	let dsl = app.ext::<Arc<DslEngine>>()?;
 
+	// Skip federation entirely for local-only action types (e.g., APKG)
+	if dsl.get_behavior(&action.typ).and_then(|b| b.local_only).unwrap_or(false) {
+		return Ok(());
+	}
+
 	// For APRV actions: check if the subject action should be broadcast to followers
 	if action.typ.as_ref() == "APRV" {
 		if let Some(ref subject_id) = action.subject {

@@ -133,6 +133,9 @@ async fn execute_hook(
 		return Ok(None);
 	};
 
+	// Look up tenant's own id_tag (not the audience)
+	let tenant = app.meta_adapter.read_tenant(tn_id).await?;
+
 	// Use the separate sub_typ field if available, otherwise try to extract from combined type string
 	let (action_type, subtype) = if action.sub_typ.is_some() {
 		(action.typ.to_string(), action.sub_typ.as_ref().map(std::string::ToString::to_string))
@@ -161,11 +164,11 @@ async fn execute_hook(
 		.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
 		.tenant(
 			i64::from(tn_id.0),
-			action
-				.audience_tag
-				.as_ref()
-				.map_or(String::new(), std::string::ToString::to_string),
-			"person",
+			tenant.id_tag.to_string(),
+			match tenant.typ {
+				meta_adapter::ProfileType::Community => "community",
+				meta_adapter::ProfileType::Person => "person",
+			},
 		)
 		.client_address(ctx.client_address().map(String::from));
 
@@ -283,6 +286,15 @@ async fn schedule_delivery(
 
 	let dsl = app.ext::<Arc<DslEngine>>()?;
 	let behavior = dsl.get_behavior(&action.typ);
+
+	// Skip federation entirely for local-only action types (e.g., APKG)
+	if behavior.as_ref().and_then(|b| b.local_only).unwrap_or(false) {
+		debug!(
+			"Action {} (type={}) is local_only, skipping delivery",
+			action.action_id, action.typ
+		);
+		return Ok(());
+	}
 
 	// Check if this action should broadcast to followers (e.g., POST to own wall)
 	let should_broadcast = behavior.as_ref().and_then(|b| b.broadcast).unwrap_or(false);

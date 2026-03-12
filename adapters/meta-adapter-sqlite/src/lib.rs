@@ -3,6 +3,7 @@ use std::{path::Path, sync::Arc};
 mod action;
 mod file;
 mod file_user_data;
+mod installed_app;
 mod profile;
 mod push;
 mod reference;
@@ -22,13 +23,13 @@ use tokio::fs;
 
 use cloudillo_types::{
 	meta_adapter::{
-		Action, ActionData, ActionId, ActionView, CreateFile, CreateOutboundActionOptions,
-		CreateRefOptions, CreateShareEntry, FileId, FileUserData, FileVariant, FileView,
-		FinalizeActionOptions, ListActionOptions, ListFileOptions, ListProfileOptions,
-		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
-		ProfileData, PushSubscription, PushSubscriptionData, ReactionData, RefData, ShareEntry,
-		Task, TaskPatch, Tenant, TenantListMeta, UpdateActionDataOptions, UpdateFileOptions,
-		UpdateProfileData, UpdateTenantData,
+		Action, ActionData, ActionId, ActionView, CreateFile, CreateRefOptions, CreateShareEntry,
+		FileId, FileUserData, FileVariant, FileView, FinalizeActionOptions, InstallApp,
+		InstalledApp, ListActionOptions, ListFileOptions, ListProfileOptions, ListRefsOptions,
+		ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile, ProfileData,
+		PushSubscription, PushSubscriptionData, RefData, ShareEntry, Task, TaskPatch, Tenant,
+		TenantListMeta, UpdateActionDataOptions, UpdateFileOptions, UpdateProfileData,
+		UpdateTenantData,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -297,16 +298,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::get_related_tokens(&self.db, tn_id, aprv_action_id).await
 	}
 
-	async fn create_outbound_action(
-		&self,
-		tn_id: TnId,
-		action_id: &str,
-		token: &str,
-		opts: &CreateOutboundActionOptions,
-	) -> ClResult<()> {
-		action::create_outbound(&self.db, tn_id, action_id, token, opts).await
-	}
-
 	// File management
 	//*****************
 	async fn get_file_id(&self, tn_id: TnId, f_id: u64) -> ClResult<Box<str>> {
@@ -433,20 +424,8 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::delete(&self.db, tn_id, action_id).await
 	}
 
-	async fn add_reaction(
-		&self,
-		tn_id: TnId,
-		action_id: &str,
-		reactor_id_tag: &str,
-		reaction_type: &str,
-		content: Option<&str>,
-	) -> ClResult<()> {
-		action::add_reaction(&self.db, tn_id, action_id, reactor_id_tag, reaction_type, content)
-			.await
-	}
-
-	async fn list_reactions(&self, tn_id: TnId, action_id: &str) -> ClResult<Vec<ReactionData>> {
-		action::list_reactions(&self.dbr, tn_id, action_id).await
+	async fn count_reactions(&self, tn_id: TnId, subject_id: &str) -> ClResult<u32> {
+		action::count_reactions(&self.dbr, tn_id, subject_id).await
 	}
 
 	// Phase 2: File Management Enhancements
@@ -666,5 +645,38 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn read_share_entry(&self, tn_id: TnId, id: i64) -> ClResult<Option<ShareEntry>> {
 		share::read(&self.dbr, tn_id, id).await
+	}
+
+	// Installed App Management
+	//*************************
+
+	async fn install_app(&self, tn_id: TnId, install: &InstallApp) -> ClResult<()> {
+		installed_app::install(&self.db, tn_id, install).await
+	}
+
+	async fn uninstall_app(
+		&self,
+		tn_id: TnId,
+		app_name: &str,
+		publisher_tag: &str,
+	) -> ClResult<()> {
+		installed_app::uninstall(&self.db, tn_id, app_name, publisher_tag).await
+	}
+
+	async fn list_installed_apps(
+		&self,
+		tn_id: TnId,
+		search: Option<&str>,
+	) -> ClResult<Vec<InstalledApp>> {
+		installed_app::list(&self.dbr, tn_id, search).await
+	}
+
+	async fn get_installed_app(
+		&self,
+		tn_id: TnId,
+		app_name: &str,
+		publisher_tag: &str,
+	) -> ClResult<Option<InstalledApp>> {
+		installed_app::get(&self.dbr, tn_id, app_name, publisher_tag).await
 	}
 }

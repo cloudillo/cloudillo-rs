@@ -419,30 +419,6 @@ pub struct ListActionsQuery {
 	pub limit: Option<usize>,
 }
 
-/// Reaction request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReactionRequest {
-	#[serde(rename = "type")]
-	pub r#type: String, // "Like", "Emoji", etc
-	pub content: Option<String>, // For emoji: "👍"
-}
-
-/// Reaction response
-#[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReactionResponse {
-	pub id: String,
-	pub action_id: String,
-	pub reactor_id_tag: String,
-	#[serde(rename = "type")]
-	pub r#type: String,
-	pub content: Option<String>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-}
-
 /// File upload response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -675,6 +651,8 @@ impl AccessLevel {
 pub enum TokenScope {
 	/// File-scoped access with specific access level
 	File { file_id: String, access: AccessLevel },
+	/// APKG publish scope — restricts to package upload and APKG action creation
+	ApkgPublish,
 }
 
 impl TokenScope {
@@ -684,8 +662,11 @@ impl TokenScope {
 	/// - "file:{file_id}:R" -> File scope with Read access
 	/// - "file:{file_id}:W" -> File scope with Write access
 	pub fn parse(s: &str) -> Option<Self> {
+		if s == "apkg:publish" {
+			return Some(Self::ApkgPublish);
+		}
 		let parts: Vec<&str> = s.split(':').collect();
-		if parts.len() >= 3 && parts[0] == "file" {
+		if parts.len() == 3 && parts[0] == "file" {
 			let access = match parts[2] {
 				"W" => AccessLevel::Write,
 				_ => AccessLevel::Read, // "R" or any other value defaults to Read
@@ -699,6 +680,7 @@ impl TokenScope {
 	pub fn file_id(&self) -> Option<&str> {
 		match self {
 			Self::File { file_id, .. } => Some(file_id),
+			Self::ApkgPublish => None,
 		}
 	}
 
@@ -706,6 +688,7 @@ impl TokenScope {
 	pub fn file_access(&self) -> Option<AccessLevel> {
 		match self {
 			Self::File { access, .. } => Some(*access),
+			Self::ApkgPublish => None,
 		}
 	}
 
@@ -713,6 +696,7 @@ impl TokenScope {
 	pub fn matches_file(&self, target_file_id: &str) -> bool {
 		match self {
 			Self::File { file_id, .. } => file_id == target_file_id,
+			Self::ApkgPublish => false,
 		}
 	}
 }

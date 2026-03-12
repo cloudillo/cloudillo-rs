@@ -259,12 +259,6 @@ pub struct FinalizeActionOptions<'a> {
 	pub key: Option<&'a str>,
 }
 
-#[derive(Debug, Clone)]
-pub struct CreateOutboundActionOptions {
-	pub recipient_tag: String,
-	pub typ: String,
-}
-
 fn deserialize_split<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
 	D: serde::Deserializer<'de>,
@@ -373,19 +367,6 @@ pub struct ActionView {
 	pub visibility: Option<char>,
 	pub flags: Option<Box<str>>, // Action flags: R/r (reactions), C/c (comments), O/o (open)
 	pub x: Option<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
-}
-
-/// Reaction data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReactionData {
-	pub id: Box<str>,
-	pub action_id: Box<str>,
-	pub reactor_id_tag: Box<str>,
-	pub r#type: Box<str>,
-	pub content: Option<Box<str>>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
 }
 
 // Files
@@ -690,6 +671,38 @@ pub struct TaskPatch {
 #[derive(Debug, Default)]
 pub struct ListTaskOptions {}
 
+// Installed Apps
+//***************
+
+/// Data for installing an app
+#[derive(Debug)]
+pub struct InstallApp {
+	pub app_name: Box<str>,
+	pub publisher_tag: Box<str>,
+	pub version: Box<str>,
+	pub action_id: Box<str>,
+	pub file_id: Box<str>,
+	pub blob_id: Box<str>,
+	pub capabilities: Option<Vec<Box<str>>>,
+}
+
+/// Installed app record
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledApp {
+	pub app_name: Box<str>,
+	pub publisher_tag: Box<str>,
+	pub version: Box<str>,
+	pub action_id: Box<str>,
+	pub file_id: Box<str>,
+	pub blob_id: Box<str>,
+	pub status: Box<str>,
+	pub capabilities: Option<Vec<Box<str>>>,
+	pub auto_update: bool,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub installed_at: Timestamp,
+}
+
 #[async_trait]
 pub trait MetaAdapter: Debug + Send + Sync {
 	// Tenant management
@@ -872,15 +885,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		aprv_action_id: &str,
 	) -> ClResult<Vec<(Box<str>, Box<str>)>>;
 
-	/// Create outbound action
-	async fn create_outbound_action(
-		&self,
-		tn_id: TnId,
-		action_id: &str,
-		token: &str,
-		opts: &CreateOutboundActionOptions,
-	) -> ClResult<()>;
-
 	// File management
 	//*****************
 	async fn get_file_id(&self, tn_id: TnId, f_id: u64) -> ClResult<Box<str>>;
@@ -960,18 +964,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Delete an action (soft delete with cleanup)
 	async fn delete_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()>;
 
-	/// Add a reaction to an action
-	async fn add_reaction(
-		&self,
-		tn_id: TnId,
-		action_id: &str,
-		reactor_id_tag: &str,
-		reaction_type: &str,
-		content: Option<&str>,
-	) -> ClResult<()>;
-
-	/// List all reactions for an action
-	async fn list_reactions(&self, tn_id: TnId, action_id: &str) -> ClResult<Vec<ReactionData>>;
+	/// Count active (non-DEL, non-deleted) REACT actions for a given subject
+	async fn count_reactions(&self, tn_id: TnId, subject_id: &str) -> ClResult<u32>;
 
 	// Phase 2: File Management Enhancements
 	//**************************************
@@ -1176,6 +1170,31 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Read a single share entry by ID (for delete validation)
 	async fn read_share_entry(&self, tn_id: TnId, id: i64) -> ClResult<Option<ShareEntry>>;
+
+	// Installed App Management
+	//*************************
+
+	/// Install an app package
+	async fn install_app(&self, tn_id: TnId, install: &InstallApp) -> ClResult<()>;
+
+	/// Uninstall an app by name and publisher
+	async fn uninstall_app(&self, tn_id: TnId, app_name: &str, publisher_tag: &str)
+		-> ClResult<()>;
+
+	/// List installed apps, optionally filtered by search term
+	async fn list_installed_apps(
+		&self,
+		tn_id: TnId,
+		search: Option<&str>,
+	) -> ClResult<Vec<InstalledApp>>;
+
+	/// Get a specific installed app
+	async fn get_installed_app(
+		&self,
+		tn_id: TnId,
+		app_name: &str,
+		publisher_tag: &str,
+	) -> ClResult<Option<InstalledApp>>;
 }
 
 #[cfg(test)]

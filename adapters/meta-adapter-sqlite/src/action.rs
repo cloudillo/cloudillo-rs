@@ -4,9 +4,8 @@ use sqlx::{Row, SqlitePool};
 
 use crate::utils::{collect_res, inspect, map_res, parse_str_list, push_in};
 use cloudillo_types::meta_adapter::{
-	Action, ActionData, ActionId, ActionView, AttachmentView, CreateOutboundActionOptions,
-	FinalizeActionOptions, ListActionOptions, ProfileInfo, ProfileType, ReactionData,
-	UpdateActionDataOptions,
+	Action, ActionData, ActionId, ActionView, AttachmentView, FinalizeActionOptions,
+	ListActionOptions, ProfileInfo, ProfileType, UpdateActionDataOptions,
 };
 use cloudillo_types::prelude::*;
 
@@ -18,17 +17,17 @@ pub(crate) async fn list(
 ) -> ClResult<Vec<ActionView>> {
 	let mut query = sqlx::QueryBuilder::new(
 		"SELECT DISTINCT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
-		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic,
-		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic,
+		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
+		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 		a.subject, a.content, a.created_at, a.expires_at,
-		own.content as own_reaction,
+		own.sub_type as own_reaction,
 		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
 		FROM actions a
 		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
 		LEFT JOIN tenants t ON t.tn_id=a.tn_id
-		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.parent_id=a.action_id AND own.issuer_tag=t.id_tag
-			AND own.type='REACT' AND coalesce(own.status, 'A') NOT IN ('D')
+		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.subject=a.action_id AND own.issuer_tag=t.id_tag
+			AND own.type='REACT' AND own.sub_type!='DEL' AND coalesce(own.status, 'A') NOT IN ('D')
 		WHERE a.tn_id=",
 	);
 	query.push_bind(tn_id.0);
@@ -254,15 +253,13 @@ pub(crate) async fn list(
 		let comments_count: i64 = row.try_get("comments").unwrap_or(0);
 		let comments_read: i64 = row.try_get("comments_read").unwrap_or(0);
 		let own_reaction: Option<String> = row.try_get("own_reaction").ok().flatten();
-		let own_reaction_json: Option<serde_json::Value> =
-			own_reaction.as_ref().and_then(|s| serde_json::from_str(s).ok());
 		let mut stat_obj = serde_json::json!({
 			"comments": comments_count,
 			"commentsRead": comments_read,
 			"reactions": reactions_count
 		});
-		if let Some(own_reaction) = own_reaction_json {
-			stat_obj["ownReaction"] = own_reaction;
+		if let Some(own_reaction) = own_reaction {
+			stat_obj["ownReaction"] = serde_json::Value::String(own_reaction);
 		}
 		let stat = Some(stat_obj);
 		let visibility: Option<String> = row.try_get("visibility").ok();
@@ -278,7 +275,10 @@ pub(crate) async fn list(
 			issuer: ProfileInfo {
 				id_tag: issuer_tag,
 				name: row.try_get::<Box<str>, _>("issuer_name").map_err(|_| Error::DbError)?,
-				typ: match row.try_get::<Option<&str>, _>("type").map_err(|_| Error::DbError)? {
+				typ: match row
+					.try_get::<Option<&str>, _>("issuer_type")
+					.map_err(|_| Error::DbError)?
+				{
 					Some("C") => ProfileType::Community,
 					_ => ProfileType::Person,
 				},
@@ -292,7 +292,10 @@ pub(crate) async fn list(
 					name: row
 						.try_get::<Box<str>, _>("audience_name")
 						.map_err(|_| Error::DbError)?,
-					typ: match row.try_get::<Option<&str>, _>("type").map_err(|_| Error::DbError)? {
+					typ: match row
+						.try_get::<Option<&str>, _>("audience_type")
+						.map_err(|_| Error::DbError)?
+					{
 						Some("C") => ProfileType::Community,
 						_ => ProfileType::Person,
 					},
@@ -912,28 +915,6 @@ pub(crate) async fn update_inbound(
 	Ok(())
 }
 
-/// Create outbound action
-pub(crate) async fn create_outbound(
-	db: &SqlitePool,
-	tn_id: TnId,
-	action_id: &str,
-	token: &str,
-	opts: &CreateOutboundActionOptions,
-) -> ClResult<()> {
-	sqlx::query("INSERT INTO action_outbox_queue (tn_id, action_id, type, token, recipient_tag, status, created_at)
-		VALUES (?, ?, ?, ?, ?, 'P', unixepoch())")
-		.bind(tn_id.0)
-		.bind(action_id)
-		.bind(opts.typ.as_str())
-		.bind(token)
-		.bind(opts.recipient_tag.as_str())
-		.execute(db).await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-
-	Ok(())
-}
-
 /// Get a single action by action_id with issuer and audience profiles
 pub(crate) async fn get(
 	db: &SqlitePool,
@@ -942,8 +923,8 @@ pub(crate) async fn get(
 ) -> ClResult<Option<ActionView>> {
 	let row = sqlx::query(
 		"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
-		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic,
-		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic,
+		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
+		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 		a.subject, a.content, a.created_at, a.expires_at,
 		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
 		FROM actions a
@@ -1052,7 +1033,10 @@ pub(crate) async fn get(
 				.try_get::<Option<Box<str>>, _>("issuer_name")
 				.map_err(|_| Error::DbError)?
 				.unwrap_or_else(|| "Unknown".into()),
-			typ: ProfileType::Person,
+			typ: match row.try_get::<Option<&str>, _>("issuer_type").map_err(|_| Error::DbError)? {
+				Some("C") => ProfileType::Community,
+				_ => ProfileType::Person,
+			},
 			profile_pic: row
 				.try_get::<Option<Box<str>>, _>("issuer_profile_pic")
 				.map_err(|_| Error::DbError)?,
@@ -1064,7 +1048,13 @@ pub(crate) async fn get(
 					.try_get::<Option<Box<str>>, _>("audience_name")
 					.map_err(|_| Error::DbError)?
 					.unwrap_or_else(|| "Unknown".into()),
-				typ: ProfileType::Person,
+				typ: match row
+					.try_get::<Option<&str>, _>("audience_type")
+					.map_err(|_| Error::DbError)?
+				{
+					Some("C") => ProfileType::Community,
+					_ => ProfileType::Person,
+				},
 				profile_pic: row
 					.try_get::<Option<Box<str>>, _>("audience_profile_pic")
 					.map_err(|_| Error::DbError)?,
@@ -1120,25 +1110,20 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClR
 	Ok(())
 }
 
-/// Add reaction (placeholder)
-pub(crate) async fn add_reaction(
-	_db: &SqlitePool,
-	_tn_id: TnId,
-	_action_id: &str,
-	_reactor_id_tag: &str,
-	_reaction_type: &str,
-	_content: Option<&str>,
-) -> ClResult<()> {
-	// TODO: Implement reaction storage (probably in JSON column)
-	Ok(())
-}
+/// Count active (non-DEL, non-deleted) REACT actions for a given subject
+pub(crate) async fn count_reactions(
+	db: &SqlitePool,
+	tn_id: TnId,
+	subject_id: &str,
+) -> ClResult<u32> {
+	let count: i64 = sqlx::query_scalar(
+		"SELECT COUNT(*) FROM actions WHERE tn_id=? AND subject=? AND type='REACT' AND sub_type!='DEL' AND coalesce(status, 'A') NOT IN ('D')"
+	)
+	.bind(tn_id.0)
+	.bind(subject_id)
+	.fetch_one(db)
+	.await
+	.map_err(|_| Error::DbError)?;
 
-/// List reactions (placeholder)
-pub(crate) async fn list_reactions(
-	_db: &SqlitePool,
-	_tn_id: TnId,
-	_action_id: &str,
-) -> ClResult<Vec<ReactionData>> {
-	// TODO: Implement reaction retrieval from JSON column
-	Ok(Vec::new())
+	Ok(u32::try_from(count).unwrap_or(0))
 }

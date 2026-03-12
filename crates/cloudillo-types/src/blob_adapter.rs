@@ -39,6 +39,15 @@ pub trait BlobAdapter: Debug + Send + Sync {
 	/// Reads a blob
 	async fn read_blob_buf(&self, tn_id: TnId, blob_id: &str) -> ClResult<Box<[u8]>>;
 
+	/// Reads a byte range from a blob
+	async fn read_blob_range(
+		&self,
+		tn_id: TnId,
+		blob_id: &str,
+		offset: u64,
+		length: u64,
+	) -> ClResult<Box<[u8]>>;
+
 	/// Reads a blob
 	async fn read_blob_stream(
 		&self,

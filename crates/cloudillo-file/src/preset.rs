@@ -260,6 +260,22 @@ pub mod presets {
 		}
 	}
 
+	/// App package preset - stores zip package as-is, extracts icon as vis.pf
+	pub fn apkg() -> FilePreset {
+		FilePreset {
+			name: "apkg".to_string(),
+			allowed_media_classes: vec![VariantClass::Raw],
+			image_variants: vec!["vis.pf".into()],
+			video_variants: vec![],
+			audio_variants: vec![],
+			extract_audio: false,
+			generate_thumbnail: false,
+			max_variant: None,
+			thumbnail_variant: Some("vis.pf".into()),
+			store_original: true,
+		}
+	}
+
 	/// Get preset by name
 	pub fn get(name: &str) -> Option<FilePreset> {
 		match name {
@@ -273,6 +289,7 @@ pub mod presets {
 			"cover" => Some(cover()),
 			"orig-only" => Some(orig_only()),
 			"thumbnail-only" => Some(thumbnail_only()),
+			"apkg" => Some(apkg()),
 			_ => None,
 		}
 	}
@@ -290,6 +307,7 @@ pub mod presets {
 			"cover",
 			"orig-only",
 			"thumbnail-only",
+			"apkg",
 		]
 	}
 }

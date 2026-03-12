@@ -37,6 +37,12 @@ regex = "1.12"
 # CRDT support (for file duplication)
 yrs = "0.25"
 
+# Zip parsing (for app packages)
+rawzip = "0.4"
+
+# Decompression (for app package manifest reading)
+flate2 = "1"
+
 # Logging
 tracing = "0.1"
 

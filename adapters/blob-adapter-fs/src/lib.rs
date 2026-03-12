@@ -124,9 +124,10 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 			Ok::<(), Error>(())
 		}
 		.await;
-		if res.is_err() {
+		if let Err(e) = res {
 			info!("  attachment download failed, removing tmpfile: {:?}", &tmp_path);
-			remove_file(&tmp_path).await?;
+			let _ = remove_file(&tmp_path).await;
+			return Err(e);
 		}
 
 		Ok(())
@@ -144,6 +145,27 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		let mut file = File::open(obj_file_path(&self.base_dir, tn_id, blob_id)?).await?;
 		let mut buf: Vec<u8> = Vec::new();
 		file.read_to_end(&mut buf).await?;
+
+		Ok(buf.into_boxed_slice())
+	}
+
+	/// Reads a byte range from a blob
+	async fn read_blob_range(
+		&self,
+		tn_id: TnId,
+		blob_id: &str,
+		offset: u64,
+		length: u64,
+	) -> ClResult<Box<[u8]>> {
+		use tokio::io::AsyncSeekExt;
+
+		let mut file = File::open(obj_file_path(&self.base_dir, tn_id, blob_id)?).await?;
+		file.seek(std::io::SeekFrom::Start(offset)).await?;
+
+		let length = usize::try_from(length)
+			.map_err(|_| Error::Internal("range length too large".into()))?;
+		let mut buf = vec![0u8; length];
+		file.read_exact(&mut buf).await?;
 
 		Ok(buf.into_boxed_slice())
 	}

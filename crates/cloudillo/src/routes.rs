@@ -54,7 +54,6 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/actions/{action_id}/accept", post(action::handler::post_action_accept))
 		.route("/api/actions/{action_id}/reject", post(action::handler::post_action_reject))
 		.route("/api/actions/{action_id}/dismiss", post(action::handler::post_action_dismiss))
-		.route("/api/actions/{action_id}/reaction", post(action::handler::post_action_reaction))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_action("write")));
 
 	// Profile read routes (check_perm_profile("read")) - requires auth
@@ -116,6 +115,13 @@ fn init_protected_routes(app: App) -> Router<App> {
 	let trash_router = Router::new()
 		.route("/api/trash", delete(file::management::empty_trash))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_create("file", "write")));
+
+	// App management routes (check_perm_create for leader-level check)
+	let app_management_router = Router::new()
+		.route("/api/apps/install", post(file::apkg::install_app))
+		.route("/api/apps/installed", get(file::apkg::list_installed_apps))
+		.route("/api/apps/@{publisher}/{name}", delete(file::apkg::uninstall_app))
+		.layer(middleware::from_fn_with_state(app.clone(), check_perm_create("app", "create")));
 
 	// --- Standard Protected Routes ---
 	// These routes only require authentication, no additional permission checks
@@ -179,6 +185,9 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.merge(file_router_write)
 		.merge(trash_router)
 		.merge(file_user_router)
+
+		// --- App Store (Install/Uninstall) ---
+		.merge(app_management_router)
 
 		// --- Share Entry Queries ---
 		.route("/api/shares", get(file::share::list_shares_by_subject))
@@ -302,6 +311,10 @@ fn init_public_routes(app: App) -> Router<App> {
 		.merge(action_router_read)
 		.route("/api/files", get(file::handler::get_file_list))
 		.merge(file_router_read)
+
+		// App Discovery and Container Content
+		.route("/api/apps", get(file::apkg::list_apps))
+		.route("/api/files/{file_id}/content/{*path}", get(file::apkg::get_container_content))
 		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "general", app.opts.mode));
 
 	Router::new()
@@ -651,7 +664,10 @@ async fn static_fallback_handler(
 	let dist_dir = &app.opts.dist_dir;
 	let mut serve_dir = ServeDir::new(dist_dir).precompressed_gzip().precompressed_br();
 
-	let response = serve_dir.call(request).await.unwrap();
+	let response = match serve_dir.call(request).await {
+		Ok(resp) => resp,
+		Err(infallible) => match infallible {},
+	};
 
 	// Check if file was not found - apply smart SPA fallback
 	if response.status() == StatusCode::NOT_FOUND {

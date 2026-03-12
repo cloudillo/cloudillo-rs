@@ -148,6 +148,10 @@ pub async fn get_access_level_with_scope(
 					// Scope exists for a different file - deny access
 					return AccessLevel::None;
 				}
+				TokenScope::ApkgPublish => {
+					// APKG publish scope has no file access
+					return AccessLevel::None;
+				}
 			}
 		}
 		// Scope string present but unparseable — deny access (least privilege)
@@ -266,6 +270,7 @@ pub fn check_scope_allows_file(
 			}
 			ScopeCheck::Denied
 		}
+		TokenScope::ApkgPublish => ScopeCheck::Denied,
 	}
 }
 
@@ -293,6 +298,7 @@ pub fn check_scope_allows_create(scope: Option<&str>, root_id: Option<&str>) -> 
 				_ => Err(Error::PermissionDenied),
 			}
 		}
+		TokenScope::ApkgPublish => Ok(()), // Middleware already restricts to /api/files/apkg/
 	}
 }
 

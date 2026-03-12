@@ -2,7 +2,9 @@
 
 #![allow(dead_code)]
 
+pub mod apkg;
 pub(crate) mod audio;
+pub(crate) mod container;
 pub mod descriptor;
 pub(crate) mod duplicate;
 pub(crate) mod ffmpeg;
@@ -24,7 +26,15 @@ pub(crate) mod video;
 
 mod prelude;
 
+use std::sync::Arc;
+
+use container::ContainerCache;
 use prelude::*;
+
+/// Create a new container cache for registration in extensions
+pub fn new_container_cache() -> Arc<ContainerCache> {
+	Arc::new(ContainerCache::new())
+}
 
 pub fn register_settings(
 	registry: &mut cloudillo_core::settings::SettingsRegistry,
