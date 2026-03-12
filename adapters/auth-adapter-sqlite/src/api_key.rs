@@ -120,12 +120,13 @@ pub async fn validate_api_key(
 				.await
 				.map_err(|_| Error::Unauthorized)?;
 
+			let expanded_roles = crate::auth::build_tenant_owner_roles(roles.as_deref());
 			return Ok(ApiKeyValidation {
 				tn_id: TnId(u32::try_from(tn_id).unwrap_or_default()),
 				id_tag: id_tag.into(),
 				key_id,
 				scopes: scopes.map(Into::into),
-				roles: roles.map(Into::into),
+				roles: Some(expanded_roles),
 			});
 		}
 	}

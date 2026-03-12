@@ -253,12 +253,12 @@ pub async fn post_password(
 	Json(req): Json<PasswordReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	// Validate new password strength
-	if req.new_password.len() < 8 {
-		return Err(Error::ValidationError("Password must be at least 8 characters".into()));
-	}
-
 	if req.new_password.trim().is_empty() {
 		return Err(Error::ValidationError("Password cannot be empty or only whitespace".into()));
+	}
+
+	if req.new_password.len() < 8 {
+		return Err(Error::ValidationError("Password must be at least 8 characters".into()));
 	}
 
 	if req.new_password == req.current_password {
@@ -347,7 +347,10 @@ pub async fn get_access_token(
 			.ok_or_else(|| Error::ValidationError("Invalid scope format".into()))?;
 
 		let TokenScope::File { file_id: ref target_file_id, access: requested_access } =
-			token_scope;
+			token_scope
+		else {
+			return Err(Error::ValidationError("scope must be a file scope".into()));
+		};
 
 		info!(
 			"Via token request: via={}, target={}, access={:?}",
@@ -767,12 +770,12 @@ pub async fn post_set_password(
 	Json(req): Json<SetPasswordReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
 	// Validate new password strength
-	if req.new_password.len() < 8 {
-		return Err(Error::ValidationError("Password must be at least 8 characters".into()));
-	}
-
 	if req.new_password.trim().is_empty() {
 		return Err(Error::ValidationError("Password cannot be empty or only whitespace".into()));
+	}
+
+	if req.new_password.len() < 8 {
+		return Err(Error::ValidationError("Password must be at least 8 characters".into()));
 	}
 
 	// Use the ref - this validates type, expiration, counter, and decrements it

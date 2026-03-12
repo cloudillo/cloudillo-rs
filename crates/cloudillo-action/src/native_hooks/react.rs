@@ -19,34 +19,34 @@ use cloudillo_types::meta_adapter::UpdateActionDataOptions;
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: REACT on_create for action {}", context.action_id);
 
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = TnId(
+		u32::try_from(context.tenant_id)
+			.map_err(|_| Error::Internal("tenant_id overflow".into()))?,
+	);
 	let Some(subject_id) = &context.subject else {
 		tracing::warn!("REACT on_create: No subject specified");
 		return Ok(HookResult::default());
 	};
 
-	// Get current subject action data
-	let subject_data = app.meta_adapter.get_action_data(tn_id, subject_id).await?;
-	let current_reactions = subject_data.as_ref().and_then(|d| d.reactions).unwrap_or(0);
+	// Count active reactions for the subject (avoids double-count on reaction type switch)
+	let new_reactions = app.meta_adapter.count_reactions(tn_id, subject_id).await?;
 
-	let new_reactions = if let Some("DEL") = context.subtype.as_deref() {
-		// Remove reaction: decrement (minimum 0)
+	if let Some("DEL") = context.subtype.as_deref() {
 		tracing::info!(
-			"REACT:DEL on_create: {} removing reaction from {}",
+			"REACT:DEL on_create: {} removing reaction from {} (count: {})",
 			context.issuer,
-			subject_id
+			subject_id,
+			new_reactions
 		);
-		current_reactions.saturating_sub(1)
 	} else {
-		// Add reaction: increment
 		tracing::info!(
-			"REACT:{:?} on_create: {} reacting to {}",
+			"REACT:{:?} on_create: {} reacting to {} (count: {})",
 			context.subtype,
 			context.issuer,
-			subject_id
+			subject_id,
+			new_reactions
 		);
-		current_reactions.saturating_add(1)
-	};
+	}
 
 	// Update subject action's reaction count
 	let update_opts =
@@ -56,9 +56,8 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 		tracing::warn!("REACT on_create: Failed to update subject {} reactions: {}", subject_id, e);
 	} else {
 		tracing::debug!(
-			"REACT on_create: Updated subject {} reactions: {} -> {}",
+			"REACT on_create: Updated subject {} reactions to {}",
 			subject_id,
-			current_reactions,
 			new_reactions
 		);
 	}
@@ -74,7 +73,10 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: REACT on_receive for action {}", context.action_id);
 
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = TnId(
+		u32::try_from(context.tenant_id)
+			.map_err(|_| Error::Internal("tenant_id overflow".into()))?,
+	);
 	let Some(subject_id) = &context.subject else {
 		tracing::warn!("REACT on_receive: No subject specified");
 		return Ok(HookResult::default());
@@ -97,28 +99,25 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 		return Ok(HookResult::default());
 	}
 
-	// Get current reaction count
-	let subject_data = app.meta_adapter.get_action_data(tn_id, subject_id).await?;
-	let current_reactions = subject_data.as_ref().and_then(|d| d.reactions).unwrap_or(0);
+	// Count active reactions for the subject (avoids double-count on reaction type switch)
+	let new_reactions = app.meta_adapter.count_reactions(tn_id, subject_id).await?;
 
-	let new_reactions = if let Some("DEL") = context.subtype.as_deref() {
-		// Remove reaction: decrement (minimum 0)
+	if let Some("DEL") = context.subtype.as_deref() {
 		tracing::info!(
-			"REACT:DEL on_receive: {} removing reaction from our action {}",
+			"REACT:DEL on_receive: {} removing reaction from our action {} (count: {})",
 			context.issuer,
-			subject_id
+			subject_id,
+			new_reactions
 		);
-		current_reactions.saturating_sub(1)
 	} else {
-		// Add reaction: increment
 		tracing::info!(
-			"REACT:{:?} on_receive: {} reacting to our action {}",
+			"REACT:{:?} on_receive: {} reacting to our action {} (count: {})",
 			context.subtype,
 			context.issuer,
-			subject_id
+			subject_id,
+			new_reactions
 		);
-		current_reactions.saturating_add(1)
-	};
+	}
 
 	// Update subject action's reaction count
 	let update_opts =
@@ -132,9 +131,8 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 		);
 	} else {
 		tracing::debug!(
-			"REACT on_receive: Updated subject {} reactions: {} -> {}",
+			"REACT on_receive: Updated subject {} reactions to {}",
 			subject_id,
-			current_reactions,
 			new_reactions
 		);
 	}

@@ -182,15 +182,6 @@ impl AuthAdapter for AuthAdapterSqlite {
 		auth::create_action_token(&self.db, &self.worker, tn_id, action).await
 	}
 
-	async fn create_proxy_token(
-		&self,
-		tn_id: TnId,
-		id_tag: &str,
-		roles: &[Box<str>],
-	) -> ClResult<Box<str>> {
-		auth::create_proxy_token(&self.db, tn_id, id_tag, roles).await
-	}
-
 	async fn verify_access_token(&self, token: &str) -> ClResult<()> {
 		auth::verify_access_token(&self.jwt_secret, token).await
 	}

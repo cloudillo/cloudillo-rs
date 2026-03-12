@@ -74,7 +74,7 @@ pub(crate) async fn ensure_jwt_secret(db: &SqlitePool) -> ClResult<String> {
 /// Build tenant owner roles string by merging base leader roles with DB roles
 /// Tenant owners always have the full role hierarchy up to leader,
 /// plus any extra roles from DB (like site-admin)
-fn build_tenant_owner_roles(db_roles: Option<&str>) -> Box<str> {
+pub(crate) fn build_tenant_owner_roles(db_roles: Option<&str>) -> Box<str> {
 	const BASE_ROLES: &str = "public,follower,supporter,contributor,moderator,leader";
 	match db_roles {
 		Some(extra) if !extra.is_empty() => Box::from(format!("{},{}", BASE_ROLES, extra)),
@@ -146,11 +146,16 @@ pub(crate) async fn update_tenant_password(
 	password: &str,
 ) -> ClResult<()> {
 	let password_hash = crypto::generate_password_hash(worker, password).await?;
-	let _res = sqlx::query("UPDATE tenants SET password=?2 WHERE id_tag = ?1")
+	let res = sqlx::query("UPDATE tenants SET password=?2 WHERE id_tag = ?1")
 		.bind(id_tag)
 		.bind(password_hash)
 		.execute(db)
-		.await;
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+	if res.rows_affected() == 0 {
+		return Err(Error::NotFound);
+	}
 	Ok(())
 }
 
@@ -160,11 +165,13 @@ pub(crate) async fn update_idp_api_key(
 	id_tag: &str,
 	api_key: &str,
 ) -> ClResult<()> {
-	let _res = sqlx::query("UPDATE tenants SET idp_api_key=?2 WHERE id_tag = ?1")
+	sqlx::query("UPDATE tenants SET idp_api_key=?2 WHERE id_tag = ?1")
 		.bind(id_tag)
 		.bind(api_key)
 		.execute(db)
-		.await;
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
 	Ok(())
 }
 
@@ -291,58 +298,6 @@ pub(crate) async fn create_action_token(
 	let token = crypto::generate_action_token(worker, action_data, private_key).await?;
 
 	Ok(token)
-}
-
-/// Create a proxy token for federation
-pub(crate) async fn create_proxy_token(
-	db: &SqlitePool,
-	tn_id: TnId,
-	id_tag: &str,
-	roles: &[Box<str>],
-) -> ClResult<Box<str>> {
-	use jsonwebtoken::{encode, EncodingKey, Header};
-
-	// Build payload as a serializable struct
-	#[derive(serde::Serialize)]
-	struct ProxyTokenPayload {
-		iss: String,
-		sub: String,
-		aud: String,
-		iat: u64,
-		exp: u64,
-		roles: Vec<String>,
-	}
-
-	// Fetch the latest key for this tenant
-	let res = sqlx::query(
-		"SELECT key_id, private_key FROM keys WHERE tn_id = ? ORDER BY key_id DESC LIMIT 1",
-	)
-	.bind(tn_id.0)
-	.fetch_one(db)
-	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
-	let _key_id: Box<str> = res.try_get("key_id").or(Err(Error::DbError))?;
-	let private_key: Box<str> = res.try_get("private_key").or(Err(Error::DbError))?;
-
-	// Create proxy token JWT with user's id_tag and roles
-	// Proxy tokens allow this user to authenticate on behalf of the server in federation
-	let now = Timestamp::now();
-	let exp = Timestamp::from_now(86400); // 24 hours from now
-
-	let payload = ProxyTokenPayload {
-		iss: id_tag.to_string(),
-		sub: "federation".to_string(),
-		aud: "federation".to_string(),
-		iat: u64::try_from(now.0).unwrap_or_default(),
-		exp: u64::try_from(exp.0).unwrap_or_default(),
-		roles: roles.iter().map(ToString::to_string).collect(),
-	};
-
-	let key = EncodingKey::from_secret(private_key.as_bytes());
-	let token = encode(&Header::default(), &payload, &key).map_err(|_| Error::DbError)?;
-
-	Ok(token.into())
 }
 
 /// Verify an access token
