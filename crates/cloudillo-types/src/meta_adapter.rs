@@ -248,6 +248,10 @@ pub struct UpdateActionDataOptions {
 	pub status: Patch<char>,
 	pub visibility: Patch<char>,
 	pub x: Patch<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
+	pub content: Patch<String>,
+	pub attachments: Patch<String>, // Comma-separated list of attachment IDs
+	pub flags: Patch<String>,
+	pub created_at: Patch<Timestamp>,
 }
 
 /// Options for finalizing an action (resolved fields from ActionCreatorTask)

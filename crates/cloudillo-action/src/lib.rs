@@ -37,6 +37,7 @@ pub fn register_settings(
 pub fn init(app: &App) -> ClResult<()> {
 	app.scheduler.register::<task::ActionCreatorTask>()?;
 	app.scheduler.register::<task::ActionVerifierTask>()?;
+	app.scheduler.register::<task::DraftPublishTask>()?;
 	app.scheduler.register::<delivery::ActionDeliveryTask>()?;
 
 	// Register native hooks (must be called after app is fully initialized)

@@ -811,13 +811,30 @@ pub(crate) async fn update_data(
 	if !opts.x.is_undefined() {
 		set_clauses.push("x = ?");
 	}
+	if !opts.content.is_undefined() {
+		set_clauses.push("content = ?");
+	}
+	if !opts.attachments.is_undefined() {
+		set_clauses.push("attachments = ?");
+	}
+	if !opts.flags.is_undefined() {
+		set_clauses.push("flags = ?");
+	}
+	if !opts.created_at.is_undefined() {
+		set_clauses.push("created_at = ?");
+	}
 
 	if set_clauses.is_empty() {
 		return Ok(()); // Nothing to update
 	}
 
-	let sql =
-		format!("UPDATE actions SET {} WHERE tn_id = ? AND action_id = ?", set_clauses.join(", "));
+	// Support both action_id and @{a_id} format
+	let where_clause = if action_id.starts_with('@') {
+		"WHERE tn_id = ? AND a_id = ?"
+	} else {
+		"WHERE tn_id = ? AND action_id = ?"
+	};
+	let sql = format!("UPDATE actions SET {} {}", set_clauses.join(", "), where_clause);
 
 	let mut query = sqlx::query(&sql);
 
@@ -878,9 +895,47 @@ pub(crate) async fn update_data(
 		};
 		query = query.bind(val);
 	}
+	if !opts.content.is_undefined() {
+		let val: Option<&str> = match &opts.content {
+			Patch::Null => None,
+			Patch::Value(v) => Some(v.as_str()),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.attachments.is_undefined() {
+		let val: Option<&str> = match &opts.attachments {
+			Patch::Null => None,
+			Patch::Value(v) => Some(v.as_str()),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.flags.is_undefined() {
+		let val: Option<&str> = match &opts.flags {
+			Patch::Null => None,
+			Patch::Value(v) => Some(v.as_str()),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.created_at.is_undefined() {
+		let val: Option<i64> = match &opts.created_at {
+			Patch::Null => None,
+			Patch::Value(ts) => Some(ts.0),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
 
 	// Bind WHERE clause params
-	query = query.bind(tn_id.0).bind(action_id);
+	query = query.bind(tn_id.0);
+	if let Some(a_id_str) = action_id.strip_prefix('@') {
+		let a_id: i64 = a_id_str.parse().map_err(|_| Error::NotFound)?;
+		query = query.bind(a_id);
+	} else {
+		query = query.bind(action_id);
+	}
 
 	let res = query.execute(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
@@ -921,23 +976,45 @@ pub(crate) async fn get(
 	tn_id: TnId,
 	action_id: &str,
 ) -> ClResult<Option<ActionView>> {
-	let row = sqlx::query(
-		"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
-		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
-		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
-		a.subject, a.content, a.created_at, a.expires_at,
-		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
-		FROM actions a
-		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
-		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
-		WHERE a.tn_id=? AND a.action_id=? AND coalesce(a.status, 'A') NOT IN ('D')",
-	)
-	.bind(tn_id.0)
-	.bind(action_id)
-	.fetch_optional(db)
-	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	// Handle @{a_id} format for drafts/pending actions
+	let row = if let Some(a_id_str) = action_id.strip_prefix('@') {
+		let a_id: i64 = a_id_str.parse().map_err(|_| Error::NotFound)?;
+		sqlx::query(
+			"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
+			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
+			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
+			a.subject, a.content, a.created_at, a.expires_at,
+			a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
+			FROM actions a
+			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
+			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
+			WHERE a.tn_id=? AND a.a_id=? AND coalesce(a.status, 'A') NOT IN ('D')",
+		)
+		.bind(tn_id.0)
+		.bind(a_id)
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?
+	} else {
+		sqlx::query(
+			"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
+			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
+			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
+			a.subject, a.content, a.created_at, a.expires_at,
+			a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
+			FROM actions a
+			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
+			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
+			WHERE a.tn_id=? AND a.action_id=? AND coalesce(a.status, 'A') NOT IN ('D')",
+		)
+		.bind(tn_id.0)
+		.bind(action_id)
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?
+	};
 
 	let Some(row) = row else {
 		return Ok(None);
@@ -1021,8 +1098,20 @@ pub(crate) async fn get(
 	let visibility: Option<String> = row.try_get("visibility").ok();
 	let visibility = visibility.and_then(|s| s.chars().next());
 
+	// action_id might be NULL for draft/pending actions - use @{a_id} placeholder
+	let result_action_id: Box<str> = row
+		.try_get::<Option<String>, _>("action_id")
+		.map_err(|_| Error::DbError)?
+		.map_or_else(
+			|| {
+				let a_id: i64 = row.try_get("a_id").unwrap_or(0);
+				format!("@{}", a_id).into_boxed_str()
+			},
+			String::into_boxed_str,
+		);
+
 	Ok(Some(ActionView {
-		action_id: row.try_get::<Box<str>, _>("action_id").map_err(|_| Error::DbError)?,
+		action_id: result_action_id,
 		typ: row.try_get::<Box<str>, _>("type").map_err(|_| Error::DbError)?,
 		sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type").map_err(|_| Error::DbError)?,
 		parent_id: row.try_get::<Option<Box<str>>, _>("parent_id").map_err(|_| Error::DbError)?,
@@ -1084,28 +1173,75 @@ pub(crate) async fn get(
 	}))
 }
 
-/// Update action (placeholder)
+/// Update action content and attachments (drafts only, status='R')
 pub(crate) async fn update(
-	_db: &SqlitePool,
-	_tn_id: TnId,
-	_action_id: &str,
-	_content: Option<&str>,
-	_attachments: Option<&[&str]>,
+	db: &SqlitePool,
+	tn_id: TnId,
+	action_id: &str,
+	content: Option<&str>,
+	attachments: Option<&[&str]>,
 ) -> ClResult<()> {
-	// TODO: Implement action update before federation
+	// Only allow updates to draft actions (status='R'), identified by @{a_id}
+	let Some(a_id_str) = action_id.strip_prefix('@') else {
+		return Err(Error::ValidationError("Only draft actions (@{a_id}) can be updated".into()));
+	};
+	let a_id: i64 = a_id_str.parse().map_err(|_| Error::NotFound)?;
+
+	let mut set_clauses = Vec::new();
+	if content.is_some() {
+		set_clauses.push("content=?");
+	}
+	if attachments.is_some() {
+		set_clauses.push("attachments=?");
+	}
+	if set_clauses.is_empty() {
+		return Ok(());
+	}
+
+	let sql = format!(
+		"UPDATE actions SET {} WHERE tn_id=? AND a_id=? AND status='R'",
+		set_clauses.join(", ")
+	);
+	let mut query = sqlx::query(&sql);
+	if let Some(content) = content {
+		query = query.bind(content);
+	}
+	if let Some(attachments) = attachments {
+		query = query.bind(attachments.join(","));
+	}
+	query = query.bind(tn_id.0).bind(a_id);
+
+	let res = query.execute(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+
+	if res.rows_affected() == 0 {
+		return Err(Error::NotFound);
+	}
+
 	Ok(())
 }
 
-/// Delete action (soft delete)
+/// Delete action (soft delete for published, hard delete for drafts)
 pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClResult<()> {
-	// Soft delete action by marking status as 'D'
-	sqlx::query("UPDATE actions SET status = 'D' WHERE tn_id = ? AND action_id = ?")
-		.bind(tn_id.0)
-		.bind(action_id)
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	if let Some(a_id_str) = action_id.strip_prefix('@') {
+		// Draft action: hard delete by a_id, only if status='R'
+		let a_id: i64 = a_id_str.parse().map_err(|_| Error::NotFound)?;
+		sqlx::query("DELETE FROM actions WHERE tn_id=? AND a_id=? AND status='R'")
+			.bind(tn_id.0)
+			.bind(a_id)
+			.execute(db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+	} else {
+		// Published action: soft delete by marking status as 'D'
+		sqlx::query("UPDATE actions SET status = 'D' WHERE tn_id = ? AND action_id = ?")
+			.bind(tn_id.0)
+			.bind(action_id)
+			.execute(db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+	}
 
 	Ok(())
 }

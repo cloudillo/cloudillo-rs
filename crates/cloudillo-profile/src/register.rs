@@ -352,6 +352,7 @@ async fn handle_idp_registration(
 		visibility: None,
 		flags: None,
 		x: None,
+		..Default::default()
 	};
 
 	// Generate action JWT token

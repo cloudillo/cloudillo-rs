@@ -29,6 +29,11 @@ pub struct CreateAction {
 	/// Extensible metadata (stored in x column, not in JWT)
 	/// Used for server-side data like x.role for SUBS actions
 	pub x: Option<serde_json::Value>,
+	/// If true, create as draft instead of publishing immediately
+	pub draft: Option<bool>,
+	/// Scheduled publish time (implies draft=true). Sets created_at to this time.
+	#[serde(rename = "publishAt")]
+	pub publish_at: Option<Timestamp>,
 }
 
 /// Action status codes for tracking action lifecycle state
@@ -48,6 +53,14 @@ pub mod status {
 	/// Deleted/Rejected - Action was rejected or deleted
 	/// Used for: rejected requests, deleted content
 	pub const DELETED: char = 'D';
+
+	/// Draft - Action is a draft, not yet published
+	/// Used for: drafts that can be edited before publishing
+	pub const DRAFT: char = 'R';
+
+	/// Scheduled - Draft with a scheduled publish time
+	/// Used for: drafts that will auto-publish at a future time
+	pub const SCHEDULED: char = 'S';
 }
 
 // vim: ts=4

@@ -566,4 +566,226 @@ pub async fn post_action_stat(
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// Request body for PATCH /api/actions/:action_id (draft update)
+#[derive(Debug, Default, Deserialize)]
+pub struct PatchActionRequest {
+	pub content: Option<serde_json::Value>,
+	pub attachments: Option<Vec<Box<str>>>,
+	pub visibility: Option<char>,
+	pub flags: Option<Box<str>>,
+	pub x: Option<serde_json::Value>,
+}
+
+/// PATCH /api/actions/:action_id - Update a draft action
+pub async fn patch_action(
+	State(app): State<App>,
+	tn_id: TnId,
+	Auth(auth): Auth,
+	IdTag(_id_tag): IdTag,
+	Path(action_id): Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(req): Json<PatchActionRequest>,
+) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
+	// Only drafts can be updated
+	if !action_id.starts_with('@') {
+		return Err(Error::ValidationError("Only draft actions can be updated".into()));
+	}
+
+	// Verify the action exists and is a draft/scheduled owned by this user
+	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+	if !matches!(action.status.as_deref(), Some("R" | "S")) {
+		return Err(Error::ValidationError("Only draft actions can be updated".into()));
+	}
+	if action.issuer.id_tag.as_ref() != auth.id_tag.as_ref() {
+		return Err(Error::PermissionDenied);
+	}
+
+	// Build update options
+	let content_str = req.content.as_ref().and_then(|v| serde_json::to_string(v).ok());
+	let attachments_str = req
+		.attachments
+		.as_ref()
+		.map(|a| a.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(","));
+
+	let opts = meta_adapter::UpdateActionDataOptions {
+		content: match content_str {
+			Some(s) => cloudillo_types::types::Patch::Value(s),
+			None => cloudillo_types::types::Patch::Undefined,
+		},
+		attachments: match attachments_str {
+			Some(s) => cloudillo_types::types::Patch::Value(s),
+			None => cloudillo_types::types::Patch::Undefined,
+		},
+		visibility: match req.visibility {
+			Some(v) => cloudillo_types::types::Patch::Value(v),
+			None => cloudillo_types::types::Patch::Undefined,
+		},
+		flags: match req.flags {
+			Some(ref f) => cloudillo_types::types::Patch::Value(f.to_string()),
+			None => cloudillo_types::types::Patch::Undefined,
+		},
+		x: match req.x {
+			Some(ref v) => cloudillo_types::types::Patch::Value(v.clone()),
+			None => cloudillo_types::types::Patch::Undefined,
+		},
+		..Default::default()
+	};
+
+	app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
+
+	// Re-fetch the updated action
+	let updated = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+
+	let response = ApiResponse::new(updated).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
+}
+
+/// Request body for POST /api/actions/:action_id/publish
+#[derive(Debug, Default, Deserialize)]
+pub struct PublishDraftRequest {
+	/// Optional scheduled publish time. If set, the draft will be published at this time.
+	#[serde(rename = "publishAt")]
+	pub publish_at: Option<cloudillo_types::types::Timestamp>,
+}
+
+/// POST /api/actions/:action_id/publish - Publish a draft action
+pub async fn publish_draft(
+	State(app): State<App>,
+	tn_id: TnId,
+	Auth(auth): Auth,
+	IdTag(_id_tag): IdTag,
+	Path(action_id): Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(req): Json<PublishDraftRequest>,
+) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
+	// Only drafts can be published
+	if !action_id.starts_with('@') {
+		return Err(Error::ValidationError("Only draft actions can be published".into()));
+	}
+
+	// Verify the action exists and is a draft/scheduled owned by this user
+	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+	if !matches!(action.status.as_deref(), Some("R" | "S")) {
+		return Err(Error::ValidationError("Only draft actions can be published".into()));
+	}
+	if action.issuer.id_tag.as_ref() != auth.id_tag.as_ref() {
+		return Err(Error::PermissionDenied);
+	}
+
+	// Parse a_id from @{a_id}
+	let a_id: u64 = action_id
+		.strip_prefix('@')
+		.ok_or(Error::NotFound)?
+		.parse()
+		.map_err(|_| Error::NotFound)?;
+
+	// Reconstruct CreateAction from the stored draft data
+	let draft_action = task::CreateAction {
+		typ: action.typ.clone(),
+		sub_typ: action.sub_typ.clone(),
+		parent_id: action.parent_id.clone(),
+		audience_tag: action.audience.as_ref().map(|a| a.id_tag.clone()),
+		content: action.content.clone(),
+		attachments: action
+			.attachments
+			.as_ref()
+			.map(|a| a.iter().map(|av| av.file_id.clone()).collect()),
+		subject: action.subject.clone(),
+		expires_at: action.expires_at,
+		visibility: action.visibility,
+		flags: action.flags.clone(),
+		x: action.x.clone(),
+		draft: None,
+		publish_at: None,
+	};
+
+	if let Some(publish_at) = req.publish_at {
+		// Scheduled publish: set status to 'S', update created_at, schedule DraftPublishTask
+		// Different scheduled_at ensures scheduler replaces the old task on reschedule
+		let opts = meta_adapter::UpdateActionDataOptions {
+			status: cloudillo_types::types::Patch::Value('S'),
+			created_at: cloudillo_types::types::Patch::Value(publish_at),
+			..Default::default()
+		};
+		app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
+
+		let publish_task =
+			task::DraftPublishTask::new(tn_id, auth.id_tag.clone(), a_id, draft_action, publish_at);
+		app.scheduler
+			.task(publish_task)
+			.key(format!("draft:{},{}", tn_id, a_id))
+			.at(publish_at)
+			.await?;
+	} else {
+		// Immediate publish: set status to 'P', update created_at to now, schedule ActionCreatorTask
+		// Old DraftPublishTask (if any) will no-op since status is no longer 'S'
+		let now = cloudillo_types::types::Timestamp::now();
+		let opts = meta_adapter::UpdateActionDataOptions {
+			status: cloudillo_types::types::Patch::Value('P'),
+			created_at: cloudillo_types::types::Patch::Value(now),
+			..Default::default()
+		};
+		app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
+
+		let creator_task =
+			task::ActionCreatorTask::new(tn_id, auth.id_tag.clone(), a_id, draft_action);
+		app.scheduler
+			.task(creator_task)
+			.key(format!("{},{}", tn_id, a_id))
+			.schedule()
+			.await?;
+	}
+
+	// Re-fetch the action
+	let updated = app
+		.meta_adapter
+		.list_actions(
+			tn_id,
+			&meta_adapter::ListActionOptions { action_id: Some(action_id), ..Default::default() },
+		)
+		.await?;
+	let result = updated.into_iter().next().ok_or(Error::NotFound)?;
+
+	let response = ApiResponse::new(result).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
+}
+
+/// POST /api/actions/:action_id/cancel - Cancel a scheduled draft (back to draft status)
+pub async fn cancel_scheduled(
+	State(app): State<App>,
+	tn_id: TnId,
+	Auth(auth): Auth,
+	IdTag(_id_tag): IdTag,
+	Path(action_id): Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
+	// Only drafts can be cancelled
+	if !action_id.starts_with('@') {
+		return Err(Error::ValidationError("Only draft actions can be cancelled".into()));
+	}
+
+	// Verify the action exists and is scheduled, owned by this user
+	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+	if action.status.as_deref() != Some("S") {
+		return Err(Error::ValidationError("Only scheduled drafts can be cancelled".into()));
+	}
+	if action.issuer.id_tag.as_ref() != auth.id_tag.as_ref() {
+		return Err(Error::PermissionDenied);
+	}
+
+	// Transition status from 'S' (scheduled) back to 'R' (draft)
+	// The DraftPublishTask will no-op when it fires since status is no longer 'S'
+	let opts = meta_adapter::UpdateActionDataOptions {
+		status: cloudillo_types::types::Patch::Value('R'),
+		..Default::default()
+	};
+	app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
+
+	// Re-fetch the updated action
+	let updated = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+
+	let response = ApiResponse::new(updated).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
+}
+
 // vim: ts=4

@@ -338,6 +338,7 @@ impl<'a> OperationExecutor<'a> {
 			visibility: None,
 			flags: None, // Will use default_flags from action type definition
 			x: None,
+			..Default::default()
 		};
 
 		// Call action creation

@@ -183,6 +183,13 @@ pub async fn create_action(
 		helpers::resolve_root_id(app.meta_adapter.as_ref(), tn_id, action.parent_id.as_deref())
 			.await;
 
+	// Determine if this is a draft action
+	let is_draft = action.draft.unwrap_or(false) || action.publish_at.is_some();
+
+	// For drafts with publish_at, use that as created_at; otherwise use now
+	let created_at =
+		if let Some(publish_at) = action.publish_at { publish_at } else { Timestamp::now() };
+
 	// Create pending action in database with a_id (action_id is NULL at this point)
 	let pending_action = meta_adapter::Action {
 		action_id: "", // Empty action_id for pending actions
@@ -196,23 +203,28 @@ pub async fn create_action(
 		attachments: action.attachments.as_ref().map(|v| v.iter().map(AsRef::as_ref).collect()),
 		subject: action.subject.as_deref(),
 		expires_at: action.expires_at,
-		created_at: Timestamp::now(),
+		created_at,
 		visibility,
 		flags: action.flags.as_deref(),
 		x: action.x.clone(),
 	};
 
 	// Generate key from key_pattern for deduplication (e.g., REACT uses {type}:{parent}:{issuer})
-	let key = dsl.get_key_pattern(action.typ.as_ref()).map(|pattern| {
-		helpers::apply_key_pattern(
-			pattern,
-			action.typ.as_ref(),
-			id_tag,
-			action.audience_tag.as_deref(),
-			action.parent_id.as_deref(),
-			action.subject.as_deref(),
-		)
-	});
+	// Drafts don't get dedup keys - generated at publish time
+	let key = if is_draft {
+		None
+	} else {
+		dsl.get_key_pattern(action.typ.as_ref()).map(|pattern| {
+			helpers::apply_key_pattern(
+				pattern,
+				action.typ.as_ref(),
+				id_tag,
+				action.audience_tag.as_deref(),
+				action.parent_id.as_deref(),
+				action.subject.as_deref(),
+			)
+		})
+	};
 	let action_result =
 		app.meta_adapter.create_action(tn_id, &pending_action, key.as_deref()).await?;
 
@@ -223,6 +235,38 @@ pub async fn create_action(
 			return Err(Error::Internal("Unexpected ActionId result".into()));
 		}
 	};
+
+	// For drafts: set status to 'R' (draft) or 'S' (scheduled) and optionally schedule auto-publish
+	if is_draft {
+		use cloudillo_types::action_types::status;
+		let a_id_ref = format!("@{}", a_id);
+
+		if let Some(publish_at) = action.publish_at {
+			// Scheduled draft: status 'S', schedule DraftPublishTask
+			let update_opts = meta_adapter::UpdateActionDataOptions {
+				status: Patch::Value(status::SCHEDULED),
+				..Default::default()
+			};
+			app.meta_adapter.update_action_data(tn_id, &a_id_ref, &update_opts).await?;
+
+			let publish_task =
+				DraftPublishTask::new(tn_id, Box::from(id_tag), a_id, action.clone(), publish_at);
+			app.scheduler
+				.task(publish_task)
+				.key(format!("draft:{},{}", tn_id, a_id))
+				.at(created_at)
+				.await?;
+		} else {
+			// Plain draft: status 'R'
+			let update_opts = meta_adapter::UpdateActionDataOptions {
+				status: Patch::Value(status::DRAFT),
+				..Default::default()
+			};
+			app.meta_adapter.update_action_data(tn_id, &a_id_ref, &update_opts).await?;
+		}
+
+		return Ok(format!("@{}", a_id).into_boxed_str());
+	}
 
 	// Collect file attachment dependencies
 	let attachments_to_wait = if let Some(attachments) = &action.attachments {
@@ -318,6 +362,7 @@ async fn create_ephemeral_action(
 		visibility: action.visibility,
 		flags,
 		x: None, // Ephemeral actions don't use x metadata
+		..Default::default()
 	};
 
 	// Generate action token
@@ -614,6 +659,7 @@ async fn generate_action_token(
 		visibility: action.visibility,
 		flags,
 		x: None, // x is stored in DB but not in JWT token
+		..Default::default()
 	};
 
 	// Try to create action token, if it fails due to missing key, create one and retry
@@ -898,6 +944,112 @@ async fn schedule_broadcast_delivery(
 	}
 
 	Ok(())
+}
+
+/// Draft publish Task - publishes a draft action at a scheduled time
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DraftPublishTask {
+	tn_id: TnId,
+	id_tag: Box<str>,
+	a_id: u64,
+	action: CreateAction,
+	/// Scheduled publish time — included in serialized params so rescheduling
+	/// produces different params, forcing the scheduler to replace the old task.
+	scheduled_at: Timestamp,
+}
+
+impl DraftPublishTask {
+	pub fn new(
+		tn_id: TnId,
+		id_tag: Box<str>,
+		a_id: u64,
+		action: CreateAction,
+		scheduled_at: Timestamp,
+	) -> Arc<Self> {
+		Arc::new(Self { tn_id, id_tag, a_id, action, scheduled_at })
+	}
+}
+
+#[async_trait]
+impl Task<App> for DraftPublishTask {
+	fn kind() -> &'static str {
+		"action.draft_publish"
+	}
+	fn kind_of(&self) -> &'static str {
+		Self::kind()
+	}
+
+	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
+		let task: DraftPublishTask = serde_json::from_str(ctx)?;
+		Ok(Arc::new(task))
+	}
+
+	fn serialize(&self) -> String {
+		serde_json::to_string(self).unwrap_or_else(|e| {
+			error!("Failed to serialize DraftPublishTask: {}", e);
+			"{}".to_string()
+		})
+	}
+
+	async fn run(&self, app: &App) -> ClResult<()> {
+		info!("→ DRAFT.PUBLISH: a_id={} type={}", self.a_id, self.action.typ);
+
+		let a_id_ref = format!("@{}", self.a_id);
+
+		// Verify the action is still scheduled
+		let action_view = app.meta_adapter.get_action(self.tn_id, &a_id_ref).await?;
+		let Some(action_view) = action_view else {
+			info!("Draft {} no longer exists, skipping publish", a_id_ref);
+			return Ok(());
+		};
+
+		if action_view.status.as_deref() != Some("S") {
+			info!(
+				"Draft {} status is {:?}, not 'S' — skipping publish",
+				a_id_ref, action_view.status
+			);
+			return Ok(());
+		}
+
+		// Re-read current content from DB to pick up any PATCH edits made after scheduling
+		let current_action = CreateAction {
+			typ: action_view.typ.clone(),
+			sub_typ: action_view.sub_typ.clone(),
+			parent_id: action_view.parent_id.clone(),
+			audience_tag: action_view.audience.as_ref().map(|a| a.id_tag.clone()),
+			content: action_view.content.clone(),
+			attachments: action_view
+				.attachments
+				.as_ref()
+				.map(|a| a.iter().map(|av| av.file_id.clone()).collect()),
+			subject: action_view.subject.clone(),
+			expires_at: action_view.expires_at,
+			visibility: action_view.visibility,
+			flags: action_view.flags.clone(),
+			x: action_view.x.clone(),
+			draft: None,
+			publish_at: None,
+		};
+
+		// Transition status from 'S' (scheduled) to 'P' (pending)
+		let update_opts = meta_adapter::UpdateActionDataOptions {
+			status: Patch::Value('P'),
+			..Default::default()
+		};
+		app.meta_adapter.update_action_data(self.tn_id, &a_id_ref, &update_opts).await?;
+
+		// Schedule ActionCreatorTask to finalize (sign JWT, deliver)
+		let task =
+			ActionCreatorTask::new(self.tn_id, self.id_tag.clone(), self.a_id, current_action);
+		app.scheduler
+			.task(task)
+			.key(format!("{},{}", self.tn_id, self.a_id))
+			.schedule()
+			.await?;
+
+		info!("← DRAFT.PUBLISHED: a_id={}", self.a_id);
+		Ok(())
+	}
 }
 
 /// Action verifier generator Task

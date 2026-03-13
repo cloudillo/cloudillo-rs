@@ -55,6 +55,16 @@ async fn check_action_permission(
 ) -> Result<Response, Error> {
 	use tracing::warn;
 
+	// Draft actions (@{a_id}): skip ABAC, verify authenticated user is the issuer
+	if action_id.starts_with('@') {
+		let auth_ctx = maybe_auth_ctx.ok_or(Error::PermissionDenied)?;
+		let draft = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+		if draft.issuer.id_tag.as_ref() != auth_ctx.id_tag.as_ref() {
+			return Err(Error::PermissionDenied);
+		}
+		return Ok(next.run(req).await);
+	}
+
 	// Create auth context or guest context if not authenticated
 	let (auth_ctx, subject_id_tag) = if let Some(auth_ctx) = maybe_auth_ctx {
 		let id_tag = auth_ctx.id_tag.clone();

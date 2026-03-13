@@ -117,6 +117,7 @@ pub async fn put_community_profile(
 			visibility: None,
 			flags: None,
 			x: None,
+			..Default::default()
 		};
 
 		// Generate and send token to IDP

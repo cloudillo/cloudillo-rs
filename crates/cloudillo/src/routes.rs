@@ -47,10 +47,12 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_create("action", "create")));
 
 	// Action write routes (check_perm_action("write"))
-	// Note: PATCH removed - actions are immutable federated content (signed JWTs)
 	let action_router_write = Router::new()
 		.route("/api/actions/{action_id}/stat", post(action::handler::post_action_stat))
 		.route("/api/actions/{action_id}", delete(action::handler::delete_action))
+		.route("/api/actions/{action_id}", patch(action::handler::patch_action))
+		.route("/api/actions/{action_id}/publish", post(action::handler::publish_draft))
+		.route("/api/actions/{action_id}/cancel", post(action::handler::cancel_scheduled))
 		.route("/api/actions/{action_id}/accept", post(action::handler::post_action_accept))
 		.route("/api/actions/{action_id}/reject", post(action::handler::post_action_reject))
 		.route("/api/actions/{action_id}/dismiss", post(action::handler::post_action_dismiss))
