@@ -289,6 +289,8 @@ pub struct ListActionOptions {
 	#[serde(default, deserialize_with = "deserialize_split")]
 	pub status: Option<Vec<String>>,
 	pub tag: Option<String>,
+	pub search: Option<String>,
+	pub visibility: Option<char>,
 	pub issuer: Option<String>,
 	pub audience: Option<String>,
 	pub involved: Option<String>,

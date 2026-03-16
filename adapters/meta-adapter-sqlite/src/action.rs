@@ -2,7 +2,7 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::{collect_res, inspect, map_res, parse_str_list, push_in};
+use crate::utils::{collect_res, escape_like, inspect, map_res, parse_str_list, push_in};
 use cloudillo_types::meta_adapter::{
 	Action, ActionData, ActionId, ActionView, AttachmentView, FinalizeActionOptions,
 	ListActionOptions, ProfileInfo, ProfileType, UpdateActionDataOptions,
@@ -91,6 +91,25 @@ pub(crate) async fn list(
 	}
 	if let Some(created_after) = &opts.created_after {
 		query.push(" AND a.created_at>").push_bind(created_after.0);
+	}
+	if let Some(tag) = &opts.tag {
+		query
+			.push(" AND a.content LIKE ")
+			.push_bind(format!("%#{}%", escape_like(tag)))
+			.push(" ESCAPE '\\'");
+	}
+	if let Some(search) = &opts.search {
+		query
+			.push(" AND a.content LIKE ")
+			.push_bind(format!("%{}%", escape_like(search)))
+			.push(" ESCAPE '\\'");
+	}
+	if let Some(visibility) = &opts.visibility {
+		if *visibility == 'D' {
+			query.push(" AND a.visibility IS NULL");
+		} else {
+			query.push(" AND a.visibility=").push_bind(visibility.to_string());
+		}
 	}
 	if let Some(action_id) = &opts.action_id {
 		// Handle both @{a_id} placeholders and real action_ids
