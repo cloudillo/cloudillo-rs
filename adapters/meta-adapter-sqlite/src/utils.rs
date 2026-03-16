@@ -78,6 +78,12 @@ macro_rules! push_patch {
 // Re-export for use in other modules
 pub(crate) use push_patch;
 
+/// Escape SQL LIKE wildcard characters for safe use in LIKE patterns.
+/// Must be used with `ESCAPE '\'` in the SQL query.
+pub(crate) fn escape_like(s: &str) -> String {
+	s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 /// Build an IN clause with parameterized values
 pub(crate) fn push_in<'a>(
 	mut query: sqlx::QueryBuilder<'a, sqlx::Sqlite>,

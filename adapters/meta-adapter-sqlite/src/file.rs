@@ -112,7 +112,10 @@ pub(crate) async fn list(
 	}
 
 	if let Some(tag) = &opts.tag {
-		query.push(" AND f.tags LIKE ").push_bind(format!("%{}%", tag));
+		query
+			.push(" AND f.tags LIKE ")
+			.push_bind(format!("%{}%", crate::utils::escape_like(tag)))
+			.push(" ESCAPE '\\'");
 	}
 
 	if let Some(preset) = &opts.preset {

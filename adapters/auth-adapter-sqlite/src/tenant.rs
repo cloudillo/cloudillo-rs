@@ -4,8 +4,6 @@ use std::sync::Arc;
 
 use sqlx::{Row, SqlitePool};
 
-use std::fmt::Write;
-
 use crate::utils::{async_map_res, inspect, map_res, parse_str_list_optional};
 use cloudillo_types::{
 	auth_adapter::{AuthProfile, CreateTenantData, ListTenantsOptions, TenantListItem},
@@ -220,41 +218,46 @@ pub(crate) async fn delete_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<()>
 	Ok(())
 }
 
+/// Escape SQL LIKE wildcard characters for safe use in LIKE patterns.
+/// Must be used with `ESCAPE '\'` in the SQL query.
+fn escape_like(s: &str) -> String {
+	s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 /// List all tenants (for admin use)
 pub(crate) async fn list_tenants(
 	db: &SqlitePool,
 	opts: &ListTenantsOptions<'_>,
 ) -> ClResult<Vec<TenantListItem>> {
-	// Build dynamic query based on options
-	let mut query = String::from(
+	let mut query = sqlx::QueryBuilder::new(
 		"SELECT tn_id, id_tag, email, roles, status, created_at FROM tenants WHERE 1=1",
 	);
 
 	if let Some(status) = opts.status {
-		let _ = write!(query, " AND status = '{}'", status.replace('\'', "''"));
+		query.push(" AND status = ").push_bind(status);
 	}
 
 	if let Some(q) = opts.q {
-		let escaped_q = q.replace('\'', "''");
-		let _ =
-			write!(query, " AND (id_tag LIKE '%{}%' OR email LIKE '%{}%')", escaped_q, escaped_q);
+		let escaped_q = escape_like(q);
+		query
+			.push(" AND (id_tag LIKE ")
+			.push_bind(format!("%{}%", escaped_q))
+			.push(" ESCAPE '\\' OR email LIKE ")
+			.push_bind(format!("%{}%", escaped_q))
+			.push(" ESCAPE '\\')");
 	}
 
-	query.push_str(" ORDER BY created_at DESC");
+	query.push(" ORDER BY created_at DESC");
 
 	if let Some(limit) = opts.limit {
-		let _ = write!(query, " LIMIT {}", limit);
+		query.push(" LIMIT ").push_bind(limit);
 	}
 
 	if let Some(offset) = opts.offset {
-		let _ = write!(query, " OFFSET {}", offset);
+		query.push(" OFFSET ").push_bind(offset);
 	}
 
-	let rows = sqlx::query(&query)
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+	let rows = query.build().fetch_all(db).await.inspect_err(inspect).or(Err(Error::DbError))?;
 
 	let tenants: Vec<TenantListItem> = rows
 		.into_iter()

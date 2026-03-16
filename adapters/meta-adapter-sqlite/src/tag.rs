@@ -67,11 +67,12 @@ pub(crate) async fn list(
 	} else {
 		// Original behavior: just return tag names without counts
 		let rows = if let Some(p) = prefix {
+			let escaped_p = crate::utils::escape_like(p);
 			sqlx::query(
-				"SELECT DISTINCT tag FROM tags WHERE tn_id = ? AND tag LIKE ? || '%' ORDER BY tag",
+				"SELECT DISTINCT tag FROM tags WHERE tn_id = ? AND tag LIKE ? ESCAPE '\\' ORDER BY tag",
 			)
 			.bind(tn_id.0)
-			.bind(p)
+			.bind(format!("{}%", escaped_p))
 			.fetch_all(db)
 			.await
 			.inspect_err(|err| warn!("DB: {:#?}", err))

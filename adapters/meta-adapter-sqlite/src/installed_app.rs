@@ -75,8 +75,7 @@ pub async fn list(
 	search: Option<&str>,
 ) -> ClResult<Vec<InstalledApp>> {
 	let rows = if let Some(search) = search {
-		let escaped = search.replace('%', "\\%").replace('_', "\\_");
-		let pattern = format!("%{escaped}%");
+		let pattern = format!("%{}%", crate::utils::escape_like(search));
 		sqlx::query(
 			"SELECT app_name, publisher_tag, version, action_id, file_id, blob_id,
 				status, capabilities, auto_update, installed_at

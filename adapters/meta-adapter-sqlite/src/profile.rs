@@ -131,12 +131,13 @@ pub(crate) async fn list(
 	}
 
 	if let Some(q) = &opts.q {
+		let escaped_q = crate::utils::escape_like(q);
 		query
 			.push(" AND (name LIKE ")
-			.push_bind(format!("%{}%", q))
-			.push(" OR id_tag LIKE ")
-			.push_bind(format!("%{}%", q))
-			.push(")");
+			.push_bind(format!("%{}%", escaped_q))
+			.push(" ESCAPE '\\' OR id_tag LIKE ")
+			.push_bind(format!("%{}%", escaped_q))
+			.push(" ESCAPE '\\')");
 	}
 
 	if let Some(id_tag) = &opts.id_tag {
