@@ -534,37 +534,16 @@ impl<'a> OperationExecutor<'a> {
 						UpdateValue::Direct(expr) | UpdateValue::Set { set: expr } => {
 							self.evaluator.evaluate(expr, context)?
 						}
-						UpdateValue::Increment { increment } => {
-							let inc = self.evaluator.evaluate(increment, context)?;
-							let inc_val = u32::try_from(inc.as_u64().ok_or_else(|| {
-								Error::ValidationError(
-									"increment value must be a number".to_string(),
-								)
-							})?)
-							.unwrap_or_default();
-
-							let current =
-								action_data.as_ref().and_then(|d| d.reactions).unwrap_or(0);
-							Value::from(current + inc_val)
-						}
-						UpdateValue::Decrement { decrement } => {
-							let dec = self.evaluator.evaluate(decrement, context)?;
-							let dec_val = u32::try_from(dec.as_u64().ok_or_else(|| {
-								Error::ValidationError(
-									"decrement value must be a number".to_string(),
-								)
-							})?)
-							.unwrap_or_default();
-
-							let current =
-								action_data.as_ref().and_then(|d| d.reactions).unwrap_or(0);
-							Value::from(current.saturating_sub(dec_val))
+						UpdateValue::Increment { .. } | UpdateValue::Decrement { .. } => {
+							return Err(Error::ValidationError(
+								"reactions field uses string format (e.g. 'L5:V3'), increment/decrement not supported".to_string(),
+							));
 						}
 					};
 					update_opts.reactions = if value.is_null() {
 						Patch::Null
-					} else if let Some(v) = value.as_u64() {
-						Patch::Value(u32::try_from(v).unwrap_or_default())
+					} else if let Some(s) = value.as_str() {
+						Patch::Value(s.to_string())
 					} else {
 						Patch::Undefined
 					};

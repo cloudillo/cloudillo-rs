@@ -234,7 +234,7 @@ pub struct UpdateProfileData {
 #[derive(Debug, Clone)]
 pub struct ActionData {
 	pub subject: Option<Box<str>>,
-	pub reactions: Option<u32>,
+	pub reactions: Option<Box<str>>,
 	pub comments: Option<u32>,
 }
 
@@ -242,7 +242,7 @@ pub struct ActionData {
 #[derive(Debug, Clone, Default)]
 pub struct UpdateActionDataOptions {
 	pub subject: Patch<String>,
-	pub reactions: Patch<u32>,
+	pub reactions: Patch<String>,
 	pub comments: Patch<u32>,
 	pub comments_read: Patch<u32>,
 	pub status: Patch<char>,
@@ -970,8 +970,9 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Delete an action (soft delete with cleanup)
 	async fn delete_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()>;
 
-	/// Count active (non-DEL, non-deleted) REACT actions for a given subject
-	async fn count_reactions(&self, tn_id: TnId, subject_id: &str) -> ClResult<u32>;
+	/// Count active (non-DEL, non-deleted) REACT actions for a given subject, grouped by type
+	/// Returns colon-separated format: "L5:V3:W1" (Like=5, Love=3, Wow=1)
+	async fn count_reactions(&self, tn_id: TnId, subject_id: &str) -> ClResult<String>;
 
 	// Phase 2: File Management Enhancements
 	//**************************************

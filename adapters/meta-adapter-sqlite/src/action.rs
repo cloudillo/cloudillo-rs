@@ -260,7 +260,7 @@ pub(crate) async fn list(
 						a.local_variants = Some(variants);
 					}
 				}
-				info!("attachment: {:?}", a);
+				debug!("attachment: {:?}", a);
 			}
 			Some(attachments)
 		} else {
@@ -268,15 +268,17 @@ pub(crate) async fn list(
 		};
 
 		// stat - build from reactions and comments counts
-		let reactions_count: i64 = row.try_get("reactions").unwrap_or(0);
+		let reactions: Option<String> = row.try_get("reactions").ok().flatten();
 		let comments_count: i64 = row.try_get("comments").unwrap_or(0);
 		let comments_read: i64 = row.try_get("comments_read").unwrap_or(0);
 		let own_reaction: Option<String> = row.try_get("own_reaction").ok().flatten();
 		let mut stat_obj = serde_json::json!({
 			"comments": comments_count,
-			"commentsRead": comments_read,
-			"reactions": reactions_count
+			"commentsRead": comments_read
 		});
+		if let Some(reactions) = reactions {
+			stat_obj["reactions"] = serde_json::Value::String(reactions);
+		}
 		if let Some(own_reaction) = own_reaction {
 			stat_obj["ownReaction"] = serde_json::Value::String(own_reaction);
 		}
@@ -702,7 +704,7 @@ pub(crate) async fn get_data(
 	match res {
 		Some(row) => Ok(Some(ActionData {
 			subject: row.try_get("subject").ok(),
-			reactions: row.try_get("reactions").ok(),
+			reactions: row.try_get::<Option<String>, _>("reactions").ok().flatten().map(Into::into),
 			comments: row.try_get("comments").ok(),
 		})),
 		None => Ok(None),
@@ -867,9 +869,15 @@ pub(crate) async fn update_data(
 		query = query.bind(val);
 	}
 	if !opts.reactions.is_undefined() {
-		let val: Option<u32> = match &opts.reactions {
+		let val: Option<&str> = match &opts.reactions {
 			Patch::Null => None,
-			Patch::Value(v) => Some(*v),
+			Patch::Value(v) => {
+				if v.is_empty() {
+					None
+				} else {
+					Some(v.as_str())
+				}
+			}
 			Patch::Undefined => unreachable!(),
 		};
 		query = query.bind(val);
@@ -1105,14 +1113,17 @@ pub(crate) async fn get(
 	};
 
 	// Build stat from reactions and comments counts
-	let reactions_count: i64 = row.try_get("reactions").unwrap_or(0);
+	let reactions: Option<String> = row.try_get("reactions").ok().flatten();
 	let comments_count: i64 = row.try_get("comments").unwrap_or(0);
 	let comments_read: i64 = row.try_get("comments_read").unwrap_or(0);
-	let stat = Some(serde_json::json!({
+	let mut stat_obj = serde_json::json!({
 		"comments": comments_count,
-		"commentsRead": comments_read,
-		"reactions": reactions_count
-	}));
+		"commentsRead": comments_read
+	});
+	if let Some(reactions) = reactions {
+		stat_obj["reactions"] = serde_json::Value::String(reactions);
+	}
+	let stat = Some(stat_obj);
 
 	let visibility: Option<String> = row.try_get("visibility").ok();
 	let visibility = visibility.and_then(|s| s.chars().next());
@@ -1265,20 +1276,59 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClR
 	Ok(())
 }
 
+/// Map reaction sub_type to single-char key for compact encoding
+fn reaction_type_key(sub_type: &str) -> Option<char> {
+	match sub_type {
+		"LIKE" => Some('L'),
+		"LOVE" => Some('V'),
+		"LAUGH" => Some('H'),
+		"WOW" => Some('W'),
+		"SAD" => Some('S'),
+		"ANGRY" => Some('A'),
+		_ => None,
+	}
+}
+
+/// Encode reaction counts as colon-separated pairs: "L5:V3:W1"
+fn encode_reaction_counts(counts: &[(char, u32)]) -> String {
+	counts
+		.iter()
+		.filter(|(_, c)| *c > 0)
+		.map(|(k, c)| format!("{}{}", k, c))
+		.collect::<Vec<_>>()
+		.join(":")
+}
+
 /// Count active (non-DEL, non-deleted) REACT actions for a given subject
 pub(crate) async fn count_reactions(
 	db: &SqlitePool,
 	tn_id: TnId,
 	subject_id: &str,
-) -> ClResult<u32> {
-	let count: i64 = sqlx::query_scalar(
-		"SELECT COUNT(*) FROM actions WHERE tn_id=? AND subject=? AND type='REACT' AND sub_type!='DEL' AND coalesce(status, 'A') NOT IN ('D')"
+) -> ClResult<String> {
+	let rows = sqlx::query(
+		"SELECT sub_type, COUNT(*) as cnt FROM actions \
+		 WHERE tn_id=? AND subject=? AND type='REACT' \
+		 AND sub_type!='DEL' AND coalesce(status, 'A') NOT IN ('D') \
+		 GROUP BY sub_type",
 	)
 	.bind(tn_id.0)
 	.bind(subject_id)
-	.fetch_one(db)
+	.fetch_all(db)
 	.await
 	.map_err(|_| Error::DbError)?;
 
-	Ok(u32::try_from(count).unwrap_or(0))
+	let counts: Vec<(char, u32)> = rows
+		.iter()
+		.filter_map(|row| {
+			let sub_type: String = row.try_get("sub_type").ok()?;
+			let cnt: i64 = row.try_get("cnt").ok()?;
+			let Some(key) = reaction_type_key(&sub_type) else {
+				warn!("Unknown reaction sub_type '{}' ignored in count", sub_type);
+				return None;
+			};
+			Some((key, u32::try_from(cnt).unwrap_or(0)))
+		})
+		.collect();
+
+	Ok(encode_reaction_counts(&counts))
 }

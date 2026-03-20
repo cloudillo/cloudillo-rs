@@ -424,7 +424,7 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::delete(&self.db, tn_id, action_id).await
 	}
 
-	async fn count_reactions(&self, tn_id: TnId, subject_id: &str) -> ClResult<u32> {
+	async fn count_reactions(&self, tn_id: TnId, subject_id: &str) -> ClResult<String> {
 		action::count_reactions(&self.dbr, tn_id, subject_id).await
 	}
 

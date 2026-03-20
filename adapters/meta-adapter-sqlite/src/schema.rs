@@ -27,7 +27,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 13;
+	const CURRENT_DB_VERSION: i64 = 14;
 
 	let mut tx = db.begin().await?;
 
@@ -276,7 +276,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			content json,
 			expires_at INTEGER,
 			attachments json,
-			reactions integer,
+			reactions text,
 			comments integer,
 			comments_read integer,
 			visibility char(1),				-- NULL: Direct (owner only), P: Public, V: Verified,
@@ -1027,6 +1027,31 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.await?;
 
 		set_db_version(&mut tx, 13).await;
+	}
+
+	// Version 14: Convert reactions column from integer to text (per-type counts)
+	// Format: "L5:V3:W1" (Like=5, Love=3, Wow=1)
+	// Existing integer values are converted to "L{n}" (assume all were likes)
+	if version < 14 {
+		// SQLite doesn't support ALTER COLUMN, but it's flexible with types.
+		// The column stays as-is structurally, we just convert existing integer values to text format.
+		// Convert non-null integer reaction counts to "L{n}" format
+		sqlx::query(
+			"UPDATE actions SET reactions = 'L' || reactions \
+			 WHERE reactions IS NOT NULL AND typeof(reactions) = 'integer' AND reactions > 0",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		// Clear zero-value reactions (they're meaningless)
+		sqlx::query(
+			"UPDATE actions SET reactions = NULL \
+			 WHERE reactions IS NOT NULL AND (reactions = '0' OR reactions = 0)",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 14).await;
 	}
 
 	tx.commit().await?;

@@ -1,8 +1,8 @@
 //! REACT (Reaction) action native hooks
 //!
 //! Handles reaction lifecycle:
-//! - on_create: Updates subject action's reaction count for local reactions
-//! - on_receive: Updates subject action's reaction count for incoming reactions
+//! - on_create: Updates subject action's per-type reaction counts for local reactions
+//! - on_receive: Updates subject action's per-type reaction counts for incoming reactions
 //!
 //! Note: REACT uses `subject` field to reference the action being reacted to,
 //! NOT `parent`. This is because reactions don't create visible hierarchy.
@@ -13,9 +13,7 @@ use cloudillo_types::meta_adapter::UpdateActionDataOptions;
 
 /// REACT on_create hook - Handle local reaction creation
 ///
-/// Updates the subject action's reaction count:
-/// - Non-DEL subtypes (LIKE, LOVE, etc.): increment by 1
-/// - DEL subtype: decrement by 1
+/// Counts active reactions per type for the subject and updates the stored counts.
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: REACT on_create for action {}", context.action_id);
 
@@ -28,19 +26,19 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 		return Ok(HookResult::default());
 	};
 
-	// Count active reactions for the subject (avoids double-count on reaction type switch)
+	// Update subject action's reaction counts (per-type)
 	let new_reactions = app.meta_adapter.count_reactions(tn_id, subject_id).await?;
 
 	if let Some("DEL") = context.subtype.as_deref() {
 		tracing::info!(
-			"REACT:DEL on_create: {} removing reaction from {} (count: {})",
+			"REACT:DEL on_create: {} removing reaction from {} (counts: {})",
 			context.issuer,
 			subject_id,
 			new_reactions
 		);
 	} else {
 		tracing::info!(
-			"REACT:{:?} on_create: {} reacting to {} (count: {})",
+			"REACT:{:?} on_create: {} reacting to {} (counts: {})",
 			context.subtype,
 			context.issuer,
 			subject_id,
@@ -48,18 +46,11 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 		);
 	}
 
-	// Update subject action's reaction count
 	let update_opts =
 		UpdateActionDataOptions { reactions: Patch::Value(new_reactions), ..Default::default() };
 
 	if let Err(e) = app.meta_adapter.update_action_data(tn_id, subject_id, &update_opts).await {
 		tracing::warn!("REACT on_create: Failed to update subject {} reactions: {}", subject_id, e);
-	} else {
-		tracing::debug!(
-			"REACT on_create: Updated subject {} reactions to {}",
-			subject_id,
-			new_reactions
-		);
 	}
 
 	Ok(HookResult::default())
@@ -67,9 +58,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 
 /// REACT on_receive hook - Handle incoming reaction
 ///
-/// Updates the subject action's reaction count if we own the subject:
-/// - Non-DEL subtypes (LIKE, LOVE, etc.): increment by 1
-/// - DEL subtype: decrement by 1
+/// Updates the subject action's reaction counts if we own the subject
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: REACT on_receive for action {}", context.action_id);
 
@@ -99,19 +88,19 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 		return Ok(HookResult::default());
 	}
 
-	// Count active reactions for the subject (avoids double-count on reaction type switch)
+	// Count active reactions per type for the subject
 	let new_reactions = app.meta_adapter.count_reactions(tn_id, subject_id).await?;
 
 	if let Some("DEL") = context.subtype.as_deref() {
 		tracing::info!(
-			"REACT:DEL on_receive: {} removing reaction from our action {} (count: {})",
+			"REACT:DEL on_receive: {} removing reaction from our action {} (counts: {})",
 			context.issuer,
 			subject_id,
 			new_reactions
 		);
 	} else {
 		tracing::info!(
-			"REACT:{:?} on_receive: {} reacting to our action {} (count: {})",
+			"REACT:{:?} on_receive: {} reacting to our action {} (counts: {})",
 			context.subtype,
 			context.issuer,
 			subject_id,
@@ -119,7 +108,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 		);
 	}
 
-	// Update subject action's reaction count
+	// Update subject action's reaction counts
 	let update_opts =
 		UpdateActionDataOptions { reactions: Patch::Value(new_reactions), ..Default::default() };
 
@@ -128,12 +117,6 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			"REACT on_receive: Failed to update subject {} reactions: {}",
 			subject_id,
 			e
-		);
-	} else {
-		tracing::debug!(
-			"REACT on_receive: Updated subject {} reactions to {}",
-			subject_id,
-			new_reactions
 		);
 	}
 
