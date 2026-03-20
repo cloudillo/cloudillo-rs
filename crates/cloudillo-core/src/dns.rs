@@ -15,7 +15,7 @@ use std::{
 };
 
 use crate::prelude::*;
-use cloudillo_types::address::{parse_address_type, AddressType};
+use cloudillo_types::address::AddressType;
 
 /// Root nameserver IPs - the 13 official ICANN root servers
 const ROOT_SERVERS: [&str; 13] = [
@@ -245,7 +245,7 @@ pub async fn resolve_domain_addresses(
 }
 
 /// Validate a domain against local address using DNS
-/// Checks A records if local_address is IP, CNAME if local_address is hostname
+/// Checks both CNAME and A records regardless of local address type
 pub async fn validate_domain_address(
 	domain: &str,
 	local_address: &[Box<str>],
@@ -255,72 +255,59 @@ pub async fn validate_domain_address(
 		return Err(Error::ValidationError("no local address configured".to_string()));
 	}
 
-	// Determine what record type to check based on local address type
-	let local_addr_type = parse_address_type(local_address[0].as_ref())?;
-
 	debug!(
 		domain = %domain,
 		local_addresses = ?local_address,
-		local_addr_type = %local_addr_type,
 		"Starting DNS validation with recursive resolver"
 	);
 
-	match local_addr_type {
-		AddressType::Ipv4 => {
-			// Local address is IP - check A record
-			if let Some(resolved_ip) = resolver.resolve_a(domain).await? {
-				for local_addr in local_address {
-					if resolved_ip == local_addr.as_ref() {
-						info!(
-							domain = %domain,
-							resolved_ip = %resolved_ip,
-							matched_local_address = %local_addr,
-							"Domain validated via A record"
-						);
-						return Ok((resolved_ip, AddressType::Ipv4));
-					}
-				}
-				warn!(
-					domain = %domain,
-					resolved_ip = %resolved_ip,
-					local_addresses = ?local_address,
-					"DNS A record doesn't match local address"
-				);
-				return Err(Error::ValidationError("address".to_string()));
-			}
-			warn!(domain = %domain, "DNS validation failed: no A record found");
-			Err(Error::ValidationError("nodns".to_string()))
-		}
-		AddressType::Hostname => {
-			// Local address is hostname - check CNAME record
-			if let Some(resolved_cname) = resolver.resolve_cname(domain).await? {
-				for local_addr in local_address {
-					if resolved_cname.eq_ignore_ascii_case(local_addr.as_ref()) {
-						info!(
-							domain = %domain,
-							resolved_cname = %resolved_cname,
-							matched_local_address = %local_addr,
-							"Domain validated via CNAME record"
-						);
-						return Ok((resolved_cname, AddressType::Hostname));
-					}
-				}
-				warn!(
+	// Try CNAME first
+	if let Some(resolved_cname) = resolver.resolve_cname(domain).await? {
+		for local_addr in local_address {
+			if resolved_cname.eq_ignore_ascii_case(local_addr.as_ref()) {
+				info!(
 					domain = %domain,
 					resolved_cname = %resolved_cname,
-					local_addresses = ?local_address,
-					"DNS CNAME record doesn't match local address"
+					matched_local_address = %local_addr,
+					"Domain validated via CNAME record"
 				);
-				return Err(Error::ValidationError("address".to_string()));
+				return Ok((resolved_cname, AddressType::Hostname));
 			}
-			warn!(domain = %domain, "DNS validation failed: no CNAME record found");
-			Err(Error::ValidationError("nodns".to_string()))
 		}
-		AddressType::Ipv6 => {
-			// IPv6 not supported for validation
-			Err(Error::ValidationError("IPv6 local address not supported".to_string()))
-		}
+		warn!(
+			domain = %domain,
+			resolved_cname = %resolved_cname,
+			local_addresses = ?local_address,
+			"DNS CNAME record doesn't match local address"
+		);
+		return Err(Error::ValidationError("address".to_string()));
 	}
+
+	// Try A record
+	if let Some(resolved_ip) = resolver.resolve_a(domain).await? {
+		for local_addr in local_address {
+			if resolved_ip == local_addr.as_ref() {
+				info!(
+					domain = %domain,
+					resolved_ip = %resolved_ip,
+					matched_local_address = %local_addr,
+					"Domain validated via A record"
+				);
+				return Ok((resolved_ip, AddressType::Ipv4));
+			}
+		}
+		warn!(
+			domain = %domain,
+			resolved_ip = %resolved_ip,
+			local_addresses = ?local_address,
+			"DNS A record doesn't match local address"
+		);
+		return Err(Error::ValidationError("address".to_string()));
+	}
+
+	// Neither CNAME nor A record found
+	warn!(domain = %domain, "DNS validation failed: no CNAME or A record found");
+	Err(Error::ValidationError("nodns".to_string()))
 }
 
 // vim: ts=4
