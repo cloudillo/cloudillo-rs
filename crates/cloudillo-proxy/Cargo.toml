@@ -17,7 +17,7 @@ cloudillo-types = { workspace = true }
 
 axum = { version = "0.8", features = ["http2", "macros"] }
 serde = { version = "1", features = ["derive"] }
-serde_with = "3.17"
+serde_with = "3.18"
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 url = "2"

@@ -37,7 +37,7 @@ futures-core = "0.3.32"
 rand = "0.10.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-serde_with = "3.17.0"
+serde_with = "3.18.0"
 sha2 = "0.10.9"
 tokio = { version = "1.50.0", features = ["io-util", "rt"] }
 tracing = "0.1.44"
@@ -45,7 +45,7 @@ tracing = "0.1.44"
 # Optional server-specific deps (for From<X> impls on Error)
 hyper = { version = "1.8.1", optional = true }
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2"], optional = true }
-image = { version = "0.25.9", optional = true }
+image = { version = "0.25.10", optional = true }
 instant-acme = { version = "0.8.5", optional = true }
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"], optional = true }
 pem = { version = "3.0.6", optional = true }

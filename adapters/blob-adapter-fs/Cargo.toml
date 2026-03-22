@@ -19,7 +19,7 @@ tokio = { version = "1.50.0", features = ["fs"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 
 [dev-dependencies]
-tempfile = "3.26"
+tempfile = "3.27"
 tokio = { version = "1.50.0", features = ["fs", "rt", "macros"] }
 
 [lints]

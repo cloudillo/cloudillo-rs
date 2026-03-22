@@ -31,9 +31,9 @@ dependencies = [
 
 [[package]]
 name = "aligned"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "377e4c0ba83e4431b10df45c1d4666f178ea9c552cac93e60c3a88bf32785923"
+checksum = "ee4508988c62edf04abd8d92897fca0c2995d907ce1dfeaf369dac3716a40685"
 dependencies = [
  "as-slice",
 ]
@@ -474,13 +474,13 @@ dependencies = [
 
 [[package]]
 name = "bcrypt"
-version = "0.18.0"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a0f5948f30df5f43ac29d310b7476793be97c50787e6ef4a63d960a0d0be827"
+checksum = "523ab528ce3a7ada6597f8ccf5bd8d85ebe26d5edf311cad4d1d3cfb2d357ac6"
 dependencies = [
  "base64 0.22.1",
  "blowfish",
- "getrandom 0.3.4",
+ "getrandom 0.4.1",
  "subtle",
  "zeroize",
 ]
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "axum",
  "axum-server",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-action"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-trait",
  "axum",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-admin"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-auth"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-trait",
  "axum",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-auth-adapter-sqlite"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-blob-adapter-fs"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-trait",
  "cloudillo-types",
@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-core"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-trait",
  "axum",
@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-crdt"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-crdt-adapter-redb"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-email"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-trait",
  "cloudillo-core",
@@ -867,16 +867,18 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-file"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-trait",
  "axum",
  "cloudillo-core",
  "cloudillo-types",
+ "flate2",
  "futures",
  "futures-core",
  "image",
  "itertools",
+ "rawzip",
  "regex",
  "resvg",
  "serde",
@@ -890,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-idp"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -904,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-meta-adapter-sqlite"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-trait",
  "cloudillo-types",
@@ -917,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-profile"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-trait",
  "axum",
@@ -937,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-proxy"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -956,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-push"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -978,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-ref"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -991,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-rtdb"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -1005,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-rtdb-adapter-redb"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1021,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-server"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "cloudillo",
  "cloudillo-auth-adapter-sqlite",
@@ -1035,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-types"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "async-trait",
  "axum",
@@ -1324,12 +1326,12 @@ dependencies = [
 
 [[package]]
 name = "darling"
-version = "0.21.3"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cdf337090841a411e2a7f3deb9187445851f91b309c0c0a29e05f74a00a48c0"
+checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
 dependencies = [
- "darling_core 0.21.3",
- "darling_macro 0.21.3",
+ "darling_core 0.23.0",
+ "darling_macro 0.23.0",
 ]
 
 [[package]]
@@ -1348,11 +1350,10 @@ dependencies = [
 
 [[package]]
 name = "darling_core"
-version = "0.21.3"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1247195ecd7e3c85f83c8d2a366e4210d588e802133e1e355180a9870b517ea4"
+checksum = "9865a50f7c335f53564bb694ef660825eb8610e0a53d3e11bf1b0d3df31e03b0"
 dependencies = [
- "fnv",
  "ident_case",
  "proc-macro2",
  "quote",
@@ -1373,11 +1374,11 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
-version = "0.21.3"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
+checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
 dependencies = [
- "darling_core 0.21.3",
+ "darling_core 0.23.0",
  "quote",
  "syn",
 ]
@@ -1685,7 +1686,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2416,7 +2417,7 @@ dependencies = [
  "hyper",
  "libc",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "tokio",
  "tower-service",
  "tracing",
@@ -2562,9 +2563,9 @@ dependencies = [
 
 [[package]]
 name = "image"
-version = "0.25.9"
+version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6506c6c10786659413faa717ceebcb8f70731c0a60cbae39795fdf114519c1a"
+checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
@@ -2580,8 +2581,8 @@ dependencies = [
  "rayon",
  "rgb",
  "tiff",
- "zune-core 0.5.0",
- "zune-jpeg 0.5.8",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3064,9 +3065,9 @@ dependencies = [
 
 [[package]]
 name = "moxcms"
-version = "0.7.9"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fbdd3d7436f8b5e892b8b7ea114271ff0fa00bc5acae845d53b07d498616ef6"
+checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
@@ -3132,7 +3133,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3604,9 +3605,9 @@ dependencies = [
 
 [[package]]
 name = "pxfm"
-version = "0.1.25"
+version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3cbdf373972bf78df4d3b518d07003938e2c7d1fb5891e55f9cb6df57009d84"
+checksum = "7186d3822593aa4393561d186d1393b3923e9d6163d3fbfd6e825e3e6cf3e6a8"
 dependencies = [
  "num-traits",
 ]
@@ -3775,9 +3776,9 @@ dependencies = [
 
 [[package]]
 name = "ravif"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef69c1990ceef18a116855938e74793a5f7496ee907562bd0857b6ac734ab285"
+checksum = "e52310197d971b0f5be7fe6b57530dcd27beb35c1b013f29d66c1ad73fbbcc45"
 dependencies = [
  "avif-serialize",
  "imgref",
@@ -3796,6 +3797,12 @@ checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
  "bitflags",
 ]
+
+[[package]]
+name = "rawzip"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d9575f44c8cf85bc843ad666dcdf20d05a7753772bef56eb2a5140282b32150"
 
 [[package]]
 name = "rayon"
@@ -3918,7 +3925,7 @@ dependencies = [
  "svgtypes",
  "tiny-skia",
  "usvg",
- "zune-jpeg 0.5.8",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4017,7 +4024,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4075,7 +4082,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4295,9 +4302,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "3.17.0"
+version = "3.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "381b283ce7bc6b476d903296fb59d0d36633652b633b27f64db4fb46dcbfc3b9"
+checksum = "dd5414fad8e6907dbdd5bc441a50ae8d6e26151a03b1de04d89a5576de61d01f"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4314,11 +4321,11 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "3.17.0"
+version = "3.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6d4e30573c8cb306ed6ab1dca8423eec9a463ea0e155f45399455e0368b27e0"
+checksum = "d3db8978e608f1fe7357e211969fd9abdcae80bac1ba7a3369bb7eb6b404eb65"
 dependencies = [
- "darling 0.21.3",
+ "darling 0.23.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -4396,9 +4403,9 @@ dependencies = [
 
 [[package]]
 name = "simd-adler32"
-version = "0.3.7"
+version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d66dc143e6b11c1eddc06d5c423cfc97062865baf299914ab64caa38182078fe"
+checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
 name = "simd_helpers"
@@ -4825,15 +4832,15 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tempfile"
-version = "3.26.0"
+version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82a72c767771b47409d2345987fda8628641887d5466101319899796367354a0"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
  "getrandom 0.4.1",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4887,16 +4894,16 @@ dependencies = [
 
 [[package]]
 name = "tiff"
-version = "0.10.3"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af9605de7fee8d9551863fd692cce7637f548dbd9db9180fcc07ccc6d26c336f"
+checksum = "b63feaf3343d35b6ca4d50483f94843803b0f51634937cc2ec519fc32232bc52"
 dependencies = [
  "fax",
  "flate2",
  "half",
  "quick-error",
  "weezl",
- "zune-jpeg 0.4.21",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -5158,9 +5165,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-subscriber"
-version = "0.3.22"
+version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f30143827ddab0d256fd843b7a66d164e9f271cfa0dde49142c5ca0ca291f1e"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
  "matchers",
  "nu-ansi-term",
@@ -5647,9 +5654,9 @@ dependencies = [
 
 [[package]]
 name = "weezl"
-version = "0.1.10"
+version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a751b3277700db47d3e574514de2eced5e54dc8a5436a3bf7a0b248b2cee16f3"
+checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "whoami"
@@ -5689,7 +5696,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6349,12 +6356,6 @@ checksum = "2fc5a66a20078bf1251bde995aa2fdcc4b800c70b5d92dd2c62abc5c60f679f8"
 
 [[package]]
 name = "zune-core"
-version = "0.4.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"
-
-[[package]]
-name = "zune-core"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "111f7d9820f05fd715df3144e254d6fc02ee4088b0644c0ffd0efc9e6d9d2773"
@@ -6370,18 +6371,9 @@ dependencies = [
 
 [[package]]
 name = "zune-jpeg"
-version = "0.4.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29ce2c8a9384ad323cf564b67da86e21d3cfdff87908bc1223ed5c99bc792713"
-dependencies = [
- "zune-core 0.4.12",
-]
-
-[[package]]
-name = "zune-jpeg"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35aee689668bf9bd6f6f3a6c60bb29ba1244b3b43adfd50edd554a371da37d5"
 dependencies = [
- "zune-core 0.5.0",
+ "zune-core",
 ]
