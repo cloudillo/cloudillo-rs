@@ -209,6 +209,11 @@ pub async fn check_file_access_with_scope(
 	)
 	.await;
 
+	// Public files are readable by anyone (including unauthenticated guests)
+	if access_level == AccessLevel::None && file_view.visibility == Some('P') {
+		access_level = AccessLevel::Read;
+	}
+
 	// Cap access by file-to-file share entry when opened via embedding
 	if let Some(via_file_id) = via {
 		if scope.is_none() && access_level != AccessLevel::None {

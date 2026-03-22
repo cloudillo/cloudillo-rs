@@ -229,29 +229,34 @@ pub async fn get_ws_rtdb(
 
 	info!("WebSocket RTDB request for file_id: {}, access={:?}", file_id, query.access);
 
-	let Some(auth_ctx) = auth else {
-		warn!("RTDB WebSocket rejected - no authentication");
-		return ws_close_unauthenticated(ws);
+	let is_guest = auth.is_none();
+	let (user_id, user_tn_id, user_roles, scope) = if let Some(ref auth_ctx) = auth {
+		(
+			auth_ctx.id_tag.to_string(),
+			auth_ctx.tn_id,
+			auth_ctx.roles.clone(),
+			auth_ctx.scope.clone(),
+		)
+	} else {
+		(String::new(), crate::types::TnId(tn_id), Box::default(), None::<Box<str>>)
 	};
 
-	let user_id = auth_ctx.id_tag.to_string();
-	let user_tn_id = auth_ctx.tn_id;
-	let user_roles = auth_ctx.roles.clone();
-	let scope = auth_ctx.scope.as_deref();
-
-	// Auto-create store file if s~ prefix
-	match validate_store_id(&file_id) {
-		Ok(Some(app_id)) => {
-			if let Err(e) =
-				ensure_store_file(&app, crate::types::TnId(tn_id), &file_id, "RTDB", app_id).await
-			{
-				return ws_close_for_error(ws, &e);
+	// Auto-create store file only for authenticated users
+	if !is_guest {
+		match validate_store_id(&file_id) {
+			Ok(Some(app_id)) => {
+				if let Err(e) =
+					ensure_store_file(&app, crate::types::TnId(tn_id), &file_id, "RTDB", app_id)
+						.await
+				{
+					return ws_close_for_error(ws, &e);
+				}
 			}
-		}
-		Ok(None) => {} // Not a store ID, proceed normally
-		Err(()) => {
-			warn!("RTDB WebSocket rejected - invalid store ID: {}", file_id);
-			return ws_close_invalid_store(ws);
+			Ok(None) => {} // Not a store ID, proceed normally
+			Err(()) => {
+				warn!("RTDB WebSocket rejected - invalid store ID: {}", file_id);
+				return ws_close_invalid_store(ws);
+			}
 		}
 	}
 
@@ -266,7 +271,7 @@ pub async fn get_ws_rtdb(
 		crate::types::TnId(tn_id),
 		&file_id,
 		&ctx,
-		scope,
+		scope.as_deref(),
 		query.via.as_deref(),
 	)
 	.await;
@@ -279,15 +284,20 @@ pub async fn get_ws_rtdb(
 				return ws_close_type_mismatch(ws);
 			}
 
-			// Resolve final read_only based on query parameter
-			let Ok(read_only) = resolve_access(&query, result.read_only) else {
-				warn!("RTDB WebSocket rejected - write access requested but not available: user={}, file={}", user_id, file_id);
-				return ws_close_write_denied(ws);
+			// Guests are always read-only
+			let read_only = if is_guest {
+				true
+			} else {
+				let Ok(ro) = resolve_access(&query, result.read_only) else {
+					warn!("RTDB WebSocket rejected - write access requested but not available: user={}, file={}", user_id, file_id);
+					return ws_close_write_denied(ws);
+				};
+				ro
 			};
 			info!(
 				"RTDB WebSocket ({}): user={}, file={}",
 				if read_only { "read-only" } else { "read-write" },
-				user_id,
+				if is_guest { "*guest" } else { &user_id },
 				file_id
 			);
 			ws.on_upgrade(move |socket| {
@@ -305,7 +315,8 @@ pub async fn get_ws_rtdb(
 ///
 /// Route: `/ws/crdt/:doc_id`
 /// Query params: `?access=read` or `?access=write`
-/// Requires authentication.
+/// Supports authenticated and guest (unauthenticated) access.
+/// Guest access is read-only and only allowed for public files.
 /// Checks file access level and passes read_only flag to connection handler.
 pub async fn get_ws_crdt(
 	ws: WebSocketUpgrade,
@@ -320,29 +331,34 @@ pub async fn get_ws_crdt(
 
 	info!("WebSocket CRDT request for doc_id: {}, access={:?}", doc_id, query.access);
 
-	let Some(auth_ctx) = auth else {
-		warn!("CRDT WebSocket rejected - no authentication");
-		return ws_close_unauthenticated(ws);
+	let is_guest = auth.is_none();
+	let (user_id, user_tn_id, user_roles, scope) = if let Some(ref auth_ctx) = auth {
+		(
+			auth_ctx.id_tag.to_string(),
+			auth_ctx.tn_id,
+			auth_ctx.roles.clone(),
+			auth_ctx.scope.clone(),
+		)
+	} else {
+		(String::new(), crate::types::TnId(tn_id), Box::default(), None::<Box<str>>)
 	};
 
-	let user_id = auth_ctx.id_tag.to_string();
-	let user_tn_id = auth_ctx.tn_id;
-	let user_roles = auth_ctx.roles.clone();
-	let scope = auth_ctx.scope.as_deref();
-
-	// Auto-create store file if s~ prefix
-	match validate_store_id(&doc_id) {
-		Ok(Some(app_id)) => {
-			if let Err(e) =
-				ensure_store_file(&app, crate::types::TnId(tn_id), &doc_id, "CRDT", app_id).await
-			{
-				return ws_close_for_error(ws, &e);
+	// Auto-create store file only for authenticated users
+	if !is_guest {
+		match validate_store_id(&doc_id) {
+			Ok(Some(app_id)) => {
+				if let Err(e) =
+					ensure_store_file(&app, crate::types::TnId(tn_id), &doc_id, "CRDT", app_id)
+						.await
+				{
+					return ws_close_for_error(ws, &e);
+				}
 			}
-		}
-		Ok(None) => {} // Not a store ID, proceed normally
-		Err(()) => {
-			warn!("CRDT WebSocket rejected - invalid store ID: {}", doc_id);
-			return ws_close_invalid_store(ws);
+			Ok(None) => {} // Not a store ID, proceed normally
+			Err(()) => {
+				warn!("CRDT WebSocket rejected - invalid store ID: {}", doc_id);
+				return ws_close_invalid_store(ws);
+			}
 		}
 	}
 
@@ -357,7 +373,7 @@ pub async fn get_ws_crdt(
 		crate::types::TnId(tn_id),
 		&doc_id,
 		&ctx,
-		scope,
+		scope.as_deref(),
 		query.via.as_deref(),
 	)
 	.await;
@@ -370,15 +386,20 @@ pub async fn get_ws_crdt(
 				return ws_close_type_mismatch(ws);
 			}
 
-			// Resolve final read_only based on query parameter
-			let Ok(read_only) = resolve_access(&query, result.read_only) else {
-				warn!("CRDT WebSocket rejected - write access requested but not available: user={}, doc={}", user_id, doc_id);
-				return ws_close_write_denied(ws);
+			// Guests are always read-only
+			let read_only = if is_guest {
+				true
+			} else {
+				let Ok(ro) = resolve_access(&query, result.read_only) else {
+					warn!("CRDT WebSocket rejected - write access requested but not available: user={}, doc={}", user_id, doc_id);
+					return ws_close_write_denied(ws);
+				};
+				ro
 			};
 			info!(
 				"CRDT WebSocket ({}): user={}, doc={}",
 				if read_only { "read-only" } else { "read-write" },
-				user_id,
+				if is_guest { "*guest" } else { &user_id },
 				doc_id
 			);
 			ws.on_upgrade(move |socket| {
