@@ -158,6 +158,16 @@ pub(crate) async fn list(
 		}
 	}
 
+	// Filter by visibility levels (push ABAC check into SQL for correct pagination)
+	if let Some(levels) = &opts.visible_levels {
+		query.push(" AND f.visibility IN (");
+		let mut sep = query.separated(", ");
+		for level in levels {
+			sep.push_bind(level.to_string());
+		}
+		sep.push_unseparated(")");
+	}
+
 	// Filter by status - if no status specified, exclude deleted files by default
 	if let Some(status) = opts.status {
 		let status_char = match status {

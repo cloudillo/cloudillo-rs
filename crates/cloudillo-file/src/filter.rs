@@ -1,20 +1,16 @@
-//! Visibility filtering for files
+//! Access level computation for files
 
 use crate::prelude::*;
-use cloudillo_core::abac::{can_view_item, ViewCheckContext};
 use cloudillo_core::file_access;
 use cloudillo_types::meta_adapter::FileView;
 use cloudillo_types::types::AccessLevel;
 
-/// Filter files by visibility and compute access_level for each file
+/// Compute access_level (Read/Write) for each file in the list.
 ///
-/// This function filters a list of files to only include those the subject
-/// is allowed to see based on:
-/// - The file's visibility level
-/// - The subject's relationship with the owner (following/connected)
-///
-/// For each visible file, it also computes the user's access level (Read/Write).
-pub async fn filter_files_by_visibility(
+/// Visibility filtering is already handled at the SQL level via
+/// `ListFileOptions::visible_levels`, so this function only determines
+/// the subject's read/write access for each file.
+pub async fn compute_file_access_levels(
 	app: &App,
 	tn_id: TnId,
 	subject_id_tag: &str,
@@ -23,43 +19,13 @@ pub async fn filter_files_by_visibility(
 	subject_roles: &[Box<str>],
 	files: Vec<FileView>,
 ) -> ClResult<Vec<FileView>> {
-	// If no files, return early
 	if files.is_empty() {
 		return Ok(files);
 	}
 
-	// Look up subject's relationship with the tenant (the only relationship we can check)
-	let rels = app.meta_adapter.get_relationships(tn_id, &[subject_id_tag]).await?;
-	let (following, connected) = rels.get(subject_id_tag).copied().unwrap_or((false, false));
-
-	// Filter files based on visibility
-	let visible_files: Vec<FileView> = files
-		.into_iter()
-		.filter(|file| {
-			// Get owner id_tag, filtering out empty strings (from failed profile JOINs)
-			let owner_tag = file
-				.owner
-				.as_ref()
-				.and_then(|o| if o.id_tag.is_empty() { None } else { Some(o.id_tag.as_ref()) })
-				.unwrap_or(tenant_id_tag);
-
-			// Files don't have audience, so pass None
-			can_view_item(&ViewCheckContext {
-				subject_id_tag,
-				is_authenticated,
-				item_owner_id_tag: owner_tag,
-				tenant_id_tag,
-				visibility: file.visibility,
-				subject_following_owner: following,
-				subject_connected_to_owner: connected,
-				audience_tags: None,
-			})
-		})
-		.collect();
-
-	// For anonymous users, access_level is Read for all visible files
+	// For anonymous users, access_level is Read for all files
 	if !is_authenticated || subject_id_tag.is_empty() {
-		return Ok(visible_files
+		return Ok(files
 			.into_iter()
 			.map(|mut file| {
 				file.access_level = Some(AccessLevel::Read);
@@ -69,8 +35,8 @@ pub async fn filter_files_by_visibility(
 	}
 
 	// For authenticated users, compute access level for each file
-	let mut result = Vec::with_capacity(visible_files.len());
-	for mut file in visible_files {
+	let mut result = Vec::with_capacity(files.len());
+	for mut file in files {
 		// Get owner id_tag, filtering out empty strings (from failed profile JOINs)
 		let owner_tag = file
 			.owner

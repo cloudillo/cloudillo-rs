@@ -115,6 +115,20 @@ impl SubjectAccessLevel {
 			VisibilityLevel::Direct => self >= Self::Owner, // Only owner for direct
 		}
 	}
+
+	/// Return the visibility level chars this access level can see.
+	/// Returns `None` for Owner (sees everything including NULL/Direct).
+	/// Used to push visibility filtering into SQL for correct pagination.
+	pub fn visible_levels(self) -> Option<&'static [char]> {
+		match self {
+			Self::None | Self::Public => Some(&['P']),
+			Self::Verified => Some(&['P', 'V']),
+			Self::SecondDegree => Some(&['P', 'V', '2']),
+			Self::Follower => Some(&['P', 'V', '2', 'F']),
+			Self::Connected => Some(&['P', 'V', '2', 'F', 'C']),
+			Self::Owner => None,
+		}
+	}
 }
 
 /// Context for checking whether a subject can view an item

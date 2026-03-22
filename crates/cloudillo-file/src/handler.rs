@@ -22,6 +22,7 @@ use crate::{
 	variant::{self, VariantClass},
 	video::VideoTranscoderTask,
 };
+use cloudillo_core::abac::SubjectAccessLevel;
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
 use cloudillo_core::file_access;
 use cloudillo_types::blob_adapter;
@@ -166,13 +167,33 @@ pub async fn get_file_list(
 		opts.scope_file_id = Some(scope_fid);
 	}
 
+	// Push visibility filtering into SQL for correct pagination
+	let rels = app.meta_adapter.get_relationships(tn_id, &[subject_id_tag]).await?;
+	let (following, connected) = rels.get(subject_id_tag).copied().unwrap_or((false, false));
+	let is_real_auth = is_authenticated && !subject_id_tag.is_empty() && subject_id_tag != "guest";
+	let is_tenant = subject_id_tag == tenant_id_tag.as_ref();
+
+	let access_level = if is_tenant {
+		SubjectAccessLevel::Owner
+	} else if connected {
+		SubjectAccessLevel::Connected
+	} else if following {
+		SubjectAccessLevel::Follower
+	} else if is_real_auth {
+		SubjectAccessLevel::Verified
+	} else {
+		SubjectAccessLevel::Public
+	};
+	opts.visible_levels = access_level.visible_levels().map(<[char]>::to_vec);
+
 	let limit = opts.limit.unwrap_or(30) as usize;
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
 
 	let files = app.meta_adapter.list_files(tn_id, &opts).await?;
 
-	// Filter files by visibility based on subject's access level
-	let mut filtered = filter::filter_files_by_visibility(
+	// Compute access_level (Read/Write) for each file
+	// (visibility is already filtered at SQL level via visible_levels)
+	let mut filtered = filter::compute_file_access_levels(
 		&app,
 		tn_id,
 		subject_id_tag,

@@ -535,6 +535,11 @@ pub struct ListFileOptions {
 	/// Overrides the normal root_id IS NULL constraint. Set by handler for scoped tokens.
 	#[serde(skip)]
 	pub scope_file_id: Option<String>,
+	/// Allowed visibility levels for SQL-level filtering (correct pagination).
+	/// None = no filter (owner sees all including NULL/Direct).
+	/// Set by handler based on subject's access level via `SubjectAccessLevel::visible_levels()`.
+	#[serde(skip)]
+	pub visible_levels: Option<Vec<char>>,
 }
 
 #[derive(Debug, Clone, Default)]
