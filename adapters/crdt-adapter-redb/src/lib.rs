@@ -332,25 +332,20 @@ impl CrdtAdapterRedb {
 				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
 			})?;
 
-			// Get the last (highest) key in the range for this document
+			// Get the last (highest) key in the range for this document.
+			// Keys are big-endian sorted, so next_back() gives us the max seq in O(1).
 			let (range_start, range_end) = key_encoding::make_doc_range(doc_id);
-			let mut max_seq: Option<u64> = None;
-
-			for item in
-				updates_table
-					.range(range_start.as_slice()..=range_end.as_slice())
-					.map_err(|e| {
-						ClError::from(Error::DbError(format!("Failed to read updates: {}", e)))
-					})? {
-				let (key, _) = item.map_err(|e| {
-					ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
-				})?;
-
-				// Decode sequence number from key
-				if let Some(seq) = key_encoding::decode_seq(key.value()) {
-					max_seq = Some(max_seq.map_or(seq, |current| current.max(seq)));
-				}
-			}
+			let max_seq = updates_table
+				.range(range_start.as_slice()..=range_end.as_slice())
+				.map_err(|e| {
+					ClError::from(Error::DbError(format!("Failed to read updates: {}", e)))
+				})?
+				.next_back()
+				.transpose()
+				.map_err(|e| {
+					ClError::from(Error::DbError(format!("Failed to read last update: {}", e)))
+				})?
+				.and_then(|(key, _)| key_encoding::decode_seq(key.value()));
 
 			// If updates exist, next seq is max + 1; otherwise start at 0
 			max_seq.map_or(0, |seq| seq + 1)
@@ -387,12 +382,15 @@ impl CrdtAdapter for CrdtAdapterRedb {
 			.map_err(|e| ClError::from(Error::DbError(format!("Failed to read updates: {}", e))))?;
 
 		for item in range {
-			let (_key, value) = item.map_err(|e| {
+			let (key, value) = item.map_err(|e| {
 				ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
 			})?;
 
+			let seq = key_encoding::decode_seq(key.value());
 			let update_data = value.value().to_vec();
-			updates.push(CrdtUpdate::new(update_data));
+			let mut update = CrdtUpdate::new(update_data);
+			update.seq = seq;
+			updates.push(update);
 		}
 
 		trace!("Got {} updates for doc {}", updates.len(), doc_id);
@@ -478,6 +476,67 @@ impl CrdtAdapter for CrdtAdapterRedb {
 
 			Ok(Box::pin(stream))
 		}
+	}
+
+	async fn compact_updates(
+		&self,
+		tn_id: TnId,
+		doc_id: &str,
+		remove_seqs: &[u64],
+		replacement: CrdtUpdate,
+	) -> ClResult<()> {
+		let db_path = self.get_db_path(tn_id, doc_id);
+		let db = self.get_or_open_db_file(db_path).await?;
+
+		// Get next sequence number for the replacement update.
+		// Note: fetch_add is called before the transaction. If the transaction
+		// fails, this seq is "burned" (gap in sequence). This is harmless —
+		// gaps are tolerated, and the counter re-syncs from DB max on restart.
+		let instance = self.get_or_create_instance(doc_id, tn_id).await?;
+		let new_seq = instance.update_count.fetch_add(1, Ordering::SeqCst);
+
+		// Single atomic transaction: delete specified seqs + insert replacement
+		let tx = db.begin_write().map_err(|e| {
+			ClError::from(Error::DbError(format!(
+				"Failed to begin write transaction for compaction: {}",
+				e
+			)))
+		})?;
+
+		{
+			let mut updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
+			})?;
+
+			// Delete only the specified sequence numbers
+			for &seq in remove_seqs {
+				let key = key_encoding::encode_update_key(doc_id, seq);
+				updates_table.remove(key.as_slice()).map_err(|e| {
+					ClError::from(Error::DbError(format!(
+						"Failed to remove update seq={}: {}",
+						seq, e
+					)))
+				})?;
+			}
+
+			// Insert the compacted replacement
+			let key = key_encoding::encode_update_key(doc_id, new_seq);
+			updates_table.insert(key.as_slice(), replacement.data.as_slice()).map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to insert compacted update: {}", e)))
+			})?;
+		}
+
+		tx.commit().map_err(|e| {
+			ClError::from(Error::DbError(format!("Failed to commit compaction: {}", e)))
+		})?;
+
+		trace!(
+			"Compacted doc {}: removed {} updates, inserted merged at seq={}",
+			doc_id,
+			remove_seqs.len(),
+			new_seq
+		);
+		Ok(())
 	}
 
 	async fn delete_doc(&self, tn_id: TnId, doc_id: &str) -> ClResult<()> {

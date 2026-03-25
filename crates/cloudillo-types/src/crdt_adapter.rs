@@ -33,17 +33,21 @@ pub struct CrdtUpdate {
 
 	/// Optional user/client ID that created this update
 	pub client_id: Option<Box<str>>,
+
+	/// Storage sequence number (populated by get_updates, used by compact_updates)
+	#[serde(skip)]
+	pub seq: Option<u64>,
 }
 
 impl CrdtUpdate {
 	/// Create a new CRDT update from raw bytes.
 	pub fn new(data: Vec<u8>) -> Self {
-		Self { data, client_id: None }
+		Self { data, client_id: None, seq: None }
 	}
 
 	/// Create a new CRDT update with client ID.
 	pub fn with_client(data: Vec<u8>, client_id: impl Into<Box<str>>) -> Self {
-		Self { data, client_id: Some(client_id.into()) }
+		Self { data, client_id: Some(client_id.into()), seq: None }
 	}
 }
 
@@ -138,6 +142,25 @@ pub trait CrdtAdapter: Debug + Send + Sync {
 
 		Ok(CrdtDocStats { doc_id: doc_id.into(), size_bytes, update_count })
 	}
+
+	/// Atomically replace specific updates with a single compacted update.
+	///
+	/// Deletes the updates identified by `remove_seqs` and inserts the
+	/// `replacement` update, all in a single transaction. Updates not listed
+	/// in `remove_seqs` (e.g., ones that failed to decode) are preserved.
+	///
+	/// Non-existent seqs in `remove_seqs` are silently ignored.
+	///
+	/// **Important:** This method does not broadcast a change event. It should
+	/// only be called when no active subscribers exist (e.g., after the last
+	/// connection to the document has closed).
+	async fn compact_updates(
+		&self,
+		tn_id: TnId,
+		doc_id: &str,
+		remove_seqs: &[u64],
+		replacement: CrdtUpdate,
+	) -> ClResult<()>;
 
 	/// Delete a document and all its updates.
 	///
