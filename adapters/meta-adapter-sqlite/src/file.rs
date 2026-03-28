@@ -1,6 +1,6 @@
 //! File management and variant handling
 
-use sqlx::{Row, SqlitePool};
+use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 
 use crate::utils::{collect_res, inspect, map_res, parse_str_list};
 use cloudillo_types::meta_adapter::{
@@ -8,6 +8,45 @@ use cloudillo_types::meta_adapter::{
 	ProfileInfo, ProfileType, UpdateFileOptions,
 };
 use cloudillo_types::prelude::*;
+
+/// Build a ProfileInfo from raw SQL columns with the given prefix.
+/// Returns None if the id_tag column is NULL or empty (i.e. the LEFT JOIN didn't match).
+fn profile_from_row(row: &SqliteRow, prefix: &str) -> Option<ProfileInfo> {
+	let id_tag: Box<str> = row
+		.try_get::<Box<str>, _>(&*format!("{prefix}id_tag"))
+		.ok()
+		.filter(|s| !s.as_ref().is_empty())?;
+	let name: Box<str> =
+		row.try_get(&*format!("{prefix}name")).ok().unwrap_or_else(|| id_tag.clone());
+	let typ = match row.try_get::<&str, _>(&*format!("{prefix}type")).ok() {
+		Some("C") => ProfileType::Community,
+		_ => ProfileType::Person,
+	};
+	let profile_pic: Option<Box<str>> = row.try_get(&*format!("{prefix}profile_pic")).ok();
+	Some(ProfileInfo { id_tag, name, typ, profile_pic })
+}
+
+/// Build a tag-only ProfileInfo for when the tag is set but no local profile exists.
+fn tag_only_profile(tag: &str) -> ProfileInfo {
+	ProfileInfo { id_tag: tag.into(), name: "".into(), typ: ProfileType::Person, profile_pic: None }
+}
+
+/// Build the owner ProfileInfo with fallback chain: owner profile → owner tag-only → tenant.
+fn build_owner_profile(row: &SqliteRow) -> Option<ProfileInfo> {
+	let owner_tag: Option<Box<str>> = row.try_get("owner_tag").ok().flatten();
+	profile_from_row(row, "owner_")
+		.or_else(|| owner_tag.as_deref().map(tag_only_profile))
+		.or_else(|| profile_from_row(row, "tn_"))
+}
+
+/// Build the creator ProfileInfo with fallback chain:
+/// creator profile → creator tag-only → owner profile → owner tag-only → tenant.
+fn build_creator_profile(row: &SqliteRow, owner: Option<&ProfileInfo>) -> Option<ProfileInfo> {
+	let creator_tag: Option<Box<str>> = row.try_get("creator_tag").ok().flatten();
+	profile_from_row(row, "creator_")
+		.or_else(|| creator_tag.as_deref().map(tag_only_profile))
+		.or_else(|| owner.cloned())
+}
 
 /// Get file_id by numeric f_id
 pub(crate) async fn get_id(db: &SqlitePool, tn_id: TnId, f_id: u64) -> ClResult<Box<str>> {
@@ -35,7 +74,8 @@ pub(crate) async fn list(
 
 	let mut query = sqlx::QueryBuilder::new(
 		"SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.x,
-		        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic,
+		        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
+		        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
 		        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic",
 	);
 
@@ -46,6 +86,7 @@ pub(crate) async fn list(
 
 	query.push(
 		" FROM files f
+		 INNER JOIN tenants t ON t.tn_id=f.tn_id
 		 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
 		 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.creator_tag",
 	);
@@ -333,39 +374,8 @@ pub(crate) async fn list(
 		let tags_str: Option<Box<str>> = row.try_get("tags")?;
 		let tags = tags_str.map(|s| parse_str_list(&s).to_vec());
 
-		// Build owner profile info if owner_tag exists
-		let owner = if let (Ok(id_tag), Ok(name)) =
-			(row.try_get::<Box<str>, _>("id_tag"), row.try_get::<Box<str>, _>("name"))
-		{
-			let typ = match row.try_get::<&str, _>("type").ok() {
-				Some("C") => ProfileType::Community,
-				_ => ProfileType::Person, // Default fallback
-			};
-
-			Some(ProfileInfo { id_tag, name, typ, profile_pic: row.try_get("profile_pic").ok() })
-		} else {
-			None
-		};
-
-		// Build creator profile info if creator_tag exists
-		let creator = if let (Ok(id_tag), Ok(name)) = (
-			row.try_get::<Box<str>, _>("creator_id_tag"),
-			row.try_get::<Box<str>, _>("creator_name"),
-		) {
-			let typ = match row.try_get::<&str, _>("creator_type").ok() {
-				Some("C") => ProfileType::Community,
-				_ => ProfileType::Person,
-			};
-
-			Some(ProfileInfo {
-				id_tag,
-				name,
-				typ,
-				profile_pic: row.try_get("creator_profile_pic").ok(),
-			})
-		} else {
-			None
-		};
+		let owner = build_owner_profile(row);
+		let creator = build_creator_profile(row, owner.as_ref());
 
 		let visibility: Option<String> = row.try_get("visibility").ok();
 		let visibility = visibility.and_then(|s| s.chars().next());
@@ -1026,9 +1036,11 @@ pub(crate) async fn read(
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 		sqlx::query(
 			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.x,
-			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic,
+			        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
+			        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
 			        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic
 			 FROM files f
+			 INNER JOIN tenants t ON t.tn_id=f.tn_id
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
 			 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.creator_tag
 			 WHERE f.tn_id=? AND f.f_id=?"
@@ -1043,9 +1055,11 @@ pub(crate) async fn read(
 		// Content-addressable ID - query by file_id
 		sqlx::query(
 			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.x,
-			        COALESCE(p.id_tag, f.owner_tag) as id_tag, COALESCE(p.name, f.owner_tag) as name, p.type, p.profile_pic,
+			        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
+			        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
 			        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic
 			 FROM files f
+			 INNER JOIN tenants t ON t.tn_id=f.tn_id
 			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
 			 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.creator_tag
 			 WHERE f.tn_id=? AND f.file_id=?"
@@ -1071,44 +1085,8 @@ pub(crate) async fn read(
 			let tags_str: Option<Box<str>> = row.try_get("tags").ok();
 			let tags = tags_str.map(|s| parse_str_list(&s).to_vec());
 
-			// Build owner profile info if owner_tag exists
-			let owner = if let (Ok(id_tag), Ok(name)) =
-				(row.try_get::<Box<str>, _>("id_tag"), row.try_get::<Box<str>, _>("name"))
-			{
-				let typ = match row.try_get::<&str, _>("type").ok() {
-					Some("C") => ProfileType::Community,
-					_ => ProfileType::Person, // Default fallback
-				};
-
-				Some(ProfileInfo {
-					id_tag,
-					name,
-					typ,
-					profile_pic: row.try_get("profile_pic").ok(),
-				})
-			} else {
-				None
-			};
-
-			// Build creator profile info if creator_tag exists
-			let creator = if let (Ok(id_tag), Ok(name)) = (
-				row.try_get::<Box<str>, _>("creator_id_tag"),
-				row.try_get::<Box<str>, _>("creator_name"),
-			) {
-				let typ = match row.try_get::<&str, _>("creator_type").ok() {
-					Some("C") => ProfileType::Community,
-					_ => ProfileType::Person,
-				};
-
-				Some(ProfileInfo {
-					id_tag,
-					name,
-					typ,
-					profile_pic: row.try_get("creator_profile_pic").ok(),
-				})
-			} else {
-				None
-			};
+			let owner = build_owner_profile(&row);
+			let creator = build_creator_profile(&row, owner.as_ref());
 
 			let visibility: Option<String> = row.try_get("visibility").ok();
 			let visibility = visibility.and_then(|s| s.chars().next());
