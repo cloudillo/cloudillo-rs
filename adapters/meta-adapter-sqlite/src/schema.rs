@@ -27,7 +27,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 14;
+	const CURRENT_DB_VERSION: i64 = 15;
 
 	let mut tx = db.begin().await?;
 
@@ -226,6 +226,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			count integer,
 			resource_id text,
 			access_level char(1),
+			params text,
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id, ref_id)
@@ -1052,6 +1053,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.await?;
 
 		set_db_version(&mut tx, 14).await;
+	}
+
+	// Version 15: Add params column to refs for share link launch params
+	if version < 15 {
+		sqlx::query("ALTER TABLE refs ADD COLUMN params TEXT").execute(&mut *tx).await?;
+
+		set_db_version(&mut tx, 15).await;
 	}
 
 	tx.commit().await?;

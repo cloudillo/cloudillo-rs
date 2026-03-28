@@ -68,7 +68,8 @@ pub async fn post_invite_community(
 			expires_at,
 			path_prefix: "/profile/new?invite=",
 			resource_id: None,
-			count: None, // Single use (default: 1)
+			count: None,
+			params: None,
 		},
 	)
 	.await?;

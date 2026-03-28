@@ -14,7 +14,7 @@ pub(crate) async fn list(
 	opts: &ListRefsOptions,
 ) -> ClResult<Vec<RefData>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT ref_id, type, description, created_at, expires_at, count, resource_id, access_level FROM refs WHERE tn_id = ",
+		"SELECT ref_id, type, description, created_at, expires_at, count, resource_id, access_level, params FROM refs WHERE tn_id = ",
 	);
 	query.push_bind(tn_id.0);
 
@@ -73,6 +73,7 @@ pub(crate) async fn list(
 				count: count.and_then(|c| u32::try_from(c).ok()), // None = unlimited
 				resource_id: row.get("resource_id"),
 				access_level: access_level.and_then(|s| s.chars().next()),
+				params: row.get("params"),
 			}
 		})
 		.collect())
@@ -112,7 +113,7 @@ pub(crate) async fn create(
 	let access_level_str = opts.access_level.map(|c| c.to_string());
 
 	sqlx::query(
-		"INSERT INTO refs (tn_id, ref_id, type, description, created_at, expires_at, count, resource_id, access_level) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+		"INSERT INTO refs (tn_id, ref_id, type, description, created_at, expires_at, count, resource_id, access_level, params) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 	)
 		.bind(tn_id.0)
 		.bind(ref_id)
@@ -123,6 +124,7 @@ pub(crate) async fn create(
 		.bind(opts.count.map(u32::cast_signed)) // None = unlimited (NULL in DB)
 		.bind(opts.resource_id.as_deref())
 		.bind(access_level_str.as_deref())
+		.bind(opts.params.as_deref())
 		.execute(db)
 		.await
 		.inspect_err(|err| warn!("DB: {:#?}", err))
@@ -137,6 +139,7 @@ pub(crate) async fn create(
 		count: opts.count, // None = unlimited
 		resource_id: opts.resource_id.clone().map(Into::into),
 		access_level: opts.access_level,
+		params: opts.params.clone().map(Into::into),
 	})
 }
 
@@ -163,7 +166,7 @@ pub(crate) async fn validate_ref(
 ) -> ClResult<(TnId, Box<str>, RefData)> {
 	// Look up the ref globally (across all tenants) and get tenant info
 	let row = sqlx::query(
-		"SELECT r.tn_id, r.ref_id, r.type, r.description, r.created_at, r.count, r.expires_at, r.resource_id, r.access_level, t.id_tag
+		"SELECT r.tn_id, r.ref_id, r.type, r.description, r.created_at, r.count, r.expires_at, r.resource_id, r.access_level, r.params, t.id_tag
 		 FROM refs r
 		 INNER JOIN tenants t ON r.tn_id = t.tn_id
 		 WHERE r.ref_id = ?",
@@ -184,6 +187,7 @@ pub(crate) async fn validate_ref(
 	let description: Option<Box<str>> = row.get("description");
 	let resource_id: Option<Box<str>> = row.get("resource_id");
 	let access_level_str: Option<String> = row.get("access_level");
+	let params: Option<Box<str>> = row.get("params");
 
 	// Validate ref type
 	if !expected_types.contains(&ref_type.as_str()) {
@@ -218,6 +222,7 @@ pub(crate) async fn validate_ref(
 		count: count.and_then(|c| u32::try_from(c).ok()),
 		resource_id,
 		access_level: access_level_str.and_then(|s| s.chars().next()),
+		params,
 	};
 
 	Ok((TnId(u32::try_from(tn_id).unwrap_or_default()), id_tag.into(), ref_data))
@@ -240,7 +245,7 @@ pub(crate) async fn use_ref(
 
 	// Look up the ref globally (across all tenants) and get tenant info
 	let row = sqlx::query(
-		"SELECT r.tn_id, r.ref_id, r.type, r.description, r.created_at, r.count, r.expires_at, r.resource_id, r.access_level, t.id_tag
+		"SELECT r.tn_id, r.ref_id, r.type, r.description, r.created_at, r.count, r.expires_at, r.resource_id, r.access_level, r.params, t.id_tag
 		 FROM refs r
 		 INNER JOIN tenants t ON r.tn_id = t.tn_id
 		 WHERE r.ref_id = ?",
@@ -261,6 +266,7 @@ pub(crate) async fn use_ref(
 	let description: Option<Box<str>> = row.get("description");
 	let resource_id: Option<Box<str>> = row.get("resource_id");
 	let access_level_str: Option<String> = row.get("access_level");
+	let params: Option<Box<str>> = row.get("params");
 
 	// Validate ref type
 	if !expected_types.contains(&ref_type.as_str()) {
@@ -313,6 +319,7 @@ pub(crate) async fn use_ref(
 		count: new_count, // None = unlimited
 		resource_id,
 		access_level: access_level_str.and_then(|s| s.chars().next()),
+		params,
 	};
 
 	Ok((TnId(u32::try_from(tn_id).unwrap_or_default()), id_tag.into(), ref_data))

@@ -478,6 +478,7 @@ async fn handle_idp_registration(
 			path_prefix: "/onboarding/welcome",
 			resource_id: None,
 			count: None,
+			params: None,
 		},
 	)
 	.await?;
@@ -632,6 +633,7 @@ async fn handle_domain_registration(
 			path_prefix: "/onboarding/welcome",
 			resource_id: None,
 			count: None,
+			params: None,
 		},
 	)
 	.await?;

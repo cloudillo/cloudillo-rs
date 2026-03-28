@@ -83,6 +83,8 @@ pub struct RefData {
 	pub resource_id: Option<Box<str>>,
 	/// Access level for share links ('R'=Read, 'W'=Write)
 	pub access_level: Option<char>,
+	/// Launch params as serialized query string (e.g., "mode=present")
+	pub params: Option<Box<str>>,
 }
 
 pub struct ListRefsOptions {
@@ -92,6 +94,7 @@ pub struct ListRefsOptions {
 	pub resource_id: Option<String>,
 }
 
+#[derive(Default)]
 pub struct CreateRefOptions {
 	pub typ: String,
 	pub description: Option<String>,
@@ -101,6 +104,8 @@ pub struct CreateRefOptions {
 	pub resource_id: Option<String>,
 	/// Access level for share links ('R'=Read, 'W'=Write)
 	pub access_level: Option<char>,
+	/// Launch params as serialized query string (e.g., "mode=present")
+	pub params: Option<String>,
 }
 
 #[skip_serializing_none]

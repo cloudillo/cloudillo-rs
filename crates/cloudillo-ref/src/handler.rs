@@ -37,6 +37,8 @@ pub struct RefResponse {
 	/// Access level for share links ("read" or "write")
 	#[serde(rename = "accessLevel")]
 	pub access_level: Option<String>,
+	/// Launch params as serialized query string
+	pub params: Option<String>,
 }
 
 /// Minimal response structure for unauthenticated requests (only refId and type)
@@ -60,6 +62,7 @@ impl From<RefData> for RefResponse {
 			access_level: ref_data
 				.access_level
 				.map(|c| if c == 'W' { "write" } else { "read" }.to_string()),
+			params: ref_data.params.map(|p| p.to_string()),
 		}
 	}
 }
@@ -91,6 +94,8 @@ pub struct CreateRefRequest {
 	/// Access level for share links ("read" or "write", default: "read")
 	#[serde(rename = "accessLevel")]
 	pub access_level: Option<String>,
+	/// Launch params as serialized query string (e.g., "mode=present")
+	pub params: Option<String>,
 }
 
 /// Query parameters for listing refs
@@ -194,6 +199,13 @@ pub async fn create_ref(
 		}
 	};
 
+	// Validate params length
+	if let Some(ref p) = create_req.params {
+		if p.len() > 2048 {
+			return Err(Error::ValidationError("params too long (max 2048 bytes)".into()));
+		}
+	}
+
 	// Validate share.file type requires resource_id
 	if create_req.r#type == "share.file" && create_req.resource_id.is_none() {
 		return Err(Error::ValidationError(
@@ -220,6 +232,7 @@ pub async fn create_ref(
 		count,
 		resource_id: create_req.resource_id.clone(),
 		access_level: access_level_char,
+		params: create_req.params.clone(),
 	};
 
 	let ref_data = app.meta_adapter.create_ref(tn_id, &ref_id, &opts).await.map_err(|e| {

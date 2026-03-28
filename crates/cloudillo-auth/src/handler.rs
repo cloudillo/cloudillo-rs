@@ -570,7 +570,8 @@ pub async fn get_access_token(
 			"token": token_result,
 			"scope": scope,
 			"resourceId": file_id.to_string(),
-			"accessLevel": if access_level == 'W' { "write" } else { "read" }
+			"accessLevel": if access_level == 'W' { "write" } else { "read" },
+			"params": ref_data.params
 		}))
 		.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
@@ -924,6 +925,7 @@ pub async fn post_forgot_password(
 			path_prefix: "/reset-password",
 			resource_id: None,
 			count: None,
+			params: None,
 		},
 	)
 	.await

@@ -20,6 +20,8 @@ pub struct CreateRefInternalParams<'a> {
 	pub resource_id: Option<&'a str>,
 	/// Number of uses allowed (default: 1)
 	pub count: Option<u32>,
+	/// Launch params as serialized query string (e.g., "mode=present")
+	pub params: Option<&'a str>,
 }
 
 /// Internal API function to create a ref programmatically
@@ -50,7 +52,8 @@ pub async fn create_ref_internal(
 		expires_at: params.expires_at,
 		count: Some(params.count.unwrap_or(1)),
 		resource_id: params.resource_id.map(ToString::to_string),
-		access_level: None,
+		params: params.params.map(ToString::to_string),
+		..Default::default()
 	};
 
 	// Store the reference in database
