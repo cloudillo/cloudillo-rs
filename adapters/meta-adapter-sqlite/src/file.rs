@@ -106,16 +106,63 @@ pub(crate) async fn list(
 	query.push(" WHERE f.tn_id=");
 	query.push_bind(tn_id.0);
 
-	if let Some(file_id) = &opts.file_id {
-		if let Some(f_id_str) = file_id.strip_prefix('@') {
-			if let Ok(f_id) = f_id_str.parse::<i64>() {
-				query.push(" AND f.f_id=").push_bind(f_id);
+	if let Some(file_ids) = &opts.file_id {
+		// Partition into @-prefixed internal IDs (f_id) and external file_ids
+		let mut f_ids: Vec<i64> = Vec::new();
+		let mut ext_ids: Vec<&String> = Vec::new();
+		for id in file_ids {
+			if let Some(f_id_str) = id.strip_prefix('@') {
+				if let Ok(f_id) = f_id_str.parse::<i64>() {
+					f_ids.push(f_id);
+				}
 			} else {
-				// Invalid @-prefixed ID: ensure no results are returned
-				query.push(" AND 1=0");
+				ext_ids.push(id);
 			}
+		}
+
+		let has_f_ids = !f_ids.is_empty();
+		let has_ext_ids = !ext_ids.is_empty();
+
+		if !has_f_ids && !has_ext_ids {
+			// All entries were invalid @-prefixed IDs
+			query.push(" AND 1=0");
 		} else {
-			query.push(" AND f.file_id=").push_bind(file_id.as_str());
+			let needs_or = has_f_ids && has_ext_ids;
+			if needs_or {
+				query.push(" AND (");
+			} else {
+				query.push(" AND ");
+			}
+			if has_f_ids {
+				if f_ids.len() == 1 {
+					query.push("f.f_id=").push_bind(f_ids[0]);
+				} else {
+					query.push("f.f_id IN (");
+					let mut sep = query.separated(", ");
+					for f_id in &f_ids {
+						sep.push_bind(*f_id);
+					}
+					sep.push_unseparated(")");
+				}
+			}
+			if needs_or {
+				query.push(" OR ");
+			}
+			if has_ext_ids {
+				if ext_ids.len() == 1 {
+					query.push("f.file_id=").push_bind(ext_ids[0].as_str());
+				} else {
+					query.push("f.file_id IN (");
+					let mut sep = query.separated(", ");
+					for id in &ext_ids {
+						sep.push_bind(id.as_str());
+					}
+					sep.push_unseparated(")");
+				}
+			}
+			if needs_or {
+				query.push(")");
+			}
 		}
 	}
 
@@ -163,36 +210,27 @@ pub(crate) async fn list(
 		query.push(" AND f.preset=").push_bind(preset.as_str());
 	}
 
-	if let Some(file_type) = &opts.file_type {
-		// Support comma-separated multiple types (e.g., "CRDT,RTDB")
-		let types: Vec<&str> = file_type.split(',').map(str::trim).collect();
-		if types.len() == 1 {
-			query.push(" AND f.file_tp=").push_bind(types[0]);
+	if let Some(file_types) = &opts.file_type {
+		if file_types.len() == 1 {
+			query.push(" AND f.file_tp=").push_bind(file_types[0].as_str());
 		} else {
-			query.push(" AND f.file_tp IN (");
-			let mut separated = query.separated(", ");
-			for t in types {
-				separated.push_bind(t);
-			}
-			separated.push_unseparated(")");
+			query.push(" AND f.file_tp IN ");
+			query = crate::utils::push_in(query, file_types.as_slice());
 		}
 	}
 
 	// Filter by content type (MIME type pattern, e.g., "image/*" or "image/*,video/*")
-	if let Some(content_type) = &opts.content_type {
-		let patterns: Vec<&str> = content_type.split(',').map(str::trim).collect();
-		if patterns.len() == 1 {
-			// Convert wildcard pattern to SQL LIKE pattern (e.g., "image/*" -> "image/%")
-			let pattern = crate::utils::escape_like(patterns[0]).replace('*', "%");
+	if let Some(content_types) = &opts.content_type {
+		if content_types.len() == 1 {
+			let pattern = crate::utils::escape_like(&content_types[0]).replace('*', "%");
 			query.push(" AND f.content_type LIKE ").push_bind(pattern).push(" ESCAPE '\\'");
 		} else {
-			// Multiple patterns - use OR conditions
 			query.push(" AND (");
-			for (i, p) in patterns.iter().enumerate() {
+			for (i, ct) in content_types.iter().enumerate() {
 				if i > 0 {
 					query.push(" OR ");
 				}
-				let pattern = crate::utils::escape_like(p).replace('*', "%");
+				let pattern = crate::utils::escape_like(ct).replace('*', "%");
 				query.push("f.content_type LIKE ").push_bind(pattern).push(" ESCAPE '\\'");
 			}
 			query.push(")");

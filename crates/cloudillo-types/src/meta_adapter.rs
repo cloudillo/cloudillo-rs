@@ -273,7 +273,13 @@ where
 	D: serde::Deserializer<'de>,
 {
 	let s = String::deserialize(deserializer)?;
-	Ok(Some(s.split(',').map(|v| v.trim().to_string()).collect()))
+	let values: Vec<String> =
+		s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
+	if values.is_empty() {
+		Ok(None)
+	} else {
+		Ok(Some(values))
+	}
 }
 
 /// Options for listing actions
@@ -508,8 +514,8 @@ pub struct ListFileOptions {
 	pub limit: Option<u32>,
 	/// Cursor for pagination (opaque base64-encoded string)
 	pub cursor: Option<String>,
-	#[serde(rename = "fileId")]
-	pub file_id: Option<String>,
+	#[serde(default, rename = "fileId", deserialize_with = "deserialize_split")]
+	pub file_id: Option<Vec<String>>,
 	#[serde(rename = "parentId")]
 	pub parent_id: Option<String>, // Filter by parent folder (None = root, "__trash__" = trash)
 	#[serde(rename = "rootId")]
@@ -519,11 +525,11 @@ pub struct ListFileOptions {
 	pub variant: Option<String>,
 	/// File status filter. If None, excludes deleted files by default.
 	pub status: Option<FileStatus>,
-	#[serde(rename = "fileTp")]
-	pub file_type: Option<String>,
+	#[serde(default, rename = "fileTp", deserialize_with = "deserialize_split")]
+	pub file_type: Option<Vec<String>>,
 	/// Filter by content type pattern (e.g., "image/*", "video/*")
-	#[serde(rename = "contentType")]
-	pub content_type: Option<String>,
+	#[serde(default, rename = "contentType", deserialize_with = "deserialize_split")]
+	pub content_type: Option<Vec<String>>,
 	/// Substring search in file name
 	#[serde(rename = "fileName")]
 	pub file_name: Option<String>,
