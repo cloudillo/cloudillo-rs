@@ -524,6 +524,15 @@ pub struct ListFileOptions {
 	/// Filter by content type pattern (e.g., "image/*", "video/*")
 	#[serde(rename = "contentType")]
 	pub content_type: Option<String>,
+	/// Substring search in file name
+	#[serde(rename = "fileName")]
+	pub file_name: Option<String>,
+	/// Filter by owner id_tag
+	#[serde(rename = "ownerIdTag")]
+	pub owner_id_tag: Option<String>,
+	/// Exclude files by this owner id_tag
+	#[serde(rename = "notOwnerIdTag")]
+	pub not_owner_id_tag: Option<String>,
 	/// Filter by pinned status (user-specific)
 	pub pinned: Option<bool>,
 	/// Filter by starred status (user-specific)

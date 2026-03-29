@@ -183,8 +183,8 @@ pub(crate) async fn list(
 		let patterns: Vec<&str> = content_type.split(',').map(str::trim).collect();
 		if patterns.len() == 1 {
 			// Convert wildcard pattern to SQL LIKE pattern (e.g., "image/*" -> "image/%")
-			let pattern = patterns[0].replace('*', "%");
-			query.push(" AND f.content_type LIKE ").push_bind(pattern);
+			let pattern = crate::utils::escape_like(patterns[0]).replace('*', "%");
+			query.push(" AND f.content_type LIKE ").push_bind(pattern).push(" ESCAPE '\\'");
 		} else {
 			// Multiple patterns - use OR conditions
 			query.push(" AND (");
@@ -192,11 +192,34 @@ pub(crate) async fn list(
 				if i > 0 {
 					query.push(" OR ");
 				}
-				let pattern = p.replace('*', "%");
-				query.push("f.content_type LIKE ").push_bind(pattern);
+				let pattern = crate::utils::escape_like(p).replace('*', "%");
+				query.push("f.content_type LIKE ").push_bind(pattern).push(" ESCAPE '\\'");
 			}
 			query.push(")");
 		}
+	}
+
+	// Filter by file name (substring search)
+	if let Some(file_name) = &opts.file_name {
+		query
+			.push(" AND f.file_name LIKE ")
+			.push_bind(format!("%{}%", crate::utils::escape_like(file_name)))
+			.push(" ESCAPE '\\'");
+	}
+
+	// Filter by owner/creator: uses COALESCE(creator_tag, owner_tag, tenant id_tag)
+	// to determine the effective author of each file
+	if let Some(owner_id_tag) = &opts.owner_id_tag {
+		query
+			.push(" AND COALESCE(f.creator_tag, f.owner_tag, t.id_tag)=")
+			.push_bind(owner_id_tag.as_str());
+	}
+
+	// Exclude files by owner/creator (for "others" filter)
+	if let Some(not_owner_id_tag) = &opts.not_owner_id_tag {
+		query
+			.push(" AND COALESCE(f.creator_tag, f.owner_tag, t.id_tag)!=")
+			.push_bind(not_owner_id_tag.as_str());
 	}
 
 	// Filter by visibility levels (push ABAC check into SQL for correct pagination)
