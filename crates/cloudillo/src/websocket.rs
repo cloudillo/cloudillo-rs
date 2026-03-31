@@ -172,7 +172,62 @@ async fn ensure_store_file(
 
 	match app.meta_adapter.create_file(tn_id, create_opts).await {
 		Ok(_) => Ok(()),
-		Err(e) => Err(FileAccessError::InternalError(e.to_string())),
+		Err(_) => {
+			// Race condition: another connection may have created it concurrently
+			match app.meta_adapter.read_file(tn_id, store_file_id).await {
+				Ok(Some(_)) => Ok(()),
+				_ => Err(FileAccessError::InternalError("Failed to create store file".into())),
+			}
+		}
+	}
+}
+
+/// Validate a meta database file_id (`{parent_file_id}~meta` format)
+///
+/// Returns:
+/// - `Some(parent_file_id)` — valid meta ID, returns the parent file_id
+/// - `None` — not a meta ID (no `~meta` suffix)
+fn validate_meta_id(file_id: &str) -> Option<&str> {
+	file_id.strip_suffix("~meta").filter(|parent| !parent.is_empty())
+}
+
+/// Auto-create a meta database file record if it does not already exist
+///
+/// Meta databases (`{file_id}~meta`) store comments and other metadata
+/// separate from the document content. They are lazily created on first
+/// WebSocket connection. Access is inherited from the parent file.
+/// Creation is idempotent — concurrent calls for the same file_id are safe.
+async fn ensure_meta_file(
+	app: &crate::app::App,
+	tn_id: crate::types::TnId,
+	meta_file_id: &str,
+) -> Result<(), FileAccessError> {
+	// Check if meta file already exists
+	match app.meta_adapter.read_file(tn_id, meta_file_id).await {
+		Ok(Some(_)) => return Ok(()),
+		Ok(None) => {} // Proceed to create
+		Err(e) => return Err(FileAccessError::InternalError(e.to_string())),
+	}
+
+	// Create meta file — idempotent (create_file with explicit file_id)
+	let create_opts = CreateFile {
+		file_id: Some(meta_file_id.into()),
+		file_tp: Some("RTDB".into()),
+		content_type: "application/json".into(),
+		file_name: meta_file_id.into(),
+		status: Some(FileStatus::Active),
+		..Default::default()
+	};
+
+	match app.meta_adapter.create_file(tn_id, create_opts).await {
+		Ok(_) => Ok(()),
+		Err(_) => {
+			// Race condition: another connection may have created it concurrently
+			match app.meta_adapter.read_file(tn_id, meta_file_id).await {
+				Ok(Some(_)) => Ok(()),
+				_ => Err(FileAccessError::InternalError("Failed to create meta file".into())),
+			}
+		}
 	}
 }
 
@@ -260,6 +315,20 @@ pub async fn get_ws_rtdb(
 		}
 	}
 
+	// Auto-create meta database for authenticated users
+	// Meta DBs ({parent_file_id}~meta) store comments and metadata
+	let access_file_id = if let Some(parent_file_id) = validate_meta_id(&file_id) {
+		if !is_guest {
+			if let Err(e) = ensure_meta_file(&app, crate::types::TnId(tn_id), &file_id).await {
+				return ws_close_for_error(ws, &e);
+			}
+		}
+		// Check access against the parent file, not the meta file itself
+		parent_file_id.to_string()
+	} else {
+		file_id.clone()
+	};
+
 	// Check file access (with scope for share links)
 	let ctx = file_access::FileAccessCtx {
 		user_id_tag: &user_id,
@@ -269,7 +338,7 @@ pub async fn get_ws_rtdb(
 	let access_result = file_access::check_file_access_with_scope(
 		&app,
 		crate::types::TnId(tn_id),
-		&file_id,
+		&access_file_id,
 		&ctx,
 		scope.as_deref(),
 		query.via.as_deref(),
