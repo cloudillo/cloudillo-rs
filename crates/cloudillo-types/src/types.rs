@@ -609,6 +609,7 @@ impl ErrorResponse {
 pub enum AccessLevel {
 	None,
 	Read,
+	Comment,
 	Write,
 	Admin,
 }
@@ -618,26 +619,32 @@ impl AccessLevel {
 		match self {
 			Self::None => "none",
 			Self::Read => "read",
+			Self::Comment => "comment",
 			Self::Write => "write",
 			Self::Admin => "admin",
 		}
 	}
 
 	/// Return the lesser of two access levels.
+	/// Ordering: None < Read < Comment < Write < Admin
 	pub fn min(self, other: Self) -> Self {
 		match (self, other) {
 			(Self::None, _) | (_, Self::None) => Self::None,
 			(Self::Read, _) | (_, Self::Read) => Self::Read,
+			(Self::Comment, _) | (_, Self::Comment) => Self::Comment,
 			(Self::Write, _) | (_, Self::Write) => Self::Write,
 			(Self::Admin, Self::Admin) => Self::Admin,
 		}
 	}
 
-	/// Convert a share permission char ('R', 'W', 'A') to an access level.
+	/// Convert a share permission char ('R', 'C', 'W', 'A') to an access level.
+	/// 'A' (admin) maps to Write because scoped tokens don't carry admin privileges;
+	/// admin access is only resolved from direct ownership, not from share links.
 	/// Unknown chars default to Read.
 	pub fn from_perm_char(c: char) -> Self {
 		match c {
 			'W' | 'A' => Self::Write,
+			'C' => Self::Comment,
 			_ => Self::Read,
 		}
 	}
@@ -645,7 +652,7 @@ impl AccessLevel {
 
 /// Token scope for scoped access tokens (e.g., share links)
 ///
-/// Format in JWT: "file:{file_id}:{R|W}"
+/// Format in JWT: "file:{file_id}:{R|C|W}"
 /// This enum provides type-safe parsing instead of manual string splitting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenScope {
@@ -660,6 +667,7 @@ impl TokenScope {
 	///
 	/// Supported formats:
 	/// - "file:{file_id}:R" -> File scope with Read access
+	/// - "file:{file_id}:C" -> File scope with Comment access
 	/// - "file:{file_id}:W" -> File scope with Write access
 	pub fn parse(s: &str) -> Option<Self> {
 		if s == "apkg:publish" {
@@ -669,6 +677,7 @@ impl TokenScope {
 		if parts.len() == 3 && parts[0] == "file" {
 			let access = match parts[2] {
 				"W" => AccessLevel::Write,
+				"C" => AccessLevel::Comment,
 				_ => AccessLevel::Read, // "R" or any other value defaults to Read
 			};
 			return Some(Self::File { file_id: parts[1].to_string(), access });

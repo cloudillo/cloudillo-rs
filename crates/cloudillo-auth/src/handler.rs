@@ -416,7 +416,11 @@ pub async fn get_access_token(
 		let effective_access = requested_access.min(AccessLevel::from_perm_char(link_perm));
 
 		// Create scoped token for the target file
-		let access_char = if effective_access == AccessLevel::Write { 'W' } else { 'R' };
+		let access_char = match effective_access {
+			AccessLevel::Write | AccessLevel::Admin => 'W',
+			AccessLevel::Comment => 'C',
+			_ => 'R',
+		};
 		let target_scope = format!("file:{}:{}", target_file_id, access_char);
 
 		let token_result = app
@@ -570,7 +574,11 @@ pub async fn get_access_token(
 			"token": token_result,
 			"scope": scope,
 			"resourceId": file_id.to_string(),
-			"accessLevel": if access_level == 'W' { "write" } else { "read" },
+			"accessLevel": match access_level {
+				'W' | 'A' => "write",
+				'C' => "comment",
+				_ => "read",
+			},
 		});
 		if let Some(ref params) = ref_data.params {
 			result["params"] = json!(params);

@@ -82,11 +82,11 @@ pub async fn get_access_level(
 		Ok(Some(action)) => {
 			// Check if action is FSHR type and active
 			if action.typ.as_ref() == "FSHR" {
-				// WRITE subtype grants write access, others grant read
-				if action.sub_typ.as_ref().map(AsRef::as_ref) == Some("WRITE") {
-					AccessLevel::Write
-				} else {
-					AccessLevel::Read
+				// WRITE subtype grants write, COMMENT grants comment, others grant read
+				match action.sub_typ.as_ref().map(AsRef::as_ref) {
+					Some("WRITE") => AccessLevel::Write,
+					Some("COMMENT") => AccessLevel::Comment,
+					_ => AccessLevel::Read,
 				}
 			} else {
 				AccessLevel::None
@@ -233,7 +233,7 @@ pub async fn check_file_access_with_scope(
 		return Err(FileAccessError::AccessDenied);
 	}
 
-	let read_only = access_level == AccessLevel::Read;
+	let read_only = access_level != AccessLevel::Write && access_level != AccessLevel::Admin;
 
 	Ok(FileAccessResult { file_view, access_level, read_only })
 }

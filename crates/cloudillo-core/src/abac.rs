@@ -493,7 +493,7 @@ impl PermissionChecker {
 		if matches!(operation, "read") {
 			// Check explicit access grants (e.g., FSHR file shares, scoped tokens)
 			if let Some(al) = object.get("access_level") {
-				if matches!(al, "read" | "write") {
+				if matches!(al, "read" | "comment" | "write") {
 					return true;
 				}
 			}

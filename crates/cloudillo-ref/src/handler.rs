@@ -59,9 +59,14 @@ impl From<RefData> for RefResponse {
 			expires_at: ref_data.expires_at,
 			count: ref_data.count,
 			resource_id: ref_data.resource_id.map(|s| s.to_string()),
-			access_level: ref_data
-				.access_level
-				.map(|c| if c == 'W' { "write" } else { "read" }.to_string()),
+			access_level: ref_data.access_level.map(|c| {
+				match c {
+					'W' | 'A' => "write",
+					'C' => "comment",
+					_ => "read",
+				}
+				.to_string()
+			}),
 			params: ref_data.params.map(|p| p.to_string()),
 		}
 	}
@@ -183,6 +188,7 @@ pub async fn create_ref(
 	// Parse and validate access_level
 	let access_level_char = match create_req.access_level.as_deref() {
 		Some("write" | "W") => Some('W'),
+		Some("comment" | "C") => Some('C'),
 		Some("read" | "R") | None => {
 			// Default to read if resource_id is present
 			if create_req.resource_id.is_some() {
@@ -193,7 +199,7 @@ pub async fn create_ref(
 		}
 		Some(other) => {
 			return Err(Error::ValidationError(format!(
-				"Invalid access_level '{}': must be 'read' or 'write'",
+				"Invalid access_level '{}': must be 'read', 'comment', or 'write'",
 				other
 			)));
 		}

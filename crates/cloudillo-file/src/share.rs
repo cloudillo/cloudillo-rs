@@ -83,9 +83,9 @@ pub async fn create_share(
 			"subjectType must be 'U' (user), 'L' (link), or 'F' (file)".into(),
 		));
 	}
-	if !matches!(input.permission, 'R' | 'W' | 'A') {
+	if !matches!(input.permission, 'R' | 'C' | 'W' | 'A') {
 		return Err(Error::ValidationError(
-			"permission must be 'R' (read), 'W' (write), or 'A' (admin)".into(),
+			"permission must be 'R' (read), 'C' (comment), 'W' (write), or 'A' (admin)".into(),
 		));
 	}
 	if input.subject_id.is_empty() {
@@ -120,10 +120,10 @@ pub async fn create_share(
 	// For user shares, also create FSHR action for federation (best-effort)
 	if input.subject_type == 'U' {
 		let file_view = &file_access.file_view;
-		let sub_typ: Option<Box<str>> = if input.permission == 'W' || input.permission == 'A' {
-			Some("WRITE".into())
-		} else {
-			None
+		let sub_typ: Option<Box<str>> = match input.permission {
+			'W' | 'A' => Some("WRITE".into()),
+			'C' => Some("COMMENT".into()),
+			_ => None,
 		};
 
 		let content_type = file_view.content_type.as_deref().unwrap_or("application/octet-stream");

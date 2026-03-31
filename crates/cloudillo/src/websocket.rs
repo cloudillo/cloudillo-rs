@@ -20,6 +20,7 @@ use cloudillo_core::file_access::{self, FileAccessError};
 use cloudillo_core::ws_bus;
 use cloudillo_core::OptionalAuth;
 use cloudillo_types::meta_adapter::{CreateFile, FileStatus};
+use cloudillo_types::types::AccessLevel;
 
 /// Query parameters for WebSocket file access endpoints
 #[derive(Debug, Deserialize, Default)]
@@ -66,20 +67,29 @@ fn ws_close_write_denied(ws: WebSocketUpgrade) -> Response {
 	ws.on_upgrade(|socket| close_with_error(socket, 4403, "Write access denied"))
 }
 
-/// Determine final read_only flag based on query parameter and computed access
+/// Determine final access level based on query parameter and computed access
 ///
-/// Returns `Ok(read_only)` or `Err(())` if write access was requested but not available
-fn resolve_access(query: &AccessQuery, computed_read_only: bool) -> Result<bool, ()> {
+/// Returns `Ok(AccessLevel)` or `Err(())` if write access was requested but not available
+fn resolve_access(query: &AccessQuery, computed: AccessLevel) -> Result<AccessLevel, ()> {
 	match query.access.as_deref() {
-		Some("read") => Ok(true), // Force read-only
-		Some("write") => {
-			if computed_read_only {
-				Err(()) // Write requested but user only has read
-			} else {
-				Ok(false)
+		Some("read") => Ok(AccessLevel::Read), // Force read-only
+		Some("comment") => {
+			// Comment requested: allow if computed is Comment or higher
+			match computed {
+				AccessLevel::Comment | AccessLevel::Write | AccessLevel::Admin => {
+					Ok(AccessLevel::Comment)
+				}
+				_ => Err(()),
 			}
 		}
-		_ => Ok(computed_read_only), // Use computed access
+		Some("write") => {
+			// Write requested: only if computed is Write or Admin
+			match computed {
+				AccessLevel::Write | AccessLevel::Admin => Ok(AccessLevel::Write),
+				_ => Err(()),
+			}
+		}
+		_ => Ok(computed), // Use computed access
 	}
 }
 
@@ -317,7 +327,9 @@ pub async fn get_ws_rtdb(
 
 	// Auto-create meta database for authenticated users
 	// Meta DBs ({parent_file_id}~meta) store comments and metadata
-	let access_file_id = if let Some(parent_file_id) = validate_meta_id(&file_id) {
+	let meta_parent = validate_meta_id(&file_id);
+	let is_meta = meta_parent.is_some();
+	let access_file_id = if let Some(parent_file_id) = meta_parent {
 		if !is_guest {
 			if let Err(e) = ensure_meta_file(&app, crate::types::TnId(tn_id), &file_id).await {
 				return ws_close_for_error(ws, &e);
@@ -354,23 +366,36 @@ pub async fn get_ws_rtdb(
 			}
 
 			// Guests are always read-only
-			let read_only = if is_guest {
-				true
+			let access_level = if is_guest {
+				AccessLevel::Read
 			} else {
-				let Ok(ro) = resolve_access(&query, result.read_only) else {
-					warn!("RTDB WebSocket rejected - write access requested but not available: user={}, file={}", user_id, file_id);
+				let Ok(al) = resolve_access(&query, result.access_level) else {
+					warn!("RTDB WebSocket rejected - requested access not available: user={}, file={}", user_id, file_id);
 					return ws_close_write_denied(ws);
 				};
-				ro
+				// For non-meta DBs, downgrade Comment to Read (comment users
+				// can only write to meta databases, not main document RTDB)
+				if !is_meta && al == AccessLevel::Comment {
+					AccessLevel::Read
+				} else {
+					al
+				}
 			};
 			info!(
 				"RTDB WebSocket ({}): user={}, file={}",
-				if read_only { "read-only" } else { "read-write" },
+				access_level.as_str(),
 				if is_guest { "*guest" } else { &user_id },
 				file_id
 			);
 			ws.on_upgrade(move |socket| {
-				rtdb::handle_rtdb_connection(socket, user_id, file_id, app, user_tn_id, read_only)
+				rtdb::handle_rtdb_connection(
+					socket,
+					user_id,
+					file_id,
+					app,
+					user_tn_id,
+					access_level,
+				)
 			})
 		}
 		Err(e) => {
@@ -455,15 +480,19 @@ pub async fn get_ws_crdt(
 				return ws_close_type_mismatch(ws);
 			}
 
-			// Guests are always read-only
+			// Guests are always read-only; Comment treated as read-only for CRDT
 			let read_only = if is_guest {
 				true
 			} else {
-				let Ok(ro) = resolve_access(&query, result.read_only) else {
-					warn!("CRDT WebSocket rejected - write access requested but not available: user={}, doc={}", user_id, doc_id);
+				let Ok(al) = resolve_access(&query, result.access_level) else {
+					warn!(
+						"CRDT WebSocket rejected - requested access not available: user={}, doc={}",
+						user_id, doc_id
+					);
 					return ws_close_write_denied(ws);
 				};
-				ro
+				// CRDT: only Write/Admin can edit; Comment is read-only
+				!matches!(al, AccessLevel::Write | AccessLevel::Admin)
 			};
 			info!(
 				"CRDT WebSocket ({}): user={}, doc={}",

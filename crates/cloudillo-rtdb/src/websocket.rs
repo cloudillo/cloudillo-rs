@@ -15,6 +15,7 @@
 use crate::prelude::*;
 use axum::extract::ws::{Message, WebSocket};
 use cloudillo_types::rtdb_adapter::{ChangeEvent, LockMode};
+use cloudillo_types::types::AccessLevel;
 use cloudillo_types::utils::random_id;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
@@ -120,8 +121,8 @@ struct RtdbConnection {
 	/// Per-subscription forwarding task handles for cleanup on unsubscribe
 	subscription_handles: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
 	tn_id: TnId,
-	/// Whether this connection is read-only (cannot execute transactions)
-	read_only: bool,
+	/// Access level for this connection (Read/Comment/Write/Admin)
+	access_level: AccessLevel,
 	// User activity tracking state (throttled)
 	last_access_update: Mutex<Option<Instant>>,
 	last_modify_update: Mutex<Option<Instant>>,
@@ -130,9 +131,10 @@ struct RtdbConnection {
 
 /// Handle an RTDB connection
 ///
-/// The `read_only` parameter controls whether this connection can execute transactions.
-/// Read-only connections can subscribe to changes and query data,
-/// but their transaction requests will be rejected.
+/// The `access_level` parameter controls what this connection can do:
+/// - `Read`: Can subscribe and query, but all writes are rejected.
+/// - `Comment`: Can subscribe/query, and write to comment collections (t/*, c/*) only.
+/// - `Write`/`Admin`: Full read-write access to all collections.
 ///
 /// SECURITY TODO: Access level is checked once at connection time but not re-validated.
 /// If a user's access is revoked (e.g., FSHR action deleted), they keep their original
@@ -144,9 +146,9 @@ pub async fn handle_rtdb_connection(
 	file_id: String,
 	app: App,
 	tn_id: TnId,
-	read_only: bool,
+	access_level: AccessLevel,
 ) {
-	info!("RTDB connection: {} / file_id={} (read_only={})", user_id, file_id, read_only);
+	info!("RTDB connection: {} / file_id={} (access={})", user_id, file_id, access_level.as_str());
 
 	let (aggregated_tx, aggregated_rx) =
 		tokio::sync::mpsc::unbounded_channel::<(String, ChangeEvent)>();
@@ -158,7 +160,7 @@ pub async fn handle_rtdb_connection(
 		aggregated_tx,
 		subscription_handles: Arc::new(RwLock::new(HashMap::new())),
 		tn_id,
-		read_only,
+		access_level,
 		last_access_update: Mutex::new(None),
 		last_modify_update: Mutex::new(None),
 		has_modified: AtomicBool::new(false),
@@ -323,19 +325,58 @@ pub async fn handle_rtdb_connection(
 	info!("RTDB connection closed: {}", user_id);
 }
 
-/// Returns an error response if the connection is read-only, None otherwise.
-fn check_read_only(conn: &RtdbConnection) -> Option<RtdbMessage> {
-	if conn.read_only {
-		Some(RtdbMessage::new(
+/// Check if the connection can write to the given path.
+///
+/// - `Write`/`Admin`: always allowed (returns None)
+/// - `Comment`: allowed only for comment collections (paths starting with `t/` or `c/`)
+/// - `Read`/`None`: always denied
+///
+/// CONVENTION: `t/` (threads) and `c/` (comments) are the only collections that
+/// Comment-level users can write to. Do not store non-comment data under these prefixes.
+fn check_write_access(conn: &RtdbConnection, path: &str) -> Option<RtdbMessage> {
+	match conn.access_level {
+		AccessLevel::Write | AccessLevel::Admin => None,
+		AccessLevel::Comment => {
+			let collection = path.split('/').next().unwrap_or("");
+			if matches!(collection, "t" | "c") {
+				None
+			} else {
+				Some(RtdbMessage::new(
+					"error",
+					json!({
+						"code": 403,
+						"message": "Comment access - writes restricted to comment collections"
+					}),
+				))
+			}
+		}
+		_ => Some(RtdbMessage::new(
 			"error",
 			json!({
 				"code": 403,
 				"message": "Write access denied - read-only connection"
 			}),
-		))
-	} else {
-		None
+		)),
 	}
+}
+
+/// Check write access for all paths in a set of operations.
+/// Returns an error if any path is not writable.
+fn check_write_access_for_operations(
+	conn: &RtdbConnection,
+	operations: &[Value],
+) -> Option<RtdbMessage> {
+	// Write/Admin can write anything — skip per-path checks
+	if matches!(conn.access_level, AccessLevel::Write | AccessLevel::Admin) {
+		return None;
+	}
+	for op in operations {
+		let path = op.get("path").and_then(|v| v.as_str()).unwrap_or("");
+		if let Some(err) = check_write_access(conn, path) {
+			return Some(err);
+		}
+	}
+	None
 }
 
 /// Handle an RTDB command
@@ -346,12 +387,12 @@ async fn handle_rtdb_command(
 ) -> RtdbMessage {
 	match msg.msg_type.as_str() {
 		"transaction" => {
-			if let Some(err) = check_read_only(conn) {
-				return err;
-			}
-
 			// Handle atomic batch operations (create/update/delete)
 			if let Some(operations) = msg.payload.get("operations").and_then(|v| v.as_array()) {
+				// Check write access for all operation paths
+				if let Some(err) = check_write_access_for_operations(conn, operations) {
+					return err;
+				}
 				debug!("RTDB transaction: {} operations", operations.len());
 
 				// Create a single transaction for all operations (atomic)
@@ -938,10 +979,6 @@ async fn handle_rtdb_command(
 		}
 
 		"createIndex" => {
-			if let Some(err) = check_read_only(conn) {
-				return err;
-			}
-
 			// Create an index on a field for query optimization
 			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			let field = msg.payload.get("field").and_then(|v| v.as_str()).unwrap_or("");
@@ -954,6 +991,11 @@ async fn handle_rtdb_command(
 						"message": "Missing path or field for index creation"
 					}),
 				);
+			}
+
+			// Check write access for the collection being indexed
+			if let Some(err) = check_write_access(conn, path) {
+				return err;
 			}
 
 			debug!("RTDB createIndex: path={}, field={}", path, field);
@@ -981,11 +1023,10 @@ async fn handle_rtdb_command(
 		}
 
 		"lock" => {
-			if let Some(err) = check_read_only(conn) {
+			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+			if let Some(err) = check_write_access(conn, path) {
 				return err;
 			}
-
-			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			let mode = match msg.payload.get("mode").and_then(|v| v.as_str()) {
 				Some("hard") => LockMode::Hard,
 				_ => LockMode::Soft,
@@ -1025,11 +1066,10 @@ async fn handle_rtdb_command(
 		}
 
 		"unlock" => {
-			if let Some(err) = check_read_only(conn) {
+			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+			if let Some(err) = check_write_access(conn, path) {
 				return err;
 			}
-
-			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
 
 			match app
 				.rtdb_adapter
