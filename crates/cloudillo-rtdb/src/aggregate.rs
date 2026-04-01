@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Incremental aggregate computation for RTDB subscriptions.
 //!
 //! Instead of recomputing the full aggregate on every document change,

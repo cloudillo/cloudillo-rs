@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Subscriber fan-out logic for federated action delivery
 //!
 //! Walks up the parent chain of an action until finding a subscribable root,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! IDP (Identity Provider) REST endpoints for managing identity registrations
 
 use axum::{

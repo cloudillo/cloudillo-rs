@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Reverse proxy module for proxying HTTP and WebSocket traffic to backend servers.
 
 pub mod admin;

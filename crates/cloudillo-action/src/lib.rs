@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Action subsystem. Actions are small signed documents representing a user action (e.g. post, comment, connection request).
 
 #![allow(dead_code)]

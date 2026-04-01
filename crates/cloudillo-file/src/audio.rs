@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Audio processing tasks for extraction and transcoding.
 //!
 //! Uses FFmpeg via shell commands for audio processing:

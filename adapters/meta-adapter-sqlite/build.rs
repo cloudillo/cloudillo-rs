@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 fn main() {
 	if !std::env::var("LIBSQLITE3_FLAGS")
 		.unwrap_or_default()

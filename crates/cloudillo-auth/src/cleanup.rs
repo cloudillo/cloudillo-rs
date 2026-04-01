@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Periodic cleanup task for expired auth data (API keys, verification codes)
 
 use async_trait::async_trait;

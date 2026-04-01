@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Real-Time Database Adapter
 //!
 //! Trait and types for pluggable real-time database backends that store JSON documents

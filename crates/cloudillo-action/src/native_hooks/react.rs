@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! REACT (Reaction) action native hooks
 //!
 //! Handles reaction lifecycle:

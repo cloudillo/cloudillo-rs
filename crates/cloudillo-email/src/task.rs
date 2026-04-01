@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Email sender task for scheduler integration
 //!
 //! Handles async, persistent email sending with template rendering.

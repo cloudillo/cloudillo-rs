@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Blob adapter streaming and large file tests
 //!
 //! Tests streaming I/O, large files, and partial uploads

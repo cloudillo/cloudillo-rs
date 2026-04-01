@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Built-in action type definitions
 //!
 //! All action types are defined here as Rust data structures for compile-time validation

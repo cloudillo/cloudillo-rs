@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Share entry management handlers
 //!
 //! Provides HTTP handlers for managing file share entries.

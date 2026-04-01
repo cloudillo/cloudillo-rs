@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! File processing presets for different use cases.
 //!
 //! Presets define which variants to generate for different media types

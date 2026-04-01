@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Container cache for zip-based app packages.
 //!
 //! Parses zip central directory on first access, caches entry metadata,

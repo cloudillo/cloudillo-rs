@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 use crate::{storage, InstanceKey};
 use cloudillo_types::prelude::*;
 use cloudillo_types::rtdb_adapter::{ChangeEvent, LockInfo};

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Shared types, adapter traits, and core utilities for the Cloudillo platform.
 //!
 //! This crate contains the foundational types that are shared between the

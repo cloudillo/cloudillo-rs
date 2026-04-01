@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Native hook implementations for core action types
 //!
 //! This module contains high-performance, security-hardened implementations of action lifecycle hooks,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! WebSocket User Messaging
 //!
 //! Manages direct user-to-user messaging via WebSocket connections.

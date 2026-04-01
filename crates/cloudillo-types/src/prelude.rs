@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 pub use crate::error::{ClResult, Error};
 pub use crate::types::{Patch, TagInfo, Timestamp, TnId};
 

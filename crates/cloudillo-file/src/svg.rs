@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! SVG processing: sanitization, dimension parsing, and rasterization.
 //!
 //! This module provides safe SVG handling by:

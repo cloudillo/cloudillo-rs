@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Share entry management
 //!
 //! Handles CRUD operations for share entries (user shares, link shares, file-to-file links).

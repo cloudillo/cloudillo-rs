@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Adapter that manages metadata. Everything including tenants, profiles, actions, file metadata, etc.
 
 /// Special parent_id value for trashed files

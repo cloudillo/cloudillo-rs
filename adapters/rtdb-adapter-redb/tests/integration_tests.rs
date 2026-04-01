@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 #![allow(clippy::expect_used)]
 
 use cloudillo_rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};

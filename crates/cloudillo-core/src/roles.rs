@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Role hierarchy and expansion logic
 //!
 //! This module defines the built-in role hierarchy and provides utilities

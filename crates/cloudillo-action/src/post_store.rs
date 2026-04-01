@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Unified post-storage action processing
 //!
 //! This module provides a shared abstraction for processing actions after they are stored,

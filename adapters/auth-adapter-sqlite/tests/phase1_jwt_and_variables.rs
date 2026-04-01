@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Phase 1 Integration Tests - JWT Secret and Variables System
 //!
 //! Tests for the critical security features implemented in Phase 1:

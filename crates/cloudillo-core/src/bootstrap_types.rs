@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Bootstrap-related types shared between server and feature crates.
 
 /// Options for creating a complete tenant with all necessary setup

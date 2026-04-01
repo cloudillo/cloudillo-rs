@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Type-erased extension map for AppState
 //!
 //! Allows feature modules to register their own state without coupling

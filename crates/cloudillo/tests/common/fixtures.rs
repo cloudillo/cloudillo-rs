@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Reusable test fixtures and test data
 //!
 //! This module defines shared test data that can be used across multiple tests

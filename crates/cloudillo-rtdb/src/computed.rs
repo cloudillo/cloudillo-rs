@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Computed Values Processor
 //!
 //! Processes computed value expressions in document data before write operations.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Rate Limiting Internal API
 //!
 //! Traits and types for programmatic rate limit management.

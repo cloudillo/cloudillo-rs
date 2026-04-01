@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! DSL Engine for executing action type hooks
 //!
 //! The engine loads action definitions, validates them, and executes lifecycle hooks

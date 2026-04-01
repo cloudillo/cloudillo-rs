@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Error handling subsystem. Implements a custom Error type.
 
 use axum::{http::StatusCode, response::IntoResponse, Json};

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! QR-code login: scan a QR on the login page with a phone that already
 //! has an active session to approve the desktop login.
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Utility functions
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};

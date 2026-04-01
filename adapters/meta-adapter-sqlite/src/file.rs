@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! File management and variant handling
 
 use sqlx::{sqlite::SqliteRow, Row, SqlitePool};

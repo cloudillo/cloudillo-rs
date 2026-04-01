@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 use cloudillo_types::error::ClResult;
 use cloudillo_types::rtdb_adapter::{ChangeEvent, QueryFilter};
 use serde_json::Value;

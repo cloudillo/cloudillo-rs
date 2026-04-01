@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Unified audience resolution for action types
 //!
 //! This module provides a single function to resolve the audience for any action type,

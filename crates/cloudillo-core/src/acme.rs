@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! ACME subsystem. Handles automatic certificate management using Let's Encrypt.
 
 use axum::extract::State;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! File duplication logic for CRDT and RTDB documents.
 //!
 //! CRDT duplication uses `AsPrelim` to recursively deep-copy all nested Yjs shared types

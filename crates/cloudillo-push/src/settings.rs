@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Push notification settings registration
 //!
 //! Settings for controlling which action types trigger push notifications.

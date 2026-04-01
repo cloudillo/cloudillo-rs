@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Variant classes and quality tiers for multi-media file processing.
 //!
 //! Implements a two-level hierarchy: `class.quality` (e.g., `vis.sd`, `aud.hd`, `vid.md`)

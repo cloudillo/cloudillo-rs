@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Blob adapter concurrency and thread safety tests
 //!
 //! Tests concurrent access patterns and thread safety

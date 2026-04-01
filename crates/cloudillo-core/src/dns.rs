@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! DNS resolver module with true recursive resolution from root nameservers
 //!
 //! This module provides DNS resolution capabilities using manual recursive

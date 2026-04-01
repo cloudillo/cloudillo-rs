@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Rate Limit Manager
 //!
 //! Core rate limiting implementation using the governor crate's GCRA algorithm.

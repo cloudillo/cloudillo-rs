@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Adapter that manages identity registration and DNS modifications.
 //!
 //! The Identity Provider Adapter is responsible for handling DNS modifications

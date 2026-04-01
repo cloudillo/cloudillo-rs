@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 use std::{fmt::Debug, path::Path, sync::Arc};
 
 use async_trait::async_trait;

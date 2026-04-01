@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Meta adapter CRUD operation tests
 //!
 //! Tests Create, Read, Update, Delete operations for tenants and profiles

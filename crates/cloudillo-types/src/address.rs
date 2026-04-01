@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Address type detection and validation for IPv4, IPv6, and hostnames
 
 use crate::prelude::*;

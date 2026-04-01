@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Bootstrap module for initial tenant setup and certificate management
 
 use std::sync::Arc;

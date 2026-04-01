@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Test adapter builders and helpers
 //!
 //! This module provides utilities for creating test instances of adapters

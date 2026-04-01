@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! File synchronization from remote instances
 //!
 //! Provides unified file sync functionality for both action attachments

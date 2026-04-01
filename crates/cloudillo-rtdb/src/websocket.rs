@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! WebSocket RTDB Handler - Real-time Database Subscriptions
 //!
 //! The RTDB protocol (`/ws/rtdb/:file_id`) provides real-time updates for

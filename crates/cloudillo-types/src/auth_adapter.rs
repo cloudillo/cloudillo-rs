@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Adapter that manages and stores authentication, authorization and other sensitive data.
 
 use async_trait::async_trait;

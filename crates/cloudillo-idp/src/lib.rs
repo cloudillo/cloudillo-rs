@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Identity Provider subsystem. Manages identity registration and lifecycle.
 
 pub mod api_keys;

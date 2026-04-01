@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! FSHR (File Share) action native hooks
 //!
 //! Handles file sharing lifecycle:

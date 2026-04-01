@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Shared utilities for SQLite adapter
 //!
 //! This module contains helper functions, macros, and error mapping utilities

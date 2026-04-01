@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! WebSocket Bus Handler - Direct user messaging
 //!
 //! The bus protocol (`/ws/bus`) provides direct user-to-user messaging.

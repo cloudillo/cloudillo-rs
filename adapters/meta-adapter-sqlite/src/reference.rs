@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Reference/bookmark management
 //!
 //! Handles named references or bookmarks that can be used to mark important resources.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Action DSL (Domain-Specific Language) for declarative action type definitions
 //!
 //! This module provides a JSON-based DSL for defining federated social action types

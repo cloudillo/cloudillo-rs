@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Core infrastructure for the Cloudillo platform.
 //!
 //! This crate contains shared infrastructure modules that are used by the server

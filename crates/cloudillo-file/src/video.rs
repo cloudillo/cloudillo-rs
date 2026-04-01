@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Video processing tasks for transcoding.
 //!
 //! Uses FFmpeg via shell commands for video processing:

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Basic **Cloudillo** Server
 //!
 //! Implements a self-contained, basic **Cloudillo** server with adapters using embedded databases and file system.

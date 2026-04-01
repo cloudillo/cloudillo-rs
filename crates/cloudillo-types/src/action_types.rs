@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Action-related types shared between server and adapters.
 
 use serde::{Deserialize, Serialize};

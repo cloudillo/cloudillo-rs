@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 use cloudillo_types::error::Error as CloudilloError;
 use std::fmt;
 

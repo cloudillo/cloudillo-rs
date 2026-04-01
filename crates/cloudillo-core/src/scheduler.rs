@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Scheduler subsystem. Handles async tasks, dependencies, fallbacks, repetitions, persistence..
 
 use async_trait::async_trait;

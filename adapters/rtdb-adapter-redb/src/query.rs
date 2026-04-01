@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 use crate::error::from_redb_error;
 use crate::{storage, DatabaseInstance};
 use cloudillo_types::error::ClResult;

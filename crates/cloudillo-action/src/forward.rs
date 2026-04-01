@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Action forwarding to connected WebSocket clients
 //!
 //! This module provides functionality to forward actions to users connected via WebSocket.

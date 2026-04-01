@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! PDF processing tasks for thumbnail generation and metadata extraction.
 //!
 //! Uses external tools for PDF processing:

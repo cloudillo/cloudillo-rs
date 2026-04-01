@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Proof-of-Work Counter System
 //!
 //! Hashcash-style proof-of-work for CONN actions based on suspicious behavior counter.

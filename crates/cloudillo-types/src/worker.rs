@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Worker pool. Handles synchronous tasks with 3 priority levels, configurable worker threads.
 
 use flume::{Receiver, Sender};

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! WebSocket upgrade handlers
 //!
 //! Routes WebSocket connections to appropriate protocol handlers:

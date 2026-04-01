@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 use axum::{
 	body::{to_bytes, Body},
 	extract::{self, Query, State},

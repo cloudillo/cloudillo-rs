@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! HTTP forwarding and WebSocket tunneling for reverse proxy
 
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Uri};

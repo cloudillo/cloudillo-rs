@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! WebSocket CRDT Handler - Collaborative Document Editing
 //!
 //! The CRDT protocol (`/ws/crdt/:doc_id`) provides real-time collaborative editing

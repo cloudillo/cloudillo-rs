@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Password Change Security Tests
 //!
 //! Comprehensive security tests for the password change functionality:

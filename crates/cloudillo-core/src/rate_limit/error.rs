@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Rate Limiting Error Types
 //!
 //! Error types for rate limiting and proof-of-work failures.

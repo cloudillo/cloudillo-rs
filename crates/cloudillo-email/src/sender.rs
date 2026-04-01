@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! SMTP email sender using lettre
 //!
 //! Handles SMTP connection and email delivery with settings integration.

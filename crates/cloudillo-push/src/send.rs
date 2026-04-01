@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Web Push notification sending
 //!
 //! Implements RFC 8030 (HTTP/2 Push), RFC 8188 (Encrypted Content-Encoding),

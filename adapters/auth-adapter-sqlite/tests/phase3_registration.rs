@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Phase 3 Integration Tests - User Registration & Account Management
 //!
 //! Tests for user registration workflow:

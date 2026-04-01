@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Push notification HTTP handlers
 
 use axum::{extract::State, http::StatusCode, Json};

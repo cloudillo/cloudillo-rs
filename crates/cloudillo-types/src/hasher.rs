@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! Hasher format for content-addressing. Capable of handling multiple versions and object variants.
 
 use base64::Engine;

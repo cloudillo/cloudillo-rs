@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! App builder - constructs and runs the Cloudillo application
 
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};

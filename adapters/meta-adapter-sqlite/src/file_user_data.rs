@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 //! File user data management (per-user file activity tracking)
 
 use sqlx::{Row, SqlitePool};

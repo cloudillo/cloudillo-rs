@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Szilárd Hajba
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const TOKEN_EXPIRE: u64 = 8; /* hours */
 const BCRYPT_COST: u32 = 10;
 
