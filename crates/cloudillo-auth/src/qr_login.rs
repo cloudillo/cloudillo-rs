@@ -81,7 +81,11 @@ impl QrLoginStore {
 /// Hash a secret string with SHA-256 and return the hex digest.
 fn hash_secret(secret: &str) -> String {
 	let hash = Sha256::digest(secret.as_bytes());
-	format!("{:x}", hash)
+	hash.iter().fold(String::with_capacity(64), |mut s, b| {
+		use std::fmt::Write;
+		let _ = write!(s, "{b:02x}");
+		s
+	})
 }
 
 // ============================================================================

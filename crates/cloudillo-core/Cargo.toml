@@ -23,7 +23,7 @@ futures-core = "0.3"
 governor = "0.10"
 hickory-resolver = "0.25"
 http-body-util = "0.1"
-hyper = "1.8"
+hyper = "1.9"
 hyper-rustls = "0.27"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2"] }
 instant-acme = "0.8"

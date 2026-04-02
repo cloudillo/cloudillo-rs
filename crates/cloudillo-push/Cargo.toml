@@ -30,7 +30,7 @@ jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 url = "2"
 
 # HTTP/2 client for push delivery
-hyper = "1.8"
+hyper = "1.9"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2"] }
 hyper-rustls = "0.27"
 http-body-util = "0.1"
