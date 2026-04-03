@@ -84,11 +84,7 @@ impl FailureEntry {
 	/// Get seconds remaining until retry is allowed
 	pub fn seconds_until_retry(&self) -> i64 {
 		let now = Timestamp::now();
-		if now >= self.retry_after {
-			0
-		} else {
-			self.retry_after.0 - now.0
-		}
+		if now >= self.retry_after { 0 } else { self.retry_after.0 - now.0 }
 	}
 }
 

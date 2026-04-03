@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use sqlx::{Row, SqlitePool};
 
 use crate::crypto;

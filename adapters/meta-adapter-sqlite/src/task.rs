@@ -218,7 +218,7 @@ pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> 
 
 	// Add next_at if present
 	match &patch.next_at {
-		Patch::Value(ref next_at) => {
+		Patch::Value(next_at) => {
 			if has_fields {
 				query.push(", ");
 			}
@@ -237,7 +237,7 @@ pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> 
 
 	// Add retry if present
 	match &patch.retry {
-		Patch::Value(ref retry) => {
+		Patch::Value(retry) => {
 			if has_fields {
 				query.push(", ");
 			}
@@ -256,7 +256,7 @@ pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> 
 
 	// Add cron if present
 	match &patch.cron {
-		Patch::Value(ref cron) => {
+		Patch::Value(cron) => {
 			if has_fields {
 				query.push(", ");
 			}

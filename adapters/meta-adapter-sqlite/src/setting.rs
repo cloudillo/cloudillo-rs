@@ -74,10 +74,9 @@ pub(crate) async fn list(
 		// Only include settings that have valid non-null values
 		if let Some(json_value) =
 			value.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+			&& !json_value.is_null()
 		{
-			if !json_value.is_null() {
-				settings.insert(name, json_value);
-			}
+			settings.insert(name, json_value);
 		}
 	}
 

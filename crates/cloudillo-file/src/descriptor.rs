@@ -208,11 +208,7 @@ pub fn parse_file_descriptor(descriptor: &str) -> ClResult<Vec<meta_adapter::Fil
 /// Handles both legacy (sd) and new (vis.sd) formats
 fn normalize_variant_name(name: &str) -> &str {
 	// If it's a two-level name, extract just the quality part for legacy comparison
-	if let Some((_class, quality)) = name.split_once('.') {
-		quality
-	} else {
-		name
-	}
+	if let Some((_class, quality)) = name.split_once('.') { quality } else { name }
 }
 
 /// Check if a variant matches the requested variant (supports both formats)
@@ -223,10 +219,10 @@ fn variant_matches(variant: &str, requested: &str) -> bool {
 	}
 
 	// Legacy format match: "sd" matches "vis.sd"
-	if let Some(parsed) = Variant::parse(variant) {
-		if parsed.quality.as_str() == requested {
-			return true;
-		}
+	if let Some(parsed) = Variant::parse(variant)
+		&& parsed.quality.as_str() == requested
+	{
+		return true;
 	}
 
 	// New format match: "vis.sd" matches when requesting "sd"

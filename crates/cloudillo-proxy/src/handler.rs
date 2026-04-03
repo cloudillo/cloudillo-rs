@@ -3,14 +3,14 @@
 
 //! HTTP forwarding and WebSocket tunneling for reverse proxy
 
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Uri};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Uri, header};
 use hyper::body::Incoming;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::prelude::*;
 use crate::ProxySiteEntry;
+use crate::prelude::*;
 
 /// Headers that should not be forwarded between client and backend (hop-by-hop)
 const HOP_BY_HOP_HEADERS: &[&str] = &[
@@ -198,16 +198,14 @@ async fn handle_websocket_proxy(
 
 	// Host header
 	let preserve_host = entry.config.preserve_host.unwrap_or(true);
-	if !preserve_host {
-		if let Some(host) = entry.backend_url.host_str() {
-			let host_val = if let Some(port) = entry.backend_url.port() {
-				format!("{}:{}", host, port)
-			} else {
-				host.to_string()
-			};
-			if let Ok(hv) = HeaderValue::from_str(&host_val) {
-				backend_headers.insert(header::HOST, hv);
-			}
+	if !preserve_host && let Some(host) = entry.backend_url.host_str() {
+		let host_val = if let Some(port) = entry.backend_url.port() {
+			format!("{}:{}", host, port)
+		} else {
+			host.to_string()
+		};
+		if let Ok(hv) = HeaderValue::from_str(&host_val) {
+			backend_headers.insert(header::HOST, hv);
 		}
 	}
 

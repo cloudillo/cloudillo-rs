@@ -4,16 +4,16 @@
 //! WebAuthn (Passkey) authentication handlers
 
 use axum::{
+	Json,
 	extract::{Path, State},
 	http::StatusCode,
-	Json,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
 
-use cloudillo_core::extract::IdTag;
 use cloudillo_core::Auth;
+use cloudillo_core::extract::IdTag;
 use cloudillo_types::{auth_adapter, types::ApiResponse};
 
 use crate::prelude::*;

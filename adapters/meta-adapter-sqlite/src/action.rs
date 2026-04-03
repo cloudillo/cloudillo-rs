@@ -139,34 +139,34 @@ pub(crate) async fn list(
 	let is_desc = sort_dir == "DESC";
 
 	// Parse cursor for keyset pagination
-	if let Some(cursor_str) = &opts.cursor {
-		if let Some(cursor) = cloudillo_types::types::CursorData::decode(cursor_str) {
-			// Look up internal a_id from cursor's external action_id
-			let cursor_a_id: Option<i64> =
-				match sqlx::query_scalar("SELECT a_id FROM actions WHERE tn_id=? AND action_id=?")
-					.bind(tn_id.0)
-					.bind(&cursor.id)
-					.fetch_optional(db)
-					.await
-				{
-					Ok(v) => v,
-					Err(e) => {
-						warn!("cursor a_id lookup failed: {}", e);
-						None
-					}
-				};
-
-			if let Some(cursor_a_id) = cursor_a_id {
-				// Keyset pagination: (created_at, a_id) < (cursor_ts, cursor_a_id) for DESC
-				// Note: push_bind() adds bind placeholders, don't use ? in push() strings
-				let comparison = if is_desc { "<" } else { ">" };
-				if let Some(ts) = cursor.timestamp() {
-					query.push(format!(" AND (a.created_at, a.a_id) {} (", comparison));
-					query.push_bind(ts);
-					query.push(", ");
-					query.push_bind(cursor_a_id);
-					query.push(")");
+	if let Some(cursor_str) = &opts.cursor
+		&& let Some(cursor) = cloudillo_types::types::CursorData::decode(cursor_str)
+	{
+		// Look up internal a_id from cursor's external action_id
+		let cursor_a_id: Option<i64> =
+			match sqlx::query_scalar("SELECT a_id FROM actions WHERE tn_id=? AND action_id=?")
+				.bind(tn_id.0)
+				.bind(&cursor.id)
+				.fetch_optional(db)
+				.await
+			{
+				Ok(v) => v,
+				Err(e) => {
+					warn!("cursor a_id lookup failed: {}", e);
+					None
 				}
+			};
+
+		if let Some(cursor_a_id) = cursor_a_id {
+			// Keyset pagination: (created_at, a_id) < (cursor_ts, cursor_a_id) for DESC
+			// Note: push_bind() adds bind placeholders, don't use ? in push() strings
+			let comparison = if is_desc { "<" } else { ">" };
+			if let Some(ts) = cursor.timestamp() {
+				query.push(format!(" AND (a.created_at, a.a_id) {} (", comparison));
+				query.push_bind(ts);
+				query.push(", ");
+				query.push_bind(cursor_a_id);
+				query.push(")");
 			}
 		}
 	}
@@ -238,12 +238,11 @@ pub(crate) async fn list(
 						.await
 				};
 
-				if let Ok(file_res) = query_result.inspect_err(inspect) {
-					if let Ok(Some(dim_str)) = file_res.try_get::<Option<&str>, _>("dim") {
-						if !dim_str.is_empty() {
-							a.dim = serde_json::from_str(dim_str)?;
-						}
-					}
+				if let Ok(file_res) = query_result.inspect_err(inspect)
+					&& let Ok(Some(dim_str)) = file_res.try_get::<Option<&str>, _>("dim")
+					&& !dim_str.is_empty()
+				{
+					a.dim = serde_json::from_str(dim_str)?;
 				}
 
 				// Query local variants
@@ -258,10 +257,10 @@ pub(crate) async fn list(
 					// Query by file_id for real IDs
 					crate::file::list_available_variants(db, tn_id, &a.file_id).await.ok()
 				};
-				if let Some(variants) = variants {
-					if !variants.is_empty() {
-						a.local_variants = Some(variants);
-					}
+				if let Some(variants) = variants
+					&& !variants.is_empty()
+				{
+					a.local_variants = Some(variants);
 				}
 				debug!("attachment: {:?}", a);
 			}
@@ -426,19 +425,19 @@ pub(crate) async fn create(
 	// For inbound actions with a key, delete old actions with the same key first
 	// This handles key-based deduplication for inbound actions (outbound actions
 	// handle this in finalize())
-	if !action.action_id.is_empty() {
-		if let Some(key) = key {
-			info!("Inbound action with key: {}, deleting old entries", key);
-			sqlx::query(
-				"UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND coalesce(status, 'A')!='D'",
-			)
-			.bind(tn_id.0)
-			.bind(key)
-			.execute(db)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
-		}
+	if !action.action_id.is_empty()
+		&& let Some(key) = key
+	{
+		info!("Inbound action with key: {}, deleting old entries", key);
+		sqlx::query(
+			"UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND coalesce(status, 'A')!='D'",
+		)
+		.bind(tn_id.0)
+		.bind(key)
+		.execute(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 	}
 
 	let status = "P";
@@ -559,21 +558,20 @@ pub(crate) async fn finalize(
 
 		tx.rollback().await.map_err(|_| Error::DbError)?;
 
-		if let Some(row) = current {
-			if let Some(existing_id) = row.try_get::<Option<String>, _>("action_id").ok().flatten()
-			{
-				if existing_id == action_id {
-					// Idempotent success - another task set it to the same value
-					return Ok(());
-				}
-				// Conflict - set to different value
-				let msg = format!(
-					"Race condition: a_id={} was set to {} instead of {}",
-					a_id, existing_id, action_id
-				);
-				error!("{}", msg);
-				return Err(Error::Conflict(msg));
+		if let Some(row) = current
+			&& let Some(existing_id) = row.try_get::<Option<String>, _>("action_id").ok().flatten()
+		{
+			if existing_id == action_id {
+				// Idempotent success - another task set it to the same value
+				return Ok(());
 			}
+			// Conflict - set to different value
+			let msg = format!(
+				"Race condition: a_id={} was set to {} instead of {}",
+				a_id, existing_id, action_id
+			);
+			error!("{}", msg);
+			return Err(Error::Conflict(msg));
 		}
 
 		return Err(Error::Internal("Failed to finalize action".into()));
@@ -1084,12 +1082,11 @@ pub(crate) async fn get(
 					.await
 			};
 
-			if let Ok(file_res) = query_result.inspect_err(inspect) {
-				if let Ok(Some(dim_str)) = file_res.try_get::<Option<&str>, _>("dim") {
-					if !dim_str.is_empty() {
-						a.dim = serde_json::from_str(dim_str)?;
-					}
-				}
+			if let Ok(file_res) = query_result.inspect_err(inspect)
+				&& let Ok(Some(dim_str)) = file_res.try_get::<Option<&str>, _>("dim")
+				&& !dim_str.is_empty()
+			{
+				a.dim = serde_json::from_str(dim_str)?;
 			}
 
 			// Query local variants
@@ -1104,10 +1101,10 @@ pub(crate) async fn get(
 				// Query by file_id for real IDs
 				crate::file::list_available_variants(db, tn_id, &a.file_id).await.ok()
 			};
-			if let Some(variants) = variants {
-				if !variants.is_empty() {
-					a.local_variants = Some(variants);
-				}
+			if let Some(variants) = variants
+				&& !variants.is_empty()
+			{
+				a.local_variants = Some(variants);
 			}
 		}
 		Some(attachments)

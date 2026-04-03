@@ -16,7 +16,7 @@
 
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use crate::task::{create_action, CreateAction};
+use crate::task::{CreateAction, create_action};
 use cloudillo_types::meta_adapter::{
 	ProfileConnectionStatus, UpdateActionDataOptions, UpdateProfileData,
 };
@@ -159,51 +159,49 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				.ok()
 				.flatten();
 
-			if let Some(ref req) = our_request {
-				if req.sub_typ.is_none() {
-					// We have a pending request - this is mutual, auto-connect
-					tracing::info!(
-						"CONN: Mutual connection detected between {} and {}",
+			if let Some(ref req) = our_request
+				&& req.sub_typ.is_none()
+			{
+				// We have a pending request - this is mutual, auto-connect
+				tracing::info!(
+					"CONN: Mutual connection detected between {} and {}",
+					context.issuer,
+					audience
+				);
+
+				// Update issuer's profile to connected
+				let profile_update = UpdateProfileData {
+					connected: Patch::Value(ProfileConnectionStatus::Connected),
+					following: if context.tenant_type == "community" {
+						Patch::Undefined
+					} else {
+						Patch::Value(true)
+					},
+					..Default::default()
+				};
+
+				if let Err(e) =
+					app.meta_adapter.update_profile(tn_id, &context.issuer, &profile_update).await
+				{
+					tracing::warn!(
+						"CONN: Failed to update issuer profile {}: {}",
 						context.issuer,
-						audience
+						e
 					);
-
-					// Update issuer's profile to connected
-					let profile_update = UpdateProfileData {
-						connected: Patch::Value(ProfileConnectionStatus::Connected),
-						following: if context.tenant_type == "community" {
-							Patch::Undefined
-						} else {
-							Patch::Value(true)
-						},
-						..Default::default()
-					};
-
-					if let Err(e) = app
-						.meta_adapter
-						.update_profile(tn_id, &context.issuer, &profile_update)
-						.await
-					{
-						tracing::warn!(
-							"CONN: Failed to update issuer profile {}: {}",
-							context.issuer,
-							e
-						);
-					}
-
-					// Set action status to 'N' (notification) - mutual connection auto-accepted
-					let update_opts =
-						UpdateActionDataOptions { status: Patch::Value('N'), ..Default::default() };
-					if let Err(e) = app
-						.meta_adapter
-						.update_action_data(tn_id, &context.action_id, &update_opts)
-						.await
-					{
-						tracing::warn!("CONN: Failed to update action status to N: {}", e);
-					}
-
-					return Ok(HookResult::default());
 				}
+
+				// Set action status to 'N' (notification) - mutual connection auto-accepted
+				let update_opts =
+					UpdateActionDataOptions { status: Patch::Value('N'), ..Default::default() };
+				if let Err(e) = app
+					.meta_adapter
+					.update_action_data(tn_id, &context.action_id, &update_opts)
+					.await
+				{
+					tracing::warn!("CONN: Failed to update action status to N: {}", e);
+				}
+
+				return Ok(HookResult::default());
 			}
 
 			// No mutual request - check connection_mode setting

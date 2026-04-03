@@ -112,11 +112,11 @@ pub async fn process_after_store(
 	schedule_delivery(app, tn_id, action, &fanout_recipients, &ctx).await?;
 
 	// 5. Direction-specific processing
-	if let ProcessingContext::Inbound { is_sync, .. } = &ctx {
-		if !is_sync {
-			// Auto-approve approvable actions from trusted sources
-			try_auto_approve(app, tn_id, action).await;
-		}
+	if let ProcessingContext::Inbound { is_sync, .. } = &ctx
+		&& !is_sync
+	{
+		// Auto-approve approvable actions from trusted sources
+		try_auto_approve(app, tn_id, action).await;
 	}
 
 	Ok(result)
@@ -319,59 +319,55 @@ async fn schedule_delivery(
 	}
 
 	// For APRV actions: check if the subject action should be broadcast to followers
-	if action.typ.as_ref() == "APRV" {
-		if let Some(ref subject_id) = action.subject {
-			if let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await {
-				let subject_broadcast = dsl
-					.get_behavior(&subject_action.typ)
-					.and_then(|b| b.broadcast)
-					.unwrap_or(false);
+	if action.typ.as_ref() == "APRV"
+		&& let Some(ref subject_id) = action.subject
+		&& let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await
+	{
+		let subject_broadcast =
+			dsl.get_behavior(&subject_action.typ).and_then(|b| b.broadcast).unwrap_or(false);
 
-				if subject_broadcast {
-					debug!(
-						"APRV {} subject {} has broadcast=true, fanning out to followers",
-						action.action_id, subject_id
-					);
-					// Fan-out APRV to followers with related action (the approved POST)
-					return schedule_broadcast_delivery(
-						app,
-						tn_id,
-						&action.issuer_tag,
-						&action.action_id,
-						Some(subject_id.as_ref()),
-					)
-					.await;
-				}
-			}
+		if subject_broadcast {
+			debug!(
+				"APRV {} subject {} has broadcast=true, fanning out to followers",
+				action.action_id, subject_id
+			);
+			// Fan-out APRV to followers with related action (the approved POST)
+			return schedule_broadcast_delivery(
+				app,
+				tn_id,
+				&action.issuer_tag,
+				&action.action_id,
+				Some(subject_id.as_ref()),
+			)
+			.await;
 		}
 	}
 
 	// Standard delivery: send to specific audience only
 	let mut recipients = Vec::new();
-	if let Some(ref audience_tag) = action.audience_tag {
-		if audience_tag.as_ref() != action.issuer_tag.as_ref() {
-			recipients.push(audience_tag.clone());
-		}
+	if let Some(ref audience_tag) = action.audience_tag
+		&& audience_tag.as_ref() != action.issuer_tag.as_ref()
+	{
+		recipients.push(audience_tag.clone());
 	}
 
 	// Check if this action type should also deliver to subject's owner
 	let deliver_to_subject_owner =
 		behavior.as_ref().and_then(|b| b.deliver_to_subject_owner).unwrap_or(false);
 
-	if deliver_to_subject_owner {
-		if let Some(ref subject_id) = action.subject {
-			if let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await {
-				let subject_owner = &subject_action.issuer.id_tag;
-				if subject_owner.as_ref() != action.issuer_tag.as_ref()
-					&& !recipients.iter().any(|r| r.as_ref() == subject_owner.as_ref())
-				{
-					info!(
-						"→ DUAL DELIVERY: Adding subject owner {} for {} (deliver_to_subject_owner)",
-						subject_owner, action.action_id
-					);
-					recipients.push(subject_owner.clone());
-				}
-			}
+	if deliver_to_subject_owner
+		&& let Some(ref subject_id) = action.subject
+		&& let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await
+	{
+		let subject_owner = &subject_action.issuer.id_tag;
+		if subject_owner.as_ref() != action.issuer_tag.as_ref()
+			&& !recipients.iter().any(|r| r.as_ref() == subject_owner.as_ref())
+		{
+			info!(
+				"→ DUAL DELIVERY: Adding subject owner {} for {} (deliver_to_subject_owner)",
+				subject_owner, action.action_id
+			);
+			recipients.push(subject_owner.clone());
 		}
 	}
 

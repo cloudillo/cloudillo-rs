@@ -7,10 +7,10 @@
 //! resolution starting from root nameservers.
 
 use hickory_resolver::{
+	TokioResolver,
 	config::{NameServerConfig, ResolverConfig},
 	name_server::TokioConnectionProvider,
 	proto::{rr::RecordType, xfer::Protocol},
-	TokioResolver,
 };
 use std::{
 	net::{IpAddr, SocketAddr},

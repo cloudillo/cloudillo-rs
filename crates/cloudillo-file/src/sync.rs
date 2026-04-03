@@ -178,19 +178,19 @@ pub async fn sync_file_variants(
 		for variant in &parsed_variants {
 			let class = Variant::parse(variant.variant).map_or(VariantClass::Visual, |v| v.class);
 
-			if let std::collections::hash_map::Entry::Vacant(e) = class_max_variants.entry(class) {
-				if let Some(setting_key) = get_sync_setting_key(class) {
-					let max_variant = app
-						.settings
-						.get_string_opt(tn_id, setting_key)
-						.await
-						.ok()
-						.flatten()
-						.unwrap_or_else(|| get_default_sync_max(class).to_string());
-					e.insert(max_variant);
-				}
-				// For doc/raw, no entry = sync all
+			if let std::collections::hash_map::Entry::Vacant(e) = class_max_variants.entry(class)
+				&& let Some(setting_key) = get_sync_setting_key(class)
+			{
+				let max_variant = app
+					.settings
+					.get_string_opt(tn_id, setting_key)
+					.await
+					.ok()
+					.flatten()
+					.unwrap_or_else(|| get_default_sync_max(class).to_string());
+				e.insert(max_variant);
 			}
+			// For doc/raw, no entry = sync all
 		}
 
 		// Filter variants using per-class max settings
@@ -359,13 +359,12 @@ pub async fn sync_file_variants(
 	}
 
 	// 8. Finalize the file by setting file_id (only if we created a new file entry)
-	if is_new_file {
-		if let Some(f_id) = f_id {
-			if let Err(e) = app.meta_adapter.finalize_file(tn_id, f_id, file_id).await {
-				warn!("Failed to finalize file {}: {}", file_id, e);
-				// Variants are synced, just finalization failed
-			}
-		}
+	if is_new_file
+		&& let Some(f_id) = f_id
+		&& let Err(e) = app.meta_adapter.finalize_file(tn_id, f_id, file_id).await
+	{
+		warn!("Failed to finalize file {}: {}", file_id, e);
+		// Variants are synced, just finalization failed
 	}
 
 	info!(

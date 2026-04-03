@@ -4,10 +4,10 @@
 //! Admin email testing handlers
 
 use axum::{
+	Json,
 	extract::State,
 	http::StatusCode,
 	response::{IntoResponse, Response},
-	Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;

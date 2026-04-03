@@ -23,10 +23,10 @@ use cloudillo_types::utils::random_id;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
@@ -429,26 +429,23 @@ async fn handle_rtdb_command(
 					}
 
 					// Check hard locks for write operations
-					if matches!(op_type, "update" | "replace" | "delete") {
-						if let Ok(Some(lock)) =
+					if matches!(op_type, "update" | "replace" | "delete")
+						&& let Ok(Some(lock)) =
 							app.rtdb_adapter.check_lock(conn.tn_id, &conn.file_id, &path).await
-						{
-							if lock.mode == LockMode::Hard
-								&& lock.user_id.as_ref() != conn.user_id.as_str()
-							{
-								drop(txn);
-								return RtdbMessage::new(
-									"error",
-									json!({
-										"code": 423,
-										"message": format!(
-											"Document locked by {}",
-											lock.user_id
-										)
-									}),
-								);
-							}
-						}
+						&& lock.mode == LockMode::Hard
+						&& lock.user_id.as_ref() != conn.user_id.as_str()
+					{
+						drop(txn);
+						return RtdbMessage::new(
+							"error",
+							json!({
+								"code": 423,
+								"message": format!(
+									"Document locked by {}",
+									lock.user_id
+								)
+							}),
+						);
 					}
 
 					let result = match op_type {
@@ -473,19 +470,13 @@ async fn handle_rtdb_command(
 								match txn.create(&path, data).await {
 									Ok(doc_id) => {
 										// Store reference if provided (e.g., { ref: "$post" })
-										if let Some(ref_value) = op.get("ref") {
-											if let Some(ref_name) = ref_value.as_str() {
-												if let Some(ref_name) = ref_name.strip_prefix('$') {
-													references.insert(
-														ref_name.to_string(),
-														doc_id.to_string(),
-													);
-													debug!(
-														"Stored reference: {} = {}",
-														ref_name, doc_id
-													);
-												}
-											}
+										if let Some(ref_value) = op.get("ref")
+											&& let Some(ref_name) = ref_value.as_str()
+											&& let Some(ref_name) = ref_name.strip_prefix('$')
+										{
+											references
+												.insert(ref_name.to_string(), doc_id.to_string());
+											debug!("Stored reference: {} = {}", ref_name, doc_id);
 										}
 										Ok(json!({ "ref": op.get("ref").cloned(), "id": doc_id }))
 									}
@@ -650,11 +641,11 @@ async fn handle_rtdb_command(
 			let mut opts = QueryOptions::new();
 
 			// Parse filter
-			if let Some(filter_obj) = msg.payload.get("filter") {
-				if let Ok(filter) = serde_json::from_value::<QueryFilter>(filter_obj.clone()) {
-					opts = opts.with_filter(filter);
-					debug!("RTDB query filter: {:?}", filter_obj);
-				}
+			if let Some(filter_obj) = msg.payload.get("filter")
+				&& let Ok(filter) = serde_json::from_value::<QueryFilter>(filter_obj.clone())
+			{
+				opts = opts.with_filter(filter);
+				debug!("RTDB query filter: {:?}", filter_obj);
 			}
 
 			// Parse sort
@@ -690,11 +681,11 @@ async fn handle_rtdb_command(
 			}
 
 			// Parse aggregate
-			if let Some(agg_obj) = msg.payload.get("aggregate") {
-				if let Ok(agg) = serde_json::from_value::<AggregateOptions>(agg_obj.clone()) {
-					debug!("RTDB query aggregate: groupBy={}", agg.group_by);
-					opts = opts.with_aggregate(agg);
-				}
+			if let Some(agg_obj) = msg.payload.get("aggregate")
+				&& let Ok(agg) = serde_json::from_value::<AggregateOptions>(agg_obj.clone())
+			{
+				debug!("RTDB query aggregate: groupBy={}", agg.group_by);
+				opts = opts.with_aggregate(agg);
 			}
 
 			match app.rtdb_adapter.query(conn.tn_id, &conn.file_id, path, opts).await {
@@ -878,19 +869,18 @@ async fn handle_rtdb_command(
 												}
 											}
 										} else if let Some(delta) = agg_state.process_change(&event)
+											&& !delta.is_empty()
 										{
-											if !delta.is_empty() {
-												let update_event = ChangeEvent::Update {
-													path: path.clone().into(),
-													data: Value::Array(delta),
-													old_data: None,
-												};
-												if agg_tx
-													.send((sub_id_clone.clone(), update_event))
-													.is_err()
-												{
-													break;
-												}
+											let update_event = ChangeEvent::Update {
+												path: path.clone().into(),
+												data: Value::Array(delta),
+												old_data: None,
+											};
+											if agg_tx
+												.send((sub_id_clone.clone(), update_event))
+												.is_err()
+											{
+												break;
 											}
 										}
 									}
@@ -1131,14 +1121,13 @@ async fn record_file_access_throttled(app: &App, conn: &RtdbConnection) {
 		should
 	};
 
-	if should_update {
-		if let Err(e) = app
+	if should_update
+		&& let Err(e) = app
 			.meta_adapter
 			.record_file_access(conn.tn_id, &conn.user_id, &conn.file_id)
 			.await
-		{
-			debug!("Failed to record file access for file {}: {}", conn.file_id, e);
-		}
+	{
+		debug!("Failed to record file access for file {}: {}", conn.file_id, e);
 	}
 }
 
@@ -1160,14 +1149,13 @@ async fn record_file_modification_throttled(app: &App, conn: &RtdbConnection) {
 		should
 	};
 
-	if should_update {
-		if let Err(e) = app
+	if should_update
+		&& let Err(e) = app
 			.meta_adapter
 			.record_file_modification(conn.tn_id, &conn.user_id, &conn.file_id)
 			.await
-		{
-			debug!("Failed to record file modification for file {}: {}", conn.file_id, e);
-		}
+	{
+		debug!("Failed to record file modification for file {}: {}", conn.file_id, e);
 	}
 }
 
@@ -1183,14 +1171,13 @@ async fn record_final_activity(app: &App, conn: &RtdbConnection) {
 	}
 
 	// Record final modification if any changes were made
-	if conn.has_modified.load(Ordering::Relaxed) {
-		if let Err(e) = app
+	if conn.has_modified.load(Ordering::Relaxed)
+		&& let Err(e) = app
 			.meta_adapter
 			.record_file_modification(conn.tn_id, &conn.user_id, &conn.file_id)
 			.await
-		{
-			debug!("Failed to record final file modification for file {}: {}", conn.file_id, e);
-		}
+	{
+		debug!("Failed to record final file modification for file {}: {}", conn.file_id, e);
 	}
 }
 

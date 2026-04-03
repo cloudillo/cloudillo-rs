@@ -209,10 +209,10 @@ pub(crate) async fn validate_ref(
 	}
 
 	// Validate count > 0 (skip if NULL = unlimited)
-	if let Some(c) = count {
-		if c <= 0 {
-			return Err(Error::ValidationError("Ref has already been used".to_string()));
-		}
+	if let Some(c) = count
+		&& c <= 0
+	{
+		return Err(Error::ValidationError("Ref has already been used".to_string()));
 	}
 
 	// Return ref data without decrementing count
@@ -288,10 +288,10 @@ pub(crate) async fn use_ref(
 	}
 
 	// Validate count > 0 (skip if NULL = unlimited)
-	if let Some(c) = count {
-		if c <= 0 {
-			return Err(Error::ValidationError("Ref has already been used".to_string()));
-		}
+	if let Some(c) = count
+		&& c <= 0
+	{
+		return Err(Error::ValidationError("Ref has already been used".to_string()));
 	}
 
 	// Decrement counter only if count is not NULL (unlimited)

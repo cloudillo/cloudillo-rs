@@ -31,7 +31,7 @@ pub async fn process_computed_values(
 	path: &str,
 	data: &mut Value,
 ) -> ClResult<()> {
-	if let Value::Object(ref mut obj) = data {
+	if let Value::Object(obj) = data {
 		let mut replacements = Vec::new();
 
 		for (key, value) in obj.iter() {
@@ -171,56 +171,56 @@ fn process_function(fn_name: &str, params: &serde_json::Map<String, Value>) -> C
 			Ok(Value::Number(timestamp.into()))
 		}
 		"slugify" => {
-			if let Some(Value::Array(args)) = params.get("args") {
-				if let Some(Value::String(text)) = args.first() {
-					let slug = text
-						.to_lowercase()
-						.chars()
-						.map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
-						.collect::<String>()
-						.split('-')
-						.filter(|s| !s.is_empty())
-						.collect::<Vec<&str>>()
-						.join("-");
-					return Ok(Value::String(slug));
-				}
+			if let Some(Value::Array(args)) = params.get("args")
+				&& let Some(Value::String(text)) = args.first()
+			{
+				let slug = text
+					.to_lowercase()
+					.chars()
+					.map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+					.collect::<String>()
+					.split('-')
+					.filter(|s| !s.is_empty())
+					.collect::<Vec<&str>>()
+					.join("-");
+				return Ok(Value::String(slug));
 			}
 			Err(Error::ValidationError("slugify requires string argument".into()))
 		}
 		"hash" => {
-			if let Some(Value::Array(args)) = params.get("args") {
-				if let Some(Value::String(text)) = args.first() {
-					use std::collections::hash_map::DefaultHasher;
-					use std::hash::{Hash, Hasher};
-					let mut hasher = DefaultHasher::new();
-					text.hash(&mut hasher);
-					let hash = hasher.finish();
-					return Ok(Value::String(format!("{:x}", hash)));
-				}
+			if let Some(Value::Array(args)) = params.get("args")
+				&& let Some(Value::String(text)) = args.first()
+			{
+				use std::collections::hash_map::DefaultHasher;
+				use std::hash::{Hash, Hasher};
+				let mut hasher = DefaultHasher::new();
+				text.hash(&mut hasher);
+				let hash = hasher.finish();
+				return Ok(Value::String(format!("{:x}", hash)));
 			}
 			Err(Error::ValidationError("hash requires string argument".into()))
 		}
 		"lowercase" => {
-			if let Some(Value::Array(args)) = params.get("args") {
-				if let Some(Value::String(text)) = args.first() {
-					return Ok(Value::String(text.to_lowercase()));
-				}
+			if let Some(Value::Array(args)) = params.get("args")
+				&& let Some(Value::String(text)) = args.first()
+			{
+				return Ok(Value::String(text.to_lowercase()));
 			}
 			Err(Error::ValidationError("lowercase requires string argument".into()))
 		}
 		"uppercase" => {
-			if let Some(Value::Array(args)) = params.get("args") {
-				if let Some(Value::String(text)) = args.first() {
-					return Ok(Value::String(text.to_uppercase()));
-				}
+			if let Some(Value::Array(args)) = params.get("args")
+				&& let Some(Value::String(text)) = args.first()
+			{
+				return Ok(Value::String(text.to_uppercase()));
 			}
 			Err(Error::ValidationError("uppercase requires string argument".into()))
 		}
 		"trim" => {
-			if let Some(Value::Array(args)) = params.get("args") {
-				if let Some(Value::String(text)) = args.first() {
-					return Ok(Value::String(text.trim().to_string()));
-				}
+			if let Some(Value::Array(args)) = params.get("args")
+				&& let Some(Value::String(text)) = args.first()
+			{
+				return Ok(Value::String(text.trim().to_string()));
 			}
 			Err(Error::ValidationError("trim requires string argument".into()))
 		}

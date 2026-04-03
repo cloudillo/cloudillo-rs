@@ -42,10 +42,10 @@ pub async fn duplicate_crdt_content(
 		{
 			let mut txn = src_doc.transact_mut();
 			for update in &updates {
-				if let Ok(decoded) = Update::decode_v1(&update.data) {
-					if let Err(e) = txn.apply_update(decoded) {
-						warn!("Failed to apply update during CRDT duplication: {}", e);
-					}
+				if let Ok(decoded) = Update::decode_v1(&update.data)
+					&& let Err(e) = txn.apply_update(decoded)
+				{
+					warn!("Failed to apply update during CRDT duplication: {}", e);
 				}
 			}
 		}

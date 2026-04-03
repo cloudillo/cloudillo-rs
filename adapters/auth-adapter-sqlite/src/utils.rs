@@ -21,11 +21,7 @@ pub(crate) fn parse_str_list(s: &str) -> Box<[Box<str>]> {
 pub(crate) fn parse_str_list_optional(s: Option<&str>) -> Option<Box<[Box<str>]>> {
 	s.and_then(|s| {
 		let s = s.trim();
-		if s.is_empty() {
-			None
-		} else {
-			Some(parse_str_list(s))
-		}
+		if s.is_empty() { None } else { Some(parse_str_list(s)) }
 	})
 }
 

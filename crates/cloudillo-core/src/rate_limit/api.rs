@@ -115,11 +115,7 @@ impl BanEntry {
 	pub fn remaining_duration(&self) -> Option<Duration> {
 		self.expires_at.map(|exp| {
 			let now = Instant::now();
-			if now >= exp {
-				Duration::ZERO
-			} else {
-				exp - now
-			}
+			if now >= exp { Duration::ZERO } else { exp - now }
 		})
 	}
 }

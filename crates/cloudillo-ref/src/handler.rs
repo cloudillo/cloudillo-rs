@@ -4,16 +4,16 @@
 //! Reference (Ref) REST endpoints for managing shareable tokens and authentication workflows
 
 use axum::{
+	Json,
 	extract::{Path, Query, State},
 	http::StatusCode,
-	Json,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 use cloudillo_core::extract::{OptionalAuth, OptionalRequestId};
 use cloudillo_types::meta_adapter::{CreateRefOptions, ListRefsOptions, RefData};
-use cloudillo_types::types::{serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse};
+use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt};
 use cloudillo_types::utils;
 
 /// Response structure for ref details (authenticated users get full data)
@@ -119,7 +119,7 @@ pub struct ListRefsQuery {
 }
 
 // Re-export service types for backward compatibility
-pub use crate::service::{create_ref_internal, CreateRefInternalParams};
+pub use crate::service::{CreateRefInternalParams, create_ref_internal};
 
 /// GET /api/refs - List refs for the current tenant
 #[axum::debug_handler]
@@ -194,11 +194,7 @@ pub async fn create_ref(
 		Some("comment" | "C") => Some('C'),
 		Some("read" | "R") | None => {
 			// Default to read if resource_id is present
-			if create_req.resource_id.is_some() {
-				Some('R')
-			} else {
-				None
-			}
+			if create_req.resource_id.is_some() { Some('R') } else { None }
 		}
 		Some(other) => {
 			return Err(Error::ValidationError(format!(
@@ -209,10 +205,10 @@ pub async fn create_ref(
 	};
 
 	// Validate params length
-	if let Some(ref p) = create_req.params {
-		if p.len() > 2048 {
-			return Err(Error::ValidationError("params too long (max 2048 bytes)".into()));
-		}
+	if let Some(ref p) = create_req.params
+		&& p.len() > 2048
+	{
+		return Err(Error::ValidationError("params too long (max 2048 bytes)".into()));
 	}
 
 	// Validate share.file type requires resource_id

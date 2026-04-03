@@ -5,11 +5,11 @@
 //!
 //! Handles SMTP connection and email delivery with settings integration.
 
-use crate::prelude::*;
 use crate::EmailMessage;
+use crate::prelude::*;
 use cloudillo_core::settings::service::SettingsService;
-use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::SmtpTransport;
+use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, Transport};
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,7 +135,7 @@ impl EmailSender {
 				return Err(Error::ConfigError(format!(
 					"Invalid TLS mode: {}. Must be 'none', 'starttls', or 'tls'",
 					tls_mode
-				)))
+				)));
 			}
 		};
 

@@ -4,7 +4,7 @@
 //! Profile image/media handlers
 
 use async_trait::async_trait;
-use axum::{body::Bytes, extract::State, http::StatusCode, Json};
+use axum::{Json, body::Bytes, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;

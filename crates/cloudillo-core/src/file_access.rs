@@ -129,10 +129,10 @@ pub async fn get_access_level_with_scope(
 
 					// Document tree check: scope is for a root, this file is a child
 					// Depth-1 invariant: root_id always points directly to a top-level file
-					if let Some(root) = root_id {
-						if scope_file_id.as_str() == root {
-							return *access;
-						}
+					if let Some(root) = root_id
+						&& scope_file_id.as_str() == root
+					{
+						return *access;
 					}
 
 					// Cross-document link: file-type share entry ('F')
@@ -218,16 +218,17 @@ pub async fn check_file_access_with_scope(
 	}
 
 	// Cap access by file-to-file share entry when opened via embedding
-	if let Some(via_file_id) = via {
-		if scope.is_none() && access_level != AccessLevel::None {
-			match app.meta_adapter.check_share_access(tn_id, 'F', via_file_id, 'F', file_id).await {
-				Ok(Some(perm)) => {
-					access_level = access_level.min(AccessLevel::from_perm_char(perm));
-				}
-				Ok(None) | Err(_) => {
-					// No file-to-file share entry — embedding doesn't exist, deny
-					access_level = AccessLevel::None;
-				}
+	if let Some(via_file_id) = via
+		&& scope.is_none()
+		&& access_level != AccessLevel::None
+	{
+		match app.meta_adapter.check_share_access(tn_id, 'F', via_file_id, 'F', file_id).await {
+			Ok(Some(perm)) => {
+				access_level = access_level.min(AccessLevel::from_perm_char(perm));
+			}
+			Ok(None) | Err(_) => {
+				// No file-to-file share entry — embedding doesn't exist, deny
+				access_level = AccessLevel::None;
 			}
 		}
 	}
@@ -271,10 +272,10 @@ pub fn check_scope_allows_file(
 				return ScopeCheck::Allowed(*access);
 			}
 			// Document tree check: scope is for a root, this file is a child
-			if let Some(root) = root_id {
-				if scope_file_id.as_str() == root {
-					return ScopeCheck::Allowed(*access);
-				}
+			if let Some(root) = root_id
+				&& scope_file_id.as_str() == root
+			{
+				return ScopeCheck::Allowed(*access);
 			}
 			ScopeCheck::Denied
 		}

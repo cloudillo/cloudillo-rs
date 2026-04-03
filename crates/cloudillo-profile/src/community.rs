@@ -4,15 +4,15 @@
 //! Community profile creation handler
 
 use axum::{
+	Json,
 	extract::{Path, State},
 	http::StatusCode,
-	Json,
 };
 
 use crate::prelude::*;
 use cloudillo_core::{
-	bootstrap_types::CreateCompleteTenantOptions, extract::Auth, CreateActionFn,
-	CreateCompleteTenantFn,
+	CreateActionFn, CreateCompleteTenantFn, bootstrap_types::CreateCompleteTenantOptions,
+	extract::Auth,
 };
 use cloudillo_idp::registration::{IdpRegContent, IdpRegResponse};
 use cloudillo_types::{
@@ -322,10 +322,10 @@ pub async fn put_community_profile(
 	);
 
 	// 10. Consume the invite ref (if used)
-	if let Some(ref_code) = invite_ref {
-		if let Err(e) = app.meta_adapter.use_ref(ref_code, &["profile.invite"]).await {
-			warn!(error = %e, "Failed to consume invite ref after community creation");
-		}
+	if let Some(ref_code) = invite_ref
+		&& let Err(e) = app.meta_adapter.use_ref(ref_code, &["profile.invite"]).await
+	{
+		warn!(error = %e, "Failed to consume invite ref after community creation");
 	}
 
 	// 11. Return response

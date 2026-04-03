@@ -6,7 +6,9 @@ fn main() {
 		.unwrap_or_default()
 		.contains("-DSQLITE_MAX_ATTACHED=125")
 	{
-		println!("cargo:warning=LIBSQLITE3_FLAGS does not contain -DSQLITE_MAX_ATTACHED=125. Multi-tenant features may fail.");
+		println!(
+			"cargo:warning=LIBSQLITE3_FLAGS does not contain -DSQLITE_MAX_ATTACHED=125. Multi-tenant features may fail."
+		);
 	}
 }
 

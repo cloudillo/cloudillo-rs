@@ -176,10 +176,10 @@ pub fn can_view_item(ctx: &ViewCheckContext<'_>) -> bool {
 	}
 
 	// For Direct visibility, also check explicit audience
-	if visibility == VisibilityLevel::Direct {
-		if let Some(tags) = ctx.audience_tags {
-			return tags.contains(&ctx.subject_id_tag);
-		}
+	if visibility == VisibilityLevel::Direct
+		&& let Some(tags) = ctx.audience_tags
+	{
+		return tags.contains(&ctx.subject_id_tag);
 	}
 
 	false
@@ -247,10 +247,10 @@ impl Condition {
 			"subject.tn_id" => self.compare_value(&subject.tn_id.0.to_string()),
 			"subject.roles" | "role.admin" | "role.moderator" | "role.member" => {
 				// Special handling for role checks
-				if let Operator::HasRole = self.operator {
-					if let Some(role) = self.value.as_str() {
-						return subject.roles.iter().any(|r| r.as_ref() == role);
-					}
+				if let Operator::HasRole = self.operator
+					&& let Some(role) = self.value.as_str()
+				{
+					return subject.roles.iter().any(|r| r.as_ref() == role);
 				}
 				// For dotted notation like "role.admin"
 				if self.attribute.starts_with("role.") {
@@ -330,11 +330,7 @@ impl PolicyRule {
 			.iter()
 			.all(|cond| cond.evaluate(subject, action, object, environment));
 
-		if all_match {
-			Some(self.effect)
-		} else {
-			None
-		}
+		if all_match { Some(self.effect) } else { None }
 	}
 }
 
@@ -475,18 +471,18 @@ impl PermissionChecker {
 
 		// Ownership check for modify operations
 		if matches!(operation, "update" | "delete" | "write") {
-			if let Some(owner) = object.get("owner_id_tag") {
-				if owner == subject.id_tag.as_ref() {
-					debug!(subject = %subject.id_tag, action = action, owner = owner, "Owner access allowed for modify operation");
-					return true;
-				}
+			if let Some(owner) = object.get("owner_id_tag")
+				&& owner == subject.id_tag.as_ref()
+			{
+				debug!(subject = %subject.id_tag, action = action, owner = owner, "Owner access allowed for modify operation");
+				return true;
 			}
 			// Check pre-computed access level (community roles, FSHR shares, scoped tokens)
-			if let Some(al) = object.get("access_level") {
-				if al == "write" {
-					debug!(subject = %subject.id_tag, action = action, "Write access level allows modify operation");
-					return true;
-				}
+			if let Some(al) = object.get("access_level")
+				&& al == "write"
+			{
+				debug!(subject = %subject.id_tag, action = action, "Write access level allows modify operation");
+				return true;
 			}
 			debug!(subject = %subject.id_tag, action = action, "Denied: not owner and no write access level");
 			return false;
@@ -495,10 +491,10 @@ impl PermissionChecker {
 		// Visibility check for read operations
 		if matches!(operation, "read") {
 			// Check explicit access grants (e.g., FSHR file shares, scoped tokens)
-			if let Some(al) = object.get("access_level") {
-				if matches!(al, "read" | "comment" | "write") {
-					return true;
-				}
+			if let Some(al) = object.get("access_level")
+				&& matches!(al, "read" | "comment" | "write")
+			{
+				return true;
 			}
 			return self.check_visibility(subject, object);
 		}

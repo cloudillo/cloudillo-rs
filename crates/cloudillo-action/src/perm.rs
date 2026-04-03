@@ -30,16 +30,8 @@ use crate::prelude::*;
 /// A cloneable middleware function with return type `PermissionCheckOutput`
 pub fn check_perm_action(
 	action: &'static str,
-) -> impl Fn(
-	State<App>,
-	TnId,
-	IdTag,
-	OptionalAuth,
-	Path<String>,
-	Request,
-	Next,
-) -> PermissionCheckOutput
-       + Clone {
+) -> impl Fn(State<App>, TnId, IdTag, OptionalAuth, Path<String>, Request, Next) -> PermissionCheckOutput
++ Clone {
 	move |state, tn_id, id_tag, auth, path, req, next| {
 		Box::pin(check_action_permission(state, tn_id, id_tag, auth, path, req, next, action))
 	}

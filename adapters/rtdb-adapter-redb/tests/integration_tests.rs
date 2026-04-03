@@ -8,7 +8,7 @@ use cloudillo_types::rtdb_adapter::{
 	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, RtdbAdapter,
 };
 use cloudillo_types::types::TnId;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use tempfile::TempDir;
 

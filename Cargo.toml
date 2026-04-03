@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
 	"server",
 	"crates/cloudillo",
@@ -26,7 +26,8 @@ members = [
 
 [workspace.package]
 version = "0.8.12"
-edition = "2021"
+edition = "2024"
+rust-version = "1.89"
 license = "LGPL-3.0-only"
 repository = "https://github.com/cloudillo/cloudillo-rs"
 homepage = "https://cloudillo.org"

@@ -124,10 +124,10 @@ pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
 
 	// Not-in-array checks (field value must NOT be in the provided array; missing fields pass)
 	for (field, excluded_values) in &filter.not_in_array {
-		if let Some(actual) = doc.get(field) {
-			if excluded_values.contains(actual) {
-				return false;
-			}
+		if let Some(actual) = doc.get(field)
+			&& excluded_values.contains(actual)
+		{
+			return false;
 		}
 	}
 
@@ -210,7 +210,7 @@ pub fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
 /// Documents are stored without an `id` field (the key is the source of truth),
 /// so this must be called at read time to ensure the `id` is present.
 pub fn inject_doc_id(doc: &mut Value, doc_id: &str) {
-	if let Value::Object(ref mut obj) = doc {
+	if let Value::Object(obj) = doc {
 		obj.entry("id").or_insert_with(|| Value::String(doc_id.to_string()));
 	}
 }

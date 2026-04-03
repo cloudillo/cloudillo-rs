@@ -62,7 +62,7 @@ impl WorkerPool {
 		&self,
 		priority: Priority,
 		f: F,
-	) -> impl std::future::Future<Output = ClResult<T>>
+	) -> impl std::future::Future<Output = ClResult<T>> + use<F, T>
 	where
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
@@ -100,7 +100,7 @@ impl WorkerPool {
 		}
 	}
 
-	pub fn run<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
+	pub fn run<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>> + use<F, T>
 	where
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
@@ -125,7 +125,10 @@ impl WorkerPool {
 		}
 	}
 
-	pub fn run_immed<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
+	pub fn run_immed<F, T>(
+		&self,
+		f: F,
+	) -> impl std::future::Future<Output = ClResult<T>> + use<F, T>
 	where
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
@@ -149,7 +152,7 @@ impl WorkerPool {
 		}
 	}
 
-	pub fn run_slow<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
+	pub fn run_slow<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>> + use<F, T>
 	where
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
@@ -176,7 +179,7 @@ impl WorkerPool {
 
 	/// Like `run`, but flattens `ClResult<ClResult<T>>` into `ClResult<T>`.
 	/// Use when the closure itself returns `ClResult<T>`.
-	pub fn try_run<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
+	pub fn try_run<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>> + use<F, T>
 	where
 		F: FnOnce() -> ClResult<T> + Send + 'static,
 		T: Send + 'static,
@@ -187,7 +190,10 @@ impl WorkerPool {
 
 	/// Like `run_immed`, but flattens `ClResult<ClResult<T>>` into `ClResult<T>`.
 	/// Use when the closure itself returns `ClResult<T>`.
-	pub fn try_run_immed<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
+	pub fn try_run_immed<F, T>(
+		&self,
+		f: F,
+	) -> impl std::future::Future<Output = ClResult<T>> + use<F, T>
 	where
 		F: FnOnce() -> ClResult<T> + Send + 'static,
 		T: Send + 'static,
@@ -198,7 +204,10 @@ impl WorkerPool {
 
 	/// Like `run_slow`, but flattens `ClResult<ClResult<T>>` into `ClResult<T>`.
 	/// Use when the closure itself returns `ClResult<T>`.
-	pub fn try_run_slow<F, T>(&self, f: F) -> impl std::future::Future<Output = ClResult<T>>
+	pub fn try_run_slow<F, T>(
+		&self,
+		f: F,
+	) -> impl std::future::Future<Output = ClResult<T>> + use<F, T>
 	where
 		F: FnOnce() -> ClResult<T> + Send + 'static,
 		T: Send + 'static,
@@ -221,6 +230,7 @@ fn worker_loop(queues: &[JobQueue]) {
 			}
 		}
 
+		#[allow(clippy::collapsible_if)]
 		if let Some(job) = job {
 			if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
 				error!("Worker thread caught panic: {:?}", e);
@@ -235,10 +245,10 @@ fn worker_loop(queues: &[JobQueue]) {
 		}
 
 		let job: Result<Box<dyn FnOnce() + Send>, flume::RecvError> = selector.wait();
-		if let Ok(job) = job {
-			if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
-				error!("Worker thread caught panic: {:?}", e);
-			}
+		if let Ok(job) = job
+			&& let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+		{
+			error!("Worker thread caught panic: {:?}", e);
 		}
 	}
 }

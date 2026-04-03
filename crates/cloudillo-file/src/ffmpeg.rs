@@ -306,10 +306,10 @@ impl FFmpeg {
 			Ok(out) if out.status.success() => {
 				// Try to parse the actual frame time
 				let stdout = String::from_utf8_lossy(&out.stdout);
-				if let Some(first_line) = stdout.lines().next() {
-					if let Ok(time) = first_line.trim().parse::<f64>() {
-						return Ok(time);
-					}
+				if let Some(first_line) = stdout.lines().next()
+					&& let Ok(time) = first_line.trim().parse::<f64>()
+				{
+					return Ok(time);
 				}
 				Ok(seek_time)
 			}

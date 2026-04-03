@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-use crate::{storage, InstanceKey};
+use crate::{InstanceKey, storage};
 use cloudillo_types::prelude::*;
 use cloudillo_types::rtdb_adapter::{ChangeEvent, LockInfo};
 use redb::{ReadableDatabase, ReadableTable};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 type IndexedFieldsMap = HashMap<Box<str>, Vec<Box<str>>>;

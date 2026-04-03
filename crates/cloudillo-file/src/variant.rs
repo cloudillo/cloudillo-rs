@@ -284,11 +284,7 @@ impl FromStr for Variant {
 /// Parse quality tier from variant name or quality string.
 /// Handles both "hd" (quality only) and "vis.hd" (class.quality) formats.
 pub fn parse_quality(s: &str) -> Option<VariantQuality> {
-	if let Some(v) = Variant::parse(s) {
-		Some(v.quality)
-	} else {
-		VariantQuality::from_str_opt(s)
-	}
+	if let Some(v) = Variant::parse(s) { Some(v.quality) } else { VariantQuality::from_str_opt(s) }
 }
 
 /// Get the fallback chain for a given variant (within the same class)

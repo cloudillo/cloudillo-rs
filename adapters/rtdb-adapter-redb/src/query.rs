@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 use crate::error::from_redb_error;
-use crate::{storage, DatabaseInstance};
+use crate::{DatabaseInstance, storage};
 use cloudillo_types::error::ClResult;
 use cloudillo_types::rtdb_adapter::{
 	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, SortField,
@@ -82,22 +82,22 @@ pub fn execute_query(
 		storage::inject_doc_id(&mut doc, remainder);
 
 		// Apply filter
-		if let Some(ref filter) = opts.filter {
-			if !storage::matches_filter(&doc, filter) {
-				continue;
-			}
+		if let Some(ref filter) = opts.filter
+			&& !storage::matches_filter(&doc, filter)
+		{
+			continue;
 		}
 
 		results.push(doc);
 
 		// Early exit if we have enough (only when not sorting, since unseen
 		// docs may sort ahead of what we already have)
-		if let Some(limit) = opts.limit {
-			if opts.sort.is_none() {
-				let needed = opts.offset.unwrap_or(0) as usize + limit as usize;
-				if results.len() >= needed {
-					break;
-				}
+		if let Some(limit) = opts.limit
+			&& opts.sort.is_none()
+		{
+			let needed = opts.offset.unwrap_or(0) as usize + limit as usize;
+			if results.len() >= needed {
+				break;
 			}
 		}
 	}
@@ -412,10 +412,10 @@ impl GroupAccumulator {
 					let key = format!("avg_{}", field);
 					let sum = self.avg_sum.get(field).copied().unwrap_or(0.0);
 					let count = self.avg_count.get(field).copied().unwrap_or(0);
-					if count > 0 {
-						if let Some(n) = serde_json::Number::from_f64(sum / u64_to_f64(count)) {
-							obj.insert(key, Value::Number(n));
-						}
+					if count > 0
+						&& let Some(n) = serde_json::Number::from_f64(sum / u64_to_f64(count))
+					{
+						obj.insert(key, Value::Number(n));
 					}
 				}
 				AggregateOp::Min { field } => {
@@ -575,10 +575,10 @@ fn execute_aggregate_scan(
 		storage::inject_doc_id(&mut doc, remainder);
 
 		// Apply filter
-		if let Some(ref filter) = opts.filter {
-			if !storage::matches_filter(&doc, filter) {
-				continue;
-			}
+		if let Some(ref filter) = opts.filter
+			&& !storage::matches_filter(&doc, filter)
+		{
+			continue;
 		}
 
 		// Extract group_by field value

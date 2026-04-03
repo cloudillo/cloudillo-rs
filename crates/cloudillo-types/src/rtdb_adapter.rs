@@ -271,10 +271,10 @@ impl QueryFilter {
 
 		// Not-in-array checks (field value must NOT be in the provided array; missing fields pass)
 		for (field, excluded_values) in &self.not_in_array {
-			if let Some(actual) = doc.get(field) {
-				if excluded_values.contains(actual) {
-					return false;
-				}
+			if let Some(actual) = doc.get(field)
+				&& excluded_values.contains(actual)
+			{
+				return false;
 			}
 		}
 
@@ -633,7 +633,7 @@ pub trait RtdbAdapter: Debug + Send + Sync {
 
 	/// Create an index on a field to improve query performance.
 	async fn create_index(&self, tn_id: TnId, db_id: &str, path: &str, field: &str)
-		-> ClResult<()>;
+	-> ClResult<()>;
 
 	/// Get database statistics (size, record count, table count).
 	async fn stats(&self, tn_id: TnId, db_id: &str) -> ClResult<DbStats>;

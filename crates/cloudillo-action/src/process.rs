@@ -87,14 +87,13 @@ pub async fn verify_action_token(
 					}
 					Err(e) => {
 						// Signature verification failed - penalize
-						if let Some(ip) = client_ip {
-							if let Err(pen_err) = app.rate_limiter.penalize(
+						if let Some(ip) = client_ip
+							&& let Err(pen_err) = app.rate_limiter.penalize(
 								ip,
 								PenaltyReason::TokenVerificationFailure,
 								1,
 							) {
-								warn!("Failed to record token penalty for {}: {}", ip, pen_err);
-							}
+							warn!("Failed to record token penalty for {}: {}", ip, pen_err);
 						}
 						warn!("  signature verification failed (cached key): {}", e);
 						return Err(e);
@@ -149,14 +148,13 @@ pub async fn verify_action_token(
 					}
 					Err(e) => {
 						// Signature verification failed - penalize
-						if let Some(ip) = client_ip {
-							if let Err(pen_err) = app.rate_limiter.penalize(
+						if let Some(ip) = client_ip
+							&& let Err(pen_err) = app.rate_limiter.penalize(
 								ip,
 								PenaltyReason::TokenVerificationFailure,
 								1,
 							) {
-								warn!("Failed to record token penalty for {}: {}", ip, pen_err);
-							}
+							warn!("Failed to record token penalty for {}: {}", ip, pen_err);
 						}
 						warn!("  signature verification failed: {}", e);
 						Err(e)
@@ -325,11 +323,8 @@ async fn process_inbound_action_token_inner(
 	.await;
 
 	// 7. Process attachments (async only)
-	if !is_sync {
-		if let Some(ref attachments) = action.a {
-			process_inbound_action_attachments(app, tn_id, &action.iss, attachments.clone())
-				.await?;
-		}
+	if !is_sync && let Some(ref attachments) = action.a {
+		process_inbound_action_attachments(app, tn_id, &action.iss, attachments.clone()).await?;
 	}
 
 	// 8. Unified post-store processing (hooks, WebSocket, fanout, auto-approve)
@@ -392,14 +387,11 @@ fn verify_pow_if_conn(
 		return Ok(());
 	}
 
-	if let Some(ip) = client_ip {
-		if let Err(pow_err) = app.rate_limiter.verify_pow(ip, token) {
-			debug!("CONN action from {} requires PoW: {:?}", issuer, pow_err);
-			return Err(Error::PreconditionRequired(format!(
-				"Proof of work required: {}",
-				pow_err
-			)));
-		}
+	if let Some(ip) = client_ip
+		&& let Err(pow_err) = app.rate_limiter.verify_pow(ip, token)
+	{
+		debug!("CONN action from {} requires PoW: {:?}", issuer, pow_err);
+		return Err(Error::PreconditionRequired(format!("Proof of work required: {}", pow_err)));
 	}
 	Ok(())
 }
@@ -415,15 +407,13 @@ async fn verify_and_handle_failure(
 	match verify_action_token(app, tn_id, token, client_ip).await {
 		Ok(action) => Ok(action),
 		Err(e) => {
-			if is_conn_action {
-				if let Some(ip) = client_ip {
-					if let Err(pen_err) = app
-						.rate_limiter
-						.increment_pow_counter(ip, PowPenaltyReason::ConnSignatureFailure)
-					{
-						warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
-					}
-				}
+			if is_conn_action
+				&& let Some(ip) = client_ip
+				&& let Err(pen_err) = app
+					.rate_limiter
+					.increment_pow_counter(ip, PowPenaltyReason::ConnSignatureFailure)
+			{
+				warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
 			}
 			Err(e)
 		}
@@ -621,48 +611,44 @@ async fn check_inbound_flags(
 	}
 
 	// Check parent flag gating
-	if let Some(flag) = definition.behavior.gated_by_parent_flag {
-		if let Some(ref parent_id) = action.p {
-			if let Ok(Some(parent)) = app.meta_adapter.get_action(tn_id, parent_id).await {
-				if !helpers::is_capability_enabled(parent.flags.as_deref(), flag) {
-					warn!(
-						issuer = %action.iss,
-						parent_id = %parent_id,
-						flag = %flag,
-						"Rejecting inbound {}: capability disabled on parent",
-						action.t
-					);
-					return Err(Error::ValidationError(format!(
-						"{} is disabled on the parent action",
-						action.t
-					)));
-				}
-			}
-			// Parent not found locally — allow through (sender should have validated)
-		}
+	if let Some(flag) = definition.behavior.gated_by_parent_flag
+		&& let Some(ref parent_id) = action.p
+		&& let Ok(Some(parent)) = app.meta_adapter.get_action(tn_id, parent_id).await
+		&& !helpers::is_capability_enabled(parent.flags.as_deref(), flag)
+	{
+		warn!(
+			issuer = %action.iss,
+			parent_id = %parent_id,
+			flag = %flag,
+			"Rejecting inbound {}: capability disabled on parent",
+			action.t
+		);
+		return Err(Error::ValidationError(format!(
+			"{} is disabled on the parent action",
+			action.t
+		)));
 	}
+	// Parent not found locally — allow through (sender should have validated)
 
 	// Check subject flag gating
-	if let Some(flag) = definition.behavior.gated_by_subject_flag {
-		if let Some(ref subject_id) = action.sub {
-			if let Ok(Some(subject)) = app.meta_adapter.get_action(tn_id, subject_id).await {
-				if !helpers::is_capability_enabled(subject.flags.as_deref(), flag) {
-					warn!(
-						issuer = %action.iss,
-						subject_id = %subject_id,
-						flag = %flag,
-						"Rejecting inbound {}: capability disabled on subject",
-						action.t
-					);
-					return Err(Error::ValidationError(format!(
-						"{} is disabled on the subject action",
-						action.t
-					)));
-				}
-			}
-			// Subject not found locally — allow through (sender should have validated)
-		}
+	if let Some(flag) = definition.behavior.gated_by_subject_flag
+		&& let Some(ref subject_id) = action.sub
+		&& let Ok(Some(subject)) = app.meta_adapter.get_action(tn_id, subject_id).await
+		&& !helpers::is_capability_enabled(subject.flags.as_deref(), flag)
+	{
+		warn!(
+			issuer = %action.iss,
+			subject_id = %subject_id,
+			flag = %flag,
+			"Rejecting inbound {}: capability disabled on subject",
+			action.t
+		);
+		return Err(Error::ValidationError(format!(
+			"{} is disabled on the subject action",
+			action.t
+		)));
 	}
+	// Subject not found locally — allow through (sender should have validated)
 
 	Ok(())
 }
@@ -736,16 +722,16 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) {
 			}
 		}
 		Err(e) => {
-			if ctx.is_conn_action {
-				if let Some(ip) = ctx.client_ip {
-					if let Err(pen_err) = app
-						.rate_limiter
-						.increment_pow_counter(ip, PowPenaltyReason::ConnDuplicatePending)
-					{
-						warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
-					}
-					debug!("CONN duplicate detected from {} - PoW counter incremented", action.iss);
+			if ctx.is_conn_action
+				&& let Some(ip) = ctx.client_ip
+			{
+				if let Err(pen_err) = app
+					.rate_limiter
+					.increment_pow_counter(ip, PowPenaltyReason::ConnDuplicatePending)
+				{
+					warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
 				}
+				debug!("CONN duplicate detected from {} - PoW counter incremented", action.iss);
 			}
 			debug!("  failed to store inbound action: {} (may be duplicate)", e);
 		}
@@ -872,7 +858,7 @@ async fn send_push_notification(
 	subtype: Option<&str>,
 ) {
 	use crate::forward::{get_push_setting_key, should_push_notify};
-	use cloudillo_push::{send_to_tenant, NotificationPayload};
+	use cloudillo_push::{NotificationPayload, send_to_tenant};
 
 	// Check if this action type should trigger push notifications
 	if !should_push_notify(action_type, subtype) {

@@ -8,9 +8,9 @@
 //! by comparing old vs new document data from change events.
 
 use cloudillo_types::rtdb_adapter::{
-	value_to_group_string, AggregateOp, AggregateOptions, ChangeEvent, QueryFilter,
+	AggregateOp, AggregateOptions, ChangeEvent, QueryFilter, value_to_group_string,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 /// Convert `u64` to `f64`, accepting minor precision loss for values above 2^53.
@@ -161,10 +161,10 @@ impl IncrementalAggState {
 
 	/// Feed a document during initial load (from Create events before Ready).
 	pub fn add_doc(&mut self, data: &Value) {
-		if let Some(ref f) = self.filter {
-			if !f.matches(data) {
-				return;
-			}
+		if let Some(ref f) = self.filter
+			&& !f.matches(data)
+		{
+			return;
 		}
 
 		let group_keys = extract_group_keys(data, &self.aggregate.group_by);
@@ -211,10 +211,10 @@ impl IncrementalAggState {
 	}
 
 	fn handle_create(&mut self, data: &Value) -> Option<Vec<Value>> {
-		if let Some(ref f) = self.filter {
-			if !f.matches(data) {
-				return None;
-			}
+		if let Some(ref f) = self.filter
+			&& !f.matches(data)
+		{
+			return None;
 		}
 
 		let group_keys = extract_group_keys(data, &self.aggregate.group_by);
@@ -260,20 +260,22 @@ impl IncrementalAggState {
 		};
 
 		// Early exit: if same groups and same op field values, no aggregate change
-		if old_match && new_match && old_groups == new_groups {
-			if let Some(od) = old_data {
-				let op_fields_changed = self.aggregate.ops.iter().any(|op| {
-					let field = match op {
-						AggregateOp::Sum { field }
-						| AggregateOp::Avg { field }
-						| AggregateOp::Min { field }
-						| AggregateOp::Max { field } => field,
-					};
-					data.get(field) != od.get(field)
-				});
-				if !op_fields_changed {
-					return None;
-				}
+		if old_match
+			&& new_match
+			&& old_groups == new_groups
+			&& let Some(od) = old_data
+		{
+			let op_fields_changed = self.aggregate.ops.iter().any(|op| {
+				let field = match op {
+					AggregateOp::Sum { field }
+					| AggregateOp::Avg { field }
+					| AggregateOp::Min { field }
+					| AggregateOp::Max { field } => field,
+				};
+				data.get(field) != od.get(field)
+			});
+			if !op_fields_changed {
+				return None;
 			}
 		}
 
@@ -318,20 +320,16 @@ impl IncrementalAggState {
 			}
 		}
 
-		if affected.is_empty() {
-			None
-		} else {
-			Some(affected)
-		}
+		if affected.is_empty() { None } else { Some(affected) }
 	}
 
 	fn handle_delete(&mut self, old_data: Option<&Value>) -> Option<Vec<Value>> {
 		let od = old_data?;
 
-		if let Some(ref f) = self.filter {
-			if !f.matches(od) {
-				return None;
-			}
+		if let Some(ref f) = self.filter
+			&& !f.matches(od)
+		{
+			return None;
 		}
 
 		let group_keys = extract_group_keys(od, &self.aggregate.group_by);

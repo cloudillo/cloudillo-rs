@@ -464,11 +464,11 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 	sqlx::query(
-			"CREATE TRIGGER IF NOT EXISTS subscriptions_insert_at AFTER INSERT ON subscriptions FOR EACH ROW \
+		"CREATE TRIGGER IF NOT EXISTS subscriptions_insert_at AFTER INSERT ON subscriptions FOR EACH ROW \
 			BEGIN UPDATE subscriptions SET updated_at = unixepoch() WHERE subs_id = NEW.subs_id; END",
-		)
-		.execute(&mut *tx)
-		.await?;
+	)
+	.execute(&mut *tx)
+	.await?;
 	sqlx::query(
 			"CREATE TRIGGER IF NOT EXISTS profiles_insert_at AFTER INSERT ON profiles FOR EACH ROW \
 			BEGIN UPDATE profiles SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND id_tag = NEW.id_tag; END",

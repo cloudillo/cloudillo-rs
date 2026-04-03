@@ -12,7 +12,7 @@
 
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use crate::task::{create_action, CreateAction};
+use crate::task::{CreateAction, create_action};
 
 /// CONV on_create hook - Auto-subscribe creator as admin
 ///

@@ -88,10 +88,10 @@ pub fn validate_definition(def: &ActionDefinition) -> Result<(), Vec<ValidationE
 	validate_field_constraints(&def.fields, &mut errors);
 
 	// Validate content schema
-	if let Some(schema_wrapper) = &def.schema {
-		if let Some(content_schema) = &schema_wrapper.content {
-			validate_content_schema(content_schema, &mut errors);
-		}
+	if let Some(schema_wrapper) = &def.schema
+		&& let Some(content_schema) = &schema_wrapper.content
+	{
+		validate_content_schema(content_schema, &mut errors);
 	}
 
 	// Validate hooks
@@ -102,11 +102,7 @@ pub fn validate_definition(def: &ActionDefinition) -> Result<(), Vec<ValidationE
 		validate_key_pattern(pattern, &mut errors);
 	}
 
-	if errors.is_empty() {
-		Ok(())
-	} else {
-		Err(errors)
-	}
+	if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
 fn validate_action_type(action_type: &str) -> Result<(), String> {
@@ -138,25 +134,24 @@ fn validate_field_constraints(_fields: &FieldConstraints, _errors: &mut Vec<Vali
 
 fn validate_content_schema(schema: &ContentSchema, errors: &mut Vec<ValidationError>) {
 	// Validate string constraints
-	if let Some(min) = schema.min_length {
-		if let Some(max) = schema.max_length {
-			if min > max {
-				errors.push(ValidationError::new(
-					format!("min_length ({}) > max_length ({})", min, max),
-					"schema.content.min_length",
-				));
-			}
-		}
+	if let Some(min) = schema.min_length
+		&& let Some(max) = schema.max_length
+		&& min > max
+	{
+		errors.push(ValidationError::new(
+			format!("min_length ({}) > max_length ({})", min, max),
+			"schema.content.min_length",
+		));
 	}
 
 	// Validate pattern if provided
-	if let Some(pattern) = &schema.pattern {
-		if let Err(e) = Regex::new(pattern) {
-			errors.push(ValidationError::new(
-				format!("Invalid regex pattern: {}", e),
-				"schema.content.pattern",
-			));
-		}
+	if let Some(pattern) = &schema.pattern
+		&& let Err(e) = Regex::new(pattern)
+	{
+		errors.push(ValidationError::new(
+			format!("Invalid regex pattern: {}", e),
+			"schema.content.pattern",
+		));
 	}
 
 	// Validate object properties
@@ -173,15 +168,14 @@ fn validate_content_schema(schema: &ContentSchema, errors: &mut Vec<ValidationEr
 
 fn validate_schema_field(field: &SchemaField, path: &str, errors: &mut Vec<ValidationError>) {
 	// Validate constraints
-	if let Some(min) = field.min_length {
-		if let Some(max) = field.max_length {
-			if min > max {
-				errors.push(ValidationError::new(
-					format!("min_length ({}) > max_length ({})", min, max),
-					format!("{}.min_length", path),
-				));
-			}
-		}
+	if let Some(min) = field.min_length
+		&& let Some(max) = field.max_length
+		&& min > max
+	{
+		errors.push(ValidationError::new(
+			format!("min_length ({}) > max_length ({})", min, max),
+			format!("{}.min_length", path),
+		));
 	}
 
 	// Validate array items

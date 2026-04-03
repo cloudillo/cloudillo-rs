@@ -10,8 +10,8 @@
 //! - Language-specific template variants
 
 use crate::prelude::*;
-use cloudillo_core::settings::service::SettingsService;
 use cloudillo_core::settings::SettingValue;
+use cloudillo_core::settings::service::SettingsService;
 use handlebars::Handlebars;
 use serde::Deserialize;
 use std::sync::Arc;

@@ -8,17 +8,17 @@
 //! Creating user shares ('U') also generates FSHR actions for federation.
 
 use axum::{
+	Json,
 	extract::{Path, Query, State},
 	http::StatusCode,
-	Json,
 };
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::prelude::*;
+use cloudillo_core::CreateActionFn;
 use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
 use cloudillo_core::file_access::{self, FileAccessCtx, FileAccessResult};
-use cloudillo_core::CreateActionFn;
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::meta_adapter::{CreateShareEntry, ShareEntry};
@@ -96,20 +96,20 @@ pub async fn create_share(
 	}
 
 	// For file subjects, validate and strip tenant prefix (e.g. "host:fileId" → "fileId")
-	if input.subject_type == 'F' {
-		if let Some((prefix, bare_id)) = input.subject_id.split_once(':') {
-			if prefix != &*tenant_id_tag {
-				return Err(Error::ValidationError(
-					"cross-tenant file references are not supported".into(),
-				));
-			}
-			if bare_id.contains(':') {
-				return Err(Error::ValidationError(
-					"invalid subject_id format: unexpected extra colon".into(),
-				));
-			}
-			input.subject_id = bare_id.to_string();
+	if input.subject_type == 'F'
+		&& let Some((prefix, bare_id)) = input.subject_id.split_once(':')
+	{
+		if prefix != &*tenant_id_tag {
+			return Err(Error::ValidationError(
+				"cross-tenant file references are not supported".into(),
+			));
 		}
+		if bare_id.contains(':') {
+			return Err(Error::ValidationError(
+				"invalid subject_id format: unexpected extra colon".into(),
+			));
+		}
+		input.subject_id = bare_id.to_string();
 	}
 
 	let file_access = require_write_access(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
@@ -145,13 +145,13 @@ pub async fn create_share(
 			..Default::default()
 		};
 
-		if let Ok(create_action_fn) = app.ext::<CreateActionFn>() {
-			if let Err(e) = create_action_fn(&app, auth.tn_id, &auth.id_tag, action).await {
-				warn!(
-					"Failed to create FSHR action for share {}->{}: {}",
-					file_id, input.subject_id, e
-				);
-			}
+		if let Ok(create_action_fn) = app.ext::<CreateActionFn>()
+			&& let Err(e) = create_action_fn(&app, auth.tn_id, &auth.id_tag, action).await
+		{
+			warn!(
+				"Failed to create FSHR action for share {}->{}: {}",
+				file_id, input.subject_id, e
+			);
 		}
 	}
 
@@ -186,29 +186,29 @@ pub async fn delete_share(
 	app.meta_adapter.delete_share_entry(tn_id, share_id).await?;
 
 	// For user shares, also create FSHR DEL action (best-effort)
-	if let Some(entry) = maybe_entry {
-		if entry.subject_type == 'U' {
-			let action = CreateAction {
-				typ: "FSHR".into(),
-				sub_typ: Some("DEL".into()),
-				audience_tag: Some(entry.subject_id.clone()),
-				subject: Some(entry.resource_id.clone()),
-				content: Some(json!({
-					"contentType": "",
-					"fileName": "",
-					"fileTp": "BLOB",
-				})),
-				..Default::default()
-			};
+	if let Some(entry) = maybe_entry
+		&& entry.subject_type == 'U'
+	{
+		let action = CreateAction {
+			typ: "FSHR".into(),
+			sub_typ: Some("DEL".into()),
+			audience_tag: Some(entry.subject_id.clone()),
+			subject: Some(entry.resource_id.clone()),
+			content: Some(json!({
+				"contentType": "",
+				"fileName": "",
+				"fileTp": "BLOB",
+			})),
+			..Default::default()
+		};
 
-			if let Ok(create_action_fn) = app.ext::<CreateActionFn>() {
-				if let Err(e) = create_action_fn(&app, auth.tn_id, &auth.id_tag, action).await {
-					warn!(
-						"Failed to create FSHR DEL action for share {}->{}: {}",
-						entry.resource_id, entry.subject_id, e
-					);
-				}
-			}
+		if let Ok(create_action_fn) = app.ext::<CreateActionFn>()
+			&& let Err(e) = create_action_fn(&app, auth.tn_id, &auth.id_tag, action).await
+		{
+			warn!(
+				"Failed to create FSHR DEL action for share {}->{}: {}",
+				entry.resource_id, entry.subject_id, e
+			);
 		}
 	}
 
@@ -257,7 +257,7 @@ pub async fn list_shares_by_subject(
 			Err(file_access::FileAccessError::NotFound) => return Err(Error::NotFound),
 			Err(file_access::FileAccessError::AccessDenied) => return Err(Error::PermissionDenied),
 			Err(file_access::FileAccessError::InternalError(msg)) => {
-				return Err(Error::Internal(msg))
+				return Err(Error::Internal(msg));
 			}
 			Ok(_) => {}
 		}

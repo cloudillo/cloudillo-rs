@@ -420,11 +420,10 @@ impl RtdbAdapter for RtdbAdapterRedb {
 							match &event {
 								ChangeEvent::Lock { .. } | ChangeEvent::Unlock { .. } => {}
 								_ => {
-									if let Some(data) = event.data() {
-										if !storage::matches_filter(data, filter) {
+									if let Some(data) = event.data()
+										&& !storage::matches_filter(data, filter) {
 											continue;
 										}
-									}
 								}
 							}
 						}
@@ -554,19 +553,19 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		let mut locks = instance.locks.write().await;
 
 		// Only release if locked by the same user
-		if let Some(existing) = locks.get(path) {
-			if existing.user_id.as_ref() == user_id {
-				locks.remove(path);
+		if let Some(existing) = locks.get(path)
+			&& existing.user_id.as_ref() == user_id
+		{
+			locks.remove(path);
 
-				// Broadcast unlock event
-				let _ = instance.change_tx.send(ChangeEvent::Unlock {
-					path: path.into(),
-					data: serde_json::json!({
-						"userId": user_id,
-						"connId": conn_id,
-					}),
-				});
-			}
+			// Broadcast unlock event
+			let _ = instance.change_tx.send(ChangeEvent::Unlock {
+				path: path.into(),
+				data: serde_json::json!({
+					"userId": user_id,
+					"connId": conn_id,
+				}),
+			});
 		}
 
 		Ok(())
@@ -578,12 +577,12 @@ impl RtdbAdapter for RtdbAdapterRedb {
 
 		let locks = instance.locks.read().await;
 
-		if let Some(lock) = locks.get(path) {
-			if now < lock.acquired_at.saturating_add(lock.ttl_secs) {
-				return Ok(Some(lock.clone()));
-			}
-			// Lock expired - will be cleaned up on next acquire
+		if let Some(lock) = locks.get(path)
+			&& now < lock.acquired_at.saturating_add(lock.ttl_secs)
+		{
+			return Ok(Some(lock.clone()));
 		}
+		// Lock expired - will be cleaned up on next acquire
 
 		Ok(None)
 	}

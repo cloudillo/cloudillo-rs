@@ -20,7 +20,7 @@ pub use api::{
 };
 pub use config::{PowConfig, RateLimitConfig, RateLimitTierConfig};
 pub use error::{PowError, RateLimitError};
-pub use extractors::{extract_client_ip, AddressKey};
+pub use extractors::{AddressKey, extract_client_ip};
 pub use limiter::RateLimitManager;
 pub use middleware::RateLimitLayer;
 

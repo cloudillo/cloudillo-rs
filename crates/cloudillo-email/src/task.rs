@@ -7,8 +7,8 @@
 //! Templates are rendered at execution time, not scheduling time.
 //! Retry logic is handled by the scheduler's built-in RetryPolicy.
 
-use crate::prelude::*;
 use crate::EmailMessage;
+use crate::prelude::*;
 use async_trait::async_trait;
 use cloudillo_core::scheduler::Task;
 use serde::{Deserialize, Serialize};

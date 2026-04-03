@@ -5,9 +5,9 @@ const TOKEN_EXPIRE: u64 = 8; /* hours */
 const BCRYPT_COST: u32 = 10;
 
 use p384::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-use p384::{elliptic_curve::rand_core::OsRng, SecretKey};
+use p384::{SecretKey, elliptic_curve::rand_core::OsRng};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use p256::SecretKey as P256SecretKey;
 
 use cloudillo_types::{
@@ -32,11 +32,7 @@ pub async fn generate_password_hash(
 
 fn check_password_sync(password: &str, password_hash: &str) -> ClResult<()> {
 	let res = bcrypt::verify(password, password_hash).map_err(|_| Error::PermissionDenied)?;
-	if res {
-		Ok(())
-	} else {
-		Err(Error::PermissionDenied)
-	}
+	if res { Ok(()) } else { Err(Error::PermissionDenied) }
 }
 
 pub async fn check_password(

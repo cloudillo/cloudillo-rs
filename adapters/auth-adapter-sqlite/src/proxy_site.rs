@@ -57,10 +57,10 @@ pub(crate) async fn create_proxy_site(
 	.execute(db)
 	.await
 	.map_err(|e| {
-		if let sqlx::Error::Database(ref db_err) = e {
-			if db_err.message().contains("UNIQUE") {
-				return Error::Conflict(format!("domain '{}' already exists", data.domain));
-			}
+		if let sqlx::Error::Database(ref db_err) = e
+			&& db_err.message().contains("UNIQUE")
+		{
+			return Error::Conflict(format!("domain '{}' already exists", data.domain));
 		}
 		inspect(&e);
 		Error::DbError

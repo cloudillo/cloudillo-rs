@@ -190,7 +190,9 @@ pub async fn bootstrap(app: Arc<AppState>, opts: &crate::app::AppBuilderOpts) ->
 		match id_tag {
 			Err(Error::NotFound) => {
 				// Base tenant doesn't exist, create it
-				info!("======================================\nBootstrapping...\n======================================");
+				info!(
+					"======================================\nBootstrapping...\n======================================"
+				);
 				let Some(base_password) = opts.base_password.clone() else {
 					return Err(Error::Internal(
 						"FATAL: No base password provided for bootstrap".to_string(),

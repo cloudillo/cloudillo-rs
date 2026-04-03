@@ -4,13 +4,13 @@
 //! API routes
 
 use axum::{
+	Router,
 	body::Body,
 	extract::State,
-	http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+	http::{HeaderMap, HeaderValue, Request, StatusCode, header},
 	middleware,
 	response::Response,
 	routing::{any, delete, get, patch, post, put},
-	Router,
 };
 use tower::Service;
 use tower_http::{
@@ -426,13 +426,13 @@ fn should_serve_spa_fallback(path: &str) -> bool {
 	// Never fallback for versioned asset directories (pattern: /assets-{version}/)
 	// The frontend uses versioned directories like /assets-0.8.6/
 	let trimmed = path.trim_start_matches('/');
-	if trimmed.starts_with("assets-") {
-		if let Some(slash_pos) = trimmed.find('/') {
-			// Has a slash after "assets-*", so it's a path into a versioned assets directory
-			if slash_pos > 7 {
-				// "assets-" is 7 chars, need at least one char for version
-				return false;
-			}
+	if trimmed.starts_with("assets-")
+		&& let Some(slash_pos) = trimmed.find('/')
+	{
+		// Has a slash after "assets-*", so it's a path into a versioned assets directory
+		if slash_pos > 7 {
+			// "assets-" is 7 chars, need at least one char for version
+			return false;
 		}
 	}
 

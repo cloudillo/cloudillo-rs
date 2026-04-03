@@ -4,16 +4,16 @@
 //! Admin tenant management handlers
 
 use axum::{
+	Json,
 	extract::{Path, Query, State},
 	http::StatusCode,
-	Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
 
-use cloudillo_email::{get_tenant_lang, EmailModule, EmailTaskParams};
-use cloudillo_ref::service::{create_ref_internal, CreateRefInternalParams};
+use cloudillo_email::{EmailModule, EmailTaskParams, get_tenant_lang};
+use cloudillo_ref::service::{CreateRefInternalParams, create_ref_internal};
 use cloudillo_types::auth_adapter::ListTenantsOptions;
 use cloudillo_types::meta_adapter::{ListTenantsMetaOptions, ProfileType};
 use cloudillo_types::types::ApiResponse;

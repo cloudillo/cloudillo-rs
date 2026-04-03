@@ -19,8 +19,8 @@ mod tenant;
 mod utils;
 use async_trait::async_trait;
 use sqlx::{
-	sqlite::{self, SqlitePool},
 	Row,
+	sqlite::{self, SqlitePool},
 };
 use tokio::fs;
 

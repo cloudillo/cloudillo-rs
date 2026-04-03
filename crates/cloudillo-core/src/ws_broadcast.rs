@@ -11,7 +11,7 @@ use cloudillo_types::utils::random_id;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 /// A message to send to a user
 #[derive(Clone, Debug)]
@@ -179,17 +179,17 @@ impl BroadcastManager {
 	) -> DeliveryResult {
 		let users = self.users.read().await;
 
-		if let Some(tenant_users) = users.get(&tn_id) {
-			if let Some(connections) = tenant_users.get(id_tag) {
-				let mut delivered = 0;
-				for conn in connections {
-					if conn.sender.send(msg.clone()).is_ok() {
-						delivered += 1;
-					}
+		if let Some(tenant_users) = users.get(&tn_id)
+			&& let Some(connections) = tenant_users.get(id_tag)
+		{
+			let mut delivered = 0;
+			for conn in connections {
+				if conn.sender.send(msg.clone()).is_ok() {
+					delivered += 1;
 				}
-				if delivered > 0 {
-					return DeliveryResult::Delivered(delivered);
-				}
+			}
+			if delivered > 0 {
+				return DeliveryResult::Delivered(delivered);
 			}
 		}
 

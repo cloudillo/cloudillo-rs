@@ -88,29 +88,28 @@ pub async fn resolve_audience<M: MetaAdapter + ?Sized>(
 
 	// 2. Subject-based resolution for non-hierarchical references
 	//    REACT, APRV, SUBS, INVT, FSHR, STAT, PRES use subject
-	if uses_subject_for_audience(action_type) {
-		if let Some(subject_id) = subject {
-			// Skip @reference placeholders - they're not resolved yet
-			if !subject_id.starts_with('@') {
-				if let Ok(Some(subject_action)) = meta_adapter.get_action(tn_id, subject_id).await {
-					return Ok(ResolvedAudience::from_subject(subject_action.issuer.id_tag));
-				}
-			}
+	if uses_subject_for_audience(action_type)
+		&& let Some(subject_id) = subject
+	{
+		// Skip @reference placeholders - they're not resolved yet
+		if !subject_id.starts_with('@')
+			&& let Ok(Some(subject_action)) = meta_adapter.get_action(tn_id, subject_id).await
+		{
+			return Ok(ResolvedAudience::from_subject(subject_action.issuer.id_tag));
 		}
 	}
 
 	// 3. Parent-based resolution for hierarchical references
 	//    CMNT, MSG (replies) use parent
-	if uses_parent_for_audience(action_type) {
-		if let Some(parent_id) = parent_id {
-			if let Ok(Some(parent_action)) = meta_adapter.get_action(tn_id, parent_id).await {
-				// Prefer parent's audience, fall back to parent's issuer
-				if let Some(audience) = parent_action.audience {
-					return Ok(ResolvedAudience::from_parent_audience(audience.id_tag));
-				}
-				return Ok(ResolvedAudience::from_parent_issuer(parent_action.issuer.id_tag));
-			}
+	if uses_parent_for_audience(action_type)
+		&& let Some(parent_id) = parent_id
+		&& let Ok(Some(parent_action)) = meta_adapter.get_action(tn_id, parent_id).await
+	{
+		// Prefer parent's audience, fall back to parent's issuer
+		if let Some(audience) = parent_action.audience {
+			return Ok(ResolvedAudience::from_parent_audience(audience.id_tag));
 		}
+		return Ok(ResolvedAudience::from_parent_issuer(parent_action.issuer.id_tag));
 	}
 
 	// 4. No audience resolution possible

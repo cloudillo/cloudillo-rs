@@ -13,7 +13,7 @@
 use crate::helpers::{self, SubscriptionRole};
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use crate::task::{create_action, CreateAction};
+use crate::task::{CreateAction, create_action};
 use cloudillo_types::meta_adapter::UpdateActionDataOptions;
 
 /// INVT on_create hook - Validate inviter permission

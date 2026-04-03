@@ -493,14 +493,14 @@ impl CursorData {
 
 	/// Encode cursor to base64 string
 	pub fn encode(&self) -> String {
-		use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+		use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 		let json = serde_json::to_string(self).unwrap_or_default();
 		URL_SAFE_NO_PAD.encode(json.as_bytes())
 	}
 
 	/// Decode cursor from base64 string
 	pub fn decode(cursor: &str) -> Option<Self> {
-		use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+		use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 		let bytes = URL_SAFE_NO_PAD.decode(cursor).ok()?;
 		let json = String::from_utf8(bytes).ok()?;
 		serde_json::from_str(&json).ok()

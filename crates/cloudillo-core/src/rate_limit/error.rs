@@ -7,9 +7,9 @@
 
 use std::time::Duration;
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
 /// Rate limit error types
 #[derive(Debug)]

@@ -4,15 +4,15 @@
 //! API Key management endpoints for Identity Provider
 
 use axum::{
+	Json,
 	extract::{Path, Query, State},
 	http::StatusCode,
-	Json,
 };
 use serde::{Deserialize, Serialize};
 
 use cloudillo_core::extract::{IdTag, OptionalRequestId};
 use cloudillo_types::identity_provider_adapter::{ApiKey, CreateApiKeyOptions, ListApiKeyOptions};
-use cloudillo_types::types::{serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse};
+use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt};
 
 use crate::prelude::*;
 

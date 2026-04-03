@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-use crate::{storage, DatabaseInstance};
+use crate::{DatabaseInstance, storage};
 use cloudillo_types::error::ClResult;
 use cloudillo_types::types::TnId;
 use redb::ReadableTable;
@@ -30,15 +30,15 @@ pub async fn create_index_impl(
 	// Load existing indexes
 	let mut indexes: Vec<String> = {
 		let meta_table = tx.open_table(storage::TABLE_METADATA).map_err(from_redb_error)?;
-		let result = match meta_table.get(meta_key.as_str()) {
+
+		match meta_table.get(meta_key.as_str()) {
 			Ok(Some(v)) => {
 				let json_str = v.value().to_string();
 				serde_json::from_str(&json_str)?
 			}
 			Ok(None) => Vec::new(),
 			Err(e) => return Err(from_redb_error(e).into()),
-		};
-		result
+		}
 	};
 
 	// Add field if not already indexed

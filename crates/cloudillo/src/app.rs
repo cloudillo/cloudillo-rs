@@ -3,7 +3,7 @@
 
 //! App builder - constructs and runs the Cloudillo application
 
-use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
+use std::{path::PathBuf, pin::Pin, sync::Arc};
 
 use crate::auth_adapter::AuthAdapter;
 use crate::blob_adapter::BlobAdapter;
@@ -12,12 +12,12 @@ use crate::identity_provider_adapter::IdentityProviderAdapter;
 use crate::meta_adapter::MetaAdapter;
 use crate::prelude::*;
 use crate::rtdb_adapter::RtdbAdapter;
-use crate::settings::service::SettingsService;
 use crate::settings::SettingsRegistry;
+use crate::settings::service::SettingsService;
 use crate::{bootstrap, file, proxy, routes, webserver};
+use cloudillo_action::KeyFetchCache;
 use cloudillo_action::dsl::DslEngine;
 use cloudillo_action::hooks::HookRegistry;
-use cloudillo_action::KeyFetchCache;
 pub use cloudillo_core::app::{Adapters, App, AppBuilderOpts, AppState, ServerMode, VERSION};
 use cloudillo_core::extensions::Extensions;
 use cloudillo_core::{abac, rate_limit::RateLimitManager, request, scheduler};

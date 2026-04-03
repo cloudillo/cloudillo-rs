@@ -20,7 +20,7 @@ use cloudillo_types::utils::random_id;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// A message in the bus protocol

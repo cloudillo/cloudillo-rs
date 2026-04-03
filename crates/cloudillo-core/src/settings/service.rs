@@ -86,13 +86,13 @@ impl SettingsService {
 			.ok_or_else(|| Error::ValidationError(format!("Unknown setting: {}", key)))?;
 
 		// Try tenant-specific setting
-		if tn_id.0 != 0 {
-			if let Some(json_value) = self.meta.read_setting(tn_id, key).await? {
-				let value = serde_json::from_value::<SettingValue>(json_value)
-					.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
-				self.cache.put(tn_id, key.to_string(), value.clone());
-				return Ok(value);
-			}
+		if tn_id.0 != 0
+			&& let Some(json_value) = self.meta.read_setting(tn_id, key).await?
+		{
+			let value = serde_json::from_value::<SettingValue>(json_value)
+				.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
+			self.cache.put(tn_id, key.to_string(), value.clone());
+			return Ok(value);
 		}
 
 		// Try global setting
@@ -168,15 +168,15 @@ impl SettingsService {
 		};
 
 		// Validate type matches definition (if default exists)
-		if let Some(default) = &def.default {
-			if !value.matches_type(default) {
-				return Err(Error::ValidationError(format!(
-					"Type mismatch for setting '{}': expected {}, got {}",
-					key,
-					default.type_name(),
-					value.type_name()
-				)));
-			}
+		if let Some(default) = &def.default
+			&& !value.matches_type(default)
+		{
+			return Err(Error::ValidationError(format!(
+				"Type mismatch for setting '{}': expected {}, got {}",
+				key,
+				default.type_name(),
+				value.type_name()
+			)));
 		}
 
 		// Run custom validator if present

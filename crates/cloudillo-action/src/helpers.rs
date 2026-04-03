@@ -51,10 +51,10 @@ pub async fn inherit_visibility<M: MetaAdapter + ?Sized>(
 	if visibility.is_some() {
 		return visibility;
 	}
-	if let Some(parent_id) = parent_id {
-		if let Ok(Some(parent)) = meta_adapter.get_action(tn_id, parent_id).await {
-			return parent.visibility;
-		}
+	if let Some(parent_id) = parent_id
+		&& let Ok(Some(parent)) = meta_adapter.get_action(tn_id, parent_id).await
+	{
+		return parent.visibility;
 	}
 	None
 }

@@ -493,7 +493,7 @@ impl<'a> OperationExecutor<'a> {
 						_ => {
 							return Err(Error::ValidationError(
 								"status field does not support increment/decrement".to_string(),
-							))
+							));
 						}
 					};
 					update_opts.status = if value.is_null() {
@@ -521,7 +521,7 @@ impl<'a> OperationExecutor<'a> {
 						_ => {
 							return Err(Error::ValidationError(
 								"subject field does not support increment/decrement".to_string(),
-							))
+							));
 						}
 					};
 					update_opts.subject = if value.is_null() {

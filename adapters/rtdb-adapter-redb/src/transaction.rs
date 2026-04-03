@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-use crate::{storage, DatabaseInstance};
+use crate::{DatabaseInstance, storage};
 use async_trait::async_trait;
 use cloudillo_types::prelude::*;
 use cloudillo_types::rtdb_adapter::{ChangeEvent, Transaction};
@@ -176,15 +176,15 @@ impl Transaction for RedbTransaction {
 			// Fall back to reading from database
 			let table =
 				self.tx_mut()?.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
-			let result = match table.get(key.as_str()) {
+
+			match table.get(key.as_str()) {
 				Ok(Some(v)) => {
 					let json_str = v.value().to_string();
 					Some(serde_json::from_str::<Value>(&json_str)?)
 				}
 				Ok(None) => None,
 				Err(e) => return Err(from_redb_error(e).into()),
-			};
-			result
+			}
 		};
 
 		// Write updated document
@@ -226,15 +226,15 @@ impl Transaction for RedbTransaction {
 			// Fall back to reading from database
 			let table =
 				self.tx_mut()?.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
-			let result = match table.get(key.as_str()) {
+
+			match table.get(key.as_str()) {
 				Ok(Some(v)) => {
 					let json_str = v.value().to_string();
 					Some(serde_json::from_str::<Value>(&json_str)?)
 				}
 				Ok(None) => None,
 				Err(e) => return Err(from_redb_error(e).into()),
-			};
-			result
+			}
 		};
 
 		// Delete document

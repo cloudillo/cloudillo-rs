@@ -23,11 +23,13 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 	// Maximum size variant to generate
 	registry.register(
 		SettingDefinition::builder("file.max_generate_variant")
-			.description("Maximum size variant to generate: tn, sd (720), md (1280), hd (1920), or xd (3840)")
+			.description(
+				"Maximum size variant to generate: tn, sd (720), md (1280), hd (1920), or xd (3840)",
+			)
 			.default(SettingValue::String("hd".into()))
 			.scope(SettingScope::Global)
 			.permission(PermissionLevel::Admin)
-			.build()?
+			.build()?,
 	)?;
 
 	// Maximum size variant to download for caching

@@ -19,8 +19,8 @@ use futures::sink::SinkExt;
 use futures::stream::SplitSink;
 use futures::stream::StreamExt;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use yrs::sync::{Message as YMessage, SyncMessage};
@@ -640,15 +640,18 @@ async fn handle_yrs_message(
 
 					let mut tx = ws_tx.lock().await;
 					let msg = YMessage::Sync(SyncMessage::SyncStep2(diff.clone()));
-					if let Err(e) = tx.send(Message::Binary(msg.encode_v1().into())).await {
-						warn!("Failed to send SyncStep2 to {}: {}", conn.user_id, e);
-					} else {
-						info!(
-							"Sent SyncStep2 to conn {} for doc {} ({} bytes)",
-							conn.conn_id,
-							conn.doc_id,
-							diff.len()
-						);
+					match tx.send(Message::Binary(msg.encode_v1().into())).await {
+						Err(e) => {
+							warn!("Failed to send SyncStep2 to {}: {}", conn.user_id, e);
+						}
+						Ok(()) => {
+							info!(
+								"Sent SyncStep2 to conn {} for doc {} ({} bytes)",
+								conn.conn_id,
+								conn.doc_id,
+								diff.len()
+							);
+						}
 					}
 					return;
 				}
@@ -896,14 +899,13 @@ async fn record_file_access_throttled(app: &App, conn: &CrdtConnection) {
 		should
 	};
 
-	if should_update {
-		if let Err(e) = app
+	if should_update
+		&& let Err(e) = app
 			.meta_adapter
 			.record_file_access(conn.tn_id, &conn.user_id, &conn.doc_id)
 			.await
-		{
-			debug!("Failed to record file access for doc {}: {}", conn.doc_id, e);
-		}
+	{
+		debug!("Failed to record file access for doc {}: {}", conn.doc_id, e);
 	}
 }
 
@@ -925,14 +927,13 @@ async fn record_file_modification_throttled(app: &App, conn: &CrdtConnection) {
 		should
 	};
 
-	if should_update {
-		if let Err(e) = app
+	if should_update
+		&& let Err(e) = app
 			.meta_adapter
 			.record_file_modification(conn.tn_id, &conn.user_id, &conn.doc_id)
 			.await
-		{
-			debug!("Failed to record file modification for doc {}: {}", conn.doc_id, e);
-		}
+	{
+		debug!("Failed to record file modification for doc {}: {}", conn.doc_id, e);
 	}
 }
 
@@ -948,14 +949,13 @@ async fn record_final_activity(app: &App, conn: &CrdtConnection) {
 	}
 
 	// Record final modification if any changes were made
-	if conn.has_modified.load(Ordering::Relaxed) {
-		if let Err(e) = app
+	if conn.has_modified.load(Ordering::Relaxed)
+		&& let Err(e) = app
 			.meta_adapter
 			.record_file_modification(conn.tn_id, &conn.user_id, &conn.doc_id)
 			.await
-		{
-			debug!("Failed to record final file modification for doc {}: {}", conn.doc_id, e);
-		}
+	{
+		debug!("Failed to record final file modification for doc {}: {}", conn.doc_id, e);
 	}
 }
 

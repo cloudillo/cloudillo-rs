@@ -780,41 +780,38 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		};
 
 		// Check if a task with this key already exists (key-based deduplication)
-		if let Some(key) = key {
-			if let Some((existing_id, existing_data)) = self.store.find_by_key(key).await? {
-				let new_serialized = task.serialize();
-				let existing_serialized = existing_data.input.as_ref();
+		if let Some(key) = key
+			&& let Some((existing_id, existing_data)) = self.store.find_by_key(key).await?
+		{
+			let new_serialized = task.serialize();
+			let existing_serialized = existing_data.input.as_ref();
 
-				// Compare serialized parameters
-				if new_serialized == existing_serialized {
-					info!(
-						"Recurring task '{}' already exists with identical parameters (id={})",
-						key, existing_id
-					);
-					// Update DB with current cron/next_at (may differ from what's stored)
-					self.store.update_task(existing_id, &task_meta).await?;
-					// Ensure the existing task is queued (may be loaded from DB but not yet in queue)
-					self.add_queue(existing_id, task_meta).await?;
-					return Ok(existing_id);
-				}
+			// Compare serialized parameters
+			if new_serialized == existing_serialized {
 				info!(
-					"Updating recurring task '{}' (id={}) - parameters changed",
+					"Recurring task '{}' already exists with identical parameters (id={})",
 					key, existing_id
 				);
-				info!("  Old params: {}", existing_serialized);
-				info!("  New params: {}", new_serialized);
-
-				// Remove from all queues (if present)
-				self.remove_from_queues(existing_id)?;
-
-				// Update the task in database with new parameters
+				// Update DB with current cron/next_at (may differ from what's stored)
 				self.store.update_task(existing_id, &task_meta).await?;
-
-				// Re-add to appropriate queue with updated parameters
+				// Ensure the existing task is queued (may be loaded from DB but not yet in queue)
 				self.add_queue(existing_id, task_meta).await?;
-
 				return Ok(existing_id);
 			}
+			info!("Updating recurring task '{}' (id={}) - parameters changed", key, existing_id);
+			info!("  Old params: {}", existing_serialized);
+			info!("  New params: {}", new_serialized);
+
+			// Remove from all queues (if present)
+			self.remove_from_queues(existing_id)?;
+
+			// Update the task in database with new parameters
+			self.store.update_task(existing_id, &task_meta).await?;
+
+			// Re-add to appropriate queue with updated parameters
+			self.add_queue(existing_id, task_meta).await?;
+
+			return Ok(existing_id);
 		}
 
 		// No existing task - create new one
@@ -865,7 +862,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 		// VALIDATION: Tasks with dependencies should NEVER be in tasks_scheduled
 		if !deps.is_empty() && task_meta.next_at.is_some() {
-			warn!("Task {} has both dependencies and scheduled time - ignoring next_at, placing in waiting queue", id);
+			warn!(
+				"Task {} has both dependencies and scheduled time - ignoring next_at, placing in waiting queue",
+				id
+			);
 			// Force to tasks_waiting instead
 			lock!(self.tasks_waiting, "tasks_waiting")?.insert(id, task_meta);
 			debug!("Task {} is waiting for {:?}", id, &deps);
@@ -909,11 +909,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				.iter()
 				.find(|((_, id), _)| *id == task_id)
 				.map(|((ts, id), _)| (*ts, *id))
+				&& let Some(task_meta) = scheduled.remove(&key)
 			{
-				if let Some(task_meta) = scheduled.remove(&key) {
-					debug!("Removed task {} from scheduled queue for update", task_id);
-					return Ok(Some(task_meta));
-				}
+				debug!("Removed task {} from scheduled queue for update", task_id);
+				return Ok(Some(task_meta));
 			}
 		}
 
@@ -1092,7 +1091,11 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 							info!(
 								"Task {} failed (attempt {}/{}). Scheduling retry in {} seconds: {}",
-								id, task_meta.retry_count + 1, retry_policy.times, backoff, e
+								id,
+								task_meta.retry_count + 1,
+								retry_policy.times,
+								backoff,
+								e
 							);
 
 							// Update database with error and reschedule

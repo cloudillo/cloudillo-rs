@@ -18,10 +18,10 @@ use serde::Deserialize;
 
 use crate::crdt;
 use crate::rtdb;
+use cloudillo_core::OptionalAuth;
 use cloudillo_core::extract::IdTag;
 use cloudillo_core::file_access::{self, FileAccessError};
 use cloudillo_core::ws_bus;
-use cloudillo_core::OptionalAuth;
 use cloudillo_types::meta_adapter::{CreateFile, FileStatus};
 use cloudillo_types::types::AccessLevel;
 
@@ -333,10 +333,10 @@ pub async fn get_ws_rtdb(
 	let meta_parent = validate_meta_id(&file_id);
 	let is_meta = meta_parent.is_some();
 	let access_file_id = if let Some(parent_file_id) = meta_parent {
-		if !is_guest {
-			if let Err(e) = ensure_meta_file(&app, crate::types::TnId(tn_id), &file_id).await {
-				return ws_close_for_error(ws, &e);
-			}
+		if !is_guest
+			&& let Err(e) = ensure_meta_file(&app, crate::types::TnId(tn_id), &file_id).await
+		{
+			return ws_close_for_error(ws, &e);
 		}
 		// Check access against the parent file, not the meta file itself
 		parent_file_id.to_string()
@@ -373,16 +373,15 @@ pub async fn get_ws_rtdb(
 				AccessLevel::Read
 			} else {
 				let Ok(al) = resolve_access(&query, result.access_level) else {
-					warn!("RTDB WebSocket rejected - requested access not available: user={}, file={}", user_id, file_id);
+					warn!(
+						"RTDB WebSocket rejected - requested access not available: user={}, file={}",
+						user_id, file_id
+					);
 					return ws_close_write_denied(ws);
 				};
 				// For non-meta DBs, downgrade Comment to Read (comment users
 				// can only write to meta databases, not main document RTDB)
-				if !is_meta && al == AccessLevel::Comment {
-					AccessLevel::Read
-				} else {
-					al
-				}
+				if !is_meta && al == AccessLevel::Comment { AccessLevel::Read } else { al }
 			};
 			info!(
 				"RTDB WebSocket ({}): user={}, file={}",

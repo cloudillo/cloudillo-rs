@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use governor::clock::{Clock, DefaultClock};

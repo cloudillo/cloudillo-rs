@@ -4,9 +4,9 @@
 //! Admin CRUD handlers for proxy site management
 
 use axum::{
+	Json,
 	extract::{Path, State},
 	http::StatusCode,
-	Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -17,7 +17,7 @@ use cloudillo_core::extract::Auth;
 use cloudillo_types::auth_adapter::{
 	CreateProxySiteData, ProxySiteConfig, ProxySiteData, UpdateProxySiteData,
 };
-use cloudillo_types::types::{serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse};
+use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt};
 
 fn default_proxy_type() -> String {
 	"basic".to_string()
@@ -171,10 +171,10 @@ pub async fn create_proxy_site(
 	}
 
 	// Generate certificate immediately (best-effort, daily cron will retry on failure)
-	if app.opts.acme_email.is_some() {
-		if let Err(e) = acme::renew_proxy_site_cert(&app, site.site_id, &site.domain).await {
-			warn!(domain = %site.domain, error = %e, "Failed to generate certificate for proxy site");
-		}
+	if app.opts.acme_email.is_some()
+		&& let Err(e) = acme::renew_proxy_site_cert(&app, site.site_id, &site.domain).await
+	{
+		warn!(domain = %site.domain, error = %e, "Failed to generate certificate for proxy site");
 	}
 
 	Ok((StatusCode::CREATED, Json(ApiResponse::new(ProxySiteResponse::from(site)))))
@@ -208,10 +208,10 @@ pub async fn update_proxy_site(
 	}
 
 	// Validate status if provided
-	if let Some(ref status) = body.status {
-		if !["A", "D"].contains(&status.as_str()) {
-			return Err(Error::ValidationError("status must be A (active) or D (disabled)".into()));
-		}
+	if let Some(ref status) = body.status
+		&& !["A", "D"].contains(&status.as_str())
+	{
+		return Err(Error::ValidationError("status must be A (active) or D (disabled)".into()));
 	}
 
 	// Validate proxy type if provided
@@ -287,10 +287,10 @@ pub async fn trigger_cert_renewal(
 	let site = app.auth_adapter.read_proxy_site(site_id).await?;
 
 	// Perform ACME renewal immediately (best-effort, daily cron will retry on failure)
-	if app.opts.acme_email.is_some() {
-		if let Err(e) = acme::renew_proxy_site_cert(&app, site_id, &site.domain).await {
-			warn!(domain = %site.domain, error = %e, "Failed to renew certificate for proxy site");
-		}
+	if app.opts.acme_email.is_some()
+		&& let Err(e) = acme::renew_proxy_site_cert(&app, site_id, &site.domain).await
+	{
+		warn!(domain = %site.domain, error = %e, "Failed to renew certificate for proxy site");
 	}
 
 	// Re-read the site to return updated cert info

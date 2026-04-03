@@ -193,10 +193,10 @@ pub async fn refresh_profile(
 
 			// Only update etag if profile_pic sync succeeded (or wasn't needed)
 			// This ensures we'll retry on next sync if the picture failed
-			if profile_pic_synced || !profile_pic_changed {
-				if let Some(etag) = new_etag {
-					update.etag = Patch::Value(etag);
-				}
+			if (profile_pic_synced || !profile_pic_changed)
+				&& let Some(etag) = new_etag
+			{
+				update.etag = Patch::Value(etag);
 			}
 
 			app.meta_adapter.update_profile(tn_id, id_tag, &update).await?;

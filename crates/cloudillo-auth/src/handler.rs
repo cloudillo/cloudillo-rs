@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 use axum::{
+	Json,
 	extract::{ConnectInfo, Query, State},
 	http::{HeaderMap, StatusCode},
-	Json,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -14,13 +14,13 @@ use serde_with::skip_serializing_none;
 use std::net::SocketAddr;
 
 use cloudillo_core::{
+	ActionVerifyFn, Auth,
 	extract::{IdTag, OptionalAuth, OptionalRequestId},
 	rate_limit::{PenaltyReason, RateLimitApi},
 	roles::expand_roles,
-	ActionVerifyFn, Auth,
 };
-use cloudillo_email::{get_tenant_lang, EmailModule, EmailTaskParams};
-use cloudillo_ref::service::{create_ref_internal, CreateRefInternalParams};
+use cloudillo_email::{EmailModule, EmailTaskParams, get_tenant_lang};
+use cloudillo_ref::service::{CreateRefInternalParams, create_ref_internal};
 use cloudillo_types::{
 	action_types::ACCESS_TOKEN_EXPIRY,
 	auth_adapter::{self, ListTenantsOptions},
@@ -712,34 +712,33 @@ pub async fn get_proxy_token(
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxyTokenRes>>)> {
 	// If target idTag is specified and different from own server, use federation
-	if let Some(ref target_id_tag) = query.id_tag {
-		if target_id_tag != own_id_tag.as_ref() {
-			#[derive(Deserialize)]
-			struct AccessTokenClaims {
-				r: Option<String>,
-			}
-
-			info!("Getting federated proxy token for {} -> {}", &auth.id_tag, target_id_tag);
-
-			// Use federation flow: create action token and exchange at target
-			let token = app.request.create_proxy_token(auth.tn_id, target_id_tag, None).await?;
-
-			let roles: Option<Vec<String>> = match decode_jwt_no_verify::<AccessTokenClaims>(&token)
-			{
-				Ok(claims) => {
-					info!("Decoded federated token, roles claim: {:?}", claims.r);
-					claims.r.map(|r| r.split(',').map(String::from).collect())
-				}
-				Err(e) => {
-					warn!("Failed to decode federated token for roles: {:?}", e);
-					None
-				}
-			};
-
-			let response = ApiResponse::new(ProxyTokenRes { token: token.to_string(), roles })
-				.with_req_id(req_id.unwrap_or_default());
-			return Ok((StatusCode::OK, Json(response)));
+	if let Some(ref target_id_tag) = query.id_tag
+		&& target_id_tag != own_id_tag.as_ref()
+	{
+		#[derive(Deserialize)]
+		struct AccessTokenClaims {
+			r: Option<String>,
 		}
+
+		info!("Getting federated proxy token for {} -> {}", &auth.id_tag, target_id_tag);
+
+		// Use federation flow: create action token and exchange at target
+		let token = app.request.create_proxy_token(auth.tn_id, target_id_tag, None).await?;
+
+		let roles: Option<Vec<String>> = match decode_jwt_no_verify::<AccessTokenClaims>(&token) {
+			Ok(claims) => {
+				info!("Decoded federated token, roles claim: {:?}", claims.r);
+				claims.r.map(|r| r.split(',').map(String::from).collect())
+			}
+			Err(e) => {
+				warn!("Failed to decode federated token for roles: {:?}", e);
+				None
+			}
+		};
+
+		let response = ApiResponse::new(ProxyTokenRes { token: token.to_string(), roles })
+			.with_req_id(req_id.unwrap_or_default());
+		return Ok((StatusCode::OK, Json(response)));
 	}
 
 	// Default: create local access token (valid on own server)

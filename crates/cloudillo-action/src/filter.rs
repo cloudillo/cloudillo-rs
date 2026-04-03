@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use cloudillo_core::abac::{can_view_item, ViewCheckContext};
+use cloudillo_core::abac::{ViewCheckContext, can_view_item};
 use cloudillo_types::meta_adapter::{ActionView, ListActionOptions};
 
 use crate::{dsl::DslEngine, prelude::*};
@@ -68,12 +68,11 @@ pub async fn filter_actions_by_visibility(
 				action.audience.as_ref().map(|a| vec![a.id_tag.as_ref()]).unwrap_or_default();
 
 			// For subscribable Direct-visibility actions, check if subject is a subscriber
-			if action.visibility.is_none() {
-				if let Some(subs) = subscribers_map.get(action.action_id.as_ref()) {
-					if subs.contains(subject_id_tag) {
-						audience.push(subject_id_tag);
-					}
-				}
+			if action.visibility.is_none()
+				&& let Some(subs) = subscribers_map.get(action.action_id.as_ref())
+				&& subs.contains(subject_id_tag)
+			{
+				audience.push(subject_id_tag);
 			}
 
 			let allowed = can_view_item(&ViewCheckContext {
@@ -89,7 +88,12 @@ pub async fn filter_actions_by_visibility(
 			if !allowed {
 				info!(
 					"FILTERED OUT action={}: subject={}, issuer={}, tenant={}, visibility={:?}, audience={:?}",
-					action.action_id, subject_id_tag, issuer_tag, tenant_id_tag, action.visibility, audience
+					action.action_id,
+					subject_id_tag,
+					issuer_tag,
+					tenant_id_tag,
+					action.visibility,
+					audience
 				);
 			}
 			allowed

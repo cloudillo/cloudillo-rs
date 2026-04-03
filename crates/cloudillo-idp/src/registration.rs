@@ -297,31 +297,31 @@ pub async fn process_registration(
 
 	// Check registrar quota
 	let quota = idp_adapter.get_quota(registrar_id_tag).await.ok();
-	if let Some(quota) = quota {
-		if quota.current_identities >= quota.max_identities {
-			warn!(
-				registrar = %registrar_id_tag,
-				current = quota.current_identities,
-				max = quota.max_identities,
-				"Registrar quota exceeded"
-			);
+	if let Some(quota) = quota
+		&& quota.current_identities >= quota.max_identities
+	{
+		warn!(
+			registrar = %registrar_id_tag,
+			current = quota.current_identities,
+			max = quota.max_identities,
+			"Registrar quota exceeded"
+		);
 
-			let response = IdpRegResponse {
-				success: false,
-				message: "Registrar quota exceeded".to_string(),
-				identity_status: "quota_exceeded".to_string(),
-				activation_ref: None,
-				api_key: None,
-			};
+		let response = IdpRegResponse {
+			success: false,
+			message: "Registrar quota exceeded".to_string(),
+			identity_status: "quota_exceeded".to_string(),
+			activation_ref: None,
+			api_key: None,
+		};
 
-			return Ok(RegistrationResult {
-				identity_id: String::new(),
-				activation_ref: String::new(),
-				api_key_prefix: String::new(),
-				plaintext_key: String::new(),
-				response,
-			});
-		}
+		return Ok(RegistrationResult {
+			identity_id: String::new(),
+			activation_ref: String::new(),
+			api_key_prefix: String::new(),
+			plaintext_key: String::new(),
+			response,
+		});
 	}
 
 	// Create the identity with Pending status

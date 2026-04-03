@@ -3,7 +3,7 @@
 
 //! File management and variant handling
 
-use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
 use crate::utils::{collect_res, inspect, map_res, parse_str_list};
 use cloudillo_types::meta_adapter::{
@@ -98,10 +98,14 @@ pub(crate) async fn list(
 	if has_user {
 		if needs_user_join && (opts.pinned == Some(true) || opts.starred == Some(true)) {
 			// INNER JOIN when filtering by pinned/starred (must have the data)
-			query.push(" INNER JOIN file_user_data fud ON fud.tn_id=f.tn_id AND fud.f_id=f.f_id AND fud.id_tag=");
+			query.push(
+				" INNER JOIN file_user_data fud ON fud.tn_id=f.tn_id AND fud.f_id=f.f_id AND fud.id_tag=",
+			);
 		} else {
 			// LEFT JOIN to include user data when available
-			query.push(" LEFT JOIN file_user_data fud ON fud.tn_id=f.tn_id AND fud.f_id=f.f_id AND fud.id_tag=");
+			query.push(
+				" LEFT JOIN file_user_data fud ON fud.tn_id=f.tn_id AND fud.f_id=f.f_id AND fud.id_tag=",
+			);
 		}
 		query.push_bind(opts.user_id_tag.as_deref().unwrap_or(""));
 	}
@@ -307,78 +311,78 @@ pub(crate) async fn list(
 	let is_desc = sort_dir == "DESC";
 
 	// Parse cursor for keyset pagination
-	if let Some(cursor_str) = &opts.cursor {
-		if let Some(cursor) = cloudillo_types::types::CursorData::decode(cursor_str) {
-			// Look up internal f_id from cursor's external file_id
-			let cursor_f_id: Option<i64> =
-				sqlx::query_scalar("SELECT f_id FROM files WHERE tn_id=? AND file_id=?")
-					.bind(tn_id.0)
-					.bind(&cursor.id)
-					.fetch_optional(db)
-					.await
-					.ok()
-					.flatten();
+	if let Some(cursor_str) = &opts.cursor
+		&& let Some(cursor) = cloudillo_types::types::CursorData::decode(cursor_str)
+	{
+		// Look up internal f_id from cursor's external file_id
+		let cursor_f_id: Option<i64> =
+			sqlx::query_scalar("SELECT f_id FROM files WHERE tn_id=? AND file_id=?")
+				.bind(tn_id.0)
+				.bind(&cursor.id)
+				.fetch_optional(db)
+				.await
+				.ok()
+				.flatten();
 
-			if let Some(cursor_f_id) = cursor_f_id {
-				// Add keyset pagination WHERE clause based on sort field
-				// For DESC: (sort_field, f_id) < (cursor_value, cursor_f_id)
-				// For ASC: (sort_field, f_id) > (cursor_value, cursor_f_id)
-				// Note: push_bind() adds bind placeholders, don't use ? in push() strings
-				let comparison = if is_desc { "<" } else { ">" };
+		if let Some(cursor_f_id) = cursor_f_id {
+			// Add keyset pagination WHERE clause based on sort field
+			// For DESC: (sort_field, f_id) < (cursor_value, cursor_f_id)
+			// For ASC: (sort_field, f_id) > (cursor_value, cursor_f_id)
+			// Note: push_bind() adds bind placeholders, don't use ? in push() strings
+			let comparison = if is_desc { "<" } else { ">" };
 
-				match sort_field {
-					"recent" if has_user => {
-						if let Some(ts) = cursor.timestamp() {
-							query.push(format!(
-								" AND ((fud.accessed_at IS NULL AND f.f_id {} ",
-								comparison
-							));
-							query.push_bind(cursor_f_id);
-							query.push(format!(
-								") OR (fud.accessed_at IS NOT NULL AND (fud.accessed_at, f.f_id) {} (",
-								comparison
-							));
-							query.push_bind(ts);
-							query.push(", ");
-							query.push_bind(cursor_f_id);
-							query.push(")))");
-						}
+			match sort_field {
+				"recent" if has_user => {
+					if let Some(ts) = cursor.timestamp() {
+						query.push(format!(
+							" AND ((fud.accessed_at IS NULL AND f.f_id {} ",
+							comparison
+						));
+						query.push_bind(cursor_f_id);
+						query.push(format!(
+							") OR (fud.accessed_at IS NOT NULL AND (fud.accessed_at, f.f_id) {} (",
+							comparison
+						));
+						query.push_bind(ts);
+						query.push(", ");
+						query.push_bind(cursor_f_id);
+						query.push(")))");
 					}
-					"modified" if has_user => {
-						if let Some(ts) = cursor.timestamp() {
-							query.push(format!(
-								" AND ((fud.modified_at IS NULL AND f.f_id {} ",
-								comparison
-							));
-							query.push_bind(cursor_f_id);
-							query.push(format!(
-								") OR (fud.modified_at IS NOT NULL AND (fud.modified_at, f.f_id) {} (",
-								comparison
-							));
-							query.push_bind(ts);
-							query.push(", ");
-							query.push_bind(cursor_f_id);
-							query.push(")))");
-						}
+				}
+				"modified" if has_user => {
+					if let Some(ts) = cursor.timestamp() {
+						query.push(format!(
+							" AND ((fud.modified_at IS NULL AND f.f_id {} ",
+							comparison
+						));
+						query.push_bind(cursor_f_id);
+						query.push(format!(
+							") OR (fud.modified_at IS NOT NULL AND (fud.modified_at, f.f_id) {} (",
+							comparison
+						));
+						query.push_bind(ts);
+						query.push(", ");
+						query.push_bind(cursor_f_id);
+						query.push(")))");
 					}
-					"name" => {
-						if let Some(name) = cursor.string_value() {
-							query.push(format!(" AND (f.file_name, f.f_id) {} (", comparison));
-							query.push_bind(name.to_string());
-							query.push(", ");
-							query.push_bind(cursor_f_id);
-							query.push(")");
-						}
+				}
+				"name" => {
+					if let Some(name) = cursor.string_value() {
+						query.push(format!(" AND (f.file_name, f.f_id) {} (", comparison));
+						query.push_bind(name.to_string());
+						query.push(", ");
+						query.push_bind(cursor_f_id);
+						query.push(")");
 					}
-					_ => {
-						// "created" or default
-						if let Some(ts) = cursor.timestamp() {
-							query.push(format!(" AND (f.created_at, f.f_id) {} (", comparison));
-							query.push_bind(ts);
-							query.push(", ");
-							query.push_bind(cursor_f_id);
-							query.push(")");
-						}
+				}
+				_ => {
+					// "created" or default
+					if let Some(ts) = cursor.timestamp() {
+						query.push(format!(" AND (f.created_at, f.f_id) {} (", comparison));
+						query.push_bind(ts);
+						query.push(", ");
+						query.push_bind(cursor_f_id);
+						query.push(")");
 					}
 				}
 			}
@@ -845,20 +849,20 @@ pub(crate) async fn update_id(
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
-		if let Some(row) = current {
-			if let Some(existing_id) = row.try_get::<Option<String>, _>("file_id").ok().flatten() {
-				if existing_id == file_id {
-					// Race condition resolved - correct value was set
-					return Ok(());
-				}
-				// Different value - this is a real conflict
-				let msg = format!(
-					"Race condition: f_id={} was set to {} instead of {}",
-					f_id, existing_id, file_id
-				);
-				error!("{}", msg);
-				return Err(Error::Conflict(msg));
+		if let Some(row) = current
+			&& let Some(existing_id) = row.try_get::<Option<String>, _>("file_id").ok().flatten()
+		{
+			if existing_id == file_id {
+				// Race condition resolved - correct value was set
+				return Ok(());
 			}
+			// Different value - this is a real conflict
+			let msg = format!(
+				"Race condition: f_id={} was set to {} instead of {}",
+				f_id, existing_id, file_id
+			);
+			error!("{}", msg);
+			return Err(Error::Conflict(msg));
 		}
 		// Still NULL somehow - return error
 		return Err(Error::Internal("Unexpected state during file_id update".into()));
@@ -967,31 +971,31 @@ pub(crate) async fn finalize_file(
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
-		if let Some(row) = current {
-			if let Some(existing_id) = row.try_get::<Option<String>, _>("file_id").ok().flatten() {
-				let status: String = row.try_get("status").map_err(|_| Error::DbError)?;
-				if existing_id == file_id && status == "A" {
-					// Race condition resolved - correct value and status were set
-					return Ok(());
-				} else if existing_id == file_id && status == "P" {
-					// Has correct file_id but status not updated - fix it
-					sqlx::query("UPDATE files SET status='A' WHERE tn_id=? AND f_id=?")
-						.bind(tn_id.0)
-						.bind(f_id.cast_signed())
-						.execute(db)
-						.await
-						.inspect_err(inspect)
-						.map_err(|_| Error::DbError)?;
-					return Ok(());
-				}
-				// Different value - this is a real conflict
-				let msg = format!(
-					"Race condition: f_id={} was set to {} instead of {}",
-					f_id, existing_id, file_id
-				);
-				error!("{}", msg);
-				return Err(Error::Conflict(msg));
+		if let Some(row) = current
+			&& let Some(existing_id) = row.try_get::<Option<String>, _>("file_id").ok().flatten()
+		{
+			let status: String = row.try_get("status").map_err(|_| Error::DbError)?;
+			if existing_id == file_id && status == "A" {
+				// Race condition resolved - correct value and status were set
+				return Ok(());
+			} else if existing_id == file_id && status == "P" {
+				// Has correct file_id but status not updated - fix it
+				sqlx::query("UPDATE files SET status='A' WHERE tn_id=? AND f_id=?")
+					.bind(tn_id.0)
+					.bind(f_id.cast_signed())
+					.execute(db)
+					.await
+					.inspect_err(inspect)
+					.map_err(|_| Error::DbError)?;
+				return Ok(());
 			}
+			// Different value - this is a real conflict
+			let msg = format!(
+				"Race condition: f_id={} was set to {} instead of {}",
+				f_id, existing_id, file_id
+			);
+			error!("{}", msg);
+			return Err(Error::Conflict(msg));
 		}
 		// Still NULL somehow - return error
 		return Err(Error::Internal("Unexpected state during file finalization".into()));

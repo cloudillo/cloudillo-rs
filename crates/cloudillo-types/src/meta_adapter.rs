@@ -278,11 +278,7 @@ where
 	let s = String::deserialize(deserializer)?;
 	let values: Vec<String> =
 		s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
-	if values.is_empty() {
-		Ok(None)
-	} else {
-		Ok(Some(values))
-	}
+	if values.is_empty() { Ok(None) } else { Ok(Some(values)) }
 }
 
 /// Options for listing actions
@@ -1214,7 +1210,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Uninstall an app by name and publisher
 	async fn uninstall_app(&self, tn_id: TnId, app_name: &str, publisher_tag: &str)
-		-> ClResult<()>;
+	-> ClResult<()>;
 
 	/// List installed apps, optionally filtered by search term
 	async fn list_installed_apps(

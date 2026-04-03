@@ -4,10 +4,10 @@
 //! IDP (Identity Provider) REST endpoints for managing identity registrations
 
 use axum::{
+	Json,
 	body::Bytes,
 	extract::{ConnectInfo, Path, Query, State},
 	http::StatusCode,
-	Json,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -18,7 +18,7 @@ use cloudillo_types::address::parse_address_type;
 use cloudillo_types::identity_provider_adapter::{
 	CreateIdentityOptions, Identity, IdentityStatus, ListIdentityOptions, UpdateIdentityOptions,
 };
-use cloudillo_types::types::{serialize_timestamp_iso, serialize_timestamp_iso_opt, ApiResponse};
+use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt};
 use cloudillo_types::utils::parse_and_validate_identity_id_tag;
 
 use crate::prelude::*;
@@ -64,10 +64,10 @@ pub enum IdpAuthResult {
 /// - After activation (Pending → Active), registrar loses control
 fn check_identity_access(identity: &Identity, requester_id_tag: &str) -> IdpAuthResult {
 	// Owner check - owner always has full access
-	if let Some(ref owner) = identity.owner_id_tag {
-		if owner.as_ref() == requester_id_tag {
-			return IdpAuthResult::Owner;
-		}
+	if let Some(ref owner) = identity.owner_id_tag
+		&& owner.as_ref() == requester_id_tag
+	{
+		return IdpAuthResult::Owner;
 	}
 
 	// Registrar check - only valid while Pending
@@ -514,28 +514,26 @@ pub async fn create_identity(
 	};
 
 	// Send activation email (if enabled and email provided)
-	if create_req.send_activation_email {
-		if let Some(ref email) = identity.email {
-			if let Err(e) = crate::registration::send_activation_email(
-				&app,
-				tn_id,
-				crate::registration::SendActivationEmailParams {
-					id_tag_prefix: &identity.id_tag_prefix,
-					id_tag_domain: &identity.id_tag_domain,
-					email,
-					lang: None,
-				},
-			)
-			.await
-			{
-				warn!(
-					id_tag_prefix = %id_tag_prefix,
-					id_tag_domain = %id_tag_domain,
-					error = %e,
-					"Failed to send activation email"
-				);
-			}
-		}
+	if create_req.send_activation_email
+		&& let Some(ref email) = identity.email
+		&& let Err(e) = crate::registration::send_activation_email(
+			&app,
+			tn_id,
+			crate::registration::SendActivationEmailParams {
+				id_tag_prefix: &identity.id_tag_prefix,
+				id_tag_domain: &identity.id_tag_domain,
+				email,
+				lang: None,
+			},
+		)
+		.await
+	{
+		warn!(
+			id_tag_prefix = %id_tag_prefix,
+			id_tag_domain = %id_tag_domain,
+			error = %e,
+			"Failed to send activation email"
+		);
 	}
 
 	let mut response_data = IdentityResponse::from(identity);
@@ -637,21 +635,21 @@ pub async fn update_identity_address(
 	};
 
 	// Check if the address has actually changed - optimization to avoid unnecessary updates
-	if let Some(current_addr) = &existing.address {
-		if current_addr.as_ref() == address_to_update {
-			// Address hasn't changed, return early with current address
-			info!(
-				identity_id = %identity_id,
-				address = %address_to_update,
-				"Address unchanged, skipping update"
-			);
-			let response_data = AddressUpdateResponse { address: address_to_update };
-			let mut response = ApiResponse::new(response_data);
-			if let Some(id) = req_id {
-				response = response.with_req_id(id);
-			}
-			return Ok((StatusCode::OK, Json(response)));
+	if let Some(current_addr) = &existing.address
+		&& current_addr.as_ref() == address_to_update
+	{
+		// Address hasn't changed, return early with current address
+		info!(
+			identity_id = %identity_id,
+			address = %address_to_update,
+			"Address unchanged, skipping update"
+		);
+		let response_data = AddressUpdateResponse { address: address_to_update };
+		let mut response = ApiResponse::new(response_data);
+		if let Some(id) = req_id {
+			response = response.with_req_id(id);
 		}
+		return Ok((StatusCode::OK, Json(response)));
 	}
 
 	// Parse and validate the address, determining its type

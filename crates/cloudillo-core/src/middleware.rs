@@ -9,12 +9,11 @@ use crate::prelude::*;
 use axum::{
 	body::Body,
 	extract::State,
-	http::{header, response::Response, Method, Request},
+	http::{Method, Request, header, response::Response},
 	middleware::Next,
 };
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::utils::random_id;
-use std::future::Future;
 use std::pin::Pin;
 
 /// Tenant API key prefix (validated by auth adapter)
@@ -215,28 +214,28 @@ pub async fn require_auth(
 	};
 
 	// Enforce scope restrictions: scoped tokens can only access matching endpoints
-	if let Some(ref scope) = claims.scope {
-		if let Some(token_scope) = cloudillo_types::types::TokenScope::parse(scope) {
-			let path = req.uri().path();
-			let method = req.method().clone();
-			let allowed = match token_scope {
-				cloudillo_types::types::TokenScope::File { .. } => {
-					path.starts_with("/api/files/")
-						|| path == "/api/files"
-						|| path.starts_with("/ws/rtdb/")
-						|| path.starts_with("/ws/crdt/")
-						|| path == "/api/auth/access-token"
-				}
-				cloudillo_types::types::TokenScope::ApkgPublish => {
-					path.starts_with("/api/files/apkg/")
-						|| (path == "/api/actions" && method == Method::POST)
-						|| path.starts_with("/api/apps")
-				}
-			};
-			if !allowed {
-				warn!(scope = %scope, path = %path, "Scoped token denied access to non-matching endpoint");
-				return Err(Error::PermissionDenied);
+	if let Some(ref scope) = claims.scope
+		&& let Some(token_scope) = cloudillo_types::types::TokenScope::parse(scope)
+	{
+		let path = req.uri().path();
+		let method = req.method().clone();
+		let allowed = match token_scope {
+			cloudillo_types::types::TokenScope::File { .. } => {
+				path.starts_with("/api/files/")
+					|| path == "/api/files"
+					|| path.starts_with("/ws/rtdb/")
+					|| path.starts_with("/ws/crdt/")
+					|| path == "/api/auth/access-token"
 			}
+			cloudillo_types::types::TokenScope::ApkgPublish => {
+				path.starts_with("/api/files/apkg/")
+					|| (path == "/api/actions" && method == Method::POST)
+					|| path.starts_with("/api/apps")
+			}
+		};
+		if !allowed {
+			warn!(scope = %scope, path = %path, "Scoped token denied access to non-matching endpoint");
+			return Err(Error::PermissionDenied);
 		}
 	}
 
@@ -303,7 +302,9 @@ pub async fn optional_auth(
 										scope: None,
 									})),
 									Ok(None) => {
-										warn!("IDP API key validation failed: key not found or expired");
+										warn!(
+											"IDP API key validation failed: key not found or expired"
+										);
 										Err(Error::PermissionDenied)
 									}
 									Err(e) => {
@@ -358,7 +359,9 @@ pub async fn optional_auth(
 						if scope_allowed {
 							req.extensions_mut().insert(Auth(claims));
 						} else {
-							warn!("Scoped token denied access in optional_auth, treating as unauthenticated");
+							warn!(
+								"Scoped token denied access in optional_auth, treating as unauthenticated"
+							);
 						}
 					}
 					Ok(Err(e)) => {

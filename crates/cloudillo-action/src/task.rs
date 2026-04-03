@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 // Re-export from cloudillo-types for backward compatibility
-pub use cloudillo_types::action_types::{CreateAction, ACCESS_TOKEN_EXPIRY};
+pub use cloudillo_types::action_types::{ACCESS_TOKEN_EXPIRY, CreateAction};
 
 use cloudillo_core::scheduler::{RetryPolicy, Task, TaskId};
 use cloudillo_file::descriptor;
@@ -48,23 +48,21 @@ pub async fn create_action(
 	// Outbound validation: allow_unknown
 	// If false, we can only send to recipients we have a relationship with
 	let allow_unknown = behavior.as_ref().and_then(|b| b.allow_unknown).unwrap_or(false);
-	if !allow_unknown {
-		if let Some(ref audience_tag) = action.audience_tag {
-			// Skip validation if audience is ourselves
-			if audience_tag.as_ref() != id_tag {
-				let has_relationship = app
-					.meta_adapter
-					.read_profile(tn_id, audience_tag)
-					.await
-					.ok()
-					.is_some_and(|(_, p)| p.following || p.connected.is_connected());
+	if !allow_unknown && let Some(ref audience_tag) = action.audience_tag {
+		// Skip validation if audience is ourselves
+		if audience_tag.as_ref() != id_tag {
+			let has_relationship = app
+				.meta_adapter
+				.read_profile(tn_id, audience_tag)
+				.await
+				.ok()
+				.is_some_and(|(_, p)| p.following || p.connected.is_connected());
 
-				if !has_relationship {
-					return Err(Error::ValidationError(format!(
-						"Cannot send {} to unknown recipient {}",
-						action.typ, audience_tag
-					)));
-				}
+			if !has_relationship {
+				return Err(Error::ValidationError(format!(
+					"Cannot send {} to unknown recipient {}",
+					action.typ, audience_tag
+				)));
 			}
 		}
 	}
@@ -116,37 +114,27 @@ pub async fn create_action(
 		let is_delete = sub_type.as_deref() == Some("DEL");
 
 		if !is_delete {
-			if let Some(flag) = behavior.as_ref().and_then(|b| b.gated_by_parent_flag) {
-				if let Some(ref parent_id) = action.parent_id {
-					if !parent_id.starts_with('@') {
-						if let Ok(Some(parent)) =
-							app.meta_adapter.get_action(tn_id, parent_id).await
-						{
-							if !helpers::is_capability_enabled(parent.flags.as_deref(), flag) {
-								return Err(Error::ValidationError(format!(
-									"{} is disabled on the parent action",
-									action.typ
-								)));
-							}
-						}
-					}
-				}
+			if let Some(flag) = behavior.as_ref().and_then(|b| b.gated_by_parent_flag)
+				&& let Some(ref parent_id) = action.parent_id
+				&& !parent_id.starts_with('@')
+				&& let Ok(Some(parent)) = app.meta_adapter.get_action(tn_id, parent_id).await
+				&& !helpers::is_capability_enabled(parent.flags.as_deref(), flag)
+			{
+				return Err(Error::ValidationError(format!(
+					"{} is disabled on the parent action",
+					action.typ
+				)));
 			}
-			if let Some(flag) = behavior.as_ref().and_then(|b| b.gated_by_subject_flag) {
-				if let Some(ref subject_id) = action.subject {
-					if !subject_id.starts_with('@') {
-						if let Ok(Some(subject)) =
-							app.meta_adapter.get_action(tn_id, subject_id).await
-						{
-							if !helpers::is_capability_enabled(subject.flags.as_deref(), flag) {
-								return Err(Error::ValidationError(format!(
-									"{} is disabled on the subject action",
-									action.typ
-								)));
-							}
-						}
-					}
-				}
+			if let Some(flag) = behavior.as_ref().and_then(|b| b.gated_by_subject_flag)
+				&& let Some(ref subject_id) = action.subject
+				&& !subject_id.starts_with('@')
+				&& let Ok(Some(subject)) = app.meta_adapter.get_action(tn_id, subject_id).await
+				&& !helpers::is_capability_enabled(subject.flags.as_deref(), flag)
+			{
+				return Err(Error::ValidationError(format!(
+					"{} is disabled on the subject action",
+					action.typ
+				)));
 			}
 		}
 	}
@@ -734,32 +722,30 @@ async fn schedule_delivery(
 	}
 
 	// For APRV actions: check if the subject action should be broadcast to followers
-	if action.typ.as_ref() == "APRV" {
-		if let Some(ref subject_id) = action.subject {
-			// Get the subject action to check its broadcast behavior
-			if let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await {
-				let subject_broadcast = dsl
-					.get_behavior(&subject_action.typ)
-					.and_then(|b| b.broadcast)
-					.unwrap_or(false);
+	if action.typ.as_ref() == "APRV"
+		&& let Some(ref subject_id) = action.subject
+	{
+		// Get the subject action to check its broadcast behavior
+		if let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await {
+			let subject_broadcast =
+				dsl.get_behavior(&subject_action.typ).and_then(|b| b.broadcast).unwrap_or(false);
 
-				if subject_broadcast {
-					debug!(
-						"APRV {} subject {} has broadcast=true, fanning out to followers",
-						action_id, subject_id
-					);
-					// Fan-out APRV to followers with related action (the approved POST)
-					// Also send to author (audience) who may not be a follower
-					return schedule_broadcast_delivery(
-						app,
-						tn_id,
-						id_tag,
-						action_id,
-						Some(subject_id.as_ref()),
-						action.audience_tag.as_deref(),
-					)
-					.await;
-				}
+			if subject_broadcast {
+				debug!(
+					"APRV {} subject {} has broadcast=true, fanning out to followers",
+					action_id, subject_id
+				);
+				// Fan-out APRV to followers with related action (the approved POST)
+				// Also send to author (audience) who may not be a follower
+				return schedule_broadcast_delivery(
+					app,
+					tn_id,
+					id_tag,
+					action_id,
+					Some(subject_id.as_ref()),
+					action.audience_tag.as_deref(),
+				)
+				.await;
 			}
 		}
 	}
@@ -775,21 +761,19 @@ async fn schedule_delivery(
 	let deliver_to_subject_owner =
 		behavior.as_ref().and_then(|b| b.deliver_to_subject_owner).unwrap_or(false);
 
-	if deliver_to_subject_owner {
-		if let Some(ref subject_id) = action.subject {
-			// Look up the subject action to find its owner
-			if let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await {
-				let subject_owner = &subject_action.issuer.id_tag;
-				// Add subject owner if not already in recipients and not self
-				if subject_owner.as_ref() != id_tag
-					&& !recipients.iter().any(|r| r.as_ref() == subject_owner.as_ref())
-				{
-					info!(
-						"→ DUAL DELIVERY: Adding subject owner {} for {} (deliver_to_subject_owner)",
-						subject_owner, action_id
-					);
-					recipients.push(subject_owner.clone());
-				}
+	if deliver_to_subject_owner && let Some(ref subject_id) = action.subject {
+		// Look up the subject action to find its owner
+		if let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await {
+			let subject_owner = &subject_action.issuer.id_tag;
+			// Add subject owner if not already in recipients and not self
+			if subject_owner.as_ref() != id_tag
+				&& !recipients.iter().any(|r| r.as_ref() == subject_owner.as_ref())
+			{
+				info!(
+					"→ DUAL DELIVERY: Adding subject owner {} for {} (deliver_to_subject_owner)",
+					subject_owner, action_id
+				);
+				recipients.push(subject_owner.clone());
 			}
 		}
 	}
@@ -900,10 +884,10 @@ async fn schedule_broadcast_delivery(
 	}
 
 	// Always send to author (they need to know their action was approved, even if not a follower)
-	if let Some(author) = author_id_tag {
-		if author != id_tag {
-			recipients.insert(author.into());
-		}
+	if let Some(author) = author_id_tag
+		&& author != id_tag
+	{
+		recipients.insert(author.into());
 	}
 
 	// Log summary with up to 3 recipient names

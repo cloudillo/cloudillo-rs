@@ -3,7 +3,7 @@
 
 //! Error handling subsystem. Implements a custom Error type.
 
-use axum::{http::StatusCode, response::IntoResponse, Json};
+use axum::{Json, http::StatusCode, response::IntoResponse};
 use tracing::warn;
 
 use crate::types::ErrorResponse;

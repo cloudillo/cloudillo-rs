@@ -27,7 +27,6 @@ pub mod settings;
 pub mod ws_broadcast;
 pub mod ws_bus;
 
-use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 

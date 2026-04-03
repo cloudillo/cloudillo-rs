@@ -331,14 +331,14 @@ pub async fn generate_image_variants(
 			continue;
 		}
 		// Skip variants exceeding max_generate_variant setting
-		if let Some(parsed) = variant::Variant::parse(variant_name) {
-			if parsed.quality > max_quality {
-				info!(
-					"Skipping variant {} - exceeds max_generate_variant {}",
-					variant_name, max_quality_str
-				);
-				continue;
-			}
+		if let Some(parsed) = variant::Variant::parse(variant_name)
+			&& parsed.quality > max_quality
+		{
+			info!(
+				"Skipping variant {} - exceeds max_generate_variant {}",
+				variant_name, max_quality_str
+			);
+			continue;
 		}
 		if let Some(tier) = preset::get_image_tier(variant_name) {
 			let variant_bbox_f = u32_to_f32(tier.max_dim);

@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use futures_core::Stream;
 use tokio::{
-	fs::{create_dir_all, metadata, remove_file, rename, File},
+	fs::{File, create_dir_all, metadata, remove_file, rename},
 	io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
 };
 use tokio_util::{bytes::Bytes, io::ReaderStream};

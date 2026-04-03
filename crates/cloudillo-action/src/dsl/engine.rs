@@ -6,7 +6,7 @@
 //! The engine loads action definitions, validates them, and executes lifecycle hooks
 //! (on_create, on_receive, on_accept, on_reject) with proper resource limits and error handling.
 
-use super::operations::{OperationExecutor, EARLY_RETURN_MARKER};
+use super::operations::{EARLY_RETURN_MARKER, OperationExecutor};
 use super::types::{
 	ActionDefinition, BehaviorFlags, ContentSchema, ContentType, FieldConstraint, FieldConstraints,
 	FieldType, SchemaField,
@@ -141,11 +141,7 @@ impl DslEngine {
 				return Some(full);
 			}
 		}
-		if self.definitions.contains_key(typ) {
-			Some(typ.to_string())
-		} else {
-			None
-		}
+		if self.definitions.contains_key(typ) { Some(typ.to_string()) } else { None }
 	}
 
 	/// Execute a hook for an action type
@@ -484,22 +480,23 @@ impl DslEngine {
 			})?;
 
 		// Check field constraints for content
-		if let Some(FieldConstraint::Required) = definition.fields.content {
-			if content.is_none() || matches!(content, Some(serde_json::Value::Null)) {
-				return Err(Error::ValidationError(format!(
-					"Content is required for action type {}",
-					action_type
-				)));
-			}
+		if let Some(FieldConstraint::Required) = definition.fields.content
+			&& (content.is_none() || matches!(content, Some(serde_json::Value::Null)))
+		{
+			return Err(Error::ValidationError(format!(
+				"Content is required for action type {}",
+				action_type
+			)));
 		}
 
-		if let Some(FieldConstraint::Forbidden) = definition.fields.content {
-			if content.is_some() && !matches!(content, Some(serde_json::Value::Null)) {
-				return Err(Error::ValidationError(format!(
-					"Content is forbidden for action type {}",
-					action_type
-				)));
-			}
+		if let Some(FieldConstraint::Forbidden) = definition.fields.content
+			&& content.is_some()
+			&& !matches!(content, Some(serde_json::Value::Null))
+		{
+			return Err(Error::ValidationError(format!(
+				"Content is forbidden for action type {}",
+				action_type
+			)));
 		}
 
 		// If no schema defined or no content, validation passes
@@ -531,23 +528,23 @@ impl DslEngine {
 					.ok_or_else(|| Error::ValidationError(format!("{}: expected string", path)))?;
 
 				// Check min_length
-				if let Some(min) = schema.min_length {
-					if s.len() < min {
-						return Err(Error::ValidationError(format!(
-							"{}: string too short (min {})",
-							path, min
-						)));
-					}
+				if let Some(min) = schema.min_length
+					&& s.len() < min
+				{
+					return Err(Error::ValidationError(format!(
+						"{}: string too short (min {})",
+						path, min
+					)));
 				}
 
 				// Check max_length
-				if let Some(max) = schema.max_length {
-					if s.len() > max {
-						return Err(Error::ValidationError(format!(
-							"{}: string too long (max {})",
-							path, max
-						)));
-					}
+				if let Some(max) = schema.max_length
+					&& s.len() > max
+				{
+					return Err(Error::ValidationError(format!(
+						"{}: string too long (max {})",
+						path, max
+					)));
 				}
 
 				// Check pattern
@@ -581,13 +578,13 @@ impl DslEngine {
 				}
 
 				// Check enum
-				if let Some(ref allowed) = schema.r#enum {
-					if !allowed.contains(value) {
-						return Err(Error::ValidationError(format!(
-							"{}: value not in allowed enum",
-							path
-						)));
-					}
+				if let Some(ref allowed) = schema.r#enum
+					&& !allowed.contains(value)
+				{
+					return Err(Error::ValidationError(format!(
+						"{}: value not in allowed enum",
+						path
+					)));
 				}
 			}
 
@@ -650,22 +647,22 @@ impl DslEngine {
 					.as_str()
 					.ok_or_else(|| Error::ValidationError(format!("{}: expected string", path)))?;
 
-				if let Some(min) = schema.min_length {
-					if s.len() < min {
-						return Err(Error::ValidationError(format!(
-							"{}: string too short (min {})",
-							path, min
-						)));
-					}
+				if let Some(min) = schema.min_length
+					&& s.len() < min
+				{
+					return Err(Error::ValidationError(format!(
+						"{}: string too short (min {})",
+						path, min
+					)));
 				}
 
-				if let Some(max) = schema.max_length {
-					if s.len() > max {
-						return Err(Error::ValidationError(format!(
-							"{}: string too long (max {})",
-							path, max
-						)));
-					}
+				if let Some(max) = schema.max_length
+					&& s.len() > max
+				{
+					return Err(Error::ValidationError(format!(
+						"{}: string too long (max {})",
+						path, max
+					)));
 				}
 
 				if let Some(ref allowed) = schema.r#enum {

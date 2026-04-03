@@ -5,11 +5,11 @@
 //! has an active session to approve the desktop login.
 
 use axum::{
-	extract::{ConnectInfo, Path, Query, State},
-	http::{header, HeaderMap, StatusCode},
 	Json,
+	extract::{ConnectInfo, Path, Query, State},
+	http::{HeaderMap, StatusCode, header},
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL};
 use dashmap::DashMap;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -19,10 +19,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-use cloudillo_core::{extract::OptionalRequestId, Auth};
+use cloudillo_core::{Auth, extract::OptionalRequestId};
 use cloudillo_types::types::ApiResponse;
 
-use crate::handler::{return_login, Login};
+use crate::handler::{Login, return_login};
 use crate::prelude::*;
 
 /// Session expiry: 5 minutes

@@ -196,7 +196,7 @@ impl ExpressionEvaluator {
 					return Err(Error::ValidationError(format!(
 						"Cannot access property '{}' on non-object",
 						part
-					)))
+					)));
 				}
 			}
 		}

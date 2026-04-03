@@ -44,8 +44,8 @@ use redb::{ReadableDatabase, ReadableTable};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, trace};
 

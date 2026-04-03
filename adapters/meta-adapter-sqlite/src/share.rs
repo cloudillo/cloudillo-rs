@@ -5,7 +5,7 @@
 //!
 //! Handles CRUD operations for share entries (user shares, link shares, file-to-file links).
 
-use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
 use cloudillo_types::meta_adapter::{CreateShareEntry, ShareEntry};
 use cloudillo_types::prelude::*;

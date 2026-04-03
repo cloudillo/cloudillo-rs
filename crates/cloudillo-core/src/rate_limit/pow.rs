@@ -127,11 +127,7 @@ impl PowCounterStore {
 		key: &AddressKey,
 	) -> u32 {
 		let cache = cache.read();
-		if let Some(entry) = cache.peek(key) {
-			self.apply_decay(entry)
-		} else {
-			0
-		}
+		if let Some(entry) = cache.peek(key) { self.apply_decay(entry) } else { 0 }
 	}
 
 	/// Apply time-based decay to counter

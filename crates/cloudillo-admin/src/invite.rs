@@ -3,14 +3,14 @@
 
 //! Admin invite endpoint for community profile creation
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::prelude::*;
-use cloudillo_core::extract::Auth;
 use cloudillo_core::CreateActionFn;
-use cloudillo_ref::service::{create_ref_internal, CreateRefInternalParams};
+use cloudillo_core::extract::Auth;
+use cloudillo_ref::service::{CreateRefInternalParams, create_ref_internal};
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::types::ApiResponse;
 

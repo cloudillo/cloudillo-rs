@@ -28,10 +28,10 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.scope(SettingScope::Tenant)
 			.permission(PermissionLevel::User)
 			.validator(|v| {
-				if let SettingValue::String(s) = v {
-					if ["P", "C", "F"].contains(&s.as_str()) {
-						return Ok(());
-					}
+				if let SettingValue::String(s) = v
+					&& ["P", "C", "F"].contains(&s.as_str())
+				{
+					return Ok(());
 				}
 				Err(Error::ValidationError("Visibility must be P, C, or F".into()))
 			})
@@ -58,10 +58,10 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.scope(SettingScope::Tenant)
 			.permission(PermissionLevel::User)
 			.validator(|v| {
-				if let SettingValue::String(s) = v {
-					if ["M", "A", "I"].contains(&s.as_str()) {
-						return Ok(());
-					}
+				if let SettingValue::String(s) = v
+					&& ["M", "A", "I"].contains(&s.as_str())
+				{
+					return Ok(());
 				}
 				Err(Error::ValidationError(
 					"Connection mode must be 'M' (manual), 'A' (auto-accept) or 'I' (ignore)"

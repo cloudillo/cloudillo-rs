@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 use axum::{
+	Json,
 	extract::{ConnectInfo, Path, Query, State},
 	http::StatusCode,
-	Json,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -14,9 +14,9 @@ use cloudillo_types::hasher::hash;
 use cloudillo_types::utils::decode_jwt_no_verify;
 
 use cloudillo_core::{
+	IdTag,
 	extract::{Auth, OptionalAuth, OptionalRequestId},
 	rate_limit::RateLimitApi,
-	IdTag,
 };
 use cloudillo_types::auth_adapter::ActionToken;
 use cloudillo_types::meta_adapter;
@@ -95,10 +95,11 @@ pub async fn post_action(
 	Json(action): Json<CreateAction>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
 	// Defense-in-depth: apkg:publish scoped keys can only create APKG actions
-	if let Some(ref scope) = auth.scope {
-		if scope.as_ref() == "apkg:publish" && action.typ.as_ref() != "APKG" {
-			return Err(Error::PermissionDenied);
-		}
+	if let Some(ref scope) = auth.scope
+		&& scope.as_ref() == "apkg:publish"
+		&& action.typ.as_ref() != "APKG"
+	{
+		return Err(Error::PermissionDenied);
 	}
 
 	let action_id = task::create_action(&app, tn_id, &id_tag, action).await?;
@@ -163,16 +164,16 @@ pub async fn post_inbox(
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	// Pre-decode to check action type for PoW requirement
 	// This check happens here so the error is returned synchronously to the client
-	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&inbox.token) {
-		if action_preview.t.starts_with("CONN") {
-			// Check PoW requirement for CONN actions
-			if let Err(pow_err) = app.rate_limiter.verify_pow(&addr.ip(), &inbox.token) {
-				debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
-				return Err(Error::PreconditionRequired(format!(
-					"Proof of work required: {}",
-					pow_err
-				)));
-			}
+	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&inbox.token)
+		&& action_preview.t.starts_with("CONN")
+	{
+		// Check PoW requirement for CONN actions
+		if let Err(pow_err) = app.rate_limiter.verify_pow(&addr.ip(), &inbox.token) {
+			debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
+			return Err(Error::PreconditionRequired(format!(
+				"Proof of work required: {}",
+				pow_err
+			)));
 		}
 	}
 
@@ -234,16 +235,12 @@ pub async fn post_inbox_sync(
 	debug!("POST /api/inbox/sync - Processing synchronous action");
 
 	// Pre-decode to check action type for PoW requirement (same as post_inbox)
-	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&inbox.token) {
-		if action_preview.t.starts_with("CONN") {
-			if let Err(pow_err) = app.rate_limiter.verify_pow(&socket_addr.ip(), &inbox.token) {
-				debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
-				return Err(Error::PreconditionRequired(format!(
-					"Proof of work required: {}",
-					pow_err
-				)));
-			}
-		}
+	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&inbox.token)
+		&& action_preview.t.starts_with("CONN")
+		&& let Err(pow_err) = app.rate_limiter.verify_pow(&socket_addr.ip(), &inbox.token)
+	{
+		debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
+		return Err(Error::PreconditionRequired(format!("Proof of work required: {}", pow_err)));
 	}
 
 	// Create action ID from token hash
@@ -320,10 +317,11 @@ pub async fn post_action_accept(
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
 	// Verify the caller is the action's audience (or the tenant owner)
-	if let Some(ref aud) = action.audience {
-		if aud.id_tag.as_ref() != auth.id_tag.as_ref() && id_tag.as_ref() != auth.id_tag.as_ref() {
-			return Err(Error::PermissionDenied);
-		}
+	if let Some(ref aud) = action.audience
+		&& aud.id_tag.as_ref() != auth.id_tag.as_ref()
+		&& id_tag.as_ref() != auth.id_tag.as_ref()
+	{
+		return Err(Error::PermissionDenied);
 	}
 
 	// Execute DSL on_accept hook if action type has one
@@ -438,10 +436,11 @@ pub async fn post_action_reject(
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
 	// Verify the caller is the action's audience (or the tenant owner)
-	if let Some(ref aud) = action.audience {
-		if aud.id_tag.as_ref() != auth.id_tag.as_ref() && id_tag.as_ref() != auth.id_tag.as_ref() {
-			return Err(Error::PermissionDenied);
-		}
+	if let Some(ref aud) = action.audience
+		&& aud.id_tag.as_ref() != auth.id_tag.as_ref()
+		&& id_tag.as_ref() != auth.id_tag.as_ref()
+	{
+		return Err(Error::PermissionDenied);
 	}
 
 	// Execute DSL on_reject hook if action type has one

@@ -14,10 +14,10 @@ use serde_with::skip_serializing_none;
 use crate::prelude::*;
 use cloudillo_core::settings::SettingValue;
 use cloudillo_core::{
+	CreateCompleteTenantFn,
 	bootstrap_types::CreateCompleteTenantOptions,
 	dns::{create_recursive_resolver, resolve_domain_addresses, validate_domain_address},
 	extract::OptionalAuth,
-	CreateCompleteTenantFn,
 };
 use cloudillo_idp::registration::{IdpRegContent, IdpRegResponse};
 use cloudillo_types::action_types::CreateAction;
@@ -108,10 +108,10 @@ pub async fn verify_register_data(
 				response.id_tag_error = "invalid".to_string();
 			}
 
-			if let Some(app_domain) = app_domain {
-				if app_domain.starts_with("cl-o.") || !domain_regex.is_match(app_domain) {
-					response.app_domain_error = "invalid".to_string();
-				}
+			if let Some(app_domain) = app_domain
+				&& (app_domain.starts_with("cl-o.") || !domain_regex.is_match(app_domain))
+			{
+				response.app_domain_error = "invalid".to_string();
 			}
 
 			if !response.id_tag_error.is_empty() || !response.app_domain_error.is_empty() {
@@ -327,7 +327,7 @@ async fn handle_idp_registration(
 		.ok_or_else(|| Error::ConfigError("BASE_ID_TAG not configured".into()))?;
 
 	let expires_at = Timestamp::now().add_seconds(86400 * 30); // 30 days
-															// Include all local addresses from the app configuration (comma-separated)
+	// Include all local addresses from the app configuration (comma-separated)
 	let address = if app.opts.local_address.is_empty() {
 		None
 	} else {
@@ -724,14 +724,14 @@ pub async fn post_register(
 	};
 
 	// If registration succeeded, consume the token
-	if result.is_ok() {
-		if let Err(e) = app.meta_adapter.use_ref(&req.token, &["register"]).await {
-			warn!(
-				error = %e,
-				"Failed to consume registration token after successful registration"
-			);
-			// Continue anyway - registration already succeeded
-		}
+	if result.is_ok()
+		&& let Err(e) = app.meta_adapter.use_ref(&req.token, &["register"]).await
+	{
+		warn!(
+			error = %e,
+			"Failed to consume registration token after successful registration"
+		);
+		// Continue anyway - registration already succeeded
 	}
 
 	result

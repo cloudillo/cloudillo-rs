@@ -8,7 +8,7 @@ use axum::http::header::HeaderMap;
 use instant_acme::{self as acme, Account};
 use rustls::crypto::CryptoProvider;
 use rustls::sign::CertifiedKey;
-use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::sync::Arc;
 use x509_parser::parse_x509_certificate;
 
@@ -151,14 +151,14 @@ async fn renew_domains<'a>(
 			while let Some(result) = authorizations.next().await {
 				if let Ok(authz) = result {
 					for challenge in &authz.challenges {
-						if challenge.r#type == acme::ChallengeType::Http01 {
-							if let Some(ref err) = challenge.error {
-								warn!(
-									"ACME validation failed for {}: {}",
-									authz.identifier(),
-									err.detail.as_deref().unwrap_or("unknown error")
-								);
-							}
+						if challenge.r#type == acme::ChallengeType::Http01
+							&& let Some(ref err) = challenge.error
+						{
+							warn!(
+								"ACME validation failed for {}: {}",
+								authz.identifier(),
+								err.detail.as_deref().unwrap_or("unknown error")
+							);
 						}
 					}
 				}

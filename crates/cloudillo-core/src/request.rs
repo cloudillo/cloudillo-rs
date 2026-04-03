@@ -5,13 +5,13 @@
 
 use futures::TryStreamExt;
 use futures_core::stream::Stream;
-use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full, StreamBody};
+use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::BoxBody};
 use hyper::http::StatusCode;
-use hyper::{body::Body, body::Bytes, Method};
+use hyper::{Method, body::Body, body::Bytes};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncRead;
@@ -168,7 +168,7 @@ impl Request {
 		tn_id: TnId,
 		id_tag: &str,
 		path: &str,
-	) -> ClResult<impl AsyncRead + Send + Unpin> {
+	) -> ClResult<impl AsyncRead + Send + Unpin + use<>> {
 		let token = self.create_proxy_token(tn_id, id_tag, None).await?;
 		debug!("Got proxy token (len={})", token.len());
 		let req = hyper::Request::builder()

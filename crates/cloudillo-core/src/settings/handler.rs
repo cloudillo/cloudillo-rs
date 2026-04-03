@@ -4,9 +4,9 @@
 //! Settings management handlers
 
 use axum::{
+	Json,
 	extract::{Path, Query, State},
 	http::StatusCode,
-	Json,
 };
 use serde::Deserialize;
 

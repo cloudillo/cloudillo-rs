@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 
 use crate::prelude::*;
-use cloudillo_core::extract::OptionalRequestId;
 use cloudillo_core::IdTag;
+use cloudillo_core::extract::OptionalRequestId;
 use cloudillo_types::types::{ApiResponse, Profile};
 
 pub async fn get_tenant_profile(

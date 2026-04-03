@@ -6,7 +6,7 @@
 //! Implements RFC 8030 (HTTP/2 Push), RFC 8188 (Encrypted Content-Encoding),
 //! RFC 8291 (Message Encryption for Web Push), and RFC 8292 (VAPID).
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper_rustls::HttpsConnectorBuilder;
@@ -160,7 +160,7 @@ fn encrypt_payload(
 /// private_key_raw is the raw 32-byte P-256 scalar, base64url encoded
 /// (compatible with TypeScript version storage format)
 fn create_vapid_jwt(endpoint: &str, id_tag: &str, private_key_raw: &str) -> Result<String, String> {
-	use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+	use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 	use p256::pkcs8::EncodePrivateKey;
 	use p256::pkcs8::LineEnding;
 

@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use url::Url;
 
 use rustls::sign::CertifiedKey;
-use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 use crate::prelude::*;
 use cloudillo_types::auth_adapter::ProxySiteConfig;
@@ -61,10 +61,10 @@ pub async fn reload_proxy_cache(app: &App) -> ClResult<()> {
 			if site.status.as_ref() == "D" {
 				continue;
 			}
-			if let (Some(cert_pem), Some(key_pem)) = (site.cert.as_ref(), site.cert_key.as_ref()) {
-				if let Some(certified_key) = build_certified_key(cert_pem, key_pem) {
-					cert_cache.insert(site.domain.clone(), Arc::new(certified_key));
-				}
+			if let (Some(cert_pem), Some(key_pem)) = (site.cert.as_ref(), site.cert_key.as_ref())
+				&& let Some(certified_key) = build_certified_key(cert_pem, key_pem)
+			{
+				cert_cache.insert(site.domain.clone(), Arc::new(certified_key));
 			}
 		}
 	}

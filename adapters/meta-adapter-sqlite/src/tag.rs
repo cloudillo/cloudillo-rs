@@ -41,10 +41,10 @@ pub(crate) async fn list(
 				let tag = tag.trim();
 				if !tag.is_empty() {
 					// Apply prefix filter if specified
-					if let Some(p) = prefix {
-						if !tag.starts_with(p) {
-							continue;
-						}
+					if let Some(p) = prefix
+						&& !tag.starts_with(p)
+					{
+						continue;
 					}
 					*tag_counts.entry(tag.to_string()).or_insert(0) += 1;
 				}

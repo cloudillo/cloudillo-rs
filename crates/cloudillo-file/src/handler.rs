@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 use axum::{
-	body::{to_bytes, Body},
+	Json,
+	body::{Body, to_bytes},
 	extract::{self, Query, State},
 	http::StatusCode,
-	response, Json,
+	response,
 };
 use futures_core::Stream;
 use serde::Deserialize;
@@ -602,10 +603,10 @@ async fn handle_post_video_stream(
 			continue; // Already created thumbnail synchronously
 		}
 		// Skip variants exceeding max_generate_variant setting
-		if let Some(parsed) = variant::Variant::parse(variant_name) {
-			if parsed.quality > max_quality {
-				continue;
-			}
+		if let Some(parsed) = variant::Variant::parse(variant_name)
+			&& parsed.quality > max_quality
+		{
+			continue;
 		}
 		if let Some(tier) = get_image_tier(variant_name) {
 			let task = ImageResizerTask::new(
@@ -623,10 +624,10 @@ async fn handle_post_video_stream(
 	// 5b. Create video transcode tasks
 	for variant_name in &preset.video_variants {
 		// Skip variants exceeding max_generate_variant setting
-		if let Some(parsed) = variant::Variant::parse(variant_name) {
-			if parsed.quality > max_quality {
-				continue;
-			}
+		if let Some(parsed) = variant::Variant::parse(variant_name)
+			&& parsed.quality > max_quality
+		{
+			continue;
 		}
 		if let Some(tier) = get_video_tier(variant_name) {
 			let task = VideoTranscoderTask::new(
@@ -645,10 +646,10 @@ async fn handle_post_video_stream(
 	if preset.extract_audio {
 		for variant_name in &preset.audio_variants {
 			// Skip variants exceeding max_generate_variant setting
-			if let Some(parsed) = variant::Variant::parse(variant_name) {
-				if parsed.quality > max_quality {
-					continue;
-				}
+			if let Some(parsed) = variant::Variant::parse(variant_name)
+				&& parsed.quality > max_quality
+			{
+				continue;
 			}
 			if let Some(tier) = get_audio_tier(variant_name) {
 				let task = AudioExtractorTask::new(
@@ -742,10 +743,10 @@ async fn handle_post_audio_stream(
 	let mut task_ids = Vec::new();
 	for variant_name in &preset.audio_variants {
 		// Skip variants exceeding max_generate_variant setting
-		if let Some(parsed) = variant::Variant::parse(variant_name) {
-			if parsed.quality > max_quality {
-				continue;
-			}
+		if let Some(parsed) = variant::Variant::parse(variant_name)
+			&& parsed.quality > max_quality
+		{
+			continue;
 		}
 		if let Some(tier) = get_audio_tier(variant_name) {
 			let task = AudioExtractorTask::new(
@@ -1024,7 +1025,7 @@ pub async fn post_file_blob(
 			return Err(Error::ValidationError(format!(
 				"preset '{}' does not allow {:?} uploads",
 				preset.name, class
-			)))
+			)));
 		}
 		None if preset.allowed_media_classes.contains(&VariantClass::Raw) => VariantClass::Raw,
 		None => return Err(Error::ValidationError("unsupported media type".into())),

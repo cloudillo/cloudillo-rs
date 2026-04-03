@@ -351,13 +351,7 @@ pub(crate) async fn update(
 		has_updates,
 		"synced_at",
 		&profile.synced,
-		expr | v | {
-			if *v {
-				Some("unixepoch()")
-			} else {
-				None
-			}
-		}
+		expr | v | { if *v { Some("unixepoch()") } else { None } }
 	);
 
 	has_updates = push_patch!(query, has_updates, "following", &profile.following);

@@ -28,16 +28,8 @@ use cloudillo_types::types::FileAttrs;
 /// A cloneable middleware function with return type `PermissionCheckOutput`
 pub fn check_perm_file(
 	action: &'static str,
-) -> impl Fn(
-	State<App>,
-	IdTag,
-	TnId,
-	OptionalAuth,
-	Path<String>,
-	Request,
-	Next,
-) -> PermissionCheckOutput
-       + Clone {
+) -> impl Fn(State<App>, IdTag, TnId, OptionalAuth, Path<String>, Request, Next) -> PermissionCheckOutput
++ Clone {
 	move |state, id_tag, tn_id, auth, path, req, next| {
 		Box::pin(check_file_permission(state, id_tag, tn_id, auth, path, req, next, action))
 	}
