@@ -6,6 +6,7 @@
 use crate::abac::AttrSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::skip_serializing_none;
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 // TnId //
@@ -304,13 +305,19 @@ pub struct Profile {
 	pub profile_pic: Option<String>,
 	pub cover_pic: Option<String>,
 	pub keys: Vec<crate::auth_adapter::AuthKey>,
+	/// Extensible metadata (profile sections, tab config, etc.)
+	pub x: Option<HashMap<String, String>>,
 }
 
 /// Profile patch for PATCH /me endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfilePatch {
+	#[serde(default)]
 	pub name: Patch<String>,
+	/// Extensible metadata fields (partial merge: existing keys preserved, null deletes)
+	#[serde(default)]
+	pub x: Option<HashMap<String, Option<String>>>,
 }
 
 /// Admin profile patch for PATCH /admin/profile/:idTag endpoint
@@ -347,6 +354,8 @@ pub struct ProfileInfo {
 		skip_serializing_if = "Option::is_none"
 	)]
 	pub created_at: Option<Timestamp>,
+	/// Extensible metadata (profile sections, tab config, etc.)
+	pub x: Option<HashMap<String, String>>,
 }
 
 /// Request body for community profile creation

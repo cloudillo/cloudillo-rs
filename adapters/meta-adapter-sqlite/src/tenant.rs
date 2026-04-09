@@ -111,6 +111,16 @@ pub(crate) async fn update(
 		push_patch!(query, has_updates, "profile_pic", &tenant.profile_pic, |v| v.as_str());
 	has_updates = push_patch!(query, has_updates, "cover_pic", &tenant.cover_pic, |v| v.as_str());
 
+	// Handle x field merge atomically using SQLite json_patch (RFC 7396)
+	if let Some(x_patch) = &tenant.x {
+		let patch_json = serde_json::to_string(x_patch).unwrap_or_else(|_| "{}".to_string());
+		if has_updates {
+			query.push(", ");
+		}
+		query.push("x=json_patch(COALESCE(x,'{}'),").push_bind(patch_json).push(")");
+		has_updates = true;
+	}
+
 	if !has_updates {
 		// No fields to update, but not an error
 		return Ok(());

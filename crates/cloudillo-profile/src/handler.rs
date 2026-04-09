@@ -23,6 +23,10 @@ pub async fn get_tenant_profile(
 		cloudillo_types::meta_adapter::ProfileType::Community => "community",
 	};
 
+	// Convert x HashMap<Box<str>, Box<str>> to HashMap<String, String>
+	let x_map: std::collections::HashMap<String, String> =
+		tenant_meta.x.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+
 	let profile = Profile {
 		id_tag: auth_profile.id_tag.to_string(),
 		name: tenant_meta.name.to_string(),
@@ -30,6 +34,7 @@ pub async fn get_tenant_profile(
 		profile_pic: tenant_meta.profile_pic.map(|s| s.to_string()),
 		cover_pic: tenant_meta.cover_pic.map(|s| s.to_string()),
 		keys: auth_profile.keys,
+		x: if x_map.is_empty() { None } else { Some(x_map) },
 	};
 
 	let mut response = ApiResponse::new(profile);

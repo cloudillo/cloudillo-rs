@@ -72,6 +72,7 @@ async fn test_update_tenant() {
 		typ: Patch::Undefined,
 		profile_pic: Patch::Undefined,
 		cover_pic: Patch::Undefined,
+		x: None,
 	};
 
 	let updated = adapter.update_tenant(tn_id, &update_data).await;

@@ -162,6 +162,9 @@ pub struct UpdateTenantData {
 	pub profile_pic: Patch<String>,
 	#[serde(rename = "coverPic", default)]
 	pub cover_pic: Patch<String>,
+	/// Partial merge for x JSON field: Some(value) = upsert, None = delete key
+	#[serde(default)]
+	pub x: Option<std::collections::HashMap<String, Option<String>>>,
 }
 
 #[derive(Debug)]

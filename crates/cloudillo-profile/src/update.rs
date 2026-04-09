@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::prelude::*;
 use cloudillo_core::extract::Auth;
-use cloudillo_types::meta_adapter::UpdateProfileData;
+use cloudillo_types::meta_adapter::{UpdateProfileData, UpdateTenantData};
 use cloudillo_types::types::{AdminProfilePatch, ProfileInfo, ProfilePatch};
 
 #[derive(Serialize)]
@@ -37,15 +37,34 @@ pub async fn patch_own_profile(
 ) -> ClResult<(StatusCode, Json<UpdateProfileResponse>)> {
 	let tn_id = auth.tn_id;
 
-	// Build profile update from patch
-	let profile_update =
-		UpdateProfileData { name: patch.name.map(Into::into), ..Default::default() };
+	// Validate x field limits
+	if let Some(ref x) = patch.x {
+		if x.len() > 32 {
+			return Err(Error::ValidationError("too many x fields (max 32)".into()));
+		}
+		for (key, value) in x {
+			if key.len() > 256 {
+				return Err(Error::ValidationError("x key too long (max 256)".into()));
+			}
+			if let Some(v) = value
+				&& v.len() > 4096
+			{
+				return Err(Error::ValidationError("x value too long (max 4096)".into()));
+			}
+		}
+	}
 
-	// Apply the patch
-	app.meta_adapter.update_profile(tn_id, &auth.id_tag, &profile_update).await?;
+	// Build tenant update (update_tenant syncs name/profile_pic to profiles table)
+	let tenant_update =
+		UpdateTenantData { name: patch.name.map(Into::into), x: patch.x, ..Default::default() };
+	app.meta_adapter.update_tenant(tn_id, &tenant_update).await?;
 
-	// Fetch updated profile
+	// Fetch updated profile and tenant data (for x field)
 	let profile_data = app.meta_adapter.get_profile_info(tn_id, &auth.id_tag).await?;
+	let tenant_data = app.meta_adapter.read_tenant(tn_id).await?;
+
+	let x_map: std::collections::HashMap<String, String> =
+		tenant_data.x.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
 	let profile = ProfileInfo {
 		id_tag: profile_data.id_tag.to_string(),
@@ -57,6 +76,7 @@ pub async fn patch_own_profile(
 		following: None,
 		roles: None,
 		created_at: Some(profile_data.created_at),
+		x: if x_map.is_empty() { None } else { Some(x_map) },
 	};
 
 	info!("User {} updated their profile", auth.id_tag);
@@ -111,6 +131,7 @@ pub async fn patch_profile_admin(
 		following: None,
 		roles: response_roles,
 		created_at: Some(profile_data.created_at),
+		x: None,
 	};
 
 	info!("Admin {} updated profile {}", auth.id_tag, id_tag);

@@ -84,6 +84,7 @@ pub async fn list_profiles(
 			following: Some(p.following),
 			roles: p.roles.map(|r| r.iter().map(ToString::to_string).collect()),
 			created_at: None, // Not available in Profile type
+			x: None,
 		})
 		.collect();
 
