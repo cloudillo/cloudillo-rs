@@ -42,6 +42,17 @@ pub enum ProfileStatus {
 	Banned,
 }
 
+/// Per-profile proxy-token preference for passive reads of a remote profile's content.
+/// Absent (NULL) means ask the user at the time of access.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProfileTrust {
+	/// Always authenticate via proxy token when accessing this profile.
+	Always,
+	/// Never authenticate; always access anonymously.
+	Never,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum ProfileConnectionStatus {
 	#[default]
@@ -176,6 +187,7 @@ pub struct Profile<S: AsRef<str>> {
 	pub following: bool,
 	pub connected: ProfileConnectionStatus,
 	pub roles: Option<Box<[Box<str>]>>,
+	pub trust: Option<ProfileTrust>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -187,6 +199,10 @@ pub struct ListProfileOptions {
 	pub following: Option<bool>,
 	pub q: Option<String>,
 	pub id_tag: Option<String>,
+	/// Filter profiles by whether a trust preference is set.
+	/// `Some(true)` returns only profiles with a non-null trust value;
+	/// `Some(false)` returns only profiles with NULL trust; `None` does not filter.
+	pub trust_set: Option<bool>,
 }
 
 /// Profile data returned from adapter queries
@@ -232,6 +248,8 @@ pub struct UpdateProfileData {
 	pub following: Patch<bool>,
 	#[serde(default)]
 	pub connected: Patch<ProfileConnectionStatus>,
+	#[serde(default)]
+	pub trust: Patch<ProfileTrust>,
 
 	// Sync metadata
 	#[serde(default)]

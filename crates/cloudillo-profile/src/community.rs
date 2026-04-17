@@ -298,6 +298,7 @@ pub async fn put_community_profile(
 		following: false,
 		connected: ProfileConnectionStatus::Connected,
 		roles: None,
+		trust: None,
 	};
 	app.meta_adapter.create_profile(community_tn_id, &creator_profile, "").await?;
 

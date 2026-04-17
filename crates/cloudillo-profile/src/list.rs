@@ -13,7 +13,7 @@ use serde_with::skip_serializing_none;
 
 use crate::prelude::*;
 use cloudillo_core::extract::OptionalRequestId;
-use cloudillo_types::meta_adapter::ListProfileOptions;
+use cloudillo_types::meta_adapter::{ListProfileOptions, ProfileTrust};
 use cloudillo_types::types::{ApiResponse, ProfileInfo};
 
 /// Profile with relationship status (for GET /api/profiles/:idTag)
@@ -29,6 +29,7 @@ pub struct ProfileWithStatus {
 	pub status: Option<String>,
 	pub connected: Option<bool>,
 	pub following: Option<bool>,
+	pub trust: Option<ProfileTrust>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +39,10 @@ pub struct ListProfilesQuery {
 	search: Option<String>,
 	#[serde(rename = "type")]
 	typ: Option<cloudillo_types::meta_adapter::ProfileType>,
+	/// `trustSet=true` returns only profiles with a non-null trust preference;
+	/// `trustSet=false` returns only profiles with no trust preference set.
+	/// Used by the shell's trusted-profiles settings page.
+	trust_set: Option<bool>,
 }
 
 /// GET /profile - List all profiles or search profiles
@@ -60,6 +65,7 @@ pub async fn list_profiles(
 		following: None,
 		q: params.search.as_ref().map(|s| s.to_lowercase()),
 		id_tag: None,
+		trust_set: params.trust_set,
 	};
 
 	// Fetch profiles with optional search
@@ -82,6 +88,7 @@ pub async fn list_profiles(
 			status: None, // Not available in Profile type
 			connected: Some(p.connected.is_connected()),
 			following: Some(p.following),
+			trust: p.trust,
 			roles: p.roles.map(|r| r.iter().map(ToString::to_string).collect()),
 			created_at: None, // Not available in Profile type
 			x: None,
@@ -119,6 +126,7 @@ pub async fn get_profile_by_id_tag(
 				status: None, // TODO: Add status to Profile struct
 				connected: Some(p.connected.is_connected()),
 				following: Some(p.following),
+				trust: p.trust,
 			})
 		}
 		Err(Error::NotFound) => None, // Return empty when not found locally

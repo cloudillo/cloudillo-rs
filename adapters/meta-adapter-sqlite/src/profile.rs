@@ -7,8 +7,8 @@ use sqlx::{Row, SqlitePool};
 
 use crate::utils::{collect_res, inspect, map_res, push_patch};
 use cloudillo_types::meta_adapter::{
-	ListProfileOptions, Profile, ProfileConnectionStatus, ProfileData, ProfileStatus, ProfileType,
-	UpdateProfileData,
+	ListProfileOptions, Profile, ProfileConnectionStatus, ProfileData, ProfileStatus, ProfileTrust,
+	ProfileType, UpdateProfileData,
 };
 use cloudillo_types::prelude::*;
 
@@ -76,6 +76,25 @@ fn connected_to_db(status: ProfileConnectionStatus) -> ConnectedDbValue {
 	}
 }
 
+/// Parse the `trust` CHAR(1) column into a `ProfileTrust` value.
+/// Unknown characters and NULL map to `None` (default "ask" behavior).
+fn parse_trust(row: &sqlx::sqlite::SqliteRow) -> Result<Option<ProfileTrust>, sqlx::Error> {
+	let raw: Option<String> = row.try_get("trust")?;
+	Ok(match raw.as_deref() {
+		Some("A") => Some(ProfileTrust::Always),
+		Some("N") => Some(ProfileTrust::Never),
+		_ => None,
+	})
+}
+
+/// Convert a `ProfileTrust` to its CHAR(1) database representation.
+fn trust_to_db(trust: ProfileTrust) -> &'static str {
+	match trust {
+		ProfileTrust::Always => "A",
+		ProfileTrust::Never => "N",
+	}
+}
+
 /// List profiles with filtering options
 pub(crate) async fn list(
 	db: &SqlitePool,
@@ -83,7 +102,7 @@ pub(crate) async fn list(
 	opts: &ListProfileOptions,
 ) -> ClResult<Vec<Profile<Box<str>>>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT id_tag, name, type, profile_pic, following, connected, roles
+		"SELECT id_tag, name, type, profile_pic, following, connected, roles, trust
 		 FROM profiles WHERE tn_id=",
 	);
 	query.push_bind(tn_id.0);
@@ -147,6 +166,14 @@ pub(crate) async fn list(
 		query.push(" AND id_tag=").push_bind(id_tag.as_str());
 	}
 
+	if let Some(trust_set) = opts.trust_set {
+		if trust_set {
+			query.push(" AND trust IS NOT NULL");
+		} else {
+			query.push(" AND trust IS NULL");
+		}
+	}
+
 	query.push(" ORDER BY name LIMIT 100");
 
 	let res = query
@@ -173,6 +200,7 @@ pub(crate) async fn list(
 			roles: row.try_get::<Option<String>, _>("roles")?.map(|s| {
 				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
 			}),
+			trust: parse_trust(row)?,
 		})
 	}))
 }
@@ -231,7 +259,7 @@ pub(crate) async fn read(
 	id_tag: &str,
 ) -> ClResult<(Box<str>, Profile<Box<str>>)> {
 	let res = sqlx::query(
-		"SELECT id_tag, type, name, profile_pic, status, perm, following, connected, roles, etag
+		"SELECT id_tag, type, name, profile_pic, status, perm, following, connected, roles, trust, etag
 		FROM profiles WHERE tn_id=? AND id_tag=?",
 	)
 	.bind(tn_id.0)
@@ -257,6 +285,7 @@ pub(crate) async fn read(
 			roles: row.try_get::<Option<String>, _>("roles")?.map(|s| {
 				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
 			}),
+			trust: parse_trust(&row)?,
 		};
 		Ok((etag, profile))
 	})
@@ -294,8 +323,8 @@ pub(crate) async fn create(
 		ProfileType::Community => "C",
 	};
 
-	sqlx::query("INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, following, connected, etag, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())")
+	sqlx::query("INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, following, connected, trust, etag, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())")
 		.bind(tn_id.0)
 		.bind(profile.id_tag)
 		.bind(profile.name)
@@ -303,11 +332,19 @@ pub(crate) async fn create(
 		.bind(profile.profile_pic)
 		.bind(profile.following)
 		.bind(connected_to_db(profile.connected))
+		.bind(profile.trust.map(trust_to_db))
 		.bind(etag)
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.map_err(|err| match &err {
+			sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+				Error::Conflict("profile already exists".into())
+			}
+			_ => {
+				inspect(&err);
+				Error::DbError
+			}
+		})?;
 
 	Ok(())
 }
@@ -361,6 +398,8 @@ pub(crate) async fn update(
 		ProfileConnectionStatus::RequestPending => ConnectedDbValue::Text("R"),
 		ProfileConnectionStatus::Connected => ConnectedDbValue::Int(1),
 	});
+
+	has_updates = push_patch!(query, has_updates, "trust", &profile.trust, |v| trust_to_db(*v));
 
 	// Sync metadata
 	has_updates = push_patch!(query, has_updates, "etag", &profile.etag, |v| v.as_ref());

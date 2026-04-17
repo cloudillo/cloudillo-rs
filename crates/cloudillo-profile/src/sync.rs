@@ -91,15 +91,39 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 				following: false, // Will be set by the calling hook
 				connected: ProfileConnectionStatus::Disconnected,
 				roles: None,
+				trust: None,
 			};
 
 			// Generate a simple etag
 			let etag = format!("sync-{}", Timestamp::now().0);
 
-			app.meta_adapter.create_profile(tn_id, &profile, &etag).await?;
-
-			tracing::info!("Successfully synced profile {} from remote", id_tag);
-			Ok(true)
+			match app.meta_adapter.create_profile(tn_id, &profile, &etag).await {
+				Ok(()) => {
+					tracing::info!("Successfully synced profile {} from remote", id_tag);
+					Ok(true)
+				}
+				Err(Error::Conflict(_)) => {
+					tracing::debug!("Profile {} created concurrently, skipping", id_tag);
+					// If we downloaded a picture the winner didn't set, surface it.
+					if let Some(file_id) = synced_profile_pic {
+						let update = UpdateProfileData {
+							profile_pic: Patch::Value(Some(file_id.into())),
+							..Default::default()
+						};
+						if let Err(e) =
+							app.meta_adapter.update_profile(tn_id, id_tag, &update).await
+						{
+							tracing::debug!(
+								"Could not surface synced profile_pic for {}: {}",
+								id_tag,
+								e
+							);
+						}
+					}
+					Ok(false)
+				}
+				Err(e) => Err(e),
+			}
 		}
 		Err(e) => {
 			tracing::warn!("Failed to fetch profile {} from remote: {}", id_tag, e);

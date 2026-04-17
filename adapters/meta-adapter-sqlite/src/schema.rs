@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 15;
+	const CURRENT_DB_VERSION: i64 = 16;
 
 	let mut tx = db.begin().await?;
 
@@ -124,6 +124,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			following boolean,
 			connected boolean,
 			roles text,
+			trust char(1),					-- Per-profile trust preference: 'A' always, 'N' never, NULL ask
 			synced_at INTEGER,
 			etag text,
 			created_at INTEGER DEFAULT (unixepoch()),
@@ -1063,6 +1064,16 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("ALTER TABLE refs ADD COLUMN params TEXT").execute(&mut *tx).await?;
 
 		set_db_version(&mut tx, 15).await;
+	}
+
+	// Version 16: Add trust column to profiles for per-profile proxy-token preference
+	// ('A' always, 'N' never, NULL = ask / default anonymous)
+	if version < 16 {
+		sqlx::query("ALTER TABLE profiles ADD COLUMN trust CHAR(1)")
+			.execute(&mut *tx)
+			.await?;
+
+		set_db_version(&mut tx, 16).await;
 	}
 
 	tx.commit().await?;

@@ -112,6 +112,7 @@ async fn test_list_profiles() {
 		following: None,
 		q: None,
 		id_tag: None,
+		trust_set: None,
 	};
 	let result = adapter.list_profiles(tn_id, &opts).await;
 

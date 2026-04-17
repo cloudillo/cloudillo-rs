@@ -348,6 +348,9 @@ pub struct ProfileInfo {
 	pub status: Option<String>,
 	pub connected: Option<bool>,
 	pub following: Option<bool>,
+	/// Per-profile trust preference controlling proxy-token use on passive reads.
+	/// `"always"` = always authenticate, `"never"` = never, absent = ask.
+	pub trust: Option<crate::meta_adapter::ProfileTrust>,
 	pub roles: Option<Vec<String>>,
 	#[serde(
 		serialize_with = "serialize_timestamp_iso_opt",
