@@ -849,6 +849,7 @@ pub async fn post_forgot_password(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	OptionalRequestId(req_id): OptionalRequestId,
+	id_tag_ext: Option<IdTag>,
 	Json(req): Json<ForgotPasswordReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ForgotPasswordRes>>)> {
 	let email = req.email.trim().to_lowercase();
@@ -869,22 +870,30 @@ pub async fn post_forgot_password(
 		return Ok((StatusCode::OK, Json(success_response())));
 	}
 
-	// Look up tenant by email
+	// Scope lookup to the current Host's tenant so that when the same email is
+	// registered against multiple tenants we only match the one the user is on.
+	let Some(IdTag(host_id_tag)) = id_tag_ext else {
+		info!(email = %email, "No Host/IdTag on request; returning silent success");
+		return Ok((StatusCode::OK, Json(success_response())));
+	};
+
 	let auth_opts =
-		ListTenantsOptions { status: None, q: Some(&email), limit: Some(10), offset: None };
+		ListTenantsOptions { status: None, q: Some(&host_id_tag), limit: Some(10), offset: None };
 	let tenants = match app.auth_adapter.list_tenants(&auth_opts).await {
 		Ok(t) => t,
 		Err(e) => {
-			warn!(email = %email, error = ?e, "Failed to look up tenant by email");
+			warn!(id_tag = %host_id_tag, error = ?e, "Failed to look up tenant by id_tag");
 			return Ok((StatusCode::OK, Json(success_response())));
 		}
 	};
 
-	// Find exact email match
-	let tenant = tenants.into_iter().find(|t| t.email.as_deref() == Some(email.as_str()));
+	// Pick exact id_tag match, then verify email matches the submitted email.
+	let tenant = tenants.into_iter().find(|t| {
+		t.id_tag.as_ref() == host_id_tag.as_ref() && t.email.as_deref() == Some(email.as_str())
+	});
 
 	let Some(tenant) = tenant else {
-		info!(email = %email, "No tenant found for email (not revealing)");
+		info!(id_tag = %host_id_tag, "Host tenant has no matching email (not revealing)");
 		return Ok((StatusCode::OK, Json(success_response())));
 	};
 

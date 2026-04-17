@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::request::Parts;
 
 use crate::error::Error;
@@ -39,6 +39,20 @@ where
 		} else {
 			Err(Error::PermissionDenied)
 		}
+	}
+}
+
+impl<S> OptionalFromRequestParts<S> for IdTag
+where
+	S: Send + Sync,
+{
+	type Rejection = Error;
+
+	async fn from_request_parts(
+		parts: &mut Parts,
+		_state: &S,
+	) -> Result<Option<Self>, Self::Rejection> {
+		Ok(parts.extensions.get::<IdTag>().cloned())
 	}
 }
 
