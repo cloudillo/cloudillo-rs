@@ -104,7 +104,7 @@ impl Default for RateLimitConfig {
 				ipv6_provider: RateLimitTierConfig::new(100, 200, 1000, 500),
 			},
 			max_tracked_ips: 100_000,
-			entry_ttl: Duration::from_secs(3600), // 1 hour
+			entry_ttl: Duration::from_hours(1),
 		}
 	}
 }

@@ -56,12 +56,11 @@ impl PenaltyReason {
 	/// Get the default ban duration for this reason
 	pub fn ban_duration(&self) -> Duration {
 		match self {
-			// 1 hour
 			PenaltyReason::AuthFailure | PenaltyReason::TokenVerificationFailure => {
-				Duration::from_secs(3600)
+				Duration::from_hours(1)
 			}
-			PenaltyReason::SuspiciousActivity => Duration::from_secs(7200), // 2 hours
-			PenaltyReason::RepeatedViolation => Duration::from_secs(86400), // 24 hours
+			PenaltyReason::SuspiciousActivity => Duration::from_hours(2),
+			PenaltyReason::RepeatedViolation => Duration::from_hours(24),
 		}
 	}
 }

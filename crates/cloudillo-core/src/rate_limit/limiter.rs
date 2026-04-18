@@ -266,32 +266,33 @@ impl RateLimitApi for RateLimitManager {
 		let keys = AddressKey::extract_all(addr);
 		let bans = self.bans.read();
 
-		let statuses =
-			keys.into_iter()
-				.map(|key| {
-					let is_banned = bans.peek(&key).is_some_and(|b| !b.is_expired());
-					let ban_expires = bans.peek(&key).and_then(|b| {
-						if b.is_expired() {
-							None
-						} else {
-							Some(b.expires_at.unwrap_or_else(|| {
-								Instant::now() + Duration::from_secs(86400 * 365)
-							}))
-						}
-					});
+		let statuses = keys
+			.into_iter()
+			.map(|key| {
+				let is_banned = bans.peek(&key).is_some_and(|b| !b.is_expired());
+				let ban_expires = bans.peek(&key).and_then(|b| {
+					if b.is_expired() {
+						None
+					} else {
+						Some(
+							b.expires_at
+								.unwrap_or_else(|| Instant::now() + Duration::from_hours(24 * 365)),
+						)
+					}
+				});
 
-					let status = RateLimitStatus {
-						is_limited: false, // Would need to check governor state
-						remaining: None,
-						reset_at: None,
-						quota: 0,
-						is_banned,
-						ban_expires_at: ban_expires,
-					};
+				let status = RateLimitStatus {
+					is_limited: false, // Would need to check governor state
+					remaining: None,
+					reset_at: None,
+					quota: 0,
+					is_banned,
+					ban_expires_at: ban_expires,
+				};
 
-					(key, status)
-				})
-				.collect();
+				(key, status)
+			})
+			.collect();
 
 		Ok(statuses)
 	}
@@ -462,7 +463,7 @@ mod tests {
 
 		assert!(!manager.is_banned(&ip));
 
-		manager.ban(&ip, Duration::from_secs(60), PenaltyReason::AuthFailure).unwrap();
+		manager.ban(&ip, Duration::from_mins(1), PenaltyReason::AuthFailure).unwrap();
 		assert!(manager.is_banned(&ip));
 
 		let result = manager.check(&ip, "general");
@@ -517,7 +518,7 @@ mod tests {
 		assert_eq!(stats.active_bans, 0);
 		assert_eq!(stats.total_bans_issued, 0);
 
-		manager.ban(&ip, Duration::from_secs(60), PenaltyReason::AuthFailure).unwrap();
+		manager.ban(&ip, Duration::from_mins(1), PenaltyReason::AuthFailure).unwrap();
 
 		let stats = manager.stats();
 		assert!(stats.active_bans > 0);
