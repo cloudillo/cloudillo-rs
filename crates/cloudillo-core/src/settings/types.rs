@@ -218,13 +218,11 @@ impl SettingDefinitionBuilder {
 
 		// Validate scope/permission combinations
 		match (self.scope, self.permission) {
-			(SettingScope::System, _) => {
-				// System scope must have System permission
-				if self.permission != PermissionLevel::System {
-					return Err(Error::ConfigError(
-						"System scope settings must have System permission".into(),
-					));
-				}
+			// System scope must have System permission
+			(SettingScope::System, _) if self.permission != PermissionLevel::System => {
+				return Err(Error::ConfigError(
+					"System scope settings must have System permission".into(),
+				));
 			}
 			(SettingScope::Global, PermissionLevel::User) => {
 				// Warn but allow - global user settings are unusual

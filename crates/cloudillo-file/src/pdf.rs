@@ -175,14 +175,9 @@ pub fn is_available() -> bool {
 	let pdfinfo = Command::new("pdfinfo")
 		.arg("--version")
 		.output()
-		.map(|o| o.status.success())
-		.unwrap_or(false);
+		.is_ok_and(|o| o.status.success());
 
-	let pdftoppm = Command::new("pdftoppm")
-		.arg("-v")
-		.output()
-		.map(|o| o.status.success())
-		.unwrap_or(false);
+	let pdftoppm = Command::new("pdftoppm").arg("-v").output().is_ok_and(|o| o.status.success());
 
 	pdfinfo && pdftoppm
 }

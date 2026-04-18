@@ -241,15 +241,10 @@ pub async fn handle_rtdb_connection(
 		while let Some((subscription_id, event)) = aggregated_rx.recv().await {
 			// Skip own lock/unlock events — the originator already has the response.
 			// Other connections from the same user (different tabs/devices) still receive them.
-			match &event {
-				ChangeEvent::Lock { data, .. } | ChangeEvent::Unlock { data, .. } => {
-					if data.get("connId").and_then(|v| v.as_str())
-						== Some(conn_clone2.conn_id.as_str())
-					{
-						continue;
-					}
-				}
-				_ => {}
+			if let ChangeEvent::Lock { data, .. } | ChangeEvent::Unlock { data, .. } = &event
+				&& data.get("connId").and_then(|v| v.as_str()) == Some(conn_clone2.conn_id.as_str())
+			{
+				continue;
 			}
 
 			// Convert ChangeEvent to change message matching TS client expectations

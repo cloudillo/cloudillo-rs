@@ -752,7 +752,7 @@ async fn log_doc_statistics(app: &App, tn_id: TnId, doc_id: &str) {
 			let total_size: usize = updates.iter().map(|u| u.data.len()).sum();
 
 			// Calculate average update size
-			let avg_size = if update_count > 0 { total_size / update_count } else { 0 };
+			let avg_size = total_size.checked_div(update_count).unwrap_or(0);
 
 			info!(
 				"CRDT doc stats [{}]: {} updates, {} bytes total, {} bytes avg",

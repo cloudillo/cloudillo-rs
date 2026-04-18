@@ -398,8 +398,7 @@ impl FFmpeg {
 		Command::new("ffmpeg")
 			.arg("-version")
 			.output()
-			.map(|o| o.status.success())
-			.unwrap_or(false)
+			.is_ok_and(|o| o.status.success())
 	}
 
 	/// Check if FFprobe is available
@@ -407,8 +406,7 @@ impl FFmpeg {
 		Command::new("ffprobe")
 			.arg("-version")
 			.output()
-			.map(|o| o.status.success())
-			.unwrap_or(false)
+			.is_ok_and(|o| o.status.success())
 	}
 }
 
