@@ -46,8 +46,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::RwLock;
-use tracing::{debug, trace};
+use tokio::sync::{OnceCell, RwLock};
+use tracing::trace;
 
 mod error;
 pub use error::Error;
@@ -96,12 +96,6 @@ use tables::TABLE_UPDATES;
 mod record_type {
 	/// CRDT update record
 	pub const UPDATE: u8 = 0;
-	/// State vector record (reserved for future use)
-	#[allow(dead_code)]
-	pub const STATE_VECTOR: u8 = 1;
-	/// Metadata record (reserved for future use)
-	#[allow(dead_code)]
-	pub const METADATA: u8 = 2;
 }
 
 /// Binary key encoding for CRDT storage
@@ -109,7 +103,7 @@ mod record_type {
 /// Key structure: [version:u8][doc_id:24bytes][type:u8][seq:u64_be]
 /// - version: Protocol version (currently 1)
 /// - doc_id: Fixed 24-character document ID
-/// - type: Record type (0=update, 1=state_vector, 2=metadata)
+/// - type: Record type (0=update; other values reserved)
 /// - seq: Sequence number in big-endian (for proper sorting)
 mod key_encoding {
 	use super::record_type;
@@ -157,8 +151,7 @@ mod key_encoding {
 		(start, end)
 	}
 
-	/// Extract doc_id from a key (reserved for future use)
-	#[allow(dead_code)]
+	/// Extract doc_id from a key
 	pub fn decode_doc_id(key: &[u8]) -> Option<String> {
 		if key.len() < 1 + DOC_ID_LEN {
 			return None;
@@ -172,7 +165,6 @@ mod key_encoding {
 	}
 
 	/// Extract sequence number from a key
-	#[allow(dead_code)]
 	pub fn decode_seq(key: &[u8]) -> Option<u64> {
 		if key.len() < KEY_LEN {
 			return None;
@@ -211,12 +203,13 @@ impl DocumentInstance {
 	fn touch(&self) {
 		self.last_accessed.store(Timestamp::now().0.cast_unsigned(), Ordering::Relaxed);
 	}
-
-	#[allow(dead_code)]
-	fn last_accessed(&self) -> u64 {
-		self.last_accessed.load(Ordering::Relaxed)
-	}
 }
+
+/// Lazily-initialized `redb::Database` handle. Wrapped in `OnceCell` so
+/// concurrent first-openers for the same path serialize on initialization
+/// (flock is per-process on Linux, so two bare opens would produce two
+/// independent handles for the same file).
+type DbCell = Arc<OnceCell<Arc<redb::Database>>>;
 
 /// CRDT Adapter using redb for storage
 pub struct CrdtAdapterRedb {
@@ -230,7 +223,7 @@ pub struct CrdtAdapterRedb {
 	config: AdapterConfig,
 
 	/// Cache of redb Database instances (one per file)
-	file_databases: Arc<RwLock<HashMap<PathBuf, Arc<redb::Database>>>>,
+	file_databases: Arc<RwLock<HashMap<PathBuf, DbCell>>>,
 
 	/// Cache of document instances (with broadcasters)
 	doc_instances: Arc<DashMap<String, Arc<DocumentInstance>>>,
@@ -264,39 +257,54 @@ impl CrdtAdapterRedb {
 		})
 	}
 
-	/// Get or open a redb database file
+	/// Get or open a redb database file.
+	///
+	/// Uses a per-path `OnceCell` so concurrent first-openers for the same
+	/// file serialize on initialization (a single `redb::Database` handle
+	/// per file). Sync redb I/O runs inside `spawn_blocking` so
+	/// `begin_write` never parks the tokio worker on redb's Condvar.
 	async fn get_or_open_db_file(&self, db_path: PathBuf) -> ClResult<Arc<redb::Database>> {
-		// Check cache first
-		{
+		// Look up — or create — the OnceCell for this path.
+		let existing = {
 			let cache = self.file_databases.read().await;
-			if let Some(db) = cache.get(&db_path) {
-				return Ok(Arc::clone(db));
-			}
-		}
-
-		// Open database
-		let db = redb::Database::create(db_path.clone()).map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to open database: {}", e)))
-		})?;
-
-		// Create tables if they don't exist
-		let tx = db.begin_write().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e)))
-		})?;
-		let _ = tx.open_table(TABLE_UPDATES);
-		tx.commit().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to commit table creation: {}", e)))
-		})?;
-
-		let db = Arc::new(db);
-
-		// Cache the database instance
-		{
+			cache.get(&db_path).map(Arc::clone)
+		};
+		let cell = if let Some(c) = existing {
+			c
+		} else {
 			let mut cache = self.file_databases.write().await;
-			cache.insert(db_path, Arc::clone(&db));
-		}
+			Arc::clone(cache.entry(db_path.clone()).or_default())
+		};
 
-		Ok(db)
+		// Initialize once; subsequent callers await the first one's result.
+		let db = cell
+			.get_or_try_init(|| async {
+				let db_path = db_path.clone();
+				tokio::task::spawn_blocking(move || -> ClResult<Arc<redb::Database>> {
+					let db = redb::Database::create(db_path.clone()).map_err(|e| {
+						ClError::from(Error::DbError(format!("Failed to open database: {}", e)))
+					})?;
+					let tx = db.begin_write().map_err(|e| {
+						ClError::from(Error::DbError(format!(
+							"Failed to begin write transaction: {}",
+							e
+						)))
+					})?;
+					let _ = tx.open_table(TABLE_UPDATES);
+					tx.commit().map_err(|e| {
+						ClError::from(Error::DbError(format!(
+							"Failed to commit table creation: {}",
+							e
+						)))
+					})?;
+					Ok(Arc::new(db))
+				})
+				.await
+				.map_err(|e| ClError::Internal(format!("spawn_blocking join error: {}", e)))?
+			})
+			.await?;
+
+		Ok(Arc::clone(db))
 	}
 
 	/// Get the database path for a document
@@ -408,26 +416,30 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		let instance = self.get_or_create_instance(doc_id, tn_id).await?;
 		let seq = instance.update_count.fetch_add(1, Ordering::SeqCst);
 
-		// Write update to database
-		let tx = db.begin_write().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e)))
-		})?;
-
-		{
-			let mut updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
+		// Write update to database — sync redb work on the blocking pool so
+		// `begin_write`'s Condvar wait never parks the tokio worker.
+		let doc_id_owned = doc_id.to_string();
+		let update_data = update.data.clone();
+		tokio::task::spawn_blocking(move || -> ClResult<()> {
+			let tx = db.begin_write().map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e)))
 			})?;
-
-			// Use binary key encoding
-			let key = key_encoding::encode_update_key(doc_id, seq);
-			updates_table.insert(key.as_slice(), update.data.as_slice()).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to insert update: {}", e)))
+			{
+				let mut updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
+					ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
+				})?;
+				let key = key_encoding::encode_update_key(&doc_id_owned, seq);
+				updates_table.insert(key.as_slice(), update_data.as_slice()).map_err(|e| {
+					ClError::from(Error::DbError(format!("Failed to insert update: {}", e)))
+				})?;
+			}
+			tx.commit().map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to commit update: {}", e)))
 			})?;
-		}
-
-		tx.commit().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to commit update: {}", e)))
-		})?;
+			Ok(())
+		})
+		.await
+		.map_err(|e| ClError::Internal(format!("spawn_blocking join error: {}", e)))??;
 
 		// Broadcast to subscribers
 		let event = CrdtChangeEvent { doc_id: doc_id.into(), update: CrdtUpdate::new(update.data) };
@@ -498,46 +510,53 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		let instance = self.get_or_create_instance(doc_id, tn_id).await?;
 		let new_seq = instance.update_count.fetch_add(1, Ordering::SeqCst);
 
-		// Single atomic transaction: delete specified seqs + insert replacement
-		let tx = db.begin_write().map_err(|e| {
-			ClError::from(Error::DbError(format!(
-				"Failed to begin write transaction for compaction: {}",
-				e
-			)))
-		})?;
-
-		{
-			let mut updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
+		// Single atomic transaction: delete specified seqs + insert replacement.
+		// Run on the blocking pool so `begin_write` never parks the tokio worker.
+		let doc_id_owned = doc_id.to_string();
+		let remove_seqs_owned: Vec<u64> = remove_seqs.to_vec();
+		let removed_count = remove_seqs_owned.len();
+		let replacement_data = replacement.data;
+		tokio::task::spawn_blocking(move || -> ClResult<()> {
+			let tx = db.begin_write().map_err(|e| {
+				ClError::from(Error::DbError(format!(
+					"Failed to begin write transaction for compaction: {}",
+					e
+				)))
 			})?;
+			{
+				let mut updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
+					ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
+				})?;
 
-			// Delete only the specified sequence numbers
-			for &seq in remove_seqs {
-				let key = key_encoding::encode_update_key(doc_id, seq);
-				updates_table.remove(key.as_slice()).map_err(|e| {
+				for &seq in &remove_seqs_owned {
+					let key = key_encoding::encode_update_key(&doc_id_owned, seq);
+					updates_table.remove(key.as_slice()).map_err(|e| {
+						ClError::from(Error::DbError(format!(
+							"Failed to remove update seq={}: {}",
+							seq, e
+						)))
+					})?;
+				}
+
+				let key = key_encoding::encode_update_key(&doc_id_owned, new_seq);
+				updates_table.insert(key.as_slice(), replacement_data.as_slice()).map_err(|e| {
 					ClError::from(Error::DbError(format!(
-						"Failed to remove update seq={}: {}",
-						seq, e
+						"Failed to insert compacted update: {}",
+						e
 					)))
 				})?;
 			}
-
-			// Insert the compacted replacement
-			let key = key_encoding::encode_update_key(doc_id, new_seq);
-			updates_table.insert(key.as_slice(), replacement.data.as_slice()).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to insert compacted update: {}", e)))
+			tx.commit().map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to commit compaction: {}", e)))
 			})?;
-		}
-
-		tx.commit().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to commit compaction: {}", e)))
-		})?;
+			Ok(())
+		})
+		.await
+		.map_err(|e| ClError::Internal(format!("spawn_blocking join error: {}", e)))??;
 
 		trace!(
 			"Compacted doc {}: removed {} updates, inserted merged at seq={}",
-			doc_id,
-			remove_seqs.len(),
-			new_seq
+			doc_id, removed_count, new_seq
 		);
 		Ok(())
 	}
@@ -546,50 +565,56 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		let db_path = self.get_db_path(tn_id, doc_id);
 		let db = self.get_or_open_db_file(db_path).await?;
 
-		let tx = db.begin_write().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e)))
-		})?;
-
-		{
-			let mut updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
+		// Run the write on the blocking pool.
+		let doc_id_owned = doc_id.to_string();
+		tokio::task::spawn_blocking(move || -> ClResult<()> {
+			let tx = db.begin_write().map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to begin write transaction: {}", e)))
 			})?;
-
-			// Delete all updates for this document
-			// First collect keys to avoid borrow conflicts
-			let mut keys_to_delete = Vec::new();
 			{
-				let (range_start, range_end) = key_encoding::make_doc_range(doc_id);
-				let range =
-					updates_table.range(range_start.as_slice()..=range_end.as_slice()).map_err(
-						|e| ClError::from(Error::DbError(format!("Failed to read updates: {}", e))),
-					)?;
-
-				for item in range {
-					let (key, _) = item.map_err(|e| {
-						ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
-					})?;
-
-					keys_to_delete.push(key.value().to_vec());
-				}
-			}
-
-			info!("Deleting {} updates for doc {}", keys_to_delete.len(), doc_id);
-
-			// Now delete the collected keys
-			for key in &keys_to_delete {
-				trace!("Deleting key for doc {}", doc_id);
-				updates_table.remove(key.as_slice()).map_err(|e| {
-					ClError::from(Error::DbError(format!("Failed to delete update: {}", e)))
+				let mut updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
+					ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
 				})?;
+
+				// Collect keys in a first pass so the range iterator's borrow
+				// of `updates_table` is released before we call `.remove()`.
+				let mut keys_to_delete = Vec::new();
+				{
+					let (range_start, range_end) = key_encoding::make_doc_range(&doc_id_owned);
+					let range = updates_table
+						.range(range_start.as_slice()..=range_end.as_slice())
+						.map_err(|e| {
+							ClError::from(Error::DbError(format!("Failed to read updates: {}", e)))
+						})?;
+					for item in range {
+						let (key, _) = item.map_err(|e| {
+							ClError::from(Error::DbError(format!(
+								"Failed to iterate updates: {}",
+								e
+							)))
+						})?;
+						keys_to_delete.push(key.value().to_vec());
+					}
+				}
+
+				info!("Deleting {} updates for doc {}", keys_to_delete.len(), doc_id_owned);
+
+				for key in &keys_to_delete {
+					trace!("Deleting key for doc {}", doc_id_owned);
+					updates_table.remove(key.as_slice()).map_err(|e| {
+						ClError::from(Error::DbError(format!("Failed to delete update: {}", e)))
+					})?;
+				}
+
+				info!("Deleted {} keys for doc {}", keys_to_delete.len(), doc_id_owned);
 			}
-
-			info!("Deleted {} keys for doc {}", keys_to_delete.len(), doc_id);
-		}
-
-		tx.commit().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to commit deletion: {}", e)))
-		})?;
+			tx.commit().map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to commit deletion: {}", e)))
+			})?;
+			Ok(())
+		})
+		.await
+		.map_err(|e| ClError::Internal(format!("spawn_blocking join error: {}", e)))??;
 
 		// Remove from instance cache
 		self.doc_instances.remove(doc_id);

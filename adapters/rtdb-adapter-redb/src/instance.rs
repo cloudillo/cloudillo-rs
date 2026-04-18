@@ -1,24 +1,20 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-use crate::{InstanceKey, storage};
+use crate::storage;
 use cloudillo_types::prelude::*;
 use cloudillo_types::rtdb_adapter::{ChangeEvent, LockInfo};
 use redb::{ReadableDatabase, ReadableTable};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::RwLock;
 
 type IndexedFieldsMap = HashMap<Box<str>, Vec<Box<str>>>;
 
 /// An active database instance with real-time subscription support
 #[derive(Debug)]
 pub struct DatabaseInstance {
-	/// Unique identifier for this instance
-	#[allow(dead_code)]
-	pub(crate) key: InstanceKey,
-
 	/// redb database file
 	pub(crate) db: Arc<redb::Database>,
 
@@ -28,22 +24,23 @@ pub struct DatabaseInstance {
 	/// Last access timestamp (Unix seconds)
 	pub(crate) last_accessed: Arc<AtomicU64>,
 
-	/// Cached indexed fields per collection
+	/// Cached indexed fields per collection. Sync `RwLock` so the
+	/// write-transaction actor (which runs on a blocking-pool thread)
+	/// can read it without bouncing through async.
 	pub(crate) indexed_fields: Arc<RwLock<IndexedFieldsMap>>,
 
-	/// In-memory locks on document paths (ephemeral, not persisted)
+	/// In-memory locks on document paths (ephemeral, not persisted).
+	/// Sync `RwLock` — same reasoning as `indexed_fields`.
 	pub(crate) locks: Arc<RwLock<HashMap<Box<str>, LockInfo>>>,
 }
 
 impl DatabaseInstance {
 	/// Create a new database instance
 	pub fn new(
-		key: InstanceKey,
 		db: Arc<redb::Database>,
 		change_tx: tokio::sync::broadcast::Sender<ChangeEvent>,
 	) -> Self {
 		Self {
-			key,
 			db,
 			change_tx,
 			last_accessed: Arc::new(AtomicU64::new(storage::now_timestamp())),
@@ -62,13 +59,19 @@ impl DatabaseInstance {
 		self.last_accessed.load(Ordering::Acquire)
 	}
 
-	/// Load indexed fields from database metadata
-	pub async fn load_indexed_fields(&self) -> ClResult<()> {
+	/// Load indexed fields from database metadata.
+	///
+	/// Synchronous — must be called from a blocking context (e.g. inside
+	/// `tokio::task::spawn_blocking`). redb's `begin_read` does sync file I/O.
+	pub fn load_indexed_fields(&self) -> ClResult<()> {
 		let tx = self.db.begin_read().map_err(crate::error::from_redb_error)?;
 		let meta_table =
 			tx.open_table(storage::TABLE_METADATA).map_err(crate::error::from_redb_error)?;
 
-		let mut indexed_fields = self.indexed_fields.write().await;
+		let mut indexed_fields = self
+			.indexed_fields
+			.write()
+			.map_err(|_| Error::Internal("indexed_fields rwlock poisoned".into()))?;
 
 		// Iterate all metadata keys looking for ".../_meta/indexes" entries.
 		// Keys have formats like "posts/_meta/indexes" (per_tenant) or

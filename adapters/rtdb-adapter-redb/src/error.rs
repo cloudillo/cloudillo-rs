@@ -52,9 +52,12 @@ impl From<tokio::task::JoinError> for Error {
 
 impl From<Error> for CloudilloError {
 	fn from(e: Error) -> Self {
-		// Map internal errors to cloudillo errors
+		// Map internal errors to cloudillo errors. `Unknown` is used for
+		// non-storage faults (e.g. `tokio::task::JoinError`); preserve the
+		// message so panic/cancellation context survives.
 		match e {
 			Error::IoError(io_err) => CloudilloError::Io(io_err),
+			Error::Unknown(msg) => CloudilloError::Internal(msg),
 			_ => CloudilloError::DbError,
 		}
 	}

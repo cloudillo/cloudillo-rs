@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 use tracing::{debug, info, warn};
 
 pub use instance::DatabaseInstance;
@@ -29,6 +29,12 @@ use cloudillo_types::rtdb_adapter::{
 	Transaction,
 };
 
+/// Lazily-initialized `redb::Database` handle. Wrapped in `OnceCell` so
+/// concurrent first-openers for the same path serialize on initialization,
+/// preventing two independent handles for the same file (flock is
+/// per-process on Linux).
+type DbCell = Arc<OnceCell<Arc<redb::Database>>>;
+
 /// redb-based implementation of RtdbAdapter.
 ///
 /// Supports two tenant isolation strategies:
@@ -39,8 +45,7 @@ pub struct RtdbAdapterRedb {
 	storage_dir: PathBuf,
 	per_tenant_files: bool,
 	instances: Arc<RwLock<HashMap<InstanceKey, Arc<DatabaseInstance>>>>,
-	/// Cache of redb::Database by file path to avoid multiple handles per file
-	file_databases: Arc<RwLock<HashMap<PathBuf, Arc<redb::Database>>>>,
+	file_databases: Arc<RwLock<HashMap<PathBuf, DbCell>>>,
 	config: AdapterConfig,
 }
 
@@ -119,72 +124,50 @@ impl RtdbAdapterRedb {
 		}
 	}
 
-	/// Get or open a redb Database instance by file path
+	/// Get or open a redb Database instance by file path.
+	///
+	/// Uses a per-path `OnceCell` so concurrent first-openers for the same
+	/// file serialize on initialization (a single `redb::Database` handle
+	/// per file). Different paths proceed in parallel.
 	async fn get_or_open_db_file(&self, db_path: PathBuf) -> ClResult<Arc<redb::Database>> {
-		// Check if already cached
-		{
+		// Look up — or create — the OnceCell for this path.
+		let existing = {
 			let cache = self.file_databases.read().await;
-			if let Some(db) = cache.get(&db_path) {
-				return Ok(Arc::clone(db));
-			}
-		}
-
-		// Open database file
-		let db = if db_path.exists() {
-			redb::Database::open(&db_path).map_err(error::from_redb_error)?
+			cache.get(&db_path).map(Arc::clone)
+		};
+		let cell = if let Some(c) = existing {
+			c
 		} else {
-			redb::Database::create(&db_path).map_err(error::from_redb_error)?
+			let mut cache = self.file_databases.write().await;
+			Arc::clone(cache.entry(db_path.clone()).or_default())
 		};
 
-		let db = Arc::new(db);
-
-		// Initialize tables
-		{
-			let tx = db.begin_write().map_err(error::from_redb_error)?;
-			let _ = tx.open_table(storage::TABLE_DOCUMENTS).map_err(error::from_redb_error)?;
-			let _ = tx.open_table(storage::TABLE_INDEXES).map_err(error::from_redb_error)?;
-			let _ = tx.open_table(storage::TABLE_METADATA).map_err(error::from_redb_error)?;
-			tx.commit().map_err(error::from_redb_error)?;
-		}
-
-		// Cache it
-		let mut cache = self.file_databases.write().await;
-		cache.insert(db_path, Arc::clone(&db));
-
-		Ok(db)
-	}
-
-	/// Build the full key with tenant prefix if needed
-	#[allow(dead_code)]
-	fn build_key(&self, tn_id: TnId, db_id: &str, path: &str) -> String {
-		if self.per_tenant_files {
-			format!("{}/{}", db_id, path)
-		} else {
-			format!("{}/{}/{}", tn_id.0, db_id, path)
-		}
-	}
-
-	/// Build index keys for a field value, expanding arrays into per-element entries
-	#[allow(dead_code)]
-	fn build_index_keys(
-		&self,
-		tn_id: TnId,
-		_db_id: &str,
-		collection: &str,
-		field: &str,
-		value: &Value,
-		doc_id: &str,
-	) -> Vec<String> {
-		storage::values_to_index_strings(value)
-			.into_iter()
-			.map(|value_str| {
-				if self.per_tenant_files {
-					format!("{}/_idx/{}/{}/{}", collection, field, value_str, doc_id)
-				} else {
-					format!("{}/{}/_idx/{}/{}/{}", tn_id.0, collection, field, value_str, doc_id)
-				}
+		// Initialize once; subsequent callers await the first one's result.
+		let db = cell
+			.get_or_try_init(|| async {
+				let db_path = db_path.clone();
+				tokio::task::spawn_blocking(move || -> ClResult<Arc<redb::Database>> {
+					let db = if db_path.exists() {
+						redb::Database::open(&db_path).map_err(error::from_redb_error)?
+					} else {
+						redb::Database::create(&db_path).map_err(error::from_redb_error)?
+					};
+					let tx = db.begin_write().map_err(error::from_redb_error)?;
+					let _ =
+						tx.open_table(storage::TABLE_DOCUMENTS).map_err(error::from_redb_error)?;
+					let _ =
+						tx.open_table(storage::TABLE_INDEXES).map_err(error::from_redb_error)?;
+					let _ =
+						tx.open_table(storage::TABLE_METADATA).map_err(error::from_redb_error)?;
+					tx.commit().map_err(error::from_redb_error)?;
+					Ok(Arc::new(db))
+				})
+				.await
+				.map_err(error::Error::from)?
 			})
-			.collect()
+			.await?;
+
+		Ok(Arc::clone(db))
 	}
 
 	/// Get or open a database instance
@@ -204,36 +187,30 @@ impl RtdbAdapterRedb {
 			}
 		}
 
-		// Slow path: open database
+		// Slow path: build the instance OUTSIDE the `instances` write lock so
+		// sync redb I/O and cross-file awaits can never block other subscribers
+		// waiting on that same lock. If two callers race the same key, the
+		// loser's instance is dropped in the double-check below — cheap since
+		// `get_or_open_db_file` dedupes the underlying `redb::Database` handle.
+		let db_path = self.db_file_path(tn_id);
+		let db = self.get_or_open_db_file(db_path).await?;
+		let (change_tx, _) = tokio::sync::broadcast::channel(self.config.broadcast_capacity);
+		let instance = Arc::new(DatabaseInstance::new(db, change_tx));
+		// load_indexed_fields does sync redb I/O; run on the blocking pool.
+		let instance_for_load = Arc::clone(&instance);
+		tokio::task::spawn_blocking(move || instance_for_load.load_indexed_fields())
+			.await
+			.map_err(error::Error::from)??;
+
+		// Take the write lock only to double-check + insert.
 		let mut instances = self.instances.write().await;
-
-		// Double-checked locking
-		if let Some(instance) = instances.get(&key) {
-			instance.touch();
-			return Ok(Arc::clone(instance));
+		if let Some(existing) = instances.get(&key) {
+			existing.touch();
+			return Ok(Arc::clone(existing));
 		}
-
-		// Check instance limit and evict if needed
 		if instances.len() >= self.config.max_instances {
 			Self::evict_lru(&mut instances);
 		}
-
-		// Get or open the redb database file (shared across all databases in per_tenant_files mode)
-		let db_path = self.db_file_path(tn_id);
-		let db = self.get_or_open_db_file(db_path).await?;
-
-		// Create broadcast channel
-		let (change_tx, _) = tokio::sync::broadcast::channel(self.config.broadcast_capacity);
-
-		let instance = Arc::new(DatabaseInstance::new(
-			InstanceKey { tn_id: tn_id.0, db_id: db_id.into() },
-			db,
-			change_tx,
-		));
-
-		// Load indexed fields from metadata
-		instance.load_indexed_fields().await?;
-
 		instances.insert(key, Arc::clone(&instance));
 		debug!("Opened database instance: tn_id={}, db_id={}", tn_id.0, db_id);
 
@@ -258,7 +235,7 @@ impl RtdbAdapterRedb {
 		let idle_timeout = self.config.idle_timeout_secs;
 
 		tokio::spawn(async move {
-			let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+			let mut interval = tokio::time::interval(std::time::Duration::from_mins(1));
 
 			loop {
 				interval.tick().await;
@@ -280,8 +257,12 @@ impl RtdbAdapterRedb {
 
 				// Clean up expired locks in remaining instances
 				for instance in instances.values() {
-					let mut locks = instance.locks.write().await;
-					locks.retain(|_, lock| now < lock.acquired_at.saturating_add(lock.ttl_secs));
+					if let Ok(mut locks) = instance.locks.write() {
+						locks
+							.retain(|_, lock| now < lock.acquired_at.saturating_add(lock.ttl_secs));
+					} else {
+						warn!("skipping locks cleanup: rwlock poisoned");
+					}
 				}
 			}
 		});
@@ -292,10 +273,9 @@ impl RtdbAdapterRedb {
 impl RtdbAdapter for RtdbAdapterRedb {
 	async fn transaction(&self, tn_id: TnId, db_id: &str) -> ClResult<Box<dyn Transaction>> {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
-
-		let tx = instance.db.begin_write().map_err(error::from_redb_error)?;
-
-		Ok(Box::new(RedbTransaction::new(self.per_tenant_files, tn_id, db_id.into(), instance, tx)))
+		let redb_tx =
+			RedbTransaction::spawn(self.per_tenant_files, tn_id, db_id.into(), instance).await?;
+		Ok(Box::new(redb_tx))
 	}
 
 	async fn close_db(&self, tn_id: TnId, db_id: &str) -> ClResult<()> {
@@ -506,7 +486,10 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 		let now = storage::now_timestamp();
 
-		let mut locks = instance.locks.write().await;
+		let mut locks = instance
+			.locks
+			.write()
+			.map_err(|_| cloudillo_types::error::Error::Internal("locks rwlock poisoned".into()))?;
 
 		// Check if already locked by another user
 		if let Some(existing) = locks.get(path) {
@@ -526,6 +509,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 			ttl_secs: 60,
 		};
 		locks.insert(path.into(), lock_info);
+		drop(locks);
 
 		// Broadcast lock event
 		let _ = instance.change_tx.send(ChangeEvent::Lock {
@@ -550,14 +534,23 @@ impl RtdbAdapter for RtdbAdapterRedb {
 	) -> ClResult<()> {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 
-		let mut locks = instance.locks.write().await;
+		let mut locks = instance
+			.locks
+			.write()
+			.map_err(|_| cloudillo_types::error::Error::Internal("locks rwlock poisoned".into()))?;
 
 		// Only release if locked by the same user
-		if let Some(existing) = locks.get(path)
+		let released = if let Some(existing) = locks.get(path)
 			&& existing.user_id.as_ref() == user_id
 		{
 			locks.remove(path);
+			true
+		} else {
+			false
+		};
+		drop(locks);
 
+		if released {
 			// Broadcast unlock event
 			let _ = instance.change_tx.send(ChangeEvent::Unlock {
 				path: path.into(),
@@ -575,7 +568,10 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 		let now = storage::now_timestamp();
 
-		let locks = instance.locks.read().await;
+		let locks = instance
+			.locks
+			.read()
+			.map_err(|_| cloudillo_types::error::Error::Internal("locks rwlock poisoned".into()))?;
 
 		if let Some(lock) = locks.get(path)
 			&& now < lock.acquired_at.saturating_add(lock.ttl_secs)
@@ -597,7 +593,9 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		let instance = self.get_or_open_instance(tn_id, db_id).await?;
 
 		let paths_to_remove: Vec<Box<str>> = {
-			let mut locks = instance.locks.write().await;
+			let mut locks = instance.locks.write().map_err(|_| {
+				cloudillo_types::error::Error::Internal("locks rwlock poisoned".into())
+			})?;
 
 			let paths: Vec<Box<str>> = locks
 				.iter()

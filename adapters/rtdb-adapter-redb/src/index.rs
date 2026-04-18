@@ -8,7 +8,10 @@ use redb::ReadableTable;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Create an index on a field
+/// Create an index on a field.
+///
+/// Entire body is sync redb work wrapped in `spawn_blocking` so
+/// `begin_write()` never parks the tokio worker.
 pub async fn create_index_impl(
 	instance: &Arc<DatabaseInstance>,
 	tn_id: TnId,
@@ -17,99 +20,109 @@ pub async fn create_index_impl(
 	field: &str,
 	per_tenant_files: bool,
 ) -> ClResult<()> {
-	use crate::error::from_redb_error;
+	let instance = Arc::clone(instance);
+	let db_id = db_id.to_string();
+	let path = path.to_string();
+	let field = field.to_string();
 
-	let meta_key = if per_tenant_files {
-		format!("{}/_meta/indexes", path)
-	} else {
-		format!("{}/{}/_meta/indexes", tn_id.0, path)
-	};
+	tokio::task::spawn_blocking(move || -> ClResult<()> {
+		use crate::error::from_redb_error;
 
-	let tx = instance.db.begin_write().map_err(from_redb_error)?;
+		let meta_key = if per_tenant_files {
+			format!("{}/_meta/indexes", path)
+		} else {
+			format!("{}/{}/_meta/indexes", tn_id.0, path)
+		};
 
-	// Load existing indexes
-	let mut indexes: Vec<String> = {
-		let meta_table = tx.open_table(storage::TABLE_METADATA).map_err(from_redb_error)?;
+		let tx = instance.db.begin_write().map_err(from_redb_error)?;
 
-		match meta_table.get(meta_key.as_str()) {
-			Ok(Some(v)) => {
-				let json_str = v.value().to_string();
-				serde_json::from_str(&json_str)?
+		// Load existing indexes
+		let mut indexes: Vec<String> = {
+			let meta_table = tx.open_table(storage::TABLE_METADATA).map_err(from_redb_error)?;
+
+			match meta_table.get(meta_key.as_str()) {
+				Ok(Some(v)) => {
+					let json_str = v.value().to_string();
+					serde_json::from_str(&json_str)?
+				}
+				Ok(None) => Vec::new(),
+				Err(e) => return Err(from_redb_error(e).into()),
 			}
-			Ok(None) => Vec::new(),
-			Err(e) => return Err(from_redb_error(e).into()),
+		};
+
+		// Add field if not already indexed
+		if !indexes.contains(&field) {
+			indexes.push(field.clone());
 		}
-	};
 
-	// Add field if not already indexed
-	if !indexes.contains(&field.to_string()) {
-		indexes.push(field.to_string());
-	}
+		// Save updated indexes
+		{
+			let mut meta_table = tx.open_table(storage::TABLE_METADATA).map_err(from_redb_error)?;
+			let json = serde_json::to_string(&indexes)?;
+			meta_table.insert(meta_key.as_str(), json.as_str()).map_err(from_redb_error)?;
+		}
 
-	// Save updated indexes
-	{
-		let mut meta_table = tx.open_table(storage::TABLE_METADATA).map_err(from_redb_error)?;
-		let json = serde_json::to_string(&indexes)?;
-		meta_table.insert(meta_key.as_str(), json.as_str()).map_err(from_redb_error)?;
-	}
+		// Build index for existing documents
+		{
+			let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+			let mut index_table = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
 
-	// Build index for existing documents
-	{
-		let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
-		let mut index_table = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
+			let doc_prefix = if per_tenant_files {
+				format!("{}/{}/", db_id, path)
+			} else {
+				format!("{}/{}/{}/", tn_id.0, db_id, path)
+			};
 
-		let _prefix = if per_tenant_files {
-			format!("{}/", db_id)
-		} else {
-			format!("{}/{}/", tn_id.0, db_id)
-		};
+			let range = doc_table.range(doc_prefix.as_str()..).map_err(from_redb_error)?;
 
-		// First pass: scan documents in this collection
-		let doc_prefix = if per_tenant_files {
-			format!("{}/{}/", db_id, path)
-		} else {
-			format!("{}/{}/{}/", tn_id.0, db_id, path)
-		};
+			for item in range {
+				let (key, value) = item.map_err(from_redb_error)?;
+				let key_str = key.value();
 
-		let range = doc_table.range(doc_prefix.as_str()..).map_err(from_redb_error)?;
+				if !key_str.starts_with(&doc_prefix) {
+					break;
+				}
 
-		for item in range {
-			let (key, value) = item.map_err(from_redb_error)?;
-			let key_str = key.value();
+				// Check it's a direct child
+				let remainder = &key_str[doc_prefix.len()..];
+				if remainder.contains('/') {
+					continue;
+				}
 
-			if !key_str.starts_with(&doc_prefix) {
-				break;
-			}
+				let doc: Value = serde_json::from_str(value.value())?;
 
-			// Check it's a direct child
-			let remainder = &key_str[doc_prefix.len()..];
-			if remainder.contains('/') {
-				continue;
-			}
-
-			let doc: Value = serde_json::from_str(value.value())?;
-
-			if let Some(field_value) = doc.get(field) {
-				let doc_id = remainder.to_string();
-				for value_str in storage::values_to_index_strings(field_value) {
-					let index_key = if per_tenant_files {
-						format!("{}/_idx/{}/{}/{}", path, field, value_str, doc_id)
-					} else {
-						format!("{}/{}/_idx/{}/{}/{}", tn_id.0, path, field, value_str, doc_id)
-					};
-					index_table.insert(index_key.as_str(), "").map_err(from_redb_error)?;
+				if let Some(field_value) = doc.get(&field) {
+					let doc_id = remainder.to_string();
+					for value_str in storage::values_to_index_strings(field_value) {
+						let index_key = if per_tenant_files {
+							format!("{}/_idx/{}/{}/{}", path, field, value_str, doc_id)
+						} else {
+							format!("{}/{}/_idx/{}/{}/{}", tn_id.0, path, field, value_str, doc_id)
+						};
+						index_table.insert(index_key.as_str(), "").map_err(from_redb_error)?;
+					}
 				}
 			}
 		}
-	}
 
-	tx.commit().map_err(from_redb_error)?;
+		tx.commit().map_err(from_redb_error)?;
 
-	// Update in-memory cache
-	{
-		let mut indexed_fields = instance.indexed_fields.write().await;
-		indexed_fields.entry(path.into()).or_insert_with(Vec::new).push(field.into());
-	}
+		// Update in-memory cache (sync RwLock — safe here since we're on the blocking pool).
+		// Idempotent: if this field is already indexed, don't duplicate it.
+		{
+			let mut indexed_fields = instance.indexed_fields.write().map_err(|_| {
+				cloudillo_types::error::Error::Internal("indexed_fields rwlock poisoned".into())
+			})?;
+			let entry = indexed_fields.entry(path.into()).or_default();
+			if !entry.iter().any(|f| f.as_ref() == field.as_str()) {
+				entry.push(field.into());
+			}
+		}
+
+		Ok(())
+	})
+	.await
+	.map_err(crate::error::Error::from)??;
 
 	Ok(())
 }

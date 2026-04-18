@@ -111,7 +111,9 @@ fn try_index_query(
 	tx: &redb::ReadTransaction,
 	ctx: &QueryContext,
 ) -> ClResult<Option<Vec<Value>>> {
-	let indexed_fields = instance.indexed_fields.blocking_read();
+	let indexed_fields = instance.indexed_fields.read().map_err(|_| {
+		cloudillo_types::error::Error::Internal("indexed_fields rwlock poisoned".into())
+	})?;
 	let indexed = match indexed_fields.get(ctx.path) {
 		Some(f) => f.clone(),
 		None => return Ok(None),
@@ -450,7 +452,9 @@ fn execute_aggregate(
 	// Index-only path: no filter, no data-dependent ops (count only), field is indexed
 	let can_use_index =
 		opts.filter.as_ref().is_none_or(QueryFilter::is_empty) && aggregate.ops.is_empty() && {
-			let indexed_fields = instance.indexed_fields.blocking_read();
+			let indexed_fields = instance.indexed_fields.read().map_err(|_| {
+				cloudillo_types::error::Error::Internal("indexed_fields rwlock poisoned".into())
+			})?;
 			indexed_fields
 				.get(path)
 				.is_some_and(|fields| fields.iter().any(|f| f.as_ref() == aggregate.group_by))
