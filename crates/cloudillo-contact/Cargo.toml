@@ -1,0 +1,30 @@
+[package]
+name = "cloudillo-contact"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Contact management (JSON REST + CardDAV) for the Cloudillo federated collaboration platform"
+keywords = ["cloudillo", "contacts", "carddav", "vcard", "address-book"]
+categories = ["web-programming"]
+readme = "../../README.md"
+
+[dependencies]
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
+cloudillo-dav = { workspace = true }
+
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http2", "macros"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+
+[lints]
+workspace = true
