@@ -26,6 +26,8 @@ cloudillo-idp = { workspace = true }
 cloudillo-admin = { workspace = true }
 cloudillo-profile = { workspace = true }
 cloudillo-action = { workspace = true }
+cloudillo-contact = { workspace = true }
+cloudillo-dav = { workspace = true }
 axum = { version = "0.8.8", features = ["http2", "macros", "multipart", "ws"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 futures = "0.3.32"

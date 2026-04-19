@@ -30,6 +30,7 @@ use crate::settings;
 use crate::websocket;
 use cloudillo_action as action;
 use cloudillo_action::perm::check_perm_action;
+use cloudillo_contact as contact;
 use cloudillo_core::acme;
 use cloudillo_core::create_perm::check_perm_create;
 use cloudillo_core::middleware::{optional_auth, request_id_middleware, require_auth};
@@ -223,6 +224,19 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/notifications/subscription", post(push::handler::post_subscription))
 		.route("/api/notifications/subscription/{subscription_id}", delete(push::handler::delete_subscription))
 
+		// --- Address Books / Contacts (CardDAV sync lives under /dav/... elsewhere) ---
+		.route("/api/address-books", get(contact::handler::list_address_books))
+		.route("/api/address-books", post(contact::handler::create_address_book))
+		.route("/api/address-books/{ab_id}", patch(contact::handler::patch_address_book))
+		.route("/api/address-books/{ab_id}", delete(contact::handler::delete_address_book))
+		.route("/api/address-books/{ab_id}/contacts", get(contact::handler::list_contacts))
+		.route("/api/address-books/{ab_id}/contacts", post(contact::handler::create_contact))
+		.route("/api/address-books/{ab_id}/import", post(contact::handler::import_contacts))
+		.route("/api/address-books/{ab_id}/contacts/{uid}", get(contact::handler::get_contact))
+		.route("/api/address-books/{ab_id}/contacts/{uid}", put(contact::handler::put_contact))
+		.route("/api/address-books/{ab_id}/contacts/{uid}", patch(contact::handler::patch_contact))
+		.route("/api/address-books/{ab_id}/contacts/{uid}", delete(contact::handler::delete_contact))
+
 		.route_layer(middleware::from_fn_with_state(app, require_auth))
 		.layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-cache")))
 		.layer(SetResponseHeaderLayer::if_not_present(header::EXPIRES, header::HeaderValue::from_static("0")))
@@ -341,6 +355,41 @@ fn init_public_routes(app: App) -> Router<App> {
 }
 
 // ============================================================================
+// CARDDAV ROUTES - HTTP Basic auth with scoped API tokens, never passwords
+// Clients: macOS Contacts, Thunderbird, iOS, DAVx5, Nextcloud clients, etc.
+// ============================================================================
+fn init_dav_routes(app: App) -> Router<App> {
+	use axum::http::HeaderName;
+
+	// The /.well-known/* redirects must stay unauthenticated — CardDAV clients probe them
+	// without credentials and expect a 301 back, not a 401 challenge.
+	let well_known = Router::new()
+		.route("/.well-known/carddav", any(contact::carddav::well_known))
+		.route("/.well-known/caldav", any(contact::carddav::well_known));
+
+	let rate_limiter = app.rate_limiter.clone();
+	let mode = app.opts.mode;
+	let dav = Router::new()
+		.route("/dav/principal/", any(contact::carddav::handle_principal))
+		.route("/dav/addressbooks/", any(contact::carddav::handle_home))
+		.route("/dav/addressbooks/{ab_name}/", any(contact::carddav::handle_collection))
+		.route("/dav/addressbooks/{ab_name}/{resource}", any(contact::carddav::handle_resource))
+		.route_layer(middleware::from_fn_with_state(app, cloudillo_dav::dav_basic_auth))
+		// Basic-auth brute-force protection: throttle DAV requests the same way we throttle
+		// other credential-facing endpoints.
+		.layer(RateLimitLayer::new(rate_limiter, "auth", mode))
+		// DAV discovery hinges on the `DAV:` response header on OPTIONS — force it onto every
+		// response from the DAV router so no middleware or handler quirk can drop it.
+		// `if_not_present` means handlers can still customize the value.
+		.layer(SetResponseHeaderLayer::if_not_present(
+			HeaderName::from_static("dav"),
+			HeaderValue::from_static("1, 2, 3, addressbook"),
+		));
+
+	well_known.merge(dav)
+}
+
+// ============================================================================
 // API SERVICE - Aggregates protected and public routes with global middleware
 // ============================================================================
 async fn api_not_found() -> Error {
@@ -350,10 +399,18 @@ async fn api_not_found() -> Error {
 fn init_api_service(app: App) -> Router {
 	let cors_layer = tower_http::cors::CorsLayer::very_permissive();
 
-	init_public_routes(app.clone())
+	// Browser-facing routes get the permissive CORS layer.
+	let browser_routes = init_public_routes(app.clone())
 		.merge(init_protected_routes(app.clone()))
+		.layer(cors_layer);
+
+	// DAV routes stay OUTSIDE CorsLayer: tower-http 0.6 treats every OPTIONS request as a
+	// CORS preflight and short-circuits it with only CORS headers, stripping the `DAV:`
+	// capability header that DAV clients need for discovery. These routes aren't called
+	// from browsers anyway, so they don't need CORS.
+	browser_routes
+		.merge(init_dav_routes(app.clone()))
 		.fallback(api_not_found)
-		.layer(cors_layer)
 		.layer(middleware::from_fn(request_id_middleware))
 		.layer(CompressionLayer::new())
 		.with_state(app)
@@ -731,6 +788,10 @@ fn init_app_service(app: App) -> Router {
 	// Add CORS layer only to the id-tag discovery endpoint
 	let well_known_router = Router::new()
 		.route("/.well-known/cloudillo/id-tag", get(auth::handler::get_id_tag))
+		// CardDAV discovery redirects to the API domain's /dav/principal/ — mounted here
+		// so clients probing the app domain (what users actually type) can find it.
+		.route("/.well-known/carddav", any(contact::carddav::well_known))
+		.route("/.well-known/caldav", any(contact::carddav::well_known))
 		.layer(tower_http::cors::CorsLayer::very_permissive());
 
 	Router::new()
