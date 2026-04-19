@@ -1,0 +1,26 @@
+[package]
+name = "cloudillo-dav"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Shared WebDAV protocol layer (CardDAV/CalDAV) for the Cloudillo federated collaboration platform"
+keywords = ["cloudillo", "webdav", "carddav", "caldav", "xml"]
+categories = ["web-programming"]
+readme = "../../README.md"
+
+[dependencies]
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
+
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http2", "macros"] }
+base64 = "0.22"
+quick-xml = "0.37"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[lints]
+workspace = true
