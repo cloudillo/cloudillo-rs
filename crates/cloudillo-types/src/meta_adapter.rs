@@ -754,6 +754,95 @@ pub struct InstalledApp {
 	pub installed_at: Timestamp,
 }
 
+// Contacts / Address Books (CardDAV + JSON REST)
+//*************************************************
+
+/// Address book collection metadata
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressBook {
+	pub ab_id: u64,
+	pub name: Box<str>,
+	pub description: Option<Box<str>>,
+	/// Collection tag — changes on any contact mutation within this book (used by CardDAV sync)
+	pub ctag: Box<str>,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Default)]
+pub struct UpdateAddressBookData {
+	pub name: Patch<String>,
+	pub description: Patch<String>,
+}
+
+/// Indexed projection of a contact — lives in DB columns, parallel to the stored vCard blob.
+/// Used both for REST API responses (via the handler layer's JSON conversion) and for
+/// CardDAV `addressbook-query` REPORT text-match filtering.
+#[derive(Debug, Clone, Default)]
+pub struct ContactExtracted {
+	pub fn_name: Option<Box<str>>,
+	pub given_name: Option<Box<str>>,
+	pub family_name: Option<Box<str>>,
+	pub email: Option<Box<str>>,
+	pub emails: Option<Box<str>>,
+	pub tel: Option<Box<str>>,
+	pub tels: Option<Box<str>>,
+	pub org: Option<Box<str>>,
+	pub title: Option<Box<str>>,
+	pub note: Option<Box<str>>,
+	pub photo_uri: Option<Box<str>>,
+	pub profile_id_tag: Option<Box<str>>,
+}
+
+/// Full contact row including the authoritative stored vCard blob.
+#[derive(Debug, Clone)]
+pub struct Contact {
+	pub c_id: u64,
+	pub ab_id: u64,
+	pub uid: Box<str>,
+	pub etag: Box<str>,
+	pub vcard: Box<str>,
+	pub extracted: ContactExtracted,
+	pub created_at: Timestamp,
+	pub updated_at: Timestamp,
+}
+
+/// Contact summary without the vCard blob — for list endpoints (REST + CardDAV REPORTs that
+/// don't need the full body).
+#[derive(Debug, Clone)]
+pub struct ContactView {
+	pub c_id: u64,
+	pub ab_id: u64,
+	pub uid: Box<str>,
+	pub etag: Box<str>,
+	pub extracted: ContactExtracted,
+	pub created_at: Timestamp,
+	pub updated_at: Timestamp,
+}
+
+/// One entry in a CardDAV `sync-collection` REPORT response. Tombstones (`deleted: true`)
+/// let clients drop stale cards.
+#[derive(Debug, Clone)]
+pub struct ContactSyncEntry {
+	pub uid: Box<str>,
+	pub etag: Box<str>,
+	pub deleted: bool,
+	pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Default)]
+pub struct ListContactOptions {
+	/// Free-text query — matches against fn_name, emails, tels (SQL LIKE).
+	pub q: Option<String>,
+	/// Opaque cursor for pagination.
+	pub cursor: Option<String>,
+	/// Page size.
+	pub limit: Option<u32>,
+}
+
 #[async_trait]
 pub trait MetaAdapter: Debug + Send + Sync {
 	// Tenant management
@@ -1247,6 +1336,96 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		app_name: &str,
 		publisher_tag: &str,
 	) -> ClResult<Option<InstalledApp>>;
+
+	// Address book / contact management
+	//***********************************
+
+	/// Create a new address book collection.
+	async fn create_address_book(
+		&self,
+		tn_id: TnId,
+		name: &str,
+		description: Option<&str>,
+	) -> ClResult<AddressBook>;
+
+	/// List all address books for a tenant.
+	async fn list_address_books(&self, tn_id: TnId) -> ClResult<Vec<AddressBook>>;
+
+	/// Read a single address book by id.
+	async fn get_address_book(&self, tn_id: TnId, ab_id: u64) -> ClResult<Option<AddressBook>>;
+
+	/// Look up an address book by its name (for CardDAV path routing).
+	async fn get_address_book_by_name(
+		&self,
+		tn_id: TnId,
+		name: &str,
+	) -> ClResult<Option<AddressBook>>;
+
+	/// Patch an address book's metadata.
+	async fn update_address_book(
+		&self,
+		tn_id: TnId,
+		ab_id: u64,
+		patch: &UpdateAddressBookData,
+	) -> ClResult<()>;
+
+	/// Delete an address book (and all its contacts).
+	async fn delete_address_book(&self, tn_id: TnId, ab_id: u64) -> ClResult<()>;
+
+	/// List + search contacts within an address book. Excludes soft-deleted rows.
+	async fn list_contacts(
+		&self,
+		tn_id: TnId,
+		ab_id: u64,
+		opts: &ListContactOptions,
+	) -> ClResult<Vec<ContactView>>;
+
+	/// Read a single contact (including vCard blob) by UID.
+	async fn get_contact(&self, tn_id: TnId, ab_id: u64, uid: &str) -> ClResult<Option<Contact>>;
+
+	/// Insert or update a contact (keyed by UID). Also bumps the address book's ctag.
+	/// Returns the new etag.
+	async fn upsert_contact(
+		&self,
+		tn_id: TnId,
+		ab_id: u64,
+		uid: &str,
+		vcard: &str,
+		etag: &str,
+		extracted: &ContactExtracted,
+	) -> ClResult<Box<str>>;
+
+	/// Soft-delete a contact (sets `deleted_at`), leaving a tombstone row for CardDAV sync.
+	/// Also bumps the address book's ctag.
+	async fn delete_contact(&self, tn_id: TnId, ab_id: u64, uid: &str) -> ClResult<()>;
+
+	/// Fetch multiple contacts by UID — for CardDAV `addressbook-multiget` REPORT.
+	async fn get_contacts_by_uids(
+		&self,
+		tn_id: TnId,
+		ab_id: u64,
+		uids: &[&str],
+	) -> ClResult<Vec<Contact>>;
+
+	/// Return live + tombstone entries for CardDAV `sync-collection` REPORT.
+	/// `since` is the sync token's timestamp; `None` means full sync.
+	/// `limit` caps the number of rows returned; callers supply their own hard ceiling
+	/// to keep responses bounded. `None` means no client-supplied limit — callers should
+	/// still pass their server-side ceiling.
+	async fn list_contacts_since(
+		&self,
+		tn_id: TnId,
+		ab_id: u64,
+		since: Option<Timestamp>,
+		limit: Option<u32>,
+	) -> ClResult<Vec<ContactSyncEntry>>;
+
+	/// List all contacts linked to a given profile id_tag (for bulk snapshot refresh).
+	async fn list_contacts_by_profile(
+		&self,
+		tn_id: TnId,
+		profile_id_tag: &str,
+	) -> ClResult<Vec<Contact>>;
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 use std::{path::Path, sync::Arc};
 
 mod action;
+mod contact;
 mod file;
 mod file_user_data;
 mod installed_app;
@@ -26,13 +27,14 @@ use tokio::fs;
 
 use cloudillo_types::{
 	meta_adapter::{
-		Action, ActionData, ActionId, ActionView, CreateFile, CreateRefOptions, CreateShareEntry,
-		FileId, FileUserData, FileVariant, FileView, FinalizeActionOptions, InstallApp,
-		InstalledApp, ListActionOptions, ListFileOptions, ListProfileOptions, ListRefsOptions,
-		ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile, ProfileData,
-		PushSubscription, PushSubscriptionData, RefData, ShareEntry, Task, TaskPatch, Tenant,
-		TenantListMeta, UpdateActionDataOptions, UpdateFileOptions, UpdateProfileData,
-		UpdateTenantData,
+		Action, ActionData, ActionId, ActionView, AddressBook, Contact, ContactExtracted,
+		ContactSyncEntry, ContactView, CreateFile, CreateRefOptions, CreateShareEntry, FileId,
+		FileUserData, FileVariant, FileView, FinalizeActionOptions, InstallApp, InstalledApp,
+		ListActionOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
+		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
+		ProfileData, PushSubscription, PushSubscriptionData, RefData, ShareEntry, Task, TaskPatch,
+		Tenant, TenantListMeta, UpdateActionDataOptions, UpdateAddressBookData, UpdateFileOptions,
+		UpdateProfileData, UpdateTenantData,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -681,5 +683,102 @@ impl MetaAdapter for MetaAdapterSqlite {
 		publisher_tag: &str,
 	) -> ClResult<Option<InstalledApp>> {
 		installed_app::get(&self.dbr, tn_id, app_name, publisher_tag).await
+	}
+
+	// Address book / contact management
+	//***********************************
+
+	async fn create_address_book(
+		&self,
+		tn_id: TnId,
+		name: &str,
+		description: Option<&str>,
+	) -> ClResult<AddressBook> {
+		contact::create_address_book(&self.db, tn_id, name, description).await
+	}
+
+	async fn list_address_books(&self, tn_id: TnId) -> ClResult<Vec<AddressBook>> {
+		contact::list_address_books(&self.dbr, tn_id).await
+	}
+
+	async fn get_address_book(&self, tn_id: TnId, ab_id: u64) -> ClResult<Option<AddressBook>> {
+		contact::get_address_book(&self.dbr, tn_id, ab_id).await
+	}
+
+	async fn get_address_book_by_name(
+		&self,
+		tn_id: TnId,
+		name: &str,
+	) -> ClResult<Option<AddressBook>> {
+		contact::get_address_book_by_name(&self.dbr, tn_id, name).await
+	}
+
+	async fn update_address_book(
+		&self,
+		tn_id: TnId,
+		ab_id: u64,
+		patch: &UpdateAddressBookData,
+	) -> ClResult<()> {
+		contact::update_address_book(&self.db, tn_id, ab_id, patch).await
+	}
+
+	async fn delete_address_book(&self, tn_id: TnId, ab_id: u64) -> ClResult<()> {
+		contact::delete_address_book(&self.db, tn_id, ab_id).await
+	}
+
+	async fn list_contacts(
+		&self,
+		tn_id: TnId,
+		ab_id: u64,
+		opts: &ListContactOptions,
+	) -> ClResult<Vec<ContactView>> {
+		contact::list_contacts(&self.dbr, tn_id, ab_id, opts).await
+	}
+
+	async fn get_contact(&self, tn_id: TnId, ab_id: u64, uid: &str) -> ClResult<Option<Contact>> {
+		contact::get_contact(&self.dbr, tn_id, ab_id, uid).await
+	}
+
+	async fn upsert_contact(
+		&self,
+		tn_id: TnId,
+		ab_id: u64,
+		uid: &str,
+		vcard: &str,
+		etag: &str,
+		extracted: &ContactExtracted,
+	) -> ClResult<Box<str>> {
+		contact::upsert_contact(&self.db, tn_id, ab_id, uid, vcard, etag, extracted).await
+	}
+
+	async fn delete_contact(&self, tn_id: TnId, ab_id: u64, uid: &str) -> ClResult<()> {
+		contact::delete_contact(&self.db, tn_id, ab_id, uid).await
+	}
+
+	async fn get_contacts_by_uids(
+		&self,
+		tn_id: TnId,
+		ab_id: u64,
+		uids: &[&str],
+	) -> ClResult<Vec<Contact>> {
+		contact::get_contacts_by_uids(&self.dbr, tn_id, ab_id, uids).await
+	}
+
+	async fn list_contacts_since(
+		&self,
+		tn_id: TnId,
+		ab_id: u64,
+		since: Option<Timestamp>,
+		limit: Option<u32>,
+	) -> ClResult<Vec<ContactSyncEntry>> {
+		contact::list_contacts_since(&self.dbr, tn_id, ab_id, since, limit).await
+	}
+
+	async fn list_contacts_by_profile(
+		&self,
+		tn_id: TnId,
+		profile_id_tag: &str,
+	) -> ClResult<Vec<Contact>> {
+		contact::list_contacts_by_profile(&self.dbr, tn_id, profile_id_tag).await
 	}
 }

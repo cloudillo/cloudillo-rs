@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 16;
+	const CURRENT_DB_VERSION: i64 = 17;
 
 	let mut tx = db.begin().await?;
 
@@ -682,6 +682,105 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
+	// Address books (CardDAV collections) and contacts
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS address_books (
+			tn_id INTEGER NOT NULL,
+			ab_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL DEFAULT 'Contacts',
+			description TEXT,
+			ctag TEXT NOT NULL,
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			UNIQUE(tn_id, name)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_address_books_tnid ON address_books(tn_id)")
+		.execute(&mut *tx)
+		.await?;
+
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS contacts (
+			tn_id INTEGER NOT NULL,
+			c_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			ab_id INTEGER NOT NULL,
+			uid TEXT NOT NULL,
+			etag TEXT NOT NULL,
+			vcard TEXT NOT NULL,
+			fn_name TEXT,
+			given_name TEXT,
+			family_name TEXT,
+			email TEXT,
+			emails TEXT,
+			tel TEXT,
+			tels TEXT,
+			org TEXT,
+			title TEXT,
+			note TEXT,
+			photo_uri TEXT,
+			profile_id_tag TEXT,
+			deleted_at INTEGER,
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			UNIQUE(tn_id, ab_id, uid)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_contacts_ab ON contacts(tn_id, ab_id)")
+		.execute(&mut *tx)
+		.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_contacts_fn ON contacts(tn_id, fn_name COLLATE NOCASE)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(tn_id, email)")
+		.execute(&mut *tx)
+		.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_contacts_uid ON contacts(tn_id, uid)")
+		.execute(&mut *tx)
+		.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_contacts_profile_tag ON contacts(tn_id, profile_id_tag) \
+		 WHERE profile_id_tag IS NOT NULL",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_contacts_updated ON contacts(tn_id, ab_id, updated_at)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// Triggers for address_books / contacts
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS address_books_insert_at AFTER INSERT ON address_books FOR EACH ROW \
+		BEGIN UPDATE address_books SET updated_at = unixepoch() WHERE ab_id = NEW.ab_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS address_books_updated_at AFTER UPDATE ON address_books FOR EACH ROW \
+		BEGIN UPDATE address_books SET updated_at = unixepoch() WHERE ab_id = NEW.ab_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS contacts_insert_at AFTER INSERT ON contacts FOR EACH ROW \
+		BEGIN UPDATE contacts SET updated_at = unixepoch() WHERE c_id = NEW.c_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS contacts_updated_at AFTER UPDATE ON contacts FOR EACH ROW \
+		BEGIN UPDATE contacts SET updated_at = unixepoch() WHERE c_id = NEW.c_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+
 	// Fresh database: skip migrations (schema already has all columns)
 	if version == 0 {
 		// Create indexes that depend on columns added in migrations
@@ -1074,6 +1173,108 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.await?;
 
 		set_db_version(&mut tx, 16).await;
+	}
+
+	// Version 17: Contact management with CardDAV sync
+	if version < 17 {
+		sqlx::query(
+			"CREATE TABLE IF NOT EXISTS address_books (
+				tn_id INTEGER NOT NULL,
+				ab_id INTEGER PRIMARY KEY AUTOINCREMENT,
+				name TEXT NOT NULL DEFAULT 'Contacts',
+				description TEXT,
+				ctag TEXT NOT NULL,
+				created_at INTEGER DEFAULT (unixepoch()),
+				updated_at INTEGER DEFAULT (unixepoch()),
+				UNIQUE(tn_id, name)
+			)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_address_books_tnid ON address_books(tn_id)")
+			.execute(&mut *tx)
+			.await?;
+
+		sqlx::query(
+			"CREATE TABLE IF NOT EXISTS contacts (
+				tn_id INTEGER NOT NULL,
+				c_id INTEGER PRIMARY KEY AUTOINCREMENT,
+				ab_id INTEGER NOT NULL,
+				uid TEXT NOT NULL,
+				etag TEXT NOT NULL,
+				vcard TEXT NOT NULL,
+				fn_name TEXT,
+				given_name TEXT,
+				family_name TEXT,
+				email TEXT,
+				emails TEXT,
+				tel TEXT,
+				tels TEXT,
+				org TEXT,
+				title TEXT,
+				note TEXT,
+				photo_uri TEXT,
+				profile_id_tag TEXT,
+				deleted_at INTEGER,
+				created_at INTEGER DEFAULT (unixepoch()),
+				updated_at INTEGER DEFAULT (unixepoch()),
+				UNIQUE(tn_id, ab_id, uid)
+			)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_contacts_ab ON contacts(tn_id, ab_id)")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_contacts_fn ON contacts(tn_id, fn_name COLLATE NOCASE)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(tn_id, email)")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_contacts_uid ON contacts(tn_id, uid)")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_contacts_profile_tag ON contacts(tn_id, profile_id_tag) \
+			 WHERE profile_id_tag IS NOT NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_contacts_updated ON contacts(tn_id, ab_id, updated_at)",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS address_books_insert_at AFTER INSERT ON address_books FOR EACH ROW \
+			BEGIN UPDATE address_books SET updated_at = unixepoch() WHERE ab_id = NEW.ab_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS address_books_updated_at AFTER UPDATE ON address_books FOR EACH ROW \
+			BEGIN UPDATE address_books SET updated_at = unixepoch() WHERE ab_id = NEW.ab_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS contacts_insert_at AFTER INSERT ON contacts FOR EACH ROW \
+			BEGIN UPDATE contacts SET updated_at = unixepoch() WHERE c_id = NEW.c_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS contacts_updated_at AFTER UPDATE ON contacts FOR EACH ROW \
+			BEGIN UPDATE contacts SET updated_at = unixepoch() WHERE c_id = NEW.c_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 17).await;
 	}
 
 	tx.commit().await?;
