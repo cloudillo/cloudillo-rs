@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 17;
+	const CURRENT_DB_VERSION: i64 = 20;
 
 	let mut tx = db.begin().await?;
 
@@ -781,6 +781,129 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
+	// Calendars (CalDAV) — mirror of address_books
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS calendars (
+			tn_id INTEGER NOT NULL,
+			cal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL DEFAULT 'Calendar',
+			description TEXT,
+			color TEXT,
+			timezone TEXT,
+			components TEXT NOT NULL DEFAULT 'VEVENT,VTODO',
+			ctag TEXT NOT NULL,
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			UNIQUE(tn_id, name)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_calendars_tnid ON calendars(tn_id)")
+		.execute(&mut *tx)
+		.await?;
+
+	// Uniqueness enforced via partial indexes below (not a table-level UNIQUE).
+	// SQLite treats NULLs in a UNIQUE index as distinct, so a plain
+	// UNIQUE(tn_id, cal_id, uid, recurrence_id) would let duplicate masters
+	// (recurrence_id IS NULL) coexist.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS calendar_objects (
+			tn_id INTEGER NOT NULL,
+			co_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			cal_id INTEGER NOT NULL,
+			uid TEXT NOT NULL,
+			component TEXT NOT NULL,
+			etag TEXT NOT NULL,
+			ical TEXT NOT NULL,
+			summary TEXT,
+			location TEXT,
+			description TEXT,
+			dtstart INTEGER,
+			dtend INTEGER,
+			all_day INTEGER NOT NULL DEFAULT 0,
+			status TEXT,
+			priority INTEGER,
+			organizer TEXT,
+			rrule TEXT,
+			exdate TEXT,
+			recurrence_id INTEGER,
+			sequence INTEGER NOT NULL DEFAULT 0,
+			deleted_at INTEGER,
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch())
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_cobj_cal ON calendar_objects(tn_id, cal_id)")
+		.execute(&mut *tx)
+		.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_cobj_uid ON calendar_objects(tn_id, uid)")
+		.execute(&mut *tx)
+		.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_cobj_component ON calendar_objects(tn_id, cal_id, component)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_cobj_dtstart ON calendar_objects(tn_id, cal_id, dtstart)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_cobj_dtend ON calendar_objects(tn_id, cal_id, dtend)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_cobj_updated ON calendar_objects(tn_id, cal_id, updated_at)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_cobj_unique_master \
+		 ON calendar_objects(tn_id, cal_id, uid) \
+		 WHERE recurrence_id IS NULL AND deleted_at IS NULL",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_cobj_unique_override \
+		 ON calendar_objects(tn_id, cal_id, uid, recurrence_id) \
+		 WHERE recurrence_id IS NOT NULL AND deleted_at IS NULL",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS calendars_insert_at AFTER INSERT ON calendars FOR EACH ROW \
+		BEGIN UPDATE calendars SET updated_at = unixepoch() WHERE cal_id = NEW.cal_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS calendars_updated_at AFTER UPDATE ON calendars FOR EACH ROW \
+		BEGIN UPDATE calendars SET updated_at = unixepoch() WHERE cal_id = NEW.cal_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS calendar_objects_insert_at \
+		AFTER INSERT ON calendar_objects FOR EACH ROW \
+		BEGIN UPDATE calendar_objects SET updated_at = unixepoch() WHERE co_id = NEW.co_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS calendar_objects_updated_at \
+		AFTER UPDATE ON calendar_objects FOR EACH ROW \
+		BEGIN UPDATE calendar_objects SET updated_at = unixepoch() WHERE co_id = NEW.co_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+
 	// Fresh database: skip migrations (schema already has all columns)
 	if version == 0 {
 		// Create indexes that depend on columns added in migrations
@@ -1275,6 +1398,163 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.await?;
 
 		set_db_version(&mut tx, 17).await;
+	}
+
+	// Migration v18: calendars + calendar_objects (CalDAV).
+	if version < 18 {
+		sqlx::query(
+			"CREATE TABLE IF NOT EXISTS calendars (
+				tn_id INTEGER NOT NULL,
+				cal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+				name TEXT NOT NULL DEFAULT 'Calendar',
+				description TEXT,
+				color TEXT,
+				timezone TEXT,
+				components TEXT NOT NULL DEFAULT 'VEVENT,VTODO',
+				ctag TEXT NOT NULL,
+				created_at INTEGER DEFAULT (unixepoch()),
+				updated_at INTEGER DEFAULT (unixepoch()),
+				UNIQUE(tn_id, name)
+			)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_calendars_tnid ON calendars(tn_id)")
+			.execute(&mut *tx)
+			.await?;
+
+		sqlx::query(
+			"CREATE TABLE IF NOT EXISTS calendar_objects (
+				tn_id INTEGER NOT NULL,
+				co_id INTEGER PRIMARY KEY AUTOINCREMENT,
+				cal_id INTEGER NOT NULL,
+				uid TEXT NOT NULL,
+				component TEXT NOT NULL,
+				etag TEXT NOT NULL,
+				ical TEXT NOT NULL,
+				summary TEXT,
+				location TEXT,
+				description TEXT,
+				dtstart INTEGER,
+				dtend INTEGER,
+				all_day INTEGER NOT NULL DEFAULT 0,
+				status TEXT,
+				priority INTEGER,
+				organizer TEXT,
+				rrule TEXT,
+				recurrence_id INTEGER,
+				sequence INTEGER NOT NULL DEFAULT 0,
+				deleted_at INTEGER,
+				created_at INTEGER DEFAULT (unixepoch()),
+				updated_at INTEGER DEFAULT (unixepoch()),
+				UNIQUE(tn_id, cal_id, uid, recurrence_id)
+			)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_cobj_cal ON calendar_objects(tn_id, cal_id)")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_cobj_uid ON calendar_objects(tn_id, uid)")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_cobj_component ON calendar_objects(tn_id, cal_id, component)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_cobj_dtstart ON calendar_objects(tn_id, cal_id, dtstart)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_cobj_dtend ON calendar_objects(tn_id, cal_id, dtend)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_cobj_updated ON calendar_objects(tn_id, cal_id, updated_at)",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS calendars_insert_at AFTER INSERT ON calendars FOR EACH ROW \
+			BEGIN UPDATE calendars SET updated_at = unixepoch() WHERE cal_id = NEW.cal_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS calendars_updated_at AFTER UPDATE ON calendars FOR EACH ROW \
+			BEGIN UPDATE calendars SET updated_at = unixepoch() WHERE cal_id = NEW.cal_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS calendar_objects_insert_at \
+			AFTER INSERT ON calendar_objects FOR EACH ROW \
+			BEGIN UPDATE calendar_objects SET updated_at = unixepoch() WHERE co_id = NEW.co_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE TRIGGER IF NOT EXISTS calendar_objects_updated_at \
+			AFTER UPDATE ON calendar_objects FOR EACH ROW \
+			BEGIN UPDATE calendar_objects SET updated_at = unixepoch() WHERE co_id = NEW.co_id; END",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 18).await;
+	}
+
+	// Migration v19: fix calendar_objects uniqueness.
+	//
+	// v18 shipped with UNIQUE(tn_id, cal_id, uid, recurrence_id), which SQLite
+	// treats as distinct for NULL recurrence_id — so PUT on a non-recurring
+	// event never hit the ON CONFLICT branch and inserted a duplicate row.
+	// Replace the broken uniqueness with partial unique indexes keyed on
+	// whether recurrence_id is NULL. Any pre-existing duplicates must be
+	// cleaned up manually before this migration runs, or the CREATE UNIQUE
+	// INDEX will fail.
+	if version < 19 {
+		sqlx::query(
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_cobj_unique_master \
+			 ON calendar_objects(tn_id, cal_id, uid) \
+			 WHERE recurrence_id IS NULL AND deleted_at IS NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_cobj_unique_override \
+			 ON calendar_objects(tn_id, cal_id, uid, recurrence_id) \
+			 WHERE recurrence_id IS NOT NULL AND deleted_at IS NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 19).await;
+	}
+
+	// Migration v20: add calendar_objects.exdate (CSV of unix seconds).
+	//
+	// Stores EXDATE exclusions on the master VEVENT so we can skip occurrences
+	// on the client without creating a separate cancelled override row. CSV of
+	// unix-second timestamps matches the recurrence_id convention.
+	if version < 20 {
+		let has_exdate: (i64,) = sqlx::query_as(
+			"SELECT COUNT(*) FROM pragma_table_info('calendar_objects') WHERE name = 'exdate'",
+		)
+		.fetch_one(&mut *tx)
+		.await?;
+		if has_exdate.0 == 0 {
+			sqlx::query("ALTER TABLE calendar_objects ADD COLUMN exdate TEXT")
+				.execute(&mut *tx)
+				.await?;
+		}
+
+		set_db_version(&mut tx, 20).await;
 	}
 
 	tx.commit().await?;

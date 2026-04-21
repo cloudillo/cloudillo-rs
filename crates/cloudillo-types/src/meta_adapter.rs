@@ -843,6 +843,130 @@ pub struct ListContactOptions {
 	pub limit: Option<u32>,
 }
 
+// Calendars / Calendar Objects (CalDAV + JSON REST)
+//***************************************************
+
+/// Calendar collection metadata. Parallels `AddressBook`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Calendar {
+	pub cal_id: u64,
+	pub name: Box<str>,
+	pub description: Option<Box<str>>,
+	/// CSS `#RRGGBB` hex for client colouring (CalendarServer `calendar-color` ext).
+	pub color: Option<Box<str>>,
+	/// Default VTIMEZONE blob, surfaced via CalDAV `calendar-timezone`.
+	pub timezone: Option<Box<str>>,
+	/// Comma-separated component set (`VEVENT,VTODO`) — powers `supported-calendar-component-set`.
+	pub components: Box<str>,
+	/// Collection tag — bumps on any calendar-object mutation (used by CalDAV sync).
+	pub ctag: Box<str>,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Default)]
+pub struct CreateCalendarData {
+	pub name: String,
+	pub description: Option<String>,
+	pub color: Option<String>,
+	pub timezone: Option<String>,
+	/// If `None`, defaults to `VEVENT,VTODO`.
+	pub components: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct UpdateCalendarData {
+	pub name: Patch<String>,
+	pub description: Patch<String>,
+	pub color: Patch<String>,
+	pub timezone: Patch<String>,
+	pub components: Patch<String>,
+}
+
+/// Indexed projection of a calendar object — lives in DB columns alongside the authoritative
+/// iCalendar blob. Enables `calendar-query` time-range filtering and REST search.
+#[derive(Debug, Clone, Default)]
+pub struct CalendarObjectExtracted {
+	/// `VEVENT` | `VTODO` (first primary component in the VCALENDAR; overrides share it).
+	pub component: Box<str>,
+	pub summary: Option<Box<str>>,
+	pub location: Option<Box<str>>,
+	pub description: Option<Box<str>>,
+	/// Master DTSTART as unix seconds (UTC). `None` for floating/undated VTODO.
+	pub dtstart: Option<Timestamp>,
+	/// DTEND for VEVENT, DUE for VTODO, as unix seconds (UTC). `None` for open-ended.
+	pub dtend: Option<Timestamp>,
+	/// True when DTSTART is `VALUE=DATE`.
+	pub all_day: bool,
+	/// `STATUS` value (CONFIRMED / TENTATIVE / CANCELLED / NEEDS-ACTION / COMPLETED / IN-PROCESS).
+	pub status: Option<Box<str>>,
+	/// `PRIORITY` 0..9 (primarily VTODO).
+	pub priority: Option<u8>,
+	pub organizer: Option<Box<str>>,
+	/// Raw RRULE string — presence signals recurrence; expansion is client-side.
+	pub rrule: Option<Box<str>>,
+	/// `EXDATE` exclusions on the master as unix seconds; empty for override rows.
+	pub exdate: Vec<Timestamp>,
+	/// `RECURRENCE-ID` as unix seconds for override instances; `None` for the master row.
+	pub recurrence_id: Option<Timestamp>,
+	pub sequence: i64,
+}
+
+/// Full calendar object row including the authoritative stored VCALENDAR blob.
+#[derive(Debug, Clone)]
+pub struct CalendarObject {
+	pub co_id: u64,
+	pub cal_id: u64,
+	pub uid: Box<str>,
+	pub etag: Box<str>,
+	pub ical: Box<str>,
+	pub extracted: CalendarObjectExtracted,
+	pub created_at: Timestamp,
+	pub updated_at: Timestamp,
+}
+
+/// Calendar object summary without the iCalendar blob — for list endpoints.
+#[derive(Debug, Clone)]
+pub struct CalendarObjectView {
+	pub co_id: u64,
+	pub cal_id: u64,
+	pub uid: Box<str>,
+	pub etag: Box<str>,
+	pub extracted: CalendarObjectExtracted,
+	pub created_at: Timestamp,
+	pub updated_at: Timestamp,
+}
+
+/// One entry in a CalDAV `sync-collection` REPORT response. Tombstones (`deleted: true`) let
+/// clients drop stale objects.
+#[derive(Debug, Clone)]
+pub struct CalendarObjectSyncEntry {
+	pub uid: Box<str>,
+	pub etag: Box<str>,
+	pub deleted: bool,
+	pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Default)]
+pub struct ListCalendarObjectOptions {
+	/// Restrict to a component (`VEVENT` or `VTODO`); `None` lists both.
+	pub component: Option<String>,
+	/// Free-text query matched against summary / location / description.
+	pub q: Option<String>,
+	/// Time-range start (inclusive, unix seconds).
+	pub start: Option<Timestamp>,
+	/// Time-range end (exclusive, unix seconds).
+	pub end: Option<Timestamp>,
+	pub cursor: Option<String>,
+	pub limit: Option<u32>,
+	/// Include recurrence-exception rows (`RECURRENCE-ID IS NOT NULL`) in the result set.
+	/// Default `false` preserves CalDAV/legacy semantics where list endpoints return masters only.
+	pub include_exceptions: bool,
+}
+
 #[async_trait]
 pub trait MetaAdapter: Debug + Send + Sync {
 	// Tenant management
@@ -1426,6 +1550,124 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		profile_id_tag: &str,
 	) -> ClResult<Vec<Contact>>;
+
+	// Calendar / calendar-object management (CalDAV + JSON REST)
+	//************************************************************
+
+	/// Create a new calendar collection.
+	async fn create_calendar(&self, tn_id: TnId, input: &CreateCalendarData) -> ClResult<Calendar>;
+
+	/// List all calendars for a tenant.
+	async fn list_calendars(&self, tn_id: TnId) -> ClResult<Vec<Calendar>>;
+
+	/// Read a single calendar by id.
+	async fn get_calendar(&self, tn_id: TnId, cal_id: u64) -> ClResult<Option<Calendar>>;
+
+	/// Look up a calendar by its name (for CalDAV path routing).
+	async fn get_calendar_by_name(&self, tn_id: TnId, name: &str) -> ClResult<Option<Calendar>>;
+
+	/// Patch a calendar's metadata.
+	async fn update_calendar(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		patch: &UpdateCalendarData,
+	) -> ClResult<()>;
+
+	/// Delete a calendar (and all its objects).
+	async fn delete_calendar(&self, tn_id: TnId, cal_id: u64) -> ClResult<()>;
+
+	/// List + search calendar objects within a calendar. Excludes soft-deleted rows.
+	async fn list_calendar_objects(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		opts: &ListCalendarObjectOptions,
+	) -> ClResult<Vec<CalendarObjectView>>;
+
+	/// Read a single calendar object (including iCalendar blob) by UID.
+	/// Returns the master row; recurrence-override rows live under the same UID but distinct
+	/// `recurrence_id` and are not merged here.
+	async fn get_calendar_object(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uid: &str,
+	) -> ClResult<Option<CalendarObject>>;
+
+	/// Read a single recurrence-override row keyed by `(uid, recurrence_id)`.
+	async fn get_calendar_object_override(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uid: &str,
+		recurrence_id: Timestamp,
+	) -> ClResult<Option<CalendarObject>>;
+
+	/// List all non-deleted recurrence-override rows for a given master UID.
+	async fn list_calendar_object_overrides(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uid: &str,
+	) -> ClResult<Vec<CalendarObject>>;
+
+	/// Soft-delete a single recurrence-override row (leaves the master untouched).
+	async fn delete_calendar_object_override(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uid: &str,
+		recurrence_id: Timestamp,
+	) -> ClResult<()>;
+
+	/// Insert or update a calendar object (keyed by UID). Also bumps the calendar's ctag.
+	/// Returns the new etag. The `extracted.recurrence_id` selects which row is written — the
+	/// master row has `None`, recurrence overrides carry their own timestamp.
+	async fn upsert_calendar_object(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uid: &str,
+		ical: &str,
+		etag: &str,
+		extracted: &CalendarObjectExtracted,
+	) -> ClResult<Box<str>>;
+
+	/// Soft-delete a calendar object by UID (sets `deleted_at` on all rows sharing that UID),
+	/// leaving tombstones for CalDAV sync. Also bumps the calendar's ctag.
+	async fn delete_calendar_object(&self, tn_id: TnId, cal_id: u64, uid: &str) -> ClResult<()>;
+
+	/// Fetch multiple calendar objects by UID — for CalDAV `calendar-multiget` REPORT.
+	async fn get_calendar_objects_by_uids(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uids: &[&str],
+	) -> ClResult<Vec<CalendarObject>>;
+
+	/// Return live + tombstone entries for CalDAV `sync-collection` REPORT.
+	/// `since` is the sync token's timestamp; `None` means full sync.
+	async fn list_calendar_objects_since(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		since: Option<Timestamp>,
+		limit: Option<u32>,
+	) -> ClResult<Vec<CalendarObjectSyncEntry>>;
+
+	/// Return calendar objects overlapping a time range — for CalDAV `calendar-query` REPORT.
+	/// Semantics are deliberately loose (superset): any object whose master `dtstart` is ≤ `end`
+	/// AND (`rrule` is set OR `dtend` is ≥ `start` OR `dtend IS NULL`) is returned. Clients
+	/// expand recurrence locally. A `None` component lists both VEVENT and VTODO.
+	async fn query_calendar_objects_in_range(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		component: Option<&str>,
+		start: Option<Timestamp>,
+		end: Option<Timestamp>,
+	) -> ClResult<Vec<CalendarObject>>;
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 use std::{path::Path, sync::Arc};
 
 mod action;
+mod calendar;
 mod contact;
 mod file;
 mod file_user_data;
@@ -27,14 +28,16 @@ use tokio::fs;
 
 use cloudillo_types::{
 	meta_adapter::{
-		Action, ActionData, ActionId, ActionView, AddressBook, Contact, ContactExtracted,
-		ContactSyncEntry, ContactView, CreateFile, CreateRefOptions, CreateShareEntry, FileId,
-		FileUserData, FileVariant, FileView, FinalizeActionOptions, InstallApp, InstalledApp,
-		ListActionOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
+		Action, ActionData, ActionId, ActionView, AddressBook, Calendar, CalendarObject,
+		CalendarObjectExtracted, CalendarObjectSyncEntry, CalendarObjectView, Contact,
+		ContactExtracted, ContactSyncEntry, ContactView, CreateCalendarData, CreateFile,
+		CreateRefOptions, CreateShareEntry, FileId, FileUserData, FileVariant, FileView,
+		FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
+		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
 		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
 		ProfileData, PushSubscription, PushSubscriptionData, RefData, ShareEntry, Task, TaskPatch,
-		Tenant, TenantListMeta, UpdateActionDataOptions, UpdateAddressBookData, UpdateFileOptions,
-		UpdateProfileData, UpdateTenantData,
+		Tenant, TenantListMeta, UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData,
+		UpdateFileOptions, UpdateProfileData, UpdateTenantData,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -780,5 +783,131 @@ impl MetaAdapter for MetaAdapterSqlite {
 		profile_id_tag: &str,
 	) -> ClResult<Vec<Contact>> {
 		contact::list_contacts_by_profile(&self.dbr, tn_id, profile_id_tag).await
+	}
+
+	// Calendar / calendar-object management
+	//***************************************
+
+	async fn create_calendar(&self, tn_id: TnId, input: &CreateCalendarData) -> ClResult<Calendar> {
+		calendar::create_calendar(&self.db, tn_id, input).await
+	}
+
+	async fn list_calendars(&self, tn_id: TnId) -> ClResult<Vec<Calendar>> {
+		calendar::list_calendars(&self.dbr, tn_id).await
+	}
+
+	async fn get_calendar(&self, tn_id: TnId, cal_id: u64) -> ClResult<Option<Calendar>> {
+		calendar::get_calendar(&self.dbr, tn_id, cal_id).await
+	}
+
+	async fn get_calendar_by_name(&self, tn_id: TnId, name: &str) -> ClResult<Option<Calendar>> {
+		calendar::get_calendar_by_name(&self.dbr, tn_id, name).await
+	}
+
+	async fn update_calendar(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		patch: &UpdateCalendarData,
+	) -> ClResult<()> {
+		calendar::update_calendar(&self.db, tn_id, cal_id, patch).await
+	}
+
+	async fn delete_calendar(&self, tn_id: TnId, cal_id: u64) -> ClResult<()> {
+		calendar::delete_calendar(&self.db, tn_id, cal_id).await
+	}
+
+	async fn list_calendar_objects(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		opts: &ListCalendarObjectOptions,
+	) -> ClResult<Vec<CalendarObjectView>> {
+		calendar::list_calendar_objects(&self.dbr, tn_id, cal_id, opts).await
+	}
+
+	async fn get_calendar_object(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uid: &str,
+	) -> ClResult<Option<CalendarObject>> {
+		calendar::get_calendar_object(&self.dbr, tn_id, cal_id, uid).await
+	}
+
+	async fn get_calendar_object_override(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uid: &str,
+		recurrence_id: Timestamp,
+	) -> ClResult<Option<CalendarObject>> {
+		calendar::get_calendar_object_override(&self.dbr, tn_id, cal_id, uid, recurrence_id).await
+	}
+
+	async fn list_calendar_object_overrides(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uid: &str,
+	) -> ClResult<Vec<CalendarObject>> {
+		calendar::list_calendar_object_overrides(&self.dbr, tn_id, cal_id, uid).await
+	}
+
+	async fn delete_calendar_object_override(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uid: &str,
+		recurrence_id: Timestamp,
+	) -> ClResult<()> {
+		calendar::delete_calendar_object_override(&self.db, tn_id, cal_id, uid, recurrence_id).await
+	}
+
+	async fn upsert_calendar_object(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uid: &str,
+		ical: &str,
+		etag: &str,
+		extracted: &CalendarObjectExtracted,
+	) -> ClResult<Box<str>> {
+		calendar::upsert_calendar_object(&self.db, tn_id, cal_id, uid, ical, etag, extracted).await
+	}
+
+	async fn delete_calendar_object(&self, tn_id: TnId, cal_id: u64, uid: &str) -> ClResult<()> {
+		calendar::delete_calendar_object(&self.db, tn_id, cal_id, uid).await
+	}
+
+	async fn get_calendar_objects_by_uids(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		uids: &[&str],
+	) -> ClResult<Vec<CalendarObject>> {
+		calendar::get_calendar_objects_by_uids(&self.dbr, tn_id, cal_id, uids).await
+	}
+
+	async fn list_calendar_objects_since(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		since: Option<Timestamp>,
+		limit: Option<u32>,
+	) -> ClResult<Vec<CalendarObjectSyncEntry>> {
+		calendar::list_calendar_objects_since(&self.dbr, tn_id, cal_id, since, limit).await
+	}
+
+	async fn query_calendar_objects_in_range(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		component: Option<&str>,
+		start: Option<Timestamp>,
+		end: Option<Timestamp>,
+	) -> ClResult<Vec<CalendarObject>> {
+		calendar::query_calendar_objects_in_range(&self.dbr, tn_id, cal_id, component, start, end)
+			.await
 	}
 }
