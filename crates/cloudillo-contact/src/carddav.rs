@@ -26,7 +26,8 @@ use axum::{
 
 use cloudillo_core::{IdTag, extract::Auth, prelude::*};
 use cloudillo_dav::{
-	MultiResponse, PropName, PropStat, Propfind, Report, escape_xml, render_multistatus,
+	MultiResponse, PropName, PropStat, Propfind, Report, escape_xml, etag_header, plain_error,
+	render_multistatus, unquote_etag, urldecode_path, urlencode_path,
 };
 use cloudillo_types::meta_adapter::ListContactOptions;
 
@@ -38,8 +39,10 @@ use crate::{
 // URL prefixes — kept in sync with route registrations in `cloudillo/src/routes.rs`.
 const PRINCIPAL_PATH: &str = "/dav/principal/";
 const ADDRESSBOOKS_PATH: &str = "/dav/addressbooks/";
+const CALENDARS_PATH: &str = "/dav/calendars/";
 const DAV_NS: &str = cloudillo_dav::NS_DAV;
 const CARDDAV_NS: &str = cloudillo_dav::NS_CARDDAV;
+const CALDAV_NS: &str = cloudillo_dav::NS_CALDAV;
 const CALSERVER_NS: &str = cloudillo_dav::NS_CALSERVER;
 
 // Body size limit for DAV XML / vCard requests (1 MiB is more than enough for any vCard).
@@ -53,33 +56,25 @@ const MAX_SYNC_PAGE: u32 = 1_000;
 // Helpers
 //*********
 
-fn etag_header(etag: &str) -> String {
-	format!("\"{etag}\"")
-}
+/// `/dav/principal/` is the discovery pivot for BOTH protocols, so every response from this
+/// module advertises CardDAV and CalDAV capability tokens — DAVx5 and other clients decide
+/// which protocols to probe based on the `DAV:` response header, not the XML body.
+const DAV_CAPABILITIES: &str = "1, 2, 3, addressbook, calendar-access";
 
 fn xml_response(status: StatusCode, body: String) -> Response<Body> {
 	Response::builder()
 		.status(status)
 		.header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
-		.header("DAV", "1, 2, 3, addressbook")
+		.header("DAV", DAV_CAPABILITIES)
 		.body(Body::from(body))
 		.unwrap_or_else(|_| plain_error(StatusCode::INTERNAL_SERVER_ERROR, "xml build failed"))
-}
-
-fn plain_error(status: StatusCode, msg: &'static str) -> Response<Body> {
-	Response::builder().status(status).body(Body::from(msg)).unwrap_or_else(|_| {
-		let mut r = Response::new(Body::from(msg));
-		*r.status_mut() = status;
-		r
-	})
 }
 
 fn ok_empty() -> Response<Body> {
 	use axum::http::HeaderValue;
 	// Direct construction (no fallible builder) so headers can never be silently dropped.
 	let mut resp = Response::new(Body::empty());
-	resp.headers_mut()
-		.insert("dav", HeaderValue::from_static("1, 2, 3, addressbook"));
+	resp.headers_mut().insert("dav", HeaderValue::from_static(DAV_CAPABILITIES));
 	resp.headers_mut().insert(
 		"allow",
 		HeaderValue::from_static("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, REPORT, MKCOL"),
@@ -213,6 +208,13 @@ pub async fn handle_principal(
 			escape_xml(home_href),
 		);
 	}
+	if want(CALDAV_NS, "calendar-home-set") {
+		let _ = write!(
+			&mut props,
+			"<cal:calendar-home-set><d:href>{}</d:href></cal:calendar-home-set>",
+			escape_xml(CALENDARS_PATH),
+		);
+	}
 
 	let resp = MultiResponse::new(principal_href).with_propstat(PropStat::ok(props));
 	xml_response(StatusCode::MULTI_STATUS, render_multistatus(&[resp], None))
@@ -342,50 +344,6 @@ fn matches_prop(pf: &Propfind, ns: &str, local: &str) -> bool {
 		Propfind::AllProp | Propfind::PropName => true,
 		Propfind::Prop(list) => has_prop(list, ns, local),
 	}
-}
-
-/// URL-encode a path segment (names may contain spaces or punctuation).
-pub(crate) fn urlencode_path(s: &str) -> String {
-	let mut out = String::with_capacity(s.len());
-	for b in s.bytes() {
-		if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-			out.push(b as char);
-		} else {
-			let _ = write!(&mut out, "%{:02X}", b);
-		}
-	}
-	out
-}
-
-/// Strip the surrounding double quotes from an ETag header value per RFC 7232 §2.3, so
-/// comparisons are always against the opaque-tag bytes themselves.
-fn unquote_etag(s: &str) -> &str {
-	let t = s.trim();
-	t.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(t)
-}
-
-/// URL-decode a path segment from the wire. Returns `None` when the input contains a
-/// malformed percent-escape or the decoded bytes are not valid UTF-8; callers should
-/// respond 400 Bad Request rather than silently passing the undecoded text downstream.
-fn urldecode_path(s: &str) -> Option<String> {
-	let bytes = s.as_bytes();
-	let mut out = Vec::with_capacity(bytes.len());
-	let mut i = 0;
-	while i < bytes.len() {
-		if bytes[i] == b'%' {
-			if i + 2 >= bytes.len() {
-				return None;
-			}
-			let hi = u8::try_from((bytes[i + 1] as char).to_digit(16)?).ok()?;
-			let lo = u8::try_from((bytes[i + 2] as char).to_digit(16)?).ok()?;
-			out.push((hi << 4) | lo);
-			i += 3;
-			continue;
-		}
-		out.push(bytes[i]);
-		i += 1;
-	}
-	String::from_utf8(out).ok()
 }
 
 // Collection (single address book) — PROPFIND / REPORT / MKCOL
@@ -607,7 +565,7 @@ async fn report_collection(
 			}
 			xml_response(StatusCode::MULTI_STATUS, render_multistatus(&responses, Some(&new_token)))
 		}
-		Report::Unknown => plain_error(StatusCode::BAD_REQUEST, "unsupported report"),
+		_ => plain_error(StatusCode::BAD_REQUEST, "unsupported report"),
 	}
 }
 
@@ -674,7 +632,7 @@ async fn get_resource(
 		.status(StatusCode::OK)
 		.header(header::CONTENT_TYPE, "text/vcard; charset=utf-8")
 		.header(header::ETAG, etag_header(&row.etag))
-		.header("DAV", "1, 2, 3, addressbook")
+		.header("DAV", DAV_CAPABILITIES)
 		.body(body)
 		.unwrap_or_else(|_| Response::new(Body::empty()))
 }
@@ -761,7 +719,7 @@ async fn put_resource(
 	Response::builder()
 		.status(status)
 		.header(header::ETAG, etag_header(&etag))
-		.header("DAV", "1, 2, 3, addressbook")
+		.header("DAV", DAV_CAPABILITIES)
 		.body(Body::empty())
 		.unwrap_or_else(|_| Response::new(Body::empty()))
 }
@@ -770,7 +728,7 @@ async fn delete_resource(app: &App, tn_id: TnId, ab_id: u64, uid: &str) -> Respo
 	match app.meta_adapter.delete_contact(tn_id, ab_id, uid).await {
 		Ok(()) => Response::builder()
 			.status(StatusCode::NO_CONTENT)
-			.header("DAV", "1, 2, 3, addressbook")
+			.header("DAV", DAV_CAPABILITIES)
 			.body(Body::empty())
 			.unwrap_or_else(|_| Response::new(Body::empty())),
 		Err(Error::NotFound) => plain_error(StatusCode::NOT_FOUND, "not found"),
@@ -784,30 +742,6 @@ async fn delete_resource(app: &App, tn_id: TnId, ab_id: u64, uid: &str) -> Respo
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn urlencode_roundtrip() {
-		assert_eq!(urlencode_path("Work Contacts"), "Work%20Contacts");
-		assert_eq!(urldecode_path("Work%20Contacts").as_deref(), Some("Work Contacts"));
-		let mixed = "Szilárd+Doe";
-		let enc = urlencode_path(mixed);
-		assert_eq!(urldecode_path(&enc).as_deref(), Some(mixed));
-	}
-
-	#[test]
-	fn urldecode_rejects_invalid_utf8() {
-		// %FF alone is not a valid UTF-8 start byte — must be rejected, not silently
-		// passed through.
-		assert!(urldecode_path("bad%FFname").is_none());
-	}
-
-	#[test]
-	fn unquote_etag_handles_quotes_and_whitespace() {
-		assert_eq!(unquote_etag("\"abc\""), "abc");
-		assert_eq!(unquote_etag("  \"abc\"  "), "abc");
-		assert_eq!(unquote_etag("abc"), "abc");
-		assert_eq!(unquote_etag("\"\""), "");
-	}
 
 	#[test]
 	fn sync_token_roundtrip() {
