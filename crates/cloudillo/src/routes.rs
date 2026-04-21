@@ -30,6 +30,7 @@ use crate::settings;
 use crate::websocket;
 use cloudillo_action as action;
 use cloudillo_action::perm::check_perm_action;
+use cloudillo_calendar as calendar;
 use cloudillo_contact as contact;
 use cloudillo_core::acme;
 use cloudillo_core::create_perm::check_perm_create;
@@ -237,6 +238,24 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/address-books/{ab_id}/contacts/{uid}", patch(contact::handler::patch_contact))
 		.route("/api/address-books/{ab_id}/contacts/{uid}", delete(contact::handler::delete_contact))
 
+		// --- Calendars / Events (CalDAV sync lives under /dav/... elsewhere) ---
+		.route("/api/calendars", get(calendar::handler::list_calendars))
+		.route("/api/calendars", post(calendar::handler::create_calendar))
+		.route("/api/calendars/{cal_id}", get(calendar::handler::get_calendar))
+		.route("/api/calendars/{cal_id}", patch(calendar::handler::patch_calendar))
+		.route("/api/calendars/{cal_id}", delete(calendar::handler::delete_calendar))
+		.route("/api/calendars/{cal_id}/objects", get(calendar::handler::list_objects))
+		.route("/api/calendars/{cal_id}/objects", post(calendar::handler::create_object))
+		.route("/api/calendars/{cal_id}/objects/{uid}", get(calendar::handler::get_object))
+		.route("/api/calendars/{cal_id}/objects/{uid}", put(calendar::handler::put_object))
+		.route("/api/calendars/{cal_id}/objects/{uid}", patch(calendar::handler::patch_object))
+		.route("/api/calendars/{cal_id}/objects/{uid}", delete(calendar::handler::delete_object))
+		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions", get(calendar::handler::list_exceptions))
+		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}", get(calendar::handler::get_exception))
+		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}", put(calendar::handler::put_exception))
+		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}", patch(calendar::handler::patch_exception))
+		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}", delete(calendar::handler::delete_exception))
+
 		.route_layer(middleware::from_fn_with_state(app, require_auth))
 		.layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-cache")))
 		.layer(SetResponseHeaderLayer::if_not_present(header::EXPIRES, header::HeaderValue::from_static("0")))
@@ -361,11 +380,11 @@ fn init_public_routes(app: App) -> Router<App> {
 fn init_dav_routes(app: App) -> Router<App> {
 	use axum::http::HeaderName;
 
-	// The /.well-known/* redirects must stay unauthenticated — CardDAV clients probe them
-	// without credentials and expect a 301 back, not a 401 challenge.
+	// The /.well-known/* redirects must stay unauthenticated — CardDAV / CalDAV clients
+	// probe them without credentials and expect a 301 back, not a 401 challenge.
 	let well_known = Router::new()
 		.route("/.well-known/carddav", any(contact::carddav::well_known))
-		.route("/.well-known/caldav", any(contact::carddav::well_known));
+		.route("/.well-known/caldav", any(calendar::caldav::well_known));
 
 	let rate_limiter = app.rate_limiter.clone();
 	let mode = app.opts.mode;
@@ -374,16 +393,20 @@ fn init_dav_routes(app: App) -> Router<App> {
 		.route("/dav/addressbooks/", any(contact::carddav::handle_home))
 		.route("/dav/addressbooks/{ab_name}/", any(contact::carddav::handle_collection))
 		.route("/dav/addressbooks/{ab_name}/{resource}", any(contact::carddav::handle_resource))
+		.route("/dav/calendars/", any(calendar::caldav::handle_home))
+		.route("/dav/calendars/{cal_name}/", any(calendar::caldav::handle_collection))
+		.route("/dav/calendars/{cal_name}/{resource}", any(calendar::caldav::handle_resource))
 		.route_layer(middleware::from_fn_with_state(app, cloudillo_dav::dav_basic_auth))
-		// Basic-auth brute-force protection: throttle DAV requests the same way we throttle
-		// other credential-facing endpoints.
-		.layer(RateLimitLayer::new(rate_limiter, "auth", mode))
+		// Basic-auth brute-force protection on its own bucket. The "auth" bucket is tuned
+		// for login/register bursts and is far too tight for real DAV sync traffic —
+		// DAVx5 fires PROPFIND/REPORT per collection per sync cycle.
+		.layer(RateLimitLayer::new(rate_limiter, "dav", mode))
 		// DAV discovery hinges on the `DAV:` response header on OPTIONS — force it onto every
 		// response from the DAV router so no middleware or handler quirk can drop it.
 		// `if_not_present` means handlers can still customize the value.
 		.layer(SetResponseHeaderLayer::if_not_present(
 			HeaderName::from_static("dav"),
-			HeaderValue::from_static("1, 2, 3, addressbook"),
+			HeaderValue::from_static("1, 2, 3, addressbook, calendar-access"),
 		));
 
 	well_known.merge(dav)
@@ -788,10 +811,10 @@ fn init_app_service(app: App) -> Router {
 	// Add CORS layer only to the id-tag discovery endpoint
 	let well_known_router = Router::new()
 		.route("/.well-known/cloudillo/id-tag", get(auth::handler::get_id_tag))
-		// CardDAV discovery redirects to the API domain's /dav/principal/ — mounted here
-		// so clients probing the app domain (what users actually type) can find it.
+		// CardDAV / CalDAV discovery redirects to the API domain's /dav/principal/ — mounted
+		// here so clients probing the app domain (what users actually type) can find it.
 		.route("/.well-known/carddav", any(contact::carddav::well_known))
-		.route("/.well-known/caldav", any(contact::carddav::well_known))
+		.route("/.well-known/caldav", any(calendar::caldav::well_known))
 		.layer(tower_http::cors::CorsLayer::very_permissive());
 
 	Router::new()
