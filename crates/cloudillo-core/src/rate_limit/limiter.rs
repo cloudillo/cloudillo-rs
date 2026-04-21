@@ -165,6 +165,7 @@ impl RateLimitManager {
 
 		// Initialize category limiters
 		categories.insert("auth".to_string(), CategoryLimiters::new(&config.auth));
+		categories.insert("dav".to_string(), CategoryLimiters::new(&config.dav));
 		categories.insert("federation".to_string(), CategoryLimiters::new(&config.federation));
 		categories.insert("general".to_string(), CategoryLimiters::new(&config.general));
 		categories.insert("websocket".to_string(), CategoryLimiters::new(&config.websocket));
@@ -423,6 +424,7 @@ impl RateLimitApi for RateLimitManager {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
 	use super::*;
 	use std::net::Ipv4Addr;

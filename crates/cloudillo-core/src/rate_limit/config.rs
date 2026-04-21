@@ -56,6 +56,8 @@ pub struct EndpointCategoryConfig {
 pub struct RateLimitConfig {
 	/// Auth endpoints (login, register, password reset)
 	pub auth: EndpointCategoryConfig,
+	/// DAV endpoints (CardDAV / CalDAV sync)
+	pub dav: EndpointCategoryConfig,
 	/// Federation endpoints (inbox)
 	pub federation: EndpointCategoryConfig,
 	/// General public endpoints (profile, refs)
@@ -78,6 +80,19 @@ impl Default for RateLimitConfig {
 				ipv4_network: RateLimitTierConfig::new(15, 30, 200, 200),
 				ipv6_subnet: RateLimitTierConfig::new(5, 10, 60, 60),
 				ipv6_provider: RateLimitTierConfig::new(15, 30, 200, 200),
+			},
+			dav: EndpointCategoryConfig {
+				name: "dav",
+				// DAV: authenticated CardDAV / CalDAV sync. Clients like DAVx5 fire a
+				// burst of PROPFIND / REPORT per sync cycle (principal + each home set +
+				// each collection), and can poll every few minutes. Has to be generous
+				// enough for routine sync traffic while still bounded in case a token
+				// leaks — rate limiting runs before auth so this is our only brute-force
+				// defense on the DAV router.
+				ipv4_individual: RateLimitTierConfig::new(30, 60, 2000, 500),
+				ipv4_network: RateLimitTierConfig::new(60, 120, 5000, 1000),
+				ipv6_subnet: RateLimitTierConfig::new(30, 60, 2000, 500),
+				ipv6_provider: RateLimitTierConfig::new(60, 120, 5000, 1000),
 			},
 			federation: EndpointCategoryConfig {
 				name: "federation",
