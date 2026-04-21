@@ -10,7 +10,7 @@
 
 use std::fmt::Write;
 
-use crate::consts::{NS_CALSERVER, NS_CARDDAV, NS_DAV};
+use crate::consts::{NS_CALDAV, NS_CALSERVER, NS_CARDDAV, NS_DAV};
 
 // `write!(String, ...)` can't actually fail, but `?` is unavailable (`render` doesn't return
 // a Result) and `.ok()` reads as "errors silently ignored." Bind to `_` to make the contract
@@ -20,7 +20,8 @@ use crate::consts::{NS_CALSERVER, NS_CARDDAV, NS_DAV};
 pub struct PropStat {
 	pub status: u16,
 	/// Pre-rendered `<d:propertyname>…</d:propertyname>` fragments. Use the same namespace
-	/// prefixes as the root: `d:` for DAV, `c:` for CardDAV, `cs:` for CalendarServer.
+	/// prefixes as the root: `d:` for DAV, `c:` for CardDAV, `cal:` for CalDAV, `cs:` for
+	/// CalendarServer.
 	pub props_xml: String,
 }
 
@@ -65,7 +66,7 @@ pub fn render(responses: &[MultiResponse], sync_token: Option<&str>) -> String {
 	out.push('\n');
 	let _ = write!(
 		out,
-		r#"<d:multistatus xmlns:d="{NS_DAV}" xmlns:c="{NS_CARDDAV}" xmlns:cs="{NS_CALSERVER}">"#,
+		r#"<d:multistatus xmlns:d="{NS_DAV}" xmlns:c="{NS_CARDDAV}" xmlns:cal="{NS_CALDAV}" xmlns:cs="{NS_CALSERVER}">"#,
 	);
 
 	for resp in responses {

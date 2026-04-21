@@ -1,20 +1,24 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-//! Parse REPORT request bodies (RFC 6352 §8, RFC 6578 §3).
+//! Parse REPORT request bodies (RFC 6352 §8, RFC 6578 §3, RFC 4791 §7).
 //!
-//! We only handle the two reports that mainstream CardDAV clients actually use:
+//! We handle the reports mainstream clients actually use:
 //! - `{urn:ietf:params:xml:ns:carddav}addressbook-multiget` — "give me these specific hrefs"
+//! - `{urn:ietf:params:xml:ns:caldav}calendar-multiget`  — same, for CalDAV
+//! - `{urn:ietf:params:xml:ns:caldav}calendar-query`     — component + time-range filter
 //! - `{DAV:}sync-collection` — "what changed since my last sync-token?"
 //!
-//! `addressbook-query` (server-side filtering) can be added later — macOS / DAVx5 / iOS
-//! all function fine without it; they just pull the full collection and filter locally.
+//! `addressbook-query` (server-side filtering) is not implemented; macOS / DAVx5 / iOS all
+//! function fine without it. For calendar-query we parse only the top-level comp-filter and
+//! time-range — deeper prop-filters collapse to "return superset" which is RFC-compliant
+//! and lets the client do the precise filtering locally.
 
 use quick_xml::{Reader, events::Event};
 use tracing::warn;
 
 use crate::{
-	consts::{NS_CARDDAV, NS_DAV},
+	consts::{NS_CALDAV, NS_CARDDAV, NS_DAV},
 	propfind::PropName,
 };
 
@@ -29,6 +33,8 @@ pub enum Report {
 	#[default]
 	Unknown,
 	AddressbookMultiget(MultigetReport),
+	CalendarMultiget(MultigetReport),
+	CalendarQuery(CalendarQueryReport),
 	SyncCollection(SyncCollectionReport),
 }
 
@@ -37,6 +43,20 @@ pub struct MultigetReport {
 	pub props: Vec<PropName>,
 	/// Raw hrefs from the request — the handler resolves them to UIDs.
 	pub hrefs: Vec<String>,
+}
+
+/// Parsed `{urn:ietf:params:xml:ns:caldav}calendar-query` (RFC 4791 §7.8).
+///
+/// We extract only the pieces we use for the deliberately-loose "superset" semantics:
+/// - `props`: which properties the client wants back
+/// - `component`: the name of the inner-most `<comp-filter>` below VCALENDAR (VEVENT / VTODO)
+/// - `time_range`: the `start` / `end` attributes from any nested `<time-range>` element
+#[derive(Debug, Clone, Default)]
+pub struct CalendarQueryReport {
+	pub props: Vec<PropName>,
+	pub component: Option<String>,
+	/// `(start, end)` in iCalendar basic format (`YYYYMMDDTHHMMSSZ`).
+	pub time_range: Option<(Option<String>, Option<String>)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -77,7 +97,11 @@ pub fn parse(body: &str) -> Report {
 	let mut had_unescape_error = false;
 
 	let mut multiget = MultigetReport::default();
+	let mut calendar_multiget = MultigetReport::default();
 	let mut sync_coll = SyncCollectionReport::default();
+	let mut cal_query = CalendarQueryReport::default();
+	// Track the deepest comp-filter name we've seen so far (VCALENDAR → VEVENT → ...).
+	let mut cal_query_comp_depth: Option<usize> = None;
 
 	loop {
 		match reader.read_event() {
@@ -90,6 +114,12 @@ pub fn parse(body: &str) -> Report {
 					match (ns.as_str(), local.as_str()) {
 						(NS_CARDDAV, "addressbook-multiget") => {
 							root_kind = Some(ReportKind::AddressbookMultiget);
+						}
+						(NS_CALDAV, "calendar-multiget") => {
+							root_kind = Some(ReportKind::CalendarMultiget);
+						}
+						(NS_CALDAV, "calendar-query") => {
+							root_kind = Some(ReportKind::CalendarQuery);
 						}
 						(NS_DAV, "sync-collection") => {
 							root_kind = Some(ReportKind::SyncCollection);
@@ -111,6 +141,35 @@ pub fn parse(body: &str) -> Report {
 						_ if parent_is_prop => multiget.props.push(PropName::new(ns, local)),
 						_ => {}
 					},
+					Some(ReportKind::CalendarMultiget) => match (ns.as_str(), local.as_str()) {
+						(NS_DAV, "prop") if prop_depth.is_none() => prop_depth = Some(depth),
+						(NS_DAV, "href") if href_depth.is_none() => {
+							href_depth = Some(depth);
+							current_text.clear();
+						}
+						_ if parent_is_prop => {
+							calendar_multiget.props.push(PropName::new(ns, local));
+						}
+						_ => {}
+					},
+					Some(ReportKind::CalendarQuery) => {
+						if ns == NS_DAV && local == "prop" && prop_depth.is_none() {
+							prop_depth = Some(depth);
+						} else if parent_is_prop {
+							cal_query.props.push(PropName::new(ns, local));
+						} else if ns == NS_CALDAV && local == "comp-filter" {
+							// Read `name="…"`; keep the deepest (inner-most) one. VCALENDAR is
+							// the outer filter; VEVENT/VTODO lives inside it.
+							if let Some(name) = read_name_attr(&e) {
+								let name_upper = name.to_ascii_uppercase();
+								let is_deeper = cal_query_comp_depth.is_none_or(|d| depth > d);
+								if is_deeper && name_upper != "VCALENDAR" {
+									cal_query.component = Some(name_upper);
+									cal_query_comp_depth = Some(depth);
+								}
+							}
+						}
+					}
 					Some(ReportKind::SyncCollection) => match (ns.as_str(), local.as_str()) {
 						(NS_DAV, "prop") if prop_depth.is_none() => prop_depth = Some(depth),
 						(NS_DAV, "sync-token") if sync_token_depth.is_none() => {
@@ -139,6 +198,12 @@ pub fn parse(body: &str) -> Report {
 						Some(ReportKind::AddressbookMultiget) => {
 							multiget.props.push(PropName::new(ns, local));
 						}
+						Some(ReportKind::CalendarMultiget) => {
+							calendar_multiget.props.push(PropName::new(ns, local));
+						}
+						Some(ReportKind::CalendarQuery) => {
+							cal_query.props.push(PropName::new(ns, local));
+						}
 						Some(ReportKind::SyncCollection) => {
 							sync_coll.props.push(PropName::new(ns, local));
 						}
@@ -149,6 +214,28 @@ pub fn parse(body: &str) -> Report {
 				{
 					// Explicit empty <sync-token/> → initial sync.
 					sync_coll.sync_token = None;
+				} else if matches!(root_kind, Some(ReportKind::CalendarQuery))
+					&& ns == NS_CALDAV
+					&& local == "time-range"
+				{
+					let start = read_attr(&e, b"start");
+					let end = read_attr(&e, b"end");
+					cal_query.time_range = Some((start, end));
+				} else if matches!(root_kind, Some(ReportKind::CalendarQuery))
+					&& ns == NS_CALDAV
+					&& local == "comp-filter"
+				{
+					// Self-closing <comp-filter name="VEVENT"/> — no inner time-range, but we
+					// still want to capture the component name.
+					if let Some(name) = read_name_attr(&e) {
+						let name_upper = name.to_ascii_uppercase();
+						let depth = element_stack.len() + 1;
+						let is_deeper = cal_query_comp_depth.is_none_or(|d| depth > d);
+						if is_deeper && name_upper != "VCALENDAR" {
+							cal_query.component = Some(name_upper);
+							cal_query_comp_depth = Some(depth);
+						}
+					}
 				}
 				ns_stack.pop();
 			}
@@ -181,7 +268,12 @@ pub fn parse(body: &str) -> Report {
 					// Empty / whitespace-only <href/> is meaningless; dropping it avoids
 					// emitting empty <D:href></D:href> rows in the multistatus response.
 					if !s.trim().is_empty() {
-						multiget.hrefs.push(s);
+						match root_kind {
+							Some(ReportKind::CalendarMultiget) => {
+								calendar_multiget.hrefs.push(s);
+							}
+							_ => multiget.hrefs.push(s),
+						}
 					}
 				}
 				if sync_token_depth.is_some_and(|d| d > depth) {
@@ -212,14 +304,31 @@ pub fn parse(body: &str) -> Report {
 	}
 	match root_kind {
 		Some(ReportKind::AddressbookMultiget) => Report::AddressbookMultiget(multiget),
+		Some(ReportKind::CalendarMultiget) => Report::CalendarMultiget(calendar_multiget),
+		Some(ReportKind::CalendarQuery) => Report::CalendarQuery(cal_query),
 		Some(ReportKind::SyncCollection) => Report::SyncCollection(sync_coll),
 		None => Report::Unknown,
 	}
 }
 
+fn read_attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
+	for attr in e.attributes().flatten() {
+		if attr.key.as_ref() == key {
+			return std::str::from_utf8(&attr.value).ok().map(str::to_string);
+		}
+	}
+	None
+}
+
+fn read_name_attr(e: &quick_xml::events::BytesStart<'_>) -> Option<String> {
+	read_attr(e, b"name")
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ReportKind {
 	AddressbookMultiget,
+	CalendarMultiget,
+	CalendarQuery,
 	SyncCollection,
 }
 
@@ -359,6 +468,71 @@ mod tests {
 		assert!(r.props.iter().any(|p| p.is(NS_CARDDAV, "address-data")));
 		assert!(!r.props.iter().any(|p| p.is(NS_DAV, "inner")));
 		assert_eq!(r.hrefs, vec!["/dav/ab/a.vcf".to_string()]);
+	}
+
+	#[test]
+	fn parse_calendar_multiget() {
+		let body = r#"<?xml version="1.0" encoding="utf-8"?>
+			<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+				<d:prop>
+					<d:getetag/>
+					<c:calendar-data/>
+				</d:prop>
+				<d:href>/dav/calendars/Default/abc.ics</d:href>
+				<d:href>/dav/calendars/Default/def.ics</d:href>
+			</c:calendar-multiget>"#;
+		let Report::CalendarMultiget(r) = parse(body) else {
+			panic!("expected calendar-multiget");
+		};
+		assert_eq!(r.hrefs.len(), 2);
+		assert!(r.hrefs.iter().any(|h| h.ends_with("abc.ics")));
+		assert!(r.props.iter().any(|p| p.is(NS_DAV, "getetag")));
+		assert!(r.props.iter().any(|p| p.is(NS_CALDAV, "calendar-data")));
+	}
+
+	#[test]
+	fn parse_calendar_query_with_time_range() {
+		let body = r#"<?xml version="1.0" encoding="utf-8"?>
+			<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+				<d:prop>
+					<d:getetag/>
+					<c:calendar-data/>
+				</d:prop>
+				<c:filter>
+					<c:comp-filter name="VCALENDAR">
+						<c:comp-filter name="VEVENT">
+							<c:time-range start="20260401T000000Z" end="20260501T000000Z"/>
+						</c:comp-filter>
+					</c:comp-filter>
+				</c:filter>
+			</c:calendar-query>"#;
+		let Report::CalendarQuery(r) = parse(body) else {
+			panic!("expected calendar-query");
+		};
+		assert_eq!(r.component.as_deref(), Some("VEVENT"));
+		assert_eq!(
+			r.time_range,
+			Some((Some("20260401T000000Z".into()), Some("20260501T000000Z".into())))
+		);
+		assert!(r.props.iter().any(|p| p.is(NS_DAV, "getetag")));
+	}
+
+	#[test]
+	fn parse_calendar_query_without_time_range() {
+		let body = r#"<?xml version="1.0" encoding="utf-8"?>
+			<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+				<d:prop><d:getetag/></d:prop>
+				<c:filter>
+					<c:comp-filter name="VCALENDAR">
+						<c:comp-filter name="VTODO"/>
+					</c:comp-filter>
+				</c:filter>
+			</c:calendar-query>"#;
+		let Report::CalendarQuery(r) = parse(body) else {
+			panic!("expected calendar-query");
+		};
+		assert_eq!(r.component.as_deref(), Some("VTODO"));
+		assert_eq!(r.time_range, None);
 	}
 
 	#[test]

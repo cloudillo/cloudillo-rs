@@ -31,27 +31,62 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use cloudillo_core::{App, extract::Auth};
 use cloudillo_types::{auth_adapter::AuthCtx, extract::IdTag, prelude::*};
 
-const REQUIRED_READ_SCOPE: &str = "carddav:read";
-const REQUIRED_WRITE_SCOPE: &str = "carddav:write";
-
 /// Returns `true` iff `scopes` (comma-separated) contains an exact-match token for `needed`.
 /// Whitespace around each token is trimmed.
 pub fn has_scope(scopes: &str, needed: &str) -> bool {
 	scopes.split(',').map(str::trim).any(|s| s == needed)
 }
 
-/// Returns the scope(s) required for the given HTTP method. The list is ANDed — all must be
-/// present. Write methods imply read.
-fn required_scopes(method: &Method) -> &'static [&'static str] {
-	// PROPFIND / REPORT / MKCOL aren't in `axum::http::Method`'s canonical set but flow through
-	// as ext methods. We match on method name strings to cover them.
-	match method.as_str() {
-		"GET" | "HEAD" | "OPTIONS" | "PROPFIND" | "REPORT" => &[REQUIRED_READ_SCOPE],
-		"PUT" | "DELETE" | "MKCOL" | "PROPPATCH" | "MKCALENDAR" | "MOVE" | "COPY" => {
-			&[REQUIRED_READ_SCOPE, REQUIRED_WRITE_SCOPE]
+/// What the token must satisfy. `AllOf` requires every scope (the read+write pattern);
+/// `AnyOf` is used for the shared principal path where either `carddav:read` OR `caldav:read`
+/// lets a DAV client discover collection URIs.
+#[derive(Debug, Clone)]
+enum Required {
+	AllOf(&'static [&'static str]),
+	AnyOf(&'static [&'static str]),
+}
+
+impl Required {
+	fn satisfied_by(&self, scopes: &str) -> bool {
+		match self {
+			Self::AllOf(needed) => needed.iter().all(|s| has_scope(scopes, s)),
+			Self::AnyOf(needed) => needed.iter().any(|s| has_scope(scopes, s)),
 		}
-		// Unknown methods: fail closed.
-		_ => &[REQUIRED_READ_SCOPE, REQUIRED_WRITE_SCOPE],
+	}
+
+	fn as_slice(&self) -> &'static [&'static str] {
+		match self {
+			Self::AllOf(s) | Self::AnyOf(s) => s,
+		}
+	}
+}
+
+/// Derive the scope prefix from the URL path. `None` = shared DAV path (principal discovery
+/// or `.well-known`) that accepts any DAV read scope.
+fn resource_scope_prefix(path: &str) -> Option<&'static str> {
+	if path.starts_with("/dav/calendars/") {
+		Some("caldav")
+	} else if path.starts_with("/dav/addressbooks/") {
+		Some("carddav")
+	} else {
+		None
+	}
+}
+
+/// Returns the scope(s) required for a given request. PROPFIND / REPORT / MKCOL aren't in
+/// `axum::http::Method`'s canonical set but flow through as ext methods, so we match on
+/// method name strings. Write methods imply read; the principal path is any-of.
+fn required_scopes(method: &Method, path: &str) -> Required {
+	let is_read = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS" | "PROPFIND" | "REPORT");
+	match (resource_scope_prefix(path), is_read) {
+		(Some("caldav"), true) => Required::AllOf(&["caldav:read"]),
+		(Some("caldav"), false) => Required::AllOf(&["caldav:read", "caldav:write"]),
+		// Everything else with an explicit prefix: default to carddav (matches the pre-CalDAV
+		// status quo for any path like `/dav/addressbooks/...`).
+		(Some(_), true) => Required::AllOf(&["carddav:read"]),
+		(Some(_), false) => Required::AllOf(&["carddav:read", "carddav:write"]),
+		(None, true) => Required::AnyOf(&["carddav:read", "caldav:read"]),
+		(None, false) => Required::AnyOf(&["carddav:write", "caldav:write"]),
 	}
 }
 
@@ -60,7 +95,7 @@ fn unauthorized() -> Response<Body> {
 	*resp.status_mut() = StatusCode::UNAUTHORIZED;
 	resp.headers_mut().insert(
 		header::WWW_AUTHENTICATE,
-		HeaderValue::from_static(r#"Basic realm="Cloudillo CardDAV""#),
+		HeaderValue::from_static(r#"Basic realm="Cloudillo DAV""#),
 	);
 	resp
 }
@@ -129,13 +164,15 @@ pub async fn dav_basic_auth(
 		return unauthorized();
 	}
 
-	// Scope check.
+	// Scope check — path-aware so the same middleware covers CardDAV + CalDAV + principal.
 	let scopes = validation.scopes.as_deref().unwrap_or("");
-	let needed = required_scopes(req.method());
-	if !needed.iter().all(|s| has_scope(scopes, s)) {
+	let needed = required_scopes(req.method(), req.uri().path());
+	if !needed.satisfied_by(scopes) {
 		warn!(
 			"DAV: token for {} lacks required scope(s) {:?} (has: {:?})",
-			validation.id_tag, needed, scopes
+			validation.id_tag,
+			needed.as_slice(),
+			scopes
 		);
 		return forbidden();
 	}
@@ -173,19 +210,42 @@ mod tests {
 	}
 
 	#[test]
-	fn required_scopes_per_method() {
-		let get = required_scopes(&Method::GET);
-		assert_eq!(get, &["carddav:read"]);
+	fn required_scopes_carddav_path() {
+		let get = required_scopes(&Method::GET, "/dav/addressbooks/Contacts/");
+		assert_eq!(get.as_slice(), &["carddav:read"]);
+		assert!(get.satisfied_by("carddav:read"));
 
-		let put = required_scopes(&Method::PUT);
-		assert_eq!(put, &["carddav:read", "carddav:write"]);
+		let put = required_scopes(&Method::PUT, "/dav/addressbooks/Contacts/abc.vcf");
+		assert_eq!(put.as_slice(), &["carddav:read", "carddav:write"]);
+		assert!(put.satisfied_by("carddav:read,carddav:write"));
+		assert!(!put.satisfied_by("carddav:read"));
 
-		// Custom method (PROPFIND)
-		let propfind = required_scopes(&Method::from_bytes(b"PROPFIND").unwrap());
-		assert_eq!(propfind, &["carddav:read"]);
+		let propfind =
+			required_scopes(&Method::from_bytes(b"PROPFIND").unwrap(), "/dav/addressbooks/");
+		assert_eq!(propfind.as_slice(), &["carddav:read"]);
+	}
 
-		let mkcol = required_scopes(&Method::from_bytes(b"MKCOL").unwrap());
-		assert_eq!(mkcol, &["carddav:read", "carddav:write"]);
+	#[test]
+	fn required_scopes_caldav_path() {
+		let get = required_scopes(&Method::GET, "/dav/calendars/Default/");
+		assert_eq!(get.as_slice(), &["caldav:read"]);
+
+		let put = required_scopes(&Method::PUT, "/dav/calendars/Default/abc.ics");
+		assert_eq!(put.as_slice(), &["caldav:read", "caldav:write"]);
+		assert!(put.satisfied_by("caldav:read,caldav:write"));
+
+		// A carddav-only token must NOT be accepted on a calendars path.
+		assert!(!put.satisfied_by("carddav:read,carddav:write"));
+	}
+
+	#[test]
+	fn required_scopes_principal_accepts_either() {
+		let get = required_scopes(&Method::GET, "/dav/principal/");
+		assert!(matches!(get, Required::AnyOf(_)));
+		// Either scope on its own discovers principal + home-sets.
+		assert!(get.satisfied_by("carddav:read"));
+		assert!(get.satisfied_by("caldav:read"));
+		assert!(!get.satisfied_by("other:read"));
 	}
 }
 
