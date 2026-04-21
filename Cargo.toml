@@ -19,6 +19,7 @@ members = [
 	"crates/cloudillo-action",
 	"crates/cloudillo-dav",
 	"crates/cloudillo-contact",
+	"crates/cloudillo-calendar",
 	"adapters/auth-adapter-sqlite",
 	"adapters/blob-adapter-fs",
 	"adapters/meta-adapter-sqlite",
@@ -53,6 +54,7 @@ cloudillo-profile = { version = "0.8.12", path = "crates/cloudillo-profile" }
 cloudillo-action = { version = "0.8.12", path = "crates/cloudillo-action" }
 cloudillo-dav = { version = "0.8.12", path = "crates/cloudillo-dav" }
 cloudillo-contact = { version = "0.8.12", path = "crates/cloudillo-contact" }
+cloudillo-calendar = { version = "0.8.12", path = "crates/cloudillo-calendar" }
 cloudillo-auth-adapter-sqlite = { version = "0.8.12", path = "adapters/auth-adapter-sqlite" }
 cloudillo-meta-adapter-sqlite = { version = "0.8.12", path = "adapters/meta-adapter-sqlite" }
 cloudillo-blob-adapter-fs = { version = "0.8.12", path = "adapters/blob-adapter-fs" }

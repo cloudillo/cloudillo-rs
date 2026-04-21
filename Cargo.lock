@@ -641,6 +641,7 @@ dependencies = [
  "cloudillo-action",
  "cloudillo-admin",
  "cloudillo-auth",
+ "cloudillo-calendar",
  "cloudillo-contact",
  "cloudillo-core",
  "cloudillo-crdt",
@@ -762,6 +763,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "cloudillo-calendar"
+version = "0.8.12"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "cloudillo-core",
+ "cloudillo-dav",
+ "cloudillo-types",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "sha2 0.10.9",
+ "tracing",
 ]
 
 [[package]]

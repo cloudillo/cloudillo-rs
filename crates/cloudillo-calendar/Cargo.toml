@@ -1,0 +1,29 @@
+[package]
+name = "cloudillo-calendar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Calendar management (JSON REST + CalDAV) for the Cloudillo federated collaboration platform"
+keywords = ["cloudillo", "calendar", "caldav", "icalendar", "vevent", "vtodo"]
+categories = ["web-programming"]
+readme = "../../README.md"
+
+[dependencies]
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
+cloudillo-dav = { workspace = true }
+
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http2", "macros"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3"
+sha2 = "0.10"
+tracing = "0.1"
+
+[lints]
+workspace = true
