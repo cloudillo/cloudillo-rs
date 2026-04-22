@@ -19,8 +19,8 @@ use cloudillo_core::{
 };
 use cloudillo_types::{
 	meta_adapter::{
-		Calendar, CalendarObject, CalendarObjectView, CreateCalendarData,
-		ListCalendarObjectOptions, UpdateCalendarData,
+		Calendar, CalendarObject, CalendarObjectExtracted, CalendarObjectView, CalendarObjectWrite,
+		CreateCalendarData, ListCalendarObjectOptions, UpdateCalendarData,
 	},
 	types::ApiResponse,
 	utils::random_id,
@@ -31,7 +31,7 @@ use crate::{
 	types::{
 		CalendarCreate, CalendarObjectInput, CalendarObjectListItem, CalendarObjectOutput,
 		CalendarObjectPatch, CalendarOutput, CalendarPatch, EventInput, EventPatch,
-		ListObjectsQuery, TodoInput, TodoPatch,
+		ListObjectsQuery, SplitSeriesRequest, SplitSeriesResponse, TodoInput, TodoPatch,
 	},
 };
 
@@ -340,12 +340,7 @@ async fn write_object(
 		}
 	};
 
-	let ical_text = ical::generate(&input);
-	let etag = ical::etag_of(&ical_text);
-	let (extracted, _, _) = ical::parse(&ical_text).ok_or_else(|| {
-		error!("failed to re-parse own generated iCalendar for UID {uid}");
-		Error::Internal("iCalendar generation produced unparseable output".into())
-	})?;
+	let (ical_text, etag, extracted) = render_object(&input)?;
 
 	app.meta_adapter
 		.upsert_calendar_object(tn_id, cal_id, &uid, &ical_text, &etag, &extracted)
@@ -541,6 +536,127 @@ pub async fn delete_object(
 ) -> ClResult<StatusCode> {
 	app.meta_adapter.delete_calendar_object(tn_id, cal_id, &uid).await?;
 	Ok(StatusCode::NO_CONTENT)
+}
+
+/// Regenerate iCalendar + extracted projection for an input. Mirrors the second half of
+/// [`write_object`] but returns the pieces instead of writing — the split path needs
+/// to hand these to the adapter's transactional writer.
+fn render_object(
+	input: &CalendarObjectInput,
+) -> ClResult<(String, String, CalendarObjectExtracted)> {
+	let ical_text = ical::generate(input);
+	let etag = ical::etag_of(&ical_text);
+	let (extracted, _, _) = ical::parse(&ical_text).ok_or_else(|| {
+		error!("failed to re-parse own generated iCalendar");
+		Error::Internal("iCalendar generation produced unparseable output".into())
+	})?;
+	Ok((ical_text, etag, extracted))
+}
+
+/// `POST /api/calendars/{cal_id}/objects/{uid}/split` — atomically fork a recurring
+/// series. Replaces the previous three-round-trip client dance (PATCH master, DELETE
+/// overrides, POST tail) whose intermediate failures could leave the series half-split
+/// on the server. Here all three mutations commit together or not at all.
+pub async fn split_series(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(_id_tag): IdTag,
+	Auth(_auth): Auth,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Path((cal_id, uid)): Path<(u64, String)>,
+	Json(body): Json<SplitSeriesRequest>,
+) -> ClResult<(StatusCode, Json<ApiResponse<SplitSeriesResponse>>)> {
+	app.meta_adapter.get_calendar(tn_id, cal_id).await?.ok_or(Error::NotFound)?;
+
+	let split_at = parse_iso_ts(&body.split_at)
+		.ok_or_else(|| Error::ValidationError("invalid splitAt".into()))?;
+
+	// Load and decode the existing master. Must exist and must actually be recurring —
+	// splitting a non-recurring object is a client mistake we reject with 400 rather
+	// than silently creating a duplicate.
+	let stored = app
+		.meta_adapter
+		.get_calendar_object(tn_id, cal_id, &uid)
+		.await?
+		.ok_or(Error::NotFound)?;
+	if stored.extracted.rrule.is_none() {
+		return Err(Error::ValidationError("object is not a recurring series".into()));
+	}
+	let (mut merged, _warnings) = ical::parse_to_input(&stored.ical)
+		.ok_or_else(|| Error::Internal("stored iCalendar not parseable".into()))?;
+	merged.uid = Some(uid.clone());
+
+	// Apply the master patch. Semantics mirror `patch_object`: component type is
+	// fixed by what's stored; a mismatched patch body is a validation error.
+	match (&merged.event, &merged.todo, body.master_patch.event, body.master_patch.todo) {
+		(Some(_), _, Some(ev), None) => {
+			let target = merged.event.as_mut().ok_or(Error::Internal("event missing".into()))?;
+			apply_event_patch(target, ev);
+		}
+		(_, Some(_), None, Some(td)) => {
+			let target = merged.todo.as_mut().ok_or(Error::Internal("todo missing".into()))?;
+			apply_todo_patch(target, td);
+		}
+		(_, _, None, None) => {}
+		_ => {
+			return Err(Error::ValidationError(
+				"master patch component does not match stored object".into(),
+			));
+		}
+	}
+
+	// Tail must describe a component; force a fresh server-minted UID so the new
+	// series is independently addressable and can't collide with the master.
+	let mut tail_input = body.tail;
+	if tail_input.event.is_none() && tail_input.todo.is_none() {
+		return Err(Error::ValidationError("tail event or todo required".into()));
+	}
+	let tail_uid = random_id()?;
+	tail_input.uid = Some(tail_uid.clone());
+	tail_input.recurrence_id = None;
+
+	let (master_ical, master_etag, master_extracted) = render_object(&merged)?;
+	let (tail_ical, tail_etag, tail_extracted) = render_object(&tail_input)?;
+
+	app.meta_adapter
+		.split_calendar_object_series(
+			tn_id,
+			cal_id,
+			CalendarObjectWrite {
+				uid: &uid,
+				ical: &master_ical,
+				etag: &master_etag,
+				extracted: &master_extracted,
+			},
+			CalendarObjectWrite {
+				uid: &tail_uid,
+				ical: &tail_ical,
+				etag: &tail_etag,
+				extracted: &tail_extracted,
+			},
+			split_at,
+		)
+		.await?;
+
+	let master_row = app
+		.meta_adapter
+		.get_calendar_object(tn_id, cal_id, &uid)
+		.await?
+		.ok_or_else(|| Error::Internal("master missing after split".into()))?;
+	let tail_row = app
+		.meta_adapter
+		.get_calendar_object(tn_id, cal_id, &tail_uid)
+		.await?
+		.ok_or_else(|| Error::Internal("tail missing after split".into()))?;
+
+	let mut resp = ApiResponse::new(SplitSeriesResponse {
+		master: object_to_output(&master_row),
+		tail: object_to_output(&tail_row),
+	});
+	if let Some(id) = req_id {
+		resp = resp.with_req_id(id);
+	}
+	Ok((StatusCode::OK, Json(resp)))
 }
 
 // Recurrence-override handlers

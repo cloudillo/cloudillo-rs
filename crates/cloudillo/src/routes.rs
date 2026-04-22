@@ -250,6 +250,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/calendars/{cal_id}/objects/{uid}", put(calendar::handler::put_object))
 		.route("/api/calendars/{cal_id}/objects/{uid}", patch(calendar::handler::patch_object))
 		.route("/api/calendars/{cal_id}/objects/{uid}", delete(calendar::handler::delete_object))
+		.route("/api/calendars/{cal_id}/objects/{uid}/split", post(calendar::handler::split_series))
 		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions", get(calendar::handler::list_exceptions))
 		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}", get(calendar::handler::get_exception))
 		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}", put(calendar::handler::put_exception))

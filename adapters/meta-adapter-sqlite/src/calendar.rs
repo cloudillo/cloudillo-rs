@@ -14,7 +14,8 @@
 use cloudillo_types::{
 	meta_adapter::{
 		Calendar, CalendarObject, CalendarObjectExtracted, CalendarObjectSyncEntry,
-		CalendarObjectView, CreateCalendarData, ListCalendarObjectOptions, UpdateCalendarData,
+		CalendarObjectView, CalendarObjectWrite, CreateCalendarData, ListCalendarObjectOptions,
+		UpdateCalendarData,
 	},
 	prelude::*,
 };
@@ -413,16 +414,7 @@ pub async fn delete_calendar_object_override(
 		return Err(Error::NotFound);
 	}
 
-	sqlx::query(
-		"UPDATE calendars SET ctag = lower(hex(randomblob(8))) \
-		 WHERE tn_id = ? AND cal_id = ?",
-	)
-	.bind(tn_id.0)
-	.bind(cal_id.cast_signed())
-	.execute(&mut *tx)
-	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	bump_calendar_ctag_tx(&mut tx, tn_id, cal_id).await?;
 
 	tx.commit().await.or(Err(Error::DbError))?;
 	Ok(())
@@ -463,7 +455,81 @@ pub async fn upsert_calendar_object(
 	extracted: &CalendarObjectExtracted,
 ) -> ClResult<Box<str>> {
 	let mut tx = db.begin().await.or(Err(Error::DbError))?;
+	let stored_etag = upsert_calendar_object_tx(
+		&mut tx,
+		tn_id,
+		cal_id,
+		CalendarObjectWrite { uid, ical, etag, extracted },
+	)
+	.await?;
+	bump_calendar_ctag_tx(&mut tx, tn_id, cal_id).await?;
+	tx.commit().await.or(Err(Error::DbError))?;
+	Ok(stored_etag)
+}
 
+/// Bump a calendar's ctag inside an open tx — shared by upsert and split.
+async fn bump_calendar_ctag_tx(
+	tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+	tn_id: TnId,
+	cal_id: u64,
+) -> ClResult<()> {
+	sqlx::query(
+		"UPDATE calendars SET ctag = lower(hex(randomblob(8))) \
+		 WHERE tn_id = ? AND cal_id = ?",
+	)
+	.bind(tn_id.0)
+	.bind(cal_id.cast_signed())
+	.execute(&mut **tx)
+	.await
+	.inspect_err(|e| error!("DB: {e}"))
+	.or(Err(Error::DbError))?;
+	Ok(())
+}
+
+pub async fn delete_calendar_object(
+	db: &SqlitePool,
+	tn_id: TnId,
+	cal_id: u64,
+	uid: &str,
+) -> ClResult<()> {
+	let mut tx = db.begin().await.or(Err(Error::DbError))?;
+
+	let res = sqlx::query(
+		"UPDATE calendar_objects SET deleted_at = unixepoch() \
+		 WHERE tn_id = ? AND cal_id = ? AND uid = ? AND deleted_at IS NULL",
+	)
+	.bind(tn_id.0)
+	.bind(cal_id.cast_signed())
+	.bind(uid)
+	.execute(&mut *tx)
+	.await
+	.inspect_err(|e| error!("DB: {e}"))
+	.or(Err(Error::DbError))?;
+
+	if res.rows_affected() == 0 {
+		return Err(Error::NotFound);
+	}
+
+	bump_calendar_ctag_tx(&mut tx, tn_id, cal_id).await?;
+
+	tx.commit().await.or(Err(Error::DbError))?;
+	Ok(())
+}
+
+/// Upsert a single calendar object row inside an open transaction. Shared by
+/// `upsert_calendar_object` (single-row write) and `split_calendar_object_series`
+/// (two writes under one tx).
+///
+/// Returns the stored etag — which always equals `write.etag` because the UPSERT's
+/// UPDATE branch sets `etag = excluded.etag` and the INSERT branch binds it directly,
+/// so no read-back is needed.
+async fn upsert_calendar_object_tx(
+	tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+	tn_id: TnId,
+	cal_id: u64,
+	write: CalendarObjectWrite<'_>,
+) -> ClResult<Box<str>> {
+	let CalendarObjectWrite { uid, ical, etag, extracted } = write;
 	// Masters (recurrence_id NULL) and overrides (recurrence_id set) have distinct
 	// partial unique indexes — SQLite's NULL-distinct rule means a single conflict
 	// target can't cover both. Pick the right one for this write.
@@ -498,77 +564,55 @@ pub async fn upsert_calendar_object(
 		.bind(format_exdate_csv(&extracted.exdate))
 		.bind(extracted.recurrence_id.map(|t| t.0))
 		.bind(extracted.sequence)
-		.execute(&mut *tx)
+		.execute(&mut **tx)
 		.await
 		.inspect_err(|e| error!("DB: {e}"))
 		.or(Err(Error::DbError))?;
 
-	sqlx::query(
-		"UPDATE calendars SET ctag = lower(hex(randomblob(8))) \
-		 WHERE tn_id = ? AND cal_id = ?",
-	)
-	.bind(tn_id.0)
-	.bind(cal_id.cast_signed())
-	.execute(&mut *tx)
-	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
-
-	let stored_etag: String = sqlx::query_scalar(
-		"SELECT etag FROM calendar_objects \
-		 WHERE tn_id = ? AND cal_id = ? AND uid = ? AND recurrence_id IS ?",
-	)
-	.bind(tn_id.0)
-	.bind(cal_id.cast_signed())
-	.bind(uid)
-	.bind(extracted.recurrence_id.map(|t| t.0))
-	.fetch_one(&mut *tx)
-	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
-
-	tx.commit().await.or(Err(Error::DbError))?;
-
-	Ok(stored_etag.into_boxed_str())
+	Ok(Box::<str>::from(etag))
 }
 
-pub async fn delete_calendar_object(
+/// Atomically fork a recurring series at `split_at`. See trait docs on
+/// `MetaAdapter::split_calendar_object_series` for the contract.
+pub async fn split_calendar_object_series(
 	db: &SqlitePool,
 	tn_id: TnId,
 	cal_id: u64,
-	uid: &str,
-) -> ClResult<()> {
+	master: CalendarObjectWrite<'_>,
+	tail: CalendarObjectWrite<'_>,
+	split_at: Timestamp,
+) -> ClResult<(Box<str>, Box<str>)> {
 	let mut tx = db.begin().await.or(Err(Error::DbError))?;
 
-	let res = sqlx::query(
-		"UPDATE calendar_objects SET deleted_at = unixepoch() \
-		 WHERE tn_id = ? AND cal_id = ? AND uid = ? AND deleted_at IS NULL",
-	)
-	.bind(tn_id.0)
-	.bind(cal_id.cast_signed())
-	.bind(uid)
-	.execute(&mut *tx)
-	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	// 1. Update the master in place.
+	let new_master_etag = upsert_calendar_object_tx(&mut tx, tn_id, cal_id, master).await?;
 
-	if res.rows_affected() == 0 {
-		return Err(Error::NotFound);
-	}
-
+	// 2. Soft-delete overrides at or after the split point. No row-count check —
+	//    a series with no overrides in the tail half is a perfectly valid split.
 	sqlx::query(
-		"UPDATE calendars SET ctag = lower(hex(randomblob(8))) \
-		 WHERE tn_id = ? AND cal_id = ?",
+		"UPDATE calendar_objects SET deleted_at = unixepoch() \
+		 WHERE tn_id = ? AND cal_id = ? AND uid = ? \
+		 AND recurrence_id IS NOT NULL AND recurrence_id >= ? \
+		 AND deleted_at IS NULL",
 	)
 	.bind(tn_id.0)
 	.bind(cal_id.cast_signed())
+	.bind(master.uid)
+	.bind(split_at.0)
 	.execute(&mut *tx)
 	.await
 	.inspect_err(|e| error!("DB: {e}"))
 	.or(Err(Error::DbError))?;
+
+	// 3. Insert the tail as a fresh master. If the caller picked a colliding UID
+	//    by accident the partial unique index fires and the whole tx rolls back.
+	let new_tail_etag = upsert_calendar_object_tx(&mut tx, tn_id, cal_id, tail).await?;
+
+	// 4. Bump the calendar's ctag once for the whole fork.
+	bump_calendar_ctag_tx(&mut tx, tn_id, cal_id).await?;
 
 	tx.commit().await.or(Err(Error::DbError))?;
-	Ok(())
+	Ok((new_master_etag, new_tail_etag))
 }
 
 pub async fn get_calendar_objects_by_uids(

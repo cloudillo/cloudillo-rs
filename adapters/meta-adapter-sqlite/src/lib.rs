@@ -29,8 +29,8 @@ use tokio::fs;
 use cloudillo_types::{
 	meta_adapter::{
 		Action, ActionData, ActionId, ActionView, AddressBook, Calendar, CalendarObject,
-		CalendarObjectExtracted, CalendarObjectSyncEntry, CalendarObjectView, Contact,
-		ContactExtracted, ContactSyncEntry, ContactView, CreateCalendarData, CreateFile,
+		CalendarObjectExtracted, CalendarObjectSyncEntry, CalendarObjectView, CalendarObjectWrite,
+		Contact, ContactExtracted, ContactSyncEntry, ContactView, CreateCalendarData, CreateFile,
 		CreateRefOptions, CreateShareEntry, FileId, FileUserData, FileVariant, FileView,
 		FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
 		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
@@ -878,6 +878,18 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn delete_calendar_object(&self, tn_id: TnId, cal_id: u64, uid: &str) -> ClResult<()> {
 		calendar::delete_calendar_object(&self.db, tn_id, cal_id, uid).await
+	}
+
+	async fn split_calendar_object_series(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		master: CalendarObjectWrite<'_>,
+		tail: CalendarObjectWrite<'_>,
+		split_at: Timestamp,
+	) -> ClResult<(Box<str>, Box<str>)> {
+		calendar::split_calendar_object_series(&self.db, tn_id, cal_id, master, tail, split_at)
+			.await
 	}
 
 	async fn get_calendar_objects_by_uids(

@@ -272,6 +272,47 @@ pub struct CalendarObjectListItem {
 	pub updated_at: Timestamp,
 }
 
+// Recurring-series split
+//*************************
+
+/// Body for `POST /api/calendars/{calId}/objects/{uid}/split`.
+///
+/// Atomically forks a recurring series at `split_at`:
+///   1. Apply `master_patch` to the existing master (typically truncating its RRULE
+///      with UNTIL just before `split_at`).
+///   2. Soft-delete every recurrence-override row whose RECURRENCE-ID is ≥ `split_at`.
+///   3. Create a new master from `tail` (with its own server-minted UID) that carries
+///      the edited fields from the split point onward.
+///
+/// All three steps run inside a single DB transaction. A failure at any step rolls the
+/// whole operation back, so the client never observes a half-split series.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitSeriesRequest {
+	/// RECURRENCE-ID of the first occurrence that belongs to the new tail series
+	/// (ISO-8601). Overrides at or after this timestamp are dropped.
+	pub split_at: String,
+	/// Patch applied to the existing master before the split. Clients typically set
+	/// `event.rrule` to a client-computed UNTIL-bounded rule so the master stops
+	/// producing occurrences at or after `split_at`.
+	#[serde(default)]
+	pub master_patch: CalendarObjectPatch,
+	/// Full `CalendarObjectInput` for the new tail master. `uid` is ignored — the
+	/// server always mints a fresh UID so the tail is independently addressable.
+	pub tail: CalendarObjectInput,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitSeriesResponse {
+	/// The updated master (post-patch). Clients should adopt this etag.
+	pub master: CalendarObjectOutput,
+	/// The newly-created tail master. Its `uid` is the one to address future edits at.
+	pub tail: CalendarObjectOutput,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListObjectsQuery {

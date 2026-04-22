@@ -915,6 +915,18 @@ pub struct CalendarObjectExtracted {
 	pub sequence: i64,
 }
 
+/// Borrowed write payload for calendar-object upserts. Groups the four fields that always
+/// travel together (authoritative blob + its derived etag + indexed projection) so trait
+/// methods writing multiple objects in one tx don't accumulate parallel-scalar parameter
+/// lists.
+#[derive(Debug, Clone, Copy)]
+pub struct CalendarObjectWrite<'a> {
+	pub uid: &'a str,
+	pub ical: &'a str,
+	pub etag: &'a str,
+	pub extracted: &'a CalendarObjectExtracted,
+}
+
 /// Full calendar object row including the authoritative stored VCALENDAR blob.
 #[derive(Debug, Clone)]
 pub struct CalendarObject {
@@ -1637,6 +1649,25 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Soft-delete a calendar object by UID (sets `deleted_at` on all rows sharing that UID),
 	/// leaving tombstones for CalDAV sync. Also bumps the calendar's ctag.
 	async fn delete_calendar_object(&self, tn_id: TnId, cal_id: u64, uid: &str) -> ClResult<()>;
+
+	/// Atomically split a recurring series at `split_at`:
+	///   1. Upsert the existing master (typically with a truncated RRULE) using the
+	///      caller-supplied ical / etag / extracted projection.
+	///   2. Soft-delete every override row whose `recurrence_id >= split_at`.
+	///   3. Insert the tail as a new master under its own UID.
+	///   4. Bump the calendar's ctag once for the whole fork.
+	///
+	/// The whole operation runs in a single transaction; on any error the caller sees the
+	/// original series unchanged. Returns the stored etags of the master and the tail,
+	/// in that order.
+	async fn split_calendar_object_series(
+		&self,
+		tn_id: TnId,
+		cal_id: u64,
+		master: CalendarObjectWrite<'_>,
+		tail: CalendarObjectWrite<'_>,
+		split_at: Timestamp,
+	) -> ClResult<(Box<str>, Box<str>)>;
 
 	/// Fetch multiple calendar objects by UID — for CalDAV `calendar-multiget` REPORT.
 	async fn get_calendar_objects_by_uids(
