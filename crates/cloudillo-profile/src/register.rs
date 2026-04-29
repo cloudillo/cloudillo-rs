@@ -23,6 +23,7 @@ use cloudillo_idp::registration::{IdpRegContent, IdpRegResponse};
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::address::parse_address_type;
 use cloudillo_types::types::{ApiResponse, RegisterRequest, RegisterVerifyCheckRequest};
+use cloudillo_types::utils::derive_name_from_id_tag;
 
 /// Domain validation response (public for reuse in community profile creation)
 #[skip_serializing_none]
@@ -415,20 +416,15 @@ async fn handle_idp_registration(
 	// IMPORTANT: Create tenant first to get the tn_id, then create the welcome ref
 	// We need to do this in two steps because create_ref_internal needs the tn_id
 
-	// Derive display name from id_tag (capitalize first letter of prefix)
-	let display_name = if id_tag_lower.contains('.') {
-		let parts: Vec<&str> = id_tag_lower.split('.').collect();
-		if parts.is_empty() {
-			id_tag_lower.clone()
-		} else {
-			let name = parts[0];
-			format!("{}{}", name.chars().next().unwrap_or('U').to_uppercase(), &name[1..])
-		}
-	} else {
-		id_tag_lower.clone()
-	};
+	// Derive display name from id_tag (capitalize first letter of prefix).
+	// Uses the shared helper to keep registration in sync with bootstrap and
+	// community creation.
+	let display_name = derive_name_from_id_tag(&id_tag_lower);
 
 	// Create tenant via extension function
+	// IDP-typed personal registration: gate the user on the IDP activation
+	// email being clicked. The verify-idp onboarding step is the only thing
+	// they see until the IDP flips Identity.status to Active.
 	let create_tenant = app.ext::<CreateCompleteTenantFn>()?;
 	let tn_id = create_tenant(
 		app,
@@ -441,6 +437,7 @@ async fn handle_idp_registration(
 			create_acme_cert: app.opts.acme_email.is_some(),
 			acme_email: app.opts.acme_email.as_deref(),
 			app_domain: None,
+			initial_onboarding: Some("verify-idp"),
 		},
 	)
 	.await?;
@@ -570,20 +567,15 @@ async fn handle_domain_registration(
 		return Err(Error::ValidationError("invalid id_tag or app_domain".into()));
 	}
 
-	// Derive display name from id_tag (capitalize first letter of prefix)
-	let display_name = if id_tag_lower.contains('.') {
-		let parts: Vec<&str> = id_tag_lower.split('.').collect();
-		if parts.is_empty() {
-			id_tag_lower.clone()
-		} else {
-			let name = parts[0];
-			format!("{}{}", name.chars().next().unwrap_or('U').to_uppercase(), &name[1..])
-		}
-	} else {
-		id_tag_lower.clone()
-	};
+	// Derive display name from id_tag (capitalize first letter of prefix).
+	// Uses the shared helper to keep registration in sync with bootstrap and
+	// community creation.
+	let display_name = derive_name_from_id_tag(&id_tag_lower);
 
 	// Create tenant via extension function
+	// Domain-typed registration: no IDP gate — the user proves control of
+	// the domain via DNS, so we leave ui.onboarding unset and the legacy
+	// welcome-link flow drives them through the rest of onboarding.
 	let create_tenant = app.ext::<CreateCompleteTenantFn>()?;
 	let tn_id = create_tenant(
 		app,
@@ -596,6 +588,7 @@ async fn handle_domain_registration(
 			create_acme_cert: app.opts.acme_email.is_some(),
 			acme_email: app.opts.acme_email.as_deref(),
 			app_domain: app_domain.as_deref(),
+			initial_onboarding: None,
 		},
 	)
 	.await?;

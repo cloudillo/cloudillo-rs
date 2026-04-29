@@ -13,6 +13,13 @@ pub struct CreateCompleteTenantOptions<'a> {
 	pub create_acme_cert: bool,
 	pub acme_email: Option<&'a str>,
 	pub app_domain: Option<&'a str>,
+	/// Initial value for `ui.onboarding`. Set to `Some("verify-idp")` for
+	/// IDP-typed personal/community registrations to gate the user (or
+	/// community context) on the IDP activation email being clicked.
+	/// Domain-typed registrations and bootstrap should leave this `None`,
+	/// which preserves the legacy unset-default behaviour (no onboarding
+	/// redirect; the welcome ref-link flow drives the user instead).
+	pub initial_onboarding: Option<&'a str>,
 }
 
 // vim: ts=4

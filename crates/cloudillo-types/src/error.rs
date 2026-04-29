@@ -14,6 +14,11 @@ pub type ClResult<T> = std::result::Result<T, Error>;
 pub enum Error {
 	// Core errors
 	NotFound,
+	/// 410 - the resource existed but is permanently gone (used for the IDP
+	/// activation-resend endpoint when `Identity.expires_at` has passed —
+	/// resending after expiry is impossible because the deadline is fixed at
+	/// registration and not extended).
+	Gone,
 	PermissionDenied,
 	Unauthorized, // 401 - missing/invalid auth token
 	DbError,
@@ -23,6 +28,12 @@ pub enum Error {
 	ValidationError(String),      // 400 - invalid input data
 	Conflict(String),             // 409 - constraint violation (unique, foreign key, etc)
 	PreconditionRequired(String), // 428 - precondition required (e.g., PoW)
+
+	/// 404 - settings registry has no entry for the requested key, or the
+	/// registered key has no default value and no override is configured.
+	/// Used by `SettingsService::*_opt` to distinguish "not configured" from
+	/// "configured with the wrong type".
+	SettingNotFound(String),
 
 	// Network and external services
 	NetworkError(String), // Network/federation failures
@@ -64,6 +75,9 @@ impl IntoResponse for Error {
 				"E-CORE-NOTFOUND".to_string(),
 				"Resource not found".to_string(),
 			),
+			Error::Gone => {
+				(StatusCode::GONE, "E-CORE-GONE".to_string(), "Resource is gone".to_string())
+			}
 			Error::PermissionDenied => (
 				StatusCode::FORBIDDEN,
 				"E-AUTH-NOPERM".to_string(),
@@ -88,6 +102,11 @@ impl IntoResponse for Error {
 				StatusCode::PRECONDITION_REQUIRED,
 				"E-POW-REQUIRED".to_string(),
 				format!("Precondition required: {}", msg),
+			),
+			Error::SettingNotFound(msg) => (
+				StatusCode::NOT_FOUND,
+				"E-SET-NOTFOUND".to_string(),
+				format!("Setting not configured: {}", msg),
 			),
 			Error::Timeout => (
 				StatusCode::REQUEST_TIMEOUT,

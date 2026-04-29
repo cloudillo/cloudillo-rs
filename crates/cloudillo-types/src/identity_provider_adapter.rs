@@ -328,6 +328,13 @@ pub trait IdentityProviderAdapter: Debug + Send + Sync {
 	/// This method should be called periodically to remove identities that have expired.
 	/// It should also clean up any associated DNS records.
 	///
+	/// **Contract:** the deadline used MUST be `Identity.expires_at`, NOT
+	/// `Identity.created_at + N`. The verify-idp onboarding gate, the resend
+	/// endpoint, and the frontend countdown all derive their semantics from
+	/// `expires_at` being the authoritative deletion deadline. Resends do not
+	/// bump it, so a Pending identity is reaped at exactly its original
+	/// `created_at + 24h` regardless of how many activation emails were sent.
+	///
 	/// # Returns
 	/// The number of identities that were cleaned up
 	async fn cleanup_expired_identities(&self) -> ClResult<u32>;

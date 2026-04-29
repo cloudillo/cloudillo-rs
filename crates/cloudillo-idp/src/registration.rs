@@ -51,7 +51,7 @@ pub struct ProcessRegistrationParams<'a> {
 	pub reg_content: IdpRegContent,
 	pub issuer: &'a str,
 	pub audience: &'a str,
-	pub tenant_id: i64,
+	pub tn_id: TnId,
 	pub client_address: Option<&'a str>,
 }
 
@@ -70,12 +70,22 @@ pub struct SendActivationEmailParams<'a> {
 	pub id_tag_domain: &'a str,
 	pub email: &'a str,
 	pub lang: Option<String>,
+	/// Hard ceiling for the activation ref's TTL — typically the underlying
+	/// `Identity.expires_at`. The ref itself never lives past the identity it
+	/// gates, otherwise a resend just before deletion would mint a ref that
+	/// outlives its target. `None` defers to the legacy 24h default (used for
+	/// the initial registration email; resends MUST pass an explicit ceiling).
+	pub ref_expires_at_ceiling: Option<Timestamp>,
 }
 
 /// Send activation email for a newly created identity
 ///
 /// Creates an activation reference and schedules the email task.
 /// Returns the activation reference string on success.
+///
+/// **Note:** this helper never touches `Identity.expires_at`. The 24-hour
+/// deletion deadline is fixed at registration time; resends only re-mail and
+/// the ref's own TTL is clamped to `min(legacy 24h, identity.expires_at)`.
 pub async fn send_activation_email(
 	app: &App,
 	tn_id: TnId,
@@ -84,8 +94,14 @@ pub async fn send_activation_email(
 	let identity_id = format!("{}.{}", params.id_tag_prefix, params.id_tag_domain);
 	let idp_domain = params.id_tag_domain;
 
-	// Create activation reference (24 hours validity)
-	let expires_at_ref = Some(Timestamp::now().add_seconds(24 * 60 * 60));
+	// Activation ref TTL: legacy 24h, but never longer than what's left on
+	// the identity itself.
+	let now = Timestamp::now();
+	let default_ttl = now.add_seconds(24 * 60 * 60);
+	let expires_at_ref = Some(match params.ref_expires_at_ceiling {
+		Some(ceiling) if ceiling.0 < default_ttl.0 => ceiling,
+		_ => default_ttl,
+	});
 	let (activation_ref, activation_link) = cloudillo_ref::service::create_ref_internal(
 		app,
 		tn_id,
@@ -214,15 +230,13 @@ pub async fn process_registration(
 		_ => None, // Already validated above, won't reach here
 	};
 
-	// Email validation: required only if no owner_id_tag
-	if owner_id_tag.is_none() && reg_content.email.as_ref().is_none_or(String::is_empty) {
+	// Email is always required
+	if reg_content.email.as_ref().is_none_or(String::is_empty) {
 		warn!(
 			id_tag = %reg_content.id_tag,
-			"IDP:REG content missing email (required when no owner specified)"
+			"IDP:REG content missing email (always required)"
 		);
-		return Err(Error::ValidationError(
-			"IDP:REG content missing email (required when no owner_id_tag is provided)".into(),
-		));
+		return Err(Error::ValidationError("IDP:REG content missing email (required)".into()));
 	}
 
 	info!(
@@ -324,7 +338,12 @@ pub async fn process_registration(
 		});
 	}
 
-	// Create the identity with Pending status
+	// Create the identity with Pending status. `expires_at = now + 24h` is
+	// the auto-deletion deadline that the IDP cleanup pass keys off
+	// (`IdentityProviderAdapter::cleanup_expired_identities`). This is the
+	// authoritative deadline visible to the verify-idp UI; resends never
+	// extend it. The frontend gates onboarding (`ui.onboarding === 'verify-idp'`)
+	// on the IDP flipping the identity to `Active` before this fires.
 	let expires_at = Timestamp::now().add_seconds(24 * 60 * 60);
 	let create_opts = cloudillo_types::identity_provider_adapter::CreateIdentityOptions {
 		id_tag_prefix: &id_tag_prefix,
@@ -383,60 +402,58 @@ pub async fn process_registration(
 	);
 
 	// Send activation email (if email is provided)
-	let tn_id = TnId(u32::try_from(params.tenant_id).unwrap_or_default());
+	let tn_id = params.tn_id;
 	let identity_id = format!("{}.{}", identity.id_tag_prefix, identity.id_tag_domain);
-	let activation_ref = if let Some(ref email) = identity.email {
-		match send_activation_email(
-			app,
-			tn_id,
-			SendActivationEmailParams {
-				id_tag_prefix: &identity.id_tag_prefix,
-				id_tag_domain: &identity.id_tag_domain,
-				email,
-				lang: reg_content.lang.clone(),
-			},
-		)
-		.await
-		{
-			Ok(ref_id) => ref_id,
-			Err(e) => {
-				warn!(
-					id_tag_prefix = %identity.id_tag_prefix,
-					id_tag_domain = %identity.id_tag_domain,
-					error = %e,
-					"Failed to send activation email, continuing registration"
-				);
-				String::new()
-			}
+	let email = identity.email.as_deref().ok_or_else(|| {
+		Error::Internal("identity unexpectedly missing email after validation".into())
+	})?;
+	let activation_ref = match send_activation_email(
+		app,
+		tn_id,
+		SendActivationEmailParams {
+			id_tag_prefix: &identity.id_tag_prefix,
+			id_tag_domain: &identity.id_tag_domain,
+			email,
+			lang: reg_content.lang.clone(),
+			// Initial registration: the identity was just created with a
+			// 24h deadline, so the legacy 24h ref TTL is already correct
+			// — leave the ceiling unset.
+			ref_expires_at_ceiling: None,
+		},
+	)
+	.await
+	{
+		Ok(ref_id) => ref_id,
+		Err(e) => {
+			warn!(
+				id_tag_prefix = %identity.id_tag_prefix,
+				id_tag_domain = %identity.id_tag_domain,
+				error = %e,
+				"Failed to send activation email, continuing registration"
+			);
+			String::new()
 		}
-	} else {
-		// No email - owner-based activation required
-		info!(
-			id_tag_prefix = %identity.id_tag_prefix,
-			id_tag_domain = %identity.id_tag_domain,
-			owner = ?identity.owner_id_tag,
-			"Identity created without email - activation via owner required"
-		);
-		String::new()
 	};
 
-	// Update quota counts
-	if idp_adapter.get_quota(registrar_id_tag).await.is_ok() {
-		let _ = idp_adapter.increment_quota(registrar_id_tag, 0).await; // Increment identity count
+	// Bump the registrar's quota row so the identity count reflects this
+	// registration. `increment_quota` takes storage bytes; a freshly-created
+	// identity has no stored content yet, so we pass 0 (the adapter is
+	// expected to bump the identity count separately based on the row).
+	if idp_adapter.get_quota(registrar_id_tag).await.is_ok()
+		&& let Err(e) = idp_adapter.increment_quota(registrar_id_tag, 0).await
+	{
+		warn!(
+			registrar = %registrar_id_tag,
+			error = %e,
+			"Failed to update registrar quota after identity registration"
+		);
 	}
 
 	// Build success response
-	let message = if let Some(ref email) = identity.email {
-		format!(
-			"Identity '{}' created successfully. Activation email sent to {}",
-			reg_content.id_tag, email
-		)
-	} else {
-		format!(
-			"Identity '{}' created successfully. Activation via owner required.",
-			reg_content.id_tag
-		)
-	};
+	let message = format!(
+		"Identity '{}' created successfully. Activation email sent to {}",
+		reg_content.id_tag, email
+	);
 	let response = IdpRegResponse {
 		success: true,
 		message,

@@ -385,6 +385,12 @@ pub struct CommunityProfileResponse {
 	pub profile_pic: Option<String>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
+	/// Initial value of the new community tenant's `ui.onboarding` setting.
+	/// `Some("verify-idp")` for an IDP-typed community whose IDP identity is
+	/// still pending; `None` for domain-typed (or already-active) communities.
+	/// The frontend uses this to decide whether to mark the community as
+	/// pending in the sidebar and show the activation banner.
+	pub onboarding: Option<String>,
 }
 
 // Phase 2: Action Management & File Integration

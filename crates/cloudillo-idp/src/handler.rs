@@ -234,12 +234,14 @@ pub async fn get_identity_by_id(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(idp_domain): IdTag,
+	Auth(auth): Auth,
 	Path(identity_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
 	info!(
 		identity_id = %identity_id,
 		idp_domain = %idp_domain,
+		auth_id_tag = %auth.id_tag,
 		"GET /api/idp/identities/:id"
 	);
 
@@ -261,11 +263,16 @@ pub async fn get_identity_by_id(
 		.await?
 		.ok_or(Error::NotFound)?;
 
-	// Check authorization using new helper (owner or registrar while Pending)
-	if !can_access_identity(&identity, &idp_domain) {
+	// Authorization: caller must be the identity itself, or owner/registrar
+	// (while Pending) per `can_access_identity`. Previously this passed
+	// `idp_domain` which always matches the registrar — bypassing all
+	// per-user checks.
+	let target_id_tag = format!("{}.{}", id_tag_prefix, id_tag_domain);
+	let is_self = auth.id_tag.as_ref() == target_id_tag;
+	if !is_self && !can_access_identity(&identity, auth.id_tag.as_ref()) {
 		warn!(
 			identity_id = %identity_id,
-			requested_by = %idp_domain,
+			requested_by = %auth.id_tag,
 			registrar = %identity.registrar_id_tag,
 			owner = ?identity.owner_id_tag,
 			status = ?identity.status,
@@ -289,11 +296,13 @@ pub async fn list_identities(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(idp_domain): IdTag,
+	Auth(auth): Auth,
 	Query(query_params): Query<ListIdentitiesQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<IdentityResponse>>>)> {
 	info!(
 		idp_domain = %idp_domain,
+		auth_id_tag = %auth.id_tag,
 		"GET /api/idp/identities"
 	);
 
@@ -305,10 +314,22 @@ pub async fn list_identities(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
 
+	// Authorization: the IDP-domain owner (i.e. the tenant whose id_tag equals
+	// the IDP domain) is the super-admin and may list everything. Any other
+	// authenticated caller is scoped to identities they registered themselves —
+	// otherwise an authenticated user from an unrelated tenant could enumerate
+	// every identity hosted at this IDP.
+	let is_idp_owner = auth.id_tag.as_ref() == idp_domain.as_ref();
+	let registrar_filter = if is_idp_owner {
+		query_params.registrar_id_tag.clone()
+	} else {
+		Some(auth.id_tag.to_string())
+	};
+
 	let opts = ListIdentityOptions {
 		id_tag_domain: idp_domain.to_string(),
 		email: query_params.email.clone(),
-		registrar_id_tag: None,
+		registrar_id_tag: registrar_filter,
 		owner_id_tag: query_params.owner_id_tag.clone(),
 		status: query_params.status.as_ref().and_then(|s| s.parse().ok()),
 		expires_after: None,
@@ -524,6 +545,7 @@ pub async fn create_identity(
 				id_tag_domain: &identity.id_tag_domain,
 				email,
 				lang: None,
+				ref_expires_at_ceiling: None,
 			},
 		)
 		.await
@@ -687,12 +709,14 @@ pub async fn delete_identity(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(idp_domain): IdTag,
+	Auth(auth): Auth,
 	Path(identity_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	info!(
 		identity_id = %identity_id,
 		idp_domain = %idp_domain,
+		auth_id_tag = %auth.id_tag,
 		"DELETE /api/idp/identities/:id - Deleting identity"
 	);
 
@@ -714,11 +738,15 @@ pub async fn delete_identity(
 		.await?
 		.ok_or(Error::NotFound)?;
 
-	// Check authorization using new helper (owner or registrar while Pending)
-	if !can_access_identity(&existing, &idp_domain) {
+	// Authorization: caller must be the identity itself, or owner/registrar
+	// (while Pending). Previously this passed `idp_domain` which always
+	// matches the registrar — bypassing per-user checks.
+	let target_id_tag = format!("{}.{}", id_tag_prefix, id_tag_domain);
+	let is_self = auth.id_tag.as_ref() == target_id_tag;
+	if !is_self && !can_access_identity(&existing, auth.id_tag.as_ref()) {
 		warn!(
 			identity_id = %identity_id,
-			requested_by = %idp_domain,
+			requested_by = %auth.id_tag,
 			registrar = %existing.registrar_id_tag,
 			owner = ?existing.owner_id_tag,
 			status = ?existing.status,
@@ -755,6 +783,7 @@ pub async fn update_identity_settings(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(idp_domain): IdTag,
+	Auth(auth): Auth,
 	Path(identity_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(update_req): Json<UpdateIdentitySettingsRequest>,
@@ -762,6 +791,7 @@ pub async fn update_identity_settings(
 	info!(
 		identity_id = %identity_id,
 		idp_domain = %idp_domain,
+		auth_id_tag = %auth.id_tag,
 		dyndns = ?update_req.dyndns,
 		"PATCH /api/idp/identities/:id - Updating identity settings"
 	);
@@ -784,11 +814,15 @@ pub async fn update_identity_settings(
 		.await?
 		.ok_or(Error::NotFound)?;
 
-	// Check authorization using new helper (owner or registrar while Pending)
-	if !can_access_identity(&existing, &idp_domain) {
+	// Authorization: caller must be the identity itself, or owner/registrar
+	// (while Pending). Previously this passed `idp_domain` which always
+	// matches the registrar — bypassing per-user checks.
+	let target_id_tag = format!("{}.{}", id_tag_prefix, id_tag_domain);
+	let is_self = auth.id_tag.as_ref() == target_id_tag;
+	if !is_self && !can_access_identity(&existing, auth.id_tag.as_ref()) {
 		warn!(
 			identity_id = %identity_id,
-			requested_by = %idp_domain,
+			requested_by = %auth.id_tag,
 			registrar = %existing.registrar_id_tag,
 			owner = ?existing.owner_id_tag,
 			status = ?existing.status,
@@ -999,6 +1033,189 @@ pub async fn check_identity_availability(
 			"Identity id_tag must contain at least one dot separator".to_string(),
 		))
 	}
+}
+
+/// Response structure for the per-identity status endpoint.
+///
+/// Returned by `GET /api/idp/identities/:id/status`. Authenticated callers
+/// (the tenant home for the same identity, via a proxy token whose `iss`
+/// matches the identity id_tag) get the live IDP-side status plus the
+/// deletion deadline so the verify-idp UI can drive a countdown without a
+/// second round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityStatusResponse {
+	pub status: String,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub expires_at: Timestamp,
+}
+
+/// Response structure for the per-identity resend endpoint.
+///
+/// `expires_at` is the **unchanged** `Identity.expires_at`. The IDP refuses to
+/// bump the deadline on resend (see plan rationale: prevents indefinite
+/// deferral past the per-activation fee window).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityResendResponse {
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub expires_at: Timestamp,
+}
+
+/// Common authorization for the per-identity status/resend endpoints.
+///
+/// The proxy token's issuer (which the federation auth middleware extracts as
+/// `auth.id_tag`) MUST match the identity being queried. This is the
+/// "issuer-match" check from the design: only `alice.cloudillo.net`'s own
+/// tenant home may ask the IDP about `alice.cloudillo.net`.
+fn require_self_query(auth_id_tag: &str, target_id_tag: &str) -> ClResult<()> {
+	if auth_id_tag != target_id_tag {
+		warn!(
+			auth = %auth_id_tag,
+			target = %target_id_tag,
+			"Proxy-token issuer does not match the identity being queried"
+		);
+		return Err(Error::PermissionDenied);
+	}
+	Ok(())
+}
+
+/// GET /api/idp/identities/:id/status
+///
+/// Live status for the identity, gated by issuer-match auth. The tenant home
+/// uses this to drive the verify-idp page's polling and the community
+/// activation banner.
+#[axum::debug_handler]
+pub async fn get_identity_status(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(idp_domain): IdTag,
+	Auth(auth): Auth,
+	Path(identity_id): Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<IdentityStatusResponse>>)> {
+	check_idp_enabled(&app, tn_id).await?;
+
+	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
+		"Identity Provider not available on this instance".to_string(),
+	))?;
+
+	let normalized_id = normalize_identity_path(&identity_id, &idp_domain);
+	let (id_tag_prefix, id_tag_domain) =
+		parse_and_validate_identity_id_tag(&normalized_id, &idp_domain)?;
+	let target_id_tag = format!("{}.{}", id_tag_prefix, id_tag_domain);
+
+	require_self_query(auth.id_tag.as_ref(), &target_id_tag)?;
+
+	let identity = idp_adapter
+		.read_identity(&id_tag_prefix, &id_tag_domain)
+		.await?
+		.ok_or(Error::NotFound)?;
+
+	let response_data = IdentityStatusResponse {
+		status: identity.status.to_string(),
+		expires_at: identity.expires_at,
+	};
+	let mut response = ApiResponse::new(response_data);
+	if let Some(id) = req_id {
+		response = response.with_req_id(id);
+	}
+	Ok((StatusCode::OK, Json(response)))
+}
+
+/// POST /api/idp/identities/:id/resend
+///
+/// Mints a fresh activation ref (TTL clamped to `min(24h, expires_at - now)`)
+/// and re-sends the activation email. Does NOT bump `Identity.expires_at` —
+/// the deadline is fixed at registration time. Returns `410 Gone` if the
+/// identity has already expired.
+#[axum::debug_handler]
+pub async fn resend_identity_activation(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(idp_domain): IdTag,
+	Auth(auth): Auth,
+	Path(identity_id): Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResendResponse>>)> {
+	check_idp_enabled(&app, tn_id).await?;
+
+	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
+		"Identity Provider not available on this instance".to_string(),
+	))?;
+
+	let normalized_id = normalize_identity_path(&identity_id, &idp_domain);
+	let (id_tag_prefix, id_tag_domain) =
+		parse_and_validate_identity_id_tag(&normalized_id, &idp_domain)?;
+	let target_id_tag = format!("{}.{}", id_tag_prefix, id_tag_domain);
+
+	require_self_query(auth.id_tag.as_ref(), &target_id_tag)?;
+
+	let identity = idp_adapter
+		.read_identity(&id_tag_prefix, &id_tag_domain)
+		.await?
+		.ok_or(Error::NotFound)?;
+
+	// Resend is only meaningful while still Pending. `expires_at` is the
+	// Pending-deletion deadline and is NOT cleared on activation, so an
+	// active identity with a stale `expires_at` would otherwise return 410
+	// here — check status first so the response is "not Pending", not "gone".
+	if identity.status != IdentityStatus::Pending {
+		return Err(Error::ValidationError(format!(
+			"Identity is not in Pending status (current: {})",
+			identity.status
+		)));
+	}
+
+	// 410 Gone past expiry — let the caller surface "register again".
+	let now = Timestamp::now();
+	if identity.expires_at.0 <= now.0 {
+		warn!(
+			identity = %target_id_tag,
+			expires_at = ?identity.expires_at,
+			"Resend rejected — identity has already expired"
+		);
+		return Err(Error::Gone);
+	}
+
+	// Need an email address to send to. Owner-only identities (no email,
+	// activated by an owner action) can't use the email-resend path.
+	let Some(ref email) = identity.email else {
+		return Err(Error::ValidationError(
+			"Identity has no email address — cannot resend activation".to_string(),
+		));
+	};
+
+	// Mint fresh ref + email. The helper clamps the ref's TTL to
+	// `identity.expires_at`, so a resend issued shortly before the identity
+	// is reaped doesn't outlive its target.
+	if let Err(e) = crate::registration::send_activation_email(
+		&app,
+		tn_id,
+		crate::registration::SendActivationEmailParams {
+			id_tag_prefix: &identity.id_tag_prefix,
+			id_tag_domain: &identity.id_tag_domain,
+			email,
+			lang: None,
+			ref_expires_at_ceiling: Some(identity.expires_at),
+		},
+	)
+	.await
+	{
+		warn!(
+			identity = %target_id_tag,
+			error = %e,
+			"Failed to resend activation email"
+		);
+		return Err(e);
+	}
+
+	let response_data = IdentityResendResponse { expires_at: identity.expires_at };
+	let mut response = ApiResponse::new(response_data);
+	if let Some(id) = req_id {
+		response = response.with_req_id(id);
+	}
+	Ok((StatusCode::OK, Json(response)))
 }
 
 /// Request structure for identity activation

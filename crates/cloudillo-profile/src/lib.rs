@@ -5,6 +5,7 @@
 
 pub mod community;
 pub mod handler;
+pub mod idp_status;
 pub mod list;
 pub mod media;
 pub mod perm;

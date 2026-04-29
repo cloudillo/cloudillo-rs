@@ -17,9 +17,7 @@ use cloudillo_core::{
 use cloudillo_idp::registration::{IdpRegContent, IdpRegResponse};
 use cloudillo_types::{
 	action_types::CreateAction,
-	meta_adapter::{
-		Profile, ProfileConnectionStatus, ProfileType, UpdateProfileData, UpdateTenantData,
-	},
+	meta_adapter::{ProfileConnectionStatus, ProfileType, UpdateTenantData, UpsertProfileFields},
 	types::{ApiResponse, CommunityProfileResponse, CreateCommunityRequest},
 	utils::derive_name_from_id_tag,
 };
@@ -98,13 +96,25 @@ pub async fn put_community_profile(
 			Some(app.opts.local_address.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(","))
 		};
 
+		let creator_email: String = app
+			.auth_adapter
+			.read_tenant(creator_id_tag)
+			.await?
+			.email
+			.ok_or_else(|| {
+				Error::ValidationError(
+					"Community creation requires the creator to have a registered email".into(),
+				)
+			})?
+			.to_string();
+
 		let reg_content = IdpRegContent {
 			id_tag: id_tag_lower.clone(),
-			email: None,                                    // Communities don't have email
-			owner_id_tag: Some(creator_id_tag.to_string()), // Creator owns the community
+			email: Some(creator_email),
+			owner_id_tag: Some(creator_id_tag.to_string()),
 			issuer: None,
 			address,
-			lang: None, // Communities don't have language preference
+			lang: None,
 		};
 
 		// Create IDP:REG action
@@ -168,8 +178,12 @@ pub async fn put_community_profile(
 		None
 	};
 
-	// 4. Create community tenant via extension function
+	// 4. Create community tenant via extension function.
+	// IDP-typed community → 'verify-idp' so the community context shows the
+	// activation banner until the creator clicks the IDP activation email.
+	// Domain-typed community → no gate (None preserves the unset legacy default).
 	let display_name = req.name.clone().unwrap_or_else(|| derive_name_from_id_tag(&id_tag_lower));
+	let initial_onboarding = if req.typ == "idp" { Some("verify-idp") } else { None };
 	let create_tenant = app.ext::<CreateCompleteTenantFn>()?;
 	let community_tn_id = create_tenant(
 		&app,
@@ -182,6 +196,7 @@ pub async fn put_community_profile(
 			create_acme_cert: app.opts.acme_email.is_some(),
 			acme_email: app.opts.acme_email.as_deref(),
 			app_domain: req.app_domain.as_deref(),
+			initial_onboarding,
 		},
 	)
 	.await?;
@@ -229,7 +244,19 @@ pub async fn put_community_profile(
 		)
 		.await?;
 
-	// 6. Create CONN: creator → community (in creator's tenant) via extension function
+	// 5b. Auto-accept incoming connection requests so the creator's CONN below
+	// gets a CONN:ACC reply without manual intervention.
+	app.meta_adapter
+		.update_setting(
+			community_tn_id,
+			"profile.connection_mode",
+			Some(serde_json::Value::String("A".into())),
+		)
+		.await?;
+
+	// 6. Create CONN: creator → community (in creator's tenant) via extension function.
+	// Federation delivers it to the community's inbox; the community's connection_mode='A'
+	// drives auto-accept and emits a CONN:ACC back to the creator.
 	info!(
 		creator = %creator_id_tag,
 		community = %id_tag_lower,
@@ -248,38 +275,22 @@ pub async fn put_community_profile(
 	)
 	.await?;
 
-	// 7. Create CONN: community → creator (in community's tenant)
-	// This triggers mutual detection and auto-accept
-	info!(
-		creator = %creator_id_tag,
-		community = %id_tag_lower,
-		"Creating CONN action from community to creator"
-	);
-	let create_action = app.ext::<CreateActionFn>()?;
-	create_action(
-		&app,
-		community_tn_id,
-		&id_tag_lower,
-		CreateAction {
-			typ: "CONN".into(),
-			audience_tag: Some(creator_id_tag.to_string().into()),
-			..Default::default()
+	// 7. Ensure the community profile row exists in creator's tenant and is Connected.
+	// The CONN on_create hook also creates this row asynchronously; race either way
+	// is fine — upsert applies the desired state regardless of who got there first.
+	let community_upsert = UpsertProfileFields {
+		name: Patch::Value(display_name.as_str().into()),
+		typ: Patch::Value(ProfileType::Community),
+		profile_pic: match req.profile_pic.as_deref() {
+			Some(pic) => Patch::Value(Some(pic.into())),
+			None => Patch::Undefined,
 		},
-	)
-	.await?;
-
-	// 7b. Directly set community profile in creator's tenant to Connected
-	// (Don't rely on async CONN delivery — the on_receive mutual detection is fragile
-	// for same-server communities because the community's signing key may not be ready)
+		connected: Patch::Value(ProfileConnectionStatus::Connected),
+		following: Patch::Value(true),
+		..Default::default()
+	};
 	app.meta_adapter
-		.update_profile(
-			creator_tn_id,
-			&id_tag_lower,
-			&UpdateProfileData {
-				connected: Patch::Value(ProfileConnectionStatus::Connected),
-				..Default::default()
-			},
-		)
+		.upsert_profile(creator_tn_id, &id_tag_lower, &community_upsert)
 		.await?;
 
 	// 8. Get creator's profile name for the community's profile record
@@ -289,31 +300,18 @@ pub async fn put_community_profile(
 		Err(_) => derive_name_from_id_tag(creator_id_tag),
 	};
 
-	// 9. Create creator's profile in community tenant with "leader" role
-	let creator_profile = Profile {
-		id_tag: creator_id_tag.as_ref(),
-		name: creator_name.as_str(),
-		typ: ProfileType::Person,
-		profile_pic: None,
-		following: false,
-		connected: ProfileConnectionStatus::Connected,
-		roles: None,
-		trust: None,
+	// 9. Ensure creator's profile in community tenant exists and has the leader role.
+	// As with step 7, federation hooks may have populated this row already; upsert
+	// asserts the final state regardless of insertion order.
+	let creator_upsert = UpsertProfileFields {
+		name: Patch::Value(creator_name.as_str().into()),
+		typ: Patch::Value(ProfileType::Person),
+		roles: Patch::Value(Some(vec!["leader".to_string().into()])),
+		connected: Patch::Value(ProfileConnectionStatus::Connected),
+		..Default::default()
 	};
-	app.meta_adapter.create_profile(community_tn_id, &creator_profile, "").await?;
-
-	// Set leader role
 	app.meta_adapter
-		.update_profile(
-			community_tn_id,
-			creator_id_tag,
-			&UpdateProfileData {
-				roles: Patch::Value(Some(vec!["leader".to_string().into()])),
-				connected: Patch::Value(ProfileConnectionStatus::Connected),
-				following: Patch::Undefined,
-				..Default::default()
-			},
-		)
+		.upsert_profile(community_tn_id, creator_id_tag, &creator_upsert)
 		.await?;
 
 	info!(
@@ -336,6 +334,7 @@ pub async fn put_community_profile(
 		r#type: "community".to_string(),
 		profile_pic: req.profile_pic,
 		created_at: Timestamp::now(),
+		onboarding: initial_onboarding.map(str::to_string),
 	};
 
 	Ok((StatusCode::CREATED, Json(ApiResponse::new(response))))
