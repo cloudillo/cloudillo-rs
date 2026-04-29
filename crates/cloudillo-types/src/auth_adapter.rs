@@ -94,7 +94,10 @@ pub struct AuthKey {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AuthProfile {
 	pub id_tag: Box<str>,
+	pub email: Option<Box<str>>,
 	pub roles: Option<Box<[Box<str>]>>,
+	/// Tenant status — typically `'A'` (Active) or `'S'` (Suspended).
+	pub status: Option<Box<str>>,
 	pub keys: Vec<AuthKey>,
 }
 
@@ -171,6 +174,24 @@ pub struct CertData {
 	pub cert: Box<str>,
 	pub key: Box<str>,
 	pub expires_at: Timestamp,
+	pub last_renewal_attempt_at: Option<Timestamp>,
+	pub last_renewal_error: Option<Box<str>>,
+	pub failure_count: u32,
+	pub notified_at: Option<Timestamp>,
+}
+
+/// Row returned by `list_tenants_needing_cert_renewal`. Includes failure-tracking
+/// state so the renewal task can decide on notifications and tenant suspension
+/// without an extra read per tenant.
+#[derive(Debug)]
+pub struct TenantCertRenewalRow {
+	pub tn_id: TnId,
+	pub id_tag: Box<str>,
+	/// `None` ⇒ tenant has no cert yet (initial bootstrap)
+	pub expires_at: Option<Timestamp>,
+	pub failure_count: u32,
+	pub last_renewal_error: Option<Box<str>>,
+	pub notified_at: Option<Timestamp>,
 }
 
 /// API key information (without the secret key)
@@ -325,7 +346,24 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn list_tenants_needing_cert_renewal(
 		&self,
 		renewal_days: u32,
-	) -> ClResult<Vec<(TnId, Box<str>)>>;
+	) -> ClResult<Vec<TenantCertRenewalRow>>;
+
+	/// Record an ACME renewal failure for the given tenant: increments
+	/// `failure_count`, sets `last_renewal_error`, and stamps
+	/// `last_renewal_attempt_at`. No-op if no cert row exists for the tenant.
+	async fn record_cert_renewal_failure(&self, tn_id: TnId, error: &str) -> ClResult<()>;
+
+	/// Record a successful ACME renewal: clears `last_renewal_error`,
+	/// resets `failure_count` to 0, clears `notified_at`.
+	async fn record_cert_renewal_success(&self, tn_id: TnId) -> ClResult<()>;
+
+	/// Stamp `notified_at` after sending a renewal-failure notification email.
+	async fn record_cert_renewal_notification(&self, tn_id: TnId) -> ClResult<()>;
+
+	/// Update tenant status. Known statuses:
+	/// `'A'` = Active, `'S'` = Suspended (cert-related, set/cleared automatically
+	/// by the ACME renewal task when an expired cert keeps failing renewal).
+	async fn update_tenant_status(&self, tn_id: TnId, status: char) -> ClResult<()>;
 
 	// Key management
 	async fn list_profile_keys(&self, tn_id: TnId) -> ClResult<Vec<AuthKey>>;

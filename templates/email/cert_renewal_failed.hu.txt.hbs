@@ -1,0 +1,41 @@
+---
+layout: default
+subject: "[{{base_id_tag}}] Tanúsítvány-megújítási hiba: {{idTag}}"
+---
+TLS-tanúsítvány megújítása sikertelen
+=====================================
+
+Kedves {{idTag}},
+
+Nem sikerült megújítanunk a {{instance_name}} bérlőd TLS-tanúsítványát.
+
+Domain:        {{domain}}
+Lejárati idő:  {{expiresAt}}
+Hátralévő nap: {{daysUntilExpiry}}
+Hiba oka:      {{errorReason}}
+
+{{#if suspended}}
+*** A BÉRLŐD FELFÜGGESZTÉSRE KERÜLT ***
+A tanúsítvány lejárt és a megújítás továbbra is sikertelen, ezért a
+HTTPS-elérés jelenleg nem működik. Amint a megújítás sikerül, a
+felfüggesztés automatikusan feloldódik.
+
+{{/if}}
+=== MIT KELL TENNED ===
+
+A leggyakoribb ok a hibás DNS-beállítás. Ellenőrizd, hogy az alábbi
+DNS-rekordok erre a szerverre mutatnak-e:
+
+  * cl-o.{{idTag}}    (az API-domain)
+  * {{idTag}}         (az alkalmazás-domain)
+
+Mindkettőnek ezt kell visszaadnia: {{localAddress}}
+
+Lehet A rekord (IP-címhez) vagy CNAME rekord (hosztnévhez), amíg a végső
+válasz a fenti címek egyike.
+
+A DNS javítása után a következő éjjeli megújítási futtatás automatikusan
+elvégzi a tanúsítvány megújítását. Ha a tanúsítvány még nem járt le,
+addig van időd kijavítani további fennakadás nélkül.
+
+Ha a probléma továbbra is fennáll, fordulj a rendszergazdához.

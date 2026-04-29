@@ -1,0 +1,60 @@
+---
+layout: default
+subject: "[{{base_id_tag}}] Certificate renewal problem for {{idTag}}"
+---
+<p style="font-size: 16px; color: #1f2937; margin: 0 0 20px 0;">Hello {{idTag}},</p>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
+	We were unable to renew the TLS certificate for your {{instance_name}} tenant.
+</p>
+
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0; background-color: #f9fafb; border-radius: 6px;">
+	<tr>
+		<td style="padding: 15px 20px;">
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Domain:</strong> {{domain}}</p>
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Expires at:</strong> {{expiresAt}}</p>
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Days to expiry:</strong> {{daysUntilExpiry}}</p>
+			<p style="font-size: 13px; color: #1f2937; margin: 0;"><strong>Reason:</strong> {{errorReason}}</p>
+		</td>
+	</tr>
+</table>
+
+{{#if suspended}}
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0;">
+	<tr>
+		<td style="background-color: #fee2e2; border: 1px solid #fca5a5; border-radius: 6px; padding: 15px;">
+			<p style="font-size: 13px; color: #991b1b; margin: 0;">
+				<strong>Your tenant has been suspended.</strong> The certificate has expired
+				and renewal is still failing, so HTTPS access to your tenant is currently
+				broken. As soon as a renewal succeeds, the suspension will be lifted
+				automatically.
+			</p>
+		</td>
+	</tr>
+</table>
+{{/if}}
+
+<h3 style="font-size: 16px; color: #1f2937; margin: 24px 0 12px 0;">What you need to do</h3>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 12px 0;">
+	The most common cause is incorrect DNS. Make sure these DNS records point
+	at this server:
+</p>
+<ul style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 12px 20px; padding: 0;">
+	<li><code>cl-o.{{idTag}}</code> &mdash; the API domain</li>
+	<li><code>{{idTag}}</code> &mdash; the app domain</li>
+</ul>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 12px 0;">
+	Both should resolve to: <code>{{localAddress}}</code>
+</p>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 12px 0;">
+	Either A records (for IP addresses) or CNAME records (for hostnames) work,
+	as long as the final answer matches one of the addresses above.
+</p>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
+	Once DNS is corrected, the next nightly renewal run will pick it up
+	automatically. If the certificate has not yet expired, you have until then
+	to fix it without further interruption.
+</p>
+
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0;">
+	If you continue to have problems, please contact your instance administrator.
+</p>

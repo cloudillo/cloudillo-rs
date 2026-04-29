@@ -83,7 +83,7 @@ impl SettingsService {
 		let def = self
 			.registry
 			.get(key)
-			.ok_or_else(|| Error::ValidationError(format!("Unknown setting: {}", key)))?;
+			.ok_or_else(|| Error::SettingNotFound(format!("Unknown setting: {}", key)))?;
 
 		// Try tenant-specific setting
 		if tn_id.0 != 0
@@ -110,7 +110,7 @@ impl SettingsService {
 				self.cache.put(tn_id, key.to_string(), value.clone());
 				Ok(value)
 			}
-			None => Err(Error::ValidationError(format!(
+			None => Err(Error::SettingNotFound(format!(
 				"Setting '{}' has no default and must be configured",
 				key
 			))),
@@ -218,6 +218,48 @@ impl SettingsService {
 		Ok(true)
 	}
 
+	/// Clear (unset) a setting with the same role-gating and scope checks as
+	/// `set`. Use this instead of calling `MetaAdapter::update_setting(..., None)`
+	/// directly when the caller is acting on behalf of an authenticated user —
+	/// it keeps audit trails and permission checks consistent across set/clear.
+	pub async fn clear<S: AsRef<str>>(&self, tn_id: TnId, key: &str, roles: &[S]) -> ClResult<()> {
+		let def = self
+			.registry
+			.get(key)
+			.ok_or_else(|| Error::ValidationError(format!("Unknown setting: {}", key)))?;
+
+		if !def.permission.check(roles) {
+			warn!(
+				"Permission denied for clearing setting '{}': requires {:?}",
+				key, def.permission
+			);
+			return Err(Error::PermissionDenied);
+		}
+
+		let storage_tn_id = match (def.scope, tn_id.0) {
+			(SettingScope::System, _) => return Err(Error::PermissionDenied),
+			(SettingScope::Global | SettingScope::Tenant, 0) => TnId(0),
+			(SettingScope::Global, _) => {
+				if !roles.iter().any(|r| r.as_ref() == "SADM") {
+					return Err(Error::PermissionDenied);
+				}
+				TnId(0)
+			}
+			(SettingScope::Tenant, _) => tn_id,
+		};
+
+		self.meta.update_setting(storage_tn_id, key, None).await?;
+
+		if storage_tn_id.0 == 0 {
+			self.cache.invalidate_key(key);
+		} else {
+			self.cache.clear();
+		}
+
+		info!("Setting '{}' cleared for tn_id={}", key, storage_tn_id.0);
+		Ok(())
+	}
+
 	/// Validate that all required settings (no default and not optional) are configured
 	pub async fn validate_required_settings(&self) -> ClResult<()> {
 		for def in self.registry.list() {
@@ -292,8 +334,7 @@ impl SettingsService {
 				key,
 				v.type_name()
 			))),
-			Err(Error::ValidationError(msg)) if msg.contains("has no default") => Ok(None),
-			Err(Error::ValidationError(msg)) if msg.contains("Unknown setting") => Ok(None),
+			Err(Error::SettingNotFound(_)) => Ok(None),
 			Err(e) => Err(e),
 		}
 	}
@@ -306,8 +347,7 @@ impl SettingsService {
 				key,
 				v.type_name()
 			))),
-			Err(Error::ValidationError(msg)) if msg.contains("has no default") => Ok(None),
-			Err(Error::ValidationError(msg)) if msg.contains("Unknown setting") => Ok(None),
+			Err(Error::SettingNotFound(_)) => Ok(None),
 			Err(e) => Err(e),
 		}
 	}
@@ -320,8 +360,7 @@ impl SettingsService {
 				key,
 				v.type_name()
 			))),
-			Err(Error::ValidationError(msg)) if msg.contains("has no default") => Ok(None),
-			Err(Error::ValidationError(msg)) if msg.contains("Unknown setting") => Ok(None),
+			Err(Error::SettingNotFound(_)) => Ok(None),
 			Err(e) => Err(e),
 		}
 	}
@@ -338,8 +377,7 @@ impl SettingsService {
 				key,
 				v.type_name()
 			))),
-			Err(Error::ValidationError(msg)) if msg.contains("has no default") => Ok(None),
-			Err(Error::ValidationError(msg)) if msg.contains("Unknown setting") => Ok(None),
+			Err(Error::SettingNotFound(_)) => Ok(None),
 			Err(e) => Err(e),
 		}
 	}

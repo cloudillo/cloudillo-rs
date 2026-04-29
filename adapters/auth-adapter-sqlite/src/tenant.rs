@@ -39,10 +39,11 @@ pub(crate) async fn read_tn_id(db: &SqlitePool, id_tag: &str) -> ClResult<TnId> 
 
 /// Read full tenant profile
 pub(crate) async fn read_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<AuthProfile> {
-	let res = sqlx::query("SELECT tn_id, id_tag, roles FROM tenants WHERE id_tag = ?1")
-		.bind(id_tag)
-		.fetch_one(db)
-		.await;
+	let res =
+		sqlx::query("SELECT tn_id, id_tag, email, roles, status FROM tenants WHERE id_tag = ?1")
+			.bind(id_tag)
+			.fetch_one(db)
+			.await;
 
 	async_map_res(res, async |row| {
 		let tn_id = TnId(row.try_get("tn_id")?);
@@ -56,11 +57,31 @@ pub(crate) async fn read_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<AuthP
 		};
 		Ok(AuthProfile {
 			id_tag: row.try_get("id_tag")?,
+			email: row.try_get("email")?,
 			roles: parse_str_list_optional(roles.as_deref()),
+			status: row.try_get("status")?,
 			keys,
 		})
 	})
 	.await
+}
+
+/// Update tenant status. See `tenants.status` schema comment for known values.
+pub(crate) async fn update_tenant_status(
+	db: &SqlitePool,
+	tn_id: TnId,
+	status: char,
+) -> ClResult<()> {
+	let mut buf = [0u8; 4];
+	let status_str: &str = status.encode_utf8(&mut buf);
+	sqlx::query("UPDATE tenants SET status = ?1, updated_at = unixepoch() WHERE tn_id = ?2")
+		.bind(status_str)
+		.bind(tn_id.0)
+		.execute(db)
+		.await
+		.inspect_err(inspect)
+		.or(Err(Error::DbError))?;
+	Ok(())
 }
 
 /// Create a new tenant with registration workflow
@@ -262,20 +283,20 @@ pub(crate) async fn list_tenants(
 
 	let rows = query.build().fetch_all(db).await.inspect_err(inspect).or(Err(Error::DbError))?;
 
-	let tenants: Vec<TenantListItem> = rows
+	let tenants = rows
 		.into_iter()
-		.map(|row| {
-			let roles_str: Option<Box<str>> = row.try_get("roles").unwrap_or(None);
-			TenantListItem {
-				tn_id: TnId(row.try_get("tn_id").unwrap_or(0)),
-				id_tag: row.try_get("id_tag").unwrap_or_else(|_| "".into()),
-				email: row.try_get("email").unwrap_or(None),
+		.map(|row| -> ClResult<TenantListItem> {
+			let roles_str: Option<Box<str>> = row.try_get("roles").map_err(|_| Error::DbError)?;
+			Ok(TenantListItem {
+				tn_id: TnId(row.try_get("tn_id").map_err(|_| Error::DbError)?),
+				id_tag: row.try_get("id_tag").map_err(|_| Error::DbError)?,
+				email: row.try_get("email").map_err(|_| Error::DbError)?,
 				roles: parse_str_list_optional(roles_str.as_deref()),
-				status: row.try_get("status").unwrap_or(None),
-				created_at: Timestamp(row.try_get("created_at").unwrap_or(0)),
-			}
+				status: row.try_get("status").map_err(|_| Error::DbError)?,
+				created_at: Timestamp(row.try_get("created_at").map_err(|_| Error::DbError)?),
+			})
 		})
-		.collect();
+		.collect::<ClResult<Vec<_>>>()?;
 
 	Ok(tenants)
 }

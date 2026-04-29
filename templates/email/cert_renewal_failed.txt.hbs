@@ -1,0 +1,41 @@
+---
+layout: default
+subject: "[{{base_id_tag}}] Certificate renewal problem for {{idTag}}"
+---
+TLS Certificate Renewal Failed
+==============================
+
+Hello {{idTag}},
+
+We were unable to renew the TLS certificate for your {{instance_name}} tenant.
+
+Domain:        {{domain}}
+Expires at:    {{expiresAt}}
+Days to expiry: {{daysUntilExpiry}}
+Reason:        {{errorReason}}
+
+{{#if suspended}}
+*** YOUR TENANT HAS BEEN SUSPENDED ***
+The certificate has expired and renewal is still failing, so HTTPS access to
+your tenant is currently broken. As soon as a renewal succeeds, the
+suspension will be lifted automatically.
+
+{{/if}}
+=== WHAT YOU NEED TO DO ===
+
+The most common cause is incorrect DNS. Make sure the following DNS records
+point at this server:
+
+  * cl-o.{{idTag}}    (the API domain)
+  * {{idTag}}         (the app domain)
+
+Both should resolve to: {{localAddress}}
+
+Either A records (for IP addresses) or CNAME records (for hostnames) work,
+as long as the final answer matches one of the addresses above.
+
+Once DNS is corrected, the next nightly renewal run will pick it up
+automatically. If the certificate has not yet expired, you have until then
+to fix it without further interruption.
+
+If you continue to have problems, please contact your instance administrator.

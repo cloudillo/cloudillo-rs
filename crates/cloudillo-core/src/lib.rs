@@ -19,6 +19,7 @@ pub mod extract;
 pub mod file_access;
 pub mod middleware;
 pub mod prelude;
+pub mod profile_visibility;
 pub mod rate_limit;
 pub mod request;
 pub mod roles;
@@ -34,6 +35,7 @@ use std::pin::Pin;
 pub use app::{App, AppBuilderOpts, AppState, ServerMode};
 pub use extract::{Auth, IdTag, OptionalAuth};
 pub use middleware::{PermissionCheckFactory, PermissionCheckInput, PermissionCheckOutput};
+pub use profile_visibility::{CommunityRole, RequesterTier, SectionVisibility};
 pub use ws_broadcast::BroadcastManager;
 
 /// Type-erased function for verifying action tokens.
@@ -86,6 +88,33 @@ pub type CreateActionFn = Box<
 			cloudillo_types::action_types::CreateAction,
 		) -> Pin<
 			Box<dyn Future<Output = cloudillo_types::error::ClResult<Box<str>>> + Send + 'a>,
+		> + Send
+		+ Sync,
+>;
+
+/// Parameters passed to a `ScheduleEmailFn` invocation. Mirrors
+/// `cloudillo_email::EmailTaskParams` but lives in core so the ACME renewal
+/// task (and other core-side tasks) can schedule emails without a cyclic
+/// dependency on the email crate.
+pub struct ScheduleEmailParams {
+	pub to: String,
+	pub template_name: String,
+	pub template_vars: serde_json::Value,
+	pub lang: Option<String>,
+	pub custom_key: Option<String>,
+	pub from_name_override: Option<String>,
+}
+
+/// Type-erased function for scheduling a templated email via the scheduler.
+/// Registered as an extension by the server's app module (delegates to
+/// `cloudillo_email::EmailModule::schedule_email_task`).
+pub type ScheduleEmailFn = Box<
+	dyn for<'a> Fn(
+			&'a app::App,
+			cloudillo_types::types::TnId,
+			ScheduleEmailParams,
+		) -> Pin<
+			Box<dyn Future<Output = cloudillo_types::error::ClResult<()>> + Send + 'a>,
 		> + Send
 		+ Sync,
 >;

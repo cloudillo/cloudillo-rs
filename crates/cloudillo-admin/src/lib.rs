@@ -3,6 +3,7 @@
 
 //! Admin API handlers for system administration
 
+pub mod cert;
 pub mod email;
 pub mod invite;
 pub mod perm;

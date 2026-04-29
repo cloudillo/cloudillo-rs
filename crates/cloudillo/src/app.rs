@@ -308,6 +308,28 @@ impl AppBuilder {
 		});
 		extensions.insert(ensure_profile_fn);
 
+		// Register schedule_email for core-side tasks (e.g. ACME renewal)
+		let schedule_email_fn: cloudillo_core::ScheduleEmailFn = Box::new(|app, tn_id, params| {
+			Box::pin(async move {
+				cloudillo_email::EmailModule::schedule_email_task(
+					&app.scheduler,
+					&app.settings,
+					tn_id,
+					cloudillo_email::EmailTaskParams {
+						to: params.to,
+						subject: None,
+						template_name: params.template_name,
+						template_vars: params.template_vars,
+						lang: params.lang,
+						custom_key: params.custom_key,
+						from_name_override: params.from_name_override,
+					},
+				)
+				.await
+			})
+		});
+		extensions.insert(schedule_email_fn);
+
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker,

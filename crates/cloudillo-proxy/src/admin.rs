@@ -115,8 +115,9 @@ fn validate_config_for_type(typ: &str, config: &ProxySiteConfig) -> ClResult<()>
 #[axum::debug_handler]
 pub async fn list_proxy_sites(
 	State(app): State<App>,
+	Auth(auth_ctx): Auth,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ProxySiteResponse>>>)> {
-	info!("GET /api/admin/proxy-sites - Listing proxy sites");
+	info!(caller = %auth_ctx.id_tag, "GET /api/admin/proxy-sites - Listing proxy sites");
 
 	let sites = app.auth_adapter.list_proxy_sites().await?;
 	let sites: Vec<ProxySiteResponse> = sites.into_iter().map(ProxySiteResponse::from).collect();
@@ -171,8 +172,9 @@ pub async fn create_proxy_site(
 	}
 
 	// Generate certificate immediately (best-effort, daily cron will retry on failure)
-	if app.opts.acme_email.is_some()
-		&& let Err(e) = acme::renew_proxy_site_cert(&app, site.site_id, &site.domain).await
+	if let Some(ref acme_email) = app.opts.acme_email
+		&& let Err(e) =
+			acme::renew_proxy_site_cert(&app, acme_email, site.site_id, &site.domain).await
 	{
 		warn!(domain = %site.domain, error = %e, "Failed to generate certificate for proxy site");
 	}
@@ -287,8 +289,8 @@ pub async fn trigger_cert_renewal(
 	let site = app.auth_adapter.read_proxy_site(site_id).await?;
 
 	// Perform ACME renewal immediately (best-effort, daily cron will retry on failure)
-	if app.opts.acme_email.is_some()
-		&& let Err(e) = acme::renew_proxy_site_cert(&app, site_id, &site.domain).await
+	if let Some(ref acme_email) = app.opts.acme_email
+		&& let Err(e) = acme::renew_proxy_site_cert(&app, acme_email, site_id, &site.domain).await
 	{
 		warn!(domain = %site.domain, error = %e, "Failed to renew certificate for proxy site");
 	}

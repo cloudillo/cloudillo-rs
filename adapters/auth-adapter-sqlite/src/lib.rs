@@ -12,8 +12,8 @@ use cloudillo_types::{
 	auth_adapter::{
 		AccessToken, ApiKeyInfo, ApiKeyValidation, AuthAdapter, AuthCtx, AuthKey, AuthLogin,
 		AuthProfile, CertData, CreateApiKeyOptions, CreateProxySiteData, CreateTenantData,
-		CreatedApiKey, KeyPair, ListTenantsOptions, ProxySiteData, TenantListItem,
-		UpdateProxySiteData, Webauthn,
+		CreatedApiKey, KeyPair, ListTenantsOptions, ProxySiteData, TenantCertRenewalRow,
+		TenantListItem, UpdateProxySiteData, Webauthn,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -149,8 +149,24 @@ impl AuthAdapter for AuthAdapterSqlite {
 	async fn list_tenants_needing_cert_renewal(
 		&self,
 		renewal_days: u32,
-	) -> ClResult<Vec<(TnId, Box<str>)>> {
+	) -> ClResult<Vec<TenantCertRenewalRow>> {
 		cert::list_tenants_needing_cert_renewal(&self.db, renewal_days).await
+	}
+
+	async fn record_cert_renewal_failure(&self, tn_id: TnId, error: &str) -> ClResult<()> {
+		cert::record_renewal_failure(&self.db, tn_id, error).await
+	}
+
+	async fn record_cert_renewal_success(&self, tn_id: TnId) -> ClResult<()> {
+		cert::record_renewal_success(&self.db, tn_id).await
+	}
+
+	async fn record_cert_renewal_notification(&self, tn_id: TnId) -> ClResult<()> {
+		cert::record_notification_sent(&self.db, tn_id).await
+	}
+
+	async fn update_tenant_status(&self, tn_id: TnId, status: char) -> ClResult<()> {
+		tenant::update_tenant_status(&self.db, tn_id, status).await
 	}
 
 	async fn list_profile_keys(&self, tn_id: TnId) -> ClResult<Vec<AuthKey>> {

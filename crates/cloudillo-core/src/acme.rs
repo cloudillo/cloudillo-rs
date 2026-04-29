@@ -12,9 +12,11 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::sync::Arc;
 use x509_parser::parse_x509_certificate;
 
+use crate::dns::{DnsResolver, create_recursive_resolver, validate_domain_address};
 use crate::prelude::*;
 use crate::scheduler::{Task, TaskId};
-use cloudillo_types::auth_adapter;
+use crate::{ScheduleEmailFn, ScheduleEmailParams};
+use cloudillo_types::auth_adapter::{self, TenantCertRenewalRow};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,43 @@ struct X509CertData {
 	expires_at: Timestamp,
 }
 
+/// Vars-table key for the persisted ACME account credentials. Stored under
+/// `TnId(0)` (global), matching the convention used for other server-wide
+/// secrets like `0:jwt_secret`.
+const ACME_ACCOUNT_VAR: &str = "acme_account";
+
+/// Load the persisted ACME account, or create a new one and persist its
+/// credentials on first use. Without persistence we'd hit Let's Encrypt's
+/// per-IP account-creation rate limit on every renewal cycle and leak the
+/// account key into the log on every call.
+async fn get_or_create_acme_account(state: &App, acme_email: &str) -> ClResult<Account> {
+	match state.auth_adapter.read_var(TnId(0), ACME_ACCOUNT_VAR).await {
+		Ok(json) => {
+			let credentials: acme::AccountCredentials = serde_json::from_str(&json)
+				.map_err(|_| Error::Internal("corrupt ACME credentials in vars".into()))?;
+			Ok(Account::builder()?.from_credentials(credentials).await?)
+		}
+		Err(Error::NotFound) => {
+			info!("Creating new ACME account for {}", acme_email);
+			let (account, credentials) = Account::builder()?
+				.create(
+					&acme::NewAccount {
+						contact: &[],
+						terms_of_service_agreed: true,
+						only_return_existing: false,
+					},
+					acme::LetsEncrypt::Production.url().to_owned(),
+					None,
+				)
+				.await?;
+			let json = serde_json::to_string(&credentials)?;
+			state.auth_adapter.update_var(TnId(0), ACME_ACCOUNT_VAR, &json).await?;
+			Ok(account)
+		}
+		Err(e) => Err(e),
+	}
+}
+
 pub async fn init(
 	state: App,
 	acme_email: &str,
@@ -33,20 +72,7 @@ pub async fn init(
 	app_domain: Option<&str>,
 ) -> ClResult<()> {
 	info!("ACME init {}", acme_email);
-
-	let (account, credentials) = Account::builder()?
-		.create(
-			&acme::NewAccount {
-				contact: &[],
-				terms_of_service_agreed: true,
-				only_return_existing: false,
-			},
-			//acme::LetsEncrypt::Staging.url().to_owned(),
-			acme::LetsEncrypt::Production.url().to_owned(),
-			None,
-		)
-		.await?;
-	info!("ACME credentials {}", serde_json::to_string_pretty(&credentials)?);
+	let account = get_or_create_acme_account(&state, acme_email).await?;
 
 	// Look up the actual tenant ID instead of hardcoding to 1
 	let tn_id = state.auth_adapter.read_tn_id(id_tag).await?;
@@ -81,19 +107,47 @@ pub async fn renew_tenant<'a>(
 			key: cert.private_key_pem,
 			cert: cert.certificate_pem,
 			expires_at: cert.expires_at,
+			last_renewal_attempt_at: None,
+			last_renewal_error: None,
+			failure_count: 0,
+			notified_at: None,
 		})
 		.await?;
 
 	Ok(())
 }
 
-//async fn renew_domains<'a>(state: &'a App, account: &'a acme::Account, domains: Vec<String>) -> Result<X509CertData, Box<dyn std::error::Error + 'a>> {
 async fn renew_domains<'a>(
 	state: &'a App,
 	account: &'a acme::Account,
 	domains: Vec<String>,
 ) -> ClResult<X509CertData> {
-	info!("ACME {:?}", &domains);
+	// Track every identifier we actually inserted into acme_challenge_map so
+	// we can remove the exact same keys on cleanup. The ACME server is free
+	// to normalize identifiers (case, trailing dots) and using the input
+	// `domains` list for removal could miss them.
+	let mut inserted_identifiers: Vec<Box<str>> = Vec::new();
+	let result = renew_domains_inner(state, account, &domains, &mut inserted_identifiers).await;
+
+	// Always clean up challenges, on both success and failure paths.
+	if let Ok(mut map) = state.acme_challenge_map.write() {
+		for ident in &inserted_identifiers {
+			map.remove(ident.as_ref());
+		}
+	} else {
+		warn!("ACME: failed to access challenge map for cleanup");
+	}
+
+	result
+}
+
+async fn renew_domains_inner<'a>(
+	state: &'a App,
+	account: &'a acme::Account,
+	domains: &'a [String],
+	inserted_identifiers: &'a mut Vec<Box<str>>,
+) -> ClResult<X509CertData> {
+	info!("ACME {:?}", domains);
 	let identifiers = domains
 		.iter()
 		.map(|domain| acme::Identifier::Dns(domain.clone()))
@@ -103,116 +157,121 @@ async fn renew_domains<'a>(
 
 	info!("ACME order {:#?}", order.state());
 
-	if order.state().status == acme::OrderStatus::Pending {
-		let mut authorizations = order.authorizations();
-		while let Some(result) = authorizations.next().await {
-			let mut authz = result?;
-			match authz.status {
-				acme::AuthorizationStatus::Pending => {}
-				acme::AuthorizationStatus::Valid => continue,
-				status => {
-					// Log unexpected status and continue - may be Deactivated, Expired, or Revoked
-					warn!("Unexpected ACME authorization status: {:?}", status);
-					continue;
-				}
-			}
-
-			let mut challenge = authz
-				.challenge(acme::ChallengeType::Http01)
-				.ok_or(acme::Error::Str("no challenge"))?;
-			let identifier = challenge.identifier().to_string().into_boxed_str();
-			let token: Box<str> = challenge.key_authorization().as_str().into();
-			info!("ACME challenge {} {}", identifier, token);
-			state
-				.acme_challenge_map
-				.write()
-				.map_err(|_| {
-					Error::ServiceUnavailable("failed to access ACME challenge map".into())
-				})?
-				.insert(identifier.clone(), token);
-
-			challenge.set_ready().await?;
-		}
-
-		info!("Start polling...");
-		// Create a more patient retry policy for Let's Encrypt validation
-		// Initial delay: 1s, backoff: 1.5x, timeout: 90s
-		// This gives LE plenty of time to validate multiple domains
-		let retry_policy = acme::RetryPolicy::new()
-			.initial_delay(std::time::Duration::from_secs(1))
-			.backoff(1.5)
-			.timeout(std::time::Duration::from_secs(90));
-
-		let status = order.poll_ready(&retry_policy).await?;
-
-		if status != acme::OrderStatus::Ready {
-			// Fetch authorization details to see validation errors
+	let initial_status = order.state().status;
+	// `Pending` is the normal first-time path. `Ready` can happen when LE has
+	// already validated authorizations on a recent retry — finalize directly.
+	// Anything else (Valid/Invalid/Processing) is unexpected and should fail.
+	match initial_status {
+		acme::OrderStatus::Pending => {
 			let mut authorizations = order.authorizations();
 			while let Some(result) = authorizations.next().await {
-				if let Ok(authz) = result {
-					for challenge in &authz.challenges {
-						if challenge.r#type == acme::ChallengeType::Http01
-							&& let Some(ref err) = challenge.error
-						{
-							warn!(
-								"ACME validation failed for {}: {}",
-								authz.identifier(),
-								err.detail.as_deref().unwrap_or("unknown error")
-							);
+				let mut authz = result?;
+				match authz.status {
+					acme::AuthorizationStatus::Pending => {}
+					acme::AuthorizationStatus::Valid => continue,
+					status => {
+						// Log unexpected status and continue - may be Deactivated, Expired, or Revoked
+						warn!("Unexpected ACME authorization status: {:?}", status);
+						continue;
+					}
+				}
+
+				let mut challenge = authz
+					.challenge(acme::ChallengeType::Http01)
+					.ok_or(acme::Error::Str("no challenge"))?;
+				let identifier: Box<str> = challenge.identifier().to_string().into_boxed_str();
+				let token: Box<str> = challenge.key_authorization().as_str().into();
+				info!("ACME challenge {} {}", identifier, token);
+				state
+					.acme_challenge_map
+					.write()
+					.map_err(|_| {
+						Error::ServiceUnavailable("failed to access ACME challenge map".into())
+					})?
+					.insert(identifier.clone(), token);
+				inserted_identifiers.push(identifier);
+
+				challenge.set_ready().await?;
+			}
+
+			info!("Start polling...");
+			// Create a more patient retry policy for Let's Encrypt validation
+			// Initial delay: 1s, backoff: 1.5x, timeout: 90s
+			// This gives LE plenty of time to validate multiple domains
+			let retry_policy = acme::RetryPolicy::new()
+				.initial_delay(std::time::Duration::from_secs(1))
+				.backoff(1.5)
+				.timeout(std::time::Duration::from_secs(90));
+
+			let status = order.poll_ready(&retry_policy).await?;
+
+			if status != acme::OrderStatus::Ready {
+				// Fetch authorization details to see validation errors
+				let mut authorizations = order.authorizations();
+				while let Some(result) = authorizations.next().await {
+					if let Ok(authz) = result {
+						for challenge in &authz.challenges {
+							if challenge.r#type == acme::ChallengeType::Http01
+								&& let Some(ref err) = challenge.error
+							{
+								warn!(
+									"ACME validation failed for {}: {}",
+									authz.identifier(),
+									err.detail.as_deref().unwrap_or("unknown error")
+								);
+							}
 						}
 					}
 				}
+				Err(acme::Error::Str("order not ready"))?;
 			}
-			Err(acme::Error::Str("order not ready"))?;
 		}
-
-		info!("Finalizing...");
-		let private_key_pem = order.finalize().await?;
-		// Use the same patient retry policy for certificate polling
-		let cert_chain_pem = order.poll_certificate(&retry_policy).await?;
-		info!("Got cert.");
-
-		// Clean up ACME challenges
-		for domain in &domains {
-			state
-				.acme_challenge_map
-				.write()
-				.map_err(|_| {
-					Error::ServiceUnavailable("failed to access ACME challenge map".into())
-				})?
-				.remove(domain.as_str());
+		acme::OrderStatus::Ready => {
+			info!("ACME order already Ready - skipping authorization phase");
 		}
-
-		let pem = &pem::parse(&cert_chain_pem)?;
-		let cert_der = pem.contents();
-		let (_, parsed_cert) = parse_x509_certificate(cert_der)?;
-		let not_after = parsed_cert.validity().not_after;
-
-		let certified_key = Arc::new(CertifiedKey::from_der(
-			CertificateDer::pem_slice_iter(cert_chain_pem.as_bytes())
-				.filter_map(Result::ok)
-				.collect(),
-			PrivateKeyDer::from_pem_slice(private_key_pem.as_bytes())?,
-			CryptoProvider::get_default().ok_or(acme::Error::Str("no crypto provider"))?,
-		)?);
-		for domain in &domains {
-			state
-				.certs
-				.write()
-				.map_err(|_| Error::ServiceUnavailable("failed to access cert cache".into()))?
-				.insert(domain.clone().into_boxed_str(), certified_key.clone());
+		other => {
+			warn!("Unexpected ACME order status on creation: {:?}", other);
+			return Err(Error::ConfigError("ACME initialization failed".into()));
 		}
-
-		let cert_data = X509CertData {
-			private_key_pem: private_key_pem.clone().into_boxed_str(),
-			certificate_pem: cert_chain_pem.clone().into_boxed_str(),
-			expires_at: Timestamp(not_after.timestamp()),
-		};
-
-		Ok(cert_data)
-	} else {
-		Err(Error::ConfigError("ACME initialization failed".into()))
 	}
+
+	let retry_policy = acme::RetryPolicy::new()
+		.initial_delay(std::time::Duration::from_secs(1))
+		.backoff(1.5)
+		.timeout(std::time::Duration::from_secs(90));
+
+	info!("Finalizing...");
+	let private_key_pem = order.finalize().await?;
+	let cert_chain_pem = order.poll_certificate(&retry_policy).await?;
+	info!("Got cert.");
+
+	let pem = &pem::parse(&cert_chain_pem)?;
+	let cert_der = pem.contents();
+	let (_, parsed_cert) = parse_x509_certificate(cert_der)?;
+	let not_after = parsed_cert.validity().not_after;
+
+	let certified_key = Arc::new(CertifiedKey::from_der(
+		CertificateDer::pem_slice_iter(cert_chain_pem.as_bytes())
+			.filter_map(Result::ok)
+			.collect(),
+		PrivateKeyDer::from_pem_slice(private_key_pem.as_bytes())?,
+		CryptoProvider::get_default().ok_or(acme::Error::Str("no crypto provider"))?,
+	)?);
+	for domain in domains {
+		state
+			.certs
+			.write()
+			.map_err(|_| Error::ServiceUnavailable("failed to access cert cache".into()))?
+			.insert(domain.clone().into_boxed_str(), certified_key.clone());
+	}
+
+	let cert_data = X509CertData {
+		private_key_pem: private_key_pem.into_boxed_str(),
+		certificate_pem: cert_chain_pem.into_boxed_str(),
+		expires_at: Timestamp(not_after.timestamp()),
+	};
+
+	Ok(cert_data)
 }
 
 pub async fn get_acme_challenge(
@@ -231,31 +290,27 @@ pub async fn get_acme_challenge(
 		.map_err(|_| Error::ServiceUnavailable("failed to access ACME challenge map".into()))?
 		.get(domain)
 	{
-		println!("    -> {:?}", &token);
+		debug!("ACME challenge served for {}", domain);
 		Ok(token.clone())
 	} else {
-		println!("    -> not found");
+		debug!("ACME challenge not found for {}", domain);
 		Err(Error::PermissionDenied)
 	}
 }
 
 /// Renew the TLS certificate for a single proxy site via ACME.
 ///
-/// Creates an ACME account, generates the certificate, stores it in the auth adapter,
-/// and invalidates the cert cache. This is called inline from proxy site creation
-/// and manual renewal endpoints, as well as from the periodic `CertRenewalTask`.
-pub async fn renew_proxy_site_cert(app: &App, site_id: i64, domain: &str) -> ClResult<()> {
-	let (account, _credentials) = Account::builder()?
-		.create(
-			&acme::NewAccount {
-				contact: &[],
-				terms_of_service_agreed: true,
-				only_return_existing: false,
-			},
-			acme::LetsEncrypt::Production.url().to_owned(),
-			None,
-		)
-		.await?;
+/// Loads the persisted ACME account (creating it on first use), generates the
+/// certificate, stores it in the auth adapter, and invalidates the cert cache.
+/// Called inline from proxy site creation and manual renewal endpoints, as
+/// well as from the periodic `CertRenewalTask`.
+pub async fn renew_proxy_site_cert(
+	app: &App,
+	acme_email: &str,
+	site_id: i64,
+	domain: &str,
+) -> ClResult<()> {
+	let account = get_or_create_acme_account(app, acme_email).await?;
 
 	let domains = vec![domain.to_string()];
 	let cert = renew_domains(app, &account, domains).await?;
@@ -316,65 +371,118 @@ impl Task<App> for CertRenewalTask {
 	}
 
 	fn serialize(&self) -> String {
-		serde_json::to_string(self)
-			.unwrap_or_else(|_| format!("acme.cert_renewal:{}", self.renewal_days))
+		// `serde_json::to_string` cannot fail for this struct (only `String` and
+		// `u32` fields, no custom Serialize impl). Falling back to an arbitrary
+		// non-JSON string would brick the scheduler entry — `build()` parses
+		// JSON. Use `to_string` directly with a debug-only assert as a guard.
+		debug_assert!(serde_json::to_string(self).is_ok());
+		serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
 		info!("Running certificate renewal check (renewal threshold: {} days)", self.renewal_days);
 
-		// Get list of tenants needing renewal
 		let tenants = app.auth_adapter.list_tenants_needing_cert_renewal(self.renewal_days).await?;
-
-		if tenants.is_empty() {
-			info!("All tenant certificates are valid");
-		}
-
-		if !tenants.is_empty() {
-			info!("Found {} tenant(s) needing certificate renewal", tenants.len());
-
-			// Renew certificates for each tenant
-			for (tn_id, id_tag) in tenants {
-				info!("Renewing certificate for tenant: {} (tn_id={})", id_tag, tn_id.0);
-
-				// Determine app_domain (only base tenant gets custom domain)
-				let app_domain = if tn_id.0 == 1 {
-					// For base tenant, check if there's a custom domain configured
-					// TODO: Get this from app configuration/settings
-					None
-				} else {
-					None
-				};
-
-				// Perform ACME renewal
-				match init(app.clone(), &self.acme_email, &id_tag, app_domain).await {
-					Ok(()) => {
-						info!(tenant = %id_tag, "Certificate renewed successfully");
-					}
-					Err(e) => {
-						error!(tenant = %id_tag, error = %e, "Failed to renew certificate");
-						// Continue with other tenants even if one fails
-					}
-				}
-			}
-		}
-
-		// Renew proxy site certificates
 		let proxy_sites = app
 			.auth_adapter
 			.list_proxy_sites_needing_cert_renewal(self.renewal_days)
 			.await?;
 
+		if tenants.is_empty() && proxy_sites.is_empty() {
+			info!("All certificates are valid");
+			return Ok(());
+		}
+
+		// Single resolver for the whole batch — same pattern as register.rs
+		let resolver = match create_recursive_resolver() {
+			Ok(r) => r,
+			Err(e) => {
+				error!(error = %e, "Cannot create DNS resolver; skipping renewal run");
+				return Ok(());
+			}
+		};
+
+		if !tenants.is_empty() {
+			info!("Found {} tenant(s) needing certificate renewal", tenants.len());
+			for row in tenants {
+				let app_domain: Option<&str> = None; // No custom domain support yet
+				let domains = build_domains_for_tenant(&row.id_tag, app_domain);
+
+				match check_domains_dns(&domains, &app.opts.local_address, &resolver).await {
+					Ok(()) => {}
+					Err(PreCheckError::Definitive(reason)) => {
+						warn!(
+							tn_id = %row.tn_id.0,
+							id_tag = %row.id_tag,
+							reason = %reason,
+							"Skipping ACME renewal: DNS pre-check failed"
+						);
+						handle_renewal_failure(app, &row, &reason).await;
+						continue;
+					}
+					Err(PreCheckError::Transient(reason)) => {
+						warn!(
+							tn_id = %row.tn_id.0,
+							id_tag = %row.id_tag,
+							reason = %reason,
+							"Skipping ACME renewal this run: transient DNS resolver error \
+							 (not counted as failure)"
+						);
+						continue;
+					}
+				}
+
+				info!("Renewing certificate for tenant: {} (tn_id={})", row.id_tag, row.tn_id.0);
+				match init(app.clone(), &self.acme_email, &row.id_tag, app_domain).await {
+					Ok(()) => {
+						info!(tn_id = %row.tn_id.0, id_tag = %row.id_tag,
+							"Certificate renewed successfully");
+						handle_renewal_success(app, &row).await;
+					}
+					Err(e) => {
+						let reason = format!("acme: {}", e);
+						error!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %reason,
+							"Failed to renew certificate");
+						handle_renewal_failure(app, &row, &reason).await;
+					}
+				}
+			}
+		}
+
 		if !proxy_sites.is_empty() {
 			info!("Found {} proxy site(s) needing certificate renewal", proxy_sites.len());
 
 			for site in proxy_sites {
+				let domains: Vec<String> = vec![site.domain.to_string()];
+				match check_domains_dns(&domains, &app.opts.local_address, &resolver).await {
+					Ok(()) => {}
+					Err(PreCheckError::Definitive(reason)) => {
+						warn!(
+							domain = %site.domain,
+							reason = %reason,
+							"Skipping ACME renewal for proxy site: DNS pre-check failed"
+						);
+						continue;
+					}
+					Err(PreCheckError::Transient(reason)) => {
+						warn!(
+							domain = %site.domain,
+							reason = %reason,
+							"Skipping ACME renewal for proxy site this run: transient DNS \
+							 resolver error"
+						);
+						continue;
+					}
+				}
+
 				info!(
 					"Renewing certificate for proxy site: {} (site_id={})",
 					site.domain, site.site_id
 				);
 
-				if let Err(e) = renew_proxy_site_cert(app, site.site_id, &site.domain).await {
+				if let Err(e) =
+					renew_proxy_site_cert(app, &self.acme_email, site.site_id, &site.domain).await
+				{
 					error!(
 						domain = %site.domain,
 						error = %e,
@@ -395,6 +503,202 @@ impl Task<App> for CertRenewalTask {
 pub fn register_tasks(app: &App) -> ClResult<()> {
 	app.scheduler.register::<CertRenewalTask>()?;
 	Ok(())
+}
+
+// ============================================================================
+// DNS pre-check + renewal-failure tracking helpers
+// ============================================================================
+
+const RENEWAL_NOTIFY_LONG_INTERVAL_SECS: i64 = 7 * 86400;
+const RENEWAL_NOTIFY_SHORT_INTERVAL_SECS: i64 = 86400;
+
+/// Build the list of domains a tenant cert needs to cover. Mirrors the logic
+/// in `renew_tenant`.
+fn build_domains_for_tenant(id_tag: &str, app_domain: Option<&str>) -> Vec<String> {
+	let mut domains = vec![format!("cl-o.{}", id_tag)];
+	domains.push(app_domain.unwrap_or(id_tag).to_string());
+	domains
+}
+
+/// Outcome of a DNS pre-check. Definitive failures (`"nodns"`, `"address"`)
+/// are deterministic — the tenant's DNS is genuinely misconfigured — so they
+/// escalate to suspension/notification. Transient failures (resolver network
+/// errors, timeouts) are not the tenant's fault; the renewal is skipped this
+/// run but failure_count / suspension state is left untouched so a flaky
+/// resolver around expiry can't push a healthy tenant into Suspended.
+enum PreCheckError {
+	Definitive(String),
+	Transient(String),
+}
+
+/// DNS pre-check for every domain in the list. Returns the error code
+/// (`"nodns"` or `"address"`, matching `register.rs` conventions) on the
+/// first definitive failure, or a transient error wrapping the underlying
+/// resolver error. If `local_address` is empty (e.g., local dev), the check
+/// is skipped — same as `register.rs` does.
+async fn check_domains_dns(
+	domains: &[String],
+	local_address: &[Box<str>],
+	resolver: &DnsResolver,
+) -> Result<(), PreCheckError> {
+	if local_address.is_empty() {
+		return Ok(());
+	}
+	for domain in domains {
+		match validate_domain_address(domain, local_address, resolver).await {
+			Ok(_) => {}
+			Err(Error::ValidationError(code)) => return Err(PreCheckError::Definitive(code)),
+			Err(e) => return Err(PreCheckError::Transient(format!("{}", e))),
+		}
+	}
+	Ok(())
+}
+
+async fn handle_renewal_success(app: &App, row: &TenantCertRenewalRow) {
+	if let Err(e) = app.auth_adapter.record_cert_renewal_success(row.tn_id).await {
+		warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
+			"Failed to record renewal success");
+	}
+	// Only flip status back to active when this row was previously suspended
+	// (i.e. its prior cert was past expiry). Calling `update_tenant_status('A')`
+	// unconditionally would bump `tenants.updated_at` on every nightly run for
+	// every healthy tenant.
+	let is_currently_expired = row.expires_at.is_some_and(|t| t.0 < Timestamp::now().0);
+	if is_currently_expired {
+		if let Err(e) = app.auth_adapter.update_tenant_status(row.tn_id, 'A').await {
+			warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
+				"Failed to clear suspended status after renewal");
+		} else {
+			info!(tn_id = %row.tn_id.0, id_tag = %row.id_tag,
+				"Tenant un-suspended after successful cert renewal");
+		}
+	}
+}
+
+async fn handle_renewal_failure(app: &App, row: &TenantCertRenewalRow, reason: &str) {
+	// Always record the failure so we have a counter, even on the
+	// initial-bootstrap path (no cert yet). The adapter upserts the row.
+	if let Err(e) = app.auth_adapter.record_cert_renewal_failure(row.tn_id, reason).await {
+		warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
+			"Failed to record renewal failure");
+	}
+
+	let now = Timestamp::now().0;
+
+	let (days_until_expiry, already_expired) = match row.expires_at {
+		Some(expires_at) => {
+			let days = (expires_at.0 - now) / 86400;
+			(days, days <= 0)
+		}
+		// No cert yet — treat as already-expired for suspension/notify cadence.
+		None => (0, true),
+	};
+
+	// Suspend the tenant once the cert is past expiry (or absent). Flipping an
+	// already-suspended tenant to 'S' is a no-op; we never downgrade here.
+	if already_expired && let Err(e) = app.auth_adapter.update_tenant_status(row.tn_id, 'S').await {
+		warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
+			"Failed to mark tenant suspended");
+	}
+
+	let should_notify = should_notify(row, now, days_until_expiry);
+	if !should_notify {
+		return;
+	}
+
+	let expires_at = row.expires_at.unwrap_or(Timestamp(now));
+	if let Err(e) = schedule_renewal_failure_email(
+		app,
+		row,
+		reason,
+		expires_at,
+		days_until_expiry,
+		already_expired,
+	)
+	.await
+	{
+		warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
+			"Failed to schedule renewal-failure email");
+		return;
+	}
+
+	if let Err(e) = app.auth_adapter.record_cert_renewal_notification(row.tn_id).await {
+		warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
+			"Failed to stamp notified_at");
+	}
+}
+
+fn should_notify(row: &TenantCertRenewalRow, now: i64, days_until_expiry: i64) -> bool {
+	// First failure (no notification recorded yet): always notify.
+	let Some(last) = row.notified_at else {
+		return true;
+	};
+	let interval = if days_until_expiry <= 7 {
+		RENEWAL_NOTIFY_SHORT_INTERVAL_SECS
+	} else {
+		RENEWAL_NOTIFY_LONG_INTERVAL_SECS
+	};
+	now - last.0 >= interval
+}
+
+async fn schedule_renewal_failure_email(
+	app: &App,
+	row: &TenantCertRenewalRow,
+	reason: &str,
+	expires_at: Timestamp,
+	days_until_expiry: i64,
+	suspended: bool,
+) -> ClResult<()> {
+	let schedule_email = app.ext::<ScheduleEmailFn>()?;
+
+	// Tenant email lives on AuthProfile.
+	let profile = app.auth_adapter.read_tenant(&row.id_tag).await?;
+	let Some(email) = profile.email else {
+		warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag,
+			"Cannot send renewal-failure email: tenant has no email on file");
+		return Ok(());
+	};
+
+	// Pull the user's preferred language directly via the settings service —
+	// we can't depend on cloudillo-email here.
+	let lang = match app.settings.get(row.tn_id, "profile.lang").await {
+		Ok(crate::settings::SettingValue::String(s)) => Some(s),
+		_ => None,
+	};
+
+	let base_id_tag = app.opts.base_id_tag.as_ref().map_or("cloudillo", AsRef::as_ref);
+	let local_address_str =
+		app.opts.local_address.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(", ");
+	let domain_for_display = format!("cl-o.{}", row.id_tag);
+
+	let template_vars = serde_json::json!({
+		"idTag": row.id_tag.as_ref(),
+		"domain": domain_for_display,
+		"daysUntilExpiry": days_until_expiry,
+		"expiresAt": expires_at.to_iso_string(),
+		"errorReason": reason,
+		"suspended": suspended,
+		"localAddress": local_address_str,
+		"base_id_tag": base_id_tag,
+		"instance_name": "Cloudillo",
+	});
+
+	let params = ScheduleEmailParams {
+		to: email.to_string(),
+		template_name: "cert_renewal_failed".to_string(),
+		template_vars,
+		lang,
+		// Once-per-day key so we don't queue duplicate emails when the task
+		// runs multiple times before sending (failure_count + day stamp).
+		custom_key: Some(format!(
+			"cert-renewal-failed:{}:{}",
+			row.tn_id.0,
+			Timestamp::now().0 / 86400
+		)),
+		from_name_override: Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
+	};
+
+	schedule_email(app, row.tn_id, params).await
 }
 
 // vim: ts=4

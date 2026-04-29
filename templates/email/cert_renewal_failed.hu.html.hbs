@@ -1,0 +1,60 @@
+---
+layout: default
+subject: "[{{base_id_tag}}] Tanúsítvány-megújítási hiba: {{idTag}}"
+---
+<p style="font-size: 16px; color: #1f2937; margin: 0 0 20px 0;">Kedves {{idTag}},</p>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
+	Nem sikerült megújítanunk a {{instance_name}} bérlőd TLS-tanúsítványát.
+</p>
+
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0; background-color: #f9fafb; border-radius: 6px;">
+	<tr>
+		<td style="padding: 15px 20px;">
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Domain:</strong> {{domain}}</p>
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Lejárati idő:</strong> {{expiresAt}}</p>
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Hátralévő nap:</strong> {{daysUntilExpiry}}</p>
+			<p style="font-size: 13px; color: #1f2937; margin: 0;"><strong>Hiba oka:</strong> {{errorReason}}</p>
+		</td>
+	</tr>
+</table>
+
+{{#if suspended}}
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0;">
+	<tr>
+		<td style="background-color: #fee2e2; border: 1px solid #fca5a5; border-radius: 6px; padding: 15px;">
+			<p style="font-size: 13px; color: #991b1b; margin: 0;">
+				<strong>A bérlőd felfüggesztésre került.</strong> A tanúsítvány lejárt és a
+				megújítás továbbra is sikertelen, ezért a HTTPS-elérés jelenleg nem
+				működik. Amint a megújítás sikerül, a felfüggesztés automatikusan
+				feloldódik.
+			</p>
+		</td>
+	</tr>
+</table>
+{{/if}}
+
+<h3 style="font-size: 16px; color: #1f2937; margin: 24px 0 12px 0;">Mit kell tenned</h3>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 12px 0;">
+	A leggyakoribb ok a hibás DNS-beállítás. Ellenőrizd, hogy az alábbi
+	DNS-rekordok erre a szerverre mutatnak-e:
+</p>
+<ul style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 12px 20px; padding: 0;">
+	<li><code>cl-o.{{idTag}}</code> &mdash; az API-domain</li>
+	<li><code>{{idTag}}</code> &mdash; az alkalmazás-domain</li>
+</ul>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 12px 0;">
+	Mindkettőnek ezt kell visszaadnia: <code>{{localAddress}}</code>
+</p>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 12px 0;">
+	Lehet A rekord (IP-címhez) vagy CNAME rekord (hosztnévhez), amíg a végső
+	válasz a fenti címek egyike.
+</p>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
+	A DNS javítása után a következő éjjeli megújítási futtatás automatikusan
+	elvégzi a tanúsítvány megújítását. Ha a tanúsítvány még nem járt le,
+	addig van időd kijavítani további fennakadás nélkül.
+</p>
+
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0;">
+	Ha a probléma továbbra is fennáll, fordulj a rendszergazdához.
+</p>

@@ -25,7 +25,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 }
 
 // Current schema version - update this when adding new migrations
-const CURRENT_DB_VERSION: i64 = 5;
+const CURRENT_DB_VERSION: i64 = 6;
 
 /// Initialize the database schema and run migrations
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -49,6 +49,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Schema creation - safe to run every time (uses IF NOT EXISTS)
 
 	// Tenants
+	// status: 'A' = Active (normal). 'S' = Suspended (set by ACME renewal task once a
+	// cert has expired with renewal still failing — flipped back to 'A' on next success).
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS tenants (
 			tn_id integer NOT NULL,
@@ -95,6 +97,10 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			expires_at INTEGER,
 			cert text,
 			key text,
+			last_renewal_attempt_at INTEGER,
+			last_renewal_error TEXT,
+			failure_count INTEGER NOT NULL DEFAULT 0,
+			notified_at INTEGER,
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id)
@@ -377,9 +383,27 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 		set_db_version(&mut tx, 5).await;
+		version = 5;
+	}
+
+	// Version 6: Add ACME renewal failure-tracking columns to certs
+	if version == 5 {
+		sqlx::query("ALTER TABLE certs ADD COLUMN last_renewal_attempt_at INTEGER")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("ALTER TABLE certs ADD COLUMN last_renewal_error TEXT")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("ALTER TABLE certs ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("ALTER TABLE certs ADD COLUMN notified_at INTEGER")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 6).await;
 		#[allow(unused_assignments)]
 		{
-			version = 5;
+			version = 6;
 		}
 	}
 

@@ -86,6 +86,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 			post(admin::tenant::send_password_reset),
 		)
 		.route("/api/admin/email/test", post(admin::email::send_test_email))
+		.route("/api/admin/cert-status", get(admin::cert::get_cert_status))
 		// Proxy site management
 		.route("/api/admin/proxy-sites", get(proxy::admin::list_proxy_sites))
 		.route("/api/admin/proxy-sites", post(proxy::admin::create_proxy_site))
@@ -173,6 +174,19 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/me/cover", put(profile::media::put_cover_image))
 		.route("/api/profiles", get(profile::list::list_profiles))
 
+		// --- IDP Onboarding Gate (verify-idp) ---
+		// Pull-on-demand IDP identity status + activation-email resend.
+		// Active only during onboarding (ui.onboarding === 'verify-idp');
+		// once cleared, no client should be calling these.
+		.route(
+			"/api/profiles/me/idp-status",
+			get(profile::idp_status::get_me_idp_status),
+		)
+		.route(
+			"/api/profiles/me/resend-activation",
+			post(profile::idp_status::post_me_resend_activation),
+		)
+
 		// --- Community Profile Creation ---
 		.route("/api/profiles/{id_tag}", put(profile::community::put_community_profile))
 
@@ -214,6 +228,18 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/idp/identities/{identity_id}", delete(idp::handler::delete_identity))
 		.route("/api/idp/identities/{identity_id}", patch(idp::handler::update_identity_settings))
 		.route("/api/idp/identities/{identity_id}/address", put(idp::handler::update_identity_address))
+		// --- IDP Onboarding-Gate Endpoints (issuer-match auth) ---
+		// Live status + activation-email resend, called by tenant homes via
+		// proxy-token-authenticated DNS-discovered HTTP. Issuer must match
+		// the requested identity.
+		.route(
+			"/api/idp/identities/{identity_id}/status",
+			get(idp::handler::get_identity_status),
+		)
+		.route(
+			"/api/idp/identities/{identity_id}/resend",
+			post(idp::handler::resend_identity_activation),
+		)
 
 		// --- IDP API Key Management ---
 		.route("/api/idp/api-keys", post(idp::api_keys::create_api_key))
