@@ -59,7 +59,7 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 		reg_content,
 		issuer: &context.issuer,
 		audience: target_idp,
-		tenant_id: context.tenant_id,
+		tn_id: context.tn_id,
 		client_address: context.client_address.as_deref(),
 	};
 

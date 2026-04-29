@@ -8,7 +8,7 @@ use sqlx::{Row, SqlitePool};
 use crate::utils::{collect_res, inspect, map_res, push_patch};
 use cloudillo_types::meta_adapter::{
 	ListProfileOptions, Profile, ProfileConnectionStatus, ProfileData, ProfileStatus, ProfileTrust,
-	ProfileType, UpdateProfileData,
+	ProfileType, UpsertProfileFields, UpsertResult,
 };
 use cloudillo_types::prelude::*;
 
@@ -103,7 +103,7 @@ pub(crate) async fn list(
 ) -> ClResult<Vec<Profile<Box<str>>>> {
 	let mut query = sqlx::QueryBuilder::new(
 		"SELECT id_tag, name, type, profile_pic, following, connected, roles, trust
-		 FROM profiles WHERE tn_id=",
+		 FROM profiles WHERE type IS NOT NULL AND tn_id=",
 	);
 	query.push_bind(tn_id.0);
 
@@ -184,9 +184,10 @@ pub(crate) async fn list(
 		.map_err(|_| Error::DbError)?;
 
 	collect_res(res.iter().map(|row| {
-		let typ = match row.try_get("type")? {
-			"P" => ProfileType::Person,
-			"C" => ProfileType::Community,
+		let type_str: Option<&str> = row.try_get("type")?;
+		let typ = match type_str {
+			Some("P") => ProfileType::Person,
+			Some("C") => ProfileType::Community,
 			_ => return Err(sqlx::Error::RowNotFound),
 		};
 
@@ -243,7 +244,7 @@ pub(crate) async fn get_relationships(
 	let mut result = HashMap::with_capacity(rows.len());
 	for row in rows {
 		let id_tag: String = row.try_get("id_tag").map_err(|_| Error::DbError)?;
-		let following: bool = row.try_get("following").unwrap_or(false);
+		let following: bool = row.try_get("following").map_err(|_| Error::DbError)?;
 		let connected_status = parse_connected(&row);
 		let connected = connected_status.is_connected();
 		result.insert(id_tag, (following, connected));
@@ -269,9 +270,10 @@ pub(crate) async fn read(
 
 	map_res(res, |row| {
 		let id_tag = row.try_get("id_tag")?;
-		let typ = match row.try_get("type")? {
-			"P" => ProfileType::Person,
-			"C" => ProfileType::Community,
+		let type_str: Option<&str> = row.try_get("type")?;
+		let typ = match type_str {
+			Some("P") => ProfileType::Person,
+			Some("C") => ProfileType::Community,
 			_ => return Err(sqlx::Error::RowNotFound),
 		};
 		let etag = row.try_get("etag")?;
@@ -311,69 +313,118 @@ pub(crate) async fn read_roles(
 	})
 }
 
-/// Create a new profile
-pub(crate) async fn create(
-	db: &SqlitePool,
-	tn_id: TnId,
-	profile: &Profile<&str>,
-	etag: &str,
-) -> ClResult<()> {
-	let typ = match profile.typ {
-		ProfileType::Person => "P",
-		ProfileType::Community => "C",
-	};
-
-	sqlx::query("INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, following, connected, trust, etag, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())")
-		.bind(tn_id.0)
-		.bind(profile.id_tag)
-		.bind(profile.name)
-		.bind(typ)
-		.bind(profile.profile_pic)
-		.bind(profile.following)
-		.bind(connected_to_db(profile.connected))
-		.bind(profile.trust.map(trust_to_db))
-		.bind(etag)
-		.execute(db)
-		.await
-		.map_err(|err| match &err {
-			sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
-				Error::Conflict("profile already exists".into())
-			}
-			_ => {
-				inspect(&err);
-				Error::DbError
-			}
-		})?;
-
-	Ok(())
-}
-
-/// Update an existing profile
-pub(crate) async fn update(
+/// Insert a profile row if missing, otherwise update it.
+pub(crate) async fn upsert(
 	db: &SqlitePool,
 	tn_id: TnId,
 	id_tag: &str,
-	profile: &UpdateProfileData,
-) -> ClResult<()> {
-	// Build dynamic UPDATE query based on what fields are present
+	fields: &UpsertProfileFields,
+) -> ClResult<UpsertResult> {
+	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+
+	// Resolve INSERT values from Patch. Note: `Patch::Null` and
+	// `Patch::Undefined` collapse to the same column default here — the
+	// INSERT branch can't distinguish "explicitly cleared" from "untouched."
+	// Both mean "no value yet"; UPDATE keeps them distinct (Undefined leaves
+	// the column alone, Null sets it to NULL). See `UpsertProfileFields` docs.
+	let insert_name: &str = match &fields.name {
+		Patch::Value(v) => v.as_ref(),
+		Patch::Null | Patch::Undefined => "",
+	};
+	let insert_type: Option<&str> = match &fields.typ {
+		Patch::Value(ProfileType::Person) => Some("P"),
+		Patch::Value(ProfileType::Community) => Some("C"),
+		Patch::Null | Patch::Undefined => None,
+	};
+	let insert_profile_pic: Option<&str> = match &fields.profile_pic {
+		Patch::Value(opt) => opt.as_ref().map(AsRef::as_ref),
+		Patch::Null | Patch::Undefined => None,
+	};
+	let insert_roles: Option<String> = match &fields.roles {
+		Patch::Value(opt) => opt
+			.as_ref()
+			.map(|roles| roles.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(",")),
+		Patch::Null | Patch::Undefined => None,
+	};
+	let insert_status: Option<&str> = match &fields.status {
+		Patch::Value(s) => Some(match s {
+			ProfileStatus::Active => "A",
+			ProfileStatus::Trusted => "T",
+			ProfileStatus::Blocked => "B",
+			ProfileStatus::Muted => "M",
+			ProfileStatus::Suspended => "S",
+			ProfileStatus::Banned => "X",
+		}),
+		Patch::Null | Patch::Undefined => None,
+	};
+	let insert_following: bool = match &fields.following {
+		Patch::Value(b) => *b,
+		Patch::Null | Patch::Undefined => false,
+	};
+	let insert_connected: Option<ConnectedDbValue> = match &fields.connected {
+		Patch::Value(s) => Some(connected_to_db(*s)),
+		Patch::Undefined => Some(ConnectedDbValue::Int(0)),
+		Patch::Null => None,
+	};
+	let insert_trust: Option<&str> = match &fields.trust {
+		Patch::Value(t) => Some(trust_to_db(*t)),
+		Patch::Null | Patch::Undefined => None,
+	};
+	let insert_etag: Option<&str> = match &fields.etag {
+		Patch::Value(v) => Some(v.as_ref()),
+		Patch::Null | Patch::Undefined => None,
+	};
+	let synced_at_now = matches!(&fields.synced, Patch::Value(true));
+
+	let insert_sql = if synced_at_now {
+		"INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, status, following, connected, roles, trust, synced_at, etag, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, unixepoch())
+		 ON CONFLICT(tn_id, id_tag) DO NOTHING"
+	} else {
+		"INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, status, following, connected, roles, trust, etag, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+		 ON CONFLICT(tn_id, id_tag) DO NOTHING"
+	};
+
+	let res = sqlx::query(insert_sql)
+		.bind(tn_id.0)
+		.bind(id_tag)
+		.bind(insert_name)
+		.bind(insert_type)
+		.bind(insert_profile_pic)
+		.bind(insert_status)
+		.bind(insert_following)
+		.bind(insert_connected)
+		.bind(insert_roles)
+		.bind(insert_trust)
+		.bind(insert_etag)
+		.execute(&mut *tx)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+	if res.rows_affected() > 0 {
+		tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		return Ok(UpsertResult::Created);
+	}
+
+	// Row already exists — update only the Patch::Value/Null fields.
 	let mut query = sqlx::QueryBuilder::new("UPDATE profiles SET ");
 	let mut has_updates = false;
 
-	// Profile content fields
-	has_updates = push_patch!(query, has_updates, "name", &profile.name, |v| v.as_ref());
-
-	has_updates = push_patch!(query, has_updates, "profile_pic", &profile.profile_pic, |v| {
+	has_updates = push_patch!(query, has_updates, "name", &fields.name, |v| v.as_ref());
+	has_updates = push_patch!(query, has_updates, "type", &fields.typ, |v| match v {
+		ProfileType::Person => "P",
+		ProfileType::Community => "C",
+	});
+	has_updates = push_patch!(query, has_updates, "profile_pic", &fields.profile_pic, |v| {
 		v.as_ref().map(AsRef::as_ref)
 	});
-
-	has_updates = push_patch!(query, has_updates, "roles", &profile.roles, |v| {
+	has_updates = push_patch!(query, has_updates, "roles", &fields.roles, |v| {
 		v.as_ref()
 			.map(|roles| roles.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(","))
 	});
-
-	// Status and moderation
-	has_updates = push_patch!(query, has_updates, "status", &profile.status, |v| match v {
+	has_updates = push_patch!(query, has_updates, "status", &fields.status, |v| match v {
 		ProfileStatus::Active => "A",
 		ProfileStatus::Trusted => "T",
 		ProfileStatus::Blocked => "B",
@@ -381,52 +432,39 @@ pub(crate) async fn update(
 		ProfileStatus::Suspended => "S",
 		ProfileStatus::Banned => "X",
 	});
-
-	// synced is special - true means set to now, false means don't update
 	has_updates = push_patch!(
 		query,
 		has_updates,
 		"synced_at",
-		&profile.synced,
+		&fields.synced,
 		expr | v | { if *v { Some("unixepoch()") } else { None } }
 	);
-
-	has_updates = push_patch!(query, has_updates, "following", &profile.following);
-
-	has_updates = push_patch!(query, has_updates, "connected", &profile.connected, |v| match v {
+	has_updates = push_patch!(query, has_updates, "following", &fields.following);
+	has_updates = push_patch!(query, has_updates, "connected", &fields.connected, |v| match v {
 		ProfileConnectionStatus::Disconnected => ConnectedDbValue::Int(0),
 		ProfileConnectionStatus::RequestPending => ConnectedDbValue::Text("R"),
 		ProfileConnectionStatus::Connected => ConnectedDbValue::Int(1),
 	});
+	has_updates = push_patch!(query, has_updates, "trust", &fields.trust, |v| trust_to_db(*v));
+	has_updates = push_patch!(query, has_updates, "etag", &fields.etag, |v| v.as_ref());
 
-	has_updates = push_patch!(query, has_updates, "trust", &profile.trust, |v| trust_to_db(*v));
+	if has_updates {
+		query
+			.push(" WHERE tn_id=")
+			.push_bind(tn_id.0)
+			.push(" AND id_tag=")
+			.push_bind(id_tag);
 
-	// Sync metadata
-	has_updates = push_patch!(query, has_updates, "etag", &profile.etag, |v| v.as_ref());
-
-	if !has_updates {
-		// No fields to update, but not an error
-		return Ok(());
+		query
+			.build()
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
 	}
 
-	query
-		.push(" WHERE tn_id=")
-		.push_bind(tn_id.0)
-		.push(" AND id_tag=")
-		.push_bind(id_tag);
-
-	let res = query
-		.build()
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-
-	if res.rows_affected() == 0 {
-		return Err(Error::NotFound);
-	}
-
-	Ok(())
+	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	Ok(UpsertResult::Updated)
 }
 
 /// Read a public key from the cache
@@ -468,37 +506,6 @@ pub(crate) async fn add_public_key(
 	Ok(())
 }
 
-type RefreshCallback<'a> = Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>;
-
-/// Process profiles that need refreshing
-pub(crate) async fn process_refresh(db: &SqlitePool, callback: RefreshCallback<'_>) {
-	// Query profiles that need refreshing (e.g., synced_at is old or NULL)
-	let res = sqlx::query(
-		"SELECT tn_id, id_tag, etag FROM profiles
-		WHERE synced_at IS NULL OR synced_at < unixepoch() - 3600
-		LIMIT 100",
-	)
-	.fetch_all(db)
-	.await;
-
-	if let Ok(rows) = res {
-		for row in rows {
-			if let (Ok(tn_id_val), Ok(id_tag), Ok(etag)) = (
-				row.try_get::<i64, _>("tn_id"),
-				row.try_get::<Box<str>, _>("id_tag"),
-				row.try_get::<Option<Box<str>>, _>("etag"),
-			) {
-				let tn_id = TnId(u32::try_from(tn_id_val).unwrap_or_default());
-				// Use Box::leak to extend lifetime - profile data is long-lived
-				let id_tag_static: &'static str = Box::leak(id_tag);
-				let etag_static: Option<&'static str> = etag.map(|s| Box::leak(s) as &'static str);
-
-				let _ = callback(tn_id, id_tag_static, etag_static);
-			}
-		}
-	}
-}
-
 /// List stale profiles that need refreshing
 ///
 /// Returns profiles where `synced_at IS NULL OR synced_at < now - max_age_secs`.
@@ -525,7 +532,7 @@ pub(crate) async fn list_stale_profiles(
 		let id_tag: Box<str> = row.try_get("id_tag").map_err(|_| Error::DbError)?;
 		let etag: Option<Box<str>> = row.try_get("etag").map_err(|_| Error::DbError)?;
 
-		results.push((TnId(u32::try_from(tn_id_val).unwrap_or_default()), id_tag, etag));
+		results.push((TnId(u32::try_from(tn_id_val).map_err(|_| Error::DbError)?), id_tag, etag));
 	}
 
 	Ok(results)
@@ -547,7 +554,8 @@ pub(crate) async fn get_info(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClRe
 		_ => Error::DbError,
 	})?;
 
-	let typ: String = row.get("type");
+	let typ: Option<String> = row.try_get("type").map_err(|_| Error::DbError)?;
+	let typ = typ.ok_or(Error::NotFound)?;
 	let created_at: i64 = row.get("created_at");
 
 	Ok(ProfileData {

@@ -37,7 +37,7 @@ use cloudillo_types::{
 		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
 		ProfileData, PushSubscription, PushSubscriptionData, RefData, ShareEntry, Task, TaskPatch,
 		Tenant, TenantListMeta, UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData,
-		UpdateFileOptions, UpdateProfileData, UpdateTenantData,
+		UpdateFileOptions, UpdateTenantData, UpsertProfileFields, UpsertResult,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -156,21 +156,13 @@ impl MetaAdapter for MetaAdapterSqlite {
 		profile::read_roles(&self.dbr, tn_id, id_tag).await
 	}
 
-	async fn create_profile(
-		&self,
-		tn_id: TnId,
-		profile: &Profile<&str>,
-		etag: &str,
-	) -> ClResult<()> {
-		profile::create(&self.db, tn_id, profile, etag).await
-	}
-	async fn update_profile(
+	async fn upsert_profile(
 		&self,
 		tn_id: TnId,
 		id_tag: &str,
-		profile: &UpdateProfileData,
-	) -> ClResult<()> {
-		profile::update(&self.db, tn_id, id_tag, profile).await
+		fields: &UpsertProfileFields,
+	) -> ClResult<UpsertResult> {
+		profile::upsert(&self.db, tn_id, id_tag, fields).await
 	}
 
 	async fn read_profile_public_key(
@@ -188,13 +180,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 		public_key: &str,
 	) -> ClResult<()> {
 		profile::add_public_key(&self.db, id_tag, key_id, public_key).await
-	}
-
-	async fn process_profile_refresh<'a>(
-		&self,
-		callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>,
-	) {
-		profile::process_refresh(&self.dbr, callback).await;
 	}
 
 	async fn list_stale_profiles(

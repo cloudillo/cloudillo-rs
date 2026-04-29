@@ -166,7 +166,7 @@ async fn execute_hook(
 		.created_at(format!("{}", action.created_at.0))
 		.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
 		.tenant(
-			i64::from(tn_id.0),
+			tn_id,
 			tenant.id_tag.to_string(),
 			match tenant.typ {
 				meta_adapter::ProfileType::Community => "community",

@@ -22,7 +22,7 @@ use crate::task::{CreateAction, create_action};
 /// - If CONV has an audience (community), SUBS federates to the community
 /// - SUBS issuer is the creator (self-issued) ensuring proper ownership
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 
 	tracing::info!(
 		"CONV: Creating conversation {} by {}, audience={:?}",

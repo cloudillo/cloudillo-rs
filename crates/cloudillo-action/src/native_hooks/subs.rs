@@ -23,7 +23,7 @@ use cloudillo_types::meta_adapter::UpdateActionDataOptions;
 /// - Closed: check for INVT (invitation) action -> accept if invited
 /// - Otherwise: reject
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 
 	// Get the target action (subject)
 	let Some(subject_id) = &context.subject else {
@@ -136,7 +136,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				.ok()
 				.flatten();
 
-			if existing_subs.is_none() {
+			let Some(existing) = existing_subs else {
 				tracing::warn!(
 					"SUBS:UPD: No existing subscription for {} on {}",
 					context.issuer,
@@ -148,6 +148,37 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					.meta_adapter
 					.update_action_data(tn_id, &context.action_id, &update_opts)
 					.await;
+				return Ok(HookResult { continue_processing: false, ..Default::default() });
+			};
+
+			// Only an active ('A') subscription may be updated. A rejected ('R'),
+			// pending ('P'), or deleted ('D') subscription must not silently
+			// reactivate via UPD — that would let a rejected subscriber
+			// self-promote back to Active. `get_action_by_key` does not return
+			// the status column, so re-read the action via `get_action`.
+			let existing_status =
+				match app.meta_adapter.get_action(tn_id, existing.action_id.as_ref()).await {
+					Ok(Some(view)) => {
+						view.status.as_deref().and_then(|s| s.chars().next()).unwrap_or('R')
+					}
+					_ => 'R',
+				};
+			if existing_status != 'A' {
+				tracing::warn!(
+					"SUBS:UPD: Refusing update from {} on {} - existing status '{}' is not Active",
+					context.issuer,
+					subject_id,
+					existing_status
+				);
+				let update_opts =
+					UpdateActionDataOptions { status: Patch::Value('R'), ..Default::default() };
+				if let Err(e) = app
+					.meta_adapter
+					.update_action_data(tn_id, &context.action_id, &update_opts)
+					.await
+				{
+					tracing::warn!("SUBS:UPD: Failed to update action status to R: {}", e);
+				}
 				return Ok(HookResult { continue_processing: false, ..Default::default() });
 			}
 
@@ -194,7 +225,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 /// Logic:
 /// - Auto-subscribe creator to their own actions
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 
 	tracing::debug!("SUBS on_create: {} subscribing to {:?}", context.issuer, context.subject);
 

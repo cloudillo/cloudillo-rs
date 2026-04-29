@@ -187,27 +187,33 @@ impl<'a> OperationExecutor<'a> {
 
 		tracing::debug!("DSL: update_profile target={} updates={:?}", target_tag, profile_updates);
 
-		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+		let tn_id = context.tn_id;
 
-		// Extract fields from profile_updates and build UpdateProfileData
+		// DSL `update_profile` is an UPDATE — the underlying meta adapter
+		// `upsert_profile` would silently insert a stub on a missing target,
+		// changing the prior NotFound semantic. Pre-check existence so DSL
+		// authors get the same error they got before the upsert migration.
+		match self.app.meta_adapter.read_profile(tn_id, &target_tag).await {
+			Ok(_) => {}
+			Err(Error::NotFound) => return Err(Error::NotFound),
+			Err(e) => return Err(e),
+		}
+
+		// Extract fields from profile_updates and build the upsert
 		let name = profile_updates
 			.get("name")
 			.and_then(|v| v.as_str())
 			.map(std::string::ToString::to_string);
 
-		let profile_update = cloudillo_types::meta_adapter::UpdateProfileData {
+		let upsert = cloudillo_types::meta_adapter::UpsertProfileFields {
 			name: name.map_or(cloudillo_types::types::Patch::Undefined, |s| {
 				cloudillo_types::types::Patch::Value(s.into())
 			}),
 			..Default::default()
 		};
 
-		// Update profile via meta adapter
-		self.app
-			.meta_adapter
-			.update_profile(tn_id, &target_tag, &profile_update)
-			.await?;
+		// Upsert profile via meta adapter (target existence pre-checked above)
+		self.app.meta_adapter.upsert_profile(tn_id, &target_tag, &upsert).await?;
 
 		tracing::info!(
 			tenant_id = %tn_id.0,
@@ -232,8 +238,7 @@ impl<'a> OperationExecutor<'a> {
 
 		tracing::debug!("DSL: get_profile target={}", target_tag);
 
-		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+		let tn_id = context.tn_id;
 
 		// Get profile via meta adapter
 		let (_etag, profile) = self.app.meta_adapter.read_profile(tn_id, &target_tag).await?;
@@ -315,8 +320,7 @@ impl<'a> OperationExecutor<'a> {
 			audience_val
 		);
 
-		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+		let tn_id = context.tn_id;
 
 		// Build CreateAction struct
 		let create_action = crate::task::CreateAction {
@@ -376,8 +380,7 @@ impl<'a> OperationExecutor<'a> {
 
 		tracing::debug!("DSL: get_action key={:?} action_id={:?}", key_val, action_id_val);
 
-		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+		let tn_id = context.tn_id;
 
 		// Retrieve action by key or action_id
 		let action_result = if let Some(key) = key_val {
@@ -474,8 +477,7 @@ impl<'a> OperationExecutor<'a> {
 
 		tracing::debug!("DSL: update_action target={}", action_id);
 
-		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+		let tn_id = context.tn_id;
 
 		// Fetch current action data for increment/decrement operations
 		let action_data = self.app.meta_adapter.get_action_data(tn_id, &action_id).await?;
@@ -499,14 +501,17 @@ impl<'a> OperationExecutor<'a> {
 					update_opts.status = if value.is_null() {
 						Patch::Null
 					} else if let Some(s) = value.as_str() {
-						// Map human-readable status names to single-char codes
 						let status_char = match s {
 							"confirmation" => 'C',
 							"notification" => 'N',
 							"active" => 'A',
 							"pending" => 'P',
 							"deleted" => 'D',
-							_ => s.chars().next().unwrap_or('A'),
+							other => {
+								return Err(Error::ValidationError(format!(
+									"unknown status value: {other}"
+								)));
+							}
 						};
 						Patch::Value(status_char)
 					} else {
@@ -563,11 +568,15 @@ impl<'a> OperationExecutor<'a> {
 									"increment value must be a number".to_string(),
 								)
 							})?)
-							.unwrap_or_default();
+							.map_err(|_| {
+								Error::ValidationError(
+									"increment value out of u32 range".to_string(),
+								)
+							})?;
 
 							let current =
 								action_data.as_ref().and_then(|d| d.comments).unwrap_or(0);
-							Value::from(current + inc_val)
+							Value::from(current.saturating_add(inc_val))
 						}
 						UpdateValue::Decrement { decrement } => {
 							let dec = self.evaluator.evaluate(decrement, context)?;
@@ -576,7 +585,11 @@ impl<'a> OperationExecutor<'a> {
 									"decrement value must be a number".to_string(),
 								)
 							})?)
-							.unwrap_or_default();
+							.map_err(|_| {
+								Error::ValidationError(
+									"decrement value out of u32 range".to_string(),
+								)
+							})?;
 
 							let current =
 								action_data.as_ref().and_then(|d| d.comments).unwrap_or(0);
@@ -586,7 +599,9 @@ impl<'a> OperationExecutor<'a> {
 					update_opts.comments = if value.is_null() {
 						Patch::Null
 					} else if let Some(v) = value.as_u64() {
-						Patch::Value(u32::try_from(v).unwrap_or_default())
+						Patch::Value(u32::try_from(v).map_err(|_| {
+							Error::ValidationError("comments value out of u32 range".to_string())
+						})?)
 					} else {
 						Patch::Undefined
 					};
@@ -625,8 +640,7 @@ impl<'a> OperationExecutor<'a> {
 
 		tracing::debug!("DSL: delete_action target={}", action_id);
 
-		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+		let tn_id = context.tn_id;
 
 		// Delete action via meta adapter
 		self.app.meta_adapter.delete_action(tn_id, &action_id).await?;
@@ -799,18 +813,21 @@ impl<'a> OperationExecutor<'a> {
 			return Err(Error::ValidationError("action_id must be a string".to_string()));
 		};
 
+		// `token` is part of the operation schema for forward-compatibility
+		// (delivery tasks pull the token from the action_tokens table directly,
+		// so the DSL-supplied value is currently unused). Validate the type so
+		// authors get a clear error if they pass garbage.
 		let token_val = self.evaluator.evaluate(token, context)?;
-		let Value::String(_token_str) = token_val else {
+		if !matches!(token_val, Value::String(_)) {
 			return Err(Error::ValidationError("token must be a string".to_string()));
-		};
+		}
 
 		tracing::debug!(
 			"DSL: broadcast_to_followers action_id={} (querying for followers)",
 			action_id_str
 		);
 
-		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+		let tn_id = context.tn_id;
 
 		// Query for FLLW and CONN actions to find followers
 		let follower_actions = self
@@ -888,10 +905,12 @@ impl<'a> OperationExecutor<'a> {
 			return Err(Error::ValidationError("action_id must be a string".to_string()));
 		};
 
+		// `token` is reserved for future DSL extensibility — see
+		// `execute_broadcast_to_followers` for context.
 		let token_val = self.evaluator.evaluate(token, context)?;
-		let Value::String(_token_str) = token_val else {
+		if !matches!(token_val, Value::String(_)) {
 			return Err(Error::ValidationError("token must be a string".to_string()));
-		};
+		}
 
 		let audience_val = self.evaluator.evaluate(audience, context)?;
 		let Value::String(audience_tag) = audience_val else {
@@ -904,8 +923,7 @@ impl<'a> OperationExecutor<'a> {
 			audience_tag
 		);
 
-		// Convert tenant_id from i64 to TnId
-		let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+		let tn_id = context.tn_id;
 
 		// Don't send to self
 		if audience_tag.as_str() == context.tenant_tag.as_str() {
@@ -1004,15 +1022,14 @@ impl<'a> OperationExecutor<'a> {
 		});
 
 		// Send notification to user via direct messaging
-		let tn_id =
-			cloudillo_types::types::TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+		let tn_id = context.tn_id;
 		let broadcast_msg =
 			BroadcastMessage::new("notification", notification_data, context.tenant_tag.clone());
 
 		let _ = self.app.broadcast.send_to_user(tn_id, &user_id, broadcast_msg).await;
 
 		tracing::info!(
-			tenant_id = %context.tenant_id,
+			tenant_id = %context.tn_id,
 			user = %user_id,
 			notification_type = %notification_type,
 			action_id = %action_id_str,

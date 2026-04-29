@@ -7,7 +7,7 @@ use crate::prelude::*;
 use cloudillo_core::request::ConditionalResult;
 use cloudillo_core::scheduler::Task;
 use cloudillo_types::meta_adapter::{
-	Profile, ProfileConnectionStatus, ProfileType, UpdateProfileData,
+	ProfileConnectionStatus, ProfileType, UpsertProfileFields, UpsertResult,
 };
 use cloudillo_types::types::ApiResponse;
 
@@ -82,48 +82,30 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 				None
 			};
 
-			// Create local profile record (with profile_pic only if sync succeeded)
-			let profile = Profile {
-				id_tag: remote.id_tag.as_str(),
-				name: remote.name.as_str(),
-				typ,
-				profile_pic: synced_profile_pic,
-				following: false, // Will be set by the calling hook
-				connected: ProfileConnectionStatus::Disconnected,
-				roles: None,
-				trust: None,
-			};
-
-			// Generate a simple etag
 			let etag = format!("sync-{}", Timestamp::now().0);
 
-			match app.meta_adapter.create_profile(tn_id, &profile, &etag).await {
-				Ok(()) => {
-					tracing::info!("Successfully synced profile {} from remote", id_tag);
-					Ok(true)
-				}
-				Err(Error::Conflict(_)) => {
-					tracing::debug!("Profile {} created concurrently, skipping", id_tag);
-					// If we downloaded a picture the winner didn't set, surface it.
-					if let Some(file_id) = synced_profile_pic {
-						let update = UpdateProfileData {
-							profile_pic: Patch::Value(Some(file_id.into())),
-							..Default::default()
-						};
-						if let Err(e) =
-							app.meta_adapter.update_profile(tn_id, id_tag, &update).await
-						{
-							tracing::debug!(
-								"Could not surface synced profile_pic for {}: {}",
-								id_tag,
-								e
-							);
-						}
-					}
-					Ok(false)
-				}
-				Err(e) => Err(e),
+			let fields = UpsertProfileFields {
+				name: Patch::Value(remote.name.clone().into()),
+				typ: Patch::Value(typ),
+				profile_pic: Patch::Value(synced_profile_pic.map(Into::into)),
+				synced: Patch::Value(true),
+				following: Patch::Value(false),
+				connected: Patch::Value(ProfileConnectionStatus::Disconnected),
+				etag: Patch::Value(etag.clone().into()),
+				..Default::default()
+			};
+
+			let result = app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
+			let created = matches!(result, UpsertResult::Created);
+			if created {
+				tracing::info!("Successfully synced profile {} from remote", id_tag);
+			} else {
+				tracing::debug!(
+					"Profile {} already existed; merged sync result via upsert",
+					id_tag
+				);
 			}
+			Ok(created)
 		}
 		Err(e) => {
 			tracing::warn!("Failed to fetch profile {} from remote: {}", id_tag, e);
@@ -158,9 +140,9 @@ pub async fn refresh_profile(
 			// Profile hasn't changed, just update synced_at
 			tracing::debug!("Profile {} not modified (304), updating synced_at", id_tag);
 
-			let update = UpdateProfileData { synced: Patch::Value(true), ..Default::default() };
+			let fields = UpsertProfileFields { synced: Patch::Value(true), ..Default::default() };
 
-			app.meta_adapter.update_profile(tn_id, id_tag, &update).await?;
+			app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
 			Ok(false)
 		}
 		Ok(ConditionalResult::Modified { data: api_response, etag: new_etag }) => {
@@ -203,27 +185,34 @@ pub async fn refresh_profile(
 				false
 			};
 
-			// Build update - only include profile_pic if sync succeeded
-			let mut update = UpdateProfileData {
-				name: Patch::Value(remote.name.into()),
+			// Determine remote profile type
+			let typ = match remote.r#type.as_str() {
+				"community" => ProfileType::Community,
+				_ => ProfileType::Person,
+			};
+
+			// Build upsert - only include profile_pic if sync succeeded
+			let mut fields = UpsertProfileFields {
+				name: Patch::Value(remote.name.clone().into()),
+				typ: Patch::Value(typ),
 				synced: Patch::Value(true),
 				..Default::default()
 			};
 
 			// Only update profile_pic if we successfully synced it (or it was removed)
 			if profile_pic_synced {
-				update.profile_pic = Patch::Value(remote.profile_pic.clone().map(Into::into));
+				fields.profile_pic = Patch::Value(remote.profile_pic.clone().map(Into::into));
 			}
 
 			// Only update etag if profile_pic sync succeeded (or wasn't needed)
 			// This ensures we'll retry on next sync if the picture failed
 			if (profile_pic_synced || !profile_pic_changed)
-				&& let Some(etag) = new_etag
+				&& let Some(etag) = new_etag.as_deref()
 			{
-				update.etag = Patch::Value(etag);
+				fields.etag = Patch::Value(etag.into());
 			}
 
-			app.meta_adapter.update_profile(tn_id, id_tag, &update).await?;
+			app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
 
 			Ok(true)
 		}
@@ -231,8 +220,8 @@ pub async fn refresh_profile(
 			tracing::warn!("Failed to refresh profile {}: {}", id_tag, e);
 			// Don't propagate error - just log and return false
 			// Still update synced_at to avoid repeated retries
-			let update = UpdateProfileData { synced: Patch::Value(true), ..Default::default() };
-			let _ = app.meta_adapter.update_profile(tn_id, id_tag, &update).await;
+			let fields = UpsertProfileFields { synced: Patch::Value(true), ..Default::default() };
+			let _ = app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await;
 			Ok(false)
 		}
 	}

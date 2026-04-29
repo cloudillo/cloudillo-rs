@@ -160,7 +160,7 @@ pub struct HookContext {
 	pub expires_at: Option<String>,
 
 	// Context
-	pub tenant_id: i64,
+	pub tn_id: TnId,
 	pub tenant_tag: String,
 	pub tenant_type: String,
 
@@ -184,7 +184,6 @@ impl HookContext {
 }
 
 /// Builder for HookContext with fluent API
-#[derive(Default)]
 pub struct HookContextBuilder {
 	action_id: String,
 	r#type: String,
@@ -197,13 +196,38 @@ pub struct HookContextBuilder {
 	attachments: Option<Vec<String>>,
 	created_at: String,
 	expires_at: Option<String>,
-	tenant_id: i64,
+	tn_id: TnId,
 	tenant_tag: String,
 	tenant_type: String,
 	is_inbound: bool,
 	is_outbound: bool,
 	client_address: Option<String>,
 	vars: HashMap<String, serde_json::Value>,
+}
+
+impl Default for HookContextBuilder {
+	fn default() -> Self {
+		Self {
+			action_id: String::new(),
+			r#type: String::new(),
+			subtype: None,
+			issuer: String::new(),
+			audience: None,
+			parent: None,
+			subject: None,
+			content: None,
+			attachments: None,
+			created_at: String::new(),
+			expires_at: None,
+			tn_id: TnId(0),
+			tenant_tag: String::new(),
+			tenant_type: String::new(),
+			is_inbound: false,
+			is_outbound: false,
+			client_address: None,
+			vars: HashMap::new(),
+		}
+	}
 }
 
 impl HookContextBuilder {
@@ -274,8 +298,8 @@ impl HookContextBuilder {
 	}
 
 	/// Set tenant info
-	pub fn tenant(mut self, id: i64, tag: impl Into<String>, typ: impl Into<String>) -> Self {
-		self.tenant_id = id;
+	pub fn tenant(mut self, id: TnId, tag: impl Into<String>, typ: impl Into<String>) -> Self {
+		self.tn_id = id;
 		self.tenant_tag = tag.into();
 		self.tenant_type = typ.into();
 		self
@@ -321,7 +345,7 @@ impl HookContextBuilder {
 			attachments: self.attachments,
 			created_at: self.created_at,
 			expires_at: self.expires_at,
-			tenant_id: self.tenant_id,
+			tn_id: self.tn_id,
 			tenant_tag: self.tenant_tag,
 			tenant_type: self.tenant_type,
 			is_inbound: self.is_inbound,
@@ -470,7 +494,7 @@ mod tests {
 			attachments: None,
 			created_at: "2025-11-09T00:00:00Z".to_string(),
 			expires_at: None,
-			tenant_id: 1,
+			tn_id: TnId(1),
 			tenant_tag: "dev".to_string(),
 			tenant_type: "user".to_string(),
 			is_inbound: false,

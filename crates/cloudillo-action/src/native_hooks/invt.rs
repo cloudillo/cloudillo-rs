@@ -22,7 +22,7 @@ use cloudillo_types::meta_adapter::UpdateActionDataOptions;
 /// - Check inviter has active SUBS on target with moderator+ role
 /// - Creator of target action can always invite
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 
 	let Some(subject_id) = &context.subject else {
 		tracing::warn!("INVT on_create: No subject specified");
@@ -90,7 +90,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// - CONV home: Store for SUBS validation (status stays 'A')
 /// - Invitee: Set status to 'C' (confirmation) so user can accept/reject
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 
 	tracing::info!(
 		"INVT: Received invitation for {} from {} to action {:?}",
@@ -161,7 +161,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 /// - SUBS targets the subject (group/action) from the invitation
 /// - SUBS will auto-accept because INVT exists (see subs.rs on_receive)
 pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 
 	// INVT structure:
 	// - issuer = person who invited (Alice)

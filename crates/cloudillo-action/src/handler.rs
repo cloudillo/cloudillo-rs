@@ -316,11 +316,16 @@ pub async fn post_action_accept(
 	// Fetch the action from database
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
-	// Verify the caller is the action's audience (or the tenant owner)
-	if let Some(ref aud) = action.audience
-		&& aud.id_tag.as_ref() != auth.id_tag.as_ref()
-		&& id_tag.as_ref() != auth.id_tag.as_ref()
-	{
+	// Verify the caller is the action's audience (or the tenant owner).
+	// When the action has no audience (broadcast actions like FLLW/SUBS), only
+	// the tenant owner may accept/reject — otherwise any authenticated user
+	// could resolve actions targeted at the tenant.
+	let caller_is_audience = action
+		.audience
+		.as_ref()
+		.is_some_and(|aud| aud.id_tag.as_ref() == auth.id_tag.as_ref());
+	let caller_is_tenant = id_tag.as_ref() == auth.id_tag.as_ref();
+	if !caller_is_audience && !caller_is_tenant {
 		return Err(Error::PermissionDenied);
 	}
 
@@ -346,7 +351,7 @@ pub async fn post_action_accept(
 			)
 			.created_at(format!("{}", action.created_at.0))
 			.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
-			.tenant(i64::from(tn_id.0), &*id_tag, "person")
+			.tenant(tn_id, &*id_tag, "person")
 			.inbound()
 			.build();
 
@@ -435,11 +440,16 @@ pub async fn post_action_reject(
 	// Fetch the action from database
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
-	// Verify the caller is the action's audience (or the tenant owner)
-	if let Some(ref aud) = action.audience
-		&& aud.id_tag.as_ref() != auth.id_tag.as_ref()
-		&& id_tag.as_ref() != auth.id_tag.as_ref()
-	{
+	// Verify the caller is the action's audience (or the tenant owner).
+	// When the action has no audience (broadcast actions like FLLW/SUBS), only
+	// the tenant owner may accept/reject — otherwise any authenticated user
+	// could resolve actions targeted at the tenant.
+	let caller_is_audience = action
+		.audience
+		.as_ref()
+		.is_some_and(|aud| aud.id_tag.as_ref() == auth.id_tag.as_ref());
+	let caller_is_tenant = id_tag.as_ref() == auth.id_tag.as_ref();
+	if !caller_is_audience && !caller_is_tenant {
 		return Err(Error::PermissionDenied);
 	}
 
@@ -465,7 +475,7 @@ pub async fn post_action_reject(
 			)
 			.created_at(format!("{}", action.created_at.0))
 			.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
-			.tenant(i64::from(tn_id.0), &*id_tag, "person")
+			.tenant(tn_id, &*id_tag, "person")
 			.inbound()
 			.build();
 

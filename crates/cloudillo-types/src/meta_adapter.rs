@@ -18,8 +18,9 @@ use crate::{
 
 // Tenants, profiles
 //*******************
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum ProfileType {
+	#[default]
 	#[serde(rename = "person")]
 	Person,
 	#[serde(rename = "community")]
@@ -254,6 +255,70 @@ pub struct UpdateProfileData {
 	// Sync metadata
 	#[serde(default)]
 	pub etag: Patch<Box<str>>,
+}
+
+/// Outcome of an `upsert_profile` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsertResult {
+	/// The profile row did not exist and was inserted.
+	Created,
+	/// The profile row existed and was updated.
+	Updated,
+}
+
+/// Fields for `MetaAdapter::upsert_profile`.
+///
+/// All fields are `Patch` and apply to both INSERT and UPDATE:
+/// * `Patch::Value(v)` / `Patch::Null` → set the column on both branches.
+/// * `Patch::Undefined` → leave the column at its current value on UPDATE,
+///   and use the column default (NULL or `""` for `name`) on INSERT.
+///
+/// **Note on the INSERT branch:** `Patch::Null` and `Patch::Undefined`
+/// collapse to the same column default for most fields — the INSERT can't
+/// distinguish "user explicitly set to NULL" from "user didn't touch this
+/// field." This is fine semantically (both mean "no value here"), but
+/// differs from UPDATE, which preserves the existing value on `Undefined`.
+///
+/// **Stub-row idiom:** `upsert_profile` creates a row with `type = NULL`
+/// when `typ` is `Patch::Undefined`. These stub rows are filtered out of
+/// `list_profiles` (which requires `type IS NOT NULL`), but `read_profile` /
+/// `get_info` will return `Error::NotFound` for them. This is intentional:
+/// relationship hooks (FOLLOW, FSHR) create stubs first and federation sync
+/// populates `type` later. Callers performing read-then-write should not
+/// rely on `read_profile` finding a freshly-inserted stub.
+#[derive(Default)]
+pub struct UpsertProfileFields {
+	pub name: Patch<Box<str>>,
+	pub typ: Patch<ProfileType>,
+	pub profile_pic: Patch<Option<Box<str>>>,
+	pub roles: Patch<Option<Vec<Box<str>>>>,
+	pub status: Patch<ProfileStatus>,
+	pub synced: Patch<bool>,
+	pub following: Patch<bool>,
+	pub connected: Patch<ProfileConnectionStatus>,
+	pub trust: Patch<ProfileTrust>,
+	pub etag: Patch<Box<str>>,
+}
+
+impl UpsertProfileFields {
+	/// Build an `UpsertProfileFields` from an existing `UpdateProfileData`.
+	///
+	/// `typ` is left `Undefined` — callers that know the profile type should
+	/// set it explicitly.
+	pub fn from_update(update: UpdateProfileData) -> Self {
+		Self {
+			name: update.name,
+			typ: Patch::Undefined,
+			profile_pic: update.profile_pic,
+			roles: update.roles,
+			status: update.status,
+			synced: update.synced,
+			following: update.following,
+			connected: update.connected,
+			trust: update.trust,
+			etag: update.etag,
+		}
+	}
 }
 
 // Actions
@@ -1034,18 +1099,18 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		id_tag: &str,
 	) -> ClResult<Option<Box<[Box<str>]>>>;
 
-	async fn create_profile(
-		&self,
-		tn_id: TnId,
-		profile: &Profile<&str>,
-		etag: &str,
-	) -> ClResult<()>;
-	async fn update_profile(
+	/// Insert a profile row if missing, otherwise update it.
+	///
+	/// Returns `UpsertResult::Created` if the row was inserted, or
+	/// `UpsertResult::Updated` if an existing row was updated. Never returns
+	/// `Error::Conflict` or `Error::NotFound` — the operation is idempotent
+	/// with respect to row existence.
+	async fn upsert_profile(
 		&self,
 		tn_id: TnId,
 		id_tag: &str,
-		profile: &UpdateProfileData,
-	) -> ClResult<()>;
+		fields: &UpsertProfileFields,
+	) -> ClResult<UpsertResult>;
 
 	/// Reads the public key of a profile
 	///
@@ -1061,16 +1126,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		key_id: &str,
 		public_key: &str,
 	) -> ClResult<()>;
-	/// Process profile refresh
-	/// callback(tn_id: TnId, id_tag: &str, etag: Option<&str>)
-	//async fn process_profile_refresh(&self, callback: FnOnce<(TnId, &str, Option<&str>)>);
-	//async fn process_profile_refresh<'a, F>(&self, callback: F)
-	//	where F: FnOnce(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send;
-	async fn process_profile_refresh<'a>(
-		&self,
-		callback: Box<dyn Fn(TnId, &'a str, Option<&'a str>) -> ClResult<()> + Send>,
-	);
-
 	/// List stale profiles that need refreshing
 	///
 	/// Returns profiles where `synced_at IS NULL OR synced_at < now - max_age_secs`.

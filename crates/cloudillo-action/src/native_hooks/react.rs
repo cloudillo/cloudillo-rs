@@ -20,10 +20,7 @@ use cloudillo_types::meta_adapter::UpdateActionDataOptions;
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: REACT on_create for action {}", context.action_id);
 
-	let tn_id = TnId(
-		u32::try_from(context.tenant_id)
-			.map_err(|_| Error::Internal("tenant_id overflow".into()))?,
-	);
+	let tn_id = context.tn_id;
 	let Some(subject_id) = &context.subject else {
 		tracing::warn!("REACT on_create: No subject specified");
 		return Ok(HookResult::default());
@@ -65,10 +62,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: REACT on_receive for action {}", context.action_id);
 
-	let tn_id = TnId(
-		u32::try_from(context.tenant_id)
-			.map_err(|_| Error::Internal("tenant_id overflow".into()))?,
-	);
+	let tn_id = context.tn_id;
 	let Some(subject_id) = &context.subject else {
 		tracing::warn!("REACT on_receive: No subject specified");
 		return Ok(HookResult::default());

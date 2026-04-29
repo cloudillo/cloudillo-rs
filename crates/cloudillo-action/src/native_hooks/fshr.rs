@@ -17,7 +17,7 @@ use cloudillo_types::meta_adapter::{CreateFile, FileStatus, UpdateActionDataOpti
 /// - If we are the audience and subType is not DEL, set status to 'C' (confirmation required)
 /// - DEL subtype doesn't require confirmation
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 
 	tracing::debug!(
 		"Native hook: FSHR on_receive for action {} from {} to {:?}",
@@ -57,7 +57,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 /// - Parse content to get fileName and contentType
 /// - Create file entry with status 'M' (mutable/shared) and owner_tag from issuer
 pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 
 	tracing::debug!(
 		"Native hook: FSHR on_accept for action {} from {}",

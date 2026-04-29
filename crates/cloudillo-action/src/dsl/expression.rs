@@ -41,6 +41,14 @@ impl ExpressionEvaluator {
 
 	/// Evaluate an expression in the given context
 	pub fn evaluate(&mut self, expr: &Expression, context: &HookContext) -> ClResult<Value> {
+		// Reset node count when entering a fresh top-level expression. The
+		// MAX_NODES cap is meant to bound a single expression tree, but
+		// `OperationExecutor` reuses one evaluator across every operation in a
+		// hook — without this reset, a long-running hook would eventually trip
+		// the cap on trivial expressions.
+		if self.depth == 0 {
+			self.node_count = 0;
+		}
 		self.depth += 1;
 		self.node_count += 1;
 
@@ -169,7 +177,10 @@ impl ExpressionEvaluator {
 			// Context object
 			"context" => {
 				let mut obj = serde_json::Map::new();
-				obj.insert("tenant_id".to_string(), Value::Number(context.tenant_id.into()));
+				obj.insert(
+					"tenant_id".to_string(),
+					Value::Number(u64::from(context.tn_id.0).into()),
+				);
 				obj.insert("tenant_tag".to_string(), Value::String(context.tenant_tag.clone()));
 				obj.insert("tenant_type".to_string(), Value::String(context.tenant_type.clone()));
 				Value::Object(obj)
@@ -469,7 +480,7 @@ mod tests {
 			attachments: None,
 			created_at: "2024-01-01T00:00:00Z".to_string(),
 			expires_at: None,
-			tenant_id: 1,
+			tn_id: TnId(1),
 			tenant_tag: "example".to_string(),
 			tenant_type: "person".to_string(),
 			is_inbound: false,

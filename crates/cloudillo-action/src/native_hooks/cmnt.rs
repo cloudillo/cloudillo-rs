@@ -19,7 +19,7 @@ use cloudillo_types::meta_adapter::UpdateActionDataOptions;
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: CMNT on_create for action {}", context.action_id);
 
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 	let Some(parent_id) = &context.parent else {
 		tracing::warn!("CMNT on_create: No parent specified");
 		return Ok(HookResult::default());
@@ -65,7 +65,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: CMNT on_receive for action {}", context.action_id);
 
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 	let Some(parent_id) = &context.parent else {
 		tracing::warn!("CMNT on_receive: No parent specified");
 		return Ok(HookResult::default());

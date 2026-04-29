@@ -9,7 +9,7 @@
 
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use cloudillo_types::meta_adapter::UpdateProfileData;
+use cloudillo_types::meta_adapter::UpsertProfileFields;
 
 /// FLLW on_create hook - Handle follow action creation
 ///
@@ -19,7 +19,7 @@ use cloudillo_types::meta_adapter::UpdateProfileData;
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: FLLW on_create for action {}", context.action_id);
 
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 	let Some(audience) = &context.audience else {
 		tracing::warn!("FLLW on_create: No audience specified");
 		return Ok(HookResult::default());
@@ -43,10 +43,10 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				);
 			}
 
-			let profile_update =
-				UpdateProfileData { following: Patch::Value(true), ..Default::default() };
+			let profile_upsert =
+				UpsertProfileFields { following: Patch::Value(true), ..Default::default() };
 
-			if let Err(e) = app.meta_adapter.update_profile(tn_id, audience, &profile_update).await
+			if let Err(e) = app.meta_adapter.upsert_profile(tn_id, audience, &profile_upsert).await
 			{
 				tracing::warn!("FLLW: Failed to update audience profile {}: {}", audience, e);
 			} else {
@@ -57,9 +57,10 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			// Unfollow: remove follow status
 			tracing::info!("FLLW:DEL: {} is no longer following {}", context.issuer, audience);
 
-			let profile_update = UpdateProfileData { following: Patch::Null, ..Default::default() };
+			let profile_upsert =
+				UpsertProfileFields { following: Patch::Null, ..Default::default() };
 
-			if let Err(e) = app.meta_adapter.update_profile(tn_id, audience, &profile_update).await
+			if let Err(e) = app.meta_adapter.upsert_profile(tn_id, audience, &profile_upsert).await
 			{
 				tracing::warn!("FLLW:DEL: Failed to update audience profile {}: {}", audience, e);
 			} else {
@@ -85,7 +86,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 ///
 /// Note: Unlike CONN, FLLW doesn't require acceptance - it's a one-way relationship
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 	let audience = context.audience.as_deref().unwrap_or("unknown");
 
 	// Check if target user allows followers
@@ -93,12 +94,27 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 		app.settings.get_bool(tn_id, "privacy.allow_followers").await.unwrap_or(true);
 
 	if !allow_followers {
+		// Silently drop the follow rather than returning PermissionDenied.
+		// Returning an error to the remote sender (a) leaks the local privacy
+		// setting and (b) invites retry storms. Mirror CONN's ignore-mode:
+		// mark the action 'D' and continue.
 		tracing::info!(
-			"FLLW: Rejecting follow from {} - {} does not accept followers",
+			"FLLW: Ignoring follow from {} - {} does not accept followers",
 			context.issuer,
 			audience
 		);
-		return Err(Error::PermissionDenied);
+		let update_opts = cloudillo_types::meta_adapter::UpdateActionDataOptions {
+			status: Patch::Value('D'),
+			..Default::default()
+		};
+		if let Err(e) = app
+			.meta_adapter
+			.update_action_data(tn_id, &context.action_id, &update_opts)
+			.await
+		{
+			tracing::warn!("FLLW: Failed to update action status to D: {}", e);
+		}
+		return Ok(HookResult::default());
 	}
 
 	match context.subtype.as_deref() {

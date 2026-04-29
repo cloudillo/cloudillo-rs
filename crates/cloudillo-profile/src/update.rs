@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::prelude::*;
 use cloudillo_core::extract::Auth;
-use cloudillo_types::meta_adapter::{UpdateProfileData, UpdateTenantData};
+use cloudillo_types::meta_adapter::{UpdateProfileData, UpdateTenantData, UpsertProfileFields};
 use cloudillo_types::types::{AdminProfilePatch, ProfileInfo, ProfilePatch};
 
 #[derive(Serialize)]
@@ -116,8 +116,10 @@ pub async fn patch_profile_admin(
 		..Default::default()
 	};
 
-	// Single update call for all fields
-	app.meta_adapter.update_profile(tn_id, &id_tag, &profile_update).await?;
+	// Asserts state on the target id_tag. If the profile cache row is missing,
+	// upsert creates a stub so the admin's intent isn't blocked by an empty cache.
+	let upsert = UpsertProfileFields::from_update(profile_update);
+	app.meta_adapter.upsert_profile(tn_id, &id_tag, &upsert).await?;
 
 	// Fetch updated profile
 	let profile_data = app.meta_adapter.get_profile_info(tn_id, &id_tag).await?;
@@ -149,8 +151,11 @@ pub async fn patch_profile_relationship(
 ) -> ClResult<StatusCode> {
 	let tn_id = auth.tn_id;
 
-	// Call meta adapter to update relationship data
-	app.meta_adapter.update_profile(tn_id, &id_tag, &patch).await?;
+	// Upsert relationship state on the target id_tag. If the profile cache row
+	// is missing (race with federation sync), upsert creates a stub so the
+	// caller's relationship change isn't blocked by an empty cache.
+	let upsert = UpsertProfileFields::from_update(patch);
+	app.meta_adapter.upsert_profile(tn_id, &id_tag, &upsert).await?;
 
 	info!("User {} updated relationship with {}", auth.id_tag, id_tag);
 	Ok(StatusCode::OK)

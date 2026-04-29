@@ -18,7 +18,7 @@ use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 use crate::task::{CreateAction, create_action};
 use cloudillo_types::meta_adapter::{
-	ProfileConnectionStatus, UpdateActionDataOptions, UpdateProfileData,
+	ProfileConnectionStatus, UpdateActionDataOptions, UpsertProfileFields,
 };
 
 /// CONN on_create hook - Handle connection request creation
@@ -29,7 +29,7 @@ use cloudillo_types::meta_adapter::{
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!("Native hook: CONN on_create for action {}", context.action_id);
 
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 	let Some(audience) = &context.audience else {
 		tracing::warn!("CONN on_create: No audience specified");
 		return Ok(HookResult::default());
@@ -53,7 +53,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				);
 			}
 
-			let profile_update = UpdateProfileData {
+			let profile_upsert = UpsertProfileFields {
 				following: if context.tenant_type == "community" {
 					Patch::Undefined
 				} else {
@@ -63,7 +63,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				..Default::default()
 			};
 
-			if let Err(e) = app.meta_adapter.update_profile(tn_id, audience, &profile_update).await
+			if let Err(e) = app.meta_adapter.upsert_profile(tn_id, audience, &profile_upsert).await
 			{
 				tracing::warn!("CONN: Failed to update audience profile {}: {}", audience, e);
 			} else {
@@ -78,7 +78,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				audience
 			);
 
-			let profile_update = UpdateProfileData {
+			let profile_upsert = UpsertProfileFields {
 				following: if context.tenant_type == "community" {
 					Patch::Undefined
 				} else {
@@ -88,7 +88,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				..Default::default()
 			};
 
-			if let Err(e) = app.meta_adapter.update_profile(tn_id, audience, &profile_update).await
+			if let Err(e) = app.meta_adapter.upsert_profile(tn_id, audience, &profile_upsert).await
 			{
 				tracing::warn!("CONN:ACC: Failed to update audience profile {}: {}", audience, e);
 			} else {
@@ -99,13 +99,13 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			// Deletion: remove connection
 			tracing::info!("CONN:DEL: Removing connection from {} to {}", context.issuer, audience);
 
-			let profile_update = UpdateProfileData {
+			let profile_upsert = UpsertProfileFields {
 				connected: Patch::Null,
 				roles: Patch::Null,
 				..Default::default()
 			};
 
-			if let Err(e) = app.meta_adapter.update_profile(tn_id, audience, &profile_update).await
+			if let Err(e) = app.meta_adapter.upsert_profile(tn_id, audience, &profile_upsert).await
 			{
 				tracing::warn!("CONN:DEL: Failed to update audience profile {}: {}", audience, e);
 			} else {
@@ -126,15 +126,18 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// - None: Check for mutual connection request, set status to 'N' (notification) or 'C' (confirmation)
 /// - DEL: Update profile, set status to 'N'
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
-	let audience = context.audience.as_deref().unwrap_or("unknown");
+	let tn_id = context.tn_id;
+	// The local tenant tag is the authoritative "to whom" — `context.audience`
+	// is the JWT `aud` claim and is attacker-controlled. Using it for action
+	// lookups would let a remote actor influence which local row we hit.
+	let local_tag = context.tenant_tag.as_str();
 
 	match context.subtype.as_deref() {
 		None => {
 			tracing::info!(
 				"CONN: Received connection request from {} to {}",
 				context.issuer,
-				audience
+				local_tag
 			);
 
 			// Ensure issuer profile exists locally (sync from remote if needed)
@@ -154,7 +157,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			// If so, this is a mutual connection - auto-accept
 			let our_request = app
 				.meta_adapter
-				.get_action_by_key(tn_id, &format!("CONN:{}:{}", audience, context.issuer))
+				.get_action_by_key(tn_id, &format!("CONN:{}:{}", local_tag, context.issuer))
 				.await
 				.ok()
 				.flatten();
@@ -166,11 +169,11 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				tracing::info!(
 					"CONN: Mutual connection detected between {} and {}",
 					context.issuer,
-					audience
+					local_tag
 				);
 
 				// Update issuer's profile to connected
-				let profile_update = UpdateProfileData {
+				let profile_upsert = UpsertProfileFields {
 					connected: Patch::Value(ProfileConnectionStatus::Connected),
 					following: if context.tenant_type == "community" {
 						Patch::Undefined
@@ -181,7 +184,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				};
 
 				if let Err(e) =
-					app.meta_adapter.update_profile(tn_id, &context.issuer, &profile_update).await
+					app.meta_adapter.upsert_profile(tn_id, &context.issuer, &profile_upsert).await
 				{
 					tracing::warn!(
 						"CONN: Failed to update issuer profile {}: {}",
@@ -253,7 +256,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					}
 
 					// Update issuer's profile to connected
-					let profile_update = UpdateProfileData {
+					let profile_upsert = UpsertProfileFields {
 						connected: Patch::Value(ProfileConnectionStatus::Connected),
 						following: if context.tenant_type == "community" {
 							Patch::Undefined
@@ -264,7 +267,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					};
 					if let Err(e) = app
 						.meta_adapter
-						.update_profile(tn_id, &context.issuer, &profile_update)
+						.upsert_profile(tn_id, &context.issuer, &profile_upsert)
 						.await
 					{
 						tracing::warn!(
@@ -310,11 +313,42 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			tracing::info!(
 				"CONN:ACC: Connection acceptance received from {} to {}",
 				context.issuer,
-				audience
+				local_tag
 			);
 
+			// Verify we actually sent an outgoing CONN request to this issuer.
+			// Without this, a remote actor could craft a CONN:ACC out of
+			// thin air and gain Connected state in the local profile.
+			let outgoing_request = app
+				.meta_adapter
+				.get_action_by_key(tn_id, &format!("CONN:{}:{}", local_tag, context.issuer))
+				.await
+				.ok()
+				.flatten();
+
+			let has_pending_request = outgoing_request
+				.as_ref()
+				.is_some_and(|a| a.sub_typ.as_deref().is_none_or(str::is_empty));
+
+			if !has_pending_request {
+				tracing::warn!(
+					"CONN:ACC: Rejecting acceptance from {} - no outgoing CONN request found",
+					context.issuer
+				);
+				let update_opts =
+					UpdateActionDataOptions { status: Patch::Value('D'), ..Default::default() };
+				if let Err(e) = app
+					.meta_adapter
+					.update_action_data(tn_id, &context.action_id, &update_opts)
+					.await
+				{
+					tracing::warn!("CONN:ACC: Failed to update action status to D: {}", e);
+				}
+				return Ok(HookResult::default());
+			}
+
 			// Update issuer's profile to connected
-			let profile_update = UpdateProfileData {
+			let profile_upsert = UpsertProfileFields {
 				connected: Patch::Value(ProfileConnectionStatus::Connected),
 				following: if context.tenant_type == "community" {
 					Patch::Undefined
@@ -325,7 +359,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			};
 
 			if let Err(e) =
-				app.meta_adapter.update_profile(tn_id, &context.issuer, &profile_update).await
+				app.meta_adapter.upsert_profile(tn_id, &context.issuer, &profile_upsert).await
 			{
 				tracing::warn!(
 					"CONN:ACC: Failed to update issuer profile {}: {}",
@@ -351,14 +385,15 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			tracing::info!(
 				"CONN:DEL: Received disconnect request from {} to {}",
 				context.issuer,
-				audience
+				local_tag
 			);
 
 			// Update issuer's profile to not connected
-			let profile_update = UpdateProfileData { connected: Patch::Null, ..Default::default() };
+			let profile_upsert =
+				UpsertProfileFields { connected: Patch::Null, ..Default::default() };
 
 			if let Err(e) =
-				app.meta_adapter.update_profile(tn_id, &context.issuer, &profile_update).await
+				app.meta_adapter.upsert_profile(tn_id, &context.issuer, &profile_upsert).await
 			{
 				tracing::warn!(
 					"CONN:DEL: Failed to update issuer profile {}: {}",
@@ -395,7 +430,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::info!("CONN: Connection accepted from {}", context.issuer);
 
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 
 	// Create reverse CONN:ACC action to notify the sender
 	// The ACC subtype signals this is an acceptance, not a new request
@@ -422,15 +457,15 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 pub async fn on_reject(app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::info!("CONN: Connection rejected from {}", context.issuer);
 
-	let tn_id = TnId(u32::try_from(context.tenant_id).unwrap_or_default());
+	let tn_id = context.tn_id;
 
-	let profile_update = UpdateProfileData {
+	let profile_upsert = UpsertProfileFields {
 		following: Patch::Value(false),
 		connected: Patch::Value(ProfileConnectionStatus::Disconnected),
 		..Default::default()
 	};
 
-	app.meta_adapter.update_profile(tn_id, &context.issuer, &profile_update).await?;
+	app.meta_adapter.upsert_profile(tn_id, &context.issuer, &profile_upsert).await?;
 
 	tracing::debug!("CONN: Updated issuer profile (following=false, connected=Disconnected)");
 
