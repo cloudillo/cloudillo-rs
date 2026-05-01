@@ -119,6 +119,29 @@ pub type ScheduleEmailFn = Box<
 		+ Sync,
 >;
 
+/// Type-erased function invoked once the very first ACME certificate for a
+/// tenant has been successfully issued. Registered by the profile crate so
+/// it can flush deferred work (e.g. queueing a welcome email that requires
+/// HTTPS to be usable). Called from `acme::handle_renewal_success` only when
+/// the renewal row's pre-renewal `expires_at` was `None`.
+///
+/// **Implementations MUST be idempotent.** The hook may fire multiple times
+/// for the same `tn_id`: the bootstrap path (`bootstrap.rs`) and the
+/// early-retry task (`acme.rs::AcmeEarlyRetryTask`) can both observe the
+/// first successful issuance after a process restart, both with
+/// `is_first_issuance: true`. Implementations must dedupe — e.g. by using a
+/// scheduler dedup key or a marker setting cleared after first run.
+pub type OnFirstCertIssuedFn = Box<
+	dyn for<'a> Fn(
+			&'a app::App,
+			cloudillo_types::types::TnId,
+			&'a str,
+		) -> Pin<
+			Box<dyn Future<Output = cloudillo_types::error::ClResult<()>> + Send + 'a>,
+		> + Send
+		+ Sync,
+>;
+
 /// Type-erased function for ensuring a remote profile exists locally.
 /// Registered as an extension by the server's app module.
 /// Used by action hooks for profile sync.

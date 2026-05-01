@@ -46,10 +46,11 @@ async fn get_or_create_acme_account(state: &App, acme_email: &str) -> ClResult<A
 		}
 		Err(Error::NotFound) => {
 			info!("Creating new ACME account for {}", acme_email);
+			let contact = format!("mailto:{}", acme_email);
 			let (account, credentials) = Account::builder()?
 				.create(
 					&acme::NewAccount {
-						contact: &[],
+						contact: &[&contact],
 						terms_of_service_agreed: true,
 						only_return_existing: false,
 					},
@@ -371,12 +372,10 @@ impl Task<App> for CertRenewalTask {
 	}
 
 	fn serialize(&self) -> String {
-		// `serde_json::to_string` cannot fail for this struct (only `String` and
-		// `u32` fields, no custom Serialize impl). Falling back to an arbitrary
-		// non-JSON string would brick the scheduler entry — `build()` parses
-		// JSON. Use `to_string` directly with a debug-only assert as a guard.
-		debug_assert!(serde_json::to_string(self).is_ok());
-		serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+		// Cannot fail: only String and u32 fields, no custom Serialize impl.
+		// Fallback to "null" so build() fails loudly rather than creating a
+		// corrupt task with default values.
+		serde_json::to_string(self).unwrap_or_else(|_| "null".to_string())
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -437,7 +436,7 @@ impl Task<App> for CertRenewalTask {
 					Ok(()) => {
 						info!(tn_id = %row.tn_id.0, id_tag = %row.id_tag,
 							"Certificate renewed successfully");
-						handle_renewal_success(app, &row).await;
+						handle_renewal_success(app, &row, false).await;
 					}
 					Err(e) => {
 						let reason = format!("acme: {}", e);
@@ -497,11 +496,86 @@ impl Task<App> for CertRenewalTask {
 	}
 }
 
+/// One-shot retry of `acme::init` for a single tenant, scheduled by bootstrap
+/// when the at-registration ACME attempt fails. Coordinated with the daily
+/// `CertRenewalTask` only by the in-task `read_cert_by_tn_id` short-circuit:
+/// each retry checks first whether a cert was installed since it was queued,
+/// and if so exits without contacting the ACME directory.
+///
+/// Three of these are typically queued at 2 / 5 / 15-minute delays. They
+/// survive process restart (unlike the previous `tokio::spawn` approach), and
+/// the per-key dedup in the scheduler stops repeated bootstrap-failure events
+/// from stacking duplicate retries on top of each other.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcmeEarlyRetryTask {
+	pub tn_id: TnId,
+	pub acme_email: String,
+	pub id_tag: String,
+	pub app_domain: Option<String>,
+}
+
+#[async_trait]
+impl Task<App> for AcmeEarlyRetryTask {
+	fn kind() -> &'static str {
+		"acme.early_retry"
+	}
+
+	fn kind_of(&self) -> &'static str {
+		Self::kind()
+	}
+
+	fn build(_id: TaskId, context: &str) -> ClResult<Arc<dyn Task<App>>> {
+		let task: AcmeEarlyRetryTask = serde_json::from_str(context).map_err(|e| {
+			Error::ValidationError(format!("Failed to deserialize early retry task: {}", e))
+		})?;
+		Ok(Arc::new(task))
+	}
+
+	fn serialize(&self) -> String {
+		// Same as CertRenewalTask::serialize — no fallible field types.
+		serde_json::to_string(self).unwrap_or_else(|_| "null".to_string())
+	}
+
+	async fn run(&self, app: &App) -> ClResult<()> {
+		// `read_cert_by_tn_id` filters `cert IS NOT NULL AND key IS NOT NULL`,
+		// so Ok(_) ⇒ cert installed (by an earlier retry or the daily renewal
+		// task) and we should stop. Err(NotFound) ⇒ proceed.
+		if app.auth_adapter.read_cert_by_tn_id(self.tn_id).await.is_ok() {
+			info!(id_tag = %self.id_tag,
+				"ACME early retry: cert already present, skipping");
+			return Ok(());
+		}
+		info!(id_tag = %self.id_tag, "ACME early retry attempt");
+		match init(app.clone(), &self.acme_email, &self.id_tag, self.app_domain.as_deref()).await {
+			Ok(()) => {
+				info!(id_tag = %self.id_tag, "ACME early retry succeeded");
+				let row = TenantCertRenewalRow {
+					tn_id: self.tn_id,
+					id_tag: self.id_tag.clone().into(),
+					expires_at: None,
+					failure_count: 0,
+					last_renewal_error: None,
+					notified_at: None,
+				};
+				handle_renewal_success(app, &row, true).await;
+				Ok(())
+			}
+			Err(e) => {
+				warn!(error = %e, id_tag = %self.id_tag, "ACME early retry failed");
+				// Surface the error so the scheduler records the failure, but
+				// the other queued retries (separate tasks) still fire.
+				Err(e)
+			}
+		}
+	}
+}
+
 /// Register ACME-related tasks with the scheduler
 ///
 /// Must be called during app initialization before the scheduler starts loading tasks
 pub fn register_tasks(app: &App) -> ClResult<()> {
 	app.scheduler.register::<CertRenewalTask>()?;
+	app.scheduler.register::<AcmeEarlyRetryTask>()?;
 	Ok(())
 }
 
@@ -554,7 +628,11 @@ async fn check_domains_dns(
 	Ok(())
 }
 
-async fn handle_renewal_success(app: &App, row: &TenantCertRenewalRow) {
+pub async fn handle_renewal_success(
+	app: &App,
+	row: &TenantCertRenewalRow,
+	is_first_issuance: bool,
+) {
 	if let Err(e) = app.auth_adapter.record_cert_renewal_success(row.tn_id).await {
 		warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
 			"Failed to record renewal success");
@@ -572,6 +650,19 @@ async fn handle_renewal_success(app: &App, row: &TenantCertRenewalRow) {
 			info!(tn_id = %row.tn_id.0, id_tag = %row.id_tag,
 				"Tenant un-suspended after successful cert renewal");
 		}
+	}
+
+	// First-issuance hook: only fire when the caller passed
+	// `is_first_issuance = true` (currently only the bootstrap synthetic-row
+	// paths). The daily renewal task passes `false` here, so a row whose
+	// `expires_at` is somehow NULL for a non-first reason will not re-fire
+	// the hook.
+	if is_first_issuance
+		&& let Ok(hook) = app.ext::<crate::OnFirstCertIssuedFn>()
+		&& let Err(e) = hook(app, row.tn_id, &row.id_tag).await
+	{
+		warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
+			"on_first_cert_issued hook failed");
 	}
 }
 
@@ -662,7 +753,7 @@ async fn schedule_renewal_failure_email(
 	// Pull the user's preferred language directly via the settings service —
 	// we can't depend on cloudillo-email here.
 	let lang = match app.settings.get(row.tn_id, "profile.lang").await {
-		Ok(crate::settings::SettingValue::String(s)) => Some(s),
+		Ok(Some(crate::settings::SettingValue::String(s))) => Some(s),
 		_ => None,
 	};
 

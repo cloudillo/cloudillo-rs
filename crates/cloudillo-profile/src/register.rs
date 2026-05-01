@@ -52,18 +52,18 @@ pub struct IdpAvailabilityResponse {
 /// Get list of trusted identity providers from settings
 pub async fn get_identity_providers(app: &cloudillo_core::app::App, tn_id: TnId) -> Vec<String> {
 	match app.settings.get(tn_id, "idp.list").await {
-		Ok(SettingValue::String(list)) => {
+		Ok(Some(SettingValue::String(list))) => {
 			// Parse comma-separated list and filter out empty strings
 			list.split(',')
 				.map(|s| s.trim().to_string())
 				.filter(|s| !s.is_empty())
 				.collect::<Vec<String>>()
 		}
-		Ok(_) => {
+		Ok(Some(_)) => {
 			warn!("Invalid idp.list setting value (expected string)");
 			Vec::new()
 		}
-		Err(_) => {
+		Ok(None) | Err(_) => {
 			// Setting not found or error, return empty list
 			Vec::new()
 		}
@@ -300,6 +300,156 @@ pub async fn post_verify_profile(
 	Ok((StatusCode::OK, Json(validation_result)))
 }
 
+/// Setting key under which deferred welcome-email params are stashed.
+/// Read & cleared by `on_first_cert_issued` (see `crates/cloudillo-profile/src/welcome_hook.rs`)
+/// once ACME succeeds for the new tenant.
+pub(crate) const PENDING_WELCOME_EMAIL_SETTING: &str = "internal.pending_welcome_email";
+
+/// Persisted form of a deferred welcome email — only the metadata needed to
+/// re-mint the welcome ref and re-issue `schedule_email_task_with_key` later.
+///
+/// Deliberately does NOT store the rendered welcome link or `ref_id`: the
+/// link embeds a single-use credential that grants password-set authority on
+/// the new tenant, and we don't want that credential sitting in the meta DB
+/// while ACME catches up. The flush hook regenerates the ref at send time.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingWelcomeEmail {
+	pub to: String,
+	pub lang: Option<String>,
+	pub from_name_override: Option<String>,
+	pub id_tag: String,
+}
+
+/// Mint a fresh welcome ref and queue the welcome email. Used by both the
+/// immediate-send path (cert already valid at registration time) and the
+/// deferred flush hook (`welcome_hook::flush_deferred_welcome_email`) once
+/// ACME completes.
+pub(crate) async fn send_welcome_email(
+	app: &cloudillo_core::app::App,
+	tn_id: TnId,
+	to: &str,
+	id_tag: &str,
+	lang: Option<String>,
+	from_name_override: Option<String>,
+	log_context: &str,
+) -> ClResult<()> {
+	let base_id_tag = app
+		.opts
+		.base_id_tag
+		.as_ref()
+		.ok_or_else(|| Error::ConfigError("BASE_ID_TAG not configured".into()))?;
+
+	let (_ref_id, welcome_link) = cloudillo_ref::service::create_ref_internal(
+		app,
+		tn_id,
+		cloudillo_ref::service::CreateRefInternalParams {
+			id_tag,
+			typ: "welcome",
+			description: Some("Welcome to Cloudillo"),
+			expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
+			path_prefix: "/onboarding/welcome",
+			resource_id: None,
+			count: None,
+			params: None,
+		},
+	)
+	.await?;
+
+	let template_vars = serde_json::json!({
+		"identity_tag": id_tag,
+		"base_id_tag": base_id_tag.as_ref(),
+		"instance_name": "Cloudillo",
+		"welcome_link": welcome_link,
+	});
+
+	cloudillo_email::EmailModule::schedule_email_task_with_key(
+		&app.scheduler,
+		&app.settings,
+		tn_id,
+		cloudillo_email::EmailTaskParams {
+			to: to.to_string(),
+			subject: None,
+			template_name: "welcome".to_string(),
+			template_vars,
+			lang: lang.clone(),
+			custom_key: Some(format!("welcome:{}", tn_id.0)),
+			from_name_override,
+		},
+	)
+	.await?;
+
+	info!(
+		email = %to, tn_id = ?tn_id, lang = ?lang, ctx = log_context,
+		"Welcome email queued"
+	);
+	Ok(())
+}
+
+/// Queue the welcome email immediately if a usable cert exists, otherwise
+/// stash metadata in `internal.pending_welcome_email` so the on-first-cert
+/// hook can mint a fresh ref and fire it once HTTPS is actually available.
+///
+/// Returns `Err` only on the deferred path when persistence fails — without
+/// the marker the welcome can never be delivered, so we surface that as a
+/// registration failure. Immediate-path schedule failures are logged and
+/// swallowed since the tenant is already created.
+async fn queue_or_defer_welcome_email(
+	app: &cloudillo_core::app::App,
+	tn_id: TnId,
+	to: String,
+	id_tag: String,
+	lang: Option<String>,
+	from_name_override: Option<String>,
+	log_context: &str,
+) -> ClResult<()> {
+	let cert_ready = match app.auth_adapter.read_cert_by_tn_id(tn_id).await {
+		Ok(cert) => cert.expires_at.0 > Timestamp::now().0,
+		Err(_) => false,
+	};
+
+	if cert_ready {
+		if let Err(e) = send_welcome_email(
+			app,
+			tn_id,
+			&to,
+			&id_tag,
+			lang.clone(),
+			from_name_override,
+			log_context,
+		)
+		.await
+		{
+			warn!(
+				error = %e, email = %to, tn_id = ?tn_id, ctx = log_context,
+				"Failed to queue welcome email, continuing registration"
+			);
+		}
+		return Ok(());
+	}
+
+	let pending = PendingWelcomeEmail { to: to.clone(), lang, from_name_override, id_tag };
+	let json = serde_json::to_value(&pending).map_err(|e| {
+		Error::Internal(format!("Failed to serialize pending welcome email: {}", e))
+	})?;
+
+	app.meta_adapter
+		.update_setting(tn_id, PENDING_WELCOME_EMAIL_SETTING, Some(json))
+		.await
+		.map_err(|e| {
+			warn!(
+				error = %e, email = %to, tn_id = ?tn_id, ctx = log_context,
+				"Failed to persist pending welcome email; user would not receive welcome"
+			);
+			e
+		})?;
+
+	info!(
+		email = %to, tn_id = ?tn_id, ctx = log_context,
+		"Welcome email deferred until ACME cert is ready"
+	);
+	Ok(())
+}
+
 /// Handle IDP registration flow
 async fn handle_idp_registration(
 	app: &cloudillo_core::app::App,
@@ -466,65 +616,20 @@ async fn handle_idp_registration(
 		}
 	}
 
-	// Now create the welcome reference using the new create_ref_internal function
-	let (_ref_id, welcome_link) = cloudillo_ref::service::create_ref_internal(
+	// Profile is already created by create_tenant in meta adapter.
+	// The welcome ref is minted lazily inside `send_welcome_email` (either
+	// inline when the cert is ready, or via the on-first-cert hook) so the
+	// single-use credential is never persisted to the meta DB.
+	queue_or_defer_welcome_email(
 		app,
 		tn_id,
-		cloudillo_ref::service::CreateRefInternalParams {
-			id_tag: &id_tag_lower,
-			typ: "welcome",
-			description: Some("Welcome to Cloudillo"),
-			expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
-			path_prefix: "/onboarding/welcome",
-			resource_id: None,
-			count: None,
-			params: None,
-		},
+		email.clone(),
+		id_tag_lower.clone(),
+		lang.clone(),
+		Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
+		"idp_registration",
 	)
 	.await?;
-
-	// Profile is already created by create_tenant in meta adapter
-	// Send welcome email with the welcome link
-	let template_vars = serde_json::json!({
-		"identity_tag": id_tag_lower,
-		"base_id_tag": base_id_tag.as_ref(),
-		"instance_name": "Cloudillo",
-		"welcome_link": welcome_link,
-	});
-
-	match cloudillo_email::EmailModule::schedule_email_task(
-		&app.scheduler,
-		&app.settings,
-		tn_id,
-		cloudillo_email::EmailTaskParams {
-			to: email.clone(),
-			subject: None, // Subject is defined in the template frontmatter
-			template_name: "welcome".to_string(),
-			template_vars,
-			lang: lang.clone(),
-			custom_key: None,
-			from_name_override: Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
-		},
-	)
-	.await
-	{
-		Ok(()) => {
-			info!(
-				email = %email,
-				id_tag = %id_tag_lower,
-				lang = ?lang,
-				"Welcome email queued for IDP registration"
-			);
-		}
-		Err(e) => {
-			warn!(
-				error = %e,
-				email = %email,
-				id_tag = %id_tag_lower,
-				"Failed to queue welcome email, continuing registration"
-			);
-		}
-	}
 
 	// Store IDP API key if provided
 	if let Some(api_key) = &idp_reg_result.api_key {
@@ -617,71 +722,26 @@ async fn handle_domain_registration(
 		}
 	}
 
-	// Create welcome reference using the new create_ref_internal function
-	let (_ref_id, welcome_link) = cloudillo_ref::service::create_ref_internal(
-		app,
-		tn_id,
-		cloudillo_ref::service::CreateRefInternalParams {
-			id_tag: &id_tag_lower,
-			typ: "welcome",
-			description: Some("Welcome to Cloudillo"),
-			expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
-			path_prefix: "/onboarding/welcome",
-			resource_id: None,
-			count: None,
-			params: None,
-		},
-	)
-	.await?;
-
-	// Profile is already created by create_tenant in meta adapter
-	// Send welcome email with the welcome link
+	// Profile is already created by create_tenant in meta adapter.
+	// The welcome ref is minted lazily inside `send_welcome_email` (either
+	// inline when the cert is ready, or via the on-first-cert hook) so the
+	// single-use credential is never persisted to the meta DB.
 	let base_id_tag = app
 		.opts
 		.base_id_tag
 		.as_ref()
 		.ok_or_else(|| Error::ConfigError("BASE_ID_TAG not configured".into()))?;
 
-	let template_vars = serde_json::json!({
-		"identity_tag": id_tag_lower,
-		"base_id_tag": base_id_tag.as_ref(),
-		"instance_name": "Cloudillo",
-		"welcome_link": welcome_link,
-	});
-
-	match cloudillo_email::EmailModule::schedule_email_task(
-		&app.scheduler,
-		&app.settings,
+	queue_or_defer_welcome_email(
+		app,
 		tn_id,
-		cloudillo_email::EmailTaskParams {
-			to: email.clone(),
-			subject: None, // Subject is defined in the template frontmatter
-			template_name: "welcome".to_string(),
-			template_vars,
-			lang: lang.clone(),
-			custom_key: None,
-			from_name_override: Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
-		},
+		email.clone(),
+		id_tag_lower.clone(),
+		lang.clone(),
+		Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
+		"domain_registration",
 	)
-	.await
-	{
-		Ok(()) => {
-			info!(
-				email = %email,
-				id_tag = %id_tag_lower,
-				lang = ?lang,
-				"Welcome email queued for domain registration"
-			);
-		}
-		Err(e) => {
-			warn!(
-				error = %e,
-				email = %email,
-				id_tag = %id_tag_lower,
-				"Failed to queue welcome email, continuing registration"
-			);
-		}
-	}
+	.await?;
 
 	// Return empty response (user must login separately)
 	let response = json!({});

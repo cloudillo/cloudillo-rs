@@ -330,6 +330,16 @@ impl AppBuilder {
 		});
 		extensions.insert(schedule_email_fn);
 
+		// Register on_first_cert_issued so deferred welcome emails fire once ACME
+		// produces the tenant's first certificate.
+		let on_first_cert_issued_fn: cloudillo_core::OnFirstCertIssuedFn =
+			Box::new(|app, tn_id, id_tag| {
+				Box::pin(cloudillo_profile::welcome_hook::flush_deferred_welcome_email(
+					app, tn_id, id_tag,
+				))
+			});
+		extensions.insert(on_first_cert_issued_fn);
+
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker,

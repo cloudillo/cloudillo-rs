@@ -11,7 +11,9 @@ use crate::prelude::*;
 use crate::settings::SettingValue;
 use crate::utils::derive_name_from_id_tag;
 use cloudillo_core::acme;
+use cloudillo_core::acme::handle_renewal_success;
 use cloudillo_core::scheduler::Task as _;
+use cloudillo_types::auth_adapter::TenantCertRenewalRow;
 
 /// Default identity provider domain
 const DEFAULT_IDP_PROVIDER: &str = "cloudillo.net";
@@ -197,12 +199,55 @@ pub async fn create_complete_tenant(
 		if let Some(acme_email) = opts.acme_email {
 			info!("Creating ACME certificate for tenant");
 			match acme::init(app.clone(), acme_email, opts.id_tag, opts.app_domain).await {
-				Ok(()) => info!("ACME certificate created successfully"),
-				Err(e) => warn!(
-					error = %e,
-					id_tag = %opts.id_tag,
-					"Failed to create ACME certificate, will retry via CertRenewalTask"
-				),
+				Ok(()) => {
+					info!("ACME certificate created successfully");
+					// First issuance — fire the on_first_cert_issued hook so any
+					// deferred work (e.g. welcome email queueing) runs now.
+					let row = TenantCertRenewalRow {
+						tn_id,
+						id_tag: opts.id_tag.into(),
+						expires_at: None,
+						failure_count: 0,
+						last_renewal_error: None,
+						notified_at: None,
+					};
+					handle_renewal_success(app, &row, true).await;
+				}
+				Err(e) => {
+					warn!(
+						error = %e,
+						id_tag = %opts.id_tag,
+						"Failed to create ACME certificate, scheduling early retries"
+					);
+					// Persisted, key-deduped retries via the scheduler — survives
+					// process restart and serializes against repeat bootstrap
+					// failures for the same tenant. The daily `CertRenewalTask`
+					// runs on its own schedule; concurrency between them is
+					// handled by the per-task `read_cert_by_tn_id` short-circuit
+					// inside `AcmeEarlyRetryTask::run`. Delays: 2, 5, 15 minutes.
+					for delay_secs in [120i64, 300, 900] {
+						let task = Arc::new(acme::AcmeEarlyRetryTask {
+							tn_id,
+							acme_email: acme_email.to_string(),
+							id_tag: opts.id_tag.to_string(),
+							app_domain: opts.app_domain.map(str::to_string),
+						});
+						let key = format!("acme-early:{}:{}", tn_id.0, delay_secs);
+						if let Err(sched_err) = app
+							.scheduler
+							.task(task)
+							.key(key)
+							.schedule_after(delay_secs)
+							.schedule()
+							.await
+						{
+							warn!(
+								error = %sched_err, id_tag = %opts.id_tag, delay_secs,
+								"Failed to schedule ACME early retry"
+							);
+						}
+					}
+				}
 			}
 		} else {
 			warn!("ACME cert requested but no ACME email provided");

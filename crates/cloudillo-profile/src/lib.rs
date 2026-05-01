@@ -13,6 +13,7 @@ pub mod register;
 pub mod settings;
 pub mod sync;
 pub mod update;
+pub mod welcome_hook;
 
 mod prelude;
 
