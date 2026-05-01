@@ -299,6 +299,15 @@ impl Default for SettingsRegistry {
 	}
 }
 
+/// Result of looking up a setting definition: distinguishes an exact-key match
+/// from a wildcard-namespace match (`foo.*`). Wildcard matches mean the key
+/// belongs to a registered namespace but isn't itself fixed-schema, so absence
+/// of a stored value is a normal state, not a configuration error.
+pub enum DefinitionMatch<'a> {
+	Exact(&'a SettingDefinition),
+	Wildcard(&'a SettingDefinition),
+}
+
 /// Immutable registry stored in AppState
 pub struct FrozenSettingsRegistry {
 	definitions: std::collections::HashMap<String, SettingDefinition>,
@@ -308,16 +317,21 @@ impl FrozenSettingsRegistry {
 	/// Get a setting definition by key
 	/// First tries exact match, then tries wildcard pattern "<first_element>.*"
 	pub fn get(&self, key: &str) -> Option<&SettingDefinition> {
-		// Try exact match first
+		self.get_match(key).map(|m| match m {
+			DefinitionMatch::Exact(d) | DefinitionMatch::Wildcard(d) => d,
+		})
+	}
+
+	/// Look up a definition, distinguishing exact vs wildcard match.
+	pub fn get_match(&self, key: &str) -> Option<DefinitionMatch<'_>> {
 		if let Some(def) = self.definitions.get(key) {
-			return Some(def);
+			return Some(DefinitionMatch::Exact(def));
 		}
 
-		// Try wildcard pattern: extract first element and append ".*"
 		if let Some(dot_pos) = key.find('.') {
 			let wildcard_key = format!("{}.*", &key[..dot_pos]);
 			if let Some(def) = self.definitions.get(&wildcard_key) {
-				return Some(def);
+				return Some(DefinitionMatch::Wildcard(def));
 			}
 		}
 

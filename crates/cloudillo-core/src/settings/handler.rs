@@ -60,7 +60,7 @@ pub async fn list_settings(
 	} else {
 		// No prefix: iterate over all definitions and get their values
 		for definition in app.settings_registry.list() {
-			if let Ok(value) = app.settings.get(auth.tn_id, &definition.key).await {
+			if let Ok(Some(value)) = app.settings.get(auth.tn_id, &definition.key).await {
 				settings_response.push(SettingResponse {
 					key: definition.key.clone(),
 					value,
@@ -90,7 +90,7 @@ pub async fn get_setting(
 	let definition = app.settings_registry.get(&name).ok_or(Error::NotFound)?;
 
 	// Get current value with three-level resolution
-	let value = app.settings.get(auth.tn_id, &name).await?;
+	let value = app.settings.get(auth.tn_id, &name).await?.ok_or(Error::NotFound)?;
 
 	let response_data = SettingResponse {
 		key: definition.key.clone(),
@@ -139,7 +139,7 @@ pub async fn update_setting(
 	info!("User {} updated setting {} in tenant {}", auth.id_tag, name, auth.tn_id);
 
 	// Return updated setting
-	let value = app.settings.get(auth.tn_id, &name).await?;
+	let value = app.settings.get(auth.tn_id, &name).await?.ok_or(Error::NotFound)?;
 
 	let response_data = SettingResponse {
 		key: definition.key.clone(),

@@ -11,7 +11,7 @@ use crate::prelude::*;
 use cloudillo_types::meta_adapter::MetaAdapter;
 
 use super::types::{
-	FrozenSettingsRegistry, Setting, SettingDefinition, SettingScope, SettingValue,
+	DefinitionMatch, FrozenSettingsRegistry, Setting, SettingDefinition, SettingScope, SettingValue,
 };
 
 // Compile-time constant for default cache capacity
@@ -20,37 +20,36 @@ const DEFAULT_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(100) {
 	None => unreachable!(),
 };
 
-/// LRU cache for settings values
+/// LRU cache for settings values.
+/// Uses Mutex because LruCache::get mutates internal recency state.
 pub struct SettingsCache {
-	cache: Arc<parking_lot::RwLock<LruCache<(TnId, String), SettingValue>>>,
+	cache: Arc<parking_lot::Mutex<LruCache<(TnId, String), SettingValue>>>,
 }
 
 impl SettingsCache {
 	pub fn new(capacity: usize) -> Self {
 		let non_zero = NonZeroUsize::new(capacity).unwrap_or(DEFAULT_CACHE_CAPACITY);
-		Self { cache: Arc::new(parking_lot::RwLock::new(LruCache::new(non_zero))) }
+		Self { cache: Arc::new(parking_lot::Mutex::new(LruCache::new(non_zero))) }
 	}
 
 	pub fn get(&self, tn_id: TnId, key: &str) -> Option<SettingValue> {
-		let mut cache = self.cache.write();
+		let mut cache = self.cache.lock();
 		cache.get(&(tn_id, key.to_string())).cloned()
 	}
 
 	pub fn put(&self, tn_id: TnId, key: String, value: SettingValue) {
-		let mut cache = self.cache.write();
+		let mut cache = self.cache.lock();
 		cache.put((tn_id, key), value);
 	}
 
 	/// Invalidate all cached settings
 	pub fn clear(&self) {
-		let mut cache = self.cache.write();
+		let mut cache = self.cache.lock();
 		cache.clear();
 	}
 
 	/// Invalidate specific key across all tenants (when global setting changes)
 	pub fn invalidate_key(&self, _key: &str) {
-		// For simplicity, clear entire cache
-		// TODO: Could optimize to only remove entries with matching key
 		self.clear();
 	}
 }
@@ -71,18 +70,32 @@ impl SettingsService {
 		Self { registry, cache: SettingsCache::new(cache_size), meta }
 	}
 
-	/// Get setting value with full resolution (tenant -> global -> default)
-	pub async fn get(&self, tn_id: TnId, key: &str) -> ClResult<SettingValue> {
-		// Check cache
+	/// Get setting value with full resolution (tenant -> global -> default).
+	///
+	/// Three distinct outcomes:
+	/// - `Ok(Some(value))` — value resolved (stored or default)
+	/// - `Ok(None)` — wildcard-namespace key with no stored value (legitimate
+	///   absence; wildcard registrations declare a namespace, not fixed keys)
+	/// - `Err(SettingNotFound)` — exact-match key with no default and not
+	///   configured (programmer/configuration error)
+	/// - `Err(other)` — transient adapter or deserialization error
+	pub async fn get(&self, tn_id: TnId, key: &str) -> ClResult<Option<SettingValue>> {
+		// Check cache (tenant-specific first, then global fallback)
 		if let Some(value) = self.cache.get(tn_id, key) {
 			debug!("Setting cache hit: {}.{}", tn_id.0, key);
-			return Ok(value);
+			return Ok(Some(value));
+		}
+		if tn_id.0 != 0
+			&& let Some(value) = self.cache.get(TnId(0), key)
+		{
+			debug!("Setting cache hit (global fallback): {}", key);
+			return Ok(Some(value));
 		}
 
 		// Get definition (supports wildcard patterns like "ui.*")
-		let def = self
+		let m = self
 			.registry
-			.get(key)
+			.get_match(key)
 			.ok_or_else(|| Error::SettingNotFound(format!("Unknown setting: {}", key)))?;
 
 		// Try tenant-specific setting
@@ -92,23 +105,26 @@ impl SettingsService {
 			let value = serde_json::from_value::<SettingValue>(json_value)
 				.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
 			self.cache.put(tn_id, key.to_string(), value.clone());
-			return Ok(value);
+			return Ok(Some(value));
 		}
 
-		// Try global setting
+		// Try global setting — cache under TnId(0) so tenant overrides aren't masked
 		if let Some(json_value) = self.meta.read_setting(TnId(0), key).await? {
 			let value = serde_json::from_value::<SettingValue>(json_value)
 				.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
-			self.cache.put(tn_id, key.to_string(), value.clone());
-			return Ok(value);
+			self.cache.put(TnId(0), key.to_string(), value.clone());
+			return Ok(Some(value));
 		}
 
-		// Use default (or error if no default)
+		let def = match m {
+			DefinitionMatch::Exact(d) => d,
+			DefinitionMatch::Wildcard(_) => return Ok(None),
+		};
 		match &def.default {
 			Some(default) => {
 				let value = default.clone();
 				self.cache.put(tn_id, key.to_string(), value.clone());
-				Ok(value)
+				Ok(Some(value))
 			}
 			None => Err(Error::SettingNotFound(format!(
 				"Setting '{}' has no default and must be configured",
@@ -282,44 +298,60 @@ impl SettingsService {
 	/// Type-safe getters (required - returns error if not found)
 	pub async fn get_string(&self, tn_id: TnId, key: &str) -> ClResult<String> {
 		match self.get(tn_id, key).await? {
-			SettingValue::String(s) => Ok(s),
-			v => Err(Error::ValidationError(format!(
+			Some(SettingValue::String(s)) => Ok(s),
+			Some(v) => Err(Error::ValidationError(format!(
 				"Setting '{}' is not a string, got {}",
 				key,
 				v.type_name()
+			))),
+			None => Err(Error::SettingNotFound(format!(
+				"Setting '{}' has no default and must be configured",
+				key
 			))),
 		}
 	}
 
 	pub async fn get_int(&self, tn_id: TnId, key: &str) -> ClResult<i64> {
 		match self.get(tn_id, key).await? {
-			SettingValue::Int(i) => Ok(i),
-			v => Err(Error::ValidationError(format!(
+			Some(SettingValue::Int(i)) => Ok(i),
+			Some(v) => Err(Error::ValidationError(format!(
 				"Setting '{}' is not an integer, got {}",
 				key,
 				v.type_name()
+			))),
+			None => Err(Error::SettingNotFound(format!(
+				"Setting '{}' has no default and must be configured",
+				key
 			))),
 		}
 	}
 
 	pub async fn get_bool(&self, tn_id: TnId, key: &str) -> ClResult<bool> {
 		match self.get(tn_id, key).await? {
-			SettingValue::Bool(b) => Ok(b),
-			v => Err(Error::ValidationError(format!(
+			Some(SettingValue::Bool(b)) => Ok(b),
+			Some(v) => Err(Error::ValidationError(format!(
 				"Setting '{}' is not a boolean, got {}",
 				key,
 				v.type_name()
+			))),
+			None => Err(Error::SettingNotFound(format!(
+				"Setting '{}' has no default and must be configured",
+				key
 			))),
 		}
 	}
 
 	pub async fn get_json(&self, tn_id: TnId, key: &str) -> ClResult<serde_json::Value> {
 		match self.get(tn_id, key).await? {
-			SettingValue::Json(j) => Ok(j),
-			v => Err(Error::ValidationError(format!(
+			Some(SettingValue::Json(j)) => Ok(j),
+			Some(v) => Err(Error::ValidationError(format!(
 				"Setting '{}' is not JSON, got {}",
 				key,
 				v.type_name()
+			))),
+			None => Err(Error::SettingNotFound(format!(
+				"Setting '{}' has no default and must be configured",
+				key
 			))),
 		}
 	}
@@ -328,39 +360,39 @@ impl SettingsService {
 	/// Still returns error if setting exists but has wrong type
 	pub async fn get_string_opt(&self, tn_id: TnId, key: &str) -> ClResult<Option<String>> {
 		match self.get(tn_id, key).await {
-			Ok(SettingValue::String(s)) => Ok(Some(s)),
-			Ok(v) => Err(Error::ValidationError(format!(
+			Ok(Some(SettingValue::String(s))) => Ok(Some(s)),
+			Ok(Some(v)) => Err(Error::ValidationError(format!(
 				"Setting '{}' is not a string, got {}",
 				key,
 				v.type_name()
 			))),
-			Err(Error::SettingNotFound(_)) => Ok(None),
+			Ok(None) | Err(Error::SettingNotFound(_)) => Ok(None),
 			Err(e) => Err(e),
 		}
 	}
 
 	pub async fn get_int_opt(&self, tn_id: TnId, key: &str) -> ClResult<Option<i64>> {
 		match self.get(tn_id, key).await {
-			Ok(SettingValue::Int(i)) => Ok(Some(i)),
-			Ok(v) => Err(Error::ValidationError(format!(
+			Ok(Some(SettingValue::Int(i))) => Ok(Some(i)),
+			Ok(Some(v)) => Err(Error::ValidationError(format!(
 				"Setting '{}' is not an integer, got {}",
 				key,
 				v.type_name()
 			))),
-			Err(Error::SettingNotFound(_)) => Ok(None),
+			Ok(None) | Err(Error::SettingNotFound(_)) => Ok(None),
 			Err(e) => Err(e),
 		}
 	}
 
 	pub async fn get_bool_opt(&self, tn_id: TnId, key: &str) -> ClResult<Option<bool>> {
 		match self.get(tn_id, key).await {
-			Ok(SettingValue::Bool(b)) => Ok(Some(b)),
-			Ok(v) => Err(Error::ValidationError(format!(
+			Ok(Some(SettingValue::Bool(b))) => Ok(Some(b)),
+			Ok(Some(v)) => Err(Error::ValidationError(format!(
 				"Setting '{}' is not a boolean, got {}",
 				key,
 				v.type_name()
 			))),
-			Err(Error::SettingNotFound(_)) => Ok(None),
+			Ok(None) | Err(Error::SettingNotFound(_)) => Ok(None),
 			Err(e) => Err(e),
 		}
 	}
@@ -371,13 +403,13 @@ impl SettingsService {
 		key: &str,
 	) -> ClResult<Option<serde_json::Value>> {
 		match self.get(tn_id, key).await {
-			Ok(SettingValue::Json(j)) => Ok(Some(j)),
-			Ok(v) => Err(Error::ValidationError(format!(
+			Ok(Some(SettingValue::Json(j))) => Ok(Some(j)),
+			Ok(Some(v)) => Err(Error::ValidationError(format!(
 				"Setting '{}' is not JSON, got {}",
 				key,
 				v.type_name()
 			))),
-			Err(Error::SettingNotFound(_)) => Ok(None),
+			Ok(None) | Err(Error::SettingNotFound(_)) => Ok(None),
 			Err(e) => Err(e),
 		}
 	}

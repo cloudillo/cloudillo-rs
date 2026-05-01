@@ -91,7 +91,9 @@ impl EmailModule {
 	) -> ClResult<()> {
 		// Get max retry attempts from settings (default: 3)
 		let max_retries = match settings_service.get(tn_id, "email.retry_attempts").await {
-			Ok(cloudillo_core::settings::SettingValue::Int(n)) => u16::try_from(n).unwrap_or(3),
+			Ok(Some(cloudillo_core::settings::SettingValue::Int(n))) => {
+				u16::try_from(n).unwrap_or(3)
+			}
 			_ => 3,
 		};
 
@@ -146,7 +148,7 @@ pub fn init(app: &App) -> ClResult<()> {
 /// Returns None if no language preference is set.
 pub async fn get_tenant_lang(settings: &SettingsService, tn_id: TnId) -> Option<String> {
 	match settings.get(tn_id, "profile.lang").await {
-		Ok(cloudillo_core::settings::SettingValue::String(lang)) => Some(lang),
+		Ok(Some(cloudillo_core::settings::SettingValue::String(lang))) => Some(lang),
 		_ => None,
 	}
 }

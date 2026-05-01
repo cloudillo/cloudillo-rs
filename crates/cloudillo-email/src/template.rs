@@ -211,7 +211,7 @@ impl TemplateEngine {
 		// Get template directory from settings
 		let template_dir = self.settings_service.get(tn_id, "email.template_dir").await?;
 
-		let SettingValue::String(template_dir) = template_dir else {
+		let Some(SettingValue::String(template_dir)) = template_dir else {
 			return Err(Error::ConfigError("Invalid template_dir setting".into()));
 		};
 
