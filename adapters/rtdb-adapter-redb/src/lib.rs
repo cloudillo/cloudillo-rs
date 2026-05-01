@@ -180,19 +180,6 @@ impl RtdbAdapterRedb {
 				let tenant_path = dir.join(format!("tn_{}.db", tn_id));
 				let db = redb::Database::create(&tenant_path).map_err(error::from_redb_error)?;
 
-				// Initialize tables
-				{
-					let tx = db.begin_write().map_err(error::from_redb_error)?;
-					let _ =
-						tx.open_table(storage::TABLE_DOCUMENTS).map_err(error::from_redb_error)?;
-					let _ =
-						tx.open_table(storage::TABLE_INDEXES).map_err(error::from_redb_error)?;
-					let _ =
-						tx.open_table(storage::TABLE_METADATA).map_err(error::from_redb_error)?;
-					tx.commit().map_err(error::from_redb_error)?;
-				}
-
-				// Insert data
 				let tx = db.begin_write().map_err(error::from_redb_error)?;
 				{
 					let mut doc_table =
