@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 21;
+	const CURRENT_DB_VERSION: i64 = 23;
 
 	let mut tx = db.begin().await?;
 
@@ -171,6 +171,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			x json,
 			visibility char(1),			-- NULL: Direct (owner only), P: Public, V: Verified,
 										-- 2: 2nd degree, F: Follower, C: Connected
+			hidden INTEGER DEFAULT 0,
 			parent_id text,				-- Folder hierarchy: references file_id of parent folder
 			root_id text,				-- Document tree: access control root file_id
 			accessed_at INTEGER,		-- Global: when anyone last accessed this file
@@ -280,7 +281,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			subject text,
 			content json,
 			expires_at INTEGER,
-			attachments json,
+			attachments text,
 			reactions text,
 			comments integer,
 			comments_read integer,
@@ -1571,6 +1572,68 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.await?;
 
 		set_db_version(&mut tx, 21).await;
+	}
+
+	// Migration v22: backfill root_id for existing meta files.
+	//
+	// Meta database files ({parent_file_id}~meta) should have root_id pointing
+	// to their parent file so they don't appear as standalone entries in listings.
+	if version < 22 {
+		sqlx::query(
+			"UPDATE files SET root_id = SUBSTR(file_id, 1, LENGTH(file_id) - 5) \
+			 WHERE file_id LIKE '%~meta' AND root_id IS NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 22).await;
+	}
+
+	// Migration v23: hidden flag for files (attachments, profile pictures)
+	if version < 23 {
+		sqlx::query("ALTER TABLE files ADD COLUMN hidden INTEGER DEFAULT 0")
+			.execute(&mut *tx)
+			.await?;
+
+		// Backfill: mark files referenced as action attachments as hidden.
+		// Attachments are stored as comma-separated file_ids, so we use a
+		// recursive CTE to split each CSV value and match against files.
+		sqlx::query(
+			"WITH RECURSIVE split(tn_id, val, rest) AS ( \
+				SELECT tn_id, \
+					CASE WHEN INSTR(attachments, ',') > 0 \
+						THEN TRIM(SUBSTR(attachments, 1, INSTR(attachments, ',') - 1)) \
+						ELSE TRIM(attachments) END, \
+					CASE WHEN INSTR(attachments, ',') > 0 \
+						THEN SUBSTR(attachments, INSTR(attachments, ',') + 1) \
+						ELSE NULL END \
+				FROM actions WHERE attachments IS NOT NULL AND attachments != '' \
+				UNION ALL \
+				SELECT tn_id, \
+					CASE WHEN INSTR(rest, ',') > 0 \
+						THEN TRIM(SUBSTR(rest, 1, INSTR(rest, ',') - 1)) \
+						ELSE TRIM(rest) END, \
+					CASE WHEN INSTR(rest, ',') > 0 \
+						THEN SUBSTR(rest, INSTR(rest, ',') + 1) \
+						ELSE NULL END \
+				FROM split WHERE rest IS NOT NULL \
+			) \
+			UPDATE files SET hidden = 1 \
+			WHERE EXISTS ( \
+				SELECT 1 FROM split \
+				WHERE split.val = files.file_id \
+					AND split.tn_id = files.tn_id \
+					AND split.val != '' \
+			)",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		sqlx::query("UPDATE files SET hidden = 1 WHERE preset = 'profile-picture'")
+			.execute(&mut *tx)
+			.await?;
+
+		set_db_version(&mut tx, 23).await;
 	}
 
 	tx.commit().await?;

@@ -531,6 +531,7 @@ pub struct FileView {
 	pub status: FileStatus,
 	pub tags: Option<Vec<Box<str>>>,
 	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
+	pub hidden: bool,
 	pub access_level: Option<crate::types::AccessLevel>, // User's access level to this file (R/W)
 	pub user_data: Option<FileUserData>, // User-specific data (only when authenticated)
 	pub x: Option<serde_json::Value>, // Extensible metadata (e.g., {"dim": [width, height]} for images)
@@ -628,6 +629,8 @@ pub struct ListFileOptions {
 	pub pinned: Option<bool>,
 	/// Filter by starred status (user-specific)
 	pub starred: Option<bool>,
+	/// Hidden file filter. None = exclude hidden (default). Some(true) = only hidden.
+	pub hidden: Option<bool>,
 	/// Sort order: 'recent' (accessed_at), 'modified' (modified_at), 'name', 'created'
 	pub sort: Option<String>,
 	/// Sort direction: 'asc' or 'desc' (default: desc for dates, asc for name)
@@ -663,6 +666,7 @@ pub struct CreateFile {
 	pub tags: Option<Vec<Box<str>>>,
 	pub x: Option<serde_json::Value>,
 	pub visibility: Option<char>, // None: Direct (default), P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
+	pub hidden: bool,
 	pub status: Option<FileStatus>, // None defaults to Pending, can set to Active for shared files
 }
 
@@ -686,6 +690,8 @@ pub struct UpdateFileOptions {
 	pub visibility: Patch<char>,
 	#[serde(default)]
 	pub status: Patch<char>,
+	#[serde(default)]
+	pub hidden: Patch<bool>,
 }
 
 // Share Entries

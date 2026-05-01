@@ -793,6 +793,20 @@ async fn process_inbound_action_attachments(
 		}
 	}
 
+	for attachment in &attachments {
+		let _ = app
+			.meta_adapter
+			.update_file_data(
+				tn_id,
+				attachment,
+				&meta_adapter::UpdateFileOptions {
+					hidden: Patch::Value(true),
+					..Default::default()
+				},
+			)
+			.await;
+	}
+
 	if !attachments.is_empty() {
 		info!(
 			"ATTACHMENTS: {} files - synced={} skipped={} failed={}",

@@ -76,7 +76,7 @@ pub(crate) async fn list(
 			|| matches!(opts.sort.as_deref(), Some("recent" | "modified")));
 
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.x,
+		"SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x,
 		        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
 		        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
 		        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic",
@@ -290,6 +290,12 @@ pub(crate) async fn list(
 		query.push(" AND f.status != 'D'");
 	}
 
+	// Filter by hidden flag
+	match opts.hidden {
+		Some(true) => query.push(" AND f.hidden = 1"),
+		_ => query.push(" AND (f.hidden IS NULL OR f.hidden = 0)"),
+	};
+
 	// Filter by pinned/starred (user-specific)
 	if opts.pinned == Some(true) {
 		query.push(" AND fud.pinned = 1");
@@ -486,6 +492,8 @@ pub(crate) async fn list(
 		// Parse x field as JSON
 		let x: Option<serde_json::Value> = row.try_get("x").ok().flatten();
 
+		let hidden = row.try_get::<Option<i32>, _>("hidden").ok().flatten().unwrap_or(0) != 0;
+
 		Ok(FileView {
 			file_id,
 			parent_id: row.try_get("parent_id").ok(),
@@ -502,6 +510,7 @@ pub(crate) async fn list(
 			status,
 			tags,
 			visibility,
+			hidden,
 			access_level: None, // Computed later by filter_files_by_visibility
 			user_data,
 			x,
@@ -754,8 +763,8 @@ pub(crate) async fn create(
 		}
 	}
 
-	let res = sqlx::query("INSERT INTO files (tn_id, file_id, parent_id, root_id, status, owner_tag, creator_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
-		.bind(tn_id.0).bind(opts.file_id).bind(opts.parent_id).bind(opts.root_id).bind(status).bind(opts.owner_tag).bind(opts.creator_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility)
+	let res = sqlx::query("INSERT INTO files (tn_id, file_id, parent_id, root_id, status, owner_tag, creator_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility, hidden) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
+		.bind(tn_id.0).bind(opts.file_id).bind(opts.parent_id).bind(opts.root_id).bind(status).bind(opts.owner_tag).bind(opts.creator_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility).bind(i32::from(opts.hidden))
 		.fetch_one(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 	Ok(FileId::FId(res.get(0)))
@@ -1027,6 +1036,9 @@ pub(crate) async fn update_data(
 	if !opts.status.is_undefined() {
 		set_clauses.push("status = ?");
 	}
+	if !opts.hidden.is_undefined() {
+		set_clauses.push("hidden = ?");
+	}
 
 	if set_clauses.is_empty() {
 		return Ok(()); // Nothing to update
@@ -1081,6 +1093,14 @@ pub(crate) async fn update_data(
 		};
 		query = query.bind(val);
 	}
+	if !opts.hidden.is_undefined() {
+		let val: Option<i32> = match &opts.hidden {
+			Patch::Null => None,
+			Patch::Value(b) => Some(i32::from(*b)),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
 
 	// Bind WHERE clause params
 	query = query.bind(tn_id.0).bind(file_id_bind);
@@ -1103,7 +1123,7 @@ pub(crate) async fn read(
 			.parse::<i64>()
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.x,
+			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x,
 			        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
 			        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
 			        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic
@@ -1122,7 +1142,7 @@ pub(crate) async fn read(
 	} else {
 		// Content-addressable ID - query by file_id
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.x,
+			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x,
 			        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
 			        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
 			        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic
@@ -1166,6 +1186,8 @@ pub(crate) async fn read(
 			// Parse x field as JSON
 			let x: Option<serde_json::Value> = row.try_get("x").ok().flatten();
 
+			let hidden = row.try_get::<Option<i32>, _>("hidden").ok().flatten().unwrap_or(0) != 0;
+
 			Ok(Some(FileView {
 				file_id: row.try_get("file_id").map_err(|_| Error::DbError)?,
 				parent_id: row.try_get("parent_id").ok(),
@@ -1185,6 +1207,7 @@ pub(crate) async fn read(
 				status,
 				tags,
 				visibility,
+				hidden,
 				access_level: None, // Computed later by filter_files_by_visibility
 				user_data: None,    // Not fetched in single-file read
 				x,

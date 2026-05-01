@@ -214,6 +214,7 @@ async fn ensure_meta_file(
 	app: &crate::app::App,
 	tn_id: crate::types::TnId,
 	meta_file_id: &str,
+	parent_file_id: &str,
 ) -> Result<(), FileAccessError> {
 	// Check if meta file already exists
 	match app.meta_adapter.read_file(tn_id, meta_file_id).await {
@@ -229,6 +230,7 @@ async fn ensure_meta_file(
 		content_type: "application/json".into(),
 		file_name: meta_file_id.into(),
 		status: Some(FileStatus::Active),
+		root_id: Some(parent_file_id.into()),
 		..Default::default()
 	};
 
@@ -334,7 +336,8 @@ pub async fn get_ws_rtdb(
 	let is_meta = meta_parent.is_some();
 	let access_file_id = if let Some(parent_file_id) = meta_parent {
 		if !is_guest
-			&& let Err(e) = ensure_meta_file(&app, crate::types::TnId(tn_id), &file_id).await
+			&& let Err(e) =
+				ensure_meta_file(&app, crate::types::TnId(tn_id), &file_id, parent_file_id).await
 		{
 			return ws_close_for_error(ws, &e);
 		}

@@ -190,6 +190,10 @@ pub async fn get_file_list(
 	};
 	opts.visible_levels = access_level.visible_levels().map(<[char]>::to_vec);
 
+	if !is_tenant {
+		opts.hidden = None;
+	}
+
 	let limit = opts.limit.unwrap_or(30) as usize;
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
 

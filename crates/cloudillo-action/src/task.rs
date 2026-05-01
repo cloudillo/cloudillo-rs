@@ -455,10 +455,27 @@ impl Task<App> for ActionCreatorTask {
 			}
 		}
 
-		// 1c. Resolve subject reference (@a_id → action_id)
+		// 1c. Mark attachments as hidden
+		if let Some(ref attachment_ids) = attachments {
+			for file_id in attachment_ids {
+				let _ = app
+					.meta_adapter
+					.update_file_data(
+						self.tn_id,
+						file_id,
+						&meta_adapter::UpdateFileOptions {
+							hidden: Patch::Value(true),
+							..Default::default()
+						},
+					)
+					.await;
+			}
+		}
+
+		// 1d. Resolve subject reference (@a_id → action_id)
 		let subject = resolve_subject(app, self.tn_id, self.action.subject.as_deref()).await?;
 
-		// 1d. Resolve audience from parent action if not explicitly set
+		// 1e. Resolve audience from parent action if not explicitly set
 		// This enables federation for conversation messages (MSG in CONV) and similar hierarchical actions
 		let resolved_audience = if self.action.audience_tag.is_none() {
 			helpers::resolve_parent_audience(
@@ -474,7 +491,7 @@ impl Task<App> for ActionCreatorTask {
 
 		let dsl = app.ext::<Arc<DslEngine>>()?;
 
-		// 1e. Regenerate key if subject was resolved (changed from @xxx to a1~xxx)
+		// 1f. Regenerate key if subject was resolved (changed from @xxx to a1~xxx)
 		let resolved_key = if subject.is_some()
 			&& self.action.subject.as_ref().is_some_and(|s| s.starts_with('@'))
 		{

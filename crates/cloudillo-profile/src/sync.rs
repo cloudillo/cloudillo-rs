@@ -263,6 +263,17 @@ async fn sync_profile_pic_variant(
 			id_tag,
 			file_id
 		);
+		let _ = app
+			.meta_adapter
+			.update_file_data(
+				tn_id,
+				file_id,
+				&cloudillo_types::meta_adapter::UpdateFileOptions {
+					hidden: cloudillo_types::types::Patch::Value(true),
+					..Default::default()
+				},
+			)
+			.await;
 		Ok(())
 	} else if vis_pf_skipped {
 		tracing::debug!(

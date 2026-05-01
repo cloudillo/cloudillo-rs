@@ -116,6 +116,7 @@ pub async fn put_profile_image(
 				tags: Some(vec!["profile".into()]),
 				x: Some(json!({ "dim": dim })),
 				visibility: Some('P'), // Profile pics are always public
+				hidden: true,
 				..Default::default()
 			},
 		)
