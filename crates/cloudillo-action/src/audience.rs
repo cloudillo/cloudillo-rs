@@ -13,6 +13,7 @@
 //! 4. None
 
 use crate::prelude::*;
+use crate::subject_ref::{SubjectRef, parse_subject_ref};
 use cloudillo_types::meta_adapter::MetaAdapter;
 
 /// Resolution source - indicates where the audience was resolved from
@@ -91,11 +92,18 @@ pub async fn resolve_audience<M: MetaAdapter + ?Sized>(
 	if uses_subject_for_audience(action_type)
 		&& let Some(subject_id) = subject
 	{
-		// Skip @reference placeholders - they're not resolved yet
-		if !subject_id.starts_with('@')
-			&& let Ok(Some(subject_action)) = meta_adapter.get_action(tn_id, subject_id).await
-		{
-			return Ok(ResolvedAudience::from_subject(subject_action.issuer.id_tag));
+		match parse_subject_ref(subject_id) {
+			Some(SubjectRef::Identity(id_tag)) => {
+				// Identity subject IS the tenant — use it directly.
+				return Ok(ResolvedAudience::from_subject(id_tag.into()));
+			}
+			Some(SubjectRef::Action(_)) => {
+				if let Ok(Some(subject_action)) = meta_adapter.get_action(tn_id, subject_id).await {
+					return Ok(ResolvedAudience::from_subject(subject_action.issuer.id_tag));
+				}
+			}
+			// Placeholder not yet resolved, or empty — skip.
+			Some(SubjectRef::Placeholder(_)) | None => {}
 		}
 	}
 

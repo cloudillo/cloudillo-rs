@@ -215,6 +215,73 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				.ok()
 				.flatten();
 
+			// If a community-membership INVT for this issuer is on record,
+			// treat the inbound CONN as pre-authorized: auto-accept and
+			// bypass the connection_mode='I' rejection.
+			// Matches only when the local tenant IS the community itself
+			// (subject in the INVT = community = local_tag); action-based
+			// invites have a different subject and fall through to the
+			// connection_mode arm below.
+			let invt_opts = cloudillo_types::meta_adapter::ListActionOptions {
+				typ: Some(vec!["INVT".to_string()]),
+				subject: Some(local_tag.to_string()),
+				audience: Some(context.issuer.clone()),
+				status: Some(vec!["A".to_string()]),
+				limit: Some(1),
+				..Default::default()
+			};
+			let has_pending_invitation = app
+				.meta_adapter
+				.list_actions(tn_id, &invt_opts)
+				.await
+				.is_ok_and(|rs| !rs.is_empty());
+
+			if has_pending_invitation {
+				// Invitation-backed CONN auto-accept always grants baseline "member"
+				// role; elevated roles require explicit community admin action.
+				debug!("CONN: Auto-accepting invitation-backed connection from {}", context.issuer);
+
+				let response_action = CreateAction {
+					typ: "CONN".into(),
+					sub_typ: Some("ACC".into()),
+					audience_tag: Some(context.issuer.clone().into()),
+					..Default::default()
+				};
+				if let Err(e) =
+					create_action(&app, tn_id, &context.tenant_tag, response_action).await
+				{
+					warn!("CONN: Failed to create invitation-accept response: {}", e);
+				}
+
+				let profile_upsert = UpsertProfileFields {
+					connected: Patch::Value(ProfileConnectionStatus::Connected),
+					following: if context.tenant_type == "community" {
+						Patch::Undefined
+					} else {
+						Patch::Value(true)
+					},
+					roles: Patch::Value(Some(vec!["member".into()])),
+					..Default::default()
+				};
+				if let Err(e) =
+					app.meta_adapter.upsert_profile(tn_id, &context.issuer, &profile_upsert).await
+				{
+					warn!("CONN: Failed to update issuer profile {}: {}", context.issuer, e);
+				}
+
+				let update_opts =
+					UpdateActionDataOptions { status: Patch::Value('N'), ..Default::default() };
+				if let Err(e) = app
+					.meta_adapter
+					.update_action_data(tn_id, &context.action_id, &update_opts)
+					.await
+				{
+					warn!("CONN: Failed to update action status to N: {}", e);
+				}
+
+				return Ok(HookResult::default());
+			}
+
 			match connection_mode.as_deref() {
 				Some("I") => {
 					// IGNORE mode: Auto-delete/reject the connection request

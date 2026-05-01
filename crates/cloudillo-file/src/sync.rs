@@ -117,6 +117,7 @@ fn verify_content_hash(data: &[u8], expected_id: &str) -> ClResult<()> {
 /// * `file_id` - The file ID to sync
 /// * `variants` - Optional list of specific variants to sync (None = all up to max setting)
 /// * `auth` - Whether to use authenticated requests (true for direct-visibility files, false for public)
+/// * `visibility` - Visibility character to assign to a newly created file row (None → 'D')
 ///
 /// # Returns
 /// Ok(SyncResult) with details of what was synced
@@ -127,6 +128,7 @@ pub async fn sync_file_variants(
 	file_id: &str,
 	variants: Option<&[&str]>,
 	auth: bool,
+	visibility: Option<char>,
 ) -> ClResult<SyncResult> {
 	let mut result = SyncResult { file_id: file_id.to_string(), ..Default::default() };
 
@@ -261,7 +263,7 @@ pub async fn sync_file_variants(
 				.into(),
 			file_name: remote_file.file_name.into(),
 			created_at: Some(remote_file.created_at),
-			visibility: Some('D'), // Direct visibility for synced files
+			visibility: Some(visibility.unwrap_or('D')),
 			..Default::default()
 		};
 
@@ -299,11 +301,8 @@ pub async fn sync_file_variants(
 		// Determine blob size and availability
 		let (blob_size, available) = if should_sync_content {
 			// This variant should have its content synced
-			let blob_exists = app.blob_adapter.stat_blob(tn_id, variant_id).await.is_some();
-
-			if blob_exists {
+			if let Some(size) = app.blob_adapter.stat_blob(tn_id, variant_id).await {
 				// Blob already exists - use its size
-				let size = app.blob_adapter.stat_blob(tn_id, variant_id).await.unwrap_or(0);
 				debug!("  variant {} blob already exists", variant_name);
 				result.skipped_variants.push(variant_name.to_string());
 				(size, true)

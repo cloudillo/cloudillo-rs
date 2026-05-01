@@ -249,7 +249,8 @@ async fn sync_profile_pic_variant(
 	);
 
 	// Sync only the 'vis.pf' variant for profile pictures (public, no auth needed)
-	let result = sync_file_variants(app, tn_id, id_tag, file_id, Some(&["vis.pf"]), false).await?;
+	let result =
+		sync_file_variants(app, tn_id, id_tag, file_id, Some(&["vis.pf"]), false, None).await?;
 
 	// Check if vis.pf was specifically synced or skipped (already exists)
 	let vis_pf_synced = result.synced_variants.iter().any(|v| v == "vis.pf");

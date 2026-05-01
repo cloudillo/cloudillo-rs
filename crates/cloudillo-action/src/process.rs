@@ -293,7 +293,8 @@ async fn process_inbound_action_token_inner(
 		let default_visibility =
 			match app.settings.get_string(tn_id, "privacy.default_visibility").await {
 				Ok(default_vis) => default_vis.chars().next().unwrap_or('F'),
-				Err(_) => 'F',
+				Err(Error::SettingNotFound(_)) => 'F',
+				Err(e) => return Err(e),
 			};
 
 		// Use action visibility (or default if not set),
@@ -307,7 +308,7 @@ async fn process_inbound_action_token_inner(
 	};
 
 	// 6. Store action in database
-	store_inbound_action(
+	let stored = store_inbound_action(
 		app,
 		&InboundActionContext {
 			tn_id,
@@ -320,11 +321,22 @@ async fn process_inbound_action_token_inner(
 			visibility: resolved_visibility,
 		},
 	)
-	.await;
+	.await?;
+
+	if !stored {
+		return Ok(None);
+	}
 
 	// 7. Process attachments (async only)
 	if !is_sync && let Some(ref attachments) = action.a {
-		process_inbound_action_attachments(app, tn_id, &action.iss, attachments.clone()).await?;
+		process_inbound_action_attachments(
+			app,
+			tn_id,
+			&action.iss,
+			resolved_visibility,
+			attachments.clone(),
+		)
+		.await?;
 	}
 
 	// 8. Unified post-store processing (hooks, WebSocket, fanout, auto-approve)
@@ -665,8 +677,9 @@ struct InboundActionContext<'a> {
 	visibility: Option<char>,
 }
 
-/// Store inbound action in database
-async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) {
+/// Store inbound action in database.
+/// Returns `Ok(true)` if stored, `Ok(false)` if duplicate.
+async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) -> ClResult<bool> {
 	let action = ctx.action;
 	let (action_type, sub_type) = helpers::extract_type_and_subtype(&action.t);
 	let sub_type_ref = sub_type.as_deref();
@@ -707,7 +720,7 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) {
 	};
 
 	match app.meta_adapter.create_action(ctx.tn_id, &inbound_action, key.as_deref()).await {
-		Ok(_) => {
+		Ok(meta_adapter::ActionId::AId(_)) => {
 			info!("← STORED: {}", ctx.action_id);
 			let update_opts = meta_adapter::UpdateActionDataOptions {
 				status: cloudillo_types::types::Patch::Value('A'),
@@ -721,7 +734,7 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) {
 				warn!("  failed to set inbound action status to active: {}", e);
 			}
 		}
-		Err(e) => {
+		Ok(meta_adapter::ActionId::ActionId(_)) => {
 			if ctx.is_conn_action
 				&& let Some(ip) = ctx.client_ip
 			{
@@ -733,7 +746,12 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) {
 				}
 				debug!("CONN duplicate detected from {} - PoW counter incremented", action.iss);
 			}
-			debug!("  failed to store inbound action: {} (may be duplicate)", e);
+			debug!("  duplicate inbound action: {}", ctx.action_id);
+			return Ok(false);
+		}
+		Err(e) => {
+			warn!("  failed to store inbound action: {}", e);
+			return Err(e);
 		}
 	}
 
@@ -744,12 +762,14 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) {
 	{
 		debug!("  failed to store inbound action token: {} (may be duplicate)", e);
 	}
+	Ok(true)
 }
 
 async fn process_inbound_action_attachments(
 	app: &App,
 	tn_id: TnId,
 	id_tag: &str,
+	visibility: Option<char>,
 	attachments: Vec<Box<str>>,
 ) -> ClResult<()> {
 	use cloudillo_file::sync::sync_file_variants;
@@ -760,7 +780,7 @@ async fn process_inbound_action_attachments(
 
 	for attachment in &attachments {
 		debug!("  syncing attachment: {}", attachment);
-		match sync_file_variants(app, tn_id, id_tag, attachment, None, true).await {
+		match sync_file_variants(app, tn_id, id_tag, attachment, None, true, visibility).await {
 			Ok(result) => {
 				total_synced += result.synced_variants.len();
 				total_skipped += result.skipped_variants.len();

@@ -23,6 +23,7 @@ use crate::{
 	post_store::{self, ProcessingContext},
 	prelude::*,
 	process,
+	subject_ref::{SubjectRef, parse_subject_ref},
 };
 
 pub async fn create_action(
@@ -127,7 +128,7 @@ pub async fn create_action(
 			}
 			if let Some(flag) = behavior.as_ref().and_then(|b| b.gated_by_subject_flag)
 				&& let Some(ref subject_id) = action.subject
-				&& !subject_id.starts_with('@')
+				&& matches!(parse_subject_ref(subject_id), Some(SubjectRef::Action(_)))
 				&& let Ok(Some(subject)) = app.meta_adapter.get_action(tn_id, subject_id).await
 				&& !helpers::is_capability_enabled(subject.flags.as_deref(), flag)
 			{
@@ -270,10 +271,12 @@ pub async fn create_action(
 		Vec::new()
 	};
 
-	// Collect subject dependency if it references a pending action
-	let subject_key = action.subject.as_ref().and_then(|s| {
-		s.strip_prefix('@')
-			.map(|a_id_str| format!("{},{}", tn_id, a_id_str).into_boxed_str())
+	// Collect subject dependency if it references a pending action.
+	// Only `@<digits>` placeholders produce a dependency; identity refs
+	// (`@<id_tag>`) and resolved action IDs do not.
+	let subject_key = action.subject.as_deref().and_then(|s| match parse_subject_ref(s) {
+		Some(SubjectRef::Placeholder(a_id)) => Some(format!("{},{}", tn_id, a_id).into_boxed_str()),
+		_ => None,
 	});
 
 	debug!(
@@ -601,7 +604,12 @@ async fn resolve_attachments(
 	Ok(Some(resolved))
 }
 
-/// Resolve subject reference (@a_id → action_id)
+/// Resolve subject reference.
+///
+/// - `@<digits>` (in-batch placeholder) → fetches the action's `action_id`.
+/// - `@<id_tag>` (identity reference) → preserved verbatim through
+///   federation; the receiver sees the same string.
+/// - bare action id (e.g. `a1~…`) → preserved verbatim.
 async fn resolve_subject(
 	app: &App,
 	tn_id: TnId,
@@ -611,13 +619,13 @@ async fn resolve_subject(
 		return Ok(None);
 	};
 
-	if let Some(a_id_str) = subject.strip_prefix('@') {
-		let a_id: u64 = a_id_str.parse()?;
-		let action_id = app.meta_adapter.get_action_id(tn_id, a_id).await?;
-		Ok(Some(action_id))
-	} else {
-		// Already resolved or external action ID
-		Ok(Some(subject.into()))
+	match parse_subject_ref(subject) {
+		Some(SubjectRef::Placeholder(a_id)) => {
+			let action_id = app.meta_adapter.get_action_id(tn_id, a_id).await?;
+			Ok(Some(action_id))
+		}
+		Some(SubjectRef::Identity(_) | SubjectRef::Action(_)) => Ok(Some(subject.into())),
+		None => Ok(None),
 	}
 }
 
@@ -761,20 +769,36 @@ async fn schedule_delivery(
 	let deliver_to_subject_owner =
 		behavior.as_ref().and_then(|b| b.deliver_to_subject_owner).unwrap_or(false);
 
-	if deliver_to_subject_owner && let Some(ref subject_id) = action.subject {
-		// Look up the subject action to find its owner
-		if let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await {
-			let subject_owner = &subject_action.issuer.id_tag;
-			// Add subject owner if not already in recipients and not self
-			if subject_owner.as_ref() != id_tag
-				&& !recipients.iter().any(|r| r.as_ref() == subject_owner.as_ref())
-			{
-				info!(
-					"→ DUAL DELIVERY: Adding subject owner {} for {} (deliver_to_subject_owner)",
-					subject_owner, action_id
-				);
-				recipients.push(subject_owner.clone());
-			}
+	if deliver_to_subject_owner
+		&& let Some(subject_id) = action.subject.as_deref()
+		&& let Some(sref) = parse_subject_ref(subject_id)
+	{
+		// Resolve the "subject owner" tenant id_tag based on subject form.
+		// - Identity: the subject IS the tenant.
+		// - Action: look up the action and use its issuer.
+		// - Placeholder: should already be resolved to Action by
+		//   resolve_subject before this point; defensive None.
+		let subject_owner: Option<Box<str>> = match sref {
+			SubjectRef::Identity(id_tag) => Some(id_tag.into()),
+			SubjectRef::Action(_) => app
+				.meta_adapter
+				.get_action(tn_id, subject_id)
+				.await
+				.ok()
+				.flatten()
+				.map(|sa| sa.issuer.id_tag),
+			SubjectRef::Placeholder(_) => None,
+		};
+
+		if let Some(subject_owner) = subject_owner
+			&& subject_owner.as_ref() != id_tag
+			&& !recipients.iter().any(|r| r.as_ref() == subject_owner.as_ref())
+		{
+			info!(
+				"→ DUAL DELIVERY: Adding subject owner {} for {} (deliver_to_subject_owner)",
+				subject_owner, action_id
+			);
+			recipients.push(subject_owner);
 		}
 	}
 
@@ -815,8 +839,16 @@ async fn schedule_delivery(
 	// Check if this action type should deliver its subject along with it
 	let deliver_subject = behavior.as_ref().and_then(|b| b.deliver_subject).unwrap_or(false);
 
-	let related_action_id =
-		if deliver_subject { action.subject.as_deref().map(Into::into) } else { None };
+	// Identity-typed subjects (`@<id_tag>`) reference a tenant, not an
+	// action — there is no related token to attach.
+	let related_action_id = if deliver_subject {
+		action.subject.as_deref().and_then(|s| match parse_subject_ref(s) {
+			Some(SubjectRef::Action(_)) => Some(s.into()),
+			_ => None,
+		})
+	} else {
+		None
+	};
 
 	for recipient_tag in recipients {
 		debug!("Creating delivery task for action {} to {}", action_id, recipient_tag);

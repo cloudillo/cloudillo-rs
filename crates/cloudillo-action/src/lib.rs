@@ -20,6 +20,7 @@ pub mod perm;
 pub(crate) mod post_store;
 mod process;
 pub mod settings;
+pub mod subject_ref;
 pub mod task;
 
 mod prelude;

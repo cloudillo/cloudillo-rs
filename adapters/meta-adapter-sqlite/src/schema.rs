@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 20;
+	const CURRENT_DB_VERSION: i64 = 21;
 
 	let mut tx = db.begin().await?;
 
@@ -1555,6 +1555,22 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		}
 
 		set_db_version(&mut tx, 20).await;
+	}
+
+	// Migration v21: index actions by (tn_id, subject, type).
+	//
+	// Speeds up community-INVT lookups (`type='INVT' AND subject=<community
+	// id_tag>`) used by the leader's Invitations sub-tab and by the CONN
+	// on_receive bypass that auto-accepts invitation-backed connections.
+	if version < 21 {
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_actions_subject_type \
+			 ON actions(tn_id, subject, type) WHERE subject IS NOT NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 21).await;
 	}
 
 	tx.commit().await?;

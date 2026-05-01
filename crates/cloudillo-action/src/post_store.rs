@@ -19,6 +19,7 @@ use crate::{
 	forward, helpers,
 	hooks::{HookContext, HookType},
 	prelude::*,
+	subject_ref::{SubjectRef, parse_subject_ref},
 };
 use std::collections::HashSet;
 
@@ -356,18 +357,34 @@ async fn schedule_delivery(
 		behavior.as_ref().and_then(|b| b.deliver_to_subject_owner).unwrap_or(false);
 
 	if deliver_to_subject_owner
-		&& let Some(ref subject_id) = action.subject
-		&& let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await
+		&& let Some(subject_id) = action.subject.as_deref()
+		&& let Some(sref) = parse_subject_ref(subject_id)
 	{
-		let subject_owner = &subject_action.issuer.id_tag;
-		if subject_owner.as_ref() != action.issuer_tag.as_ref()
+		// Resolve "subject owner" tenant id_tag based on subject form.
+		// - Identity: the subject IS the tenant.
+		// - Action: look up the action and use its issuer.
+		// - Placeholder: should already be resolved before this point.
+		let subject_owner: Option<Box<str>> = match sref {
+			SubjectRef::Identity(id_tag) => Some(id_tag.into()),
+			SubjectRef::Action(_) => app
+				.meta_adapter
+				.get_action(tn_id, subject_id)
+				.await
+				.ok()
+				.flatten()
+				.map(|sa| sa.issuer.id_tag),
+			SubjectRef::Placeholder(_) => None,
+		};
+
+		if let Some(subject_owner) = subject_owner
+			&& subject_owner.as_ref() != action.issuer_tag.as_ref()
 			&& !recipients.iter().any(|r| r.as_ref() == subject_owner.as_ref())
 		{
 			info!(
 				"→ DUAL DELIVERY: Adding subject owner {} for {} (deliver_to_subject_owner)",
 				subject_owner, action.action_id
 			);
-			recipients.push(subject_owner.clone());
+			recipients.push(subject_owner);
 		}
 	}
 
@@ -388,10 +405,18 @@ async fn schedule_delivery(
 		}
 	}
 
-	// Check if this action type should deliver its subject along with it
+	// Check if this action type should deliver its subject along with it.
+	// Identity-typed subjects (`@<id_tag>`) reference a tenant, not an
+	// action — there is no related token to attach.
 	let deliver_subject = behavior.as_ref().and_then(|b| b.deliver_subject).unwrap_or(false);
-	let related_action_id =
-		if deliver_subject { action.subject.as_deref().map(Into::into) } else { None };
+	let related_action_id = if deliver_subject {
+		action.subject.as_deref().and_then(|s| match parse_subject_ref(s) {
+			Some(SubjectRef::Action(_)) => Some(s.into()),
+			_ => None,
+		})
+	} else {
+		None
+	};
 
 	let retry_policy = RetryPolicy::new((10, 43200), 50);
 
