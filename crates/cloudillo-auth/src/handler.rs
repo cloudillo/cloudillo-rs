@@ -18,6 +18,7 @@ use cloudillo_core::{
 	extract::{IdTag, OptionalAuth, OptionalRequestId},
 	rate_limit::{PenaltyReason, RateLimitApi},
 	roles::expand_roles,
+	settings::SettingValue,
 };
 use cloudillo_email::{EmailModule, EmailTaskParams, get_tenant_lang};
 use cloudillo_ref::service::{CreateRefInternalParams, create_ref_internal};
@@ -629,15 +630,7 @@ pub async fn get_access_token(
 
 		info!("Got access token from API key: {}", &token_result);
 
-		// Create AuthLogin and use return_login for consistent response
-		let auth_login = auth_adapter::AuthLogin {
-			tn_id,
-			id_tag: validation.id_tag,
-			roles: validation.roles.map(|r| r.split(',').map(Into::into).collect()),
-			token: token_result,
-		};
-		let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
-		let response = ApiResponse::new(serde_json::to_value(login_data)?)
+		let response = ApiResponse::new(json!({ "token": token_result }))
 			.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else {
@@ -791,10 +784,56 @@ pub async fn post_set_password(
 		return Err(Error::ValidationError("Password must be at least 8 characters".into()));
 	}
 
-	// Use the ref - this validates type, expiration, counter, and decrements it
-	// Returns the tenant ID, id_tag, and ref data that owns this ref
+	// Validate the ref non-destructively first so we can refuse to consume
+	// the counter when the IDP-activation gate is still engaged. The user
+	// will retry from the same welcome link after activating their identity.
 	let (tn_id, id_tag, _ref_data) = app
 		.meta_adapter
+		.validate_ref(&req.ref_id, &["welcome", "password"])
+		.await
+		.map_err(|e| {
+			warn!("Failed to validate ref {}: {}", req.ref_id, e);
+			match e {
+				Error::NotFound => Error::ValidationError("Invalid or expired reference".into()),
+				Error::ValidationError(_) => e,
+				_ => Error::ValidationError("Invalid reference".into()),
+			}
+		})?;
+
+	// Defence-in-depth: the frontend gates the password form on
+	// /api/refs/{refId}/idp-status, but a curl client could otherwise post
+	// straight here with an active welcome ref. Reject while the gate is
+	// engaged; the counter is preserved (validate_ref doesn't decrement) so
+	// the user can retry after activating.
+	//
+	// Fail closed on transient settings-adapter errors — if we cannot tell
+	// whether the gate is engaged we must not silently allow the password set.
+	match app.settings.get(tn_id, "ui.onboarding").await {
+		Ok(Some(SettingValue::String(ref s))) if s == "verify-idp" => {
+			return Err(Error::ValidationError(
+				"Identity is not yet activated. Please click the activation link \
+				 in your identity-provider email first."
+					.into(),
+			));
+		}
+		Ok(Some(_) | None) => {}
+		Err(e) => {
+			warn!(error = %e, ?tn_id, "Failed to read ui.onboarding gate; rejecting set-password");
+			return Err(Error::ValidationError(
+				"Unable to verify identity activation status, please try again".into(),
+			));
+		}
+	}
+
+	info!(
+		tn_id = ?tn_id,
+		id_tag = %id_tag,
+		ref_id = %req.ref_id,
+		"Setting password via reference"
+	);
+
+	// Consume the ref now that we're committed to the success path.
+	app.meta_adapter
 		.use_ref(&req.ref_id, &["welcome", "password"])
 		.await
 		.map_err(|e| {
@@ -805,13 +844,6 @@ pub async fn post_set_password(
 				_ => Error::ValidationError("Invalid reference".into()),
 			}
 		})?;
-
-	info!(
-		tn_id = ?tn_id,
-		id_tag = %id_tag,
-		ref_id = %req.ref_id,
-		"Setting password via reference"
-	);
 
 	// Update the password
 	app.auth_adapter.update_tenant_password(&id_tag, &req.new_password).await?;

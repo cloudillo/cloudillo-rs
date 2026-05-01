@@ -85,6 +85,10 @@ fn init_protected_routes(app: App) -> Router<App> {
 			"/api/admin/tenants/{id_tag}/password-reset",
 			post(admin::tenant::send_password_reset),
 		)
+		.route(
+			"/api/admin/tenants/{id_tag}/purge",
+			post(admin::tenant::purge_tenant_handler),
+		)
 		.route("/api/admin/email/test", post(admin::email::send_test_email))
 		.route("/api/admin/cert-status", get(admin::cert::get_cert_status))
 		// Proxy site management
@@ -356,6 +360,18 @@ fn init_public_routes(app: App) -> Router<App> {
 		.route("/ws/crdt/{doc_id}", any(websocket::get_ws_crdt))
 		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "websocket", app.opts.mode));
 
+	// --- Ref-Scoped Resend (auth bucket) ---
+	// Sends an activation email on every call — gets the same tight bucket as
+	// other email-sending unauthenticated endpoints (forgot-password etc.).
+	// Per-tenant cooldown inside the handler stops same-tenant abuse from
+	// rotated IPs; the auth bucket stops same-IP abuse against many tenants.
+	let resend_activation_router = Router::new()
+		.route(
+			"/api/refs/{ref_id}/resend-activation",
+			post(profile::idp_status::post_ref_resend_activation),
+		)
+		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "auth", app.opts.mode));
+
 	// --- General Public API (relaxed rate limiting) ---
 	// Read-only endpoints with visibility-based access control
 	let general_public_router = Router::new()
@@ -365,6 +381,16 @@ fn init_public_routes(app: App) -> Router<App> {
 
 		// Public References
 		.route("/api/refs/{ref_id}", get(r#ref::handler::get_ref))
+
+		// Ref-scoped IDP onboarding gate (read-only status check)
+		// Gates the unauthenticated welcome (set-password) page on IDP
+		// activation. The refId is the credential — same trust model as the
+		// existing `/api/refs/{ref_id}` lookup and `/api/auth/set-password`.
+		// The companion resend route is on its own tighter bucket above.
+		.route(
+			"/api/refs/{ref_id}/idp-status",
+			get(profile::idp_status::get_ref_idp_status),
+		)
 
 		// IDP Discovery and Activation
 		.route("/api/idp/info", get(idp::handler::get_idp_info))
@@ -385,6 +411,7 @@ fn init_public_routes(app: App) -> Router<App> {
 	Router::new()
 		.merge(auth_public_router)
 		.merge(profile_creation_router)
+		.merge(resend_activation_router)
 		.merge(token_exchange_router)
 		.merge(federation_router)
 		.merge(websocket_router)

@@ -26,15 +26,15 @@ use crate::prelude::*;
 /// Check if IDP functionality is enabled for a tenant
 async fn check_idp_enabled(app: &App, tn_id: TnId) -> ClResult<()> {
 	match app.settings.get(tn_id, "idp.enabled").await {
-		Ok(SettingValue::Bool(true)) => {
+		Ok(Some(SettingValue::Bool(true))) => {
 			debug!(tn_id = tn_id.0, "IDP enabled for tenant");
 			Ok(())
 		}
-		Ok(SettingValue::Bool(false)) => {
+		Ok(Some(SettingValue::Bool(false)) | None) => {
 			warn!(tn_id = tn_id.0, "IDP not enabled for tenant");
 			Err(Error::NotFound)
 		}
-		Ok(_) => {
+		Ok(Some(_)) => {
 			warn!(tn_id = tn_id.0, "Invalid idp.enabled setting value");
 			Err(Error::ConfigError("Invalid idp.enabled setting value (expected boolean)".into()))
 		}
@@ -360,6 +360,7 @@ pub async fn create_identity(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(idp_domain): IdTag,
+	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(create_req): Json<CreateIdentityRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
@@ -412,11 +413,17 @@ pub async fn create_identity(
 
 	// Get renewal interval from settings (in days) and convert to seconds
 	let renewal_interval_days = match app.settings.get(tn_id, "idp.renewal_interval").await {
-		Ok(SettingValue::Int(days)) => days,
-		Ok(_) => {
+		Ok(Some(SettingValue::Int(days))) => days,
+		Ok(Some(_)) => {
 			warn!(tn_id = tn_id.0, "Invalid idp.renewal_interval setting value");
 			return Err(Error::ConfigError(
 				"Invalid idp.renewal_interval setting value (expected integer days)".into(),
+			));
+		}
+		Ok(None) => {
+			warn!(tn_id = tn_id.0, "idp.renewal_interval setting is not configured");
+			return Err(Error::ConfigError(
+				"idp.renewal_interval setting is not configured".into(),
 			));
 		}
 		Err(e) => {
@@ -477,7 +484,7 @@ pub async fn create_identity(
 		id_tag_prefix: &id_tag_prefix,
 		id_tag_domain: &id_tag_domain,
 		email: create_req.email.as_deref(),
-		registrar_id_tag: &idp_domain,
+		registrar_id_tag: &auth.id_tag,
 		owner_id_tag: create_req.owner_id_tag.as_deref(),
 		status: initial_status,
 		address: create_req.address.as_deref(),
@@ -888,19 +895,19 @@ pub async fn get_idp_info(
 
 	// Get the provider name from settings
 	let name = match app.settings.get(tn_id, "idp.name").await {
-		Ok(SettingValue::String(s)) if !s.is_empty() => s,
+		Ok(Some(SettingValue::String(s))) if !s.is_empty() => s,
 		_ => domain.clone(), // Fallback to domain if name not set
 	};
 
 	// Get the provider info text from settings
 	let info = match app.settings.get(tn_id, "idp.info").await {
-		Ok(SettingValue::String(s)) => s,
+		Ok(Some(SettingValue::String(s))) => s,
 		_ => String::new(),
 	};
 
 	// Get the optional URL from settings
 	let url = match app.settings.get(tn_id, "idp.url").await {
-		Ok(SettingValue::String(s)) if !s.is_empty() => Some(s),
+		Ok(Some(SettingValue::String(s))) if !s.is_empty() => Some(s),
 		_ => None,
 	};
 
@@ -931,9 +938,8 @@ pub struct CheckAvailabilityQuery {
 
 /// GET /api/idp/check-availability - Check if an identity id_tag is available
 ///
-/// This endpoint checks if an identity is available for registration within the
-/// authenticated tenant's domain. The identity must belong to the same domain as
-/// the authenticated tenant.
+/// Intentionally unauthenticated (public, rate-limited) to support
+/// registration UX. Reveals only whether a prefix is taken, not who owns it.
 #[axum::debug_handler]
 pub async fn check_identity_availability(
 	State(app): State<App>,
