@@ -183,6 +183,12 @@ pub trait CrdtAdapter: Debug + Send + Sync {
 	///
 	/// Useful for administrative tasks and migrations.
 	async fn list_docs(&self, tn_id: TnId) -> ClResult<Vec<Box<str>>>;
+
+	/// Delete every CRDT document owned by the tenant.
+	///
+	/// Used by tenant purge orchestration. Implementations should treat a
+	/// missing tenant store as success.
+	async fn delete_tenant_documents(&self, tn_id: TnId) -> ClResult<()>;
 }
 
 // vim: ts=4

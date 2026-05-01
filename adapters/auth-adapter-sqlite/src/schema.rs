@@ -51,6 +51,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Tenants
 	// status: 'A' = Active (normal). 'S' = Suspended (set by ACME renewal task once a
 	// cert has expired with renewal still failing — flipped back to 'A' on next success).
+	// 'X' = Purging (soft-deleted; admin force-purge in progress. Login is blocked.
+	// A retry of the purge endpoint resumes destructive cleanup from the failed step.)
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS tenants (
 			tn_id integer NOT NULL,

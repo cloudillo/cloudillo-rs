@@ -329,6 +329,9 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	/// Lists all tenants (for admin use)
 	async fn list_tenants(&self, opts: &ListTenantsOptions<'_>) -> ClResult<Vec<TenantListItem>>;
 
+	/// Returns the total number of tenants matching the filter (ignoring limit/offset)
+	async fn count_tenants(&self, opts: &ListTenantsOptions<'_>) -> ClResult<usize>;
+
 	// Password management
 	async fn create_tenant_login(&self, id_tag: &str) -> ClResult<AuthLogin>;
 	async fn check_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<AuthLogin>;
@@ -362,7 +365,9 @@ pub trait AuthAdapter: Debug + Send + Sync {
 
 	/// Update tenant status. Known statuses:
 	/// `'A'` = Active, `'S'` = Suspended (cert-related, set/cleared automatically
-	/// by the ACME renewal task when an expired cert keeps failing renewal).
+	/// by the ACME renewal task when an expired cert keeps failing renewal),
+	/// `'X'` = Purging (soft-deleted; admin force-purge has begun. Auth is
+	/// blocked and a retry of the purge endpoint resumes destructive cleanup).
 	async fn update_tenant_status(&self, tn_id: TnId, status: char) -> ClResult<()>;
 
 	// Key management

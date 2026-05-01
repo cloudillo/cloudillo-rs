@@ -646,6 +646,87 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		})
 		.await?
 	}
+
+	async fn delete_tenant_databases(&self, tn_id: TnId) -> ClResult<()> {
+		let db_path = self.db_file_path(tn_id);
+
+		// Drop any cached instances for this tenant before unlinking.
+		{
+			let mut instances = self.instances.write().await;
+			instances.retain(|key, _| key.tn_id != tn_id.0);
+		}
+
+		if self.per_tenant_files {
+			// Drop the cached redb handle and remove the file.
+			{
+				let mut cache = self.file_databases.write().await;
+				cache.remove(&db_path);
+			}
+			match tokio::fs::remove_file(&db_path).await {
+				Ok(()) => Ok(()),
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+				Err(e) => Err(cloudillo_types::error::Error::Internal(format!(
+					"failed to remove rtdb tenant file {}: {}",
+					db_path.display(),
+					e
+				))),
+			}
+		} else {
+			// Shared-file mode: keys are prefixed with the tenant id, so we can
+			// scope a delete by walking each table for that prefix. Run on the
+			// blocking pool because redb is sync.
+			let db = self.get_or_open_db_file(db_path).await?;
+			let prefix = format!("{}/", tn_id.0);
+			tokio::task::spawn_blocking(move || -> ClResult<()> {
+				use redb::ReadableTable;
+
+				const TENANT_TABLES: &[redb::TableDefinition<&str, &str>] =
+					&[storage::TABLE_DOCUMENTS, storage::TABLE_INDEXES, storage::TABLE_METADATA];
+				const CHUNK: usize = 1000;
+
+				for table_def in TENANT_TABLES {
+					loop {
+						let tx = db.begin_write().map_err(error::from_redb_error)?;
+						let drained;
+						{
+							let mut table =
+								tx.open_table(*table_def).map_err(error::from_redb_error)?;
+							let keys: Vec<String> = {
+								let range = table
+									.range(prefix.as_str()..)
+									.map_err(error::from_redb_error)?;
+								let mut keys = Vec::with_capacity(CHUNK);
+								for item in range {
+									let (key, _) = item.map_err(error::from_redb_error)?;
+									let k = key.value();
+									if !k.starts_with(&prefix) {
+										break;
+									}
+									keys.push(k.to_string());
+									if keys.len() >= CHUNK {
+										break;
+									}
+								}
+								keys
+							};
+							drained = keys.is_empty();
+							for k in &keys {
+								table.remove(k.as_str()).map_err(error::from_redb_error)?;
+							}
+						}
+						tx.commit().map_err(error::from_redb_error)?;
+						if drained {
+							break;
+						}
+					}
+				}
+				Ok(())
+			})
+			.await
+			.map_err(error::Error::from)??;
+			Ok(())
+		}
+	}
 }
 
 // vim: ts=4

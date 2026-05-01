@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
 
+use cloudillo_core::extract::Auth;
 use cloudillo_email::{EmailModule, EmailTaskParams, get_tenant_lang};
 use cloudillo_ref::service::{CreateRefInternalParams, create_ref_internal};
 use cloudillo_types::auth_adapter::ListTenantsOptions;
@@ -105,9 +106,10 @@ pub async fn list_tenants(
 		})
 		.collect();
 
-	let total = tenants.len();
+	let total = app.auth_adapter.count_tenants(&auth_opts).await?;
 	let offset = query.offset.unwrap_or(0) as usize;
-	let response = ApiResponse::with_pagination(tenants, offset, total, total);
+	let limit = query.limit.map_or(total, |l| l as usize);
+	let response = ApiResponse::with_pagination(tenants, offset, limit, total);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -197,6 +199,135 @@ pub async fn send_password_reset(
 
 	let response = ApiResponse::new(PasswordResetResponse {
 		message: format!("Password reset email sent to {}", email),
+	});
+
+	Ok((StatusCode::OK, Json(response)))
+}
+
+/// Result of a tenant purge across all storage layers.
+#[derive(Debug)]
+pub struct PurgeReport {
+	pub tn_id: TnId,
+	pub id_tag: Box<str>,
+}
+
+/// Purge every record owned by a tenant across all five storage layers.
+///
+/// Two-phase orchestration:
+///
+/// **Phase A (soft delete):** mark the tenant as `status='X'` (purging) in the
+/// auth DB. This blocks login / token issuance and makes the tenant visible
+/// in the admin tenant list so an operator can see half-purged tenants.
+/// Idempotent: re-running on an already-purging tenant is a no-op.
+///
+/// **Phase B (destructive cleanup):** blobs → CRDT docs → RTDB → meta DB
+/// cascade → auth DB cascade. Each step hard-fails on error, so a mid-purge
+/// failure leaves the tenant in the soft-deleted state. A subsequent
+/// `POST /api/admin/tenants/{id_tag}/purge` finds the soft-deleted row,
+/// re-applies phase A (no-op) and re-runs phase B from the failed step.
+/// Steps 2–5 are idempotent against partially-purged state (blob/CRDT/RTDB
+/// return success on missing data; meta/auth cascade DELETEs ignore absent
+/// rows).
+///
+/// **Limitation:** the CRDT step requires the redb adapter to be configured
+/// with `per_tenant_files=true`. Shared-file CRDT mode does not encode tn_id
+/// in keys, so the adapter cannot scope a delete to one tenant; the purge
+/// will hard-fail at step 3 with a `ConfigError`. Operators running shared
+/// CRDT must clear the tenant's documents from the shared store before
+/// invoking this endpoint.
+pub async fn purge_tenant(app: &App, tn_id: TnId) -> ClResult<PurgeReport> {
+	// 1. Resolve id_tag (NotFound bubbles up from the auth adapter)
+	let id_tag = app.auth_adapter.read_id_tag(tn_id).await?;
+
+	// Phase A — soft delete. Idempotent (already-'X' tenants stay 'X').
+	app.auth_adapter.update_tenant_status(tn_id, 'X').await.inspect_err(|e| {
+		warn!(tn_id = ?tn_id, %id_tag, error = ?e, "tenant purge phase A (soft delete) failed");
+	})?;
+
+	// Phase B — destructive cleanup. Each step hard-fails on error.
+
+	// 2. Blobs
+	app.blob_adapter.delete_tenant_blobs(tn_id).await.inspect_err(|e| {
+		warn!(tn_id = ?tn_id, %id_tag, error = ?e, "tenant purge: blob step failed");
+	})?;
+
+	// 3. CRDT documents
+	app.crdt_adapter.delete_tenant_documents(tn_id).await.inspect_err(|e| {
+		warn!(tn_id = ?tn_id, %id_tag, error = ?e, "tenant purge: crdt step failed");
+	})?;
+
+	// 4. RTDB databases
+	app.rtdb_adapter.delete_tenant_databases(tn_id).await.inspect_err(|e| {
+		warn!(tn_id = ?tn_id, %id_tag, error = ?e, "tenant purge: rtdb step failed");
+	})?;
+
+	// 5. Meta DB cascade (transactional)
+	app.meta_adapter.delete_tenant(tn_id).await.inspect_err(|e| {
+		warn!(tn_id = ?tn_id, %id_tag, error = ?e, "tenant purge: meta cascade failed");
+	})?;
+
+	// 6. Auth DB cascade (transactional) — drops the soft-deleted row last.
+	app.auth_adapter.delete_tenant(&id_tag).await.inspect_err(|e| {
+		warn!(tn_id = ?tn_id, %id_tag, error = ?e, "tenant purge: auth cascade failed");
+	})?;
+
+	info!(tn_id = ?tn_id, %id_tag, "tenant purged");
+
+	Ok(PurgeReport { tn_id, id_tag })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeTenantBody {
+	pub confirm_id_tag: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeTenantResponse {
+	pub tn_id: u32,
+	pub id_tag: String,
+}
+
+/// POST /api/admin/tenants/{id_tag}/purge - Immediately and irreversibly delete a tenant.
+///
+/// The endpoint is idempotent: if a previous call failed mid-cascade, the
+/// tenant is left in `status='X'` (purging) and a retry resumes destructive
+/// cleanup from the failed step.
+#[axum::debug_handler]
+pub async fn purge_tenant_handler(
+	State(app): State<App>,
+	Auth(auth_ctx): Auth,
+	Path(id_tag): Path<String>,
+	Json(body): Json<PurgeTenantBody>,
+) -> ClResult<(StatusCode, Json<ApiResponse<PurgeTenantResponse>>)> {
+	if body.confirm_id_tag != id_tag {
+		return Err(Error::ValidationError("confirm_id_tag mismatch".into()));
+	}
+
+	// Self-lockout guard: a SADM cannot purge their own tenant via this endpoint.
+	if auth_ctx.id_tag.as_ref() == id_tag {
+		return Err(Error::ValidationError("cannot purge the admin's own tenant".into()));
+	}
+
+	let tn_id = app.auth_adapter.read_tn_id(&id_tag).await?;
+
+	if tn_id == TnId(1) {
+		return Err(Error::ValidationError("cannot purge the base tenant".into()));
+	}
+
+	info!(
+		tn_id = ?tn_id,
+		%id_tag,
+		admin = %auth_ctx.id_tag,
+		"tenant force-purge requested"
+	);
+
+	let report = purge_tenant(&app, tn_id).await?;
+
+	let response = ApiResponse::new(PurgeTenantResponse {
+		tn_id: report.tn_id.0,
+		id_tag: report.id_tag.into(),
 	});
 
 	Ok((StatusCode::OK, Json(response)))

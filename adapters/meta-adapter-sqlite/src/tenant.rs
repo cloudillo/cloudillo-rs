@@ -6,12 +6,10 @@
 //! Handles CRUD operations for tenants, including creation, reading, updating,
 //! and cascading deletion of all tenant-related data.
 
-use std::collections::HashMap;
-use std::fmt::Write;
-
 use sqlx::{Row, SqlitePool};
+use std::collections::HashMap;
 
-use crate::utils::push_patch;
+use crate::utils::{inspect, push_patch};
 use cloudillo_types::meta_adapter::{
 	ListTenantsMetaOptions, ProfileType, Tenant, TenantListMeta, UpdateTenantData,
 };
@@ -113,7 +111,8 @@ pub(crate) async fn update(
 
 	// Handle x field merge atomically using SQLite json_patch (RFC 7396)
 	if let Some(x_patch) = &tenant.x {
-		let patch_json = serde_json::to_string(x_patch).unwrap_or_else(|_| "{}".to_string());
+		let patch_json = serde_json::to_string(x_patch)
+			.map_err(|e| Error::Internal(format!("json serialization failed: {}", e)))?;
 		if has_updates {
 			query.push(", ");
 		}
@@ -178,109 +177,67 @@ pub(crate) async fn update(
 	Ok(())
 }
 
+/// Tables keyed directly by `tn_id` that participate in the tenant cascade.
+/// Order isn't significant — every row only references the parent tenant.
+/// `task_dependencies` is keyed by `task_id` and is cleared in `delete()`
+/// BEFORE this list runs, so `tasks` is safe to include here.
+///
+/// IMPORTANT: every table in `schema.rs` with a `tn_id` column MUST appear
+/// here, otherwise rows orphan when a tenant is purged. `key_cache.tn_id`
+/// is nullable; the unconditional `WHERE tn_id=?` form correctly skips
+/// NULL rows.
+const TENANT_CASCADE_TABLES: &[&str] = &[
+	"tasks",
+	"action_tokens",
+	"actions",
+	"file_variants",
+	"files",
+	"file_user_data",
+	"share_entries",
+	"refs",
+	"profiles",
+	"tags",
+	"settings",
+	"subscriptions",
+	"tenant_data",
+	"key_cache",
+	"installed_apps",
+	"address_books",
+	"contacts",
+	"calendars",
+	"calendar_objects",
+	"collections",
+];
+
 /// Delete a tenant and all its associated data (cascading delete)
 pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId) -> ClResult<()> {
 	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
 
-	// Delete in order: dependencies first, then parent records
+	// `task_dependencies` is keyed by task_id, not tn_id — clear it before the
+	// `tasks` rows go away (the subquery would otherwise miss them).
 	sqlx::query(
 		"DELETE FROM task_dependencies WHERE task_id IN (SELECT task_id FROM tasks WHERE tn_id=?)",
 	)
 	.bind(tn_id.0)
 	.execute(&mut *tx)
 	.await
-	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?;
 
-	sqlx::query("DELETE FROM tasks WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
-
-	sqlx::query("DELETE FROM action_tokens WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
-
-	sqlx::query("DELETE FROM action_outbox_queue WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
-
-	sqlx::query("DELETE FROM actions WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
-
-	sqlx::query("DELETE FROM file_variants WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
-
-	sqlx::query("DELETE FROM files WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
-
-	sqlx::query("DELETE FROM refs WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
-
-	sqlx::query("DELETE FROM profiles WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
-
-	sqlx::query("DELETE FROM tags WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
-
-	sqlx::query("DELETE FROM settings WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
-
-	sqlx::query("DELETE FROM subscriptions WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
-
-	sqlx::query("DELETE FROM tenant_data WHERE tn_id=?")
-		.bind(tn_id.0)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+	for table in TENANT_CASCADE_TABLES {
+		sqlx::query(&format!("DELETE FROM {table} WHERE tn_id=?"))
+			.bind(tn_id.0)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+	}
 
 	let res = sqlx::query("DELETE FROM tenants WHERE tn_id=?")
 		.bind(tn_id.0)
 		.execute(&mut *tx)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
 	if res.rows_affected() == 0 {
@@ -296,20 +253,20 @@ pub(crate) async fn list(
 	dbr: &SqlitePool,
 	opts: &ListTenantsMetaOptions,
 ) -> ClResult<Vec<TenantListMeta>> {
-	let mut query =
-		String::from("SELECT tn_id, id_tag, name, type, profile_pic, created_at FROM tenants");
-
-	query.push_str(" ORDER BY created_at DESC");
+	let mut query = sqlx::QueryBuilder::new(
+		"SELECT tn_id, id_tag, name, type, profile_pic, created_at FROM tenants ORDER BY created_at DESC",
+	);
 
 	if let Some(limit) = opts.limit {
-		let _ = write!(query, " LIMIT {}", limit);
+		query.push(" LIMIT ").push_bind(limit);
 	}
 
 	if let Some(offset) = opts.offset {
-		let _ = write!(query, " OFFSET {}", offset);
+		query.push(" OFFSET ").push_bind(offset);
 	}
 
-	let rows = sqlx::query(&query)
+	let rows = query
+		.build()
 		.fetch_all(dbr)
 		.await
 		.inspect_err(|err| warn!("DB: {:#?}", err))

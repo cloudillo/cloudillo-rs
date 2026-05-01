@@ -679,6 +679,12 @@ pub trait RtdbAdapter: Debug + Send + Sync {
 		user_id: &str,
 		conn_id: &str,
 	) -> ClResult<()>;
+
+	/// Delete every RTDB database owned by the tenant.
+	///
+	/// Used by tenant purge orchestration. Implementations should treat a
+	/// missing tenant store as success.
+	async fn delete_tenant_databases(&self, tn_id: TnId) -> ClResult<()>;
 }
 
 // vim: ts=4

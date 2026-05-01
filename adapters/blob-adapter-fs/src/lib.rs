@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use futures_core::Stream;
 use tokio::{
-	fs::{File, create_dir_all, metadata, remove_file, rename},
+	fs::{File, create_dir_all, metadata, remove_dir_all, remove_file, rename},
 	io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
 };
 use tokio_util::{bytes::Bytes, io::ReaderStream};
@@ -122,8 +122,14 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 			}
 			let id = hasher.finalize("b");
 
+			if id != file_id {
+				return Err(Error::ValidationError(format!(
+					"blob hash mismatch: expected {}, got {}",
+					file_id, id
+				)));
+			}
 			rename(&tmp_path, obj_file_path(&self.base_dir, tn_id, &id)?).await?;
-			info!("  attachment downloaded, check: {} ?= {}", &id, &file_id);
+			info!("  attachment downloaded: {}", &id);
 			Ok::<(), Error>(())
 		}
 		.await;
@@ -186,6 +192,16 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		let stream = ReaderStream::new(file);
 
 		Ok(Box::pin(stream))
+	}
+
+	async fn delete_tenant_blobs(&self, tn_id: TnId) -> ClResult<()> {
+		let tenant_dir = PathBuf::from(self.base_dir.as_ref()).join(tn_id.to_string());
+
+		match remove_dir_all(&tenant_dir).await {
+			Ok(()) => Ok(()),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+			Err(e) => Err(Error::from(e)),
+		}
 	}
 }
 

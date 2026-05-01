@@ -622,6 +622,49 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		Ok(())
 	}
 
+	async fn delete_tenant_documents(&self, tn_id: TnId) -> ClResult<()> {
+		let db_path = self.get_db_path(tn_id, "");
+
+		if self.per_tenant_files {
+			// Drop any cached handle for this tenant's file before unlinking.
+			{
+				let mut cache = self.file_databases.write().await;
+				cache.remove(&db_path);
+			}
+			// Best-effort: also flush document instance caches whose docs lived
+			// in this file. We can't easily know which doc_ids belonged to this
+			// tenant in shared-file mode; in per-tenant mode we simply nuke the
+			// file and let stale doc_instance entries lazy-fail on next access.
+			match tokio::fs::remove_file(&db_path).await {
+				Ok(()) => {}
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+				Err(e) => {
+					return Err(ClError::Internal(format!(
+						"failed to remove crdt tenant file {}: {}",
+						db_path.display(),
+						e
+					)));
+				}
+			}
+			Ok(())
+		} else {
+			// Shared-file mode: keys are `[version][doc_id][type][seq]` with no
+			// tn_id, so there is no way to scope a delete to one tenant from
+			// inside this adapter. Refuse loudly so the admin sees the failure
+			// rather than silently leaving data behind.
+			//
+			// TODO: walk meta-adapter for (tn_id → doc_id) pairs and delete each
+			// doc individually before the meta cascade, so this mode can support
+			// tenant purge.
+			Err(ClError::ConfigError(format!(
+				"Tenant purge of CRDT data is unsupported in shared-file mode (tn_id={}); \
+				reconfigure adapter with `per_tenant_files=true` and migrate, \
+				or manually clear the tenant's documents from the shared store before purging.",
+				tn_id.0
+			)))
+		}
+	}
+
 	async fn list_docs(&self, tn_id: TnId) -> ClResult<Vec<Box<str>>> {
 		let db_path = self.get_db_path(tn_id, "");
 		let db = self.get_or_open_db_file(db_path).await?;

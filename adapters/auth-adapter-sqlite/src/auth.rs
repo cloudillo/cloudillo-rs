@@ -94,6 +94,14 @@ fn parse_roles_to_boxed_slice(roles_str: &str) -> Box<[Box<str>]> {
 		.into_boxed_slice()
 }
 
+/// Reject soft-deleted tenants (status='X' = purging in progress).
+fn assert_tenant_active(status: Option<&str>) -> ClResult<()> {
+	if status == Some("X") {
+		return Err(Error::PermissionDenied);
+	}
+	Ok(())
+}
+
 /// Check tenant password
 pub(crate) async fn check_tenant_password(
 	db: &SqlitePool,
@@ -102,15 +110,18 @@ pub(crate) async fn check_tenant_password(
 	password: &str,
 	jwt_secret_str: &str,
 ) -> ClResult<AuthLogin> {
-	let res = sqlx::query("SELECT tn_id, id_tag, password, roles FROM tenants WHERE id_tag = ?1")
-		.bind(id_tag)
-		.fetch_one(db)
-		.await;
+	let res =
+		sqlx::query("SELECT tn_id, id_tag, password, roles, status FROM tenants WHERE id_tag = ?1")
+			.bind(id_tag)
+			.fetch_one(db)
+			.await;
 
 	match res {
 		Err(_) => Err(Error::PermissionDenied),
 		Ok(row) => {
 			let _tn_id: TnId = row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?;
+			let status: Option<&str> = row.try_get("status").or(Err(Error::DbError))?;
+			assert_tenant_active(status)?;
 			let password_hash: Box<str> = row.try_get("password").or(Err(Error::DbError))?;
 			let db_roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
 
@@ -185,7 +196,7 @@ pub(crate) async fn create_tenant_login(
 	id_tag: &str,
 	jwt_secret_str: &str,
 ) -> ClResult<AuthLogin> {
-	let res = sqlx::query("SELECT tn_id, id_tag, roles FROM tenants WHERE id_tag = ?1")
+	let res = sqlx::query("SELECT tn_id, id_tag, roles, status FROM tenants WHERE id_tag = ?1")
 		.bind(id_tag)
 		.fetch_one(db)
 		.await;
@@ -194,6 +205,8 @@ pub(crate) async fn create_tenant_login(
 		Err(_) => Err(Error::PermissionDenied),
 		Ok(row) => {
 			let _tn_id = row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?;
+			let status: Option<&str> = row.try_get("status").or(Err(Error::DbError))?;
+			assert_tenant_active(status)?;
 			let db_roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
 
 			let roles_str = build_tenant_owner_roles(db_roles);

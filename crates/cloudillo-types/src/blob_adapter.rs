@@ -57,6 +57,10 @@ pub trait BlobAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		blob_id: &str,
 	) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>>;
+
+	/// Delete every blob owned by the tenant. Treats a missing tenant directory
+	/// as success. Used by tenant purge orchestration.
+	async fn delete_tenant_blobs(&self, tn_id: TnId) -> ClResult<()>;
 }
 
 // vim: ts=4

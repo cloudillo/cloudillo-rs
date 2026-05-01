@@ -181,6 +181,15 @@ pub(crate) async fn create_tenant(
 	Ok(tn_id)
 }
 
+/// Tables (other than `tenants` itself and `user_vfy`) keyed directly by `tn_id`.
+/// All are dropped in a single transaction; ordering doesn't matter since each
+/// row only references the parent tenant.
+///
+/// `api_keys` has `FOREIGN KEY ... ON DELETE CASCADE`, but `PRAGMA foreign_keys`
+/// is not enabled on this connection pool — the cascade does not fire, so it
+/// must be listed explicitly here. `webauthn` has no FK at all.
+const TENANT_CASCADE_TABLES: &[&str] = &["certs", "keys", "events", "webauthn", "api_keys"];
+
 /// Delete a tenant and all associated data
 pub(crate) async fn delete_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<()> {
 	// Get the tenant ID first
@@ -197,24 +206,10 @@ pub(crate) async fn delete_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<()>
 
 	let tn_id: i32 = row.try_get("tn_id").inspect_err(inspect).or(Err(Error::DbError))?;
 
-	// Begin transaction for atomic deletion
 	let mut tx = db.begin().await.inspect_err(inspect).or(Err(Error::DbError))?;
 
-	// Delete in order (respecting potential foreign key constraints)
-	sqlx::query("DELETE FROM certs WHERE tn_id = ?1")
-		.bind(tn_id)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
-
-	sqlx::query("DELETE FROM keys WHERE tn_id = ?1")
-		.bind(tn_id)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
-
+	// `user_vfy` is joined via email rather than tn_id; clean it before the
+	// `tenants` row goes away (the subquery would otherwise miss rows).
 	sqlx::query("DELETE FROM user_vfy WHERE email IN (SELECT email FROM tenants WHERE tn_id = ?1)")
 		.bind(tn_id)
 		.execute(&mut *tx)
@@ -222,12 +217,14 @@ pub(crate) async fn delete_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<()>
 		.inspect_err(inspect)
 		.or(Err(Error::DbError))?;
 
-	sqlx::query("DELETE FROM events WHERE tn_id = ?1")
-		.bind(tn_id)
-		.execute(&mut *tx)
-		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+	for table in TENANT_CASCADE_TABLES {
+		sqlx::query(&format!("DELETE FROM {table} WHERE tn_id = ?1"))
+			.bind(tn_id)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.or(Err(Error::DbError))?;
+	}
 
 	sqlx::query("DELETE FROM tenants WHERE tn_id = ?1")
 		.bind(tn_id)
@@ -299,4 +296,30 @@ pub(crate) async fn list_tenants(
 		.collect::<ClResult<Vec<_>>>()?;
 
 	Ok(tenants)
+}
+
+pub(crate) async fn count_tenants(
+	db: &SqlitePool,
+	opts: &ListTenantsOptions<'_>,
+) -> ClResult<usize> {
+	let mut query = sqlx::QueryBuilder::new("SELECT COUNT(*) as cnt FROM tenants WHERE 1=1");
+
+	if let Some(status) = opts.status {
+		query.push(" AND status = ").push_bind(status);
+	}
+
+	if let Some(q) = opts.q {
+		let escaped_q = escape_like(q);
+		query
+			.push(" AND (id_tag LIKE ")
+			.push_bind(format!("%{}%", escaped_q))
+			.push(" ESCAPE '\\' OR email LIKE ")
+			.push_bind(format!("%{}%", escaped_q))
+			.push(" ESCAPE '\\')");
+	}
+
+	let row = query.build().fetch_one(db).await.inspect_err(inspect).or(Err(Error::DbError))?;
+
+	let count: i64 = row.try_get("cnt").map_err(|_| Error::DbError)?;
+	usize::try_from(count).map_err(|_| Error::DbError)
 }
