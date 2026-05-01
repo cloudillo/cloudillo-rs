@@ -98,6 +98,10 @@ impl RtdbAdapterRedb {
 	) -> ClResult<Self> {
 		tokio::fs::create_dir_all(&storage_dir).await?;
 
+		if per_tenant_files {
+			Self::migrate_global_to_per_tenant(&storage_dir).await?;
+		}
+
 		let auto_evict = config.auto_evict;
 		let adapter = Self {
 			storage_dir,
@@ -115,10 +119,128 @@ impl RtdbAdapterRedb {
 		Ok(adapter)
 	}
 
+	/// Migrate data from a single global `rtdb.redb` file into per-tenant files.
+	///
+	/// Idempotent: skips if the global file doesn't exist or `.migrated` marker is present.
+	/// The original file is preserved as `rtdb.redb.migrated` after successful migration.
+	async fn migrate_global_to_per_tenant(storage_dir: &std::path::Path) -> ClResult<()> {
+		let global_path = storage_dir.join("rtdb.redb");
+		let migrated_marker = storage_dir.join("rtdb.redb.migrated");
+
+		if !global_path.exists() || migrated_marker.exists() {
+			return Ok(());
+		}
+
+		info!("Migrating RTDB from global file to per-tenant files...");
+
+		let dir = storage_dir.to_path_buf();
+		let count = tokio::task::spawn_blocking(move || -> ClResult<usize> {
+			use redb::ReadableDatabase;
+
+			let tables: &[redb::TableDefinition<&str, &str>] =
+				&[storage::TABLE_DOCUMENTS, storage::TABLE_INDEXES, storage::TABLE_METADATA];
+
+			let source_db =
+				redb::Database::open(dir.join("rtdb.redb")).map_err(error::from_redb_error)?;
+			let read_tx = source_db.begin_read().map_err(error::from_redb_error)?;
+
+			// Collect entries grouped by (tn_id, table_index)
+			let mut entries: HashMap<u32, Vec<(usize, String, String)>> = HashMap::new();
+			let mut total = 0usize;
+
+			for (table_idx, table_def) in tables.iter().enumerate() {
+				let table = read_tx.open_table(*table_def).map_err(error::from_redb_error)?;
+				let range = table.range::<&str>(..).map_err(error::from_redb_error)?;
+				for item in range {
+					let (key, value) = item.map_err(error::from_redb_error)?;
+					let key_str = key.value();
+
+					let Some(slash_pos) = key_str.find('/') else {
+						warn!("Skipping RTDB key without tenant prefix: {}", key_str);
+						continue;
+					};
+					let Ok(tn_id) = key_str[..slash_pos].parse::<u32>() else {
+						warn!("Skipping RTDB key with invalid tenant prefix: {}", key_str);
+						continue;
+					};
+					let new_key = key_str[slash_pos + 1..].to_string();
+					entries.entry(tn_id).or_default().push((
+						table_idx,
+						new_key,
+						value.value().to_string(),
+					));
+					total += 1;
+				}
+			}
+			drop(read_tx);
+			drop(source_db);
+
+			// Write entries to per-tenant files
+			for (tn_id, tenant_entries) in &entries {
+				let tenant_path = dir.join(format!("tn_{}.db", tn_id));
+				let db = redb::Database::create(&tenant_path).map_err(error::from_redb_error)?;
+
+				// Initialize tables
+				{
+					let tx = db.begin_write().map_err(error::from_redb_error)?;
+					let _ =
+						tx.open_table(storage::TABLE_DOCUMENTS).map_err(error::from_redb_error)?;
+					let _ =
+						tx.open_table(storage::TABLE_INDEXES).map_err(error::from_redb_error)?;
+					let _ =
+						tx.open_table(storage::TABLE_METADATA).map_err(error::from_redb_error)?;
+					tx.commit().map_err(error::from_redb_error)?;
+				}
+
+				// Insert data
+				let tx = db.begin_write().map_err(error::from_redb_error)?;
+				{
+					let mut doc_table =
+						tx.open_table(storage::TABLE_DOCUMENTS).map_err(error::from_redb_error)?;
+					let mut idx_table =
+						tx.open_table(storage::TABLE_INDEXES).map_err(error::from_redb_error)?;
+					let mut meta_table =
+						tx.open_table(storage::TABLE_METADATA).map_err(error::from_redb_error)?;
+
+					for (table_idx, key, value) in tenant_entries {
+						match *table_idx {
+							0 => {
+								doc_table
+									.insert(key.as_str(), value.as_str())
+									.map_err(error::from_redb_error)?;
+							}
+							1 => {
+								idx_table
+									.insert(key.as_str(), value.as_str())
+									.map_err(error::from_redb_error)?;
+							}
+							_ => {
+								meta_table
+									.insert(key.as_str(), value.as_str())
+									.map_err(error::from_redb_error)?;
+							}
+						}
+					}
+				}
+				tx.commit().map_err(error::from_redb_error)?;
+			}
+
+			// Rename original file as migration-complete marker
+			std::fs::rename(dir.join("rtdb.redb"), dir.join("rtdb.redb.migrated"))?;
+
+			Ok(total)
+		})
+		.await
+		.map_err(error::Error::from)??;
+
+		info!("RTDB migration complete: {} entries migrated to per-tenant files", count);
+		Ok(())
+	}
+
 	/// Get the redb file path for a given tenant
 	fn db_file_path(&self, tn_id: TnId) -> PathBuf {
 		if self.per_tenant_files {
-			self.storage_dir.join(format!("tenant_{}.redb", tn_id.0))
+			self.storage_dir.join(format!("tn_{}.db", tn_id.0))
 		} else {
 			self.storage_dir.join("rtdb.redb")
 		}

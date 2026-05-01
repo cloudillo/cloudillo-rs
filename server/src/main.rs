@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		auto_evict: true,
 	};
 	let rtdb_adapter = Arc::new(
-		RtdbAdapterRedb::new(config.db_dir.join("rtdb"), false, rtdb_config)
+		RtdbAdapterRedb::new(config.db_dir.join("rtdb"), true, rtdb_config)
 			.await
 			.unwrap(),
 	);
