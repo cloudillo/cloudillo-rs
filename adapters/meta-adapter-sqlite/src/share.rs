@@ -10,6 +10,8 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 use cloudillo_types::meta_adapter::{CreateShareEntry, ShareEntry};
 use cloudillo_types::prelude::*;
 
+use crate::utils::inspect;
+
 /// Convert a SQLite row into a ShareEntry
 fn row_to_share_entry(row: &SqliteRow) -> ShareEntry {
 	let resource_type_val: String = row.get("resource_type");
@@ -70,7 +72,7 @@ pub(crate) async fn create(
 	.bind(now.0)
 	.fetch_one(db)
 	.await
-	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?;
 
 	let id: i64 = row.get("id");
@@ -99,7 +101,7 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, id: i64) -> ClResult<()
 		.bind(tn_id.0)
 		.execute(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
 	Ok(())
@@ -131,7 +133,7 @@ pub(crate) async fn list_by_resource(
 	.bind(resource_id)
 	.fetch_all(db)
 	.await
-	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?;
 
 	Ok(rows.iter().map(row_to_share_entry).collect())
@@ -166,7 +168,7 @@ pub(crate) async fn list_by_subject(
 	.bind(subject_id)
 	.fetch_all(db)
 	.await
-	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?;
 
 	Ok(rows.iter().map(row_to_share_entry).collect())
@@ -198,7 +200,7 @@ pub(crate) async fn check_access(
 	.bind(subject_id)
 	.fetch_optional(db)
 	.await
-	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?;
 
 	Ok(row.and_then(|r| {
@@ -218,7 +220,7 @@ pub(crate) async fn read(db: &SqlitePool, tn_id: TnId, id: i64) -> ClResult<Opti
 	.bind(tn_id.0)
 	.fetch_optional(db)
 	.await
-	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?;
 
 	Ok(row.map(|r| row_to_share_entry(&r)))

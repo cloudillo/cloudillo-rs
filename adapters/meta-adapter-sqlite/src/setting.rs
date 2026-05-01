@@ -11,6 +11,8 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use cloudillo_types::prelude::*;
 
+use crate::utils::{escape_like, inspect};
+
 /// Maximum number of prefixes allowed in a single query to prevent DoS
 const MAX_PREFIXES: usize = 20;
 
@@ -45,7 +47,8 @@ pub(crate) async fn list(
 					builder.push(" OR ");
 				}
 				builder.push("name LIKE ");
-				builder.push_bind(format!("{}%", prefix));
+				builder.push_bind(format!("{}%", escape_like(prefix)));
+				builder.push(" ESCAPE '\\'");
 			}
 			builder.push(")");
 
@@ -53,7 +56,7 @@ pub(crate) async fn list(
 				.build()
 				.fetch_all(db)
 				.await
-				.inspect_err(|err| warn!("DB: {:#?}", err))
+				.inspect_err(inspect)
 				.map_err(|_| Error::DbError)?
 		}
 		_ => {
@@ -62,7 +65,7 @@ pub(crate) async fn list(
 				.bind(tn_id.0)
 				.fetch_all(db)
 				.await
-				.inspect_err(|err| warn!("DB: {:#?}", err))
+				.inspect_err(inspect)
 				.map_err(|_| Error::DbError)?
 		}
 	};
@@ -94,7 +97,7 @@ pub(crate) async fn read(
 		.bind(name)
 		.fetch_optional(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
 	Ok(row.and_then(|r| {
@@ -118,7 +121,7 @@ pub(crate) async fn update(
 			.bind(value_str)
 			.execute(db)
 			.await
-			.inspect_err(|err| warn!("DB: {:#?}", err))
+			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 	} else {
 		// Delete setting if value is None
@@ -127,7 +130,7 @@ pub(crate) async fn update(
 			.bind(name)
 			.execute(db)
 			.await
-			.inspect_err(|err| warn!("DB: {:#?}", err))
+			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 	}
 

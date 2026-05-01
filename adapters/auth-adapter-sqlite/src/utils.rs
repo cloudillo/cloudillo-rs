@@ -25,8 +25,14 @@ pub(crate) fn parse_str_list_optional(s: Option<&str>) -> Option<Box<[Box<str>]>
 	})
 }
 
-/// Log database errors
+/// `inspect_err` adapter that warns on DB errors but silences
+/// `RowNotFound` — intended for use after `fetch_optional` / `fetch_one`
+/// paths where missing rows are an expected outcome, not a fault. Do not
+/// use after writes that should always affect at least one row.
 pub(crate) fn inspect(err: &sqlx::Error) {
+	if matches!(err, sqlx::Error::RowNotFound) {
+		return;
+	}
 	warn!("DB: {:#?}", err);
 }
 

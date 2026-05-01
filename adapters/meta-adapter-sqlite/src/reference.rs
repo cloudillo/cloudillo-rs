@@ -10,6 +10,8 @@ use sqlx::{Row, SqlitePool};
 use cloudillo_types::meta_adapter::{CreateRefOptions, ListRefsOptions, RefData};
 use cloudillo_types::prelude::*;
 
+use crate::utils::inspect;
+
 /// List references with optional filtering
 pub(crate) async fn list(
 	db: &SqlitePool,
@@ -56,7 +58,7 @@ pub(crate) async fn list(
 		.build()
 		.fetch_all(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
 	Ok(rows
@@ -93,7 +95,7 @@ pub(crate) async fn get(
 		.bind(ref_id)
 		.fetch_optional(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
 	Ok(row.map(|r| {
@@ -130,7 +132,7 @@ pub(crate) async fn create(
 		.bind(opts.params.as_deref())
 		.execute(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
 	Ok(RefData {
@@ -153,7 +155,7 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, ref_id: &str) -> ClResu
 		.bind(ref_id)
 		.execute(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
+		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
 	Ok(())
@@ -177,7 +179,7 @@ pub(crate) async fn validate_ref(
 	.bind(ref_id)
 	.fetch_optional(db)
 	.await
-	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?
 	.ok_or(Error::NotFound)?;
 
@@ -228,7 +230,7 @@ pub(crate) async fn validate_ref(
 		params,
 	};
 
-	Ok((TnId(u32::try_from(tn_id).unwrap_or_default()), id_tag.into(), ref_data))
+	Ok((TnId(u32::try_from(tn_id).map_err(|_| Error::DbError)?), id_tag.into(), ref_data))
 }
 
 /// Use/consume a reference - validates and decrements counter
@@ -240,11 +242,7 @@ pub(crate) async fn use_ref(
 	expected_types: &[&str],
 ) -> ClResult<(TnId, Box<str>, RefData)> {
 	// Start a transaction to ensure atomicity
-	let mut tx = db
-		.begin()
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 	// Look up the ref globally (across all tenants) and get tenant info
 	let row = sqlx::query(
@@ -256,7 +254,7 @@ pub(crate) async fn use_ref(
 	.bind(ref_id)
 	.fetch_optional(&mut *tx)
 	.await
-	.inspect_err(|err| warn!("DB: {:#?}", err))
+	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?
 	.ok_or(Error::NotFound)?;
 
@@ -287,31 +285,25 @@ pub(crate) async fn use_ref(
 		}
 	}
 
-	// Validate count > 0 (skip if NULL = unlimited)
-	if let Some(c) = count
-		&& c <= 0
-	{
-		return Err(Error::ValidationError("Ref has already been used".to_string()));
-	}
-
-	// Decrement counter only if count is not NULL (unlimited)
+	// Atomically decrement counter (only if count is not NULL = unlimited)
 	let new_count = if count.is_some() {
-		sqlx::query("UPDATE refs SET count = count - 1 WHERE ref_id = ?")
-			.bind(ref_id)
-			.execute(&mut *tx)
-			.await
-			.inspect_err(|err| warn!("DB: {:#?}", err))
-			.map_err(|_| Error::DbError)?;
+		let result =
+			sqlx::query("UPDATE refs SET count = count - 1 WHERE ref_id = ? AND count > 0")
+				.bind(ref_id)
+				.execute(&mut *tx)
+				.await
+				.inspect_err(inspect)
+				.map_err(|_| Error::DbError)?;
+		if result.rows_affected() == 0 {
+			return Err(Error::ValidationError("Ref has already been used".to_string()));
+		}
 		count.and_then(|c| u32::try_from((c - 1).max(0)).ok())
 	} else {
 		None // Still unlimited
 	};
 
 	// Commit transaction
-	tx.commit()
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 	let ref_data = RefData {
 		ref_id: ref_id.into(),
@@ -325,5 +317,5 @@ pub(crate) async fn use_ref(
 		params,
 	};
 
-	Ok((TnId(u32::try_from(tn_id).unwrap_or_default()), id_tag.into(), ref_data))
+	Ok((TnId(u32::try_from(tn_id).map_err(|_| Error::DbError)?), id_tag.into(), ref_data))
 }
