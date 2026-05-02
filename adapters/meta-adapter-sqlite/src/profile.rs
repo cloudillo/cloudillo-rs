@@ -489,20 +489,30 @@ pub(crate) async fn read_public_key(
 	})
 }
 
-/// Add a public key to the cache (upserts if key already exists)
+/// Add a public key to the cache (upserts if key already exists).
+///
+/// `expires_at` is the owner-declared expiration from the remote profile.
+/// `None` is stored as NULL `expire` and treated as "never expires" by
+/// `read_public_key` — but still gets refreshed on signature failure via the
+/// stale-key fall-through in `verify_action_token`.
 pub(crate) async fn add_public_key(
 	db: &SqlitePool,
 	id_tag: &str,
 	key_id: &str,
 	public_key: &str,
+	expires_at: Option<Timestamp>,
 ) -> ClResult<()> {
-	sqlx::query("INSERT OR REPLACE INTO key_cache (id_tag, key_id, public_key) VALUES (?, ?, ?)")
-		.bind(id_tag)
-		.bind(key_id)
-		.bind(public_key)
-		.execute(db)
-		.await
-		.map_err(|_| Error::DbError)?;
+	sqlx::query(
+		"INSERT OR REPLACE INTO key_cache (id_tag, key_id, public_key, expire) \
+		 VALUES (?, ?, ?, ?)",
+	)
+	.bind(id_tag)
+	.bind(key_id)
+	.bind(public_key)
+	.bind(expires_at.map(|t| t.0))
+	.execute(db)
+	.await
+	.map_err(|_| Error::DbError)?;
 	Ok(())
 }
 

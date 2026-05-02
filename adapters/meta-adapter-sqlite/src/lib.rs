@@ -178,8 +178,9 @@ impl MetaAdapter for MetaAdapterSqlite {
 		id_tag: &str,
 		key_id: &str,
 		public_key: &str,
+		expires_at: Option<Timestamp>,
 	) -> ClResult<()> {
-		profile::add_public_key(&self.db, id_tag, key_id, public_key).await
+		profile::add_public_key(&self.db, id_tag, key_id, public_key, expires_at).await
 	}
 
 	async fn list_stale_profiles(

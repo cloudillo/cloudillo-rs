@@ -40,6 +40,65 @@ fn verify_jwt_signature(token: &str, public_key: &str) -> ClResult<ActionToken> 
 	Ok(action)
 }
 
+/// Try verifying with the SQLite-cached key.
+///
+/// Returns:
+/// - `Some(Ok(action))` — cache hit and signature valid (caller should return this).
+/// - `Some(Err(e))` — terminal cache error that should propagate (currently unused;
+///   reserved for future use).
+/// - `None` — fall through to HTTP fetch (cache miss, expired, DB error, **or**
+///   stale-key signature failure). When the entry was present but the signature
+///   failed, the cached key bytes are returned via `stale_key_out` so the caller
+///   can detect refresh-with-same-key thrash.
+///
+/// Note: this function intentionally does **not** penalize on signature failure.
+/// A cached key may be stale; penalizing here would punish honest clients for
+/// our own stale data. Penalties are only applied after the HTTP-fetch path
+/// confirms the bad signature against a freshly fetched key.
+async fn try_cached_key_verify(
+	app: &App,
+	token: &str,
+	issuer: &str,
+	key_id: &str,
+	stale_key_out: &mut Option<Box<str>>,
+) -> Option<ClResult<ActionToken>> {
+	match app.meta_adapter.read_profile_public_key(issuer, key_id).await {
+		Ok((public_key, expires_at)) => {
+			if expires_at <= Timestamp::now() {
+				debug!("  cached key expired at {}, fetching fresh", expires_at);
+				return None;
+			}
+			debug!("  using cached key (expires at {})", expires_at);
+			match verify_jwt_signature(token, &public_key) {
+				Ok(action) => {
+					info!("← VERIFIED: type={} from={}", action.t, action.iss);
+					Some(Ok(action))
+				}
+				Err(e) => {
+					// Stale-cache hypothesis: cached key may have been overwritten
+					// by a key rotation. Fall through to HTTP fetch for an
+					// authoritative refresh. Do not penalize yet — that happens
+					// only if the freshly fetched key also fails to verify.
+					info!(
+						"  cached_key_signature_failure for {}:{}: {} (refetching)",
+						issuer, key_id, e
+					);
+					*stale_key_out = Some(public_key);
+					None
+				}
+			}
+		}
+		Err(Error::NotFound) => {
+			debug!("  no cached key, fetching from remote");
+			None
+		}
+		Err(e) => {
+			warn!("  key cache read error: {}, fetching from remote", e);
+			None
+		}
+	}
+}
+
 /// Verify an action token using 3-tier caching:
 /// 1. Check failure cache (in-memory) - return early if cached failure
 /// 2. Check SQLite key_cache - use if valid
@@ -75,42 +134,9 @@ pub async fn verify_action_token(
 	}
 
 	// 2. Check SQLite key cache - use if we have a cached key
-	match app.meta_adapter.read_profile_public_key(issuer, key_id).await {
-		Ok((public_key, expires_at)) => {
-			// Check if key is still valid (not expired)
-			if expires_at > Timestamp::now() {
-				debug!("  using cached key (expires at {})", expires_at);
-				match verify_jwt_signature(token, &public_key) {
-					Ok(action) => {
-						info!("← VERIFIED: type={} from={}", action.t, action.iss);
-						return Ok(action);
-					}
-					Err(e) => {
-						// Signature verification failed - penalize
-						if let Some(ip) = client_ip
-							&& let Err(pen_err) = app.rate_limiter.penalize(
-								ip,
-								PenaltyReason::TokenVerificationFailure,
-								1,
-							) {
-							warn!("Failed to record token penalty for {}: {}", ip, pen_err);
-						}
-						warn!("  signature verification failed (cached key): {}", e);
-						return Err(e);
-					}
-				}
-			}
-			// Key expired - continue to HTTP fetch
-			debug!("  cached key expired at {}, fetching fresh", expires_at);
-		}
-		Err(Error::NotFound) => {
-			// No cached key - continue to HTTP fetch
-			debug!("  no cached key, fetching from remote");
-		}
-		Err(e) => {
-			// Database error - log but continue to HTTP fetch
-			warn!("  key cache read error: {}, fetching from remote", e);
-		}
+	let mut stale_key: Option<Box<str>> = None;
+	if let Some(result) = try_cached_key_verify(app, token, issuer, key_id, &mut stale_key).await {
+		return result;
 	}
 
 	// 3. HTTP fetch from remote instance
@@ -128,9 +154,31 @@ pub async fn verify_action_token(
 			if let Some(key) = key {
 				let public_key = &key.public_key;
 
-				// Cache the key in SQLite for future use
-				if let Err(e) =
-					app.meta_adapter.add_profile_public_key(issuer, key_id, public_key).await
+				// If we just refetched after a stale-cache failure and the bytes
+				// are identical, the second verify will fail for the same reason —
+				// this is a genuine bad signature, not a stale-cache artifact.
+				// Penalize and return without redoing the verify.
+				if let Some(ref stale) = stale_key
+					&& stale.as_ref() == public_key.as_ref()
+				{
+					if let Some(ip) = client_ip
+						&& let Err(pen_err) = app.rate_limiter.penalize(
+							ip,
+							PenaltyReason::TokenVerificationFailure,
+							1,
+						) {
+						warn!("Failed to record token penalty for {}: {}", ip, pen_err);
+					}
+					warn!("  signature verification failed (refetched key matches stale)");
+					return Err(Error::Unauthorized);
+				}
+
+				// Cache the (possibly refreshed) key in SQLite for future use,
+				// honoring the owner-declared expiration from the remote profile.
+				if let Err(e) = app
+					.meta_adapter
+					.add_profile_public_key(issuer, key_id, public_key, key.expires_at)
+					.await
 				{
 					warn!("Failed to cache public key for {}:{}: {}", issuer, key_id, e);
 				} else {

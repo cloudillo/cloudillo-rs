@@ -1126,11 +1126,17 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		id_tag: &str,
 		key_id: &str,
 	) -> ClResult<(Box<str>, Timestamp)>;
+	/// Cache a federated profile public key.
+	///
+	/// `expires_at` is the owner-declared key expiration from the remote profile.
+	/// `None` means the owner did not declare an expiration; the implementation
+	/// may store it as NULL (treated as "never expires" by `read_profile_public_key`).
 	async fn add_profile_public_key(
 		&self,
 		id_tag: &str,
 		key_id: &str,
 		public_key: &str,
+		expires_at: Option<Timestamp>,
 	) -> ClResult<()>;
 	/// List stale profiles that need refreshing
 	///
