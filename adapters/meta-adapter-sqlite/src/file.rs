@@ -296,12 +296,17 @@ pub(crate) async fn list(
 		_ => query.push(" AND (f.hidden IS NULL OR f.hidden = 0)"),
 	};
 
-	// Filter by pinned/starred (user-specific)
-	if opts.pinned == Some(true) {
-		query.push(" AND fud.pinned = 1");
-	}
-	if opts.starred == Some(true) {
-		query.push(" AND fud.starred = 1");
+	// Filter by pinned/starred (user-specific) — only valid when the
+	// file_user_data JOIN was added (i.e. an authenticated user is present).
+	// Without auth there is no `fud` alias, so referencing fud.* would be a
+	// sqlite "no such column" error.
+	if has_user {
+		if opts.pinned == Some(true) {
+			query.push(" AND fud.pinned = 1");
+		}
+		if opts.starred == Some(true) {
+			query.push(" AND fud.starred = 1");
+		}
 	}
 
 	// Determine sort order
