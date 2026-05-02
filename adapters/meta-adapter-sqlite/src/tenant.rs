@@ -206,7 +206,6 @@ const TENANT_CASCADE_TABLES: &[&str] = &[
 	"contacts",
 	"calendars",
 	"calendar_objects",
-	"collections",
 ];
 
 /// Delete a tenant and all its associated data (cascading delete)
