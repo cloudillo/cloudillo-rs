@@ -658,6 +658,18 @@ impl AccessLevel {
 		}
 	}
 
+	/// Return the greater of two access levels.
+	/// Ordering: None < Read < Comment < Write < Admin
+	pub fn max(self, other: Self) -> Self {
+		match (self, other) {
+			(Self::Admin, _) | (_, Self::Admin) => Self::Admin,
+			(Self::Write, _) | (_, Self::Write) => Self::Write,
+			(Self::Comment, _) | (_, Self::Comment) => Self::Comment,
+			(Self::Read, _) | (_, Self::Read) => Self::Read,
+			(Self::None, Self::None) => Self::None,
+		}
+	}
+
 	/// Convert a share permission char ('R', 'C', 'W', 'A') to an access level.
 	/// 'A' (admin) maps to Write because scoped tokens don't carry admin privileges;
 	/// admin access is only resolved from direct ownership, not from share links.

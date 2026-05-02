@@ -9,7 +9,78 @@
 
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use cloudillo_types::meta_adapter::{CreateFile, FileStatus, UpdateActionDataOptions};
+use cloudillo_types::meta_adapter::{
+	CreateFile, CreateShareEntry, FileStatus, UpdateActionDataOptions,
+};
+
+/// FSHR on_create hook - Create share_entry on the sender's side
+///
+/// When a user shares a file/directory via the action API, this hook ensures
+/// the corresponding share_entry is created so that the recipient can access
+/// the shared content. For DEL subtype, removes the share_entry instead.
+pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
+	let tn_id = context.tn_id;
+
+	let Some(ref resource_id) = context.subject else {
+		tracing::warn!("FSHR on_create: Missing subject (file_id)");
+		return Ok(HookResult::default());
+	};
+
+	let Some(ref audience) = context.audience else {
+		tracing::warn!("FSHR on_create: Missing audience");
+		return Ok(HookResult::default());
+	};
+
+	if context.subtype.as_deref() == Some("DEL") {
+		// Remove the share entry
+		let entries = app.meta_adapter.list_share_entries(tn_id, 'F', resource_id).await?;
+		for entry in entries {
+			if entry.subject_type == 'U' && entry.subject_id.as_ref() == audience.as_str() {
+				app.meta_adapter.delete_share_entry(tn_id, entry.id).await?;
+				tracing::info!(
+					"FSHR on_create: Deleted share entry for {} on {}",
+					audience,
+					resource_id
+				);
+			}
+		}
+		return Ok(HookResult::default());
+	}
+
+	let permission = match context.subtype.as_deref() {
+		Some("WRITE") => 'W',
+		Some("COMMENT") => 'C',
+		_ => 'R',
+	};
+
+	let entry = CreateShareEntry {
+		subject_type: 'U',
+		subject_id: audience.clone(),
+		permission,
+		expires_at: None,
+	};
+
+	match app
+		.meta_adapter
+		.create_share_entry(tn_id, 'F', resource_id, &context.issuer, &entry)
+		.await
+	{
+		Ok(_) => {
+			tracing::info!(
+				"FSHR on_create: Created share entry for {} on {} (perm={})",
+				audience,
+				resource_id,
+				permission
+			);
+		}
+		Err(e) => {
+			tracing::warn!("FSHR on_create: Failed to create share entry: {}", e);
+			return Err(e);
+		}
+	}
+
+	Ok(HookResult::default())
+}
 
 /// FSHR on_receive hook - Handle incoming file share request
 ///

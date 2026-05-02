@@ -82,7 +82,7 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 	// FSHR hooks
 	{
 		let fshr_hooks = ActionTypeHooks {
-			on_create: None,
+			on_create: Some(Arc::new(|app, ctx| Box::pin(fshr::on_create(app, ctx)))),
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(fshr::on_receive(app, ctx)))),
 			on_accept: Some(Arc::new(|app, ctx| Box::pin(fshr::on_accept(app, ctx)))),
 			on_reject: None,
@@ -203,6 +203,7 @@ mod tests {
 		let _ = fllw::on_create;
 		let _ = fllw::on_receive;
 		let _ = idp::idp_reg_on_receive;
+		let _ = fshr::on_create;
 		let _ = fshr::on_receive;
 		let _ = fshr::on_accept;
 		let _ = react::on_create;

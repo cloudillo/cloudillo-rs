@@ -13,13 +13,15 @@ use cloudillo_types::types::AccessLevel;
 /// Visibility filtering is already handled at the SQL level via
 /// `ListFileOptions::visible_levels`, so this function only determines
 /// the subject's read/write access for each file.
+///
+/// `floor_access` provides a minimum access level inherited from a parent
+/// directory share. When set, each file's effective access is the maximum of
+/// its individually computed level and this floor.
 pub async fn compute_file_access_levels(
 	app: &App,
 	tn_id: TnId,
-	subject_id_tag: &str,
-	is_authenticated: bool,
-	tenant_id_tag: &str,
-	subject_roles: &[Box<str>],
+	ctx: &file_access::FileAccessCtx<'_>,
+	floor_access: Option<AccessLevel>,
 	files: Vec<FileView>,
 ) -> ClResult<Vec<FileView>> {
 	if files.is_empty() {
@@ -27,7 +29,7 @@ pub async fn compute_file_access_levels(
 	}
 
 	// For anonymous users, access_level is Read for all files
-	if !is_authenticated || subject_id_tag.is_empty() {
+	if ctx.user_id_tag.is_empty() {
 		return Ok(files
 			.into_iter()
 			.map(|mut file| {
@@ -40,22 +42,22 @@ pub async fn compute_file_access_levels(
 	// For authenticated users, compute access level for each file
 	let mut result = Vec::with_capacity(files.len());
 	for mut file in files {
-		// Get owner id_tag, filtering out empty strings (from failed profile JOINs)
 		let owner_tag = file
 			.owner
 			.as_ref()
 			.and_then(|o| if o.id_tag.is_empty() { None } else { Some(o.id_tag.as_ref()) })
-			.unwrap_or(tenant_id_tag);
+			.unwrap_or(ctx.tenant_id_tag);
 
-		let ctx = file_access::FileAccessCtx {
-			user_id_tag: subject_id_tag,
-			tenant_id_tag,
-			user_roles: subject_roles,
-		};
 		let access_level =
-			file_access::get_access_level(app, tn_id, &file.file_id, owner_tag, &ctx).await;
+			file_access::get_access_level(app, tn_id, &file.file_id, owner_tag, ctx, floor_access)
+				.await;
 
-		file.access_level = Some(access_level);
+		let effective = match floor_access {
+			Some(floor) => floor.max(access_level),
+			None => access_level,
+		};
+
+		file.access_level = Some(effective);
 		result.push(file);
 	}
 

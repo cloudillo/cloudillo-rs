@@ -33,6 +33,58 @@ pub struct FileAccessCtx<'a> {
 	pub user_roles: &'a [Box<str>],
 }
 
+/// Walk the parent chain of a file to find an inherited share entry.
+///
+/// Checks each ancestor's share_access for the given user. Returns the first
+/// (closest ancestor) match's access level, or None if no ancestor is shared.
+/// Bounded to 20 levels to prevent runaway traversal.
+pub async fn walk_parent_chain_for_share(
+	app: &App,
+	tn_id: TnId,
+	file_id: &str,
+	user_id_tag: &str,
+) -> Option<AccessLevel> {
+	let mut current_id = file_id.to_string();
+	let mut depth = 0;
+	while depth < 20 {
+		match app.meta_adapter.read_file(tn_id, &current_id).await {
+			Ok(Some(file)) => {
+				if let Some(ref parent_id) = file.parent_id {
+					if let Ok(Some(perm)) = app
+						.meta_adapter
+						.check_share_access(tn_id, 'F', parent_id, 'U', user_id_tag)
+						.await
+					{
+						return Some(AccessLevel::from_perm_char(perm));
+					}
+					current_id = parent_id.to_string();
+					depth += 1;
+				} else {
+					break;
+				}
+			}
+			_ => break,
+		}
+	}
+	None
+}
+
+/// Check if a user has share access to a file — either a direct share entry
+/// on the file itself or an inherited share from an ancestor folder.
+pub async fn check_share_for_file(
+	app: &App,
+	tn_id: TnId,
+	file_id: &str,
+	user_id_tag: &str,
+) -> Option<AccessLevel> {
+	if let Ok(Some(perm)) =
+		app.meta_adapter.check_share_access(tn_id, 'F', file_id, 'U', user_id_tag).await
+	{
+		return Some(AccessLevel::from_perm_char(perm));
+	}
+	walk_parent_chain_for_share(app, tn_id, file_id, user_id_tag).await
+}
+
 /// Get access level for a user on a file
 ///
 /// Determines access level based on:
@@ -47,19 +99,28 @@ pub async fn get_access_level(
 	file_id: &str,
 	owner_id_tag: &str,
 	ctx: &FileAccessCtx<'_>,
+	inherited_share: Option<AccessLevel>,
 ) -> AccessLevel {
 	// Owner always has write access
 	if ctx.user_id_tag == owner_id_tag {
 		return AccessLevel::Write;
 	}
 
-	// User share entry ('U') check — explicit per-file grants take priority
+	// Direct share on this specific file
 	if let Ok(Some(perm)) = app
 		.meta_adapter
 		.check_share_access(tn_id, 'F', file_id, 'U', ctx.user_id_tag)
 		.await
 	{
 		return AccessLevel::from_perm_char(perm);
+	}
+	// Inherited share from parent folder (already resolved by caller)
+	if let Some(level) = inherited_share {
+		return level;
+	}
+	// No known inheritance — walk the parent chain
+	if let Some(level) = walk_parent_chain_for_share(app, tn_id, file_id, ctx.user_id_tag).await {
+		return level;
 	}
 
 	// Role-based access for tenant-owned files only (owner_id_tag == tenant_id_tag)
@@ -162,7 +223,7 @@ pub async fn get_access_level_with_scope(
 	}
 
 	// Fall back to existing logic (ownership, roles, FSHR actions)
-	get_access_level(app, tn_id, file_id, owner_id_tag, ctx).await
+	get_access_level(app, tn_id, file_id, owner_id_tag, ctx, None).await
 }
 
 /// Check file access and return file view with access level

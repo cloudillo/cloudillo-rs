@@ -194,6 +194,23 @@ pub async fn get_file_list(
 		opts.hidden = None;
 	}
 
+	// Share access: bypass visibility filter when the user has a share entry
+	// on the queried folder (parentId). Per-file share checks are handled
+	// individually by get_access_level in compute_file_access_levels.
+	let mut inherited_share: Option<types::AccessLevel> = None;
+	if !is_tenant
+		&& is_real_auth
+		&& let Some(ref parent_id) = opts.parent_id
+		&& parent_id != "__root__"
+		&& parent_id != "__trash__"
+	{
+		inherited_share =
+			file_access::check_share_for_file(&app, tn_id, parent_id, subject_id_tag).await;
+	}
+	if inherited_share.is_some() {
+		opts.visible_levels = None;
+	}
+
 	let limit = opts.limit.unwrap_or(30) as usize;
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
 
@@ -201,16 +218,14 @@ pub async fn get_file_list(
 
 	// Compute access_level (Read/Write) for each file
 	// (visibility is already filtered at SQL level via visible_levels)
-	let mut filtered = filter::compute_file_access_levels(
-		&app,
-		tn_id,
-		subject_id_tag,
-		is_authenticated,
-		&tenant_id_tag,
-		subject_roles,
-		files,
-	)
-	.await?;
+	let access_ctx = file_access::FileAccessCtx {
+		user_id_tag: subject_id_tag,
+		tenant_id_tag: &tenant_id_tag,
+		user_roles: subject_roles,
+	};
+	let mut filtered =
+		filter::compute_file_access_levels(&app, tn_id, &access_ctx, inherited_share, files)
+			.await?;
 
 	// Check if there are more results (we fetched limit+1)
 	let has_more = filtered.len() > limit;
