@@ -1300,9 +1300,22 @@ pub async fn activate_identity(
 		)));
 	}
 
-	// Update identity status to Active
-	let update_opts =
-		UpdateIdentityOptions { status: Some(IdentityStatus::Active), ..Default::default() };
+	// Recalculate expires_at from idp.renewal_interval now that the identity is being activated.
+	// Pending identities are created with a short 24h TTL; on activation we extend to the
+	// configured renewal interval so they don't get reaped by cleanup_expired_identities.
+	let renewal_interval_days = match app.settings.get(tn_id, "idp.renewal_interval").await {
+		Ok(Some(SettingValue::Int(days))) => days.clamp(1, 3650),
+		_ => 365, // Fallback to 1 year if setting is missing or invalid
+	};
+	let renewal_interval_seconds = renewal_interval_days.saturating_mul(86400);
+	let new_expires_at = Timestamp::now().add_seconds(renewal_interval_seconds);
+
+	// Update identity status to Active with new expiration
+	let update_opts = UpdateIdentityOptions {
+		status: Some(IdentityStatus::Active),
+		expires_at: Some(new_expires_at),
+		..Default::default()
+	};
 
 	let updated_identity = idp_adapter
 		.update_identity(&id_tag_prefix, &id_tag_domain, update_opts)
