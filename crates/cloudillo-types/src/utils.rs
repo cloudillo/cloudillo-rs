@@ -99,6 +99,21 @@ pub fn parse_and_validate_identity_id_tag(
 	}
 }
 
+/// Mask an email for safe display: "al***@ex***.com"
+pub fn mask_email(email: &str) -> Option<String> {
+	let (local, domain) = email.split_once('@')?;
+	let (domain_name, tld) = domain.rsplit_once('.')?;
+
+	if local.is_empty() || domain_name.is_empty() {
+		return None;
+	}
+
+	let local_visible = &local[..local.len().min(1)];
+	let domain_visible = &domain_name[..domain_name.len().min(1)];
+
+	Some(format!("{}***@{}***.{}", local_visible, domain_visible, tld))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -152,6 +167,17 @@ mod tests {
 	fn test_empty_registrar_domain_fails() {
 		let result = parse_and_validate_identity_id_tag("alice.example.com", "");
 		assert!(result.is_err());
+	}
+	#[test]
+	fn test_mask_email() {
+		assert_eq!(super::mask_email("alice@example.com"), Some("a***@e***.com".to_string()));
+		assert_eq!(super::mask_email("a@x.co"), Some("a***@x***.co".to_string()));
+		assert_eq!(super::mask_email("bob@sub.domain.org"), Some("b***@s***.org".to_string()));
+		assert_eq!(super::mask_email("no-at-sign"), None);
+		assert_eq!(super::mask_email("user@nodot"), None);
+		assert_eq!(super::mask_email("@example.com"), None);
+		assert_eq!(super::mask_email("user@.com"), None);
+		assert_eq!(super::mask_email(""), None);
 	}
 }
 

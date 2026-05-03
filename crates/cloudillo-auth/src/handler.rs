@@ -1045,6 +1045,8 @@ pub enum LoginInitResponse {
 		qr_login: crate::qr_login::InitResponse,
 		#[serde(rename = "webAuthn")]
 		web_authn: Option<crate::webauthn::LoginChallengeRes>,
+		#[serde(rename = "maskedEmail", skip_serializing_if = "Option::is_none")]
+		masked_email: Option<String>,
 	},
 }
 
@@ -1066,13 +1068,20 @@ pub async fn post_login_init(
 			.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else {
-		// Unauthenticated path: return QR + WebAuthn init data
+		// Unauthenticated path: return QR + WebAuthn init data + masked email for forgot-password
 		debug!("login-init for unauthenticated user");
 		let qr_result = crate::qr_login::create_session(&app, tn_id, &addr, &headers)?;
 		let wa_result = crate::webauthn::try_login_challenge(&app, &id_tag, tn_id).await;
+
+		let masked_email = match app.auth_adapter.read_tenant(&id_tag.0).await {
+			Ok(profile) => profile.email.as_deref().and_then(cloudillo_types::utils::mask_email),
+			Err(_) => None,
+		};
+
 		let response = ApiResponse::new(LoginInitResponse::Unauthenticated {
 			qr_login: qr_result,
 			web_authn: wa_result,
+			masked_email,
 		})
 		.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
