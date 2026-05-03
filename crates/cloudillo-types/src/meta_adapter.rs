@@ -1578,11 +1578,12 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Delete an address book (and all its contacts).
 	async fn delete_address_book(&self, tn_id: TnId, ab_id: u64) -> ClResult<()>;
 
-	/// List + search contacts within an address book. Excludes soft-deleted rows.
+	/// List + search contacts. When `ab_id` is `Some`, scopes to that book (cursor
+	/// is c_id-ordered). When `None`, queries across all books sorted by name.
 	async fn list_contacts(
 		&self,
 		tn_id: TnId,
-		ab_id: u64,
+		ab_id: Option<u64>,
 		opts: &ListContactOptions,
 	) -> ClResult<Vec<ContactView>>;
 

@@ -401,7 +401,7 @@ async fn propfind_collection(
 	if d >= 1 {
 		let rows = match app
 			.meta_adapter
-			.list_contacts(tn_id, ab.ab_id, &ListContactOptions::default())
+			.list_contacts(tn_id, Some(ab.ab_id), &ListContactOptions::default())
 			.await
 		{
 			Ok(r) => r,

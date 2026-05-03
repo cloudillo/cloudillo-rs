@@ -722,7 +722,7 @@ impl MetaAdapter for MetaAdapterSqlite {
 	async fn list_contacts(
 		&self,
 		tn_id: TnId,
-		ab_id: u64,
+		ab_id: Option<u64>,
 		opts: &ListContactOptions,
 	) -> ClResult<Vec<ContactView>> {
 		contact::list_contacts(&self.dbr, tn_id, ab_id, opts).await

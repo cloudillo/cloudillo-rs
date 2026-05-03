@@ -260,6 +260,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/address-books", post(contact::handler::create_address_book))
 		.route("/api/address-books/{ab_id}", patch(contact::handler::patch_address_book))
 		.route("/api/address-books/{ab_id}", delete(contact::handler::delete_address_book))
+		.route("/api/contacts", get(contact::handler::list_all_contacts))
 		.route("/api/address-books/{ab_id}/contacts", get(contact::handler::list_contacts))
 		.route("/api/address-books/{ab_id}/contacts", post(contact::handler::create_contact))
 		.route("/api/address-books/{ab_id}/import", post(contact::handler::import_contacts))

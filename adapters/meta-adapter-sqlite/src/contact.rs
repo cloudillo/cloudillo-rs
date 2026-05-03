@@ -243,13 +243,15 @@ fn row_to_contact(row: &sqlx::sqlite::SqliteRow) -> Contact {
 pub async fn list_contacts(
 	db: &SqlitePool,
 	tn_id: TnId,
-	ab_id: u64,
+	ab_id: Option<u64>,
 	opts: &ListContactOptions,
 ) -> ClResult<Vec<ContactView>> {
 	let mut query = sqlx::QueryBuilder::new("SELECT ");
 	query.push(CONTACT_COLS);
 	query.push(" FROM contacts WHERE tn_id = ").push_bind(tn_id.0);
-	query.push(" AND ab_id = ").push_bind(ab_id.cast_signed());
+	if let Some(id) = ab_id {
+		query.push(" AND ab_id = ").push_bind(id.cast_signed());
+	}
 	query.push(" AND deleted_at IS NULL");
 
 	if let Some(q) = opts.q.as_deref()
@@ -265,13 +267,32 @@ pub async fn list_contacts(
 		query.push(" ESCAPE '\\')");
 	}
 
-	if let Some(cursor) = opts.cursor.as_deref() {
-		let c_id: i64 =
-			cursor.parse().map_err(|_| Error::ValidationError("Invalid cursor".into()))?;
-		query.push(" AND c_id > ").push_bind(c_id);
+	if ab_id.is_some() {
+		// Single-book mode: cursor by c_id, ordered by c_id.
+		if let Some(cursor) = opts.cursor.as_deref() {
+			let c_id: i64 =
+				cursor.parse().map_err(|_| Error::ValidationError("Invalid cursor".into()))?;
+			query.push(" AND c_id > ").push_bind(c_id);
+		}
+		query.push(" ORDER BY c_id ASC");
+	} else {
+		// All-books mode: name-sorted with keyset pagination on (fn_name, c_id).
+		if let Some(cursor) = opts.cursor.as_deref() {
+			let c_id: i64 =
+				cursor.parse().map_err(|_| Error::ValidationError("Invalid cursor".into()))?;
+			query.push(" AND (COALESCE(fn_name, '') > COALESCE((");
+			query.push("SELECT COALESCE(fn_name, '') FROM contacts WHERE c_id = ");
+			query.push_bind(c_id);
+			query.push("), '') OR (COALESCE(fn_name, '') = COALESCE((");
+			query.push("SELECT COALESCE(fn_name, '') FROM contacts WHERE c_id = ");
+			query.push_bind(c_id);
+			query.push("), '') AND c_id > ");
+			query.push_bind(c_id);
+			query.push("))");
+		}
+		query.push(" ORDER BY COALESCE(fn_name, '') ASC, c_id ASC");
 	}
 
-	query.push(" ORDER BY c_id ASC");
 	// Fetch limit+1 so the handler can tell real "there's more" from exact-fit pages.
 	let limit = opts.limit.unwrap_or(100).min(500);
 	query.push(" LIMIT ").push_bind(i64::from(limit) + 1);

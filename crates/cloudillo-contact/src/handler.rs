@@ -384,14 +384,12 @@ pub async fn delete_address_book(
 // Contacts
 //**********
 
-pub async fn list_contacts(
-	State(app): State<App>,
+async fn list_contacts_inner(
+	app: &App,
 	tn_id: TnId,
-	IdTag(_id_tag): IdTag,
-	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
-	Path(ab_id): Path<u64>,
-	Query(query): Query<ListContactsQuery>,
+	ab_id: Option<u64>,
+	query: ListContactsQuery,
+	req_id: Option<String>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ContactListItem>>>)> {
 	let opts = ListContactOptions { q: query.q, cursor: query.cursor, limit: query.limit };
 	let mut rows = app.meta_adapter.list_contacts(tn_id, ab_id, &opts).await?;
@@ -407,7 +405,7 @@ pub async fn list_contacts(
 		.iter()
 		.filter_map(|r| r.extracted.profile_id_tag.as_deref().map(str::to_string))
 		.collect();
-	let overlays = resolve_overlays(&app, tn_id, profile_tags.iter().map(String::as_str)).await?;
+	let overlays = resolve_overlays(app, tn_id, profile_tags.iter().map(String::as_str)).await?;
 
 	let items: Vec<ContactListItem> =
 		rows.iter().map(|row| contact_view_to_list_item(row, &overlays)).collect();
@@ -419,6 +417,29 @@ pub async fn list_contacts(
 		resp = resp.with_req_id(id);
 	}
 	Ok((StatusCode::OK, Json(resp)))
+}
+
+pub async fn list_contacts(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(_id_tag): IdTag,
+	Auth(_auth): Auth,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Path(ab_id): Path<u64>,
+	Query(query): Query<ListContactsQuery>,
+) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ContactListItem>>>)> {
+	list_contacts_inner(&app, tn_id, Some(ab_id), query, req_id).await
+}
+
+pub async fn list_all_contacts(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(_id_tag): IdTag,
+	Auth(_auth): Auth,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Query(query): Query<ListContactsQuery>,
+) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ContactListItem>>>)> {
+	list_contacts_inner(&app, tn_id, None, query, req_id).await
 }
 
 pub async fn get_contact(
