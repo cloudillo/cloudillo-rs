@@ -24,6 +24,7 @@ struct RemoteFileMetadata {
 	content_type: Option<String>,
 	file_name: String,
 	created_at: Timestamp,
+	x: Option<serde_json::Value>,
 }
 
 /// Result of a file sync operation
@@ -264,6 +265,7 @@ pub async fn sync_file_variants(
 			file_name: remote_file.file_name.into(),
 			created_at: Some(remote_file.created_at),
 			visibility: Some(visibility.unwrap_or('D')),
+			x: remote_file.x,
 			..Default::default()
 		};
 
