@@ -145,13 +145,16 @@ impl DslEngine {
 	}
 
 	/// Execute a hook for an action type
+	///
+	/// Returns `true` if processing should continue, `false` if the hook
+	/// requested to abort further processing (e.g. spurious CONN:ACC).
 	pub async fn execute_hook(
 		&self,
 		app: &App,
 		action_type: &str,
 		hook_type: HookType,
 		mut context: HookContext,
-	) -> ClResult<()> {
+	) -> ClResult<bool> {
 		use crate::hooks::HookImplementation;
 
 		let definition = self.definitions.get(action_type).ok_or_else(|| {
@@ -179,20 +182,20 @@ impl DslEngine {
 							if !hook_result.continue_processing {
 								tracing::debug!("Native hook requested to abort processing");
 							}
-							Ok(())
+							Ok(hook_result.continue_processing)
 						}
 						Ok(Err(e)) => Err(e),
 						Err(_) => Err(Error::Timeout),
 					}
 				} else {
 					drop(registry);
-					Ok(())
+					Ok(true)
 				}
 			}
 
 			HookImplementation::Dsl(operations) => {
 				if operations.is_empty() {
-					return Ok(());
+					return Ok(true);
 				}
 
 				// Execute DSL operations with timeout
@@ -210,7 +213,7 @@ impl DslEngine {
 						}
 					}
 
-					Ok(())
+					Ok(true)
 				};
 
 				match timeout(HOOK_TIMEOUT, execution).await {
@@ -228,12 +231,10 @@ impl DslEngine {
 					drop(registry);
 					match timeout(HOOK_TIMEOUT, hook_fn(app.clone(), context)).await {
 						Ok(Ok(hook_result)) => {
-							// Merge variables back into context
-							// (in future, we may want to pass context by reference and update it)
 							if !hook_result.continue_processing {
 								tracing::debug!("Native hook requested to abort processing");
 							}
-							Ok(())
+							Ok(hook_result.continue_processing)
 						}
 						Ok(Err(e)) => Err(e),
 						Err(_) => Err(Error::Timeout),
@@ -245,7 +246,7 @@ impl DslEngine {
 						hook_type.as_str(),
 						action_type
 					);
-					Ok(())
+					Ok(true)
 				}
 			}
 
@@ -288,14 +289,14 @@ impl DslEngine {
 							if !hook_result.continue_processing {
 								tracing::debug!("Hybrid native hook requested to abort processing");
 							}
-							Ok(())
+							Ok(hook_result.continue_processing)
 						}
 						Ok(Err(e)) => Err(e),
 						Err(_) => Err(Error::Timeout),
 					}
 				} else {
 					drop(registry);
-					Ok(())
+					Ok(true)
 				}
 			}
 		}

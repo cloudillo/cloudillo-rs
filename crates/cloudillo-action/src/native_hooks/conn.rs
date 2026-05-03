@@ -300,6 +300,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					{
 						tracing::warn!("CONN: Failed to update action status to D: {}", e);
 					}
+					return Ok(HookResult { continue_processing: false, ..Default::default() });
 				}
 				Some("A") => {
 					// AUTO-ACCEPT mode: Create response CONN action and connect
@@ -411,7 +412,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				{
 					tracing::warn!("CONN:ACC: Failed to update action status to D: {}", e);
 				}
-				return Ok(HookResult::default());
+				return Ok(HookResult { continue_processing: false, ..Default::default() });
 			}
 
 			// Update issuer's profile to connected

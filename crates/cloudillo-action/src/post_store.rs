@@ -70,6 +70,11 @@ pub struct PostStoreResult {
 	pub hook_result: Option<serde_json::Value>,
 }
 
+struct HookExecutionResult {
+	return_value: Option<serde_json::Value>,
+	continue_processing: bool,
+}
+
 /// Unified post-storage action processing
 ///
 /// This is the merge point for both outbound and inbound action flows.
@@ -93,8 +98,11 @@ pub async fn process_after_store(
 	let mut result = PostStoreResult { hook_result: None };
 
 	// 1. Execute hook (on_create for outbound, on_receive for inbound)
-	let hook_result = execute_hook(app, tn_id, action, &ctx).await?;
-	result.hook_result = hook_result;
+	let hook_exec = execute_hook(app, tn_id, action, &ctx).await?;
+	result.hook_result = hook_exec.return_value;
+	if !hook_exec.continue_processing {
+		return Ok(result);
+	}
 
 	// 2. Forward to WebSocket clients
 	forward_to_websocket(app, tn_id, action, attachment_views, &ctx).await;
@@ -129,12 +137,12 @@ async fn execute_hook(
 	tn_id: TnId,
 	action: &meta_adapter::Action<Box<str>>,
 	ctx: &ProcessingContext,
-) -> ClResult<Option<serde_json::Value>> {
+) -> ClResult<HookExecutionResult> {
 	let dsl = app.ext::<Arc<DslEngine>>()?;
 
 	let Some(resolved_type) = dsl.resolve_action_type(&action.typ, action.sub_typ.as_deref())
 	else {
-		return Ok(None);
+		return Ok(HookExecutionResult { return_value: None, continue_processing: true });
 	};
 
 	// Look up tenant's own id_tag (not the audience)
@@ -184,7 +192,10 @@ async fn execute_hook(
 	let is_sync = matches!(ctx, ProcessingContext::Inbound { is_sync: true, .. });
 	if is_sync {
 		match dsl.execute_hook_with_result(app, &resolved_type, hook_type, hook_context).await {
-			Ok(result) => Ok(result.return_value),
+			Ok(result) => Ok(HookExecutionResult {
+				return_value: result.return_value,
+				continue_processing: result.continue_processing,
+			}),
 			Err(e) => {
 				warn!(
 					action_id = %action.action_id,
@@ -197,16 +208,21 @@ async fn execute_hook(
 			}
 		}
 	} else {
-		if let Err(e) = dsl.execute_hook(app, &resolved_type, hook_type, hook_context).await {
-			warn!(
-				action_id = %action.action_id,
-				action_type = %action.typ,
-				hook = %hook_type.as_str(),
-				error = %e,
-				"DSL hook failed"
-			);
+		match dsl.execute_hook(app, &resolved_type, hook_type, hook_context).await {
+			Ok(continue_processing) => {
+				Ok(HookExecutionResult { return_value: None, continue_processing })
+			}
+			Err(e) => {
+				warn!(
+					action_id = %action.action_id,
+					action_type = %action.typ,
+					hook = %hook_type.as_str(),
+					error = %e,
+					"DSL hook failed"
+				);
+				Ok(HookExecutionResult { return_value: None, continue_processing: true })
+			}
 		}
-		Ok(None)
 	}
 }
 
