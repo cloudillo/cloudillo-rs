@@ -408,7 +408,10 @@ pub async fn upgrade_file_visibility(
 				tn_id,
 				file_id,
 				&UpdateFileOptions {
-					visibility: Patch::Value(target_visibility.unwrap_or('F')),
+					visibility: match target_visibility {
+						Some(c) => Patch::Value(c),
+						None => Patch::Null,
+					},
 					..Default::default()
 				},
 			)
