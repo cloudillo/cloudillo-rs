@@ -3,8 +3,6 @@
 
 use std::path::Path;
 
-use tokio::io::AsyncReadExt;
-
 use crate::prelude::*;
 use cloudillo_types::blob_adapter;
 use cloudillo_types::hasher;
@@ -16,9 +14,15 @@ pub async fn create_blob_buf(
 	opts: blob_adapter::CreateBlobOptions,
 ) -> ClResult<Box<str>> {
 	let tm = std::time::SystemTime::now();
-	let mut hasher = hasher::Hasher::new();
-	hasher.update(data);
-	let file_id = hasher.finalize("b");
+	let data_vec = data.to_vec();
+	let file_id = app
+		.worker
+		.run(move || {
+			let mut hasher = hasher::Hasher::new();
+			hasher.update(&data_vec);
+			hasher.finalize("b")
+		})
+		.await?;
 	if let Ok(elapsed) = tm.elapsed() {
 		info!("SHA256 elapsed: {}ms", elapsed.as_millis());
 	}
@@ -37,29 +41,32 @@ pub async fn create_blob_from_file(
 ) -> ClResult<Box<str>> {
 	let tm = std::time::SystemTime::now();
 
-	// Open file and compute hash
-	let mut file = tokio::fs::File::open(file_path).await?;
-	let mut hasher = hasher::Hasher::new();
-	let mut buffer = vec![0u8; 64 * 1024]; // 64KB chunks
-
-	loop {
-		let n = file.read(&mut buffer).await?;
-		if n == 0 {
-			break;
-		}
-		hasher.update(&buffer[..n]);
-	}
-
-	let blob_id = hasher.finalize("b");
+	let path = file_path.to_path_buf();
+	let blob_id = app
+		.worker
+		.try_run(move || -> ClResult<String> {
+			use std::io::Read;
+			let mut file = std::fs::File::open(&path)?;
+			let mut hasher = hasher::Hasher::new();
+			let mut buffer = vec![0u8; 64 * 1024];
+			loop {
+				let n = file.read(&mut buffer)?;
+				if n == 0 {
+					break;
+				}
+				hasher.update(&buffer[..n]);
+			}
+			Ok(hasher.finalize("b"))
+		})
+		.await?;
 
 	if let Ok(elapsed) = tm.elapsed() {
 		info!("SHA256 streaming hash elapsed: {}ms", elapsed.as_millis());
 	}
 
-	// Read file again and store via blob adapter
-	// (Could optimize with blob_adapter streaming support in future)
-	let bytes = tokio::fs::read(file_path).await?;
-	app.blob_adapter.create_blob_buf(tn_id, &blob_id, &bytes, &opts).await?;
+	app.blob_adapter
+		.create_blob_from_path(tn_id, &blob_id, file_path, &opts)
+		.await?;
 
 	Ok(blob_id.into_boxed_str())
 }

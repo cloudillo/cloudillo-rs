@@ -103,7 +103,7 @@ impl Task<App> for VideoTranscoderTask {
 
 		let (resolution, duration) = app
 			.worker
-			.try_run(move || {
+			.try_run_slow(move || {
 				let opts = ffmpeg::VideoTranscodeOpts {
 					max_dim,
 					bitrate,
@@ -125,12 +125,14 @@ impl Task<App> for VideoTranscoderTask {
 			self.input_path, resolution.0, resolution.1, duration
 		);
 
-		// Read output and create blob
-		let bytes = tokio::fs::read(&output_path).await?;
-		let variant_id = store::create_blob_buf(
+		// Get file size before creating blob
+		let file_size = tokio::fs::metadata(&output_path).await?.len();
+
+		// Create blob from file (streams + hashes off the tokio worker thread)
+		let variant_id = store::create_blob_from_file(
 			app,
 			self.tn_id,
-			&bytes,
+			&output_path,
 			blob_adapter::CreateBlobOptions::default(),
 		)
 		.await?;
@@ -148,7 +150,7 @@ impl Task<App> for VideoTranscoderTask {
 					variant: &self.variant,
 					format: "mp4",
 					resolution,
-					size: bytes.len() as u64,
+					size: file_size,
 					available: true,
 					duration: Some(duration),
 					bitrate: Some(self.bitrate),

@@ -95,7 +95,7 @@ impl Task<App> for AudioExtractorTask {
 
 		let duration = app
 			.worker
-			.try_run(move || {
+			.try_run_slow(move || {
 				let opts = ffmpeg::AudioExtractOpts {
 					bitrate,
 					codec: "libopus".to_string(),
@@ -110,12 +110,14 @@ impl Task<App> for AudioExtractorTask {
 
 		info!("Finished task audio.extract {:?} → dur={:.2}s", self.input_path, duration);
 
-		// Read output and create blob
-		let bytes = tokio::fs::read(&output_path).await?;
-		let variant_id = store::create_blob_buf(
+		// Get file size before creating blob
+		let file_size = tokio::fs::metadata(&output_path).await?.len();
+
+		// Create blob from file (streams + hashes off the worker thread)
+		let variant_id = store::create_blob_from_file(
 			app,
 			self.tn_id,
-			&bytes,
+			&output_path,
 			blob_adapter::CreateBlobOptions::default(),
 		)
 		.await?;
@@ -132,8 +134,8 @@ impl Task<App> for AudioExtractorTask {
 					variant_id: &variant_id,
 					variant: &self.variant,
 					format: "opus",
-					resolution: (0, 0), // Audio has no resolution
-					size: bytes.len() as u64,
+					resolution: (0, 0),
+					size: file_size,
 					available: true,
 					duration: Some(duration),
 					bitrate: Some(self.bitrate),

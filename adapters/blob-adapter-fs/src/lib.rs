@@ -194,6 +194,18 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		Ok(Box::pin(stream))
 	}
 
+	async fn create_blob_from_path(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		source: &Path,
+		_opts: &blob_adapter::CreateBlobOptions,
+	) -> ClResult<()> {
+		create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
+		tokio::fs::copy(source, obj_file_path(&self.base_dir, tn_id, file_id)?).await?;
+		Ok(())
+	}
+
 	async fn delete_tenant_blobs(&self, tn_id: TnId) -> ClResult<()> {
 		let tenant_dir = PathBuf::from(self.base_dir.as_ref()).join(tn_id.to_string());
 
