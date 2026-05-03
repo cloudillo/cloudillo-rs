@@ -26,6 +26,27 @@ use crate::{
 	subject_ref::{SubjectRef, parse_subject_ref},
 };
 
+pub async fn collect_file_deps(
+	app: &App,
+	tn_id: TnId,
+	attachments: Option<&Vec<Box<str>>>,
+) -> ClResult<Vec<TaskId>> {
+	let keys: Vec<Box<str>> = attachments
+		.map(|a| {
+			a.iter()
+				.filter(|a| a.starts_with('@'))
+				.map(|a| format!("{},{}", tn_id, &a[1..]).into_boxed_str())
+				.collect()
+		})
+		.unwrap_or_default();
+	if keys.is_empty() {
+		return Ok(Vec::new());
+	}
+	app.meta_adapter
+		.list_task_ids(descriptor::FileIdGeneratorTask::kind(), &keys.into_boxed_slice())
+		.await
+}
+
 pub async fn create_action(
 	app: &App,
 	tn_id: TnId,
@@ -157,7 +178,7 @@ pub async fn create_action(
 		visibility
 	} else {
 		// Get user's default visibility setting
-		match app.settings.get_string(tn_id, "privacy.default_visibility").await {
+		match app.settings.get_string(tn_id, "profile.default_visibility").await {
 			Ok(default_vis) => default_vis.chars().next(),
 			Err(_) => Some('F'), // Fallback to Followers
 		}
@@ -169,6 +190,9 @@ pub async fn create_action(
 	} else {
 		visibility
 	};
+
+	let mut action = action;
+	action.visibility = visibility;
 
 	// Resolve root_id from parent chain (auto-populated, not client-specified)
 	let root_id =
@@ -261,15 +285,7 @@ pub async fn create_action(
 	}
 
 	// Collect file attachment dependencies
-	let attachments_to_wait = if let Some(attachments) = &action.attachments {
-		attachments
-			.iter()
-			.filter(|a| a.starts_with('@'))
-			.map(|a| format!("{},{}", tn_id, &a[1..]).into_boxed_str())
-			.collect::<Vec<_>>()
-	} else {
-		Vec::new()
-	};
+	let mut deps = collect_file_deps(app, tn_id, action.attachments.as_ref()).await?;
 
 	// Collect subject dependency if it references a pending action.
 	// Only `@<digits>` placeholders produce a dependency; identity refs
@@ -278,32 +294,10 @@ pub async fn create_action(
 		Some(SubjectRef::Placeholder(a_id)) => Some(format!("{},{}", tn_id, a_id).into_boxed_str()),
 		_ => None,
 	});
-
-	debug!(
-		"Dependencies for a_id={}: attachments={:?}, subject={:?}",
-		a_id, attachments_to_wait, subject_key
-	);
-
-	// Get file task dependencies
-	let file_deps = app
-		.meta_adapter
-		.list_task_ids(
-			descriptor::FileIdGeneratorTask::kind(),
-			&attachments_to_wait.into_boxed_slice(),
-		)
-		.await?;
-
-	// Get subject action task dependencies
-	let subject_deps = if let Some(ref key) = subject_key {
+	if let Some(ref key) = subject_key {
 		let keys = vec![key.clone()];
-		app.meta_adapter.list_task_ids(ActionCreatorTask::kind(), &keys).await?
-	} else {
-		Vec::new()
-	};
-
-	// Combine all dependencies
-	let mut deps = file_deps;
-	deps.extend(subject_deps);
+		deps.extend(app.meta_adapter.list_task_ids(ActionCreatorTask::kind(), &keys).await?);
+	}
 	debug!("Task dependencies: {:?}", deps);
 
 	// Create ActionCreatorTask to finalize the action
@@ -1075,11 +1069,14 @@ impl Task<App> for DraftPublishTask {
 		app.meta_adapter.update_action_data(self.tn_id, &a_id_ref, &update_opts).await?;
 
 		// Schedule ActionCreatorTask to finalize (sign JWT, deliver)
+		let file_deps =
+			collect_file_deps(app, self.tn_id, current_action.attachments.as_ref()).await?;
 		let task =
 			ActionCreatorTask::new(self.tn_id, self.id_tag.clone(), self.a_id, current_action);
 		app.scheduler
 			.task(task)
 			.key(format!("{},{}", self.tn_id, self.a_id))
+			.depend_on(file_deps)
 			.schedule()
 			.await?;
 

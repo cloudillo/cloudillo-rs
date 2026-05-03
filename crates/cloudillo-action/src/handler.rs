@@ -299,7 +299,7 @@ pub async fn delete_action(
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
-	Ok((StatusCode::NO_CONTENT, Json(response)))
+	Ok((StatusCode::OK, Json(response)))
 }
 
 /// POST /api/actions/:action_id/accept - Accept an action
@@ -739,11 +739,14 @@ pub async fn publish_draft(
 		};
 		app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
 
+		let file_deps =
+			task::collect_file_deps(&app, tn_id, draft_action.attachments.as_ref()).await?;
 		let creator_task =
 			task::ActionCreatorTask::new(tn_id, auth.id_tag.clone(), a_id, draft_action);
 		app.scheduler
 			.task(creator_task)
 			.key(format!("{},{}", tn_id, a_id))
+			.depend_on(file_deps)
 			.schedule()
 			.await?;
 	}

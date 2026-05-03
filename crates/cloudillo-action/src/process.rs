@@ -326,33 +326,41 @@ async fn process_inbound_action_token_inner(
 	}
 
 	// 5. Resolve visibility once for both store and processing
+	let visibility = helpers::inherit_visibility(
+		app.meta_adapter.as_ref(),
+		tn_id,
+		action.v,
+		action.p.as_deref(),
+	)
+	.await;
+
 	let resolved_visibility = if skip_permission_check {
-		None // Pre-approved APRV-related actions get Direct visibility
+		visibility
 	} else {
-		let visibility = helpers::inherit_visibility(
-			app.meta_adapter.as_ref(),
-			tn_id,
-			action.v,
-			action.p.as_deref(),
-		)
-		.await;
-
-		// Get tenant's default visibility (fallback for missing + cap for explicit)
-		let default_visibility =
-			match app.settings.get_string(tn_id, "privacy.default_visibility").await {
-				Ok(default_vis) => default_vis.chars().next().unwrap_or('F'),
-				Err(Error::SettingNotFound(_)) => 'F',
+		let visibility = if visibility.is_some() {
+			visibility
+		} else {
+			match app.settings.get_string(tn_id, "profile.default_visibility").await {
+				Ok(default_vis) => default_vis.chars().next(),
+				Err(Error::SettingNotFound(_)) => Some('F'),
 				Err(e) => return Err(e),
-			};
+			}
+		};
 
-		// Use action visibility (or default if not set),
-		// capped at tenant's default (more restrictive wins)
-		let vis = visibility.unwrap_or(default_visibility);
-		let vis_level = VisibilityLevel::from_char(Some(vis));
-		let default_level = VisibilityLevel::from_char(Some(default_visibility));
-		// VisibilityLevel Ord: Public < ... < Connected < Direct
-		// "more restrictive" = higher Ord value → use max()
-		Some(vis_level.max(default_level).to_char().unwrap_or(vis))
+		match app.settings.get_string(tn_id, "profile.visibility_cap").await {
+			Ok(cap_str) => {
+				if let Some(cap_char) = cap_str.chars().next() {
+					let vis = visibility.unwrap_or('F');
+					let vis_level = VisibilityLevel::from_char(Some(vis));
+					let cap_level = VisibilityLevel::from_char(Some(cap_char));
+					Some(vis_level.max(cap_level).to_char().unwrap_or(vis))
+				} else {
+					visibility
+				}
+			}
+			Err(Error::SettingNotFound(_)) => visibility,
+			Err(e) => return Err(e),
+		}
 	};
 
 	// 6. Store action in database
