@@ -13,7 +13,7 @@ use serde_with::skip_serializing_none;
 
 use crate::prelude::*;
 use cloudillo_core::acme;
-use cloudillo_core::extract::Auth;
+use cloudillo_core::extract::{Auth, OptionalRequestId};
 use cloudillo_types::auth_adapter::{
 	CreateProxySiteData, ProxySiteConfig, ProxySiteData, UpdateProxySiteData,
 };
@@ -256,7 +256,8 @@ pub async fn update_proxy_site(
 pub async fn delete_proxy_site(
 	State(app): State<App>,
 	Path(site_id): Path<i64>,
-) -> ClResult<StatusCode> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	info!(site_id = site_id, "DELETE /api/admin/proxy-sites/:site_id");
 
 	// Read site first to get domain for cache invalidation
@@ -275,7 +276,8 @@ pub async fn delete_proxy_site(
 		certs.remove(&domain);
 	}
 
-	Ok(StatusCode::NO_CONTENT)
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
 }
 
 /// POST /api/admin/proxy-sites/:site_id/renew-cert - Trigger certificate renewal

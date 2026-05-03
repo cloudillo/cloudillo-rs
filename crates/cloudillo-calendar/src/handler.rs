@@ -254,9 +254,11 @@ pub async fn delete_calendar(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path(cal_id): Path<u64>,
-) -> ClResult<StatusCode> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	app.meta_adapter.delete_calendar(tn_id, cal_id).await?;
-	Ok(StatusCode::NO_CONTENT)
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
 }
 
 // Calendar object handlers
@@ -533,9 +535,11 @@ pub async fn delete_object(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((cal_id, uid)): Path<(u64, String)>,
-) -> ClResult<StatusCode> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	app.meta_adapter.delete_calendar_object(tn_id, cal_id, &uid).await?;
-	Ok(StatusCode::NO_CONTENT)
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
 }
 
 /// Regenerate iCalendar + extracted projection for an input. Mirrors the second half of
@@ -788,13 +792,15 @@ pub async fn delete_exception(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((cal_id, uid, rid)): Path<(u64, String, String)>,
-) -> ClResult<StatusCode> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	let ts =
 		parse_iso_ts(&rid).ok_or_else(|| Error::ValidationError("invalid recurrence_id".into()))?;
 	app.meta_adapter
 		.delete_calendar_object_override(tn_id, cal_id, &uid, ts)
 		.await?;
-	Ok(StatusCode::NO_CONTENT)
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
 }
 
 // Tests

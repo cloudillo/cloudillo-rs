@@ -7,8 +7,9 @@ use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
-use cloudillo_core::extract::Auth;
+use cloudillo_core::extract::{Auth, OptionalRequestId};
 use cloudillo_types::meta_adapter::{PushSubscriptionData, PushSubscriptionKeys};
+use cloudillo_types::types::ApiResponse;
 
 /// Request body for creating a push subscription
 #[derive(Debug, Deserialize)]
@@ -98,22 +99,18 @@ pub async fn delete_subscription(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	axum::extract::Path(subscription_id): axum::extract::Path<u64>,
-) -> Result<StatusCode, (StatusCode, String)> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	tracing::info!(
 		tn_id = %auth.tn_id.0,
 		subscription_id = %subscription_id,
 		"Deleting push subscription"
 	);
 
-	app.meta_adapter
-		.delete_push_subscription(auth.tn_id, subscription_id)
-		.await
-		.map_err(|e| {
-			tracing::error!(error = %e, "Failed to delete push subscription");
-			(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete subscription: {}", e))
-		})?;
+	app.meta_adapter.delete_push_subscription(auth.tn_id, subscription_id).await?;
 
-	Ok(StatusCode::NO_CONTENT)
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
 }
 
 /// GET /api/notification/vapid-public-key

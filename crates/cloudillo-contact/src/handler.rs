@@ -374,9 +374,11 @@ pub async fn delete_address_book(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path(ab_id): Path<u64>,
-) -> ClResult<StatusCode> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	app.meta_adapter.delete_address_book(tn_id, ab_id).await?;
-	Ok(StatusCode::NO_CONTENT)
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
 }
 
 // Contacts
@@ -507,9 +509,11 @@ pub async fn delete_contact(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((ab_id, uid)): Path<(u64, String)>,
-) -> ClResult<StatusCode> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	app.meta_adapter.delete_contact(tn_id, ab_id, &uid).await?;
-	Ok(StatusCode::NO_CONTENT)
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
 }
 
 /// POST /api/address-books/{ab_id}/import?conflict=skip|replace|add

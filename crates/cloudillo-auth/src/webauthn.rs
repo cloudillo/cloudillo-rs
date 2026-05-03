@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
 
 use cloudillo_core::Auth;
-use cloudillo_core::extract::IdTag;
+use cloudillo_core::extract::{IdTag, OptionalRequestId};
 use cloudillo_types::{auth_adapter, types::ApiResponse};
 
 use crate::prelude::*;
@@ -351,12 +351,14 @@ pub async fn delete_reg(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(key_id): Path<String>,
-) -> ClResult<StatusCode> {
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	info!("Deleting WebAuthn credential {} for {}", key_id, auth.id_tag);
 
 	app.auth_adapter.delete_webauthn_credential(auth.tn_id, &key_id).await?;
 
-	Ok(StatusCode::NO_CONTENT)
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
 }
 
 /// Try to create a login challenge, returning `None` instead of an error when no passkeys exist.
