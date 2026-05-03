@@ -1285,6 +1285,9 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Update task fields with partial updates
 	async fn update_task(&self, task_id: u64, patch: &TaskPatch) -> ClResult<()>;
 
+	/// Find deps that have completed (status != 'P')
+	async fn find_completed_deps(&self, deps: &[u64]) -> ClResult<Vec<u64>>;
+
 	// Phase 1: Profile Management
 	//****************************
 	/// Get a single profile by id_tag

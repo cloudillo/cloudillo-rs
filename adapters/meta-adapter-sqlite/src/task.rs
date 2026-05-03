@@ -46,6 +46,9 @@ pub(crate) async fn list(db: &SqlitePool, _opts: &ListTaskOptions) -> ClResult<V
 
 /// Find task IDs by kind and key
 pub(crate) async fn list_ids(db: &SqlitePool, kind: &str, keys: &[Box<str>]) -> ClResult<Vec<u64>> {
+	if keys.is_empty() {
+		return Ok(Vec::new());
+	}
 	let mut query = sqlx::QueryBuilder::new(
 		"SELECT t.task_id FROM tasks t
 		WHERE status IN ('P') AND kind=",
@@ -197,6 +200,29 @@ pub(crate) async fn find_by_key(db: &SqlitePool, key: &str) -> ClResult<Option<T
 		}
 		None => Ok(None),
 	}
+}
+
+/// Find deps that have completed (status != 'P')
+pub(crate) async fn find_completed(db: &SqlitePool, deps: &[u64]) -> ClResult<Vec<u64>> {
+	if deps.is_empty() {
+		return Ok(Vec::new());
+	}
+	let mut query =
+		sqlx::QueryBuilder::new("SELECT task_id FROM tasks WHERE status != 'P' AND task_id IN (");
+	for (i, dep) in deps.iter().enumerate() {
+		if i > 0 {
+			query.push(", ");
+		}
+		query.push_bind((*dep).cast_signed());
+	}
+	query.push(")");
+	let res = query
+		.build()
+		.fetch_all(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+	collect_res(res.iter().map(|row| row.try_get("task_id")))
 }
 
 /// Update task fields with partial updates using a single query

@@ -118,6 +118,7 @@ pub trait TaskStore<S: Clone>: Send + Sync {
 	) -> ClResult<()>;
 	async fn find_by_key(&self, key: &str) -> ClResult<Option<(TaskId, TaskData)>>;
 	async fn update_task(&self, id: TaskId, task: &TaskMeta<S>) -> ClResult<()>;
+	async fn find_completed_deps(&self, deps: &[TaskId]) -> ClResult<Vec<TaskId>>;
 }
 
 // InMemoryTaskStore
@@ -165,6 +166,10 @@ impl<S: Clone> TaskStore<S> for InMemoryTaskStore {
 	async fn update_task(&self, _id: TaskId, _task: &TaskMeta<S>) -> ClResult<()> {
 		// In-memory store doesn't support persistence
 		Ok(())
+	}
+
+	async fn find_completed_deps(&self, _deps: &[TaskId]) -> ClResult<Vec<TaskId>> {
+		Ok(vec![])
 	}
 }
 
@@ -299,6 +304,10 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 		}
 
 		self.meta_adapter.update_task(id, &patch).await
+	}
+
+	async fn find_completed_deps(&self, deps: &[TaskId]) -> ClResult<Vec<TaskId>> {
+		self.meta_adapter.find_completed_deps(deps).await
 	}
 }
 
@@ -869,9 +878,14 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			// Force to tasks_waiting instead
 			lock!(self.tasks_waiting, "tasks_waiting")?.insert(id, task_meta);
 			debug!("Task {} is waiting for {:?}", id, &deps);
-			for dep in deps {
-				lock!(self.task_dependents, "task_dependents")?.entry(dep).or_default().push(id);
+			for dep in &deps {
+				lock!(self.task_dependents, "task_dependents")?
+					.entry(*dep)
+					.or_default()
+					.push(id);
 			}
+
+			self.check_and_resolve_completed_deps(id, &deps).await?;
 			return Ok(id);
 		}
 
@@ -886,11 +900,51 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		} else {
 			lock!(self.tasks_waiting, "tasks_waiting")?.insert(id, task_meta);
 			debug!("Task {} is waiting for {:?}", id, &deps);
-			for dep in deps {
-				lock!(self.task_dependents, "task_dependents")?.entry(dep).or_default().push(id);
+			for dep in &deps {
+				lock!(self.task_dependents, "task_dependents")?
+					.entry(*dep)
+					.or_default()
+					.push(id);
 			}
+
+			self.check_and_resolve_completed_deps(id, &deps).await?;
 		}
 		Ok(id)
+	}
+
+	/// After registering deps, check if any completed in the meantime.
+	/// If all deps are satisfied, move the task from waiting → scheduled.
+	async fn check_and_resolve_completed_deps(&self, id: TaskId, deps: &[TaskId]) -> ClResult<()> {
+		let completed_deps = self.store.find_completed_deps(deps).await?;
+		if completed_deps.is_empty() {
+			return Ok(());
+		}
+		let mut waiting = lock!(self.tasks_waiting, "tasks_waiting")?;
+		if let Some(task_meta) = waiting.get_mut(&id) {
+			for dep in &completed_deps {
+				task_meta.deps.retain(|d| *d != *dep);
+			}
+			if task_meta.deps.is_empty()
+				&& let Some(ready_task) = waiting.remove(&id)
+			{
+				drop(waiting);
+				let mut dependents = lock!(self.task_dependents, "task_dependents")?;
+				for dep in deps {
+					if let Some(dep_list) = dependents.get_mut(dep) {
+						dep_list.retain(|d| *d != id);
+						if dep_list.is_empty() {
+							dependents.remove(dep);
+						}
+					}
+				}
+				drop(dependents);
+				debug!("Task {} deps already completed, scheduling immediately", id);
+				lock!(self.tasks_scheduled, "tasks_scheduled")?
+					.insert((Timestamp(0), id), ready_task);
+				self.notify_schedule.notify_one();
+			}
+		}
+		Ok(())
 	}
 
 	/// Remove a task from all internal queues (waiting, scheduled, running)
@@ -1164,17 +1218,13 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				} else {
 					// Check if all dependencies still exist
 					for dep in &task_meta.deps {
-						// Check if dependency is in any queue or dependents map
-						let dep_exists =
-							self.tasks_running.lock().ok().is_some_and(|r| r.contains_key(dep))
-								|| self
-									.tasks_waiting
-									.lock()
-									.ok()
-									.is_some_and(|w| w.contains_key(dep))
-								|| self.tasks_scheduled.lock().ok().is_some_and(|s| {
-									s.iter().any(|((_, task_id), _)| task_id == dep)
-								});
+						let dep_exists = waiting.contains_key(dep)
+							|| self.tasks_running.lock().ok().is_some_and(|r| r.contains_key(dep))
+							|| self
+								.tasks_scheduled
+								.lock()
+								.ok()
+								.is_some_and(|s| s.iter().any(|((_, task_id), _)| task_id == dep));
 
 						if !dep_exists {
 							tasks_with_missing_deps.push((*id, *dep));

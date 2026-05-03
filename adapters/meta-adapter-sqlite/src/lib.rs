@@ -392,6 +392,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		task::update(&self.db, task_id, patch).await
 	}
 
+	async fn find_completed_deps(&self, deps: &[u64]) -> ClResult<Vec<u64>> {
+		task::find_completed(&self.dbr, deps).await
+	}
+
 	// Phase 1: Profile Management
 	async fn get_profile_info(&self, tn_id: TnId, id_tag: &str) -> ClResult<ProfileData> {
 		profile::get_info(&self.dbr, tn_id, id_tag).await
