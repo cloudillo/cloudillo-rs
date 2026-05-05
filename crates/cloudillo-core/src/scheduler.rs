@@ -815,8 +815,8 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				return Ok(existing_id);
 			}
 			info!("Updating recurring task '{}' (id={}) - parameters changed", key, existing_id);
-			info!("  Old params: {}", existing_serialized);
-			info!("  New params: {}", new_serialized);
+			debug!("  Old params: {}", existing_serialized);
+			debug!("  New params: {}", new_serialized);
 
 			// Remove from all queues (if present)
 			self.remove_from_queues(existing_id)?;

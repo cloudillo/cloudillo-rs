@@ -17,6 +17,7 @@ pub mod dns;
 pub mod extensions;
 pub mod extract;
 pub mod file_access;
+pub mod log;
 pub mod middleware;
 pub mod prelude;
 pub mod profile_visibility;

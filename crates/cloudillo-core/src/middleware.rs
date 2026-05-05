@@ -13,7 +13,6 @@ use axum::{
 	middleware::Next,
 };
 use cloudillo_types::auth_adapter::AuthCtx;
-use cloudillo_types::utils::random_id;
 use std::pin::Pin;
 
 /// Tenant API key prefix (validated by auth adapter)
@@ -381,26 +380,26 @@ pub async fn optional_auth(
 	Ok(next.run(req).await)
 }
 
-/// Add or generate request ID and store in extensions
+/// Add or generate request ID, attach a `request` span carrying its short
+/// form, and store the full id in extensions. The custom log formatter
+/// (`crate::log::CloudilloFormat`) uses the `request` span's `id` field to
+/// prefix every event line with `REQ:<short>`.
+///
+/// If the outer transport layer (see `cloudillo::webserver::create_https_server`)
+/// has already inserted a `RequestId` extension and entered the `request` span,
+/// `RequestId::install` returns a span that just re-uses the existing id.
 pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Response<Body> {
-	// Extract X-Request-ID header if present, otherwise generate new one
-	let request_id = req
-		.headers()
-		.get("X-Request-ID")
-		.and_then(|h| h.to_str().ok())
-		.map_or_else(|| format!("req_{}", random_id().unwrap_or_default()), ToString::to_string);
+	let span = RequestId::install(&mut req);
+	let request_id = req.extensions().get::<RequestId>().map(|r| r.0.clone()).unwrap_or_default();
 
-	// Store in extensions for handlers to access
-	req.extensions_mut().insert(RequestId(request_id.clone()));
+	let mut response = {
+		use tracing::Instrument;
+		next.run(req).instrument(span).await
+	};
 
-	// Run the request
-	let mut response = next.run(req).await;
-
-	// Add request ID to response headers
 	if let Ok(header_value) = request_id.parse() {
 		response.headers_mut().insert("X-Request-ID", header_value);
 	}
-
 	response
 }
 

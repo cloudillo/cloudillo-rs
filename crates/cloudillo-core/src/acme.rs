@@ -182,7 +182,7 @@ async fn renew_domains_inner<'a>(
 					.ok_or(acme::Error::Str("no challenge"))?;
 				let identifier: Box<str> = challenge.identifier().to_string().into_boxed_str();
 				let token: Box<str> = challenge.key_authorization().as_str().into();
-				info!("ACME challenge {} {}", identifier, token);
+				debug!("ACME challenge {} {}", identifier, token);
 				state
 					.acme_challenge_map
 					.write()

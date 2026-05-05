@@ -36,10 +36,25 @@ pub struct AppBuilder {
 
 impl AppBuilder {
 	pub fn new() -> Self {
-		tracing_subscriber::fmt()
-			.with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-			.with_target(false)
-			//.with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
+		use tracing_subscriber::layer::SubscriberExt;
+		use tracing_subscriber::util::SubscriberInitExt;
+
+		let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+			// Defensive: `try_new` returns Err on syntactically invalid input,
+			// but `EnvFilter::new("info")` is hard-coded valid so this fallback
+			// is just a belt-and-braces guard for the lint suite that forbids
+			// panics.
+			tracing_subscriber::EnvFilter::try_new(
+				"info,h2=warn,hyper=warn,tower=warn,axum=warn,reqwest=warn",
+			)
+			.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+		});
+		let fmt_layer = tracing_subscriber::fmt::layer()
+			.event_format(cloudillo_core::log::CloudilloFormat::new());
+		tracing_subscriber::registry()
+			.with(filter)
+			.with(cloudillo_core::log::RequestSpanLayer)
+			.with(fmt_layer)
 			.init();
 		AppBuilder {
 			opts: AppBuilderOpts {

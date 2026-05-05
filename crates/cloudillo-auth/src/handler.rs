@@ -174,7 +174,6 @@ pub async fn get_login_token(
 		info!("login-token for {}", &auth.id_tag);
 		let auth = app.auth_adapter.create_tenant_login(&auth.id_tag).await;
 		if let Ok(auth) = auth {
-			info!("token: {}", &auth.token);
 			let (_status, Json(login_data)) = return_login(&app, auth).await?;
 			let response =
 				ApiResponse::new(Some(login_data)).with_req_id(req_id.unwrap_or_default());
@@ -335,7 +334,7 @@ pub async fn get_access_token(
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	use tracing::warn;
 
-	info!("Got access token request for id_tag={} with scope={:?}", id_tag.0, query.scope);
+	debug!("Got access token request for id_tag={} with scope={:?}", id_tag.0, query.scope);
 
 	// Cross-document link: get scoped token for target file via source file
 	if let Some(ref via_file_id) = query.via {
@@ -356,7 +355,7 @@ pub async fn get_access_token(
 			return Err(Error::ValidationError("scope must be a file scope".into()));
 		};
 
-		info!(
+		debug!(
 			"Via token request: via={}, target={}, access={:?}",
 			via_file_id, target_file_id, requested_access
 		);
@@ -441,7 +440,11 @@ pub async fn get_access_token(
 			)
 			.await?;
 
-		info!("Created via token for {} with scope {}", target_file_id, target_scope);
+		info!(
+			"Issued access token: id_tag={} sub={} scope={} via=cross_doc_link",
+			id_tag.0, auth.id_tag, target_scope
+		);
+		debug!("Created via token for {} with scope {}", target_file_id, target_scope);
 		let response = ApiResponse::new(json!({
 			"token": token_result,
 			"scope": target_scope,
@@ -454,16 +457,19 @@ pub async fn get_access_token(
 
 	// If token is provided in query, verify it; otherwise use authenticated session
 	if let Some(token_param) = query.token {
-		info!("Verifying action token from query parameter");
+		debug!("Verifying action token from query parameter");
 		let verify_fn = app.ext::<ActionVerifyFn>()?;
 		let auth_action = verify_fn(&app, tn_id, &token_param, Some(&addr.ip())).await?;
 		if *auth_action.aud.as_ref().ok_or(Error::PermissionDenied)?.as_ref() != *id_tag.0 {
 			warn!("Auth action issuer {} doesn't match id_tag {}", auth_action.iss, id_tag.0);
 			return Err(Error::PermissionDenied);
 		}
-		info!("Got auth action: {:?}", &auth_action);
+		debug!(
+			"Got auth action: iss={} sub={:?} exp={:?}",
+			auth_action.iss, auth_action.sub, auth_action.exp
+		);
 
-		info!(
+		debug!(
 			"Creating access token with t={}, u={}, scope={:?}",
 			id_tag.0,
 			auth_action.iss,
@@ -474,7 +480,7 @@ pub async fn get_access_token(
 		let profile_roles = match app.meta_adapter.read_profile_roles(tn_id, &auth_action.iss).await
 		{
 			Ok(roles) => {
-				info!(
+				debug!(
 					"Found profile roles for {} in tn_id {:?}: {:?}",
 					auth_action.iss, tn_id, roles
 				);
@@ -503,7 +509,7 @@ pub async fn get_access_token(
 			.map(|roles| expand_roles(roles))
 			.filter(|s| !s.is_empty());
 
-		info!("Expanded roles for access token: {:?}", expanded_roles);
+		debug!("Expanded roles for access token: {:?}", expanded_roles);
 
 		let token_result = app
 			.auth_adapter
@@ -518,13 +524,17 @@ pub async fn get_access_token(
 				},
 			)
 			.await?;
+		info!(
+			"Issued access token: id_tag={} sub={} scope={:?} via=action_token",
+			id_tag.0, auth_action.iss, query.scope
+		);
 		let response = ApiResponse::new(json!({ "token": token_result }))
 			.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else if let Some(ref_id) = query.ref_id {
 		// Exchange share link ref for scoped access token (no auth required)
 		let is_refresh = query.refresh.unwrap_or(false);
-		info!("Exchanging ref_id {} for scoped access token (refresh={})", ref_id, is_refresh);
+		debug!("Exchanging ref_id {} for scoped access token (refresh={})", ref_id, is_refresh);
 
 		// For refresh: validate without decrementing counter
 		// For initial access: validate and decrement counter
@@ -565,7 +575,7 @@ pub async fn get_access_token(
 		// Create scoped access token
 		// scope format: "file:{file_id}:{R|W}"
 		let scope = format!("file:{}:{}", file_id, access_level);
-		info!("Creating scoped access token with scope={}", scope);
+		debug!("Creating scoped access token with scope={}", scope);
 
 		let token_result = app
 			.auth_adapter
@@ -581,7 +591,8 @@ pub async fn get_access_token(
 			)
 			.await?;
 
-		info!("Got scoped access token for share link");
+		info!("Issued access token: id_tag={} sub=anonymous scope={} via=ref_id", id_tag.0, scope);
+		debug!("Got scoped access token for share link");
 		let mut result = json!({
 			"token": token_result,
 			"scope": scope,
@@ -599,7 +610,7 @@ pub async fn get_access_token(
 		Ok((StatusCode::OK, Json(response)))
 	} else if let Some(api_key) = query.api_key {
 		// Exchange API key for access token (no auth required)
-		info!("Exchanging API key for access token");
+		debug!("Exchanging API key for access token");
 
 		// Validate the API key
 		let validation = app.auth_adapter.validate_api_key(&api_key).await.map_err(|e| {
@@ -616,7 +627,7 @@ pub async fn get_access_token(
 			return Err(Error::PermissionDenied);
 		}
 
-		info!(
+		debug!(
 			"Creating access token from API key for id_tag={}, scopes={:?}",
 			validation.id_tag, validation.scopes
 		);
@@ -636,7 +647,10 @@ pub async fn get_access_token(
 			)
 			.await?;
 
-		info!("Got access token from API key: {}", &token_result);
+		info!(
+			"Issued access token: id_tag={} sub={} scope={:?} via=api_key",
+			id_tag.0, validation.id_tag, validation.scopes
+		);
 
 		let response = ApiResponse::new(json!({ "token": token_result }))
 			.with_req_id(req_id.unwrap_or_default());
@@ -645,7 +659,7 @@ pub async fn get_access_token(
 		// Use authenticated session token - requires auth
 		let auth = maybe_auth.ok_or(Error::Unauthorized)?;
 
-		info!(
+		debug!(
 			"Using authenticated session for id_tag={}, scope={:?}",
 			auth.id_tag,
 			query.scope.as_deref()
@@ -680,6 +694,10 @@ pub async fn get_access_token(
 				},
 			)
 			.await?;
+		info!(
+			"Issued access token: id_tag={} sub={} scope={:?} via=session",
+			id_tag.0, auth.id_tag, query.scope
+		);
 		let response = ApiResponse::new(json!({ "token": token_result }))
 			.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
@@ -720,14 +738,14 @@ pub async fn get_proxy_token(
 			r: Option<String>,
 		}
 
-		info!("Getting federated proxy token for {} -> {}", &auth.id_tag, target_id_tag);
+		debug!("Getting federated proxy token for {} -> {}", &auth.id_tag, target_id_tag);
 
 		// Mint fresh on each call: clients want full TTL, cache is for server-to-server only.
 		let token = app.request.create_proxy_token(auth.tn_id, target_id_tag, None).await?;
 
 		let roles: Option<Vec<String>> = match decode_jwt_no_verify::<AccessTokenClaims>(&token) {
 			Ok(claims) => {
-				info!("Decoded federated token, roles claim: {:?}", claims.r);
+				debug!("Decoded federated token, roles claim: {:?}", claims.r);
 				claims.r.map(|r| r.split(',').map(String::from).collect())
 			}
 			Err(e) => {
@@ -736,13 +754,17 @@ pub async fn get_proxy_token(
 			}
 		};
 
+		info!(
+			"Issued proxy token: id_tag={} sub={} target={} via=federation",
+			own_id_tag, auth.id_tag, target_id_tag
+		);
 		let response = ApiResponse::new(ProxyTokenRes { token: token.to_string(), roles })
 			.with_req_id(req_id.unwrap_or_default());
 		return Ok((StatusCode::OK, Json(response)));
 	}
 
 	// Default: create local access token (valid on own server)
-	info!("Generating local access token for {}", &auth.id_tag);
+	debug!("Generating local access token for {}", &auth.id_tag);
 	let roles_str: String = auth.roles.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(",");
 	let token = app
 		.auth_adapter
@@ -758,6 +780,7 @@ pub async fn get_proxy_token(
 		)
 		.await?;
 
+	info!("Issued proxy token: id_tag={} sub={} via=local", own_id_tag, auth.id_tag);
 	// Return roles alongside token for local context
 	let roles: Vec<String> = auth.roles.iter().map(ToString::to_string).collect();
 	let response = ApiResponse::new(ProxyTokenRes { token: token.to_string(), roles: Some(roles) })

@@ -15,6 +15,8 @@ use tower::Service;
 
 use crate::prelude::*;
 use cloudillo_core::IdTag;
+use cloudillo_core::extract::RequestId;
+use tracing::Instrument;
 
 pub struct CertResolver {
 	state: App,
@@ -173,10 +175,10 @@ pub async fn create_https_server(
 			.ext::<crate::proxy::ProxySiteCache>()
 			.cloned()
 			.unwrap_or_else(|_| crate::proxy::new_proxy_cache());
+		let span = RequestId::install(&mut req);
+
 		async move {
 			let start = std::time::Instant::now();
-			let span = info_span!("REQ", req = req.uri().path());
-			let _ = span.enter();
 			let peer_addr = req
 				.extensions()
 				.get::<axum::extract::ConnectInfo<SocketAddr>>()
@@ -188,90 +190,73 @@ pub async fn create_https_server(
 					req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok())
 				})
 				.unwrap_or_default();
+			let method = req.method().clone();
+			let path = req.uri().path().to_string();
 
 			if let Some(id_tag) = host.strip_prefix("cl-o.") {
-				let id_tag = Box::from(id_tag);
-				info!(
-					"REQ [{}] API: {} {} {}",
-					&peer_addr,
-					req.method(),
-					&id_tag,
-					req.uri().path()
-				);
-				req.extensions_mut().insert(IdTag(id_tag));
+				let id_tag_owned: Box<str> = Box::from(id_tag);
+				let host_label: &str = &id_tag_owned;
+				debug!("API {} {} {} {}", peer_addr, method, host_label, path);
+				let host_label_owned = host_label.to_string();
+				req.extensions_mut().insert(IdTag(id_tag_owned));
 				let res = api_router.clone().call(req).await;
-
 				let status = res.as_ref().map_or(
 					axum::http::StatusCode::INTERNAL_SERVER_ERROR,
 					axum::http::Response::status,
 				);
-				if status.is_client_error() || status.is_server_error() {
-					warn!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
-				} else {
-					info!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
-				}
-
+				log_access("API", &peer_addr, &method, &host_label_owned, &path, status, start);
 				res
 			} else {
-				// Check proxy site cache
 				let proxy_entry = {
 					let cache = proxy_cache.read().await;
 					cache.get(host).cloned()
 				};
 
 				if let Some(entry) = proxy_entry {
-					info!(
-						"REQ [{}] Proxy: {} {} {}",
-						&peer_addr,
-						req.method(),
-						&entry.domain,
-						req.uri().path()
-					);
+					let host_label: &str = entry.domain.as_ref();
+					debug!("Proxy {} {} {} {}", peer_addr, method, host_label, path);
+					let host_label_owned = host_label.to_string();
 					let res =
 						crate::proxy::handler::handle_proxy_request(entry, req, &peer_addr).await;
 					match res {
 						Ok(resp) => {
 							let status = resp.status();
-							if status.is_client_error() || status.is_server_error() {
-								warn!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
-							} else {
-								info!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
-							}
+							log_access(
+								"Proxy",
+								&peer_addr,
+								&method,
+								&host_label_owned,
+								&path,
+								status,
+								start,
+							);
 							Ok(resp.map(axum::body::Body::new))
 						}
 						Err(e) => {
-							warn!("RES: proxy error: {} tm:{:?}", e, start.elapsed().as_millis());
+							let elapsed = start.elapsed().as_millis();
+							warn!(
+								"Proxy {} {} {} {} -> error:{} tm:{}ms",
+								peer_addr, method, host_label_owned, path, e, elapsed
+							);
 							Ok(e.into_response())
 						}
 					}
 				} else {
-					// Clone host before logging (to avoid borrow issue)
 					let host_owned = host.to_string();
-					info!(
-						"REQ [{}] App: {} {} {}",
-						&peer_addr,
-						req.method(),
-						&host_owned,
-						req.uri().path()
-					);
-					// Insert IdTag for app routes too (host is the id_tag)
+					debug!("App {} {} {} {}", peer_addr, method, host_owned, path);
+					let host_label_owned = host_owned.clone();
 					req.extensions_mut().insert(IdTag(host_owned.into_boxed_str()));
 					let res = app_router.clone().call(req).await;
-
 					let status = res.as_ref().map_or(
 						axum::http::StatusCode::INTERNAL_SERVER_ERROR,
 						axum::http::Response::status,
 					);
-					if status.is_client_error() || status.is_server_error() {
-						warn!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
-					} else {
-						info!("RES: {} tm:{:?}", &status, start.elapsed().as_millis());
-					}
-
+					log_access("App", &peer_addr, &method, &host_label_owned, &path, status, start);
 					res
 				}
 			}
 		}
+		.instrument(span)
 	});
 
 	info!("Listening on HTTPS {}", &listen);
@@ -282,6 +267,26 @@ pub async fn create_https_server(
 	});
 
 	Ok(handle)
+}
+
+/// Single point that emits the per-request access log line. Picks `warn!` for
+/// 4xx/5xx and `info!` for everything else, so the level/format/argument list
+/// is not duplicated across the API/Proxy/App branches above.
+fn log_access(
+	kind: &str,
+	peer: &str,
+	method: &axum::http::Method,
+	host: &str,
+	path: &str,
+	status: axum::http::StatusCode,
+	start: std::time::Instant,
+) {
+	let elapsed = start.elapsed().as_millis();
+	if status.is_client_error() || status.is_server_error() {
+		warn!("{} {} {} {} {} -> {} tm:{}ms", kind, peer, method, host, path, status, elapsed);
+	} else {
+		info!("{} {} {} {} {} -> {} tm:{}ms", kind, peer, method, host, path, status, elapsed);
+	}
 }
 
 // vim: ts=4
