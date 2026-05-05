@@ -13,7 +13,7 @@ use serde_with::skip_serializing_none;
 
 use crate::prelude::*;
 use cloudillo_core::extract::OptionalRequestId;
-use cloudillo_types::meta_adapter::{ListProfileOptions, ProfileTrust};
+use cloudillo_types::meta_adapter::{ListProfileOptions, ProfileStatus, ProfileTrust};
 use cloudillo_types::types::{ApiResponse, ProfileInfo};
 
 /// Profile with relationship status (for GET /api/profiles/:idTag)
@@ -26,7 +26,7 @@ pub struct ProfileWithStatus {
 	#[serde(rename = "type")]
 	pub r#type: Option<String>,
 	pub profile_pic: Option<String>,
-	pub status: Option<String>,
+	pub status: Option<ProfileStatus>,
 	pub connected: Option<bool>,
 	pub following: Option<bool>,
 	pub trust: Option<ProfileTrust>,
@@ -85,7 +85,7 @@ pub async fn list_profiles(
 				.to_string(),
 			),
 			profile_pic: p.profile_pic.map(|s| s.to_string()),
-			status: p.status.map(|s| s.as_str().to_string()),
+			status: p.status,
 			connected: Some(p.connected.is_connected()),
 			following: Some(p.following),
 			trust: p.trust,
@@ -123,7 +123,7 @@ pub async fn get_profile_by_id_tag(
 				name: p.name.to_string(),
 				r#type: typ,
 				profile_pic: p.profile_pic.map(|s| s.to_string()),
-				status: p.status.map(|s| s.as_str().to_string()),
+				status: p.status,
 				connected: Some(p.connected.is_connected()),
 				following: Some(p.following),
 				trust: p.trust,

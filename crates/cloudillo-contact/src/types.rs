@@ -52,7 +52,7 @@ pub struct ProfileOverlay {
 	pub name: Option<String>,
 	pub r#type: Option<String>,
 	pub profile_pic: Option<String>,
-	pub status: Option<String>,
+	pub status: Option<cloudillo_types::meta_adapter::ProfileStatus>,
 	pub connected: Option<bool>,
 	pub following: Option<bool>,
 }

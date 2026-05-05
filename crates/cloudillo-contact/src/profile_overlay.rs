@@ -106,7 +106,7 @@ pub fn build_overlay(profile: &Profile<Box<str>>) -> ProfileOverlay {
 		name: Some(profile.name.to_string()),
 		r#type: Some(r#type.to_string()),
 		profile_pic: profile_pic_url(profile.id_tag.as_ref(), profile.profile_pic.as_deref()),
-		status: profile.status.map(|s| s.as_str().to_string()),
+		status: profile.status,
 		connected: Some(matches!(profile.connected, ProfileConnectionStatus::Connected)),
 		following: Some(profile.following),
 	}

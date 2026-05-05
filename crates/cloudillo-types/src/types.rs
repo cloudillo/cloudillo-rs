@@ -345,7 +345,7 @@ pub struct ProfileInfo {
 	#[serde(rename = "type")]
 	pub r#type: Option<String>,
 	pub profile_pic: Option<String>, // file_id
-	pub status: Option<String>,
+	pub status: Option<crate::meta_adapter::ProfileStatus>,
 	pub connected: Option<bool>,
 	pub following: Option<bool>,
 	/// Per-profile trust preference controlling proxy-token use on passive reads.
