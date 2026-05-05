@@ -202,17 +202,27 @@ pub async fn get_me_idp_status(
 ) -> ClResult<(StatusCode, Json<ApiResponse<MeIdpStatusResponse>>)> {
 	let id_tag = auth.id_tag.as_ref();
 
-	// Caller must be the active tenant itself (personal tenants always are;
-	// community gates require the community's identity, not a member's). The
-	// IDP enforces issuer-match defence-in-depth; this local guard prevents
-	// a non-owner from clearing `ui.onboarding` on the active tenant. Use
-	// the request's host id_tag — `auth.id_tag` is already the caller, so
-	// querying `read_id_tag(auth.tn_id)` would be a redundant DB round-trip.
-	if host_id_tag.as_ref() != id_tag {
+	// Allow either:
+	//   (a) the active tenant authenticating as itself (the personal verify-idp
+	//       onboarding flow on a user's own home); or
+	//   (b) a community leader of the active tenant via proxy token (the
+	//       community activation banner — communities have no human user of
+	//       their own, so a leader acts on the community's behalf).
+	// The IDP enforces issuer-match defence-in-depth on the federated call,
+	// so accepting a leader proxy token here cannot let a non-owner forge
+	// IDP status from elsewhere; the local guard is just preventing
+	// unrelated members from clearing `ui.onboarding`.
+	let is_self = host_id_tag.as_ref() == id_tag;
+	let is_leader = auth.roles.iter().any(|r| r.as_ref() == "leader");
+	if !(is_self || is_leader) {
 		return Err(Error::PermissionDenied);
 	}
 
-	let mut response_data = fetch_idp_status(&app, auth.tn_id, id_tag).await?;
+	// Always query the IDP for the *active tenant's* identity (`host_id_tag`),
+	// not for the bearer's `auth.id_tag`. They coincide in the personal
+	// self-auth case, but for a community-leader proxy token we want the
+	// community's IDP record, not the leader's.
+	let mut response_data = fetch_idp_status(&app, auth.tn_id, host_id_tag.as_ref()).await?;
 	response_data.onboarding =
 		apply_onboarding_clear(&app, auth.tn_id, &response_data.status).await;
 	let mut response = ApiResponse::new(response_data);
@@ -243,12 +253,17 @@ pub async fn post_me_resend_activation(
 
 	let id_tag = auth.id_tag.as_ref();
 
-	// Caller must be the active tenant itself — same guard as get_me_idp_status.
-	if host_id_tag.as_ref() != id_tag {
+	// Same guard as get_me_idp_status: tenant self-auth, or proxy-token
+	// leader. See get_me_idp_status for the rationale.
+	let is_self = host_id_tag.as_ref() == id_tag;
+	let is_leader = auth.roles.iter().any(|r| r.as_ref() == "leader");
+	if !(is_self || is_leader) {
 		return Err(Error::PermissionDenied);
 	}
 
-	let response_data = forward_resend_to_idp(&app, auth.tn_id, id_tag).await?;
+	// Resend for the active tenant's identity (`host_id_tag`), not the
+	// bearer's `auth.id_tag` — see get_me_idp_status for the rationale.
+	let response_data = forward_resend_to_idp(&app, auth.tn_id, host_id_tag.as_ref()).await?;
 	let mut response = ApiResponse::new(response_data);
 	if let Some(id) = req_id {
 		response = response.with_req_id(id);
