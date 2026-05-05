@@ -207,9 +207,12 @@ pub async fn post_inbox(
 		}
 	}
 
-	// Process main action (APRV) - its on_receive hook will trigger related action processing
+	// Process main action (APRV) - its on_receive hook will trigger related action processing.
+	// Use the default retry policy (10 attempts, 60s..3600s exponential back-off) so the
+	// verifier can recover from transient failures during attachment sync — e.g. a
+	// momentarily unreachable source server or a slow blob fetch.
 	let task = ActionVerifierTask::new(tn_id, inbox.token.into(), client_address.clone());
-	let _task_id = app.scheduler.task(task).now().await?;
+	let _task_id = app.scheduler.task(task).with_automatic_retry().await?;
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
@@ -581,6 +584,8 @@ pub async fn post_action_stat(
 /// Request body for PATCH /api/actions/:action_id (draft update)
 #[derive(Debug, Default, Deserialize)]
 pub struct PatchActionRequest {
+	#[serde(rename = "subType")]
+	pub sub_typ: Option<Box<str>>,
 	pub content: Option<serde_json::Value>,
 	pub attachments: Option<Vec<Box<str>>>,
 	pub visibility: Option<char>,
@@ -634,6 +639,10 @@ pub async fn patch_action(
 		},
 		flags: match req.flags {
 			Some(ref f) => cloudillo_types::types::Patch::Value(f.to_string()),
+			None => cloudillo_types::types::Patch::Undefined,
+		},
+		sub_typ: match req.sub_typ {
+			Some(ref s) => cloudillo_types::types::Patch::Value(s.to_string()),
 			None => cloudillo_types::types::Patch::Undefined,
 		},
 		x: match req.x {
@@ -800,6 +809,370 @@ pub async fn cancel_scheduled(
 	let updated = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
 	let response = ApiResponse::new(updated).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
+}
+
+/// Auxiliary action types that ride along with primaries (do NOT count against limit)
+const HISTORY_SYNC_AUXILIARY_TYPES: &[&str] = &["APRV", "STAT"];
+
+/// Default item limit when setting is unset
+const HISTORY_SYNC_DEFAULT_LIMIT: i64 = 10;
+/// Hard upper bound on the number of items a single /api/outbox call returns.
+/// Applies regardless of the caller-supplied `limit` and the per-tenant
+/// admin setting — keeps the response size and the per-call signing cost
+/// (one STAT per primary) bounded for federated peers.
+const HISTORY_SYNC_HARD_LIMIT: i64 = 100;
+
+/// Query parameters for GET /api/outbox
+#[derive(Debug, Default, Deserialize)]
+pub struct OutboxQuery {
+	/// Earliest action timestamp (unix seconds). Caller-supplied lower bound;
+	/// clamped at most to `now`. Workload control comes from the count cap.
+	pub since: Option<i64>,
+	/// Maximum number of primary actions to return. Clamped to server's limit setting.
+	pub limit: Option<u32>,
+}
+
+/// One item in the outbox response. Same envelope shape as the `/inbox`
+/// delivery payload (`Inbox { token, related }`): the receiver pre-stores
+/// every `related` token as an inbound action linked to the primary `token`,
+/// then processes the primary — its post-store hook drives the related tokens
+/// via `process_related_actions` exactly like `/inbox` does.
+///
+/// Case A — tenant's own wall post: `token` is the primary (POST/REPOST/...),
+/// `related` carries a freshly-minted STAT.
+///
+/// Case B — 3rd-party post on tenant's wall (audience-bridge): `token` is the
+/// tenant's most recent active APRV approving the post; `related` carries the
+/// 3rd-party post itself plus the STAT. The receiver follows the tenant, so
+/// the APRV passes its inbound-permission check, and the bridged post is
+/// processed via the pre-approved related-token path.
+#[derive(Debug, Serialize)]
+pub struct OutboxItem {
+	pub token: Box<str>,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub related: Vec<Box<str>>,
+}
+
+/// Response body for GET /api/outbox
+#[derive(Debug, Serialize)]
+pub struct OutboxResponse {
+	pub items: Vec<OutboxItem>,
+}
+
+/// Derive the list of primary action types from the DSL: types where
+/// `broadcast=true` and `local_only != true`, minus the auxiliary exception list.
+/// Today this yields `POST` and `REPOST`; future broadcast user-content types
+/// added to a DSL definition automatically extend history sync.
+fn derive_primary_types(dsl: &DslEngine) -> Vec<String> {
+	dsl.list_action_types()
+		.into_iter()
+		.filter(|t| {
+			let Some(b) = dsl.get_behavior(t) else {
+				return false;
+			};
+			let broadcast = b.broadcast.unwrap_or(false);
+			let local_only = b.local_only.unwrap_or(false);
+			let is_aux = HISTORY_SYNC_AUXILIARY_TYPES.contains(&t.as_str());
+			broadcast && !local_only && !is_aux
+		})
+		.collect()
+}
+
+/// Read the configured per-fetch item cap for history sync, falling back to the default.
+async fn read_limit_setting(app: &App, tn_id: TnId) -> i64 {
+	app.settings
+		.get_int(tn_id, "federation.history_sync.limit")
+		.await
+		.unwrap_or(HISTORY_SYNC_DEFAULT_LIMIT)
+}
+
+/// Extract `(reactions_string, comments_count)` from `ActionView.stat`.
+/// Returns `(None, 0)` if absent. The reactions field is a CSV-like string
+/// of reaction-type counts; we pass it through unchanged since that's the
+/// source-of-truth shape used everywhere else.
+fn extract_counters(stat: Option<&serde_json::Value>) -> (Option<String>, i64) {
+	let Some(stat) = stat else {
+		return (None, 0);
+	};
+	let reactions = stat.get("reactions").and_then(|v| v.as_str()).map(String::from);
+	let comments = stat.get("comments").and_then(serde_json::Value::as_i64).unwrap_or(0);
+	(reactions, comments)
+}
+
+/// Mint a fresh STAT token for the primary action carrying its current counters.
+/// Returns `None` if both reactions and comments are absent/zero (no useful info).
+///
+/// TODO(perf): this signs an ES384 (P-384) JWT on every outbox call. For popular
+/// tenants with many federated followers regularly polling /api/outbox, that's
+/// `min(limit, primaries)` signing ops per call. When this becomes hot, cache
+/// the minted STAT in `actions.token_stat` (or analogous) keyed on
+/// `(action_id, counter_hash)` and reuse it until the counters change.
+async fn mint_stat_token(
+	app: &App,
+	tn_id: TnId,
+	primary_id: &str,
+	stat: Option<&serde_json::Value>,
+) -> Option<Box<str>> {
+	let (reactions, comments) = extract_counters(stat);
+	if reactions.is_none() && comments == 0 {
+		return None;
+	}
+
+	let mut content = serde_json::Map::new();
+	if let Some(r) = reactions {
+		content.insert("reactions".into(), serde_json::Value::String(r));
+	}
+	if comments > 0 {
+		content.insert("comments".into(), serde_json::Value::from(comments));
+	}
+
+	let create = task::CreateAction {
+		typ: "STAT".into(),
+		parent_id: Some(primary_id.into()),
+		content: Some(serde_json::Value::Object(content)),
+		..Default::default()
+	};
+
+	match app.auth_adapter.create_action_token(tn_id, create).await {
+		Ok(token) => Some(token),
+		Err(e) => {
+			warn!(primary_id = %primary_id, error = %e, "Failed to mint STAT token");
+			None
+		}
+	}
+}
+
+/// Find the most recent active APRV by `tenant` approving `primary_id` and
+/// return its token. Used for the audience-bridge case in /outbox: when the
+/// primary's issuer is a 3rd party but it lives on the tenant's wall, the
+/// tenant's APRV is the trusted gate that lets the receiver pre-approve and
+/// process the bridged primary.
+///
+/// Visibility against the requester is re-enforced via
+/// `filter_actions_by_visibility`. Returns `None` if no eligible APRV exists.
+async fn find_tenant_aprv_token(
+	app: &App,
+	tn_id: TnId,
+	primary_id: &str,
+	requester_id_tag: &str,
+	tenant_id_tag: &str,
+) -> Option<Box<str>> {
+	let opts = meta_adapter::ListActionOptions {
+		typ: Some(vec!["APRV".into()]),
+		subject: Some(primary_id.to_string()),
+		status: Some(vec!["A".into()]),
+		issuer: Some(tenant_id_tag.to_string()),
+		viewer_id_tag: Some(requester_id_tag.to_string()),
+		sort: Some("created".into()),
+		sort_dir: Some("desc".into()),
+		limit: Some(1),
+		..Default::default()
+	};
+
+	let aprvs = match app.meta_adapter.list_actions(tn_id, &opts).await {
+		Ok(rs) => rs,
+		Err(e) => {
+			warn!(primary_id = %primary_id, error = %e, "list tenant APRVs failed");
+			return None;
+		}
+	};
+
+	let filtered = match filter_actions_by_visibility(
+		app,
+		tn_id,
+		requester_id_tag,
+		true,
+		tenant_id_tag,
+		aprvs,
+	)
+	.await
+	{
+		Ok(v) => v,
+		Err(e) => {
+			warn!(primary_id = %primary_id, error = %e, "filter tenant APRVs failed");
+			return None;
+		}
+	};
+
+	let aprv = filtered.into_iter().next()?;
+	match app.meta_adapter.get_action_token(tn_id, &aprv.action_id).await {
+		Ok(Some(token)) => Some(token),
+		Ok(None) => {
+			debug!(action_id = %aprv.action_id, "tenant APRV token missing, skipping");
+			None
+		}
+		Err(e) => {
+			warn!(action_id = %aprv.action_id, error = %e, "tenant APRV token fetch failed");
+			None
+		}
+	}
+}
+
+/// GET /api/outbox - Return a bounded tail of primary actions (POST, REPOST, ...)
+/// addressable to the authenticated requester, plus auxiliary tokens (APRV approvals
+/// and a freshly-minted STAT) that the receiver should process AFTER each primary.
+///
+/// Visibility is enforced server-side via `filter_actions_by_visibility`. The
+/// item count is capped by `HISTORY_SYNC_HARD_LIMIT` and a per-tenant admin
+/// setting; the age window is purely caller-controlled (clamped at most to
+/// `now` to reject future timestamps) since the count cap already bounds work.
+#[axum::debug_handler]
+pub async fn get_outbox(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
+	Auth(auth): Auth,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Query(query): Query<OutboxQuery>,
+) -> ClResult<(StatusCode, Json<ApiResponse<OutboxResponse>>)> {
+	let requester = auth.id_tag.clone();
+
+	// Per-tenant admin setting is itself capped by the hard limit so an admin
+	// can lower the cap but never raise it above the protocol-level bound.
+	let limit_cap = read_limit_setting(&app, tn_id).await.clamp(0, HISTORY_SYNC_HARD_LIMIT);
+
+	let now = Timestamp::now().0;
+	// The caller picks the age window; we only reject future timestamps. The
+	// count cap below bounds workload regardless of how far back `since`
+	// reaches, so there's no need for a server-side floor.
+	let since_ts = query.since.map_or(0, |s| s.min(now));
+	// Caller-supplied `limit` is also clamped to the hard cap; missing or
+	// over-large values default to the (already-clamped) per-tenant cap.
+	let requested_limit = query.limit.map_or(limit_cap, i64::from);
+	let effective_limit = requested_limit.clamp(0, limit_cap);
+	// Bound is statically `[0, HISTORY_SYNC_HARD_LIMIT]`, so the conversion
+	// always succeeds; `unwrap_or(0)` is a clippy-clean unreachable fallback.
+	let effective_limit_u32: u32 = effective_limit.try_into().unwrap_or(0);
+	if effective_limit_u32 == 0 {
+		let response = ApiResponse::new(OutboxResponse { items: Vec::new() })
+			.with_req_id(req_id.unwrap_or_default());
+		return Ok((StatusCode::OK, Json(response)));
+	}
+
+	// Federation outbox is for known peers only. Skip the relationship check
+	// for self-pulls (tenant's own UI fetching its outbox); for everyone else,
+	// require either `following` or `connected` to be true. Non-peers get 403
+	// rather than an empty list — HistoryFetchTask treats 403 as "drop the
+	// task" and we avoid leaking peer-relation existence as a probe surface.
+	if requester.as_ref() != tenant_id_tag.as_ref() {
+		// `following` on profiles[requester] would mean "tenant follows requester",
+		// which is the wrong direction for gating the outbox. Use the same
+		// peer-relation predicate as filter_actions_by_visibility: connected OR
+		// an active inbound FLLW from requester.
+		let related = crate::filter::subject_has_peer_relation_to_tenant(
+			&app,
+			tn_id,
+			requester.as_ref(),
+			tenant_id_tag.as_ref(),
+		)
+		.await?;
+		if !related {
+			debug!(
+				requester = %requester,
+				tenant = %tenant_id_tag,
+				"outbox: requester is not a known relation, denying access"
+			);
+			return Err(Error::PermissionDenied);
+		}
+	}
+
+	let dsl = app.ext::<Arc<DslEngine>>()?;
+	let primary_types = derive_primary_types(dsl.as_ref());
+	if primary_types.is_empty() {
+		let response = ApiResponse::new(OutboxResponse { items: Vec::new() })
+			.with_req_id(req_id.unwrap_or_default());
+		return Ok((StatusCode::OK, Json(response)));
+	}
+
+	// The tenant's "wall" includes BOTH (a) actions the tenant issued, and
+	// (b) actions issued by 3rd parties addressed to the tenant (audience=
+	// tenant) that the tenant has approved via an APRV. Filtering by audience
+	// with the coalesce-aware semantics covers both, since
+	// `coalesce(audience, issuer_tag) = tenant` matches case (a) when audience
+	// is NULL and case (b) when audience equals the tenant.
+	// Fetch newest-first so the per-call cap selects the most recent items;
+	// reverse afterwards so the receiver processes them chronologically.
+	let opts = meta_adapter::ListActionOptions {
+		typ: Some(primary_types),
+		status: Some(vec!["A".into()]),
+		audience: Some(tenant_id_tag.to_string()),
+		created_after: Some(Timestamp(since_ts)),
+		limit: Some(effective_limit_u32),
+		sort: Some("created".into()),
+		sort_dir: Some("desc".into()),
+		viewer_id_tag: Some(requester.to_string()),
+		..Default::default()
+	};
+
+	// Propagate errors as 5xx so the polling peer retries via HistoryFetchTask
+	// rather than concluding "the tenant has no recent posts".
+	let primaries = app.meta_adapter.list_actions(tn_id, &opts).await?;
+
+	let mut primaries =
+		filter_actions_by_visibility(&app, tn_id, &requester, true, &tenant_id_tag, primaries)
+			.await?;
+	// Newest-first → chronological for the downstream loop. Reversing here
+	// (after visibility filtering) keeps the per-item APRV/STAT pairing tight.
+	primaries.reverse();
+
+	let mut items: Vec<OutboxItem> = Vec::with_capacity(primaries.len());
+	for primary in primaries {
+		let primary_token = match app.meta_adapter.get_action_token(tn_id, &primary.action_id).await
+		{
+			Ok(Some(t)) => t,
+			Ok(None) => {
+				debug!(action_id = %primary.action_id, "primary token missing, skipping");
+				continue;
+			}
+			Err(e) => {
+				warn!(action_id = %primary.action_id, error = %e, "primary token fetch failed");
+				continue;
+			}
+		};
+
+		let stat_token =
+			mint_stat_token(&app, tn_id, &primary.action_id, primary.stat.as_ref()).await;
+
+		let issuer_is_tenant = primary.issuer.id_tag.as_ref() == tenant_id_tag.as_ref();
+		let item = if issuer_is_tenant {
+			// Case A — primary is the tenant's own post. Receiver follows the
+			// tenant, so primary processing passes the inbound permission
+			// check directly. STAT rides as a related token.
+			let mut related: Vec<Box<str>> = Vec::new();
+			if let Some(stat) = stat_token {
+				related.push(stat);
+			}
+			OutboxItem { token: primary_token, related }
+		} else {
+			// Case B — 3rd-party post on the tenant's wall. The tenant's APRV
+			// is the trusted bridge; without it the receiver can't ingest the
+			// primary (issuer not followed). Skip items missing such an APRV
+			// rather than emit something the receiver would reject.
+			let Some(aprv_token) =
+				find_tenant_aprv_token(&app, tn_id, &primary.action_id, &requester, &tenant_id_tag)
+					.await
+			else {
+				debug!(
+					action_id = %primary.action_id,
+					issuer = %primary.issuer.id_tag,
+					"outbox: no tenant APRV for bridged primary, skipping"
+				);
+				continue;
+			};
+			let mut related: Vec<Box<str>> = Vec::with_capacity(2);
+			related.push(primary_token);
+			if let Some(stat) = stat_token {
+				related.push(stat);
+			}
+			OutboxItem { token: aprv_token, related }
+		};
+
+		items.push(item);
+	}
+
+	let response =
+		ApiResponse::new(OutboxResponse { items }).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::OK, Json(response)))
 }
 

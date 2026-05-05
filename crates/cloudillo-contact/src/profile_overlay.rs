@@ -106,6 +106,7 @@ pub fn build_overlay(profile: &Profile<Box<str>>) -> ProfileOverlay {
 		name: Some(profile.name.to_string()),
 		r#type: Some(r#type.to_string()),
 		profile_pic: profile_pic_url(profile.id_tag.as_ref(), profile.profile_pic.as_deref()),
+		status: profile.status.map(|s| s.as_str().to_string()),
 		connected: Some(matches!(profile.connected, ProfileConnectionStatus::Connected)),
 		following: Some(profile.following),
 	}
@@ -124,6 +125,8 @@ mod tests {
 			name: name.into(),
 			typ: ProfileType::Person,
 			profile_pic: pic.map(Into::into),
+			status: None,
+			synced_at: None,
 			following: true,
 			connected: ProfileConnectionStatus::Connected,
 			roles: None,

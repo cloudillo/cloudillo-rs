@@ -85,6 +85,13 @@ pub trait Task<S: Clone>: Send + Sync + Debug {
 	async fn run(&self, state: &S) -> ClResult<()>;
 
 	fn kind_of(&self) -> &'static str;
+
+	/// Called when the task transitions to `Failed` after exhausting retries
+	/// (or on the very first failure when no retry policy is set). Lets the
+	/// task perform irreversible cleanup — e.g. mark a related domain row as
+	/// permanently failed — that should not happen on retryable failures.
+	/// Default: no-op.
+	async fn on_failed(&self, _state: &S, _attempts: u16, _last_error: &str) {}
 }
 
 #[derive(Debug)]
@@ -1181,12 +1188,14 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 								id, task_meta.retry_count, e
 							);
 							store.update_task_error(id, &e.to_string(), None).await.unwrap_or(());
+							task.on_failed(&state, task_meta.retry_count, &e.to_string()).await;
 							tx_finish.send(id).unwrap_or(());
 						}
 					} else {
 						// No retry policy - fail immediately
 						error!("Task {} failed: {}", id, e);
 						store.update_task_error(id, &e.to_string(), None).await.unwrap_or(());
+						task.on_failed(&state, 0, &e.to_string()).await;
 						tx_finish.send(id).unwrap_or(());
 					}
 				}

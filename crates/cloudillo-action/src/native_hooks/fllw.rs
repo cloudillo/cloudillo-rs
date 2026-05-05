@@ -7,6 +7,7 @@
 //! - on_create: Updates local profile when following someone
 //! - on_receive: Handles incoming follow/unfollow notifications
 
+use crate::history_sync::schedule_history_sync;
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 use cloudillo_types::meta_adapter::UpsertProfileFields;
@@ -17,18 +18,18 @@ use cloudillo_types::meta_adapter::UpsertProfileFields;
 /// - None (normal follow): Set audience's profile: following=true
 /// - DEL (unfollow): Set audience's following=null
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
-	tracing::debug!("Native hook: FLLW on_create for action {}", context.action_id);
+	debug!("Native hook: FLLW on_create for action {}", context.action_id);
 
 	let tn_id = context.tn_id;
 	let Some(audience) = &context.audience else {
-		tracing::warn!("FLLW on_create: No audience specified");
+		warn!("FLLW on_create: No audience specified");
 		return Ok(HookResult::default());
 	};
 
 	match context.subtype.as_deref() {
 		None => {
 			// Normal follow: update audience's profile
-			tracing::info!("FLLW: {} is now following {}", context.issuer, audience);
+			info!("FLLW: {} is now following {}", context.issuer, audience);
 
 			// Ensure audience profile exists locally (sync from remote if needed)
 			let ensure_profile = app.ext::<cloudillo_core::EnsureProfileFn>();
@@ -36,10 +37,9 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				Ok(f) => f(&app, tn_id, audience).await,
 				Err(e) => Err(e),
 			} {
-				tracing::warn!(
+				warn!(
 					"FLLW: Failed to sync audience profile {}: {} - continuing anyway",
-					audience,
-					e
+					audience, e
 				);
 			}
 
@@ -48,27 +48,29 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 
 			if let Err(e) = app.meta_adapter.upsert_profile(tn_id, audience, &profile_upsert).await
 			{
-				tracing::warn!("FLLW: Failed to update audience profile {}: {}", audience, e);
+				warn!("FLLW: Failed to update audience profile {}: {}", audience, e);
 			} else {
-				tracing::debug!("FLLW: Updated audience profile (following=true)");
+				debug!("FLLW: Updated audience profile (following=true)");
 			}
+
+			schedule_history_sync(&app, tn_id, audience).await;
 		}
 		Some("DEL") => {
 			// Unfollow: remove follow status
-			tracing::info!("FLLW:DEL: {} is no longer following {}", context.issuer, audience);
+			info!("FLLW:DEL: {} is no longer following {}", context.issuer, audience);
 
 			let profile_upsert =
 				UpsertProfileFields { following: Patch::Null, ..Default::default() };
 
 			if let Err(e) = app.meta_adapter.upsert_profile(tn_id, audience, &profile_upsert).await
 			{
-				tracing::warn!("FLLW:DEL: Failed to update audience profile {}: {}", audience, e);
+				warn!("FLLW:DEL: Failed to update audience profile {}: {}", audience, e);
 			} else {
-				tracing::debug!("FLLW:DEL: Updated audience profile (following=null)");
+				debug!("FLLW:DEL: Updated audience profile (following=null)");
 			}
 		}
 		Some(subtype) => {
-			tracing::warn!("FLLW on_create: Unknown subtype '{}', ignoring", subtype);
+			warn!("FLLW on_create: Unknown subtype '{}', ignoring", subtype);
 		}
 	}
 
@@ -98,10 +100,9 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 		// Returning an error to the remote sender (a) leaks the local privacy
 		// setting and (b) invites retry storms. Mirror CONN's ignore-mode:
 		// mark the action 'D' and continue.
-		tracing::info!(
+		info!(
 			"FLLW: Ignoring follow from {} - {} does not accept followers",
-			context.issuer,
-			audience
+			context.issuer, audience
 		);
 		let update_opts = cloudillo_types::meta_adapter::UpdateActionDataOptions {
 			status: Patch::Value('D'),
@@ -112,14 +113,14 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			.update_action_data(tn_id, &context.action_id, &update_opts)
 			.await
 		{
-			tracing::warn!("FLLW: Failed to update action status to D: {}", e);
+			warn!("FLLW: Failed to update action status to D: {}", e);
 		}
 		return Ok(HookResult::default());
 	}
 
 	match context.subtype.as_deref() {
 		None => {
-			tracing::info!("FLLW: {} started following {}", context.issuer, audience);
+			info!("FLLW: {} started following {}", context.issuer, audience);
 
 			// Ensure issuer profile exists locally (sync from remote if needed)
 			// This ensures we have info about our new follower
@@ -128,18 +129,17 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				Ok(f) => f(&app, tn_id, &context.issuer).await,
 				Err(e) => Err(e),
 			} {
-				tracing::warn!(
+				warn!(
 					"FLLW: Failed to sync follower profile {}: {} - continuing anyway",
-					context.issuer,
-					e
+					context.issuer, e
 				);
 			}
 		}
 		Some("DEL") => {
-			tracing::info!("FLLW:DEL: {} stopped following {}", context.issuer, audience);
+			info!("FLLW:DEL: {} stopped following {}", context.issuer, audience);
 		}
 		Some(subtype) => {
-			tracing::warn!("FLLW on_receive: Unknown subtype '{}', ignoring", subtype);
+			warn!("FLLW on_receive: Unknown subtype '{}', ignoring", subtype);
 		}
 	}
 

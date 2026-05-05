@@ -41,6 +41,26 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Federation history sync: age window in days
+	registry.register(
+		SettingDefinition::builder("federation.history_sync.since_days")
+			.description("Default age window in days for history sync on new connection")
+			.default(SettingValue::Int(30))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
+	// Federation history sync: maximum items per fetch
+	registry.register(
+		SettingDefinition::builder("federation.history_sync.limit")
+			.description("Default maximum number of actions to fetch per history sync")
+			.default(SettingValue::Int(10))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
 	Ok(())
 }
 

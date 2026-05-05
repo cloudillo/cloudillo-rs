@@ -186,9 +186,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 	async fn list_stale_profiles(
 		&self,
 		max_age_secs: i64,
+		disable_after_secs: i64,
 		limit: u32,
 	) -> ClResult<Vec<(TnId, Box<str>, Option<Box<str>>)>> {
-		profile::list_stale_profiles(&self.dbr, max_age_secs, limit).await
+		profile::list_stale_profiles(&self.dbr, max_age_secs, disable_after_secs, limit).await
 	}
 
 	// Action management
@@ -289,7 +290,7 @@ impl MetaAdapter for MetaAdapterSqlite {
 		tn_id: TnId,
 		aprv_action_id: &str,
 	) -> ClResult<Vec<(Box<str>, Box<str>)>> {
-		action::get_related_tokens(&self.db, tn_id, aprv_action_id).await
+		action::get_related_tokens(&self.dbr, tn_id, aprv_action_id).await
 	}
 
 	// File management

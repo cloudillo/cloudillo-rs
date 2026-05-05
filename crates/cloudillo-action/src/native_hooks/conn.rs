@@ -14,6 +14,7 @@
 //! - ACC: Connection acceptance response
 //! - DEL: Connection deletion/disconnect
 
+use crate::history_sync::schedule_history_sync;
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 use crate::task::{CreateAction, create_action};
@@ -27,18 +28,18 @@ use cloudillo_types::meta_adapter::{
 /// - None (normal connection): Set audience's profile: following=true, connected="request"
 /// - DEL: Remove connection by setting connected=null
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
-	tracing::debug!("Native hook: CONN on_create for action {}", context.action_id);
+	debug!("Native hook: CONN on_create for action {}", context.action_id);
 
 	let tn_id = context.tn_id;
 	let Some(audience) = &context.audience else {
-		tracing::warn!("CONN on_create: No audience specified");
+		warn!("CONN on_create: No audience specified");
 		return Ok(HookResult::default());
 	};
 
 	match context.subtype.as_deref() {
 		None => {
 			// Normal connection request: update audience's profile
-			tracing::info!("CONN: Establishing connection from {} to {}", context.issuer, audience);
+			info!("CONN: Establishing connection from {} to {}", context.issuer, audience);
 
 			// Ensure audience profile exists locally (sync from remote if needed)
 			let ensure_profile = app.ext::<cloudillo_core::EnsureProfileFn>();
@@ -46,10 +47,9 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				Ok(f) => f(&app, tn_id, audience).await,
 				Err(e) => Err(e),
 			} {
-				tracing::warn!(
+				warn!(
 					"CONN: Failed to sync audience profile {}: {} - continuing anyway",
-					audience,
-					e
+					audience, e
 				);
 			}
 
@@ -65,18 +65,14 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 
 			if let Err(e) = app.meta_adapter.upsert_profile(tn_id, audience, &profile_upsert).await
 			{
-				tracing::warn!("CONN: Failed to update audience profile {}: {}", audience, e);
+				warn!("CONN: Failed to update audience profile {}: {}", audience, e);
 			} else {
-				tracing::debug!("CONN: Updated audience profile");
+				debug!("CONN: Updated audience profile");
 			}
 		}
 		Some("ACC") => {
 			// Acceptance response: set audience's profile to connected
-			tracing::info!(
-				"CONN:ACC: Creating acceptance response from {} to {}",
-				context.issuer,
-				audience
-			);
+			info!("CONN:ACC: Creating acceptance response from {} to {}", context.issuer, audience);
 
 			let profile_upsert = UpsertProfileFields {
 				following: if context.tenant_type == "community" {
@@ -90,14 +86,14 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 
 			if let Err(e) = app.meta_adapter.upsert_profile(tn_id, audience, &profile_upsert).await
 			{
-				tracing::warn!("CONN:ACC: Failed to update audience profile {}: {}", audience, e);
+				warn!("CONN:ACC: Failed to update audience profile {}: {}", audience, e);
 			} else {
-				tracing::debug!("CONN:ACC: Updated audience profile to Connected");
+				debug!("CONN:ACC: Updated audience profile to Connected");
 			}
 		}
 		Some("DEL") => {
 			// Deletion: remove connection
-			tracing::info!("CONN:DEL: Removing connection from {} to {}", context.issuer, audience);
+			info!("CONN:DEL: Removing connection from {} to {}", context.issuer, audience);
 
 			let profile_upsert = UpsertProfileFields {
 				connected: Patch::Null,
@@ -107,13 +103,13 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 
 			if let Err(e) = app.meta_adapter.upsert_profile(tn_id, audience, &profile_upsert).await
 			{
-				tracing::warn!("CONN:DEL: Failed to update audience profile {}: {}", audience, e);
+				warn!("CONN:DEL: Failed to update audience profile {}: {}", audience, e);
 			} else {
-				tracing::debug!("CONN:DEL: Removed audience connection");
+				debug!("CONN:DEL: Removed audience connection");
 			}
 		}
 		Some(subtype) => {
-			tracing::warn!("CONN on_create: Unknown subtype '{}', ignoring", subtype);
+			warn!("CONN on_create: Unknown subtype '{}', ignoring", subtype);
 		}
 	}
 
@@ -134,11 +130,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 	match context.subtype.as_deref() {
 		None => {
-			tracing::info!(
-				"CONN: Received connection request from {} to {}",
-				context.issuer,
-				local_tag
-			);
+			info!("CONN: Received connection request from {} to {}", context.issuer, local_tag);
 
 			// Ensure issuer profile exists locally (sync from remote if needed)
 			let ensure_profile = app.ext::<cloudillo_core::EnsureProfileFn>();
@@ -146,10 +138,9 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				Ok(f) => f(&app, tn_id, &context.issuer).await,
 				Err(e) => Err(e),
 			} {
-				tracing::warn!(
+				warn!(
 					"CONN: Failed to sync issuer profile {}: {} - continuing anyway",
-					context.issuer,
-					e
+					context.issuer, e
 				);
 			}
 
@@ -166,10 +157,9 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				&& req.sub_typ.is_none()
 			{
 				// We have a pending request - this is mutual, auto-connect
-				tracing::info!(
+				info!(
 					"CONN: Mutual connection detected between {} and {}",
-					context.issuer,
-					local_tag
+					context.issuer, local_tag
 				);
 
 				// Update issuer's profile to connected
@@ -186,12 +176,10 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				if let Err(e) =
 					app.meta_adapter.upsert_profile(tn_id, &context.issuer, &profile_upsert).await
 				{
-					tracing::warn!(
-						"CONN: Failed to update issuer profile {}: {}",
-						context.issuer,
-						e
-					);
+					warn!("CONN: Failed to update issuer profile {}: {}", context.issuer, e);
 				}
+
+				schedule_history_sync(&app, tn_id, &context.issuer).await;
 
 				// Set action status to 'N' (notification) - mutual connection auto-accepted
 				let update_opts =
@@ -201,7 +189,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					.update_action_data(tn_id, &context.action_id, &update_opts)
 					.await
 				{
-					tracing::warn!("CONN: Failed to update action status to N: {}", e);
+					warn!("CONN: Failed to update action status to N: {}", e);
 				}
 
 				return Ok(HookResult::default());
@@ -269,6 +257,8 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					warn!("CONN: Failed to update issuer profile {}: {}", context.issuer, e);
 				}
 
+				schedule_history_sync(&app, tn_id, &context.issuer).await;
+
 				let update_opts =
 					UpdateActionDataOptions { status: Patch::Value('N'), ..Default::default() };
 				if let Err(e) = app
@@ -285,7 +275,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			match connection_mode.as_deref() {
 				Some("I") => {
 					// IGNORE mode: Auto-delete/reject the connection request
-					tracing::info!(
+					info!(
 						"CONN: Ignoring connection request from {} (connection_mode=I)",
 						context.issuer
 					);
@@ -298,13 +288,13 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 						.update_action_data(tn_id, &context.action_id, &update_opts)
 						.await
 					{
-						tracing::warn!("CONN: Failed to update action status to D: {}", e);
+						warn!("CONN: Failed to update action status to D: {}", e);
 					}
 					return Ok(HookResult { continue_processing: false, ..Default::default() });
 				}
 				Some("A") => {
 					// AUTO-ACCEPT mode: Create response CONN action and connect
-					tracing::info!(
+					info!(
 						"CONN: Auto-accepting connection from {} (connection_mode=A)",
 						context.issuer
 					);
@@ -320,7 +310,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					if let Err(e) =
 						create_action(&app, tn_id, &context.tenant_tag, response_action).await
 					{
-						tracing::warn!("CONN: Failed to create auto-accept response: {}", e);
+						warn!("CONN: Failed to create auto-accept response: {}", e);
 					}
 
 					// Update issuer's profile to connected
@@ -338,12 +328,10 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 						.upsert_profile(tn_id, &context.issuer, &profile_upsert)
 						.await
 					{
-						tracing::warn!(
-							"CONN: Failed to update issuer profile {}: {}",
-							context.issuer,
-							e
-						);
+						warn!("CONN: Failed to update issuer profile {}: {}", context.issuer, e);
 					}
+
+					schedule_history_sync(&app, tn_id, &context.issuer).await;
 
 					// Set action status to 'N' (notification - auto-processed)
 					let update_opts =
@@ -353,15 +341,12 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 						.update_action_data(tn_id, &context.action_id, &update_opts)
 						.await
 					{
-						tracing::warn!("CONN: Failed to update action status to N: {}", e);
+						warn!("CONN: Failed to update action status to N: {}", e);
 					}
 				}
 				_ => {
 					// Normal behavior: requires user confirmation
-					tracing::info!(
-						"CONN: Connection request from {} requires confirmation",
-						context.issuer
-					);
+					info!("CONN: Connection request from {} requires confirmation", context.issuer);
 
 					// Set action status to 'C' (confirmation) - user needs to accept/reject
 					let update_opts =
@@ -371,17 +356,16 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 						.update_action_data(tn_id, &context.action_id, &update_opts)
 						.await
 					{
-						tracing::warn!("CONN: Failed to update action status to C: {}", e);
+						warn!("CONN: Failed to update action status to C: {}", e);
 					}
 				}
 			}
 		}
 		Some("ACC") => {
 			// Connection accepted - update issuer's profile to connected
-			tracing::info!(
+			info!(
 				"CONN:ACC: Connection acceptance received from {} to {}",
-				context.issuer,
-				local_tag
+				context.issuer, local_tag
 			);
 
 			// Verify we actually sent an outgoing CONN request to this issuer.
@@ -399,7 +383,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				.is_some_and(|a| a.sub_typ.as_deref().is_none_or(str::is_empty));
 
 			if !has_pending_request {
-				tracing::warn!(
+				warn!(
 					"CONN:ACC: Rejecting acceptance from {} - no outgoing CONN request found",
 					context.issuer
 				);
@@ -410,7 +394,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					.update_action_data(tn_id, &context.action_id, &update_opts)
 					.await
 				{
-					tracing::warn!("CONN:ACC: Failed to update action status to D: {}", e);
+					warn!("CONN:ACC: Failed to update action status to D: {}", e);
 				}
 				return Ok(HookResult { continue_processing: false, ..Default::default() });
 			}
@@ -429,14 +413,12 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			if let Err(e) =
 				app.meta_adapter.upsert_profile(tn_id, &context.issuer, &profile_upsert).await
 			{
-				tracing::warn!(
-					"CONN:ACC: Failed to update issuer profile {}: {}",
-					context.issuer,
-					e
-				);
+				warn!("CONN:ACC: Failed to update issuer profile {}: {}", context.issuer, e);
 			} else {
-				tracing::debug!("CONN:ACC: Updated issuer profile to Connected");
+				debug!("CONN:ACC: Updated issuer profile to Connected");
 			}
+
+			schedule_history_sync(&app, tn_id, &context.issuer).await;
 
 			// Set action status to 'N' (notification)
 			let update_opts =
@@ -446,15 +428,11 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				.update_action_data(tn_id, &context.action_id, &update_opts)
 				.await
 			{
-				tracing::warn!("CONN:ACC: Failed to update action status to N: {}", e);
+				warn!("CONN:ACC: Failed to update action status to N: {}", e);
 			}
 		}
 		Some("DEL") => {
-			tracing::info!(
-				"CONN:DEL: Received disconnect request from {} to {}",
-				context.issuer,
-				local_tag
-			);
+			info!("CONN:DEL: Received disconnect request from {} to {}", context.issuer, local_tag);
 
 			// Update issuer's profile to not connected
 			let profile_upsert =
@@ -463,11 +441,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			if let Err(e) =
 				app.meta_adapter.upsert_profile(tn_id, &context.issuer, &profile_upsert).await
 			{
-				tracing::warn!(
-					"CONN:DEL: Failed to update issuer profile {}: {}",
-					context.issuer,
-					e
-				);
+				warn!("CONN:DEL: Failed to update issuer profile {}: {}", context.issuer, e);
 			}
 
 			// Set action status to 'N' (notification)
@@ -478,11 +452,11 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				.update_action_data(tn_id, &context.action_id, &update_opts)
 				.await
 			{
-				tracing::warn!("CONN:DEL: Failed to update action status to N: {}", e);
+				warn!("CONN:DEL: Failed to update action status to N: {}", e);
 			}
 		}
 		Some(subtype) => {
-			tracing::warn!("CONN on_receive: Unknown subtype '{}', ignoring", subtype);
+			warn!("CONN on_receive: Unknown subtype '{}', ignoring", subtype);
 		}
 	}
 
@@ -496,7 +470,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 /// - The CONN:ACC on_create hook will update the local profile
 /// - The CONN:ACC on_receive hook on the sender's side will update their profile
 pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
-	tracing::info!("CONN: Connection accepted from {}", context.issuer);
+	info!("CONN: Connection accepted from {}", context.issuer);
 
 	let tn_id = context.tn_id;
 
@@ -510,11 +484,13 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 	};
 
 	if let Err(e) = create_action(&app, tn_id, &context.tenant_tag, response_action).await {
-		tracing::warn!("CONN: Failed to create response CONN:ACC action: {}", e);
+		warn!("CONN: Failed to create response CONN:ACC action: {}", e);
 		// Don't fail the accept if response creation fails
 	} else {
-		tracing::info!("CONN:ACC: Response action created for {}", context.issuer);
+		info!("CONN:ACC: Response action created for {}", context.issuer);
 	}
+
+	schedule_history_sync(&app, tn_id, &context.issuer).await;
 
 	Ok(HookResult::default())
 }
@@ -523,7 +499,7 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 ///
 /// Logic: Update issuer's profile: following=false, connected=Disconnected
 pub async fn on_reject(app: App, context: HookContext) -> ClResult<HookResult> {
-	tracing::info!("CONN: Connection rejected from {}", context.issuer);
+	info!("CONN: Connection rejected from {}", context.issuer);
 
 	let tn_id = context.tn_id;
 
@@ -535,7 +511,7 @@ pub async fn on_reject(app: App, context: HookContext) -> ClResult<HookResult> {
 
 	app.meta_adapter.upsert_profile(tn_id, &context.issuer, &profile_upsert).await?;
 
-	tracing::debug!("CONN: Updated issuer profile (following=false, connected=Disconnected)");
+	debug!("CONN: Updated issuer profile (following=false, connected=Disconnected)");
 
 	Ok(HookResult::default())
 }

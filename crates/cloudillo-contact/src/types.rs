@@ -52,6 +52,7 @@ pub struct ProfileOverlay {
 	pub name: Option<String>,
 	pub r#type: Option<String>,
 	pub profile_pic: Option<String>,
+	pub status: Option<String>,
 	pub connected: Option<bool>,
 	pub following: Option<bool>,
 }

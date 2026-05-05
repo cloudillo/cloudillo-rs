@@ -85,7 +85,7 @@ pub async fn list_profiles(
 				.to_string(),
 			),
 			profile_pic: p.profile_pic.map(|s| s.to_string()),
-			status: None, // Not available in Profile type
+			status: p.status.map(|s| s.as_str().to_string()),
 			connected: Some(p.connected.is_connected()),
 			following: Some(p.following),
 			trust: p.trust,
@@ -123,7 +123,7 @@ pub async fn get_profile_by_id_tag(
 				name: p.name.to_string(),
 				r#type: typ,
 				profile_pic: p.profile_pic.map(|s| s.to_string()),
-				status: None, // TODO: Add status to Profile struct
+				status: p.status.map(|s| s.as_str().to_string()),
 				connected: Some(p.connected.is_connected()),
 				following: Some(p.following),
 				trust: p.trust,

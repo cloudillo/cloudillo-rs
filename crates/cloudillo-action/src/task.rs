@@ -1146,6 +1146,25 @@ impl Task<App> for ActionVerifierTask {
 		debug!("Finished task action.verify {}", action_id);
 		Ok(())
 	}
+
+	async fn on_failed(&self, app: &App, attempts: u16, last_error: &str) {
+		// All retries exhausted while verifying / activating this inbound action.
+		// Flip the row to 'F' so it never appears in client listings (which
+		// filter on status='A'). The descriptor invariant holds because the
+		// action never reached 'A' on a partial sync.
+		let action_id = hasher::hash("a", self.token.as_bytes());
+		error!(
+			"ACTIVATE: action {} failed permanently after {} attempts: {}",
+			action_id, attempts, last_error
+		);
+		let opts = cloudillo_types::meta_adapter::UpdateActionDataOptions {
+			status: cloudillo_types::types::Patch::Value('F'),
+			..Default::default()
+		};
+		if let Err(e) = app.meta_adapter.update_action_data(self.tn_id, &action_id, &opts).await {
+			warn!("  failed to mark action {} as 'F' after retry exhaustion: {}", action_id, e);
+		}
+	}
 }
 
 #[cfg(test)]

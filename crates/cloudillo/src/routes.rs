@@ -9,7 +9,7 @@ use axum::{
 	extract::State,
 	http::{HeaderMap, HeaderValue, Request, StatusCode, header},
 	middleware,
-	response::Response,
+	response::{IntoResponse, Response},
 	routing::{any, delete, get, patch, post, put},
 };
 use tower::Service;
@@ -197,6 +197,11 @@ fn init_protected_routes(app: App) -> Router<App> {
 		// --- Action API (Create + Write) ---
 		.merge(action_router_create)
 		.merge(action_router_write)
+
+		// --- Federation History Sync (peer-initiated pull) ---
+		// Auth is enforced by the `Auth` extractor; non-related peers are rejected
+		// with an empty list inside the handler before any action query runs.
+		.route("/api/outbox", get(action::handler::get_outbox))
 
 		// --- Profile API (Permission-Checked) ---
 		// Note: All profile routes require auth (check_perm_profile uses Auth, not OptionalAuth)
@@ -596,7 +601,7 @@ async fn serve_shell_index_html(
 	dist_dir: &std::path::Path,
 	disable_cache: bool,
 	if_none_match: Option<&str>,
-) -> axum::response::Response {
+) -> ClResult<axum::response::Response> {
 	let file_path = dist_dir.join("index.html");
 
 	// Read file metadata for ETag computation (length + mtime)
@@ -618,12 +623,11 @@ async fn serve_shell_index_html(
 			} else {
 				HeaderValue::from_static("no-cache, must-revalidate")
 			};
-			return Response::builder()
+			return Ok(Response::builder()
 				.status(StatusCode::NOT_MODIFIED)
 				.header(header::CACHE_CONTROL, cache_value)
 				.header(header::ETAG, etag.as_str())
-				.body(Body::empty())
-				.unwrap_or_else(|_| Response::new(Body::empty()));
+				.body(Body::empty())?);
 		}
 	}
 
@@ -643,21 +647,14 @@ async fn serve_shell_index_html(
 			if let Some(etag) = &etag {
 				builder = builder.header(header::ETAG, etag.as_str());
 			}
-			builder
-				.body(Body::from(content))
-				.unwrap_or_else(|_| Response::new(Body::from("Internal Server Error")))
+			Ok(builder.body(Body::from(content))?)
 		}
 		Err(_) => {
 			// Shell index.html doesn't exist - critical deployment error
-			Response::builder()
+			Ok(Response::builder()
 				.status(StatusCode::NOT_FOUND)
 				.header(header::CONTENT_TYPE, "text/plain")
-				.body(Body::from("Not Found"))
-				.unwrap_or_else(|_| {
-					let mut res = Response::new(Body::from("Not Found"));
-					*res.status_mut() = StatusCode::NOT_FOUND;
-					res
-				})
+				.body(Body::from("Not Found"))?)
 		}
 	}
 }
@@ -813,7 +810,9 @@ async fn static_fallback_handler(
 	if response.status() == StatusCode::NOT_FOUND {
 		// Only serve shell's index.html for client routes (not API, WS, apps, or files with extensions)
 		if should_serve_spa_fallback(&path_owned) {
-			return serve_shell_index_html(dist_dir, disable_cache, if_none_match.as_deref()).await;
+			return serve_shell_index_html(dist_dir, disable_cache, if_none_match.as_deref())
+				.await
+				.unwrap_or_else(IntoResponse::into_response);
 		}
 		// Otherwise return the 404 as-is
 		return response.map(Body::new);

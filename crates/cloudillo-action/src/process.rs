@@ -248,8 +248,13 @@ pub async fn process_inbound_action_token(
 	.await?;
 
 	// Process any related actions that came with this action
-	// (only for regular inbound actions, not for pre-approved/related ones to avoid recursion)
-	process_related_actions(app, tn_id, action_id).await;
+	// (only for regular inbound actions, not for pre-approved/related ones to avoid recursion).
+	// Run in the background so a slow remote does not block the primary verifier.
+	let app_clone = app.clone();
+	let action_id_clone: Box<str> = action_id.into();
+	tokio::spawn(async move {
+		process_related_actions(&app_clone, tn_id, &action_id_clone).await;
+	});
 
 	Ok(result)
 }
@@ -389,6 +394,7 @@ async fn process_inbound_action_token_inner(
 			app,
 			tn_id,
 			&action.iss,
+			action.aud.as_deref(),
 			resolved_visibility,
 			attachments.clone(),
 		)
@@ -439,6 +445,19 @@ async fn process_inbound_action_token_inner(
 		ProcessingContext::Inbound { client_address, is_sync },
 	)
 	.await?;
+
+	// Activate the action only after the full pipeline (attachment sync +
+	// post-store) succeeded. Any failure earlier returned an Err and left the
+	// row in 'P', so the verifier task can retry. The flip is idempotent
+	// ('P' → 'A' on first success, 'A' → 'A' on subsequent runs).
+	let activate_opts = meta_adapter::UpdateActionDataOptions {
+		status: cloudillo_types::types::Patch::Value('A'),
+		..Default::default()
+	};
+	if let Err(e) = app.meta_adapter.update_action_data(tn_id, action_id, &activate_opts).await {
+		warn!("  failed to activate inbound action {}: {}", action_id, e);
+		return Err(e);
+	}
 
 	Ok(result.hook_result)
 }
@@ -531,6 +550,22 @@ async fn check_inbound_permissions(
 		issuer_profile.as_ref().is_some_and(|p| p.following),
 		issuer_profile.as_ref().is_some_and(|p| p.connected.is_connected())
 	);
+
+	if let Some(ref p) = issuer_profile {
+		use cloudillo_types::meta_adapter::ProfileStatus;
+		if matches!(
+			p.status,
+			Some(ProfileStatus::Suspended | ProfileStatus::Blocked | ProfileStatus::Banned)
+		) {
+			warn!(
+				issuer = %action.iss,
+				action_type = %action.t,
+				status = ?p.status,
+				"Inbound action refused: issuer profile is deactivated/blocked/banned"
+			);
+			return Err(Error::PermissionDenied);
+		}
+	}
 
 	let allowed = issuer_profile
 		.as_ref()
@@ -777,33 +812,55 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) -> ClRe
 
 	match app.meta_adapter.create_action(ctx.tn_id, &inbound_action, key.as_deref()).await {
 		Ok(meta_adapter::ActionId::AId(_)) => {
+			// Row was created in the meta-adapter's default status ('P', shared
+			// with outbound-pending). Immediately mark it 'V' (verifying) to
+			// distinguish inbound rows whose attachment sync hasn't completed
+			// from outbound-pending rows. 'V' is filtered from client listings
+			// and the federation outbox; activation ('V' → 'A') is deferred to
+			// the end of process_inbound_action_token_inner so the action only
+			// goes live after attachment sync and post-store steps succeed.
 			info!("← STORED: {}", ctx.action_id);
-			let update_opts = meta_adapter::UpdateActionDataOptions {
-				status: cloudillo_types::types::Patch::Value('A'),
+			let opts = meta_adapter::UpdateActionDataOptions {
+				status: cloudillo_types::types::Patch::Value('V'),
 				..Default::default()
 			};
-			if let Err(e) = app
-				.meta_adapter
-				.update_action_data(ctx.tn_id, ctx.action_id, &update_opts)
-				.await
+			if let Err(e) =
+				app.meta_adapter.update_action_data(ctx.tn_id, ctx.action_id, &opts).await
 			{
-				warn!("  failed to set inbound action status to active: {}", e);
+				warn!("  failed to set inbound action status to 'V': {}", e);
+				return Err(e);
 			}
 		}
 		Ok(meta_adapter::ActionId::ActionId(_)) => {
 			if ctx.is_conn_action
 				&& let Some(ip) = ctx.client_ip
-			{
-				if let Err(pen_err) = app
+				&& let Err(pen_err) = app
 					.rate_limiter
 					.increment_pow_counter(ip, PowPenaltyReason::ConnDuplicatePending)
-				{
-					warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
-				}
-				debug!("CONN duplicate detected from {} - PoW counter incremented", action.iss);
+			{
+				warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
 			}
-			debug!("  duplicate inbound action: {}", ctx.action_id);
-			return Ok(false);
+			// Existing row: if it's already active, nothing to do. If it's still
+			// verifying (typical for a verifier-task retry whose previous run
+			// failed during attachment sync), fall through and rerun the rest
+			// of the pipeline so it can finally activate.
+			let existing = app.meta_adapter.get_action(ctx.tn_id, ctx.action_id).await?;
+			match existing.as_ref().and_then(|a| a.status.as_deref()) {
+				Some("A") => {
+					debug!("  duplicate inbound action {} already active", ctx.action_id);
+					return Ok(false);
+				}
+				Some("V" | "P") | None => {
+					debug!("  resuming pending inbound action {}", ctx.action_id);
+				}
+				Some(other) => {
+					debug!(
+						"  duplicate inbound action {} in unexpected status {}",
+						ctx.action_id, other
+					);
+					return Ok(false);
+				}
+			}
 		}
 		Err(e) => {
 			warn!("  failed to store inbound action: {}", e);
@@ -824,32 +881,51 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) -> ClRe
 async fn process_inbound_action_attachments(
 	app: &App,
 	tn_id: TnId,
-	id_tag: &str,
+	issuer_tag: &str,
+	audience_tag: Option<&str>,
 	visibility: Option<char>,
 	attachments: Vec<Box<str>>,
 ) -> ClResult<()> {
-	use cloudillo_file::sync::sync_file_variants;
+	use cloudillo_file::sync::{get_sync_source, is_audience, sync_file_variants};
+
+	let tenant = app.meta_adapter.read_tenant(tn_id).await?;
+	let tenant_tag: &str = tenant.id_tag.as_ref();
+
+	let source = get_sync_source(tenant_tag, audience_tag, issuer_tag);
+	let sync_all = is_audience(tenant_tag, audience_tag);
+
+	debug!(
+		issuer = %issuer_tag,
+		audience = ?audience_tag,
+		tenant = %tenant_tag,
+		source = %source,
+		sync_all = %sync_all,
+		"attachment sync routing"
+	);
 
 	let mut total_synced = 0;
 	let mut total_skipped = 0;
-	let mut total_failed = 0;
 
-	for attachment in &attachments {
-		debug!("  syncing attachment: {}", attachment);
-		match sync_file_variants(app, tn_id, id_tag, attachment, None, true, visibility).await {
-			Ok(result) => {
-				total_synced += result.synced_variants.len();
-				total_skipped += result.skipped_variants.len();
-				total_failed += result.failed_variants.len();
-			}
-			Err(e) => {
-				warn!("  failed to sync attachment {}: {}", attachment, e);
-				total_failed += 1;
-			}
-		}
+	// Atomic across attachments: the first failure aborts the whole sync. The
+	// inbound action stays in status='P', and the verifier task retries with
+	// exponential back-off until every attachment is fully synced.
+	for attachment in attachments.iter().filter(|a| !a.is_empty()) {
+		debug!("  syncing attachment: {} from {}", attachment, source);
+		let result =
+			sync_file_variants(app, tn_id, source, attachment, None, true, visibility, sync_all)
+				.await
+				.map_err(|e| {
+					warn!("  failed to sync attachment {}: {}", attachment, e);
+					e
+				})?;
+		total_synced += result.synced_variants.len();
+		total_skipped += result.skipped_variants.len();
 	}
 
-	for attachment in &attachments {
+	// Only flip `hidden=true` after every attachment has been fully synced. If
+	// an earlier attachment failed we returned above, so the next retry redoes
+	// the sync rather than persisting an inconsistent hidden flag.
+	for attachment in attachments.iter().filter(|a| !a.is_empty()) {
 		let _ = app
 			.meta_adapter
 			.update_file_data(
@@ -865,11 +941,10 @@ async fn process_inbound_action_attachments(
 
 	if !attachments.is_empty() {
 		info!(
-			"ATTACHMENTS: {} files - synced={} skipped={} failed={}",
+			"ATTACHMENTS: {} files - synced={} skipped={}",
 			attachments.len(),
 			total_synced,
 			total_skipped,
-			total_failed
 		);
 	}
 

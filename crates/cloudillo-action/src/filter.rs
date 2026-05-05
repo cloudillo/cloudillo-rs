@@ -38,6 +38,16 @@ pub async fn filter_actions_by_visibility(
 	// Batch load relationship status for all issuers
 	let relationships = load_relationships(app, tn_id, subject_id_tag, &issuer_tags).await?;
 
+	// For the federation outbox case (subject != tenant, issuer == tenant), the
+	// `relationships` map keyed on issuer.id_tag becomes useless: it would ask
+	// the tenant's profile table "does the tenant follow itself?" Resolve the
+	// subject↔tenant peer-relation explicitly so we can override that lookup.
+	let federation_relation = if subject_id_tag == tenant_id_tag {
+		false
+	} else {
+		subject_has_peer_relation_to_tenant(app, tn_id, subject_id_tag, tenant_id_tag).await?
+	};
+
 	// Identify subscribable actions with Direct visibility that need subscriber lookup
 	let subscribable_direct: Vec<&str> = actions
 		.iter()
@@ -49,7 +59,7 @@ pub async fn filter_actions_by_visibility(
 	let subscribers_map = load_subscribers(app, tn_id, &subscribable_direct).await;
 
 	// Filter actions based on visibility
-	info!(
+	debug!(
 		"filter_actions_by_visibility: subject={}, is_auth={}, tenant={}, action_count={}",
 		subject_id_tag,
 		is_authenticated,
@@ -61,7 +71,14 @@ pub async fn filter_actions_by_visibility(
 		.filter(|action| {
 			let issuer_tag = action.issuer.id_tag.as_ref();
 			let (following, connected) =
-				relationships.get(issuer_tag).copied().unwrap_or((false, false));
+				if issuer_tag == tenant_id_tag && subject_id_tag != tenant_id_tag {
+					// Federation case (e.g. /api/outbox). Map peer-relation onto
+					// `connected` since the visibility chart treats Connected ⊇
+					// Follower (abac.rs:128-134).
+					(false, federation_relation)
+				} else {
+					relationships.get(issuer_tag).copied().unwrap_or((false, false))
+				};
 
 			// Build audience list for Direct visibility check
 			let mut audience: Vec<&str> =
@@ -86,7 +103,7 @@ pub async fn filter_actions_by_visibility(
 				audience_tags: Some(&audience),
 			});
 			if !allowed {
-				info!(
+				debug!(
 					"FILTERED OUT action={}: subject={}, issuer={}, tenant={}, visibility={:?}, audience={:?}",
 					action.action_id,
 					subject_id_tag,
@@ -160,6 +177,45 @@ async fn load_relationships(
 
 	// Single batch query instead of N+1 queries
 	app.meta_adapter.get_relationships(tn_id, &targets).await
+}
+
+/// Does `subject` count as a follower-or-better of `tenant` in `tn_id`'s DB?
+///
+/// Returns true if either:
+/// - `profiles[subject].connected` is true (mutual CONN — symmetric), or
+/// - there is an active FLLW action from subject → tenant (status='A', no DEL sub_typ).
+///
+/// `following` on `profiles[subject]` is intentionally ignored: in tenant T's DB
+/// it means "T follows subject", which is the wrong direction for "is subject a
+/// follower of T?" Inbound FLLWs are stored in the actions table, not on the
+/// profile row (see fllw.rs::on_receive: "Followers are queried from stored
+/// FLLW actions when needed").
+pub(crate) async fn subject_has_peer_relation_to_tenant(
+	app: &App,
+	tn_id: TnId,
+	subject_id_tag: &str,
+	tenant_id_tag: &str,
+) -> ClResult<bool> {
+	if subject_id_tag == tenant_id_tag {
+		return Ok(true);
+	}
+
+	let rels = app.meta_adapter.get_relationships(tn_id, &[subject_id_tag]).await?;
+	if rels.get(subject_id_tag).is_some_and(|(_following, connected)| *connected) {
+		return Ok(true);
+	}
+
+	let opts = ListActionOptions {
+		typ: Some(vec!["FLLW".into()]),
+		issuer: Some(subject_id_tag.to_string()),
+		audience: Some(tenant_id_tag.to_string()),
+		status: Some(vec!["A".into()]),
+		limit: Some(1),
+		..Default::default()
+	};
+	let fllw = app.meta_adapter.list_actions(tn_id, &opts).await?;
+	// Active FLLW with no DEL sub_typ means "still following".
+	Ok(fllw.iter().any(|a| a.sub_typ.as_deref() != Some("DEL")))
 }
 
 // vim: ts=4

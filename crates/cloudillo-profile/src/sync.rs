@@ -7,7 +7,7 @@ use crate::prelude::*;
 use cloudillo_core::request::ConditionalResult;
 use cloudillo_core::scheduler::Task;
 use cloudillo_types::meta_adapter::{
-	ProfileConnectionStatus, ProfileType, UpsertProfileFields, UpsertResult,
+	ProfileConnectionStatus, ProfileStatus, ProfileType, UpsertProfileFields, UpsertResult,
 };
 use cloudillo_types::types::ApiResponse;
 
@@ -20,6 +20,25 @@ use std::sync::Arc;
 const STALE_PROFILE_THRESHOLD_SECS: i64 = 86400;
 /// Maximum profiles to process per batch
 const BATCH_SIZE: u32 = 100;
+/// Days of continuous sync failure before flipping a profile to Suspended.
+const DEACTIVATE_AFTER_DAYS: i64 = 1;
+/// Days of continuous sync failure before the refresh batch stops attempting.
+const DISABLE_REFRESH_AFTER_DAYS: i64 = 7;
+const SECS_PER_DAY: i64 = 86400;
+/// The single profile-picture variant we mirror locally (public, hashed thumbnail).
+const PROFILE_PIC_VARIANT: &str = "vis.pf";
+
+/// Returns true if the local `vis.pf` variant of a remote profile picture is
+/// already cached in `file_variants`. Used to retry the picture-only sync
+/// when the profile row has the right `file_id` but the variant blob never
+/// landed (e.g. transient network failure during initial sync).
+async fn local_profile_pic_present(app: &App, tn_id: TnId, file_id: &str) -> bool {
+	// "Present" means we read the variant successfully. Any error (NotFound,
+	// DB error, lock error) is treated as "not confirmed present" so the
+	// best-effort retry path is still taken — that's the safe direction.
+	let variant_id = format!("{}:{}", file_id, PROFILE_PIC_VARIANT);
+	app.meta_adapter.read_file_variant(tn_id, &variant_id).await.is_ok()
+}
 
 /// Remote profile response from /me endpoint
 #[derive(Debug, serde::Deserialize)]
@@ -131,16 +150,33 @@ pub async fn refresh_profile(
 ) -> ClResult<bool> {
 	tracing::debug!("Refreshing profile {} (etag: {:?})", id_tag, etag);
 
+	// Snapshot prior status so both success branches can recover S → A.
+	let prev_status = app
+		.meta_adapter
+		.read_profile(tn_id, id_tag)
+		.await
+		.ok()
+		.and_then(|(_, p)| p.status);
+	let reactivate_status = if matches!(prev_status, Some(ProfileStatus::Suspended)) {
+		Patch::Value(ProfileStatus::Active)
+	} else {
+		Patch::Undefined
+	};
+
 	// Make conditional request to remote /me endpoint
 	let result: ClResult<ConditionalResult<ApiResponse<RemoteProfile>>> =
 		app.request.get_conditional(id_tag, "/me", etag).await;
 
 	match result {
 		Ok(ConditionalResult::NotModified) => {
-			// Profile hasn't changed, just update synced_at
+			// Profile hasn't changed, just update synced_at (and recover from S if applicable)
 			tracing::debug!("Profile {} not modified (304), updating synced_at", id_tag);
 
-			let fields = UpsertProfileFields { synced: Patch::Value(true), ..Default::default() };
+			let fields = UpsertProfileFields {
+				synced: Patch::Value(true),
+				status: reactivate_status,
+				..Default::default()
+			};
 
 			app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
 			Ok(false)
@@ -185,6 +221,19 @@ pub async fn refresh_profile(
 				false
 			};
 
+			// File_id unchanged but the local vis.pf variant is missing — this
+			// is the "broken picture" case: initial pic sync failed, profile
+			// row has the right file_id, refresh sees no remote change and
+			// would skip the download. Retry the variant fetch silently;
+			// don't touch profile_pic fields either way.
+			if !profile_pic_changed
+				&& let Some(ref file_id) = remote.profile_pic
+				&& !local_profile_pic_present(app, tn_id, file_id).await
+				&& let Err(e) = sync_profile_pic_variant(app, tn_id, id_tag, file_id).await
+			{
+				tracing::debug!("Profile pic variant retry still failing for {}: {}", id_tag, e);
+			}
+
 			// Determine remote profile type
 			let typ = match remote.r#type.as_str() {
 				"community" => ProfileType::Community,
@@ -196,6 +245,7 @@ pub async fn refresh_profile(
 				name: Patch::Value(remote.name.clone().into()),
 				typ: Patch::Value(typ),
 				synced: Patch::Value(true),
+				status: reactivate_status,
 				..Default::default()
 			};
 
@@ -218,10 +268,30 @@ pub async fn refresh_profile(
 		}
 		Err(e) => {
 			tracing::warn!("Failed to refresh profile {}: {}", id_tag, e);
-			// Don't propagate error - just log and return false
-			// Still update synced_at to avoid repeated retries
-			let fields = UpsertProfileFields { synced: Patch::Value(true), ..Default::default() };
-			let _ = app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await;
+			// CRITICAL: do NOT bump synced_at here. Once `synced_at` only
+			// advances on success, every higher-level question — "is it
+			// failing?", "for how long?", "should we stop trying?" — is
+			// answered by `now - synced_at` against a single column.
+			let now = Timestamp::now().0;
+			let (last_success, current_status) = app
+				.meta_adapter
+				.read_profile(tn_id, id_tag)
+				.await
+				.map_or((None, None), |(_, p)| (p.synced_at.map(|t| t.0), p.status));
+
+			let should_suspend = last_success.is_some_and(|s| {
+				now.saturating_sub(s).max(0) >= DEACTIVATE_AFTER_DAYS * SECS_PER_DAY
+			}) && matches!(current_status, None | Some(ProfileStatus::Active));
+
+			if should_suspend {
+				let fields = UpsertProfileFields {
+					status: Patch::Value(ProfileStatus::Suspended),
+					..Default::default()
+				};
+				if let Err(e) = app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await {
+					warn!(id_tag = %id_tag, error = %e, "failed to mark profile Suspended");
+				}
+			}
 			Ok(false)
 		}
 	}
@@ -243,23 +313,34 @@ async fn sync_profile_pic_variant(
 	use cloudillo_file::sync::sync_file_variants;
 
 	tracing::debug!(
-		"Syncing profile picture variant 'vis.pf' for {} (file_id: {})",
+		"Syncing profile picture variant '{}' for {} (file_id: {})",
+		PROFILE_PIC_VARIANT,
 		id_tag,
 		file_id
 	);
 
-	// Sync only the 'vis.pf' variant for profile pictures (public, no auth needed)
-	let result =
-		sync_file_variants(app, tn_id, id_tag, file_id, Some(&["vis.pf"]), false, None).await?;
+	// Sync only the profile-picture variant (public, no auth needed)
+	let result = sync_file_variants(
+		app,
+		tn_id,
+		id_tag,
+		file_id,
+		Some(&[PROFILE_PIC_VARIANT]),
+		false,
+		None,
+		false,
+	)
+	.await?;
 
-	// Check if vis.pf was specifically synced or skipped (already exists)
-	let vis_pf_synced = result.synced_variants.iter().any(|v| v == "vis.pf");
-	let vis_pf_skipped = result.skipped_variants.iter().any(|v| v == "vis.pf");
-	let vis_pf_failed = result.failed_variants.iter().any(|v| v == "vis.pf");
+	// Check if it was specifically synced or skipped (already exists).
+	// Failure cases short-circuit via `?` above (sync_file_variants is atomic).
+	let vis_pf_synced = result.synced_variants.iter().any(|v| v == PROFILE_PIC_VARIANT);
+	let vis_pf_skipped = result.skipped_variants.iter().any(|v| v == PROFILE_PIC_VARIANT);
 
 	if vis_pf_synced {
 		tracing::info!(
-			"Synced profile picture variant 'vis.pf' for {} (file_id: {})",
+			"Synced profile picture variant '{}' for {} (file_id: {})",
+			PROFILE_PIC_VARIANT,
 			id_tag,
 			file_id
 		);
@@ -277,22 +358,17 @@ async fn sync_profile_pic_variant(
 		Ok(())
 	} else if vis_pf_skipped {
 		tracing::debug!(
-			"Profile picture variant 'vis.pf' already exists for {} (file_id: {})",
+			"Profile picture variant '{}' already exists for {} (file_id: {})",
+			PROFILE_PIC_VARIANT,
 			id_tag,
 			file_id
 		);
 		Ok(())
-	} else if vis_pf_failed {
-		tracing::warn!(
-			"Failed to sync profile picture variant 'vis.pf' for {} (file_id: {})",
-			id_tag,
-			file_id
-		);
-		Err(Error::NetworkError("vis.pf variant sync failed".into()))
 	} else {
-		// vis.pf wasn't in synced, skipped, or failed - means it doesn't exist in the descriptor
+		// Wasn't in synced, skipped, or failed → not present in the descriptor.
 		tracing::warn!(
-			"No 'vis.pf' variant found in descriptor for profile picture {} (file_id: {})",
+			"No '{}' variant found in descriptor for profile picture {} (file_id: {})",
+			PROFILE_PIC_VARIANT,
 			id_tag,
 			file_id
 		);
@@ -331,7 +407,11 @@ impl Task<App> for ProfileRefreshBatchTask {
 		// Query stale profiles
 		let stale_profiles = app
 			.meta_adapter
-			.list_stale_profiles(STALE_PROFILE_THRESHOLD_SECS, BATCH_SIZE)
+			.list_stale_profiles(
+				STALE_PROFILE_THRESHOLD_SECS,
+				DISABLE_REFRESH_AFTER_DAYS * SECS_PER_DAY,
+				BATCH_SIZE,
+			)
 			.await?;
 
 		let total = stale_profiles.len();

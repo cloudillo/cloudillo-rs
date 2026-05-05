@@ -12,6 +12,24 @@ use cloudillo_types::meta_adapter::{
 };
 use cloudillo_types::prelude::*;
 
+/// Parse the `status` CHAR(1) column into a `ProfileStatus` value.
+fn parse_status(row: &sqlx::sqlite::SqliteRow) -> Result<Option<ProfileStatus>, sqlx::Error> {
+	let raw: Option<String> = row.try_get("status")?;
+	Ok(match raw.as_deref() {
+		Some("A") => Some(ProfileStatus::Active),
+		Some("T") => Some(ProfileStatus::Trusted),
+		Some("B") => Some(ProfileStatus::Blocked),
+		Some("M") => Some(ProfileStatus::Muted),
+		Some("S") => Some(ProfileStatus::Suspended),
+		Some("X") => Some(ProfileStatus::Banned),
+		Some(other) => {
+			warn!("Unknown profile status code: {:?}", other);
+			None
+		}
+		None => None,
+	})
+}
+
 /// Parse connected column value to ProfileConnectionStatus
 /// Handles both TEXT ("0", "R", "1") and INTEGER (0, 1) values from SQLite
 fn parse_connected(row: &sqlx::sqlite::SqliteRow) -> ProfileConnectionStatus {
@@ -102,7 +120,7 @@ pub(crate) async fn list(
 	opts: &ListProfileOptions,
 ) -> ClResult<Vec<Profile<Box<str>>>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT id_tag, name, type, profile_pic, following, connected, roles, trust
+		"SELECT id_tag, name, type, profile_pic, status, synced_at, following, connected, roles, trust
 		 FROM profiles WHERE type IS NOT NULL AND tn_id=",
 	);
 	query.push_bind(tn_id.0);
@@ -196,6 +214,8 @@ pub(crate) async fn list(
 			name: row.try_get("name")?,
 			typ,
 			profile_pic: row.try_get("profile_pic")?,
+			status: parse_status(row)?,
+			synced_at: row.try_get::<Option<i64>, _>("synced_at")?.map(Timestamp),
 			following: row.try_get("following")?,
 			connected: parse_connected(row),
 			roles: row.try_get::<Option<String>, _>("roles")?.map(|s| {
@@ -260,7 +280,7 @@ pub(crate) async fn read(
 	id_tag: &str,
 ) -> ClResult<(Box<str>, Profile<Box<str>>)> {
 	let res = sqlx::query(
-		"SELECT id_tag, type, name, profile_pic, status, perm, following, connected, roles, trust, etag
+		"SELECT id_tag, type, name, profile_pic, status, synced_at, perm, following, connected, roles, trust, etag
 		FROM profiles WHERE tn_id=? AND id_tag=?",
 	)
 	.bind(tn_id.0)
@@ -282,6 +302,8 @@ pub(crate) async fn read(
 			typ,
 			name: row.try_get("name")?,
 			profile_pic: row.try_get("profile_pic")?,
+			status: parse_status(&row)?,
+			synced_at: row.try_get::<Option<i64>, _>("synced_at")?.map(Timestamp),
 			following: row.try_get("following")?,
 			connected: parse_connected(&row),
 			roles: row.try_get::<Option<String>, _>("roles")?.map(|s| {
@@ -518,18 +540,29 @@ pub(crate) async fn add_public_key(
 
 /// List stale profiles that need refreshing
 ///
-/// Returns profiles where `synced_at IS NULL OR synced_at < now - max_age_secs`.
+/// Returns profiles where:
+/// - `synced_at IS NULL` (never-synced stub rows from relationship hooks), OR
+/// - `synced_at < now - max_age_secs` AND `synced_at >= now - disable_after_secs`
+///   (stale but not yet abandoned).
+///
+/// The upper bound is the "give up" cutoff: once a remote has been unreachable
+/// for longer than `disable_after_secs`, we stop hammering it from the batch
+/// task. The row stays in the DB and remains visible; manual reactivation
+/// (or a future explicit refresh endpoint) is required.
 pub(crate) async fn list_stale_profiles(
 	db: &SqlitePool,
 	max_age_secs: i64,
+	disable_after_secs: i64,
 	limit: u32,
 ) -> ClResult<Vec<(TnId, Box<str>, Option<Box<str>>)>> {
 	let rows = sqlx::query(
 		"SELECT tn_id, id_tag, etag FROM profiles
-		WHERE synced_at IS NULL OR synced_at < unixepoch() - ?1
-		LIMIT ?2",
+		WHERE (synced_at IS NULL OR synced_at < unixepoch() - ?1)
+		  AND (synced_at IS NULL OR synced_at >= unixepoch() - ?2)
+		LIMIT ?3",
 	)
 	.bind(max_age_secs)
+	.bind(disable_after_secs)
 	.bind(limit)
 	.fetch_all(db)
 	.await
@@ -551,7 +584,7 @@ pub(crate) async fn list_stale_profiles(
 /// Get profile info
 pub(crate) async fn get_info(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClResult<ProfileData> {
 	let row = sqlx::query(
-		"SELECT id_tag, name, type, profile_pic, created_at
+		"SELECT id_tag, name, type, profile_pic, status, created_at
 		 FROM profiles WHERE tn_id = ? AND id_tag = ?",
 	)
 	.bind(tn_id.0)
@@ -567,12 +600,14 @@ pub(crate) async fn get_info(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClRe
 	let typ: Option<String> = row.try_get("type").map_err(|_| Error::DbError)?;
 	let typ = typ.ok_or(Error::NotFound)?;
 	let created_at: i64 = row.get("created_at");
+	let status = parse_status(&row).map_err(|_| Error::DbError)?.map(|s| s.as_str().into());
 
 	Ok(ProfileData {
 		id_tag: row.get("id_tag"),
 		name: row.get("name"),
 		r#type: typ.into(),
 		profile_pic: row.get("profile_pic"),
+		status,
 		created_at: Timestamp(created_at),
 	})
 }

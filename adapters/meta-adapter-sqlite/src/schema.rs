@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 24;
+	const CURRENT_DB_VERSION: i64 = 25;
 
 	let mut tx = db.begin().await?;
 
@@ -285,8 +285,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			reactions text,
 			comments integer,
 			comments_read integer,
-			visibility char(1),				-- NULL: Direct (owner only), P: Public, V: Verified,
-											-- 2: 2nd degree, F: Follower, C: Connected
+			visibility char(1) NOT NULL DEFAULT 'D',	-- D: Direct (owner only), P: Public, V: Verified,
+														-- 2: 2nd degree, F: Follower, C: Connected
 			flags text,						-- Action flags: R/r (reactions), C/c (comments), O/o (open)
 			x json,
 			created_at INTEGER DEFAULT (unixepoch()),
@@ -1605,6 +1605,19 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("DROP TABLE IF EXISTS collections").execute(&mut *tx).await?;
 
 		set_db_version(&mut tx, 24).await;
+	}
+
+	// Version 25: migrate actions.visibility NULL → 'D'.
+	// Storage now uses 'D' for Direct uniformly; ActionView still maps 'D'
+	// back to None at the SQL adapter boundary, so the wire/token format
+	// is unchanged. NOT NULL is enforced for fresh DBs (CREATE TABLE) and
+	// upheld by write-path discipline on existing DBs.
+	if version < 25 {
+		sqlx::query("UPDATE actions SET visibility = 'D' WHERE visibility IS NULL")
+			.execute(&mut *tx)
+			.await?;
+
+		set_db_version(&mut tx, 25).await;
 	}
 
 	tx.commit().await?;

@@ -128,6 +128,49 @@ pub async fn process_after_store(
 		try_auto_approve(app, tn_id, action).await;
 	}
 
+	// 6. Sync involved profiles for inbound actions. ensure_profile early-returns
+	// when the profile already exists, so this is a no-op for known peers.
+	// Spawned to keep the inbound pipeline off the remote /me round-trip.
+	//
+	// Why both issuer and audience: bridged actions arrive with strangers as
+	// issuer (e.g. a 3rd-party POST forwarded via a tenant's APRV — the tenant
+	// is known locally but the original author isn't). Audience is included
+	// for completeness when a federated action carries a non-self audience
+	// not covered by CONN/FLLW hooks.
+	if ctx.is_inbound() {
+		let tenant_tag: Option<Box<str>> =
+			app.meta_adapter.read_tenant(tn_id).await.ok().map(|t| t.id_tag);
+
+		let mut targets: Vec<Box<str>> = Vec::new();
+		if tenant_tag.as_deref().map(AsRef::as_ref) != Some(action.issuer_tag.as_ref()) {
+			targets.push(action.issuer_tag.clone());
+		}
+		if let Some(aud) = action.audience_tag.as_ref()
+			&& tenant_tag.as_deref().map(AsRef::as_ref) != Some(aud.as_ref())
+			&& !targets.iter().any(|t| t.as_ref() == aud.as_ref())
+		{
+			targets.push(aud.clone());
+		}
+
+		if !targets.is_empty() {
+			let app_ref = app.clone();
+			tokio::spawn(async move {
+				let ensure = match app_ref.ext::<cloudillo_core::EnsureProfileFn>() {
+					Ok(f) => f,
+					Err(e) => {
+						debug!(error = %e, "ensure_profile (inbound): extension not registered");
+						return;
+					}
+				};
+				for id_tag in targets {
+					if let Err(e) = ensure(&app_ref, tn_id, &id_tag).await {
+						debug!(id_tag = %id_tag, error = %e, "ensure_profile (inbound) failed");
+					}
+				}
+			});
+		}
+	}
+
 	Ok(result)
 }
 

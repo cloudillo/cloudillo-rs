@@ -27,7 +27,7 @@ pub enum ProfileType {
 	Community,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProfileStatus {
 	#[serde(rename = "A")]
 	Active,
@@ -41,6 +41,20 @@ pub enum ProfileStatus {
 	Suspended,
 	#[serde(rename = "X")]
 	Banned,
+}
+
+impl ProfileStatus {
+	/// Lowercase string form for JSON DTO exposure to the frontend.
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			ProfileStatus::Active => "active",
+			ProfileStatus::Trusted => "trusted",
+			ProfileStatus::Blocked => "blocked",
+			ProfileStatus::Muted => "muted",
+			ProfileStatus::Suspended => "suspended",
+			ProfileStatus::Banned => "banned",
+		}
+	}
 }
 
 /// Per-profile proxy-token preference for passive reads of a remote profile's content.
@@ -185,6 +199,8 @@ pub struct Profile<S: AsRef<str>> {
 	pub name: S,
 	pub typ: ProfileType,
 	pub profile_pic: Option<S>,
+	pub status: Option<ProfileStatus>,
+	pub synced_at: Option<Timestamp>,
 	pub following: bool,
 	pub connected: ProfileConnectionStatus,
 	pub roles: Option<Box<[Box<str>]>>,
@@ -215,6 +231,9 @@ pub struct ProfileData {
 	#[serde(rename = "type")]
 	pub r#type: Box<str>, // "person" or "community"
 	pub profile_pic: Option<Box<str>>,
+	/// Federation lifecycle: "active" | "trusted" | "suspended" | "blocked" | "muted" | "banned"
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub status: Option<Box<str>>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 }
@@ -345,6 +364,7 @@ pub struct UpdateActionDataOptions {
 	pub content: Patch<String>,
 	pub attachments: Patch<String>, // Comma-separated list of attachment IDs
 	pub flags: Patch<String>,
+	pub sub_typ: Patch<String>,
 	pub created_at: Patch<Timestamp>,
 }
 
@@ -367,6 +387,18 @@ where
 	if values.is_empty() { Ok(None) } else { Ok(Some(values)) }
 }
 
+/// Audience filter axis: classify actions by the **type of the effective wall
+/// owner** (`coalesce(audience, issuer_tag)` joined to `profiles.type`).
+/// `Personal` matches `pa.type='P'` (with NULL→Personal fallback for unknown
+/// remote profiles). `Community` matches `pa.type='C'`.
+/// Combines with `audience` (specific community) as AND.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudienceType {
+	Personal,
+	Community,
+}
+
 /// Options for listing actions
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -386,9 +418,12 @@ pub struct ListActionOptions {
 	pub status: Option<Vec<String>>,
 	pub tag: Option<String>,
 	pub search: Option<String>,
-	pub visibility: Option<char>,
+	#[serde(default, deserialize_with = "deserialize_split")]
+	pub visibility: Option<Vec<String>>,
 	pub issuer: Option<String>,
 	pub audience: Option<String>,
+	#[serde(rename = "audienceType")]
+	pub audience_type: Option<AudienceType>,
 	pub involved: Option<String>,
 	/// The authenticated user's id_tag (set by handler, not from query params)
 	#[serde(skip)]
@@ -460,6 +495,7 @@ pub struct ActionView {
 	pub content: Option<serde_json::Value>,
 	pub attachments: Option<Vec<AttachmentView>>,
 	pub subject: Option<Box<str>>,
+	pub subject_profile: Option<ProfileInfo>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
@@ -580,12 +616,11 @@ impl<S: AsRef<str> + Debug + Ord> PartialOrd for FileVariant<S> {
 
 impl<S: AsRef<str> + Debug + Ord> Ord for FileVariant<S> {
 	fn cmp(&self, other: &Self) -> Ordering {
-		//info!("cmp: {:?} vs {:?}", self, other);
 		self.size
 			.cmp(&other.size)
 			.then_with(|| self.resolution.0.cmp(&other.resolution.0))
 			.then_with(|| self.resolution.1.cmp(&other.resolution.1))
-			.then_with(|| self.size.cmp(&other.size))
+			.then_with(|| self.variant.as_ref().cmp(other.variant.as_ref()))
 	}
 }
 
@@ -1140,11 +1175,18 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	) -> ClResult<()>;
 	/// List stale profiles that need refreshing
 	///
-	/// Returns profiles where `synced_at IS NULL OR synced_at < now - max_age_secs`.
+	/// Returns profiles where:
+	/// - `synced_at IS NULL` (never synced — always eligible), OR
+	/// - `synced_at < now - max_age_secs` AND `synced_at >= now - disable_after_secs`
+	///   (stale but not yet abandoned).
+	///
+	/// Profiles with `synced_at < now - disable_after_secs` are excluded so the
+	/// refresh batch stops attempting persistently failing remotes.
 	/// Returns `Vec<(tn_id, id_tag, etag)>` tuples for conditional refresh requests.
 	async fn list_stale_profiles(
 		&self,
 		max_age_secs: i64,
+		disable_after_secs: i64,
 		limit: u32,
 	) -> ClResult<Vec<(TnId, Box<str>, Option<Box<str>>)>>;
 
@@ -1815,6 +1857,54 @@ mod tests {
 		let statuses = opts.status.expect("status should be Some");
 		assert_eq!(statuses.len(), 1);
 		assert_eq!(statuses[0].as_str(), "C");
+	}
+
+	#[test]
+	fn test_deserialize_list_action_options_audience_type() {
+		let opts: ListActionOptions = serde_urlencoded::from_str("audienceType=personal")
+			.expect("should deserialize personal");
+		assert!(matches!(opts.audience_type, Some(AudienceType::Personal)));
+
+		let opts: ListActionOptions = serde_urlencoded::from_str("audienceType=community")
+			.expect("should deserialize community");
+		assert!(matches!(opts.audience_type, Some(AudienceType::Community)));
+
+		let opts: ListActionOptions =
+			serde_urlencoded::from_str("issuer=alice").expect("should deserialize");
+		assert!(opts.audience_type.is_none());
+
+		let res: Result<ListActionOptions, _> = serde_urlencoded::from_str("audienceType=garbage");
+		assert!(res.is_err(), "garbage audienceType should error");
+	}
+
+	#[test]
+	fn test_deserialize_list_action_options_multi_visibility() {
+		let opts: ListActionOptions =
+			serde_urlencoded::from_str("visibility=F,C").expect("should deserialize");
+		let v = opts.visibility.expect("visibility should be Some");
+		assert_eq!(v.len(), 2);
+		assert_eq!(v[0].as_str(), "F");
+		assert_eq!(v[1].as_str(), "C");
+
+		let opts: ListActionOptions =
+			serde_urlencoded::from_str("visibility=P").expect("should deserialize");
+		let v = opts.visibility.expect("visibility should be Some");
+		assert_eq!(v.len(), 1);
+		assert_eq!(v[0].as_str(), "P");
+
+		let opts: ListActionOptions =
+			serde_urlencoded::from_str("issuer=alice").expect("should deserialize");
+		assert!(opts.visibility.is_none());
+	}
+
+	#[test]
+	fn test_deserialize_list_action_options_visibility_with_direct() {
+		let opts: ListActionOptions =
+			serde_urlencoded::from_str("visibility=D,F").expect("should deserialize");
+		let v = opts.visibility.expect("visibility should be Some");
+		assert_eq!(v.len(), 2);
+		assert_eq!(v[0].as_str(), "D");
+		assert_eq!(v[1].as_str(), "F");
 	}
 }
 

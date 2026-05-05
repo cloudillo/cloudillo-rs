@@ -7,10 +7,17 @@ use sqlx::{Row, SqlitePool};
 
 use crate::utils::{collect_res, escape_like, inspect, map_res, parse_str_list, push_in};
 use cloudillo_types::meta_adapter::{
-	Action, ActionData, ActionId, ActionView, AttachmentView, FinalizeActionOptions,
+	Action, ActionData, ActionId, ActionView, AttachmentView, AudienceType, FinalizeActionOptions,
 	ListActionOptions, ProfileInfo, ProfileType, UpdateActionDataOptions,
 };
 use cloudillo_types::prelude::*;
+
+/// Map a DB visibility column value to the ActionView representation.
+/// Storage uses 'D' for Direct uniformly; ActionView treats Direct as None to
+/// keep the wire/token format unchanged.
+fn db_visibility_to_action(s: Option<String>) -> Option<char> {
+	s.and_then(|s| s.chars().next()).filter(|c| *c != 'D')
+}
 
 /// List actions with filtering options
 pub(crate) async fn list(
@@ -22,12 +29,16 @@ pub(crate) async fn list(
 		"SELECT DISTINCT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
 		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
-		a.subject, a.content, a.created_at, a.expires_at,
+		a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
+		a.content, a.created_at, a.expires_at,
 		own.sub_type as own_reaction,
 		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
 		FROM actions a
 		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
-		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
+		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
+		LEFT JOIN profiles ps ON ps.tn_id=a.tn_id
+			AND a.subject LIKE '@%'
+			AND ps.id_tag = substr(a.subject, 2)
 		LEFT JOIN tenants t ON t.tn_id=a.tn_id
 		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.subject=a.action_id AND own.issuer_tag=t.id_tag
 			AND own.type='REACT' AND own.sub_type!='DEL' AND coalesce(own.status, 'A') NOT IN ('D')
@@ -39,7 +50,13 @@ pub(crate) async fn list(
 		query.push(" AND coalesce(a.status, 'A') IN ");
 		query = push_in(query, status);
 	} else {
-		query.push(" AND coalesce(a.status, 'A') NOT IN ('D')");
+		// Default: hide deleted ('D'), inbound-verifying ('V'), and permanently
+		// failed ('F') rows. 'V' covers inbound actions whose attachment sync
+		// hasn't finished — surfacing them would expose half-synced posts and
+		// break the descriptor-hash invariant for downstream peers fetching
+		// attachments. 'F' is the terminal state for verifier tasks that
+		// exhausted retries.
+		query.push(" AND coalesce(a.status, 'A') NOT IN ('D', 'V', 'F')");
 	}
 	if let Some(typ) = &opts.typ {
 		query.push(" AND a.type IN ");
@@ -49,7 +66,31 @@ pub(crate) async fn list(
 		query.push(" AND a.issuer_tag=").push_bind(issuer);
 	}
 	if let Some(audience) = &opts.audience {
-		query.push(" AND a.audience=").push_bind(audience);
+		// `audience IS NULL` means "on the issuer's wall" by codebase convention
+		// (see helpers::effective_audience). Match the same semantics here so
+		// callers asking "show me actions on T's wall" get both T's own rows
+		// and 3rd-party rows explicitly addressed to T (the audience-bridge
+		// case used by federation history sync).
+		query.push(" AND coalesce(a.audience, a.issuer_tag)=").push_bind(audience);
+	}
+	if let Some(audience_type) = opts.audience_type {
+		// Filter on the type of the *effective audience* profile (i.e., the
+		// profile whose wall the action lives on). `pa` is joined on
+		// `coalesce(audience, issuer_tag)`, so this works both for explicitly
+		// addressed actions and for actions on the issuer's own wall. Both
+		// branches are strict on `pa.type`: unknown remote profiles (no `pa`
+		// row, e.g. cross-tenant observer never synced locally) are excluded
+		// from both filters rather than guessed-as-Personal — callers asking
+		// for a specific audience type get only confirmed matches, and the
+		// profile sync flow is the right place to populate `pa`.
+		match audience_type {
+			AudienceType::Personal => {
+				query.push(" AND pa.type='P'");
+			}
+			AudienceType::Community => {
+				query.push(" AND pa.type='C'");
+			}
+		}
 	}
 	if let Some(involved) = &opts.involved {
 		if let Some(viewer) = &opts.viewer_id_tag {
@@ -107,12 +148,11 @@ pub(crate) async fn list(
 			.push_bind(format!("%{}%", escape_like(search)))
 			.push(" ESCAPE '\\'");
 	}
-	if let Some(visibility) = &opts.visibility {
-		if *visibility == 'D' {
-			query.push(" AND a.visibility IS NULL");
-		} else {
-			query.push(" AND a.visibility=").push_bind(visibility.to_string());
-		}
+	if let Some(visibility) = &opts.visibility
+		&& !visibility.is_empty()
+	{
+		query.push(" AND a.visibility IN ");
+		query = push_in(query, visibility);
 	}
 	if let Some(action_id) = &opts.action_id {
 		// Handle both @{a_id} placeholders and real action_ids
@@ -286,7 +326,7 @@ pub(crate) async fn list(
 		}
 		let stat = Some(stat_obj);
 		let visibility: Option<String> = row.try_get("visibility").ok();
-		let visibility = visibility.and_then(|s| s.chars().next());
+		let visibility = db_visibility_to_action(visibility);
 		actions.push(ActionView {
 			action_id,
 			typ: row.try_get::<Box<str>, _>("type").map_err(|_| Error::DbError)?,
@@ -330,6 +370,29 @@ pub(crate) async fn list(
 				None
 			},
 			subject: row.try_get("subject").map_err(|_| Error::DbError)?,
+			subject_profile: match row
+				.try_get::<Option<Box<str>>, _>("subject_id_tag")
+				.map_err(|_| Error::DbError)?
+			{
+				Some(id_tag) => Some(ProfileInfo {
+					id_tag,
+					name: row
+						.try_get::<Option<Box<str>>, _>("subject_name")
+						.map_err(|_| Error::DbError)?
+						.unwrap_or_else(|| "Unknown".into()),
+					typ: match row
+						.try_get::<Option<&str>, _>("subject_type")
+						.map_err(|_| Error::DbError)?
+					{
+						Some("C") => ProfileType::Community,
+						_ => ProfileType::Person,
+					},
+					profile_pic: row
+						.try_get::<Option<Box<str>>, _>("subject_profile_pic")
+						.map_err(|_| Error::DbError)?,
+				}),
+				None => None,
+			},
 			content: row
 				.try_get::<Option<String>, _>("content")
 				.map_err(|_| Error::DbError)?
@@ -371,7 +434,10 @@ pub(crate) async fn list_tokens(
 		query.push(" AND coalesce(a.status, 'A') IN ");
 		query = push_in(query, status);
 	} else {
-		query.push(" AND coalesce(a.status, 'A') NOT IN ('D')");
+		// Same default as list_actions: hide 'D', 'V' (inbound verifying) and
+		// 'F' (terminal failure) so peers polling the outbox never see
+		// half-finished inbound actions.
+		query.push(" AND coalesce(a.status, 'A') NOT IN ('D', 'V', 'F')");
 	}
 
 	if let Some(typ) = &opts.typ {
@@ -441,7 +507,11 @@ pub(crate) async fn create(
 	}
 
 	let status = "P";
-	let visibility = action.visibility.map(|c| c.to_string());
+	// Storage uses 'D' for Direct uniformly; ActionView still maps 'D' → None at
+	// the read-side boundary, keeping the wire/token format unchanged.
+	// Never write NULL here — migration 25 (schema.rs) backfilled NULLs to 'D'
+	// and the fresh-DB schema declares the column NOT NULL DEFAULT 'D'.
+	let visibility = action.visibility.unwrap_or('D').to_string();
 	let x_json = action.x.as_ref().and_then(|v| serde_json::to_string(v).ok());
 	let res = sqlx::query(
 		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, expires_at, attachments, status, visibility, flags, x)
@@ -729,7 +799,7 @@ pub(crate) async fn get_by_key(
 			let attachments_str: Option<Box<str>> = row.try_get("attachments").ok();
 			let attachments = attachments_str.map(|s| parse_str_list(&s).to_vec());
 			let visibility: Option<String> = row.try_get("visibility").ok();
-			let visibility = visibility.and_then(|s| s.chars().next());
+			let visibility = db_visibility_to_action(visibility);
 
 			Ok(Some(Action {
 				action_id: row.try_get("action_id").map_err(|_| Error::DbError)?,
@@ -842,6 +912,9 @@ pub(crate) async fn update_data(
 	if !opts.flags.is_undefined() {
 		set_clauses.push("flags = ?");
 	}
+	if !opts.sub_typ.is_undefined() {
+		set_clauses.push("sub_type = ?");
+	}
 	if !opts.created_at.is_undefined() {
 		set_clauses.push("created_at = ?");
 	}
@@ -908,9 +981,10 @@ pub(crate) async fn update_data(
 		query = query.bind(val);
 	}
 	if !opts.visibility.is_undefined() {
-		let val: Option<String> = match &opts.visibility {
-			Patch::Null => None,
-			Patch::Value(c) => Some(c.to_string()),
+		// 'D' (Direct) is the storage representation of None on the wire/Patch::Null.
+		let val: String = match &opts.visibility {
+			Patch::Null => "D".to_string(),
+			Patch::Value(c) => c.to_string(),
 			Patch::Undefined => unreachable!(),
 		};
 		query = query.bind(val);
@@ -941,6 +1015,14 @@ pub(crate) async fn update_data(
 	}
 	if !opts.flags.is_undefined() {
 		let val: Option<&str> = match &opts.flags {
+			Patch::Null => None,
+			Patch::Value(v) => Some(v.as_str()),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.sub_typ.is_undefined() {
+		let val: Option<&str> = match &opts.sub_typ {
 			Patch::Null => None,
 			Patch::Value(v) => Some(v.as_str()),
 			Patch::Undefined => unreachable!(),
@@ -1011,11 +1093,15 @@ pub(crate) async fn get(
 			"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
 			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
-			a.subject, a.content, a.created_at, a.expires_at,
+			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
+			a.content, a.created_at, a.expires_at,
 			a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
 			FROM actions a
 			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
-			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
+			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
+			LEFT JOIN profiles ps ON ps.tn_id=a.tn_id
+				AND a.subject LIKE '@%'
+				AND ps.id_tag = substr(a.subject, 2)
 			WHERE a.tn_id=? AND a.a_id=? AND coalesce(a.status, 'A') NOT IN ('D')",
 		)
 		.bind(tn_id.0)
@@ -1029,11 +1115,15 @@ pub(crate) async fn get(
 			"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
 			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
-			a.subject, a.content, a.created_at, a.expires_at,
+			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
+			a.content, a.created_at, a.expires_at,
 			a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
 			FROM actions a
 			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
-			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=a.audience
+			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
+			LEFT JOIN profiles ps ON ps.tn_id=a.tn_id
+				AND a.subject LIKE '@%'
+				AND ps.id_tag = substr(a.subject, 2)
 			WHERE a.tn_id=? AND a.action_id=? AND coalesce(a.status, 'A') NOT IN ('D')",
 		)
 		.bind(tn_id.0)
@@ -1126,7 +1216,7 @@ pub(crate) async fn get(
 	let stat = Some(stat_obj);
 
 	let visibility: Option<String> = row.try_get("visibility").ok();
-	let visibility = visibility.and_then(|s| s.chars().next());
+	let visibility = db_visibility_to_action(visibility);
 
 	// action_id might be NULL for draft/pending actions - use @{a_id} placeholder
 	let result_action_id: Box<str> = row
@@ -1182,6 +1272,29 @@ pub(crate) async fn get(
 			None
 		},
 		subject: row.try_get("subject").map_err(|_| Error::DbError)?,
+		subject_profile: match row
+			.try_get::<Option<Box<str>>, _>("subject_id_tag")
+			.map_err(|_| Error::DbError)?
+		{
+			Some(id_tag) => Some(ProfileInfo {
+				id_tag,
+				name: row
+					.try_get::<Option<Box<str>>, _>("subject_name")
+					.map_err(|_| Error::DbError)?
+					.unwrap_or_else(|| "Unknown".into()),
+				typ: match row
+					.try_get::<Option<&str>, _>("subject_type")
+					.map_err(|_| Error::DbError)?
+				{
+					Some("C") => ProfileType::Community,
+					_ => ProfileType::Person,
+				},
+				profile_pic: row
+					.try_get::<Option<Box<str>>, _>("subject_profile_pic")
+					.map_err(|_| Error::DbError)?,
+			}),
+			None => None,
+		},
 		content: row
 			.try_get::<Option<String>, _>("content")
 			.map_err(|_| Error::DbError)?
