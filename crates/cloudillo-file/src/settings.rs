@@ -20,6 +20,16 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Max streaming (video/audio/raw) upload size
+	registry.register(
+		SettingDefinition::builder("file.max_streaming_file_size_mb")
+			.description("Maximum streaming upload size in megabytes (video/audio/raw)")
+			.default(SettingValue::Int(100))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
 	// Maximum size variant to generate
 	registry.register(
 		SettingDefinition::builder("file.max_generate_variant")
@@ -67,6 +77,15 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.default(SettingValue::String("md".into()))
 			.scope(SettingScope::Tenant)
 			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("file.sync_variant_timeout_secs")
+			.description("Maximum seconds to spend streaming a single attachment variant before aborting (the task will retry)")
+			.default(SettingValue::Int(300))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::Admin)
 			.build()?,
 	)?;
 

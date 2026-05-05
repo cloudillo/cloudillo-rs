@@ -50,6 +50,26 @@ impl VariantClass {
 		}
 	}
 
+	/// Whether receivers should fetch the `orig` blob bytes when syncing a
+	/// file of this class.
+	///
+	/// Media classes (Visual / Video / Audio) keep `orig` as metadata-only on
+	/// receivers: the original is large, may not even be stored at the source
+	/// (`file.store_original_*` defaults to false), and the generated variants
+	/// (`tn`/`sd`/`md`/`hd`/`xd`) are what gets distributed.
+	///
+	/// Non-media classes carry their payload in `orig`, so receivers must
+	/// fetch it (Document = PDF, Raw = unprocessed binary).
+	///
+	/// Default is "sync orig"; media classes opt out. New classes added in
+	/// the future inherit the default unless they explicitly opt out here.
+	pub fn sync_orig(self) -> bool {
+		match self {
+			Self::Visual | Self::Video | Self::Audio => false,
+			Self::Document | Self::Raw => true,
+		}
+	}
+
 	/// Determine variant class from content-type MIME string
 	pub fn from_content_type(content_type: &str) -> Option<Self> {
 		match content_type {

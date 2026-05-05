@@ -7,12 +7,12 @@
 //! and profile picture synchronization.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::prelude::*;
-use crate::variant::{Variant, VariantClass};
-use cloudillo_types::blob_adapter::CreateBlobOptions;
+use crate::variant::{Variant, VariantClass, VariantQuality};
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter::{CreateFile, FileId, FileVariant};
 use cloudillo_types::types::ApiResponse;
@@ -33,7 +33,6 @@ pub struct SyncResult {
 	pub file_id: String,
 	pub synced_variants: Vec<String>,
 	pub skipped_variants: Vec<String>,
-	pub failed_variants: Vec<String>,
 }
 
 /// Variant size ordering for filtering by max_cache_variant setting
@@ -85,6 +84,21 @@ pub fn is_audience(tenant_tag: &str, audience_tag: Option<&str>) -> bool {
 	audience_tag.is_some_and(|aud| aud == tenant_tag)
 }
 
+/// Recover the file's primary variant class from a parsed descriptor.
+///
+/// The first parseable non-Original quality wins. A descriptor with only
+/// `orig` (e.g., a binary archive uploaded as Raw) defaults to `Raw`.
+fn primary_class(variants: &[cloudillo_types::meta_adapter::FileVariant<&str>]) -> VariantClass {
+	for v in variants {
+		if let Some(parsed) = Variant::parse(v.variant)
+			&& parsed.quality != VariantQuality::Original
+		{
+			return parsed.class;
+		}
+	}
+	VariantClass::Raw
+}
+
 /// Verify that content hash matches expected ID
 ///
 /// IDs are formatted as `prefix~hash` (e.g., `b1~abc123`, `f1~xyz789`, `d1~...`)
@@ -119,9 +133,14 @@ fn verify_content_hash(data: &[u8], expected_id: &str) -> ClResult<()> {
 /// * `variants` - Optional list of specific variants to sync (None = all up to max setting)
 /// * `auth` - Whether to use authenticated requests (true for direct-visibility files, false for public)
 /// * `visibility` - Visibility character to assign to a newly created file row (None → 'D')
+/// * `sync_all` - When true and `variants` is None, bypass the per-class
+///   `file.sync_max_*` settings filter and sync every variant on the remote
+///   descriptor. Used when the local tenant is the audience and acts as the
+///   canonical mirror for downstream followers.
 ///
 /// # Returns
 /// Ok(SyncResult) with details of what was synced
+#[allow(clippy::too_many_arguments)]
 pub async fn sync_file_variants(
 	app: &App,
 	tn_id: TnId,
@@ -130,10 +149,21 @@ pub async fn sync_file_variants(
 	variants: Option<&[&str]>,
 	auth: bool,
 	visibility: Option<char>,
+	sync_all: bool,
 ) -> ClResult<SyncResult> {
 	let mut result = SyncResult { file_id: file_id.to_string(), ..Default::default() };
 
 	debug!("Syncing file {} from {}", file_id, remote_id_tag);
+
+	let variant_timeout_secs = app
+		.settings
+		.get_int_opt(tn_id, "file.sync_variant_timeout_secs")
+		.await
+		.ok()
+		.flatten()
+		.and_then(|v| u64::try_from(v).ok())
+		.unwrap_or(300);
+	let variant_timeout = Duration::from_secs(variant_timeout_secs);
 
 	// 1. Fetch file descriptor from remote
 	let descriptor_path = format!("/files/{}/descriptor", file_id);
@@ -147,17 +177,39 @@ pub async fn sync_file_variants(
 	debug!("  fetched descriptor: {}", descriptor);
 
 	// 3. Parse descriptor to get variant info (parse first for debugging)
-	let mut parsed_variants = super::descriptor::parse_file_descriptor(descriptor)?;
+	let (root_id, mut parsed_variants) = super::descriptor::parse_file_descriptor(descriptor)?;
 
 	// 2. Verify descriptor hash matches file_id
 	if let Err(e) = verify_content_hash(descriptor.as_bytes(), file_id) {
-		// Generate local descriptor from parsed variants to compare
+		// Regenerate the descriptor from parsed pieces; if it differs from what we fetched,
+		// the source's canonicalizer disagrees with ours. If it matches, the source's variants
+		// table has drifted from what was hashed at finalize.
 		parsed_variants.sort();
-		let local_descriptor = super::descriptor::get_file_descriptor(&parsed_variants);
-		warn!(
-			"Descriptor hash mismatch for {}:\n  fetched:   {}\n  generated: {}\n  error: {}",
-			file_id, descriptor, local_descriptor, e
-		);
+		let local_descriptor = super::descriptor::get_file_descriptor(&parsed_variants, root_id);
+		let computed = hasher::hash("f", descriptor.as_bytes());
+		if local_descriptor == *descriptor {
+			warn!(
+				"Descriptor hash mismatch for {} (computed {}, {} bytes, source produced canonical form):\n  \
+				 fetched:   {}\n  error: {}",
+				file_id,
+				computed,
+				descriptor.len(),
+				descriptor,
+				e
+			);
+		} else {
+			warn!(
+				"Descriptor hash mismatch for {} (computed {}, fetched {} bytes / regenerated {} bytes — formats differ):\n  \
+				 fetched:    {}\n  regenerated: {}\n  error: {}",
+				file_id,
+				computed,
+				descriptor.len(),
+				local_descriptor.len(),
+				descriptor,
+				local_descriptor,
+				e
+			);
+		}
 		return Err(e);
 	}
 
@@ -166,12 +218,31 @@ pub async fn sync_file_variants(
 		return Ok(result);
 	}
 
+	// Look up the file's class so the audience/non-audience filters can ask
+	// `class.sync_orig()` whether the `orig` bytes should be fetched. The
+	// class itself owns this policy (Visual/Video/Audio opt out; Document/Raw
+	// keep the default).
+	let file_class = primary_class(&parsed_variants);
+	let fetch_orig_bytes = file_class.sync_orig();
+
 	// 4. Filter variants to sync using per-class settings
 	let variants_to_sync: Vec<_> = if let Some(explicit_variants) = variants {
 		// Explicit variant list provided - only sync those
 		parsed_variants
 			.iter()
 			.filter(|v| explicit_variants.contains(&v.variant))
+			.collect()
+	} else if sync_all {
+		// Audience role: act as the canonical descriptor mirror. Fetch blob
+		// bytes for every variant whose class is OK with it. Media classes
+		// declare `sync_orig() = false` so we skip `orig` byte fetch — the
+		// metadata row is still created below from the parsed descriptor.
+		parsed_variants
+			.iter()
+			.filter(|v| {
+				let q = Variant::parse(v.variant).map(|vp| vp.quality);
+				if q == Some(VariantQuality::Original) { fetch_orig_bytes } else { true }
+			})
 			.collect()
 	} else {
 		// Use per-class sync settings
@@ -200,15 +271,19 @@ pub async fn sync_file_variants(
 		parsed_variants
 			.iter()
 			.filter(|v| {
-				let class = Variant::parse(v.variant).map_or(VariantClass::Visual, |vp| vp.class);
+				let parsed = Variant::parse(v.variant);
 
-				// Doc/Raw always sync (no setting key)
+				// `orig`: defer to the file's class policy.
+				if parsed.map(|vp| vp.quality) == Some(VariantQuality::Original) {
+					return fetch_orig_bytes;
+				}
+
+				// Non-orig variants: existing per-class max-quality logic.
+				let class = parsed.map_or(VariantClass::Visual, |vp| vp.class);
 				let Some(max_variant) = class_max_variants.get(&class).map(String::as_str) else {
-					return true; // No limit = sync all
+					return true; // No setting key (Doc/Raw): sync all qualities.
 				};
-
-				let quality = Variant::parse(v.variant).map_or(v.variant, |vp| vp.quality.as_str());
-
+				let quality = parsed.map_or(v.variant, |vp| vp.quality.as_str());
 				should_sync_variant(quality, max_variant)
 			})
 			.collect()
@@ -317,6 +392,7 @@ pub async fn sync_file_variants(
 					variant_id,
 					variant_name,
 					auth,
+					variant_timeout,
 				)
 				.await
 				{
@@ -326,9 +402,14 @@ pub async fn sync_file_variants(
 						(size, true)
 					}
 					Err(e) => {
-						warn!("  failed to sync variant {}: {}", variant_name, e);
-						result.failed_variants.push(variant_name.to_string());
-						continue; // Skip creating record for failed fetches
+						// Atomic sync: any fetch failure aborts. The file row
+						// stays in status='P' and finalize_file is never reached.
+						// The caller (ActionVerifierTask) retries with exponential
+						// back-off; on the retry, variant_record_exists short-
+						// circuits already-synced variants and stat_blob short-
+						// circuits already-stored blobs.
+						warn!("  failed to sync variant {}: {} — aborting sync", variant_name, e);
+						return Err(e);
 					}
 				}
 			}
@@ -348,9 +429,9 @@ pub async fn sync_file_variants(
 				resolution: variant.resolution,
 				size: blob_size,
 				available,
-				duration: None,
-				bitrate: None,
-				page_count: None,
+				duration: variant.duration,
+				bitrate: variant.bitrate,
+				page_count: variant.page_count,
 			};
 
 			if let Err(e) = app.meta_adapter.create_file_variant(tn_id, f_id, file_variant).await {
@@ -369,11 +450,10 @@ pub async fn sync_file_variants(
 	}
 
 	info!(
-		"File sync complete for {}: {} synced, {} skipped, {} failed",
+		"File sync complete for {}: {} synced, {} skipped",
 		file_id,
 		result.synced_variants.len(),
 		result.skipped_variants.len(),
-		result.failed_variants.len()
 	);
 
 	Ok(result)
@@ -381,7 +461,12 @@ pub async fn sync_file_variants(
 
 /// Fetch a variant blob from remote and store it locally
 ///
-/// Returns the blob size on success
+/// Streams the response body straight to disk via `create_blob_stream`, so
+/// large attachments (video etc.) do not have to be buffered in memory and the
+/// 10s default body-collection timeout does not apply. The whole streaming
+/// operation is bounded by `timeout` to guard against stalled connections.
+///
+/// Returns the blob size on success.
 async fn fetch_and_store_blob(
 	app: &App,
 	tn_id: TnId,
@@ -389,31 +474,30 @@ async fn fetch_and_store_blob(
 	variant_id: &str,
 	variant_name: &str,
 	auth: bool,
+	timeout: Duration,
 ) -> ClResult<u64> {
 	let variant_path = format!("/files/variant/{}", variant_id);
-	let bytes = app.request.get_bin(tn_id, remote_id_tag, &variant_path, auth).await?;
+	let mut stream = app.request.get_stream(tn_id, remote_id_tag, &variant_path, auth).await?;
 
-	if bytes.is_empty() {
-		warn!("  variant {} returned empty data", variant_name);
-		return Err(Error::ValidationError("empty variant data".into()));
+	let store_res = tokio::time::timeout(
+		timeout,
+		app.blob_adapter.create_blob_stream(tn_id, variant_id, &mut stream),
+	)
+	.await
+	.map_err(|_| Error::Timeout)?;
+
+	if let Err(e) = &store_res
+		&& matches!(e, Error::ValidationError(_))
+	{
+		warn!("  variant {} hash mismatch or empty stream: {}", variant_name, e);
 	}
+	store_res?;
 
-	// Verify blob hash matches variant_id
-	verify_content_hash(&bytes, variant_id).map_err(|e| {
-		error!("  variant {} hash mismatch: {}", variant_name, e);
-		e
-	})?;
-
-	let blob_size = bytes.len() as u64;
-
-	// Store blob
-	app.blob_adapter
-		.create_blob_buf(tn_id, variant_id, &bytes, &CreateBlobOptions::default())
+	let blob_size = app
+		.blob_adapter
+		.stat_blob(tn_id, variant_id)
 		.await
-		.map_err(|e| {
-			warn!("  failed to store blob for variant {}: {}", variant_name, e);
-			e
-		})?;
+		.ok_or_else(|| Error::Internal("blob disappeared after streaming write".into()))?;
 
 	Ok(blob_size)
 }

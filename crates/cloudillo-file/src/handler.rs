@@ -11,7 +11,11 @@ use axum::{
 use futures_core::Stream;
 use serde::Deserialize;
 use serde_json::json;
-use std::{fmt::Debug, path::PathBuf, pin::Pin};
+use std::{
+	fmt::Debug,
+	path::{Path, PathBuf},
+	pin::Pin,
+};
 use tokio::io::AsyncWriteExt;
 
 use crate::prelude::*;
@@ -64,22 +68,68 @@ pub fn format_from_content_type(content_type: &str) -> Option<&str> {
 	})
 }
 
-/// Stream request body directly to a temp file (for large uploads)
-async fn stream_body_to_file(body: Body, path: &PathBuf) -> ClResult<u64> {
+/// Stream request body directly to a temp file (for large uploads).
+/// Hashes bytes inline so callers receive both the size and the orig blob id
+/// without re-reading the file from disk. Aborts and removes the partial file
+/// when the streamed bytes exceed `max_size_bytes`.
+async fn stream_body_to_file(
+	body: Body,
+	path: &PathBuf,
+	max_size_bytes: u64,
+) -> ClResult<(u64, Box<str>)> {
 	use futures::StreamExt;
 
 	let mut file = tokio::fs::File::create(path).await?;
 	let mut body_stream = body.into_data_stream();
 	let mut total_size: u64 = 0;
+	let mut hasher = hasher::Hasher::new();
 
 	while let Some(chunk) = body_stream.next().await {
 		let chunk = chunk.map_err(|e| Error::Internal(format!("body read error: {}", e)))?;
 		total_size += chunk.len() as u64;
+		if total_size > max_size_bytes {
+			drop(file);
+			let _ = tokio::fs::remove_file(path).await;
+			return Err(Error::ValidationError("upload exceeds maximum file size".into()));
+		}
+		hasher.update(&chunk);
 		file.write_all(&chunk).await?;
 	}
 	file.flush().await?;
 
-	Ok(total_size)
+	Ok((total_size, hasher.finalize("b").into_boxed_str()))
+}
+
+/// Best-effort RAII cleanup for streaming-upload temp files.
+/// On drop, spawns a remove_file task unless `keep()` was called.
+struct TempFileGuard(Option<PathBuf>);
+
+impl TempFileGuard {
+	fn new(p: PathBuf) -> Self {
+		Self(Some(p))
+	}
+
+	fn replace(&mut self, p: PathBuf) {
+		self.0 = Some(p);
+	}
+
+	fn keep(mut self) {
+		self.0 = None;
+	}
+}
+
+impl Drop for TempFileGuard {
+	fn drop(&mut self) {
+		if let Some(p) = self.0.take() {
+			tokio::spawn(async move {
+				if let Err(e) = tokio::fs::remove_file(&p).await
+					&& e.kind() != std::io::ErrorKind::NotFound
+				{
+					warn!("TempFileGuard cleanup failed for {:?}: {}", p, e);
+				}
+			});
+		}
+	}
 }
 
 pub fn content_type_from_format(format: &str) -> &str {
@@ -307,7 +357,9 @@ pub async fn get_file_variant_file_id(
 
 	let variant = descriptor::get_best_file_variant(&variants, &selector)?;
 	let stream = app.blob_adapter.read_blob_stream(tn_id, &variant.variant_id).await?;
-	let descriptor = descriptor::get_file_descriptor(&variants);
+
+	let root_id = app.meta_adapter.read_file(tn_id, &file_id).await?.and_then(|f| f.root_id);
+	let descriptor = descriptor::get_file_descriptor(&variants, root_id.as_deref());
 
 	serve_file(Some(&descriptor), variant, stream, app.opts.disable_cache)
 }
@@ -324,7 +376,8 @@ pub async fn get_file_descriptor(
 		.await?;
 	variants.sort();
 
-	let descriptor = descriptor::get_file_descriptor(&variants);
+	let root_id = app.meta_adapter.read_file(tn_id, &file_id).await?.and_then(|f| f.root_id);
+	let descriptor = descriptor::get_file_descriptor(&variants, root_id.as_deref());
 
 	let response = ApiResponse::new(descriptor).with_req_id(req_id.unwrap_or_default());
 
@@ -496,25 +549,23 @@ async fn handle_post_svg(
 	}))
 }
 
-/// Handle video upload - streams body to temp file, probes, creates transcode tasks
+/// Handle video upload - assumes body has already been streamed to `temp_path`
+/// and probed; always records the orig variant row so re-uploads dedup at
+/// `create_file` next time around.
+#[expect(clippy::too_many_arguments, reason = "video pipeline carries pre-computed inputs")]
 async fn handle_post_video_stream(
 	app: &App,
 	tn_id: types::TnId,
 	f_id: u64,
 	content_type: &str,
-	body: Body,
+	temp_path: &Path,
+	resolution: (u32, u32),
+	duration: f64,
+	orig_blob_id: &str,
+	blob_stored: bool,
+	total_size: u64,
 	preset: &preset::FilePreset,
 ) -> ClResult<serde_json::Value> {
-	// 1. Stream body directly to temp file (no memory buffering!)
-	let temp_path = app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
-	let total_size = stream_body_to_file(body, &temp_path).await?;
-	info!("Video upload streamed to {:?}, size: {} bytes", temp_path, total_size);
-
-	// 2. Probe with FFmpeg to get duration/resolution
-	let media_info = ffmpeg::FFmpeg::probe(&temp_path)
-		.map_err(|e| Error::Internal(format!("ffprobe failed: {}", e)))?;
-	let duration = media_info.duration;
-	let resolution = media_info.video_resolution().unwrap_or((0, 0));
 	info!("Video info: duration={:.2}s, resolution={}x{}", duration, resolution.0, resolution.1);
 
 	// Read max_generate_variant setting
@@ -526,33 +577,26 @@ async fn handle_post_video_stream(
 	let max_quality =
 		variant::parse_quality(&max_quality_str).unwrap_or(variant::VariantQuality::High);
 
-	// 3. Optionally store original variant (based on setting)
-	if app.settings.get_bool(tn_id, "file.store_original_vid").await.unwrap_or(false) {
-		let orig_blob_id = store::create_blob_from_file(
-			app,
+	// Always record the orig variant row so future re-uploads of identical
+	// content hit the dedup path in create_file. `available` reflects whether
+	// the blob bytes exist on disk for this tenant.
+	app.meta_adapter
+		.create_file_variant(
 			tn_id,
-			&temp_path,
-			blob_adapter::CreateBlobOptions::default(),
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: orig_blob_id,
+				variant: "orig",
+				format: format_from_content_type(content_type).unwrap_or("mp4"),
+				resolution,
+				size: total_size,
+				available: blob_stored,
+				duration: Some(duration),
+				bitrate: None,
+				page_count: None,
+			},
 		)
 		.await?;
-		app.meta_adapter
-			.create_file_variant(
-				tn_id,
-				f_id,
-				meta_adapter::FileVariant {
-					variant_id: &orig_blob_id,
-					variant: "orig",
-					format: format_from_content_type(content_type).unwrap_or("mp4"),
-					resolution,
-					size: total_size,
-					available: true,
-					duration: Some(duration),
-					bitrate: None,
-					page_count: None,
-				},
-			)
-			.await?;
-	}
 
 	// 4. Extract thumbnail synchronously (like images)
 	let frame_path = app.opts.tmp_dir.join(format!("frame_{}.jpg", f_id));
@@ -567,7 +611,7 @@ async fn handle_post_video_stream(
 	};
 
 	// Extract frame using FFmpeg
-	ffmpeg::FFmpeg::extract_frame(&temp_path, &frame_path, seek_time)
+	ffmpeg::FFmpeg::extract_frame(temp_path, &frame_path, seek_time)
 		.map_err(|e| Error::Internal(format!("thumbnail extraction failed: {}", e)))?;
 
 	// Read frame and resize to thumbnail (keep frame file for other vis.* variants)
@@ -652,7 +696,7 @@ async fn handle_post_video_stream(
 			let task = VideoTranscoderTask::new(
 				tn_id,
 				f_id,
-				temp_path.clone(),
+				temp_path.to_owned(),
 				variant_name.as_str(),
 				tier.max_dim,
 				tier.bitrate,
@@ -674,7 +718,7 @@ async fn handle_post_video_stream(
 				let task = AudioExtractorTask::new(
 					tn_id,
 					f_id,
-					temp_path.clone(),
+					temp_path.to_owned(),
 					variant_name.as_str(),
 					tier.bitrate,
 				);
@@ -701,24 +745,21 @@ async fn handle_post_video_stream(
 	}))
 }
 
-/// Handle audio upload - streams body to temp file, probes, creates transcode tasks
+/// Handle audio upload - assumes body has already been streamed to `temp_path`
+/// and probed; always records the orig variant row.
+#[expect(clippy::too_many_arguments, reason = "audio pipeline carries pre-computed inputs")]
 async fn handle_post_audio_stream(
 	app: &App,
 	tn_id: types::TnId,
 	f_id: u64,
 	content_type: &str,
-	body: Body,
+	temp_path: &Path,
+	duration: f64,
+	orig_blob_id: &str,
+	blob_stored: bool,
+	total_size: u64,
 	preset: &preset::FilePreset,
 ) -> ClResult<serde_json::Value> {
-	// 1. Stream body to temp file
-	let temp_path = app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
-	let total_size = stream_body_to_file(body, &temp_path).await?;
-	info!("Audio upload streamed to {:?}, size: {} bytes", temp_path, total_size);
-
-	// 2. Probe for duration
-	let media_info = ffmpeg::FFmpeg::probe(&temp_path)
-		.map_err(|e| Error::Internal(format!("ffprobe failed: {}", e)))?;
-	let duration = media_info.duration;
 	info!("Audio info: duration={:.2}s", duration);
 
 	// Read max_generate_variant setting
@@ -730,33 +771,24 @@ async fn handle_post_audio_stream(
 	let max_quality =
 		variant::parse_quality(&max_quality_str).unwrap_or(variant::VariantQuality::High);
 
-	// 3. Optionally store aud.orig
-	if app.settings.get_bool(tn_id, "file.store_original_aud").await.unwrap_or(false) {
-		let orig_blob_id = store::create_blob_from_file(
-			app,
+	// Always record the orig variant row.
+	app.meta_adapter
+		.create_file_variant(
 			tn_id,
-			&temp_path,
-			blob_adapter::CreateBlobOptions::default(),
+			f_id,
+			meta_adapter::FileVariant {
+				variant_id: orig_blob_id,
+				variant: "orig",
+				format: format_from_content_type(content_type).unwrap_or("mp3"),
+				resolution: (0, 0),
+				size: total_size,
+				available: blob_stored,
+				duration: Some(duration),
+				bitrate: None,
+				page_count: None,
+			},
 		)
 		.await?;
-		app.meta_adapter
-			.create_file_variant(
-				tn_id,
-				f_id,
-				meta_adapter::FileVariant {
-					variant_id: &orig_blob_id,
-					variant: "orig",
-					format: format_from_content_type(content_type).unwrap_or("mp3"),
-					resolution: (0, 0),
-					size: total_size,
-					available: true,
-					duration: Some(duration),
-					bitrate: None,
-					page_count: None,
-				},
-			)
-			.await?;
-	}
 
 	// 4. Create AudioExtractorTask for each variant
 	let mut task_ids = Vec::new();
@@ -771,7 +803,7 @@ async fn handle_post_audio_stream(
 			let task = AudioExtractorTask::new(
 				tn_id,
 				f_id,
-				temp_path.clone(),
+				temp_path.to_owned(),
 				variant_name.as_str(),
 				tier.bitrate,
 			);
@@ -849,27 +881,26 @@ async fn handle_post_pdf(
 	}))
 }
 
-/// Handle raw file upload - streams body to temp file, stores as-is
+/// Handle raw file upload - assumes body has already been streamed to `temp_path`
+/// with hash known; stores blob bytes (no re-hash) and records orig variant.
 async fn handle_post_raw_stream(
 	app: &App,
 	tn_id: types::TnId,
 	f_id: u64,
 	content_type: &str,
-	body: Body,
+	temp_path: &Path,
+	orig_blob_id: &str,
+	total_size: u64,
 ) -> ClResult<serde_json::Value> {
-	// 1. Stream body to temp file
-	let temp_path = app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
-	let total_size = stream_body_to_file(body, &temp_path).await?;
-	info!("Raw upload streamed to {:?}, size: {} bytes", temp_path, total_size);
-
-	// 2. Store original blob as raw.orig
-	let orig_blob_id = store::create_blob_from_file(
-		app,
-		tn_id,
-		&temp_path,
-		blob_adapter::CreateBlobOptions::default(),
-	)
-	.await?;
+	// Persist blob bytes from the temp file (hash already in scope).
+	app.blob_adapter
+		.create_blob_from_path(
+			tn_id,
+			orig_blob_id,
+			temp_path,
+			&blob_adapter::CreateBlobOptions::default(),
+		)
+		.await?;
 
 	// Determine format from content-type or use generic extension
 	let format = format_from_content_type(content_type).unwrap_or("bin");
@@ -879,7 +910,7 @@ async fn handle_post_raw_stream(
 			tn_id,
 			f_id,
 			meta_adapter::FileVariant {
-				variant_id: &orig_blob_id,
+				variant_id: orig_blob_id,
 				variant: "orig",
 				format,
 				resolution: (0, 0),
@@ -892,10 +923,10 @@ async fn handle_post_raw_stream(
 		)
 		.await?;
 
-	// 3. Clean up temp file
-	let _ = tokio::fs::remove_file(&temp_path).await;
+	// Clean up temp file
+	let _ = tokio::fs::remove_file(temp_path).await;
 
-	// 4. Create FileIdGeneratorTask (no variants, just the original)
+	// Create FileIdGeneratorTask (no variants, just the original)
 	app.scheduler
 		.task(FileIdGeneratorTask::new(tn_id, f_id))
 		.key(format!("{},{}", tn_id, f_id))
@@ -996,6 +1027,7 @@ pub async fn post_file_blob(
 	// Max file size constants (in MiB, using binary units)
 	const BYTES_PER_MIB: usize = 1_048_576; // 1024 * 1024
 	const DEFAULT_MAX_SIZE_MIB: i64 = 50;
+	const DEFAULT_MAX_STREAMING_SIZE_MIB: i64 = 100;
 
 	// Scope check: scoped tokens can only create children under the scoped root
 	file_access::check_scope_allows_create(auth.scope.as_deref(), query.root_id.as_deref())?;
@@ -1060,6 +1092,15 @@ pub async fn post_file_blob(
 		.max(1); // Ensure at least 1 MiB
 
 	let max_size_bytes = usize::try_from(max_size_mib).unwrap_or(50) * BYTES_PER_MIB;
+
+	let max_streaming_mib = app
+		.settings
+		.get_int(tn_id, "file.max_streaming_file_size_mb")
+		.await
+		.unwrap_or(DEFAULT_MAX_STREAMING_SIZE_MIB)
+		.max(1);
+	let max_streaming_bytes =
+		u64::try_from(max_streaming_mib).unwrap_or(100) * BYTES_PER_MIB as u64;
 
 	// 4. Route to handler - some need bytes (in-memory), some need streaming Body
 	match media_class {
@@ -1164,14 +1205,43 @@ pub async fn post_file_blob(
 			}
 		}
 
-		// Streaming to disk (large files) - create file metadata first, then stream
+		// Streaming to disk (large files) - stream first so we know the orig
+		// blob hash, then call create_file with `orig_variant_id` set so the
+		// existing dedup branch in the meta adapter catches re-uploads.
 		VariantClass::Video => {
+			let temp_token = utils::random_id()?;
+			let temp_path =
+				app.opts.tmp_dir.join(format!("upload_{}_pending_{}", tn_id.0, temp_token));
+			let (total_size, orig_blob_id) =
+				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
+			let mut temp_guard = TempFileGuard::new(temp_path.clone());
+			info!("Video upload streamed to {:?}, size: {} bytes", temp_path, total_size);
+
+			let media_info = ffmpeg::FFmpeg::probe(&temp_path)
+				.map_err(|e| Error::Internal(format!("ffprobe failed: {}", e)))?;
+			let resolution = media_info.video_resolution().unwrap_or((0, 0));
+			let duration = media_info.duration;
+
+			let blob_stored =
+				app.settings.get_bool(tn_id, "file.store_original_vid").await.unwrap_or(false);
+			if blob_stored {
+				app.blob_adapter
+					.create_blob_from_path(
+						tn_id,
+						&orig_blob_id,
+						&temp_path,
+						&blob_adapter::CreateBlobOptions::default(),
+					)
+					.await?;
+			}
+
 			let f_id = app
 				.meta_adapter
 				.create_file(
 					tn_id,
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
+						orig_variant_id: Some(orig_blob_id.clone()),
 						creator_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
@@ -1188,13 +1258,31 @@ pub async fn post_file_blob(
 
 			match f_id {
 				meta_adapter::FileId::FId(f_id) => {
-					let data =
-						handle_post_video_stream(&app, tn_id, f_id, content_type, body, &preset)
-							.await?;
+					let final_temp_path =
+						app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
+					tokio::fs::rename(&temp_path, &final_temp_path).await?;
+					temp_guard.replace(final_temp_path.clone());
+					let data = handle_post_video_stream(
+						&app,
+						tn_id,
+						f_id,
+						content_type,
+						&final_temp_path,
+						resolution,
+						duration,
+						&orig_blob_id,
+						blob_stored,
+						total_size,
+						&preset,
+					)
+					.await?;
+					// Transcode tasks consume the temp file; keep it past this request.
+					temp_guard.keep();
 					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 					Ok((StatusCode::CREATED, Json(response)))
 				}
 				meta_adapter::FileId::FileId(file_id) => {
+					// Dedup hit: keep relying on TempFileGuard's Drop to clean up.
 					let data = json!({"fileId": file_id});
 					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 					Ok((StatusCode::CREATED, Json(response)))
@@ -1203,12 +1291,38 @@ pub async fn post_file_blob(
 		}
 
 		VariantClass::Audio => {
+			let temp_token = utils::random_id()?;
+			let temp_path =
+				app.opts.tmp_dir.join(format!("upload_{}_pending_{}", tn_id.0, temp_token));
+			let (total_size, orig_blob_id) =
+				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
+			let mut temp_guard = TempFileGuard::new(temp_path.clone());
+			info!("Audio upload streamed to {:?}, size: {} bytes", temp_path, total_size);
+
+			let media_info = ffmpeg::FFmpeg::probe(&temp_path)
+				.map_err(|e| Error::Internal(format!("ffprobe failed: {}", e)))?;
+			let duration = media_info.duration;
+
+			let blob_stored =
+				app.settings.get_bool(tn_id, "file.store_original_aud").await.unwrap_or(false);
+			if blob_stored {
+				app.blob_adapter
+					.create_blob_from_path(
+						tn_id,
+						&orig_blob_id,
+						&temp_path,
+						&blob_adapter::CreateBlobOptions::default(),
+					)
+					.await?;
+			}
+
 			let f_id = app
 				.meta_adapter
 				.create_file(
 					tn_id,
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
+						orig_variant_id: Some(orig_blob_id.clone()),
 						creator_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
@@ -1225,13 +1339,30 @@ pub async fn post_file_blob(
 
 			match f_id {
 				meta_adapter::FileId::FId(f_id) => {
-					let data =
-						handle_post_audio_stream(&app, tn_id, f_id, content_type, body, &preset)
-							.await?;
+					let final_temp_path =
+						app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
+					tokio::fs::rename(&temp_path, &final_temp_path).await?;
+					temp_guard.replace(final_temp_path.clone());
+					let data = handle_post_audio_stream(
+						&app,
+						tn_id,
+						f_id,
+						content_type,
+						&final_temp_path,
+						duration,
+						&orig_blob_id,
+						blob_stored,
+						total_size,
+						&preset,
+					)
+					.await?;
+					// Audio extractor task consumes the temp file; keep it past this request.
+					temp_guard.keep();
 					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 					Ok((StatusCode::CREATED, Json(response)))
 				}
 				meta_adapter::FileId::FileId(file_id) => {
+					// Dedup hit: keep relying on TempFileGuard's Drop to clean up.
 					let data = json!({"fileId": file_id});
 					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 					Ok((StatusCode::CREATED, Json(response)))
@@ -1240,12 +1371,21 @@ pub async fn post_file_blob(
 		}
 
 		VariantClass::Raw => {
+			let temp_token = utils::random_id()?;
+			let temp_path =
+				app.opts.tmp_dir.join(format!("upload_{}_pending_{}", tn_id.0, temp_token));
+			let (total_size, orig_blob_id) =
+				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
+			let mut temp_guard = TempFileGuard::new(temp_path.clone());
+			info!("Raw upload streamed to {:?}, size: {} bytes", temp_path, total_size);
+
 			let f_id = app
 				.meta_adapter
 				.create_file(
 					tn_id,
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
+						orig_variant_id: Some(orig_blob_id.clone()),
 						creator_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
@@ -1262,12 +1402,28 @@ pub async fn post_file_blob(
 
 			match f_id {
 				meta_adapter::FileId::FId(f_id) => {
-					let data =
-						handle_post_raw_stream(&app, tn_id, f_id, content_type, body).await?;
+					let final_temp_path =
+						app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
+					tokio::fs::rename(&temp_path, &final_temp_path).await?;
+					temp_guard.replace(final_temp_path.clone());
+					let data = handle_post_raw_stream(
+						&app,
+						tn_id,
+						f_id,
+						content_type,
+						&final_temp_path,
+						&orig_blob_id,
+						total_size,
+					)
+					.await?;
+					// handle_post_raw_stream removed the temp file on success.
+					temp_guard.keep();
 					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 					Ok((StatusCode::CREATED, Json(response)))
 				}
 				meta_adapter::FileId::FileId(file_id) => {
+					let _ = tokio::fs::remove_file(&temp_path).await;
+					temp_guard.keep();
 					let data = json!({"fileId": file_id});
 					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 					Ok((StatusCode::CREATED, Json(response)))
@@ -1281,10 +1437,17 @@ pub async fn post_file_blob(
 pub async fn get_file_metadata(
 	State(app): State<App>,
 	tn_id: TnId,
+	OptionalAuth(maybe_auth): OptionalAuth,
 	extract::Path(file_id): extract::Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::FileView>>)> {
 	let file = app.meta_adapter.read_file(tn_id, &file_id).await?.ok_or(Error::NotFound)?;
+	// Defence in depth: never expose Direct-visibility metadata (creator tag,
+	// tags, x-extras) to an anonymous caller, even if the ABAC middleware was
+	// misconfigured. Federation sync supplies auth for Direct files.
+	if file.visibility.is_none() && maybe_auth.is_none() {
+		return Err(Error::NotFound);
+	}
 	Ok((StatusCode::OK, Json(ApiResponse::new(file).with_req_id(req_id.unwrap_or_default()))))
 }
 
