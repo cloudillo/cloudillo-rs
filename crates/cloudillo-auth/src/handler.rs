@@ -480,6 +480,15 @@ pub async fn get_access_token(
 				);
 				roles
 			}
+			Err(Error::NotFound) => {
+				// Stranger requesting a federated access token — no local
+				// profile, so no roles. Expected case in cross-instance flows.
+				debug!(
+					"No profile yet for {} in tn_id {:?}, issuing token without roles",
+					auth_action.iss, tn_id
+				);
+				None
+			}
 			Err(e) => {
 				warn!(
 					"Failed to read profile roles for {} in tn_id {:?}: {}",
@@ -509,7 +518,6 @@ pub async fn get_access_token(
 				},
 			)
 			.await?;
-		info!("Got access token: {}", &token_result);
 		let response = ApiResponse::new(json!({ "token": token_result }))
 			.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
@@ -672,7 +680,6 @@ pub async fn get_access_token(
 				},
 			)
 			.await?;
-		info!("Got access token from session: {}", &token_result);
 		let response = ApiResponse::new(json!({ "token": token_result }))
 			.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
@@ -715,7 +722,7 @@ pub async fn get_proxy_token(
 
 		info!("Getting federated proxy token for {} -> {}", &auth.id_tag, target_id_tag);
 
-		// Use federation flow: create action token and exchange at target
+		// Mint fresh on each call: clients want full TTL, cache is for server-to-server only.
 		let token = app.request.create_proxy_token(auth.tn_id, target_id_tag, None).await?;
 
 		let roles: Option<Vec<String>> = match decode_jwt_no_verify::<AccessTokenClaims>(&token) {

@@ -20,6 +20,7 @@ pub mod file_access;
 pub mod middleware;
 pub mod prelude;
 pub mod profile_visibility;
+pub mod proxy_token_cache;
 pub mod rate_limit;
 pub mod request;
 pub mod roles;
@@ -36,6 +37,7 @@ pub use app::{App, AppBuilderOpts, AppState, ServerMode};
 pub use extract::{Auth, IdTag, OptionalAuth};
 pub use middleware::{PermissionCheckFactory, PermissionCheckInput, PermissionCheckOutput};
 pub use profile_visibility::{CommunityRole, RequesterTier, SectionVisibility};
+pub use proxy_token_cache::ProxyTokenCache;
 pub use ws_broadcast::BroadcastManager;
 
 /// Type-erased function for verifying action tokens.

@@ -12,6 +12,7 @@ use std::{
 
 use crate::extensions::Extensions;
 use crate::prelude::*;
+use crate::proxy_token_cache::ProxyTokenCache;
 use crate::{abac, request, scheduler, ws_broadcast::BroadcastManager};
 
 use cloudillo_types::auth_adapter::AuthAdapter;
@@ -39,6 +40,7 @@ pub struct AppState {
 	pub scheduler: Arc<scheduler::Scheduler<App>>,
 	pub worker: Arc<worker::WorkerPool>,
 	pub request: request::Request,
+	pub proxy_tokens: Arc<ProxyTokenCache>,
 	pub acme_challenge_map: RwLock<HashMap<Box<str>, Box<str>>>,
 	pub certs: RwLock<HashMap<Box<str>, Arc<CertifiedKey>>>,
 	pub opts: AppBuilderOpts,

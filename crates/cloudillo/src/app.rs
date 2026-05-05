@@ -340,10 +340,13 @@ impl AppBuilder {
 			});
 		extensions.insert(on_first_cert_issued_fn);
 
+		let proxy_tokens = Arc::new(cloudillo_core::ProxyTokenCache::new());
+
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker,
-			request: request::Request::new(auth_adapter.clone())?,
+			request: request::Request::new(auth_adapter.clone(), proxy_tokens.clone())?,
+			proxy_tokens,
 			acme_challenge_map: std::sync::RwLock::new(std::collections::HashMap::new()),
 			certs: std::sync::RwLock::new(std::collections::HashMap::new()),
 			opts: self.opts,
