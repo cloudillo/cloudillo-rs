@@ -9,7 +9,7 @@ use cloudillo_core::scheduler::Task;
 use cloudillo_types::meta_adapter::{
 	ProfileConnectionStatus, ProfileStatus, ProfileType, UpsertProfileFields, UpsertResult,
 };
-use cloudillo_types::types::ApiResponse;
+use cloudillo_types::types::{ApiResponse, ProfileBase};
 
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
@@ -40,18 +40,6 @@ async fn local_profile_pic_present(app: &App, tn_id: TnId, file_id: &str) -> boo
 	app.meta_adapter.read_file_variant(tn_id, &variant_id).await.is_ok()
 }
 
-/// Remote profile response from /me endpoint
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteProfile {
-	pub id_tag: String,
-	pub name: String,
-	#[serde(rename = "type")]
-	pub r#type: String,
-	pub profile_pic: Option<String>,
-	pub cover_pic: Option<String>,
-}
-
 /// Ensure a profile exists locally by fetching from remote if needed.
 ///
 /// This function:
@@ -70,7 +58,7 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 	// Fetch profile from remote instance
 	tracing::info!("Syncing profile {} from remote instance", id_tag);
 
-	let fetch_result: ClResult<ApiResponse<RemoteProfile>> =
+	let fetch_result: ClResult<ApiResponse<ProfileBase>> =
 		app.request.get_noauth(tn_id, id_tag, "/me").await;
 
 	match fetch_result {
@@ -164,7 +152,7 @@ pub async fn refresh_profile(
 	};
 
 	// Make conditional request to remote /me endpoint
-	let result: ClResult<ConditionalResult<ApiResponse<RemoteProfile>>> =
+	let result: ClResult<ConditionalResult<ApiResponse<ProfileBase>>> =
 		app.request.get_conditional(id_tag, "/me", etag).await;
 
 	match result {

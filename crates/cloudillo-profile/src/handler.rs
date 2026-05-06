@@ -9,7 +9,17 @@ use crate::prelude::*;
 use cloudillo_core::IdTag;
 use cloudillo_core::extract::{OptionalAuth, OptionalRequestId};
 use cloudillo_core::profile_visibility::{CommunityRole, RequesterTier, SectionVisibility};
-use cloudillo_types::types::{ApiResponse, Profile};
+use cloudillo_types::meta_adapter::ProfileType;
+use cloudillo_types::types::{ApiResponse, Profile, ProfileBase};
+
+/// Wire-format string for a `ProfileType`. Shared between the full and base
+/// `/api/me` handlers so they can't drift.
+fn profile_type_str(t: ProfileType) -> &'static str {
+	match t {
+		ProfileType::Person => "person",
+		ProfileType::Community => "community",
+	}
+}
 
 /// Suffix appended to a section field name to mark its required visibility.
 const VIS_SUFFIX: &str = ".vis";
@@ -75,6 +85,41 @@ fn filter_sections(x: HashMap<Box<str>, Box<str>>, tier: RequesterTier) -> HashM
 	out
 }
 
+/// `GET /api/me` — terse self-profile for federation peers.
+///
+/// Intentionally does not consult `OptionalAuth`: peers fetch this
+/// unauthenticated, so the response shape must not depend on caller identity
+/// (no tier filtering, no `x` map, no `cover_pic`). Owner-rendering UI
+/// clients should call `/api/me/full` to get `x` and `cover_pic` with tier
+/// filtering applied. Do not add an auth extractor here — that would
+/// re-introduce the leakage `ProfileBase` was added to avoid.
+pub async fn get_tenant_profile_base(
+	State(app): State<App>,
+	IdTag(id_tag): IdTag,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<ProfileBase>>)> {
+	// `AuthProfile` carries `tn_id`, so a single `read_tenant` lookup feeds
+	// both the auth-side and meta-side reads — no need for a parallel
+	// `read_tn_id` call against the same tenants row.
+	let auth_profile = app.auth_adapter.read_tenant(&id_tag).await?;
+	let tenant_meta = app.meta_adapter.read_tenant(auth_profile.tn_id).await?;
+
+	let profile = ProfileBase {
+		id_tag: auth_profile.id_tag.to_string(),
+		name: tenant_meta.name.to_string(),
+		r#type: profile_type_str(tenant_meta.typ).to_string(),
+		profile_pic: tenant_meta.profile_pic.map(|s| s.to_string()),
+		keys: auth_profile.keys,
+	};
+
+	let mut response = ApiResponse::new(profile);
+	if let Some(id) = req_id {
+		response = response.with_req_id(id);
+	}
+
+	Ok((StatusCode::OK, Json(response)))
+}
+
 pub async fn get_tenant_profile(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
@@ -82,13 +127,8 @@ pub async fn get_tenant_profile(
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Profile>>)> {
 	let auth_profile = app.auth_adapter.read_tenant(&id_tag).await?;
-	let tn_id = app.auth_adapter.read_tn_id(&id_tag).await?;
+	let tn_id = auth_profile.tn_id;
 	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
-
-	let typ = match tenant_meta.typ {
-		cloudillo_types::meta_adapter::ProfileType::Person => "person",
-		cloudillo_types::meta_adapter::ProfileType::Community => "community",
-	};
 
 	let is_owner = auth.as_ref().is_some_and(|a| a.id_tag.as_ref() == &*id_tag);
 	let is_authenticated = auth.is_some();
@@ -115,7 +155,7 @@ pub async fn get_tenant_profile(
 	let profile = Profile {
 		id_tag: auth_profile.id_tag.to_string(),
 		name: tenant_meta.name.to_string(),
-		r#type: typ.to_string(),
+		r#type: profile_type_str(tenant_meta.typ).to_string(),
 		profile_pic: tenant_meta.profile_pic.map(|s| s.to_string()),
 		cover_pic: tenant_meta.cover_pic.map(|s| s.to_string()),
 		keys: auth_profile.keys,

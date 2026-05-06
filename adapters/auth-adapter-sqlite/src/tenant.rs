@@ -56,6 +56,7 @@ pub(crate) async fn read_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<AuthP
 			}
 		};
 		Ok(AuthProfile {
+			tn_id,
 			id_tag: row.try_get("id_tag")?,
 			email: row.try_get("email")?,
 			roles: parse_str_list_optional(roles.as_deref()),

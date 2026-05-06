@@ -89,10 +89,15 @@ pub struct AuthKey {
 	pub expires_at: Option<Timestamp>,
 }
 
-/// Represents an auth profile
+/// Represents an auth profile.
+///
+/// Adapter-internal: not serialized to clients (handlers project this into
+/// separate wire types). The `Serialize`/`Deserialize` derives are kept for
+/// adapter ergonomics only, so adding `tn_id` does not change any wire shape.
 #[skip_serializing_none]
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AuthProfile {
+	pub tn_id: TnId,
 	pub id_tag: Box<str>,
 	pub email: Option<Box<str>>,
 	pub roles: Option<Box<[Box<str>]>>,

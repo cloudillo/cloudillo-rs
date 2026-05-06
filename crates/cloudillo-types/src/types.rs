@@ -309,6 +309,23 @@ pub struct Profile {
 	pub x: Option<HashMap<String, String>>,
 }
 
+/// Terse self-profile shape returned by `/api/me`.
+///
+/// Used for server-to-server federation sync (base profile fields + signing
+/// keys). Deliberately omits the `x` extension map that `Profile` carries —
+/// peers don't need tier-filtered UI metadata.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileBase {
+	pub id_tag: String,
+	pub name: String,
+	#[serde(rename = "type")]
+	pub r#type: String,
+	pub profile_pic: Option<String>,
+	pub keys: Vec<crate::auth_adapter::AuthKey>,
+}
+
 /// Profile patch for PATCH /me endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

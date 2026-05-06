@@ -141,7 +141,7 @@ pub async fn verify_action_token(
 
 	// 3. HTTP fetch from remote instance
 	let fetch_result: ClResult<
-		cloudillo_types::types::ApiResponse<cloudillo_types::types::Profile>,
+		cloudillo_types::types::ApiResponse<cloudillo_types::types::ProfileBase>,
 	> = app.request.get_noauth(tn_id, issuer, "/me").await;
 
 	match fetch_result {
@@ -358,7 +358,13 @@ async fn process_inbound_action_token_inner(
 					let vis = visibility.unwrap_or('F');
 					let vis_level = VisibilityLevel::from_char(Some(vis));
 					let cap_level = VisibilityLevel::from_char(Some(cap_char));
-					Some(vis_level.max(cap_level).to_char().unwrap_or(vis))
+					// `to_char()` returns `None` only for `Direct`; `'D'` is
+					// the canonical storage character (see migration v25 and
+					// the actions table default). Falling back to the input
+					// `vis` would silently re-introduce a non-canonical
+					// character if a future caller passes anything other
+					// than `'D'` for Direct.
+					Some(vis_level.max(cap_level).to_char().unwrap_or('D'))
 				} else {
 					visibility
 				}
