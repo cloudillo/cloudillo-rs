@@ -15,8 +15,8 @@ readme = "../../README.md"
 cloudillo-types = { workspace = true }
 
 # Core dependencies
-redb = "3.1"
-tokio = { version = "1.50", features = ["full"] }
+redb = "4.1"
+tokio = { version = "1.52", features = ["full"] }
 async-trait = "0.1"
 async-stream = "0.3"
 dashmap = "6.1"

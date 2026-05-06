@@ -244,10 +244,16 @@ pub fn parse(body: &str) -> Report {
 					|| sync_token_depth.is_some()
 					|| nresults_depth.is_some() =>
 			{
-				match t.unescape() {
-					Ok(s) => current_text.push_str(&s),
+				match t.decode() {
+					Ok(decoded) => match quick_xml::escape::unescape(&decoded) {
+						Ok(s) => current_text.push_str(&s),
+						Err(e) => {
+							warn!("REPORT body has malformed XML entity: {e}");
+							had_unescape_error = true;
+						}
+					},
 					Err(e) => {
-						warn!("REPORT body has malformed XML entity: {e}");
+						warn!("REPORT body has invalid encoding: {e}");
 						had_unescape_error = true;
 					}
 				}

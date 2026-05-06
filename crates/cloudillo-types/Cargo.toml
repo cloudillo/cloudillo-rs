@@ -28,18 +28,18 @@ server = [
 
 [dependencies]
 async-trait = "0.1.89"
-axum = { version = "0.8.8", default-features = false, features = ["json"] }
+axum = { version = "0.8.9", default-features = false, features = ["json"] }
 base64 = "0.22.1"
 chrono = "0.4"
 flume = { version = "0.12.0", features = ["async"] }
 futures = "0.3.32"
 futures-core = "0.3.32"
-rand = "0.10.0"
+rand = "0.10.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-serde_with = "3.18.0"
+serde_with = "3.19.0"
 sha2 = "0.11.0"
-tokio = { version = "1.50.0", features = ["io-util", "rt"] }
+tokio = { version = "1.52.2", features = ["io-util", "rt"] }
 tracing = "0.1.44"
 
 # Optional server-specific deps (for From<X> impls on Error)
@@ -49,8 +49,8 @@ image = { version = "0.25.10", optional = true }
 instant-acme = { version = "0.8.5", optional = true }
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"], optional = true }
 pem = { version = "3.0.6", optional = true }
-rustls = { version = "0.23.37", optional = true }
-rustls-pki-types = { version = "1.14.0", features = ["alloc"], optional = true }
+rustls = { version = "0.23.40", optional = true }
+rustls-pki-types = { version = "1.14.1", features = ["alloc"], optional = true }
 x509-parser = { version = "0.18.1", optional = true }
 
 [dev-dependencies]

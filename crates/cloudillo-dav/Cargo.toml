@@ -18,7 +18,7 @@ cloudillo-types = { workspace = true }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2", "macros"] }
 base64 = "0.22"
-quick-xml = "0.37"
+quick-xml = "0.39"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 

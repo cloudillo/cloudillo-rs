@@ -35,7 +35,7 @@ usvg = "0.47"
 regex = "1.12"
 
 # CRDT support (for file duplication)
-yrs = "0.25"
+yrs = "0.26"
 
 # Zip parsing (for app packages)
 rawzip = "0.4"

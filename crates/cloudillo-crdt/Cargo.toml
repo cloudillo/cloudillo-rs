@@ -21,7 +21,7 @@ tokio = { version = "1", features = ["rt", "sync"] }
 tracing = "0.1"
 
 # CRDT (exclusive to this crate)
-yrs = "0.25"
+yrs = "0.26"
 
 [lints]
 workspace = true

@@ -8,14 +8,11 @@
 
 use hickory_resolver::{
 	TokioResolver,
-	config::{NameServerConfig, ResolverConfig},
-	name_server::TokioConnectionProvider,
-	proto::{rr::RecordType, xfer::Protocol},
+	config::{ConnectionConfig, NameServerConfig, ResolverConfig},
+	net::runtime::TokioRuntimeProvider,
+	proto::rr::{RData, RecordType},
 };
-use std::{
-	net::{IpAddr, SocketAddr},
-	sync::Arc,
-};
+use std::{net::IpAddr, sync::Arc};
 
 use crate::prelude::*;
 use cloudillo_types::address::AddressType;
@@ -48,18 +45,16 @@ impl DnsResolver {
 	}
 
 	/// Create a resolver configured to query specific nameservers
-	#[expect(
-		clippy::unused_self,
-		clippy::unnecessary_wraps,
-		reason = "method for consistency; Result for future error handling"
-	)]
+	#[expect(clippy::unused_self, reason = "method for consistency")]
 	fn create_resolver_for_ns(&self, ns_ips: &[IpAddr]) -> ClResult<TokioResolver> {
-		let mut config = ResolverConfig::new();
-		for ip in ns_ips {
-			let socket_addr = SocketAddr::new(*ip, 53);
-			config.add_name_server(NameServerConfig::new(socket_addr, Protocol::Udp));
-		}
-		Ok(TokioResolver::builder_with_config(config, TokioConnectionProvider::default()).build())
+		let name_servers = ns_ips
+			.iter()
+			.map(|ip| NameServerConfig::new(*ip, true, vec![ConnectionConfig::udp()]))
+			.collect();
+		let config = ResolverConfig::from_parts(None, vec![], name_servers);
+		TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+			.build()
+			.map_err(|e| Error::ValidationError(format!("dns resolver build: {e}")))
 	}
 
 	/// Resolve NS record hostnames to IP addresses using the given resolver
@@ -101,22 +96,22 @@ impl DnsResolver {
 					let mut ns_names: Vec<String> = Vec::new();
 					let mut glue_ips: Vec<IpAddr> = Vec::new();
 
-					// Collect NS names
-					for record in ns_lookup.record_iter() {
-						if let Some(ns) = record.data().as_ns() {
+					// Collect NS names — referrals put NS records in the AUTHORITY section
+					for record in ns_lookup.answers().iter().chain(ns_lookup.authorities()) {
+						if let RData::NS(ns) = &record.data {
 							let ns_name = ns.0.to_string();
 							debug!(subdomain = %subdomain, ns = %ns_name, "Found NS record");
 							ns_names.push(ns_name);
 						}
 					}
 
-					// Check for glue records (A/AAAA in additional section)
-					for record in ns_lookup.record_iter() {
-						if let Some(a) = record.data().as_a() {
-							glue_ips.push(IpAddr::V4(a.0));
-						}
-						if let Some(aaaa) = record.data().as_aaaa() {
-							glue_ips.push(IpAddr::V6(aaaa.0));
+					// Glue records — typically ADDITIONAL, but some servers also place
+					// A/AAAA in authorities; accept both, exactly as record_iter() used to.
+					for record in ns_lookup.additionals().iter().chain(ns_lookup.authorities()) {
+						match &record.data {
+							RData::A(a) => glue_ips.push(IpAddr::V4(a.0)),
+							RData::AAAA(aaaa) => glue_ips.push(IpAddr::V6(aaaa.0)),
+							_ => {}
 						}
 					}
 
@@ -174,8 +169,8 @@ impl DnsResolver {
 		debug!(domain = %domain, "Querying A records from authoritative NS");
 		match auth_resolver.lookup(domain, RecordType::A).await {
 			Ok(lookup) => {
-				for record in lookup.record_iter() {
-					if let Some(a) = record.data().as_a() {
+				for record in lookup.answers() {
+					if let RData::A(a) = &record.data {
 						let ip = a.0.to_string();
 						debug!(domain = %domain, ip = %ip, "Found A record");
 						return Ok(Some(ip));
@@ -205,8 +200,8 @@ impl DnsResolver {
 		debug!(domain = %domain, "Querying CNAME records from authoritative NS");
 		match auth_resolver.lookup(domain, RecordType::CNAME).await {
 			Ok(lookup) => {
-				for record in lookup.record_iter() {
-					if let Some(cname) = record.data().as_cname() {
+				for record in lookup.answers() {
+					if let RData::CNAME(cname) = &record.data {
 						let target = cname.0.to_string().trim_end_matches('.').to_string();
 						debug!(domain = %domain, cname = %target, "Found CNAME record");
 						return Ok(Some(target));

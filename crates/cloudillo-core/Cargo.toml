@@ -21,7 +21,7 @@ flume = { version = "0.12", features = ["async"] }
 futures = "0.3"
 futures-core = "0.3"
 governor = "0.10"
-hickory-resolver = "0.25"
+hickory-resolver = "0.26"
 http-body-util = "0.1"
 hyper = "1.9"
 hyper-rustls = "0.27"
@@ -29,7 +29,7 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", 
 instant-acme = "0.8"
 itertools = "0.14"
 jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
-lru = "0.16"
+lru = "0.18"
 parking_lot = "0.12"
 pem = "3.0"
 rustls = "0.23"
