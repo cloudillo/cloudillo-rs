@@ -9,11 +9,13 @@ use axum::{
 	http::StatusCode,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 use cloudillo_core::extract::Auth;
-use cloudillo_types::meta_adapter::{UpdateProfileData, UpdateTenantData, UpsertProfileFields};
+use cloudillo_types::meta_adapter::{
+	ProfileStatus, ProfileTrust, UpdateProfileData, UpdateTenantData, UpsertProfileFields,
+};
 use cloudillo_types::types::{AdminProfilePatch, ProfileInfo, ProfilePatch};
 
 #[derive(Serialize)]
@@ -85,19 +87,16 @@ pub async fn patch_own_profile(
 }
 
 /// PATCH /admin/profile/:idTag - Update another user's profile data (admin only)
+///
+/// The route is mounted behind `check_perm_profile("admin")` ABAC middleware
+/// (see `crates/cloudillo/src/routes.rs`), which enforces `profile:admin` —
+/// no manual role guard is needed here.
 pub async fn patch_profile_admin(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(id_tag): Path<String>,
 	Json(patch): Json<AdminProfilePatch>,
 ) -> ClResult<(StatusCode, Json<UpdateProfileResponse>)> {
-	// Check admin permission - ensure user has "leader" role
-	let has_admin_role = auth.roles.iter().any(|role| role.as_ref() == "leader");
-	if !has_admin_role {
-		warn!("Non-admin user {} attempted to modify profile {}", auth.id_tag, id_tag);
-		return Err(Error::PermissionDenied);
-	}
-
 	let tn_id = auth.tn_id;
 
 	// Extract roles for response before consuming patch
@@ -124,12 +123,26 @@ pub async fn patch_profile_admin(
 	// Fetch updated profile
 	let profile_data = app.meta_adapter.get_profile_info(tn_id, &id_tag).await?;
 
+	// `ProfileData.status` is the single-char DB code (`A`/`T`/`B`/`M`/`S`/`X`);
+	// `ProfileInfo.status` is the typed enum that serializes to the same code.
+	// Mirror `parse_status_list` in `list.rs`: unrecognized codes → `None` so a
+	// future schema addition doesn't 500 every admin response.
+	let status = profile_data.status.as_deref().and_then(|s| match s {
+		"A" => Some(ProfileStatus::Active),
+		"T" => Some(ProfileStatus::Trusted),
+		"B" => Some(ProfileStatus::Blocked),
+		"M" => Some(ProfileStatus::Muted),
+		"S" => Some(ProfileStatus::Suspended),
+		"X" => Some(ProfileStatus::Banned),
+		_ => None,
+	});
+
 	let profile = ProfileInfo {
 		id_tag: profile_data.id_tag.to_string(),
 		name: profile_data.name.to_string(),
 		r#type: Some(profile_type_label(&profile_data.r#type).to_string()),
 		profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
-		status: None,
+		status,
 		connected: None,
 		following: None,
 		trust: None,
@@ -142,19 +155,37 @@ pub async fn patch_profile_admin(
 	Ok((StatusCode::OK, Json(UpdateProfileResponse { profile })))
 }
 
+/// Body for PATCH /profile/:idTag.
+///
+/// Only `status` (block/mute/trust flags) and `trust` (per-profile proxy-token
+/// preference) belong on this endpoint — `following` and `connected` flow
+/// through FOLLOW / CONN actions, and admin-only fields like `roles` /
+/// `profile_pic` / `synced` / `etag` must not be writable by a non-admin caller
+/// over their own cache row.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchProfileRelationshipRequest {
+	#[serde(default)]
+	pub status: Patch<ProfileStatus>,
+	#[serde(default)]
+	pub trust: Patch<ProfileTrust>,
+}
+
 /// PATCH /profile/:idTag - Update relationship data with another user
 pub async fn patch_profile_relationship(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(id_tag): Path<String>,
-	Json(patch): Json<cloudillo_types::meta_adapter::UpdateProfileData>,
+	Json(patch): Json<PatchProfileRelationshipRequest>,
 ) -> ClResult<StatusCode> {
 	let tn_id = auth.tn_id;
 
 	// Upsert relationship state on the target id_tag. If the profile cache row
 	// is missing (race with federation sync), upsert creates a stub so the
 	// caller's relationship change isn't blocked by an empty cache.
-	let upsert = UpsertProfileFields::from_update(patch);
+	let update =
+		UpdateProfileData { status: patch.status, trust: patch.trust, ..Default::default() };
+	let upsert = UpsertProfileFields::from_update(update);
 	app.meta_adapter.upsert_profile(tn_id, &id_tag, &upsert).await?;
 
 	info!("User {} updated relationship with {}", auth.id_tag, id_tag);

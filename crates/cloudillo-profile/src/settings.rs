@@ -38,6 +38,26 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Maximum allowed visibility for posts (used to cap community member posts)
+	registry.register(
+		SettingDefinition::builder("profile.visibility_cap")
+			.description(
+				"Maximum allowed visibility for posts (P=Public, F=Followers, C=Connected)",
+			)
+			.default(SettingValue::String("P".into()))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.validator(|v| {
+				if let SettingValue::String(s) = v
+					&& ["P", "F", "C"].contains(&s.as_str())
+				{
+					return Ok(());
+				}
+				Err(Error::ValidationError("Visibility cap must be P, F, or C".into()))
+			})
+			.build()?,
+	)?;
+
 	// Allow followers
 	registry.register(
 		SettingDefinition::builder("profile.allow_followers")

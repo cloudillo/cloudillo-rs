@@ -183,8 +183,10 @@ async fn forward_resend_to_idp(
 ) -> ClResult<MeResendActivationResponse> {
 	let idp_domain = split_idp_domain(id_tag)?;
 	let path = format!("/idp/identities/{}/resend", id_tag);
-	let resp: ApiResponse<IdpResendBody> =
-		app.request.post(tn_id, idp_domain, &path, &serde_json::json!({})).await?;
+	let resp: ApiResponse<IdpResendBody> = app
+		.request
+		.post_authed(tn_id, idp_domain, &path, &serde_json::json!({}))
+		.await?;
 	Ok(MeResendActivationResponse { expires_at: resp.data.expires_at })
 }
 
@@ -339,15 +341,20 @@ pub async fn post_ref_resend_activation(
 	Path(ref_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<MeResendActivationResponse>>)> {
-	let (tn_id, id_tag, _ref_data) = app
-		.meta_adapter
-		.validate_ref(&ref_id, &["welcome"])
-		.await
-		.map_err(|e| match e {
-			Error::NotFound => Error::ValidationError("Invalid or expired reference".into()),
-			Error::ValidationError(_) => e,
-			_ => Error::ValidationError("Invalid reference".into()),
-		})?;
+	// Allow both "welcome" and "password" ref types here for symmetry with
+	// `get_ref_idp_status`: a `password` ref already grants enough trust to
+	// inspect IDP status (which exposes the email and expiry), so it should
+	// also be trusted to trigger an activation resend, and conversely a
+	// holder of a `password` ref hitting the resend endpoint via the welcome
+	// page UI should not get a confusing 400.
+	let (tn_id, id_tag, _ref_data) =
+		app.meta_adapter.validate_ref(&ref_id, &["welcome", "password"]).await.map_err(
+			|e| match e {
+				Error::NotFound => Error::ValidationError("Invalid or expired reference".into()),
+				Error::ValidationError(_) => e,
+				_ => Error::ValidationError("Invalid reference".into()),
+			},
+		)?;
 
 	if !is_verify_idp(&app, tn_id).await {
 		return Err(Error::ValidationError(
