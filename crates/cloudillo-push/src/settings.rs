@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-//! Push notification settings registration
+//! Notification settings registration
 //!
-//! Settings for controlling which action types trigger push notifications.
-//! Users can enable/disable notifications for each action type.
+//! All `notify.*` settings live here — push (`notify.push.*`) and email
+//! (`notify.email.*`) preferences share one registration call by design,
+//! since they are user-facing notification routing toggles for the same
+//! underlying events. `cloudillo-push` owns the unified "notifications"
+//! subsystem; do not split these into `cloudillo-email::settings` without
+//! also moving the dispatcher boundary.
 
 use crate::prelude::*;
 use cloudillo_core::settings::{
@@ -97,6 +101,88 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 	registry.register(
 		SettingDefinition::builder("notify.push.post")
 			.description("Notify on new posts from people you follow")
+			.default(SettingValue::Bool(false))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	// Master switch for email notifications (opt-in)
+	registry.register(
+		SettingDefinition::builder("notify.email")
+			.description("Enable email notifications")
+			.default(SettingValue::Bool(false))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("notify.email.message")
+			.description("Email on direct messages")
+			.default(SettingValue::Bool(true))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("notify.email.connection")
+			.description("Email on connection requests")
+			.default(SettingValue::Bool(true))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("notify.email.file_share")
+			.description("Email when files are shared with you")
+			.default(SettingValue::Bool(true))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("notify.email.follow")
+			.description("Email when someone follows you")
+			.default(SettingValue::Bool(false))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("notify.email.comment")
+			.description("Email on comments to your posts")
+			.default(SettingValue::Bool(true))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("notify.email.reaction")
+			.description("Email on reactions to your posts")
+			.default(SettingValue::Bool(false))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("notify.email.mention")
+			.description("Email when you are mentioned in a post")
+			.default(SettingValue::Bool(true))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("notify.email.post")
+			.description("Email on new posts from people you follow")
 			.default(SettingValue::Bool(false))
 			.scope(SettingScope::Tenant)
 			.permission(PermissionLevel::User)
