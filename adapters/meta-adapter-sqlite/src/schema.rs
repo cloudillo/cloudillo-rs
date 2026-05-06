@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 25;
+	const CURRENT_DB_VERSION: i64 = 26;
 
 	let mut tx = db.begin().await?;
 
@@ -289,6 +289,10 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 														-- 2: 2nd degree, F: Follower, C: Connected
 			flags text,						-- Action flags: R/r (reactions), C/c (comments), O/o (open)
 			x json,
+			-- Dual-purpose: for status R (draft) / S (scheduled), holds the
+			-- target publish instant (consumed by ActionCreatorTask + PATCH
+			-- /actions). For status A (active/finalized) and onward, holds
+			-- the actual creation time. See UpdateActionDataOptions::created_at.
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch())
 		)",
@@ -1618,6 +1622,27 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.await?;
 
 		set_db_version(&mut tx, 25).await;
+	}
+
+	// Version 26: rename `federation.auto_approve` → `profile.auto_approve_actions`.
+	// The new key has the same shape (Bool, scope Tenant, default false), so we
+	// copy values forward before deleting the old rows. INSERT OR IGNORE keeps
+	// any existing new-key value if both happen to be set.
+	if version < 26 {
+		sqlx::query(
+			"INSERT OR IGNORE INTO settings (tn_id, name, value)
+			 SELECT tn_id, 'profile.auto_approve_actions', value
+			 FROM settings
+			 WHERE name = 'federation.auto_approve'",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		sqlx::query("DELETE FROM settings WHERE name = 'federation.auto_approve'")
+			.execute(&mut *tx)
+			.await?;
+
+		set_db_version(&mut tx, 26).await;
 	}
 
 	tx.commit().await?;

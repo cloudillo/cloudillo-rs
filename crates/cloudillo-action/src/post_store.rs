@@ -511,25 +511,25 @@ async fn schedule_broadcast_delivery(
 	action_id: &str,
 	related_action_id: Option<&str>,
 ) -> ClResult<()> {
-	// Query for followers (entities that issued FLLW or CONN actions to us)
+	// Query for accepted FLLW / CONN actions only. `status="A"` excludes
+	// pending notifications ('N'), confirmation-pending ('C'), and deleted
+	// ('D') rows in a single index-bounded query, instead of fetching all
+	// statuses and filtering in Rust.
 	let follower_actions = app
 		.meta_adapter
 		.list_actions(
 			tn_id,
 			&meta_adapter::ListActionOptions {
 				typ: Some(vec!["FLLW".into(), "CONN".into()]),
+				status: Some(vec!["A".into()]),
 				..Default::default()
 			},
 		)
 		.await?;
 
-	// Extract unique follower id_tags (excluding self and deleted connections)
+	// Extract unique follower id_tags (excluding self).
 	let mut recipients: HashSet<Box<str>> = HashSet::new();
 	for action_view in follower_actions {
-		// Skip deleted connections
-		if action_view.status.as_deref() == Some("D") {
-			continue;
-		}
 		if action_view.issuer.id_tag.as_ref() != id_tag {
 			recipients.insert(action_view.issuer.id_tag.clone());
 		}
@@ -642,10 +642,13 @@ async fn try_auto_approve(app: &App, tn_id: TnId, action: &meta_adapter::Action<
 	}
 
 	// Check if auto-approve setting is enabled
-	let auto_approve_enabled =
-		app.settings.get_bool(tn_id, "federation.auto_approve").await.unwrap_or(false);
+	let auto_approve_enabled = app
+		.settings
+		.get_bool(tn_id, "profile.auto_approve_actions")
+		.await
+		.unwrap_or(false);
 	if !auto_approve_enabled {
-		debug!("try_auto_approve: federation.auto_approve is not enabled");
+		debug!("try_auto_approve: profile.auto_approve_actions is not enabled");
 		return;
 	}
 

@@ -12,7 +12,7 @@ use axum::{
 use crate::prelude::*;
 use cloudillo_core::{
 	CreateActionFn, CreateCompleteTenantFn, bootstrap_types::CreateCompleteTenantOptions,
-	extract::Auth,
+	extract::Auth, settings::SettingValue,
 };
 use cloudillo_idp::registration::{IdpRegContent, IdpRegResponse};
 use cloudillo_types::{
@@ -235,22 +235,21 @@ pub async fn put_community_profile(
 		)
 		.await?;
 
-	// 5a. Enable auto-approve for incoming posts from connected users
-	app.meta_adapter
-		.update_setting(
-			community_tn_id,
-			"federation.auto_approve",
-			Some(serde_json::Value::Bool(true)),
-		)
+	// 5a. Enable auto-approve for incoming posts from connected users.
+	// Route through `app.settings.set` (not the raw meta adapter) so the
+	// resolved-value cache is invalidated and the validator runs.
+	app.settings
+		.set(community_tn_id, "profile.auto_approve_actions", SettingValue::Bool(true), &auth.roles)
 		.await?;
 
 	// 5b. Auto-accept incoming connection requests so the creator's CONN below
 	// gets a CONN:ACC reply without manual intervention.
-	app.meta_adapter
-		.update_setting(
+	app.settings
+		.set(
 			community_tn_id,
 			"profile.connection_mode",
-			Some(serde_json::Value::String("A".into())),
+			SettingValue::String("A".into()),
+			&auth.roles,
 		)
 		.await?;
 
