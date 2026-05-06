@@ -186,7 +186,9 @@ impl Request {
 					self.proxy_tokens.invalidate(tn_id, id_tag);
 					attempt += 1;
 				}
-				StatusCode::FORBIDDEN => return Err(Error::PermissionDenied),
+				StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+					return Err(Error::PermissionDenied);
+				}
 				code => {
 					return Err(Error::NetworkError(format!("unexpected HTTP status: {}", code)));
 				}
@@ -407,6 +409,77 @@ impl Request {
 		Res: DeserializeOwned,
 	{
 		let res = self.post_bin(tn_id, id_tag, path, serde_json::to_vec(data)?.into()).await?;
+		let parsed: Res = serde_json::from_slice(&res)?;
+		Ok(parsed)
+	}
+
+	/// Authenticated JSON POST to a remote tenant. Mirrors [`Self::get_bin`]:
+	/// attaches a cached proxy token in the `Authorization` header and retries
+	/// once on 401/403 after invalidating the cached token. Branches on
+	/// response status so callers see a typed `Error` (NotFound / Gone /
+	/// PermissionDenied / NetworkError) instead of a downstream JSON-
+	/// deserialization failure when the upstream returns an error envelope.
+	///
+	/// Hard-codes `Content-Type: application/json`; for binary authed POSTs
+	/// add a separate helper that takes an explicit content-type parameter.
+	pub async fn post_json_authed(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		path: &str,
+		data: Bytes,
+	) -> ClResult<Bytes> {
+		let mut attempt = 0u8;
+		loop {
+			let token = self.get_or_mint_proxy_token(tn_id, id_tag).await?;
+			let req = hyper::Request::builder()
+				.method(Method::POST)
+				.uri(format!("https://cl-o.{}/api{}", id_tag, path))
+				.header("Content-Type", "application/json")
+				.header("Authorization", format!("Bearer {}", token))
+				.body(to_boxed(Full::from(data.clone())))?;
+			let res = self.timed_request(req).await?;
+			debug!(status = %res.status(), "federated POST response");
+			match res.status() {
+				StatusCode::NOT_FOUND => return Err(Error::NotFound),
+				StatusCode::GONE => return Err(Error::Gone),
+				StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if attempt == 0 => {
+					debug!(id_tag = %id_tag, path = %path,
+						"auth rejected on POST, refreshing cached token and retrying");
+					self.proxy_tokens.invalidate(tn_id, id_tag);
+					attempt += 1;
+				}
+				StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+					return Err(Error::PermissionDenied);
+				}
+				code if code.is_success() => {
+					// Accept any 2xx — the wire shape is up to the caller.
+					// `204 No Content` returns empty bytes; the typed
+					// `post_authed` wrapper will surface that as a JSON parse
+					// error, which is acceptable for callers that opted in.
+					return Self::collect_body(res.into_body()).await;
+				}
+				code => {
+					return Err(Error::NetworkError(format!("unexpected HTTP status: {}", code)));
+				}
+			}
+		}
+	}
+
+	/// Typed JSON wrapper around [`Self::post_json_authed`].
+	pub async fn post_authed<Res>(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		path: &str,
+		data: &impl Serialize,
+	) -> ClResult<Res>
+	where
+		Res: DeserializeOwned,
+	{
+		let res = self
+			.post_json_authed(tn_id, id_tag, path, serde_json::to_vec(data)?.into())
+			.await?;
 		let parsed: Res = serde_json::from_slice(&res)?;
 		Ok(parsed)
 	}
