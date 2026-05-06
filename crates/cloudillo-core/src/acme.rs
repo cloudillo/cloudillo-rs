@@ -156,7 +156,7 @@ async fn renew_domains_inner<'a>(
 
 	let mut order = account.new_order(&acme::NewOrder::new(identifiers.as_slice())).await?;
 
-	info!("ACME order {:#?}", order.state());
+	debug!("ACME order {:#?}", order.state());
 
 	let initial_status = order.state().status;
 	// `Pending` is the normal first-time path. `Ready` can happen when LE has

@@ -166,6 +166,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/settings", get(settings::handler::list_settings))
 		.route("/api/settings/{name}", get(settings::handler::get_setting))
 		.route("/api/settings/{name}", put(settings::handler::update_setting))
+		.route("/api/settings/{name}", delete(settings::handler::delete_setting))
 
 		// --- Reference API ---
 		.route("/api/refs", get(r#ref::handler::list_refs))
@@ -382,7 +383,7 @@ fn init_public_routes(app: App) -> Router<App> {
 	// Read-only endpoints with visibility-based access control
 	let general_public_router = Router::new()
 		// Tenant Discovery
-		.route("/api/me", get(profile::handler::get_tenant_profile))
+		.route("/api/me", get(profile::handler::get_tenant_profile_base))
 		.route("/api/me/full", get(profile::handler::get_tenant_profile))
 
 		// Public References
