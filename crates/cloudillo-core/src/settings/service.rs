@@ -48,9 +48,19 @@ impl SettingsCache {
 		cache.clear();
 	}
 
-	/// Invalidate specific key across all tenants (when global setting changes)
-	pub fn invalidate_key(&self, _key: &str) {
-		self.clear();
+	/// Invalidate cached entries for a specific key across all tenants
+	/// (typically called after a global setting changes, so each tenant
+	/// re-resolves through the new global default on next read).
+	pub fn invalidate_key(&self, key: &str) {
+		let mut cache = self.cache.lock();
+		// `LruCache` has no "remove by predicate" API, so collect matching
+		// composite keys first and pop them in a second pass — bounded by the
+		// cache capacity (default 100), so this is cheap.
+		let to_remove: Vec<(TnId, String)> =
+			cache.iter().filter(|((_, k), _)| k == key).map(|(k, _)| k.clone()).collect();
+		for k in to_remove {
+			cache.pop(&k);
+		}
 	}
 }
 
@@ -133,6 +143,32 @@ impl SettingsService {
 		}
 	}
 
+	/// Get the raw stored value at a single level without fallback.
+	///
+	/// Unlike `get`, this does not consult the schema default or the global
+	/// row when querying a tenant — it only returns the value stored in the
+	/// row keyed by `(tn_id, key)`. Useful for the UI to distinguish "no
+	/// per-tenant override" from "explicit override that happens to equal
+	/// the global value".
+	///
+	/// Returns `Ok(None)` when no row exists at that level. Bypasses cache
+	/// because the cache stores resolved values, not raw rows.
+	pub async fn get_raw(&self, tn_id: TnId, key: &str) -> ClResult<Option<SettingValue>> {
+		// Validate the key is registered (matches the strictness of `get`).
+		self.registry
+			.get_match(key)
+			.ok_or_else(|| Error::SettingNotFound(format!("Unknown setting: {}", key)))?;
+
+		match self.meta.read_setting(tn_id, key).await? {
+			Some(json_value) => {
+				let value = serde_json::from_value::<SettingValue>(json_value)
+					.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
+				Ok(Some(value))
+			}
+			None => Ok(None),
+		}
+	}
+
 	/// Set setting value with validation and permission checks
 	/// The `roles` parameter should be the authenticated user's roles
 	pub async fn set<S: AsRef<str>>(
@@ -155,13 +191,27 @@ impl SettingsService {
 		}
 
 		// Check scope validity
-		// Determine the actual tn_id to use for storage
+		// Determine the actual tn_id to use for storage.
+		//
+		// (Tenant, 0) writes the shared global default row that every tenant
+		// resolves through, so it is SADM-only — same invariant `clear`
+		// enforces below. The HTTP path reaches this arm only via SADM (since
+		// `resolve_target_tn_id` already gates cross-tenant access), but
+		// non-HTTP callers (`community.rs` etc.) come straight in and would
+		// otherwise be a privilege-escalation footgun.
 		let storage_tn_id = match (def.scope, tn_id.0) {
 			(SettingScope::System, _) => {
 				return Err(Error::PermissionDenied);
 			}
-			(SettingScope::Global, 0) => {
-				// OK: Setting global value
+			(SettingScope::Global | SettingScope::Tenant, 0) => {
+				// Writing the global default row affects every tenant —
+				// require SADM regardless of scope. Today the HTTP handler
+				// passes `acting_tn_id` (never 0 for non-SADM), so this is
+				// defense-in-depth against non-HTTP callers and consistency
+				// with the `clear` invariant below.
+				if !roles.iter().any(|r| r.as_ref() == "SADM") {
+					return Err(Error::PermissionDenied);
+				}
 				TnId(0)
 			}
 			(SettingScope::Global, _) => {
@@ -170,11 +220,6 @@ impl SettingsService {
 				if !roles.iter().any(|r| r.as_ref() == "SADM") {
 					return Err(Error::PermissionDenied);
 				}
-				TnId(0)
-			}
-			(SettingScope::Tenant, 0) => {
-				// Setting global default for tenant-scoped setting
-				// This is OK - acts as default for all tenants
 				TnId(0)
 			}
 			(SettingScope::Tenant, _) => {
@@ -205,14 +250,10 @@ impl SettingsService {
 			.map_err(|e| Error::ValidationError(format!("Failed to serialize setting: {}", e)))?;
 		self.meta.update_setting(storage_tn_id, key, Some(json_value)).await?;
 
-		// Invalidate cache
-		if storage_tn_id.0 == 0 {
-			// Global setting changed, invalidate all tenants for this key
-			self.cache.invalidate_key(key);
-		} else {
-			// Just clear cache (simple approach)
-			self.cache.clear();
-		}
+		// Invalidate cached entries for this key (across all tenants), so
+		// any tenant whose value resolved through the now-stale (tenant or
+		// global) row re-resolves on next read.
+		self.cache.invalidate_key(key);
 
 		info!("Setting '{}' updated for tn_id={}", key, storage_tn_id.0);
 
@@ -228,7 +269,7 @@ impl SettingsService {
 	/// Delete a setting (falls back to next level)
 	pub async fn delete(&self, tn_id: TnId, key: &str) -> ClResult<bool> {
 		self.meta.update_setting(tn_id, key, None).await?;
-		self.cache.clear();
+		self.cache.invalidate_key(key);
 
 		info!("Setting '{}' deleted for tn_id={}", key, tn_id.0);
 		Ok(true)
@@ -252,9 +293,24 @@ impl SettingsService {
 			return Err(Error::PermissionDenied);
 		}
 
+		// Same invariant as `set`: clearing the (Tenant|Global, TnId(0)) row
+		// touches the shared global default that every tenant resolves
+		// through, and the HTTP `delete_setting` handler already requires
+		// SADM unconditionally for `level=global`. Caller `tn_id == 0`
+		// reaches here only via SADM in practice (auth.tn_id==0 only for the
+		// system tenant; cross-tenant `tenant=` resolves to `TnId(0)` only
+		// when caller is SADM).
 		let storage_tn_id = match (def.scope, tn_id.0) {
 			(SettingScope::System, _) => return Err(Error::PermissionDenied),
-			(SettingScope::Global | SettingScope::Tenant, 0) => TnId(0),
+			(SettingScope::Global | SettingScope::Tenant, 0) => {
+				// Caller-supplied tn_id==0 targets the shared global default
+				// row that every tenant resolves through — gate symmetrically
+				// with `set` to keep non-HTTP callers honest.
+				if !roles.iter().any(|r| r.as_ref() == "SADM") {
+					return Err(Error::PermissionDenied);
+				}
+				TnId(0)
+			}
 			(SettingScope::Global, _) => {
 				if !roles.iter().any(|r| r.as_ref() == "SADM") {
 					return Err(Error::PermissionDenied);
@@ -266,11 +322,10 @@ impl SettingsService {
 
 		self.meta.update_setting(storage_tn_id, key, None).await?;
 
-		if storage_tn_id.0 == 0 {
-			self.cache.invalidate_key(key);
-		} else {
-			self.cache.clear();
-		}
+		// Invalidate this key across all tenants — even when clearing a
+		// per-tenant override, any other tenant whose cached resolution
+		// flowed through the same `key` should still re-resolve on next read.
+		self.cache.invalidate_key(key);
 
 		info!("Setting '{}' cleared for tn_id={}", key, storage_tn_id.0);
 		Ok(())
