@@ -365,6 +365,12 @@ pub struct UpdateActionDataOptions {
 	pub attachments: Patch<String>, // Comma-separated list of attachment IDs
 	pub flags: Patch<String>,
 	pub sub_typ: Patch<String>,
+	/// Dual-purpose for actions in status `R` (draft) or `S` (scheduled): the
+	/// `actions.created_at` column holds the target publish instant, not the
+	/// row's actual creation time. PATCH /actions, `publish_draft`, and
+	/// `task::handle_create_action` all rely on this overload. For any other
+	/// status, leave this `Patch::Undefined` — overwriting `created_at` on a
+	/// finalized (`A`) action would corrupt the timeline.
 	pub created_at: Patch<Timestamp>,
 }
 

@@ -581,7 +581,14 @@ pub async fn post_action_stat(
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// Request body for PATCH /api/actions/:action_id (draft update)
+/// Request body for PATCH /api/actions/:action_id.
+///
+/// Allowed only for drafts (status `R`) and scheduled actions (status `S`).
+/// `publishAt` updates the scheduled publish time; the convention here is that
+/// scheduled drafts store the target publish instant in the `created_at`
+/// column (see `publish_draft` and `task::handle_create_action`), so we map
+/// `publishAt` → `UpdateActionDataOptions::created_at`. State transitions
+/// (draft → scheduled/published) still go through POST /actions/:id/publish.
 #[derive(Debug, Default, Deserialize)]
 pub struct PatchActionRequest {
 	#[serde(rename = "subType")]
@@ -591,6 +598,8 @@ pub struct PatchActionRequest {
 	pub visibility: Option<char>,
 	pub flags: Option<Box<str>>,
 	pub x: Option<serde_json::Value>,
+	#[serde(rename = "publishAt")]
+	pub publish_at: Option<cloudillo_types::types::Timestamp>,
 }
 
 /// PATCH /api/actions/:action_id - Update a draft action
@@ -647,6 +656,14 @@ pub async fn patch_action(
 		},
 		x: match req.x {
 			Some(ref v) => cloudillo_types::types::Patch::Value(v.clone()),
+			None => cloudillo_types::types::Patch::Undefined,
+		},
+		// Scheduled-publish time is stored as `created_at` for actions in
+		// state R/S; this lets ComposePanel auto-save persist schedule edits
+		// without going through the publish endpoint.
+		// see actions.created_at: dual-purpose for status R/S — holds publish_at
+		created_at: match req.publish_at {
+			Some(ts) => cloudillo_types::types::Patch::Value(ts),
 			None => cloudillo_types::types::Patch::Undefined,
 		},
 		..Default::default()
