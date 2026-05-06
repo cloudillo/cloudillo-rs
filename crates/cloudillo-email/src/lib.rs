@@ -14,7 +14,7 @@ pub mod settings;
 pub mod task;
 pub mod template;
 
-pub use sender::EmailSender;
+pub use sender::{EmailSender, SmtpCategory, SmtpDiagnostic};
 pub use task::EmailSenderTask;
 pub use template::TemplateEngine;
 
@@ -128,6 +128,20 @@ impl EmailModule {
 	/// Send email immediately (bypass scheduler)
 	pub async fn send_now(&self, tn_id: TnId, message: EmailMessage) -> ClResult<()> {
 		self.sender.send(tn_id, message).await
+	}
+
+	/// Send email immediately and return a structured `SmtpDiagnostic` on
+	/// failure — used by the admin test endpoint to render category-keyed
+	/// hints. Bypasses the `email.enabled` toggle so admins can validate SMTP
+	/// without flipping the global switch on; missing SMTP host surfaces as
+	/// `SmtpCategory::NotConfigured`. Other callers should keep using
+	/// `send_now` for the standard `ClResult<()>` shape.
+	pub async fn send_test(
+		&self,
+		tn_id: TnId,
+		message: EmailMessage,
+	) -> Result<(), SmtpDiagnostic> {
+		self.sender.send_test(tn_id, message).await
 	}
 }
 

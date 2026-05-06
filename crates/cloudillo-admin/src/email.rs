@@ -10,7 +10,6 @@ use axum::{
 	response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use serde_with::skip_serializing_none;
 
 use std::sync::Arc;
 
@@ -28,15 +27,12 @@ pub struct TestEmailRequest {
 }
 
 /// Response body for test email endpoint
-#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct TestEmailResponse {
 	/// Whether the test email was sent successfully
 	pub success: bool,
 	/// Human-readable status message
 	pub message: String,
-	/// Error details if the send failed
-	pub error: Option<String>,
 }
 
 /// POST /api/admin/email/test - Send a test email to verify email configuration
@@ -69,32 +65,13 @@ pub async fn send_test_email(
 			.into_response());
 	}
 
-	// Check if email is enabled
-	let email_enabled = app.settings.get_bool(tn_id, "email.enabled").await.unwrap_or(false);
-	if !email_enabled {
-		return Ok((
-			StatusCode::PRECONDITION_FAILED,
-			Json(ErrorResponse::new(
-				"EMAIL_DISABLED".to_string(),
-				"Email sending is disabled. Enable email.enabled setting to send emails."
-					.to_string(),
-			)),
-		)
-			.into_response());
-	}
-
-	// Check if SMTP host is configured
-	let smtp_host = app.settings.get_string_opt(tn_id, "email.smtp.host").await.unwrap_or(None);
-	if smtp_host.is_none() || smtp_host.as_ref().is_some_and(String::is_empty) {
-		return Ok((
-			StatusCode::PRECONDITION_FAILED,
-			Json(ErrorResponse::new(
-				"SMTP_NOT_CONFIGURED".to_string(),
-				"SMTP host not configured. Configure email.smtp.host setting.".to_string(),
-			)),
-		)
-			.into_response());
-	}
+	// `EmailSender::send_test` intentionally bypasses the `email.enabled`
+	// toggle (admins must be able to validate SMTP without flipping the
+	// global on/off switch) and reports a missing SMTP host as
+	// `SmtpCategory::NotConfigured`. We delegate to it directly instead of
+	// pre-flight checks: the pre-flight reads used `.unwrap_or(_)` which
+	// silently masked transient adapter errors, and the `email.enabled`
+	// short-circuit was wrong for the test path anyway.
 
 	// Get base_id_tag for sender name
 	let base_id_tag = app.opts.base_id_tag.as_ref().map_or("cloudillo", AsRef::as_ref);
@@ -123,7 +100,7 @@ pub async fn send_test_email(
 	};
 
 	// Send immediately for direct feedback
-	match app.ext::<Arc<EmailModule>>()?.send_now(tn_id, message).await {
+	match app.ext::<Arc<EmailModule>>()?.send_test(tn_id, message).await {
 		Ok(()) => {
 			info!(
 				tn_id = ?tn_id,
@@ -135,24 +112,40 @@ pub async fn send_test_email(
 				Json(ApiResponse::new(TestEmailResponse {
 					success: true,
 					message: format!("Test email sent to {}", request.to),
-					error: None,
 				})),
 			)
 				.into_response())
 		}
-		Err(e) => {
+		Err(diag) => {
 			warn!(
 				tn_id = ?tn_id,
 				to = %request.to,
-				error = %e,
+				category = ?diag.category,
+				smtp_code = ?diag.smtp_code,
+				raw = %diag.raw,
 				"Failed to send test email"
 			);
+			// `SmtpDiagnostic` is `#[derive(Serialize)]` over plain
+			// String/Option<String>/Option<u16>/enum, so this conversion
+			// can't actually fail. Fallback kept defensively in case the
+			// shape grows a fallible field later.
+			let details = serde_json::to_value(&diag)
+				.unwrap_or_else(|_| serde_json::json!({"category": "other"}));
+			// `NotConfigured` is a configuration precondition, not a transient
+			// SMTP delivery failure — surface it as 412 with a distinct error
+			// code so the admin UI can prompt the user to set SMTP host.
+			let (status, code) = match diag.category {
+				cloudillo_email::SmtpCategory::NotConfigured => {
+					(StatusCode::PRECONDITION_FAILED, "SMTP_NOT_CONFIGURED")
+				}
+				_ => (StatusCode::SERVICE_UNAVAILABLE, "SMTP_SEND_FAILED"),
+			};
 			Ok((
-				StatusCode::SERVICE_UNAVAILABLE,
-				Json(ErrorResponse::new(
-					"SMTP_SEND_FAILED".to_string(),
-					format!("Failed to send test email: {}", e),
-				)),
+				status,
+				Json(
+					ErrorResponse::new(code.to_string(), diag.message.clone())
+						.with_details(details),
+				),
 			)
 				.into_response())
 		}
