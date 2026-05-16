@@ -323,7 +323,19 @@ pub async fn bootstrap(app: Arc<AppState>, opts: &crate::app::AppBuilderOpts) ->
 	// Always schedule cert renewal when ACME is configured
 	// (both fresh bootstrap and restart)
 	if let Some(acme_email) = opts.acme_email.as_ref() {
-		info!("Scheduling automatic certificate renewal task (runs daily)");
+		// Spread renewals across the full day, keyed off base_id_tag so the slot
+		// is stable per deployment and avoids the midnight-UTC stampede against
+		// root / TLD nameservers.
+		let h: u32 = base_id_tag
+			.bytes()
+			.fold(2_166_136_261u32, |acc, b| (acc ^ u32::from(b)).wrapping_mul(16_777_619));
+		let hour = h % 24;
+		let minute = (h / 24) % 60;
+		let cron_expr = format!("{minute} {hour} * * *");
+		info!(
+			"Scheduling automatic certificate renewal task (daily at {:02}:{:02} UTC)",
+			hour, minute,
+		);
 
 		// TODO: Make renewal_days configurable via admin settings, default 30 days
 		let renewal_days = 30;
@@ -338,7 +350,7 @@ pub async fn bootstrap(app: Arc<AppState>, opts: &crate::app::AppBuilderOpts) ->
 				.scheduler
 				.task(renewal_task)
 				.key("acme.cert_renewal") // Unique key prevents duplicates on restart
-				.cron("0 0 * * *") // Every day
+				.cron(&cron_expr)
 				.schedule()
 				.await
 			{

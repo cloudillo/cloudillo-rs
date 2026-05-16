@@ -9,7 +9,8 @@
 use hickory_resolver::{
 	TokioResolver,
 	config::{ConnectionConfig, NameServerConfig, ResolverConfig},
-	net::runtime::TokioRuntimeProvider,
+	lookup::Lookup,
+	net::{NetError, runtime::TokioRuntimeProvider},
 	proto::rr::{RData, RecordType},
 };
 use std::{net::IpAddr, sync::Arc};
@@ -34,6 +35,20 @@ const ROOT_SERVERS: [&str; 13] = [
 	"202.12.27.33",   // M.ROOT-SERVERS.NET
 ];
 
+/// Outcome of a single DNS record lookup, distinguishing legitimate "no record"
+/// from actual lookup failure so callers can log the difference.
+#[derive(Debug)]
+enum LookupOutcome {
+	/// Query succeeded and a matching record was found.
+	Found(String),
+	/// Query succeeded but no matching records of the requested type.
+	NoRecord,
+	/// All retry attempts failed. The underlying error is already logged in
+	/// detail by `lookup_with_retry`; this variant only signals "transport
+	/// failure" vs `NoRecord` to the operator-facing summary warn.
+	LookupError,
+}
+
 /// DNS Resolver wrapper that performs recursive resolution from root servers
 pub struct DnsResolver {}
 
@@ -49,7 +64,13 @@ impl DnsResolver {
 	fn create_resolver_for_ns(&self, ns_ips: &[IpAddr]) -> ClResult<TokioResolver> {
 		let name_servers = ns_ips
 			.iter()
-			.map(|ip| NameServerConfig::new(*ip, true, vec![ConnectionConfig::udp()]))
+			.map(|ip| {
+				NameServerConfig::new(
+					*ip,
+					true,
+					vec![ConnectionConfig::udp(), ConnectionConfig::tcp()],
+				)
+			})
 			.collect();
 		let config = ResolverConfig::from_parts(None, vec![], name_servers);
 		TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
@@ -57,19 +78,108 @@ impl DnsResolver {
 			.map_err(|e| Error::ValidationError(format!("dns resolver build: {e}")))
 	}
 
-	/// Resolve NS record hostnames to IP addresses using the given resolver
+	/// Retry a DNS lookup a few times with short backoff. Transient UDP loss
+	/// against root / TLD / authoritative NS is the main reason we get spurious
+	/// `nodns` results; one or two retries usually fixes it.
+	async fn lookup_with_retry(
+		resolver: &TokioResolver,
+		name: &str,
+		rtype: RecordType,
+	) -> Result<Lookup, NetError> {
+		const ATTEMPTS: u32 = 3;
+		// invariant: BACKOFF_MS.len() == ATTEMPTS - 1
+		const BACKOFF_MS: [u64; 2] = [300, 900];
+		let mut last_err: Option<NetError> = None;
+		for attempt in 0..ATTEMPTS {
+			match resolver.lookup(name, rtype).await {
+				Ok(r) => return Ok(r),
+				Err(e) => {
+					// Authoritative negative answer (NXDomain or NoError with no
+					// records). Don't retry, don't WARN — it's a legitimate result.
+					if e.is_no_records_found() {
+						debug!(
+							query = %name,
+							rtype = ?rtype,
+							error = %e,
+							"DNS lookup returned no records (authoritative negative answer)"
+						);
+						return Err(e);
+					}
+					let is_final = attempt + 1 >= ATTEMPTS;
+					if is_final {
+						warn!(
+							query = %name,
+							rtype = ?rtype,
+							attempt = attempt + 1,
+							total_attempts = ATTEMPTS,
+							error = %e,
+							"DNS lookup failed (final)"
+						);
+					} else {
+						debug!(
+							query = %name,
+							rtype = ?rtype,
+							attempt = attempt + 1,
+							total_attempts = ATTEMPTS,
+							error = %e,
+							"DNS lookup failed, will retry"
+						);
+						let idx = attempt as usize;
+						if idx < BACKOFF_MS.len() {
+							tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[idx]))
+								.await;
+						}
+					}
+					last_err = Some(e);
+				}
+			}
+		}
+		match last_err {
+			Some(e) => Err(e),
+			// Unreachable: ATTEMPTS >= 1 guarantees the loop ran and set last_err on any error.
+			None => Err(NetError::Message("dns lookup retry loop produced no error")),
+		}
+	}
+
+	/// Resolve NS record hostnames to IP addresses using the given resolver.
+	///
+	/// Retries the whole batch (not per name) when no NS name resolves: a
+	/// simultaneous flake of every NS name otherwise zeroes the level silently
+	/// and surfaces downstream as a misleading `nodns`.
 	async fn resolve_ns_to_ips(
 		&self,
 		ns_names: &[String],
 		resolver: &TokioResolver,
 	) -> Vec<IpAddr> {
+		const BATCH_ATTEMPTS: u32 = 2;
+		const BATCH_BACKOFF_MS: u64 = 500;
 		let mut ips = Vec::new();
-		for ns_name in ns_names {
-			if let Ok(lookup) = resolver.lookup_ip(ns_name.as_str()).await {
-				for ip in lookup.iter() {
-					ips.push(ip);
+		for attempt in 0..BATCH_ATTEMPTS {
+			for ns_name in ns_names {
+				if let Ok(lookup) = resolver.lookup_ip(ns_name.as_str()).await {
+					for ip in lookup.iter() {
+						ips.push(ip);
+					}
 				}
 			}
+			if !ips.is_empty() {
+				return ips;
+			}
+			if attempt + 1 < BATCH_ATTEMPTS {
+				debug!(
+					ns_names = ?ns_names,
+					attempt = attempt + 1,
+					"All NS-name resolutions failed in this batch, retrying"
+				);
+				tokio::time::sleep(std::time::Duration::from_millis(BATCH_BACKOFF_MS)).await;
+			}
+		}
+		if ips.is_empty() && !ns_names.is_empty() {
+			warn!(
+				ns_names = ?ns_names,
+				attempts = BATCH_ATTEMPTS,
+				"Failed to resolve any NS names to IPs after batch retries"
+			);
 		}
 		ips
 	}
@@ -91,7 +201,9 @@ impl DnsResolver {
 			debug!(subdomain = %subdomain, "Looking up NS for zone");
 
 			// Query NS records for this level
-			match current_resolver.lookup(subdomain.as_str(), RecordType::NS).await {
+			match Self::lookup_with_retry(&current_resolver, subdomain.as_str(), RecordType::NS)
+				.await
+			{
 				Ok(ns_lookup) => {
 					let mut ns_names: Vec<String> = Vec::new();
 					let mut glue_ips: Vec<IpAddr> = Vec::new();
@@ -123,7 +235,13 @@ impl DnsResolver {
 							glue_ips
 						};
 
-						if !ns_ips.is_empty() {
+						if ns_ips.is_empty() {
+							debug!(
+								subdomain = %subdomain,
+								ns_names = ?ns_names,
+								"Got NS names but failed to resolve any to IPs — keeping parent NS"
+							);
+						} else {
 							debug!(
 								subdomain = %subdomain,
 								ns_count = ns_ips.len(),
@@ -135,11 +253,25 @@ impl DnsResolver {
 					}
 				}
 				Err(e) => {
-					// NS lookup failed - this is normal for non-delegated subdomains
-					debug!(
+					if e.is_no_records_found() {
+						// Authoritative "no NS at this level" — every deeper label
+						// under the same parent will get the same answer from the
+						// same nameserver. Stop walking; keep the parent's NS.
+						debug!(
+							subdomain = %subdomain,
+							ns_count_in = current_ns_ips.len(),
+							"No NS delegation at this level — stopping walk-down, using parent NS"
+						);
+						break;
+					}
+					// True transport failure after exhausting retries. A single
+					// flaky TLD server shouldn't abort the walk — keep the
+					// previous level's NS and try the next label.
+					warn!(
 						subdomain = %subdomain,
+						ns_count_in = current_ns_ips.len(),
 						error = %e,
-						"No NS delegation at this level"
+						"NS lookup failed at this level (all retries exhausted)"
 					);
 				}
 			}
@@ -154,66 +286,100 @@ impl DnsResolver {
 		Ok(current_ns_ips)
 	}
 
-	/// Resolve a domain to A record
+	/// Resolve a domain to A record (legacy `Option` interface preserved for callers).
 	pub async fn resolve_a(&self, domain: &str) -> ClResult<Option<String>> {
+		match self.resolve_a_outcome(domain).await? {
+			LookupOutcome::Found(ip) => Ok(Some(ip)),
+			LookupOutcome::NoRecord | LookupOutcome::LookupError => Ok(None),
+		}
+	}
+
+	/// Resolve a domain to A record, distinguishing legitimate `NoRecord` from lookup failure.
+	async fn resolve_a_outcome(&self, domain: &str) -> ClResult<LookupOutcome> {
 		debug!(domain = %domain, "Starting A record resolution from root");
 
 		let auth_ns = self.find_authoritative_ns(domain).await?;
 		if auth_ns.is_empty() {
 			warn!(domain = %domain, "Could not find authoritative nameservers");
-			return Ok(None);
+			return Ok(LookupOutcome::LookupError);
 		}
 
 		let auth_resolver = self.create_resolver_for_ns(&auth_ns)?;
 
 		debug!(domain = %domain, "Querying A records from authoritative NS");
-		match auth_resolver.lookup(domain, RecordType::A).await {
+		match Self::lookup_with_retry(&auth_resolver, domain, RecordType::A).await {
 			Ok(lookup) => {
 				for record in lookup.answers() {
 					if let RData::A(a) = &record.data {
 						let ip = a.0.to_string();
 						debug!(domain = %domain, ip = %ip, "Found A record");
-						return Ok(Some(ip));
+						return Ok(LookupOutcome::Found(ip));
 					}
 				}
+				Ok(LookupOutcome::NoRecord)
 			}
 			Err(e) => {
-				debug!(domain = %domain, error = %e, "A lookup failed");
+				if e.is_no_records_found() {
+					debug!(
+						domain = %domain,
+						rtype = ?RecordType::A,
+						error = %e,
+						"Authoritative NS returned no record (no answer)"
+					);
+					Ok(LookupOutcome::NoRecord)
+				} else {
+					Ok(LookupOutcome::LookupError)
+				}
 			}
 		}
-
-		Ok(None)
 	}
 
-	/// Resolve a domain to CNAME record
+	/// Resolve a domain to CNAME record (legacy `Option` interface preserved for callers).
 	pub async fn resolve_cname(&self, domain: &str) -> ClResult<Option<String>> {
+		match self.resolve_cname_outcome(domain).await? {
+			LookupOutcome::Found(name) => Ok(Some(name)),
+			LookupOutcome::NoRecord | LookupOutcome::LookupError => Ok(None),
+		}
+	}
+
+	/// Resolve a domain to CNAME record, distinguishing legitimate `NoRecord` from lookup failure.
+	async fn resolve_cname_outcome(&self, domain: &str) -> ClResult<LookupOutcome> {
 		debug!(domain = %domain, "Starting CNAME record resolution from root");
 
 		let auth_ns = self.find_authoritative_ns(domain).await?;
 		if auth_ns.is_empty() {
 			warn!(domain = %domain, "Could not find authoritative nameservers");
-			return Ok(None);
+			return Ok(LookupOutcome::LookupError);
 		}
 
 		let auth_resolver = self.create_resolver_for_ns(&auth_ns)?;
 
 		debug!(domain = %domain, "Querying CNAME records from authoritative NS");
-		match auth_resolver.lookup(domain, RecordType::CNAME).await {
+		match Self::lookup_with_retry(&auth_resolver, domain, RecordType::CNAME).await {
 			Ok(lookup) => {
 				for record in lookup.answers() {
 					if let RData::CNAME(cname) = &record.data {
 						let target = cname.0.to_string().trim_end_matches('.').to_string();
 						debug!(domain = %domain, cname = %target, "Found CNAME record");
-						return Ok(Some(target));
+						return Ok(LookupOutcome::Found(target));
 					}
 				}
+				Ok(LookupOutcome::NoRecord)
 			}
 			Err(e) => {
-				debug!(domain = %domain, error = %e, "CNAME lookup failed");
+				if e.is_no_records_found() {
+					debug!(
+						domain = %domain,
+						rtype = ?RecordType::CNAME,
+						error = %e,
+						"Authoritative NS returned no record (no answer)"
+					);
+					Ok(LookupOutcome::NoRecord)
+				} else {
+					Ok(LookupOutcome::LookupError)
+				}
 			}
 		}
-
-		Ok(None)
 	}
 }
 
@@ -260,7 +426,8 @@ pub async fn validate_domain_address(
 	);
 
 	// Try CNAME first
-	if let Some(resolved_cname) = resolver.resolve_cname(domain).await? {
+	let cname_outcome = resolver.resolve_cname_outcome(domain).await?;
+	if let LookupOutcome::Found(ref resolved_cname) = cname_outcome {
 		for local_addr in local_address {
 			if resolved_cname.eq_ignore_ascii_case(local_addr.as_ref()) {
 				info!(
@@ -269,7 +436,7 @@ pub async fn validate_domain_address(
 					matched_local_address = %local_addr,
 					"Domain validated via CNAME record"
 				);
-				return Ok((resolved_cname, AddressType::Hostname));
+				return Ok((resolved_cname.clone(), AddressType::Hostname));
 			}
 		}
 		warn!(
@@ -282,7 +449,8 @@ pub async fn validate_domain_address(
 	}
 
 	// Try A record
-	if let Some(resolved_ip) = resolver.resolve_a(domain).await? {
+	let a_outcome = resolver.resolve_a_outcome(domain).await?;
+	if let LookupOutcome::Found(ref resolved_ip) = a_outcome {
 		for local_addr in local_address {
 			if resolved_ip == local_addr.as_ref() {
 				info!(
@@ -291,7 +459,7 @@ pub async fn validate_domain_address(
 					matched_local_address = %local_addr,
 					"Domain validated via A record"
 				);
-				return Ok((resolved_ip, AddressType::Ipv4));
+				return Ok((resolved_ip.clone(), AddressType::Ipv4));
 			}
 		}
 		warn!(
@@ -303,8 +471,14 @@ pub async fn validate_domain_address(
 		return Err(Error::ValidationError("address".to_string()));
 	}
 
-	// Neither CNAME nor A record found
-	warn!(domain = %domain, "DNS validation failed: no CNAME or A record found");
+	// Neither CNAME nor A record found — log with the per-record-type outcome so
+	// the operator can tell "domain genuinely missing" from "lookup failed".
+	warn!(
+		domain = %domain,
+		cname_outcome = ?cname_outcome,
+		a_outcome = ?a_outcome,
+		"DNS validation failed: no CNAME or A record found (final result)"
+	);
 	Err(Error::ValidationError("nodns".to_string()))
 }
 
