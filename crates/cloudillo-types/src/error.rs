@@ -165,7 +165,15 @@ impl IntoResponse for Error {
 		};
 
 		let error_response = ErrorResponse::new(code, message);
-		(status, Json(error_response)).into_response()
+		let mut response = (status, Json(error_response)).into_response();
+		response.headers_mut().insert(
+			axum::http::header::CACHE_CONTROL,
+			axum::http::HeaderValue::from_static("no-store"),
+		);
+		response
+			.headers_mut()
+			.insert(axum::http::header::PRAGMA, axum::http::HeaderValue::from_static("no-cache"));
+		response
 	}
 }
 
