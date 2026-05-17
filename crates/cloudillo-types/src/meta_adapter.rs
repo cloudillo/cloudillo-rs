@@ -589,6 +589,9 @@ pub struct FileVariant<S: AsRef<str> + Debug> {
 	pub size: u64,
 	pub resolution: (u32, u32),
 	pub available: bool,
+	/// Blob stored in the shared `TnId(0)` store instead of this tenant's store.
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub global: bool,
 	/// Duration in seconds (for video/audio)
 	pub duration: Option<f64>,
 	/// Bitrate in kbps (for video/audio)
@@ -598,6 +601,8 @@ pub struct FileVariant<S: AsRef<str> + Debug> {
 	pub page_count: Option<u32>,
 }
 
+// `global` is a storage location, not part of content identity, so it is
+// deliberately excluded from PartialEq/Ord.
 impl<S: AsRef<str> + Debug> PartialEq for FileVariant<S> {
 	fn eq(&self, other: &Self) -> bool {
 		self.variant_id.as_ref() == other.variant_id.as_ref()
@@ -1287,6 +1292,17 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	) -> ClResult<Vec<FileVariant<Box<str>>>>;
 	/// List locally available variant names for a file (only those marked available)
 	async fn list_available_variants(&self, tn_id: TnId, file_id: &str) -> ClResult<Vec<Box<str>>>;
+	/// List every `variant_id` whose blob is expected to be present in the
+	/// given tenant's blob store. For `TnId(0)` returns the union of all
+	/// `global=1` variant rows across tenants; for other tenants returns only
+	/// the variants whose `global=0` (i.e., stored locally, not in shared).
+	async fn list_referenced_variant_ids(&self, tn_id: TnId) -> ClResult<Vec<Box<str>>>;
+	/// Targeted recheck for the blob GC: is there *currently* a `file_variants`
+	/// row that expects this blob to live in `tn_id`'s blob store? For
+	/// `TnId(0)` matches any `global=1` row; for other tenants matches a
+	/// `tn_id`-scoped `global=0` row. Used to close the race between the
+	/// referenced-set snapshot and the actual `delete_blob` call.
+	async fn is_variant_referenced(&self, tn_id: TnId, variant_id: &str) -> ClResult<bool>;
 	async fn read_file_variant(
 		&self,
 		tn_id: TnId,

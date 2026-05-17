@@ -137,6 +137,7 @@ impl Task<App> for AudioExtractorTask {
 					resolution: (0, 0),
 					size: file_size,
 					available: true,
+					global: false,
 					duration: Some(duration),
 					bitrate: Some(self.bitrate),
 					page_count: None,

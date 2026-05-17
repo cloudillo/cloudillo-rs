@@ -531,7 +531,7 @@ pub(crate) async fn list_variants(
 ) -> ClResult<Vec<FileVariant<Box<str>>>> {
 	let res = match file_id {
 		FileId::FId(f_id) => sqlx::query(
-			"SELECT variant_id, variant, res_x, res_y, format, size, available, duration, bitrate, page_count
+			"SELECT variant_id, variant, res_x, res_y, format, size, available, global, duration, bitrate, page_count
 			FROM file_variants WHERE tn_id=? AND f_id=?",
 		)
 		.bind(tn_id.0)
@@ -546,7 +546,7 @@ pub(crate) async fn list_variants(
 					.parse::<i64>()
 					.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 				sqlx::query(
-					"SELECT variant_id, variant, res_x, res_y, format, size, available, duration, bitrate, page_count
+					"SELECT variant_id, variant, res_x, res_y, format, size, available, global, duration, bitrate, page_count
 					FROM file_variants WHERE tn_id=? AND f_id=?",
 				)
 				.bind(tn_id.0)
@@ -556,7 +556,7 @@ pub(crate) async fn list_variants(
 				.inspect_err(inspect)
 				.map_err(|_| Error::DbError)?
 			} else {
-				sqlx::query("SELECT fv.variant_id, fv.variant, fv.res_x, fv.res_y, fv.format, fv.size, fv.available, fv.duration, fv.bitrate, fv.page_count
+				sqlx::query("SELECT fv.variant_id, fv.variant, fv.res_x, fv.res_y, fv.format, fv.size, fv.available, fv.global, fv.duration, fv.bitrate, fv.page_count
 					FROM files f
 					JOIN file_variants fv ON fv.tn_id=f.tn_id AND fv.f_id=f.f_id
 					WHERE f.tn_id=? AND f.file_id=?")
@@ -576,6 +576,7 @@ pub(crate) async fn list_variants(
 			format: row.try_get("format")?,
 			size: row.try_get("size")?,
 			available: row.try_get("available")?,
+			global: row.try_get::<Option<bool>, _>("global").ok().flatten().unwrap_or(false),
 			duration: row.try_get::<Option<f64>, _>("duration").ok().flatten(),
 			bitrate: row
 				.try_get::<Option<i64>, _>("bitrate")
@@ -613,6 +614,68 @@ pub(crate) async fn list_available_variants(
 	collect_res(res.iter().map(|row| row.try_get("variant")))
 }
 
+/// List every `variant_id` whose blob is expected to be on disk for a given
+/// tenant's blob store.
+///
+/// - `tn_id != 0`: variants with `global=0` (stored in this tenant's store).
+/// - `tn_id == 0`: variants with `global=1` across all tenants (the union
+///   referencing the shared store).
+pub(crate) async fn list_referenced_variant_ids(
+	db: &SqlitePool,
+	tn_id: TnId,
+) -> ClResult<Vec<Box<str>>> {
+	let res = if tn_id.0 == 0 {
+		sqlx::query(
+			"SELECT DISTINCT variant_id FROM file_variants WHERE global = 1 AND variant_id IS NOT NULL",
+		)
+		.fetch_all(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?
+	} else {
+		sqlx::query(
+			"SELECT DISTINCT variant_id FROM file_variants
+			 WHERE tn_id = ? AND COALESCE(global, 0) = 0 AND variant_id IS NOT NULL",
+		)
+		.bind(tn_id.0)
+		.fetch_all(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?
+	};
+
+	collect_res(res.iter().map(|row| row.try_get("variant_id")))
+}
+
+/// Targeted check used by the blob GC just before a delete: is there
+/// currently a `file_variants` row that expects this blob in `tn_id`'s store?
+pub(crate) async fn is_variant_referenced(
+	db: &SqlitePool,
+	tn_id: TnId,
+	variant_id: &str,
+) -> ClResult<bool> {
+	let row = if tn_id.0 == 0 {
+		sqlx::query("SELECT 1 FROM file_variants WHERE variant_id = ? AND global = 1 LIMIT 1")
+			.bind(variant_id)
+			.fetch_optional(db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?
+	} else {
+		sqlx::query(
+			"SELECT 1 FROM file_variants
+			 WHERE tn_id = ? AND variant_id = ? AND COALESCE(global, 0) = 0 LIMIT 1",
+		)
+		.bind(tn_id.0)
+		.bind(variant_id)
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?
+	};
+	Ok(row.is_some())
+}
+
 /// List available (locally present) variant names for a file by f_id
 pub(crate) async fn list_available_variants_by_fid(
 	db: &SqlitePool,
@@ -642,7 +705,7 @@ pub(crate) async fn read_variant(
 ) -> ClResult<FileVariant<Box<str>>> {
 	debug!("read_variant: tn_id={}, variant_id={}", tn_id.0, variant_id);
 	let res = sqlx::query(
-		"SELECT variant_id, variant, res_x, res_y, format, size, available, duration, bitrate, page_count
+		"SELECT variant_id, variant, res_x, res_y, format, size, available, global, duration, bitrate, page_count
 			FROM file_variants WHERE tn_id=? AND variant_id=?",
 	)
 	.bind(tn_id.0)
@@ -661,6 +724,7 @@ pub(crate) async fn read_variant(
 			format: row.try_get("format")?,
 			size: row.try_get("size")?,
 			available: row.try_get("available")?,
+			global: row.try_get::<Option<bool>, _>("global").ok().flatten().unwrap_or(false),
 			duration: row.try_get::<Option<f64>, _>("duration").ok().flatten(),
 			bitrate: row
 				.try_get::<Option<i64>, _>("bitrate")
@@ -792,8 +856,28 @@ pub(crate) async fn create_variant<'a>(
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
-	let _res = sqlx::query("INSERT OR IGNORE INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size, available, duration, bitrate, page_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		.bind(tn_id.0).bind(f_id.cast_signed()).bind(opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size.cast_signed()).bind(opts.available).bind(opts.duration).bind(opts.bitrate.map(i64::from)).bind(opts.page_count.map(i64::from))
+	// Upgrade-friendly insert: a prior sync may have written a metadata-only
+	// row (`available=0, global=0`) for this variant when content was not
+	// being fetched. A later sync that *does* fetch content (and may route
+	// the blob to the shared `TnId(0)` store) must overwrite size/available/
+	// global on that placeholder row, otherwise reads would route to the
+	// wrong store and a backfilled blob would have no `global=1` reference
+	// — the GC would then collect it.
+	//
+	// The `WHERE file_variants.available = 0` guard preserves the existing
+	// "first writer wins" semantics for already-available rows: two concurrent
+	// uploaders racing the original INSERT OR IGNORE both succeeded without
+	// overwriting; the same property holds here for the available case.
+	let _res = sqlx::query(
+		"INSERT INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, size, available, global, duration, bitrate, page_count) \
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+		 ON CONFLICT(f_id, variant_id, tn_id) DO UPDATE SET \
+		     size      = excluded.size, \
+		     available = excluded.available, \
+		     global    = excluded.global \
+		 WHERE file_variants.available = 0",
+	)
+		.bind(tn_id.0).bind(f_id.cast_signed()).bind(opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size.cast_signed()).bind(opts.available).bind(opts.global).bind(opts.duration).bind(opts.bitrate.map(i64::from)).bind(opts.page_count.map(i64::from))
 		.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 	tx.commit().await.map_err(|_| Error::DbError)?;
 

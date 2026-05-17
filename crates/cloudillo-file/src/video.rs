@@ -152,6 +152,7 @@ impl Task<App> for VideoTranscoderTask {
 					resolution,
 					size: file_size,
 					available: true,
+					global: false,
 					duration: Some(duration),
 					bitrate: Some(self.bitrate),
 					page_count: None,

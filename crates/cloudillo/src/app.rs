@@ -407,6 +407,10 @@ impl AppBuilder {
 			callback(app.clone()).await?;
 		}
 
+		// Schedule recurring file-subsystem jobs (blob GC). Needs scheduler
+		// registration done above and settings service available.
+		file::schedule_recurring(&app).await?;
+
 		// Start scheduler
 		app.scheduler.start(app.clone());
 

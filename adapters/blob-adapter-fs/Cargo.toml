@@ -12,6 +12,7 @@ categories = ["filesystem", "database-implementations"]
 readme = "../../README.md"
 
 [dependencies]
+async-stream = "0.3"
 async-trait = "0.1.89"
 cloudillo-types = { workspace = true }
 futures-core = "0.3.32"

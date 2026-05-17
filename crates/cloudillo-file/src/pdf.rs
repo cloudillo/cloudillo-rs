@@ -160,6 +160,7 @@ pub async fn generate_pdf_thumbnail_variant(
 				resolution: (resize_result.width, resize_result.height),
 				size: resize_result.bytes.len() as u64,
 				available: true,
+				global: false,
 				duration: None,
 				bitrate: None,
 				page_count: Some(pdf_info.page_count),

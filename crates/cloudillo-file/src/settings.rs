@@ -111,6 +111,44 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Shared blob store master switch
+	registry.register(
+		SettingDefinition::builder("file.shared_blob_store_enabled")
+			.description("Use the shared TnId(0) blob store for Public/Verified federated attachments (deduplicates across tenants)")
+			.default(SettingValue::Bool(true))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
+	// Blob GC
+	registry.register(
+		SettingDefinition::builder("file.blob_gc_enabled")
+			.description("Enable the periodic blob garbage collector")
+			.default(SettingValue::Bool(true))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+	registry.register(
+		SettingDefinition::builder("file.blob_gc_cron")
+			.description(
+				"Cron expression for the blob GC schedule (5-field: 'minute hour day month weekday')",
+			)
+			.default(SettingValue::String("0 4 * * *".into()))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+	registry.register(
+		SettingDefinition::builder("file.blob_gc_safety_window_secs")
+			.description("Minimum age (seconds) before an orphan blob becomes eligible for GC — protects against sync-in-progress races")
+			.default(SettingValue::Int(3600))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
 	// Storage quota
 	registry.register(
 		SettingDefinition::builder("limits.max_storage_gb")

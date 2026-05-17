@@ -307,7 +307,8 @@ async fn sync_profile_pic_variant(
 		file_id
 	);
 
-	// Sync only the profile-picture variant (public, no auth needed)
+	// Sync only the profile-picture variant (public, no auth needed).
+	// Profile pictures are inherently Public so the shared blob cache applies.
 	let result = sync_file_variants(
 		app,
 		tn_id,
@@ -315,7 +316,7 @@ async fn sync_profile_pic_variant(
 		file_id,
 		Some(&[PROFILE_PIC_VARIANT]),
 		false,
-		None,
+		Some('P'),
 		false,
 	)
 	.await?;

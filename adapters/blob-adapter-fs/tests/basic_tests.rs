@@ -35,7 +35,7 @@ async fn test_create_and_retrieve_blob() {
 		.expect("Failed to create blob");
 
 	// Verify blob exists via stat
-	let size = adapter.stat_blob(tn_id, file_id).await.expect("Failed to stat blob");
+	let size = adapter.stat_blob(tn_id, file_id).await.expect("Failed to stat blob").size;
 	assert_eq!(size, test_data.len() as u64);
 }
 
@@ -54,7 +54,7 @@ async fn test_create_blob_empty_data() {
 		.expect("Failed to create empty blob");
 
 	// Verify empty blob exists
-	let size = adapter.stat_blob(tn_id, file_id).await.expect("Failed to stat blob");
+	let size = adapter.stat_blob(tn_id, file_id).await.expect("Failed to stat blob").size;
 	assert_eq!(size, 0);
 }
 
@@ -79,8 +79,16 @@ async fn test_per_tenant_isolation() {
 		.expect("Failed to create blob for tenant 2");
 
 	// Verify both exist with correct sizes
-	let size1 = adapter.stat_blob(TnId(1), file_id).await.expect("Tenant 1 blob should exist");
-	let size2 = adapter.stat_blob(TnId(2), file_id).await.expect("Tenant 2 blob should exist");
+	let size1 = adapter
+		.stat_blob(TnId(1), file_id)
+		.await
+		.expect("Tenant 1 blob should exist")
+		.size;
+	let size2 = adapter
+		.stat_blob(TnId(2), file_id)
+		.await
+		.expect("Tenant 2 blob should exist")
+		.size;
 
 	assert_eq!(size1, data1.len() as u64);
 	assert_eq!(size2, data2.len() as u64);

@@ -13,8 +13,11 @@ use crate::prelude::*;
 #[derive(Clone, Default)]
 pub struct CreateBlobOptions {}
 
+#[derive(Debug, Clone)]
 pub struct BlobStat {
 	pub size: u64,
+	/// Unix epoch seconds of the blob's last modification (or creation).
+	pub modified_at: i64,
 }
 
 #[async_trait]
@@ -36,8 +39,8 @@ pub trait BlobAdapter: Debug + Send + Sync {
 		stream: &mut (dyn AsyncRead + Send + Unpin),
 	) -> ClResult<()>;
 
-	/// Stats a blob
-	async fn stat_blob(&self, tn_id: TnId, blob_id: &str) -> Option<u64>;
+	/// Stats a blob. Returns `None` if the blob is not present.
+	async fn stat_blob(&self, tn_id: TnId, blob_id: &str) -> Option<BlobStat>;
 
 	/// Reads a blob
 	async fn read_blob_buf(&self, tn_id: TnId, blob_id: &str) -> ClResult<Box<[u8]>>;
@@ -70,6 +73,23 @@ pub trait BlobAdapter: Debug + Send + Sync {
 	/// Delete every blob owned by the tenant. Treats a missing tenant directory
 	/// as success. Used by tenant purge orchestration.
 	async fn delete_tenant_blobs(&self, tn_id: TnId) -> ClResult<()>;
+
+	/// Delete a single blob. Missing blob is success (idempotent).
+	async fn delete_blob(&self, tn_id: TnId, blob_id: &str) -> ClResult<()>;
+
+	/// Enumerate every `blob_id` (typically a `variant_id`) currently present
+	/// in this tenant's blob store. Used by the GC scanner.
+	async fn list_blobs(
+		&self,
+		tn_id: TnId,
+	) -> ClResult<Pin<Box<dyn Stream<Item = ClResult<String>> + Send>>>;
+
+	/// Delete in-progress upload artifacts whose mtime is at or before
+	/// `cutoff_secs` (Unix epoch seconds). These are written outside the
+	/// content-addressed `xx/yy/` shards by `create_blob_stream`, so they
+	/// are invisible to `list_blobs`. Returns the number of files removed.
+	/// Adapters with no notion of tmp files may return `Ok(0)`.
+	async fn cleanup_tmp_files(&self, tn_id: TnId, cutoff_secs: i64) -> ClResult<u64>;
 }
 
 // vim: ts=4

@@ -328,7 +328,8 @@ pub async fn get_file_variant(
 ) -> ClResult<impl response::IntoResponse> {
 	let variant = app.meta_adapter.read_file_variant(tn_id, &variant_id).await?;
 	info!("variant: {:?}", variant);
-	let stream = app.blob_adapter.read_blob_stream(tn_id, &variant_id).await?;
+	let blob_tn = if variant.global { TnId(0) } else { tn_id };
+	let stream = app.blob_adapter.read_blob_stream(blob_tn, &variant_id).await?;
 
 	serve_file(None, &variant, stream, app.opts.disable_cache)
 }
@@ -356,7 +357,8 @@ pub async fn get_file_variant_file_id(
 	debug!("variants: {:?}", variants);
 
 	let variant = descriptor::get_best_file_variant(&variants, &selector)?;
-	let stream = app.blob_adapter.read_blob_stream(tn_id, &variant.variant_id).await?;
+	let blob_tn = if variant.global { TnId(0) } else { tn_id };
+	let stream = app.blob_adapter.read_blob_stream(blob_tn, &variant.variant_id).await?;
 
 	let root_id = app.meta_adapter.read_file(tn_id, &file_id).await?.and_then(|f| f.root_id);
 	let descriptor = descriptor::get_file_descriptor(&variants, root_id.as_deref());
@@ -486,6 +488,7 @@ async fn handle_post_svg(
 				resolution: (orig_width, orig_height),
 				size: sanitized.len() as u64,
 				available: preset.store_original,
+				global: false,
 				duration: None,
 				bitrate: None,
 				page_count: None,
@@ -521,6 +524,7 @@ async fn handle_post_svg(
 				resolution: (resized_tn.width, resized_tn.height),
 				size: resized_tn.bytes.len() as u64,
 				available: true,
+				global: false,
 				duration: None,
 				bitrate: None,
 				page_count: None,
@@ -591,6 +595,7 @@ async fn handle_post_video_stream(
 				resolution,
 				size: total_size,
 				available: blob_stored,
+				global: false,
 				duration: Some(duration),
 				bitrate: None,
 				page_count: None,
@@ -643,6 +648,7 @@ async fn handle_post_video_stream(
 				resolution: (thumbnail_result.width, thumbnail_result.height),
 				size: thumbnail_result.bytes.len() as u64,
 				available: true,
+				global: false,
 				duration: None,
 				bitrate: None,
 				page_count: None,
@@ -783,6 +789,7 @@ async fn handle_post_audio_stream(
 				resolution: (0, 0),
 				size: total_size,
 				available: blob_stored,
+				global: false,
 				duration: Some(duration),
 				bitrate: None,
 				page_count: None,
@@ -861,6 +868,7 @@ async fn handle_post_pdf(
 				resolution: (0, 0),
 				size: bytes.len() as u64,
 				available: true,
+				global: false,
 				duration: None,
 				bitrate: None,
 				page_count: Some(pdf_result.page_count),
@@ -916,6 +924,7 @@ async fn handle_post_raw_stream(
 				resolution: (0, 0),
 				size: total_size,
 				available: true,
+				global: false,
 				duration: None,
 				bitrate: None,
 				page_count: None,

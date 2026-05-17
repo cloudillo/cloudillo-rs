@@ -757,6 +757,7 @@ dependencies = [
 name = "cloudillo-blob-adapter-fs"
 version = "0.8.13"
 dependencies = [
+ "async-stream",
  "async-trait",
  "cloudillo-types",
  "futures-core",

@@ -60,7 +60,8 @@ async fn test_sequential_blob_creation() {
 		let size = adapter
 			.stat_blob(tn_id, &file_id)
 			.await
-			.unwrap_or_else(|| panic!("Blob {} should exist", i));
+			.unwrap_or_else(|| panic!("Blob {} should exist", i))
+			.size;
 		assert!(size > 0, "Blob {} should have content", i);
 	}
 }

@@ -55,7 +55,8 @@ async fn test_concurrent_blob_creation() {
 		let size = adapter
 			.stat_blob(tn_id, &file_id)
 			.await
-			.unwrap_or_else(|| panic!("Blob {} should exist", i));
+			.unwrap_or_else(|| panic!("Blob {} should exist", i))
+			.size;
 		assert!(size > 0);
 	}
 }
@@ -83,7 +84,8 @@ async fn test_concurrent_read_write() {
 			let size = adapter_clone
 				.stat_blob(tn_id, file_id)
 				.await
-				.unwrap_or_else(|| panic!("Read {} failed", i));
+				.unwrap_or_else(|| panic!("Read {} failed", i))
+				.size;
 			assert!(size > 0);
 		});
 		handles.push(handle);
@@ -131,7 +133,8 @@ async fn test_concurrent_multi_tenant_isolation() {
 			let size = adapter
 				.stat_blob(TnId(tn), &file_id)
 				.await
-				.unwrap_or_else(|| panic!("Tenant {} blob {} should exist", tn, i));
+				.unwrap_or_else(|| panic!("Tenant {} blob {} should exist", tn, i))
+				.size;
 			assert!(size > 0);
 		}
 	}

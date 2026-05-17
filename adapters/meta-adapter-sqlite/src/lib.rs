@@ -315,6 +315,14 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::list_available_variants(&self.dbr, tn_id, file_id).await
 	}
 
+	async fn list_referenced_variant_ids(&self, tn_id: TnId) -> ClResult<Vec<Box<str>>> {
+		file::list_referenced_variant_ids(&self.dbr, tn_id).await
+	}
+
+	async fn is_variant_referenced(&self, tn_id: TnId, variant_id: &str) -> ClResult<bool> {
+		file::is_variant_referenced(&self.dbr, tn_id, variant_id).await
+	}
+
 	async fn read_file_variant(
 		&self,
 		tn_id: TnId,

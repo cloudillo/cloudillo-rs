@@ -35,6 +35,15 @@ pub struct SyncResult {
 	pub skipped_variants: Vec<String>,
 }
 
+/// The system tenant used as the shared blob cache for federated public/verified attachments.
+const SHARED_TN: TnId = TnId(0);
+
+/// A federated variant is eligible for the shared store iff the action driving
+/// the sync has Public ('P') or Verified ('V') visibility.
+fn use_shared_store(visibility: Option<char>) -> bool {
+	matches!(visibility, Some('P' | 'V'))
+}
+
 /// Variant size ordering for filtering by max_cache_variant setting
 const VARIANT_ORDER: &[&str] = &["tn", "pf", "sd", "md", "hd", "xd"];
 
@@ -164,6 +173,16 @@ pub async fn sync_file_variants(
 		.and_then(|v| u64::try_from(v).ok())
 		.unwrap_or(300);
 	let variant_timeout = Duration::from_secs(variant_timeout_secs);
+
+	// Master switch for the shared blob store. Read once per sync invocation.
+	let shared_store_enabled = app
+		.settings
+		.get_bool_opt(SHARED_TN, "file.shared_blob_store_enabled")
+		.await
+		.ok()
+		.flatten()
+		.unwrap_or(true);
+	let shared = shared_store_enabled && use_shared_store(visibility);
 
 	// 1. Fetch file descriptor from remote
 	let descriptor_path = format!("/files/{}/descriptor", file_id);
@@ -301,15 +320,17 @@ pub async fn sync_file_variants(
 	// 6. Check if file already exists by file_id and get its f_id
 	let existing_f_id = app.meta_adapter.read_f_id_by_file_id(tn_id, file_id).await.ok();
 
-	// Also get existing variant records to know which ones need to be created
-	let existing_variants: Vec<String> = if existing_f_id.is_some() {
+	// Also get existing variant records to know which ones need to be created.
+	// Preserve the `available` flag so we can distinguish fully-synced rows from
+	// metadata-only stubs (available=false) created by an earlier partial sync.
+	let existing_variants: HashMap<String, bool> = if existing_f_id.is_some() {
 		app.meta_adapter
 			.list_file_variants(tn_id, cloudillo_types::meta_adapter::FileId::FileId(file_id))
 			.await
-			.map(|v| v.iter().map(|fv| fv.variant.to_string()).collect())
+			.map(|v| v.into_iter().map(|fv| (fv.variant.to_string(), fv.available)).collect())
 			.unwrap_or_default()
 	} else {
-		vec![]
+		HashMap::new()
 	};
 
 	let (f_id, is_new_file): (Option<u64>, bool) = if let Some(f_id) = existing_f_id {
@@ -365,30 +386,54 @@ pub async fn sync_file_variants(
 		let variant_name = variant.variant;
 		let should_sync_content = variants_to_sync_set.contains(variant_name);
 
-		// Check if this variant record already exists in the database
-		let variant_record_exists = existing_variants.iter().any(|v| v == variant_name);
-
-		if variant_record_exists {
-			// Variant record already exists - skip
-			debug!("  variant {} record already exists, skipping", variant_name);
+		// Skip only if the row is already AVAILABLE. If it's a metadata-only stub
+		// (available=false) and we're about to fetch the content, fall through so
+		// `create_file_variant`'s ON CONFLICT clause can upgrade it.
+		if matches!(existing_variants.get(variant_name), Some(true)) {
+			debug!("  variant {} record already available, skipping", variant_name);
+			result.skipped_variants.push(variant_name.to_string());
+			continue;
+		}
+		if existing_variants.contains_key(variant_name) && !should_sync_content {
+			// Stub exists, still not syncing content → leave as-is.
+			debug!("  variant {} stub exists and content not requested, skipping", variant_name);
 			result.skipped_variants.push(variant_name.to_string());
 			continue;
 		}
 
-		// Determine blob size and availability
-		let (blob_size, available) = if should_sync_content {
-			// This variant should have its content synced
-			if let Some(size) = app.blob_adapter.stat_blob(tn_id, variant_id).await {
-				// Blob already exists - use its size
+		// Determine blob size, availability, and where the blob lives.
+		// When `shared` is true the blob lives under `TnId(0)`; the per-tenant
+		// `file_variants` row records that via `global=true`. We probe the
+		// shared store first, then fall back to the per-tenant store (covering
+		// the case where this tenant fetched the same blob before this feature
+		// shipped — no backfill).
+		let (blob_size, available, stored_global) = if should_sync_content {
+			let mut found: Option<(u64, bool)> = None;
+			if shared && let Some(stat) = app.blob_adapter.stat_blob(SHARED_TN, variant_id).await {
+				info!("  shared variant {} already in TnId(0), skipping download", variant_id);
+				found = Some((stat.size, true));
+			}
+			if found.is_none()
+				&& let Some(stat) = app.blob_adapter.stat_blob(tn_id, variant_id).await
+			{
 				debug!("  variant {} blob already exists", variant_name);
+				found = Some((stat.size, false));
+			}
+
+			if let Some((size, in_shared)) = found {
 				result.skipped_variants.push(variant_name.to_string());
-				(size, true)
+				(size, true, in_shared)
 			} else {
-				// Fetch variant data from remote
+				// Fetch variant data from remote — write to shared store when eligible.
+				let store_tn = if shared { SHARED_TN } else { tn_id };
+				if shared {
+					info!("  storing variant {} to shared store TnId(0)", variant_id);
+				}
 				match fetch_and_store_blob(
 					app,
-					tn_id,
+					store_tn,
 					remote_id_tag,
+					tn_id,
 					variant_id,
 					variant_name,
 					auth,
@@ -399,7 +444,7 @@ pub async fn sync_file_variants(
 					Ok(size) => {
 						info!("  synced variant {} ({})", variant_name, variant_id);
 						result.synced_variants.push(variant_name.to_string());
-						(size, true)
+						(size, true, shared)
 					}
 					Err(e) => {
 						// Atomic sync: any fetch failure aborts. The file row
@@ -417,7 +462,7 @@ pub async fn sync_file_variants(
 			// This variant is metadata-only (not syncing content)
 			debug!("  variant {} metadata-only (not syncing content)", variant_name);
 			result.skipped_variants.push(variant_name.to_string());
-			(variant.size, false) // Use size from descriptor, mark as unavailable
+			(variant.size, false, false) // Use size from descriptor, mark as unavailable
 		};
 
 		// Create file variant record in MetaAdapter
@@ -429,6 +474,7 @@ pub async fn sync_file_variants(
 				resolution: variant.resolution,
 				size: blob_size,
 				available,
+				global: stored_global,
 				duration: variant.duration,
 				bitrate: variant.bitrate,
 				page_count: variant.page_count,
@@ -467,21 +513,26 @@ pub async fn sync_file_variants(
 /// operation is bounded by `timeout` to guard against stalled connections.
 ///
 /// Returns the blob size on success.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_and_store_blob(
 	app: &App,
-	tn_id: TnId,
+	store_tn: TnId,
 	remote_id_tag: &str,
+	request_tn: TnId,
 	variant_id: &str,
 	variant_name: &str,
 	auth: bool,
 	timeout: Duration,
 ) -> ClResult<u64> {
 	let variant_path = format!("/files/variant/{}", variant_id);
-	let mut stream = app.request.get_stream(tn_id, remote_id_tag, &variant_path, auth).await?;
+	// The HTTP request itself uses the requesting tenant's identity (so we
+	// authenticate as the tenant the sync is happening for); the blob is
+	// stored under `store_tn` which may be `TnId(0)` for the shared store.
+	let mut stream = app.request.get_stream(request_tn, remote_id_tag, &variant_path, auth).await?;
 
 	let store_res = tokio::time::timeout(
 		timeout,
-		app.blob_adapter.create_blob_stream(tn_id, variant_id, &mut stream),
+		app.blob_adapter.create_blob_stream(store_tn, variant_id, &mut stream),
 	)
 	.await
 	.map_err(|_| Error::Timeout)?;
@@ -495,9 +546,10 @@ async fn fetch_and_store_blob(
 
 	let blob_size = app
 		.blob_adapter
-		.stat_blob(tn_id, variant_id)
+		.stat_blob(store_tn, variant_id)
 		.await
-		.ok_or_else(|| Error::Internal("blob disappeared after streaming write".into()))?;
+		.ok_or_else(|| Error::Internal("blob disappeared after streaming write".into()))?
+		.size;
 
 	Ok(blob_size)
 }
