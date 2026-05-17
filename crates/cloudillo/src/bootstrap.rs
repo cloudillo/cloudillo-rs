@@ -12,7 +12,6 @@ use crate::settings::SettingValue;
 use crate::utils::derive_name_from_id_tag;
 use cloudillo_core::acme;
 use cloudillo_core::acme::handle_renewal_success;
-use cloudillo_core::scheduler::Task as _;
 use cloudillo_types::auth_adapter::TenantCertRenewalRow;
 
 /// Default identity provider domain
@@ -344,13 +343,13 @@ pub async fn bootstrap(app: Arc<AppState>, opts: &crate::app::AppBuilderOpts) ->
 			Arc::new(acme::CertRenewalTask::new(acme_email.to_string(), renewal_days));
 
 		let app_clone = app.clone();
-		let renewal_task_for_startup = renewal_task.clone();
 		tokio::spawn(async move {
 			match app_clone
 				.scheduler
 				.task(renewal_task)
 				.key("acme.cert_renewal") // Unique key prevents duplicates on restart
 				.cron(&cron_expr)
+				.run_on_startup()
 				.schedule()
 				.await
 			{
@@ -360,14 +359,6 @@ pub async fn bootstrap(app: Arc<AppState>, opts: &crate::app::AppBuilderOpts) ->
 				Err(e) => {
 					error!(error = %e, "Failed to schedule certificate renewal task");
 				}
-			}
-
-			// Run the same task body now so startup behaves identically to
-			// the nightly run: DNS pre-check, failure tracking, suspension,
-			// and notification all apply.
-			info!("Running initial certificate check on startup...");
-			if let Err(e) = renewal_task_for_startup.run(&app_clone).await {
-				warn!(error = %e, "Initial certificate check failed");
 			}
 		});
 	} else {
@@ -384,6 +375,7 @@ pub async fn bootstrap(app: Arc<AppState>, opts: &crate::app::AppBuilderOpts) ->
 				.task(refresh_task)
 				.key("profile.refresh_batch")
 				.cron("0 */4 * * *") // Every 4 hours
+				.run_on_startup()
 				.schedule()
 				.await
 			{
@@ -407,6 +399,7 @@ pub async fn bootstrap(app: Arc<AppState>, opts: &crate::app::AppBuilderOpts) ->
 				.task(cleanup_task)
 				.key("auth.cleanup")
 				.cron("0 3 * * *") // Daily at 3 AM
+				.run_on_startup()
 				.schedule()
 				.await
 			{

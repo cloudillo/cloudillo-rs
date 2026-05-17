@@ -362,6 +362,7 @@ pub struct TaskSchedulerBuilder<'a, S: Clone> {
 	deps: Vec<TaskId>,
 	retry: Option<RetryPolicy>,
 	cron: Option<CronSchedule>,
+	run_on_startup: bool,
 }
 
 impl<'a, S: Clone + Send + Sync + 'static> TaskSchedulerBuilder<'a, S> {
@@ -375,6 +376,7 @@ impl<'a, S: Clone + Send + Sync + 'static> TaskSchedulerBuilder<'a, S> {
 			deps: Vec::new(),
 			retry: None,
 			cron: None,
+			run_on_startup: false,
 		}
 	}
 
@@ -459,6 +461,15 @@ impl<'a, S: Clone + Send + Sync + 'static> TaskSchedulerBuilder<'a, S> {
 		self
 	}
 
+	/// Opt-in: if this is a cron task and a scheduled run was missed
+	/// while the server was down (or this is the first time the task
+	/// is being registered), run it once immediately on startup before
+	/// resuming the normal cron schedule.
+	pub fn run_on_startup(mut self) -> Self {
+		self.run_on_startup = true;
+		self
+	}
+
 	/// Execute the scheduled task immediately
 	pub async fn now(self) -> ClResult<TaskId> {
 		self.schedule().await
@@ -498,6 +509,7 @@ impl<'a, S: Clone + Send + Sync + 'static> TaskSchedulerBuilder<'a, S> {
 				if self.deps.is_empty() { None } else { Some(self.deps) },
 				self.retry,
 				self.cron,
+				self.run_on_startup,
 			)
 			.await
 	}
@@ -777,6 +789,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 	/// Internal method to schedule a task with all options
 	/// This is the core implementation used by the builder pattern
+	#[allow(clippy::too_many_arguments)]
 	async fn schedule_task_impl(
 		&self,
 		task: Arc<dyn Task<S>>,
@@ -785,10 +798,34 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		deps: Option<Vec<TaskId>>,
 		retry: Option<RetryPolicy>,
 		cron: Option<CronSchedule>,
+		run_on_startup: bool,
 	) -> ClResult<TaskId> {
+		// Look up any existing task by key once; reuse for both the
+		// run_on_startup decision and the dedup branch below.
+		let existing = if let Some(k) = key { self.store.find_by_key(k).await? } else { None };
+
+		// Resolve effective next_at, factoring in run_on_startup for cron tasks.
+		let effective_next_at = if run_on_startup && cron.is_some() {
+			match &existing {
+				Some((_existing_id, existing_data)) => {
+					// Task exists from a previous run. If its persisted
+					// next_at has already passed (or is missing), we missed
+					// a run while down — fire now. Otherwise honor the
+					// persisted future schedule.
+					match existing_data.next_at {
+						Some(persisted) if persisted > Timestamp::now() => next_at,
+						_ => Some(Timestamp::now()),
+					}
+				}
+				None => Some(Timestamp::now()), // fresh registration → run now
+			}
+		} else {
+			next_at
+		};
+
 		let task_meta = TaskMeta {
 			task: task.clone(),
-			next_at,
+			next_at: effective_next_at,
 			deps: deps.clone().unwrap_or_default(),
 			retry_count: 0,
 			retry,
@@ -797,7 +834,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 		// Check if a task with this key already exists (key-based deduplication)
 		if let Some(key) = key
-			&& let Some((existing_id, existing_data)) = self.store.find_by_key(key).await?
+			&& let Some((existing_id, existing_data)) = existing
 		{
 			let new_serialized = task.serialize();
 			let existing_serialized = existing_data.input.as_ref();
