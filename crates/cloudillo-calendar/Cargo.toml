@@ -7,7 +7,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "Calendar management (JSON REST + CalDAV) for the Cloudillo federated collaboration platform"
-keywords = ["cloudillo", "calendar", "caldav", "icalendar", "vevent", "vtodo"]
+keywords = ["cloudillo", "calendar", "caldav", "icalendar", "vevent"]
 categories = ["web-programming"]
 readme = "../../README.md"
 
