@@ -30,8 +30,16 @@ pub struct SettingResponse {
 /// Query parameters for listing settings
 #[derive(Deserialize, Default)]
 pub struct ListSettingsQuery {
-	/// Filter settings by key prefix (e.g., "ui", "notify")
+	/// Comma-separated list of key prefixes (e.g., "file,limits").
+	/// Each prefix is matched as `<prefix>.%` against stored setting names.
 	pub prefix: Option<String>,
+	/// Resolution level — mirrors GET /settings/:name:
+	///   - omitted: full resolution chain (tenant overrides global).
+	///   - "global": raw rows from TnId(0) only.
+	///   - "tenant": raw rows from the caller's (or `tenant=` target's) tenant only.
+	pub level: Option<String>,
+	/// SADM-only: target tenant idTag for cross-tenant reads. Only meaningful with level=tenant.
+	pub tenant: Option<String>,
 }
 
 /// GET /settings - List all settings for authenticated tenant
@@ -45,10 +53,51 @@ pub async fn list_settings(
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<SettingResponse>>>)> {
 	let mut settings_response = Vec::new();
 
+	// `level` requires `prefix`: the no-prefix branch iterates registry
+	// definitions through the normal resolution chain, where "raw at level"
+	// has no clean meaning. Reject explicitly rather than silently ignore.
+	if query.level.is_some() && query.prefix.is_none() {
+		return Err(Error::ValidationError("level requires prefix".into()));
+	}
+
 	if let Some(ref prefix) = query.prefix {
-		// Query stored settings from database matching prefix
-		// Uses wildcard pattern matching (e.g., "ui.theme" matches "ui.*" definition)
-		for (key, value, definition) in app.settings.list_by_prefix(auth.tn_id, prefix).await? {
+		// Split the comma-joined prefix list, trim, drop empties.
+		let prefixes: Vec<String> = prefix
+			.split(',')
+			.map(|s| s.trim().to_string())
+			.filter(|s| !s.is_empty())
+			.collect();
+
+		// `tenant=` is meaningless with `level=global` (the global row is shared
+		// across all tenants). Reject explicitly rather than silently ignore, to
+		// match the documented intent on `SettingScopeQuery`.
+		if matches!(query.level.as_deref(), Some("global")) && query.tenant.is_some() {
+			return Err(Error::ValidationError("tenant= is not allowed with level=global".into()));
+		}
+
+		// Resolve target tenant (SADM-only when `tenant=` is supplied).
+		let target_tn_id = resolve_target_tn_id(&app, &auth, query.tenant.as_deref()).await?;
+
+		let rows = match query.level.as_deref() {
+			Some("global") => {
+				// SADM unconditionally for level=global on the list endpoint.
+				// This is stricter than `get_setting`'s per-scope guard but is
+				// simpler and safe because list returns mixed-scope keys —
+				// without per-row scope checks, we can't selectively allow
+				// Tenant-scoped global rows for non-SADM callers.
+				if !auth.roles.iter().any(|r| r.as_ref() == "SADM") {
+					return Err(Error::PermissionDenied);
+				}
+				app.settings.list_by_prefix_at(TnId(0), &prefixes).await?
+			}
+			Some("tenant") => app.settings.list_by_prefix_at(target_tn_id, &prefixes).await?,
+			Some(other) => {
+				return Err(Error::ValidationError(format!("unknown level: {}", other)));
+			}
+			None => app.settings.list_by_prefix(target_tn_id, &prefixes).await?,
+		};
+
+		for (key, value, definition) in rows {
 			settings_response.push(SettingResponse {
 				key,
 				value,

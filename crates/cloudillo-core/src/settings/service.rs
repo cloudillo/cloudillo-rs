@@ -476,22 +476,22 @@ impl SettingsService {
 
 	/// List stored settings by prefix with definition metadata
 	///
-	/// This queries the database for actual stored settings matching the prefix,
+	/// This queries the database for actual stored settings matching the prefixes,
 	/// then resolves each against the registry (supporting wildcard patterns like "ui.*").
 	/// Global settings are merged with tenant-specific settings (tenant overrides global).
 	pub async fn list_by_prefix(
 		&self,
 		tn_id: TnId,
-		prefix: &str,
+		prefixes: &[String],
 	) -> ClResult<Vec<(String, SettingValue, &SettingDefinition)>> {
-		let prefixes = vec![format!("{}.", prefix)]; // "ui" -> "ui."
+		let prefixes_dotted: Vec<String> = prefixes.iter().map(|p| format!("{}.", p)).collect();
 
 		// Get global settings first (tn_id=0)
-		let global_settings = self.meta.list_settings(TnId(0), Some(&prefixes)).await?;
+		let global_settings = self.meta.list_settings(TnId(0), Some(&prefixes_dotted)).await?;
 
 		// Get tenant-specific settings (override global)
 		let tenant_settings = if tn_id.0 != 0 {
-			self.meta.list_settings(tn_id, Some(&prefixes)).await?
+			self.meta.list_settings(tn_id, Some(&prefixes_dotted)).await?
 		} else {
 			std::collections::HashMap::new()
 		};
@@ -509,6 +509,26 @@ impl SettingsService {
 			}
 		}
 
+		Ok(result)
+	}
+
+	/// List stored settings at exactly one level (no merge, no fallback).
+	/// Used by the list handler when an explicit `level=` is requested.
+	pub async fn list_by_prefix_at(
+		&self,
+		tn_id: TnId,
+		prefixes: &[String],
+	) -> ClResult<Vec<(String, SettingValue, &SettingDefinition)>> {
+		let prefixes_dotted: Vec<String> = prefixes.iter().map(|p| format!("{}.", p)).collect();
+		let rows = self.meta.list_settings(tn_id, Some(&prefixes_dotted)).await?;
+		let mut result = Vec::new();
+		for (key, json_value) in rows {
+			if let Some(definition) = self.registry.get(&key) {
+				let value = serde_json::from_value::<SettingValue>(json_value)
+					.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
+				result.push((key, value, definition));
+			}
+		}
 		Ok(result)
 	}
 }
