@@ -102,13 +102,16 @@ pub async fn put_profile_image(
 	// Get preset for profile pictures
 	let preset = preset::presets::profile_picture();
 
-	// Create file metadata
+	// Create file metadata — route into the managed folder so the file GC
+	// can reap previous profile pics once they're no longer referenced by
+	// `tenants.profile_pic`.
 	let f_id = app
 		.meta_adapter
 		.create_file(
 			auth.tn_id,
 			meta_adapter::CreateFile {
 				preset: Some("profile-picture".into()),
+				parent_id: Some(meta_adapter::MANAGED_PARENT_ID.into()),
 				creator_tag: Some(auth.id_tag.as_ref().into()),
 				content_type: content_type.into(),
 				file_name: format!("{}-profile-pic.jpg", auth.id_tag).into(),
@@ -116,7 +119,6 @@ pub async fn put_profile_image(
 				tags: Some(vec!["profile".into()]),
 				x: Some(json!({ "dim": dim })),
 				visibility: Some('P'), // Profile pics are always public
-				hidden: true,
 				..Default::default()
 			},
 		)
@@ -196,13 +198,16 @@ pub async fn put_cover_image(
 	// Get preset for cover images
 	let preset = preset::presets::cover();
 
-	// Create file metadata
+	// Create file metadata — route into the managed folder so the file GC
+	// can reap previous cover images once they're no longer referenced by
+	// `tenants.cover_pic`.
 	let f_id = app
 		.meta_adapter
 		.create_file(
 			auth.tn_id,
 			meta_adapter::CreateFile {
 				preset: Some("cover".into()),
+				parent_id: Some(meta_adapter::MANAGED_PARENT_ID.into()),
 				creator_tag: Some(auth.id_tag.as_ref().into()),
 				content_type: content_type.into(),
 				file_name: format!("{}-cover.jpg", auth.id_tag).into(),

@@ -7,12 +7,12 @@
 
 pub mod apkg;
 pub(crate) mod audio;
-pub mod blob_gc;
 pub(crate) mod container;
 pub mod descriptor;
 pub(crate) mod duplicate;
 pub(crate) mod ffmpeg;
 pub mod filter;
+pub mod gc;
 pub mod handler;
 pub mod image;
 pub mod management;
@@ -52,14 +52,14 @@ pub fn init(app: &App) -> ClResult<()> {
 	app.scheduler.register::<video::VideoTranscoderTask>()?;
 	app.scheduler.register::<audio::AudioExtractorTask>()?;
 	app.scheduler.register::<pdf::PdfProcessorTask>()?;
-	app.scheduler.register::<blob_gc::BlobGcTask>()?;
+	app.scheduler.register::<gc::GcTask>()?;
 	Ok(())
 }
 
-/// Schedule recurring file-subsystem maintenance jobs (currently the blob GC).
+/// Schedule recurring file-subsystem maintenance jobs (currently the file+blob GC).
 /// Call after settings have been initialized so defaults are readable.
 pub async fn schedule_recurring(app: &App) -> ClResult<()> {
-	blob_gc::schedule(app).await?;
+	gc::schedule(app).await?;
 	Ok(())
 }
 

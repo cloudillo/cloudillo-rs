@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::prelude::*;
 use crate::variant::{Variant, VariantClass, VariantQuality};
 use cloudillo_types::hasher;
-use cloudillo_types::meta_adapter::{CreateFile, FileId, FileVariant};
+use cloudillo_types::meta_adapter::{CreateFile, FileId, FileVariant, MANAGED_PARENT_ID};
 use cloudillo_types::types::ApiResponse;
 
 /// Lightweight struct for deserializing remote file metadata
@@ -347,13 +347,18 @@ pub async fn sync_file_variants(
 		};
 		let remote_file = remote_meta.data;
 
-		// Create file entry with file_id and status='P' (pending)
-		// Variants can be added to pending files, then finalize sets status='A'
+		// Create file entry with file_id and status='P' (pending).
+		// Variants can be added to pending files, then finalize sets status='A'.
+		// All sync_file_variants callers create row-owned cached content
+		// (profile-pic sync, inbound action-attachment sync); user-uploaded
+		// files never reach this path. Park the row in the managed folder so
+		// the file GC can reap it once the owning row drops its reference.
 		let first_variant = &parsed_variants[0];
 		let create_opts = CreateFile {
 			orig_variant_id: Some(first_variant.variant_id.into()),
 			file_id: Some(file_id.into()),
 			preset: Some("sync".into()),
+			parent_id: Some(MANAGED_PARENT_ID.into()),
 			content_type: remote_file
 				.content_type
 				.unwrap_or_else(|| "application/octet-stream".into())

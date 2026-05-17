@@ -915,6 +915,8 @@ async fn process_inbound_action_attachments(
 	// Atomic across attachments: the first failure aborts the whole sync. The
 	// inbound action stays in status='P', and the verifier task retries with
 	// exponential back-off until every attachment is fully synced.
+	// sync_file_variants creates each row with parent_id = MANAGED_PARENT_ID,
+	// which is what excludes inbound attachments from the default file listing.
 	for attachment in attachments.iter().filter(|a| !a.is_empty()) {
 		debug!("  syncing attachment: {} from {}", attachment, source);
 		let result =
@@ -926,23 +928,6 @@ async fn process_inbound_action_attachments(
 				})?;
 		total_synced += result.synced_variants.len();
 		total_skipped += result.skipped_variants.len();
-	}
-
-	// Only flip `hidden=true` after every attachment has been fully synced. If
-	// an earlier attachment failed we returned above, so the next retry redoes
-	// the sync rather than persisting an inconsistent hidden flag.
-	for attachment in attachments.iter().filter(|a| !a.is_empty()) {
-		let _ = app
-			.meta_adapter
-			.update_file_data(
-				tn_id,
-				attachment,
-				&meta_adapter::UpdateFileOptions {
-					hidden: Patch::Value(true),
-					..Default::default()
-				},
-			)
-			.await;
 	}
 
 	if !attachments.is_empty() {

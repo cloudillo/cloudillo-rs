@@ -6,10 +6,19 @@
 /// Special parent_id value for trashed files
 pub const TRASH_PARENT_ID: &str = "__trash__";
 
+/// Special parent_id value for system-managed files (action attachments, profile/cover
+/// images, cached remote profile images). Files in this hidden per-tenant folder are
+/// reaped by the file GC when no canonical column still references them.
+pub const MANAGED_PARENT_ID: &str = "__managed__";
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
-use std::{cmp::Ordering, collections::HashMap, fmt::Debug};
+use std::{
+	cmp::Ordering,
+	collections::{HashMap, HashSet},
+	fmt::Debug,
+};
 
 use crate::{
 	prelude::*,
@@ -573,6 +582,10 @@ pub struct FileView {
 	pub status: FileStatus,
 	pub tags: Option<Vec<Box<str>>>,
 	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
+	/// LEGACY: read-only flag from pre-managed-folder schema. New writes route
+	/// system-managed files into `parent_id = MANAGED_PARENT_ID` instead; the
+	/// `hidden` column is preserved only so existing rows from earlier DB
+	/// versions still list-filter correctly until they are migrated.
 	pub hidden: bool,
 	pub access_level: Option<crate::types::AccessLevel>, // User's access level to this file (R/W)
 	pub user_data: Option<FileUserData>, // User-specific data (only when authenticated)
@@ -675,7 +688,10 @@ pub struct ListFileOptions {
 	pub pinned: Option<bool>,
 	/// Filter by starred status (user-specific)
 	pub starred: Option<bool>,
-	/// Hidden file filter. None = exclude hidden (default). Some(true) = only hidden.
+	/// LEGACY hidden filter. None = exclude hidden (default). Some(true) = only hidden.
+	/// Kept so pre-migration `hidden=1` rows still drop out of user-library
+	/// listings; new system-managed files use `parent_id = MANAGED_PARENT_ID`
+	/// instead and are filtered by the managed-folder rule above.
 	pub hidden: Option<bool>,
 	/// Sort order: 'recent' (accessed_at), 'modified' (modified_at), 'name', 'created'
 	pub sort: Option<String>,
@@ -712,6 +728,8 @@ pub struct CreateFile {
 	pub tags: Option<Vec<Box<str>>>,
 	pub x: Option<serde_json::Value>,
 	pub visibility: Option<char>, // None: Direct (default), P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
+	/// LEGACY: do not set on new rows. System-managed files should be created
+	/// with `parent_id = MANAGED_PARENT_ID` so the file GC can reap them.
 	pub hidden: bool,
 	pub status: Option<FileStatus>, // None defaults to Pending, can set to Active for shared files
 }
@@ -736,6 +754,8 @@ pub struct UpdateFileOptions {
 	pub visibility: Patch<char>,
 	#[serde(default)]
 	pub status: Patch<char>,
+	/// LEGACY: writes to the `hidden` column. Prefer moving files into the
+	/// managed folder via `parent_id = MANAGED_PARENT_ID`.
 	#[serde(default)]
 	pub hidden: Patch<bool>,
 }
@@ -1323,6 +1343,44 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Finalize a pending file - sets file_id and transitions status from 'P' to 'A' atomically
 	async fn finalize_file(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
+
+	/// List internal `f_id`s of files whose `parent_id` equals the given sentinel
+	/// (e.g. [`MANAGED_PARENT_ID`]) and whose `created_at` is strictly before
+	/// `before`. Used by the file GC to enumerate candidates inside the managed
+	/// folder while honouring the safety window.
+	async fn list_files_by_parent(
+		&self,
+		tn_id: TnId,
+		parent_id: &str,
+		before: Timestamp,
+	) -> ClResult<Vec<u64>>;
+
+	/// Internal `f_id`s of files in the managed folder that are still referenced
+	/// by at least one canonical column. The file GC keeps any candidate whose
+	/// `f_id` is in this set.
+	///
+	/// Returning numeric `f_id`s (instead of string `file_id`s) keeps the
+	/// reference set small — it is naturally scoped to managed-folder rows by
+	/// the join, so even tenants with millions of references hold only the
+	/// distinct managed-file count in memory.
+	///
+	/// Current sources:
+	/// - `actions.attachments` (CSV-split, every action regardless of
+	///   `actions.status`). Both raw `file_id` tokens and `@<f_id>` draft-time
+	///   placeholders resolve via the `files` table — the latter must not be
+	///   dropped, or files attached to drafts that finalized after the draft
+	///   was saved would be reaped.
+	/// - `tenants.profile_pic`, `tenants.cover_pic` (this tenant).
+	/// - `profiles.profile_pic` (cached remote profile images, this tenant).
+	///
+	/// MUST be updated when a new column names a file in the managed folder.
+	/// Missing a source here will cause the GC to reap files that are still
+	/// referenced elsewhere.
+	async fn list_referenced_managed_fids(&self, tn_id: TnId) -> ClResult<HashSet<u64>>;
+
+	/// Hard-delete a file: removes all `file_variants` rows and then the
+	/// `files` row inside a single transaction. Intended for the file GC.
+	async fn hard_delete_file(&self, tn_id: TnId, f_id: u64) -> ClResult<()>;
 
 	// Task scheduler
 	//****************

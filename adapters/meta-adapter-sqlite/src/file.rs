@@ -3,6 +3,8 @@
 
 //! File management and variant handling
 
+use std::collections::HashSet;
+
 use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
 use crate::utils::{collect_res, inspect, map_res, parse_str_list};
@@ -179,15 +181,17 @@ pub(crate) async fn list(
 			// Explicit root: files with no parent (not in any folder, not in trash)
 			query.push(" AND f.parent_id IS NULL");
 		} else {
-			// Specific folder (including "__trash__" for trash contents)
+			// Specific folder (including "__trash__" / "__managed__" for those contents)
 			query.push(" AND f.parent_id=").push_bind(parent_id.as_str());
 		}
 	} else {
-		// Exclude trashed files when no specific parent is requested
+		// Exclude trashed and managed files when no specific parent is requested
 		query
-			.push(" AND (f.parent_id IS NULL OR f.parent_id != ")
+			.push(" AND (f.parent_id IS NULL OR f.parent_id NOT IN (")
 			.push_bind(cloudillo_types::meta_adapter::TRASH_PARENT_ID)
-			.push(")");
+			.push(", ")
+			.push_bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+			.push("))");
 	}
 
 	// Scope filter: file_id matches OR root_id matches (for scoped tokens)
@@ -1303,6 +1307,150 @@ pub(crate) async fn read(
 			}))
 		}
 	}
+}
+
+/// List internal `f_id`s of files whose `parent_id` equals the given sentinel
+/// (e.g. `__managed__`) and whose `created_at` is strictly before `before`.
+/// Used by the file GC to enumerate candidates. Rows without a `file_id` (still
+/// pending finalization) are skipped via the join in `list_referenced_managed_fids`
+/// rather than here, since pending files can still be referenced via `@<f_id>`
+/// placeholders — but we don't actually want to GC a file that has never had a
+/// `file_id`, since it's mid-upload. Filter both: must have `file_id` set and
+/// be older than the safety window.
+pub(crate) async fn list_files_by_parent(
+	db: &SqlitePool,
+	tn_id: TnId,
+	parent_id: &str,
+	before: Timestamp,
+) -> ClResult<Vec<u64>> {
+	let rows: Vec<(i64,)> = sqlx::query_as(
+		"SELECT f_id FROM files
+		 WHERE tn_id = ? AND parent_id = ? AND file_id IS NOT NULL
+		   AND status IN ('A', 'P', 'D')
+		   AND created_at < ?",
+	)
+	.bind(tn_id.0)
+	.bind(parent_id)
+	.bind(before.0)
+	.fetch_all(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+
+	Ok(rows.into_iter().map(|(f_id,)| f_id.cast_unsigned()).collect())
+}
+
+/// Internal `f_id`s of files in the managed folder that are still referenced
+/// by at least one canonical column. Used by the file GC.
+///
+/// The set is naturally scoped to managed-folder rows via the join, so
+/// references to files in other folders never enter the set. Returning
+/// numeric `f_id`s instead of `file_id` strings keeps the in-memory set tiny.
+///
+/// Sources (one query per source, UNIONed at application level — readable and
+/// each subquery is index-friendly):
+/// - `actions.attachments` CSV (every action regardless of status). Both raw
+///   `f.file_id` tokens and `@<f.f_id>` draft-time placeholders match.
+/// - `tenants.profile_pic`, `tenants.cover_pic` (this tenant).
+/// - `profiles.profile_pic` (cached remote profile images).
+///
+/// MUST be updated when a new column names a file in the managed folder.
+pub(crate) async fn list_referenced_managed_fids(
+	db: &SqlitePool,
+	tn_id: TnId,
+) -> ClResult<HashSet<u64>> {
+	let mut out: HashSet<u64> = HashSet::new();
+
+	// 1. actions.attachments via recursive CSV split. The JOIN against `files`
+	//    scopes results to managed-folder rows for this tenant.
+	let attachment_refs: Vec<(i64,)> = sqlx::query_as(
+		"WITH RECURSIVE split(item, rest) AS (
+			SELECT NULL, attachments || ',' FROM actions
+			 WHERE tn_id = ?1 AND attachments IS NOT NULL AND attachments != ''
+			UNION ALL
+			SELECT substr(rest, 1, instr(rest, ',') - 1),
+				   substr(rest, instr(rest, ',') + 1)
+			  FROM split WHERE rest != ''
+		)
+		SELECT DISTINCT f.f_id FROM split s
+		  JOIN files f
+		    ON f.tn_id = ?1
+		   AND f.parent_id = ?2
+		 WHERE s.item IS NOT NULL AND s.item != ''
+		   AND (
+			   (s.item LIKE '@%' AND f.f_id = CAST(substr(s.item, 2) AS INTEGER))
+			   OR (s.item NOT LIKE '@%' AND f.file_id = s.item)
+		   )",
+	)
+	.bind(tn_id.0)
+	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.fetch_all(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+	for (f_id,) in attachment_refs {
+		out.insert(f_id.cast_unsigned());
+	}
+
+	// 2. tenants.profile_pic / cover_pic (this tenant).
+	let tenant_refs: Vec<(i64,)> = sqlx::query_as(
+		"SELECT f.f_id FROM files f
+		  JOIN tenants t ON t.tn_id = f.tn_id
+		 WHERE f.tn_id = ?1 AND f.parent_id = ?2
+		   AND (t.profile_pic = f.file_id OR t.cover_pic = f.file_id)",
+	)
+	.bind(tn_id.0)
+	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.fetch_all(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+	for (f_id,) in tenant_refs {
+		out.insert(f_id.cast_unsigned());
+	}
+
+	// 3. profiles.profile_pic (cached remote profile images).
+	let profile_refs: Vec<(i64,)> = sqlx::query_as(
+		"SELECT DISTINCT f.f_id FROM files f
+		  JOIN profiles p ON p.tn_id = f.tn_id AND p.profile_pic = f.file_id
+		 WHERE f.tn_id = ?1 AND f.parent_id = ?2",
+	)
+	.bind(tn_id.0)
+	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.fetch_all(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+	for (f_id,) in profile_refs {
+		out.insert(f_id.cast_unsigned());
+	}
+
+	Ok(out)
+}
+
+/// Hard-delete a file: removes all `file_variants` rows and then the `files`
+/// row inside a single transaction. Intended for the file GC.
+pub(crate) async fn hard_delete_file(db: &SqlitePool, tn_id: TnId, f_id: u64) -> ClResult<()> {
+	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
+
+	sqlx::query("DELETE FROM file_variants WHERE tn_id = ? AND f_id = ?")
+		.bind(tn_id.0)
+		.bind(f_id.cast_signed())
+		.execute(&mut *tx)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+	sqlx::query("DELETE FROM files WHERE tn_id = ? AND f_id = ?")
+		.bind(tn_id.0)
+		.bind(f_id.cast_signed())
+		.execute(&mut *tx)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+	tx.commit().await.map_err(|_| Error::DbError)?;
+	Ok(())
 }
 
 /// Delete a file (set status to 'D')

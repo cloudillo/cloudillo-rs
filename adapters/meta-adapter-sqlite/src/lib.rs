@@ -360,6 +360,26 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::finalize_file(&self.db, tn_id, f_id, file_id).await
 	}
 
+	async fn list_files_by_parent(
+		&self,
+		tn_id: TnId,
+		parent_id: &str,
+		before: Timestamp,
+	) -> ClResult<Vec<u64>> {
+		file::list_files_by_parent(&self.dbr, tn_id, parent_id, before).await
+	}
+
+	async fn list_referenced_managed_fids(
+		&self,
+		tn_id: TnId,
+	) -> ClResult<std::collections::HashSet<u64>> {
+		file::list_referenced_managed_fids(&self.dbr, tn_id).await
+	}
+
+	async fn hard_delete_file(&self, tn_id: TnId, f_id: u64) -> ClResult<()> {
+		file::hard_delete_file(&self.db, tn_id, f_id).await
+	}
+
 	// Task scheduler
 	//****************
 	async fn list_tasks(&self, opts: ListTaskOptions) -> ClResult<Vec<Task>> {

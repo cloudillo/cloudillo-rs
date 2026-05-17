@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 26;
+	const CURRENT_DB_VERSION: i64 = 27;
 
 	let mut tx = db.begin().await?;
 
@@ -1643,6 +1643,22 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.await?;
 
 		set_db_version(&mut tx, 26).await;
+	}
+
+	// Version 27: migrate legacy hidden=1 files into the managed folder so the
+	// file GC can reap them. Only files with parent_id IS NULL are moved —
+	// files already nested under a real folder or under __trash__ are left
+	// alone to preserve user-visible structure.
+	if version < 27 {
+		sqlx::query(
+			"UPDATE files SET parent_id = ?, hidden = 0
+			  WHERE hidden = 1 AND parent_id IS NULL",
+		)
+		.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 27).await;
 	}
 
 	tx.commit().await?;

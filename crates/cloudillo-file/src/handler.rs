@@ -36,6 +36,7 @@ use cloudillo_core::file_access;
 use cloudillo_types::blob_adapter;
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter;
+use cloudillo_types::meta_adapter::{MANAGED_PARENT_ID, TRASH_PARENT_ID};
 use cloudillo_types::types::{self, ApiResponse, TokenScope};
 use cloudillo_types::utils;
 
@@ -252,7 +253,8 @@ pub async fn get_file_list(
 		&& is_real_auth
 		&& let Some(ref parent_id) = opts.parent_id
 		&& parent_id != "__root__"
-		&& parent_id != "__trash__"
+		&& parent_id != TRASH_PARENT_ID
+		&& parent_id != MANAGED_PARENT_ID
 	{
 		inherited_share =
 			file_access::check_share_for_file(&app, tn_id, parent_id, subject_id_tag).await;
@@ -397,6 +399,43 @@ pub struct PostFileQuery {
 	tags: Option<String>,
 	/// Visibility level: P=Public, V=Verified, F=Follower, C=Connected, NULL=Direct
 	visibility: Option<char>,
+	/// `as=managed` routes the new file into the hidden per-tenant managed folder
+	/// (parent_id = `__managed__`). Used for system-managed uploads (action
+	/// attachments, profile/cover images) so the file GC can reap unreferenced
+	/// files without touching user-library files. Any client-supplied `parentId`
+	/// is ignored when this is set.
+	#[serde(rename = "as")]
+	as_kind: Option<String>,
+}
+
+/// Resolve the effective parent_id from a request's `as` and `parentId` fields.
+///
+/// `as=managed` always wins and routes the file into the managed folder.
+/// Otherwise, the explicit `parentId` is honored — except a client cannot plant
+/// a file directly into `__managed__` or `__trash__` without the matching
+/// `as=managed` hint, since those would be silently GC'd or hidden in trash.
+fn resolve_managed_parent(
+	as_kind: Option<&str>,
+	parent_id: Option<&str>,
+) -> ClResult<Option<String>> {
+	if matches!(as_kind, Some("managed")) {
+		return Ok(Some(MANAGED_PARENT_ID.to_string()));
+	}
+	if let Some(p) = parent_id
+		&& (p == MANAGED_PARENT_ID || p == TRASH_PARENT_ID)
+	{
+		return Err(Error::ValidationError(format!(
+			"parentId '{}' is reserved and requires as=managed",
+			p
+		)));
+	}
+	Ok(parent_id.map(str::to_owned))
+}
+
+impl PostFileQuery {
+	fn effective_parent_id(&self) -> ClResult<Option<String>> {
+		resolve_managed_parent(self.as_kind.as_deref(), self.parent_id.as_deref())
+	}
 }
 
 #[derive(Deserialize)]
@@ -417,6 +456,16 @@ pub struct PostFileRequest {
 	tags: Option<String>,
 	/// Visibility level: P=Public, V=Verified, F=Follower, C=Connected, NULL=Direct
 	visibility: Option<char>,
+	/// `as: "managed"` routes the new file into the hidden per-tenant managed folder.
+	/// Mirrors the `?as=managed` query param on the blob upload endpoint.
+	#[serde(rename = "as")]
+	as_kind: Option<String>,
+}
+
+impl PostFileRequest {
+	fn effective_parent_id(&self) -> ClResult<Option<String>> {
+		resolve_managed_parent(self.as_kind.as_deref(), self.parent_id.as_deref())
+	}
 }
 
 async fn handle_post_image(
@@ -999,7 +1048,7 @@ pub async fn post_file(
 				preset: Some("default".into()),
 				orig_variant_id: Some(file_id.clone().into()),
 				file_id: Some(file_id.clone().into()),
-				parent_id: req.parent_id.map(Into::into),
+				parent_id: req.effective_parent_id()?.map(Into::into),
 				root_id: req.root_id.map(Into::into),
 				creator_tag: Some(auth.id_tag.clone()),
 				content_type: content_type.into(),
@@ -1020,6 +1069,26 @@ pub async fn post_file(
 	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn build_dedup_response(
+	app: &App,
+	tn_id: types::TnId,
+	id_tag: &str,
+	file_id: &str,
+	req_id: Option<String>,
+) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+	info!("Dedup hit: file_id={}", file_id);
+	app.meta_adapter.record_file_access(tn_id, id_tag, file_id).await?;
+
+	let view = app.meta_adapter.read_file(tn_id, file_id).await?.ok_or(Error::NotFound)?;
+
+	let mut data = serde_json::to_value(&view).unwrap_or_else(|_| json!({"fileId": file_id}));
+	if let Some(obj) = data.as_object_mut() {
+		obj.insert("existed".into(), serde_json::Value::Bool(true));
+	}
+	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
 }
 
 #[expect(clippy::too_many_arguments, reason = "file processing requires multiple parameters")]
@@ -1117,6 +1186,7 @@ pub async fn post_file_blob(
 		VariantClass::Visual => {
 			let bytes = to_bytes(body, max_size_bytes).await?;
 			let orig_variant_id = hasher::hash("b", &bytes);
+			info!("Content id: {} ({} bytes)", orig_variant_id, bytes.len());
 
 			// Detect if this is an SVG (check content-type or content itself)
 			let is_svg = content_type == "image/svg+xml"
@@ -1149,7 +1219,7 @@ pub async fn post_file_blob(
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						x: Some(json!({ "dim": dim })),
 						root_id: query.root_id.clone().map(Into::into),
-						parent_id: query.parent_id.clone().map(Into::into),
+						parent_id: query.effective_parent_id()?.map(Into::into),
 						visibility,
 						..Default::default()
 					},
@@ -1168,9 +1238,7 @@ pub async fn post_file_blob(
 					Ok((StatusCode::CREATED, Json(response)))
 				}
 				meta_adapter::FileId::FileId(file_id) => {
-					let data = json!({"fileId": file_id});
-					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-					Ok((StatusCode::CREATED, Json(response)))
+					return build_dedup_response(&app, tn_id, &auth.id_tag, &file_id, req_id).await;
 				}
 			}
 		}
@@ -1178,6 +1246,7 @@ pub async fn post_file_blob(
 		VariantClass::Document => {
 			let bytes = to_bytes(body, max_size_bytes).await?;
 			let orig_variant_id = hasher::hash("b", &bytes);
+			info!("Content id: {} ({} bytes)", orig_variant_id, bytes.len());
 
 			let f_id = app
 				.meta_adapter
@@ -1193,7 +1262,7 @@ pub async fn post_file_blob(
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						root_id: query.root_id.clone().map(Into::into),
-						parent_id: query.parent_id.clone().map(Into::into),
+						parent_id: query.effective_parent_id()?.map(Into::into),
 						visibility,
 						..Default::default()
 					},
@@ -1207,9 +1276,7 @@ pub async fn post_file_blob(
 					Ok((StatusCode::CREATED, Json(response)))
 				}
 				meta_adapter::FileId::FileId(file_id) => {
-					let data = json!({"fileId": file_id});
-					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-					Ok((StatusCode::CREATED, Json(response)))
+					return build_dedup_response(&app, tn_id, &auth.id_tag, &file_id, req_id).await;
 				}
 			}
 		}
@@ -1224,7 +1291,10 @@ pub async fn post_file_blob(
 			let (total_size, orig_blob_id) =
 				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
 			let mut temp_guard = TempFileGuard::new(temp_path.clone());
-			info!("Video upload streamed to {:?}, size: {} bytes", temp_path, total_size);
+			info!(
+				"Video upload streamed to {:?}, size: {} bytes, content id: {}",
+				temp_path, total_size, orig_blob_id
+			);
 
 			let media_info = ffmpeg::FFmpeg::probe(&temp_path)
 				.map_err(|e| Error::Internal(format!("ffprobe failed: {}", e)))?;
@@ -1258,7 +1328,7 @@ pub async fn post_file_blob(
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						root_id: query.root_id.clone().map(Into::into),
-						parent_id: query.parent_id.clone().map(Into::into),
+						parent_id: query.effective_parent_id()?.map(Into::into),
 						visibility,
 						..Default::default()
 					},
@@ -1292,9 +1362,7 @@ pub async fn post_file_blob(
 				}
 				meta_adapter::FileId::FileId(file_id) => {
 					// Dedup hit: keep relying on TempFileGuard's Drop to clean up.
-					let data = json!({"fileId": file_id});
-					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-					Ok((StatusCode::CREATED, Json(response)))
+					return build_dedup_response(&app, tn_id, &auth.id_tag, &file_id, req_id).await;
 				}
 			}
 		}
@@ -1306,7 +1374,10 @@ pub async fn post_file_blob(
 			let (total_size, orig_blob_id) =
 				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
 			let mut temp_guard = TempFileGuard::new(temp_path.clone());
-			info!("Audio upload streamed to {:?}, size: {} bytes", temp_path, total_size);
+			info!(
+				"Audio upload streamed to {:?}, size: {} bytes, content id: {}",
+				temp_path, total_size, orig_blob_id
+			);
 
 			let media_info = ffmpeg::FFmpeg::probe(&temp_path)
 				.map_err(|e| Error::Internal(format!("ffprobe failed: {}", e)))?;
@@ -1339,7 +1410,7 @@ pub async fn post_file_blob(
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						root_id: query.root_id.clone().map(Into::into),
-						parent_id: query.parent_id.clone().map(Into::into),
+						parent_id: query.effective_parent_id()?.map(Into::into),
 						visibility,
 						..Default::default()
 					},
@@ -1372,9 +1443,7 @@ pub async fn post_file_blob(
 				}
 				meta_adapter::FileId::FileId(file_id) => {
 					// Dedup hit: keep relying on TempFileGuard's Drop to clean up.
-					let data = json!({"fileId": file_id});
-					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-					Ok((StatusCode::CREATED, Json(response)))
+					return build_dedup_response(&app, tn_id, &auth.id_tag, &file_id, req_id).await;
 				}
 			}
 		}
@@ -1386,7 +1455,10 @@ pub async fn post_file_blob(
 			let (total_size, orig_blob_id) =
 				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
 			let mut temp_guard = TempFileGuard::new(temp_path.clone());
-			info!("Raw upload streamed to {:?}, size: {} bytes", temp_path, total_size);
+			info!(
+				"Raw upload streamed to {:?}, size: {} bytes, content id: {}",
+				temp_path, total_size, orig_blob_id
+			);
 
 			let f_id = app
 				.meta_adapter
@@ -1402,7 +1474,7 @@ pub async fn post_file_blob(
 						created_at: query.created_at,
 						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 						root_id: query.root_id.clone().map(Into::into),
-						parent_id: query.parent_id.clone().map(Into::into),
+						parent_id: query.effective_parent_id()?.map(Into::into),
 						visibility,
 						..Default::default()
 					},
@@ -1433,9 +1505,7 @@ pub async fn post_file_blob(
 				meta_adapter::FileId::FileId(file_id) => {
 					let _ = tokio::fs::remove_file(&temp_path).await;
 					temp_guard.keep();
-					let data = json!({"fileId": file_id});
-					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-					Ok((StatusCode::CREATED, Json(response)))
+					return build_dedup_response(&app, tn_id, &auth.id_tag, &file_id, req_id).await;
 				}
 			}
 		}

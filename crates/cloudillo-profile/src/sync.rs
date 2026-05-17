@@ -333,17 +333,9 @@ async fn sync_profile_pic_variant(
 			id_tag,
 			file_id
 		);
-		let _ = app
-			.meta_adapter
-			.update_file_data(
-				tn_id,
-				file_id,
-				&cloudillo_types::meta_adapter::UpdateFileOptions {
-					hidden: cloudillo_types::types::Patch::Value(true),
-					..Default::default()
-				},
-			)
-			.await;
+		// sync_file_variants already created the row with
+		// parent_id = MANAGED_PARENT_ID, making it eligible for the file GC
+		// once a refresh swaps `profiles.profile_pic` to a different file_id.
 		Ok(())
 	} else if vis_pf_skipped {
 		tracing::debug!(
