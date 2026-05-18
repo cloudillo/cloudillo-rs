@@ -10,7 +10,7 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 use crate::utils::{collect_res, inspect, map_res, parse_str_list};
 use cloudillo_types::meta_adapter::{
 	CreateFile, FileId, FileStatus, FileUserData, FileVariant, FileView, ListFileOptions,
-	ProfileInfo, ProfileType, UpdateFileOptions,
+	ProfileInfo, ProfileType, ROOT_PARENT_ID, UpdateFileOptions,
 };
 use cloudillo_types::prelude::*;
 
@@ -177,7 +177,7 @@ pub(crate) async fn list(
 
 	// Filter by parent folder
 	if let Some(parent_id) = &opts.parent_id {
-		if parent_id == "__root__" {
+		if parent_id == ROOT_PARENT_ID {
 			// Explicit root: files with no parent (not in any folder, not in trash)
 			query.push(" AND f.parent_id IS NULL");
 		} else {
@@ -192,6 +192,20 @@ pub(crate) async fn list(
 			.push(", ")
 			.push_bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
 			.push("))");
+	}
+
+	// Exclude files inside a specific folder (used by the "outside this
+	// folder" probe). `parent_id IS NULL` rows are kept (they live at root,
+	// not inside the excluded folder).
+	if let Some(not_parent_id) = &opts.not_parent_id {
+		if not_parent_id == ROOT_PARENT_ID {
+			query.push(" AND f.parent_id IS NOT NULL");
+		} else {
+			query
+				.push(" AND (f.parent_id IS NULL OR f.parent_id<>")
+				.push_bind(not_parent_id.as_str())
+				.push(")");
+		}
 	}
 
 	// Scope filter: file_id matches OR root_id matches (for scoped tokens)
@@ -523,6 +537,8 @@ pub(crate) async fn list(
 			access_level: None, // Computed later by filter_files_by_visibility
 			user_data,
 			x,
+			parent_name: None, // Filled in by handler when with_parent=true
+			path: None,        // Filled in by handler when with_path=true
 		})
 	}))
 }
@@ -1304,6 +1320,8 @@ pub(crate) async fn read(
 				access_level: None, // Computed later by filter_files_by_visibility
 				user_data: None,    // Not fetched in single-file read
 				x,
+				parent_name: None, // Filled in by handler when with_parent=true
+				path: None,        // Filled in by handler when with_path=true
 			}))
 		}
 	}

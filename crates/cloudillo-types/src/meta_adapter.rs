@@ -11,6 +11,12 @@ pub const TRASH_PARENT_ID: &str = "__trash__";
 /// reaped by the file GC when no canonical column still references them.
 pub const MANAGED_PARENT_ID: &str = "__managed__";
 
+/// Sentinel parent_id value representing the root (files with no parent folder).
+/// API input/filter only — never appears in DB rows; root rows have
+/// `parent_id = NULL` in the `files` table. Use this constant only on the API
+/// surface when the request needs to disambiguate root from "no filter".
+pub const ROOT_PARENT_ID: &str = "__root__";
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -590,6 +596,22 @@ pub struct FileView {
 	pub access_level: Option<crate::types::AccessLevel>, // User's access level to this file (R/W)
 	pub user_data: Option<FileUserData>, // User-specific data (only when authenticated)
 	pub x: Option<serde_json::Value>, // Extensible metadata (e.g., {"dim": [width, height]} for images)
+	/// Immediate parent folder name. Populated only when listing requests
+	/// `withParent=true`; `None` for root, trash, managed-parent, or when not
+	/// requested. Serialized as `parentName` and omitted when `None`.
+	pub parent_name: Option<Box<str>>,
+	/// Full path from root → immediate parent (not including the file itself).
+	/// Populated only when listing requests `withPath=true` (typically a
+	/// single-file fetch). Serialized as `path` and omitted when `None`.
+	pub path: Option<Vec<PathSegment>>,
+}
+
+/// Single hop in a file's folder ancestry chain.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathSegment {
+	pub id: Box<str>,
+	pub name: Box<str>,
 }
 
 #[skip_serializing_none]
@@ -663,6 +685,11 @@ pub struct ListFileOptions {
 	pub file_id: Option<Vec<String>>,
 	#[serde(rename = "parentId")]
 	pub parent_id: Option<String>, // Filter by parent folder (None = root, "__trash__" = trash)
+	/// Exclude files whose immediate parent is this folder. Used by the
+	/// frontend "more matches exist outside this folder" probe so it can ask
+	/// a single global question without re-finding the in-folder matches.
+	#[serde(rename = "notParentId")]
+	pub not_parent_id: Option<String>,
 	#[serde(rename = "rootId")]
 	pub root_id: Option<String>, // Filter by document tree root
 	pub tag: Option<String>,
@@ -710,6 +737,15 @@ pub struct ListFileOptions {
 	/// Set by handler based on subject's access level via `SubjectAccessLevel::visible_levels()`.
 	#[serde(skip)]
 	pub visible_levels: Option<Vec<char>>,
+	/// When true, populate `FileView.parent_name` with the immediate parent
+	/// folder's name (one level). Resolved via a shared LRU cache; on cache
+	/// misses, one SQL round-trip per distinct missing parent on the page.
+	#[serde(default, rename = "withParent")]
+	pub with_parent: bool,
+	/// When true, populate `FileView.path` with the full root→parent chain.
+	/// Typically used together with `file_id` to fetch a single file's location.
+	#[serde(default, rename = "withPath")]
+	pub with_path: bool,
 }
 
 #[derive(Debug, Clone, Default)]

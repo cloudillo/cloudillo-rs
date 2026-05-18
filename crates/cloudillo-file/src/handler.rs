@@ -22,6 +22,7 @@ use crate::prelude::*;
 use crate::{
 	audio::AudioExtractorTask,
 	descriptor::{self, FileIdGeneratorTask},
+	dir_cache::{DirCache, DirEntry},
 	ffmpeg, filter, image,
 	image::ImageResizerTask,
 	pdf,
@@ -36,7 +37,7 @@ use cloudillo_core::file_access;
 use cloudillo_types::blob_adapter;
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter;
-use cloudillo_types::meta_adapter::{MANAGED_PARENT_ID, TRASH_PARENT_ID};
+use cloudillo_types::meta_adapter::{MANAGED_PARENT_ID, ROOT_PARENT_ID, TRASH_PARENT_ID};
 use cloudillo_types::types::{self, ApiResponse, TokenScope};
 use cloudillo_types::utils;
 
@@ -196,6 +197,108 @@ fn serve_file<S: AsRef<str> + Debug>(
 	Ok(response.body(axum::body::Body::from_stream(stream))?)
 }
 
+/// Sentinel parents that have no real folder row backing them. `ROOT_PARENT_ID`
+/// is intentionally NOT listed here: root rows store `parent_id = NULL` in the
+/// DB, so a `Some("__root__")` value never appears on a `FileView` from the
+/// adapter.
+fn is_terminal_parent(parent_id: &str) -> bool {
+	parent_id == TRASH_PARENT_ID || parent_id == MANAGED_PARENT_ID
+}
+
+/// Resolve a single (tn, file_id) → DirEntry through the cache, falling back
+/// to a single read_file call on cache miss.
+async fn resolve_dir_entry(
+	app: &App,
+	cache: &DirCache,
+	tn_id: TnId,
+	file_id: &str,
+) -> Option<DirEntry> {
+	if let Some(entry) = cache.get(tn_id, file_id) {
+		return Some(entry);
+	}
+	match app.meta_adapter.read_file(tn_id, file_id).await {
+		Ok(Some(view)) => {
+			let entry =
+				DirEntry { parent_id: view.parent_id.clone(), name: view.file_name.clone() };
+			cache.put(tn_id, file_id, entry.clone());
+			Some(entry)
+		}
+		Ok(None) => None,
+		Err(e) => {
+			warn!("dir_cache resolve failed for tn_id={} file_id={}: {}", tn_id, file_id, e);
+			None
+		}
+	}
+}
+
+/// Populate `parent_name` on each file in `files` when `with_parent` is true.
+/// Resolves names via `DirCache`; misses fall back to one `read_file` per
+/// distinct missing parent_id on the page.
+async fn populate_parent_names(
+	app: &App,
+	cache: &DirCache,
+	tn_id: TnId,
+	files: &mut [meta_adapter::FileView],
+) {
+	use std::collections::HashMap;
+
+	let mut missing: Vec<Box<str>> = Vec::new();
+	for f in files.iter() {
+		if let Some(pid) = f.parent_id.as_deref()
+			&& !is_terminal_parent(pid)
+			&& cache.get(tn_id, pid).is_none()
+			&& !missing.iter().any(|m| m.as_ref() == pid)
+		{
+			missing.push(Box::from(pid));
+		}
+	}
+
+	let mut resolved: HashMap<Box<str>, Box<str>> = HashMap::new();
+	for pid in &missing {
+		if let Some(entry) = resolve_dir_entry(app, cache, tn_id, pid).await {
+			resolved.insert(pid.clone(), entry.name.clone());
+		}
+	}
+
+	for f in files.iter_mut() {
+		let Some(pid) = f.parent_id.as_deref() else { continue };
+		if is_terminal_parent(pid) {
+			continue;
+		}
+		if let Some(name) = resolved.get(pid) {
+			f.parent_name = Some(name.clone());
+		} else if let Some(entry) = cache.get(tn_id, pid) {
+			f.parent_name = Some(entry.name);
+		}
+	}
+}
+
+/// Walk the parent chain iteratively (cap depth at 64) and produce a
+/// root→parent ordered path. The file itself is not included.
+async fn build_path(
+	app: &App,
+	cache: &DirCache,
+	tn_id: TnId,
+	start_parent_id: Option<&str>,
+) -> Vec<meta_adapter::PathSegment> {
+	const MAX_DEPTH: usize = 64;
+	let mut acc: Vec<meta_adapter::PathSegment> = Vec::new();
+	let mut current: Option<Box<str>> = start_parent_id.map(Box::from);
+
+	for _ in 0..MAX_DEPTH {
+		let Some(cur) = current.take() else { break };
+		if is_terminal_parent(&cur) {
+			break;
+		}
+		let Some(entry) = resolve_dir_entry(app, cache, tn_id, &cur).await else { break };
+		acc.push(meta_adapter::PathSegment { id: cur.clone(), name: entry.name.clone() });
+		current = entry.parent_id;
+	}
+
+	acc.reverse();
+	acc
+}
+
 /// GET /api/files
 pub async fn get_file_list(
 	State(app): State<App>,
@@ -205,6 +308,19 @@ pub async fn get_file_list(
 	Query(mut opts): Query<meta_adapter::ListFileOptions>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<meta_adapter::FileView>>>)> {
+	// Guard: with_path is intended for single-file fetches. Reject misuse on
+	// wide listings to keep iterative walks bounded.
+	const MAX_BULK_WITHPATH_LIMIT: usize = 5;
+	if opts.with_path
+		&& opts.file_id.is_none()
+		&& opts.limit.unwrap_or(30) as usize > MAX_BULK_WITHPATH_LIMIT
+	{
+		return Err(Error::ValidationError(format!(
+			"withPath requires fileId or limit<={}",
+			MAX_BULK_WITHPATH_LIMIT
+		)));
+	}
+
 	// Set user_id_tag for user-specific data (pinned, starred, sorting by recent/modified)
 	let (subject_id_tag, is_authenticated, subject_roles, scope) = match &maybe_auth {
 		Some(auth) => {
@@ -252,7 +368,7 @@ pub async fn get_file_list(
 	if !is_tenant
 		&& is_real_auth
 		&& let Some(ref parent_id) = opts.parent_id
-		&& parent_id != "__root__"
+		&& parent_id != ROOT_PARENT_ID
 		&& parent_id != TRASH_PARENT_ID
 		&& parent_id != MANAGED_PARENT_ID
 	{
@@ -283,6 +399,21 @@ pub async fn get_file_list(
 	let has_more = filtered.len() > limit;
 	if has_more {
 		filtered.truncate(limit);
+	}
+
+	// Optional enrichment: parent folder name (one level) and full path chain.
+	// Both are resolved via the shared DirCache extension.
+	if opts.with_parent || opts.with_path {
+		let dir_cache = app.ext::<DirCache>()?.clone();
+		if opts.with_parent {
+			populate_parent_names(&app, &dir_cache, tn_id, &mut filtered).await;
+		}
+		if opts.with_path {
+			for f in &mut filtered {
+				let segs = build_path(&app, &dir_cache, tn_id, f.parent_id.as_deref()).await;
+				f.path = Some(segs);
+			}
+		}
 	}
 
 	// Build next cursor from last item

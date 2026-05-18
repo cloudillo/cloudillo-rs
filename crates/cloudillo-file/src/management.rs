@@ -11,6 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::dir_cache::DirCache;
 use crate::prelude::*;
 use cloudillo_core::abac::VisibilityLevel;
 use cloudillo_core::extract::{Auth, OptionalRequestId};
@@ -18,6 +19,15 @@ use cloudillo_core::file_access;
 use cloudillo_types::meta_adapter::{self, UpdateFileOptions};
 use cloudillo_types::types::{AccessLevel, ApiResponse};
 use cloudillo_types::utils;
+
+/// Best-effort DirCache eviction. Folders may not yet be in the cache; either
+/// way, dropping any stale entry keeps subsequent path-walks correct after a
+/// rename or move. Silently no-op if the extension is missing.
+fn invalidate_dir_cache(app: &App, tn_id: TnId, file_id: &str) {
+	if let Ok(cache) = app.ext::<DirCache>() {
+		cache.invalidate(tn_id, file_id);
+	}
+}
 
 /// Special folder ID for trash
 const TRASH_FOLDER_ID: &str = cloudillo_types::meta_adapter::TRASH_PARENT_ID;
@@ -38,6 +48,7 @@ pub async fn patch_file(
 	Json(opts): Json<UpdateFileOptions>,
 ) -> ClResult<Json<PatchFileResponse>> {
 	app.meta_adapter.update_file_data(auth.tn_id, &file_id, &opts).await?;
+	invalidate_dir_cache(&app, auth.tn_id, &file_id);
 
 	info!("User {} patched file {}", auth.id_tag, file_id);
 
@@ -85,10 +96,12 @@ pub async fn delete_file(
 		let children = app.meta_adapter.list_children_by_root(auth.tn_id, &file_id).await?;
 		for child_id in &children {
 			app.meta_adapter.delete_file(auth.tn_id, child_id).await?;
+			invalidate_dir_cache(&app, auth.tn_id, child_id);
 		}
 
 		// Actually delete from database
 		app.meta_adapter.delete_file(auth.tn_id, &file_id).await?;
+		invalidate_dir_cache(&app, auth.tn_id, &file_id);
 		info!(
 			"User {} permanently deleted file {} (+ {} children)",
 			auth.id_tag,
@@ -111,6 +124,7 @@ pub async fn delete_file(
 				},
 			)
 			.await?;
+		invalidate_dir_cache(&app, auth.tn_id, &file_id);
 
 		info!("User {} moved file {} to trash", auth.id_tag, file_id);
 
@@ -165,6 +179,7 @@ pub async fn restore_file(
 			},
 		)
 		.await?;
+	invalidate_dir_cache(&app, auth.tn_id, &file_id);
 
 	info!("User {} restored file {} to {:?}", auth.id_tag, file_id, target_parent_id);
 
@@ -197,6 +212,7 @@ pub async fn empty_trash(
 	let mut deleted_count = 0;
 	for file in &trash_files {
 		app.meta_adapter.delete_file(auth.tn_id, &file.file_id).await?;
+		invalidate_dir_cache(&app, auth.tn_id, &file.file_id);
 		deleted_count += 1;
 	}
 
