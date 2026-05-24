@@ -119,9 +119,12 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("write")));
 
 	// File user data routes (authentication only, no file write permission needed)
-	// Users can pin/star any file they have read access to
+	// Users can pin/star any file they have read access to. The refresh
+	// endpoint also lives here: it checks read-access on the destination row
+	// internally rather than going through the file-write ABAC layer.
 	let file_user_router = Router::new()
-		.route("/api/files/{file_id}/user", patch(file::management::patch_file_user_data));
+		.route("/api/files/{file_id}/user", patch(file::management::patch_file_user_data))
+		.route("/api/files/{file_id}/refresh", post(file::handler::refresh_file));
 
 	// Trash management (collection-level permission - no file_id needed)
 	let trash_router = Router::new()

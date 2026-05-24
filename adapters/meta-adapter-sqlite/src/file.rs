@@ -7,12 +7,13 @@ use std::collections::HashSet;
 
 use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
-use crate::utils::{collect_res, inspect, map_res, parse_str_list};
+use crate::utils::{collect_res, inspect, map_res, parse_str_list, push_patch};
 use cloudillo_types::meta_adapter::{
-	CreateFile, FileId, FileStatus, FileUserData, FileVariant, FileView, ListFileOptions,
-	ProfileInfo, ProfileType, ROOT_PARENT_ID, UpdateFileOptions,
+	BrokenReason, CreateFile, FileId, FileStatus, FileUserData, FileVariant, FileView,
+	ListFileOptions, ProfileInfo, ProfileType, ROOT_PARENT_ID, UpdateFileOptions,
 };
 use cloudillo_types::prelude::*;
+use cloudillo_types::types::AccessLevel;
 
 /// Build a ProfileInfo from raw SQL columns with the given prefix.
 /// Returns None if the id_tag column is NULL or empty (i.e. the LEFT JOIN didn't match).
@@ -29,6 +30,20 @@ fn profile_from_row(row: &SqliteRow, prefix: &str) -> Option<ProfileInfo> {
 	};
 	let profile_pic: Option<Box<str>> = row.try_get(&*format!("{prefix}profile_pic")).ok();
 	Some(ProfileInfo { id_tag, name, typ, profile_pic })
+}
+
+/// Map the on-disk `broken_reason` text to the typed enum. Unknown / NULL
+/// strings produce `None`; callers should treat that as "no tombstone".
+fn parse_broken_reason(s: Option<&str>) -> Option<BrokenReason> {
+	match s {
+		Some("deleted") => Some(BrokenReason::Deleted),
+		Some("revoked") => Some(BrokenReason::Revoked),
+		None => None,
+		Some(other) => {
+			warn!("unknown broken_reason on disk: {}", other);
+			None
+		}
+	}
 }
 
 /// Build a tag-only ProfileInfo for when the tag is set but no local profile exists.
@@ -78,7 +93,7 @@ pub(crate) async fn list(
 			|| matches!(opts.sort.as_deref(), Some("recent" | "modified")));
 
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x,
+		"SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
 		        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
 		        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
 		        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic",
@@ -86,7 +101,7 @@ pub(crate) async fn list(
 
 	// Add user data columns if user is authenticated
 	if has_user {
-		query.push(", fud.accessed_at as fud_accessed_at, fud.modified_at as fud_modified_at, fud.pinned as fud_pinned, fud.starred as fud_starred");
+		query.push(", fud.accessed_at as fud_accessed_at, fud.modified_at as fud_modified_at, fud.pinned as fud_pinned, fud.starred as fud_starred, fud.access_level as fud_access_level");
 	}
 
 	query.push(
@@ -488,18 +503,23 @@ pub(crate) async fn list(
 			let modified_at: Option<i64> = row.try_get("fud_modified_at").ok().flatten();
 			let pinned: Option<i64> = row.try_get("fud_pinned").ok().flatten();
 			let starred: Option<i64> = row.try_get("fud_starred").ok().flatten();
+			let access_level_str: Option<String> = row.try_get("fud_access_level").ok().flatten();
+			let access_level =
+				access_level_str.and_then(|s| s.chars().next()).map(AccessLevel::from_perm_char);
 
 			// Only include user_data if there's at least some data
 			if accessed_at.is_some()
 				|| modified_at.is_some()
 				|| pinned.is_some()
 				|| starred.is_some()
+				|| access_level.is_some()
 			{
 				Some(FileUserData {
 					accessed_at: accessed_at.map(Timestamp),
 					modified_at: modified_at.map(Timestamp),
 					pinned: pinned.unwrap_or(0) != 0,
 					starred: starred.unwrap_or(0) != 0,
+					access_level,
 				})
 			} else {
 				None
@@ -516,6 +536,10 @@ pub(crate) async fn list(
 		let x: Option<serde_json::Value> = row.try_get("x").ok().flatten();
 
 		let hidden = row.try_get::<Option<i32>, _>("hidden").ok().flatten().unwrap_or(0) != 0;
+
+		let broken_at: Option<i64> = row.try_get("broken_at").ok().flatten();
+		let broken_reason: Option<String> = row.try_get("broken_reason").ok().flatten();
+		let broken_reason = parse_broken_reason(broken_reason.as_deref());
 
 		Ok(FileView {
 			file_id,
@@ -539,6 +563,8 @@ pub(crate) async fn list(
 			x,
 			parent_name: None, // Filled in by handler when with_parent=true
 			path: None,        // Filled in by handler when with_path=true
+			broken_at: broken_at.map(Timestamp),
+			broken_reason,
 		})
 	}))
 }
@@ -1130,91 +1156,78 @@ pub(crate) async fn update_data(
 	file_id: &str,
 	opts: &UpdateFileOptions,
 ) -> ClResult<()> {
-	// Build dynamic UPDATE query based on which fields are set
-	let mut set_clauses = Vec::new();
+	// Pre-serialize the `x` Patch so the macro can bind a plain string; doing
+	// this before the QueryBuilder is built keeps the `?` operator usable
+	// (panic-free, per workspace lint).
+	let x_serialized: Patch<String> = match &opts.x {
+		Patch::Undefined => Patch::Undefined,
+		Patch::Null => Patch::Null,
+		Patch::Value(v) => Patch::Value(serde_json::to_string(v)?),
+	};
 
-	if !opts.file_name.is_undefined() {
-		set_clauses.push("file_name = ?");
-	}
-	if !opts.parent_id.is_undefined() {
-		set_clauses.push("parent_id = ?");
-	}
-	if !opts.visibility.is_undefined() {
-		set_clauses.push("visibility = ?");
-	}
-	if !opts.status.is_undefined() {
-		set_clauses.push("status = ?");
-	}
-	if !opts.hidden.is_undefined() {
-		set_clauses.push("hidden = ?");
+	let mut query = sqlx::QueryBuilder::new("UPDATE files SET ");
+	let mut has_updates = false;
+
+	has_updates = push_patch!(query, has_updates, "file_name", &opts.file_name, |v| v.as_str());
+	has_updates = push_patch!(query, has_updates, "parent_id", &opts.parent_id, |v| v.as_str());
+	has_updates =
+		push_patch!(query, has_updates, "visibility", &opts.visibility, |c| c.to_string());
+	has_updates = push_patch!(query, has_updates, "status", &opts.status, |c| c.to_string());
+	has_updates = push_patch!(query, has_updates, "hidden", &opts.hidden, |b| i32::from(*b));
+	has_updates =
+		push_patch!(query, has_updates, "content_type", &opts.content_type, |v| v.as_str());
+	has_updates = push_patch!(query, has_updates, "file_tp", &opts.file_tp, |v| v.as_str());
+	has_updates = push_patch!(query, has_updates, "tags", &opts.tags, |v| v.join(","));
+	has_updates = push_patch!(query, has_updates, "preset", &opts.preset, |v| v.as_str());
+	has_updates = push_patch!(query, has_updates, "x", &x_serialized, |v| v.as_str());
+
+	// `broken` is a paired update: `Value` sets broken_at to the current time
+	// and broken_reason to the supplied code; `Null` clears both.
+	match &opts.broken {
+		Patch::Undefined => {}
+		Patch::Null => {
+			if has_updates {
+				query.push(", ");
+			}
+			query.push("broken_at = NULL, broken_reason = NULL");
+			has_updates = true;
+		}
+		Patch::Value(reason) => {
+			if has_updates {
+				query.push(", ");
+			}
+			query
+				.push("broken_at = unixepoch(), broken_reason = ")
+				.push_bind(reason.as_str());
+			has_updates = true;
+		}
 	}
 
-	if set_clauses.is_empty() {
+	if !has_updates {
 		return Ok(()); // Nothing to update
 	}
 
 	// Handle @-prefixed integer IDs vs content-addressable IDs
-	let (where_clause, file_id_bind): (&str, &str) =
-		if let Some(f_id_str) = file_id.strip_prefix('@') {
-			("f_id", f_id_str)
-		} else {
-			("file_id", file_id)
-		};
-
-	let sql = format!(
-		"UPDATE files SET {} WHERE tn_id = ? AND {} = ?",
-		set_clauses.join(", "),
-		where_clause
-	);
-
-	let mut query = sqlx::query(&sql);
-
-	// Bind values in the same order as set_clauses
-	if !opts.file_name.is_undefined() {
-		let val: Option<&str> = match &opts.file_name {
-			Patch::Null => None,
-			Patch::Value(v) => Some(v.as_str()),
-			Patch::Undefined => unreachable!(),
-		};
-		query = query.bind(val);
-	}
-	if !opts.parent_id.is_undefined() {
-		let val: Option<&str> = match &opts.parent_id {
-			Patch::Null => None,
-			Patch::Value(v) => Some(v.as_str()),
-			Patch::Undefined => unreachable!(),
-		};
-		query = query.bind(val);
-	}
-	if !opts.visibility.is_undefined() {
-		let val: Option<String> = match &opts.visibility {
-			Patch::Null => None,
-			Patch::Value(c) => Some(c.to_string()),
-			Patch::Undefined => unreachable!(),
-		};
-		query = query.bind(val);
-	}
-	if !opts.status.is_undefined() {
-		let val: Option<String> = match &opts.status {
-			Patch::Null => None,
-			Patch::Value(c) => Some(c.to_string()),
-			Patch::Undefined => unreachable!(),
-		};
-		query = query.bind(val);
-	}
-	if !opts.hidden.is_undefined() {
-		let val: Option<i32> = match &opts.hidden {
-			Patch::Null => None,
-			Patch::Value(b) => Some(i32::from(*b)),
-			Patch::Undefined => unreachable!(),
-		};
-		query = query.bind(val);
+	if let Some(f_id_str) = file_id.strip_prefix('@') {
+		query
+			.push(" WHERE tn_id = ")
+			.push_bind(tn_id.0)
+			.push(" AND f_id = ")
+			.push_bind(f_id_str);
+	} else {
+		query
+			.push(" WHERE tn_id = ")
+			.push_bind(tn_id.0)
+			.push(" AND file_id = ")
+			.push_bind(file_id);
 	}
 
-	// Bind WHERE clause params
-	query = query.bind(tn_id.0).bind(file_id_bind);
-
-	query.execute(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	query
+		.build()
+		.execute(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
 
 	Ok(())
 }
@@ -1232,7 +1245,7 @@ pub(crate) async fn read(
 			.parse::<i64>()
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x,
+			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
 			        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
 			        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
 			        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic
@@ -1251,7 +1264,7 @@ pub(crate) async fn read(
 	} else {
 		// Content-addressable ID - query by file_id
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x,
+			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
 			        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
 			        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
 			        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic
@@ -1271,60 +1284,163 @@ pub(crate) async fn read(
 
 	match row {
 		None => Ok(None),
-		Some(row) => {
-			let status = match row.try_get("status").map_err(|_| Error::DbError)? {
-				"A" => FileStatus::Active,
-				"P" => FileStatus::Pending,
-				"D" => FileStatus::Deleted,
-				_ => return Err(Error::DbError),
-			};
-
-			let tags_str: Option<Box<str>> = row.try_get("tags").ok();
-			let tags = tags_str.map(|s| parse_str_list(&s).to_vec());
-
-			let owner = build_owner_profile(&row);
-			let creator = build_creator_profile(&row, owner.as_ref());
-
-			let visibility: Option<String> = row.try_get("visibility").ok();
-			let visibility = visibility.and_then(|s| s.chars().next());
-
-			// Global file activity timestamps
-			let accessed_at: Option<i64> = row.try_get("accessed_at").ok().flatten();
-			let modified_at: Option<i64> = row.try_get("modified_at").ok().flatten();
-
-			// Parse x field as JSON
-			let x: Option<serde_json::Value> = row.try_get("x").ok().flatten();
-
-			let hidden = row.try_get::<Option<i32>, _>("hidden").ok().flatten().unwrap_or(0) != 0;
-
-			Ok(Some(FileView {
-				file_id: row.try_get("file_id").map_err(|_| Error::DbError)?,
-				parent_id: row.try_get("parent_id").ok(),
-				root_id: row.try_get("root_id").ok().flatten(),
-				owner,
-				creator,
-				preset: row.try_get("preset").ok(),
-				content_type: row.try_get("content_type").ok(),
-				file_name: row.try_get("file_name").map_err(|_| Error::DbError)?,
-				file_tp: row.try_get("file_tp").ok(),
-				created_at: row
-					.try_get::<i64, _>("created_at")
-					.map(Timestamp)
-					.map_err(|_| Error::DbError)?,
-				accessed_at: accessed_at.map(Timestamp),
-				modified_at: modified_at.map(Timestamp),
-				status,
-				tags,
-				visibility,
-				hidden,
-				access_level: None, // Computed later by filter_files_by_visibility
-				user_data: None,    // Not fetched in single-file read
-				x,
-				parent_name: None, // Filled in by handler when with_parent=true
-				path: None,        // Filled in by handler when with_path=true
-			}))
-		}
+		Some(row) => Ok(Some(row_to_file_view(&row, None, None)?)),
 	}
+}
+
+/// Project an `f.*` / `t.*` / `p.*` / `p2.*` SQL row into a `FileView`. Shared
+/// by [`read`] (no `f_id`, no `fud.*`) and [`read_with_user_data`] (passes
+/// `f_id` for the `@<f_id>` fallback when `file_id IS NULL`, and `user_data`
+/// from the joined `file_user_data` row).
+fn row_to_file_view(
+	row: &SqliteRow,
+	f_id_fallback: Option<i64>,
+	user_data: Option<FileUserData>,
+) -> ClResult<FileView> {
+	let status = match row.try_get("status").map_err(|_| Error::DbError)? {
+		"A" => FileStatus::Active,
+		"P" => FileStatus::Pending,
+		"D" => FileStatus::Deleted,
+		_ => return Err(Error::DbError),
+	};
+
+	let tags_str: Option<Box<str>> = row.try_get("tags").ok();
+	let tags = tags_str.map(|s| parse_str_list(&s).to_vec());
+
+	let owner = build_owner_profile(row);
+	let creator = build_creator_profile(row, owner.as_ref());
+
+	let visibility: Option<String> = row.try_get("visibility").ok();
+	let visibility = visibility.and_then(|s| s.chars().next());
+
+	let accessed_at: Option<i64> = row.try_get("accessed_at").ok().flatten();
+	let modified_at: Option<i64> = row.try_get("modified_at").ok().flatten();
+	let x: Option<serde_json::Value> = row.try_get("x").ok().flatten();
+	let hidden = row.try_get::<Option<i32>, _>("hidden").ok().flatten().unwrap_or(0) != 0;
+	let broken_at: Option<i64> = row.try_get("broken_at").ok().flatten();
+	let broken_reason: Option<String> = row.try_get("broken_reason").ok().flatten();
+	let broken_reason = parse_broken_reason(broken_reason.as_deref());
+
+	let file_id: Box<str> = if let Some(f_id) = f_id_fallback {
+		let stored: Option<Box<str>> = row.try_get("file_id").ok().flatten();
+		stored.unwrap_or_else(|| format!("@{}", f_id).into())
+	} else {
+		row.try_get("file_id").map_err(|_| Error::DbError)?
+	};
+
+	Ok(FileView {
+		file_id,
+		parent_id: row.try_get("parent_id").ok(),
+		root_id: row.try_get("root_id").ok().flatten(),
+		owner,
+		creator,
+		preset: row.try_get("preset").ok(),
+		content_type: row.try_get("content_type").ok(),
+		file_name: row.try_get("file_name").map_err(|_| Error::DbError)?,
+		file_tp: row.try_get("file_tp").ok(),
+		created_at: row
+			.try_get::<i64, _>("created_at")
+			.map(Timestamp)
+			.map_err(|_| Error::DbError)?,
+		accessed_at: accessed_at.map(Timestamp),
+		modified_at: modified_at.map(Timestamp),
+		status,
+		tags,
+		visibility,
+		hidden,
+		access_level: None, // Computed later by filter_files_by_visibility
+		user_data,
+		x,
+		parent_name: None, // Filled in by handler when with_parent=true
+		path: None,        // Filled in by handler when with_path=true
+		broken_at: broken_at.map(Timestamp),
+		broken_reason,
+	})
+}
+
+/// Read a single file and include the caller's per-user data (pinned, starred,
+/// per-user timestamps, cached cross-context access_level).
+///
+/// Unlike [`read`], this performs the same LEFT JOIN on `file_user_data` as the
+/// list query so callers like `refresh_file` can read back the freshly stored
+/// `access_level` without an extra round-trip.
+pub(crate) async fn read_with_user_data(
+	db: &SqlitePool,
+	tn_id: TnId,
+	file_id: &str,
+	id_tag: &str,
+) -> ClResult<Option<FileView>> {
+	let base_sql = "SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, \
+		f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, \
+		f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, \
+		f.broken_at, f.broken_reason, \
+		t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic, \
+		p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic, \
+		p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic, \
+		fud.accessed_at as fud_accessed_at, fud.modified_at as fud_modified_at, \
+		fud.pinned as fud_pinned, fud.starred as fud_starred, fud.access_level as fud_access_level \
+		FROM files f \
+		INNER JOIN tenants t ON t.tn_id=f.tn_id \
+		LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag \
+		LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.creator_tag \
+		LEFT JOIN file_user_data fud ON fud.tn_id=f.tn_id AND fud.f_id=f.f_id AND fud.id_tag=?";
+
+	let row = if let Some(f_id_str) = file_id.strip_prefix('@') {
+		let f_id = f_id_str
+			.parse::<i64>()
+			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
+		let sql = format!("{} WHERE f.tn_id=? AND f.f_id=?", base_sql);
+		sqlx::query(&sql)
+			.bind(id_tag)
+			.bind(tn_id.0)
+			.bind(f_id)
+			.fetch_optional(db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?
+	} else {
+		let sql = format!("{} WHERE f.tn_id=? AND f.file_id=?", base_sql);
+		sqlx::query(&sql)
+			.bind(id_tag)
+			.bind(tn_id.0)
+			.bind(file_id)
+			.fetch_optional(db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?
+	};
+
+	let Some(row) = row else { return Ok(None) };
+
+	let f_id: i64 = row.try_get("f_id").map_err(|_| Error::DbError)?;
+
+	let fud_accessed_at: Option<i64> = row.try_get("fud_accessed_at").ok().flatten();
+	let fud_modified_at: Option<i64> = row.try_get("fud_modified_at").ok().flatten();
+	let fud_pinned: Option<i64> = row.try_get("fud_pinned").ok().flatten();
+	let fud_starred: Option<i64> = row.try_get("fud_starred").ok().flatten();
+	let fud_access_level_str: Option<String> = row.try_get("fud_access_level").ok().flatten();
+	let fud_access_level = fud_access_level_str
+		.and_then(|s| s.chars().next())
+		.map(AccessLevel::from_perm_char);
+
+	let user_data = if fud_accessed_at.is_some()
+		|| fud_modified_at.is_some()
+		|| fud_pinned.is_some()
+		|| fud_starred.is_some()
+		|| fud_access_level.is_some()
+	{
+		Some(FileUserData {
+			accessed_at: fud_accessed_at.map(Timestamp),
+			modified_at: fud_modified_at.map(Timestamp),
+			pinned: fud_pinned.unwrap_or(0) != 0,
+			starred: fud_starred.unwrap_or(0) != 0,
+			access_level: fud_access_level,
+		})
+	} else {
+		None
+	};
+
+	Ok(Some(row_to_file_view(&row, Some(f_id), user_data)?))
 }
 
 /// List internal `f_id`s of files whose `parent_id` equals the given sentinel
@@ -1507,4 +1623,28 @@ pub(crate) async fn list_children_by_root(
 			.map_err(|_| Error::DbError)?;
 
 	Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::parse_broken_reason;
+	use cloudillo_types::meta_adapter::BrokenReason;
+
+	#[test]
+	fn test_parse_broken_reason_roundtrip() {
+		for reason in [BrokenReason::Deleted, BrokenReason::Revoked] {
+			let parsed = parse_broken_reason(Some(reason.as_str()));
+			assert_eq!(parsed, Some(reason), "round-trip diverged for {:?}", reason);
+		}
+	}
+
+	#[test]
+	fn test_parse_broken_reason_none() {
+		assert_eq!(parse_broken_reason(None), None);
+	}
+
+	#[test]
+	fn test_parse_broken_reason_unknown_value() {
+		assert_eq!(parse_broken_reason(Some("not-a-real-reason")), None);
+	}
 }

@@ -180,6 +180,7 @@ impl Request {
 			match res.status() {
 				StatusCode::OK => return Self::collect_body(res.into_body()).await,
 				StatusCode::NOT_FOUND => return Err(Error::NotFound),
+				StatusCode::GONE => return Err(Error::Gone),
 				StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if auth && attempt == 0 => {
 					debug!(id_tag = %id_tag, path = %path,
 						"auth rejected, refreshing cached token and retrying");

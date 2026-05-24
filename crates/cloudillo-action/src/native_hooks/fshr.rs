@@ -191,6 +191,33 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 		}
 	}
 
+	// Seed the recipient's cached access_level in file_user_data so the eye
+	// badge appears on first list (no refresh round-trip needed). Mirrors the
+	// permission mapping used by FSHR on_create on the sender side; matches
+	// what `refresh_file` writes on subsequent reconciliations.
+	let access_perm = match context.subtype.as_deref() {
+		Some("WRITE") => 'W',
+		Some("COMMENT") => 'C',
+		_ => 'R',
+	};
+	if let Err(e) = app
+		.meta_adapter
+		.update_file_user_data(
+			tn_id,
+			&context.tenant_tag,
+			file_id,
+			Patch::Undefined,
+			Patch::Undefined,
+			Patch::Value(access_perm),
+		)
+		.await
+	{
+		tracing::warn!(
+			"FSHR on_accept: failed to seed cached access_level on file_user_data: {}",
+			e
+		);
+	}
+
 	Ok(HookResult::default())
 }
 

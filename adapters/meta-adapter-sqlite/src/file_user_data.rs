@@ -8,6 +8,7 @@ use sqlx::{Row, SqlitePool};
 use crate::utils::inspect;
 use cloudillo_types::meta_adapter::FileUserData;
 use cloudillo_types::prelude::*;
+use cloudillo_types::types::AccessLevel;
 
 /// Record file access for a user (upserts record, updates accessed_at timestamp)
 /// Also updates the global accessed_at on the files table
@@ -93,52 +94,94 @@ pub(crate) async fn record_modification(
 	Ok(())
 }
 
-/// Update file user data (pinned/starred status)
+/// Update file user data (pinned/starred status, cached cross-context access_level).
+///
+/// All three fields share the same `Patch` three-state encoding:
+///   - `Patch::Undefined` = leave column unchanged
+///   - `Patch::Null`      = clear (NULL the column — `pinned`/`starred` read back as `false`)
+///   - `Patch::Value(v)`  = set to the given value (`access_level` ch ∈ 'R'/'C'/'W')
 pub(crate) async fn update(
 	db: &SqlitePool,
 	tn_id: TnId,
 	id_tag: &str,
 	file_id: &str,
-	pinned: Option<bool>,
-	starred: Option<bool>,
+	pinned: Patch<bool>,
+	starred: Patch<bool>,
+	access_level: Patch<char>,
 ) -> ClResult<FileUserData> {
-	if pinned.is_none() && starred.is_none() {
+	if pinned.is_undefined() && starred.is_undefined() && access_level.is_undefined() {
 		// Nothing to update, just return current data
 		return get(db, tn_id, id_tag, file_id).await.map(Option::unwrap_or_default);
 	}
 
-	// Build dynamic update query using f_id via subquery
-	let pinned_val = pinned.map_or(0, i64::from);
-	let starred_val = starred.map_or(0, i64::from);
+	// Build dynamic upsert. Columns and the ON CONFLICT clause both adapt to
+	// which fields the caller wants to touch — leaving unmentioned columns
+	// alone on the conflict path.
+	let pinned_val: Option<i64> = match pinned {
+		Patch::Undefined | Patch::Null => None,
+		Patch::Value(b) => Some(i64::from(b)),
+	};
+	let starred_val: Option<i64> = match starred {
+		Patch::Undefined | Patch::Null => None,
+		Patch::Value(b) => Some(i64::from(b)),
+	};
+	let access_level_val: Option<String> = match access_level {
+		// Undefined isn't bound (guarded by `is_undefined` below); Null binds as NULL.
+		Patch::Undefined | Patch::Null => None,
+		Patch::Value(c) => Some(c.to_string()),
+	};
 
+	let mut insert_cols = vec!["tn_id", "id_tag", "f_id", "created_at", "updated_at"];
+	let mut select_exprs = vec![
+		"?".to_string(),
+		"?".to_string(),
+		"f_id".to_string(),
+		"unixepoch()".to_string(),
+		"unixepoch()".to_string(),
+	];
 	let mut updates = Vec::new();
-	if pinned.is_some() {
+
+	if !pinned.is_undefined() {
+		insert_cols.push("pinned");
+		select_exprs.push("?".to_string());
 		updates.push("pinned = excluded.pinned");
 	}
-	if starred.is_some() {
+	if !starred.is_undefined() {
+		insert_cols.push("starred");
+		select_exprs.push("?".to_string());
 		updates.push("starred = excluded.starred");
 	}
+	if !access_level.is_undefined() {
+		insert_cols.push("access_level");
+		select_exprs.push("?".to_string());
+		updates.push("access_level = excluded.access_level");
+	}
+
 	let update_clause = format!("{}, updated_at = unixepoch()", updates.join(", "));
 
-	let query = format!(
-		"INSERT INTO file_user_data (tn_id, id_tag, f_id, pinned, starred, created_at, updated_at)
-		 SELECT ?, ?, f_id, ?, ?, unixepoch(), unixepoch()
+	let query_str = format!(
+		"INSERT INTO file_user_data ({})
+		 SELECT {}
 		 FROM files WHERE tn_id = ? AND file_id = ?
 		 ON CONFLICT (tn_id, id_tag, f_id) DO UPDATE SET {}",
+		insert_cols.join(", "),
+		select_exprs.join(", "),
 		update_clause
 	);
 
-	sqlx::query(&query)
-		.bind(tn_id.0)
-		.bind(id_tag)
-		.bind(pinned_val)
-		.bind(starred_val)
-		.bind(tn_id.0)
-		.bind(file_id)
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let mut q = sqlx::query(&query_str).bind(tn_id.0).bind(id_tag);
+	if !pinned.is_undefined() {
+		q = q.bind(pinned_val);
+	}
+	if !starred.is_undefined() {
+		q = q.bind(starred_val);
+	}
+	if !access_level.is_undefined() {
+		q = q.bind(access_level_val);
+	}
+	q = q.bind(tn_id.0).bind(file_id);
+
+	q.execute(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 	// Return the updated data
 	get(db, tn_id, id_tag, file_id).await.map(Option::unwrap_or_default)
@@ -152,7 +195,7 @@ pub(crate) async fn get(
 	file_id: &str,
 ) -> ClResult<Option<FileUserData>> {
 	let res = sqlx::query(
-		"SELECT fud.accessed_at, fud.modified_at, fud.pinned, fud.starred
+		"SELECT fud.accessed_at, fud.modified_at, fud.pinned, fud.starred, fud.access_level
 		 FROM file_user_data fud
 		 JOIN files f ON f.tn_id = fud.tn_id AND f.f_id = fud.f_id
 		 WHERE fud.tn_id = ? AND fud.id_tag = ? AND f.file_id = ?",
@@ -171,12 +214,16 @@ pub(crate) async fn get(
 			let modified_at: Option<i64> = row.try_get("modified_at").ok();
 			let pinned: i64 = row.try_get("pinned").unwrap_or(0);
 			let starred: i64 = row.try_get("starred").unwrap_or(0);
+			let access_level_str: Option<String> = row.try_get("access_level").ok().flatten();
+			let access_level =
+				access_level_str.and_then(|s| s.chars().next()).map(AccessLevel::from_perm_char);
 
 			Ok(Some(FileUserData {
 				accessed_at: accessed_at.map(Timestamp),
 				modified_at: modified_at.map(Timestamp),
 				pinned: pinned != 0,
 				starred: starred != 0,
+				access_level,
 			}))
 		}
 		None => Ok(None),

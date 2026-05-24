@@ -48,6 +48,12 @@ pub enum Error {
 	ImageError(String),  // Image processing failures
 	CryptoError(String), // Cryptography/TLS configuration errors
 
+	// File cross-context (Hand) errors
+	FileSourceNotFound,    // 404: sourceFileId doesn't exist in sourceIdTag's context
+	FileSourceForbidden,   // 403: Caller has no READ on the source
+	FileSourceUnreachable, // 503: Source server unreachable during synchronous resolve
+	FileCycleRejected,     // 400: sourceFileId is itself a cross-context row
+
 	// externals
 	Io(std::io::Error),
 }
@@ -161,6 +167,26 @@ impl IntoResponse for Error {
 				StatusCode::INTERNAL_SERVER_ERROR,
 				"E-CONF-CFGERR".to_string(),
 				"Internal server error".to_string(),
+			),
+			Error::FileSourceNotFound => (
+				StatusCode::NOT_FOUND,
+				"E-FILE-SRCNOTFOUND".to_string(),
+				"source_not_found".to_string(),
+			),
+			Error::FileSourceForbidden => (
+				StatusCode::FORBIDDEN,
+				"E-FILE-SRCFORBID".to_string(),
+				"source_forbidden".to_string(),
+			),
+			Error::FileSourceUnreachable => (
+				StatusCode::SERVICE_UNAVAILABLE,
+				"E-FILE-SRCUNREACH".to_string(),
+				"source_unreachable".to_string(),
+			),
+			Error::FileCycleRejected => (
+				StatusCode::BAD_REQUEST,
+				"E-FILE-CYCLEREJ".to_string(),
+				"cycle_rejected".to_string(),
 			),
 		};
 

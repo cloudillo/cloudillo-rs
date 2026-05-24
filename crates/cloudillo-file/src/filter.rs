@@ -48,9 +48,40 @@ pub async fn compute_file_access_levels(
 			.and_then(|o| if o.id_tag.is_empty() { None } else { Some(o.id_tag.as_ref()) })
 			.unwrap_or(ctx.tenant_id_tag);
 
-		let access_level =
+		// Cross-context row: the owner lives on a different tenant. Source
+		// authority is the origin server, not us; the FSHR-fallback path in
+		// `get_access_level` would return stale data after a downgrade. Use
+		// the value persisted in `file_user_data` by `refresh_file` (and by
+		// FSHR on_accept) instead.
+		//
+		// Cache miss fallback: rows from before the v30 backfill, or rows
+		// whose FSHR didn't match the migration's filter, leave the column
+		// NULL. Returning `None` there would erase the eye badge until the
+		// user manually triggered a refresh. Fall back to the legacy
+		// `get_access_level` path (best-effort: stale after a downgrade,
+		// but better than no badge). The fallback runs once per row until
+		// `refresh_file` populates the cache; that's still cheaper than the
+		// pre-cache behaviour in the common case.
+		let is_cross_context = owner_tag != ctx.tenant_id_tag;
+		let access_level = if is_cross_context {
+			match file.user_data.as_ref().and_then(|u| u.access_level) {
+				Some(lv) => lv,
+				None => {
+					file_access::get_access_level(
+						app,
+						tn_id,
+						&file.file_id,
+						owner_tag,
+						ctx,
+						floor_access,
+					)
+					.await
+				}
+			}
+		} else {
 			file_access::get_access_level(app, tn_id, &file.file_id, owner_tag, ctx, floor_access)
-				.await;
+				.await
+		};
 
 		let effective = match floor_access {
 			Some(floor) => floor.max(access_level),

@@ -9,7 +9,7 @@ use axum::{
 	response,
 };
 use futures_core::Stream;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
 	fmt::Debug,
@@ -38,7 +38,7 @@ use cloudillo_types::blob_adapter;
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter;
 use cloudillo_types::meta_adapter::{MANAGED_PARENT_ID, ROOT_PARENT_ID, TRASH_PARENT_ID};
-use cloudillo_types::types::{self, ApiResponse, TokenScope};
+use cloudillo_types::types::{self, AccessLevel, ApiResponse, TokenScope};
 use cloudillo_types::utils;
 
 // Utility functions //
@@ -591,6 +591,14 @@ pub struct PostFileRequest {
 	/// Mirrors the `?as=managed` query param on the blob upload endpoint.
 	#[serde(rename = "as")]
 	as_kind: Option<String>,
+	/// Hand cross-context creation: fileId from the source context to reference.
+	/// When present, the new row in the destination tenant points to a file owned
+	/// by another tenant; together with `source_id_tag`.
+	#[serde(rename = "sourceFileId")]
+	source_file_id: Option<String>,
+	/// Hand cross-context creation: owner idTag of the source content.
+	#[serde(rename = "sourceIdTag")]
+	source_id_tag: Option<String>,
 }
 
 impl PostFileRequest {
@@ -1141,8 +1149,28 @@ pub async fn post_file(
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	info!("POST /api/files - Creating file with fileTp={}", req.file_tp);
 
-	// Scope check: scoped tokens can only create children under the scoped root
+	// Scope check first: cross-context placements have no `root_id`, so a
+	// scoped token (share link, scope `file:<id>:W`) cannot create them — and a
+	// scoped token creating a normal new file is bounded to the scoped root.
 	file_access::check_scope_allows_create(auth.scope.as_deref(), req.root_id.as_deref())?;
+
+	// Cross-context creation (Hand verbs: Pin / Place) routes through a dedicated
+	// branch before the normal new-blob path. Triggered by the presence of
+	// `sourceFileId` + `sourceIdTag`.
+	if let (Some(source_file_id), Some(source_id_tag)) =
+		(req.source_file_id.as_deref(), req.source_id_tag.as_deref())
+	{
+		return post_file_cross_context(
+			app,
+			tn_id,
+			auth,
+			req_id,
+			&req,
+			source_file_id,
+			source_id_tag,
+		)
+		.await;
+	}
 
 	// Generate file_id
 	let file_id = utils::random_id()?;
@@ -1200,6 +1228,477 @@ pub async fn post_file(
 	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Fetch a `FileView` for `source_file_id` from the peer that owns `source_id_tag`,
+/// translating peer errors into the typed cross-context error codes. The proxy-token
+/// exchange already gates access: 403 → caller has no share grant on the source,
+/// 404/410 → source row gone or never existed, network/parse → source unreachable.
+async fn fetch_source_file_view(
+	app: &App,
+	tn_id: types::TnId,
+	source_id_tag: &str,
+	source_file_id: &str,
+) -> ClResult<meta_adapter::FileView> {
+	let envelope: types::ApiResponse<meta_adapter::FileView> = app
+		.request
+		.get(tn_id, source_id_tag, &format!("/files/{}/metadata", source_file_id))
+		.await
+		.map_err(|e| match e {
+			Error::NotFound | Error::Gone => Error::FileSourceNotFound,
+			Error::PermissionDenied => Error::FileSourceForbidden,
+			Error::NetworkError(_) => Error::FileSourceUnreachable,
+			Error::Parse => Error::Internal("source returned malformed metadata".into()),
+			other => other,
+		})?;
+	Ok(envelope.data)
+}
+
+/// Combine source-supplied tags with caller-supplied tags into the initial tag
+/// set for a cross-context placement. Caller tags layer on top of source tags
+/// (intent: "also tag it locally with these") and duplicates are skipped.
+fn merge_cross_context_tags(
+	source_tags: Option<&[Box<str>]>,
+	req_tags: Option<&str>,
+) -> Option<Vec<Box<str>>> {
+	let source: Option<Vec<Box<str>>> = source_tags.map(|t| {
+		t.iter()
+			.map(|s| s.as_ref().trim())
+			.filter(|s| !s.is_empty())
+			.map(Box::<str>::from)
+			.collect()
+	});
+	let extra: Option<Vec<Box<str>>> = req_tags.map(|s| {
+		s.split(',')
+			.map(str::trim)
+			.filter(|s| !s.is_empty())
+			.map(Box::<str>::from)
+			.collect()
+	});
+	match (source, extra) {
+		(None, None) => None,
+		(Some(t), None) | (None, Some(t)) => (!t.is_empty()).then_some(t),
+		(Some(mut a), Some(b)) => {
+			for tag in b {
+				if !a.iter().any(|existing| existing.as_ref() == tag.as_ref()) {
+					a.push(tag);
+				}
+			}
+			(!a.is_empty()).then_some(a)
+		}
+	}
+}
+
+/// Resolve the initial visibility for a cross-context placement. `override_`
+/// (from the request body) wins; otherwise community tenants default to `'C'`
+/// (Connected) and personal tenants to NULL (Direct, kept out of directory
+/// listings).
+async fn default_cross_context_visibility(
+	app: &App,
+	tn_id: types::TnId,
+	override_: Option<char>,
+) -> ClResult<Option<char>> {
+	if let Some(v) = override_ {
+		return Ok(Some(v));
+	}
+	let dest_tenant = app.meta_adapter.read_tenant(tn_id).await?;
+	Ok(matches!(dest_tenant.typ, meta_adapter::ProfileType::Community).then_some('C'))
+}
+
+/// Cross-context file creation (Hand: Pin / Place verbs).
+///
+/// Step 2 of the Hand flow; FSHR creation on the source is a prior, separate
+/// frontend call. Creates a new row in the destination tenant (`tn_id`) that
+/// references content owned by another tenant (`source_id_tag`). The
+/// destination row's `owner_tag` is the canonical source owner, never the
+/// caller and never the destination.
+///
+/// Source file metadata is fetched via the inter-node HTTP API; this handler
+/// never touches the source tenant's adapters.
+async fn post_file_cross_context(
+	app: App,
+	tn_id: types::TnId,
+	auth: cloudillo_types::auth_adapter::AuthCtx,
+	req_id: Option<String>,
+	req: &PostFileRequest,
+	source_file_id: &str,
+	source_id_tag: &str,
+) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+	info!(
+		"POST /api/files cross-context: source={}@{} -> dest tn_id={}",
+		source_file_id, source_id_tag, tn_id.0
+	);
+
+	// (Reminder: in Cloudillo each user is a separate tenant, so a tenant-
+	// scoped proxy token authenticates the calling user.)
+	let source_view = fetch_source_file_view(&app, tn_id, source_id_tag, source_file_id).await?;
+
+	// Cycle reject: source must be owned by source_id_tag itself, not be a
+	// cross-tenant placement of yet another tenant's file.
+	let source_owner = source_view.owner.as_ref().map_or(source_id_tag, |o| o.id_tag.as_ref());
+	if source_owner != source_id_tag {
+		return Err(Error::FileCycleRejected);
+	}
+
+	// Idempotency check: if a row already exists for the same source file_id
+	// AND the existing row's owner matches the requested source AND the parent
+	// matches, return 200 with the existing FileView (safe retry).
+	let parent_id_resolved = req.effective_parent_id()?;
+	if let Some(existing) = app.meta_adapter.read_file(tn_id, source_file_id).await? {
+		let existing_owner = existing.owner.as_ref().map(|o| o.id_tag.as_ref());
+		let existing_parent = existing.parent_id.as_deref();
+		let req_parent = parent_id_resolved.as_deref();
+
+		if existing_owner == Some(source_id_tag) && existing_parent == req_parent {
+			info!("Idempotent cross-context create: returning existing row");
+			let view = app
+				.meta_adapter
+				.read_file_with_user_data(tn_id, source_file_id, &auth.id_tag)
+				.await?
+				.ok_or_else(|| Error::Internal("idempotent row vanished".into()))?;
+			let data = serde_json::to_value(&view)?;
+			let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+			return Ok((StatusCode::OK, Json(response)));
+		}
+
+		// Same file_id but different owner: this row was created via a
+		// different path (e.g. an inbound action attachment) and is not
+		// the same logical placement. Semantically a generic conflict.
+		if existing_owner != Some(source_id_tag) {
+			return Err(Error::Conflict(format!(
+				"file_id '{}' already exists in this tenant with a different owner",
+				source_file_id
+			)));
+		}
+
+		// Same owner, different parent: the file is already placed in this
+		// tenant under a different parent. Frontend behavior matches the
+		// different-owner case ("go to existing location"), so a generic 409
+		// with the existing parent embedded is sufficient.
+		return Err(Error::Conflict(format!(
+			"file_id '{}' is already placed in this context (parent: {})",
+			source_file_id,
+			existing.parent_id.as_deref().unwrap_or("<root>")
+		)));
+	}
+
+	let visibility = default_cross_context_visibility(&app, tn_id, req.visibility).await?;
+
+	let content_type: Box<str> = source_view
+		.content_type
+		.clone()
+		.unwrap_or_else(|| "application/octet-stream".into());
+
+	// Initial row state must match what the first `refresh_file` would write,
+	// so the visible state doesn't flip between Pin/Place and the very next
+	// refresh. Copy `tags`, `preset`, `x` from the source view; request-
+	// supplied tags layer on top of source tags rather than replacing them.
+	let combined_tags = merge_cross_context_tags(source_view.tags.as_deref(), req.tags.as_deref());
+
+	app.meta_adapter
+		.create_file(
+			tn_id,
+			cloudillo_types::meta_adapter::CreateFile {
+				file_id: Some(source_file_id.into()),
+				owner_tag: Some(source_id_tag.into()),
+				creator_tag: Some(auth.id_tag.clone()),
+				content_type,
+				file_name: source_view.file_name.clone(),
+				file_tp: source_view.file_tp.clone(),
+				parent_id: parent_id_resolved.map(Into::into),
+				preset: source_view.preset.clone(),
+				tags: combined_tags,
+				x: source_view.x.clone(),
+				status: Some(cloudillo_types::meta_adapter::FileStatus::Active),
+				visibility,
+				..Default::default()
+			},
+		)
+		.await?;
+
+	// Seed the caller's cached access_level so the response carries the eye
+	// badge without a follow-up `/refresh` round-trip. Mirrors what FSHR
+	// on_accept does on the recipient side and what `refresh_file` writes on
+	// subsequent reconciliations.
+	let access_patch: Patch<char> = match source_view.access_level {
+		Some(lv) => match access_level_to_perm_char(lv) {
+			Some(ch) => Patch::Value(ch),
+			None => Patch::Null,
+		},
+		None => Patch::Undefined,
+	};
+	if !access_patch.is_undefined() {
+		// Best-effort: a failure here just means the eye badge will appear
+		// on the next list/refresh rather than this response.
+		if let Err(e) = app
+			.meta_adapter
+			.update_file_user_data(
+				tn_id,
+				&auth.id_tag,
+				source_file_id,
+				Patch::Undefined,
+				Patch::Undefined,
+				access_patch,
+			)
+			.await
+		{
+			tracing::warn!("cross-context create: failed to seed cached access_level: {}", e);
+		}
+	}
+
+	let view = app
+		.meta_adapter
+		.read_file_with_user_data(tn_id, source_file_id, &auth.id_tag)
+		.await?
+		.ok_or_else(|| Error::Internal("freshly created row missing".into()))?;
+	let data = serde_json::to_value(&view)?;
+	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Wrapper around `FileView` that adds a non-sticky `refreshStatus` hint for
+/// transient outcomes (e.g. network failure). The hint lives only in the
+/// response — it is never persisted — so it disappears on the next successful
+/// refresh. `view` flattens onto the wire, so callers that ignore the hint
+/// see exactly the same shape as `GET /files/{id}/metadata`.
+#[derive(Debug, Serialize)]
+pub struct RefreshResponse {
+	#[serde(flatten)]
+	view: meta_adapter::FileView,
+	#[serde(rename = "refreshStatus", skip_serializing_if = "Option::is_none")]
+	refresh_status: Option<&'static str>,
+}
+
+/// POST /api/files/{file_id}/refresh
+///
+/// Reconciles a cross-context file row with its source. Frontend calls this
+/// when it detects an inconsistency (broken thumbnail, 404 on blob, stale
+/// access). The response body wraps the destination `FileView` (same shape as
+/// `GET /files/{id}/metadata`) plus an optional `refreshStatus` hint for
+/// transient outcomes.
+///
+/// Outcomes:
+/// - 200 + cleared tombstone → source responded; if caller is the row's
+///   creator we sync `file_name` / `content_type` / `file_tp` / `tags` /
+///   `preset` / `x` and clear any prior `broken_*`. Non-creators get a
+///   per-user-only refresh (the cached `access_level` is updated for the
+///   caller, shared row state is left untouched).
+/// - 200 + `broken_reason = 'deleted'` → source returned 404/410. Creator-only.
+/// - 200 + `broken_reason = 'revoked'` → source returned 403. Creator-only;
+///   non-creators get their cached `access_level` cleared but the shared
+///   tombstone is left alone.
+/// - 200 + `refreshStatus = "unreachable"` → transient network/parse failure.
+///   No row mutation: the response returns whatever was already on disk.
+///   The hint is non-sticky, so a successful retry simply omits the field.
+///
+/// Atomicity: the handler issues up to three independent adapter writes
+/// (`update_file_data`, `update_file_user_data`, then a read). Each write is
+/// individually idempotent — replaying the same refresh is safe. A failure
+/// between writes therefore leaves the row in a consistent point along the
+/// (file_data updated? → user_data updated?) trajectory, which the next
+/// refresh resolves. This is deliberate: avoiding a transaction here keeps
+/// the adapter trait surface narrow.
+pub async fn refresh_file(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
+	Auth(auth): Auth,
+	extract::Path(file_id): extract::Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<RefreshResponse>>)> {
+	// Cross-context placements always use content-addressed ids (`f1~…`); the
+	// `@<f_id>` form addresses local-only rows and cannot have an upstream
+	// source. Reject early so callers see a clear validation error rather
+	// than a later "refresh is only valid for cross-context" message that
+	// looks like a permission / state issue.
+	if file_id.starts_with('@') {
+		return Err(Error::ValidationError(
+			"refresh requires a content-addressed file_id, not an @-prefixed id".into(),
+		));
+	}
+
+	// Caller must have read access to the destination row. We don't have a
+	// cheap-and-direct ABAC check at the handler layer, so reuse
+	// `check_file_access_with_scope` (the same gate that
+	// `GET /metadata` uses for authed callers).
+	let ctx = file_access::FileAccessCtx {
+		user_id_tag: &auth.id_tag,
+		tenant_id_tag: &tenant_id_tag,
+		user_roles: &auth.roles,
+	};
+	let existing = file_access::check_file_access_with_scope(
+		&app,
+		tn_id,
+		&file_id,
+		&ctx,
+		auth.scope.as_deref(),
+		None,
+	)
+	.await
+	.map_err(|e| match e {
+		file_access::FileAccessError::NotFound => Error::NotFound,
+		file_access::FileAccessError::AccessDenied => Error::PermissionDenied,
+		file_access::FileAccessError::InternalError(m) => Error::Internal(m),
+	})?
+	.file_view;
+
+	// Refresh only makes sense for cross-context rows — local-owned rows have
+	// no upstream source to fetch. Identify them by `owner_tag` differing
+	// from the local tenant's id_tag.
+	let owner_tag = match existing.owner.as_ref() {
+		Some(o) if o.id_tag.as_ref() != tenant_id_tag.as_ref() => o.id_tag.as_ref(),
+		_ => {
+			return Err(Error::ValidationError(
+				"refresh is only valid for cross-context (hand-pinned) files".into(),
+			));
+		}
+	};
+
+	// Only the row's creator may write shared row state (file_name,
+	// content_type, tags, preset, x, broken_*). Non-creators with read access
+	// can still keep their per-user cached `access_level` in sync, but they
+	// cannot toggle the tombstone or overwrite shared fields for everyone.
+	let is_creator =
+		existing.creator.as_ref().map(|c| c.id_tag.as_ref()) == Some(auth.id_tag.as_ref());
+
+	let fetch: Result<types::ApiResponse<meta_adapter::FileView>, Error> =
+		app.request.get(tn_id, owner_tag, &format!("/files/{}/metadata", file_id)).await;
+
+	let mut refresh_status: Option<&'static str> = None;
+
+	let access_level_update: Patch<char> = match fetch {
+		Ok(envelope) => {
+			let source = envelope.data;
+			let source_access_level = source.access_level;
+			if is_creator {
+				// Refresh is reconciliation, not authoritative replacement: a
+				// source omitting a field means "no information, preserve
+				// local" (Patch::Undefined). A source that wants to clear a
+				// field must send explicit null (handled via Patch::Null
+				// where serde maps to Option). For tags, an empty list is the
+				// source's way to clear; that maps to Patch::Null.
+				let opts = meta_adapter::UpdateFileOptions {
+					file_name: Patch::Value(source.file_name.to_string()),
+					content_type: match source.content_type.as_deref() {
+						Some(c) => Patch::Value(c.to_string()),
+						None => Patch::Undefined,
+					},
+					file_tp: match source.file_tp.as_deref() {
+						Some(s) => Patch::Value(s.to_string()),
+						None => Patch::Undefined,
+					},
+					tags: match source.tags.as_deref() {
+						Some(t) => {
+							let cleaned: Vec<String> = t
+								.iter()
+								.map(|s| s.as_ref().trim().to_string())
+								.filter(|s| !s.is_empty())
+								.collect();
+							if cleaned.is_empty() { Patch::Null } else { Patch::Value(cleaned) }
+						}
+						None => Patch::Undefined,
+					},
+					preset: match source.preset.as_deref() {
+						Some(p) => Patch::Value(p.to_string()),
+						None => Patch::Undefined,
+					},
+					x: match &source.x {
+						Some(v) => Patch::Value(v.clone()),
+						None => Patch::Undefined,
+					},
+					broken: Patch::Null,
+					..Default::default()
+				};
+				app.meta_adapter.update_file_data(tn_id, &file_id, &opts).await?;
+			}
+			// Source server populated access_level → cache it; otherwise preserve
+			// whatever we already had (older peer servers may omit the field).
+			match source_access_level {
+				Some(lv) => match access_level_to_perm_char(lv) {
+					Some(ch) => Patch::Value(ch),
+					None => Patch::Null, // source says "no access" — clear cache
+				},
+				None => Patch::Undefined,
+			}
+		}
+		Err(Error::NotFound | Error::Gone) => {
+			if is_creator {
+				let opts = meta_adapter::UpdateFileOptions {
+					broken: Patch::Value(meta_adapter::BrokenReason::Deleted),
+					..Default::default()
+				};
+				app.meta_adapter.update_file_data(tn_id, &file_id, &opts).await?;
+			}
+			Patch::Null // file gone — clear cached badge for this user
+		}
+		Err(Error::PermissionDenied) => {
+			if is_creator {
+				let opts = meta_adapter::UpdateFileOptions {
+					broken: Patch::Value(meta_adapter::BrokenReason::Revoked),
+					..Default::default()
+				};
+				app.meta_adapter.update_file_data(tn_id, &file_id, &opts).await?;
+			}
+			Patch::Null // caller's grant revoked — clear their cached badge
+		}
+		Err(Error::NetworkError(_) | Error::Timeout) => {
+			// Transient: don't mutate the row at all. A single hiccup on the
+			// source server must not flip the tombstone — that's a sticky
+			// signal reserved for authoritative source responses. Surface the
+			// failure to the UI via `refreshStatus` so it can show a
+			// non-sticky banner that disappears on success.
+			refresh_status = Some("unreachable");
+			Patch::Undefined
+		}
+		Err(Error::Parse) => {
+			// Malformed peer response is a permanent bug on the source side,
+			// not a transient condition. Bubble it up as an internal error
+			// rather than the tombstone-clear / unreachable banner UX.
+			return Err(Error::Internal("source returned malformed metadata".into()));
+		}
+		Err(other) => return Err(other),
+	};
+
+	// Persist the source-reported access_level decision (skipped on transient
+	// failure via Patch::Undefined). Subsequent list responses read this back
+	// via the file_user_data JOIN, so the eye badge survives reloads instead
+	// of being recomputed from stale FSHR actions.
+	if !access_level_update.is_undefined() {
+		app.meta_adapter
+			.update_file_user_data(
+				tn_id,
+				&auth.id_tag,
+				&file_id,
+				Patch::Undefined, // pinned
+				Patch::Undefined, // starred
+				access_level_update,
+			)
+			.await?;
+	}
+
+	let mut view = app
+		.meta_adapter
+		.read_file_with_user_data(tn_id, &file_id, &auth.id_tag)
+		.await?
+		.ok_or(Error::NotFound)?;
+	// Mirror the persisted user_data.access_level onto the top-level field so the
+	// immediate response matches what subsequent list calls will return.
+	view.access_level = view.user_data.as_ref().and_then(|u| u.access_level);
+	let body = RefreshResponse { view, refresh_status };
+	Ok((StatusCode::OK, Json(ApiResponse::new(body).with_req_id(req_id.unwrap_or_default()))))
+}
+
+/// Map an AccessLevel back to its single-char wire form for storage in
+/// `file_user_data.access_level`. Mirrors [`AccessLevel::from_perm_char`].
+/// `AccessLevel::None` returns `None` — the caller should clear the cache
+/// rather than write a stale `'R'` badge.
+fn access_level_to_perm_char(level: AccessLevel) -> Option<char> {
+	match level {
+		AccessLevel::None => None,
+		AccessLevel::Read => Some('R'),
+		AccessLevel::Comment => Some('C'),
+		AccessLevel::Write | AccessLevel::Admin => Some('W'),
+	}
 }
 
 async fn build_dedup_response(
@@ -1647,16 +2146,50 @@ pub async fn post_file_blob(
 pub async fn get_file_metadata(
 	State(app): State<App>,
 	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth): OptionalAuth,
 	extract::Path(file_id): extract::Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::FileView>>)> {
-	let file = app.meta_adapter.read_file(tn_id, &file_id).await?.ok_or(Error::NotFound)?;
-	// Defence in depth: never expose Direct-visibility metadata (creator tag,
-	// tags, x-extras) to an anonymous caller, even if the ABAC middleware was
-	// misconfigured. Federation sync supplies auth for Direct files.
-	if file.visibility.is_none() && maybe_auth.is_none() {
+	let mut file = app.meta_adapter.read_file(tn_id, &file_id).await?.ok_or(Error::NotFound)?;
+	// Defence in depth for anonymous callers: never expose Direct-visibility
+	// metadata (creator tag, tags, x-extras) without auth. Authed callers are
+	// already gated by the route-level `check_perm_file("read")` ABAC middleware.
+	if maybe_auth.is_none() && file.visibility.is_none() {
 		return Err(Error::NotFound);
+	}
+	// Compute the caller's effective access level so cross-context callers
+	// (e.g. `POST /files/{id}/refresh` on a peer) can cache it. Same-tenant
+	// access is already fully described by the route-level ABAC role check —
+	// running `get_access_level_with_scope` for every authed request to this
+	// endpoint (hit by virtually every file view) would add a needless FSHR-
+	// fallback query against the actions table to the hot path. Skip it
+	// unless the file is genuinely cross-tenant.
+	if let Some(auth) = maybe_auth.as_ref() {
+		let owner_tag = file.owner.as_ref().map_or(tenant_id_tag.as_ref(), |o| o.id_tag.as_ref());
+		let is_cross_tenant = owner_tag != tenant_id_tag.as_ref();
+		if is_cross_tenant {
+			let ctx = file_access::FileAccessCtx {
+				user_id_tag: &auth.id_tag,
+				tenant_id_tag: &tenant_id_tag,
+				user_roles: &auth.roles,
+			};
+			let level = file_access::get_access_level_with_scope(
+				&app,
+				tn_id,
+				&file_id,
+				owner_tag,
+				&ctx,
+				auth.scope.as_deref(),
+				file.root_id.as_deref(),
+			)
+			.await;
+			// Map AccessLevel::None → None so we don't lie about a non-grant.
+			file.access_level = match level {
+				AccessLevel::None => None,
+				other => Some(other),
+			};
+		}
 	}
 	Ok((StatusCode::OK, Json(ApiResponse::new(file).with_req_id(req_id.unwrap_or_default()))))
 }

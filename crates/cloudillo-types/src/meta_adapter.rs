@@ -461,7 +461,7 @@ pub struct ListActionOptions {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ProfileInfo {
 	#[serde(rename = "idTag")]
 	pub id_tag: Box<str>,
@@ -555,59 +555,118 @@ pub enum FileStatus {
 
 /// User-specific file metadata (access tracking, pinned/starred status)
 #[skip_serializing_none]
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileUserData {
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	#[serde(default, serialize_with = "serialize_timestamp_iso_opt")]
 	pub accessed_at: Option<Timestamp>,
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	#[serde(default, serialize_with = "serialize_timestamp_iso_opt")]
 	pub modified_at: Option<Timestamp>,
+	#[serde(default)]
 	pub pinned: bool,
+	#[serde(default)]
 	pub starred: bool,
+	/// Cached source-reported access level for cross-context (hand-pinned)
+	/// rows. Written by `POST /files/{id}/refresh` and FSHR on_accept on the
+	/// receiver side. Cross-context list responses prefer this over the
+	/// FSHR-fallback path in `get_access_level`. `None` means the row has
+	/// never been refreshed (frontend renders no badge).
+	#[serde(default)]
+	pub access_level: Option<crate::types::AccessLevel>,
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileView {
 	pub file_id: Box<str>,
+	#[serde(default)]
 	pub parent_id: Option<Box<str>>, // Parent folder file_id (None = root)
-	pub root_id: Option<Box<str>>,   // Document tree root file_id (None = standalone)
+	#[serde(default)]
+	pub root_id: Option<Box<str>>, // Document tree root file_id (None = standalone)
+	#[serde(default)]
 	pub owner: Option<ProfileInfo>,
+	#[serde(default)]
 	pub creator: Option<ProfileInfo>,
+	#[serde(default)]
 	pub preset: Option<Box<str>>,
+	#[serde(default)]
 	pub content_type: Option<Box<str>>,
 	pub file_name: Box<str>,
+	#[serde(default)]
 	pub file_tp: Option<Box<str>>, // 'BLOB', 'CRDT', 'RTDB', 'FLDR'
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
-	#[serde(serialize_with = "crate::types::serialize_timestamp_iso_opt")]
+	#[serde(default, serialize_with = "crate::types::serialize_timestamp_iso_opt")]
 	pub accessed_at: Option<Timestamp>, // Global: when anyone last accessed
-	#[serde(serialize_with = "crate::types::serialize_timestamp_iso_opt")]
+	#[serde(default, serialize_with = "crate::types::serialize_timestamp_iso_opt")]
 	pub modified_at: Option<Timestamp>, // Global: when anyone last modified
 	pub status: FileStatus,
+	#[serde(default)]
 	pub tags: Option<Vec<Box<str>>>,
+	#[serde(default)]
 	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
 	/// LEGACY: read-only flag from pre-managed-folder schema. New writes route
 	/// system-managed files into `parent_id = MANAGED_PARENT_ID` instead; the
 	/// `hidden` column is preserved only so existing rows from earlier DB
 	/// versions still list-filter correctly until they are migrated.
+	#[serde(default)]
 	pub hidden: bool,
+	#[serde(default)]
 	pub access_level: Option<crate::types::AccessLevel>, // User's access level to this file (R/W)
+	#[serde(default)]
 	pub user_data: Option<FileUserData>, // User-specific data (only when authenticated)
+	#[serde(default)]
 	pub x: Option<serde_json::Value>, // Extensible metadata (e.g., {"dim": [width, height]} for images)
 	/// Immediate parent folder name. Populated only when listing requests
 	/// `withParent=true`; `None` for root, trash, managed-parent, or when not
 	/// requested. Serialized as `parentName` and omitted when `None`.
+	#[serde(default)]
 	pub parent_name: Option<Box<str>>,
 	/// Full path from root → immediate parent (not including the file itself).
 	/// Populated only when listing requests `withPath=true` (typically a
 	/// single-file fetch). Serialized as `path` and omitted when `None`.
+	#[serde(default)]
 	pub path: Option<Vec<PathSegment>>,
+	/// Tombstone: when set, the source of this cross-context row has issued
+	/// an authoritative permanent signal (deleted or revoked). Written by
+	/// `POST /api/files/{file_id}/refresh`; the frontend calls that endpoint
+	/// when it detects an inconsistency (broken thumbnail, 404 on blob,
+	/// stale access). Transient network failures do NOT set this — they
+	/// surface via the response wrapper's `refreshStatus` field instead.
+	#[serde(default, serialize_with = "crate::types::serialize_timestamp_iso_opt")]
+	pub broken_at: Option<Timestamp>,
+	/// Tombstone reason, set together with `broken_at`. See
+	/// [`BrokenReason`] for the closed set of values.
+	#[serde(default)]
+	pub broken_reason: Option<BrokenReason>,
+}
+
+/// Reason a cross-context file row is tombstoned. Written by the refresh
+/// endpoint based on the source's response. Tombstones are sticky, so this
+/// is reserved for permanent / authoritative source signals — transient
+/// network failures DO NOT mutate the row (the handler surfaces them
+/// out-of-band via `refreshStatus` in the response wrapper).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BrokenReason {
+	/// Source returned 404 / 410: the row is gone upstream.
+	Deleted,
+	/// Source returned 403: the caller's grant on the source has been revoked.
+	Revoked,
+}
+
+impl BrokenReason {
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			Self::Deleted => "deleted",
+			Self::Revoked => "revoked",
+		}
+	}
 }
 
 /// Single hop in a file's folder ancestry chain.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathSegment {
 	pub id: Box<str>,
@@ -794,6 +853,23 @@ pub struct UpdateFileOptions {
 	/// managed folder via `parent_id = MANAGED_PARENT_ID`.
 	#[serde(default)]
 	pub hidden: Patch<bool>,
+	// Fields below (content_type, file_tp, tags, preset, x, broken) are set
+	// only by the cross-context refresh handler; not exposed as PATCH fields.
+	#[serde(default, rename = "contentType", skip_deserializing)]
+	pub content_type: Patch<String>,
+	#[serde(default, rename = "fileTp", skip_deserializing)]
+	pub file_tp: Patch<String>,
+	#[serde(default, skip_deserializing)]
+	pub tags: Patch<Vec<String>>,
+	#[serde(default, skip_deserializing)]
+	pub preset: Patch<String>,
+	#[serde(default, skip_deserializing)]
+	pub x: Patch<serde_json::Value>,
+	/// Paired tombstone field. `Patch::Value(reason)` sets `broken_reason` and
+	/// stamps `broken_at = unixepoch()`. `Patch::Null` clears both. `Undefined`
+	/// touches neither.
+	#[serde(default, skip_deserializing)]
+	pub broken: Patch<BrokenReason>,
 }
 
 // Share Entries
@@ -1571,6 +1647,16 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Read file metadata
 	async fn read_file(&self, tn_id: TnId, file_id: &str) -> ClResult<Option<FileView>>;
 
+	/// Like [`read_file`] but also populates `user_data` (pinned, starred,
+	/// per-user timestamps, cached cross-context `access_level`) for the
+	/// given user.
+	async fn read_file_with_user_data(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		id_tag: &str,
+	) -> ClResult<Option<FileView>>;
+
 	// File User Data (per-user file activity tracking)
 	//**************************************************
 
@@ -1585,14 +1671,22 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		file_id: &str,
 	) -> ClResult<()>;
 
-	/// Update file user data (pinned/starred status)
+	/// Update file user data (pinned/starred status, cached access_level).
+	///
+	/// All three fields share the same three-state `Patch` encoding:
+	/// `Patch::Undefined` leaves the column untouched, `Patch::Null` clears it
+	/// (writes NULL — `pinned`/`starred` read back as `false`),
+	/// `Patch::Value(v)` sets it (`access_level` ch ∈ {'R', 'C', 'W'}).
+	/// Used by the `POST /files/{id}/refresh` handler (and FSHR on_accept on
+	/// the receiver side) to cache the source-reported cross-context access level.
 	async fn update_file_user_data(
 		&self,
 		tn_id: TnId,
 		id_tag: &str,
 		file_id: &str,
-		pinned: Option<bool>,
-		starred: Option<bool>,
+		pinned: crate::types::Patch<bool>,
+		starred: crate::types::Patch<bool>,
+		access_level: crate::types::Patch<char>,
 	) -> ClResult<FileUserData>;
 
 	/// Get file user data for a specific file
@@ -2021,6 +2115,18 @@ mod tests {
 		assert_eq!(v.len(), 2);
 		assert_eq!(v[0].as_str(), "D");
 		assert_eq!(v[1].as_str(), "F");
+	}
+
+	#[test]
+	fn test_broken_reason_as_str_matches_serde() {
+		for reason in [BrokenReason::Deleted, BrokenReason::Revoked] {
+			let via_serde = serde_json::to_value(reason)
+				.expect("serialize")
+				.as_str()
+				.expect("string variant")
+				.to_string();
+			assert_eq!(reason.as_str(), via_serde, "as_str diverged from serde for {:?}", reason);
+		}
 	}
 }
 

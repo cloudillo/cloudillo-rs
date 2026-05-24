@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 27;
+	const CURRENT_DB_VERSION: i64 = 30;
 
 	let mut tx = db.begin().await?;
 
@@ -178,6 +178,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			modified_at INTEGER,		-- Global: when anyone last modified this file
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
+			broken_at INTEGER,			-- Tombstone written by the cross-context refresh endpoint
+			broken_reason TEXT,			-- BrokenReason enum: 'deleted' | 'revoked'
 			PRIMARY KEY(f_id)
 		)",
 	)
@@ -382,6 +384,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			modified_at INTEGER,
 			pinned INTEGER DEFAULT 0,
 			starred INTEGER DEFAULT 0,
+			access_level CHAR(1),
 			created_at INTEGER NOT NULL DEFAULT (unixepoch()),
 			updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
 			PRIMARY KEY (tn_id, id_tag, f_id)
@@ -1659,6 +1662,82 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.await?;
 
 		set_db_version(&mut tx, 27).await;
+	}
+
+	// Version 28: Hand (cross-context file refs) tombstone columns. Cross-tenant
+	// rows whose source has been deleted or had access revoked are flagged here by
+	// the refresh endpoint (`POST /api/files/{id}/refresh`); UI renders them as
+	// tombstones.
+	if version < 28 {
+		sqlx::query("ALTER TABLE files ADD COLUMN broken_at INTEGER")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("ALTER TABLE files ADD COLUMN broken_reason TEXT")
+			.execute(&mut *tx)
+			.await?;
+
+		set_db_version(&mut tx, 28).await;
+	}
+
+	// Version 29: per-user persisted access_level for cross-context rows. Written
+	// by `POST /api/files/{id}/refresh` (and FSHR on_accept on the receiver side)
+	// so subsequent list queries can return the source-reported access without
+	// re-running the FSHR-fallback path in `get_access_level`.
+	if version < 29 {
+		sqlx::query("ALTER TABLE file_user_data ADD COLUMN access_level CHAR(1)")
+			.execute(&mut *tx)
+			.await?;
+
+		set_db_version(&mut tx, 29).await;
+	}
+
+	// Version 30: backfill file_user_data.access_level from receiver-side FSHR
+	// actions. v29 added the column but pre-existing accepted shares — created
+	// before FSHR on_accept learned to seed — would have a NULL access_level
+	// until the user manually refreshed each file. This migration matches each
+	// receiver tenant's accepted FSHR action (audience = tenant id_tag, status
+	// 'A', non-DEL) to its created file row and writes the cached perm char.
+	// One-shot — runtime writes still funnel through `update_file_user_data` /
+	// `refresh_file`, which take precedence on next reconciliation.
+	//
+	// Within each (tn_id, audience, subject) we keep the LATEST action —
+	// ORDER BY created_at DESC, a_id DESC — so a recipient with multiple
+	// accepted FSHRs for the same file (e.g. an initial READ later upgraded
+	// to WRITE, or vice versa) gets the most recent grant. A plain JOIN
+	// without ordering would pick an arbitrary row, potentially downgrading
+	// a real grant.
+	if version < 30 {
+		sqlx::query(
+			"INSERT INTO file_user_data (tn_id, id_tag, f_id, access_level, created_at, updated_at)
+			 SELECT t.tn_id, t.id_tag, f.f_id,
+			        CASE WHEN latest.sub_type = 'WRITE' THEN 'W'
+			             WHEN latest.sub_type = 'COMMENT' THEN 'C'
+			             ELSE 'R' END,
+			        unixepoch(), unixepoch()
+			 FROM (
+			     SELECT a.tn_id, a.audience, a.subject, a.sub_type,
+			            ROW_NUMBER() OVER (
+			                PARTITION BY a.tn_id, a.audience, a.subject
+			                ORDER BY a.created_at DESC, a.a_id DESC
+			            ) AS rn
+			     FROM actions a
+			     WHERE a.type = 'FSHR'
+			       AND a.subject IS NOT NULL
+			       AND a.audience IS NOT NULL
+			       AND (a.sub_type IS NULL OR a.sub_type != 'DEL')
+			       AND (a.status IS NULL OR a.status = 'A')
+			 ) latest
+			 INNER JOIN tenants t ON latest.tn_id = t.tn_id AND latest.audience = t.id_tag
+			 INNER JOIN files f ON f.tn_id = t.tn_id AND f.file_id = latest.subject
+			 WHERE latest.rn = 1
+			 ON CONFLICT (tn_id, id_tag, f_id) DO UPDATE SET
+			    access_level = excluded.access_level,
+			    updated_at = unixepoch()",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		set_db_version(&mut tx, 30).await;
 	}
 
 	tx.commit().await?;

@@ -106,7 +106,9 @@ pub(crate) fn push_in<'a>(
 /// Parse comma-separated string list into boxed array of boxed strings
 pub(crate) fn parse_str_list(s: &str) -> Box<[Box<str>]> {
 	s.split(',')
-		.map(|s| s.trim().to_owned().into_boxed_str())
+		.map(str::trim)
+		.filter(|s| !s.is_empty())
+		.map(|s| s.to_owned().into_boxed_str())
 		.collect::<Vec<_>>()
 		.into_boxed_slice()
 }
@@ -154,4 +156,21 @@ pub(crate) fn collect_res<T>(
 		items.push(item.inspect_err(inspect).map_err(|_| Error::DbError)?);
 	}
 	Ok(items)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::parse_str_list;
+
+	#[test]
+	fn parse_str_list_skips_empty_and_whitespace_only() {
+		let v = parse_str_list("a, ,b,,c");
+		assert_eq!(v.iter().map(AsRef::as_ref).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+	}
+
+	#[test]
+	fn parse_str_list_trims() {
+		let v = parse_str_list(" a ,  b");
+		assert_eq!(v.iter().map(AsRef::as_ref).collect::<Vec<_>>(), vec!["a", "b"]);
+	}
 }

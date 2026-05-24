@@ -275,9 +275,24 @@ pub async fn patch_file_user_data(
 	}
 
 	// Update user-specific data
+	let pinned = match req.pinned {
+		Some(v) => Patch::Value(v),
+		None => Patch::Undefined,
+	};
+	let starred = match req.starred {
+		Some(v) => Patch::Value(v),
+		None => Patch::Undefined,
+	};
 	let user_data = app
 		.meta_adapter
-		.update_file_user_data(auth.tn_id, &auth.id_tag, &file_id, req.pinned, req.starred)
+		.update_file_user_data(
+			auth.tn_id,
+			&auth.id_tag,
+			&file_id,
+			pinned,
+			starred,
+			Patch::Undefined,
+		)
 		.await?;
 
 	info!(

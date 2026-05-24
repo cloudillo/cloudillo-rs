@@ -567,6 +567,15 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::read(&self.dbr, tn_id, file_id).await
 	}
 
+	async fn read_file_with_user_data(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		id_tag: &str,
+	) -> ClResult<Option<FileView>> {
+		file::read_with_user_data(&self.dbr, tn_id, file_id, id_tag).await
+	}
+
 	// File User Data (per-user file activity tracking)
 	//**************************************************
 
@@ -588,10 +597,12 @@ impl MetaAdapter for MetaAdapterSqlite {
 		tn_id: TnId,
 		id_tag: &str,
 		file_id: &str,
-		pinned: Option<bool>,
-		starred: Option<bool>,
+		pinned: cloudillo_types::types::Patch<bool>,
+		starred: cloudillo_types::types::Patch<bool>,
+		access_level: cloudillo_types::types::Patch<char>,
 	) -> ClResult<FileUserData> {
-		file_user_data::update(&self.db, tn_id, id_tag, file_id, pinned, starred).await
+		file_user_data::update(&self.db, tn_id, id_tag, file_id, pinned, starred, access_level)
+			.await
 	}
 
 	async fn get_file_user_data(
