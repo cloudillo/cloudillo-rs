@@ -24,7 +24,7 @@ pub async fn require_admin(
 	next: Next,
 ) -> Result<Response, Error> {
 	// Check if user has SADM (site admin) role
-	if !auth_ctx.roles.iter().any(|r| r.as_ref() == "SADM") {
+	if !cloudillo_core::abac::is_admin(&auth_ctx) {
 		tracing::warn!(
 			subject = %auth_ctx.id_tag,
 			roles = ?auth_ctx.roles,

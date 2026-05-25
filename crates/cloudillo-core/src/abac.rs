@@ -188,6 +188,14 @@ pub fn can_view_item(ctx: &ViewCheckContext<'_>) -> bool {
 // Re-export AttrSet from cloudillo-types (canonical definition)
 pub use cloudillo_types::abac::AttrSet;
 
+/// True iff `auth` carries the site-admin (SADM) role.
+///
+/// Single source of truth for the role-name string; callers must not
+/// compare role strings inline.
+pub fn is_admin(auth: &AuthCtx) -> bool {
+	auth.roles.iter().any(|r| r.as_ref() == "SADM")
+}
+
 /// Environment attributes (environmental context)
 #[derive(Debug, Clone)]
 pub struct Environment {

@@ -85,7 +85,7 @@ pub async fn list_settings(
 				// simpler and safe because list returns mixed-scope keys —
 				// without per-row scope checks, we can't selectively allow
 				// Tenant-scoped global rows for non-SADM callers.
-				if !auth.roles.iter().any(|r| r.as_ref() == "SADM") {
+				if !crate::abac::is_admin(&auth) {
 					return Err(Error::PermissionDenied);
 				}
 				app.settings.list_by_prefix_at(TnId(0), &prefixes).await?
@@ -175,7 +175,7 @@ async fn resolve_target_tn_id(
 			// even when `id_tag == auth.id_tag` so the audit trail is honest:
 			// a non-SADM admin should hit "permission denied", not silently
 			// have their explicit `tenant=self` collapse to the implicit path.
-			if !auth.roles.iter().any(|r| r.as_ref() == "SADM") {
+			if !crate::abac::is_admin(auth) {
 				return Err(Error::PermissionDenied);
 			}
 			app.auth_adapter.read_tn_id(id_tag).await.map_err(|_| Error::NotFound)
