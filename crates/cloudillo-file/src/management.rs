@@ -377,7 +377,16 @@ pub async fn duplicate_file(
 	}
 
 	// 6. Create file metadata for the duplicate
-	let parent_id = req.parent_id.map(Box::from).or(file.parent_id);
+	// Normalize empty-string parent_id to None on both inputs. An empty string
+	// is neither root (NULL) nor a real folder ID; binding it would store ""
+	// which fails the `parent_id IS NULL` filter the listing uses for
+	// `parentId=__root__`, hiding the duplicate from the root view even though
+	// the source row is correctly NULL.
+	let parent_id = req
+		.parent_id
+		.filter(|s| !s.is_empty())
+		.map(Box::from)
+		.or_else(|| file.parent_id.filter(|s| !s.is_empty()));
 	let _f_id = app
 		.meta_adapter
 		.create_file(
