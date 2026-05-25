@@ -37,7 +37,7 @@ use cloudillo_types::{
 		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
 		ProfileData, PushSubscription, PushSubscriptionData, RefData, ShareEntry, Task, TaskPatch,
 		Tenant, TenantListMeta, UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData,
-		UpdateFileOptions, UpdateTenantData, UpsertProfileFields, UpsertResult,
+		UpdateFileOptions, UpdateRefOptions, UpdateTenantData, UpsertProfileFields, UpsertResult,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -497,7 +497,7 @@ impl MetaAdapter for MetaAdapterSqlite {
 		reference::list(&self.dbr, tn_id, opts).await
 	}
 
-	async fn get_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<Option<(Box<str>, Box<str>)>> {
+	async fn get_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<Option<RefData>> {
 		reference::get(&self.dbr, tn_id, ref_id).await
 	}
 
@@ -512,6 +512,15 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn delete_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<()> {
 		reference::delete(&self.db, tn_id, ref_id).await
+	}
+
+	async fn update_ref(
+		&self,
+		tn_id: TnId,
+		ref_id: &str,
+		opts: &UpdateRefOptions,
+	) -> ClResult<RefData> {
+		reference::update(&self.db, tn_id, ref_id, opts).await
 	}
 
 	async fn use_ref(

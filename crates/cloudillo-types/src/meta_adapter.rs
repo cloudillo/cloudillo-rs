@@ -152,6 +152,22 @@ pub struct CreateRefOptions {
 	pub params: Option<String>,
 }
 
+/// Options for updating an existing reference via PATCH semantics.
+///
+/// Each field uses `Patch<T>`: `Undefined` leaves the column unchanged,
+/// `Null` clears it, `Value(v)` sets it. `type`, `resource_id`, and
+/// `params` are intentionally immutable post-create.
+#[derive(Debug, Default)]
+pub struct UpdateRefOptions {
+	pub description: Patch<String>,
+	/// Expiration timestamp. `Null` clears expiration (link never expires).
+	pub expires_at: Patch<Timestamp>,
+	/// `Null` clears the counter (unlimited uses).
+	pub count: Patch<u32>,
+	/// `Value('R'|'C'|'W')`.
+	pub access_level: Patch<char>,
+}
+
 #[skip_serializing_none]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1582,7 +1598,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn list_refs(&self, tn_id: TnId, opts: &ListRefsOptions) -> ClResult<Vec<RefData>>;
 
 	/// Get a specific reference by ID
-	async fn get_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<Option<(Box<str>, Box<str>)>>;
+	async fn get_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<Option<RefData>>;
 
 	/// Create a new reference
 	async fn create_ref(
@@ -1594,6 +1610,14 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Delete a reference
 	async fn delete_ref(&self, tn_id: TnId, ref_id: &str) -> ClResult<()>;
+
+	/// Update fields of an existing reference. Returns the updated row.
+	async fn update_ref(
+		&self,
+		tn_id: TnId,
+		ref_id: &str,
+		opts: &UpdateRefOptions,
+	) -> ClResult<RefData>;
 
 	/// Use/consume a reference - validates type, expiration, counter, decrements counter
 	/// Returns (TnId, id_tag, RefData) of the tenant that owns this ref

@@ -174,6 +174,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 		// --- Reference API ---
 		.route("/api/refs", get(r#ref::handler::list_refs))
 		.route("/api/refs", post(r#ref::handler::create_ref))
+		.route("/api/refs/{ref_id}", patch(r#ref::handler::update_ref))
 		.route("/api/refs/{ref_id}", delete(r#ref::handler::delete_ref))
 
 		// --- Own Profile Management ---

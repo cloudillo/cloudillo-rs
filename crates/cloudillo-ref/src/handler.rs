@@ -11,10 +11,25 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
-use cloudillo_core::extract::{OptionalAuth, OptionalRequestId};
-use cloudillo_types::meta_adapter::{CreateRefOptions, ListRefsOptions, RefData};
-use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt};
+use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
+use cloudillo_core::file_access::{self, FileAccessCtx};
+use cloudillo_types::meta_adapter::{CreateRefOptions, ListRefsOptions, RefData, UpdateRefOptions};
+use cloudillo_types::types::{
+	AccessLevel, ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt,
+};
 use cloudillo_types::utils;
+
+fn parse_access_level(s: &str) -> ClResult<char> {
+	match s {
+		"write" | "W" => Ok('W'),
+		"comment" | "C" => Ok('C'),
+		"read" | "R" => Ok('R'),
+		other => Err(Error::ValidationError(format!(
+			"Invalid access_level '{}': must be 'read', 'comment', or 'write'",
+			other
+		))),
+	}
+}
 
 /// Response structure for ref details (authenticated users get full data)
 #[serde_with::skip_serializing_none]
@@ -88,8 +103,8 @@ pub struct CreateRefRequest {
 	pub r#type: String,
 	/// Human-readable description
 	pub description: Option<String>,
-	/// Optional expiration timestamp
-	pub expires_at: Option<i64>,
+	/// Optional expiration as an ISO 8601 timestamp (e.g. `"2026-05-31T00:00:00Z"`)
+	pub expires_at: Option<Timestamp>,
 	/// Number of times this ref can be used:
 	/// - Omit field: defaults to 1 (single use)
 	/// - null: unlimited uses
@@ -179,28 +194,22 @@ pub async fn create_ref(
 	}
 
 	// Validate expiration if provided
-	if let Some(expires_timestamp) = create_req.expires_at {
-		let expiration = Timestamp(expires_timestamp);
-		if expiration.0 <= Timestamp::now().0 {
-			return Err(Error::ValidationError(
-				"Expiration time must be in the future".to_string(),
-			));
-		}
+	if let Some(expiration) = create_req.expires_at
+		&& expiration.0 <= Timestamp::now().0
+	{
+		return Err(Error::ValidationError("Expiration time must be in the future".to_string()));
 	}
 
 	// Parse and validate access_level
 	let access_level_char = match create_req.access_level.as_deref() {
-		Some("write" | "W") => Some('W'),
-		Some("comment" | "C") => Some('C'),
-		Some("read" | "R") | None => {
-			// Default to read if resource_id is present
-			if create_req.resource_id.is_some() { Some('R') } else { None }
-		}
-		Some(other) => {
-			return Err(Error::ValidationError(format!(
-				"Invalid access_level '{}': must be 'read', 'comment', or 'write'",
-				other
-			)));
+		Some(s) => Some(parse_access_level(s)?),
+		// Default to read if resource_id is present, else None.
+		None => {
+			if create_req.resource_id.is_some() {
+				Some('R')
+			} else {
+				None
+			}
 		}
 	};
 
@@ -233,7 +242,7 @@ pub async fn create_ref(
 	let opts = CreateRefOptions {
 		typ: create_req.r#type.clone(),
 		description: create_req.description.clone(),
-		expires_at: create_req.expires_at.map(Timestamp),
+		expires_at: create_req.expires_at,
 		count,
 		resource_id: create_req.resource_id.clone(),
 		access_level: access_level_char,
@@ -274,19 +283,7 @@ pub async fn get_ref(
 		"GET /api/refs/:id - Getting ref"
 	);
 
-	// Verify the ref exists first
-	app.meta_adapter.get_ref(tn_id, &ref_id).await?.ok_or(Error::NotFound)?;
-
-	// Reconstruct RefData from tuple (we have ref_type, ref_description)
-	// Note: The return type is Option<(Box<str>, Box<str>)> which contains (type, description)
-	// We need to use list_refs to get the full RefData with timestamps and count
-	let opts = ListRefsOptions { typ: None, filter: Some("all".to_string()), resource_id: None };
-
-	let refs = app.meta_adapter.list_refs(tn_id, &opts).await?;
-	let ref_data = refs
-		.into_iter()
-		.find(|r| r.ref_id.as_ref() == ref_id.as_str())
-		.ok_or(Error::NotFound)?;
+	let ref_data = app.meta_adapter.get_ref(tn_id, &ref_id).await?.ok_or(Error::NotFound)?;
 
 	// Return different response based on authentication
 	let response_value = if is_authenticated {
@@ -334,6 +331,181 @@ pub async fn delete_ref(
 	})?;
 
 	let mut response = ApiResponse::new(());
+	if let Some(id) = req_id {
+		response = response.with_req_id(id);
+	}
+
+	Ok((StatusCode::OK, Json(response)))
+}
+
+/// Request body for PATCH /api/refs/{ref_id}.
+///
+/// Each field uses `Patch<T>` semantics: omitted = leave unchanged,
+/// explicit `null` = clear, value = set.
+#[derive(Debug, Deserialize)]
+pub struct UpdateRefRequest {
+	#[serde(default)]
+	pub description: Patch<String>,
+	/// Expiration as an ISO 8601 timestamp string. Use `null` to clear.
+	#[serde(rename = "expiresAt", default)]
+	pub expires_at: Patch<Timestamp>,
+	#[serde(default)]
+	pub count: Patch<u32>,
+	#[serde(rename = "accessLevel", default)]
+	pub access_level: Patch<String>,
+}
+
+/// PATCH /api/refs/{ref_id} - Update fields of an existing ref in place.
+#[axum::debug_handler]
+pub async fn update_ref(
+	State(app): State<App>,
+	tn_id: TnId,
+	Auth(auth): Auth,
+	IdTag(tenant_id_tag): IdTag,
+	Path(ref_id): Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(req): Json<UpdateRefRequest>,
+) -> ClResult<(StatusCode, Json<ApiResponse<RefResponse>>)> {
+	info!(
+		tn_id = ?tn_id,
+		ref_id = %ref_id,
+		user_id_tag = %auth.id_tag,
+		"PATCH /api/refs/:id - Updating ref"
+	);
+
+	let existing = app.meta_adapter.get_ref(tn_id, &ref_id).await?.ok_or(Error::NotFound)?;
+
+	// Per-type authorization. share.file uses file-access ACL; register is
+	// admin-only (SADM). All other system-issued ref types (invite,
+	// password-reset, email-verify, auth tokens) remain non-PATCHable.
+	match existing.r#type.as_ref() {
+		"share.file" => {
+			let file_id = existing
+				.resource_id
+				.as_deref()
+				.ok_or_else(|| Error::Internal("share.file ref missing resource_id".to_string()))?;
+
+			let ctx = FileAccessCtx {
+				user_id_tag: &auth.id_tag,
+				tenant_id_tag: &tenant_id_tag,
+				user_roles: &auth.roles,
+			};
+			// Intentionally drop scope: a share recipient must not be able to mutate
+			// the very ref that granted them access (confused-deputy).
+			let access =
+				file_access::check_file_access_with_scope(&app, tn_id, file_id, &ctx, None, None)
+					.await
+					.map_err(|e| match e {
+						file_access::FileAccessError::NotFound => Error::NotFound,
+						file_access::FileAccessError::AccessDenied => Error::PermissionDenied,
+						file_access::FileAccessError::InternalError(msg) => Error::Internal(msg),
+					})?;
+
+			// Mutation requires Write or Admin on the file (Comment and Read are not
+			// sufficient — they grant view/annotate, not ACL changes).
+			if access.access_level != AccessLevel::Write
+				&& access.access_level != AccessLevel::Admin
+			{
+				return Err(Error::PermissionDenied);
+			}
+
+			if matches!(req.access_level, Patch::Null) {
+				return Err(Error::ValidationError(
+					"access_level cannot be cleared on share.file refs; DELETE the ref instead"
+						.to_string(),
+				));
+			}
+		}
+		"register" => {
+			if !cloudillo_core::abac::is_admin(&auth) {
+				tracing::warn!(
+					subject = %auth.id_tag,
+					roles = ?auth.roles,
+					ref_id = %ref_id,
+					"PATCH register ref denied - SADM role required"
+				);
+				return Err(Error::PermissionDenied);
+			}
+			// access_level is not a concept for register refs; reject if set
+			// rather than silently dropping it.
+			if !matches!(req.access_level, Patch::Undefined) {
+				return Err(Error::ValidationError(
+					"access_level cannot be set on register refs".to_string(),
+				));
+			}
+		}
+		other => {
+			return Err(Error::ValidationError(format!(
+				"PATCH is not supported for refs of type {}",
+				other
+			)));
+		}
+	}
+
+	// Validate expires_at is in the future when set (matches create_ref behavior).
+	if let Patch::Value(exp) = req.expires_at
+		&& exp.0 <= Timestamp::now().0
+	{
+		return Err(Error::ValidationError("Expiration time must be in the future".to_string()));
+	}
+
+	// Cap description length (mirrors the 2048-byte cap on `params` in create_ref).
+	if let Patch::Value(ref d) = req.description
+		&& d.len() > 2048
+	{
+		return Err(Error::ValidationError("description too long (max 2048 bytes)".into()));
+	}
+
+	// Map access_level string -> char with the same vocabulary as create_ref.
+	let access_level_patch: Patch<char> = match &req.access_level {
+		Patch::Undefined => Patch::Undefined,
+		Patch::Null => Patch::Null,
+		Patch::Value(s) => Patch::Value(parse_access_level(s)?),
+	};
+
+	// Reject empty PATCH at the handler boundary; the adapter is a no-op for empty patches.
+	if req.description.is_undefined()
+		&& req.expires_at.is_undefined()
+		&& req.count.is_undefined()
+		&& access_level_patch.is_undefined()
+	{
+		return Err(Error::ValidationError("no fields to update".to_string()));
+	}
+
+	// I3: a fully-consumed ref (count == 0) cannot be resurrected. Both raising
+	// the counter (Value(n > 0)) and clearing it (Null -> unlimited) would
+	// silently re-enable a link callers treat as single-use. Owners who want a
+	// new link should DELETE + POST.
+	if existing.count == Some(0) {
+		let resurrecting =
+			matches!(req.count, Patch::Value(n) if n > 0) || matches!(req.count, Patch::Null);
+		if resurrecting {
+			return Err(Error::ValidationError(
+				"cannot resurrect a fully-used ref; create a new ref instead".to_string(),
+			));
+		}
+	}
+
+	if matches!(req.count, Patch::Value(0)) && existing.count != Some(0) {
+		return Err(Error::ValidationError(
+			"cannot set count to 0; DELETE the ref to revoke it".to_string(),
+		));
+	}
+
+	let update_opts = UpdateRefOptions {
+		description: req.description,
+		expires_at: req.expires_at,
+		count: req.count,
+		access_level: access_level_patch,
+	};
+
+	let updated = app.meta_adapter.update_ref(tn_id, &ref_id, &update_opts).await.map_err(|e| {
+		warn!("Failed to update ref: {}", e);
+		e
+	})?;
+
+	let response_data = RefResponse::from(updated);
+	let mut response = ApiResponse::new(response_data);
 	if let Some(id) = req_id {
 		response = response.with_req_id(id);
 	}
