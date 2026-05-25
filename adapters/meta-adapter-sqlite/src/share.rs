@@ -7,10 +7,10 @@
 
 use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
-use cloudillo_types::meta_adapter::{CreateShareEntry, ShareEntry};
+use cloudillo_types::meta_adapter::{CreateShareEntry, ShareEntry, UpdateShareEntryOptions};
 use cloudillo_types::prelude::*;
 
-use crate::utils::inspect;
+use crate::utils::{inspect, push_patch};
 
 /// Convert a SQLite row into a ShareEntry
 fn row_to_share_entry(row: &SqliteRow) -> ShareEntry {
@@ -105,6 +105,68 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, id: i64) -> ClResult<()
 		.map_err(|_| Error::DbError)?;
 
 	Ok(())
+}
+
+/// Update fields of an existing share entry using `Patch<T>` semantics.
+///
+/// Only `Patch::Value`/`Patch::Null` columns are written; `Patch::Undefined`
+/// columns are left alone. The `updated_at` column is maintained by the
+/// `share_entries_updated_at` trigger. Returns the post-update row via
+/// `RETURNING`.
+pub(crate) async fn update(
+	db: &SqlitePool,
+	tn_id: TnId,
+	id: i64,
+	resource_type: char,
+	resource_id: &str,
+	opts: &UpdateShareEntryOptions,
+) -> ClResult<ShareEntry> {
+	let resource_type_str = resource_type.to_string();
+
+	// Empty-patch safety: handler enforces non-empty, but adapter must
+	// also be safe to call. If both fields are Undefined, just re-read,
+	// still scoped by resource so we can't return a row for a different one.
+	let any_change = !opts.permission.is_undefined() || !opts.expires_at.is_undefined();
+	if !any_change {
+		let row = sqlx::query(
+			"SELECT id, resource_type, resource_id, subject_type, subject_id, \
+				permission, expires_at, created_by, created_at \
+			 FROM share_entries \
+			 WHERE id = ? AND tn_id = ? AND resource_type = ? AND resource_id = ?",
+		)
+		.bind(id)
+		.bind(tn_id.0)
+		.bind(&resource_type_str)
+		.bind(resource_id)
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+		return row.map(|r| row_to_share_entry(&r)).ok_or(Error::NotFound);
+	}
+
+	let mut query = sqlx::QueryBuilder::new("UPDATE share_entries SET ");
+	let mut has = false;
+	has = push_patch!(query, has, "permission", &opts.permission, |c| c.to_string());
+	let _: bool = push_patch!(query, has, "expires_at", &opts.expires_at, |v| v.0);
+
+	query.push(" WHERE tn_id = ").push_bind(tn_id.0);
+	query.push(" AND id = ").push_bind(id);
+	query.push(" AND resource_type = ").push_bind(resource_type_str);
+	query.push(" AND resource_id = ").push_bind(resource_id);
+	query.push(
+		" RETURNING id, resource_type, resource_id, subject_type, subject_id, \
+		 permission, expires_at, created_by, created_at",
+	);
+
+	let row = query
+		.build()
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+	row.map(|r| row_to_share_entry(&r)).ok_or(Error::NotFound)
 }
 
 /// List share entries for a resource, excluding expired entries

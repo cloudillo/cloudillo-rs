@@ -921,6 +921,21 @@ pub struct CreateShareEntry {
 	pub expires_at: Option<Timestamp>,
 }
 
+/// Options for updating an existing share entry via PATCH semantics.
+///
+/// Each field uses `Patch<T>`: `Undefined` leaves the column unchanged,
+/// `Null` clears it, `Value(v)` sets it. `resource_type`, `resource_id`,
+/// `subject_type`, `subject_id`, `created_by`, and `created_at` are
+/// intentionally immutable post-create.
+#[derive(Debug, Default)]
+pub struct UpdateShareEntryOptions {
+	/// `Value('R'|'C'|'W'|'A')`. `Null` is rejected at the handler
+	/// boundary — to revoke access, DELETE the share entry instead.
+	pub permission: Patch<char>,
+	/// Expiration timestamp. `Null` clears expiration (share never expires).
+	pub expires_at: Patch<Timestamp>,
+}
+
 // Push Subscriptions
 //********************
 
@@ -1762,6 +1777,20 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Delete a share entry by ID
 	async fn delete_share_entry(&self, tn_id: TnId, id: i64) -> ClResult<()>;
+
+	/// Update fields of an existing share entry using PATCH semantics.
+	/// The update only applies if the row also matches `(resource_type, resource_id)`,
+	/// which both prevents cross-resource targeting and removes the need for a
+	/// caller-side pre-read. Returns the updated row via SQL `RETURNING`, or
+	/// `Error::NotFound` if no row matched.
+	async fn update_share_entry(
+		&self,
+		tn_id: TnId,
+		id: i64,
+		resource_type: char,
+		resource_id: &str,
+		opts: &UpdateShareEntryOptions,
+	) -> ClResult<ShareEntry>;
 
 	/// List share entries for a resource
 	async fn list_share_entries(

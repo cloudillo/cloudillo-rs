@@ -37,7 +37,8 @@ use cloudillo_types::{
 		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
 		ProfileData, PushSubscription, PushSubscriptionData, RefData, ShareEntry, Task, TaskPatch,
 		Tenant, TenantListMeta, UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData,
-		UpdateFileOptions, UpdateRefOptions, UpdateTenantData, UpsertProfileFields, UpsertResult,
+		UpdateFileOptions, UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData,
+		UpsertProfileFields, UpsertResult,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -658,6 +659,17 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn delete_share_entry(&self, tn_id: TnId, id: i64) -> ClResult<()> {
 		share::delete(&self.db, tn_id, id).await
+	}
+
+	async fn update_share_entry(
+		&self,
+		tn_id: TnId,
+		id: i64,
+		resource_type: char,
+		resource_id: &str,
+		opts: &UpdateShareEntryOptions,
+	) -> ClResult<ShareEntry> {
+		share::update(&self.db, tn_id, id, resource_type, resource_id, opts).await
 	}
 
 	async fn list_share_entries(

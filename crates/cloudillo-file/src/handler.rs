@@ -2167,8 +2167,15 @@ pub async fn get_file_metadata(
 	// unless the file is genuinely cross-tenant.
 	if let Some(auth) = maybe_auth.as_ref() {
 		let owner_tag = file.owner.as_ref().map_or(tenant_id_tag.as_ref(), |o| o.id_tag.as_ref());
-		let is_cross_tenant = owner_tag != tenant_id_tag.as_ref();
-		if is_cross_tenant {
+		// Compute access_level when either (a) the file is from another tenant
+		// (the original cross-context Pin/Place path), or (b) the caller is from
+		// another tenant (federated /refresh from the receiver — the owner's
+		// server must report the receiver's effective level so they can cache
+		// the eye-badge after a permission change). Skipping both cases would
+		// leave `refresh_file` unable to pick up share_entry PATCHes.
+		let is_cross_tenant_file = owner_tag != tenant_id_tag.as_ref();
+		let is_cross_tenant_caller = auth.id_tag.as_ref() != tenant_id_tag.as_ref();
+		if is_cross_tenant_file || is_cross_tenant_caller {
 			let ctx = file_access::FileAccessCtx {
 				user_id_tag: &auth.id_tag,
 				tenant_id_tag: &tenant_id_tag,

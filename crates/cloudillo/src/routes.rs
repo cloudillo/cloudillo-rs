@@ -230,7 +230,10 @@ fn init_protected_routes(app: App) -> Router<App> {
 		// --- File Share Management ---
 		.route("/api/files/{file_id}/shares", get(file::share::list_shares))
 		.route("/api/files/{file_id}/shares", post(file::share::create_share))
-		.route("/api/files/{file_id}/shares/{share_id}", delete(file::share::delete_share))
+		.route(
+			"/api/files/{file_id}/shares/{share_id}",
+			delete(file::share::delete_share).patch(file::share::update_share),
+		)
 
 		// --- Tag API ---
 		.route("/api/tags", get(file::tag::list_tags))
