@@ -210,8 +210,8 @@ pub(crate) async fn get(
 
 	match res {
 		Some(row) => {
-			let accessed_at: Option<i64> = row.try_get("accessed_at").ok();
-			let modified_at: Option<i64> = row.try_get("modified_at").ok();
+			let accessed_at: Option<i64> = row.try_get("accessed_at").ok().flatten();
+			let modified_at: Option<i64> = row.try_get("modified_at").ok().flatten();
 			let pinned: i64 = row.try_get("pinned").unwrap_or(0);
 			let starred: i64 = row.try_get("starred").unwrap_or(0);
 			let access_level_str: Option<String> = row.try_get("access_level").ok().flatten();

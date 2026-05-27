@@ -489,7 +489,7 @@ pub(crate) async fn list(
 		let owner = build_owner_profile(row);
 		let creator = build_creator_profile(row, owner.as_ref());
 
-		let visibility: Option<String> = row.try_get("visibility").ok();
+		let visibility: Option<String> = row.try_get("visibility").ok().flatten();
 		let visibility = visibility.and_then(|s| s.chars().next());
 
 		// Use @{f_id} as fallback when file_id is NULL (for pending files)
@@ -543,7 +543,7 @@ pub(crate) async fn list(
 
 		Ok(FileView {
 			file_id,
-			parent_id: row.try_get("parent_id").ok(),
+			parent_id: row.try_get("parent_id").ok().flatten(),
 			root_id: row.try_get("root_id").ok().flatten(),
 			owner,
 			creator,
@@ -1304,13 +1304,13 @@ fn row_to_file_view(
 		_ => return Err(Error::DbError),
 	};
 
-	let tags_str: Option<Box<str>> = row.try_get("tags").ok();
+	let tags_str: Option<Box<str>> = row.try_get("tags").ok().flatten();
 	let tags = tags_str.map(|s| parse_str_list(&s).to_vec());
 
 	let owner = build_owner_profile(row);
 	let creator = build_creator_profile(row, owner.as_ref());
 
-	let visibility: Option<String> = row.try_get("visibility").ok();
+	let visibility: Option<String> = row.try_get("visibility").ok().flatten();
 	let visibility = visibility.and_then(|s| s.chars().next());
 
 	let accessed_at: Option<i64> = row.try_get("accessed_at").ok().flatten();
@@ -1330,14 +1330,14 @@ fn row_to_file_view(
 
 	Ok(FileView {
 		file_id,
-		parent_id: row.try_get("parent_id").ok(),
+		parent_id: row.try_get("parent_id").ok().flatten(),
 		root_id: row.try_get("root_id").ok().flatten(),
 		owner,
 		creator,
-		preset: row.try_get("preset").ok(),
-		content_type: row.try_get("content_type").ok(),
+		preset: row.try_get("preset").ok().flatten(),
+		content_type: row.try_get("content_type").ok().flatten(),
 		file_name: row.try_get("file_name").map_err(|_| Error::DbError)?,
-		file_tp: row.try_get("file_tp").ok(),
+		file_tp: row.try_get("file_tp").ok().flatten(),
 		created_at: row
 			.try_get::<i64, _>("created_at")
 			.map(Timestamp)

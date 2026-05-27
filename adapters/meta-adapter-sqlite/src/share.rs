@@ -30,9 +30,9 @@ fn row_to_share_entry(row: &SqliteRow) -> ShareEntry {
 		expires_at: expires_at.map(Timestamp),
 		created_by: row.get("created_by"),
 		created_at: Timestamp(created_at),
-		subject_file_name: row.try_get("subject_file_name").ok(),
-		subject_content_type: row.try_get("subject_content_type").ok(),
-		subject_file_tp: row.try_get("subject_file_tp").ok(),
+		subject_file_name: row.try_get("subject_file_name").ok().flatten(),
+		subject_content_type: row.try_get("subject_content_type").ok().flatten(),
+		subject_file_tp: row.try_get("subject_file_tp").ok().flatten(),
 	}
 }
 

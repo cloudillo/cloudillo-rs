@@ -274,18 +274,18 @@ pub(crate) async fn list(
 	let tenants: Vec<TenantListMeta> = rows
 		.into_iter()
 		.filter_map(|row| {
-			let typ_str: &str = row.try_get("type").ok()?;
-			let typ = match typ_str {
+			let typ_str: String = row.try_get::<Option<String>, _>("type").ok().flatten()?;
+			let typ = match typ_str.as_str() {
 				"P" => ProfileType::Person,
 				"C" => ProfileType::Community,
 				_ => return None,
 			};
 			Some(TenantListMeta {
 				tn_id: TnId(row.try_get("tn_id").ok()?),
-				id_tag: row.try_get("id_tag").ok()?,
-				name: row.try_get("name").ok()?,
+				id_tag: row.try_get::<Option<Box<str>>, _>("id_tag").ok().flatten()?,
+				name: row.try_get::<Option<Box<str>>, _>("name").ok().flatten()?,
 				typ,
-				profile_pic: row.try_get("profile_pic").ok()?,
+				profile_pic: row.try_get("profile_pic").ok().flatten(),
 				created_at: Timestamp(row.try_get("created_at").ok()?),
 			})
 		})

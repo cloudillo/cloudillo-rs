@@ -352,7 +352,7 @@ pub(crate) async fn list(
 			stat_obj["ownReaction"] = serde_json::Value::String(own_reaction);
 		}
 		let stat = Some(stat_obj);
-		let visibility: Option<String> = row.try_get("visibility").ok();
+		let visibility: Option<String> = row.try_get("visibility").ok().flatten();
 		let visibility = db_visibility_to_action(visibility);
 		actions.push(ActionView {
 			action_id,
@@ -801,9 +801,9 @@ pub(crate) async fn get_data(
 
 	match res {
 		Some(row) => Ok(Some(ActionData {
-			subject: row.try_get("subject").ok(),
+			subject: row.try_get("subject").ok().flatten(),
 			reactions: row.try_get::<Option<String>, _>("reactions").ok().flatten().map(Into::into),
-			comments: row.try_get("comments").ok(),
+			comments: row.try_get("comments").ok().flatten(),
 			stat_at: row.try_get::<Option<i64>, _>("stat_at").ok().flatten().map(Timestamp),
 		})),
 		None => Ok(None),
@@ -824,29 +824,29 @@ pub(crate) async fn get_by_key(
 
 	match res {
 		Ok(Some(row)) => {
-			let attachments_str: Option<Box<str>> = row.try_get("attachments").ok();
+			let attachments_str: Option<Box<str>> = row.try_get("attachments").ok().flatten();
 			let attachments = attachments_str.map(|s| parse_str_list(&s).to_vec());
-			let visibility: Option<String> = row.try_get("visibility").ok();
+			let visibility: Option<String> = row.try_get("visibility").ok().flatten();
 			let visibility = db_visibility_to_action(visibility);
 
 			Ok(Some(Action {
 				action_id: row.try_get("action_id").map_err(|_| Error::DbError)?,
 				typ: row.try_get("type").map_err(|_| Error::DbError)?,
-				sub_typ: row.try_get("sub_type").ok(),
+				sub_typ: row.try_get("sub_type").ok().flatten(),
 				issuer_tag: row.try_get("issuer_tag").map_err(|_| Error::DbError)?,
-				parent_id: row.try_get("parent_id").ok(),
-				root_id: row.try_get("root_id").ok(),
-				audience_tag: row.try_get("audience").ok(),
-				content: row.try_get("content").ok(),
+				parent_id: row.try_get("parent_id").ok().flatten(),
+				root_id: row.try_get("root_id").ok().flatten(),
+				audience_tag: row.try_get("audience").ok().flatten(),
+				content: row.try_get("content").ok().flatten(),
 				attachments,
-				subject: row.try_get("subject").ok(),
+				subject: row.try_get("subject").ok().flatten(),
 				created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
 				expires_at: row
 					.try_get("expires_at")
 					.ok()
 					.and_then(|v: Option<i64>| v.map(Timestamp)),
 				visibility,
-				flags: row.try_get("flags").ok(),
+				flags: row.try_get("flags").ok().flatten(),
 				x: row
 					.try_get::<Option<String>, _>("x")
 					.ok()
@@ -1254,7 +1254,7 @@ pub(crate) async fn get(
 	}
 	let stat = Some(stat_obj);
 
-	let visibility: Option<String> = row.try_get("visibility").ok();
+	let visibility: Option<String> = row.try_get("visibility").ok().flatten();
 	let visibility = db_visibility_to_action(visibility);
 
 	// action_id might be NULL for draft/pending actions - use @{a_id} placeholder
@@ -1462,7 +1462,7 @@ pub(crate) async fn count_reactions(
 	let counts: Vec<(char, u32)> = rows
 		.iter()
 		.filter_map(|row| {
-			let sub_type: String = row.try_get("sub_type").ok()?;
+			let sub_type: String = row.try_get::<Option<String>, _>("sub_type").ok().flatten()?;
 			let cnt: i64 = row.try_get("cnt").ok()?;
 			let Some(key) = reaction_type_key(&sub_type) else {
 				warn!("Unknown reaction sub_type '{}' ignored in count", sub_type);
