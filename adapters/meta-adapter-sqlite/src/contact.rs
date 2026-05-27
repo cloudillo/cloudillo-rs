@@ -313,10 +313,10 @@ pub async fn get_contact(
 	ab_id: u64,
 	uid: &str,
 ) -> ClResult<Option<Contact>> {
-	let row = sqlx::query(&format!(
+	let row = sqlx::query(sqlx::AssertSqlSafe(format!(
 		"SELECT {CONTACT_COLS}, vcard FROM contacts \
 		 WHERE tn_id = ? AND ab_id = ? AND uid = ? AND deleted_at IS NULL",
-	))
+	)))
 	.bind(tn_id.0)
 	.bind(ab_id.cast_signed())
 	.bind(uid)
@@ -534,10 +534,10 @@ pub async fn list_contacts_by_profile(
 	tn_id: TnId,
 	profile_id_tag: &str,
 ) -> ClResult<Vec<Contact>> {
-	let rows = sqlx::query(&format!(
+	let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
 		"SELECT {CONTACT_COLS}, vcard FROM contacts \
 		 WHERE tn_id = ? AND profile_id_tag = ? AND deleted_at IS NULL",
-	))
+	)))
 	.bind(tn_id.0)
 	.bind(profile_id_tag)
 	.fetch_all(db)

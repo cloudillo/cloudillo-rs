@@ -16,12 +16,12 @@ async-stream = "0.3"
 async-trait = "0.1.89"
 cloudillo-types = { workspace = true }
 futures-core = "0.3.32"
-tokio = { version = "1.52.2", features = ["fs"] }
+tokio = { version = "1.52.3", features = ["fs"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 
 [dev-dependencies]
 tempfile = "3.27"
-tokio = { version = "1.52.2", features = ["fs", "rt", "macros"] }
+tokio = { version = "1.52.3", features = ["fs", "rt", "macros"] }
 
 [lints]
 workspace = true

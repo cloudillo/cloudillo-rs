@@ -20,7 +20,7 @@ cloudillo-push = { workspace = true }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2", "macros"] }
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 lru = "0.18"
 parking_lot = "0.12"
 regex = "1"

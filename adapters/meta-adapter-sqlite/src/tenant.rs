@@ -224,7 +224,7 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId) -> ClResult<()> {
 	.map_err(|_| Error::DbError)?;
 
 	for table in TENANT_CASCADE_TABLES {
-		sqlx::query(&format!("DELETE FROM {table} WHERE tn_id=?"))
+		sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table} WHERE tn_id=?")))
 			.bind(tn_id.0)
 			.execute(&mut *tx)
 			.await

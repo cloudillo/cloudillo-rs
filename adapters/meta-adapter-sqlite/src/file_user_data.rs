@@ -169,7 +169,7 @@ pub(crate) async fn update(
 		update_clause
 	);
 
-	let mut q = sqlx::query(&query_str).bind(tn_id.0).bind(id_tag);
+	let mut q = sqlx::query(sqlx::AssertSqlSafe(query_str)).bind(tn_id.0).bind(id_tag);
 	if !pinned.is_undefined() {
 		q = q.bind(pinned_val);
 	}

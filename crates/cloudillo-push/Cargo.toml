@@ -26,11 +26,11 @@ tracing = "0.1"
 ece = "2.3"
 p256 = { version = "0.13", features = ["pkcs8", "pem"] }
 base64 = "0.22"
-jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 url = "2"
 
 # HTTP/2 client for push delivery
-hyper = "1.9"
+hyper = "1.10"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2"] }
 hyper-rustls = "0.27"
 http-body-util = "0.1"

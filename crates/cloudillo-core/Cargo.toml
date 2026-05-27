@@ -23,12 +23,12 @@ futures-core = "0.3"
 governor = "0.10"
 hickory-resolver = "0.26"
 http-body-util = "0.1"
-hyper = "1.9"
+hyper = "1.10"
 hyper-rustls = "0.27"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2"] }
 instant-acme = "0.8"
 itertools = "0.14"
-jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 lru = "0.18"
 parking_lot = "0.12"
 pem = "3.0"

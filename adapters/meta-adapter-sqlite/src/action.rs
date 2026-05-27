@@ -245,7 +245,7 @@ pub(crate) async fn list(
 	let limit = i64::from(opts.limit.unwrap_or(20));
 	query.push(format!(" LIMIT {}", limit + 1));
 
-	debug!("SQL: {}", query.sql());
+	debug!("SQL: {}", query.sql().as_str());
 
 	let res = query
 		.build()
@@ -962,7 +962,7 @@ pub(crate) async fn update_data(
 	};
 	let sql = format!("UPDATE actions SET {} {}", set_clauses.join(", "), where_clause);
 
-	let mut query = sqlx::query(&sql);
+	let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
 
 	// Bind values in the same order as set_clauses
 	if !opts.subject.is_undefined() {
@@ -1384,7 +1384,7 @@ pub(crate) async fn update(
 		"UPDATE actions SET {} WHERE tn_id=? AND a_id=? AND status='R'",
 		set_clauses.join(", ")
 	);
-	let mut query = sqlx::query(&sql);
+	let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
 	if let Some(content) = content {
 		query = query.bind(content);
 	}

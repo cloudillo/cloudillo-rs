@@ -325,11 +325,11 @@ pub async fn get_calendar_object(
 	cal_id: u64,
 	uid: &str,
 ) -> ClResult<Option<CalendarObject>> {
-	let row = sqlx::query(&format!(
+	let row = sqlx::query(sqlx::AssertSqlSafe(format!(
 		"SELECT {OBJECT_COLS}, ical FROM calendar_objects \
 		 WHERE tn_id = ? AND cal_id = ? AND uid = ? AND recurrence_id IS NULL \
 		 AND deleted_at IS NULL",
-	))
+	)))
 	.bind(tn_id.0)
 	.bind(cal_id.cast_signed())
 	.bind(uid)
@@ -348,11 +348,11 @@ pub async fn get_calendar_object_override(
 	uid: &str,
 	recurrence_id: Timestamp,
 ) -> ClResult<Option<CalendarObject>> {
-	let row = sqlx::query(&format!(
+	let row = sqlx::query(sqlx::AssertSqlSafe(format!(
 		"SELECT {OBJECT_COLS}, ical FROM calendar_objects \
 		 WHERE tn_id = ? AND cal_id = ? AND uid = ? AND recurrence_id = ? \
 		 AND deleted_at IS NULL",
-	))
+	)))
 	.bind(tn_id.0)
 	.bind(cal_id.cast_signed())
 	.bind(uid)
@@ -371,11 +371,11 @@ pub async fn list_calendar_object_overrides(
 	cal_id: u64,
 	uid: &str,
 ) -> ClResult<Vec<CalendarObject>> {
-	let rows = sqlx::query(&format!(
+	let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
 		"SELECT {OBJECT_COLS}, ical FROM calendar_objects \
 		 WHERE tn_id = ? AND cal_id = ? AND uid = ? AND recurrence_id IS NOT NULL \
 		 AND deleted_at IS NULL ORDER BY recurrence_id ASC",
-	))
+	)))
 	.bind(tn_id.0)
 	.bind(cal_id.cast_signed())
 	.bind(uid)
@@ -544,7 +544,7 @@ async fn upsert_calendar_object_tx(
 			 WHERE recurrence_id IS NOT NULL AND deleted_at IS NULL {UPSERT_UPDATE_SET}"
 		)
 	};
-	sqlx::query(&sql)
+	sqlx::query(sqlx::AssertSqlSafe(sql))
 		.bind(tn_id.0)
 		.bind(cal_id.cast_signed())
 		.bind(uid)

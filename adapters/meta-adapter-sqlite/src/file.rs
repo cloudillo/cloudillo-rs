@@ -466,7 +466,7 @@ pub(crate) async fn list(
 	let limit = i64::from(opts.limit.unwrap_or(30));
 	query.push(format!(" LIMIT {}", limit + 1));
 
-	debug!("SQL: {}", query.sql());
+	debug!("SQL: {}", query.sql().as_str());
 
 	let res = query
 		.build()
@@ -1390,7 +1390,7 @@ pub(crate) async fn read_with_user_data(
 			.parse::<i64>()
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 		let sql = format!("{} WHERE f.tn_id=? AND f.f_id=?", base_sql);
-		sqlx::query(&sql)
+		sqlx::query(sqlx::AssertSqlSafe(sql))
 			.bind(id_tag)
 			.bind(tn_id.0)
 			.bind(f_id)
@@ -1400,7 +1400,7 @@ pub(crate) async fn read_with_user_data(
 			.map_err(|_| Error::DbError)?
 	} else {
 		let sql = format!("{} WHERE f.tn_id=? AND f.file_id=?", base_sql);
-		sqlx::query(&sql)
+		sqlx::query(sqlx::AssertSqlSafe(sql))
 			.bind(id_tag)
 			.bind(tn_id.0)
 			.bind(file_id)
@@ -1596,7 +1596,7 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, file_id: &str) -> ClRes
 	};
 
 	let sql = format!("UPDATE files SET status = 'D' WHERE tn_id = ? AND {} = ?", where_col);
-	sqlx::query(&sql)
+	sqlx::query(sqlx::AssertSqlSafe(sql))
 		.bind(tn_id.0)
 		.bind(id_bind)
 		.execute(db)

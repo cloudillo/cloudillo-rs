@@ -88,10 +88,10 @@ pub(crate) fn escape_like(s: &str) -> String {
 }
 
 /// Build an IN clause with parameterized values
-pub(crate) fn push_in<'a>(
-	mut query: sqlx::QueryBuilder<'a, sqlx::Sqlite>,
-	values: &'a [impl AsRef<str>],
-) -> sqlx::QueryBuilder<'a, sqlx::Sqlite> {
+pub(crate) fn push_in(
+	mut query: sqlx::QueryBuilder<sqlx::Sqlite>,
+	values: &[impl AsRef<str>],
+) -> sqlx::QueryBuilder<sqlx::Sqlite> {
 	query.push("(");
 	for (i, value) in values.iter().enumerate() {
 		if i > 0 {

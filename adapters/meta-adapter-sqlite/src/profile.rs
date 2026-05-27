@@ -60,7 +60,7 @@ enum ConnectedDbValue {
 impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for ConnectedDbValue {
 	fn encode_by_ref(
 		&self,
-		buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+		buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer,
 	) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
 		match self {
 			ConnectedDbValue::Int(i) => {
