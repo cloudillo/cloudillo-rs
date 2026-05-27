@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use cloudillo_core::scheduler::RetryPolicy;
-use cloudillo_types::meta_adapter::{self, AttachmentView};
+use cloudillo_types::meta_adapter::{self, AttachmentView, ProfileStatus};
 
 use crate::{
 	delivery::ActionDeliveryTask,
@@ -450,6 +450,44 @@ async fn schedule_delivery(
 	// Add fanout recipients (delivery tasks were already scheduled, just log)
 	// Don't add to recipients list - they're already handled by schedule_subscriber_fanout
 
+	// Drop recipients whose local profile is Suspended/Blocked/Banned.
+	// `recipients` here is the explicit audience + subject-owner set — at most
+	// two entries — so per-recipient `read_profile` is cheaper than a batched
+	// adapter call. Missing-profile (NotFound) is treated as "open-federation
+	// default — keep the recipient." Transient lookup errors propagate as a
+	// scheduling failure — same fail-closed semantics as fanout.rs /
+	// schedule_broadcast_delivery, which let SQL errors abort the whole list.
+	// The scheduler's retry policy reattempts on transient backend faults;
+	// silently keeping the recipient would deliver moderated content.
+	let before_len = recipients.len();
+	let mut kept: Vec<Box<str>> = Vec::with_capacity(recipients.len());
+	for recipient in recipients.drain(..) {
+		let suppressed = match app.meta_adapter.read_profile(tn_id, recipient.as_ref()).await {
+			Ok((_, p)) => matches!(
+				p.status,
+				Some(ProfileStatus::Suspended | ProfileStatus::Blocked | ProfileStatus::Banned)
+			),
+			// Missing local profile is the open-federation default — recipient kept.
+			Err(Error::NotFound) => false,
+			// Any other adapter error fails the whole scheduling call, matching the
+			// SQL-filter semantics in `fanout::schedule_subscriber_fanout` and
+			// `schedule_broadcast_delivery` (both let adapter errors propagate from
+			// `list_actions` rather than silently delivering to suppressed recipients).
+			Err(e) => return Err(e),
+		};
+		if !suppressed {
+			kept.push(recipient);
+		}
+	}
+	recipients = kept;
+	if recipients.len() < before_len {
+		debug!(
+			action_id = %action.action_id,
+			dropped = before_len - recipients.len(),
+			"Skipped suppressed recipients"
+		);
+	}
+
 	if !recipients.is_empty() {
 		let recipient_preview: Vec<&str> = recipients.iter().take(3).map(AsRef::as_ref).collect();
 		if recipients.len() <= 3 {
@@ -514,7 +552,9 @@ async fn schedule_broadcast_delivery(
 	// Query for accepted FLLW / CONN actions only. `status="A"` excludes
 	// pending notifications ('N'), confirmation-pending ('C'), and deleted
 	// ('D') rows in a single index-bounded query, instead of fetching all
-	// statuses and filtering in Rust.
+	// statuses and filtering in Rust. Suppression (Suspended/Blocked/Banned)
+	// is enforced in SQL via exclude_issuer_profile_status — see fanout.rs
+	// rationale.
 	let follower_actions = app
 		.meta_adapter
 		.list_actions(
@@ -522,6 +562,11 @@ async fn schedule_broadcast_delivery(
 			&meta_adapter::ListActionOptions {
 				typ: Some(vec!["FLLW".into(), "CONN".into()]),
 				status: Some(vec!["A".into()]),
+				exclude_issuer_profile_status: Some(Box::from([
+					ProfileStatus::Suspended,
+					ProfileStatus::Blocked,
+					ProfileStatus::Banned,
+				])),
 				..Default::default()
 			},
 		)

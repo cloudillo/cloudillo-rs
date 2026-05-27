@@ -99,12 +99,33 @@ pub async fn patch_profile_admin(
 ) -> ClResult<(StatusCode, Json<UpdateProfileResponse>)> {
 	let tn_id = auth.tn_id;
 
+	// Snapshot prior status + sync provenance so we can detect S → (anything-else)
+	// transitions and decide whether an immediate refresh makes sense. Done here,
+	// before any DB mutation. NotFound is fine — the admin is creating a new
+	// profile row, and there is genuinely no refresh trigger. Any other error
+	// aborts the request: we can't safely reason about whether the side-effect
+	// was needed, so the patch must not land.
+	let (prev_status, prev_synced) = match app.meta_adapter.read_profile(tn_id, &id_tag).await {
+		Ok((_, p)) => (p.status, p.synced_at),
+		Err(Error::NotFound) => (None, None),
+		Err(e) => return Err(e),
+	};
+
 	// Extract roles for response before consuming patch
 	let response_roles = match &patch.roles {
 		Patch::Value(Some(roles)) => Some(roles.clone()),
 		Patch::Value(None) | Patch::Null => Some(vec![]),
 		Patch::Undefined => None,
 	};
+
+	// Compute the trigger before `patch.status` is moved into the upsert.
+	// Fires only on prev=Suspended AND new ≠ Suspended (Undefined = no-op).
+	let status_lifted_from_suspended = matches!(prev_status, Some(ProfileStatus::Suspended))
+		&& match &patch.status {
+			Patch::Value(s) => !matches!(s, ProfileStatus::Suspended),
+			Patch::Null => true,
+			Patch::Undefined => false,
+		};
 
 	let profile_update = UpdateProfileData {
 		name: patch.name.map(Into::into),
@@ -120,16 +141,40 @@ pub async fn patch_profile_admin(
 	let upsert = UpsertProfileFields::from_update(profile_update);
 	app.meta_adapter.upsert_profile(tn_id, &id_tag, &upsert).await?;
 
+	// If the admin lifted a Suspended state on a peer that has previously
+	// synced from a remote (`synced_at` is non-NULL), re-sync immediately so
+	// the cached row reflects current reality instead of waiting for the next
+	// scheduled refresh. Skip the refresh for never-synced rows — these are
+	// locally-created IdP users or the tenant's own profile, with no remote
+	// `/me` endpoint to call. Soft-fail on error — the status change already
+	// landed; the next periodic sync will retry.
+	if status_lifted_from_suspended {
+		if prev_synced.is_some() {
+			let app = app.clone();
+			let id_tag = id_tag.clone();
+			tokio::spawn(async move {
+				if let Err(e) = crate::sync::refresh_profile(&app, tn_id, &id_tag, None).await {
+					warn!(
+						id_tag = %id_tag,
+						error = %e,
+						"Admin lifted Suspended state, but background refresh failed; next scheduled sync will retry"
+					);
+				}
+			});
+		} else {
+			debug!(id_tag = %id_tag, "Admin lifted Suspended state; skipped refresh: profile never synced");
+		}
+	}
+
 	// Fetch updated profile
 	let profile_data = app.meta_adapter.get_profile_info(tn_id, &id_tag).await?;
 
-	// `ProfileData.status` is the single-char DB code (`A`/`T`/`B`/`M`/`S`/`X`);
+	// `ProfileData.status` is the single-char DB code (`A`/`B`/`M`/`S`/`X`);
 	// `ProfileInfo.status` is the typed enum that serializes to the same code.
 	// Mirror `parse_status_list` in `list.rs`: unrecognized codes → `None` so a
 	// future schema addition doesn't 500 every admin response.
 	let status = profile_data.status.as_deref().and_then(|s| match s {
 		"A" => Some(ProfileStatus::Active),
-		"T" => Some(ProfileStatus::Trusted),
 		"B" => Some(ProfileStatus::Blocked),
 		"M" => Some(ProfileStatus::Muted),
 		"S" => Some(ProfileStatus::Suspended),

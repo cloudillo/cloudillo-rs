@@ -51,6 +51,34 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// STAT coalesce window — quiet-period (seconds) before a pending STAT broadcast
+	// is emitted. Re-scheduling within the window debounces; longer values reduce
+	// federation traffic on busy threads at the cost of update latency for peers.
+	registry.register(
+		SettingDefinition::builder("federation.stat_coalesce_window_secs")
+			.description("Quiet-period (seconds) before a pending STAT broadcast is emitted")
+			.default(SettingValue::Int(10))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
+	// STAT coalesce maximum window — upper bound on how far a STAT broadcast may
+	// be deferred by repeated reactions/comments. Without this, a steady stream
+	// of reactions on a hot subject could keep bumping next_at forward
+	// indefinitely.
+	registry.register(
+		SettingDefinition::builder("federation.stat_coalesce_max_window_secs")
+			.description(
+				"Hard upper bound on how far a STAT broadcast may be deferred \
+				 by repeated reactions",
+			)
+			.default(SettingValue::Int(60))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
 	Ok(())
 }
 

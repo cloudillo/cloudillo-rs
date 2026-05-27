@@ -17,6 +17,7 @@
 //! - invt: Invitation management (INVT)
 //! - prinvt: Profile invite notification (PRINVT)
 //! - react: Reaction management (REACT)
+//! - stat: Statistics action normalization (STAT)
 //! - subs: Subscription management (SUBS)
 
 pub mod aprv;
@@ -27,8 +28,12 @@ pub mod fllw;
 pub mod fshr;
 pub mod idp;
 pub mod invt;
+mod ownership;
 pub mod prinvt;
 pub mod react;
+pub mod stat;
+mod stat_emit;
+pub(crate) mod stat_emit_task;
 pub mod subs;
 
 use crate::hooks::{ActionTypeHooks, HookRegistry};
@@ -170,6 +175,19 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		tracing::info!("Registered native hooks for INVT action type");
 	}
 
+	// STAT hooks
+	{
+		let stat_hooks = ActionTypeHooks {
+			on_create: None,
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(stat::on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("STAT", stat_hooks);
+		tracing::info!("Registered native hooks for STAT action type");
+	}
+
 	// PRINVT hooks
 	{
 		let prinvt_hooks = ActionTypeHooks {
@@ -208,6 +226,7 @@ mod tests {
 		let _ = fshr::on_accept;
 		let _ = react::on_create;
 		let _ = react::on_receive;
+		let _ = stat::on_receive;
 		let _ = subs::on_create;
 		let _ = subs::on_receive;
 		let _ = conv::on_create;

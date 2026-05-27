@@ -7,8 +7,11 @@
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
-use cloudillo_types::meta_adapter::{ListProfileOptions, MetaAdapter, UpdateTenantData};
-use cloudillo_types::types::{Patch, TnId};
+use cloudillo_types::meta_adapter::{
+	Action, ListActionOptions, ListProfileOptions, MetaAdapter, ProfileStatus, ProfileType,
+	UpdateTenantData, UpsertProfileFields,
+};
+use cloudillo_types::types::{Patch, Timestamp, TnId};
 use cloudillo_types::worker::WorkerPool;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -123,6 +126,187 @@ async fn test_list_profiles() {
 		// May be empty or have profiles
 		let _ = profiles; // Just verify we got a result
 	}
+}
+
+/// Helper: insert a Person profile with a given status (or NULL).
+async fn insert_profile_with_status(
+	adapter: &MetaAdapterSqlite,
+	tn_id: TnId,
+	id_tag: &str,
+	status: Patch<ProfileStatus>,
+) {
+	let fields = UpsertProfileFields {
+		name: Patch::Value(id_tag.into()),
+		typ: Patch::Value(ProfileType::Person),
+		status,
+		..Default::default()
+	};
+	adapter
+		.upsert_profile(tn_id, id_tag, &fields)
+		.await
+		.expect("Should upsert profile");
+}
+
+#[tokio::test]
+async fn test_list_profiles_status_filter_legacy_no_filter() {
+	// With `status: None`, no status filter is applied and every profile is returned.
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	insert_profile_with_status(&adapter, tn_id, "p-null", Patch::Undefined).await;
+	insert_profile_with_status(&adapter, tn_id, "p-a", Patch::Value(ProfileStatus::Active)).await;
+	insert_profile_with_status(&adapter, tn_id, "p-m", Patch::Value(ProfileStatus::Muted)).await;
+	insert_profile_with_status(&adapter, tn_id, "p-s", Patch::Value(ProfileStatus::Suspended))
+		.await;
+	insert_profile_with_status(&adapter, tn_id, "p-b", Patch::Value(ProfileStatus::Blocked)).await;
+	insert_profile_with_status(&adapter, tn_id, "p-x", Patch::Value(ProfileStatus::Banned)).await;
+
+	let opts = ListProfileOptions { ..Default::default() };
+	let profiles = adapter.list_profiles(tn_id, &opts).await.expect("Should list profiles");
+
+	let id_tags: Vec<&str> = profiles.iter().map(|p| p.id_tag.as_ref()).collect();
+	assert!(id_tags.contains(&"p-null"));
+	assert!(id_tags.contains(&"p-a"));
+	assert!(id_tags.contains(&"p-m"));
+	assert!(id_tags.contains(&"p-s"));
+	assert!(id_tags.contains(&"p-b"));
+	assert!(id_tags.contains(&"p-x"));
+}
+
+#[tokio::test]
+async fn test_list_profiles_status_filter_default_safe_set_includes_null() {
+	// Default safe set `[Active, Muted]`. NULL-status rows must appear
+	// because the set contains Active; S/B/X must not.
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	insert_profile_with_status(&adapter, tn_id, "p-null", Patch::Undefined).await;
+	insert_profile_with_status(&adapter, tn_id, "p-a", Patch::Value(ProfileStatus::Active)).await;
+	insert_profile_with_status(&adapter, tn_id, "p-m", Patch::Value(ProfileStatus::Muted)).await;
+	insert_profile_with_status(&adapter, tn_id, "p-s", Patch::Value(ProfileStatus::Suspended))
+		.await;
+	insert_profile_with_status(&adapter, tn_id, "p-b", Patch::Value(ProfileStatus::Blocked)).await;
+	insert_profile_with_status(&adapter, tn_id, "p-x", Patch::Value(ProfileStatus::Banned)).await;
+
+	let opts = ListProfileOptions {
+		status: Some(Box::from([ProfileStatus::Active, ProfileStatus::Muted])),
+		..Default::default()
+	};
+	let profiles = adapter.list_profiles(tn_id, &opts).await.expect("Should list profiles");
+
+	let id_tags: Vec<&str> = profiles.iter().map(|p| p.id_tag.as_ref()).collect();
+	assert!(id_tags.contains(&"p-null"), "NULL-status rows must be included");
+	assert!(id_tags.contains(&"p-a"));
+	assert!(id_tags.contains(&"p-m"));
+	assert!(!id_tags.contains(&"p-s"), "Suspended must be excluded");
+	assert!(!id_tags.contains(&"p-b"), "Blocked must be excluded");
+	assert!(!id_tags.contains(&"p-x"), "Banned must be excluded");
+}
+
+#[tokio::test]
+async fn test_list_profiles_status_filter_explicit_excludes_null() {
+	// Explicit filter without Active: NULL rows are excluded because the adapter
+	// only widens to NULL when Active is in the requested set.
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	insert_profile_with_status(&adapter, tn_id, "p-null", Patch::Undefined).await;
+	insert_profile_with_status(&adapter, tn_id, "p-a", Patch::Value(ProfileStatus::Active)).await;
+	insert_profile_with_status(&adapter, tn_id, "p-b", Patch::Value(ProfileStatus::Blocked)).await;
+
+	let opts = ListProfileOptions {
+		status: Some(Box::from([ProfileStatus::Blocked])),
+		..Default::default()
+	};
+	let profiles = adapter.list_profiles(tn_id, &opts).await.expect("Should list profiles");
+
+	let id_tags: Vec<&str> = profiles.iter().map(|p| p.id_tag.as_ref()).collect();
+	assert_eq!(id_tags, vec!["p-b"], "Only Blocked row should match");
+}
+
+#[tokio::test]
+async fn test_list_profiles_status_filter_active_includes_null() {
+	// Active is stored as NULL — filtering for just Active must include
+	// legacy NULL-status rows as well as explicit 'A' rows.
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	insert_profile_with_status(&adapter, tn_id, "p-null", Patch::Undefined).await;
+	insert_profile_with_status(&adapter, tn_id, "p-a", Patch::Value(ProfileStatus::Active)).await;
+	insert_profile_with_status(&adapter, tn_id, "p-b", Patch::Value(ProfileStatus::Blocked)).await;
+
+	let opts = ListProfileOptions {
+		status: Some(Box::from([ProfileStatus::Active])),
+		..Default::default()
+	};
+	let profiles = adapter.list_profiles(tn_id, &opts).await.expect("Should list profiles");
+
+	let id_tags: Vec<&str> = profiles.iter().map(|p| p.id_tag.as_ref()).collect();
+	assert!(id_tags.contains(&"p-null"), "NULL-status row must match Active filter");
+	assert!(id_tags.contains(&"p-a"), "Explicit Active row must match");
+	assert!(!id_tags.contains(&"p-b"), "Blocked row must not match");
+}
+
+#[tokio::test]
+async fn test_list_actions_exclude_issuer_profile_status() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	// Two local profiles: one Active, one Blocked.
+	insert_profile_with_status(&adapter, tn_id, "p-ok", Patch::Value(ProfileStatus::Active)).await;
+	insert_profile_with_status(&adapter, tn_id, "p-bad", Patch::Value(ProfileStatus::Blocked))
+		.await;
+
+	let now = Timestamp::now();
+	let subject = "convroot";
+
+	// Three SUBS actions sharing the same subject: from p-ok, p-bad, and a
+	// missing (never-cached) profile p-missing.
+	for (action_id, issuer) in [("a-ok", "p-ok"), ("a-bad", "p-bad"), ("a-miss", "p-missing")] {
+		let action = Action {
+			action_id,
+			typ: "SUBS",
+			sub_typ: None,
+			issuer_tag: issuer,
+			parent_id: None,
+			root_id: None,
+			audience_tag: None,
+			content: None,
+			attachments: None,
+			subject: Some(subject),
+			created_at: now,
+			expires_at: None,
+			visibility: None,
+			flags: None,
+			x: None,
+		};
+		adapter.create_action(tn_id, &action, None).await.expect("create action");
+	}
+
+	let opts = ListActionOptions {
+		typ: Some(vec!["SUBS".into()]),
+		subject: Some(subject.into()),
+		exclude_issuer_profile_status: Some(Box::from([
+			ProfileStatus::Suspended,
+			ProfileStatus::Blocked,
+			ProfileStatus::Banned,
+		])),
+		..Default::default()
+	};
+	let res = adapter.list_actions(tn_id, &opts).await.expect("list_actions");
+	let issuers: Vec<&str> = res.iter().map(|a| a.issuer.id_tag.as_ref()).collect();
+
+	assert!(issuers.contains(&"p-ok"), "Active issuer must be present");
+	assert!(!issuers.contains(&"p-bad"), "Blocked issuer must be filtered");
+	assert!(
+		issuers.contains(&"p-missing"),
+		"Missing local profile must NOT be excluded (open-federation default)"
+	);
 }
 
 #[tokio::test]

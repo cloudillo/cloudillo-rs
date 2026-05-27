@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use cloudillo_core::scheduler::RetryPolicy;
-use cloudillo_types::meta_adapter;
+use cloudillo_types::meta_adapter::{self, ProfileStatus};
 
 use crate::{delivery::ActionDeliveryTask, dsl::DslEngine, prelude::*};
 
@@ -67,7 +67,10 @@ pub async fn schedule_subscriber_fanout(
 			};
 
 			if is_local {
-				// Get all subscribers, excluding ourselves and the issuer
+				// Get all subscribers, excluding ourselves and the issuer.
+				// Suppression (Suspended/Blocked/Banned) is enforced in SQL via
+				// exclude_issuer_profile_status so a transient adapter error
+				// fails the whole list rather than silently fail-opening.
 				let subs = app
 					.meta_adapter
 					.list_actions(
@@ -76,6 +79,11 @@ pub async fn schedule_subscriber_fanout(
 							typ: Some(vec!["SUBS".into()]),
 							subject: Some(p_id.clone()),
 							status: Some(vec!["A".into()]),
+							exclude_issuer_profile_status: Some(Box::from([
+								ProfileStatus::Suspended,
+								ProfileStatus::Blocked,
+								ProfileStatus::Banned,
+							])),
 							..Default::default()
 						},
 					)

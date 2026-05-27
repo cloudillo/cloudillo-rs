@@ -46,8 +46,6 @@ pub enum ProfileType {
 pub enum ProfileStatus {
 	#[serde(rename = "A")]
 	Active,
-	#[serde(rename = "T")]
-	Trusted,
 	#[serde(rename = "B")]
 	Blocked,
 	#[serde(rename = "M")]
@@ -63,7 +61,6 @@ impl ProfileStatus {
 	pub fn as_str(&self) -> &'static str {
 		match self {
 			ProfileStatus::Active => "active",
-			ProfileStatus::Trusted => "trusted",
 			ProfileStatus::Blocked => "blocked",
 			ProfileStatus::Muted => "muted",
 			ProfileStatus::Suspended => "suspended",
@@ -380,6 +377,13 @@ pub struct ActionData {
 	pub subject: Option<Box<str>>,
 	pub reactions: Option<Box<str>>,
 	pub comments: Option<u32>,
+	/// Highest `created_at` of any STAT mirror update applied to this row
+	/// on the non-authoritative side. Used to reject reordered inbound
+	/// STATs. Always `None` on the authoritative node (REACT/CMNT write
+	/// the counters there; STAT `on_receive` never touches the row — see
+	/// the counter-update exclusivity invariant in
+	/// `cloudillo_action::native_hooks::ownership`).
+	pub stat_at: Option<Timestamp>,
 }
 
 /// Options for updating action metadata
@@ -389,6 +393,8 @@ pub struct UpdateActionDataOptions {
 	pub reactions: Patch<String>,
 	pub comments: Patch<u32>,
 	pub comments_read: Patch<u32>,
+	/// Watermark for inbound STAT mirror updates — see [`ActionData::stat_at`].
+	pub stat_at: Patch<Timestamp>,
 	pub status: Patch<char>,
 	pub visibility: Patch<char>,
 	pub x: Patch<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
@@ -474,6 +480,11 @@ pub struct ListActionOptions {
 	pub subject: Option<String>,
 	#[serde(rename = "createdAfter")]
 	pub created_after: Option<Timestamp>,
+	/// Exclude actions whose issuer's profile has any of these statuses.
+	/// LEFT JOIN profiles ON (tn_id, id_tag=issuer.id_tag) — missing-profile
+	/// rows are NOT excluded (open-federation default).
+	#[serde(skip)]
+	pub exclude_issuer_profile_status: Option<Box<[ProfileStatus]>>,
 }
 
 #[skip_serializing_none]

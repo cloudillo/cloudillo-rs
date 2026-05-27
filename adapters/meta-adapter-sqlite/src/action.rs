@@ -8,7 +8,7 @@ use sqlx::{Row, SqlitePool};
 use crate::utils::{collect_res, escape_like, inspect, map_res, parse_str_list, push_in};
 use cloudillo_types::meta_adapter::{
 	Action, ActionData, ActionId, ActionView, AttachmentView, AudienceType, FinalizeActionOptions,
-	ListActionOptions, ProfileInfo, ProfileType, UpdateActionDataOptions,
+	ListActionOptions, ProfileInfo, ProfileStatus, ProfileType, UpdateActionDataOptions,
 };
 use cloudillo_types::prelude::*;
 
@@ -39,9 +39,11 @@ pub(crate) async fn list(
 		LEFT JOIN profiles ps ON ps.tn_id=a.tn_id
 			AND a.subject LIKE '@%'
 			AND ps.id_tag = substr(a.subject, 2)
-		LEFT JOIN tenants t ON t.tn_id=a.tn_id
-		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.subject=a.action_id AND own.issuer_tag=t.id_tag
-			AND own.type='REACT' AND own.sub_type!='DEL' AND coalesce(own.status, 'A') NOT IN ('D')
+		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.subject=a.action_id AND own.issuer_tag=",
+	);
+	query.push_bind(opts.viewer_id_tag.as_deref());
+	query.push(
+		" AND own.type='REACT' AND own.sub_type!='DEL' AND coalesce(own.status, 'A') NOT IN ('D')
 		WHERE a.tn_id=",
 	);
 	query.push_bind(tn_id.0);
@@ -135,6 +137,31 @@ pub(crate) async fn list(
 	}
 	if let Some(created_after) = &opts.created_after {
 		query.push(" AND a.created_at>").push_bind(created_after.0);
+	}
+	// Materialize excluded-status codes ahead of push_bind so the &str slice
+	// outlives the QueryBuilder (push_in takes references with lifetime 'a).
+	let excluded_status_codes: Option<Vec<&str>> = opts
+		.exclude_issuer_profile_status
+		.as_ref()
+		.filter(|v| !v.is_empty())
+		.map(|excluded| {
+			excluded
+				.iter()
+				.map(|s| match s {
+					ProfileStatus::Active => "A",
+					ProfileStatus::Blocked => "B",
+					ProfileStatus::Muted => "M",
+					ProfileStatus::Suspended => "S",
+					ProfileStatus::Banned => "X",
+				})
+				.collect()
+		});
+	if let Some(codes) = excluded_status_codes.as_ref() {
+		// Reuses the `pi` LEFT JOIN above. NULL pi.status (missing profile or
+		// stored-as-NULL Active) is NOT excluded — open-federation default.
+		query.push(" AND (pi.status IS NULL OR pi.status NOT IN ");
+		query = push_in(query, codes.as_slice());
+		query.push(")");
 	}
 	if let Some(tag) = &opts.tag {
 		query
@@ -763,7 +790,7 @@ pub(crate) async fn get_data(
 	action_id: &str,
 ) -> ClResult<Option<ActionData>> {
 	let res = sqlx::query(
-		"SELECT subject, reactions, comments FROM actions WHERE tn_id=? AND action_id=?",
+		"SELECT subject, reactions, comments, stat_at FROM actions WHERE tn_id=? AND action_id=?",
 	)
 	.bind(tn_id.0)
 	.bind(action_id)
@@ -777,6 +804,7 @@ pub(crate) async fn get_data(
 			subject: row.try_get("subject").ok(),
 			reactions: row.try_get::<Option<String>, _>("reactions").ok().flatten().map(Into::into),
 			comments: row.try_get("comments").ok(),
+			stat_at: row.try_get::<Option<i64>, _>("stat_at").ok().flatten().map(Timestamp),
 		})),
 		None => Ok(None),
 	}
@@ -918,6 +946,9 @@ pub(crate) async fn update_data(
 	if !opts.created_at.is_undefined() {
 		set_clauses.push("created_at = ?");
 	}
+	if !opts.stat_at.is_undefined() {
+		set_clauses.push("stat_at = ?");
+	}
 
 	if set_clauses.is_empty() {
 		return Ok(()); // Nothing to update
@@ -1031,6 +1062,14 @@ pub(crate) async fn update_data(
 	}
 	if !opts.created_at.is_undefined() {
 		let val: Option<i64> = match &opts.created_at {
+			Patch::Null => None,
+			Patch::Value(ts) => Some(ts.0),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.stat_at.is_undefined() {
+		let val: Option<i64> = match &opts.stat_at {
 			Patch::Null => None,
 			Patch::Value(ts) => Some(ts.0),
 			Patch::Undefined => unreachable!(),
@@ -1402,16 +1441,6 @@ fn reaction_type_key(sub_type: &str) -> Option<char> {
 	}
 }
 
-/// Encode reaction counts as colon-separated pairs: "L5:V3:W1"
-fn encode_reaction_counts(counts: &[(char, u32)]) -> String {
-	counts
-		.iter()
-		.filter(|(_, c)| *c > 0)
-		.map(|(k, c)| format!("{}{}", k, c))
-		.collect::<Vec<_>>()
-		.join(":")
-}
-
 /// Count active (non-DEL, non-deleted) REACT actions for a given subject
 pub(crate) async fn count_reactions(
 	db: &SqlitePool,
@@ -1443,5 +1472,6 @@ pub(crate) async fn count_reactions(
 		})
 		.collect();
 
-	Ok(encode_reaction_counts(&counts))
+	let total: u32 = counts.iter().map(|(_, c)| *c).sum();
+	Ok(cloudillo_types::reactions::encode_reaction_counts(counts, total))
 }

@@ -938,10 +938,10 @@ async fn mint_stat_token(
 
 	let mut content = serde_json::Map::new();
 	if let Some(r) = reactions {
-		content.insert("reactions".into(), serde_json::Value::String(r));
+		content.insert("r".into(), serde_json::Value::String(r));
 	}
 	if comments > 0 {
-		content.insert("comments".into(), serde_json::Value::from(comments));
+		content.insert("c".into(), serde_json::Value::from(comments));
 	}
 
 	let create = task::CreateAction {

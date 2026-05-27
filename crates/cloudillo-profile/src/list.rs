@@ -93,7 +93,6 @@ fn parse_status_list(value: &str) -> ClResult<Option<Box<[ProfileStatus]>>> {
 			had_token = true;
 			match t {
 				"A" => Some(ProfileStatus::Active),
-				"T" => Some(ProfileStatus::Trusted),
 				"B" => Some(ProfileStatus::Blocked),
 				"M" => Some(ProfileStatus::Muted),
 				"S" => Some(ProfileStatus::Suspended),
@@ -118,6 +117,13 @@ fn parse_status_list(value: &str) -> ClResult<Option<Box<[ProfileStatus]>>> {
 ///   search: Optional search term to filter profiles by id_tag or name
 ///   limit: Results per page (default 20, max 100)
 ///   offset: Pagination offset (default 0)
+///
+/// Status default policy: when `status` is omitted, the handler defaults to
+/// the visible set `[Active, Muted]` — Active is the default state, Muted is
+/// a soft moderation state still visible to callers. The adapter treats
+/// `status IS NULL` rows as Active, so legacy rows surface under this default
+/// and under any explicit filter that includes Active. Suspended, Blocked,
+/// and Banned are only returned when explicitly requested via `?status=...`.
 pub async fn list_profiles(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -125,12 +131,13 @@ pub async fn list_profiles(
 	Query(params): Query<ListProfilesQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ProfileInfo>>>)> {
 	// Build options for list_profiles
+	let status = match params.status.as_deref() {
+		Some(s) => parse_status_list(s)?,
+		None => Some(Box::from([ProfileStatus::Active, ProfileStatus::Muted])),
+	};
 	let opts = ListProfileOptions {
 		typ: params.typ,
-		status: match params.status.as_deref() {
-			Some(s) => parse_status_list(s)?,
-			None => None,
-		},
+		status,
 		connected: params.connected.as_deref().and_then(parse_connected),
 		following: params.following,
 		q: params.search.as_ref().map(|s| s.to_lowercase()),
@@ -241,18 +248,17 @@ mod tests {
 	#[test]
 	fn parse_status_list_multiple_codes() {
 		assert_eq!(
-			&*ok_some("A,T,B"),
-			&[ProfileStatus::Active, ProfileStatus::Trusted, ProfileStatus::Blocked]
+			&*ok_some("A,M,B"),
+			&[ProfileStatus::Active, ProfileStatus::Muted, ProfileStatus::Blocked]
 		);
 	}
 
 	#[test]
-	fn parse_status_list_all_six_codes() {
+	fn parse_status_list_all_five_codes() {
 		assert_eq!(
-			&*ok_some("A,T,B,M,S,X"),
+			&*ok_some("A,B,M,S,X"),
 			&[
 				ProfileStatus::Active,
-				ProfileStatus::Trusted,
 				ProfileStatus::Blocked,
 				ProfileStatus::Muted,
 				ProfileStatus::Suspended,
@@ -263,12 +269,12 @@ mod tests {
 
 	#[test]
 	fn parse_status_list_trims_whitespace() {
-		assert_eq!(&*ok_some(" A , T "), &[ProfileStatus::Active, ProfileStatus::Trusted]);
+		assert_eq!(&*ok_some(" A , M "), &[ProfileStatus::Active, ProfileStatus::Muted]);
 	}
 
 	#[test]
 	fn parse_status_list_drops_unknown_codes() {
-		assert_eq!(&*ok_some("A,Q,T,Z"), &[ProfileStatus::Active, ProfileStatus::Trusted]);
+		assert_eq!(&*ok_some("A,Q,T,Z"), &[ProfileStatus::Active]);
 	}
 
 	#[test]

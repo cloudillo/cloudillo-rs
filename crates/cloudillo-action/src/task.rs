@@ -452,9 +452,24 @@ impl Task<App> for ActionCreatorTask {
 		// 1c. Resolve subject reference (@a_id → action_id)
 		let subject = resolve_subject(app, self.tn_id, self.action.subject.as_deref()).await?;
 
-		// 1d. Resolve audience from parent action if not explicitly set
-		// This enables federation for conversation messages (MSG in CONV) and similar hierarchical actions
-		let resolved_audience = if self.action.audience_tag.is_none() {
+		let dsl = app.ext::<Arc<DslEngine>>()?;
+
+		// 1d. Resolve audience from parent action if not explicitly set.
+		// Enables federation for conversation messages (MSG in CONV) and similar
+		// hierarchical actions where the reply should follow the parent's home.
+		//
+		// Skipped for actions marked `broadcast=true` (e.g. STAT): for those,
+		// `audience=None` is the documented "post to own wall / fan out to
+		// followers" signal. Inheriting the parent's audience here would set
+		// `audience=<our id_tag>` for community-hosted parents, which makes
+		// `schedule_delivery` fall through the broadcast branch and produce
+		// zero recipients (issuer == audience), so the action would never
+		// federate.
+		let is_broadcast = dsl
+			.get_behavior(self.action.typ.as_ref())
+			.and_then(|b| b.broadcast)
+			.unwrap_or(false);
+		let resolved_audience = if self.action.audience_tag.is_none() && !is_broadcast {
 			helpers::resolve_parent_audience(
 				app.meta_adapter.as_ref(),
 				self.tn_id,
@@ -465,8 +480,6 @@ impl Task<App> for ActionCreatorTask {
 			None
 		};
 		let effective_audience = self.action.audience_tag.clone().or(resolved_audience);
-
-		let dsl = app.ext::<Arc<DslEngine>>()?;
 
 		// 1e. Regenerate key if subject was resolved (changed from @xxx to a1~xxx)
 		let resolved_key = if subject.is_some()

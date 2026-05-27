@@ -17,7 +17,6 @@ fn parse_status(row: &sqlx::sqlite::SqliteRow) -> Result<Option<ProfileStatus>, 
 	let raw: Option<String> = row.try_get("status")?;
 	Ok(match raw.as_deref() {
 		Some("A") => Some(ProfileStatus::Active),
-		Some("T") => Some(ProfileStatus::Trusted),
 		Some("B") => Some(ProfileStatus::Blocked),
 		Some("M") => Some(ProfileStatus::Muted),
 		Some("S") => Some(ProfileStatus::Suspended),
@@ -134,14 +133,20 @@ pub(crate) async fn list(
 	}
 
 	if let Some(status) = &opts.status {
-		query.push(" AND status IN (");
+		// Active is stored as NULL in the `status` column. If the caller asked
+		// for Active, legacy NULL rows must match too.
+		let include_null = status.iter().any(|s| matches!(s, ProfileStatus::Active));
+		if include_null {
+			query.push(" AND (status IS NULL OR status IN (");
+		} else {
+			query.push(" AND status IN (");
+		}
 		for (i, s) in status.iter().enumerate() {
 			if i > 0 {
 				query.push(", ");
 			}
 			let status_char = match s {
 				ProfileStatus::Active => "A",
-				ProfileStatus::Trusted => "T",
 				ProfileStatus::Blocked => "B",
 				ProfileStatus::Muted => "M",
 				ProfileStatus::Suspended => "S",
@@ -149,7 +154,11 @@ pub(crate) async fn list(
 			};
 			query.push_bind(status_char);
 		}
-		query.push(")");
+		if include_null {
+			query.push("))");
+		} else {
+			query.push(")");
+		}
 	}
 
 	if let Some(connected) = opts.connected {
@@ -371,7 +380,6 @@ pub(crate) async fn upsert(
 	let insert_status: Option<&str> = match &fields.status {
 		Patch::Value(s) => Some(match s {
 			ProfileStatus::Active => "A",
-			ProfileStatus::Trusted => "T",
 			ProfileStatus::Blocked => "B",
 			ProfileStatus::Muted => "M",
 			ProfileStatus::Suspended => "S",
@@ -448,7 +456,6 @@ pub(crate) async fn upsert(
 	});
 	has_updates = push_patch!(query, has_updates, "status", &fields.status, |v| match v {
 		ProfileStatus::Active => "A",
-		ProfileStatus::Trusted => "T",
 		ProfileStatus::Blocked => "B",
 		ProfileStatus::Muted => "M",
 		ProfileStatus::Suspended => "S",

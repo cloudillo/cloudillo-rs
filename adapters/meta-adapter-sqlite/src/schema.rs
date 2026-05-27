@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 30;
+	const CURRENT_DB_VERSION: i64 = 32;
 
 	let mut tx = db.begin().await?;
 
@@ -287,6 +287,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			reactions text,
 			comments integer,
 			comments_read integer,
+			stat_at INTEGER,				-- Highest created_at of any STAT applied to reactions/comments
 			visibility char(1) NOT NULL DEFAULT 'D',	-- D: Direct (owner only), P: Public, V: Verified,
 														-- 2: 2nd degree, F: Follower, C: Connected
 			flags text,						-- Action flags: R/r (reactions), C/c (comments), O/o (open)
@@ -1738,6 +1739,27 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.await?;
 
 		set_db_version(&mut tx, 30).await;
+	}
+
+	if version < 31 {
+		// ProfileStatus::Trusted removed; collapse legacy 'T' rows into
+		// Active. Active is stored as NULL by convention (see parse_status).
+		sqlx::query("UPDATE profiles SET status = NULL WHERE status = 'T'")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 31).await;
+	}
+
+	// Version 32: per-subject STAT watermark. Receivers gate inbound STAT
+	// mirror updates on `created_at > stat_at` so a delayed/out-of-order
+	// STAT cannot overwrite fresher counts already applied via direct REACT
+	// or CMNT federation events. Existing rows start NULL — the first
+	// inbound STAT after deployment accepts unconditionally.
+	if version < 32 {
+		sqlx::query("ALTER TABLE actions ADD COLUMN stat_at INTEGER")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 32).await;
 	}
 
 	tx.commit().await?;
