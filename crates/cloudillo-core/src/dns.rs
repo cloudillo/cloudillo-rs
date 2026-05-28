@@ -13,7 +13,12 @@ use hickory_resolver::{
 	net::{NetError, runtime::TokioRuntimeProvider},
 	proto::rr::{RData, RecordType},
 };
-use std::{net::IpAddr, sync::Arc};
+use lru::LruCache;
+use std::{
+	net::IpAddr,
+	num::NonZeroUsize,
+	sync::{Arc, LazyLock},
+};
 
 use crate::prelude::*;
 use cloudillo_types::address::AddressType;
@@ -35,6 +40,28 @@ const ROOT_SERVERS: [&str; 13] = [
 	"202.12.27.33",   // M.ROOT-SERVERS.NET
 ];
 
+/// Parsed root server IPs, computed once at first use. The previous
+/// implementation re-parsed `ROOT_SERVERS` on every recursive entry into
+/// `find_authoritative_ns_depth`; with out-of-bailiwick walks each NS name
+/// added another set of parses.
+static ROOT_SERVER_IPS: LazyLock<Vec<IpAddr>> =
+	LazyLock::new(|| ROOT_SERVERS.iter().filter_map(|ip| ip.parse().ok()).collect());
+
+const NS_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(256) {
+	Some(n) => n,
+	None => NonZeroUsize::MIN,
+};
+/// Time-to-live for cached NS resolutions. Conservative: we don't read DNS
+/// TTLs from hickory's `Lookup`, so 5 minutes covers typical re-validation
+/// bursts without holding stale entries through routine NS rotations.
+const NS_CACHE_TTL_SECS: i64 = 300;
+
+#[derive(Clone)]
+struct CachedNs {
+	ips: Vec<IpAddr>,
+	valid_until: Timestamp,
+}
+
 /// Outcome of a single DNS record lookup, distinguishing legitimate "no record"
 /// from actual lookup failure so callers can log the difference.
 #[derive(Debug)]
@@ -50,13 +77,15 @@ enum LookupOutcome {
 }
 
 /// DNS Resolver wrapper that performs recursive resolution from root servers
-pub struct DnsResolver {}
+pub struct DnsResolver {
+	ns_cache: Arc<parking_lot::Mutex<LruCache<Box<str>, CachedNs>>>,
+}
 
 impl DnsResolver {
 	/// Create a new DNS resolver configured with root servers
 	pub fn new() -> ClResult<Self> {
 		debug!("Created DNS resolver with {} root servers", ROOT_SERVERS.len());
-		Ok(Self {})
+		Ok(Self { ns_cache: Arc::new(parking_lot::Mutex::new(LruCache::new(NS_CACHE_CAPACITY))) })
 	}
 
 	/// Create a resolver configured to query specific nameservers
@@ -141,56 +170,109 @@ impl DnsResolver {
 		}
 	}
 
-	/// Resolve NS record hostnames to IP addresses using the given resolver.
-	///
-	/// Retries the whole batch (not per name) when no NS name resolves: a
-	/// simultaneous flake of every NS name otherwise zeroes the level silently
-	/// and surfaces downstream as a misleading `nodns`.
-	async fn resolve_ns_to_ips(
-		&self,
-		ns_names: &[String],
+	/// Collect A/AAAA answer records for `name` into `ips`, swallowing transport
+	/// errors. `lookup_with_retry` already handles its own backoff and logging.
+	async fn collect_addr_records(
 		resolver: &TokioResolver,
-	) -> Vec<IpAddr> {
-		const BATCH_ATTEMPTS: u32 = 2;
-		const BATCH_BACKOFF_MS: u64 = 500;
+		name: &str,
+		rtype: RecordType,
+		ips: &mut Vec<IpAddr>,
+	) {
+		let Ok(lookup) = Self::lookup_with_retry(resolver, name, rtype).await else {
+			return;
+		};
+		for record in lookup.answers() {
+			match &record.data {
+				RData::A(a) => ips.push(IpAddr::V4(a.0)),
+				RData::AAAA(aaaa) => ips.push(IpAddr::V6(aaaa.0)),
+				_ => {}
+			}
+		}
+	}
+
+	/// Resolve NS record hostnames to IP addresses by recursively walking from
+	/// root for each NS name.
+	///
+	/// We cannot reuse the parent zone's authoritative servers to resolve the
+	/// NS hostnames, because those NS may live out-of-bailiwick (under a
+	/// different TLD than the zone being delegated). In that case the parent's
+	/// NS have no authority over the NS hostname and answer REFUSED/empty.
+	/// Walking from root for each NS hostname correctly re-roots the lookup
+	/// under the NS's own TLD.
+	async fn resolve_ns_to_ips(&self, ns_names: &[String], depth: u8) -> Vec<IpAddr> {
 		let mut ips = Vec::new();
-		for attempt in 0..BATCH_ATTEMPTS {
-			for ns_name in ns_names {
-				if let Ok(lookup) = resolver.lookup_ip(ns_name.as_str()).await {
-					for ip in lookup.iter() {
-						ips.push(ip);
-					}
-				}
+		for ns_name in ns_names {
+			// Recursively find the authoritative NS for this NS hostname.
+			// Handles out-of-bailiwick delegations by walking from root
+			// again under the NS's own TLD. Box::pin breaks the recursive
+			// async fn into a heap-allocated future (required by rustc).
+			let Ok(auth_ns) = Box::pin(self.find_authoritative_ns_depth(ns_name, depth + 1)).await
+			else {
+				continue;
+			};
+			if auth_ns.is_empty() {
+				continue;
 			}
-			if !ips.is_empty() {
-				return ips;
-			}
-			if attempt + 1 < BATCH_ATTEMPTS {
-				debug!(
-					ns_names = ?ns_names,
-					attempt = attempt + 1,
-					"All NS-name resolutions failed in this batch, retrying"
-				);
-				tokio::time::sleep(std::time::Duration::from_millis(BATCH_BACKOFF_MS)).await;
-			}
+			let Ok(auth_resolver) = self.create_resolver_for_ns(&auth_ns) else {
+				continue;
+			};
+			Self::collect_addr_records(&auth_resolver, ns_name, RecordType::A, &mut ips).await;
+			Self::collect_addr_records(&auth_resolver, ns_name, RecordType::AAAA, &mut ips).await;
 		}
 		if ips.is_empty() && !ns_names.is_empty() {
 			warn!(
 				ns_names = ?ns_names,
-				attempts = BATCH_ATTEMPTS,
-				"Failed to resolve any NS names to IPs after batch retries"
+				"Failed to resolve any NS names to IPs"
 			);
 		}
 		ips
 	}
 
-	/// Find authoritative nameservers for a domain by walking down from root
+	/// Find authoritative nameservers for a domain by walking down from root.
+	///
+	/// Public wrapper around `find_authoritative_ns_depth` that starts at depth 0.
 	async fn find_authoritative_ns(&self, domain: &str) -> ClResult<Vec<IpAddr>> {
+		self.find_authoritative_ns_depth(domain, 0).await
+	}
+
+	/// Find authoritative nameservers for a domain by walking down from root,
+	/// with a recursion depth bound.
+	///
+	/// `depth` tracks indirect recursion through `resolve_ns_to_ips` (which
+	/// re-roots out-of-bailiwick NS hostname resolution). Real-world delegation
+	/// chains are very shallow (usually 1–2 hops); we cap at 4 to defend
+	/// against pathological loops without spinning forever.
+	async fn find_authoritative_ns_depth(&self, domain: &str, depth: u8) -> ClResult<Vec<IpAddr>> {
+		const MAX_DEPTH: u8 = 4;
 		let labels: Vec<&str> = domain.trim_end_matches('.').split('.').collect();
 
+		// Safety bound: cap NS-resolution recursion to defend against
+		// pathological delegation loops. Return empty so the caller
+		// (resolve_ns_to_ips) cleanly skips this name via its
+		// `if auth_ns.is_empty() { continue; }` short-circuit, rather than
+		// asking root for an A record it cannot answer.
+		if depth >= MAX_DEPTH {
+			warn!(
+				domain = %domain,
+				depth = depth,
+				max_depth = MAX_DEPTH,
+				"find_authoritative_ns_depth: max recursion depth reached, returning empty, caller will skip"
+			);
+			return Ok(Vec::new());
+		}
+
+		let key: Box<str> = domain.trim_end_matches('.').into();
+		{
+			let mut cache = self.ns_cache.lock();
+			if let Some(entry) = cache.get(&key)
+				&& entry.valid_until.0 > Timestamp::now().0
+			{
+				return Ok(entry.ips.clone());
+			}
+		}
+
 		// Start with root servers
-		let mut current_ns_ips: Vec<IpAddr> =
-			ROOT_SERVERS.iter().filter_map(|ip| ip.parse().ok()).collect();
+		let mut current_ns_ips: Vec<IpAddr> = ROOT_SERVER_IPS.clone();
 
 		let mut current_resolver = self.create_resolver_for_ns(&current_ns_ips)?;
 
@@ -230,7 +312,7 @@ impl DnsResolver {
 					if !ns_names.is_empty() {
 						// Resolve NS names to IPs if no glue records
 						let ns_ips = if glue_ips.is_empty() {
-							self.resolve_ns_to_ips(&ns_names, &current_resolver).await
+							self.resolve_ns_to_ips(&ns_names, depth).await
 						} else {
 							glue_ips
 						};
@@ -283,6 +365,15 @@ impl DnsResolver {
 			"Found authoritative nameservers"
 		);
 
+		if depth == 0 {
+			// Only cache top-level calls — inner recursive calls still benefit
+			// when they target a name already cached by a previous top-level
+			// call, but we avoid caching the partial state of an in-flight walk.
+			let valid_until = Timestamp(Timestamp::now().0 + NS_CACHE_TTL_SECS);
+			self.ns_cache
+				.lock()
+				.put(key, CachedNs { ips: current_ns_ips.clone(), valid_until });
+		}
 		Ok(current_ns_ips)
 	}
 
