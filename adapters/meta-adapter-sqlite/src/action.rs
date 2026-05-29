@@ -499,16 +499,15 @@ pub(crate) async fn create(
 ) -> ClResult<ActionId<Box<str>>> {
 	// If action already has action_id (inbound federation), check if it exists
 	if !action.action_id.is_empty() {
-		let action_id_exists = sqlx::query(
-			"SELECT action_id FROM actions WHERE tn_id=? AND action_id=? AND status!='D'",
-		)
-		.bind(tn_id.0)
-		.bind(action.action_id)
-		.fetch_optional(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?
-		.and_then(|row| row.get(0));
+		let action_id_exists =
+			sqlx::query("SELECT action_id FROM actions WHERE tn_id=? AND action_id=?")
+				.bind(tn_id.0)
+				.bind(action.action_id)
+				.fetch_optional(db)
+				.await
+				.inspect_err(inspect)
+				.map_err(|_| Error::DbError)?
+				.and_then(|row| row.get(0));
 
 		if let Some(action_id) = action_id_exists {
 			return Ok(ActionId::ActionId(action_id));
@@ -817,7 +816,8 @@ pub(crate) async fn get_by_key(
 	action_key: &str,
 ) -> ClResult<Option<Action<Box<str>>>> {
 	let res = sqlx::query("SELECT action_id, type, sub_type, issuer_tag, parent_id, root_id, audience, content, attachments, subject, created_at, expires_at, visibility, flags, x
-		FROM actions WHERE tn_id=? AND key=?")
+		FROM actions WHERE tn_id=? AND key=? AND coalesce(status, 'A')!='D'
+		ORDER BY a_id DESC LIMIT 1")
 		.bind(tn_id.0)
 		.bind(action_key)
 		.fetch_optional(db).await;

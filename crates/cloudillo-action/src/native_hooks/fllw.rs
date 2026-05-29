@@ -99,23 +99,13 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 		// Silently drop the follow rather than returning PermissionDenied.
 		// Returning an error to the remote sender (a) leaks the local privacy
 		// setting and (b) invites retry storms. Mirror CONN's ignore-mode:
-		// mark the action 'D' and continue.
+		// rest the action at 'D' and continue. The post-store pipeline
+		// (process.rs) writes this status once.
 		info!(
 			"FLLW: Ignoring follow from {} - {} does not accept followers",
 			context.issuer, audience
 		);
-		let update_opts = cloudillo_types::meta_adapter::UpdateActionDataOptions {
-			status: Patch::Value('D'),
-			..Default::default()
-		};
-		if let Err(e) = app
-			.meta_adapter
-			.update_action_data(tn_id, &context.action_id, &update_opts)
-			.await
-		{
-			warn!("FLLW: Failed to update action status to D: {}", e);
-		}
-		return Ok(HookResult::default());
+		return Ok(HookResult { status: Some('D'), ..Default::default() });
 	}
 
 	match context.subtype.as_deref() {

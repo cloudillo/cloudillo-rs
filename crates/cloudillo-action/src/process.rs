@@ -452,12 +452,20 @@ async fn process_inbound_action_token_inner(
 	)
 	.await?;
 
-	// Activate the action only after the full pipeline (attachment sync +
-	// post-store) succeeded. Any failure earlier returned an Err and left the
-	// row in 'P', so the verifier task can retry. The flip is idempotent
-	// ('P' → 'A' on first success, 'A' → 'A' on subsequent runs).
+	// Write the action's final resting status once, after the full pipeline
+	// (attachment sync + post-store) succeeded. Any failure earlier returned
+	// an Err and left the row in 'V'/'P', so the verifier task can retry.
+	//
+	// The status is whatever the `on_receive` hook declared via
+	// `HookResult.status`, defaulting to 'A' (active) when the hook had no
+	// opinion. This is the single authoritative write: the hooks no longer
+	// set the current action's status directly, so this no longer clobbers a
+	// confirmation ('C') / rejected ('D') status the hook intended (the bug
+	// where INVT invitee copies ended at 'A' instead of 'C'). The write is
+	// idempotent on repeated verifier runs.
+	let final_status = result.status.unwrap_or('A');
 	let activate_opts = meta_adapter::UpdateActionDataOptions {
-		status: cloudillo_types::types::Patch::Value('A'),
+		status: cloudillo_types::types::Patch::Value(final_status),
 		..Default::default()
 	};
 	if let Err(e) = app.meta_adapter.update_action_data(tn_id, action_id, &activate_opts).await {
@@ -858,6 +866,13 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) -> ClRe
 				}
 				Some("V" | "P") | None => {
 					debug!("  resuming pending inbound action {}", ctx.action_id);
+				}
+				Some("D") => {
+					debug!(
+						"  inbound action {} already superseded/deleted, skipping",
+						ctx.action_id
+					);
+					return Ok(false);
 				}
 				Some(other) => {
 					debug!(

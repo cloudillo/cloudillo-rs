@@ -68,11 +68,19 @@ impl ProcessingContext {
 pub struct PostStoreResult {
 	/// Hook result value (for sync processing)
 	pub hook_result: Option<serde_json::Value>,
+
+	/// Resting status declared by the hook (`None` = default `'A'`).
+	///
+	/// Propagated to the caller so the inbound pipeline can write the
+	/// action's final status once, after the full post-store pipeline
+	/// succeeds, instead of unconditionally activating to `'A'`.
+	pub status: Option<char>,
 }
 
 struct HookExecutionResult {
 	return_value: Option<serde_json::Value>,
 	continue_processing: bool,
+	status: Option<char>,
 }
 
 /// Unified post-storage action processing
@@ -95,17 +103,30 @@ pub async fn process_after_store(
 	attachment_views: Option<&[AttachmentView]>,
 	ctx: ProcessingContext,
 ) -> ClResult<PostStoreResult> {
-	let mut result = PostStoreResult { hook_result: None };
+	let mut result = PostStoreResult { hook_result: None, status: None };
 
 	// 1. Execute hook (on_create for outbound, on_receive for inbound)
 	let hook_exec = execute_hook(app, tn_id, action, &ctx).await?;
 	result.hook_result = hook_exec.return_value;
+	// Capture the hook's resting status BEFORE the early-return check, so the
+	// caller still sees it when a hook aborts further processing
+	// (continue_processing == false, e.g. the CONN ignore arm).
+	result.status = hook_exec.status;
 	if !hook_exec.continue_processing {
 		return Ok(result);
 	}
 
-	// 2. Forward to WebSocket clients
-	forward_to_websocket(app, tn_id, action, attachment_views, &ctx).await;
+	// 2. Forward to WebSocket clients.
+	//
+	// The DB row is still 'V' (verifying) at this point — the action's resting
+	// status is written once, after this pipeline, by the inbound caller
+	// (process.rs). So pass the hook's declared resting status through and
+	// stamp it onto the forwarded view, otherwise live WS notifications would
+	// carry the transient 'V' and the client's notification filter
+	// (status ∈ {C, N}) would drop them (e.g. an online invitee never sees the
+	// badge). When the hook declared no status (None → default 'A'), the view
+	// is forwarded as-is, matching pre-existing behavior for feed-type actions.
+	forward_to_websocket(app, tn_id, action, attachment_views, &ctx, result.status).await;
 
 	// 3. Fan-out to subscribers of subscribable parent chain
 	let fanout_recipients = schedule_subscriber_fanout(
@@ -185,7 +206,11 @@ async fn execute_hook(
 
 	let Some(resolved_type) = dsl.resolve_action_type(&action.typ, action.sub_typ.as_deref())
 	else {
-		return Ok(HookExecutionResult { return_value: None, continue_processing: true });
+		return Ok(HookExecutionResult {
+			return_value: None,
+			continue_processing: true,
+			status: None,
+		});
 	};
 
 	// Look up tenant's own id_tag (not the audience)
@@ -231,39 +256,35 @@ async fn execute_hook(
 
 	let hook_context = hook_context.build();
 
-	// For sync processing (IDP:REG), use execute_hook_with_result
+	// Always use execute_hook_with_result so the hook's resting `status`
+	// (and return_value) propagate back — the inbound pipeline writes that
+	// status once after post-store succeeds. Sync processing (IDP:REG)
+	// surfaces hook errors to the caller; async processing swallows them and
+	// continues (status stays None → default activation), matching prior
+	// behavior.
 	let is_sync = matches!(ctx, ProcessingContext::Inbound { is_sync: true, .. });
-	if is_sync {
-		match dsl.execute_hook_with_result(app, &resolved_type, hook_type, hook_context).await {
-			Ok(result) => Ok(HookExecutionResult {
-				return_value: result.return_value,
-				continue_processing: result.continue_processing,
-			}),
-			Err(e) => {
-				warn!(
-					action_id = %action.action_id,
-					action_type = %action.typ,
-					hook = %hook_type.as_str(),
-					error = %e,
-					"DSL hook failed"
-				);
+	match dsl.execute_hook_with_result(app, &resolved_type, hook_type, hook_context).await {
+		Ok(result) => Ok(HookExecutionResult {
+			return_value: result.return_value,
+			continue_processing: result.continue_processing,
+			status: result.status,
+		}),
+		Err(e) => {
+			warn!(
+				action_id = %action.action_id,
+				action_type = %action.typ,
+				hook = %hook_type.as_str(),
+				error = %e,
+				"DSL hook failed"
+			);
+			if is_sync {
 				Err(e)
-			}
-		}
-	} else {
-		match dsl.execute_hook(app, &resolved_type, hook_type, hook_context).await {
-			Ok(continue_processing) => {
-				Ok(HookExecutionResult { return_value: None, continue_processing })
-			}
-			Err(e) => {
-				warn!(
-					action_id = %action.action_id,
-					action_type = %action.typ,
-					hook = %hook_type.as_str(),
-					error = %e,
-					"DSL hook failed"
-				);
-				Ok(HookExecutionResult { return_value: None, continue_processing: true })
+			} else {
+				Ok(HookExecutionResult {
+					return_value: None,
+					continue_processing: true,
+					status: None,
+				})
 			}
 		}
 	}
@@ -280,6 +301,7 @@ async fn forward_to_websocket(
 	action: &meta_adapter::Action<Box<str>>,
 	_attachment_views: Option<&[AttachmentView]>,
 	ctx: &ProcessingContext,
+	resting_status: Option<char>,
 ) {
 	debug!(
 		action_id = %action.action_id,
@@ -291,7 +313,17 @@ async fn forward_to_websocket(
 	);
 
 	// Fetch the full ActionView so WS messages match the API response format
-	let action_view = app.meta_adapter.get_action(tn_id, &action.action_id).await.ok().flatten();
+	let mut action_view =
+		app.meta_adapter.get_action(tn_id, &action.action_id).await.ok().flatten();
+
+	// Stamp the hook's declared resting status onto the view. The persisted
+	// row is still 'V' here (the authoritative status write happens after this
+	// pipeline), so without this the WS message would carry 'V' and the client
+	// would not treat it as a notification. Only override when the hook
+	// declared a status; otherwise leave the fetched view untouched.
+	if let (Some(status), Some(view)) = (resting_status, action_view.as_mut()) {
+		view.status = Some(status.to_string().into());
+	}
 
 	let result = if let Some(ref view) = action_view {
 		if ctx.is_outbound() {

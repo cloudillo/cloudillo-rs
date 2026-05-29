@@ -15,9 +15,7 @@ use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 use crate::subject_ref::{SubjectRef, parse_subject_ref};
 use crate::task::{CreateAction, create_action};
-use cloudillo_types::meta_adapter::{
-	ProfileConnectionStatus, UpdateActionDataOptions, UpsertProfileFields,
-};
+use cloudillo_types::meta_adapter::{ProfileConnectionStatus, UpsertProfileFields};
 
 /// Extract the community id_tag from an identity-typed subject string.
 ///
@@ -212,7 +210,11 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 		false
 	};
 
-	match context.subtype.as_deref() {
+	// Resting status is declared here and written once by the post-store
+	// pipeline (process.rs). The invitee copy must rest at 'C' so it shows as
+	// an actionable, persistent confirmation; the community-home copy stays at
+	// 'A' (default) so the `has_pending_invitation` lookup in conn.rs finds it.
+	let status: Option<char> = match context.subtype.as_deref() {
 		None => {
 			if is_conv_home {
 				// CONV home context - store for SUBS validation, keep default 'A' status
@@ -220,35 +222,28 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					"INVT: Storing invitation at CONV home for SUBS validation (action_id: {})",
 					context.action_id
 				);
-				// Status stays 'A' (default) - invitation is recorded for SUBS validation lookup
+				None
 			} else {
 				// Invitee context - set status to 'C' for confirmation UI
 				info!(
 					"INVT: Setting invitation to confirmation status for invitee (action_id: {})",
 					context.action_id
 				);
-				let update_opts =
-					UpdateActionDataOptions { status: Patch::Value('C'), ..Default::default() };
-
-				if let Err(e) = app
-					.meta_adapter
-					.update_action_data(tn_id, &context.action_id, &update_opts)
-					.await
-				{
-					warn!("INVT: Failed to update action status to C: {}", e);
-				}
+				Some('C')
 			}
 		}
 		Some("DEL") => {
 			// Invitation revoked - handled by normal action processing
 			info!("INVT:DEL: Invitation revoked by {}", context.issuer);
+			None
 		}
 		Some(subtype) => {
 			warn!("INVT on_receive: Unknown subtype '{}', ignoring", subtype);
+			None
 		}
-	}
+	};
 
-	Ok(HookResult::default())
+	Ok(HookResult { status, ..Default::default() })
 }
 
 /// INVT on_accept hook - Create subscription when invitation accepted
@@ -359,11 +354,15 @@ async fn on_accept_community(
 	}
 
 	// If the community is hosted locally, also flip the invitee's row in
-	// the community tenant to Connected with a baseline `member` role.
+	// the community tenant to Connected with a baseline `contributor` role.
+	// `contributor` is the canonical baseline membership role (see
+	// cloudillo-core `roles.rs` ROLE_HIERARCHY) and the minimum tier allowed
+	// to create content (create_perm.rs). A non-canonical role like `member`
+	// would expand to no permissions and render as "Follower" in the UI.
 	if let Ok(Some(community_tn_id)) = lookup_local_tenant(app, community_id_tag).await {
 		let invitee_upsert = UpsertProfileFields {
 			connected: Patch::Value(ProfileConnectionStatus::Connected),
-			roles: Patch::Value(Some(vec!["member".into()])),
+			roles: Patch::Value(Some(vec!["contributor".into()])),
 			..Default::default()
 		};
 		if let Err(e) = app

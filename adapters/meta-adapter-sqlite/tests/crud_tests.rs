@@ -8,8 +8,8 @@
 
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{
-	Action, ListActionOptions, ListProfileOptions, MetaAdapter, ProfileStatus, ProfileType,
-	UpdateTenantData, UpsertProfileFields,
+	Action, ActionId, ListActionOptions, ListProfileOptions, MetaAdapter, ProfileStatus,
+	ProfileType, UpdateActionDataOptions, UpdateTenantData, UpsertProfileFields,
 };
 use cloudillo_types::types::{Patch, Timestamp, TnId};
 use cloudillo_types::worker::WorkerPool;
@@ -306,6 +306,319 @@ async fn test_list_actions_exclude_issuer_profile_status() {
 	assert!(
 		issuers.contains(&"p-missing"),
 		"Missing local profile must NOT be excluded (open-federation default)"
+	);
+}
+
+/// Guards the resting-status design behind the inbound-activation fix
+/// (HookResult-driven status in cloudillo-action): the `status=['A']` filter
+/// used by subscriber fan-out (fanout.rs), broadcast-to-followers
+/// (post_store.rs `schedule_broadcast_delivery`), and timeline filtering
+/// (filter.rs) must include only rows resting at 'A' and exclude rows resting
+/// at 'N' (informational) or 'C' (confirmation).
+///
+/// This is why an auto-accepted CONN MUST rest at 'A' (not 'N') — otherwise it
+/// would be dropped from fan-out — and why an INVT invitee copy resting at 'C'
+/// is correctly excluded from these active-relationship queries.
+#[tokio::test]
+async fn test_list_actions_status_filter_active_excludes_notif_and_confirmation() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	let now = Timestamp::now();
+
+	// Three CONN actions from distinct issuers; created at default status 'P'.
+	for (action_id, issuer) in
+		[("c-active", "p-active"), ("c-notif", "p-notif"), ("c-confirm", "p-confirm")]
+	{
+		let action = Action {
+			action_id,
+			typ: "CONN",
+			sub_typ: None,
+			issuer_tag: issuer,
+			parent_id: None,
+			root_id: None,
+			audience_tag: Some("owner"),
+			content: None,
+			attachments: None,
+			subject: None,
+			created_at: now,
+			expires_at: None,
+			visibility: None,
+			flags: None,
+			x: None,
+		};
+		adapter.create_action(tn_id, &action, None).await.expect("create action");
+	}
+
+	// Move each to its resting status, mirroring what the post-store pipeline
+	// writes once after on_receive (process.rs).
+	for (action_id, status) in [("c-active", 'A'), ("c-notif", 'N'), ("c-confirm", 'C')] {
+		adapter
+			.update_action_data(
+				tn_id,
+				action_id,
+				&UpdateActionDataOptions { status: Patch::Value(status), ..Default::default() },
+			)
+			.await
+			.expect("update status");
+	}
+
+	// The fan-out/broadcast query shape: typ CONN, status ['A'].
+	let opts = ListActionOptions {
+		typ: Some(vec!["CONN".into()]),
+		status: Some(vec!["A".into()]),
+		..Default::default()
+	};
+	let res = adapter.list_actions(tn_id, &opts).await.expect("list_actions");
+	let issuers: Vec<&str> = res.iter().map(|a| a.issuer.id_tag.as_ref()).collect();
+
+	assert!(issuers.contains(&"p-active"), "'A'-resting CONN must be included in status=['A']");
+	assert!(
+		!issuers.contains(&"p-notif"),
+		"'N'-resting CONN must be excluded — auto-accepted CONNs therefore must rest at 'A'"
+	);
+	assert!(
+		!issuers.contains(&"p-confirm"),
+		"'C'-resting (confirmation) CONN must be excluded from active-relationship queries"
+	);
+}
+
+/// Guards the community-invitation retirement design
+/// (cloudillo-action conn.rs `retire_community_invitations` and the
+/// `has_pending_invitation` gate). Two invariants:
+///
+/// 1. **The `@`-prefix is load-bearing.** A community-membership INVT stores its
+///    `subject` as the identity reference `@<id_tag>` (the frontend builds it as
+///    `'@' + communityIdTag`), but the community's tenant id_tag is the *bare*
+///    `<id_tag>` (no `@`). So a lookup keyed on the bare tenant tag finds
+///    nothing — the lookups in conn.rs must prepend `@`. This was the bug that
+///    let a left member's invite reappear as "pending".
+/// 2. **'D' retires.** Once the invitation is consumed/severed and flipped to
+///    'D', the `@`-prefixed `status=['A']` lookup must return empty, so it neither
+///    auto-accepts a re-connect nor reappears as "pending".
+#[tokio::test]
+async fn test_retired_invitation_excluded_from_pending_lookup() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	// The community tenant's id_tag is the BARE tag (no leading '@').
+	adapter
+		.create_tenant(tn_id, "team-alice.example")
+		.await
+		.expect("Should create tenant");
+
+	let now = Timestamp::now();
+
+	// Community-home INVT copy: subject is the identity reference '@<id_tag>'
+	// (with the '@'), audience is the invitee. This is the row shape the
+	// conn.rs lookups must match.
+	let action = Action {
+		action_id: "invt-1",
+		typ: "INVT",
+		sub_typ: None,
+		issuer_tag: "alice.example",
+		parent_id: None,
+		root_id: None,
+		audience_tag: Some("bob.example"),
+		content: None,
+		attachments: None,
+		subject: Some("@team-alice.example"),
+		created_at: now,
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+	};
+	adapter.create_action(tn_id, &action, None).await.expect("create action");
+
+	// Rest it at 'A', mirroring the home-copy state while the member is connected.
+	adapter
+		.update_action_data(
+			tn_id,
+			"invt-1",
+			&UpdateActionDataOptions { status: Patch::Value('A'), ..Default::default() },
+		)
+		.await
+		.expect("update status to A");
+
+	// Invariant 1: keying the lookup on the BARE tenant tag finds nothing.
+	let bare_lookup = ListActionOptions {
+		typ: Some(vec!["INVT".into()]),
+		subject: Some("team-alice.example".into()),
+		audience: Some("bob.example".into()),
+		status: Some(vec!["A".into()]),
+		..Default::default()
+	};
+	let bare = adapter.list_actions(tn_id, &bare_lookup).await.expect("list_actions");
+	assert!(
+		bare.is_empty(),
+		"bare-tag (no '@') subject lookup must miss the '@'-prefixed INVT — this was the bug"
+	);
+
+	// The lookup shape conn.rs actually builds: subject = format!("@{}", tag).
+	let lookup = ListActionOptions {
+		typ: Some(vec!["INVT".into()]),
+		subject: Some(format!("@{}", "team-alice.example")),
+		audience: Some("bob.example".into()),
+		status: Some(vec!["A".into()]),
+		..Default::default()
+	};
+	let before = adapter.list_actions(tn_id, &lookup).await.expect("list_actions");
+	assert_eq!(
+		before.len(),
+		1,
+		"'@'-prefixed lookup must find the 'A'-resting community-home INVT"
+	);
+
+	// Retire it (what `retire_community_invitations` does on accept/leave).
+	adapter
+		.update_action_data(
+			tn_id,
+			"invt-1",
+			&UpdateActionDataOptions { status: Patch::Value('D'), ..Default::default() },
+		)
+		.await
+		.expect("update status to D");
+
+	// Invariant 2: retired ('D') INVT drops out of the status=['A'] lookup.
+	let after = adapter.list_actions(tn_id, &lookup).await.expect("list_actions");
+	assert!(
+		after.is_empty(),
+		"retired ('D') INVT must be excluded from the status=['A'] pending/auto-accept lookup"
+	);
+}
+
+/// Re-receiving a federated action whose `action_id` was already soft-deleted
+/// (`status='D'`) must be an idempotent no-op, not a UNIQUE-constraint `DbError`.
+///
+/// This guards the rejoin-resync fix: the existence check in `create()` queries
+/// `action_id` regardless of status, mirroring the `idx_actions_action_id`
+/// unique index (which has no status predicate). A STAT-style action whose key
+/// was superseded (soft-deleted) earlier and then re-delivered must return the
+/// existing `ActionId::ActionId(...)` instead of falling through to an INSERT
+/// that collides on the unique index.
+#[tokio::test]
+async fn test_create_action_redelivered_soft_deleted_is_idempotent() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	let now = Timestamp::now();
+	let key = "STAT:a1~parent";
+
+	// Helper: a STAT action for the shared key with the given action_id.
+	let stat = |action_id: &'static str| Action {
+		action_id,
+		typ: "STAT",
+		sub_typ: None,
+		issuer_tag: "issuer.example",
+		parent_id: None,
+		root_id: None,
+		audience_tag: None,
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: now,
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+	};
+
+	// First inbound STAT for the shared key.
+	adapter
+		.create_action(tn_id, &stat("a1~stat-old"), Some(key))
+		.await
+		.expect("create first STAT");
+
+	// A newer STAT on the SAME key but a different action_id soft-deletes the
+	// first (delete-by-key path marks the old row status='D').
+	adapter
+		.create_action(tn_id, &stat("a1~stat-new"), Some(key))
+		.await
+		.expect("create second STAT");
+
+	// Re-delivery of the now soft-deleted first action during a resync must be a
+	// silent idempotent skip — returns the existing action_id, no DbError.
+	let res = adapter
+		.create_action(tn_id, &stat("a1~stat-old"), Some(key))
+		.await
+		.expect("re-delivery of soft-deleted action must not error");
+	match res {
+		ActionId::ActionId(id) => {
+			assert_eq!(id.as_ref(), "a1~stat-old", "must return the existing action_id");
+		}
+		ActionId::AId(_) => panic!("re-delivery must not insert a new row"),
+	}
+
+	// And it must not have revived the superseded row: no active STAT for the
+	// old action_id remains.
+	let all = adapter
+		.list_actions(
+			tn_id,
+			&ListActionOptions { typ: Some(vec!["STAT".into()]), ..Default::default() },
+		)
+		.await
+		.expect("list_actions");
+	let active_old = all.iter().filter(|a| a.action_id.as_ref() == "a1~stat-old").count();
+	assert_eq!(active_old, 0, "superseded STAT must remain inactive, not revived");
+}
+
+/// Guards the `get_by_key` soft-delete fix: the delete-by-key dedup path in
+/// `create()` flips superseded rows to status='D' and inserts a fresh live row,
+/// so multiple rows can share one key. `get_action_by_key` must return the live
+/// row, never a stale 'D' one — all callers want the current live action.
+#[tokio::test]
+async fn test_get_action_by_key_skips_soft_deleted() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	let now = Timestamp::now();
+	let key = "STAT:a1~parent";
+
+	// Helper: a STAT action for the shared key with the given action_id.
+	let stat = |action_id: &'static str| Action {
+		action_id,
+		typ: "STAT",
+		sub_typ: None,
+		issuer_tag: "issuer.example",
+		parent_id: None,
+		root_id: None,
+		audience_tag: None,
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: now,
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+	};
+
+	// First inbound STAT for the shared key.
+	adapter
+		.create_action(tn_id, &stat("a1~stat-old"), Some(key))
+		.await
+		.expect("create first STAT");
+
+	// A newer STAT on the SAME key soft-deletes the first (delete-by-key path
+	// marks the old row status='D') and inserts a fresh live row.
+	adapter
+		.create_action(tn_id, &stat("a1~stat-new"), Some(key))
+		.await
+		.expect("create second STAT");
+
+	// Lookup by key must return the live row, not the superseded 'D' one.
+	let found = adapter
+		.get_action_by_key(tn_id, key)
+		.await
+		.expect("get_action_by_key")
+		.expect("a live action must exist for the key");
+	assert_eq!(
+		found.action_id.as_ref(),
+		"a1~stat-new",
+		"get_action_by_key must return the live row, not the soft-deleted one"
 	);
 }
 

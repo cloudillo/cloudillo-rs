@@ -9,9 +9,7 @@
 
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use cloudillo_types::meta_adapter::{
-	CreateFile, CreateShareEntry, FileStatus, UpdateActionDataOptions,
-};
+use cloudillo_types::meta_adapter::{CreateFile, CreateShareEntry, FileStatus};
 
 /// FSHR on_create hook - Create share_entry on the sender's side
 ///
@@ -87,9 +85,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// Logic:
 /// - If we are the audience and subType is not DEL, set status to 'C' (confirmation required)
 /// - DEL subtype doesn't require confirmation
-pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
-	let tn_id = context.tn_id;
-
+pub async fn on_receive(_app: App, context: HookContext) -> ClResult<HookResult> {
 	tracing::debug!(
 		"Native hook: FSHR on_receive for action {} from {} to {:?}",
 		context.action_id,
@@ -100,26 +96,20 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 	// Check if we are the audience
 	let is_audience = context.audience.as_ref() == Some(&context.tenant_tag);
 
-	// Only require confirmation for non-DEL subtypes when we are the audience
-	if is_audience && context.subtype.as_deref() != Some("DEL") {
+	// Only require confirmation for non-DEL subtypes when we are the audience.
+	// The resting status is declared here and written once by the post-store
+	// pipeline (process.rs); otherwise the action rests at 'A' (default).
+	let status: Option<char> = if is_audience && context.subtype.as_deref() != Some("DEL") {
 		tracing::info!(
 			"FSHR: Received file share from {} - setting status to confirmation required",
 			context.issuer
 		);
+		Some('C')
+	} else {
+		None
+	};
 
-		let update_opts =
-			UpdateActionDataOptions { status: Patch::Value('C'), ..Default::default() };
-
-		if let Err(e) = app
-			.meta_adapter
-			.update_action_data(tn_id, &context.action_id, &update_opts)
-			.await
-		{
-			tracing::warn!("FSHR: Failed to update action status to 'C': {}", e);
-		}
-	}
-
-	Ok(HookResult::default())
+	Ok(HookResult { status, ..Default::default() })
 }
 
 /// FSHR on_accept hook - Create file entry when user accepts the share

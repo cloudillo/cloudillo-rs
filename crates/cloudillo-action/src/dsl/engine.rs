@@ -368,6 +368,7 @@ impl DslEngine {
 						vars: context.vars.clone(),
 						continue_processing: true,
 						return_value: None,
+						status: None,
 					})
 				};
 

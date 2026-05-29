@@ -18,9 +18,46 @@ use crate::history_sync::schedule_history_sync;
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 use crate::task::{CreateAction, create_action};
-use cloudillo_types::meta_adapter::{
-	ProfileConnectionStatus, UpdateActionDataOptions, UpsertProfileFields,
-};
+use cloudillo_types::meta_adapter::{ProfileConnectionStatus, UpsertProfileFields};
+
+/// Retire (soft-delete) any active community-membership invitations on record
+/// for `invitee` in this community tenant. Called when the invitation is
+/// consumed (membership established) or the membership is severed (CONN:DEL), so
+/// a stale 'A' invitation neither reappears as "pending" in the community's
+/// Invitations UI nor silently auto-accepts a later re-connect via the
+/// `has_pending_invitation` gate.
+///
+/// `community_tag` is the bare tenant id_tag (no `@`). Community-membership
+/// INVTs store their `subject` as the identity reference `@<id_tag>` (the
+/// frontend builds it as `'@' + communityIdTag`), so the lookup must prepend
+/// `@` — querying the bare tag matches nothing.
+async fn retire_community_invitations(app: &App, tn_id: TnId, community_tag: &str, invitee: &str) {
+	let invt_opts = cloudillo_types::meta_adapter::ListActionOptions {
+		typ: Some(vec!["INVT".to_string()]),
+		subject: Some(format!("@{}", community_tag)),
+		audience: Some(invitee.to_string()),
+		status: Some(vec!["A".to_string()]),
+		..Default::default()
+	};
+	let invts = match app.meta_adapter.list_actions(tn_id, &invt_opts).await {
+		Ok(rs) => rs,
+		Err(e) => {
+			warn!("CONN: Failed to list invitations to retire for {}: {}", invitee, e);
+			return;
+		}
+	};
+	for invt in invts {
+		let opts = cloudillo_types::meta_adapter::UpdateActionDataOptions {
+			status: cloudillo_types::types::Patch::Value('D'),
+			..Default::default()
+		};
+		if let Err(e) = app.meta_adapter.update_action_data(tn_id, &invt.action_id, &opts).await {
+			warn!("CONN: Failed to retire invitation {}: {}", invt.action_id, e);
+		} else {
+			info!("CONN: Retired invitation {} for {}", invt.action_id, invitee);
+		}
+	}
+}
 
 /// CONN on_create hook - Handle connection request creation
 ///
@@ -53,13 +90,31 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				);
 			}
 
+			// Don't demote an already-Connected profile back to RequestPending.
+			// This CONN may be the relationship-recording send fired by an
+			// invitation accept (invt.rs on_accept_community), which has already
+			// set the local profile to Connected; running unconditionally here
+			// would clobber it back to 'R' (RequestPending) and leave the
+			// invitee stuck "not connected" until/unless a CONN:ACC round-trip
+			// arrives. Only set RequestPending when not already connected.
+			let already_connected = app
+				.meta_adapter
+				.read_profile(tn_id, audience)
+				.await
+				.ok()
+				.is_some_and(|(_, p)| p.connected.is_connected());
+
 			let profile_upsert = UpsertProfileFields {
 				following: if context.tenant_type == "community" {
 					Patch::Undefined
 				} else {
 					Patch::Value(true)
 				},
-				connected: Patch::Value(ProfileConnectionStatus::RequestPending),
+				connected: if already_connected {
+					Patch::Undefined // keep Connected
+				} else {
+					Patch::Value(ProfileConnectionStatus::RequestPending)
+				},
 				..Default::default()
 			};
 
@@ -107,6 +162,11 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			} else {
 				debug!("CONN:DEL: Removed audience connection");
 			}
+
+			if context.tenant_type == "community" {
+				retire_community_invitations(&app, tn_id, context.tenant_tag.as_str(), audience)
+					.await;
+			}
 		}
 		Some(subtype) => {
 			warn!("CONN on_create: Unknown subtype '{}', ignoring", subtype);
@@ -119,8 +179,9 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// CONN on_receive hook - Handle incoming connection request
 ///
 /// Logic:
-/// - None: Check for mutual connection request, set status to 'N' (notification) or 'C' (confirmation)
-/// - DEL: Update profile, set status to 'N'
+/// - None: mutual/auto-accept rests at 'A' (default); ignore-mode rests at 'D';
+///   normal requests rest at 'C' (confirmation)
+/// - DEL: Update profile, rests at 'N' (informational)
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
 	let tn_id = context.tn_id;
 	// The local tenant tag is the authoritative "to whom" — `context.audience`
@@ -181,17 +242,8 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 				schedule_history_sync(&app, tn_id, &context.issuer).await;
 
-				// Set action status to 'N' (notification) - mutual connection auto-accepted
-				let update_opts =
-					UpdateActionDataOptions { status: Patch::Value('N'), ..Default::default() };
-				if let Err(e) = app
-					.meta_adapter
-					.update_action_data(tn_id, &context.action_id, &update_opts)
-					.await
-				{
-					warn!("CONN: Failed to update action status to N: {}", e);
-				}
-
+				// Mutual connection auto-accepted — rests at 'A' (default) so the
+				// status=['A'] fan-out/broadcast/filter queries include it.
 				return Ok(HookResult::default());
 			}
 
@@ -206,13 +258,14 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			// If a community-membership INVT for this issuer is on record,
 			// treat the inbound CONN as pre-authorized: auto-accept and
 			// bypass the connection_mode='I' rejection.
-			// Matches only when the local tenant IS the community itself
-			// (subject in the INVT = community = local_tag); action-based
-			// invites have a different subject and fall through to the
-			// connection_mode arm below.
+			// Matches only when the local tenant IS the community itself.
+			// The INVT subject is the identity reference `@<id_tag>` (frontend
+			// builds it as `'@' + communityIdTag`), while local_tag is the bare
+			// tenant id_tag — so prepend `@`. Action-based invites have a
+			// different subject and fall through to the connection_mode arm below.
 			let invt_opts = cloudillo_types::meta_adapter::ListActionOptions {
 				typ: Some(vec!["INVT".to_string()]),
-				subject: Some(local_tag.to_string()),
+				subject: Some(format!("@{}", local_tag)),
 				audience: Some(context.issuer.clone()),
 				status: Some(vec!["A".to_string()]),
 				limit: Some(1),
@@ -225,8 +278,13 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				.is_ok_and(|rs| !rs.is_empty());
 
 			if has_pending_invitation {
-				// Invitation-backed CONN auto-accept always grants baseline "member"
-				// role; elevated roles require explicit community admin action.
+				// Invitation-backed CONN auto-accept always grants the baseline
+				// "contributor" role; elevated roles require explicit community
+				// admin action. "contributor" is the canonical baseline membership
+				// role (cloudillo-core `roles.rs` ROLE_HIERARCHY) and the minimum
+				// tier allowed to create content (create_perm.rs); a non-canonical
+				// role like "member" expands to no permissions and renders as
+				// "Follower" in the UI.
 				debug!("CONN: Auto-accepting invitation-backed connection from {}", context.issuer);
 
 				let response_action = CreateAction {
@@ -248,7 +306,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					} else {
 						Patch::Value(true)
 					},
-					roles: Patch::Value(Some(vec!["member".into()])),
+					roles: Patch::Value(Some(vec!["contributor".into()])),
 					..Default::default()
 				};
 				if let Err(e) =
@@ -259,38 +317,28 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 				schedule_history_sync(&app, tn_id, &context.issuer).await;
 
-				let update_opts =
-					UpdateActionDataOptions { status: Patch::Value('N'), ..Default::default() };
-				if let Err(e) = app
-					.meta_adapter
-					.update_action_data(tn_id, &context.action_id, &update_opts)
-					.await
-				{
-					warn!("CONN: Failed to update action status to N: {}", e);
-				}
+				// The invitation has now been consumed (membership established); retire it so
+				// it doesn't linger at 'A' and reappear as "pending" if this member later leaves.
+				retire_community_invitations(&app, tn_id, local_tag, &context.issuer).await;
 
+				// Invitation-backed connection accepted — rests at 'A' (default)
+				// so fan-out/broadcast/filter (status=['A']) include it.
 				return Ok(HookResult::default());
 			}
 
 			match connection_mode.as_deref() {
 				Some("I") => {
-					// IGNORE mode: Auto-delete/reject the connection request
+					// IGNORE mode: Auto-delete/reject the connection request.
+					// Rest at 'D' (rejected/deleted) and abort further processing.
 					info!(
 						"CONN: Ignoring connection request from {} (connection_mode=I)",
 						context.issuer
 					);
-
-					// Set action status to 'D' (deleted)
-					let update_opts =
-						UpdateActionDataOptions { status: Patch::Value('D'), ..Default::default() };
-					if let Err(e) = app
-						.meta_adapter
-						.update_action_data(tn_id, &context.action_id, &update_opts)
-						.await
-					{
-						warn!("CONN: Failed to update action status to D: {}", e);
-					}
-					return Ok(HookResult { continue_processing: false, ..Default::default() });
+					return Ok(HookResult {
+						continue_processing: false,
+						status: Some('D'),
+						..Default::default()
+					});
 				}
 				Some("A") => {
 					// AUTO-ACCEPT mode: Create response CONN action and connect
@@ -333,31 +381,15 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 					schedule_history_sync(&app, tn_id, &context.issuer).await;
 
-					// Set action status to 'N' (notification - auto-processed)
-					let update_opts =
-						UpdateActionDataOptions { status: Patch::Value('N'), ..Default::default() };
-					if let Err(e) = app
-						.meta_adapter
-						.update_action_data(tn_id, &context.action_id, &update_opts)
-						.await
-					{
-						warn!("CONN: Failed to update action status to N: {}", e);
-					}
+					// Auto-accepted (connection_mode=A) — rests at 'A' (default) so
+					// fan-out/broadcast/filter (status=['A']) include it.
 				}
 				_ => {
-					// Normal behavior: requires user confirmation
+					// Normal behavior: requires user confirmation. Rest at 'C' so
+					// the user gets a persistent, actionable accept/reject
+					// notification (not clobbered to 'A' on reload).
 					info!("CONN: Connection request from {} requires confirmation", context.issuer);
-
-					// Set action status to 'C' (confirmation) - user needs to accept/reject
-					let update_opts =
-						UpdateActionDataOptions { status: Patch::Value('C'), ..Default::default() };
-					if let Err(e) = app
-						.meta_adapter
-						.update_action_data(tn_id, &context.action_id, &update_opts)
-						.await
-					{
-						warn!("CONN: Failed to update action status to C: {}", e);
-					}
+					return Ok(HookResult { status: Some('C'), ..Default::default() });
 				}
 			}
 		}
@@ -387,16 +419,12 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					"CONN:ACC: Rejecting acceptance from {} - no outgoing CONN request found",
 					context.issuer
 				);
-				let update_opts =
-					UpdateActionDataOptions { status: Patch::Value('D'), ..Default::default() };
-				if let Err(e) = app
-					.meta_adapter
-					.update_action_data(tn_id, &context.action_id, &update_opts)
-					.await
-				{
-					warn!("CONN:ACC: Failed to update action status to D: {}", e);
-				}
-				return Ok(HookResult { continue_processing: false, ..Default::default() });
+				// Spurious acceptance — rest at 'D' (rejected) and abort processing.
+				return Ok(HookResult {
+					continue_processing: false,
+					status: Some('D'),
+					..Default::default()
+				});
 			}
 
 			// Update issuer's profile to connected
@@ -420,16 +448,8 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 			schedule_history_sync(&app, tn_id, &context.issuer).await;
 
-			// Set action status to 'N' (notification)
-			let update_opts =
-				UpdateActionDataOptions { status: Patch::Value('N'), ..Default::default() };
-			if let Err(e) = app
-				.meta_adapter
-				.update_action_data(tn_id, &context.action_id, &update_opts)
-				.await
-			{
-				warn!("CONN:ACC: Failed to update action status to N: {}", e);
-			}
+			// Connection accepted — rests at 'A' (default) so fan-out/broadcast/
+			// filter (status=['A']) include the established relationship.
 		}
 		Some("DEL") => {
 			info!("CONN:DEL: Received disconnect request from {} to {}", context.issuer, local_tag);
@@ -444,16 +464,14 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				warn!("CONN:DEL: Failed to update issuer profile {}: {}", context.issuer, e);
 			}
 
-			// Set action status to 'N' (notification)
-			let update_opts =
-				UpdateActionDataOptions { status: Patch::Value('N'), ..Default::default() };
-			if let Err(e) = app
-				.meta_adapter
-				.update_action_data(tn_id, &context.action_id, &update_opts)
-				.await
-			{
-				warn!("CONN:DEL: Failed to update action status to N: {}", e);
+			if context.tenant_type == "community" {
+				retire_community_invitations(&app, tn_id, local_tag, &context.issuer).await;
 			}
+
+			// Disconnect notification — rest at 'N' (informational). The
+			// relationship is severed, so it must NOT be 'A' (which would keep
+			// it in fan-out/broadcast queries).
+			return Ok(HookResult { status: Some('N'), ..Default::default() });
 		}
 		Some(subtype) => {
 			warn!("CONN on_receive: Unknown subtype '{}', ignoring", subtype);

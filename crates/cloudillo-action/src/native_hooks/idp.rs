@@ -84,6 +84,7 @@ pub async fn idp_reg_on_receive(app: App, context: HookContext) -> ClResult<Hook
 		},
 		continue_processing: true,
 		return_value: Some(serde_json::to_value(result.response)?),
+		status: None,
 	})
 }
 

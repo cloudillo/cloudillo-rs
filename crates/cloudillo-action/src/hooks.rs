@@ -112,11 +112,20 @@ pub struct HookResult {
 
 	/// Optional early return value
 	pub return_value: Option<serde_json::Value>,
+
+	/// Resting action status declared by the hook.
+	///
+	/// `None` means "no opinion" — the post-store pipeline defaults the
+	/// action to `'A'` (active) so untouched actions go live and remain
+	/// queryable by fan-out/broadcast/filter (`status=['A']`). A hook sets
+	/// this to declare a different resting status (e.g. `'C'` confirmation,
+	/// `'D'` rejected) which the pipeline writes once after processing.
+	pub status: Option<char>,
 }
 
 impl Default for HookResult {
 	fn default() -> Self {
-		Self { vars: HashMap::new(), continue_processing: true, return_value: None }
+		Self { vars: HashMap::new(), continue_processing: true, return_value: None, status: None }
 	}
 }
 
@@ -454,6 +463,7 @@ mod tests {
 		assert!(result.vars.is_empty());
 		assert!(result.continue_processing);
 		assert!(result.return_value.is_none());
+		assert!(result.status.is_none());
 	}
 
 	#[test]

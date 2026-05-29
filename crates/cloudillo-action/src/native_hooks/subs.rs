@@ -14,7 +14,6 @@
 use crate::helpers;
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
-use cloudillo_types::meta_adapter::UpdateActionDataOptions;
 
 /// SUBS on_receive hook - Handle incoming subscription request
 ///
@@ -48,19 +47,9 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			// Check if target action is open
 			let target_flags = target_action.flags.as_deref();
 			if helpers::is_open(target_flags) {
-				// Open action - auto-accept subscription
+				// Open action - auto-accept subscription. Rests at 'A' (default)
+				// so subscriber fan-out (status=['A']) includes it.
 				tracing::info!("SUBS: Auto-accepting subscription (target action is open)");
-
-				let update_opts =
-					UpdateActionDataOptions { status: Patch::Value('A'), ..Default::default() };
-				if let Err(e) = app
-					.meta_adapter
-					.update_action_data(tn_id, &context.action_id, &update_opts)
-					.await
-				{
-					tracing::warn!("SUBS: Failed to update action status to A: {}", e);
-				}
-
 				return Ok(HookResult::default());
 			}
 
@@ -71,52 +60,23 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				app.meta_adapter.get_action_by_key(tn_id, &invt_key).await.ok().flatten();
 
 			if invitation.is_some() {
-				// Has invitation - accept subscription
+				// Has invitation - accept subscription (rests at 'A').
 				tracing::info!("SUBS: Accepting subscription (has valid invitation)");
-
-				let update_opts =
-					UpdateActionDataOptions { status: Patch::Value('A'), ..Default::default() };
-				if let Err(e) = app
-					.meta_adapter
-					.update_action_data(tn_id, &context.action_id, &update_opts)
-					.await
-				{
-					tracing::warn!("SUBS: Failed to update action status to A: {}", e);
-				}
-
 				return Ok(HookResult::default());
 			}
 
 			// Check if subscription issuer is the target action's creator
 			// (creator can always be subscribed - auto-accept for self-subscription)
 			if context.issuer == target_action.issuer.id_tag.as_ref() {
+				// Self-subscription - auto-accept (rests at 'A').
 				tracing::info!("SUBS: Auto-accepting subscription (issuer is target creator)");
-
-				let update_opts =
-					UpdateActionDataOptions { status: Patch::Value('A'), ..Default::default() };
-				if let Err(e) = app
-					.meta_adapter
-					.update_action_data(tn_id, &context.action_id, &update_opts)
-					.await
-				{
-					tracing::warn!("SUBS: Failed to update action status to A: {}", e);
-				}
-
 				return Ok(HookResult::default());
 			}
 
-			// No invitation, not open - reject
+			// No invitation, not open - reject. Rests at 'D' (rejected) so it is
+			// excluded from active-subscription listings and fan-out.
 			tracing::info!("SUBS: Rejecting subscription (closed action, no invitation)");
-
-			let update_opts =
-				UpdateActionDataOptions { status: Patch::Value('R'), ..Default::default() };
-			if let Err(e) = app
-				.meta_adapter
-				.update_action_data(tn_id, &context.action_id, &update_opts)
-				.await
-			{
-				tracing::warn!("SUBS: Failed to update action status to R: {}", e);
-			}
+			return Ok(HookResult { status: Some('D'), ..Default::default() });
 		}
 		Some("UPD") => {
 			// Update subscription (role change, preferences)
@@ -142,26 +102,24 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					context.issuer,
 					subject_id
 				);
-				let update_opts =
-					UpdateActionDataOptions { status: Patch::Value('R'), ..Default::default() };
-				let _ = app
-					.meta_adapter
-					.update_action_data(tn_id, &context.action_id, &update_opts)
-					.await;
-				return Ok(HookResult { continue_processing: false, ..Default::default() });
+				return Ok(HookResult {
+					continue_processing: false,
+					status: Some('D'),
+					..Default::default()
+				});
 			};
 
-			// Only an active ('A') subscription may be updated. A rejected ('R'),
-			// pending ('P'), or deleted ('D') subscription must not silently
+			// Only an active ('A') subscription may be updated. A rejected or
+			// severed ('D'), or pending ('P') subscription must not silently
 			// reactivate via UPD — that would let a rejected subscriber
 			// self-promote back to Active. `get_action_by_key` does not return
 			// the status column, so re-read the action via `get_action`.
 			let existing_status =
 				match app.meta_adapter.get_action(tn_id, existing.action_id.as_ref()).await {
 					Ok(Some(view)) => {
-						view.status.as_deref().and_then(|s| s.chars().next()).unwrap_or('R')
+						view.status.as_deref().and_then(|s| s.chars().next()).unwrap_or('D')
 					}
-					_ => 'R',
+					_ => 'D',
 				};
 			if existing_status != 'A' {
 				tracing::warn!(
@@ -170,28 +128,14 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					subject_id,
 					existing_status
 				);
-				let update_opts =
-					UpdateActionDataOptions { status: Patch::Value('R'), ..Default::default() };
-				if let Err(e) = app
-					.meta_adapter
-					.update_action_data(tn_id, &context.action_id, &update_opts)
-					.await
-				{
-					tracing::warn!("SUBS:UPD: Failed to update action status to R: {}", e);
-				}
-				return Ok(HookResult { continue_processing: false, ..Default::default() });
+				return Ok(HookResult {
+					continue_processing: false,
+					status: Some('D'),
+					..Default::default()
+				});
 			}
 
-			// Accept the update (role validation done elsewhere)
-			let update_opts =
-				UpdateActionDataOptions { status: Patch::Value('A'), ..Default::default() };
-			if let Err(e) = app
-				.meta_adapter
-				.update_action_data(tn_id, &context.action_id, &update_opts)
-				.await
-			{
-				tracing::warn!("SUBS:UPD: Failed to update action status: {}", e);
-			}
+			// Accept the update (role validation done elsewhere) — rests at 'A'.
 		}
 		Some("DEL") => {
 			// Unsubscribe / leave
@@ -201,16 +145,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				subject_id
 			);
 
-			// Always accept unsubscribe requests (users can always leave)
-			let update_opts =
-				UpdateActionDataOptions { status: Patch::Value('A'), ..Default::default() };
-			if let Err(e) = app
-				.meta_adapter
-				.update_action_data(tn_id, &context.action_id, &update_opts)
-				.await
-			{
-				tracing::warn!("SUBS:DEL: Failed to update action status to A: {}", e);
-			}
+			// Always accept unsubscribe requests (users can always leave) — rests at 'A'.
 		}
 		Some(subtype) => {
 			tracing::warn!("SUBS on_receive: Unknown subtype '{}', ignoring", subtype);
