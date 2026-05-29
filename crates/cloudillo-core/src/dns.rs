@@ -542,6 +542,7 @@ pub async fn validate_domain_address(
 	// Try A record
 	let a_outcome = resolver.resolve_a_outcome(domain).await?;
 	if let LookupOutcome::Found(ref resolved_ip) = a_outcome {
+		// 1. Direct match: a literal IP in local_address equals the resolved A record.
 		for local_addr in local_address {
 			if resolved_ip == local_addr.as_ref() {
 				info!(
@@ -553,11 +554,62 @@ pub async fn validate_domain_address(
 				return Ok((resolved_ip.clone(), AddressType::Ipv4));
 			}
 		}
+		// 2. Indirect match: local_address is a hostname (CNAME-style config) and
+		// the cert domain has a *direct* A record (so the exact-CNAME check above
+		// could not match). Resolve each configured hostname's own A record and
+		// accept the domain if it points to the same IP — i.e. both names reach
+		// this server. (A cert domain that CNAMEs to a *different* host is not
+		// covered here; the CNAME branch above returns early in that case.)
+		let mut transient = false;
+		for local_addr in local_address {
+			if local_addr.parse::<IpAddr>().is_ok() {
+				continue; // IP literal — already compared above
+			}
+			match resolver.resolve_a_outcome(local_addr.as_ref()).await? {
+				LookupOutcome::Found(ref local_ip) if local_ip == resolved_ip => {
+					info!(
+						domain = %domain,
+						resolved_ip = %resolved_ip,
+						local_hostname = %local_addr,
+						"Domain validated: configured hostname resolves to same IP as domain"
+					);
+					return Ok((resolved_ip.clone(), AddressType::Ipv4));
+				}
+				LookupOutcome::Found(ref local_ip) => {
+					debug!(
+						domain = %domain,
+						resolved_ip = %resolved_ip,
+						local_hostname = %local_addr,
+						local_ip = %local_ip,
+						"Configured hostname resolves to a different IP than the domain"
+					);
+				}
+				LookupOutcome::NoRecord => {
+					debug!(local_hostname = %local_addr, "Configured hostname has no A record");
+				}
+				LookupOutcome::LookupError => {
+					transient = true;
+					debug!(
+						local_hostname = %local_addr,
+						"Transient failure resolving configured hostname's A record"
+					);
+				}
+			}
+		}
+		// A transient resolver failure on the configured hostname must not be
+		// reported as a definitive "address" failure (which would escalate the
+		// tenant toward suspension). Surface it as a non-ValidationError so
+		// check_domains_dns maps it to PreCheckError::Transient (skip this run).
+		if transient {
+			return Err(Error::ServiceUnavailable(
+				"transient DNS failure resolving configured local hostname".to_string(),
+			));
+		}
 		warn!(
 			domain = %domain,
 			resolved_ip = %resolved_ip,
 			local_addresses = ?local_address,
-			"DNS A record doesn't match local address"
+			"DNS A record doesn't match local address (no configured hostname resolves to it)"
 		);
 		return Err(Error::ValidationError("address".to_string()));
 	}

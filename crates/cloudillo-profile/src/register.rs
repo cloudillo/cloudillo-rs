@@ -154,6 +154,17 @@ pub async fn verify_register_data(
 						response.api_address = Some(address);
 					}
 				}
+				// Transient DNS failure (e.g. flaky resolver while checking the configured
+				// local hostname's A record). Surface as the "nodns" diagnostic code rather
+				// than a 503, matching the resolver-creation fallback above. The user can retry.
+				Err(Error::ServiceUnavailable(_)) => {
+					response.id_tag_error = "nodns".to_string();
+					if let Ok(Some(address)) =
+						resolve_domain_addresses(&api_domain, &resolver).await
+					{
+						response.api_address = Some(address);
+					}
+				}
 				Err(e) => return Err(e),
 			}
 
@@ -173,6 +184,17 @@ pub async fn verify_register_data(
 				Err(Error::ValidationError(err_code)) => {
 					response.app_domain_error = err_code;
 					// Still show what was resolved so user can debug
+					if let Ok(Some(address)) =
+						resolve_domain_addresses(app_domain_to_validate, &resolver).await
+					{
+						response.app_address = Some(address);
+					}
+				}
+				// Transient DNS failure (e.g. flaky resolver while checking the configured
+				// local hostname's A record). Surface as the "nodns" diagnostic code rather
+				// than a 503, matching the resolver-creation fallback above. The user can retry.
+				Err(Error::ServiceUnavailable(_)) => {
+					response.app_domain_error = "nodns".to_string();
 					if let Ok(Some(address)) =
 						resolve_domain_addresses(app_domain_to_validate, &resolver).await
 					{
