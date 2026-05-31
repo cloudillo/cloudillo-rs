@@ -199,8 +199,10 @@ pub(crate) async fn list(
 			// Specific folder (including "__trash__" / "__managed__" for those contents)
 			query.push(" AND f.parent_id=").push_bind(parent_id.as_str());
 		}
-	} else {
-		// Exclude trashed and managed files when no specific parent is requested
+	} else if opts.file_id.is_none() {
+		// Default browse listing (no targeted fileId): exclude trashed and managed
+		// files. A by-id lookup with no parentId deliberately skips this so it
+		// returns the file wherever it lives (managed or trash included).
 		query
 			.push(" AND (f.parent_id IS NULL OR f.parent_id NOT IN (")
 			.push_bind(cloudillo_types::meta_adapter::TRASH_PARENT_ID)
@@ -208,6 +210,8 @@ pub(crate) async fn list(
 			.push_bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
 			.push("))");
 	}
+	// else (fileId present, no parentId): no parent-folder predicate — return the
+	// file regardless of folder.
 
 	// Exclude files inside a specific folder (used by the "outside this
 	// folder" probe). `parent_id IS NULL` rows are kept (they live at root,

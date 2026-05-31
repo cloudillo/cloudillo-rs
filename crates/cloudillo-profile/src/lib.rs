@@ -27,6 +27,7 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 pub fn init(app: &App) -> ClResult<()> {
 	app.scheduler.register::<media::TenantImageUpdaterTask>()?;
 	app.scheduler.register::<sync::ProfileRefreshBatchTask>()?;
+	app.scheduler.register::<sync::ProfilePicSyncTask>()?;
 	Ok(())
 }
 

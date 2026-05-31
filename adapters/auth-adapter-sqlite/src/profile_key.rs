@@ -14,12 +14,16 @@ use cloudillo_types::{auth_adapter::AuthKey, prelude::*};
 
 /// List all profile keys for a tenant
 pub(crate) async fn list_profile_keys(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<AuthKey>> {
-	let res = sqlx::query("SELECT key_id, public_key, expires_at FROM keys WHERE tn_id = ?1")
-		.bind(tn_id.0)
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	// ORDER BY key_id so the `keys` array (hashed into the /api/me content ETag)
+	// has a stable order, preventing ETag flapping / spurious 200s.
+	let res = sqlx::query(
+		"SELECT key_id, public_key, expires_at FROM keys WHERE tn_id = ?1 ORDER BY key_id",
+	)
+	.bind(tn_id.0)
+	.fetch_all(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
 
 	collect_res(res.iter().map(|row| {
 		Ok(AuthKey {

@@ -234,6 +234,9 @@ pub async fn put_community_profile(
 			},
 		)
 		.await?;
+	// The community tenant's own profile (`type`/`profile_pic`) just changed →
+	// drop its cached /api/me so federation peers see the new state immediately.
+	app.profile_me.invalidate(community_tn_id);
 
 	// 5a. Enable auto-approve for incoming posts from connected users.
 	// Route through `app.settings.set` (not the raw meta adapter) so the

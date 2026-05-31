@@ -211,22 +211,19 @@ pub fn get_best_file_variant<'a, S: AsRef<str> + Debug + Eq>(
 		(None, "orig")
 	};
 
-	// Filter variants by class if specified
-	let class_filtered: Vec<_> = if let Some(class) = requested_class {
-		variants
-			.iter()
-			.filter(|v| {
-				if let Some(parsed) = Variant::parse(v.variant.as_ref()) {
-					parsed.class == class
-				} else {
-					// Legacy variants are assumed to be Visual
-					class == VariantClass::Visual
-				}
-			})
-			.collect()
-	} else {
-		variants.iter().collect()
-	};
+	// Filter to locally-available variants, then by class. Unavailable
+	// (metadata-only) variants must not short-circuit the quality fallback —
+	// otherwise a requested-but-unfetched variant is selected and its missing
+	// blob 404s instead of serving the closest variant that is on disk.
+	let class_filtered: Vec<_> = variants
+		.iter()
+		.filter(|v| v.available)
+		.filter(|v| match requested_class {
+			Some(class) => Variant::parse(v.variant.as_ref())
+				.map_or(class == VariantClass::Visual, |p| p.class == class),
+			None => true,
+		})
+		.collect();
 
 	let best = match requested_quality {
 		"tn" => find_variant(&class_filtered, "tn")
@@ -261,6 +258,19 @@ pub fn get_best_file_variant<'a, S: AsRef<str> + Debug + Eq>(
 			.ok_or(Error::NotFound),
 		_ => Err(Error::NotFound),
 	};
+
+	// Final safety net: the named quality chains do not all reference every
+	// variant (e.g. `hd`/`md`/`xd`/`orig` never mention `pf`). When the only
+	// locally-available variant is off-chain — as with a sync'd profile pic
+	// where just `vis.pf` was fetched — serve the best available variant in
+	// the class rather than 404ing.
+	let best = best.or_else(|_| {
+		class_filtered
+			.iter()
+			.max_by_key(|v| u64::from(v.resolution.0) * u64::from(v.resolution.1))
+			.copied()
+			.ok_or(Error::NotFound)
+	});
 
 	debug!("best variant: {:?}", best);
 	best
@@ -506,6 +516,159 @@ mod tests {
 		// No match
 		assert!(!variant_matches("vis.sd", "hd"));
 		assert!(!variant_matches("sd", "hd"));
+	}
+
+	#[test]
+	fn test_get_best_file_variant_skips_unavailable() {
+		// vis.hd is present in metadata but its blob was never fetched locally
+		// (available: false); vis.tn is on disk (available: true). Requesting
+		// vis.hd must fall back to the available vis.tn instead of selecting the
+		// unavailable vis.hd (whose blob would 404) or returning NotFound.
+		let variants = vec![
+			meta_adapter::FileVariant {
+				variant: "vis.hd",
+				variant_id: "b1~hdblob",
+				format: "webp",
+				size: 102400,
+				resolution: (1920, 1080),
+				available: false,
+				global: false,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+			meta_adapter::FileVariant {
+				variant: "vis.tn",
+				variant_id: "b1~tnblob",
+				format: "webp",
+				size: 2048,
+				resolution: (128, 128),
+				available: true,
+				global: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+		];
+
+		let selector =
+			GetFileVariantSelector { variant: Some("vis.hd".to_string()), ..Default::default() };
+		let best = get_best_file_variant(&variants, &selector).unwrap();
+		assert_eq!(best.variant, "vis.tn");
+		assert_eq!(best.variant_id, "b1~tnblob");
+	}
+
+	#[test]
+	fn test_get_best_file_variant_prefers_available_requested() {
+		// When the requested variant's blob is local, it is served as-is.
+		let variants = vec![
+			meta_adapter::FileVariant {
+				variant: "vis.hd",
+				variant_id: "b1~hdblob",
+				format: "webp",
+				size: 102400,
+				resolution: (1920, 1080),
+				available: true,
+				global: false,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+			meta_adapter::FileVariant {
+				variant: "vis.tn",
+				variant_id: "b1~tnblob",
+				format: "webp",
+				size: 2048,
+				resolution: (128, 128),
+				available: true,
+				global: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+		];
+
+		let selector =
+			GetFileVariantSelector { variant: Some("vis.hd".to_string()), ..Default::default() };
+		let best = get_best_file_variant(&variants, &selector).unwrap();
+		assert_eq!(best.variant, "vis.hd");
+	}
+
+	#[test]
+	fn test_get_best_file_variant_falls_back_to_only_available_pf() {
+		// Sync'd profile pic where only the off-chain `vis.pf` blob was fetched
+		// locally; hd/md/sd/tn are present in metadata but unavailable. The `hd`
+		// quality chain never references `pf`, so the safety net must serve the
+		// only available variant instead of 404ing.
+		let mut variants = vec![
+			meta_adapter::FileVariant {
+				variant: "vis.hd",
+				variant_id: "b1~hdblob",
+				format: "webp",
+				size: 87572,
+				resolution: (1536, 1536),
+				available: false,
+				global: false,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+			meta_adapter::FileVariant {
+				variant: "vis.md",
+				variant_id: "b1~mdblob",
+				format: "webp",
+				size: 70692,
+				resolution: (1280, 1280),
+				available: false,
+				global: false,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+			meta_adapter::FileVariant {
+				variant: "vis.sd",
+				variant_id: "b1~sdblob",
+				format: "webp",
+				size: 33288,
+				resolution: (720, 720),
+				available: false,
+				global: false,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+			meta_adapter::FileVariant {
+				variant: "vis.tn",
+				variant_id: "b1~tnblob",
+				format: "webp",
+				size: 7424,
+				resolution: (256, 256),
+				available: false,
+				global: false,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+			meta_adapter::FileVariant {
+				variant: "vis.pf",
+				variant_id: "b1~pfblob",
+				format: "avif",
+				size: 1366,
+				resolution: (80, 80),
+				available: true,
+				global: true,
+				duration: None,
+				bitrate: None,
+				page_count: None,
+			},
+		];
+		variants.sort();
+
+		let selector =
+			GetFileVariantSelector { variant: Some("vis.hd".to_string()), ..Default::default() };
+		let best = get_best_file_variant(&variants, &selector).unwrap();
+		assert_eq!(best.variant, "vis.pf");
+		assert_eq!(best.variant_id, "b1~pfblob");
 	}
 }
 

@@ -5,7 +5,7 @@
 
 use crate::prelude::*;
 use cloudillo_core::request::ConditionalResult;
-use cloudillo_core::scheduler::Task;
+use cloudillo_core::scheduler::{RetryPolicy, Task, TaskId};
 use cloudillo_types::meta_adapter::{
 	ProfileConnectionStatus, ProfileStatus, ProfileType, UpsertProfileFields, UpsertResult,
 };
@@ -58,11 +58,14 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 	// Fetch profile from remote instance
 	tracing::info!("Syncing profile {} from remote instance", id_tag);
 
-	let fetch_result: ClResult<ApiResponse<ProfileBase>> =
-		app.request.get_noauth(tn_id, id_tag, "/me").await;
+	// Use the conditional request (auth-less, like the old `get_noauth`) so we
+	// capture the *real* etag from the response instead of a synthetic value.
+	// No stored etag yet → `None` → a normal 200 with the peer's etag.
+	let result: ClResult<ConditionalResult<ApiResponse<ProfileBase>>> =
+		app.request.get_conditional(id_tag, "/me", None).await;
 
-	match fetch_result {
-		Ok(api_response) => {
+	match result {
+		Ok(ConditionalResult::Modified { data: api_response, etag: new_etag }) => {
 			let remote = api_response.data;
 
 			// Determine profile type
@@ -71,39 +74,25 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 				_ => ProfileType::Person,
 			};
 
-			// Sync profile picture FIRST if present, before creating profile
-			// Only include profile_pic in the profile if sync succeeds
-			let synced_profile_pic = if let Some(ref file_id) = remote.profile_pic {
-				match sync_profile_pic_variant(app, tn_id, id_tag, file_id).await {
-					Ok(()) => Some(file_id.as_str()),
-					Err(e) => {
-						tracing::warn!(
-							"Failed to sync profile picture for {}: {} (continuing without profile_pic)",
-							id_tag,
-							e
-						);
-						None
-					}
-				}
-			} else {
-				None
-			};
-
-			let etag = format!("sync-{}", Timestamp::now().0);
-
+			// Create the row WITHOUT profile_pic; the picture is fetched by a
+			// retryable background task (uniform with `refresh_profile`). Store
+			// the real etag if the peer provided one, otherwise leave it empty
+			// (`Patch::Null`) — never a synthetic `sync-<ts>` placeholder.
 			let fields = UpsertProfileFields {
 				name: Patch::Value(remote.name.clone().into()),
 				typ: Patch::Value(typ),
-				profile_pic: Patch::Value(synced_profile_pic.map(Into::into)),
 				synced: Patch::Value(true),
 				following: Patch::Value(false),
 				connected: Patch::Value(ProfileConnectionStatus::Disconnected),
-				etag: Patch::Value(etag.clone().into()),
+				etag: match new_etag.as_deref() {
+					Some(e) => Patch::Value(e.into()),
+					None => Patch::Null,
+				},
 				..Default::default()
 			};
 
-			let result = app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
-			let created = matches!(result, UpsertResult::Created);
+			let upsert_result = app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
+			let created = matches!(upsert_result, UpsertResult::Created);
 			if created {
 				tracing::info!("Successfully synced profile {} from remote", id_tag);
 			} else {
@@ -112,7 +101,25 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 					id_tag
 				);
 			}
+
+			// Fetch the picture inline first; on success advance `profile_pic`.
+			// Transient failures fall back to the retryable background task.
+			if let Some(ref file_id) = remote.profile_pic
+				&& sync_or_enqueue_profile_pic(app, tn_id, id_tag, file_id).await?
+			{
+				let pic_fields = UpsertProfileFields {
+					profile_pic: Patch::Value(Some(file_id.clone().into())),
+					..Default::default()
+				};
+				app.meta_adapter.upsert_profile(tn_id, id_tag, &pic_fields).await?;
+			}
 			Ok(created)
+		}
+		Ok(ConditionalResult::NotModified) => {
+			// We sent no `If-None-Match`, so a 304 is unexpected; treat as
+			// "not created" and let the next scheduled refresh try again.
+			tracing::warn!("Unexpected 304 on first sync of profile {}", id_tag);
+			Ok(false)
 		}
 		Err(e) => {
 			tracing::warn!("Failed to fetch profile {} from remote: {}", id_tag, e);
@@ -167,6 +174,18 @@ pub async fn refresh_profile(
 			};
 
 			app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
+
+			// Preserve "broken picture" recovery: an unchanged profile returns
+			// 304, so the picture won't be re-examined here. If we hold a stored
+			// picture ref but its local `vis.pf` variant never landed, heal it.
+			// The stored `file_id` is unchanged, so only the variant blob needs
+			// healing — no `profile_pic` write; we ignore the returned bool.
+			if let Ok((_, p)) = app.meta_adapter.read_profile(tn_id, id_tag).await
+				&& let Some(file_id) = p.profile_pic.as_deref()
+				&& !local_profile_pic_present(app, tn_id, file_id).await
+			{
+				sync_or_enqueue_profile_pic(app, tn_id, id_tag, file_id).await?;
+			}
 			Ok(false)
 		}
 		Ok(ConditionalResult::Modified { data: api_response, etag: new_etag }) => {
@@ -179,7 +198,7 @@ pub async fn refresh_profile(
 				new_etag
 			);
 
-			// Read current profile to check if profile_pic changed
+			// Read current stored picture ref to detect a *changed* file_id.
 			let current_profile_pic = app
 				.meta_adapter
 				.read_profile(tn_id, id_tag)
@@ -187,48 +206,16 @@ pub async fn refresh_profile(
 				.ok()
 				.and_then(|(_, p)| p.profile_pic);
 
-			// Sync profile picture FIRST if it changed
-			// Only update profile_pic in database if sync succeeds
-			let profile_pic_changed =
-				remote.profile_pic.as_deref() != current_profile_pic.as_deref();
-			let profile_pic_synced = if profile_pic_changed {
-				if let Some(ref file_id) = remote.profile_pic {
-					if sync_profile_pic_variant(app, tn_id, id_tag, file_id).await.is_ok() {
-						true
-					} else {
-						// Error already logged in sync_file_variants
-						tracing::debug!("Keeping old profile picture for {}", id_tag);
-						false
-					}
-				} else {
-					// Remote has no profile pic - that's a valid sync
-					true
-				}
-			} else {
-				// No change needed
-				false
-			};
-
-			// File_id unchanged but the local vis.pf variant is missing — this
-			// is the "broken picture" case: initial pic sync failed, profile
-			// row has the right file_id, refresh sees no remote change and
-			// would skip the download. Retry the variant fetch silently;
-			// don't touch profile_pic fields either way.
-			if !profile_pic_changed
-				&& let Some(ref file_id) = remote.profile_pic
-				&& !local_profile_pic_present(app, tn_id, file_id).await
-				&& let Err(e) = sync_profile_pic_variant(app, tn_id, id_tag, file_id).await
-			{
-				tracing::debug!("Profile pic variant retry still failing for {}: {}", id_tag, e);
-			}
-
 			// Determine remote profile type
 			let typ = match remote.r#type.as_str() {
 				"community" => ProfileType::Community,
 				_ => ProfileType::Person,
 			};
 
-			// Build upsert - only include profile_pic if sync succeeded
+			// Metadata always advances — this bumps `synced_at`, keeping a
+			// reachable `/api/me` permanently out of the abandonment window.
+			// The etag is stored whenever the remote provided one, unconditional
+			// of picture sync (which is now a separate background job).
 			let mut fields = UpsertProfileFields {
 				name: Patch::Value(remote.name.clone().into()),
 				typ: Patch::Value(typ),
@@ -236,21 +223,36 @@ pub async fn refresh_profile(
 				status: reactivate_status,
 				..Default::default()
 			};
-
-			// Only update profile_pic if we successfully synced it (or it was removed)
-			if profile_pic_synced {
-				fields.profile_pic = Patch::Value(remote.profile_pic.clone().map(Into::into));
-			}
-
-			// Only update etag if profile_pic sync succeeded (or wasn't needed)
-			// This ensures we'll retry on next sync if the picture failed
-			if (profile_pic_synced || !profile_pic_changed)
-				&& let Some(etag) = new_etag.as_deref()
-			{
+			if let Some(etag) = new_etag.as_deref() {
 				fields.etag = Patch::Value(etag.into());
 			}
 
+			// Picture removed upstream → clear immediately (no blob needed).
+			// Otherwise leave `profile_pic` untouched (`Patch::Undefined`) so the
+			// previously rendered picture stays live until the task fetches the
+			// new one and writes the ref on success.
+			if remote.profile_pic.is_none() {
+				fields.profile_pic = Patch::Null;
+			}
+
 			app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
+
+			// Fetch the picture inline when the remote still has one and either
+			// the file_id changed or the local `vis.pf` variant is missing; on
+			// success advance `profile_pic`. Transient failures fall back to the
+			// retryable background task.
+			if let Some(ref file_id) = remote.profile_pic {
+				let changed = current_profile_pic.as_deref() != Some(file_id.as_str());
+				if (changed || !local_profile_pic_present(app, tn_id, file_id).await)
+					&& sync_or_enqueue_profile_pic(app, tn_id, id_tag, file_id).await?
+				{
+					let pic_fields = UpsertProfileFields {
+						profile_pic: Patch::Value(Some(file_id.clone().into())),
+						..Default::default()
+					};
+					app.meta_adapter.upsert_profile(tn_id, id_tag, &pic_fields).await?;
+				}
+			}
 
 			Ok(true)
 		}
@@ -354,6 +356,151 @@ async fn sync_profile_pic_variant(
 			file_id
 		);
 		Err(Error::NotFound)
+	}
+}
+
+/// Enqueue a retryable background sync of a profile's picture variant.
+///
+/// Deduped on `(tn_id, id_tag, file_id)` so repeated refreshes for the same
+/// profile's picture collapse to a single task, while two distinct profiles that
+/// happen to share a content-addressed `file_id` get separate tasks rather than
+/// one clobbering the other's params; a refresh that observes a *new* file_id schedules
+/// a distinct task that overwrites `profile_pic` on success. Bounded backoff
+/// (30s → 30m, 6 attempts) handles transient failures without hammering a
+/// remote, and `NotFound` stops immediately (see `ProfilePicSyncTask::run`).
+async fn enqueue_profile_pic_sync(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	file_id: &str,
+) -> ClResult<()> {
+	let task = ProfilePicSyncTask::new(tn_id, id_tag.into(), file_id.into());
+	app.scheduler
+		.task(task)
+		.key(format!("profile.pic_sync:{},{},{}", tn_id.0, id_tag, file_id))
+		.with_retry(RetryPolicy::new((30, 1800), 6))
+		.schedule()
+		.await?;
+	Ok(())
+}
+
+/// Sync a profile picture variant inline; on a transient failure, fall back to the
+/// retryable `ProfilePicSyncTask`. Returns `true` when `vis.pf` is present locally
+/// afterward (so the caller may advance `profile_pic`).
+async fn sync_or_enqueue_profile_pic(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	file_id: &str,
+) -> ClResult<bool> {
+	match sync_profile_pic_variant(app, tn_id, id_tag, file_id).await {
+		Ok(()) => Ok(true),
+		Err(Error::NotFound) => {
+			// Variant genuinely absent in the remote descriptor — permanent; don't retry.
+			info!("Profile picture {} for {} not found; keeping previous picture", file_id, id_tag);
+			Ok(false)
+		}
+		Err(e) => {
+			// Transient (network/timeout/etc.) → hand off to the retryable task.
+			debug!("Inline profile-pic sync for {} failed ({}); enqueuing retry task", id_tag, e);
+			enqueue_profile_pic_sync(app, tn_id, id_tag, file_id).await?;
+			Ok(false)
+		}
+	}
+}
+
+/// Background task that fetches a profile's `vis.pf` picture variant and, on
+/// success, writes `profile_pic` to the freshly-synced `file_id`.
+///
+/// This is the retry fallback for transient inline-sync failures: callers try
+/// `sync_or_enqueue_profile_pic` (which syncs inline first) and this task only
+/// runs when the inline fetch fails transiently. Decoupled from metadata sync so
+/// a picture-fetch hiccup never blocks profile freshness or keeps the row
+/// eligible for abandonment. The previously rendered picture stays live until
+/// this task succeeds — `profile_pic` is only ever advanced to a reference we
+/// can actually render.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProfilePicSyncTask {
+	tn_id: TnId,
+	id_tag: Box<str>,
+	file_id: Box<str>,
+}
+
+impl ProfilePicSyncTask {
+	pub fn new(tn_id: TnId, id_tag: Box<str>, file_id: Box<str>) -> Arc<Self> {
+		Arc::new(Self { tn_id, id_tag, file_id })
+	}
+}
+
+#[async_trait]
+impl Task<App> for ProfilePicSyncTask {
+	fn kind() -> &'static str {
+		"profile.pic_sync"
+	}
+	fn kind_of(&self) -> &'static str {
+		Self::kind()
+	}
+
+	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
+		let task: ProfilePicSyncTask = serde_json::from_str(ctx)?;
+		Ok(Arc::new(task))
+	}
+
+	fn serialize(&self) -> String {
+		serde_json::to_string(self).unwrap_or_else(|e| {
+			error!("Failed to serialize ProfilePicSyncTask: {}", e);
+			"{}".to_string()
+		})
+	}
+
+	async fn run(&self, app: &App) -> ClResult<()> {
+		match sync_profile_pic_variant(app, self.tn_id, &self.id_tag, &self.file_id).await {
+			Ok(()) => {
+				// Advance profile_pic only if the row still exists, so a future
+				// profile-delete path can't be resurrected as a nameless stub by a
+				// late-running task (upsert_profile is INSERT-on-conflict).
+				if app.meta_adapter.read_profile(self.tn_id, &self.id_tag).await.is_ok() {
+					let fields = UpsertProfileFields {
+						profile_pic: Patch::Value(Some(self.file_id.clone())),
+						..Default::default()
+					};
+					app.meta_adapter.upsert_profile(self.tn_id, &self.id_tag, &fields).await?;
+					debug!(
+						"Profile picture synced for {} (file_id: {})",
+						self.id_tag, self.file_id
+					);
+				} else {
+					debug!(
+						"Profile {} gone; skipping profile_pic write for {}",
+						self.id_tag, self.file_id
+					);
+				}
+				Ok(())
+			}
+			Err(Error::NotFound) => {
+				// Permanent: the descriptor/variant is genuinely absent or the
+				// file 404s. Keep the previous picture and stop retrying — the
+				// scheduler retries on any `Err`, so returning `Ok` abandons it.
+				info!(
+					"Profile picture {} for {} not found; keeping previous picture (no retry)",
+					self.file_id, self.id_tag
+				);
+				Ok(())
+			}
+			Err(e) => {
+				// Transient (network/timeout/etc.) → reschedule with backoff.
+				Err(e)
+			}
+		}
+	}
+
+	async fn on_failed(&self, _app: &App, attempts: u16, last_error: &str) {
+		// Bounded transient retries exhausted. Leave `profile_pic` untouched so
+		// the previously rendered picture stays live.
+		warn!(
+			"Profile picture sync for {} (file_id: {}) abandoned after {} transient attempts: {}",
+			self.id_tag, self.file_id, attempts, last_error
+		);
 	}
 }
 

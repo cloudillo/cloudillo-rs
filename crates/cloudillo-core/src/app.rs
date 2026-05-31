@@ -12,6 +12,7 @@ use std::{
 
 use crate::extensions::Extensions;
 use crate::prelude::*;
+use crate::profile_me_cache::ProfileMeCache;
 use crate::proxy_token_cache::ProxyTokenCache;
 use crate::{abac, request, scheduler, ws_broadcast::BroadcastManager};
 
@@ -41,6 +42,7 @@ pub struct AppState {
 	pub worker: Arc<worker::WorkerPool>,
 	pub request: request::Request,
 	pub proxy_tokens: Arc<ProxyTokenCache>,
+	pub profile_me: Arc<ProfileMeCache>,
 	pub acme_challenge_map: RwLock<HashMap<Box<str>, Box<str>>>,
 	pub certs: RwLock<HashMap<Box<str>, Arc<CertifiedKey>>>,
 	pub opts: AppBuilderOpts,

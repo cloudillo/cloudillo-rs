@@ -3,7 +3,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+	Json,
+	body::Body,
+	extract::State,
+	http::{HeaderMap, StatusCode, header},
+	response::Response,
+};
 
 use crate::prelude::*;
 use cloudillo_core::IdTag;
@@ -85,6 +91,40 @@ fn filter_sections(x: HashMap<Box<str>, Box<str>>, tier: RequesterTier) -> HashM
 	out
 }
 
+/// Format a hash as a strong ETag per RFC 7232 §2.3 — the surrounding quotes
+/// are mandatory. Kept byte-identical to `cloudillo_dav::http::etag_header` so
+/// behavior can't drift (inlined rather than taking a `cloudillo-dav` dep).
+fn etag_header(etag: &str) -> String {
+	format!("\"{etag}\"")
+}
+
+/// Strip the surrounding double quotes from an ETag header value per RFC 7232
+/// §2.3, so comparisons are always against the opaque-tag bytes themselves.
+/// Kept byte-identical to `cloudillo_dav::http::unquote_etag`.
+fn unquote_etag(s: &str) -> &str {
+	let t = s.trim();
+	t.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(t)
+}
+
+/// Compute a stable, content-derived ETag for a serialized `ProfileBase`.
+///
+/// Uses SHA-256 (the platform's existing content-hash primitive, via the `sha2`
+/// crate) truncated to 64 bits and base64url-encoded — the same `URL_SAFE_NO_PAD`
+/// alphabet the content-addressing `Hasher` uses (`cloudillo_types::hasher`), and
+/// safe to embed verbatim in an ETag value. SHA-256 has a fixed, specified output
+/// identical across Rust versions, platforms, and restarts, so a follower's
+/// `If-None-Match` keeps matching as long as the content is unchanged — unlike
+/// `std::hash::DefaultHasher`, which is deterministic today but carries no
+/// cross-version stability guarantee. Because `ProfileBase` carries `name`,
+/// `type`, `profile_pic`, **and** `keys`, the digest changes on any of them —
+/// including signing-key rotation — with no extra inputs.
+fn compute_etag(bytes: &[u8]) -> String {
+	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+	use sha2::{Digest, Sha256};
+	let digest = Sha256::digest(bytes);
+	URL_SAFE_NO_PAD.encode(&digest[..8])
+}
+
 /// `GET /api/me` — terse self-profile for federation peers.
 ///
 /// Intentionally does not consult `OptionalAuth`: peers fetch this
@@ -93,17 +133,43 @@ fn filter_sections(x: HashMap<Box<str>, Box<str>>, tier: RequesterTier) -> HashM
 /// clients should call `/api/me/full` to get `x` and `cover_pic` with tier
 /// filtering applied. Do not add an auth extractor here — that would
 /// re-introduce the leakage `ProfileBase` was added to avoid.
+///
+/// Serves a content-derived `ETag` from an in-memory `ProfileMeCache` so the
+/// frequent follower polls answer `304 Not Modified` without a meta-adapter
+/// read. The cache stores only the ETag; the `ProfileBase` body is rebuilt on
+/// every `200` and re-wrapped in a fresh `ApiResponse` carrying the current
+/// `reqId`. The ETag is computed over the serialized `ProfileBase`, so a `304`
+/// is consistent with the body a `200` would have produced.
 pub async fn get_tenant_profile_base(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
 	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<ProfileBase>>)> {
-	// `AuthProfile` carries `tn_id`, so a single `read_tenant` lookup feeds
-	// both the auth-side and meta-side reads — no need for a parallel
-	// `read_tn_id` call against the same tenants row.
+	headers: HeaderMap,
+) -> ClResult<Response> {
 	let auth_profile = app.auth_adapter.read_tenant(&id_tag).await?;
-	let tenant_meta = app.meta_adapter.read_tenant(auth_profile.tn_id).await?;
+	let tn_id = auth_profile.tn_id;
 
+	let if_none_match = headers
+		.get(header::IF_NONE_MATCH)
+		.and_then(|v| v.to_str().ok())
+		.map(|s| unquote_etag(s).to_string());
+
+	// Fast path: cached etag matches the conditional request → 304, no meta read.
+	if let Some(ref inm) = if_none_match
+		&& let Some(cached) = app.profile_me.get(tn_id)
+		&& inm.as_str() == &*cached
+	{
+		// Sliding expiry: a hot tenant under constant polling stays warm instead
+		// of expiring every TTL and paying a full auth + meta rebuild.
+		app.profile_me.touch(tn_id);
+		return Response::builder()
+			.status(StatusCode::NOT_MODIFIED)
+			.header(header::ETAG, etag_header(&cached))
+			.body(Body::empty())
+			.map_err(|e| Error::Internal(format!("failed to build 304 response: {}", e)));
+	}
+
+	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
 	let profile = ProfileBase {
 		id_tag: auth_profile.id_tag.to_string(),
 		name: tenant_meta.name.to_string(),
@@ -111,13 +177,30 @@ pub async fn get_tenant_profile_base(
 		profile_pic: tenant_meta.profile_pic.map(|s| s.to_string()),
 		keys: auth_profile.keys,
 	};
+	let body = serde_json::to_vec(&profile)?;
+	let etag = compute_etag(&body);
+	app.profile_me.insert(tn_id, etag.clone().into());
+
+	// Cold/expired cache but content unchanged → still 304.
+	if if_none_match.as_deref() == Some(etag.as_str()) {
+		return Response::builder()
+			.status(StatusCode::NOT_MODIFIED)
+			.header(header::ETAG, etag_header(&etag))
+			.body(Body::empty())
+			.map_err(|e| Error::Internal(format!("failed to build 304 response: {}", e)));
+	}
 
 	let mut response = ApiResponse::new(profile);
 	if let Some(id) = req_id {
 		response = response.with_req_id(id);
 	}
-
-	Ok((StatusCode::OK, Json(response)))
+	let json = serde_json::to_vec(&response)?;
+	Response::builder()
+		.status(StatusCode::OK)
+		.header(header::CONTENT_TYPE, "application/json")
+		.header(header::ETAG, etag_header(&etag))
+		.body(Body::from(json))
+		.map_err(|e| Error::Internal(format!("failed to build 200 response: {}", e)))
 }
 
 pub async fn get_tenant_profile(

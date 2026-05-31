@@ -12,11 +12,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
-use cloudillo_core::extract::Auth;
+use cloudillo_core::extract::{Auth, OptionalRequestId};
 use cloudillo_types::meta_adapter::{
 	ProfileStatus, ProfileTrust, UpdateProfileData, UpdateTenantData, UpsertProfileFields,
 };
-use cloudillo_types::types::{AdminProfilePatch, ProfileInfo, ProfilePatch};
+use cloudillo_types::types::{AdminProfilePatch, ApiResponse, ProfileInfo, ProfilePatch};
 
 #[derive(Serialize)]
 pub struct UpdateProfileResponse {
@@ -60,6 +60,8 @@ pub async fn patch_own_profile(
 	let tenant_update =
 		UpdateTenantData { name: patch.name.map(Into::into), x: patch.x, ..Default::default() };
 	app.meta_adapter.update_tenant(tn_id, &tenant_update).await?;
+	// `name`/`x` just changed → drop the cached /api/me so peers see it now.
+	app.profile_me.invalidate(tn_id);
 
 	// Fetch updated profile and tenant data (for x field)
 	let profile_data = app.meta_adapter.get_profile_info(tn_id, &auth.id_tag).await?;
@@ -235,6 +237,75 @@ pub async fn patch_profile_relationship(
 
 	info!("User {} updated relationship with {}", auth.id_tag, id_tag);
 	Ok(StatusCode::OK)
+}
+
+/// POST /profiles/:idTag/refresh — force an immediate re-sync of the caller's
+/// local mirror of `id_tag` from its home server, bypassing the scheduled
+/// staleness/abandonment window.
+///
+/// The scheduled `ProfileRefreshBatchTask` stops attempting a mirror once it is
+/// flipped to `Suspended` — `refresh_profile`'s error branch suspends a
+/// continuously-failing profile after `DEACTIVATE_AFTER_DAYS`, and
+/// `list_stale_profiles` excludes `Suspended` rows from the batch. This is the
+/// explicit, on-demand recovery path for such a row: a forced, unconditional
+/// `refresh_profile(.., None)` that re-fetches `/me`, re-syncs the `vis.pf`
+/// picture variant, stores `profile_pic`, bumps `synced_at` back to now, and
+/// recovers `S → A` on success (an admin un-suspend is the other recovery path).
+pub async fn post_profile_refresh(
+	State(app): State<App>,
+	Auth(auth): Auth,
+	Path(id_tag): Path<String>,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<ProfileInfo>>)> {
+	let tn_id = auth.tn_id;
+
+	// Only refresh a profile the caller already tracks (a real relationship),
+	// so this can't be used to force arbitrary remote fetches.
+	app.meta_adapter
+		.read_profile(tn_id, &id_tag)
+		.await
+		.map_err(|_| Error::NotFound)?;
+
+	// Forced, unconditional refresh (etag = None → full fetch + picture re-sync).
+	// Soft-fail: still return current state so the client can retry (covers the
+	// async variant-generation race right after a fresh upload).
+	if let Err(e) = crate::sync::refresh_profile(&app, tn_id, &id_tag, None).await {
+		warn!(id_tag = %id_tag, error = %e, "Forced profile refresh failed; returning current cached state");
+	}
+
+	// Build the response from the (possibly just-updated) cache row, mirroring
+	// the mapping in `patch_profile_admin`.
+	let profile_data = app.meta_adapter.get_profile_info(tn_id, &id_tag).await?;
+
+	let status = profile_data.status.as_deref().and_then(|s| match s {
+		"A" => Some(ProfileStatus::Active),
+		"B" => Some(ProfileStatus::Blocked),
+		"M" => Some(ProfileStatus::Muted),
+		"S" => Some(ProfileStatus::Suspended),
+		"X" => Some(ProfileStatus::Banned),
+		_ => None,
+	});
+
+	let profile = ProfileInfo {
+		id_tag: profile_data.id_tag.to_string(),
+		name: profile_data.name.to_string(),
+		r#type: Some(profile_type_label(&profile_data.r#type).to_string()),
+		profile_pic: profile_data.profile_pic.map(|s| s.to_string()),
+		status,
+		connected: None,
+		following: None,
+		trust: None,
+		roles: None,
+		created_at: Some(profile_data.created_at),
+		x: None,
+	};
+
+	info!("User {} forced refresh of profile {}", auth.id_tag, id_tag);
+	let mut response = ApiResponse::new(profile);
+	if let Some(id) = req_id {
+		response = response.with_req_id(id);
+	}
+	Ok((StatusCode::OK, Json(response)))
 }
 
 // vim: ts=4

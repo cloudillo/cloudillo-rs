@@ -8,9 +8,10 @@
 
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{
-	CreateFile, ListActionOptions, ListFileOptions, ListTaskOptions, MetaAdapter,
+	CreateFile, ListActionOptions, ListFileOptions, ListTaskOptions, MetaAdapter, ProfileStatus,
+	ProfileType, UpsertProfileFields,
 };
-use cloudillo_types::types::TnId;
+use cloudillo_types::types::{Patch, TnId};
 use cloudillo_types::worker::WorkerPool;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -192,6 +193,48 @@ async fn test_list_files_not_parent_id_nonexistent_passes_all() {
 }
 
 #[tokio::test]
+async fn test_list_files_by_id_includes_managed() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "test_user").await.ok();
+
+	make_file(&adapter, tn_id, "f_mgd", "avatar.png", Some("__managed__")).await;
+
+	// By-id lookup without parent_id must return the managed file.
+	let opts = ListFileOptions { file_id: Some(vec!["f_mgd".into()]), ..Default::default() };
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let names: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	assert!(names.iter().any(|n| n == "f_mgd"), "by-id lookup should return managed file");
+
+	// A plain browse must NOT return the managed file.
+	let opts = ListFileOptions { file_name: Some("avatar".into()), ..Default::default() };
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let names: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	assert!(!names.iter().any(|n| n == "f_mgd"), "browse must exclude managed file");
+}
+
+#[tokio::test]
+async fn test_list_files_by_id_includes_trash() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "test_user").await.ok();
+
+	make_file(&adapter, tn_id, "f_trash", "deleted.txt", Some("__trash__")).await;
+
+	// By-id lookup without parent_id must return the trashed file.
+	let opts = ListFileOptions { file_id: Some(vec!["f_trash".into()]), ..Default::default() };
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let names: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	assert!(names.iter().any(|n| n == "f_trash"), "by-id lookup should return trashed file");
+
+	// A plain browse must NOT return the trashed file.
+	let opts = ListFileOptions { file_name: Some("deleted".into()), ..Default::default() };
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let names: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	assert!(!names.iter().any(|n| n == "f_trash"), "browse must exclude trashed file");
+}
+
+#[tokio::test]
 async fn test_list_tasks() {
 	let (adapter, _temp) = create_test_adapter().await;
 
@@ -207,4 +250,36 @@ async fn test_list_tasks() {
 		// May be empty initially
 		let _ = tasks; // Just verify we got a result
 	}
+}
+
+#[tokio::test]
+async fn test_list_stale_profiles_excludes_suspended() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "test_user").await.ok();
+
+	// Both rows are stale: `synced` is left `Undefined`, so `synced_at` stays
+	// NULL, which qualifies as stale and within the give-up window.
+	let active =
+		UpsertProfileFields { typ: Patch::Value(ProfileType::Person), ..Default::default() };
+	adapter.upsert_profile(tn_id, "alice", &active).await.expect("upsert active");
+
+	let suspended = UpsertProfileFields {
+		typ: Patch::Value(ProfileType::Person),
+		status: Patch::Value(ProfileStatus::Suspended),
+		..Default::default()
+	};
+	adapter
+		.upsert_profile(tn_id, "bob", &suspended)
+		.await
+		.expect("upsert suspended");
+
+	let stale = adapter
+		.list_stale_profiles(0, 7 * 86400, 100)
+		.await
+		.expect("list stale profiles");
+	let id_tags: Vec<String> = stale.iter().map(|(_, id_tag, _)| id_tag.to_string()).collect();
+
+	assert!(id_tags.iter().any(|t| t == "alice"), "active stale profile must be returned");
+	assert!(!id_tags.iter().any(|t| t == "bob"), "suspended profile must be excluded");
 }

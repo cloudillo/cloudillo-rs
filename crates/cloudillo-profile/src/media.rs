@@ -72,6 +72,10 @@ impl Task<App> for TenantImageUpdaterTask {
 		};
 
 		app.meta_adapter.update_tenant(self.tn_id, &update).await?;
+		// `profile_pic`/`cover_pic` just changed → drop the cached /api/me. This
+		// is the point where the data truly lands (the HTTP handler only schedules
+		// this task), so invalidating here covers both image types correctly.
+		app.profile_me.invalidate(self.tn_id);
 
 		info!("Updated tenant {} {:?} to {}", self.tn_id, self.image_type, file_id);
 		Ok(())
@@ -138,6 +142,8 @@ pub async fn put_profile_image(
 					},
 				)
 				.await?;
+			// profile_pic changed on the dedup fast path → invalidate cached /api/me.
+			app.profile_me.invalidate(auth.tn_id);
 			info!("User {} uploaded profile image (existing): {}", auth.id_tag, fid);
 			return Ok((
 				StatusCode::OK,
@@ -224,7 +230,9 @@ pub async fn put_cover_image(
 	let f_id = match f_id {
 		meta_adapter::FileId::FId(fid) => fid,
 		meta_adapter::FileId::FileId(fid) => {
-			// Already has a file_id (duplicate), use it directly
+			// Already has a file_id (duplicate), use it directly.
+			// Only `cover_pic` changes here, which is NOT part of `ProfileBase`
+			// (/api/me), so no `profile_me.invalidate` is needed.
 			app.meta_adapter
 				.update_tenant(
 					auth.tn_id,

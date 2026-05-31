@@ -199,6 +199,13 @@ fn init_protected_routes(app: App) -> Router<App> {
 		// --- Community Profile Creation ---
 		.route("/api/profiles/{id_tag}", put(profile::community::put_community_profile))
 
+		// --- Explicit Profile Mirror Refresh ---
+		// Forces an immediate re-sync of the caller's local mirror of {id_tag},
+		// bypassing the scheduled staleness/abandonment window. Auth-only: the
+		// handler checks the caller already tracks {id_tag} before refreshing
+		// (mirrors the /api/files/{file_id}/refresh precedent).
+		.route("/api/profiles/{id_tag}/refresh", post(profile::update::post_profile_refresh))
+
 		// --- Action API (Create + Write) ---
 		.merge(action_router_create)
 		.merge(action_router_write)

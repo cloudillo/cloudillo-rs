@@ -676,6 +676,10 @@ async fn generate_action_token(
 				// Key might be missing - create one and retry
 				info!("No signing key found for tenant {}, creating one automatically", tn_id.0);
 				app.auth_adapter.create_profile_key(tn_id, None).await?;
+				// New signing key minted long after the profile went live →
+				// the `keys` array in /api/me changed; drop the cached entry so
+				// followers pick up the new key on their next poll.
+				app.profile_me.invalidate(tn_id);
 				app.auth_adapter.create_action_token(tn_id, action_for_token).await?
 			}
 			Err(e) => return Err(e),

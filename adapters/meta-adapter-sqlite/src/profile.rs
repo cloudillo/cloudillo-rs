@@ -547,15 +547,27 @@ pub(crate) async fn add_public_key(
 
 /// List stale profiles that need refreshing
 ///
-/// Returns profiles where:
-/// - `synced_at IS NULL` (never-synced stub rows from relationship hooks), OR
-/// - `synced_at < now - max_age_secs` AND `synced_at >= now - disable_after_secs`
-///   (stale but not yet abandoned).
+/// Returns profiles that are:
+/// - stale — `synced_at IS NULL` (never-synced stub rows from relationship
+///   hooks) or `synced_at` older than `max_age_secs`, AND
+/// - within the give-up window — `synced_at IS NULL` or no older than
+///   `disable_after_secs`, AND
+/// - not `Suspended` (DB code `'S'`; `Active` is stored as NULL, so
+///   `status IS NULL` still passes).
 ///
-/// The upper bound is the "give up" cutoff: once a remote has been unreachable
-/// for longer than `disable_after_secs`, we stop hammering it from the batch
-/// task. The row stays in the DB and remains visible; manual reactivation
-/// (or a future explicit refresh endpoint) is required.
+/// The `disable_after_secs` upper bound is the "give up" cutoff: once a remote
+/// has been unreachable for longer than that, the batch stops hammering it.
+/// Independently, `refresh_profile`'s error branch flips a continuously-failing
+/// profile to `Suspended` after `DEACTIVATE_AFTER_DAYS` (1 day), and excluding
+/// `Suspended` rows here is what makes suspension actually *stop* sync attempts
+/// — so a permanently-unreachable peer is hammered for at most ~1 day, not
+/// forever. Recovery is the explicit `POST /api/profiles/{id_tag}/refresh`
+/// endpoint or an admin un-suspend; both call `refresh_profile` directly and
+/// recover `S → A` on the next successful fetch.
+///
+/// Note: never-synced stub rows (`synced_at IS NULL`) cannot be suspended by the
+/// error-branch logic (it requires a prior success timestamp), so a
+/// permanently-unreachable never-synced stub still retries each cycle.
 pub(crate) async fn list_stale_profiles(
 	db: &SqlitePool,
 	max_age_secs: i64,
@@ -566,6 +578,7 @@ pub(crate) async fn list_stale_profiles(
 		"SELECT tn_id, id_tag, etag FROM profiles
 		WHERE (synced_at IS NULL OR synced_at < unixepoch() - ?1)
 		  AND (synced_at IS NULL OR synced_at >= unixepoch() - ?2)
+		  AND (status IS NULL OR status != 'S')
 		LIMIT ?3",
 	)
 	.bind(max_age_secs)

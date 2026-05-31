@@ -108,6 +108,10 @@ pub async fn create_complete_tenant(
 				"Failed to create profile key");
 			e
 		})?;
+		// New signing key → the `keys` array in /api/me changed. Cache is cold at
+		// first creation, but this path also runs for IDP/community/domain
+		// registration; invalidate for correctness/uniformity.
+		app.profile_me.invalidate(tn_id);
 		info!("Profile key created");
 	}
 
@@ -154,6 +158,12 @@ pub async fn create_complete_tenant(
 		);
 		e
 	})?;
+
+	// `name` is part of `ProfileBase`, so a just-changed tenant display name must
+	// drop any cached /api/me. Cold on first bootstrap (harmless), but this
+	// function also runs the resume path for IDP/community/domain registration,
+	// where an existing tenant's /api/me may already be cached.
+	app.profile_me.invalidate(tn_id);
 
 	info!(display_name = %display_name, "Tenant display name set");
 
