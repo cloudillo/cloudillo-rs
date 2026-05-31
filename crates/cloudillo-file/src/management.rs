@@ -11,9 +11,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::dir_cache::DirCache;
 use crate::prelude::*;
 use cloudillo_core::abac::VisibilityLevel;
+use cloudillo_core::dir_cache::DirCache;
 use cloudillo_core::extract::{Auth, OptionalRequestId};
 use cloudillo_core::file_access;
 use cloudillo_types::meta_adapter::{self, UpdateFileOptions};
@@ -23,7 +23,7 @@ use cloudillo_types::utils;
 /// Best-effort DirCache eviction. Folders may not yet be in the cache; either
 /// way, dropping any stale entry keeps subsequent path-walks correct after a
 /// rename or move. Silently no-op if the extension is missing.
-fn invalidate_dir_cache(app: &App, tn_id: TnId, file_id: &str) {
+pub(crate) fn invalidate_dir_cache(app: &App, tn_id: TnId, file_id: &str) {
 	if let Ok(cache) = app.ext::<DirCache>() {
 		cache.invalidate(tn_id, file_id);
 	}

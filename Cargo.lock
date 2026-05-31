@@ -816,6 +816,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "cloudillo-meta-adapter-sqlite",
  "cloudillo-types",
  "croner",
  "flume",
@@ -837,6 +838,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tower",
@@ -964,6 +966,7 @@ version = "0.8.15"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "cloudillo-core",
  "cloudillo-email",
  "cloudillo-file",
@@ -975,6 +978,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "sha2 0.11.0",
  "tokio",
  "tracing",
 ]

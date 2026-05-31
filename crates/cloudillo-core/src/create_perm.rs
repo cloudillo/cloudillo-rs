@@ -45,6 +45,19 @@ async fn check_create_permission(
 ) -> Result<Response, Error> {
 	use tracing::warn;
 
+	// A file-write scope (share link with editor access) is itself the grant for
+	// file *creation* only; `check_scope_allows_create_in` in the file handler
+	// then enforces the subtree boundary and the owner's quota applies. Such
+	// guests have no role, so they would fail the contributor check below. The
+	// shortcut must NOT extend to action/app creation or trash emptying.
+	if crate::file_access::scope_grants_collection_op(
+		auth_ctx.scope.as_deref(),
+		resource_type,
+		action,
+	) {
+		return Ok(next.run(req).await);
+	}
+
 	// Check if user has a role that allows content creation
 	// Minimum role for creating content: "contributor"
 	if !auth_ctx.roles.iter().any(|r| r.as_ref() == "contributor") {

@@ -22,7 +22,6 @@ use crate::prelude::*;
 use crate::{
 	audio::AudioExtractorTask,
 	descriptor::{self, FileIdGeneratorTask},
-	dir_cache::{DirCache, DirEntry},
 	ffmpeg, filter, image,
 	image::ImageResizerTask,
 	pdf,
@@ -32,6 +31,7 @@ use crate::{
 	video::VideoTranscoderTask,
 };
 use cloudillo_core::abac::SubjectAccessLevel;
+use cloudillo_core::dir_cache::{DirCache, DirEntry};
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
 use cloudillo_core::file_access;
 use cloudillo_types::blob_adapter;
@@ -205,25 +205,18 @@ fn is_terminal_parent(parent_id: &str) -> bool {
 	parent_id == TRASH_PARENT_ID || parent_id == MANAGED_PARENT_ID
 }
 
-/// Resolve a single (tn, file_id) → DirEntry through the cache, falling back
-/// to a single read_file call on cache miss.
-async fn resolve_dir_entry(
+/// Best-effort folder resolve for breadcrumb/parent-name enrichment: a read
+/// error is logged and treated as "missing" so a transient fault degrades the
+/// breadcrumb instead of failing the listing. Authorization paths use the
+/// checked `file_access::resolve_dir_entry` directly.
+async fn resolve_dir_entry_best_effort(
 	app: &App,
 	cache: &DirCache,
 	tn_id: TnId,
 	file_id: &str,
 ) -> Option<DirEntry> {
-	if let Some(entry) = cache.get(tn_id, file_id) {
-		return Some(entry);
-	}
-	match app.meta_adapter.read_file(tn_id, file_id).await {
-		Ok(Some(view)) => {
-			let entry =
-				DirEntry { parent_id: view.parent_id.clone(), name: view.file_name.clone() };
-			cache.put(tn_id, file_id, entry.clone());
-			Some(entry)
-		}
-		Ok(None) => None,
+	match file_access::resolve_dir_entry(&app.meta_adapter, cache, tn_id, file_id).await {
+		Ok(entry) => entry,
 		Err(e) => {
 			warn!("dir_cache resolve failed for tn_id={} file_id={}: {}", tn_id, file_id, e);
 			None
@@ -239,6 +232,7 @@ async fn populate_parent_names(
 	cache: &DirCache,
 	tn_id: TnId,
 	files: &mut [meta_adapter::FileView],
+	share_root: Option<&str>,
 ) {
 	use std::collections::HashMap;
 
@@ -255,12 +249,15 @@ async fn populate_parent_names(
 
 	let mut resolved: HashMap<Box<str>, Box<str>> = HashMap::new();
 	for pid in &missing {
-		if let Some(entry) = resolve_dir_entry(app, cache, tn_id, pid).await {
+		if let Some(entry) = resolve_dir_entry_best_effort(app, cache, tn_id, pid).await {
 			resolved.insert(pid.clone(), entry.name.clone());
 		}
 	}
 
 	for f in files.iter_mut() {
+		if Some(f.file_id.as_ref()) == share_root {
+			continue; // do not disclose the share root's own parent
+		}
 		let Some(pid) = f.parent_id.as_deref() else { continue };
 		if is_terminal_parent(pid) {
 			continue;
@@ -273,25 +270,37 @@ async fn populate_parent_names(
 	}
 }
 
-/// Walk the parent chain iteratively (cap depth at 64) and produce a
-/// root→parent ordered path. The file itself is not included.
+/// Walk the parent chain iteratively (cap depth at `MAX_PARENT_DEPTH`) and
+/// produce a root→parent ordered path. The file itself is not included.
+///
+/// `stop_at`, when set, bounds the breadcrumb at a folder-share root: once the
+/// walk reaches that folder it pushes that segment (its name is already known
+/// to the guest) and stops, so ancestor folder names above the shared root are
+/// never disclosed to a share-link holder.
 async fn build_path(
 	app: &App,
 	cache: &DirCache,
 	tn_id: TnId,
 	start_parent_id: Option<&str>,
+	stop_at: Option<&str>,
 ) -> Vec<meta_adapter::PathSegment> {
-	const MAX_DEPTH: usize = 64;
 	let mut acc: Vec<meta_adapter::PathSegment> = Vec::new();
 	let mut current: Option<Box<str>> = start_parent_id.map(Box::from);
 
-	for _ in 0..MAX_DEPTH {
+	for _ in 0..file_access::MAX_PARENT_DEPTH {
 		let Some(cur) = current.take() else { break };
 		if is_terminal_parent(&cur) {
 			break;
 		}
-		let Some(entry) = resolve_dir_entry(app, cache, tn_id, &cur).await else { break };
+		let Some(entry) = resolve_dir_entry_best_effort(app, cache, tn_id, &cur).await else {
+			break;
+		};
 		acc.push(meta_adapter::PathSegment { id: cur.clone(), name: entry.name.clone() });
+		// Folder-share breadcrumb bound: stop at the share root rather than
+		// ascending into ancestors the guest has no grant on.
+		if Some(cur.as_ref()) == stop_at {
+			break;
+		}
 		current = entry.parent_id;
 	}
 
@@ -330,12 +339,97 @@ pub async fn get_file_list(
 		None => ("", false, &[][..], None),
 	};
 
-	// For scoped tokens, push scope constraint into the DB query
-	if let Some(scope_fid) = scope.and_then(TokenScope::parse).and_then(|ts| match ts {
-		TokenScope::File { file_id, .. } => Some(file_id),
-		TokenScope::ApkgPublish => None,
-	}) {
-		opts.scope_file_id = Some(scope_fid);
+	// For scoped tokens, push the scope constraint into the DB query.
+	//
+	// A document-tree scope (`file:<doc>:*`) constrains the listing to that tree
+	// via `scope_file_id` (matches `file_id` or `root_id`). A folder-share scope
+	// (`file:<folder>:*`) instead grants access across the folder's subtree:
+	//   - `parentId` within the subtree → browse: leave `scope_file_id` unset so
+	//     the `parent_id` predicate returns the folder's direct children.
+	//   - by-id lookup (`fileId`) → keep only the ids that are the folder or a
+	//     descendant of it and narrow the `file_id` predicate to those; drop the
+	//     out-of-subtree ids rather than failing the whole request (used for
+	//     folder metadata and the breadcrumb ancestor walk).
+	//   - a `parentId` browse outside the subtree → deny (constrain to the scope
+	//     tree, which yields an empty result for unrelated folders).
+	// Shared folder/path resolution reuses the DirCache. Hoisted here so the
+	// scope-subtree checks below and the later with_parent/with_path enrichment
+	// share the same memoized parent-chain hops.
+	let dir_cache = app.ext::<DirCache>()?.clone();
+
+	let mut folder_scope_level: Option<types::AccessLevel> = None;
+	// For folder-share requests, the breadcrumb walk is bounded at this folder so
+	// ancestor names above the share root are not disclosed (set in every folder
+	// branch below).
+	let mut folder_scope_root: Option<String> = None;
+	if let Some((scope_fid, scope_access)) =
+		scope.and_then(TokenScope::parse).and_then(|ts| match ts {
+			TokenScope::File { file_id, access } => Some((file_id, access)),
+			TokenScope::ApkgPublish => None,
+		}) {
+		let scope_is_folder =
+			file_access::scope_target_is_folder(&app.meta_adapter, &dir_cache, tn_id, &scope_fid)
+				.await?;
+
+		if scope_is_folder {
+			// Bound breadcrumbs at the share root regardless of which folder
+			// branch (browse / by-id / fallback) handles the request.
+			folder_scope_root = Some(scope_fid.clone());
+			if let Some(parent_id) = opts.parent_id.as_deref() {
+				// Browse case: only within the shared folder's subtree.
+				if parent_id == scope_fid
+					|| file_access::is_descendant_of(
+						&app.meta_adapter,
+						&dir_cache,
+						tn_id,
+						parent_id,
+						&scope_fid,
+					)
+					.await?
+				{
+					folder_scope_level = Some(scope_access);
+				} else {
+					// parentId outside the shared subtree — deny enumeration.
+					let response = ApiResponse::with_cursor_pagination(Vec::new(), None, false)
+						.with_req_id(req_id.unwrap_or_default());
+					return Ok((StatusCode::OK, Json(response)));
+				}
+			} else if let Some(ids) = opts.file_id.as_deref().filter(|ids| !ids.is_empty()) {
+				// By-id lookup (one or more): keep only ids that are the scoped
+				// folder itself or a descendant of it. Out-of-subtree ids are
+				// dropped rather than failing the whole request, so a mixed batch
+				// still returns the rows the share link legitimately covers.
+				let mut in_subtree: Vec<String> = Vec::with_capacity(ids.len());
+				for id in ids {
+					if id.as_str() == scope_fid
+						|| file_access::is_descendant_of(
+							&app.meta_adapter,
+							&dir_cache,
+							tn_id,
+							id,
+							&scope_fid,
+						)
+						.await?
+					{
+						in_subtree.push(id.clone());
+					}
+				}
+				if in_subtree.is_empty() {
+					// No requested id falls within the shared subtree.
+					let response = ApiResponse::with_cursor_pagination(Vec::new(), None, false)
+						.with_req_id(req_id.unwrap_or_default());
+					return Ok((StatusCode::OK, Json(response)));
+				}
+				opts.file_id = Some(in_subtree);
+				folder_scope_level = Some(scope_access);
+			} else {
+				// No parentId / fileId: fall back to the scope-tree constraint
+				// (returns only the folder's own row, matching document-scope).
+				opts.scope_file_id = Some(scope_fid);
+			}
+		} else {
+			opts.scope_file_id = Some(scope_fid);
+		}
 	}
 
 	// Push visibility filtering into SQL for correct pagination
@@ -364,8 +458,11 @@ pub async fn get_file_list(
 	// Share access: bypass visibility filter when the user has a share entry
 	// on the queried folder (parentId). Per-file share checks are handled
 	// individually by get_access_level in compute_file_access_levels.
-	let mut inherited_share: Option<types::AccessLevel> = None;
-	if !is_tenant
+	// A verified folder-share browse seeds the floor access for every child and
+	// bypasses visibility filtering (the share itself is the grant).
+	let mut inherited_share: Option<types::AccessLevel> = folder_scope_level;
+	if inherited_share.is_none()
+		&& !is_tenant
 		&& is_real_auth
 		&& let Some(ref parent_id) = opts.parent_id
 		&& parent_id != ROOT_PARENT_ID
@@ -404,13 +501,27 @@ pub async fn get_file_list(
 	// Optional enrichment: parent folder name (one level) and full path chain.
 	// Both are resolved via the shared DirCache extension.
 	if opts.with_parent || opts.with_path {
-		let dir_cache = app.ext::<DirCache>()?.clone();
 		if opts.with_parent {
-			populate_parent_names(&app, &dir_cache, tn_id, &mut filtered).await;
+			populate_parent_names(
+				&app,
+				&dir_cache,
+				tn_id,
+				&mut filtered,
+				folder_scope_root.as_deref(),
+			)
+			.await;
 		}
 		if opts.with_path {
 			for f in &mut filtered {
-				let segs = build_path(&app, &dir_cache, tn_id, f.parent_id.as_deref()).await;
+				// The shared-folder row itself must not disclose any ancestor above
+				// the share root, so start the walk from nothing for that row.
+				let start = if Some(f.file_id.as_ref()) == folder_scope_root.as_deref() {
+					None
+				} else {
+					f.parent_id.as_deref()
+				};
+				let segs =
+					build_path(&app, &dir_cache, tn_id, start, folder_scope_root.as_deref()).await;
 				f.path = Some(segs);
 			}
 		}
@@ -1151,8 +1262,18 @@ pub async fn post_file(
 
 	// Scope check first: cross-context placements have no `root_id`, so a
 	// scoped token (share link, scope `file:<id>:W`) cannot create them — and a
-	// scoped token creating a normal new file is bounded to the scoped root.
-	file_access::check_scope_allows_create(auth.scope.as_deref(), req.root_id.as_deref())?;
+	// scoped token creating a normal new file is bounded to the scoped root or,
+	// for folder share links, to the scoped folder's subtree.
+	let dir_cache = app.ext::<DirCache>()?;
+	file_access::check_scope_allows_create_in(
+		&app.meta_adapter,
+		dir_cache,
+		tn_id,
+		auth.scope.as_deref(),
+		req.effective_parent_id()?.as_deref(),
+		req.root_id.as_deref(),
+	)
+	.await?;
 
 	// Cross-context creation (Hand verbs: Pin / Place) routes through a dedicated
 	// branch before the normal new-blob path. Triggered by the presence of
@@ -1610,6 +1731,7 @@ pub async fn refresh_file(
 					..Default::default()
 				};
 				app.meta_adapter.update_file_data(tn_id, &file_id, &opts).await?;
+				crate::management::invalidate_dir_cache(&app, tn_id, &file_id);
 			}
 			// Source server populated access_level → cache it; otherwise preserve
 			// whatever we already had (older peer servers may omit the field).
@@ -1737,8 +1859,18 @@ pub async fn post_file_blob(
 	const DEFAULT_MAX_SIZE_MIB: i64 = 50;
 	const DEFAULT_MAX_STREAMING_SIZE_MIB: i64 = 100;
 
-	// Scope check: scoped tokens can only create children under the scoped root
-	file_access::check_scope_allows_create(auth.scope.as_deref(), query.root_id.as_deref())?;
+	// Scope check: scoped tokens can only create children under the scoped root,
+	// or — for folder share links — anywhere within the scoped folder's subtree.
+	let dir_cache = app.ext::<DirCache>()?;
+	file_access::check_scope_allows_create_in(
+		&app.meta_adapter,
+		dir_cache,
+		tn_id,
+		auth.scope.as_deref(),
+		query.effective_parent_id()?.as_deref(),
+		query.root_id.as_deref(),
+	)
+	.await?;
 
 	let content_type = header
 		.get(axum::http::header::CONTENT_TYPE)

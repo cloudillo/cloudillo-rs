@@ -9,7 +9,6 @@ pub mod apkg;
 pub(crate) mod audio;
 pub(crate) mod container;
 pub mod descriptor;
-pub mod dir_cache;
 pub(crate) mod duplicate;
 pub(crate) mod ffmpeg;
 pub mod filter;
@@ -34,18 +33,11 @@ mod prelude;
 use std::sync::Arc;
 
 use container::ContainerCache;
-use dir_cache::DirCache;
 use prelude::*;
 
 /// Create a new container cache for registration in extensions
 pub fn new_container_cache() -> Arc<ContainerCache> {
 	Arc::new(ContainerCache::new())
-}
-
-/// Create a new directory-name LRU cache for registration in extensions.
-/// Capacity is fixed for now (~1k entries ≈ ~150 KB shared across tenants).
-pub fn new_dir_cache() -> DirCache {
-	DirCache::new(1_000)
 }
 
 pub fn register_settings(

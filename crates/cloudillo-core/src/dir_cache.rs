@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-//! Shared LRU cache of folder metadata (parent id + name) used to resolve
-//! `withParent` / `withPath` listing options without recursive SQL.
+//! Shared LRU cache of folder metadata (parent id, name, is_folder) used to
+//! resolve `withParent` / `withPath` listing options and bounded parent-chain
+//! walks without recursive SQL. The cache holds folder rows only.
 //!
 //! Tenant safety invariants:
 //! - The cache key is `(TnId, file_id)`. Callers MUST pass the requesting
@@ -10,8 +11,8 @@
 //! - On insert, the `TnId` recorded MUST be the tenant that owns the row that
 //!   produced the entry. Never insert a row read from a different tenant under
 //!   the requestor's `TnId`.
-//! - Entries store only `parent_id` and `name`. They do NOT cache access
-//!   control. ACL checks happen at the call site, not via the cache.
+//! - Entries store only `parent_id`, `name`, and `is_folder`. They do NOT cache
+//!   access control. ACL checks happen at the call site, not via the cache.
 
 use lru::LruCache;
 use std::num::NonZeroUsize;
@@ -25,6 +26,11 @@ pub struct DirEntry {
 	/// `__root__`, `__trash__`, or the managed-parent constant are stored as-is.
 	pub parent_id: Option<Box<str>>,
 	pub name: Box<str>,
+	/// True when the row is a folder (`file_tp == "FLDR"`). The cache stores ONLY
+	/// folder rows, so every *cached* entry has `is_folder == true`; a non-folder
+	/// `DirEntry` is only ever returned transiently from `resolve_dir_entry`
+	/// (the first hop of a descendant walk) and is never inserted.
+	pub is_folder: bool,
 }
 
 type Key = (TnId, Box<str>);
@@ -78,12 +84,18 @@ impl DirCache {
 	}
 }
 
+/// Construct the process-wide folder-metadata cache with the default capacity.
+/// Capacity is fixed for now (~1k entries ≈ ~150 KB shared across tenants).
+pub fn new_dir_cache() -> DirCache {
+	DirCache::new(1_000)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	fn entry(parent: Option<&str>, name: &str) -> DirEntry {
-		DirEntry { parent_id: parent.map(Box::from), name: Box::from(name) }
+		DirEntry { parent_id: parent.map(Box::from), name: Box::from(name), is_folder: true }
 	}
 
 	#[test]

@@ -13,6 +13,7 @@ pub mod app;
 pub mod bootstrap_types;
 pub mod core_settings;
 pub mod create_perm;
+pub mod dir_cache;
 pub mod dns;
 pub mod extensions;
 pub mod extract;
@@ -36,6 +37,7 @@ use std::pin::Pin;
 
 // Re-export commonly used types
 pub use app::{App, AppBuilderOpts, AppState, ServerMode};
+pub use dir_cache::{DirCache, DirEntry};
 pub use extract::{Auth, IdTag, OptionalAuth};
 pub use middleware::{PermissionCheckFactory, PermissionCheckInput, PermissionCheckOutput};
 pub use profile_me_cache::ProfileMeCache;
