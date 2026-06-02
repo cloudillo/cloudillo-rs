@@ -21,11 +21,26 @@ use cloudillo_types::{
 pub(crate) async fn validate_access_token(
 	jwt_secret: &DecodingKey,
 	tn_id: TnId,
+	id_tag: &str,
 	token: &str,
 ) -> ClResult<AuthCtx> {
 	let token_data =
 		decode::<AccessToken<Box<str>>>(token, jwt_secret, &Validation::new(Algorithm::HS256))
 			.map_err(|_| Error::Unauthorized)?;
+
+	// Bind the token to the requesting tenant. Every access token is minted with
+	// `iss` == the id_tag of the tenant it grants access to (see cloudillo-auth
+	// get_access_token / get_proxy_token). The HS256 secret is shared across all
+	// tenants on this server, so without this check a token minted for tenant A
+	// would validate at tenant B's host and leak A-scoped roles into B's context.
+	if token_data.claims.iss.as_ref() != id_tag {
+		warn!(
+			token_iss = %token_data.claims.iss,
+			requested = %id_tag,
+			"Access token issuer does not match requested tenant"
+		);
+		return Err(Error::Unauthorized);
+	}
 
 	// Use `sub` (the actual user identity) when present, fall back to `iss`.
 	// Access tokens always set `iss` to the local tenant; for federated and
@@ -323,4 +338,45 @@ pub(crate) async fn verify_access_token(jwt_secret: &DecodingKey, token: &str) -
 		.map_err(|_| Error::Unauthorized)?;
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use jsonwebtoken::{EncodingKey, Header, encode};
+
+	fn make_token(secret: &[u8], iss: &str) -> String {
+		let claims = AccessToken {
+			iss,
+			sub: Some(iss),
+			scope: None::<&str>,
+			r: Some("leader"),
+			exp: Timestamp::from_now(3600),
+		};
+		encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
+			.expect("encode token")
+	}
+
+	#[tokio::test]
+	async fn validate_access_token_rejects_issuer_mismatch() {
+		let secret = b"test-secret-bytes-for-hs256-signing";
+		let dec = DecodingKey::from_secret(secret);
+		let token = make_token(secret, "a.example");
+
+		let res = validate_access_token(&dec, TnId(1), "b.example", &token).await;
+		assert!(matches!(res, Err(Error::Unauthorized)));
+	}
+
+	#[tokio::test]
+	async fn validate_access_token_accepts_matching_issuer() {
+		let secret = b"test-secret-bytes-for-hs256-signing";
+		let dec = DecodingKey::from_secret(secret);
+		let token = make_token(secret, "a.example");
+
+		let ctx = validate_access_token(&dec, TnId(1), "a.example", &token)
+			.await
+			.expect("matching issuer accepted");
+		assert_eq!(ctx.id_tag.as_ref(), "a.example");
+		assert!(ctx.roles.iter().any(|r| r.as_ref() == "leader"));
+	}
 }
