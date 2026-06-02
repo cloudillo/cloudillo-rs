@@ -153,11 +153,15 @@ pub async fn process_after_store(
 	// when the profile already exists, so this is a no-op for known peers.
 	// Spawned to keep the inbound pipeline off the remote /me round-trip.
 	//
-	// Why both issuer and audience: bridged actions arrive with strangers as
-	// issuer (e.g. a 3rd-party POST forwarded via a tenant's APRV — the tenant
-	// is known locally but the original author isn't). Audience is included
-	// for completeness when a federated action carries a non-self audience
-	// not covered by CONN/FLLW hooks.
+	// Why issuer, audience and an identity subject: bridged actions arrive with
+	// strangers as issuer (e.g. a 3rd-party POST forwarded via a tenant's APRV —
+	// the tenant is known locally but the original author isn't). Audience is
+	// included for completeness when a federated action carries a non-self
+	// audience not covered by CONN/FLLW hooks. An identity-typed subject
+	// (`@<id_tag>`, e.g. the community an INVT invites into) is a third involved
+	// profile no hook ensures; syncing it here populates the `subjectProfile`
+	// LEFT JOIN so name + avatar resolve for every surface (inbox, feed,
+	// onboarding) instead of rendering as "Unknown".
 	if ctx.is_inbound() {
 		let tenant_tag: Option<Box<str>> =
 			app.meta_adapter.read_tenant(tn_id).await.ok().map(|t| t.id_tag);
@@ -171,6 +175,13 @@ pub async fn process_after_store(
 			&& !targets.iter().any(|t| t.as_ref() == aud.as_ref())
 		{
 			targets.push(aud.clone());
+		}
+		if let Some(subject) = action.subject.as_ref()
+			&& let Some(SubjectRef::Identity(id_tag)) = parse_subject_ref(subject.as_ref())
+			&& tenant_tag.as_deref().map(AsRef::as_ref) != Some(id_tag)
+			&& !targets.iter().any(|t| t.as_ref() == id_tag)
+		{
+			targets.push(id_tag.into());
 		}
 
 		if !targets.is_empty() {
