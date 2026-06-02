@@ -50,6 +50,11 @@ pub struct EmailTaskParams {
 	pub custom_key: Option<String>,
 	/// Optional sender name override (e.g., "Cloudillo (myinstance)" or identity_provider)
 	pub from_name_override: Option<String>,
+	/// Optional delay (in seconds) before the email task is allowed to run.
+	/// When `Some(n)` with `n > 0`, the task is scheduled `n` seconds out via
+	/// the scheduler's `schedule_after`. Used to order the onboarding welcome
+	/// email after register-time CONN/INVT effects land. `None`/`0` = immediate.
+	pub delay_seconds: Option<i64>,
 }
 
 /// Email module - main orchestrator for email operations
@@ -115,12 +120,14 @@ impl EmailModule {
 		let task_key =
 			params.custom_key.unwrap_or_else(|| format!("email:{}:{}", tn_id.0, params.to));
 
-		scheduler
-			.task(std::sync::Arc::new(task))
-			.key(task_key)
-			.with_retry(retry_policy)
-			.schedule()
-			.await?;
+		let mut builder =
+			scheduler.task(std::sync::Arc::new(task)).key(task_key).with_retry(retry_policy);
+		if let Some(delay) = params.delay_seconds
+			&& delay > 0
+		{
+			builder = builder.schedule_after(delay);
+		}
+		builder.schedule().await?;
 		info!("Email task scheduled for {} with {} retry attempts", params.to, max_retries);
 		Ok(())
 	}

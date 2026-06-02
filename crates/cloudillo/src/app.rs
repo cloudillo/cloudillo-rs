@@ -339,6 +339,7 @@ impl AppBuilder {
 						lang: params.lang,
 						custom_key: params.custom_key,
 						from_name_override: params.from_name_override,
+						delay_seconds: None,
 					},
 				)
 				.await

@@ -186,6 +186,7 @@ pub async fn send_password_reset(
 		lang,
 		custom_key: Some(format!("pw-reset:{}:{}", tn_id.0, Timestamp::now().0)),
 		from_name_override: Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
+		delay_seconds: None,
 	};
 
 	EmailModule::schedule_email_task(&app.scheduler, &app.settings, tn_id, email_params).await?;
