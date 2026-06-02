@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 32;
+	const CURRENT_DB_VERSION: i64 = 33;
 
 	let mut tx = db.begin().await?;
 
@@ -287,6 +287,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			reactions text,
 			comments integer,
 			comments_read integer,
+			reposts integer,
 			stat_at INTEGER,				-- Highest created_at of any STAT applied to reactions/comments
 			visibility char(1) NOT NULL DEFAULT 'D',	-- D: Direct (owner only), P: Public, V: Verified,
 														-- 2: 2nd degree, F: Follower, C: Connected
@@ -1760,6 +1761,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 		set_db_version(&mut tx, 32).await;
+	}
+
+	if version < 33 {
+		sqlx::query("ALTER TABLE actions ADD COLUMN reposts integer")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 33).await;
 	}
 
 	tx.commit().await?;

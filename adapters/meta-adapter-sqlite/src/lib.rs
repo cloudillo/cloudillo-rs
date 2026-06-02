@@ -203,6 +203,19 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::list(&self.dbr, tn_id, opts).await
 	}
 
+	async fn count_actions(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64> {
+		action::count(&self.dbr, tn_id, opts).await
+	}
+
+	async fn count_actions_grouped(
+		&self,
+		tn_id: TnId,
+		opts: &ListActionOptions,
+		group_by: cloudillo_types::meta_adapter::ActionCountGroupBy,
+	) -> ClResult<Vec<(Option<String>, i64)>> {
+		action::count_grouped(&self.dbr, tn_id, opts, group_by).await
+	}
+
 	async fn list_action_tokens(
 		&self,
 		tn_id: TnId,
@@ -435,7 +448,7 @@ impl MetaAdapter for MetaAdapterSqlite {
 	//***************************
 
 	async fn get_action(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<ActionView>> {
-		action::get(&self.dbr, tn_id, action_id).await
+		action::get(&self.dbr, tn_id, action_id, None, true).await
 	}
 
 	async fn update_action(
@@ -450,10 +463,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn delete_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()> {
 		action::delete(&self.db, tn_id, action_id).await
-	}
-
-	async fn count_reactions(&self, tn_id: TnId, subject_id: &str) -> ClResult<String> {
-		action::count_reactions(&self.dbr, tn_id, subject_id).await
 	}
 
 	// Phase 2: File Management Enhancements

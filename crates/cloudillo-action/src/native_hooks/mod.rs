@@ -28,9 +28,10 @@ pub mod fllw;
 pub mod fshr;
 pub mod idp;
 pub mod invt;
-mod ownership;
+pub(crate) mod ownership;
 pub mod prinvt;
 pub mod react;
+pub mod repost;
 pub mod stat;
 mod stat_emit;
 pub(crate) mod stat_emit_task;
@@ -108,6 +109,19 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 
 		registry.register_type("REACT", react_hooks);
 		tracing::info!("Registered native hooks for REACT action type");
+	}
+
+	// REPOST hooks — emit STAT (repost count) for the subject when we own it.
+	{
+		let repost_hooks = ActionTypeHooks {
+			on_create: Some(Arc::new(|app, ctx| Box::pin(repost::on_create(app, ctx)))),
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(repost::on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("REPOST", repost_hooks);
+		tracing::info!("Registered native hooks for REPOST action type");
 	}
 
 	// CMNT hooks

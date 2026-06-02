@@ -410,9 +410,13 @@ fn repost_definition() -> ActionDefinition {
 		fields: FieldConstraints {
 			content: None,
 			audience: None,
-			parent: Some(FieldConstraint::Required),
+			// REPOST references the shared action via `subject` (non-hierarchical,
+			// like REACT/APRV) — NOT `parent`. `parent` is reserved for visible
+			// hierarchy/threading (CMNT→POST). The reposter's client always sends
+			// an explicit audience (own idTag for boost; target wall otherwise).
+			parent: Some(FieldConstraint::Forbidden),
 			attachments: Some(FieldConstraint::Forbidden),
-			subject: Some(FieldConstraint::Forbidden),
+			subject: Some(FieldConstraint::Required),
 		},
 		schema: Some(ContentSchemaWrapper {
 			content: Some(ContentSchema {
@@ -431,11 +435,21 @@ fn repost_definition() -> ActionDefinition {
 			allow_unknown: Some(false),
 			requires_acceptance: Some(false),
 			approvable: Some(true),
+			// Dual delivery: in addition to the repost's own audience (reposter's
+			// followers / target wall), deliver to the subject's owner (the
+			// original poster) so they count the repost, can list reposters, and
+			// notify. Generic flag, same path INVT uses. The original poster
+			// accepts it via the subject-ownership rule (R1) in process.rs.
+			deliver_to_subject_owner: Some(true),
 			..Default::default()
 		},
 		hooks: ActionHooks {
-			on_create: HookImplementation::None, // TODO: Get parent action and log
-			on_receive: HookImplementation::None, // Auto-approve handled in process.rs; TODO: notification if parent issuer is tenant
+			// Native hooks registered via the registry (see native_hooks/repost.rs).
+			// Local-side-effect only: bump the `rp` repost counter on the subject
+			// post (analogous to react/cmnt). Federation is handled generically by
+			// the subject-keyed outbox/inbox/relay rules, not here.
+			on_create: HookImplementation::None,
+			on_receive: HookImplementation::None,
 			on_accept: HookImplementation::None,
 			on_reject: HookImplementation::None,
 		},
@@ -445,7 +459,14 @@ fn repost_definition() -> ActionDefinition {
 			requires_following: Some(false),
 			requires_connected: Some(false),
 		}),
-		key_pattern: None, // No key pattern since subject is forbidden
+		// One repost per (subject, issuer, target audience). Keyed so an
+		// un-repost (REPOST:DEL) supersedes the original (turns :DEL into a real
+		// deletion) and repeated reposts of the same target dedup to one live
+		// row. {audience} is part of the identity: a user may boost to their own
+		// wall *and* repost to a community = two distinct keys = two independent,
+		// independently un-repostable rows (matches the ownRepostIds-by-target
+		// design).
+		key_pattern: Some("{type}:{subject}:{issuer}:{audience}".to_string()),
 	}
 }
 

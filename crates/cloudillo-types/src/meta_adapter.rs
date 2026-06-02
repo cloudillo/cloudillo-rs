@@ -393,6 +393,7 @@ pub struct UpdateActionDataOptions {
 	pub reactions: Patch<String>,
 	pub comments: Patch<u32>,
 	pub comments_read: Patch<u32>,
+	pub reposts: Patch<u32>,
 	/// Watermark for inbound STAT mirror updates — see [`ActionData::stat_at`].
 	pub stat_at: Patch<Timestamp>,
 	pub status: Patch<char>,
@@ -442,6 +443,13 @@ pub enum AudienceType {
 	Community,
 }
 
+/// Field to group an action count by. Mapped to a fixed column server-side
+/// (never interpolated from caller input) to keep the query injection-safe.
+#[derive(Debug, Clone, Copy)]
+pub enum ActionCountGroupBy {
+	SubType,
+}
+
 /// Options for listing actions
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -480,6 +488,10 @@ pub struct ListActionOptions {
 	pub subject: Option<String>,
 	#[serde(rename = "createdAfter")]
 	pub created_after: Option<Timestamp>,
+	/// When true, the list path populates each `ActionView.token` with the raw
+	/// signed JWS from `action_tokens`. Opt-in so normal feed payloads stay lean.
+	#[serde(rename = "includeTokens")]
+	pub include_tokens: Option<bool>,
 	/// Exclude actions whose issuer's profile has any of these statuses.
 	/// LEFT JOIN profiles ON (tn_id, id_tag=issuer.id_tag) — missing-profile
 	/// rows are NOT excluded (open-federation default).
@@ -499,6 +511,7 @@ pub struct ProfileInfo {
 	pub profile_pic: Option<Box<str>>,
 }
 
+#[derive(Default)]
 pub struct Action<S: AsRef<str>> {
 	pub action_id: S,
 	pub typ: S,
@@ -544,6 +557,12 @@ pub struct ActionView {
 	pub attachments: Option<Vec<AttachmentView>>,
 	pub subject: Option<Box<str>>,
 	pub subject_profile: Option<ProfileInfo>,
+	/// Hydrated original action referenced by `subject` (e.g. the post a REPOST
+	/// shares). Populated by the listing path for REPOST rows so the client can
+	/// render the embedded original card without a second fetch. Boxed to keep
+	/// the recursive type sized.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub subject_action: Option<Box<ActionView>>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
@@ -553,6 +572,10 @@ pub struct ActionView {
 	pub visibility: Option<char>,
 	pub flags: Option<Box<str>>, // Action flags: R/r (reactions), C/c (comments), O/o (open)
 	pub x: Option<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
+	/// Raw signed JWS for this action, populated only when the list query sets
+	/// `includeTokens=true`. Lets clients verify action signatures locally.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub token: Option<Box<str>>,
 }
 
 // Files
@@ -1389,6 +1412,21 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		opts: &ListActionOptions,
 	) -> ClResult<Box<[Box<str>]>>;
 
+	/// Count actions matching `opts` (same filters as `list_actions`), with no
+	/// limit/sort/cursor. Generic and type-agnostic — callers supply the
+	/// business filters (which type/status defines "a repost", etc.).
+	async fn count_actions(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64>;
+
+	/// Count actions matching `opts`, grouped by `group_by`. Returns
+	/// `(group_value, count)` pairs (group value NULL-able). Used to derive
+	/// per-reaction-type counts without baking reaction semantics into the adapter.
+	async fn count_actions_grouped(
+		&self,
+		tn_id: TnId,
+		opts: &ListActionOptions,
+		group_by: ActionCountGroupBy,
+	) -> ClResult<Vec<(Option<String>, i64)>>;
+
 	async fn create_action(
 		&self,
 		tn_id: TnId,
@@ -1585,10 +1623,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Delete an action (soft delete with cleanup)
 	async fn delete_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()>;
-
-	/// Count active (non-DEL, non-deleted) REACT actions for a given subject, grouped by type
-	/// Returns colon-separated format: "L5:V3:W1" (Like=5, Love=3, Wow=1)
-	async fn count_reactions(&self, tn_id: TnId, subject_id: &str) -> ClResult<String>;
 
 	// Phase 2: File Management Enhancements
 	//**************************************

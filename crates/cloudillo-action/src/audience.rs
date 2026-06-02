@@ -131,7 +131,13 @@ fn uses_subject_for_audience(action_type: &str) -> bool {
 
 /// Check if action type uses parent for audience resolution
 fn uses_parent_for_audience(action_type: &str) -> bool {
-	matches!(action_type, "CMNT" | "MSG" | "REPOST")
+	// REPOST is intentionally NOT here: it is neither parent- nor subject-derived.
+	// Parent-derived would be impossible (parent is forbidden), and subject-derived
+	// would deliver the repost back onto the original poster's wall. REPOST relies
+	// solely on the explicit audience the client provides (own idTag for a boost;
+	// community/profile idTag for a wall-repost). A missing audience is rejected at
+	// create time (see handler.rs).
+	matches!(action_type, "CMNT" | "MSG")
 }
 
 #[cfg(test)]
@@ -156,7 +162,10 @@ mod tests {
 	fn test_uses_parent_for_audience() {
 		assert!(uses_parent_for_audience("CMNT"));
 		assert!(uses_parent_for_audience("MSG"));
-		assert!(uses_parent_for_audience("REPOST"));
+		// REPOST must NOT inherit audience from parent or subject — it relies on
+		// the explicit audience the client sends (boost vs wall-repost).
+		assert!(!uses_parent_for_audience("REPOST"));
+		assert!(!uses_subject_for_audience("REPOST"));
 		assert!(!uses_parent_for_audience("POST"));
 		assert!(!uses_parent_for_audience("REACT"));
 		assert!(!uses_parent_for_audience("CONN"));

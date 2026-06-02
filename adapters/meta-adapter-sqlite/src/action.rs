@@ -19,35 +19,15 @@ fn db_visibility_to_action(s: Option<String>) -> Option<char> {
 	s.and_then(|s| s.chars().next()).filter(|c| *c != 'D')
 }
 
-/// List actions with filtering options
-pub(crate) async fn list(
-	db: &SqlitePool,
-	tn_id: TnId,
+/// Append the WHERE filters shared by `list`, `count`, and `count_grouped`.
+/// Caller has already emitted `... WHERE a.tn_id=<bind>`; this appends `AND ...`
+/// clauses. Operates on alias `a`, with `pi` (issuer profile) and `pa`
+/// (effective-audience profile) joins available for the profile-status and
+/// audience-type filters. Does NOT touch sort/cursor/limit (list-only).
+fn push_action_filters(
+	mut query: sqlx::QueryBuilder<sqlx::Sqlite>,
 	opts: &ListActionOptions,
-) -> ClResult<Vec<ActionView>> {
-	let mut query = sqlx::QueryBuilder::new(
-		"SELECT DISTINCT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
-		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
-		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
-		a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
-		a.content, a.created_at, a.expires_at,
-		own.sub_type as own_reaction,
-		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
-		FROM actions a
-		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
-		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
-		LEFT JOIN profiles ps ON ps.tn_id=a.tn_id
-			AND a.subject LIKE '@%'
-			AND ps.id_tag = substr(a.subject, 2)
-		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.subject=a.action_id AND own.issuer_tag=",
-	);
-	query.push_bind(opts.viewer_id_tag.as_deref());
-	query.push(
-		" AND own.type='REACT' AND own.sub_type!='DEL' AND coalesce(own.status, 'A') NOT IN ('D')
-		WHERE a.tn_id=",
-	);
-	query.push_bind(tn_id.0);
-
+) -> sqlx::QueryBuilder<sqlx::Sqlite> {
 	if let Some(status) = &opts.status {
 		query.push(" AND coalesce(a.status, 'A') IN ");
 		query = push_in(query, status);
@@ -196,6 +176,154 @@ pub(crate) async fn list(
 			query.push(" AND a.action_id=").push_bind(action_id);
 		}
 	}
+	query
+}
+
+/// Append only the profile joins that the active filters in `opts` actually
+/// reference, then ` WHERE a.tn_id=<bind>`. `pi` (issuer profile) is needed by
+/// `exclude_issuer_profile_status`; `pa` (effective-audience profile) by
+/// `audience_type`. Count paths that set neither skip both joins — SQLite does
+/// NOT elide the unused LEFT JOINs here (verified via EXPLAIN QUERY PLAN: it
+/// still does a covering-index SEARCH per row even when pi/pa are unreferenced),
+/// so omitting them removes a per-row index probe. The emitted alias set must
+/// stay a superset of what `push_action_filters` references for the same `opts`.
+fn push_count_from_where(
+	mut query: sqlx::QueryBuilder<sqlx::Sqlite>,
+	tn_id: TnId,
+	opts: &ListActionOptions,
+) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+	if opts.exclude_issuer_profile_status.as_ref().is_some_and(|v| !v.is_empty()) {
+		query.push(" LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag");
+	}
+	if opts.audience_type.is_some() {
+		query.push(
+			" LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)",
+		);
+	}
+	query.push(" WHERE a.tn_id=");
+	query.push_bind(tn_id.0);
+	query
+}
+
+/// Count actions matching `opts` (same filters as `list`), with NO limit/sort/
+/// cursor. Generic and type-agnostic — callers supply the business filters.
+pub(crate) async fn count(db: &SqlitePool, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64> {
+	let mut query = sqlx::QueryBuilder::new("SELECT COUNT(DISTINCT a.a_id) FROM actions a");
+	query = push_count_from_where(query, tn_id, opts);
+	query = push_action_filters(query, opts);
+	query
+		.build_query_scalar::<i64>()
+		.fetch_one(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)
+}
+
+/// Count actions matching `opts`, grouped by `group_by`. Returns
+/// `(group_value, count)` pairs (group value NULL-able). Used to derive
+/// per-reaction-type counts without baking reaction semantics into the adapter.
+pub(crate) async fn count_grouped(
+	db: &SqlitePool,
+	tn_id: TnId,
+	opts: &ListActionOptions,
+	group_by: cloudillo_types::meta_adapter::ActionCountGroupBy,
+) -> ClResult<Vec<(Option<String>, i64)>> {
+	use cloudillo_types::meta_adapter::ActionCountGroupBy;
+	// Fixed column mapping — never interpolate caller input (injection-safe).
+	let col = match group_by {
+		ActionCountGroupBy::SubType => "a.sub_type",
+	};
+	let mut query = sqlx::QueryBuilder::new(format!(
+		"SELECT {col} AS grp, COUNT(DISTINCT a.a_id) AS cnt FROM actions a"
+	));
+	query = push_count_from_where(query, tn_id, opts);
+	query = push_action_filters(query, opts);
+	query.push(format!(" GROUP BY {col}"));
+	let rows = query
+		.build()
+		.fetch_all(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+	let mut out = Vec::with_capacity(rows.len());
+	for r in &rows {
+		let grp: Option<String> = r.try_get("grp").map_err(|_| Error::DbError)?;
+		let cnt: i64 = r.try_get("cnt").map_err(|_| Error::DbError)?;
+		out.push((grp, cnt));
+	}
+	Ok(out)
+}
+
+/// Fetch the viewer's active reposts of `subject_ids`, keyed by subject and then
+/// by target audience: `{subject_action_id: {target: repost_action_id}}`.
+///
+/// Shared by `list()` (batched over many subjects) and `get()` (a single
+/// subject) so the two read paths cannot drift on the `type='REPOST'` /
+/// `status NOT IN ('D')` / issuer filter. Returns an empty map for an empty
+/// input. Errors are logged via `inspect` and surfaced to the caller, which
+/// decides whether to degrade gracefully.
+async fn fetch_own_repost_ids(
+	db: &SqlitePool,
+	tn_id: TnId,
+	subject_ids: &[&str],
+	viewer: &str,
+) -> ClResult<std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>>> {
+	use std::collections::HashMap;
+	let mut map: HashMap<String, serde_json::Map<String, serde_json::Value>> = HashMap::new();
+	if subject_ids.is_empty() {
+		return Ok(map);
+	}
+	let mut q = sqlx::QueryBuilder::new(
+		"SELECT subject, coalesce(audience, issuer_tag) as target, action_id
+		FROM actions WHERE tn_id=",
+	);
+	q.push_bind(tn_id.0);
+	q.push(" AND type='REPOST' AND coalesce(status,'A') NOT IN ('D') AND issuer_tag=");
+	q.push_bind(viewer);
+	q.push(" AND subject IN ");
+	q = push_in(q, subject_ids);
+	let rows = q.build().fetch_all(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	for r in &rows {
+		let subject: Option<String> = r.try_get("subject").ok().flatten();
+		let target: Option<String> = r.try_get("target").ok().flatten();
+		let aid: Option<String> = r.try_get("action_id").ok().flatten();
+		if let (Some(subject), Some(target), Some(aid)) = (subject, target, aid) {
+			map.entry(subject).or_default().insert(target, serde_json::Value::String(aid));
+		}
+	}
+	Ok(map)
+}
+
+/// List actions with filtering options
+pub(crate) async fn list(
+	db: &SqlitePool,
+	tn_id: TnId,
+	opts: &ListActionOptions,
+) -> ClResult<Vec<ActionView>> {
+	let mut query = sqlx::QueryBuilder::new(
+		"SELECT DISTINCT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
+		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
+		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
+		a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
+		a.content, a.created_at, a.expires_at,
+		own.sub_type as own_reaction,
+		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.reposts, a.visibility, a.flags, a.x
+		FROM actions a
+		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
+		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
+		LEFT JOIN profiles ps ON ps.tn_id=a.tn_id
+			AND a.subject LIKE '@%'
+			AND ps.id_tag = substr(a.subject, 2)
+		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.subject=a.action_id AND own.issuer_tag=",
+	);
+	query.push_bind(opts.viewer_id_tag.as_deref());
+	query.push(
+		" AND own.type='REACT' AND own.sub_type!='DEL' AND coalesce(own.status, 'A') NOT IN ('D')
+		WHERE a.tn_id=",
+	);
+	query.push_bind(tn_id.0);
+
+	query = push_action_filters(query, opts);
 
 	// Determine sort order (currently only created_at is supported)
 	let _sort_field = opts.sort.as_deref().unwrap_or("created");
@@ -341,6 +469,7 @@ pub(crate) async fn list(
 		let comments_count: i64 = row.try_get("comments").unwrap_or(0);
 		let comments_read: i64 = row.try_get("comments_read").unwrap_or(0);
 		let own_reaction: Option<String> = row.try_get("own_reaction").ok().flatten();
+		let reposts: i64 = row.try_get("reposts").unwrap_or(0);
 		let mut stat_obj = serde_json::json!({
 			"comments": comments_count,
 			"commentsRead": comments_read
@@ -350,6 +479,9 @@ pub(crate) async fn list(
 		}
 		if let Some(own_reaction) = own_reaction {
 			stat_obj["ownReaction"] = serde_json::Value::String(own_reaction);
+		}
+		if reposts > 0 {
+			stat_obj["reposts"] = serde_json::Value::from(reposts);
 		}
 		let stat = Some(stat_obj);
 		let visibility: Option<String> = row.try_get("visibility").ok().flatten();
@@ -420,6 +552,8 @@ pub(crate) async fn list(
 				}),
 				None => None,
 			},
+			// Hydrated below for REPOST rows.
+			subject_action: None,
 			content: row
 				.try_get::<Option<String>, _>("content")
 				.map_err(|_| Error::DbError)?
@@ -438,7 +572,79 @@ pub(crate) async fn list(
 				.try_get::<Option<String>, _>("x")
 				.map_err(|_| Error::DbError)?
 				.and_then(|s| serde_json::from_str(&s).ok()),
+			token: None,
 		});
+	}
+
+	// Opt-in: populate each action's raw signed JWS from action_tokens. Only
+	// runs when the caller passes includeTokens=true (e.g. the engagement
+	// dialog's signature-verification path), so normal feed lists stay lean.
+	if opts.include_tokens == Some(true) && !actions.is_empty() {
+		let ids: Vec<&str> = actions.iter().map(|a| a.action_id.as_ref()).collect();
+		let mut q =
+			sqlx::QueryBuilder::new("SELECT action_id, token FROM action_tokens WHERE tn_id=");
+		q.push_bind(tn_id.0);
+		q.push(" AND action_id IN ");
+		q = push_in(q, &ids);
+		drop(ids);
+		match q.build().fetch_all(db).await {
+			Ok(rows) => {
+				use std::collections::HashMap;
+				let mut map: HashMap<String, Box<str>> = HashMap::new();
+				for r in &rows {
+					let aid: Option<String> = r.try_get("action_id").ok().flatten();
+					let token: Option<Box<str>> = r.try_get("token").ok().flatten();
+					if let (Some(aid), Some(token)) = (aid, token) {
+						map.insert(aid, token);
+					}
+				}
+				for a in &mut actions {
+					if let Some(token) = map.get(a.action_id.as_ref()) {
+						a.token = Some(token.clone());
+					}
+				}
+			}
+			Err(e) => warn!("list: includeTokens fetch failed: {e}"),
+		}
+	}
+
+	// Post-pass hydration for reposts.
+	// 1. Embedded original action for REPOST rows, so the client renders the
+	//    shared post without a second round-trip. The inner get() is called with
+	//    hydrate_subject=false so the embedded subject never re-hydrates *its*
+	//    subject — one level only, structurally, regardless of stored data.
+	for action in &mut actions {
+		if action.typ.as_ref() == "REPOST"
+			&& let Some(subject_id) = action.subject.clone()
+			&& !subject_id.starts_with('@')
+			&& let Ok(Some(sub)) =
+				get(db, tn_id, &subject_id, opts.viewer_id_tag.as_deref(), false).await
+		{
+			action.subject_action = Some(Box::new(sub));
+		}
+	}
+
+	// 2. The viewer's own reposts of any listed action, keyed by target audience,
+	//    merged into stat.ownRepostIds (drives ✓-badges and the undo affordance).
+	if let Some(viewer) = opts.viewer_id_tag.as_deref()
+		&& !actions.is_empty()
+	{
+		let ids: Vec<&str> = actions.iter().map(|a| a.action_id.as_ref()).collect();
+		match fetch_own_repost_ids(db, tn_id, &ids, viewer).await {
+			Ok(map) => {
+				// `ids` borrows `actions` immutably; it is dropped here before the
+				// mutable pass below.
+				drop(ids);
+				for a in &mut actions {
+					if let Some(obj) = map.get(a.action_id.as_ref())
+						&& !obj.is_empty() && let Some(stat) = a.stat.as_mut()
+					{
+						stat["ownRepostIds"] = serde_json::Value::Object(obj.clone());
+					}
+				}
+			}
+			Err(e) => warn!("list: ownRepostIds fetch failed: {e}"),
+		}
 	}
 
 	Ok(actions)
@@ -922,6 +1128,9 @@ pub(crate) async fn update_data(
 	if !opts.comments_read.is_undefined() {
 		set_clauses.push("comments_read = ?");
 	}
+	if !opts.reposts.is_undefined() {
+		set_clauses.push("reposts = ?");
+	}
 	if !opts.status.is_undefined() {
 		set_clauses.push("status = ?");
 	}
@@ -997,6 +1206,14 @@ pub(crate) async fn update_data(
 	}
 	if !opts.comments_read.is_undefined() {
 		let val: Option<u32> = match &opts.comments_read {
+			Patch::Null => None,
+			Patch::Value(v) => Some(*v),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.reposts.is_undefined() {
+		let val: Option<u32> = match &opts.reposts {
 			Patch::Null => None,
 			Patch::Value(v) => Some(*v),
 			Patch::Undefined => unreachable!(),
@@ -1119,11 +1336,20 @@ pub(crate) async fn update_inbound(
 	Ok(())
 }
 
-/// Get a single action by action_id with issuer and audience profiles
+/// Get a single action by action_id with issuer and audience profiles.
+///
+/// `hydrate_subject` controls whether a REPOST row embeds its referenced
+/// `subject_action`. Top-level callers pass `true` for a single embedded level;
+/// the internal recursive call passes `false`, capping hydration at exactly one
+/// level. This bound is structural — it does NOT rely on create-time
+/// canonicalization, so a non-conformant federated repost-of-a-repost (or even
+/// a cyclic A→B→A pair) can never drive unbounded recursion / stack overflow.
 pub(crate) async fn get(
 	db: &SqlitePool,
 	tn_id: TnId,
 	action_id: &str,
+	viewer_id_tag: Option<&str>,
+	hydrate_subject: bool,
 ) -> ClResult<Option<ActionView>> {
 	// Handle @{a_id} format for drafts/pending actions
 	let row = if let Some(a_id_str) = action_id.strip_prefix('@') {
@@ -1134,7 +1360,7 @@ pub(crate) async fn get(
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
 			a.content, a.created_at, a.expires_at,
-			a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
+			a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.reposts, a.visibility, a.flags, a.x
 			FROM actions a
 			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
@@ -1156,7 +1382,7 @@ pub(crate) async fn get(
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
 			a.content, a.created_at, a.expires_at,
-			a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.visibility, a.flags, a.x
+			a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.reposts, a.visibility, a.flags, a.x
 			FROM actions a
 			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
@@ -1245,12 +1471,45 @@ pub(crate) async fn get(
 	let reactions: Option<String> = row.try_get("reactions").ok().flatten();
 	let comments_count: i64 = row.try_get("comments").unwrap_or(0);
 	let comments_read: i64 = row.try_get("comments_read").unwrap_or(0);
+	let reposts: i64 = row.try_get("reposts").unwrap_or(0);
 	let mut stat_obj = serde_json::json!({
 		"comments": comments_count,
 		"commentsRead": comments_read
 	});
 	if let Some(reactions) = reactions {
 		stat_obj["reactions"] = serde_json::Value::String(reactions);
+	}
+	if reposts > 0 {
+		stat_obj["reposts"] = serde_json::Value::from(reposts);
+	}
+	// Per-user stat, only when a viewer is supplied. Mirrors the list path's
+	// own_reaction (lines 341-360) and ownRepostIds (lines 468-505) so an
+	// embedded subject_action carries the viewer's reaction/repost state.
+	if let Some(viewer) = viewer_id_tag {
+		let own_reaction: Option<String> = sqlx::query_scalar(
+			"SELECT sub_type FROM actions
+			WHERE tn_id=? AND subject=? AND issuer_tag=? AND type='REACT'
+				AND sub_type!='DEL' AND coalesce(status, 'A') NOT IN ('D') LIMIT 1",
+		)
+		.bind(tn_id.0)
+		.bind(action_id)
+		.bind(viewer)
+		.fetch_optional(db)
+		.await
+		.ok()
+		.flatten();
+		if let Some(own_reaction) = own_reaction {
+			stat_obj["ownReaction"] = serde_json::Value::String(own_reaction);
+		}
+		// Viewer's active reposts of this action, keyed by target audience.
+		// Shares fetch_own_repost_ids with list() so the filter can't drift.
+		let own_reposts =
+			fetch_own_repost_ids(db, tn_id, &[action_id], viewer).await.unwrap_or_default();
+		if let Some(map) = own_reposts.get(action_id)
+			&& !map.is_empty()
+		{
+			stat_obj["ownRepostIds"] = serde_json::Value::Object(map.clone());
+		}
 	}
 	let stat = Some(stat_obj);
 
@@ -1269,7 +1528,7 @@ pub(crate) async fn get(
 			String::into_boxed_str,
 		);
 
-	Ok(Some(ActionView {
+	let mut action = ActionView {
 		action_id: result_action_id,
 		typ: row.try_get::<Box<str>, _>("type").map_err(|_| Error::DbError)?,
 		sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type").map_err(|_| Error::DbError)?,
@@ -1334,6 +1593,8 @@ pub(crate) async fn get(
 			}),
 			None => None,
 		},
+		// Hydrated below for REPOST rows (see post-construction embed).
+		subject_action: None,
 		content: row
 			.try_get::<Option<String>, _>("content")
 			.map_err(|_| Error::DbError)?
@@ -1352,7 +1613,24 @@ pub(crate) async fn get(
 			.try_get::<Option<String>, _>("x")
 			.map_err(|_| Error::DbError)?
 			.and_then(|s| serde_json::from_str(&s).ok()),
-	}))
+		token: None,
+	};
+
+	// Embed the shared original for REPOST rows so a single-action fetch (e.g. a
+	// repost permalink) renders without a second round trip — mirrors list().
+	// The inner call passes hydrate_subject=false, so the embedded subject never
+	// re-hydrates *its* subject: hydration is capped at one level structurally,
+	// independent of whether the stored data was canonicalized.
+	if hydrate_subject
+		&& action.typ.as_ref() == "REPOST"
+		&& let Some(subject_id) = action.subject.clone()
+		&& !subject_id.starts_with('@')
+		&& let Ok(Some(sub)) = Box::pin(get(db, tn_id, &subject_id, viewer_id_tag, false)).await
+	{
+		action.subject_action = Some(Box::new(sub));
+	}
+
+	Ok(Some(action))
 }
 
 /// Update action content and attachments (drafts only, status='R')
@@ -1428,50 +1706,299 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClR
 	Ok(())
 }
 
-/// Map reaction sub_type to single-char key for compact encoding
-fn reaction_type_key(sub_type: &str) -> Option<char> {
-	match sub_type {
-		"LIKE" => Some('L'),
-		"LOVE" => Some('V'),
-		"LAUGH" => Some('H'),
-		"WOW" => Some('W'),
-		"SAD" => Some('S'),
-		"ANGRY" => Some('A'),
-		_ => None,
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use cloudillo_types::meta_adapter::ActionCountGroupBy;
+	use sqlx::sqlite;
+
+	// Single-connection write pool over a temp DB file, mirroring
+	// `MetaAdapterSqlite::new` (WAL, one write connection). Same pattern as the
+	// file.rs test harness.
+	async fn test_pool(dir: &std::path::Path) -> SqlitePool {
+		let opts = sqlite::SqliteConnectOptions::new()
+			.filename(dir.join("meta.db"))
+			.create_if_missing(true)
+			.journal_mode(sqlite::SqliteJournalMode::Wal);
+		let db = sqlite::SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect_with(opts)
+			.await
+			.expect("connect test pool");
+		crate::schema::init_db(&db).await.expect("init schema");
+		db
 	}
-}
 
-/// Count active (non-DEL, non-deleted) REACT actions for a given subject
-pub(crate) async fn count_reactions(
-	db: &SqlitePool,
-	tn_id: TnId,
-	subject_id: &str,
-) -> ClResult<String> {
-	let rows = sqlx::query(
-		"SELECT sub_type, COUNT(*) as cnt FROM actions \
-		 WHERE tn_id=? AND subject=? AND type='REACT' \
-		 AND sub_type!='DEL' AND coalesce(status, 'A') NOT IN ('D') \
-		 GROUP BY sub_type",
-	)
-	.bind(tn_id.0)
-	.bind(subject_id)
-	.fetch_all(db)
-	.await
-	.map_err(|_| Error::DbError)?;
+	// Insert one finalized (status 'A') action row directly. Bypasses create()
+	// so tests can mint many distinct rows for one subject without the
+	// pending→finalize dance.
+	async fn insert_action(
+		db: &SqlitePool,
+		tn_id: TnId,
+		action_id: &str,
+		typ: &str,
+		sub_type: &str,
+		subject: &str,
+	) {
+		sqlx::query(
+			"INSERT INTO actions (tn_id, action_id, type, sub_type, issuer_tag, subject, status, visibility, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, 'A', 'P', unixepoch())",
+		)
+		.bind(tn_id.0)
+		.bind(action_id)
+		.bind(typ)
+		.bind(sub_type)
+		.bind("alice.example")
+		.bind(subject)
+		.execute(db)
+		.await
+		.expect("insert action");
+	}
 
-	let counts: Vec<(char, u32)> = rows
-		.iter()
-		.filter_map(|row| {
-			let sub_type: String = row.try_get::<Option<String>, _>("sub_type").ok().flatten()?;
-			let cnt: i64 = row.try_get("cnt").ok()?;
-			let Some(key) = reaction_type_key(&sub_type) else {
-				warn!("Unknown reaction sub_type '{}' ignored in count", sub_type);
-				return None;
-			};
-			Some((key, u32::try_from(cnt).unwrap_or(0)))
-		})
-		.collect();
+	// Build a public REPOST Action for the keyed-create tests. Empty `sub_type`
+	// → None (a normal repost); "DEL" → the un-repost marker.
+	fn repost_action<'a>(
+		action_id: &'a str,
+		sub_type: &'a str,
+		subject: &'a str,
+		issuer: &'a str,
+		audience: &'a str,
+	) -> Action<&'a str> {
+		Action {
+			action_id,
+			typ: "REPOST",
+			sub_typ: if sub_type.is_empty() { None } else { Some(sub_type) },
+			issuer_tag: issuer,
+			audience_tag: Some(audience),
+			subject: Some(subject),
+			visibility: Some('P'),
+			..Default::default()
+		}
+	}
 
-	let total: u32 = counts.iter().map(|(_, c)| *c).sum();
-	Ok(cloudillo_types::reactions::encode_reaction_counts(counts, total))
+	// Drive the real keyed create() path for an inbound action so the key-based
+	// supersede SQL actually runs (insert_action writes rows directly and bypasses
+	// it). A non-empty action_id marks the action inbound — the branch that
+	// supersedes prior rows sharing the same key, exactly the mechanism that turns
+	// a REPOST:DEL into a real deletion and dedups repeated reposts. The supersede
+	// key is derived from the action itself ({type}:{subject}:{issuer}:{audience}).
+	async fn create_keyed(db: &SqlitePool, tn_id: TnId, action: &Action<&str>) {
+		let key = format!(
+			"{}:{}:{}:{}",
+			action.typ,
+			action.subject.unwrap_or_default(),
+			action.issuer_tag,
+			action.audience_tag.unwrap_or_default(),
+		);
+		create(db, tn_id, action, Some(&key)).await.expect("create keyed action");
+	}
+
+	// H1 regression: count() must report the true total, not the LIMIT-20
+	// saturated value the old `list_actions().len()` path returned (21).
+	#[tokio::test]
+	async fn count_reposts_does_not_saturate_at_limit() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		let subject = "a1~the-shared-post";
+
+		for i in 0..25 {
+			insert_action(&db, tn_id, &format!("a1~repost-{i}"), "REPOST", "", subject).await;
+		}
+
+		let opts = ListActionOptions {
+			typ: Some(vec!["REPOST".into()]),
+			subject: Some(subject.to_string()),
+			..Default::default()
+		};
+
+		// count() sees all 25 active reposts.
+		let n = count(&db, tn_id, &opts).await.expect("count");
+		assert_eq!(n, 25, "count() must report the true repost total");
+
+		// The old buggy path (list + len) saturates at limit+1 = 21.
+		let listed = list(&db, tn_id, &opts).await.expect("list");
+		assert_eq!(listed.len(), 21, "list() is capped at LIMIT+1, proving why count() is needed");
+	}
+
+	// H1 regression (real keyed flow): a REPOST:DEL un-repost with the same
+	// {subject,issuer,audience} key as the original REPOST must supersede it
+	// (status→'D'), dropping the live repost count to 0. The previous version of
+	// this test inserted a standalone DEL row and asserted the live total stayed
+	// 3 — it enshrined the bug (REPOST had key_pattern: None, so :DEL never
+	// superseded anything). With REPOST now keyed, the un-repost actually deletes.
+	#[tokio::test]
+	async fn count_reposts_keyed_del_supersedes() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		let subject = "a1~the-shared-post";
+		let issuer = "bob.example";
+		let audience = "bob.example"; // boost to own wall
+
+		let opts = ListActionOptions {
+			typ: Some(vec!["REPOST".into()]),
+			subject: Some(subject.to_string()),
+			..Default::default()
+		};
+
+		// A single keyed repost.
+		create_keyed(&db, tn_id, &repost_action("a1~repost-1", "", subject, issuer, audience))
+			.await;
+		assert_eq!(count(&db, tn_id, &opts).await.expect("count"), 1, "one live repost");
+
+		// The un-repost: same {subject,issuer,audience} ⇒ same key ⇒ supersedes the
+		// original. The DEL marker row is grouped separately and excluded by the
+		// caller-side filter, so the live total returns to 0.
+		create_keyed(&db, tn_id, &repost_action("a1~unrepost-1", "DEL", subject, issuer, audience))
+			.await;
+
+		let grouped = count_grouped(&db, tn_id, &opts, ActionCountGroupBy::SubType)
+			.await
+			.expect("count_grouped");
+		let live: i64 = grouped
+			.iter()
+			.filter(|(g, _)| g.as_deref() != Some("DEL"))
+			.map(|(_, c)| *c)
+			.sum();
+		assert_eq!(live, 0, "un-repost must supersede the original; live count back to 0");
+	}
+
+	// H2 regression: two keyed reposts of the same {subject,issuer,audience}
+	// collapse to a single live row (the prior is superseded to status='D'), so a
+	// peer cannot inflate the count by re-delivering the same repost.
+	#[tokio::test]
+	async fn count_reposts_keyed_dedup() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		let subject = "a1~the-shared-post";
+		let issuer = "bob.example";
+		let audience = "community.example"; // wall-repost to a community
+
+		create_keyed(&db, tn_id, &repost_action("a1~repost-1", "", subject, issuer, audience))
+			.await;
+		create_keyed(&db, tn_id, &repost_action("a1~repost-2", "", subject, issuer, audience))
+			.await;
+
+		let opts = ListActionOptions {
+			typ: Some(vec!["REPOST".into()]),
+			subject: Some(subject.to_string()),
+			..Default::default()
+		};
+		assert_eq!(
+			count(&db, tn_id, &opts).await.expect("count"),
+			1,
+			"duplicate reposts of the same target collapse to one live row"
+		);
+	}
+
+	// A boost (own wall) and a wall-repost (community) of the same subject by the
+	// same issuer have DISTINCT keys (audience differs) and therefore coexist as
+	// two independent, independently un-repostable rows — the model the
+	// ownRepostIds-by-target design assumes.
+	#[tokio::test]
+	async fn count_reposts_keyed_distinct_audiences_coexist() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		let subject = "a1~the-shared-post";
+		let issuer = "bob.example";
+
+		create_keyed(&db, tn_id, &repost_action("a1~repost-1", "", subject, issuer, "bob.example"))
+			.await;
+		create_keyed(
+			&db,
+			tn_id,
+			&repost_action("a1~repost-2", "", subject, issuer, "community.example"),
+		)
+		.await;
+
+		let opts = ListActionOptions {
+			typ: Some(vec!["REPOST".into()]),
+			subject: Some(subject.to_string()),
+			..Default::default()
+		};
+		assert_eq!(
+			count(&db, tn_id, &opts).await.expect("count"),
+			2,
+			"reposts to distinct audiences are distinct keys and coexist"
+		);
+	}
+
+	// Grouped count over >20 same-type reactions returns the true per-type total.
+	#[tokio::test]
+	async fn count_grouped_reactions_true_total() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		let subject = "a1~liked-post";
+
+		for i in 0..23 {
+			insert_action(&db, tn_id, &format!("a1~like-{i}"), "REACT", "LIKE", subject).await;
+		}
+		// A removed reaction (REACT:DEL) must not inflate the LIKE total.
+		insert_action(&db, tn_id, "a1~del-1", "REACT", "DEL", subject).await;
+
+		let opts = ListActionOptions {
+			typ: Some(vec!["REACT".into()]),
+			subject: Some(subject.to_string()),
+			..Default::default()
+		};
+		let grouped = count_grouped(&db, tn_id, &opts, ActionCountGroupBy::SubType)
+			.await
+			.expect("count_grouped");
+
+		let like = grouped.iter().find(|(g, _)| g.as_deref() == Some("LIKE")).map(|(_, c)| *c);
+		assert_eq!(like, Some(23), "LIKE total must reflect all 23 active reactions");
+		let del = grouped.iter().find(|(g, _)| g.as_deref() == Some("DEL")).map(|(_, c)| *c);
+		assert_eq!(del, Some(1), "DEL rows are grouped separately; caller excludes them");
+	}
+
+	// Guards the conditional `pa` join: when `audience_type` is set, count() must
+	// add the effective-audience profile join so the filter resolves correctly.
+	// The default (counter) path omits the join entirely; this path must not.
+	#[tokio::test]
+	async fn count_filters_by_audience_type_via_conditional_join() {
+		use cloudillo_types::meta_adapter::AudienceType;
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+
+		// Two audience profiles: one community, one personal.
+		for (id_tag, typ) in [("community.example", "C"), ("person.example", "P")] {
+			sqlx::query("INSERT INTO profiles (tn_id, id_tag, name, type) VALUES (?, ?, ?, ?)")
+				.bind(tn_id.0)
+				.bind(id_tag)
+				.bind(id_tag)
+				.bind(typ)
+				.execute(&db)
+				.await
+				.expect("insert profile");
+		}
+
+		// Two POSTs addressed to those audiences.
+		for (action_id, audience) in
+			[("a1~p-community", "community.example"), ("a1~p-person", "person.example")]
+		{
+			sqlx::query(
+				"INSERT INTO actions (tn_id, action_id, type, issuer_tag, audience, status, visibility, created_at)
+				VALUES (?, ?, 'POST', 'alice.example', ?, 'A', 'P', unixepoch())",
+			)
+			.bind(tn_id.0)
+			.bind(action_id)
+			.bind(audience)
+			.execute(&db)
+			.await
+			.expect("insert post");
+		}
+
+		let opts = ListActionOptions {
+			typ: Some(vec!["POST".into()]),
+			audience_type: Some(AudienceType::Community),
+			..Default::default()
+		};
+		let n = count(&db, tn_id, &opts).await.expect("count");
+		assert_eq!(n, 1, "only the community-addressed POST matches audienceType=community");
+	}
 }

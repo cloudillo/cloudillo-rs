@@ -194,6 +194,63 @@ pub async fn create_action(
 	let mut action = action;
 	action.visibility = visibility;
 
+	// REPOST validation + canonicalization. Public-only, no self-repost, explicit
+	// audience required, and reposts never nest (subject is flattened to the true
+	// original before signing/storing — so federation bundling never recurses).
+	{
+		let (base_type, sub_typ_x) = helpers::extract_type_and_subtype(&action.typ);
+		if base_type.as_str() == "REPOST" {
+			// Explicit audience is mandatory for EVERY repost, including the
+			// un-repost (REPOST:DEL). The supersede key is
+			// {type}:{subject}:{issuer}:{audience}; a DEL that omitted the
+			// audience would compute a non-matching key and never cancel the
+			// original repost. (Boost: own idTag; wall-repost: target.)
+			if action.audience_tag.is_none() {
+				return Err(Error::ValidationError("REPOST requires an explicit audience".into()));
+			}
+
+			// Non-DEL creates additionally validate the subject and canonicalize a
+			// repost-of-a-repost down to the true original before signing. A DEL
+			// only needs to carry the same subject+audience as the repost it
+			// cancels to produce a matching supersede key — it does not need
+			// (and must not require) the original to still be repostable.
+			if sub_typ_x.as_deref() != Some("DEL") {
+				let subject_id = action
+					.subject
+					.as_deref()
+					.ok_or_else(|| Error::ValidationError("REPOST requires a subject".into()))?;
+				let subject =
+					app.meta_adapter.get_action(tn_id, subject_id).await?.ok_or(Error::NotFound)?;
+
+				// Canonicalize: if the subject is itself a REPOST, retarget to its
+				// subject (the true original) before signing, then validate that.
+				let original = if subject.typ.as_ref() == "REPOST" {
+					let inner_id = subject.subject.as_deref().ok_or_else(|| {
+						Error::ValidationError("Reposted repost has no subject".into())
+					})?;
+					let inner = app
+						.meta_adapter
+						.get_action(tn_id, inner_id)
+						.await?
+						.ok_or(Error::NotFound)?;
+					action.subject = Some(inner_id.into());
+					inner
+				} else {
+					subject
+				};
+
+				// Single visibility gate: only public posts are repostable.
+				if original.visibility != Some('P') {
+					return Err(Error::ValidationError("Only public posts can be reposted".into()));
+				}
+				// No self-repost.
+				if original.issuer.id_tag.as_ref() == id_tag {
+					return Err(Error::ValidationError("Cannot repost your own post".into()));
+				}
+			}
+		}
+	}
+
 	// Resolve root_id from parent chain (auto-populated, not client-specified)
 	let root_id =
 		helpers::resolve_root_id(app.meta_adapter.as_ref(), tn_id, action.parent_id.as_deref())

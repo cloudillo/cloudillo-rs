@@ -22,7 +22,41 @@ use crate::hooks::{HookContext, HookResult};
 use crate::native_hooks::ownership::owns_subject;
 use crate::native_hooks::stat_emit::emit_stat_for_subject;
 use crate::prelude::*;
-use cloudillo_types::meta_adapter::UpdateActionDataOptions;
+use cloudillo_types::meta_adapter::{
+	ActionCountGroupBy, ListActionOptions, UpdateActionDataOptions,
+};
+use cloudillo_types::reactions;
+
+/// Recompute the encoded per-type reaction string for `subject_id` from the live
+/// REACT rows. Business filter (type/status/DEL handling) lives here; the adapter
+/// only does the generic grouped count.
+pub(crate) async fn count_reactions(app: &App, tn_id: TnId, subject_id: &str) -> ClResult<String> {
+	let opts = ListActionOptions {
+		typ: Some(vec!["REACT".into()]),
+		subject: Some(subject_id.to_string()),
+		..Default::default() // status unset → default "active" filter NOT IN ('D','V','F')
+	};
+	let grouped = app
+		.meta_adapter
+		.count_actions_grouped(tn_id, &opts, ActionCountGroupBy::SubType)
+		.await?;
+	let mut counts: Vec<(char, u32)> = Vec::new();
+	let mut total: u32 = 0;
+	for (sub_type, cnt) in grouped {
+		let Some(sub_type) = sub_type else { continue };
+		if sub_type == "DEL" {
+			continue; // removed reactions — excluded from counts
+		}
+		let cnt = u32::try_from(cnt).unwrap_or(0);
+		let Some(key) = reactions::reaction_type_key(&sub_type) else {
+			tracing::warn!("Unknown reaction sub_type '{}' ignored in count", sub_type);
+			continue;
+		};
+		total = total.saturating_add(cnt);
+		counts.push((key, cnt));
+	}
+	Ok(reactions::encode_reaction_counts(counts, total))
+}
 
 /// REACT on_create hook - Handle local reaction creation
 ///
@@ -52,7 +86,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	}
 
 	// Update subject action's reaction counts (per-type)
-	let new_reactions = app.meta_adapter.count_reactions(tn_id, subject_id).await?;
+	let new_reactions = count_reactions(&app, tn_id, subject_id).await?;
 
 	if let Some("DEL") = context.subtype.as_deref() {
 		tracing::info!(
@@ -114,7 +148,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 	}
 
 	// Count active reactions per type for the subject
-	let new_reactions = app.meta_adapter.count_reactions(tn_id, subject_id).await?;
+	let new_reactions = count_reactions(&app, tn_id, subject_id).await?;
 
 	if let Some("DEL") = context.subtype.as_deref() {
 		tracing::info!(

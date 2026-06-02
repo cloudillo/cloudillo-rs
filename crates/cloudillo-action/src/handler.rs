@@ -908,13 +908,14 @@ async fn read_limit_setting(app: &App, tn_id: TnId) -> i64 {
 /// Returns `(None, 0)` if absent. The reactions field is a CSV-like string
 /// of reaction-type counts; we pass it through unchanged since that's the
 /// source-of-truth shape used everywhere else.
-fn extract_counters(stat: Option<&serde_json::Value>) -> (Option<String>, i64) {
+fn extract_counters(stat: Option<&serde_json::Value>) -> (Option<String>, i64, i64) {
 	let Some(stat) = stat else {
-		return (None, 0);
+		return (None, 0, 0);
 	};
 	let reactions = stat.get("reactions").and_then(|v| v.as_str()).map(String::from);
 	let comments = stat.get("comments").and_then(serde_json::Value::as_i64).unwrap_or(0);
-	(reactions, comments)
+	let reposts = stat.get("reposts").and_then(serde_json::Value::as_i64).unwrap_or(0);
+	(reactions, comments, reposts)
 }
 
 /// Mint a fresh STAT token for the primary action carrying its current counters.
@@ -931,8 +932,8 @@ async fn mint_stat_token(
 	primary_id: &str,
 	stat: Option<&serde_json::Value>,
 ) -> Option<Box<str>> {
-	let (reactions, comments) = extract_counters(stat);
-	if reactions.is_none() && comments == 0 {
+	let (reactions, comments, reposts) = extract_counters(stat);
+	if reactions.is_none() && comments == 0 && reposts == 0 {
 		return None;
 	}
 
@@ -942,6 +943,9 @@ async fn mint_stat_token(
 	}
 	if comments > 0 {
 		content.insert("c".into(), serde_json::Value::from(comments));
+	}
+	if reposts > 0 {
+		content.insert("rp".into(), serde_json::Value::from(reposts));
 	}
 
 	let create = task::CreateAction {
@@ -1023,6 +1027,99 @@ async fn find_tenant_aprv_token(
 			warn!(action_id = %aprv.action_id, error = %e, "tenant APRV token fetch failed");
 			None
 		}
+	}
+}
+
+/// Build a single outbox item for `action`, type-agnostically.
+///
+/// The shape is driven entirely by the generic action-token fields, NOT by the
+/// action type:
+///   - own action, no subject → primary = action, related = [STAT(action)]
+///   - own action WITH subject → related also carries the subject token + its
+///     STAT (so a receiver who doesn't follow the subject's issuer can still
+///     verify and render it). REPOST inherits this for free.
+///   - 3rd-party action on the tenant's wall → primary = tenant's APRV bridge,
+///     with the action's own token prepended to related[].
+///
+/// Comments/`parent` tokens are deliberately never bundled — comments are not
+/// federated; they surface as a STAT counter fetched on demand. Returns `None`
+/// to skip the item (missing primary token, or a bridged primary with no APRV).
+async fn build_outbox_item(
+	app: &App,
+	tn_id: TnId,
+	action: &meta_adapter::ActionView,
+	requester_id_tag: &str,
+	tenant_id_tag: &str,
+) -> Option<OutboxItem> {
+	let action_token = match app.meta_adapter.get_action_token(tn_id, &action.action_id).await {
+		Ok(Some(t)) => t,
+		Ok(None) => {
+			debug!(action_id = %action.action_id, "primary token missing, skipping");
+			return None;
+		}
+		Err(e) => {
+			warn!(action_id = %action.action_id, error = %e, "primary token fetch failed");
+			return None;
+		}
+	};
+
+	let mut related: Vec<Box<str>> = Vec::new();
+
+	// STAT snapshot of the action itself (kept live later by STAT relay).
+	if let Some(stat) = mint_stat_token(app, tn_id, &action.action_id, action.stat.as_ref()).await {
+		related.push(stat);
+	}
+
+	// Subject-keyed bundling: if the action references another action, ship that
+	// reference + its STAT. Receiver dedupes if already stored; emits without the
+	// entry if a token is locally unavailable rather than dropping the primary.
+	if let Some(subject_id) = action.subject.as_deref() {
+		match app.meta_adapter.get_action_token(tn_id, subject_id).await {
+			Ok(Some(sub_tok)) => related.push(sub_tok),
+			Ok(None) => {
+				debug!(subject_id = %subject_id, "outbox: subject token missing, emitting without it");
+			}
+			Err(e) => {
+				warn!(subject_id = %subject_id, error = %e, "outbox: subject token fetch failed");
+			}
+		}
+		// Only mint a STAT for the subject when this tenant is its authoritative
+		// owner. For the common REPOST case the subject is a 3rd-party post, and
+		// a STAT we self-mint for it would be rejected by the receiver's R2 rule
+		// (which requires the STAT issuer to own the target) — wasted minting and
+		// bandwidth. The subject *token* is still bundled above so the receiver
+		// can render the original without following its issuer.
+		if let Ok(Some(sub_action)) = app.meta_adapter.get_action(tn_id, subject_id).await
+			&& crate::native_hooks::ownership::owns_subject(&sub_action, tenant_id_tag)
+			&& let Some(sub_stat) =
+				mint_stat_token(app, tn_id, subject_id, sub_action.stat.as_ref()).await
+		{
+			related.push(sub_stat);
+		}
+	}
+
+	let issuer_is_tenant = action.issuer.id_tag.as_ref() == tenant_id_tag;
+	if issuer_is_tenant {
+		// Receiver follows the tenant → primary passes the inbound permission
+		// check directly.
+		Some(OutboxItem { token: action_token, related })
+	} else {
+		// 3rd-party-on-wall: the tenant's APRV is the trusted bridge; without it
+		// the receiver can't ingest the primary. Skip rather than emit a rejected
+		// item.
+		let Some(aprv_token) =
+			find_tenant_aprv_token(app, tn_id, &action.action_id, requester_id_tag, tenant_id_tag)
+				.await
+		else {
+			debug!(
+				action_id = %action.action_id,
+				issuer = %action.issuer.id_tag,
+				"outbox: no tenant APRV for bridged primary, skipping"
+			);
+			return None;
+		};
+		related.insert(0, action_token);
+		Some(OutboxItem { token: aprv_token, related })
 	}
 }
 
@@ -1135,57 +1232,13 @@ pub async fn get_outbox(
 
 	let mut items: Vec<OutboxItem> = Vec::with_capacity(primaries.len());
 	for primary in primaries {
-		let primary_token = match app.meta_adapter.get_action_token(tn_id, &primary.action_id).await
+		// Generic, type-agnostic bundling (subject-keyed). REPOST and any future
+		// subject-referencing broadcast type get correct bundling for free.
+		if let Some(item) =
+			build_outbox_item(&app, tn_id, &primary, &requester, &tenant_id_tag).await
 		{
-			Ok(Some(t)) => t,
-			Ok(None) => {
-				debug!(action_id = %primary.action_id, "primary token missing, skipping");
-				continue;
-			}
-			Err(e) => {
-				warn!(action_id = %primary.action_id, error = %e, "primary token fetch failed");
-				continue;
-			}
-		};
-
-		let stat_token =
-			mint_stat_token(&app, tn_id, &primary.action_id, primary.stat.as_ref()).await;
-
-		let issuer_is_tenant = primary.issuer.id_tag.as_ref() == tenant_id_tag.as_ref();
-		let item = if issuer_is_tenant {
-			// Case A — primary is the tenant's own post. Receiver follows the
-			// tenant, so primary processing passes the inbound permission
-			// check directly. STAT rides as a related token.
-			let mut related: Vec<Box<str>> = Vec::new();
-			if let Some(stat) = stat_token {
-				related.push(stat);
-			}
-			OutboxItem { token: primary_token, related }
-		} else {
-			// Case B — 3rd-party post on the tenant's wall. The tenant's APRV
-			// is the trusted bridge; without it the receiver can't ingest the
-			// primary (issuer not followed). Skip items missing such an APRV
-			// rather than emit something the receiver would reject.
-			let Some(aprv_token) =
-				find_tenant_aprv_token(&app, tn_id, &primary.action_id, &requester, &tenant_id_tag)
-					.await
-			else {
-				debug!(
-					action_id = %primary.action_id,
-					issuer = %primary.issuer.id_tag,
-					"outbox: no tenant APRV for bridged primary, skipping"
-				);
-				continue;
-			};
-			let mut related: Vec<Box<str>> = Vec::with_capacity(2);
-			related.push(primary_token);
-			if let Some(stat) = stat_token {
-				related.push(stat);
-			}
-			OutboxItem { token: aprv_token, related }
-		};
-
-		items.push(item);
+			items.push(item);
+		}
 	}
 
 	let response =

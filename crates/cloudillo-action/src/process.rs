@@ -16,6 +16,7 @@ use crate::{
 	dsl::DslEngine,
 	helpers,
 	key_cache::KeyFetchCache,
+	native_hooks::ownership::owns_subject,
 	post_store::{self, ProcessingContext},
 	prelude::*,
 };
@@ -585,16 +586,55 @@ async fn check_inbound_permissions(
 		.as_ref()
 		.is_some_and(|p| p.following || p.connected.is_connected());
 
-	if !allowed {
-		warn!(
-			issuer = %action.iss,
-			action_type = %action.t,
-			"Permission denied - sender not following/connected"
-		);
-		return Err(Error::PermissionDenied);
+	if allowed {
+		return Ok(());
 	}
 
-	Ok(())
+	// Subject-anchored acceptance rules, evaluated IN ADDITION to the follower
+	// gate (any rule granting is sufficient). These are type-agnostic: they make
+	// stranger-engagement on public content work without per-type branches.
+	//
+	// R1 — accept engagement on your own content. If an engagement action
+	// (REACT/REPOST only) references a locally-owned action via `subject` whose
+	// visibility admits the sender (public ⇒ anyone), accept regardless of
+	// follow state. This is what lets the original poster accept a REPOST/REACT
+	// from a non-follower. Restricting to the engagement allowlist keeps the
+	// rule from broadening stranger access to arbitrary subject-bearing types
+	// (e.g. a stranger commenting on a public post still requires the follow
+	// gate). The owner predicate (audience if set, else issuer) is the shared
+	// `owns_subject` helper.
+	let (base_type, _sub) = helpers::extract_type_and_subtype(&action.t);
+	if matches!(base_type.as_str(), "REACT" | "REPOST")
+		&& let Some(subject_id) = action.sub.as_deref()
+		&& let Ok(Some(subject)) = app.meta_adapter.get_action(tn_id, subject_id).await
+		&& let Ok(tenant) = app.meta_adapter.read_tenant(tn_id).await
+		&& owns_subject(&subject, tenant.id_tag.as_ref())
+		&& subject.visibility == Some('P')
+	{
+		return Ok(());
+	}
+
+	// R2 — accept a STAT for content you hold, but only from the target's
+	// authoritative owner (its audience if community-hosted, else its issuer).
+	// A STAT references its target via `parent`. Restricting the issuer to the
+	// authoritative owner (mirroring stat.rs's owner computation) prevents a
+	// non-authoritative stranger from injecting counter STATs for content we
+	// merely mirror. This still lets a non-follower reposter (and its followers)
+	// accept the original's relayed STAT — no follow relationship required.
+	if action.t.starts_with("STAT")
+		&& let Some(target_id) = action.p.as_deref()
+		&& let Ok(Some(target)) = app.meta_adapter.get_action(tn_id, target_id).await
+		&& owns_subject(&target, &action.iss)
+	{
+		return Ok(());
+	}
+
+	warn!(
+		issuer = %action.iss,
+		action_type = %action.t,
+		"Permission denied - sender not following/connected"
+	);
+	Err(Error::PermissionDenied)
 }
 
 /// Check subscription-based permissions for actions that require active subscriptions

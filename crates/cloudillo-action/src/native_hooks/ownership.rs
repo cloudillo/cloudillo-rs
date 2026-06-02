@@ -62,6 +62,7 @@ mod tests {
 			attachments: None,
 			subject: None,
 			subject_profile: None,
+			subject_action: None,
 			created_at: Timestamp(0),
 			expires_at: None,
 			status: None,
@@ -69,6 +70,7 @@ mod tests {
 			visibility: None,
 			flags: None,
 			x: None,
+			token: None,
 		}
 	}
 

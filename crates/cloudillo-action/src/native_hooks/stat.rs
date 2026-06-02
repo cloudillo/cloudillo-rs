@@ -84,6 +84,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				} else {
 					let r_str = content_val.get("r").and_then(|v| v.as_str());
 					let c_int = content_val.get("c").and_then(serde_json::Value::as_u64);
+					let rp_int = content_val.get("rp").and_then(serde_json::Value::as_u64);
 
 					let reactions_patch = match r_str {
 						Some(s) => Patch::Value(s.to_string()),
@@ -93,13 +94,19 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 						Some(n) => Patch::Value(u32::try_from(n).unwrap_or(u32::MAX)),
 						None => Patch::Undefined,
 					};
+					let reposts_patch = match rp_int {
+						Some(n) => Patch::Value(u32::try_from(n).unwrap_or(u32::MAX)),
+						None => Patch::Undefined,
+					};
 
-					if !matches!(reactions_patch, Patch::Undefined)
-						|| !matches!(comments_patch, Patch::Undefined)
+					if !reactions_patch.is_undefined()
+						|| !comments_patch.is_undefined()
+						|| !reposts_patch.is_undefined()
 					{
 						let update_opts = UpdateActionDataOptions {
 							reactions: reactions_patch,
 							comments: comments_patch,
+							reposts: reposts_patch,
 							stat_at: Patch::Value(Timestamp(incoming_created_at)),
 							..Default::default()
 						};

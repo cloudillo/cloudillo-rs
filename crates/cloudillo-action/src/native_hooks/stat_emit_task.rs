@@ -73,22 +73,30 @@ impl Task<App> for StatEmitTask {
 
 	async fn run(&self, app: &App) -> ClResult<()> {
 		// Read freshest counters.
-		let reactions = app.meta_adapter.count_reactions(self.tn_id, &self.subject_id).await?;
+		let reactions =
+			crate::native_hooks::react::count_reactions(app, self.tn_id, &self.subject_id).await?;
 		let comments = app
 			.meta_adapter
 			.get_action_data(self.tn_id, &self.subject_id)
 			.await?
 			.and_then(|d| d.comments)
 			.unwrap_or(0);
+		// Repost count: active REPOSTs (excluding DEL markers) whose subject is
+		// this action. The authoritative owner also persists this to the
+		// denormalized `actions.reposts` column (see repost.rs); here it is
+		// recomputed fresh and carried in the STAT `rp` field so mirrors and
+		// reposters' embedded cards stay live.
+		let reposts = count_reposts(app, self.tn_id, &self.subject_id).await?;
 
-		// Always emit both `r` and `c`, including empty/zero values:
+		// Always emit `r`, `c`, and `rp`, including empty/zero values:
 		// receivers need an explicit zeroing signal to decrement their
 		// mirrored counts. Omitting a field would mean "no change", so
 		// remote counters would never return to zero after the last
-		// REACT/CMNT was deleted.
+		// REACT/CMNT/REPOST was deleted.
 		let mut content = serde_json::Map::new();
 		content.insert("r".into(), serde_json::Value::String(reactions.clone()));
 		content.insert("c".into(), serde_json::Value::from(comments));
+		content.insert("rp".into(), serde_json::Value::from(reposts));
 
 		let create = CreateAction {
 			typ: "STAT".into(),
@@ -119,7 +127,8 @@ impl Task<App> for StatEmitTask {
 		// drop-and-rescue path is exercised indirectly via the scheduler
 		// integration tests in `crates/cloudillo-core/tests/` and via the
 		// manual federation flow documented in the M2 verification step.
-		let post_reactions = app.meta_adapter.count_reactions(self.tn_id, &self.subject_id).await?;
+		let post_reactions =
+			crate::native_hooks::react::count_reactions(app, self.tn_id, &self.subject_id).await?;
 		let post_comments = app
 			.meta_adapter
 			.get_action_data(self.tn_id, &self.subject_id)
@@ -137,6 +146,31 @@ impl Task<App> for StatEmitTask {
 		}
 		Ok(())
 	}
+}
+
+/// Count active REPOSTs whose `subject` is `subject_id`. Business filter
+/// (type/status/DEL handling) lives here; the adapter only does the generic
+/// grouped count.
+pub(crate) async fn count_reposts(app: &App, tn_id: TnId, subject_id: &str) -> ClResult<i64> {
+	use cloudillo_types::meta_adapter::{ActionCountGroupBy, ListActionOptions};
+	let opts = ListActionOptions {
+		typ: Some(vec!["REPOST".into()]),
+		subject: Some(subject_id.to_string()),
+		..Default::default() // status unset → default "active" filter
+	};
+	// Exclude REPOST:DEL marker rows, mirroring react::count_reactions. Normal
+	// reposts carry an empty/NULL sub_type and are summed; the "DEL" group is the
+	// un-repost marker and must not inflate the count.
+	let grouped = app
+		.meta_adapter
+		.count_actions_grouped(tn_id, &opts, ActionCountGroupBy::SubType)
+		.await?;
+	let total = grouped
+		.into_iter()
+		.filter(|(sub_type, _)| sub_type.as_deref() != Some("DEL"))
+		.map(|(_, cnt)| cnt)
+		.sum();
+	Ok(total)
 }
 
 #[cfg(test)]

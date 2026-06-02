@@ -10,6 +10,19 @@
 //!     the top 5 entries, sorted DESC by count then ASC by code.
 //!   - Empty list with `total == 0` encodes as an empty string.
 
+/// Map a reaction sub_type (e.g. "LIKE") to its single-char wire key.
+pub fn reaction_type_key(sub_type: &str) -> Option<char> {
+	match sub_type {
+		"LIKE" => Some('L'),
+		"LOVE" => Some('V'),
+		"LAUGH" => Some('H'),
+		"WOW" => Some('W'),
+		"SAD" => Some('S'),
+		"ANGRY" => Some('A'),
+		_ => None,
+	}
+}
+
 /// Encodes reactions into the canonical wire format. Sorts and truncates
 /// `entries` in place so callers can't accidentally pass unsorted data.
 /// Returns "" when `total == 0`.
