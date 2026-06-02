@@ -95,6 +95,16 @@ fn can_access_identity(identity: &Identity, requester_id_tag: &str) -> bool {
 	)
 }
 
+/// True iff the caller is an admin of this IDP domain: the literal domain
+/// owner (id_tag == idp_domain) or a community leader (role "leader").
+///
+/// Mirrors the frontend gate `isOwner || roles.includes('leader')` in
+/// shell/src/idp/identities.tsx so leaders see/manage the identities the
+/// management UI already shows them controls for.
+fn is_idp_admin(auth_id_tag: &str, auth_roles: &[Box<str>], idp_domain: &str) -> bool {
+	auth_id_tag == idp_domain || auth_roles.iter().any(|r| r.as_ref() == "leader")
+}
+
 /// Response structure for identity details
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -269,7 +279,10 @@ pub async fn get_identity_by_id(
 	// per-user checks.
 	let target_id_tag = format!("{}.{}", id_tag_prefix, id_tag_domain);
 	let is_self = auth.id_tag.as_ref() == target_id_tag;
-	if !is_self && !can_access_identity(&identity, auth.id_tag.as_ref()) {
+	if !is_self
+		&& !can_access_identity(&identity, auth.id_tag.as_ref())
+		&& !is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref())
+	{
 		warn!(
 			identity_id = %identity_id,
 			requested_by = %auth.id_tag,
@@ -319,7 +332,7 @@ pub async fn list_identities(
 	// authenticated caller is scoped to identities they registered themselves —
 	// otherwise an authenticated user from an unrelated tenant could enumerate
 	// every identity hosted at this IDP.
-	let is_idp_owner = auth.id_tag.as_ref() == idp_domain.as_ref();
+	let is_idp_owner = is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref());
 	let registrar_filter = if is_idp_owner {
 		query_params.registrar_id_tag.clone()
 	} else {
@@ -750,7 +763,10 @@ pub async fn delete_identity(
 	// matches the registrar — bypassing per-user checks.
 	let target_id_tag = format!("{}.{}", id_tag_prefix, id_tag_domain);
 	let is_self = auth.id_tag.as_ref() == target_id_tag;
-	if !is_self && !can_access_identity(&existing, auth.id_tag.as_ref()) {
+	if !is_self
+		&& !can_access_identity(&existing, auth.id_tag.as_ref())
+		&& !is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref())
+	{
 		warn!(
 			identity_id = %identity_id,
 			requested_by = %auth.id_tag,
@@ -826,7 +842,10 @@ pub async fn update_identity_settings(
 	// matches the registrar — bypassing per-user checks.
 	let target_id_tag = format!("{}.{}", id_tag_prefix, id_tag_domain);
 	let is_self = auth.id_tag.as_ref() == target_id_tag;
-	if !is_self && !can_access_identity(&existing, auth.id_tag.as_ref()) {
+	if !is_self
+		&& !can_access_identity(&existing, auth.id_tag.as_ref())
+		&& !is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref())
+	{
 		warn!(
 			identity_id = %identity_id,
 			requested_by = %auth.id_tag,
@@ -1339,6 +1358,36 @@ pub async fn activate_identity(
 	}
 
 	Ok((StatusCode::OK, Json(response)))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::is_idp_admin;
+
+	fn roles(items: &[&str]) -> Box<[Box<str>]> {
+		items.iter().map(|s| (*s).into()).collect()
+	}
+
+	#[test]
+	fn leader_with_nonmatching_id_tag_is_admin() {
+		// The reported bug: a community leader whose id_tag is NOT the IDP
+		// domain must still be treated as an admin (unfiltered listing).
+		let r = roles(&["leader"]);
+		assert!(is_idp_admin("alice.example.com", &r, "cloudillo.net"));
+	}
+
+	#[test]
+	fn literal_domain_owner_is_admin() {
+		let r = roles(&[]);
+		assert!(is_idp_admin("cloudillo.net", &r, "cloudillo.net"));
+	}
+
+	#[test]
+	fn non_leader_non_owner_is_not_admin() {
+		// Empty roles (e.g. IDP API-key callers) and unrelated roles stay scoped.
+		assert!(!is_idp_admin("alice.example.com", &roles(&[]), "cloudillo.net"));
+		assert!(!is_idp_admin("alice.example.com", &roles(&["member", "editor"]), "cloudillo.net"));
+	}
 }
 
 // vim: ts=4
