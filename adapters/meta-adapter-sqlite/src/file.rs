@@ -878,15 +878,50 @@ pub(crate) async fn create(
 				.map_err(|_| Error::DbError)?;
 
 		if let Some(f_id) = existing {
-			return Ok(FileId::FId(u64::try_from(f_id).unwrap_or_default()));
+			return Ok(FileId::FId(u64::try_from(f_id).map_err(|_| Error::DbError)?));
 		}
 	}
 
-	let res = sqlx::query("INSERT INTO files (tn_id, file_id, parent_id, root_id, status, owner_tag, creator_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility, hidden) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING f_id")
-		.bind(tn_id.0).bind(opts.file_id).bind(opts.parent_id).bind(opts.root_id).bind(status).bind(opts.owner_tag).bind(opts.creator_tag).bind(opts.preset).bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0).bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility).bind(i32::from(opts.hidden))
-		.fetch_one(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	// Conflict-tolerant insert: a racing create() for the same shared file_id
+	// (common during bulk action federation at registration) must not hard-error
+	// on the UNIQUE(file_id, tn_id) index. On conflict, return the row the other
+	// writer created. NULL file_id rows never conflict (SQLite treats NULLs as
+	// distinct), so pending uploads are unaffected.
+	let inserted: Option<i64> = sqlx::query_scalar(
+		"INSERT INTO files (tn_id, file_id, parent_id, root_id, status, owner_tag, creator_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility, hidden) \
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+		 ON CONFLICT(file_id, tn_id) DO NOTHING \
+		 RETURNING f_id",
+	)
+		.bind(tn_id.0).bind(&opts.file_id).bind(opts.parent_id).bind(opts.root_id)
+		.bind(status).bind(opts.owner_tag).bind(opts.creator_tag).bind(opts.preset)
+		.bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0)
+		.bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility)
+		.bind(i32::from(opts.hidden))
+		.fetch_optional(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
-	Ok(FileId::FId(res.get(0)))
+	if let Some(f_id) = inserted {
+		return Ok(FileId::FId(u64::try_from(f_id).map_err(|_| Error::DbError)?));
+	}
+
+	// Conflict (DO NOTHING returned no row) — a concurrent caller won the race.
+	// The write pool is single-connection and auto-commits, so the row is now
+	// committed and visible. Fetch and return its f_id.
+	let existing: Option<i64> =
+		sqlx::query_scalar("SELECT f_id FROM files WHERE tn_id=? AND file_id=?")
+			.bind(tn_id.0)
+			.bind(&opts.file_id)
+			.fetch_optional(db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+
+	match existing {
+		Some(f_id) => Ok(FileId::FId(u64::try_from(f_id).map_err(|_| Error::DbError)?)),
+		// DO NOTHING only fires on a real conflict; absence here means the row
+		// was inserted then removed concurrently — surface as a DB error.
+		None => Err(Error::DbError),
+	}
 }
 
 /// Create a file variant
@@ -1650,5 +1685,93 @@ mod tests {
 	#[test]
 	fn test_parse_broken_reason_unknown_value() {
 		assert_eq!(parse_broken_reason(Some("not-a-real-reason")), None);
+	}
+
+	use cloudillo_types::meta_adapter::{CreateFile, FileId, FileStatus};
+	use cloudillo_types::prelude::TnId;
+	use sqlx::Row;
+	use sqlx::sqlite::{self, SqlitePool};
+
+	// Build a production-like single-connection write pool over a temp DB file
+	// (mirrors `MetaAdapterSqlite::new`: WAL, single write connection).
+	async fn test_pool(dir: &std::path::Path) -> SqlitePool {
+		let opts = sqlite::SqliteConnectOptions::new()
+			.filename(dir.join("meta.db"))
+			.create_if_missing(true)
+			.journal_mode(sqlite::SqliteJournalMode::Wal);
+		let db = sqlite::SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect_with(opts)
+			.await
+			.expect("connect test pool");
+		crate::schema::init_db(&db).await.expect("init schema");
+		db
+	}
+
+	fn shared_file_opts(file_id: &str) -> CreateFile {
+		CreateFile {
+			orig_variant_id: None,
+			file_id: Some(file_id.into()),
+			parent_id: None,
+			root_id: None,
+			owner_tag: Some("alice.example".into()),
+			creator_tag: Some("alice.example".into()),
+			preset: None,
+			content_type: "image/jpeg".into(),
+			file_name: "shared.jpg".into(),
+			file_tp: Some("BLOB".into()),
+			created_at: None,
+			tags: None,
+			x: None,
+			visibility: None,
+			hidden: false,
+			status: Some(FileStatus::Active),
+		}
+	}
+
+	// Reproduces the bulk-federation race: N concurrent create() calls for the
+	// same explicit (file_id, tn_id). All must succeed, return the same f_id,
+	// and leave exactly one row — no UNIQUE constraint crash.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn create_file_concurrent_same_file_id() {
+		for iter in 0..10 {
+			let dir = tempfile::tempdir().expect("tempdir");
+			let db = test_pool(dir.path()).await;
+			let tn_id = TnId(1);
+			let file_id = "f1~6A_MV8F8cImk_6XZsDgvKgnA0gDmREC0rFhLLYbOJWs";
+
+			let mut handles = Vec::new();
+			for _ in 0..8 {
+				let db = db.clone();
+				handles.push(tokio::spawn(async move {
+					super::create(&db, tn_id, shared_file_opts(file_id)).await
+				}));
+			}
+
+			let mut f_ids = Vec::new();
+			for h in handles {
+				let res = h.await.expect("task join");
+				let id =
+					res.unwrap_or_else(|e| panic!("iter {iter}: create() returned Err: {e:?}"));
+				match id {
+					FileId::FId(f_id) => f_ids.push(f_id),
+					other @ FileId::FileId(_) => {
+						panic!("iter {iter}: expected FId, got {other:?}")
+					}
+				}
+			}
+
+			let first = f_ids[0];
+			assert!(f_ids.iter().all(|&f| f == first), "iter {iter}: divergent f_ids: {f_ids:?}");
+
+			let count: i64 = sqlx::query("SELECT count(*) FROM files WHERE tn_id=? AND file_id=?")
+				.bind(tn_id.0)
+				.bind(file_id)
+				.fetch_one(&db)
+				.await
+				.expect("count query")
+				.get(0);
+			assert_eq!(count, 1, "iter {iter}: expected exactly one files row");
+		}
 	}
 }
