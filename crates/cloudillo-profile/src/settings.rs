@@ -91,6 +91,31 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Delay (seconds) before the onboarding welcome email is sent when the
+	// invitation carries auto-connect/auto-join effects, so the CONN + INVTs
+	// land in the new user's inbox first. Plain invites are unaffected.
+	registry.register(
+		SettingDefinition::builder("onboarding.welcome_email_delay")
+			.description(
+				"Delay in seconds before sending the welcome email for invitations that auto-connect or auto-join communities (orders inbox effects before login)",
+			)
+			.default(SettingValue::Int(crate::register::DEFAULT_WELCOME_EMAIL_DELAY))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.validator(|v| {
+				if let SettingValue::Int(n) = v
+					&& *n >= 0
+					&& *n <= 3600
+				{
+					return Ok(());
+				}
+				Err(Error::ValidationError(
+					"Welcome email delay must be between 0 and 3600 seconds".into(),
+				))
+			})
+			.build()?,
+	)?;
+
 	// Auto-approve incoming federated actions
 	registry.register(
 		SettingDefinition::builder("profile.auto_approve_actions")

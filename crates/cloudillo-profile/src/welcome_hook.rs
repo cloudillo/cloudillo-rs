@@ -5,7 +5,9 @@
 //! ACME issues the tenant's first certificate.
 
 use crate::prelude::*;
-use crate::register::{PENDING_WELCOME_EMAIL_SETTING, PendingWelcomeEmail, send_welcome_email};
+use crate::register::{
+	PENDING_WELCOME_EMAIL_SETTING, PendingWelcomeEmail, WelcomeEmailParams, send_welcome_email,
+};
 
 /// Read the pending-welcome-email marker for `tn_id`, mint a fresh welcome
 /// ref, queue the email, then clear the marker. Idempotent: if the setting
@@ -44,6 +46,11 @@ pub async fn flush_deferred_welcome_email(
 	// different tenant or the caller resolved the wrong row.
 	debug_assert_eq!(id_tag, pending.id_tag.as_str());
 
+	// `pending` is consumed by the params struct below; keep copies for the
+	// final log line.
+	let log_email = pending.to.clone();
+	let log_lang = pending.lang.clone();
+
 	// Schedule first, then clear the marker. `send_welcome_email` calls
 	// `schedule_email_task_with_key` with `welcome:{tn_id}` as `custom_key`,
 	// which dedupes on the scheduler side — so a retry triggered by a still-
@@ -51,12 +58,18 @@ pub async fn flush_deferred_welcome_email(
 	// firing from double-sending.
 	send_welcome_email(
 		app,
-		tn_id,
-		&pending.to,
-		&pending.id_tag,
-		pending.lang.clone(),
-		pending.from_name_override,
-		"deferred_welcome_hook",
+		WelcomeEmailParams {
+			tn_id,
+			to: pending.to,
+			id_tag: pending.id_tag,
+			lang: pending.lang,
+			from_name_override: pending.from_name_override,
+			// Deferred path: register-time effects (the following=1 seed, CONN
+			// and INVTs) already ran during registration, so there is no
+			// ordering to protect here — send immediately once the cert is ready.
+			delay_seconds: None,
+			log_context: "deferred_welcome_hook",
+		},
 	)
 	.await?;
 
@@ -70,7 +83,7 @@ pub async fn flush_deferred_welcome_email(
 			 dedup will prevent double-send on retry");
 	}
 
-	info!(email = %pending.to, tn_id = ?tn_id, lang = ?pending.lang,
+	info!(email = %log_email, tn_id = ?tn_id, lang = ?log_lang,
 		"Welcome email queued (deferred — first ACME cert issued)");
 
 	Ok(())

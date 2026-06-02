@@ -817,7 +817,7 @@ pub async fn post_set_password(
 	// Validate the ref non-destructively first so we can refuse to consume
 	// the counter when the IDP-activation gate is still engaged. The user
 	// will retry from the same welcome link after activating their identity.
-	let (tn_id, id_tag, _ref_data) = app
+	let (tn_id, id_tag, ref_data) = app
 		.meta_adapter
 		.validate_ref(&req.ref_id, &["welcome", "password"])
 		.await
@@ -862,11 +862,15 @@ pub async fn post_set_password(
 		"Setting password via reference"
 	);
 
-	// Consume the ref now that we're committed to the success path.
-	app.meta_adapter
-		.use_ref(&req.ref_id, &["welcome", "password"])
-		.await
-		.map_err(|e| {
+	// Consume the ref now that we're committed to the success path — but ONLY
+	// for `password` (reset) refs, which must stay strictly single-use. A
+	// `welcome` ref is deliberately left intact here so the reversible
+	// onboarding wizard can re-enter the flow from the same link (resume on
+	// reopen) and commit only at the end. The welcome ref is consumed later by
+	// the authenticated POST /api/onboarding/complete endpoint. Re-posting here
+	// with a still-valid welcome ref simply re-sets the password (idempotent).
+	if &*ref_data.r#type == "password" {
+		app.meta_adapter.use_ref(&req.ref_id, &["password"]).await.map_err(|e| {
 			warn!("Failed to use ref {}: {}", req.ref_id, e);
 			match e {
 				Error::NotFound => Error::ValidationError("Invalid or expired reference".into()),
@@ -874,6 +878,7 @@ pub async fn post_set_password(
 				_ => Error::ValidationError("Invalid reference".into()),
 			}
 		})?;
+	}
 
 	// Update the password
 	app.auth_adapter.update_tenant_password(&id_tag, &req.new_password).await?;
@@ -891,6 +896,66 @@ pub async fn post_set_password(
 	let (_status, Json(login_data)) = return_login(&app, auth).await?;
 	let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
 
+	Ok((StatusCode::OK, Json(response)))
+}
+
+/// # POST /api/onboarding/complete
+/// Finish the reversible onboarding wizard.
+///
+/// `post_set_password` deliberately leaves the `welcome` ref intact so the user
+/// can re-enter the flow from the welcome link (resume on reopen) until they
+/// commit. This authenticated endpoint is the single commit point: it validates
+/// that `refId` is a `welcome` ref belonging to the caller's own tenant and then
+/// consumes it, retiring the link. Clearing the `ui.onboarding` gate is done by
+/// the frontend via `settings.update` to avoid a double-clear race.
+///
+/// Idempotent for the client: if the ref is already consumed (e.g. a retried
+/// Finish) the lookup fails and we return success rather than an error, since
+/// "already complete" is the desired end state.
+#[derive(Deserialize)]
+pub struct CompleteOnboardingReq {
+	#[serde(rename = "refId")]
+	ref_id: String,
+}
+
+pub async fn post_complete_onboarding(
+	State(app): State<App>,
+	Auth(auth): Auth,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(req): Json<CompleteOnboardingReq>,
+) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+	// Validate the ref is a welcome ref and belongs to the caller. We validate
+	// first (non-destructive) so an unrelated/already-consumed ref can't be
+	// used to tamper, and so we can treat "already gone" as success below.
+	match app.meta_adapter.validate_ref(&req.ref_id, &["welcome"]).await {
+		Ok((tn_id, _id_tag, _ref_data)) => {
+			if tn_id != auth.tn_id {
+				warn!(
+					caller = %auth.id_tag,
+					ref_id = %req.ref_id,
+					"complete-onboarding: welcome ref belongs to a different tenant"
+				);
+				return Err(Error::PermissionDenied);
+			}
+			// Consume the welcome ref, retiring the onboarding link.
+			if let Err(e) = app.meta_adapter.use_ref(&req.ref_id, &["welcome"]).await {
+				warn!("complete-onboarding: failed to consume welcome ref {}: {}", req.ref_id, e);
+			} else {
+				info!(id_tag = %auth.id_tag, ref_id = %req.ref_id, "Onboarding completed");
+			}
+		}
+		Err(Error::NotFound | Error::ValidationError(_)) => {
+			// Ref already consumed/expired — onboarding is effectively complete.
+			info!(
+				id_tag = %auth.id_tag,
+				ref_id = %req.ref_id,
+				"complete-onboarding: welcome ref already retired; treating as complete"
+			);
+		}
+		Err(e) => return Err(e),
+	}
+
+	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -1041,6 +1106,7 @@ pub async fn post_forgot_password(
 		lang,
 		custom_key: Some(format!("pw-reset:{}:{}", tn_id.0, now)),
 		from_name_override: Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
+		delay_seconds: None,
 	};
 
 	if let Err(e) =

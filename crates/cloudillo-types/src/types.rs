@@ -326,6 +326,14 @@ pub struct ProfileBase {
 	pub keys: Vec<crate::auth_adapter::AuthKey>,
 }
 
+/// Public app/web domain of a tenant (the cert `domain`). Used by clients on the
+/// API host (`cl-o.<idTag>`) to build links to the tenant's web UI (share links).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppDomainRes {
+	pub app_domain: String,
+}
+
 /// Profile patch for PATCH /me endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

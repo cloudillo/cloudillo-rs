@@ -148,6 +148,11 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/auth/password", post(auth::handler::post_password))
 		.route("/api/auth/vapid", get(push::handler::get_vapid_public_key))
 
+		// --- Onboarding completion (authenticated) ---
+		// Single commit point of the reversible onboarding wizard: consumes the
+		// welcome ref (left intact by post_set_password) to retire the link.
+		.route("/api/onboarding/complete", post(auth::handler::post_complete_onboarding))
+
 		// --- QR Login (Protected) ---
 		.route("/api/auth/qr-login/{session_id}/details", get(auth::qr_login::get_details))
 		.route("/api/auth/qr-login/{session_id}/respond", post(auth::qr_login::post_respond))
@@ -399,6 +404,7 @@ fn init_public_routes(app: App) -> Router<App> {
 		// Tenant Discovery
 		.route("/api/me", get(profile::handler::get_tenant_profile_base))
 		.route("/api/me/full", get(profile::handler::get_tenant_profile))
+		.route("/api/me/app-domain", get(profile::handler::get_tenant_app_domain))
 
 		// Public References
 		.route("/api/refs/{ref_id}", get(r#ref::handler::get_ref))

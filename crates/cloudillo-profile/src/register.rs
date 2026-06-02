@@ -22,6 +22,7 @@ use cloudillo_core::{
 use cloudillo_idp::registration::{IdpRegContent, IdpRegResponse};
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::address::parse_address_type;
+use cloudillo_types::meta_adapter::{ProfileType, UpsertProfileFields};
 use cloudillo_types::types::{ApiResponse, RegisterRequest, RegisterVerifyCheckRequest};
 use cloudillo_types::utils::derive_name_from_id_tag;
 
@@ -342,18 +343,28 @@ pub(crate) struct PendingWelcomeEmail {
 	pub id_tag: String,
 }
 
+/// Render + scheduling inputs for the onboarding welcome email. Bundled into one
+/// struct so `send_welcome_email` / `queue_or_defer_welcome_email` stay at two
+/// parameters instead of a long, transposition-prone positional list.
+pub(crate) struct WelcomeEmailParams {
+	pub tn_id: TnId,
+	pub to: String,
+	pub id_tag: String,
+	pub lang: Option<String>,
+	pub from_name_override: Option<String>,
+	/// See `EmailTaskParams::delay_seconds`: `Some(n>0)` delays the task `n`
+	/// seconds; `None`/`0` sends immediately.
+	pub delay_seconds: Option<i64>,
+	pub log_context: &'static str,
+}
+
 /// Mint a fresh welcome ref and queue the welcome email. Used by both the
 /// immediate-send path (cert already valid at registration time) and the
 /// deferred flush hook (`welcome_hook::flush_deferred_welcome_email`) once
 /// ACME completes.
 pub(crate) async fn send_welcome_email(
 	app: &cloudillo_core::app::App,
-	tn_id: TnId,
-	to: &str,
-	id_tag: &str,
-	lang: Option<String>,
-	from_name_override: Option<String>,
-	log_context: &str,
+	params: WelcomeEmailParams,
 ) -> ClResult<()> {
 	let base_id_tag = app
 		.opts
@@ -363,13 +374,13 @@ pub(crate) async fn send_welcome_email(
 
 	let (_ref_id, welcome_link) = cloudillo_ref::service::create_ref_internal(
 		app,
-		tn_id,
+		params.tn_id,
 		cloudillo_ref::service::CreateRefInternalParams {
-			id_tag,
+			id_tag: &params.id_tag,
 			typ: "welcome",
 			description: Some("Welcome to Cloudillo"),
 			expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
-			path_prefix: "/onboarding/welcome",
+			path_prefix: "/onboarding",
 			resource_id: None,
 			count: None,
 			params: None,
@@ -378,7 +389,7 @@ pub(crate) async fn send_welcome_email(
 	.await?;
 
 	let template_vars = serde_json::json!({
-		"identity_tag": id_tag,
+		"identity_tag": params.id_tag,
 		"base_id_tag": base_id_tag.as_ref(),
 		"instance_name": "Cloudillo",
 		"welcome_link": welcome_link,
@@ -387,21 +398,22 @@ pub(crate) async fn send_welcome_email(
 	cloudillo_email::EmailModule::schedule_email_task_with_key(
 		&app.scheduler,
 		&app.settings,
-		tn_id,
+		params.tn_id,
 		cloudillo_email::EmailTaskParams {
-			to: to.to_string(),
+			to: params.to.clone(),
 			subject: None,
 			template_name: "welcome".to_string(),
 			template_vars,
-			lang: lang.clone(),
-			custom_key: Some(format!("welcome:{}", tn_id.0)),
-			from_name_override,
+			lang: params.lang.clone(),
+			custom_key: Some(format!("welcome:{}", params.tn_id.0)),
+			from_name_override: params.from_name_override,
+			delay_seconds: params.delay_seconds,
 		},
 	)
 	.await?;
 
 	info!(
-		email = %to, tn_id = ?tn_id, lang = ?lang, ctx = log_context,
+		email = %params.to, tn_id = ?params.tn_id, lang = ?params.lang, ctx = params.log_context,
 		"Welcome email queued"
 	);
 	Ok(())
@@ -417,30 +429,18 @@ pub(crate) async fn send_welcome_email(
 /// swallowed since the tenant is already created.
 async fn queue_or_defer_welcome_email(
 	app: &cloudillo_core::app::App,
-	tn_id: TnId,
-	to: String,
-	id_tag: String,
-	lang: Option<String>,
-	from_name_override: Option<String>,
-	log_context: &str,
+	params: WelcomeEmailParams,
 ) -> ClResult<()> {
-	let cert_ready = match app.auth_adapter.read_cert_by_tn_id(tn_id).await {
+	let cert_ready = match app.auth_adapter.read_cert_by_tn_id(params.tn_id).await {
 		Ok(cert) => cert.expires_at.0 > Timestamp::now().0,
 		Err(_) => false,
 	};
 
 	if cert_ready {
-		if let Err(e) = send_welcome_email(
-			app,
-			tn_id,
-			&to,
-			&id_tag,
-			lang.clone(),
-			from_name_override,
-			log_context,
-		)
-		.await
-		{
+		let tn_id = params.tn_id;
+		let to = params.to.clone();
+		let log_context = params.log_context;
+		if let Err(e) = send_welcome_email(app, params).await {
 			warn!(
 				error = %e, email = %to, tn_id = ?tn_id, ctx = log_context,
 				"Failed to queue welcome email, continuing registration"
@@ -449,7 +449,14 @@ async fn queue_or_defer_welcome_email(
 		return Ok(());
 	}
 
-	let pending = PendingWelcomeEmail { to: to.clone(), lang, from_name_override, id_tag };
+	let tn_id = params.tn_id;
+	let log_context = params.log_context;
+	let pending = PendingWelcomeEmail {
+		to: params.to,
+		lang: params.lang,
+		from_name_override: params.from_name_override,
+		id_tag: params.id_tag,
+	};
 	let json = serde_json::to_value(&pending).map_err(|e| {
 		Error::Internal(format!("Failed to serialize pending welcome email: {}", e))
 	})?;
@@ -459,14 +466,14 @@ async fn queue_or_defer_welcome_email(
 		.await
 		.map_err(|e| {
 			warn!(
-				error = %e, email = %to, tn_id = ?tn_id, ctx = log_context,
+				error = %e, email = %pending.to, tn_id = ?tn_id, ctx = log_context,
 				"Failed to persist pending welcome email; user would not receive welcome"
 			);
 			e
 		})?;
 
 	info!(
-		email = %to, tn_id = ?tn_id, ctx = log_context,
+		email = %pending.to, tn_id = ?tn_id, ctx = log_context,
 		"Welcome email deferred until ACME cert is ready"
 	);
 	Ok(())
@@ -478,7 +485,8 @@ async fn handle_idp_registration(
 	id_tag_lower: String,
 	email: String,
 	lang: Option<String>,
-) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
+	welcome_delay_seconds: Option<i64>,
+) -> ClResult<(StatusCode, Json<serde_json::Value>, TnId)> {
 	#[derive(serde::Serialize)]
 	struct InboxRequest {
 		token: String,
@@ -644,12 +652,15 @@ async fn handle_idp_registration(
 	// single-use credential is never persisted to the meta DB.
 	queue_or_defer_welcome_email(
 		app,
-		tn_id,
-		email.clone(),
-		id_tag_lower.clone(),
-		lang.clone(),
-		Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
-		"idp_registration",
+		WelcomeEmailParams {
+			tn_id,
+			to: email.clone(),
+			id_tag: id_tag_lower.clone(),
+			lang: lang.clone(),
+			from_name_override: Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
+			delay_seconds: welcome_delay_seconds,
+			log_context: "idp_registration",
+		},
 	)
 	.await?;
 
@@ -671,7 +682,7 @@ async fn handle_idp_registration(
 
 	// Return empty response
 	let response = json!({});
-	Ok((StatusCode::CREATED, Json(response)))
+	Ok((StatusCode::CREATED, Json(response), tn_id))
 }
 
 /// Handle domain registration flow
@@ -682,7 +693,8 @@ async fn handle_domain_registration(
 	email: String,
 	providers: Vec<String>,
 	lang: Option<String>,
-) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
+	welcome_delay_seconds: Option<i64>,
+) -> ClResult<(StatusCode, Json<serde_json::Value>, TnId)> {
 	// Validate domain again before creating account
 	let validation_result =
 		verify_register_data(app, "domain", &id_tag_lower, app_domain.as_deref(), providers)
@@ -756,18 +768,193 @@ async fn handle_domain_registration(
 
 	queue_or_defer_welcome_email(
 		app,
-		tn_id,
-		email.clone(),
-		id_tag_lower.clone(),
-		lang.clone(),
-		Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
-		"domain_registration",
+		WelcomeEmailParams {
+			tn_id,
+			to: email.clone(),
+			id_tag: id_tag_lower.clone(),
+			lang: lang.clone(),
+			from_name_override: Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
+			delay_seconds: welcome_delay_seconds,
+			log_context: "domain_registration",
+		},
 	)
 	.await?;
 
 	// Return empty response (user must login separately)
 	let response = json!({});
-	Ok((StatusCode::CREATED, Json(response)))
+	Ok((StatusCode::CREATED, Json(response), tn_id))
+}
+
+/// Default delay (seconds) applied to the welcome email when an invitation
+/// carries auto-connect/auto-join effects, so the CONN + INVTs land in the new
+/// user's inbox before the welcome link sends them in. Overridable via the
+/// `onboarding.welcome_email_delay` global setting.
+pub(crate) const DEFAULT_WELCOME_EMAIL_DELAY: i64 = 60;
+
+/// Setting key for the tunable welcome-email delay.
+pub(crate) const WELCOME_EMAIL_DELAY_SETTING: &str = "onboarding.welcome_email_delay";
+
+/// Parsed auto-connect / auto-join intent encoded in a `register` ref's
+/// `params` query string (`connect=1&communities=<id_tag>,<id_tag>`).
+///
+/// The operator who created the ref is the inviter; these effects are applied
+/// at `post_register` time (the first point the new user's id_tag is known).
+#[derive(Default)]
+struct InvitationEffects {
+	/// Create an opt-out `CONN inviter→invitee` the new user accepts later.
+	connect: bool,
+	/// Community id_tags to send identity INVTs for.
+	communities: Vec<String>,
+}
+
+impl InvitationEffects {
+	/// Parse the ref `params` query string. Unparseable params degrade to "no
+	/// effects" rather than failing the registration.
+	fn parse(params: Option<&str>) -> Self {
+		#[derive(serde::Deserialize, Default)]
+		struct RawParams {
+			#[serde(default)]
+			connect: Option<String>,
+			#[serde(default)]
+			communities: Option<String>,
+		}
+
+		let Some(params) = params else {
+			return Self::default();
+		};
+
+		let raw: RawParams = serde_urlencoded::from_str(params).unwrap_or_default();
+		let connect = raw.connect.as_deref() == Some("1");
+		let communities = raw
+			.communities
+			.map(|c| {
+				c.split(',')
+					// Store/compare bare id_tags; strip a leading '@' defensively
+					// (the INVT subject is built as "@<id_tag>" later).
+					.map(|s| s.trim().trim_start_matches('@').to_string())
+					.filter(|s| !s.is_empty())
+					.collect::<Vec<_>>()
+			})
+			.unwrap_or_default();
+
+		Self { connect, communities }
+	}
+
+	/// Whether there is any effect to wire up.
+	fn has_any(&self) -> bool {
+		self.connect || !self.communities.is_empty()
+	}
+}
+
+/// Read the configured welcome-email delay (seconds), falling back to
+/// `DEFAULT_WELCOME_EMAIL_DELAY` when unset/invalid.
+async fn welcome_email_delay(app: &cloudillo_core::app::App) -> i64 {
+	match app.settings.get(TnId(1), WELCOME_EMAIL_DELAY_SETTING).await {
+		Ok(Some(SettingValue::Int(n))) => n,
+		_ => DEFAULT_WELCOME_EMAIL_DELAY,
+	}
+}
+
+/// Best-effort orchestration of the operator's invitation intent, run once the
+/// new tenant exists and before the registration token is consumed.
+///
+/// Every step is `warn!`-and-continue: registration must succeed even if all
+/// effects fail. Order matters — the `following=1` seed (#1) must land before
+/// the INVTs (#3) because `create_action`'s outbound gate reads the inviter's
+/// profile of the invitee (see `cloudillo-action` `task.rs`); INVT has
+/// `allow_unknown=false`, so a brand-new (unknown) invitee would otherwise be
+/// rejected. The seed is a direct local profile write — justified because the
+/// inviter and invitee are always co-located on this node.
+async fn apply_invitation_effects(
+	app: &cloudillo_core::app::App,
+	new_tn_id: TnId,
+	new_id_tag: &str,
+	inviter_tn_id: TnId,
+	inviter_id_tag: &str,
+	effects: &InvitationEffects,
+) {
+	if !effects.has_any() {
+		return;
+	}
+
+	// A self-invite (the operator registering with their own ref) has no
+	// relationship to establish.
+	if inviter_tn_id == new_tn_id || inviter_id_tag == new_id_tag {
+		return;
+	}
+
+	// 1. Seed following=1 in BOTH tenants via direct, idempotent profile writes.
+	//    The inviter-side seed satisfies the INVT outbound gate; the mirror
+	//    write gives a symmetric follow the onboarding UI uses to show the
+	//    inviter. If the inviter-side seed fails the gate is not satisfied, so
+	//    bail out of the remaining (gated) effects.
+	let follow_seed = UpsertProfileFields {
+		following: Patch::Value(true),
+		typ: Patch::Value(ProfileType::Person),
+		..Default::default()
+	};
+	if let Err(e) = app.meta_adapter.upsert_profile(inviter_tn_id, new_id_tag, &follow_seed).await {
+		warn!(
+			error = %e, inviter_tn_id = ?inviter_tn_id, invitee = %new_id_tag,
+			"Invitation effects: failed to seed following on inviter profile; skipping effects"
+		);
+		return;
+	}
+	if let Err(e) = app.meta_adapter.upsert_profile(new_tn_id, inviter_id_tag, &follow_seed).await {
+		warn!(
+			error = %e, new_tn_id = ?new_tn_id, inviter = %inviter_id_tag,
+			"Invitation effects: failed to seed mirror following on invitee profile; continuing"
+		);
+		// Continue — the inviter-side seed already satisfies the gate.
+	}
+
+	let create_action = match app.ext::<cloudillo_core::CreateActionFn>() {
+		Ok(f) => f,
+		Err(e) => {
+			warn!(
+				error = %e,
+				"Invitation effects: create_action extension unavailable; skipping CONN/INVT"
+			);
+			return;
+		}
+	};
+
+	// 2. Connection — CONN inviter→invitee, presented as a default-ON opt-out
+	//    toggle in onboarding. The follow seed already exists, so this is the
+	//    connection upgrade the user accepts (or not).
+	if effects.connect {
+		let action = CreateAction {
+			typ: "CONN".into(),
+			audience_tag: Some(new_id_tag.into()),
+			..Default::default()
+		};
+		if let Err(e) = create_action(app, inviter_tn_id, inviter_id_tag, action).await {
+			warn!(
+				error = %e, inviter = %inviter_id_tag, invitee = %new_id_tag,
+				"Invitation effects: failed to create CONN"
+			);
+		}
+	}
+
+	// 3. Per community — INVT inviter→invitee with subject="@<community>".
+	//    audience is the invitee; subject is the community (mirrors the
+	//    invite-members flow). Gate is satisfied by #1. A community the inviter
+	//    can't invite to (not a moderator / remote unreachable) is logged and
+	//    skipped; the others still apply.
+	for community in &effects.communities {
+		let action = CreateAction {
+			typ: "INVT".into(),
+			audience_tag: Some(new_id_tag.into()),
+			subject: Some(format!("@{community}").into()),
+			..Default::default()
+		};
+		if let Err(e) = create_action(app, inviter_tn_id, inviter_id_tag, action).await {
+			warn!(
+				error = %e, inviter = %inviter_id_tag, invitee = %new_id_tag, community = %community,
+				"Invitation effects: failed to create INVT for community; skipping it"
+			);
+		}
+	}
 }
 
 /// POST /api/profiles/register - Create profile after validation
@@ -781,8 +968,10 @@ pub async fn post_register(
 		return Err(Error::ValidationError("id_tag, token, and email are required".into()));
 	}
 
-	// Validate the registration token (ref) before processing
-	app.meta_adapter.validate_ref(&req.token, &["register"]).await?;
+	// Validate the registration token (ref) and capture the ref owner (the
+	// inviter) plus its params (the operator's auto-connect/auto-join intent).
+	let (inviter_tn_id, inviter_id_tag, ref_data) =
+		app.meta_adapter.validate_ref(&req.token, &["register"]).await?;
 
 	let id_tag_lower = req.id_tag.to_lowercase();
 	let app_domain = req.app_domain.map(|d| d.to_lowercase());
@@ -790,26 +979,75 @@ pub async fn post_register(
 	// Get identity providers list (use TnId(1) as default for global settings)
 	let providers = get_identity_providers(&app, TnId(1)).await;
 
+	// Parse invitation effects up front so we can delay the welcome email when
+	// there is anything to wire up — the CONN/INVTs must land in the new user's
+	// inbox before the welcome link logs them in. Plain invites stay immediate.
+	let effects = InvitationEffects::parse(ref_data.params.as_deref());
+	let welcome_delay_seconds =
+		if effects.has_any() { Some(welcome_email_delay(&app).await) } else { None };
+
 	// Route to appropriate registration handler
 	let result = if req.typ == "idp" {
-		handle_idp_registration(&app, id_tag_lower, req.email, req.lang).await
+		handle_idp_registration(
+			&app,
+			id_tag_lower.clone(),
+			req.email,
+			req.lang,
+			welcome_delay_seconds,
+		)
+		.await
 	} else {
-		handle_domain_registration(&app, id_tag_lower, app_domain, req.email, providers, req.lang)
-			.await
+		handle_domain_registration(
+			&app,
+			id_tag_lower.clone(),
+			app_domain,
+			req.email,
+			providers,
+			req.lang,
+			welcome_delay_seconds,
+		)
+		.await
 	};
 
-	// If registration succeeded, consume the token
-	if result.is_ok()
-		&& let Err(e) = app.meta_adapter.use_ref(&req.token, &["register"]).await
-	{
-		warn!(
-			error = %e,
-			"Failed to consume registration token after successful registration"
-		);
-		// Continue anyway - registration already succeeded
-	}
+	// If registration succeeded, consume the token, then wire up invitation
+	// effects off the request path.
+	match result {
+		Ok((status, body, new_tn_id)) => {
+			if let Err(e) = app.meta_adapter.use_ref(&req.token, &["register"]).await {
+				warn!(
+					error = %e,
+					"Failed to consume registration token after successful registration"
+				);
+				// Continue anyway - registration already succeeded
+			}
 
-	result
+			// Apply invitation effects (CONN/INVTs + follow seeds) in the
+			// background so they don't block the registration response. The
+			// welcome email is delayed by `welcome_delay_seconds`, which gives
+			// this spawned work time to land the effects in the new user's
+			// inbox before the welcome link logs them in. Best-effort either
+			// way: registration already succeeded.
+			if effects.has_any() {
+				let app_bg = app.clone();
+				let new_id_tag = id_tag_lower.clone();
+				let inviter = inviter_id_tag.clone();
+				tokio::spawn(async move {
+					apply_invitation_effects(
+						&app_bg,
+						new_tn_id,
+						&new_id_tag,
+						inviter_tn_id,
+						&inviter,
+						&effects,
+					)
+					.await;
+				});
+			}
+
+			Ok((status, body))
+		}
+		Err(e) => Err(e),
+	}
 }
 
 // vim: ts=4

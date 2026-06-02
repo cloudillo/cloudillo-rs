@@ -16,7 +16,7 @@ use cloudillo_core::IdTag;
 use cloudillo_core::extract::{OptionalAuth, OptionalRequestId};
 use cloudillo_core::profile_visibility::{CommunityRole, RequesterTier, SectionVisibility};
 use cloudillo_types::meta_adapter::ProfileType;
-use cloudillo_types::types::{ApiResponse, Profile, ProfileBase};
+use cloudillo_types::types::{ApiResponse, AppDomainRes, Profile, ProfileBase};
 
 /// Wire-format string for a `ProfileType`. Shared between the full and base
 /// `/api/me` handlers so they can't drift.
@@ -201,6 +201,26 @@ pub async fn get_tenant_profile_base(
 		.header(header::ETAG, etag_header(&etag))
 		.body(Body::from(json))
 		.map_err(|e| Error::Internal(format!("failed to build 200 response: {}", e)))
+}
+
+/// Public: returns the tenant's app/web domain (the cert `domain`) so clients on
+/// the API host can build links to the tenant's web UI (e.g. `/s/<refId>` share
+/// links). Unauthenticated — the app domain is public. Falls back to the idTag if
+/// no cert row exists yet (e.g. local/dev without ACME), so it always returns 200.
+pub async fn get_tenant_app_domain(
+	State(app): State<App>,
+	IdTag(id_tag): IdTag,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<AppDomainRes>>)> {
+	let app_domain = match app.auth_adapter.read_cert_by_id_tag(&id_tag).await {
+		Ok(cert) => cert.domain.to_string(),
+		Err(_) => id_tag.to_string(),
+	};
+	let mut response = ApiResponse::new(AppDomainRes { app_domain });
+	if let Some(id) = req_id {
+		response = response.with_req_id(id);
+	}
+	Ok((StatusCode::OK, Json(response)))
 }
 
 pub async fn get_tenant_profile(
