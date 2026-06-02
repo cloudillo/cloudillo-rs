@@ -7,7 +7,7 @@ use crate::prelude::*;
 use cloudillo_core::request::ConditionalResult;
 use cloudillo_core::scheduler::{RetryPolicy, Task, TaskId};
 use cloudillo_types::meta_adapter::{
-	ProfileConnectionStatus, ProfileStatus, ProfileType, UpsertProfileFields, UpsertResult,
+	ProfileStatus, ProfileType, UpsertProfileFields, UpsertResult,
 };
 use cloudillo_types::types::{ApiResponse, ProfileBase};
 
@@ -82,8 +82,8 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 				name: Patch::Value(remote.name.clone().into()),
 				typ: Patch::Value(typ),
 				synced: Patch::Value(true),
-				following: Patch::Value(false),
-				connected: Patch::Value(ProfileConnectionStatus::Disconnected),
+				following: Patch::Undefined,
+				connected: Patch::Undefined,
 				etag: match new_etag.as_deref() {
 					Some(e) => Patch::Value(e.into()),
 					None => Patch::Null,
