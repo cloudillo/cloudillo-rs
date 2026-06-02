@@ -131,10 +131,11 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// action id). The invitation invites `audience` to become a member of the
 /// community identified by `subject_id`.
 ///
-/// Authorization: the inviter must hold `moderator` or `leader` in the
-/// community tenant. If the community is not hosted locally, the local
-/// server cannot verify the role and admits the action — the community
-/// home will re-validate on receive.
+/// Authorization: TEMPORARILY DEFERRED (issue #3). The moderator/leader role
+/// gate is not enforced here for now — both local and remote communities are
+/// admitted and the community home re-validates authorization on accept. Real
+/// role-gating returns once the invitation picker only offers communities the
+/// operator can actually invite to.
 async fn on_create_community(
 	app: App,
 	context: &HookContext,
@@ -145,20 +146,24 @@ async fn on_create_community(
 		return Ok(HookResult { continue_processing: false, ..Default::default() });
 	};
 
+	// TEMP (issue #3): do not gate community INVTs on the inviter's local role.
+	// Local and remote communities are treated identically here — admit the
+	// invite and let the community home enforce authorization on accept. Proper
+	// moderator-role gating returns once the invitation picker only offers
+	// communities the operator can actually invite to (a CommunityRef role/
+	// canInvite field — frontend follow-up below).
 	let local_community_tn_id = lookup_local_tenant(&app, community_id_tag).await?;
 	if let Some(community_tn_id) = local_community_tn_id {
-		let authorized =
-			issuer_has_community_authority(&app, community_tn_id, &context.issuer).await?;
+		let authorized = issuer_has_community_authority(&app, community_tn_id, &context.issuer)
+			.await
+			.unwrap_or(false);
 		if !authorized {
 			warn!(
-				"INVT on_create (community): Inviter {} lacks moderator+ role in {}",
+				"INVT on_create (community): inviter {} is not moderator+ in {}; admitting anyway (gating deferred, issue #3)",
 				context.issuer, community_id_tag
 			);
-			return Ok(HookResult { continue_processing: false, ..Default::default() });
 		}
 	} else {
-		// Remote community — cannot verify inviter authority; allow to proceed
-		// as the remote community will enforce its own authorization on accept.
 		warn!(
 			"INVT on_create (community): skipping authz for remote community {} (inviter: {})",
 			community_id_tag, context.issuer
