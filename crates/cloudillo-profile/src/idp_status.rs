@@ -100,6 +100,27 @@ async fn is_verify_idp(app: &App, tn_id: TnId) -> bool {
 	)
 }
 
+/// Synthetic "active" IDP status for tenants not gated on IDP activation
+/// (domain-typed tenants, already-active identities, communities never
+/// registered with an IDP). `expires_at` is the Unix epoch — the frontend
+/// ignores it when `status == "active"`.
+fn synthetic_active_idp_response(
+	req_id: Option<String>,
+) -> (StatusCode, Json<ApiResponse<MeIdpStatusResponse>>) {
+	let response_data = MeIdpStatusResponse {
+		status: "active".to_string(),
+		expires_at: Timestamp(0),
+		provider_name: None,
+		email: None,
+		onboarding: None,
+	};
+	let mut response = ApiResponse::new(response_data);
+	if let Some(id) = req_id {
+		response = response.with_req_id(id);
+	}
+	(StatusCode::OK, Json(response))
+}
+
 /// Pulls live IDP status from the federated IDP for `(tn_id, id_tag)` and
 /// enriches with provider name + recovery email. Read-only — does NOT mutate
 /// `ui.onboarding`. Callers that want to advance the onboarding gate must
@@ -220,6 +241,16 @@ pub async fn get_me_idp_status(
 		return Err(Error::PermissionDenied);
 	}
 
+	// Short-circuit for tenants that are not gated on IDP activation
+	// (domain-typed tenants, already-active identities, communities never
+	// registered with an IDP). Mirrors get_ref_idp_status: without this guard
+	// the handler federates unconditionally, and for a domain-typed id_tag
+	// split_idp_domain("cloudillo.net") => "net" makes the outbound call hit a
+	// bogus host (cl-o.net), failing with hyper "client error (Connect)" -> 500.
+	if !is_verify_idp(&app, auth.tn_id).await {
+		return Ok(synthetic_active_idp_response(req_id));
+	}
+
 	// Always query the IDP for the *active tenant's* identity (`host_id_tag`),
 	// not for the bearer's `auth.id_tag`. They coincide in the personal
 	// self-auth case, but for a community-leader proxy token we want the
@@ -307,18 +338,7 @@ pub async fn get_ref_idp_status(
 	// IDP-vs-domain. The synthetic `expires_at` is the Unix epoch — the
 	// frontend ignores it on `status === "active"`.
 	if !is_verify_idp(&app, tn_id).await {
-		let response_data = MeIdpStatusResponse {
-			status: "active".to_string(),
-			expires_at: Timestamp(0),
-			provider_name: None,
-			email: None,
-			onboarding: None,
-		};
-		let mut response = ApiResponse::new(response_data);
-		if let Some(id) = req_id {
-			response = response.with_req_id(id);
-		}
-		return Ok((StatusCode::OK, Json(response)));
+		return Ok(synthetic_active_idp_response(req_id));
 	}
 
 	let mut response_data = fetch_idp_status(&app, tn_id, id_tag.as_ref()).await?;
