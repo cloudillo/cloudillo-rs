@@ -795,7 +795,8 @@ pub(crate) const DEFAULT_WELCOME_EMAIL_DELAY: i64 = 60;
 pub(crate) const WELCOME_EMAIL_DELAY_SETTING: &str = "onboarding.welcome_email_delay";
 
 /// Parsed auto-connect / auto-join intent encoded in a `register` ref's
-/// `params` query string (`connect=1&communities=<id_tag>,<id_tag>`).
+/// `params` query string (`communities=<id_tag>,<id_tag>`; auto-connect is on
+/// by default, pass `connect=0` to disable).
 ///
 /// The operator who created the ref is the inviter; these effects are applied
 /// at `post_register` time (the first point the new user's id_tag is known).
@@ -819,12 +820,13 @@ impl InvitationEffects {
 			communities: Option<String>,
 		}
 
-		let Some(params) = params else {
-			return Self::default();
-		};
+		let raw: RawParams =
+			params.and_then(|p| serde_urlencoded::from_str(p).ok()).unwrap_or_default();
 
-		let raw: RawParams = serde_urlencoded::from_str(params).unwrap_or_default();
-		let connect = raw.connect.as_deref() == Some("1");
+		// Auto-connect is the default; only an explicit `connect=0` opts out. A
+		// missing flag (including legacy refs created before the flag existed)
+		// therefore auto-connects.
+		let connect = raw.connect.as_deref() != Some("0");
 		let communities = raw
 			.communities
 			.map(|c| {
