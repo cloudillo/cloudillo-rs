@@ -17,6 +17,7 @@ use cloudillo_core::{
 	IdTag,
 	extract::{Auth, OptionalAuth, OptionalRequestId},
 	rate_limit::RateLimitApi,
+	roles,
 };
 use cloudillo_types::auth_adapter::ActionToken;
 use cloudillo_types::meta_adapter;
@@ -25,6 +26,7 @@ use cloudillo_types::types::{self, ApiResponse};
 use crate::{
 	dsl::DslEngine,
 	filter::filter_actions_by_visibility,
+	helpers,
 	prelude::*,
 	task::{self, ActionVerifierTask, CreateAction},
 };
@@ -100,6 +102,41 @@ pub async fn post_action(
 		&& action.typ.as_ref() != "APKG"
 	{
 		return Err(Error::PermissionDenied);
+	}
+
+	// Role-hierarchy guard on community member removal (CONN:DEL). The authoritative
+	// outbound check: only moderators+ may remove a member, and an actor may only remove a
+	// member strictly below them (leaders may also remove peer leaders). Self-leave
+	// (audience == the community itself) and personal disconnects are skipped.
+	{
+		let (action_type, sub_type) = helpers::extract_type_and_subtype(&action.typ);
+		if action_type == "CONN"
+			&& sub_type.as_deref() == Some("DEL")
+			&& let Some(ref audience_tag) = action.audience_tag
+			&& audience_tag.as_ref() != id_tag.as_ref()
+		{
+			let tenant = app.meta_adapter.read_tenant(tn_id).await?;
+			if tenant.typ == meta_adapter::ProfileType::Community {
+				let target_roles =
+					match app.meta_adapter.read_profile_roles(tn_id, audience_tag).await {
+						Ok(roles) => roles,
+						Err(Error::NotFound) => None,
+						Err(e) => return Err(e),
+					}
+					.unwrap_or_default();
+				if !roles::can_manage_member_by_roles(&auth.roles, &target_roles) {
+					warn!(
+						"Rejecting CONN:DEL by {} against {} in community {}: insufficient role (actor_level={}, target_level={})",
+						auth.id_tag,
+						audience_tag,
+						tn_id,
+						roles::highest_role_level(&auth.roles),
+						roles::highest_role_level(&target_roles)
+					);
+					return Err(Error::PermissionDenied);
+				}
+			}
+		}
 	}
 
 	let action_id = task::create_action(&app, tn_id, &id_tag, action).await?;
@@ -1084,11 +1121,13 @@ async fn build_outbox_item(
 			}
 		}
 		// Only mint a STAT for the subject when this tenant is its authoritative
-		// owner. For the common REPOST case the subject is a 3rd-party post, and
-		// a STAT we self-mint for it would be rejected by the receiver's R2 rule
-		// (which requires the STAT issuer to own the target) — wasted minting and
-		// bandwidth. The subject *token* is still bundled above so the receiver
-		// can render the original without following its issuer.
+		// owner. For the common REPOST case the subject is a 3rd-party post. The
+		// receiver now accepts a STAT for any target it holds (R2), but a STAT we
+		// self-mint for a subject we don't own would be ignored by the receiver's
+		// `stat.rs` hook (which only mirrors counters from the subject's
+		// authoritative owner) — so minting it is wasted work and bandwidth. The
+		// subject *token* is still bundled above so the receiver can render the
+		// original without following its issuer.
 		if let Ok(Some(sub_action)) = app.meta_adapter.get_action(tn_id, subject_id).await
 			&& crate::native_hooks::ownership::owns_subject(&sub_action, tenant_id_tag)
 			&& let Some(sub_stat) =

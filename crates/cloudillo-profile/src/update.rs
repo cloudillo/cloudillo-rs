@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 use cloudillo_core::extract::{Auth, OptionalRequestId};
+use cloudillo_core::roles::{
+	LEADER_LEVEL, can_assign_role, can_manage_member_by_roles, highest_role_level,
+};
 use cloudillo_types::meta_adapter::{
 	ProfileStatus, ProfileTrust, UpdateProfileData, UpdateTenantData, UpsertProfileFields,
 };
@@ -91,8 +94,11 @@ pub async fn patch_own_profile(
 /// PATCH /admin/profile/:idTag - Update another user's profile data (admin only)
 ///
 /// The route is mounted behind `check_perm_profile("admin")` ABAC middleware
-/// (see `crates/cloudillo/src/routes.rs`), which enforces `profile:admin` —
-/// no manual role guard is needed here.
+/// (see `crates/cloudillo/src/routes.rs`), which enforces `profile:admin` and
+/// admits community moderators and above. ABAC alone says nothing about the
+/// *target's* rank or *which* fields an actor may touch, so this handler also
+/// runs a role-hierarchy guard (below): name/status are leader-only, and role
+/// changes are bounded by `can_manage_member`.
 pub async fn patch_profile_admin(
 	State(app): State<App>,
 	Auth(auth): Auth,
@@ -107,11 +113,12 @@ pub async fn patch_profile_admin(
 	// profile row, and there is genuinely no refresh trigger. Any other error
 	// aborts the request: we can't safely reason about whether the side-effect
 	// was needed, so the patch must not land.
-	let (prev_status, prev_synced) = match app.meta_adapter.read_profile(tn_id, &id_tag).await {
-		Ok((_, p)) => (p.status, p.synced_at),
-		Err(Error::NotFound) => (None, None),
-		Err(e) => return Err(e),
-	};
+	let (prev_status, prev_synced, prev_roles) =
+		match app.meta_adapter.read_profile(tn_id, &id_tag).await {
+			Ok((_, p)) => (p.status, p.synced_at, p.roles),
+			Err(Error::NotFound) => (None, None, None),
+			Err(e) => return Err(e),
+		};
 
 	// Extract roles for response before consuming patch
 	let response_roles = match &patch.roles {
@@ -128,6 +135,73 @@ pub async fn patch_profile_admin(
 			Patch::Null => true,
 			Patch::Undefined => false,
 		};
+
+	// Role-hierarchy guard on community admin profile changes.
+	//
+	// This handler is mounted behind `check_perm_profile("admin")`. The ABAC default
+	// grants `profile:admin` to community moderators and above (see
+	// `check_default_rules` in `cloudillo-core/src/abac.rs`) — so this handler, not
+	// ABAC, is the authority for *what* an admin may change and *against whom*:
+	//
+	//   - name / status: leaders only. A moderator may reach this gate but must never
+	//     rename another member or change their status.
+	//   - roles: only moderators+ may re-role anyone; an actor may only re-role a
+	//     member strictly below them (leaders may also re-role peer leaders, via
+	//     `can_manage_member`); no one may re-role themselves. For assignment, a
+	//     leader may grant any known role (including peer-leader); everyone else may
+	//     only grant roles strictly below their own level.
+	//
+	// Any non-`Undefined` patch field is a change and must pass this check —
+	// including `Patch::Null` / `Patch::Value(None)` on `roles`, which both clear the
+	// target's roles (`SET roles = NULL`). Gating roles only on `Patch::Value(_)`
+	// would let `{"roles": null}` clear a member's roles unguarded.
+	if !patch.roles.is_undefined() || !patch.name.is_undefined() || !patch.status.is_undefined() {
+		let actor_level = highest_role_level(&auth.roles);
+		let actor_is_leader = actor_level >= LEADER_LEVEL;
+
+		// Name / status are leader-only. A moderator who passes the ABAC gate may
+		// manage roles of lower members, but must not rename anyone or change
+		// their status.
+		if !actor_is_leader && (!patch.name.is_undefined() || !patch.status.is_undefined()) {
+			warn!(
+				"Rejecting admin name/status change by {} against {}: only leaders may edit name/status (actor_level={})",
+				auth.id_tag, id_tag, actor_level
+			);
+			return Err(Error::PermissionDenied);
+		}
+
+		if !patch.roles.is_undefined() {
+			// No one may change their own roles (blocks self-demotion and self-promotion).
+			if id_tag == auth.id_tag.as_ref() {
+				warn!("Rejecting admin role change by {}: cannot change own roles", auth.id_tag);
+				return Err(Error::PermissionDenied);
+			}
+
+			if !can_manage_member_by_roles(&auth.roles, prev_roles.as_deref().unwrap_or(&[])) {
+				warn!(
+					"Rejecting admin role change by {} against {}: insufficient role (actor_level={})",
+					auth.id_tag, id_tag, actor_level
+				);
+				return Err(Error::PermissionDenied);
+			}
+
+			// Assignment cap. Leaders may grant any known role; everyone else is
+			// capped at strictly below their own level. Unknown roles are never
+			// assignable. (Clears — `Patch::Null` / `Patch::Value(None)` — have no
+			// roles to validate here and fall through, already gated above.)
+			if let Patch::Value(Some(ref new_roles)) = patch.roles {
+				for role in new_roles {
+					if !can_assign_role(role, actor_level) {
+						warn!(
+							"Rejecting admin role change by {} against {}: cannot assign role {:?} (actor_level={}, actor_is_leader={})",
+							auth.id_tag, id_tag, role, actor_level, actor_is_leader
+						);
+						return Err(Error::PermissionDenied);
+					}
+				}
+			}
+		}
+	}
 
 	let profile_update = UpdateProfileData {
 		name: patch.name.map(Into::into),

@@ -513,6 +513,23 @@ impl PermissionChecker {
 			return true; // Allow for now
 		}
 
+		// Admin operations (e.g. `profile:admin`) — community moderators and above
+		// pass the gate. Leaders were already allowed by the override at the top of
+		// this function; this admits moderators so they can manage lower-ranked
+		// members. The finer-grained target-rank and field-level rules (a moderator
+		// may only re-role members strictly below them, never rename or change
+		// status) are enforced in the handler — see `patch_profile_admin`'s
+		// role-hierarchy guard in `cloudillo-profile/src/update.rs`.
+		if operation == "admin" {
+			use crate::roles::{MODERATOR_LEVEL, highest_role_level};
+			if highest_role_level(&subject.roles) >= MODERATOR_LEVEL {
+				debug!(subject = %subject.id_tag, action = action, "Moderator+ role allows admin operation");
+				return true;
+			}
+			debug!(subject = %subject.id_tag, action = action, "Denied: admin operation requires moderator+");
+			return false;
+		}
+
 		// Default deny
 		debug!(subject = %subject.id_tag, action = action, "Default deny: no matching rules");
 		false

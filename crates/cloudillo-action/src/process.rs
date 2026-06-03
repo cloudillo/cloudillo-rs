@@ -614,17 +614,17 @@ async fn check_inbound_permissions(
 		return Ok(());
 	}
 
-	// R2 — accept a STAT for content you hold, but only from the target's
-	// authoritative owner (its audience if community-hosted, else its issuer).
-	// A STAT references its target via `parent`. Restricting the issuer to the
-	// authoritative owner (mirroring stat.rs's owner computation) prevents a
-	// non-authoritative stranger from injecting counter STATs for content we
-	// merely mirror. This still lets a non-follower reposter (and its followers)
-	// accept the original's relayed STAT — no follow relationship required.
-	if action.t.starts_with("STAT")
+	// R2 — accept a STAT for any content we already hold, regardless of who
+	// issued it. The receive hook (`native_hooks::stat::on_receive`) is the sole
+	// authority on whether the STAT's counters are applied: it only mirrors them
+	// when the issuer is the subject's authoritative owner (audience if community-
+	// hosted, else issuer) and we don't own the subject ourselves. Requiring the
+	// parent to be held bounds storage to content we know about; a STAT for an
+	// action we don't mirror is still rejected. A non-authoritative STAT that
+	// slips through here is stored but ignored by the hook.
+	if action.t.as_ref() == "STAT"
 		&& let Some(target_id) = action.p.as_deref()
-		&& let Ok(Some(target)) = app.meta_adapter.get_action(tn_id, target_id).await
-		&& owns_subject(&target, &action.iss)
+		&& matches!(app.meta_adapter.get_action(tn_id, target_id).await, Ok(Some(_)))
 	{
 		return Ok(());
 	}
