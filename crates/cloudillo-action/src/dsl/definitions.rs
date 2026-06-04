@@ -441,6 +441,12 @@ fn repost_definition() -> ActionDefinition {
 			// notify. Generic flag, same path INVT uses. The original poster
 			// accepts it via the subject-ownership rule (R1) in process.rs.
 			deliver_to_subject_owner: Some(true),
+			// Bundle the reposted (subject) action with every REPOST delivery so the
+			// audience (community/wall + reposter's followers) receives the original
+			// content, not a dangling reference. Reuses the generic related-token path
+			// (same flag INVT uses for CONV); the receiver stores it via the
+			// pre-approved path (R-skip-perm) in process.rs.
+			deliver_subject: Some(true),
 			..Default::default()
 		},
 		hooks: ActionHooks {
