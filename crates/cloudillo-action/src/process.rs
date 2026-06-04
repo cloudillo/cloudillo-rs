@@ -444,12 +444,13 @@ async fn process_inbound_action_token_inner(
 			.collect()
 	});
 
+	let ctx = ProcessingContext::Inbound { client_address, is_sync };
 	let result = post_store::process_after_store(
 		app,
 		tn_id,
 		&action_for_processing,
 		attachment_views.as_deref(),
-		ProcessingContext::Inbound { client_address, is_sync },
+		ctx.clone(),
 	)
 	.await?;
 
@@ -472,6 +473,22 @@ async fn process_inbound_action_token_inner(
 	if let Err(e) = app.meta_adapter.update_action_data(tn_id, action_id, &activate_opts).await {
 		warn!("  failed to activate inbound action {}: {}", action_id, e);
 		return Err(e);
+	}
+
+	// Forward to WS clients now that the row holds its final status. Deferred
+	// from process_after_store so the push (and any client refetch) never sees
+	// the transient 'V' that the shell feed drops. Skipped when the hook aborted
+	// processing (ws_forward_deferred == false), preserving prior behavior.
+	if result.ws_forward_deferred {
+		post_store::forward_to_websocket(
+			app,
+			tn_id,
+			&action_for_processing,
+			attachment_views.as_deref(),
+			&ctx,
+			result.status,
+		)
+		.await;
 	}
 
 	Ok(result.hook_result)

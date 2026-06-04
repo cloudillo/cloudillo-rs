@@ -79,6 +79,7 @@ pub async fn schedule_subscriber_fanout(
 							typ: Some(vec!["SUBS".into()]),
 							subject: Some(p_id.clone()),
 							status: Some(vec!["A".into()]),
+							exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
 							exclude_issuer_profile_status: Some(Box::from([
 								ProfileStatus::Suspended,
 								ProfileStatus::Blocked,

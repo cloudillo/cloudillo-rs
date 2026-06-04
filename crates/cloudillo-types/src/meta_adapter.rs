@@ -497,6 +497,12 @@ pub struct ListActionOptions {
 	/// rows are NOT excluded (open-federation default).
 	#[serde(skip)]
 	pub exclude_issuer_profile_status: Option<Box<[ProfileStatus]>>,
+	/// Exclude action rows whose `sub_type` is in this set. Used by relationship
+	/// fan-out queries to drop tombstone rows (e.g. FLLW:DEL / SUBS:DEL), which
+	/// rest at status 'A' but represent a severed relationship. NULL sub_type
+	/// (the active join/follow row) is always kept.
+	#[serde(skip)]
+	pub exclude_sub_typ: Option<Box<[Box<str>]>>,
 }
 
 #[skip_serializing_none]

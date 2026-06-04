@@ -24,7 +24,7 @@ use crate::{
 use std::collections::HashSet;
 
 /// Direction-specific processing context
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ProcessingContext {
 	/// Locally created action going out
 	Outbound {
@@ -75,6 +75,12 @@ pub struct PostStoreResult {
 	/// action's final status once, after the full post-store pipeline
 	/// succeeds, instead of unconditionally activating to `'A'`.
 	pub status: Option<char>,
+
+	/// Inbound forwards are deferred to the caller (run after the authoritative
+	/// status write) so the WS push — and any client refetch — sees the
+	/// activated row, not the transient 'V'. `false` for outbound (forwarded
+	/// inline here) and for aborted hooks (never forwarded).
+	pub ws_forward_deferred: bool,
 }
 
 struct HookExecutionResult {
@@ -103,7 +109,8 @@ pub async fn process_after_store(
 	attachment_views: Option<&[AttachmentView]>,
 	ctx: ProcessingContext,
 ) -> ClResult<PostStoreResult> {
-	let mut result = PostStoreResult { hook_result: None, status: None };
+	let mut result =
+		PostStoreResult { hook_result: None, status: None, ws_forward_deferred: false };
 
 	// 1. Execute hook (on_create for outbound, on_receive for inbound)
 	let hook_exec = execute_hook(app, tn_id, action, &ctx).await?;
@@ -126,7 +133,16 @@ pub async fn process_after_store(
 	// (status ∈ {C, N}) would drop them (e.g. an online invitee never sees the
 	// badge). When the hook declared no status (None → default 'A'), the view
 	// is forwarded as-is, matching pre-existing behavior for feed-type actions.
-	forward_to_websocket(app, tn_id, action, attachment_views, &ctx, result.status).await;
+	// Outbound rows are already finalized here, so forward inline. Inbound rows
+	// are still 'V' at this point — defer the forward to the caller, which runs
+	// it after the authoritative status write (process.rs), so the pushed view
+	// (and any client refetch) sees the activated row instead of the transient
+	// 'V' that the shell feed would silently drop.
+	if ctx.is_outbound() {
+		forward_to_websocket(app, tn_id, action, attachment_views, &ctx, result.status).await;
+	} else {
+		result.ws_forward_deferred = true;
+	}
 
 	// 3. Fan-out to subscribers of subscribable parent chain
 	let fanout_recipients = schedule_subscriber_fanout(
@@ -306,7 +322,7 @@ async fn execute_hook(
 /// Fetches the full ActionView from the database so that WebSocket messages
 /// contain all fields (createdAt, issuer name/profilePic, etc.) matching
 /// the API response format.
-async fn forward_to_websocket(
+pub(crate) async fn forward_to_websocket(
 	app: &App,
 	tn_id: TnId,
 	action: &meta_adapter::Action<Box<str>>,
@@ -605,6 +621,7 @@ async fn schedule_broadcast_delivery(
 			&meta_adapter::ListActionOptions {
 				typ: Some(vec!["FLLW".into(), "CONN".into()]),
 				status: Some(vec!["A".into()]),
+				exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
 				exclude_issuer_profile_status: Some(Box::from([
 					ProfileStatus::Suspended,
 					ProfileStatus::Blocked,

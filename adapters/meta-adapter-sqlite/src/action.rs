@@ -44,6 +44,14 @@ fn push_action_filters(
 		query.push(" AND a.type IN ");
 		query = push_in(query, typ.as_slice());
 	}
+	if let Some(excluded_sub) = opts.exclude_sub_typ.as_ref().filter(|v| !v.is_empty()) {
+		let codes: Vec<&str> = excluded_sub.iter().map(AsRef::as_ref).collect();
+		// NULL sub_type (the active join/follow/subscribe row) is kept; only
+		// explicitly-listed tombstone subtypes (DEL) are excluded.
+		query.push(" AND (a.sub_type IS NULL OR a.sub_type NOT IN ");
+		query = push_in(query, codes.as_slice());
+		query.push(")");
+	}
 	if let Some(issuer) = &opts.issuer {
 		query.push(" AND a.issuer_tag=").push_bind(issuer);
 	}
@@ -1890,6 +1898,54 @@ mod tests {
 			count(&db, tn_id, &opts).await.expect("count"),
 			1,
 			"duplicate reposts of the same target collapse to one live row"
+		);
+	}
+
+	// Fan-out regression: relationship recipient queries filter on
+	// status='A' + exclude_sub_typ=['DEL']. A severed FLLW (the only remaining
+	// row is the FLLW:DEL tombstone, which rests at status 'A') must NOT be
+	// returned; the active join (sub_type NULL) must be. Guards the ex-member
+	// fan-out bug — see crates/cloudillo-action/src/{post_store,fanout,task}.rs.
+	#[tokio::test]
+	async fn list_excludes_del_subtype_tombstones() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+
+		// Active follow from alice: sub_type NULL.
+		sqlx::query(
+			"INSERT INTO actions (tn_id, action_id, type, sub_type, issuer_tag, status, visibility, created_at)
+			VALUES (?, 'a1~fllw-alice', 'FLLW', NULL, 'alice.example', 'A', 'P', unixepoch())",
+		)
+		.bind(tn_id.0)
+		.execute(&db)
+		.await
+		.expect("insert active fllw");
+
+		// Severed follow from bob: the only remaining FLLW row is the DEL
+		// tombstone, resting at status 'A'.
+		sqlx::query(
+			"INSERT INTO actions (tn_id, action_id, type, sub_type, issuer_tag, status, visibility, created_at)
+			VALUES (?, 'a1~fllw-bob-del', 'FLLW', 'DEL', 'bob.example', 'A', 'P', unixepoch())",
+		)
+		.bind(tn_id.0)
+		.execute(&db)
+		.await
+		.expect("insert fllw del");
+
+		let opts = ListActionOptions {
+			typ: Some(vec!["FLLW".into()]),
+			status: Some(vec!["A".into()]),
+			exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
+			..Default::default()
+		};
+
+		let listed = list(&db, tn_id, &opts).await.expect("list");
+		let issuers: Vec<&str> = listed.iter().map(|a| a.issuer.id_tag.as_ref()).collect();
+		assert_eq!(
+			issuers,
+			vec!["alice.example"],
+			"only the active follow survives the DEL filter"
 		);
 	}
 

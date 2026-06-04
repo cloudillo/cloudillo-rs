@@ -837,6 +837,8 @@ impl<'a> OperationExecutor<'a> {
 				tn_id,
 				&meta_adapter::ListActionOptions {
 					typ: Some(vec!["FLLW".into(), "CONN".into()]),
+					status: Some(vec!["A".into()]),
+					exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
 					..Default::default()
 				},
 			)

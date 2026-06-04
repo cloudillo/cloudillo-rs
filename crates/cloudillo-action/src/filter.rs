@@ -144,6 +144,7 @@ async fn load_subscribers(
 			typ: Some(vec!["SUBS".into()]),
 			subject: Some((*action_id).to_string()),
 			status: Some(vec!["A".into()]),
+			exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
 			..Default::default()
 		};
 

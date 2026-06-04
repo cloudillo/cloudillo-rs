@@ -964,20 +964,18 @@ async fn schedule_broadcast_delivery(
 			tn_id,
 			&meta_adapter::ListActionOptions {
 				typ: Some(vec!["FLLW".into(), "CONN".into()]),
-				// Don't filter by status - we'll exclude deleted ('D') in the loop
+				status: Some(vec!["A".into()]),
+				exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
 				..Default::default()
 			},
 		)
 		.await?;
 
-	// Extract unique follower id_tags (excluding self and deleted connections)
-	// Anyone who sent us a CONN/FLLW request is a follower (unless deleted)
+	// Extract unique follower id_tags (excluding self).
+	// Anyone who sent us a CONN/FLLW request is a follower (active rows only;
+	// status='A' + exclude_sub_typ=['DEL'] drop deleted/severed relationships).
 	let mut recipients: HashSet<Box<str>> = HashSet::new();
 	for action_view in follower_actions {
-		// Skip deleted connections
-		if action_view.status.as_deref() == Some("D") {
-			continue;
-		}
 		if action_view.issuer.id_tag.as_ref() != id_tag {
 			recipients.insert(action_view.issuer.id_tag.clone());
 		}
