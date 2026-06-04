@@ -1182,8 +1182,9 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					tx_finish.send(id).unwrap_or(());
 				}
 				Err(e) => {
+					let is_retryable = e.is_retryable();
 					if let Some(retry_policy) = &task_meta.retry {
-						if retry_policy.should_retry(task_meta.retry_count) {
+						if is_retryable && retry_policy.should_retry(task_meta.retry_count) {
 							let backoff = retry_policy.calculate_backoff(task_meta.retry_count);
 							let next_at = Timestamp::from_now(backoff.cast_signed());
 
@@ -1219,11 +1220,15 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 							retry_meta.next_at = Some(next_at);
 							scheduler.add_queue(id, retry_meta).await.unwrap_or(id);
 						} else {
-							// Max retries exhausted
-							error!(
-								"Task {} failed after {} retries: {}",
-								id, task_meta.retry_count, e
-							);
+							// Max retries exhausted OR error is permanent
+							if is_retryable {
+								error!(
+									"Task {} failed after {} retries: {}",
+									id, task_meta.retry_count, e
+								);
+							} else {
+								error!("Task {} failed permanently (non-retryable): {}", id, e);
+							}
 							store.update_task_error(id, &e.to_string(), None).await.unwrap_or(());
 							task.on_failed(&state, task_meta.retry_count, &e.to_string()).await;
 							tx_finish.send(id).unwrap_or(());

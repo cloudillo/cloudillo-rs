@@ -65,6 +65,37 @@ impl From<std::io::Error> for Error {
 	}
 }
 
+impl Error {
+	/// Whether a failed operation is worth retrying. A short denylist of
+	/// *permanent* failures returns `false`; everything else returns `true`.
+	///
+	/// Scoped to what the task scheduler's federation tasks actually return.
+	/// Permanent here means "a later attempt cannot succeed": the sender isn't
+	/// following us, the JWT signature is invalid, the action is malformed, or
+	/// the remote resource is gone (410). Transient failures — network/TLS
+	/// errors, timeouts, a locked DB, a peer briefly returning 404 — are NOT
+	/// listed and so remain retryable. Mis-classifying a rare error toward
+	/// "retryable" is cheap (a few wasted attempts, then the retry limit stops
+	/// it); mis-classifying toward "permanent" would silently drop recoverable
+	/// federated actions, so we err toward retryable.
+	/// Known cost of this choice: `Error::NotFound` is retryable so a peer
+	/// briefly 404-ing can recover, but a task whose *local* target is genuinely
+	/// gone (e.g. a deleted action) also returns `NotFound` and will retry to the
+	/// policy limit before `on_failed` fires. `Error` carries no local-vs-remote
+	/// distinction, so we accept those wasted retries rather than break federation
+	/// recovery by denylisting `NotFound`.
+	pub fn is_retryable(&self) -> bool {
+		!matches!(
+			self,
+			Error::PermissionDenied
+				| Error::Unauthorized
+				| Error::ValidationError(_)
+				| Error::Parse
+				| Error::Gone
+		)
+	}
+}
+
 impl std::fmt::Display for Error {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
 		write!(f, "{:?}", self)
@@ -363,6 +394,30 @@ macro_rules! lock {
 			.lock()
 			.map_err(|_| $crate::error::Error::Internal(format!("mutex poisoned: {}", $context)))
 	};
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn permanent_errors_are_not_retryable() {
+		assert!(!Error::PermissionDenied.is_retryable());
+		assert!(!Error::Unauthorized.is_retryable());
+		assert!(!Error::ValidationError("x".into()).is_retryable());
+		assert!(!Error::Parse.is_retryable());
+		assert!(!Error::Gone.is_retryable());
+	}
+
+	#[test]
+	fn transient_errors_are_retryable() {
+		assert!(Error::Timeout.is_retryable());
+		assert!(Error::NetworkError("x".into()).is_retryable());
+		assert!(Error::DbError.is_retryable());
+		assert!(Error::NotFound.is_retryable()); // 404 = peer briefly unreachable
+		// TLS handshake failures (e.g. dyndns IP reallocation) must retry
+		assert!(Error::CryptoError("TLS error".into()).is_retryable());
+	}
 }
 
 // vim: ts=4
