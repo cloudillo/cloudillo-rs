@@ -744,6 +744,7 @@ async fn handle_post_svg(
 	tn_id: types::TnId,
 	f_id: u64,
 	bytes: &[u8],
+	orig_variant_id: &str,
 	preset: &preset::FilePreset,
 ) -> ClResult<serde_json::Value> {
 	// 1. Sanitize SVG
@@ -837,6 +838,61 @@ async fn handle_post_svg(
 		resized_tn.height,
 		resized_tn.bytes.len()
 	);
+
+	// Record an `orig` variant keyed by the ORIGINAL bytes hash so identical
+	// re-uploads dedup at create_file (same path as raster/video).
+	//
+	// When `store_original` is set we persist the original (unsanitized) bytes as
+	// a blob and mark the variant `available: true`. Serving the original is safe:
+	// `serve_file` attaches `Content-Security-Policy: script-src 'none';
+	// object-src 'none'` and `X-Content-Type-Options: nosniff` to EVERY
+	// image/svg+xml response regardless of variant name, so an original SVG cannot
+	// execute scripts. When `store_original` is false we record the row with
+	// `available: false` (dedup key only, no blob stored).
+	//
+	// Collision guard: when sanitization is byte-stable (`sanitized == bytes`),
+	// `orig_variant_id` equals `sd_variant_id` and the PRIMARY KEY
+	// (f_id, variant_id, tn_id) cannot hold two variant rows for one blob. In that
+	// case we skip the `orig` insert — the `vis.sd` row (stored when
+	// `store_original`) already preserves the original bytes. This leaves a
+	// residual dedup gap for byte-identical sanitizations (rare: the sanitizer
+	// normally re-serializes and changes the bytes).
+	if orig_variant_id == sd_variant_id.as_ref() {
+		debug!(
+			"SVG original is byte-identical to vis.sd ({}); skipping orig variant insert",
+			orig_variant_id
+		);
+	} else {
+		if preset.store_original {
+			let stored_orig_id = store::create_blob_buf(
+				app,
+				tn_id,
+				bytes,
+				blob_adapter::CreateBlobOptions::default(),
+			)
+			.await?;
+			debug_assert_eq!(stored_orig_id.as_ref(), orig_variant_id);
+		}
+
+		app.meta_adapter
+			.create_file_variant(
+				tn_id,
+				f_id,
+				meta_adapter::FileVariant {
+					variant_id: orig_variant_id,
+					variant: "orig",
+					format: "svg",
+					resolution: (orig_width, orig_height),
+					size: bytes.len() as u64,
+					available: preset.store_original,
+					global: false,
+					duration: None,
+					bitrate: None,
+					page_count: None,
+				},
+			)
+			.await?;
+	}
 
 	// 8. Schedule FileIdGeneratorTask (no additional variant tasks needed)
 	app.scheduler
@@ -1968,7 +2024,7 @@ pub async fn post_file_blob(
 					tn_id,
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
-						orig_variant_id: Some(orig_variant_id),
+						orig_variant_id: Some(orig_variant_id.clone()),
 						creator_tag: Some(auth.id_tag.clone()),
 						content_type: if is_svg {
 							"image/svg+xml".into()
@@ -1992,7 +2048,8 @@ pub async fn post_file_blob(
 				meta_adapter::FileId::FId(f_id) => {
 					// Route to SVG or raster image handler
 					let data = if is_svg {
-						handle_post_svg(&app, tn_id, f_id, &bytes, &preset).await?
+						handle_post_svg(&app, tn_id, f_id, &bytes, &orig_variant_id, &preset)
+							.await?
 					} else {
 						handle_post_image(&app, tn_id, f_id, content_type, &bytes, &preset).await?
 					};
