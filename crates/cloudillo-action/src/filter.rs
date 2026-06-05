@@ -180,17 +180,10 @@ async fn load_relationships(
 	app.meta_adapter.get_relationships(tn_id, &targets).await
 }
 
-/// Does `subject` count as a follower-or-better of `tenant` in `tn_id`'s DB?
-///
-/// Returns true if either:
-/// - `profiles[subject].connected` is true (mutual CONN — symmetric), or
-/// - there is an active FLLW action from subject → tenant (status='A', no DEL sub_typ).
-///
-/// `following` on `profiles[subject]` is intentionally ignored: in tenant T's DB
-/// it means "T follows subject", which is the wrong direction for "is subject a
-/// follower of T?" Inbound FLLWs are stored in the actions table, not on the
-/// profile row (see fllw.rs::on_receive: "Followers are queried from stored
-/// FLLW actions when needed").
+/// Does `subject` count as a follower of `tenant` in `tn_id`'s DB?
+/// Reads the explicit, directional `follower` flag (set by FLLW/CONN hooks):
+/// true iff `subject` follows `tenant`. Replaces the old symmetric-`connected`
+/// assumption, which wrongly treated a one-way community membership as mutual.
 pub(crate) async fn subject_has_peer_relation_to_tenant(
 	app: &App,
 	tn_id: TnId,
@@ -200,23 +193,11 @@ pub(crate) async fn subject_has_peer_relation_to_tenant(
 	if subject_id_tag == tenant_id_tag {
 		return Ok(true);
 	}
-
-	let rels = app.meta_adapter.get_relationships(tn_id, &[subject_id_tag]).await?;
-	if rels.get(subject_id_tag).is_some_and(|(_following, connected)| *connected) {
-		return Ok(true);
+	match app.meta_adapter.read_profile(tn_id, subject_id_tag).await {
+		Ok((_, p)) => Ok(p.follower),
+		Err(Error::NotFound) => Ok(false),
+		Err(e) => Err(e),
 	}
-
-	let opts = ListActionOptions {
-		typ: Some(vec!["FLLW".into()]),
-		issuer: Some(subject_id_tag.to_string()),
-		audience: Some(tenant_id_tag.to_string()),
-		status: Some(vec!["A".into()]),
-		limit: Some(1),
-		..Default::default()
-	};
-	let fllw = app.meta_adapter.list_actions(tn_id, &opts).await?;
-	// Active FLLW with no DEL sub_typ means "still following".
-	Ok(fllw.iter().any(|a| a.sub_typ.as_deref() != Some("DEL")))
 }
 
 // vim: ts=4

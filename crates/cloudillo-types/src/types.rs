@@ -373,6 +373,7 @@ pub struct ProfileInfo {
 	pub status: Option<crate::meta_adapter::ProfileStatus>,
 	pub connected: Option<bool>,
 	pub following: Option<bool>,
+	pub follower: Option<bool>,
 	/// Per-profile trust preference controlling proxy-token use on passive reads.
 	/// `"always"` = always authenticate, `"never"` = never, absent = ask.
 	pub trust: Option<crate::meta_adapter::ProfileTrust>,

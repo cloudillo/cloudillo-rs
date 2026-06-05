@@ -30,7 +30,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 33;
+	const CURRENT_DB_VERSION: i64 = 35;
 
 	let mut tx = db.begin().await?;
 
@@ -122,6 +122,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			status char(1),
 			perm char(1),
 			following boolean,
+			follower boolean,
 			connected boolean,
 			roles text,
 			trust char(1),					-- Per-profile trust preference: 'A' always, 'N' never, NULL ask
@@ -926,6 +927,12 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query(
 			"CREATE INDEX IF NOT EXISTS idx_files_root ON files(tn_id, root_id) \
 			 WHERE root_id IS NOT NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_profiles_follower \
+			 ON profiles(tn_id, id_tag) WHERE follower = 1",
 		)
 		.execute(&mut *tx)
 		.await?;
@@ -1768,6 +1775,46 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 		set_db_version(&mut tx, 33).await;
+	}
+
+	if version < 34 {
+		sqlx::query("ALTER TABLE profiles ADD COLUMN follower boolean")
+			.execute(&mut *tx)
+			.await?;
+		// Backfill the directional follower set from existing relationship actions.
+		// A profile P (row keyed by P.id_tag) follows the local tenant iff P issued
+		// an active FLLW to us, OR P is a *person* who issued an active CONN to us
+		// (connection-implied follow is persons-only; communities are followed,
+		// never follow). Mirrors the new hook rules so existing followers keep
+		// receiving broadcasts after upgrade.
+		sqlx::query(
+			"UPDATE profiles SET follower = 1 \
+			 WHERE EXISTS ( \
+			     SELECT 1 FROM actions a \
+			     WHERE a.tn_id = profiles.tn_id \
+			       AND a.issuer_tag = profiles.id_tag \
+			       AND a.status = 'A' \
+			       AND (a.sub_type IS NULL OR a.sub_type != 'DEL') \
+			       AND ( a.type = 'FLLW' \
+			             OR (a.type = 'CONN' AND profiles.type = 'P') ) \
+			 )",
+		)
+		.execute(&mut *tx)
+		.await?;
+		set_db_version(&mut tx, 34).await;
+	}
+
+	if version < 35 {
+		// Partial index backing `list_follower_tags` (SELECT id_tag WHERE
+		// tn_id=? AND follower=1), run on every broadcast. Without it the engine
+		// range-scans all of the tenant's profiles via idx_profiles_tnid_idtag.
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_profiles_follower \
+			 ON profiles(tn_id, id_tag) WHERE follower = 1",
+		)
+		.execute(&mut *tx)
+		.await?;
+		set_db_version(&mut tx, 35).await;
 	}
 
 	tx.commit().await?;

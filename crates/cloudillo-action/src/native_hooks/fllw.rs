@@ -84,6 +84,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// We just need to:
 /// - Check if user allows followers (privacy.allow_followers setting)
 /// - Sync the issuer's profile (the follower) if not already known
+/// - Record the directional `follower` flag on the issuer's profile
 /// - Log the event for auditing
 ///
 /// Note: Unlike CONN, FLLW doesn't require acceptance - it's a one-way relationship
@@ -124,18 +125,37 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					context.issuer, e
 				);
 			}
+
+			// Record the explicit, directional follower flag: the issuer now
+			// follows us and should receive our broadcasts.
+			let follower_upsert =
+				UpsertProfileFields { follower: Patch::Value(true), ..Default::default() };
+			if let Err(e) =
+				app.meta_adapter.upsert_profile(tn_id, &context.issuer, &follower_upsert).await
+			{
+				warn!("FLLW: Failed to set follower for {}: {}", context.issuer, e);
+			}
 		}
 		Some("DEL") => {
 			info!("FLLW:DEL: {} stopped following {}", context.issuer, audience);
+
+			let follower_upsert =
+				UpsertProfileFields { follower: Patch::Null, ..Default::default() };
+			if let Err(e) =
+				app.meta_adapter.upsert_profile(tn_id, &context.issuer, &follower_upsert).await
+			{
+				warn!("FLLW:DEL: Failed to clear follower for {}: {}", context.issuer, e);
+			}
 		}
 		Some(subtype) => {
 			warn!("FLLW on_receive: Unknown subtype '{}', ignoring", subtype);
 		}
 	}
 
-	// The action is already stored in the database by the action verifier
-	// No additional profile updates needed on the receiving side
-	// Followers are queried from stored FLLW actions when needed
+	// The action itself is already stored by the action verifier. Beyond that,
+	// this hook maintains the directional `follower` flag on the issuer's
+	// profile (set above), which is the single source of truth consumed by the
+	// broadcast path via `list_follower_tags`.
 
 	Ok(HookResult::default())
 }

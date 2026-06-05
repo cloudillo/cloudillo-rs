@@ -3,6 +3,7 @@
 
 //! Shared helper functions for action processing
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::str::FromStr;
 
@@ -242,6 +243,25 @@ pub fn is_action_issuer(action_issuer: &str, user_id: &str) -> bool {
 /// This helper normalizes the audience field for consistent handling.
 pub fn effective_audience<'a>(audience: Option<&'a str>, issuer: &'a str) -> &'a str {
 	audience.unwrap_or(issuer)
+}
+
+/// Broadcast/Announce recipient set for `tn_id`: every profile with the
+/// directional `follower` flag set (maintained by the FLLW/CONN native hooks),
+/// excluding `exclude_id_tag` (the author/self). `list_follower_tags` already
+/// drops Suspended/Blocked/Banned issuers. Callers append any extra direct
+/// recipients (e.g. the action author) themselves.
+pub(crate) async fn broadcast_recipient_tags(
+	app: &App,
+	tn_id: TnId,
+	exclude_id_tag: &str,
+) -> ClResult<HashSet<Box<str>>> {
+	Ok(app
+		.meta_adapter
+		.list_follower_tags(tn_id)
+		.await?
+		.into_iter()
+		.filter(|tag| tag.as_ref() != exclude_id_tag)
+		.collect())
 }
 
 #[cfg(test)]

@@ -230,6 +230,7 @@ pub struct Profile<S: AsRef<str>> {
 	pub status: Option<ProfileStatus>,
 	pub synced_at: Option<Timestamp>,
 	pub following: bool,
+	pub follower: bool,
 	pub connected: ProfileConnectionStatus,
 	pub roles: Option<Box<[Box<str>]>>,
 	pub trust: Option<ProfileTrust>,
@@ -242,6 +243,7 @@ pub struct ListProfileOptions {
 	pub status: Option<Box<[ProfileStatus]>>,
 	pub connected: Option<ProfileConnectionStatus>,
 	pub following: Option<bool>,
+	pub follower: Option<bool>,
 	pub q: Option<String>,
 	pub id_tag: Option<String>,
 	/// Filter profiles by whether a trust preference is set.
@@ -293,10 +295,6 @@ pub struct UpdateProfileData {
 	#[serde(default)]
 	pub synced: Patch<bool>,
 	#[serde(default)]
-	pub following: Patch<bool>,
-	#[serde(default)]
-	pub connected: Patch<ProfileConnectionStatus>,
-	#[serde(default)]
 	pub trust: Patch<ProfileTrust>,
 
 	// Sync metadata
@@ -342,6 +340,7 @@ pub struct UpsertProfileFields {
 	pub status: Patch<ProfileStatus>,
 	pub synced: Patch<bool>,
 	pub following: Patch<bool>,
+	pub follower: Patch<bool>,
 	pub connected: Patch<ProfileConnectionStatus>,
 	pub trust: Patch<ProfileTrust>,
 	pub etag: Patch<Box<str>>,
@@ -360,8 +359,12 @@ impl UpsertProfileFields {
 			roles: update.roles,
 			status: update.status,
 			synced: update.synced,
-			following: update.following,
-			connected: update.connected,
+			// `following`, `follower`, and `connected` are set only by the
+			// FLLW/CONN native hooks, never via the client-facing update DTO;
+			// leave them untouched here.
+			following: Patch::Undefined,
+			follower: Patch::Undefined,
+			connected: Patch::Undefined,
 			trust: update.trust,
 			etag: update.etag,
 		}
@@ -1325,6 +1328,12 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		opts: &ListProfileOptions,
 	) -> ClResult<Vec<Profile<Box<str>>>>;
+
+	/// List the id_tags of every profile that follows this tenant (i.e. should
+	/// receive its broadcasts). This is the broadcast/Announce recipient set:
+	/// profiles with `follower = true`, excluding Suspended/Blocked/Banned issuers.
+	/// Unbounded (no LIMIT) — unlike `list_profiles`.
+	async fn list_follower_tags(&self, tn_id: TnId) -> ClResult<Vec<Box<str>>>;
 
 	/// Get relationships between the current user and multiple target profiles
 	///

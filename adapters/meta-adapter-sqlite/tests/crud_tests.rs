@@ -113,6 +113,7 @@ async fn test_list_profiles() {
 		status: None,
 		connected: None,
 		following: None,
+		follower: None,
 		q: None,
 		id_tag: None,
 		trust_set: None,

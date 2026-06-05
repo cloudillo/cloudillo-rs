@@ -133,6 +133,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		profile::list(&self.dbr, tn_id, opts).await
 	}
 
+	async fn list_follower_tags(&self, tn_id: TnId) -> ClResult<Vec<Box<str>>> {
+		profile::list_follower_tags(&self.dbr, tn_id).await
+	}
+
 	async fn get_relationships(
 		&self,
 		tn_id: TnId,

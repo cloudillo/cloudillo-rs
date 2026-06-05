@@ -3,7 +3,6 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 // Re-export from cloudillo-types for backward compatibility
@@ -957,29 +956,9 @@ async fn schedule_broadcast_delivery(
 	related_action_id: Option<&str>,
 	author_id_tag: Option<&str>,
 ) -> ClResult<()> {
-	// Query for followers (entities that issued FLLW or CONN actions to us)
-	let follower_actions = app
-		.meta_adapter
-		.list_actions(
-			tn_id,
-			&meta_adapter::ListActionOptions {
-				typ: Some(vec!["FLLW".into(), "CONN".into()]),
-				status: Some(vec!["A".into()]),
-				exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
-				..Default::default()
-			},
-		)
-		.await?;
-
-	// Extract unique follower id_tags (excluding self).
-	// Anyone who sent us a CONN/FLLW request is a follower (active rows only;
-	// status='A' + exclude_sub_typ=['DEL'] drop deleted/severed relationships).
-	let mut recipients: HashSet<Box<str>> = HashSet::new();
-	for action_view in follower_actions {
-		if action_view.issuer.id_tag.as_ref() != id_tag {
-			recipients.insert(action_view.issuer.id_tag.clone());
-		}
-	}
+	// Recipient set = profiles with the directional `follower` flag; see
+	// `helpers::broadcast_recipient_tags` for the full rationale.
+	let mut recipients = crate::helpers::broadcast_recipient_tags(app, tn_id, id_tag).await?;
 
 	// Always send to author (they need to know their action was approved, even if not a follower)
 	if let Some(author) = author_id_tag

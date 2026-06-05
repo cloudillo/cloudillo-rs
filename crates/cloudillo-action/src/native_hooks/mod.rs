@@ -39,7 +39,27 @@ pub mod subs;
 
 use crate::hooks::{ActionTypeHooks, HookRegistry};
 use crate::prelude::*;
+use cloudillo_types::meta_adapter::ProfileType;
 use std::sync::Arc;
+
+/// CONN-implied follower update. Connection implies a follow only for *persons*
+/// (communities are followed, never follow). Purely **additive**: returns
+/// `Value(true)` for a known person and `Undefined` otherwise, so an unclassified
+/// or unsynced issuer is left untouched instead of clobbering a flag an FLLW
+/// already set. Clearing is the job of FLLW:DEL only; CONN:DEL / CONN-reject
+/// leave the follow intact.
+pub(crate) async fn conn_follower_patch(app: &App, tn_id: TnId, id_tag: &str) -> Patch<bool> {
+	if app
+		.meta_adapter
+		.read_profile(tn_id, id_tag)
+		.await
+		.is_ok_and(|(_, p)| p.typ == ProfileType::Person)
+	{
+		Patch::Value(true)
+	} else {
+		Patch::Undefined
+	}
+}
 
 /// Register all native hooks into the app's hook registry
 pub async fn register_native_hooks(app: &App) -> ClResult<()> {

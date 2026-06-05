@@ -12,6 +12,7 @@
 
 use crate::helpers::{self, SubscriptionRole};
 use crate::hooks::{HookContext, HookResult};
+use crate::native_hooks::conn_follower_patch;
 use crate::prelude::*;
 use crate::subject_ref::{SubjectRef, parse_subject_ref};
 use crate::task::{CreateAction, create_action};
@@ -367,6 +368,7 @@ async fn on_accept_community(
 	if let Ok(Some(community_tn_id)) = lookup_local_tenant(app, community_id_tag).await {
 		let invitee_upsert = UpsertProfileFields {
 			connected: Patch::Value(ProfileConnectionStatus::Connected),
+			follower: conn_follower_patch(app, community_tn_id, audience).await,
 			roles: Patch::Value(Some(vec!["contributor".into()])),
 			..Default::default()
 		};

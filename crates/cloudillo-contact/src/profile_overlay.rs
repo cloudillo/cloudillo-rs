@@ -128,6 +128,7 @@ mod tests {
 			status: None,
 			synced_at: None,
 			following: true,
+			follower: true,
 			connected: ProfileConnectionStatus::Connected,
 			roles: None,
 			trust: None,

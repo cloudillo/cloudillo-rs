@@ -16,6 +16,7 @@
 
 use crate::history_sync::schedule_history_sync;
 use crate::hooks::{HookContext, HookResult};
+use crate::native_hooks::conn_follower_patch;
 use crate::prelude::*;
 use crate::task::{CreateAction, create_action};
 use cloudillo_types::meta_adapter::{ProfileConnectionStatus, UpsertProfileFields};
@@ -135,6 +136,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				} else {
 					Patch::Value(true)
 				},
+				follower: conn_follower_patch(&app, tn_id, audience).await,
 				connected: Patch::Value(ProfileConnectionStatus::Connected),
 				..Default::default()
 			};
@@ -231,6 +233,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					} else {
 						Patch::Value(true)
 					},
+					follower: conn_follower_patch(&app, tn_id, &context.issuer).await,
 					..Default::default()
 				};
 
@@ -306,6 +309,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					} else {
 						Patch::Value(true)
 					},
+					follower: conn_follower_patch(&app, tn_id, &context.issuer).await,
 					roles: Patch::Value(Some(vec!["contributor".into()])),
 					..Default::default()
 				};
@@ -369,6 +373,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 						} else {
 							Patch::Value(true)
 						},
+						follower: conn_follower_patch(&app, tn_id, &context.issuer).await,
 						..Default::default()
 					};
 					if let Err(e) = app
@@ -435,6 +440,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				} else {
 					Patch::Value(true)
 				},
+				follower: conn_follower_patch(&app, tn_id, &context.issuer).await,
 				..Default::default()
 			};
 

@@ -31,6 +31,7 @@ pub struct ProfileWithStatus {
 	pub status: Option<ProfileStatus>,
 	pub connected: Option<bool>,
 	pub following: Option<bool>,
+	pub follower: Option<bool>,
 	pub trust: Option<ProfileTrust>,
 }
 
@@ -49,6 +50,8 @@ pub struct ListProfilesQuery {
 	id_tag: Option<String>,
 	/// Filter by `following` flag.
 	following: Option<bool>,
+	/// Filter by `follower` flag (profiles that follow this tenant).
+	follower: Option<bool>,
 	/// Filter by connection status. Wire values: `"true"` / `"false"` for the
 	/// boolean cases plus `"R"` for `RequestPending` — mirrors the frontend
 	/// `ProfileConnectionStatus = boolean | 'R'` shape.
@@ -140,6 +143,7 @@ pub async fn list_profiles(
 		status,
 		connected: params.connected.as_deref().and_then(parse_connected),
 		following: params.following,
+		follower: params.follower,
 		q: params.search.as_ref().map(|s| s.to_lowercase()),
 		id_tag: params.id_tag,
 		trust_set: params.trust_set,
@@ -165,6 +169,7 @@ pub async fn list_profiles(
 			status: p.status,
 			connected: Some(p.connected.is_connected()),
 			following: Some(p.following),
+			follower: Some(p.follower),
 			trust: p.trust,
 			roles: p.roles.map(|r| r.iter().map(ToString::to_string).collect()),
 			created_at: None, // Not available in Profile type
@@ -203,6 +208,7 @@ pub async fn get_profile_by_id_tag(
 				status: p.status,
 				connected: Some(p.connected.is_connected()),
 				following: Some(p.following),
+				follower: Some(p.follower),
 				trust: p.trust,
 			})
 		}

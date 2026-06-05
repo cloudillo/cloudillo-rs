@@ -21,7 +21,6 @@ use crate::{
 	prelude::*,
 	subject_ref::{SubjectRef, parse_subject_ref},
 };
-use std::collections::HashSet;
 
 /// Direction-specific processing context
 #[derive(Debug, Clone)]
@@ -608,37 +607,9 @@ async fn schedule_broadcast_delivery(
 	action_id: &str,
 	related_action_id: Option<&str>,
 ) -> ClResult<()> {
-	// Query for accepted FLLW / CONN actions only. `status="A"` excludes
-	// pending notifications ('N'), confirmation-pending ('C'), and deleted
-	// ('D') rows in a single index-bounded query, instead of fetching all
-	// statuses and filtering in Rust. Suppression (Suspended/Blocked/Banned)
-	// is enforced in SQL via exclude_issuer_profile_status — see fanout.rs
-	// rationale.
-	let follower_actions = app
-		.meta_adapter
-		.list_actions(
-			tn_id,
-			&meta_adapter::ListActionOptions {
-				typ: Some(vec!["FLLW".into(), "CONN".into()]),
-				status: Some(vec!["A".into()]),
-				exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
-				exclude_issuer_profile_status: Some(Box::from([
-					ProfileStatus::Suspended,
-					ProfileStatus::Blocked,
-					ProfileStatus::Banned,
-				])),
-				..Default::default()
-			},
-		)
-		.await?;
-
-	// Extract unique follower id_tags (excluding self).
-	let mut recipients: HashSet<Box<str>> = HashSet::new();
-	for action_view in follower_actions {
-		if action_view.issuer.id_tag.as_ref() != id_tag {
-			recipients.insert(action_view.issuer.id_tag.clone());
-		}
-	}
+	// Recipient set = profiles with the directional `follower` flag; see
+	// `helpers::broadcast_recipient_tags` for the full rationale.
+	let recipients = crate::helpers::broadcast_recipient_tags(app, tn_id, id_tag).await?;
 
 	if recipients.is_empty() {
 		debug!("No followers to broadcast {} to", action_id);

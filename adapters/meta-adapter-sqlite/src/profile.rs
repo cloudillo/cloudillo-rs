@@ -119,7 +119,7 @@ pub(crate) async fn list(
 	opts: &ListProfileOptions,
 ) -> ClResult<Vec<Profile<Box<str>>>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT id_tag, name, type, profile_pic, status, synced_at, following, connected, roles, trust
+		"SELECT id_tag, name, type, profile_pic, status, synced_at, following, follower, connected, roles, trust
 		 FROM profiles WHERE type IS NOT NULL AND tn_id=",
 	);
 	query.push_bind(tn_id.0);
@@ -179,6 +179,14 @@ pub(crate) async fn list(
 		query.push(" AND following=").push_bind(following);
 	}
 
+	if let Some(follower) = opts.follower {
+		if follower {
+			query.push(" AND follower=1");
+		} else {
+			query.push(" AND (follower IS NULL OR follower=0)");
+		}
+	}
+
 	if let Some(q) = &opts.q {
 		let escaped_q = crate::utils::escape_like(q);
 		query
@@ -226,6 +234,7 @@ pub(crate) async fn list(
 			status: parse_status(row)?,
 			synced_at: row.try_get::<Option<i64>, _>("synced_at")?.map(Timestamp),
 			following: row.try_get("following")?,
+			follower: row.try_get::<Option<bool>, _>("follower")?.unwrap_or(false),
 			connected: parse_connected(row),
 			roles: row.try_get::<Option<String>, _>("roles")?.map(|s| {
 				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
@@ -289,7 +298,7 @@ pub(crate) async fn read(
 	id_tag: &str,
 ) -> ClResult<(Box<str>, Profile<Box<str>>)> {
 	let res = sqlx::query(
-		"SELECT id_tag, type, name, profile_pic, status, synced_at, perm, following, connected, roles, trust, etag
+		"SELECT id_tag, type, name, profile_pic, status, synced_at, perm, following, follower, connected, roles, trust, etag
 		FROM profiles WHERE tn_id=? AND id_tag=?",
 	)
 	.bind(tn_id.0)
@@ -314,6 +323,7 @@ pub(crate) async fn read(
 			status: parse_status(&row)?,
 			synced_at: row.try_get::<Option<i64>, _>("synced_at")?.map(Timestamp),
 			following: row.try_get("following")?,
+			follower: row.try_get::<Option<bool>, _>("follower")?.unwrap_or(false),
 			connected: parse_connected(&row),
 			roles: row.try_get::<Option<String>, _>("roles")?.map(|s| {
 				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
@@ -322,6 +332,23 @@ pub(crate) async fn read(
 		};
 		Ok((etag, profile))
 	})
+}
+
+/// List the id_tags of every profile that follows this tenant (broadcast set).
+pub(crate) async fn list_follower_tags(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<Box<str>>> {
+	// active = status NULL; exclude Suspended/Blocked/Banned ('S','B','X');
+	// Muted ('M') is kept
+	let rows = sqlx::query(
+		"SELECT id_tag FROM profiles \
+		 WHERE tn_id=? AND follower=1 \
+		   AND (status IS NULL OR status NOT IN ('S','B','X'))",
+	)
+	.bind(tn_id.0)
+	.fetch_all(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+	collect_res(rows.iter().map(|row| row.try_get::<Box<str>, _>("id_tag")))
 }
 
 /// Read profile roles for access token generation
@@ -391,6 +418,10 @@ pub(crate) async fn upsert(
 		Patch::Value(b) => *b,
 		Patch::Null | Patch::Undefined => false,
 	};
+	let insert_follower: bool = match &fields.follower {
+		Patch::Value(b) => *b,
+		Patch::Null | Patch::Undefined => false,
+	};
 	let insert_connected: Option<ConnectedDbValue> = match &fields.connected {
 		Patch::Value(s) => Some(connected_to_db(*s)),
 		Patch::Undefined => Some(ConnectedDbValue::Int(0)),
@@ -407,12 +438,12 @@ pub(crate) async fn upsert(
 	let synced_at_now = matches!(&fields.synced, Patch::Value(true));
 
 	let insert_sql = if synced_at_now {
-		"INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, status, following, connected, roles, trust, synced_at, etag, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, unixepoch())
+		"INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, status, following, follower, connected, roles, trust, synced_at, etag, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, unixepoch())
 		 ON CONFLICT(tn_id, id_tag) DO NOTHING"
 	} else {
-		"INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, status, following, connected, roles, trust, etag, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+		"INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, status, following, follower, connected, roles, trust, etag, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
 		 ON CONFLICT(tn_id, id_tag) DO NOTHING"
 	};
 
@@ -424,6 +455,7 @@ pub(crate) async fn upsert(
 		.bind(insert_profile_pic)
 		.bind(insert_status)
 		.bind(insert_following)
+		.bind(insert_follower)
 		.bind(insert_connected)
 		.bind(insert_roles)
 		.bind(insert_trust)
@@ -469,6 +501,7 @@ pub(crate) async fn upsert(
 		expr | v | { if *v { Some("unixepoch()") } else { None } }
 	);
 	has_updates = push_patch!(query, has_updates, "following", &fields.following);
+	has_updates = push_patch!(query, has_updates, "follower", &fields.follower);
 	has_updates = push_patch!(query, has_updates, "connected", &fields.connected, |v| match v {
 		ProfileConnectionStatus::Disconnected => ConnectedDbValue::Int(0),
 		ProfileConnectionStatus::RequestPending => ConnectedDbValue::Text("R"),
@@ -630,4 +663,297 @@ pub(crate) async fn get_info(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClRe
 		status,
 		created_at: Timestamp(created_at),
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use sqlx::sqlite;
+
+	// Single-connection write pool over a temp DB file, mirroring
+	// `MetaAdapterSqlite::new`. Runs the full schema (init_db → CURRENT_DB_VERSION).
+	async fn test_pool(dir: &std::path::Path) -> SqlitePool {
+		let opts = sqlite::SqliteConnectOptions::new()
+			.filename(dir.join("meta.db"))
+			.create_if_missing(true)
+			.journal_mode(sqlite::SqliteJournalMode::Wal);
+		let db = sqlite::SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect_with(opts)
+			.await
+			.expect("connect test pool");
+		crate::schema::init_db(&db).await.expect("init schema");
+		db
+	}
+
+	// Insert a minimal profile row. `status` is the raw CHAR(1) code (None = NULL = active).
+	async fn insert_profile(
+		db: &SqlitePool,
+		tn_id: TnId,
+		id_tag: &str,
+		typ: &str,
+		status: Option<&str>,
+	) {
+		sqlx::query(
+			"INSERT INTO profiles (tn_id, id_tag, name, type, status) VALUES (?, ?, ?, ?, ?)",
+		)
+		.bind(tn_id.0)
+		.bind(id_tag)
+		.bind(id_tag)
+		.bind(typ)
+		.bind(status)
+		.execute(db)
+		.await
+		.expect("insert profile");
+	}
+
+	// Insert one active (status 'A') action issued by `issuer`.
+	async fn insert_action(
+		db: &SqlitePool,
+		tn_id: TnId,
+		action_id: &str,
+		typ: &str,
+		sub_type: Option<&str>,
+		issuer: &str,
+	) {
+		sqlx::query(
+			"INSERT INTO actions (tn_id, action_id, type, sub_type, issuer_tag, status, created_at)
+			 VALUES (?, ?, ?, ?, ?, 'A', unixepoch())",
+		)
+		.bind(tn_id.0)
+		.bind(action_id)
+		.bind(typ)
+		.bind(sub_type)
+		.bind(issuer)
+		.execute(db)
+		.await
+		.expect("insert action");
+	}
+
+	// Read the raw `follower` flag for a profile (NULL → false).
+	async fn read_follower(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> bool {
+		sqlx::query_scalar::<_, Option<bool>>(
+			"SELECT follower FROM profiles WHERE tn_id=? AND id_tag=?",
+		)
+		.bind(tn_id.0)
+		.bind(id_tag)
+		.fetch_one(db)
+		.await
+		.expect("read follower")
+		.unwrap_or(false)
+	}
+
+	// `list_follower_tags` returns only follower=1 profiles and drops
+	// Suspended/Blocked/Banned issuers; active (NULL) and Muted are kept.
+	#[tokio::test]
+	async fn list_follower_tags_excludes_suppressed() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+
+		// follower=1 rows with varying status.
+		for (tag, status) in [
+			("active.example", None),
+			("muted.example", Some("M")),
+			("suspended.example", Some("S")),
+			("blocked.example", Some("B")),
+			("banned.example", Some("X")),
+		] {
+			insert_profile(&db, tn_id, tag, "P", status).await;
+			sqlx::query("UPDATE profiles SET follower=1 WHERE tn_id=? AND id_tag=?")
+				.bind(tn_id.0)
+				.bind(tag)
+				.execute(&db)
+				.await
+				.expect("set follower");
+		}
+		// A non-follower row must never appear.
+		insert_profile(&db, tn_id, "nonfollower.example", "P", None).await;
+
+		let mut tags = list_follower_tags(&db, tn_id).await.expect("list_follower_tags");
+		tags.sort();
+		assert_eq!(
+			tags,
+			vec![Box::from("active.example"), Box::from("muted.example")],
+			"only active + muted followers are returned"
+		);
+	}
+
+	// The v34 migration backfills `follower` from existing relationship actions:
+	// FLLW (any issuer type) and person-issued CONN set it; community-issued CONN
+	// and FLLW:DEL tombstones do not.
+	#[tokio::test]
+	async fn migration_v34_backfills_follower() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+
+		// Roll the schema back to v33 so re-running init_db replays the v34
+		// migration (ADD COLUMN follower + backfill) against the rows below.
+		// The v35 partial index references `follower`, so drop it before the
+		// column (SQLite rejects dropping a column an index depends on).
+		sqlx::query("DROP INDEX IF EXISTS idx_profiles_follower")
+			.execute(&db)
+			.await
+			.expect("drop follower index");
+		sqlx::query("ALTER TABLE profiles DROP COLUMN follower")
+			.execute(&db)
+			.await
+			.expect("drop follower column");
+		sqlx::query("UPDATE vars SET value='33' WHERE key='db_version'")
+			.execute(&db)
+			.await
+			.expect("reset db_version");
+
+		// person who CONN'd us → follower (person-CONN implies follow).
+		insert_profile(&db, tn_id, "p_conn.example", "P", None).await;
+		insert_action(&db, tn_id, "a1~conn-p", "CONN", None, "p_conn.example").await;
+		// community we CONN'd to → NOT follower (community-CONN never implies follow).
+		insert_profile(&db, tn_id, "c_conn.example", "C", None).await;
+		insert_action(&db, tn_id, "a1~conn-c", "CONN", None, "c_conn.example").await;
+		// person who FLLW'd us → follower.
+		insert_profile(&db, tn_id, "p_fllw.example", "P", None).await;
+		insert_action(&db, tn_id, "a1~fllw-p", "FLLW", None, "p_fllw.example").await;
+		// community that FLLW'd us → follower (explicit FLLW regardless of type).
+		insert_profile(&db, tn_id, "c_fllw.example", "C", None).await;
+		insert_action(&db, tn_id, "a1~fllw-c", "FLLW", None, "c_fllw.example").await;
+		// person whose only FLLW is a :DEL tombstone → NOT follower.
+		insert_profile(&db, tn_id, "p_unfllw.example", "P", None).await;
+		insert_action(&db, tn_id, "a1~fllw-del", "FLLW", Some("DEL"), "p_unfllw.example").await;
+		// person with no relationship action → NOT follower.
+		insert_profile(&db, tn_id, "p_none.example", "P", None).await;
+
+		// Replay the migration.
+		crate::schema::init_db(&db).await.expect("re-run migration");
+
+		assert!(read_follower(&db, tn_id, "p_conn.example").await, "person-CONN ⇒ follower");
+		assert!(
+			!read_follower(&db, tn_id, "c_conn.example").await,
+			"community-CONN ⇒ not follower"
+		);
+		assert!(read_follower(&db, tn_id, "p_fllw.example").await, "person-FLLW ⇒ follower");
+		assert!(read_follower(&db, tn_id, "c_fllw.example").await, "community-FLLW ⇒ follower");
+		assert!(!read_follower(&db, tn_id, "p_unfllw.example").await, "FLLW:DEL ⇒ not follower");
+		assert!(!read_follower(&db, tn_id, "p_none.example").await, "no action ⇒ not follower");
+	}
+
+	// M4 — a CONN accept is purely additive for the `follower` flag.
+	// `conn_follower_patch` (native_hooks/mod.rs) returns `Patch::Undefined` for
+	// an unknown/unsynced issuer and `Patch::Value(true)` for a known person,
+	// never `Value(false)`. This proves the upsert layer honours that contract:
+	// an existing follower=1 survives an Undefined write (no clobber of a flag an
+	// FLLW already set), a Value(true) write keeps it, an Undefined write never
+	// flips a non-follower to 1, and clearing now happens only via FLLW:DEL
+	// (Patch::Null still clears at this upsert layer).
+	#[tokio::test]
+	async fn conn_accept_follower_update_is_additive() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+
+		// Existing follower, as established by an earlier FLLW.
+		insert_profile(&db, tn_id, "peer.example", "P", None).await;
+		sqlx::query("UPDATE profiles SET follower=1 WHERE tn_id=? AND id_tag=?")
+			.bind(tn_id.0)
+			.bind("peer.example")
+			.execute(&db)
+			.await
+			.expect("set follower");
+
+		// Unknown-type CONN accept (conn_follower_patch → Undefined): must NOT
+		// clobber the flag an FLLW already set.
+		upsert(
+			&db,
+			tn_id,
+			"peer.example",
+			&UpsertProfileFields {
+				connected: Patch::Value(ProfileConnectionStatus::Connected),
+				follower: Patch::Undefined,
+				..Default::default()
+			},
+		)
+		.await
+		.expect("upsert undefined");
+		assert!(read_follower(&db, tn_id, "peer.example").await, "Undefined keeps follower=1");
+
+		// Known-person CONN accept (conn_follower_patch → Value(true)): keeps it set.
+		upsert(
+			&db,
+			tn_id,
+			"peer.example",
+			&UpsertProfileFields {
+				connected: Patch::Value(ProfileConnectionStatus::Connected),
+				follower: Patch::Value(true),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("upsert value true");
+		assert!(read_follower(&db, tn_id, "peer.example").await, "Value(true) keeps follower=1");
+
+		// A non-follower row: an Undefined CONN accept never flips it to 1.
+		insert_profile(&db, tn_id, "stranger.example", "P", None).await;
+		upsert(
+			&db,
+			tn_id,
+			"stranger.example",
+			&UpsertProfileFields {
+				connected: Patch::Value(ProfileConnectionStatus::Connected),
+				follower: Patch::Undefined,
+				..Default::default()
+			},
+		)
+		.await
+		.expect("upsert stranger");
+		assert!(
+			!read_follower(&db, tn_id, "stranger.example").await,
+			"Undefined never sets follower=1"
+		);
+
+		// The clearing sites (CONN:DEL / FLLW:DEL) DO drop the flag.
+		upsert(
+			&db,
+			tn_id,
+			"peer.example",
+			&UpsertProfileFields { follower: Patch::Null, ..Default::default() },
+		)
+		.await
+		.expect("upsert null");
+		assert!(!read_follower(&db, tn_id, "peer.example").await, "Null clears follower");
+	}
+
+	// M1 — accepting a community invitation flips the invitee's row in the
+	// community tenant to Connected + contributor AND sets `follower` in the same
+	// atomic upsert (via conn_follower_patch on the already-synced person
+	// invitee), so the member receives community broadcasts without waiting for
+	// the separately federated CONN to round-trip.
+	#[tokio::test]
+	async fn community_invite_accept_sets_follower() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let community_tn_id = TnId(7);
+
+		// Invitee was synced into the community tenant during the invite, so its
+		// type is known (Person) → conn_follower_patch returns Value(true).
+		insert_profile(&db, community_tn_id, "member.example", "P", None).await;
+
+		upsert(
+			&db,
+			community_tn_id,
+			"member.example",
+			&UpsertProfileFields {
+				connected: Patch::Value(ProfileConnectionStatus::Connected),
+				follower: Patch::Value(true),
+				roles: Patch::Value(Some(vec!["contributor".into()])),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("invitee upsert");
+
+		assert!(
+			read_follower(&db, community_tn_id, "member.example").await,
+			"community invite accept sets follower without the federated CONN"
+		);
+	}
 }
