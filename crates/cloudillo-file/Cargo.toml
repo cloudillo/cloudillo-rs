@@ -35,7 +35,7 @@ usvg = "0.47"
 regex = "1.12"
 
 # CRDT support (for file duplication)
-yrs = "0.26"
+yrs = "0.27"
 
 # LRU cache for the shared directory name cache
 lru = "0.18"
