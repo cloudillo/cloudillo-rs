@@ -474,6 +474,75 @@ impl DnsResolver {
 	}
 }
 
+/// Identifiers a name maps to, used for equivalence comparison: every CNAME
+/// name in its chain (incl. the starting name, normalized) plus the first
+/// terminal A-record IP. Two names refer to the same server iff their token sets
+/// intersect. `had_record` distinguishes "no DNS at all" (→ nodns) from
+/// "resolved, but elsewhere" (→ address). `transient` means a lookup failed
+/// transiently and the signature may be incomplete (→ never escalate).
+struct Signature {
+	tokens: Vec<String>,
+	had_record: bool,
+	transient: bool,
+}
+
+fn normalize_name(name: &str) -> String {
+	name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Find the first token present in both `a` and `b`. Pure helper factored out
+/// for unit testing the intersection logic without hitting the network.
+fn first_shared_token<'a>(a: &'a [String], b: &[String]) -> Option<&'a String> {
+	a.iter().find(|t| b.iter().any(|u| u == *t))
+}
+
+impl DnsResolver {
+	/// Build the signature of `name` by following its CNAME chain, then reading
+	/// the terminal A record. IP literals short-circuit to a single-IP set.
+	async fn resolve_signature(&self, name: &str) -> ClResult<Signature> {
+		const MAX_CNAME_HOPS: u8 = 8;
+		if name.parse::<IpAddr>().is_ok() {
+			return Ok(Signature {
+				tokens: vec![name.to_string()],
+				had_record: true,
+				transient: false,
+			});
+		}
+		let mut tokens = vec![normalize_name(name)];
+		let mut had_record = false;
+		let mut current = name.to_string();
+		for _ in 0..MAX_CNAME_HOPS {
+			match self.resolve_cname_outcome(&current).await? {
+				LookupOutcome::Found(target) => {
+					had_record = true;
+					tokens.push(normalize_name(&target));
+					current = target;
+				}
+				LookupOutcome::NoRecord => {
+					// Chain end — read the A record here.
+					match self.resolve_a_outcome(&current).await? {
+						LookupOutcome::Found(ip) => {
+							had_record = true;
+							tokens.push(ip);
+						}
+						LookupOutcome::NoRecord => {}
+						LookupOutcome::LookupError => {
+							return Ok(Signature { tokens, had_record, transient: true });
+						}
+					}
+					return Ok(Signature { tokens, had_record, transient: false });
+				}
+				LookupOutcome::LookupError => {
+					return Ok(Signature { tokens, had_record, transient: true });
+				}
+			}
+		}
+		// Pathological/looping chain — treat as transient (do not escalate).
+		warn!(name = %name, "CNAME chain exceeded max hops; treating as transient");
+		Ok(Signature { tokens, had_record, transient: true })
+	}
+}
+
 /// Create a recursive DNS resolver that starts from root nameservers
 pub fn create_recursive_resolver() -> ClResult<Arc<DnsResolver>> {
 	Ok(Arc::new(DnsResolver::new()?))
@@ -499,8 +568,31 @@ pub async fn resolve_domain_addresses(
 	Ok(None)
 }
 
-/// Validate a domain against local address using DNS
-/// Checks both CNAME and A records regardless of local address type
+/// Validate that `domain` refers to the same server as one of `local_address`.
+///
+/// Each name is resolved to a *signature*: every CNAME name in its chain (incl.
+/// the name itself, normalized) plus its first terminal A-record IP. An IP literal
+/// has signature `{ip}`. The domain matches when its signature shares any token
+/// with a local address's signature. Names ∪ IPs is needed because name-overlap
+/// alone misses IP-literal / direct-A configs, and IP-overlap alone is fragile
+/// under round-robin A records (shared CNAME *name* is rotation-proof).
+///
+/// Cases (D = domain, L = local_address; ✓ = validates):
+///   1. D=A,      L=IP same           ✓ shared IP
+///   2. D=A,      L=IP different      → "address"
+///   3. D=CNAME H, L=H (literal)      ✓ shared name H
+///   4. D=CNAME H, L=CNAME H          ✓ shared name H   (the alias bug this fixes)
+///   5. D=A,      L=host→same IP      ✓ shared IP
+///   6. D=CNAME→A ip, L=IP ip         ✓ shared IP
+///   7. D lookup transient            → Transient (skip; never suspend)
+///   8. D has no record               → "nodns"
+///   9. L hostname lookup transient   → Transient
+///  10. D&L share >1 token            ✓ first shared token wins
+///  11. D&L CNAME→round-robin host    ✓ shared CNAME name
+///
+/// `"address"`/`"nodns"` are definitive (escalate toward suspension);
+/// `ServiceUnavailable` maps to a transient skip. Any transient lookup anywhere
+/// suppresses a definitive verdict.
 pub async fn validate_domain_address(
 	domain: &str,
 	local_address: &[Box<str>],
@@ -510,119 +602,132 @@ pub async fn validate_domain_address(
 		return Err(Error::ValidationError("no local address configured".to_string()));
 	}
 
-	debug!(
-		domain = %domain,
-		local_addresses = ?local_address,
-		"Starting DNS validation with recursive resolver"
-	);
+	let dsig = resolver.resolve_signature(domain).await?;
+	let mut any_transient = dsig.transient;
 
-	// Try CNAME first
-	let cname_outcome = resolver.resolve_cname_outcome(domain).await?;
-	if let LookupOutcome::Found(ref resolved_cname) = cname_outcome {
-		for local_addr in local_address {
-			if resolved_cname.eq_ignore_ascii_case(local_addr.as_ref()) {
-				info!(
-					domain = %domain,
-					resolved_cname = %resolved_cname,
-					matched_local_address = %local_addr,
-					"Domain validated via CNAME record"
-				);
-				return Ok((resolved_cname.clone(), AddressType::Hostname));
-			}
-		}
-		warn!(
-			domain = %domain,
-			resolved_cname = %resolved_cname,
-			local_addresses = ?local_address,
-			"DNS CNAME record doesn't match local address"
-		);
-		return Err(Error::ValidationError("address".to_string()));
+	// Domain produced no DNS record at all → it cannot point at this server.
+	// (A transient lookup is inconclusive; fall through so any_transient handles it.)
+	if !dsig.had_record && !dsig.transient {
+		warn!(domain = %domain, "DNS validation failed: domain has no CNAME or A record");
+		return Err(Error::ValidationError("nodns".to_string()));
 	}
 
-	// Try A record
-	let a_outcome = resolver.resolve_a_outcome(domain).await?;
-	if let LookupOutcome::Found(ref resolved_ip) = a_outcome {
-		// 1. Direct match: a literal IP in local_address equals the resolved A record.
-		for local_addr in local_address {
-			if resolved_ip == local_addr.as_ref() {
-				info!(
-					domain = %domain,
-					resolved_ip = %resolved_ip,
-					matched_local_address = %local_addr,
-					"Domain validated via A record"
-				);
-				return Ok((resolved_ip.clone(), AddressType::Ipv4));
-			}
+	for local_addr in local_address {
+		let lsig = resolver.resolve_signature(local_addr.as_ref()).await?;
+		any_transient |= lsig.transient;
+		// First shared token wins. Names are normalized on both sides; IP tokens
+		// compare as plain strings.
+		if let Some(common) = first_shared_token(&dsig.tokens, &lsig.tokens) {
+			let addr_type = if common.parse::<IpAddr>().is_ok() {
+				AddressType::Ipv4
+			} else {
+				AddressType::Hostname
+			};
+			info!(
+				domain = %domain,
+				matched_local_address = %local_addr,
+				matched_token = %common,
+				"Domain validated (shared CNAME name or IP)"
+			);
+			return Ok((common.clone(), addr_type));
 		}
-		// 2. Indirect match: local_address is a hostname (CNAME-style config) and
-		// the cert domain has a *direct* A record (so the exact-CNAME check above
-		// could not match). Resolve each configured hostname's own A record and
-		// accept the domain if it points to the same IP — i.e. both names reach
-		// this server. (A cert domain that CNAMEs to a *different* host is not
-		// covered here; the CNAME branch above returns early in that case.)
-		let mut transient = false;
-		for local_addr in local_address {
-			if local_addr.parse::<IpAddr>().is_ok() {
-				continue; // IP literal — already compared above
-			}
-			match resolver.resolve_a_outcome(local_addr.as_ref()).await? {
-				LookupOutcome::Found(ref local_ip) if local_ip == resolved_ip => {
-					info!(
-						domain = %domain,
-						resolved_ip = %resolved_ip,
-						local_hostname = %local_addr,
-						"Domain validated: configured hostname resolves to same IP as domain"
-					);
-					return Ok((resolved_ip.clone(), AddressType::Ipv4));
-				}
-				LookupOutcome::Found(ref local_ip) => {
-					debug!(
-						domain = %domain,
-						resolved_ip = %resolved_ip,
-						local_hostname = %local_addr,
-						local_ip = %local_ip,
-						"Configured hostname resolves to a different IP than the domain"
-					);
-				}
-				LookupOutcome::NoRecord => {
-					debug!(local_hostname = %local_addr, "Configured hostname has no A record");
-				}
-				LookupOutcome::LookupError => {
-					transient = true;
-					debug!(
-						local_hostname = %local_addr,
-						"Transient failure resolving configured hostname's A record"
-					);
-				}
-			}
-		}
-		// A transient resolver failure on the configured hostname must not be
-		// reported as a definitive "address" failure (which would escalate the
-		// tenant toward suspension). Surface it as a non-ValidationError so
-		// check_domains_dns maps it to PreCheckError::Transient (skip this run).
-		if transient {
-			return Err(Error::ServiceUnavailable(
-				"transient DNS failure resolving configured local hostname".to_string(),
-			));
-		}
-		warn!(
-			domain = %domain,
-			resolved_ip = %resolved_ip,
-			local_addresses = ?local_address,
-			"DNS A record doesn't match local address (no configured hostname resolves to it)"
-		);
-		return Err(Error::ValidationError("address".to_string()));
 	}
 
-	// Neither CNAME nor A record found — log with the per-record-type outcome so
-	// the operator can tell "domain genuinely missing" from "lookup failed".
+	// No intersection. A transient lookup anywhere means the signature may be
+	// incomplete — never escalate; skip the run instead.
+	if any_transient {
+		return Err(Error::ServiceUnavailable(
+			"transient DNS failure during domain validation".to_string(),
+		));
+	}
 	warn!(
 		domain = %domain,
-		cname_outcome = ?cname_outcome,
-		a_outcome = ?a_outcome,
-		"DNS validation failed: no CNAME or A record found (final result)"
+		resolved = ?dsig.tokens,
+		local_addresses = ?local_address,
+		"Domain resolves but does not match any configured local address"
 	);
-	Err(Error::ValidationError("nodns".to_string()))
+	Err(Error::ValidationError("address".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::first_shared_token;
+
+	fn s(items: &[&str]) -> Vec<String> {
+		items.iter().map(std::string::ToString::to_string).collect()
+	}
+
+	#[test]
+	fn case1_shared_ip() {
+		// D direct-A, L IP-literal, same IP.
+		let d = s(&["cl-o.example.com", "1.2.3.4"]);
+		let l = s(&["1.2.3.4"]);
+		assert_eq!(first_shared_token(&d, &l), Some(&"1.2.3.4".to_string()));
+	}
+
+	#[test]
+	fn case2_different_ip_no_match() {
+		// D direct-A, L IP-literal, different IP.
+		let d = s(&["cl-o.example.com", "1.2.3.4"]);
+		let l = s(&["5.6.7.8"]);
+		assert_eq!(first_shared_token(&d, &l), None);
+	}
+
+	#[test]
+	fn case3_shared_name_literal() {
+		// D CNAME->srv, L literally srv.
+		let d = s(&["cl-o.example.com", "srv.host.net", "1.2.3.4"]);
+		let l = s(&["srv.host.net"]);
+		assert_eq!(first_shared_token(&d, &l), Some(&"srv.host.net".to_string()));
+	}
+
+	#[test]
+	fn case4_shared_cname_alias() {
+		// The reported bug: D and L both CNAME to the same host H.
+		let d = s(&["cl-o.home.w9.hu", "szilard-home.cloudillo.net", "84.0.234.154"]);
+		let l = s(&["zsuzska.symbion.hu", "szilard-home.cloudillo.net", "84.0.234.154"]);
+		assert_eq!(first_shared_token(&d, &l), Some(&"szilard-home.cloudillo.net".to_string()));
+	}
+
+	#[test]
+	fn case5_direct_a_same_ip_different_names() {
+		// D direct-A, L hostname direct-A, same IP, different names.
+		let d = s(&["cl-o.example.com", "1.2.3.4"]);
+		let l = s(&["other.host.net", "1.2.3.4"]);
+		assert_eq!(first_shared_token(&d, &l), Some(&"1.2.3.4".to_string()));
+	}
+
+	#[test]
+	fn case6_cname_to_ip_literal_local() {
+		// D CNAME->host(A=1.2.3.4), L IP-literal 1.2.3.4.
+		let d = s(&["cl-o.example.com", "host.net", "1.2.3.4"]);
+		let l = s(&["1.2.3.4"]);
+		assert_eq!(first_shared_token(&d, &l), Some(&"1.2.3.4".to_string()));
+	}
+
+	#[test]
+	fn case10_first_match_wins() {
+		// The first shared token in D's order is returned.
+		let d = s(&["a.example.com", "shared.net", "1.2.3.4"]);
+		let l = s(&["shared.net", "1.2.3.4"]);
+		assert_eq!(first_shared_token(&d, &l), Some(&"shared.net".to_string()));
+	}
+
+	#[test]
+	fn case11_round_robin_shared_cname() {
+		// D & L both CNAME to the same round-robin host but terminal A records
+		// rotated to different first-IPs; the shared CNAME name still matches.
+		let d = s(&["cl-o.example.com", "rr.host.net", "1.2.3.4"]);
+		let l = s(&["alias.example.org", "rr.host.net", "9.8.7.6"]);
+		assert_eq!(first_shared_token(&d, &l), Some(&"rr.host.net".to_string()));
+	}
+
+	#[test]
+	fn no_shared_token() {
+		let d = s(&["a.example.com", "host-a.net", "1.2.3.4"]);
+		let l = s(&["b.example.org", "host-b.net", "5.6.7.8"]);
+		assert_eq!(first_shared_token(&d, &l), None);
+	}
 }
 
 // vim: ts=4
