@@ -390,10 +390,32 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					// fan-out/broadcast/filter (status=['A']) include it.
 				}
 				_ => {
-					// Normal behavior: requires user confirmation. Rest at 'C' so
-					// the user gets a persistent, actionable accept/reject
-					// notification (not clobbered to 'A' on reload).
+					// The connection itself requires user confirmation (rest at 'C'),
+					// but *following* needs no consent — turn on the directional
+					// `follower` flag now so the issuer receives our broadcasts
+					// immediately, exactly as FLLW on_receive does. Gated on the same
+					// privacy.allow_followers setting FLLW honors.
 					info!("CONN: Connection request from {} requires confirmation", context.issuer);
+
+					let allow_followers = app
+						.settings
+						.get_bool(tn_id, "privacy.allow_followers")
+						.await
+						.unwrap_or(true);
+					if allow_followers {
+						let follower_upsert = UpsertProfileFields {
+							follower: conn_follower_patch(&app, tn_id, &context.issuer).await,
+							..Default::default()
+						};
+						if let Err(e) = app
+							.meta_adapter
+							.upsert_profile(tn_id, &context.issuer, &follower_upsert)
+							.await
+						{
+							warn!("CONN: Failed to set follower for {}: {}", context.issuer, e);
+						}
+					}
+
 					return Ok(HookResult { status: Some('C'), ..Default::default() });
 				}
 			}
