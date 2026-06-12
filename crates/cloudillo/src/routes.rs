@@ -345,13 +345,9 @@ fn init_public_routes(app: App) -> Router<App> {
 	let auth_public_router = Router::new()
 		.route("/api/auth/login", post(auth::handler::post_login))
 		.route("/api/auth/login-token", get(auth::handler::get_login_token))
-		.route("/api/auth/set-password", post(auth::handler::post_set_password))
-		.route("/api/auth/forgot-password", post(auth::handler::post_forgot_password))
 		// WebAuthn login endpoints
 		.route("/api/auth/wa/login/challenge", get(auth::webauthn::get_login_challenge))
 		.route("/api/auth/wa/login", post(auth::webauthn::post_login))
-		// Combined login init (replaces separate login-token + QR init + WebAuthn challenge)
-		.route("/api/auth/login-init", post(auth::handler::post_login_init))
 		// QR login init (public endpoint, kept for manual refresh)
 		.route("/api/auth/qr-login/init", post(auth::qr_login::post_init))
 		// QR login status (long-poll)
@@ -403,11 +399,7 @@ fn init_public_routes(app: App) -> Router<App> {
 	let general_public_router = Router::new()
 		// Tenant Discovery
 		.route("/api/me", get(profile::handler::get_tenant_profile_base))
-		.route("/api/me/full", get(profile::handler::get_tenant_profile))
 		.route("/api/me/app-domain", get(profile::handler::get_tenant_app_domain))
-
-		// Public References
-		.route("/api/refs/{ref_id}", get(r#ref::handler::get_ref))
 
 		// Ref-scoped IDP onboarding gate (read-only status check)
 		// Gates the unauthenticated welcome (set-password) page on IDP
@@ -435,6 +427,25 @@ fn init_public_routes(app: App) -> Router<App> {
 		.route("/api/files/{file_id}/content/{*path}", get(file::apkg::get_container_content))
 		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "general", app.opts.mode));
 
+	// --- Recovery flow (auth bucket, ban bypassed) ---
+	// A failed-login auto-ban must NOT lock a user out of account recovery.
+	// These keep the strict "auth" rate limit (429) but skip the 403 ban:
+	// set-password/forgot-password are gated by the secret ref token / per-tenant
+	// app-level cap; login-init exposes only a login challenge. POST /api/auth/login
+	// stays fully ban-enforced above.
+	let recovery_auth_router = Router::new()
+		.route("/api/auth/login-init", post(auth::handler::post_login_init))
+		.route("/api/auth/set-password", post(auth::handler::post_set_password))
+		.route("/api/auth/forgot-password", post(auth::handler::post_forgot_password))
+		.layer(RateLimitLayer::new_skip_ban(app.rate_limiter.clone(), "auth", app.opts.mode));
+
+	// --- Recovery flow (general bucket, ban bypassed) ---
+	// Reset page loads ref data + profile display; no secrets exposed.
+	let recovery_general_router = Router::new()
+		.route("/api/refs/{ref_id}", get(r#ref::handler::get_ref))
+		.route("/api/me/full", get(profile::handler::get_tenant_profile))
+		.layer(RateLimitLayer::new_skip_ban(app.rate_limiter.clone(), "general", app.opts.mode));
+
 	Router::new()
 		.merge(auth_public_router)
 		.merge(profile_creation_router)
@@ -443,6 +454,8 @@ fn init_public_routes(app: App) -> Router<App> {
 		.merge(federation_router)
 		.merge(websocket_router)
 		.merge(general_public_router)
+		.merge(recovery_auth_router)
+		.merge(recovery_general_router)
 		.route_layer(middleware::from_fn_with_state(app, optional_auth))
 		.layer(SetResponseHeaderLayer::if_not_present(
 			header::CACHE_CONTROL,

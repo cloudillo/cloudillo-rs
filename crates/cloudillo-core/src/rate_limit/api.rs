@@ -46,7 +46,7 @@ impl PenaltyReason {
 	/// Get the number of failures before auto-ban for this reason
 	pub fn failures_to_ban(&self) -> u32 {
 		match self {
-			PenaltyReason::AuthFailure => 5,
+			PenaltyReason::AuthFailure => 20,
 			PenaltyReason::TokenVerificationFailure => 3,
 			PenaltyReason::SuspiciousActivity => 2,
 			PenaltyReason::RepeatedViolation => 1,

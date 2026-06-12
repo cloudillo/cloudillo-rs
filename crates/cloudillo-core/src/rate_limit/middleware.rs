@@ -24,12 +24,26 @@ pub struct RateLimitLayer {
 	manager: Arc<RateLimitManager>,
 	category: &'static str,
 	mode: ServerMode,
+	skip_ban: bool,
 }
 
 impl RateLimitLayer {
 	/// Create a new rate limit layer
 	pub fn new(manager: Arc<RateLimitManager>, category: &'static str, mode: ServerMode) -> Self {
-		Self { manager, category, mode }
+		Self { manager, category, mode, skip_ban: false }
+	}
+
+	/// Create a rate limit layer that bypasses the global ban list.
+	///
+	/// The per-category rate limit (429) still applies; only the hard ban (403)
+	/// is skipped. Used by routes that must stay reachable from a banned IP,
+	/// such as the password-recovery flow.
+	pub fn new_skip_ban(
+		manager: Arc<RateLimitManager>,
+		category: &'static str,
+		mode: ServerMode,
+	) -> Self {
+		Self { manager, category, mode, skip_ban: true }
 	}
 }
 
@@ -42,6 +56,7 @@ impl<S> Layer<S> for RateLimitLayer {
 			manager: self.manager.clone(),
 			category: self.category,
 			mode: self.mode,
+			skip_ban: self.skip_ban,
 		}
 	}
 }
@@ -53,6 +68,7 @@ pub struct RateLimitService<S> {
 	manager: Arc<RateLimitManager>,
 	category: &'static str,
 	mode: ServerMode,
+	skip_ban: bool,
 }
 
 impl<S> Service<Request<Body>> for RateLimitService<S>
@@ -72,6 +88,7 @@ where
 		let manager = self.manager.clone();
 		let category = self.category;
 		let mode = self.mode;
+		let skip_ban = self.skip_ban;
 		let mut inner = self.inner.clone();
 
 		Box::pin(async move {
@@ -80,7 +97,12 @@ where
 
 			if let Some(ip) = client_ip {
 				// Check rate limit
-				if let Err(error) = manager.check(&ip, category) {
+				let result = if skip_ban {
+					manager.check_skip_ban(&ip, category)
+				} else {
+					manager.check(&ip, category)
+				};
+				if let Err(error) = result {
 					// Rate limited - return error response
 					return Ok(error.into_response());
 				}

@@ -212,6 +212,25 @@ impl RateLimitManager {
 		Ok(())
 	}
 
+	/// Check rate limits for a request WITHOUT consulting the global ban list.
+	///
+	/// Behaves exactly like [`Self::check`] minus the ban gate. Used by routes
+	/// that must remain reachable from a banned IP (e.g. the password-recovery
+	/// flow) while still being subject to the normal per-category rate limit.
+	pub fn check_skip_ban(&self, addr: &IpAddr, category: &str) -> Result<(), RateLimitError> {
+		let cat_limiters = self
+			.categories
+			.get(category)
+			.ok_or_else(|| RateLimitError::UnknownCategory(category.to_string()))?;
+
+		if let Err(e) = cat_limiters.check(addr) {
+			self.total_limited.fetch_add(1, Ordering::Relaxed);
+			return Err(e);
+		}
+
+		Ok(())
+	}
+
 	/// Check if address is banned
 	fn check_ban(&self, addr: &IpAddr) -> Option<BanEntry> {
 		let keys = AddressKey::extract_all(addr);
@@ -480,13 +499,13 @@ mod tests {
 		let manager = RateLimitManager::default();
 		let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
 
-		// AuthFailure requires 5 failures for auto-ban
-		for _ in 0..4 {
+		// AuthFailure requires 20 failures for auto-ban
+		for _ in 0..19 {
 			manager.penalize(&ip, PenaltyReason::AuthFailure, 1).unwrap();
 			assert!(!manager.is_banned(&ip));
 		}
 
-		// 5th failure should trigger auto-ban
+		// 20th failure should trigger auto-ban
 		manager.penalize(&ip, PenaltyReason::AuthFailure, 1).unwrap();
 		assert!(manager.is_banned(&ip));
 	}
