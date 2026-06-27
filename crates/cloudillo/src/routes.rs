@@ -6,7 +6,7 @@
 use axum::{
 	Router,
 	body::Body,
-	extract::State,
+	extract::{DefaultBodyLimit, State},
 	http::{HeaderMap, HeaderValue, Request, StatusCode, header},
 	middleware,
 	response::{IntoResponse, Response},
@@ -14,7 +14,9 @@ use axum::{
 };
 use tower::Service;
 use tower_http::{
-	compression::CompressionLayer, services::ServeDir, set_header::SetResponseHeaderLayer,
+	compression::{CompressionLayer, CompressionLevel, Predicate, predicate::SizeAbove},
+	services::ServeDir,
+	set_header::SetResponseHeaderLayer,
 };
 
 use crate::admin;
@@ -38,6 +40,106 @@ use cloudillo_core::middleware::{optional_auth, request_id_middleware, require_a
 use cloudillo_core::rate_limit::RateLimitLayer;
 use cloudillo_profile as profile;
 use cloudillo_profile::perm::check_perm_profile;
+
+// ============================================================================
+// REQUEST BODY SIZE LIMITS
+// ============================================================================
+
+/// Conservative global request-body limit applied to every API route.
+///
+/// `DefaultBodyLimit` only constrains *buffering* extractors (`Json`, `Bytes`,
+/// `String`, `Form`); raw streaming `Body` handlers (file upload, DAV) are
+/// unaffected and keep enforcing their own caps. 1 MiB comfortably covers the
+/// small JSON payloads that make up the bulk of the API while preventing a
+/// single request from buffering unbounded memory.
+const GLOBAL_BODY_LIMIT: usize = 1024 * 1024; // 1 MiB
+
+/// Higher body limit for routes that legitimately buffer a whole image, a
+/// vCard import or a batch of federated action tokens. Still bounded, just
+/// generous enough not to reject real payloads.
+const UPLOAD_BODY_LIMIT: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Per-route override layer raising the body limit to [`UPLOAD_BODY_LIMIT`].
+/// A more specific (inner) `DefaultBodyLimit` overrides the global one.
+fn upload_body_limit() -> DefaultBodyLimit {
+	DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)
+}
+
+/// Default-deny allowlist of genuinely-compressible, text-based media types.
+/// Used as the extra `compress_when` predicate on the API `CompressionLayer`.
+/// Self-contained (no longer ANDed with `DefaultPredicate`): the size floor lives
+/// in the layer's `SizeAbove(32)`, while the content-type allowlist, the SSE
+/// exclusion and the 206-partial exclusion live here. `image/svg+xml` matches the
+/// `+xml` arm and IS compressed (it is text and compresses well).
+fn is_compressible_media_type(
+	status: axum::http::StatusCode,
+	_: axum::http::Version,
+	headers: &axum::http::HeaderMap,
+	_: &axum::http::Extensions,
+) -> bool {
+	// Never compress partial responses: tower-http would re-encode the body while
+	// leaving Content-Range untouched (it only strips Accept-Ranges/Content-Length),
+	// corrupting the 206. Range/seek responses must pass through uncompressed.
+	if status == axum::http::StatusCode::PARTIAL_CONTENT {
+		return false;
+	}
+	let essence = headers
+		.get(axum::http::header::CONTENT_TYPE)
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or("")
+		.split(';')
+		.next()
+		.unwrap_or("")
+		.trim();
+	// SSE must stay unbuffered/uncompressed (matched by the text/ arm below otherwise).
+	if essence == "text/event-stream" {
+		return false;
+	}
+	essence.starts_with("text/")
+		|| matches!(
+			essence,
+			"application/json"
+				| "application/javascript"
+				| "application/xml"
+				| "application/xhtml+xml"
+				| "application/wasm"
+		) || essence.ends_with("+json")
+		|| essence.ends_with("+xml") // includes image/svg+xml — intentionally compressed
+}
+
+// ============================================================================
+// SECURITY HEADERS
+// ============================================================================
+
+/// Add transport/sniffing/referrer hardening headers to every response of a
+/// router.
+///
+/// Deliberately scoped to three headers and **no framing policy**: the shell
+/// embeds sandboxed apps in iframes (including, in future, apps served from
+/// external origins), so we must not add `X-Frame-Options` or a restrictive
+/// `frame-ancestors`/`frame-src` CSP that would block that embedding.
+///
+/// All three use `if_not_present` so handler- or file-specific headers (e.g.
+/// the per-SVG `Content-Security-Policy` set when serving uploaded files) are
+/// never overwritten.
+fn with_security_headers(router: Router) -> Router {
+	router
+		// HTTPS-only platform: opt browsers into HTTPS for two years.
+		.layer(SetResponseHeaderLayer::if_not_present(
+			header::STRICT_TRANSPORT_SECURITY,
+			HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+		))
+		// Block MIME sniffing across the whole API/app surface.
+		.layer(SetResponseHeaderLayer::if_not_present(
+			header::X_CONTENT_TYPE_OPTIONS,
+			HeaderValue::from_static("nosniff"),
+		))
+		// Don't leak full URLs (paths can carry id-tags) to cross-origin targets.
+		.layer(SetResponseHeaderLayer::if_not_present(
+			header::REFERRER_POLICY,
+			HeaderValue::from_static("strict-origin-when-cross-origin"),
+		))
+}
 
 // ============================================================================
 // PROTECTED ROUTES - All routes require valid authentication
@@ -104,7 +206,12 @@ fn init_protected_routes(app: App) -> Router<App> {
 	// File create routes (check_perm_create for quota/tier checking)
 	let file_router_create = Router::new()
 		.route("/api/files", post(file::handler::post_file))
-		.route("/api/files/{preset}/{file_name}", post(file::handler::post_file_blob))
+		// Streaming upload: reads the raw `Body` and enforces its own
+		// per-tenant size cap, so opt out of the global buffering limit.
+		.route(
+			"/api/files/{preset}/{file_name}",
+			post(file::handler::post_file_blob).layer(DefaultBodyLimit::disable()),
+		)
 		.route("/api/files/{file_id}/duplicate", post(file::management::duplicate_file))
 		.layer(middleware::from_fn_with_state(app.clone(), check_perm_create("file", "create")));
 
@@ -183,8 +290,12 @@ fn init_protected_routes(app: App) -> Router<App> {
 
 		// --- Own Profile Management ---
 		.route("/api/me", patch(profile::update::patch_own_profile))
-		.route("/api/me/image", put(profile::media::put_profile_image))
-		.route("/api/me/cover", put(profile::media::put_cover_image))
+		// Profile/cover images are buffered whole into memory (`Bytes`).
+		.route(
+			"/api/me/image",
+			put(profile::media::put_profile_image).layer(upload_body_limit()),
+		)
+		.route("/api/me/cover", put(profile::media::put_cover_image).layer(upload_body_limit()))
 		.route("/api/profiles", get(profile::list::list_profiles))
 
 		// --- IDP Onboarding Gate (verify-idp) ---
@@ -292,11 +403,24 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/address-books/{ab_id}", delete(contact::handler::delete_address_book))
 		.route("/api/contacts", get(contact::handler::list_all_contacts))
 		.route("/api/address-books/{ab_id}/contacts", get(contact::handler::list_contacts))
-		.route("/api/address-books/{ab_id}/contacts", post(contact::handler::create_contact))
-		.route("/api/address-books/{ab_id}/import", post(contact::handler::import_contacts))
+		// Contacts and vCard imports may embed photos / many cards (> 1 MiB).
+		.route(
+			"/api/address-books/{ab_id}/contacts",
+			post(contact::handler::create_contact).layer(upload_body_limit()),
+		)
+		.route(
+			"/api/address-books/{ab_id}/import",
+			post(contact::handler::import_contacts).layer(upload_body_limit()),
+		)
 		.route("/api/address-books/{ab_id}/contacts/{uid}", get(contact::handler::get_contact))
-		.route("/api/address-books/{ab_id}/contacts/{uid}", put(contact::handler::put_contact))
-		.route("/api/address-books/{ab_id}/contacts/{uid}", patch(contact::handler::patch_contact))
+		.route(
+			"/api/address-books/{ab_id}/contacts/{uid}",
+			put(contact::handler::put_contact).layer(upload_body_limit()),
+		)
+		.route(
+			"/api/address-books/{ab_id}/contacts/{uid}",
+			patch(contact::handler::patch_contact).layer(upload_body_limit()),
+		)
 		.route("/api/address-books/{ab_id}/contacts/{uid}", delete(contact::handler::delete_contact))
 
 		// --- Calendars / Events (CalDAV sync lives under /dav/... elsewhere) ---
@@ -374,9 +498,12 @@ fn init_public_routes(app: App) -> Router<App> {
 
 	// --- CRITICAL: Federation Inbox (moderate rate limiting) ---
 	// Attack surface: spam, malicious payloads, resource exhaustion
+	// Inbox payloads carry signed action tokens plus their related tokens; a
+	// thread backfill can exceed the 1 MiB global cap, so raise it here.
 	let federation_router = Router::new()
 		.route("/api/inbox", post(action::handler::post_inbox))
 		.route("/api/inbox/sync", post(action::handler::post_inbox_sync))
+		.layer(upload_body_limit())
 		.layer(RateLimitLayer::new(app.rate_limiter.clone(), "federation", app.opts.mode));
 
 	// --- WebSocket Endpoints (separate rate limiting) ---
@@ -530,12 +657,53 @@ fn init_api_service(app: App) -> Router {
 	// CORS preflight and short-circuits it with only CORS headers, stripping the `DAV:`
 	// capability header that DAV clients need for discovery. These routes aren't called
 	// from browsers anyway, so they don't need CORS.
-	browser_routes
+	let router = browser_routes
 		.merge(init_dav_routes(app.clone()))
 		.fallback(api_not_found)
 		.layer(middleware::from_fn(request_id_middleware))
-		.layer(CompressionLayer::new())
-		.with_state(app)
+		// Compress only an allowlist of text-based, genuinely-compressible media
+		// types (default-deny — see `is_compressible_media_type`). SVG and other
+		// text/structured types (HTML/JSON/JS/XML/wasm/`+json`/`+xml`) ARE
+		// compressed on full (`200`) responses. When tower-http compresses, it
+		// drops both `Accept-Ranges` and `Content-Length` and switches the body to
+		// chunked `Content-Encoding` — so a compressed full response is simply not
+		// range-advertised; there is no stale `Content-Length` and no broken range.
+		//
+		// Binary file blobs (`serve_file` emits octet-stream / video|audio/* / pdf /
+		// non-svg image), archives and any unknown binary are NOT on the list →
+		// left uncompressed so the headers `serve_file` sets survive. This:
+		// (1) preserves `Content-Length` for the browser download-progress bar and
+		// the shell SW's `/cl-download` stream that forwards the length, and
+		// (2) avoids wasting CPU re-compressing already-compressed media.
+		//
+		// Range/seek: `get_file_variant{,_file_id}` answer a `Range` request with
+		// `206`/`Content-Range`/`Accept-Ranges`. tower-http does NOT strip
+		// `Content-Range` and does NOT skip `206` itself, so a compressed `206`
+		// would carry a now-wrong `Content-Range` over a re-encoded body. The
+		// predicate therefore vetoes ALL `206` partial responses → range/seek stays
+		// uncompressed with intact `Content-Length`/`Content-Range`/`Accept-Ranges`.
+		//
+		// `SizeAbove(32)` mirrors `DefaultPredicate`'s tiny-body floor; the rest of
+		// the gating lives in `is_compressible_media_type` so the policy is
+		// self-contained (we no longer use `DefaultPredicate`, whose blanket
+		// `image/*` exclusion would have kept SVG uncompressed).
+		//
+		// `.quality(Precise(4))` keeps on-the-fly compression cheap: tower-http
+		// prefers zstd > br > gzip, so modern clients get zstd (level 4, fast,
+		// dynamic-appropriate); the rare br-only client gets brotli q4 instead of
+		// the q11 default (which is a slow static-precompression level); gzip
+		// fallback at level 4. (Static JS/CSS are unaffected — they are served
+		// pre-compressed by `ServeDir::precompressed_br()/_gzip()`, not here.)
+		.layer(
+			CompressionLayer::new()
+				.quality(CompressionLevel::Precise(4))
+				.compress_when(SizeAbove::new(32).and(is_compressible_media_type)),
+		)
+		// Global buffering-extractor body cap. Routes that need more override it
+		// inline with `upload_body_limit()` / `DefaultBodyLimit::disable()`.
+		.layer(DefaultBodyLimit::max(GLOBAL_BODY_LIMIT))
+		.with_state(app);
+	with_security_headers(router)
 }
 
 // ============================================================================
@@ -910,11 +1078,12 @@ fn init_app_service(app: App) -> Router {
 		.route("/.well-known/caldav", any(calendar::caldav::well_known))
 		.layer(tower_http::cors::CorsLayer::very_permissive());
 
-	Router::new()
+	let router = Router::new()
 		.merge(well_known_router)
 		.merge(ws_router)
 		.fallback(static_fallback_handler)
-		.with_state(app)
+		.with_state(app);
+	with_security_headers(router)
 }
 
 fn init_http_service(app: App) -> Router {
@@ -926,6 +1095,65 @@ fn init_http_service(app: App) -> Router {
 
 pub fn init(app: App) -> (Router, Router, Router) {
 	(init_api_service(app.clone()), init_app_service(app.clone()), init_http_service(app))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::is_compressible_media_type;
+	use axum::http::{Extensions, HeaderMap, StatusCode, Version, header};
+
+	/// Run `is_compressible_media_type` for a given content-type header value at
+	/// `200 OK`. `None` means no `content-type` header is set at all.
+	fn check(content_type: Option<&str>) -> bool {
+		check_status(StatusCode::OK, content_type)
+	}
+
+	/// As [`check`], but for an arbitrary response status (covers the 206 path).
+	fn check_status(status: StatusCode, content_type: Option<&str>) -> bool {
+		let mut headers = HeaderMap::new();
+		if let Some(ct) = content_type {
+			headers.insert(header::CONTENT_TYPE, ct.parse().unwrap());
+		}
+		is_compressible_media_type(status, Version::HTTP_11, &headers, &Extensions::default())
+	}
+
+	#[test]
+	fn compressible_text_and_structured_types() {
+		assert!(check(Some("text/html")));
+		assert!(check(Some("text/html; charset=utf-8")));
+		assert!(check(Some("text/plain")));
+		assert!(check(Some("application/json")));
+		assert!(check(Some("application/javascript")));
+		assert!(check(Some("application/xml")));
+		assert!(check(Some("application/xhtml+xml")));
+		assert!(check(Some("application/wasm")));
+		// `+json` / `+xml` suffix arms.
+		assert!(check(Some("application/manifest+json")));
+		// `image/svg+xml` matches the `+xml` arm and IS now actually compressed on
+		// full (`200`) responses (we no longer use `DefaultPredicate`'s `image/*`
+		// exclusion — see the layer comment).
+		assert!(check(Some("image/svg+xml")));
+	}
+
+	#[test]
+	fn non_compressible_binary_types() {
+		assert!(!check(Some("application/octet-stream")));
+		assert!(!check(Some("video/mp4")));
+		assert!(!check(Some("audio/mpeg")));
+		assert!(!check(Some("application/pdf")));
+		assert!(!check(Some("image/png")));
+		// Missing / empty content-type → not compressible.
+		assert!(!check(None));
+		assert!(!check(Some("")));
+	}
+
+	#[test]
+	fn never_compress_sse_or_partial_responses() {
+		// SSE must stay unbuffered/uncompressed even though it matches `text/`.
+		assert!(!check(Some("text/event-stream")));
+		// A 206 partial is never compressed, even for a normally-compressible type.
+		assert!(!check_status(StatusCode::PARTIAL_CONTENT, Some("text/html")));
+	}
 }
 
 // vim: ts=4

@@ -25,6 +25,23 @@ use cloudillo_core::ws_bus;
 use cloudillo_types::meta_adapter::{CreateFile, FileStatus};
 use cloudillo_types::types::AccessLevel;
 
+/// Maximum size of a single inbound WebSocket frame.
+///
+/// axum/tungstenite default to 16 MiB frames and 64 MiB messages, which is far
+/// more than any legitimate CRDT update / RTDB transaction / bus event and lets
+/// a single connection pin large buffers. These caps bound per-connection
+/// memory while staying generous enough for large collaborative documents.
+const WS_MAX_FRAME_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// Maximum size of a reassembled inbound WebSocket message.
+const WS_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Apply the conservative frame/message size caps to a WebSocket upgrade.
+/// Oversized frames/messages cause tungstenite to close the socket.
+fn limit_ws(ws: WebSocketUpgrade) -> WebSocketUpgrade {
+	ws.max_frame_size(WS_MAX_FRAME_SIZE).max_message_size(WS_MAX_MESSAGE_SIZE)
+}
+
 /// Query parameters for WebSocket file access endpoints
 #[derive(Debug, Deserialize, Default)]
 pub struct AccessQuery {
@@ -268,6 +285,7 @@ pub async fn get_ws_bus(
 
 	debug!("WebSocket bus request");
 
+	let ws = limit_ws(ws);
 	let Some(auth_ctx) = auth else {
 		warn!("Bus WebSocket rejected - no authentication");
 		return ws_close_unauthenticated(ws);
@@ -299,6 +317,7 @@ pub async fn get_ws_rtdb(
 
 	info!("WebSocket RTDB request for file_id: {}, access={:?}", file_id, query.access);
 
+	let ws = limit_ws(ws);
 	let is_guest = auth.is_none();
 	let (user_id, user_tn_id, user_roles, scope) = if let Some(ref auth_ctx) = auth {
 		(
@@ -430,6 +449,7 @@ pub async fn get_ws_crdt(
 
 	info!("WebSocket CRDT request for doc_id: {}, access={:?}", doc_id, query.access);
 
+	let ws = limit_ws(ws);
 	let is_guest = auth.is_none();
 	let (user_id, user_tn_id, user_roles, scope) = if let Some(ref auth_ctx) = auth {
 		(
