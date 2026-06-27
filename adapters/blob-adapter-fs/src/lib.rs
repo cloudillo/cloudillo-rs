@@ -164,25 +164,24 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		Ok(buf.into_boxed_slice())
 	}
 
-	/// Reads a byte range from a blob
-	async fn read_blob_range(
+	/// Reads a byte range from a blob as a stream (no full buffering).
+	async fn read_blob_range_stream(
 		&self,
 		tn_id: TnId,
 		blob_id: &str,
 		offset: u64,
 		length: u64,
-	) -> ClResult<Box<[u8]>> {
+	) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>> {
 		use tokio::io::AsyncSeekExt;
 
-		let mut file = File::open(obj_file_path(&self.base_dir, tn_id, blob_id)?).await?;
-		file.seek(std::io::SeekFrom::Start(offset)).await?;
-
-		let length = usize::try_from(length)
-			.map_err(|_| Error::Internal("range length too large".into()))?;
-		let mut buf = vec![0u8; length];
-		file.read_exact(&mut buf).await?;
-
-		Ok(buf.into_boxed_slice())
+		let mut file = File::open(obj_file_path(&self.base_dir, tn_id, blob_id)?)
+			.await
+			.map_err(|_| Error::NotFound)?;
+		file.seek(std::io::SeekFrom::Start(offset))
+			.await
+			.map_err(|e| Error::Internal(format!("blob range seek failed: {e}")))?;
+		let stream = ReaderStream::new(file.take(length));
+		Ok(Box::pin(stream))
 	}
 
 	/// Reads a blob
@@ -351,6 +350,34 @@ mod test {
 	fn test_slash_in_hash_rejected() {
 		let malicious_id = "f1~ab/cd/evil";
 		assert!(obj_dir(Path::new("some_dir"), TnId(42), malicious_id).is_err());
+	}
+
+	#[tokio::test]
+	async fn test_read_blob_range_stream() {
+		use crate::BlobAdapterFs;
+		use cloudillo_types::blob_adapter::{BlobAdapter, CreateBlobOptions};
+		use futures::TryStreamExt;
+
+		let dir = tempfile::tempdir().unwrap();
+		let adapter = BlobAdapterFs::new(dir.path().into()).await.unwrap();
+
+		let blob_id = "b1~abcdefghij";
+		let data: Vec<u8> = (0u8..32).collect();
+		adapter
+			.create_blob_buf(TnId(7), blob_id, &data, &CreateBlobOptions::default())
+			.await
+			.unwrap();
+
+		// Read bytes [4, 12) — offset 4, length 8.
+		let chunks: Vec<_> = adapter
+			.read_blob_range_stream(TnId(7), blob_id, 4, 8)
+			.await
+			.unwrap()
+			.try_collect()
+			.await
+			.unwrap();
+		let read: Vec<u8> = chunks.concat();
+		assert_eq!(read, data[4..12]);
 	}
 }
 

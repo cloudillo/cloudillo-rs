@@ -20,6 +20,7 @@ tokio = { version = "1.52.3", features = ["fs"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 
 [dev-dependencies]
+futures = "0.3"
 tempfile = "3.27"
 tokio = { version = "1.52.3", features = ["fs", "rt", "macros"] }
 

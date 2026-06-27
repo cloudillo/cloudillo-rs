@@ -5,7 +5,7 @@ use axum::{
 	Json,
 	body::{Body, to_bytes},
 	extract::{self, Query, State},
-	http::StatusCode,
+	http::{HeaderMap, StatusCode, header},
 	response,
 };
 use futures_core::Stream;
@@ -161,17 +161,99 @@ pub fn content_type_from_format(format: &str) -> &str {
 	}
 }
 
+/// Parse a single HTTP `Range` header value against a known `total` size.
+///
+/// Supports `bytes=start-end`, `bytes=start-` (to end) and `bytes=-suffix`
+/// (last N bytes). Returns:
+/// - `None` — no/again-unparseable-but-ignorable header (serve the full body);
+///   multi-range (comma-separated) requests also fall here and are served full.
+/// - `Some(Err(()))` — syntactically valid but unsatisfiable (caller → 416).
+/// - `Some(Ok((start, end)))` — satisfiable, `end` inclusive and clamped to
+///   `total - 1`.
+fn parse_range(value: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
+	let spec = value.trim().strip_prefix("bytes=")?.trim();
+	// Multi-range is not supported; serve the full body instead.
+	if spec.contains(',') {
+		return None;
+	}
+	let (start_s, end_s) = spec.split_once('-')?;
+	let (start_s, end_s) = (start_s.trim(), end_s.trim());
+
+	if start_s.is_empty() {
+		// Suffix range: last `suffix` bytes.
+		let suffix: u64 = end_s.parse().ok()?;
+		if suffix == 0 || total == 0 {
+			return Some(Err(()));
+		}
+		let start = total.saturating_sub(suffix);
+		return Some(Ok((start, total - 1)));
+	}
+
+	let start: u64 = start_s.parse().ok()?;
+	let end: u64 = if end_s.is_empty() {
+		total.saturating_sub(1)
+	} else {
+		let e: u64 = end_s.parse().ok()?;
+		e.min(total.saturating_sub(1))
+	};
+
+	if total == 0 || start >= total || start > end {
+		return Some(Err(()));
+	}
+	Some(Ok((start, end)))
+}
+
+/// Shared 416/range-stream/full-stream decision used by both variant-serving
+/// handlers, so the branching lives in exactly one place.
+async fn respond_variant(
+	app: &App,
+	blob_tn: TnId,
+	variant_id: &str,
+	variant: &meta_adapter::FileVariant<impl AsRef<str> + Debug>,
+	descriptor: Option<&str>,
+	range: Option<Result<(u64, u64), ()>>,
+	disable_cache: bool,
+) -> ClResult<response::Response<axum::body::Body>> {
+	match range {
+		Some(Err(())) => Ok(range_not_satisfiable(variant.size)),
+		Some(Ok((start, end))) => {
+			let stream = app
+				.blob_adapter
+				.read_blob_range_stream(blob_tn, variant_id, start, end - start + 1)
+				.await?;
+			serve_file(descriptor, variant, stream, disable_cache, Some((start, end)))
+		}
+		None => {
+			let stream = app.blob_adapter.read_blob_stream(blob_tn, variant_id).await?;
+			serve_file(descriptor, variant, stream, disable_cache, None)
+		}
+	}
+}
+
 fn serve_file<S: AsRef<str> + Debug>(
 	descriptor: Option<&str>,
 	variant: &meta_adapter::FileVariant<S>,
 	stream: Pin<Box<dyn Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>>,
 	disable_cache: bool,
+	range: Option<(u64, u64)>,
 ) -> ClResult<response::Response<axum::body::Body>> {
 	let content_type = content_type_from_format(variant.format.as_ref());
 
 	let mut response = axum::response::Response::builder()
 		.header(axum::http::header::CONTENT_TYPE, content_type)
-		.header(axum::http::header::CONTENT_LENGTH, variant.size);
+		.header(axum::http::header::ACCEPT_RANGES, "bytes");
+
+	response = if let Some((start, end)) = range {
+		response
+			.status(StatusCode::PARTIAL_CONTENT)
+			.header(axum::http::header::CONTENT_LENGTH, end - start + 1)
+			.header(
+				axum::http::header::CONTENT_RANGE,
+				format!("bytes {start}-{end}/{}", variant.size),
+			)
+	} else {
+		response.header(axum::http::header::CONTENT_LENGTH, variant.size)
+	};
 
 	// Add cache headers for content-addressed (immutable) files
 	if disable_cache {
@@ -569,13 +651,33 @@ pub async fn get_file_variant(
 	State(app): State<App>,
 	tn_id: TnId,
 	extract::Path(variant_id): extract::Path<String>,
+	headers: HeaderMap,
 ) -> ClResult<impl response::IntoResponse> {
 	let variant = app.meta_adapter.read_file_variant(tn_id, &variant_id).await?;
 	info!("variant: {:?}", variant);
 	let blob_tn = if variant.global { TnId(0) } else { tn_id };
-	let stream = app.blob_adapter.read_blob_stream(blob_tn, &variant_id).await?;
 
-	serve_file(None, &variant, stream, app.opts.disable_cache)
+	let range = headers
+		.get(header::RANGE)
+		.and_then(|v| v.to_str().ok())
+		.and_then(|v| parse_range(v, variant.size));
+
+	respond_variant(&app, blob_tn, &variant_id, &variant, None, range, app.opts.disable_cache).await
+}
+
+/// Build a `416 Range Not Satisfiable` response carrying the resource size in
+/// `Content-Range: bytes */{total}` and no body.
+fn range_not_satisfiable(total: u64) -> response::Response<axum::body::Body> {
+	axum::response::Response::builder()
+		.status(StatusCode::RANGE_NOT_SATISFIABLE)
+		.header(axum::http::header::ACCEPT_RANGES, "bytes")
+		.header(axum::http::header::CONTENT_RANGE, format!("bytes */{total}"))
+		.body(axum::body::Body::empty())
+		.unwrap_or_else(|_| {
+			let mut resp = response::Response::new(axum::body::Body::empty());
+			*resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+			resp
+		})
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -592,6 +694,7 @@ pub async fn get_file_variant_file_id(
 	tn_id: TnId,
 	extract::Path(file_id): extract::Path<String>,
 	extract::Query(selector): extract::Query<GetFileVariantSelector>,
+	headers: HeaderMap,
 ) -> ClResult<impl response::IntoResponse> {
 	let mut variants = app
 		.meta_adapter
@@ -602,12 +705,41 @@ pub async fn get_file_variant_file_id(
 
 	let variant = descriptor::get_best_file_variant(&variants, &selector)?;
 	let blob_tn = if variant.global { TnId(0) } else { tn_id };
-	let stream = app.blob_adapter.read_blob_stream(blob_tn, &variant.variant_id).await?;
+	let variant_id = variant.variant_id.as_ref().to_string();
 
-	let root_id = app.meta_adapter.read_file(tn_id, &file_id).await?.and_then(|f| f.root_id);
-	let descriptor = descriptor::get_file_descriptor(&variants, root_id.as_deref());
+	let range = headers
+		.get(header::RANGE)
+		.and_then(|v| v.to_str().ok())
+		.and_then(|v| parse_range(v, variant.size));
 
-	serve_file(Some(&descriptor), variant, stream, app.opts.disable_cache)
+	// Descriptor (X-Cloudillo-Variants) is delivered on the full fetch AND on the
+	// initial range request (`bytes=0-...`), which is what browser <video>/<audio>
+	// elements and download managers send first. Only seek requests that start past
+	// byte 0 skip it (and skip the extra read_file lookup) — by then the client
+	// already has the descriptor from its initial response, and can otherwise fetch
+	// it from GET /api/files/{file_id}/descriptor.
+	let needs_descriptor = match range {
+		None => true,
+		Some(Ok((start, _))) => start == 0,
+		Some(Err(())) => false, // unsatisfiable → 416, no body/descriptor
+	};
+	let descriptor = if needs_descriptor {
+		let root_id = app.meta_adapter.read_file(tn_id, &file_id).await?.and_then(|f| f.root_id);
+		Some(descriptor::get_file_descriptor(&variants, root_id.as_deref()))
+	} else {
+		None
+	};
+
+	respond_variant(
+		&app,
+		blob_tn,
+		&variant_id,
+		variant,
+		descriptor.as_deref(),
+		range,
+		app.opts.disable_cache,
+	)
+	.await
 }
 
 pub async fn get_file_descriptor(

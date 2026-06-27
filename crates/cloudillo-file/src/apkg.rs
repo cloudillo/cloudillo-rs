@@ -16,6 +16,7 @@ use axum::{
 	http::{StatusCode, header},
 	response::Response,
 };
+use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::container::{self, ContainerCache};
@@ -140,10 +141,14 @@ pub async fn get_container_content(
 	let entry = index.entries.get(path.as_str()).ok_or(Error::NotFound)?;
 
 	// Read only the compressed data for this entry via range read
-	let raw_data = app
+	let chunks: Vec<axum::body::Bytes> = app
 		.blob_adapter
-		.read_blob_range(tn_id, variant_id, entry.data_offset, entry.compressed_size)
-		.await?;
+		.read_blob_range_stream(tn_id, variant_id, entry.data_offset, entry.compressed_size)
+		.await?
+		.try_collect()
+		.await
+		.map_err(|e| Error::Internal(format!("range read failed: {e}")))?;
+	let raw_data: Vec<u8> = chunks.concat();
 
 	// Check if client accepts gzip encoding
 	let client_accepts_gzip = headers
@@ -163,7 +168,7 @@ pub async fn get_container_content(
 		(decompressed, None)
 	} else {
 		// Stored (uncompressed) — serve as-is
-		(raw_data.to_vec(), None)
+		(raw_data, None)
 	};
 
 	let mut builder = Response::builder()

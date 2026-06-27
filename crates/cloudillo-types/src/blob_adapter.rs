@@ -45,14 +45,15 @@ pub trait BlobAdapter: Debug + Send + Sync {
 	/// Reads a blob
 	async fn read_blob_buf(&self, tn_id: TnId, blob_id: &str) -> ClResult<Box<[u8]>>;
 
-	/// Reads a byte range from a blob
-	async fn read_blob_range(
+	/// Reads a byte range from a blob as a stream (no full buffering).
+	/// `offset` is the start byte; `length` is the number of bytes to read.
+	async fn read_blob_range_stream(
 		&self,
 		tn_id: TnId,
 		blob_id: &str,
 		offset: u64,
 		length: u64,
-	) -> ClResult<Box<[u8]>>;
+	) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>>;
 
 	/// Reads a blob
 	async fn read_blob_stream(
