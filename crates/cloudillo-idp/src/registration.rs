@@ -140,6 +140,7 @@ pub async fn send_activation_email(
 			custom_key: Some(email_task_key),
 			from_name_override: Some(format!("{} Identity Provider", idp_domain.to_uppercase())),
 			delay_seconds: None,
+			notify_guard: None,
 		},
 	)
 	.await

@@ -179,6 +179,22 @@ pub async fn handle_bus_connection(
 	// Cleanup
 	app.broadcast.unregister_user(tn_id, &user_id, &connection_id).await;
 	heartbeat_task.abort();
+
+	// Presence (Contract 11): persist last_seen_at only when the tenant's last
+	// ws-bus connection closes. "Online now" is read from the in-memory registry;
+	// this DB value mainly survives restarts. No per-heartbeat writes.
+	if app.broadcast.online_users(tn_id).await.is_empty() {
+		let update = cloudillo_types::meta_adapter::UpdateTenantData {
+			last_seen_at: cloudillo_types::types::Patch::Value(
+				cloudillo_types::types::Timestamp::now(),
+			),
+			..Default::default()
+		};
+		if let Err(e) = app.meta_adapter.update_tenant(tn_id, &update).await {
+			debug!("Failed to stamp last_seen_at for tn_id={}: {}", tn_id.0, e);
+		}
+	}
+
 	info!("Bus connection closed: {} (conn={})", user_id, &connection_id[..8]);
 }
 

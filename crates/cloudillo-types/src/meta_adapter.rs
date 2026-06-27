@@ -179,6 +179,18 @@ pub struct Tenant<S: AsRef<str>> {
 	pub cover_pic: Option<S>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
+	/// Presence: stamped when the tenant's last ws-bus connection closes.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub last_seen_at: Option<Timestamp>,
+	/// Offline-throttle watermark for the 'direct' group (MSG/CONN/FSHR).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub notify_email_direct_at: Option<Timestamp>,
+	/// Offline-throttle watermark for the 'engagement' group (CMNT/REACT).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub notify_email_engagement_at: Option<Timestamp>,
+	/// Offline-throttle watermark for the 'social' group (FLLW/POST).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub notify_email_social_at: Option<Timestamp>,
 	pub x: HashMap<S, S>,
 }
 
@@ -219,6 +231,18 @@ pub struct UpdateTenantData {
 	/// Partial merge for x JSON field: Some(value) = upsert, None = delete key
 	#[serde(default)]
 	pub x: Option<std::collections::HashMap<String, Option<String>>>,
+	/// Presence watermark, server-set only (not deserialized from API requests).
+	/// Stamped when the tenant's last ws-bus connection closes.
+	#[serde(skip)]
+	pub last_seen_at: Patch<Timestamp>,
+	/// Offline-throttle watermarks, server-set only (stamped after an offline
+	/// notification email is scheduled for the group).
+	#[serde(skip)]
+	pub notify_email_direct_at: Patch<Timestamp>,
+	#[serde(skip)]
+	pub notify_email_engagement_at: Patch<Timestamp>,
+	#[serde(skip)]
+	pub notify_email_social_at: Patch<Timestamp>,
 }
 
 #[derive(Debug)]
@@ -234,6 +258,14 @@ pub struct Profile<S: AsRef<str>> {
 	pub connected: ProfileConnectionStatus,
 	pub roles: Option<Box<[Box<str>]>>,
 	pub trust: Option<ProfileTrust>,
+	/// Reader's feed read-watermark for this context (own/community profile).
+	pub feed_read_at: Option<Timestamp>,
+	/// Reader's DM read-watermark for this peer profile.
+	pub msg_read_at: Option<Timestamp>,
+	/// Composition control for the home feed: `Some(true)` = this community is
+	/// hidden from the merged home feed (shown only in its own feed); `None` =
+	/// shown (the default). Only meaningful for community profiles.
+	pub hidden_in_home: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -250,6 +282,9 @@ pub struct ListProfileOptions {
 	/// `Some(true)` returns only profiles with a non-null trust value;
 	/// `Some(false)` returns only profiles with NULL trust; `None` does not filter.
 	pub trust_set: Option<bool>,
+	/// Filter by home-feed composition flag. Some(true) → only communities hidden
+	/// from the home feed (hidden_in_home = 1); Some(false) → only shown; None → no filter.
+	pub hidden_in_home: Option<bool>,
 }
 
 /// Profile data returned from adapter queries
@@ -296,6 +331,10 @@ pub struct UpdateProfileData {
 	pub synced: Patch<bool>,
 	#[serde(default)]
 	pub trust: Patch<ProfileTrust>,
+	/// Composition control: `Value(true)` hides this community from the home
+	/// feed (column → 1), `Null`/`Value(false)` clears it (column → NULL = shown).
+	#[serde(default)]
+	pub hidden_in_home: Patch<bool>,
 
 	// Sync metadata
 	#[serde(default)]
@@ -343,6 +382,10 @@ pub struct UpsertProfileFields {
 	pub follower: Patch<bool>,
 	pub connected: Patch<ProfileConnectionStatus>,
 	pub trust: Patch<ProfileTrust>,
+	/// Composition: `Value(true)` → column 1 (hidden from home); `Null` → column
+	/// NULL (shown). Callers normalize a `false` request to `Null` so the column
+	/// stays in the NULL/1 encoding.
+	pub hidden_in_home: Patch<bool>,
 	pub etag: Patch<Box<str>>,
 }
 
@@ -366,6 +409,7 @@ impl UpsertProfileFields {
 			follower: Patch::Undefined,
 			connected: Patch::Undefined,
 			trust: update.trust,
+			hidden_in_home: update.hidden_in_home,
 			etag: update.etag,
 		}
 	}
@@ -379,7 +423,11 @@ impl UpsertProfileFields {
 pub struct ActionData {
 	pub subject: Option<Box<str>>,
 	pub reactions: Option<Box<str>>,
-	pub comments: Option<u32>,
+	/// Total comment count (active child CMNT rows). Federated as STAT `c`.
+	pub comments: Option<i64>,
+	/// Last-comment timestamp (epoch seconds = created_at of the newest active
+	/// child comment). Federated as STAT `ct`; drives the unread comment dot.
+	pub comments_ts: Option<Timestamp>,
 	/// Highest `created_at` of any STAT mirror update applied to this row
 	/// on the non-authoritative side. Used to reject reordered inbound
 	/// STATs. Always `None` on the authoritative node (REACT/CMNT write
@@ -394,8 +442,10 @@ pub struct ActionData {
 pub struct UpdateActionDataOptions {
 	pub subject: Patch<String>,
 	pub reactions: Patch<String>,
+	/// Total comment count, federated as STAT `c`.
 	pub comments: Patch<u32>,
-	pub comments_read: Patch<u32>,
+	/// Last-comment timestamp (epoch seconds), federated as STAT `ct`.
+	pub comments_ts: Patch<Timestamp>,
 	pub reposts: Patch<u32>,
 	/// Watermark for inbound STAT mirror updates — see [`ActionData::stat_at`].
 	pub stat_at: Patch<Timestamp>,
@@ -405,6 +455,8 @@ pub struct UpdateActionDataOptions {
 	pub content: Patch<String>,
 	pub attachments: Patch<String>, // Comma-separated list of attachment IDs
 	pub flags: Patch<String>,
+	/// Reader's W/T/M thread subscription level. `Patch::Null` clears it.
+	pub sub_level: Patch<char>,
 	pub sub_typ: Patch<String>,
 	/// Dual-purpose for actions in status `R` (draft) or `S` (scheduled): the
 	/// `actions.created_at` column holds the target publish instant, not the
@@ -461,7 +513,9 @@ pub struct ListActionOptions {
 	pub limit: Option<u32>,
 	/// Cursor for pagination (opaque base64-encoded string)
 	pub cursor: Option<String>,
-	/// Sort order: 'created' (default, created_at DESC)
+	/// Sort order: 'created' (default, created_at) or 'received' (received_at,
+	/// the home feed's ingestion-order sort). Also selects the column used by the
+	/// keyset cursor and the created_after/created_before range filters.
 	pub sort: Option<String>,
 	/// Sort direction: 'asc' or 'desc' (default: desc)
 	#[serde(rename = "sortDir")]
@@ -491,6 +545,11 @@ pub struct ListActionOptions {
 	pub subject: Option<String>,
 	#[serde(rename = "createdAfter")]
 	pub created_after: Option<Timestamp>,
+	#[serde(rename = "createdBefore")]
+	pub created_before: Option<Timestamp>,
+	/// HTTP boolean flag: when true, return only rows the viewer is subscribed
+	/// to (`sub_level` set to a followed level). Uses `idx_actions_sub_level`.
+	pub subscribed: Option<bool>,
 	/// When true, the list path populates each `ActionView.token` with the raw
 	/// signed JWS from `action_tokens`. Opt-in so normal feed payloads stay lean.
 	#[serde(rename = "includeTokens")]
@@ -506,6 +565,16 @@ pub struct ListActionOptions {
 	/// (the active join/follow row) is always kept.
 	#[serde(skip)]
 	pub exclude_sub_typ: Option<Box<[Box<str>]>>,
+	/// Exclude actions whose *effective audience* (coalesce(audience, issuer_tag))
+	/// is in this set. Server-set, not from query params. Used by the home feed
+	/// to drop posts addressed to communities the reader opted out of home
+	/// (`profiles.hidden_in_home = 1`).
+	#[serde(skip)]
+	pub exclude_audiences: Option<Box<[String]>>,
+	/// When true, exclude actions issued by the requesting tenant (issuer == viewer).
+	/// Requires an authenticated request (viewer_id_tag set by the handler).
+	#[serde(rename = "excludeOwnIssuer")]
+	pub exclude_own_issuer: Option<bool>,
 }
 
 #[skip_serializing_none]
@@ -574,12 +643,25 @@ pub struct ActionView {
 	pub subject_action: Option<Box<ActionView>>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
+	/// LOCAL ingestion time (when this action was inserted on this node), emitted
+	/// as `receivedAt`. Drives the home feed's arrival-order sort and its unread
+	/// watermark so late-federated posts (old `created_at`, recent arrival)
+	/// surface correctly. Optional: NULL on relationship/system rows inserted via
+	/// paths that don't stamp it. See `meta-adapter-sqlite` migration 36.
+	#[serde(
+		serialize_with = "serialize_timestamp_iso_opt",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub received_at: Option<Timestamp>,
 	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
 	pub expires_at: Option<Timestamp>,
 	pub status: Option<Box<str>>,
 	pub stat: Option<serde_json::Value>,
 	pub visibility: Option<char>,
 	pub flags: Option<Box<str>>, // Action flags: R/r (reactions), C/c (comments), O/o (open)
+	/// Reader's W/T/M thread subscription level on this (cached) action row.
+	#[serde(rename = "subLevel", skip_serializing_if = "Option::is_none")]
+	pub sub_level: Option<Box<str>>,
 	pub x: Option<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
 	/// Raw signed JWS for this action, populated only when the list query sets
 	/// `includeTokens=true`. Lets clients verify action signatures locally.
@@ -1427,11 +1509,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		opts: &ListActionOptions,
 	) -> ClResult<Box<[Box<str>]>>;
 
-	/// Count actions matching `opts` (same filters as `list_actions`), with no
-	/// limit/sort/cursor. Generic and type-agnostic — callers supply the
-	/// business filters (which type/status defines "a repost", etc.).
-	async fn count_actions(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64>;
-
 	/// Count actions matching `opts`, grouped by `group_by`. Returns
 	/// `(group_value, count)` pairs (group value NULL-able). Used to derive
 	/// per-reaction-type counts without baking reaction semantics into the adapter.
@@ -1441,6 +1518,25 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		opts: &ListActionOptions,
 		group_by: ActionCountGroupBy,
 	) -> ClResult<Vec<(Option<String>, i64)>>;
+
+	/// Set a read-watermark, forward-only (a lower `position` is a no-op).
+	/// Dispatches by `scope`, all against the reader's own (`tn_id`) node:
+	///   - `"feed"`   → `profiles.feed_read_at` for `id_tag = key`
+	///   - `"msg"`    → `profiles.msg_read_at`  for `id_tag = key`
+	///   - `"thread"` → `actions.comments_read_at` for `action_id = key`
+	/// Unknown scope → bad-request error.
+	async fn set_read_marker(
+		&self,
+		tn_id: TnId,
+		scope: &str,
+		key: &str,
+		position: i64,
+	) -> ClResult<()>;
+
+	/// Auto-subscribe at Tracking: set `sub_level='T'` only when it is currently
+	/// NULL (never downgrade an existing Watching). No-op if the row is absent.
+	/// (Manual W/T/M changes go through `update_action_data`'s `sub_level` patch.)
+	async fn auto_track_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()>;
 
 	async fn create_action(
 		&self,

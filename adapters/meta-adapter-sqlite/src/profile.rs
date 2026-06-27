@@ -119,7 +119,7 @@ pub(crate) async fn list(
 	opts: &ListProfileOptions,
 ) -> ClResult<Vec<Profile<Box<str>>>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT id_tag, name, type, profile_pic, status, synced_at, following, follower, connected, roles, trust
+		"SELECT id_tag, name, type, profile_pic, status, synced_at, following, follower, connected, roles, trust, feed_read_at, msg_read_at, hidden_in_home
 		 FROM profiles WHERE type IS NOT NULL AND tn_id=",
 	);
 	query.push_bind(tn_id.0);
@@ -209,6 +209,14 @@ pub(crate) async fn list(
 		}
 	}
 
+	if let Some(hidden) = opts.hidden_in_home {
+		if hidden {
+			query.push(" AND hidden_in_home=1");
+		} else {
+			query.push(" AND (hidden_in_home IS NULL OR hidden_in_home=0)");
+		}
+	}
+
 	query.push(" ORDER BY name LIMIT 100");
 
 	let res = query
@@ -240,6 +248,9 @@ pub(crate) async fn list(
 				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
 			}),
 			trust: parse_trust(row)?,
+			feed_read_at: row.try_get::<Option<i64>, _>("feed_read_at")?.map(Timestamp),
+			msg_read_at: row.try_get::<Option<i64>, _>("msg_read_at")?.map(Timestamp),
+			hidden_in_home: row.try_get::<Option<i64>, _>("hidden_in_home")?.map(|v| v != 0),
 		})
 	}))
 }
@@ -298,7 +309,7 @@ pub(crate) async fn read(
 	id_tag: &str,
 ) -> ClResult<(Box<str>, Profile<Box<str>>)> {
 	let res = sqlx::query(
-		"SELECT id_tag, type, name, profile_pic, status, synced_at, perm, following, follower, connected, roles, trust, etag
+		"SELECT id_tag, type, name, profile_pic, status, synced_at, perm, following, follower, connected, roles, trust, feed_read_at, msg_read_at, hidden_in_home, etag
 		FROM profiles WHERE tn_id=? AND id_tag=?",
 	)
 	.bind(tn_id.0)
@@ -329,6 +340,9 @@ pub(crate) async fn read(
 				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
 			}),
 			trust: parse_trust(&row)?,
+			feed_read_at: row.try_get::<Option<i64>, _>("feed_read_at")?.map(Timestamp),
+			msg_read_at: row.try_get::<Option<i64>, _>("msg_read_at")?.map(Timestamp),
+			hidden_in_home: row.try_get::<Option<i64>, _>("hidden_in_home")?.map(|v| v != 0),
 		};
 		Ok((etag, profile))
 	})
@@ -508,6 +522,11 @@ pub(crate) async fn upsert(
 		ProfileConnectionStatus::Connected => ConnectedDbValue::Int(1),
 	});
 	has_updates = push_patch!(query, has_updates, "trust", &fields.trust, |v| trust_to_db(*v));
+	// NULL/1 encoding: callers normalize a `false` request to `Patch::Null`
+	// (→ column NULL = shown), so a `Value` here is always `true` → store 1.
+	has_updates = push_patch!(query, has_updates, "hidden_in_home", &fields.hidden_in_home, |v| {
+		i64::from(*v)
+	});
 	has_updates = push_patch!(query, has_updates, "etag", &fields.etag, |v| v.as_ref());
 
 	if has_updates {

@@ -388,6 +388,36 @@ pub(crate) async fn forward_to_websocket(
 			"User offline - may need push notification"
 		);
 		// TODO: Send push notification for inbound actions when user is offline
+
+		// Offline email only fires for *persisted inbound* actions (the
+		// `ctx.is_inbound()` guard). The recipient is always this node's own
+		// tenant: notifying a *different* tenant is a forbidden cross-tenant
+		// operation, and is handled by that tenant's own node when the action
+		// arrives there via federated inbound delivery. We therefore never email
+		// the action's audience from this node.
+		//
+		// Each inbound action reaches exactly one forward path: ephemeral inbound
+		// actions are forwarded by process::forward_inbound_action_to_websocket
+		// and return before persistence (process.rs ~330); everything persisted
+		// lands here. This single-path invariant is load-bearing twice over: the
+		// `email:notify:` custom_key dedups the email, and the group
+		// throttle-watermark stamp inside the helper is NOT custom-key-deduped and
+		// relies on this same invariant (a double stamp would only re-advance the
+		// watermark within the window — idempotent). The grouped offline throttle
+		// rate-limits repeats. Best-effort: errors are logged inside the helper.
+		// The helper reads this node's tenant to derive the recipient and skips
+		// self-authored actions (recipient == issuer).
+		let content = action_view.as_ref().and_then(|v| v.content.as_ref());
+		crate::process::deliver_notification_email(
+			app,
+			tn_id,
+			&action.action_id,
+			&action.typ,
+			action.sub_typ.as_deref(),
+			&action.issuer_tag,
+			content,
+		)
+		.await;
 	}
 }
 

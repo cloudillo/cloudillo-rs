@@ -50,6 +50,37 @@ pub async fn list_actions(
 		opts.viewer_id_tag = Some(subject_id_tag.to_string());
 	}
 
+	// Home feed composition: when serving the merged home feed (no explicit
+	// audience/audienceType and not a thread/single-action fetch), drop posts
+	// addressed to communities the reader opted out of home
+	// (`profiles.hidden_in_home = 1`). Explicit community/profile feeds and
+	// thread/comment fetches (parent_id/root_id/action_id/subject) are left
+	// untouched so a hidden community's own feed and threads still resolve.
+	let is_home_feed = is_authenticated
+		&& opts.audience.is_none()
+		&& opts.audience_type.is_none()
+		&& opts.parent_id.is_none()
+		&& opts.root_id.is_none()
+		&& opts.action_id.is_none()
+		&& opts.subject.is_none();
+	if is_home_feed {
+		let communities = app
+			.meta_adapter
+			.list_profiles(
+				tn_id,
+				&meta_adapter::ListProfileOptions {
+					typ: Some(meta_adapter::ProfileType::Community),
+					hidden_in_home: Some(true),
+					..Default::default()
+				},
+			)
+			.await?;
+		let hidden: Vec<String> = communities.into_iter().map(|p| p.id_tag.to_string()).collect();
+		if !hidden.is_empty() {
+			opts.exclude_audiences = Some(hidden.into_boxed_slice());
+		}
+	}
+
 	let limit = opts.limit.unwrap_or(20) as usize;
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
 
@@ -71,10 +102,17 @@ pub async fn list_actions(
 		filtered.truncate(limit);
 	}
 
-	// Build next cursor from last item
+	// Build next cursor from last item. The cursor's sort value must be the same
+	// column the keyset query orders by, so sort=received cursors carry received_at
+	// (falling back to created_at if a row has no received_at).
 	let next_cursor = if has_more && !filtered.is_empty() {
 		let last = filtered.last().ok_or(Error::Internal("no last item".into()))?;
-		let sort_value = serde_json::Value::Number(last.created_at.0.into());
+		let sort_ts = if sort_field == "received" {
+			last.received_at.map_or(last.created_at.0, |t| t.0)
+		} else {
+			last.created_at.0
+		};
+		let sort_value = serde_json::Value::Number(sort_ts.into());
 		let cursor = types::CursorData::new(sort_field, sort_value, &last.action_id);
 		Some(cursor.encode())
 	} else {
@@ -85,6 +123,101 @@ pub async fn list_actions(
 		.with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
+}
+
+/// Body for `PUT /api/read-marker`. `scope` selects the watermark column,
+/// `key` is the entity id (context/peer id_tag for feed/msg, action_id for
+/// thread), `position` is the forward-only watermark value. `position` is a
+/// `Timestamp`, so it accepts an ISO 8601 string (the client's wire format) or
+/// a raw epoch-seconds integer.
+#[derive(Deserialize)]
+pub struct ReadMarkerBody {
+	pub scope: String,
+	pub key: String,
+	pub position: types::Timestamp,
+}
+
+/// `PUT /api/read-marker` — set a read-watermark on the reader's own node.
+/// Auth-only (the reader); forward-only is enforced in the adapter UPDATE.
+pub async fn put_read_marker(
+	State(app): State<App>,
+	tn_id: TnId,
+	Auth(auth): Auth,
+	IdTag(id_tag): IdTag,
+	Json(body): Json<ReadMarkerBody>,
+) -> ClResult<StatusCode> {
+	// Caller must be the tenant owner. All read-watermarks are reader-local rows
+	// in this tenant's own DB: `profiles.feed_read_at`/`msg_read_at` on the
+	// reader's per-context/per-peer profile row (keyed by that id_tag), and
+	// `actions.comments_read_at` on the reader's cached action row. The `tn_id`
+	// scoping is the authorization boundary; the owner check just stops a
+	// principal authenticated on this node from moving the owner's markers.
+	if id_tag.as_ref() != auth.id_tag.as_ref() {
+		return Err(Error::PermissionDenied);
+	}
+	// Verify the target row exists in this tenant before the UPDATE so a bogus key
+	// is a 404 rather than a silently-dropped watermark (consistent across scopes,
+	// and avoids a silent no-op masquerading as success). `feed`/`msg` resolve the
+	// reader's per-context/per-peer `profiles` row; `thread` the cached action row.
+	// An unknown scope falls through to `set_read_marker`, which returns a
+	// ValidationError for it.
+	match body.scope.as_str() {
+		"thread" => {
+			app.meta_adapter.get_action(tn_id, &body.key).await?.ok_or(Error::NotFound)?;
+		}
+		"feed" | "msg" => {
+			// read_profile returns Error::NotFound when the row is absent.
+			app.meta_adapter.read_profile(tn_id, &body.key).await?;
+		}
+		_ => {}
+	}
+	app.meta_adapter
+		.set_read_marker(tn_id, &body.scope, &body.key, body.position.0)
+		.await?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// Body for `PUT /api/actions/{action_id}/subscribe`. `level` is the W/T/M
+/// subscription level, or `null`/absent to clear the subscription.
+#[derive(Deserialize)]
+pub struct SubscribeBody {
+	pub level: Option<String>,
+}
+
+/// `PUT /api/actions/{action_id}/subscribe` — set the reader's W/T/M thread
+/// subscription level on their locally-cached action row. Auth-only (reader's
+/// own preference); folds into `update_action_data`'s `sub_level` patch.
+pub async fn put_action_subscribe(
+	State(app): State<App>,
+	tn_id: TnId,
+	Auth(auth): Auth,
+	IdTag(id_tag): IdTag,
+	Path(action_id): Path<String>,
+	Json(body): Json<SubscribeBody>,
+) -> ClResult<StatusCode> {
+	// Caller must be the tenant owner: `actions.sub_level` is a tenant-wide row,
+	// so any other authenticated principal would otherwise move the owner's
+	// subscription.
+	if id_tag.as_ref() != auth.id_tag.as_ref() {
+		return Err(Error::PermissionDenied);
+	}
+	let sub_level = match body.level.as_deref() {
+		None => types::Patch::Null,
+		Some("W") => types::Patch::Value('W'),
+		Some("T") => types::Patch::Value('T'),
+		Some("M") => types::Patch::Value('M'),
+		Some(other) => {
+			return Err(Error::ValidationError(format!("invalid subscription level: {other}")));
+		}
+	};
+	// Verify the action exists in this tenant before mutating, so a bogus id is a
+	// 404 rather than a silent no-op (which would otherwise allow existence-probing).
+	app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+
+	let opts = meta_adapter::UpdateActionDataOptions { sub_level, ..Default::default() };
+	app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
+
+	Ok(StatusCode::NO_CONTENT)
 }
 
 #[axum::debug_handler]
@@ -588,36 +721,6 @@ pub async fn post_action_dismiss(
 	Ok((StatusCode::OK, Json(ApiResponse::new(()).with_req_id(req_id.unwrap_or_default()))))
 }
 
-/// POST /api/actions/:action_id/stat - Update action statistics
-#[derive(Debug, Default, Deserialize)]
-pub struct UpdateActionStatRequest {
-	#[serde(default, rename = "commentsRead")]
-	pub comments_read: cloudillo_types::types::Patch<u32>,
-}
-
-pub async fn post_action_stat(
-	State(app): State<App>,
-	tn_id: TnId,
-	Auth(auth): Auth,
-	Path(action_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
-	Json(req): Json<UpdateActionStatRequest>,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	// Update action statistics
-	let opts = cloudillo_types::meta_adapter::UpdateActionDataOptions {
-		comments_read: req.comments_read,
-		..Default::default()
-	};
-
-	app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
-
-	info!("User {} updated stats for action {}", auth.id_tag, action_id);
-
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-
-	Ok((StatusCode::OK, Json(response)))
-}
-
 /// Request body for PATCH /api/actions/:action_id.
 ///
 /// Allowed only for drafts (status `R`) and scheduled actions (status `S`).
@@ -941,22 +1044,29 @@ async fn read_limit_setting(app: &App, tn_id: TnId) -> i64 {
 		.unwrap_or(HISTORY_SYNC_DEFAULT_LIMIT)
 }
 
-/// Extract `(reactions_string, comments_count)` from `ActionView.stat`.
-/// Returns `(None, 0)` if absent. The reactions field is a CSV-like string
-/// of reaction-type counts; we pass it through unchanged since that's the
-/// source-of-truth shape used everywhere else.
-fn extract_counters(stat: Option<&serde_json::Value>) -> (Option<String>, i64, i64) {
+/// Extract `(reactions_string, comment_count, last_comment_ts, reposts_count)`
+/// from `ActionView.stat`. Returns zeros if absent. The reactions field is a
+/// CSV-like string of reaction-type counts, passed through unchanged. The
+/// comment count is served as `commentCount` (STAT `c`); the last-comment
+/// timestamp (epoch seconds) is served as an ISO 8601 string (`lastCommentAt`)
+/// and parsed back here for STAT `ct`.
+fn extract_counters(stat: Option<&serde_json::Value>) -> (Option<String>, i64, i64, i64) {
 	let Some(stat) = stat else {
-		return (None, 0, 0);
+		return (None, 0, 0, 0);
 	};
 	let reactions = stat.get("reactions").and_then(|v| v.as_str()).map(String::from);
-	let comments = stat.get("comments").and_then(serde_json::Value::as_i64).unwrap_or(0);
+	let comment_count = stat.get("commentCount").and_then(serde_json::Value::as_i64).unwrap_or(0);
+	let comments_ts = stat
+		.get("lastCommentAt")
+		.and_then(|v| serde_json::from_value::<types::Timestamp>(v.clone()).ok())
+		.map_or(0, |t| t.0);
 	let reposts = stat.get("reposts").and_then(serde_json::Value::as_i64).unwrap_or(0);
-	(reactions, comments, reposts)
+	(reactions, comment_count, comments_ts, reposts)
 }
 
 /// Mint a fresh STAT token for the primary action carrying its current counters.
-/// Returns `None` if both reactions and comments are absent/zero (no useful info).
+/// Returns `None` if reactions, comments, and reposts are all absent/zero (no
+/// useful info).
 ///
 /// TODO(perf): this signs an ES384 (P-384) JWT on every outbox call. For popular
 /// tenants with many federated followers regularly polling /api/outbox, that's
@@ -969,8 +1079,8 @@ async fn mint_stat_token(
 	primary_id: &str,
 	stat: Option<&serde_json::Value>,
 ) -> Option<Box<str>> {
-	let (reactions, comments, reposts) = extract_counters(stat);
-	if reactions.is_none() && comments == 0 && reposts == 0 {
+	let (reactions, comment_count, comments_ts, reposts) = extract_counters(stat);
+	if reactions.is_none() && comment_count == 0 && comments_ts == 0 && reposts == 0 {
 		return None;
 	}
 
@@ -978,8 +1088,11 @@ async fn mint_stat_token(
 	if let Some(r) = reactions {
 		content.insert("r".into(), serde_json::Value::String(r));
 	}
-	if comments > 0 {
-		content.insert("c".into(), serde_json::Value::from(comments));
+	if comment_count > 0 {
+		content.insert("c".into(), serde_json::Value::from(comment_count));
+	}
+	if comments_ts > 0 {
+		content.insert("ct".into(), serde_json::Value::from(comments_ts));
 	}
 	if reposts > 0 {
 		content.insert("rp".into(), serde_json::Value::from(reposts));

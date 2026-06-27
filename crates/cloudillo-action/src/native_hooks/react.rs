@@ -76,6 +76,17 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 		tracing::debug!("REACT on_create: Subject action {} not found locally", subject_id);
 		return Ok(HookResult::default());
 	};
+
+	// Engaging (reacting) auto-subscribes the local reactor to the thread at
+	// Tracking level (coalesce — never downgrades Watching/Muted). Runs even for
+	// remote-owned subjects; operates on the locally-cached root row.
+	if context.subtype.as_deref() != Some("DEL") {
+		let root_id = subject_action.root_id.as_deref().unwrap_or(subject_id.as_str());
+		if let Err(e) = app.meta_adapter.auto_track_action(tn_id, root_id).await {
+			tracing::warn!("REACT on_create: auto-track of root {} failed: {}", root_id, e);
+		}
+	}
+
 	if !owns_subject(&subject_action, &context.tenant_tag) {
 		tracing::debug!(
 			"REACT on_create: Subject {} not owned by us ({}) — skipping count update (non-authoritative for subject — STAT mirror path will handle counters)",
@@ -183,6 +194,14 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 	}
 
 	emit_stat_for_subject(&app, tn_id, &context.tenant_tag, subject_id).await;
+
+	// The post author (we host the subject) auto-tracks their own thread (coalesce).
+	if context.subtype.as_deref() != Some("DEL") {
+		let root_id = subject_action.root_id.as_deref().unwrap_or(subject_id.as_str());
+		if let Err(e) = app.meta_adapter.auto_track_action(tn_id, root_id).await {
+			tracing::warn!("REACT on_receive: auto-track of root {} failed: {}", root_id, e);
+		}
+	}
 
 	Ok(HookResult::default())
 }

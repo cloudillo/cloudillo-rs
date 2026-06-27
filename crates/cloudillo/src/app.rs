@@ -340,6 +340,7 @@ impl AppBuilder {
 						custom_key: params.custom_key,
 						from_name_override: params.from_name_override,
 						delay_seconds: None,
+						notify_guard: None,
 					},
 				)
 				.await

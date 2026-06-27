@@ -207,21 +207,109 @@ pub fn should_push_notify(action_type: &str, sub_type: Option<&str>) -> bool {
 	)
 }
 
+/// Single source of truth for per-type notification metadata. One row per
+/// notifiable action type; `None` => the type has no type-specific keys and
+/// callers fall back to the channel master switch.
+struct NotifyType {
+	push_key: &'static str,
+	email_key: &'static str,
+	label: &'static str,
+	/// Offline email throttle group (None = not grouped).
+	throttle_group: Option<&'static str>,
+}
+
+fn notify_type(action_type: &str) -> Option<NotifyType> {
+	Some(match action_type {
+		"MSG" => NotifyType {
+			push_key: "notify.push.message",
+			email_key: "notify.email.message",
+			label: "message",
+			throttle_group: Some("direct"),
+		},
+		"CONN" => NotifyType {
+			push_key: "notify.push.connection",
+			email_key: "notify.email.connection",
+			label: "connection request",
+			throttle_group: Some("direct"),
+		},
+		"FSHR" => NotifyType {
+			push_key: "notify.push.file_share",
+			email_key: "notify.email.file_share",
+			label: "shared file",
+			throttle_group: Some("direct"),
+		},
+		"FLLW" => NotifyType {
+			push_key: "notify.push.follow",
+			email_key: "notify.email.follow",
+			label: "follower",
+			throttle_group: Some("social"),
+		},
+		"CMNT" => NotifyType {
+			push_key: "notify.push.comment",
+			email_key: "notify.email.comment",
+			label: "comment",
+			throttle_group: Some("engagement"),
+		},
+		"REACT" => NotifyType {
+			push_key: "notify.push.reaction",
+			email_key: "notify.email.reaction",
+			label: "reaction",
+			throttle_group: Some("engagement"),
+		},
+		"POST" => NotifyType {
+			push_key: "notify.push.post",
+			email_key: "notify.email.post",
+			label: "post",
+			throttle_group: Some("social"),
+		},
+		_ => return None,
+	})
+}
+
+/// Human-readable English label for a notifiable action type, used in the
+/// notification email subject/body. i18n-ready: when notification emails are
+/// localized, give this a `lang` parameter and translate per language (and add
+/// `notification.<lang>.*` templates).
+pub(crate) fn notify_action_label(action_type: &str) -> &'static str {
+	notify_type(action_type).map_or("notification", |n| n.label)
+}
+
 /// Get the push notification setting key for an action type
 ///
 /// Returns the settings key to check whether push notifications are enabled
 /// for this action type.
 pub fn get_push_setting_key(action_type: &str) -> &'static str {
-	match action_type {
-		"MSG" => "notify.push.message",
-		"CONN" => "notify.push.connection",
-		"FSHR" => "notify.push.file_share",
-		"FLLW" => "notify.push.follow",
-		"CMNT" => "notify.push.comment",
-		"REACT" => "notify.push.reaction",
-		"POST" => "notify.push.post",
-		_ => "notify.push", // Fall back to master switch
+	notify_type(action_type).map_or("notify.push", |n| n.push_key)
+}
+
+/// Whether an action type is eligible for an email notification.
+///
+/// Unlike `should_push_notify` (which excludes FLLW/REACT/POST), this admits
+/// every type that has a type-specific email cadence key — i.e. every type
+/// `get_email_setting_key` maps to something other than the bare `notify.email`
+/// master-switch fallback. DEL subtypes never notify.
+pub fn is_email_notifiable(action_type: &str, sub_type: Option<&str>) -> bool {
+	if sub_type == Some("DEL") {
+		return false;
 	}
+	// A type-specific cadence key exists (not the bare master-switch fallback).
+	get_email_setting_key(action_type) != "notify.email"
+}
+
+/// Get the per-type email setting key for an action type. The value is a plain
+/// boolean on/off toggle. Types without a specific key fall back to the
+/// `notify.email` master switch.
+pub fn get_email_setting_key(action_type: &str) -> &'static str {
+	notify_type(action_type).map_or("notify.email", |n| n.email_key)
+}
+
+/// Email throttle group for a notifiable action type (None = not grouped).
+///
+/// While the recipient is offline, each group throttles independently: they get
+/// one email per group at the start of an absence, plus at most one more per
+/// `email.throttle_hours` window if they stay away.
+pub(crate) fn email_throttle_group(action_type: &str) -> Option<&'static str> {
+	notify_type(action_type).and_then(|n| n.throttle_group)
 }
 
 #[cfg(test)]
@@ -252,6 +340,51 @@ mod tests {
 		assert_eq!(get_push_setting_key("CONN"), "notify.push.connection");
 		assert_eq!(get_push_setting_key("FSHR"), "notify.push.file_share");
 		assert_eq!(get_push_setting_key("UNKNOWN"), "notify.push");
+	}
+
+	#[test]
+	fn test_is_email_notifiable() {
+		// Types with a specific cadence key are notifiable (incl. ones
+		// should_push_notify wrongly excluded: FLLW/REACT/POST).
+		assert!(is_email_notifiable("POST", None));
+		assert!(is_email_notifiable("REACT", None));
+		assert!(is_email_notifiable("FLLW", None));
+		assert!(is_email_notifiable("CMNT", None));
+
+		// DEL subtypes never notify.
+		assert!(!is_email_notifiable("REACT", Some("DEL")));
+		assert!(!is_email_notifiable("CMNT", Some("DEL")));
+
+		// Unknown types (no specific key → master-switch fallback) are skipped.
+		assert!(!is_email_notifiable("UNKNOWN", None));
+	}
+
+	#[test]
+	fn test_push_email_keys_agree_on_membership() {
+		// Both channels derive from the single `notify_type` table, so they must
+		// agree on which types have a type-specific key vs. fall back to the master
+		// switch.
+		for ty in ["MSG", "CONN", "FSHR", "FLLW", "CMNT", "REACT", "POST", "UNKNOWN", "DEL"] {
+			let push_specific = get_push_setting_key(ty) != "notify.push";
+			let email_specific = get_email_setting_key(ty) != "notify.email";
+			assert_eq!(push_specific, email_specific, "mismatch for type {ty}");
+		}
+	}
+
+	#[test]
+	fn test_notify_action_label() {
+		assert_eq!(notify_action_label("MSG"), "message");
+		assert_eq!(notify_action_label("CONN"), "connection request");
+		assert_eq!(notify_action_label("CMNT"), "comment");
+		assert_eq!(notify_action_label("UNKNOWN"), "notification");
+	}
+
+	#[test]
+	fn test_email_throttle_group() {
+		assert_eq!(email_throttle_group("MSG"), Some("direct"));
+		assert_eq!(email_throttle_group("CMNT"), Some("engagement"));
+		assert_eq!(email_throttle_group("POST"), Some("social"));
+		assert_eq!(email_throttle_group("UNKNOWN"), None);
 	}
 }
 

@@ -64,11 +64,13 @@ mod tests {
 			subject_profile: None,
 			subject_action: None,
 			created_at: Timestamp(0),
+			received_at: None,
 			expires_at: None,
 			status: None,
 			stat: None,
 			visibility: None,
 			flags: None,
+			sub_level: None,
 			x: None,
 			token: None,
 		}

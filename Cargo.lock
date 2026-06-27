@@ -683,6 +683,7 @@ dependencies = [
  "async-trait",
  "axum",
  "cloudillo-core",
+ "cloudillo-email",
  "cloudillo-file",
  "cloudillo-idp",
  "cloudillo-push",

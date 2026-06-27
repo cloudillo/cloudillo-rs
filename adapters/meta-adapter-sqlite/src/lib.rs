@@ -207,10 +207,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::list(&self.dbr, tn_id, opts).await
 	}
 
-	async fn count_actions(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64> {
-		action::count(&self.dbr, tn_id, opts).await
-	}
-
 	async fn count_actions_grouped(
 		&self,
 		tn_id: TnId,
@@ -218,6 +214,20 @@ impl MetaAdapter for MetaAdapterSqlite {
 		group_by: cloudillo_types::meta_adapter::ActionCountGroupBy,
 	) -> ClResult<Vec<(Option<String>, i64)>> {
 		action::count_grouped(&self.dbr, tn_id, opts, group_by).await
+	}
+
+	async fn set_read_marker(
+		&self,
+		tn_id: TnId,
+		scope: &str,
+		key: &str,
+		position: i64,
+	) -> ClResult<()> {
+		action::set_read_marker(&self.db, tn_id, scope, key, position).await
+	}
+
+	async fn auto_track_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()> {
+		action::auto_track(&self.db, tn_id, action_id).await
 	}
 
 	async fn list_action_tokens(

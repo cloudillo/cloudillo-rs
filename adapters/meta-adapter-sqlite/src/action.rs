@@ -63,6 +63,14 @@ fn push_action_filters(
 		// case used by federation history sync).
 		query.push(" AND coalesce(a.audience, a.issuer_tag)=").push_bind(audience);
 	}
+	if let Some(excluded_aud) = opts.exclude_audiences.as_ref().filter(|v| !v.is_empty()) {
+		// Drop posts whose effective audience the reader opted out of their home
+		// feed (hidden_in_home communities). Same effective-audience expression
+		// the inclusive `audience` filter uses above.
+		let codes: Vec<&str> = excluded_aud.iter().map(String::as_str).collect();
+		query.push(" AND coalesce(a.audience, a.issuer_tag) NOT IN ");
+		query = push_in(query, codes.as_slice());
+	}
 	if let Some(audience_type) = opts.audience_type {
 		// Filter on the type of the *effective audience* profile (i.e., the
 		// profile whose wall the action lives on). `pa` is joined on
@@ -123,8 +131,28 @@ fn push_action_filters(
 	if let Some(subject) = &opts.subject {
 		query.push(" AND a.subject=").push_bind(subject);
 	}
+	// Range filters apply to the same column the caller sorts by, so the Unread
+	// "since" boundary filters on received_at for the home feed (sort=received)
+	// and on created_at otherwise — keeping the count/list consistent with the
+	// watermark's meaning. The "received" branch coalesces to created_at so it
+	// matches the cursor's NULL fallback (handler builds the next cursor from
+	// created_at when received_at is NULL); see `order_col` below for the
+	// indexing tradeoff.
+	let range_col = if opts.sort.as_deref() == Some("received") {
+		"coalesce(a.received_at, a.created_at)"
+	} else {
+		"a.created_at"
+	};
 	if let Some(created_after) = &opts.created_after {
-		query.push(" AND a.created_at>").push_bind(created_after.0);
+		query.push(format!(" AND {range_col}>")).push_bind(created_after.0);
+	}
+	if let Some(created_before) = &opts.created_before {
+		query.push(format!(" AND {range_col}<")).push_bind(created_before.0);
+	}
+	if opts.subscribed == Some(true) {
+		// Watching + Tracking count as "followed"; Muted is excluded. sub_level lives
+		// on the reader's own cached action rows, so this needs no viewer-scoping.
+		query.push(" AND a.sub_level IN ('W','T')");
 	}
 	// Materialize excluded-status codes ahead of push_bind so the &str slice
 	// outlives the QueryBuilder (push_in takes references with lifetime 'a).
@@ -184,6 +212,11 @@ fn push_action_filters(
 			query.push(" AND a.action_id=").push_bind(action_id);
 		}
 	}
+	if opts.exclude_own_issuer == Some(true)
+		&& let Some(viewer) = &opts.viewer_id_tag
+	{
+		query.push(" AND a.issuer_tag<>").push_bind(viewer);
+	}
 	query
 }
 
@@ -215,6 +248,10 @@ fn push_count_from_where(
 
 /// Count actions matching `opts` (same filters as `list`), with NO limit/sort/
 /// cursor. Generic and type-agnostic — callers supply the business filters.
+/// Not exposed through the adapter trait (no production caller); retained as the
+/// probe for the repost dedup/supersede/audience regression tests below, which
+/// guard the same `push_action_filters` SQL that `count_grouped` relies on.
+#[cfg(test)]
 pub(crate) async fn count(db: &SqlitePool, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64> {
 	let mut query = sqlx::QueryBuilder::new("SELECT COUNT(DISTINCT a.a_id) FROM actions a");
 	query = push_count_from_where(query, tn_id, opts);
@@ -313,9 +350,9 @@ pub(crate) async fn list(
 		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 		a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
-		a.content, a.created_at, a.expires_at,
+		a.content, a.created_at, a.received_at, a.expires_at,
 		own.sub_type as own_reaction,
-		a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.reposts, a.visibility, a.flags, a.x
+		a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
 		FROM actions a
 		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
@@ -333,8 +370,25 @@ pub(crate) async fn list(
 
 	query = push_action_filters(query, opts);
 
-	// Determine sort order (currently only created_at is supported)
-	let _sort_field = opts.sort.as_deref().unwrap_or("created");
+	// Determine the ordering column. The home feed passes sort="received" so it
+	// orders by ingestion time (received_at); every other caller keeps the
+	// default author-time (created_at) ordering. This column also drives the
+	// keyset cursor and the created_after/created_before range filters (see
+	// push_action_filters) so pagination and the Unread "since" boundary stay
+	// consistent with the sort.
+	//
+	// The "received" branch coalesces to created_at so NULL received_at rows
+	// (inserted via non-create() paths) sort and keyset-compare consistently
+	// with the cursor, which the handler builds from created_at when
+	// received_at is NULL. Tradeoff: coalesce(...) is not directly served by
+	// idx_actions_received (on received_at), but NULL received_at is rare (the
+	// base schema DEFAULTs it and migration 36 backfills), so the correctness
+	// is worth the minor planner cost.
+	let order_col = if opts.sort.as_deref() == Some("received") {
+		"coalesce(a.received_at, a.created_at)"
+	} else {
+		"a.created_at"
+	};
 	let sort_dir = match opts.sort_dir.as_deref() {
 		Some("asc") => "ASC",
 		_ => "DESC", // Default DESC for actions
@@ -365,7 +419,7 @@ pub(crate) async fn list(
 			// Note: push_bind() adds bind placeholders, don't use ? in push() strings
 			let comparison = if is_desc { "<" } else { ">" };
 			if let Some(ts) = cursor.timestamp() {
-				query.push(format!(" AND (a.created_at, a.a_id) {} (", comparison));
+				query.push(format!(" AND ({}, a.a_id) {} (", order_col, comparison));
 				query.push_bind(ts);
 				query.push(", ");
 				query.push_bind(cursor_a_id);
@@ -374,7 +428,7 @@ pub(crate) async fn list(
 		}
 	}
 
-	query.push(format!(" ORDER BY a.created_at {}, a.a_id {}", sort_dir, sort_dir));
+	query.push(format!(" ORDER BY {} {}, a.a_id {}", order_col, sort_dir, sort_dir));
 
 	// Fetch limit+1 to determine hasMore
 	// Note: SQLite doesn't allow bound parameters in LIMIT clause, so we use format!
@@ -472,16 +526,26 @@ pub(crate) async fn list(
 			None
 		};
 
-		// stat - build from reactions and comments counts
+		// stat - reactions string, comment count, last-comment / comments-read
+		// watermarks (ISO), reposts count. `comments` holds the total comment count;
+		// `comments_ts` holds the last-comment timestamp (epoch seconds) — the client
+		// computes the unread dot from lastCommentAt vs commentsReadAt.
 		let reactions: Option<String> = row.try_get("reactions").ok().flatten();
-		let comments_count: i64 = row.try_get("comments").unwrap_or(0);
-		let comments_read: i64 = row.try_get("comments_read").unwrap_or(0);
+		let comment_count: i64 = row.try_get("comments").unwrap_or(0);
+		let last_comment_at: Option<i64> = row.try_get("comments_ts").ok().flatten();
+		let comments_read_at: Option<i64> = row.try_get("comments_read_at").ok().flatten();
 		let own_reaction: Option<String> = row.try_get("own_reaction").ok().flatten();
 		let reposts: i64 = row.try_get("reposts").unwrap_or(0);
-		let mut stat_obj = serde_json::json!({
-			"comments": comments_count,
-			"commentsRead": comments_read
-		});
+		let mut stat_obj = serde_json::json!({});
+		if comment_count > 0 {
+			stat_obj["commentCount"] = serde_json::Value::from(comment_count);
+		}
+		if let Some(ts) = last_comment_at {
+			stat_obj["lastCommentAt"] = serde_json::Value::String(Timestamp(ts).to_iso_string());
+		}
+		if let Some(ts) = comments_read_at {
+			stat_obj["commentsReadAt"] = serde_json::Value::String(Timestamp(ts).to_iso_string());
+		}
 		if let Some(reactions) = reactions {
 			stat_obj["reactions"] = serde_json::Value::String(reactions);
 		}
@@ -568,6 +632,7 @@ pub(crate) async fn list(
 				.and_then(|s| serde_json::from_str(&s).ok()),
 			attachments,
 			created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
+			received_at: row.try_get::<Option<i64>, _>("received_at").ok().flatten().map(Timestamp),
 			expires_at: row
 				.try_get("expires_at")
 				.map(|ts: Option<i64>| ts.map(Timestamp))
@@ -576,6 +641,7 @@ pub(crate) async fn list(
 			stat,
 			visibility,
 			flags: row.try_get("flags").map_err(|_| Error::DbError)?,
+			sub_level: row.try_get("sub_level").map_err(|_| Error::DbError)?,
 			x: row
 				.try_get::<Option<String>, _>("x")
 				.map_err(|_| Error::DbError)?
@@ -753,9 +819,15 @@ pub(crate) async fn create(
 	// and the fresh-DB schema declares the column NOT NULL DEFAULT 'D'.
 	let visibility = action.visibility.unwrap_or('D').to_string();
 	let x_json = action.x.as_ref().and_then(|v| serde_json::to_string(v).ok());
+	// `received_at` is stamped with the LOCAL insert time via the `unixepoch()`
+	// SQL literal (NOT a bind, NOT the federated `created_at`) so the home feed
+	// orders/tracks by arrival. Setting it explicitly — rather than relying on
+	// the column DEFAULT — is required because migrated DBs add the column via
+	// ALTER without a default (SQLite forbids a non-constant default there), so
+	// the default only exists on fresh DBs. See schema migration 36.
 	let res = sqlx::query(
-		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, expires_at, attachments, status, visibility, flags, x)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING a_id"
+		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, received_at, expires_at, attachments, status, visibility, flags, x)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, ?, ?, ?, ?, ?) RETURNING a_id"
 	)
 		.bind(tn_id.0)
 		.bind(if action.action_id.is_empty() { None } else { Some(action.action_id) })
@@ -1003,7 +1075,7 @@ pub(crate) async fn get_data(
 	action_id: &str,
 ) -> ClResult<Option<ActionData>> {
 	let res = sqlx::query(
-		"SELECT subject, reactions, comments, stat_at FROM actions WHERE tn_id=? AND action_id=?",
+		"SELECT subject, reactions, comments, comments_ts, stat_at FROM actions WHERE tn_id=? AND action_id=?",
 	)
 	.bind(tn_id.0)
 	.bind(action_id)
@@ -1016,7 +1088,8 @@ pub(crate) async fn get_data(
 		Some(row) => Ok(Some(ActionData {
 			subject: row.try_get("subject").ok().flatten(),
 			reactions: row.try_get::<Option<String>, _>("reactions").ok().flatten().map(Into::into),
-			comments: row.try_get("comments").ok().flatten(),
+			comments: row.try_get::<Option<i64>, _>("comments").ok().flatten(),
+			comments_ts: row.try_get::<Option<i64>, _>("comments_ts").ok().flatten().map(Timestamp),
 			stat_at: row.try_get::<Option<i64>, _>("stat_at").ok().flatten().map(Timestamp),
 		})),
 		None => Ok(None),
@@ -1133,8 +1206,8 @@ pub(crate) async fn update_data(
 	if !opts.comments.is_undefined() {
 		set_clauses.push("comments = ?");
 	}
-	if !opts.comments_read.is_undefined() {
-		set_clauses.push("comments_read = ?");
+	if !opts.comments_ts.is_undefined() {
+		set_clauses.push("comments_ts = ?");
 	}
 	if !opts.reposts.is_undefined() {
 		set_clauses.push("reposts = ?");
@@ -1156,6 +1229,9 @@ pub(crate) async fn update_data(
 	}
 	if !opts.flags.is_undefined() {
 		set_clauses.push("flags = ?");
+	}
+	if !opts.sub_level.is_undefined() {
+		set_clauses.push("sub_level = ?");
 	}
 	if !opts.sub_typ.is_undefined() {
 		set_clauses.push("sub_type = ?");
@@ -1212,10 +1288,10 @@ pub(crate) async fn update_data(
 		};
 		query = query.bind(val);
 	}
-	if !opts.comments_read.is_undefined() {
-		let val: Option<u32> = match &opts.comments_read {
+	if !opts.comments_ts.is_undefined() {
+		let val: Option<i64> = match &opts.comments_ts {
 			Patch::Null => None,
-			Patch::Value(v) => Some(*v),
+			Patch::Value(ts) => Some(ts.0),
 			Patch::Undefined => unreachable!(),
 		};
 		query = query.bind(val);
@@ -1273,6 +1349,14 @@ pub(crate) async fn update_data(
 		let val: Option<&str> = match &opts.flags {
 			Patch::Null => None,
 			Patch::Value(v) => Some(v.as_str()),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.sub_level.is_undefined() {
+		let val: Option<String> = match &opts.sub_level {
+			Patch::Null => None,
+			Patch::Value(c) => Some(c.to_string()),
 			Patch::Undefined => unreachable!(),
 		};
 		query = query.bind(val);
@@ -1367,8 +1451,8 @@ pub(crate) async fn get(
 			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
-			a.content, a.created_at, a.expires_at,
-			a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.reposts, a.visibility, a.flags, a.x
+			a.content, a.created_at, a.received_at, a.expires_at,
+			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
 			FROM actions a
 			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
@@ -1389,8 +1473,8 @@ pub(crate) async fn get(
 			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
-			a.content, a.created_at, a.expires_at,
-			a.attachments, a.status, a.reactions, a.comments, a.comments_read, a.reposts, a.visibility, a.flags, a.x
+			a.content, a.created_at, a.received_at, a.expires_at,
+			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
 			FROM actions a
 			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
@@ -1475,15 +1559,24 @@ pub(crate) async fn get(
 		None
 	};
 
-	// Build stat from reactions and comments counts
+	// Build stat: reactions string, comment count, last-comment / comments-read
+	// watermarks (ISO), reposts count. `comments` holds the total comment count;
+	// `comments_ts` holds the last-comment timestamp.
 	let reactions: Option<String> = row.try_get("reactions").ok().flatten();
-	let comments_count: i64 = row.try_get("comments").unwrap_or(0);
-	let comments_read: i64 = row.try_get("comments_read").unwrap_or(0);
+	let comment_count: i64 = row.try_get("comments").unwrap_or(0);
+	let last_comment_at: Option<i64> = row.try_get("comments_ts").ok().flatten();
+	let comments_read_at: Option<i64> = row.try_get("comments_read_at").ok().flatten();
 	let reposts: i64 = row.try_get("reposts").unwrap_or(0);
-	let mut stat_obj = serde_json::json!({
-		"comments": comments_count,
-		"commentsRead": comments_read
-	});
+	let mut stat_obj = serde_json::json!({});
+	if comment_count > 0 {
+		stat_obj["commentCount"] = serde_json::Value::from(comment_count);
+	}
+	if let Some(ts) = last_comment_at {
+		stat_obj["lastCommentAt"] = serde_json::Value::String(Timestamp(ts).to_iso_string());
+	}
+	if let Some(ts) = comments_read_at {
+		stat_obj["commentsReadAt"] = serde_json::Value::String(Timestamp(ts).to_iso_string());
+	}
 	if let Some(reactions) = reactions {
 		stat_obj["reactions"] = serde_json::Value::String(reactions);
 	}
@@ -1609,6 +1702,7 @@ pub(crate) async fn get(
 			.and_then(|s| serde_json::from_str(&s).ok()),
 		attachments,
 		created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
+		received_at: row.try_get::<Option<i64>, _>("received_at").ok().flatten().map(Timestamp),
 		expires_at: row
 			.try_get("expires_at")
 			.map(|ts: Option<i64>| ts.map(Timestamp))
@@ -1617,6 +1711,7 @@ pub(crate) async fn get(
 		stat,
 		visibility,
 		flags: row.try_get("flags").map_err(|_| Error::DbError)?,
+		sub_level: row.try_get("sub_level").map_err(|_| Error::DbError)?,
 		x: row
 			.try_get::<Option<String>, _>("x")
 			.map_err(|_| Error::DbError)?
@@ -1711,6 +1806,58 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClR
 			.map_err(|_| Error::DbError)?;
 	}
 
+	Ok(())
+}
+
+/// Set a read-watermark forward-only (lower position is a no-op). Dispatches by
+/// `scope` over the two tables that carry reader-relative state. See the
+/// `MetaAdapter::set_read_marker` doc for the scope/column map.
+pub async fn set_read_marker(
+	db: &SqlitePool,
+	tn_id: TnId,
+	scope: &str,
+	key: &str,
+	position: i64,
+) -> ClResult<()> {
+	let sql = match scope {
+		"feed" => {
+			"UPDATE profiles SET feed_read_at = max(coalesce(feed_read_at, 0), ?) \
+			 WHERE tn_id = ? AND id_tag = ?"
+		}
+		"msg" => {
+			"UPDATE profiles SET msg_read_at = max(coalesce(msg_read_at, 0), ?) \
+			 WHERE tn_id = ? AND id_tag = ?"
+		}
+		"thread" => {
+			"UPDATE actions SET comments_read_at = max(coalesce(comments_read_at, 0), ?) \
+			 WHERE tn_id = ? AND action_id = ?"
+		}
+		_ => return Err(Error::ValidationError(format!("unknown read-marker scope: {scope}"))),
+	};
+	sqlx::query(sql)
+		.bind(position)
+		.bind(tn_id.0)
+		.bind(key)
+		.execute(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+	Ok(())
+}
+
+/// Auto-subscribe at Tracking: set `sub_level='T'` only when currently NULL
+/// (never downgrade an existing Watching). No-op if the row is absent.
+pub async fn auto_track(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClResult<()> {
+	sqlx::query(
+		"UPDATE actions SET sub_level = 'T' \
+		 WHERE tn_id = ? AND action_id = ? AND sub_level IS NULL",
+	)
+	.bind(tn_id.0)
+	.bind(action_id)
+	.execute(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
 	Ok(())
 }
 

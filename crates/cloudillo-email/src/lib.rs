@@ -15,7 +15,7 @@ pub mod task;
 pub mod template;
 
 pub use sender::{EmailSender, SmtpCategory, SmtpDiagnostic};
-pub use task::EmailSenderTask;
+pub use task::{EmailSenderTask, NotifyGuard};
 pub use template::TemplateEngine;
 
 mod prelude;
@@ -55,6 +55,9 @@ pub struct EmailTaskParams {
 	/// the scheduler's `schedule_after`. Used to order the onboarding welcome
 	/// email after register-time CONN/INVT effects land. `None`/`0` = immediate.
 	pub delay_seconds: Option<i64>,
+	/// Optional notification guard, evaluated at fire time. Present only for
+	/// action notification emails (defer-and-recheck presence suppression).
+	pub notify_guard: Option<crate::task::NotifyGuard>,
 }
 
 /// Email module - main orchestrator for email operations
@@ -108,7 +111,7 @@ impl EmailModule {
 		// - Attempts: 60s, 120s, 240s, 480s, 960s, 1800s, 3600s...
 		let retry_policy = cloudillo_core::scheduler::RetryPolicy::new((60, 3600), max_retries);
 
-		let task = EmailSenderTask::new(
+		let mut task = EmailSenderTask::new(
 			tn_id,
 			params.to.clone(),
 			params.subject,
@@ -117,6 +120,7 @@ impl EmailModule {
 			params.lang,
 			params.from_name_override,
 		);
+		task.notify_guard = params.notify_guard;
 		let task_key =
 			params.custom_key.unwrap_or_else(|| format!("email:{}:{}", tn_id.0, params.to));
 

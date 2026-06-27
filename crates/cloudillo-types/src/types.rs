@@ -362,7 +362,7 @@ pub struct AdminProfilePatch {
 
 /// Profile information response
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileInfo {
 	pub id_tag: String,
@@ -383,6 +383,23 @@ pub struct ProfileInfo {
 		skip_serializing_if = "Option::is_none"
 	)]
 	pub created_at: Option<Timestamp>,
+	/// Reader's feed read-watermark for this context (seeds `useReadMarker`).
+	/// ISO 8601 string (round-trips with `PUT /api/read-marker`'s `position`).
+	#[serde(
+		serialize_with = "serialize_timestamp_iso_opt",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub feed_read_at: Option<Timestamp>,
+	/// Reader's DM read-watermark for this peer (seeds `useReadMarker`).
+	/// ISO 8601 string (round-trips with `PUT /api/read-marker`'s `position`).
+	#[serde(
+		serialize_with = "serialize_timestamp_iso_opt",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub msg_read_at: Option<Timestamp>,
+	/// Composition control for the home feed (community profiles): `Some(true)` =
+	/// hidden from the merged home feed. Absent/`None` = shown (the default).
+	pub hidden_in_home: Option<bool>,
 	/// Extensible metadata (profile sections, tab config, etc.)
 	pub x: Option<HashMap<String, String>>,
 }

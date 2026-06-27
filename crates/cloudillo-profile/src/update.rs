@@ -86,6 +86,7 @@ pub async fn patch_own_profile(
 		roles: None,
 		created_at: Some(profile_data.created_at),
 		x: if x_map.is_empty() { None } else { Some(x_map) },
+		..Default::default()
 	};
 
 	info!("User {} updated their profile", auth.id_tag);
@@ -272,6 +273,7 @@ pub async fn patch_profile_admin(
 		roles: response_roles,
 		created_at: Some(profile_data.created_at),
 		x: None,
+		..Default::default()
 	};
 
 	info!("Admin {} updated profile {}", auth.id_tag, id_tag);
@@ -292,6 +294,11 @@ pub struct PatchProfileRelationshipRequest {
 	pub status: Patch<ProfileStatus>,
 	#[serde(default)]
 	pub trust: Patch<ProfileTrust>,
+	/// Composition: hide/show this community in the merged home feed. `true`
+	/// hides it (column → 1), `false` shows it (normalized to `Patch::Null` so
+	/// the column returns to the NULL = shown default).
+	#[serde(default)]
+	pub hidden_in_home: Patch<bool>,
 }
 
 /// PATCH /profile/:idTag - Update relationship data with another user
@@ -306,8 +313,19 @@ pub async fn patch_profile_relationship(
 	// Upsert relationship state on the target id_tag. If the profile cache row
 	// is missing (race with federation sync), upsert creates a stub so the
 	// caller's relationship change isn't blocked by an empty cache.
-	let update =
-		UpdateProfileData { status: patch.status, trust: patch.trust, ..Default::default() };
+	// Normalize the composition flag to the NULL/1 encoding: an explicit `false`
+	// (or `null`) clears the column to NULL = shown; only `true` sets it.
+	let hidden_in_home = match patch.hidden_in_home {
+		Patch::Value(true) => Patch::Value(true),
+		Patch::Value(false) | Patch::Null => Patch::Null,
+		Patch::Undefined => Patch::Undefined,
+	};
+	let update = UpdateProfileData {
+		status: patch.status,
+		trust: patch.trust,
+		hidden_in_home,
+		..Default::default()
+	};
 	let upsert = UpsertProfileFields::from_update(update);
 	app.meta_adapter.upsert_profile(tn_id, &id_tag, &upsert).await?;
 
@@ -375,6 +393,7 @@ pub async fn post_profile_refresh(
 		roles: None,
 		created_at: Some(profile_data.created_at),
 		x: None,
+		..Default::default()
 	};
 
 	info!("User {} forced refresh of profile {}", auth.id_tag, id_tag);

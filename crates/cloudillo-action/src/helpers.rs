@@ -42,6 +42,27 @@ pub fn serialize_content(content: Option<&serde_json::Value>) -> Option<String> 
 	content.map(|v| serde_json::to_string(v).unwrap_or_default())
 }
 
+/// Derive a short rendering snippet from an action's content value.
+///
+/// Handles the common content shapes: a bare `String`, an object with a `text`
+/// or `content` field, or any other value (rendered via `to_string`). Caps the
+/// result at 200 characters. Used by the offline email notification path
+/// (`process::deliver_notification_email`).
+pub(crate) fn content_snippet(content: Option<&serde_json::Value>) -> String {
+	let raw = match content {
+		Some(serde_json::Value::String(s)) => s.clone(),
+		Some(serde_json::Value::Object(o)) => o
+			.get("text")
+			.or_else(|| o.get("content"))
+			.and_then(|v| v.as_str())
+			.map(str::to_string)
+			.unwrap_or_default(),
+		Some(other) => other.to_string(),
+		None => String::new(),
+	};
+	raw.chars().take(200).collect()
+}
+
 /// Inherit visibility from parent action if not explicitly set
 pub async fn inherit_visibility<M: MetaAdapter + ?Sized>(
 	meta_adapter: &M,
@@ -481,6 +502,36 @@ mod tests {
 	fn test_effective_audience_without_audience() {
 		// When audience is None, fall back to issuer
 		assert_eq!(effective_audience(None, "alice@example.com"), "alice@example.com");
+	}
+
+	#[test]
+	fn test_content_snippet_object_text() {
+		let value = serde_json::json!({ "text": "hello" });
+		assert_eq!(content_snippet(Some(&value)), "hello");
+	}
+
+	#[test]
+	fn test_content_snippet_object_content() {
+		let value = serde_json::json!({ "content": "world" });
+		assert_eq!(content_snippet(Some(&value)), "world");
+	}
+
+	#[test]
+	fn test_content_snippet_string() {
+		let value = serde_json::Value::String("hi there".to_string());
+		assert_eq!(content_snippet(Some(&value)), "hi there");
+	}
+
+	#[test]
+	fn test_content_snippet_none() {
+		assert_eq!(content_snippet(None), "");
+	}
+
+	#[test]
+	fn test_content_snippet_caps_at_200() {
+		let long = "x".repeat(500);
+		let value = serde_json::Value::String(long);
+		assert_eq!(content_snippet(Some(&value)).chars().count(), 200);
 	}
 }
 

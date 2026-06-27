@@ -69,14 +69,8 @@ async fn test_update_tenant() {
 	adapter.create_tenant(tn_id, "bob").await.expect("Should create tenant");
 
 	// Update tenant with name change
-	let update_data = UpdateTenantData {
-		id_tag: Patch::Undefined,
-		name: Patch::Value("Robert".into()),
-		typ: Patch::Undefined,
-		profile_pic: Patch::Undefined,
-		cover_pic: Patch::Undefined,
-		x: None,
-	};
+	let update_data =
+		UpdateTenantData { name: Patch::Value("Robert".into()), ..Default::default() };
 
 	let updated = adapter.update_tenant(tn_id, &update_data).await;
 
@@ -117,6 +111,7 @@ async fn test_list_profiles() {
 		q: None,
 		id_tag: None,
 		trust_set: None,
+		hidden_in_home: None,
 	};
 	let result = adapter.list_profiles(tn_id, &opts).await;
 

@@ -1028,7 +1028,7 @@ pub async fn post_forgot_password(
 	let id_tag = tenant.id_tag.to_string();
 
 	// Rate limiting: check recent password reset refs for this tenant
-	// Allow max 1 per hour, 3 per day
+	// Allow max 3 per hour, 5 per day
 	let opts = ListRefsOptions {
 		typ: Some("password".to_string()),
 		filter: Some("all".to_string()),
@@ -1043,12 +1043,12 @@ pub async fn post_forgot_password(
 	let hourly_count = recent_refs.iter().filter(|r| r.created_at.0 > one_hour_ago).count();
 	let daily_count = recent_refs.iter().filter(|r| r.created_at.0 > one_day_ago).count();
 
-	if hourly_count >= 1 {
+	if hourly_count >= 3 {
 		info!(tn_id = ?tn_id, id_tag = %id_tag, "Password reset rate limited (hourly)");
 		return Ok((StatusCode::OK, Json(success_response())));
 	}
 
-	if daily_count >= 3 {
+	if daily_count >= 5 {
 		info!(tn_id = ?tn_id, id_tag = %id_tag, "Password reset rate limited (daily)");
 		return Ok((StatusCode::OK, Json(success_response())));
 	}
@@ -1088,25 +1088,24 @@ pub async fn post_forgot_password(
 	// Get tenant's preferred language
 	let lang = get_tenant_lang(&app.settings, tn_id).await;
 
-	// Get base_id_tag for sender name
-	let base_id_tag = app.opts.base_id_tag.as_ref().map_or("cloudillo", AsRef::as_ref);
-
-	// Schedule email
+	// A password reset is for the user's own account, so the email is branded with
+	// the user's id_tag (subject prefix + sender name), not the node's base tenant.
 	let email_params = EmailTaskParams {
 		to: email.clone(),
 		subject: None,
 		template_name: "password_reset".to_string(),
 		template_vars: serde_json::json!({
 			"identity_tag": user_name,
-			"base_id_tag": base_id_tag,
+			"idTag": id_tag,
 			"instance_name": "Cloudillo",
 			"reset_link": reset_url,
 			"expire_hours": 24,
 		}),
 		lang,
 		custom_key: Some(format!("pw-reset:{}:{}", tn_id.0, now)),
-		from_name_override: Some(format!("Cloudillo | {}", base_id_tag.to_uppercase())),
+		from_name_override: Some(format!("Cloudillo | {}", id_tag.to_uppercase())),
 		delay_seconds: None,
+		notify_guard: None,
 	};
 
 	if let Err(e) =

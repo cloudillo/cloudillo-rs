@@ -479,9 +479,6 @@ impl<'a> OperationExecutor<'a> {
 
 		let tn_id = context.tn_id;
 
-		// Fetch current action data for increment/decrement operations
-		let action_data = self.app.meta_adapter.get_action_data(tn_id, &action_id).await?;
-
 		// Evaluate all update expressions
 		let mut update_opts = meta_adapter::UpdateActionDataOptions::default();
 
@@ -557,43 +554,17 @@ impl<'a> OperationExecutor<'a> {
 					};
 				}
 				"comments" => {
+					// `comments` is the total comment count. The recompute lives in
+					// the CMNT hook, so the adapter binds a direct value — accept a
+					// direct numeric value or null; increment/decrement unsupported.
 					let value = match update_value {
 						UpdateValue::Direct(expr) | UpdateValue::Set { set: expr } => {
 							self.evaluator.evaluate(expr, context)?
 						}
-						UpdateValue::Increment { increment } => {
-							let inc = self.evaluator.evaluate(increment, context)?;
-							let inc_val = u32::try_from(inc.as_u64().ok_or_else(|| {
-								Error::ValidationError(
-									"increment value must be a number".to_string(),
-								)
-							})?)
-							.map_err(|_| {
-								Error::ValidationError(
-									"increment value out of u32 range".to_string(),
-								)
-							})?;
-
-							let current =
-								action_data.as_ref().and_then(|d| d.comments).unwrap_or(0);
-							Value::from(current.saturating_add(inc_val))
-						}
-						UpdateValue::Decrement { decrement } => {
-							let dec = self.evaluator.evaluate(decrement, context)?;
-							let dec_val = u32::try_from(dec.as_u64().ok_or_else(|| {
-								Error::ValidationError(
-									"decrement value must be a number".to_string(),
-								)
-							})?)
-							.map_err(|_| {
-								Error::ValidationError(
-									"decrement value out of u32 range".to_string(),
-								)
-							})?;
-
-							let current =
-								action_data.as_ref().and_then(|d| d.comments).unwrap_or(0);
-							Value::from(current.saturating_sub(dec_val))
+						UpdateValue::Increment { .. } | UpdateValue::Decrement { .. } => {
+							return Err(Error::ValidationError(
+								"comments field is recomputed by the CMNT hook, increment/decrement not supported".to_string(),
+							));
 						}
 					};
 					update_opts.comments = if value.is_null() {
@@ -602,6 +573,27 @@ impl<'a> OperationExecutor<'a> {
 						Patch::Value(u32::try_from(v).map_err(|_| {
 							Error::ValidationError("comments value out of u32 range".to_string())
 						})?)
+					} else {
+						Patch::Undefined
+					};
+				}
+				"comments_ts" => {
+					// `comments_ts` is the last-comment timestamp (epoch seconds),
+					// not a count — accept a direct numeric/timestamp value or null.
+					let value = match update_value {
+						UpdateValue::Direct(expr) | UpdateValue::Set { set: expr } => {
+							self.evaluator.evaluate(expr, context)?
+						}
+						UpdateValue::Increment { .. } | UpdateValue::Decrement { .. } => {
+							return Err(Error::ValidationError(
+								"comments_ts field is a timestamp (epoch seconds), increment/decrement not supported".to_string(),
+							));
+						}
+					};
+					update_opts.comments_ts = if value.is_null() {
+						Patch::Null
+					} else if let Some(v) = value.as_i64() {
+						Patch::Value(Timestamp(v))
 					} else {
 						Patch::Undefined
 					};

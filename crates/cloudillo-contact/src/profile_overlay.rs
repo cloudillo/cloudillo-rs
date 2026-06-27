@@ -132,6 +132,9 @@ mod tests {
 			connected: ProfileConnectionStatus::Connected,
 			roles: None,
 			trust: None,
+			feed_read_at: None,
+			msg_read_at: None,
+			hidden_in_home: None,
 		}
 	}
 

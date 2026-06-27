@@ -408,6 +408,7 @@ pub(crate) async fn send_welcome_email(
 			custom_key: Some(format!("welcome:{}", params.tn_id.0)),
 			from_name_override: params.from_name_override,
 			delay_seconds: params.delay_seconds,
+			notify_guard: None,
 		},
 	)
 	.await?;

@@ -53,7 +53,6 @@ fn init_protected_routes(app: App) -> Router<App> {
 
 	// Action write routes (check_perm_action("write"))
 	let action_router_write = Router::new()
-		.route("/api/actions/{action_id}/stat", post(action::handler::post_action_stat))
 		.route("/api/actions/{action_id}", delete(action::handler::delete_action))
 		.route("/api/actions/{action_id}", patch(action::handler::patch_action))
 		.route("/api/actions/{action_id}/publish", post(action::handler::publish_draft))
@@ -210,6 +209,12 @@ fn init_protected_routes(app: App) -> Router<App> {
 		// handler checks the caller already tracks {id_tag} before refreshing
 		// (mirrors the /api/files/{file_id}/refresh precedent).
 		.route("/api/profiles/{id_tag}/refresh", post(profile::update::post_profile_refresh))
+
+		// --- Read Markers (auth-only, reader's own node, forward-only) ---
+		.route("/api/read-marker", put(action::handler::put_read_marker))
+
+		// --- Thread Subscription Level (auth-only, reader's own cached row) ---
+		.route("/api/actions/{action_id}/subscribe", put(action::handler::put_action_subscribe))
 
 		// --- Action API (Create + Write) ---
 		.merge(action_router_create)

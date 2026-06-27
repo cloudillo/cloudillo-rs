@@ -67,6 +67,26 @@ async fn test_list_actions_with_issuer_filter() {
 }
 
 #[tokio::test]
+async fn test_list_actions_exclude_own_issuer() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+
+	// Create test tenant
+	adapter.create_tenant(tn_id, "test_user").await.ok();
+
+	// excludeOwnIssuer drops rows whose issuer == the viewer (authenticated request).
+	let opts = ListActionOptions {
+		exclude_own_issuer: Some(true),
+		viewer_id_tag: Some("test_user".into()),
+		..Default::default()
+	};
+
+	let result = adapter.list_actions(tn_id, &opts).await;
+
+	assert!(result.is_ok(), "Should list actions excluding own issuer");
+}
+
+#[tokio::test]
 async fn test_list_actions_with_type_filter() {
 	let (adapter, _temp) = create_test_adapter().await;
 	let tn_id = TnId(1);

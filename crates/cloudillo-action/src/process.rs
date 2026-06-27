@@ -1073,6 +1073,197 @@ async fn forward_inbound_action_to_websocket(
 		// Send push notification for offline user
 		send_push_notification(app, tn_id, action_id, action, &action_type, subtype.as_deref())
 			.await;
+		// Offline email notification (presence-suppressed + throttled in the
+		// helper). The recipient is always this node's own tenant, derived inside
+		// the helper.
+		deliver_notification_email(
+			app,
+			tn_id,
+			action_id,
+			&action_type,
+			subtype.as_deref(),
+			&action.iss,
+			action.c.as_ref(),
+		)
+		.await;
+	}
+}
+
+/// Schedule a deferred offline email notification for an action. Types whose
+/// per-type `notify.email.<type>` toggle is off are skipped. Rather than deciding
+/// at arrival whether the recipient "saw" the message, the email is *deferred* by
+/// a short grace window (`email.presence_suppress_minutes`) and the presence
+/// check is re-run at fire time inside `EmailSenderTask::run`: if the recipient
+/// has been present at/after the action's arrival instant by then, they had the
+/// live in-app notification and the email is suppressed; otherwise it sends.
+/// `NotifyGuard.present_since` is set to *now* here (the synchronous inbound
+/// forward path runs at node arrival time), so a federated action created long
+/// before it arrived is not wrongly suppressed for a user who was online before
+/// arrival but offline at fire time. Notifications are never silently dropped —
+/// either the recipient demonstrably caught up, or the email fires.
+///
+/// For offline recipients a grouped throttle then applies: the notifiable types
+/// bucket into three urgency groups (`direct` / `engagement` / `social`), each
+/// throttled independently via its own `tenants.notify_email_<group>_at`
+/// watermark. An event sends iff the group has never emailed, or the user has
+/// been active since the last email (a fresh absence), or the
+/// `email.throttle_hours` cooldown has elapsed. Both the throttle *check* and the
+/// watermark *stamp* happen at fire time in `EmailSenderTask::run` (not here at
+/// schedule time), so a grace-window burst of same-group actions yields one email
+/// per group rather than one per action, and a deferred-then-suppressed email
+/// never blocks a later genuine one. This yields one email per group at the start
+/// of each absence, plus at most one more per window if the user stays away.
+///
+/// This is a primitive-parameter helper shared by the two *inbound* forward
+/// paths (`forward_inbound_action_to_websocket` and the guarded
+/// `post_store::forward_to_websocket` branch). The recipient is always this
+/// node's own tenant — the helper derives it from the tenant row it loads for
+/// presence/throttle, so callers pass only `tn_id`. Notifying a *different*
+/// tenant is forbidden; that tenant is emailed by its own node's inbound path.
+/// `issuer` is the token issuer (the action author).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn deliver_notification_email(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	action_type: &str,
+	subtype: Option<&str>,
+	issuer: &str,
+	content: Option<&serde_json::Value>,
+) {
+	use crate::forward::{get_email_setting_key, is_email_notifiable};
+
+	// Admit every type with a per-type setting key; skip DEL/unknown.
+	if !is_email_notifiable(action_type, subtype) {
+		return;
+	}
+
+	// Master switch + per-type toggle. Both are keyed on `tn_id` only, so they run
+	// before the meta `read_tenant` and the email-address resolution: on the common
+	// disabled path (email notifications default off) this avoids both a meta DB
+	// read and an auth-adapter round-trip on every offline inbound action.
+	if !app.settings.get_bool(tn_id, "notify.email").await.unwrap_or(false) {
+		return;
+	}
+	if !app
+		.settings
+		.get_bool(tn_id, get_email_setting_key(action_type))
+		.await
+		.unwrap_or(false)
+	{
+		return; // type disabled
+	}
+
+	// Thread mute: if the recipient has muted this thread (sub_level='M' on the
+	// cached root action), suppress engagement emails. Best-effort — on a missing
+	// row or read error, fall through and notify.
+	if matches!(action_type, "CMNT" | "REACT")
+		&& let Ok(Some(av)) = app.meta_adapter.get_action(tn_id, action_id).await
+	{
+		let root_id = av.root_id.as_deref().unwrap_or(action_id);
+		if let Ok(Some(root)) = app.meta_adapter.get_action(tn_id, root_id).await
+			&& root.sub_level.as_deref() == Some("M")
+		{
+			return;
+		}
+	}
+
+	// The recipient is always this node's own tenant. The tenant row also carries
+	// the presence (`last_seen_at`) and throttle watermarks used below, so we load
+	// it once here and derive the recipient id_tag from it.
+	let tenant = match app.meta_adapter.read_tenant(tn_id).await {
+		Ok(t) => t,
+		Err(e) => {
+			warn!(tn_id = tn_id.0, error = %e, "notification email: failed to read tenant");
+			return;
+		}
+	};
+	let recipient_id_tag: &str = tenant.id_tag.as_ref();
+
+	// Never notify someone about their own action (e.g. a self-audience POST
+	// published while offline).
+	if recipient_id_tag == issuer {
+		return;
+	}
+
+	// Recipient email address (from the auth adapter).
+	let profile = match app.auth_adapter.read_tenant(recipient_id_tag).await {
+		Ok(profile) => profile,
+		Err(e) => {
+			warn!(recipient = recipient_id_tag, error = %e, "notification email: failed to read auth tenant");
+			return;
+		}
+	};
+	let Some(to) = profile.email else {
+		debug!(recipient = recipient_id_tag, "notification email: recipient has no email address");
+		return;
+	};
+	let to = to.to_string();
+
+	// Defer-and-recheck instead of drop. We no longer decide at arrival whether
+	// the recipient "saw" the message. We always defer the email by the full grace
+	// window from now and let the email task re-check presence at fire time (see
+	// EmailSenderTask::run): if the recipient comes online and catches up on the
+	// in-app notification within the window, the email is suppressed; if they stay
+	// absent for the whole window, it sends.
+	let suppress_minutes = app
+		.settings
+		.get_int(tn_id, "email.presence_suppress_minutes")
+		.await
+		.unwrap_or(1);
+	let delay_seconds = suppress_minutes * 60;
+
+	// Resolve the throttle group only to carry it into `NotifyGuard`. The throttle
+	// decision itself is evaluated at fire time in `EmailSenderTask::run`, where
+	// the watermark is also stamped, so a grace-window burst of same-group actions
+	// yields one email rather than one per action.
+	let group = crate::forward::email_throttle_group(action_type);
+
+	let snippet = helpers::content_snippet(content);
+	// A notification is about activity in the recipient's own space, so it is
+	// branded with the recipient's id_tag (subject prefix + sender name), not the
+	// node's base tenant.
+	//
+	// The `link` (CTA) var is intentionally NOT set here: it requires an
+	// auth-adapter TLS-cert read and is injected at fire time by
+	// `EmailSenderTask::run`, so emails suppressed by the presence/throttle gates
+	// never pay for that read.
+	let vars = serde_json::json!({
+		"idTag": recipient_id_tag,
+		"actionType": action_type,
+		"actionLabel": crate::forward::notify_action_label(action_type),
+		"byIdTag": issuer,
+		"snippet": snippet,
+	});
+
+	// Build the fire-time guard. The throttle watermark is stamped on actual send
+	// (inside EmailSenderTask::run), not here at schedule time — a deferred email
+	// that gets suppressed at fire time must not block a later genuine
+	// notification.
+	let params = cloudillo_email::EmailTaskParams {
+		to,
+		subject: None, // from template frontmatter
+		template_name: "notification".to_string(),
+		template_vars: vars,
+		lang: None,
+		custom_key: Some(format!("email:notify:{}:{}", tn_id.0, action_id)),
+		from_name_override: Some(format!("Cloudillo | {}", recipient_id_tag.to_uppercase())),
+		delay_seconds: Some(delay_seconds),
+		notify_guard: Some(cloudillo_email::NotifyGuard {
+			recipient_id_tag: recipient_id_tag.to_string(),
+			present_since: cloudillo_types::types::Timestamp::now(),
+			throttle_group: group.map(str::to_string),
+		}),
+	};
+	if let Err(e) = cloudillo_email::EmailModule::schedule_email_task_with_key(
+		&app.scheduler,
+		&app.settings,
+		tn_id,
+		params,
+	)
+	.await
+	{
+		warn!(action_id = %action_id, error = %e, "Failed to schedule notification email");
 	}
 }
 

@@ -117,6 +117,9 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Per-type email toggles (boolean on/off). When the user is offline, the
+	// grouped offline-throttle decides whether an enabled type actually emails —
+	// see `email_throttle_group` / `deliver_notification_email`.
 	registry.register(
 		SettingDefinition::builder("notify.email.message")
 			.description("Email on direct messages")
@@ -174,6 +177,10 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 	registry.register(
 		SettingDefinition::builder("notify.email.mention")
 			.description("Email when you are mentioned in a post")
+			// NOTE: `mention` is not yet wired into the offline-email path —
+			// `deliver_notification_email` only handles the types in `notify_type` /
+			// `is_email_notifiable` (crates/cloudillo-action/src/forward.rs), so this
+			// toggle is currently inert.
 			.default(SettingValue::Bool(true))
 			.scope(SettingScope::Tenant)
 			.permission(PermissionLevel::User)

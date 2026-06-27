@@ -33,6 +33,20 @@ pub struct ProfileWithStatus {
 	pub following: Option<bool>,
 	pub follower: Option<bool>,
 	pub trust: Option<ProfileTrust>,
+	/// Reader's feed read-watermark for this context (seeds `useReadMarker`).
+	/// ISO 8601 string (round-trips with `PUT /api/read-marker`'s `position`).
+	#[serde(
+		serialize_with = "cloudillo_types::types::serialize_timestamp_iso_opt",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub feed_read_at: Option<Timestamp>,
+	/// Reader's DM read-watermark for this peer (seeds `useReadMarker`).
+	/// ISO 8601 string (round-trips with `PUT /api/read-marker`'s `position`).
+	#[serde(
+		serialize_with = "cloudillo_types::types::serialize_timestamp_iso_opt",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub msg_read_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +161,7 @@ pub async fn list_profiles(
 		q: params.search.as_ref().map(|s| s.to_lowercase()),
 		id_tag: params.id_tag,
 		trust_set: params.trust_set,
+		hidden_in_home: None,
 	};
 
 	// Fetch profiles with optional search
@@ -173,6 +188,10 @@ pub async fn list_profiles(
 			trust: p.trust,
 			roles: p.roles.map(|r| r.iter().map(ToString::to_string).collect()),
 			created_at: None, // Not available in Profile type
+			feed_read_at: p.feed_read_at,
+			msg_read_at: p.msg_read_at,
+			// NULL/0 in the column both mean "shown" → only surface a positive flag.
+			hidden_in_home: p.hidden_in_home.filter(|&h| h),
 			x: None,
 		})
 		.collect();
@@ -210,6 +229,8 @@ pub async fn get_profile_by_id_tag(
 				following: Some(p.following),
 				follower: Some(p.follower),
 				trust: p.trust,
+				feed_read_at: p.feed_read_at,
+				msg_read_at: p.msg_read_at,
 			})
 		}
 		Err(Error::NotFound) => None, // Return empty when not found locally

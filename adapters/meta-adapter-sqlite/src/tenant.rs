@@ -18,7 +18,7 @@ use cloudillo_types::prelude::*;
 /// Read a single tenant by ID
 pub(crate) async fn read(dbr: &SqlitePool, tn_id: TnId) -> ClResult<Tenant<Box<str>>> {
 	let res = sqlx::query(
-		"SELECT tn_id, id_tag, name, type, profile_pic, cover_pic, created_at, x FROM tenants WHERE tn_id = ?1"
+		"SELECT tn_id, id_tag, name, type, profile_pic, cover_pic, created_at, last_seen_at, notify_email_direct_at, notify_email_engagement_at, notify_email_social_at, x FROM tenants WHERE tn_id = ?1"
 	).bind(tn_id.0).fetch_one(dbr).await;
 
 	match res {
@@ -45,6 +45,22 @@ pub(crate) async fn read(dbr: &SqlitePool, tn_id: TnId) -> ClResult<Tenant<Box<s
 				profile_pic: row.try_get("profile_pic").or(Err(Error::DbError))?,
 				cover_pic: row.try_get("cover_pic").or(Err(Error::DbError))?,
 				created_at: row.try_get("created_at").map(Timestamp).or(Err(Error::DbError))?,
+				last_seen_at: row
+					.try_get::<Option<i64>, _>("last_seen_at")
+					.or(Err(Error::DbError))?
+					.map(Timestamp),
+				notify_email_direct_at: row
+					.try_get::<Option<i64>, _>("notify_email_direct_at")
+					.or(Err(Error::DbError))?
+					.map(Timestamp),
+				notify_email_engagement_at: row
+					.try_get::<Option<i64>, _>("notify_email_engagement_at")
+					.or(Err(Error::DbError))?
+					.map(Timestamp),
+				notify_email_social_at: row
+					.try_get::<Option<i64>, _>("notify_email_social_at")
+					.or(Err(Error::DbError))?
+					.map(Timestamp),
 				x,
 			})
 		}
@@ -108,6 +124,28 @@ pub(crate) async fn update(
 	has_updates =
 		push_patch!(query, has_updates, "profile_pic", &tenant.profile_pic, |v| v.as_str());
 	has_updates = push_patch!(query, has_updates, "cover_pic", &tenant.cover_pic, |v| v.as_str());
+	has_updates = push_patch!(query, has_updates, "last_seen_at", &tenant.last_seen_at, |v| v.0);
+	has_updates = push_patch!(
+		query,
+		has_updates,
+		"notify_email_direct_at",
+		&tenant.notify_email_direct_at,
+		|v| v.0
+	);
+	has_updates = push_patch!(
+		query,
+		has_updates,
+		"notify_email_engagement_at",
+		&tenant.notify_email_engagement_at,
+		|v| v.0
+	);
+	has_updates = push_patch!(
+		query,
+		has_updates,
+		"notify_email_social_at",
+		&tenant.notify_email_social_at,
+		|v| v.0
+	);
 
 	// Handle x field merge atomically using SQLite json_patch (RFC 7396)
 	if let Some(x_patch) = &tenant.x {

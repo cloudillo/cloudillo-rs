@@ -5,8 +5,9 @@
 //!
 //! On receive this hook does two things:
 //!
-//! 1. Applies the broadcasted `content.r` (reactions) and `content.c`
-//!    (comments) counters to the subject's local `actions_data` row
+//! 1. Applies the broadcasted `content.r` (reactions string), `content.c`
+//!    (comment count), and `content.ct` (last-comment timestamp) to the
+//!    subject's local `actions_data` row
 //!    when the STAT comes from the subject's authoritative owner and
 //!    we don't own the subject ourselves (the
 //!    [`crate::native_hooks::ownership`] counter-update exclusivity
@@ -83,15 +84,22 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					);
 				} else {
 					let r_str = content_val.get("r").and_then(|v| v.as_str());
-					let c_int = content_val.get("c").and_then(serde_json::Value::as_u64);
+					// `c` is the total comment count; `ct` the last-comment timestamp.
+					let c_count = content_val.get("c").and_then(serde_json::Value::as_u64);
+					let ct_ts = content_val.get("ct").and_then(serde_json::Value::as_i64);
 					let rp_int = content_val.get("rp").and_then(serde_json::Value::as_u64);
 
 					let reactions_patch = match r_str {
 						Some(s) => Patch::Value(s.to_string()),
 						None => Patch::Undefined,
 					};
-					let comments_patch = match c_int {
+					let comments_patch = match c_count {
 						Some(n) => Patch::Value(u32::try_from(n).unwrap_or(u32::MAX)),
+						None => Patch::Undefined,
+					};
+					let comments_ts_patch = match ct_ts {
+						Some(t) if t > 0 => Patch::Value(Timestamp(t)),
+						Some(_) => Patch::Null,
 						None => Patch::Undefined,
 					};
 					let reposts_patch = match rp_int {
@@ -101,11 +109,13 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 					if !reactions_patch.is_undefined()
 						|| !comments_patch.is_undefined()
+						|| !comments_ts_patch.is_undefined()
 						|| !reposts_patch.is_undefined()
 					{
 						let update_opts = UpdateActionDataOptions {
 							reactions: reactions_patch,
 							comments: comments_patch,
+							comments_ts: comments_ts_patch,
 							reposts: reposts_patch,
 							stat_at: Patch::Value(Timestamp(incoming_created_at)),
 							..Default::default()

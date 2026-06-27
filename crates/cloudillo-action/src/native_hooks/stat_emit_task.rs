@@ -14,8 +14,8 @@
 //! meta adapter and mints a STAT action via `task::create_action`.
 //!
 //! Zero-broadcast guarantee: the task always emits when it fires, and
-//! always includes both `r` and `c` in `content` — even when both are
-//! empty/zero. Remote receivers need the explicit zeroing signal to
+//! always includes `r`, `c`, `ct`, and `rp` in `content` — even when they
+//! are empty/zero. Remote receivers need the explicit zeroing signal to
 //! decrement their mirrored counters after the last REACT or CMNT on a
 //! subject is deleted; if the fields were omitted, receivers would
 //! retain their previous non-zero counts indefinitely.
@@ -75,12 +75,12 @@ impl Task<App> for StatEmitTask {
 		// Read freshest counters.
 		let reactions =
 			crate::native_hooks::react::count_reactions(app, self.tn_id, &self.subject_id).await?;
-		let comments = app
-			.meta_adapter
-			.get_action_data(self.tn_id, &self.subject_id)
-			.await?
-			.and_then(|d| d.comments)
-			.unwrap_or(0);
+		// Comment stats: `comments` is the total count (STAT `c`) and `comments_ts`
+		// the last-comment timestamp (STAT `ct`) so mirror nodes (no comment rows)
+		// show the count and compute the unread dot identically.
+		let comment_data = app.meta_adapter.get_action_data(self.tn_id, &self.subject_id).await?;
+		let comment_count = comment_data.as_ref().and_then(|d| d.comments).unwrap_or(0);
+		let comments_ts = comment_data.as_ref().and_then(|d| d.comments_ts).map_or(0, |t| t.0);
 		// Repost count: active REPOSTs (excluding DEL markers) whose subject is
 		// this action. The authoritative owner also persists this to the
 		// denormalized `actions.reposts` column (see repost.rs); here it is
@@ -88,14 +88,15 @@ impl Task<App> for StatEmitTask {
 		// reposters' embedded cards stay live.
 		let reposts = count_reposts(app, self.tn_id, &self.subject_id).await?;
 
-		// Always emit `r`, `c`, and `rp`, including empty/zero values:
+		// Always emit `r`, `c`, `ct`, and `rp`, including empty/zero values:
 		// receivers need an explicit zeroing signal to decrement their
 		// mirrored counts. Omitting a field would mean "no change", so
 		// remote counters would never return to zero after the last
 		// REACT/CMNT/REPOST was deleted.
 		let mut content = serde_json::Map::new();
 		content.insert("r".into(), serde_json::Value::String(reactions.clone()));
-		content.insert("c".into(), serde_json::Value::from(comments));
+		content.insert("c".into(), serde_json::Value::from(comment_count));
+		content.insert("ct".into(), serde_json::Value::from(comments_ts));
 		content.insert("rp".into(), serde_json::Value::from(reposts));
 
 		let create = CreateAction {
@@ -129,13 +130,10 @@ impl Task<App> for StatEmitTask {
 		// manual federation flow documented in the M2 verification step.
 		let post_reactions =
 			crate::native_hooks::react::count_reactions(app, self.tn_id, &self.subject_id).await?;
-		let post_comments = app
-			.meta_adapter
-			.get_action_data(self.tn_id, &self.subject_id)
-			.await?
-			.and_then(|d| d.comments)
-			.unwrap_or(0);
-		if post_reactions != reactions || post_comments != comments {
+		let post_comment_data =
+			app.meta_adapter.get_action_data(self.tn_id, &self.subject_id).await?;
+		let post_comment_count = post_comment_data.as_ref().and_then(|d| d.comments).unwrap_or(0);
+		if post_reactions != reactions || post_comment_count != comment_count {
 			crate::native_hooks::stat_emit::emit_stat_for_subject(
 				app,
 				self.tn_id,

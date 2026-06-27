@@ -6,7 +6,51 @@
 //! This module handles creating tables, indexes, and running migrations
 //! to ensure the database schema is up to date.
 
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+
+/// Add a column only if it is not already present. SQLite has no
+/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`; a plain ALTER errors with
+/// "duplicate column name" when the column exists. Migrations normally run only
+/// on older DBs that lack the column, but a replay over a current base schema
+/// (e.g. a migration test that rolls db_version back) would otherwise fail.
+async fn add_column_if_missing(
+	tx: &mut Transaction<'_, Sqlite>,
+	table: &str,
+	column: &str,
+	decl: &str,
+) -> Result<(), sqlx::Error> {
+	// table/column/decl are internal constants (never user input), so the
+	// dynamic SQL is safe — assert that for the sqlx injection lint.
+	let cols = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
+		.fetch_all(&mut **tx)
+		.await?;
+	let exists = cols.iter().any(|r| r.get::<String, _>("name") == column);
+	if !exists {
+		sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE {table} ADD COLUMN {column} {decl}")))
+			.execute(&mut **tx)
+			.await?;
+	}
+	Ok(())
+}
+
+async fn drop_column_if_exists(
+	tx: &mut Transaction<'_, Sqlite>,
+	table: &str,
+	column: &str,
+) -> Result<(), sqlx::Error> {
+	// table/column are internal constants (never user input), so the dynamic SQL
+	// is safe — assert that for the sqlx injection lint.
+	let cols = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
+		.fetch_all(&mut **tx)
+		.await?;
+	let exists = cols.iter().any(|r| r.get::<String, _>("name") == column);
+	if exists {
+		sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE {table} DROP COLUMN {column}")))
+			.execute(&mut **tx)
+			.await?;
+	}
+	Ok(())
+}
 
 /// Get the current database version from vars table
 async fn get_db_version(tx: &mut Transaction<'_, Sqlite>) -> i64 {
@@ -30,7 +74,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 35;
+	const CURRENT_DB_VERSION: i64 = 36;
 
 	let mut tx = db.begin().await?;
 
@@ -62,6 +106,10 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			profile_pic text,
 			cover_pic text,
 			x json,
+			last_seen_at INTEGER,			-- Presence: stamped when the tenant's last ws-bus connection closes
+			notify_email_direct_at INTEGER,			-- Offline-throttle watermark for the 'direct' group (MSG/CONN/FSHR)
+			notify_email_engagement_at INTEGER,		-- Offline-throttle watermark for the 'engagement' group (CMNT/REACT)
+			notify_email_social_at INTEGER,			-- Offline-throttle watermark for the 'social' group (FLLW/POST)
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id)
@@ -128,6 +176,9 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			trust char(1),					-- Per-profile trust preference: 'A' always, 'N' never, NULL ask
 			synced_at INTEGER,
 			etag text,
+			feed_read_at INTEGER,			-- Reader's feed read-watermark for this context
+			msg_read_at INTEGER,			-- Reader's DM read-watermark for this peer
+			hidden_in_home INTEGER,			-- Composition: NULL = community shown in home feed (default), 1 = hidden
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id, id_tag)
@@ -286,19 +337,28 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			expires_at INTEGER,
 			attachments text,
 			reactions text,
-			comments integer,
-			comments_read integer,
+			comments integer DEFAULT 0,	-- total comment count, federated as STAT `c`
+			comments_ts integer,		-- last-comment timestamp (epoch seconds), federated as STAT `ct`
+			comments_read_at integer,	-- reader's comment read-watermark (epoch seconds)
 			reposts integer,
 			stat_at INTEGER,				-- Highest created_at of any STAT applied to reactions/comments
 			visibility char(1) NOT NULL DEFAULT 'D',	-- D: Direct (owner only), P: Public, V: Verified,
 														-- 2: 2nd degree, F: Follower, C: Connected
 			flags text,						-- Action flags: R/r (reactions), C/c (comments), O/o (open)
+			sub_level char(1),				-- Reader's W/T/M thread subscription level (NULL=none)
 			x json,
 			-- Dual-purpose: for status R (draft) / S (scheduled), holds the
 			-- target publish instant (consumed by ActionCreatorTask + PATCH
 			-- /actions). For status A (active/finalized) and onward, holds
 			-- the actual creation time. See UpdateActionDataOptions::created_at.
 			created_at INTEGER DEFAULT (unixepoch()),
+			-- LOCAL ingestion time (epoch seconds), stamped at insert — NEVER the
+			-- federated payload's created_at. The home feed sorts/watermarks by
+			-- this so late-federated posts surface by arrival order. Migrated DBs
+			-- can't get this DEFAULT (SQLite rejects a non-constant default on
+			-- ALTER of a populated table), so create() stamps it explicitly via
+			-- unixepoch(); see migration 36.
+			received_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch())
 		)",
 	)
@@ -311,6 +371,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.await?;
 	sqlx::query(
 		"CREATE INDEX IF NOT EXISTS idx_actions_key ON actions(key, tn_id) WHERE key NOT NULL",
+	)
+	.execute(&mut *tx)
+	.await?;
+	// Backs thread comment listing + the `comments` (last-comment ts) recompute
+	// done by CMNT:DEL and the v36 migration.
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_actions_parent_created ON actions(tn_id, parent_id, created_at)",
 	)
 	.execute(&mut *tx)
 	.await?;
@@ -933,6 +1000,18 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query(
 			"CREATE INDEX IF NOT EXISTS idx_profiles_follower \
 			 ON profiles(tn_id, id_tag) WHERE follower = 1",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_actions_sub_level \
+			 ON actions(tn_id, sub_level) WHERE sub_level IS NOT NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+		// Backs the home feed's received_at ordering + keyset cursor (migration 36).
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_actions_received ON actions(tn_id, received_at, a_id)",
 		)
 		.execute(&mut *tx)
 		.await?;
@@ -1815,6 +1894,94 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 		set_db_version(&mut tx, 35).await;
+	}
+
+	if version < 36 {
+		// Unreleased "notifications, activity & content-availability" feature.
+		// Idempotent: safe to re-run on a dev DB rolled back to db_version 35.
+		// Comment stats split into: comments = live count (STAT `c`),
+		// comments_ts = last-comment timestamp (STAT `ct`), comments_read_at =
+		// reader watermark; legacy comments_read dropped.
+
+		// --- new columns (all idempotent) ---
+		add_column_if_missing(&mut tx, "profiles", "feed_read_at", "INTEGER").await?;
+		add_column_if_missing(&mut tx, "profiles", "msg_read_at", "INTEGER").await?;
+		add_column_if_missing(&mut tx, "profiles", "hidden_in_home", "INTEGER").await?;
+		add_column_if_missing(&mut tx, "actions", "sub_level", "CHAR(1)").await?;
+		add_column_if_missing(&mut tx, "actions", "comments_ts", "INTEGER").await?;
+		add_column_if_missing(&mut tx, "actions", "comments_read_at", "INTEGER").await?;
+		// No DEFAULT on the ALTER: SQLite rejects a non-constant default when adding
+		// a column to a populated table. The INSERT path stamps received_at instead.
+		add_column_if_missing(&mut tx, "actions", "received_at", "INTEGER").await?;
+		add_column_if_missing(&mut tx, "tenants", "last_seen_at", "INTEGER").await?;
+		add_column_if_missing(&mut tx, "tenants", "notify_email_direct_at", "INTEGER").await?;
+		add_column_if_missing(&mut tx, "tenants", "notify_email_engagement_at", "INTEGER").await?;
+		add_column_if_missing(&mut tx, "tenants", "notify_email_social_at", "INTEGER").await?;
+
+		// --- indexes (also present in the base schema for fresh DBs) ---
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_actions_sub_level \
+			 ON actions(tn_id, sub_level) WHERE sub_level IS NOT NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_actions_parent_created ON actions(tn_id, parent_id, created_at)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_actions_received ON actions(tn_id, received_at, a_id)",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		// --- backfills / recompute ---
+		// home feed sorts by local arrival; existing rows approximate with created_at.
+		sqlx::query("UPDATE actions SET received_at = created_at WHERE received_at IS NULL")
+			.execute(&mut *tx)
+			.await?;
+		// Seed the reader watermark for already-commented posts so they start "read"
+		// (no unread-dot storm). Must run BEFORE the recompute. The IS NULL guard
+		// makes a rolled-back re-run non-destructive to existing watermarks.
+		sqlx::query(
+			"UPDATE actions SET comments_read_at = unixepoch() \
+			 WHERE comments_read_at IS NULL AND comments IS NOT NULL AND comments > 0",
+		)
+		.execute(&mut *tx)
+		.await?;
+		// Recompute count + timestamp from the live child CMNT rows. The EXISTS
+		// predicate is robust regardless of what `comments` previously held (a stale
+		// timestamp from a buggy dev build, or a real count): only rows with child
+		// CMNTs are touched, and DEL/inactive children are excluded from both
+		// aggregates.
+		sqlx::query(
+			"UPDATE actions SET
+				comments = (
+					SELECT COUNT(*) FROM actions c
+					WHERE c.tn_id = actions.tn_id AND c.parent_id = actions.action_id
+						AND c.type = 'CMNT' AND coalesce(c.sub_type,'') != 'DEL'
+						AND coalesce(c.status,'A') = 'A'
+				),
+				comments_ts = (
+					SELECT MAX(c.created_at) FROM actions c
+					WHERE c.tn_id = actions.tn_id AND c.parent_id = actions.action_id
+						AND c.type = 'CMNT' AND coalesce(c.sub_type,'') != 'DEL'
+						AND coalesce(c.status,'A') = 'A'
+				)
+			WHERE EXISTS (
+				SELECT 1 FROM actions c
+				WHERE c.tn_id = actions.tn_id AND c.parent_id = actions.action_id
+					AND c.type = 'CMNT'
+			)",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		// Drop the obsolete legacy count column (reader-local, never federated).
+		drop_column_if_exists(&mut tx, "actions", "comments_read").await?;
+
+		set_db_version(&mut tx, 36).await;
 	}
 
 	tx.commit().await?;

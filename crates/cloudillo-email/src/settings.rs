@@ -22,6 +22,34 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Presence grace window. A notification email is *deferred* (not dropped) by
+	// this many minutes; presence is then re-checked at fire time. If the
+	// recipient has returned within the window — they had the live in-app
+	// notification — the email is suppressed; otherwise it sends.
+	registry.register(
+		SettingDefinition::builder("email.presence_suppress_minutes")
+			.description(
+				"Defer (not drop) a notification email by this many minutes; if the recipient \
+				 returns within the window the email is suppressed",
+			)
+			.default(SettingValue::Int(1))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
+	// Offline-throttle window. After the first offline notification email of a
+	// throttle group, further emails for that group are suppressed for this many
+	// hours (unless the user returns and leaves again).
+	registry.register(
+		SettingDefinition::builder("email.throttle_hours")
+			.description("Hours to suppress further offline email reminders per notification group")
+			.default(SettingValue::Int(24))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
 	// SMTP host
 	registry.register(
 		SettingDefinition::builder("email.smtp.host")

@@ -17,6 +17,7 @@ cloudillo-types = { workspace = true }
 cloudillo-file = { workspace = true }
 cloudillo-idp = { workspace = true }
 cloudillo-push = { workspace = true }
+cloudillo-email = { workspace = true }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2", "macros"] }
