@@ -23,6 +23,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 use crate::prelude::*;
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::auth_adapter::AuthAdapter;
+use cloudillo_types::validation::validate_id_tag;
 
 fn to_boxed<B>(body: B) -> BoxBody<Bytes, Error>
 where
@@ -88,6 +89,22 @@ impl Request {
 			.map_err(Error::from)
 	}
 
+	/// Reject an `id_tag` that is unsafe to interpolate into an outbound
+	/// federation URL (`https://cl-o.{id_tag}/api...`).
+	///
+	/// `id_tag` ultimately originates from attacker-controllable action-token
+	/// `iss`/`aud` fields, so without this guard a crafted value could inject a
+	/// path, query, fragment, userinfo or port into the request target (SSRF /
+	/// request smuggling). The shared [`validate_id_tag`] validator forbids `/`,
+	/// `@`, `:`, whitespace and uppercase, leaving only a bare DNS-style label.
+	fn check_id_tag(id_tag: &str) -> ClResult<()> {
+		if validate_id_tag(id_tag) {
+			Ok(())
+		} else {
+			Err(Error::ValidationError(format!("invalid id_tag for federation request: {id_tag}")))
+		}
+	}
+
 	/// Collect response body with timeout
 	async fn collect_body(body: hyper::body::Incoming) -> ClResult<Bytes> {
 		timeout(REQUEST_TIMEOUT, body.collect())
@@ -108,6 +125,7 @@ impl Request {
 		id_tag: &str,
 		subject: Option<&str>,
 	) -> ClResult<Box<str>> {
+		Self::check_id_tag(id_tag)?;
 		let auth_token = self
 			.auth_adapter
 			.create_action_token(
@@ -161,6 +179,7 @@ impl Request {
 		path: &str,
 		auth: bool,
 	) -> ClResult<Bytes> {
+		Self::check_id_tag(id_tag)?;
 		let mut attempt = 0u8;
 		loop {
 			let req = hyper::Request::builder()
@@ -209,6 +228,7 @@ impl Request {
 		path: &str,
 		auth: bool,
 	) -> ClResult<impl AsyncRead + Send + Unpin + use<>> {
+		Self::check_id_tag(id_tag)?;
 		let mut attempt = 0u8;
 		loop {
 			let req = hyper::Request::builder()
@@ -268,6 +288,7 @@ impl Request {
 	where
 		Res: DeserializeOwned,
 	{
+		Self::check_id_tag(id_tag)?;
 		let req = hyper::Request::builder()
 			.method(Method::GET)
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
@@ -298,6 +319,7 @@ impl Request {
 	where
 		Res: DeserializeOwned,
 	{
+		Self::check_id_tag(id_tag)?;
 		let mut builder = hyper::Request::builder()
 			.method(Method::GET)
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path));
@@ -336,6 +358,7 @@ impl Request {
 		Req: Serialize,
 		Res: DeserializeOwned,
 	{
+		Self::check_id_tag(id_tag)?;
 		let json_data = serde_json::to_vec(data)?;
 		let req = hyper::Request::builder()
 			.method(Method::POST)
@@ -370,6 +393,7 @@ impl Request {
 		path: &str,
 		data: Bytes,
 	) -> ClResult<Bytes> {
+		Self::check_id_tag(id_tag)?;
 		let req = hyper::Request::builder()
 			.method(Method::POST)
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
@@ -391,6 +415,7 @@ impl Request {
 	where
 		S: Stream<Item = Result<hyper::body::Frame<Bytes>, hyper::Error>> + Send + Sync + 'static,
 	{
+		Self::check_id_tag(id_tag)?;
 		let req = hyper::Request::builder()
 			.method(Method::POST)
 			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
@@ -430,6 +455,7 @@ impl Request {
 		path: &str,
 		data: Bytes,
 	) -> ClResult<Bytes> {
+		Self::check_id_tag(id_tag)?;
 		let mut attempt = 0u8;
 		loop {
 			let token = self.get_or_mint_proxy_token(tn_id, id_tag).await?;
@@ -483,6 +509,37 @@ impl Request {
 			.await?;
 		let parsed: Res = serde_json::from_slice(&res)?;
 		Ok(parsed)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn check_id_tag_accepts_valid() {
+		assert!(Request::check_id_tag("alice").is_ok());
+		assert!(Request::check_id_tag("home.w9.hu").is_ok());
+		assert!(Request::check_id_tag("user-name-123").is_ok());
+	}
+
+	#[test]
+	fn check_id_tag_rejects_url_injection() {
+		// Each of these would corrupt the `https://cl-o.{id_tag}/api...` target
+		// if it were allowed through.
+		for bad in [
+			"alice/../../etc",
+			"alice/admin",
+			"alice@evil.com",
+			"alice:8080",
+			"alice evil",
+			"alice?x=1",
+			"alice#frag",
+			"",
+		] {
+			let err = Request::check_id_tag(bad);
+			assert!(matches!(err, Err(Error::ValidationError(_))), "expected reject for {bad:?}");
+		}
 	}
 }
 

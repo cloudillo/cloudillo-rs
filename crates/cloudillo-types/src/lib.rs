@@ -24,6 +24,7 @@ pub mod reactions;
 pub mod rtdb_adapter;
 pub mod types;
 pub mod utils;
+pub mod validation;
 pub mod worker;
 
 // vim: ts=4

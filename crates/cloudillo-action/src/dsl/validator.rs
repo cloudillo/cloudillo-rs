@@ -39,12 +39,6 @@ static KEY_PATTERN_RE: LazyLock<Regex> = LazyLock::new(|| {
 		.unwrap_or_else(|e| unreachable!("KEY_PATTERN_RE regex compilation failed: {}", e))
 });
 
-/// Regex for idTag format
-static ID_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-	Regex::new(r"^[a-z0-9-][a-z0-9.-]{3,60}[a-z0-9-]$")
-		.unwrap_or_else(|e| unreachable!("ID_TAG_RE regex compilation failed: {}", e))
-});
-
 /// Regex for actionId format (SHA-256 hash)
 static ACTION_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
 	Regex::new(r"^[a-f0-9]{64}$")
@@ -262,10 +256,11 @@ fn validate_key_pattern(pattern: &str, errors: &mut Vec<ValidationError>) {
 	}
 }
 
-/// Validate idTag format
-pub fn validate_id_tag(id_tag: &str) -> bool {
-	ID_TAG_RE.is_match(id_tag)
-}
+/// Validate idTag format.
+///
+/// Re-exported from [`cloudillo_types::validation`] so the DSL and the
+/// low-level federation request client share a single definition.
+pub use cloudillo_types::validation::validate_id_tag;
 
 /// Validate actionId format (SHA-256 hash)
 pub fn validate_action_id(action_id: &str) -> bool {
