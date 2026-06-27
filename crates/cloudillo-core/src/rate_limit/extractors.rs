@@ -124,14 +124,31 @@ impl AddressKey {
 ///
 /// - Standalone mode: Use peer IP directly from ConnectInfo
 /// - Proxy/StreamProxy mode: Check forwarding headers first
+///
+/// # Security: forwarding-header trust model
+///
+/// Client-supplied forwarding headers (`X-Forwarded-For`, `X-Real-IP`,
+/// `Forwarded`) are **only** trusted in [`ServerMode::Proxy`] /
+/// [`ServerMode::StreamProxy`]. In the default [`ServerMode::Standalone`]
+/// deployment (direct-to-internet, see `server/src/main.rs`), they are ignored
+/// entirely and the kernel-reported peer IP is used, so a client cannot spoof
+/// its address to evade IP-based rate limiting or bans.
+///
+/// The Proxy modes trust these headers because the IP is taken from them. They
+/// are therefore **only safe behind a trusted reverse proxy that strips any
+/// client-supplied forwarding headers and sets its own** — otherwise a client
+/// could forge an arbitrary client IP. Do not enable a Proxy mode while exposed
+/// directly to the internet.
 pub fn extract_client_ip<B>(req: &Request<B>, mode: &ServerMode) -> Option<IpAddr> {
 	match mode {
 		ServerMode::Standalone => {
-			// Direct connection - use peer IP
+			// Direct connection - use peer IP. Forwarding headers are NOT
+			// consulted here, so they cannot be spoofed by the client.
 			req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0.ip())
 		}
 		ServerMode::Proxy | ServerMode::StreamProxy => {
-			// Behind reverse proxy - check headers first
+			// Behind reverse proxy - check headers first. Only safe when the
+			// proxy strips client-supplied forwarding headers (see fn docs).
 			extract_from_xff(req)
 				.or_else(|| extract_from_x_real_ip(req))
 				.or_else(|| extract_from_forwarded(req))
