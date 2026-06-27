@@ -72,6 +72,35 @@ pub mod presets {
 		FilePreset::default()
 	}
 
+	/// File preset - generic uploads from the Files app. Processes known media
+	/// (images/video/audio/PDF) into variants, and stores any other type as a Raw
+	/// BLOB so arbitrary binaries (zip, bin, etc.) can be uploaded.
+	pub fn file() -> FilePreset {
+		FilePreset {
+			name: "file".to_string(),
+			allowed_media_classes: vec![
+				VariantClass::Visual,
+				VariantClass::Video,
+				VariantClass::Audio,
+				VariantClass::Document,
+				VariantClass::Raw,
+			],
+			image_variants: vec![
+				"vis.tn".into(),
+				"vis.sd".into(),
+				"vis.md".into(),
+				"vis.hd".into(),
+			],
+			video_variants: vec!["vid.sd".into(), "vid.md".into(), "vid.hd".into()],
+			audio_variants: vec!["aud.md".into()],
+			extract_audio: false,
+			generate_thumbnail: true,
+			max_variant: Some("vid.hd".into()),
+			thumbnail_variant: Some("vis.tn".into()),
+			store_original: true,
+		}
+	}
+
 	/// Podcast preset - prioritizes audio extraction and quality
 	pub fn podcast() -> FilePreset {
 		FilePreset {
@@ -283,6 +312,7 @@ pub mod presets {
 	pub fn get(name: &str) -> Option<FilePreset> {
 		match name {
 			"default" => Some(default()),
+			"file" => Some(file()),
 			"podcast" => Some(podcast()),
 			"archive" => Some(archive()),
 			"high_quality" => Some(high_quality()),
@@ -301,6 +331,7 @@ pub mod presets {
 	pub fn list() -> Vec<&'static str> {
 		vec![
 			"default",
+			"file",
 			"podcast",
 			"archive",
 			"high_quality",
@@ -405,6 +436,15 @@ mod tests {
 		assert!(presets::get("default").is_some());
 		assert!(presets::get("podcast").is_some());
 		assert!(presets::get("nonexistent").is_none());
+	}
+
+	#[test]
+	fn test_file_preset() {
+		let preset = presets::file();
+		assert_eq!(preset.name, "file");
+		assert!(presets::get("file").is_some());
+		assert!(presets::get("file").unwrap().allowed_media_classes.contains(&VariantClass::Raw));
+		assert!(presets::list().contains(&"file"));
 	}
 
 	#[test]
