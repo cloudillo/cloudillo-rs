@@ -34,6 +34,24 @@ fn f32_to_u32(v: f32) -> u32 {
 	v.max(0.0) as u32
 }
 
+/// Maximum width/height (in pixels) accepted when decoding an uploaded image.
+///
+/// Guards against decompression bombs: a small, highly-compressed file can
+/// declare enormous dimensions and force the decoder to allocate gigabytes.
+const MAX_DECODE_DIM: u32 = 16_384;
+
+/// Maximum number of bytes the image decoder may allocate for a single image.
+const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Build the decode limits applied before every image decode / dimension read.
+fn decode_limits() -> image::Limits {
+	let mut limits = image::Limits::default();
+	limits.max_image_width = Some(MAX_DECODE_DIM);
+	limits.max_image_height = Some(MAX_DECODE_DIM);
+	limits.max_alloc = Some(MAX_DECODE_ALLOC);
+	limits
+}
+
 /// Result of image resizing: encoded bytes and actual dimensions
 pub struct ResizeResult {
 	pub bytes: Box<[u8]>,
@@ -84,9 +102,9 @@ fn resize_image_sync<'a>(
 	resize: (u32, u32),
 ) -> Result<ResizeResult, image::error::ImageError> {
 	let now = std::time::Instant::now();
-	let original = ImageReader::new(Cursor::new(&orig_buf.as_ref()))
-		.with_guessed_format()?
-		.decode()?;
+	let mut reader = ImageReader::new(Cursor::new(orig_buf.as_ref())).with_guessed_format()?;
+	reader.limits(decode_limits());
+	let original = reader.decode()?;
 	debug!("decoded [{:.2}ms]", now.elapsed().as_millis());
 
 	let now = std::time::Instant::now();
@@ -146,7 +164,9 @@ pub async fn resize_image(
 
 pub async fn get_image_dimensions(buf: &[u8]) -> Result<(u32, u32), image::error::ImageError> {
 	let now = std::time::Instant::now();
-	let dim = ImageReader::new(Cursor::new(&buf)).with_guessed_format()?.into_dimensions()?;
+	let mut reader = ImageReader::new(Cursor::new(&buf)).with_guessed_format()?;
+	reader.limits(decode_limits());
+	let dim = reader.into_dimensions()?;
 	debug!("dimensions read in [{:.2}ms]", now.elapsed().as_millis());
 	Ok(dim)
 }
