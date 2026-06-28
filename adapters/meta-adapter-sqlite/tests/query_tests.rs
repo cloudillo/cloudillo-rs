@@ -303,3 +303,164 @@ async fn test_list_stale_profiles_excludes_suspended() {
 	assert!(id_tags.iter().any(|t| t == "alice"), "active stale profile must be returned");
 	assert!(!id_tags.iter().any(|t| t == "bob"), "suspended profile must be excluded");
 }
+
+async fn make_image(
+	adapter: &MetaAdapterSqlite,
+	tn_id: TnId,
+	file_id: &str,
+	name: &str,
+	parent: Option<&str>,
+) {
+	let opts = CreateFile {
+		file_id: Some(file_id.into()),
+		parent_id: parent.map(Into::into),
+		content_type: "image/png".into(),
+		file_name: name.into(),
+		file_tp: Some("BLOB".into()),
+		..Default::default()
+	};
+	adapter.create_file(tn_id, opts).await.expect("create image");
+}
+
+#[tokio::test]
+async fn test_list_files_content_type_filter_with_include_folders() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "test_user").await.ok();
+
+	make_folder(&adapter, tn_id, "fld_imgs", "Photos", None).await;
+	make_image(&adapter, tn_id, "f_img", "pic.png", None).await;
+	make_file(&adapter, tn_id, "f_txt", "notes.txt", None).await;
+
+	// content_type=image/* without include_folders: only the image (folders excluded)
+	let opts = ListFileOptions { content_type: Some(vec!["image/*".into()]), ..Default::default() };
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	assert!(ids.iter().any(|n| n == "f_img"), "image must be present");
+	assert!(!ids.iter().any(|n| n == "f_txt"), "text file must be filtered out");
+	assert!(!ids.iter().any(|n| n == "fld_imgs"), "folder excluded without include_folders");
+
+	// content_type=image/* with include_folders: image + folder, still no text file
+	let opts = ListFileOptions {
+		content_type: Some(vec!["image/*".into()]),
+		include_folders: true,
+		..Default::default()
+	};
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	assert!(ids.iter().any(|n| n == "f_img"), "image must be present");
+	assert!(ids.iter().any(|n| n == "fld_imgs"), "folder must pass via include_folders");
+	assert!(!ids.iter().any(|n| n == "f_txt"), "text file must stay filtered out");
+}
+
+#[tokio::test]
+async fn test_list_files_file_type_filter_with_include_folders() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "test_user").await.ok();
+
+	make_folder(&adapter, tn_id, "fld_docs", "Docs", None).await;
+	make_image(&adapter, tn_id, "f_pic", "pic.png", None).await;
+
+	// fileTp=BLOB with include_folders: the BLOB image and the folder, even though
+	// a folder is file_tp='FLDR', not 'BLOB'.
+	let opts = ListFileOptions {
+		file_type: Some(vec!["BLOB".into()]),
+		include_folders: true,
+		..Default::default()
+	};
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	assert!(ids.iter().any(|n| n == "f_pic"), "BLOB file must be present");
+	assert!(ids.iter().any(|n| n == "fld_docs"), "folder must pass via include_folders");
+
+	// Without include_folders the folder is excluded.
+	let opts = ListFileOptions { file_type: Some(vec!["BLOB".into()]), ..Default::default() };
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	assert!(ids.iter().any(|n| n == "f_pic"), "BLOB file must be present");
+	assert!(!ids.iter().any(|n| n == "fld_docs"), "folder excluded without include_folders");
+}
+
+#[tokio::test]
+async fn test_list_files_empty_filter_vectors_apply_no_constraint() {
+	// An empty filter vector must behave as "no constraint" rather than emitting
+	// broken SQL (e.g. `IN ()` or a dangling `AND ()`). Not reachable from HTTP
+	// today (deserialize_split returns None for empties), but a direct Rust caller
+	// could hand the adapter Some(vec![]).
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "test_user").await.ok();
+
+	make_folder(&adapter, tn_id, "fld_e", "Empties", None).await;
+	make_file(&adapter, tn_id, "f_e", "data.txt", None).await;
+
+	// Empty file_type + content_type, without include_folders.
+	let opts = ListFileOptions {
+		file_type: Some(vec![]),
+		content_type: Some(vec![]),
+		..Default::default()
+	};
+	let result = adapter.list_files(tn_id, &opts).await.expect("empty filters: list ok");
+	assert!(!result.is_empty(), "empty filters must not exclude everything");
+
+	// Same with include_folders: true (the branch that emitted a leading `OR`).
+	let opts = ListFileOptions {
+		file_type: Some(vec![]),
+		content_type: Some(vec![]),
+		include_folders: true,
+		..Default::default()
+	};
+	adapter
+		.list_files(tn_id, &opts)
+		.await
+		.expect("empty filters with include_folders: list ok");
+}
+
+#[tokio::test]
+async fn test_list_files_local_only_excludes_remote() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "team-alice").await.ok();
+
+	// Local file created by a community member: owner_tag is NULL, creator_tag
+	// is the member (NOT the tenant). This is the case the picker must include.
+	let local = CreateFile {
+		file_id: Some("f_local".into()),
+		content_type: "image/png".into(),
+		file_name: "local.png".into(),
+		file_tp: Some("BLOB".into()),
+		creator_tag: Some("alice.home.w9.hu".into()),
+		..Default::default()
+	};
+	adapter.create_file(tn_id, local).await.expect("create local");
+
+	// Remote/federated cached copy: owner_tag set to the origin node.
+	let remote = CreateFile {
+		file_id: Some("f_remote".into()),
+		content_type: "image/png".into(),
+		file_name: "remote.png".into(),
+		file_tp: Some("BLOB".into()),
+		owner_tag: Some("bob.example.com".into()),
+		..Default::default()
+	};
+	adapter.create_file(tn_id, remote).await.expect("create remote");
+
+	// Without local_only: both rows visible.
+	let opts = ListFileOptions { content_type: Some(vec!["image/*".into()]), ..Default::default() };
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	assert!(ids.iter().any(|n| n == "f_local"));
+	assert!(ids.iter().any(|n| n == "f_remote"));
+
+	// With local_only: the member-created local file remains, remote excluded.
+	let opts = ListFileOptions {
+		content_type: Some(vec!["image/*".into()]),
+		local_only: true,
+		..Default::default()
+	};
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	assert!(ids.iter().any(|n| n == "f_local"), "member-created local file must remain");
+	assert!(!ids.iter().any(|n| n == "f_remote"), "remote cached file must be excluded");
+}

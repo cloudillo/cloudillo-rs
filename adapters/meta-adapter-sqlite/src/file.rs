@@ -254,31 +254,38 @@ pub(crate) async fn list(
 		query.push(" AND f.preset=").push_bind(preset.as_str());
 	}
 
-	if let Some(file_types) = &opts.file_type {
+	if let Some(file_types) = &opts.file_type
+		&& !file_types.is_empty()
+	{
+		query.push(" AND (");
 		if file_types.len() == 1 {
-			query.push(" AND f.file_tp=").push_bind(file_types[0].as_str());
+			query.push("f.file_tp=").push_bind(file_types[0].as_str());
 		} else {
-			query.push(" AND f.file_tp IN ");
+			query.push("f.file_tp IN ");
 			query = crate::utils::push_in(query, file_types.as_slice());
 		}
+		if opts.include_folders {
+			query.push(" OR f.file_tp='FLDR'");
+		}
+		query.push(")");
 	}
 
 	// Filter by content type (MIME type pattern, e.g., "image/*" or "image/*,video/*")
-	if let Some(content_types) = &opts.content_type {
-		if content_types.len() == 1 {
-			let pattern = crate::utils::escape_like(&content_types[0]).replace('*', "%");
-			query.push(" AND f.content_type LIKE ").push_bind(pattern).push(" ESCAPE '\\'");
-		} else {
-			query.push(" AND (");
-			for (i, ct) in content_types.iter().enumerate() {
-				if i > 0 {
-					query.push(" OR ");
-				}
-				let pattern = crate::utils::escape_like(ct).replace('*', "%");
-				query.push("f.content_type LIKE ").push_bind(pattern).push(" ESCAPE '\\'");
+	if let Some(content_types) = &opts.content_type
+		&& !content_types.is_empty()
+	{
+		query.push(" AND (");
+		for (i, ct) in content_types.iter().enumerate() {
+			if i > 0 {
+				query.push(" OR ");
 			}
-			query.push(")");
+			let pattern = crate::utils::escape_like(ct).replace('*', "%");
+			query.push("f.content_type LIKE ").push_bind(pattern).push(" ESCAPE '\\'");
 		}
+		if opts.include_folders {
+			query.push(" OR f.file_tp='FLDR'");
+		}
+		query.push(")");
 	}
 
 	// Filter by file name (substring search)
@@ -302,6 +309,12 @@ pub(crate) async fn list(
 		query
 			.push(" AND COALESCE(f.creator_tag, f.owner_tag, t.id_tag)!=")
 			.push_bind(not_owner_id_tag.as_str());
+	}
+
+	// Restrict to tenant-owned files (exclude remote/federated cached copies).
+	// Local files leave owner_tag NULL; only cross-context Pin/Place rows set it.
+	if opts.local_only {
+		query.push(" AND f.owner_tag IS NULL");
 	}
 
 	// Filter by visibility levels (push ABAC check into SQL for correct pagination)

@@ -876,6 +876,7 @@ impl<S: AsRef<str> + Debug + Ord> Ord for FileVariant<S> {
 /// To include deleted files, explicitly set `status` to `FileStatus::Deleted`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ListFileOptions {
 	/// Maximum number of items to return (default: 30)
 	pub limit: Option<u32>,
@@ -902,6 +903,10 @@ pub struct ListFileOptions {
 	/// Filter by content type pattern (e.g., "image/*", "video/*")
 	#[serde(default, rename = "contentType", deserialize_with = "deserialize_split")]
 	pub content_type: Option<Vec<String>>,
+	/// Include folders (file_tp='FLDR') even when a content_type/file_type filter
+	/// is set, so folder navigation keeps working in type-filtered pickers.
+	#[serde(default, rename = "includeFolders")]
+	pub include_folders: bool,
 	/// Substring search in file name
 	#[serde(rename = "fileName")]
 	pub file_name: Option<String>,
@@ -911,6 +916,12 @@ pub struct ListFileOptions {
 	/// Exclude files by this owner id_tag
 	#[serde(rename = "notOwnerIdTag")]
 	pub not_owner_id_tag: Option<String>,
+	/// Restrict to files owned by the active tenant (owner_tag IS NULL), excluding
+	/// remote/federated cached copies. Unlike `owner_id_tag` (which keys off
+	/// COALESCE(creator_tag, owner_tag, tenant) and so matches the *creator*),
+	/// this keys purely off ownership — the right test for "can be embedded".
+	#[serde(default, rename = "localOnly")]
+	pub local_only: bool,
 	/// Filter by pinned status (user-specific)
 	pub pinned: Option<bool>,
 	/// Filter by starred status (user-specific)
