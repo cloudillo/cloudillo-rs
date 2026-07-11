@@ -4,8 +4,9 @@
 const TOKEN_EXPIRE: u64 = 8; /* hours */
 const BCRYPT_COST: u32 = 10;
 
+use p384::SecretKey;
+use p384::elliptic_curve::Generate;
 use p384::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-use p384::{SecretKey, elliptic_curve::rand_core::OsRng};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use p256::SecretKey as P256SecretKey;
@@ -81,7 +82,7 @@ pub async fn generate_access_token(
 ///
 /// Must be run on a worker thread!
 fn generate_key_sync() -> ClResult<KeyPair> {
-	let private = SecretKey::random(&mut OsRng);
+	let private = SecretKey::generate();
 	let public = private.public_key();
 
 	//let private_key = private.to_pkcs8_pem(LineEnding::LF).map_err(|_| Error::PermissionDenied)?;
@@ -114,16 +115,16 @@ pub async fn generate_key(worker: &worker::WorkerPool) -> ClResult<KeyPair> {
 /// - private_key: Raw 32-byte scalar, base64url encoded (compatible with TS version)
 /// - public_key: 65-byte uncompressed point, base64url encoded (for Web Push API)
 fn generate_vapid_key_sync() -> KeyPair {
-	use p256::elliptic_curve::sec1::ToEncodedPoint;
+	use p256::elliptic_curve::sec1::ToSec1Point;
 
-	let private = P256SecretKey::random(&mut OsRng);
+	let private = P256SecretKey::generate();
 	let public = private.public_key();
 
 	// Private key as raw scalar, base64url encoded (compatible with TypeScript version)
 	let private_key: Box<str> = URL_SAFE_NO_PAD.encode(private.to_bytes()).into();
 
 	// Public key as uncompressed point, base64url encoded (for Web Push API)
-	let public_point = public.to_encoded_point(false);
+	let public_point = public.to_sec1_point(false);
 	let public_key: Box<str> = URL_SAFE_NO_PAD.encode(public_point.as_bytes()).into();
 
 	KeyPair { private_key, public_key }

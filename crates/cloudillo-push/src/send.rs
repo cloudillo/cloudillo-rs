@@ -178,7 +178,7 @@ fn create_vapid_jwt(endpoint: &str, id_tag: &str, private_key_raw: &str) -> Resu
 		.map_err(|e| format!("Invalid base64url private key: {}", e))?;
 
 	// Load the raw scalar into p256 SecretKey
-	let secret_key = p256::SecretKey::from_bytes(private_key_bytes.as_slice().into())
+	let secret_key = p256::SecretKey::from_slice(&private_key_bytes)
 		.map_err(|e| format!("Invalid P-256 private key: {:?}", e))?;
 
 	// Convert to PEM format for jsonwebtoken

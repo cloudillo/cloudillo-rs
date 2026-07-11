@@ -24,7 +24,7 @@ tracing = "0.1"
 
 # Web Push crypto (exclusive to this crate)
 ece = "2.3"
-p256 = { version = "0.13", features = ["pkcs8", "pem"] }
+p256 = { version = "0.14", features = ["pkcs8", "pem"] }
 base64 = "0.22"
 jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 url = "2"
