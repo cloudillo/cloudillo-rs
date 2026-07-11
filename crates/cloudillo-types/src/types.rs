@@ -533,6 +533,10 @@ pub struct CursorPaginationInfo {
 	pub next_cursor: Option<String>,
 	/// Whether more results are available
 	pub has_more: bool,
+	/// Aggregate row count. `Some` only on a `count=true` response (which pairs it
+	/// with an empty `data` array); `None` on every non-count response.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub count: Option<i64>,
 }
 
 /// Cursor data structure (encoded as base64 JSON in API)
@@ -621,7 +625,27 @@ impl<T> ApiResponse<T> {
 		Self {
 			data,
 			pagination: None,
-			cursor_pagination: Some(CursorPaginationInfo { next_cursor, has_more }),
+			cursor_pagination: Some(CursorPaginationInfo { next_cursor, has_more, count: None }),
+			time: Timestamp::now(),
+			req_id: None,
+		}
+	}
+
+	/// Create an aggregate-count response: `data` is the empty default and the
+	/// count is surfaced only under `cursorPagination.count`. Backs the
+	/// `count=true` flag on `GET /actions`.
+	pub fn with_count(count: i64) -> Self
+	where
+		T: Default,
+	{
+		Self {
+			data: T::default(),
+			pagination: None,
+			cursor_pagination: Some(CursorPaginationInfo {
+				next_cursor: None,
+				has_more: false,
+				count: Some(count),
+			}),
 			time: Timestamp::now(),
 			req_id: None,
 		}

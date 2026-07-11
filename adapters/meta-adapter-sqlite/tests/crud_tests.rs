@@ -286,7 +286,7 @@ async fn test_list_actions_exclude_issuer_profile_status() {
 
 	let opts = ListActionOptions {
 		typ: Some(vec!["SUBS".into()]),
-		subject: Some(subject.into()),
+		subject: Some(vec![subject.into()]),
 		exclude_issuer_profile_status: Some(Box::from([
 			ProfileStatus::Suspended,
 			ProfileStatus::Blocked,
@@ -440,7 +440,7 @@ async fn test_retired_invitation_excluded_from_pending_lookup() {
 	// Invariant 1: keying the lookup on the BARE tenant tag finds nothing.
 	let bare_lookup = ListActionOptions {
 		typ: Some(vec!["INVT".into()]),
-		subject: Some("team-alice.example".into()),
+		subject: Some(vec!["team-alice.example".into()]),
 		audience: Some("bob.example".into()),
 		status: Some(vec!["A".into()]),
 		..Default::default()
@@ -454,7 +454,7 @@ async fn test_retired_invitation_excluded_from_pending_lookup() {
 	// The lookup shape conn.rs actually builds: subject = format!("@{}", tag).
 	let lookup = ListActionOptions {
 		typ: Some(vec!["INVT".into()]),
-		subject: Some(format!("@{}", "team-alice.example")),
+		subject: Some(vec![format!("@{}", "team-alice.example")]),
 		audience: Some("bob.example".into()),
 		status: Some(vec!["A".into()]),
 		..Default::default()

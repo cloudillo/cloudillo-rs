@@ -208,9 +208,19 @@ pub struct BehaviorFlags {
 	/// Used by INVT to deliver to both invitee and CONV home for validation.
 	pub deliver_to_subject_owner: Option<bool>,
 
+	/// When set, the owner of this (subscribable) container vouches every accepted
+	/// child — minting an owner-signed APRV bound to the child and parented to the
+	/// container — so it federates to all subscribers pre-approved. Set with
+	/// `subscribable`.
+	pub relay_children: Option<bool>,
+
 	/// Default flags for this action type (R/r=reactions, C/c=comments, O/o=open).
 	/// Applied during action creation.
 	pub default_flags: Option<String>,
+
+	/// Default visibility char (P/V/2/F/C/S), applied at creation when neither an
+	/// explicit value nor parent/subject inheritance resolves one.
+	pub default_visibility: Option<char>,
 
 	/// Flag character that gates this action on the PARENT action's flags.
 	/// If set and the parent has the lowercase version, this action is rejected.

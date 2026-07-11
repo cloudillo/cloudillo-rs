@@ -15,6 +15,40 @@ use crate::helpers;
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 
+/// Retire (soft-delete) any active INVTs for `invitee` on this subscribable
+/// action. Called when the invitation is consumed (join SUBS accepted) and when
+/// membership is severed (SUBS:DEL), so a stale 'A' invitation neither shows as
+/// "pending invited" nor lets an ex-member rejoin without a fresh one. Genuine
+/// re-deliveries reuse the same action_id and hit create()'s duplicate
+/// early-return before hooks run.
+async fn retire_subject_invitations(app: &App, tn_id: TnId, subject_id: &str, invitee: &str) {
+	let invt_opts = cloudillo_types::meta_adapter::ListActionOptions {
+		typ: Some(vec!["INVT".to_string()]),
+		subject: Some(vec![subject_id.to_string()]),
+		audience: Some(invitee.to_string()),
+		status: Some(vec!["A".to_string()]),
+		..Default::default()
+	};
+	let invts = match app.meta_adapter.list_actions(tn_id, &invt_opts).await {
+		Ok(rs) => rs,
+		Err(e) => {
+			tracing::warn!("SUBS: Failed to list invitations to retire for {}: {}", invitee, e);
+			return;
+		}
+	};
+	for invt in invts {
+		let opts = cloudillo_types::meta_adapter::UpdateActionDataOptions {
+			status: cloudillo_types::types::Patch::Value('D'),
+			..Default::default()
+		};
+		if let Err(e) = app.meta_adapter.update_action_data(tn_id, &invt.action_id, &opts).await {
+			tracing::warn!("SUBS: Failed to retire invitation {}: {}", invt.action_id, e);
+		} else {
+			tracing::info!("SUBS: Retired invitation {} for {}", invt.action_id, invitee);
+		}
+	}
+}
+
 /// SUBS on_receive hook - Handle incoming subscription request
 ///
 /// Logic:
@@ -50,6 +84,9 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				// Open action - auto-accept subscription. Rests at 'A' (default)
 				// so subscriber fan-out (status=['A']) includes it.
 				tracing::info!("SUBS: Auto-accepting subscription (target action is open)");
+				// Joining an open group while holding a pending invitation
+				// consumes it too.
+				retire_subject_invitations(&app, tn_id, subject_id, &context.issuer).await;
 				return Ok(HookResult::default());
 			}
 
@@ -60,8 +97,10 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				app.meta_adapter.get_action_by_key(tn_id, &invt_key).await.ok().flatten();
 
 			if invitation.is_some() {
-				// Has invitation - accept subscription (rests at 'A').
+				// Has invitation - accept subscription (rests at 'A') and
+				// consume the invitation so it no longer counts as pending.
 				tracing::info!("SUBS: Accepting subscription (has valid invitation)");
+				retire_subject_invitations(&app, tn_id, subject_id, &context.issuer).await;
 				return Ok(HookResult::default());
 			}
 
@@ -70,6 +109,16 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			if context.issuer == target_action.issuer.id_tag.as_ref() {
 				// Self-subscription - auto-accept (rests at 'A').
 				tracing::info!("SUBS: Auto-accepting subscription (issuer is target creator)");
+				return Ok(HookResult::default());
+			}
+
+			// An owner-vouched, pre-approved relay copy of this SUBS must be accepted
+			// on member nodes even with no local INVT and not the creator — that's the
+			// point of the relay (every member learns the full roster). The owner only
+			// vouched it after its own hooks accepted it, so the vouch is trustworthy.
+			// Rests at 'A'.
+			if context.pre_approved {
+				tracing::info!("SUBS: Accepting pre-approved (owner-vouched) subscription relay");
 				return Ok(HookResult::default());
 			}
 
@@ -146,6 +195,12 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			);
 
 			// Always accept unsubscribe requests (users can always leave) — rests at 'A'.
+
+			// Also retire any still-active invitation for the leaver (covers
+			// memberships from before join-time consumption). Self-leave only: the
+			// DEL issuer is the departing member; a future moderator-kick must retire
+			// the removed member's INVT, not the issuer's.
+			retire_subject_invitations(&app, tn_id, subject_id, &context.issuer).await;
 		}
 		Some(subtype) => {
 			tracing::warn!("SUBS on_receive: Unknown subtype '{}', ignoring", subtype);
@@ -174,6 +229,12 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	if app.meta_adapter.get_action(tn_id, subject_id).await?.is_none() {
 		tracing::warn!("SUBS on_create: Target action {} not found", subject_id);
 		return Ok(HookResult { continue_processing: false, ..Default::default() });
+	}
+
+	// A local leave must also clean the leaver's own accepted-INVT copy
+	// (on_receive never runs for locally created actions).
+	if context.subtype.as_deref() == Some("DEL") {
+		retire_subject_invitations(&app, tn_id, subject_id, &context.issuer).await;
 	}
 
 	Ok(HookResult::default())

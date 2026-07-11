@@ -32,12 +32,9 @@ fn push_action_filters(
 		query.push(" AND coalesce(a.status, 'A') IN ");
 		query = push_in(query, status);
 	} else {
-		// Default: hide deleted ('D'), inbound-verifying ('V'), and permanently
-		// failed ('F') rows. 'V' covers inbound actions whose attachment sync
-		// hasn't finished — surfacing them would expose half-synced posts and
-		// break the descriptor-hash invariant for downstream peers fetching
-		// attachments. 'F' is the terminal state for verifier tasks that
-		// exhausted retries.
+		// Default: hide deleted ('D'), inbound-verifying ('V', attachments not yet
+		// synced — surfacing would leak half-synced posts), and permanently-failed
+		// ('F', verifier exhausted retries) rows.
 		query.push(" AND coalesce(a.status, 'A') NOT IN ('D', 'V', 'F')");
 	}
 	if let Some(typ) = &opts.typ {
@@ -56,11 +53,9 @@ fn push_action_filters(
 		query.push(" AND a.issuer_tag=").push_bind(issuer);
 	}
 	if let Some(audience) = &opts.audience {
-		// `audience IS NULL` means "on the issuer's wall" by codebase convention
-		// (see helpers::effective_audience). Match the same semantics here so
-		// callers asking "show me actions on T's wall" get both T's own rows
-		// and 3rd-party rows explicitly addressed to T (the audience-bridge
-		// case used by federation history sync).
+		// `audience IS NULL` means "on the issuer's wall" (see
+		// helpers::effective_audience), so this matches both T's own rows and
+		// 3rd-party rows addressed to T (federation history sync).
 		query.push(" AND coalesce(a.audience, a.issuer_tag)=").push_bind(audience);
 	}
 	if let Some(excluded_aud) = opts.exclude_audiences.as_ref().filter(|v| !v.is_empty()) {
@@ -72,15 +67,9 @@ fn push_action_filters(
 		query = push_in(query, codes.as_slice());
 	}
 	if let Some(audience_type) = opts.audience_type {
-		// Filter on the type of the *effective audience* profile (i.e., the
-		// profile whose wall the action lives on). `pa` is joined on
-		// `coalesce(audience, issuer_tag)`, so this works both for explicitly
-		// addressed actions and for actions on the issuer's own wall. Both
-		// branches are strict on `pa.type`: unknown remote profiles (no `pa`
-		// row, e.g. cross-tenant observer never synced locally) are excluded
-		// from both filters rather than guessed-as-Personal — callers asking
-		// for a specific audience type get only confirmed matches, and the
-		// profile sync flow is the right place to populate `pa`.
+		// Filter on the effective-audience profile's type. `pa` joins on
+		// `coalesce(audience, issuer_tag)`. Strict on `pa.type`: unknown remote
+		// profiles (no `pa` row) are excluded rather than guessed-as-Personal.
 		match audience_type {
 			AudienceType::Personal => {
 				query.push(" AND pa.type='P'");
@@ -93,12 +82,15 @@ fn push_action_filters(
 	if let Some(involved) = &opts.involved {
 		if let Some(viewer) = &opts.viewer_id_tag {
 			if viewer == involved {
-				// Self-messages: both issuer and audience must be the user
+				// All actions where the user is issuer OR audience (their own DM
+				// history). `audience IS NULL` (on-own-wall posts) still satisfies
+				// `issuer_tag=me`, so no COALESCE is needed.
 				query
-					.push(" AND a.issuer_tag=")
+					.push(" AND (a.issuer_tag=")
 					.push_bind(involved)
-					.push(" AND a.audience=")
-					.push_bind(involved);
+					.push(" OR a.audience=")
+					.push_bind(involved)
+					.push(")");
 			} else {
 				// Conversation between viewer and involved person
 				query
@@ -129,15 +121,17 @@ fn push_action_filters(
 		query.push(" AND a.root_id=").push_bind(root_id);
 	}
 	if let Some(subject) = &opts.subject {
-		query.push(" AND a.subject=").push_bind(subject);
+		if subject.is_empty() {
+			query.push(" AND 1=0"); // explicit empty set → no rows (was: matched all)
+		} else {
+			query.push(" AND a.subject IN ");
+			query = push_in(query, subject);
+		}
 	}
 	// Range filters apply to the same column the caller sorts by, so the Unread
-	// "since" boundary filters on received_at for the home feed (sort=received)
-	// and on created_at otherwise — keeping the count/list consistent with the
-	// watermark's meaning. The "received" branch coalesces to created_at so it
-	// matches the cursor's NULL fallback (handler builds the next cursor from
-	// created_at when received_at is NULL); see `order_col` below for the
-	// indexing tradeoff.
+	// "since" boundary uses received_at for the home feed (sort=received) and
+	// created_at otherwise. "received" coalesces to created_at to match the
+	// cursor's NULL fallback.
 	let range_col = if opts.sort.as_deref() == Some("received") {
 		"coalesce(a.received_at, a.created_at)"
 	} else {
@@ -220,14 +214,12 @@ fn push_action_filters(
 	query
 }
 
-/// Append only the profile joins that the active filters in `opts` actually
-/// reference, then ` WHERE a.tn_id=<bind>`. `pi` (issuer profile) is needed by
-/// `exclude_issuer_profile_status`; `pa` (effective-audience profile) by
-/// `audience_type`. Count paths that set neither skip both joins — SQLite does
-/// NOT elide the unused LEFT JOINs here (verified via EXPLAIN QUERY PLAN: it
-/// still does a covering-index SEARCH per row even when pi/pa are unreferenced),
-/// so omitting them removes a per-row index probe. The emitted alias set must
-/// stay a superset of what `push_action_filters` references for the same `opts`.
+/// Append only the profile joins the active filters in `opts` reference, then
+/// ` WHERE a.tn_id=<bind>`. `pi` (issuer profile) backs
+/// `exclude_issuer_profile_status`; `pa` (effective-audience) backs
+/// `audience_type`. SQLite does not elide unused LEFT JOINs (per-row index
+/// probe), so skipping them when unreferenced is a real saving. The emitted
+/// aliases must stay a superset of what `push_action_filters` references.
 fn push_count_from_where(
 	mut query: sqlx::QueryBuilder<sqlx::Sqlite>,
 	tn_id: TnId,
@@ -241,21 +233,82 @@ fn push_count_from_where(
 			" LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)",
 		);
 	}
+	// `pv` (viewer↔issuer relationship) backs the follow/connect arms of the
+	// count-path visibility guard. Only needed for a concrete viewer
+	// (`Patch::Value`); the guest guard (`Patch::Null`) is Public-only.
+	if matches!(opts.visibility_guard, Patch::Value(_)) {
+		query.push(" LEFT JOIN profiles pv ON pv.tn_id=a.tn_id AND pv.id_tag=a.issuer_tag");
+	}
 	query.push(" WHERE a.tn_id=");
 	query.push_bind(tn_id.0);
 	query
 }
 
+/// Append the query-level visibility guard for the aggregate `count()` path
+/// (H1) — the SQL equivalent of `abac::can_view_item` /
+/// `SubjectAccessLevel::can_access`, so guests/non-privileged callers can't
+/// enumerate private aggregates that ABAC hides on the row-list path
+/// (`filter_actions_by_visibility`). Requires `push_count_from_where`'s joins.
+///
+/// - `Patch::Undefined` → no guard (tenant see-all / internal callers).
+/// - `Patch::Null` → guest: only Public ('P') rows.
+/// - `Patch::Value(v)` → viewer `v`: full OR-group (Public/Verified,
+///   follow/connect via `pv`, own-issuer, addressed audience, Subscribed 'S').
+///
+/// Omits `subject_has_peer_relation_to_tenant`, which only *widens* audience for
+/// Direct rows the viewer is already addressed on — can under-count, never leak.
+fn push_visibility_guard(
+	mut query: sqlx::QueryBuilder<sqlx::Sqlite>,
+	opts: &ListActionOptions,
+) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+	match &opts.visibility_guard {
+		Patch::Undefined => {}
+		Patch::Null => {
+			// Guest: no viewer id_tag, so every non-Public arm collapses away.
+			query.push(" AND (a.visibility = 'P')");
+		}
+		Patch::Value(v) => {
+			// `connected` is stored as int 1 (mutual) or 'R' (requested, not yet
+			// mutual); test for the canonical int 1, which excludes 'R'.
+			query.push(" AND ( a.visibility = 'P' OR a.visibility = 'V'");
+			query
+				.push(" OR (a.visibility IN ('2','F') AND (pv.following = 1 OR pv.connected = 1))");
+			query.push(" OR (a.visibility = 'C' AND pv.connected = 1)");
+			query.push(" OR (a.issuer_tag = ").push_bind(v.clone()).push(")");
+			query.push(" OR (a.audience = ").push_bind(v.clone()).push(")");
+			query.push(
+				" OR (a.visibility = 'S' AND EXISTS (
+					SELECT 1 FROM actions s
+					WHERE s.tn_id = a.tn_id AND s.type = 'SUBS' AND s.status = 'A'
+						AND (s.sub_type IS NULL OR s.sub_type <> 'DEL')
+						AND s.issuer_tag = ",
+			);
+			query.push_bind(v.clone());
+			query.push(" AND s.subject = COALESCE(a.root_id, a.subject, a.action_id)))");
+			query.push(" )");
+		}
+	}
+	query
+}
+
 /// Count actions matching `opts` (same filters as `list`), with NO limit/sort/
 /// cursor. Generic and type-agnostic — callers supply the business filters.
-/// Not exposed through the adapter trait (no production caller); retained as the
-/// probe for the repost dedup/supersede/audience regression tests below, which
+/// Backs the `count=true` flag on `GET /actions` (via the `count_actions` trait
+/// method) and the repost dedup/supersede/audience regression tests below, which
 /// guard the same `push_action_filters` SQL that `count_grouped` relies on.
-#[cfg(test)]
+///
+/// When `opts.visibility_guard` is set (guest `Patch::Null` / viewer
+/// `Patch::Value`), the count applies `push_visibility_guard` — the query-level
+/// ABAC translation of `abac::can_view_item` — so the result is a
+/// post-visibility count. `filter_actions_by_visibility` (`cloudillo-action`) is
+/// the row-list equivalent; the two are kept pinned by the parity tests below.
+/// `Patch::Undefined` (the default for every in-crate test and internal caller)
+/// counts every matching row.
 pub(crate) async fn count(db: &SqlitePool, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64> {
 	let mut query = sqlx::QueryBuilder::new("SELECT COUNT(DISTINCT a.a_id) FROM actions a");
 	query = push_count_from_where(query, tn_id, opts);
 	query = push_action_filters(query, opts);
+	query = push_visibility_guard(query, opts);
 	query
 		.build_query_scalar::<i64>()
 		.fetch_one(db)
@@ -650,9 +703,8 @@ pub(crate) async fn list(
 		});
 	}
 
-	// Opt-in: populate each action's raw signed JWS from action_tokens. Only
-	// runs when the caller passes includeTokens=true (e.g. the engagement
-	// dialog's signature-verification path), so normal feed lists stay lean.
+	// Opt-in (includeTokens=true): populate each action's raw signed JWS from
+	// action_tokens (e.g. the engagement dialog's signature-verification path).
 	if opts.include_tokens == Some(true) && !actions.is_empty() {
 		let ids: Vec<&str> = actions.iter().map(|a| a.action_id.as_ref()).collect();
 		let mut q =
@@ -682,19 +734,19 @@ pub(crate) async fn list(
 		}
 	}
 
-	// Post-pass hydration for reposts.
-	// 1. Embedded original action for REPOST rows, so the client renders the
-	//    shared post without a second round-trip. The inner get() is called with
-	//    hydrate_subject=false so the embedded subject never re-hydrates *its*
-	//    subject — one level only, structurally, regardless of stored data.
-	for action in &mut actions {
-		if action.typ.as_ref() == "REPOST"
-			&& let Some(subject_id) = action.subject.clone()
-			&& !subject_id.starts_with('@')
-			&& let Ok(Some(sub)) =
-				get(db, tn_id, &subject_id, opts.viewer_id_tag.as_deref(), false).await
-		{
-			action.subject_action = Some(Box::new(sub));
+	// Opt-in (includeSubject=true): embed each row's referenced action (with its
+	// `stat`) so the client renders the shared/referenced post without a second
+	// round-trip. Generic across types (REPOST→post, SUBS→CONV, ...). The inner
+	// get() passes hydrate_subject=false, so hydration is one level only.
+	if opts.include_subject == Some(true) {
+		for action in &mut actions {
+			if let Some(subject_id) = action.subject.clone()
+				&& !subject_id.starts_with('@')
+				&& let Ok(Some(sub)) =
+					get(db, tn_id, &subject_id, opts.viewer_id_tag.as_deref(), false).await
+			{
+				action.subject_action = Some(Box::new(sub));
+			}
 		}
 	}
 
@@ -1001,6 +1053,29 @@ pub(crate) async fn get_id(db: &SqlitePool, tn_id: TnId, a_id: u64) -> ClResult<
 
 	let action_id: String = res.try_get("action_id").map_err(|_| Error::NotFound)?;
 	Ok(action_id.into_boxed_str())
+}
+
+/// Lightweight probe: the action's `type` column only (no joins/hydration).
+pub(crate) async fn get_type(
+	db: &SqlitePool,
+	tn_id: TnId,
+	action_id: &str,
+) -> ClResult<Option<Box<str>>> {
+	let res = sqlx::query("SELECT type FROM actions WHERE tn_id=? AND action_id=?")
+		.bind(tn_id.0)
+		.bind(action_id)
+		.fetch_optional(db)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)?;
+
+	match res {
+		Some(row) => {
+			let typ: String = row.try_get("type").map_err(|_| Error::DbError)?;
+			Ok(Some(typ.into_boxed_str()))
+		}
+		None => Ok(None),
+	}
 }
 
 /// Create an inbound action
@@ -1963,7 +2038,7 @@ mod tests {
 
 		let opts = ListActionOptions {
 			typ: Some(vec!["REPOST".into()]),
-			subject: Some(subject.to_string()),
+			subject: Some(vec![subject.to_string()]),
 			..Default::default()
 		};
 
@@ -1993,7 +2068,7 @@ mod tests {
 
 		let opts = ListActionOptions {
 			typ: Some(vec!["REPOST".into()]),
-			subject: Some(subject.to_string()),
+			subject: Some(vec![subject.to_string()]),
 			..Default::default()
 		};
 
@@ -2038,7 +2113,7 @@ mod tests {
 
 		let opts = ListActionOptions {
 			typ: Some(vec!["REPOST".into()]),
-			subject: Some(subject.to_string()),
+			subject: Some(vec![subject.to_string()]),
 			..Default::default()
 		};
 		assert_eq!(
@@ -2119,7 +2194,7 @@ mod tests {
 
 		let opts = ListActionOptions {
 			typ: Some(vec!["REPOST".into()]),
-			subject: Some(subject.to_string()),
+			subject: Some(vec![subject.to_string()]),
 			..Default::default()
 		};
 		assert_eq!(
@@ -2145,7 +2220,7 @@ mod tests {
 
 		let opts = ListActionOptions {
 			typ: Some(vec!["REACT".into()]),
-			subject: Some(subject.to_string()),
+			subject: Some(vec![subject.to_string()]),
 			..Default::default()
 		};
 		let grouped = count_grouped(&db, tn_id, &opts, ActionCountGroupBy::SubType)
@@ -2203,5 +2278,573 @@ mod tests {
 		};
 		let n = count(&db, tn_id, &opts).await.expect("count");
 		assert_eq!(n, 1, "only the community-addressed POST matches audienceType=community");
+	}
+
+	// Insert a finalized MSG with explicit parent_id/audience/created_at so the
+	// child-counter and keyset tests control thread membership and ordering
+	// (`insert_action` is too coarse: fixed created_at, no parent_id/audience).
+	#[allow(clippy::too_many_arguments)]
+	async fn insert_msg(
+		db: &SqlitePool,
+		tn_id: TnId,
+		action_id: &str,
+		sub_type: &str,
+		parent_id: &str,
+		issuer: &str,
+		audience: &str,
+		created_at: i64,
+	) {
+		sqlx::query(
+			"INSERT INTO actions (tn_id, action_id, type, sub_type, parent_id, issuer_tag, audience, status, visibility, created_at)
+			VALUES (?, ?, 'MSG', ?, ?, ?, ?, 'A', 'P', ?)",
+		)
+		.bind(tn_id.0)
+		.bind(action_id)
+		.bind(sub_type)
+		.bind(parent_id)
+		.bind(issuer)
+		.bind(audience)
+		.bind(created_at)
+		.execute(db)
+		.await
+		.expect("insert msg");
+	}
+
+	// Insert one CMNT child of `parent_id` with an explicit created_at, so the
+	// CMNT-vs-MSG type-isolation assertions can mix child types under one parent.
+	async fn insert_cmnt_child(
+		db: &SqlitePool,
+		tn_id: TnId,
+		action_id: &str,
+		parent_id: &str,
+		created_at: i64,
+	) {
+		sqlx::query(
+			"INSERT INTO actions (tn_id, action_id, type, sub_type, parent_id, issuer_tag, status, visibility, created_at)
+			VALUES (?, ?, 'CMNT', '', ?, 'alice.example', 'A', 'P', ?)",
+		)
+		.bind(tn_id.0)
+		.bind(action_id)
+		.bind(parent_id)
+		.bind(created_at)
+		.execute(db)
+		.await
+		.expect("insert cmnt child");
+	}
+
+	// E1/E9: a group CONV's `comments`/`comments_ts` are driven by its MSG children
+	// via the same primitives the native MSG hook composes (grouped count + newest
+	// list, then update_action_data), isolating MSG from CMNT children under the
+	// same parent.
+	#[tokio::test]
+	async fn conv_counters_track_msg_children() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		let conv = "a1~conv";
+
+		// The CONV container itself.
+		insert_action(&db, tn_id, conv, "CONV", "", "").await;
+
+		// Three live group messages with increasing created_at, plus one MSG:DEL
+		// tombstone that must NOT inflate the count.
+		insert_msg(&db, tn_id, "a1~msg-1", "", conv, "bob.example", "community.example", 100).await;
+		insert_msg(&db, tn_id, "a1~msg-2", "", conv, "carol.example", "community.example", 200)
+			.await;
+		insert_msg(&db, tn_id, "a1~msg-3", "", conv, "bob.example", "community.example", 300).await;
+		insert_msg(&db, tn_id, "a1~msg-del", "DEL", conv, "bob.example", "community.example", 350)
+			.await;
+		// A CMNT child of the same CONV: must be ignored by the MSG-typed recompute.
+		insert_cmnt_child(&db, tn_id, "a1~cmnt-1", conv, 400).await;
+
+		// Count active MSG children (mirrors recompute_comment_stats' grouped count).
+		let count_opts = ListActionOptions {
+			typ: Some(vec!["MSG".into()]),
+			parent_id: Some(conv.to_string()),
+			..Default::default()
+		};
+		let grouped = count_grouped(&db, tn_id, &count_opts, ActionCountGroupBy::SubType)
+			.await
+			.expect("count_grouped MSG");
+		let msg_count: i64 = grouped
+			.iter()
+			.filter(|(g, _)| g.as_deref() != Some("DEL"))
+			.map(|(_, c)| *c)
+			.sum();
+		assert_eq!(msg_count, 3, "three live MSG children (DEL tombstone excluded)");
+
+		// Newest active MSG child's created_at → comments_ts.
+		let newest_opts = ListActionOptions {
+			typ: Some(vec!["MSG".into()]),
+			parent_id: Some(conv.to_string()),
+			sort: Some("created".into()),
+			sort_dir: Some("desc".into()),
+			limit: Some(1),
+			exclude_sub_typ: Some(Box::from([Box::from("DEL") as Box<str>])),
+			..Default::default()
+		};
+		let newest = list(&db, tn_id, &newest_opts).await.expect("newest MSG");
+		let comments_ts = newest.first().map_or(0, |a| a.created_at.0);
+		assert_eq!(comments_ts, 300, "comments_ts is the newest live MSG child's created_at");
+
+		// Persist onto the CONV row and read it back (this is the actual "bump").
+		update_data(
+			&db,
+			tn_id,
+			conv,
+			&UpdateActionDataOptions {
+				comments: Patch::Value(u32::try_from(msg_count).expect("msg_count fits u32")),
+				comments_ts: Patch::Value(Timestamp(comments_ts)),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("update_data");
+
+		let data = get_data(&db, tn_id, conv).await.expect("get_data").expect("CONV row");
+		assert_eq!(data.comments, Some(3), "CONV.comments reflects its MSG children");
+		assert_eq!(data.comments_ts.map(|t| t.0), Some(300), "CONV.comments_ts = newest MSG");
+
+		// Type isolation: the CMNT child is counted only under the CMNT-typed recompute.
+		let cmnt_opts = ListActionOptions {
+			typ: Some(vec!["CMNT".into()]),
+			parent_id: Some(conv.to_string()),
+			..Default::default()
+		};
+		let cmnt_grouped = count_grouped(&db, tn_id, &cmnt_opts, ActionCountGroupBy::SubType)
+			.await
+			.expect("count_grouped CMNT");
+		let cmnt_count: i64 = cmnt_grouped
+			.iter()
+			.filter(|(g, _)| g.as_deref() != Some("DEL"))
+			.map(|(_, c)| *c)
+			.sum();
+		assert_eq!(cmnt_count, 1, "CMNT child counted separately from MSG children");
+	}
+
+	// E9: the `thread` read-marker scope writes `comments_read_at` on a CONV row
+	// (the UPDATE is type-agnostic; the watermark is forward-only).
+	#[tokio::test]
+	async fn read_marker_thread_scope_on_conv() {
+		async fn read_marker(db: &SqlitePool, tn_id: TnId, conv: &str) -> Option<i64> {
+			sqlx::query_scalar("SELECT comments_read_at FROM actions WHERE tn_id=? AND action_id=?")
+				.bind(tn_id.0)
+				.bind(conv)
+				.fetch_one(db)
+				.await
+				.expect("select comments_read_at")
+		}
+
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		let conv = "a1~conv";
+		insert_action(&db, tn_id, conv, "CONV", "", "").await;
+
+		set_read_marker(&db, tn_id, "thread", conv, 500).await.expect("set 500");
+		assert_eq!(read_marker(&db, tn_id, conv).await, Some(500), "watermark set on CONV row");
+
+		// Forward-only: a lower position is a no-op.
+		set_read_marker(&db, tn_id, "thread", conv, 300).await.expect("set 300");
+		assert_eq!(read_marker(&db, tn_id, conv).await, Some(500), "lower position ignored");
+
+		// Higher position advances.
+		set_read_marker(&db, tn_id, "thread", conv, 700).await.expect("set 700");
+		assert_eq!(read_marker(&db, tn_id, conv).await, Some(700), "higher position advances");
+	}
+
+	// E6/E9: `includeSubject=true` hydrates `subject_action` (with its `stat`) for
+	// ANY row whose subject is a real action id (SUBS→CONV as well as REPOST).
+	// Without the flag it's omitted even for a REPOST.
+	#[tokio::test]
+	async fn list_include_subject_hydrates_any_type() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		let conv = "a1~conv";
+
+		// The shared subject: a CONV carrying a comment count, so its hydrated stat
+		// has a non-empty commentCount.
+		insert_action(&db, tn_id, conv, "CONV", "", "").await;
+		update_data(
+			&db,
+			tn_id,
+			conv,
+			&UpdateActionDataOptions { comments: Patch::Value(5), ..Default::default() },
+		)
+		.await
+		.expect("seed conv comments");
+
+		// A SUBS membership row and a REPOST row, both referencing the CONV as subject.
+		insert_action(&db, tn_id, "a1~subs", "SUBS", "", conv).await;
+		insert_action(&db, tn_id, "a1~rp", "REPOST", "", conv).await;
+
+		let base = ListActionOptions {
+			typ: Some(vec!["SUBS".into(), "REPOST".into()]),
+			..Default::default()
+		};
+
+		// With the flag: both rows get a hydrated subject carrying the CONV's stat.
+		let with_flag = ListActionOptions { include_subject: Some(true), ..base };
+		let listed = list(&db, tn_id, &with_flag).await.expect("list include_subject");
+		assert_eq!(listed.len(), 2, "both rows returned");
+		for a in &listed {
+			let sub = a
+				.subject_action
+				.as_ref()
+				.unwrap_or_else(|| panic!("subject_action hydrated for {}", a.typ));
+			let cc = sub
+				.stat
+				.as_ref()
+				.and_then(|s| s.get("commentCount"))
+				.and_then(serde_json::Value::as_i64);
+			assert_eq!(
+				cc,
+				Some(5),
+				"hydrated subject carries its stat (commentCount) for {}",
+				a.typ
+			);
+		}
+
+		// Without the flag: subject_action omitted for every row, REPOST included.
+		let no_flag = ListActionOptions {
+			typ: Some(vec!["SUBS".into(), "REPOST".into()]),
+			..Default::default()
+		};
+		let listed = list(&db, tn_id, &no_flag).await.expect("list no flag");
+		assert_eq!(listed.len(), 2, "both rows returned");
+		for a in &listed {
+			assert!(
+				a.subject_action.is_none(),
+				"subject_action omitted without includeSubject (type {})",
+				a.typ
+			);
+		}
+	}
+
+	// E5: keyset pagination (`cursor` over created_at + a_id) composes with the
+	// `involved` and `parentId` filters for MSG, never dropping or duplicating rows.
+	#[tokio::test]
+	async fn keyset_cursor_composes_with_involved_and_parent() {
+		use cloudillo_types::types::CursorData;
+
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		let conv = "a1~conv";
+		let viewer = "alice.example";
+		let peer = "bob.example";
+
+		// Five MSGs in the CONV, a DM thread alice<->bob, distinct created_at.
+		for (i, ts) in [100, 200, 300, 400, 500].into_iter().enumerate() {
+			let id = format!("a1~msg-{i}");
+			insert_msg(&db, tn_id, &id, "", conv, viewer, peer, ts).await;
+		}
+		// A decoy MSG in a different conversation/parent that the filters must exclude.
+		insert_msg(&db, tn_id, "a1~decoy", "", "a1~other-conv", viewer, "carol.example", 250).await;
+
+		// Page through 2 at a time, holding parentId + involved constant.
+		let mk_opts = |cursor: Option<String>| ListActionOptions {
+			typ: Some(vec!["MSG".into()]),
+			parent_id: Some(conv.to_string()),
+			involved: Some(peer.to_string()),
+			viewer_id_tag: Some(viewer.to_string()),
+			limit: Some(2),
+			cursor,
+			..Default::default()
+		};
+
+		let mut seen: Vec<i64> = Vec::new();
+		let mut cursor: Option<String> = None;
+		for _ in 0..5 {
+			let opts = mk_opts(cursor.take());
+			let page = list(&db, tn_id, &opts).await.expect("page");
+			// list() fetches limit+1; emulate the handler taking `limit` and building
+			// the next cursor from the last kept row.
+			let has_more = page.len() > 2;
+			let kept: Vec<_> = page.into_iter().take(2).collect();
+			for a in &kept {
+				seen.push(a.created_at.0);
+			}
+			if has_more && let Some(last) = kept.last() {
+				let c = CursorData::new(
+					"created",
+					serde_json::Value::Number(last.created_at.0.into()),
+					&last.action_id,
+				);
+				cursor = Some(c.encode());
+			} else {
+				break;
+			}
+		}
+
+		assert_eq!(
+			seen,
+			vec![500, 400, 300, 200, 100],
+			"cursor + involved + parentId paginate the CONV thread with no gaps/dupes and exclude the decoy"
+		);
+	}
+
+	// A3 regression: `involved:<viewer>` (self-branch) returns every row where the
+	// viewer is issuer OR audience (full DM history), not just notes-to-self.
+	#[tokio::test]
+	async fn involved_self_returns_issuer_or_audience() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		let me = "alice.example";
+		let peer = "bob.example";
+
+		// Outbound DM (me → peer), inbound DM (peer → me), and a note-to-self.
+		insert_msg(&db, tn_id, "a1~out", "", "a1~dm", me, peer, 100).await;
+		insert_msg(&db, tn_id, "a1~in", "", "a1~dm", peer, me, 200).await;
+		insert_msg(&db, tn_id, "a1~self", "", "a1~dm", me, me, 300).await;
+		// A third-party DM the viewer is not part of — must be excluded.
+		insert_msg(&db, tn_id, "a1~other", "", "a1~dm2", peer, "carol.example", 400).await;
+
+		let opts = ListActionOptions {
+			typ: Some(vec!["MSG".into()]),
+			involved: Some(me.to_string()),
+			viewer_id_tag: Some(me.to_string()),
+			sort: Some("created".into()),
+			sort_dir: Some("desc".into()),
+			..Default::default()
+		};
+		let rows = list(&db, tn_id, &opts).await.expect("list");
+		let mut ids: Vec<&str> = rows.iter().map(|a| a.action_id.as_ref()).collect();
+		ids.sort_unstable();
+		assert_eq!(
+			ids,
+			vec!["a1~in", "a1~out", "a1~self"],
+			"involved:<viewer> returns issuer-OR-audience rows and excludes third-party DMs"
+		);
+	}
+
+	// A1 regression: an array-valued `subject` filters with `subject IN (...)`,
+	// returning rows for every listed subject.
+	#[tokio::test]
+	async fn subject_array_matches_all_listed() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+
+		insert_action(&db, tn_id, "a1~s1", "SUBS", "", "grp-a").await;
+		insert_action(&db, tn_id, "a1~s2", "SUBS", "", "grp-b").await;
+		insert_action(&db, tn_id, "a1~s3", "SUBS", "", "grp-c").await;
+
+		let opts = ListActionOptions {
+			typ: Some(vec!["SUBS".into()]),
+			subject: Some(vec!["grp-a".into(), "grp-b".into()]),
+			status: Some(vec!["A".into()]),
+			..Default::default()
+		};
+		let rows = list(&db, tn_id, &opts).await.expect("list");
+		let mut ids: Vec<&str> = rows.iter().map(|a| a.action_id.as_ref()).collect();
+		ids.sort_unstable();
+		assert_eq!(
+			ids,
+			vec!["a1~s1", "a1~s2"],
+			"subject:[grp-a,grp-b] returns rows for both subjects and excludes grp-c"
+		);
+
+		// And the generic count() path applies the same array filter.
+		let n = count(&db, tn_id, &opts).await.expect("count");
+		assert_eq!(n, 2, "count() honors the array subject filter");
+
+		// L1: an explicit empty subject set must fail closed (match nothing), not all
+		// rows. Query-string callers can't reach it; this guards the Rust-caller path.
+		let empty_opts = ListActionOptions {
+			typ: Some(vec!["SUBS".into()]),
+			subject: Some(vec![]),
+			status: Some(vec!["A".into()]),
+			..Default::default()
+		};
+		let empty_rows = list(&db, tn_id, &empty_opts).await.expect("list");
+		assert!(empty_rows.is_empty(), "empty subject set must match no rows");
+		let empty_n = count(&db, tn_id, &empty_opts).await.expect("count");
+		assert_eq!(empty_n, 0, "empty subject set must count zero rows");
+	}
+
+	// ---- H1: count-path visibility guard parity ------------------------------
+	//
+	// Pin the SQL `push_visibility_guard` to the Rust ABAC rule (`can_view_item` /
+	// `SubjectAccessLevel::can_access`): seed one action per visibility level plus
+	// own-issuer and addressed-audience rows, then assert `count()` per guard state.
+
+	const VIS_ISSUER: &str = "carol.example";
+	const VIS_VIEWER: &str = "viewer.example";
+	const VIS_CONTAINER: &str = "a1~conv-1";
+
+	// Insert one finalized POST row with an explicit issuer/audience/visibility.
+	async fn insert_vis(
+		db: &SqlitePool,
+		tn_id: TnId,
+		action_id: &str,
+		issuer: &str,
+		audience: Option<&str>,
+		visibility: &str,
+	) {
+		sqlx::query(
+			"INSERT INTO actions (tn_id, action_id, type, issuer_tag, audience, status, visibility, created_at)
+			VALUES (?, ?, 'POST', ?, ?, 'A', ?, unixepoch())",
+		)
+		.bind(tn_id.0)
+		.bind(action_id)
+		.bind(issuer)
+		.bind(audience)
+		.bind(visibility)
+		.execute(db)
+		.await
+		.expect("insert vis action");
+	}
+
+	// Insert an active SUBS membership row (issuer subscribes to `subject`).
+	async fn insert_subs_membership(db: &SqlitePool, tn_id: TnId, issuer: &str, subject: &str) {
+		sqlx::query(
+			"INSERT INTO actions (tn_id, action_id, type, issuer_tag, subject, status, visibility, created_at)
+			VALUES (?, ?, 'SUBS', ?, ?, 'A', 'P', unixepoch())",
+		)
+		.bind(tn_id.0)
+		.bind(format!("a1~subs-{issuer}"))
+		.bind(issuer)
+		.bind(subject)
+		.execute(db)
+		.await
+		.expect("insert subs membership");
+	}
+
+	// Insert the viewer's relationship row, keyed on the issuer's id_tag (the
+	// guard joins on the action's issuer_tag).
+	async fn insert_relationship(
+		db: &SqlitePool,
+		tn_id: TnId,
+		id_tag: &str,
+		following: bool,
+		connected: bool,
+	) {
+		sqlx::query(
+			"INSERT INTO profiles (tn_id, id_tag, name, following, connected)
+			VALUES (?, ?, ?, ?, ?)",
+		)
+		.bind(tn_id.0)
+		.bind(id_tag)
+		.bind(id_tag)
+		.bind(following)
+		.bind(connected)
+		.execute(db)
+		.await
+		.expect("insert relationship");
+	}
+
+	// Seed one row per visibility level ('P','V','2','F','C','S','D') from
+	// VIS_ISSUER, plus own-issuer and addressed-audience rows (both Direct, so they
+	// match only via the issuer/audience arms). The 'S' row's action_id is its
+	// container id.
+	async fn seed_vis_rows(db: &SqlitePool, tn_id: TnId) {
+		insert_vis(db, tn_id, "a1~p", VIS_ISSUER, None, "P").await;
+		insert_vis(db, tn_id, "a1~v", VIS_ISSUER, None, "V").await;
+		insert_vis(db, tn_id, "a1~2", VIS_ISSUER, None, "2").await;
+		insert_vis(db, tn_id, "a1~f", VIS_ISSUER, None, "F").await;
+		insert_vis(db, tn_id, "a1~c", VIS_ISSUER, None, "C").await;
+		insert_vis(db, tn_id, VIS_CONTAINER, VIS_ISSUER, None, "S").await;
+		insert_vis(db, tn_id, "a1~d", VIS_ISSUER, None, "D").await;
+		insert_vis(db, tn_id, "a1~own", VIS_VIEWER, None, "D").await;
+		insert_vis(db, tn_id, "a1~aud", VIS_ISSUER, Some(VIS_VIEWER), "D").await;
+	}
+
+	// Count only the seeded POST content rows (excludes SUBS membership rows) under
+	// the given visibility guard.
+	fn vis_count_opts(guard: Patch<String>) -> ListActionOptions {
+		ListActionOptions {
+			typ: Some(vec!["POST".into()]),
+			status: Some(vec!["A".into()]),
+			visibility_guard: guard,
+			..Default::default()
+		}
+	}
+
+	#[tokio::test]
+	async fn count_guard_guest_only_public() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		seed_vis_rows(&db, tn_id).await;
+
+		// Patch::Null (guest): only the Public row is visible.
+		let n = count(&db, tn_id, &vis_count_opts(Patch::Null)).await.expect("count");
+		assert_eq!(n, 1, "guest count sees only the Public row");
+	}
+
+	#[tokio::test]
+	async fn count_guard_authed_non_follower() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		seed_vis_rows(&db, tn_id).await;
+
+		// Patch::Value(viewer), no relationship row: Public, Verified, own-issuer,
+		// and addressed-audience rows only.
+		let guard = Patch::Value(VIS_VIEWER.to_string());
+		let n = count(&db, tn_id, &vis_count_opts(guard)).await.expect("count");
+		assert_eq!(n, 4, "authed non-follower sees P, V, own-issuer, addressed-audience");
+	}
+
+	#[tokio::test]
+	async fn count_guard_following_adds_second_and_follower() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		seed_vis_rows(&db, tn_id).await;
+		insert_relationship(&db, tn_id, VIS_ISSUER, true, false).await;
+
+		// following=1 adds the '2' (2nd-degree) and 'F' (follower) rows.
+		let guard = Patch::Value(VIS_VIEWER.to_string());
+		let n = count(&db, tn_id, &vis_count_opts(guard)).await.expect("count");
+		assert_eq!(n, 6, "following adds the 2nd-degree and follower rows");
+	}
+
+	#[tokio::test]
+	async fn count_guard_connected_adds_connected() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		seed_vis_rows(&db, tn_id).await;
+		insert_relationship(&db, tn_id, VIS_ISSUER, false, true).await;
+
+		// connected=1 satisfies the 2nd-degree/follower OR-arm AND the connected
+		// arm: P, V, own, aud, 2, F, C.
+		let guard = Patch::Value(VIS_VIEWER.to_string());
+		let n = count(&db, tn_id, &vis_count_opts(guard)).await.expect("count");
+		assert_eq!(n, 7, "connected adds the 2nd-degree, follower, and connected rows");
+	}
+
+	#[tokio::test]
+	async fn count_guard_subscriber_bridge() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		seed_vis_rows(&db, tn_id).await;
+		let guard = || Patch::Value(VIS_VIEWER.to_string());
+
+		// Non-member: the Subscribed 'S' row is not visible → 4 (P, V, own, aud).
+		let before = count(&db, tn_id, &vis_count_opts(guard())).await.expect("count");
+		assert_eq!(before, 4, "non-member does not see the Subscribed row");
+
+		// Active SUBS membership to the container → the 'S' row becomes visible.
+		insert_subs_membership(&db, tn_id, VIS_VIEWER, VIS_CONTAINER).await;
+		let after = count(&db, tn_id, &vis_count_opts(guard())).await.expect("count");
+		assert_eq!(after, 5, "active member sees the Subscribed row via the bridge");
+	}
+
+	#[tokio::test]
+	async fn count_guard_undefined_sees_all() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		seed_vis_rows(&db, tn_id).await;
+
+		// Patch::Undefined (tenant/owner see-all): every seeded POST row counts.
+		let n = count(&db, tn_id, &vis_count_opts(Patch::Undefined)).await.expect("count");
+		assert_eq!(n, 9, "tenant see-all counts every row regardless of visibility");
 	}
 }

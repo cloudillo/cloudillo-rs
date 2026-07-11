@@ -542,7 +542,8 @@ pub struct ListActionOptions {
 	pub parent_id: Option<String>,
 	#[serde(rename = "rootId")]
 	pub root_id: Option<String>,
-	pub subject: Option<String>,
+	#[serde(default, deserialize_with = "deserialize_split")]
+	pub subject: Option<Vec<String>>,
 	#[serde(rename = "createdAfter")]
 	pub created_after: Option<Timestamp>,
 	#[serde(rename = "createdBefore")]
@@ -554,6 +555,13 @@ pub struct ListActionOptions {
 	/// signed JWS from `action_tokens`. Opt-in so normal feed payloads stay lean.
 	#[serde(rename = "includeTokens")]
 	pub include_tokens: Option<bool>,
+	/// When true, hydrate each row's `subject_action` (the referenced action with
+	/// its full `stat`) for any row whose `subject` is a real action id (not an
+	/// `@`-prefixed placeholder). Opt-in — unread-dot count probes omit it to stay
+	/// lean; feed/banner/conversation-list paths set it to get the subject's
+	/// commentCount/lastCommentAt/commentsReadAt in one round-trip.
+	#[serde(rename = "includeSubject")]
+	pub include_subject: Option<bool>,
 	/// Exclude actions whose issuer's profile has any of these statuses.
 	/// LEFT JOIN profiles ON (tn_id, id_tag=issuer.id_tag) — missing-profile
 	/// rows are NOT excluded (open-federation default).
@@ -575,6 +583,22 @@ pub struct ListActionOptions {
 	/// Requires an authenticated request (viewer_id_tag set by the handler).
 	#[serde(rename = "excludeOwnIssuer")]
 	pub exclude_own_issuer: Option<bool>,
+	/// When true, `GET /actions` returns only a `COUNT(*)` of matching rows (under
+	/// `cursorPagination.count`) instead of the row list. The count applies
+	/// `visibility_guard` below, so it's a post-visibility count.
+	pub count: Option<bool>,
+	/// Visibility guard for the aggregate count path (H1). NEVER deserialized from
+	/// the client — set only by the `/actions` handler. Reuses `Patch<String>`:
+	/// `Undefined` → no guard (tenant see-all, internal callers, list path);
+	/// `Null` → guest, only Public ('P') rows; `Value(id_tag)` → viewer, full ABAC
+	/// translation for `id_tag`.
+	///
+	/// `#[serde(skip)]` is load-bearing: it keeps the field out of client
+	/// deserialization so a client cannot forge a see-all (`Undefined`) count.
+	/// `Patch` defaults to `Undefined`, so existing `..Default::default()` sites
+	/// keep the "no guard" behavior.
+	#[serde(skip)]
+	pub visibility_guard: Patch<String>,
 }
 
 #[skip_serializing_none]
@@ -1530,6 +1554,13 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		group_by: ActionCountGroupBy,
 	) -> ClResult<Vec<(Option<String>, i64)>>;
 
+	/// Count actions matching `opts` (same filters as `list_actions`), no
+	/// limit/sort/cursor. Backs the `count=true` flag on `GET /actions`. When
+	/// `opts.visibility_guard` is set (`Null` guest / `Value` viewer) the count is
+	/// post-visibility, applying the same ABAC translation of `can_view_item` the
+	/// row-list pass uses. `Undefined` (default) counts every matching row.
+	async fn count_actions(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64>;
+
 	/// Set a read-watermark, forward-only (a lower `position` is a no-op).
 	/// Dispatches by `scope`, all against the reader's own (`tn_id`) node:
 	///   - `"feed"`   → `profiles.feed_read_at` for `id_tag = key`
@@ -1733,6 +1764,9 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	//***************************
 	/// Get a single action by action_id
 	async fn get_action(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<ActionView>>;
+
+	/// Lightweight probe: the action's `type` column only (no joins/hydration).
+	async fn get_action_type(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<Box<str>>>;
 
 	/// Update action content and attachments (if not yet federated)
 	async fn update_action(

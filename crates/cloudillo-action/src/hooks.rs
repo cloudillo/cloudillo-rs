@@ -176,6 +176,10 @@ pub struct HookContext {
 	// Flags
 	pub is_inbound: bool,
 	pub is_outbound: bool,
+	/// True when this action arrived pre-approved (a related token bundled under
+	/// an owner-vouched APRV). A gating `on_receive` hook may read this to accept
+	/// a relayed copy it would otherwise reject.
+	pub pre_approved: bool,
 
 	// Client information
 	/// Client IP address (available for inbound actions)
@@ -210,6 +214,7 @@ pub struct HookContextBuilder {
 	tenant_type: String,
 	is_inbound: bool,
 	is_outbound: bool,
+	pre_approved: bool,
 	client_address: Option<String>,
 	vars: HashMap<String, serde_json::Value>,
 }
@@ -233,6 +238,7 @@ impl Default for HookContextBuilder {
 			tenant_type: String::new(),
 			is_inbound: false,
 			is_outbound: false,
+			pre_approved: false,
 			client_address: None,
 			vars: HashMap::new(),
 		}
@@ -334,6 +340,12 @@ impl HookContextBuilder {
 		self
 	}
 
+	/// Mark this action as pre-approved (a related token under an owner-vouched APRV)
+	pub fn pre_approved(mut self, pre_approved: bool) -> Self {
+		self.pre_approved = pre_approved;
+		self
+	}
+
 	/// Set variables
 	pub fn vars(mut self, vars: HashMap<String, serde_json::Value>) -> Self {
 		self.vars = vars;
@@ -359,6 +371,7 @@ impl HookContextBuilder {
 			tenant_type: self.tenant_type,
 			is_inbound: self.is_inbound,
 			is_outbound: self.is_outbound,
+			pre_approved: self.pre_approved,
 			client_address: self.client_address,
 			vars: self.vars,
 		}
@@ -509,6 +522,7 @@ mod tests {
 			tenant_type: "user".to_string(),
 			is_inbound: false,
 			is_outbound: true,
+			pre_approved: false,
 			client_address: None,
 			vars: HashMap::new(),
 		};

@@ -37,6 +37,9 @@ pub enum VisibilityLevel {
 	Follower,
 	/// Authenticated user who is connected (mutual) with owner
 	Connected,
+	/// Readable by any active subscriber of the action's container (group members).
+	/// Owner/tenant pass the base check; subscribers pass via the audience bridge.
+	Subscribed,
 	/// Most restrictive - only owner and explicit audience
 	#[default]
 	Direct,
@@ -51,6 +54,7 @@ impl VisibilityLevel {
 			Some('2') => Self::SecondDegree,
 			Some('F') => Self::Follower,
 			Some('C') => Self::Connected,
+			Some('S') => Self::Subscribed,
 			// NULL or unknown = Direct (most restrictive, secure by default)
 			None | Some(_) => Self::Direct,
 		}
@@ -64,6 +68,7 @@ impl VisibilityLevel {
 			Self::SecondDegree => Some('2'),
 			Self::Follower => Some('F'),
 			Self::Connected => Some('C'),
+			Self::Subscribed => Some('S'),
 			Self::Direct => None,
 		}
 	}
@@ -76,6 +81,7 @@ impl VisibilityLevel {
 			Self::SecondDegree => "second_degree",
 			Self::Follower => "follower",
 			Self::Connected => "connected",
+			Self::Subscribed => "subscribed",
 			Self::Direct => "direct",
 		}
 	}
@@ -115,7 +121,9 @@ impl SubjectAccessLevel {
 			VisibilityLevel::SecondDegree => self >= Self::SecondDegree,
 			VisibilityLevel::Follower => self >= Self::Follower,
 			VisibilityLevel::Connected => self >= Self::Connected,
-			VisibilityLevel::Direct => self >= Self::Owner, // Only owner for direct
+			// Both admit only owner/tenant here; subscribers/explicit-audience readers
+			// pass via the audience bridge in `can_view_item`.
+			VisibilityLevel::Subscribed | VisibilityLevel::Direct => self >= Self::Owner,
 		}
 	}
 
@@ -175,8 +183,10 @@ pub fn can_view_item(ctx: &ViewCheckContext<'_>) -> bool {
 		return true;
 	}
 
-	// For Direct visibility, also check explicit audience
-	if visibility == VisibilityLevel::Direct
+	// Direct and Subscribed also check explicit audience. For Subscribed,
+	// `filter.rs` injects the reader into `audience_tags` when they hold an active
+	// SUBS to the container (group membership).
+	if (visibility == VisibilityLevel::Direct || visibility == VisibilityLevel::Subscribed)
 		&& let Some(tags) = ctx.audience_tags
 	{
 		return tags.contains(&ctx.subject_id_tag);
@@ -690,5 +700,86 @@ mod tests {
 	fn test_permission_checker_creation() {
 		let checker = PermissionChecker::new();
 		assert_eq!(checker.profile_policies.len(), 0);
+	}
+
+	#[test]
+	fn test_subscribed_level_char_roundtrip() {
+		assert_eq!(VisibilityLevel::from_char(Some('S')), VisibilityLevel::Subscribed);
+		assert_eq!(VisibilityLevel::Subscribed.to_char(), Some('S'));
+		assert_eq!(VisibilityLevel::Subscribed.as_str(), "subscribed");
+	}
+
+	#[test]
+	fn test_subscribed_can_access_base_check() {
+		// Only owner/tenant pass the base check; everyone else must go through the
+		// audience/subscription bridge in `can_view_item`.
+		assert!(SubjectAccessLevel::Owner.can_access(VisibilityLevel::Subscribed));
+		assert!(!SubjectAccessLevel::Connected.can_access(VisibilityLevel::Subscribed));
+		assert!(!SubjectAccessLevel::Follower.can_access(VisibilityLevel::Subscribed));
+		assert!(!SubjectAccessLevel::Verified.can_access(VisibilityLevel::Subscribed));
+		assert!(!SubjectAccessLevel::Public.can_access(VisibilityLevel::Subscribed));
+	}
+
+	#[test]
+	fn test_subscribed_view_via_audience_bridge() {
+		// A member injected into audience_tags (by filter.rs) can view a Subscribed row
+		// issued by a co-member, despite having no follow/connect relationship.
+		let member = "alice.example.com";
+		let ctx = ViewCheckContext {
+			subject_id_tag: member,
+			is_authenticated: true,
+			item_owner_id_tag: "bob.example.com", // a different member
+			tenant_id_tag: "home.example.com",
+			visibility: Some('S'),
+			subject_following_owner: false,
+			subject_connected_to_owner: false,
+			audience_tags: Some(&[member]),
+		};
+		assert!(can_view_item(&ctx));
+	}
+
+	#[test]
+	fn test_subscribed_denied_when_not_member() {
+		// A non-member (not in audience_tags) cannot view a Subscribed row.
+		let ctx = ViewCheckContext {
+			subject_id_tag: "carol.example.com",
+			is_authenticated: true,
+			item_owner_id_tag: "bob.example.com",
+			tenant_id_tag: "home.example.com",
+			visibility: Some('S'),
+			subject_following_owner: false,
+			subject_connected_to_owner: false,
+			audience_tags: Some(&[]),
+		};
+		assert!(!can_view_item(&ctx));
+	}
+
+	#[test]
+	fn test_subscribed_owner_and_tenant_shortcut() {
+		// The issuer views their own Subscribed row without the audience bridge.
+		let ctx = ViewCheckContext {
+			subject_id_tag: "bob.example.com",
+			is_authenticated: true,
+			item_owner_id_tag: "bob.example.com",
+			tenant_id_tag: "home.example.com",
+			visibility: Some('S'),
+			subject_following_owner: false,
+			subject_connected_to_owner: false,
+			audience_tags: Some(&[]),
+		};
+		assert!(can_view_item(&ctx));
+
+		// The node tenant reads any Subscribed row hosted on their own node.
+		let ctx_tenant = ViewCheckContext {
+			subject_id_tag: "home.example.com",
+			is_authenticated: true,
+			item_owner_id_tag: "bob.example.com",
+			tenant_id_tag: "home.example.com",
+			visibility: Some('S'),
+			subject_following_owner: false,
+			subject_connected_to_owner: false,
+			audience_tags: Some(&[]),
+		};
+		assert!(can_view_item(&ctx_tenant));
 	}
 }

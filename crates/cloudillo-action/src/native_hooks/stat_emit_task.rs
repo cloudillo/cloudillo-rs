@@ -153,7 +153,7 @@ pub(crate) async fn count_reposts(app: &App, tn_id: TnId, subject_id: &str) -> C
 	use cloudillo_types::meta_adapter::{ActionCountGroupBy, ListActionOptions};
 	let opts = ListActionOptions {
 		typ: Some(vec!["REPOST".into()]),
-		subject: Some(subject_id.to_string()),
+		subject: Some(vec![subject_id.to_string()]),
 		..Default::default() // status unset → default "active" filter
 	};
 	// Exclude REPOST:DEL marker rows, mirroring react::count_reactions. Normal

@@ -163,16 +163,21 @@ pub async fn create_action(
 	// Serialize content Value to string for storage (always JSON-encode)
 	let content_str = helpers::serialize_content(action.content.as_ref());
 
-	// Resolve visibility: explicit > parent inheritance > user default > 'F'
+	// Resolve visibility: explicit > parent-inherit > subject-inherit > type-default
+	// > user-default > 'F'.
 	let visibility = helpers::inherit_visibility(
 		app.meta_adapter.as_ref(),
 		tn_id,
 		action.visibility,
 		action.parent_id.as_deref(),
+		action.subject.as_deref(),
 	)
 	.await;
 
-	// If no visibility from explicit or parent, use user's default setting
+	// Type default from the action definition's BehaviorFlags (e.g. CONV → 'S')
+	let visibility = visibility.or_else(|| behavior.as_ref().and_then(|b| b.default_visibility));
+
+	// If still unresolved, use user's default setting, then fall back to 'F'
 	let visibility = if visibility.is_some() {
 		visibility
 	} else {
@@ -183,12 +188,9 @@ pub async fn create_action(
 		}
 	};
 
-	// Open actions (uppercase 'O' flag) should be Connected visibility for discoverability
-	let visibility = if helpers::is_open(action.flags.as_deref()) {
-		Some('C') // Connected visibility for open groups
-	} else {
-		visibility
-	};
+	// Open ('O') actions are promoted to Connected for discoverability — but a
+	// resolved 'S' never is; see `helpers::apply_open_flag_visibility` for why.
+	let visibility = helpers::apply_open_flag_visibility(action.flags.as_deref(), visibility);
 
 	let mut action = action;
 	action.visibility = visibility;
@@ -249,6 +251,23 @@ pub async fn create_action(
 			}
 		}
 	}
+
+	// Enforce declared field constraints + content schema on the create path, using
+	// the final canonicalized field set (post REPOST subject-flattening / visibility
+	// resolution) — the exact shape that will be signed and federated. Mirrors the
+	// inbound check in `process.rs` so a locally-created action that violates its own
+	// DSL schema is rejected here (4xx to the client) instead of silently by every
+	// receiving peer. Drafts are validated too: they publish later with these fields.
+	// `validate_*` returns `Error::ValidationError`; `?` maps it to a 4xx response.
+	dsl.validate_field_constraints(
+		action.typ.as_ref(),
+		action.content.as_ref().is_some_and(|c| !c.is_null()),
+		action.audience_tag.is_some(),
+		action.subject.is_some(),
+		action.parent_id.is_some(),
+		action.attachments.as_ref().is_some_and(|a| !a.is_empty()),
+	)?;
+	dsl.validate_content(action.typ.as_ref(), action.content.as_ref())?;
 
 	// Resolve root_id from parent chain (auto-populated, not client-specified)
 	let root_id =
@@ -876,6 +895,7 @@ async fn schedule_delivery(
 		tn_id,
 		action_id,
 		action.parent_id.as_deref(),
+		action.subject.as_deref(),
 		id_tag, // issuer = ourselves for outbound
 	)
 	.await?;
@@ -1232,6 +1252,65 @@ mod tests {
 		assert_eq!(action.typ.as_ref(), "POST");
 		assert!(action.audience_tag.is_none());
 		assert_eq!(action.flags.as_deref(), Some("RC"));
+	}
+
+	/// Run the exact field-constraint + content validation the create path applies
+	/// (see the block above `resolve_root_id` in `create_action`) against a
+	/// `CreateAction`, so the `CreateAction`-field → validator-arg mapping is under
+	/// test without needing a full `App`. Mirrors the inbound check in `process.rs`.
+	fn run_create_validation(dsl: &crate::dsl::DslEngine, action: &CreateAction) -> ClResult<()> {
+		dsl.validate_field_constraints(
+			action.typ.as_ref(),
+			action.content.as_ref().is_some_and(|c| !c.is_null()),
+			action.audience_tag.is_some(),
+			action.subject.is_some(),
+			action.parent_id.is_some(),
+			action.attachments.as_ref().is_some_and(|a| !a.is_empty()),
+		)?;
+		dsl.validate_content(action.typ.as_ref(), action.content.as_ref())
+	}
+
+	#[test]
+	fn test_create_path_rejects_field_constraint_violation() {
+		let mut dsl = crate::dsl::DslEngine::new();
+		// APRV forbids content and requires a subject (the approved action).
+		dsl.load_definition_from_json(
+			r#"
+			{
+				"type": "APRV",
+				"version": "1.0",
+				"description": "Owner approval relay",
+				"fields": {
+					"content": "forbidden",
+					"subject": "required"
+				},
+				"behavior": {},
+				"hooks": {}
+			}
+			"#,
+		)
+		.expect("definition should load");
+
+		// Violates the content=Forbidden constraint → rejected at create.
+		let bad = CreateAction {
+			typ: "APRV".into(),
+			subject: Some("a1~subject".into()),
+			content: Some(serde_json::Value::String("nope".to_string())),
+			..Default::default()
+		};
+		assert!(matches!(run_create_validation(&dsl, &bad), Err(Error::ValidationError(_))));
+
+		// Well-formed APRV: subject present, no content → accepted.
+		let good = CreateAction {
+			typ: "APRV".into(),
+			subject: Some("a1~subject".into()),
+			..Default::default()
+		};
+		assert!(run_create_validation(&dsl, &good).is_ok());
+
+		// Missing the required subject → rejected too.
+		let no_subject = CreateAction { typ: "APRV".into(), ..Default::default() };
+		assert!(matches!(run_create_validation(&dsl, &no_subject), Err(Error::ValidationError(_))));
 	}
 }
 

@@ -84,6 +84,29 @@ pub async fn list_actions(
 	let limit = opts.limit.unwrap_or(20) as usize;
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
 
+	// Aggregate-only path: return a COUNT(*) of matching rows. Runs the SQL
+	// visibility guard (`push_visibility_guard`, the query-level equivalent of
+	// `filter_actions_by_visibility` below) so it can't leak private aggregates on
+	// this guest route. Wire contract: a `count=true` response has an empty `data`
+	// array and surfaces the count only under `cursorPagination.count`.
+	if opts.count == Some(true) {
+		// Tenant/owner sees everything (Owner level); everyone else is guarded to
+		// what they may view; guest → Public only.
+		let sees_all = is_authenticated && subject_id_tag == tenant_id_tag.as_ref();
+		opts.visibility_guard = if sees_all {
+			types::Patch::Undefined // tenant/owner: sees everything
+		} else if is_authenticated {
+			types::Patch::Value(subject_id_tag.to_string())
+		} else {
+			types::Patch::Null // guest → only Public rows
+		};
+		let n = app.meta_adapter.count_actions(tn_id, &opts).await?;
+		return Ok((
+			StatusCode::OK,
+			Json(ApiResponse::with_count(n).with_req_id(req_id.unwrap_or_default())),
+		));
+	}
+
 	let actions = app.meta_adapter.list_actions(tn_id, &opts).await?;
 
 	let mut filtered = filter_actions_by_visibility(
@@ -1131,7 +1154,7 @@ async fn find_tenant_aprv_token(
 ) -> Option<Box<str>> {
 	let opts = meta_adapter::ListActionOptions {
 		typ: Some(vec!["APRV".into()]),
-		subject: Some(primary_id.to_string()),
+		subject: Some(vec![primary_id.to_string()]),
 		status: Some(vec!["A".into()]),
 		issuer: Some(tenant_id_tag.to_string()),
 		viewer_id_tag: Some(requester_id_tag.to_string()),

@@ -48,15 +48,26 @@ pub async fn filter_actions_by_visibility(
 		subject_has_peer_relation_to_tenant(app, tn_id, subject_id_tag, tenant_id_tag).await?
 	};
 
-	// Identify subscribable actions with Direct visibility that need subscriber lookup
-	let subscribable_direct: Vec<&str> = actions
+	// Identify the container ids whose subscriber set gates read access:
+	// - subscribable actions with Direct visibility (legacy subscriber-bridge):
+	//   the container is the action itself.
+	// - actions with Subscribed ('S') visibility: the container is resolved via
+	//   `root_id ?? subject ?? action_id` (CONV → itself, MSG → root CONV,
+	//   SUBS/INVT → subject CONV).
+	let mut container_ids: HashSet<&str> = actions
 		.iter()
 		.filter(|a| a.visibility.is_none() && is_subscribable(app, &a.typ))
 		.map(|a| a.action_id.as_ref())
 		.collect();
+	for a in &actions {
+		if a.visibility == Some('S') {
+			container_ids.insert(subscribed_container_id(a));
+		}
+	}
+	let container_ids: Vec<&str> = container_ids.into_iter().collect();
 
-	// Batch load subscribers for subscribable Direct-visibility actions
-	let subscribers_map = load_subscribers(app, tn_id, &subscribable_direct).await;
+	// Batch load subscribers for every distinct container
+	let subscribers_map = load_subscribers(app, tn_id, &container_ids).await;
 
 	// Filter actions based on visibility
 	debug!(
@@ -92,6 +103,15 @@ pub async fn filter_actions_by_visibility(
 				audience.push(subject_id_tag);
 			}
 
+			// For Subscribed ('S') actions, admit the reader if they are an active
+			// subscriber of the action's container (i.e. a group member).
+			if action.visibility == Some('S')
+				&& let Some(subs) = subscribers_map.get(subscribed_container_id(action))
+				&& subs.contains(subject_id_tag)
+			{
+				audience.push(subject_id_tag);
+			}
+
 			let allowed = can_view_item(&ViewCheckContext {
 				subject_id_tag,
 				is_authenticated,
@@ -120,6 +140,20 @@ pub async fn filter_actions_by_visibility(
 	Ok(filtered)
 }
 
+/// Resolve the container id whose subscribers may read a Subscribed ('S') action.
+///
+/// One general rule: `root_id ?? subject ?? action_id`.
+/// - CONV itself → `action_id` (its own subscribers are its members)
+/// - MSG → `root_id` (the thread's root CONV)
+/// - SUBS / INVT → `subject` (parent is forbidden, so `root_id` is empty)
+fn subscribed_container_id(action: &ActionView) -> &str {
+	action
+		.root_id
+		.as_deref()
+		.or(action.subject.as_deref())
+		.unwrap_or(action.action_id.as_ref())
+}
+
 /// Check if action type is subscribable based on DSL definition
 fn is_subscribable(app: &App, action_type: &str) -> bool {
 	app.ext::<Arc<DslEngine>>()
@@ -142,7 +176,7 @@ async fn load_subscribers(
 	for action_id in action_ids {
 		let subs_opts = ListActionOptions {
 			typ: Some(vec!["SUBS".into()]),
-			subject: Some((*action_id).to_string()),
+			subject: Some(vec![(*action_id).to_string()]),
 			status: Some(vec!["A".into()]),
 			exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
 			..Default::default()
@@ -197,6 +231,79 @@ pub(crate) async fn subject_has_peer_relation_to_tenant(
 		Ok((_, p)) => Ok(p.follower),
 		Err(Error::NotFound) => Ok(false),
 		Err(e) => Err(e),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use cloudillo_types::meta_adapter::{ProfileInfo, ProfileType};
+
+	fn action_view(
+		action_id: &str,
+		typ: &str,
+		root_id: Option<&str>,
+		subject: Option<&str>,
+	) -> ActionView {
+		ActionView {
+			action_id: action_id.into(),
+			typ: typ.into(),
+			sub_typ: None,
+			parent_id: None,
+			root_id: root_id.map(Into::into),
+			issuer: ProfileInfo {
+				id_tag: "alice.example.com".into(),
+				name: "Alice".into(),
+				typ: ProfileType::Person,
+				profile_pic: None,
+			},
+			audience: None,
+			content: None,
+			attachments: None,
+			subject: subject.map(Into::into),
+			subject_profile: None,
+			subject_action: None,
+			created_at: Timestamp(0),
+			received_at: None,
+			expires_at: None,
+			status: Some("A".into()),
+			stat: None,
+			visibility: Some('S'),
+			flags: None,
+			sub_level: None,
+			x: None,
+			token: None,
+		}
+	}
+
+	#[test]
+	fn test_subscribed_container_id_conv_is_itself() {
+		// CONV has no root_id/subject → container is its own action_id.
+		let conv = action_view("a1~conv", "CONV", None, None);
+		assert_eq!(subscribed_container_id(&conv), "a1~conv");
+	}
+
+	#[test]
+	fn test_subscribed_container_id_msg_uses_root() {
+		// MSG carries root_id = CONV → container is the root.
+		let msg = action_view("a2~msg", "MSG", Some("a1~conv"), None);
+		assert_eq!(subscribed_container_id(&msg), "a1~conv");
+	}
+
+	#[test]
+	fn test_subscribed_container_id_subs_uses_subject() {
+		// SUBS/INVT forbid parent (no root_id) and reference the CONV via subject.
+		let subs = action_view("a3~subs", "SUBS", None, Some("a1~conv"));
+		assert_eq!(subscribed_container_id(&subs), "a1~conv");
+		let invt = action_view("a4~invt", "INVT", None, Some("a1~conv"));
+		assert_eq!(subscribed_container_id(&invt), "a1~conv");
+	}
+
+	#[test]
+	fn test_subscribed_container_id_root_beats_subject() {
+		// General rule is root_id ?? subject ?? action_id — root wins when both present.
+		let a = action_view("a5~x", "MSG", Some("a1~root"), Some("a9~subj"));
+		assert_eq!(subscribed_container_id(&a), "a1~root");
 	}
 }
 

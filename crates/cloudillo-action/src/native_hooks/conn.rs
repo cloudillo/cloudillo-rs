@@ -35,7 +35,7 @@ use cloudillo_types::meta_adapter::{ProfileConnectionStatus, UpsertProfileFields
 async fn retire_community_invitations(app: &App, tn_id: TnId, community_tag: &str, invitee: &str) {
 	let invt_opts = cloudillo_types::meta_adapter::ListActionOptions {
 		typ: Some(vec!["INVT".to_string()]),
-		subject: Some(format!("@{}", community_tag)),
+		subject: Some(vec![format!("@{}", community_tag)]),
 		audience: Some(invitee.to_string()),
 		status: Some(vec!["A".to_string()]),
 		..Default::default()
@@ -268,7 +268,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			// different subject and fall through to the connection_mode arm below.
 			let invt_opts = cloudillo_types::meta_adapter::ListActionOptions {
 				typ: Some(vec!["INVT".to_string()]),
-				subject: Some(format!("@{}", local_tag)),
+				subject: Some(vec![format!("@{}", local_tag)]),
 				audience: Some(context.issuer.clone()),
 				status: Some(vec!["A".to_string()]),
 				limit: Some(1),

@@ -33,7 +33,7 @@ use cloudillo_types::reactions;
 pub(crate) async fn count_reactions(app: &App, tn_id: TnId, subject_id: &str) -> ClResult<String> {
 	let opts = ListActionOptions {
 		typ: Some(vec!["REACT".into()]),
-		subject: Some(subject_id.to_string()),
+		subject: Some(vec![subject_id.to_string()]),
 		..Default::default() // status unset → default "active" filter NOT IN ('D','V','F')
 	};
 	let grouped = app

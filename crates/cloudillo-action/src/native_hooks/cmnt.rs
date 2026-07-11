@@ -74,7 +74,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	// active CMNT children + newest active child's created_at). Recomputing —
 	// rather than ±1 / max-with-incoming — keeps both the federated count and the
 	// unread-dot timestamp correct across creates and deletes without drift.
-	let (count, comments_ts) = recompute_comment_stats(&app, tn_id, parent_id).await?;
+	let (count, comments_ts) = recompute_comment_stats(&app, tn_id, parent_id, &["CMNT"]).await?;
 	tracing::info!(
 		"CMNT{} on_create: {} on {} → STAT broadcast (count={}, ts={})",
 		if context.subtype.as_deref() == Some("DEL") { ":DEL" } else { "" },
@@ -140,7 +140,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 	// Recompute the parent's comment stats from its live child rows — see the
 	// on_create path for the rationale (count + newest-child timestamp, no drift).
-	let (count, comments_ts) = recompute_comment_stats(&app, tn_id, parent_id).await?;
+	let (count, comments_ts) = recompute_comment_stats(&app, tn_id, parent_id, &["CMNT"]).await?;
 	tracing::info!(
 		"CMNT{} on_receive: {} on our action {} → STAT broadcast (count={}, ts={})",
 		if context.subtype.as_deref() == Some("DEL") { ":DEL" } else { "" },
@@ -181,18 +181,22 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 }
 
 /// Recompute `(comment_count, last_comment_ts)` for `parent_id` from its live
-/// child CMNT rows. The count mirrors `count_reposts` (grouped count excluding
-/// DEL markers); the timestamp is the newest active child's `created_at`, used
-/// for the unread-comment dot. Returns `(0, 0)` for a thread with no active
-/// comments.
+/// children of `child_types`: grouped count excluding DEL markers, plus the
+/// newest active child's `created_at` (drives the unread dot). `(0, 0)` when
+/// empty. `child_types` selects the children — `&["CMNT"]` for a post's comment
+/// thread, `&["MSG"]` for a group CONV (structurally a post with comments, so it
+/// reuses the same `comments`/`comments_ts` columns).
 pub(crate) async fn recompute_comment_stats(
 	app: &App,
 	tn_id: TnId,
 	parent_id: &str,
+	child_types: &[&str],
 ) -> ClResult<(u32, i64)> {
-	// Count active CMNT children (exclude DEL markers), like count_reposts.
+	let typ: Vec<String> = child_types.iter().map(|t| (*t).to_string()).collect();
+
+	// Count active children (exclude DEL markers), like count_reposts.
 	let count_opts = ListActionOptions {
-		typ: Some(vec!["CMNT".into()]),
+		typ: Some(typ.clone()),
 		parent_id: Some(parent_id.to_string()),
 		..Default::default() // status unset → default "active" filter
 	};
@@ -209,7 +213,7 @@ pub(crate) async fn recompute_comment_stats(
 
 	// Newest active child's created_at → last-comment timestamp for the dot.
 	let newest_opts = ListActionOptions {
-		typ: Some(vec!["CMNT".into()]),
+		typ: Some(typ),
 		parent_id: Some(parent_id.to_string()),
 		sort: Some("created".into()),
 		sort_dir: Some("desc".into()),

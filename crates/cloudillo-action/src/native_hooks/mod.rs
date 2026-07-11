@@ -28,6 +28,7 @@ pub mod fllw;
 pub mod fshr;
 pub mod idp;
 pub mod invt;
+pub mod msg;
 pub(crate) mod ownership;
 pub mod prinvt;
 pub mod react;
@@ -157,6 +158,20 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		tracing::info!("Registered native hooks for CMNT action type");
 	}
 
+	// MSG hooks — a group MSG (parent = CONV) maintains the CONV's comment-style
+	// counters, reusing the same machinery CMNT uses (see native_hooks::msg).
+	{
+		let msg_hooks = ActionTypeHooks {
+			on_create: Some(Arc::new(|app, ctx| Box::pin(msg::on_create(app, ctx)))),
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(msg::on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("MSG", msg_hooks);
+		tracing::info!("Registered native hooks for MSG action type");
+	}
+
 	// APRV hooks
 	{
 		let aprv_hooks = ActionTypeHooks {
@@ -248,6 +263,8 @@ mod tests {
 		let _ = aprv::on_receive;
 		let _ = cmnt::on_create;
 		let _ = cmnt::on_receive;
+		let _ = msg::on_create;
+		let _ = msg::on_receive;
 		let _ = conn::on_create;
 		let _ = conn::on_receive;
 		let _ = conn::on_accept;

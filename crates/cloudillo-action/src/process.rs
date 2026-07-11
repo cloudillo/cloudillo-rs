@@ -294,6 +294,23 @@ async fn process_inbound_action_token_inner(
 	// 3. Resolve definition (try full type, then base type)
 	let (_definition_type, definition) = resolve_definition(app, &action.t)?;
 
+	// 3b. Enforce declared field constraints + content schema on inbound actions.
+	// `validate_*` returns `Error::ValidationError`; `?` propagates it to the
+	// inbox/HTTP error response. Runs for normal inbound AND pre-approved related
+	// tokens, so a smuggled/malformed related token is rejected too.
+	{
+		let dsl = app.ext::<Arc<DslEngine>>()?;
+		dsl.validate_field_constraints(
+			&action.t,
+			action.c.as_ref().is_some_and(|c| !c.is_null()),
+			action.aud.is_some(),
+			action.sub.is_some(),
+			action.p.is_some(),
+			action.a.as_ref().is_some_and(|a| !a.is_empty()),
+		)?;
+		dsl.validate_content(&action.t, action.c.as_ref())?;
+	}
+
 	// 4. Check permissions (skip for pre-approved related actions)
 	if skip_permission_check {
 		debug!(
@@ -337,6 +354,7 @@ async fn process_inbound_action_token_inner(
 		tn_id,
 		action.v,
 		action.p.as_deref(),
+		action.sub.as_deref(),
 	)
 	.await;
 
@@ -444,7 +462,8 @@ async fn process_inbound_action_token_inner(
 			.collect()
 	});
 
-	let ctx = ProcessingContext::Inbound { client_address, is_sync };
+	let ctx =
+		ProcessingContext::Inbound { client_address, is_sync, pre_approved: skip_permission_check };
 	let result = post_store::process_after_store(
 		app,
 		tn_id,
@@ -642,6 +661,23 @@ async fn check_inbound_permissions(
 	if action.t.as_ref() == "STAT"
 		&& let Some(target_id) = action.p.as_deref()
 		&& matches!(app.meta_adapter.get_action(tn_id, target_id).await, Ok(Some(_)))
+	{
+		return Ok(());
+	}
+
+	// R3 — accept a vouching APRV from the owner of a relay_children container we
+	// hold. The APRV's JWT is signature-verified above, so its vouch can't be
+	// forged; the bundled related token is bound to APRV.subject and re-checked in
+	// process_related_actions. Keyed on relay_children, so generic across types.
+	if action.t.as_ref() == "APRV"
+		&& let Some(parent_id) = action.p.as_deref()
+		&& let Ok(Some(container)) = app.meta_adapter.get_action(tn_id, parent_id).await
+		&& app
+			.ext::<Arc<DslEngine>>()?
+			.get_behavior(&container.typ)
+			.and_then(|b| b.relay_children)
+			.unwrap_or(false)
+		&& owns_subject(&container, &action.iss)
 	{
 		return Ok(());
 	}
@@ -1376,10 +1412,34 @@ async fn process_related_actions(app: &App, tn_id: TnId, action_id: &str) {
 
 	info!("Processing {} related actions for {}", related_tokens.len(), action_id);
 
+	// Load the stored main action to enforce the APRV→subject binding. An APRV
+	// pre-approves exactly the action named in its `subject`; a bundled related
+	// token with a different id is smuggled (e.g. a captured public owner-APRV
+	// POSTed with an attacker's own token in `related`) and would bypass the
+	// follower/subscription gates. So only the APRV's declared subject may be
+	// processed pre-approved. Fail closed if the main action can't be read back.
+	let Some(main_action) = app.meta_adapter.get_action(tn_id, action_id).await.ok().flatten()
+	else {
+		warn!(
+			"Cannot load main action {} — skipping related-token processing (fail-closed)",
+			action_id
+		);
+		return;
+	};
+	let main_is_aprv = main_action.typ.as_ref() == "APRV";
+	let aprv_subject: Option<&str> = main_action.subject.as_deref();
+
 	let mut success_count = 0;
 	let mut fail_count = 0;
 
 	for (related_action_id, related_token) in &related_tokens {
+		if main_is_aprv && aprv_subject != Some(&**related_action_id) {
+			warn!(
+				"Skipping related action {} not bound to APRV {} subject {:?}",
+				related_action_id, action_id, aprv_subject
+			);
+			continue;
+		}
 		debug!("Processing related action {}", related_action_id);
 
 		match process_preapproved_action_token(app, tn_id, related_action_id, related_token).await {

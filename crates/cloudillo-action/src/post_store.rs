@@ -15,7 +15,7 @@ use cloudillo_types::meta_adapter::{self, AttachmentView, ProfileStatus};
 use crate::{
 	delivery::ActionDeliveryTask,
 	dsl::DslEngine,
-	fanout::schedule_subscriber_fanout,
+	fanout::{maybe_relay_child_to_subscribers, schedule_subscriber_fanout},
 	forward, helpers,
 	hooks::{HookContext, HookType},
 	prelude::*,
@@ -36,6 +36,10 @@ pub enum ProcessingContext {
 		client_address: Option<String>,
 		/// Whether to process synchronously (for IDP:REG)
 		is_sync: bool,
+		/// True when this action arrived pre-approved (a related token under an
+		/// owner-vouched APRV — `skip_permission_check`). Read by gating hooks
+		/// (e.g. `subs::on_receive`) to accept a relayed copy they'd otherwise reject.
+		pre_approved: bool,
 	},
 }
 
@@ -143,15 +147,28 @@ pub async fn process_after_store(
 		result.ws_forward_deferred = true;
 	}
 
-	// 3. Fan-out to subscribers of subscribable parent chain
-	let fanout_recipients = schedule_subscriber_fanout(
-		app,
-		tn_id,
-		&action.action_id,
-		action.parent_id.as_deref(),
-		&action.issuer_tag,
-	)
-	.await?;
+	// 3. Fan-out to subscribers of the subscribable parent chain.
+	//
+	// When this is an accepted child of a `relay_children` container we own, mint
+	// an owner-signed APRV vouching it; the APRV's own fan-out then federates the
+	// child to every member pre-approved, so suppress the raw fan-out here. Gate on
+	// the hook's resting status — a rejected child (e.g. a stranger SUBS at 'D')
+	// must never be vouched.
+	let accepted = result.status.is_none_or(|s| s == crate::status::ACTIVE);
+	let vouched = accepted && maybe_relay_child_to_subscribers(app, tn_id, action).await?;
+	let fanout_recipients = if vouched {
+		Vec::new()
+	} else {
+		schedule_subscriber_fanout(
+			app,
+			tn_id,
+			&action.action_id,
+			action.parent_id.as_deref(),
+			action.subject.as_deref(),
+			&action.issuer_tag,
+		)
+		.await?
+	};
 
 	// 4. Schedule delivery (with broadcast check)
 	schedule_delivery(app, tn_id, action, &fanout_recipients, &ctx).await?;
@@ -276,7 +293,8 @@ async fn execute_hook(
 				meta_adapter::ProfileType::Person => "person",
 			},
 		)
-		.client_address(ctx.client_address().map(String::from));
+		.client_address(ctx.client_address().map(String::from))
+		.pre_approved(matches!(ctx, ProcessingContext::Inbound { pre_approved: true, .. }));
 
 	hook_context = if ctx.is_outbound() { hook_context.outbound() } else { hook_context.inbound() };
 
@@ -451,6 +469,28 @@ async fn schedule_delivery(
 	let should_broadcast = behavior.as_ref().and_then(|b| b.broadcast).unwrap_or(false);
 
 	if should_broadcast && action.audience_tag.is_none() {
+		// A broadcast action on a non-broadcast parent (e.g. a STAT under a
+		// member-scoped CONV) must NOT fan out to followers — subscriber fan-out
+		// already reaches members, so a follower broadcast is pure leak. Only STAT
+		// carries a parent_id among broadcast=true types, so this is effectively
+		// STAT-scoped and safe for feed POSTs (whose comment STATs hang off a
+		// broadcast=true POST).
+		if let Some(parent_id) = action.parent_id.as_deref() {
+			let parent_broadcasts = match app.meta_adapter.get_action_type(tn_id, parent_id).await?
+			{
+				Some(typ) => dsl.get_behavior(&typ).and_then(|b| b.broadcast).unwrap_or(false),
+				None => false,
+			};
+			if !parent_broadcasts {
+				debug!(
+					"Action {} parent {} is member-scoped (broadcast=false); skipping \
+					 follower broadcast — subscriber fan-out already covers members",
+					action.action_id, parent_id
+				);
+				return Ok(());
+			}
+		}
+
 		// Self-posted broadcast action (no audience = posting to own wall)
 		debug!(
 			"Action {} (type={}) has broadcast=true and no audience, fanning out to followers",

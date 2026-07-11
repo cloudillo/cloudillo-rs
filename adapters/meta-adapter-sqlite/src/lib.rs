@@ -216,6 +216,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::count_grouped(&self.dbr, tn_id, opts, group_by).await
 	}
 
+	async fn count_actions(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64> {
+		action::count(&self.dbr, tn_id, opts).await
+	}
+
 	async fn set_read_marker(
 		&self,
 		tn_id: TnId,
@@ -463,6 +467,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn get_action(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<ActionView>> {
 		action::get(&self.dbr, tn_id, action_id, None, true).await
+	}
+
+	async fn get_action_type(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<Box<str>>> {
+		action::get_type(&self.dbr, tn_id, action_id).await
 	}
 
 	async fn update_action(

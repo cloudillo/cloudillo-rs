@@ -485,6 +485,7 @@ mod tests {
 			tenant_type: "person".to_string(),
 			is_inbound: false,
 			is_outbound: true,
+			pre_approved: false,
 			client_address: None,
 			vars: HashMap::new(),
 		}

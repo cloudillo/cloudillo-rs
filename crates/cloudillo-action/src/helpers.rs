@@ -8,6 +8,7 @@ use std::convert::Infallible;
 use std::str::FromStr;
 
 use crate::prelude::*;
+use crate::subject_ref::{SubjectRef, parse_subject_ref};
 use cloudillo_types::meta_adapter::MetaAdapter;
 
 /// Extract type and optional subtype from type string (e.g., "POST:TEXT" -> ("POST", Some("TEXT")))
@@ -63,12 +64,18 @@ pub(crate) fn content_snippet(content: Option<&serde_json::Value>) -> String {
 	raw.chars().take(200).collect()
 }
 
-/// Inherit visibility from parent action if not explicitly set
+/// Inherit visibility from the parent action, else from an action `subject`.
+///
+/// MSG inherits from `parent_id`; SUBS/INVT (which forbid a parent and reference
+/// their container CONV via `subject`) inherit from that subject action. Only
+/// **action** subjects count — identity subjects (`@community`) have no action
+/// to inherit from and fall through to the type/user default.
 pub async fn inherit_visibility<M: MetaAdapter + ?Sized>(
 	meta_adapter: &M,
 	tn_id: TnId,
 	visibility: Option<char>,
 	parent_id: Option<&str>,
+	subject: Option<&str>,
 ) -> Option<char> {
 	if visibility.is_some() {
 		return visibility;
@@ -77,6 +84,12 @@ pub async fn inherit_visibility<M: MetaAdapter + ?Sized>(
 		&& let Ok(Some(parent)) = meta_adapter.get_action(tn_id, parent_id).await
 	{
 		return parent.visibility;
+	}
+	if let Some(subject) = subject
+		&& matches!(parse_subject_ref(subject), Some(SubjectRef::Action(_)))
+		&& let Ok(Some(subj)) = meta_adapter.get_action(tn_id, subject).await
+	{
+		return subj.visibility;
 	}
 	None
 }
@@ -158,6 +171,21 @@ pub fn can_comment(flags: Option<&str>) -> bool {
 /// Returns true if 'O' is present in flags, false otherwise
 pub fn is_open(flags: Option<&str>) -> bool {
 	flags.is_some_and(|f| f.contains('O'))
+}
+
+/// Apply the open ('O') flag visibility promotion for new actions.
+///
+/// Open actions get Connected ('C') visibility, but a resolved 'S' (Subscribed)
+/// is NEVER promoted: visibility cascades via `inherit_visibility`, so promoting
+/// an open CONV to 'C' would expose its MSG children and SUBS roster rows to mere
+/// connections. Open-group discovery happens at the community-profile layer, so
+/// keeping 'S' costs no discoverability.
+pub fn apply_open_flag_visibility(flags: Option<&str>, visibility: Option<char>) -> Option<char> {
+	if is_open(flags) && visibility != Some('S') {
+		Some('C') // Connected visibility for open groups
+	} else {
+		visibility
+	}
 }
 
 // =============================================================================
@@ -422,6 +450,21 @@ mod tests {
 	fn test_is_open_lowercase() {
 		assert!(!is_open(Some("RCo")));
 		assert!(!is_open(Some("rc")));
+	}
+
+	// Regression: an open ('O') group's 'S' must never be promoted to 'C' — it
+	// would cascade into MSG/SUBS children and leak group content + roster.
+	#[test]
+	fn test_open_flag_never_promotes_subscribed() {
+		// An open CONV's 'S' survives the open flag…
+		assert_eq!(apply_open_flag_visibility(Some("rcO"), Some('S')), Some('S'));
+		assert_eq!(apply_open_flag_visibility(Some("O"), Some('S')), Some('S'));
+		// …other resolved visibilities are promoted for discoverability…
+		assert_eq!(apply_open_flag_visibility(Some("rcO"), Some('F')), Some('C'));
+		assert_eq!(apply_open_flag_visibility(Some("O"), None), Some('C'));
+		// …and closed (no 'O') actions are untouched.
+		assert_eq!(apply_open_flag_visibility(Some("rco"), Some('S')), Some('S'));
+		assert_eq!(apply_open_flag_visibility(None, Some('F')), Some('F'));
 	}
 
 	// Role-based permission tests

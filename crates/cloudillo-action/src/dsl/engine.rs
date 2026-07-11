@@ -516,6 +516,57 @@ impl DslEngine {
 		self.validate_value_against_schema(content, schema, "content")
 	}
 
+	/// Validate an action instance's field presence against the type's declared
+	/// `FieldConstraints` (Required / Forbidden / optional), like `validate_content`
+	/// but for every constrained field. Each bool means "field present (non-null)".
+	/// Resolves the definition with the same full-type-then-base-type fallback as
+	/// `validate_content` (e.g. "REACT:LIKE" → "REACT").
+	#[allow(clippy::fn_params_excessive_bools)]
+	pub fn validate_field_constraints(
+		&self,
+		action_type: &str,
+		has_content: bool,
+		has_audience: bool,
+		has_subject: bool,
+		has_parent: bool,
+		has_attachments: bool,
+	) -> ClResult<()> {
+		let definition = self
+			.definitions
+			.get(action_type)
+			.or_else(|| action_type.split(':').next().and_then(|base| self.definitions.get(base)))
+			.ok_or_else(|| {
+				Error::ValidationError(format!("Unknown action type: {}", action_type))
+			})?;
+
+		let fields = &definition.fields;
+		for (name, constraint, present) in [
+			("content", fields.content, has_content),
+			("audience", fields.audience, has_audience),
+			("subject", fields.subject, has_subject),
+			("parent", fields.parent, has_parent),
+			("attachments", fields.attachments, has_attachments),
+		] {
+			match constraint {
+				Some(FieldConstraint::Required) if !present => {
+					return Err(Error::ValidationError(format!(
+						"Field '{}' is required for action type {}",
+						name, action_type
+					)));
+				}
+				Some(FieldConstraint::Forbidden) if present => {
+					return Err(Error::ValidationError(format!(
+						"Field '{}' is forbidden for action type {}",
+						name, action_type
+					)));
+				}
+				_ => {}
+			}
+		}
+
+		Ok(())
+	}
+
 	/// Validate a value against a content schema
 	fn validate_value_against_schema(
 		&self,
@@ -757,6 +808,8 @@ pub struct HookCounts {
 
 #[cfg(test)]
 mod tests {
+	use super::*;
+
 	#[test]
 	fn test_load_definition_from_json() {
 		let _ = r#"
@@ -772,6 +825,72 @@ mod tests {
 
 		// Note: Can't create App in test without full initialization
 		// This test would need mock/test fixtures
+	}
+
+	#[test]
+	fn test_validate_field_constraints() {
+		let mut engine = DslEngine::new();
+		// content Required, audience Forbidden, subject Required; parent/attachments optional.
+		engine
+			.load_definition_from_json(
+				r#"
+				{
+					"type": "TFLD",
+					"version": "1.0",
+					"description": "Field-constraint test action",
+					"fields": {
+						"content": "required",
+						"audience": "forbidden",
+						"subject": "required"
+					},
+					"behavior": {},
+					"hooks": {}
+				}
+				"#,
+			)
+			.expect("definition should load");
+
+		// Satisfied: content + subject present, audience absent → ok.
+		assert!(
+			engine
+				.validate_field_constraints("TFLD", true, false, true, false, false)
+				.is_ok()
+		);
+
+		// Required-missing: content absent → error.
+		assert!(
+			engine
+				.validate_field_constraints("TFLD", false, false, true, false, false)
+				.is_err()
+		);
+
+		// Required-missing: subject absent → error.
+		assert!(
+			engine
+				.validate_field_constraints("TFLD", true, false, false, false, false)
+				.is_err()
+		);
+
+		// Forbidden-present: audience present → error.
+		assert!(
+			engine
+				.validate_field_constraints("TFLD", true, true, true, false, false)
+				.is_err()
+		);
+
+		// Base-type fallback: subtype resolves to base "TFLD".
+		assert!(
+			engine
+				.validate_field_constraints("TFLD:X", true, false, true, false, false)
+				.is_ok()
+		);
+
+		// Unknown type → error.
+		assert!(
+			engine
+				.validate_field_constraints("NOPE", true, false, true, false, false)
+				.is_err()
+		);
 	}
 }
 

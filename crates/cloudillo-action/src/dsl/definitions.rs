@@ -376,7 +376,7 @@ fn message_definition() -> ActionDefinition {
 		},
 		hooks: ActionHooks {
 			on_create: HookImplementation::None,
-			on_receive: HookImplementation::None, // Auto-approve handled in process.rs; TODO: notification for new messages
+			on_receive: HookImplementation::None, // Native hook (native_hooks::msg); push/email via forward.rs + process.rs
 			on_accept: HookImplementation::None,
 			on_reject: HookImplementation::None,
 		},
@@ -492,7 +492,10 @@ fn aprv_definition() -> ActionDefinition {
 		subtypes: None,
 		fields: FieldConstraints {
 			content: Some(FieldConstraint::Forbidden),
-			audience: Some(FieldConstraint::Required),
+			// Optional: the owner-vouched relay APRV has no single audience (it fans
+			// to subscribers via parent=container). The auto-approve-to-followers
+			// path still sets audience explicitly.
+			audience: None,
 			parent: None,
 			attachments: Some(FieldConstraint::Forbidden),
 			subject: Some(FieldConstraint::Required),
@@ -502,6 +505,9 @@ fn aprv_definition() -> ActionDefinition {
 			broadcast: Some(true),
 			allow_unknown: Some(false),
 			requires_acceptance: Some(false),
+			// On subscriber fan-out (parent=container) bundle the approved child
+			// as the `related` token so members accept it pre-approved.
+			deliver_subject: Some(true),
 			ttl: None,
 			..Default::default()
 		},
@@ -1028,6 +1034,8 @@ fn conv_definition() -> ActionDefinition {
 			requires_subscription: Some(false), // Creating CONV doesn't require subscription
 			default_flags: Some("rco".to_string()), // Default: closed, no reactions/comments on CONV itself
 			subscribable: Some(true),           // CONV can have SUBS pointing to it
+			relay_children: Some(true),         // Owner vouches accepted children (MSG/SUBS) to all members
+			default_visibility: Some('S'),      // Group content readable by members (SUBS/INVT/MSG inherit)
 			..Default::default()
 		},
 		hooks: ActionHooks {
@@ -1379,6 +1387,33 @@ fn apkg_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{content.name}".to_string()),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// Regression: CONV defaults to 'S'; MSG/SUBS have no own default and inherit
+	// it via `helpers::inherit_visibility`. Do not flip CONV to 'C' — see
+	// `helpers::apply_open_flag_visibility` for why that leaks group content and
+	// the roster.
+	#[test]
+	fn conv_default_visibility_is_subscribed_and_children_inherit() {
+		let defs = get_definitions();
+		let conv = defs.iter().find(|d| d.r#type == "CONV").expect("CONV definition");
+		assert_eq!(
+			conv.behavior.default_visibility,
+			Some('S'),
+			"CONV must default to Subscribed so group content stays member-only"
+		);
+		for typ in ["MSG", "SUBS"] {
+			let def = defs.iter().find(|d| d.r#type == typ).expect("definition");
+			assert_eq!(
+				def.behavior.default_visibility, None,
+				"{typ} must have no own visibility default so it inherits the CONV's 'S'"
+			);
+		}
 	}
 }
 
