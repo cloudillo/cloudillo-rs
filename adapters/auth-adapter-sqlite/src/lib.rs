@@ -54,7 +54,8 @@ impl AuthAdapterSqlite {
 		let opts = sqlite::SqliteConnectOptions::new()
 			.filename(&db_path)
 			.create_if_missing(true)
-			.journal_mode(sqlite::SqliteJournalMode::Wal);
+			.journal_mode(sqlite::SqliteJournalMode::Wal)
+			.pragma("temp_store", "MEMORY");
 		let db = sqlite::SqlitePoolOptions::new()
 			.max_connections(5)
 			.connect_with(opts)
