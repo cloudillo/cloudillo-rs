@@ -42,7 +42,7 @@ lru = "0.18"
 parking_lot = "0.12"
 
 # Zip parsing (for app packages)
-rawzip = "0.4"
+rawzip = "0.5"
 
 # Decompression (for app package manifest reading)
 flate2 = "1"

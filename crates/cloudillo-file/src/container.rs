@@ -116,7 +116,7 @@ fn parse_zip_index(data: &[u8]) -> ClResult<ZipIndex> {
 		})?;
 		let path: &str = normalized.as_ref();
 
-		let is_deflated = matches!(entry.compression_method(), rawzip::CompressionMethod::Deflate);
+		let is_deflated = matches!(entry.compression_method(), rawzip::CompressionMethod::DEFLATE);
 
 		// Get the local entry to find data offset
 		let wayfinder = entry.wayfinder();
@@ -237,8 +237,8 @@ pub fn read_manifest(data: &[u8]) -> ClResult<serde_json::Value> {
 			let raw_data = local_entry.data();
 
 			let manifest_bytes = match entry.compression_method() {
-				rawzip::CompressionMethod::Store => raw_data.to_vec(),
-				rawzip::CompressionMethod::Deflate => inflate(raw_data)
+				rawzip::CompressionMethod::STORE => raw_data.to_vec(),
+				rawzip::CompressionMethod::DEFLATE => inflate(raw_data)
 					.map_err(|e| Error::Internal(format!("Failed to inflate manifest: {e}")))?,
 				_ => {
 					return Err(Error::Internal(
