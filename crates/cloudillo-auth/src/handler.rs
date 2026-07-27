@@ -659,6 +659,15 @@ pub async fn get_access_token(
 		// Use authenticated session token - requires auth
 		let auth = maybe_auth.ok_or(Error::Unauthorized)?;
 
+		// A scoped token (e.g. a share link) must never mint a broader session token.
+		// Only this bare, param-less branch is closed: `?via=` (cross-document
+		// re-scoping) accepts a scoped bearer and `?refId=` needs no auth at all —
+		// which is why `cloudillo_core::scope` still allowlists this path for `file:*`.
+		if auth.scope.is_some() {
+			warn!("Scoped token attempted to mint an unscoped session token");
+			return Err(Error::PermissionDenied);
+		}
+
 		debug!(
 			"Using authenticated session for id_tag={}, scope={:?}",
 			auth.id_tag,
@@ -736,6 +745,18 @@ pub async fn get_proxy_token(
 		#[derive(Deserialize)]
 		struct AccessTokenClaims {
 			r: Option<String>,
+		}
+
+		// Federated exchange mints a token in which the *tenant* vouches for the caller
+		// toward a remote server, so it stays owner/leader-only. The local branch below
+		// is an ordinary self-scoped session token and needs only auth.
+		if auth.scope.is_some() || !cloudillo_core::roles::is_leader(&auth.roles) {
+			warn!(
+				subject = %auth.id_tag,
+				target = %target_id_tag,
+				"Federated proxy token denied - owner/leader required"
+			);
+			return Err(Error::PermissionDenied);
 		}
 
 		debug!("Getting federated proxy token for {} -> {}", &auth.id_tag, target_id_tag);
