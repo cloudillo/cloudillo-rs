@@ -236,7 +236,7 @@ pub async fn get_me_idp_status(
 	// IDP status from elsewhere; the local guard is just preventing
 	// unrelated members from clearing `ui.onboarding`.
 	let is_self = host_id_tag.as_ref() == id_tag;
-	let is_leader = auth.roles.iter().any(|r| r.as_ref() == "leader");
+	let is_leader = cloudillo_core::roles::is_leader(&auth.roles);
 	if !(is_self || is_leader) {
 		return Err(Error::PermissionDenied);
 	}
@@ -289,7 +289,7 @@ pub async fn post_me_resend_activation(
 	// Same guard as get_me_idp_status: tenant self-auth, or proxy-token
 	// leader. See get_me_idp_status for the rationale.
 	let is_self = host_id_tag.as_ref() == id_tag;
-	let is_leader = auth.roles.iter().any(|r| r.as_ref() == "leader");
+	let is_leader = cloudillo_core::roles::is_leader(&auth.roles);
 	if !(is_self || is_leader) {
 		return Err(Error::PermissionDenied);
 	}

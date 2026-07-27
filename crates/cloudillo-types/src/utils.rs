@@ -99,6 +99,16 @@ pub fn parse_and_validate_identity_id_tag(
 	}
 }
 
+/// Parse a comma-separated role list into the shape `AuthCtx::roles` expects.
+///
+/// Empty segments are dropped, because `"".split(',')` yields one empty item and a
+/// `""` entry reads as "has a role" in `file_access::role_access_level`, granting
+/// every federated stranger access to tenant-owned files. Every conversion from a
+/// stored/claimed role string to `Box<[Box<str>]>` must go through here.
+pub fn parse_roles(roles: &str) -> Box<[Box<str>]> {
+	roles.split(',').filter(|s| !s.is_empty()).map(Into::into).collect()
+}
+
 /// Mask an email for safe display: "al***@ex***.com"
 pub fn mask_email(email: &str) -> Option<String> {
 	let (local, domain) = email.split_once('@')?;
@@ -168,6 +178,17 @@ mod tests {
 		let result = parse_and_validate_identity_id_tag("alice.example.com", "");
 		assert!(result.is_err());
 	}
+	#[test]
+	fn test_parse_roles() {
+		let as_vec =
+			|s: &str| -> Vec<String> { parse_roles(s).iter().map(ToString::to_string).collect() };
+		assert!(parse_roles("").is_empty());
+		assert_eq!(as_vec("leader"), vec!["leader"]);
+		assert_eq!(as_vec("public,leader"), vec!["public", "leader"]);
+		// Stray separators must not produce `""` entries.
+		assert_eq!(as_vec(",,leader,"), vec!["leader"]);
+	}
+
 	#[test]
 	fn test_mask_email() {
 		assert_eq!(super::mask_email("alice@example.com"), Some("a***@e***.com".to_string()));

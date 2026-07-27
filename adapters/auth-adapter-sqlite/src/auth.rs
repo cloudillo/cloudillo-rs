@@ -14,6 +14,7 @@ use cloudillo_types::{
 	action_types,
 	auth_adapter::{AccessToken, ActionToken, AuthCtx, AuthLogin},
 	prelude::*,
+	utils::parse_roles,
 	worker::WorkerPool,
 };
 
@@ -48,7 +49,7 @@ pub(crate) async fn validate_access_token(
 	Ok(AuthCtx {
 		tn_id,
 		id_tag: token_data.claims.sub.unwrap_or(token_data.claims.iss),
-		roles: token_data.claims.r.unwrap_or("".into()).split(',').map(Box::from).collect(),
+		roles: parse_roles(token_data.claims.r.as_deref().unwrap_or("")),
 		scope: token_data.claims.scope,
 	})
 }
@@ -98,15 +99,6 @@ pub(crate) fn build_tenant_owner_roles(db_roles: Option<&str>) -> Box<str> {
 		Some(extra) if !extra.is_empty() => Box::from(format!("{},{}", BASE_ROLES, extra)),
 		_ => Box::from(BASE_ROLES),
 	}
-}
-
-/// Parse roles string into boxed slice for AuthLogin
-fn parse_roles_to_boxed_slice(roles_str: &str) -> Box<[Box<str>]> {
-	roles_str
-		.split(',')
-		.map(Into::into)
-		.collect::<Vec<Box<str>>>()
-		.into_boxed_slice()
 }
 
 /// Reject soft-deleted tenants (status='X' = purging in progress).
@@ -160,7 +152,7 @@ pub(crate) async fn check_tenant_password(
 			Ok(AuthLogin {
 				tn_id: row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?,
 				id_tag: Box::from(id_tag),
-				roles: Some(parse_roles_to_boxed_slice(&roles_str)),
+				roles: Some(parse_roles(&roles_str)),
 				token,
 			})
 		}
@@ -242,7 +234,7 @@ pub(crate) async fn create_tenant_login(
 			Ok(AuthLogin {
 				tn_id: row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?,
 				id_tag: Box::from(id_tag),
-				roles: Some(parse_roles_to_boxed_slice(&roles_str)),
+				roles: Some(parse_roles(&roles_str)),
 				token,
 			})
 		}
@@ -345,16 +337,20 @@ mod tests {
 	use super::*;
 	use jsonwebtoken::{EncodingKey, Header, encode};
 
-	fn make_token(secret: &[u8], iss: &str) -> String {
+	fn make_token_with_roles(secret: &[u8], iss: &str, roles: Option<&str>) -> String {
 		let claims = AccessToken {
 			iss,
 			sub: Some(iss),
 			scope: None::<&str>,
-			r: Some("leader"),
+			r: roles,
 			exp: Timestamp::from_now(3600),
 		};
 		encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
 			.expect("encode token")
+	}
+
+	fn make_token(secret: &[u8], iss: &str) -> String {
+		make_token_with_roles(secret, iss, Some("leader"))
 	}
 
 	#[tokio::test]
@@ -378,5 +374,44 @@ mod tests {
 			.expect("matching issuer accepted");
 		assert_eq!(ctx.id_tag.as_ref(), "a.example");
 		assert!(ctx.roles.iter().any(|r| r.as_ref() == "leader"));
+	}
+
+	/// A single empty role string would read as "has a role" in the role-based
+	/// file access path and hand federated strangers read access to tenant files.
+	#[tokio::test]
+	async fn validate_access_token_missing_roles_yields_empty_slice() {
+		let secret = b"test-secret-bytes-for-hs256-signing";
+		let dec = DecodingKey::from_secret(secret);
+		let token = make_token_with_roles(secret, "a.example", None);
+
+		let ctx = validate_access_token(&dec, TnId(1), "a.example", &token)
+			.await
+			.expect("token accepted");
+		assert!(ctx.roles.is_empty(), "expected no roles, got {:?}", ctx.roles);
+	}
+
+	#[tokio::test]
+	async fn validate_access_token_empty_roles_claim_yields_empty_slice() {
+		let secret = b"test-secret-bytes-for-hs256-signing";
+		let dec = DecodingKey::from_secret(secret);
+		let token = make_token_with_roles(secret, "a.example", Some(""));
+
+		let ctx = validate_access_token(&dec, TnId(1), "a.example", &token)
+			.await
+			.expect("token accepted");
+		assert!(ctx.roles.is_empty(), "expected no roles, got {:?}", ctx.roles);
+	}
+
+	#[tokio::test]
+	async fn validate_access_token_parses_role_list() {
+		let secret = b"test-secret-bytes-for-hs256-signing";
+		let dec = DecodingKey::from_secret(secret);
+		let token = make_token_with_roles(secret, "a.example", Some("public,leader"));
+
+		let ctx = validate_access_token(&dec, TnId(1), "a.example", &token)
+			.await
+			.expect("token accepted");
+		let roles: Vec<&str> = ctx.roles.iter().map(AsRef::as_ref).collect();
+		assert_eq!(roles, vec!["public", "leader"]);
 	}
 }

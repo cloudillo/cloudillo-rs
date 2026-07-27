@@ -9,10 +9,11 @@ use crate::prelude::*;
 use axum::{
 	body::Body,
 	extract::State,
-	http::{Method, Request, header, response::Response},
+	http::{Request, header, response::Response},
 	middleware::Next,
 };
 use cloudillo_types::auth_adapter::AuthCtx;
+use cloudillo_types::types::TokenScope;
 use std::pin::Pin;
 
 /// Tenant API key prefix (validated by auth adapter)
@@ -112,6 +113,39 @@ fn extract_token_from_query(query: &str) -> Option<String> {
 	None
 }
 
+/// Owner/leader gate. Must be layered *after* `require_auth`, which installs `Auth`.
+///
+/// *Delegated* credentials — share links and apkg-publish tokens — are rejected
+/// before the role check: tenant API keys are minted with the *full* owner role set
+/// regardless of their `scopes` column, so a role test alone would let one through.
+///
+/// Capability scopes (`carddav:*` / `caldav:*`) are deliberately not rejected here —
+/// `crate::scope::scope_permits` already constrained them fail-closed in
+/// `require_auth`, and a second rejection would 403 a DAV key on its own routes.
+pub async fn require_leader(
+	Auth(auth_ctx): Auth,
+	req: Request<Body>,
+	next: Next,
+) -> ClResult<Response<Body>> {
+	if auth_ctx.scope.as_deref().and_then(TokenScope::parse).is_some() {
+		warn!(
+			subject = %auth_ctx.id_tag,
+			scope = ?auth_ctx.scope,
+			"Owner/leader permission denied - delegated token"
+		);
+		return Err(Error::PermissionDenied);
+	}
+	if !crate::roles::is_leader(&auth_ctx.roles) {
+		warn!(
+			subject = %auth_ctx.id_tag,
+			roles = ?auth_ctx.roles,
+			"Owner/leader permission denied"
+		);
+		return Err(Error::PermissionDenied);
+	}
+	Ok(next.run(req).await)
+}
+
 pub async fn require_auth(
 	State(state): State<App>,
 	mut req: Request<Body>,
@@ -173,10 +207,7 @@ pub async fn require_auth(
 			AuthCtx {
 				tn_id: validation.tn_id,
 				id_tag: validation.id_tag,
-				roles: validation
-					.roles
-					.map(|r| r.split(',').map(Box::from).collect())
-					.unwrap_or_default(),
+				roles: validation.roles.map(|r| crate::roles::parse_roles(&r)).unwrap_or_default(),
 				scope: validation.scopes,
 			}
 		}
@@ -212,30 +243,15 @@ pub async fn require_auth(
 		}
 	};
 
-	// Enforce scope restrictions: scoped tokens can only access matching endpoints
-	if let Some(ref scope) = claims.scope
-		&& let Some(token_scope) = cloudillo_types::types::TokenScope::parse(scope)
-	{
-		let path = req.uri().path();
-		let method = req.method().clone();
-		let allowed = match token_scope {
-			cloudillo_types::types::TokenScope::File { .. } => {
-				path.starts_with("/api/files/")
-					|| path == "/api/files"
-					|| path.starts_with("/ws/rtdb/")
-					|| path.starts_with("/ws/crdt/")
-					|| path == "/api/auth/access-token"
-			}
-			cloudillo_types::types::TokenScope::ApkgPublish => {
-				path.starts_with("/api/files/apkg/")
-					|| (path == "/api/actions" && method == Method::POST)
-					|| path.starts_with("/api/apps")
-			}
-		};
-		if !allowed {
-			warn!(scope = %scope, path = %path, "Scoped token denied access to non-matching endpoint");
-			return Err(Error::PermissionDenied);
-		}
+	// Enforce scope restrictions centrally and fail-closed: a scope string the
+	// matcher doesn't recognise grants nothing anywhere (see `crate::scope`).
+	if !crate::scope::scope_permits(claims.scope.as_deref(), req.method(), req.uri().path()) {
+		warn!(
+			scope = ?claims.scope,
+			path = %req.uri().path(),
+			"Scoped token denied access to non-matching endpoint"
+		);
+		return Err(Error::PermissionDenied);
 	}
 
 	req.extensions_mut().insert(Auth(claims));
@@ -284,7 +300,7 @@ pub async fn optional_auth(
 									id_tag: validation.id_tag,
 									roles: validation
 										.roles
-										.map(|r| r.split(',').map(Box::from).collect())
+										.map(|r| crate::roles::parse_roles(&r))
 										.unwrap_or_default(),
 									scope: validation.scopes,
 								})
@@ -330,39 +346,19 @@ pub async fn optional_auth(
 
 				match claims_result {
 					Ok(Ok(claims)) => {
-						// Enforce scope restrictions: scoped tokens can only access matching endpoints
-						let scope_allowed = if let Some(ref scope) = claims.scope {
-							if let Some(token_scope) =
-								cloudillo_types::types::TokenScope::parse(scope)
-							{
-								let path = req.uri().path();
-								let method = req.method().clone();
-								match token_scope {
-									cloudillo_types::types::TokenScope::File { .. } => {
-										path.starts_with("/api/files/")
-											|| path == "/api/files" || path.starts_with("/ws/rtdb/")
-											|| path.starts_with("/ws/crdt/") || path
-											== "/api/auth/access-token"
-									}
-									// ApkgPublish scope: intentionally restrictive allowlist.
-									// Only permits the exact endpoints needed for app publishing
-									// to limit blast radius of a compromised scoped token.
-									cloudillo_types::types::TokenScope::ApkgPublish => {
-										path.starts_with("/api/files/apkg/")
-											|| (path == "/api/actions" && method == Method::POST)
-											|| path.starts_with("/api/apps")
-									}
-								}
-							} else {
-								false
-							}
-						} else {
-							true
-						};
-						if scope_allowed {
+						// Same fail-closed decision as `require_auth`, but a denial
+						// here degrades to unauthenticated rather than 403.
+						let allowed = crate::scope::scope_permits(
+							claims.scope.as_deref(),
+							req.method(),
+							req.uri().path(),
+						);
+						if allowed {
 							req.extensions_mut().insert(Auth(claims));
 						} else {
 							warn!(
+								scope = ?claims.scope,
+								path = %req.uri().path(),
 								"Scoped token denied access in optional_auth, treating as unauthenticated"
 							);
 						}
@@ -405,6 +401,82 @@ pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Respon
 		response.headers_mut().insert("X-Request-ID", header_value);
 	}
 	response
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use axum::{Router, http::StatusCode, middleware, routing::get};
+	use tower::ServiceExt;
+
+	fn auth_ctx(roles: &[&str], scope: Option<&str>) -> AuthCtx {
+		AuthCtx {
+			tn_id: TnId(1),
+			id_tag: "alice.example.com".into(),
+			roles: roles.iter().map(|r| Box::from(*r)).collect(),
+			scope: scope.map(Box::from),
+		}
+	}
+
+	/// Drives `require_leader` without `require_auth` or `App` state — `Auth`
+	/// reads straight from request extensions (see `crate::extract`).
+	async fn run_require_leader(auth: Option<AuthCtx>) -> StatusCode {
+		let app: Router = Router::new()
+			.route("/x", get(|| async { "ok" }))
+			.layer(middleware::from_fn(require_leader));
+
+		let mut req = Request::builder().uri("/x").body(Body::empty()).expect("build request");
+		if let Some(ctx) = auth {
+			req.extensions_mut().insert(Auth(ctx));
+		}
+
+		app.oneshot(req).await.expect("router responds").status()
+	}
+
+	#[tokio::test]
+	async fn require_leader_allows_leader() {
+		assert_eq!(run_require_leader(Some(auth_ctx(&["leader"], None))).await, StatusCode::OK);
+	}
+
+	#[tokio::test]
+	async fn require_leader_denies_non_leader_roles() {
+		assert_eq!(
+			run_require_leader(Some(auth_ctx(&["contributor"], None))).await,
+			StatusCode::FORBIDDEN
+		);
+	}
+
+	#[tokio::test]
+	async fn require_leader_denies_role_less_principal() {
+		// The federated stranger: authenticated, but carries no roles.
+		assert_eq!(run_require_leader(Some(auth_ctx(&[], None))).await, StatusCode::FORBIDDEN);
+	}
+
+	#[tokio::test]
+	async fn require_leader_denies_delegated_token_with_leader_roles() {
+		// Tenant API keys carry the full owner role set regardless of scope, so a
+		// delegated (share-link) token must be rejected on its scope, not its roles.
+		assert_eq!(
+			run_require_leader(Some(auth_ctx(&["leader"], Some("file:f1~abc:W")))).await,
+			StatusCode::FORBIDDEN
+		);
+	}
+
+	#[tokio::test]
+	async fn require_leader_allows_capability_token_with_leader_roles() {
+		// A capability scope is not a delegation, so it passes on its roles;
+		// `crate::scope::scope_permits` is what confines it to its own routes.
+		assert_eq!(
+			run_require_leader(Some(auth_ctx(&["leader"], Some("carddav:read")))).await,
+			StatusCode::OK
+		);
+	}
+
+	#[tokio::test]
+	async fn require_leader_denies_missing_auth() {
+		// Fail closed when the `Auth` extension is absent entirely.
+		assert_eq!(run_require_leader(None).await, StatusCode::FORBIDDEN);
+	}
 }
 
 // vim: ts=4

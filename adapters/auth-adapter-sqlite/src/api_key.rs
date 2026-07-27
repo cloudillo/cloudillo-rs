@@ -128,7 +128,9 @@ pub async fn validate_api_key(
 				tn_id: TnId(u32::try_from(tn_id).unwrap_or_default()),
 				id_tag: id_tag.into(),
 				key_id,
-				scopes: scopes.map(Into::into),
+				// A blank `scopes` column means "unscoped"; as a capability list with
+				// zero capabilities it would deny everything in `scope::scope_permits`.
+				scopes: scopes.filter(|s| !s.trim().is_empty()).map(Into::into),
 				roles: Some(expanded_roles),
 			});
 		}

@@ -6,6 +6,10 @@
 //! This module defines the built-in role hierarchy and provides utilities
 //! for expanding hierarchical roles.
 
+/// The single parser for comma-separated role strings, re-exported for core-side
+/// callers. Empty segments must be dropped — see the definition for why.
+pub use cloudillo_types::utils::parse_roles;
+
 /// Role hierarchy for profile-level permissions
 /// Higher roles inherit all permissions from lower roles
 pub const ROLE_HIERARCHY: &[&str] =
@@ -52,6 +56,13 @@ pub fn role_level(role: &str) -> Option<usize> {
 /// Empty / all-unknown ⇒ 0 (public).
 pub fn highest_role_level(roles: &[Box<str>]) -> usize {
 	roles.iter().filter_map(|r| role_level(r)).max().unwrap_or(0)
+}
+
+/// True iff `roles` reaches the `leader` level — the bar for managing tenant-owned
+/// resources. The tenant owner carries the full hierarchy (`build_tenant_owner_roles`
+/// in auth-adapter-sqlite); federated visitors and share-link tokens carry none.
+pub fn is_leader(roles: &[Box<str>]) -> bool {
+	highest_role_level(roles) >= LEADER_LEVEL
 }
 
 /// Lowest hierarchy level permitted to manage (remove / re-role) other members.
@@ -171,6 +182,23 @@ mod tests {
 		assert_eq!(highest_role_level(&["leader".into()]), 5);
 		assert_eq!(highest_role_level(&["contributor".into(), "moderator".into()]), 4);
 		assert_eq!(highest_role_level(&["unknown".into(), "leader".into()]), 5);
+	}
+
+	#[test]
+	fn test_is_leader() {
+		// The full tenant-owner role set.
+		assert!(is_leader(&[
+			"public".into(),
+			"follower".into(),
+			"supporter".into(),
+			"contributor".into(),
+			"moderator".into(),
+			"leader".into(),
+		]));
+		assert!(is_leader(&["leader".into()]));
+		// Federated visitors and share-link tokens carry no roles.
+		assert!(!is_leader(&[]));
+		assert!(!is_leader(&["contributor".into()]));
 	}
 
 	#[test]

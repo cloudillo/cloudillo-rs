@@ -183,6 +183,29 @@ pub async fn check_share_for_file(
 	walk_parent_chain_for_share(app, tn_id, file_id, user_id_tag).await
 }
 
+/// Access level granted purely by community-role membership on a *tenant-owned*
+/// file. Only roles from `crate::roles::ROLE_HIERARCHY` count.
+///
+/// Membership is matched explicitly rather than by testing "the role slice is
+/// non-empty": a `[""]` slice reads as "has a role" and would hand every
+/// federated stranger Read access. Second defence behind `roles::parse_roles`,
+/// which drops empty segments.
+pub fn role_access_level(user_roles: &[Box<str>]) -> AccessLevel {
+	if user_roles
+		.iter()
+		.any(|r| matches!(r.as_ref(), "leader" | "moderator" | "contributor"))
+	{
+		return AccessLevel::Write;
+	}
+	if user_roles
+		.iter()
+		.any(|r| matches!(r.as_ref(), "public" | "follower" | "supporter"))
+	{
+		return AccessLevel::Read;
+	}
+	AccessLevel::None
+}
+
 /// Get access level for a user on a file
 ///
 /// Determines access level based on:
@@ -225,16 +248,11 @@ pub async fn get_access_level(
 	// When a file has no explicit owner, it belongs to the tenant.
 	// Community members with roles get access based on their role level.
 	// Files owned by other users are NOT accessible via role-based access.
-	if owner_id_tag == ctx.tenant_id_tag && !ctx.user_roles.is_empty() {
-		if ctx
-			.user_roles
-			.iter()
-			.any(|r| matches!(r.as_ref(), "leader" | "moderator" | "contributor"))
-		{
-			return AccessLevel::Write;
+	if owner_id_tag == ctx.tenant_id_tag {
+		let level = role_access_level(ctx.user_roles);
+		if level != AccessLevel::None {
+			return level;
 		}
-		// Any authenticated role on this tenant → at least Read
-		return AccessLevel::Read;
 	}
 
 	// Look up FSHR action: key pattern is "FSHR:{file_id}:{audience}"
@@ -568,6 +586,30 @@ mod tests {
 	#[test]
 	fn unparseable_scope_denies_file_create() {
 		assert!(!scope_grants_collection_op(Some("not-a-valid-scope"), "file", "create"));
+	}
+
+	#[test]
+	fn role_access_level_requires_a_known_role() {
+		// The federated-stranger case.
+		assert_eq!(role_access_level(&[]), AccessLevel::None);
+		// A single empty role string is not a role.
+		assert_eq!(role_access_level(&["".into()]), AccessLevel::None);
+		assert_eq!(role_access_level(&["SADM".into()]), AccessLevel::None);
+	}
+
+	#[test]
+	fn role_access_level_maps_community_roles() {
+		assert_eq!(role_access_level(&["public".into()]), AccessLevel::Read);
+		assert_eq!(role_access_level(&["follower".into()]), AccessLevel::Read);
+		assert_eq!(role_access_level(&["supporter".into()]), AccessLevel::Read);
+		assert_eq!(role_access_level(&["contributor".into()]), AccessLevel::Write);
+		assert_eq!(role_access_level(&["moderator".into()]), AccessLevel::Write);
+		assert_eq!(role_access_level(&["leader".into()]), AccessLevel::Write);
+		// The highest role in a mixed set wins.
+		assert_eq!(
+			role_access_level(&["public".into(), "follower".into(), "leader".into()]),
+			AccessLevel::Write
+		);
 	}
 }
 

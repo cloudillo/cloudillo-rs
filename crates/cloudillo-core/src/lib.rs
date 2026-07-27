@@ -28,6 +28,7 @@ pub mod rate_limit;
 pub mod request;
 pub mod roles;
 pub mod scheduler;
+pub mod scope;
 pub mod settings;
 pub mod ws_broadcast;
 pub mod ws_bus;

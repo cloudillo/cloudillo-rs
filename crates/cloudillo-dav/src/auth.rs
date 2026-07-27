@@ -31,11 +31,10 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use cloudillo_core::{App, extract::Auth};
 use cloudillo_types::{auth_adapter::AuthCtx, extract::IdTag, prelude::*};
 
-/// Returns `true` iff `scopes` (comma-separated) contains an exact-match token for `needed`.
-/// Whitespace around each token is trimmed.
-pub fn has_scope(scopes: &str, needed: &str) -> bool {
-	scopes.split(',').map(str::trim).any(|s| s == needed)
-}
+/// Comma-separated exact-match scope test. Lives in `cloudillo-core` so
+/// `scope::scope_permits` enforces the same vocabulary on the REST surface
+/// that this middleware enforces on `/dav/*`.
+pub use cloudillo_core::scope::has_scope;
 
 /// What the token must satisfy. `AllOf` requires every scope (the read+write pattern);
 /// `AnyOf` is used for the shared principal path where either `carddav:read` OR `caldav:read`
@@ -183,7 +182,7 @@ pub async fn dav_basic_auth(
 		id_tag: validation.id_tag,
 		roles: validation
 			.roles
-			.map(|r| r.split(',').map(Box::from).collect())
+			.map(|r| cloudillo_core::roles::parse_roles(&r))
 			.unwrap_or_default(),
 		scope: validation.scopes,
 	};
@@ -196,18 +195,7 @@ pub async fn dav_basic_auth(
 mod tests {
 	use super::*;
 
-	#[test]
-	fn has_scope_exact_match_only() {
-		assert!(has_scope("carddav:read", "carddav:read"));
-		assert!(has_scope("carddav:read,carddav:write", "carddav:read"));
-		assert!(has_scope("carddav:read, carddav:write", "carddav:write"));
-		assert!(has_scope("other,carddav:write", "carddav:write"));
-		assert!(!has_scope("carddav:reader", "carddav:read"));
-		assert!(!has_scope("", "carddav:read"));
-		assert!(!has_scope("carddav", "carddav:read"));
-		// Space-separation is NOT accepted — use commas.
-		assert!(!has_scope("carddav:read carddav:write", "carddav:read"));
-	}
+	// `has_scope` is tested in `cloudillo_core::scope`, where it lives.
 
 	#[test]
 	fn required_scopes_carddav_path() {
