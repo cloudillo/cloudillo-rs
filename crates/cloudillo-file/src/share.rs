@@ -3,8 +3,9 @@
 
 //! Share entry management handlers
 //!
-//! Provides HTTP handlers for managing file share entries.
-//! Handlers do manual permission checking (require Write access to the file).
+//! Provides HTTP handlers for managing file share entries. Permission checking is
+//! manual, via `require_share_manager` (mutating the share set) or the weaker
+//! `require_share_reader` (listing it); both reject scoped (share-link) tokens.
 //! Creating user shares ('U') also generates FSHR actions for federation.
 
 use axum::{
@@ -36,33 +37,151 @@ fn validate_share_permission(c: char) -> ClResult<()> {
 	}
 }
 
-/// Check file access and require Write permission.
-/// Maps FileAccessError variants to the corresponding ClResult errors.
-async fn require_write_access(
+/// Shared prologue for both share gates: reject scoped (share-link) callers, then
+/// resolve the caller's access to the file.
+async fn resolve_share_access(
 	app: &App,
 	tn_id: TnId,
 	file_id: &str,
 	auth: &AuthCtx,
 	tenant_id_tag: &str,
 ) -> ClResult<FileAccessResult> {
-	let ctx = FileAccessCtx { user_id_tag: &auth.id_tag, tenant_id_tag, user_roles: &auth.roles };
-	let result = file_access::check_file_access_with_scope(
-		app,
-		tn_id,
-		file_id,
-		&ctx,
-		auth.scope.as_deref(),
-		None,
-	)
-	.await;
+	// A delegated share-link token must never touch share entries.
+	if auth.scope.is_some() {
+		warn!("Scoped token attempted to access share entries");
+		return Err(Error::PermissionDenied);
+	}
 
-	match result {
+	let ctx = FileAccessCtx { user_id_tag: &auth.id_tag, tenant_id_tag, user_roles: &auth.roles };
+	// Scope `None`: scoped callers were rejected above.
+	match file_access::check_file_access_with_scope(app, tn_id, file_id, &ctx, None, None).await {
 		Err(file_access::FileAccessError::NotFound) => Err(Error::NotFound),
 		Err(file_access::FileAccessError::AccessDenied) => Err(Error::PermissionDenied),
 		Err(file_access::FileAccessError::InternalError(msg)) => Err(Error::Internal(msg)),
-		Ok(access) if access.access_level != AccessLevel::Write => Err(Error::PermissionDenied),
 		Ok(access) => Ok(access),
 	}
+}
+
+/// Pure share-management decision, split out so it is unit-testable without an `App`.
+///
+/// Requires access to the file itself, plus standing: a community leader **who
+/// already has access to the file**, an explicit `'A'` share grant, the file owner,
+/// or — **only for tenant-owned files** — the member who created the row.
+///
+/// The creator rule exists because a local file leaves `files.owner_tag` NULL and the
+/// meta adapter back-fills the *tenant* profile as owner (`build_owner_profile`);
+/// without it, on a community tenant even the file's creator fails the owner test and
+/// only `leader` could manage shares. The `tenant_owned` guard keeps a locally-placed
+/// copy of a foreign file (Pin/Place row, `owner_tag` = foreign owner) out of the
+/// placer's reach.
+fn is_share_manager(
+	access: AccessLevel,
+	subject: &str,
+	tenant_id_tag: &str,
+	owner_id_tag: Option<&str>,
+	creator_id_tag: Option<&str>,
+	is_leader: bool,
+	has_admin_grant: bool,
+) -> bool {
+	// Defence in depth, not a live path: `resolve_share_access` already rejected
+	// anyone who cannot reach the row.
+	if access == AccessLevel::None {
+		return false;
+	}
+	if is_leader || has_admin_grant || owner_id_tag == Some(subject) {
+		return true;
+	}
+	let tenant_owned = owner_id_tag == Some(tenant_id_tag);
+	tenant_owned && creator_id_tag == Some(subject)
+}
+
+/// Pure share-*listing* decision: any unscoped caller with Write access may
+/// enumerate a file's share entries.
+fn is_share_reader(access: AccessLevel) -> bool {
+	access == AccessLevel::Write
+}
+
+/// Authorize share *management* (create/update/delete share entries).
+///
+/// An ownership/admin operation, strictly stronger than plain Write access — see
+/// `is_share_manager` for who qualifies. Plain FSHR-`W` grantees and scoped
+/// share-link tokens are deliberately excluded: otherwise a delegated link or a mere
+/// write grant could re-share, grant admin, or emit FSHR to arbitrary users. They may
+/// only *list* shares, via `require_share_reader`.
+async fn require_share_manager(
+	app: &App,
+	tn_id: TnId,
+	file_id: &str,
+	auth: &AuthCtx,
+	tenant_id_tag: &str,
+) -> ClResult<FileAccessResult> {
+	let access = resolve_share_access(app, tn_id, file_id, auth, tenant_id_tag).await?;
+
+	// Read the share row directly: `AccessLevel::from_perm_char` folds 'A' into Write,
+	// so `access.access_level` can never report Admin. Direct entries only — a
+	// folder-inherited share does not confer admin over its contents.
+	let has_admin_grant = matches!(
+		app.meta_adapter
+			.check_share_access(tn_id, 'F', file_id, 'U', &auth.id_tag)
+			.await,
+		Ok(Some('A'))
+	);
+
+	let owner_id_tag = non_empty_id_tag(access.file_view.owner.as_ref().map(|p| p.id_tag.as_ref()));
+	let creator_id_tag =
+		non_empty_id_tag(access.file_view.creator.as_ref().map(|p| p.id_tag.as_ref()));
+
+	if is_share_manager(
+		access.access_level,
+		&auth.id_tag,
+		tenant_id_tag,
+		owner_id_tag,
+		creator_id_tag,
+		cloudillo_core::roles::is_leader(&auth.roles),
+		has_admin_grant,
+	) {
+		Ok(access)
+	} else {
+		warn!(
+			subject = %auth.id_tag,
+			file_id = %file_id,
+			"Share management denied - owner/creator/leader/admin required"
+		);
+		Err(Error::PermissionDenied)
+	}
+}
+
+/// Authorize *listing* a file's share entries.
+///
+/// Weaker than `require_share_manager`: any Write-access caller — including a plain
+/// FSHR-`W` grantee — may see who the file is shared with, since enumeration is not
+/// part of the re-share escalation that gate defends against. Scoped tokens are
+/// still rejected.
+async fn require_share_reader(
+	app: &App,
+	tn_id: TnId,
+	file_id: &str,
+	auth: &AuthCtx,
+	tenant_id_tag: &str,
+) -> ClResult<FileAccessResult> {
+	let access = resolve_share_access(app, tn_id, file_id, auth, tenant_id_tag).await?;
+
+	if is_share_reader(access.access_level) {
+		Ok(access)
+	} else {
+		warn!(
+			subject = %auth.id_tag,
+			file_id = %file_id,
+			"Share listing denied - write access required"
+		);
+		Err(Error::PermissionDenied)
+	}
+}
+
+/// Normalize an id_tag that may be present but blank into `None`, mirroring
+/// `file_access::check_file_access_with_scope`'s owner resolution.
+fn non_empty_id_tag(id_tag: Option<&str>) -> Option<&str> {
+	id_tag.filter(|s| !s.is_empty())
 }
 
 /// GET /api/files/{file_id}/shares — List share entries for a file
@@ -74,7 +193,7 @@ pub async fn list_shares(
 	Path(file_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ShareEntry>>>)> {
-	require_write_access(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	require_share_reader(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
 
 	let entries = app.meta_adapter.list_share_entries(tn_id, 'F', &file_id).await?;
 
@@ -120,7 +239,7 @@ pub async fn create_share(
 		input.subject_id = bare_id.to_string();
 	}
 
-	let file_access = require_write_access(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	let file_access = require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
 
 	// Create share entry
 	let entry = app
@@ -154,7 +273,7 @@ pub async fn create_share(
 		};
 
 		if let Ok(create_action_fn) = app.ext::<CreateActionFn>()
-			&& let Err(e) = create_action_fn(&app, auth.tn_id, &auth.id_tag, action).await
+			&& let Err(e) = create_action_fn(&app, tn_id, &auth.id_tag, action).await
 		{
 			warn!(
 				"Failed to create FSHR action for share {}->{}: {}",
@@ -176,7 +295,7 @@ pub async fn delete_share(
 	Path((file_id, share_id)): Path<(String, i64)>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	require_write_access(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
 
 	// Load share entry before deleting (need subject info for FSHR revocation)
 	let maybe_entry = app.meta_adapter.read_share_entry(tn_id, share_id).await?;
@@ -211,7 +330,7 @@ pub async fn delete_share(
 		};
 
 		if let Ok(create_action_fn) = app.ext::<CreateActionFn>()
-			&& let Err(e) = create_action_fn(&app, auth.tn_id, &auth.id_tag, action).await
+			&& let Err(e) = create_action_fn(&app, tn_id, &auth.id_tag, action).await
 		{
 			warn!(
 				"Failed to create FSHR DEL action for share {}->{}: {}",
@@ -251,7 +370,7 @@ pub async fn update_share(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<UpdateShareRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ShareEntry>>)> {
-	require_write_access(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
 
 	// Reject empty PATCH at the handler boundary.
 	if req.permission.is_undefined() && req.expires_at.is_undefined() {
@@ -346,6 +465,123 @@ pub async fn list_shares_by_subject(
 
 	let response = ApiResponse::new(entries).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::OK, Json(response)))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const TENANT: &str = "community.example.com";
+	const MEMBER: &str = "alice.example.com";
+	const OTHER: &str = "bob.example.com";
+
+	const W: AccessLevel = AccessLevel::Write;
+
+	#[test]
+	fn personal_tenant_owner_manages_shares() {
+		// Personal tenant: owner back-fills to the tenant profile, which *is* the caller.
+		assert!(is_share_manager(W, TENANT, TENANT, Some(TENANT), Some(TENANT), false, false));
+	}
+
+	#[test]
+	fn creator_of_tenant_owned_file_manages_shares() {
+		// On a community tenant the owner is the tenant, so the member who created
+		// the row must pass on the creator rule.
+		assert!(is_share_manager(W, MEMBER, TENANT, Some(TENANT), Some(MEMBER), false, false));
+	}
+
+	#[test]
+	fn non_creator_member_cannot_manage_shares() {
+		assert!(!is_share_manager(W, MEMBER, TENANT, Some(TENANT), Some(OTHER), false, false));
+	}
+
+	#[test]
+	fn leader_manages_shares() {
+		assert!(is_share_manager(W, MEMBER, TENANT, Some(TENANT), Some(OTHER), true, false));
+	}
+
+	#[test]
+	fn creator_of_placed_foreign_file_cannot_manage_shares() {
+		// Pin/Place row: `owner_tag` holds the foreign owner, so the local
+		// placer (recorded as creator) must not gain share management.
+		assert!(!is_share_manager(W, MEMBER, TENANT, Some(OTHER), Some(MEMBER), false, false));
+	}
+
+	#[test]
+	fn explicit_admin_grant_manages_shares() {
+		// Same caller, with and without the 'A' grant.
+		assert!(!is_share_manager(W, OTHER, TENANT, Some(TENANT), Some(MEMBER), false, false));
+		assert!(is_share_manager(W, OTHER, TENANT, Some(TENANT), Some(MEMBER), false, true));
+	}
+
+	#[test]
+	fn plain_write_grantee_cannot_manage_shares() {
+		// The FSHR-`W` grantee: no owner/creator/leader/admin standing, so it fails
+		// regardless of access level.
+		assert!(!is_share_manager(W, OTHER, TENANT, Some(MEMBER), Some(MEMBER), false, false));
+	}
+
+	#[test]
+	fn missing_owner_and_creator_deny() {
+		assert!(!is_share_manager(W, MEMBER, TENANT, None, None, false, false));
+	}
+
+	#[test]
+	fn leader_without_access_is_not_a_share_manager() {
+		// A leader has no role-based access to a foreign-owned placed file, so
+		// leadership alone never confers share management over it.
+		assert!(!is_share_manager(
+			AccessLevel::None,
+			MEMBER,
+			TENANT,
+			Some(OTHER),
+			Some(OTHER),
+			true,
+			false
+		));
+	}
+
+	#[test]
+	fn admin_grant_without_access_is_not_a_share_manager() {
+		assert!(!is_share_manager(
+			AccessLevel::None,
+			MEMBER,
+			TENANT,
+			Some(OTHER),
+			Some(OTHER),
+			false,
+			true
+		));
+	}
+
+	#[test]
+	fn read_access_creator_is_still_a_share_manager() {
+		// Manage standing is ownership-derived, not Write-derived: read access to
+		// the row is enough once the caller created the tenant-owned file.
+		assert!(is_share_manager(
+			AccessLevel::Read,
+			MEMBER,
+			TENANT,
+			Some(TENANT),
+			Some(MEMBER),
+			false,
+			false
+		));
+	}
+
+	#[test]
+	fn share_reader_needs_write_access() {
+		assert!(is_share_reader(AccessLevel::Write));
+		// Read access is not enough to enumerate the share set.
+		assert!(!is_share_reader(AccessLevel::Read));
+	}
+
+	#[test]
+	fn non_empty_id_tag_normalizes_blank() {
+		assert_eq!(non_empty_id_tag(Some("")), None);
+		assert_eq!(non_empty_id_tag(Some(MEMBER)), Some(MEMBER));
+		assert_eq!(non_empty_id_tag(None), None);
+	}
 }
 
 // vim: ts=4
