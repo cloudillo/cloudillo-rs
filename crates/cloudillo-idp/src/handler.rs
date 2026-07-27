@@ -23,8 +23,17 @@ use cloudillo_types::utils::parse_and_validate_identity_id_tag;
 
 use crate::prelude::*;
 
-/// Check if IDP functionality is enabled for a tenant
-async fn check_idp_enabled(app: &App, tn_id: TnId) -> ClResult<()> {
+/// Check if IDP functionality is enabled for a tenant.
+///
+/// **Fails closed**, and denies with **404, not 403**. `idp.enabled` defaults to
+/// false with no default-on path and no bootstrap writer, so an operator must set it
+/// explicitly (`PUT /api/settings/idp.enabled`, per tenant or as the global `TnId(0)`
+/// row) before any `/api/idp/*` endpoint stops returning `NotFound`.
+///
+/// The federated `IDP:REG` path (`crate::registration::process_registration`) does
+/// **not** consult this setting, so a tenant can be serving registrations while
+/// every `/api/idp/*` HTTP endpoint returns 404.
+pub(crate) async fn check_idp_enabled(app: &App, tn_id: TnId) -> ClResult<()> {
 	match app.settings.get(tn_id, "idp.enabled").await {
 		Ok(Some(SettingValue::Bool(true))) => {
 			debug!(tn_id = tn_id.0, "IDP enabled for tenant");
@@ -88,7 +97,7 @@ fn check_identity_access(identity: &Identity, requester_id_tag: &str) -> IdpAuth
 }
 
 /// Check if requester can access an identity (view, update, delete)
-fn can_access_identity(identity: &Identity, requester_id_tag: &str) -> bool {
+pub(crate) fn can_access_identity(identity: &Identity, requester_id_tag: &str) -> bool {
 	matches!(
 		check_identity_access(identity, requester_id_tag),
 		IdpAuthResult::Owner | IdpAuthResult::Registrar
@@ -101,8 +110,8 @@ fn can_access_identity(identity: &Identity, requester_id_tag: &str) -> bool {
 /// Mirrors the frontend gate `isOwner || roles.includes('leader')` in
 /// shell/src/idp/identities.tsx so leaders see/manage the identities the
 /// management UI already shows them controls for.
-fn is_idp_admin(auth_id_tag: &str, auth_roles: &[Box<str>], idp_domain: &str) -> bool {
-	auth_id_tag == idp_domain || auth_roles.iter().any(|r| r.as_ref() == "leader")
+pub(crate) fn is_idp_admin(auth_id_tag: &str, auth_roles: &[Box<str>], idp_domain: &str) -> bool {
+	auth_id_tag == idp_domain || cloudillo_core::roles::is_leader(auth_roles)
 }
 
 /// Response structure for identity details
@@ -387,6 +396,18 @@ pub async fn create_identity(
 
 	// Check if IDP is enabled for this tenant
 	check_idp_enabled(&app, tn_id).await?;
+
+	// Admin-only: external self-registration has its own quota-gated REG-token flow
+	// (registration.rs), so a federated visitor or share-link token must not mint
+	// identities on the tenant's IDP domain here.
+	if !is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref()) {
+		warn!(
+			requested_by = %auth.id_tag,
+			idp_domain = %idp_domain,
+			"Unauthorized identity creation"
+		);
+		return Err(Error::PermissionDenied);
+	}
 
 	// Verify Identity Provider adapter is available
 	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(

@@ -10,11 +10,74 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use cloudillo_core::extract::{IdTag, OptionalRequestId};
-use cloudillo_types::identity_provider_adapter::{ApiKey, CreateApiKeyOptions, ListApiKeyOptions};
+use std::sync::Arc;
+
+use cloudillo_core::extract::{Auth, OptionalRequestId};
+use cloudillo_types::auth_adapter::AuthCtx;
+use cloudillo_types::identity_provider_adapter::{
+	ApiKey, CreateApiKeyOptions, Identity, IdentityProviderAdapter, ListApiKeyOptions,
+};
 use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt};
 
+use crate::handler::{can_access_identity, check_idp_enabled, is_idp_admin};
 use crate::prelude::*;
+
+/// Pure API-key authorization decision, split out so it is unit-testable without
+/// an adapter.
+///
+/// Mirrors the identity-handler triad (`handler.rs`): the identity itself, an IDP
+/// admin (domain owner or `leader`), or the owner/registrar of the stored identity —
+/// `can_access_identity` drops the registrar once the identity leaves `Pending`.
+/// Federated strangers and share-link tokens carry `roles=[]` and no matching
+/// id_tag, so they are rejected.
+///
+/// `identity: None` means "not fetched, or no such identity" — either way only the
+/// self / IDP-admin checks can pass.
+fn api_key_access_allowed(
+	auth_id_tag: &str,
+	auth_roles: &[Box<str>],
+	target_id_tag: &str,
+	idp_domain: &str,
+	identity: Option<&Identity>,
+) -> bool {
+	if auth_id_tag == target_id_tag || is_idp_admin(auth_id_tag, auth_roles, idp_domain) {
+		return true;
+	}
+	identity.is_some_and(|i| can_access_identity(i, auth_id_tag))
+}
+
+/// Authorize the caller to manage API keys for `target_id_tag`.
+///
+/// Supplies the stored identity to `api_key_access_allowed`, reading it only when
+/// the identity-free checks (self / IDP admin) have already failed.
+async fn authorize_api_key_access(
+	idp_adapter: &Arc<dyn IdentityProviderAdapter>,
+	auth: &AuthCtx,
+	target_id_tag: &str,
+	id_tag_prefix: &str,
+	id_tag_domain: &str,
+	idp_domain: &str,
+) -> ClResult<()> {
+	if api_key_access_allowed(&auth.id_tag, &auth.roles, target_id_tag, idp_domain, None) {
+		return Ok(());
+	}
+	let identity = idp_adapter.read_identity(id_tag_prefix, id_tag_domain).await?;
+	if api_key_access_allowed(
+		&auth.id_tag,
+		&auth.roles,
+		target_id_tag,
+		idp_domain,
+		identity.as_ref(),
+	) {
+		return Ok(());
+	}
+	warn!(
+		target = %target_id_tag,
+		requested_by = %auth.id_tag,
+		"Unauthorized IDP API key access"
+	);
+	Err(Error::PermissionDenied)
+}
 
 /// Helper function to split id_tag into (prefix, domain) using the tenant domain
 fn split_id_tag_with_tenant(id_tag: &str, tenant_domain: &str) -> ClResult<(String, String)> {
@@ -110,10 +173,12 @@ pub struct ListApiKeysQuery {
 pub async fn create_api_key(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(_auth_id_tag): IdTag,
+	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(create_req): Json<CreateApiKeyRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CreatedApiKeyResponse>>)> {
+	check_idp_enabled(&app, tn_id).await?;
+
 	// Get the tenant domain (IDP domain)
 	let tenant_domain = app.auth_adapter.read_id_tag(tn_id).await?;
 
@@ -142,6 +207,18 @@ pub async fn create_api_key(
 	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
+
+	// Without this, a federated visitor or share-link token could mint API keys
+	// for arbitrary identities.
+	authorize_api_key_access(
+		idp_adapter,
+		&auth,
+		&create_req.id_tag,
+		&id_tag_prefix,
+		&id_tag_domain,
+		&tenant_domain,
+	)
+	.await?;
 
 	// Validate expiration if provided
 	if let Some(expires_timestamp) = create_req.expires_at {
@@ -184,10 +261,12 @@ pub async fn create_api_key(
 pub async fn list_api_keys(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(_auth_id_tag): IdTag,
+	Auth(auth): Auth,
 	Query(query_params): Query<ListApiKeysQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ApiKeyResponse>>>)> {
+	check_idp_enabled(&app, tn_id).await?;
+
 	// id_tag is required to list API keys
 	let id_tag = query_params
 		.id_tag
@@ -210,6 +289,16 @@ pub async fn list_api_keys(
 	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
+
+	authorize_api_key_access(
+		idp_adapter,
+		&auth,
+		id_tag,
+		&id_tag_prefix,
+		&id_tag_domain,
+		&tenant_domain,
+	)
+	.await?;
 
 	let opts = ListApiKeyOptions {
 		id_tag_prefix: Some(id_tag_prefix),
@@ -246,11 +335,13 @@ pub struct ApiKeyIdTagQuery {
 pub async fn get_api_key(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(_auth_id_tag): IdTag,
+	Auth(auth): Auth,
 	Path(api_key_id): Path<i32>,
 	Query(query): Query<ApiKeyIdTagQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ApiKeyResponse>>)> {
+	check_idp_enabled(&app, tn_id).await?;
+
 	// Get the tenant domain (IDP domain)
 	let tenant_domain = app.auth_adapter.read_id_tag(tn_id).await?;
 
@@ -268,6 +359,16 @@ pub async fn get_api_key(
 	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
+
+	authorize_api_key_access(
+		idp_adapter,
+		&auth,
+		&query.id_tag,
+		&id_tag_prefix,
+		&id_tag_domain,
+		&tenant_domain,
+	)
+	.await?;
 
 	// List all keys for this identity and find the one with matching ID
 	let opts = ListApiKeyOptions {
@@ -294,11 +395,13 @@ pub async fn get_api_key(
 pub async fn delete_api_key(
 	State(app): State<App>,
 	tn_id: TnId,
-	IdTag(_auth_id_tag): IdTag,
+	Auth(auth): Auth,
 	Path(api_key_id): Path<i32>,
 	Query(query): Query<ApiKeyIdTagQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+	check_idp_enabled(&app, tn_id).await?;
+
 	// Get the tenant domain (IDP domain)
 	let tenant_domain = app.auth_adapter.read_id_tag(tn_id).await?;
 
@@ -316,6 +419,16 @@ pub async fn delete_api_key(
 	let idp_adapter = app.idp_adapter.as_ref().ok_or(Error::ServiceUnavailable(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
+
+	authorize_api_key_access(
+		idp_adapter,
+		&auth,
+		&query.id_tag,
+		&id_tag_prefix,
+		&id_tag_domain,
+		&tenant_domain,
+	)
+	.await?;
 
 	// Use the ownership-scoped deletion to ensure the key belongs to this identity
 	let deleted = idp_adapter
@@ -342,6 +455,86 @@ pub async fn delete_api_key(
 	}
 
 	Ok((StatusCode::OK, Json(response)))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use cloudillo_types::identity_provider_adapter::IdentityStatus;
+
+	const IDP_DOMAIN: &str = "idp.example.com";
+	const TARGET: &str = "alice.idp.example.com";
+	const OWNER: &str = "owner.example.com";
+	const REGISTRAR: &str = "registrar.example.com";
+
+	fn identity(owner: Option<&str>, status: IdentityStatus) -> Identity {
+		Identity {
+			id_tag_prefix: "alice".into(),
+			id_tag_domain: IDP_DOMAIN.into(),
+			email: None,
+			registrar_id_tag: REGISTRAR.into(),
+			owner_id_tag: owner.map(Box::from),
+			address: None,
+			address_type: None,
+			address_updated_at: None,
+			dyndns: false,
+			lang: None,
+			status,
+			created_at: Timestamp(0),
+			updated_at: Timestamp(0),
+			expires_at: Timestamp(0),
+		}
+	}
+
+	fn allowed(auth: &str, roles: &[&str], identity: Option<&Identity>) -> bool {
+		let roles: Vec<Box<str>> = roles.iter().map(|r| Box::from(*r)).collect();
+		api_key_access_allowed(auth, &roles, TARGET, IDP_DOMAIN, identity)
+	}
+
+	#[test]
+	fn identity_itself_is_allowed() {
+		assert!(allowed(TARGET, &[], None));
+	}
+
+	#[test]
+	fn idp_domain_owner_is_allowed() {
+		assert!(allowed(IDP_DOMAIN, &[], None));
+	}
+
+	#[test]
+	fn leader_role_is_allowed() {
+		assert!(allowed("someone.example.com", &["leader"], None));
+	}
+
+	#[test]
+	fn identity_owner_is_allowed() {
+		let id = identity(Some(OWNER), IdentityStatus::Active);
+		assert!(allowed(OWNER, &[], Some(&id)));
+	}
+
+	#[test]
+	fn registrar_is_allowed_while_pending() {
+		let id = identity(None, IdentityStatus::Pending);
+		assert!(allowed(REGISTRAR, &[], Some(&id)));
+	}
+
+	#[test]
+	fn registrar_is_denied_after_activation() {
+		let id = identity(None, IdentityStatus::Active);
+		assert!(!allowed(REGISTRAR, &[], Some(&id)));
+	}
+
+	#[test]
+	fn unrelated_federated_stranger_is_denied() {
+		let id = identity(Some(OWNER), IdentityStatus::Active);
+		assert!(!allowed("stranger.example.com", &[], Some(&id)));
+	}
+
+	#[test]
+	fn missing_identity_denies_non_self_non_admin() {
+		assert!(!allowed(OWNER, &[], None));
+		assert!(!allowed(REGISTRAR, &[], None));
+	}
 }
 
 // vim: ts=4
