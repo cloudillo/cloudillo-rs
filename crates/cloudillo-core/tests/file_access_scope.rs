@@ -225,6 +225,50 @@ async fn m1_subtree_rule_suppressed_for_non_folder_scope() {
 }
 
 #[tokio::test]
+async fn document_scope_cannot_place_copy_in_unrelated_folder() {
+	// H1 regression, for `cloudillo_file::management::duplicate_file`: a share-link
+	// editor scoped to a single *document* (Z, a BLOB) asks for the copy to land in
+	// an unrelated folder (F1). Neither the document-tree rule (root_id != Z) nor
+	// the folder-subtree rule (Z is not a folder) applies, so it must be denied.
+	let (meta, tn_id, _temp) = seed().await;
+	let cache = DirCache::new(64);
+
+	assert!(matches!(
+		file_access::check_scope_allows_create_in(
+			&meta,
+			&cache,
+			tn_id,
+			Some("file:Z:W"),
+			Some("F1"),
+			None
+		)
+		.await,
+		Err(Error::PermissionDenied)
+	));
+
+	// …and the same for the tenant root (`parent_id = None`).
+	assert!(matches!(
+		file_access::check_scope_allows_create_in(
+			&meta,
+			&cache,
+			tn_id,
+			Some("file:Z:W"),
+			None,
+			None
+		)
+		.await,
+		Err(Error::PermissionDenied)
+	));
+
+	// An unscoped caller (the ordinary logged-in owner) is unaffected.
+	assert!(matches!(
+		file_access::check_scope_allows_create_in(&meta, &cache, tn_id, None, Some("F1"), None)
+			.await,
+		Ok(())
+	));
+}
+
+#[tokio::test]
 async fn m2_by_id_listing_filters_to_in_subtree_ids() {
 	// Mirrors the by-id filter in `cloudillo_file::handler::get_file_list`: under a
 	// folder-share scope, a by-id batch keeps only the ids that are the scoped

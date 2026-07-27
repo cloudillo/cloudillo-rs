@@ -14,7 +14,7 @@ use serde_json::json;
 use crate::prelude::*;
 use cloudillo_core::abac::VisibilityLevel;
 use cloudillo_core::dir_cache::DirCache;
-use cloudillo_core::extract::{Auth, OptionalRequestId};
+use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
 use cloudillo_core::file_access;
 use cloudillo_types::meta_adapter::{self, UpdateFileOptions};
 use cloudillo_types::types::{AccessLevel, ApiResponse};
@@ -321,31 +321,43 @@ pub async fn duplicate_file(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
+	IdTag(tenant_id_tag): IdTag,
 	Path(file_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<DuplicateFileRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
-	// 1. Read source file metadata
-	let file = app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or_else(|| {
-		warn!("duplicate_file: File {} not found", file_id);
-		Error::NotFound
+	// Read access to the *source* is required before copying its contents, otherwise
+	// any private CRDT/RTDB document could be exfiltrated by duplicating it. The check
+	// loads the row, so its `file_view` doubles as the source metadata.
+	let ctx = file_access::FileAccessCtx {
+		user_id_tag: &auth.id_tag,
+		tenant_id_tag: &tenant_id_tag,
+		user_roles: &auth.roles,
+	};
+	let access = file_access::check_file_access_with_scope(
+		&app,
+		tn_id,
+		&file_id,
+		&ctx,
+		auth.scope.as_deref(),
+		None,
+	)
+	.await
+	.map_err(|e| match e {
+		file_access::FileAccessError::NotFound => Error::NotFound,
+		file_access::FileAccessError::AccessDenied => Error::PermissionDenied,
+		file_access::FileAccessError::InternalError(m) => Error::Internal(m),
 	})?;
 
-	// Scope check: source file must be within scope and scope must grant Write
-	let scope_check = file_access::check_scope_allows_file(
-		auth.scope.as_deref(),
-		&file_id,
-		file.root_id.as_deref(),
-	);
-	match scope_check {
-		// No scope restriction or scope grants Write — allow duplication
-		file_access::ScopeCheck::NoScope | file_access::ScopeCheck::Allowed(AccessLevel::Write) => {
-		}
-		// Read-only scope, Denied, or any other level — reject
-		_ => return Err(Error::PermissionDenied),
+	// A scoped (share-link) caller needs editor access, and only within its own scope —
+	// `check_file_access_with_scope` resolved both, returning the scope's own level for
+	// a covered file and AccessDenied otherwise. An unscoped caller needs only read
+	// here; creation is gated by `check_perm_create("file", "create")` on the route.
+	if auth.scope.is_some() && access.access_level != AccessLevel::Write {
+		return Err(Error::PermissionDenied);
 	}
+	let file = access.file_view;
 
-	// 2. Validate file type
 	let file_tp = file.file_tp.as_deref().unwrap_or("BLOB");
 	if file_tp != "CRDT" && file_tp != "RTDB" {
 		return Err(Error::ValidationError(format!(
@@ -354,13 +366,36 @@ pub async fn duplicate_file(
 		)));
 	}
 
-	// 3. Generate new file_id
+	// Normalize empty-string parent_id to None on both inputs. An empty string
+	// is neither root (NULL) nor a real folder ID; binding it would store ""
+	// which fails the `parent_id IS NULL` filter the listing uses for
+	// `parentId=__root__`, hiding the duplicate from the root view even though
+	// the source row is correctly NULL.
+	let parent_id = req
+		.parent_id
+		.filter(|s| !s.is_empty())
+		.map(Box::from)
+		.or_else(|| file.parent_id.clone().filter(|s| !s.is_empty()));
+
+	// A scoped (share-link) caller may only place the duplicate inside its own subtree —
+	// the same boundary `post_file` enforces for direct creation. Without it the
+	// `file:*:W` shortcut in `check_perm_create` would let a guest editor plant
+	// tenant-owned rows anywhere, root included. Runs before any content is copied.
+	let dir_cache = app.ext::<DirCache>()?;
+	file_access::check_scope_allows_create_in(
+		&app.meta_adapter,
+		dir_cache,
+		tn_id,
+		auth.scope.as_deref(),
+		parent_id.as_deref(),
+		file.root_id.as_deref(),
+	)
+	.await?;
+
 	let new_file_id = utils::random_id()?;
 
-	// 4. Determine filename
 	let new_file_name = req.file_name.unwrap_or_else(|| format!("Copy of {}", file.file_name));
 
-	// 5. Copy content based on type
 	match file_tp {
 		"CRDT" => {
 			super::duplicate::duplicate_crdt_content(&app, tn_id, &file_id, &new_file_id).await?;
@@ -376,17 +411,6 @@ pub async fn duplicate_file(
 		}
 	}
 
-	// 6. Create file metadata for the duplicate
-	// Normalize empty-string parent_id to None on both inputs. An empty string
-	// is neither root (NULL) nor a real folder ID; binding it would store ""
-	// which fails the `parent_id IS NULL` filter the listing uses for
-	// `parentId=__root__`, hiding the duplicate from the root view even though
-	// the source row is correctly NULL.
-	let parent_id = req
-		.parent_id
-		.filter(|s| !s.is_empty())
-		.map(Box::from)
-		.or_else(|| file.parent_id.filter(|s| !s.is_empty()));
 	let _f_id = app
 		.meta_adapter
 		.create_file(
