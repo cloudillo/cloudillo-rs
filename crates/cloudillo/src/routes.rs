@@ -36,7 +36,9 @@ use cloudillo_calendar as calendar;
 use cloudillo_contact as contact;
 use cloudillo_core::acme;
 use cloudillo_core::create_perm::check_perm_create;
-use cloudillo_core::middleware::{optional_auth, request_id_middleware, require_auth};
+use cloudillo_core::middleware::{
+	optional_auth, request_id_middleware, require_auth, require_leader,
+};
 use cloudillo_core::rate_limit::RateLimitLayer;
 use cloudillo_profile as profile;
 use cloudillo_profile::perm::check_perm_profile;
@@ -203,6 +205,93 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/admin/invite-community", post(admin::invite::post_invite_community))
 		.layer(middleware::from_fn_with_state(app.clone(), admin::perm::require_admin));
 
+	// Tenant-owned resources: only the tenant owner or a community leader may manage
+	// them; federated visitors and share-link tokens carry roles=[] and are rejected.
+	// Merged below so `require_auth` runs first and installs the `Auth` extension
+	// `require_leader` reads.
+	let leader_router = Router::new()
+		// --- WebAuthn (Passkey) Management ---
+		// Enrollment only; the login endpoints stay public and are wired elsewhere.
+		.route("/api/auth/wa/reg", get(auth::webauthn::list_reg))
+		.route("/api/auth/wa/reg/challenge", get(auth::webauthn::get_reg_challenge))
+		.route("/api/auth/wa/reg", post(auth::webauthn::post_reg))
+		.route("/api/auth/wa/reg/{key_id}", delete(auth::webauthn::delete_reg))
+		// --- Auth API Key Management ---
+		.route("/api/auth/api-keys", get(auth::api_key::list_api_keys))
+		.route("/api/auth/api-keys", post(auth::api_key::create_api_key))
+		.route("/api/auth/api-keys/{key_id}", get(auth::api_key::get_api_key))
+		.route("/api/auth/api-keys/{key_id}", patch(auth::api_key::update_api_key))
+		.route("/api/auth/api-keys/{key_id}", delete(auth::api_key::delete_api_key))
+		// --- Push Notification Management ---
+		.route("/api/notifications/subscription", post(push::handler::post_subscription))
+		.route(
+			"/api/notifications/subscription/{subscription_id}",
+			delete(push::handler::delete_subscription),
+		)
+		// --- Address Books / Contacts (CardDAV sync lives under /dav/... elsewhere) ---
+		.route("/api/address-books", get(contact::handler::list_address_books))
+		.route("/api/address-books", post(contact::handler::create_address_book))
+		.route("/api/address-books/{ab_id}", patch(contact::handler::patch_address_book))
+		.route("/api/address-books/{ab_id}", delete(contact::handler::delete_address_book))
+		.route("/api/contacts", get(contact::handler::list_all_contacts))
+		.route("/api/address-books/{ab_id}/contacts", get(contact::handler::list_contacts))
+		// Contacts and vCard imports may embed photos / many cards (> 1 MiB).
+		.route(
+			"/api/address-books/{ab_id}/contacts",
+			post(contact::handler::create_contact).layer(upload_body_limit()),
+		)
+		.route(
+			"/api/address-books/{ab_id}/import",
+			post(contact::handler::import_contacts).layer(upload_body_limit()),
+		)
+		.route("/api/address-books/{ab_id}/contacts/{uid}", get(contact::handler::get_contact))
+		.route(
+			"/api/address-books/{ab_id}/contacts/{uid}",
+			put(contact::handler::put_contact).layer(upload_body_limit()),
+		)
+		.route(
+			"/api/address-books/{ab_id}/contacts/{uid}",
+			patch(contact::handler::patch_contact).layer(upload_body_limit()),
+		)
+		.route(
+			"/api/address-books/{ab_id}/contacts/{uid}",
+			delete(contact::handler::delete_contact),
+		)
+		// --- Calendars / Events (CalDAV sync lives under /dav/... elsewhere) ---
+		.route("/api/calendars", get(calendar::handler::list_calendars))
+		.route("/api/calendars", post(calendar::handler::create_calendar))
+		.route("/api/calendars/{cal_id}", get(calendar::handler::get_calendar))
+		.route("/api/calendars/{cal_id}", patch(calendar::handler::patch_calendar))
+		.route("/api/calendars/{cal_id}", delete(calendar::handler::delete_calendar))
+		.route("/api/calendars/{cal_id}/objects", get(calendar::handler::list_objects))
+		.route("/api/calendars/{cal_id}/objects", post(calendar::handler::create_object))
+		.route("/api/calendars/{cal_id}/objects/{uid}", get(calendar::handler::get_object))
+		.route("/api/calendars/{cal_id}/objects/{uid}", put(calendar::handler::put_object))
+		.route("/api/calendars/{cal_id}/objects/{uid}", patch(calendar::handler::patch_object))
+		.route("/api/calendars/{cal_id}/objects/{uid}", delete(calendar::handler::delete_object))
+		.route("/api/calendars/{cal_id}/objects/{uid}/split", post(calendar::handler::split_series))
+		.route(
+			"/api/calendars/{cal_id}/objects/{uid}/exceptions",
+			get(calendar::handler::list_exceptions),
+		)
+		.route(
+			"/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}",
+			get(calendar::handler::get_exception),
+		)
+		.route(
+			"/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}",
+			put(calendar::handler::put_exception),
+		)
+		.route(
+			"/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}",
+			patch(calendar::handler::patch_exception),
+		)
+		.route(
+			"/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}",
+			delete(calendar::handler::delete_exception),
+		)
+		.layer(middleware::from_fn(require_leader));
+
 	// File create routes (check_perm_create for quota/tier checking)
 	let file_router_create = Router::new()
 		.route("/api/files", post(file::handler::post_file))
@@ -250,8 +339,10 @@ fn init_protected_routes(app: App) -> Router<App> {
 	Router::new()
 		// --- Session Management ---
 		.route("/api/auth/logout", post(auth::handler::post_logout))
-		.route("/api/auth/proxy-token", get(auth::handler::get_proxy_token))
 		.route("/api/auth/password", post(auth::handler::post_password))
+		// Issues an ordinary self-scoped session token; the federated (`?idTag=`)
+		// branch gates itself on owner/leader inside the handler.
+		.route("/api/auth/proxy-token", get(auth::handler::get_proxy_token))
 		.route("/api/auth/vapid", get(push::handler::get_vapid_public_key))
 
 		// --- Onboarding completion (authenticated) ---
@@ -262,19 +353,6 @@ fn init_protected_routes(app: App) -> Router<App> {
 		// --- QR Login (Protected) ---
 		.route("/api/auth/qr-login/{session_id}/details", get(auth::qr_login::get_details))
 		.route("/api/auth/qr-login/{session_id}/respond", post(auth::qr_login::post_respond))
-
-		// --- WebAuthn (Passkey) Management ---
-		.route("/api/auth/wa/reg", get(auth::webauthn::list_reg))
-		.route("/api/auth/wa/reg/challenge", get(auth::webauthn::get_reg_challenge))
-		.route("/api/auth/wa/reg", post(auth::webauthn::post_reg))
-		.route("/api/auth/wa/reg/{key_id}", delete(auth::webauthn::delete_reg))
-
-		// --- API Key Management ---
-		.route("/api/auth/api-keys", get(auth::api_key::list_api_keys))
-		.route("/api/auth/api-keys", post(auth::api_key::create_api_key))
-		.route("/api/auth/api-keys/{key_id}", get(auth::api_key::get_api_key))
-		.route("/api/auth/api-keys/{key_id}", patch(auth::api_key::update_api_key))
-		.route("/api/auth/api-keys/{key_id}", delete(auth::api_key::delete_api_key))
 
 		// --- Settings API ---
 		.route("/api/settings", get(settings::handler::list_settings))
@@ -392,55 +470,7 @@ fn init_protected_routes(app: App) -> Router<App> {
 		.route("/api/idp/api-keys/{api_key_id}", get(idp::api_keys::get_api_key))
 		.route("/api/idp/api-keys/{api_key_id}", delete(idp::api_keys::delete_api_key))
 
-		// --- Push Notification Management ---
-		.route("/api/notifications/subscription", post(push::handler::post_subscription))
-		.route("/api/notifications/subscription/{subscription_id}", delete(push::handler::delete_subscription))
-
-		// --- Address Books / Contacts (CardDAV sync lives under /dav/... elsewhere) ---
-		.route("/api/address-books", get(contact::handler::list_address_books))
-		.route("/api/address-books", post(contact::handler::create_address_book))
-		.route("/api/address-books/{ab_id}", patch(contact::handler::patch_address_book))
-		.route("/api/address-books/{ab_id}", delete(contact::handler::delete_address_book))
-		.route("/api/contacts", get(contact::handler::list_all_contacts))
-		.route("/api/address-books/{ab_id}/contacts", get(contact::handler::list_contacts))
-		// Contacts and vCard imports may embed photos / many cards (> 1 MiB).
-		.route(
-			"/api/address-books/{ab_id}/contacts",
-			post(contact::handler::create_contact).layer(upload_body_limit()),
-		)
-		.route(
-			"/api/address-books/{ab_id}/import",
-			post(contact::handler::import_contacts).layer(upload_body_limit()),
-		)
-		.route("/api/address-books/{ab_id}/contacts/{uid}", get(contact::handler::get_contact))
-		.route(
-			"/api/address-books/{ab_id}/contacts/{uid}",
-			put(contact::handler::put_contact).layer(upload_body_limit()),
-		)
-		.route(
-			"/api/address-books/{ab_id}/contacts/{uid}",
-			patch(contact::handler::patch_contact).layer(upload_body_limit()),
-		)
-		.route("/api/address-books/{ab_id}/contacts/{uid}", delete(contact::handler::delete_contact))
-
-		// --- Calendars / Events (CalDAV sync lives under /dav/... elsewhere) ---
-		.route("/api/calendars", get(calendar::handler::list_calendars))
-		.route("/api/calendars", post(calendar::handler::create_calendar))
-		.route("/api/calendars/{cal_id}", get(calendar::handler::get_calendar))
-		.route("/api/calendars/{cal_id}", patch(calendar::handler::patch_calendar))
-		.route("/api/calendars/{cal_id}", delete(calendar::handler::delete_calendar))
-		.route("/api/calendars/{cal_id}/objects", get(calendar::handler::list_objects))
-		.route("/api/calendars/{cal_id}/objects", post(calendar::handler::create_object))
-		.route("/api/calendars/{cal_id}/objects/{uid}", get(calendar::handler::get_object))
-		.route("/api/calendars/{cal_id}/objects/{uid}", put(calendar::handler::put_object))
-		.route("/api/calendars/{cal_id}/objects/{uid}", patch(calendar::handler::patch_object))
-		.route("/api/calendars/{cal_id}/objects/{uid}", delete(calendar::handler::delete_object))
-		.route("/api/calendars/{cal_id}/objects/{uid}/split", post(calendar::handler::split_series))
-		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions", get(calendar::handler::list_exceptions))
-		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}", get(calendar::handler::get_exception))
-		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}", put(calendar::handler::put_exception))
-		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}", patch(calendar::handler::patch_exception))
-		.route("/api/calendars/{cal_id}/objects/{uid}/exceptions/{recurrence_id}", delete(calendar::handler::delete_exception))
+		.merge(leader_router)
 
 		.route_layer(middleware::from_fn_with_state(app, require_auth))
 		.layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-cache")))
