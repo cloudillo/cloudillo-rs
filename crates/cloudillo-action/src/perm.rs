@@ -4,10 +4,11 @@
 //! Action permission middleware for ABAC
 
 use axum::{
-	extract::{Path, Request, State},
+	extract::{Path, Request, State, rejection::PathRejection},
 	middleware::Next,
 	response::Response,
 };
+use serde::Deserialize;
 
 use cloudillo_core::{
 	abac::Environment,
@@ -19,6 +20,21 @@ use cloudillo_types::types::ActionAttrs;
 
 use crate::prelude::*;
 
+/// The one path parameter this guard authorizes on.
+///
+/// Extracted by name, so trailing captures are simply ignored — `Path<T>` over a
+/// struct goes through serde's map deserializer, which does not arity-check the
+/// way a single-field `Path<String>` (a *sequence*) does.
+#[derive(Deserialize)]
+pub struct ActionIdParam {
+	action_id: String,
+}
+
+/// The guard's path extraction, kept fallible: a route with no `{action_id}`
+/// capture gets a logged `PermissionDenied` rather than axum's bare 400 with the
+/// serde message in it.
+type ActionIdPath = Result<Path<ActionIdParam>, PathRejection>;
+
 /// Middleware factory for action permission checks
 ///
 /// Returns a middleware function that validates action permissions via ABAC
@@ -28,12 +44,15 @@ use crate::prelude::*;
 ///
 /// # Returns
 /// A cloneable middleware function with return type `PermissionCheckOutput`
+///
+/// The route must capture the action id as `{action_id}` — the guard reads it by
+/// name, not by position. Other captures are ignored.
 pub fn check_perm_action(
 	action: &'static str,
-) -> impl Fn(State<App>, TnId, IdTag, OptionalAuth, Path<String>, Request, Next) -> PermissionCheckOutput
+) -> impl Fn(State<App>, TnId, IdTag, OptionalAuth, ActionIdPath, Request, Next) -> PermissionCheckOutput
 + Clone {
-	move |state, tn_id, id_tag, auth, path, req, next| {
-		Box::pin(check_action_permission(state, tn_id, id_tag, auth, path, req, next, action))
+	move |state, tn_id, id_tag, auth, params, req, next| {
+		Box::pin(check_action_permission(state, tn_id, id_tag, auth, params, req, next, action))
 	}
 }
 
@@ -43,12 +62,17 @@ async fn check_action_permission(
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth_ctx): OptionalAuth,
-	Path(action_id): Path<String>,
+	params: ActionIdPath,
 	req: Request,
 	next: Next,
 	action: &str,
 ) -> Result<Response, Error> {
 	use tracing::warn;
+
+	let Ok(Path(ActionIdParam { action_id })) = params else {
+		warn!("Action permission guard on a route with no {{action_id}} capture");
+		return Err(Error::PermissionDenied);
+	};
 
 	// Draft actions (@{a_id}): skip ABAC, verify authenticated user is the issuer
 	if action_id.starts_with('@') {

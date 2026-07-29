@@ -4,16 +4,34 @@
 //! Profile permission middleware for ABAC
 
 use axum::{
-	extract::{Path, Request, State},
+	extract::{Path, Request, State, rejection::PathRejection},
 	middleware::Next,
 	response::Response,
 };
+use serde::Deserialize;
 
 use crate::prelude::*;
 use cloudillo_core::abac::Environment;
 use cloudillo_core::extract::Auth;
 use cloudillo_core::middleware::PermissionCheckOutput;
 use cloudillo_types::types::ProfileAttrs;
+
+/// The one path parameter this guard authorizes on.
+///
+/// Extracted by name, so trailing captures are simply ignored — `Path<T>` over a
+/// struct goes through serde's map deserializer, which does not arity-check the
+/// way a single-field `Path<String>` (a *sequence*) does. Reading positionally
+/// would be worse than inelegant here: a route whose first capture is not the
+/// id_tag would authorize against a different subject.
+#[derive(Deserialize)]
+pub struct IdTagParam {
+	id_tag: String,
+}
+
+/// The guard's path extraction, kept fallible: a route with no `{id_tag}` capture
+/// gets a logged `PermissionDenied` rather than axum's bare 400 with the serde
+/// message in it.
+type IdTagPath = Result<Path<IdTagParam>, PathRejection>;
 
 /// Middleware factory for profile permission checks
 ///
@@ -24,23 +42,31 @@ use cloudillo_types::types::ProfileAttrs;
 ///
 /// # Returns
 /// A cloneable middleware function with return type `PermissionCheckOutput`
+///
+/// The route must capture the subject as `{id_tag}` — the guard reads it by name,
+/// not by position. Other captures are ignored.
 pub fn check_perm_profile(
 	action: &'static str,
-) -> impl Fn(State<App>, Auth, Path<String>, Request, Next) -> PermissionCheckOutput + Clone {
-	move |state, auth, path, req, next| {
-		Box::pin(check_profile_permission(state, auth, path, req, next, action))
+) -> impl Fn(State<App>, Auth, IdTagPath, Request, Next) -> PermissionCheckOutput + Clone {
+	move |state, auth, params, req, next| {
+		Box::pin(check_profile_permission(state, auth, params, req, next, action))
 	}
 }
 
 async fn check_profile_permission(
 	State(app): State<App>,
 	Auth(auth_ctx): Auth,
-	Path(id_tag): Path<String>,
+	params: IdTagPath,
 	req: Request,
 	next: Next,
 	action: &str,
 ) -> Result<Response, Error> {
 	use tracing::warn;
+
+	let Ok(Path(IdTagParam { id_tag })) = params else {
+		warn!("Profile permission guard on a route with no {{id_tag}} capture");
+		return Err(Error::PermissionDenied);
+	};
 
 	// Load profile attributes (STUB - Phase 3 will implement)
 	let attrs = load_profile_attrs(&app, auth_ctx.tn_id, &id_tag, &auth_ctx.id_tag).await?;

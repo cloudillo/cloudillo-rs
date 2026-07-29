@@ -4,10 +4,11 @@
 //! File permission middleware for ABAC
 
 use axum::{
-	extract::{Path, Request, State},
+	extract::{Path, Request, State, rejection::PathRejection},
 	middleware::Next,
 	response::Response,
 };
+use serde::Deserialize;
 
 use crate::prelude::*;
 use cloudillo_core::abac::Environment;
@@ -16,6 +17,26 @@ use cloudillo_core::file_access;
 use cloudillo_core::middleware::PermissionCheckOutput;
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::types::FileAttrs;
+
+/// The one path parameter this guard authorizes on.
+///
+/// Extracted by name, so trailing captures like the `{tag}` of
+/// `/api/files/{file_id}/tag/{tag}` are simply ignored — `Path<T>` over a struct
+/// goes through serde's map deserializer, which does not arity-check the way a
+/// single-field `Path<String>` (a *sequence*) does.
+#[derive(Deserialize)]
+pub struct FileIdParam {
+	/// `/api/files/variant/{variant_id}` captures under a different name;
+	/// `load_file_attrs` below detects the `b` prefix and resolves the variant
+	/// id to its file id.
+	#[serde(alias = "variant_id")]
+	file_id: String,
+}
+
+/// The guard's path extraction, kept fallible: a route with no accepted capture
+/// gets a logged `PermissionDenied` rather than axum's bare 400 with the serde
+/// message in it.
+type FileIdPath = Result<Path<FileIdParam>, PathRejection>;
 
 /// Middleware factory for file permission checks
 ///
@@ -26,12 +47,15 @@ use cloudillo_types::types::FileAttrs;
 ///
 /// # Returns
 /// A cloneable middleware function with return type `PermissionCheckOutput`
+///
+/// The route must capture the file id as `{file_id}` (or `{variant_id}`) — the
+/// guard reads it by name, not by position. Other captures are ignored.
 pub fn check_perm_file(
 	action: &'static str,
-) -> impl Fn(State<App>, IdTag, TnId, OptionalAuth, Path<String>, Request, Next) -> PermissionCheckOutput
+) -> impl Fn(State<App>, IdTag, TnId, OptionalAuth, FileIdPath, Request, Next) -> PermissionCheckOutput
 + Clone {
-	move |state, id_tag, tn_id, auth, path, req, next| {
-		Box::pin(check_file_permission(state, id_tag, tn_id, auth, path, req, next, action))
+	move |state, id_tag, tn_id, auth, params, req, next| {
+		Box::pin(check_file_permission(state, id_tag, tn_id, auth, params, req, next, action))
 	}
 }
 
@@ -41,12 +65,17 @@ async fn check_file_permission(
 	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
 	OptionalAuth(maybe_auth_ctx): OptionalAuth,
-	Path(file_id): Path<String>,
+	params: FileIdPath,
 	req: Request,
 	next: Next,
 	action: &str,
 ) -> Result<Response, Error> {
 	use tracing::warn;
+
+	let Ok(Path(FileIdParam { file_id })) = params else {
+		warn!("File permission guard on a route with no {{file_id}} capture");
+		return Err(Error::PermissionDenied);
+	};
 
 	// Create auth context or guest context if not authenticated
 	let (auth_ctx, subject_id_tag) = if let Some(auth_ctx) = maybe_auth_ctx {
