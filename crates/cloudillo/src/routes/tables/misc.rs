@@ -71,7 +71,8 @@ pub(crate) fn settings() -> Router<App> {
 }
 
 /// Reference (invite / recovery link) management — authentication only, no ABAC
-/// guard; the handlers scope every operation to the caller's own tenant.
+/// guard; the handlers authorize themselves per resource, dispatching on the ref's
+/// type via `cloudillo_ref::handler::ref_gate`. Scoped tokens are refused outright.
 ///
 /// `GET /api/refs/{ref_id}` is **not** here — it is public, in [`ref_public`],
 /// because the reset page must load ref data before the user has any session.

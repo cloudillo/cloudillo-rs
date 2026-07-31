@@ -1730,7 +1730,7 @@ async fn post_file_cross_context(
 	// on_accept does on the recipient side and what `refresh_file` writes on
 	// subsequent reconciliations.
 	let access_patch: Patch<char> = match source_view.access_level {
-		Some(lv) => match access_level_to_perm_char(lv) {
+		Some(lv) => match lv.to_perm_char() {
 			Some(ch) => Patch::Value(ch),
 			None => Patch::Null,
 		},
@@ -1924,7 +1924,7 @@ pub async fn refresh_file(
 			// Source server populated access_level → cache it; otherwise preserve
 			// whatever we already had (older peer servers may omit the field).
 			match source_access_level {
-				Some(lv) => match access_level_to_perm_char(lv) {
+				Some(lv) => match lv.to_perm_char() {
 					Some(ch) => Patch::Value(ch),
 					None => Patch::Null, // source says "no access" — clear cache
 				},
@@ -1996,19 +1996,6 @@ pub async fn refresh_file(
 	view.access_level = view.user_data.as_ref().and_then(|u| u.access_level);
 	let body = RefreshResponse { view, refresh_status };
 	Ok((StatusCode::OK, Json(ApiResponse::new(body).with_req_id(req_id.unwrap_or_default()))))
-}
-
-/// Map an AccessLevel back to its single-char wire form for storage in
-/// `file_user_data.access_level`. Mirrors [`AccessLevel::from_perm_char`].
-/// `AccessLevel::None` returns `None` — the caller should clear the cache
-/// rather than write a stale `'R'` badge.
-fn access_level_to_perm_char(level: AccessLevel) -> Option<char> {
-	match level {
-		AccessLevel::None => None,
-		AccessLevel::Read => Some('R'),
-		AccessLevel::Comment => Some('C'),
-		AccessLevel::Write | AccessLevel::Admin => Some('W'),
-	}
 }
 
 async fn build_dedup_response(

@@ -31,8 +31,8 @@ use cloudillo_types::{
 		Action, ActionData, ActionId, ActionView, AddressBook, Calendar, CalendarObject,
 		CalendarObjectExtracted, CalendarObjectSyncEntry, CalendarObjectView, CalendarObjectWrite,
 		Contact, ContactExtracted, ContactSyncEntry, ContactView, CreateCalendarData, CreateFile,
-		CreateRefOptions, CreateShareEntry, FileId, FileUserData, FileVariant, FileView,
-		FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
+		CreateRefOptions, CreateShareEntry, DeleteFileResult, FileId, FileUserData, FileVariant,
+		FileView, FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
 		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
 		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
 		ProfileData, PushSubscription, PushSubscriptionData, RefData, ShareEntry, Task, TaskPatch,
@@ -491,12 +491,8 @@ impl MetaAdapter for MetaAdapterSqlite {
 	// Phase 2: File Management Enhancements
 	//**************************************
 
-	async fn delete_file(&self, tn_id: TnId, file_id: &str) -> ClResult<()> {
+	async fn delete_file(&self, tn_id: TnId, file_id: &str) -> ClResult<DeleteFileResult> {
 		file::delete(&self.db, tn_id, file_id).await
-	}
-
-	async fn list_children_by_root(&self, tn_id: TnId, root_id: &str) -> ClResult<Vec<Box<str>>> {
-		file::list_children_by_root(&self.dbr, tn_id, root_id).await
 	}
 
 	// Settings Management

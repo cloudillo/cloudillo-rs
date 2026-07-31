@@ -692,7 +692,12 @@ impl ErrorResponse {
 //*****************************
 
 /// Access level enum for files
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// The variant order IS the ordering (None < Read < Comment < Write < Admin), so `Ord` lets
+/// callers cap one level by another — e.g. a share manager may not grant more than they hold.
+#[derive(
+	Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum AccessLevel {
 	None,
@@ -713,40 +718,85 @@ impl AccessLevel {
 		}
 	}
 
-	/// Return the lesser of two access levels.
-	/// Ordering: None < Read < Comment < Write < Admin
-	pub fn min(self, other: Self) -> Self {
-		match (self, other) {
-			(Self::None, _) | (_, Self::None) => Self::None,
-			(Self::Read, _) | (_, Self::Read) => Self::Read,
-			(Self::Comment, _) | (_, Self::Comment) => Self::Comment,
-			(Self::Write, _) | (_, Self::Write) => Self::Write,
-			(Self::Admin, Self::Admin) => Self::Admin,
+	/// Parse the wire/attribute name produced by [`AccessLevel::as_str`], for call sites that
+	/// receive a level as an untyped string (the ABAC object attribute bag). Unknown names yield
+	/// `None` so a caller denies rather than guessing.
+	pub fn from_str_name(s: &str) -> Option<Self> {
+		match s {
+			"none" => Some(Self::None),
+			"read" => Some(Self::Read),
+			"comment" => Some(Self::Comment),
+			"write" => Some(Self::Write),
+			"admin" => Some(Self::Admin),
+			_ => Option::None,
 		}
 	}
 
-	/// Return the greater of two access levels.
-	/// Ordering: None < Read < Comment < Write < Admin
-	pub fn max(self, other: Self) -> Self {
-		match (self, other) {
-			(Self::Admin, _) | (_, Self::Admin) => Self::Admin,
-			(Self::Write, _) | (_, Self::Write) => Self::Write,
-			(Self::Comment, _) | (_, Self::Comment) => Self::Comment,
-			(Self::Read, _) | (_, Self::Read) => Self::Read,
-			(Self::None, Self::None) => Self::None,
-		}
-	}
-
-	/// Convert a share permission char ('R', 'C', 'W', 'A') to an access level.
-	/// 'A' (admin) maps to Write because scoped tokens don't carry admin privileges;
-	/// admin access is only resolved from direct ownership, not from share links.
-	/// Unknown chars default to Read.
+	/// Convert a permission char ('R', 'C', 'W', 'A') to an access level.
+	///
+	/// The single converter for the `permission CHAR(1)` vocabulary used by `share_entries`,
+	/// `file_user_data.access_level` and ref rows. `'A'` is a *distinct* level, not a synonym for
+	/// write: it additionally confers share management. Unknown chars fall back to `Read` —
+	/// fail-safe for a corrupt row, which the adapter logs.
 	pub fn from_perm_char(c: char) -> Self {
 		match c {
-			'W' | 'A' => Self::Write,
+			'A' => Self::Admin,
+			'W' => Self::Write,
 			'C' => Self::Comment,
 			_ => Self::Read,
 		}
+	}
+
+	/// Map an access level back to its single-char wire form.
+	///
+	/// Injective inverse of [`AccessLevel::from_perm_char`]. `None` has no char — the caller
+	/// should clear the stored value rather than write a stale `'R'`.
+	pub fn to_perm_char(self) -> Option<char> {
+		match self {
+			Self::None => Option::None,
+			Self::Read => Some('R'),
+			Self::Comment => Some('C'),
+			Self::Write => Some('W'),
+			Self::Admin => Some('A'),
+		}
+	}
+
+	/// Map an access level to the char used inside a *token scope* (`file:{id}:{R|C|W}`).
+	///
+	/// Deliberately lossy at the top: `Admin` caps to `'W'`. `share_access` refuses every scoped
+	/// caller, so admin inside a scope would be unusable, and emitting it risks a parser elsewhere
+	/// reading it as authority.
+	///
+	/// `None` has no char, mirroring [`AccessLevel::to_perm_char`]: a scope is a grant, so "no
+	/// access" must not silently become a read scope. Callers already hold `>= Read`, making the
+	/// `None` arm a compile-time reminder rather than a live path.
+	pub fn to_scope_char(self) -> Option<char> {
+		match self {
+			Self::Admin | Self::Write => Some('W'),
+			Self::Comment => Some('C'),
+			Self::Read => Some('R'),
+			Self::None => Option::None,
+		}
+	}
+
+	/// May read the resource.
+	pub fn can_read(self) -> bool {
+		self >= Self::Read
+	}
+
+	/// May comment on the resource.
+	pub fn can_comment(self) -> bool {
+		self >= Self::Comment
+	}
+
+	/// May modify the resource. True for `Admin` too — use ordering, never `== Write`.
+	pub fn can_write(self) -> bool {
+		self >= Self::Write
+	}
+
+	/// May manage the resource's share set (grant, revoke, mint share links).
+	pub fn can_manage_shares(self) -> bool {
+		self == Self::Admin
 	}
 }
 
@@ -775,10 +825,14 @@ impl TokenScope {
 		}
 		let parts: Vec<&str> = s.split(':').collect();
 		if parts.len() == 3 && parts[0] == "file" {
+			// Exhaustive on purpose: an unrecognized level char (including `'A'`, which
+			// `to_scope_char` never emits) makes the whole scope unparseable, which callers treat
+			// as "deny". A `Read` fallback would silently *widen* a malformed scope.
 			let access = match parts[2] {
-				"W" => AccessLevel::Write,
+				"R" => AccessLevel::Read,
 				"C" => AccessLevel::Comment,
-				_ => AccessLevel::Read, // "R" or any other value defaults to Read
+				"W" => AccessLevel::Write,
+				_ => return None,
 			};
 			return Some(Self::File { file_id: parts[1].to_string(), access });
 		}
@@ -961,6 +1015,97 @@ impl AttrSet for SubjectAttrs {
 			"roles" => Some(self.roles.iter().map(AsRef::as_ref).collect()),
 			_ => None,
 		}
+	}
+}
+
+#[cfg(test)]
+mod access_level_tests {
+	use super::{AccessLevel, TokenScope};
+
+	#[test]
+	fn perm_char_keeps_admin_distinct() {
+		assert_eq!(AccessLevel::from_perm_char('A'), AccessLevel::Admin);
+		assert_eq!(AccessLevel::from_perm_char('W'), AccessLevel::Write);
+		assert_eq!(AccessLevel::from_perm_char('C'), AccessLevel::Comment);
+		assert_eq!(AccessLevel::from_perm_char('R'), AccessLevel::Read);
+		// Corrupt rows fail safe to the weakest level.
+		assert_eq!(AccessLevel::from_perm_char('?'), AccessLevel::Read);
+	}
+
+	#[test]
+	fn to_perm_char_is_the_injective_inverse() {
+		for level in
+			[AccessLevel::Read, AccessLevel::Comment, AccessLevel::Write, AccessLevel::Admin]
+		{
+			let c = level.to_perm_char().expect("every level above None has a char");
+			assert_eq!(AccessLevel::from_perm_char(c), level);
+		}
+		// `None` has no char — the caller clears the stored value instead.
+		assert_eq!(AccessLevel::None.to_perm_char(), None);
+	}
+
+	#[test]
+	fn str_name_round_trips_every_variant() {
+		// The ABAC attribute bag carries the level as an untyped string, so this round trip is the
+		// only thing keeping that gate's ordering in step with this enum.
+		for level in [
+			AccessLevel::None,
+			AccessLevel::Read,
+			AccessLevel::Comment,
+			AccessLevel::Write,
+			AccessLevel::Admin,
+		] {
+			assert_eq!(AccessLevel::from_str_name(level.as_str()), Some(level));
+		}
+		// Unknown names yield `None`, distinct from `Some(AccessLevel::None)` — a recognized
+		// "no access" — so the caller denies rather than guessing.
+		assert_eq!(AccessLevel::from_str_name("bogus"), None);
+		assert_eq!(AccessLevel::from_str_name(""), None);
+		// Case-sensitive: `as_str` only ever emits lowercase.
+		assert_eq!(AccessLevel::from_str_name("Write"), None);
+	}
+
+	#[test]
+	fn scope_char_caps_admin_at_write() {
+		assert_eq!(AccessLevel::Admin.to_scope_char(), Some('W'));
+		assert_eq!(AccessLevel::Write.to_scope_char(), Some('W'));
+		assert_eq!(AccessLevel::Comment.to_scope_char(), Some('C'));
+		assert_eq!(AccessLevel::Read.to_scope_char(), Some('R'));
+		// "No access" is not a read scope: it has no char at all, so a caller cannot accidentally
+		// mint `file:{id}:R` out of a denial.
+		assert_eq!(AccessLevel::None.to_scope_char(), None);
+	}
+
+	#[test]
+	fn predicates_follow_the_ordering() {
+		assert!(AccessLevel::Admin.can_read());
+		assert!(AccessLevel::Admin.can_comment());
+		assert!(AccessLevel::Admin.can_write());
+		assert!(AccessLevel::Admin.can_manage_shares());
+
+		assert!(AccessLevel::Write.can_write());
+		assert!(!AccessLevel::Write.can_manage_shares());
+		assert!(!AccessLevel::Comment.can_write());
+		assert!(AccessLevel::Comment.can_comment());
+		assert!(!AccessLevel::Read.can_comment());
+		assert!(AccessLevel::Read.can_read());
+		assert!(!AccessLevel::None.can_read());
+	}
+
+	#[test]
+	fn scope_parse_rejects_an_admin_level_char() {
+		// `'A'` must not parse: callers treat an unparseable scope as deny, whereas a fallback
+		// would widen it into a valid Read scope.
+		assert_eq!(TokenScope::parse("file:f1~abc:A"), None);
+		assert_eq!(TokenScope::parse("file:f1~abc:X"), None);
+		assert_eq!(
+			TokenScope::parse("file:f1~abc:W"),
+			Some(TokenScope::File { file_id: "f1~abc".to_string(), access: AccessLevel::Write })
+		);
+		assert_eq!(
+			TokenScope::parse("file:f1~abc:R"),
+			Some(TokenScope::File { file_id: "f1~abc".to_string(), access: AccessLevel::Read })
+		);
 	}
 }
 

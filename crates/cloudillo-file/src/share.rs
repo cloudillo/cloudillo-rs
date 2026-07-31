@@ -7,6 +7,12 @@
 //! manual, via `require_share_manager` (mutating the share set) or the weaker
 //! `require_share_reader` (listing it); both reject scoped (share-link) tokens.
 //! Creating user shares ('U') also generates FSHR actions for federation.
+//!
+//! Both gates live in `cloudillo_core::share_access` so the ref endpoints in `cloudillo-ref` can
+//! apply the same rule: a `refId` is a bearer credential, so handing one out is re-sharing.
+//!
+//! [`list_shares_by_subject`] is the one exception: it gates per `subjectType` rather than on share
+//! standing, and admits a scoped caller for `subjectType=F` alone.
 
 use axum::{
 	Json,
@@ -19,9 +25,11 @@ use serde_json::json;
 use crate::prelude::*;
 use cloudillo_core::CreateActionFn;
 use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
-use cloudillo_core::file_access::{self, FileAccessCtx, FileAccessResult};
+use cloudillo_core::file_access::{self, FileAccessCtx};
+use cloudillo_core::share_access::{
+	ensure_grant_within, require_share_manager, require_share_reader, require_unscoped_file_access,
+};
 use cloudillo_types::action_types::CreateAction;
-use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::meta_adapter::{CreateShareEntry, ShareEntry, UpdateShareEntryOptions};
 use cloudillo_types::types::{AccessLevel, ApiResponse};
 
@@ -37,151 +45,20 @@ fn validate_share_permission(c: char) -> ClResult<()> {
 	}
 }
 
-/// Shared prologue for both share gates: reject scoped (share-link) callers, then
-/// resolve the caller's access to the file.
-async fn resolve_share_access(
-	app: &App,
-	tn_id: TnId,
-	file_id: &str,
-	auth: &AuthCtx,
-	tenant_id_tag: &str,
-) -> ClResult<FileAccessResult> {
-	// A delegated share-link token must never touch share entries.
-	if auth.scope.is_some() {
-		warn!("Scoped token attempted to access share entries");
-		return Err(Error::PermissionDenied);
-	}
-
-	let ctx = FileAccessCtx { user_id_tag: &auth.id_tag, tenant_id_tag, user_roles: &auth.roles };
-	// Scope `None`: scoped callers were rejected above.
-	match file_access::check_file_access_with_scope(app, tn_id, file_id, &ctx, None, None).await {
-		Err(file_access::FileAccessError::NotFound) => Err(Error::NotFound),
-		Err(file_access::FileAccessError::AccessDenied) => Err(Error::PermissionDenied),
-		Err(file_access::FileAccessError::InternalError(msg)) => Err(Error::Internal(msg)),
-		Ok(access) => Ok(access),
-	}
-}
-
-/// Pure share-management decision, split out so it is unit-testable without an `App`.
+/// `'A'` (admin) only means something for a **user** subject.
 ///
-/// Requires access to the file itself, plus standing: a community leader **who
-/// already has access to the file**, an explicit `'A'` share grant, the file owner,
-/// or — **only for tenant-owned files** — the member who created the row.
-///
-/// The creator rule exists because a local file leaves `files.owner_tag` NULL and the
-/// meta adapter back-fills the *tenant* profile as owner (`build_owner_profile`);
-/// without it, on a community tenant even the file's creator fails the owner test and
-/// only `leader` could manage shares. The `tenant_owned` guard keeps a locally-placed
-/// copy of a foreign file (Pin/Place row, `owner_tag` = foreign owner) out of the
-/// placer's reach.
-fn is_share_manager(
-	access: AccessLevel,
-	subject: &str,
-	tenant_id_tag: &str,
-	owner_id_tag: Option<&str>,
-	creator_id_tag: Option<&str>,
-	is_leader: bool,
-	has_admin_grant: bool,
-) -> bool {
-	// Defence in depth, not a live path: `resolve_share_access` already rejected
-	// anyone who cannot reach the row.
-	if access == AccessLevel::None {
-		return false;
+/// Admin is the right to manage a share set under an identity, and `share_access` refuses every
+/// scoped caller — so a link ('L') grantee could never exercise it, and a file/embed ('F') subject
+/// is not an identity at all. Storing `'A'` on either is a no-op that later reads as an admin grant.
+fn validate_admin_subject(permission: char, subject_type: char) -> ClResult<()> {
+	if permission == 'A' && subject_type != 'U' {
+		return Err(Error::ValidationError(
+			"permission 'A' (admin) is only valid for subjectType 'U' (user); share links and \
+			 file embeds cannot manage a share set"
+				.into(),
+		));
 	}
-	if is_leader || has_admin_grant || owner_id_tag == Some(subject) {
-		return true;
-	}
-	let tenant_owned = owner_id_tag == Some(tenant_id_tag);
-	tenant_owned && creator_id_tag == Some(subject)
-}
-
-/// Pure share-*listing* decision: any unscoped caller with Write access may
-/// enumerate a file's share entries.
-fn is_share_reader(access: AccessLevel) -> bool {
-	access == AccessLevel::Write
-}
-
-/// Authorize share *management* (create/update/delete share entries).
-///
-/// An ownership/admin operation, strictly stronger than plain Write access — see
-/// `is_share_manager` for who qualifies. Plain FSHR-`W` grantees and scoped
-/// share-link tokens are deliberately excluded: otherwise a delegated link or a mere
-/// write grant could re-share, grant admin, or emit FSHR to arbitrary users. They may
-/// only *list* shares, via `require_share_reader`.
-async fn require_share_manager(
-	app: &App,
-	tn_id: TnId,
-	file_id: &str,
-	auth: &AuthCtx,
-	tenant_id_tag: &str,
-) -> ClResult<FileAccessResult> {
-	let access = resolve_share_access(app, tn_id, file_id, auth, tenant_id_tag).await?;
-
-	// Read the share row directly: `AccessLevel::from_perm_char` folds 'A' into Write,
-	// so `access.access_level` can never report Admin. Direct entries only — a
-	// folder-inherited share does not confer admin over its contents.
-	let has_admin_grant = matches!(
-		app.meta_adapter
-			.check_share_access(tn_id, 'F', file_id, 'U', &auth.id_tag)
-			.await,
-		Ok(Some('A'))
-	);
-
-	let owner_id_tag = non_empty_id_tag(access.file_view.owner.as_ref().map(|p| p.id_tag.as_ref()));
-	let creator_id_tag =
-		non_empty_id_tag(access.file_view.creator.as_ref().map(|p| p.id_tag.as_ref()));
-
-	if is_share_manager(
-		access.access_level,
-		&auth.id_tag,
-		tenant_id_tag,
-		owner_id_tag,
-		creator_id_tag,
-		cloudillo_core::roles::is_leader(&auth.roles),
-		has_admin_grant,
-	) {
-		Ok(access)
-	} else {
-		warn!(
-			subject = %auth.id_tag,
-			file_id = %file_id,
-			"Share management denied - owner/creator/leader/admin required"
-		);
-		Err(Error::PermissionDenied)
-	}
-}
-
-/// Authorize *listing* a file's share entries.
-///
-/// Weaker than `require_share_manager`: any Write-access caller — including a plain
-/// FSHR-`W` grantee — may see who the file is shared with, since enumeration is not
-/// part of the re-share escalation that gate defends against. Scoped tokens are
-/// still rejected.
-async fn require_share_reader(
-	app: &App,
-	tn_id: TnId,
-	file_id: &str,
-	auth: &AuthCtx,
-	tenant_id_tag: &str,
-) -> ClResult<FileAccessResult> {
-	let access = resolve_share_access(app, tn_id, file_id, auth, tenant_id_tag).await?;
-
-	if is_share_reader(access.access_level) {
-		Ok(access)
-	} else {
-		warn!(
-			subject = %auth.id_tag,
-			file_id = %file_id,
-			"Share listing denied - write access required"
-		);
-		Err(Error::PermissionDenied)
-	}
-}
-
-/// Normalize an id_tag that may be present but blank into `None`, mirroring
-/// `file_access::check_file_access_with_scope`'s owner resolution.
-fn non_empty_id_tag(id_tag: Option<&str>) -> Option<&str> {
-	id_tag.filter(|s| !s.is_empty())
+	Ok(())
 }
 
 /// GET /api/files/{file_id}/shares — List share entries for a file
@@ -211,6 +88,10 @@ pub async fn create_share(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(mut input): Json<CreateShareEntry>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ShareEntry>>)> {
+	// Authorization before body validation, per the ordering convention in
+	// `cloudillo_core::share_access`.
+	let authority = require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+
 	// Validate input
 	if !matches!(input.subject_type, 'U' | 'L' | 'F') {
 		return Err(Error::ValidationError(
@@ -218,6 +99,7 @@ pub async fn create_share(
 		));
 	}
 	validate_share_permission(input.permission)?;
+	validate_admin_subject(input.permission, input.subject_type)?;
 	if input.subject_id.is_empty() {
 		return Err(Error::ValidationError("subjectId cannot be empty".into()));
 	}
@@ -239,7 +121,15 @@ pub async fn create_share(
 		input.subject_id = bare_id.to_string();
 	}
 
-	let file_access = require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	// Manager standing is ownership-derived (a `Read`-level creator of a tenant-owned file
+	// qualifies), so cap the grant at the caller's ceiling or they could hand themselves more than
+	// they hold. Runs after `validate_share_permission`, which makes the char safe to convert.
+	ensure_grant_within(
+		AccessLevel::from_perm_char(input.permission),
+		authority.grant_ceiling,
+		&auth.id_tag,
+		&file_id,
+	)?;
 
 	// Create share entry
 	let entry = app
@@ -249,9 +139,12 @@ pub async fn create_share(
 
 	// For user shares, also create FSHR action for federation (best-effort)
 	if input.subject_type == 'U' {
-		let file_view = &file_access.file_view;
+		let file_view = &authority.access.file_view;
+		// The grant federates at its real level, including `'A'`: the remote grantee manages shares
+		// on the owner's node under their own identity, resolved from the row created above.
 		let sub_typ: Option<Box<str>> = match input.permission {
-			'W' | 'A' => Some("WRITE".into()),
+			'A' => Some("ADMIN".into()),
+			'W' => Some("WRITE".into()),
 			'C' => Some("COMMENT".into()),
 			_ => None,
 		};
@@ -370,7 +263,7 @@ pub async fn update_share(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<UpdateShareRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ShareEntry>>)> {
-	require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	let authority = require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
 
 	// Reject empty PATCH at the handler boundary.
 	if req.permission.is_undefined() && req.expires_at.is_undefined() {
@@ -386,6 +279,26 @@ pub async fn update_share(
 		}
 		Patch::Value(c) => {
 			validate_share_permission(c)?;
+			// `'A'` on a link or an embed is as meaningless here as on create, and only the stored
+			// row says which subject kind this entry targets.
+			if c == 'A' {
+				let entry = app
+					.meta_adapter
+					.read_share_entry(tn_id, share_id)
+					.await?
+					.ok_or(Error::NotFound)?;
+				if entry.resource_type != 'F' || *entry.resource_id != *file_id {
+					return Err(Error::NotFound);
+				}
+				validate_admin_subject(c, entry.subject_type)?;
+			}
+			// Same cap as create_share: a manager may not raise an entry past their own ceiling.
+			ensure_grant_within(
+				AccessLevel::from_perm_char(c),
+				authority.grant_ceiling,
+				&auth.id_tag,
+				&file_id,
+			)?;
 			Patch::Value(c)
 		}
 	};
@@ -424,6 +337,18 @@ pub struct ListSharesBySubjectQuery {
 }
 
 /// GET /api/shares?subject_id={id}[&subject_type=F] — List share entries by subject
+///
+/// A scoped (share-link) caller is admitted only for `subjectType=F`, because embed resolution is
+/// exactly what a link guest needs. Every other `subjectType` is refused outright, so a guest can
+/// never turn the link that admitted them into a view of the share set.
+///
+/// Unscoped callers are gated per `subjectType`, since each answers a different question:
+/// - `F` (or absent) — plain access to the subject file, not share standing
+/// - `U` — the subject themselves, the tenant account, or a leader
+/// - `L` — the tenant account alone
+/// - anything else — a validation error rather than an ungated fall-through
+///
+/// `subjectId` accepts an optional `@` prefix, matching what `create_share` strips before storing.
 pub async fn list_shares_by_subject(
 	State(app): State<App>,
 	Auth(auth): Auth,
@@ -432,8 +357,27 @@ pub async fn list_shares_by_subject(
 	Query(query): Query<ListSharesBySubjectQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ShareEntry>>>)> {
-	// When looking up by file subject, verify caller has at least read access
-	if query.subject_type.is_none() || query.subject_type == Some('F') {
+	// Narrowed to `Some('F')` in the scoped branch, so however the query was written the response
+	// can only carry file-to-file embed rows.
+	let mut subject_type = query.subject_type;
+
+	// `create_share` strips the `@` before storing, so normalize once here — for the gate AND the
+	// query. Normalizing only for the gate let `@alice.example.com` clear it and then match nothing.
+	// The file-access checks below keep the raw value: `@{f_id}` is a live file address form.
+	let subject_id = query.subject_id.strip_prefix('@').unwrap_or(&query.subject_id);
+
+	if auth.scope.is_some() {
+		if query.subject_type != Some('F') {
+			warn!(
+				subject = %auth.id_tag,
+				"Scoped token may only list file-to-file share entries (subjectType=F)"
+			);
+			return Err(Error::PermissionDenied);
+		}
+		subject_type = Some('F');
+
+		// The scope is passed through, not ignored: the link that admitted this caller is the grant
+		// that gives them reach into the embedded file.
 		let ctx = FileAccessCtx {
 			user_id_tag: &auth.id_tag,
 			tenant_id_tag: &tenant_id_tag,
@@ -456,132 +400,50 @@ pub async fn list_shares_by_subject(
 			}
 			Ok(_) => {}
 		}
+	} else {
+		match query.subject_type {
+			// A file subject: "which containers embed this file". Plain read access to the file.
+			None | Some('F') => {
+				require_unscoped_file_access(&app, tn_id, &query.subject_id, &auth, &tenant_id_tag)
+					.await?;
+			}
+			// A user subject: "which files is this user shared into" — their own share map, so
+			// without this gate any member could enumerate anyone's.
+			Some('U') => {
+				let is_self = auth.id_tag.as_ref() == subject_id;
+				let is_tenant = auth.id_tag == tenant_id_tag;
+				if !is_self && !is_tenant && !cloudillo_core::roles::is_leader(&auth.roles) {
+					warn!(
+						subject = %auth.id_tag,
+						target = %subject_id,
+						"Share-by-subject listing denied - self, tenant account or leader required"
+					);
+					return Err(Error::PermissionDenied);
+				}
+			}
+			// A link subject: the subject_id IS a bearer credential. Tenant account only.
+			Some('L') => {
+				if auth.id_tag != tenant_id_tag {
+					warn!(
+						subject = %auth.id_tag,
+						"Share-by-subject listing denied - link subjects are the tenant account's"
+					);
+					return Err(Error::PermissionDenied);
+				}
+			}
+			Some(other) => {
+				return Err(Error::ValidationError(format!("unsupported subjectType '{other}'")));
+			}
+		}
 	}
 
 	let entries = app
 		.meta_adapter
-		.list_share_entries_by_subject(tn_id, query.subject_type, &query.subject_id)
+		.list_share_entries_by_subject(tn_id, subject_type, subject_id)
 		.await?;
 
 	let response = ApiResponse::new(entries).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::OK, Json(response)))
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	const TENANT: &str = "community.example.com";
-	const MEMBER: &str = "alice.example.com";
-	const OTHER: &str = "bob.example.com";
-
-	const W: AccessLevel = AccessLevel::Write;
-
-	#[test]
-	fn personal_tenant_owner_manages_shares() {
-		// Personal tenant: owner back-fills to the tenant profile, which *is* the caller.
-		assert!(is_share_manager(W, TENANT, TENANT, Some(TENANT), Some(TENANT), false, false));
-	}
-
-	#[test]
-	fn creator_of_tenant_owned_file_manages_shares() {
-		// On a community tenant the owner is the tenant, so the member who created
-		// the row must pass on the creator rule.
-		assert!(is_share_manager(W, MEMBER, TENANT, Some(TENANT), Some(MEMBER), false, false));
-	}
-
-	#[test]
-	fn non_creator_member_cannot_manage_shares() {
-		assert!(!is_share_manager(W, MEMBER, TENANT, Some(TENANT), Some(OTHER), false, false));
-	}
-
-	#[test]
-	fn leader_manages_shares() {
-		assert!(is_share_manager(W, MEMBER, TENANT, Some(TENANT), Some(OTHER), true, false));
-	}
-
-	#[test]
-	fn creator_of_placed_foreign_file_cannot_manage_shares() {
-		// Pin/Place row: `owner_tag` holds the foreign owner, so the local
-		// placer (recorded as creator) must not gain share management.
-		assert!(!is_share_manager(W, MEMBER, TENANT, Some(OTHER), Some(MEMBER), false, false));
-	}
-
-	#[test]
-	fn explicit_admin_grant_manages_shares() {
-		// Same caller, with and without the 'A' grant.
-		assert!(!is_share_manager(W, OTHER, TENANT, Some(TENANT), Some(MEMBER), false, false));
-		assert!(is_share_manager(W, OTHER, TENANT, Some(TENANT), Some(MEMBER), false, true));
-	}
-
-	#[test]
-	fn plain_write_grantee_cannot_manage_shares() {
-		// The FSHR-`W` grantee: no owner/creator/leader/admin standing, so it fails
-		// regardless of access level.
-		assert!(!is_share_manager(W, OTHER, TENANT, Some(MEMBER), Some(MEMBER), false, false));
-	}
-
-	#[test]
-	fn missing_owner_and_creator_deny() {
-		assert!(!is_share_manager(W, MEMBER, TENANT, None, None, false, false));
-	}
-
-	#[test]
-	fn leader_without_access_is_not_a_share_manager() {
-		// A leader has no role-based access to a foreign-owned placed file, so
-		// leadership alone never confers share management over it.
-		assert!(!is_share_manager(
-			AccessLevel::None,
-			MEMBER,
-			TENANT,
-			Some(OTHER),
-			Some(OTHER),
-			true,
-			false
-		));
-	}
-
-	#[test]
-	fn admin_grant_without_access_is_not_a_share_manager() {
-		assert!(!is_share_manager(
-			AccessLevel::None,
-			MEMBER,
-			TENANT,
-			Some(OTHER),
-			Some(OTHER),
-			false,
-			true
-		));
-	}
-
-	#[test]
-	fn read_access_creator_is_still_a_share_manager() {
-		// Manage standing is ownership-derived, not Write-derived: read access to
-		// the row is enough once the caller created the tenant-owned file.
-		assert!(is_share_manager(
-			AccessLevel::Read,
-			MEMBER,
-			TENANT,
-			Some(TENANT),
-			Some(MEMBER),
-			false,
-			false
-		));
-	}
-
-	#[test]
-	fn share_reader_needs_write_access() {
-		assert!(is_share_reader(AccessLevel::Write));
-		// Read access is not enough to enumerate the share set.
-		assert!(!is_share_reader(AccessLevel::Read));
-	}
-
-	#[test]
-	fn non_empty_id_tag_normalizes_blank() {
-		assert_eq!(non_empty_id_tag(Some("")), None);
-		assert_eq!(non_empty_id_tag(Some(MEMBER)), Some(MEMBER));
-		assert_eq!(non_empty_id_tag(None), None);
-	}
 }
 
 // vim: ts=4

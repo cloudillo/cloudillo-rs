@@ -870,8 +870,12 @@ fn fileshare_definition() -> ActionDefinition {
 		}),
 		subtypes: Some({
 			let mut map = HashMap::new();
+			// Descriptive only — the DSL validator never reads this. Authoritative mapping (and
+			// the absent-means-read default) lives in `native_hooks::fshr::perm_char_for_sub_typ`.
 			map.insert("DEL".to_string(), "Revoke file share".to_string());
+			map.insert("COMMENT".to_string(), "Grant comment permission".to_string());
 			map.insert("WRITE".to_string(), "Grant write permission".to_string());
+			map.insert("ADMIN".to_string(), "Grant share-management permission".to_string());
 			map
 		}),
 		fields: FieldConstraints {

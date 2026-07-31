@@ -4,9 +4,10 @@
 //! File access level helpers
 //!
 //! Provides functions to determine user access levels to files based on:
-//! - Scoped tokens (file:{file_id}:{R|W} grants Read/Write access)
-//! - Ownership (owner always has Write access)
-//! - FSHR action grants (WRITE subtype = Write, otherwise Read)
+//! - Scoped tokens (file:{file_id}:{R|C|W} grants Read/Comment/Write access)
+//! - Ownership (owner has Admin access — write, plus share management)
+//! - FSHR action grants, but only from the file's owner (ADMIN subtype = Admin, WRITE = Write,
+//!   COMMENT = Comment, else Read)
 
 use std::sync::Arc;
 
@@ -191,10 +192,12 @@ pub async fn check_share_for_file(
 /// federated stranger Read access. Second defence behind `roles::parse_roles`,
 /// which drops empty segments.
 pub fn role_access_level(user_roles: &[Box<str>]) -> AccessLevel {
-	if user_roles
-		.iter()
-		.any(|r| matches!(r.as_ref(), "leader" | "moderator" | "contributor"))
-	{
+	// A leader resolves to `Admin`, not `Write`: leadership over a tenant-owned file *is* the right
+	// to manage its share set, so `access_level` alone answers "may manage shares".
+	if user_roles.iter().any(|r| r.as_ref() == "leader") {
+		return AccessLevel::Admin;
+	}
+	if user_roles.iter().any(|r| matches!(r.as_ref(), "moderator" | "contributor")) {
 		return AccessLevel::Write;
 	}
 	if user_roles
@@ -206,14 +209,61 @@ pub fn role_access_level(user_roles: &[Box<str>]) -> AccessLevel {
 	AccessLevel::None
 }
 
+/// Resolve the grant an `FSHR:{file_id}:{audience}` action row carries: `ADMIN` → Admin, `WRITE` →
+/// Write, `COMMENT` → Comment, `DEL` → None (a revocation is not a grant), anything else → Read.
+///
+/// An FSHR is a *claim by its issuer* that they granted access, so only the file's owner can make
+/// it credibly. Without the issuer test the row is a self-service grant: `POST /api/actions` is
+/// gated only by the `contributor` role, the action DSL's `key_pattern` builds the key straight
+/// from the client's `subject` and `aud`, and hooks run *after* the row is stored with no rollback,
+/// so `fshr::on_create` rejecting the write leaves the row behind. Federated peers can post such a
+/// token to the inbox just as easily.
+///
+/// Both live paths survive the test: on the recipient's node `fshr::on_accept` creates the file row
+/// with `owner_tag = issuer`, and on the owner's node the grantee's access resolves earlier, from
+/// the `share_entries` row.
+fn fshr_grant_level(
+	typ: &str,
+	sub_typ: Option<&str>,
+	issuer_tag: &str,
+	owner_id_tag: &str,
+	file_id: &str,
+) -> AccessLevel {
+	if typ != "FSHR" {
+		return AccessLevel::None;
+	}
+	if issuer_tag != owner_id_tag {
+		warn!(
+			file_id = %file_id,
+			issuer = %issuer_tag,
+			owner = %owner_id_tag,
+			sub_typ = ?sub_typ,
+			"Ignoring FSHR grant: issuer does not own the file"
+		);
+		return AccessLevel::None;
+	}
+	match sub_typ {
+		Some("ADMIN") => AccessLevel::Admin,
+		Some("WRITE") => AccessLevel::Write,
+		Some("COMMENT") => AccessLevel::Comment,
+		// A `DEL` shares the key `FSHR:{subject}:{audience}`, so it replaces the row it revokes —
+		// without this arm the catch-all reads it back as Read and revocation leaves read access.
+		Some("DEL") => AccessLevel::None,
+		_ => AccessLevel::Read,
+	}
+}
+
 /// Get access level for a user on a file
 ///
 /// Determines access level based on:
-/// 1. Ownership - owner has Write access
-/// 2. Role-based access - for tenant-owned files (no explicit owner), community
-///    roles determine access: leader/moderator/contributor → Write, any role → Read
-/// 3. FSHR action - WRITE subtype grants Write, other subtypes grant Read
-/// 4. No access - returns None
+/// 1. Ownership — owner has Admin access
+/// 2. Direct `share_entries` grant on this file, then the caller-supplied `inherited_share`, then a
+///    parent-chain walk for a folder-inherited grant
+/// 3. Role-based access — tenant-owned files only: leader → Admin, moderator/contributor → Write,
+///    any role → Read
+/// 4. FSHR action issued by the file's owner — ADMIN → Admin, WRITE → Write, COMMENT → Comment,
+///    DEL → None (a revocation is not a grant), other sub-types → Read (see [`fshr_grant_level`])
+/// 5. No access — returns None
 pub async fn get_access_level(
 	app: &App,
 	tn_id: TnId,
@@ -222,9 +272,10 @@ pub async fn get_access_level(
 	ctx: &FileAccessCtx<'_>,
 	inherited_share: Option<AccessLevel>,
 ) -> AccessLevel {
-	// Owner always has write access
+	// The owner is the file's admin: write plus share management. Callers must test
+	// `can_write()`/`can_manage_shares()` rather than `== AccessLevel::Write`.
 	if ctx.user_id_tag == owner_id_tag {
-		return AccessLevel::Write;
+		return AccessLevel::Admin;
 	}
 
 	// Direct share on this specific file
@@ -258,20 +309,16 @@ pub async fn get_access_level(
 	// Look up FSHR action: key pattern is "FSHR:{file_id}:{audience}"
 	let action_key = format!("FSHR:{}:{}", file_id, ctx.user_id_tag);
 
+	// `get_action_by_key` does not filter on action status, so a pending ('C') or rejected FSHR
+	// resolves here too. Moot in practice: the local file row only exists once `on_accept` ran.
 	match app.meta_adapter.get_action_by_key(tn_id, &action_key).await {
-		Ok(Some(action)) => {
-			// Check if action is FSHR type and active
-			if action.typ.as_ref() == "FSHR" {
-				// WRITE subtype grants write, COMMENT grants comment, others grant read
-				match action.sub_typ.as_ref().map(AsRef::as_ref) {
-					Some("WRITE") => AccessLevel::Write,
-					Some("COMMENT") => AccessLevel::Comment,
-					_ => AccessLevel::Read,
-				}
-			} else {
-				AccessLevel::None
-			}
-		}
+		Ok(Some(action)) => fshr_grant_level(
+			&action.typ,
+			action.sub_typ.as_ref().map(AsRef::as_ref),
+			&action.issuer_tag,
+			owner_id_tag,
+			file_id,
+		),
 		Ok(None) | Err(_) => AccessLevel::None,
 	}
 }
@@ -279,11 +326,10 @@ pub async fn get_access_level(
 /// Get access level for a user on a file, considering scoped tokens
 ///
 /// Determines access level based on:
-/// 1. Scoped token - file:{file_id}:{R|W} grants Read/Write access
+/// 1. Scoped token — file:{file_id}:{R|C|W} grants Read/Comment/Write access
 ///    (also checks document tree: a token for a root grants access to children)
-/// 2. Ownership - owner has Write access
-/// 3. FSHR action - WRITE subtype grants Write, other subtypes grant Read
-/// 4. No access - returns None
+/// 2. Everything [`get_access_level`] resolves, in its order
+/// 3. No access — returns None
 pub async fn get_access_level_with_scope(
 	app: &App,
 	tn_id: TnId,
@@ -445,7 +491,7 @@ pub async fn check_file_access_with_scope(
 		return Err(FileAccessError::AccessDenied);
 	}
 
-	let read_only = access_level != AccessLevel::Write && access_level != AccessLevel::Admin;
+	let read_only = !access_level.can_write();
 
 	Ok(FileAccessResult { file_view, access_level, read_only })
 }
@@ -520,7 +566,7 @@ pub async fn check_scope_allows_create_in(
 	};
 	match &token_scope {
 		TokenScope::File { file_id: scope_file_id, access } => {
-			if *access != AccessLevel::Write {
+			if !access.can_write() {
 				return Err(Error::PermissionDenied);
 			}
 			// Document-tree rule: new file is a child in the scoped document tree.
@@ -553,6 +599,8 @@ pub async fn check_scope_allows_create_in(
 /// or any other collection operation.
 pub fn scope_grants_collection_op(scope: Option<&str>, resource_type: &str, action: &str) -> bool {
 	let Some(scope) = scope else { return false };
+	// `Write` is the top of the scope vocabulary — `AccessLevel::to_scope_char` caps `Admin` at
+	// `'W'` and `TokenScope::parse` refuses any other char, so `Admin` is unreachable here.
 	matches!(TokenScope::parse(scope), Some(TokenScope::File { access: AccessLevel::Write, .. }))
 		&& resource_type == "file"
 		&& action == "create"
@@ -604,11 +652,65 @@ mod tests {
 		assert_eq!(role_access_level(&["supporter".into()]), AccessLevel::Read);
 		assert_eq!(role_access_level(&["contributor".into()]), AccessLevel::Write);
 		assert_eq!(role_access_level(&["moderator".into()]), AccessLevel::Write);
-		assert_eq!(role_access_level(&["leader".into()]), AccessLevel::Write);
+		// Leadership over a tenant-owned file carries share management, hence Admin not Write.
+		assert_eq!(role_access_level(&["leader".into()]), AccessLevel::Admin);
 		// The highest role in a mixed set wins.
 		assert_eq!(
 			role_access_level(&["public".into(), "follower".into(), "leader".into()]),
-			AccessLevel::Write
+			AccessLevel::Admin
+		);
+		assert_eq!(role_access_level(&["public".into(), "contributor".into()]), AccessLevel::Write);
+	}
+
+	const OWNER: &str = "alice.example.com";
+	const ATTACKER: &str = "mallory.example.com";
+
+	#[test]
+	fn fshr_from_a_non_owner_grants_nothing() {
+		// The action row is stored before `fshr::on_create` runs and a hook denial does not roll it
+		// back, so any contributor — or any followed peer posting to the inbox — can self-address
+		// an FSHR naming someone else's file. Every sub-type must be inert, `ADMIN` above all: it
+		// would otherwise read back as share-manager standing with an admin grant ceiling.
+		for sub_typ in [Some("ADMIN"), Some("WRITE"), Some("COMMENT"), Some("READ"), None] {
+			assert_eq!(
+				fshr_grant_level("FSHR", sub_typ, ATTACKER, OWNER, "f1~doc"),
+				AccessLevel::None,
+				"{sub_typ:?} from a non-owner must grant nothing"
+			);
+		}
+	}
+
+	#[test]
+	fn fshr_from_the_owner_grants_its_sub_type() {
+		// The live path: on the recipient's node `fshr::on_accept` writes `owner_tag = issuer`, so
+		// the grant resolves exactly as the sender sent it.
+		for (sub_typ, level) in [
+			(Some("ADMIN"), AccessLevel::Admin),
+			(Some("WRITE"), AccessLevel::Write),
+			(Some("COMMENT"), AccessLevel::Comment),
+			(Some("READ"), AccessLevel::Read),
+			(None, AccessLevel::Read),
+		] {
+			assert_eq!(fshr_grant_level("FSHR", sub_typ, OWNER, OWNER, "f1~doc"), level);
+		}
+	}
+
+	#[test]
+	fn a_del_from_the_owner_revokes_rather_than_granting_read() {
+		// `delete_share` drops the `share_entries` row and emits an FSHR `DEL`, which — same key —
+		// overwrites the grant. Falling through to the catch-all would hand the read back.
+		assert_eq!(
+			fshr_grant_level("FSHR", Some("DEL"), OWNER, OWNER, "f1~doc"),
+			AccessLevel::None
+		);
+	}
+
+	#[test]
+	fn only_fshr_rows_grant_anything() {
+		// The key is `FSHR:{file}:{audience}`, but `get_action_by_key` does not filter on type.
+		assert_eq!(
+			fshr_grant_level("CONN", Some("ADMIN"), OWNER, OWNER, "f1~doc"),
+			AccessLevel::None
 		);
 	}
 }

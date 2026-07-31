@@ -17,8 +17,8 @@ use cloudillo_core::dir_cache::DirCache;
 use cloudillo_core::file_access;
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::error::Error;
-use cloudillo_types::meta_adapter::{CreateFile, MetaAdapter};
-use cloudillo_types::types::TnId;
+use cloudillo_types::meta_adapter::{CreateFile, CreateShareEntry, MetaAdapter};
+use cloudillo_types::types::{AccessLevel, TnId};
 use cloudillo_types::worker::WorkerPool;
 use tempfile::TempDir;
 
@@ -351,6 +351,50 @@ async fn create_uses_cache_backed_folder_gate() {
 		.await,
 		Err(Error::PermissionDenied)
 	));
+}
+
+/// An `'A'` grant on a folder confers admin over everything nested under it.
+///
+/// `file_access::walk_parent_chain_for_share` needs a full `App`, so this pins the two halves it
+/// composes against the real adapter instead: the ancestor walk that finds F0 from X, and the
+/// `check_share_access` → `from_perm_char` conversion that must report `Admin`, not `Write`.
+#[tokio::test]
+async fn folder_inherited_admin_grant_reaches_nested_files() {
+	let (meta, tn_id, _temp) = seed().await;
+	let cache = DirCache::new(64);
+	let grantee = "bob.example.com";
+
+	meta.create_share_entry(
+		tn_id,
+		'F',
+		"F0",
+		"owner",
+		&CreateShareEntry {
+			subject_type: 'U',
+			subject_id: grantee.to_string(),
+			permission: 'A',
+			expires_at: None,
+		},
+	)
+	.await
+	.expect("create admin share entry on the folder");
+
+	// X sits two levels below F0, so the parent-chain walk reaches the grant...
+	assert!(file_access::is_descendant_of(&meta, &cache, tn_id, "X", "F0").await.unwrap());
+	// ...and there is no grant on X itself, so inheritance is the only route.
+	assert_eq!(meta.check_share_access(tn_id, 'F', "X", 'U', grantee).await.unwrap(), None);
+
+	let inherited = meta
+		.check_share_access(tn_id, 'F', "F0", 'U', grantee)
+		.await
+		.unwrap()
+		.expect("the folder grant is readable");
+	assert_eq!(inherited, 'A');
+	assert_eq!(AccessLevel::from_perm_char(inherited), AccessLevel::Admin);
+	assert!(AccessLevel::from_perm_char(inherited).can_manage_shares());
+
+	// The unrelated root file Y inherits nothing.
+	assert!(!file_access::is_descendant_of(&meta, &cache, tn_id, "Y", "F0").await.unwrap());
 }
 
 // vim: ts=4

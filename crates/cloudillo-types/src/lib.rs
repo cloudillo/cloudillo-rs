@@ -21,6 +21,7 @@ pub mod identity_provider_adapter;
 pub mod meta_adapter;
 pub mod prelude;
 pub mod reactions;
+pub mod roles;
 pub mod rtdb_adapter;
 pub mod types;
 pub mod utils;

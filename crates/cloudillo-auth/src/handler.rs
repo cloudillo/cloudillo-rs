@@ -17,7 +17,7 @@ use cloudillo_core::{
 	ActionVerifyFn, Auth,
 	extract::{IdTag, OptionalAuth, OptionalRequestId},
 	rate_limit::{PenaltyReason, RateLimitApi},
-	roles::expand_roles,
+	roles::{expand_roles, expand_roles_preserving_extras},
 	settings::SettingValue,
 };
 use cloudillo_email::{EmailModule, EmailTaskParams, get_tenant_lang};
@@ -25,8 +25,8 @@ use cloudillo_ref::service::{CreateRefInternalParams, create_ref_internal};
 use cloudillo_types::{
 	action_types::ACCESS_TOKEN_EXPIRY,
 	auth_adapter::{self, ListTenantsOptions},
-	meta_adapter::ListRefsOptions,
-	types::ApiResponse,
+	meta_adapter::{ListRefsOptions, PASSWORD_REF_TYPE, SHARE_FILE_REF_TYPE, WELCOME_REF_TYPE},
+	types::{AccessLevel, ApiResponse},
 	utils::decode_jwt_no_verify,
 };
 
@@ -338,7 +338,7 @@ pub async fn get_access_token(
 
 	// Cross-document link: get scoped token for target file via source file
 	if let Some(ref via_file_id) = query.via {
-		use cloudillo_types::types::{AccessLevel, TokenScope};
+		use cloudillo_types::types::TokenScope;
 
 		// Requires scope param: "file:{target_file_id}:{R|W}"
 		let scope_str = query
@@ -369,11 +369,12 @@ pub async fn get_access_token(
 
 		// Check caller has access to the via (source) file
 		let caller_has_via_access = if let Some(ref caller_scope) = auth.scope {
-			// Scoped token: must be scoped to the via file (bare id)
-			if let Some(TokenScope::File { file_id: ref scope_fid, access: scope_access }) =
+			// Must be scoped to the via file (bare id). The level needs no test —
+			// `TokenScope::parse` only yields `R`/`C`/`W`, so any file scope carries read.
+			if let Some(TokenScope::File { file_id: ref scope_fid, .. }) =
 				TokenScope::parse(caller_scope)
 			{
-				scope_fid == via_bare_file_id && scope_access != AccessLevel::None
+				scope_fid == via_bare_file_id
 			} else {
 				false
 			}
@@ -418,13 +419,10 @@ pub async fn get_access_token(
 		// Determine effective access: min(requested, link_permission)
 		let effective_access = requested_access.min(AccessLevel::from_perm_char(link_perm));
 
-		// Create scoped token for the target file
-		let access_char = match effective_access {
-			AccessLevel::Write | AccessLevel::Admin => 'W',
-			AccessLevel::Comment => 'C',
-			_ => 'R',
-		};
-		let target_scope = format!("file:{}:{}", target_file_id, access_char);
+		// `to_scope_char` caps admin at 'W' — a scope never carries share-management authority. Its
+		// `None` arm is unreachable here: the link permission came from a stored share entry.
+		let scope_char = effective_access.to_scope_char().ok_or(Error::PermissionDenied)?;
+		let target_scope = format!("file:{}:{}", target_file_id, scope_char);
 
 		let token_result = app
 			.auth_adapter
@@ -449,7 +447,8 @@ pub async fn get_access_token(
 			"token": token_result,
 			"scope": target_scope,
 			"resourceId": target_file_id,
-			"accessLevel": effective_access.as_str(),
+			// Same cap as the scope, so the client never sees authority the token cannot exercise.
+			"accessLevel": effective_access.min(AccessLevel::Write).as_str(),
 		}))
 		.with_req_id(req_id.unwrap_or_default());
 		return Ok((StatusCode::OK, Json(response)));
@@ -539,9 +538,9 @@ pub async fn get_access_token(
 		// For refresh: validate without decrementing counter
 		// For initial access: validate and decrement counter
 		let (ref_tn_id, _ref_id_tag, ref_data) = if is_refresh {
-			app.meta_adapter.validate_ref(&ref_id, &["share.file"]).await
+			app.meta_adapter.validate_ref(&ref_id, &[SHARE_FILE_REF_TYPE]).await
 		} else {
-			app.meta_adapter.use_ref(&ref_id, &["share.file"]).await
+			app.meta_adapter.use_ref(&ref_id, &[SHARE_FILE_REF_TYPE]).await
 		}
 		.map_err(|e| {
 			warn!(
@@ -570,11 +569,14 @@ pub async fn get_access_token(
 		let file_id = ref_data
 			.resource_id
 			.ok_or_else(|| Error::ValidationError("Share link missing resource_id".into()))?;
-		let access_level = ref_data.access_level.unwrap_or('R');
+		// `to_scope_char` caps admin at 'W', so a ref that somehow carried 'A' cannot emit
+		// `file:{id}:A` — which `TokenScope::parse` rejects outright, silently denying the link.
+		let access_level = AccessLevel::from_perm_char(ref_data.access_level.unwrap_or('R'));
 
-		// Create scoped access token
-		// scope format: "file:{file_id}:{R|W}"
-		let scope = format!("file:{}:{}", file_id, access_level);
+		// Scope format: "file:{file_id}:{R|C|W}". `from_perm_char` never returns `None`, so
+		// `to_scope_char`'s `None` arm is unreachable; deny rather than mint an unsupported scope.
+		let scope_char = access_level.to_scope_char().ok_or(Error::PermissionDenied)?;
+		let scope = format!("file:{}:{}", file_id, scope_char);
 		debug!("Creating scoped access token with scope={}", scope);
 
 		let token_result = app
@@ -597,11 +599,8 @@ pub async fn get_access_token(
 			"token": token_result,
 			"scope": scope,
 			"resourceId": file_id.to_string(),
-			"accessLevel": match access_level {
-				'W' | 'A' => "write",
-				'C' => "comment",
-				_ => "read",
-			},
+			// Same cap as the scope: a share link never reports admin.
+			"accessLevel": access_level.min(AccessLevel::Write).as_str(),
 		});
 		if let Some(ref params) = ref_data.params {
 			result["params"] = json!(params);
@@ -674,21 +673,33 @@ pub async fn get_access_token(
 			query.scope.as_deref()
 		);
 
-		// Fetch profile roles from meta adapter and expand them
-		let profile_roles =
-			app.meta_adapter.read_profile_roles(tn_id, &auth.id_tag).await.ok().flatten();
-
-		// If user is the tenant owner, they implicitly have leader role
-		let profile_roles: Option<Box<[Box<str>]>> = if auth.id_tag == id_tag.0 {
-			Some(vec!["leader".into()].into_boxed_slice())
+		// The tenant owner implicitly has `leader`, plus whatever out-of-band roles the tenant row
+		// carries — plain `expand_roles` emits only `ROLE_HIERARCHY` entries and would drop `SADM`,
+		// costing the site admin every SADM-gated operation.
+		//
+		// Read those extras from the tenant row rather than carrying the presented token's roles
+		// forward, or a role revoked out of band survives indefinitely across refreshes.
+		// `tenants.roles` holds the extras alone, exactly what auth-adapter-sqlite's
+		// `build_tenant_owner_roles` appends to the base hierarchy — mirror it so login and refresh
+		// mint the same set. A failed read degrades to plain `leader`, which only narrows.
+		let expanded_roles = if auth.id_tag == id_tag.0 {
+			let mut roles: Vec<Box<str>> = vec!["leader".into()];
+			if let Ok(tenant) = app.auth_adapter.read_tenant(&id_tag.0).await
+				&& let Some(extra) = tenant.roles
+			{
+				roles.extend(extra.iter().cloned());
+			}
+			Some(expand_roles_preserving_extras(&roles))
 		} else {
-			profile_roles
-		};
-
-		let expanded_roles = profile_roles
-			.as_ref()
-			.map(|roles| expand_roles(roles))
-			.filter(|s: &String| !s.is_empty());
+			app.meta_adapter
+				.read_profile_roles(tn_id, &auth.id_tag)
+				.await
+				.ok()
+				.flatten()
+				.as_ref()
+				.map(|roles| expand_roles(roles))
+		}
+		.filter(|s: &String| !s.is_empty());
 
 		let token_result = app
 			.auth_adapter
@@ -840,7 +851,7 @@ pub async fn post_set_password(
 	// will retry from the same welcome link after activating their identity.
 	let (tn_id, id_tag, ref_data) = app
 		.meta_adapter
-		.validate_ref(&req.ref_id, &["welcome", "password"])
+		.validate_ref(&req.ref_id, &[WELCOME_REF_TYPE, PASSWORD_REF_TYPE])
 		.await
 		.map_err(|e| {
 			warn!("Failed to validate ref {}: {}", req.ref_id, e);
@@ -890,8 +901,8 @@ pub async fn post_set_password(
 	// reopen) and commit only at the end. The welcome ref is consumed later by
 	// the authenticated POST /api/onboarding/complete endpoint. Re-posting here
 	// with a still-valid welcome ref simply re-sets the password (idempotent).
-	if &*ref_data.r#type == "password" {
-		app.meta_adapter.use_ref(&req.ref_id, &["password"]).await.map_err(|e| {
+	if &*ref_data.r#type == PASSWORD_REF_TYPE {
+		app.meta_adapter.use_ref(&req.ref_id, &[PASSWORD_REF_TYPE]).await.map_err(|e| {
 			warn!("Failed to use ref {}: {}", req.ref_id, e);
 			match e {
 				Error::NotFound => Error::ValidationError("Invalid or expired reference".into()),
@@ -948,7 +959,7 @@ pub async fn post_complete_onboarding(
 	// Validate the ref is a welcome ref and belongs to the caller. We validate
 	// first (non-destructive) so an unrelated/already-consumed ref can't be
 	// used to tamper, and so we can treat "already gone" as success below.
-	match app.meta_adapter.validate_ref(&req.ref_id, &["welcome"]).await {
+	match app.meta_adapter.validate_ref(&req.ref_id, &[WELCOME_REF_TYPE]).await {
 		Ok((tn_id, _id_tag, _ref_data)) => {
 			if tn_id != auth.tn_id {
 				warn!(
@@ -959,7 +970,7 @@ pub async fn post_complete_onboarding(
 				return Err(Error::PermissionDenied);
 			}
 			// Consume the welcome ref, retiring the onboarding link.
-			if let Err(e) = app.meta_adapter.use_ref(&req.ref_id, &["welcome"]).await {
+			if let Err(e) = app.meta_adapter.use_ref(&req.ref_id, &[WELCOME_REF_TYPE]).await {
 				warn!("complete-onboarding: failed to consume welcome ref {}: {}", req.ref_id, e);
 			} else {
 				info!(id_tag = %auth.id_tag, ref_id = %req.ref_id, "Onboarding completed");
@@ -1051,7 +1062,7 @@ pub async fn post_forgot_password(
 	// Rate limiting: check recent password reset refs for this tenant
 	// Allow max 3 per hour, 5 per day
 	let opts = ListRefsOptions {
-		typ: Some("password".to_string()),
+		typ: Some(PASSWORD_REF_TYPE.to_string()),
 		filter: Some("all".to_string()),
 		resource_id: None,
 	};
@@ -1088,7 +1099,7 @@ pub async fn post_forgot_password(
 		tn_id,
 		CreateRefInternalParams {
 			id_tag: &id_tag,
-			typ: "password",
+			typ: PASSWORD_REF_TYPE,
 			description: Some("User-initiated password reset"),
 			expires_at,
 			path_prefix: "/reset-password",

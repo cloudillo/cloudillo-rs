@@ -3,6 +3,8 @@
 
 //! File management (PATCH, DELETE, restore, duplicate) handlers
 
+use std::collections::HashSet;
+
 use axum::{
 	Json,
 	extract::{Path, Query, State},
@@ -17,7 +19,7 @@ use cloudillo_core::dir_cache::DirCache;
 use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
 use cloudillo_core::file_access;
 use cloudillo_types::meta_adapter::{self, UpdateFileOptions};
-use cloudillo_types::types::{AccessLevel, ApiResponse};
+use cloudillo_types::types::ApiResponse;
 use cloudillo_types::utils;
 
 /// Best-effort DirCache eviction. Folders may not yet be in the cache; either
@@ -92,21 +94,22 @@ pub async fn delete_file(
 			));
 		}
 
-		// Cascade delete to document tree children
-		let children = app.meta_adapter.list_children_by_root(auth.tn_id, &file_id).await?;
-		for child_id in &children {
-			app.meta_adapter.delete_file(auth.tn_id, child_id).await?;
-			invalidate_dir_cache(&app, auth.tn_id, child_id);
+		// One transactional cascade over the document tree: the files, their `share.file` refs and
+		// their `share_entries`. Nothing else clears the latter two, and because file ids are
+		// content-addressed, re-uploading identical content would resurrect the row along with any
+		// stale link or `'A'` grant still pointing at it. Soft delete deliberately keeps both, so
+		// restoring from trash keeps links and grants working.
+		let purged = app.meta_adapter.delete_file(auth.tn_id, &file_id).await?;
+		for id in &purged.file_ids {
+			invalidate_dir_cache(&app, auth.tn_id, id);
 		}
-
-		// Actually delete from database
-		app.meta_adapter.delete_file(auth.tn_id, &file_id).await?;
-		invalidate_dir_cache(&app, auth.tn_id, &file_id);
 		info!(
-			"User {} permanently deleted file {} (+ {} children)",
+			"User {} permanently deleted file {} ({} rows, {} share links, {} share entries)",
 			auth.id_tag,
 			file_id,
-			children.len()
+			purged.file_ids.len(),
+			purged.refs_removed,
+			purged.share_entries_removed
 		);
 
 		Ok(Json(DeleteFileResponse { file_id, permanent: true }))
@@ -189,7 +192,9 @@ pub async fn restore_file(
 /// DELETE /trash - Empty trash (permanently delete all files in trash)
 #[derive(Serialize)]
 pub struct EmptyTrashResponse {
-	/// Number of files permanently deleted
+	/// Number of trash entries permanently deleted. Not the total number of rows tombstoned: a
+	/// trashed file takes its whole document tree with it, and those children were never in the
+	/// trash.
 	pub deleted_count: usize,
 }
 
@@ -209,14 +214,35 @@ pub async fn empty_trash(
 		)
 		.await?;
 
-	let mut deleted_count = 0;
+	// Same cascade the permanent single-file delete runs. A trashed file's document-tree children
+	// may themselves be listed here, and `delete_file` takes the whole tree, so track what each
+	// call purged and skip entries already covered rather than counting them twice.
+	let mut purged_ids: HashSet<Box<str>> = HashSet::new();
+	let mut files_deleted = 0u64;
+	let mut refs_removed = 0u64;
+	let mut share_entries_removed = 0u64;
 	for file in &trash_files {
-		app.meta_adapter.delete_file(auth.tn_id, &file.file_id).await?;
-		invalidate_dir_cache(&app, auth.tn_id, &file.file_id);
-		deleted_count += 1;
+		if purged_ids.contains(&file.file_id) {
+			continue;
+		}
+		let purged = app.meta_adapter.delete_file(auth.tn_id, &file.file_id).await?;
+		for id in &purged.file_ids {
+			invalidate_dir_cache(&app, auth.tn_id, id);
+			purged_ids.insert(id.clone());
+		}
+		files_deleted += purged.files_deleted;
+		refs_removed += purged.refs_removed;
+		share_entries_removed += purged.share_entries_removed;
 	}
+	// Every listed trash entry is deleted, whether directly or as part of an earlier entry's tree —
+	// so the response keeps meaning "trash entries removed". The wider cascade totals stay in the log.
+	let deleted_count = trash_files.len();
 
-	info!("User {} emptied trash ({} files deleted)", auth.id_tag, deleted_count);
+	info!(
+		"User {} emptied trash ({} trash entries, {} rows tombstoned, {} share links, \
+		 {} share entries)",
+		auth.id_tag, deleted_count, files_deleted, refs_removed, share_entries_removed
+	);
 
 	Ok(Json(EmptyTrashResponse { deleted_count }))
 }
@@ -353,7 +379,7 @@ pub async fn duplicate_file(
 	// `check_file_access_with_scope` resolved both, returning the scope's own level for
 	// a covered file and AccessDenied otherwise. An unscoped caller needs only read
 	// here; creation is gated by `check_perm_create("file", "create")` on the route.
-	if auth.scope.is_some() && access.access_level != AccessLevel::Write {
+	if auth.scope.is_some() && !access.access_level.can_write() {
 		return Err(Error::PermissionDenied);
 	}
 	let file = access.file_view;

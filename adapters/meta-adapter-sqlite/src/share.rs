@@ -20,13 +20,28 @@ fn row_to_share_entry(row: &SqliteRow) -> ShareEntry {
 	let created_at: i64 = row.get("created_at");
 	let expires_at: Option<i64> = row.get("expires_at");
 
+	// `from_perm_char` fails safe to `Read`, but log anyway — the row is corrupt. SQLite cannot add
+	// a CHECK constraint via ALTER TABLE, so validation proper lives in the handler
+	// (`cloudillo_file::share::validate_share_permission`).
+	let id: i64 = row.get("id");
+	let permission = permission_val.chars().next().unwrap_or('?');
+	if !matches!(permission, 'R' | 'C' | 'W' | 'A') {
+		// Unthrottled: the handler cannot produce such a value, so occurrences are bounded by
+		// actual data corruption.
+		warn!(
+			id = id,
+			permission = %permission_val,
+			"share_entries row has an out-of-vocabulary permission; reading it as 'R'"
+		);
+	}
+
 	ShareEntry {
-		id: row.get("id"),
+		id,
 		resource_type: resource_type_val.chars().next().unwrap_or('?'),
 		resource_id: row.get("resource_id"),
 		subject_type: subject_type_val.chars().next().unwrap_or('?'),
 		subject_id: row.get("subject_id"),
-		permission: permission_val.chars().next().unwrap_or('?'),
+		permission,
 		expires_at: expires_at.map(Timestamp),
 		created_by: row.get("created_by"),
 		created_at: Timestamp(created_at),

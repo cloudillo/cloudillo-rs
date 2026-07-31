@@ -107,6 +107,23 @@ impl std::fmt::Display for ProfileConnectionStatus {
 // Reference / Bookmark types
 //*****************************
 
+// The vocabulary of the `refs.type` column. Lives here because the authorization table in
+// `cloudillo-ref` and the redemption allowlists in `cloudillo-auth`, `cloudillo-profile` and
+// `cloudillo-idp` describe the same set and must be checkable against each other.
+
+/// The one ref type an ordinary member may mint, list or revoke: a file share link.
+pub const SHARE_FILE_REF_TYPE: &str = "share.file";
+/// Grants the right to create a NEW TENANT on this server — server-scoped, so `SADM` only.
+pub const REGISTER_REF_TYPE: &str = "register";
+/// Buys membership of one community — the tenant's leadership legitimately hands these out.
+pub const PROFILE_INVITE_REF_TYPE: &str = "profile.invite";
+/// Password-reset capability against one tenant *account*.
+pub const PASSWORD_REF_TYPE: &str = "password";
+/// First-login capability; `POST /api/auth/set-password` accepts it exactly like `password`.
+pub const WELCOME_REF_TYPE: &str = "welcome";
+/// Activates an identity at the IdP — power over the tenant account, not over its membership.
+pub const IDP_ACTIVATION_REF_TYPE: &str = "idp.activation";
+
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -122,7 +139,8 @@ pub struct RefData {
 	pub count: Option<u32>,
 	/// Resource ID for share links (e.g., file_id for share.file type)
 	pub resource_id: Option<Box<str>>,
-	/// Access level for share links ('R'=Read, 'W'=Write)
+	/// Access level for share links: `'R'`=Read, `'C'`=Comment, `'W'`=Write. Never `'A'` — a link
+	/// cannot delegate share management, so `cloudillo_ref::handler::parse_access_level` refuses it.
 	pub access_level: Option<char>,
 	/// Launch params as serialized query string (e.g., "mode=present")
 	pub params: Option<Box<str>>,
@@ -143,7 +161,8 @@ pub struct CreateRefOptions {
 	pub count: Option<u32>,
 	/// Resource ID for share links (e.g., file_id for share.file type)
 	pub resource_id: Option<String>,
-	/// Access level for share links ('R'=Read, 'W'=Write)
+	/// Access level for share links: `'R'`=Read, `'C'`=Comment, `'W'`=Write. Never `'A'` — a link
+	/// cannot delegate share management, so `cloudillo_ref::handler::parse_access_level` refuses it.
 	pub access_level: Option<char>,
 	/// Launch params as serialized query string (e.g., "mode=present")
 	pub params: Option<String>,
@@ -1048,6 +1067,20 @@ pub struct UpdateFileOptions {
 	pub broken: Patch<BrokenReason>,
 }
 
+/// What [`MetaAdapter::delete_file`] removed.
+#[derive(Debug, Clone, Default)]
+pub struct DeleteFileResult {
+	/// Every file id deleted, root first, so the caller can evict each from its folder cache.
+	/// Content ids only — a row whose `file_id` is still NULL (an unfinalized upload) is tombstoned
+	/// but has no cache key and nothing that can reference it, so it is absent here.
+	pub file_ids: Vec<Box<str>>,
+	/// How many `files` rows were actually tombstoned, including the NULL-`file_id` ones missing
+	/// from `file_ids`. Always `>= file_ids.len()`.
+	pub files_deleted: u64,
+	pub refs_removed: u64,
+	pub share_entries_removed: u64,
+}
+
 // Share Entries
 //**************
 
@@ -1782,11 +1815,17 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// Phase 2: File Management Enhancements
 	//**************************************
-	/// Delete a file (set status to 'D')
-	async fn delete_file(&self, tn_id: TnId, file_id: &str) -> ClResult<()>;
-
-	/// List all child files in a document tree (files with the given root_id)
-	async fn list_children_by_root(&self, tn_id: TnId, root_id: &str) -> ClResult<Vec<Box<str>>>;
+	/// Delete `file_id` and its document-tree children (tombstoned as `status = 'D'`; the file GC
+	/// reclaims blobs and hard-deletes later), cascading everything that would otherwise outlive
+	/// them: [`SHARE_FILE_REF_TYPE`] refs naming any of the ids, and `share_entries` where any of
+	/// the ids is either the resource or the subject.
+	///
+	/// One transaction, because file ids are content-addressed: re-uploading identical content
+	/// resurrects the row, and a half-run cascade would resurrect stale grants with it. Not soft
+	/// delete — that moves the file to the trash folder and keeps links and grants working.
+	///
+	/// `file_id` may be `@{f_id}`; the result reports the resolved content ids.
+	async fn delete_file(&self, tn_id: TnId, file_id: &str) -> ClResult<DeleteFileResult>;
 
 	// Settings Management
 	//*********************
@@ -1916,7 +1955,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// All three fields share the same three-state `Patch` encoding:
 	/// `Patch::Undefined` leaves the column untouched, `Patch::Null` clears it
 	/// (writes NULL — `pinned`/`starred` read back as `false`),
-	/// `Patch::Value(v)` sets it (`access_level` ch ∈ {'R', 'C', 'W'}).
+	/// `Patch::Value(v)` sets it (`access_level` ch ∈ {'R', 'C', 'W', 'A'} — the
+	/// [`crate::types::AccessLevel::to_perm_char`] vocabulary, `'A'` included).
 	/// Used by the `POST /files/{id}/refresh` handler (and FSHR on_accept on
 	/// the receiver side) to cache the source-reported cross-context access level.
 	async fn update_file_user_data(

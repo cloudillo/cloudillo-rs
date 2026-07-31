@@ -332,8 +332,10 @@ pub async fn handle_rtdb_connection(
 /// CONVENTION: `t/` (threads) and `c/` (comments) are the only collections that
 /// Comment-level users can write to. Do not store non-comment data under these prefixes.
 fn check_write_access(conn: &RtdbConnection, path: &str) -> Option<RtdbMessage> {
+	if conn.access_level.can_write() {
+		return None;
+	}
 	match conn.access_level {
-		AccessLevel::Write | AccessLevel::Admin => None,
 		AccessLevel::Comment => {
 			let collection = path.split('/').next().unwrap_or("");
 			if matches!(collection, "t" | "c") {
@@ -364,8 +366,8 @@ fn check_write_access_for_operations(
 	conn: &RtdbConnection,
 	operations: &[Value],
 ) -> Option<RtdbMessage> {
-	// Write/Admin can write anything — skip per-path checks
-	if matches!(conn.access_level, AccessLevel::Write | AccessLevel::Admin) {
+	// Write-or-better can write anything — skip per-path checks
+	if conn.access_level.can_write() {
 		return None;
 	}
 	for op in operations {

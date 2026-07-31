@@ -18,6 +18,7 @@ use cloudillo_types::address::parse_address_type;
 use cloudillo_types::identity_provider_adapter::{
 	CreateIdentityOptions, Identity, IdentityStatus, ListIdentityOptions, UpdateIdentityOptions,
 };
+use cloudillo_types::meta_adapter::IDP_ACTIVATION_REF_TYPE;
 use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt};
 use cloudillo_types::utils::parse_and_validate_identity_id_tag;
 
@@ -1299,14 +1300,22 @@ pub async fn activate_identity(
 	))?;
 
 	// Use and validate the activation ref
-	let (_ref_tn_id, _ref_id_tag, ref_data) = app
+	let (ref_tn_id, _ref_id_tag, ref_data) = app
 		.meta_adapter
-		.use_ref(&activate_req.ref_id, &["idp.activation"])
+		.use_ref(&activate_req.ref_id, &[IDP_ACTIVATION_REF_TYPE])
 		.await
 		.map_err(|e| {
 			warn!(ref_id = %activate_req.ref_id, error = ?e, "Invalid activation ref");
 			e
 		})?;
+
+	// `use_ref` resolves globally, with no `tn_id` predicate, but `send_activation_email` creates
+	// the ref under the IdP tenant's own `tn_id`. Bind the two so a ref minted elsewhere cannot
+	// activate an identity here.
+	if ref_tn_id != tn_id {
+		warn!(?ref_tn_id, ?tn_id, "Activation ref belongs to another tenant");
+		return Err(Error::PermissionDenied);
+	}
 
 	// Get the identity id_tag from the ref's resource_id
 	let identity_id = ref_data

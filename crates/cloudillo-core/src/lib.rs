@@ -30,6 +30,7 @@ pub mod roles;
 pub mod scheduler;
 pub mod scope;
 pub mod settings;
+pub mod share_access;
 pub mod ws_broadcast;
 pub mod ws_bus;
 

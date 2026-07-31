@@ -9,8 +9,9 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
 use crate::utils::{collect_res, inspect, map_res, parse_str_list, push_patch};
 use cloudillo_types::meta_adapter::{
-	BrokenReason, CreateFile, FileId, FileStatus, FileUserData, FileVariant, FileView,
-	ListFileOptions, ProfileInfo, ProfileType, ROOT_PARENT_ID, UpdateFileOptions,
+	BrokenReason, CreateFile, DeleteFileResult, FileId, FileStatus, FileUserData, FileVariant,
+	FileView, ListFileOptions, ProfileInfo, ProfileType, ROOT_PARENT_ID, SHARE_FILE_REF_TYPE,
+	UpdateFileOptions,
 };
 use cloudillo_types::prelude::*;
 use cloudillo_types::types::AccessLevel;
@@ -1614,10 +1615,70 @@ pub(crate) async fn list_referenced_managed_fids(
 	Ok(out)
 }
 
+/// Sweep everything that references a file by its CONTENT id: its `share.file` links, and its
+/// `share_entries` on both sides — as the *resource*, and as the *subject* of the file-to-file embed
+/// rows `list_share_entries_by_subject` serves. Returns `(refs_removed, share_entries_removed)`.
+///
+/// Shared by [`delete`] and [`hard_delete_file`] so the tombstone path and the GC path cannot drift:
+/// file ids are content-addressed, so anything left behind is resurrected the moment identical
+/// content is re-uploaded.
+async fn sweep_file_shares(
+	tx: &mut sqlx::SqliteConnection,
+	tn_id: TnId,
+	file_id: &str,
+) -> ClResult<(u64, u64)> {
+	// `resource_id` is free-form on every ref type, so filter by type or an unrelated row
+	// naming the same id gets swept up.
+	let refs_removed =
+		sqlx::query("DELETE FROM refs WHERE tn_id = ? AND resource_id = ? AND type = ?")
+			.bind(tn_id.0)
+			.bind(file_id)
+			.bind(SHARE_FILE_REF_TYPE)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?
+			.rows_affected();
+
+	let share_entries_removed = sqlx::query(
+		"DELETE FROM share_entries WHERE tn_id = ? \
+		 AND ((resource_type = 'F' AND resource_id = ?) \
+		   OR (subject_type = 'F' AND subject_id = ?))",
+	)
+	.bind(tn_id.0)
+	.bind(file_id)
+	.bind(file_id)
+	.execute(&mut *tx)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?
+	.rows_affected();
+
+	Ok((refs_removed, share_entries_removed))
+}
+
 /// Hard-delete a file: removes all `file_variants` rows and then the `files`
 /// row inside a single transaction. Intended for the file GC.
+///
+/// Runs the same [`sweep_file_shares`] cascade [`delete`] does: a row can reach `status = 'D'` by
+/// routes other than `delete`, and removing it without clearing its links and grants would leave
+/// them to be resurrected by a re-upload of identical content.
 pub(crate) async fn hard_delete_file(db: &SqlitePool, tn_id: TnId, f_id: u64) -> ClResult<()> {
 	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
+
+	// Nothing can reference a NULL `file_id`, so only a resolvable content id needs the sweep.
+	let resolved: Option<(Option<Box<str>>,)> =
+		sqlx::query_as("SELECT file_id FROM files WHERE tn_id = ? AND f_id = ?")
+			.bind(tn_id.0)
+			.bind(f_id.cast_signed())
+			.fetch_optional(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+
+	if let Some((Some(file_id),)) = resolved {
+		sweep_file_shares(&mut tx, tn_id, &file_id).await?;
+	}
 
 	sqlx::query("DELETE FROM file_variants WHERE tn_id = ? AND f_id = ?")
 		.bind(tn_id.0)
@@ -1639,42 +1700,125 @@ pub(crate) async fn hard_delete_file(db: &SqlitePool, tn_id: TnId, f_id: u64) ->
 	Ok(())
 }
 
-/// Delete a file (set status to 'D')
-pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, file_id: &str) -> ClResult<()> {
-	let (where_col, id_bind) = if let Some(f_id_str) = file_id.strip_prefix('@') {
-		("f_id", f_id_str)
-	} else {
-		("file_id", file_id)
-	};
-
-	let sql = format!("UPDATE files SET status = 'D' WHERE tn_id = ? AND {} = ?", where_col);
-	sqlx::query(sqlx::AssertSqlSafe(sql))
-		.bind(tn_id.0)
-		.bind(id_bind)
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-
-	Ok(())
-}
-
-/// List all child file_ids in a document tree (files with the given root_id)
-pub(crate) async fn list_children_by_root(
+/// Delete a document tree and everything that would otherwise outlive it.
+///
+/// Rows are tombstoned (`status = 'D'`); the file GC reclaims blobs and hard-deletes later. Not
+/// soft delete — that moves the file into the trash folder and deliberately keeps links and grants
+/// so a restore keeps them working. This path is terminal, so it clears them.
+///
+/// One transaction, because file ids are content-addressed: re-uploading identical content brings
+/// the row back, and a half-run cascade would resurrect a stale share link or `'A'` grant with it.
+///
+/// `share_entries` is swept on both sides: as the *resource*, and as the *subject* (the
+/// file-to-file embed rows `list_share_entries_by_subject` serves).
+pub(crate) async fn delete(
 	db: &SqlitePool,
 	tn_id: TnId,
-	root_id: &str,
-) -> ClResult<Vec<Box<str>>> {
-	let rows: Vec<(Box<str>,)> =
-		sqlx::query_as("SELECT file_id FROM files WHERE tn_id=? AND root_id=? AND status != 'D'")
+	file_id: &str,
+) -> ClResult<DeleteFileResult> {
+	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
+
+	// `@`-prefixed ids address the `f_id` primary key, as `read` does. Every statement below
+	// matches on `file_id` (`root_id`/`refs.resource_id`/`share_entries` all reference the content
+	// id), so resolve it up front or the whole cascade matches nothing.
+	let file_id: Box<str> = if let Some(f_id_str) = file_id.strip_prefix('@') {
+		let f_id = f_id_str
+			.parse::<i64>()
+			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
+		let resolved: Option<(Option<Box<str>>,)> =
+			sqlx::query_as("SELECT file_id FROM files WHERE tn_id = ? AND f_id = ?")
+				.bind(tn_id.0)
+				.bind(f_id)
+				.fetch_optional(&mut *tx)
+				.await
+				.inspect_err(inspect)
+				.map_err(|_| Error::DbError)?;
+
+		match resolved {
+			None => return Err(Error::NotFound),
+			// Nothing can reference a NULL `file_id` — no cascade to run, so tombstone by `f_id`.
+			Some((None,)) => {
+				sqlx::query("UPDATE files SET status = 'D' WHERE tn_id = ? AND f_id = ?")
+					.bind(tn_id.0)
+					.bind(f_id)
+					.execute(&mut *tx)
+					.await
+					.inspect_err(inspect)
+					.map_err(|_| Error::DbError)?;
+				tx.commit().await.map_err(|_| Error::DbError)?;
+				return Ok(DeleteFileResult { files_deleted: 1, ..Default::default() });
+			}
+			Some((Some(id),)) => id,
+		}
+	} else {
+		file_id.into()
+	};
+
+	// Read inside the transaction so the tree cannot grow underneath the cascade. No `status`
+	// filter: a child soft-deleted on its own still owns links and grants this path must sweep.
+	// `files.file_id` is NULLABLE — the upload path creates a row with `root_id` set and `file_id`
+	// unset until finalization — so decode it as `Option` or one pending upload in the tree aborts
+	// the whole delete.
+	let children: Vec<(i64, Option<Box<str>>)> =
+		sqlx::query_as("SELECT f_id, file_id FROM files WHERE tn_id = ? AND root_id = ?")
 			.bind(tn_id.0)
-			.bind(root_id)
-			.fetch_all(db)
+			.bind(file_id.as_ref())
+			.fetch_all(&mut *tx)
 			.await
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
-	Ok(rows.into_iter().map(|(id,)| id).collect())
+	// Tombstone the tree in one statement, NULL-`file_id` rows included — the per-id sweep below
+	// only reaches rows that have a content id.
+	let mut files_deleted =
+		sqlx::query("UPDATE files SET status = 'D' WHERE tn_id = ? AND root_id = ?")
+			.bind(tn_id.0)
+			.bind(file_id.as_ref())
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?
+			.rows_affected();
+
+	// The root is addressed by its own content id. A tree root may carry its own `root_id`, in which
+	// case the statement above already covered it — the guard keeps it from being counted twice.
+	files_deleted += sqlx::query(
+		"UPDATE files SET status = 'D' WHERE tn_id = ? AND file_id = ? \
+		 AND (root_id IS NULL OR root_id <> ?)",
+	)
+	.bind(tn_id.0)
+	.bind(file_id.as_ref())
+	.bind(file_id.as_ref())
+	.execute(&mut *tx)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?
+	.rows_affected();
+
+	// Root first, so the caller's cache eviction order matches the delete order. Only resolvable
+	// content ids: the caller keys its folder cache on them, and nothing can reference a NULL
+	// `file_id` anyway. A self-rooted root would appear twice, so drop the duplicate.
+	let mut file_ids: Vec<Box<str>> = Vec::with_capacity(children.len() + 1);
+	file_ids.push(file_id.clone());
+	file_ids.extend(
+		children
+			.into_iter()
+			.filter_map(|(_f_id, id)| id)
+			.filter(|id| id.as_ref() != file_id.as_ref()),
+	);
+
+	let mut refs_removed = 0u64;
+	let mut share_entries_removed = 0u64;
+
+	for id in &file_ids {
+		let (refs, entries) = sweep_file_shares(&mut tx, tn_id, id).await?;
+		refs_removed += refs;
+		share_entries_removed += entries;
+	}
+
+	tx.commit().await.map_err(|_| Error::DbError)?;
+
+	Ok(DeleteFileResult { file_ids, files_deleted, refs_removed, share_entries_removed })
 }
 
 #[cfg(test)]

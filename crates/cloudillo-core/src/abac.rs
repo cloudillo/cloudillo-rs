@@ -11,6 +11,7 @@
 
 use crate::prelude::*;
 use cloudillo_types::auth_adapter::AuthCtx;
+use cloudillo_types::types::AccessLevel;
 use std::collections::HashMap;
 
 /// Visibility levels for resources (files, actions, profile fields)
@@ -495,9 +496,10 @@ impl PermissionChecker {
 				debug!(subject = %subject.id_tag, action = action, owner = owner, "Owner access allowed for modify operation");
 				return true;
 			}
-			// Check pre-computed access level (community roles, FSHR shares, scoped tokens)
+			// Pre-computed access level (community roles, FSHR shares, scoped tokens). Ordering
+			// comes from `AccessLevel` itself; an unrecognized name parses to `None` and denies.
 			if let Some(al) = object.get("access_level")
-				&& al == "write"
+				&& AccessLevel::from_str_name(al).is_some_and(AccessLevel::can_write)
 			{
 				debug!(subject = %subject.id_tag, action = action, "Write access level allows modify operation");
 				return true;
@@ -508,9 +510,10 @@ impl PermissionChecker {
 
 		// Visibility check for read operations
 		if matches!(operation, "read") {
-			// Check explicit access grants (e.g., FSHR file shares, scoped tokens)
+			// Explicit access grants (FSHR file shares, scoped tokens), same `AccessLevel`
+			// ordering as the modify branch above.
 			if let Some(al) = object.get("access_level")
-				&& matches!(al, "read" | "comment" | "write")
+				&& AccessLevel::from_str_name(al).is_some_and(AccessLevel::can_read)
 			{
 				return true;
 			}
@@ -700,6 +703,63 @@ mod tests {
 	fn test_permission_checker_creation() {
 		let checker = PermissionChecker::new();
 		assert_eq!(checker.profile_policies.len(), 0);
+	}
+
+	/// Only the pre-computed `access_level`, no owner — so only the access-level branch can allow
+	/// anything.
+	struct AccessLevelObject(&'static str);
+
+	impl AttrSet for AccessLevelObject {
+		fn get(&self, key: &str) -> Option<&str> {
+			match key {
+				"access_level" => Some(self.0),
+				_ => None,
+			}
+		}
+
+		fn get_list(&self, _key: &str) -> Option<Vec<&str>> {
+			None
+		}
+	}
+
+	fn plain_subject() -> AuthCtx {
+		AuthCtx {
+			tn_id: TnId(1),
+			id_tag: "alice.example.com".into(),
+			roles: Box::new([]),
+			scope: None,
+		}
+	}
+
+	#[test]
+	fn admin_access_level_allows_read_and_update() {
+		// The owner resolves to `AccessLevel::Admin`, so "admin" must satisfy both the modify and
+		// the read branch.
+		let checker = PermissionChecker::new();
+		let subject = plain_subject();
+		let env = Environment::new();
+		let object = AccessLevelObject("admin");
+
+		assert!(checker.has_permission(&subject, "file:read", &object, &env));
+		assert!(checker.has_permission(&subject, "file:update", &object, &env));
+		assert!(checker.has_permission(&subject, "file:delete", &object, &env));
+
+		// Levels below admin are unaffected.
+		let writer = AccessLevelObject("write");
+		assert!(checker.has_permission(&subject, "file:read", &writer, &env));
+		assert!(checker.has_permission(&subject, "file:update", &writer, &env));
+		let reader = AccessLevelObject("read");
+		assert!(checker.has_permission(&subject, "file:read", &reader, &env));
+		assert!(!checker.has_permission(&subject, "file:update", &reader, &env));
+
+		// A string outside the `AccessLevel::as_str` vocabulary must not read as authority.
+		let bogus = AccessLevelObject("bogus");
+		assert!(!checker.has_permission(&subject, "file:read", &bogus, &env));
+		assert!(!checker.has_permission(&subject, "file:update", &bogus, &env));
+		// ...and "none" is a recognized level that still grants nothing.
+		let none = AccessLevelObject("none");
+		assert!(!checker.has_permission(&subject, "file:read", &none, &env));
+		assert!(!checker.has_permission(&subject, "file:update", &none, &env));
 	}
 
 	#[test]

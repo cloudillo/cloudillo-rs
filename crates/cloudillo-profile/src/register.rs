@@ -22,7 +22,9 @@ use cloudillo_core::{
 use cloudillo_idp::registration::{IdpRegContent, IdpRegResponse};
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::address::parse_address_type;
-use cloudillo_types::meta_adapter::{ProfileType, UpsertProfileFields};
+use cloudillo_types::meta_adapter::{
+	ProfileType, REGISTER_REF_TYPE, UpsertProfileFields, WELCOME_REF_TYPE,
+};
 use cloudillo_types::types::{ApiResponse, RegisterRequest, RegisterVerifyCheckRequest};
 use cloudillo_types::utils::derive_name_from_id_tag;
 
@@ -281,7 +283,7 @@ pub async fn post_verify_profile(
 			Error::ValidationError("Token required for unauthenticated requests".into())
 		})?;
 		// Validate the ref without consuming it
-		app.meta_adapter.validate_ref(token, &["register"]).await?;
+		app.meta_adapter.validate_ref(token, &[REGISTER_REF_TYPE]).await?;
 	}
 
 	let id_tag_lower = req.id_tag.to_lowercase();
@@ -377,7 +379,7 @@ pub(crate) async fn send_welcome_email(
 		params.tn_id,
 		cloudillo_ref::service::CreateRefInternalParams {
 			id_tag: &params.id_tag,
-			typ: "welcome",
+			typ: WELCOME_REF_TYPE,
 			description: Some("Welcome to Cloudillo"),
 			expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
 			path_prefix: "/onboarding",
@@ -974,7 +976,7 @@ pub async fn post_register(
 	// Validate the registration token (ref) and capture the ref owner (the
 	// inviter) plus its params (the operator's auto-connect/auto-join intent).
 	let (inviter_tn_id, inviter_id_tag, ref_data) =
-		app.meta_adapter.validate_ref(&req.token, &["register"]).await?;
+		app.meta_adapter.validate_ref(&req.token, &[REGISTER_REF_TYPE]).await?;
 
 	let id_tag_lower = req.id_tag.to_lowercase();
 	let app_domain = req.app_domain.map(|d| d.to_lowercase());
@@ -1016,7 +1018,7 @@ pub async fn post_register(
 	// effects off the request path.
 	match result {
 		Ok((status, body, new_tn_id)) => {
-			if let Err(e) = app.meta_adapter.use_ref(&req.token, &["register"]).await {
+			if let Err(e) = app.meta_adapter.use_ref(&req.token, &[REGISTER_REF_TYPE]).await {
 				warn!(
 					error = %e,
 					"Failed to consume registration token after successful registration"

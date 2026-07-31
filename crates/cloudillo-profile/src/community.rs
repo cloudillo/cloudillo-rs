@@ -17,7 +17,10 @@ use cloudillo_core::{
 use cloudillo_idp::registration::{IdpRegContent, IdpRegResponse};
 use cloudillo_types::{
 	action_types::CreateAction,
-	meta_adapter::{ProfileConnectionStatus, ProfileType, UpdateTenantData, UpsertProfileFields},
+	meta_adapter::{
+		PROFILE_INVITE_REF_TYPE, ProfileConnectionStatus, ProfileType, UpdateTenantData,
+		UpsertProfileFields,
+	},
 	types::{ApiResponse, CommunityProfileResponse, CreateCommunityRequest},
 	utils::derive_name_from_id_tag,
 };
@@ -46,7 +49,7 @@ pub async fn put_community_profile(
 			Error::ValidationError("Community creation requires an invite".into())
 		})?;
 		// Validate ref exists, is correct type, not expired, has remaining uses
-		app.meta_adapter.validate_ref(ref_code, &["profile.invite"]).await?;
+		app.meta_adapter.validate_ref(ref_code, &[PROFILE_INVITE_REF_TYPE]).await?;
 	}
 
 	info!(
@@ -324,7 +327,7 @@ pub async fn put_community_profile(
 
 	// 10. Consume the invite ref (if used)
 	if let Some(ref_code) = invite_ref
-		&& let Err(e) = app.meta_adapter.use_ref(ref_code, &["profile.invite"]).await
+		&& let Err(e) = app.meta_adapter.use_ref(ref_code, &[PROFILE_INVITE_REF_TYPE]).await
 	{
 		warn!(error = %e, "Failed to consume invite ref after community creation");
 	}

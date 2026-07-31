@@ -99,7 +99,7 @@ pub(crate) async fn record_modification(
 /// All three fields share the same `Patch` three-state encoding:
 ///   - `Patch::Undefined` = leave column unchanged
 ///   - `Patch::Null`      = clear (NULL the column — `pinned`/`starred` read back as `false`)
-///   - `Patch::Value(v)`  = set to the given value (`access_level` ch ∈ 'R'/'C'/'W')
+///   - `Patch::Value(v)`  = set (`access_level` ∈ 'R'/'C'/'W'/'A', per `AccessLevel::to_perm_char`)
 pub(crate) async fn update(
 	db: &SqlitePool,
 	tn_id: TnId,

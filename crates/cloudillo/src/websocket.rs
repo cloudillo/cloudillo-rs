@@ -95,19 +95,11 @@ fn resolve_access(query: &AccessQuery, computed: AccessLevel) -> Result<AccessLe
 		Some("read") => Ok(AccessLevel::Read), // Force read-only
 		Some("comment") => {
 			// Comment requested: allow if computed is Comment or higher
-			match computed {
-				AccessLevel::Comment | AccessLevel::Write | AccessLevel::Admin => {
-					Ok(AccessLevel::Comment)
-				}
-				_ => Err(()),
-			}
+			if computed.can_comment() { Ok(AccessLevel::Comment) } else { Err(()) }
 		}
 		Some("write") => {
-			// Write requested: only if computed is Write or Admin
-			match computed {
-				AccessLevel::Write | AccessLevel::Admin => Ok(AccessLevel::Write),
-				_ => Err(()),
-			}
+			// Write requested: only if computed is Write or better
+			if computed.can_write() { Ok(AccessLevel::Write) } else { Err(()) }
 		}
 		_ => Ok(computed), // Use computed access
 	}
@@ -516,8 +508,8 @@ pub async fn get_ws_crdt(
 					);
 					return ws_close_write_denied(ws);
 				};
-				// CRDT: only Write/Admin can edit; Comment is read-only
-				!matches!(al, AccessLevel::Write | AccessLevel::Admin)
+				// CRDT: only Write-or-better can edit; Comment is read-only
+				!al.can_write()
 			};
 			info!(
 				"CRDT WebSocket ({}): user={}, doc={}",

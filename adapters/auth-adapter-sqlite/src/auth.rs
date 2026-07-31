@@ -14,6 +14,7 @@ use cloudillo_types::{
 	action_types,
 	auth_adapter::{AccessToken, ActionToken, AuthCtx, AuthLogin},
 	prelude::*,
+	roles::expand_roles_preserving_extras,
 	utils::parse_roles,
 	worker::WorkerPool,
 };
@@ -90,15 +91,19 @@ pub(crate) async fn ensure_jwt_secret(db: &SqlitePool) -> ClResult<String> {
 	Ok(secret_str)
 }
 
-/// Build tenant owner roles string by merging base leader roles with DB roles
-/// Tenant owners always have the full role hierarchy up to leader,
-/// plus any extra roles from DB (like site-admin)
+/// Build tenant owner roles string by merging base leader roles with DB roles.
+/// Tenant owners always have the full role hierarchy up to leader, plus any extra roles from DB
+/// (like site-admin).
+///
+/// Delegates to [`expand_roles_preserving_extras`] rather than concatenating a hardcoded base,
+/// because access-token refresh (`cloudillo_auth::handler`) builds the same string that way — a
+/// second implementation here would deduplicate and filter differently and silently widen or
+/// narrow the owner's authority depending on which path issued their token.
 pub(crate) fn build_tenant_owner_roles(db_roles: Option<&str>) -> Box<str> {
-	const BASE_ROLES: &str = "public,follower,supporter,contributor,moderator,leader";
-	match db_roles {
-		Some(extra) if !extra.is_empty() => Box::from(format!("{},{}", BASE_ROLES, extra)),
-		_ => Box::from(BASE_ROLES),
-	}
+	// `parse_roles` drops empty segments, so `None` / `""` degrades to plain `leader`.
+	let mut roles: Vec<Box<str>> = vec!["leader".into()];
+	roles.extend(parse_roles(db_roles.unwrap_or("")).into_vec());
+	expand_roles_preserving_extras(&roles).into()
 }
 
 /// Reject soft-deleted tenants (status='X' = purging in progress).
@@ -351,6 +356,43 @@ mod tests {
 
 	fn make_token(secret: &[u8], iss: &str) -> String {
 		make_token_with_roles(secret, iss, Some("leader"))
+	}
+
+	#[test]
+	fn tenant_owner_login_reproduces_the_refresh_role_string() {
+		// Login mints the owner's roles here; access-token refresh mints them in
+		// `cloudillo_auth::handler` as `expand_roles_preserving_extras(["leader", ...extras])`,
+		// with the extras read from `tenants.roles`. The two must be byte-identical, or the site
+		// admin's authority silently widens or narrows depending on which issued their token.
+		// Asserted against the refresh path's expression rather than a hardcoded string, so a
+		// change to the expansion rules can never drift the two apart unnoticed.
+		let refresh = |extras: &[&str]| {
+			let mut roles: Vec<Box<str>> = vec!["leader".into()];
+			roles.extend(extras.iter().map(|r| Box::from(*r)));
+			expand_roles_preserving_extras(&roles)
+		};
+
+		for (db_roles, extras) in [
+			(None, &[][..]),
+			(Some(""), &[][..]),
+			(Some("SADM"), &["SADM"][..]),
+			// Concatenation kept the hierarchy word and the duplicate; the shared expansion
+			// drops both — this pair is the drift the old implementation had.
+			(Some("moderator,SADM"), &["moderator", "SADM"][..]),
+			(Some("SADM,SADM"), &["SADM", "SADM"][..]),
+		] {
+			assert_eq!(
+				build_tenant_owner_roles(db_roles).as_ref(),
+				refresh(extras),
+				"login and refresh disagree for db_roles={db_roles:?}"
+			);
+		}
+
+		// And the degenerate inputs still yield the plain hierarchy, not an empty or dangling set.
+		assert_eq!(
+			build_tenant_owner_roles(None).as_ref(),
+			"public,follower,supporter,contributor,moderator,leader"
+		);
 	}
 
 	#[tokio::test]
