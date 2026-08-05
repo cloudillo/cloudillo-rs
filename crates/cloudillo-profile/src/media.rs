@@ -13,13 +13,83 @@ use crate::prelude::*;
 use cloudillo_core::extract::Auth;
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_file::{image, preset};
-use cloudillo_types::meta_adapter;
+use cloudillo_types::{auth_adapter, meta_adapter};
 
 /// Image type for tenant profile updates
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum TenantImageType {
 	ProfilePic,
 	CoverPic,
+}
+
+impl TenantImageType {
+	/// `files.preset` value
+	fn preset_name(self) -> &'static str {
+		match self {
+			Self::ProfilePic => "profile-picture",
+			Self::CoverPic => "cover",
+		}
+	}
+
+	/// Variant set to generate for this image kind
+	fn preset(self) -> preset::FilePreset {
+		match self {
+			Self::ProfilePic => preset::presets::profile_picture(),
+			Self::CoverPic => preset::presets::cover(),
+		}
+	}
+
+	fn file_name(self, id_tag: &str) -> String {
+		match self {
+			Self::ProfilePic => format!("{}-profile-pic.jpg", id_tag),
+			Self::CoverPic => format!("{}-cover.jpg", id_tag),
+		}
+	}
+
+	/// `files.tags` entry
+	fn tag(self) -> &'static str {
+		match self {
+			Self::ProfilePic => "profile",
+			Self::CoverPic => "cover",
+		}
+	}
+
+	/// `type` field of the JSON response
+	fn response_type(self) -> &'static str {
+		match self {
+			Self::ProfilePic => "profile-pic",
+			Self::CoverPic => "cover",
+		}
+	}
+
+	fn log_label(self) -> &'static str {
+		match self {
+			Self::ProfilePic => "profile image",
+			Self::CoverPic => "cover image",
+		}
+	}
+
+	/// Whether the dedup fast path must drop the cached /api/me: only `profile_pic`
+	/// is part of `ProfileBase`. `TenantImageUpdaterTask::run` invalidates for both.
+	fn invalidate_me(self) -> bool {
+		match self {
+			Self::ProfilePic => true,
+			Self::CoverPic => false,
+		}
+	}
+
+	fn update_data(self, file_id: &str) -> meta_adapter::UpdateTenantData {
+		match self {
+			Self::ProfilePic => meta_adapter::UpdateTenantData {
+				profile_pic: Patch::Value(file_id.to_string()),
+				..Default::default()
+			},
+			Self::CoverPic => meta_adapter::UpdateTenantData {
+				cover_pic: Patch::Value(file_id.to_string()),
+				..Default::default()
+			},
+		}
+	}
 }
 
 /// Task to update tenant profile/cover image after file ID is generated
@@ -59,17 +129,7 @@ impl Task<App> for TenantImageUpdaterTask {
 		// Get the generated file_id
 		let file_id = app.meta_adapter.get_file_id(self.tn_id, self.f_id).await?;
 
-		// Update tenant with the final file_id
-		let update = match self.image_type {
-			TenantImageType::ProfilePic => meta_adapter::UpdateTenantData {
-				profile_pic: Patch::Value(file_id.to_string()),
-				..Default::default()
-			},
-			TenantImageType::CoverPic => meta_adapter::UpdateTenantData {
-				cover_pic: Patch::Value(file_id.to_string()),
-				..Default::default()
-			},
-		};
+		let update = self.image_type.update_data(file_id.as_ref());
 
 		app.meta_adapter.update_tenant(self.tn_id, &update).await?;
 		// `profile_pic`/`cover_pic` just changed → drop the cached /api/me. This
@@ -88,96 +148,7 @@ pub async fn put_profile_image(
 	Auth(auth): Auth,
 	body: Bytes,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
-	// Get image data directly from body
-	let image_data = body.to_vec();
-
-	if image_data.is_empty() {
-		return Err(Error::ValidationError("No image data provided".into()));
-	}
-
-	// Detect content type from image data
-	let content_type = image::detect_image_type(&image_data)
-		.ok_or_else(|| Error::ValidationError("Invalid or unsupported image format".into()))?;
-
-	// Get image dimensions
-	let dim = image::get_image_dimensions(&image_data).await?;
-	info!("Profile image dimensions: {}x{}", dim.0, dim.1);
-
-	// Get preset for profile pictures
-	let preset = preset::presets::profile_picture();
-
-	// Create file metadata — route into the managed folder so the file GC
-	// can reap previous profile pics once they're no longer referenced by
-	// `tenants.profile_pic`.
-	let f_id = app
-		.meta_adapter
-		.create_file(
-			auth.tn_id,
-			meta_adapter::CreateFile {
-				preset: Some("profile-picture".into()),
-				parent_id: Some(meta_adapter::MANAGED_PARENT_ID.into()),
-				creator_tag: Some(auth.id_tag.as_ref().into()),
-				content_type: content_type.into(),
-				file_name: format!("{}-profile-pic.jpg", auth.id_tag).into(),
-				file_tp: Some("BLOB".into()),
-				tags: Some(vec!["profile".into()]),
-				x: Some(json!({ "dim": dim })),
-				visibility: Some('P'), // Profile pics are always public
-				..Default::default()
-			},
-		)
-		.await?;
-
-	// Extract numeric f_id
-	let f_id = match f_id {
-		meta_adapter::FileId::FId(fid) => fid,
-		meta_adapter::FileId::FileId(fid) => {
-			// Already has a file_id (duplicate), use it directly
-			app.meta_adapter
-				.update_tenant(
-					auth.tn_id,
-					&meta_adapter::UpdateTenantData {
-						profile_pic: Patch::Value(fid.to_string()),
-						..Default::default()
-					},
-				)
-				.await?;
-			// profile_pic changed on the dedup fast path → invalidate cached /api/me.
-			app.profile_me.invalidate(auth.tn_id);
-			info!("User {} uploaded profile image (existing): {}", auth.id_tag, fid);
-			return Ok((
-				StatusCode::OK,
-				Json(json!({
-					"fileId": fid,
-					"type": "profile-pic"
-				})),
-			));
-		}
-	};
-
-	// Generate image variants using the helper function
-	let result =
-		image::generate_image_variants(&app, auth.tn_id, f_id, &image_data, &preset).await?;
-
-	// Schedule TenantImageUpdaterTask to update tenant profile_pic after file_id is generated
-	app.scheduler
-		.task(TenantImageUpdaterTask::new(auth.tn_id, f_id, TenantImageType::ProfilePic))
-		.depend_on(vec![result.file_id_task])
-		.schedule()
-		.await?;
-
-	// Return pending file_id (prefixed with @)
-	let pending_file_id = format!("@{}", f_id);
-
-	info!("User {} uploaded profile image: {}", auth.id_tag, pending_file_id);
-
-	Ok((
-		StatusCode::OK,
-		Json(json!({
-			"fileId": pending_file_id,
-			"type": "profile-pic"
-		})),
-	))
+	put_tenant_image(app, auth, body, TenantImageType::ProfilePic).await
 }
 
 /// PUT /me/cover - Upload cover image
@@ -186,94 +157,95 @@ pub async fn put_cover_image(
 	Auth(auth): Auth,
 	body: Bytes,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
-	// Get image data directly from body
+	put_tenant_image(app, auth, body, TenantImageType::CoverPic).await
+}
+
+/// Shared body of the profile-picture and cover-image upload handlers.
+async fn put_tenant_image(
+	app: App,
+	auth: auth_adapter::AuthCtx,
+	body: Bytes,
+	kind: TenantImageType,
+) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
 	let image_data = body.to_vec();
 
 	if image_data.is_empty() {
 		return Err(Error::ValidationError("No image data provided".into()));
 	}
 
-	// Detect content type from image data
 	let content_type = image::detect_image_type(&image_data)
 		.ok_or_else(|| Error::ValidationError("Invalid or unsupported image format".into()))?;
 
-	// Get image dimensions
 	let dim = image::get_image_dimensions(&image_data).await?;
-	info!("Cover image dimensions: {}x{}", dim.0, dim.1);
+	info!("Uploaded {} dimensions: {}x{}", kind.log_label(), dim.0, dim.1);
 
-	// Get preset for cover images
-	let preset = preset::presets::cover();
+	let preset = kind.preset();
 
-	// Create file metadata — route into the managed folder so the file GC
-	// can reap previous cover images once they're no longer referenced by
-	// `tenants.cover_pic`.
+	// Route into the managed folder so the file GC can reap the previous image once
+	// `tenants.profile_pic` / `tenants.cover_pic` no longer references it.
 	let f_id = app
 		.meta_adapter
 		.create_file(
 			auth.tn_id,
 			meta_adapter::CreateFile {
-				preset: Some("cover".into()),
+				preset: Some(kind.preset_name().into()),
 				parent_id: Some(meta_adapter::MANAGED_PARENT_ID.into()),
 				creator_tag: Some(auth.id_tag.as_ref().into()),
 				content_type: content_type.into(),
-				file_name: format!("{}-cover.jpg", auth.id_tag).into(),
+				file_name: kind.file_name(&auth.id_tag).into(),
 				file_tp: Some("BLOB".into()),
-				tags: Some(vec!["cover".into()]),
+				tags: Some(vec![kind.tag().into()]),
 				x: Some(json!({ "dim": dim })),
-				visibility: Some('P'), // Cover images are always public
+				// Always public: guest-mode views fetch avatars without a token
+				visibility: Some('P'),
 				..Default::default()
 			},
 		)
 		.await?;
 
-	// Extract numeric f_id
 	let f_id = match f_id {
 		meta_adapter::FileId::FId(fid) => fid,
 		meta_adapter::FileId::FileId(fid) => {
-			// Already has a file_id (duplicate), use it directly.
-			// Only `cover_pic` changes here, which is NOT part of `ProfileBase`
-			// (/api/me), so no `profile_me.invalidate` is needed.
+			// Unreachable with the SQLite meta adapter: it returns `FileId::FileId` only
+			// from its dedup branch, which requires `orig_variant_id` — not set here.
+			// Kept because `FileId` is part of the adapter trait and another adapter may dedup.
 			app.meta_adapter
-				.update_tenant(
-					auth.tn_id,
-					&meta_adapter::UpdateTenantData {
-						cover_pic: Patch::Value(fid.to_string()),
-						..Default::default()
-					},
-				)
+				.update_tenant(auth.tn_id, &kind.update_data(fid.as_ref()))
 				.await?;
-			info!("User {} uploaded cover image (existing): {}", auth.id_tag, fid);
+			if kind.invalidate_me() {
+				app.profile_me.invalidate(auth.tn_id);
+			}
+			info!("User {} uploaded {} (existing): {}", auth.id_tag, kind.log_label(), fid);
 			return Ok((
 				StatusCode::OK,
 				Json(json!({
 					"fileId": fid,
-					"type": "cover"
+					"type": kind.response_type()
 				})),
 			));
 		}
 	};
 
-	// Generate image variants using the helper function
 	let result =
 		image::generate_image_variants(&app, auth.tn_id, f_id, &image_data, &preset).await?;
 
-	// Schedule TenantImageUpdaterTask to update tenant cover_pic after file_id is generated
+	// The tenant field is written by the task, once the file_id exists
 	app.scheduler
-		.task(TenantImageUpdaterTask::new(auth.tn_id, f_id, TenantImageType::CoverPic))
+		.task(TenantImageUpdaterTask::new(auth.tn_id, f_id, kind))
 		.depend_on(vec![result.file_id_task])
 		.schedule()
 		.await?;
 
-	// Return pending file_id (prefixed with @)
+	// `@` marks a pending file_id the client must resolve later
 	let pending_file_id = format!("@{}", f_id);
 
-	info!("User {} uploaded cover image: {}", auth.id_tag, pending_file_id);
+	info!("User {} uploaded {}: {}", auth.id_tag, kind.log_label(), pending_file_id);
 
 	Ok((
 		StatusCode::OK,
 		Json(json!({
 			"fileId": pending_file_id,
-			"type": "cover"
+			"type": kind.response_type()
 		})),
 	))
 }
