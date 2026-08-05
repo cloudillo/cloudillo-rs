@@ -74,7 +74,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 36;
+	const CURRENT_DB_VERSION: i64 = 37;
 
 	let mut tx = db.begin().await?;
 
@@ -1982,6 +1982,33 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		drop_column_if_exists(&mut tx, "actions", "comments_read").await?;
 
 		set_db_version(&mut tx, 36).await;
+	}
+
+	if version < 37 {
+		// Profile and cover pictures must be Public so guest-mode views can fetch
+		// avatars without a token. Rows synced before the sync path started passing
+		// Some('P') are stuck at 'D' (Direct), and that path never rewrites visibility
+		// on an existing row, so only this migration can repair them. The `<> 'P'`
+		// guard makes it idempotent, and it only ever loosens.
+		// `updated_at` is stamped by the `files_updated_at` AFTER UPDATE trigger.
+		sqlx::query(
+			"UPDATE files SET visibility = 'P' \
+			 WHERE (visibility IS NULL OR visibility <> 'P') \
+			   AND EXISTS (SELECT 1 FROM profiles p \
+			               WHERE p.tn_id = files.tn_id AND p.profile_pic = files.file_id)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		sqlx::query(
+			"UPDATE files SET visibility = 'P' \
+			 WHERE (visibility IS NULL OR visibility <> 'P') \
+			   AND EXISTS (SELECT 1 FROM tenants t \
+			               WHERE t.tn_id = files.tn_id \
+			                 AND files.file_id IN (t.profile_pic, t.cover_pic))",
+		)
+		.execute(&mut *tx)
+		.await?;
+		set_db_version(&mut tx, 37).await;
 	}
 
 	tx.commit().await?;

@@ -328,6 +328,12 @@ async fn sync_profile_pic_variant(
 	let vis_pf_synced = result.synced_variants.iter().any(|v| v == PROFILE_PIC_VARIANT);
 	let vis_pf_skipped = result.skipped_variants.iter().any(|v| v == PROFILE_PIC_VARIANT);
 
+	// Never rewrite visibility on an already-existing row: `file_id` comes from the
+	// peer's own profile document (`remote.profile_pic`), so loosening whatever local
+	// row matches it would let a remote make a local file Public. New rows get 'P' from
+	// `sync_file_variants` above; pre-existing restrictive rows are repaired only by
+	// meta-adapter migration 37.
+
 	if vis_pf_synced {
 		tracing::info!(
 			"Synced profile picture variant '{}' for {} (file_id: {})",
