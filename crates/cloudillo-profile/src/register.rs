@@ -633,11 +633,11 @@ async fn handle_idp_registration(
 
 	// Save language preference if provided
 	if let Some(ref lang_code) = lang {
-		// Use empty roles - PermissionLevel::User always allows any authenticated user
-		let empty_roles: &[&str] = &[];
+		// `set_system`: registration has no authenticated principal yet, and
+		// `profile.lang` is owner/leader-gated.
 		if let Err(e) = app
 			.settings
-			.set(tn_id, "profile.lang", SettingValue::String(lang_code.clone()), empty_roles)
+			.set_system(tn_id, "profile.lang", SettingValue::String(lang_code.clone()))
 			.await
 		{
 			warn!(
@@ -743,11 +743,11 @@ async fn handle_domain_registration(
 
 	// Save language preference if provided
 	if let Some(ref lang_code) = lang {
-		// Use empty roles - PermissionLevel::User always allows any authenticated user
-		let empty_roles: &[&str] = &[];
+		// `set_system`: registration has no authenticated principal yet, and
+		// `profile.lang` is owner/leader-gated.
 		if let Err(e) = app
 			.settings
-			.set(tn_id, "profile.lang", SettingValue::String(lang_code.clone()), empty_roles)
+			.set_system(tn_id, "profile.lang", SettingValue::String(lang_code.clone()))
 			.await
 		{
 			warn!(

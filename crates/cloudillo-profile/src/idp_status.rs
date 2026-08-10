@@ -175,11 +175,10 @@ async fn apply_onboarding_clear(app: &App, tn_id: TnId, status: &str) -> Option<
 	if status != "active" || !is_verify_idp(app, tn_id).await {
 		return None;
 	}
-	// `ui.*` is registered with `PermissionLevel::User`, which accepts any
-	// roles slice (including empty), so this works from the unauthenticated
-	// ref-scoped handler too.
-	let empty_roles: &[&str] = &[];
-	match app.settings.clear(tn_id, "ui.onboarding", empty_roles).await {
+	// `clear_system` rather than `clear`: no authenticated principal on the
+	// ref-scoped path, and `ui.*` is `PermissionLevel::User` (owner/leader),
+	// which an empty roles slice does not satisfy.
+	match app.settings.clear_system(tn_id, "ui.onboarding").await {
 		Ok(()) => Some(None),
 		Err(e) => {
 			warn!(

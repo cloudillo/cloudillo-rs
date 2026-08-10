@@ -169,8 +169,11 @@ impl SettingsService {
 		}
 	}
 
-	/// Set setting value with validation and permission checks
-	/// The `roles` parameter should be the authenticated user's roles
+	/// Set setting value with validation and permission checks.
+	///
+	/// The `roles` parameter should be the authenticated user's roles.
+	/// `PermissionLevel::User` means owner/leader of the target tenant, not "any
+	/// authenticated user" — see [`super::types::PermissionLevel::check`].
 	pub async fn set<S: AsRef<str>>(
 		&self,
 		tn_id: TnId,
@@ -179,10 +182,7 @@ impl SettingsService {
 		roles: &[S],
 	) -> ClResult<Setting> {
 		// Get definition (supports wildcard patterns like "ui.*")
-		let def = self
-			.registry
-			.get(key)
-			.ok_or_else(|| Error::ValidationError(format!("Unknown setting: {}", key)))?;
+		let def = self.definition(key)?;
 
 		// Check permission level
 		if !def.permission.check(roles) {
@@ -223,11 +223,53 @@ impl SettingsService {
 				TnId(0)
 			}
 			(SettingScope::Tenant, _) => {
-				// OK: Setting tenant-specific value
+				// OK: the tenant's own row — `def.permission` above already
+				// established the caller may configure this tenant.
 				tn_id
 			}
 		};
 
+		self.write_at(def, storage_tn_id, key, value).await
+	}
+
+	/// Set a tenant's setting on the system's own behalf, bypassing the permission
+	/// check. The `set` half of [`Self::clear_system`], for server-initiated writes
+	/// with no authenticated principal: seeding `ui.onboarding` on a just-created
+	/// tenant, or storing the `profile.lang` a registration form supplied before
+	/// anyone can log in.
+	///
+	/// Same narrow shape as `clear_system`: only a Tenant-scoped key on a real tenant,
+	/// so the shared global default row stays SADM-only through [`Self::set`]. Type
+	/// validation and the custom validator still run.
+	pub async fn set_system(
+		&self,
+		tn_id: TnId,
+		key: &str,
+		value: SettingValue,
+	) -> ClResult<Setting> {
+		let def = self.definition(key)?;
+
+		if def.scope != SettingScope::Tenant || tn_id.0 == 0 {
+			warn!(
+				"System write refused for setting '{}' (scope {:?}, tn_id={})",
+				key, def.scope, tn_id.0
+			);
+			return Err(Error::PermissionDenied);
+		}
+
+		self.write_at(def, tn_id, key, value).await
+	}
+
+	/// Validate and store one resolved `(tn_id, key)` row. Shared tail of
+	/// [`Self::set`] and [`Self::set_system`]; the caller has already decided
+	/// that the write is permitted and which row it lands in.
+	async fn write_at(
+		&self,
+		def: &SettingDefinition,
+		storage_tn_id: TnId,
+		key: &str,
+		value: SettingValue,
+	) -> ClResult<Setting> {
 		// Validate type matches definition (if default exists)
 		if let Some(default) = &def.default
 			&& !value.matches_type(default)
@@ -280,10 +322,7 @@ impl SettingsService {
 	/// directly when the caller is acting on behalf of an authenticated user —
 	/// it keeps audit trails and permission checks consistent across set/clear.
 	pub async fn clear<S: AsRef<str>>(&self, tn_id: TnId, key: &str, roles: &[S]) -> ClResult<()> {
-		let def = self
-			.registry
-			.get(key)
-			.ok_or_else(|| Error::ValidationError(format!("Unknown setting: {}", key)))?;
+		let def = self.definition(key)?;
 
 		if !def.permission.check(roles) {
 			warn!(
@@ -320,6 +359,41 @@ impl SettingsService {
 			(SettingScope::Tenant, _) => tn_id,
 		};
 
+		self.clear_at(storage_tn_id, key).await
+	}
+
+	/// Clear a tenant's setting on the system's own behalf, bypassing the permission
+	/// check. For server-initiated cleanup with no authenticated principal — see
+	/// `apply_onboarding_clear` in `cloudillo-profile`, which clears the onboarding
+	/// gate from the unauthenticated ref-scoped IDP-status handler.
+	///
+	/// Narrow on purpose: only a Tenant-scoped key on a real tenant. `System` scope is
+	/// never writable, and `tn_id == 0` (or a Global-scoped key, which always stores
+	/// there) is the shared default row every tenant resolves through — that stays
+	/// SADM-only through [`Self::clear`].
+	pub async fn clear_system(&self, tn_id: TnId, key: &str) -> ClResult<()> {
+		let def = self.definition(key)?;
+
+		if def.scope != SettingScope::Tenant || tn_id.0 == 0 {
+			warn!(
+				"System clear refused for setting '{}' (scope {:?}, tn_id={})",
+				key, def.scope, tn_id.0
+			);
+			return Err(Error::PermissionDenied);
+		}
+
+		self.clear_at(tn_id, key).await
+	}
+
+	/// Look up a definition, supporting wildcard patterns like `ui.*`.
+	fn definition(&self, key: &str) -> ClResult<&SettingDefinition> {
+		self.registry
+			.get(key)
+			.ok_or_else(|| Error::ValidationError(format!("Unknown setting: {}", key)))
+	}
+
+	/// Drop the stored row and the cached resolutions that flowed through it.
+	async fn clear_at(&self, storage_tn_id: TnId, key: &str) -> ClResult<()> {
 		self.meta.update_setting(storage_tn_id, key, None).await?;
 
 		// Invalidate this key across all tenants — even when clearing a

@@ -36,7 +36,11 @@ pub enum PermissionLevel {
 	/// Admin: Only users with admin role can change
 	#[serde(rename = "admin")]
 	Admin,
-	/// User: Any authenticated user can change their tenant's value
+	/// User: The tenant's owner — or a community's leader — can change that
+	/// tenant's value. Not "any authenticated user": these keys carry privacy
+	/// and configuration decisions (`profile.allow_followers`,
+	/// `profile.visibility_cap`, `app.*`), so a mere member holding a proxy
+	/// token must not reach them.
 	#[serde(rename = "user")]
 	User,
 }
@@ -47,7 +51,21 @@ impl PermissionLevel {
 		match self {
 			PermissionLevel::System => false, // Never changeable
 			PermissionLevel::Admin => roles.iter().any(|r| r.as_ref() == "SADM"),
-			PermissionLevel::User => true, // Any authenticated user
+			// Owner / leader, or SADM. SADM is admitted here so a site admin
+			// writing the shared global default row of a User-level key is not
+			// stopped by the tenant-hierarchy check before reaching `set`'s own
+			// explicit SADM gate for `tn_id == 0`.
+			//
+			// `roles::highest_role_level` takes `&[Box<str>]` while this is
+			// generic over `AsRef<str>`, so the level is folded inline.
+			PermissionLevel::User => {
+				roles.iter().any(|r| r.as_ref() == "SADM")
+					|| roles
+						.iter()
+						.filter_map(|r| crate::roles::role_level(r.as_ref()))
+						.max()
+						.unwrap_or(0) >= crate::roles::LEADER_LEVEL
+			}
 		}
 	}
 }
@@ -359,6 +377,39 @@ impl FrozenSettingsRegistry {
 	/// Check if registry is empty
 	pub fn is_empty(&self) -> bool {
 		self.definitions.is_empty()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The role set an auth adapter mints for a tenant's own owner.
+	const OWNER: [&str; 6] =
+		["public", "follower", "supporter", "contributor", "moderator", "leader"];
+
+	#[test]
+	fn test_user_level_requires_owner_or_leader() {
+		assert!(PermissionLevel::User.check(&OWNER));
+		assert!(PermissionLevel::User.check(&["leader"]));
+		// A member with a community proxy token must not reach tenant config.
+		assert!(!PermissionLevel::User.check(&["contributor"]));
+		assert!(!PermissionLevel::User.check(&["moderator"]));
+		// Federated visitors and share-link tokens carry no roles.
+		assert!(!PermissionLevel::User.check::<&str>(&[]));
+	}
+
+	#[test]
+	fn test_sadm_satisfies_user_and_admin() {
+		assert!(PermissionLevel::User.check(&["SADM"]));
+		assert!(PermissionLevel::Admin.check(&["SADM"]));
+	}
+
+	#[test]
+	fn test_admin_level_is_sadm_only() {
+		assert!(!PermissionLevel::Admin.check(&OWNER));
+		assert!(!PermissionLevel::Admin.check(&["leader"]));
+		assert!(!PermissionLevel::Admin.check::<&str>(&[]));
 	}
 }
 

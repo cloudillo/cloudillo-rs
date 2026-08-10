@@ -158,6 +158,7 @@ pub async fn create_complete_tenant(
 		);
 		e
 	})?;
+	cloudillo_core::search_index_profile(app, tn_id, opts.id_tag);
 
 	// `name` is part of `ProfileBase`, so a just-changed tenant display name must
 	// drop any cached /api/me. Cold on first bootstrap (harmless), but this
@@ -172,18 +173,11 @@ pub async fn create_complete_tenant(
 	// registrations and the bootstrap path leave it unset so the legacy
 	// "welcome ref-link" onboarding remains untouched.
 	if let Some(onboarding_step) = opts.initial_onboarding {
-		// PermissionLevel::User accepts any authenticated user, so empty roles
-		// suffice here — we're acting on behalf of a freshly-created tenant
-		// that has no roles yet anyway.
-		let empty_roles: &[&str] = &[];
+		// `set_system`: nobody has authenticated as this just-created tenant yet, so
+		// no roles exist to satisfy `ui.*`'s owner/leader permission.
 		if let Err(e) = app
 			.settings
-			.set(
-				tn_id,
-				"ui.onboarding",
-				SettingValue::String(onboarding_step.to_string()),
-				empty_roles,
-			)
+			.set_system(tn_id, "ui.onboarding", SettingValue::String(onboarding_step.to_string()))
 			.await
 		{
 			warn!(
