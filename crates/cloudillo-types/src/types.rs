@@ -1109,4 +1109,16 @@ mod access_level_tests {
 	}
 }
 
+/// What a storage-file compaction gave back.
+///
+/// `bytes_before`/`bytes_after` are summed over every file the adapter rewrote;
+/// `files` is how many it touched. All zero means the adapter does not support
+/// compaction, which is the trait's default.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompactReport {
+	pub files: usize,
+	pub bytes_before: u64,
+	pub bytes_after: u64,
+}
+
 // vim: ts=4

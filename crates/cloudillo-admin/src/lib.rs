@@ -6,6 +6,7 @@
 pub mod cert;
 pub mod email;
 pub mod invite;
+pub mod maintenance;
 pub mod perm;
 pub mod tenant;
 

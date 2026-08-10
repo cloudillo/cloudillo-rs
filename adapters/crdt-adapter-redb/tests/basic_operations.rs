@@ -277,3 +277,47 @@ async fn test_compact_updates_nonexistent_seqs() {
 	// Original 2 updates + 1 replacement (nothing was actually removed)
 	assert_eq!(updates.len(), 3);
 }
+
+/// Writes running concurrently with `compact_storage` must all succeed and stay readable.
+///
+/// `redb::Database::compact` opens the file bare to take sole ownership of it, and flock is
+/// per-process — so only the adapter's per-path maintenance barrier stops a store landing
+/// mid-sweep from racing a second live handle for the same file.
+#[tokio::test]
+async fn concurrent_writes_survive_compaction() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	let doc_id = "doc1";
+	let adapter = std::sync::Arc::new(adapter);
+
+	// Seed, so there is a file on disk when the sweep starts.
+	adapter
+		.store_update(tn_id, doc_id, CrdtUpdate { data: vec![0x00], client_id: None, seq: None })
+		.await
+		.expect("seed store failed");
+
+	let writer = {
+		let adapter = std::sync::Arc::clone(&adapter);
+		tokio::spawn(async move {
+			for i in 1..=20u8 {
+				adapter
+					.store_update(
+						tn_id,
+						doc_id,
+						CrdtUpdate { data: vec![i], client_id: None, seq: None },
+					)
+					.await
+					.expect("store failed during compaction");
+			}
+		})
+	};
+
+	adapter
+		.compact_storage()
+		.await
+		.expect("compaction failed while writes were in flight");
+	writer.await.expect("the writer task failed");
+
+	let updates = adapter.get_updates(tn_id, doc_id).await.expect("test failed");
+	assert_eq!(updates.len(), 21, "an update was lost across the compaction");
+}

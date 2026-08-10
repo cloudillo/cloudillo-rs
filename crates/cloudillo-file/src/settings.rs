@@ -130,6 +130,7 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.default(SettingValue::String("0 4 * * *".into()))
 			.scope(SettingScope::Global)
 			.permission(PermissionLevel::Admin)
+			.validator(cloudillo_core::core_settings::cron_validator)
 			.build()?,
 	)?;
 	registry.register(

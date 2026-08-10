@@ -38,6 +38,7 @@ use cloudillo_types::crdt_adapter::{
 };
 use cloudillo_types::error::Error as ClError;
 use cloudillo_types::prelude::*;
+use cloudillo_types::types::CompactReport;
 use dashmap::DashMap;
 use futures_core::Stream;
 use redb::{ReadableDatabase, ReadableTable};
@@ -211,6 +212,34 @@ impl DocumentInstance {
 /// independent handles for the same file).
 type DbCell = Arc<OnceCell<Arc<redb::Database>>>;
 
+/// One redb file's maintenance barrier. See [`CrdtAdapterRedb::maintenance`].
+type PathBarrier = Arc<RwLock<()>>;
+
+/// A `redb::Database` handle that keeps its file's maintenance barrier held.
+///
+/// The guard travels *with* the handle instead of being released when the
+/// opening function returns, and that is the whole point: an operation keeps its
+/// `Arc<redb::Database>` for its entire duration — often inside a
+/// `spawn_blocking` write — so a guard released at the end of the open call
+/// covered exactly the one window in which nothing was at risk. Bound here, no
+/// operation can hold a database handle outside a read guard, and
+/// `compact_storage` cannot take the write guard until the last one is gone.
+///
+/// `OwnedRwLockReadGuard` is `Send`, so a handle crosses `.await` points and
+/// moves into `spawn_blocking` freely.
+pub(crate) struct DbHandle {
+	db: Arc<redb::Database>,
+	_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl std::ops::Deref for DbHandle {
+	type Target = redb::Database;
+
+	fn deref(&self) -> &Self::Target {
+		&self.db
+	}
+}
+
 /// CRDT Adapter using redb for storage
 pub struct CrdtAdapterRedb {
 	/// Base storage directory
@@ -227,6 +256,22 @@ pub struct CrdtAdapterRedb {
 
 	/// Cache of document instances (with broadcasters)
 	doc_instances: Arc<DashMap<String, Arc<DocumentInstance>>>,
+
+	/// One barrier per redb file. Every operation on a path holds a *read* guard
+	/// for its whole duration; `compact_storage` takes the *write* guard, so it
+	/// cannot begin until no live `Arc<redb::Database>` for that path remains.
+	///
+	/// `redb::Database::compact` needs sole ownership of the handle, so
+	/// compaction drops the cached one and opens the file bare. flock is
+	/// per-process, so redb does not stop a second bare open of a file this
+	/// process already has open — this barrier is the only thing that does.
+	///
+	/// Per *path*, deliberately: a single node-wide lock would freeze every
+	/// tenant's document I/O for the length of the whole sweep, since compaction
+	/// also empties the handle cache and forces all traffic onto the blocking
+	/// open path. Compacting one tenant's file now stalls only that tenant, and
+	/// only while its own file is being rewritten.
+	maintenance: Arc<RwLock<HashMap<PathBuf, PathBarrier>>>,
 }
 
 impl CrdtAdapterRedb {
@@ -254,16 +299,50 @@ impl CrdtAdapterRedb {
 			config,
 			file_databases: Arc::new(RwLock::new(HashMap::new())),
 			doc_instances: Arc::new(DashMap::new()),
+			maintenance: Arc::new(RwLock::new(HashMap::new())),
 		})
 	}
 
-	/// Get or open a redb database file.
+	/// The maintenance barrier for one redb file, created on first use.
+	async fn path_barrier(&self, path: &Path) -> PathBarrier {
+		let existing = {
+			let map = self.maintenance.read().await;
+			map.get(path).map(Arc::clone)
+		};
+		if let Some(barrier) = existing {
+			return barrier;
+		}
+		let mut map = self.maintenance.write().await;
+		Arc::clone(map.entry(path.to_path_buf()).or_default())
+	}
+
+	/// Get or open a redb database file, holding the path's maintenance barrier
+	/// for as long as the returned handle lives.
 	///
 	/// Uses a per-path `OnceCell` so concurrent first-openers for the same
 	/// file serialize on initialization (a single `redb::Database` handle
 	/// per file). Sync redb I/O runs inside `spawn_blocking` so
 	/// `begin_write` never parks the tokio worker on redb's Condvar.
-	async fn get_or_open_db_file(&self, db_path: PathBuf) -> ClResult<Arc<redb::Database>> {
+	///
+	/// The barrier is **not re-entrant**: `tokio::sync::RwLock` is fair, so a
+	/// second read acquisition for the same path behind a waiting
+	/// `compact_storage` writer would deadlock. A caller that needs both a handle
+	/// and a document instance must take the instance first — see
+	/// [`Self::store_update`].
+	async fn get_or_open_db_file(&self, db_path: PathBuf) -> ClResult<DbHandle> {
+		// Taken *before* the handle and released only with it — see `DbHandle`.
+		let barrier = self.path_barrier(&db_path).await;
+		let guard = barrier.read_owned().await;
+		let db = self.open_db_file_guarded(db_path).await?;
+		Ok(DbHandle { db, _guard: guard })
+	}
+
+	/// The cache half of [`Self::get_or_open_db_file`], without the barrier.
+	///
+	/// **The caller must already hold a guard on the path's barrier** — in
+	/// practice only `compact_storage`, reinstalling a fresh handle under its
+	/// write guard.
+	async fn open_db_file_guarded(&self, db_path: PathBuf) -> ClResult<Arc<redb::Database>> {
 		// Look up — or create — the OnceCell for this path.
 		let existing = {
 			let cache = self.file_databases.read().await;
@@ -374,47 +453,64 @@ impl CrdtAdapterRedb {
 impl CrdtAdapter for CrdtAdapterRedb {
 	async fn get_updates(&self, tn_id: TnId, doc_id: &str) -> ClResult<Vec<CrdtUpdate>> {
 		let db_path = self.get_db_path(tn_id, doc_id);
+		// The handle — and with it the maintenance barrier's read guard — is taken
+		// on the async side and moved into the closure, so the barrier is never
+		// acquired from a blocking thread.
 		let db = self.get_or_open_db_file(db_path).await?;
 
-		let tx = db.begin_read().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e)))
-		})?;
-
-		let updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
-		})?;
-
-		let mut updates = Vec::new();
-
-		// Use binary key range for efficient scanning
-		let (range_start, range_end) = key_encoding::make_doc_range(doc_id);
-		let range = updates_table
-			.range(range_start.as_slice()..=range_end.as_slice())
-			.map_err(|e| ClError::from(Error::DbError(format!("Failed to read updates: {}", e))))?;
-
-		for item in range {
-			let (key, value) = item.map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
+		// The scan below is synchronous redb work whose size is the document's whole
+		// update log, and it copies every blob. On a runtime thread that stalls a
+		// tokio worker for as long as the log is large, so it goes to the blocking
+		// pool — the same shape `delete_tenant_documents` uses.
+		let doc_id_owned = doc_id.to_string();
+		let updates = tokio::task::spawn_blocking(move || -> ClResult<Vec<CrdtUpdate>> {
+			let tx = db.begin_read().map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e)))
 			})?;
 
-			let seq = key_encoding::decode_seq(key.value());
-			let update_data = value.value().to_vec();
-			let mut update = CrdtUpdate::new(update_data);
-			update.seq = seq;
-			updates.push(update);
-		}
+			let updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
+			})?;
+
+			let mut updates = Vec::new();
+
+			let (range_start, range_end) = key_encoding::make_doc_range(&doc_id_owned);
+			let range =
+				updates_table.range(range_start.as_slice()..=range_end.as_slice()).map_err(
+					|e| ClError::from(Error::DbError(format!("Failed to read updates: {}", e))),
+				)?;
+
+			for item in range {
+				let (key, value) = item.map_err(|e| {
+					ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
+				})?;
+
+				let seq = key_encoding::decode_seq(key.value());
+				let update_data = value.value().to_vec();
+				let mut update = CrdtUpdate::new(update_data);
+				update.seq = seq;
+				updates.push(update);
+			}
+
+			Ok(updates)
+		})
+		.await
+		.map_err(|e| ClError::Internal(format!("spawn_blocking join error: {}", e)))??;
 
 		trace!("Got {} updates for doc {}", updates.len(), doc_id);
 		Ok(updates)
 	}
 
 	async fn store_update(&self, tn_id: TnId, doc_id: &str, update: CrdtUpdate) -> ClResult<()> {
-		let db_path = self.get_db_path(tn_id, doc_id);
-		let db = self.get_or_open_db_file(db_path).await?;
-
-		// Get or create instance (initializes seq from DB if new)
+		// Instance first, handle second. `get_or_create_instance` takes and
+		// releases its own barrier guard when it has to seed the sequence counter
+		// from the file; nesting that inside a guard we already hold would
+		// deadlock behind a waiting `compact_storage`.
 		let instance = self.get_or_create_instance(doc_id, tn_id).await?;
 		let seq = instance.update_count.fetch_add(1, Ordering::SeqCst);
+
+		let db_path = self.get_db_path(tn_id, doc_id);
+		let db = self.get_or_open_db_file(db_path).await?;
 
 		// Write update to database — sync redb work on the blocking pool so
 		// `begin_write`'s Condvar wait never parks the tokio worker.
@@ -500,15 +596,18 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		remove_seqs: &[u64],
 		replacement: CrdtUpdate,
 	) -> ClResult<()> {
-		let db_path = self.get_db_path(tn_id, doc_id);
-		let db = self.get_or_open_db_file(db_path).await?;
-
 		// Get next sequence number for the replacement update.
 		// Note: fetch_add is called before the transaction. If the transaction
 		// fails, this seq is "burned" (gap in sequence). This is harmless —
 		// gaps are tolerated, and the counter re-syncs from DB max on restart.
+		//
+		// Instance before handle, for the re-entrancy reason spelled out in
+		// `store_update`.
 		let instance = self.get_or_create_instance(doc_id, tn_id).await?;
 		let new_seq = instance.update_count.fetch_add(1, Ordering::SeqCst);
+
+		let db_path = self.get_db_path(tn_id, doc_id);
+		let db = self.get_or_open_db_file(db_path).await?;
 
 		// Single atomic transaction: delete specified seqs + insert replacement.
 		// Run on the blocking pool so `begin_write` never parks the tokio worker.
@@ -622,8 +721,122 @@ impl CrdtAdapter for CrdtAdapterRedb {
 		Ok(())
 	}
 
+	/// Rewrite every redb file, giving back the space already freed inside it.
+	///
+	/// `redb::Database::compact` takes `&mut self` and fails with
+	/// `TransactionInProgress` if any read transaction is live, so a cached
+	/// `Arc<Database>` can never be compacted in place. The file must be opened
+	/// bare while nothing else holds it — and flock is per-process, so redb will
+	/// not stop this process from opening a file it already has open. The
+	/// `maintenance` barrier is what does.
+	///
+	/// Per path, therefore: take the path's **write** guard, which cannot be
+	/// granted until every outstanding read guard is gone and so guarantees no
+	/// live handle remains; drop the cached handle; compact; reinstall a fresh
+	/// handle *if the path was cached before the sweep*. The guard is taken inside
+	/// the loop, never across it, so compacting one tenant's file does not stall
+	/// another tenant's document I/O.
+	/// `doc_instances` holds only broadcasters and sequence counters, never a
+	/// database handle, so it is left alone.
+	///
+	/// The payoff is small: this returns only space already dead inside the file,
+	/// and a document's update log is trimmed by `compact_updates`, which runs 2 s
+	/// after its *last* WebSocket client disconnects. A document that is never
+	/// vacated appends forever and frees nothing for this to reclaim.
+	async fn compact_storage(&self) -> ClResult<CompactReport> {
+		let cached: std::collections::HashSet<PathBuf> = {
+			let cache = self.file_databases.read().await;
+			cache.keys().cloned().collect()
+		};
+		let mut all: Vec<PathBuf> = cached.iter().cloned().collect();
+		// Files nothing has opened this run are on disk but not in the cache.
+		if let Ok(mut dir) = tokio::fs::read_dir(&self.storage_path).await {
+			while let Ok(Some(entry)) = dir.next_entry().await {
+				let path = entry.path();
+				// Both layouts this adapter writes: `tn_<id>.db` per tenant, or the
+				// single shared `crdt.db`.
+				let is_db = path.extension().is_some_and(|e| e == "db");
+				if is_db && !all.contains(&path) {
+					all.push(path);
+				}
+			}
+		}
+
+		let mut report = CompactReport::default();
+		for path in all {
+			let before = match tokio::fs::metadata(&path).await {
+				Ok(m) => m.len(),
+				Err(_) => continue,
+			};
+			// Exclusive access to this one file. Nothing else may hold a handle
+			// for it from here until the guard drops at the end of the iteration.
+			let barrier = self.path_barrier(&path).await;
+			let _guard = barrier.write_owned().await;
+
+			{
+				let mut cache = self.file_databases.write().await;
+				cache.remove(&path);
+			}
+
+			let compact_path = path.clone();
+			// The join result is folded into the same deferred `Result` as the
+			// compaction's own rather than `?`-ed: the cached handle for this path
+			// has already been evicted, so an early return here would skip the
+			// reopen below and abandon the rest of the sweep. A panicking
+			// `Database::open` on a damaged file is exactly that case.
+			let compacted = tokio::task::spawn_blocking(move || -> ClResult<()> {
+				let mut db = redb::Database::open(&compact_path).map_err(|e| {
+					ClError::from(Error::DbError(format!("Failed to open database: {}", e)))
+				})?;
+				db.compact().map_err(|e| {
+					ClError::from(Error::DbError(format!("redb compact failed: {}", e)))
+				})?;
+				Ok(())
+			})
+			.await
+			.unwrap_or_else(|e| {
+				Err(ClError::Internal(format!("spawn_blocking join error: {}", e)))
+			});
+
+			// Reinstall a fresh handle before releasing the guard, so the first
+			// operation through does not have to pay the open cost while holding
+			// the barrier — and so a failed compaction leaves the cache warm
+			// rather than empty.
+			//
+			// Only for a path that *was* cached, though: that warmth argument holds
+			// for a file something opened, not for one this sweep found by walking
+			// the directory. `file_databases` is never evicted, so reopening every
+			// file on disk would pin an fd and a redb page cache for every tenant
+			// that has ever existed.
+			if cached.contains(&path)
+				&& let Err(e) = self.open_db_file_guarded(path.clone()).await
+			{
+				warn!("crdt compact: reopening {} failed: {}", path.display(), e);
+			}
+
+			if let Err(e) = compacted {
+				warn!("crdt compact: {} failed: {}", path.display(), e);
+				continue;
+			}
+
+			let after = tokio::fs::metadata(&path).await.map_or(before, |m| m.len());
+			report.files += 1;
+			report.bytes_before += before;
+			report.bytes_after += after;
+		}
+		Ok(report)
+	}
+
 	async fn delete_tenant_documents(&self, tn_id: TnId) -> ClResult<()> {
 		let db_path = self.get_db_path(tn_id, "");
+
+		// Exclusive access to the file for the whole purge. Without it a
+		// `compact_storage` already past its own cache eviction would reopen — and
+		// `Database::create` — the file we are about to unlink, resurrecting an
+		// empty database for a tenant that no longer exists. Held across both the
+		// cache removal and the `remove_file`, and taken before either.
+		let barrier = self.path_barrier(&db_path).await;
+		let _guard = barrier.write_owned().await;
 
 		if self.per_tenant_files {
 			// Drop any cached handle for this tenant's file before unlinking.
@@ -667,33 +880,42 @@ impl CrdtAdapter for CrdtAdapterRedb {
 
 	async fn list_docs(&self, tn_id: TnId) -> ClResult<Vec<Box<str>>> {
 		let db_path = self.get_db_path(tn_id, "");
+		// Handle — and with it the maintenance barrier's read guard — taken on the
+		// async side and moved into the closure, as `get_updates` does.
 		let db = self.get_or_open_db_file(db_path).await?;
 
-		let tx = db.begin_read().map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e)))
-		})?;
-
-		let updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
-			ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
-		})?;
-
-		let mut doc_ids = std::collections::HashSet::new();
-		let range = updates_table
-			.iter()
-			.map_err(|e| ClError::from(Error::DbError(format!("Failed to read updates: {}", e))))?;
-
-		for item in range {
-			let (key, _) = item.map_err(|e| {
-				ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
+		// Strictly larger than `get_updates`' scan: every update of every document
+		// in the file, not one document's log. Off the runtime for the same reason,
+		// and because the read guard it holds for the whole scan otherwise delays
+		// `compact_storage`'s write-guard acquisition from a tokio worker.
+		tokio::task::spawn_blocking(move || -> ClResult<Vec<Box<str>>> {
+			let tx = db.begin_read().map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to begin read transaction: {}", e)))
 			})?;
 
-			// Extract doc_id from key
-			if let Some(doc_id) = key_encoding::decode_doc_id(key.value()) {
-				doc_ids.insert(doc_id);
-			}
-		}
+			let updates_table = tx.open_table(TABLE_UPDATES).map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to open updates table: {}", e)))
+			})?;
 
-		Ok(doc_ids.into_iter().map(Into::into).collect())
+			let mut doc_ids = std::collections::HashSet::new();
+			let range = updates_table.iter().map_err(|e| {
+				ClError::from(Error::DbError(format!("Failed to read updates: {}", e)))
+			})?;
+
+			for item in range {
+				let (key, _) = item.map_err(|e| {
+					ClError::from(Error::DbError(format!("Failed to iterate updates: {}", e)))
+				})?;
+
+				if let Some(doc_id) = key_encoding::decode_doc_id(key.value()) {
+					doc_ids.insert(doc_id);
+				}
+			}
+
+			Ok(doc_ids.into_iter().map(Into::into).collect())
+		})
+		.await
+		.map_err(|e| ClError::Internal(format!("spawn_blocking join error: {}", e)))?
 	}
 }
 

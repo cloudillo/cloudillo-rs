@@ -32,6 +32,7 @@ pub(crate) fn tenant() -> Router<App> {
 		.route("/api/admin/tenants/{id_tag}/purge", post(admin::tenant::purge_tenant_handler))
 		.route("/api/admin/email/test", post(admin::email::send_test_email))
 		.route("/api/admin/cert-status", get(admin::cert::get_cert_status))
+		.route("/api/admin/db-maintenance", post(admin::maintenance::post_db_maintenance))
 		// Handlers live in `cloudillo-proxy`; kept here to match their URL prefix.
 		.route(
 			"/api/admin/proxy-sites",

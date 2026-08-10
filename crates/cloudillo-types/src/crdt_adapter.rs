@@ -24,6 +24,7 @@ use std::fmt::Debug;
 use std::pin::Pin;
 
 use crate::prelude::*;
+use crate::types::CompactReport;
 
 /// A binary CRDT update (serialized Yjs sync protocol message).
 ///
@@ -189,6 +190,24 @@ pub trait CrdtAdapter: Debug + Send + Sync {
 	/// Used by tenant purge orchestration. Implementations should treat a
 	/// missing tenant store as success.
 	async fn delete_tenant_documents(&self, tn_id: TnId) -> ClResult<()>;
+
+	/// Rewrite every storage file, returning the space already freed inside them
+	/// to the filesystem.
+	///
+	/// Called from the nightly maintenance task, never from a request path: a
+	/// backend may have to close and reopen its files, which blocks every reader
+	/// and writer of the one being rewritten.
+	///
+	/// Only space already dead *inside* the file is given back. A CRDT document's
+	/// update log is trimmed by `compact_updates`, which runs only when the last
+	/// WebSocket client of a document disconnects — so a long-lived document frees
+	/// nothing here.
+	///
+	/// Defaults to a no-op report, the honest answer for a backend with nothing
+	/// to compact.
+	async fn compact_storage(&self) -> ClResult<CompactReport> {
+		Ok(CompactReport::default())
+	}
 }
 
 // vim: ts=4
