@@ -25,6 +25,12 @@ pub struct WorkerPool {
 
 impl WorkerPool {
 	pub fn new(n1: usize, n2: usize, n3: usize) -> Self {
+		Self::build(n1, n2, n3).0
+	}
+
+	/// `new`, plus a witness whose strong count is the number of live worker threads —
+	/// each worker holds a clone until `worker_loop` returns.
+	fn build(n1: usize, n2: usize, n3: usize) -> (Self, std::sync::Weak<()>) {
 		let (high, rx_high) = flume::unbounded();
 		let (med, rx_med) = flume::unbounded();
 		let (low, rx_low) = flume::unbounded();
@@ -33,17 +39,28 @@ impl WorkerPool {
 		let rx_med = Arc::new(rx_med);
 		let rx_low = Arc::new(rx_low);
 
+		let alive = Arc::new(());
+		let witness = Arc::downgrade(&alive);
+
 		// Workers dedicated to High only
 		for _ in 0..n1 {
 			let rx_high = Arc::clone(&rx_high);
-			thread::spawn(move || worker_loop(&[rx_high]));
+			let alive = Arc::clone(&alive);
+			thread::spawn(move || {
+				worker_loop(&[rx_high]);
+				drop(alive);
+			});
 		}
 
 		// Workers for High + Medium
 		for _ in 0..n2 {
 			let rx_high = Arc::clone(&rx_high);
 			let rx_med = Arc::clone(&rx_med);
-			thread::spawn(move || worker_loop(&[rx_high, rx_med]));
+			let alive = Arc::clone(&alive);
+			thread::spawn(move || {
+				worker_loop(&[rx_high, rx_med]);
+				drop(alive);
+			});
 		}
 
 		// Workers for High + Medium + Low
@@ -51,10 +68,15 @@ impl WorkerPool {
 			let rx_high = Arc::clone(&rx_high);
 			let rx_med = Arc::clone(&rx_med);
 			let rx_low = Arc::clone(&rx_low);
-			thread::spawn(move || worker_loop(&[rx_high, rx_med, rx_low]));
+			let alive = Arc::clone(&alive);
+			thread::spawn(move || {
+				worker_loop(&[rx_high, rx_med, rx_low]);
+				drop(alive);
+			});
 		}
 
-		Self { high, med, low }
+		drop(alive);
+		(Self { high, med, low }, witness)
 	}
 
 	/// Submit a closure with arguments → returns a Future for the result
@@ -105,7 +127,6 @@ impl WorkerPool {
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
 	{
-		info!("[RUN normal]");
 		let (res_tx, res_rx) = oneshot::channel();
 
 		let job = Box::new(move || {
@@ -157,7 +178,6 @@ impl WorkerPool {
 		F: FnOnce() -> T + Send + 'static,
 		T: Send + 'static,
 	{
-		info!("[RUN slow]");
 		let (res_tx, res_rx) = oneshot::channel();
 
 		let job = Box::new(move || {
@@ -219,37 +239,118 @@ impl WorkerPool {
 
 type JobQueue = Arc<Receiver<Box<dyn FnOnce() + Send>>>;
 
+fn run_job(job: Box<dyn FnOnce() + Send>) {
+	if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+		error!("Worker thread caught panic: {:?}", e);
+	}
+}
+
 fn worker_loop(queues: &[JobQueue]) {
+	// Queues still worth waiting on. flume reports a disconnected channel as *ready*, so a
+	// dead queue left in the wait set turns `Selector::wait` into a busy spin that outlives
+	// the pool. Drop each one once its sender is gone and its buffer drained; stop when the
+	// set empties.
+	let mut live: Vec<&JobQueue> = queues.iter().collect();
+
 	loop {
 		// Try higher-priority queues first (non-blocking)
 		let mut job = None;
-		for rx in queues {
+		for rx in &live {
 			if let Ok(j) = rx.try_recv() {
 				job = Some(j);
 				break;
 			}
 		}
-
-		#[allow(clippy::collapsible_if)]
 		if let Some(job) = job {
-			if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
-				error!("Worker thread caught panic: {:?}", e);
-			}
+			run_job(job);
 			continue;
+		}
+
+		live.retain(|rx| !rx.is_disconnected() || !rx.is_empty());
+		if live.is_empty() {
+			break;
 		}
 
 		// Wait for next job
 		let mut selector = flume::Selector::new();
-		for rx in queues {
+		for &rx in &live {
 			selector = selector.recv(rx, |res| res);
 		}
-
-		let job: Result<Box<dyn FnOnce() + Send>, flume::RecvError> = selector.wait();
-		if let Ok(job) = job
-			&& let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
-		{
-			error!("Worker thread caught panic: {:?}", e);
+		match selector.wait() {
+			Ok(job) => run_job(job),
+			// A sender dropped while we waited. Loop: the `try_recv` sweep drains what is
+			// left and `retain` prunes the dead queue.
+			Err(flume::RecvError::Disconnected) => (),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+	use super::*;
+	use std::sync::{
+		Weak,
+		atomic::{AtomicBool, Ordering},
+	};
+	use std::time::{Duration, Instant};
+
+	/// Poll `alive` until every worker thread has returned, or the deadline expires.
+	fn wait_for_exit(alive: &Weak<()>, timeout: Duration) -> usize {
+		let deadline = Instant::now() + timeout;
+		loop {
+			let count = alive.strong_count();
+			if count == 0 || Instant::now() >= deadline {
+				return count;
+			}
+			thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	#[test]
+	fn workers_exit_when_pool_is_dropped() {
+		let (pool, alive) = WorkerPool::build(1, 1, 1);
+		assert_eq!(alive.strong_count(), 3, "expected 3 worker threads");
+
+		drop(pool);
+
+		assert_eq!(
+			wait_for_exit(&alive, Duration::from_secs(2)),
+			0,
+			"worker threads did not exit after the pool was dropped"
+		);
+	}
+
+	#[test]
+	fn queued_jobs_run_before_workers_exit() {
+		// A single worker serving [high, med], so the two jobs below are strictly ordered.
+		let (pool, alive) = WorkerPool::build(0, 1, 0);
+
+		// Occupy the worker so the second job is still buffered when the pool drops.
+		let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+		let blocker = pool.run(move || {
+			let _ignore = release_rx.recv();
+		});
+
+		let ran = Arc::new(AtomicBool::new(false));
+		let flag = Arc::clone(&ran);
+		let queued = pool.run(move || flag.store(true, Ordering::SeqCst));
+
+		drop(pool);
+		drop(blocker);
+		drop(queued);
+
+		// Let the worker go; it must drain the buffered job before exiting.
+		let _ignore = release_tx.send(());
+		drop(release_tx);
+
+		assert_eq!(
+			wait_for_exit(&alive, Duration::from_secs(2)),
+			0,
+			"worker thread did not exit after the pool was dropped"
+		);
+		assert!(ran.load(Ordering::SeqCst), "job queued before the pool dropped was never run");
 	}
 }
 
