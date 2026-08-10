@@ -143,6 +143,42 @@ impl SubjectAccessLevel {
 	}
 }
 
+/// The one relationship ladder, shared so the endpoints that list and the
+/// endpoint that searches cannot drift apart.
+///
+/// Callers compute the four inputs themselves, because *how* you become the
+/// owner or a real authenticated caller differs by endpoint — `GET /api/search`
+/// demotes every scoped caller to `Public` before asking (a file scope is handed
+/// to an untrusted app and carries no ambient authority), while `GET /api/files`
+/// resolves a scope through its own share lookup. What must never differ is the
+/// ordering below.
+///
+/// [`can_view_item`] carries a third copy of the ladder with a different
+/// signature: it folds the item owner into the owner test and an
+/// `is_authenticated` flag into `is_real_auth`.
+// Four bools on purpose: they are the ladder's rungs, and a struct would put a
+// name between each caller and the ordering this function exists to fix in one
+// place. Both call sites pass them in the order the doc above states.
+#[allow(clippy::fn_params_excessive_bools)]
+pub fn relationship_level(
+	is_owner: bool,
+	connected: bool,
+	following: bool,
+	is_real_auth: bool,
+) -> SubjectAccessLevel {
+	if is_owner {
+		SubjectAccessLevel::Owner
+	} else if connected {
+		SubjectAccessLevel::Connected
+	} else if following {
+		SubjectAccessLevel::Follower
+	} else if is_real_auth {
+		SubjectAccessLevel::Verified
+	} else {
+		SubjectAccessLevel::Public
+	}
+}
+
 /// Context for checking whether a subject can view an item
 pub struct ViewCheckContext<'a> {
 	pub subject_id_tag: &'a str,

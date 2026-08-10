@@ -775,6 +775,9 @@ async fn finalize_action(
 ) -> ClResult<()> {
 	app.meta_adapter.finalize_action(tn_id, a_id, action_id, options).await?;
 	app.meta_adapter.store_action_token(tn_id, action_id, action_token).await?;
+	// Where a locally created action first gets an `action_id` and goes Active;
+	// until now the row could not be indexed at all.
+	cloudillo_core::search_index_action(app, tn_id, action_id);
 
 	Ok(())
 }
@@ -1217,6 +1220,8 @@ impl Task<App> for ActionVerifierTask {
 		};
 		if let Err(e) = app.meta_adapter.update_action_data(self.tn_id, &action_id, &opts).await {
 			warn!("  failed to mark action {} as 'F' after retry exhaustion: {}", action_id, e);
+		} else {
+			cloudillo_core::search_index_action(app, self.tn_id, &action_id);
 		}
 	}
 }

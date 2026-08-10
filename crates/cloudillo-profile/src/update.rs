@@ -65,6 +65,10 @@ pub async fn patch_own_profile(
 	app.meta_adapter.update_tenant(tn_id, &tenant_update).await?;
 	// `name`/`x` just changed → drop the cached /api/me so peers see it now.
 	app.profile_me.invalidate(tn_id);
+	// `update_tenant` syncs `name` into the tenant's `profiles` row, which the index reads.
+	if !matches!(tenant_update.name, Patch::Undefined) {
+		cloudillo_core::search_index_profile(&app, tn_id, &auth.id_tag);
+	}
 
 	// Fetch updated profile and tenant data (for x field)
 	let profile_data = app.meta_adapter.get_profile_info(tn_id, &auth.id_tag).await?;
@@ -218,6 +222,9 @@ pub async fn patch_profile_admin(
 	// upsert creates a stub so the admin's intent isn't blocked by an empty cache.
 	let upsert = UpsertProfileFields::from_update(profile_update);
 	app.meta_adapter.upsert_profile(tn_id, &id_tag, &upsert).await?;
+	if upsert.affects_search_index() {
+		cloudillo_core::search_index_profile(&app, tn_id, &id_tag);
+	}
 
 	// If the admin lifted a Suspended state on a peer that has previously
 	// synced from a remote (`synced_at` is non-NULL), re-sync immediately so
@@ -328,6 +335,9 @@ pub async fn patch_profile_relationship(
 	};
 	let upsert = UpsertProfileFields::from_update(update);
 	app.meta_adapter.upsert_profile(tn_id, &id_tag, &upsert).await?;
+	if upsert.affects_search_index() {
+		cloudillo_core::search_index_profile(&app, tn_id, &id_tag);
+	}
 
 	info!("User {} updated relationship with {}", auth.id_tag, id_tag);
 	Ok(StatusCode::OK)

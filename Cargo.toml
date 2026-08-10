@@ -10,6 +10,7 @@ members = [
 	"crates/cloudillo-crdt",
 	"crates/cloudillo-rtdb",
 	"crates/cloudillo-ref",
+	"crates/cloudillo-search",
 	"crates/cloudillo-email",
 	"crates/cloudillo-auth",
 	"crates/cloudillo-proxy",
@@ -45,6 +46,7 @@ cloudillo-push = { version = "0.8.17", path = "crates/cloudillo-push" }
 cloudillo-crdt = { version = "0.8.17", path = "crates/cloudillo-crdt" }
 cloudillo-rtdb = { version = "0.8.17", path = "crates/cloudillo-rtdb" }
 cloudillo-ref = { version = "0.8.17", path = "crates/cloudillo-ref" }
+cloudillo-search = { version = "0.8.17", path = "crates/cloudillo-search" }
 cloudillo-email = { version = "0.8.17", path = "crates/cloudillo-email" }
 cloudillo-auth = { version = "0.8.17", path = "crates/cloudillo-auth" }
 cloudillo-proxy = { version = "0.8.17", path = "crates/cloudillo-proxy" }

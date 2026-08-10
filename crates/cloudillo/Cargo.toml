@@ -19,6 +19,7 @@ cloudillo-push = { workspace = true }
 cloudillo-crdt = { workspace = true }
 cloudillo-rtdb = { workspace = true }
 cloudillo-ref = { workspace = true }
+cloudillo-search = { workspace = true }
 cloudillo-email = { workspace = true }
 cloudillo-auth = { workspace = true }
 cloudillo-proxy = { workspace = true }

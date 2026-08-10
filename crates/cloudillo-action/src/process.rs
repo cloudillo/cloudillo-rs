@@ -493,6 +493,9 @@ async fn process_inbound_action_token_inner(
 		warn!("  failed to activate inbound action {}: {}", action_id, e);
 		return Err(e);
 	}
+	// The 'V' → 'A' transition is where a federated action becomes searchable;
+	// the earlier 'P'/'V' writes never were.
+	cloudillo_core::search_index_action(app, tn_id, action_id);
 
 	// Forward to WS clients now that the row holds its final status. Deferred
 	// from process_after_store so the push (and any client refetch) never sees

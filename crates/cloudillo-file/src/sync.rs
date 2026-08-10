@@ -371,7 +371,12 @@ pub async fn sync_file_variants(
 		};
 
 		match app.meta_adapter.create_file(tn_id, create_opts).await {
-			Ok(FileId::FId(f_id)) => (Some(f_id), true),
+			Ok(FileId::FId(f_id)) => {
+				// The row already carries its `file_id`, so it is searchable before
+				// `finalize_file` flips it to Active.
+				cloudillo_core::search_index_file(app, tn_id, file_id);
+				(Some(f_id), true)
+			}
 			Ok(FileId::FileId(_)) => {
 				// Matched by orig_variant_id - shouldn't happen often but handle it
 				debug!("File {} matched existing by orig_variant_id", file_id);
@@ -492,12 +497,13 @@ pub async fn sync_file_variants(
 	}
 
 	// 8. Finalize the file by setting file_id (only if we created a new file entry)
-	if is_new_file
-		&& let Some(f_id) = f_id
-		&& let Err(e) = app.meta_adapter.finalize_file(tn_id, f_id, file_id).await
-	{
-		warn!("Failed to finalize file {}: {}", file_id, e);
-		// Variants are synced, just finalization failed
+	if is_new_file && let Some(f_id) = f_id {
+		if let Err(e) = app.meta_adapter.finalize_file(tn_id, f_id, file_id).await {
+			warn!("Failed to finalize file {}: {}", file_id, e);
+			// Variants are synced, just finalization failed
+		} else {
+			cloudillo_core::search_index_file(app, tn_id, file_id);
+		}
 	}
 
 	info!(

@@ -6,13 +6,16 @@ use std::{path::Path, sync::Arc};
 mod action;
 mod calendar;
 mod contact;
+mod doc_format;
 mod file;
 mod file_user_data;
 mod installed_app;
+mod maintenance;
 mod profile;
 mod push;
 mod reference;
 mod schema;
+mod search;
 mod setting;
 mod share;
 mod tag;
@@ -31,13 +34,14 @@ use cloudillo_types::{
 		Action, ActionData, ActionId, ActionView, AddressBook, Calendar, CalendarObject,
 		CalendarObjectExtracted, CalendarObjectSyncEntry, CalendarObjectView, CalendarObjectWrite,
 		Contact, ContactExtracted, ContactSyncEntry, ContactView, CreateCalendarData, CreateFile,
-		CreateRefOptions, CreateShareEntry, DeleteFileResult, FileId, FileUserData, FileVariant,
-		FileView, FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
+		CreateRefOptions, CreateShareEntry, DeleteFileResult, DocFormat, FileId, FileUserData,
+		FileVariant, FileView, FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
 		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
 		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
-		ProfileData, PushSubscription, PushSubscriptionData, RefData, ShareEntry, Task, TaskPatch,
-		Tenant, TenantListMeta, UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData,
-		UpdateFileOptions, UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData,
+		ProfileData, PushSubscription, PushSubscriptionData, RefData, SearchObject, SearchOptions,
+		SearchPart, SearchRow, ShareEntry, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
+		UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData, UpdateFileOptions,
+		UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData, UpsertDocFormat,
 		UpsertProfileFields, UpsertResult,
 	},
 	prelude::*,
@@ -409,7 +413,7 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::list_referenced_managed_fids(&self.dbr, tn_id).await
 	}
 
-	async fn hard_delete_file(&self, tn_id: TnId, f_id: u64) -> ClResult<()> {
+	async fn hard_delete_file(&self, tn_id: TnId, f_id: u64) -> ClResult<Option<Box<str>>> {
 		file::hard_delete_file(&self.db, tn_id, f_id).await
 	}
 
@@ -765,6 +769,100 @@ impl MetaAdapter for MetaAdapterSqlite {
 		publisher_tag: &str,
 	) -> ClResult<Option<InstalledApp>> {
 		installed_app::get(&self.dbr, tn_id, app_name, publisher_tag).await
+	}
+
+	// Full-text search
+	//******************
+
+	async fn replace_search_object(
+		&self,
+		tn_id: TnId,
+		obj: &SearchObject<'_>,
+		parts: &[SearchPart<'_>],
+	) -> ClResult<()> {
+		if parts.is_empty() {
+			return search::delete_object(&self.db, tn_id, obj.obj_tp, obj.obj_id).await;
+		}
+		search::replace_object(&self.db, tn_id, obj, parts).await
+	}
+
+	async fn replace_search_row(
+		&self,
+		tn_id: TnId,
+		obj_tp: char,
+		obj_id: &str,
+		part: Option<&SearchPart<'_>>,
+		fts_cl: bool,
+	) -> ClResult<()> {
+		search::replace_row(&self.db, tn_id, obj_tp, obj_id, part, fts_cl).await
+	}
+
+	async fn delete_search_object(&self, tn_id: TnId, obj_tp: char, obj_id: &str) -> ClResult<()> {
+		search::delete_object(&self.db, tn_id, obj_tp, obj_id).await
+	}
+
+	async fn delete_deep_search_by_content_type(
+		&self,
+		tn_id: TnId,
+		content_type: &str,
+	) -> ClResult<()> {
+		search::delete_deep_by_content_type(&self.db, tn_id, content_type).await
+	}
+
+	async fn reap_search_orphans(&self, tn_id: TnId) -> ClResult<()> {
+		search::reap_orphans(&self.db, tn_id).await
+	}
+
+	async fn optimize_search_index(&self, full: bool) -> ClResult<()> {
+		maintenance::optimize_search_index(&self.db, full).await
+	}
+
+	async fn reclaim_space(&self, min_free_pct: i64) -> ClResult<SpaceReport> {
+		maintenance::reclaim_space(&self.db, min_free_pct).await
+	}
+
+	async fn search(&self, tn_id: TnId, opts: &SearchOptions) -> ClResult<Vec<SearchRow>> {
+		search::search(&self.dbr, tn_id, opts).await
+	}
+
+	async fn count_search(&self, tn_id: TnId, opts: &SearchOptions) -> ClResult<i64> {
+		search::count(&self.dbr, tn_id, opts).await
+	}
+
+	async fn read_tenant_data(&self, tn_id: TnId, name: &str) -> ClResult<Option<Box<str>>> {
+		tenant::read_data(&self.dbr, tn_id, name).await
+	}
+
+	async fn write_tenant_data(
+		&self,
+		tn_id: TnId,
+		name: &str,
+		value: Option<&str>,
+	) -> ClResult<()> {
+		tenant::write_data(&self.db, tn_id, name, value).await
+	}
+
+	// Document format manifests
+	//**************************
+
+	async fn read_doc_format(
+		&self,
+		tn_id: TnId,
+		content_type: &str,
+	) -> ClResult<Option<DocFormat>> {
+		doc_format::read(&self.dbr, tn_id, content_type).await
+	}
+
+	async fn list_doc_formats(&self, tn_id: TnId) -> ClResult<Vec<DocFormat>> {
+		doc_format::list(&self.dbr, tn_id).await
+	}
+
+	async fn upsert_doc_format(&self, tn_id: TnId, fmt: &UpsertDocFormat<'_>) -> ClResult<()> {
+		doc_format::upsert(&self.db, tn_id, fmt).await
+	}
+
+	async fn delete_doc_format(&self, tn_id: TnId, content_type: &str) -> ClResult<()> {
+		doc_format::delete(&self.db, tn_id, content_type).await
 	}
 
 	// Address book / contact management

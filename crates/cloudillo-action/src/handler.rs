@@ -491,6 +491,7 @@ pub async fn delete_action(
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	app.meta_adapter.delete_action(tn_id, &action_id).await?;
+	cloudillo_core::search_index_action(&app, tn_id, &action_id);
 	info!("Deleted action {}", action_id);
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
@@ -572,6 +573,7 @@ pub async fn post_action_accept(
 		..Default::default()
 	};
 	app.meta_adapter.update_action_data(tn_id, &action_id, &update_opts).await?;
+	cloudillo_core::search_index_action(&app, tn_id, &action_id);
 
 	// If action type is approvable, create APRV action to signal approval to the issuer
 	let is_approvable = dsl
@@ -696,6 +698,7 @@ pub async fn post_action_reject(
 		..Default::default()
 	};
 	app.meta_adapter.update_action_data(tn_id, &action_id, &update_opts).await?;
+	cloudillo_core::search_index_action(&app, tn_id, &action_id);
 
 	info!(
 		action_id = %action_id,
@@ -726,6 +729,7 @@ pub async fn post_action_dismiss(
 				..Default::default()
 			};
 			app.meta_adapter.update_action_data(tn_id, &action_id, &update_opts).await?;
+			cloudillo_core::search_index_action(&app, tn_id, &action_id);
 		}
 		"C" => {
 			return Err(Error::ValidationError(
@@ -833,6 +837,9 @@ pub async fn patch_action(
 	};
 
 	app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
+	if opts.affects_search_index() {
+		cloudillo_core::search_index_action(&app, tn_id, &action_id);
+	}
 
 	// Re-fetch the updated action
 	let updated = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
@@ -909,6 +916,7 @@ pub async fn publish_draft(
 			..Default::default()
 		};
 		app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
+		cloudillo_core::search_index_action(&app, tn_id, &action_id);
 
 		let publish_task =
 			task::DraftPublishTask::new(tn_id, auth.id_tag.clone(), a_id, draft_action, publish_at);
@@ -927,6 +935,7 @@ pub async fn publish_draft(
 			..Default::default()
 		};
 		app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
+		cloudillo_core::search_index_action(&app, tn_id, &action_id);
 
 		let file_deps =
 			task::collect_file_deps(&app, tn_id, draft_action.attachments.as_ref()).await?;
@@ -984,6 +993,9 @@ pub async fn cancel_scheduled(
 		..Default::default()
 	};
 	app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
+	if opts.affects_search_index() {
+		cloudillo_core::search_index_action(&app, tn_id, &action_id);
+	}
 
 	// Re-fetch the updated action
 	let updated = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;

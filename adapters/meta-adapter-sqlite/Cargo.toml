@@ -20,6 +20,10 @@ sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1.52.3", features = ["fs"] }
 
 [dev-dependencies]
+# A second, independent connection to the same `meta.db`, so the tests can look
+# at `search_fts_cl` and run FTS5 `'integrity-check'` — neither is reachable
+# through the adapter's public surface.
+sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio"] }
 tempfile = "3.27"
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
 

@@ -58,6 +58,8 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					subject_action_id,
 					e
 				);
+			} else {
+				cloudillo_core::search_index_action(&app, tn_id, subject_action_id);
 			}
 		}
 	}

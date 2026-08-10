@@ -840,6 +840,7 @@ async fn try_auto_approve(app: &App, tn_id: TnId, action: &meta_adapter::Action<
 		);
 		return;
 	}
+	cloudillo_core::search_index_action(app, tn_id, &action.action_id);
 
 	// Create APRV action to signal approval to the issuer
 	// APRV gets Follower visibility so it broadcasts to our followers

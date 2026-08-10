@@ -22,6 +22,7 @@
 //! | `"auth"` | **skipped** | account recovery — a failed-login ban must not lock a user out |
 //! | `"federation"` | enforced | server-to-server: token exchange, inbox |
 //! | `"websocket"` | enforced | `/ws/*` — see [`super::tables::websocket`] |
+//! | `"search"` | enforced | `/api/search` — a full-corpus FTS scan |
 //! | `"general"` | enforced | read-only public content and discovery |
 //! | `"general"` | **skipped** | the recovery page's ref + profile lookups |
 //!
@@ -102,6 +103,15 @@ pub(super) fn init(app: App) -> Router<App> {
 				.layer(RateLimitLayer::new(limiter.clone(), "websocket", mode)),
 		)
 		.merge(general)
+		// Anonymous full-text search. `optional_auth` gives the handler either a real
+		// `Auth` or nothing, deriving `SubjectAccessLevel::Public` for the latter —
+		// the same level `GET /api/files` gives an anonymous caller. Its own bucket,
+		// not `general`: a search is a full-corpus FTS scan plus a capped `COUNT(*)`,
+		// and an anonymous caller cannot be traced to an account.
+		.merge(
+			tables::search::search()
+				.layer(RateLimitLayer::new(limiter.clone(), "search", mode)),
+		)
 		// Ban bypassed: a failed-login auto-ban must NOT lock a user out of
 		// account recovery. The 429 rate limit still applies.
 		.merge(

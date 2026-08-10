@@ -233,27 +233,26 @@ fn push_count_from_where(
 			" LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)",
 		);
 	}
-	// `pv` (viewer↔issuer relationship) backs the follow/connect arms of the
-	// count-path visibility guard. Only needed for a concrete viewer
-	// (`Patch::Value`); the guest guard (`Patch::Null`) is Public-only.
-	if matches!(opts.visibility_guard, Patch::Value(_)) {
-		query.push(" LEFT JOIN profiles pv ON pv.tn_id=a.tn_id AND pv.id_tag=a.issuer_tag");
-	}
+	// No join for the visibility guard: `push_action_visibility_predicate`
+	// reaches the issuer's profile through an `EXISTS` subquery, so the guard
+	// costs nothing on the queries that do not use it.
 	query.push(" WHERE a.tn_id=");
 	query.push_bind(tn_id.0);
 	query
 }
 
-/// Append the query-level visibility guard for the aggregate `count()` path
-/// (H1) — the SQL equivalent of `abac::can_view_item` /
+/// Append the query-level visibility guard for the aggregate `count()` path —
+/// the SQL equivalent of `abac::can_view_item` /
 /// `SubjectAccessLevel::can_access`, so guests/non-privileged callers can't
 /// enumerate private aggregates that ABAC hides on the row-list path
-/// (`filter_actions_by_visibility`). Requires `push_count_from_where`'s joins.
+/// (`filter_actions_by_visibility`). Needs no join of its own — see
+/// [`push_action_visibility_predicate`], which carries the actual expression.
 ///
 /// - `Patch::Undefined` → no guard (tenant see-all / internal callers).
 /// - `Patch::Null` → guest: only Public ('P') rows.
 /// - `Patch::Value(v)` → viewer `v`: full OR-group (Public/Verified,
-///   follow/connect via `pv`, own-issuer, addressed audience, Subscribed 'S').
+///   follow/connect on the issuer, own-issuer, addressed audience,
+///   Subscribed 'S').
 ///
 /// Omits `subject_has_peer_relation_to_tenant`, which only *widens* audience for
 /// Direct rows the viewer is already addressed on — can under-count, never leak.
@@ -264,31 +263,65 @@ fn push_visibility_guard(
 	match &opts.visibility_guard {
 		Patch::Undefined => {}
 		Patch::Null => {
-			// Guest: no viewer id_tag, so every non-Public arm collapses away.
-			query.push(" AND (a.visibility = 'P')");
+			query.push(" AND ");
+			push_action_visibility_predicate(&mut query, "a", None);
 		}
 		Patch::Value(v) => {
-			// `connected` is stored as int 1 (mutual) or 'R' (requested, not yet
-			// mutual); test for the canonical int 1, which excludes 'R'.
-			query.push(" AND ( a.visibility = 'P' OR a.visibility = 'V'");
-			query
-				.push(" OR (a.visibility IN ('2','F') AND (pv.following = 1 OR pv.connected = 1))");
-			query.push(" OR (a.visibility = 'C' AND pv.connected = 1)");
-			query.push(" OR (a.issuer_tag = ").push_bind(v.clone()).push(")");
-			query.push(" OR (a.audience = ").push_bind(v.clone()).push(")");
-			query.push(
-				" OR (a.visibility = 'S' AND EXISTS (
-					SELECT 1 FROM actions s
-					WHERE s.tn_id = a.tn_id AND s.type = 'SUBS' AND s.status = 'A'
-						AND (s.sub_type IS NULL OR s.sub_type <> 'DEL')
-						AND s.issuer_tag = ",
-			);
-			query.push_bind(v.clone());
-			query.push(" AND s.subject = COALESCE(a.root_id, a.subject, a.action_id)))");
-			query.push(" )");
+			query.push(" AND ");
+			push_action_visibility_predicate(&mut query, "a", Some(v));
 		}
 	}
 	query
+}
+
+/// The query-level translation of `abac::can_view_item` for one action row.
+///
+/// Written against an arbitrary row alias, and with the issuer's profile reached
+/// through an `EXISTS` subquery rather than a join, so `crate::search` can apply
+/// the *same* predicate to a `search_docs` row without reproducing `list`'s FROM
+/// clause.
+///
+/// Emits a self-contained parenthesised boolean expression — no leading `AND` —
+/// so a caller can drop it anywhere an expression is legal. `viewer = None` is
+/// the guest case, where every non-Public arm collapses away.
+///
+/// `alias` is `&'static str` so the compiler enforces that it can only be a
+/// literal from this crate, never caller input — interpolating it is
+/// injection-safe; every viewer value goes through `push_bind`.
+pub(crate) fn push_action_visibility_predicate(
+	query: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+	alias: &'static str,
+	viewer: Option<&str>,
+) {
+	let Some(viewer) = viewer else {
+		query.push(format!("({alias}.visibility = 'P')"));
+		return;
+	};
+	// `connected` is stored as int 1 (mutual) or 'R' (requested, not yet
+	// mutual); test for the canonical int 1, which excludes 'R'.
+	query.push(format!(
+		"({alias}.visibility = 'P' OR {alias}.visibility = 'V' \
+		 OR ({alias}.visibility IN ('2','F') AND EXISTS (SELECT 1 FROM profiles pv \
+		      WHERE pv.tn_id = {alias}.tn_id AND pv.id_tag = {alias}.issuer_tag \
+		        AND (pv.following = 1 OR pv.connected = 1))) \
+		 OR ({alias}.visibility = 'C' AND EXISTS (SELECT 1 FROM profiles pv \
+		      WHERE pv.tn_id = {alias}.tn_id AND pv.id_tag = {alias}.issuer_tag \
+		        AND pv.connected = 1)) \
+		 OR {alias}.issuer_tag = "
+	));
+	query.push_bind(viewer.to_owned());
+	query.push(format!(" OR {alias}.audience = "));
+	query.push_bind(viewer.to_owned());
+	query.push(format!(
+		" OR ({alias}.visibility = 'S' AND EXISTS (SELECT 1 FROM actions s \
+		      WHERE s.tn_id = {alias}.tn_id AND s.type = 'SUBS' AND s.status = 'A' \
+		        AND (s.sub_type IS NULL OR s.sub_type <> 'DEL') \
+		        AND s.issuer_tag = "
+	));
+	query.push_bind(viewer.to_owned());
+	query.push(format!(
+		" AND s.subject = COALESCE({alias}.root_id, {alias}.subject, {alias}.action_id))))"
+	));
 }
 
 /// Count actions matching `opts` (same filters as `list`), with NO limit/sort/
@@ -1941,6 +1974,53 @@ mod tests {
 	use super::*;
 	use cloudillo_types::meta_adapter::ActionCountGroupBy;
 	use sqlx::sqlite;
+
+	/// The predicate is spliced into a bigger expression by both
+	/// `push_visibility_guard` and `crate::search`, so its parenthesisation has
+	/// to be self-contained: balanced, and one boolean expression rather than a
+	/// bare OR-chain that would bind loosely against a surrounding `AND`.
+	fn predicate_sql(alias: &'static str, viewer: Option<&str>) -> String {
+		let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new("");
+		push_action_visibility_predicate(&mut q, alias, viewer);
+		q.into_sql().as_str().to_owned()
+	}
+
+	fn is_balanced(sql: &str) -> bool {
+		let mut depth = 0i32;
+		for c in sql.chars() {
+			match c {
+				'(' => depth += 1,
+				')' => depth -= 1,
+				_ => {}
+			}
+			if depth < 0 {
+				return false;
+			}
+		}
+		depth == 0
+	}
+
+	#[test]
+	fn the_visibility_predicate_is_one_balanced_expression() {
+		for viewer in [None, Some("bob.example")] {
+			let sql = predicate_sql("a", viewer);
+			assert!(sql.starts_with('('), "must open its own group: {sql}");
+			assert!(sql.ends_with(')'), "must close its own group: {sql}");
+			assert!(is_balanced(&sql), "unbalanced parentheses: {sql}");
+		}
+	}
+
+	#[test]
+	fn the_predicate_follows_its_alias_and_binds_the_viewer() {
+		let sql = predicate_sql("d", Some("bob.example"));
+		assert!(sql.contains("d.issuer_tag"), "{sql}");
+		assert!(!sql.contains("a.issuer_tag"), "the alias must not be hard-coded: {sql}");
+		// The subquery on `profiles` is the issuer relationship — keyed on the
+		// row's issuer, never on the tenant.
+		assert!(sql.contains("pv.id_tag = d.issuer_tag"), "{sql}");
+		// Viewer values are bound, never interpolated.
+		assert!(!sql.contains("bob.example"), "{sql}");
+	}
 
 	// Single-connection write pool over a temp DB file, mirroring
 	// `MetaAdapterSqlite::new` (WAL, one write connection). Same pattern as the

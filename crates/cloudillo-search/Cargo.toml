@@ -1,0 +1,30 @@
+[package]
+name = "cloudillo-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Full-text search index and query API for the Cloudillo platform"
+keywords = ["cloudillo", "search", "full-text", "fts", "api"]
+categories = ["web-programming"]
+readme = "../../README.md"
+
+[dependencies]
+cloudillo-core = { workspace = true }
+cloudillo-types = { workspace = true }
+
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http2", "macros"] }
+jsonpath-rust = "1.0"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+# Read-only: CRDT documents are materialised for indexing, never written here.
+yrs = "0.27"
+
+[lints]
+workspace = true

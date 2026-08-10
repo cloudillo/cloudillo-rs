@@ -304,6 +304,12 @@ pub struct ListProfileOptions {
 	/// Filter by home-feed composition flag. Some(true) → only communities hidden
 	/// from the home feed (hidden_in_home = 1); Some(false) → only shown; None → no filter.
 	pub hidden_in_home: Option<bool>,
+	/// Page size. Setting this (or [`Self::after_id_tag`]) switches the listing
+	/// from its default name-ordered top-100 to an `id_tag`-ordered keyset page,
+	/// making a full walk of a tenant's profiles possible.
+	pub limit: Option<u32>,
+	/// Keyset cursor: return only profiles whose `id_tag` sorts after this one.
+	pub after_id_tag: Option<String>,
 }
 
 /// Profile data returned from adapter queries
@@ -409,6 +415,14 @@ pub struct UpsertProfileFields {
 }
 
 impl UpsertProfileFields {
+	/// Whether this upsert touches a column the full-text index reads, and so
+	/// needs a `search_index_profile` call afterwards. Only `name` qualifies, so
+	/// relationship-only upserts (a CONN accept, an FLLW, a sync watermark) —
+	/// which dominate the call sites — cost nothing.
+	pub fn affects_search_index(&self) -> bool {
+		!matches!(self.name, Patch::Undefined)
+	}
+
 	/// Build an `UpsertProfileFields` from an existing `UpdateProfileData`.
 	///
 	/// `typ` is left `Undefined` — callers that know the profile type should
@@ -484,6 +498,19 @@ pub struct UpdateActionDataOptions {
 	/// status, leave this `Patch::Undefined` — overwriting `created_at` on a
 	/// finalized (`A`) action would corrupt the timeline.
 	pub created_at: Patch<Timestamp>,
+}
+
+impl UpdateActionDataOptions {
+	/// Whether this patch touches a column the full-text index reads, and so
+	/// needs a `search_index_action` call afterwards. The hottest writes on this
+	/// table — `reactions`, `comments`, `reposts`, `stat_at` bumps from
+	/// REACT/CMNT/STAT hooks — set none of these and cost nothing.
+	pub fn affects_search_index(&self) -> bool {
+		!matches!(
+			(&self.content, &self.status, &self.visibility, &self.sub_typ),
+			(Patch::Undefined, Patch::Undefined, Patch::Undefined, Patch::Undefined)
+		)
+	}
 }
 
 /// Options for finalizing an action (resolved fields from ActionCreatorTask)
@@ -770,6 +797,15 @@ pub struct FileView {
 	pub root_id: Option<Box<str>>, // Document tree root file_id (None = standalone)
 	#[serde(default)]
 	pub owner: Option<ProfileInfo>,
+	/// Raw `files.owner_tag` column — `None` for a locally-owned file.
+	///
+	/// Not part of the API surface: `owner` above carries the resolved owner,
+	/// falling back to the tenant's own profile when this column is NULL.
+	/// Consumers that must agree with the stored column rather than the resolved
+	/// profile — the search indexer, which denormalises it into
+	/// `search_docs.owner_tag` — need the raw value.
+	#[serde(skip)]
+	pub owner_tag: Option<Box<str>>,
 	#[serde(default)]
 	pub creator: Option<ProfileInfo>,
 	#[serde(default)]
@@ -991,6 +1027,18 @@ pub struct ListFileOptions {
 	/// Set by handler based on subject's access level via `SubjectAccessLevel::visible_levels()`.
 	#[serde(skip)]
 	pub visible_levels: Option<Vec<char>>,
+	/// Include files that belong to a document tree (`root_id IS NOT NULL`) as
+	/// well as standalone ones. Server-only: set by maintenance sweeps, never by
+	/// a request. The default listing hides tree children because a file browser
+	/// shows containers, not their parts.
+	#[serde(skip)]
+	pub include_tree_children: bool,
+	/// Drop the browse-listing exclusions: trashed, managed, hidden and
+	/// soft-deleted (`status = 'D'`) files are all returned. Server-only: set by
+	/// maintenance sweeps that must see every row in order to *remove* stale
+	/// derived state.
+	#[serde(skip)]
+	pub sweep_all: bool,
 	/// When true, populate `FileView.parent_name` with the immediate parent
 	/// folder's name (one level). Resolved via a shared LRU cache; on cache
 	/// misses, one SQL round-trip per distinct missing parent on the page.
@@ -1065,6 +1113,39 @@ pub struct UpdateFileOptions {
 	/// touches neither.
 	#[serde(default, skip_deserializing)]
 	pub broken: Patch<BrokenReason>,
+}
+
+impl UpdateFileOptions {
+	/// Whether this patch touches a column the full-text index reads, and so
+	/// needs a `search_index_file` call afterwards.
+	///
+	/// `parent_id` and `hidden` are here not as indexed text but because they
+	/// decide whether the file has an index row at all: moving into
+	/// [`TRASH_PARENT_ID`] or hiding it must drop it from `search_docs`
+	/// (`objects::is_indexable` gates on `!file.hidden`). `file_tp`, `preset`, `x`
+	/// and `broken` are deliberately absent: none of them reaches `search_docs`.
+	pub fn affects_search_index(&self) -> bool {
+		!matches!(
+			(
+				&self.file_name,
+				&self.visibility,
+				&self.status,
+				&self.content_type,
+				&self.tags,
+				&self.parent_id,
+				&self.hidden,
+			),
+			(
+				Patch::Undefined,
+				Patch::Undefined,
+				Patch::Undefined,
+				Patch::Undefined,
+				Patch::Undefined,
+				Patch::Undefined,
+				Patch::Undefined
+			)
+		)
+	}
 }
 
 /// What [`MetaAdapter::delete_file`] removed.
@@ -1225,6 +1306,214 @@ pub struct InstalledApp {
 	pub auto_update: bool,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub installed_at: Timestamp,
+}
+
+// Full-text search
+//******************
+
+/// One indexable unit of an object.
+///
+/// A whole object (a file, an action, a profile) has a single part with
+/// `part_id = ""`. A deep-indexed document emits one part per sub-unit, where
+/// `part_id` is the app's deep-link key (e.g. a notillo page id).
+#[derive(Debug, Default)]
+pub struct SearchPart<'a> {
+	/// Deep-link key; `""` for whole-object rows.
+	pub part_id: &'a str,
+	/// Rule kind that produced this part (the RTDB collection name).
+	pub part_kind: Option<&'a str>,
+	/// Parent part id, for tree display of results.
+	pub parent_part: Option<&'a str>,
+	/// Finest-grained anchor inside the part (e.g. a notillo block id).
+	pub anchor_id: Option<&'a str>,
+	pub title: Option<&'a str>,
+	pub body: Option<&'a str>,
+	/// Space-separated tag list.
+	pub tags: Option<&'a str>,
+}
+
+/// The object a set of [`SearchPart`]s belongs to. The ACL columns are
+/// denormalised mirrors of the source row so the search query can pre-filter
+/// in SQL.
+#[derive(Debug, Default)]
+pub struct SearchObject<'a> {
+	/// `'F'` file, `'D'` deep document part, `'A'` action, `'P'` profile.
+	pub obj_tp: char,
+	/// file_id / action_id / id_tag; for `'D'` the container file_id.
+	pub obj_id: &'a str,
+	pub content_type: Option<&'a str>,
+	pub owner_tag: Option<&'a str>,
+	/// None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
+	pub visibility: Option<char>,
+	pub root_id: Option<&'a str>,
+	pub created_at: Option<Timestamp>,
+	/// Which of the two FTS indexes these rows belong to. `false` (the default)
+	/// keeps the plain-text extract alongside an external-content index; `true`
+	/// stores no text at all and indexes the body into a contentless one —
+	/// matching and ranking unchanged, but no result snippets.
+	///
+	/// Decided per tenant from `search.store_text`, not per write: flipping it
+	/// moves an object's rows between two physically separate indexes, so it only
+	/// takes effect through a full reindex.
+	pub fts_cl: bool,
+}
+
+/// Bounds a [`SearchOptions`] is clamped to at both ends — the handler clamps what
+/// a caller asked for, the adapter re-clamps what it was handed — so a programmatic
+/// caller cannot widen them either. Deep offsets in a relevance-ordered FTS scan get
+/// expensive fast.
+pub const SEARCH_MAX_LIMIT: u32 = 100;
+pub const SEARCH_MAX_OFFSET: u32 = 1000;
+
+/// Bounds on the two list-valued filters, clamped at both ends the same way:
+/// ~33k `contentType` values overrun SQLite's 32766 bound-variable limit into a
+/// 500, and a long `tags` list builds an arbitrarily deep FTS5 `MATCH` expression.
+pub const SEARCH_MAX_TAGS: usize = 16;
+pub const SEARCH_MAX_CONTENT_TYPES: usize = 16;
+
+/// Search query options. The fields below the marker are server-derived and are
+/// never deserialized from the wire.
+#[derive(Debug, Default)]
+pub struct SearchOptions {
+	/// Raw user query text — the adapter sanitizes it into FTS5 syntax.
+	pub q: String,
+	pub obj_tp: Option<Vec<char>>,
+	/// Restrict to one container document (its own row plus its parts).
+	pub file_id: Option<String>,
+	pub content_type: Option<Vec<String>>,
+	/// AND-combined tag filter, applied inside the FTS match rather than after
+	/// it — filtering the top-`limit` rows afterwards would silently drop a
+	/// document that matches both the text and the tag but ranks below the cut.
+	pub tags: Option<Vec<String>>,
+	pub limit: u32,
+	pub offset: u32,
+
+	// --- server-only ---
+	/// Visibility levels the caller may see. `None` means "everything",
+	/// including Direct (tenant owner).
+	pub visible_levels: Option<Vec<char>>,
+	pub viewer_id_tag: Option<String>,
+	/// File-scoped token: only this file and its document tree are visible.
+	pub scope_file_id: Option<String>,
+	/// File id a delegated (share-link / app) token was scoped to. Its own row and
+	/// the deep `'D'` parts of its document tree bypass the visibility filter —
+	/// the share itself is the grant. Child `'F'` rows in the same tree stay
+	/// visibility-filtered, matching `GET /api/files`' document-scope branch.
+	pub scope_grant_file_id: Option<Box<str>>,
+	/// Query the contentless index instead of the external-content one. Must
+	/// match the tenant's `search.store_text` setting, since a tenant's rows live
+	/// in exactly one of the two. Hits from the contentless index carry no
+	/// `snippet`.
+	pub fts_cl: bool,
+}
+
+/// A highlighted range inside a snippet.
+///
+/// **Offsets are UTF-16 code units**, counted from the start of the snippet —
+/// the client's unit, not Rust's: the frontend slices with
+/// `String.prototype.slice`, so byte offsets or code-point counts would misplace
+/// every highlight in a snippet containing an astral-plane character, and only
+/// there. See `Highlight` in `libs/react/src/components/Highlight/Highlight.tsx`.
+///
+/// Ranges are ascending, non-overlapping, and half-open (`start..end`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SearchMatch {
+	pub start: u32,
+	pub end: u32,
+}
+
+/// A single search index row plus its FTS ranking data.
+#[derive(Debug)]
+pub struct SearchRow {
+	pub s_id: i64,
+	pub obj_tp: char,
+	pub obj_id: Box<str>,
+	pub part_id: Box<str>,
+	pub part_kind: Option<Box<str>>,
+	pub parent_part: Option<Box<str>>,
+	pub anchor_id: Option<Box<str>>,
+	pub title: Option<Box<str>>,
+	pub tags: Option<Box<str>>,
+	pub content_type: Option<Box<str>>,
+	pub owner_tag: Option<Box<str>>,
+	pub visibility: Option<char>,
+	pub root_id: Option<Box<str>>,
+	pub updated_at: Timestamp,
+	/// Server-built excerpt as **plain text** — no markup of any kind.
+	///
+	/// The text is document content, so any in-band delimiter is ambiguous with a
+	/// document containing that delimiter literally — an `<mark>` scheme deletes
+	/// the literal string from the excerpt and lets it widen the highlight over
+	/// unmatched text. `snippet_matches` carries the highlight out of band
+	/// instead, which no document content can forge.
+	///
+	/// An adapter implementing this trait **must** honour that: the value is
+	/// handed to the client unmodified.
+	pub snippet: Option<Box<str>>,
+	/// Ranges within `snippet` to emphasise, ascending and non-overlapping.
+	/// `None` when there is no snippet or nothing matched inside it.
+	pub snippet_matches: Option<Box<[SearchMatch]>>,
+	/// Raw `bm25()` value: negative, more negative = more relevant.
+	pub score: f64,
+}
+
+/// What [`MetaAdapter::reclaim_space`] found, and whether it acted on it.
+///
+/// `page_size * page_count` is the file's size in bytes and
+/// `page_size * freelist_count` the dead space inside it, both measured *after*
+/// the rewrite when `vacuumed` is true and before it otherwise: the report is
+/// quoted by the log line and the admin notification, so it describes the
+/// database as it stands when the call returns. An all-zero report with
+/// `vacuumed: false` is the trait default, meaning the adapter does not reclaim
+/// space at all.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpaceReport {
+	pub page_size: i64,
+	pub page_count: i64,
+	pub freelist_count: i64,
+	/// Whether the free-page ratio cleared the caller's threshold and a full
+	/// rewrite actually ran.
+	pub vacuumed: bool,
+}
+
+/// Document format manifest — how an app declares what it indexes.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocFormat {
+	pub content_type: Box<str>,
+	pub publisher_tag: Box<str>,
+	pub app_name: Box<str>,
+	/// Encoded document format version, `MMMmmmppp` (three decimal digits per
+	/// component of `major.minor.patch`). `None` on rows written before the
+	/// integer encoding existed, which the handler reads as "no ordering known".
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub format_version: Option<i64>,
+	/// `'RTDB'` | `'CRDT'` | `'BLOB'`
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub store_tp: Option<Box<str>>,
+	/// Deep-link query param name, e.g. `"nav"`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub nav_param: Option<Box<str>>,
+	/// The FTS index manifest.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub search: Option<serde_json::Value>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub x: Option<serde_json::Value>,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub updated_at: Timestamp,
+}
+
+/// Writable subset of [`DocFormat`].
+#[derive(Debug)]
+pub struct UpsertDocFormat<'a> {
+	pub content_type: &'a str,
+	pub publisher_tag: &'a str,
+	pub app_name: &'a str,
+	pub format_version: Option<i64>,
+	pub store_tp: Option<&'a str>,
+	pub nav_param: Option<&'a str>,
+	pub search: Option<&'a serde_json::Value>,
+	pub x: Option<&'a serde_json::Value>,
 }
 
 // Contacts / Address Books (CardDAV + JSON REST)
@@ -1758,7 +2047,11 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Hard-delete a file: removes all `file_variants` rows and then the
 	/// `files` row inside a single transaction. Intended for the file GC.
-	async fn hard_delete_file(&self, tn_id: TnId, f_id: u64) -> ClResult<()>;
+	///
+	/// Returns the deleted row's `file_id`, which the caller needs to drop the
+	/// search index entry: an `f_id` alone cannot be mapped back to one once the
+	/// row is gone. `None` for an unfinalized upload, which never had one.
+	async fn hard_delete_file(&self, tn_id: TnId, f_id: u64) -> ClResult<Option<Box<str>>>;
 
 	// Task scheduler
 	//****************
@@ -2089,6 +2382,133 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		publisher_tag: &str,
 	) -> ClResult<Option<InstalledApp>>;
 
+	// Full-text search
+	//******************
+
+	/// Replace every index row of one object atomically: delete the existing
+	/// `(obj_tp, obj_id)` rows, then insert `parts`. An empty `parts` slice is
+	/// equivalent to [`MetaAdapter::delete_search_object`].
+	async fn replace_search_object(
+		&self,
+		tn_id: TnId,
+		obj: &SearchObject<'_>,
+		parts: &[SearchPart<'_>],
+	) -> ClResult<()>;
+
+	/// Replace the single whole-object index row for `(obj_tp, obj_id)`.
+	///
+	/// `obj_tp` selects the source table — `'F'` files, `'P'` profiles, `'A'`
+	/// actions — and the adapter derives `content_type`, `owner_tag`,
+	/// `visibility`, `root_id`, `created_at` and `part_kind` from that row, so the
+	/// index and its source can never disagree about who may see it. Only `title`,
+	/// `body` and `tags` come from the caller; `part_id`, `parent_part` and
+	/// `anchor_id` have no place in a whole-object row and may be rejected rather
+	/// than dropped silently.
+	///
+	/// `part = None` deletes the row, and so does a `Some` whose source row has
+	/// meanwhile vanished. For `'F'` the call also refreshes the ACL columns of
+	/// the file's deep `'D'` rows, and drops them when the file is gone.
+	///
+	/// `fts_cl` selects the index route as [`SearchObject::fts_cl`] does; flipping
+	/// it for an existing object only takes effect through a full reindex.
+	async fn replace_search_row(
+		&self,
+		tn_id: TnId,
+		obj_tp: char,
+		obj_id: &str,
+		part: Option<&SearchPart<'_>>,
+		fts_cl: bool,
+	) -> ClResult<()>;
+
+	/// Remove every index row of one object.
+	async fn delete_search_object(&self, tn_id: TnId, obj_tp: char, obj_id: &str) -> ClResult<()>;
+
+	/// Drop the **deep** `'D'` index rows of one content type — used when a
+	/// format manifest's index rules change and the parts they produced must be
+	/// rebuilt.
+	///
+	/// The whole-object `'F'` rows are server-owned — a file name and a tag list —
+	/// and outlive any manifest, so they are left in place: dropping them would
+	/// make every such file unfindable by name until the next weekly sweep.
+	async fn delete_deep_search_by_content_type(
+		&self,
+		tn_id: TnId,
+		content_type: &str,
+	) -> ClResult<()>;
+
+	/// Delete the whole-object index rows of one tenant whose source row is gone.
+	///
+	/// Not a rebuild: what an object contributes is decided in Rust and written
+	/// through [`MetaAdapter::replace_search_row`], so all SQL can catch is a
+	/// source row hard-deleted without its index row going with it. Deep `'D'`
+	/// rows are not touched.
+	async fn reap_search_orphans(&self, tn_id: TnId) -> ClResult<()>;
+
+	/// Merge the search indexes' segments. `full` runs the exhaustive pass, worth
+	/// its cost only after a bulk rebuild. Defaults to a no-op: an adapter whose
+	/// index needs no compaction — or has none — implements nothing.
+	///
+	/// Both indexes are database-wide, not per tenant, so this takes no `TnId`
+	/// and must be called once per sweep rather than once per tenant.
+	async fn optimize_search_index(&self, full: bool) -> ClResult<()> {
+		let _ = full;
+		Ok(())
+	}
+
+	/// Checkpoint, analyse, and — only if at least `min_free_pct` percent of
+	/// pages are free — rewrite the database to give the space back to the
+	/// filesystem.
+	///
+	/// The gate exists because the rewrite holds the single write connection for
+	/// its whole duration. Defaults to reclaiming nothing and reporting an
+	/// all-zero [`SpaceReport`].
+	async fn reclaim_space(&self, min_free_pct: i64) -> ClResult<SpaceReport> {
+		let _ = min_free_pct;
+		Ok(SpaceReport::default())
+	}
+
+	/// Run a full-text query. Results are relevance-ordered, so pagination is
+	/// `limit`/`offset` rather than the keyset cursor used elsewhere.
+	async fn search(&self, tn_id: TnId, opts: &SearchOptions) -> ClResult<Vec<SearchRow>>;
+
+	/// How many rows [`MetaAdapter::search`] would match for the same `opts`,
+	/// ignoring `limit` and `offset` — a relevance ordering gives pagination no
+	/// other has-more signal to anchor on.
+	///
+	/// Counted with the same SQL filters as `search`, and therefore *before* the
+	/// handler's ABAC post-filter: for a scoped token it is an upper bound.
+	async fn count_search(&self, tn_id: TnId, opts: &SearchOptions) -> ClResult<i64>;
+
+	// Per-tenant subsystem state
+	//****************************
+
+	/// Read one opaque per-tenant value written by a subsystem.
+	///
+	/// Distinct from `read_setting`: a setting is user-facing, registered,
+	/// validated and shown in the admin UI; this is a subsystem's own bookkeeping
+	/// (a watermark, a schema revision) that no operator should see or change.
+	async fn read_tenant_data(&self, tn_id: TnId, name: &str) -> ClResult<Option<Box<str>>>;
+
+	/// Write, or with `value = None` delete, one such value.
+	async fn write_tenant_data(&self, tn_id: TnId, name: &str, value: Option<&str>)
+	-> ClResult<()>;
+
+	// Document format manifests
+	//**************************
+
+	/// Read the manifest claiming `content_type`, if any.
+	async fn read_doc_format(&self, tn_id: TnId, content_type: &str)
+	-> ClResult<Option<DocFormat>>;
+
+	/// List every active manifest of this tenant.
+	async fn list_doc_formats(&self, tn_id: TnId) -> ClResult<Vec<DocFormat>>;
+
+	/// Create or update a manifest. Callers must enforce the claim rule first.
+	async fn upsert_doc_format(&self, tn_id: TnId, fmt: &UpsertDocFormat<'_>) -> ClResult<()>;
+
+	/// Remove a manifest.
+	async fn delete_doc_format(&self, tn_id: TnId, content_type: &str) -> ClResult<()>;
+
 	// Address book / contact management
 	//***********************************
 
@@ -2321,6 +2741,16 @@ pub trait MetaAdapter: Debug + Send + Sync {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_affects_search_index_hidden() {
+		let opts = UpdateFileOptions { hidden: Patch::Value(true), ..Default::default() };
+		assert!(opts.affects_search_index());
+
+		let opts = UpdateFileOptions::default();
+		assert!(!opts.affects_search_index());
+	}
+
 	#[test]
 	fn test_deserialize_list_action_options_with_multiple_statuses() {
 		let query = "status=C,N&type=POST,REPLY";

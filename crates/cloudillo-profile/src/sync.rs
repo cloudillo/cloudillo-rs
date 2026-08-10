@@ -92,6 +92,9 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 			};
 
 			let upsert_result = app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
+			if fields.affects_search_index() {
+				cloudillo_core::search_index_profile(app, tn_id, id_tag);
+			}
 			let created = matches!(upsert_result, UpsertResult::Created);
 			if created {
 				tracing::info!("Successfully synced profile {} from remote", id_tag);
@@ -174,6 +177,9 @@ pub async fn refresh_profile(
 			};
 
 			app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
+			if fields.affects_search_index() {
+				cloudillo_core::search_index_profile(app, tn_id, id_tag);
+			}
 
 			// Preserve "broken picture" recovery: an unchanged profile returns
 			// 304, so the picture won't be re-examined here. If we hold a stored
@@ -236,6 +242,9 @@ pub async fn refresh_profile(
 			}
 
 			app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
+			if fields.affects_search_index() {
+				cloudillo_core::search_index_profile(app, tn_id, id_tag);
+			}
 
 			// Fetch the picture inline when the remote still has one and either
 			// the file_id changed or the local `vis.pf` variant is missing; on

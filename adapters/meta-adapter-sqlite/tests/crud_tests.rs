@@ -112,6 +112,8 @@ async fn test_list_profiles() {
 		id_tag: None,
 		trust_set: None,
 		hidden_in_home: None,
+		limit: None,
+		after_id_tag: None,
 	};
 	let result = adapter.list_profiles(tn_id, &opts).await;
 
@@ -628,4 +630,78 @@ async fn test_read_nonexistent_tenant() {
 
 	// Should error since tenant doesn't exist
 	assert!(result.is_err(), "Nonexistent tenant should error");
+}
+
+#[tokio::test]
+async fn doc_format_claim_round_trips_and_deletes() {
+	use cloudillo_types::meta_adapter::UpsertDocFormat;
+
+	let (adapter, _dir) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	let rules = serde_json::json!({ "v": 1, "parts": [{ "kind": "p", "title": ["ti"] }] });
+
+	adapter
+		.upsert_doc_format(
+			tn_id,
+			&UpsertDocFormat {
+				content_type: "cloudillo/notillo",
+				publisher_tag: "cloudillo.org",
+				app_name: "notillo",
+				format_version: Some(1_000_000),
+				store_tp: Some("RTDB"),
+				nav_param: Some("nav"),
+				search: Some(&rules),
+				x: None,
+			},
+		)
+		.await
+		.expect("upsert");
+
+	let fmt = adapter
+		.read_doc_format(tn_id, "cloudillo/notillo")
+		.await
+		.expect("read")
+		.expect("present");
+	assert_eq!(&*fmt.app_name, "notillo");
+	assert_eq!(fmt.nav_param.as_deref(), Some("nav"));
+	assert_eq!(fmt.search.as_ref(), Some(&rules));
+	// The column must be INTEGER-declared: a TEXT affinity coerces the bound i64 back
+	// to a string, and `map_row`'s panicking accessor then dies on the next read.
+	assert_eq!(fmt.format_version, Some(1_000_000));
+
+	assert_eq!(adapter.list_doc_formats(tn_id).await.expect("list").len(), 1);
+
+	// A bump must reach the row through `DO UPDATE SET format_version = excluded...`.
+	adapter
+		.upsert_doc_format(
+			tn_id,
+			&UpsertDocFormat {
+				content_type: "cloudillo/notillo",
+				publisher_tag: "cloudillo.org",
+				app_name: "notillo",
+				format_version: Some(1_001_000),
+				store_tp: Some("RTDB"),
+				nav_param: Some("nav"),
+				search: Some(&rules),
+				x: None,
+			},
+		)
+		.await
+		.expect("upsert bump");
+
+	let fmt = adapter
+		.read_doc_format(tn_id, "cloudillo/notillo")
+		.await
+		.expect("read")
+		.expect("present");
+	assert_eq!(fmt.format_version, Some(1_001_000));
+
+	adapter.delete_doc_format(tn_id, "cloudillo/notillo").await.expect("delete");
+	assert!(
+		adapter
+			.read_doc_format(tn_id, "cloudillo/notillo")
+			.await
+			.expect("read")
+			.is_none()
+	);
 }

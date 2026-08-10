@@ -180,6 +180,9 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			return Ok(HookResult::default());
 		}
 	};
+	// No `search_index_action` despite the `content` change: STAT has no `search`
+	// block, so indexing would resolve to "no rules" and write nothing — and STAT is
+	// by far the highest-volume writer on the `actions` table.
 	let update_opts =
 		UpdateActionDataOptions { content: Patch::Value(new_content_str), ..Default::default() };
 	if let Err(e) = app

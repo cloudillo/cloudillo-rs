@@ -193,7 +193,10 @@ async fn ensure_store_file(
 	};
 
 	match app.meta_adapter.create_file(tn_id, create_opts).await {
-		Ok(_) => Ok(()),
+		Ok(_) => {
+			cloudillo_core::search_index_file(app, tn_id, store_file_id);
+			Ok(())
+		}
 		Err(_) => {
 			// Race condition: another connection may have created it concurrently
 			match app.meta_adapter.read_file(tn_id, store_file_id).await {
@@ -244,7 +247,10 @@ async fn ensure_meta_file(
 	};
 
 	match app.meta_adapter.create_file(tn_id, create_opts).await {
-		Ok(_) => Ok(()),
+		Ok(_) => {
+			cloudillo_core::search_index_file(app, tn_id, meta_file_id);
+			Ok(())
+		}
 		Err(_) => {
 			// Race condition: another connection may have created it concurrently
 			match app.meta_adapter.read_file(tn_id, meta_file_id).await {

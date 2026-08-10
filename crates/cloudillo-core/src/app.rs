@@ -10,6 +10,7 @@ use std::{
 	sync::{Arc, RwLock},
 };
 
+use crate::bundled_apps::BundledAppRegistry;
 use crate::extensions::Extensions;
 use crate::prelude::*;
 use crate::profile_me_cache::ProfileMeCache;
@@ -48,6 +49,10 @@ pub struct AppState {
 	pub opts: AppBuilderOpts,
 	pub broadcast: BroadcastManager,
 	pub permission_checker: Arc<tokio::sync::RwLock<abac::PermissionChecker>>,
+	/// Doc formats this build ships, loaded once from `opts.dist_dir`. The global tier
+	/// under every tenant's own rows — resolve through [`crate::doc_format::resolve`]
+	/// rather than reading it directly.
+	pub bundled_apps: Arc<BundledAppRegistry>,
 
 	pub auth_adapter: Arc<dyn AuthAdapter>,
 	pub meta_adapter: Arc<dyn MetaAdapter>,

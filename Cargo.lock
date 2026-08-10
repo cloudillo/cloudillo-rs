@@ -668,6 +668,7 @@ dependencies = [
  "cloudillo-push",
  "cloudillo-ref",
  "cloudillo-rtdb",
+ "cloudillo-search",
  "cloudillo-types",
  "futures",
  "hyper",
@@ -846,6 +847,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1067,6 +1069,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "cloudillo-types",
+ "futures",
  "futures-core",
  "redb",
  "serde",
@@ -1074,6 +1077,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "cloudillo-search"
+version = "0.8.17"
+dependencies = [
+ "async-trait",
+ "axum",
+ "cloudillo-core",
+ "cloudillo-types",
+ "jsonpath-rust",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "yrs",
 ]
 
 [[package]]
@@ -3018,6 +3038,19 @@ checksum = "464a3709c7f55f1f721e5389aa6ea4e3bc6aba669353300af094b29ffbdde1d8"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonpath-rust"
+version = "1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e07021eefc09f897611b067ba7897b5e9266edfc902768418968772e5bb06a7"
+dependencies = [
+ "pest",
+ "pest_derive",
+ "regex",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

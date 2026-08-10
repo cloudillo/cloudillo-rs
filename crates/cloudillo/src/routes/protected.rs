@@ -58,6 +58,7 @@ pub(super) fn init(app: App) -> Router<App> {
 				.merge(tables::pim::contacts())
 				.merge(tables::pim::calendars())
 				.merge(tables::misc::push_subscriptions())
+				.merge(tables::search::reindex())
 				.layer(middleware::from_fn(require_leader)),
 		)
 		// Auth only — handler self-enforces ownership
@@ -115,6 +116,12 @@ pub(super) fn init(app: App) -> Router<App> {
 		.merge(tables::file::shares())
 		// Auth only — handler self-enforces ownership
 		.merge(tables::file::tags())
+		// Auth only — handler self-enforces ownership. `tables::search::search()`
+		// accepts guests and lives in `routes/public.rs`; a file-scoped token may
+		// reach `/api/search` (see `scope::scope_permits`) but never
+		// `/api/doc-formats`, and `tables::search::reindex()` is narrower still,
+		// in the `require_leader` group above.
+		.merge(tables::search::doc_formats())
 		// Auth only — handler self-enforces ownership
 		.merge(tables::idp::management())
 		.merge(tables::idp::api_keys())

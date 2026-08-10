@@ -44,6 +44,7 @@ async fn retire_subject_invitations(app: &App, tn_id: TnId, subject_id: &str, in
 		if let Err(e) = app.meta_adapter.update_action_data(tn_id, &invt.action_id, &opts).await {
 			tracing::warn!("SUBS: Failed to retire invitation {}: {}", invt.action_id, e);
 		} else {
+			cloudillo_core::search_index_action(app, tn_id, &invt.action_id);
 			tracing::info!("SUBS: Retired invitation {} for {}", invt.action_id, invitee);
 		}
 	}

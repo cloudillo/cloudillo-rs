@@ -51,6 +51,9 @@ pub async fn patch_file(
 ) -> ClResult<Json<PatchFileResponse>> {
 	app.meta_adapter.update_file_data(auth.tn_id, &file_id, &opts).await?;
 	invalidate_dir_cache(&app, auth.tn_id, &file_id);
+	if opts.affects_search_index() {
+		cloudillo_core::search_index_file(&app, auth.tn_id, &file_id);
+	}
 
 	info!("User {} patched file {}", auth.id_tag, file_id);
 
@@ -100,8 +103,10 @@ pub async fn delete_file(
 		// stale link or `'A'` grant still pointing at it. Soft delete deliberately keeps both, so
 		// restoring from trash keeps links and grants working.
 		let purged = app.meta_adapter.delete_file(auth.tn_id, &file_id).await?;
+		// Every id in the subtree, root first: one index call per removed row.
 		for id in &purged.file_ids {
 			invalidate_dir_cache(&app, auth.tn_id, id);
+			cloudillo_core::search_index_file(&app, auth.tn_id, id);
 		}
 		info!(
 			"User {} permanently deleted file {} ({} rows, {} share links, {} share entries)",
@@ -128,6 +133,9 @@ pub async fn delete_file(
 			)
 			.await?;
 		invalidate_dir_cache(&app, auth.tn_id, &file_id);
+		// Trashing must take the file and its deep document parts out of the index
+		// here — nothing else would, since the sweep never pages the trash.
+		cloudillo_core::search_index_file(&app, auth.tn_id, &file_id);
 
 		info!("User {} moved file {} to trash", auth.id_tag, file_id);
 
@@ -183,6 +191,11 @@ pub async fn restore_file(
 		)
 		.await?;
 	invalidate_dir_cache(&app, auth.tn_id, &file_id);
+	// Both halves of what trashing removed: the file's own row and its deep document
+	// parts. The document hook is a no-op for a file with no document store behind
+	// it, so it needs no `file_tp` check.
+	cloudillo_core::search_index_file(&app, auth.tn_id, &file_id);
+	cloudillo_core::search_index_document(&app, auth.tn_id, &file_id);
 
 	info!("User {} restored file {} to {:?}", auth.id_tag, file_id, target_parent_id);
 
@@ -228,6 +241,7 @@ pub async fn empty_trash(
 		let purged = app.meta_adapter.delete_file(auth.tn_id, &file.file_id).await?;
 		for id in &purged.file_ids {
 			invalidate_dir_cache(&app, auth.tn_id, id);
+			cloudillo_core::search_index_file(&app, auth.tn_id, id);
 			purged_ids.insert(id.clone());
 		}
 		files_deleted += purged.files_deleted;
@@ -459,6 +473,7 @@ pub async fn duplicate_file(
 		.await?;
 
 	info!("User {} duplicated file {} -> {}", auth.id_tag, file_id, new_file_id);
+	cloudillo_core::search_index_file(&app, tn_id, &new_file_id);
 
 	let data = json!({"fileId": new_file_id});
 	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
@@ -506,6 +521,7 @@ pub async fn upgrade_file_visibility(
 				},
 			)
 			.await?;
+		cloudillo_core::search_index_file(app, tn_id, file_id);
 
 		Ok(true)
 	} else {

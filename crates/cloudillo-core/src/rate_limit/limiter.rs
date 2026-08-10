@@ -168,6 +168,7 @@ impl RateLimitManager {
 		categories.insert("dav".to_string(), CategoryLimiters::new(&config.dav));
 		categories.insert("federation".to_string(), CategoryLimiters::new(&config.federation));
 		categories.insert("general".to_string(), CategoryLimiters::new(&config.general));
+		categories.insert("search".to_string(), CategoryLimiters::new(&config.search));
 		categories.insert("websocket".to_string(), CategoryLimiters::new(&config.websocket));
 
 		let ban_cap = NonZeroUsize::new(config.max_tracked_ips / 10).unwrap_or(Self::TEN_THOUSAND);
@@ -454,6 +455,9 @@ mod tests {
 		assert!(manager.categories.contains_key("auth"));
 		assert!(manager.categories.contains_key("federation"));
 		assert!(manager.categories.contains_key("general"));
+		// A `RateLimitLayer` naming a missing bucket 500s every request; `/api/search`
+		// names this one.
+		assert!(manager.categories.contains_key("search"));
 		assert!(manager.categories.contains_key("websocket"));
 	}
 

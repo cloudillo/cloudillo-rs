@@ -43,6 +43,14 @@ pub struct ActionDefinition {
 
 	/// Permission rules
 	pub permissions: Option<PermissionRules>,
+
+	/// Search index manifest. Absent means the type is not indexed; that absence is
+	/// the only allowlist there is.
+	///
+	/// Opaque JSON, like `doc_formats.search`, so the parser lives in one place
+	/// (`cloudillo-search`) and this crate gains no dependency on it. The server
+	/// validates every block at startup.
+	pub search: Option<serde_json::Value>,
 }
 
 /// Metadata about an action type

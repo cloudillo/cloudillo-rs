@@ -214,6 +214,9 @@ impl<'a> OperationExecutor<'a> {
 
 		// Upsert profile via meta adapter (target existence pre-checked above)
 		self.app.meta_adapter.upsert_profile(tn_id, &target_tag, &upsert).await?;
+		if upsert.affects_search_index() {
+			cloudillo_core::search_index_profile(self.app, tn_id, &target_tag);
+		}
 
 		tracing::info!(
 			tenant_id = %tn_id.0,
@@ -609,6 +612,9 @@ impl<'a> OperationExecutor<'a> {
 			.meta_adapter
 			.update_action_data(tn_id, &action_id, &update_opts)
 			.await?;
+		if update_opts.affects_search_index() {
+			cloudillo_core::search_index_action(self.app, tn_id, &action_id);
+		}
 
 		tracing::info!(
 			tenant_id = %tn_id.0,
@@ -636,6 +642,7 @@ impl<'a> OperationExecutor<'a> {
 
 		// Delete action via meta adapter
 		self.app.meta_adapter.delete_action(tn_id, &action_id).await?;
+		cloudillo_core::search_index_action(self.app, tn_id, &action_id);
 
 		tracing::info!(
 			tenant_id = %tn_id.0,

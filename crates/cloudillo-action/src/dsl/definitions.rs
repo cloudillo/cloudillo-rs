@@ -92,6 +92,7 @@ fn connection_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{issuer}:{audience}".to_string()),
+		search: None,
 	}
 }
 
@@ -151,6 +152,7 @@ fn follow_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{issuer}:{audience}".to_string()),
+		search: None,
 	}
 }
 
@@ -207,6 +209,13 @@ fn post_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: None,
+		// One whole-`content` walk covers all three shapes a post body takes —
+		// a bare string, `{text: …}` and `{content: …}` — since it descends
+		// into whichever is there.
+		search: Some(serde_json::json!({
+			"v": 1,
+			"body": [{ "field": "content", "extract": "text" }]
+		})),
 	}
 }
 
@@ -262,6 +271,7 @@ fn react_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{subject}:{issuer}".to_string()), // One reaction per user per action
+		search: None,
 	}
 }
 
@@ -321,6 +331,10 @@ fn comment_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: None,
+		search: Some(serde_json::json!({
+			"v": 1,
+			"body": [{ "field": "content", "extract": "text" }]
+		})),
 	}
 }
 
@@ -387,6 +401,10 @@ fn message_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: None,
+		search: Some(serde_json::json!({
+			"v": 1,
+			"body": [{ "field": "content", "extract": "text" }]
+		})),
 	}
 }
 
@@ -473,6 +491,7 @@ fn repost_definition() -> ActionDefinition {
 		// independently un-repostable rows (matches the ownRepostIds-by-target
 		// design).
 		key_pattern: Some("{type}:{subject}:{issuer}:{audience}".to_string()),
+		search: None,
 	}
 }
 
@@ -524,6 +543,7 @@ fn aprv_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: None,
+		search: None,
 	}
 }
 
@@ -579,6 +599,7 @@ fn stat_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{parent}".to_string()),
+		search: None,
 	}
 }
 
@@ -678,6 +699,7 @@ fn idp_reg_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{issuer}:{audience}:{content.id_tag}".to_string()),
+		search: None,
 	}
 }
 
@@ -742,6 +764,7 @@ fn pres_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: None, // Ephemeral actions don't need deduplication keys
+		search: None,
 	}
 }
 
@@ -853,6 +876,7 @@ fn subs_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{subject}:{issuer}".to_string()), // One subscription per user per action
+		search: None,
 	}
 }
 
@@ -959,6 +983,7 @@ fn fileshare_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{subject}:{audience}".to_string()),
+		search: None,
 	}
 }
 
@@ -1055,6 +1080,11 @@ fn conv_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: None, // Each conversation is unique
+		search: Some(serde_json::json!({
+			"v": 1,
+			"title": ["content.name"],
+			"body": [{ "field": "content", "extract": "text" }]
+		})),
 	}
 }
 
@@ -1152,6 +1182,7 @@ fn invt_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{subject}:{audience}".to_string()), // One invitation per user per action
+		search: None,
 	}
 }
 
@@ -1242,6 +1273,7 @@ fn prinvt_definition() -> ActionDefinition {
 			requires_connected: Some(true),
 		}),
 		key_pattern: Some("{type}:{issuer}:{audience}".to_string()),
+		search: None,
 	}
 }
 
@@ -1391,12 +1423,29 @@ fn apkg_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{content.name}".to_string()),
+		search: None,
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A type with no `search` block is not indexed, and that absence *is* the
+	/// allowlist. Pinned here so widening it is a deliberate edit rather than a side
+	/// effect of copying a definition: every other type is machine-generated
+	/// relationship or counter traffic that dwarfs real posts in volume.
+	#[test]
+	fn only_prose_carrying_action_types_declare_search_rules() {
+		let defs = get_definitions();
+		let mut indexed: Vec<&str> =
+			defs.iter().filter(|d| d.search.is_some()).map(|d| d.r#type.as_str()).collect();
+		indexed.sort_unstable();
+		// FSHR is the tempting omission: its content is `{contentType, fileName,
+		// fileTp}` — metadata, no prose — and the shared file's own `'F'` row
+		// already makes it findable by name.
+		assert_eq!(indexed, ["CMNT", "CONV", "MSG", "POST"]);
+	}
 
 	// Regression: CONV defaults to 'S'; MSG/SUBS have no own default and inherit
 	// it via `helpers::inherit_visibility`. Do not flip CONV to 'C' — see

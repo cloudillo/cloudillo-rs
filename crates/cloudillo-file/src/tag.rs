@@ -60,6 +60,7 @@ pub async fn put_file_tag(
 	}
 
 	let tags = app.meta_adapter.add_tag(auth.tn_id, &file_id, &tag).await?;
+	cloudillo_core::search_index_file(&app, auth.tn_id, &file_id);
 
 	info!("User {} added tag {} to file {}", auth.id_tag, tag, file_id);
 
@@ -73,6 +74,7 @@ pub async fn delete_file_tag(
 	Path((file_id, tag)): Path<(String, String)>,
 ) -> ClResult<Json<TagResponse>> {
 	let tags = app.meta_adapter.remove_tag(auth.tn_id, &file_id, &tag).await?;
+	cloudillo_core::search_index_file(&app, auth.tn_id, &file_id);
 
 	info!("User {} removed tag {} from file {}", auth.id_tag, tag, file_id);
 

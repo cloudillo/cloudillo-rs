@@ -30,7 +30,7 @@ use crate::{
 	variant::{self, VariantClass},
 	video::VideoTranscoderTask,
 };
-use cloudillo_core::abac::SubjectAccessLevel;
+use cloudillo_core::abac::relationship_level;
 use cloudillo_core::dir_cache::{DirCache, DirEntry};
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
 use cloudillo_core::file_access;
@@ -520,17 +520,7 @@ pub async fn get_file_list(
 	let is_real_auth = is_authenticated && !subject_id_tag.is_empty() && subject_id_tag != "guest";
 	let is_tenant = subject_id_tag == tenant_id_tag.as_ref();
 
-	let access_level = if is_tenant {
-		SubjectAccessLevel::Owner
-	} else if connected {
-		SubjectAccessLevel::Connected
-	} else if following {
-		SubjectAccessLevel::Follower
-	} else if is_real_auth {
-		SubjectAccessLevel::Verified
-	} else {
-		SubjectAccessLevel::Public
-	};
+	let access_level = relationship_level(is_tenant, connected, following, is_real_auth);
 	opts.visible_levels = access_level.visible_levels().map(<[char]>::to_vec);
 
 	if !is_tenant {
@@ -1531,6 +1521,7 @@ pub async fn post_file(
 		.await?;
 
 	info!("Created file metadata for fileTp={} by {}", req.file_tp, auth.id_tag);
+	cloudillo_core::search_index_file(&app, tn_id, &file_id);
 
 	let data = json!({"fileId": file_id});
 
@@ -1724,6 +1715,7 @@ async fn post_file_cross_context(
 			},
 		)
 		.await?;
+	cloudillo_core::search_index_file(&app, tn_id, source_file_id);
 
 	// Seed the caller's cached access_level so the response carries the eye
 	// badge without a follow-up `/refresh` round-trip. Mirrors what FSHR
@@ -1920,6 +1912,8 @@ pub async fn refresh_file(
 				};
 				app.meta_adapter.update_file_data(tn_id, &file_id, &opts).await?;
 				crate::management::invalidate_dir_cache(&app, tn_id, &file_id);
+				// `file_name`, `content_type` and `tags` all reach the index.
+				cloudillo_core::search_index_file(&app, tn_id, &file_id);
 			}
 			// Source server populated access_level → cache it; otherwise preserve
 			// whatever we already had (older peer servers may omit the field).

@@ -62,6 +62,9 @@ pub struct RateLimitConfig {
 	pub federation: EndpointCategoryConfig,
 	/// General public endpoints (profile, refs)
 	pub general: EndpointCategoryConfig,
+	/// Full-text search — its own bucket: unauthenticated, and far more expensive
+	/// per request than the rest of `general`
+	pub search: EndpointCategoryConfig,
 	/// WebSocket endpoints
 	pub websocket: EndpointCategoryConfig,
 	/// Maximum number of IPs to track (memory limit)
@@ -109,6 +112,16 @@ impl Default for RateLimitConfig {
 				ipv4_network: RateLimitTierConfig::new(600, 1000, 50000, 5000),
 				ipv6_subnet: RateLimitTierConfig::new(300, 500, 5000, 500),
 				ipv6_provider: RateLimitTierConfig::new(600, 1000, 50000, 5000),
+			},
+			search: EndpointCategoryConfig {
+				name: "search",
+				// Tighter than `general`: an FTS5 scan plus a capped COUNT(*) over the
+				// whole corpus, reachable unauthenticated. The omnibox debounces at
+				// 250ms, so a live typist needs only a handful per second.
+				ipv4_individual: RateLimitTierConfig::new(30, 60, 600, 100),
+				ipv4_network: RateLimitTierConfig::new(60, 120, 2000, 300),
+				ipv6_subnet: RateLimitTierConfig::new(30, 60, 600, 100),
+				ipv6_provider: RateLimitTierConfig::new(60, 120, 2000, 300),
 			},
 			websocket: EndpointCategoryConfig {
 				name: "websocket",

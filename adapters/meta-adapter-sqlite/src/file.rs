@@ -200,10 +200,12 @@ pub(crate) async fn list(
 			// Specific folder (including "__trash__" / "__managed__" for those contents)
 			query.push(" AND f.parent_id=").push_bind(parent_id.as_str());
 		}
-	} else if opts.file_id.is_none() {
+	} else if opts.file_id.is_none() && !opts.sweep_all {
 		// Default browse listing (no targeted fileId): exclude trashed and managed
 		// files. A by-id lookup with no parentId deliberately skips this so it
-		// returns the file wherever it lives (managed or trash included).
+		// returns the file wherever it lives (managed or trash included), and so
+		// does `sweep_all`, which must see a trashed file to take its derived
+		// state back out.
 		query
 			.push(" AND (f.parent_id IS NULL OR f.parent_id NOT IN (")
 			.push_bind(cloudillo_types::meta_adapter::TRASH_PARENT_ID)
@@ -240,6 +242,9 @@ pub(crate) async fn list(
 	} else if let Some(root_id) = &opts.root_id {
 		// Filter by document tree root
 		query.push(" AND f.root_id=").push_bind(root_id.as_str());
+	} else if opts.include_tree_children {
+		// Server-only sweeps: no root_id constraint, so files inside a document
+		// tree are walked too.
 	} else {
 		query.push(" AND f.root_id IS NULL");
 	}
@@ -329,6 +334,7 @@ pub(crate) async fn list(
 	}
 
 	// Filter by status - if no status specified, exclude deleted files by default
+	// (except under `sweep_all`, which must see a soft-deleted row to clean up after it)
 	if let Some(status) = opts.status {
 		let status_char = match status {
 			FileStatus::Active => "A",
@@ -336,16 +342,22 @@ pub(crate) async fn list(
 			FileStatus::Deleted => "D",
 		};
 		query.push(" AND f.status=").push_bind(status_char);
-	} else {
+	} else if !opts.sweep_all {
 		// By default, exclude deleted files
 		query.push(" AND f.status != 'D'");
 	}
 
-	// Filter by hidden flag
+	// Filter by hidden flag. `sweep_all` with no explicit `hidden` pushes nothing:
+	// a hidden file is a normal, indexable file a browse listing just does not show.
 	match opts.hidden {
-		Some(true) => query.push(" AND f.hidden = 1"),
-		_ => query.push(" AND (f.hidden IS NULL OR f.hidden = 0)"),
-	};
+		Some(true) => {
+			query.push(" AND f.hidden = 1");
+		}
+		None if opts.sweep_all => {}
+		_ => {
+			query.push(" AND (f.hidden IS NULL OR f.hidden = 0)");
+		}
+	}
 
 	// Filter by pinned/starred (user-specific) — only valid when the
 	// file_user_data JOIN was added (i.e. an authenticated user is present).
@@ -564,6 +576,7 @@ pub(crate) async fn list(
 			parent_id: row.try_get("parent_id").ok().flatten(),
 			root_id: row.try_get("root_id").ok().flatten(),
 			owner,
+			owner_tag: row.try_get("owner_tag").ok().flatten(),
 			creator,
 			preset: row.try_get("preset")?,
 			content_type: row.try_get("content_type")?,
@@ -1386,6 +1399,7 @@ fn row_to_file_view(
 		parent_id: row.try_get("parent_id").ok().flatten(),
 		root_id: row.try_get("root_id").ok().flatten(),
 		owner,
+		owner_tag: row.try_get("owner_tag").ok().flatten(),
 		creator,
 		preset: row.try_get("preset").ok().flatten(),
 		content_type: row.try_get("content_type").ok().flatten(),
@@ -1663,7 +1677,11 @@ async fn sweep_file_shares(
 /// Runs the same [`sweep_file_shares`] cascade [`delete`] does: a row can reach `status = 'D'` by
 /// routes other than `delete`, and removing it without clearing its links and grants would leave
 /// them to be resurrected by a re-upload of identical content.
-pub(crate) async fn hard_delete_file(db: &SqlitePool, tn_id: TnId, f_id: u64) -> ClResult<()> {
+pub(crate) async fn hard_delete_file(
+	db: &SqlitePool,
+	tn_id: TnId,
+	f_id: u64,
+) -> ClResult<Option<Box<str>>> {
 	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
 
 	// Nothing can reference a NULL `file_id`, so only a resolvable content id needs the sweep.
@@ -1676,8 +1694,9 @@ pub(crate) async fn hard_delete_file(db: &SqlitePool, tn_id: TnId, f_id: u64) ->
 			.inspect_err(inspect)
 			.map_err(|_| Error::DbError)?;
 
-	if let Some((Some(file_id),)) = resolved {
-		sweep_file_shares(&mut tx, tn_id, &file_id).await?;
+	let file_id = resolved.and_then(|(id,)| id);
+	if let Some(file_id) = &file_id {
+		sweep_file_shares(&mut tx, tn_id, file_id).await?;
 	}
 
 	sqlx::query("DELETE FROM file_variants WHERE tn_id = ? AND f_id = ?")
@@ -1697,7 +1716,7 @@ pub(crate) async fn hard_delete_file(db: &SqlitePool, tn_id: TnId, f_id: u64) ->
 		.map_err(|_| Error::DbError)?;
 
 	tx.commit().await.map_err(|_| Error::DbError)?;
-	Ok(())
+	Ok(file_id)
 }
 
 /// Delete a document tree and everything that would otherwise outlive it.

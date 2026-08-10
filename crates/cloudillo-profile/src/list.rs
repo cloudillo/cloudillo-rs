@@ -162,6 +162,9 @@ pub async fn list_profiles(
 		id_tag: params.id_tag,
 		trust_set: params.trust_set,
 		hidden_in_home: None,
+		// Unset: this endpoint keeps the name-ordered top-100 listing.
+		limit: None,
+		after_id_tag: None,
 	};
 
 	// Fetch profiles with optional search

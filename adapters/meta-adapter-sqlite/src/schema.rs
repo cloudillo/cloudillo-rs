@@ -63,6 +63,21 @@ async fn get_db_version(tx: &mut Transaction<'_, Sqlite>) -> i64 {
 		.unwrap_or(0)
 }
 
+/// Column list shared by every `search_docs` writer below.
+pub(crate) const SEARCH_COLS: &str = "(tn_id, obj_tp, obj_id, part_id, part_kind, title, body, \
+	 tags, content_type, owner_tag, visibility, root_id, created_at, updated_at, fts_cl, obj_hash)";
+
+/// The `DO UPDATE` clause shared by every upsert below. `part_id` is always `''`
+/// for whole-object rows, so `idx_search_docs_key` makes `(tn_id, obj_tp,
+/// obj_id)` the effective conflict target.
+pub(crate) const SEARCH_UPSERT: &str = "ON CONFLICT(tn_id, obj_tp, obj_id, part_id) DO UPDATE SET \
+	 part_kind = excluded.part_kind, title = excluded.title, body = excluded.body, \
+	 tags = excluded.tags, content_type = excluded.content_type, \
+	 owner_tag = excluded.owner_tag, visibility = excluded.visibility, \
+	 root_id = excluded.root_id, created_at = excluded.created_at, \
+	 updated_at = excluded.updated_at, fts_cl = excluded.fts_cl, \
+	 obj_hash = excluded.obj_hash";
+
 /// Set the database version in vars table
 async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 	let _ = sqlx::query("INSERT OR REPLACE INTO vars (key, value) VALUES ('db_version', ?)")
@@ -71,10 +86,55 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 		.await;
 }
 
+/// The FTS5 virtual tables backing full-text search, and the triggers that
+/// mirror `search_docs` into the external-content one.
+///
+/// The trigger strings carry no `CREATE TRIGGER` prefix so a future migration
+/// that has to drop and recreate them can reuse these constants verbatim — FTS5
+/// has no `ALTER TABLE ... ADD COLUMN`, so any column change to these tables is a
+/// drop/recreate/repopulate.
+///
+/// Every statement lists all four `search_fts` columns. FTS5's `'delete'`
+/// command needs the original value of each one, so an omission would silently
+/// leave tombstones behind.
+///
+/// `tn_id` is a real indexed column, not metadata: a query pushes a `tn_id:<n>`
+/// clause into the MATCH expression so FTS5 narrows to one tenant before ranking,
+/// instead of matching the whole node's corpus and letting the `d.tn_id` join
+/// condition trim it afterwards.
+const SEARCH_FTS_DDL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+		title, body, tags, tn_id,
+		content='search_docs', content_rowid='s_id',
+		tokenize=\"unicode61 remove_diacritics 2 tokenchars '#@'\"
+	)";
+
+const SEARCH_FTS_CL_DDL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts_cl USING fts5(
+		title, body, tags, tn_id,
+		content='', contentless_delete=1,
+		tokenize=\"unicode61 remove_diacritics 2 tokenchars '#@'\"
+	)";
+
+const SEARCH_FTS_TRIGGERS: [&str; 3] = [
+	"search_docs_ai AFTER INSERT ON search_docs \
+	 WHEN new.fts_cl = 0 BEGIN \
+	 INSERT INTO search_fts(rowid, title, body, tags, tn_id) \
+	 VALUES (new.s_id, new.title, new.body, new.tags, new.tn_id); END",
+	"search_docs_ad AFTER DELETE ON search_docs \
+	 WHEN old.fts_cl = 0 BEGIN \
+	 INSERT INTO search_fts(search_fts, rowid, title, body, tags, tn_id) \
+	 VALUES ('delete', old.s_id, old.title, old.body, old.tags, old.tn_id); END",
+	"search_docs_au AFTER UPDATE ON search_docs \
+	 WHEN old.fts_cl = 0 AND new.fts_cl = 0 BEGIN \
+	 INSERT INTO search_fts(search_fts, rowid, title, body, tags, tn_id) \
+	 VALUES ('delete', old.s_id, old.title, old.body, old.tags, old.tn_id); \
+	 INSERT INTO search_fts(rowid, title, body, tags, tn_id) \
+	 VALUES (new.s_id, new.title, new.body, new.tags, new.tn_id); END",
+];
+
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 37;
+	const CURRENT_DB_VERSION: i64 = 40;
 
 	let mut tx = db.begin().await?;
 
@@ -759,6 +819,127 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	)
 	.execute(&mut *tx)
 	.await?;
+
+	// Document format manifests. `content_type` is the claim key: only one app may
+	// register (and therefore index) a given document type per tenant.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS doc_formats (
+			tn_id integer NOT NULL,
+			content_type text NOT NULL,
+			publisher_tag text NOT NULL,
+			app_name text NOT NULL,
+			format_version integer,
+			store_tp char(4),
+			nav_param text,
+			search json,
+			x json,
+			status char(1) DEFAULT 'A',
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			PRIMARY KEY(tn_id, content_type)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS doc_formats_insert_at AFTER INSERT ON doc_formats FOR EACH ROW \
+		BEGIN UPDATE doc_formats SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND content_type = NEW.content_type; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS doc_formats_updated_at AFTER UPDATE ON doc_formats FOR EACH ROW \
+		BEGIN UPDATE doc_formats SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND content_type = NEW.content_type; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// Full-text search index. One row per searchable unit: a whole object
+	// (part_id = '') or a deep sub-part of a document (part_id = the app's
+	// deep-link key, e.g. a notillo page id).
+	//
+	// `part_id` is NOT NULL DEFAULT '' on purpose — SQLite treats NULLs as
+	// distinct in a UNIQUE index, so a nullable column would silently permit
+	// duplicate whole-object rows.
+	//
+	// There is deliberately NO `updated_at` trigger here: `updated_at` is set
+	// explicitly by the writer. An AFTER UPDATE ... UPDATE trigger would
+	// re-fire the FTS mirror triggers below.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS search_docs (
+			s_id integer PRIMARY KEY AUTOINCREMENT,
+			tn_id integer NOT NULL,
+			obj_tp char(1) NOT NULL,
+			obj_id text NOT NULL,
+			part_id text NOT NULL DEFAULT '',
+			part_kind text,
+			parent_part text,
+			anchor_id text,
+			title text,
+			body text,
+			tags text,
+			content_type text,
+			owner_tag text,
+			visibility char(1),
+			root_id text,
+			created_at INTEGER,
+			updated_at INTEGER,
+			fts_cl integer NOT NULL DEFAULT 0,
+			obj_hash text
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_search_docs_key \
+		ON search_docs(tn_id, obj_tp, obj_id, part_id)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	// FTS5 external-content table mirroring search_docs. External content (as
+	// opposed to contentless) keeps snippet() working while storing the text
+	// only once. `remove_diacritics 2` folds Unicode accents server-side;
+	// `tokenchars '#@'` keeps #tag and @mention as single tokens.
+	//
+	// `tn_id` is indexed as a column so a query can push `tn_id:<n>` into the
+	// MATCH expression and have FTS5 narrow to one tenant *before* ranking,
+	// instead of matching the whole node's corpus and letting the `d.tn_id` join
+	// condition cut it down afterwards. It comes last so the ordinals of the three
+	// text columns — which the mirror triggers and `crate::search`'s inserts both
+	// depend on — do not shift. External content maps columns by name and
+	// `search_docs.tn_id` already exists, so the content table is unchanged.
+	sqlx::query(SEARCH_FTS_DDL).execute(&mut *tx).await?;
+
+	// Second FTS5 index, for tenants that turned `search.store_text` off. It is
+	// *contentless* — no plain-text copy is kept anywhere, so `snippet()` cannot
+	// work — but the body is still fully tokenized, so matching and `bm25()` are
+	// identical to `search_fts`. Same four columns in the same order and the
+	// same tokenizer, so the query builder and `escape_fts_query` work unchanged
+	// against either table.
+	//
+	// `contentless_delete=1` (SQLite >= 3.43) is what makes deletion possible at
+	// all without the original column values: it swaps the FTS5 `'delete'`
+	// command — which requires them — for ordinary `DELETE`/`UPDATE` keyed on the
+	// rowid. FTS5 rejects `'delete'` on such a table outright.
+	//
+	// A trigger cannot maintain this table: for a contentless row `search_docs.
+	// body` is NULL by construction, so there would be no text to index. It is
+	// written *only* by `crate::search`, which holds the extracted body.
+	sqlx::query(SEARCH_FTS_CL_DDL).execute(&mut *tx).await?;
+
+	// Mirror triggers — search_fts must never be written directly outside these.
+	//
+	// `fts_cl = 1` rows belong to `search_fts_cl` and are skipped here; the
+	// adapter writes them. A row never changes mode in place — a `search.
+	// store_text` flip is applied by a full reindex, which deletes and
+	// re-inserts — so `old.fts_cl <> new.fts_cl` on the AU trigger is a bug, not
+	// a supported path, and the guard deliberately does not try to migrate it.
+	for stmt in SEARCH_FTS_TRIGGERS {
+		sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TRIGGER IF NOT EXISTS {stmt}")))
+			.execute(&mut *tx)
+			.await?;
+	}
 
 	// Address books (CardDAV collections) and contacts
 	sqlx::query(
@@ -2009,6 +2190,51 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 		set_db_version(&mut tx, 37).await;
+	}
+
+	if version < 38 {
+		// Full-text search: `doc_formats`, `search_docs`, both FTS5 virtual tables
+		// and the three mirror triggers are all created by the `IF NOT EXISTS`
+		// descriptor statements above, in their final shape — `SEARCH_FTS_DDL`,
+		// `SEARCH_FTS_CL_DDL` and `SEARCH_FTS_TRIGGERS` already carry the `tn_id`
+		// column, and `search_docs` already carries `fts_cl` and `obj_hash`. A
+		// database below this version has no search tables at all, so there is
+		// nothing to alter and this block only stamps the version.
+		//
+		// Backfilling existing files/actions/profiles is the `search-reindex`
+		// scheduler task's job — keeping it out of the startup transaction.
+		set_db_version(&mut tx, 38).await;
+	}
+
+	if version < 39 {
+		// `doc_formats.version` held the registering app's release version as free
+		// text: it bumped on unrelated releases, never when the index rules were
+		// edited, and nothing compared two of them. Replaced by `format_version`,
+		// the integer `MMMmmmppp` encoding of a *document format* version, which
+		// `format::gate` orders registrations by.
+		//
+		// The old TEXT values are dropped rather than parsed: an app version is not
+		// a document format version, so translating `'0.8.17'` would fabricate an
+		// ordering. The gate reads NULL as "no ordering known". Nothing else ever
+		// read this column, `doc_formats` has no index on it, and its triggers
+		// reference only `tn_id`/`content_type`, so the DROP is safe.
+		//
+		// INTEGER, not TEXT: SQLite's TEXT affinity would coerce a bound i64 back to
+		// text, and `doc_format::map_row` reads it with the panicking accessor.
+		add_column_if_missing(&mut tx, "doc_formats", "format_version", "INTEGER").await?;
+		drop_column_if_exists(&mut tx, "doc_formats", "version").await?;
+		set_db_version(&mut tx, 39).await;
+	}
+
+	if version < 40 {
+		// `idx_search_docs_obj (tn_id, obj_tp, obj_id)` was a strict left-prefix of
+		// the UNIQUE `idx_search_docs_key (tn_id, obj_tp, obj_id, part_id)`, so the
+		// planner could never choose it and it only cost a second b-tree write per
+		// insert and delete.
+		sqlx::query("DROP INDEX IF EXISTS idx_search_docs_obj")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 40).await;
 	}
 
 	tx.commit().await?;

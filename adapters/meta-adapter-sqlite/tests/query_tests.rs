@@ -8,8 +8,9 @@
 
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{
-	CreateFile, ListActionOptions, ListFileOptions, ListTaskOptions, MetaAdapter, ProfileStatus,
-	ProfileType, UpsertProfileFields,
+	CreateFile, FileStatus, ListActionOptions, ListFileOptions, ListTaskOptions, MANAGED_PARENT_ID,
+	MetaAdapter, ProfileStatus, ProfileType, TRASH_PARENT_ID, UpdateFileOptions,
+	UpsertProfileFields,
 };
 use cloudillo_types::types::{Patch, TnId};
 use cloudillo_types::worker::WorkerPool;
@@ -160,6 +161,46 @@ async fn make_file(
 		..Default::default()
 	};
 	adapter.create_file(tn_id, opts).await.expect("create file");
+}
+
+#[tokio::test]
+async fn include_tree_children_returns_document_tree_members() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "test_user").await.ok();
+
+	make_file(&adapter, tn_id, "f_root", "tree.txt", None).await;
+	adapter
+		.create_file(
+			tn_id,
+			CreateFile {
+				file_id: Some("f_child".into()),
+				root_id: Some("f_root".into()),
+				content_type: "text/plain".into(),
+				file_name: "tree.txt".into(),
+				file_tp: Some("BLOB".into()),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("create tree child");
+
+	// The default listing is a file browser's: containers, not their parts.
+	let opts = ListFileOptions { file_name: Some("tree".into()), ..Default::default() };
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	assert_eq!(result.len(), 1, "tree children must stay hidden by default");
+	assert_eq!(&*result[0].file_id, "f_root");
+
+	// The maintenance sweeps set the flag, and must see every document.
+	let opts = ListFileOptions {
+		file_name: Some("tree".into()),
+		include_tree_children: true,
+		..Default::default()
+	};
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let ids: Vec<&str> = result.iter().map(|f| &*f.file_id).collect();
+	assert_eq!(ids.len(), 2, "got {ids:?}");
+	assert!(ids.contains(&"f_child"), "the sweep must reach documents inside a tree: {ids:?}");
 }
 
 #[tokio::test]
@@ -463,4 +504,75 @@ async fn test_list_files_local_only_excludes_remote() {
 	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
 	assert!(ids.iter().any(|n| n == "f_local"), "member-created local file must remain");
 	assert!(!ids.iter().any(|n| n == "f_remote"), "remote cached file must be excluded");
+}
+
+/// A file at an explicit location, with an explicit `hidden` flag.
+async fn create_file_at(
+	adapter: &MetaAdapterSqlite,
+	tn_id: TnId,
+	file_id: &str,
+	file_name: &str,
+	parent_id: Option<&str>,
+	hidden: bool,
+) {
+	adapter
+		.create_file(
+			tn_id,
+			CreateFile {
+				file_id: Some(file_id.into()),
+				parent_id: parent_id.map(Into::into),
+				hidden,
+				content_type: "text/plain".into(),
+				file_name: file_name.into(),
+				file_tp: Some("BLOB".into()),
+				status: Some(FileStatus::Active),
+				visibility: Some('P'),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("create file");
+}
+
+fn file_ids(files: &[cloudillo_types::meta_adapter::FileView]) -> Vec<&str> {
+	let mut ids: Vec<&str> = files.iter().map(|f| &*f.file_id).collect();
+	ids.sort_unstable();
+	ids
+}
+
+/// `sweep_all` is what lets the weekly search sweep *remove* index rows, not only
+/// add them: a file the browse listing hides is a file the sweep would never
+/// re-verify, so a write path that forgot its index call would leave a trashed
+/// file searchable by name forever.
+#[tokio::test]
+async fn the_sweep_listing_returns_the_rows_a_browse_listing_hides() {
+	let (adapter, _dir) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.ok();
+
+	create_file_at(&adapter, tn_id, "f1~plain", "sima.txt", None, false).await;
+	create_file_at(&adapter, tn_id, "f1~hidden", "rejtett.txt", None, true).await;
+	create_file_at(&adapter, tn_id, "f1~managed", "kezelt.txt", Some(MANAGED_PARENT_ID), false)
+		.await;
+	create_file_at(&adapter, tn_id, "f1~trashed", "kukazott.txt", Some(TRASH_PARENT_ID), false)
+		.await;
+	create_file_at(&adapter, tn_id, "f1~deleted", "torolt.txt", None, false).await;
+	adapter
+		.update_file_data(
+			tn_id,
+			"f1~deleted",
+			&UpdateFileOptions { status: Patch::Value('D'), ..Default::default() },
+		)
+		.await
+		.expect("soft delete");
+
+	let browse = adapter.list_files(tn_id, &ListFileOptions::default()).await.expect("browse");
+	assert_eq!(file_ids(&browse), vec!["f1~plain"]);
+
+	let opts = ListFileOptions { sweep_all: true, ..Default::default() };
+	let sweep = adapter.list_files(tn_id, &opts).await.expect("sweep");
+	assert_eq!(
+		file_ids(&sweep),
+		vec!["f1~deleted", "f1~hidden", "f1~managed", "f1~plain", "f1~trashed"]
+	);
 }

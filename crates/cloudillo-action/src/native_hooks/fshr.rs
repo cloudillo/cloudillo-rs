@@ -123,6 +123,8 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				 (file_access::fshr_grant_level requires the issuer to own the file) but will \
 				 remain visible until the next cleanup"
 			);
+		} else {
+			cloudillo_core::search_index_action(&app, tn_id, &context.action_id);
 		}
 		return Err(e);
 	}
@@ -310,6 +312,7 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 	match app.meta_adapter.create_file(tn_id, create_opts).await {
 		Ok(file_result) => {
 			tracing::info!("FSHR: Created shared file entry: {:?}", file_result);
+			cloudillo_core::search_index_file(&app, tn_id, file_id);
 		}
 		Err(e) => {
 			tracing::error!("FSHR: Failed to create file entry: {}", e);

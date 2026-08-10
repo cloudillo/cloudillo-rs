@@ -244,6 +244,13 @@ const TENANT_CASCADE_TABLES: &[&str] = &[
 	"contacts",
 	"calendars",
 	"calendar_objects",
+	"doc_formats",
+	// `search_fts` is absent because the `search_docs_ad` trigger clears it as
+	// `search_docs` rows go; `search_fts_cl` because it is contentless, has no
+	// trigger, and is cleared by `search::purge_tenant_contentless` below. Their
+	// `tn_id` is an *FTS column*, so a plain `DELETE ... WHERE tn_id=?` on either
+	// virtual table would not work anyway.
+	"search_docs",
 ];
 
 /// Delete a tenant and all its associated data (cascading delete)
@@ -260,6 +267,11 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId) -> ClResult<()> {
 	.await
 	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?;
+
+	// Must run before the `search_docs` rows go: the contentless FTS index has no
+	// trigger behind it and cannot be rebuilt from its content, so entries missed
+	// here would be unreachable forever.
+	crate::search::purge_tenant_contentless(&mut tx, tn_id).await?;
 
 	for table in TENANT_CASCADE_TABLES {
 		sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table} WHERE tn_id=?")))
@@ -330,4 +342,46 @@ pub(crate) async fn list(
 		.collect();
 
 	Ok(tenants)
+}
+
+/// Read one subsystem's per-tenant bookkeeping value.
+pub(crate) async fn read_data(
+	dbr: &SqlitePool,
+	tn_id: TnId,
+	name: &str,
+) -> ClResult<Option<Box<str>>> {
+	sqlx::query_scalar("SELECT value FROM tenant_data WHERE tn_id = ? AND name = ?")
+		.bind(tn_id.0)
+		.bind(name)
+		.fetch_optional(dbr)
+		.await
+		.inspect_err(inspect)
+		.map_err(|_| Error::DbError)
+		.map(Option::flatten)
+}
+
+/// Write, or with `value = None` delete, one such value.
+pub(crate) async fn write_data(
+	db: &SqlitePool,
+	tn_id: TnId,
+	name: &str,
+	value: Option<&str>,
+) -> ClResult<()> {
+	match value {
+		Some(value) => sqlx::query(
+			"INSERT INTO tenant_data (tn_id, name, value) VALUES (?, ?, ?) \
+			 ON CONFLICT(tn_id, name) DO UPDATE SET value = excluded.value",
+		)
+		.bind(tn_id.0)
+		.bind(name)
+		.bind(value),
+		None => sqlx::query("DELETE FROM tenant_data WHERE tn_id = ? AND name = ?")
+			.bind(tn_id.0)
+			.bind(name),
+	}
+	.execute(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+	Ok(())
 }

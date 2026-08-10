@@ -132,6 +132,11 @@ impl DslEngine {
 		self.definitions.contains_key(action_type)
 	}
 
+	/// Every loaded definition, for startup validation of fields `load_definition` skips.
+	pub fn definitions(&self) -> impl Iterator<Item = (&str, &ActionDefinition)> {
+		self.definitions.iter().map(|(k, v)| (k.as_str(), v))
+	}
+
 	/// Resolve action type for hook lookup.
 	/// Tries full type (typ:sub_typ) first, then falls back to base type.
 	pub fn resolve_action_type(&self, typ: &str, sub_typ: Option<&str>) -> Option<String> {

@@ -297,6 +297,7 @@ pub async fn put_community_profile(
 	app.meta_adapter
 		.upsert_profile(creator_tn_id, &id_tag_lower, &community_upsert)
 		.await?;
+	cloudillo_core::search_index_profile(&app, creator_tn_id, &id_tag_lower);
 
 	// 8. Get creator's profile name for the community's profile record
 	let creator_name = match app.meta_adapter.get_profile_info(creator_tn_id, creator_id_tag).await
@@ -318,6 +319,7 @@ pub async fn put_community_profile(
 	app.meta_adapter
 		.upsert_profile(community_tn_id, creator_id_tag, &creator_upsert)
 		.await?;
+	cloudillo_core::search_index_profile(&app, community_tn_id, creator_id_tag);
 
 	info!(
 		creator = %creator_id_tag,

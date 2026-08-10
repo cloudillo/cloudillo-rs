@@ -11,14 +11,17 @@ pub mod abac;
 pub mod acme;
 pub mod app;
 pub mod bootstrap_types;
+pub mod bundled_apps;
 pub mod core_settings;
 pub mod create_perm;
 pub mod dir_cache;
 pub mod dns;
+pub mod doc_format;
 pub mod extensions;
 pub mod extract;
 pub mod file_access;
 pub mod log;
+pub mod maintenance;
 pub mod middleware;
 pub mod prelude;
 pub mod profile_me_cache;
@@ -100,6 +103,89 @@ pub type CreateActionFn = Box<
 		> + Send
 		+ Sync,
 >;
+
+/// Type-erased hook asking for a document to be (re)indexed for full-text search.
+/// Registered as an extension by the server's app module (delegates to
+/// `cloudillo_search::indexer::schedule`).
+///
+/// Exists so storage crates can notify the search subsystem without depending on it:
+/// `cloudillo-rtdb` calling `cloudillo-search` directly would be a dependency cycle,
+/// since search reads documents back through the adapters.
+///
+/// Synchronous and infallible on purpose — the hook only enqueues a debounced task,
+/// so a write path must never await or fail on it.
+pub type SearchIndexFn = Box<dyn Fn(&app::App, cloudillo_types::types::TnId, &str) + Send + Sync>;
+
+/// Type-erased hook asking for one **whole object** — a file, a profile, an action —
+/// to be re-indexed. The counterpart of [`SearchIndexFn`], which covers the deep parts
+/// of a document.
+///
+/// `obj_tp` is the `search_docs` object type: `'F'`, `'P'` or `'A'`. Same contract as
+/// [`SearchIndexFn`]. Call it through [`search_index_object`] rather than looking the
+/// extension up by hand.
+pub type SearchObjectFn =
+	Box<dyn Fn(&app::App, cloudillo_types::types::TnId, char, &str) + Send + Sync>;
+
+/// Ask for one object's whole-object index row to be rebuilt. Prefer the three typed
+/// wrappers below.
+///
+/// Call this right after a write that changes a column the index reads — a file's
+/// `file_name`, `tags`, `status`, `visibility`, `owner_tag`, `root_id` or
+/// `content_type`; a profile's `name` or `id_tag`; an action's `content`, `type`,
+/// `sub_type`, `status`, `visibility` or `root_id`. Writes that only bump timestamps
+/// or counters need nothing.
+///
+/// A no-op when the search subsystem is not wired in, so a feature crate can call it
+/// unconditionally.
+pub fn search_index_object(
+	app: &app::App,
+	tn_id: cloudillo_types::types::TnId,
+	obj_tp: char,
+	obj_id: &str,
+) {
+	if let Ok(f) = app.ext::<SearchObjectFn>() {
+		f(app, tn_id, obj_tp, obj_id);
+	}
+}
+
+/// [`search_index_object`] for a file.
+pub fn search_index_file(app: &app::App, tn_id: cloudillo_types::types::TnId, file_id: &str) {
+	search_index_object(app, tn_id, 'F', file_id);
+}
+
+/// Ask for one document's deep `'D'` index rows to be rebuilt; a no-op when the search
+/// subsystem is not wired in. The counterpart of [`search_index_file`], which covers
+/// the file's own row.
+pub fn search_index_document(app: &app::App, tn_id: cloudillo_types::types::TnId, file_id: &str) {
+	if let Ok(f) = app.ext::<SearchIndexFn>() {
+		f(app, tn_id, file_id);
+	}
+}
+
+/// [`search_index_object`] for a profile.
+pub fn search_index_profile(app: &app::App, tn_id: cloudillo_types::types::TnId, id_tag: &str) {
+	search_index_object(app, tn_id, 'P', id_tag);
+}
+
+/// [`search_index_object`] for an action.
+pub fn search_index_action(app: &app::App, tn_id: cloudillo_types::types::TnId, action_id: &str) {
+	search_index_object(app, tn_id, 'A', action_id);
+}
+
+/// Type-erased lookup of an action type's search manifest, resolved through the DSL
+/// engine (`TYPE:SUB` first, then `TYPE`). Registered by the server's app module.
+///
+/// Exists for the same reason as [`SearchIndexFn`]: `cloudillo-search` must not depend
+/// on `cloudillo-action`. The manifest crosses as opaque JSON, so only
+/// `cloudillo-search` ever parses it.
+///
+/// Returns `None` when the type has no definition at all; otherwise the **resolved**
+/// definition key and that definition's manifest, itself `None` for a type that is not
+/// indexed. The key comes back separately so the caller can cache parsed rules under
+/// it — a resolved key is one of the process's fixed definition names, whereas the
+/// `(type, subType)` pair a federated action carries is not bounded by anything.
+pub type ActionSearchRulesFn =
+	Box<dyn Fn(&str, Option<&str>) -> Option<(Box<str>, Option<serde_json::Value>)> + Send + Sync>;
 
 /// Parameters passed to a `ScheduleEmailFn` invocation. Mirrors
 /// `cloudillo_email::EmailTaskParams` but lives in core so the ACME renewal

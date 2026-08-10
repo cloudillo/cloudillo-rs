@@ -220,6 +220,7 @@ impl AppBuilder {
 		cloudillo_idp::register_settings(&mut settings_registry)?;
 		cloudillo_push::register_settings(&mut settings_registry)?;
 		cloudillo_profile::register_settings(&mut settings_registry)?;
+		cloudillo_search::register_settings(&mut settings_registry)?;
 
 		info!("Registered {} settings", settings_registry.len());
 
@@ -287,8 +288,21 @@ impl AppBuilder {
 			return Err(Error::Internal("No RTDB adapter configured".to_string()));
 		};
 
+		// A `search` block reaches the index through `load_definition`, which does
+		// not validate. Parsing every one here means a malformed manifest is a
+		// startup failure with a name attached, rather than a per-action warning
+		// that only shows up once someone searches and comes up empty.
+		for (typ, def) in dsl_engine.definitions() {
+			let Some(search) = &def.search else { continue };
+			cloudillo_search::rules::ActionSearchRules::parse(search).map_err(|e| {
+				error!("FATAL: invalid search manifest on action definition '{typ}': {e}");
+				Error::Internal(format!("invalid search manifest on action type '{typ}'"))
+			})?;
+		}
+
 		// Build extensions map for feature-specific state
 		let mut extensions = Extensions::new();
+		let dsl_for_search = dsl_engine.clone();
 		extensions.insert(dsl_engine);
 		extensions.insert::<Arc<tokio::sync::RwLock<HookRegistry>>>(Arc::new(
 			tokio::sync::RwLock::new(HookRegistry::new()),
@@ -323,6 +337,37 @@ impl AppBuilder {
 			Box::pin(cloudillo_profile::sync::ensure_profile(app, tn_id, id_tag))
 		});
 		extensions.insert(ensure_profile_fn);
+
+		// Register the search reindex hook so cloudillo-rtdb can notify the
+		// search subsystem after a commit without depending on it.
+		let search_index_fn: cloudillo_core::SearchIndexFn = Box::new(|app, tn_id, file_id| {
+			cloudillo_search::indexer::schedule(app, tn_id, file_id);
+		});
+		extensions.insert(search_index_fn);
+
+		// Same, for whole objects: the feature crates ask for a file, profile or
+		// action to be re-indexed after they write it.
+		let search_object_fn: cloudillo_core::SearchObjectFn =
+			Box::new(|app, tn_id, obj_tp, obj_id| {
+				cloudillo_search::objects::schedule_object(app, tn_id, obj_tp, obj_id);
+			});
+		extensions.insert(search_object_fn);
+
+		// Which actions are indexed, and what text comes out of them, is declared
+		// per type in the DSL. This is how `cloudillo-search` reaches those
+		// declarations without depending on `cloudillo-action`.
+		let action_search_rules_fn: cloudillo_core::ActionSearchRulesFn =
+			Box::new(move |typ, sub_typ| {
+				let key = dsl_for_search.resolve_action_type(typ, sub_typ)?;
+				let def = dsl_for_search.get_definition(&key)?;
+				Some((key.into(), def.search.clone()))
+			});
+		extensions.insert(action_search_rules_fn);
+		// Where those parsed manifests are memoised. Per-`App` rather than a
+		// process static — see `ActionRulesCache`'s docs.
+		extensions.insert(cloudillo_search::objects::new_action_rules_cache());
+		// Same shape, for the `doc_formats` resolution — see `DocFormatCache`.
+		extensions.insert(cloudillo_core::doc_format::new_doc_format_cache());
 
 		// Register schedule_email for core-side tasks (e.g. ACME renewal)
 		let schedule_email_fn: cloudillo_core::ScheduleEmailFn = Box::new(|app, tn_id, params| {
@@ -361,6 +406,21 @@ impl AppBuilder {
 		let proxy_tokens = Arc::new(cloudillo_core::ProxyTokenCache::new());
 		let profile_me = Arc::new(cloudillo_core::ProfileMeCache::new());
 
+		// The doc formats this build ships, read out of the frontend bundle. Unlike
+		// the action manifests above, a bad one here is not fatal: `dist_dir` is
+		// externally supplied and often absent in dev, and a stale dist must not
+		// brick the node. The validator is passed in because the rules DSL lives in
+		// `cloudillo-search`, which depends on `cloudillo-core` — validating inside
+		// the loader would be a dependency cycle.
+		let bundled_apps = Arc::new(cloudillo_core::bundled_apps::BundledAppRegistry::load(
+			&self.opts.dist_dir,
+			|search| {
+				cloudillo_search::rules::IndexRules::parse(search)
+					.map(|_| ())
+					.map_err(|e| e.to_string())
+			},
+		));
+
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker,
@@ -372,6 +432,7 @@ impl AppBuilder {
 			opts: self.opts,
 			broadcast: cloudillo_core::BroadcastManager::new(),
 			permission_checker: Arc::new(tokio::sync::RwLock::new(abac::PermissionChecker::new())),
+			bundled_apps,
 
 			auth_adapter,
 			meta_adapter,
@@ -401,6 +462,8 @@ impl AppBuilder {
 		cloudillo_profile::init(&app)?;
 		crate::auth::init(&app)?;
 		crate::email::init(&app)?;
+		cloudillo_search::init(&app)?;
+		cloudillo_core::maintenance::init(&app)?;
 		cloudillo_core::acme::register_tasks(&app)?;
 		let (api_router, app_router, http_router) = routes::init(app.clone());
 
@@ -415,6 +478,13 @@ impl AppBuilder {
 		// Schedule recurring file-subsystem jobs (blob GC). Needs scheduler
 		// registration done above and settings service available.
 		file::schedule_recurring(&app).await?;
+
+		// Weekly search reindex, plus the startup pass that rebuilds any tenant
+		// whose index predates this build's extraction rules.
+		cloudillo_search::schedule_recurring(&app).await?;
+
+		// Nightly FTS merge + WAL checkpoint + conditional VACUUM of meta.db.
+		cloudillo_core::maintenance::schedule(&app).await?;
 
 		// Start scheduler
 		app.scheduler.start(app.clone());
@@ -505,6 +575,26 @@ impl AppBuilder {
 impl Default for AppBuilder {
 	fn default() -> Self {
 		Self::new()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	/// `AppBuilder::run` parses every action definition's `search` block and
+	/// refuses to boot on a bad one, so a mistyped key in a bundled definition is
+	/// a startup failure. Checking the bundled set here makes that a test failure
+	/// instead — and keeps it checked as the field-rule DSL grows.
+	///
+	/// It lives in this crate because `cloudillo-search` deliberately does not
+	/// depend on `cloudillo-action`; this is the only place both are in scope.
+	#[test]
+	fn every_bundled_action_definition_parses_as_search_rules() {
+		for def in cloudillo_action::dsl::definitions::get_definitions() {
+			let Some(search) = &def.search else { continue };
+			if let Err(e) = cloudillo_search::rules::ActionSearchRules::parse(search) {
+				panic!("action definition '{}' has an invalid search manifest: {e}", def.r#type);
+			}
+		}
 	}
 }
 // vim: ts=4

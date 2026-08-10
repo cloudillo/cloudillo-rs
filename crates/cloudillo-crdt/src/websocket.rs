@@ -578,6 +578,12 @@ async fn apply_and_store(
 		update_data.len()
 	);
 	record_file_modification_throttled(app, conn).await;
+	// The hook only enqueues a debounced task, so an editing burst collapses into one
+	// run well after the document goes quiet. Same seam `cloudillo-rtdb` uses after a
+	// committed transaction.
+	if let Ok(index) = app.ext::<cloudillo_core::SearchIndexFn>() {
+		index(app, conn.tn_id, &conn.doc_id);
+	}
 	true
 }
 

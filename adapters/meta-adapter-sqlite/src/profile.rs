@@ -217,7 +217,19 @@ pub(crate) async fn list(
 		}
 	}
 
-	query.push(" ORDER BY name LIMIT 100");
+	// Default is the name-ordered top-100 every UI listing expects. `limit`/`after_id_tag`
+	// switch to an `id_tag` keyset — the only order stable enough to walk a whole tenant
+	// while it is being written to.
+	if let (None, None) = (opts.limit, &opts.after_id_tag) {
+		query.push(" ORDER BY name LIMIT 100");
+	} else {
+		if let Some(after) = &opts.after_id_tag {
+			query.push(" AND id_tag > ").push_bind(after.as_str());
+		}
+		query
+			.push(" ORDER BY id_tag LIMIT ")
+			.push_bind(i64::from(opts.limit.unwrap_or(100).clamp(1, 1000)));
+	}
 
 	let res = query
 		.build()

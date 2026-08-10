@@ -60,6 +60,7 @@ pub(crate) mod idp;
 pub(crate) mod misc;
 pub(crate) mod pim;
 pub(crate) mod profile;
+pub(crate) mod search;
 pub(crate) mod shared;
 pub(crate) mod websocket;
 
@@ -119,6 +120,9 @@ fn all_api_tables() -> axum::Router<crate::prelude::App> {
 		.merge(profile::registration())
 		.merge(profile::public_discovery())
 		.merge(profile::recovery_public())
+		.merge(search::search())
+		.merge(search::reindex())
+		.merge(search::doc_formats())
 		.merge(shared::well_known_dav())
 		.merge(websocket::all())
 }
@@ -162,6 +166,7 @@ mod tests {
 			("misc", include_str!("misc.rs")),
 			("pim", include_str!("pim.rs")),
 			("profile", include_str!("profile.rs")),
+			("search", include_str!("search.rs")),
 			("shared", include_str!("shared.rs")),
 			("websocket", include_str!("websocket.rs")),
 		];

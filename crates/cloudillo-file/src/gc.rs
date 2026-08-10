@@ -156,8 +156,11 @@ async fn sweep_managed_files(app: &App, tn_id: TnId, cutoff: Timestamp) -> ClRes
 			continue;
 		}
 		match app.meta_adapter.hard_delete_file(tn_id, f_id).await {
-			Ok(()) => {
+			Ok(file_id) => {
 				debug!("gc: tenant {} hard-deleted managed file f_id={}", tn_id, f_id);
+				if let Some(file_id) = &file_id {
+					cloudillo_core::search_index_file(app, tn_id, file_id);
+				}
 				deleted += 1;
 			}
 			Err(e) => warn!("gc: tenant {} failed to hard-delete f_id={}: {}", tn_id, f_id, e),

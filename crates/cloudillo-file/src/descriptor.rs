@@ -335,6 +335,9 @@ impl Task<App> for FileIdGeneratorTask {
 
 		// Finalize the file - sets file_id and transitions status from 'P' to 'A' atomically
 		app.meta_adapter.finalize_file(self.tn_id, self.f_id, &file_id).await?;
+		// Where most files first become searchable: until now the row had no
+		// `file_id` at all.
+		cloudillo_core::search_index_file(app, self.tn_id, &file_id);
 
 		// Broadcast FILE_ID_GENERATED event to all connections on this tenant
 		// Frontend clients will filter based on whether they're tracking this temp ID

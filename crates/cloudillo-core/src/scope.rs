@@ -67,6 +67,12 @@ pub fn scope_permits(scope: Option<&str>, method: &Method, path: &str) -> bool {
 		Some(TokenScope::File { .. }) => {
 			path.starts_with("/api/files/")
 				|| path == "/api/files"
+				// Document-scoped full-text search: an app (or share-link guest)
+				// searching inside the one document it was handed; the handler
+				// confines results to that document's tree and to file/document
+				// rows. `/api/doc-formats` is deliberately NOT here — registering
+				// index rules is shell-mediated, out of reach of app credentials.
+				|| path == "/api/search"
 				|| path.starts_with("/ws/rtdb/")
 				|| path.starts_with("/ws/crdt/")
 				// Reachable for the `?via=` cross-document re-scoping branch, which takes
@@ -136,10 +142,18 @@ mod tests {
 		assert!(scope_permits(s, &Method::GET, "/ws/crdt/f1~abc"));
 		// Must stay reachable for `?via=`; rejecting the bare branch is the handler's job.
 		assert!(scope_permits(s, &Method::POST, "/api/auth/access-token"));
+		// In-document search: the handler confines results to the scoped tree.
+		assert!(scope_permits(s, &Method::GET, "/api/search"));
+		// ...but the whitelist is an exact match, so the sibling rebuild route
+		// (owner/leader only) is not delegable to a file-scoped token.
+		assert!(!scope_permits(s, &Method::POST, "/api/search/reindex"));
 
 		assert!(!scope_permits(s, &Method::POST, "/api/idp/identities"));
 		assert!(!scope_permits(s, &Method::PUT, "/api/settings/foo"));
 		assert!(!scope_permits(s, &Method::GET, "/api/auth/proxy-token"));
+		// Claiming a document type is never delegable to an app's own token.
+		assert!(!scope_permits(s, &Method::GET, "/api/doc-formats"));
+		assert!(!scope_permits(s, &Method::PUT, "/api/doc-formats/cloudillo%2Fnotillo"));
 	}
 
 	#[test]
