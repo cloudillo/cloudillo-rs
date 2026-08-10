@@ -244,7 +244,10 @@ pub async fn duplicate_rtdb_content(
 	for (path, data) in docs {
 		tx.update(&path, data).await?;
 	}
-	drop(tx); // Auto-commits via Drop implementation
+	// Must be explicit: `RedbTransaction` has no `Drop` impl, and dropping the handle
+	// closes the actor's command channel, which makes redb auto-*rollback* and swallow
+	// every pending `ChangeEvent` — a silently empty duplicate.
+	tx.commit().await?;
 
 	Ok(())
 }

@@ -5,10 +5,10 @@ use crate::error::from_redb_error;
 use crate::{DatabaseInstance, storage};
 use cloudillo_types::error::ClResult;
 use cloudillo_types::rtdb_adapter::{
-	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, SortField,
+	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, SortField, project_doc,
 };
 use cloudillo_types::types::TnId;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -20,16 +20,33 @@ fn u64_to_f64(v: u64) -> f64 {
 	v as f64
 }
 
-/// Query context grouping related parameters
-struct QueryContext<'a> {
-	tn_id: TnId,
-	db_id: &'a str,
-	path: &'a str,
-	filter: &'a QueryFilter,
-	per_tenant_files: bool,
+/// Which collection, in which tenant's database, a query addresses.
+pub(crate) struct QueryScope<'a> {
+	pub tn_id: TnId,
+	pub db_id: &'a str,
+	pub path: &'a str,
+	pub per_tenant_files: bool,
 }
 
-/// Execute a query against a collection
+/// The two tables every query path reads.
+///
+/// Generic over the table type rather than over a transaction: redb has no common
+/// transaction trait, but `ReadOnlyTable` and `Table` both implement
+/// [`ReadableTable`]. That lets one query engine serve both [`execute_query`] on a
+/// read transaction and `Transaction::query`'s read *through the open write
+/// transaction*, which sees its own uncommitted writes.
+pub(crate) struct QueryTables<'a, T> {
+	pub docs: &'a T,
+	pub idx: &'a T,
+}
+
+/// Query context grouping related parameters
+struct QueryContext<'a> {
+	scope: &'a QueryScope<'a>,
+	filter: &'a QueryFilter,
+}
+
+/// Execute a query against a collection, on its own read transaction.
 pub fn execute_query(
 	instance: &Arc<DatabaseInstance>,
 	tn_id: TnId,
@@ -38,31 +55,45 @@ pub fn execute_query(
 	opts: &QueryOptions,
 	per_tenant_files: bool,
 ) -> ClResult<Vec<Value>> {
+	let tx = instance.db()?.begin_read().map_err(from_redb_error)?;
+	let docs = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
+	let idx = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
+	let scope = QueryScope { tn_id, db_id, path, per_tenant_files };
+	execute_query_tables(instance, &QueryTables { docs: &docs, idx: &idx }, &scope, opts)
+}
+
+/// Execute a query against already-open tables.
+pub(crate) fn execute_query_tables<T>(
+	instance: &Arc<DatabaseInstance>,
+	tables: &QueryTables<'_, T>,
+	scope: &QueryScope<'_>,
+	opts: &QueryOptions,
+) -> ClResult<Vec<Value>>
+where
+	T: ReadableTable<&'static str, &'static str>,
+{
 	// Dispatch to aggregation if requested
 	if let Some(ref aggregate) = opts.aggregate {
-		return execute_aggregate(instance, tn_id, db_id, path, opts, aggregate, per_tenant_files);
+		return execute_aggregate(instance, tables, scope, opts, aggregate);
 	}
-
-	let tx = instance.db.begin_read().map_err(from_redb_error)?;
-	let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
 
 	// Try index-based query first
 	if let Some(ref filter) = opts.filter {
-		let ctx = QueryContext { tn_id, db_id, path, filter, per_tenant_files };
-		if let Some(docs) = try_index_query(instance, &tx, &ctx)? {
+		let ctx = QueryContext { scope, filter };
+		if let Some(docs) = try_index_query(instance, tables, &ctx)? {
 			return Ok(apply_sort_limit(docs, opts));
 		}
 	}
 
 	// Fall back to collection scan
-	let prefix = if per_tenant_files {
-		format!("{}/{}/", db_id, path)
+	let prefix = if scope.per_tenant_files {
+		format!("{}/{}/", scope.db_id, scope.path)
 	} else {
-		format!("{}/{}/{}/", tn_id.0, db_id, path)
+		format!("{}/{}/{}/", scope.tn_id.0, scope.db_id, scope.path)
 	};
 
 	let mut results = Vec::new();
-	let range = doc_table.range(prefix.as_str()..).map_err(from_redb_error)?;
+	let range = tables.docs.range(prefix.as_str()..).map_err(from_redb_error)?;
 
 	for item in range {
 		let (key, value) = item.map_err(from_redb_error)?;
@@ -106,15 +137,18 @@ pub fn execute_query(
 }
 
 /// Try to execute a query using an index if available
-fn try_index_query(
+fn try_index_query<T>(
 	instance: &Arc<DatabaseInstance>,
-	tx: &redb::ReadTransaction,
+	tables: &QueryTables<'_, T>,
 	ctx: &QueryContext,
-) -> ClResult<Option<Vec<Value>>> {
+) -> ClResult<Option<Vec<Value>>>
+where
+	T: ReadableTable<&'static str, &'static str>,
+{
 	let indexed_fields = instance.indexed_fields.read().map_err(|_| {
 		cloudillo_types::error::Error::Internal("indexed_fields rwlock poisoned".into())
 	})?;
-	let indexed = match indexed_fields.get(ctx.path) {
+	let indexed = match indexed_fields.get(ctx.scope.path) {
 		Some(f) => f.clone(),
 		None => return Ok(None),
 	};
@@ -124,28 +158,28 @@ fn try_index_query(
 	// Check if any filter field is indexed
 	for (field, value) in &ctx.filter.equals {
 		if indexed.iter().any(|f| f.as_ref() == field.as_str()) {
-			return Ok(Some(execute_index_query(tx, ctx, field, value)?));
+			return Ok(Some(execute_index_query(tables, ctx, field, value)?));
 		}
 	}
 
 	// Check if any arrayContains field is indexed
 	for (field, value) in &ctx.filter.array_contains {
 		if indexed.iter().any(|f| f.as_ref() == field.as_str()) {
-			return Ok(Some(execute_index_query(tx, ctx, field, value)?));
+			return Ok(Some(execute_index_query(tables, ctx, field, value)?));
 		}
 	}
 
 	// Check if any arrayContainsAny field is indexed
 	for (field, values) in &ctx.filter.array_contains_any {
 		if indexed.iter().any(|f| f.as_ref() == field.as_str()) {
-			return Ok(Some(execute_index_query_any(tx, ctx, field, values)?));
+			return Ok(Some(execute_index_query_any(tables, ctx, field, values)?));
 		}
 	}
 
 	// Check if any arrayContainsAll field is indexed (use first value for index scan)
 	for (field, values) in &ctx.filter.array_contains_all {
 		if !values.is_empty() && indexed.iter().any(|f| f.as_ref() == field.as_str()) {
-			return Ok(Some(execute_index_query(tx, ctx, field, &values[0])?));
+			return Ok(Some(execute_index_query(tables, ctx, field, &values[0])?));
 		}
 	}
 
@@ -153,24 +187,24 @@ fn try_index_query(
 }
 
 /// Execute a query using an index
-fn execute_index_query(
-	tx: &redb::ReadTransaction,
+fn execute_index_query<T>(
+	tables: &QueryTables<'_, T>,
 	ctx: &QueryContext,
 	field: &str,
 	value: &Value,
-) -> ClResult<Vec<Value>> {
-	let index_table = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
-	let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
-
+) -> ClResult<Vec<Value>>
+where
+	T: ReadableTable<&'static str, &'static str>,
+{
 	let value_str = storage::value_to_string(value);
-	let index_prefix = if ctx.per_tenant_files {
-		format!("{}/_idx/{}/{}/", ctx.path, field, value_str)
+	let index_prefix = if ctx.scope.per_tenant_files {
+		format!("{}/_idx/{}/{}/", ctx.scope.path, field, value_str)
 	} else {
-		format!("{}/{}/_idx/{}/{}/", ctx.tn_id.0, ctx.path, field, value_str)
+		format!("{}/{}/_idx/{}/{}/", ctx.scope.tn_id.0, ctx.scope.path, field, value_str)
 	};
 
 	let mut results = Vec::new();
-	let range = index_table.range(index_prefix.as_str()..).map_err(from_redb_error)?;
+	let range = tables.idx.range(index_prefix.as_str()..).map_err(from_redb_error)?;
 
 	for item in range {
 		let (key, _) = item.map_err(from_redb_error)?;
@@ -184,14 +218,10 @@ fn execute_index_query(
 		let doc_id = extract_doc_id_from_index_key(key_str);
 
 		// Build document key - must match the key format used in create/update
-		let doc_key = if ctx.per_tenant_files {
-			format!("{}/{}/{}", ctx.db_id, ctx.path, doc_id)
-		} else {
-			format!("{}/{}/{}/{}", ctx.tn_id.0, ctx.db_id, ctx.path, doc_id)
-		};
+		let doc_key = doc_key(ctx.scope, &doc_id);
 
 		// Fetch document
-		if let Some(json) = doc_table.get(doc_key.as_str()).map_err(from_redb_error)? {
+		if let Some(json) = tables.docs.get(doc_key.as_str()).map_err(from_redb_error)? {
 			let mut doc: Value = serde_json::from_str(json.value())?;
 			storage::inject_doc_id(&mut doc, &doc_id);
 
@@ -205,28 +235,37 @@ fn execute_index_query(
 	Ok(results)
 }
 
+/// The storage key of one document, in whichever layout this adapter runs.
+fn doc_key(scope: &QueryScope<'_>, doc_id: &str) -> String {
+	if scope.per_tenant_files {
+		format!("{}/{}/{}", scope.db_id, scope.path, doc_id)
+	} else {
+		format!("{}/{}/{}/{}", scope.tn_id.0, scope.db_id, scope.path, doc_id)
+	}
+}
+
 /// Execute a query using an index, scanning for any of several values and deduplicating results
-fn execute_index_query_any(
-	tx: &redb::ReadTransaction,
+fn execute_index_query_any<T>(
+	tables: &QueryTables<'_, T>,
 	ctx: &QueryContext,
 	field: &str,
 	values: &[Value],
-) -> ClResult<Vec<Value>> {
-	let index_table = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
-	let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
-
+) -> ClResult<Vec<Value>>
+where
+	T: ReadableTable<&'static str, &'static str>,
+{
 	let mut seen_ids = HashSet::new();
 	let mut results = Vec::new();
 
 	for value in values {
 		let value_str = storage::value_to_string(value);
-		let index_prefix = if ctx.per_tenant_files {
-			format!("{}/_idx/{}/{}/", ctx.path, field, value_str)
+		let index_prefix = if ctx.scope.per_tenant_files {
+			format!("{}/_idx/{}/{}/", ctx.scope.path, field, value_str)
 		} else {
-			format!("{}/{}/_idx/{}/{}/", ctx.tn_id.0, ctx.path, field, value_str)
+			format!("{}/{}/_idx/{}/{}/", ctx.scope.tn_id.0, ctx.scope.path, field, value_str)
 		};
 
-		let range = index_table.range(index_prefix.as_str()..).map_err(from_redb_error)?;
+		let range = tables.idx.range(index_prefix.as_str()..).map_err(from_redb_error)?;
 
 		for item in range {
 			let (key, _) = item.map_err(from_redb_error)?;
@@ -242,13 +281,9 @@ fn execute_index_query_any(
 				continue;
 			}
 
-			let doc_key = if ctx.per_tenant_files {
-				format!("{}/{}/{}", ctx.db_id, ctx.path, doc_id)
-			} else {
-				format!("{}/{}/{}/{}", ctx.tn_id.0, ctx.db_id, ctx.path, doc_id)
-			};
+			let doc_key = doc_key(ctx.scope, &doc_id);
 
-			if let Some(json) = doc_table.get(doc_key.as_str()).map_err(from_redb_error)? {
+			if let Some(json) = tables.docs.get(doc_key.as_str()).map_err(from_redb_error)? {
 				let mut doc: Value = serde_json::from_str(json.value())?;
 				storage::inject_doc_id(&mut doc, &doc_id);
 
@@ -262,7 +297,7 @@ fn execute_index_query_any(
 	Ok(results)
 }
 
-/// Apply sorting and pagination to results
+/// Apply sorting, pagination and the field projection to results
 fn apply_sort_limit(mut docs: Vec<Value>, opts: &QueryOptions) -> Vec<Value> {
 	// Apply sorting
 	if let Some(ref sort_fields) = opts.sort {
@@ -278,7 +313,14 @@ fn apply_sort_limit(mut docs: Vec<Value>, opts: &QueryOptions) -> Vec<Value> {
 	// Apply limit
 	let end = opts.limit.map_or(docs.len(), |l| (start + l as usize).min(docs.len()));
 
-	docs[start..end].to_vec()
+	let page = &docs[start..end];
+
+	// Projection runs last, so filtering and sorting still see fields the caller
+	// asked not to receive - `.orderBy('o')` must work under `.select('ti')`.
+	match opts.select {
+		Some(ref select) => page.iter().map(|doc| project_doc(doc, select)).collect(),
+		None => page.to_vec(),
+	}
 }
 
 /// Compare two documents for sorting
@@ -440,15 +482,16 @@ impl GroupAccumulator {
 }
 
 /// Decide aggregation strategy and dispatch.
-fn execute_aggregate(
+fn execute_aggregate<T>(
 	instance: &Arc<DatabaseInstance>,
-	tn_id: TnId,
-	db_id: &str,
-	path: &str,
+	tables: &QueryTables<'_, T>,
+	scope: &QueryScope<'_>,
 	opts: &QueryOptions,
 	aggregate: &AggregateOptions,
-	per_tenant_files: bool,
-) -> ClResult<Vec<Value>> {
+) -> ClResult<Vec<Value>>
+where
+	T: ReadableTable<&'static str, &'static str>,
+{
 	// Index-only path: no filter, no data-dependent ops (count only), field is indexed
 	let can_use_index =
 		opts.filter.as_ref().is_none_or(QueryFilter::is_empty) && aggregate.ops.is_empty() && {
@@ -456,35 +499,33 @@ fn execute_aggregate(
 				cloudillo_types::error::Error::Internal("indexed_fields rwlock poisoned".into())
 			})?;
 			indexed_fields
-				.get(path)
+				.get(scope.path)
 				.is_some_and(|fields| fields.iter().any(|f| f.as_ref() == aggregate.group_by))
 		};
 
 	if can_use_index {
-		execute_aggregate_index_only(instance, tn_id, path, opts, aggregate, per_tenant_files)
+		execute_aggregate_index_only(tables.idx, scope, opts, aggregate)
 	} else {
-		execute_aggregate_scan(instance, tn_id, db_id, path, opts, aggregate, per_tenant_files)
+		execute_aggregate_scan(tables.docs, scope, opts, aggregate)
 	}
 }
 
 /// Pure index scan aggregation — no document fetches needed.
-fn execute_aggregate_index_only(
-	instance: &Arc<DatabaseInstance>,
-	tn_id: TnId,
-	path: &str,
+fn execute_aggregate_index_only<T>(
+	index_table: &T,
+	scope: &QueryScope<'_>,
 	opts: &QueryOptions,
 	aggregate: &AggregateOptions,
-	per_tenant_files: bool,
-) -> ClResult<Vec<Value>> {
-	let tx = instance.db.begin_read().map_err(from_redb_error)?;
-	let index_table = tx.open_table(storage::TABLE_INDEXES).map_err(from_redb_error)?;
-
+) -> ClResult<Vec<Value>>
+where
+	T: ReadableTable<&'static str, &'static str>,
+{
 	// Index key format: "{path}/_idx/{field}/{value}/{doc_id}"
 	// or with tenant: "{tn_id}/{path}/_idx/{field}/{value}/{doc_id}"
-	let index_prefix = if per_tenant_files {
-		format!("{}/_idx/{}/", path, aggregate.group_by)
+	let index_prefix = if scope.per_tenant_files {
+		format!("{}/_idx/{}/", scope.path, aggregate.group_by)
 	} else {
-		format!("{}/{}/_idx/{}/", tn_id.0, path, aggregate.group_by)
+		format!("{}/{}/_idx/{}/", scope.tn_id.0, scope.path, aggregate.group_by)
 	};
 
 	let mut counts: HashMap<String, u64> = HashMap::new();
@@ -540,22 +581,19 @@ fn execute_aggregate_index_only(
 }
 
 /// Collection scan aggregation — supports filters and all ops.
-fn execute_aggregate_scan(
-	instance: &Arc<DatabaseInstance>,
-	tn_id: TnId,
-	db_id: &str,
-	path: &str,
+fn execute_aggregate_scan<T>(
+	doc_table: &T,
+	scope: &QueryScope<'_>,
 	opts: &QueryOptions,
 	aggregate: &AggregateOptions,
-	per_tenant_files: bool,
-) -> ClResult<Vec<Value>> {
-	let tx = instance.db.begin_read().map_err(from_redb_error)?;
-	let doc_table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(from_redb_error)?;
-
-	let prefix = if per_tenant_files {
-		format!("{}/{}/", db_id, path)
+) -> ClResult<Vec<Value>>
+where
+	T: ReadableTable<&'static str, &'static str>,
+{
+	let prefix = if scope.per_tenant_files {
+		format!("{}/{}/", scope.db_id, scope.path)
 	} else {
-		format!("{}/{}/{}/", tn_id.0, db_id, path)
+		format!("{}/{}/{}/", scope.tn_id.0, scope.db_id, scope.path)
 	};
 
 	let mut groups: HashMap<String, GroupAccumulator> = HashMap::new();

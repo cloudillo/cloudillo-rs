@@ -7,7 +7,7 @@
 //! Supports field operations ($op), functions ($fn), and query operations ($query).
 
 use crate::prelude::*;
-use cloudillo_types::rtdb_adapter::{QueryOptions, RtdbAdapter, Transaction};
+use cloudillo_types::rtdb_adapter::{QueryOptions, Transaction};
 use serde_json::Value;
 
 /// Convert `usize` to `f64`, accepting minor precision loss for values above 2^53.
@@ -21,11 +21,12 @@ fn usize_to_f64(v: usize) -> f64 {
 /// Scans the data object for special computed value expressions and replaces them
 /// with their computed results.
 ///
-/// Uses transaction-local reads to prevent race conditions. Field operations like $op:increment
-/// must read from the transaction's uncommitted state to ensure atomicity.
+/// Every read goes through `txn`, never the adapter, for two load-bearing reasons:
+/// field operations like `$op:increment` must see the transaction's uncommitted state
+/// to be atomic, and an adapter call made while the transaction is open deadlocks
+/// against a queued `compact_storage` — see `RtdbAdapter::transaction`.
 pub async fn process_computed_values(
 	txn: &dyn Transaction,
-	adapter: &dyn RtdbAdapter,
 	tn_id: TnId,
 	db_id: &str,
 	path: &str,
@@ -60,7 +61,7 @@ pub async fn process_computed_values(
 				}
 				// Check for $query (query operation)
 				else if let Some(query_type) = inner.get("$query").and_then(|v| v.as_str()) {
-					match process_query_operation(adapter, tn_id, db_id, query_type, inner).await {
+					match process_query_operation(txn, query_type, inner).await {
 						Ok(computed) => replacements.push((key.clone(), computed)),
 						Err(e) => {
 							warn!("Query operation failed for {}: {}", key, e);
@@ -242,10 +243,11 @@ fn process_function(fn_name: &str, params: &serde_json::Map<String, Value>) -> C
 }
 
 /// Process query operations ($query)
+///
+/// Reads through the transaction, so an aggregate computed here counts the rows
+/// this same transaction has already written.
 async fn process_query_operation(
-	adapter: &dyn RtdbAdapter,
-	tn_id: TnId,
-	db_id: &str,
+	txn: &dyn Transaction,
 	query_type: &str,
 	params: &serde_json::Map<String, Value>,
 ) -> ClResult<Value> {
@@ -256,8 +258,7 @@ async fn process_query_operation(
 
 	match query_type {
 		"count" => {
-			let opts = QueryOptions::new();
-			let results = adapter.query(tn_id, db_id, path, opts).await?;
+			let results = txn.query(path, &QueryOptions::new()).await?;
 			let count = results.len() as u64;
 			Ok(Value::Number(count.into()))
 		}
@@ -266,8 +267,7 @@ async fn process_query_operation(
 				.get("field")
 				.and_then(|v| v.as_str())
 				.ok_or_else(|| Error::ValidationError("sum requires field".into()))?;
-			let opts = QueryOptions::new();
-			let results = adapter.query(tn_id, db_id, path, opts).await?;
+			let results = txn.query(path, &QueryOptions::new()).await?;
 			let sum: f64 =
 				results.iter().filter_map(|doc| doc.get(field)).filter_map(Value::as_f64).sum();
 			Ok(serde_json::json!(sum))
@@ -277,8 +277,7 @@ async fn process_query_operation(
 				.get("field")
 				.and_then(|v| v.as_str())
 				.ok_or_else(|| Error::ValidationError("avg requires field".into()))?;
-			let opts = QueryOptions::new();
-			let results = adapter.query(tn_id, db_id, path, opts).await?;
+			let results = txn.query(path, &QueryOptions::new()).await?;
 			let values: Vec<f64> = results
 				.iter()
 				.filter_map(|doc| doc.get(field))
@@ -296,8 +295,7 @@ async fn process_query_operation(
 				.get("field")
 				.and_then(|v| v.as_str())
 				.ok_or_else(|| Error::ValidationError("min requires field".into()))?;
-			let opts = QueryOptions::new();
-			let results = adapter.query(tn_id, db_id, path, opts).await?;
+			let results = txn.query(path, &QueryOptions::new()).await?;
 			let min = results
 				.iter()
 				.filter_map(|doc| doc.get(field))
@@ -310,8 +308,7 @@ async fn process_query_operation(
 				.get("field")
 				.and_then(|v| v.as_str())
 				.ok_or_else(|| Error::ValidationError("max requires field".into()))?;
-			let opts = QueryOptions::new();
-			let results = adapter.query(tn_id, db_id, path, opts).await?;
+			let results = txn.query(path, &QueryOptions::new()).await?;
 			let max = results
 				.iter()
 				.filter_map(|doc| doc.get(field))
@@ -320,17 +317,15 @@ async fn process_query_operation(
 			Ok(max.map_or(Value::Null, |v| serde_json::json!(v)))
 		}
 		"exists" => {
-			let doc = adapter.get(tn_id, db_id, path).await?;
+			let doc = txn.get(path).await?;
 			Ok(Value::Bool(doc.is_some()))
 		}
 		"first" => {
-			let opts = QueryOptions::new().with_limit(1);
-			let results = adapter.query(tn_id, db_id, path, opts).await?;
+			let results = txn.query(path, &QueryOptions::new().with_limit(1)).await?;
 			Ok(results.first().cloned().unwrap_or(Value::Null))
 		}
 		"last" => {
-			let opts = QueryOptions::new();
-			let results = adapter.query(tn_id, db_id, path, opts).await?;
+			let results = txn.query(path, &QueryOptions::new()).await?;
 			Ok(results.last().cloned().unwrap_or(Value::Null))
 		}
 		_ => Err(Error::ValidationError(format!("Unknown query operation: {}", query_type))),

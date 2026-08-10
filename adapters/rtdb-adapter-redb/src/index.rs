@@ -34,7 +34,8 @@ pub async fn create_index_impl(
 			format!("{}/{}/_meta/indexes", tn_id.0, path)
 		};
 
-		let tx = instance.db.begin_write().map_err(from_redb_error)?;
+		let db = instance.db()?;
+		let tx = db.begin_write().map_err(from_redb_error)?;
 
 		// Load existing indexes
 		let mut indexes: Vec<String> = {

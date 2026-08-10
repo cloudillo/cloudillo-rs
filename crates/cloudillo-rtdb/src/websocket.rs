@@ -17,7 +17,7 @@
 
 use crate::prelude::*;
 use axum::extract::ws::{Message, WebSocket};
-use cloudillo_types::rtdb_adapter::{ChangeEvent, LockMode};
+use cloudillo_types::rtdb_adapter::{ChangeEvent, LockMode, project_doc};
 use cloudillo_types::types::AccessLevel;
 use cloudillo_types::utils::random_id;
 use futures::sink::SinkExt;
@@ -255,6 +255,7 @@ pub async fn handle_rtdb_connection(
 				ChangeEvent::Lock { data, .. } => ("lock", Some(data.clone())),
 				ChangeEvent::Unlock { data, .. } => ("unlock", Some(data.clone())),
 				ChangeEvent::Ready { data, .. } => ("ready", data.clone()),
+				ChangeEvent::Replace { data, .. } => ("replace", data.clone()),
 			};
 
 			debug!(
@@ -321,6 +322,22 @@ pub async fn handle_rtdb_connection(
 
 	heartbeat_task.abort();
 	info!("RTDB connection closed: {}", user_id);
+}
+
+/// Read a `select` field projection out of a message payload.
+///
+/// An absent, non-array or empty `select` means "whole documents", so a client
+/// cannot accidentally ask for nothing. Non-string entries are dropped rather
+/// than rejected, matching how the surrounding parsers treat malformed options.
+fn parse_select(payload: &serde_json::Map<String, Value>) -> Option<Vec<String>> {
+	let fields: Vec<String> = payload
+		.get("select")?
+		.as_array()?
+		.iter()
+		.filter_map(|v| v.as_str().map(String::from))
+		.collect();
+
+	(!fields.is_empty()).then_some(fields)
 }
 
 /// Check if the connection can write to the given path.
@@ -426,9 +443,12 @@ async fn handle_rtdb_command(
 					}
 
 					// Check hard locks for write operations
+					// Through the transaction, not the adapter: an adapter call while
+					// this transaction is open takes a second guard on the file's
+					// maintenance barrier and deadlocks behind a queued
+					// `compact_storage`. See `RtdbAdapter::transaction`.
 					if matches!(op_type, "update" | "replace" | "delete")
-						&& let Ok(Some(lock)) =
-							app.rtdb_adapter.check_lock(conn.tn_id, &conn.file_id, &path).await
+						&& let Ok(Some(lock)) = txn.check_lock(&path).await
 						&& lock.mode == LockMode::Hard
 						&& lock.user_id.as_ref() != conn.user_id.as_str()
 					{
@@ -453,7 +473,6 @@ async fn handle_rtdb_command(
 							// CRITICAL: Pass transaction for atomic read-your-own-writes
 							if let Err(e) = crate::computed::process_computed_values(
 								txn.as_ref(),
-								app.rtdb_adapter.as_ref(),
 								conn.tn_id,
 								&conn.file_id,
 								&path,
@@ -489,7 +508,6 @@ async fn handle_rtdb_command(
 							// CRITICAL: Pass transaction for atomic read-your-own-writes
 							if let Err(e) = crate::computed::process_computed_values(
 								txn.as_ref(),
-								app.rtdb_adapter.as_ref(),
 								conn.tn_id,
 								&conn.file_id,
 								&path,
@@ -544,7 +562,6 @@ async fn handle_rtdb_command(
 							// Process computed values in data ($op, $fn, $query)
 							if let Err(e) = crate::computed::process_computed_values(
 								txn.as_ref(),
-								app.rtdb_adapter.as_ref(),
 								conn.tn_id,
 								&conn.file_id,
 								&path,
@@ -617,6 +634,14 @@ async fn handle_rtdb_command(
 				// Record file modification (throttled)
 				record_file_modification_throttled(app, conn).await;
 
+				// Late-bound through an extension because this crate must not
+				// depend on cloudillo-search, which reads documents back through
+				// the adapters. Absent extension = search not wired in; the write
+				// still succeeds. The hook only enqueues a debounced task.
+				if let Ok(index) = app.ext::<cloudillo_core::SearchIndexFn>() {
+					index(app, conn.tn_id, &conn.file_id);
+				}
+
 				let mut result_map = serde_json::Map::new();
 				result_map.insert("results".to_string(), Value::Array(results));
 				RtdbMessage::response(msg.id.clone(), "transactionResult", result_map)
@@ -637,7 +662,13 @@ async fn handle_rtdb_command(
 			// Build query options from payload
 			let mut opts = QueryOptions::new();
 
-			// Parse filter
+			// `QueryFilter` is not `deny_unknown_fields` and the decode error is
+			// swallowed, so an unrecognised option degrades to *no filter at all*
+			// rather than to an error — as do the other options below. Protocol
+			// additions are therefore safe in one direction only: a newer client on
+			// an older server gets a superset of what it asked for (`select`
+			// ignored, whole documents back), never a rejection, and must not assume
+			// an option took effect without checking the response.
 			if let Some(filter_obj) = msg.payload.get("filter")
 				&& let Ok(filter) = serde_json::from_value::<QueryFilter>(filter_obj.clone())
 			{
@@ -685,6 +716,12 @@ async fn handle_rtdb_command(
 				opts = opts.with_aggregate(agg);
 			}
 
+			// Parse select (field projection)
+			if let Some(select) = parse_select(&msg.payload) {
+				debug!("RTDB query select: {} fields", select.len());
+				opts = opts.with_select(select);
+			}
+
 			match app.rtdb_adapter.query(conn.tn_id, &conn.file_id, path, opts).await {
 				Ok(documents) => {
 					debug!("RTDB query result: {} documents", documents.len());
@@ -702,9 +739,18 @@ async fn handle_rtdb_command(
 		"get" => {
 			// Fetch single document
 			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+			let select = parse_select(&msg.payload);
 
 			match app.rtdb_adapter.get(conn.tn_id, &conn.file_id, path).await {
 				Ok(document) => {
+					// Projected here rather than in the adapter: `get` takes no
+					// options, and widening the trait for one caller would touch
+					// every implementation for no gain - a single document is
+					// already fetched whole either way.
+					let document = match (&select, document) {
+						(Some(select), Some(doc)) => Some(project_doc(&doc, select)),
+						(_, doc) => doc,
+					};
 					let mut result_map = serde_json::Map::new();
 					result_map.insert("data".to_string(), document.unwrap_or(Value::Null));
 					RtdbMessage::response(msg.id.clone(), "getResult", result_map)
@@ -740,6 +786,11 @@ async fn handle_rtdb_command(
 				.get("aggregate")
 				.and_then(|obj| serde_json::from_value::<AggregateOptions>(obj.clone()).ok());
 
+			// Parse select from payload. An aggregate subscription ignores it:
+			// the group-by field would have to survive the projection anyway, and
+			// the events it emits are groups rather than documents.
+			let select = if aggregate.is_some() { None } else { parse_select(&msg.payload) };
+
 			// For aggregate subscriptions, subscribe without filter at the adapter level.
 			// The aggregate task applies the filter itself to detect filter transitions
 			// (old doc matched but new doesn't, and vice versa).
@@ -753,6 +804,7 @@ async fn handle_rtdb_command(
 					}
 					None => SubscriptionOptions::all(path),
 				}
+				.with_select(select)
 			};
 
 			match app.rtdb_adapter.subscribe(conn.tn_id, &conn.file_id, sub_opts).await {
@@ -849,13 +901,25 @@ async fn handle_rtdb_command(
 												.await
 											{
 												Ok(groups) => {
-													let update_event = ChangeEvent::Update {
+													// Protocol contract: `replace` carries a
+													// complete result set and the client drops
+													// what it holds before applying it. A
+													// recompute cannot be sent as anything
+													// else: an emptied group is absent rather
+													// than zeroed, so `update` would make the
+													// client merge and keep it forever, and
+													// `ready` is the one-shot initial-snapshot
+													// signal a client resolves its loading
+													// state on.
+													let snapshot_event = ChangeEvent::Replace {
 														path: path.clone().into(),
-														data: Value::Array(groups),
-														old_data: None,
+														data: Some(Value::Array(groups)),
 													};
 													if agg_tx
-														.send((sub_id_clone.clone(), update_event))
+														.send((
+															sub_id_clone.clone(),
+															snapshot_event,
+														))
 														.is_err()
 													{
 														break;

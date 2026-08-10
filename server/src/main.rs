@@ -40,7 +40,13 @@ pub struct Config {
 }
 
 //#[tokio::main(flavor = "current_thread")]
-// This is needed for task::block_in_place() which is used in SNI certificate resolver
+// This is needed for task::block_in_place() which is used in SNI certificate resolver.
+//
+// One async worker: anything CPU-bound must go to the worker pool or `spawn_blocking`,
+// or it stalls every request. The blocking pool keeps tokio's default of 512 threads
+// (`#[tokio::main]` exposes no knob for it), the budget the adapters size their caps
+// against — see `TX_PERMITS` in `rtdb-adapter-redb`, where every open write transaction
+// holds one for its life.
 #[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 #[expect(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

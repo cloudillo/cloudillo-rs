@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#![allow(clippy::expect_used)]
+#![allow(clippy::panic, clippy::expect_used)]
 
 use cloudillo_rtdb_adapter_redb::{AdapterConfig, RtdbAdapterRedb};
 use cloudillo_types::rtdb_adapter::{
-	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, RtdbAdapter,
+	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, RtdbAdapter, SortField,
 };
 use cloudillo_types::types::TnId;
 use serde_json::{Value, json};
@@ -29,6 +29,23 @@ async fn create_test_adapter(per_tenant_files: bool) -> (RtdbAdapterRedb, TempDi
 		.expect("Failed to create adapter");
 
 	(adapter, temp_dir)
+}
+
+/// Read one event off a subscription stream, failing rather than hanging when it
+/// never arrives.
+///
+/// A bare `stream.next().await` turns a suppression regression — an event the
+/// adapter should have delivered but did not — into a suite that hangs forever
+/// instead of a test that fails. The clock is never reached on the happy path.
+async fn next_event<S>(stream: &mut S, what: &str) -> cloudillo_types::rtdb_adapter::ChangeEvent
+where
+	S: futures::Stream<Item = cloudillo_types::rtdb_adapter::ChangeEvent> + Unpin,
+{
+	use futures::StreamExt;
+	tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+		.await
+		.unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+		.unwrap_or_else(|| panic!("the subscription closed while waiting for {what}"))
 }
 
 #[tokio::test]
@@ -1171,4 +1188,510 @@ async fn test_aggregate_scalar_field() {
 
 	let mod_group = results.iter().find(|r| r["group"] == "moderator");
 	assert_eq!(mod_group.and_then(|r| r["count"].as_u64()), Some(1));
+}
+
+// ── Field projections (`select`) ──
+
+/// Seed a page-like collection: a few fields worth listing, a few not.
+async fn create_projection_docs(adapter: &RtdbAdapterRedb) {
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+
+	for (title, order) in &[("Zulu", 3), ("Alpha", 1), ("Mike", 2)] {
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create(
+			"p",
+			json!({"ti": title, "o": order, "ca": "2026-01-01", "cb": "u", "hc": false}),
+		)
+		.await
+		.expect("Failed to create document");
+		tx.commit().await.expect("Failed to commit");
+	}
+}
+
+#[tokio::test]
+async fn test_query_with_select_returns_only_requested_fields() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	create_projection_docs(&adapter).await;
+
+	let opts = QueryOptions::new().with_select(vec!["ti".to_string(), "o".to_string()]);
+	let results = adapter.query(TnId(1), "test_db", "p", opts).await.expect("Failed to query");
+
+	assert_eq!(results.len(), 3);
+	for doc in &results {
+		let obj = doc.as_object().expect("document should be an object");
+		// `id` is injected rather than stored, and every caller keys on it, so a
+		// projection must never drop it.
+		assert!(obj.contains_key("id"), "id must survive the projection");
+		assert!(obj.contains_key("ti"));
+		assert!(obj.contains_key("o"));
+		assert!(!obj.contains_key("ca"), "unselected field must not be returned");
+		assert!(!obj.contains_key("cb"));
+		assert!(!obj.contains_key("hc"));
+		assert_eq!(obj.len(), 3, "id + the two selected fields, nothing else");
+	}
+}
+
+#[tokio::test]
+async fn test_select_still_sorts_and_filters_on_unselected_fields() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	create_projection_docs(&adapter).await;
+
+	// Sorting on `o` while selecting only `ti`: the projection runs last, so the
+	// comparator still sees the field it orders by.
+	let opts = QueryOptions::new()
+		.with_sort(vec![SortField::asc("o")])
+		.with_select(vec!["ti".to_string()]);
+	let results = adapter.query(TnId(1), "test_db", "p", opts).await.expect("Failed to query");
+
+	let titles: Vec<&str> = results.iter().filter_map(|d| d["ti"].as_str()).collect();
+	assert_eq!(titles, vec!["Alpha", "Mike", "Zulu"]);
+	assert!(results[0].get("o").is_none(), "the sort field was not selected");
+
+	// Same for a filter on a field the caller did not ask to receive.
+	let mut filter = QueryFilter::default();
+	filter.equals.insert("cb".to_string(), Value::String("u".to_string()));
+	let opts = QueryOptions::new().with_filter(filter).with_select(vec!["ti".to_string()]);
+	let results = adapter.query(TnId(1), "test_db", "p", opts).await.expect("Failed to query");
+
+	assert_eq!(results.len(), 3, "the filter matched on an unselected field");
+	assert!(results[0].get("cb").is_none());
+}
+
+#[tokio::test]
+async fn test_select_ignores_fields_a_document_does_not_have() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	create_projection_docs(&adapter).await;
+
+	// `tg` is absent from every document here. Selecting it must leave the key
+	// out rather than materialise a null - clients distinguish the two.
+	let opts = QueryOptions::new().with_select(vec!["ti".to_string(), "tg".to_string()]);
+	let results = adapter.query(TnId(1), "test_db", "p", opts).await.expect("Failed to query");
+
+	assert_eq!(results.len(), 3);
+	for doc in &results {
+		assert!(doc.get("tg").is_none(), "absent field must not become null");
+	}
+}
+
+#[tokio::test]
+async fn test_subscribe_with_select_projects_and_suppresses() {
+	use cloudillo_types::rtdb_adapter::{ChangeEvent, SubscriptionOptions};
+
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	let doc_id = tx
+		.create("p", json!({"ti": "Alpha", "o": 1, "ua": "t0"}))
+		.await
+		.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	let opts = SubscriptionOptions::all("p").with_select(Some(vec!["ti".to_string()]));
+	let mut stream = adapter.subscribe(tn_id, db_id, opts).await.expect("Failed to subscribe");
+
+	// Initial replay: projected like a query.
+	match next_event(&mut stream, "the initial Create").await {
+		ChangeEvent::Create { data, .. } => {
+			assert_eq!(data["ti"], "Alpha");
+			assert!(data.get("o").is_none(), "initial docs must be projected too");
+		}
+		other => panic!("expected Create, got {other:?}"),
+	}
+	assert!(matches!(next_event(&mut stream, "Ready").await, ChangeEvent::Ready { .. }));
+
+	// A write that touches no selected field must not wake the subscriber. This
+	// is notillo's hot path: tag sync rewrites `ua` about once a second while
+	// someone types, and each delivered event costs an O(total pages) rebuild.
+	// Adapter-level `update` replaces the whole document, so the untouched fields
+	// are written back verbatim - exactly what a field-level patch produces.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.update(&format!("p/{doc_id}"), json!({"ti": "Alpha", "o": 1, "ua": "t1"}))
+		.await
+		.expect("Failed to update document");
+	tx.commit().await.expect("Failed to commit");
+
+	// Then one that does.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.update(&format!("p/{doc_id}"), json!({"ti": "Renamed", "o": 1, "ua": "t2"}))
+		.await
+		.expect("Failed to update document");
+	tx.commit().await.expect("Failed to commit");
+
+	// The suppressed event is skipped, so the next one through is the rename.
+	match next_event(&mut stream, "the rename Update").await {
+		ChangeEvent::Update { data, .. } => {
+			assert_eq!(data["ti"], "Renamed", "the `ua`-only write should have been suppressed");
+			assert!(data.get("ua").is_none(), "update payload must be projected");
+		}
+		other => panic!("expected Update, got {other:?}"),
+	}
+}
+
+/// A document entering the filter set must be delivered even when no selected
+/// field moved.
+///
+/// The `select` suppression compares only the projected fields, so a write that
+/// flips the filter field alone looks like "nothing changed" — but for a
+/// subscriber whose result set the document has just *entered*, that event is
+/// the only notice it will ever get that the document exists. The sibling test
+/// above subscribes without a filter, which is why it does not catch this.
+#[tokio::test]
+async fn test_subscribe_with_filter_and_select_delivers_set_entry() {
+	use cloudillo_types::rtdb_adapter::{ChangeEvent, SubscriptionOptions};
+
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+
+	// X starts outside the filter, so it is absent from the initial snapshot.
+	// Y starts inside it, to pin that the suppression still works for a document
+	// already in the set.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	let x_id = tx
+		.create("p", json!({"status": "closed", "ti": "Ex", "ua": "t0"}))
+		.await
+		.expect("Failed to create document");
+	let y_id = tx
+		.create("p", json!({"status": "open", "ti": "Why", "ua": "t0"}))
+		.await
+		.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	let filter = QueryFilter::new().with_equals("status", Value::String("open".to_string()));
+	let opts = SubscriptionOptions::filtered("p", filter).with_select(Some(vec!["ti".to_string()]));
+	let mut stream = adapter.subscribe(tn_id, db_id, opts).await.expect("Failed to subscribe");
+
+	// Only Y is in the initial snapshot.
+	match next_event(&mut stream, "the initial Create").await {
+		ChangeEvent::Create { data, .. } => assert_eq!(data["ti"], "Why"),
+		other => panic!("expected Create, got {other:?}"),
+	}
+	assert!(matches!(next_event(&mut stream, "Ready").await, ChangeEvent::Ready { .. }));
+
+	// A non-selected-field write on Y, which is *already* in the set: still
+	// suppressed, or the optimisation is gone.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.update(&format!("p/{y_id}"), json!({"status": "open", "ti": "Why", "ua": "t1"}))
+		.await
+		.expect("Failed to update document");
+	tx.commit().await.expect("Failed to commit");
+
+	// X enters the set: `status` flips, `ti` does not move.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.update(&format!("p/{x_id}"), json!({"status": "open", "ti": "Ex", "ua": "t0"}))
+		.await
+		.expect("Failed to update document");
+	tx.commit().await.expect("Failed to commit");
+
+	// The suppressed Y write is skipped, so the next event through is X's entry.
+	match next_event(&mut stream, "X's set-entry Update").await {
+		ChangeEvent::Update { path, data, .. } => {
+			assert!(
+				path.ends_with(&x_id as &str),
+				"expected the entering document, got {path} (the `ua`-only write on an \
+				 already-matching document should have been suppressed)"
+			);
+			assert_eq!(data["ti"], "Ex");
+			assert!(data.get("status").is_none(), "update payload must be projected");
+		}
+		other => panic!("expected Update, got {other:?}"),
+	}
+}
+
+/// A `Delete` must be filtered like every other event.
+///
+/// `ChangeEvent::data()` returns `None` for a delete, so a generic
+/// `if let Some(data) = event.data()` test *fails open* and hands a filtered
+/// subscriber the paths of documents that never matched its filter. `old_data` —
+/// the pre-delete document, present whenever the document existed — is the right
+/// input.
+#[tokio::test]
+async fn test_subscribe_with_filter_applies_it_to_deletes() {
+	use cloudillo_types::rtdb_adapter::{ChangeEvent, SubscriptionOptions};
+
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+
+	// X is outside the filter, Y inside it.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	let x_id = tx
+		.create("p", json!({"status": "closed", "ti": "Ex"}))
+		.await
+		.expect("Failed to create document");
+	let y_id = tx
+		.create("p", json!({"status": "open", "ti": "Why"}))
+		.await
+		.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	let filter = QueryFilter::new().with_equals("status", Value::String("open".to_string()));
+	let mut stream = adapter
+		.subscribe(tn_id, db_id, SubscriptionOptions::filtered("p", filter))
+		.await
+		.expect("Failed to subscribe");
+
+	// Only Y is in the initial snapshot; drain it so the next read is live.
+	match next_event(&mut stream, "the initial Create").await {
+		ChangeEvent::Create { data, .. } => assert_eq!(data["ti"], "Why"),
+		other => panic!("expected Create, got {other:?}"),
+	}
+	assert!(matches!(next_event(&mut stream, "Ready").await, ChangeEvent::Ready { .. }));
+
+	// Delete the excluded document. Nothing may come through.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.delete(&format!("p/{x_id}")).await.expect("Failed to delete document");
+	tx.commit().await.expect("Failed to commit");
+
+	{
+		use futures::StreamExt;
+		let leaked = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+			.await
+			.ok()
+			.flatten();
+		assert!(leaked.is_none(), "a filtered-out document's delete leaked: {leaked:?}");
+	}
+
+	// Then the matching one. Delivery is FIFO, so this arriving *first* is what
+	// pins the suppression above — a leaked X delete would be ahead of it.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.delete(&format!("p/{y_id}")).await.expect("Failed to delete document");
+	tx.commit().await.expect("Failed to commit");
+
+	match next_event(&mut stream, "Y's Delete").await {
+		ChangeEvent::Delete { path, .. } => {
+			assert!(path.ends_with(&y_id as &str), "expected Y's delete, got {path}");
+		}
+		other => panic!("expected Delete, got {other:?}"),
+	}
+}
+
+/// More concurrent transactions than `TX_PERMITS` allows must all complete.
+///
+/// The cap queues rather than rejects, so the failure this guards against is a
+/// permit leaked on one of `RedbTransaction::spawn`'s early-return paths — after
+/// which the adapter would wedge for good at the 33rd transaction of the process.
+#[tokio::test]
+async fn concurrent_transactions_queue_rather_than_deadlock() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let adapter = std::sync::Arc::new(adapter);
+
+	// Sequential batches: redb serialises writers on one file, so overlapping
+	// them here would only measure `begin_write` contention. What matters is
+	// that permit N+1 is available after N released.
+	for batch in 0..4 {
+		let mut handles = Vec::new();
+		for i in 0..10 {
+			let adapter = std::sync::Arc::clone(&adapter);
+			handles.push(tokio::spawn(async move {
+				let mut tx = adapter
+					.transaction(tn_id, "test_db")
+					.await
+					.expect("Failed to create transaction");
+				tx.create("p", json!({"n": batch * 10 + i})).await.expect("Failed to create");
+				tx.commit().await.expect("Failed to commit");
+			}));
+		}
+		for h in handles {
+			h.await.expect("transaction task panicked");
+		}
+	}
+
+	let docs = adapter
+		.query(tn_id, "test_db", "p", QueryOptions::new())
+		.await
+		.expect("Query failed");
+	assert_eq!(docs.len(), 40, "every queued transaction must have committed");
+}
+
+// ── Nightly compaction ──
+//
+// `compact_storage` has to take sole ownership of a redb file to rewrite it,
+// which is exactly what a live realtime workload will not give up. Both tests
+// below fail against the "drop every cached handle and hope" design these
+// replaced: flock is per-process, so redb itself stops none of this.
+
+/// A subscription must survive a compaction of the file underneath it.
+///
+/// The old code cleared the whole `instances` map to release its
+/// `Arc<redb::Database>` clones, which dropped each instance's `change_tx` with
+/// it — the only sender its subscribers hold a receiver on. Every live
+/// subscription saw `RecvError::Closed`, ended its stream without telling the
+/// client anything, and the next write built a fresh instance around a fresh
+/// channel nobody could reattach to. A notillo tab open across the nightly
+/// maintenance window went silently dead until reload.
+#[tokio::test]
+async fn a_subscription_survives_compaction() {
+	use cloudillo_types::rtdb_adapter::{ChangeEvent, SubscriptionOptions};
+	use futures::StreamExt;
+
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+
+	// A document has to exist, or the file is not on disk to be compacted.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.create("p", json!({"ti": "Alpha"})).await.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	let mut stream = adapter
+		.subscribe(tn_id, db_id, SubscriptionOptions::all("p"))
+		.await
+		.expect("Failed to subscribe");
+	// Drain the initial replay so the next event read is a live one.
+	assert!(matches!(stream.next().await, Some(ChangeEvent::Create { .. })));
+	assert!(matches!(stream.next().await, Some(ChangeEvent::Ready { .. })));
+
+	adapter.compact_storage().await.expect("compaction failed");
+
+	// A write after the sweep must still reach the subscriber that was open
+	// across it.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.create("p", json!({"ti": "Beta"})).await.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	let event = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+		.await
+		.expect("the subscription stopped delivering after compaction")
+		.expect("the subscription closed during compaction");
+	match event {
+		ChangeEvent::Create { data, .. } => assert_eq!(data["ti"], "Beta"),
+		other => panic!("expected Create, got {other:?}"),
+	}
+}
+
+/// Writes running concurrently with a compaction must all succeed, and every one
+/// of them must be readable afterwards.
+///
+/// Without the per-path barrier, `compact_storage` opened the file bare while a
+/// write-transaction actor still held a `redb::Database` for it.
+#[tokio::test]
+async fn concurrent_writes_survive_compaction() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let adapter = std::sync::Arc::new(adapter);
+
+	// Seed, so there is a file on disk when the sweep starts.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.create("p", json!({"n": 0})).await.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	let writer = {
+		let adapter = std::sync::Arc::clone(&adapter);
+		tokio::spawn(async move {
+			for n in 1..=20 {
+				let mut tx = adapter
+					.transaction(tn_id, db_id)
+					.await
+					.expect("Failed to create transaction during compaction");
+				tx.create("p", json!({"n": n}))
+					.await
+					.expect("Failed to create document during compaction");
+				tx.commit().await.expect("Failed to commit during compaction");
+			}
+		})
+	};
+
+	adapter
+		.compact_storage()
+		.await
+		.expect("compaction failed while writes were in flight");
+	writer.await.expect("the writer task failed");
+
+	let results = adapter
+		.query(tn_id, db_id, "p", QueryOptions::default())
+		.await
+		.expect("Failed to query");
+	assert_eq!(results.len(), 21, "a write was lost across the compaction");
+}
+
+/// Every read an open transaction needs must be available *on the transaction*,
+/// and none of them may re-enter the adapter.
+///
+/// The transaction actor holds the file's maintenance barrier read guard for its
+/// whole life. `tokio::sync::RwLock` is write-preferring, so once a
+/// `compact_storage` writer is queued, a *second* read acquisition on the same
+/// path never completes — and every `RtdbAdapter` method takes one through
+/// `get_or_open_instance`. Before `Transaction::query`/`check_lock` existed,
+/// `websocket.rs`'s lock check and `computed.rs`'s `$query` operations did
+/// exactly that, so a compaction landing mid-transaction hung the transaction
+/// forever and the nightly sweep with it.
+///
+/// The timeout is the assertion: this test does not fail, it hangs, without the
+/// fix.
+#[tokio::test]
+async fn reads_inside_a_transaction_do_not_deadlock_against_compaction() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+	let adapter = std::sync::Arc::new(adapter);
+
+	// Seed, so there is a file on disk for the sweep to compact.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.create("p", json!({"n": 0})).await.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	let body = async {
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		let id = tx.create("p", json!({"n": 1})).await.expect("Failed to create document");
+
+		// Queue the compaction while the transaction is open. It cannot be granted
+		// the write guard until the actor exits, and any read that went through the
+		// adapter would now be stuck behind it.
+		let sweeper = {
+			let adapter = std::sync::Arc::clone(&adapter);
+			tokio::spawn(async move { adapter.compact_storage().await })
+		};
+		// Give the writer a chance to actually queue on the barrier — without this
+		// the reads below might complete before it ever asks for the guard, and the
+		// test would pass against the broken code too.
+		tokio::task::yield_now().await;
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+		// Read-your-own-writes, through the transaction.
+		let doc = tx.get(&format!("p/{id}")).await.expect("get inside transaction");
+		assert_eq!(doc.expect("the transaction must see its own write")["n"], 1);
+
+		let rows = tx.query("p", &QueryOptions::default()).await.expect("query inside transaction");
+		assert_eq!(rows.len(), 2, "the query must see both the committed and the pending row");
+
+		assert!(tx.check_lock("p").await.expect("check_lock inside transaction").is_none());
+
+		tx.commit().await.expect("Failed to commit");
+		sweeper.await.expect("the sweeper task failed").expect("compaction failed");
+	};
+
+	tokio::time::timeout(std::time::Duration::from_secs(10), body)
+		.await
+		.expect("a read inside an open transaction deadlocked against a queued compaction");
+}
+
+#[tokio::test]
+async fn test_dropping_a_transaction_rolls_back() {
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+
+	// Dropping the handle closes the actor's command channel; the actor exits and
+	// the `WriteTransaction` drops into redb's auto-rollback. Nothing commits.
+	{
+		let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+		tx.create("users", json!({"name": "Dropped"}))
+			.await
+			.expect("Failed to create document");
+	}
+
+	// The actor is a `spawn_blocking` thread; give it a moment to notice.
+	tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+	let results = adapter
+		.query(tn_id, db_id, "users", QueryOptions::default())
+		.await
+		.expect("Failed to query");
+	assert!(results.is_empty(), "a dropped transaction must roll back, not commit");
 }

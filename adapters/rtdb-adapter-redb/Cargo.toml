@@ -30,6 +30,8 @@ tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3.27"
+# `StreamExt::next`, for driving a subscription stream in the projection tests.
+futures = "0.3"
 
 [lints]
 workspace = true

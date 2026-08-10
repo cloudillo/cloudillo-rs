@@ -21,6 +21,7 @@ use std::fmt::Debug;
 use std::pin::Pin;
 
 use crate::prelude::*;
+use crate::types::CompactReport;
 
 /// Lock mode for document locking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,6 +353,10 @@ pub struct QueryOptions {
 
 	/// When set, returns aggregated groups instead of documents.
 	pub aggregate: Option<AggregateOptions>,
+
+	/// Optional field projection. When set, only these top-level fields (plus
+	/// `id`) are returned. `None` returns whole documents.
+	pub select: Option<Vec<String>>,
 }
 
 impl QueryOptions {
@@ -389,6 +394,46 @@ impl QueryOptions {
 		self.aggregate = Some(aggregate);
 		self
 	}
+
+	/// Set the field projection.
+	pub fn with_select(mut self, select: Vec<String>) -> Self {
+		self.select = Some(select);
+		self
+	}
+}
+
+/// Restrict a document to the selected top-level fields.
+///
+/// `id` is always retained: it is injected by the adapter rather than stored, and
+/// every caller keys results by it, so a projection that dropped it would return
+/// documents nothing could address.
+///
+/// Only top-level fields are addressable, matching the same restriction sorting
+/// and filtering already carry. A non-object value is returned untouched.
+pub fn project_doc(doc: &Value, select: &[String]) -> Value {
+	let Some(obj) = doc.as_object() else { return doc.clone() };
+
+	let mut out = serde_json::Map::with_capacity(select.len() + 1);
+	if let Some(id) = obj.get("id") {
+		out.insert("id".to_string(), id.clone());
+	}
+	for field in select {
+		if let Some(value) = obj.get(field) {
+			out.insert(field.clone(), value.clone());
+		}
+	}
+
+	Value::Object(out)
+}
+
+/// True when any selected field differs between two versions of a document.
+///
+/// Drives event suppression on projected subscriptions: a subscriber that asked
+/// for four fields has no way to observe a write that touched none of them, so
+/// waking it costs a full client-side rebuild for nothing.
+pub fn selection_changed(old: Option<&Value>, new: &Value, select: &[String]) -> bool {
+	let Some(old) = old else { return true };
+	select.iter().any(|field| old.get(field) != new.get(field))
 }
 
 /// Options for subscribing to real-time changes.
@@ -399,17 +444,27 @@ pub struct SubscriptionOptions {
 
 	/// Optional filter (only matching changes are sent)
 	pub filter: Option<QueryFilter>,
+
+	/// Optional field projection, applied to `Create`/`Update` payloads. When
+	/// set, an event touching none of these fields is not delivered at all.
+	pub select: Option<Vec<String>>,
 }
 
 impl SubscriptionOptions {
 	/// Create a subscription to all changes at a path.
 	pub fn all(path: impl Into<Box<str>>) -> Self {
-		Self { path: path.into(), filter: None }
+		Self { path: path.into(), filter: None, select: None }
 	}
 
 	/// Create a subscription with a filter.
 	pub fn filtered(path: impl Into<Box<str>>, filter: QueryFilter) -> Self {
-		Self { path: path.into(), filter: Some(filter) }
+		Self { path: path.into(), filter: Some(filter), select: None }
+	}
+
+	/// Set the field projection.
+	pub fn with_select(mut self, select: Option<Vec<String>>) -> Self {
+		self.select = select;
+		self
 	}
 }
 
@@ -469,6 +524,22 @@ pub enum ChangeEvent {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		data: Option<Value>,
 	},
+
+	/// A complete result set replacing everything the subscriber holds.
+	///
+	/// Distinct from [`ChangeEvent::Ready`], which is the *one-shot*
+	/// initial-snapshot signal a client resolves its loading state on, and from
+	/// [`ChangeEvent::Update`], which a client merges as a delta. A min/max
+	/// aggregate cannot express its recompute as either: the recompute yields the
+	/// whole group set, so a group that emptied is simply absent rather than
+	/// zeroed, and merging would keep it forever.
+	Replace {
+		/// Subscription path
+		path: Box<str>,
+		/// The complete new dataset
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		data: Option<Value>,
+	},
 }
 
 impl ChangeEvent {
@@ -480,7 +551,8 @@ impl ChangeEvent {
 			| ChangeEvent::Delete { path, .. }
 			| ChangeEvent::Lock { path, .. }
 			| ChangeEvent::Unlock { path, .. }
-			| ChangeEvent::Ready { path, .. } => path,
+			| ChangeEvent::Ready { path, .. }
+			| ChangeEvent::Replace { path, .. } => path,
 		}
 	}
 
@@ -503,7 +575,7 @@ impl ChangeEvent {
 			| ChangeEvent::Lock { data, .. }
 			| ChangeEvent::Unlock { data, .. } => Some(data),
 			ChangeEvent::Delete { .. } => None,
-			ChangeEvent::Ready { data, .. } => data.as_ref(),
+			ChangeEvent::Ready { data, .. } | ChangeEvent::Replace { data, .. } => data.as_ref(),
 		}
 	}
 
@@ -592,6 +664,21 @@ pub trait Transaction: Send + Sync {
 	/// - `Err` if read operation fails
 	async fn get(&self, path: &str) -> ClResult<Option<Value>>;
 
+	/// Query documents from the transaction's view, with the same
+	/// read-your-own-writes semantics as [`Transaction::get`].
+	///
+	/// Exists so a caller inside a transaction never has to reach back into
+	/// [`RtdbAdapter::query`] — see [`RtdbAdapter::transaction`] for why that
+	/// deadlocks.
+	async fn query(&self, path: &str, opts: &QueryOptions) -> ClResult<Vec<Value>>;
+
+	/// Read a hard/soft lock from the transaction's view.
+	///
+	/// Same reason as [`Transaction::query`]: the adapter-level
+	/// [`RtdbAdapter::check_lock`] must not be called while a transaction on the
+	/// same file is open.
+	async fn check_lock(&self, path: &str) -> ClResult<Option<LockInfo>>;
+
 	/// Commit the transaction, applying all changes atomically.
 	async fn commit(&mut self) -> ClResult<()>;
 
@@ -606,6 +693,15 @@ pub trait Transaction: Send + Sync {
 #[async_trait]
 pub trait RtdbAdapter: Debug + Send + Sync {
 	/// Begin a new transaction for write operations.
+	///
+	/// **While a transaction is open, no code path may call back into this trait
+	/// for the same file.** A backend may hold the file's maintenance barrier for
+	/// the transaction's whole life, and re-entering through an adapter method
+	/// takes a second guard on it — which a queued `compact_storage` writer
+	/// deadlocks against permanently, hanging both the transaction and the
+	/// maintenance sweep. Every read a transaction needs is on [`Transaction`]
+	/// itself: [`Transaction::get`], [`Transaction::query`],
+	/// [`Transaction::check_lock`].
 	async fn transaction(&self, tn_id: TnId, db_id: &str) -> ClResult<Box<dyn Transaction>>;
 
 	/// Close a database instance, flushing pending changes to disk.
@@ -685,6 +781,19 @@ pub trait RtdbAdapter: Debug + Send + Sync {
 	/// Used by tenant purge orchestration. Implementations should treat a
 	/// missing tenant store as success.
 	async fn delete_tenant_databases(&self, tn_id: TnId) -> ClResult<()>;
+
+	/// Rewrite every storage file, returning the space already freed inside them
+	/// to the filesystem.
+	///
+	/// Called from the nightly maintenance task, never from a request path: a
+	/// backend may have to close and reopen its files, which blocks every reader
+	/// and writer of the one being rewritten.
+	///
+	/// Defaults to a no-op report, the honest answer for a backend with nothing
+	/// to compact.
+	async fn compact_storage(&self) -> ClResult<CompactReport> {
+		Ok(CompactReport::default())
+	}
 }
 
 // vim: ts=4

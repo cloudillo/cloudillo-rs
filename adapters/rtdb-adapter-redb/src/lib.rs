@@ -12,11 +12,11 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{OnceCell, RwLock};
-use tracing::{debug, info, warn};
+use tokio::sync::{OnceCell, OwnedRwLockReadGuard, RwLock};
+use tracing::{debug, error, info, warn};
 
 pub use instance::DatabaseInstance;
 pub use transaction::RedbTransaction;
@@ -26,14 +26,18 @@ pub use error::Error;
 use cloudillo_types::prelude::*;
 use cloudillo_types::rtdb_adapter::{
 	ChangeEvent, DbStats, LockInfo, LockMode, QueryOptions, RtdbAdapter, SubscriptionOptions,
-	Transaction,
+	Transaction, project_doc, selection_changed,
 };
+use cloudillo_types::types::CompactReport;
 
 /// Lazily-initialized `redb::Database` handle. Wrapped in `OnceCell` so
 /// concurrent first-openers for the same path serialize on initialization,
 /// preventing two independent handles for the same file (flock is
 /// per-process on Linux).
 type DbCell = Arc<OnceCell<Arc<redb::Database>>>;
+
+/// One redb file's maintenance barrier. See [`RtdbAdapterRedb::maintenance`].
+type PathBarrier = Arc<RwLock<()>>;
 
 /// redb-based implementation of RtdbAdapter.
 ///
@@ -47,6 +51,19 @@ pub struct RtdbAdapterRedb {
 	instances: Arc<RwLock<HashMap<InstanceKey, Arc<DatabaseInstance>>>>,
 	file_databases: Arc<RwLock<HashMap<PathBuf, DbCell>>>,
 	config: AdapterConfig,
+	/// One barrier per redb file. Every operation on a path holds a *read* guard
+	/// for its whole duration; `compact_storage` takes the *write* guard, so it
+	/// cannot begin until no live `Arc<redb::Database>` for that path remains.
+	///
+	/// `redb::Database::compact` needs sole ownership of the handle, so
+	/// compaction drops the cached one and opens the file bare. flock is
+	/// per-process, so redb does not stop a second bare open of a file this
+	/// process already has open — this barrier is the only thing that does.
+	///
+	/// Per *path*, deliberately: a node-wide lock would freeze every tenant's
+	/// realtime I/O for the whole sweep, since compaction also empties the handle
+	/// cache and forces all traffic onto the blocking open path.
+	maintenance: Arc<RwLock<HashMap<PathBuf, PathBarrier>>>,
 }
 
 /// Unique key for a database instance
@@ -109,6 +126,7 @@ impl RtdbAdapterRedb {
 			instances: Arc::new(RwLock::new(HashMap::new())),
 			file_databases: Arc::new(RwLock::new(HashMap::new())),
 			config,
+			maintenance: Arc::new(RwLock::new(HashMap::new())),
 		};
 
 		// Start background eviction task if enabled
@@ -233,12 +251,31 @@ impl RtdbAdapterRedb {
 		}
 	}
 
-	/// Get or open a redb Database instance by file path.
+	/// The maintenance barrier for one redb file, created on first use.
+	async fn path_barrier(&self, path: &Path) -> PathBarrier {
+		let existing = {
+			let map = self.maintenance.read().await;
+			map.get(path).map(Arc::clone)
+		};
+		if let Some(barrier) = existing {
+			return barrier;
+		}
+		let mut map = self.maintenance.write().await;
+		Arc::clone(map.entry(path.to_path_buf()).or_default())
+	}
+
+	/// Get or open a redb Database handle by file path.
 	///
 	/// Uses a per-path `OnceCell` so concurrent first-openers for the same
 	/// file serialize on initialization (a single `redb::Database` handle
 	/// per file). Different paths proceed in parallel.
-	async fn get_or_open_db_file(&self, db_path: PathBuf) -> ClResult<Arc<redb::Database>> {
+	///
+	/// **The caller must already hold a guard on the path's barrier** for as long
+	/// as it uses the handle — `compact_storage` needs the write guard to be
+	/// unobtainable while any handle is live. Not taken here because the barrier
+	/// is not re-entrant: `tokio::sync::RwLock` is write-preferring, so a second
+	/// read acquisition behind a waiting `compact_storage` writer would deadlock.
+	async fn open_db_file_guarded(&self, db_path: PathBuf) -> ClResult<Arc<redb::Database>> {
 		// Look up — or create — the OnceCell for this path.
 		let existing = {
 			let cache = self.file_databases.read().await;
@@ -279,20 +316,81 @@ impl RtdbAdapterRedb {
 		Ok(Arc::clone(db))
 	}
 
-	/// Get or open a database instance
+	/// Give the instances on `path` a database handle back after a compaction
+	/// attempt — successful, failed, or skipped.
+	///
+	/// Reopen only when something is holding this file: a live instance needs its
+	/// handle back even after a failed compaction, and a path that was in the
+	/// cache before the sweep was warm for a reason. A file only found by walking
+	/// the directory has no user, and caching a handle for it would pin an fd and
+	/// a redb page cache forever, since nothing ever evicts `file_databases`.
+	///
+	/// Failing here is logged, not fatal: `get_or_open_instance` re-opens a cached
+	/// instance whose handle slot is empty, so the next use heals it.
+	async fn reopen_instances(
+		&self,
+		path: &Path,
+		on_this_file: &[Arc<DatabaseInstance>],
+		cached: &std::collections::HashSet<PathBuf>,
+	) {
+		if on_this_file.is_empty() && !cached.contains(path) {
+			return;
+		}
+		match self.open_db_file_guarded(path.to_path_buf()).await {
+			Ok(db) => {
+				for instance in on_this_file {
+					instance.set_db(Arc::clone(&db));
+				}
+			}
+			Err(e) => error!(
+				"rtdb compact: reopening {} failed: {} — its instances are left without a \
+				 database handle and will be healed on next use",
+				path.display(),
+				e
+			),
+		}
+	}
+
+	/// Get or open a database instance, together with the read guard its file's
+	/// maintenance barrier must be held under.
+	///
+	/// The guard is returned rather than dropped here because the instance caches
+	/// an `Arc<redb::Database>` the caller then uses for the whole operation.
+	/// Every caller keeps it until its redb work is done — `transaction` hands it
+	/// to the write-transaction actor.
+	///
+	/// The barrier is **not re-entrant**: a caller holding this guard must not
+	/// await another operation on the same path, or it deadlocks behind a waiting
+	/// `compact_storage`. `subscribe` is the one place that would, and drops the
+	/// guard first.
 	async fn get_or_open_instance(
 		&self,
 		tn_id: TnId,
 		db_id: &str,
-	) -> ClResult<Arc<DatabaseInstance>> {
+	) -> ClResult<(Arc<DatabaseInstance>, OwnedRwLockReadGuard<()>)> {
 		let key = InstanceKey { tn_id: tn_id.0, db_id: db_id.into() };
+		let db_path = self.db_file_path(tn_id);
+		let barrier = self.path_barrier(&db_path).await;
+		let guard = barrier.read_owned().await;
 
 		// Fast path: already open
 		{
 			let instances = self.instances.read().await;
 			if let Some(instance) = instances.get(&key) {
 				instance.touch();
-				return Ok(Arc::clone(instance));
+				let instance = Arc::clone(instance);
+				if instance.db().is_err() {
+					// A compaction whose reopen failed left this instance without a
+					// handle. Heal it rather than drop it: dropping closes
+					// `change_tx` and kills every live subscription, which the
+					// compaction protocol exists to avoid. A failed
+					// `get_or_try_init` leaves the `OnceCell` uninitialized, so
+					// the retry actually re-opens.
+					drop(instances);
+					let db = self.open_db_file_guarded(db_path.clone()).await?;
+					instance.set_db(db);
+				}
+				return Ok((instance, guard));
 			}
 		}
 
@@ -300,9 +398,8 @@ impl RtdbAdapterRedb {
 		// sync redb I/O and cross-file awaits can never block other subscribers
 		// waiting on that same lock. If two callers race the same key, the
 		// loser's instance is dropped in the double-check below — cheap since
-		// `get_or_open_db_file` dedupes the underlying `redb::Database` handle.
-		let db_path = self.db_file_path(tn_id);
-		let db = self.get_or_open_db_file(db_path).await?;
+		// `open_db_file_guarded` dedupes the underlying `redb::Database` handle.
+		let db = self.open_db_file_guarded(db_path).await?;
 		let (change_tx, _) = tokio::sync::broadcast::channel(self.config.broadcast_capacity);
 		let instance = Arc::new(DatabaseInstance::new(db, change_tx));
 		// load_indexed_fields does sync redb I/O; run on the blocking pool.
@@ -315,7 +412,7 @@ impl RtdbAdapterRedb {
 		let mut instances = self.instances.write().await;
 		if let Some(existing) = instances.get(&key) {
 			existing.touch();
-			return Ok(Arc::clone(existing));
+			return Ok((Arc::clone(existing), guard));
 		}
 		if instances.len() >= self.config.max_instances {
 			Self::evict_lru(&mut instances);
@@ -323,7 +420,7 @@ impl RtdbAdapterRedb {
 		instances.insert(key, Arc::clone(&instance));
 		debug!("Opened database instance: tn_id={}, db_id={}", tn_id.0, db_id);
 
-		Ok(instance)
+		Ok((instance, guard))
 	}
 
 	/// Evict least recently used instance
@@ -381,9 +478,12 @@ impl RtdbAdapterRedb {
 #[async_trait]
 impl RtdbAdapter for RtdbAdapterRedb {
 	async fn transaction(&self, tn_id: TnId, db_id: &str) -> ClResult<Box<dyn Transaction>> {
-		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let (instance, guard) = self.get_or_open_instance(tn_id, db_id).await?;
+		// The guard goes with the actor, not with this call: the transaction
+		// outlives `transaction()` and holds a write handle the whole time.
 		let redb_tx =
-			RedbTransaction::spawn(self.per_tenant_files, tn_id, db_id.into(), instance).await?;
+			RedbTransaction::spawn(self.per_tenant_files, tn_id, db_id.into(), instance, guard)
+				.await?;
 		Ok(Box::new(redb_tx))
 	}
 
@@ -405,7 +505,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		path: &str,
 		opts: QueryOptions,
 	) -> ClResult<Vec<Value>> {
-		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let (instance, _guard) = self.get_or_open_instance(tn_id, db_id).await?;
 		let per_tenant_files = self.per_tenant_files;
 		let db_id_owned = db_id.to_string();
 		let path_owned = path.to_string();
@@ -424,7 +524,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 	}
 
 	async fn get(&self, tn_id: TnId, db_id: &str, path: &str) -> ClResult<Option<Value>> {
-		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let (instance, _guard) = self.get_or_open_instance(tn_id, db_id).await?;
 		let per_tenant_files = self.per_tenant_files;
 		let db_id_owned = db_id.to_string();
 		let path_owned = path.to_string();
@@ -432,7 +532,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		tokio::task::spawn_blocking(move || {
 			use redb::ReadableDatabase;
 
-			let tx = instance.db.begin_read().map_err(error::from_redb_error)?;
+			let tx = instance.db()?.begin_read().map_err(error::from_redb_error)?;
 			let table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(error::from_redb_error)?;
 
 			let key = if per_tenant_files {
@@ -461,10 +561,16 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		db_id: &str,
 		opts: SubscriptionOptions,
 	) -> ClResult<Pin<Box<dyn Stream<Item = ChangeEvent> + Send>>> {
-		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let (instance, guard) = self.get_or_open_instance(tn_id, db_id).await?;
 
 		// Subscribe to broadcast FIRST to avoid losing events between query and subscribe
 		let mut rx = instance.change_tx.subscribe();
+
+		// Nothing below touches the database through this instance — `self.query`
+		// takes its own barrier guard. Holding two read guards on one path across
+		// an await deadlocks against a waiting `compact_storage`, because
+		// `tokio::sync::RwLock` is fair and queues the second read behind it.
+		drop(guard);
 
 		// Then get all existing documents at the path
 		let initial_docs = {
@@ -472,10 +578,14 @@ impl RtdbAdapter for RtdbAdapterRedb {
 			if let Some(ref filter) = opts.filter {
 				query_opts = query_opts.with_filter(filter.clone());
 			}
+			if let Some(ref select) = opts.select {
+				query_opts = query_opts.with_select(select.clone());
+			}
 			self.query(tn_id, db_id, &opts.path, query_opts).await?
 		};
 		let path = opts.path.clone();
 		let filter = opts.filter.clone();
+		let select = opts.select.clone();
 
 		let stream = async_stream::stream! {
 			// First, yield all existing documents as Create events
@@ -504,20 +614,76 @@ impl RtdbAdapter for RtdbAdapterRedb {
 							continue;
 						}
 
-						// Apply filter if specified (skip for lock/unlock events)
+						// Filters are applied before the projection below, so a
+						// filter may reference a field the subscriber did not
+						// select.
 						if let Some(ref filter) = filter {
 							match &event {
+								// Lock state is not document data; a filter has
+								// nothing to say about it.
 								ChangeEvent::Lock { .. } | ChangeEvent::Unlock { .. } => {}
+								// `data()` is `None` for a delete, so the generic
+								// arm below would fail open and hand filtered
+								// subscribers the paths of documents that never
+								// matched. The pre-delete document — what
+								// aggregates also filter on — is the right input.
+								// `old_data` is `None` only when the path held
+								// nothing (see `TransactionImpl::delete`), and
+								// deleting what never existed is a no-op.
+								ChangeEvent::Delete { old_data, .. } => {
+									if let Some(old) = old_data
+										&& !storage::matches_filter(old, filter)
+									{
+										continue;
+									}
+								}
 								_ => {
 									if let Some(data) = event.data()
-										&& !storage::matches_filter(data, filter) {
-											continue;
-										}
+										&& !storage::matches_filter(data, filter)
+									{
+										continue;
+									}
 								}
 							}
 						}
 
-						yield event;
+						match (&select, event) {
+							(Some(select), ChangeEvent::Create { path, data }) => {
+								yield ChangeEvent::Create {
+									path,
+									data: project_doc(&data, select),
+								};
+							}
+							(Some(select), ChangeEvent::Update { path, data, old_data }) => {
+								// Suppression is only sound for a document already
+								// in this subscriber's result set. One that just
+								// entered it — `old_data` failed the filter, or
+								// there is none — must be delivered even if no
+								// selected field moved, or the client never
+								// learns it exists.
+								let was_matching = match (&filter, old_data.as_ref()) {
+									(Some(f), Some(old)) => storage::matches_filter(old, f),
+									(Some(_), None) => false,
+									(None, _) => true,
+								};
+								// A write that touched nothing this subscriber
+								// asked for is invisible to it, so delivering it
+								// only buys a wasted rebuild on the client.
+								if was_matching
+									&& !selection_changed(old_data.as_ref(), &data, select)
+								{
+									continue;
+								}
+								yield ChangeEvent::Update {
+									path,
+									data: project_doc(&data, select),
+									old_data: old_data.map(|d| project_doc(&d, select)),
+								};
+							}
+							// Delete carries no payload; lock/unlock payloads are
+							// lock metadata rather than document fields.
+							(_, event) => yield event,
+						}
 					}
 					Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
 						warn!("Subscription lagged, missed {} events", n);
@@ -539,20 +705,20 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		path: &str,
 		field: &str,
 	) -> ClResult<()> {
-		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let (instance, _guard) = self.get_or_open_instance(tn_id, db_id).await?;
 
 		index::create_index_impl(&instance, tn_id, db_id, path, field, self.per_tenant_files).await
 	}
 
 	async fn export_all(&self, tn_id: TnId, db_id: &str) -> ClResult<Vec<(Box<str>, Value)>> {
-		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let (instance, _guard) = self.get_or_open_instance(tn_id, db_id).await?;
 		let per_tenant_files = self.per_tenant_files;
 		let db_id_owned = db_id.to_string();
 
 		tokio::task::spawn_blocking(move || {
 			use redb::ReadableDatabase;
 
-			let tx = instance.db.begin_read().map_err(error::from_redb_error)?;
+			let tx = instance.db()?.begin_read().map_err(error::from_redb_error)?;
 			let table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(error::from_redb_error)?;
 
 			let prefix = if per_tenant_files {
@@ -592,7 +758,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		mode: LockMode,
 		conn_id: &str,
 	) -> ClResult<Option<LockInfo>> {
-		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let (instance, _guard) = self.get_or_open_instance(tn_id, db_id).await?;
 		let now = storage::now_timestamp();
 
 		let mut locks = instance
@@ -641,7 +807,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		user_id: &str,
 		conn_id: &str,
 	) -> ClResult<()> {
-		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let (instance, _guard) = self.get_or_open_instance(tn_id, db_id).await?;
 
 		let mut locks = instance
 			.locks
@@ -674,7 +840,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 	}
 
 	async fn check_lock(&self, tn_id: TnId, db_id: &str, path: &str) -> ClResult<Option<LockInfo>> {
-		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let (instance, _guard) = self.get_or_open_instance(tn_id, db_id).await?;
 		let now = storage::now_timestamp();
 
 		let locks = instance
@@ -699,7 +865,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		user_id: &str,
 		conn_id: &str,
 	) -> ClResult<()> {
-		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let (instance, _guard) = self.get_or_open_instance(tn_id, db_id).await?;
 
 		let paths_to_remove: Vec<Box<str>> = {
 			let mut locks = instance.locks.write().map_err(|_| {
@@ -733,13 +899,13 @@ impl RtdbAdapter for RtdbAdapterRedb {
 	}
 
 	async fn stats(&self, tn_id: TnId, db_id: &str) -> ClResult<DbStats> {
-		let instance = self.get_or_open_instance(tn_id, db_id).await?;
+		let (instance, _guard) = self.get_or_open_instance(tn_id, db_id).await?;
 		let db_path = self.db_file_path(tn_id);
 
 		tokio::task::spawn_blocking(move || {
 			use redb::{ReadableDatabase, ReadableTableMetadata};
 
-			let tx = instance.db.begin_read().map_err(error::from_redb_error)?;
+			let tx = instance.db()?.begin_read().map_err(error::from_redb_error)?;
 			let table = tx.open_table(storage::TABLE_DOCUMENTS).map_err(error::from_redb_error)?;
 
 			let record_count = table.len().map_err(error::from_redb_error)?;
@@ -756,8 +922,142 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		.await?
 	}
 
+	/// Rewrite every redb file, giving back the space already freed inside it.
+	///
+	/// `redb::Database::compact` takes `&mut self` and fails with
+	/// `TransactionInProgress` if any read transaction is live, so a cached
+	/// `Arc<Database>` can never be compacted in place. The file must be opened
+	/// bare while nothing else holds it — and flock is per-process, so redb will
+	/// not stop this process from opening a file it already has open. The
+	/// `maintenance` barrier is what does.
+	///
+	/// Per path, therefore:
+	///
+	/// 1. Take the path's **write** guard. It cannot be granted until every
+	///    outstanding read guard is gone, and every operation — including a whole
+	///    write transaction — holds one for its duration. Taken inside the loop,
+	///    never across it: one tenant's compaction must not stall another's
+	///    realtime I/O.
+	/// 2. Clear the handle out of every `DatabaseInstance` on this file and out
+	///    of the file-handle cache. The instances themselves **stay**: each owns
+	///    the `change_tx` its subscribers hold receivers on, so dropping them
+	///    would close every live subscription with `RecvError::Closed`, and the
+	///    next write would build a fresh channel nobody can reattach to.
+	/// 3. Compact, then reopen and reinstall a fresh handle in both places — see
+	///    [`Self::reopen_instances`] for which files that covers.
+	///
+	/// This only returns space already dead inside the file; it does not shrink a
+	/// document whose data is still live.
+	async fn compact_storage(&self) -> ClResult<CompactReport> {
+		let cached: std::collections::HashSet<PathBuf> = {
+			let cache = self.file_databases.read().await;
+			cache.keys().cloned().collect()
+		};
+		// Files nothing has opened this run are on disk but not in the cache.
+		let mut all: Vec<PathBuf> = cached.iter().cloned().collect();
+		if let Ok(mut dir) = tokio::fs::read_dir(&self.storage_dir).await {
+			while let Ok(Some(entry)) = dir.next_entry().await {
+				let path = entry.path();
+				// Both layouts this adapter writes: `tn_<id>.db` per tenant, or the
+				// single shared `rtdb.redb`.
+				let is_db = path.extension().is_some_and(|e| e == "db" || e == "redb");
+				if is_db && !all.contains(&path) {
+					all.push(path);
+				}
+			}
+		}
+
+		let mut report = CompactReport::default();
+		for path in all {
+			let before = match tokio::fs::metadata(&path).await {
+				Ok(m) => m.len(),
+				Err(_) => continue,
+			};
+
+			// Exclusive access to this one file. Nothing else may hold a handle
+			// for it from here until the guard drops at the end of the iteration.
+			let barrier = self.path_barrier(&path).await;
+			let _guard = barrier.write_owned().await;
+
+			// Every live handle for this file must go before the bare open, or
+			// two would exist for one file. The instances survive — see the doc
+			// comment; only their handles are released.
+			let on_this_file: Vec<Arc<DatabaseInstance>> = {
+				let instances = self.instances.read().await;
+				instances
+					.iter()
+					.filter(|(key, _)| self.db_file_path(TnId(key.tn_id)) == path)
+					.map(|(_, instance)| Arc::clone(instance))
+					.collect()
+			};
+			// A handle that would not go means the file must not be compacted:
+			// `Database::open` below would be a *second* live handle on it, which
+			// redb will not stop because flock is per-process. Repair whatever was
+			// already cleared and move on to the next file.
+			let mut released = true;
+			for instance in &on_this_file {
+				if let Err(e) = instance.clear_db() {
+					warn!(
+						"rtdb compact: {} skipped, instance would not release its handle: {}",
+						path.display(),
+						e
+					);
+					released = false;
+					break;
+				}
+			}
+			if !released {
+				self.reopen_instances(&path, &on_this_file, &cached).await;
+				continue;
+			}
+			{
+				let mut cache = self.file_databases.write().await;
+				cache.remove(&path);
+			}
+
+			let compact_path = path.clone();
+			// Never `?`-ed here: every instance for this path has had `clear_db()`
+			// called on it and the cached handle is gone, so an early return before
+			// `reopen_instances` would leave those tenants answering "rtdb file is
+			// being compacted" until their next use heals them. A panicking
+			// `Database::open` on a damaged file is exactly that case.
+			let compacted = tokio::task::spawn_blocking(move || -> ClResult<()> {
+				let mut db = redb::Database::open(&compact_path).map_err(error::from_redb_error)?;
+				db.compact().map_err(|e| {
+					cloudillo_types::error::Error::Internal(format!("redb compact failed: {e}"))
+				})?;
+				Ok(())
+			})
+			.await
+			.unwrap_or_else(|e| Err(error::Error::from(e).into()));
+
+			self.reopen_instances(&path, &on_this_file, &cached).await;
+
+			if let Err(e) = compacted {
+				warn!("rtdb compact: {} failed: {}", path.display(), e);
+				continue;
+			}
+
+			let after = tokio::fs::metadata(&path).await.map_or(before, |m| m.len());
+			report.files += 1;
+			report.bytes_before += before;
+			report.bytes_after += after;
+		}
+		Ok(report)
+	}
+
 	async fn delete_tenant_databases(&self, tn_id: TnId) -> ClResult<()> {
 		let db_path = self.db_file_path(tn_id);
+
+		// Exclusive access to the file for the whole purge. Without it a
+		// `compact_storage` already past its own cache eviction would reopen — and
+		// `Database::create` — the file we are about to unlink, resurrecting an
+		// empty database for a tenant that no longer exists. In shared-file mode it
+		// covers the chunked `begin_write` loop below for the same reason, which is
+		// why that branch opens through `open_db_file_guarded`: the barrier is not
+		// re-entrant, so an opener taking its own read guard would deadlock here.
+		let barrier = self.path_barrier(&db_path).await;
+		let _guard = barrier.write_owned().await;
 
 		// Drop any cached instances for this tenant before unlinking.
 		{
@@ -784,7 +1084,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 			// Shared-file mode: keys are prefixed with the tenant id, so we can
 			// scope a delete by walking each table for that prefix. Run on the
 			// blocking pool because redb is sync.
-			let db = self.get_or_open_db_file(db_path).await?;
+			let db = self.open_db_file_guarded(db_path).await?;
 			let prefix = format!("{}/", tn_id.0);
 			tokio::task::spawn_blocking(move || -> ClResult<()> {
 				use redb::ReadableTable;

@@ -204,9 +204,10 @@ impl IncrementalAggState {
 				self.handle_update(data, old_data.as_ref())
 			}
 			ChangeEvent::Delete { old_data, .. } => self.handle_delete(old_data.as_ref()),
-			ChangeEvent::Ready { .. } | ChangeEvent::Lock { .. } | ChangeEvent::Unlock { .. } => {
-				None
-			}
+			ChangeEvent::Ready { .. }
+			| ChangeEvent::Replace { .. }
+			| ChangeEvent::Lock { .. }
+			| ChangeEvent::Unlock { .. } => None,
 		}
 	}
 
@@ -294,6 +295,13 @@ impl IncrementalAggState {
 					.or_insert_with(|| GroupState::new(&self.aggregate.ops));
 				state.remove(od, &self.aggregate.ops);
 				affected.push(state.to_value(key, &self.aggregate.ops));
+				// The count=0 tombstone is already in the delta; evict the entry so a
+				// long-lived subscription over a high-cardinality group_by cannot grow
+				// without bound. A later add recreates it via or_insert_with.
+				let is_empty = state.count == 0;
+				if is_empty {
+					self.groups.remove(*key);
+				}
 			}
 		}
 
@@ -345,6 +353,12 @@ impl IncrementalAggState {
 				.or_insert_with(|| GroupState::new(&self.aggregate.ops));
 			state.remove(od, &self.aggregate.ops);
 			affected.push(state.to_value(key, &self.aggregate.ops));
+			// Emptied group: evict the entry rather than keeping it around forever —
+			// see `handle_update` above.
+			let is_empty = state.count == 0;
+			if is_empty {
+				self.groups.remove(key);
+			}
 		}
 		Some(affected)
 	}
@@ -549,6 +563,66 @@ mod tests {
 		let delta = delta.unwrap_or_default();
 		let go = find_group(&delta, "go");
 		assert_eq!(go.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(0));
+	}
+
+	#[test]
+	fn group_evicted_when_count_reaches_zero() {
+		let mut state = IncrementalAggState::new(count_only_agg("category"), None);
+
+		state.add_doc(&json!({"id": "1", "category": "go"}));
+		assert!(state.groups.contains_key("go"));
+
+		let delta = state.process_change(&ChangeEvent::Delete {
+			path: "items/1".into(),
+			old_data: Some(json!({"id": "1", "category": "go"})),
+		});
+
+		// The tombstone still reaches the client...
+		let delta = delta.unwrap_or_default();
+		let go = find_group(&delta, "go");
+		assert_eq!(go.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(0));
+
+		// ...but the map entry is gone
+		assert!(!state.groups.contains_key("go"));
+		assert!(state.get_full_result().is_empty());
+	}
+
+	#[test]
+	fn group_reappears_after_eviction() {
+		let mut state = IncrementalAggState::new(count_only_agg("category"), None);
+
+		state.add_doc(&json!({"id": "1", "category": "go"}));
+		state.process_change(&ChangeEvent::Delete {
+			path: "items/1".into(),
+			old_data: Some(json!({"id": "1", "category": "go"})),
+		});
+		assert!(!state.groups.contains_key("go"));
+
+		let delta = state.process_change(&ChangeEvent::Create {
+			path: "items/2".into(),
+			data: json!({"id": "2", "category": "go"}),
+		});
+
+		let delta = delta.unwrap_or_default();
+		let go = find_group(&delta, "go");
+		assert_eq!(go.and_then(|v| v.get("count")).and_then(Value::as_u64), Some(1));
+	}
+
+	#[test]
+	fn evicted_group_on_update_leaving_last_doc() {
+		let mut state = IncrementalAggState::new(count_only_agg("tags"), None);
+
+		state.add_doc(&json!({"id": "1", "tags": ["rust", "web"]}));
+
+		state.process_change(&ChangeEvent::Update {
+			path: "items/1".into(),
+			data: json!({"id": "1", "tags": ["rust", "cli"]}),
+			old_data: Some(json!({"id": "1", "tags": ["rust", "web"]})),
+		});
+
+		assert!(!state.groups.contains_key("web"));
+		assert!(state.groups.contains_key("rust"));
+		assert!(state.groups.contains_key("cli"));
 	}
 
 	#[test]
