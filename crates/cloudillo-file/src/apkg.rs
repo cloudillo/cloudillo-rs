@@ -66,8 +66,13 @@ pub async fn get_container_content(
 			let id_tag = auth_ctx.id_tag.clone();
 			(auth_ctx, id_tag)
 		} else {
-			let guest_ctx =
-				AuthCtx { tn_id, id_tag: "guest".into(), roles: vec![].into(), scope: None };
+			let guest_ctx = AuthCtx {
+				tn_id,
+				id_tag: "guest".into(),
+				roles: vec![].into(),
+				scope: None,
+				anonymous: true,
+			};
 			(guest_ctx, "guest".into())
 		};
 

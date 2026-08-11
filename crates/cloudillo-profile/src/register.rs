@@ -73,6 +73,34 @@ pub async fn get_identity_providers(app: &cloudillo_core::app::App, tn_id: TnId)
 	}
 }
 
+/// The listener-address half of a [`DomainValidationResponse`], with no verdict yet.
+///
+/// Shared by the "ref" reply (which has nothing to validate) and the early
+/// `id_tag_error: "invalid"` reply, so the two cannot drift from what
+/// [`verify_register_data`] reports.
+fn base_validation_response(
+	app: &cloudillo_core::app::App,
+	identity_providers: Vec<String>,
+) -> DomainValidationResponse {
+	let address_type = if app.opts.local_address.is_empty() {
+		None
+	} else {
+		match parse_address_type(app.opts.local_address[0].as_ref()) {
+			Ok(addr_type) => Some(addr_type.to_string()),
+			Err(_) => None,
+		}
+	};
+	DomainValidationResponse {
+		address: app.opts.local_address.iter().map(ToString::to_string).collect(),
+		address_type,
+		id_tag_error: String::new(),
+		app_domain_error: String::new(),
+		api_address: None,
+		app_address: None,
+		identity_providers,
+	}
+}
+
 /// Verify domain and id_tag before registration
 pub async fn verify_register_data(
 	app: &cloudillo_core::app::App,
@@ -81,41 +109,28 @@ pub async fn verify_register_data(
 	app_domain: Option<&str>,
 	identity_providers: Vec<String>,
 ) -> ClResult<DomainValidationResponse> {
-	// Determine address type from local addresses (all same type, guaranteed by startup validation)
-	let address_type = if app.opts.local_address.is_empty() {
-		None
-	} else {
-		match parse_address_type(app.opts.local_address[0].as_ref()) {
-			Ok(addr_type) => Some(addr_type.to_string()),
-			Err(_) => None, // Should not happen due to startup validation
-		}
-	};
-
-	let mut response = DomainValidationResponse {
-		address: app.opts.local_address.iter().map(ToString::to_string).collect(),
-		address_type,
-		id_tag_error: String::new(),
-		app_domain_error: String::new(),
-		api_address: None,
-		app_address: None,
-		identity_providers,
-	};
+	let mut response = base_validation_response(app, identity_providers);
 
 	// Validate format
 	match typ {
 		"domain" => {
-			// Regex for domain: alphanumeric and hyphens, with at least one dot
-			let domain_regex = Regex::new(r"^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$")
-				.map_err(|e| Error::Internal(format!("domain regex compilation failed: {}", e)))?;
-
-			if !domain_regex.is_match(id_tag) {
+			// The shared validator, not a local regex: it accepts IDN U-labels and
+			// enforces the same character set and length bounds as every other boundary
+			// (storage, federation, the action format).
+			if !cloudillo_types::validation::validate_id_tag(id_tag) {
 				response.id_tag_error = "invalid".to_string();
 			}
 
-			if let Some(app_domain) = app_domain
-				&& (app_domain.starts_with("cl-o.") || !domain_regex.is_match(app_domain))
-			{
-				response.app_domain_error = "invalid".to_string();
+			if let Some(app_domain) = app_domain {
+				// An operator-configured hostname rather than an id_tag, so it keeps the
+				// plain ASCII-domain regex.
+				let domain_regex =
+					Regex::new(r"^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$").map_err(|e| {
+						Error::Internal(format!("domain regex compilation failed: {}", e))
+					})?;
+				if app_domain.starts_with("cl-o.") || !domain_regex.is_match(app_domain) {
+					response.app_domain_error = "invalid".to_string();
+				}
 			}
 
 			if !response.id_tag_error.is_empty() || !response.app_domain_error.is_empty() {
@@ -142,8 +157,11 @@ pub async fn verify_register_data(
 				// For now, we'll skip this check
 			}
 
+			// DNS speaks A-labels; the id_tag we hold is the canonical U-label.
+			let ascii_id_tag = cloudillo_types::validation::id_tag_to_ascii_lossy(id_tag);
+
 			// DNS lookups for API domain (cl-o.<id_tag>)
-			let api_domain = format!("cl-o.{}", id_tag);
+			let api_domain = format!("cl-o.{}", ascii_id_tag);
 			match validate_domain_address(&api_domain, &app.opts.local_address, &resolver).await {
 				Ok((address, _addr_type)) => {
 					response.api_address = Some(address);
@@ -172,8 +190,9 @@ pub async fn verify_register_data(
 			}
 
 			// DNS lookups for app domain
-			// Use provided app_domain or default to id_tag if not provided
-			let app_domain_to_validate = app_domain.unwrap_or(id_tag);
+			// An operator-supplied app_domain passes through verbatim; the id_tag
+			// fallback is punycoded for the same reason `api_domain` is.
+			let app_domain_to_validate = app_domain.unwrap_or(ascii_id_tag.as_ref());
 			match validate_domain_address(
 				app_domain_to_validate,
 				&app.opts.local_address,
@@ -286,36 +305,21 @@ pub async fn post_verify_profile(
 		app.meta_adapter.validate_ref(token, &[REGISTER_REF_TYPE]).await?;
 	}
 
-	let id_tag_lower = req.id_tag.to_lowercase();
-
 	// Get identity providers list (use TnId(1) for base tenant settings)
 	let providers = get_identity_providers(&app, TnId(1)).await;
 
 	// For "ref" type, just return identity providers
 	if req.typ == "ref" {
-		// Determine address type from local addresses
-		let address_type = if app.opts.local_address.is_empty() {
-			None
-		} else {
-			match parse_address_type(app.opts.local_address[0].as_ref()) {
-				Ok(addr_type) => Some(addr_type.to_string()),
-				Err(_) => None,
-			}
-		};
-
-		return Ok((
-			StatusCode::OK,
-			Json(DomainValidationResponse {
-				address: app.opts.local_address.iter().map(ToString::to_string).collect(),
-				address_type,
-				id_tag_error: String::new(),
-				app_domain_error: String::new(),
-				api_address: None,
-				app_address: None,
-				identity_providers: providers,
-			}),
-		));
+		return Ok((StatusCode::OK, Json(base_validation_response(&app, providers))));
 	}
+
+	// The canonical (UTS #46 U-label) form every other boundary stores and compares —
+	// not a naive lowercase, or an IDN identity could never be verified here.
+	let Ok(id_tag_lower) = cloudillo_types::validation::canonicalize_id_tag(&req.id_tag) else {
+		let mut response = base_validation_response(&app, providers);
+		response.id_tag_error = "invalid".to_string();
+		return Ok((StatusCode::OK, Json(response)));
+	};
 
 	// Validate domain/local and get validation errors
 	let validation_result =
@@ -978,7 +982,12 @@ pub async fn post_register(
 	let (inviter_tn_id, inviter_id_tag, ref_data) =
 		app.meta_adapter.validate_ref(&req.token, &[REGISTER_REF_TYPE]).await?;
 
-	let id_tag_lower = req.id_tag.to_lowercase();
+	// The canonical (UTS #46 U-label) form every other boundary stores and compares —
+	// not a naive lowercase, or an IDN identity could never be registered. This is also
+	// where the id_tag length policy belongs: registration decides it.
+	let id_tag_lower = cloudillo_types::validation::canonicalize_id_tag(&req.id_tag)
+		.map_err(|_| Error::ValidationError(format!("invalid id_tag: {}", req.id_tag)))?
+		.into_owned();
 	let app_domain = req.app_domain.map(|d| d.to_lowercase());
 
 	// Get identity providers list (use TnId(1) as default for global settings)

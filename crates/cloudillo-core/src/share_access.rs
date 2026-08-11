@@ -227,7 +227,7 @@ pub async fn share_standing_for_actor(
 		}
 	};
 
-	let auth = AuthCtx { tn_id, id_tag: actor_id_tag.into(), roles, scope: None };
+	let auth = AuthCtx { tn_id, id_tag: actor_id_tag.into(), roles, scope: None, anonymous: false };
 	share_standing(app, tn_id, file_id, &auth, tenant_id_tag).await
 }
 

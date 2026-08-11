@@ -12,6 +12,7 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncRead;
@@ -23,7 +24,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 use crate::prelude::*;
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::auth_adapter::AuthAdapter;
-use cloudillo_types::validation::validate_id_tag;
+use cloudillo_types::validation::{id_tag_to_ascii, validate_id_tag};
 
 fn to_boxed<B>(body: B) -> BoxBody<Bytes, Error>
 where
@@ -89,20 +90,24 @@ impl Request {
 			.map_err(Error::from)
 	}
 
-	/// Reject an `id_tag` that is unsafe to interpolate into an outbound
-	/// federation URL (`https://cl-o.{id_tag}/api...`).
+	/// Validate an `id_tag` and return its A-label for URL construction.
 	///
 	/// `id_tag` ultimately originates from attacker-controllable action-token
 	/// `iss`/`aud` fields, so without this guard a crafted value could inject a
 	/// path, query, fragment, userinfo or port into the request target (SSRF /
-	/// request smuggling). The shared [`validate_id_tag`] validator forbids `/`,
-	/// `@`, `:`, whitespace and uppercase, leaving only a bare DNS-style label.
-	fn check_id_tag(id_tag: &str) -> ClResult<()> {
-		if validate_id_tag(id_tag) {
-			Ok(())
-		} else {
-			Err(Error::ValidationError(format!("invalid id_tag for federation request: {id_tag}")))
+	/// request smuggling). [`validate_id_tag`] forbids `/`, `@`, `:`, whitespace,
+	/// `_` and uppercase, leaving only a canonical DNS-style name; the A-label
+	/// returned here is pure LDH ASCII by construction.
+	///
+	/// Stored id_tags are UTS #46 U-labels, so an IDN identity must be punycoded
+	/// before it goes on the wire — DNS and TLS only speak the A-label.
+	fn host_for(id_tag: &str) -> ClResult<Cow<'_, str>> {
+		if !validate_id_tag(id_tag) {
+			return Err(Error::ValidationError(format!(
+				"invalid id_tag for federation request: {id_tag}"
+			)));
 		}
+		id_tag_to_ascii(id_tag)
 	}
 
 	/// Collect response body with timeout
@@ -125,7 +130,7 @@ impl Request {
 		id_tag: &str,
 		subject: Option<&str>,
 	) -> ClResult<Box<str>> {
-		Self::check_id_tag(id_tag)?;
+		let host = Self::host_for(id_tag)?;
 		let auth_token = self
 			.auth_adapter
 			.create_action_token(
@@ -142,7 +147,7 @@ impl Request {
 			.method(Method::GET)
 			.uri(format!(
 				"https://cl-o.{}/api/auth/access-token?token={}{}",
-				id_tag,
+				host,
 				auth_token,
 				if let Some(subject) = subject {
 					format!("&subject={}", subject)
@@ -179,12 +184,12 @@ impl Request {
 		path: &str,
 		auth: bool,
 	) -> ClResult<Bytes> {
-		Self::check_id_tag(id_tag)?;
+		let host = Self::host_for(id_tag)?;
 		let mut attempt = 0u8;
 		loop {
 			let req = hyper::Request::builder()
 				.method(Method::GET)
-				.uri(format!("https://cl-o.{}/api{}", id_tag, path));
+				.uri(format!("https://cl-o.{}/api{}", host, path));
 			let req = if auth {
 				req.header(
 					"Authorization",
@@ -228,12 +233,12 @@ impl Request {
 		path: &str,
 		auth: bool,
 	) -> ClResult<impl AsyncRead + Send + Unpin + use<>> {
-		Self::check_id_tag(id_tag)?;
+		let host = Self::host_for(id_tag)?;
 		let mut attempt = 0u8;
 		loop {
 			let req = hyper::Request::builder()
 				.method(Method::GET)
-				.uri(format!("https://cl-o.{}/api{}", id_tag, path));
+				.uri(format!("https://cl-o.{}/api{}", host, path));
 			let req = if auth {
 				let token = self.get_or_mint_proxy_token(tn_id, id_tag).await?;
 				debug!("Got proxy token (len={})", token.len());
@@ -288,10 +293,10 @@ impl Request {
 	where
 		Res: DeserializeOwned,
 	{
-		Self::check_id_tag(id_tag)?;
+		let host = Self::host_for(id_tag)?;
 		let req = hyper::Request::builder()
 			.method(Method::GET)
-			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
+			.uri(format!("https://cl-o.{}/api{}", host, path))
 			.body(to_boxed(Empty::new()))?;
 		let res = self.timed_request(req).await?;
 		match res.status() {
@@ -319,10 +324,10 @@ impl Request {
 	where
 		Res: DeserializeOwned,
 	{
-		Self::check_id_tag(id_tag)?;
+		let host = Self::host_for(id_tag)?;
 		let mut builder = hyper::Request::builder()
 			.method(Method::GET)
-			.uri(format!("https://cl-o.{}/api{}", id_tag, path));
+			.uri(format!("https://cl-o.{}/api{}", host, path));
 
 		// Add If-None-Match header if we have an etag
 		if let Some(etag) = etag {
@@ -358,11 +363,11 @@ impl Request {
 		Req: Serialize,
 		Res: DeserializeOwned,
 	{
-		Self::check_id_tag(id_tag)?;
+		let host = Self::host_for(id_tag)?;
 		let json_data = serde_json::to_vec(data)?;
 		let req = hyper::Request::builder()
 			.method(Method::POST)
-			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
+			.uri(format!("https://cl-o.{}/api{}", host, path))
 			.header("Content-Type", "application/json")
 			.body(to_boxed(Full::from(json_data)))?;
 		let res = self.timed_request(req).await?;
@@ -393,10 +398,10 @@ impl Request {
 		path: &str,
 		data: Bytes,
 	) -> ClResult<Bytes> {
-		Self::check_id_tag(id_tag)?;
+		let host = Self::host_for(id_tag)?;
 		let req = hyper::Request::builder()
 			.method(Method::POST)
-			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
+			.uri(format!("https://cl-o.{}/api{}", host, path))
 			.header("Content-Type", "application/json")
 			.body(to_boxed(Full::from(data)))?;
 		let res = self.timed_request(req).await?;
@@ -415,10 +420,10 @@ impl Request {
 	where
 		S: Stream<Item = Result<hyper::body::Frame<Bytes>, hyper::Error>> + Send + Sync + 'static,
 	{
-		Self::check_id_tag(id_tag)?;
+		let host = Self::host_for(id_tag)?;
 		let req = hyper::Request::builder()
 			.method(Method::POST)
-			.uri(format!("https://cl-o.{}/api{}", id_tag, path))
+			.uri(format!("https://cl-o.{}/api{}", host, path))
 			.body(to_boxed(StreamBody::new(stream)))?;
 		let res = self.timed_request(req).await?;
 		Self::collect_body(res.into_body()).await
@@ -455,13 +460,13 @@ impl Request {
 		path: &str,
 		data: Bytes,
 	) -> ClResult<Bytes> {
-		Self::check_id_tag(id_tag)?;
+		let host = Self::host_for(id_tag)?;
 		let mut attempt = 0u8;
 		loop {
 			let token = self.get_or_mint_proxy_token(tn_id, id_tag).await?;
 			let req = hyper::Request::builder()
 				.method(Method::POST)
-				.uri(format!("https://cl-o.{}/api{}", id_tag, path))
+				.uri(format!("https://cl-o.{}/api{}", host, path))
 				.header("Content-Type", "application/json")
 				.header("Authorization", format!("Bearer {}", token))
 				.body(to_boxed(Full::from(data.clone())))?;
@@ -517,14 +522,20 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn check_id_tag_accepts_valid() {
-		assert!(Request::check_id_tag("alice").is_ok());
-		assert!(Request::check_id_tag("home.w9.hu").is_ok());
-		assert!(Request::check_id_tag("user-name-123").is_ok());
+	fn host_for_accepts_valid() {
+		assert_eq!(Request::host_for("alice").unwrap(), "alice");
+		assert_eq!(Request::host_for("home.w9.hu").unwrap(), "home.w9.hu");
+		assert_eq!(Request::host_for("user-name-123").unwrap(), "user-name-123");
 	}
 
 	#[test]
-	fn check_id_tag_rejects_url_injection() {
+	fn host_for_punycodes_idn() {
+		// Storage holds the U-label; the wire needs the A-label.
+		assert_eq!(Request::host_for("münchen.example.com").unwrap(), "xn--mnchen-3ya.example.com");
+	}
+
+	#[test]
+	fn host_for_rejects_url_injection() {
 		// Each of these would corrupt the `https://cl-o.{id_tag}/api...` target
 		// if it were allowed through.
 		for bad in [
@@ -535,9 +546,11 @@ mod tests {
 			"alice evil",
 			"alice?x=1",
 			"alice#frag",
+			"alice_123",
+			"Alice.Example.com",
 			"",
 		] {
-			let err = Request::check_id_tag(bad);
+			let err = Request::host_for(bad);
 			assert!(matches!(err, Err(Error::ValidationError(_))), "expected reject for {bad:?}");
 		}
 	}

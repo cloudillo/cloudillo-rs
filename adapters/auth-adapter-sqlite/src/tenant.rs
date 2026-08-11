@@ -11,7 +11,7 @@ use crate::utils::{async_map_res, inspect, map_res, parse_str_list_optional};
 use cloudillo_types::{
 	auth_adapter::{AuthProfile, CreateTenantData, ListTenantsOptions, TenantListItem},
 	prelude::*,
-	utils::random_id,
+	utils::{normalize_id_tag, random_id},
 	worker::WorkerPool,
 };
 
@@ -29,7 +29,7 @@ pub(crate) async fn read_id_tag(db: &SqlitePool, tn_id: TnId) -> ClResult<Box<st
 /// Read tenant tn_id by id_tag
 pub(crate) async fn read_tn_id(db: &SqlitePool, id_tag: &str) -> ClResult<TnId> {
 	let res = sqlx::query("SELECT tn_id FROM tenants WHERE id_tag = ?1")
-		.bind(id_tag)
+		.bind(normalize_id_tag(id_tag).as_ref())
 		.fetch_one(db)
 		.await
 		.inspect_err(inspect);
@@ -41,7 +41,7 @@ pub(crate) async fn read_tn_id(db: &SqlitePool, id_tag: &str) -> ClResult<TnId> 
 pub(crate) async fn read_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<AuthProfile> {
 	let res =
 		sqlx::query("SELECT tn_id, id_tag, email, roles, status FROM tenants WHERE id_tag = ?1")
-			.bind(id_tag)
+			.bind(normalize_id_tag(id_tag).as_ref())
 			.fetch_one(db)
 			.await;
 
@@ -166,7 +166,7 @@ pub(crate) async fn create_tenant(
 	let res = sqlx::query(
 		"INSERT INTO tenants (id_tag, email, roles, status) VALUES (?1, ?2, ?3, 'A') RETURNING tn_id",
 	)
-	.bind(id_tag)
+	.bind(normalize_id_tag(id_tag).as_ref())
 	.bind(data.email)
 	.bind(roles_str.as_deref())
 	.fetch_one(db)
@@ -195,7 +195,7 @@ const TENANT_CASCADE_TABLES: &[&str] = &["certs", "keys", "events", "webauthn", 
 pub(crate) async fn delete_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<()> {
 	// Get the tenant ID first
 	let res = sqlx::query("SELECT tn_id FROM tenants WHERE id_tag = ?1")
-		.bind(id_tag)
+		.bind(normalize_id_tag(id_tag).as_ref())
 		.fetch_optional(db)
 		.await
 		.inspect_err(inspect)

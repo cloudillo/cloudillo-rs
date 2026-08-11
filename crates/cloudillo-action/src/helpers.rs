@@ -11,6 +11,24 @@ use crate::prelude::*;
 use crate::subject_ref::{SubjectRef, parse_subject_ref};
 use cloudillo_types::meta_adapter::MetaAdapter;
 
+/// Gate an identity-valued action field (`iss`, `aud`) on being a **canonical**
+/// id_tag — a UTS #46 U-label, per [`cloudillo_types::validation::validate_id_tag`].
+///
+/// The action format constrains its identities rather than normalising them: a
+/// mixed-case, punycoded or otherwise non-canonical identity would be signed into the
+/// token, federate under a name that does not match the peer's stored identity, and key
+/// local rows off a third form. Enforced at both boundaries — the inbound verifier
+/// (`process::verify_action_token`) and the local creator (`task::create_action`).
+///
+/// `field` names the offending claim in the error.
+pub fn check_identity_field(field: &str, id_tag: &str) -> ClResult<()> {
+	if cloudillo_types::validation::validate_id_tag(id_tag) {
+		Ok(())
+	} else {
+		Err(Error::ValidationError(format!("invalid {field} id_tag: {id_tag}")))
+	}
+}
+
 /// Extract type and optional subtype from type string (e.g., "POST:TEXT" -> ("POST", Some("TEXT")))
 pub fn extract_type_and_subtype(type_str: &str) -> (String, Option<String>) {
 	if let Some(colon_pos) = type_str.find(':') {
@@ -22,6 +40,11 @@ pub fn extract_type_and_subtype(type_str: &str) -> (String, Option<String>) {
 }
 
 /// Apply key pattern with action field substitutions for deduplication
+///
+/// Besides the action fields, `{content.<field>}` resolves a top-level field of the
+/// action content — IDP:REG and APKG key their dedup on an identity/package name that
+/// only exists in the content. A field that is absent, null or non-scalar substitutes
+/// empty, matching how the optional action fields degrade.
 pub fn apply_key_pattern(
 	pattern: &str,
 	action_type: &str,
@@ -29,13 +52,28 @@ pub fn apply_key_pattern(
 	audience: Option<&str>,
 	parent: Option<&str>,
 	subject: Option<&str>,
+	content: Option<&serde_json::Value>,
 ) -> String {
-	pattern
+	let mut result = pattern
 		.replace("{type}", action_type)
 		.replace("{issuer}", issuer)
 		.replace("{audience}", audience.unwrap_or(""))
 		.replace("{parent}", parent.unwrap_or(""))
-		.replace("{subject}", subject.unwrap_or(""))
+		.replace("{subject}", subject.unwrap_or(""));
+
+	while let Some(start) = result.find("{content.") {
+		// A pattern missing its closing brace would otherwise loop forever
+		let Some(len) = result[start..].find('}') else { break };
+		let end = start + len;
+		let field = &result[start + "{content.".len()..end];
+		let value = match content.and_then(|c| c.as_object()).and_then(|o| o.get(field)) {
+			Some(serde_json::Value::String(s)) => s.clone(),
+			Some(v) if v.is_number() || v.is_boolean() => v.to_string(),
+			_ => String::new(),
+		};
+		result.replace_range(start..=end, &value);
+	}
+	result
 }
 
 /// Serialize content Value to JSON string
@@ -317,6 +355,21 @@ pub(crate) async fn broadcast_recipient_tags(
 mod tests {
 	use super::*;
 
+	/// Only the field name in the error is this wrapper's own; which identities pass is
+	/// `cloudillo_types::validation::validate_id_tag`'s contract, tested there.
+	#[test]
+	fn test_check_identity_field() {
+		assert!(check_identity_field("issuer", "alice.example.com").is_ok());
+
+		// Non-canonical identities are rejected, not normalised — and the error
+		// names the offending claim.
+		let Err(Error::ValidationError(msg)) = check_identity_field("issuer", "Alice.Example.com")
+		else {
+			panic!("expected a validation error");
+		};
+		assert!(msg.contains("issuer"), "error should name the field: {msg}");
+	}
+
 	#[test]
 	fn test_extract_type_and_subtype_simple() {
 		let (t, st) = extract_type_and_subtype("POST");
@@ -341,14 +394,14 @@ mod tests {
 	#[test]
 	fn test_apply_key_pattern_full() {
 		let pattern = "{type}:{parent}:{issuer}";
-		let key = apply_key_pattern(pattern, "REACT", "user1", None, Some("action123"), None);
+		let key = apply_key_pattern(pattern, "REACT", "user1", None, Some("action123"), None, None);
 		assert_eq!(key, "REACT:action123:user1");
 	}
 
 	#[test]
 	fn test_apply_key_pattern_empty_optionals() {
 		let pattern = "{type}:{parent}:{issuer}:{audience}:{subject}";
-		let key = apply_key_pattern(pattern, "POST", "user1", None, None, None);
+		let key = apply_key_pattern(pattern, "POST", "user1", None, None, None, None);
 		assert_eq!(key, "POST::user1::");
 	}
 
@@ -362,8 +415,39 @@ mod tests {
 			Some("user2"),
 			Some("parent123"),
 			Some("hello"),
+			None,
 		);
 		assert_eq!(key, "MSG:parent123:user1:user2:hello");
+	}
+
+	/// Without content substitution every IDP:REG from one server to one IdP shares
+	/// a single key, and the meta adapter tombstones the previous row on store.
+	#[test]
+	fn test_apply_key_pattern_content_field() {
+		let pattern = "{type}:{issuer}:{audience}:{content.idTag}";
+		let content = serde_json::json!({ "idTag": "test5.home.w9.hu", "lang": "hu" });
+		let key = apply_key_pattern(
+			pattern,
+			"IDP",
+			"home.w9.hu",
+			Some("home.w9.hu"),
+			None,
+			None,
+			Some(&content),
+		);
+		assert_eq!(key, "IDP:home.w9.hu:home.w9.hu:test5.home.w9.hu");
+	}
+
+	#[test]
+	fn test_apply_key_pattern_content_field_missing() {
+		let pattern = "{type}:{content.name}:{content.missing}";
+		let content = serde_json::json!({ "name": "quillo" });
+		// A missing field substitutes empty, like the absent action optionals…
+		let key = apply_key_pattern(pattern, "APKG", "user1", None, None, None, Some(&content));
+		assert_eq!(key, "APKG:quillo:");
+		// …as does content that is absent entirely.
+		let key = apply_key_pattern(pattern, "APKG", "user1", None, None, None, None);
+		assert_eq!(key, "APKG::");
 	}
 
 	#[test]

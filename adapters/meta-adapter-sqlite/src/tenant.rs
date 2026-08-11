@@ -9,6 +9,8 @@
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 
+use cloudillo_types::utils::normalize_id_tag;
+
 use crate::utils::{inspect, push_patch};
 use cloudillo_types::meta_adapter::{
 	ListTenantsMetaOptions, ProfileType, Tenant, TenantListMeta, UpdateTenantData,
@@ -74,8 +76,10 @@ pub(crate) async fn create(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClResu
 		VALUES (?, ?, 'P', ?, '{}', unixepoch())",
 	)
 	.bind(tn_id.0)
+	.bind(normalize_id_tag(id_tag).as_ref())
+	// Default *display name* = the id_tag as given (will be updated by bootstrap).
+	// Deliberately NOT normalised: this one is free text, not an id_tag column.
 	.bind(id_tag)
-	.bind(id_tag) // Default name = id_tag (will be updated by bootstrap)
 	.execute(db)
 	.await
 	.inspect_err(|err| warn!("DB: {:#?}", err))
@@ -115,7 +119,9 @@ pub(crate) async fn update(
 	let mut has_updates = false;
 
 	// Apply each patch field - macro handles parameter binding safely
-	has_updates = push_patch!(query, has_updates, "id_tag", &tenant.id_tag, |v| v.as_str());
+	has_updates = push_patch!(query, has_updates, "id_tag", &tenant.id_tag, |v| {
+		normalize_id_tag(v).into_owned()
+	});
 	has_updates = push_patch!(query, has_updates, "name", &tenant.name, |v| v.as_str());
 	has_updates = push_patch!(query, has_updates, "type", &tenant.typ, |v| match v {
 		ProfileType::Person => "P",
@@ -198,11 +204,15 @@ pub(crate) async fn update(
 
 	// Sync id_tag changes (profile's id_tag must match tenant's)
 	has_profile_updates =
-		push_patch!(profile_query, has_profile_updates, "id_tag", &tenant.id_tag, |v| v.as_str());
+		push_patch!(profile_query, has_profile_updates, "id_tag", &tenant.id_tag, |v| {
+			normalize_id_tag(v).into_owned()
+		});
 
 	if has_profile_updates {
 		profile_query.push(" WHERE tn_id=").push_bind(tn_id.0);
-		profile_query.push(" AND id_tag=").push_bind(current_id_tag.as_ref());
+		profile_query
+			.push(" AND id_tag=")
+			.push_bind(normalize_id_tag(&current_id_tag).into_owned());
 
 		profile_query
 			.build()

@@ -38,11 +38,11 @@ use cloudillo_types::{
 		FileVariant, FileView, FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
 		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
 		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
-		ProfileData, PushSubscription, PushSubscriptionData, RefData, SearchObject, SearchOptions,
-		SearchPart, SearchRow, ShareEntry, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
-		UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData, UpdateFileOptions,
-		UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData, UpsertDocFormat,
-		UpsertProfileFields, UpsertResult,
+		ProfileData, PublicProfileRow, PushSubscription, PushSubscriptionData, RefData,
+		SearchObject, SearchOptions, SearchPart, SearchRow, ShareEntry, SpaceReport, Task,
+		TaskPatch, Tenant, TenantListMeta, UpdateActionDataOptions, UpdateAddressBookData,
+		UpdateCalendarData, UpdateFileOptions, UpdateRefOptions, UpdateShareEntryOptions,
+		UpdateTenantData, UpsertDocFormat, UpsertProfileFields, UpsertResult,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -156,6 +156,14 @@ impl MetaAdapter for MetaAdapterSqlite {
 		id_tag: &str,
 	) -> ClResult<(Box<str>, Profile<Box<str>>)> {
 		profile::read(&self.dbr, tn_id, id_tag).await
+	}
+
+	async fn read_profiles(
+		&self,
+		tn_id: TnId,
+		id_tags: &[&str],
+	) -> ClResult<Vec<PublicProfileRow>> {
+		profile::read_many(&self.dbr, tn_id, id_tags).await
 	}
 
 	async fn read_profile_roles(

@@ -52,7 +52,9 @@ pub async fn resolve_profile(
 fn profile_pic_url(id_tag: &str, profile_pic: Option<&str>) -> Option<String> {
 	let pic = profile_pic?;
 	let encoded_pic = cloudillo_dav::urlencode_path(pic);
-	Some(format!("https://cl-o.{id_tag}/api/files/{encoded_pic}?variant=vis.sd"))
+	// A-label: the URL goes to a CardDAV client that will resolve it via DNS.
+	let host = crate::wire_host(id_tag);
+	Some(format!("https://cl-o.{host}/api/files/{encoded_pic}?variant=vis.sd"))
 }
 
 /// Split a display name into (given, family) — naive whitespace split. Only used when the

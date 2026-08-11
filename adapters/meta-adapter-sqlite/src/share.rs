@@ -9,8 +9,25 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
 use cloudillo_types::meta_adapter::{CreateShareEntry, ShareEntry, UpdateShareEntryOptions};
 use cloudillo_types::prelude::*;
+use cloudillo_types::utils::normalize_id_tag;
 
 use crate::utils::{inspect, push_patch};
+
+/// `share_entries.subject_id` in the form it is stored and matched under.
+///
+/// The column is polymorphic and only `subject_type = 'U'` (user — see
+/// `cloudillo_file::share`) holds an id_tag, stored canonical so it lines up with
+/// `profiles.id_tag`. `'L'` (share-link token) and `'F'` (a `f1~…` file_id) are
+/// case-sensitive opaque values a blanket normalisation would corrupt, so they pass
+/// through untouched. The invariant is established on write only — there is no backfill
+/// — so every reader and writer of this column must apply the same `subject_type` gate.
+fn subject_id_needle(subject_type: char, subject_id: &str) -> std::borrow::Cow<'_, str> {
+	if subject_type == 'U' {
+		normalize_id_tag(subject_id)
+	} else {
+		std::borrow::Cow::Borrowed(subject_id)
+	}
+}
 
 /// Convert a SQLite row into a ShareEntry
 fn row_to_share_entry(row: &SqliteRow) -> ShareEntry {
@@ -64,6 +81,11 @@ pub(crate) async fn create(
 	let resource_type_str = resource_type.to_string();
 	let subject_type_str = entry.subject_type.to_string();
 	let permission_str = entry.permission.to_string();
+	// `subject_id` is polymorphic — see `subject_id_needle`. Normalising it
+	// unconditionally would corrupt the `'L'` and `'F'` subject types.
+	let subject_id = subject_id_needle(entry.subject_type, &entry.subject_id);
+	// `created_by` is always an id_tag.
+	let created_by_norm = normalize_id_tag(created_by);
 
 	let row = sqlx::query(
 		"INSERT INTO share_entries \
@@ -80,10 +102,10 @@ pub(crate) async fn create(
 	.bind(&resource_type_str)
 	.bind(resource_id)
 	.bind(&subject_type_str)
-	.bind(&entry.subject_id)
+	.bind(subject_id.as_ref())
 	.bind(&permission_str)
 	.bind(entry.expires_at.map(|t| t.0))
-	.bind(created_by)
+	.bind(created_by_norm.as_ref())
 	.bind(now.0)
 	.fetch_one(db)
 	.await
@@ -98,10 +120,11 @@ pub(crate) async fn create(
 		resource_type,
 		resource_id: resource_id.into(),
 		subject_type: entry.subject_type,
-		subject_id: entry.subject_id.clone().into(),
+		// Report what was actually stored, not the raw input.
+		subject_id: subject_id.as_ref().into(),
 		permission: entry.permission,
 		expires_at: entry.expires_at,
-		created_by: created_by.into(),
+		created_by: created_by_norm.as_ref().into(),
 		created_at: Timestamp(created_at),
 		subject_file_name: None,
 		subject_content_type: None,
@@ -225,6 +248,9 @@ pub(crate) async fn list_by_subject(
 	subject_id: &str,
 ) -> ClResult<Vec<ShareEntry>> {
 	let subject_type_str = subject_type.map(|c| c.to_string());
+	// Only a `'U'` subject is an id_tag — see `subject_id_needle`.
+	let subject_id = subject_type
+		.map_or(std::borrow::Cow::Borrowed(subject_id), |t| subject_id_needle(t, subject_id));
 
 	let rows = sqlx::query(
 		"SELECT se.id, se.resource_type, se.resource_id, se.subject_type, se.subject_id, \
@@ -242,7 +268,7 @@ pub(crate) async fn list_by_subject(
 	.bind(tn_id.0)
 	.bind(&subject_type_str)
 	.bind(&subject_type_str)
-	.bind(subject_id)
+	.bind(subject_id.as_ref())
 	.fetch_all(db)
 	.await
 	.inspect_err(inspect)
@@ -263,6 +289,8 @@ pub(crate) async fn check_access(
 ) -> ClResult<Option<char>> {
 	let resource_type_str = resource_type.to_string();
 	let subject_type_str = subject_type.to_string();
+	// Only a `'U'` subject is an id_tag — see `subject_id_needle`.
+	let subject_id = subject_id_needle(subject_type, subject_id);
 
 	let row = sqlx::query(
 		"SELECT permission FROM share_entries \
@@ -274,7 +302,7 @@ pub(crate) async fn check_access(
 	.bind(&resource_type_str)
 	.bind(resource_id)
 	.bind(&subject_type_str)
-	.bind(subject_id)
+	.bind(subject_id.as_ref())
 	.fetch_optional(db)
 	.await
 	.inspect_err(inspect)

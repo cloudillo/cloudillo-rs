@@ -16,6 +16,7 @@ use tower::Service;
 use crate::prelude::*;
 use cloudillo_core::IdTag;
 use cloudillo_core::extract::RequestId;
+use cloudillo_types::validation::dns_host_to_unicode_lossy;
 use tracing::Instrument;
 
 pub struct CertResolver {
@@ -55,6 +56,17 @@ impl CertResolver {
 	}
 }
 
+/// The cert-cache key and DB `domain` needle an SNI name resolves to.
+///
+/// SNI presents the A-label while `certs.id_tag` and `certs.domain` — and therefore the
+/// cache keyed off them — hold the canonical U-label, so the name is decoded exactly
+/// once here and both lookups run off the decoded form.
+fn cert_lookup_keys(sni: &str) -> (String, String) {
+	let host = dns_host_to_unicode_lossy(sni);
+	let domain = host.strip_prefix("cl-o.").unwrap_or(&host).to_string();
+	(host.into_owned(), domain)
+}
+
 impl std::fmt::Debug for CertResolver {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("CertResolver").finish()
@@ -65,16 +77,16 @@ impl ResolvesServerCert for CertResolver {
 	fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
 		if let Some(name) = client_hello.server_name() {
 			//debug!("Resolving cert for {}...", name);
-			if let Some(cert) = self.get(name) {
+			// The only A-label -> U-label conversion on this path.
+			let (host, domain) = cert_lookup_keys(name);
+			if let Some(cert) = self.get(&host) {
 				//debug!("[found in cache]");
 				Some(cert)
 			} else {
-				let domain =
-					if let Some(id_tag) = name.strip_prefix("cl-o.") { id_tag } else { name };
 				// FIXME: Should not block
 				let cert_data = tokio::task::block_in_place(|| {
 					tokio::runtime::Handle::current().block_on(async {
-						self.state.auth_adapter.read_cert_by_domain(domain).await
+						self.state.auth_adapter.read_cert_by_domain(&domain).await
 					})
 				});
 				if let Ok(cert_data) = cert_data {
@@ -96,6 +108,8 @@ impl ResolvesServerCert for CertResolver {
 						}
 					};
 					//debug!("[inserting into cache]");
+					// Both keys are canonical U-labels, matching what `resolve` decodes an
+					// SNI name to.
 					cache.insert(
 						("cl-o.".to_string() + &cert_data.id_tag).into_boxed_str(),
 						certified_key.clone(),
@@ -139,6 +153,8 @@ pub fn prepopulate_cert_cache(app: &App, certs: &[crate::auth_adapter::CertData]
 			Err(_) => continue,
 		};
 
+		// Both keys are canonical U-labels, matching what `resolve` decodes an SNI name
+		// to.
 		cache.insert(
 			("cl-o.".to_string() + &cert_data.id_tag).into_boxed_str(),
 			certified_key.clone(),
@@ -193,11 +209,19 @@ pub async fn create_https_server(
 			let method = req.method().clone();
 			let path = req.uri().path().to_string();
 
-			if let Some(id_tag) = host.strip_prefix("cl-o.") {
-				let id_tag_owned: Box<str> = Box::from(id_tag);
-				let host_label: &str = &id_tag_owned;
-				debug!("API {} {} {} {}", peer_addr, method, host_label, path);
-				let host_label_owned = host_label.to_string();
+			let api_id_tag = api_id_tag_from_host(host);
+			if host.starts_with("cl-o.") && api_id_tag.is_none() {
+				// A `cl-o.` host that yields no usable identity falls through to the
+				// proxy/static branch, where `/api/*` answers with the SPA. Log it, or
+				// the misconfiguration looks like a routing bug rather than a bad host.
+				warn!("Unusable cl-o. host {}, falling through to proxy/static", host);
+			}
+
+			if let Some(id_tag_owned) = api_id_tag {
+				// Logged as the bare id_tag, which is the field every existing log
+				// parser is keyed on. The canonicalised value goes into the extension.
+				let host_label_owned = id_tag_owned.to_string();
+				debug!("API {} {} {} {}", peer_addr, method, host_label_owned, path);
 				req.extensions_mut().insert(IdTag(id_tag_owned));
 				let res = api_router.clone().call(req).await;
 				let status = res.as_ref().map_or(
@@ -269,6 +293,36 @@ pub async fn create_https_server(
 	Ok(handle)
 }
 
+/// The tenant id_tag an API request's `Host` names, or `None` when the host is not
+/// a usable `cl-o.` identity.
+///
+/// The Host header carries the A-label plus whatever else a client legitimately puts
+/// there, but tenants are stored under the canonical U-label, so it has to be decoded
+/// before lookup. Two things come off first, because `canonicalize_dns_host` rejects
+/// both:
+///
+/// - the `:port`, which a browser includes whenever the listener is not on 443 — and the
+///   default `LISTEN` is `0.0.0.0:1443`. Stripped only when everything after the last `:`
+///   is ASCII digits, so an IPv6 literal is never truncated.
+/// - one trailing root dot, a valid absolute-FQDN spelling.
+///
+/// The id_tag length policy deliberately does **not** apply: a host has to resolve to
+/// whatever tenant exists (`BASE_ID_TAG=dev` is the documented minimal setup), and
+/// registration is where length is decided. The value derived here is only ever a
+/// parameterised DB lookup key; the SSRF-sensitive outbound side
+/// (`cloudillo_core::request::Request::host_for`) keeps `validate_id_tag`.
+fn api_id_tag_from_host(host: &str) -> Option<Box<str>> {
+	let host = match host.rsplit_once(':') {
+		Some((base, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => base,
+		_ => host,
+	};
+	let host = host.strip_suffix('.').unwrap_or(host);
+	let id_tag = host.strip_prefix("cl-o.")?;
+	cloudillo_types::validation::canonicalize_dns_host(id_tag)
+		.ok()
+		.map(|id_tag| Box::from(id_tag.as_ref()))
+}
+
 /// Single point that emits the per-request access log line. Picks `warn!` for
 /// 4xx/5xx and `info!` for everything else, so the level/format/argument list
 /// is not duplicated across the API/Proxy/App branches above.
@@ -286,6 +340,88 @@ fn log_access(
 		warn!("{} {} {} {} {} -> {} tm:{}ms", kind, peer, method, host, path, status, elapsed);
 	} else {
 		info!("{} {} {} {} {} -> {} tm:{}ms", kind, peer, method, host, path, status, elapsed);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{api_id_tag_from_host, cert_lookup_keys};
+
+	fn id_tag(host: &str) -> Option<String> {
+		api_id_tag_from_host(host).map(|t| t.to_string())
+	}
+
+	#[test]
+	fn accepts_a_plain_cl_o_host() {
+		assert_eq!(id_tag("cl-o.alice.example.com").as_deref(), Some("alice.example.com"));
+	}
+
+	#[test]
+	fn strips_the_port() {
+		// The default LISTEN is `0.0.0.0:1443`, so this is the ordinary dev case —
+		// `canonicalize_id_tag` rejects `:` outright.
+		assert_eq!(id_tag("cl-o.alice.example.com:1443").as_deref(), Some("alice.example.com"));
+	}
+
+	#[test]
+	fn strips_one_trailing_root_dot() {
+		assert_eq!(id_tag("cl-o.alice.example.com.").as_deref(), Some("alice.example.com"));
+		assert_eq!(id_tag("cl-o.alice.example.com.:1443").as_deref(), Some("alice.example.com"));
+	}
+
+	#[test]
+	fn canonicalises_case_and_punycode() {
+		assert_eq!(id_tag("cl-o.ALICE.example.com").as_deref(), Some("alice.example.com"));
+		assert_eq!(
+			id_tag("cl-o.xn--mnchen-3ya.example.com").as_deref(),
+			Some("münchen.example.com")
+		);
+	}
+
+	#[test]
+	fn only_strips_a_numeric_port() {
+		// Everything after the last `:` must be non-empty digits to count as a port.
+		// Both of these canonicalise fine once naively split at the last `:`, which is
+		// why they catch a missing guard — an IPv6 literal like `[::1]` would fail
+		// canonicalisation either way and so proves nothing.
+		assert_eq!(id_tag("cl-o.alice.example.com:abc"), None);
+		assert_eq!(id_tag("cl-o.alice.example.com:"), None);
+	}
+
+	#[test]
+	fn rejects_a_host_that_is_not_an_identity() {
+		assert_eq!(id_tag("app.example.com"), None);
+		assert_eq!(id_tag("cl-o."), None);
+		assert_eq!(id_tag("cl-o.alice_evil.example.com"), None); // underscore
+		assert_eq!(id_tag("cl-o.alice evil"), None);
+	}
+
+	#[test]
+	fn accepts_a_short_id_tag() {
+		// `BASE_ID_TAG=dev` is the documented minimal dev setup; the id_tag length policy
+		// is a registration rule and must not decide host routing.
+		assert_eq!(id_tag("cl-o.dev").as_deref(), Some("dev"));
+		assert_eq!(id_tag("cl-o.dev:1443").as_deref(), Some("dev"));
+	}
+
+	#[test]
+	fn sni_resolves_to_the_u_label_cache_key_and_domain_needle() {
+		assert_eq!(
+			cert_lookup_keys("cl-o.xn--mnchen-3ya.example.com"),
+			("cl-o.münchen.example.com".to_string(), "münchen.example.com".to_string())
+		);
+		// The bare app domain of the same tenant.
+		assert_eq!(
+			cert_lookup_keys("xn--mnchen-3ya.example.com"),
+			("münchen.example.com".to_string(), "münchen.example.com".to_string())
+		);
+		// ASCII is unaffected, and SNI case is folded.
+		assert_eq!(
+			cert_lookup_keys("CL-O.Alice.Example.COM"),
+			("cl-o.alice.example.com".to_string(), "alice.example.com".to_string())
+		);
+		// An undecodable name falls through verbatim and simply fails to match.
+		assert_eq!(cert_lookup_keys("a_b"), ("a_b".to_string(), "a_b".to_string()));
 	}
 }
 

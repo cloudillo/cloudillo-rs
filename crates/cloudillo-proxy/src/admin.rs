@@ -271,9 +271,10 @@ pub async fn delete_proxy_site(
 		warn!("Failed to reload proxy cache: {}", e);
 	}
 
-	// Invalidate cert cache
+	// Invalidate cert cache. Same key space as `CertResolver::resolve` — canonical
+	// U-label — or the stale cert outlives the site.
 	if let Ok(mut certs) = app.certs.write() {
-		certs.remove(&domain);
+		certs.remove(cloudillo_types::validation::dns_host_to_unicode_lossy(&domain).as_ref());
 	}
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());

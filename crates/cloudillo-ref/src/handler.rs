@@ -799,6 +799,7 @@ mod tests {
 			id_tag: id_tag.into(),
 			roles: roles.iter().map(|r| Box::from(*r)).collect(),
 			scope: scope.map(Box::from),
+			anonymous: false,
 		}
 	}
 

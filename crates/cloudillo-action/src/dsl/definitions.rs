@@ -632,7 +632,7 @@ fn idp_reg_definition() -> ActionDefinition {
 				r#enum: None,
 				properties: Some({
 					let mut props = std::collections::HashMap::new();
-					props.insert("id_tag".to_string(), SchemaField {
+					props.insert("idTag".to_string(), SchemaField {
 						field_type: FieldType::String,
 						min_length: Some(1),
 						max_length: Some(255),
@@ -646,8 +646,8 @@ fn idp_reg_definition() -> ActionDefinition {
 						r#enum: None,
 						items: None,
 					});
-					// Owner id_tag for community ownership
-					props.insert("owner_id_tag".to_string(), SchemaField {
+					// Owner idTag for community ownership
+					props.insert("ownerIdTag".to_string(), SchemaField {
 						field_type: FieldType::String,
 						min_length: None,
 						max_length: Some(255),
@@ -665,18 +665,27 @@ fn idp_reg_definition() -> ActionDefinition {
 						]),
 						items: None,
 					});
-					props.insert("expires_at".to_string(), SchemaField {
-						field_type: FieldType::Number,
+					// Comma-separated local addresses, or the literal "auto"
+					props.insert("address".to_string(), SchemaField {
+						field_type: FieldType::String,
 						min_length: None,
 						max_length: None,
 						r#enum: None,
 						items: None,
 					});
+					// Language preference for emails and notifications (e.g. "hu")
+					props.insert("lang".to_string(), SchemaField {
+						field_type: FieldType::String,
+						min_length: None,
+						max_length: Some(10),
+						r#enum: None,
+						items: None,
+					});
 					props
 				}),
-				// Only id_tag is required; email is optional when owner_id_tag is provided
-				required: Some(vec!["id_tag".to_string()]),
-				description: Some("Identity registration content with id_tag, optional email/owner, and expiration".to_string()),
+				// Only idTag is required; email is optional when ownerIdTag is provided
+				required: Some(vec!["idTag".to_string()]),
+				description: Some("Identity registration content with idTag, optional email/owner, address and language".to_string()),
 			}),
 		}),
 		behavior: BehaviorFlags {
@@ -698,7 +707,7 @@ fn idp_reg_definition() -> ActionDefinition {
 			requires_following: Some(false),
 			requires_connected: Some(false),
 		}),
-		key_pattern: Some("{type}:{issuer}:{audience}:{content.id_tag}".to_string()),
+		key_pattern: Some("{type}:{issuer}:{audience}:{content.idTag}".to_string()),
 		search: None,
 	}
 }
@@ -1467,6 +1476,44 @@ mod tests {
 				"{typ} must have no own visibility default so it inherits the CONV's 'S'"
 			);
 		}
+	}
+
+	/// `IdpRegContent` is `#[serde(rename_all = "camelCase")]`, so the wire content is
+	/// `idTag`/`ownerIdTag` and the schema must match exactly — `process.rs` block 3b
+	/// runs `validate_content` on every inbound action, so a snake_case schema silently
+	/// breaks federated registration at the receiver.
+	#[test]
+	fn idp_reg_schema_accepts_the_serialized_content_struct() {
+		let content = cloudillo_idp::registration::IdpRegContent {
+			id_tag: "test5.home.w9.hu".to_string(),
+			email: Some("user@example.com".to_string()),
+			owner_id_tag: Some("owner.home.w9.hu".to_string()),
+			issuer: Some("registrar".to_string()),
+			address: Some("10.0.0.1".to_string()),
+			lang: Some("hu".to_string()),
+		};
+		let value = serde_json::to_value(&content).expect("serialize");
+
+		let mut engine = crate::dsl::engine::DslEngine::new();
+		for def in get_definitions() {
+			engine.load_definition(def);
+		}
+		engine
+			.validate_content("IDP:REG", Some(&value))
+			.expect("IDP:REG schema must accept the camelCase content it actually receives");
+
+		// The dedup key must carry the identity, not a literal `{content.idTag}`.
+		let pattern = engine.get_key_pattern("IDP:REG").expect("key pattern");
+		let key = crate::helpers::apply_key_pattern(
+			pattern,
+			"IDP",
+			"home.w9.hu",
+			Some("home.w9.hu"),
+			None,
+			None,
+			Some(&value),
+		);
+		assert!(key.ends_with("test5.home.w9.hu"), "key must resolve content.idTag, got {key}");
 	}
 }
 

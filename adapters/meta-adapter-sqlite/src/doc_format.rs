@@ -11,6 +11,7 @@
 use cloudillo_types::{
 	meta_adapter::{DocFormat, UpsertDocFormat},
 	prelude::*,
+	utils::normalize_id_tag,
 };
 use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
@@ -74,7 +75,7 @@ pub async fn upsert(db: &SqlitePool, tn_id: TnId, fmt: &UpsertDocFormat<'_>) -> 
 	)
 	.bind(tn_id.0)
 	.bind(fmt.content_type)
-	.bind(fmt.publisher_tag)
+	.bind(normalize_id_tag(fmt.publisher_tag).as_ref())
 	.bind(fmt.app_name)
 	.bind(fmt.format_version)
 	.bind(fmt.store_tp)

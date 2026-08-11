@@ -15,6 +15,7 @@ use cloudillo_types::meta_adapter::{
 };
 use cloudillo_types::prelude::*;
 use cloudillo_types::types::AccessLevel;
+use cloudillo_types::utils::normalize_id_tag;
 
 /// Build a ProfileInfo from raw SQL columns with the given prefix.
 /// Returns None if the id_tag column is NULL or empty (i.e. the LEFT JOIN didn't match).
@@ -125,7 +126,7 @@ pub(crate) async fn list(
 				" LEFT JOIN file_user_data fud ON fud.tn_id=f.tn_id AND fud.f_id=f.f_id AND fud.id_tag=",
 			);
 		}
-		query.push_bind(opts.user_id_tag.as_deref().unwrap_or(""));
+		query.push_bind(normalize_id_tag(opts.user_id_tag.as_deref().unwrap_or("")).into_owned());
 	}
 
 	query.push(" WHERE f.tn_id=");
@@ -307,14 +308,14 @@ pub(crate) async fn list(
 	if let Some(owner_id_tag) = &opts.owner_id_tag {
 		query
 			.push(" AND COALESCE(f.creator_tag, f.owner_tag, t.id_tag)=")
-			.push_bind(owner_id_tag.as_str());
+			.push_bind(normalize_id_tag(owner_id_tag).into_owned());
 	}
 
 	// Exclude files by owner/creator (for "others" filter)
 	if let Some(not_owner_id_tag) = &opts.not_owner_id_tag {
 		query
 			.push(" AND COALESCE(f.creator_tag, f.owner_tag, t.id_tag)!=")
-			.push_bind(not_owner_id_tag.as_str());
+			.push_bind(normalize_id_tag(not_owner_id_tag).into_owned());
 	}
 
 	// Restrict to tenant-owned files (exclude remote/federated cached copies).
@@ -909,6 +910,12 @@ pub(crate) async fn create(
 		}
 	}
 
+	// `profiles.id_tag` is joined by value against both of these columns (see the
+	// `owner_id_tag`/`creator_id_tag` LEFT JOINs in the list and read queries), and
+	// profiles are stored canonical — so these must be stored canonical too.
+	let owner_tag = opts.owner_tag.as_deref().map(|t| normalize_id_tag(t).into_owned());
+	let creator_tag = opts.creator_tag.as_deref().map(|t| normalize_id_tag(t).into_owned());
+
 	// Conflict-tolerant insert: a racing create() for the same shared file_id
 	// (common during bulk action federation at registration) must not hard-error
 	// on the UNIQUE(file_id, tn_id) index. On conflict, return the row the other
@@ -921,7 +928,7 @@ pub(crate) async fn create(
 		 RETURNING f_id",
 	)
 		.bind(tn_id.0).bind(&opts.file_id).bind(opts.parent_id).bind(opts.root_id)
-		.bind(status).bind(opts.owner_tag).bind(opts.creator_tag).bind(opts.preset)
+		.bind(status).bind(owner_tag.as_deref()).bind(creator_tag.as_deref()).bind(opts.preset)
 		.bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0)
 		.bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility)
 		.bind(i32::from(opts.hidden))
@@ -1437,6 +1444,7 @@ pub(crate) async fn read_with_user_data(
 	file_id: &str,
 	id_tag: &str,
 ) -> ClResult<Option<FileView>> {
+	let id_tag = normalize_id_tag(id_tag);
 	let base_sql = "SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, \
 		f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, \
 		f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, \
@@ -1458,7 +1466,7 @@ pub(crate) async fn read_with_user_data(
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
 		let sql = format!("{} WHERE f.tn_id=? AND f.f_id=?", base_sql);
 		sqlx::query(sqlx::AssertSqlSafe(sql))
-			.bind(id_tag)
+			.bind(id_tag.as_ref())
 			.bind(tn_id.0)
 			.bind(f_id)
 			.fetch_optional(db)
@@ -1468,7 +1476,7 @@ pub(crate) async fn read_with_user_data(
 	} else {
 		let sql = format!("{} WHERE f.tn_id=? AND f.file_id=?", base_sql);
 		sqlx::query(sqlx::AssertSqlSafe(sql))
-			.bind(id_tag)
+			.bind(id_tag.as_ref())
 			.bind(tn_id.0)
 			.bind(file_id)
 			.fetch_optional(db)

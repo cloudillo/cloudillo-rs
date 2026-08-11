@@ -17,6 +17,7 @@ use crate::prelude::*;
 use crate::scheduler::{Task, TaskId};
 use crate::{ScheduleEmailFn, ScheduleEmailParams};
 use cloudillo_types::auth_adapter::{self, TenantCertRenewalRow};
+use cloudillo_types::validation::id_tag_to_ascii_lossy;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -89,12 +90,9 @@ pub async fn renew_tenant<'a>(
 	tn_id: u32,
 	app_domain: Option<&'a str>,
 ) -> ClResult<()> {
-	let mut domains: Vec<String> = vec!["cl-o.".to_string() + id_tag];
-	if let Some(app_domain) = app_domain {
-		domains.push(app_domain.to_string());
-	} else {
+	let domains = build_domains_for_tenant(id_tag, app_domain);
+	if app_domain.is_none() {
 		info!("cloudillo app domain: {}", &id_tag);
-		domains.push(id_tag.into());
 	}
 
 	let cert = renew_domains(&state, account, domains).await?;
@@ -586,12 +584,19 @@ pub fn register_tasks(app: &App) -> ClResult<()> {
 const RENEWAL_NOTIFY_LONG_INTERVAL_SECS: i64 = 7 * 86400;
 const RENEWAL_NOTIFY_SHORT_INTERVAL_SECS: i64 = 86400;
 
-/// Build the list of domains a tenant cert needs to cover. Mirrors the logic
-/// in `renew_tenant`.
+/// Build the list of domains a tenant cert needs to cover — one definition shared by
+/// `renew_tenant` and the DNS pre-check.
+///
+/// id_tags are stored as UTS #46 U-labels, but ACME identifiers, DNS and TLS SNI all
+/// speak punycode, so both entries derived from the id_tag go out as A-labels.
+/// `app_domain` is an operator-configured hostname, not an id_tag, and passes through
+/// verbatim.
 fn build_domains_for_tenant(id_tag: &str, app_domain: Option<&str>) -> Vec<String> {
-	let mut domains = vec![format!("cl-o.{}", id_tag)];
-	domains.push(app_domain.unwrap_or(id_tag).to_string());
-	domains
+	let ascii = id_tag_to_ascii_lossy(id_tag);
+	vec![
+		format!("cl-o.{}", ascii),
+		app_domain.map_or_else(|| ascii.into_owned(), ToString::to_string),
+	]
 }
 
 /// Outcome of a DNS pre-check. Definitive failures (`"nodns"`, `"address"`)
@@ -790,6 +795,38 @@ async fn schedule_renewal_failure_email(
 	};
 
 	schedule_email(app, row.tn_id, params).await
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn builds_ascii_domains_for_an_idn_id_tag() {
+		// Both entries derived from the id_tag must be A-labels: ACME identifiers
+		// and the TLS SNI name they end up matching are DNS names, never U-labels.
+		assert_eq!(
+			build_domains_for_tenant("münchen.example.com", None),
+			vec!["cl-o.xn--mnchen-3ya.example.com", "xn--mnchen-3ya.example.com"]
+		);
+	}
+
+	#[test]
+	fn keeps_a_configured_app_domain_verbatim() {
+		// `app_domain` is an operator-configured hostname, not an id_tag.
+		assert_eq!(
+			build_domains_for_tenant("münchen.example.com", Some("app.example.com")),
+			vec!["cl-o.xn--mnchen-3ya.example.com", "app.example.com"]
+		);
+	}
+
+	#[test]
+	fn passes_an_ascii_id_tag_through_unchanged() {
+		assert_eq!(
+			build_domains_for_tenant("alice.example.com", None),
+			vec!["cl-o.alice.example.com", "alice.example.com"]
+		);
+	}
 }
 
 // vim: ts=4

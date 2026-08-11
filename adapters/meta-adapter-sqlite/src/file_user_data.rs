@@ -9,9 +9,16 @@ use crate::utils::inspect;
 use cloudillo_types::meta_adapter::FileUserData;
 use cloudillo_types::prelude::*;
 use cloudillo_types::types::AccessLevel;
+use cloudillo_types::utils::normalize_id_tag;
 
 /// Record file access for a user (upserts record, updates accessed_at timestamp)
-/// Also updates the global accessed_at on the files table
+/// Also updates the global accessed_at on the files table.
+///
+/// An empty `id_tag` means the caller has no identity to attribute the access to — an
+/// anonymous share-link visitor on a CRDT/RTDB socket. The file's own `accessed_at` still
+/// advances (an anonymous read *is* a read); only the per-user row is skipped, because
+/// `(tn_id, id_tag, f_id)` is the primary key and every anonymous visitor would otherwise
+/// collapse into one `id_tag = ''` row.
 pub(crate) async fn record_access(
 	db: &SqlitePool,
 	tn_id: TnId,
@@ -30,7 +37,8 @@ pub(crate) async fn record_access(
 	.map_err(|_| Error::DbError)?;
 
 	// If file exists, update per-user access timestamp using the returned f_id
-	if let Some(row) = row {
+	let id_tag = normalize_id_tag(id_tag);
+	if let Some(row) = row.filter(|_| !id_tag.is_empty()) {
 		let f_id: i64 = row.try_get("f_id").map_err(|_| Error::DbError)?;
 
 		sqlx::query(
@@ -41,7 +49,7 @@ pub(crate) async fn record_access(
 			 updated_at = unixepoch()",
 		)
 		.bind(tn_id.0)
-		.bind(id_tag)
+		.bind(id_tag.as_ref())
 		.bind(f_id)
 		.execute(db)
 		.await
@@ -53,7 +61,10 @@ pub(crate) async fn record_access(
 }
 
 /// Record file modification for a user (upserts record, updates modified_at timestamp)
-/// Also updates the global modified_at on the files table
+/// Also updates the global modified_at on the files table.
+///
+/// An empty `id_tag` skips the per-user row for the same reason as
+/// [`record_access`]; `files.modified_at` still advances.
 pub(crate) async fn record_modification(
 	db: &SqlitePool,
 	tn_id: TnId,
@@ -72,7 +83,8 @@ pub(crate) async fn record_modification(
 	.map_err(|_| Error::DbError)?;
 
 	// If file exists, update per-user modification timestamp using the returned f_id
-	if let Some(row) = row {
+	let id_tag = normalize_id_tag(id_tag);
+	if let Some(row) = row.filter(|_| !id_tag.is_empty()) {
 		let f_id: i64 = row.try_get("f_id").map_err(|_| Error::DbError)?;
 
 		sqlx::query(
@@ -83,7 +95,7 @@ pub(crate) async fn record_modification(
 			 updated_at = unixepoch()",
 		)
 		.bind(tn_id.0)
-		.bind(id_tag)
+		.bind(id_tag.as_ref())
 		.bind(f_id)
 		.execute(db)
 		.await
@@ -169,7 +181,8 @@ pub(crate) async fn update(
 		update_clause
 	);
 
-	let mut q = sqlx::query(sqlx::AssertSqlSafe(query_str)).bind(tn_id.0).bind(id_tag);
+	let id_tag = normalize_id_tag(id_tag);
+	let mut q = sqlx::query(sqlx::AssertSqlSafe(query_str)).bind(tn_id.0).bind(id_tag.as_ref());
 	if !pinned.is_undefined() {
 		q = q.bind(pinned_val);
 	}
@@ -184,7 +197,7 @@ pub(crate) async fn update(
 	q.execute(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 	// Return the updated data
-	get(db, tn_id, id_tag, file_id).await.map(Option::unwrap_or_default)
+	get(db, tn_id, id_tag.as_ref(), file_id).await.map(Option::unwrap_or_default)
 }
 
 /// Get file user data for a specific file
@@ -201,7 +214,7 @@ pub(crate) async fn get(
 		 WHERE fud.tn_id = ? AND fud.id_tag = ? AND f.file_id = ?",
 	)
 	.bind(tn_id.0)
-	.bind(id_tag)
+	.bind(normalize_id_tag(id_tag).as_ref())
 	.bind(file_id)
 	.fetch_optional(db)
 	.await

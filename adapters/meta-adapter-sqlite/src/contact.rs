@@ -16,6 +16,7 @@ use cloudillo_types::{
 		UpdateAddressBookData,
 	},
 	prelude::*,
+	utils::normalize_id_tag,
 };
 use sqlx::{Row, SqlitePool};
 
@@ -378,7 +379,7 @@ pub async fn upsert_contact(
 	.bind(extracted.title.as_deref())
 	.bind(extracted.note.as_deref())
 	.bind(extracted.photo_uri.as_deref())
-	.bind(extracted.profile_id_tag.as_deref())
+	.bind(extracted.profile_id_tag.as_deref().map(|t| normalize_id_tag(t).into_owned()))
 	.execute(&mut *tx)
 	.await
 	.inspect_err(|e| error!("DB: {e}"))
@@ -539,7 +540,7 @@ pub async fn list_contacts_by_profile(
 		 WHERE tn_id = ? AND profile_id_tag = ? AND deleted_at IS NULL",
 	)))
 	.bind(tn_id.0)
-	.bind(profile_id_tag)
+	.bind(normalize_id_tag(profile_id_tag).as_ref())
 	.fetch_all(db)
 	.await
 	.inspect_err(|e| error!("DB: {e}"))

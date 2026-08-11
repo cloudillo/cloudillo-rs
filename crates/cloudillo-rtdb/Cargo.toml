@@ -22,5 +22,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync"] }
 tracing = "0.1"
 
+[dev-dependencies]
+# `macros` for `#[tokio::test]`; the normal dependency carries only `rt`+`sync`.
+tokio = { version = "1", features = ["macros", "rt"] }
+
 [lints]
 workspace = true

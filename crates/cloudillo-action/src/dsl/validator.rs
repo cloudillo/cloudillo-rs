@@ -305,10 +305,13 @@ mod tests {
 		assert!(validate_id_tag("alice"));
 		assert!(validate_id_tag("bob-123"));
 		assert!(validate_id_tag("user-name-123"));
+		// IDN identities are accepted in their canonical U-label form.
+		assert!(validate_id_tag("münchen.example.com"));
 
 		assert!(!validate_id_tag("Al")); // too short
 		assert!(!validate_id_tag("Alice")); // uppercase
 		assert!(!validate_id_tag("alice_123")); // underscore not allowed
+		assert!(!validate_id_tag("xn--mnchen-3ya.example.com")); // A-label is never stored
 	}
 
 	#[test]

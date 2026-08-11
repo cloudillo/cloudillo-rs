@@ -15,7 +15,7 @@ use cloudillo_types::{
 	auth_adapter::{AccessToken, ActionToken, AuthCtx, AuthLogin},
 	prelude::*,
 	roles::expand_roles_preserving_extras,
-	utils::parse_roles,
+	utils::{normalize_id_tag, parse_roles},
 	worker::WorkerPool,
 };
 
@@ -49,6 +49,7 @@ pub(crate) async fn validate_access_token(
 	// external users `sub` carries the real user identity (id_tag).
 	Ok(AuthCtx {
 		tn_id,
+		anonymous: token_data.claims.sub.is_none(),
 		id_tag: token_data.claims.sub.unwrap_or(token_data.claims.iss),
 		roles: parse_roles(token_data.claims.r.as_deref().unwrap_or("")),
 		scope: token_data.claims.scope,
@@ -124,7 +125,7 @@ pub(crate) async fn check_tenant_password(
 ) -> ClResult<AuthLogin> {
 	let res =
 		sqlx::query("SELECT tn_id, id_tag, password, roles, status FROM tenants WHERE id_tag = ?1")
-			.bind(id_tag)
+			.bind(normalize_id_tag(id_tag).as_ref())
 			.fetch_one(db)
 			.await;
 
@@ -173,7 +174,7 @@ pub(crate) async fn update_tenant_password(
 ) -> ClResult<()> {
 	let password_hash = crypto::generate_password_hash(worker, password).await?;
 	let res = sqlx::query("UPDATE tenants SET password=?2 WHERE id_tag = ?1")
-		.bind(id_tag)
+		.bind(normalize_id_tag(id_tag).as_ref())
 		.bind(password_hash)
 		.execute(db)
 		.await
@@ -192,7 +193,7 @@ pub(crate) async fn update_idp_api_key(
 	api_key: &str,
 ) -> ClResult<()> {
 	sqlx::query("UPDATE tenants SET idp_api_key=?2 WHERE id_tag = ?1")
-		.bind(id_tag)
+		.bind(normalize_id_tag(id_tag).as_ref())
 		.bind(api_key)
 		.execute(db)
 		.await
@@ -209,7 +210,7 @@ pub(crate) async fn create_tenant_login(
 	jwt_secret_str: &str,
 ) -> ClResult<AuthLogin> {
 	let res = sqlx::query("SELECT tn_id, id_tag, roles, status FROM tenants WHERE id_tag = ?1")
-		.bind(id_tag)
+		.bind(normalize_id_tag(id_tag).as_ref())
 		.fetch_one(db)
 		.await;
 
@@ -356,6 +357,65 @@ mod tests {
 
 	fn make_token(secret: &[u8], iss: &str) -> String {
 		make_token_with_roles(secret, iss, Some("leader"))
+	}
+
+	/// A share-link token as `cloudillo_auth`'s ref exchange mints it: a `file:`
+	/// scope and **no** `sub`.
+	fn make_anonymous_token(secret: &[u8], iss: &str, scope: &str) -> String {
+		let claims = AccessToken {
+			iss,
+			sub: None::<&str>,
+			scope: Some(scope),
+			r: None,
+			exp: Timestamp::from_now(3600),
+		};
+		encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
+			.expect("encode token")
+	}
+
+	/// A `sub`-less token's `id_tag` falls back to `iss` — the *tenant owner*.
+	/// Everything that asserts an identity on the holder's behalf (CRDT awareness
+	/// stamping in `cloudillo::websocket::get_ws_crdt`) reads `anonymous` to
+	/// refuse doing so; without the flag it would stamp the owner's id_tag onto
+	/// an anonymous share-link visitor.
+	#[tokio::test]
+	async fn validate_access_token_marks_subless_token_anonymous() {
+		let secret = b"test-secret-bytes-for-hs256-signing";
+		let dec = DecodingKey::from_secret(secret);
+		let token = make_anonymous_token(secret, "a.example", "file:f1~abc:W");
+
+		let ctx = validate_access_token(&dec, TnId(1), "a.example", &token)
+			.await
+			.expect("token accepted");
+		assert!(ctx.anonymous, "a token without `sub` must be anonymous");
+		assert_eq!(ctx.id_tag.as_ref(), "a.example", "id_tag falls back to iss");
+		// The scope — and therefore the share link's authority — is untouched.
+		assert_eq!(ctx.scope.as_deref(), Some("file:f1~abc:W"));
+	}
+
+	/// The mirror image: a `file:`-scoped token minted for a signed-in user (the
+	/// `?via=` cross-document path) carries a real `sub` and must keep its
+	/// identity. Scope alone is *not* an anonymity signal.
+	#[tokio::test]
+	async fn validate_access_token_keeps_identity_of_scoped_sub_bearing_token() {
+		let secret = b"test-secret-bytes-for-hs256-signing";
+		let dec = DecodingKey::from_secret(secret);
+		let claims = AccessToken {
+			iss: "a.example",
+			sub: Some("bob.example"),
+			scope: Some("file:f1~abc:W"),
+			r: Some("public"),
+			exp: Timestamp::from_now(3600),
+		};
+		let token =
+			encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
+				.expect("encode token");
+
+		let ctx = validate_access_token(&dec, TnId(1), "a.example", &token)
+			.await
+			.expect("token accepted");
+		assert!(!ctx.anonymous, "a token carrying `sub` names a person");
+		assert_eq!(ctx.id_tag.as_ref(), "bob.example");
 	}
 
 	#[test]

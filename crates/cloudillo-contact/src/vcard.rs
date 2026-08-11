@@ -551,7 +551,9 @@ pub fn generate(input: &ContactInput, rev: Option<&str>) -> String {
 	if let Some(tag) = input.profile_id_tag.as_deref() {
 		let uri = format!("cloudillo:{tag}");
 		write_line(&mut out, "X-CLOUDILLO-PROFILE", &[("VALUE", "uri")], &uri, true);
-		let https_uri = format!("https://cl-o.{tag}/");
+		// A-label in the https form; the `cloudillo:` URI above keeps the identity
+		// as stored (the U-label), since that is an identifier, not a host.
+		let https_uri = format!("https://cl-o.{}/", crate::wire_host(tag));
 		write_line(&mut out, "SOCIALPROFILE", &[("SERVICE-TYPE", "Cloudillo")], &https_uri, true);
 	}
 	if let Some(rev) = rev {

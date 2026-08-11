@@ -64,7 +64,13 @@ pub async fn reload_proxy_cache(app: &App) -> ClResult<()> {
 			if let (Some(cert_pem), Some(key_pem)) = (site.cert.as_ref(), site.cert_key.as_ref())
 				&& let Some(certified_key) = build_certified_key(cert_pem, key_pem)
 			{
-				cert_cache.insert(site.domain.clone(), Arc::new(certified_key));
+				// Same key space as `CertResolver::resolve` — canonical U-label.
+				cert_cache.insert(
+					cloudillo_types::validation::dns_host_to_unicode_lossy(&site.domain)
+						.into_owned()
+						.into_boxed_str(),
+					Arc::new(certified_key),
+				);
 			}
 		}
 	}

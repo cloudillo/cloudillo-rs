@@ -6,6 +6,7 @@
 use cloudillo_types::{
 	meta_adapter::{InstallApp, InstalledApp},
 	prelude::*,
+	utils::normalize_id_tag,
 };
 use sqlx::{Row, SqlitePool};
 
@@ -31,7 +32,7 @@ pub async fn install(db: &SqlitePool, tn_id: TnId, install: &InstallApp) -> ClRe
 	)
 	.bind(tn_id.0)
 	.bind(&*install.app_name)
-	.bind(&*install.publisher_tag)
+	.bind(normalize_id_tag(&install.publisher_tag).as_ref())
 	.bind(&*install.version)
 	.bind(&*install.action_id)
 	.bind(&*install.file_id)
@@ -56,7 +57,7 @@ pub async fn uninstall(
 	)
 	.bind(tn_id.0)
 	.bind(app_name)
-	.bind(publisher_tag)
+	.bind(normalize_id_tag(publisher_tag).as_ref())
 	.execute(db)
 	.await
 	.map_err(|e| {
@@ -150,7 +151,7 @@ pub async fn get(
 	)
 	.bind(tn_id.0)
 	.bind(app_name)
-	.bind(publisher_tag)
+	.bind(normalize_id_tag(publisher_tag).as_ref())
 	.fetch_optional(db)
 	.await
 	.map_err(|e| {

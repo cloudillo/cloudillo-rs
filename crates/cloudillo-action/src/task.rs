@@ -54,6 +54,13 @@ pub async fn create_action(
 ) -> ClResult<Box<str>> {
 	let dsl = app.ext::<Arc<DslEngine>>()?;
 
+	// The action format constrains its identities (see `helpers::check_identity_field`).
+	// Checked before the ephemeral branch so both creation paths are covered. The
+	// issuer is this tenant's own id_tag and is not re-checked here.
+	if let Some(audience_tag) = action.audience_tag.as_deref() {
+		helpers::check_identity_field("audience", audience_tag)?;
+	}
+
 	// Check if this is an ephemeral action type
 	let is_ephemeral = dsl
 		.get_behavior(action.typ.as_ref())
@@ -313,6 +320,7 @@ pub async fn create_action(
 				action.audience_tag.as_deref(),
 				action.parent_id.as_deref(),
 				action.subject.as_deref(),
+				action.content.as_ref(),
 			)
 		})
 	};
@@ -569,6 +577,7 @@ impl Task<App> for ActionCreatorTask {
 					effective_audience.as_deref(),
 					self.action.parent_id.as_deref(),
 					subject.as_deref(),
+					self.action.content.as_ref(),
 				)
 			})
 		} else {

@@ -146,10 +146,31 @@ pub async fn require_leader(
 	Ok(next.run(req).await)
 }
 
-pub async fn require_auth(
-	State(state): State<App>,
+/// Whether [`authenticate`] applies [`crate::scope::scope_permits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeGate {
+	/// Normal protected-API behaviour.
+	Enforce,
+	/// The scope-agnostic tier — see [`require_auth_public_data`].
+	Skip,
+}
+
+/// Full credential validation for the protected API surface.
+///
+/// Validates all three credential families (`cl_` tenant API key, `idp_` key,
+/// JWT), resolves the tenant, and — under [`ScopeGate::Enforce`] — applies
+/// [`crate::scope::scope_permits`]. On success `Auth` is installed in the
+/// request extensions.
+///
+/// The [`ScopeGate`] is the **only** difference between [`require_auth`] and
+/// [`require_auth_public_data`]; both delegate here so the validation itself can
+/// never drift between them. Keep both wrappers one-line delegations — inlining
+/// either body is what would silently drop token validation from one tier.
+async fn authenticate(
+	state: App,
 	mut req: Request<Body>,
 	next: Next,
+	gate: ScopeGate,
 ) -> ClResult<Response<Body>> {
 	// Extract IdTag from request extensions (inserted by webserver)
 	let id_tag = req
@@ -209,6 +230,7 @@ pub async fn require_auth(
 				id_tag: validation.id_tag,
 				roles: validation.roles.map(|r| crate::roles::parse_roles(&r)).unwrap_or_default(),
 				scope: validation.scopes,
+				anonymous: false,
 			}
 		}
 		Some(ApiKeyType::Idp) => {
@@ -235,6 +257,7 @@ pub async fn require_auth(
 				id_tag: auth_id_tag.into(),
 				roles: Box::new([]), // IDP keys don't have roles
 				scope: None,
+				anonymous: false,
 			}
 		}
 		None => {
@@ -245,7 +268,9 @@ pub async fn require_auth(
 
 	// Enforce scope restrictions centrally and fail-closed: a scope string the
 	// matcher doesn't recognise grants nothing anywhere (see `crate::scope`).
-	if !crate::scope::scope_permits(claims.scope.as_deref(), req.method(), req.uri().path()) {
+	if gate == ScopeGate::Enforce
+		&& !crate::scope::scope_permits(claims.scope.as_deref(), req.method(), req.uri().path())
+	{
 		warn!(
 			scope = ?claims.scope,
 			path = %req.uri().path(),
@@ -257,6 +282,59 @@ pub async fn require_auth(
 	req.extensions_mut().insert(Auth(claims));
 
 	Ok(next.run(req).await)
+}
+
+pub async fn require_auth(
+	State(state): State<App>,
+	req: Request<Body>,
+	next: Next,
+) -> ClResult<Response<Body>> {
+	authenticate(state, req, next, ScopeGate::Enforce).await
+}
+
+/// Like [`require_auth`], but **skips the scope gate**. It relaxes *scope*, never
+/// *validity*: an expired, forged, wrong-tenant or unparseable token is rejected here
+/// exactly as `require_auth` rejects it.
+///
+/// # The admission rule — read before mounting anything here
+///
+/// > **Mount a route under this layer only if every field of its response is already
+/// > obtainable without authentication elsewhere.**
+///
+/// That rule is what makes the admission safe, and the admission is total: *any* valid
+/// credential reaches this tier with **no** scope filtering. Exhaustively —
+///
+/// - every `file:{file_id}:{R|C|W}` share-link token,
+/// - every `apkg:publish` token,
+/// - every `carddav:*` / `caldav:*` capability key,
+/// - every scope string [`crate::scope::scope_permits`] does **not** recognise — the
+///   case it exists to fail closed on, since tenant API keys are minted with the full
+///   owner role set regardless of their `scopes` column,
+/// - and every scope family added in future, admitted the day it is added with no diff
+///   touching this file.
+///
+/// The share-link token is the worked example because it is the most adversarial: a
+/// credential handed to an untrusted third party for one document, which
+/// `scope_permits` otherwise confines to `/api/files/**`, `/api/search` and the
+/// CRDT/RTDB sockets. Mounting a route here hands that third party the route, with no
+/// ABAC behind it unless the compose site adds one.
+///
+/// It exists because [`crate::scope::scope_permits`] is a central path list, and growing
+/// it is how a scope quietly widens: the list drifts away from the routes it governs and
+/// no reviewer of a route change ever sees it. Expressing the relaxation as a mount puts
+/// the decision in the diff that adds the route, and leaves `scope.rs` untouched — so
+/// every other `/api/profiles/*` route stays denied to a file-scoped token.
+///
+/// The mounted set is pinned by
+/// `crate::routes::protected::tests::public_data_tier_holds_exactly_the_admitted_tables`
+/// in the `cloudillo` crate. Currently: `GET /api/profiles/batch` — the reduced 4-field
+/// profile projection, which is `GET /api/me` minus `keys`.
+pub async fn require_auth_public_data(
+	State(state): State<App>,
+	req: Request<Body>,
+	next: Next,
+) -> ClResult<Response<Body>> {
+	authenticate(state, req, next, ScopeGate::Skip).await
 }
 
 pub async fn optional_auth(
@@ -303,6 +381,7 @@ pub async fn optional_auth(
 										.map(|r| crate::roles::parse_roles(&r))
 										.unwrap_or_default(),
 									scope: validation.scopes,
+									anonymous: false,
 								})
 							})
 						}
@@ -315,6 +394,7 @@ pub async fn optional_auth(
 										id_tag: auth_id_tag.into(),
 										roles: Box::new([]),
 										scope: None,
+										anonymous: false,
 									})),
 									Ok(None) => {
 										warn!(
@@ -415,6 +495,7 @@ mod tests {
 			id_tag: "alice.example.com".into(),
 			roles: roles.iter().map(|r| Box::from(*r)).collect(),
 			scope: scope.map(Box::from),
+			anonymous: false,
 		}
 	}
 
@@ -476,6 +557,29 @@ mod tests {
 	async fn require_leader_denies_missing_auth() {
 		// Fail closed when the `Auth` extension is absent entirely.
 		assert_eq!(run_require_leader(None).await, StatusCode::FORBIDDEN);
+	}
+
+	/// Driving the real middleware needs a full `App` (adapters, DB) that no unit test
+	/// here can build, so pin the half that can be pinned: *why* the permissive tier is
+	/// needed at all.
+	#[test]
+	fn file_scope_needs_the_permissive_tier_for_the_batch_route() {
+		use crate::scope::scope_permits;
+		use axum::http::Method;
+
+		let s = Some("file:f1~abc:R");
+
+		// The whole reason `require_auth_public_data` exists: under `require_auth`
+		// this request is a 403.
+		assert!(!scope_permits(s, &Method::GET, "/api/profiles/batch"));
+
+		// ...and `scope.rs` is deliberately untouched, so every other profile route
+		// stays denied to a file-scoped token exactly as before.
+		assert!(!scope_permits(s, &Method::GET, "/api/profiles/alice.example.com"));
+		assert!(!scope_permits(s, &Method::PATCH, "/api/profiles/alice.example.com"));
+		assert!(!scope_permits(s, &Method::POST, "/api/profiles/alice.example.com/refresh"));
+		assert!(!scope_permits(s, &Method::PUT, "/api/profiles/alice.example.com"));
+		assert!(!scope_permits(s, &Method::GET, "/api/profiles"));
 	}
 }
 

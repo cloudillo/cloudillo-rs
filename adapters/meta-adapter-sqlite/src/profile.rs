@@ -8,9 +8,10 @@ use sqlx::{Row, SqlitePool};
 use crate::utils::{collect_res, inspect, map_res, push_patch};
 use cloudillo_types::meta_adapter::{
 	ListProfileOptions, Profile, ProfileConnectionStatus, ProfileData, ProfileStatus, ProfileTrust,
-	ProfileType, UpsertProfileFields, UpsertResult,
+	ProfileType, PublicProfileRow, UpsertProfileFields, UpsertResult,
 };
 use cloudillo_types::prelude::*;
+use cloudillo_types::utils::normalize_id_tag;
 
 /// Parse the `status` CHAR(1) column into a `ProfileStatus` value.
 fn parse_status(row: &sqlx::sqlite::SqliteRow) -> Result<Option<ProfileStatus>, sqlx::Error> {
@@ -198,7 +199,7 @@ pub(crate) async fn list(
 	}
 
 	if let Some(id_tag) = &opts.id_tag {
-		query.push(" AND id_tag=").push_bind(id_tag.as_str());
+		query.push(" AND id_tag=").push_bind(normalize_id_tag(id_tag).into_owned());
 	}
 
 	if let Some(trust_set) = opts.trust_set {
@@ -224,7 +225,7 @@ pub(crate) async fn list(
 		query.push(" ORDER BY name LIMIT 100");
 	} else {
 		if let Some(after) = &opts.after_id_tag {
-			query.push(" AND id_tag > ").push_bind(after.as_str());
+			query.push(" AND id_tag > ").push_bind(normalize_id_tag(after).into_owned());
 		}
 		query
 			.push(" ORDER BY id_tag LIMIT ")
@@ -269,7 +270,9 @@ pub(crate) async fn list(
 
 /// Get relationships for multiple target profiles in a single query
 ///
-/// Returns a HashMap of target_id_tag -> (following, connected)
+/// Returns a HashMap of target_id_tag -> (following, connected), keyed by the
+/// id_tags the caller passed in, verbatim — not by the canonical form the rows
+/// are stored under.
 pub(crate) async fn get_relationships(
 	db: &SqlitePool,
 	tn_id: TnId,
@@ -291,7 +294,7 @@ pub(crate) async fn get_relationships(
 		if i > 0 {
 			query.push(", ");
 		}
-		query.push_bind(*id_tag);
+		query.push_bind(normalize_id_tag(id_tag).into_owned());
 	}
 	query.push(")");
 
@@ -302,13 +305,22 @@ pub(crate) async fn get_relationships(
 		.inspect_err(inspect)
 		.map_err(|_| Error::DbError)?;
 
-	let mut result = HashMap::with_capacity(rows.len());
+	let mut by_canonical = HashMap::with_capacity(rows.len());
 	for row in rows {
 		let id_tag: String = row.try_get("id_tag").map_err(|_| Error::DbError)?;
 		let following: bool = row.try_get("following").map_err(|_| Error::DbError)?;
 		let connected_status = parse_connected(&row);
 		let connected = connected_status.is_connected();
-		result.insert(id_tag, (following, connected));
+		by_canonical.insert(id_tag, (following, connected));
+	}
+
+	// Rows come back under the canonical id_tag; callers key by the string they
+	// passed in, so map back before returning.
+	let mut result = HashMap::with_capacity(target_id_tags.len());
+	for original in target_id_tags {
+		if let Some(&rel) = by_canonical.get(normalize_id_tag(original).as_ref()) {
+			result.insert((*original).to_string(), rel);
+		}
 	}
 
 	Ok(result)
@@ -320,12 +332,13 @@ pub(crate) async fn read(
 	tn_id: TnId,
 	id_tag: &str,
 ) -> ClResult<(Box<str>, Profile<Box<str>>)> {
+	let id_tag = normalize_id_tag(id_tag);
 	let res = sqlx::query(
 		"SELECT id_tag, type, name, profile_pic, status, synced_at, perm, following, follower, connected, roles, trust, feed_read_at, msg_read_at, hidden_in_home, etag
 		FROM profiles WHERE tn_id=? AND id_tag=?",
 	)
 	.bind(tn_id.0)
-	.bind(id_tag)
+	.bind(id_tag.as_ref())
 	.fetch_one(db)
 	.await;
 
@@ -360,6 +373,74 @@ pub(crate) async fn read(
 	})
 }
 
+/// Chunk size for the `IN (…)` batch. Well under SQLite's 999 bound-variable limit with
+/// room for `tn_id`, and it bounds the number of distinct SQL texts this function can
+/// push through sqlx's per-connection statement cache. Callers need not pre-chunk.
+const READ_MANY_CHUNK: usize = 64;
+
+/// Batch sibling of [`read`], reduced to the public projection and chunked.
+///
+/// Rows the tenant has not mirrored are simply absent — the caller cannot distinguish
+/// "no such profile" from "not mirrored here". A row whose `type` is NULL or
+/// unrecognised is dropped the same way: those are the never-synced relationship stubs
+/// the FLLW/CONN native hooks insert, which have neither a name nor a picture to
+/// project. Result order is unspecified; callers key by `id_tag`.
+pub(crate) async fn read_many(
+	db: &SqlitePool,
+	tn_id: TnId,
+	id_tags: &[&str],
+) -> ClResult<Vec<PublicProfileRow>> {
+	if id_tags.is_empty() {
+		return Ok(Vec::new());
+	}
+
+	let mut profiles = Vec::with_capacity(id_tags.len());
+	for chunk in id_tags.chunks(READ_MANY_CHUNK) {
+		let mut query = sqlx::QueryBuilder::new(
+			"SELECT id_tag, name, type, profile_pic FROM profiles WHERE tn_id=",
+		);
+		query.push_bind(tn_id.0);
+		query.push(" AND id_tag IN (");
+
+		for (i, id_tag) in chunk.iter().enumerate() {
+			if i > 0 {
+				query.push(", ");
+			}
+			query.push_bind(normalize_id_tag(id_tag).into_owned());
+		}
+		query.push(")");
+
+		let rows = query
+			.build()
+			.fetch_all(db)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+
+		for row in rows {
+			let type_str: Option<&str> =
+				row.try_get("type").inspect_err(inspect).map_err(|_| Error::DbError)?;
+			let typ = match type_str {
+				Some("P") => ProfileType::Person,
+				Some("C") => ProfileType::Community,
+				// Never-synced stub — skip it rather than fail the batch.
+				_ => continue,
+			};
+			profiles.push(PublicProfileRow {
+				id_tag: row.try_get("id_tag").inspect_err(inspect).map_err(|_| Error::DbError)?,
+				name: row.try_get("name").inspect_err(inspect).map_err(|_| Error::DbError)?,
+				typ,
+				profile_pic: row
+					.try_get("profile_pic")
+					.inspect_err(inspect)
+					.map_err(|_| Error::DbError)?,
+			});
+		}
+	}
+
+	Ok(profiles)
+}
+
 /// List the id_tags of every profile that follows this tenant (broadcast set).
 pub(crate) async fn list_follower_tags(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<Box<str>>> {
 	// active = status NULL; exclude Suspended/Blocked/Banned ('S','B','X');
@@ -383,9 +464,10 @@ pub(crate) async fn read_roles(
 	tn_id: TnId,
 	id_tag: &str,
 ) -> ClResult<Option<Box<[Box<str>]>>> {
+	let id_tag = normalize_id_tag(id_tag);
 	let res = sqlx::query("SELECT roles FROM profiles WHERE tn_id=? AND id_tag=?")
 		.bind(tn_id.0)
-		.bind(id_tag)
+		.bind(id_tag.as_ref())
 		.fetch_one(db)
 		.await;
 
@@ -404,6 +486,7 @@ pub(crate) async fn upsert(
 	id_tag: &str,
 	fields: &UpsertProfileFields,
 ) -> ClResult<UpsertResult> {
+	let id_tag = normalize_id_tag(id_tag);
 	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
 	// Resolve INSERT values from Patch. Note: `Patch::Null` and
@@ -475,7 +558,7 @@ pub(crate) async fn upsert(
 
 	let res = sqlx::query(insert_sql)
 		.bind(tn_id.0)
-		.bind(id_tag)
+		.bind(id_tag.as_ref())
 		.bind(insert_name)
 		.bind(insert_type)
 		.bind(insert_profile_pic)
@@ -546,7 +629,7 @@ pub(crate) async fn upsert(
 			.push(" WHERE tn_id=")
 			.push_bind(tn_id.0)
 			.push(" AND id_tag=")
-			.push_bind(id_tag);
+			.push_bind(id_tag.clone().into_owned());
 
 		query
 			.build()
@@ -567,8 +650,9 @@ pub(crate) async fn read_public_key(
 	id_tag: &str,
 	key_id: &str,
 ) -> ClResult<(Box<str>, Timestamp)> {
+	let id_tag = normalize_id_tag(id_tag);
 	let res = sqlx::query("SELECT public_key, expire FROM key_cache WHERE id_tag=? AND key_id=?")
-		.bind(id_tag)
+		.bind(id_tag.as_ref())
 		.bind(key_id)
 		.fetch_one(db)
 		.await;
@@ -599,7 +683,7 @@ pub(crate) async fn add_public_key(
 		"INSERT OR REPLACE INTO key_cache (id_tag, key_id, public_key, expire) \
 		 VALUES (?, ?, ?, ?)",
 	)
-	.bind(id_tag)
+	.bind(normalize_id_tag(id_tag).as_ref())
 	.bind(key_id)
 	.bind(public_key)
 	.bind(expires_at.map(|t| t.0))
@@ -672,7 +756,7 @@ pub(crate) async fn get_info(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClRe
 		 FROM profiles WHERE tn_id = ? AND id_tag = ?",
 	)
 	.bind(tn_id.0)
-	.bind(id_tag)
+	.bind(normalize_id_tag(id_tag).as_ref())
 	.fetch_one(db)
 	.await
 	.inspect_err(inspect)

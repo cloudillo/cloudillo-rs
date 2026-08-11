@@ -113,6 +113,13 @@ pub struct AuthCtx {
 	pub id_tag: Box<str>,
 	pub roles: Box<[Box<str>]>,
 	pub scope: Option<Box<str>>,
+	/// True when the credential carries no `sub` claim, so `id_tag` came from
+	/// `iss` and names the *tenant*, not a person — an anonymous share-link
+	/// token. Anything that asserts an identity on the holder's behalf (CRDT
+	/// awareness stamping, activity attribution) must treat this as "no
+	/// identity to assert". Authorization must NOT read this: a share link's
+	/// authority comes from `scope`, and that is unchanged.
+	pub anonymous: bool,
 }
 
 #[derive(Debug)]

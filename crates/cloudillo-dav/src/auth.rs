@@ -185,6 +185,7 @@ pub async fn dav_basic_auth(
 			.map(|r| cloudillo_core::roles::parse_roles(&r))
 			.unwrap_or_default(),
 		scope: validation.scopes,
+		anonymous: false,
 	};
 	req.extensions_mut().insert(Auth(ctx));
 

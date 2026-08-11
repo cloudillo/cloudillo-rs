@@ -323,6 +323,21 @@ pub struct GetAccessTokenQuery {
 	via: Option<String>,
 }
 
+/// The `sub` a *derived* token (`?via=` cross-document link) should carry.
+///
+/// A derived token inherits the caller's identity, because the caller is the person who
+/// will be editing the embedded document. It carries none only when the caller has none
+/// to pass on — an anonymous share-link visitor, whose `AuthCtx::id_tag` is the tenant
+/// owner by `iss` fallback and must never be asserted as a person.
+///
+/// Keyed on [`auth_adapter::AuthCtx::anonymous`], NOT on `scope`: a `file:`-scoped token
+/// minted for a signed-in user names a real person, and chaining a second `?via=` hop
+/// must not silently demote them to a guest. The token's *authority* is unaffected
+/// either way — it comes from the freshly computed `file:` scope, and `r` is `None`.
+fn derived_sub(auth: &auth_adapter::AuthCtx) -> Option<&str> {
+	(!auth.anonymous).then_some(&*auth.id_tag)
+}
+
 pub async fn get_access_token(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -430,7 +445,7 @@ pub async fn get_access_token(
 				tn_id,
 				&auth_adapter::AccessToken {
 					iss: &id_tag.0,
-					sub: auth.scope.as_ref().map_or(Some(&*auth.id_tag), |_| None),
+					sub: derived_sub(auth),
 					r: None,
 					scope: Some(&target_scope),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
@@ -440,7 +455,9 @@ pub async fn get_access_token(
 
 		info!(
 			"Issued access token: id_tag={} sub={} scope={} via=cross_doc_link",
-			id_tag.0, auth.id_tag, target_scope
+			id_tag.0,
+			derived_sub(auth).unwrap_or("anonymous"),
+			target_scope
 		);
 		debug!("Created via token for {} with scope {}", target_file_id, target_scope);
 		let response = ApiResponse::new(json!({
@@ -1212,6 +1229,41 @@ pub async fn post_login_init(
 		})
 		.with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn auth_ctx(anonymous: bool, scope: Option<&str>) -> auth_adapter::AuthCtx {
+		auth_adapter::AuthCtx {
+			tn_id: TnId(1),
+			id_tag: "alice.example.com".into(),
+			roles: Box::default(),
+			scope: scope.map(Box::from),
+			anonymous,
+		}
+	}
+
+	#[test]
+	fn derived_sub_keeps_a_session_callers_identity() {
+		assert_eq!(derived_sub(&auth_ctx(false, None)), Some("alice.example.com"));
+	}
+
+	#[test]
+	fn derived_sub_keeps_a_scoped_signed_in_callers_identity() {
+		// Keying on `scope` instead would demote a signed-in user following a second
+		// `?via=` hop to a nameless guest — no awareness idTag, an `anon:` RTDB lock
+		// owner, no `file_user_data` row.
+		assert_eq!(derived_sub(&auth_ctx(false, Some("file:f1~abc:W"))), Some("alice.example.com"));
+	}
+
+	#[test]
+	fn derived_sub_asserts_nothing_for_an_anonymous_caller() {
+		// A share-link visitor's `id_tag` is the tenant owner by `iss` fallback —
+		// there is no person to name.
+		assert_eq!(derived_sub(&auth_ctx(true, Some("file:f1~abc:R"))), None);
 	}
 }
 

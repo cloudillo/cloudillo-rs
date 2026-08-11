@@ -496,6 +496,7 @@ mod tests {
 			id_tag: id_tag.into(),
 			roles: roles.iter().map(|r| (*r).into()).collect(),
 			scope: None,
+			anonymous: false,
 		}
 	}
 

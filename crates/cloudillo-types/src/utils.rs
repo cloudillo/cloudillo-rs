@@ -3,6 +3,8 @@
 
 //! Utility functions
 
+use std::borrow::Cow;
+
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::de::DeserializeOwned;
 
@@ -32,6 +34,24 @@ pub fn derive_name_from_id_tag(id_tag: &str) -> String {
 		Some(c) => c.to_uppercase().chain(chars).collect(),
 		None => id_tag.to_string(),
 	}
+}
+
+/// Canonical form of an id_tag **for use as a lookup key**.
+///
+/// Delegates to [`crate::validation::canonicalize_id_tag`], the single definition of the
+/// canonical (UTS #46 U-label) form every id_tag-valued column in the meta and auth
+/// databases stores. The invariant is enforced on write only — there is no backfill
+/// migration, because every deployed id_tag is already canonical ASCII.
+///
+/// Infallible on purpose: this is a key normaliser, not a validator. An input that cannot
+/// be canonicalised is passed through trimmed, so a read simply matches nothing — the
+/// correct failure mode for a lookup. Writes are gated by
+/// [`crate::validation::validate_id_tag`] at the boundaries (Action format, federation
+/// client), so a non-canonical value cannot reach storage in the first place.
+///
+/// Borrows when the input is already canonical, so hot read paths do not allocate.
+pub fn normalize_id_tag(id_tag: &str) -> Cow<'_, str> {
+	crate::validation::canonicalize_id_tag(id_tag).unwrap_or(Cow::Borrowed(id_tag.trim()))
 }
 
 pub fn random_id() -> ClResult<String> {
@@ -135,6 +155,29 @@ mod tests {
 		assert_eq!(derive_name_from_id_tag("alice"), "Alice");
 		assert_eq!(derive_name_from_id_tag("UPPER.test"), "UPPER");
 		assert_eq!(derive_name_from_id_tag(""), "");
+	}
+
+	#[test]
+	fn test_normalize_id_tag() {
+		// Already canonical — borrows, no allocation.
+		assert!(matches!(
+			normalize_id_tag("alice.example.com"),
+			Cow::Borrowed("alice.example.com")
+		));
+		assert_eq!(normalize_id_tag("Alice.Example.COM"), "alice.example.com");
+		// Trimming alone still borrows.
+		assert!(matches!(normalize_id_tag("  alice.example.com \t"), Cow::Borrowed(_)));
+		assert_eq!(normalize_id_tag("  alice.example.com \t"), "alice.example.com");
+		assert_eq!(normalize_id_tag(" Alice.Example.com "), "alice.example.com");
+		// Empty stays empty (via the pass-through arm — `""` is not canonicalisable).
+		assert_eq!(normalize_id_tag(""), "");
+		assert_eq!(normalize_id_tag("   "), "");
+		// Passed through trimmed rather than mangled: as a lookup needle it then matches
+		// nothing, the correct failure mode for a read.
+		assert_eq!(normalize_id_tag("alice_123"), "alice_123");
+		// IDN: the stored form is the decoded, case-folded U-label.
+		assert_eq!(normalize_id_tag("MÜNCHEN.example.com"), "münchen.example.com");
+		assert_eq!(normalize_id_tag("xn--mnchen-3ya.example.com"), "münchen.example.com");
 	}
 
 	#[test]

@@ -19,8 +19,9 @@ use cloudillo_types::meta_adapter::ProfileType;
 use cloudillo_types::types::{ApiResponse, AppDomainRes, Profile, ProfileBase};
 
 /// Wire-format string for a `ProfileType`. Shared between the full and base
-/// `/api/me` handlers so they can't drift.
-fn profile_type_str(t: ProfileType) -> &'static str {
+/// `/api/me` handlers and `list::get_profiles_batch` so they can't drift — the
+/// batch projection's whole justification is that it is `/api/me` minus `keys`.
+pub(crate) fn profile_type_str(t: ProfileType) -> &'static str {
 	match t {
 		ProfileType::Person => "person",
 		ProfileType::Community => "community",

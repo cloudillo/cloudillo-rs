@@ -90,8 +90,13 @@ async fn check_action_permission(
 		(auth_ctx, id_tag)
 	} else {
 		// For unauthenticated requests, create a guest context
-		let guest_ctx =
-			AuthCtx { tn_id, id_tag: "guest".into(), roles: vec![].into(), scope: None };
+		let guest_ctx = AuthCtx {
+			tn_id,
+			id_tag: "guest".into(),
+			roles: vec![].into(),
+			scope: None,
+			anonymous: true,
+		};
 		(guest_ctx, "guest".into())
 	};
 

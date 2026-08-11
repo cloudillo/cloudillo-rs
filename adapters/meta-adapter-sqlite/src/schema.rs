@@ -2241,4 +2241,5 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 
 	Ok(())
 }
+
 // vim: ts=4

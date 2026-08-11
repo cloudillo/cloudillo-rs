@@ -113,6 +113,7 @@ fn all_api_tables() -> axum::Router<crate::prelude::App> {
 		.merge(misc::ref_public())
 		.merge(pim::contacts())
 		.merge(pim::calendars())
+		.merge(profile::batch())
 		.merge(profile::read())
 		.merge(profile::write())
 		.merge(profile::admin())

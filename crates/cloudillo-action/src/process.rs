@@ -116,6 +116,15 @@ pub async fn verify_action_token(
 	let issuer = &action_not_validated.iss;
 	let key_id = &action_not_validated.k;
 
+	// The action format constrains its identities (see `helpers::check_identity_field`).
+	// Checked before the key fetch, so a malformed issuer cannot even trigger an
+	// outbound request.
+	helpers::check_identity_field("issuer", issuer).inspect_err(|e| warn!("  rejected: {e}"))?;
+	if let Some(audience) = action_not_validated.aud.as_deref() {
+		helpers::check_identity_field("audience", audience)
+			.inspect_err(|e| warn!("  rejected: {e}"))?;
+	}
+
 	info!("→ VERIFY: from={} key={}", issuer, key_id);
 
 	let key_cache = app.ext::<Arc<KeyFetchCache>>()?;
@@ -893,6 +902,7 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) -> ClRe
 			action.aud.as_deref(),
 			action.p.as_deref(),
 			action.sub.as_deref(),
+			action.c.as_ref(),
 		)
 	});
 

@@ -11,6 +11,7 @@ use cloudillo_types::meta_adapter::{
 	ListActionOptions, ProfileInfo, ProfileStatus, ProfileType, UpdateActionDataOptions,
 };
 use cloudillo_types::prelude::*;
+use cloudillo_types::utils::normalize_id_tag;
 
 /// Map a DB visibility column value to the ActionView representation.
 /// Storage uses 'D' for Direct uniformly; ActionView treats Direct as None to
@@ -50,13 +51,17 @@ fn push_action_filters(
 		query.push(")");
 	}
 	if let Some(issuer) = &opts.issuer {
-		query.push(" AND a.issuer_tag=").push_bind(issuer);
+		query
+			.push(" AND a.issuer_tag=")
+			.push_bind(normalize_id_tag(issuer).into_owned());
 	}
 	if let Some(audience) = &opts.audience {
 		// `audience IS NULL` means "on the issuer's wall" (see
 		// helpers::effective_audience), so this matches both T's own rows and
 		// 3rd-party rows addressed to T (federation history sync).
-		query.push(" AND coalesce(a.audience, a.issuer_tag)=").push_bind(audience);
+		query
+			.push(" AND coalesce(a.audience, a.issuer_tag)=")
+			.push_bind(normalize_id_tag(audience).into_owned());
 	}
 	if let Some(excluded_aud) = opts.exclude_audiences.as_ref().filter(|v| !v.is_empty()) {
 		// Drop posts whose effective audience the reader opted out of their home
@@ -87,30 +92,30 @@ fn push_action_filters(
 				// `issuer_tag=me`, so no COALESCE is needed.
 				query
 					.push(" AND (a.issuer_tag=")
-					.push_bind(involved)
+					.push_bind(normalize_id_tag(involved).into_owned())
 					.push(" OR a.audience=")
-					.push_bind(involved)
+					.push_bind(normalize_id_tag(involved).into_owned())
 					.push(")");
 			} else {
 				// Conversation between viewer and involved person
 				query
 					.push(" AND ((a.issuer_tag=")
-					.push_bind(viewer)
+					.push_bind(normalize_id_tag(viewer).into_owned())
 					.push(" AND a.audience=")
-					.push_bind(involved)
+					.push_bind(normalize_id_tag(involved).into_owned())
 					.push(") OR (a.issuer_tag=")
-					.push_bind(involved)
+					.push_bind(normalize_id_tag(involved).into_owned())
 					.push(" AND a.audience=")
-					.push_bind(viewer)
+					.push_bind(normalize_id_tag(viewer).into_owned())
 					.push("))");
 			}
 		} else {
 			// No viewer (unauthenticated): fall back to simple OR
 			query
 				.push(" AND (a.audience=")
-				.push_bind(involved)
+				.push_bind(normalize_id_tag(involved).into_owned())
 				.push(" OR a.issuer_tag=")
-				.push_bind(involved)
+				.push_bind(normalize_id_tag(involved).into_owned())
 				.push(")");
 		}
 	}
@@ -209,7 +214,9 @@ fn push_action_filters(
 	if opts.exclude_own_issuer == Some(true)
 		&& let Some(viewer) = &opts.viewer_id_tag
 	{
-		query.push(" AND a.issuer_tag<>").push_bind(viewer);
+		query
+			.push(" AND a.issuer_tag<>")
+			.push_bind(normalize_id_tag(viewer).into_owned());
 	}
 	query
 }
@@ -309,16 +316,17 @@ pub(crate) fn push_action_visibility_predicate(
 		        AND pv.connected = 1)) \
 		 OR {alias}.issuer_tag = "
 	));
-	query.push_bind(viewer.to_owned());
+	let viewer = normalize_id_tag(viewer);
+	query.push_bind(viewer.clone().into_owned());
 	query.push(format!(" OR {alias}.audience = "));
-	query.push_bind(viewer.to_owned());
+	query.push_bind(viewer.clone().into_owned());
 	query.push(format!(
 		" OR ({alias}.visibility = 'S' AND EXISTS (SELECT 1 FROM actions s \
 		      WHERE s.tn_id = {alias}.tn_id AND s.type = 'SUBS' AND s.status = 'A' \
 		        AND (s.sub_type IS NULL OR s.sub_type <> 'DEL') \
 		        AND s.issuer_tag = "
 	));
-	query.push_bind(viewer.to_owned());
+	query.push_bind(viewer.into_owned());
 	query.push(format!(
 		" AND s.subject = COALESCE({alias}.root_id, {alias}.subject, {alias}.action_id))))"
 	));
@@ -447,7 +455,7 @@ pub(crate) async fn list(
 			AND ps.id_tag = substr(a.subject, 2)
 		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.subject=a.action_id AND own.issuer_tag=",
 	);
-	query.push_bind(opts.viewer_id_tag.as_deref());
+	query.push_bind(opts.viewer_id_tag.as_deref().map(|v| normalize_id_tag(v).into_owned()));
 	query.push(
 		" AND own.type='REACT' AND own.sub_type!='DEL' AND coalesce(own.status, 'A') NOT IN ('D')
 		WHERE a.tn_id=",
@@ -921,8 +929,8 @@ pub(crate) async fn create(
 		.bind(action.sub_typ)
 		.bind(action.parent_id)
 		.bind(action.root_id)
-		.bind(action.issuer_tag)
-		.bind(action.audience_tag)
+		.bind(normalize_id_tag(action.issuer_tag).as_ref())
+		.bind(action.audience_tag.map(|a| normalize_id_tag(a).into_owned()))
 		.bind(action.subject)
 		.bind(action.content)
 		.bind(action.created_at.0)
@@ -1003,7 +1011,7 @@ pub(crate) async fn finalize(
 		.bind(action_id)
 		.bind(attachments_str)
 		.bind(options.subject)
-		.bind(options.audience_tag)
+		.bind(options.audience_tag.map(|a| normalize_id_tag(a).into_owned()))
 		.bind(options.key)
 		.bind(tn_id.0)
 		.bind(a_id.cast_signed())

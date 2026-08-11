@@ -287,6 +287,19 @@ pub struct Profile<S: AsRef<str>> {
 	pub hidden_in_home: Option<bool>,
 }
 
+/// Reduced, public-safe profile projection returned by
+/// [`MetaAdapter::read_profiles`]. Deliberately not [`Profile`], which carries
+/// the reading tenant's private relationship state — status (including
+/// Blocked/Muted/Banned), connected/following/follower, trust and the
+/// feed/msg read watermarks. None of that may reach a batch caller.
+#[derive(Debug, Clone)]
+pub struct PublicProfileRow {
+	pub id_tag: Box<str>,
+	pub name: Box<str>,
+	pub typ: ProfileType,
+	pub profile_pic: Option<Box<str>>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct ListProfileOptions {
 	#[serde(rename = "type")]
@@ -1780,6 +1793,11 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// in a single database call, avoiding N+1 query patterns.
 	///
 	/// Returns: HashMap<target_id_tag, (following: bool, connected: bool)>
+	///
+	/// Keys are the id_tags in `target_id_tags`, **verbatim** — an implementation
+	/// that canonicalises id_tags for storage (id_tags are case-insensitive DNS
+	/// names) still keys the result by what the caller passed in, so a mixed-case
+	/// needle can be looked back up. Targets with no mirrored profile are absent.
 	async fn get_relationships(
 		&self,
 		tn_id: TnId,
@@ -1794,6 +1812,19 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		id_tag: &str,
 	) -> ClResult<(Box<str>, Profile<Box<str>>)>;
+
+	/// Batch sibling of [`Self::read_profile`], reduced to the public projection.
+	///
+	/// Unknown / not-mirrored id_tags are omitted from the result rather than
+	/// reported, and order is unspecified — callers key by `id_tag`. A row whose
+	/// `type` is NULL or unrecognised is likewise omitted: it is a never-synced
+	/// relationship stub with no name and no picture, so it has nothing to
+	/// contribute to this projection.
+	///
+	/// Implementations MUST chunk internally: callers are not required to cap
+	/// `id_tags`, and no caller-side cap is part of this contract.
+	async fn read_profiles(&self, tn_id: TnId, id_tags: &[&str])
+	-> ClResult<Vec<PublicProfileRow>>;
 
 	/// Read profile roles for access token generation
 	async fn read_profile_roles(

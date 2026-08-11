@@ -24,6 +24,7 @@ use cloudillo_core::file_access::{self, FileAccessError};
 use cloudillo_core::ws_bus;
 use cloudillo_types::meta_adapter::{CreateFile, FileStatus};
 use cloudillo_types::types::AccessLevel;
+use cloudillo_types::utils::normalize_id_tag;
 
 /// Maximum size of a single inbound WebSocket frame.
 ///
@@ -52,6 +53,14 @@ pub struct AccessQuery {
 	pub access: Option<String>,
 	/// Container file_id when opening an embedded file (caps access by share entry)
 	pub via: Option<String>,
+	/// Opt in to the RTDB presence channel: `"1"` or `"true"`.
+	///
+	/// Presence is connection-level, never a subscription — the flag is fixed for the
+	/// socket's lifetime, which is what makes reconnect correct by construction: the
+	/// URL carries it, so a reconnect re-enables presence and gets a fresh roster.
+	/// `get_ws_crdt` shares this struct and ignores the field; CRDT awareness is
+	/// always on there.
+	pub presence: Option<String>,
 }
 
 /// Helper to close WebSocket with error code
@@ -298,7 +307,8 @@ pub async fn get_ws_bus(
 /// WebSocket upgrade handler for RTDB subscriptions
 ///
 /// Route: `/ws/rtdb/:file_id`
-/// Query params: `?access=read` or `?access=write`
+/// Query params: `?access=read` or `?access=write`, `?presence=1` to opt in to the
+/// presence channel.
 /// Requires authentication.
 /// Connects to real-time database changes for a specific file.
 /// Checks file access level and passes read_only flag to connection handler.
@@ -317,6 +327,23 @@ pub async fn get_ws_rtdb(
 
 	let ws = limit_ws(ws);
 	let is_guest = auth.is_none();
+	let presence_enabled = matches!(query.presence.as_deref(), Some("1" | "true"));
+
+	// Asserted identity: only a credential that names a person may be asserted as a lock
+	// holder or as the author of per-user file activity. A share-link token has no `sub`,
+	// so `AuthCtx::id_tag` fell back to `iss` — the tenant OWNER — and passing that down
+	// would let an untrusted visitor take, hold and break hard locks as the owner. A
+	// `file:`-scoped token minted for a signed-in user (cloudillo-auth `?via=`) is NOT
+	// anonymous and keeps its real identity.
+	//
+	// Canonicalised here rather than downstream: this is the RTDB lock owner and is
+	// matched byte-exact, while `record_file_access` normalises internally — the two must
+	// not disagree.
+	let identity_id_tag = auth
+		.as_ref()
+		.filter(|ctx| !ctx.anonymous)
+		.map(|ctx| normalize_id_tag(&ctx.id_tag).into_owned());
+
 	let (user_id, user_tn_id, user_roles, scope) = if let Some(ref auth_ctx) = auth {
 		(
 			auth_ctx.id_tag.to_string(),
@@ -410,13 +437,18 @@ pub async fn get_ws_rtdb(
 				file_id
 			);
 			ws.on_upgrade(move |socket| {
+				// `identity_id_tag`, deliberately *not* `is_guest` — that still governs
+				// store-file auto-creation and the read-only downgrade above, and a
+				// `file:{id}:W` share-link visitor keeps write access while losing only
+				// the asserted identity.
 				rtdb::handle_rtdb_connection(
 					socket,
-					user_id,
+					identity_id_tag,
 					file_id,
 					app,
 					user_tn_id,
 					access_level,
+					presence_enabled,
 				)
 			})
 		}
@@ -449,6 +481,21 @@ pub async fn get_ws_crdt(
 
 	let ws = limit_ws(ws);
 	let is_guest = auth.is_none();
+
+	// Awareness identity: only a credential that names a person may be asserted on the
+	// wire. A share-link token has no `sub`, so `AuthCtx::id_tag` fell back to `iss` —
+	// the tenant OWNER — and stamping that would make an untrusted visitor appear as the
+	// document owner in everyone's roster. A `file:`-scoped token minted for a signed-in
+	// user (cloudillo-auth `?via=`) is NOT anonymous and keeps its real identity.
+	//
+	// Canonicalised here rather than downstream: this is the identity peers see and is
+	// matched byte-exact against what `record_file_access` normalises internally — the
+	// two must not disagree.
+	let awareness_id_tag = auth
+		.as_ref()
+		.filter(|ctx| !ctx.anonymous)
+		.map(|ctx| normalize_id_tag(&ctx.id_tag).into_owned());
+
 	let (user_id, user_tn_id, user_roles, scope) = if let Some(ref auth_ctx) = auth {
 		(
 			auth_ctx.id_tag.to_string(),
@@ -524,7 +571,18 @@ pub async fn get_ws_crdt(
 				doc_id
 			);
 			ws.on_upgrade(move |socket| {
-				crdt::handle_crdt_connection(socket, user_id, doc_id, app, user_tn_id, read_only)
+				// `awareness_id_tag`, deliberately *not* `is_guest` — that still governs
+				// store-file auto-creation and read-only above, and a `file:{id}:W`
+				// share-link visitor keeps write access while losing only the asserted
+				// identity.
+				crdt::handle_crdt_connection(
+					socket,
+					awareness_id_tag,
+					doc_id,
+					app,
+					user_tn_id,
+					read_only,
+				)
 			})
 		}
 		Err(e) => {

@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::Mutex;
-use yrs::sync::{Message as YMessage, SyncMessage};
+use yrs::block::ClientID;
+use yrs::sync::awareness::AwarenessUpdateEntry;
+use yrs::sync::{AwarenessUpdate, Message as YMessage, SyncMessage};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, Map, ReadTxn, StateVector, Transact, Update};
@@ -42,7 +44,10 @@ fn usize_to_f64(v: usize) -> f64 {
 /// CRDT connection tracking
 struct CrdtConnection {
 	conn_id: String, // Unique connection ID (to distinguish multiple tabs from same user)
-	user_id: String,
+	/// Who this connection is authenticated as. `None` for an anonymous share-link
+	/// visitor — there is no identity to assert on their behalf, which is what
+	/// [`stamp_awareness_identity`] keys off.
+	id_tag: Option<String>,
 	doc_id: String,
 	tn_id: TnId,
 	// Broadcast channel for awareness updates (conn_id, raw_awareness_data)
@@ -51,11 +56,58 @@ struct CrdtConnection {
 	sync_tx: Arc<tokio::sync::broadcast::Sender<(String, Vec<u8>)>>,
 	// Live Y.Doc kept in memory for instant state vector / diff computation
 	doc: Arc<Mutex<Doc>>,
+	/// Shared with every other connection on this document — see [`DocState`].
+	awareness_owners: SharedAwarenessOwners,
 	// User activity tracking state (throttled)
 	last_access_update: Mutex<Option<Instant>>,
 	last_modify_update: Mutex<Option<Instant>>,
 	has_modified: AtomicBool,
 }
+
+impl CrdtConnection {
+	/// The identity to log and to record file activity under. Empty for a guest.
+	fn user_id(&self) -> &str {
+		self.id_tag.as_deref().unwrap_or_default()
+	}
+}
+
+/// Which connection owns a Yjs clientId on a document, and the highest clock seen
+/// for it.
+struct AwarenessOwner {
+	conn_id: Box<str>,
+	clock: u32,
+}
+
+/// Largest number of Yjs clientIds one connection may own on a document.
+///
+/// A browser tab publishes one, and a reconnecting tab briefly needs a second while the
+/// old connection's [`drain_awareness_removal`] has not run yet. Anything beyond a
+/// handful is a client bug or an attempt to grow this map without bound — awareness is
+/// ungated by `read_only`, so a read-only share-link visitor reaches this path too.
+const MAX_AWARENESS_CLIENT_IDS_PER_CONN: usize = 8;
+
+/// Per-document map of Yjs clientId -> owning connection, plus the per-connection
+/// counts that bound it.
+///
+/// A Yjs clientId is allocated client-side with no server-verifiable provenance, so
+/// ownership is established by first publish — the protocol offers no alternative. It
+/// is what lets the server tell a connection's own awareness apart from the peer states
+/// it legitimately relays (see [`stamp_awareness_identity`]), and what lets the server
+/// emit an awareness removal on disconnect.
+///
+/// Both halves are always mutated under the same lock: `claimed[c]` is the number of
+/// `owners` entries whose `conn_id` is `c`, and [`drain_awareness_removal`] clears both.
+///
+/// Inherits the CRDT registry's bare-`doc_id` key, so two tenants sharing a file id
+/// share this map along with the document — a known pre-existing flaw of the registry
+/// (`cloudillo_rtdb::presence::PresenceKey` documents it from the other side).
+#[derive(Default)]
+struct AwarenessOwners {
+	owners: HashMap<ClientID, AwarenessOwner>,
+	claimed: HashMap<Box<str>, usize>,
+}
+
+type SharedAwarenessOwners = Arc<Mutex<AwarenessOwners>>;
 
 /// Per-document state: broadcast channels + live Y.Doc
 #[derive(Clone)]
@@ -63,6 +115,7 @@ struct DocState {
 	awareness_tx: Arc<tokio::sync::broadcast::Sender<(String, Vec<u8>)>>,
 	sync_tx: Arc<tokio::sync::broadcast::Sender<(String, Vec<u8>)>>,
 	doc: Arc<Mutex<Doc>>,
+	awareness_owners: SharedAwarenessOwners,
 }
 
 /// Type alias for the CRDT document registry
@@ -78,18 +131,24 @@ static CRDT_DOCS: std::sync::LazyLock<CrdtDocRegistry> =
 /// Read-only connections can receive sync messages and awareness updates,
 /// but their Update messages will be rejected.
 ///
+/// `id_tag` is `Some` only for an authenticated connection; an anonymous share-link
+/// visitor connects as `None`. That is a different question from `read_only` (a
+/// signed-in reader is read-only but not anonymous), and it is what decides whose
+/// identity gets stamped onto relayed awareness — see [`stamp_awareness_identity`].
+///
 /// SECURITY TODO: Access level is checked once at connection time but not re-validated.
 /// If a user's access is revoked (e.g., FSHR action deleted), they keep their original
 /// access level until reconnection. Consider adding periodic re-validation (every 30s
 /// or 100 messages) to enforce access revocation mid-session.
 pub async fn handle_crdt_connection(
 	ws: WebSocket,
-	user_id: String,
+	id_tag: Option<String>,
 	doc_id: String,
 	app: App,
 	tn_id: TnId,
 	read_only: bool,
 ) {
+	let user_id = id_tag.as_deref().unwrap_or_default().to_owned();
 	// Generate unique connection ID
 	let conn_id =
 		cloudillo_types::utils::random_id().unwrap_or_else(|_| format!("conn-{}", now_timestamp()));
@@ -125,6 +184,7 @@ pub async fn handle_crdt_connection(
 				awareness_tx: Arc::new(awareness_tx),
 				sync_tx: Arc::new(sync_tx),
 				doc: Arc::new(Mutex::new(live_doc)),
+				awareness_owners: Arc::new(Mutex::default()),
 			};
 			docs.insert(doc_id.clone(), state.clone());
 			state
@@ -133,12 +193,13 @@ pub async fn handle_crdt_connection(
 
 	let conn = Arc::new(CrdtConnection {
 		conn_id: conn_id.clone(),
-		user_id: user_id.clone(),
+		id_tag,
 		doc_id: doc_id.clone(),
 		tn_id,
 		awareness_tx: doc_state.awareness_tx,
 		sync_tx: doc_state.sync_tx,
 		doc: doc_state.doc,
+		awareness_owners: doc_state.awareness_owners,
 		last_access_update: Mutex::new(None),
 		last_modify_update: Mutex::new(None),
 		has_modified: AtomicBool::new(false),
@@ -158,15 +219,15 @@ pub async fn handle_crdt_connection(
 		drop(doc_guard);
 		let y_msg = YMessage::Sync(SyncMessage::SyncStep1(sv));
 		let encoded = y_msg.encode_v1();
-		info!("Sent SyncStep1 to {} for doc {} ({} bytes)", user_id, doc_id, encoded.len());
+		info!("Sent SyncStep1 to {} for doc {} ({} bytes)", conn.user_id(), doc_id, encoded.len());
 		let mut tx = ws_tx.lock().await;
 		if let Err(e) = tx.send(Message::Binary(encoded.into())).await {
-			warn!("Failed to send SyncStep1 to {}: {}", user_id, e);
+			warn!("Failed to send SyncStep1 to {}: {}", conn.user_id(), e);
 		}
 	}
 
 	// Heartbeat task - sends ping frames to keep connection alive
-	let heartbeat_task = spawn_heartbeat_task(user_id.clone(), ws_tx.clone());
+	let heartbeat_task = spawn_heartbeat_task(user_id, ws_tx.clone());
 
 	// WebSocket receive task - handles incoming messages
 	let ws_recv_task =
@@ -193,7 +254,7 @@ pub async fn handle_crdt_connection(
 	record_final_activity(&app, &conn).await;
 
 	// Abort all other tasks to ensure cleanup
-	info!("CRDT connection closing for {}, aborting tasks...", user_id);
+	info!("CRDT connection closing for {}, aborting tasks...", conn.user_id());
 	heartbeat_task.abort();
 	sync_task.abort();
 	awareness_task.abort();
@@ -201,7 +262,9 @@ pub async fn handle_crdt_connection(
 	// Wait for aborted tasks to fully clean up (drop their receivers)
 	// We can ignore the JoinError since we just aborted them
 	let _ = tokio::join!(heartbeat_task, sync_task, awareness_task);
-	info!("CRDT connection closed: {} (all tasks cleaned up)", user_id);
+	info!("CRDT connection closed: {} (all tasks cleaned up)", conn.user_id());
+
+	broadcast_awareness_removal(&conn).await;
 
 	// Always log document statistics on close
 	log_doc_statistics(&app, tn_id, &conn.doc_id).await;
@@ -386,7 +449,10 @@ fn spawn_broadcast_task(
 	tokio::spawn(async move {
 		debug!(
 			"Connection {} (user {}) subscribed to {} broadcasts for doc {}",
-			conn.conn_id, conn.user_id, label, conn.doc_id
+			conn.conn_id,
+			conn.user_id(),
+			label,
+			conn.doc_id
 		);
 
 		loop {
@@ -412,7 +478,11 @@ fn spawn_broadcast_task(
 
 					debug!(
 						"Forwarding {} update from conn {} to conn {} (user {}) for doc {}",
-						label, sender_conn_id, conn.conn_id, conn.user_id, conn.doc_id
+						label,
+						sender_conn_id,
+						conn.conn_id,
+						conn.user_id(),
+						conn.doc_id
 					);
 
 					let mut tx = ws_tx.lock().await;
@@ -426,7 +496,9 @@ fn spawn_broadcast_task(
 					if label == "SYNC" {
 						warn!(
 							"Client {} lagged behind on {} updates for doc {}",
-							conn.user_id, label, conn.doc_id
+							conn.user_id(),
+							label,
+							conn.doc_id
 						);
 					} else {
 						debug!("Connection {} lagged on {} updates", conn.conn_id, label);
@@ -560,7 +632,7 @@ async fn apply_and_store(
 	// will persist the full merged state.
 	let update = cloudillo_types::crdt_adapter::CrdtUpdate::with_client(
 		update_data.to_vec(),
-		conn.user_id.clone(),
+		conn.user_id().to_owned(),
 	);
 	if let Err(e) = app.crdt_adapter.store_update(tn_id, &conn.doc_id, update).await {
 		warn!(
@@ -574,7 +646,7 @@ async fn apply_and_store(
 		"{} stored for doc {} from user {} ({} bytes)",
 		msg_type,
 		conn.doc_id,
-		conn.user_id,
+		conn.user_id(),
 		update_data.len()
 	);
 	record_file_modification_throttled(app, conn).await;
@@ -609,7 +681,7 @@ async fn handle_yrs_message(
 			debug!(
 				"CRDT SYNC message from conn {} (user {}) for doc {}: {:?}",
 				conn.conn_id,
-				conn.user_id,
+				conn.user_id(),
 				conn.doc_id,
 				match &sync_msg {
 					SyncMessage::SyncStep1(_) => "SyncStep1",
@@ -629,7 +701,7 @@ async fn handle_yrs_message(
 					info!(
 						"Received SyncStep1 from conn {} (user {}) for doc {} ({} bytes)",
 						conn.conn_id,
-						conn.user_id,
+						conn.user_id(),
 						conn.doc_id,
 						data.len()
 					);
@@ -648,7 +720,7 @@ async fn handle_yrs_message(
 					let msg = YMessage::Sync(SyncMessage::SyncStep2(diff.clone()));
 					match tx.send(Message::Binary(msg.encode_v1().into())).await {
 						Err(e) => {
-							warn!("Failed to send SyncStep2 to {}: {}", conn.user_id, e);
+							warn!("Failed to send SyncStep2 to {}: {}", conn.user_id(), e);
 						}
 						Ok(()) => {
 							info!(
@@ -669,7 +741,7 @@ async fn handle_yrs_message(
 					info!(
 						"Received SyncStep2 from conn {} (user {}) for doc {} ({} bytes)",
 						conn.conn_id,
-						conn.user_id,
+						conn.user_id(),
 						conn.doc_id,
 						update_data.len()
 					);
@@ -699,7 +771,7 @@ async fn handle_yrs_message(
 			broadcast_message(
 				&conn.sync_tx,
 				&conn.conn_id,
-				&conn.user_id,
+				conn.user_id(),
 				&conn.doc_id,
 				broadcast_data.clone(),
 				"SYNC",
@@ -711,35 +783,80 @@ async fn handle_yrs_message(
 			send_echo_raw(
 				ws_tx,
 				&conn.conn_id,
-				&conn.user_id,
+				conn.user_id(),
 				&conn.doc_id,
 				&broadcast_data,
 				"SYNC",
 			)
 			.await;
 		}
-		Ok(YMessage::Awareness(_awareness_update)) => {
+		Ok(YMessage::Awareness(awareness_update)) => {
 			debug!(
 				"CRDT AWARENESS from conn {} (user {}) for doc {} ({} bytes)",
 				conn.conn_id,
-				conn.user_id,
+				conn.user_id(),
 				conn.doc_id,
 				data.len()
 			);
+
+			// Never relay what the client sent. The echo gets the stamped bytes too —
+			// an app whose local state disagreed with what its peers see would be a
+			// second bug. `Unchanged` relays the received bytes verbatim, skipping a
+			// re-serialise on the highest-frequency message this socket carries.
+			//
+			// The owners lock is held only for the stamp: the map is per-document and
+			// awareness fires on every cursor move.
+			let stamped_data = {
+				let mut owners = conn.awareness_owners.lock().await;
+				match stamp_awareness_identity(
+					&awareness_update,
+					conn.id_tag.as_deref(),
+					&conn.conn_id,
+					&mut owners,
+				) {
+					Stamped::Unchanged => data.to_vec(),
+					Stamped::Rewritten(update) => YMessage::Awareness(update).encode_v1(),
+					Stamped::Empty => {
+						debug!(
+							"Awareness from conn {} (user {}) for doc {} carried only relayed peer states",
+							conn.conn_id,
+							conn.user_id(),
+							conn.doc_id
+						);
+						return;
+					}
+					Stamped::Undecodable => {
+						warn!(
+							"Dropping undecodable awareness state from conn {} (user {}) for doc {}",
+							conn.conn_id,
+							conn.user_id(),
+							conn.doc_id
+						);
+						return;
+					}
+				}
+			};
 
 			// Broadcast to other clients
 			broadcast_message(
 				&conn.awareness_tx,
 				&conn.conn_id,
-				&conn.user_id,
+				conn.user_id(),
 				&conn.doc_id,
-				data.to_vec(),
+				stamped_data.clone(),
 				"AWARENESS",
 			);
 
 			// Echo back to sender
-			send_echo_raw(ws_tx, &conn.conn_id, &conn.user_id, &conn.doc_id, data, "AWARENESS")
-				.await;
+			send_echo_raw(
+				ws_tx,
+				&conn.conn_id,
+				conn.user_id(),
+				&conn.doc_id,
+				&stamped_data,
+				"AWARENESS",
+			)
+			.await;
 		}
 		Ok(other) => {
 			debug!("Received non-sync/awareness message: {:?}", other);
@@ -748,6 +865,239 @@ async fn handle_yrs_message(
 			warn!("Failed to decode yrs message from conn {}: {}", conn.conn_id, e);
 		}
 	}
+}
+
+/// Assert this connection's identity over an awareness update: drop entries belonging
+/// to other connections, and rewrite `user.idTag` in this connection's own.
+///
+/// Awareness is relayed verbatim by design and the Yjs clientId is allocated
+/// client-side, so nothing in the protocol binds a broadcast identity to the connection
+/// it arrived on. Clients derive a collaborator's colour and fetch their profile picture
+/// FROM the idTag (`libs/crdt/src/presence.ts`), so an unchecked `idTag` lets anyone
+/// appear in everyone's roster wearing a victim's real name and avatar.
+///
+/// **Ownership comes first, because a client legitimately relays other peers'
+/// awareness.** `y-websocket`'s `_awarenessUpdateHandler` ignores its origin argument,
+/// so every state a client applies is re-broadcast over that client's own socket — a
+/// second tab does exactly that for the whole roster. Stamping those with the sender's
+/// tag would relabel every peer, worse than the impersonation it was meant to close. So
+/// an entry whose clientId is owned by a *different* connection is dropped from the
+/// relay (the owner's own updates are authoritative); only that entry, never the
+/// message.
+///
+/// For an entry this connection owns (or has just claimed):
+///
+/// - `Some(tag)` (authenticated) -> `idTag` is overwritten with `tag`;
+/// - `None` (anonymous share-link visitor) -> `idTag` is REMOVED. There is no identity
+///   to assert on their behalf, and the shell hands such a visitor the OWNER's tag
+///   client-side, so a stamp here would *be* the impersonation. `name` is left alone,
+///   so a guest still shows a display name.
+///
+/// Overwriting rather than rejecting keeps clients that legitimately send no `idTag`
+/// valid and makes the invariant total: every `idTag` on this wire was put there by us.
+/// Every other field (`name`, `cursor`, `editing`, …) is app-specific and untouched.
+///
+/// Returns [`Stamped::Undecodable`] if any client state is unparseable or carries a
+/// non-object `user` — a payload we cannot rewrite is exactly the one that must not slip
+/// through unrewritten, so the caller drops the whole message.
+///
+/// **Decide, then commit.** The first pass only reads `owners`, buffering claims and
+/// clock bumps; an `Undecodable` message reaches no peer and so must leave no ownership
+/// behind either, or a client could squat clientIds with messages nobody sees and the
+/// legitimate owner would go silently invisible in every roster.
+///
+/// Past [`MAX_AWARENESS_CLIENT_IDS_PER_CONN`], further unclaimed ids are dropped like a
+/// peer-owned entry, so the connection keeps working with its legitimate clientIds.
+fn stamp_awareness_identity(
+	update: &AwarenessUpdate,
+	id_tag: Option<&str>,
+	conn_id: &str,
+	owners: &mut AwarenessOwners,
+) -> Stamped {
+	let mut retained: Vec<(ClientID, AwarenessUpdateEntry)> = Vec::new();
+	// Buffered decisions — applied only once the whole message has been accepted.
+	let mut claims: Vec<(ClientID, u32)> = Vec::new();
+	let mut bumps: Vec<(ClientID, u32)> = Vec::new();
+	let mut dropped = false;
+	let mut rewritten = false;
+	let mut capped = false;
+	let mut budget = MAX_AWARENESS_CLIENT_IDS_PER_CONN
+		.saturating_sub(owners.claimed.get(conn_id).copied().unwrap_or(0));
+
+	for (&client_id, entry) in &update.clients {
+		match owners.owners.get(&client_id) {
+			// A peer's state, relayed back to us by a client that received it.
+			Some(owner) if *owner.conn_id != *conn_id => {
+				dropped = true;
+				continue;
+			}
+			// Ours already: keep the highest clock, which is what the disconnect
+			// removal below has to beat for peers to accept it.
+			Some(_) => bumps.push((client_id, entry.clock)),
+			// Unclaimed: first publish wins, which is the only ownership signal the
+			// protocol offers — up to this connection's budget.
+			None => {
+				if budget == 0 {
+					dropped = true;
+					capped = true;
+					continue;
+				}
+				budget -= 1;
+				claims.push((client_id, entry.clock));
+			}
+		}
+
+		let Some(stamped) = stamp_state_json(&entry.json, id_tag) else {
+			// Nothing has been committed yet, so the dropped message claims nothing.
+			return Stamped::Undecodable;
+		};
+		match stamped {
+			Some(json) => {
+				rewritten = true;
+				retained.push((client_id, AwarenessUpdateEntry { clock: entry.clock, json }));
+			}
+			None => retained.push((client_id, entry.clone())),
+		}
+	}
+
+	if capped {
+		warn!(
+			"Conn {} already owns {} clientIds on this document; dropping further ones",
+			conn_id, MAX_AWARENESS_CLIENT_IDS_PER_CONN
+		);
+	}
+
+	// Commit: reached only when every entry was decodable.
+	for (client_id, clock) in claims {
+		owners
+			.owners
+			.insert(client_id, AwarenessOwner { conn_id: conn_id.into(), clock });
+		*owners.claimed.entry(conn_id.into()).or_default() += 1;
+	}
+	for (client_id, clock) in bumps {
+		if let Some(owner) = owners.owners.get_mut(&client_id) {
+			owner.clock = owner.clock.max(clock);
+		}
+	}
+
+	if dropped && retained.is_empty() {
+		Stamped::Empty
+	} else if dropped || rewritten {
+		Stamped::Rewritten(AwarenessUpdate { clients: retained.into_iter().collect() })
+	} else {
+		Stamped::Unchanged
+	}
+}
+
+/// Outcome of asserting this connection's identity over an awareness update.
+enum Stamped {
+	/// Nothing was dropped and nothing was rewritten: every entry is this
+	/// connection's own and already carried the correct identity. Relay the bytes as
+	/// received, skipping the re-serialise and re-encode.
+	Unchanged,
+	/// At least one state was rewritten or dropped; relay these bytes instead.
+	Rewritten(AwarenessUpdate),
+	/// Every entry belonged to another connection. Relay nothing — there is no
+	/// message left, and the owning connections publish their own states anyway.
+	Empty,
+	/// A client state could not be parsed, or its `user` was not an object. Relay
+	/// nothing: a payload we cannot rewrite is precisely the one that must not
+	/// slip through unrewritten.
+	Undecodable,
+}
+
+/// Tell the remaining peers that every clientId this connection owned is gone.
+///
+/// Exactly the wire form y-protocols' `removeAwarenessStates` produces — the clientId's
+/// clock bumped by one, carrying a `null` state — so peers drop the departing
+/// collaborator immediately instead of waiting out the client-side ~30 s awareness
+/// timeout.
+///
+/// The entries are drained, so the clientIds are free for a reconnecting tab to claim
+/// again — a browser tab keeps its `doc.clientID` across a reconnect. The `claimed`
+/// count goes with them, or a tab that reconnected often enough would exhaust
+/// [`MAX_AWARENESS_CLIENT_IDS_PER_CONN`] while owning nothing.
+fn drain_awareness_removal(owners: &mut AwarenessOwners, conn_id: &str) -> AwarenessUpdate {
+	let mut clients: HashMap<ClientID, AwarenessUpdateEntry> = HashMap::new();
+	owners.owners.retain(|&client_id, owner| {
+		if *owner.conn_id == *conn_id {
+			// One past the highest clock we relayed, so peers accept it as newer
+			// than every state they already hold for this clientId.
+			clients.insert(
+				client_id,
+				AwarenessUpdateEntry {
+					clock: owner.clock.saturating_add(1),
+					json: Arc::from("null"),
+				},
+			);
+			false
+		} else {
+			true
+		}
+	});
+	owners.claimed.remove(conn_id);
+	AwarenessUpdate { clients }
+}
+
+/// See [`drain_awareness_removal`] — this is the connection-facing half, splitting
+/// the lock and the broadcast off the pure part so the shape of the update is
+/// testable.
+async fn broadcast_awareness_removal(conn: &CrdtConnection) {
+	let update = {
+		let mut owners = conn.awareness_owners.lock().await;
+		drain_awareness_removal(&mut owners, &conn.conn_id)
+	};
+
+	if update.clients.is_empty() {
+		return;
+	}
+	debug!(
+		"CRDT awareness removal for conn {} on doc {}: {} client(s)",
+		conn.conn_id,
+		conn.doc_id,
+		update.clients.len()
+	);
+	let bytes = YMessage::Awareness(update).encode_v1();
+	broadcast_message(
+		&conn.awareness_tx,
+		&conn.conn_id,
+		conn.user_id(),
+		&conn.doc_id,
+		bytes,
+		"AWARENESS",
+	);
+}
+
+/// One client state's JSON payload, with `user.idTag` asserted.
+///
+/// Three-valued, to let the caller skip the rewrite entirely: `None` is
+/// undecodable, `Some(None)` is "already correct, reuse the input", and
+/// `Some(Some(json))` is the rewritten payload.
+#[allow(clippy::option_option)]
+fn stamp_state_json(json: &Arc<str>, id_tag: Option<&str>) -> Option<Option<Arc<str>>> {
+	let mut state: serde_json::Value = serde_json::from_str(json).ok()?;
+	// A disconnecting client sends `null`, and an app with no presence payload sends a
+	// state without `user` — neither carries an identity to assert. (`get_mut` on a
+	// `Value::Null` yields `None`, so both land here.) Adding a `user` object would
+	// conjure a nameless phantom into every roster.
+	let Some(user) = state.get_mut("user") else { return Some(None) };
+	// Present but not an object (`{"user":"alice"}`): no identity can be asserted into
+	// it, so it must not be relayed — passing it through unrewritten is the evasion the
+	// rewrite exists to prevent. `?` is the undecodable outcome.
+	let user = user.as_object_mut()?;
+	// Nothing to do when the client already sent what we would have written — the
+	// overwhelmingly common case, since awareness fires on every cursor move.
+	if let Some(tag) = id_tag {
+		if user.get("idTag").and_then(serde_json::Value::as_str) == Some(tag) {
+			return Some(None);
+		}
+		user.insert("idTag".to_owned(), serde_json::Value::String(tag.to_owned()));
+	} else if user.contains_key("idTag") {
+		user.remove("idTag");
+	} else {
+		return Some(None);
+	}
+	Some(Some(Arc::from(serde_json::to_string(&state).ok()?)))
 }
 
 /// Log document statistics (update count and total size)
@@ -908,7 +1258,7 @@ async fn record_file_access_throttled(app: &App, conn: &CrdtConnection) {
 	if should_update
 		&& let Err(e) = app
 			.meta_adapter
-			.record_file_access(conn.tn_id, &conn.user_id, &conn.doc_id)
+			.record_file_access(conn.tn_id, conn.user_id(), &conn.doc_id)
 			.await
 	{
 		debug!("Failed to record file access for doc {}: {}", conn.doc_id, e);
@@ -936,7 +1286,7 @@ async fn record_file_modification_throttled(app: &App, conn: &CrdtConnection) {
 	if should_update
 		&& let Err(e) = app
 			.meta_adapter
-			.record_file_modification(conn.tn_id, &conn.user_id, &conn.doc_id)
+			.record_file_modification(conn.tn_id, conn.user_id(), &conn.doc_id)
 			.await
 	{
 		debug!("Failed to record file modification for doc {}: {}", conn.doc_id, e);
@@ -948,7 +1298,7 @@ async fn record_final_activity(app: &App, conn: &CrdtConnection) {
 	// Always record final access time
 	if let Err(e) = app
 		.meta_adapter
-		.record_file_access(conn.tn_id, &conn.user_id, &conn.doc_id)
+		.record_file_access(conn.tn_id, conn.user_id(), &conn.doc_id)
 		.await
 	{
 		debug!("Failed to record final file access for doc {}: {}", conn.doc_id, e);
@@ -958,10 +1308,426 @@ async fn record_final_activity(app: &App, conn: &CrdtConnection) {
 	if conn.has_modified.load(Ordering::Relaxed)
 		&& let Err(e) = app
 			.meta_adapter
-			.record_file_modification(conn.tn_id, &conn.user_id, &conn.doc_id)
+			.record_file_modification(conn.tn_id, conn.user_id(), &conn.doc_id)
 			.await
 	{
 		debug!("Failed to record final file modification for doc {}: {}", conn.doc_id, e);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A fresh, empty ownership registry. Every helper below drives the real one.
+	fn owners() -> AwarenessOwners {
+		AwarenessOwners::default()
+	}
+
+	fn entry(clock: u32, json: &str) -> AwarenessUpdateEntry {
+		AwarenessUpdateEntry { clock, json: Arc::from(json) }
+	}
+
+	fn update_of(entries: &[(u64, u32, &str)]) -> AwarenessUpdate {
+		let mut clients = HashMap::new();
+		for &(client_id, clock, json) in entries {
+			clients.insert(ClientID::new(client_id), entry(clock, json));
+		}
+		AwarenessUpdate { clients }
+	}
+
+	fn update_with(json: &str) -> AwarenessUpdate {
+		update_of(&[(42, 7, json)])
+	}
+
+	/// The single entry of a stamped update, as parsed JSON, for a clientId this
+	/// connection is publishing for the first time. `Unchanged` maps back to the input,
+	/// which is what the caller relays in that case.
+	fn stamped(json: &str, id_tag: Option<&str>) -> Option<serde_json::Value> {
+		let mut owners = owners();
+		match stamp_awareness_identity(&update_with(json), id_tag, "conn-a", &mut owners) {
+			Stamped::Unchanged => serde_json::from_str(json).ok(),
+			Stamped::Rewritten(out) => {
+				let entry = out.clients.get(&ClientID::new(42))?;
+				serde_json::from_str(&entry.json).ok()
+			}
+			Stamped::Empty | Stamped::Undecodable => None,
+		}
+	}
+
+	fn is_unchanged(json: &str, id_tag: Option<&str>) -> bool {
+		let mut owners = owners();
+		matches!(
+			stamp_awareness_identity(&update_with(json), id_tag, "conn-a", &mut owners),
+			Stamped::Unchanged
+		)
+	}
+
+	// Identity stamping //
+	//*******************//
+
+	#[test]
+	fn a_rewrite_preserves_the_clock() {
+		// The clock is how peers order awareness states; a rewrite that reset it
+		// would make every stamped state look stale or brand new.
+		let mut owners = owners();
+		let Stamped::Rewritten(out) = stamp_awareness_identity(
+			&update_with(r#"{"user":{"name":"Alice"}}"#),
+			Some("@alice.example.com"),
+			"conn-a",
+			&mut owners,
+		) else {
+			panic!("expected a rewrite");
+		};
+		assert_eq!(out.clients.get(&ClientID::new(42)).expect("the entry").clock, 7);
+	}
+
+	#[test]
+	fn overwrites_a_forged_id_tag() {
+		let state = stamped(
+			r#"{"user":{"name":"Mallory","idTag":"@victim.example.com"}}"#,
+			Some("@mallory.example.com"),
+		);
+		assert_eq!(
+			state,
+			Some(serde_json::json!({
+				"user": { "name": "Mallory", "idTag": "@mallory.example.com" }
+			}))
+		);
+	}
+
+	#[test]
+	fn stamps_a_state_that_sent_no_id_tag() {
+		let state = stamped(r#"{"user":{"name":"Alice"}}"#, Some("@alice.example.com"));
+		assert_eq!(
+			state,
+			Some(serde_json::json!({
+				"user": { "name": "Alice", "idTag": "@alice.example.com" }
+			}))
+		);
+	}
+
+	#[test]
+	fn strips_the_id_tag_of_a_guest_and_keeps_the_name() {
+		// The tag a share-link visitor sends is the OWNER's — that is what the shell
+		// hands an unauthenticated app — so relaying it would hand them the owner's
+		// name and face in everyone else's roster.
+		let state = stamped(r#"{"user":{"name":"Guest","idTag":"@owner.example.com"}}"#, None);
+		assert_eq!(state, Some(serde_json::json!({ "user": { "name": "Guest" } })));
+	}
+
+	#[test]
+	fn leaves_app_specific_fields_alone() {
+		let state = stamped(
+			r#"{"user":{"name":"Alice"},"cursor":{"x":1,"y":2},"presenting":true}"#,
+			Some("@alice.example.com"),
+		);
+		assert_eq!(
+			state,
+			Some(serde_json::json!({
+				"user": { "name": "Alice", "idTag": "@alice.example.com" },
+				"cursor": { "x": 1, "y": 2 },
+				"presenting": true
+			}))
+		);
+	}
+
+	#[test]
+	fn passes_through_a_state_with_no_user_object() {
+		// A disconnect (`null`) and a payload-free app state both have nothing to
+		// stamp; inventing a `user` would put a nameless phantom in every roster.
+		assert_eq!(stamped("null", Some("@alice.example.com")), Some(serde_json::Value::Null));
+		assert_eq!(
+			stamped(r#"{"cursor":{"x":1}}"#, Some("@alice.example.com")),
+			Some(serde_json::json!({ "cursor": { "x": 1 } }))
+		);
+	}
+
+	#[test]
+	fn carries_an_already_correct_entry_through_a_later_rewrite() {
+		// Client 1 already carries the right tag and client 2 forges one; both are
+		// this connection's own, so both must come through the rewrite.
+		let update = update_of(&[
+			(1, 3, r#"{"user":{"idTag":"@alice.example.com"}}"#),
+			(2, 4, r#"{"user":{"idTag":"@victim.example.com"}}"#),
+		]);
+		let mut owners = owners();
+		let Stamped::Rewritten(out) =
+			stamp_awareness_identity(&update, Some("@alice.example.com"), "conn-a", &mut owners)
+		else {
+			panic!("expected a rewrite");
+		};
+		assert_eq!(out.clients.len(), 2);
+		let first = out.clients.get(&ClientID::new(1)).expect("first entry carried over");
+		assert_eq!(first.clock, 3);
+		assert_eq!(&*first.json, r#"{"user":{"idTag":"@alice.example.com"}}"#);
+		let second = out.clients.get(&ClientID::new(2)).expect("second entry rewritten");
+		assert_eq!(second.clock, 4);
+		let parsed: serde_json::Value =
+			serde_json::from_str(&second.json).expect("rewritten entry is JSON");
+		assert_eq!(parsed, serde_json::json!({ "user": { "idTag": "@alice.example.com" } }));
+	}
+
+	#[test]
+	fn drops_an_undecodable_state() {
+		// The caller relays nothing: a payload we cannot rewrite is precisely the one
+		// that must not slip through unrewritten.
+		let mut owners = owners();
+		assert!(matches!(
+			stamp_awareness_identity(
+				&update_with("not json"),
+				Some("@alice.example.com"),
+				"conn-a",
+				&mut owners
+			),
+			Stamped::Undecodable
+		));
+	}
+
+	#[test]
+	fn rejects_a_non_object_user_value() {
+		// A `user` that is present but not an object cannot have an identity asserted
+		// into it, so relaying it would be a hole straight through the rewrite.
+		for json in [r#"{"user":"alice"}"#, r#"{"user":["a"]}"#] {
+			let mut owners = owners();
+			assert!(matches!(
+				stamp_awareness_identity(
+					&update_with(json),
+					Some("@alice.example.com"),
+					"conn-a",
+					&mut owners
+				),
+				Stamped::Undecodable
+			));
+		}
+	}
+
+	#[test]
+	fn relays_the_original_bytes_when_the_id_tag_already_matches() {
+		// The common case on every cursor move: no re-serialise, no re-encode.
+		assert!(is_unchanged(
+			r#"{"user":{"name":"Alice","idTag":"@alice.example.com"}}"#,
+			Some("@alice.example.com")
+		));
+	}
+
+	#[test]
+	fn a_guest_state_with_no_id_tag_is_unchanged() {
+		assert!(is_unchanged(r#"{"user":{"name":"Guest"}}"#, None));
+		assert!(is_unchanged("null", None));
+		assert!(is_unchanged(r#"{"cursor":{"x":1}}"#, None));
+	}
+
+	// clientId ownership //
+	//********************//
+
+	#[test]
+	fn claims_a_new_client_id_for_the_publishing_connection() {
+		let mut owners = owners();
+		let update = update_of(&[(1, 3, r#"{"user":{"name":"Alice"}}"#)]);
+		let Stamped::Rewritten(out) =
+			stamp_awareness_identity(&update, Some("@alice.example.com"), "conn-a", &mut owners)
+		else {
+			panic!("expected a rewrite");
+		};
+		let entry = out.clients.get(&ClientID::new(1)).expect("stamped");
+		let parsed: serde_json::Value = serde_json::from_str(&entry.json).expect("JSON");
+		assert_eq!(
+			parsed,
+			serde_json::json!({ "user": { "name": "Alice", "idTag": "@alice.example.com" } })
+		);
+
+		let owner = owners.owners.get(&ClientID::new(1)).expect("claimed");
+		assert_eq!(&*owner.conn_id, "conn-a");
+		assert_eq!(owner.clock, 3);
+	}
+
+	#[test]
+	fn drops_a_peers_client_id_relayed_by_another_connection() {
+		// The two-tab case: y-websocket re-broadcasts every awareness state a client
+		// applies, so B's socket carries A's clientId. Stamping it with B's tag would
+		// relabel A for everyone; the entry is dropped instead, and B's own entry in
+		// the very same update still goes out stamped.
+		let mut owners = owners();
+		let a = update_of(&[(1, 3, r#"{"user":{"idTag":"@alice.example.com"}}"#)]);
+		assert!(matches!(
+			stamp_awareness_identity(&a, Some("@alice.example.com"), "conn-a", &mut owners),
+			Stamped::Unchanged
+		));
+
+		let b = update_of(&[
+			(1, 4, r#"{"user":{"idTag":"@alice.example.com"}}"#),
+			(2, 1, r#"{"user":{"name":"Bob"}}"#),
+		]);
+		let Stamped::Rewritten(out) =
+			stamp_awareness_identity(&b, Some("@bob.example.com"), "conn-b", &mut owners)
+		else {
+			panic!("expected a rewrite");
+		};
+		assert_eq!(out.clients.len(), 1, "A's clientId is not relayed by B");
+		let entry = out.clients.get(&ClientID::new(2)).expect("B's own entry survives");
+		let parsed: serde_json::Value = serde_json::from_str(&entry.json).expect("JSON");
+		assert_eq!(
+			parsed,
+			serde_json::json!({ "user": { "name": "Bob", "idTag": "@bob.example.com" } })
+		);
+
+		// A's ownership and clock are untouched by B's relay.
+		let owner = owners.owners.get(&ClientID::new(1)).expect("still A's");
+		assert_eq!(&*owner.conn_id, "conn-a");
+		assert_eq!(owner.clock, 3);
+	}
+
+	#[test]
+	fn relays_nothing_when_every_entry_belongs_to_someone_else() {
+		// The queryAwareness reply: a second tab answers with the whole roster and
+		// none of it is its own.
+		let mut owners = owners();
+		let a = update_of(&[
+			(1, 3, r#"{"user":{"idTag":"@alice.example.com"}}"#),
+			(2, 3, r#"{"user":{"idTag":"@alice.example.com"}}"#),
+		]);
+		let _ = stamp_awareness_identity(&a, Some("@alice.example.com"), "conn-a", &mut owners);
+
+		let b = update_of(&[
+			(1, 4, r#"{"user":{"idTag":"@alice.example.com"}}"#),
+			(2, 4, r#"{"user":{"idTag":"@alice.example.com"}}"#),
+		]);
+		assert!(matches!(
+			stamp_awareness_identity(&b, Some("@alice.example.com"), "conn-b", &mut owners),
+			Stamped::Empty
+		));
+	}
+
+	#[test]
+	fn keeps_the_highest_clock_for_an_owned_client_id() {
+		// The disconnect removal has to out-clock everything peers have seen, so the
+		// recorded clock must be the maximum rather than the latest.
+		let mut owners = owners();
+		for clock in [3, 9, 5] {
+			let update = update_of(&[(1, clock, r#"{"user":{"idTag":"@alice.example.com"}}"#)]);
+			let _ =
+				stamp_awareness_identity(&update, Some("@alice.example.com"), "c1", &mut owners);
+		}
+		assert_eq!(owners.owners.get(&ClientID::new(1)).expect("owned").clock, 9);
+	}
+
+	#[test]
+	fn caps_the_client_ids_one_connection_can_own() {
+		// Awareness is ungated by `read_only`, so without a cap a single read-only
+		// share-link visitor grows this per-document map without bound.
+		let mut owners = owners();
+		for i in 0..MAX_AWARENESS_CLIENT_IDS_PER_CONN as u64 {
+			let update = update_of(&[(i + 1, 1, r#"{"user":{"idTag":"@alice.example.com"}}"#)]);
+			let _ = stamp_awareness_identity(
+				&update,
+				Some("@alice.example.com"),
+				"conn-a",
+				&mut owners,
+			);
+		}
+		assert_eq!(owners.owners.len(), MAX_AWARENESS_CLIENT_IDS_PER_CONN);
+
+		// One past the cap: the entry is dropped from the relay and never recorded.
+		let over = update_of(&[(9999, 1, r#"{"user":{"idTag":"@alice.example.com"}}"#)]);
+		assert!(matches!(
+			stamp_awareness_identity(&over, Some("@alice.example.com"), "conn-a", &mut owners),
+			Stamped::Empty
+		));
+		assert_eq!(owners.owners.len(), MAX_AWARENESS_CLIENT_IDS_PER_CONN);
+		assert!(!owners.owners.contains_key(&ClientID::new(9999)));
+	}
+
+	#[test]
+	fn a_different_connection_gets_its_own_budget() {
+		let mut owners = owners();
+		for i in 0..MAX_AWARENESS_CLIENT_IDS_PER_CONN as u64 {
+			let update = update_of(&[(i + 1, 1, r#"{"user":{"name":"Alice"}}"#)]);
+			let _ = stamp_awareness_identity(
+				&update,
+				Some("@alice.example.com"),
+				"conn-a",
+				&mut owners,
+			);
+		}
+		let b = update_of(&[(500, 1, r#"{"user":{"name":"Bob"}}"#)]);
+		let _ = stamp_awareness_identity(&b, Some("@bob.example.com"), "conn-b", &mut owners);
+		assert_eq!(&*owners.owners.get(&ClientID::new(500)).expect("claimed").conn_id, "conn-b");
+	}
+
+	#[test]
+	fn disconnecting_returns_the_whole_budget() {
+		// Without clearing `claimed`, a reconnecting tab would exhaust its budget after
+		// enough reconnects even though it owns nothing.
+		let mut owners = owners();
+		let update = update_of(&[(1, 3, r#"{"user":{"name":"Alice"}}"#)]);
+		let _ =
+			stamp_awareness_identity(&update, Some("@alice.example.com"), "conn-a", &mut owners);
+		let _ = drain_awareness_removal(&mut owners, "conn-a");
+		assert_eq!(owners.claimed.get("conn-a").copied().unwrap_or(0), 0);
+	}
+
+	#[test]
+	fn an_undecodable_entry_commits_no_ownership() {
+		// The message is relayed to nobody, so it must not be able to squat a clientId
+		// that a legitimate peer would then be unable to publish under.
+		let mut owners = owners();
+		let update = update_of(&[(1, 1, r#"{"user":{"name":"Alice"}}"#), (2, 1, "not json")]);
+		assert!(matches!(
+			stamp_awareness_identity(&update, Some("@alice.example.com"), "conn-a", &mut owners),
+			Stamped::Undecodable
+		));
+		assert!(owners.owners.is_empty(), "a dropped message claims nothing");
+
+		// …and the clientId is still free for its real owner.
+		let legit = update_of(&[(1, 1, r#"{"user":{"name":"Bob"}}"#)]);
+		let _ = stamp_awareness_identity(&legit, Some("@bob.example.com"), "conn-b", &mut owners);
+		assert_eq!(&*owners.owners.get(&ClientID::new(1)).expect("claimed").conn_id, "conn-b");
+	}
+
+	// Disconnect removal //
+	//********************//
+
+	#[test]
+	fn removal_carries_a_null_state_at_the_next_clock() {
+		let mut owners = owners();
+		let a = update_of(&[
+			(1, 3, r#"{"user":{"idTag":"@alice.example.com"}}"#),
+			(2, 8, r#"{"user":{"idTag":"@alice.example.com"}}"#),
+		]);
+		let _ = stamp_awareness_identity(&a, Some("@alice.example.com"), "conn-a", &mut owners);
+		let b = update_of(&[(3, 1, r#"{"user":{"idTag":"@bob.example.com"}}"#)]);
+		let _ = stamp_awareness_identity(&b, Some("@bob.example.com"), "conn-b", &mut owners);
+
+		let removal = drain_awareness_removal(&mut owners, "conn-a");
+		assert_eq!(removal.clients.len(), 2);
+		for (client_id, expected_clock) in [(1, 4), (2, 9)] {
+			let entry = removal.clients.get(&ClientID::new(client_id)).expect("removed");
+			assert_eq!(entry.clock, expected_clock, "clock must beat what peers have seen");
+			assert_eq!(&*entry.json, "null");
+		}
+
+		// Only this connection's clientIds are drained; Bob's stays owned.
+		assert_eq!(owners.owners.len(), 1);
+		assert_eq!(&*owners.owners.get(&ClientID::new(3)).expect("Bob's").conn_id, "conn-b");
+	}
+
+	#[test]
+	fn a_reconnecting_tab_can_reclaim_its_client_id() {
+		// Draining on disconnect is what lets the same clientId be claimed again —
+		// a browser tab keeps its `doc.clientID` across a reconnect.
+		let mut owners = owners();
+		let update = update_of(&[(1, 3, r#"{"user":{"idTag":"@alice.example.com"}}"#)]);
+		let _ =
+			stamp_awareness_identity(&update, Some("@alice.example.com"), "conn-a", &mut owners);
+		let _ = drain_awareness_removal(&mut owners, "conn-a");
+
+		let again = update_of(&[(1, 4, r#"{"user":{"idTag":"@alice.example.com"}}"#)]);
+		assert!(matches!(
+			stamp_awareness_identity(&again, Some("@alice.example.com"), "conn-a2", &mut owners),
+			Stamped::Unchanged
+		));
+		assert_eq!(&*owners.owners.get(&ClientID::new(1)).expect("reclaimed").conn_id, "conn-a2");
 	}
 }
 

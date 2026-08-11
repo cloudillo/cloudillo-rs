@@ -9,6 +9,8 @@ use crate::utils::map_res;
 use cloudillo_types::{
 	auth_adapter::{CertData, TenantCertRenewalRow},
 	prelude::*,
+	utils::normalize_id_tag,
+	validation::dns_host_to_unicode_lossy,
 };
 
 /// Create or update a certificate. INSERT OR REPLACE clears the failure-tracking
@@ -22,8 +24,10 @@ pub(crate) async fn create_cert(db: &SqlitePool, cert_data: &CertData) -> ClResu
 		) VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch(), NULL, 0, NULL)",
 	)
 	.bind(cert_data.tn_id.0)
-	.bind(&cert_data.id_tag)
-	.bind(&cert_data.domain)
+	.bind(normalize_id_tag(&cert_data.id_tag).as_ref())
+	// `domain` is an app domain rather than an id_tag, but still a DNS host, so it is
+	// stored in the same canonical U-label form the TLS resolver decodes SNI to.
+	.bind(dns_host_to_unicode_lossy(&cert_data.domain).as_ref())
 	.bind(cert_data.expires_at.0)
 	.bind(&cert_data.cert)
 	.bind(&cert_data.key)
@@ -80,14 +84,21 @@ pub(crate) async fn read_cert_by_tn_id(db: &SqlitePool, tn_id: TnId) -> ClResult
 
 /// Read a certificate by id_tag
 pub(crate) async fn read_cert_by_id_tag(db: &SqlitePool, id_tag: &str) -> ClResult<CertData> {
-	let res = sqlx::query(CERT_SELECT_BY_ID_TAG).bind(id_tag).fetch_one(db).await;
+	let res = sqlx::query(CERT_SELECT_BY_ID_TAG)
+		.bind(normalize_id_tag(id_tag).as_ref())
+		.fetch_one(db)
+		.await;
 
 	map_res(res, map_cert_row)
 }
 
-/// Read a certificate by domain
+/// Read a certificate by domain. The needle is canonicalised the same way
+/// `create_cert` canonicalises the column.
 pub(crate) async fn read_cert_by_domain(db: &SqlitePool, domain: &str) -> ClResult<CertData> {
-	let res = sqlx::query(CERT_SELECT_BY_DOMAIN).bind(domain).fetch_one(db).await;
+	let res = sqlx::query(CERT_SELECT_BY_DOMAIN)
+		.bind(dns_host_to_unicode_lossy(domain).as_ref())
+		.fetch_one(db)
+		.await;
 
 	map_res(res, map_cert_row)
 }

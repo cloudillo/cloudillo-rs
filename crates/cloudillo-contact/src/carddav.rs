@@ -132,7 +132,10 @@ pub async fn well_known(req: Request<Body>) -> Response<Body> {
 		warn!("well-known: IdTag not present in request extensions");
 		return plain_error(StatusCode::INTERNAL_SERVER_ERROR, "host not resolved");
 	};
-	let location = format!("https://cl-o.{}{}", id_tag.0, PRINCIPAL_PATH);
+	// A-label: the `IdTag` extension carries the decoded U-label, but the client
+	// has to resolve this Location via DNS.
+	let host = crate::wire_host(&id_tag.0);
+	let location = format!("https://cl-o.{}{}", host, PRINCIPAL_PATH);
 
 	Response::builder()
 		.status(StatusCode::MOVED_PERMANENTLY)

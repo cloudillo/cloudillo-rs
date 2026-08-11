@@ -4,6 +4,7 @@
 pub(crate) mod aggregate;
 pub(crate) mod computed;
 pub(crate) mod merge;
+pub(crate) mod presence;
 pub mod websocket;
 
 mod prelude;

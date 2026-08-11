@@ -764,6 +764,7 @@ mod tests {
 			id_tag: "alice.example.com".into(),
 			roles: Box::new([]),
 			scope: None,
+			anonymous: false,
 		}
 	}
 

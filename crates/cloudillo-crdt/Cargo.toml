@@ -17,6 +17,8 @@ cloudillo-types = { workspace = true }
 
 axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"
+# Awareness client states are JSON strings; the relay rewrites `user.idTag` in them.
+serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync"] }
 tracing = "0.1"
 

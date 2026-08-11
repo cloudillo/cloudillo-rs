@@ -3,6 +3,8 @@
 
 //! Profile listing and retrieval handlers
 
+use std::collections::HashSet;
+
 use axum::{
 	Json,
 	extract::{Path, Query, State},
@@ -17,6 +19,7 @@ use cloudillo_types::meta_adapter::{
 	ListProfileOptions, ProfileConnectionStatus, ProfileStatus, ProfileTrust,
 };
 use cloudillo_types::types::{ApiResponse, ProfileInfo};
+use cloudillo_types::utils::normalize_id_tag;
 
 /// Profile with relationship status (for GET /api/profiles/:idTag)
 #[skip_serializing_none]
@@ -47,6 +50,143 @@ pub struct ProfileWithStatus {
 		skip_serializing_if = "Option::is_none"
 	)]
 	pub msg_read_at: Option<Timestamp>,
+}
+
+/// Reduced, deliberately public projection returned by `GET /api/profiles/batch`.
+///
+/// **Every field here is already obtainable without authentication** at that profile's
+/// own node, from `GET /api/me` (`routes/public.rs` → `handler::get_tenant_profile_base`)
+/// — this is exactly that response minus `keys`. That equivalence is what admits the
+/// route to the scope-agnostic tier whose rule is on
+/// `cloudillo_core::middleware::require_auth_public_data`.
+///
+/// It is **not** [`ProfileWithStatus`], which leaks the reading tenant's private
+/// relationship state (`status` including Blocked/Muted/Banned, `connected`,
+/// `following`, `follower`, `trust`, and the `feedReadAt`/`msgReadAt` DM read
+/// watermarks), and **not** `ProfileBase`, which carries `keys`.
+#[skip_serializing_none]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicProfile {
+	pub id_tag: String,
+	pub name: String,
+	#[serde(rename = "type")]
+	pub r#type: String,
+	pub profile_pic: Option<String>,
+}
+
+/// Hard server-side cap on `?idTags=` entries. Matches the shell's existing
+/// client-side cap.
+///
+/// It bounds the size of one request's `IN (…)` lookup; requests *per second* are
+/// bounded separately by the `"general"` `RateLimitLayer` the route carries in
+/// `routes/protected.rs`.
+pub const PROFILE_BATCH_MAX: usize = 64;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchProfilesQuery {
+	/// Comma-separated id_tags. Absent or empty yields an empty result set.
+	id_tags: Option<String>,
+}
+
+/// Normalise a raw `?idTags=` value into the lookup set: canonicalise each entry with
+/// [`cloudillo_types::utils::normalize_id_tag`] (the same helper the meta adapter applies
+/// to every stored id_tag), drop empties, de-duplicate preserving first-seen order, and
+/// enforce [`PROFILE_BATCH_MAX`]. Not redundant with the adapter's normalisation: the
+/// de-duplication and the cap are both case-insensitive accounting the handler has to do
+/// for itself.
+///
+/// The cap is checked against the raw split count **first**, so an oversized query string
+/// is rejected without work proportional to its length. Empty and whitespace-only entries
+/// therefore count toward that early check. It is applied again after normalisation, so
+/// the error stays correct for a value that is only oversized once trimmed.
+fn normalise_batch_tags(raw: &str) -> ClResult<Vec<String>> {
+	fn too_many() -> Error {
+		Error::ValidationError(format!("idTags: at most {PROFILE_BATCH_MAX} entries per request"))
+	}
+
+	if raw.split(',').count() > PROFILE_BATCH_MAX {
+		return Err(too_many());
+	}
+
+	let mut seen: HashSet<String> = HashSet::new();
+	let mut out: Vec<String> = Vec::new();
+	for tag in raw.split(',') {
+		let tag = normalize_id_tag(tag).into_owned();
+		if tag.is_empty() {
+			continue;
+		}
+		if seen.insert(tag.clone()) {
+			out.push(tag);
+		}
+	}
+
+	if out.len() > PROFILE_BATCH_MAX {
+		return Err(too_many());
+	}
+
+	Ok(out)
+}
+
+/// `GET /api/profiles/batch?idTags=a,b,c` — reduced public projection for a set
+/// of locally mirrored profiles.
+///
+/// Exists so that collaborators on a **foreign-hosted** document resolve to a name and
+/// picture for viewers whose own node has never synced them. A document app holds a
+/// `file:{file_id}:{R|C|W}`-scoped token for the *document's* node, so it asks that node
+/// — the one guaranteed to know every collaborator. `GET /api/profiles/{id_tag}` cannot
+/// serve this: it is scope-denied to a file-scoped token, and it returns the reading
+/// tenant's private relationship state.
+///
+/// The tier's admission rule — and why any valid token, whatever its scope, reaches this
+/// handler — is on `cloudillo_core::middleware::require_auth_public_data`.
+///
+/// ## What this deliberately exposes
+///
+/// A document token becomes a lookup capability against this node's mirrored profiles,
+/// accepted knowingly. Every *field* returned is already public at that profile's own
+/// node (see [`PublicProfile`]), so the sole incremental disclosure is **which** profiles
+/// this node has mirrored. Mitigated by the reduced projection, [`PROFILE_BATCH_MAX`],
+/// and the `"general"` rate-limit bucket.
+///
+/// ## Behaviour
+///
+/// - Absent or empty `idTags` → `200` with an empty array.
+/// - Over [`PROFILE_BATCH_MAX`] entries → `400` (see [`normalise_batch_tags`] for what is
+///   counted). Rejected, not truncated: a silent truncation would show our own clients a
+///   *partial* roster with no signal that it was cut.
+/// - Unknown or not-locally-mirrored id_tags are **omitted**, not reported — so the
+///   caller cannot distinguish "no such profile" from "this node has not mirrored it",
+///   and one bad entry does not fail the batch.
+/// - The response may therefore be shorter than the request, is *not* positionally
+///   aligned with it, and its order is unspecified. Callers key by `idTag`.
+pub async fn get_profiles_batch(
+	State(app): State<App>,
+	tn_id: TnId,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Query(params): Query<BatchProfilesQuery>,
+) -> ClResult<(StatusCode, Json<ApiResponse<Vec<PublicProfile>>>)> {
+	let raw = params.id_tags.unwrap_or_default();
+	let id_tags = normalise_batch_tags(&raw)?;
+	let tag_refs: Vec<&str> = id_tags.iter().map(String::as_str).collect();
+
+	let profiles: Vec<PublicProfile> = app
+		.meta_adapter
+		.read_profiles(tn_id, &tag_refs)
+		.await?
+		.into_iter()
+		.map(|p| PublicProfile {
+			id_tag: p.id_tag.to_string(),
+			name: p.name.to_string(),
+			r#type: crate::handler::profile_type_str(p.typ).to_string(),
+			profile_pic: p.profile_pic.map(|s| s.to_string()),
+		})
+		.collect();
+
+	let response = ApiResponse::new(profiles).with_req_id(req_id.unwrap_or_default());
+
+	Ok((StatusCode::OK, Json(response)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -325,6 +465,113 @@ mod tests {
 	#[test]
 	fn parse_status_list_all_unknown_errors() {
 		assert!(matches!(parse_status_list("Q,Z,foo"), Err(Error::ValidationError(_))));
+	}
+
+	fn normalised(raw: &str) -> Vec<String> {
+		normalise_batch_tags(raw).expect("within the cap")
+	}
+
+	/// `n` distinct tags, comma-joined with **no** trailing comma — a trailing one would
+	/// add an empty entry to the raw split count, which `normalise_batch_tags` counts.
+	fn tags(n: usize) -> String {
+		(0..n).map(|i| format!("u{i}.example.com")).collect::<Vec<_>>().join(",")
+	}
+
+	#[test]
+	fn normalise_batch_tags_trims_and_drops_empties() {
+		assert_eq!(
+			normalised(" a.example.com , b.example.com "),
+			["a.example.com", "b.example.com"]
+		);
+		assert_eq!(normalised(",a.example.com,,"), ["a.example.com"]);
+		assert!(normalised("").is_empty());
+		assert!(normalised(",,, ").is_empty());
+	}
+
+	#[test]
+	fn normalise_batch_tags_dedupes_preserving_first_seen_order() {
+		// De-dup runs *after* the raw-count cap check, so duplicates still consume budget
+		// against `PROFILE_BATCH_MAX`.
+		assert_eq!(
+			normalised("b.example.com,a.example.com,b.example.com"),
+			["b.example.com", "a.example.com"]
+		);
+	}
+
+	/// id_tags are DNS names and the write paths store them lowercased, so the
+	/// lookup set is lowercased too — otherwise `Alice.example.com` burns a slot
+	/// and then silently misses on SQLite's case-sensitive `id_tag=?`.
+	#[test]
+	fn normalise_batch_tags_lowercases_and_dedupes_case_insensitively() {
+		assert_eq!(normalised("Alice.Example.COM"), ["alice.example.com"]);
+		assert_eq!(
+			normalised("Alice.Example.COM,alice.example.com,BOB.example.com"),
+			["alice.example.com", "bob.example.com"]
+		);
+	}
+
+	#[test]
+	fn normalise_batch_tags_accepts_the_cap_exactly() {
+		let out = normalised(&tags(PROFILE_BATCH_MAX));
+		assert_eq!(out.len(), PROFILE_BATCH_MAX);
+	}
+
+	/// The cap is the endpoint's fan-out control; one entry over it is a 400.
+	#[test]
+	fn normalise_batch_tags_rejects_one_over_the_cap() {
+		assert!(matches!(
+			normalise_batch_tags(&tags(PROFILE_BATCH_MAX + 1)),
+			Err(Error::ValidationError(_))
+		));
+	}
+
+	/// Duplicates do not push a caller over the cap as long as the raw entry
+	/// count stays within it.
+	#[test]
+	fn normalise_batch_tags_duplicates_do_not_consume_the_cap_twice() {
+		let mut raw = tags(PROFILE_BATCH_MAX - 2);
+		raw.push_str(",u0.example.com,u1.example.com");
+		let out = normalised(&raw);
+		assert_eq!(out.len(), PROFILE_BATCH_MAX - 2);
+	}
+
+	/// The cap is checked against the **raw** entry count before de-duplication,
+	/// so the quadratic-ish normalisation work can never run on an unbounded
+	/// query string. Rejecting a value whose *distinct* count would have fit is
+	/// the deliberate trade — do not "fix" this by moving the check after de-dup.
+	#[test]
+	fn normalise_batch_tags_rejects_oversized_raw_input_even_when_duplicated() {
+		let dupes = vec!["u.example.com"; PROFILE_BATCH_MAX + 10].join(",");
+		assert!(matches!(normalise_batch_tags(&dupes), Err(Error::ValidationError(_))));
+	}
+
+	/// The projection is the whole justification for mounting this route on the
+	/// scope-agnostic tier, so pin the wire shape exactly: the four public fields and
+	/// nothing else — in particular none of the reading tenant's private relationship
+	/// state (`status`, `connected`, `following`, `follower`, `trust`, `feedReadAt`,
+	/// `msgReadAt`) and none of `keys` / `roles`.
+	#[test]
+	fn public_profile_serialises_only_the_four_public_fields() {
+		let cases = [
+			(Some("f1~abc"), vec!["idTag", "name", "profilePic", "type"]),
+			// An absent picture is omitted, not serialised as null.
+			(None, vec!["idTag", "name", "type"]),
+		];
+
+		for (profile_pic, expected) in cases {
+			let json = serde_json::to_value(PublicProfile {
+				id_tag: "alice.example.com".into(),
+				name: "Alice".into(),
+				r#type: "person".into(),
+				profile_pic: profile_pic.map(Into::into),
+			})
+			.expect("serialises");
+
+			let obj = json.as_object().expect("object");
+			let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+			keys.sort_unstable();
+			assert_eq!(keys, expected);
+		}
 	}
 }
 

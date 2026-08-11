@@ -16,6 +16,7 @@
 //! ```
 
 use crate::prelude::*;
+use crate::presence::{PresenceFrame, PresenceKey, RTDB_PRESENCE, RateBucket, presence_frame};
 use axum::extract::ws::{Message, WebSocket};
 use cloudillo_types::rtdb_adapter::{ChangeEvent, LockMode, project_doc};
 use cloudillo_types::types::AccessLevel;
@@ -70,6 +71,19 @@ impl RtdbMessage {
 		Self { id, msg_type: "ack".to_string(), payload: map }
 	}
 
+	/// Create an error response, correlated to the request that caused it.
+	///
+	/// The id *has* to be echoed. The TS client keys its pending-request map on the id it
+	/// sent (`libs/rtdb/src/websocket.ts`), so an error carrying the freshly minted
+	/// random id [`RtdbMessage::new`] produces matches nothing and leaves its caller
+	/// hanging until the 30 s timeout.
+	pub fn error(id: Value, code: u16, message: impl Into<String>) -> Self {
+		let mut map = serde_json::Map::new();
+		map.insert("code".to_string(), Value::Number(code.into()));
+		map.insert("message".to_string(), Value::String(message.into()));
+		Self { id, msg_type: "error".to_string(), payload: map }
+	}
+
 	/// Create a database change message
 	pub fn db_change(collection: String, doc_id: String, operation: String, data: Value) -> Self {
 		let mut map = serde_json::Map::new();
@@ -117,7 +131,19 @@ impl RtdbMessage {
 /// RTDB connection tracking
 struct RtdbConnection {
 	conn_id: String,
-	user_id: String,
+	/// The authenticated identity, `None` for an anonymous share-link visitor or
+	/// an unauthenticated guest. A share-link token carries no `sub`, so
+	/// `AuthCtx::id_tag` fell back to `iss` — the tenant OWNER — and asserting
+	/// that here would let a visitor take, hold and break locks *as the document
+	/// owner*, and would attribute their activity to them.
+	id_tag: Option<String>,
+	/// Lock ownership key: the identity when there is one, otherwise a stable
+	/// per-connection `anon:{conn_id}`. Locks need *some* stable owner or every
+	/// anonymous visitor would collapse into a single lock holder and could break
+	/// each other's locks. `anon:` is a reserved prefix an id_tag can never take
+	/// (id_tags are DNS names, which cannot contain `:`), so the two identity
+	/// spaces cannot collide.
+	lock_id: String,
 	file_id: String,
 	/// Aggregated channel for forwarding events from all subscriptions
 	aggregated_tx: tokio::sync::mpsc::UnboundedSender<(String, ChangeEvent)>,
@@ -126,10 +152,29 @@ struct RtdbConnection {
 	tn_id: TnId,
 	/// Access level for this connection (Read/Comment/Write/Admin)
 	access_level: AccessLevel,
+	/// The presence room this connection belongs to, kept even when presence is off
+	/// so the `"presence"` arm needs no second lookup.
+	presence_key: PresenceKey,
+	/// Whether `?presence=1` was given *and* the room had room for us. False makes
+	/// every `"presence"` frame a fast 400 rather than a silent no-op.
+	presence_enabled: bool,
+	/// Per-connection token bucket for presence frames. Presence is published on
+	/// every caret move, so this is the only thing between a busy editor and a
+	/// broadcast storm.
+	presence_rate: Mutex<RateBucket>,
 	// User activity tracking state (throttled)
 	last_access_update: Mutex<Option<Instant>>,
 	last_modify_update: Mutex<Option<Instant>>,
 	has_modified: AtomicBool,
+}
+
+impl RtdbConnection {
+	/// The identity to log and to record file activity under. Empty for an
+	/// anonymous connection, which the meta adapter treats as "no per-user row"
+	/// (see `record_access`). Mirrors `CrdtConnection::user_id`.
+	fn user_id(&self) -> &str {
+		self.id_tag.as_deref().unwrap_or_default()
+	}
 }
 
 /// Handle an RTDB connection
@@ -139,31 +184,59 @@ struct RtdbConnection {
 /// - `Comment`: Can subscribe/query, and write to comment collections (t/*, c/*) only.
 /// - `Write`/`Admin`: Full read-write access to all collections.
 ///
+/// `presence_enabled` comes from `?presence=1` on the socket URL. It is deliberately
+/// independent of `access_level`: presence must work at `Read` and for anonymous
+/// connections, since a read-only viewer is exactly the peer it exists to show.
+///
 /// SECURITY TODO: Access level is checked once at connection time but not re-validated.
 /// If a user's access is revoked (e.g., FSHR action deleted), they keep their original
 /// access level until reconnection. Consider adding periodic re-validation (every 30s
 /// or 100 messages) to enforce access revocation mid-session.
 pub async fn handle_rtdb_connection(
 	ws: WebSocket,
-	user_id: String,
+	id_tag: Option<String>,
 	file_id: String,
 	app: App,
 	tn_id: TnId,
 	access_level: AccessLevel,
+	presence_enabled: bool,
 ) {
+	let user_id = id_tag.clone().unwrap_or_default();
 	info!("RTDB connection: {} / file_id={} (access={})", user_id, file_id, access_level.as_str());
 
 	let (aggregated_tx, aggregated_rx) =
 		tokio::sync::mpsc::unbounded_channel::<(String, ChangeEvent)>();
 
+	let conn_id = random_id().unwrap_or_default();
+
+	// Join before any task exists, so nothing can land in the gap between construction
+	// and the first frame: `join` queues the `sync` onto the receiver itself, so it
+	// necessarily precedes every later event.
+	let presence_key: PresenceKey = (tn_id, file_id.as_str().into());
+	let presence_rx = if presence_enabled {
+		let rx = RTDB_PRESENCE.join(&presence_key, &conn_id).await;
+		if rx.is_none() {
+			// Room at capacity. The document itself still works, so carry on
+			// without presence rather than refusing the connection.
+			warn!("RTDB presence room full: file_id={}", file_id);
+		}
+		rx
+	} else {
+		None
+	};
+
 	let conn = Arc::new(RtdbConnection {
-		conn_id: random_id().unwrap_or_default(),
-		user_id: user_id.clone(),
+		lock_id: id_tag.clone().unwrap_or_else(|| format!("anon:{conn_id}")),
+		conn_id,
+		id_tag,
 		file_id: file_id.clone(),
 		aggregated_tx,
 		subscription_handles: Arc::new(RwLock::new(HashMap::new())),
 		tn_id,
 		access_level,
+		presence_key,
+		presence_enabled: presence_rx.is_some(),
+		presence_rate: Mutex::new(RateBucket::new(Instant::now())),
 		last_access_update: Mutex::new(None),
 		last_modify_update: Mutex::new(None),
 		has_modified: AtomicBool::new(false),
@@ -290,6 +363,26 @@ pub async fn handle_rtdb_connection(
 		}
 	});
 
+	// Its own channel, deliberately not folded into `aggregated_tx`: that one carries
+	// `ChangeEvent`, the adapter-facing enum, so a presence variant there would push a
+	// websocket concern into the `RtdbAdapter` trait and every implementation of it.
+	// Data changes and presence need no mutual ordering.
+	let presence_task = presence_rx.map(|mut presence_rx| {
+		let ws_tx_presence = ws_tx.clone();
+		tokio::spawn(async move {
+			while let Some(event) = presence_rx.recv().await {
+				let msg = RtdbMessage::new("presenceChange", json!({ "event": event.to_json() }));
+				let Ok(ws_response) = msg.to_ws_message() else { continue };
+
+				let mut tx = ws_tx_presence.lock().await;
+				if tx.send(ws_response).await.is_err() {
+					debug!("Client disconnected while forwarding presence");
+					return;
+				}
+			}
+		})
+	});
+
 	// Wait for either task to complete
 	tokio::select! {
 		_ = ws_recv_task => {
@@ -298,6 +391,13 @@ pub async fn handle_rtdb_connection(
 		_ = forward_task => {
 			debug!("Forward task ended");
 		}
+	}
+
+	// Leave the presence room first: everything below this point awaits an adapter,
+	// and peers should not keep staring at a ghost avatar for the duration of a lock
+	// release and two meta writes.
+	if conn.presence_enabled {
+		RTDB_PRESENCE.leave(&conn.presence_key, &conn.conn_id).await;
 	}
 
 	// Abort all subscription forwarding tasks
@@ -311,7 +411,7 @@ pub async fn handle_rtdb_connection(
 	// Release all locks held by this user on disconnect
 	if let Err(e) = app
 		.rtdb_adapter
-		.release_all_locks(conn.tn_id, &conn.file_id, &conn.user_id, &conn.conn_id)
+		.release_all_locks(conn.tn_id, &conn.file_id, &conn.lock_id, &conn.conn_id)
 		.await
 	{
 		warn!("Failed to release locks on disconnect: {}", e);
@@ -321,6 +421,9 @@ pub async fn handle_rtdb_connection(
 	record_final_activity(&app, &conn).await;
 
 	heartbeat_task.abort();
+	if let Some(task) = presence_task {
+		task.abort();
+	}
 	info!("RTDB connection closed: {}", user_id);
 }
 
@@ -348,7 +451,10 @@ fn parse_select(payload: &serde_json::Map<String, Value>) -> Option<Vec<String>>
 ///
 /// CONVENTION: `t/` (threads) and `c/` (comments) are the only collections that
 /// Comment-level users can write to. Do not store non-comment data under these prefixes.
-fn check_write_access(conn: &RtdbConnection, path: &str) -> Option<RtdbMessage> {
+///
+/// `msg_id` is the id of the request being checked; the refusal echoes it so the
+/// client can correlate it. See [`RtdbMessage::error`].
+fn check_write_access(conn: &RtdbConnection, msg_id: &Value, path: &str) -> Option<RtdbMessage> {
 	if conn.access_level.can_write() {
 		return None;
 	}
@@ -358,21 +464,17 @@ fn check_write_access(conn: &RtdbConnection, path: &str) -> Option<RtdbMessage> 
 			if matches!(collection, "t" | "c") {
 				None
 			} else {
-				Some(RtdbMessage::new(
-					"error",
-					json!({
-						"code": 403,
-						"message": "Comment access - writes restricted to comment collections"
-					}),
+				Some(RtdbMessage::error(
+					msg_id.clone(),
+					403,
+					"Comment access - writes restricted to comment collections",
 				))
 			}
 		}
-		_ => Some(RtdbMessage::new(
-			"error",
-			json!({
-				"code": 403,
-				"message": "Write access denied - read-only connection"
-			}),
+		_ => Some(RtdbMessage::error(
+			msg_id.clone(),
+			403,
+			"Write access denied - read-only connection",
 		)),
 	}
 }
@@ -381,6 +483,7 @@ fn check_write_access(conn: &RtdbConnection, path: &str) -> Option<RtdbMessage> 
 /// Returns an error if any path is not writable.
 fn check_write_access_for_operations(
 	conn: &RtdbConnection,
+	msg_id: &Value,
 	operations: &[Value],
 ) -> Option<RtdbMessage> {
 	// Write-or-better can write anything — skip per-path checks
@@ -389,7 +492,7 @@ fn check_write_access_for_operations(
 	}
 	for op in operations {
 		let path = op.get("path").and_then(|v| v.as_str()).unwrap_or("");
-		if let Some(err) = check_write_access(conn, path) {
+		if let Some(err) = check_write_access(conn, msg_id, path) {
 			return Some(err);
 		}
 	}
@@ -407,7 +510,7 @@ async fn handle_rtdb_command(
 			// Handle atomic batch operations (create/update/delete)
 			if let Some(operations) = msg.payload.get("operations").and_then(|v| v.as_array()) {
 				// Check write access for all operation paths
-				if let Some(err) = check_write_access_for_operations(conn, operations) {
+				if let Some(err) = check_write_access_for_operations(conn, &msg.id, operations) {
 					return err;
 				}
 				debug!("RTDB transaction: {} operations", operations.len());
@@ -417,12 +520,10 @@ async fn handle_rtdb_command(
 					Ok(t) => t,
 					Err(e) => {
 						warn!("Failed to start transaction: {}", e);
-						return RtdbMessage::new(
-							"error",
-							json!({
-								"code": 500,
-								"message": format!("Failed to start transaction: {}", e)
-							}),
+						return RtdbMessage::error(
+							msg.id.clone(),
+							500,
+							format!("Failed to start transaction: {}", e),
 						);
 					}
 				};
@@ -450,18 +551,13 @@ async fn handle_rtdb_command(
 					if matches!(op_type, "update" | "replace" | "delete")
 						&& let Ok(Some(lock)) = txn.check_lock(&path).await
 						&& lock.mode == LockMode::Hard
-						&& lock.user_id.as_ref() != conn.user_id.as_str()
+						&& lock.user_id.as_ref() != conn.lock_id.as_str()
 					{
 						drop(txn);
-						return RtdbMessage::new(
-							"error",
-							json!({
-								"code": 423,
-								"message": format!(
-									"Document locked by {}",
-									lock.user_id
-								)
-							}),
+						return RtdbMessage::error(
+							msg.id.clone(),
+							423,
+							format!("Document locked by {}", lock.user_id),
 						);
 					}
 
@@ -587,12 +683,10 @@ async fn handle_rtdb_command(
 							warn!("Unknown transaction operation type: {}", op_type);
 							// Explicitly drop transaction to trigger rollback
 							drop(txn);
-							return RtdbMessage::new(
-								"error",
-								json!({
-									"code": 400,
-									"message": "Invalid operation type"
-								}),
+							return RtdbMessage::error(
+								msg.id.clone(),
+								400,
+								"Invalid operation type",
 							);
 						}
 					};
@@ -604,12 +698,10 @@ async fn handle_rtdb_command(
 							warn!("Transaction operation failed: {}", e);
 							// Explicitly drop transaction to trigger rollback
 							drop(txn);
-							return RtdbMessage::new(
-								"error",
-								json!({
-									"code": 500,
-									"message": format!("Transaction failed: {}", e)
-								}),
+							return RtdbMessage::error(
+								msg.id.clone(),
+								500,
+								format!("Transaction failed: {}", e),
 							);
 						}
 					}
@@ -622,12 +714,10 @@ async fn handle_rtdb_command(
 				);
 				if let Err(e) = txn.commit().await {
 					warn!("Transaction commit failed: {}", e);
-					return RtdbMessage::new(
-						"error",
-						json!({
-							"code": 500,
-							"message": format!("Transaction commit failed: {}", e)
-						}),
+					return RtdbMessage::error(
+						msg.id.clone(),
+						500,
+						format!("Transaction commit failed: {}", e),
 					);
 				}
 
@@ -647,7 +737,7 @@ async fn handle_rtdb_command(
 				RtdbMessage::response(msg.id.clone(), "transactionResult", result_map)
 			} else {
 				warn!("RTDB transaction: no operations found");
-				RtdbMessage::new("error", json!({ "code": 400, "message": "Missing operations" }))
+				RtdbMessage::error(msg.id.clone(), 400, "Missing operations")
 			}
 		}
 
@@ -731,7 +821,7 @@ async fn handle_rtdb_command(
 				}
 				Err(e) => {
 					warn!("Query failed: {}", e);
-					RtdbMessage::new("error", json!({ "code": 500, "message": "Query failed" }))
+					RtdbMessage::error(msg.id.clone(), 500, "Query failed")
 				}
 			}
 		}
@@ -757,10 +847,7 @@ async fn handle_rtdb_command(
 				}
 				Err(e) => {
 					warn!("Get failed: {}", e);
-					RtdbMessage::new(
-						"error",
-						json!({ "code": 404, "message": "Document not found" }),
-					)
+					RtdbMessage::error(msg.id.clone(), 404, "Document not found")
 				}
 			}
 		}
@@ -1001,7 +1088,9 @@ async fn handle_rtdb_command(
 					handles.insert(subscription_id.clone(), handle);
 					debug!(
 						"User {} subscribed to path: {} (id: {})",
-						conn.user_id, path, subscription_id
+						conn.user_id(),
+						path,
+						subscription_id
 					);
 
 					let mut result_map = serde_json::Map::new();
@@ -1010,10 +1099,7 @@ async fn handle_rtdb_command(
 				}
 				Err(e) => {
 					warn!("Subscribe failed: {}", e);
-					RtdbMessage::new(
-						"error",
-						json!({ "code": 500, "message": format!("Subscribe failed: {}", e) }),
-					)
+					RtdbMessage::error(msg.id.clone(), 500, format!("Subscribe failed: {}", e))
 				}
 			}
 		}
@@ -1027,7 +1113,7 @@ async fn handle_rtdb_command(
 			if let Some(handle) = handles.remove(subscription_id) {
 				handle.abort();
 			}
-			debug!("User {} unsubscribed from subscription: {}", conn.user_id, subscription_id);
+			debug!("User {} unsubscribed from subscription: {}", conn.user_id(), subscription_id);
 
 			RtdbMessage::response(msg.id.clone(), "unsubscribeResult", serde_json::Map::new())
 		}
@@ -1038,17 +1124,15 @@ async fn handle_rtdb_command(
 			let field = msg.payload.get("field").and_then(|v| v.as_str()).unwrap_or("");
 
 			if path.is_empty() || field.is_empty() {
-				return RtdbMessage::new(
-					"error",
-					json!({
-						"code": 400,
-						"message": "Missing path or field for index creation"
-					}),
+				return RtdbMessage::error(
+					msg.id.clone(),
+					400,
+					"Missing path or field for index creation",
 				);
 			}
 
 			// Check write access for the collection being indexed
-			if let Some(err) = check_write_access(conn, path) {
+			if let Some(err) = check_write_access(conn, &msg.id, path) {
 				return err;
 			}
 
@@ -1065,20 +1149,14 @@ async fn handle_rtdb_command(
 				}
 				Err(e) => {
 					warn!("Create index failed: {}", e);
-					RtdbMessage::new(
-						"error",
-						json!({
-							"code": 500,
-							"message": format!("Create index failed: {}", e)
-						}),
-					)
+					RtdbMessage::error(msg.id.clone(), 500, format!("Create index failed: {}", e))
 				}
 			}
 		}
 
 		"lock" => {
 			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
-			if let Some(err) = check_write_access(conn, path) {
+			if let Some(err) = check_write_access(conn, &msg.id, path) {
 				return err;
 			}
 			let mode = match msg.payload.get("mode").and_then(|v| v.as_str()) {
@@ -1088,7 +1166,7 @@ async fn handle_rtdb_command(
 
 			match app
 				.rtdb_adapter
-				.acquire_lock(conn.tn_id, &conn.file_id, path, &conn.user_id, mode, &conn.conn_id)
+				.acquire_lock(conn.tn_id, &conn.file_id, path, &conn.lock_id, mode, &conn.conn_id)
 				.await
 			{
 				Ok(None) => {
@@ -1101,6 +1179,9 @@ async fn handle_rtdb_command(
 					// Lock denied
 					let mut result_map = serde_json::Map::new();
 					result_map.insert("locked".to_string(), Value::Bool(false));
+					// The holder comes from the stored lock record, so an anonymous
+					// visitor is reported as `anon:{conn_id}` rather than as the
+					// tenant owner. See `RtdbConnection::lock_id`.
 					result_map
 						.insert("holder".to_string(), Value::String(existing.user_id.to_string()));
 					result_map.insert(
@@ -1111,23 +1192,20 @@ async fn handle_rtdb_command(
 				}
 				Err(e) => {
 					warn!("Lock failed: {}", e);
-					RtdbMessage::new(
-						"error",
-						json!({ "code": 500, "message": format!("Lock failed: {}", e) }),
-					)
+					RtdbMessage::error(msg.id.clone(), 500, format!("Lock failed: {}", e))
 				}
 			}
 		}
 
 		"unlock" => {
 			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
-			if let Some(err) = check_write_access(conn, path) {
+			if let Some(err) = check_write_access(conn, &msg.id, path) {
 				return err;
 			}
 
 			match app
 				.rtdb_adapter
-				.release_lock(conn.tn_id, &conn.file_id, path, &conn.user_id, &conn.conn_id)
+				.release_lock(conn.tn_id, &conn.file_id, path, &conn.lock_id, &conn.conn_id)
 				.await
 			{
 				Ok(()) => {
@@ -1135,12 +1213,54 @@ async fn handle_rtdb_command(
 				}
 				Err(e) => {
 					warn!("Unlock failed: {}", e);
-					RtdbMessage::new(
-						"error",
-						json!({ "code": 500, "message": format!("Unlock failed: {}", e) }),
-					)
+					RtdbMessage::error(msg.id.clone(), 500, format!("Unlock failed: {}", e))
 				}
 			}
+		}
+
+		"presence" => {
+			// Deliberately NOT gated by `check_write_access`. A read-only viewer and
+			// an anonymous share-link visitor are precisely the peers presence exists
+			// to make visible, and neither can write.
+			if !conn.presence_enabled {
+				// Either the socket never asked for presence (`?presence=1`) or its
+				// room was full at connect. Refusing outright beats accepting frames
+				// nobody will ever receive.
+				return RtdbMessage::error(
+					msg.id.clone(),
+					400,
+					"Presence not enabled for this connection",
+				);
+			}
+
+			// Clear vs. publish, identity, size cap, rate budget — and above all the order
+			// between them — is decided by `presence::presence_frame`, which is pure and
+			// therefore tested. Everything here is the I/O it decides on. The rate guard
+			// is a statement temporary, so it is released before `publish` awaits.
+			let outcome = presence_frame(
+				msg.payload.get("state"),
+				conn.id_tag.as_deref(),
+				&mut *conn.presence_rate.lock().await,
+				Instant::now(),
+			);
+
+			let state = match outcome {
+				Err(rejection) => {
+					return RtdbMessage::error(msg.id.clone(), rejection.code, rejection.message);
+				}
+				Ok(PresenceFrame::Throttled) => {
+					// Nothing stored and nothing broadcast, so the client has to resend —
+					// which is why this is a distinguishable flag rather than a silent ok.
+					let mut fields = serde_json::Map::new();
+					fields.insert("throttled".to_string(), Value::Bool(true));
+					return RtdbMessage::response(msg.id.clone(), "presenceResult", fields);
+				}
+				Ok(PresenceFrame::Clear) => None,
+				Ok(PresenceFrame::Publish(state)) => Some(state),
+			};
+
+			RTDB_PRESENCE.publish(&conn.presence_key, &conn.conn_id, state).await;
+			RtdbMessage::response(msg.id.clone(), "presenceResult", serde_json::Map::new())
 		}
 
 		"ping" => {
@@ -1149,12 +1269,11 @@ async fn handle_rtdb_command(
 		}
 
 		_ => {
-			// Unknown command
+			// Unknown command. Correlating this one is what lets a newer client fail
+			// *fast* against an older server — an uncorrelated refusal would instead
+			// stall the caller for the full 30 s request timeout.
 			warn!("Unknown RTDB command: {}", msg.msg_type);
-			RtdbMessage::new(
-				"error",
-				json!({ "code": 400, "message": format!("Unknown command: {}", msg.msg_type) }),
-			)
+			RtdbMessage::error(msg.id.clone(), 400, format!("Unknown command: {}", msg.msg_type))
 		}
 	}
 }
@@ -1185,7 +1304,7 @@ async fn record_file_access_throttled(app: &App, conn: &RtdbConnection) {
 	if should_update
 		&& let Err(e) = app
 			.meta_adapter
-			.record_file_access(conn.tn_id, &conn.user_id, &conn.file_id)
+			.record_file_access(conn.tn_id, conn.user_id(), &conn.file_id)
 			.await
 	{
 		debug!("Failed to record file access for file {}: {}", conn.file_id, e);
@@ -1213,7 +1332,7 @@ async fn record_file_modification_throttled(app: &App, conn: &RtdbConnection) {
 	if should_update
 		&& let Err(e) = app
 			.meta_adapter
-			.record_file_modification(conn.tn_id, &conn.user_id, &conn.file_id)
+			.record_file_modification(conn.tn_id, conn.user_id(), &conn.file_id)
 			.await
 	{
 		debug!("Failed to record file modification for file {}: {}", conn.file_id, e);
@@ -1225,7 +1344,7 @@ async fn record_final_activity(app: &App, conn: &RtdbConnection) {
 	// Always record final access time
 	if let Err(e) = app
 		.meta_adapter
-		.record_file_access(conn.tn_id, &conn.user_id, &conn.file_id)
+		.record_file_access(conn.tn_id, conn.user_id(), &conn.file_id)
 		.await
 	{
 		debug!("Failed to record final file access for file {}: {}", conn.file_id, e);
@@ -1235,10 +1354,28 @@ async fn record_final_activity(app: &App, conn: &RtdbConnection) {
 	if conn.has_modified.load(Ordering::Relaxed)
 		&& let Err(e) = app
 			.meta_adapter
-			.record_file_modification(conn.tn_id, &conn.user_id, &conn.file_id)
+			.record_file_modification(conn.tn_id, conn.user_id(), &conn.file_id)
 			.await
 	{
 		debug!("Failed to record final file modification for file {}: {}", conn.file_id, e);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn echoes_the_request_id() {
+		// `RtdbMessage::new` would mint a random id, correlating with nothing the client
+		// is waiting on. Both id shapes the TS client sends must come back verbatim.
+		for id in [Value::String("req-7".to_owned()), json!(7)] {
+			let msg = RtdbMessage::error(id.clone(), 413, "too large");
+			assert_eq!(msg.id, id);
+			assert_eq!(msg.msg_type, "error");
+			assert_eq!(msg.payload.get("code"), Some(&json!(413)));
+			assert_eq!(msg.payload.get("message"), Some(&json!("too large")));
+		}
 	}
 }
 

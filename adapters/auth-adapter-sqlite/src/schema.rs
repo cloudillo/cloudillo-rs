@@ -2,6 +2,14 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Database schema initialization and migrations
+//!
+//! Every `id_tag` column here holds the same canonical (UTS #46 U-label) form the meta
+//! database uses — see `cloudillo_types::utils::normalize_id_tag`. The invariant is
+//! enforced on write by the adapter, not by the schema, and there is no backfill
+//! migration: every deployed id_tag is already canonical ASCII. `certs.domain` is not an
+//! id_tag but is still a DNS host, so it is held in the same form — the TLS resolver
+//! decodes the SNI name to it before looking a cert up by domain. `tenants.name` is NOT
+//! an id_tag and stays byte-exact.
 
 use sqlx::{Sqlite, SqlitePool, Transaction};
 

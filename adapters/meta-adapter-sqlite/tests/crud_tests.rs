@@ -8,8 +8,9 @@
 
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{
-	Action, ActionId, ListActionOptions, ListProfileOptions, MetaAdapter, ProfileStatus,
-	ProfileType, UpdateActionDataOptions, UpdateTenantData, UpsertProfileFields,
+	Action, ActionId, CreateFile, FileStatus, FileView, ListActionOptions, ListProfileOptions,
+	MetaAdapter, ProfileStatus, ProfileType, UpdateActionDataOptions, UpdateTenantData,
+	UpsertProfileFields,
 };
 use cloudillo_types::types::{Patch, Timestamp, TnId};
 use cloudillo_types::worker::WorkerPool;
@@ -91,6 +92,101 @@ async fn test_read_profile() {
 
 	// Should return a tuple or error
 	assert!(result.is_ok() || result.is_err());
+}
+
+/// `read_profiles` is the batch reader behind `GET /api/profiles/batch`: one
+/// `IN (…)` query, unknown id_tags simply absent from the result rather than
+/// reported, and no fixed result order.
+#[tokio::test]
+async fn test_read_profiles_batch() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	insert_profile_with_status(&adapter, tn_id, "alice", Patch::Undefined).await;
+	insert_profile_with_status(&adapter, tn_id, "bob", Patch::Value(ProfileStatus::Active)).await;
+
+	// Empty input never touches the database.
+	assert!(adapter.read_profiles(tn_id, &[]).await.expect("Should read").is_empty());
+
+	let profiles = adapter
+		.read_profiles(tn_id, &["alice", "bob", "nosuch"])
+		.await
+		.expect("Should read profiles");
+
+	let mut tags: Vec<String> = profiles.iter().map(|p| p.id_tag.to_string()).collect();
+	tags.sort();
+	assert_eq!(tags, ["alice", "bob"], "unknown id_tags must be omitted, not reported");
+
+	// Another tenant's id_tags are not visible.
+	assert!(
+		adapter
+			.read_profiles(TnId(2), &["alice"])
+			.await
+			.expect("Should read")
+			.is_empty()
+	);
+}
+
+/// The FLLW/CONN native hooks insert a bare relationship stub — no `type`, no `name`, no
+/// picture — and carry on when the remote profile sync fails. Such a row has nothing this
+/// projection can show, so it is dropped like an unknown id_tag rather than surfacing as
+/// an empty name and a fabricated default `type` — and dropping it must not fail the
+/// batch.
+#[tokio::test]
+async fn test_read_profiles_batch_skips_never_synced_stub_rows() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	// A stub as a relationship hook writes it: no name, no type.
+	adapter
+		.upsert_profile(
+			tn_id,
+			"stub.example.com",
+			&UpsertProfileFields { following: Patch::Value(true), ..Default::default() },
+		)
+		.await
+		.expect("Should upsert stub profile");
+	insert_profile_with_status(&adapter, tn_id, "alice", Patch::Undefined).await;
+
+	let profiles = adapter
+		.read_profiles(tn_id, &["stub.example.com", "alice"])
+		.await
+		.expect("Should read profiles");
+
+	let tags: Vec<&str> = profiles.iter().map(|p| p.id_tag.as_ref()).collect();
+	assert_eq!(tags, ["alice"], "a NULL-`type` stub is skipped, and does not fail the batch");
+}
+
+/// The reader chunks internally (`READ_MANY_CHUNK`), so a caller with more
+/// id_tags than SQLite's 999 bound-variable limit — or than any caller-side cap —
+/// must still get every row back rather than a `DbError`.
+#[tokio::test]
+async fn test_read_profiles_batch_chunks_large_input() {
+	// Crosses at least two `READ_MANY_CHUNK` boundaries. The constant is 64 and private
+	// to `meta-adapter-sqlite::profile`, so it cannot be read from an integration test —
+	// raise this if it ever grows past 64. Every profile costs an `upsert_profile`
+	// round-trip, hence just past 2× rather than an order of magnitude over.
+	const COUNT: usize = 129;
+
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	let tags: Vec<String> = (0..COUNT).map(|i| format!("p{i:03}.example.com")).collect();
+	for tag in &tags {
+		insert_profile_with_status(&adapter, tn_id, tag, Patch::Undefined).await;
+	}
+
+	let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+	let profiles = adapter.read_profiles(tn_id, &refs).await.expect("Should read profiles");
+
+	let mut got: Vec<&str> = profiles.iter().map(|p| p.id_tag.as_ref()).collect();
+	got.sort_unstable();
+	let mut want: Vec<&str> = refs.clone();
+	want.sort_unstable();
+	assert_eq!(got, want, "every id_tag across all chunks must be returned");
 }
 
 #[tokio::test]
@@ -704,4 +800,101 @@ async fn doc_format_claim_round_trips_and_deletes() {
 			.expect("read")
 			.is_none()
 	);
+}
+
+// id_tags are case-insensitive DNS names and the adapter stores them
+// canonicalised, but `get_relationships` must still key its result by whatever
+// the caller passed in — otherwise a mixed-case caller looks up a row it can
+// never read back and silently falls through to `(false, false)`, which is a
+// visibility *downgrade* on the search path.
+#[tokio::test]
+async fn get_relationships_keys_by_the_callers_id_tag() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+
+	adapter
+		.upsert_profile(
+			tn_id,
+			"alice.example.com",
+			&UpsertProfileFields {
+				name: Patch::Value("Alice".into()),
+				typ: Patch::Value(ProfileType::Person),
+				following: Patch::Value(true),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("upsert profile");
+
+	let rels = adapter
+		.get_relationships(tn_id, &["Alice.Example.COM"])
+		.await
+		.expect("get_relationships");
+
+	assert_eq!(
+		rels.get("Alice.Example.COM").copied(),
+		Some((true, false)),
+		"the result is keyed by the needle the caller passed, not by the stored id_tag"
+	);
+	assert!(
+		!rels.contains_key("alice.example.com"),
+		"the canonical form is not leaked as a second key"
+	);
+}
+
+// An anonymous share-link visitor has no identity to attribute per-user activity to. The
+// file's own timestamp must still advance — an anonymous read is a read — but no
+// `file_user_data` row may be created, or every anonymous visitor would collapse into one
+// `id_tag = ''` row on a `(tn_id, id_tag, f_id)` PK. Driven through both entry points,
+// which carry the same `!id_tag.is_empty()` guard written out twice.
+#[tokio::test]
+async fn recording_activity_with_an_empty_id_tag_writes_no_per_user_row() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+
+	// `read_file` INNER JOINs `tenants`, so the file needs an owning tenant row.
+	adapter.create_tenant(tn_id, "owner.example.com").await.expect("create tenant");
+
+	for entry_point in ["access", "modification"] {
+		let file_id = format!("f1~anon-{entry_point}");
+		adapter
+			.create_file(
+				tn_id,
+				CreateFile {
+					file_id: Some(file_id.as_str().into()),
+					content_type: "text/plain".into(),
+					file_name: "anon.txt".into(),
+					file_tp: Some("BLOB".into()),
+					status: Some(FileStatus::Active),
+					..Default::default()
+				},
+			)
+			.await
+			.expect("create file");
+
+		let before = adapter.read_file(tn_id, &file_id).await.expect("read").expect("present");
+		let stamp = |file: &FileView| match entry_point {
+			"access" => file.accessed_at,
+			_ => file.modified_at,
+		};
+		assert!(stamp(&before).is_none(), "{entry_point}: a fresh file has never been touched");
+
+		match entry_point {
+			"access" => adapter.record_file_access(tn_id, "", &file_id).await,
+			_ => adapter.record_file_modification(tn_id, "", &file_id).await,
+		}
+		.expect("record anonymous activity");
+
+		let after = adapter.read_file(tn_id, &file_id).await.expect("read").expect("present");
+		assert!(stamp(&after).is_some(), "{entry_point}: the file's own timestamp still advances");
+
+		assert!(
+			adapter
+				.get_file_user_data(tn_id, "", &file_id)
+				.await
+				.expect("read fud")
+				.is_none(),
+			"{entry_point}: no per-user row is created for an identity-less caller"
+		);
+	}
 }
