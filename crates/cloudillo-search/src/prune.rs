@@ -22,12 +22,17 @@
 //!
 //! # Why deletion-only is safe
 //!
-//! Pruning can only ever *remove* text. It cannot reorder anything and cannot
-//! fabricate anything, so the single-ordered-walk invariant the field rules rest
-//! on survives untouched, and a pattern that fails at run time degrades to "a few
+//! Pruning can only ever *remove* text: it loses no text it was not aimed at and
+//! fabricates nothing, so a pattern that fails at run time degrades to "a few
 //! style-flag tokens survive". That is why a failure here is a `warn!` rather
 //! than an error: propagating would abort a scheduler task that retries on a
 //! timer forever, for a manifest problem that only degrades the index.
+//!
+//! Object deletion does not preserve order, though: under
+//! `serde_json/preserve_order` `Map::remove` is a *swap*-remove, which is what
+//! `jsonpath-rust` calls, so the object's last key lands in the freed slot and its
+//! siblings' extraction order shifts. Array-element deletion keeps order — one more
+//! reason to prefer the slice patterns below.
 //!
 //! # Slices, not wildcards
 //!
@@ -58,7 +63,8 @@ use crate::{indexer::split_path, prelude::*, rules::IndexRules};
 ///
 /// A failing pattern is skipped rather than propagated — see the module docs on
 /// why partial pruning is harmless. It leaves the document *less* pruned, never
-/// wrong: no text is lost, no ordering changes, nothing is fabricated.
+/// wrong: no text is lost and nothing is fabricated (on ordering, see the module
+/// note on swap-remove).
 pub fn prune_document(doc: &mut Value, patterns: &[String]) -> (usize, usize) {
 	let mut deleted = 0;
 	let mut failed = 0;

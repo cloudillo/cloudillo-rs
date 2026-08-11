@@ -263,11 +263,10 @@ fn walk(
 				walk(item, rule, key, prefix, depth - 1, sink);
 			}
 		}
-		// Object leaves come out in *key* order, not source order: `serde_json`
-		// backs its maps with a BTreeMap unless `preserve_order` is on, and it
-		// is not on in this workspace. Arrays — which is where prose actually
-		// lives — do keep source order, so document text reads correctly; only
-		// sibling fields of one object can be reordered relative to each other.
+		// Object leaves come out in *source* order: this crate enables
+		// `serde_json/preserve_order` (see its `Cargo.toml`), which backs a map with
+		// an IndexMap, not a BTreeMap. Arrays keep source order too, so the whole
+		// document reads in document order.
 		Value::Object(map) => {
 			for (child_key, child) in map {
 				if rule.exclude_keys.iter().any(|k| k == child_key) {
@@ -310,13 +309,12 @@ mod tests {
 		let doc = serde_json::json!({
 			"c": ["Hello", ["world", "b"], { "l": "https://example.com", "c": "link text" }]
 		});
-		// Array order is source order; the object's two leaves come out in key
-		// order ("c" before "l") — see `walk`'s note on ordering.
-		assert_eq!(extract(&doc, &rule("c")), "Hello world b link text https://example.com");
+		// Source order throughout — the object's leaves as written, "l" before "c".
+		assert_eq!(extract(&doc, &rule("c")), "Hello world b https://example.com link text");
 		// An empty allowlist means "every key", so it changes nothing.
 		assert_eq!(
 			extract(&doc, &json_rule(serde_json::json!({ "path": "c", "keys": [] }))),
-			"Hello world b link text https://example.com"
+			"Hello world b https://example.com link text"
 		);
 	}
 
@@ -333,9 +331,22 @@ mod tests {
 			} } }
 		});
 		let out = extract(&doc, &json_rule(serde_json::json!({ "path": "rows", "keys": ["v"] })));
-		// Cell keys come out in BTreeMap order, so `ct.s[].v` precedes the cell's
-		// own `v`.
-		assert_eq!(out, "árbevétel bevétel");
+		// Source order: the cell's own `v` is written before `ct.s[].v`.
+		assert_eq!(out, "bevétel árbevétel");
+	}
+
+	/// The crate's text order rests on `serde_json/preserve_order`, a global and
+	/// additive Cargo feature: one `default-features = false` in the wrong place
+	/// silently reverts every object to sorted-key order.
+	#[test]
+	fn object_leaves_follow_source_order() {
+		let doc = serde_json::json!({ "c": { "b": "második", "a": "első" } });
+		assert_eq!(
+			extract(&doc, &rule("c")),
+			"második első",
+			"serde_json/preserve_order is off — cloudillo-search's Cargo.toml must keep it; \
+			 check with `cargo tree -p cloudillo-search -e features -i serde_json`"
+		);
 	}
 
 	#[test]

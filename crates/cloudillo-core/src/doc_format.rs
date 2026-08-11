@@ -50,6 +50,9 @@ type CacheInner = LruCache<CacheKey, Option<DocFormat>>;
 /// What a cache lookup found. Three states, not two: `Hit(None)` — "cached as
 /// governed by no format" — is a real answer, and the one that would otherwise
 /// cost the round trip on every lookup.
+// `Hit` is matched and dropped at the call site, never stored, so the padding
+// never outlives one expression — and a `Box` would cost an allocation per hit.
+#[allow(clippy::large_enum_variant)]
 enum Cached {
 	Miss,
 	Hit(Option<DocFormat>),

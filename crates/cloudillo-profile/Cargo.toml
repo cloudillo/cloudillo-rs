@@ -21,7 +21,7 @@ cloudillo-ref = { workspace = true }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2", "macros"] }
-base64 = "0.22"
+base64 = "0.23"
 futures = "0.3"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

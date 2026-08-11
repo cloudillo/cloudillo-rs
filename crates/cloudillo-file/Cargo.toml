@@ -30,8 +30,8 @@ image = "0.25"
 webp = "0.3"
 
 # SVG processing
-resvg = "0.47"
-usvg = "0.47"
+resvg = "0.48"
+usvg = "0.48"
 regex = "1.13"
 
 # CRDT support (for file duplication)

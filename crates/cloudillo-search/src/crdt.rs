@@ -106,7 +106,11 @@ fn materialize(updates: &[CrdtUpdate], doc_id: &str) -> Vec<(Box<str>, Value)> {
 
 	let txn = doc.transact();
 	let mut out = Vec::new();
-	for (root, value) in txn.root_refs() {
+	// Sorted by root name: `root_refs` walks yrs' own `HashMap`, so its order is
+	// randomised per process. See [`collect_root`] for what that costs.
+	let mut roots: Vec<(&str, Out)> = txn.root_refs().collect();
+	roots.sort_unstable_by(|a, b| a.0.cmp(b.0));
+	for (root, value) in roots {
 		// Anything else — XML, a subdocument — has no addressable entries for a
 		// search hit to deep-link to. See the module docs. A replayed `Y.Text`
 		// arrives as `UndefinedRef`; `YText` is listed for the case where it
@@ -154,7 +158,15 @@ fn collect_root<T: ReadTxn>(
 	// and a keyed entry carries an id worth deep-linking to.
 	let map = MapRef::from(ptr);
 	if map.len(txn) > 0 {
-		for (key, entry) in map.iter(txn) {
+		// Sorted by key: `MapRef::iter` walks yrs' own `HashMap`. Each entry is its
+		// own part, so order never changes a part's text — but it decides which parts
+		// `indexer::build_parts` keeps once a document reaches `max_parts` or
+		// `max_total_chars`, and that subset must not differ between reindexes. yrs
+		// kept no source order to restore, so key order is the only one available;
+		// the array branch below is positional and stays so.
+		let mut entries: Vec<(&str, Out)> = map.iter(txn).collect();
+		entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+		for (key, entry) in entries {
 			let json = any_to_json(&entry.to_json(txn), MAX_ANY_DEPTH, &mut truncated);
 			out.push((format!("{root}/{key}").into(), json));
 		}
@@ -283,11 +295,20 @@ fn any_to_json(any: &Any, depth: usize, truncated: &mut bool) -> Value {
 		Any::Array(items) => {
 			Value::Array(items.iter().map(|i| any_to_json(i, depth - 1, truncated)).collect())
 		}
-		Any::Map(map) => Value::Object(
-			map.iter()
-				.map(|(k, v)| (k.clone(), any_to_json(v, depth - 1, truncated)))
-				.collect(),
-		),
+		// `yrs::Any::Map` is an `Arc<HashMap<..>>`, so its order is randomised per
+		// process and `preserve_order` faithfully keeps it — an embed's indexed text
+		// would differ run to run. yrs kept no source order to restore, so sorting is
+		// the only determinism available; RTDB JSON, which has one, keeps it.
+		Any::Map(map) => {
+			let mut entries: Vec<(&String, &Any)> = map.iter().collect();
+			entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+			Value::Object(
+				entries
+					.into_iter()
+					.map(|(k, v)| (k.clone(), any_to_json(v, depth - 1, truncated)))
+					.collect(),
+			)
+		}
 	}
 }
 
@@ -316,8 +337,9 @@ mod tests {
 			pages.insert(&mut txn, "page2", MapPrelim::from([("ti", "Részletek")]));
 		}
 
-		let mut out = materialize(&updates_of(&doc), "f1~doc");
-		out.sort_by(|a, b| a.0.cmp(&b.0));
+		// Deliberately not sorted: `materialize` owes the caller key order, and a
+		// sort here would hide its loss behind yrs' randomised `HashMap` order.
+		let out = materialize(&updates_of(&doc), "f1~doc");
 
 		assert_eq!(out.len(), 2);
 		assert_eq!(&*out[0].0, "p/page1");
@@ -335,13 +357,33 @@ mod tests {
 			slides.push_back(&mut txn, MapPrelim::from([("ti", "Second")]));
 		}
 
-		let mut out = materialize(&updates_of(&doc), "f1~doc");
-		out.sort_by(|a, b| a.0.cmp(&b.0));
+		// Positional: this order is the array's own, not the key sort's.
+		let out = materialize(&updates_of(&doc), "f1~doc");
 
 		assert_eq!(out.len(), 2);
 		assert_eq!(&*out[0].0, "s/0");
 		assert_eq!(out[0].1["ti"], serde_json::json!("First"));
 		assert_eq!(out[1].1["ti"], serde_json::json!("Second"));
+	}
+
+	/// Roots are the second `HashMap` in the path. Inserted in reverse, so
+	/// insertion order cannot pass for sorted order.
+	#[test]
+	fn roots_come_out_in_name_order() {
+		let doc = Doc::new();
+		let second = doc.get_or_insert_map("z");
+		let first = doc.get_or_insert_map("a");
+		{
+			let mut txn = doc.transact_mut();
+			second.insert(&mut txn, "k", MapPrelim::from([("ti", "Utolsó")]));
+			first.insert(&mut txn, "k", MapPrelim::from([("ti", "Első")]));
+		}
+
+		let out = materialize(&updates_of(&doc), "f1~doc");
+
+		assert_eq!(out.len(), 2);
+		assert_eq!(&*out[0].0, "a/k");
+		assert_eq!(&*out[1].0, "z/k");
 	}
 
 	#[test]

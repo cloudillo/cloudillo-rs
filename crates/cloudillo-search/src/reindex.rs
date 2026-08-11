@@ -668,9 +668,8 @@ mod tests {
 	/// The hand-built `serialize` must describe exactly what the derive would, for
 	/// every scope — otherwise a row written by one and read by the other is a task
 	/// the scheduler can never rebuild. Compared as parsed JSON rather than as
-	/// bytes: `serde_json::Map` is a `BTreeMap` here (no `preserve_order`), so the
-	/// hand-built object sorts its keys while the derive emits them in declaration
-	/// order. Key order is invisible to every reader of this row.
+	/// bytes because key order carries no meaning here: every reader parses the row,
+	/// so the two writers need only agree on the key/value set.
 	#[test]
 	fn every_scope_serializes_exactly_as_the_derive_would() {
 		let scopes = [

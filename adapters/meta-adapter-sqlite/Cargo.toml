@@ -12,12 +12,12 @@ categories = ["database-implementations", "database"]
 readme = "../../README.md"
 
 [dependencies]
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 cloudillo-types = { workspace = true }
 libsqlite3-sys = { version = "0.37.0", features = ["bundled"] }
-serde_json = "1.0.150"
+serde_json = "1.0.151"
 sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio"] }
-tokio = { version = "1.52.3", features = ["fs"] }
+tokio = { version = "1.53.1", features = ["fs"] }
 
 [dev-dependencies]
 # A second, independent connection to the same `meta.db`, so the tests can look
@@ -25,7 +25,7 @@ tokio = { version = "1.52.3", features = ["fs"] }
 # through the adapter's public surface.
 sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio"] }
 tempfile = "3.27"
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true
