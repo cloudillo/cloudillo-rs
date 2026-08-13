@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "axum",
  "axum-server",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-action"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-admin"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-auth"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-auth-adapter-sqlite"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-blob-adapter-fs"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-calendar"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-contact"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-core"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-crdt"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-crdt-adapter-redb"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-dav"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-email"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "cloudillo-core",
@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-file"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -979,7 +979,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-idp"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-meta-adapter-sqlite"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "cloudillo-types",
@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-profile"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -1030,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-proxy"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-push"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-ref"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-rtdb"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "axum",
  "cloudillo-core",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-rtdb-adapter-redb"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-search"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-server"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "cloudillo",
  "cloudillo-auth-adapter-sqlite",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "cloudillo-types"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "async-trait",
  "axum",

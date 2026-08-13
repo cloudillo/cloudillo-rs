@@ -6,5 +6,8 @@ incremental = true
 rustflags = ["-C", "codegen-units=4"]
 #rustc-wrapper = "sccache"
 
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.build-override]
 opt-level = 3
