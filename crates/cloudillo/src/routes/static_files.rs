@@ -57,14 +57,48 @@ fn short(s: &str) -> &str {
 	}
 }
 
+/// Context-free routes reached exactly, with no further segment.
+///
+/// This and [`GUEST_ROOT_PREFIXES`] are the sole owner of the list — the shell has no
+/// counterpart, its route tree only guards sections with `RequireAuth`. Backend-generated
+/// links land here (`/onboarding/{ref}`, `/reset-password/{ref}`, `/idp/activate/{ref}`),
+/// so the shapes are load-bearing.
+const GUEST_ROOTS_EXACT: [&str; 1] = ["/login"];
+
+/// Context-free routes that always carry at least one further segment (a token or ref id).
+const GUEST_ROOT_PREFIXES: [&str; 5] =
+	["/s/", "/register/", "/reset-password/", "/idp/activate/", "/onboarding/"];
+
+/// Is this a route the shell's client-side router can render?
+///
+/// Everything under a context segment — `~` at home, `@<idTag>` elsewhere, per
+/// `isContextSegment` in `shell/src/routes.ts` — plus a static list of context-free
+/// bootstrap entry points.
+///
+/// Nothing after the context is inspected: this allowlist only has to 404 unknown scan
+/// traffic, which is never context-shaped. A mistyped `/~/settngs` is better handled by
+/// the shell's own not-found page than by mirroring the section list across two repos.
+fn is_shell_route(path: &str) -> bool {
+	if path == "/" || path == "/~" || path.starts_with("/~/") {
+		return true;
+	}
+	if let Some(rest) = path.strip_prefix("/@") {
+		// `@` alone names no idTag; `/@/x` has an empty one.
+		return !rest.is_empty() && !rest.starts_with('/');
+	}
+	// Tolerate a single trailing slash: /login/ and /login are the same route.
+	let path = path.strip_suffix('/').unwrap_or(path);
+
+	GUEST_ROOTS_EXACT.contains(&path)
+		|| GUEST_ROOT_PREFIXES.iter().any(|p| path.len() > p.len() && path.starts_with(p))
+}
+
 /// Check if a path should receive SPA fallback (serve shell's index.html for client routing)
 ///
-/// Returns false for:
-/// - API routes (start with /api/)
-/// - WebSocket routes (start with /ws/)
-/// - App routes (start with /apps/) - apps run in iframes, use hash fragments
-/// - Known static asset directories (/fonts/, /sounds/, /assets-*/)
-/// - Root-level files with extensions (e.g., /favicon.ico, /robots.txt)
+/// An **allowlist**: only paths [`is_shell_route`] recognises get `index.html`, everything
+/// else keeps its 404 — scan probes (`/wp-admin/`, `/.env`) must not come back 200 + HTML.
+/// The deny rules below run first as a fast path: those prefixes are served by other
+/// handlers, and a 404 from them must stay a 404.
 fn should_serve_spa_fallback(path: &str) -> bool {
 	// Never fallback for API routes
 	if path.starts_with("/api/") {
@@ -81,46 +115,25 @@ fn should_serve_spa_fallback(path: &str) -> bool {
 		return false;
 	}
 
-	// Never fallback for known static asset directories
-	// These should 404 if the file doesn't exist
-	if path.starts_with("/fonts/") || path.starts_with("/sounds/") {
+	// Never fallback for known static asset directories, nor for the versioned ones the
+	// frontend emits (`/assets-0.8.6/`). These should 404 if the file doesn't exist.
+	// Documented fast paths, not load-bearing: the allowlist below rejects them anyway.
+	if path.starts_with("/fonts/")
+		|| path.starts_with("/sounds/")
+		|| path.trim_start_matches('/').starts_with("assets-")
+	{
 		return false;
 	}
 
-	// Never fallback for versioned asset directories (pattern: /assets-{version}/)
-	// The frontend uses versioned directories like /assets-0.8.6/
-	let trimmed = path.trim_start_matches('/');
-	if trimmed.starts_with("assets-")
-		&& let Some(slash_pos) = trimmed.find('/')
-	{
-		// Has a slash after "assets-*", so it's a path into a versioned assets directory
-		if slash_pos > 7 {
-			// "assets-" is 7 chars, need at least one char for version
-			return false;
-		}
-	}
-
-	// Never fallback for root-level files with extensions
-	// (e.g., /favicon.ico, /robots.txt, /manifest.json, /sw-0.8.6.js)
-	if !trimmed.contains('/') {
-		// It's a root-level path - check for file extension
-		if let Some(dot_pos) = trimmed.rfind('.') {
-			let ext = &trimmed[dot_pos + 1..];
-			// Valid file extension: 2-5 alphanumeric chars
-			if (2..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
-				return false;
-			}
-		}
-	}
-
-	// Everything else gets SPA fallback for client-side routing
-	// This includes paths like /profile/home.w9.hu/szilard.hajba.eu
-	true
+	// Everything else must be a route the shell can actually render. Root-level files
+	// (/favicon.ico, /robots.txt) fall out for free — none of them is a shell route.
+	is_shell_route(path)
 }
 
 /// Serve shell's index.html for SPA fallback (client-side routing)
 ///
-/// Only used for shell routes (e.g., /app/feed, /settings) - apps use iframes with hash fragments.
+/// Only used for shell routes (e.g., /~/app/feed, /@comm.tld/settings) - apps use iframes with
+/// hash fragments.
 async fn serve_shell_index_html(
 	dist_dir: &std::path::Path,
 	disable_cache: bool,
@@ -377,7 +390,19 @@ pub(super) async fn static_fallback_handler(
 
 #[cfg(test)]
 mod tests {
-	use super::should_serve_spa_fallback;
+	use super::{GUEST_ROOT_PREFIXES, GUEST_ROOTS_EXACT, should_serve_spa_fallback};
+
+	/// Pins the list. The shell declares its bootstrap routes in
+	/// `cloudillo/shell/src/auth/auth.tsx` (`authRoutes`) and `.../onboarding/index.tsx`;
+	/// adding or moving one there means changing this list, then this test.
+	#[test]
+	fn guest_root_lists_are_pinned() {
+		assert_eq!(GUEST_ROOTS_EXACT, ["/login"]);
+		assert_eq!(
+			GUEST_ROOT_PREFIXES,
+			["/s/", "/register/", "/reset-password/", "/idp/activate/", "/onboarding/"]
+		);
+	}
 
 	/// `/ws/*` is mounted on the API domain only (`routes/tables/websocket.rs`),
 	/// so on the app domain those paths reach this fallback. They must 404: a
@@ -399,9 +424,78 @@ mod tests {
 
 	#[test]
 	fn shell_client_routes_do_get_the_spa_fallback() {
-		assert!(should_serve_spa_fallback("/app/feed"));
-		assert!(should_serve_spa_fallback("/settings"));
-		assert!(should_serve_spa_fallback("/profile/home.w9.hu/szilard.hajba.eu"));
+		assert!(should_serve_spa_fallback("/"));
+		assert!(should_serve_spa_fallback("/~/app/feed"));
+		assert!(should_serve_spa_fallback("/~/settings/security"));
+		assert!(should_serve_spa_fallback("/@comm.tld/app/quillo/home.w9.hu:abc"));
+		assert!(should_serve_spa_fallback("/@comm.tld/profile/szilard.hajba.eu/feed"));
+		assert!(should_serve_spa_fallback("/~/site-admin/tenants/bob.org"));
+		assert!(should_serve_spa_fallback("/~/notifications"));
+	}
+
+	/// `/~` and `/@<idTag>` are routes in their own right — the shell redirects them
+	/// to the feed. A trailing slash is the same route.
+	#[test]
+	fn bare_context_roots_get_the_spa_fallback() {
+		assert!(should_serve_spa_fallback("/~"));
+		assert!(should_serve_spa_fallback("/~/"));
+		assert!(should_serve_spa_fallback("/@comm.tld"));
+		assert!(should_serve_spa_fallback("/@comm.tld/"));
+	}
+
+	/// The three backend-generated link shapes plus `/login` and `/s/`, none of which
+	/// carries a context. Breaking one breaks password-reset or onboarding email links.
+	#[test]
+	fn context_free_guest_roots_get_the_spa_fallback() {
+		assert!(should_serve_spa_fallback("/login"));
+		assert!(should_serve_spa_fallback("/s/abc123"));
+		assert!(should_serve_spa_fallback("/register/tok3n"));
+		assert!(should_serve_spa_fallback("/register/tok3n/idp/verify"));
+		assert!(should_serve_spa_fallback("/reset-password/abc123"));
+		assert!(should_serve_spa_fallback("/idp/activate/abc123"));
+		assert!(should_serve_spa_fallback("/onboarding/abc123"));
+		// Bare `/onboarding` is not a route — the shell registers only `/onboarding/…` children.
+		assert!(!should_serve_spa_fallback("/onboarding"));
+	}
+
+	/// The point of the allowlist: scan probes 404 instead of coming back 200 + HTML.
+	#[test]
+	fn attack_scan_paths_never_get_the_spa_fallback() {
+		assert!(!should_serve_spa_fallback("/wp-admin/"));
+		assert!(!should_serve_spa_fallback("/.env"));
+		assert!(!should_serve_spa_fallback("/.git/config"));
+		assert!(!should_serve_spa_fallback("/phpmyadmin"));
+		assert!(!should_serve_spa_fallback("/admin"));
+		assert!(!should_serve_spa_fallback("/vendor/phpunit/phpunit/phpunit.xml"));
+	}
+
+	/// The old grammar put the context second, or omitted it — no redirects were kept.
+	#[test]
+	fn pre_flip_grammar_no_longer_gets_the_spa_fallback() {
+		assert!(!should_serve_spa_fallback("/app/feed"));
+		assert!(!should_serve_spa_fallback("/settings"));
+		assert!(!should_serve_spa_fallback("/profile/home.w9.hu/szilard.hajba.eu"));
+		assert!(!should_serve_spa_fallback("/site-admin/tenants"));
+	}
+
+	/// The sigil is the whole test. Without it the path is not context-shaped, however
+	/// much the rest of it looks like the grammar.
+	#[test]
+	fn unsigiled_contexts_never_get_the_spa_fallback() {
+		assert!(!should_serve_spa_fallback("/comm.tld/app/feed"));
+		assert!(!should_serve_spa_fallback("/~x/app/feed"));
+		// A sigil with nothing behind it names no idTag either.
+		assert!(!should_serve_spa_fallback("/@"));
+		assert!(!should_serve_spa_fallback("/@/.env"));
+	}
+
+	/// The section after the context is not validated here — the shell owns its own
+	/// not-found page, and scan traffic never arrives context-shaped.
+	#[test]
+	fn any_section_under_a_context_gets_the_spa_fallback() {
+		assert!(should_serve_spa_fallback("/~/settngs"));
+		assert!(should_serve_spa_fallback("/~/some-future-section/x"));
+		assert!(should_serve_spa_fallback("/@comm.tld/whatever"));
 	}
 }
 

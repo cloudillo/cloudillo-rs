@@ -1120,9 +1120,7 @@ pub async fn post_forgot_password(
 			description: Some("User-initiated password reset"),
 			expires_at,
 			path_prefix: "/reset-password",
-			resource_id: None,
-			count: None,
-			params: None,
+			..Default::default()
 		},
 	)
 	.await

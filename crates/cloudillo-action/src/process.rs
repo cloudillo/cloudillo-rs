@@ -1325,7 +1325,7 @@ async fn send_push_notification(
 	action_type: &str,
 	subtype: Option<&str>,
 ) {
-	use crate::forward::{get_push_setting_key, should_push_notify};
+	use crate::forward::{get_push_setting_key, notification_path, should_push_notify};
 	use cloudillo_push::{NotificationPayload, send_to_tenant};
 
 	// Check if this action type should trigger push notifications
@@ -1380,7 +1380,7 @@ async fn send_push_notification(
 	let payload = NotificationPayload {
 		title,
 		body,
-		path: Some(format!("/action/{}", action_id)),
+		path: Some(notification_path(action_type, action_id, action)),
 		image: None,
 		tag: Some(action_type.to_string()),
 	};

@@ -387,9 +387,7 @@ pub(crate) async fn send_welcome_email(
 			description: Some("Welcome to Cloudillo"),
 			expires_at: Some(Timestamp::now().add_seconds(86400 * 30)), // 30 days
 			path_prefix: "/onboarding",
-			resource_id: None,
-			count: None,
-			params: None,
+			..Default::default()
 		},
 	)
 	.await?;

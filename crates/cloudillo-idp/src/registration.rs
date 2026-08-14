@@ -112,8 +112,7 @@ pub async fn send_activation_email(
 			expires_at: expires_at_ref,
 			path_prefix: "/idp/activate",
 			resource_id: Some(&identity_id),
-			count: None,
-			params: None,
+			..Default::default()
 		},
 	)
 	.await?;

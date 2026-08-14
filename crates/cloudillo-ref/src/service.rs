@@ -8,6 +8,7 @@ use cloudillo_types::meta_adapter::CreateRefOptions;
 use cloudillo_types::utils;
 
 /// Parameters for creating a ref internally
+#[derive(Default)]
 pub struct CreateRefInternalParams<'a> {
 	/// The id_tag for constructing the URL
 	pub id_tag: &'a str,
@@ -19,6 +20,9 @@ pub struct CreateRefInternalParams<'a> {
 	pub expires_at: Option<Timestamp>,
 	/// URL path prefix (e.g., "/onboarding/welcome")
 	pub path_prefix: &'a str,
+	/// Query parameter to carry the ref id in, instead of a trailing path segment:
+	/// `Some("invite")` yields `{path_prefix}?invite={ref_id}`.
+	pub query_param: Option<&'a str>,
 	/// Optional resource identifier to store with the ref
 	pub resource_id: Option<&'a str>,
 	/// Number of uses allowed (default: 1)
@@ -72,7 +76,12 @@ pub async fn create_ref_internal(
 	})?;
 
 	// Construct the full URL
-	let url = format!("https://{}{}/{}", params.id_tag, params.path_prefix, ref_id);
+	let url = match params.query_param {
+		Some(name) => {
+			format!("https://{}{}?{}={}", params.id_tag, params.path_prefix, name, ref_id)
+		}
+		None => format!("https://{}{}/{}", params.id_tag, params.path_prefix, ref_id),
+	};
 
 	info!(
 		tn_id = ?tn_id,

@@ -12,6 +12,7 @@
 
 use crate::prelude::*;
 use cloudillo_core::ws_broadcast::{BroadcastMessage, DeliveryResult};
+use cloudillo_types::auth_adapter::ActionToken;
 use cloudillo_types::meta_adapter::{ActionView, AttachmentView};
 use serde_json::json;
 
@@ -207,6 +208,28 @@ pub fn should_push_notify(action_type: &str, sub_type: Option<&str>) -> bool {
 	)
 }
 
+/// Where a push notification for `action` should navigate.
+///
+/// Relative to the recipient's own app domain, so `~` (home context) is always right.
+/// Mirrors the in-app routing in `shell/src/notifications/notifications.tsx`.
+pub fn notification_path(action_type: &str, action_id: &str, action: &ActionToken) -> String {
+	match action_type {
+		// Group conversations are keyed by the parent action id, direct ones by the
+		// peer's idTag — see `isGroupId` / `useMessages.ts` in the shell.
+		"MSG" => {
+			let conv = action.p.as_deref().unwrap_or(&action.iss);
+			format!("/~/app/messages/{conv}")
+		}
+		// The comment's own id is not a permalink; the post it hangs off is.
+		"CMNT" => {
+			let post = action.p.as_deref().unwrap_or(action_id);
+			format!("/~/app/feed/{post}")
+		}
+		// CONN and FSHR are accept/reject cards with no page of their own.
+		_ => "/~/notifications".to_string(),
+	}
+}
+
 /// Single source of truth for per-type notification metadata. One row per
 /// notifiable action type; `None` => the type has no type-specific keys and
 /// callers fall back to the channel master switch.
@@ -377,6 +400,59 @@ mod tests {
 		assert_eq!(notify_action_label("CONN"), "connection request");
 		assert_eq!(notify_action_label("CMNT"), "comment");
 		assert_eq!(notify_action_label("UNKNOWN"), "notification");
+	}
+
+	fn token(iss: &str, p: Option<&str>) -> ActionToken {
+		ActionToken {
+			iss: iss.into(),
+			k: "k1".into(),
+			t: "MSG".into(),
+			c: None,
+			p: p.map(Into::into),
+			a: None,
+			aud: None,
+			sub: None,
+			iat: Timestamp(0),
+			exp: None,
+			f: None,
+			v: None,
+			nonce: None,
+		}
+	}
+
+	/// A group conversation is addressed by its parent action id, a direct one by
+	/// the peer — who, on an inbound message, is the issuer.
+	#[test]
+	fn test_notification_path_msg() {
+		assert_eq!(
+			notification_path("MSG", "a1~msg", &token("bob.org", Some("a1~conv"))),
+			"/~/app/messages/a1~conv"
+		);
+		assert_eq!(
+			notification_path("MSG", "a1~msg", &token("bob.org", None)),
+			"/~/app/messages/bob.org"
+		);
+	}
+
+	/// The permalink is the parent post's, never the comment's own id.
+	#[test]
+	fn test_notification_path_cmnt() {
+		assert_eq!(
+			notification_path("CMNT", "a1~cmnt", &token("bob.org", Some("a1~post"))),
+			"/~/app/feed/a1~post"
+		);
+		assert_eq!(
+			notification_path("CMNT", "a1~cmnt", &token("bob.org", None)),
+			"/~/app/feed/a1~cmnt"
+		);
+	}
+
+	/// Accept/reject cards live on the notifications page and nowhere else.
+	#[test]
+	fn test_notification_path_conn_and_fshr() {
+		let t = token("bob.org", None);
+		assert_eq!(notification_path("CONN", "a1~conn", &t), "/~/notifications");
+		assert_eq!(notification_path("FSHR", "a1~fshr", &t), "/~/notifications");
 	}
 
 	#[test]

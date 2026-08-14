@@ -69,10 +69,11 @@ pub async fn post_invite_community(
 			typ: "profile.invite",
 			description: Some("Community profile invite"),
 			expires_at,
-			path_prefix: "/profile/new?invite=",
-			resource_id: None,
-			count: None,
-			params: None,
+			// CreateCommunity reads the ref from `?invite=` (shell/src/profile/community.tsx);
+			// must be a real query param, or the ref lands after the `=` as a path segment.
+			path_prefix: "/~/communities/create",
+			query_param: Some("invite"),
+			..Default::default()
 		},
 	)
 	.await?;

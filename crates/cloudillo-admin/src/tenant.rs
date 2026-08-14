@@ -157,9 +157,7 @@ pub async fn send_password_reset(
 			description: Some("Admin-initiated password reset"),
 			expires_at,
 			path_prefix: "/reset-password", // Frontend route (must match AuthRoutes in shell)
-			resource_id: None,
-			count: None,
-			params: None,
+			..Default::default()
 		},
 	)
 	.await?;
