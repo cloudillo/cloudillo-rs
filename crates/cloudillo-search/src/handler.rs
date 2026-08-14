@@ -96,8 +96,8 @@ use cloudillo_core::{
 use cloudillo_types::{
 	auth_adapter::AuthCtx,
 	meta_adapter::{
-		SEARCH_MAX_CONTENT_TYPES, SEARCH_MAX_LIMIT, SEARCH_MAX_OFFSET, SEARCH_MAX_TAGS,
-		SearchMatch, SearchOptions, SearchRow,
+		ProfileType, SEARCH_MAX_CONTENT_TYPES, SEARCH_MAX_LIMIT, SEARCH_MAX_OFFSET,
+		SEARCH_MAX_TAGS, SearchMatch, SearchOptions, SearchRow,
 	},
 	types::{ApiResponse, TokenScope, serialize_timestamp_iso},
 };
@@ -175,6 +175,8 @@ pub struct SearchHit {
 	pub nav_param: Option<Box<str>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub content_type: Option<Box<str>>,
+	/// For a `'P'` hit this is the profile's live name while the profile is still
+	/// mirrored here, and the indexed name otherwise.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub title: Option<Box<str>>,
 	/// Server-built excerpt as plain text; `snippetMatches` carries the highlight
@@ -193,6 +195,15 @@ pub struct SearchHit {
 	pub tags: Option<Box<[Box<str>]>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub owner_tag: Option<Box<str>>,
+	/// The profile's picture file id — `'P'` hits only. The file lives on the
+	/// profile's own node, addressed by [`Self::obj_id`], not on the searching
+	/// tenant's.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub profile_pic: Option<Box<str>>,
+	/// `"person"` or `"community"` — `'P'` hits only. Read from the live
+	/// `profiles` row alongside the picture, so it costs no extra query.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub profile_type: Option<ProfileType>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub updated_at: Timestamp,
 	/// Sign-flipped `bm25()`: higher is more relevant.
@@ -322,8 +333,14 @@ pub async fn get_search(
 		);
 	}
 
+	// Keyed off the rows this page returns. What keeps a `'P'` row — and so a
+	// profile's picture — away from a caller who may not see it is the `obj_tp`
+	// narrowing above plus the adapter's identified-viewer test, not the scope
+	// post-check, which only ever touches `'F'` and `'D'` rows.
 	let nav_params = read_nav_params(&app, tn_id, &rows).await;
-	let hits: Vec<SearchHit> = rows.into_iter().map(|row| to_hit(row, &nav_params)).collect();
+	let profile_meta = read_profile_meta(&app, tn_id, &rows).await;
+	let hits: Vec<SearchHit> =
+		rows.into_iter().map(|row| to_hit(row, &nav_params, &profile_meta)).collect();
 
 	let total = usize::try_from(total).unwrap_or(0);
 	let response = ApiResponse::with_pagination(hits, offset as usize, limit as usize, total)
@@ -428,12 +445,64 @@ async fn read_nav_params(
 	out
 }
 
+/// The `'P'`-hit fields taken live from `profiles` rather than from the index row.
+struct ProfileMeta {
+	name: Box<str>,
+	typ: ProfileType,
+	profile_pic: Option<Box<str>>,
+}
+
+/// Live `profiles` fields for the `'P'` rows on this page, keyed by id_tag.
+///
+/// One batch call rather than one lookup per hit; the adapter chunks internally.
+/// Profiles this tenant has not mirrored are simply absent, and such a hit falls
+/// back to what its index row carries.
+///
+/// Degrades rather than fails: these fields are decoration on top of a row the
+/// caller can already see, and losing the adapter call must not turn a search
+/// into a 500.
+async fn read_profile_meta(
+	app: &App,
+	tn_id: TnId,
+	rows: &[SearchRow],
+) -> HashMap<Box<str>, ProfileMeta> {
+	let mut tags: Vec<&str> = rows
+		.iter()
+		.filter(|r| r.obj_tp == OBJ_PROFILE)
+		.map(|r| r.obj_id.as_ref())
+		.collect();
+	tags.sort_unstable();
+	tags.dedup();
+	if tags.is_empty() {
+		return HashMap::new();
+	}
+
+	let profiles = app
+		.meta_adapter
+		.read_profiles(tn_id, &tags)
+		.await
+		.inspect_err(|e| {
+			warn!(tn_id = %tn_id, error = %e, "Cannot read profiles for search hits");
+		})
+		.unwrap_or_default();
+
+	profiles
+		.into_iter()
+		.map(|p| (p.id_tag, ProfileMeta { name: p.name, typ: p.typ, profile_pic: p.profile_pic }))
+		.collect()
+}
+
 /// Build the client-facing hit, enriching it with the deep-link metadata the
 /// client needs to construct `cl:{appId}/{owner}:{fileId}?{navParam}={partId}`.
 ///
-/// `nav_params` is [`read_nav_params`]' per-content-type lookup, so this is a
-/// plain synchronous mapping with no database access of its own.
-fn to_hit(row: SearchRow, nav_params: &HashMap<Box<str>, Option<Box<str>>>) -> SearchHit {
+/// `nav_params` and `profile_meta` are the per-page lookups built by
+/// [`read_nav_params`] and [`read_profile_meta`], so this is a plain synchronous
+/// mapping with no database access of its own.
+fn to_hit(
+	row: SearchRow,
+	nav_params: &HashMap<Box<str>, Option<Box<str>>>,
+	profile_meta: &HashMap<Box<str>, ProfileMeta>,
+) -> SearchHit {
 	let content_type = row.content_type;
 	let nav_param = match (&content_type, row.part_id.is_empty()) {
 		(Some(ct), false) => nav_params.get(ct.as_ref()).cloned().flatten(),
@@ -448,6 +517,15 @@ fn to_hit(row: SearchRow, nav_params: &HashMap<Box<str>, Option<Box<str>>>) -> S
 	let parent_part: Option<Box<str>> =
 		row.parent_part.as_deref().map(|p| strip_kind(p, kind).into());
 
+	// Read before the struct literal moves `row.obj_id` and `row.title` out.
+	let profile =
+		if row.obj_tp == OBJ_PROFILE { profile_meta.get(row.obj_id.as_ref()) } else { None };
+	let profile_pic = profile.and_then(|p| p.profile_pic.clone());
+	let profile_type = profile.map(|p| p.typ);
+	// The live name wins over the indexed one, which goes stale between a rename
+	// and its reindex. An empty name is not an improvement on the index row.
+	let title = profile.map(|p| p.name.clone()).filter(|n| !n.is_empty()).or(row.title);
+
 	SearchHit {
 		obj_tp: row.obj_tp,
 		obj_id: row.obj_id,
@@ -458,11 +536,13 @@ fn to_hit(row: SearchRow, nav_params: &HashMap<Box<str>, Option<Box<str>>>) -> S
 		app_id: content_type.as_deref().and_then(app_id_of).map(Into::into),
 		nav_param,
 		content_type,
-		title: row.title,
+		title,
 		snippet: row.snippet,
 		snippet_matches: row.snippet_matches,
 		tags: row.tags.as_deref().map(split_tags),
 		owner_tag: row.owner_tag,
+		profile_pic,
+		profile_type,
 		updated_at: row.updated_at,
 		// `bm25()` is negative and ascending-relevant; flip it so the client's
 		// "higher is better" intuition holds.
