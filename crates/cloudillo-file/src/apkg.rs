@@ -7,8 +7,6 @@
 //! - Installation: install/uninstall apps
 //! - Container content: serve files from within zip packages
 
-use std::sync::Arc;
-
 use axum::{
 	Json,
 	body::Body,
@@ -16,10 +14,10 @@ use axum::{
 	http::{StatusCode, header},
 	response::Response,
 };
-use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::container::{self, ContainerCache};
+use cloudillo_types::worker::Priority;
+
 use crate::prelude::*;
 use cloudillo_core::abac::{Environment, VisibilityLevel};
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth};
@@ -55,8 +53,11 @@ pub async fn get_container_content(
 	// Look up the file metadata
 	let file = app.meta_adapter.read_file(tn_id, &file_id).await?.ok_or(Error::NotFound)?;
 
-	// Check that the file is an apkg preset
-	if file.preset.as_deref() != Some("apkg") {
+	// `site` joins `apkg` here so a published site container is readable through the same
+	// route: the `OptionalAuth` path below is what lets an unauthenticated reader fetch out
+	// of a `visibility = Public` container, and duplicating it would duplicate an
+	// authorization check.
+	if !matches!(file.preset.as_deref(), Some("apkg" | "site")) {
 		return Err(Error::NotFound);
 	}
 
@@ -121,66 +122,61 @@ pub async fn get_container_content(
 		}
 	}
 
-	// Get the original variant to find the blob_id
-	let variants = app
-		.meta_adapter
-		.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id))
-		.await?;
+	// Whether an HTML entry out of this container may run scripts on
+	// `cl-o.<idTag>` — the origin holding every session on this tenant.
+	//
+	// The **preset** answers nothing here. `apkg` is an ordinary preset taken straight from
+	// the upload path and gated only by the collection-level `check_perm_create`, so anyone
+	// who may upload may claim it — and where more than one principal may upload (a
+	// community, a share-write scope) that is stored XSS against the session origin. So the
+	// question asked is the one the database can answer: is this the package of an app
+	// `install_app` wrote from an `APKG` action's attachment. Everything else is sandboxed,
+	// sites included.
+	//
+	// Deliberately below the permission check: it is a read-pool query on every container
+	// entry fetch, and a request about to be refused must not pay it.
+	let trusted = file.preset.as_deref() == Some("apkg")
+		&& app.meta_adapter.is_installed_app_file(tn_id, &file_id).await?;
 
-	let orig_variant =
-		variants.iter().find(|v| v.variant.as_ref() == "orig").ok_or(Error::NotFound)?;
+	// The index lookup and the entry's range read live behind `crate::Container`, which
+	// `cloudillo-site` reads its fragments through too. Resolves once per request.
+	let container = crate::open_container(&app, tn_id, &file_id, Priority::High).await?;
+	let Some(info) = container.entry(&path) else {
+		return Err(Error::NotFound);
+	};
+	let content_type = info.content_type;
 
-	let variant_id = orig_variant.variant_id.as_ref();
+	// Shared with `cloudillo_site::serve`: a substring test here would read the
+	// explicit refusal `gzip;q=0` as support.
+	let client_accepts_gzip = crate::accepts_gzip(&headers);
 
-	// Get or parse the container cache (parses zip central directory on first access)
-	let cache: &ContainerCache = app
-		.extensions
-		.get::<Arc<ContainerCache>>()
-		.ok_or_else(|| Error::Internal("Container cache not initialized".into()))?;
-
-	let index = cache
-		.get_or_parse_with(variant_id, || app.blob_adapter.read_blob_buf(tn_id, variant_id))
-		.await?;
-
-	// Look up the requested path in the zip index
-	let entry = index.entries.get(path.as_str()).ok_or(Error::NotFound)?;
-
-	// Read only the compressed data for this entry via range read
-	let chunks: Vec<axum::body::Bytes> = app
-		.blob_adapter
-		.read_blob_range_stream(tn_id, variant_id, entry.data_offset, entry.compressed_size)
-		.await?
-		.try_collect()
-		.await
-		.map_err(|e| Error::Internal(format!("range read failed: {e}")))?;
-	let raw_data: Vec<u8> = chunks.concat();
-
-	// Check if client accepts gzip encoding
-	let client_accepts_gzip = headers
-		.get(header::ACCEPT_ENCODING)
-		.and_then(|v| v.to_str().ok())
-		.is_some_and(|v| v.contains("gzip"));
-
-	// Build response based on compression method and client capability
-	let (body_bytes, content_encoding) = if entry.is_deflated && client_accepts_gzip {
-		// Wrap raw deflate in gzip envelope — nearly free
-		let gzip_data = container::wrap_in_gzip(&raw_data, entry.crc32, entry.uncompressed_size);
-		(gzip_data, Some("gzip"))
-	} else if entry.is_deflated {
-		// Client doesn't accept gzip — decompress
-		let decompressed = container::inflate(&raw_data)
-			.map_err(|e| Error::Internal(format!("Failed to decompress zip entry: {e}")))?;
-		(decompressed, None)
+	// `read_gzip` passes the stored deflate stream through in a gzip envelope, nearly
+	// free; `None` for a stored entry, which falls back to the plain bytes.
+	let (body_bytes, content_encoding) = if client_accepts_gzip {
+		match container.read_gzip(&app, info).await? {
+			Some(gzip_data) => (gzip_data, Some("gzip")),
+			None => (container.read_bytes(&app, info, Priority::High).await?, None),
+		}
 	} else {
-		// Stored (uncompressed) — serve as-is
-		(raw_data, None)
+		(container.read_bytes(&app, info, Priority::High).await?, None)
 	};
 
 	let mut builder = Response::builder()
 		.status(StatusCode::OK)
-		.header(header::CONTENT_TYPE, &*entry.content_type)
+		.header(header::CONTENT_TYPE, content_type)
 		.header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+		// The body is chosen from `Accept-Encoding`, so a shared cache must not
+		// hand a gzip body to a client that never offered gzip.
+		.header(header::VARY, "Accept-Encoding")
 		.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+
+	// Sandbox unless the container was proven installed above: `sandbox` with no tokens
+	// puts the response in a unique opaque origin and blocks script execution outright, so
+	// an entry can no longer reach the session origin. An installed app package is exempt —
+	// it is iframed and must run its scripts.
+	if !trusted {
+		builder = builder.header(header::CONTENT_SECURITY_POLICY, "sandbox");
+	}
 
 	if let Some(encoding) = content_encoding {
 		builder = builder.header(header::CONTENT_ENCODING, encoding);

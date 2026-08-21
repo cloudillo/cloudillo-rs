@@ -1327,8 +1327,10 @@ pub struct InstalledApp {
 /// One indexable unit of an object.
 ///
 /// A whole object (a file, an action, a profile) has a single part with
-/// `part_id = ""`. A deep-indexed document emits one part per sub-unit, where
-/// `part_id` is the app's deep-link key (e.g. a notillo page id).
+/// `part_id = ""`. A deep-indexed document emits one `'D'` part per sub-unit, keyed by
+/// the app's deep-link key (e.g. a notillo page id); a static file emits one `'F'` part
+/// per addressable piece — a site container's pages, a PDF's pages. Which of the two a
+/// part is follows from its object's `obj_tp`, not from anything here.
 #[derive(Debug, Default)]
 pub struct SearchPart<'a> {
 	/// Deep-link key; `""` for whole-object rows.
@@ -1527,6 +1529,127 @@ pub struct UpsertDocFormat<'a> {
 	pub nav_param: Option<&'a str>,
 	pub search: Option<&'a serde_json::Value>,
 	pub x: Option<&'a serde_json::Value>,
+}
+
+// Site builder
+//**************
+
+/// A tenant's site. A **per-tenant singleton**: `tn_id` is the whole key, which is
+/// also why [`SiteDoc`] carries no site reference.
+///
+/// There is deliberately no host field. A tenant's site host is always its app
+/// domain, which `build_domains_for_tenant` derives, so a stored copy would drift.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Site {
+	/// `'A'` active (served) | `'D'` disabled (configured but dark).
+	pub status: Box<str>,
+	/// The owner's explicit main navigation. **Empty means derive** — the site falls
+	/// back to the nav read from the root container's manifest. A non-empty list takes
+	/// over wholesale; the two are never merged.
+	///
+	/// Navigation is not routing: a target may name a path no document serves, omit one
+	/// that is served, or be an external URL.
+	pub nav: Vec<SiteNavItem>,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub updated_at: Timestamp,
+}
+
+/// One top-level entry in the site's explicit main navigation.
+///
+/// `target` is a **site-absolute** path (`/blog/hello`) or an absolute external URL,
+/// never a document or page reference: a path survives the document behind it being
+/// unpublished — the link 404s, which is legible — and needs no resolution at serve time.
+///
+/// Nesting is one level, and structural rather than checked: [`SiteNavChild`] has no
+/// `children` of its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteNavItem {
+	pub label: Box<str>,
+	pub target: Box<str>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub children: Vec<SiteNavChild>,
+}
+
+/// A second-level navigation entry. See [`SiteNavItem`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteNavChild {
+	pub label: Box<str>,
+	pub target: Box<str>,
+}
+
+/// Writable subset of [`Site`], as a **patch**: an `Undefined` field is left alone.
+///
+/// `status` is deliberately absent. It is the serving kill switch and nothing on this
+/// path writes it, so carrying it would mean every nav edit reads it back out of the
+/// database to write the same value in again — which is exactly how a concurrent edit
+/// clobbers it. A future `status` writer gets its own single-column statement: a kill
+/// switch a nav edit can overwrite is not a kill switch.
+#[derive(Debug)]
+pub struct UpsertSite<'a> {
+	/// `Undefined` creates the record if it is missing and leaves `nav` alone;
+	/// `Null` and an empty list both store SQL NULL, the "derive it" state;
+	/// `Value` stores the list.
+	pub nav: Patch<&'a [SiteNavItem]>,
+}
+
+/// One document's participation in the site — one row per document.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteDoc {
+	/// The Notillo document.
+	pub doc_file_id: Box<str>,
+	/// The path the owner configured, `/` for the root document and `/blog` for a mount.
+	/// Unique within the tenant. What the settings page writes, not necessarily what is
+	/// served — see [`Self::published_mount_path`].
+	pub mount_path: Box<str>,
+	/// The path the currently served container was built for. `None` while the
+	/// document has never published. Serving and the site cache read *this*, so
+	/// editing `mount_path` cannot break the live site: the move lands at the
+	/// document's next publish, which copies one into the other.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub published_mount_path: Option<Box<str>>,
+	/// The container currently served. `None` between "add to site" and the first
+	/// publish — a row may exist before any container does.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub published_file_id: Option<Box<str>>,
+	/// The one generation kept for rollback. `None` before the second publish.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub previous_file_id: Option<Box<str>>,
+	/// The path [`Self::previous_file_id`] was built for, so a rollback restores the
+	/// prefix along with the container — a document repathed between two publishes would
+	/// otherwise come back serving links baked for the other. `None` when there is no
+	/// previous generation, or the row predates this column.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub previous_mount_path: Option<Box<str>>,
+	/// When the served generation was published. `None` on a row that has none.
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub published_at: Option<Timestamp>,
+}
+
+/// One mount row as the settings page writes it — the binding alone, with no
+/// container in sight. The argument of [`MetaAdapter::upsert_site_mount`].
+#[derive(Debug)]
+pub struct UpsertSiteMount<'a> {
+	pub doc_file_id: &'a str,
+	/// Already normalized by the handler; this is a stored key.
+	pub mount_path: &'a str,
+}
+
+/// One publish of a document into the site — the argument of
+/// [`MetaAdapter::publish_site_doc`].
+#[derive(Debug)]
+pub struct PublishSiteDoc<'a> {
+	pub doc_file_id: &'a str,
+	pub mount_path: &'a str,
+	/// The freshly built container. The row's current `published_file_id` is
+	/// demoted to `previous_file_id` as this one takes its place.
+	pub published_file_id: &'a str,
 }
 
 // Contacts / Address Books (CardDAV + JSON REST)
@@ -2070,6 +2193,10 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	///   was saved would be reaped.
 	/// - `tenants.profile_pic`, `tenants.cover_pic` (this tenant).
 	/// - `profiles.profile_pic` (cached remote profile images, this tenant).
+	/// - `site_docs.published_file_id` and `site_docs.previous_file_id` — the live
+	///   and rollback generations of every published site container. Missing this
+	///   source is total, silent site loss: a served container is hard-deleted one
+	///   safety window after publish and the blob sweep takes its blob.
 	///
 	/// MUST be updated when a new column names a file in the managed folder.
 	/// Missing a source here will cause the GC to reap files that are still
@@ -2413,6 +2540,17 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		publisher_tag: &str,
 	) -> ClResult<Option<InstalledApp>>;
 
+	/// Is `file_id` the package of an app this tenant has actually installed?
+	///
+	/// The trust signal `cloudillo_file::apkg::get_container_content` gates script-capable
+	/// HTML on. The `apkg` **preset** is not one: it is a client-chosen URL segment gated
+	/// only by the collection-level `check_perm_create`, so anyone who may upload may claim
+	/// it. An installed row is written by `install_app` from an `APKG` action's attachment,
+	/// which is the curation the preset only implied.
+	///
+	/// `status = 'A'` only: an inactive row is not an app the tenant is running.
+	async fn is_installed_app_file(&self, tn_id: TnId, file_id: &str) -> ClResult<bool>;
+
 	// Full-text search
 	//******************
 
@@ -2426,19 +2564,30 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		parts: &[SearchPart<'_>],
 	) -> ClResult<()>;
 
-	/// Replace the single whole-object index row for `(obj_tp, obj_id)`.
+	/// Replace the index rows of `(obj_tp, obj_id)` from the source row's own ACL.
 	///
 	/// `obj_tp` selects the source table — `'F'` files, `'P'` profiles, `'A'`
 	/// actions — and the adapter derives `content_type`, `owner_tag`,
-	/// `visibility`, `root_id`, `created_at` and `part_kind` from that row, so the
-	/// index and its source can never disagree about who may see it. Only `title`,
-	/// `body` and `tags` come from the caller; `part_id`, `parent_part` and
-	/// `anchor_id` have no place in a whole-object row and may be rejected rather
-	/// than dropped silently.
+	/// `visibility`, `root_id` and `created_at` from that row, so the index and its
+	/// source can never disagree about who may see it. Only `title`, `body`, `tags`
+	/// and the part addressing come from the caller.
 	///
-	/// `part = None` deletes the row, and so does a `Some` whose source row has
-	/// meanwhile vanished. For `'F'` the call also refreshes the ACL columns of
-	/// the file's deep `'D'` rows, and drops them when the file is gone.
+	/// `parts` is the object's **whole** index content and replaces every row it has, in
+	/// one transaction. At most one part carries an empty `part_id` — the whole-object row,
+	/// whose `part_kind` is derived and whose `parent_part`/`anchor_id` are rejected rather
+	/// than dropped silently — followed by any number with a non-empty one. A part absent
+	/// from `parts` is deleted, which makes "no longer published" a real operation.
+	///
+	/// Only `'F'` may carry non-empty `part_id`s: a static file's addressable pieces — a
+	/// site container's published pages, a PDF's pages — indexed on write, as against the
+	/// `'D'` rows a live document's rules engine produces through
+	/// [`MetaAdapter::replace_search_object`]. One indexer pass produces both a file's
+	/// global metadata and its parts, so they arrive as one slice rather than from two
+	/// writers that could disagree about whether the object exists.
+	///
+	/// An empty `parts` deletes every row of the object, and so does a non-empty one whose
+	/// source row has meanwhile vanished. For `'F'` the call also refreshes the ACL columns
+	/// of the file's deep `'D'` rows, and drops them when the file is gone.
 	///
 	/// `fts_cl` selects the index route as [`SearchObject::fts_cl`] does; flipping
 	/// it for an existing object only takes effect through a full reindex.
@@ -2447,7 +2596,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		obj_tp: char,
 		obj_id: &str,
-		part: Option<&SearchPart<'_>>,
+		parts: &[SearchPart<'_>],
 		fts_cl: bool,
 	) -> ClResult<()>;
 
@@ -2539,6 +2688,81 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Remove a manifest.
 	async fn delete_doc_format(&self, tn_id: TnId, content_type: &str) -> ClResult<()>;
+
+	// Site builder
+	//**************
+
+	/// Read the tenant's site record; `None` when no site has been configured.
+	async fn read_site(&self, tn_id: TnId) -> ClResult<Option<Site>>;
+
+	/// Create the tenant's site record if it is missing and apply `site` to it.
+	/// A patch, not a full assignment — see [`UpsertSite`].
+	async fn upsert_site(&self, tn_id: TnId, site: &UpsertSite<'_>) -> ClResult<()>;
+
+	/// Read one document's site binding.
+	async fn read_site_doc(&self, tn_id: TnId, doc_file_id: &str) -> ClResult<Option<SiteDoc>>;
+
+	/// Read the binding serving `mount_path`. `UNIQUE (tn_id, mount_path)` is what
+	/// makes "at most one" true here rather than "whichever row comes back first".
+	async fn read_site_doc_by_mount(
+		&self,
+		tn_id: TnId,
+		mount_path: &str,
+	) -> ClResult<Option<SiteDoc>>;
+
+	/// Read the binding whose **published** container is currently served at
+	/// `mount_path`.
+	///
+	/// Distinct from [`Self::read_site_doc_by_mount`], which reads the *configured* path:
+	/// repathing a published document leaves `published_mount_path` where it was, so the
+	/// two columns can differ and only this one answers "what is served here now".
+	///
+	/// No unique index backs this column — a duplicate is exactly what the publish endpoint
+	/// uses this call to refuse — so the adapter returns the lowest `doc_file_id` of a
+	/// duplicate set, making the answer deterministic.
+	async fn read_site_doc_by_published_mount(
+		&self,
+		tn_id: TnId,
+		mount_path: &str,
+	) -> ClResult<Option<SiteDoc>>;
+
+	/// Every document participating in this tenant's site, ordered by mount path.
+	async fn list_site_docs(&self, tn_id: TnId) -> ClResult<Vec<SiteDoc>>;
+
+	/// Bind a document at its mount path and make the given container the one
+	/// served, demoting the row's current `published_file_id` to
+	/// `previous_file_id` in the same statement — read-modify-write in a handler
+	/// would race two concurrent publishes of the same document.
+	///
+	/// The displaced `previous_file_id` loses its last reference here, which is
+	/// what makes retention free: the file GC reaps it on its next sweep.
+	async fn publish_site_doc(&self, tn_id: TnId, publish: &PublishSiteDoc<'_>) -> ClResult<()>;
+
+	/// Swap the row's two generation columns, putting `previous_file_id` back in
+	/// service and demoting the container that was live. `Ok(false)` means there
+	/// was nothing to roll back — no row, or a row that has only ever been
+	/// published once.
+	///
+	/// One statement for the same reason [`Self::publish_site_doc`] is: a
+	/// read-modify-write would let a concurrent publish and rollback read the same pair and
+	/// lose a generation. The swap is symmetric, so it is its own inverse.
+	///
+	/// Neither container is unreferenced afterwards, so nothing becomes reapable.
+	async fn rollback_site_doc(&self, tn_id: TnId, doc_file_id: &str) -> ClResult<bool>;
+
+	/// Create or repath one document's mount row without touching either
+	/// generation column. This is the settings page's write, and it is what makes
+	/// a row exist before the document has ever published.
+	async fn upsert_site_mount(&self, tn_id: TnId, mount: &UpsertSiteMount<'_>) -> ClResult<()>;
+
+	/// Remove a document from the site entirely. `Ok(false)` when there was no
+	/// such row.
+	///
+	/// Unconditional: a published row goes too, and its two generations lose their last
+	/// reference exactly as a displaced generation does on publish — `GcTask` reaps them.
+	/// Refusing would leave a published document permanently unremovable, since nothing in
+	/// the site API unpublishes one.
+	async fn delete_site_mount(&self, tn_id: TnId, doc_file_id: &str) -> ClResult<bool>;
 
 	// Address book / contact management
 	//***********************************

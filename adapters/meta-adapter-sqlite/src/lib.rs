@@ -18,6 +18,7 @@ mod schema;
 mod search;
 mod setting;
 mod share;
+mod site;
 mod tag;
 mod task;
 mod tenant;
@@ -38,11 +39,12 @@ use cloudillo_types::{
 		FileVariant, FileView, FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
 		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
 		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
-		ProfileData, PublicProfileRow, PushSubscription, PushSubscriptionData, RefData,
-		SearchObject, SearchOptions, SearchPart, SearchRow, ShareEntry, SpaceReport, Task,
-		TaskPatch, Tenant, TenantListMeta, UpdateActionDataOptions, UpdateAddressBookData,
-		UpdateCalendarData, UpdateFileOptions, UpdateRefOptions, UpdateShareEntryOptions,
-		UpdateTenantData, UpsertDocFormat, UpsertProfileFields, UpsertResult,
+		ProfileData, PublicProfileRow, PublishSiteDoc, PushSubscription, PushSubscriptionData,
+		RefData, SearchObject, SearchOptions, SearchPart, SearchRow, ShareEntry, Site, SiteDoc,
+		SpaceReport, Task, TaskPatch, Tenant, TenantListMeta, UpdateActionDataOptions,
+		UpdateAddressBookData, UpdateCalendarData, UpdateFileOptions, UpdateRefOptions,
+		UpdateShareEntryOptions, UpdateTenantData, UpsertDocFormat, UpsertProfileFields,
+		UpsertResult, UpsertSite,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -770,6 +772,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		installed_app::list(&self.dbr, tn_id, search).await
 	}
 
+	async fn is_installed_app_file(&self, tn_id: TnId, file_id: &str) -> ClResult<bool> {
+		installed_app::is_installed_file(&self.dbr, tn_id, file_id).await
+	}
+
 	async fn get_installed_app(
 		&self,
 		tn_id: TnId,
@@ -799,10 +805,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		tn_id: TnId,
 		obj_tp: char,
 		obj_id: &str,
-		part: Option<&SearchPart<'_>>,
+		parts: &[SearchPart<'_>],
 		fts_cl: bool,
 	) -> ClResult<()> {
-		search::replace_row(&self.db, tn_id, obj_tp, obj_id, part, fts_cl).await
+		search::replace_row(&self.db, tn_id, obj_tp, obj_id, parts, fts_cl).await
 	}
 
 	async fn delete_search_object(&self, tn_id: TnId, obj_tp: char, obj_id: &str) -> ClResult<()> {
@@ -871,6 +877,61 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn delete_doc_format(&self, tn_id: TnId, content_type: &str) -> ClResult<()> {
 		doc_format::delete(&self.db, tn_id, content_type).await
+	}
+
+	// Site builder
+	//**************
+
+	async fn read_site(&self, tn_id: TnId) -> ClResult<Option<Site>> {
+		site::read(&self.dbr, tn_id).await
+	}
+
+	async fn upsert_site(&self, tn_id: TnId, data: &UpsertSite<'_>) -> ClResult<()> {
+		site::upsert(&self.db, tn_id, data).await
+	}
+
+	async fn read_site_doc(&self, tn_id: TnId, doc_file_id: &str) -> ClResult<Option<SiteDoc>> {
+		site::read_doc(&self.dbr, tn_id, doc_file_id).await
+	}
+
+	async fn read_site_doc_by_mount(
+		&self,
+		tn_id: TnId,
+		mount_path: &str,
+	) -> ClResult<Option<SiteDoc>> {
+		site::read_doc_by_mount(&self.dbr, tn_id, mount_path).await
+	}
+
+	async fn read_site_doc_by_published_mount(
+		&self,
+		tn_id: TnId,
+		mount_path: &str,
+	) -> ClResult<Option<SiteDoc>> {
+		site::read_doc_by_published_mount(&self.dbr, tn_id, mount_path).await
+	}
+
+	async fn list_site_docs(&self, tn_id: TnId) -> ClResult<Vec<SiteDoc>> {
+		site::list_docs(&self.dbr, tn_id).await
+	}
+
+	async fn publish_site_doc(&self, tn_id: TnId, publish: &PublishSiteDoc<'_>) -> ClResult<()> {
+		site::publish_doc(&self.db, tn_id, publish).await
+	}
+
+	async fn rollback_site_doc(&self, tn_id: TnId, doc_file_id: &str) -> ClResult<bool> {
+		site::rollback_doc(&self.db, tn_id, doc_file_id).await
+	}
+
+	async fn upsert_site_mount(
+		&self,
+		tn_id: TnId,
+		mount: &cloudillo_types::meta_adapter::UpsertSiteMount<'_>,
+	) -> ClResult<()> {
+		site::upsert_mount(&self.db, tn_id, mount).await
+	}
+
+	async fn delete_site_mount(&self, tn_id: TnId, doc_file_id: &str) -> ClResult<bool> {
+		site::delete_mount(&self.db, tn_id, doc_file_id).await
 	}
 
 	// Address book / contact management

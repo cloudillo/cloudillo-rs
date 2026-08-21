@@ -255,6 +255,11 @@ const TENANT_CASCADE_TABLES: &[&str] = &[
 	"calendars",
 	"calendar_objects",
 	"doc_formats",
+	"sites",
+	// Beyond the orphaned rows: `file::…` joins `site_docs` for GC reachability,
+	// so a purged tenant's published containers would stay referenced and never
+	// be reaped.
+	"site_docs",
 	// `search_fts` is absent because the `search_docs_ad` trigger clears it as
 	// `search_docs` rows go; `search_fts_cl` because it is contentless, has no
 	// trigger, and is cleared by `search::purge_tenant_contentless` below. Their

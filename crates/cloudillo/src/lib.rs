@@ -56,6 +56,7 @@ pub use cloudillo_proxy as proxy;
 pub use cloudillo_push as push;
 pub use cloudillo_ref as r#ref;
 pub use cloudillo_rtdb as rtdb;
+pub use cloudillo_site as site;
 
 // Local modules
 pub mod app;

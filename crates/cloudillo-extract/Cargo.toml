@@ -1,0 +1,23 @@
+[package]
+name = "cloudillo-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Text and metadata extraction from stored content for the Cloudillo platform"
+keywords = ["cloudillo", "extract", "html", "text", "indexing"]
+categories = ["text-processing"]
+readme = "../../README.md"
+
+[dependencies]
+cloudillo-types = { workspace = true }
+
+# Streaming tokenizer, no DOM allocation. Its `TextType` is what lets script and
+# style content be skipped as a property of the tokenizer rather than by a tag
+# list this crate would have to keep in step with the serializer.
+lol_html = "2"
+
+[lints]
+workspace = true

@@ -89,6 +89,7 @@ pub(super) fn init(app: App) -> Router<App> {
 				.merge(tables::pim::calendars())
 				.merge(tables::misc::push_subscriptions())
 				.merge(tables::search::reindex())
+				.merge(tables::site::config())
 				.layer(middleware::from_fn(require_leader)),
 		)
 		// Auth only — handler self-enforces ownership

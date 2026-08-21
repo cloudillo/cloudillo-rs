@@ -34,6 +34,10 @@ pub struct Config {
 	pub priv_data_dir: PathBuf,
 	pub pub_data_dir: PathBuf,
 	pub dist_dir: PathBuf,
+	/// Version stamping the shell's asset directory, for the `/assets-<version>/…`
+	/// links the site wrapper composes. Unset means "the same version as this
+	/// build", which is what a normal release is.
+	pub shell_version: Option<String>,
 	pub acme_email: Option<String>,
 	pub local_address: Vec<String>,
 	pub db_dir: PathBuf,
@@ -74,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		pub_data_dir: env::var("PUBLIC_DATA_DIR")
 			.map_or_else(|_| PathBuf::from("./data"), PathBuf::from),
 		dist_dir: env::var("DIST_DIR").map_or_else(|_| PathBuf::from("./dist"), PathBuf::from),
+		shell_version: env::var("SHELL_VERSION").ok().filter(|v| !v.trim().is_empty()),
 		acme_email: env::var("ACME_EMAIL").ok(),
 		local_address: env::var("LOCAL_ADDRESS")
 			.ok()
@@ -143,6 +148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}
 	if let Some(base_password) = config.base_password {
 		cloudillo.base_password(base_password);
+	}
+	if let Some(shell_version) = config.shell_version {
+		cloudillo.shell_version(shell_version);
 	}
 	if let Some(acme_email) = config.acme_email {
 		cloudillo.acme_email(acme_email);

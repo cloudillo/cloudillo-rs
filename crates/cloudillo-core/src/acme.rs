@@ -402,7 +402,28 @@ impl Task<App> for CertRenewalTask {
 		if !tenants.is_empty() {
 			info!("Found {} tenant(s) needing certificate renewal", tenants.len());
 			for row in tenants {
-				let app_domain: Option<&str> = None; // No custom domain support yet
+				// Recover the tenant's custom app domain from the cert row issuance wrote
+				// it into (`renew_tenant` stores `app_domain.unwrap_or(id_tag)` as
+				// `domain`), so a renewal covers the same names as the issuance.
+				//
+				// Only `Error::NotFound` is the bootstrap case. Renewing with `None` after
+				// a transient failure would write the id_tag back into `certs.domain` —
+				// the only place this task recovers the app domain from — losing the custom
+				// domain permanently and taking the published site off it with it. Skipping
+				// the run costs a retry; getting it wrong costs the domain.
+				let cert_domain: Option<Box<str>> =
+					match app.auth_adapter.read_cert_by_id_tag(&row.id_tag).await {
+						Ok(cert) if cert.domain != row.id_tag => Some(cert.domain),
+						// No custom domain, or no cert row yet: the bootstrap case.
+						Ok(_) | Err(Error::NotFound) => None,
+						Err(e) => {
+							warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
+								"Skipping ACME renewal this run: cannot read the cert row, \
+								 and renewing without it would overwrite a custom app domain");
+							continue;
+						}
+					};
+				let app_domain: Option<&str> = cert_domain.as_deref();
 				let domains = build_domains_for_tenant(&row.id_tag, app_domain);
 
 				match check_domains_dns(&domains, &app.opts.local_address, &resolver).await {
@@ -669,6 +690,16 @@ pub async fn handle_renewal_success(
 		warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
 			"on_first_cert_issued hook failed");
 	}
+
+	// Unconditional, because both halves of a renewal can move the site cache entry: the
+	// un-suspend above brings the site back, and a changed `certs.domain` re-keys the
+	// entry onto another host. Neither is a column patch. This runs at most once per
+	// tenant per nightly renewal and does open every mounted container — affordable off
+	// the request path, and a stale entry serves the wrong host until a restart.
+	if let Err(e) = crate::reload_site_cache_for_tenant(app, row.tn_id).await {
+		warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
+			"Failed to reload the site cache after renewal");
+	}
 }
 
 async fn handle_renewal_failure(app: &App, row: &TenantCertRenewalRow, reason: &str) {
@@ -692,9 +723,17 @@ async fn handle_renewal_failure(app: &App, row: &TenantCertRenewalRow, reason: &
 
 	// Suspend the tenant once the cert is past expiry (or absent). Flipping an
 	// already-suspended tenant to 'S' is a no-op; we never downgrade here.
-	if already_expired && let Err(e) = app.auth_adapter.update_tenant_status(row.tn_id, 'S').await {
-		warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
-			"Failed to mark tenant suspended");
+	if already_expired {
+		if let Err(e) = app.auth_adapter.update_tenant_status(row.tn_id, 'S').await {
+			warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
+				"Failed to mark tenant suspended");
+		// This is what actually takes a suspended tenant's published site off the air:
+		// the cache is push-triggered and never polled, so without it the site keeps
+		// serving until the process restarts. Non-fatal — the status write is committed.
+		} else if let Err(e) = crate::reload_site_cache_for_tenant(app, row.tn_id).await {
+			warn!(tn_id = %row.tn_id.0, id_tag = %row.id_tag, error = %e,
+				"Failed to drop the site cache entry after suspending");
+		}
 	}
 
 	let should_notify = should_notify(row, now, days_until_expiry);

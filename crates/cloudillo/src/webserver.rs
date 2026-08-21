@@ -312,12 +312,7 @@ pub async fn create_https_server(
 /// parameterised DB lookup key; the SSRF-sensitive outbound side
 /// (`cloudillo_core::request::Request::host_for`) keeps `validate_id_tag`.
 fn api_id_tag_from_host(host: &str) -> Option<Box<str>> {
-	let host = match host.rsplit_once(':') {
-		Some((base, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => base,
-		_ => host,
-	};
-	let host = host.strip_suffix('.').unwrap_or(host);
-	let id_tag = host.strip_prefix("cl-o.")?;
+	let id_tag = cloudillo_types::validation::strip_host_port(host).strip_prefix("cl-o.")?;
 	cloudillo_types::validation::canonicalize_dns_host(id_tag)
 		.ok()
 		.map(|id_tag| Box::from(id_tag.as_ref()))

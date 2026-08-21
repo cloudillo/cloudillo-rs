@@ -153,6 +153,10 @@ struct NewAction<'a> {
 /// hidden one. Managed files are the cached peer avatars, `'P'`-visible by
 /// construction, so indexing them would expose the tenant's contact graph to an
 /// unauthenticated search.
+///
+/// Deliberately narrower in one place: a *live published site container* is managed but
+/// exempt, judged by `objects::is_live_site_indexable`. Restating that here would mean
+/// restating `site_docs` liveness, and no fixture in this file publishes a site.
 async fn index_file(adapter: &MetaAdapterSqlite, tn_id: TnId, file_id: &str, fts_cl: bool) {
 	let file = adapter.read_file(tn_id, file_id).await.expect("read file").filter(|f| {
 		f.parent_id.as_deref() != Some(TRASH_PARENT_ID)
@@ -167,7 +171,7 @@ async fn index_file(adapter: &MetaAdapterSqlite, tn_id: TnId, file_id: &str, fts
 		..Default::default()
 	});
 	adapter
-		.replace_search_row(tn_id, 'F', file_id, part.as_ref(), fts_cl)
+		.replace_search_row(tn_id, 'F', file_id, part.as_slice(), fts_cl)
 		.await
 		.expect("index file");
 }
@@ -191,7 +195,7 @@ async fn index_profile(adapter: &MetaAdapterSqlite, tn_id: TnId, id_tag: &str, f
 		..Default::default()
 	});
 	adapter
-		.replace_search_row(tn_id, 'P', id_tag, part.as_ref(), fts_cl)
+		.replace_search_row(tn_id, 'P', id_tag, part.as_slice(), fts_cl)
 		.await
 		.expect("index profile");
 }
@@ -212,7 +216,7 @@ async fn index_action(adapter: &MetaAdapterSqlite, tn_id: TnId, action_id: &str,
 		.map(ToOwned::to_owned);
 	let part = body.as_ref().map(|b| SearchPart { body: Some(b), ..Default::default() });
 	adapter
-		.replace_search_row(tn_id, 'A', action_id, part.as_ref(), fts_cl)
+		.replace_search_row(tn_id, 'A', action_id, part.as_slice(), fts_cl)
 		.await
 		.expect("index action");
 }
@@ -890,7 +894,7 @@ both_modes! {
 		// caller's read and the index run.
 		let part = SearchPart { title: Some("kiserteties"), ..Default::default() };
 		adapter
-			.replace_search_row(tn_id, 'F', "f1~ghost", Some(&part), fts_cl)
+			.replace_search_row(tn_id, 'F', "f1~ghost", std::slice::from_ref(&part), fts_cl)
 			.await
 			.expect("index ghost");
 		assert!(
@@ -2955,7 +2959,7 @@ both_modes! {
 				..Default::default()
 			};
 			adapter
-				.replace_search_row(tn_id, 'F', "f1~note", Some(&part), fts_cl)
+				.replace_search_row(tn_id, 'F', "f1~note", std::slice::from_ref(&part), fts_cl)
 				.await
 				.expect("index file");
 		};
@@ -2981,23 +2985,302 @@ both_modes! {
 	}
 }
 
+// ── `'F'` parts ──
+//
+// A static file's addressable pieces — a site container's pages, a PDF's pages — get
+// their own `search_docs` rows, `obj_tp = 'F'` with a non-empty `part_id`. So
+// `replace_search_row` addresses two disjoint row spaces for one object, and one slice
+// carries both: replaced together, in one transaction, with no caller-supplied ACL.
+
+/// The file name `create_doc_file` gives every file it makes, and so the title of
+/// the metadata part the indexer builds from that row.
+const DOC_FILE_NAME: &str = "Jegyzet";
+
+/// Index a container the way the file indexer does: **one** slice, the metadata
+/// part first and then one part per addressable piece — for a site, its published
+/// pages, keyed by published path.
+async fn index_file_parts(
+	adapter: &MetaAdapterSqlite,
+	tn_id: TnId,
+	file_id: &str,
+	pages: &[(&str, &str)],
+	fts_cl: bool,
+) {
+	let parts: Vec<SearchPart> =
+		std::iter::once(SearchPart { title: Some(DOC_FILE_NAME), ..Default::default() })
+			.chain(pages.iter().map(|&(path, body)| SearchPart {
+				part_id: path,
+				body: Some(body),
+				..Default::default()
+			}))
+			.collect();
+	adapter
+		.replace_search_row(tn_id, 'F', file_id, &parts, fts_cl)
+		.await
+		.expect("index file parts");
+}
+
+/// The part rows of one `'F'` object, as
+/// `(part_id, content_type, owner_tag, visibility, root_id)`.
+async fn part_acl_rows(
+	db: &sqlx::SqlitePool,
+	tn_id: TnId,
+	obj_id: &str,
+) -> Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>)> {
+	sqlx::query_as(
+		"SELECT part_id, content_type, owner_tag, visibility, root_id FROM search_docs \
+		 WHERE tn_id = ? AND obj_tp = 'F' AND obj_id = ? AND part_id <> '' ORDER BY part_id",
+	)
+	.bind(tn_id.0)
+	.bind(obj_id)
+	.fetch_all(db)
+	.await
+	.expect("read part acl columns")
+}
+
 #[tokio::test]
-async fn replace_search_row_rejects_part_level_fields() {
+async fn replace_search_row_rejects_mixed_and_non_file_parts() {
 	let (adapter, _dir) = create_test_adapter().await;
 	let tn_id = TnId(1);
 	adapter.create_tenant(tn_id, "alice").await.ok();
 	create_doc_file(&adapter, tn_id, "f1~note", None).await;
 
-	for part in [
-		SearchPart { part_id: "p1", title: Some("cim"), ..Default::default() },
-		SearchPart { parent_part: Some("p1"), title: Some("cim"), ..Default::default() },
-		SearchPart { anchor_id: Some("b1"), title: Some("cim"), ..Default::default() },
+	for parts in [
+		// `SEARCH_COLS` has no `parent_part`/`anchor_id` column on the whole-object
+		// row, so passing either must reject rather than be silently dropped.
+		vec![SearchPart { parent_part: Some("p1"), title: Some("cim"), ..Default::default() }],
+		vec![SearchPart { anchor_id: Some("b1"), title: Some("cim"), ..Default::default() }],
+		// One call writes one whole-object row.
+		vec![
+			SearchPart { title: Some("cim"), ..Default::default() },
+			SearchPart { title: Some("masik"), ..Default::default() },
+		],
+		// The whole-object part leads the slice; a second empty `part_id` after a
+		// page means something the row space cannot express.
+		vec![
+			SearchPart { part_id: "/rolunk", title: Some("oldal"), ..Default::default() },
+			SearchPart { title: Some("cim"), ..Default::default() },
+		],
 	] {
 		let err = adapter
-			.replace_search_row(tn_id, 'F', "f1~note", Some(&part), false)
+			.replace_search_row(tn_id, 'F', "f1~note", &parts, false)
 			.await
-			.expect_err("part-level fields must be rejected, not silently dropped");
+			.expect_err("an ambiguous or unwritable part slice must be rejected");
 		assert!(matches!(err, Error::ValidationError(_)), "got {err:?}");
+	}
+
+	// Only static files have parts. A profile and an action have no addressable
+	// pieces, and a live document's parts go through `replace_search_object`.
+	let part = SearchPart { part_id: "/rolunk", title: Some("cim"), ..Default::default() };
+	for obj_tp in ['P', 'A', 'D'] {
+		let err = adapter
+			.replace_search_row(tn_id, obj_tp, "f1~note", std::slice::from_ref(&part), false)
+			.await
+			.expect_err("only 'F' objects carry parts");
+		assert!(matches!(err, Error::ValidationError(_)), "got {err:?}");
+	}
+}
+
+/// `idx_search_docs_key` is UNIQUE on `(tn_id, obj_tp, obj_id, part_id)` and the part
+/// insert carries no `ON CONFLICT`, so two parts on one `part_id` cannot both be written.
+/// Two site pages that slugify to one path are exactly that slice — the manifest is
+/// publisher-written — and it must come back named rather than as an opaque `DbError`,
+/// leaving the file's existing rows alone.
+#[tokio::test]
+async fn replace_search_row_rejects_a_repeated_part_id() {
+	let (adapter, dir) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.ok();
+	let db = probe(&dir).await;
+	create_doc_file(&adapter, tn_id, "f1~note", None).await;
+
+	index_file_parts(
+		&adapter,
+		tn_id,
+		"f1~note",
+		&[("/", "kezdolap"), ("/rolunk", "rolunk")],
+		false,
+	)
+	.await;
+	let before = part_acl_rows(&db, tn_id, "f1~note").await;
+	assert_eq!(before.len(), 2);
+
+	let parts = vec![
+		SearchPart { title: Some(DOC_FILE_NAME), ..Default::default() },
+		SearchPart { part_id: "/rolunk", body: Some("egyik"), ..Default::default() },
+		SearchPart { part_id: "/rolunk", body: Some("masik"), ..Default::default() },
+	];
+	let err = adapter
+		.replace_search_row(tn_id, 'F', "f1~note", &parts, false)
+		.await
+		.expect_err("two parts on one part_id must be rejected");
+	assert!(matches!(err, Error::ValidationError(_)), "got {err:?}");
+
+	assert_eq!(part_acl_rows(&db, tn_id, "f1~note").await, before, "the rejected call wrote");
+	assert_indexes_intact(&db).await;
+}
+
+both_modes! {
+	/// The part set is replaced whole, so a page dropped from the site stops being
+	/// searchable at the next publish rather than lingering as an orphan —
+	/// "unpublished" is a real operation, not an absence nobody acts on.
+	async fn an_f_part_absent_from_the_new_set_is_dropped(fts_cl: bool) {
+		let (adapter, dir) = create_test_adapter().await;
+		let tn_id = TnId(1);
+		adapter.create_tenant(tn_id, "alice").await.ok();
+		let db = probe(&dir).await;
+
+		create_doc_file(&adapter, tn_id, "f1~site", None).await;
+		index_file_parts(
+			&adapter,
+			tn_id,
+			"f1~site",
+			&[("/", "kezdolap szoveg"), ("/rolunk", "bemutatkozas")],
+			fts_cl,
+		)
+		.await;
+		assert_eq!(find(&adapter, tn_id, "bemutatkozas", fts_cl).await.len(), 1);
+
+		index_file_parts(&adapter, tn_id, "f1~site", &[("/", "kezdolap szoveg")], fts_cl).await;
+
+		assert!(
+			find(&adapter, tn_id, "bemutatkozas", fts_cl).await.is_empty(),
+			"an unpublished page must stop being searchable"
+		);
+		let hits = find(&adapter, tn_id, "kezdolap", fts_cl).await;
+		assert_eq!(hits.len(), 1, "the page still in the set must survive");
+		assert_eq!(hits[0].obj_tp, 'F');
+		assert_eq!(&*hits[0].part_id, "/", "the site path is the part id");
+		assert_indexes_intact(&db).await;
+	}
+}
+
+both_modes! {
+	/// Every ACL column on an `'F'` part comes from the container's `files` row.
+	///
+	/// `SearchPart` carries no ACL field, so `refresh_file_acl` (and
+	/// `fill_part_created_at` for `created_at`) is the only thing that can give one a
+	/// value — index and source cannot disagree about who may see a hit. `root_id` is
+	/// plain `files.root_id`, so a file-scoped share token prefilters a part exactly as it
+	/// prefilters the file.
+	async fn f_part_acl_columns_come_from_the_container_file_row(fts_cl: bool) {
+		let (adapter, dir) = create_test_adapter().await;
+		let tn_id = TnId(1);
+		adapter.create_tenant(tn_id, "alice").await.ok();
+		let db = probe(&dir).await;
+
+		create_doc_file(&adapter, tn_id, "f1~site", Some("bob.example")).await;
+		index_file_parts(&adapter, tn_id, "f1~site", &[("/", "kezdolap szoveg")], fts_cl).await;
+
+		let rows = part_acl_rows(&db, tn_id, "f1~site").await;
+		assert_eq!(rows.len(), 1);
+		let (part_id, content_type, owner_tag, visibility, root_id) = &rows[0];
+		assert_eq!(part_id, "/");
+		assert_eq!(content_type.as_deref(), Some("application/x-notillo"));
+		assert_eq!(owner_tag.as_deref(), Some("bob.example"));
+		assert_eq!(visibility.as_deref(), Some("P"));
+		assert_eq!(root_id.as_deref(), None, "an 'F' part must not resolve root_id");
+
+		// A republish that changed no text takes the hash short-circuit, which
+		// skips the upsert but must still re-derive — it is then the only statement
+		// that carries a visibility flip onto the part rows.
+		sqlx::query("UPDATE files SET visibility = 'D' WHERE tn_id = ? AND file_id = ?")
+			.bind(tn_id.0)
+			.bind("f1~site")
+			.execute(&db)
+			.await
+			.expect("flip visibility");
+		index_file_parts(&adapter, tn_id, "f1~site", &[("/", "kezdolap szoveg")], fts_cl).await;
+
+		let rows = part_acl_rows(&db, tn_id, "f1~site").await;
+		assert_eq!(rows[0].3.as_deref(), Some("D"), "the hash short-circuit skipped the derive");
+		// `find` is the tenant-owner search (`visible_levels: None`), which is
+		// unfiltered and keeps seeing the row; an anonymous caller gets `['P']`.
+		let anon = SearchOptions { visible_levels: Some(vec!['P']), ..opts("kezdolap", fts_cl) };
+		assert!(
+			adapter.search(tn_id, &anon).await.expect("search").is_empty(),
+			"a page of a file no longer Public must drop out of an anonymous search"
+		);
+		assert_eq!(
+			find(&adapter, tn_id, "kezdolap", fts_cl).await.len(),
+			1,
+			"the owner keeps finding their own page"
+		);
+		assert_indexes_intact(&db).await;
+	}
+}
+
+both_modes! {
+	/// A file's metadata row and its parts are one slice and one replacement, so a write
+	/// can never land half of it. Dropping the page parts — what a container displaced out
+	/// of `published_file_id` produces — takes its pages out of the index and leaves the
+	/// container searchable by name.
+	async fn an_f_slice_carries_the_file_row_and_its_pages_together(fts_cl: bool) {
+		let (adapter, dir) = create_test_adapter().await;
+		let tn_id = TnId(1);
+		adapter.create_tenant(tn_id, "alice").await.ok();
+		let db = probe(&dir).await;
+
+		create_doc_file(&adapter, tn_id, "f1~site", None).await;
+		index_file_parts(&adapter, tn_id, "f1~site", &[("/", "kezdolap szoveg")], fts_cl).await;
+
+		assert_eq!(
+			find(&adapter, tn_id, DOC_FILE_NAME, fts_cl).await.len(),
+			1,
+			"the file's own row"
+		);
+		assert_eq!(find(&adapter, tn_id, "kezdolap", fts_cl).await.len(), 1, "the page row");
+		assert_eq!(part_acl_rows(&db, tn_id, "f1~site").await.len(), 1);
+
+		// The metadata part alone, and a changed title so this takes the
+		// delete-and-insert path rather than the short-circuit.
+		let part = SearchPart { title: Some("Atnevezett"), ..Default::default() };
+		adapter
+			.replace_search_row(tn_id, 'F', "f1~site", std::slice::from_ref(&part), fts_cl)
+			.await
+			.expect("reindex the container with no live pages");
+
+		assert_eq!(find(&adapter, tn_id, "Atnevezett", fts_cl).await.len(), 1);
+		assert!(
+			find(&adapter, tn_id, "kezdolap", fts_cl).await.is_empty(),
+			"a slice with no page parts drops the pages it replaces"
+		);
+		assert!(part_acl_rows(&db, tn_id, "f1~site").await.is_empty());
+		assert_indexes_intact(&db).await;
+	}
+}
+
+both_modes! {
+	/// With no `files` row there is no ACL to derive, so a part write becomes a delete —
+	/// the same postcondition the whole-object path keeps, and what stops a container
+	/// reaped between the caller's read and the index run leaving its pages searchable.
+	async fn an_f_part_write_with_no_source_row_is_a_delete(fts_cl: bool) {
+		let (adapter, dir) = create_test_adapter().await;
+		let tn_id = TnId(1);
+		adapter.create_tenant(tn_id, "alice").await.ok();
+		let db = probe(&dir).await;
+
+		create_doc_file(&adapter, tn_id, "f1~site", None).await;
+		index_file_parts(&adapter, tn_id, "f1~site", &[("/", "kezdolap szoveg")], fts_cl).await;
+		assert_eq!(find(&adapter, tn_id, "kezdolap", fts_cl).await.len(), 1);
+
+		sqlx::query("DELETE FROM files WHERE tn_id = ? AND file_id = ?")
+			.bind(tn_id.0)
+			.bind("f1~site")
+			.execute(&db)
+			.await
+			.expect("drop the source row");
+
+		// Identical parts, so the hash still matches — but the short-circuit is
+		// gated on the source row being there, and it is not.
+		index_file_parts(&adapter, tn_id, "f1~site", &[("/", "kezdolap szoveg")], fts_cl).await;
+
+		assert!(
+			find(&adapter, tn_id, "kezdolap", fts_cl).await.is_empty(),
+			"an index row must never outlive the source row it mirrors"
+		);
+		assert!(part_acl_rows(&db, tn_id, "f1~site").await.is_empty());
+		assert_indexes_intact(&db).await;
 	}
 }
 

@@ -21,12 +21,13 @@ use tokio::io::AsyncWriteExt;
 use crate::prelude::*;
 use crate::{
 	audio::AudioExtractorTask,
+	container::MAX_CONTAINER_BYTES,
 	descriptor::{self, FileIdGeneratorTask},
 	ffmpeg, filter, image,
 	image::ImageResizerTask,
 	pdf,
 	preset::{self, get_audio_tier, get_image_tier, get_video_tier, presets},
-	store, svg,
+	site_html, store, svg,
 	variant::{self, VariantClass},
 	video::VideoTranscoderTask,
 };
@@ -2391,6 +2392,39 @@ pub async fn post_file_blob(
 				"Raw upload streamed to {:?}, size: {} bytes, content id: {}",
 				temp_path, total_size, orig_blob_id
 			);
+
+			// A published site's fragments are served from the tenant's own app
+			// domain, under a CSP carrying `script-src 'unsafe-inline'` — so the
+			// allowlist is applied here, once, before the bytes reach blob storage.
+			// The guard above already owns the temp file, so a rejection cleans up.
+			if preset_name == "site" {
+				// The upload half of the bound `open_container` enforces on the read half.
+				// `max_streaming_bytes` comes from the tenant-settable
+				// `file.max_streaming_file_size_mb`, so without this a tenant can raise it
+				// past this ceiling and store a container that validates now and is
+				// permanently unopenable later, with no message naming the size.
+				if total_size > MAX_CONTAINER_BYTES {
+					return Err(Error::ValidationError(
+						"container exceeds the maximum readable size".into(),
+					));
+				}
+				// Read on the worker thread, not here: the whole container is held in
+				// memory to be parsed, and concurrent site uploads multiply that — it
+				// belongs on the bounded pool rather than on the request task.
+				let path = temp_path.clone();
+				let variant_id = orig_blob_id.clone();
+				app.worker
+					.run_slow(move || {
+						let data = std::fs::read(&path)?;
+						site_html::validate_site_container(&data, &variant_id)
+					})
+					.await
+					.map_err(|e| {
+						Error::Internal(format!(
+							"Worker pool failed validating the site container: {e}"
+						))
+					})??;
+			}
 
 			let f_id = app
 				.meta_adapter

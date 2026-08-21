@@ -136,6 +136,11 @@ impl Task<App> for TenantImageUpdaterTask {
 		// is the point where the data truly lands (the HTTP handler only schedules
 		// this task), so invalidating here covers both image types correctly.
 		app.profile_me.invalidate(self.tn_id);
+		// A published site caches its owner's picture, so the same write goes
+		// stale there too. Cover images are not part of that copy.
+		if matches!(self.image_type, TenantImageType::ProfilePic) {
+			crate::reload_site_cache_after_profile_change(app, self.tn_id).await;
+		}
 
 		info!("Updated tenant {} {:?} to {}", self.tn_id, self.image_type, file_id);
 		Ok(())
@@ -214,6 +219,9 @@ async fn put_tenant_image(
 				.await?;
 			if kind.invalidate_me() {
 				app.profile_me.invalidate(auth.tn_id);
+			}
+			if matches!(kind, TenantImageType::ProfilePic) {
+				crate::reload_site_cache_after_profile_change(&app, auth.tn_id).await;
 			}
 			info!("User {} uploaded {} (existing): {}", auth.id_tag, kind.log_label(), fid);
 			return Ok((

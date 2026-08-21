@@ -62,6 +62,7 @@ pub(crate) mod pim;
 pub(crate) mod profile;
 pub(crate) mod search;
 pub(crate) mod shared;
+pub(crate) mod site;
 pub(crate) mod websocket;
 
 /// Every table on the API surface, merged the way the compose sites merge them.
@@ -125,6 +126,7 @@ fn all_api_tables() -> axum::Router<crate::prelude::App> {
 		.merge(search::reindex())
 		.merge(search::doc_formats())
 		.merge(shared::well_known_dav())
+		.merge(site::config())
 		.merge(websocket::all())
 }
 
@@ -169,6 +171,7 @@ mod tests {
 			("profile", include_str!("profile.rs")),
 			("search", include_str!("search.rs")),
 			("shared", include_str!("shared.rs")),
+			("site", include_str!("site.rs")),
 			("websocket", include_str!("websocket.rs")),
 		];
 

@@ -1,0 +1,26 @@
+[package]
+name = "cloudillo-site"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Site builder for the Cloudillo platform — publishes a Notillo document as a public website"
+keywords = ["cloudillo", "site", "static-site", "publishing", "web"]
+categories = ["web-programming"]
+readme = "../../README.md"
+
+[dependencies]
+cloudillo-core = { workspace = true }
+cloudillo-file = { workspace = true }
+cloudillo-types = { workspace = true }
+
+axum = { version = "0.8", features = ["http2", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+
+[lints]
+workspace = true

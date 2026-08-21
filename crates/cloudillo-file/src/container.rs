@@ -7,9 +7,10 @@
 //! and serves individual files by wrapping raw deflate data in gzip envelope.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use lru::LruCache;
 
 use crate::prelude::*;
 
@@ -26,8 +27,34 @@ pub struct ZipEntryInfo {
 	pub crc32: u32,
 	/// Whether the entry uses deflate compression (vs stored)
 	pub is_deflated: bool,
-	/// MIME type inferred from file extension
-	pub content_type: Box<str>,
+	/// MIME type inferred from file extension. Every value `mime_from_path`
+	/// can return is a literal, so this costs no allocation per entry.
+	pub content_type: &'static str,
+}
+
+impl ZipEntryInfo {
+	/// Is this entry within the size this server will read at all?
+	///
+	/// The compressed size, because that is the one bound holding for **every** entry:
+	/// deflate does not meaningfully expand, so a compressed size past the cap means an
+	/// inflated size past it too, and a stored entry's two sizes are the same number.
+	/// Checking the declared *uncompressed* size would let a stored entry through.
+	///
+	/// Applied in `Container::read_raw`, which every reader of an entry's bytes goes
+	/// through.
+	pub fn within_read_limit(&self) -> bool {
+		self.compressed_size <= MAX_ENTRY_BYTES
+	}
+
+	/// May this entry go out as a gzip envelope around its stored deflate stream?
+	///
+	/// A stored entry has no deflate stream to wrap. A deflated one declaring more
+	/// than [`crate::MAX_ENTRY_BYTES`] is refused because nothing inflates on that path:
+	/// the declared size goes straight into the gzip trailer, so a 1 MiB stream
+	/// claiming 8 GiB would ship to any client that sent `Accept-Encoding: gzip`.
+	pub fn can_pass_through_gzip(&self) -> bool {
+		self.is_deflated && self.uncompressed_size <= MAX_ENTRY_BYTES
+	}
 }
 
 /// Parsed zip index for a container blob
@@ -35,63 +62,127 @@ pub struct ZipEntryInfo {
 pub struct ZipIndex {
 	/// Map from normalized file path to entry metadata
 	pub entries: HashMap<Box<str>, ZipEntryInfo>,
+	/// The `orig` variant id this index was parsed from — the blob its entries
+	/// live in. Cached alongside the index so a warm request never has to ask
+	/// the database how a fileId resolves to a variant.
+	pub variant_id: Box<str>,
 }
 
-/// Cache of parsed container indexes, keyed by blob_id
-#[derive(Debug, Default)]
+/// Default LRU capacity. An index holds parsed offsets only, never entry bytes: a few
+/// hundred entries × ~100 bytes ≈ 30 KB per container, so 128 indexes ≈ 4 MB. The `None`
+/// fallback is unreachable (128 is non-zero) but coded as `NonZeroUsize::MIN`.
+const DEFAULT_CAPACITY: NonZeroUsize = match NonZeroUsize::new(128) {
+	Some(n) => n,
+	None => NonZeroUsize::MIN,
+};
+
+/// Concurrent **cold** container loads allowed across the whole process.
+///
+/// A cold load holds a whole blob in memory — up to [`MAX_CONTAINER_BYTES`] — on an
+/// unauthenticated path, so without a cap the peak is a client's to choose.
+/// `loading_gate` collapses a burst on *one* container; this bounds how many distinct
+/// ones are in flight. Warm opens never touch it.
+const MAX_CONCURRENT_LOADS: usize = 4;
+
+/// Cache of parsed container indexes, keyed by the container's **fileId**.
+///
+/// A fileId is a hash of the file descriptor, so it names one immutable `orig` blob for
+/// all time and a key is never reused. Keying here rather than by variant id lets a warm
+/// request skip the `files JOIN file_variants` lookup entirely: the variant id rides
+/// inside the cached [`ZipIndex`].
+///
+/// A file that has not been finalised is addressed as `@<f_id>`, and that id is
+/// **mutable** — `open_container` bypasses the cache for those.
+///
+/// LRU-bounded: every publish that changes bytes mints a new fileId, so an unbounded map
+/// would grow by one index per publish and never shed one. Eviction needs no
+/// invalidation — a miss just re-reads and re-parses the blob.
+///
+/// Uses `parking_lot::Mutex` (no poisoning) because `LruCache::get` mutates recency
+/// state. The guard is never held across an await.
+#[derive(Debug)]
 pub struct ContainerCache {
-	entries: RwLock<HashMap<Box<str>, Arc<ZipIndex>>>,
+	entries: parking_lot::Mutex<LruCache<Box<str>, Arc<ZipIndex>>>,
+	/// One gate per container being loaded, so N concurrent cold requests for one
+	/// container cost one blob read and one parse instead of N. See
+	/// [`ContainerCache::loading_gate`].
+	loading: parking_lot::Mutex<HashMap<Box<str>, Arc<tokio::sync::Mutex<()>>>>,
+	/// Permits for a cold load. See [`MAX_CONCURRENT_LOADS`].
+	loads: tokio::sync::Semaphore,
+}
+
+impl Default for ContainerCache {
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl ContainerCache {
 	pub fn new() -> Self {
-		Self { entries: RwLock::new(HashMap::new()) }
+		Self::with_capacity(DEFAULT_CAPACITY)
 	}
 
-	/// Get a cached zip index, or load the blob and parse it on cache miss
+	pub fn with_capacity(capacity: NonZeroUsize) -> Self {
+		Self {
+			entries: parking_lot::Mutex::new(LruCache::new(capacity)),
+			loading: parking_lot::Mutex::new(HashMap::new()),
+			loads: tokio::sync::Semaphore::new(MAX_CONCURRENT_LOADS),
+		}
+	}
+
+	/// The gate a cold open holds while it reads the blob and parses the index.
 	///
-	/// The `load_blob` closure is only called if the index is not cached,
-	/// avoiding full-blob reads for subsequent requests.
-	pub async fn get_or_parse_with<F, Fut>(
-		&self,
-		blob_id: &str,
-		load_blob: F,
-	) -> ClResult<Arc<ZipIndex>>
-	where
-		F: FnOnce() -> Fut,
-		Fut: std::future::Future<Output = ClResult<Box<[u8]>>>,
-	{
-		// Fast path: check read lock
-		{
-			let cache = self.entries.read().await;
-			if let Some(index) = cache.get(blob_id) {
-				return Ok(Arc::clone(index));
-			}
-		}
+	/// Everyone asking for the same container waits on the same gate and finds the index
+	/// in the cache when it opens, so a burst of concurrent first requests costs one blob
+	/// read and one parse. That matters because the path reaching here is
+	/// **unauthenticated**, so N is whatever a client chooses.
+	///
+	/// A `tokio::sync::Mutex` because the guard is held across an await; the map around it
+	/// is the sync one, and is never held across one.
+	///
+	/// Gates nothing waits on any more are swept here rather than released by the winner,
+	/// which would have to release on every error path out of the load.
+	pub fn loading_gate(&self, file_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+		let mut map = self.loading.lock();
+		map.retain(|_, gate| Arc::strong_count(gate) > 1);
+		Arc::clone(
+			map.entry(file_id.into())
+				.or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+		)
+	}
 
-		// Cache miss: load blob and parse
-		let blob_data = load_blob().await?;
-		let index = Arc::new(parse_zip_index(&blob_data)?);
+	/// A permit for one cold load, awaited before the blob read. See
+	/// [`MAX_CONCURRENT_LOADS`].
+	pub async fn load_permit(&self) -> ClResult<tokio::sync::SemaphorePermit<'_>> {
+		self.loads
+			.acquire()
+			.await
+			.map_err(|_| Error::Internal("Container load semaphore closed".into()))
+	}
 
-		// Re-check under write lock to avoid duplicate inserts (TOCTOU)
-		let mut cache = self.entries.write().await;
-		if let Some(existing) = cache.get(blob_id) {
-			return Ok(Arc::clone(existing));
-		}
-		cache.insert(blob_id.into(), Arc::clone(&index));
-		Ok(index)
+	/// Get a cached index by fileId. A hit also promotes it to most-recently-used.
+	pub fn get(&self, file_id: &str) -> Option<Arc<ZipIndex>> {
+		self.entries.lock().get(file_id).map(Arc::clone)
+	}
+
+	/// Store a parsed index under its container's fileId.
+	///
+	/// Two requests racing the same cold container would both parse and insert an equal
+	/// index — correct but wasteful on an unauthenticated path. [`Self::loading_gate`]
+	/// collapses the race to one read and one parse.
+	pub fn put(&self, file_id: &str, index: Arc<ZipIndex>) {
+		self.entries.lock().put(file_id.into(), index);
 	}
 
 	/// Invalidate a cached entry
 	#[allow(dead_code)]
-	pub async fn invalidate(&self, blob_id: &str) {
-		let mut cache = self.entries.write().await;
-		cache.remove(blob_id);
+	pub fn invalidate(&self, file_id: &str) {
+		self.entries.lock().pop(file_id);
 	}
 }
 
 /// Parse a zip file's central directory and build an index of entries
-fn parse_zip_index(data: &[u8]) -> ClResult<ZipIndex> {
+pub fn parse_zip_index(data: &[u8], variant_id: &str) -> ClResult<ZipIndex> {
 	let archive = rawzip::ZipArchive::from_slice(data).map_err(|e| {
 		error!("Failed to parse zip archive: {}", e);
 		Error::Internal(format!("Invalid zip archive: {e}"))
@@ -116,7 +207,21 @@ fn parse_zip_index(data: &[u8]) -> ClResult<ZipIndex> {
 		})?;
 		let path: &str = normalized.as_ref();
 
-		let is_deflated = matches!(entry.compression_method(), rawzip::CompressionMethod::DEFLATE);
+		// Only the two methods this reader can honour. Anything else — bzip2, zstd,
+		// lzma — would be indistinguishable from a stored entry downstream and get
+		// served byte for byte under its inferred `Content-Type`: garbage, silently.
+		let method = entry.compression_method();
+		let is_deflated = if method == rawzip::CompressionMethod::DEFLATE {
+			true
+		} else if method == rawzip::CompressionMethod::STORE {
+			false
+		} else {
+			// Left out of the index rather than failing the container: such an entry must
+			// never be served, but it must not take every other page of the site with it.
+			// A missing index entry is a 404 for that path alone.
+			warn!(%path, %method, "Skipping container entry with unsupported compression");
+			continue;
+		};
 
 		// Get the local entry to find data offset
 		let wayfinder = entry.wayfinder();
@@ -143,7 +248,7 @@ fn parse_zip_index(data: &[u8]) -> ClResult<ZipIndex> {
 		);
 	}
 
-	Ok(ZipIndex { entries })
+	Ok(ZipIndex { entries, variant_id: variant_id.into() })
 }
 
 /// Wrap raw deflate data in a gzip envelope.
@@ -175,19 +280,61 @@ pub fn wrap_in_gzip(deflate_data: &[u8], crc32: u32, uncompressed_size: u64) -> 
 	output
 }
 
-/// Decompress raw deflate data.
-pub fn inflate(deflate_data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+/// Largest entry this server will inflate out of a container.
+///
+/// A container entry is a page fragment, a manifest or a feed; nothing legitimate
+/// approaches this. Without a cap, `inflate` is an unauthenticated memory-exhaustion
+/// vector — the zip header's declared size is attacker-controlled.
+pub const MAX_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Largest container blob this server will open.
+///
+/// `open_container` reads the whole blob to parse its central directory, and uploads
+/// carry `DefaultBodyLimit::disable()`, so without this an unbounded upload becomes an
+/// unbounded allocation on an unauthenticated request. Well clear of any real container —
+/// a published document is fragments and media references, not the media itself.
+pub const MAX_CONTAINER_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Largest `_site/manifest.json` this server will parse.
+///
+/// Deliberately far below [`MAX_ENTRY_BYTES`]: the manifest is a page index, and
+/// deserializing it builds a `HashMap` plus a sorted `Vec` of everything in it.
+/// At 32 MB that is ~400k entries built on a worker thread for one page view.
+pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Below this, an entry inflates inline rather than on the worker pool.
+///
+/// A page fragment is a few kilobytes and the serve path is latency-critical, so a
+/// channel round trip per fragment would cost more than the inflate. Above it the work
+/// is worth a hop: [`MAX_ENTRY_BYTES`] of deflate is real CPU time.
+pub const INFLATE_INLINE_BYTES: u64 = 64 * 1024;
+
+/// Decompress raw deflate data, refusing anything past `max_output` bytes.
+pub fn inflate_bounded(deflate_data: &[u8], max_output: u64) -> Result<Vec<u8>, std::io::Error> {
 	use flate2::read::DeflateDecoder;
 	use std::io::Read;
 
-	let mut decoder = DeflateDecoder::new(deflate_data);
+	// One byte past the cap is read on purpose: it is what tells an entry that
+	// exactly fills the budget from one that overruns it.
+	let mut decoder = DeflateDecoder::new(deflate_data).take(max_output.saturating_add(1));
 	let mut output = Vec::new();
 	decoder.read_to_end(&mut output)?;
+	if output.len() as u64 > max_output {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"container entry exceeds the maximum inflated size",
+		));
+	}
 	Ok(output)
 }
 
+/// Decompress raw deflate data, up to [`MAX_ENTRY_BYTES`].
+pub fn inflate(deflate_data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+	inflate_bounded(deflate_data, MAX_ENTRY_BYTES)
+}
+
 /// Infer MIME type from file path extension
-fn mime_from_path(path: &str) -> Box<str> {
+fn mime_from_path(path: &str) -> &'static str {
 	let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
 	match ext.as_str() {
 		"html" | "htm" => "text/html; charset=utf-8",
@@ -211,7 +358,6 @@ fn mime_from_path(path: &str) -> Box<str> {
 		"map" => "application/json",
 		_ => "application/octet-stream",
 	}
-	.into()
 }
 
 /// Read the `cloudillo.json` manifest from zip data
@@ -261,11 +407,11 @@ mod tests {
 
 	#[test]
 	fn test_mime_from_path() {
-		assert_eq!(&*mime_from_path("index.html"), "text/html; charset=utf-8");
-		assert_eq!(&*mime_from_path("app.js"), "application/javascript; charset=utf-8");
-		assert_eq!(&*mime_from_path("style.css"), "text/css; charset=utf-8");
-		assert_eq!(&*mime_from_path("icon.svg"), "image/svg+xml");
-		assert_eq!(&*mime_from_path("unknown.xyz"), "application/octet-stream");
+		assert_eq!(mime_from_path("index.html"), "text/html; charset=utf-8");
+		assert_eq!(mime_from_path("app.js"), "application/javascript; charset=utf-8");
+		assert_eq!(mime_from_path("style.css"), "text/css; charset=utf-8");
+		assert_eq!(mime_from_path("icon.svg"), "image/svg+xml");
+		assert_eq!(mime_from_path("unknown.xyz"), "application/octet-stream");
 	}
 
 	#[test]
@@ -294,6 +440,136 @@ mod tests {
 		]);
 		assert_eq!(trailer_crc, crc);
 		assert_eq!(trailer_size, 5);
+	}
+
+	fn deflate(data: &[u8]) -> Vec<u8> {
+		use flate2::{Compression, write::DeflateEncoder};
+		use std::io::Write;
+
+		let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+		encoder.write_all(data).expect("deflate");
+		encoder.finish().expect("deflate finish")
+	}
+
+	fn info(compressed: u64, uncompressed: u64, is_deflated: bool) -> ZipEntryInfo {
+		ZipEntryInfo {
+			data_offset: 0,
+			compressed_size: compressed,
+			uncompressed_size: uncompressed,
+			crc32: 0,
+			is_deflated,
+			content_type: "text/plain",
+		}
+	}
+
+	/// The cap has to sit on the compressed size — the one number that bounds every
+	/// entry. On the inflate call it would miss a **stored** entry entirely.
+	#[test]
+	fn an_oversized_entry_is_refused_whether_or_not_it_is_deflated() {
+		let cap = MAX_ENTRY_BYTES;
+		assert!(info(cap, cap, false).within_read_limit());
+		assert!(info(cap, cap, true).within_read_limit());
+		assert!(!info(cap + 1, cap + 1, false).within_read_limit());
+		assert!(!info(cap + 1, cap * 100, true).within_read_limit());
+		// A header lying *downward* about the inflated size cannot buy a bigger
+		// read: the compressed size is what is checked.
+		assert!(!info(cap + 1, 10, true).within_read_limit());
+	}
+
+	/// Nothing inflates on the gzip pass-through — the declared size is copied straight
+	/// into the trailer — so an oversized entry is declined here, not bounded downstream.
+	#[test]
+	fn the_gzip_pass_through_declines_a_declared_size_past_the_cap() {
+		let cap = MAX_ENTRY_BYTES;
+		assert!(info(1024, cap, true).can_pass_through_gzip());
+		assert!(!info(1024, cap + 1, true).can_pass_through_gzip());
+		// A stored entry has no deflate stream to wrap, whatever its size.
+		assert!(!info(1024, 1024, false).can_pass_through_gzip());
+	}
+
+	/// A minimal one-entry zip, so the compression method in both headers is ours to
+	/// choose. `data` is stored verbatim: the method field is a claim, and what is under
+	/// test is whether the parser believes it.
+	fn one_entry_zip(method: u16, name: &str, data: &[u8]) -> Vec<u8> {
+		let name = name.as_bytes();
+		let size = u32::try_from(data.len()).expect("small");
+		let mut out = Vec::new();
+
+		// Local file header.
+		out.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+		out.extend_from_slice(&20_u16.to_le_bytes()); // version needed
+		out.extend_from_slice(&0_u16.to_le_bytes()); // flags
+		out.extend_from_slice(&method.to_le_bytes());
+		out.extend_from_slice(&0_u32.to_le_bytes()); // mod time + date
+		out.extend_from_slice(&0_u32.to_le_bytes()); // crc32
+		out.extend_from_slice(&size.to_le_bytes()); // compressed
+		out.extend_from_slice(&size.to_le_bytes()); // uncompressed
+		out.extend_from_slice(&u16::try_from(name.len()).expect("short").to_le_bytes());
+		out.extend_from_slice(&0_u16.to_le_bytes()); // extra len
+		out.extend_from_slice(name);
+		out.extend_from_slice(data);
+
+		// Central directory.
+		let cd_offset = u32::try_from(out.len()).expect("small");
+		out.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+		out.extend_from_slice(&20_u16.to_le_bytes()); // version made by
+		out.extend_from_slice(&20_u16.to_le_bytes()); // version needed
+		out.extend_from_slice(&0_u16.to_le_bytes()); // flags
+		out.extend_from_slice(&method.to_le_bytes());
+		out.extend_from_slice(&0_u32.to_le_bytes()); // mod time + date
+		out.extend_from_slice(&0_u32.to_le_bytes()); // crc32
+		out.extend_from_slice(&size.to_le_bytes()); // compressed
+		out.extend_from_slice(&size.to_le_bytes()); // uncompressed
+		out.extend_from_slice(&u16::try_from(name.len()).expect("short").to_le_bytes());
+		out.extend_from_slice(&0_u16.to_le_bytes()); // extra len
+		out.extend_from_slice(&0_u16.to_le_bytes()); // comment len
+		out.extend_from_slice(&0_u16.to_le_bytes()); // disk number
+		out.extend_from_slice(&0_u16.to_le_bytes()); // internal attrs
+		out.extend_from_slice(&0_u32.to_le_bytes()); // external attrs
+		out.extend_from_slice(&0_u32.to_le_bytes()); // local header offset
+		out.extend_from_slice(name);
+
+		// End of central directory.
+		let cd_size = u32::try_from(out.len()).expect("small") - cd_offset;
+		out.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
+		out.extend_from_slice(&0_u32.to_le_bytes()); // disk numbers
+		out.extend_from_slice(&1_u16.to_le_bytes()); // entries on this disk
+		out.extend_from_slice(&1_u16.to_le_bytes()); // entries total
+		out.extend_from_slice(&cd_size.to_le_bytes());
+		out.extend_from_slice(&cd_offset.to_le_bytes());
+		out.extend_from_slice(&0_u16.to_le_bytes()); // comment len
+		out
+	}
+
+	/// A method this reader cannot decode must not parse as *stored*, or its bytes go out
+	/// compressed under the `Content-Type` inferred from the name.
+	#[test]
+	fn a_compression_method_this_reader_cannot_honour_is_left_out_of_the_index() {
+		let stored = one_entry_zip(0, "index.html", b"<p>hi</p>");
+		let index = parse_zip_index(&stored, "v1").expect("stored parses");
+		let entry = index.entries.get("index.html").expect("entry");
+		assert!(!entry.is_deflated);
+
+		// 93 is zstd; 12 is bzip2. Neither has a decoder here.
+		for method in [93_u16, 12] {
+			let blob = one_entry_zip(method, "index.html", b"<p>hi</p>");
+			let index = parse_zip_index(&blob, "v1").expect("container still parses");
+			assert!(index.entries.is_empty(), "method {method}");
+		}
+	}
+
+	/// The declared uncompressed size comes off the zip header, so this cap is all that
+	/// stands between a crafted entry and the heap — and one that exactly fills the budget
+	/// is still legitimate.
+	#[test]
+	fn an_entry_that_inflates_past_the_cap_is_refused() {
+		let compressed = deflate(&vec![b'a'; 1024]);
+
+		let exact = inflate_bounded(&compressed, 1024).expect("at the cap");
+		assert_eq!(exact.len(), 1024);
+		assert!(inflate_bounded(&compressed, 2048).is_ok());
+		assert!(inflate_bounded(&compressed, 1023).is_err());
+		assert!(inflate_bounded(&compressed, 0).is_err());
 	}
 }
 

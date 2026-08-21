@@ -1562,6 +1562,8 @@ pub(crate) async fn list_files_by_parent(
 ///   `f.file_id` tokens and `@<f.f_id>` draft-time placeholders match.
 /// - `tenants.profile_pic`, `tenants.cover_pic` (this tenant).
 /// - `profiles.profile_pic` (cached remote profile images).
+/// - `site_docs.published_file_id`, `site_docs.previous_file_id` (the live and
+///   rollback generations of every published site container).
 ///
 /// MUST be updated when a new column names a file in the managed folder.
 pub(crate) async fn list_referenced_managed_fids(
@@ -1631,6 +1633,27 @@ pub(crate) async fn list_referenced_managed_fids(
 	.inspect_err(inspect)
 	.map_err(|_| Error::DbError)?;
 	for (f_id,) in profile_refs {
+		out.insert(f_id.cast_unsigned());
+	}
+
+	// 4. site_docs.published_file_id / previous_file_id (published site containers).
+	//    Both generations are plain scalar columns, so this is a plain join — the
+	//    reason the schema rejected a CSV `previous_file_ids` list. A NULL
+	//    `previous_file_id` needs no special case: `x IN (a, NULL)` is true when
+	//    x = a and NULL otherwise, and NULL filters out like false.
+	let site_docs_refs: Vec<(i64,)> = sqlx::query_as(
+		"SELECT DISTINCT f.f_id FROM files f
+		  JOIN site_docs d ON d.tn_id = f.tn_id
+		   AND f.file_id IN (d.published_file_id, d.previous_file_id)
+		 WHERE f.tn_id = ?1 AND f.parent_id = ?2",
+	)
+	.bind(tn_id.0)
+	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.fetch_all(db)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+	for (f_id,) in site_docs_refs {
 		out.insert(f_id.cast_unsigned());
 	}
 

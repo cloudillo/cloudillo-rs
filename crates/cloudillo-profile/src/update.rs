@@ -68,6 +68,9 @@ pub async fn patch_own_profile(
 	// `update_tenant` syncs `name` into the tenant's `profiles` row, which the index reads.
 	if !matches!(tenant_update.name, Patch::Undefined) {
 		cloudillo_core::search_index_profile(&app, tn_id, &auth.id_tag);
+		// A published site caches the owner's display name too. Only `name` is
+		// copied there, so an `x`-only patch needs no reload.
+		crate::reload_site_cache_after_profile_change(&app, tn_id).await;
 	}
 
 	// Fetch updated profile and tenant data (for x field)

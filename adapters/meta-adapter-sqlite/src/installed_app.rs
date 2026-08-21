@@ -136,6 +136,24 @@ pub async fn list(
 	Ok(apps)
 }
 
+/// Is this file the package of an installed, active app?
+///
+/// The read pool: it is on the container-serving path, which must not queue
+/// behind a write.
+pub async fn is_installed_file(db: &SqlitePool, tn_id: TnId, file_id: &str) -> ClResult<bool> {
+	let row = sqlx::query(
+		"SELECT 1 FROM installed_apps WHERE tn_id = ? AND file_id = ? AND status = 'A' LIMIT 1",
+	)
+	.bind(tn_id.0)
+	.bind(file_id)
+	.fetch_optional(db)
+	.await
+	.inspect_err(|e| error!("DB: {e}"))
+	.or(Err(Error::DbError))?;
+
+	Ok(row.is_some())
+}
+
 /// Get a specific installed app
 pub async fn get(
 	db: &SqlitePool,

@@ -101,6 +101,16 @@ pub struct AppBuilderOpts {
 	pub base_app_domain: Option<Box<str>>,
 	pub base_password: Option<Box<str>>,
 	pub dist_dir: Box<Path>,
+	/// Version stamping the shell's asset directory, i.e. the `<version>` in
+	/// `/assets-<version>/index.js`.
+	///
+	/// Read only by the site wrapper, which composes those links at request time rather
+	/// than baking them into a published container — a container naming an asset path
+	/// would stale on the next shell release with no republish available to fix it.
+	///
+	/// Defaults to [`VERSION`]: the shell and the server are released together, unless a
+	/// deployment deliberately serves a `dist/` from elsewhere.
+	pub shell_version: Box<str>,
 	pub tmp_dir: Box<Path>,
 	pub acme_email: Option<Box<str>>,
 	pub local_address: Box<[Box<str>]>,

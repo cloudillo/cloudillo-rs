@@ -6,6 +6,7 @@
 //! This module handles creating tables, indexes, and running migrations
 //! to ensure the database schema is up to date.
 
+use cloudillo_types::prelude::*;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 /// Add a column only if it is not already present. SQLite has no
@@ -134,7 +135,7 @@ const SEARCH_FTS_TRIGGERS: [&str; 3] = [
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 40;
+	const CURRENT_DB_VERSION: i64 = 48;
 
 	let mut tx = db.begin().await?;
 
@@ -1159,6 +1160,145 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		"CREATE TRIGGER IF NOT EXISTS calendar_objects_updated_at \
 		AFTER UPDATE ON calendar_objects FOR EACH ROW \
 		BEGIN UPDATE calendar_objects SET updated_at = unixepoch() WHERE co_id = NEW.co_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// Site builder
+	//
+	// `sites` is a per-tenant singleton: `tn_id` alone is the discriminator, so
+	// `site_docs` carries no site reference. A table and not settings keys — the settings
+	// store is typed scalar key/value, which fits no structured record.
+	//
+	// No `host` column: a tenant's site host is always its app domain, which
+	// `build_domains_for_tenant` derives, so a stored copy would drift. Domain aliases
+	// arrive as a `site_host (tn_id, host)` table, not as a scalar override — an override
+	// would *replace* the app domain, silently taking the site off `<idTag>`.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS sites (
+			tn_id integer NOT NULL,
+			status char(1) DEFAULT 'A',		-- 'A': active (served), 'D': disabled (configured but dark)
+			nav text,						-- explicit main navigation, JSON array; NULL/empty = derive it
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			PRIMARY KEY(tn_id)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// One row per document participating in the site.
+	//
+	// `UNIQUE (tn_id, mount_path)` is not optional. The primary key says a document
+	// appears at most once in the site but nothing about the reverse; without the index
+	// two documents can both claim '/blog' and longest-prefix resolution picks whichever
+	// row the query returns first — different content per restart, with no error anywhere.
+	// The publish endpoint checks it explicitly too, so the conflict is reported by
+	// document name rather than as a raw constraint violation.
+	//
+	// Exactly two generations, both plain scalar columns. That keeps the GC reachability
+	// query (`list_referenced_managed_fids`) a plain join, the shape of
+	// `tenants.profile_pic`, instead of the `WITH RECURSIVE` CSV split
+	// `actions.attachments` needs. It also makes retention free: on publish the displaced
+	// generation loses its last reference and the GC reaps it.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS site_docs (
+			tn_id integer NOT NULL,
+			doc_file_id text NOT NULL,			-- the Notillo document
+			mount_path text NOT NULL,			-- configured: '/' for the root document, '/blog' for a mount
+			published_mount_path text,			-- the path the served container was built for
+			published_file_id text,				-- current container; NULL before the first publish
+			previous_file_id text,				-- the one generation kept for rollback
+			previous_mount_path text,			-- the path that generation was built for
+			published_at INTEGER,
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			PRIMARY KEY(tn_id, doc_file_id)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	// Here and not in a versioned migration, against the usual rule: the descriptor block
+	// runs unconditionally and *before* every migration, and the statements below are part
+	// of it and read `published_mount_path`. `CREATE TABLE IF NOT EXISTS` cannot add a
+	// column to a table that exists, so this is the only placement where the columns are
+	// guaranteed present by the time they are read. Seven no-op `PRAGMA table_info` checks
+	// per start on two tiny tables.
+	add_column_if_missing(&mut tx, "sites", "status", "char(1) DEFAULT 'A'").await?;
+	add_column_if_missing(&mut tx, "sites", "nav", "text").await?;
+	add_column_if_missing(&mut tx, "site_docs", "published_mount_path", "text").await?;
+	add_column_if_missing(&mut tx, "site_docs", "published_file_id", "text").await?;
+	add_column_if_missing(&mut tx, "site_docs", "previous_file_id", "text").await?;
+	add_column_if_missing(&mut tx, "site_docs", "previous_mount_path", "text").await?;
+	add_column_if_missing(&mut tx, "site_docs", "published_at", "INTEGER").await?;
+
+	// The index below is unconditional and runs inside `init_db`'s single transaction for
+	// existing databases too, and nothing enforced uniqueness before it existed. One
+	// duplicate `(tn_id, mount_path)` anywhere on the node fails the statement, rolls the
+	// transaction back and leaves the process unbootable for *every* tenant. So the losers
+	// go first.
+	//
+	// Mirrors `cloudillo_types::site::published_path_drifted`, the one definition of the
+	// tie-break, so the database and the live mount table cannot disagree about which row
+	// stays: the row whose published path still equals its configured one, then the lowest
+	// `doc_file_id`. (`IS NOT` rather than `<>` because an unpublished row's
+	// `published_mount_path` is NULL, and NULL has to lose.) Loud, never silent — a removed
+	// row is a document that stops serving.
+	let shadowed = sqlx::query(
+		"SELECT d.tn_id, d.doc_file_id, d.mount_path FROM site_docs d WHERE EXISTS ( \
+			SELECT 1 FROM site_docs x \
+			 WHERE x.tn_id = d.tn_id AND x.mount_path = d.mount_path \
+			   AND x.doc_file_id <> d.doc_file_id \
+			   AND ((x.published_mount_path IS NOT x.mount_path) \
+					  < (d.published_mount_path IS NOT d.mount_path) \
+				 OR ((x.published_mount_path IS NOT x.mount_path) \
+					  = (d.published_mount_path IS NOT d.mount_path) \
+					 AND x.doc_file_id < d.doc_file_id)))",
+	)
+	.fetch_all(&mut *tx)
+	.await?;
+	for row in &shadowed {
+		let tn_id: i64 = row.get("tn_id");
+		let doc_file_id: String = row.get("doc_file_id");
+		let mount_path: String = row.get("mount_path");
+		warn!(
+			tn_id,
+			%doc_file_id,
+			%mount_path,
+			"Two documents share one site mount path; removing the shadowed row"
+		);
+		sqlx::query("DELETE FROM site_docs WHERE tn_id=? AND doc_file_id=?")
+			.bind(tn_id)
+			.bind(&doc_file_id)
+			.execute(&mut *tx)
+			.await?;
+	}
+
+	sqlx::query(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_site_docs_mount ON site_docs(tn_id, mount_path)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// The `updated_at` columns default to `unixepoch()`, so an insert-time trigger
+	// only rewrites what the default just wrote — and its `UPDATE` then fires the
+	// trigger below. Dropped here rather than in a versioned migration because the
+	// statement is idempotent and these triggers only ever existed in unreleased
+	// development databases.
+	sqlx::query("DROP TRIGGER IF EXISTS sites_insert_at").execute(&mut *tx).await?;
+	sqlx::query("DROP TRIGGER IF EXISTS site_docs_insert_at")
+		.execute(&mut *tx)
+		.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS sites_updated_at AFTER UPDATE ON sites FOR EACH ROW \
+		BEGIN UPDATE sites SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id; END",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE TRIGGER IF NOT EXISTS site_docs_updated_at AFTER UPDATE ON site_docs FOR EACH ROW \
+		BEGIN UPDATE site_docs SET updated_at = unixepoch() \
+		WHERE tn_id = NEW.tn_id AND doc_file_id = NEW.doc_file_id; END",
 	)
 	.execute(&mut *tx)
 	.await?;
@@ -2235,6 +2375,34 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 		set_db_version(&mut tx, 40).await;
+	}
+
+	if version < 47 {
+		// `sites`, `site_docs`, the UNIQUE (tn_id, mount_path) index and both updated_at
+		// trigger pairs are created by the `IF NOT EXISTS` descriptor statements above, in
+		// their final shape — that block is unconditional and runs for existing databases too.
+		//
+		// 41..46 are skipped rather than absent: the site tables were built up over those six
+		// steps, under the names `site`/`site_doc`, in unreleased development builds that
+		// never reached a commit. The steps are gone and the numbers stay burnt.
+		//
+		// Nothing is left for this block but the stamp: the descriptor block above adds each
+		// site column explicitly, because it reads them itself and runs ahead of every
+		// migration, so nothing here has to assume a sub-47 database lacks the site tables.
+		set_db_version(&mut tx, 47).await;
+	}
+
+	if version < 48 {
+		// Rollback swaps the two container generations, and the mount path has to travel
+		// with them: a row repathed, republished and then rolled back would otherwise name
+		// the new prefix while serving a container built for the old one, and
+		// `cache::mounts_from_docs` keys the live mount table on exactly that column.
+		//
+		// The descriptor block above carries the column for a fresh database, but
+		// `CREATE TABLE IF NOT EXISTS` cannot add one to an existing table — hence the
+		// ALTER. Older rows keep a NULL, which `rollback_doc` reads as "no path to restore".
+		add_column_if_missing(&mut tx, "site_docs", "previous_mount_path", "text").await?;
+		set_db_version(&mut tx, 48).await;
 	}
 
 	tx.commit().await?;

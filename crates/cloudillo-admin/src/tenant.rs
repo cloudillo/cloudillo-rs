@@ -241,6 +241,14 @@ pub async fn purge_tenant(app: &App, tn_id: TnId) -> ClResult<PurgeReport> {
 		warn!(tn_id = ?tn_id, %id_tag, error = ?e, "tenant purge phase A (soft delete) failed");
 	})?;
 
+	// Stop serving the published site before its blobs go, not after: the site cache is
+	// push-triggered, so a surviving entry would 500 its way through the deleted blobs
+	// below and keep the owner's name and picture live afterwards. Non-fatal — the
+	// soft delete is already committed.
+	if let Err(e) = cloudillo_core::reload_site_cache_for_tenant(app, tn_id).await {
+		warn!(tn_id = ?tn_id, %id_tag, error = ?e, "tenant purge: site cache reload failed");
+	}
+
 	// Phase B — destructive cleanup. Each step hard-fails on error.
 
 	// 2. Blobs

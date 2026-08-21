@@ -80,7 +80,7 @@ use cloudillo_types::{error::ClResult, types::TnId};
 /// `search` block on an action type. A tenant whose stored revision differs gets
 /// one full sweep on the next startup and then stops re-extracting; see
 /// [`reindex`].
-pub const INDEX_REV: u32 = 3;
+pub const INDEX_REV: u32 = 4;
 
 /// Serialises document materialisation across the whole process.
 ///

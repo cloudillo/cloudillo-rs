@@ -65,6 +65,7 @@ impl AppBuilder {
 				base_app_domain: None,
 				base_password: None,
 				dist_dir: PathBuf::from("./dist").into(),
+				shell_version: cloudillo_core::app::VERSION.into(),
 				tmp_dir: PathBuf::from("./data/tmp").into(),
 				acme_email: None,
 				local_address: Box::new([]),
@@ -110,6 +111,12 @@ impl AppBuilder {
 	}
 	pub fn dist_dir(&mut self, dist_dir: impl Into<Box<std::path::Path>>) -> &mut Self {
 		self.opts.dist_dir = dist_dir.into();
+		self
+	}
+	/// Override the version the site wrapper composes `/assets-<version>/…` from.
+	/// Only needed when the served `dist/` is not this build's own shell.
+	pub fn shell_version(&mut self, shell_version: impl Into<Box<str>>) -> &mut Self {
+		self.opts.shell_version = shell_version.into();
 		self
 	}
 	pub fn tmp_dir(&mut self, tmp_dir: impl Into<Box<std::path::Path>>) -> &mut Self {
@@ -313,6 +320,7 @@ impl AppBuilder {
 		extensions.insert(crate::auth::new_qr_login_store());
 		extensions.insert(cloudillo_file::new_container_cache());
 		extensions.insert(cloudillo_core::dir_cache::new_dir_cache());
+		extensions.insert(cloudillo_site::cache::new_site_cache());
 
 		// Register action token verifier for use by auth module
 		let action_verify_fn: cloudillo_core::ActionVerifyFn = Box::new(|app, tn_id, token, ip| {
@@ -337,6 +345,22 @@ impl AppBuilder {
 			Box::pin(cloudillo_profile::sync::ensure_profile(app, tn_id, id_tag))
 		});
 		extensions.insert(ensure_profile_fn);
+
+		// So the profile crate can invalidate the cached owner name and picture without
+		// depending on cloudillo-site. The narrow refresh: a profile write changes those
+		// two columns and nothing a container contributes, so `refresh_tenant` would
+		// re-open every mounted container inline on an avatar upload for no change.
+		let site_cache_update_fn: cloudillo_core::SiteCacheUpdateFn = Box::new(|app, tn_id| {
+			Box::pin(cloudillo_site::cache::refresh_tenant_profile(app, tn_id))
+		});
+		extensions.insert(site_cache_update_fn);
+
+		// The wide counterpart, for writers that change a tenant's status or app domain:
+		// both move the entry's key and whether it exists at all, so the entry has to be
+		// rebuilt rather than patched.
+		let site_cache_reload_fn: cloudillo_core::SiteCacheReloadFn =
+			Box::new(|app, tn_id| Box::pin(cloudillo_site::cache::refresh_tenant(app, tn_id)));
+		extensions.insert(site_cache_reload_fn);
 
 		// Register the search reindex hook so cloudillo-rtdb can notify the
 		// search subsystem after a commit without depending on it.
@@ -535,10 +559,10 @@ impl AppBuilder {
 			}
 		}
 
-		let https_server =
-			webserver::create_https_server(app.clone(), &app.opts.listen, api_router, app_router)
-				.await?;
-
+		// Ahead of everything else, and ahead of the HTTPS listener in particular:
+		// it answers nothing but `/.well-known/acme-challenge/{token}`, which is
+		// the HTTP-01 responder `bootstrap` needs to be reachable while it asks
+		// for a first certificate.
 		let http_server = if let Some(listen_http) = &app.opts.listen_http {
 			let http_listener = tokio::net::TcpListener::bind(listen_http.as_ref()).await?;
 			let http = tokio::spawn(async move { axum::serve(http_listener, http_router).await });
@@ -561,6 +585,28 @@ impl AppBuilder {
 				warn!("Failed to load proxy site cache: {}", e);
 			}
 		}
+
+		// Same for published sites: the cache is push-triggered, so this is the
+		// only thing that populates it before the first publish of this run.
+		match cloudillo_site::cache::reload_site_cache(&app).await {
+			Ok(()) => {}
+			Err(e) => {
+				warn!("Failed to load site cache: {}", e);
+			}
+		}
+
+		// Only now. Both caches above are read by the request path and neither is polled,
+		// so a request arriving before they are populated is answered wrongly rather than
+		// slowly: `GET /` on a published site would match the shell's SPA fallback and
+		// return `200` with the placeholder home page — which a crawler in that window
+		// indexes as the site's home. `bootstrap` stays ahead of both because it creates
+		// the tenant rows they read.
+		//
+		// A cache load failure stays non-fatal: the node comes up with an empty site cache
+		// and the next publish fills it.
+		let https_server =
+			webserver::create_https_server(app.clone(), &app.opts.listen, api_router, app_router)
+				.await?;
 
 		if let Some(http_server) = http_server {
 			let _ = tokio::try_join!(https_server, http_server)?;

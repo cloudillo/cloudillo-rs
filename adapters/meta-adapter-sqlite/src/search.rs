@@ -93,6 +93,35 @@ fn object_hash(obj: &SearchObject<'_>, parts: &[SearchPart<'_>]) -> String {
 	h.finalize("")
 }
 
+/// Which of a `(obj_tp, obj_id)` group's two row spaces a statement addresses.
+///
+/// A whole-object row (`part_id = ''`) and the object's part rows share an `obj_id`, so
+/// every lookup and delete has to say which space it means, or it reads a hash that
+/// mixes the two and deletes rows it does not own.
+#[derive(Clone, Copy)]
+enum RowScope {
+	/// Every row of the object, whatever its `part_id`. The `'D'` document path,
+	/// where one caller owns the whole group.
+	All,
+	/// The single `part_id = ''` row.
+	Whole,
+	/// The `part_id <> ''` rows.
+	Parts,
+}
+
+impl RowScope {
+	/// Appended to a `WHERE tn_id=? AND obj_tp=? AND obj_id=?` predicate. The
+	/// return is `&'static str` so the compiler enforces that it is an internal
+	/// constant, never caller input.
+	fn sql(self) -> &'static str {
+		match self {
+			Self::All => "",
+			Self::Whole => " AND part_id = ''",
+			Self::Parts => " AND part_id <> ''",
+		}
+	}
+}
+
 /// The `s_id`s and index route of an object's existing rows.
 struct ExistingRows {
 	/// `s_id`s of rows that live in `search_fts_cl` and need an explicit delete.
@@ -109,24 +138,32 @@ impl ExistingRows {
 	fn mode_differs_from(&self, fts_cl: bool) -> bool {
 		if fts_cl { self.external > 0 } else { !self.contentless.is_empty() }
 	}
+
+	/// No rows at all in the scope that was queried.
+	fn is_empty(&self) -> bool {
+		self.contentless.is_empty() && self.external == 0
+	}
 }
 
 /// Look up what an object already has indexed: which rows need a manual
 /// `search_fts_cl` delete, and what the last write hashed to.
 ///
 /// Served by `idx_search_docs_key` — the predicate is that UNIQUE index's left
-/// prefix. One query rather than two because the short-circuit check and the
-/// contentless cleanup want the same rows.
+/// prefix, `scope` narrowing it along the index's own fourth column. One query
+/// rather than two because the short-circuit check and the contentless cleanup
+/// want the same rows.
 async fn existing_rows(
 	tx: &mut Transaction<'_, Sqlite>,
 	tn_id: TnId,
 	obj_tp: char,
 	obj_id: &str,
+	scope: RowScope,
 ) -> ClResult<ExistingRows> {
-	let rows = sqlx::query(
+	let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
 		"SELECT s_id, fts_cl, obj_hash FROM search_docs \
-		 WHERE tn_id=? AND obj_tp=? AND obj_id=?",
-	)
+		 WHERE tn_id=? AND obj_tp=? AND obj_id=?{}",
+		scope.sql()
+	)))
 	.bind(tn_id.0)
 	.bind(obj_tp.to_string())
 	.bind(obj_id)
@@ -227,7 +264,7 @@ pub async fn replace_object(
 ) -> ClResult<()> {
 	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
-	let existing = existing_rows(&mut tx, tn_id, obj.obj_tp, obj.obj_id).await?;
+	let existing = existing_rows(&mut tx, tn_id, obj.obj_tp, obj.obj_id, RowScope::All).await?;
 	let hash = object_hash(obj, parts);
 	// Nothing an index row carries has moved, so the delete/re-insert — and the
 	// FTS churn it would cause — is pure waste. An RTDB commit touching no
@@ -438,43 +475,83 @@ pub async fn delete_deep_by_content_type(
 // statement that writes the index row, so the index cannot disagree with its
 // source about who may see a hit — which is what `search()`'s visibility
 // prefilter relies on. Only `title`, `body` and `tags` are bound from the caller.
+//
+// A file's *parts* — a site container's pages, a PDF's pages — take the same
+// guarantee by a second statement rather than the same one, because a chunked
+// `VALUES` insert cannot join: see `replace_parts`, `refresh_file_acl` and
+// `fill_part_created_at`.
 
-/// Replace the single whole-object index row for `(obj_tp, obj_id)`.
+/// Replace every index row of `(obj_tp, obj_id)` from one slice.
 ///
 /// See [`cloudillo_types::meta_adapter::MetaAdapter::replace_search_row`] for
-/// the contract. `part = None` deletes; anything else upserts.
+/// the contract. The slice leads with the whole-object part (empty `part_id`,
+/// at most one) and continues with the object's addressable parts, which
+/// [`replace_parts`] writes in the same transaction; an empty slice deletes the
+/// object from the index.
 pub async fn replace_row(
 	db: &SqlitePool,
 	tn_id: TnId,
 	obj_tp: char,
 	obj_id: &str,
-	part: Option<&SearchPart<'_>>,
+	parts: &[SearchPart<'_>],
 	fts_cl: bool,
 ) -> ClResult<()> {
 	let Some(source) = SourceRow::of(obj_tp) else {
 		return Err(Error::ValidationError(format!("unknown search object type '{obj_tp}'")));
 	};
-	// This path writes the *whole-object* row and nothing else, so rather than
-	// silently dropping part-level fields, reject them.
-	if let Some(part) = part
-		&& (!part.part_id.is_empty() || part.parent_part.is_some() || part.anchor_id.is_some())
+	// The slice is the object's whole content: the whole-object part first, then its
+	// addressable parts. Splitting on position keeps `part_rows` contiguous, so nothing
+	// here allocates.
+	let (whole, part_rows) = match parts.split_first() {
+		Some((first, rest)) if first.part_id.is_empty() => (Some(first), rest),
+		_ => (None, parts),
+	};
+	// The whole-object row is one row, so a second empty `part_id` anywhere means
+	// the caller meant something this cannot express.
+	if part_rows.iter().any(|part| part.part_id.is_empty()) {
+		return Err(Error::ValidationError(
+			"replace_search_row: the whole-object part (empty part_id) must be the first of the \
+			 slice, and there is at most one"
+				.into(),
+		));
+	}
+	if !part_rows.is_empty() && obj_tp != OBJ_FILE {
+		return Err(Error::ValidationError(format!(
+			"replace_search_row: only '{OBJ_FILE}' objects carry parts, not '{obj_tp}'"
+		)));
+	}
+	// `idx_search_docs_key` is UNIQUE on (tn_id, obj_tp, obj_id, part_id), so a repeated
+	// `part_id` cannot be written — `replace_parts` inserts with no `ON CONFLICT` because
+	// the pre-allocated `s_id`s the contentless index is keyed on cannot survive an
+	// upsert. Naming the collision here beats a constraint violation three statements away.
+	let mut seen = std::collections::HashSet::with_capacity(part_rows.len());
+	if let Some(duplicate) = part_rows.iter().map(|part| part.part_id).find(|id| !seen.insert(*id))
+	{
+		return Err(Error::ValidationError(format!(
+			"replace_search_row: duplicate part_id {duplicate:?} — one part addresses one row"
+		)));
+	}
+	// `SEARCH_COLS` has no `parent_part` or `anchor_id` column on the whole-object
+	// row, so rather than silently dropping either, reject them.
+	if let Some(part) = whole
+		&& (part.parent_part.is_some() || part.anchor_id.is_some())
 	{
 		return Err(Error::ValidationError(
-			"replace_search_row writes whole-object rows: part_id must be empty and \
-			 parent_part/anchor_id unset"
+			"replace_search_row writes whole-object rows: parent_part/anchor_id must be unset"
 				.into(),
 		));
 	}
 
 	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
 
-	let existing = existing_rows(&mut tx, tn_id, obj_tp, obj_id).await?;
+	let existing = existing_rows(&mut tx, tn_id, obj_tp, obj_id, RowScope::Whole).await?;
 
 	// Whether the source row is still there. `false` falls through to the delete
 	// below, which is what keeps this method's postcondition — the index agrees
-	// with the source — true either way.
-	let mut written = false;
-	if let Some(part) = part {
+	// with the source — true either way, and it is also what stops a part row
+	// being written with no ACL to derive.
+	let mut alive = false;
+	if let Some(part) = whole {
 		// Same short-circuit as `replace_object`: identical text and index route
 		// mean the upsert would rewrite the row for nothing, and every rewrite is
 		// an FTS delete plus re-insert.
@@ -499,7 +576,7 @@ pub async fn replace_row(
 		let obj = SearchObject { obj_tp, obj_id, fts_cl, ..Default::default() };
 		let hash = object_hash(&obj, std::slice::from_ref(&hashed));
 		if existing.hash.as_deref() == Some(hash.as_str()) {
-			written = sqlx::query(sqlx::AssertSqlSafe(source.exists()))
+			alive = sqlx::query(sqlx::AssertSqlSafe(source.exists()))
 				.bind(tn_id.0)
 				.bind(obj_id)
 				.fetch_optional(&mut *tx)
@@ -513,16 +590,22 @@ pub async fn replace_row(
 			// mode flip would strand the old entry in whichever index it came
 			// from. Delete first and let the insert arm run instead. (A hash match
 			// cannot hide this case — `fts_cl` is part of the hash.)
+			//
+			// Scoped to `part_id = ''`: an `'F'` object's part rows are another
+			// writer's, and a mode flip on the file row must not take them out.
 			if existing.mode_differs_from(fts_cl) {
 				delete_contentless(&mut tx, &existing.contentless).await?;
-				sqlx::query("DELETE FROM search_docs WHERE tn_id=? AND obj_tp=? AND obj_id=?")
-					.bind(tn_id.0)
-					.bind(obj_tp.to_string())
-					.bind(obj_id)
-					.execute(&mut *tx)
-					.await
-					.inspect_err(inspect)
-					.map_err(|_| Error::DbError)?;
+				sqlx::query(
+					"DELETE FROM search_docs \
+					 WHERE tn_id=? AND obj_tp=? AND obj_id=? AND part_id = ''",
+				)
+				.bind(tn_id.0)
+				.bind(obj_tp.to_string())
+				.bind(obj_id)
+				.execute(&mut *tx)
+				.await
+				.inspect_err(inspect)
+				.map_err(|_| Error::DbError)?;
 			}
 
 			// `RETURNING s_id` covers both arms of the upsert, so the contentless
@@ -545,7 +628,7 @@ pub async fn replace_row(
 				.await
 				.inspect_err(inspect)
 				.map_err(|_| Error::DbError)?;
-			written = s_id.is_some();
+			alive = s_id.is_some();
 
 			if let Some(s_id) = s_id
 				&& fts_cl
@@ -568,11 +651,37 @@ pub async fn replace_row(
 				.map_err(|_| Error::DbError)?;
 			}
 		}
+	} else if !part_rows.is_empty() {
+		// Parts with no whole-object part: the object keeps addressable content but no
+		// metadata row, so that row goes and the parts stand. Nothing emits this today, but
+		// the slice can express it, so it must mean something.
+		alive = sqlx::query(sqlx::AssertSqlSafe(source.exists()))
+			.bind(tn_id.0)
+			.bind(obj_id)
+			.fetch_optional(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?
+			.is_some();
+		if alive {
+			delete_contentless(&mut tx, &existing.contentless).await?;
+			sqlx::query(
+				"DELETE FROM search_docs WHERE tn_id=? AND obj_tp=? AND obj_id=? AND part_id = ''",
+			)
+			.bind(tn_id.0)
+			.bind(obj_tp.to_string())
+			.bind(obj_id)
+			.execute(&mut *tx)
+			.await
+			.inspect_err(inspect)
+			.map_err(|_| Error::DbError)?;
+		}
 	}
 
-	if !written {
-		// A file's deep parts go with it: a soft-deleted document must stop being
-		// searchable at once, not at the next sweep.
+	if !alive {
+		// A file's parts go with it — deep `'D'` document pages and its own `'F'` part rows
+		// alike — hence a delete deliberately unscoped by `part_id`: a soft-deleted document
+		// must stop being searchable at once, not at the next sweep.
 		let types: &[char] = if obj_tp == OBJ_FILE { &[OBJ_FILE, OBJ_DOC] } else { &[obj_tp] };
 		for tp in types {
 			purge_contentless_where(
@@ -591,6 +700,8 @@ pub async fn replace_row(
 				.inspect_err(inspect)
 				.map_err(|_| Error::DbError)?;
 		}
+	} else if obj_tp == OBJ_FILE {
+		replace_parts(&mut tx, tn_id, obj_id, part_rows, fts_cl).await?;
 	}
 
 	if obj_tp == OBJ_FILE {
@@ -601,8 +712,179 @@ pub async fn replace_row(
 	Ok(())
 }
 
+/// Replace the whole part-row set of one `'F'` object, inside [`replace_row`]'s
+/// transaction.
+///
+/// The whole-object row (`part_id = ''`) is written by the caller from the same slice, so
+/// both halves of a file's index content land in one transaction and cannot disagree
+/// about whether the object exists. A part missing from `parts` is deleted, which makes
+/// "no longer published" a real operation.
+///
+/// The caller has already established that the source file row is there, so no row can be
+/// written with no ACL to derive.
+///
+/// The five ACL columns go in NULL: a chunked `VALUES` insert cannot join `files`, so the
+/// derivation [`SourceRow`] does inline takes separate statements here. [`replace_row`]
+/// runs [`refresh_file_acl`] for the four it owns immediately after this returns, and
+/// [`fill_part_created_at`] stamps the fifth — both inside this transaction, before any
+/// reader sees the rows.
+async fn replace_parts(
+	tx: &mut Transaction<'_, Sqlite>,
+	tn_id: TnId,
+	obj_id: &str,
+	parts: &[SearchPart<'_>],
+	fts_cl: bool,
+) -> ClResult<()> {
+	let existing = existing_rows(tx, tn_id, OBJ_FILE, obj_id, RowScope::Parts).await?;
+	// Nothing stored and nothing to store, which is every ordinary file. Without this the
+	// delete and the `created_at` stamp below are two statements for no change, on every
+	// file of every reindex sweep.
+	if parts.is_empty() && existing.is_empty() {
+		return Ok(());
+	}
+	// The same short-circuit as `replace_object`: the ACL columns are out of the hash
+	// because they come from `files`, so a hash match means the *text* is unchanged. A
+	// visibility flip still reaches these rows — `replace_row` calls `refresh_file_acl` for
+	// every `'F'` write, this arm included.
+	let obj = SearchObject { obj_tp: OBJ_FILE, obj_id, fts_cl, ..Default::default() };
+	let hash = object_hash(&obj, parts);
+	if !parts.is_empty() && existing.hash.as_deref() == Some(hash.as_str()) {
+		return Ok(());
+	}
+
+	delete_contentless(tx, &existing.contentless).await?;
+	// The `search_docs_ad` trigger cleans `search_fts` for the `fts_cl = 0` rows.
+	sqlx::query(
+		"DELETE FROM search_docs \
+		 WHERE tn_id=? AND obj_tp=? AND obj_id=? AND part_id <> ''",
+	)
+	.bind(tn_id.0)
+	.bind(OBJ_FILE.to_string())
+	.bind(obj_id)
+	.execute(&mut **tx)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+
+	{
+		let mut next_s_id = if parts.is_empty() { 0 } else { alloc_s_ids(tx).await? };
+
+		for chunk in parts.chunks(INSERT_CHUNK) {
+			let base = next_s_id;
+			// Precomputed rather than stripped inside the `push_values` closure
+			// below, where a per-row `Cow` would not outlive the bind it feeds.
+			let bodies: Vec<Option<std::borrow::Cow<str>>> =
+				chunk.iter().map(|part| strip_marks(part.body)).collect();
+			let mut query = QueryBuilder::<Sqlite>::new(
+				"INSERT INTO search_docs \
+				 (s_id, tn_id, obj_tp, obj_id, part_id, part_kind, parent_part, anchor_id, \
+				  title, body, tags, content_type, owner_tag, visibility, root_id, \
+				  created_at, updated_at, fts_cl, obj_hash) ",
+			);
+			// `try_from` cannot fail — `i` is bounded by `INSERT_CHUNK` — but the
+			// fallback is cheap.
+			query.push_values(chunk.iter().enumerate(), |mut row, (i, part)| {
+				row.push_bind(base + i64::try_from(i).unwrap_or(0))
+					.push_bind(tn_id.0)
+					.push_bind(OBJ_FILE.to_string())
+					.push_bind(obj_id)
+					.push_bind(part.part_id)
+					.push_bind(part.part_kind)
+					.push_bind(part.parent_part)
+					.push_bind(part.anchor_id)
+					.push_bind(part.title)
+					// The whole point of the contentless route: the text is indexed
+					// but never stored.
+					.push_bind(if fts_cl {
+						None
+					} else {
+						bodies.get(i).and_then(|b| b.as_deref())
+					})
+					.push_bind(part.tags)
+					// content_type, owner_tag, visibility, root_id, created_at:
+					// `refresh_file_acl` fills the first four from `files` and
+					// `fill_part_created_at` the fifth, both inside this
+					// transaction, so no caller value can reach them.
+					.push("NULL")
+					.push("NULL")
+					.push("NULL")
+					.push("NULL")
+					.push("NULL")
+					.push("unixepoch()")
+					.push_bind(i64::from(fts_cl))
+					.push_bind(hash.as_str());
+			});
+			query
+				.build()
+				.execute(&mut **tx)
+				.await
+				.inspect_err(inspect)
+				.map_err(|_| Error::DbError)?;
+
+			if fts_cl {
+				// `tn_id` is a real FTS column here, not metadata: the query builder
+				// pushes a `tn_id:<n>` clause into the MATCH expression so FTS5 narrows
+				// to one tenant before ranking.
+				let mut fts = QueryBuilder::<Sqlite>::new(
+					"INSERT INTO search_fts_cl(rowid, title, body, tags, tn_id) ",
+				);
+				fts.push_values(chunk.iter().enumerate(), |mut row, (i, part)| {
+					row.push_bind(base + i64::try_from(i).unwrap_or(0))
+						.push_bind(part.title)
+						.push_bind(bodies.get(i).and_then(|b| b.as_deref()))
+						.push_bind(part.tags)
+						.push_bind(tn_id.0);
+				});
+				fts.build()
+					.execute(&mut **tx)
+					.await
+					.inspect_err(inspect)
+					.map_err(|_| Error::DbError)?;
+			}
+
+			next_s_id = base + i64::try_from(chunk.len()).unwrap_or(0);
+		}
+	}
+
+	// Only stamps rows this function just wrote; with no parts there are none.
+	if !parts.is_empty() {
+		fill_part_created_at(tx, tn_id, obj_id).await?;
+	}
+	Ok(())
+}
+
+/// Stamp `created_at` onto an `'F'` object's freshly inserted part rows.
+///
+/// The four ACL columns are [`refresh_file_acl`]'s — it already covers `'F'` part rows,
+/// so deriving them here too would be the same `root_id` CASE expression written twice.
+/// `created_at` is the one column that statement deliberately leaves alone, and a row
+/// inserted by [`replace_parts`] goes in with it NULL, so this fills it and nothing else.
+async fn fill_part_created_at(
+	tx: &mut Transaction<'_, Sqlite>,
+	tn_id: TnId,
+	file_id: &str,
+) -> ClResult<()> {
+	sqlx::query(
+		"UPDATE search_docs SET created_at = f.created_at \
+		 FROM files f \
+		 WHERE f.tn_id = search_docs.tn_id AND f.file_id = search_docs.obj_id \
+		   AND search_docs.tn_id = ? AND search_docs.obj_tp = 'F' \
+		   AND search_docs.obj_id = ? AND search_docs.part_id <> '' \
+		   AND search_docs.created_at IS NULL",
+	)
+	.bind(tn_id.0)
+	.bind(file_id)
+	.execute(&mut **tx)
+	.await
+	.inspect_err(inspect)
+	.map_err(|_| Error::DbError)?;
+	Ok(())
+}
+
 /// Re-derive from `files` the four ACL columns `search_docs` denormalises out of
-/// it, for the file's own `'F'` row *and* its deep `'D'` parts.
+/// it, for the file's own `'F'` row, its `'F'` part rows *and* its deep `'D'`
+/// parts — the `WHERE` carries no `part_id` filter, so this statement is the sole
+/// owner of those four columns for every row of the file.
 ///
 /// Called from both write paths, because each owns a different half of the
 /// problem:

@@ -113,11 +113,15 @@ fn init_api_service(app: App) -> Router {
 		// `image/*` exclusion would have kept SVG uncompressed).
 		//
 		// `.quality(Precise(4))` keeps on-the-fly compression cheap: tower-http
-		// prefers zstd > br > gzip, so modern clients get zstd (level 4, fast,
-		// dynamic-appropriate); the rare br-only client gets brotli q4 instead of
-		// the q11 default (which is a slow static-precompression level); gzip
-		// fallback at level 4. (Static JS/CSS are unaffected — they are served
-		// pre-compressed by `ServeDir::precompressed_br()/_gzip()`, not here.)
+		// prefers zstd > gzip on equal q-values, so modern clients get zstd (level
+		// 4, fast, dynamic-appropriate) and everyone else — Googlebot included,
+		// which never offers zstd — gets gzip level 4. Dynamic brotli is
+		// deliberately not compiled in: measured over 400 site pages, brotli q4
+		// produces the same ratio as gzip -4 for ~24% more CPU and 2.3x zstd -4's,
+		// and only beats them at q5, which costs 4x zstd -4. (Static JS/CSS are
+		// unaffected — they are served pre-compressed by
+		// `ServeDir::precompressed_br()/_gzip()`, which needs the `fs` feature,
+		// not `compression-br`.)
 		.layer(
 			CompressionLayer::new()
 				.quality(CompressionLevel::Precise(4))
@@ -144,11 +148,34 @@ fn init_app_service(app: App) -> Router {
 		.merge(tables::shared::well_known_dav())
 		.layer(tower_http::cors::CorsLayer::very_permissive());
 
-	let router = Router::new()
-		.merge(well_known_router)
-		.fallback(static_fallback_handler)
-		.with_state(app);
+	let router = Router::new().merge(well_known_router).fallback(static_fallback_handler);
+	// The same policy the API service runs, for the same reasons (see
+	// `init_api_service`): a default-deny media-type allowlist admitting `text/html` and
+	// `+xml`, a veto on `206` so `ServeDir`'s range responses keep an intact
+	// `Content-Range`, and a 32-byte floor.
+	//
+	// Nothing here is ever double-encoded: tower-http skips any response already carrying
+	// `Content-Encoding`, which covers both the site's gzip pass-through
+	// (`Kind::Verbatim`) and `ServeDir`'s precompressed `.br`/`.gz` siblings. It appends
+	// `Vary: accept-encoding` itself, and only when absent.
+	//
+	// As on the API service, a compressed response loses `Content-Length` and goes out
+	// chunked — fine for site HTML, which nothing streams a progress bar over.
+	let router = with_site_compression(router).with_state(app);
 	with_security_headers(router)
+}
+
+/// The app service's compression policy, in one place so the tests below drive
+/// the layer that actually ships rather than a replica of it.
+fn with_site_compression<S>(router: Router<S>) -> Router<S>
+where
+	S: Clone + Send + Sync + 'static,
+{
+	router.layer(
+		CompressionLayer::new()
+			.quality(CompressionLevel::Precise(4))
+			.compress_when(SizeAbove::new(32).and(is_compressible_media_type)),
+	)
 }
 
 fn init_http_service(app: App) -> Router {
@@ -160,6 +187,99 @@ fn init_http_service(app: App) -> Router {
 
 pub fn init(app: App) -> (Router, Router, Router) {
 	(init_api_service(app.clone()), init_app_service(app.clone()), init_http_service(app))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use axum::body::Body;
+	use axum::http::{Request, StatusCode, header};
+	use axum::response::Response;
+	use tower::ServiceExt;
+
+	/// What the inner handler answers with, in the terms the layer's predicate
+	/// reads. [`Answer::page`] is a wrapped site page: `200`, HTML, and comfortably
+	/// past the layer's 32-byte floor.
+	#[derive(Clone, Copy)]
+	struct Answer {
+		status: StatusCode,
+		content_encoding: Option<&'static str>,
+	}
+
+	impl Answer {
+		fn page() -> Self {
+			Self { status: StatusCode::OK, content_encoding: None }
+		}
+
+		fn build(self) -> Response {
+			let html = format!("<!doctype html><html><body>{}</body></html>", "x".repeat(200));
+			let mut builder = Response::builder()
+				.status(self.status)
+				.header(header::CONTENT_TYPE, "text/html; charset=utf-8");
+			if let Some(encoding) = self.content_encoding {
+				builder = builder.header(header::CONTENT_ENCODING, encoding);
+			}
+			builder.body(Body::from(html)).expect("build response")
+		}
+	}
+
+	/// Ask the app service's compression layer what it does with one
+	/// `Accept-Encoding`, given the response the inner handler shapes.
+	///
+	/// The real `init_app_service` returns a `Router<App>` and no test harness
+	/// builds an `App`, so the layer goes onto a stub router — but it is the same
+	/// `with_site_compression` the service itself applies, so the two cannot drift.
+	async fn negotiate(
+		accept_encoding: Option<&str>,
+		answer: Answer,
+	) -> (StatusCode, Option<String>, Option<String>) {
+		let router: Router =
+			with_site_compression(Router::new().fallback(async move || answer.build()));
+		let mut req = Request::builder().uri("/page");
+		if let Some(value) = accept_encoding {
+			req = req.header(header::ACCEPT_ENCODING, value);
+		}
+		let res = router
+			.oneshot(req.body(Body::empty()).expect("build request"))
+			.await
+			.expect("router responds");
+		let header_value = |name: header::HeaderName| {
+			res.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
+		};
+		(res.status(), header_value(header::CONTENT_ENCODING), header_value(header::VARY))
+	}
+
+	/// zstd wins on equal q-values (tower-http's `Encoding` orders
+	/// `Identity < Deflate < Gzip < Brotli < Zstd` and takes the max), and the layer
+	/// adds the `Vary` a shared cache needs.
+	#[tokio::test]
+	async fn a_modern_browser_gets_zstd() {
+		let (status, encoding, vary) =
+			negotiate(Some("gzip, deflate, br, zstd"), Answer::page()).await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(encoding.as_deref(), Some("zstd"));
+		assert_eq!(vary.as_deref(), Some("accept-encoding"));
+	}
+
+	/// Googlebot advertises `gzip, deflate, br` and never zstd. With dynamic brotli
+	/// no longer compiled in, that has to land on gzip rather than fall through to
+	/// an uncompressed body.
+	#[tokio::test]
+	async fn a_client_without_zstd_gets_gzip_now_that_brotli_is_gone() {
+		let (_, encoding, _) = negotiate(Some("gzip, deflate, br"), Answer::page()).await;
+		assert_eq!(encoding.as_deref(), Some("gzip"));
+	}
+
+	/// The site's gzip pass-through (`cloudillo-site`'s `Kind::Verbatim`) and
+	/// `ServeDir`'s precompressed siblings both answer with `Content-Encoding`
+	/// already set. tower-http must leave those alone — re-encoding them would hand
+	/// the client a body it cannot decode.
+	#[tokio::test]
+	async fn an_already_encoded_response_is_not_encoded_twice() {
+		let answer = Answer { content_encoding: Some("gzip"), ..Answer::page() };
+		let (_, encoding, _) = negotiate(Some("gzip, deflate, br, zstd"), answer).await;
+		assert_eq!(encoding.as_deref(), Some("gzip"));
+	}
 }
 
 // vim: ts=4

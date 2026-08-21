@@ -16,9 +16,9 @@ use std::sync::Arc;
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{
 	CreateFile, CreateRefOptions, CreateShareEntry, FileId, FileStatus, MetaAdapter,
-	PROFILE_INVITE_REF_TYPE, SHARE_FILE_REF_TYPE,
+	PROFILE_INVITE_REF_TYPE, PublishSiteDoc, SHARE_FILE_REF_TYPE, UpsertSite,
 };
-use cloudillo_types::types::TnId;
+use cloudillo_types::types::{Patch, TnId};
 use cloudillo_types::worker::WorkerPool;
 use tempfile::TempDir;
 
@@ -370,6 +370,49 @@ async fn hard_deleting_a_file_sweeps_its_links_and_grants_too() {
 	let keep_entries = adapter.list_share_entries(tn_id, 'F', "f1~keep").await.unwrap();
 	assert_eq!(keep_entries.len(), 1, "only the embed should have been swept from f1~keep");
 	assert_eq!(keep_entries[0].subject_id.as_ref(), "dave.example.com");
+}
+
+/// Every `tn_id`-keyed table takes part in the tenant cascade, and the site tables
+/// are keyed by nothing else. A `site_docs` row left behind is worse than an
+/// orphan: `list_referenced_managed_fids` joins it for GC reachability, so a purged
+/// tenant's published containers would stay referenced and never be reaped.
+#[tokio::test]
+async fn purging_a_tenant_takes_its_site_with_it() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	let other_tn_id = TnId(2);
+	adapter.create_tenant(tn_id, "alice").await.expect("create tenant");
+	adapter.create_tenant(other_tn_id, "bob").await.expect("create other tenant");
+
+	for tn in [tn_id, other_tn_id] {
+		adapter
+			.upsert_site(tn, &UpsertSite { nav: Patch::Value(&[]) })
+			.await
+			.expect("upsert site");
+		adapter
+			.publish_site_doc(
+				tn,
+				&PublishSiteDoc {
+					doc_file_id: "f1~doc",
+					mount_path: "/",
+					published_file_id: "f1~container",
+				},
+			)
+			.await
+			.expect("publish site doc");
+	}
+
+	adapter.delete_tenant(tn_id).await.expect("delete tenant");
+
+	assert!(adapter.read_site(tn_id).await.expect("read site").is_none(), "sites row survived");
+	assert!(
+		adapter.list_site_docs(tn_id).await.expect("list site docs").is_empty(),
+		"site_docs row survived"
+	);
+
+	// The other tenant's site is untouched — the cascade is keyed, not global.
+	assert!(adapter.read_site(other_tn_id).await.expect("read site").is_some());
+	assert_eq!(adapter.list_site_docs(other_tn_id).await.expect("list site docs").len(), 1);
 }
 
 // vim: ts=4

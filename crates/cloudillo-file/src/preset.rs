@@ -308,6 +308,31 @@ pub mod presets {
 		}
 	}
 
+	/// Site container preset - stores the published zip as-is, nothing derived
+	///
+	/// Modelled on [`apkg`], minus the icon: there is no image to extract.
+	/// `store_original` is the whole preset — the zip is read back entry-by-entry through
+	/// the container index, so any re-encoding would break the stored offsets.
+	///
+	/// Stored as-is, but not unchecked: every HTML entry is walked by
+	/// [`crate::site_html::validate_site_container`] first, and a fragment outside the
+	/// allowlist fails the whole upload. Validating rather than rewriting keeps "as-is"
+	/// true.
+	pub fn site() -> FilePreset {
+		FilePreset {
+			name: "site".to_string(),
+			allowed_media_classes: vec![VariantClass::Raw],
+			image_variants: vec![],
+			video_variants: vec![],
+			audio_variants: vec![],
+			extract_audio: false,
+			generate_thumbnail: false,
+			max_variant: None,
+			thumbnail_variant: None,
+			store_original: true,
+		}
+	}
+
 	/// Get preset by name
 	pub fn get(name: &str) -> Option<FilePreset> {
 		match name {
@@ -323,6 +348,7 @@ pub mod presets {
 			"orig-only" => Some(orig_only()),
 			"thumbnail-only" => Some(thumbnail_only()),
 			"apkg" => Some(apkg()),
+			"site" => Some(site()),
 			_ => None,
 		}
 	}
@@ -342,6 +368,7 @@ pub mod presets {
 			"orig-only",
 			"thumbnail-only",
 			"apkg",
+			"site",
 		]
 	}
 }

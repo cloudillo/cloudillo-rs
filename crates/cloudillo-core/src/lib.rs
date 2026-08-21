@@ -251,6 +251,76 @@ pub type EnsureProfileFn = Box<
 		+ Sync,
 >;
 
+/// Type-erased hook asking for one tenant's cached **owner profile** to be refreshed.
+/// Delegates to `cloudillo_site::cache::refresh_tenant_profile`, which patches the two
+/// columns a profile write can change rather than rebuilding the entry — the rebuild
+/// re-opens every mounted container.
+///
+/// The site cache holds each site's mount table **and its owner's profile**, so it goes
+/// stale on two unrelated writes. The publish path calls the refresh directly; the
+/// profile writers live in `cloudillo-profile`, which must not depend on
+/// `cloudillo-site` — this hook is how they reach it.
+///
+/// Push-triggered, never polled, and scoped to one tenant: a profile write must not cost
+/// a read per tenant on the instance. The entries are dropped and re-inserted under one
+/// write lock, so no reader observes a half-updated tenant.
+pub type SiteCacheUpdateFn = Box<
+	dyn for<'a> Fn(
+			&'a app::App,
+			cloudillo_types::types::TnId,
+		) -> Pin<
+			Box<dyn Future<Output = cloudillo_types::error::ClResult<()>> + Send + 'a>,
+		> + Send
+		+ Sync,
+>;
+
+/// Refresh one tenant's site cache records; a no-op when the site subsystem is
+/// not wired in, so a feature crate can call it unconditionally.
+///
+/// A failure here leaves the previous records in place — stale, not empty — so
+/// callers log it and carry on rather than failing the write that triggered it.
+pub async fn update_site_cache(
+	app: &app::App,
+	tn_id: cloudillo_types::types::TnId,
+) -> cloudillo_types::error::ClResult<()> {
+	match app.ext::<SiteCacheUpdateFn>() {
+		Ok(f) => f(app, tn_id).await,
+		Err(_) => Ok(()),
+	}
+}
+
+/// Type-erased hook asking for one tenant's site cache entry to be **rebuilt**.
+/// Delegates to `cloudillo_site::cache::refresh_tenant`.
+///
+/// Distinct from [`SiteCacheUpdateFn`] on purpose: that one patches the two columns a
+/// profile write can change. A status or domain change moves the entry's *key* and its
+/// very existence — a suspended tenant has no entry, a new app domain re-keys it onto
+/// another host — and neither is something a column patch can express.
+pub type SiteCacheReloadFn = Box<
+	dyn for<'a> Fn(
+			&'a app::App,
+			cloudillo_types::types::TnId,
+		) -> Pin<
+			Box<dyn Future<Output = cloudillo_types::error::ClResult<()>> + Send + 'a>,
+		> + Send
+		+ Sync,
+>;
+
+/// Rebuild one tenant's site cache entry; a no-op when the site subsystem is not wired
+/// in, so a feature crate can call it unconditionally.
+///
+/// Callers log a failure and carry on: a stale entry is bad, but failing an
+/// already-committed status write because a cache would not rebuild is worse.
+pub async fn reload_site_cache_for_tenant(
+	app: &app::App,
+	tn_id: cloudillo_types::types::TnId,
+) -> cloudillo_types::error::ClResult<()> {
+	match app.ext::<SiteCacheReloadFn>() {
+		Ok(f) => f(app, tn_id).await,
+		Err(_) => Ok(()),
+	}
+}
+
 pub fn register_settings(
 	registry: &mut settings::SettingsRegistry,
 ) -> cloudillo_types::error::ClResult<()> {

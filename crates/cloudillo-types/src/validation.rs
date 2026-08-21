@@ -117,6 +117,23 @@ fn is_canonical_ascii_host(s: &str) -> bool {
 	})
 }
 
+/// A `Host` header stripped of the two things a client may legally add to it: a
+/// port, and one trailing root dot.
+///
+/// The port is stripped only when everything after the last `:` is ASCII digits,
+/// so an IPv6 literal is never truncated.
+///
+/// Shared because two routers derive a lookup key from the same header and must not
+/// disagree: `cloudillo::webserver::api_id_tag_from_host` maps it to a tenant, and
+/// `cloudillo_site::cache::site_host_key` to a published site.
+pub fn strip_host_port(host: &str) -> &str {
+	let host = match host.rsplit_once(':') {
+		Some((base, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => base,
+		_ => host,
+	};
+	host.strip_suffix('.').unwrap_or(host)
+}
+
 /// The canonical U-label form of a DNS host, falling back to the input verbatim when
 /// it cannot be decoded.
 ///

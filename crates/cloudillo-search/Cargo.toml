@@ -13,6 +13,10 @@ readme = "../../README.md"
 
 [dependencies]
 cloudillo-core = { workspace = true }
+# A file's indexable parts come from its stored bytes: `cloudillo-file` reads the
+# container entry, `cloudillo-extract` turns the fragment into text.
+cloudillo-extract = { workspace = true }
+cloudillo-file = { workspace = true }
 cloudillo-types = { workspace = true }
 
 async-trait = "0.1"
