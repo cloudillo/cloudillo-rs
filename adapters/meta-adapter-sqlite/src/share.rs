@@ -11,7 +11,7 @@ use cloudillo_types::meta_adapter::{CreateShareEntry, ShareEntry, UpdateShareEnt
 use cloudillo_types::prelude::*;
 use cloudillo_types::utils::normalize_id_tag;
 
-use crate::utils::{inspect, push_patch};
+use crate::utils::{Db, push_patch};
 
 /// `share_entries.subject_id` in the form it is stored and matched under.
 ///
@@ -109,8 +109,7 @@ pub(crate) async fn create(
 	.bind(now.0)
 	.fetch_one(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	let id: i64 = row.get("id");
 	let created_at: i64 = row.get("created_at");
@@ -139,8 +138,7 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, id: i64) -> ClResult<()
 		.bind(tn_id.0)
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	Ok(())
 }
@@ -178,8 +176,7 @@ pub(crate) async fn update(
 		.bind(resource_id)
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 		return row.map(|r| row_to_share_entry(&r)).ok_or(Error::NotFound);
 	}
 
@@ -197,12 +194,7 @@ pub(crate) async fn update(
 		 permission, expires_at, created_by, created_at",
 	);
 
-	let row = query
-		.build()
-		.fetch_optional(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let row = query.build().fetch_optional(db).await.db()?;
 
 	row.map(|r| row_to_share_entry(&r)).ok_or(Error::NotFound)
 }
@@ -233,8 +225,7 @@ pub(crate) async fn list_by_resource(
 	.bind(resource_id)
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	Ok(rows.iter().map(row_to_share_entry).collect())
 }
@@ -271,8 +262,7 @@ pub(crate) async fn list_by_subject(
 	.bind(subject_id.as_ref())
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	Ok(rows.iter().map(row_to_share_entry).collect())
 }
@@ -305,8 +295,7 @@ pub(crate) async fn check_access(
 	.bind(subject_id.as_ref())
 	.fetch_optional(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	Ok(row.and_then(|r| {
 		let perm: String = r.get("permission");
@@ -325,8 +314,7 @@ pub(crate) async fn read(db: &SqlitePool, tn_id: TnId, id: i64) -> ClResult<Opti
 	.bind(tn_id.0)
 	.fetch_optional(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	Ok(row.map(|r| row_to_share_entry(&r)))
 }

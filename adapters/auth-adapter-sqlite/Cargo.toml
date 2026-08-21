@@ -15,16 +15,15 @@ readme = "../../README.md"
 async-trait = "0.1.92"
 base64 = "0.23.1"
 bcrypt = "0.19.3"
+chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
 cloudillo-types = { workspace = true }
 jsonwebtoken = "11.0.0"
 p256 = { version = "0.14.0", features = ["pkcs8", "pem", "getrandom"] }
 p384 = { version = "0.14.0", features = ["pkcs8", "pem", "getrandom"] }
 rand = "0.10.2"
-serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio"] }
 libsqlite3-sys = { version = "0.37.0", features = ["bundled"] }
-time = { version = "0.3.55", features = ["local-offset"] }
 tokio = { version = "1.53.1", features = ["fs"] }
 
 [dev-dependencies]

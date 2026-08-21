@@ -8,7 +8,7 @@ use sqlx::{Row, SqlitePool};
 use cloudillo_types::meta_adapter::{ListTaskOptions, Task, TaskPatch};
 use cloudillo_types::prelude::*;
 
-use crate::utils::{collect_res, inspect, parse_u64_list, push_in};
+use crate::utils::{Db, collect_res, parse_u64_list, push_in};
 
 /// List all pending tasks with their dependencies
 pub(crate) async fn list(db: &SqlitePool, _opts: &ListTaskOptions) -> ClResult<Vec<Task>> {
@@ -22,8 +22,7 @@ pub(crate) async fn list(db: &SqlitePool, _opts: &ListTaskOptions) -> ClResult<V
 	)
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	collect_res(res.iter().map(|row| {
 		let deps: Option<Box<str>> = row.try_get("deps")?;
@@ -56,12 +55,7 @@ pub(crate) async fn list_ids(db: &SqlitePool, kind: &str, keys: &[Box<str>]) -> 
 	query.push_bind(kind).push(" AND key IN ");
 	query = push_in(query, keys);
 
-	let res = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let res = query.build().fetch_all(db).await.db()?;
 
 	collect_res(res.iter().map(|row| row.try_get("task_id")))
 }
@@ -74,7 +68,7 @@ pub(crate) async fn create(
 	input: &str,
 	deps: &[u64],
 ) -> ClResult<u64> {
-	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 
 	let res = sqlx::query(
 		"INSERT INTO tasks (tn_id, kind, key, status, input)
@@ -87,8 +81,7 @@ pub(crate) async fn create(
 	.bind(input)
 	.fetch_one(&mut *tx)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	let task_id: u64 = res.get(0);
 
 	for dep in deps {
@@ -97,10 +90,9 @@ pub(crate) async fn create(
 			.bind((*dep).cast_signed())
 			.execute(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 	}
-	tx.commit().await.map_err(|_| Error::DbError)?;
+	tx.commit().await.db()?;
 
 	Ok(task_id)
 }
@@ -114,14 +106,12 @@ pub(crate) async fn mark_finished(db: &SqlitePool, task_id: u64, output: &str) -
 	.bind(task_id.cast_signed())
 	.execute(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	sqlx::query("DELETE FROM task_dependencies WHERE dep_id=?")
 		.bind(task_id.cast_signed())
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	Ok(())
 }
@@ -141,8 +131,7 @@ pub(crate) async fn mark_error(
 				.bind(task_id.cast_signed())
 				.execute(db)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?;
+				.db()?;
 		}
 		None => {
 			sqlx::query(
@@ -152,8 +141,7 @@ pub(crate) async fn mark_error(
 			.bind(task_id.cast_signed())
 			.execute(db)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 		}
 	}
 
@@ -174,27 +162,23 @@ pub(crate) async fn find_by_key(db: &SqlitePool, key: &str) -> ClResult<Option<T
 	.bind(key)
 	.fetch_optional(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	match res {
 		Some(row) => {
-			let deps: Option<Box<str>> = row.try_get("deps").map_err(|_| Error::DbError)?;
-			let status: &str = row.try_get("status").map_err(|_| Error::DbError)?;
+			let deps: Option<Box<str>> = row.try_get("deps").db()?;
+			let status: &str = row.try_get("status").db()?;
 			Ok(Some(Task {
-				task_id: row.try_get("task_id").map_err(|_| Error::DbError)?,
-				tn_id: TnId(row.try_get("tn_id").map_err(|_| Error::DbError)?),
-				kind: row.try_get::<Box<str>, _>("kind").map_err(|_| Error::DbError)?,
+				task_id: row.try_get("task_id").db()?,
+				tn_id: TnId(row.try_get("tn_id").db()?),
+				kind: row.try_get::<Box<str>, _>("kind").db()?,
 				status: status.chars().next().unwrap_or('E'),
-				created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
-				next_at: row
-					.try_get::<Option<i64>, _>("next_at")
-					.map_err(|_| Error::DbError)?
-					.map(Timestamp),
-				retry: row.try_get("retry").map_err(|_| Error::DbError)?,
-				cron: row.try_get("cron").map_err(|_| Error::DbError)?,
-				input: row.try_get("input").map_err(|_| Error::DbError)?,
-				output: row.try_get("output").map_err(|_| Error::DbError)?,
+				created_at: row.try_get("created_at").map(Timestamp).db()?,
+				next_at: row.try_get::<Option<i64>, _>("next_at").db()?.map(Timestamp),
+				retry: row.try_get("retry").db()?,
+				cron: row.try_get("cron").db()?,
+				input: row.try_get("input").db()?,
+				output: row.try_get("output").db()?,
 				deps: deps.map(|s| parse_u64_list(&s)).unwrap_or_default(),
 			}))
 		}
@@ -216,18 +200,13 @@ pub(crate) async fn find_completed(db: &SqlitePool, deps: &[u64]) -> ClResult<Ve
 		query.push_bind((*dep).cast_signed());
 	}
 	query.push(")");
-	let res = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let res = query.build().fetch_all(db).await.db()?;
 	collect_res(res.iter().map(|row| row.try_get("task_id")))
 }
 
 /// Update task fields with partial updates using a single query
 pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> ClResult<()> {
-	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 
 	// Build dynamic UPDATE query
 	let mut query = sqlx::QueryBuilder::new("UPDATE tasks SET ");
@@ -302,12 +281,7 @@ pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> 
 	// Execute UPDATE if there are fields to update
 	if has_fields {
 		query.push(" WHERE task_id=").push_bind(task_id.cast_signed());
-		query
-			.build()
-			.execute(&mut *tx)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+		query.build().execute(&mut *tx).await.db()?;
 	}
 
 	// Update dependencies if present (requires separate operations)
@@ -317,8 +291,7 @@ pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> 
 			.bind(task_id.cast_signed())
 			.execute(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 
 		// Insert new dependencies
 		for dep in deps {
@@ -327,12 +300,11 @@ pub(crate) async fn update(db: &SqlitePool, task_id: u64, patch: &TaskPatch) -> 
 				.bind((*dep).cast_signed())
 				.execute(&mut *tx)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?;
+				.db()?;
 		}
 	}
 
-	tx.commit().await.map_err(|_| Error::DbError)?;
+	tx.commit().await.db()?;
 
 	Ok(())
 }

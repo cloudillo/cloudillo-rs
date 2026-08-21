@@ -5,7 +5,7 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::{collect_res, escape_like, inspect, map_res, parse_str_list, push_in};
+use crate::utils::{Db, escape_like, inspect, parse_str_list, push_in};
 use cloudillo_types::meta_adapter::{
 	Action, ActionData, ActionId, ActionView, AttachmentView, AudienceType, FinalizeActionOptions,
 	ListActionOptions, ProfileInfo, ProfileStatus, ProfileType, UpdateActionDataOptions,
@@ -350,12 +350,7 @@ pub(crate) async fn count(db: &SqlitePool, tn_id: TnId, opts: &ListActionOptions
 	query = push_count_from_where(query, tn_id, opts);
 	query = push_action_filters(query, opts);
 	query = push_visibility_guard(query, opts);
-	query
-		.build_query_scalar::<i64>()
-		.fetch_one(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)
+	query.build_query_scalar::<i64>().fetch_one(db).await.db()
 }
 
 /// Count actions matching `opts`, grouped by `group_by`. Returns
@@ -378,16 +373,11 @@ pub(crate) async fn count_grouped(
 	query = push_count_from_where(query, tn_id, opts);
 	query = push_action_filters(query, opts);
 	query.push(format!(" GROUP BY {col}"));
-	let rows = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let rows = query.build().fetch_all(db).await.db()?;
 	let mut out = Vec::with_capacity(rows.len());
 	for r in &rows {
-		let grp: Option<String> = r.try_get("grp").map_err(|_| Error::DbError)?;
-		let cnt: i64 = r.try_get("cnt").map_err(|_| Error::DbError)?;
+		let grp: Option<String> = r.try_get("grp").db()?;
+		let cnt: i64 = r.try_get("cnt").db()?;
 		out.push((grp, cnt));
 	}
 	Ok(out)
@@ -421,7 +411,7 @@ async fn fetch_own_repost_ids(
 	q.push_bind(viewer);
 	q.push(" AND subject IN ");
 	q = push_in(q, subject_ids);
-	let rows = q.build().fetch_all(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	let rows = q.build().fetch_all(db).await.db()?;
 	for r in &rows {
 		let subject: Option<String> = r.try_get("subject").ok().flatten();
 		let target: Option<String> = r.try_get("target").ok().flatten();
@@ -531,37 +521,25 @@ pub(crate) async fn list(
 
 	debug!("SQL: {}", query.sql().as_str());
 
-	let res = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let res = query.build().fetch_all(db).await.db()?;
 
 	let mut actions = Vec::new();
 	for row in res {
 		// action_id might be NULL for pending actions - use @{a_id} placeholder
-		let action_id: Box<str> = row
-			.try_get::<Option<String>, _>("action_id")
-			.map_err(|_| Error::DbError)?
-			.map_or_else(
-				|| {
-					// NULL action_id - construct @{a_id} placeholder
-					let a_id: i64 = row.try_get("a_id").unwrap_or(0);
-					format!("@{}", a_id).into_boxed_str()
-				},
-				String::into_boxed_str,
-			);
+		let action_id: Box<str> = row.try_get::<Option<String>, _>("action_id").db()?.map_or_else(
+			|| {
+				// NULL action_id - construct @{a_id} placeholder
+				let a_id: i64 = row.try_get("a_id").unwrap_or(0);
+				format!("@{}", a_id).into_boxed_str()
+			},
+			String::into_boxed_str,
+		);
 
-		let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag").map_err(|_| Error::DbError)?;
-		let audience_tag =
-			row.try_get::<Option<Box<str>>, _>("audience").map_err(|_| Error::DbError)?;
+		let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag").db()?;
+		let audience_tag = row.try_get::<Option<Box<str>>, _>("audience").db()?;
 
 		// collect attachments
-		let attachments = row
-			.try_get::<Option<Box<str>>, _>("attachments")
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+		let attachments = row.try_get::<Option<Box<str>>, _>("attachments").db()?;
 		let attachments = if let Some(attachments) = &attachments {
 			let mut attachments = parse_str_list(attachments)
 				.iter()
@@ -654,67 +632,45 @@ pub(crate) async fn list(
 		let visibility = db_visibility_to_action(visibility);
 		actions.push(ActionView {
 			action_id,
-			typ: row.try_get::<Box<str>, _>("type").map_err(|_| Error::DbError)?,
-			sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type").map_err(|_| Error::DbError)?,
-			parent_id: row
-				.try_get::<Option<Box<str>>, _>("parent_id")
-				.map_err(|_| Error::DbError)?,
-			root_id: row.try_get::<Option<Box<str>>, _>("root_id").map_err(|_| Error::DbError)?,
+			typ: row.try_get::<Box<str>, _>("type").db()?,
+			sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type").db()?,
+			parent_id: row.try_get::<Option<Box<str>>, _>("parent_id").db()?,
+			root_id: row.try_get::<Option<Box<str>>, _>("root_id").db()?,
 			issuer: ProfileInfo {
 				id_tag: issuer_tag,
-				name: row.try_get::<Box<str>, _>("issuer_name").map_err(|_| Error::DbError)?,
-				typ: match row
-					.try_get::<Option<&str>, _>("issuer_type")
-					.map_err(|_| Error::DbError)?
-				{
+				name: row.try_get::<Box<str>, _>("issuer_name").db()?,
+				typ: match row.try_get::<Option<&str>, _>("issuer_type").db()? {
 					Some("C") => ProfileType::Community,
 					_ => ProfileType::Person,
 				},
-				profile_pic: row
-					.try_get::<Option<Box<str>>, _>("issuer_profile_pic")
-					.map_err(|_| Error::DbError)?,
+				profile_pic: row.try_get::<Option<Box<str>>, _>("issuer_profile_pic").db()?,
 			},
 			audience: if let Some(audience_tag) = audience_tag {
 				Some(ProfileInfo {
 					id_tag: audience_tag,
-					name: row
-						.try_get::<Box<str>, _>("audience_name")
-						.map_err(|_| Error::DbError)?,
-					typ: match row
-						.try_get::<Option<&str>, _>("audience_type")
-						.map_err(|_| Error::DbError)?
-					{
+					name: row.try_get::<Box<str>, _>("audience_name").db()?,
+					typ: match row.try_get::<Option<&str>, _>("audience_type").db()? {
 						Some("C") => ProfileType::Community,
 						_ => ProfileType::Person,
 					},
-					profile_pic: row
-						.try_get::<Option<Box<str>>, _>("audience_profile_pic")
-						.map_err(|_| Error::DbError)?,
+					profile_pic: row.try_get::<Option<Box<str>>, _>("audience_profile_pic").db()?,
 				})
 			} else {
 				None
 			},
-			subject: row.try_get("subject").map_err(|_| Error::DbError)?,
-			subject_profile: match row
-				.try_get::<Option<Box<str>>, _>("subject_id_tag")
-				.map_err(|_| Error::DbError)?
-			{
+			subject: row.try_get("subject").db()?,
+			subject_profile: match row.try_get::<Option<Box<str>>, _>("subject_id_tag").db()? {
 				Some(id_tag) => Some(ProfileInfo {
 					id_tag,
 					name: row
 						.try_get::<Option<Box<str>>, _>("subject_name")
-						.map_err(|_| Error::DbError)?
+						.db()?
 						.unwrap_or_else(|| "Unknown".into()),
-					typ: match row
-						.try_get::<Option<&str>, _>("subject_type")
-						.map_err(|_| Error::DbError)?
-					{
+					typ: match row.try_get::<Option<&str>, _>("subject_type").db()? {
 						Some("C") => ProfileType::Community,
 						_ => ProfileType::Person,
 					},
-					profile_pic: row
-						.try_get::<Option<Box<str>>, _>("subject_profile_pic")
-						.map_err(|_| Error::DbError)?,
+					profile_pic: row.try_get::<Option<Box<str>>, _>("subject_profile_pic").db()?,
 				}),
 				None => None,
 			},
@@ -722,23 +678,20 @@ pub(crate) async fn list(
 			subject_action: None,
 			content: row
 				.try_get::<Option<String>, _>("content")
-				.map_err(|_| Error::DbError)?
+				.db()?
 				.and_then(|s| serde_json::from_str(&s).ok()),
 			attachments,
-			created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
+			created_at: row.try_get("created_at").map(Timestamp).db()?,
 			received_at: row.try_get::<Option<i64>, _>("received_at").ok().flatten().map(Timestamp),
-			expires_at: row
-				.try_get("expires_at")
-				.map(|ts: Option<i64>| ts.map(Timestamp))
-				.map_err(|_| Error::DbError)?,
-			status: row.try_get("status").map_err(|_| Error::DbError)?,
+			expires_at: row.try_get("expires_at").map(|ts: Option<i64>| ts.map(Timestamp)).db()?,
+			status: row.try_get("status").db()?,
 			stat,
 			visibility,
-			flags: row.try_get("flags").map_err(|_| Error::DbError)?,
-			sub_level: row.try_get("sub_level").map_err(|_| Error::DbError)?,
+			flags: row.try_get("flags").db()?,
+			sub_level: row.try_get("sub_level").db()?,
 			x: row
 				.try_get::<Option<String>, _>("x")
-				.map_err(|_| Error::DbError)?
+				.db()?
 				.and_then(|s| serde_json::from_str(&s).ok()),
 			token: None,
 		});
@@ -817,52 +770,6 @@ pub(crate) async fn list(
 	Ok(actions)
 }
 
-/// List action tokens
-pub(crate) async fn list_tokens(
-	db: &SqlitePool,
-	tn_id: TnId,
-	opts: &ListActionOptions,
-) -> ClResult<Box<[Box<str>]>> {
-	let mut query = sqlx::QueryBuilder::new(
-		"SELECT at.token FROM action_tokens at
-		 JOIN actions a ON a.tn_id=at.tn_id AND a.action_id=at.action_id
-		 WHERE at.tn_id=",
-	);
-	query.push_bind(tn_id.0);
-
-	if let Some(status) = &opts.status {
-		query.push(" AND coalesce(a.status, 'A') IN ");
-		query = push_in(query, status);
-	} else {
-		// Same default as list_actions: hide 'D', 'V' (inbound verifying) and
-		// 'F' (terminal failure) so peers polling the outbox never see
-		// half-finished inbound actions.
-		query.push(" AND coalesce(a.status, 'A') NOT IN ('D', 'V', 'F')");
-	}
-
-	if let Some(typ) = &opts.typ {
-		query.push(" AND a.type IN ");
-		query = push_in(query, typ.as_slice());
-	}
-
-	if let Some(action_id) = &opts.action_id {
-		query.push(" AND a.action_id=").push_bind(action_id.as_str());
-	}
-
-	query.push(" ORDER BY a.created_at DESC LIMIT 100");
-
-	let res = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-
-	let tokens = collect_res(res.iter().map(|row| row.try_get("token")))?;
-
-	Ok(tokens.into_boxed_slice())
-}
-
 /// Create a new action (creates pending action with a_id, no action_id yet)
 pub(crate) async fn create(
 	db: &SqlitePool,
@@ -878,8 +785,7 @@ pub(crate) async fn create(
 				.bind(action.action_id)
 				.fetch_optional(db)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?
+				.db()?
 				.and_then(|row| row.get(0));
 
 		if let Some(action_id) = action_id_exists {
@@ -901,8 +807,7 @@ pub(crate) async fn create(
 		.bind(key)
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 	}
 
 	let status = "P";
@@ -942,8 +847,7 @@ pub(crate) async fn create(
 		.bind(x_json)
 		.fetch_one(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	Ok(ActionId::AId(res.get(0)))
 }
@@ -962,8 +866,7 @@ pub(crate) async fn finalize(
 		.bind(a_id.cast_signed())
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	match existing {
 		None => {
@@ -1002,7 +905,7 @@ pub(crate) async fn finalize(
 	}
 
 	// Update NULL action_id to new value, update attachments/subject/audience/key, and transition status from 'P' to 'A'
-	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 
 	let attachments_str = options.attachments.map(|a| a.join(","));
 	let res = sqlx::query(
@@ -1017,8 +920,7 @@ pub(crate) async fn finalize(
 		.bind(a_id.cast_signed())
 		.execute(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	if res.rows_affected() == 0 {
 		// Race condition - someone else just set it between our check and update.
@@ -1028,10 +930,9 @@ pub(crate) async fn finalize(
 			.bind(a_id.cast_signed())
 			.fetch_optional(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 
-		tx.rollback().await.map_err(|_| Error::DbError)?;
+		tx.rollback().await.db()?;
 
 		if let Some(row) = current
 			&& let Some(existing_id) = row.try_get::<Option<String>, _>("action_id").ok().flatten()
@@ -1058,8 +959,7 @@ pub(crate) async fn finalize(
 		.bind(a_id.cast_signed())
 		.fetch_one(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	let key: Option<String> = action.try_get("key").ok().flatten();
 
@@ -1074,11 +974,10 @@ pub(crate) async fn finalize(
 		.bind(a_id.cast_signed())
 		.execute(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 	}
 
-	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	tx.commit().await.db()?;
 	Ok(())
 }
 
@@ -1107,12 +1006,11 @@ pub(crate) async fn get_type(
 		.bind(action_id)
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	match res {
 		Some(row) => {
-			let typ: String = row.try_get("type").map_err(|_| Error::DbError)?;
+			let typ: String = row.try_get("type").db()?;
 			Ok(Some(typ.into_boxed_str()))
 		}
 		None => Ok(None),
@@ -1138,8 +1036,7 @@ pub(crate) async fn create_inbound(
 	.bind(ack_token)
 	.execute(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	Ok(())
 }
 
@@ -1156,32 +1053,16 @@ pub(crate) async fn get_related_tokens(
 			.bind(aprv_action_id)
 			.fetch_all(db)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 
 	let mut result = Vec::with_capacity(rows.len());
 	for row in rows {
-		let action_id: String = row.try_get("action_id").map_err(|_| Error::DbError)?;
-		let token: String = row.try_get("token").map_err(|_| Error::DbError)?;
+		let action_id: String = row.try_get("action_id").db()?;
+		let token: String = row.try_get("token").db()?;
 		result.push((action_id.into_boxed_str(), token.into_boxed_str()));
 	}
 
 	Ok(result)
-}
-
-/// Get action root ID
-pub(crate) async fn get_root_id(
-	db: &SqlitePool,
-	tn_id: TnId,
-	action_id: &str,
-) -> ClResult<Box<str>> {
-	let res = sqlx::query("SELECT root_id FROM actions WHERE tn_id=? AND action_id=?")
-		.bind(tn_id.0)
-		.bind(action_id)
-		.fetch_one(db)
-		.await;
-
-	map_res(res, |row| row.try_get("root_id"))
 }
 
 /// Get action data
@@ -1197,8 +1078,7 @@ pub(crate) async fn get_data(
 	.bind(action_id)
 	.fetch_optional(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	match res {
 		Some(row) => Ok(Some(ActionData {
@@ -1233,17 +1113,17 @@ pub(crate) async fn get_by_key(
 			let visibility = db_visibility_to_action(visibility);
 
 			Ok(Some(Action {
-				action_id: row.try_get("action_id").map_err(|_| Error::DbError)?,
-				typ: row.try_get("type").map_err(|_| Error::DbError)?,
+				action_id: row.try_get("action_id").db()?,
+				typ: row.try_get("type").db()?,
 				sub_typ: row.try_get("sub_type").ok().flatten(),
-				issuer_tag: row.try_get("issuer_tag").map_err(|_| Error::DbError)?,
+				issuer_tag: row.try_get("issuer_tag").db()?,
 				parent_id: row.try_get("parent_id").ok().flatten(),
 				root_id: row.try_get("root_id").ok().flatten(),
 				audience_tag: row.try_get("audience").ok().flatten(),
 				content: row.try_get("content").ok().flatten(),
 				attachments,
 				subject: row.try_get("subject").ok().flatten(),
-				created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
+				created_at: row.try_get("created_at").map(Timestamp).db()?,
 				expires_at: row
 					.try_get("expires_at")
 					.ok()
@@ -1278,8 +1158,7 @@ pub(crate) async fn store_token(
 	.bind(token)
 	.execute(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	Ok(())
 }
@@ -1297,7 +1176,7 @@ pub(crate) async fn get_token(
 		.await;
 
 	match res {
-		Ok(Some(row)) => Ok(Some(row.try_get("token").map_err(|_| Error::DbError)?)),
+		Ok(Some(row)) => Ok(Some(row.try_get("token").db()?)),
 		Ok(None) => Ok(None),
 		Err(_) => Err(Error::DbError),
 	}
@@ -1511,31 +1390,7 @@ pub(crate) async fn update_data(
 		query = query.bind(action_id);
 	}
 
-	let res = query.execute(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
-
-	if res.rows_affected() == 0 {
-		return Err(Error::NotFound);
-	}
-
-	Ok(())
-}
-
-/// Update inbound action status
-pub(crate) async fn update_inbound(
-	db: &SqlitePool,
-	tn_id: TnId,
-	action_id: &str,
-	status: Option<char>,
-) -> ClResult<()> {
-	let status_str = status.map(|c| c.to_string());
-	let res = sqlx::query("UPDATE action_tokens SET status=? WHERE tn_id=? AND action_id=?")
-		.bind(status_str.as_deref())
-		.bind(tn_id.0)
-		.bind(action_id)
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let res = query.execute(db).await.db()?;
 
 	if res.rows_affected() == 0 {
 		return Err(Error::NotFound);
@@ -1581,8 +1436,7 @@ pub(crate) async fn get(
 		.bind(a_id)
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?
+		.db()?
 	} else {
 		sqlx::query(
 			"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
@@ -1603,23 +1457,18 @@ pub(crate) async fn get(
 		.bind(action_id)
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?
+		.db()?
 	};
 
 	let Some(row) = row else {
 		return Ok(None);
 	};
 
-	let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag").map_err(|_| Error::DbError)?;
-	let audience_tag =
-		row.try_get::<Option<Box<str>>, _>("audience").map_err(|_| Error::DbError)?;
+	let issuer_tag = row.try_get::<Box<str>, _>("issuer_tag").db()?;
+	let audience_tag = row.try_get::<Option<Box<str>>, _>("audience").db()?;
 
 	// Parse attachments
-	let attachments = row
-		.try_get::<Option<Box<str>>, _>("attachments")
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let attachments = row.try_get::<Option<Box<str>>, _>("attachments").db()?;
 	let attachments = if let Some(attachments) = &attachments {
 		let mut attachments = parse_str_list(attachments)
 			.iter()
@@ -1734,10 +1583,8 @@ pub(crate) async fn get(
 	let visibility = db_visibility_to_action(visibility);
 
 	// action_id might be NULL for draft/pending actions - use @{a_id} placeholder
-	let result_action_id: Box<str> = row
-		.try_get::<Option<String>, _>("action_id")
-		.map_err(|_| Error::DbError)?
-		.map_or_else(
+	let result_action_id: Box<str> =
+		row.try_get::<Option<String>, _>("action_id").db()?.map_or_else(
 			|| {
 				let a_id: i64 = row.try_get("a_id").unwrap_or(0);
 				format!("@{}", a_id).into_boxed_str()
@@ -1747,66 +1594,51 @@ pub(crate) async fn get(
 
 	let mut action = ActionView {
 		action_id: result_action_id,
-		typ: row.try_get::<Box<str>, _>("type").map_err(|_| Error::DbError)?,
-		sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type").map_err(|_| Error::DbError)?,
-		parent_id: row.try_get::<Option<Box<str>>, _>("parent_id").map_err(|_| Error::DbError)?,
-		root_id: row.try_get::<Option<Box<str>>, _>("root_id").map_err(|_| Error::DbError)?,
+		typ: row.try_get::<Box<str>, _>("type").db()?,
+		sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type").db()?,
+		parent_id: row.try_get::<Option<Box<str>>, _>("parent_id").db()?,
+		root_id: row.try_get::<Option<Box<str>>, _>("root_id").db()?,
 		issuer: ProfileInfo {
 			id_tag: issuer_tag,
 			name: row
 				.try_get::<Option<Box<str>>, _>("issuer_name")
-				.map_err(|_| Error::DbError)?
+				.db()?
 				.unwrap_or_else(|| "Unknown".into()),
-			typ: match row.try_get::<Option<&str>, _>("issuer_type").map_err(|_| Error::DbError)? {
+			typ: match row.try_get::<Option<&str>, _>("issuer_type").db()? {
 				Some("C") => ProfileType::Community,
 				_ => ProfileType::Person,
 			},
-			profile_pic: row
-				.try_get::<Option<Box<str>>, _>("issuer_profile_pic")
-				.map_err(|_| Error::DbError)?,
+			profile_pic: row.try_get::<Option<Box<str>>, _>("issuer_profile_pic").db()?,
 		},
 		audience: if let Some(audience_tag) = audience_tag {
 			Some(ProfileInfo {
 				id_tag: audience_tag,
 				name: row
 					.try_get::<Option<Box<str>>, _>("audience_name")
-					.map_err(|_| Error::DbError)?
+					.db()?
 					.unwrap_or_else(|| "Unknown".into()),
-				typ: match row
-					.try_get::<Option<&str>, _>("audience_type")
-					.map_err(|_| Error::DbError)?
-				{
+				typ: match row.try_get::<Option<&str>, _>("audience_type").db()? {
 					Some("C") => ProfileType::Community,
 					_ => ProfileType::Person,
 				},
-				profile_pic: row
-					.try_get::<Option<Box<str>>, _>("audience_profile_pic")
-					.map_err(|_| Error::DbError)?,
+				profile_pic: row.try_get::<Option<Box<str>>, _>("audience_profile_pic").db()?,
 			})
 		} else {
 			None
 		},
-		subject: row.try_get("subject").map_err(|_| Error::DbError)?,
-		subject_profile: match row
-			.try_get::<Option<Box<str>>, _>("subject_id_tag")
-			.map_err(|_| Error::DbError)?
-		{
+		subject: row.try_get("subject").db()?,
+		subject_profile: match row.try_get::<Option<Box<str>>, _>("subject_id_tag").db()? {
 			Some(id_tag) => Some(ProfileInfo {
 				id_tag,
 				name: row
 					.try_get::<Option<Box<str>>, _>("subject_name")
-					.map_err(|_| Error::DbError)?
+					.db()?
 					.unwrap_or_else(|| "Unknown".into()),
-				typ: match row
-					.try_get::<Option<&str>, _>("subject_type")
-					.map_err(|_| Error::DbError)?
-				{
+				typ: match row.try_get::<Option<&str>, _>("subject_type").db()? {
 					Some("C") => ProfileType::Community,
 					_ => ProfileType::Person,
 				},
-				profile_pic: row
-					.try_get::<Option<Box<str>>, _>("subject_profile_pic")
-					.map_err(|_| Error::DbError)?,
+				profile_pic: row.try_get::<Option<Box<str>>, _>("subject_profile_pic").db()?,
 			}),
 			None => None,
 		},
@@ -1814,23 +1646,20 @@ pub(crate) async fn get(
 		subject_action: None,
 		content: row
 			.try_get::<Option<String>, _>("content")
-			.map_err(|_| Error::DbError)?
+			.db()?
 			.and_then(|s| serde_json::from_str(&s).ok()),
 		attachments,
-		created_at: row.try_get("created_at").map(Timestamp).map_err(|_| Error::DbError)?,
+		created_at: row.try_get("created_at").map(Timestamp).db()?,
 		received_at: row.try_get::<Option<i64>, _>("received_at").ok().flatten().map(Timestamp),
-		expires_at: row
-			.try_get("expires_at")
-			.map(|ts: Option<i64>| ts.map(Timestamp))
-			.map_err(|_| Error::DbError)?,
-		status: row.try_get("status").map_err(|_| Error::DbError)?,
+		expires_at: row.try_get("expires_at").map(|ts: Option<i64>| ts.map(Timestamp)).db()?,
+		status: row.try_get("status").db()?,
 		stat,
 		visibility,
-		flags: row.try_get("flags").map_err(|_| Error::DbError)?,
-		sub_level: row.try_get("sub_level").map_err(|_| Error::DbError)?,
+		flags: row.try_get("flags").db()?,
+		sub_level: row.try_get("sub_level").db()?,
 		x: row
 			.try_get::<Option<String>, _>("x")
-			.map_err(|_| Error::DbError)?
+			.db()?
 			.and_then(|s| serde_json::from_str(&s).ok()),
 		token: None,
 	};
@@ -1852,53 +1681,6 @@ pub(crate) async fn get(
 	Ok(Some(action))
 }
 
-/// Update action content and attachments (drafts only, status='R')
-pub(crate) async fn update(
-	db: &SqlitePool,
-	tn_id: TnId,
-	action_id: &str,
-	content: Option<&str>,
-	attachments: Option<&[&str]>,
-) -> ClResult<()> {
-	// Only allow updates to draft actions (status='R'), identified by @{a_id}
-	let Some(a_id_str) = action_id.strip_prefix('@') else {
-		return Err(Error::ValidationError("Only draft actions (@{a_id}) can be updated".into()));
-	};
-	let a_id: i64 = a_id_str.parse().map_err(|_| Error::NotFound)?;
-
-	let mut set_clauses = Vec::new();
-	if content.is_some() {
-		set_clauses.push("content=?");
-	}
-	if attachments.is_some() {
-		set_clauses.push("attachments=?");
-	}
-	if set_clauses.is_empty() {
-		return Ok(());
-	}
-
-	let sql = format!(
-		"UPDATE actions SET {} WHERE tn_id=? AND a_id=? AND status='R'",
-		set_clauses.join(", ")
-	);
-	let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
-	if let Some(content) = content {
-		query = query.bind(content);
-	}
-	if let Some(attachments) = attachments {
-		query = query.bind(attachments.join(","));
-	}
-	query = query.bind(tn_id.0).bind(a_id);
-
-	let res = query.execute(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
-
-	if res.rows_affected() == 0 {
-		return Err(Error::NotFound);
-	}
-
-	Ok(())
-}
-
 /// Delete action (soft delete for published, hard delete for drafts)
 pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClResult<()> {
 	if let Some(a_id_str) = action_id.strip_prefix('@') {
@@ -1909,8 +1691,7 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClR
 			.bind(a_id)
 			.execute(db)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 	} else {
 		// Published action: soft delete by marking status as 'D'
 		sqlx::query("UPDATE actions SET status = 'D' WHERE tn_id = ? AND action_id = ?")
@@ -1918,8 +1699,7 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClR
 			.bind(action_id)
 			.execute(db)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 	}
 
 	Ok(())
@@ -1950,14 +1730,7 @@ pub async fn set_read_marker(
 		}
 		_ => return Err(Error::ValidationError(format!("unknown read-marker scope: {scope}"))),
 	};
-	sqlx::query(sql)
-		.bind(position)
-		.bind(tn_id.0)
-		.bind(key)
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	sqlx::query(sql).bind(position).bind(tn_id.0).bind(key).execute(db).await.db()?;
 	Ok(())
 }
 
@@ -1972,8 +1745,7 @@ pub async fn auto_track(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClResu
 	.bind(action_id)
 	.execute(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	Ok(())
 }
 

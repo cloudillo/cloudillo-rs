@@ -5,7 +5,7 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::inspect;
+use crate::utils::Db;
 use cloudillo_types::meta_adapter::FileUserData;
 use cloudillo_types::prelude::*;
 use cloudillo_types::types::AccessLevel;
@@ -33,13 +33,12 @@ pub(crate) async fn record_access(
 	.bind(file_id)
 	.fetch_optional(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	// If file exists, update per-user access timestamp using the returned f_id
 	let id_tag = normalize_id_tag(id_tag);
 	if let Some(row) = row.filter(|_| !id_tag.is_empty()) {
-		let f_id: i64 = row.try_get("f_id").map_err(|_| Error::DbError)?;
+		let f_id: i64 = row.try_get("f_id").db()?;
 
 		sqlx::query(
 			"INSERT INTO file_user_data (tn_id, id_tag, f_id, accessed_at, created_at, updated_at)
@@ -53,8 +52,7 @@ pub(crate) async fn record_access(
 		.bind(f_id)
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 	}
 
 	Ok(())
@@ -79,13 +77,12 @@ pub(crate) async fn record_modification(
 	.bind(file_id)
 	.fetch_optional(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	// If file exists, update per-user modification timestamp using the returned f_id
 	let id_tag = normalize_id_tag(id_tag);
 	if let Some(row) = row.filter(|_| !id_tag.is_empty()) {
-		let f_id: i64 = row.try_get("f_id").map_err(|_| Error::DbError)?;
+		let f_id: i64 = row.try_get("f_id").db()?;
 
 		sqlx::query(
 			"INSERT INTO file_user_data (tn_id, id_tag, f_id, modified_at, created_at, updated_at)
@@ -99,8 +96,7 @@ pub(crate) async fn record_modification(
 		.bind(f_id)
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 	}
 
 	Ok(())
@@ -194,7 +190,7 @@ pub(crate) async fn update(
 	}
 	q = q.bind(tn_id.0).bind(file_id);
 
-	q.execute(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	q.execute(db).await.db()?;
 
 	// Return the updated data
 	get(db, tn_id, id_tag.as_ref(), file_id).await.map(Option::unwrap_or_default)
@@ -218,8 +214,7 @@ pub(crate) async fn get(
 	.bind(file_id)
 	.fetch_optional(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	match res {
 		Some(row) => {

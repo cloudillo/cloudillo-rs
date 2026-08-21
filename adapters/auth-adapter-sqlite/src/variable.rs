@@ -5,7 +5,7 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::{inspect, map_res};
+use crate::utils::{Db, inspect, map_res};
 use cloudillo_types::prelude::*;
 
 /// Read a tenant variable
@@ -35,7 +35,6 @@ pub(crate) async fn update_var(
 	.bind(value)
 	.execute(db)
 	.await
-	.inspect_err(inspect)
-	.or(Err(Error::DbError))?;
+	.db()?;
 	Ok(())
 }

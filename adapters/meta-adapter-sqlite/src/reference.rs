@@ -10,7 +10,7 @@ use sqlx::{Row, SqlitePool};
 use cloudillo_types::meta_adapter::{CreateRefOptions, ListRefsOptions, RefData, UpdateRefOptions};
 use cloudillo_types::prelude::*;
 
-use crate::utils::{inspect, push_patch};
+use crate::utils::{Db, push_patch};
 
 fn row_to_ref_data(row: &sqlx::sqlite::SqliteRow) -> RefData {
 	let created_at: i64 = row.get("created_at");
@@ -73,12 +73,7 @@ pub(crate) async fn list(
 
 	query.push(" ORDER BY created_at DESC, description");
 
-	let rows = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let rows = query.build().fetch_all(db).await.db()?;
 
 	Ok(rows.iter().map(row_to_ref_data).collect())
 }
@@ -93,8 +88,7 @@ pub(crate) async fn get(db: &SqlitePool, tn_id: TnId, ref_id: &str) -> ClResult<
 	.bind(ref_id)
 	.fetch_optional(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	Ok(row.map(|row| row_to_ref_data(&row)))
 }
@@ -126,8 +120,7 @@ pub(crate) async fn create(
 		.bind(opts.params.as_deref())
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	Ok(RefData {
 		ref_id: ref_id.into(),
@@ -149,8 +142,7 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, ref_id: &str) -> ClResu
 		.bind(ref_id)
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	Ok(())
 }
@@ -202,12 +194,7 @@ pub(crate) async fn update(
 		 count, resource_id, access_level, params",
 	);
 
-	let row = query
-		.build()
-		.fetch_optional(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let row = query.build().fetch_optional(db).await.db()?;
 
 	match row {
 		Some(row) => Ok(row_to_ref_data(&row)),
@@ -242,8 +229,7 @@ pub(crate) async fn validate_ref(
 	.bind(ref_id)
 	.fetch_optional(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?
+	.db()?
 	.ok_or(Error::NotFound)?;
 
 	let tn_id: i64 = row.get("tn_id");
@@ -305,7 +291,7 @@ pub(crate) async fn use_ref(
 	expected_types: &[&str],
 ) -> ClResult<(TnId, Box<str>, RefData)> {
 	// Start a transaction to ensure atomicity
-	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 
 	// Look up the ref globally (across all tenants) and get tenant info
 	let row = sqlx::query(
@@ -317,8 +303,7 @@ pub(crate) async fn use_ref(
 	.bind(ref_id)
 	.fetch_optional(&mut *tx)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?
+	.db()?
 	.ok_or(Error::NotFound)?;
 
 	let tn_id: i64 = row.get("tn_id");
@@ -355,8 +340,7 @@ pub(crate) async fn use_ref(
 				.bind(ref_id)
 				.execute(&mut *tx)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?;
+				.db()?;
 		if result.rows_affected() == 0 {
 			return Err(Error::ValidationError("Ref has already been used".to_string()));
 		}
@@ -366,7 +350,7 @@ pub(crate) async fn use_ref(
 	};
 
 	// Commit transaction
-	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	tx.commit().await.db()?;
 
 	let ref_data = RefData {
 		ref_id: ref_id.into(),

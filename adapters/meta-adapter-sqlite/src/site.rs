@@ -11,6 +11,7 @@
 //! Deciding *who* may publish, and naming the conflicting document on a collision, is
 //! the handler's job.
 
+use crate::utils::Db;
 use cloudillo_types::{
 	meta_adapter::{PublishSiteDoc, Site, SiteDoc, UpsertSite, UpsertSiteMount},
 	prelude::*,
@@ -26,14 +27,9 @@ pub async fn read(db: &SqlitePool, tn_id: TnId) -> ClResult<Option<Site>> {
 	.bind(tn_id.0)
 	.fetch_optional(db)
 	.await
-	.inspect_err(crate::utils::inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
-	row.as_ref()
-		.map(map_site)
-		.transpose()
-		.inspect_err(crate::utils::inspect)
-		.map_err(|_| Error::DbError)
+	row.as_ref().map(map_site).transpose().db()
 }
 
 /// Create the tenant's site record if it is missing and apply the patch to it.
@@ -50,8 +46,7 @@ pub async fn upsert(db: &SqlitePool, tn_id: TnId, site: &UpsertSite<'_>) -> ClRe
 				.bind(tn_id.0)
 				.execute(db)
 				.await
-				.inspect_err(crate::utils::inspect)
-				.map_err(|_| Error::DbError)?;
+				.db()?;
 			return Ok(());
 		}
 		// An empty list stores NULL rather than `[]`, so "no explicit nav" has exactly
@@ -73,8 +68,7 @@ pub async fn upsert(db: &SqlitePool, tn_id: TnId, site: &UpsertSite<'_>) -> ClRe
 	.bind(nav)
 	.execute(db)
 	.await
-	.inspect_err(crate::utils::inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	Ok(())
 }
@@ -103,19 +97,9 @@ async fn fetch_doc(
 	sql: &'static str,
 	value: &str,
 ) -> ClResult<Option<SiteDoc>> {
-	let row = sqlx::query(sql)
-		.bind(tn_id.0)
-		.bind(value)
-		.fetch_optional(db)
-		.await
-		.inspect_err(crate::utils::inspect)
-		.map_err(|_| Error::DbError)?;
+	let row = sqlx::query(sql).bind(tn_id.0).bind(value).fetch_optional(db).await.db()?;
 
-	row.as_ref()
-		.map(map_doc)
-		.transpose()
-		.inspect_err(crate::utils::inspect)
-		.map_err(|_| Error::DbError)
+	row.as_ref().map(map_doc).transpose().db()
 }
 
 /// Read one document's site binding.
@@ -165,8 +149,7 @@ pub async fn list_docs(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<SiteDoc>> {
 		.bind(tn_id.0)
 		.fetch_all(db)
 		.await
-		.inspect_err(crate::utils::inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	crate::utils::collect_res(rows.iter().map(map_doc))
 }
@@ -246,8 +229,7 @@ pub async fn rollback_doc(db: &SqlitePool, tn_id: TnId, doc_file_id: &str) -> Cl
 	.bind(doc_file_id)
 	.execute(db)
 	.await
-	.inspect_err(crate::utils::inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	Ok(result.rows_affected() > 0)
 }
@@ -308,8 +290,7 @@ pub async fn delete_mount(db: &SqlitePool, tn_id: TnId, doc_file_id: &str) -> Cl
 		.bind(doc_file_id)
 		.execute(db)
 		.await
-		.inspect_err(crate::utils::inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	Ok(result.rows_affected() > 0)
 }

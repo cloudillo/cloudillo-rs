@@ -5,10 +5,9 @@
 //!
 //! Tests for:
 //! 1. list_webauthn_credentials - Enumerate user credentials
-//! 2. read_webauthn_credential - Read specific credential
-//! 3. create_webauthn_credential - Register new credential
-//! 4. update_webauthn_credential_counter - Update usage counter (replay protection)
-//! 5. delete_webauthn_credential - Revoke credential
+//! 2. create_webauthn_credential - Register new credential
+//! 3. update_webauthn_credential_counter - Update usage counter (replay protection)
+//! 4. delete_webauthn_credential - Revoke credential
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 #[cfg(test)]
@@ -45,10 +44,10 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		let credential = cloudillo_types::auth_adapter::Webauthn {
-			credential_id: "cred_12345",
+			credential_id: "cred_12345".into(),
 			counter: 0,
-			public_key: "test-public-key-xyz",
-			description: Some("My Test Credential"),
+			public_key: "test-public-key-xyz".into(),
+			description: Some("My Test Credential".into()),
 		};
 
 		// Create WebAuthn credential
@@ -61,7 +60,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_read_webauthn_credential() {
+	async fn test_webauthn_credential_fields_roundtrip() {
 		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let tn_id = TnId(1);
@@ -77,10 +76,10 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		let credential = cloudillo_types::auth_adapter::Webauthn {
-			credential_id: "cred_read_test",
+			credential_id: "cred_read_test".into(),
 			counter: 5,
-			public_key: "public-key-abc-123",
-			description: Some("Read Test Credential"),
+			public_key: "public-key-abc-123".into(),
+			description: Some("Read Test Credential".into()),
 		};
 
 		// Create credential
@@ -89,32 +88,37 @@ mod tests {
 			.await
 			.expect("Failed to create WebAuthn credential");
 
-		// Read it back
-		let read_cred = adapter
-			.read_webauthn_credential(tn_id, "cred_read_test")
+		// List it back and verify all fields survived the round-trip
+		let listed = adapter
+			.list_webauthn_credentials(tn_id)
 			.await
-			.expect("Failed to read WebAuthn credential");
+			.expect("Failed to list WebAuthn credentials");
+		let read_cred = listed
+			.iter()
+			.find(|c| &*c.credential_id == "cred_read_test")
+			.expect("credential missing");
 
-		assert_eq!(read_cred.credential_id, "cred_read_test");
+		assert_eq!(&*read_cred.credential_id, "cred_read_test");
 		assert_eq!(read_cred.counter, 5);
-		assert_eq!(read_cred.public_key, "public-key-abc-123");
-		assert_eq!(read_cred.description, Some("Read Test Credential"));
+		assert_eq!(&*read_cred.public_key, "public-key-abc-123");
+		assert_eq!(read_cred.description.as_deref(), Some("Read Test Credential"));
 
-		println!("✅ WebAuthn credential read successfully");
+		println!("✅ WebAuthn credential fields round-trip successfully");
 	}
 
 	#[tokio::test]
-	async fn test_read_nonexistent_webauthn_credential() {
+	async fn test_webauthn_list_empty_tenant() {
 		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let tn_id = TnId(999);
-		let nonexistent_cred_id = "nonexistent_cred";
 
-		// Try to read non-existent credential
-		let result = adapter.read_webauthn_credential(tn_id, nonexistent_cred_id).await;
-
-		assert!(result.is_err());
-		println!("✅ Non-existent WebAuthn credential correctly returns error");
+		// A tenant that never created credentials lists none
+		let credentials = adapter
+			.list_webauthn_credentials(tn_id)
+			.await
+			.expect("Failed to list WebAuthn credentials");
+		assert!(credentials.is_empty());
+		println!("✅ Non-existent WebAuthn credential correctly lists nothing");
 	}
 
 	#[tokio::test]
@@ -135,23 +139,23 @@ mod tests {
 
 		// Create multiple credentials
 		let cred1 = cloudillo_types::auth_adapter::Webauthn {
-			credential_id: "cred_list_1",
+			credential_id: "cred_list_1".into(),
 			counter: 0,
-			public_key: "pubkey1",
-			description: Some("First credential"),
+			public_key: "pubkey1".into(),
+			description: Some("First credential".into()),
 		};
 
 		let cred2 = cloudillo_types::auth_adapter::Webauthn {
-			credential_id: "cred_list_2",
+			credential_id: "cred_list_2".into(),
 			counter: 0,
-			public_key: "pubkey2",
-			description: Some("Second credential"),
+			public_key: "pubkey2".into(),
+			description: Some("Second credential".into()),
 		};
 
 		let cred3 = cloudillo_types::auth_adapter::Webauthn {
-			credential_id: "cred_list_3",
+			credential_id: "cred_list_3".into(),
 			counter: 0,
-			public_key: "pubkey3",
+			public_key: "pubkey3".into(),
 			description: None,
 		};
 
@@ -177,7 +181,7 @@ mod tests {
 		assert_eq!(credentials.len(), 3);
 
 		// Verify we can find our credentials
-		let cred_ids: Vec<&str> = credentials.iter().map(|c| c.credential_id).collect();
+		let cred_ids: Vec<&str> = credentials.iter().map(|c| &*c.credential_id).collect();
 		assert!(cred_ids.contains(&"cred_list_1"));
 		assert!(cred_ids.contains(&"cred_list_2"));
 		assert!(cred_ids.contains(&"cred_list_3"));
@@ -229,10 +233,10 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		let credential = cloudillo_types::auth_adapter::Webauthn {
-			credential_id: "cred_counter_test",
+			credential_id: "cred_counter_test".into(),
 			counter: 10,
-			public_key: "pubkey-counter",
-			description: Some("Counter test credential"),
+			public_key: "pubkey-counter".into(),
+			description: Some("Counter test credential".into()),
 		};
 
 		// Create credential
@@ -248,10 +252,14 @@ mod tests {
 			.expect("Failed to update credential counter");
 
 		// Verify counter was updated
-		let updated_cred = adapter
-			.read_webauthn_credential(tn_id, "cred_counter_test")
+		let listed = adapter
+			.list_webauthn_credentials(tn_id)
 			.await
-			.expect("Failed to read updated credential");
+			.expect("Failed to list credentials");
+		let updated_cred = listed
+			.iter()
+			.find(|c| &*c.credential_id == "cred_counter_test")
+			.expect("credential missing after update");
 
 		assert_eq!(updated_cred.counter, 11);
 
@@ -275,10 +283,10 @@ mod tests {
 			.expect("Failed to create tenant");
 
 		let credential = cloudillo_types::auth_adapter::Webauthn {
-			credential_id: "cred_to_delete",
+			credential_id: "cred_to_delete".into(),
 			counter: 0,
-			public_key: "pubkey-delete",
-			description: Some("To be deleted"),
+			public_key: "pubkey-delete".into(),
+			description: Some("To be deleted".into()),
 		};
 
 		// Create credential
@@ -288,10 +296,14 @@ mod tests {
 			.expect("Failed to create WebAuthn credential");
 
 		// Verify it exists
-		let _ = adapter
-			.read_webauthn_credential(tn_id, "cred_to_delete")
+		let listed_before = adapter
+			.list_webauthn_credentials(tn_id)
 			.await
-			.expect("Credential should exist before deletion");
+			.expect("Failed to list credentials before deletion");
+		assert!(
+			listed_before.iter().any(|c| &*c.credential_id == "cred_to_delete"),
+			"Credential should exist before deletion"
+		);
 
 		// Delete the credential
 		adapter
@@ -300,8 +312,14 @@ mod tests {
 			.expect("Failed to delete WebAuthn credential");
 
 		// Verify it no longer exists
-		let result = adapter.read_webauthn_credential(tn_id, "cred_to_delete").await;
-		assert!(result.is_err());
+		let listed_after = adapter
+			.list_webauthn_credentials(tn_id)
+			.await
+			.expect("Failed to list credentials after deletion");
+		assert!(
+			!listed_after.iter().any(|c| &*c.credential_id == "cred_to_delete"),
+			"Credential should be gone after deletion"
+		);
 
 		println!("✅ WebAuthn credential deleted successfully");
 	}
@@ -332,17 +350,17 @@ mod tests {
 
 		// Create credentials for each tenant
 		let cred1 = cloudillo_types::auth_adapter::Webauthn {
-			credential_id: "shared_id", // Same ID on different tenants
+			credential_id: "shared_id".into(), // Same ID on different tenants
 			counter: 0,
-			public_key: "tenant1-pubkey",
-			description: Some("Tenant 1 credential"),
+			public_key: "tenant1-pubkey".into(),
+			description: Some("Tenant 1 credential".into()),
 		};
 
 		let cred2 = cloudillo_types::auth_adapter::Webauthn {
-			credential_id: "shared_id", // Same ID on different tenants
+			credential_id: "shared_id".into(), // Same ID on different tenants
 			counter: 0,
-			public_key: "tenant2-pubkey",
-			description: Some("Tenant 2 credential"),
+			public_key: "tenant2-pubkey".into(),
+			description: Some("Tenant 2 credential".into()),
 		};
 
 		adapter
@@ -355,19 +373,20 @@ mod tests {
 			.await
 			.expect("Failed to create tenant 2 credential");
 
-		// Verify each tenant sees only their credential
-		let tn1_cred = adapter
-			.read_webauthn_credential(tn_id_1, "shared_id")
+		// Verify each tenant lists only their credential
+		let tn1_creds = adapter
+			.list_webauthn_credentials(tn_id_1)
 			.await
-			.expect("Failed to read tenant 1 credential");
-
-		let tn2_cred = adapter
-			.read_webauthn_credential(tn_id_2, "shared_id")
+			.expect("Failed to list tenant 1 credentials");
+		let tn2_creds = adapter
+			.list_webauthn_credentials(tn_id_2)
 			.await
-			.expect("Failed to read tenant 2 credential");
+			.expect("Failed to list tenant 2 credentials");
 
-		assert_eq!(tn1_cred.public_key, "tenant1-pubkey");
-		assert_eq!(tn2_cred.public_key, "tenant2-pubkey");
+		assert_eq!(tn1_creds.len(), 1, "tenant 1 sees only its own credential");
+		assert_eq!(tn2_creds.len(), 1, "tenant 2 sees only its own credential");
+		assert_eq!(&*tn1_creds[0].public_key, "tenant1-pubkey");
+		assert_eq!(&*tn2_creds[0].public_key, "tenant2-pubkey");
 
 		println!("✅ WebAuthn credentials are isolated per tenant");
 	}
@@ -390,9 +409,9 @@ mod tests {
 
 		// Create credential without description
 		let credential = cloudillo_types::auth_adapter::Webauthn {
-			credential_id: "cred_no_desc",
+			credential_id: "cred_no_desc".into(),
 			counter: 0,
-			public_key: "pubkey-no-desc",
+			public_key: "pubkey-no-desc".into(),
 			description: None,
 		};
 
@@ -401,13 +420,17 @@ mod tests {
 			.await
 			.expect("Failed to create WebAuthn credential");
 
-		// Read it back
-		let read_cred = adapter
-			.read_webauthn_credential(tn_id, "cred_no_desc")
+		// List it back
+		let listed = adapter
+			.list_webauthn_credentials(tn_id)
 			.await
-			.expect("Failed to read WebAuthn credential");
+			.expect("Failed to list WebAuthn credentials");
+		let read_cred = listed
+			.iter()
+			.find(|c| &*c.credential_id == "cred_no_desc")
+			.expect("credential missing");
 
-		assert_eq!(read_cred.credential_id, "cred_no_desc");
+		assert_eq!(&*read_cred.credential_id, "cred_no_desc");
 		assert_eq!(read_cred.description, None);
 
 		println!("✅ WebAuthn credential without description handled correctly");
@@ -432,10 +455,10 @@ mod tests {
 		// Create 5 credentials
 		for i in 0u32..5 {
 			let credential = cloudillo_types::auth_adapter::Webauthn {
-				credential_id: &format!("cred_{}", i),
+				credential_id: format!("cred_{}", i).into(),
 				counter: i,
-				public_key: &format!("pubkey_{}", i),
-				description: Some(&format!("Credential {}", i)),
+				public_key: format!("pubkey_{}", i).into(),
+				description: Some(format!("Credential {}", i).into()),
 			};
 
 			adapter
@@ -456,7 +479,7 @@ mod tests {
 		for i in 0u32..5 {
 			let cred = credentials
 				.iter()
-				.find(|c| c.credential_id == format!("cred_{}", i))
+				.find(|c| *c.credential_id == format!("cred_{}", i))
 				.unwrap_or_else(|| panic!("Credential {} not found", i));
 			assert_eq!(cred.counter, i);
 		}

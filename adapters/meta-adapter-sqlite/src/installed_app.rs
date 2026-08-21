@@ -3,6 +3,7 @@
 
 //! Installed app database operations
 
+use crate::utils::Db;
 use cloudillo_types::{
 	meta_adapter::{InstallApp, InstalledApp},
 	prelude::*,
@@ -91,8 +92,7 @@ pub async fn list(
 		.bind(&pattern)
 		.fetch_all(db)
 		.await
-		.inspect_err(|e| error!("DB: {e}"))
-		.or(Err(Error::DbError))?
+		.db()?
 	} else {
 		sqlx::query(
 			"SELECT app_name, publisher_tag, version, action_id, file_id, blob_id,
@@ -104,8 +104,7 @@ pub async fn list(
 		.bind(tn_id.0)
 		.fetch_all(db)
 		.await
-		.inspect_err(|e| error!("DB: {e}"))
-		.or(Err(Error::DbError))?
+		.db()?
 	};
 
 	let mut apps = Vec::with_capacity(rows.len());
@@ -148,55 +147,9 @@ pub async fn is_installed_file(db: &SqlitePool, tn_id: TnId, file_id: &str) -> C
 	.bind(file_id)
 	.fetch_optional(db)
 	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	Ok(row.is_some())
-}
-
-/// Get a specific installed app
-pub async fn get(
-	db: &SqlitePool,
-	tn_id: TnId,
-	app_name: &str,
-	publisher_tag: &str,
-) -> ClResult<Option<InstalledApp>> {
-	let row = sqlx::query(
-		"SELECT app_name, publisher_tag, version, action_id, file_id, blob_id,
-			status, capabilities, auto_update, installed_at
-		 FROM installed_apps
-		 WHERE tn_id = ? AND app_name = ? AND publisher_tag = ?",
-	)
-	.bind(tn_id.0)
-	.bind(app_name)
-	.bind(normalize_id_tag(publisher_tag).as_ref())
-	.fetch_optional(db)
-	.await
-	.map_err(|e| {
-		error!("DB: {e}");
-		Error::DbError
-	})?;
-
-	let Some(row) = row else {
-		return Ok(None);
-	};
-
-	let capabilities: Option<Vec<Box<str>>> = row
-		.get::<Option<String>, _>("capabilities")
-		.and_then(|s| serde_json::from_str(&s).ok());
-
-	Ok(Some(InstalledApp {
-		app_name: row.get::<String, _>("app_name").into(),
-		publisher_tag: row.get::<String, _>("publisher_tag").into(),
-		version: row.get::<String, _>("version").into(),
-		action_id: row.get::<String, _>("action_id").into(),
-		file_id: row.get::<String, _>("file_id").into(),
-		blob_id: row.get::<String, _>("blob_id").into(),
-		status: row.get::<String, _>("status").into(),
-		capabilities,
-		auto_update: row.get::<i32, _>("auto_update") != 0,
-		installed_at: Timestamp(row.get::<i64, _>("installed_at")),
-	}))
 }
 
 // vim: ts=4

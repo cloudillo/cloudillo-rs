@@ -5,7 +5,7 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::map_res;
+use crate::utils::{Db, map_res};
 use cloudillo_types::{
 	auth_adapter::{CertData, TenantCertRenewalRow},
 	prelude::*,
@@ -33,7 +33,7 @@ pub(crate) async fn create_cert(db: &SqlitePool, cert_data: &CertData) -> ClResu
 	.bind(&cert_data.key)
 	.execute(db)
 	.await
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	Ok(())
 }
@@ -105,11 +105,11 @@ pub(crate) async fn read_cert_by_domain(db: &SqlitePool, domain: &str) -> ClResu
 
 /// List all valid certificates for cache pre-population
 pub(crate) async fn list_all_certs(db: &SqlitePool) -> ClResult<Vec<CertData>> {
-	let rows = sqlx::query(CERT_SELECT_VALID).fetch_all(db).await.or(Err(Error::DbError))?;
+	let rows = sqlx::query(CERT_SELECT_VALID).fetch_all(db).await.db()?;
 
 	let mut certs = Vec::new();
 	for row in rows {
-		certs.push(map_cert_row(&row).map_err(|_| Error::DbError)?);
+		certs.push(map_cert_row(&row).db()?);
 	}
 	Ok(certs)
 }
@@ -141,15 +141,14 @@ pub(crate) async fn list_tenants_needing_cert_renewal(
 	.bind(renewal_threshold)
 	.fetch_all(db)
 	.await
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	let mut tenants = Vec::new();
 	for row in rows {
-		let tn_id: i64 = row.try_get("tn_id").or(Err(Error::DbError))?;
-		let id_tag: String = row.try_get("id_tag").or(Err(Error::DbError))?;
-		let expires_at: Option<i64> = row.try_get("expires_at").or(Err(Error::DbError))?;
-		let failure_count_raw: Option<i64> =
-			row.try_get("failure_count").or(Err(Error::DbError))?;
+		let tn_id: i64 = row.try_get("tn_id").db()?;
+		let id_tag: String = row.try_get("id_tag").db()?;
+		let expires_at: Option<i64> = row.try_get("expires_at").db()?;
+		let failure_count_raw: Option<i64> = row.try_get("failure_count").db()?;
 		let failure_count = if let Some(v) = failure_count_raw.and_then(|v| u32::try_from(v).ok()) {
 			v
 		} else {
@@ -157,9 +156,8 @@ pub(crate) async fn list_tenants_needing_cert_renewal(
 				"cert.failure_count is missing or out of range; defaulting to 0");
 			0
 		};
-		let last_renewal_error: Option<String> =
-			row.try_get("last_renewal_error").or(Err(Error::DbError))?;
-		let notified_at: Option<i64> = row.try_get("notified_at").or(Err(Error::DbError))?;
+		let last_renewal_error: Option<String> = row.try_get("last_renewal_error").db()?;
+		let notified_at: Option<i64> = row.try_get("notified_at").db()?;
 		tenants.push(TenantCertRenewalRow {
 			tn_id: TnId(u32::try_from(tn_id).map_err(|_| Error::DbError)?),
 			id_tag: id_tag.into_boxed_str(),
@@ -195,7 +193,7 @@ pub(crate) async fn record_renewal_failure(
 	.bind(tn_id.0)
 	.execute(db)
 	.await
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	Ok(())
 }
@@ -215,7 +213,7 @@ pub(crate) async fn record_renewal_success(db: &SqlitePool, tn_id: TnId) -> ClRe
 	.bind(tn_id.0)
 	.execute(db)
 	.await
-	.or(Err(Error::DbError))?;
+	.db()?;
 	Ok(())
 }
 
@@ -225,7 +223,7 @@ pub(crate) async fn record_notification_sent(db: &SqlitePool, tn_id: TnId) -> Cl
 		.bind(tn_id.0)
 		.execute(db)
 		.await
-		.or(Err(Error::DbError))?;
+		.db()?;
 	Ok(())
 }
 

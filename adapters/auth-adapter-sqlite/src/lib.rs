@@ -8,6 +8,7 @@ use jsonwebtoken::DecodingKey;
 use sqlx::sqlite::{self, SqlitePool};
 use tokio::fs;
 
+use crate::utils::Db;
 use cloudillo_types::{
 	auth_adapter::{
 		AccessToken, ApiKeyInfo, ApiKeyValidation, AuthAdapter, AuthCtx, AuthKey, AuthLogin,
@@ -183,10 +184,6 @@ impl AuthAdapter for AuthAdapterSqlite {
 		profile_key::list_profile_keys(&self.db, tn_id).await
 	}
 
-	async fn read_profile_key(&self, tn_id: TnId, key_id: &str) -> ClResult<AuthKey> {
-		profile_key::read_profile_key(&self.db, tn_id, key_id).await
-	}
-
 	async fn create_profile_key(
 		&self,
 		tn_id: TnId,
@@ -209,10 +206,6 @@ impl AuthAdapter for AuthAdapterSqlite {
 		action: cloudillo_types::action_types::CreateAction,
 	) -> ClResult<Box<str>> {
 		auth::create_action_token(&self.db, &self.worker, tn_id, action).await
-	}
-
-	async fn verify_access_token(&self, token: &str) -> ClResult<()> {
-		auth::verify_access_token(&self.jwt_secret, token).await
 	}
 
 	async fn read_vapid_key(&self, tn_id: TnId) -> ClResult<KeyPair> {
@@ -243,14 +236,6 @@ impl AuthAdapter for AuthAdapterSqlite {
 
 	async fn list_webauthn_credentials(&self, tn_id: TnId) -> ClResult<Box<[Webauthn]>> {
 		webauthn::list_webauthn_credentials(&self.db, tn_id).await
-	}
-
-	async fn read_webauthn_credential(
-		&self,
-		tn_id: TnId,
-		credential_id: &str,
-	) -> ClResult<Webauthn> {
-		webauthn::read_webauthn_credential(&self.db, tn_id, credential_id).await
 	}
 
 	async fn create_webauthn_credential(&self, tn_id: TnId, data: &Webauthn) -> ClResult<()> {
@@ -316,7 +301,7 @@ impl AuthAdapter for AuthAdapterSqlite {
 		)
 		.execute(&self.db)
 		.await
-		.or(Err(Error::DbError))?;
+		.db()?;
 		Ok(u32::try_from(result.rows_affected()).unwrap_or_default())
 	}
 
@@ -327,10 +312,6 @@ impl AuthAdapter for AuthAdapterSqlite {
 
 	async fn read_proxy_site(&self, site_id: i64) -> ClResult<ProxySiteData> {
 		proxy_site::read_proxy_site(&self.db, site_id).await
-	}
-
-	async fn read_proxy_site_by_domain(&self, domain: &str) -> ClResult<ProxySiteData> {
-		proxy_site::read_proxy_site_by_domain(&self.db, domain).await
 	}
 
 	async fn update_proxy_site(

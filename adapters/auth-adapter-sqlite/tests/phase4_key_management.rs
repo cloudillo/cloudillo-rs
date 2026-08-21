@@ -4,8 +4,8 @@
 //! Phase 4 Integration Tests - Key Management Features
 //!
 //! Tests for:
-//! 1. read_profile_key - Reading historical profile keys
-//! 2. VAPID key management - Reading and updating VAPID keys for push notifications
+//! 1. Profile key listing (historical keys)
+//! 2. VAPID key management - Creating and reading VAPID keys for push notifications
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 #[cfg(test)]
@@ -26,7 +26,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_read_profile_key_success() {
+	async fn test_list_profile_keys_success() {
 		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let tn_id = TnId(1);
@@ -37,35 +37,34 @@ mod tests {
 			.await
 			.expect("Failed to create profile key");
 
-		// Now read it back using read_profile_key
-		let read_key = adapter
-			.read_profile_key(tn_id, &created_key.key_id)
-			.await
-			.expect("Failed to read profile key");
+		// List the tenant's keys and find the created one
+		let keys = adapter.list_profile_keys(tn_id).await.expect("Failed to list profile keys");
+		let read_key = keys
+			.iter()
+			.find(|k| k.key_id == created_key.key_id)
+			.expect("created key not listed");
 
 		// Verify the keys match
 		assert_eq!(read_key.key_id, created_key.key_id);
 		assert_eq!(read_key.public_key, created_key.public_key);
 		assert_eq!(read_key.expires_at, created_key.expires_at);
-		println!("✅ Profile key read successfully");
+		println!("✅ Profile key listed successfully");
 	}
 
 	#[tokio::test]
-	async fn test_read_profile_key_not_found() {
+	async fn test_list_profile_keys_empty() {
 		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let tn_id = TnId(999);
-		let nonexistent_key_id = "999912";
 
-		// Try to read non-existent key
-		let result = adapter.read_profile_key(tn_id, nonexistent_key_id).await;
-
-		assert!(result.is_err(), "Should fail for non-existent key");
-		println!("✅ Non-existent key correctly returns error");
+		// A tenant that never created keys lists none
+		let keys = adapter.list_profile_keys(tn_id).await.expect("Failed to list profile keys");
+		assert!(keys.is_empty(), "Should list no keys for a fresh tenant");
+		println!("✅ Fresh tenant correctly lists no keys");
 	}
 
 	#[tokio::test]
-	async fn test_read_profile_key_different_tenants() {
+	async fn test_profile_keys_are_tenant_isolated() {
 		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let tn_id_1 = TnId(1);
@@ -77,38 +76,16 @@ mod tests {
 			.await
 			.expect("Failed to create key for tenant 1");
 
-		let key2 = adapter
+		let _key2 = adapter
 			.create_profile_key(tn_id_2, None)
 			.await
 			.expect("Failed to create key for tenant 2");
 
-		// Verify each can read their own key
-		let read_key1 = adapter
-			.read_profile_key(tn_id_1, &key1.key_id)
-			.await
-			.expect("Failed to read tenant 1 key");
-
-		let read_key2 = adapter
-			.read_profile_key(tn_id_2, &key2.key_id)
-			.await
-			.expect("Failed to read tenant 2 key");
-
-		assert_eq!(read_key1.key_id, key1.key_id);
-		assert_eq!(read_key2.key_id, key2.key_id);
-
-		// If both have same key_id (created on same day), tenant 1 reading tenant 2's would succeed
-		// If different key_id, reading other key returns NotFound
-		// Both are valid depending on when the test runs
-		let cross_tenant_key_id = &key2.key_id;
-		let cross_tenant_result = adapter.read_profile_key(tn_id_1, cross_tenant_key_id).await;
-
-		// This should fail if key_id is unique, or succeed if key_id is same for both tenants
-		// The key_id is date-based so could be same on same day
-		match cross_tenant_result {
-			Ok(_) => println!("✅ Same key_id across tenants readable (created on same day)"),
-			Err(Error::NotFound) => println!("✅ Different key_id isolation works correctly"),
-			Err(e) => panic!("Unexpected error: {e}"),
-		}
+		// Each tenant lists exactly its own keys
+		let keys1 = adapter.list_profile_keys(tn_id_1).await.expect("Failed to list tenant 1 keys");
+		assert!(keys1.iter().any(|k| k.key_id == key1.key_id), "tenant 1 sees its own key");
+		assert_eq!(keys1.len(), 1, "tenant 1 sees no other tenant's keys");
+		println!("✅ Profile keys are isolated per tenant");
 	}
 
 	#[tokio::test]
@@ -117,8 +94,6 @@ mod tests {
 
 		let tn_id = TnId(1);
 		let id_tag = "test_vapid_user";
-		let test_public_key = "test-public-key-12345";
-		let test_private_key = "test-private-key-12345";
 
 		// Create a tenant first
 		adapter
@@ -129,16 +104,8 @@ mod tests {
 			.await
 			.expect("Failed to create tenant");
 
-		let keypair = cloudillo_types::auth_adapter::KeyPair {
-			public_key: test_public_key.into(),
-			private_key: test_private_key.into(),
-		};
-
-		// Update VAPID key
-		adapter
-			.update_vapid_key(tn_id, &keypair)
-			.await
-			.expect("Failed to update VAPID key");
+		// Create VAPID key
+		let keypair = adapter.create_vapid_key(tn_id).await.expect("Failed to create VAPID key");
 
 		// Read public key
 		let public_key = adapter
@@ -146,7 +113,7 @@ mod tests {
 			.await
 			.expect("Failed to read VAPID public key");
 
-		assert_eq!(public_key.as_ref(), test_public_key);
+		assert_eq!(public_key.as_ref(), keypair.public_key.as_ref());
 		println!("✅ VAPID public key read successfully");
 	}
 
@@ -156,8 +123,6 @@ mod tests {
 
 		let tn_id = TnId(1);
 		let id_tag = "test_vapid_pair_user";
-		let test_public_key = "another-public-key";
-		let test_private_key = "another-private-key";
 
 		// Create a tenant first
 		adapter
@@ -168,28 +133,20 @@ mod tests {
 			.await
 			.expect("Failed to create tenant");
 
-		let keypair = cloudillo_types::auth_adapter::KeyPair {
-			public_key: test_public_key.into(),
-			private_key: test_private_key.into(),
-		};
-
-		// Update VAPID key
-		adapter
-			.update_vapid_key(tn_id, &keypair)
-			.await
-			.expect("Failed to update VAPID key");
+		// Create VAPID key
+		let keypair = adapter.create_vapid_key(tn_id).await.expect("Failed to create VAPID key");
 
 		// Read full key pair
 		let read_keypair =
 			adapter.read_vapid_key(tn_id).await.expect("Failed to read VAPID key pair");
 
-		assert_eq!(read_keypair.public_key.as_ref(), test_public_key);
-		assert_eq!(read_keypair.private_key.as_ref(), test_private_key);
+		assert_eq!(read_keypair.public_key, keypair.public_key);
+		assert_eq!(read_keypair.private_key, keypair.private_key);
 		println!("✅ VAPID key pair read successfully");
 	}
 
 	#[tokio::test]
-	async fn test_update_vapid_key_overwrites() {
+	async fn test_create_vapid_key_overwrites() {
 		let (adapter, _tmp) = create_test_adapter().await.expect("Failed to create adapter");
 
 		let tn_id = TnId(1);
@@ -204,35 +161,24 @@ mod tests {
 			.await
 			.expect("Failed to create tenant");
 
-		// Set initial VAPID key
-		let keypair1 = cloudillo_types::auth_adapter::KeyPair {
-			public_key: "key1-public".into(),
-			private_key: "key1-private".into(),
-		};
-
-		adapter
-			.update_vapid_key(tn_id, &keypair1)
+		// First creation stores keypair1
+		let keypair1 = adapter
+			.create_vapid_key(tn_id)
 			.await
-			.expect("Failed to update VAPID key");
+			.expect("Failed to create initial VAPID key");
 
-		// Update with new key
-		let keypair2 = cloudillo_types::auth_adapter::KeyPair {
-			public_key: "key2-public".into(),
-			private_key: "key2-private".into(),
-		};
+		// Creating again replaces it with keypair2
+		let keypair2 =
+			adapter.create_vapid_key(tn_id).await.expect("Failed to overwrite VAPID key");
 
-		adapter
-			.update_vapid_key(tn_id, &keypair2)
-			.await
-			.expect("Failed to update VAPID key");
-
-		// Verify new key is stored
+		// Verify the second key is what is stored now
 		let read_keypair =
 			adapter.read_vapid_key(tn_id).await.expect("Failed to read VAPID key pair");
 
-		assert_eq!(read_keypair.public_key.as_ref(), "key2-public");
-		assert_eq!(read_keypair.private_key.as_ref(), "key2-private");
-		println!("✅ VAPID key update (overwrite) works correctly");
+		assert_eq!(read_keypair.public_key, keypair2.public_key);
+		assert_eq!(read_keypair.private_key, keypair2.private_key);
+		assert_ne!(keypair1.public_key, keypair2.public_key, "each create mints a fresh key");
+		println!("✅ VAPID key creation (overwrite) works correctly");
 	}
 
 	#[tokio::test]
@@ -285,34 +231,24 @@ mod tests {
 			.await
 			.expect("Failed to create tenant 2");
 
-		// Set different VAPID keys for two tenants
-		let keypair1 = cloudillo_types::auth_adapter::KeyPair {
-			public_key: "tenant1-public".into(),
-			private_key: "tenant1-private".into(),
-		};
-
-		let keypair2 = cloudillo_types::auth_adapter::KeyPair {
-			public_key: "tenant2-public".into(),
-			private_key: "tenant2-private".into(),
-		};
-
-		adapter
-			.update_vapid_key(tn_id_1, &keypair1)
+		// Create different VAPID keys for two tenants
+		let keypair1 = adapter
+			.create_vapid_key(tn_id_1)
 			.await
-			.expect("Failed to update tenant 1 VAPID key");
+			.expect("Failed to create tenant 1 VAPID key");
 
-		adapter
-			.update_vapid_key(tn_id_2, &keypair2)
+		let keypair2 = adapter
+			.create_vapid_key(tn_id_2)
 			.await
-			.expect("Failed to update tenant 2 VAPID key");
+			.expect("Failed to create tenant 2 VAPID key");
 
 		// Verify isolation
 		let read_key1 = adapter.read_vapid_key(tn_id_1).await.expect("Failed to read tenant 1 key");
 
 		let read_key2 = adapter.read_vapid_key(tn_id_2).await.expect("Failed to read tenant 2 key");
 
-		assert_eq!(read_key1.public_key.as_ref(), "tenant1-public");
-		assert_eq!(read_key2.public_key.as_ref(), "tenant2-public");
+		assert_eq!(read_key1.public_key, keypair1.public_key);
+		assert_eq!(read_key2.public_key, keypair2.public_key);
 
 		println!("✅ VAPID keys are isolated per tenant");
 	}

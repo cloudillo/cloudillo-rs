@@ -9,7 +9,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use sqlx::{Row, SqlitePool};
 
 use crate::crypto;
-use crate::utils::inspect;
+use crate::utils::{Db, map_res};
 use cloudillo_types::{
 	action_types,
 	auth_adapter::{AccessToken, ActionToken, AuthCtx, AuthLogin},
@@ -66,11 +66,10 @@ pub(crate) async fn ensure_jwt_secret(db: &SqlitePool) -> ClResult<String> {
 		.bind("0:jwt_secret")
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+		.db()?;
 
 	if let Some(row) = res {
-		return row.try_get("value").inspect_err(inspect).or(Err(Error::DbError));
+		return row.try_get("value").db();
 	}
 
 	// Generate new secret (32 random bytes, base64 encoded)
@@ -85,8 +84,7 @@ pub(crate) async fn ensure_jwt_secret(db: &SqlitePool) -> ClResult<String> {
 		.bind(&secret_str)
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+		.db()?;
 
 	info!("Generated new JWT secret");
 	Ok(secret_str)
@@ -132,11 +130,11 @@ pub(crate) async fn check_tenant_password(
 	match res {
 		Err(_) => Err(Error::PermissionDenied),
 		Ok(row) => {
-			let _tn_id: TnId = row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?;
-			let status: Option<&str> = row.try_get("status").or(Err(Error::DbError))?;
+			let _tn_id: TnId = row.try_get("tn_id").map(TnId).db()?;
+			let status: Option<&str> = row.try_get("status").db()?;
 			assert_tenant_active(status)?;
-			let password_hash: Box<str> = row.try_get("password").or(Err(Error::DbError))?;
-			let db_roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
+			let password_hash: Box<str> = row.try_get("password").db()?;
+			let db_roles: Option<&str> = row.try_get("roles").db()?;
 
 			crypto::check_password(worker, password, password_hash).await?;
 
@@ -156,7 +154,7 @@ pub(crate) async fn check_tenant_password(
 			.await?;
 
 			Ok(AuthLogin {
-				tn_id: row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?,
+				tn_id: row.try_get("tn_id").map(TnId).db()?,
 				id_tag: Box::from(id_tag),
 				roles: Some(parse_roles(&roles_str)),
 				token,
@@ -178,8 +176,7 @@ pub(crate) async fn update_tenant_password(
 		.bind(password_hash)
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+		.db()?;
 	if res.rows_affected() == 0 {
 		return Err(Error::NotFound);
 	}
@@ -197,8 +194,7 @@ pub(crate) async fn update_idp_api_key(
 		.bind(api_key)
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+		.db()?;
 	Ok(())
 }
 
@@ -217,10 +213,10 @@ pub(crate) async fn create_tenant_login(
 	match res {
 		Err(_) => Err(Error::PermissionDenied),
 		Ok(row) => {
-			let _tn_id = row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?;
-			let status: Option<&str> = row.try_get("status").or(Err(Error::DbError))?;
+			let _tn_id = row.try_get("tn_id").map(TnId).db()?;
+			let status: Option<&str> = row.try_get("status").db()?;
 			assert_tenant_active(status)?;
-			let db_roles: Option<&str> = row.try_get("roles").or(Err(Error::DbError))?;
+			let db_roles: Option<&str> = row.try_get("roles").db()?;
 
 			let roles_str = build_tenant_owner_roles(db_roles);
 			let access_token = AccessToken {
@@ -238,7 +234,7 @@ pub(crate) async fn create_tenant_login(
 			.await?;
 
 			Ok(AuthLogin {
-				tn_id: row.try_get("tn_id").map(TnId).or(Err(Error::DbError))?,
+				tn_id: row.try_get("tn_id").map(TnId).db()?,
 				id_tag: Box::from(id_tag),
 				roles: Some(parse_roles(&roles_str)),
 				token,
@@ -255,14 +251,13 @@ pub(crate) async fn create_access_token(
 	data: &AccessToken<&str>,
 	jwt_secret_str: &str,
 ) -> ClResult<Box<str>> {
-	let res = sqlx::query("SELECT tn_id, id_tag FROM tenants WHERE tn_id = ?")
-		.bind(tn_id.0)
-		.fetch_one(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-
-	let id_tag: Box<str> = res.try_get("id_tag").or(Err(Error::DbError))?;
+	let id_tag: Box<str> = map_res(
+		sqlx::query("SELECT tn_id, id_tag FROM tenants WHERE tn_id = ?")
+			.bind(tn_id.0)
+			.fetch_one(db)
+			.await,
+		|row| row.try_get("id_tag"),
+	)?;
 
 	// Use roles from data parameter (user's roles in this context),
 	// NOT from tenants table (which is the tenant's system roles)
@@ -297,13 +292,13 @@ pub(crate) async fn create_action_token(
 		WHERE t.tn_id=? ORDER BY k.key_id DESC LIMIT 1",
 	)
 	.bind(tn_id.0)
-	.fetch_one(db)
+	.fetch_optional(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
-	let id_tag: &str = res.try_get("id_tag").or(Err(Error::DbError))?;
-	let key_id: Box<str> = res.try_get("key_id").or(Err(Error::DbError))?;
-	let private_key: Box<str> = res.try_get("private_key").or(Err(Error::DbError))?;
+	.db()?
+	.ok_or_else(|| Error::Internal("no signing key for tenant".into()))?;
+	let id_tag: &str = res.try_get("id_tag").db()?;
+	let key_id: Box<str> = res.try_get("key_id").db()?;
+	let private_key: Box<str> = res.try_get("private_key").db()?;
 
 	let mut typ = action.typ.to_string();
 	if let Some(sub_typ) = &action.sub_typ {
@@ -327,15 +322,6 @@ pub(crate) async fn create_action_token(
 	let token = crypto::generate_action_token(worker, action_data, private_key).await?;
 
 	Ok(token)
-}
-
-/// Verify an access token
-pub(crate) async fn verify_access_token(jwt_secret: &DecodingKey, token: &str) -> ClResult<()> {
-	// Decode and validate the JWT token
-	decode::<AccessToken<Box<str>>>(token, jwt_secret, &Validation::new(Algorithm::HS256))
-		.map_err(|_| Error::Unauthorized)?;
-
-	Ok(())
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@
 
 //! Push subscription database operations
 
+use crate::utils::Db;
 use cloudillo_types::{
 	meta_adapter::{PushSubscription, PushSubscriptionData},
 	prelude::*,
@@ -19,7 +20,7 @@ pub async fn list(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<PushSubscription
 	.bind(tn_id.0)
 	.fetch_all(db)
 	.await
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	let mut subscriptions = Vec::with_capacity(rows.len());
 	for row in rows {
@@ -54,7 +55,7 @@ pub async fn create(
 	.bind(&subscription_json)
 	.execute(db)
 	.await
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	Ok(u64::try_from(result.last_insert_rowid()).unwrap_or_default())
 }
@@ -66,7 +67,7 @@ pub async fn delete(db: &SqlitePool, tn_id: TnId, subscription_id: u64) -> ClRes
 		.bind(subscription_id.cast_signed())
 		.execute(db)
 		.await
-		.or(Err(Error::DbError))?;
+		.db()?;
 
 	Ok(())
 }

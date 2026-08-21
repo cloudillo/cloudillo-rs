@@ -11,7 +11,7 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use cloudillo_types::prelude::*;
 
-use crate::utils::{escape_like, inspect};
+use crate::utils::{Db, escape_like};
 
 /// Maximum number of prefixes allowed in a single query to prevent DoS
 const MAX_PREFIXES: usize = 20;
@@ -52,12 +52,7 @@ pub(crate) async fn list(
 			}
 			builder.push(")");
 
-			builder
-				.build()
-				.fetch_all(db)
-				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?
+			builder.build().fetch_all(db).await.db()?
 		}
 		_ => {
 			// No prefix or empty prefix list - return all settings
@@ -65,8 +60,7 @@ pub(crate) async fn list(
 				.bind(tn_id.0)
 				.fetch_all(db)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?
+				.db()?
 		}
 	};
 
@@ -97,8 +91,7 @@ pub(crate) async fn read(
 		.bind(name)
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	Ok(row.and_then(|r| {
 		let value: Option<String> = r.get("value");
@@ -121,8 +114,7 @@ pub(crate) async fn update(
 			.bind(value_str)
 			.execute(db)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 	} else {
 		// Delete setting if value is None
 		sqlx::query("DELETE FROM settings WHERE tn_id = ? AND name = ?")
@@ -130,8 +122,7 @@ pub(crate) async fn update(
 			.bind(name)
 			.execute(db)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 	}
 
 	Ok(())

@@ -21,7 +21,7 @@ use cloudillo_types::{
 };
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::{escape_like, push_patch};
+use crate::utils::{Db, escape_like, push_patch};
 
 // Calendars //
 //***********//
@@ -68,8 +68,7 @@ pub async fn list_calendars(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<Calend
 	.bind(tn_id.0)
 	.fetch_all(db)
 	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	Ok(rows.iter().map(row_to_calendar).collect())
 }
@@ -84,8 +83,7 @@ pub async fn get_calendar(db: &SqlitePool, tn_id: TnId, cal_id: u64) -> ClResult
 	.bind(cal_id.cast_signed())
 	.fetch_optional(db)
 	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	Ok(row.as_ref().map(row_to_calendar))
 }
@@ -104,8 +102,7 @@ pub async fn get_calendar_by_name(
 	.bind(name)
 	.fetch_optional(db)
 	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	Ok(row.as_ref().map(row_to_calendar))
 }
@@ -131,12 +128,7 @@ pub async fn update_calendar(
 	query.push(" WHERE tn_id = ").push_bind(tn_id.0);
 	query.push(" AND cal_id = ").push_bind(cal_id.cast_signed());
 
-	let res = query
-		.build()
-		.execute(db)
-		.await
-		.inspect_err(|e| error!("DB: {e}"))
-		.or(Err(Error::DbError))?;
+	let res = query.build().execute(db).await.db()?;
 
 	if res.rows_affected() == 0 {
 		return Err(Error::NotFound);
@@ -145,22 +137,20 @@ pub async fn update_calendar(
 }
 
 pub async fn delete_calendar(db: &SqlitePool, tn_id: TnId, cal_id: u64) -> ClResult<()> {
-	let mut tx = db.begin().await.or(Err(Error::DbError))?;
+	let mut tx = db.begin().await.db()?;
 	sqlx::query("DELETE FROM calendar_objects WHERE tn_id = ? AND cal_id = ?")
 		.bind(tn_id.0)
 		.bind(cal_id.cast_signed())
 		.execute(&mut *tx)
 		.await
-		.inspect_err(|e| error!("DB: {e}"))
-		.or(Err(Error::DbError))?;
+		.db()?;
 	let res = sqlx::query("DELETE FROM calendars WHERE tn_id = ? AND cal_id = ?")
 		.bind(tn_id.0)
 		.bind(cal_id.cast_signed())
 		.execute(&mut *tx)
 		.await
-		.inspect_err(|e| error!("DB: {e}"))
-		.or(Err(Error::DbError))?;
-	tx.commit().await.or(Err(Error::DbError))?;
+		.db()?;
+	tx.commit().await.db()?;
 
 	if res.rows_affected() == 0 {
 		return Err(Error::NotFound);
@@ -309,12 +299,7 @@ pub async fn list_calendar_objects(
 	let limit = opts.limit.unwrap_or(200).min(1000);
 	query.push(" LIMIT ").push_bind(i64::from(limit) + 1);
 
-	let rows = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(|e| error!("DB: {e}"))
-		.or(Err(Error::DbError))?;
+	let rows = query.build().fetch_all(db).await.db()?;
 
 	Ok(rows.iter().map(row_to_view).collect())
 }
@@ -335,8 +320,7 @@ pub async fn get_calendar_object(
 	.bind(uid)
 	.fetch_optional(db)
 	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	Ok(row.as_ref().map(row_to_object))
 }
@@ -359,8 +343,7 @@ pub async fn get_calendar_object_override(
 	.bind(recurrence_id.0)
 	.fetch_optional(db)
 	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	Ok(row.as_ref().map(row_to_object))
 }
@@ -381,8 +364,7 @@ pub async fn list_calendar_object_overrides(
 	.bind(uid)
 	.fetch_all(db)
 	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	Ok(rows.iter().map(row_to_object).collect())
 }
@@ -394,7 +376,7 @@ pub async fn delete_calendar_object_override(
 	uid: &str,
 	recurrence_id: Timestamp,
 ) -> ClResult<()> {
-	let mut tx = db.begin().await.or(Err(Error::DbError))?;
+	let mut tx = db.begin().await.db()?;
 
 	let res = sqlx::query(
 		"UPDATE calendar_objects SET deleted_at = unixepoch() \
@@ -407,8 +389,7 @@ pub async fn delete_calendar_object_override(
 	.bind(recurrence_id.0)
 	.execute(&mut *tx)
 	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	if res.rows_affected() == 0 {
 		return Err(Error::NotFound);
@@ -416,7 +397,7 @@ pub async fn delete_calendar_object_override(
 
 	bump_calendar_ctag_tx(&mut tx, tn_id, cal_id).await?;
 
-	tx.commit().await.or(Err(Error::DbError))?;
+	tx.commit().await.db()?;
 	Ok(())
 }
 
@@ -454,7 +435,7 @@ pub async fn upsert_calendar_object(
 	etag: &str,
 	extracted: &CalendarObjectExtracted,
 ) -> ClResult<Box<str>> {
-	let mut tx = db.begin().await.or(Err(Error::DbError))?;
+	let mut tx = db.begin().await.db()?;
 	let stored_etag = upsert_calendar_object_tx(
 		&mut tx,
 		tn_id,
@@ -463,7 +444,7 @@ pub async fn upsert_calendar_object(
 	)
 	.await?;
 	bump_calendar_ctag_tx(&mut tx, tn_id, cal_id).await?;
-	tx.commit().await.or(Err(Error::DbError))?;
+	tx.commit().await.db()?;
 	Ok(stored_etag)
 }
 
@@ -481,8 +462,7 @@ async fn bump_calendar_ctag_tx(
 	.bind(cal_id.cast_signed())
 	.execute(&mut **tx)
 	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	.db()?;
 	Ok(())
 }
 
@@ -492,7 +472,7 @@ pub async fn delete_calendar_object(
 	cal_id: u64,
 	uid: &str,
 ) -> ClResult<()> {
-	let mut tx = db.begin().await.or(Err(Error::DbError))?;
+	let mut tx = db.begin().await.db()?;
 
 	let res = sqlx::query(
 		"UPDATE calendar_objects SET deleted_at = unixepoch() \
@@ -503,8 +483,7 @@ pub async fn delete_calendar_object(
 	.bind(uid)
 	.execute(&mut *tx)
 	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	if res.rows_affected() == 0 {
 		return Err(Error::NotFound);
@@ -512,7 +491,7 @@ pub async fn delete_calendar_object(
 
 	bump_calendar_ctag_tx(&mut tx, tn_id, cal_id).await?;
 
-	tx.commit().await.or(Err(Error::DbError))?;
+	tx.commit().await.db()?;
 	Ok(())
 }
 
@@ -566,8 +545,7 @@ async fn upsert_calendar_object_tx(
 		.bind(extracted.sequence)
 		.execute(&mut **tx)
 		.await
-		.inspect_err(|e| error!("DB: {e}"))
-		.or(Err(Error::DbError))?;
+		.db()?;
 
 	Ok(Box::<str>::from(etag))
 }
@@ -582,7 +560,7 @@ pub async fn split_calendar_object_series(
 	tail: CalendarObjectWrite<'_>,
 	split_at: Timestamp,
 ) -> ClResult<(Box<str>, Box<str>)> {
-	let mut tx = db.begin().await.or(Err(Error::DbError))?;
+	let mut tx = db.begin().await.db()?;
 
 	// 1. Update the master in place.
 	let new_master_etag = upsert_calendar_object_tx(&mut tx, tn_id, cal_id, master).await?;
@@ -601,8 +579,7 @@ pub async fn split_calendar_object_series(
 	.bind(split_at.0)
 	.execute(&mut *tx)
 	.await
-	.inspect_err(|e| error!("DB: {e}"))
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	// 3. Insert the tail as a fresh master. If the caller picked a colliding UID
 	//    by accident the partial unique index fires and the whole tx rolls back.
@@ -611,7 +588,7 @@ pub async fn split_calendar_object_series(
 	// 4. Bump the calendar's ctag once for the whole fork.
 	bump_calendar_ctag_tx(&mut tx, tn_id, cal_id).await?;
 
-	tx.commit().await.or(Err(Error::DbError))?;
+	tx.commit().await.db()?;
 	Ok((new_master_etag, new_tail_etag))
 }
 
@@ -638,12 +615,7 @@ pub async fn get_calendar_objects_by_uids(
 	}
 	query.push(")");
 
-	let rows = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(|e| error!("DB: {e}"))
-		.or(Err(Error::DbError))?;
+	let rows = query.build().fetch_all(db).await.db()?;
 
 	Ok(rows.iter().map(row_to_object).collect())
 }
@@ -674,12 +646,7 @@ pub async fn list_calendar_objects_since(
 		query.push(" LIMIT ").push_bind(i64::from(n));
 	}
 
-	let rows = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(|e| error!("DB: {e}"))
-		.or(Err(Error::DbError))?;
+	let rows = query.build().fetch_all(db).await.db()?;
 
 	Ok(rows
 		.into_iter()
@@ -724,12 +691,7 @@ pub async fn query_calendar_objects_in_range(
 
 	query.push(" ORDER BY dtstart ASC, co_id ASC");
 
-	let rows = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(|e| error!("DB: {e}"))
-		.or(Err(Error::DbError))?;
+	let rows = query.build().fetch_all(db).await.db()?;
 
 	Ok(rows.iter().map(row_to_object).collect())
 }

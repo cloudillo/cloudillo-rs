@@ -101,7 +101,7 @@ fn decode_challenge_jwt<T: for<'de> Deserialize<'de>>(token: &str, secret: &str)
 ///
 /// The public_key field stores the full Passkey JSON serialization
 fn stored_to_passkey(stored: &auth_adapter::Webauthn) -> ClResult<Passkey> {
-	serde_json::from_str(stored.public_key).map_err(|e| {
+	serde_json::from_str(&stored.public_key).map_err(|e| {
 		warn!("Failed to deserialize Passkey: {:?}", e);
 		Error::Internal("Failed to deserialize Passkey".into())
 	})
@@ -209,7 +209,10 @@ pub async fn list_reg(
 		.iter()
 		.map(|c| CredentialInfo {
 			credential_id: c.credential_id.to_string(),
-			description: c.description.map_or_else(|| "Passkey".to_string(), ToString::to_string),
+			description: c
+				.description
+				.as_deref()
+				.map_or_else(|| "Passkey".to_string(), ToString::to_string),
 		})
 		.collect();
 
@@ -229,7 +232,7 @@ pub async fn get_reg_challenge(
 	let existing = app.auth_adapter.list_webauthn_credentials(auth.tn_id).await?;
 	let exclude_credentials: Vec<CredentialID> = existing
 		.iter()
-		.filter_map(|c| URL_SAFE_NO_PAD.decode(c.credential_id).ok())
+		.filter_map(|c| URL_SAFE_NO_PAD.decode(c.credential_id.as_bytes()).ok())
 		.map(CredentialID::from)
 		.collect();
 
@@ -331,10 +334,10 @@ pub async fn post_reg(
 	// Store the credential
 	// Note: public_key field stores the full Passkey JSON
 	let webauthn_data = auth_adapter::Webauthn {
-		credential_id: &cred_id,
+		credential_id: cred_id.as_str().into(),
 		counter: 0, // Initial counter, will be managed by Passkey internally
-		public_key: &passkey_json,
-		description: Some(&description),
+		public_key: passkey_json.as_str().into(),
+		description: Some(description.as_str().into()),
 	};
 	app.auth_adapter.create_webauthn_credential(auth.tn_id, &webauthn_data).await?;
 

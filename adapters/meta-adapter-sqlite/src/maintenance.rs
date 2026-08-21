@@ -35,7 +35,7 @@
 use cloudillo_types::{meta_adapter::SpaceReport, prelude::*};
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::inspect;
+use crate::utils::Db;
 
 /// Merge the two FTS indexes' segments.
 ///
@@ -57,11 +57,7 @@ pub(crate) async fn optimize_search_index(db: &SqlitePool, full: bool) -> ClResu
 		} else {
 			format!("INSERT INTO {table}({table}, rank) VALUES('merge', {MERGE_PAGES})")
 		};
-		sqlx::query(sqlx::AssertSqlSafe(stmt))
-			.execute(db)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+		sqlx::query(sqlx::AssertSqlSafe(stmt)).execute(db).await.db()?;
 	}
 	Ok(())
 }
@@ -74,19 +70,11 @@ pub(crate) async fn optimize_search_index(db: &SqlitePool, full: bool) -> ClResu
 pub(crate) async fn reclaim_space(db: &SqlitePool, min_free_pct: i64) -> ClResult<SpaceReport> {
 	// Nothing truncates the WAL otherwise: under `journal_mode=WAL` SQLite
 	// checkpoints automatically but leaves the file at its high-water mark.
-	sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(db).await.db()?;
 
 	// SQLite's recommended periodic maintenance: re-runs ANALYZE only on the
 	// indexes whose statistics have gone stale enough to matter.
-	sqlx::query("PRAGMA optimize")
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	sqlx::query("PRAGMA optimize").execute(db).await.db()?;
 
 	let page_size = read_pragma(db, "PRAGMA page_size").await?;
 	let page_count = read_pragma(db, "PRAGMA page_count").await?;
@@ -97,20 +85,12 @@ pub(crate) async fn reclaim_space(db: &SqlitePool, min_free_pct: i64) -> ClResul
 
 	let mut report = SpaceReport { page_size, page_count, freelist_count, vacuumed };
 	if vacuumed {
-		sqlx::query("VACUUM")
-			.execute(db)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+		sqlx::query("VACUUM").execute(db).await.db()?;
 
 		// The checkpoint above ran before the rewrite, so it cannot have truncated
 		// the full copy `VACUUM` just wrote through the WAL. Without this second
 		// one the journal sits at that high-water mark until the next nightly run.
-		sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-			.execute(db)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+		sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(db).await.db()?;
 
 		// The pre-rewrite numbers describe the database the caller asked about,
 		// not the one it now has, and the report is what the log line and the
@@ -124,12 +104,8 @@ pub(crate) async fn reclaim_space(db: &SqlitePool, min_free_pct: i64) -> ClResul
 
 /// Read a single-value PRAGMA. `pragma` is an internal constant, never input.
 async fn read_pragma(db: &SqlitePool, pragma: &str) -> ClResult<i64> {
-	let row = sqlx::query(sqlx::AssertSqlSafe(pragma.to_string()))
-		.fetch_one(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-	row.try_get::<i64, _>(0).inspect_err(inspect).map_err(|_| Error::DbError)
+	let row = sqlx::query(sqlx::AssertSqlSafe(pragma.to_string())).fetch_one(db).await.db()?;
+	row.try_get::<i64, _>(0).db()
 }
 
 // vim: ts=4

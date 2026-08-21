@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use cloudillo_types::utils::normalize_id_tag;
 
-use crate::utils::{inspect, push_patch};
+use crate::utils::{Db, push_patch};
 use cloudillo_types::meta_adapter::{
 	ListTenantsMetaOptions, ProfileType, Tenant, TenantListMeta, UpdateTenantData,
 };
@@ -30,38 +30,35 @@ pub(crate) async fn read(dbr: &SqlitePool, tn_id: TnId) -> ClResult<Tenant<Box<s
 			Err(Error::DbError)
 		}
 		Ok(row) => {
-			let xs: Option<String> = row.try_get("x").or(Err(Error::DbError))?;
+			let xs: Option<String> = row.try_get("x").db()?;
 			let x: HashMap<Box<str>, Box<str>> = match xs {
-				Some(json_str) => serde_json::from_str(&json_str).or(Err(Error::DbError))?,
+				Some(json_str) => serde_json::from_str(&json_str).map_err(|_| Error::DbError)?,
 				None => HashMap::new(),
 			};
 			Ok(Tenant {
 				tn_id,
-				id_tag: row.try_get("id_tag").or(Err(Error::DbError))?,
-				name: row.try_get("name").or(Err(Error::DbError))?,
-				typ: match row.try_get("type").or(Err(Error::DbError))? {
+				id_tag: row.try_get("id_tag").db()?,
+				name: row.try_get("name").db()?,
+				typ: match row.try_get("type").db()? {
 					"P" => ProfileType::Person,
 					"C" => ProfileType::Community,
 					_ => return Err(Error::DbError),
 				},
-				profile_pic: row.try_get("profile_pic").or(Err(Error::DbError))?,
-				cover_pic: row.try_get("cover_pic").or(Err(Error::DbError))?,
-				created_at: row.try_get("created_at").map(Timestamp).or(Err(Error::DbError))?,
-				last_seen_at: row
-					.try_get::<Option<i64>, _>("last_seen_at")
-					.or(Err(Error::DbError))?
-					.map(Timestamp),
+				profile_pic: row.try_get("profile_pic").db()?,
+				cover_pic: row.try_get("cover_pic").db()?,
+				created_at: row.try_get("created_at").map(Timestamp).db()?,
+				last_seen_at: row.try_get::<Option<i64>, _>("last_seen_at").db()?.map(Timestamp),
 				notify_email_direct_at: row
 					.try_get::<Option<i64>, _>("notify_email_direct_at")
-					.or(Err(Error::DbError))?
+					.db()?
 					.map(Timestamp),
 				notify_email_engagement_at: row
 					.try_get::<Option<i64>, _>("notify_email_engagement_at")
-					.or(Err(Error::DbError))?
+					.db()?
 					.map(Timestamp),
 				notify_email_social_at: row
 					.try_get::<Option<i64>, _>("notify_email_social_at")
-					.or(Err(Error::DbError))?
+					.db()?
 					.map(Timestamp),
 				x,
 			})
@@ -82,8 +79,7 @@ pub(crate) async fn create(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClResu
 	.bind(id_tag)
 	.execute(db)
 	.await
-	.inspect_err(|err| warn!("DB: {:#?}", err))
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	// Create corresponding profile entry for the tenant
 	// Uses tenant's name and type from the just-inserted row
@@ -94,8 +90,7 @@ pub(crate) async fn create(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClResu
 	.bind(tn_id.0)
 	.execute(db)
 	.await
-	.inspect_err(|err| warn!("DB: {:#?}", err))
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	Ok(tn_id)
 }
@@ -109,10 +104,10 @@ pub(crate) async fn update(
 	// Get current id_tag for profile sync (before potential id_tag change)
 	let current_id_tag: Box<str> = sqlx::query_scalar("SELECT id_tag FROM tenants WHERE tn_id = ?")
 		.bind(tn_id.0)
-		.fetch_one(db)
+		.fetch_optional(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+		.db()?
+		.ok_or(Error::NotFound)?;
 
 	// Build dynamic UPDATE query based on what fields are present
 	let mut query = sqlx::QueryBuilder::new("UPDATE tenants SET ");
@@ -171,12 +166,7 @@ pub(crate) async fn update(
 
 	query.push(" WHERE tn_id=").push_bind(tn_id.0);
 
-	let res = query
-		.build()
-		.execute(db)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+	let res = query.build().execute(db).await.db()?;
 
 	if res.rows_affected() == 0 {
 		return Err(Error::NotFound);
@@ -219,7 +209,7 @@ pub(crate) async fn update(
 			.execute(db)
 			.await
 			.inspect_err(|err| warn!("DB profile sync: {:#?}", err))
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 	}
 
 	Ok(())
@@ -270,7 +260,7 @@ const TENANT_CASCADE_TABLES: &[&str] = &[
 
 /// Delete a tenant and all its associated data (cascading delete)
 pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId) -> ClResult<()> {
-	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 
 	// `task_dependencies` is keyed by task_id, not tn_id — clear it before the
 	// `tasks` rows go away (the subquery would otherwise miss them).
@@ -280,8 +270,7 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId) -> ClResult<()> {
 	.bind(tn_id.0)
 	.execute(&mut *tx)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	// Must run before the `search_docs` rows go: the contentless FTS index has no
 	// trigger behind it and cannot be rebuilt from its content, so entries missed
@@ -293,22 +282,20 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId) -> ClResult<()> {
 			.bind(tn_id.0)
 			.execute(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 	}
 
 	let res = sqlx::query("DELETE FROM tenants WHERE tn_id=?")
 		.bind(tn_id.0)
 		.execute(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	if res.rows_affected() == 0 {
 		return Err(Error::NotFound);
 	}
 
-	tx.commit().await.map_err(|_| Error::DbError)?;
+	tx.commit().await.db()?;
 	Ok(())
 }
 
@@ -329,12 +316,7 @@ pub(crate) async fn list(
 		query.push(" OFFSET ").push_bind(offset);
 	}
 
-	let rows = query
-		.build()
-		.fetch_all(dbr)
-		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+	let rows = query.build().fetch_all(dbr).await.db()?;
 
 	let tenants: Vec<TenantListMeta> = rows
 		.into_iter()
@@ -370,8 +352,7 @@ pub(crate) async fn read_data(
 		.bind(name)
 		.fetch_optional(dbr)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)
+		.db()
 		.map(Option::flatten)
 }
 
@@ -396,7 +377,6 @@ pub(crate) async fn write_data(
 	}
 	.execute(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	Ok(())
 }

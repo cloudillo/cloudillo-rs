@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::{async_map_res, inspect, map_res, parse_str_list_optional};
+use crate::utils::{Db, async_map_res, inspect, map_res, parse_str_list_optional};
 use cloudillo_types::{
 	auth_adapter::{AuthProfile, CreateTenantData, ListTenantsOptions, TenantListItem},
 	prelude::*,
@@ -80,8 +80,7 @@ pub(crate) async fn update_tenant_status(
 		.bind(tn_id.0)
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+		.db()?;
 	Ok(())
 }
 
@@ -92,8 +91,7 @@ pub(crate) async fn create_tenant_registration(db: &SqlitePool, email: &str) -> 
 		.bind(email)
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+		.db()?;
 
 	if existing.is_some() {
 		return Err(Error::PermissionDenied); // Email already registered
@@ -110,8 +108,7 @@ pub(crate) async fn create_tenant_registration(db: &SqlitePool, email: &str) -> 
 	.bind(email)
 	.execute(db)
 	.await
-	.inspect_err(inspect)
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	info!("Tenant registration initiated for email: {}", email);
 	Ok(())
@@ -132,16 +129,14 @@ pub(crate) async fn create_tenant(
 				.bind(vfy_code)
 				.fetch_optional(db)
 				.await
-				.inspect_err(inspect)
-				.or(Err(Error::DbError))?;
+				.db()?;
 
 			let Some(vfy_row) = row else {
 				// Verification code not found
 				return Err(Error::PermissionDenied);
 			};
 
-			let stored_email: String =
-				vfy_row.try_get("email").inspect_err(inspect).or(Err(Error::DbError))?;
+			let stored_email: String = vfy_row.try_get("email").db()?;
 			if stored_email != email_addr {
 				// Email mismatch - code belongs to different email
 				return Err(Error::PermissionDenied);
@@ -152,8 +147,7 @@ pub(crate) async fn create_tenant(
 				.bind(vfy_code)
 				.execute(db)
 				.await
-				.inspect_err(inspect)
-				.or(Err(Error::DbError))?;
+				.db()?;
 		} else {
 			// vfy_code provided but no email
 			return Err(Error::PermissionDenied);
@@ -198,16 +192,15 @@ pub(crate) async fn delete_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<()>
 		.bind(normalize_id_tag(id_tag).as_ref())
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+		.db()?;
 
 	let Some(row) = res else {
 		return Err(Error::NotFound);
 	};
 
-	let tn_id: i32 = row.try_get("tn_id").inspect_err(inspect).or(Err(Error::DbError))?;
+	let tn_id: i32 = row.try_get("tn_id").db()?;
 
-	let mut tx = db.begin().await.inspect_err(inspect).or(Err(Error::DbError))?;
+	let mut tx = db.begin().await.db()?;
 
 	// `user_vfy` is joined via email rather than tn_id; clean it before the
 	// `tenants` row goes away (the subquery would otherwise miss rows).
@@ -215,26 +208,23 @@ pub(crate) async fn delete_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<()>
 		.bind(tn_id)
 		.execute(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+		.db()?;
 
 	for table in TENANT_CASCADE_TABLES {
 		sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table} WHERE tn_id = ?1")))
 			.bind(tn_id)
 			.execute(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.or(Err(Error::DbError))?;
+			.db()?;
 	}
 
 	sqlx::query("DELETE FROM tenants WHERE tn_id = ?1")
 		.bind(tn_id)
 		.execute(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+		.db()?;
 
-	tx.commit().await.inspect_err(inspect).or(Err(Error::DbError))?;
+	tx.commit().await.db()?;
 
 	info!("Tenant deleted: {}", id_tag);
 	Ok(())
@@ -279,19 +269,19 @@ pub(crate) async fn list_tenants(
 		query.push(" OFFSET ").push_bind(offset);
 	}
 
-	let rows = query.build().fetch_all(db).await.inspect_err(inspect).or(Err(Error::DbError))?;
+	let rows = query.build().fetch_all(db).await.db()?;
 
 	let tenants = rows
 		.into_iter()
 		.map(|row| -> ClResult<TenantListItem> {
-			let roles_str: Option<Box<str>> = row.try_get("roles").map_err(|_| Error::DbError)?;
+			let roles_str: Option<Box<str>> = row.try_get("roles").db()?;
 			Ok(TenantListItem {
-				tn_id: TnId(row.try_get("tn_id").map_err(|_| Error::DbError)?),
-				id_tag: row.try_get("id_tag").map_err(|_| Error::DbError)?,
-				email: row.try_get("email").map_err(|_| Error::DbError)?,
+				tn_id: TnId(row.try_get("tn_id").db()?),
+				id_tag: row.try_get("id_tag").db()?,
+				email: row.try_get("email").db()?,
 				roles: parse_str_list_optional(roles_str.as_deref()),
-				status: row.try_get("status").map_err(|_| Error::DbError)?,
-				created_at: Timestamp(row.try_get("created_at").map_err(|_| Error::DbError)?),
+				status: row.try_get("status").db()?,
+				created_at: Timestamp(row.try_get("created_at").db()?),
 			})
 		})
 		.collect::<ClResult<Vec<_>>>()?;
@@ -319,8 +309,8 @@ pub(crate) async fn count_tenants(
 			.push(" ESCAPE '\\')");
 	}
 
-	let row = query.build().fetch_one(db).await.inspect_err(inspect).or(Err(Error::DbError))?;
+	let row = query.build().fetch_one(db).await.db()?;
 
-	let count: i64 = row.try_get("cnt").map_err(|_| Error::DbError)?;
+	let count: i64 = row.try_get("cnt").db()?;
 	usize::try_from(count).map_err(|_| Error::DbError)
 }

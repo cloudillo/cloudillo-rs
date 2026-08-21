@@ -8,6 +8,7 @@
 //! an existing row) and ordering by the encoded `format_version` (`MMMmmmppp`) are the
 //! handler's job, not this module's.
 
+use crate::utils::Db;
 use cloudillo_types::{
 	meta_adapter::{DocFormat, UpsertDocFormat},
 	prelude::*,
@@ -26,14 +27,9 @@ pub async fn read(db: &SqlitePool, tn_id: TnId, content_type: &str) -> ClResult<
 	.bind(content_type)
 	.fetch_optional(db)
 	.await
-	.inspect_err(crate::utils::inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
-	row.as_ref()
-		.map(map_row)
-		.transpose()
-		.inspect_err(crate::utils::inspect)
-		.map_err(|_| Error::DbError)
+	row.as_ref().map(map_row).transpose().db()
 }
 
 /// List every active manifest of this tenant.
@@ -46,8 +42,7 @@ pub async fn list(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<DocFormat>> {
 	.bind(tn_id.0)
 	.fetch_all(db)
 	.await
-	.inspect_err(crate::utils::inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	crate::utils::collect_res(rows.iter().map(map_row))
 }
@@ -84,8 +79,7 @@ pub async fn upsert(db: &SqlitePool, tn_id: TnId, fmt: &UpsertDocFormat<'_>) -> 
 	.bind(x)
 	.execute(db)
 	.await
-	.inspect_err(crate::utils::inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	Ok(())
 }
@@ -97,8 +91,7 @@ pub async fn delete(db: &SqlitePool, tn_id: TnId, content_type: &str) -> ClResul
 		.bind(content_type)
 		.execute(db)
 		.await
-		.inspect_err(crate::utils::inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	if res.rows_affected() == 0 {
 		return Err(Error::NotFound);

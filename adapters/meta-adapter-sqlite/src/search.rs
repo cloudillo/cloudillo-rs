@@ -44,7 +44,7 @@ use cloudillo_types::{
 };
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 
-use crate::utils::{escape_fts_query, inspect};
+use crate::utils::{Db, escape_fts_query};
 
 /// Rows per multi-row INSERT. Each row binds 18 variables — the 19th column,
 /// `updated_at`, is a `unixepoch()` literal — so 500 rows is 9000, comfortably
@@ -169,8 +169,7 @@ async fn existing_rows(
 	.bind(obj_id)
 	.fetch_all(&mut **tx)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	let contentless: Vec<i64> = rows
 		.iter()
@@ -202,12 +201,7 @@ async fn delete_contentless(tx: &mut Transaction<'_, Sqlite>, s_ids: &[i64]) -> 
 			sep.push_bind(*s_id);
 		}
 		sep.push_unseparated(")");
-		query
-			.build()
-			.execute(&mut **tx)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+		query.build().execute(&mut **tx).await.db()?;
 	}
 	Ok(())
 }
@@ -234,8 +228,7 @@ async fn purge_contentless_where(
 	let s_ids: Vec<i64> = query
 		.fetch_all(&mut **tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?
+		.db()?
 		.iter()
 		.map(|r| r.get::<i64, _>("s_id"))
 		.collect();
@@ -262,7 +255,7 @@ pub async fn replace_object(
 	obj: &SearchObject<'_>,
 	parts: &[SearchPart<'_>],
 ) -> ClResult<()> {
-	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 
 	let existing = existing_rows(&mut tx, tn_id, obj.obj_tp, obj.obj_id, RowScope::All).await?;
 	let hash = object_hash(obj, parts);
@@ -277,7 +270,7 @@ pub async fn replace_object(
 	if !parts.is_empty() && existing.hash.as_deref() == Some(hash.as_str()) {
 		if obj.obj_tp == OBJ_DOC {
 			refresh_file_acl(&mut tx, tn_id, obj.obj_id).await?;
-			tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+			tx.commit().await.db()?;
 		}
 		return Ok(());
 	}
@@ -290,8 +283,7 @@ pub async fn replace_object(
 		.bind(obj.obj_id)
 		.execute(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	let created_at = obj.created_at.map(|ts| ts.0);
 	let visibility = obj.visibility.map(|c| c.to_string());
@@ -338,12 +330,7 @@ pub async fn replace_object(
 				.push_bind(i64::from(obj.fts_cl))
 				.push_bind(hash.as_str());
 		});
-		query
-			.build()
-			.execute(&mut *tx)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+		query.build().execute(&mut *tx).await.db()?;
 
 		if obj.fts_cl {
 			// `tn_id` is a real FTS column here, not metadata: the query builder
@@ -359,11 +346,7 @@ pub async fn replace_object(
 					.push_bind(part.tags)
 					.push_bind(tn_id.0);
 			});
-			fts.build()
-				.execute(&mut *tx)
-				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?;
+			fts.build().execute(&mut *tx).await.db()?;
 		}
 
 		next_s_id = base + i64::try_from(chunk.len()).unwrap_or(0);
@@ -375,7 +358,7 @@ pub async fn replace_object(
 		refresh_file_acl(&mut tx, tn_id, obj.obj_id).await?;
 	}
 
-	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	tx.commit().await.db()?;
 	Ok(())
 }
 
@@ -401,8 +384,7 @@ async fn alloc_s_ids(tx: &mut Transaction<'_, Sqlite>) -> ClResult<i64> {
 	)
 	.fetch_one(&mut **tx)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	Ok(base + 1)
 }
 
@@ -413,7 +395,7 @@ pub async fn delete_object(
 	obj_tp: char,
 	obj_id: &str,
 ) -> ClResult<()> {
-	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 	purge_contentless_where(
 		&mut tx,
 		"tn_id=? AND obj_tp=? AND obj_id=?",
@@ -427,9 +409,8 @@ pub async fn delete_object(
 		.bind(obj_id)
 		.execute(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		.db()?;
+	tx.commit().await.db()?;
 	Ok(())
 }
 
@@ -445,7 +426,7 @@ pub async fn delete_deep_by_content_type(
 	tn_id: TnId,
 	content_type: &str,
 ) -> ClResult<()> {
-	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 	purge_contentless_where(
 		&mut tx,
 		"tn_id=? AND content_type=? AND obj_tp='D'",
@@ -458,9 +439,8 @@ pub async fn delete_deep_by_content_type(
 		.bind(content_type)
 		.execute(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		.db()?;
+	tx.commit().await.db()?;
 	Ok(())
 }
 
@@ -542,7 +522,7 @@ pub async fn replace_row(
 		));
 	}
 
-	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 
 	let existing = existing_rows(&mut tx, tn_id, obj_tp, obj_id, RowScope::Whole).await?;
 
@@ -581,8 +561,7 @@ pub async fn replace_row(
 				.bind(obj_id)
 				.fetch_optional(&mut *tx)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?
+				.db()?
 				.is_some();
 		} else {
 			// An upsert cannot move a row between the two indexes: the AU trigger
@@ -604,8 +583,7 @@ pub async fn replace_row(
 				.bind(obj_id)
 				.execute(&mut *tx)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?;
+				.db()?;
 			}
 
 			// `RETURNING s_id` covers both arms of the upsert, so the contentless
@@ -626,8 +604,7 @@ pub async fn replace_row(
 				.bind(obj_id)
 				.fetch_optional(&mut *tx)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?;
+				.db()?;
 			alive = s_id.is_some();
 
 			if let Some(s_id) = s_id
@@ -647,8 +624,7 @@ pub async fn replace_row(
 				.bind(tn_id.0)
 				.execute(&mut *tx)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?;
+				.db()?;
 			}
 		}
 	} else if !part_rows.is_empty() {
@@ -660,8 +636,7 @@ pub async fn replace_row(
 			.bind(obj_id)
 			.fetch_optional(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?
+			.db()?
 			.is_some();
 		if alive {
 			delete_contentless(&mut tx, &existing.contentless).await?;
@@ -673,8 +648,7 @@ pub async fn replace_row(
 			.bind(obj_id)
 			.execute(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 		}
 	}
 
@@ -697,8 +671,7 @@ pub async fn replace_row(
 				.bind(obj_id)
 				.execute(&mut *tx)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?;
+				.db()?;
 		}
 	} else if obj_tp == OBJ_FILE {
 		replace_parts(&mut tx, tn_id, obj_id, part_rows, fts_cl).await?;
@@ -708,7 +681,7 @@ pub async fn replace_row(
 		refresh_file_acl(&mut tx, tn_id, obj_id).await?;
 	}
 
-	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	tx.commit().await.db()?;
 	Ok(())
 }
 
@@ -763,8 +736,7 @@ async fn replace_parts(
 	.bind(obj_id)
 	.execute(&mut **tx)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	{
 		let mut next_s_id = if parts.is_empty() { 0 } else { alloc_s_ids(tx).await? };
@@ -814,12 +786,7 @@ async fn replace_parts(
 					.push_bind(i64::from(fts_cl))
 					.push_bind(hash.as_str());
 			});
-			query
-				.build()
-				.execute(&mut **tx)
-				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?;
+			query.build().execute(&mut **tx).await.db()?;
 
 			if fts_cl {
 				// `tn_id` is a real FTS column here, not metadata: the query builder
@@ -835,11 +802,7 @@ async fn replace_parts(
 						.push_bind(part.tags)
 						.push_bind(tn_id.0);
 				});
-				fts.build()
-					.execute(&mut **tx)
-					.await
-					.inspect_err(inspect)
-					.map_err(|_| Error::DbError)?;
+				fts.build().execute(&mut **tx).await.db()?;
 			}
 
 			next_s_id = base + i64::try_from(chunk.len()).unwrap_or(0);
@@ -876,8 +839,7 @@ async fn fill_part_created_at(
 	.bind(file_id)
 	.execute(&mut **tx)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	Ok(())
 }
 
@@ -943,8 +905,7 @@ async fn refresh_file_acl(
 	.bind(file_id)
 	.execute(&mut **tx)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	Ok(())
 }
 
@@ -1055,17 +1016,16 @@ pub async fn reap_orphans(db: &SqlitePool, tn_id: TnId) -> ClResult<()> {
 		 AND NOT EXISTS (SELECT 1 FROM files f \
 		   WHERE f.tn_id = search_docs.tn_id AND f.file_id = search_docs.obj_id)",
 	];
-	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 	for pred in preds {
 		purge_contentless_where(&mut tx, pred, &[], tn_id).await?;
 		sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM search_docs WHERE {pred}")))
 			.bind(tn_id.0)
 			.execute(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 	}
-	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	tx.commit().await.db()?;
 	Ok(())
 }
 
@@ -1144,12 +1104,7 @@ pub async fn search(
 		.push_bind(i64::from(opts.limit.clamp(1, SEARCH_MAX_LIMIT)));
 	query.push(" OFFSET ").push_bind(i64::from(opts.offset.min(SEARCH_MAX_OFFSET)));
 
-	let rows = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let rows = query.build().fetch_all(db).await.db()?;
 
 	// A row whose `obj_tp` will not decode is corrupt index data — `obj_tp` is
 	// `char(1) NOT NULL` but SQLite enforces neither the length nor a CHECK, so
@@ -1232,12 +1187,7 @@ pub async fn count(db: &SqlitePool, tn_id: TnId, opts: &SearchOptions) -> ClResu
 	push_search_filters(&mut query, tn_id, opts)?;
 	query.push(" LIMIT ").push_bind(COUNT_CAP).push(")");
 
-	let row = query
-		.build()
-		.fetch_one(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let row = query.build().fetch_one(db).await.db()?;
 	Ok(row.get("n"))
 }
 

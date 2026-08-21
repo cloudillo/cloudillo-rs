@@ -5,7 +5,7 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::inspect;
+use crate::utils::Db;
 use cloudillo_types::{auth_adapter::KeyPair, prelude::*};
 
 /// Read VAPID key pair (public and private keys)
@@ -15,15 +15,14 @@ pub(crate) async fn read_vapid_key(db: &SqlitePool, tn_id: TnId) -> ClResult<Key
 			.bind(tn_id.0)
 			.fetch_optional(db)
 			.await
-			.inspect_err(inspect)
-			.or(Err(Error::DbError))?;
+			.db()?;
 
 	let Some(row) = res else {
 		return Err(Error::NotFound);
 	};
 
-	let public_key: Option<String> = row.try_get("vapid_public_key").or(Err(Error::DbError))?;
-	let private_key: Option<String> = row.try_get("vapid_private_key").or(Err(Error::DbError))?;
+	let public_key: Option<String> = row.try_get("vapid_public_key").db()?;
+	let private_key: Option<String> = row.try_get("vapid_private_key").db()?;
 
 	match (public_key, private_key) {
 		(Some(pub_key), Some(priv_key)) => {
@@ -39,14 +38,13 @@ pub(crate) async fn read_vapid_public_key(db: &SqlitePool, tn_id: TnId) -> ClRes
 		.bind(tn_id.0)
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.or(Err(Error::DbError))?;
+		.db()?;
 
 	let Some(row) = res else {
 		return Err(Error::NotFound);
 	};
 
-	let public_key: Option<String> = row.try_get("vapid_public_key").or(Err(Error::DbError))?;
+	let public_key: Option<String> = row.try_get("vapid_public_key").db()?;
 	public_key.map(Into::into).ok_or(Error::NotFound)
 }
 
@@ -60,8 +58,7 @@ pub(crate) async fn update_vapid_key(db: &SqlitePool, tn_id: TnId, key: &KeyPair
 	.bind(tn_id.0)
 	.execute(db)
 	.await
-	.inspect_err(inspect)
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	Ok(())
 }

@@ -341,15 +341,6 @@ pub struct ProfileData {
 	pub created_at: Timestamp,
 }
 
-/// List of profiles response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfileList {
-	pub profiles: Vec<ProfileData>,
-	pub total: usize,
-	pub limit: usize,
-	pub offset: usize,
-}
-
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateProfileData {
 	// Profile content fields
@@ -1083,15 +1074,6 @@ pub struct CreateFile {
 	/// with `parent_id = MANAGED_PARENT_ID` so the file GC can reap them.
 	pub hidden: bool,
 	pub status: Option<FileStatus>, // None defaults to Pending, can set to Active for shared files
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CreateFileVariant {
-	pub variant: Box<str>,
-	pub format: Box<str>,
-	pub resolution: (u32, u32),
-	pub size: u64,
-	pub available: bool,
 }
 
 /// Options for updating file metadata
@@ -2014,11 +1996,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		opts: &ListActionOptions,
 	) -> ClResult<Vec<ActionView>>;
-	async fn list_action_tokens(
-		&self,
-		tn_id: TnId,
-		opts: &ListActionOptions,
-	) -> ClResult<Box<[Box<str>]>>;
 
 	/// Count actions matching `opts`, grouped by `group_by`. Returns
 	/// `(group_value, count)` pairs (group value NULL-able). Used to derive
@@ -2079,9 +2056,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		ack_token: Option<&str>,
 	) -> ClResult<()>;
 
-	/// Get the root_id of an action
-	async fn get_action_root_id(&self, tn_id: TnId, action_id: &str) -> ClResult<Box<str>>;
-
 	/// Get action data (subject, reaction count, comment count)
 	async fn get_action_data(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<ActionData>>;
 
@@ -2104,14 +2078,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		action_id: &str,
 		opts: &UpdateActionDataOptions,
-	) -> ClResult<()>;
-
-	/// Update inbound action status
-	async fn update_inbound_action(
-		&self,
-		tn_id: TnId,
-		action_id: &str,
-		status: Option<char>,
 	) -> ClResult<()>;
 
 	/// Get related action tokens by APRV action_id
@@ -2160,7 +2126,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		f_id: u64,
 		opts: FileVariant<&'a str>,
 	) -> ClResult<&'a str>;
-	async fn update_file_id(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
 
 	/// Finalize a pending file - sets file_id and transitions status from 'P' to 'A' atomically
 	async fn finalize_file(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
@@ -2251,15 +2216,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Lightweight probe: the action's `type` column only (no joins/hydration).
 	async fn get_action_type(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<Box<str>>>;
-
-	/// Update action content and attachments (if not yet federated)
-	async fn update_action(
-		&self,
-		tn_id: TnId,
-		action_id: &str,
-		content: Option<&str>,
-		attachments: Option<&[&str]>,
-	) -> ClResult<()>;
 
 	/// Delete an action (soft delete with cleanup)
 	async fn delete_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()>;
@@ -2420,14 +2376,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		access_level: crate::types::Patch<char>,
 	) -> ClResult<FileUserData>;
 
-	/// Get file user data for a specific file
-	async fn get_file_user_data(
-		&self,
-		tn_id: TnId,
-		id_tag: &str,
-		file_id: &str,
-	) -> ClResult<Option<FileUserData>>;
-
 	// Push Subscription Management
 	//*****************************
 
@@ -2531,14 +2479,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		search: Option<&str>,
 	) -> ClResult<Vec<InstalledApp>>;
-
-	/// Get a specific installed app
-	async fn get_installed_app(
-		&self,
-		tn_id: TnId,
-		app_name: &str,
-		publisher_tag: &str,
-	) -> ClResult<Option<InstalledApp>>;
 
 	/// Is `file_id` the package of an app this tenant has actually installed?
 	///
@@ -2847,13 +2787,6 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		since: Option<Timestamp>,
 		limit: Option<u32>,
 	) -> ClResult<Vec<ContactSyncEntry>>;
-
-	/// List all contacts linked to a given profile id_tag (for bulk snapshot refresh).
-	async fn list_contacts_by_profile(
-		&self,
-		tn_id: TnId,
-		profile_id_tag: &str,
-	) -> ClResult<Vec<Contact>>;
 
 	// Calendar / calendar-object management (CalDAV + JSON REST)
 	//************************************************************

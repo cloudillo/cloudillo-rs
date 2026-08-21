@@ -5,7 +5,7 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::{inspect, map_res};
+use crate::utils::{Db, inspect, map_res};
 use cloudillo_types::{
 	auth_adapter::{CreateProxySiteData, ProxySiteConfig, ProxySiteData, UpdateProxySiteData},
 	prelude::*,
@@ -78,23 +78,6 @@ pub(crate) async fn read_proxy_site(db: &SqlitePool, site_id: i64) -> ClResult<P
 		FROM proxy_sites WHERE site_id = ?1",
 	)
 	.bind(site_id)
-	.fetch_one(db)
-	.await;
-
-	map_res(res, parse_proxy_site_row)
-}
-
-/// Read a proxy site by domain
-pub(crate) async fn read_proxy_site_by_domain(
-	db: &SqlitePool,
-	domain: &str,
-) -> ClResult<ProxySiteData> {
-	let res = sqlx::query(
-		"SELECT site_id, domain, backend_url, status, proxy_type, cert, cert_key, cert_expires_at,
-			config, created_by, created_at, updated_at
-		FROM proxy_sites WHERE domain = ?1",
-	)
-	.bind(domain)
 	.fetch_one(db)
 	.await;
 
@@ -185,11 +168,11 @@ pub(crate) async fn list_proxy_sites(db: &SqlitePool) -> ClResult<Vec<ProxySiteD
 	)
 	.fetch_all(db)
 	.await
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	let mut sites = Vec::new();
 	for row in rows {
-		sites.push(parse_proxy_site_row(&row).inspect_err(inspect).map_err(|_| Error::DbError)?);
+		sites.push(parse_proxy_site_row(&row).db()?);
 	}
 	Ok(sites)
 }
@@ -242,11 +225,11 @@ pub(crate) async fn list_proxy_sites_needing_cert_renewal(
 	.bind(renewal_threshold)
 	.fetch_all(db)
 	.await
-	.or(Err(Error::DbError))?;
+	.db()?;
 
 	let mut sites = Vec::new();
 	for row in rows {
-		sites.push(parse_proxy_site_row(&row).inspect_err(inspect).map_err(|_| Error::DbError)?);
+		sites.push(parse_proxy_site_row(&row).db()?);
 	}
 	Ok(sites)
 }

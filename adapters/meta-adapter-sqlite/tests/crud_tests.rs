@@ -887,14 +887,5 @@ async fn recording_activity_with_an_empty_id_tag_writes_no_per_user_row() {
 
 		let after = adapter.read_file(tn_id, &file_id).await.expect("read").expect("present");
 		assert!(stamp(&after).is_some(), "{entry_point}: the file's own timestamp still advances");
-
-		assert!(
-			adapter
-				.get_file_user_data(tn_id, "", &file_id)
-				.await
-				.expect("read fud")
-				.is_none(),
-			"{entry_point}: no per-user row is created for an identity-less caller"
-		);
 	}
 }

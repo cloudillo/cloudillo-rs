@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use sqlx::{Row, SqlitePool};
 
+use crate::utils::Db;
 use cloudillo_types::prelude::*;
 
 /// List all tags with optional prefix filtering and counts
@@ -30,8 +31,7 @@ pub(crate) async fn list(
 		.bind(tn_id.0)
 		.fetch_all(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 		// Count tag occurrences
 		let mut tag_counts: HashMap<String, u32> = HashMap::new();
@@ -78,15 +78,13 @@ pub(crate) async fn list(
 			.bind(format!("{}%", escaped_p))
 			.fetch_all(db)
 			.await
-			.inspect_err(|err| warn!("DB: {:#?}", err))
-			.map_err(|_| Error::DbError)?
+			.db()?
 		} else {
 			sqlx::query("SELECT DISTINCT tag FROM tags WHERE tn_id = ? ORDER BY tag")
 				.bind(tn_id.0)
 				.fetch_all(db)
 				.await
-				.inspect_err(|err| warn!("DB: {:#?}", err))
-				.map_err(|_| Error::DbError)?
+				.db()?
 		};
 
 		let mut tags: Vec<TagInfo> = rows
@@ -119,8 +117,7 @@ pub(crate) async fn add(
 		.bind(file_id)
 		.fetch_optional(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	let Some(row) = row else {
 		return Err(Error::NotFound);
@@ -144,8 +141,7 @@ pub(crate) async fn add(
 		.bind(file_id)
 		.execute(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	// Ensure tag exists in global tags table
 	sqlx::query("INSERT OR IGNORE INTO tags (tn_id, tag) VALUES (?, ?)")
@@ -153,8 +149,7 @@ pub(crate) async fn add(
 		.bind(tag)
 		.execute(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	Ok(tags)
 }
@@ -172,8 +167,7 @@ pub(crate) async fn remove(
 		.bind(file_id)
 		.fetch_optional(db)
 		.await
-		.inspect_err(|err| warn!("DB: {:#?}", err))
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	let Some(row) = row else {
 		return Err(Error::NotFound);
@@ -194,8 +188,7 @@ pub(crate) async fn remove(
 			.bind(file_id)
 			.execute(db)
 			.await
-			.inspect_err(|err| warn!("DB: {:#?}", err))
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 	} else {
 		let tags_str = tags.join(",");
 		sqlx::query("UPDATE files SET tags = ? WHERE tn_id = ? AND file_id = ?")
@@ -204,8 +197,7 @@ pub(crate) async fn remove(
 			.bind(file_id)
 			.execute(db)
 			.await
-			.inspect_err(|err| warn!("DB: {:#?}", err))
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 	}
 
 	Ok(tags)

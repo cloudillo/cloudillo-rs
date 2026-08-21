@@ -249,14 +249,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::auto_track(&self.db, tn_id, action_id).await
 	}
 
-	async fn list_action_tokens(
-		&self,
-		tn_id: TnId,
-		opts: &ListActionOptions,
-	) -> ClResult<Box<[Box<str>]>> {
-		action::list_tokens(&self.dbr, tn_id, opts).await
-	}
-
 	async fn get_action_id(&self, tn_id: TnId, a_id: u64) -> ClResult<Box<str>> {
 		action::get_id(&self.dbr, tn_id, a_id).await
 	}
@@ -290,10 +282,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::create_inbound(&self.db, tn_id, action_id, token, ack_token).await
 	}
 
-	async fn get_action_root_id(&self, tn_id: TnId, action_id: &str) -> ClResult<Box<str>> {
-		action::get_root_id(&self.dbr, tn_id, action_id).await
-	}
-
 	async fn get_action_data(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<ActionData>> {
 		action::get_data(&self.dbr, tn_id, action_id).await
 	}
@@ -321,15 +309,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 		opts: &UpdateActionDataOptions,
 	) -> ClResult<()> {
 		action::update_data(&self.db, tn_id, action_id, opts).await
-	}
-
-	async fn update_inbound_action(
-		&self,
-		tn_id: TnId,
-		action_id: &str,
-		status: Option<char>,
-	) -> ClResult<()> {
-		action::update_inbound(&self.db, tn_id, action_id, status).await
 	}
 
 	async fn get_related_action_tokens(
@@ -397,10 +376,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 		opts: FileVariant<&'a str>,
 	) -> ClResult<&'a str> {
 		file::create_variant(&self.db, tn_id, f_id, opts).await
-	}
-
-	async fn update_file_id(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()> {
-		file::update_id(&self.db, tn_id, f_id, file_id).await
 	}
 
 	async fn finalize_file(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()> {
@@ -486,16 +461,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn get_action_type(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<Box<str>>> {
 		action::get_type(&self.dbr, tn_id, action_id).await
-	}
-
-	async fn update_action(
-		&self,
-		tn_id: TnId,
-		action_id: &str,
-		content: Option<&str>,
-		attachments: Option<&[&str]>,
-	) -> ClResult<()> {
-		action::update(&self.db, tn_id, action_id, content, attachments).await
 	}
 
 	async fn delete_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()> {
@@ -657,15 +622,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 			.await
 	}
 
-	async fn get_file_user_data(
-		&self,
-		tn_id: TnId,
-		id_tag: &str,
-		file_id: &str,
-	) -> ClResult<Option<FileUserData>> {
-		file_user_data::get(&self.dbr, tn_id, id_tag, file_id).await
-	}
-
 	// Push Subscription Management
 	//*****************************
 
@@ -774,15 +730,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn is_installed_app_file(&self, tn_id: TnId, file_id: &str) -> ClResult<bool> {
 		installed_app::is_installed_file(&self.dbr, tn_id, file_id).await
-	}
-
-	async fn get_installed_app(
-		&self,
-		tn_id: TnId,
-		app_name: &str,
-		publisher_tag: &str,
-	) -> ClResult<Option<InstalledApp>> {
-		installed_app::get(&self.dbr, tn_id, app_name, publisher_tag).await
 	}
 
 	// Full-text search
@@ -1021,14 +968,6 @@ impl MetaAdapter for MetaAdapterSqlite {
 		limit: Option<u32>,
 	) -> ClResult<Vec<ContactSyncEntry>> {
 		contact::list_contacts_since(&self.dbr, tn_id, ab_id, since, limit).await
-	}
-
-	async fn list_contacts_by_profile(
-		&self,
-		tn_id: TnId,
-		profile_id_tag: &str,
-	) -> ClResult<Vec<Contact>> {
-		contact::list_contacts_by_profile(&self.dbr, tn_id, profile_id_tag).await
 	}
 
 	// Calendar / calendar-object management

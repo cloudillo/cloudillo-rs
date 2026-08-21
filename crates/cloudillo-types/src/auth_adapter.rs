@@ -138,11 +138,11 @@ pub struct KeyPair {
 }
 
 #[derive(Debug)]
-pub struct Webauthn<'a> {
-	pub credential_id: &'a str,
+pub struct Webauthn {
+	pub credential_id: Box<str>,
 	pub counter: u32,
-	pub public_key: &'a str,
-	pub description: Option<&'a str>,
+	pub public_key: Box<str>,
+	pub description: Option<Box<str>>,
 }
 
 /// Data needed to create a new tenant
@@ -389,13 +389,11 @@ pub trait AuthAdapter: Debug + Send + Sync {
 
 	// Key management
 	async fn list_profile_keys(&self, tn_id: TnId) -> ClResult<Vec<AuthKey>>;
-	async fn read_profile_key(&self, tn_id: TnId, key_id: &str) -> ClResult<AuthKey>;
 	async fn create_profile_key(
 		&self,
 		tn_id: TnId,
 		expires_at: Option<Timestamp>,
 	) -> ClResult<AuthKey>;
-
 	async fn create_access_token(
 		&self,
 		tn_id: TnId,
@@ -406,7 +404,6 @@ pub trait AuthAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		data: action_types::CreateAction,
 	) -> ClResult<Box<str>>;
-	async fn verify_access_token(&self, token: &str) -> ClResult<()>;
 
 	// Vapid keys
 	async fn read_vapid_key(&self, tn_id: TnId) -> ClResult<KeyPair>;
@@ -420,11 +417,6 @@ pub trait AuthAdapter: Debug + Send + Sync {
 
 	// Webauthn
 	async fn list_webauthn_credentials(&self, tn_id: TnId) -> ClResult<Box<[Webauthn]>>;
-	async fn read_webauthn_credential(
-		&self,
-		tn_id: TnId,
-		credential_id: &str,
-	) -> ClResult<Webauthn>;
 	async fn create_webauthn_credential(&self, tn_id: TnId, data: &Webauthn) -> ClResult<()>;
 	async fn update_webauthn_credential_counter(
 		&self,
@@ -458,7 +450,6 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	// Proxy site management
 	async fn create_proxy_site(&self, data: &CreateProxySiteData<'_>) -> ClResult<ProxySiteData>;
 	async fn read_proxy_site(&self, site_id: i64) -> ClResult<ProxySiteData>;
-	async fn read_proxy_site_by_domain(&self, domain: &str) -> ClResult<ProxySiteData>;
 	async fn update_proxy_site(
 		&self,
 		site_id: i64,

@@ -202,13 +202,27 @@ pub(crate) fn inspect(err: &sqlx::Error) {
 	warn!("DB: {:#?}", err);
 }
 
+/// `inspect_err(inspect)` + map-to-`DbError` in one step. `inspect` does not log
+/// `RowNotFound` (the normal outcome of an optional query), but `.db()` still maps
+/// it to `Error::DbError` — i.e. HTTP 500. Use `map_res` instead when a missing row
+/// is a client-visible 404.
+pub(crate) trait Db<T> {
+	fn db(self) -> ClResult<T>;
+}
+
+impl<T> Db<T> for Result<T, sqlx::Error> {
+	fn db(self) -> ClResult<T> {
+		self.inspect_err(inspect).map_err(|_| Error::DbError)
+	}
+}
+
 /// Map a single-row query result, translating SQL errors to ClResult
 pub(crate) fn map_res<T, F>(row: Result<SqliteRow, sqlx::Error>, f: F) -> ClResult<T>
 where
 	F: FnOnce(SqliteRow) -> Result<T, sqlx::Error>,
 {
 	match row {
-		Ok(row) => f(row).inspect_err(inspect).map_err(|_| Error::DbError),
+		Ok(row) => f(row).db(),
 		Err(sqlx::Error::RowNotFound) => Err(Error::NotFound),
 		Err(err) => {
 			inspect(&err);
@@ -223,7 +237,7 @@ pub(crate) fn collect_res<T>(
 ) -> ClResult<Vec<T>> {
 	let mut items = Vec::new();
 	for item in iter {
-		items.push(item.inspect_err(inspect).map_err(|_| Error::DbError)?);
+		items.push(item.db()?);
 	}
 	Ok(items)
 }

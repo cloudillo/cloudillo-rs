@@ -103,27 +103,6 @@ async fn test_list_actions_with_type_filter() {
 	assert!(result.is_ok(), "Should list actions with type filter");
 }
 
-#[tokio::test]
-async fn test_list_action_tokens() {
-	let (adapter, _temp) = create_test_adapter().await;
-	let tn_id = TnId(1);
-
-	// Create test tenant
-	adapter.create_tenant(tn_id, "test_user").await.ok();
-
-	// List action tokens
-	let opts = ListActionOptions::default();
-	let result = adapter.list_action_tokens(tn_id, &opts).await;
-
-	// Should execute successfully
-	assert!(result.is_ok(), "Should list action tokens");
-
-	if let Ok(tokens) = result {
-		// Should return a boxed array of token IDs
-		let _ = tokens; // Just verify we got a result
-	}
-}
-
 // Helpers for the not_parent_id filter tests: create a folder and a plain file
 // under a parent. Both use the same tenant; we don't care about visibility
 // since these tests run without `visible_levels` set (owner-level access).

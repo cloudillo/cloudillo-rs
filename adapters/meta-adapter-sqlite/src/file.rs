@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
-use crate::utils::{collect_res, inspect, map_res, parse_str_list, push_patch};
+use crate::utils::{Db, collect_res, map_res, parse_str_list, push_patch};
 use cloudillo_types::meta_adapter::{
 	BrokenReason, CreateFile, DeleteFileResult, FileId, FileStatus, FileUserData, FileVariant,
 	FileView, ListFileOptions, ProfileInfo, ProfileType, ROOT_PARENT_ID, SHARE_FILE_REF_TYPE,
@@ -499,12 +499,7 @@ pub(crate) async fn list(
 
 	debug!("SQL: {}", query.sql().as_str());
 
-	let res = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let res = query.build().fetch_all(db).await.db()?;
 
 	collect_res(res.iter().map(|row| {
 		let status = match row.try_get("status")? {
@@ -616,8 +611,7 @@ pub(crate) async fn list_variants(
 		.bind(f_id.cast_signed())
 		.fetch_all(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?,
+		.db()?,
 		FileId::FileId(file_id) => {
 			if let Some(f_id_str) = file_id.strip_prefix('@') {
 				let f_id = f_id_str
@@ -631,15 +625,14 @@ pub(crate) async fn list_variants(
 				.bind(f_id)
 				.fetch_all(db)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?
+				.db()?
 			} else {
 				sqlx::query("SELECT fv.variant_id, fv.variant, fv.res_x, fv.res_y, fv.format, fv.size, fv.available, fv.global, fv.duration, fv.bitrate, fv.page_count
 					FROM files f
 					JOIN file_variants fv ON fv.tn_id=f.tn_id AND fv.f_id=f.f_id
 					WHERE f.tn_id=? AND f.file_id=?")
 					.bind(tn_id.0).bind(file_id)
-					.fetch_all(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?
+					.fetch_all(db).await.db()?
 			}
 		}
 	};
@@ -686,8 +679,7 @@ pub(crate) async fn list_available_variants(
 	.bind(file_id)
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	collect_res(res.iter().map(|row| row.try_get("variant")))
 }
@@ -708,8 +700,7 @@ pub(crate) async fn list_referenced_variant_ids(
 		)
 		.fetch_all(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?
+		.db()?
 	} else {
 		sqlx::query(
 			"SELECT DISTINCT variant_id FROM file_variants
@@ -718,8 +709,7 @@ pub(crate) async fn list_referenced_variant_ids(
 		.bind(tn_id.0)
 		.fetch_all(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?
+		.db()?
 	};
 
 	collect_res(res.iter().map(|row| row.try_get("variant_id")))
@@ -737,8 +727,7 @@ pub(crate) async fn is_variant_referenced(
 			.bind(variant_id)
 			.fetch_optional(db)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?
+			.db()?
 	} else {
 		sqlx::query(
 			"SELECT 1 FROM file_variants
@@ -748,8 +737,7 @@ pub(crate) async fn is_variant_referenced(
 		.bind(variant_id)
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?
+		.db()?
 	};
 	Ok(row.is_some())
 }
@@ -769,8 +757,7 @@ pub(crate) async fn list_available_variants_by_fid(
 	.bind(f_id)
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	collect_res(res.iter().map(|row| row.try_get("variant")))
 }
@@ -875,8 +862,7 @@ pub(crate) async fn create(
 		.bind(orig_variant_id)
 		.fetch_one(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?
+		.db()?
 		.get(0);
 
 		if let Some(file_id) = file_id_exists {
@@ -902,8 +888,7 @@ pub(crate) async fn create(
 				.bind(file_id)
 				.fetch_optional(db)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?;
+				.db()?;
 
 		if let Some(f_id) = existing {
 			return Ok(FileId::FId(u64::try_from(f_id).map_err(|_| Error::DbError)?));
@@ -932,7 +917,7 @@ pub(crate) async fn create(
 		.bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0)
 		.bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility)
 		.bind(i32::from(opts.hidden))
-		.fetch_optional(db).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		.fetch_optional(db).await.db()?;
 
 	if let Some(f_id) = inserted {
 		return Ok(FileId::FId(u64::try_from(f_id).map_err(|_| Error::DbError)?));
@@ -947,8 +932,7 @@ pub(crate) async fn create(
 			.bind(&opts.file_id)
 			.fetch_optional(db)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 
 	match existing {
 		Some(f_id) => Ok(FileId::FId(u64::try_from(f_id).map_err(|_| Error::DbError)?)),
@@ -966,14 +950,14 @@ pub(crate) async fn create_variant<'a>(
 	f_id: u64,
 	opts: FileVariant<&'a str>,
 ) -> ClResult<&'a str> {
-	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
-	let _res = sqlx::query("SELECT f_id FROM files WHERE tn_id=? AND f_id=? AND status='P'")
+	let mut tx = db.begin().await.db()?;
+	sqlx::query("SELECT f_id FROM files WHERE tn_id=? AND f_id=? AND status='P'")
 		.bind(tn_id.0)
 		.bind(f_id.cast_signed())
-		.fetch_one(&mut *tx)
+		.fetch_optional(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?
+		.ok_or(Error::NotFound)?;
 
 	// Upgrade-friendly insert: a prior sync may have written a metadata-only
 	// row (`available=0, global=0`) for this variant when content was not
@@ -997,95 +981,10 @@ pub(crate) async fn create_variant<'a>(
 		 WHERE file_variants.available = 0",
 	)
 		.bind(tn_id.0).bind(f_id.cast_signed()).bind(opts.variant_id).bind(opts.variant).bind(opts.resolution.0).bind(opts.resolution.1).bind(opts.format).bind(opts.size.cast_signed()).bind(opts.available).bind(opts.global).bind(opts.duration).bind(opts.bitrate.map(i64::from)).bind(opts.page_count.map(i64::from))
-		.execute(&mut *tx).await.inspect_err(inspect).map_err(|_| Error::DbError)?;
-	tx.commit().await.map_err(|_| Error::DbError)?;
+		.execute(&mut *tx).await.db()?;
+	tx.commit().await.db()?;
 
 	Ok(opts.variant_id)
-}
-
-/// Update file_id for a pending file (idempotent - succeeds if already set to same value)
-pub(crate) async fn update_id(
-	db: &SqlitePool,
-	tn_id: TnId,
-	f_id: u64,
-	file_id: &str,
-) -> ClResult<()> {
-	// First check if file exists and what its current file_id is
-	let existing = sqlx::query("SELECT file_id FROM files WHERE tn_id=? AND f_id=?")
-		.bind(tn_id.0)
-		.bind(f_id.cast_signed())
-		.fetch_optional(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-
-	match existing {
-		None => {
-			// File doesn't exist at all
-			return Err(Error::NotFound);
-		}
-		Some(row) => {
-			let existing_file_id: Option<String> = row.try_get("file_id").ok().flatten();
-
-			if let Some(existing_id) = existing_file_id {
-				// Already has a file_id - check if it matches
-				if existing_id == file_id {
-					// Idempotent success - already set to the correct value
-					return Ok(());
-				}
-				// Different file_id - this is a conflict
-				let msg = format!(
-					"Attempted to update f_id={} to file_id={} but already set to {}",
-					f_id, file_id, existing_id
-				);
-				error!("{}", msg);
-				return Err(Error::Conflict(msg));
-			}
-			// file_id is NULL - proceed with update
-		}
-	}
-
-	// Update file_id for pending files
-	let res = sqlx::query("UPDATE files SET file_id=? WHERE tn_id=? AND f_id=? AND status='P'")
-		.bind(file_id)
-		.bind(tn_id.0)
-		.bind(f_id.cast_signed())
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
-
-	if res.rows_affected() == 0 {
-		// Race condition - someone else just set it between our check and update.
-		// Re-check what value was set (idempotent verification)
-		let current = sqlx::query("SELECT file_id FROM files WHERE tn_id=? AND f_id=?")
-			.bind(tn_id.0)
-			.bind(f_id.cast_signed())
-			.fetch_optional(db)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
-
-		if let Some(row) = current
-			&& let Some(existing_id) = row.try_get::<Option<String>, _>("file_id").ok().flatten()
-		{
-			if existing_id == file_id {
-				// Race condition resolved - correct value was set
-				return Ok(());
-			}
-			// Different value - this is a real conflict
-			let msg = format!(
-				"Race condition: f_id={} was set to {} instead of {}",
-				f_id, existing_id, file_id
-			);
-			error!("{}", msg);
-			return Err(Error::Conflict(msg));
-		}
-		// Still NULL somehow - return error
-		return Err(Error::Internal("Unexpected state during file_id update".into()));
-	}
-
-	Ok(())
 }
 
 /// Finalize a pending file - sets file_id and transitions status from 'P' to 'A' atomically
@@ -1101,8 +1000,7 @@ pub(crate) async fn finalize_file(
 		.bind(f_id.cast_signed())
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	match existing {
 		None => {
@@ -1111,7 +1009,7 @@ pub(crate) async fn finalize_file(
 		}
 		Some(row) => {
 			let existing_file_id: Option<String> = row.try_get("file_id").ok().flatten();
-			let status: String = row.try_get("status").map_err(|_| Error::DbError)?;
+			let status: String = row.try_get("status").db()?;
 
 			if let Some(existing_id) = existing_file_id {
 				// Already has a file_id - check if it matches
@@ -1125,8 +1023,7 @@ pub(crate) async fn finalize_file(
 						.bind(f_id.cast_signed())
 						.execute(db)
 						.await
-						.inspect_err(inspect)
-						.map_err(|_| Error::DbError)?;
+						.db()?;
 					return Ok(());
 				} else if existing_id != file_id {
 					// Different file_id - this is a conflict
@@ -1154,16 +1051,14 @@ pub(crate) async fn finalize_file(
 	.bind(file_id)
 	.execute(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	sqlx::query("DELETE FROM files WHERE tn_id = ? AND file_id = ? AND status = 'D'")
 		.bind(tn_id.0)
 		.bind(file_id)
 		.execute(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	// Set file_id and status='A' atomically for pending files
 	let res = sqlx::query(
@@ -1174,8 +1069,7 @@ pub(crate) async fn finalize_file(
 	.bind(f_id.cast_signed())
 	.execute(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	if res.rows_affected() == 0 {
 		// Race condition - someone else just set it between our check and update.
@@ -1185,13 +1079,12 @@ pub(crate) async fn finalize_file(
 			.bind(f_id.cast_signed())
 			.fetch_optional(db)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 
 		if let Some(row) = current
 			&& let Some(existing_id) = row.try_get::<Option<String>, _>("file_id").ok().flatten()
 		{
-			let status: String = row.try_get("status").map_err(|_| Error::DbError)?;
+			let status: String = row.try_get("status").db()?;
 			if existing_id == file_id && status == "A" {
 				// Race condition resolved - correct value and status were set
 				return Ok(());
@@ -1202,8 +1095,7 @@ pub(crate) async fn finalize_file(
 					.bind(f_id.cast_signed())
 					.execute(db)
 					.await
-					.inspect_err(inspect)
-					.map_err(|_| Error::DbError)?;
+					.db()?;
 				return Ok(());
 			}
 			// Different value - this is a real conflict
@@ -1295,12 +1187,7 @@ pub(crate) async fn update_data(
 			.push_bind(file_id);
 	}
 
-	query
-		.build()
-		.execute(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	query.build().execute(db).await.db()?;
 
 	Ok(())
 }
@@ -1332,8 +1219,7 @@ pub(crate) async fn read(
 		.bind(f_id)
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?
+		.db()?
 	} else {
 		// Content-addressable ID - query by file_id
 		sqlx::query(
@@ -1351,8 +1237,7 @@ pub(crate) async fn read(
 		.bind(file_id)
 		.fetch_optional(db)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?
+		.db()?
 	};
 
 	match row {
@@ -1370,7 +1255,7 @@ fn row_to_file_view(
 	f_id_fallback: Option<i64>,
 	user_data: Option<FileUserData>,
 ) -> ClResult<FileView> {
-	let status = match row.try_get("status").map_err(|_| Error::DbError)? {
+	let status = match row.try_get("status").db()? {
 		"A" => FileStatus::Active,
 		"P" => FileStatus::Pending,
 		"D" => FileStatus::Deleted,
@@ -1398,7 +1283,7 @@ fn row_to_file_view(
 		let stored: Option<Box<str>> = row.try_get("file_id").ok().flatten();
 		stored.unwrap_or_else(|| format!("@{}", f_id).into())
 	} else {
-		row.try_get("file_id").map_err(|_| Error::DbError)?
+		row.try_get("file_id").db()?
 	};
 
 	Ok(FileView {
@@ -1410,12 +1295,9 @@ fn row_to_file_view(
 		creator,
 		preset: row.try_get("preset").ok().flatten(),
 		content_type: row.try_get("content_type").ok().flatten(),
-		file_name: row.try_get("file_name").map_err(|_| Error::DbError)?,
+		file_name: row.try_get("file_name").db()?,
 		file_tp: row.try_get("file_tp").ok().flatten(),
-		created_at: row
-			.try_get::<i64, _>("created_at")
-			.map(Timestamp)
-			.map_err(|_| Error::DbError)?,
+		created_at: row.try_get::<i64, _>("created_at").map(Timestamp).db()?,
 		accessed_at: accessed_at.map(Timestamp),
 		modified_at: modified_at.map(Timestamp),
 		status,
@@ -1471,8 +1353,7 @@ pub(crate) async fn read_with_user_data(
 			.bind(f_id)
 			.fetch_optional(db)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?
+			.db()?
 	} else {
 		let sql = format!("{} WHERE f.tn_id=? AND f.file_id=?", base_sql);
 		sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -1481,13 +1362,12 @@ pub(crate) async fn read_with_user_data(
 			.bind(file_id)
 			.fetch_optional(db)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?
+			.db()?
 	};
 
 	let Some(row) = row else { return Ok(None) };
 
-	let f_id: i64 = row.try_get("f_id").map_err(|_| Error::DbError)?;
+	let f_id: i64 = row.try_get("f_id").db()?;
 
 	let fud_accessed_at: Option<i64> = row.try_get("fud_accessed_at").ok().flatten();
 	let fud_modified_at: Option<i64> = row.try_get("fud_modified_at").ok().flatten();
@@ -1543,8 +1423,7 @@ pub(crate) async fn list_files_by_parent(
 	.bind(before.0)
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	Ok(rows.into_iter().map(|(f_id,)| f_id.cast_unsigned()).collect())
 }
@@ -1597,8 +1476,7 @@ pub(crate) async fn list_referenced_managed_fids(
 	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	for (f_id,) in attachment_refs {
 		out.insert(f_id.cast_unsigned());
 	}
@@ -1614,8 +1492,7 @@ pub(crate) async fn list_referenced_managed_fids(
 	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	for (f_id,) in tenant_refs {
 		out.insert(f_id.cast_unsigned());
 	}
@@ -1630,8 +1507,7 @@ pub(crate) async fn list_referenced_managed_fids(
 	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	for (f_id,) in profile_refs {
 		out.insert(f_id.cast_unsigned());
 	}
@@ -1651,8 +1527,7 @@ pub(crate) async fn list_referenced_managed_fids(
 	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	for (f_id,) in site_docs_refs {
 		out.insert(f_id.cast_unsigned());
 	}
@@ -1681,8 +1556,7 @@ async fn sweep_file_shares(
 			.bind(SHARE_FILE_REF_TYPE)
 			.execute(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?
+			.db()?
 			.rows_affected();
 
 	let share_entries_removed = sqlx::query(
@@ -1695,8 +1569,7 @@ async fn sweep_file_shares(
 	.bind(file_id)
 	.execute(&mut *tx)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?
+	.db()?
 	.rows_affected();
 
 	Ok((refs_removed, share_entries_removed))
@@ -1713,7 +1586,7 @@ pub(crate) async fn hard_delete_file(
 	tn_id: TnId,
 	f_id: u64,
 ) -> ClResult<Option<Box<str>>> {
-	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 
 	// Nothing can reference a NULL `file_id`, so only a resolvable content id needs the sweep.
 	let resolved: Option<(Option<Box<str>>,)> =
@@ -1722,8 +1595,7 @@ pub(crate) async fn hard_delete_file(
 			.bind(f_id.cast_signed())
 			.fetch_optional(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 
 	let file_id = resolved.and_then(|(id,)| id);
 	if let Some(file_id) = &file_id {
@@ -1735,18 +1607,16 @@ pub(crate) async fn hard_delete_file(
 		.bind(f_id.cast_signed())
 		.execute(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	sqlx::query("DELETE FROM files WHERE tn_id = ? AND f_id = ?")
 		.bind(tn_id.0)
 		.bind(f_id.cast_signed())
 		.execute(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
-	tx.commit().await.map_err(|_| Error::DbError)?;
+	tx.commit().await.db()?;
 	Ok(file_id)
 }
 
@@ -1766,7 +1636,7 @@ pub(crate) async fn delete(
 	tn_id: TnId,
 	file_id: &str,
 ) -> ClResult<DeleteFileResult> {
-	let mut tx = db.begin().await.map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 
 	// `@`-prefixed ids address the `f_id` primary key, as `read` does. Every statement below
 	// matches on `file_id` (`root_id`/`refs.resource_id`/`share_entries` all reference the content
@@ -1781,8 +1651,7 @@ pub(crate) async fn delete(
 				.bind(f_id)
 				.fetch_optional(&mut *tx)
 				.await
-				.inspect_err(inspect)
-				.map_err(|_| Error::DbError)?;
+				.db()?;
 
 		match resolved {
 			None => return Err(Error::NotFound),
@@ -1793,9 +1662,8 @@ pub(crate) async fn delete(
 					.bind(f_id)
 					.execute(&mut *tx)
 					.await
-					.inspect_err(inspect)
-					.map_err(|_| Error::DbError)?;
-				tx.commit().await.map_err(|_| Error::DbError)?;
+					.db()?;
+				tx.commit().await.db()?;
 				return Ok(DeleteFileResult { files_deleted: 1, ..Default::default() });
 			}
 			Some((Some(id),)) => id,
@@ -1815,8 +1683,7 @@ pub(crate) async fn delete(
 			.bind(file_id.as_ref())
 			.fetch_all(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+			.db()?;
 
 	// Tombstone the tree in one statement, NULL-`file_id` rows included — the per-id sweep below
 	// only reaches rows that have a content id.
@@ -1826,8 +1693,7 @@ pub(crate) async fn delete(
 			.bind(file_id.as_ref())
 			.execute(&mut *tx)
 			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?
+			.db()?
 			.rows_affected();
 
 	// The root is addressed by its own content id. A tree root may carry its own `root_id`, in which
@@ -1841,8 +1707,7 @@ pub(crate) async fn delete(
 	.bind(file_id.as_ref())
 	.execute(&mut *tx)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?
+	.db()?
 	.rows_affected();
 
 	// Root first, so the caller's cache eviction order matches the delete order. Only resolvable
@@ -1866,7 +1731,7 @@ pub(crate) async fn delete(
 		share_entries_removed += entries;
 	}
 
-	tx.commit().await.map_err(|_| Error::DbError)?;
+	tx.commit().await.db()?;
 
 	Ok(DeleteFileResult { file_ids, files_deleted, refs_removed, share_entries_removed })
 }

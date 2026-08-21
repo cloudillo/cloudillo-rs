@@ -5,7 +5,7 @@
 
 use sqlx::{Row, SqlitePool};
 
-use crate::utils::{collect_res, inspect, map_res, push_patch};
+use crate::utils::{Db, collect_res, inspect, map_res, push_patch};
 use cloudillo_types::meta_adapter::{
 	ListProfileOptions, Profile, ProfileConnectionStatus, ProfileData, ProfileStatus, ProfileTrust,
 	ProfileType, PublicProfileRow, UpsertProfileFields, UpsertResult,
@@ -232,12 +232,7 @@ pub(crate) async fn list(
 			.push_bind(i64::from(opts.limit.unwrap_or(100).clamp(1, 1000)));
 	}
 
-	let res = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let res = query.build().fetch_all(db).await.db()?;
 
 	collect_res(res.iter().map(|row| {
 		let type_str: Option<&str> = row.try_get("type")?;
@@ -298,17 +293,12 @@ pub(crate) async fn get_relationships(
 	}
 	query.push(")");
 
-	let rows = query
-		.build()
-		.fetch_all(db)
-		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+	let rows = query.build().fetch_all(db).await.db()?;
 
 	let mut by_canonical = HashMap::with_capacity(rows.len());
 	for row in rows {
-		let id_tag: String = row.try_get("id_tag").map_err(|_| Error::DbError)?;
-		let following: bool = row.try_get("following").map_err(|_| Error::DbError)?;
+		let id_tag: String = row.try_get("id_tag").db()?;
+		let following: bool = row.try_get("following").db()?;
 		let connected_status = parse_connected(&row);
 		let connected = connected_status.is_connected();
 		by_canonical.insert(id_tag, (following, connected));
@@ -410,16 +400,10 @@ pub(crate) async fn read_many(
 		}
 		query.push(")");
 
-		let rows = query
-			.build()
-			.fetch_all(db)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+		let rows = query.build().fetch_all(db).await.db()?;
 
 		for row in rows {
-			let type_str: Option<&str> =
-				row.try_get("type").inspect_err(inspect).map_err(|_| Error::DbError)?;
+			let type_str: Option<&str> = row.try_get("type").db()?;
 			let typ = match type_str {
 				Some("P") => ProfileType::Person,
 				Some("C") => ProfileType::Community,
@@ -427,13 +411,10 @@ pub(crate) async fn read_many(
 				_ => continue,
 			};
 			profiles.push(PublicProfileRow {
-				id_tag: row.try_get("id_tag").inspect_err(inspect).map_err(|_| Error::DbError)?,
-				name: row.try_get("name").inspect_err(inspect).map_err(|_| Error::DbError)?,
+				id_tag: row.try_get("id_tag").db()?,
+				name: row.try_get("name").db()?,
 				typ,
-				profile_pic: row
-					.try_get("profile_pic")
-					.inspect_err(inspect)
-					.map_err(|_| Error::DbError)?,
+				profile_pic: row.try_get("profile_pic").db()?,
 			});
 		}
 	}
@@ -453,8 +434,7 @@ pub(crate) async fn list_follower_tags(db: &SqlitePool, tn_id: TnId) -> ClResult
 	.bind(tn_id.0)
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	collect_res(rows.iter().map(|row| row.try_get::<Box<str>, _>("id_tag")))
 }
 
@@ -487,7 +467,7 @@ pub(crate) async fn upsert(
 	fields: &UpsertProfileFields,
 ) -> ClResult<UpsertResult> {
 	let id_tag = normalize_id_tag(id_tag);
-	let mut tx = db.begin().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	let mut tx = db.begin().await.db()?;
 
 	// Resolve INSERT values from Patch. Note: `Patch::Null` and
 	// `Patch::Undefined` collapse to the same column default here — the
@@ -571,11 +551,10 @@ pub(crate) async fn upsert(
 		.bind(insert_etag)
 		.execute(&mut *tx)
 		.await
-		.inspect_err(inspect)
-		.map_err(|_| Error::DbError)?;
+		.db()?;
 
 	if res.rows_affected() > 0 {
-		tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+		tx.commit().await.db()?;
 		return Ok(UpsertResult::Created);
 	}
 
@@ -631,15 +610,10 @@ pub(crate) async fn upsert(
 			.push(" AND id_tag=")
 			.push_bind(id_tag.clone().into_owned());
 
-		query
-			.build()
-			.execute(&mut *tx)
-			.await
-			.inspect_err(inspect)
-			.map_err(|_| Error::DbError)?;
+		query.build().execute(&mut *tx).await.db()?;
 	}
 
-	tx.commit().await.inspect_err(inspect).map_err(|_| Error::DbError)?;
+	tx.commit().await.db()?;
 	Ok(UpsertResult::Updated)
 }
 
@@ -689,7 +663,7 @@ pub(crate) async fn add_public_key(
 	.bind(expires_at.map(|t| t.0))
 	.execute(db)
 	.await
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 	Ok(())
 }
 
@@ -734,14 +708,13 @@ pub(crate) async fn list_stale_profiles(
 	.bind(limit)
 	.fetch_all(db)
 	.await
-	.inspect_err(inspect)
-	.map_err(|_| Error::DbError)?;
+	.db()?;
 
 	let mut results = Vec::with_capacity(rows.len());
 	for row in rows {
-		let tn_id_val: i64 = row.try_get("tn_id").map_err(|_| Error::DbError)?;
-		let id_tag: Box<str> = row.try_get("id_tag").map_err(|_| Error::DbError)?;
-		let etag: Option<Box<str>> = row.try_get("etag").map_err(|_| Error::DbError)?;
+		let tn_id_val: i64 = row.try_get("tn_id").db()?;
+		let id_tag: Box<str> = row.try_get("id_tag").db()?;
+		let etag: Option<Box<str>> = row.try_get("etag").db()?;
 
 		results.push((TnId(u32::try_from(tn_id_val).map_err(|_| Error::DbError)?), id_tag, etag));
 	}
@@ -765,10 +738,10 @@ pub(crate) async fn get_info(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClRe
 		_ => Error::DbError,
 	})?;
 
-	let typ: Option<String> = row.try_get("type").map_err(|_| Error::DbError)?;
+	let typ: Option<String> = row.try_get("type").db()?;
 	let typ = typ.ok_or(Error::NotFound)?;
 	let created_at: i64 = row.get("created_at");
-	let status = parse_status(&row).map_err(|_| Error::DbError)?.map(|s| s.as_str().into());
+	let status = parse_status(&row).db()?.map(|s| s.as_str().into());
 
 	Ok(ProfileData {
 		id_tag: row.get("id_tag"),
