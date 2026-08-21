@@ -84,21 +84,6 @@ impl RtdbMessage {
 		Self { id, msg_type: "error".to_string(), payload: map }
 	}
 
-	/// Create a database change message
-	pub fn db_change(collection: String, doc_id: String, operation: String, data: Value) -> Self {
-		let mut map = serde_json::Map::new();
-		map.insert("collection".to_string(), Value::String(collection));
-		map.insert("docId".to_string(), Value::String(doc_id));
-		map.insert("operation".to_string(), Value::String(operation));
-		map.insert("data".to_string(), data);
-		map.insert("timestamp".to_string(), Value::Number(now_timestamp().into()));
-		Self {
-			id: Value::String(format!("db-change-{}", random_id().unwrap_or_default())),
-			msg_type: "dbChange".to_string(),
-			payload: map,
-		}
-	}
-
 	/// Create a response message with explicit fields
 	pub fn response(
 		id: Value,

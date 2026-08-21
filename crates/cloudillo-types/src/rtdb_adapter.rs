@@ -603,12 +603,6 @@ impl ChangeEvent {
 		self.path().split('/').next_back()
 	}
 
-	/// Get the parent path (all segments except the last).
-	pub fn parent_path(&self) -> Option<&str> {
-		let path = self.path();
-		path.rfind('/').map(|pos| &path[..pos])
-	}
-
 	/// Get the document data if this is a Create or Update event.
 	pub fn data(&self) -> Option<&Value> {
 		match self {
@@ -621,24 +615,17 @@ impl ChangeEvent {
 		}
 	}
 
-	/// Check if this is a Create event.
-	pub fn is_create(&self) -> bool {
-		matches!(self, ChangeEvent::Create { .. })
-	}
-
-	/// Check if this is an Update event.
-	pub fn is_update(&self) -> bool {
-		matches!(self, ChangeEvent::Update { .. })
-	}
-
 	/// Check if this is a Delete event.
 	pub fn is_delete(&self) -> bool {
 		matches!(self, ChangeEvent::Delete { .. })
 	}
 }
 
-/// Compare two JSON values for ordering (used by filter range operators).
-fn compare_json_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+/// Compare two JSON values for ordering.
+///
+/// Shared by the filter range operators (`QueryFilter::matches`) and by adapter
+/// sort ordering and aggregation.
+pub fn compare_json_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
 	match (a, b) {
 		(None, None) => std::cmp::Ordering::Equal,
 		(None, Some(_)) => std::cmp::Ordering::Less,
@@ -835,6 +822,236 @@ pub trait RtdbAdapter: Debug + Send + Sync {
 	/// to compact.
 	async fn compact_storage(&self) -> ClResult<CompactReport> {
 		Ok(CompactReport::default())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::cmp::Ordering;
+
+	#[test]
+	fn test_matches_filter() {
+		let doc = serde_json::json!({
+			"name": "Alice",
+			"age": 30,
+			"score": 85.5,
+			"active": true,
+			"tags": ["admin", "user"],
+			"role": "developer"
+		});
+
+		// Test equality
+		let filter = QueryFilter {
+			equals: [("name".to_string(), Value::String("Alice".to_string()))]
+				.iter()
+				.cloned()
+				.collect(),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc));
+
+		let filter = QueryFilter {
+			equals: [("name".to_string(), Value::String("Bob".to_string()))]
+				.iter()
+				.cloned()
+				.collect(),
+			..Default::default()
+		};
+		assert!(!filter.matches(&doc));
+
+		// Test not-equals
+		let filter = QueryFilter {
+			not_equals: [("name".to_string(), Value::String("Bob".to_string()))]
+				.iter()
+				.cloned()
+				.collect(),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc));
+
+		// Test greater-than
+		let filter = QueryFilter {
+			greater_than: [("age".to_string(), Value::Number(25.into()))].iter().cloned().collect(),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc));
+
+		let filter = QueryFilter {
+			greater_than: [("age".to_string(), Value::Number(35.into()))].iter().cloned().collect(),
+			..Default::default()
+		};
+		assert!(!filter.matches(&doc));
+
+		// Test less-than
+		let filter = QueryFilter {
+			less_than: [("age".to_string(), Value::Number(40.into()))].iter().cloned().collect(),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc));
+
+		// Test in-array
+		let filter = QueryFilter {
+			in_array: [(
+				"role".to_string(),
+				vec![Value::String("admin".to_string()), Value::String("developer".to_string())],
+			)]
+			.iter()
+			.cloned()
+			.collect(),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc));
+
+		let filter = QueryFilter {
+			in_array: [("role".to_string(), vec![Value::String("manager".to_string())])]
+				.iter()
+				.cloned()
+				.collect(),
+			..Default::default()
+		};
+		assert!(!filter.matches(&doc));
+
+		// Test array-contains
+		let filter = QueryFilter {
+			array_contains: [("tags".to_string(), Value::String("admin".to_string()))]
+				.iter()
+				.cloned()
+				.collect(),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc));
+
+		let filter = QueryFilter {
+			array_contains: [("tags".to_string(), Value::String("guest".to_string()))]
+				.iter()
+				.cloned()
+				.collect(),
+			..Default::default()
+		};
+		assert!(!filter.matches(&doc));
+
+		// Test not-in-array
+		let filter = QueryFilter {
+			not_in_array: std::collections::HashMap::from([(
+				"role".to_string(),
+				vec![Value::String("manager".to_string())],
+			)]),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc), "role 'developer' is not in ['manager']");
+
+		let filter = QueryFilter {
+			not_in_array: std::collections::HashMap::from([(
+				"role".to_string(),
+				vec![Value::String("developer".to_string()), Value::String("admin".to_string())],
+			)]),
+			..Default::default()
+		};
+		assert!(!filter.matches(&doc), "role 'developer' IS in ['developer','admin']");
+
+		// Not-in-array with missing field should pass
+		let filter = QueryFilter {
+			not_in_array: std::collections::HashMap::from([(
+				"missing_field".to_string(),
+				vec![Value::String("anything".to_string())],
+			)]),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc), "missing field should pass notInArray");
+
+		// Test array-contains-any
+		let filter = QueryFilter {
+			array_contains_any: std::collections::HashMap::from([(
+				"tags".to_string(),
+				vec![Value::String("admin".to_string()), Value::String("guest".to_string())],
+			)]),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc), "tags has 'admin' from ['admin','guest']");
+
+		let filter = QueryFilter {
+			array_contains_any: std::collections::HashMap::from([(
+				"tags".to_string(),
+				vec![Value::String("guest".to_string()), Value::String("moderator".to_string())],
+			)]),
+			..Default::default()
+		};
+		assert!(!filter.matches(&doc), "tags has neither 'guest' nor 'moderator'");
+
+		// Array-contains-any with non-array field should fail
+		let filter = QueryFilter {
+			array_contains_any: std::collections::HashMap::from([(
+				"name".to_string(),
+				vec![Value::String("Alice".to_string())],
+			)]),
+			..Default::default()
+		};
+		assert!(!filter.matches(&doc), "name is not an array");
+
+		// Test array-contains-all
+		let filter = QueryFilter {
+			array_contains_all: std::collections::HashMap::from([(
+				"tags".to_string(),
+				vec![Value::String("admin".to_string()), Value::String("user".to_string())],
+			)]),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc), "tags has both 'admin' and 'user'");
+
+		let filter = QueryFilter {
+			array_contains_all: std::collections::HashMap::from([(
+				"tags".to_string(),
+				vec![Value::String("admin".to_string()), Value::String("guest".to_string())],
+			)]),
+			..Default::default()
+		};
+		assert!(!filter.matches(&doc), "tags does not have 'guest'");
+
+		// Array-contains-all with empty required list should pass (vacuously true)
+		let filter = QueryFilter {
+			array_contains_all: std::collections::HashMap::from([("tags".to_string(), vec![])]),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc), "empty required list is vacuously true");
+
+		// Test multiple conditions (AND logic)
+		let filter = QueryFilter {
+			equals: [("name".to_string(), Value::String("Alice".to_string()))]
+				.iter()
+				.cloned()
+				.collect(),
+			greater_than: [("age".to_string(), Value::Number(25.into()))].iter().cloned().collect(),
+			array_contains: [("tags".to_string(), Value::String("admin".to_string()))]
+				.iter()
+				.cloned()
+				.collect(),
+			..Default::default()
+		};
+		assert!(filter.matches(&doc));
+	}
+
+	#[test]
+	fn test_compare_values() {
+		// Numbers
+		assert_eq!(
+			compare_json_values(Some(&Value::Number(10.into())), Some(&Value::Number(20.into()))),
+			Ordering::Less
+		);
+
+		// Strings
+		assert_eq!(
+			compare_json_values(
+				Some(&Value::String("alice".to_string())),
+				Some(&Value::String("bob".to_string()))
+			),
+			Ordering::Less
+		);
+
+		// None comparisons
+		assert_eq!(compare_json_values(None, None), Ordering::Equal);
+		assert_eq!(compare_json_values(None, Some(&Value::Number(1.into()))), Ordering::Less);
+		assert_eq!(compare_json_values(Some(&Value::Number(1.into())), None), Ordering::Greater);
 	}
 }
 

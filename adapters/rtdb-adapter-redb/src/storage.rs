@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 use cloudillo_types::error::ClResult;
-use cloudillo_types::rtdb_adapter::{ChangeEvent, QueryFilter, SubscriptionScope};
+use cloudillo_types::rtdb_adapter::{ChangeEvent, SubscriptionScope};
 use serde_json::Value;
-use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Document storage table
@@ -48,108 +47,6 @@ pub fn values_to_index_strings(value: &Value) -> Vec<String> {
 	}
 }
 
-/// Check if a document matches a filter
-pub fn matches_filter(doc: &Value, filter: &QueryFilter) -> bool {
-	// Equality checks
-	for (field, expected) in &filter.equals {
-		if doc.get(field) != Some(expected) {
-			return false;
-		}
-	}
-
-	// Not-equal checks (missing fields are inherently "not equal")
-	for (field, expected) in &filter.not_equals {
-		if doc.get(field) == Some(expected) {
-			return false;
-		}
-	}
-
-	// Greater-than checks
-	for (field, threshold) in &filter.greater_than {
-		match doc.get(field) {
-			Some(actual) if compare_values(Some(actual), Some(threshold)) == Ordering::Greater => {}
-			_ => return false,
-		}
-	}
-
-	// Greater-than-or-equal checks
-	for (field, threshold) in &filter.greater_than_or_equal {
-		match doc.get(field) {
-			Some(actual) => {
-				let ord = compare_values(Some(actual), Some(threshold));
-				if ord != Ordering::Greater && ord != Ordering::Equal {
-					return false;
-				}
-			}
-			_ => return false,
-		}
-	}
-
-	// Less-than checks
-	for (field, threshold) in &filter.less_than {
-		match doc.get(field) {
-			Some(actual) if compare_values(Some(actual), Some(threshold)) == Ordering::Less => {}
-			_ => return false,
-		}
-	}
-
-	// Less-than-or-equal checks
-	for (field, threshold) in &filter.less_than_or_equal {
-		match doc.get(field) {
-			Some(actual) => {
-				let ord = compare_values(Some(actual), Some(threshold));
-				if ord != Ordering::Less && ord != Ordering::Equal {
-					return false;
-				}
-			}
-			_ => return false,
-		}
-	}
-
-	// In-array checks (field value must be in the provided array)
-	for (field, allowed_values) in &filter.in_array {
-		match doc.get(field) {
-			Some(actual) if allowed_values.contains(actual) => {}
-			_ => return false,
-		}
-	}
-
-	// Array-contains checks (field must be an array containing the value)
-	for (field, required_value) in &filter.array_contains {
-		match doc.get(field) {
-			Some(Value::Array(arr)) if arr.contains(required_value) => {}
-			_ => return false,
-		}
-	}
-
-	// Not-in-array checks (field value must NOT be in the provided array; missing fields pass)
-	for (field, excluded_values) in &filter.not_in_array {
-		if let Some(actual) = doc.get(field)
-			&& excluded_values.contains(actual)
-		{
-			return false;
-		}
-	}
-
-	// Array-contains-any checks (field must be an array containing at least one of the values)
-	for (field, candidate_values) in &filter.array_contains_any {
-		match doc.get(field) {
-			Some(Value::Array(arr)) if candidate_values.iter().any(|v| arr.contains(v)) => {}
-			_ => return false,
-		}
-	}
-
-	// Array-contains-all checks (field must be an array containing all of the values)
-	for (field, required_values) in &filter.array_contains_all {
-		match doc.get(field) {
-			Some(Value::Array(arr)) if required_values.iter().all(|v| arr.contains(v)) => {}
-			_ => return false,
-		}
-	}
-
-	true
-}
-
 /// Check if an event matches a subscription path (prefix match with boundary check)
 pub fn event_matches_path(event: &ChangeEvent, subscription_path: &str) -> bool {
 	let event_path = event.path();
@@ -190,15 +87,6 @@ pub fn event_matches_scope(
 	}
 }
 
-/// Extract document ID from a path (last segment)
-pub fn extract_doc_id(full_path: &str, collection: &str) -> String {
-	if full_path.len() > collection.len() + 1 {
-		full_path[collection.len() + 1..].to_string()
-	} else {
-		String::new()
-	}
-}
-
 /// Parse path into collection and doc_id
 pub fn parse_path(path: &str) -> ClResult<(String, String)> {
 	let parts: Vec<&str> = path.rsplitn(2, '/').collect();
@@ -208,21 +96,6 @@ pub fn parse_path(path: &str) -> ClResult<(String, String)> {
 	}
 
 	Ok((parts[1].to_string(), parts[0].to_string()))
-}
-
-/// Compare two JSON values for sorting
-pub fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
-	match (a, b) {
-		(None, None) => Ordering::Equal,
-		(None, Some(_)) => Ordering::Less,
-		(Some(_), None) => Ordering::Greater,
-		(Some(Value::Number(a)), Some(Value::Number(b))) => {
-			a.as_f64().partial_cmp(&b.as_f64()).unwrap_or(Ordering::Equal)
-		}
-		(Some(Value::String(a)), Some(Value::String(b))) => a.cmp(b),
-		(Some(Value::Bool(a)), Some(Value::Bool(b))) => a.cmp(b),
-		(Some(a), Some(b)) => a.to_string().cmp(&b.to_string()),
-	}
 }
 
 /// Inject the `id` field into a document if it doesn't already have one.

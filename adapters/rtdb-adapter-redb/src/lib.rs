@@ -582,8 +582,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 				// for a plain `get`.
 				match self.get(tn_id, db_id, &opts.path).await? {
 					Some(doc) => {
-						let passes =
-							opts.filter.as_ref().is_none_or(|f| storage::matches_filter(&doc, f));
+						let passes = opts.filter.as_ref().is_none_or(|f| f.matches(&doc));
 						match (passes, &opts.select) {
 							(false, _) => Vec::new(),
 							(true, Some(select)) => vec![project_doc(&doc, select)],
@@ -658,14 +657,14 @@ impl RtdbAdapter for RtdbAdapterRedb {
 								// deleting what never existed is a no-op.
 								ChangeEvent::Delete { old_data, .. } => {
 									if let Some(old) = old_data
-										&& !storage::matches_filter(old, filter)
+										&& !filter.matches(old)
 									{
 										continue;
 									}
 								}
 								_ => {
 									if let Some(data) = event.data()
-										&& !storage::matches_filter(data, filter)
+										&& !filter.matches(data)
 									{
 										continue;
 									}
@@ -688,7 +687,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 								// selected field moved, or the client never
 								// learns it exists.
 								let was_matching = match (&filter, old_data.as_ref()) {
-									(Some(f), Some(old)) => storage::matches_filter(old, f),
+									(Some(f), Some(old)) => f.matches(old),
 									(Some(_), None) => false,
 									(None, _) => true,
 								};

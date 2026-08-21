@@ -5,7 +5,8 @@ use crate::error::from_redb_error;
 use crate::{DatabaseInstance, storage};
 use cloudillo_types::error::ClResult;
 use cloudillo_types::rtdb_adapter::{
-	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, SortField, project_doc,
+	AggregateOp, AggregateOptions, QueryFilter, QueryOptions, SortField, compare_json_values,
+	project_doc,
 };
 use cloudillo_types::types::TnId;
 use redb::{ReadableDatabase, ReadableTable};
@@ -114,7 +115,7 @@ where
 
 		// Apply filter
 		if let Some(ref filter) = opts.filter
-			&& !storage::matches_filter(&doc, filter)
+			&& !filter.matches(&doc)
 		{
 			continue;
 		}
@@ -226,7 +227,7 @@ where
 			storage::inject_doc_id(&mut doc, &doc_id);
 
 			// Apply full filter
-			if storage::matches_filter(&doc, ctx.filter) {
+			if ctx.filter.matches(&doc) {
 				results.push(doc);
 			}
 		}
@@ -287,7 +288,7 @@ where
 				let mut doc: Value = serde_json::from_str(json.value())?;
 				storage::inject_doc_id(&mut doc, &doc_id);
 
-				if storage::matches_filter(&doc, ctx.filter) {
+				if ctx.filter.matches(&doc) {
 					results.push(doc);
 				}
 			}
@@ -329,7 +330,7 @@ fn compare_documents(a: &Value, b: &Value, sort_fields: &[SortField]) -> Orderin
 		let a_val = a.get(&field.field);
 		let b_val = b.get(&field.field);
 
-		let ord = storage::compare_values(a_val, b_val);
+		let ord = compare_json_values(a_val, b_val);
 
 		let ord = if field.ascending { ord } else { ord.reverse() };
 
@@ -408,9 +409,7 @@ impl GroupAccumulator {
 								e.insert(val.clone());
 							}
 							std::collections::hash_map::Entry::Occupied(mut e) => {
-								if storage::compare_values(Some(val), Some(e.get()))
-									== Ordering::Less
-								{
+								if compare_json_values(Some(val), Some(e.get())) == Ordering::Less {
 									e.insert(val.clone());
 								}
 							}
@@ -425,7 +424,7 @@ impl GroupAccumulator {
 								e.insert(val.clone());
 							}
 							std::collections::hash_map::Entry::Occupied(mut e) => {
-								if storage::compare_values(Some(val), Some(e.get()))
+								if compare_json_values(Some(val), Some(e.get()))
 									== Ordering::Greater
 								{
 									e.insert(val.clone());
@@ -562,11 +561,11 @@ where
 		groups.sort_by(|a, b| compare_documents(a, b, sort_fields));
 	} else {
 		groups.sort_by(|a, b| {
-			let count_ord = storage::compare_values(b.get("count"), a.get("count"));
+			let count_ord = compare_json_values(b.get("count"), a.get("count"));
 			if count_ord != Ordering::Equal {
 				return count_ord;
 			}
-			storage::compare_values(a.get("group"), b.get("group"))
+			compare_json_values(a.get("group"), b.get("group"))
 		});
 	}
 
@@ -618,7 +617,7 @@ where
 
 		// Apply filter
 		if let Some(ref filter) = opts.filter
-			&& !storage::matches_filter(&doc, filter)
+			&& !filter.matches(&doc)
 		{
 			continue;
 		}
@@ -650,11 +649,11 @@ where
 		results.sort_by(|a, b| compare_documents(a, b, sort_fields));
 	} else {
 		results.sort_by(|a, b| {
-			let count_ord = storage::compare_values(b.get("count"), a.get("count"));
+			let count_ord = compare_json_values(b.get("count"), a.get("count"));
 			if count_ord != Ordering::Equal {
 				return count_ord;
 			}
-			storage::compare_values(a.get("group"), b.get("group"))
+			compare_json_values(a.get("group"), b.get("group"))
 		});
 	}
 

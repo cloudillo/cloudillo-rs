@@ -70,26 +70,6 @@ mod tests {
 		assert_eq!(msg.payload.get("status").and_then(|v| v.as_str()), Some("ok"));
 	}
 
-	/// Test that RTDB database change messages are created correctly
-	#[test]
-	fn test_rtdb_db_change_message() {
-		use cloudillo::rtdb::websocket::RtdbMessage;
-		use serde_json::json;
-
-		// Test creating a database change message
-		let msg = RtdbMessage::db_change(
-			"users".to_string(),
-			"user-123".to_string(),
-			"create".to_string(),
-			json!({"name": "Alice", "email": "alice@example.com"}),
-		);
-
-		assert_eq!(msg.msg_type, "dbChange");
-		assert_eq!(msg.payload.get("collection").and_then(|v| v.as_str()), Some("users"));
-		assert_eq!(msg.payload.get("docId").and_then(|v| v.as_str()), Some("user-123"));
-		assert_eq!(msg.payload.get("operation").and_then(|v| v.as_str()), Some("create"));
-	}
-
 	/// Test that CRDT message types are compatible with Yjs protocol
 	#[test]
 	fn test_crdt_yjs_message_types() {
