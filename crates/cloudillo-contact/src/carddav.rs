@@ -19,14 +19,18 @@
 use std::fmt::Write as _;
 
 use axum::{
-	body::{Body, to_bytes},
+	body::Body,
 	extract::{Path, Request, State},
 	http::{Method, Response, StatusCode, header},
 };
 
 use cloudillo_core::{IdTag, extract::Auth, prelude::*};
+use cloudillo_dav::http::{
+	DAV_CAPABILITIES, decode_sync_token, depth, encode_sync_token, has_prop, matches_prop,
+	ok_empty, read_body, xml_response,
+};
 use cloudillo_dav::{
-	MultiResponse, PropName, PropStat, Propfind, Report, escape_xml, etag_header, plain_error,
+	MultiResponse, PropStat, Propfind, Report, escape_xml, etag_header, plain_error,
 	render_multistatus, unquote_etag, urldecode_path, urlencode_path,
 };
 use cloudillo_types::meta_adapter::ListContactOptions;
@@ -45,9 +49,6 @@ const CARDDAV_NS: &str = cloudillo_dav::NS_CARDDAV;
 const CALDAV_NS: &str = cloudillo_dav::NS_CALDAV;
 const CALSERVER_NS: &str = cloudillo_dav::NS_CALSERVER;
 
-// Body size limit for DAV XML / vCard requests (1 MiB is more than enough for any vCard).
-const MAX_BODY_BYTES: usize = 1024 * 1024;
-
 // Server-side ceiling on sync-collection page size. Clients may request a smaller limit;
 // they cannot force a larger one. When a response is truncated, the returned sync-token
 // advances to the last row we sent and clients repeat the request to fetch the rest.
@@ -55,65 +56,6 @@ const MAX_SYNC_PAGE: u32 = 1_000;
 
 // Helpers
 //*********
-
-/// `/dav/principal/` is the discovery pivot for BOTH protocols, so every response from this
-/// module advertises CardDAV and CalDAV capability tokens — DAVx5 and other clients decide
-/// which protocols to probe based on the `DAV:` response header, not the XML body.
-const DAV_CAPABILITIES: &str = "1, 2, 3, addressbook, calendar-access";
-
-fn xml_response(status: StatusCode, body: String) -> Response<Body> {
-	Response::builder()
-		.status(status)
-		.header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
-		.header("DAV", DAV_CAPABILITIES)
-		.body(Body::from(body))
-		.unwrap_or_else(|_| plain_error(StatusCode::INTERNAL_SERVER_ERROR, "xml build failed"))
-}
-
-fn ok_empty() -> Response<Body> {
-	use axum::http::HeaderValue;
-	// Direct construction (no fallible builder) so headers can never be silently dropped.
-	let mut resp = Response::new(Body::empty());
-	resp.headers_mut().insert("dav", HeaderValue::from_static(DAV_CAPABILITIES));
-	resp.headers_mut().insert(
-		"allow",
-		HeaderValue::from_static("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, REPORT, MKCOL"),
-	);
-	resp
-}
-
-/// Encode a sync token from a unix timestamp. Opaque to clients but stable.
-fn encode_sync_token(ts: i64) -> String {
-	format!("urn:cloudillo:sync:{ts}")
-}
-
-fn decode_sync_token(token: &str) -> Option<i64> {
-	token.strip_prefix("urn:cloudillo:sync:").and_then(|s| s.parse().ok())
-}
-
-fn has_prop(props: &[PropName], ns: &str, local: &str) -> bool {
-	props.iter().any(|p| p.is(ns, local))
-}
-
-fn depth(req: &Request<Body>) -> u8 {
-	match req.headers().get("Depth").and_then(|h| h.to_str().ok()) {
-		Some("1") => 1,
-		Some("infinity") => u8::MAX,
-		_ => 0,
-	}
-}
-
-/// Read the request body as UTF-8. RFC 6350 §3.1 and RFC 6352 §6.3 require vCard/CardDAV
-/// bodies to be UTF-8; malformed bytes are rejected rather than silently repaired so we
-/// never persist a corrupted vCard and serve it back to clients.
-async fn read_body(req: Request<Body>) -> Result<String, Response<Body>> {
-	let bytes = to_bytes(req.into_body(), MAX_BODY_BYTES).await.map_err(|e| {
-		warn!("CardDAV body read failed (likely > {} bytes): {:?}", MAX_BODY_BYTES, e);
-		plain_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
-	})?;
-	String::from_utf8(bytes.to_vec())
-		.map_err(|_| plain_error(StatusCode::BAD_REQUEST, "request body must be UTF-8"))
-}
 
 // .well-known/carddav redirect
 //******************************
@@ -160,13 +102,13 @@ pub async fn handle_principal(
 	let _ = (&app, &auth, &id_tag);
 
 	if method == Method::OPTIONS {
-		return ok_empty();
+		return ok_empty("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, REPORT, MKCOL");
 	}
 	if method.as_str() != "PROPFIND" {
 		return plain_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
 	}
 
-	let body = match read_body(req).await {
+	let body = match read_body(req, "CardDAV").await {
 		Ok(b) => b,
 		Err(r) => return r,
 	};
@@ -235,14 +177,14 @@ pub async fn handle_home(
 	let tn_id = auth.tn_id;
 
 	if method == Method::OPTIONS {
-		return ok_empty();
+		return ok_empty("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, REPORT, MKCOL");
 	}
 	if method.as_str() != "PROPFIND" {
 		return plain_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
 	}
 
 	let d = depth(&req);
-	let body = match read_body(req).await {
+	let body = match read_body(req, "CardDAV").await {
 		Ok(b) => b,
 		Err(r) => return r,
 	};
@@ -342,13 +284,6 @@ fn collection_response(
 	MultiResponse::new(href).with_propstat(PropStat::ok(props))
 }
 
-fn matches_prop(pf: &Propfind, ns: &str, local: &str) -> bool {
-	match pf {
-		Propfind::AllProp | Propfind::PropName => true,
-		Propfind::Prop(list) => has_prop(list, ns, local),
-	}
-}
-
 // Collection (single address book) — PROPFIND / REPORT / MKCOL
 //**************************************************************
 
@@ -365,7 +300,7 @@ pub async fn handle_collection(
 	};
 
 	if method == Method::OPTIONS {
-		return ok_empty();
+		return ok_empty("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, REPORT, MKCOL");
 	}
 
 	let ab = match app.meta_adapter.get_address_book_by_name(tn_id, &ab_name).await {
@@ -392,7 +327,7 @@ async fn propfind_collection(
 	req: Request<Body>,
 ) -> Response<Body> {
 	let d = depth(&req);
-	let body = match read_body(req).await {
+	let body = match read_body(req, "CardDAV").await {
 		Ok(b) => b,
 		Err(r) => return r,
 	};
@@ -457,7 +392,7 @@ async fn report_collection(
 	ab: cloudillo_types::meta_adapter::AddressBook,
 	req: Request<Body>,
 ) -> Response<Body> {
-	let body = match read_body(req).await {
+	let body = match read_body(req, "CardDAV").await {
 		Ok(b) => b,
 		Err(r) => return r,
 	};
@@ -590,7 +525,7 @@ pub async fn handle_resource(
 	};
 
 	if method == Method::OPTIONS {
-		return ok_empty();
+		return ok_empty("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, REPORT, MKCOL");
 	}
 
 	let Some(uid) = resource.strip_suffix(".vcf") else {
@@ -655,7 +590,7 @@ async fn put_resource(
 		.and_then(|h| h.to_str().ok())
 		.map(str::to_string);
 
-	let vcard_text = match read_body(req).await {
+	let vcard_text = match read_body(req, "CardDAV").await {
 		Ok(s) => s,
 		Err(r) => return r,
 	};

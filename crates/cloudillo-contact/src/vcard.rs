@@ -14,134 +14,12 @@
 //!
 //! This is NOT a general-purpose vCard library.
 
-use sha2::{Digest, Sha256};
+pub use cloudillo_dav::content_line::etag_of;
+use cloudillo_dav::content_line::{get_param, parse_line, unescape_text, unfold, write_line};
 
 use cloudillo_types::meta_adapter::ContactExtracted;
 
 use crate::types::{ContactInput, ContactName, TypedValue};
-
-const MAX_LINE_LEN: usize = 75;
-
-/// Canonical ETag for a vCard blob — first 8 bytes of SHA-256, lowercase hex.
-///
-/// Used identically by REST and CardDAV paths so both surfaces emit the same ETag for a
-/// given canonical vCard. Returned unquoted; wrap in `"..."` at the HTTP header boundary.
-pub fn etag_of(vcard: &str) -> String {
-	let digest = Sha256::digest(vcard.as_bytes());
-	let mut s = String::with_capacity(16);
-	for b in &digest[..8] {
-		use std::fmt::Write as _;
-		let _ = write!(&mut s, "{b:02x}");
-	}
-	s
-}
-
-// Parsing
-//*********
-
-#[derive(Debug)]
-struct RawLine {
-	name: String,
-	params: Vec<(String, String)>,
-	value: String,
-}
-
-/// Join continuation lines (CRLF + SPACE/TAB) and split into logical lines.
-fn unfold(input: &str) -> Vec<String> {
-	let mut out: Vec<String> = Vec::new();
-	for raw in input.split('\n') {
-		let line = raw.strip_suffix('\r').unwrap_or(raw);
-		if let Some(first) = line.chars().next()
-			&& (first == ' ' || first == '\t')
-			&& let Some(last) = out.last_mut()
-		{
-			last.push_str(&line[1..]);
-			continue;
-		}
-		out.push(line.to_string());
-	}
-	out
-}
-
-fn parse_line(line: &str) -> Option<RawLine> {
-	// Name and params are separated from value by the first unquoted ':'.
-	// Params are separated by ';'. Parameter values may be quoted with double quotes.
-	let mut in_quote = false;
-	let mut colon_idx = None;
-	for (i, c) in line.char_indices() {
-		match c {
-			'"' => in_quote = !in_quote,
-			':' if !in_quote => {
-				colon_idx = Some(i);
-				break;
-			}
-			_ => {}
-		}
-	}
-	let colon_idx = colon_idx?;
-	let head = &line[..colon_idx];
-	let value = line[colon_idx + 1..].to_string();
-
-	let mut parts = split_params(head);
-	let name_full = parts.remove(0);
-	// A group prefix is possible: item1.URL — drop the group, keep the property name.
-	let name = match name_full.rsplit_once('.') {
-		Some((_, n)) => n.to_string(),
-		None => name_full,
-	};
-	let params = parts
-		.into_iter()
-		.filter_map(|p| {
-			let (k, v) = p.split_once('=')?;
-			Some((k.to_ascii_uppercase(), strip_quotes(v).to_string()))
-		})
-		.collect();
-
-	Some(RawLine { name: name.to_ascii_uppercase(), params, value })
-}
-
-fn split_params(head: &str) -> Vec<String> {
-	let mut parts = Vec::new();
-	let mut buf = String::new();
-	let mut in_quote = false;
-	for c in head.chars() {
-		match c {
-			'"' => {
-				in_quote = !in_quote;
-				buf.push(c);
-			}
-			';' if !in_quote => {
-				parts.push(buf.clone());
-				buf.clear();
-			}
-			_ => buf.push(c),
-		}
-	}
-	parts.push(buf);
-	parts
-}
-
-fn strip_quotes(s: &str) -> &str {
-	s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s)
-}
-
-/// Decode vCard text escapes: \n → newline, \, \; \\ unescape themselves.
-fn unescape_text(s: &str) -> String {
-	let mut out = String::with_capacity(s.len());
-	let mut iter = s.chars();
-	while let Some(c) = iter.next() {
-		if c == '\\' {
-			match iter.next() {
-				Some('n' | 'N') => out.push('\n'),
-				Some(other) => out.push(other),
-				None => out.push('\\'),
-			}
-		} else {
-			out.push(c);
-		}
-	}
-	out
-}
 
 /// Split a structured-value (semicolon-separated, with backslash escaping).
 fn split_structured(s: &str) -> Vec<String> {
@@ -174,10 +52,6 @@ fn types_from_params(params: &[(String, String)]) -> Vec<String> {
 
 fn pref_from_params(params: &[(String, String)]) -> Option<u8> {
 	params.iter().find(|(k, _)| k == "PREF").and_then(|(_, v)| v.parse::<u8>().ok())
-}
-
-fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
-	params.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
 /// Split a multi-card vCard stream into individual `BEGIN:VCARD ... END:VCARD` blocks.
@@ -248,7 +122,7 @@ pub fn parse(vcard: &str) -> Option<(ContactInput, ContactExtracted, Vec<String>
 		if trimmed_line.is_empty() {
 			continue;
 		}
-		let Some(raw) = parse_line(&line) else {
+		let Some(raw) = parse_line(&line, true) else {
 			warnings.push(format!("malformed vCard line: {trimmed_line:.80}"));
 			continue;
 		};
@@ -395,20 +269,6 @@ fn parse_cloudillo_uri(value: &str) -> Option<String> {
 // Generation
 //************
 
-fn escape_text(s: &str) -> String {
-	let mut out = String::with_capacity(s.len());
-	for c in s.chars() {
-		match c {
-			'\\' => out.push_str("\\\\"),
-			'\n' => out.push_str("\\n"),
-			',' => out.push_str("\\,"),
-			';' => out.push_str("\\;"),
-			_ => out.push(c),
-		}
-	}
-	out
-}
-
 fn escape_structured(s: &str) -> String {
 	// Same escapes as text; comma NOT escaped in structured segments (it stays a literal comma
 	// inside a segment, since ';' is the segment separator).
@@ -422,74 +282,6 @@ fn escape_structured(s: &str) -> String {
 		}
 	}
 	out
-}
-
-fn fold_line(out: &mut String, line: &str) {
-	// RFC 6350: fold at 75 octets; continuation lines are prefixed with a single space.
-	let bytes = line.as_bytes();
-	if bytes.len() <= MAX_LINE_LEN {
-		out.push_str(line);
-		out.push_str("\r\n");
-		return;
-	}
-	let mut i = 0;
-	while i < bytes.len() {
-		let end = (i + MAX_LINE_LEN).min(bytes.len());
-		// Back off to a char boundary if needed. With MAX_LINE_LEN ≫ 4 (max UTF-8 byte-width)
-		// and `line: &str` guaranteeing valid UTF-8, a boundary always exists within 3 steps.
-		let mut safe_end = end;
-		while safe_end > i && !line.is_char_boundary(safe_end) {
-			safe_end -= 1;
-		}
-		if i > 0 {
-			out.push(' ');
-		}
-		out.push_str(&line[i..safe_end]);
-		out.push_str("\r\n");
-		i = safe_end;
-	}
-}
-
-/// Strip CR/LF from a value destined for the structured-write path, where callers have
-/// pre-formatted segment separators (`;`, `,`) and we cannot re-run a text escape without
-/// double-escaping their work. Line injection is the only real threat here — a `\r` or `\n`
-/// would end the logical line and inject a new vCard property. Dropping those (rather than
-/// escaping) keeps the output round-trip-safe for legitimate URIs and structured N/ORG data.
-fn sanitize_for_line(s: &str) -> String {
-	s.chars().filter(|c| !matches!(c, '\r' | '\n')).collect()
-}
-
-fn write_line(
-	out: &mut String,
-	name: &str,
-	params: &[(&str, &str)],
-	value: &str,
-	structured: bool,
-) {
-	let escaped = if structured { sanitize_for_line(value) } else { escape_text(value) };
-	let mut line = String::with_capacity(name.len() + escaped.len() + 8);
-	line.push_str(name);
-	for (k, v) in params {
-		line.push(';');
-		line.push_str(k);
-		line.push('=');
-		// Parameter values: RFC 6350 §3.3 has no escape sequence for a literal `"` inside a
-		// quoted-string, so we strip any `"` from the value — leaving it unquoted would let
-		// the value terminate the quoted string. Then quote iff the value contains a parser-
-		// significant char (`,`, `;`, `:`). Control characters are dropped for the same
-		// line-injection reason as structured values.
-		let cleaned: String = v.chars().filter(|c| *c != '"' && !c.is_control()).collect();
-		if cleaned.contains([',', ';', ':']) {
-			line.push('"');
-			line.push_str(&cleaned);
-			line.push('"');
-		} else {
-			line.push_str(&cleaned);
-		}
-	}
-	line.push(':');
-	line.push_str(&escaped);
-	fold_line(out, &line);
 }
 
 /// Generate a canonical vCard 4.0 blob from a `ContactInput`.

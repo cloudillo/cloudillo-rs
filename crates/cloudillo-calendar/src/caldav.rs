@@ -18,14 +18,18 @@
 use std::fmt::Write as _;
 
 use axum::{
-	body::{Body, to_bytes},
+	body::Body,
 	extract::{Path, Request, State},
 	http::{Method, Response, StatusCode, header},
 };
 
 use cloudillo_core::{IdTag, extract::Auth, prelude::*};
+use cloudillo_dav::http::{
+	DAV_CAPABILITIES, decode_sync_token, depth, encode_sync_token, matches_prop, ok_empty,
+	read_body, xml_response,
+};
 use cloudillo_dav::{
-	MultiResponse, PropName, PropStat, Propfind, Report, escape_xml, etag_header, plain_error,
+	MultiResponse, PropStat, Propfind, Report, escape_xml, etag_header, plain_error,
 	render_multistatus, unquote_etag, urldecode_path, urlencode_path,
 };
 use cloudillo_types::meta_adapter::ListCalendarObjectOptions;
@@ -38,74 +42,13 @@ const DAV_NS: &str = cloudillo_dav::NS_DAV;
 const CALDAV_NS: &str = cloudillo_dav::NS_CALDAV;
 const CALSERVER_NS: &str = cloudillo_dav::NS_CALSERVER;
 
-const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Ceiling on how many rows one `sync-collection` REPORT can return. Mirrors the CardDAV
 /// constant in `cloudillo-contact`; keeps responses bounded even when the client requests
 /// more.
 const MAX_SYNC_PAGE: u32 = 1_000;
 
-/// Matches the CardDAV module's constant — discovery clients (DAVx5 etc.) decide which
-/// protocols to probe from the `DAV:` response header, so every DAV response advertises
-/// both `addressbook` and `calendar-access` to avoid one protocol masking the other.
-const DAV_CAPABILITIES: &str = "1, 2, 3, addressbook, calendar-access";
-
 // Helpers
 //*********
-
-fn xml_response(status: StatusCode, body: String) -> Response<Body> {
-	Response::builder()
-		.status(status)
-		.header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
-		.header("DAV", DAV_CAPABILITIES)
-		.body(Body::from(body))
-		.unwrap_or_else(|_| plain_error(StatusCode::INTERNAL_SERVER_ERROR, "xml build failed"))
-}
-
-fn ok_empty() -> Response<Body> {
-	Response::builder()
-		.status(StatusCode::OK)
-		.header("DAV", DAV_CAPABILITIES)
-		.header("Allow", "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, REPORT")
-		.body(Body::empty())
-		.unwrap_or_else(|_| Response::new(Body::empty()))
-}
-
-fn encode_sync_token(ts: i64) -> String {
-	format!("urn:cloudillo:sync:{ts}")
-}
-
-fn decode_sync_token(token: &str) -> Option<i64> {
-	token.strip_prefix("urn:cloudillo:sync:").and_then(|s| s.parse().ok())
-}
-
-fn has_prop(props: &[PropName], ns: &str, local: &str) -> bool {
-	props.iter().any(|p| p.is(ns, local))
-}
-
-fn matches_prop(pf: &Propfind, ns: &str, local: &str) -> bool {
-	match pf {
-		Propfind::AllProp | Propfind::PropName => true,
-		Propfind::Prop(list) => has_prop(list, ns, local),
-	}
-}
-
-fn depth(req: &Request<Body>) -> u8 {
-	match req.headers().get("Depth").and_then(|h| h.to_str().ok()) {
-		Some("1") => 1,
-		Some("infinity") => u8::MAX,
-		_ => 0,
-	}
-}
-
-/// Read the request body as UTF-8. RFC 5545 §3.1 mandates UTF-8 for iCalendar bodies.
-async fn read_body(req: Request<Body>) -> Result<String, Response<Body>> {
-	let bytes = to_bytes(req.into_body(), MAX_BODY_BYTES).await.map_err(|e| {
-		warn!("CalDAV body read failed (likely > {} bytes): {:?}", MAX_BODY_BYTES, e);
-		plain_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
-	})?;
-	String::from_utf8(bytes.to_vec())
-		.map_err(|_| plain_error(StatusCode::BAD_REQUEST, "request body must be UTF-8"))
-}
 
 // .well-known/caldav redirect
 //*****************************
@@ -139,14 +82,14 @@ pub async fn handle_home(
 	let tn_id = auth.tn_id;
 
 	if method == Method::OPTIONS {
-		return ok_empty();
+		return ok_empty("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, REPORT");
 	}
 	if method.as_str() != "PROPFIND" {
 		return plain_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
 	}
 
 	let d = depth(&req);
-	let body = match read_body(req).await {
+	let body = match read_body(req, "CalDAV").await {
 		Ok(b) => b,
 		Err(r) => return r,
 	};
@@ -280,7 +223,7 @@ pub async fn handle_collection(
 	};
 
 	if method == Method::OPTIONS {
-		return ok_empty();
+		return ok_empty("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, REPORT");
 	}
 
 	let cal = match app.meta_adapter.get_calendar_by_name(tn_id, &cal_name).await {
@@ -307,7 +250,7 @@ async fn propfind_collection(
 	req: Request<Body>,
 ) -> Response<Body> {
 	let d = depth(&req);
-	let body = match read_body(req).await {
+	let body = match read_body(req, "CalDAV").await {
 		Ok(b) => b,
 		Err(r) => return r,
 	};
@@ -374,7 +317,7 @@ async fn report_collection(
 	cal: cloudillo_types::meta_adapter::Calendar,
 	req: Request<Body>,
 ) -> Response<Body> {
-	let body = match read_body(req).await {
+	let body = match read_body(req, "CalDAV").await {
 		Ok(b) => b,
 		Err(r) => return r,
 	};
@@ -551,7 +494,7 @@ pub async fn handle_resource(
 	};
 
 	if method == Method::OPTIONS {
-		return ok_empty();
+		return ok_empty("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, REPORT");
 	}
 
 	let Some(uid) = resource.strip_suffix(".ics") else {
@@ -615,7 +558,7 @@ async fn put_resource(
 		.and_then(|h| h.to_str().ok())
 		.map(str::to_string);
 
-	let ical_text = match read_body(req).await {
+	let ical_text = match read_body(req, "CalDAV").await {
 		Ok(s) => s,
 		Err(r) => return r,
 	};

@@ -16,129 +16,16 @@
 //! enough for the deliberately-loose `calendar-query` time-range filter, and clients expand
 //! recurrence locally.
 
-use sha2::{Digest, Sha256};
+use cloudillo_dav::content_line::{
+	RawLine, get_param, parse_line, unescape_text, unfold, write_line,
+};
 
 use cloudillo_core::prelude::*;
 use cloudillo_types::meta_adapter::CalendarObjectExtracted;
 
 use crate::types::{Alarm, Attendee, CalendarObjectInput, EventInput, TodoInput};
 
-const MAX_LINE_LEN: usize = 75;
-
-/// Canonical ETag for an iCalendar blob — first 8 bytes of SHA-256, lowercase hex.
-pub fn etag_of(ical: &str) -> String {
-	let digest = Sha256::digest(ical.as_bytes());
-	let mut s = String::with_capacity(16);
-	for b in &digest[..8] {
-		use std::fmt::Write as _;
-		let _ = write!(&mut s, "{b:02x}");
-	}
-	s
-}
-
-// Parsing
-//*********
-
-#[derive(Debug)]
-struct RawLine {
-	name: String,
-	params: Vec<(String, String)>,
-	value: String,
-}
-
-/// Join continuation lines (CRLF + SPACE/TAB) and split into logical lines.
-fn unfold(input: &str) -> Vec<String> {
-	let mut out: Vec<String> = Vec::new();
-	for raw in input.split('\n') {
-		let line = raw.strip_suffix('\r').unwrap_or(raw);
-		if let Some(first) = line.chars().next()
-			&& (first == ' ' || first == '\t')
-			&& let Some(last) = out.last_mut()
-		{
-			last.push_str(&line[1..]);
-			continue;
-		}
-		out.push(line.to_string());
-	}
-	out
-}
-
-fn parse_line(line: &str) -> Option<RawLine> {
-	// Name and params are separated from value by the first unquoted ':'.
-	let mut in_quote = false;
-	let mut colon_idx = None;
-	for (i, c) in line.char_indices() {
-		match c {
-			'"' => in_quote = !in_quote,
-			':' if !in_quote => {
-				colon_idx = Some(i);
-				break;
-			}
-			_ => {}
-		}
-	}
-	let colon_idx = colon_idx?;
-	let head = &line[..colon_idx];
-	let value = line[colon_idx + 1..].to_string();
-
-	let mut parts = split_params(head);
-	let name_full = parts.remove(0);
-	let params = parts
-		.into_iter()
-		.filter_map(|p| {
-			let (k, v) = p.split_once('=')?;
-			Some((k.to_ascii_uppercase(), strip_quotes(v).to_string()))
-		})
-		.collect();
-
-	Some(RawLine { name: name_full.to_ascii_uppercase(), params, value })
-}
-
-fn split_params(head: &str) -> Vec<String> {
-	let mut parts = Vec::new();
-	let mut buf = String::new();
-	let mut in_quote = false;
-	for c in head.chars() {
-		match c {
-			'"' => {
-				in_quote = !in_quote;
-				buf.push(c);
-			}
-			';' if !in_quote => {
-				parts.push(buf.clone());
-				buf.clear();
-			}
-			_ => buf.push(c),
-		}
-	}
-	parts.push(buf);
-	parts
-}
-
-fn strip_quotes(s: &str) -> &str {
-	s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s)
-}
-
-fn unescape_text(s: &str) -> String {
-	let mut out = String::with_capacity(s.len());
-	let mut iter = s.chars();
-	while let Some(c) = iter.next() {
-		if c == '\\' {
-			match iter.next() {
-				Some('n' | 'N') => out.push('\n'),
-				Some(other) => out.push(other),
-				None => out.push('\\'),
-			}
-		} else {
-			out.push(c);
-		}
-	}
-	out
-}
-
-fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
-	params.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
-}
+pub use cloudillo_dav::content_line::etag_of;
 
 // Date/time
 //***********
@@ -150,92 +37,39 @@ fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
 /// - `YYYYMMDD`         — all-day; stored as UTC midnight
 fn parse_dt(value: &str, is_date: bool) -> Option<(i64, bool)> {
 	let v = value.trim();
+	let y: i32 = v.get(0..4)?.parse().ok()?;
+	let m: u32 = v.get(4..6)?.parse().ok()?;
+	let d: u32 = v.get(6..8)?.parse().ok()?;
 	if is_date || (v.len() == 8 && v.chars().all(|c| c.is_ascii_digit())) {
-		let y: i32 = v.get(0..4)?.parse().ok()?;
-		let m: u32 = v.get(4..6)?.parse().ok()?;
-		let d: u32 = v.get(6..8)?.parse().ok()?;
-		let ts = date_to_unix(y, m, d)?;
-		return Some((ts, true));
+		return Some((date_to_unix(y, m, d)?, true));
 	}
 	if v.len() >= 15 {
-		let y: i32 = v.get(0..4)?.parse().ok()?;
-		let m: u32 = v.get(4..6)?.parse().ok()?;
-		let d: u32 = v.get(6..8)?.parse().ok()?;
 		// v[8] is 'T'
 		let hh: u32 = v.get(9..11)?.parse().ok()?;
 		let mm: u32 = v.get(11..13)?.parse().ok()?;
 		let ss: u32 = v.get(13..15)?.parse().ok()?;
-		let ts = date_to_unix(y, m, d)?;
-		let ts = ts + i64::from(hh) * 3600 + i64::from(mm) * 60 + i64::from(ss);
-		return Some((ts, false));
+		// ponytail: leap seconds clamp to :59 (≤1s index error) rather than rolling
+		// into the next minute; switch to real rollover only if a client complains.
+		let dt = chrono::NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(hh, mm, ss.min(59))?;
+		return Some((dt.and_utc().timestamp(), false));
 	}
 	None
 }
 
-/// Convert a Gregorian date to Unix seconds (midnight UTC). Proleptic; matches chrono.
+/// Convert a Gregorian date to Unix seconds (midnight UTC). Proleptic; invalid
+/// calendar dates (Feb 30, month 13, ...) return None rather than rolling over.
 fn date_to_unix(y: i32, m: u32, d: u32) -> Option<i64> {
-	if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-		return None;
-	}
-	// Reject days beyond the actual month length so Feb 30 / Apr 31 don't silently
-	// roll forward into the next month via the Hinnant algorithm.
-	let leap = y.rem_euclid(4) == 0 && (y.rem_euclid(100) != 0 || y.rem_euclid(400) == 0);
-	let max_day: u32 = match m {
-		1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-		4 | 6 | 9 | 11 => 30,
-		2 if leap => 29,
-		2 => 28,
-		_ => return None,
-	};
-	if d > max_day {
-		return None;
-	}
-	// Howard Hinnant's date algorithm — matches RFC 5545's proleptic Gregorian calendar.
-	let y = i64::from(if m <= 2 { y - 1 } else { y });
-	let era = y.div_euclid(400);
-	let yoe = y.rem_euclid(400);
-	let m_i = i64::from(m);
-	let d_i = i64::from(d);
-	let doy = (153 * (if m_i > 2 { m_i - 3 } else { m_i + 9 }) + 2) / 5 + d_i - 1;
-	let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-	let days_since_epoch = era * 146_097 + doe - 719_468;
-	Some(days_since_epoch * 86400)
+	chrono::NaiveDate::from_ymd_opt(y, m, d)?
+		.and_hms_opt(0, 0, 0)
+		.map(|dt| dt.and_utc().timestamp())
 }
 
 fn emit_dt(ts: Timestamp, all_day: bool) -> String {
-	// Inverse of `date_to_unix` + time-of-day split. Emits UTC (Z) for datetimes, plain
-	// date for all-day. Matches what clients sent us on the happy path.
-	let total = ts.0;
-	let days = total.div_euclid(86400);
-	let sod = total.rem_euclid(86400);
-	let (y, m, d) = unix_days_to_ymd(days);
-	if all_day {
-		format!("{y:04}{m:02}{d:02}")
-	} else {
-		let hh = sod / 3600;
-		let mm = (sod % 3600) / 60;
-		let ss = sod % 60;
-		format!("{y:04}{m:02}{d:02}T{hh:02}{mm:02}{ss:02}Z")
-	}
-}
-
-fn unix_days_to_ymd(days: i64) -> (i32, u32, u32) {
-	// Inverse of date_to_unix's day computation.
-	let z = days + 719_468;
-	let era = z.div_euclid(146_097);
-	let doe = z.rem_euclid(146_097);
-	let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-	let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-	let mp = (5 * doy + 2) / 153;
-	let d = doy - (153 * mp + 2) / 5 + 1;
-	let m = if mp < 10 { mp + 3 } else { mp - 9 };
-	let y = yoe + era * 400 + i64::from(m <= 2);
-	// Month (1..=12) and day (1..=31) always fit in u32. Year within 0..=9999 for formatting;
-	// clamp anything wilder.
-	let m32 = u32::try_from(m).unwrap_or(0);
-	let d32 = u32::try_from(d).unwrap_or(0);
-	let y32 = i32::try_from(y).unwrap_or(0);
-	(y32, m32, d32)
+	let dt = chrono::DateTime::from_timestamp(ts.0, 0).unwrap_or_else(|| {
+		warn!("ical: timestamp {} out of range; emitting the epoch", ts.0);
+		chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+	});
+	if all_day { dt.format("%Y%m%d").to_string() } else { dt.format("%Y%m%dT%H%M%SZ").to_string() }
 }
 
 // Public parse
@@ -254,7 +88,7 @@ pub fn parse(ical: &str) -> Option<(CalendarObjectExtracted, Option<String>, Vec
 		if trimmed_line.is_empty() {
 			continue;
 		}
-		let Some(raw) = parse_line(&line) else {
+		let Some(raw) = parse_line(&line, false) else {
 			warnings.push(format!("malformed line: {trimmed_line:.80}"));
 			continue;
 		};
@@ -317,7 +151,7 @@ pub fn parse_to_input(ical: &str) -> Option<(CalendarObjectInput, Vec<String>)> 
 		if trimmed_line.is_empty() {
 			continue;
 		}
-		let Some(raw) = parse_line(&line) else {
+		let Some(raw) = parse_line(&line, false) else {
 			warnings.push(format!("malformed line: {trimmed_line:.80}"));
 			continue;
 		};
@@ -390,7 +224,7 @@ pub fn parse_all_to_inputs(ical: &str) -> (Vec<CalendarObjectInput>, Vec<String>
 		if trimmed_line.is_empty() {
 			continue;
 		}
-		let Some(raw) = parse_line(&line) else {
+		let Some(raw) = parse_line(&line, false) else {
 			warnings.push(format!("malformed line: {trimmed_line:.80}"));
 			continue;
 		};
@@ -730,116 +564,30 @@ impl ComponentAccum {
 // Generation
 //************
 
-fn escape_text(s: &str) -> String {
-	let mut out = String::with_capacity(s.len());
-	for c in s.chars() {
-		match c {
-			'\\' => out.push_str("\\\\"),
-			'\n' => out.push_str("\\n"),
-			',' => out.push_str("\\,"),
-			';' => out.push_str("\\;"),
-			_ => out.push(c),
-		}
-	}
-	out
-}
-
-fn fold_line(out: &mut String, line: &str) {
-	let bytes = line.as_bytes();
-	if bytes.len() <= MAX_LINE_LEN {
-		out.push_str(line);
-		out.push_str("\r\n");
-		return;
-	}
-	let mut i = 0;
-	while i < bytes.len() {
-		let end = (i + MAX_LINE_LEN).min(bytes.len());
-		let mut safe_end = end;
-		while safe_end > i && !line.is_char_boundary(safe_end) {
-			safe_end -= 1;
-		}
-		if i > 0 {
-			out.push(' ');
-		}
-		out.push_str(&line[i..safe_end]);
-		out.push_str("\r\n");
-		i = safe_end;
-	}
-}
-
-fn sanitize_for_line(s: &str) -> String {
-	s.chars().filter(|c| !matches!(c, '\r' | '\n')).collect()
-}
-
-fn write_line(out: &mut String, name: &str, params: &[(&str, &str)], value: &str, verbatim: bool) {
-	let encoded = if verbatim { sanitize_for_line(value) } else { escape_text(value) };
-	let mut line = String::with_capacity(name.len() + encoded.len() + 8);
-	line.push_str(name);
-	for (k, v) in params {
-		line.push(';');
-		line.push_str(k);
-		line.push('=');
-		let cleaned: String = v.chars().filter(|c| *c != '"' && !c.is_control()).collect();
-		if cleaned.contains([',', ';', ':']) {
-			line.push('"');
-			line.push_str(&cleaned);
-			line.push('"');
-		} else {
-			line.push_str(&cleaned);
-		}
-	}
-	line.push(':');
-	line.push_str(&encoded);
-	fold_line(out, &line);
-}
-
 /// Parse an ISO-8601 datetime from REST JSON (`YYYY-MM-DDTHH:MM:SS(Z|±HH:MM)?`) or a bare
 /// date (`YYYY-MM-DD`). Returns (unix seconds, is_date). Timezone offsets are applied;
 /// floating datetimes (no offset) are treated as UTC.
 fn parse_iso(value: &str) -> Option<(i64, bool)> {
 	let v = value.trim();
 	if v.len() == 10 && v.as_bytes().get(4) == Some(&b'-') && v.as_bytes().get(7) == Some(&b'-') {
-		let y: i32 = v.get(0..4)?.parse().ok()?;
-		let m: u32 = v.get(5..7)?.parse().ok()?;
-		let d: u32 = v.get(8..10)?.parse().ok()?;
-		return Some((date_to_unix(y, m, d)?, true));
+		let d = chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").ok()?;
+		return Some((d.and_hms_opt(0, 0, 0)?.and_utc().timestamp(), true));
 	}
 	if v.len() < 19 {
 		return None;
 	}
-	let y: i32 = v.get(0..4)?.parse().ok()?;
-	let m: u32 = v.get(5..7)?.parse().ok()?;
-	let d: u32 = v.get(8..10)?.parse().ok()?;
-	let hh: u32 = v.get(11..13)?.parse().ok()?;
-	let mm: u32 = v.get(14..16)?.parse().ok()?;
-	let ss: u32 = v.get(17..19)?.parse().ok()?;
-	let base = date_to_unix(y, m, d)? + i64::from(hh) * 3600 + i64::from(mm) * 60 + i64::from(ss);
-	let tz_part = v.get(19..).unwrap_or("");
-	let offset_secs = parse_tz_offset(tz_part).unwrap_or(0);
-	Some((base - offset_secs, false))
-}
-
-fn parse_tz_offset(s: &str) -> Option<i64> {
-	let s = s.trim_start_matches('.').trim_start_matches(|c: char| c.is_ascii_digit());
-	if s.is_empty() || s == "Z" {
-		return Some(0);
-	}
-	let sign = match s.as_bytes().first() {
-		Some(b'+') => 1_i64,
-		Some(b'-') => -1_i64,
-		_ => return None,
-	};
-	let rest = &s[1..];
-	let (hh, mm) = if let Some((h, m)) = rest.split_once(':') {
-		(h, m)
-	} else if rest.len() == 4 {
-		(&rest[..2], &rest[2..])
+	// RFC 3339 with offset, else a floating local time treated as UTC.
+	let ts = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
+		dt.timestamp()
+	} else if let Ok(dt) = chrono::DateTime::parse_from_str(v, "%Y-%m-%dT%H:%M:%S%.f%z") {
+		dt.timestamp()
 	} else {
-		return None;
+		chrono::NaiveDateTime::parse_from_str(v.get(..19)?, "%Y-%m-%dT%H:%M:%S")
+			.ok()?
+			.and_utc()
+			.timestamp()
 	};
-	let h: i64 = hh.parse().ok()?;
-	let m: i64 = mm.parse().ok()?;
-	Some(sign * (h * 3600 + m * 60))
+	Some((ts, false))
 }
 
 /// Generate a canonical VCALENDAR blob from structured input. `uid` is taken from
@@ -1006,16 +754,14 @@ fn write_dtstamp(out: &mut String) {
 
 /// Format a unix timestamp back to ISO-8601 for REST JSON responses.
 pub fn ts_to_iso(ts: Timestamp, all_day: bool) -> String {
-	let days = ts.0.div_euclid(86400);
-	let sod = ts.0.rem_euclid(86400);
-	let (y, m, d) = unix_days_to_ymd(days);
+	let dt = chrono::DateTime::from_timestamp(ts.0, 0).unwrap_or_else(|| {
+		warn!("ical: timestamp {} out of range; emitting the epoch", ts.0);
+		chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+	});
 	if all_day {
-		format!("{y:04}-{m:02}-{d:02}")
+		dt.format("%Y-%m-%d").to_string()
 	} else {
-		let hh = sod / 3600;
-		let mm = (sod % 3600) / 60;
-		let ss = sod % 60;
-		format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+		dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 	}
 }
 
@@ -1137,6 +883,31 @@ mod tests {
 			parse_iso("2026-05-01T09:00:00+02:00"),
 			Some((date_to_unix(2026, 5, 1).unwrap() + 7 * 3600, false))
 		);
+		// Basic (colon-less) offset form, as emitted by some clients.
+		assert_eq!(
+			parse_iso("2026-05-01T09:00:00+0200"),
+			Some((date_to_unix(2026, 5, 1).unwrap() + 7 * 3600, false))
+		);
+		// Fractional seconds must not cost the offset.
+		assert_eq!(
+			parse_iso("2026-05-01T09:00:00.123+0200"),
+			Some((date_to_unix(2026, 5, 1).unwrap() + 7 * 3600, false))
+		);
+		assert_eq!(
+			parse_iso("2026-05-01T09:00:00.123+02:00"),
+			Some((date_to_unix(2026, 5, 1).unwrap() + 7 * 3600, false))
+		);
+	}
+
+	#[test]
+	fn iso_multibyte_boundary_does_not_panic() {
+		// 20 bytes; byte 19 falls inside the two-byte 'e\u{301}' sequence.
+		assert_eq!(parse_iso("aaaaaaaaaaaaaaaaaa\u{e9}"), None);
+	}
+
+	#[test]
+	fn parse_dt_keeps_leap_second() {
+		assert!(parse_dt("20260630T235960Z", false).is_some());
 	}
 
 	#[test]

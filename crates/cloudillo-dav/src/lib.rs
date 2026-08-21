@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod consts;
+pub mod content_line;
 pub mod http;
 pub mod multistatus;
 pub mod propfind;

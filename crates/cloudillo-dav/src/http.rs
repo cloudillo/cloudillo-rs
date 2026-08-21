@@ -10,9 +10,93 @@
 use std::fmt::Write as _;
 
 use axum::{
-	body::Body,
-	http::{Response, StatusCode},
+	body::{Body, to_bytes},
+	http::{HeaderValue, Request, Response, StatusCode, header},
 };
+use tracing::warn;
+
+use crate::propfind::{PropName, Propfind};
+
+/// DAV capability tokens advertised in the `DAV:` response header. DAVx5 and other
+/// clients decide which protocols to probe based on this header, not the XML body.
+pub const DAV_CAPABILITIES: &str = "1, 2, 3, addressbook, calendar-access";
+
+/// Upper bound for request bodies parsed as UTF-8 (iCalendar / vCard payloads).
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Build an XML multistatus/propfind response.
+pub fn xml_response(status: StatusCode, body: String) -> Response<Body> {
+	Response::builder()
+		.status(status)
+		.header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
+		.header("DAV", DAV_CAPABILITIES)
+		.body(Body::from(body))
+		.unwrap_or_else(|_| plain_error(StatusCode::INTERNAL_SERVER_ERROR, "xml build failed"))
+}
+
+/// Empty 200 OK for OPTIONS/HEAD-style endpoints; the `Allow` list is per protocol.
+///
+/// Built directly rather than through the fallible builder so the `DAV:` and `Allow`
+/// headers can never be silently dropped — discovery clients key off them.
+pub fn ok_empty(allow: &str) -> Response<Body> {
+	let mut resp = Response::new(Body::empty());
+	resp.headers_mut().insert("dav", HeaderValue::from_static(DAV_CAPABILITIES));
+	if let Ok(value) = HeaderValue::from_str(allow) {
+		resp.headers_mut().insert("allow", value);
+	} else {
+		warn!("ok_empty: unrepresentable Allow header {:?}", allow);
+	}
+	resp
+}
+
+/// Encode a sync token from a unix timestamp. Opaque to clients but stable.
+pub fn encode_sync_token(ts: i64) -> String {
+	format!("urn:cloudillo:sync:{ts}")
+}
+
+pub fn decode_sync_token(token: &str) -> Option<i64> {
+	token.strip_prefix("urn:cloudillo:sync:").and_then(|s| s.parse().ok())
+}
+
+pub fn has_prop(props: &[PropName], ns: &str, local: &str) -> bool {
+	props.iter().any(|p| p.is(ns, local))
+}
+
+pub fn matches_prop(pf: &Propfind, ns: &str, local: &str) -> bool {
+	match pf {
+		Propfind::AllProp | Propfind::PropName => true,
+		Propfind::Prop(list) => has_prop(list, ns, local),
+	}
+}
+
+pub fn depth(req: &Request<Body>) -> u8 {
+	match req.headers().get("Depth").and_then(|h| h.to_str().ok()) {
+		Some("1") => 1,
+		Some("infinity") => u8::MAX,
+		_ => 0,
+	}
+}
+
+/// Read the request body as UTF-8. Both RFC 5545 §3.1 and RFC 6350 §3.1 mandate UTF-8 for
+/// iCalendar / vCard bodies; malformed bytes are rejected rather than silently repaired.
+pub async fn read_body(req: Request<Body>, log_prefix: &str) -> Result<String, Response<Body>> {
+	let bytes = to_bytes(req.into_body(), MAX_BODY_BYTES).await.map_err(|e| {
+		// `to_bytes` reports the size cap and transport failures through the same
+		// error, so walk the source chain: only a LengthLimitError is a 413.
+		let mut src: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+		while let Some(err) = src {
+			if err.is::<http_body_util::LengthLimitError>() {
+				warn!("{} body exceeds {} bytes", log_prefix, MAX_BODY_BYTES);
+				return plain_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+			}
+			src = err.source();
+		}
+		warn!("{} body read failed: {:?}", log_prefix, e);
+		plain_error(StatusCode::BAD_REQUEST, "could not read request body")
+	})?;
+	String::from_utf8(bytes.to_vec())
+		.map_err(|_| plain_error(StatusCode::BAD_REQUEST, "request body must be UTF-8"))
+}
 
 /// Format a hash as a strong ETag per RFC 7232 §2.3 — the surrounding quotes are mandatory.
 pub fn etag_header(etag: &str) -> String {
