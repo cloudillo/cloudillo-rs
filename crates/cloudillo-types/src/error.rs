@@ -357,45 +357,6 @@ impl From<image::error::ImageError> for Error {
 	}
 }
 
-/// Helper macro for locking mutexes with automatic internal error handling.
-///
-/// This macro simplifies the common pattern of locking a mutex and converting
-/// poisoning errors to `Error::Internal`. It automatically adds context about
-/// which mutex was poisoned.
-///
-/// # Examples
-///
-/// ```ignore
-/// // Without macro:
-/// let mut data = my_mutex.lock().map_err(|_| Error::Internal("mutex poisoned".into()))?;
-///
-/// // With macro:
-/// let mut data = lock!(my_mutex)?;
-/// ```
-///
-/// The macro also supports adding context information:
-///
-/// ```ignore
-/// // With context:
-/// let mut data = lock!(my_mutex, "task_queue")?;
-/// // Produces: Error::Internal("mutex poisoned: task_queue")
-/// ```
-#[macro_export]
-macro_rules! lock {
-	// Simple version without context
-	($mutex:expr) => {
-		$mutex
-			.lock()
-			.map_err(|_| $crate::error::Error::Internal("mutex poisoned".into()))
-	};
-	// Version with context description
-	($mutex:expr, $context:expr) => {
-		$mutex
-			.lock()
-			.map_err(|_| $crate::error::Error::Internal(format!("mutex poisoned: {}", $context)))
-	};
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;

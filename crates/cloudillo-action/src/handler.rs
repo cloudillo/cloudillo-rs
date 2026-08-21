@@ -326,27 +326,6 @@ pub struct Inbox {
 	related: Option<Vec<String>>,
 }
 
-/// Request structure for synchronous action processing (e.g., IDP:REG)
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SyncActionRequest {
-	/// Action type (e.g., "IDP:REG")
-	pub r#type: String,
-	/// Optional subtype for action variants
-	pub subtype: Option<String>,
-	/// Issuer ID tag (who is sending this action)
-	pub issuer: String,
-	/// Target audience (who should receive this action)
-	pub audience: Option<String>,
-	/// Action content (structure depends on action type)
-	pub content: serde_json::Value,
-	/// Optional parent action ID (for threading)
-	pub parent: Option<String>,
-	/// Optional subject
-	pub subject: Option<String>,
-	/// Optional attachments
-	pub attachments: Option<Vec<String>>,
-}
-
 #[axum::debug_handler]
 pub async fn post_inbox(
 	State(app): State<App>,

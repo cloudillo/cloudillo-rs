@@ -32,10 +32,6 @@ pub use cloudillo_types::rtdb_adapter;
 pub use cloudillo_types::types;
 pub use cloudillo_types::utils;
 
-// Re-export the lock! macro so `$crate::error::Error` resolves correctly
-// for code in this crate that uses `lock!` via cloudillo_types
-pub use cloudillo_types::lock;
-
 // Re-export additional cloudillo-types modules used by adapters
 pub use cloudillo_types::action_types;
 pub use cloudillo_types::hasher;

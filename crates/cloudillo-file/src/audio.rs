@@ -96,11 +96,7 @@ impl Task<App> for AudioExtractorTask {
 		let duration = app
 			.worker
 			.try_run_slow(move || {
-				let opts = ffmpeg::AudioExtractOpts {
-					bitrate,
-					codec: "libopus".to_string(),
-					format: "opus".to_string(),
-				};
+				let opts = ffmpeg::AudioExtractOpts { bitrate, codec: "libopus".to_string() };
 
 				let duration =
 					ffmpeg::FFmpeg::extract_audio(&input_path, &output_path_clone, &opts)?;

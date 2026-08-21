@@ -75,18 +75,6 @@ pub struct CrdtSubscriptionOptions {
 	pub send_snapshot: bool,
 }
 
-impl CrdtSubscriptionOptions {
-	/// Create a subscription to a document with snapshot.
-	pub fn with_snapshot(doc_id: impl Into<Box<str>>) -> Self {
-		Self { doc_id: doc_id.into(), send_snapshot: true }
-	}
-
-	/// Create a subscription to future updates only (no snapshot).
-	pub fn updates_only(doc_id: impl Into<Box<str>>) -> Self {
-		Self { doc_id: doc_id.into(), send_snapshot: false }
-	}
-}
-
 /// CRDT Document statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrdtDocStats {

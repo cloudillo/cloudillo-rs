@@ -57,20 +57,6 @@ impl AddressKey {
 		}
 	}
 
-	/// Create provider key from IPv6 address (/48)
-	/// Returns None for IPv4 addresses
-	pub fn from_ipv6_provider(addr: &IpAddr) -> Option<Self> {
-		match addr {
-			IpAddr::V4(_) => None,
-			IpAddr::V6(ip) => {
-				let octets = ip.octets();
-				let mut provider = [0u8; 6];
-				provider.copy_from_slice(&octets[..6]);
-				Some(AddressKey::Ipv6Provider(provider))
-			}
-		}
-	}
-
 	/// Extract all applicable hierarchical keys for an address
 	pub fn extract_all(addr: &IpAddr) -> Vec<Self> {
 		let mut keys = Vec::with_capacity(3);
@@ -237,15 +223,6 @@ mod tests {
 	}
 
 	#[test]
-	fn test_ipv6_provider_key() {
-		let ipv4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-		let ipv6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-
-		assert!(AddressKey::from_ipv6_provider(&ipv4).is_none());
-		assert!(AddressKey::from_ipv6_provider(&ipv6).is_some());
-	}
-
-	#[test]
 	fn test_level_names() {
 		let ipv4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 		let ipv6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
@@ -255,7 +232,6 @@ mod tests {
 		// IPv6 individual falls back to subnet
 		assert_eq!(AddressKey::from_ip_individual(&ipv6).level_name(), "ipv6_subnet");
 		assert_eq!(AddressKey::from_ip_network(&ipv6).level_name(), "ipv6_subnet");
-		assert_eq!(AddressKey::from_ipv6_provider(&ipv6).unwrap().level_name(), "ipv6_provider");
 	}
 }
 

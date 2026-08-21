@@ -3,9 +3,6 @@
 
 //! Action subsystem. Actions are small signed documents representing a user action (e.g. post, comment, connection request).
 
-#![allow(dead_code)]
-
-pub(crate) mod audience;
 pub mod delivery;
 pub mod dsl;
 pub mod fanout;

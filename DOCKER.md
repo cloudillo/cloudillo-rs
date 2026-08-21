@@ -157,8 +157,6 @@ server {
 | `ACME_EMAIL` | Email for Let's Encrypt registration | - |
 | `DATA_DIR` | Blob storage directory | `/data` |
 | `DB_DIR` | Database directory (SQLite + redb) | `/data` |
-| `PRIVATE_DATA_DIR` | Private data directory | `/data/priv` |
-| `PUBLIC_DATA_DIR` | Public data directory | `/data/pub` |
 | `DIST_DIR` | Frontend distribution directory | `/dist` |
 | `RUST_LOG` | Logging level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `DISABLE_CACHE` | Disable caching (set to any value to enable) | - |

@@ -8,22 +8,19 @@ use itertools::Itertools;
 use std::{
 	collections::{BTreeMap, HashMap},
 	fmt::Debug,
-	sync::{Arc, Mutex, RwLock},
+	sync::Arc,
 };
+
+use parking_lot::{Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use croner::Cron;
 use std::str::FromStr;
 
 use crate::prelude::*;
-use cloudillo_types::{lock, meta_adapter};
+use cloudillo_types::meta_adapter;
 
 pub type TaskId = u64;
-
-pub enum TaskType {
-	Periodic,
-	Once,
-}
 
 /// Cron schedule wrapper using the croner crate
 /// Stores the expression string for serialization
@@ -151,7 +148,7 @@ impl InMemoryTaskStore {
 #[async_trait]
 impl<S: Clone> TaskStore<S> for InMemoryTaskStore {
 	async fn add(&self, _task: &TaskMeta<S>, _key: Option<&str>) -> ClResult<TaskId> {
-		let mut last_id = lock!(self.last_id)?;
+		let mut last_id = self.last_id.lock();
 		*last_id += 1;
 		Ok(*last_id)
 	}
@@ -517,12 +514,6 @@ impl<'a, S: Clone + Send + Sync + 'static> TaskSchedulerBuilder<'a, S> {
 		self.schedule().await
 	}
 
-	/// Execute the scheduled task after another task completes
-	pub async fn after_task(mut self, dep: TaskId) -> ClResult<TaskId> {
-		self.deps.push(dep);
-		self.schedule().await
-	}
-
 	/// Execute the scheduled task with automatic retry using default policy
 	pub async fn with_automatic_retry(mut self) -> ClResult<TaskId> {
 		self.retry = Some(RetryPolicy::default());
@@ -698,30 +689,15 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				}
 
 				// Handle dependencies of finished task using atomic release method
-				match schedule.release_dependents(id) {
-					Ok(ready_to_spawn) => {
-						for (dep_id, dep_task_meta) in ready_to_spawn {
-							// Add to running queue before spawning
-							match schedule.tasks_running.lock() {
-								Ok(mut tasks_running) => {
-									tasks_running.insert(dep_id, dep_task_meta.clone());
-								}
-								Err(poisoned) => {
-									error!("Mutex poisoned: tasks_running (recovering)");
-									poisoned.into_inner().insert(dep_id, dep_task_meta.clone());
-								}
-							}
-							schedule.spawn_task(
-								stat.clone(),
-								dep_task_meta.task.clone(),
-								dep_id,
-								dep_task_meta,
-							);
-						}
-					}
-					Err(e) => {
-						error!("Failed to release dependents of task {}: {}", id, e);
-					}
+				for (dep_id, dep_task_meta) in schedule.release_dependents(id) {
+					// Add to running queue before spawning
+					schedule.tasks_running.lock().insert(dep_id, dep_task_meta.clone());
+					schedule.spawn_task(
+						stat.clone(),
+						dep_task_meta.task.clone(),
+						dep_id,
+						dep_task_meta,
+					);
 				}
 			}
 		});
@@ -730,37 +706,19 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		let schedule = self.clone();
 		tokio::spawn(async move {
 			loop {
-				let is_empty = match schedule.tasks_scheduled.lock() {
-					Ok(guard) => guard.is_empty(),
-					Err(poisoned) => {
-						error!("Mutex poisoned: tasks_scheduled (recovering)");
-						poisoned.into_inner().is_empty()
-					}
-				};
+				let is_empty = schedule.tasks_scheduled.lock().is_empty();
 				if is_empty {
 					schedule.notify_schedule.notified().await;
 				}
 				let time = Timestamp::now();
 				if let Some((timestamp, _id)) = loop {
-					let mut tasks_scheduled = match schedule.tasks_scheduled.lock() {
-						Ok(guard) => guard,
-						Err(poisoned) => {
-							error!("Mutex poisoned: tasks_scheduled (recovering)");
-							poisoned.into_inner()
-						}
-					};
+					let mut tasks_scheduled = schedule.tasks_scheduled.lock();
 					if let Some((&(timestamp, id), _)) = tasks_scheduled.first_key_value() {
 						let (timestamp, id) = (timestamp, id);
 						if timestamp <= Timestamp::now() {
 							debug!("Spawning task id {} (from schedule)", id);
 							if let Some(task) = tasks_scheduled.remove(&(timestamp, id)) {
-								let mut tasks_running = match schedule.tasks_running.lock() {
-									Ok(guard) => guard,
-									Err(poisoned) => {
-										error!("Mutex poisoned: tasks_running (recovering)");
-										poisoned.into_inner()
-									}
-								};
+								let mut tasks_running = schedule.tasks_running.lock();
 								tasks_running.insert(id, task.clone());
 								schedule.spawn_task(state.clone(), task.task.clone(), id, task);
 							} else {
@@ -795,22 +753,14 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		});
 	}
 
-	fn register_builder(
-		&self,
-		name: &'static str,
-		builder: &'static TaskBuilder<S>,
-	) -> ClResult<&Self> {
-		let mut task_builders = self
-			.task_builders
-			.write()
-			.map_err(|_| Error::Internal("task_builders RwLock poisoned".into()))?;
+	fn register_builder(&self, name: &'static str, builder: &'static TaskBuilder<S>) {
+		let mut task_builders = self.task_builders.write();
 		task_builders.insert(name, Box::new(builder));
-		Ok(self)
 	}
 
 	pub fn register<T: Task<S>>(&self) -> ClResult<&Self> {
 		info!("Registering task type {}", T::kind());
-		self.register_builder(T::kind(), &|id: TaskId, params: &str| T::build(id, params))?;
+		self.register_builder(T::kind(), &|id: TaskId, params: &str| T::build(id, params));
 		Ok(self)
 	}
 
@@ -909,7 +859,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			// The guard is confined to this block: it is not `Send`, so holding it
 			// across the `await` below would make the whole handler non-`Send`.
 			let was_running = {
-				let mut running = lock!(self.tasks_running, "tasks_running")?;
+				let mut running = self.tasks_running.lock();
 				match running.get_mut(&existing_id) {
 					Some(existing_meta) => {
 						debug!("Task {} is running; updating metadata in place", existing_id);
@@ -927,7 +877,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			}
 
 			if params_changed {
-				self.remove_from_queues(existing_id)?;
+				self.remove_from_queues(existing_id);
 			}
 
 			// Update the task in database with the current parameters, cron and
@@ -958,7 +908,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		// If task is already running, update its metadata (especially for cron updates)
 		// but don't add to scheduled queue (it will reschedule on completion)
 		{
-			let mut running = lock!(self.tasks_running, "tasks_running")?;
+			let mut running = self.tasks_running.lock();
 			if let Some(existing_meta) = running.get_mut(&id) {
 				debug!(
 					"Task {} is already running, updating metadata (will reschedule on completion)",
@@ -976,7 +926,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 		// Remove from other queues if present (prevents duplicate entries with different timestamps)
 		{
-			let mut scheduled = lock!(self.tasks_scheduled, "tasks_scheduled")?;
+			let mut scheduled = self.tasks_scheduled.lock();
 			if let Some(key) = scheduled
 				.iter()
 				.find(|((_, tid), _)| *tid == id)
@@ -987,7 +937,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			}
 		}
 		{
-			let mut waiting = lock!(self.tasks_waiting, "tasks_waiting")?;
+			let mut waiting = self.tasks_waiting.lock();
 			if waiting.remove(&id).is_some() {
 				debug!("Removed existing waiting entry for task {} before re-queueing", id);
 			}
@@ -1002,13 +952,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				id
 			);
 			// Force to tasks_waiting instead
-			lock!(self.tasks_waiting, "tasks_waiting")?.insert(id, task_meta);
+			self.tasks_waiting.lock().insert(id, task_meta);
 			debug!("Task {} is waiting for {:?}", id, &deps);
 			for dep in &deps {
-				lock!(self.task_dependents, "task_dependents")?
-					.entry(*dep)
-					.or_default()
-					.push(id);
+				self.task_dependents.lock().entry(*dep).or_default().push(id);
 			}
 
 			self.check_and_resolve_completed_deps(id, &deps).await?;
@@ -1017,20 +964,17 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 		if deps.is_empty() && task_meta.next_at.unwrap_or(Timestamp(0)) < Timestamp::now() {
 			debug!("Spawning task {}", id);
-			lock!(self.tasks_scheduled, "tasks_scheduled")?.insert((Timestamp(0), id), task_meta);
+			self.tasks_scheduled.lock().insert((Timestamp(0), id), task_meta);
 			self.notify_schedule.notify_one();
 		} else if let Some(next_at) = task_meta.next_at {
 			debug!("Scheduling task {} for {}", id, next_at);
-			lock!(self.tasks_scheduled, "tasks_scheduled")?.insert((next_at, id), task_meta);
+			self.tasks_scheduled.lock().insert((next_at, id), task_meta);
 			self.notify_schedule.notify_one();
 		} else {
-			lock!(self.tasks_waiting, "tasks_waiting")?.insert(id, task_meta);
+			self.tasks_waiting.lock().insert(id, task_meta);
 			debug!("Task {} is waiting for {:?}", id, &deps);
 			for dep in &deps {
-				lock!(self.task_dependents, "task_dependents")?
-					.entry(*dep)
-					.or_default()
-					.push(id);
+				self.task_dependents.lock().entry(*dep).or_default().push(id);
 			}
 
 			self.check_and_resolve_completed_deps(id, &deps).await?;
@@ -1045,7 +989,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		if completed_deps.is_empty() {
 			return Ok(());
 		}
-		let mut waiting = lock!(self.tasks_waiting, "tasks_waiting")?;
+		let mut waiting = self.tasks_waiting.lock();
 		if let Some(task_meta) = waiting.get_mut(&id) {
 			for dep in &completed_deps {
 				task_meta.deps.retain(|d| *d != *dep);
@@ -1054,7 +998,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				&& let Some(ready_task) = waiting.remove(&id)
 			{
 				drop(waiting);
-				let mut dependents = lock!(self.task_dependents, "task_dependents")?;
+				let mut dependents = self.task_dependents.lock();
 				for dep in deps {
 					if let Some(dep_list) = dependents.get_mut(dep) {
 						dep_list.retain(|d| *d != id);
@@ -1065,8 +1009,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				}
 				drop(dependents);
 				debug!("Task {} deps already completed, scheduling immediately", id);
-				lock!(self.tasks_scheduled, "tasks_scheduled")?
-					.insert((Timestamp(0), id), ready_task);
+				self.tasks_scheduled.lock().insert((Timestamp(0), id), ready_task);
 				self.notify_schedule.notify_one();
 			}
 		}
@@ -1075,16 +1018,16 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 	/// Remove a task from all internal queues (waiting, scheduled, running)
 	/// Returns the removed TaskMeta if found
-	fn remove_from_queues(&self, task_id: TaskId) -> ClResult<Option<TaskMeta<S>>> {
+	fn remove_from_queues(&self, task_id: TaskId) -> Option<TaskMeta<S>> {
 		// Try tasks_waiting
-		if let Some(task_meta) = lock!(self.tasks_waiting, "tasks_waiting")?.remove(&task_id) {
+		if let Some(task_meta) = self.tasks_waiting.lock().remove(&task_id) {
 			debug!("Removed task {} from waiting queue for update", task_id);
-			return Ok(Some(task_meta));
+			return Some(task_meta);
 		}
 
 		// Try tasks_scheduled (need to find by task_id in BTreeMap)
 		{
-			let mut scheduled = lock!(self.tasks_scheduled, "tasks_scheduled")?;
+			let mut scheduled = self.tasks_scheduled.lock();
 			if let Some(key) = scheduled
 				.iter()
 				.find(|((_, id), _)| *id == task_id)
@@ -1092,33 +1035,30 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 				&& let Some(task_meta) = scheduled.remove(&key)
 			{
 				debug!("Removed task {} from scheduled queue for update", task_id);
-				return Ok(Some(task_meta));
+				return Some(task_meta);
 			}
 		}
 
 		// Try tasks_running (should rarely happen, but handle it)
-		if let Some(task_meta) = lock!(self.tasks_running, "tasks_running")?.remove(&task_id) {
+		if let Some(task_meta) = self.tasks_running.lock().remove(&task_id) {
 			warn!("Removed task {} from running queue during update", task_id);
-			return Ok(Some(task_meta));
+			return Some(task_meta);
 		}
 
-		Ok(None)
+		None
 	}
 
 	/// Release all dependent tasks of a completed task
 	/// This method safely handles dependency cleanup and spawning
-	fn release_dependents(
-		&self,
-		completed_task_id: TaskId,
-	) -> ClResult<Vec<(TaskId, TaskMeta<S>)>> {
+	fn release_dependents(&self, completed_task_id: TaskId) -> Vec<(TaskId, TaskMeta<S>)> {
 		// Get list of dependents (atomic removal to prevent re-processing)
 		let dependents = {
-			let mut deps_map = lock!(self.task_dependents, "task_dependents")?;
+			let mut deps_map = self.task_dependents.lock();
 			deps_map.remove(&completed_task_id).unwrap_or_default()
 		};
 
 		if dependents.is_empty() {
-			return Ok(Vec::new()); // No dependents to release
+			return Vec::new(); // No dependents to release
 		}
 
 		debug!("Releasing {} dependents of completed task {}", dependents.len(), completed_task_id);
@@ -1129,7 +1069,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		for dependent_id in dependents {
 			// Try tasks_waiting first (most common case for dependent tasks)
 			{
-				let mut waiting = lock!(self.tasks_waiting, "tasks_waiting")?;
+				let mut waiting = self.tasks_waiting.lock();
 				if let Some(task_meta) = waiting.get_mut(&dependent_id) {
 					// Remove the completed task from dependencies
 					task_meta.deps.retain(|x| *x != completed_task_id);
@@ -1156,7 +1096,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 			// Try tasks_scheduled if not in waiting (shouldn't happen with validation, but be defensive)
 			{
-				let mut scheduled = lock!(self.tasks_scheduled, "tasks_scheduled")?;
+				let mut scheduled = self.tasks_scheduled.lock();
 				if let Some(scheduled_key) = scheduled
 					.iter()
 					.find(|((_, id), _)| *id == dependent_id)
@@ -1188,7 +1128,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			);
 		}
 
-		Ok(ready_to_spawn)
+		ready_to_spawn
 	}
 
 	/// Re-queue every pending task the store holds.
@@ -1228,10 +1168,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 	async fn load_one(&self, t: TaskData) -> ClResult<()> {
 		debug!("Loading task {} {}", t.id, t.kind);
 		let task = {
-			let builder_map = self
-				.task_builders
-				.read()
-				.map_err(|_| Error::Internal("task_builders RwLock poisoned".into()))?;
+			let builder_map = self.task_builders.read();
 			let builder = builder_map
 				.get(t.kind.as_ref())
 				.ok_or(Error::Internal(format!("task builder not registered: {}", t.kind)))?;
@@ -1305,13 +1242,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 	/// Recovers from a poisoned lock rather than propagating: the finish handler
 	/// has no error channel, and dropping the event strands the task.
 	fn take_running(&self, id: TaskId) -> Option<TaskMeta<S>> {
-		match self.tasks_running.lock() {
-			Ok(mut running) => running.remove(&id),
-			Err(poisoned) => {
-				error!("Mutex poisoned: tasks_running (recovering)");
-				poisoned.into_inner().remove(&id)
-			}
-		}
+		self.tasks_running.lock().remove(&id)
 	}
 
 	/// Drop any in-flight "re-run when this finishes" request for `id`.
@@ -1322,13 +1253,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 	/// from a poisoned lock rather than propagating: a stale flag left set re-runs
 	/// a task that must not run again.
 	fn clear_rerun_request(&self, id: TaskId) {
-		let mut running = match self.tasks_running.lock() {
-			Ok(guard) => guard,
-			Err(poisoned) => {
-				error!("Mutex poisoned: tasks_running (recovering)");
-				poisoned.into_inner()
-			}
-		};
+		let mut running = self.tasks_running.lock();
 		if let Some(meta) = running.get_mut(&id) {
 			meta.rerun_requested = false;
 		}
@@ -1384,13 +1309,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 							// entry is already gone. The removal also recovers any
 							// pending rerun request along with the metadata, and the
 							// retry satisfies it — it carries the new parameters.
-							let current_meta = match scheduler.tasks_running.lock() {
-								Ok(mut tasks_running) => tasks_running.remove(&id),
-								Err(poisoned) => {
-									error!("Mutex poisoned: tasks_running (recovering)");
-									poisoned.into_inner().remove(&id)
-								}
-							};
+							let current_meta = scheduler.tasks_running.lock().remove(&id);
 
 							// Re-queue task with incremented retry count. Counted off
 							// the snapshot, not off `current_meta`: an in-place update
@@ -1486,10 +1405,10 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 	/// Get health status of the scheduler
 	/// Returns information about tasks in each queue and detects anomalies
 	pub async fn health_check(&self) -> ClResult<SchedulerHealth> {
-		let waiting_count = lock!(self.tasks_waiting, "tasks_waiting")?.len();
-		let scheduled_count = lock!(self.tasks_scheduled, "tasks_scheduled")?.len();
-		let running_count = lock!(self.tasks_running, "tasks_running")?.len();
-		let dependents_count = lock!(self.task_dependents, "task_dependents")?.len();
+		let waiting_count = self.tasks_waiting.lock().len();
+		let scheduled_count = self.tasks_scheduled.lock().len();
+		let running_count = self.tasks_running.lock().len();
+		let dependents_count = self.task_dependents.lock().len();
 
 		// Check for anomalies
 		let mut stuck_tasks = Vec::new();
@@ -1497,8 +1416,17 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 		// Check tasks_waiting for tasks with no dependencies (stuck)
 		{
-			let waiting = lock!(self.tasks_waiting, "tasks_waiting")?;
-			let _deps_map = lock!(self.task_dependents, "task_dependents")?;
+			// INVARIANT: health_check must never hold two queue locks at once. The
+			// dispatch loop holds `tasks_scheduled` while taking `tasks_running`, so
+			// probing them in the opposite order under `tasks_waiting` would deadlock.
+			// Snapshot ids first; this probe is warning-only and already tolerates a
+			// stale view.
+			let running_ids: std::collections::HashSet<TaskId> =
+				self.tasks_running.lock().keys().copied().collect();
+			let scheduled_ids: std::collections::HashSet<TaskId> =
+				self.tasks_scheduled.lock().keys().map(|(_, id)| *id).collect();
+
+			let waiting = self.tasks_waiting.lock();
 
 			for (id, task_meta) in waiting.iter() {
 				if task_meta.deps.is_empty() {
@@ -1512,12 +1440,8 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 					// await instead of ending just before it.
 					for dep in &task_meta.deps {
 						let dep_exists = waiting.contains_key(dep)
-							|| self.tasks_running.lock().ok().is_some_and(|r| r.contains_key(dep))
-							|| self
-								.tasks_scheduled
-								.lock()
-								.ok()
-								.is_some_and(|s| s.iter().any(|((_, task_id), _)| task_id == dep));
+							|| running_ids.contains(dep)
+							|| scheduled_ids.contains(dep);
 
 						if !dep_exists {
 							tasks_with_missing_deps.push((*id, *dep));
@@ -1603,7 +1527,7 @@ mod tests {
 			info!("Running task {}", self.num);
 			tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(self.num))).await;
 			info!("Completed task {}", self.num);
-			state.lock().unwrap().push(self.num);
+			state.lock().push(self.num);
 			Ok(())
 		}
 	}
@@ -1660,7 +1584,7 @@ mod tests {
 		}
 
 		async fn run(&self, state: &State) -> ClResult<()> {
-			let mut attempt = self.attempt.lock().unwrap();
+			let mut attempt = self.attempt.lock();
 			*attempt += 1;
 			let current_attempt = *attempt;
 
@@ -1672,16 +1596,16 @@ mod tests {
 			}
 
 			info!("FailingTask {} succeeded on attempt {}", self.id, current_attempt);
-			state.lock().unwrap().push(self.id);
+			state.lock().push(self.id);
 			Ok(())
 		}
 
 		async fn on_attempt_failed(&self, _state: &State, attempt: u16, _last_error: &str) {
-			self.retried.lock().unwrap().push(attempt);
+			self.retried.lock().push(attempt);
 		}
 
 		async fn on_failed(&self, _state: &State, attempts: u16, _last_error: &str) {
-			self.gave_up.lock().unwrap().push(attempts);
+			self.gave_up.lock().push(attempts);
 		}
 	}
 
@@ -1734,7 +1658,7 @@ mod tests {
 
 		tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		info!("res: {}", st.len());
 		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1:1:1");
@@ -1768,7 +1692,7 @@ mod tests {
 		tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
 		{
-			let st = state.lock().unwrap();
+			let st = state.lock();
 			assert_eq!(st.len(), 1, "Task should have succeeded after retries");
 			assert_eq!(st[0], 42);
 		}
@@ -1777,11 +1701,11 @@ mod tests {
 		// between "failed, retrying" and "failed for good": `on_attempt_failed` sees
 		// each retried failure with its zero-based attempt index, `on_failed` none.
 		assert_eq!(
-			retried.lock().unwrap().as_slice(),
+			retried.lock().as_slice(),
 			&[0, 1],
 			"Both retried failures should report their zero-based attempt index"
 		);
-		assert!(gave_up.lock().unwrap().is_empty(), "on_failed is only for terminal failures");
+		assert!(gave_up.lock().is_empty(), "on_failed is only for terminal failures");
 	}
 
 	// ===== Builder Pattern Tests =====
@@ -1802,7 +1726,7 @@ mod tests {
 
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		assert_eq!(st.len(), 1, "Task should have executed");
 		assert_eq!(st[0], 1);
 	}
@@ -1821,7 +1745,7 @@ mod tests {
 
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		assert_eq!(st.len(), 1);
 		assert_eq!(st[0], 1);
 	}
@@ -1845,7 +1769,7 @@ mod tests {
 		// Should not have executed yet
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 		{
-			let st = state.lock().unwrap();
+			let st = state.lock();
 			assert_eq!(st.len(), 0, "Task should not execute yet");
 		}
 
@@ -1853,7 +1777,7 @@ mod tests {
 		tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
 		{
-			let st = state.lock().unwrap();
+			let st = state.lock();
 			assert_eq!(st.len(), 1, "Task should have executed");
 			assert_eq!(st[0], 1);
 		}
@@ -1882,7 +1806,7 @@ mod tests {
 		// Wait for all tasks: task1 200ms, task2 400ms, task3 600ms = ~1200ms
 		tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		// Should have all three tasks in execution order: 1 finishes first (200ms), then 2 (200ms), then 3 (200ms after both)
 		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1");
@@ -1905,7 +1829,7 @@ mod tests {
 		// Wait for retry cycle: 1 fail + 1s wait + 1 success
 		tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		assert_eq!(st.len(), 1);
 		assert_eq!(st[0], 55);
 	}
@@ -1927,7 +1851,7 @@ mod tests {
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
 		// The important part is that this compiles and integrates correctly
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		// With default policy (min=60s), task shouldn't succeed in test timeframe
 		// Just verify builder chaining works
 		let _ = st.len(); // Verify state is accessible, but don't assert on timeout-dependent result
@@ -1961,7 +1885,7 @@ mod tests {
 
 		tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		// Should have all tasks: 20:10 (immediate deps) then 30 (after deps)
 		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1");
@@ -1983,7 +1907,7 @@ mod tests {
 
 		tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		// Both old and new API should have executed
 		assert_eq!(st.len(), 2);
 		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
@@ -2005,15 +1929,27 @@ mod tests {
 		let id1 = scheduler.task(TestTask::new(1)).key("stage-1").now().await.unwrap();
 
 		// Stage 2: Create task that depends on stage 1
-		let id2 = scheduler.task(TestTask::new(1)).key("stage-2").after_task(id1).await.unwrap();
+		let id2 = scheduler
+			.task(TestTask::new(1))
+			.key("stage-2")
+			.depend_on(vec![id1])
+			.schedule()
+			.await
+			.unwrap();
 
 		// Stage 3: Create task that depends on stage 2
-		let _id3 = scheduler.task(TestTask::new(1)).key("stage-3").after_task(id2).await.unwrap();
+		let _id3 = scheduler
+			.task(TestTask::new(1))
+			.key("stage-3")
+			.depend_on(vec![id2])
+			.schedule()
+			.await
+			.unwrap();
 
 		// Wait for pipeline: 1(200ms) + 2(200ms) + 3(200ms) = 600ms
 		tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		// Should execute in order: 1, 2, 3
 		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1");
@@ -2042,7 +1978,7 @@ mod tests {
 
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		// 1 and 2 execute in parallel, then 3 executes after both
 		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1");
@@ -2073,7 +2009,7 @@ mod tests {
 		// Wait for dependency to complete but before scheduled time
 		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 		{
-			let st = state.lock().unwrap();
+			let st = state.lock();
 			assert_eq!(st.len(), 1); // Only dependency executed
 		}
 
@@ -2081,7 +2017,7 @@ mod tests {
 		tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
 		{
-			let st = state.lock().unwrap();
+			let st = state.lock();
 			let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 			assert_eq!(str_vec.join(":"), "1:1");
 		}
@@ -2125,7 +2061,7 @@ mod tests {
 		// Wait for tasks: id1 (200ms) + id2 (200ms after id1) + id3 (200ms) = ~600ms
 		tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		// All three tasks should execute
 		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		assert_eq!(str_vec.join(":"), "1:1:1");
@@ -2176,7 +2112,7 @@ mod tests {
 
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		assert_eq!(st.len(), 3);
 		let str_vec = st.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
 		// All three tasks should execute
@@ -2211,39 +2147,10 @@ mod tests {
 		// This test just verifies the methods compile and chain properly
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		// Task is scheduled for future (9 AM), so it won't have executed yet
 		// The important thing is that the cron methods compile and integrate
 		assert_eq!(st.len(), 0); // Not executed yet since scheduled for future
-	}
-
-	#[tokio::test]
-	pub async fn test_builder_daily_at_placeholder() {
-		// Verify daily_at placeholder compiles and integrates
-		let task_store: Arc<dyn TaskStore<State>> = InMemoryTaskStore::new();
-		let state: State = Arc::new(Mutex::new(Vec::new()));
-		let scheduler = Scheduler::new(task_store);
-		scheduler.start(state.clone());
-		scheduler.register::<TestTask>().unwrap();
-
-		// Test that daily_at placeholder compiles
-		let task = TestTask::new(1);
-		let _id = scheduler
-			.task(task)
-			.key("daily-task")
-			.daily_at(14, 30)  // 2:30 PM daily
-			.schedule()
-			.await
-			.unwrap();
-
-		// Daily_at scheduling - task will execute at the specified time (2:30 PM daily)
-		// Task is scheduled for future, so it won't execute in this test
-		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-		let st = state.lock().unwrap();
-		// Task is scheduled for future (2:30 PM), not executed yet
-		// The important thing is that daily_at compiles and integrates properly
-		assert_eq!(st.len(), 0);
 	}
 
 	#[tokio::test]
@@ -2269,7 +2176,7 @@ mod tests {
 		// Task is scheduled for future, so it won't execute in this test
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		// Task is scheduled for future (Monday 9 AM), not executed yet
 		// The important thing is that weekly_at compiles and integrates properly
 		assert_eq!(st.len(), 0);
@@ -2289,7 +2196,7 @@ mod tests {
 		let _id = scheduler
 			.task(task)
 			.key("reliable-scheduled-task")
-			.daily_at(2, 0)  // 2 AM daily
+			.cron("0 2 * * *")  // 2 AM daily
 			.with_retry(RetryPolicy {
 				wait_min_max: (60, 3600),
 				times: 5,
@@ -2302,7 +2209,7 @@ mod tests {
 		// Task is scheduled for 2 AM, so won't execute in this test
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		// Task scheduled for future (2 AM), not executed yet
 		// The important thing is that chaining cron + retry works
 		assert_eq!(st.len(), 0);
@@ -2336,7 +2243,7 @@ mod tests {
 
 		// Verify task is in tasks_running
 		{
-			let running = scheduler.tasks_running.lock().unwrap();
+			let running = scheduler.tasks_running.lock();
 			assert!(running.contains_key(&task_id), "Task should be in running queue");
 		}
 
@@ -2357,7 +2264,7 @@ mod tests {
 
 		// Verify task is NOT in tasks_scheduled (only in running)
 		{
-			let sched_queue = scheduler.tasks_scheduled.lock().unwrap();
+			let sched_queue = scheduler.tasks_scheduled.lock();
 			let in_scheduled = sched_queue.iter().any(|((_, id), _)| *id == task_id);
 			assert!(!in_scheduled, "Task should NOT be in scheduled queue while running");
 		}
@@ -2366,7 +2273,7 @@ mod tests {
 		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
 		// Verify task completed
-		let st = state.lock().unwrap();
+		let st = state.lock();
 		assert_eq!(st.len(), 1, "Only one task execution should have occurred");
 		assert_eq!(st[0], 5);
 	}
@@ -2390,7 +2297,7 @@ mod tests {
 
 		// Verify task is running and has no cron
 		{
-			let running = scheduler.tasks_running.lock().unwrap();
+			let running = scheduler.tasks_running.lock();
 			let meta = running.get(&task_id).expect("Task should be running");
 			assert!(meta.cron.is_none(), "Task should have no cron initially");
 		}
@@ -2413,7 +2320,7 @@ mod tests {
 
 		// Verify the running task now has the cron schedule
 		{
-			let running = scheduler.tasks_running.lock().unwrap();
+			let running = scheduler.tasks_running.lock();
 			let meta = running.get(&task_id).expect("Task should still be running");
 			assert!(meta.cron.is_some(), "Task should now have cron after update");
 		}
@@ -2488,11 +2395,11 @@ mod tests {
 		}
 
 		fn finished_ids(&self) -> Vec<TaskId> {
-			self.finished.lock().unwrap().clone()
+			self.finished.lock().clone()
 		}
 
 		fn error_calls(&self) -> Vec<(TaskId, Option<Timestamp>)> {
-			self.errors.lock().unwrap().clone()
+			self.errors.lock().clone()
 		}
 
 		fn release_finished(&self, n: usize) {
@@ -2530,23 +2437,22 @@ mod tests {
 	impl<S: Clone> TaskStore<S> for KeyedTaskStore {
 		async fn add(&self, task: &TaskMeta<S>, key: Option<&str>) -> ClResult<TaskId> {
 			let id = {
-				let mut last = self.last_id.lock().unwrap();
+				let mut last = self.last_id.lock();
 				*last += 1;
 				*last
 			};
 			self.input
 				.lock()
-				.unwrap()
 				.insert(id, (task.task.kind_of().to_owned(), task.task.serialize()));
 			if let Some(key) = key {
-				self.by_key.lock().unwrap().insert(key.to_owned(), id);
+				self.by_key.lock().insert(key.to_owned(), id);
 			}
 			Ok(id)
 		}
 
 		async fn find_by_key(&self, key: &str) -> ClResult<Option<(TaskId, TaskData)>> {
-			let Some(id) = self.by_key.lock().unwrap().get(key).copied() else { return Ok(None) };
-			let Some((kind, input)) = self.input.lock().unwrap().get(&id).cloned() else {
+			let Some(id) = self.by_key.lock().get(key).copied() else { return Ok(None) };
+			let Some((kind, input)) = self.input.lock().get(&id).cloned() else {
 				return Ok(None);
 			};
 			Ok(Some((
@@ -2571,7 +2477,7 @@ mod tests {
 				.await
 				.map(tokio::sync::SemaphorePermit::forget)
 				.map_err(|_| Error::Internal("store gate closed".into()))?;
-			if let Some(entry) = self.input.lock().unwrap().get_mut(&id) {
+			if let Some(entry) = self.input.lock().get_mut(&id) {
 				entry.1 = task.task.serialize();
 			}
 			Ok(())
@@ -2584,7 +2490,7 @@ mod tests {
 				.await
 				.map(tokio::sync::SemaphorePermit::forget)
 				.map_err(|_| Error::Internal("store gate closed".into()))?;
-			self.finished.lock().unwrap().push(id);
+			self.finished.lock().push(id);
 			Ok(())
 		}
 		async fn load(&self) -> ClResult<Vec<TaskData>> {
@@ -2596,7 +2502,7 @@ mod tests {
 			_output: &str,
 			next_at: Option<Timestamp>,
 		) -> ClResult<()> {
-			self.errors.lock().unwrap().push((task_id, next_at));
+			self.errors.lock().push((task_id, next_at));
 			Ok(())
 		}
 		async fn find_completed_deps(&self, _deps: &[TaskId]) -> ClResult<Vec<TaskId>> {
@@ -2636,7 +2542,7 @@ mod tests {
 			self.param.to_string()
 		}
 		async fn run(&self, _state: &State) -> ClResult<()> {
-			self.runs.lock().unwrap().push(self.param);
+			self.runs.lock().push(self.param);
 			self.entered.notify_one();
 			let _permit = self.gate.acquire().await;
 			if self.fail {
@@ -2673,7 +2579,7 @@ mod tests {
 		}
 
 		fn params(&self) -> Vec<u8> {
-			self.runs.lock().unwrap().clone()
+			self.runs.lock().clone()
 		}
 
 		/// Await the next body being entered. The timeout only exists so a
@@ -2742,7 +2648,7 @@ mod tests {
 			"the re-requested run must reach `finished`, or the task is stuck pending"
 		);
 		assert!(
-			!scheduler.tasks_running.lock().unwrap().contains_key(&first_id),
+			!scheduler.tasks_running.lock().contains_key(&first_id),
 			"a finished task must not stay in the running map"
 		);
 	}
@@ -2968,7 +2874,7 @@ mod tests {
 			"the re-requested run must reach `finished`, or the row stays 'P' forever"
 		);
 		assert!(
-			!scheduler.tasks_running.lock().unwrap().contains_key(&id),
+			!scheduler.tasks_running.lock().contains_key(&id),
 			"a finished task must not stay in the running map"
 		);
 	}
@@ -3030,7 +2936,7 @@ mod tests {
 		// cron firing is minutes away.
 		for _ in 0..200 {
 			let queued = {
-				let scheduled = scheduler.tasks_scheduled.lock().unwrap();
+				let scheduled = scheduler.tasks_scheduled.lock();
 				scheduled.iter().any(|((_, tid), _)| *tid == id)
 			};
 			if queued {
@@ -3038,7 +2944,7 @@ mod tests {
 			}
 			tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 		}
-		let scheduled = scheduler.tasks_scheduled.lock().unwrap();
+		let scheduled = scheduler.tasks_scheduled.lock();
 		let (_, meta) = scheduled
 			.iter()
 			.find(|((_, tid), _)| *tid == id)

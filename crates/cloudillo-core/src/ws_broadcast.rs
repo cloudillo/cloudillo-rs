@@ -256,19 +256,6 @@ impl BroadcastManager {
 
 		UserRegistryStats { online_users, total_connections, users_per_tenant }
 	}
-
-	/// Cleanup disconnected users (users with no active receivers)
-	pub async fn cleanup_users(&self) {
-		let mut users = self.users.write().await;
-
-		for tenant_users in users.values_mut() {
-			for connections in tenant_users.values_mut() {
-				connections.retain(|conn| conn.sender.receiver_count() > 0);
-			}
-			tenant_users.retain(|_, connections| !connections.is_empty());
-		}
-		users.retain(|_, tenant_users| !tenant_users.is_empty());
-	}
 }
 
 impl Default for BroadcastManager {
@@ -315,6 +302,10 @@ mod tests {
 		let stats = manager.user_stats().await;
 		assert_eq!(stats.online_users, 1);
 		assert_eq!(stats.total_connections, 2);
+
+		let msg = BroadcastMessage::new("test", serde_json::json!({}), "system");
+		let result = manager.send_to_user(tn_id, "alice", msg).await;
+		assert_eq!(result, DeliveryResult::Delivered(2));
 	}
 
 	#[tokio::test]

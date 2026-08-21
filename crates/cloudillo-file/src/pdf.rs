@@ -171,18 +171,6 @@ pub async fn generate_pdf_thumbnail_variant(
 	Ok(PdfThumbnailResult { page_count: pdf_info.page_count, variant_id: variant_id.to_string() })
 }
 
-/// Check if PDF tools are available
-pub fn is_available() -> bool {
-	let pdfinfo = Command::new("pdfinfo")
-		.arg("--version")
-		.output()
-		.is_ok_and(|o| o.status.success());
-
-	let pdftoppm = Command::new("pdftoppm").arg("-v").output().is_ok_and(|o| o.status.success());
-
-	pdfinfo && pdftoppm
-}
-
 /// PDF processor task - generates thumbnail and extracts metadata
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PdfProcessorTask {
@@ -256,13 +244,6 @@ impl Task<App> for PdfProcessorTask {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn test_pdf_tools_availability() {
-		// This test will pass if poppler-utils is installed
-		let available = is_available();
-		println!("PDF tools available: {}", available);
-	}
 
 	#[test]
 	fn test_pdf_processor_serialize_deserialize() {

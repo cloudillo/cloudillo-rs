@@ -328,11 +328,6 @@ pub fn inflate_bounded(deflate_data: &[u8], max_output: u64) -> Result<Vec<u8>, 
 	Ok(output)
 }
 
-/// Decompress raw deflate data, up to [`MAX_ENTRY_BYTES`].
-pub fn inflate(deflate_data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-	inflate_bounded(deflate_data, MAX_ENTRY_BYTES)
-}
-
 /// Infer MIME type from file path extension
 fn mime_from_path(path: &str) -> &'static str {
 	let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
@@ -358,47 +353,6 @@ fn mime_from_path(path: &str) -> &'static str {
 		"map" => "application/json",
 		_ => "application/octet-stream",
 	}
-}
-
-/// Read the `cloudillo.json` manifest from zip data
-pub fn read_manifest(data: &[u8]) -> ClResult<serde_json::Value> {
-	let archive = rawzip::ZipArchive::from_slice(data)
-		.map_err(|e| Error::Internal(format!("Invalid zip archive: {e}")))?;
-
-	for entry_result in archive.entries() {
-		let entry = entry_result.map_err(|e| Error::Internal(format!("Invalid zip entry: {e}")))?;
-
-		let normalized = entry
-			.file_path()
-			.try_normalize()
-			.map_err(|e| Error::Internal(format!("Invalid zip entry path: {e}")))?;
-		let path: &str = normalized.as_ref();
-
-		if path == "cloudillo.json" {
-			let wayfinder = entry.wayfinder();
-			let local_entry = archive
-				.get_entry(wayfinder)
-				.map_err(|e| Error::Internal(format!("Failed to read manifest entry: {e}")))?;
-
-			let raw_data = local_entry.data();
-
-			let manifest_bytes = match entry.compression_method() {
-				rawzip::CompressionMethod::STORE => raw_data.to_vec(),
-				rawzip::CompressionMethod::DEFLATE => inflate(raw_data)
-					.map_err(|e| Error::Internal(format!("Failed to inflate manifest: {e}")))?,
-				_ => {
-					return Err(Error::Internal(
-						"Unsupported compression method in manifest".into(),
-					));
-				}
-			};
-
-			return serde_json::from_slice(&manifest_bytes)
-				.map_err(|e| Error::Internal(format!("Invalid cloudillo.json: {e}")));
-		}
-	}
-
-	Err(Error::Internal("cloudillo.json not found in package".into()))
 }
 
 #[cfg(test)]

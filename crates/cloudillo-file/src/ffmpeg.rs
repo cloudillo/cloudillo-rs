@@ -51,21 +51,6 @@ impl MediaInfo {
 		self.video_streams.first()
 	}
 
-	/// Get the primary audio stream (first one)
-	pub fn primary_audio(&self) -> Option<&AudioStream> {
-		self.audio_streams.first()
-	}
-
-	/// Check if this is a video file (has video stream)
-	pub fn has_video(&self) -> bool {
-		!self.video_streams.is_empty()
-	}
-
-	/// Check if this is an audio file (has audio stream)
-	pub fn has_audio(&self) -> bool {
-		!self.audio_streams.is_empty()
-	}
-
 	/// Get video resolution as (width, height)
 	pub fn video_resolution(&self) -> Option<(u32, u32)> {
 		self.primary_video().map(|v| (v.width, v.height))
@@ -103,13 +88,11 @@ pub struct AudioExtractOpts {
 	pub bitrate: u32,
 	/// Audio codec (default: libopus)
 	pub codec: String,
-	/// Output format (default: opus)
-	pub format: String,
 }
 
 impl Default for AudioExtractOpts {
 	fn default() -> Self {
-		Self { bitrate: 128, codec: "libopus".to_string(), format: "opus".to_string() }
+		Self { bitrate: 128, codec: "libopus".to_string() }
 	}
 }
 
@@ -266,57 +249,6 @@ impl FFmpeg {
 		Ok(())
 	}
 
-	/// Find an "interesting" frame for thumbnail using scene detection
-	/// Returns the timestamp in seconds of a visually interesting frame
-	pub fn find_interesting_frame(input: &Path, duration: f64) -> ClResult<f64> {
-		// Strategy: Sample frames at 10%, 25%, 50% and pick the one with highest scene score
-		// For simplicity, we'll use 10% of the duration (avoids intro/credits)
-		// A more sophisticated approach would use scene detection
-
-		let seek_time = if duration > 10.0 {
-			// For videos > 10 seconds, seek to 10% or 3 seconds, whichever is larger
-			(duration * 0.1).max(3.0).min(duration - 1.0)
-		} else if duration > 1.0 {
-			// For short videos, seek to middle
-			duration / 2.0
-		} else {
-			// Very short videos, use start
-			0.0
-		};
-
-		// Verify we can actually seek to this position
-		let output = Command::new("ffprobe")
-			.args([
-				"-v",
-				"quiet",
-				"-select_streams",
-				"v:0",
-				"-show_entries",
-				"frame=pkt_pts_time",
-				"-read_intervals",
-				&format!("%{:.3}", seek_time),
-				"-of",
-				"csv=p=0",
-				input.to_str().ok_or(Error::Internal("invalid path".into()))?,
-			])
-			.output();
-
-		// If probing fails, fall back to our calculated time
-		match output {
-			Ok(out) if out.status.success() => {
-				// Try to parse the actual frame time
-				let stdout = String::from_utf8_lossy(&out.stdout);
-				if let Some(first_line) = stdout.lines().next()
-					&& let Ok(time) = first_line.trim().parse::<f64>()
-				{
-					return Ok(time);
-				}
-				Ok(seek_time)
-			}
-			_ => Ok(seek_time),
-		}
-	}
-
 	/// Transcode video to a specific quality
 	pub fn transcode_video(
 		input: &Path,
@@ -391,121 +323,6 @@ impl FFmpeg {
 		// Get the duration of the output file
 		let info = Self::probe(output)?;
 		Ok(info.duration)
-	}
-
-	/// Check if FFmpeg is available
-	pub fn is_available() -> bool {
-		Command::new("ffmpeg")
-			.arg("-version")
-			.output()
-			.is_ok_and(|o| o.status.success())
-	}
-
-	/// Check if FFprobe is available
-	pub fn is_probe_available() -> bool {
-		Command::new("ffprobe")
-			.arg("-version")
-			.output()
-			.is_ok_and(|o| o.status.success())
-	}
-}
-
-/// Video quality presets using bounding box approach
-pub mod presets {
-	use super::{AudioExtractOpts, VideoTranscodeOpts};
-
-	pub const VIDEO_SD: VideoTranscodeOpts = VideoTranscodeOpts {
-		max_dim: 480,
-		bitrate: 1500,
-		codec: String::new(),  // Will use "libx264"
-		preset: String::new(), // Will use "medium"
-	};
-
-	pub const VIDEO_MD: VideoTranscodeOpts = VideoTranscodeOpts {
-		max_dim: 720,
-		bitrate: 3000,
-		codec: String::new(),
-		preset: String::new(),
-	};
-
-	pub const VIDEO_HD: VideoTranscodeOpts = VideoTranscodeOpts {
-		max_dim: 1080,
-		bitrate: 5000,
-		codec: String::new(),
-		preset: String::new(),
-	};
-
-	pub const VIDEO_XD: VideoTranscodeOpts = VideoTranscodeOpts {
-		max_dim: 2160,
-		bitrate: 15000,
-		codec: String::new(),
-		preset: String::new(),
-	};
-
-	pub const AUDIO_SD: AudioExtractOpts = AudioExtractOpts {
-		bitrate: 64,
-		codec: String::new(),  // Will use "libopus"
-		format: String::new(), // Will use "opus"
-	};
-
-	pub const AUDIO_MD: AudioExtractOpts =
-		AudioExtractOpts { bitrate: 128, codec: String::new(), format: String::new() };
-
-	pub const AUDIO_HD: AudioExtractOpts =
-		AudioExtractOpts { bitrate: 256, codec: String::new(), format: String::new() };
-
-	/// Get video transcode options for a quality tier
-	pub fn video_opts(quality: &str) -> VideoTranscodeOpts {
-		let base = match quality {
-			"sd" => VIDEO_SD,
-			"md" => VIDEO_MD,
-			"xd" => VIDEO_XD,
-			_ => VIDEO_HD,
-		};
-
-		VideoTranscodeOpts {
-			max_dim: base.max_dim,
-			bitrate: base.bitrate,
-			codec: "libx264".to_string(),
-			preset: "medium".to_string(),
-		}
-	}
-
-	/// Get audio extraction options for a quality tier
-	pub fn audio_opts(quality: &str) -> AudioExtractOpts {
-		let base = match quality {
-			"sd" => AUDIO_SD,
-			"hd" => AUDIO_HD,
-			_ => AUDIO_MD,
-		};
-
-		AudioExtractOpts {
-			bitrate: base.bitrate,
-			codec: "libopus".to_string(),
-			format: "opus".to_string(),
-		}
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn test_ffmpeg_available() {
-		// This test will pass if FFmpeg is installed
-		let available = FFmpeg::is_available();
-		println!("FFmpeg available: {}", available);
-	}
-
-	#[test]
-	fn test_presets() {
-		let video_opts = presets::video_opts("hd");
-		assert_eq!(video_opts.max_dim, 1080);
-		assert_eq!(video_opts.bitrate, 5000);
-
-		let audio_opts = presets::audio_opts("md");
-		assert_eq!(audio_opts.bitrate, 128);
 	}
 }
 

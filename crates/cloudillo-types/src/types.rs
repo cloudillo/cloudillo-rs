@@ -12,30 +12,13 @@ use std::time::SystemTime;
 // TnId //
 //******//
 //pub type TnId = u32;
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct TnId(pub u32);
 
 impl std::fmt::Display for TnId {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}", self.0)
-	}
-}
-
-impl Serialize for TnId {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		serializer.serialize_u32(self.0)
-	}
-}
-
-impl<'de> Deserialize<'de> for TnId {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		Ok(TnId(u32::deserialize(deserializer)?))
 	}
 }
 
@@ -285,14 +268,6 @@ pub struct RegisterRequest {
 	pub lang: Option<String>,
 }
 
-/// Registration verification request (legacy, kept for compatibility)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegisterVerifyRequest {
-	pub id_tag: String,
-	pub token: String,
-}
-
 /// Public profile wire type for federated profile exchange
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -438,69 +413,6 @@ pub struct CommunityProfileResponse {
 
 // Phase 2: Action Management & File Integration
 //***********************************************
-
-/// Action creation request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateActionRequest {
-	#[serde(rename = "type")]
-	pub r#type: String, // "Create", "Update", etc
-	pub sub_type: Option<String>, // "Note", "Image", etc
-	pub parent_id: Option<String>,
-	// Note: root_id is auto-populated from parent chain, not specified by clients
-	pub content: String,
-	pub attachments: Option<Vec<String>>, // file_ids
-	pub audience: Option<Vec<String>>,
-}
-
-/// Action response (API layer)
-#[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActionResponse {
-	pub action_id: String,
-	pub action_token: String,
-	#[serde(rename = "type")]
-	pub r#type: String,
-	pub sub_type: Option<String>,
-	pub parent_id: Option<String>,
-	pub root_id: Option<String>,
-	pub content: String,
-	pub attachments: Vec<String>,
-	pub issuer_tag: String,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-}
-
-/// List actions query parameters
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListActionsQuery {
-	#[serde(rename = "type")]
-	pub r#type: Option<String>,
-	pub parent_id: Option<String>,
-	pub offset: Option<usize>,
-	pub limit: Option<usize>,
-}
-
-/// File upload response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileUploadResponse {
-	pub file_id: String,
-	pub descriptor: String,
-	pub variants: Vec<FileVariantInfo>,
-}
-
-/// File variant information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileVariantInfo {
-	pub variant_id: String,
-	pub format: String,
-	pub size: u64,
-	pub resolution: Option<(u32, u32)>,
-}
 
 /// Tag information with optional usage count
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -852,14 +764,6 @@ impl TokenScope {
 		match self {
 			Self::File { access, .. } => Some(*access),
 			Self::ApkgPublish => None,
-		}
-	}
-
-	/// Check if scope matches a specific file
-	pub fn matches_file(&self, target_file_id: &str) -> bool {
-		match self {
-			Self::File { file_id, .. } => file_id == target_file_id,
-			Self::ApkgPublish => false,
 		}
 	}
 }

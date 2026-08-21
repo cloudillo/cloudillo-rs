@@ -195,16 +195,6 @@ pub fn is_capability_enabled(flags: Option<&str>, capability: char) -> bool {
 	!flags.is_some_and(|f| f.contains(disabled_char))
 }
 
-/// Reactions enabled unless explicitly disabled with lowercase 'r'
-pub fn can_react(flags: Option<&str>) -> bool {
-	is_capability_enabled(flags, 'R')
-}
-
-/// Comments enabled unless explicitly disabled with lowercase 'c'
-pub fn can_comment(flags: Option<&str>) -> bool {
-	is_capability_enabled(flags, 'C')
-}
-
 /// Check if the action is open (anyone can subscribe without invitation)
 /// Returns true if 'O' is present in flags, false otherwise
 pub fn is_open(flags: Option<&str>) -> bool {
@@ -273,16 +263,6 @@ impl SubscriptionRole {
 	}
 }
 
-/// Check if a user's role permits the given action
-/// Returns true if allowed, false otherwise
-///
-/// Note: This does NOT check issuer permission - that should be checked separately
-pub fn check_role_permission(user_role: &str, action_type: &str, subtype: Option<&str>) -> bool {
-	let role: SubscriptionRole = user_role.parse().unwrap_or(SubscriptionRole::Observer);
-	let required = SubscriptionRole::required_for_action(action_type, subtype);
-	role >= required
-}
-
 /// Get subscription role from action's metadata
 ///
 /// Reads from x.role (new location), falling back to content.role for migration.
@@ -313,23 +293,6 @@ pub fn get_subscription_role(
 		.and_then(|c| c.get("role"))
 		.and_then(|r| r.as_str())
 		.map_or(SubscriptionRole::Member, |s| s.parse().unwrap_or(SubscriptionRole::Member))
-}
-
-/// Check if the user is the issuer (creator) of an action
-/// Issuers always have full permission on their own actions
-pub fn is_action_issuer(action_issuer: &str, user_id: &str) -> bool {
-	action_issuer == user_id
-}
-
-/// Get the effective audience, defaulting to issuer if audience is None
-///
-/// In Cloudillo's action model:
-/// - Actions with no audience are "self-directed" (e.g., personal posts)
-/// - These should be treated as if audience == issuer for delivery/processing
-///
-/// This helper normalizes the audience field for consistent handling.
-pub fn effective_audience<'a>(audience: Option<&'a str>, issuer: &'a str) -> &'a str {
-	audience.unwrap_or(issuer)
 }
 
 /// Broadcast/Announce recipient set for `tn_id`: every profile with the
@@ -472,50 +435,6 @@ mod tests {
 
 	// Flag tests
 	#[test]
-	fn test_can_react_none() {
-		// None = enabled (no flags means all capabilities on)
-		assert!(can_react(None));
-	}
-
-	#[test]
-	fn test_can_react_enabled() {
-		// No lowercase 'r' = reactions enabled
-		assert!(can_react(Some("RCo")));
-		assert!(can_react(Some("co")));
-		assert!(can_react(Some("")));
-	}
-
-	#[test]
-	fn test_can_react_disabled() {
-		// Lowercase 'r' = reactions disabled
-		assert!(!can_react(Some("rCo")));
-		assert!(!can_react(Some("rco")));
-		assert!(!can_react(Some("r")));
-	}
-
-	#[test]
-	fn test_can_comment_none() {
-		// None = enabled
-		assert!(can_comment(None));
-	}
-
-	#[test]
-	fn test_can_comment_enabled() {
-		// No lowercase 'c' = comments enabled
-		assert!(can_comment(Some("RCo")));
-		assert!(can_comment(Some("ro")));
-		assert!(can_comment(Some("")));
-	}
-
-	#[test]
-	fn test_can_comment_disabled() {
-		// Lowercase 'c' = comments disabled
-		assert!(!can_comment(Some("Rco")));
-		assert!(!can_comment(Some("rco")));
-		assert!(!can_comment(Some("c")));
-	}
-
-	#[test]
 	fn test_is_capability_enabled() {
 		// Generic helper tests
 		assert!(is_capability_enabled(None, 'R'));
@@ -567,68 +486,6 @@ mod tests {
 		assert!(SubscriptionRole::Admin > SubscriptionRole::Moderator);
 		assert!(SubscriptionRole::Moderator > SubscriptionRole::Member);
 		assert!(SubscriptionRole::Member > SubscriptionRole::Observer);
-	}
-
-	#[test]
-	fn test_check_role_permission_member() {
-		// Members can send messages
-		assert!(check_role_permission("member", "MSG", None));
-		// Members can react
-		assert!(check_role_permission("member", "REACT", None));
-		// Members cannot kick
-		assert!(!check_role_permission("member", "SUBS", Some("DEL")));
-		// Members cannot change roles
-		assert!(!check_role_permission("member", "SUBS", Some("UPD")));
-	}
-
-	#[test]
-	fn test_check_role_permission_moderator() {
-		// Moderators can do everything members can
-		assert!(check_role_permission("moderator", "MSG", None));
-		assert!(check_role_permission("moderator", "REACT", None));
-		// Moderators can kick
-		assert!(check_role_permission("moderator", "SUBS", Some("DEL")));
-		// Moderators cannot change roles
-		assert!(!check_role_permission("moderator", "SUBS", Some("UPD")));
-	}
-
-	#[test]
-	fn test_check_role_permission_admin() {
-		// Admins can do everything
-		assert!(check_role_permission("admin", "MSG", None));
-		assert!(check_role_permission("admin", "SUBS", Some("DEL")));
-		assert!(check_role_permission("admin", "SUBS", Some("UPD")));
-		assert!(check_role_permission("admin", "CONV", Some("UPD")));
-	}
-
-	#[test]
-	fn test_check_role_permission_observer() {
-		// Observers can only view
-		assert!(!check_role_permission("observer", "MSG", None));
-		assert!(!check_role_permission("observer", "REACT", None));
-		// Observers can create subscriptions (join)
-		assert!(check_role_permission("observer", "SUBS", None));
-	}
-
-	#[test]
-	fn test_is_action_issuer() {
-		assert!(is_action_issuer("alice@example.com", "alice@example.com"));
-		assert!(!is_action_issuer("alice@example.com", "bob@example.com"));
-	}
-
-	#[test]
-	fn test_effective_audience_with_audience() {
-		// When audience is provided, use it
-		assert_eq!(
-			effective_audience(Some("bob@example.com"), "alice@example.com"),
-			"bob@example.com"
-		);
-	}
-
-	#[test]
-	fn test_effective_audience_without_audience() {
-		// When audience is None, fall back to issuer
-		assert_eq!(effective_audience(None, "alice@example.com"), "alice@example.com");
 	}
 
 	#[test]

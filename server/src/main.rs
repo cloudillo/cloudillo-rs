@@ -6,8 +6,6 @@
 //! Implements a self-contained, basic **Cloudillo** server with adapters using embedded databases and file system.
 //! Configuration is done through environment variables, ideal for self-hosting with containerization.
 
-#![allow(unused)]
-
 use mimalloc::MiMalloc;
 
 #[global_allocator]
@@ -16,7 +14,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 use std::{env, path::PathBuf, sync::Arc};
 use tokio::fs;
 
-use cloudillo::{auth_adapter, meta_adapter, worker};
+use cloudillo::worker;
 use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 use cloudillo_blob_adapter_fs::BlobAdapterFs;
 use cloudillo_crdt_adapter_redb::{AdapterConfig as CrdtConfig, CrdtAdapterRedb};
@@ -31,8 +29,6 @@ pub struct Config {
 	pub base_app_domain: String,
 	pub base_password: Option<String>,
 	pub data_dir: PathBuf,
-	pub priv_data_dir: PathBuf,
-	pub pub_data_dir: PathBuf,
 	pub dist_dir: PathBuf,
 	/// Version stamping the shell's asset directory, for the `/assets-<version>/…`
 	/// links the site wrapper composes. Unset means "the same version as this
@@ -73,10 +69,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		base_id_tag,
 		base_password: env::var("BASE_PASSWORD").ok(),
 		data_dir: env::var("DATA_DIR").map_or_else(|_| PathBuf::from("./data"), PathBuf::from),
-		priv_data_dir: env::var("PRIVATE_DATA_DIR")
-			.map_or_else(|_| PathBuf::from("./data"), PathBuf::from),
-		pub_data_dir: env::var("PUBLIC_DATA_DIR")
-			.map_or_else(|_| PathBuf::from("./data"), PathBuf::from),
 		dist_dir: env::var("DIST_DIR").map_or_else(|_| PathBuf::from("./dist"), PathBuf::from),
 		shell_version: env::var("SHELL_VERSION").ok().filter(|v| !v.trim().is_empty()),
 		acme_email: env::var("ACME_EMAIL").ok(),

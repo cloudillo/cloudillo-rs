@@ -4,8 +4,7 @@
 //! Request client implementation
 
 use futures::TryStreamExt;
-use futures_core::stream::Stream;
-use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::BoxBody};
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::http::StatusCode;
 use hyper::{Method, body::Body, body::Bytes};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
@@ -404,27 +403,6 @@ impl Request {
 			.uri(format!("https://cl-o.{}/api{}", host, path))
 			.header("Content-Type", "application/json")
 			.body(to_boxed(Full::from(data)))?;
-		let res = self.timed_request(req).await?;
-		Self::collect_body(res.into_body()).await
-	}
-
-	/// Unauthenticated streaming POST to a remote tenant. See [`Self::post_bin`]
-	/// for why no `Authorization` header is attached.
-	pub async fn post_stream<S>(
-		&self,
-		_tn_id: TnId,
-		id_tag: &str,
-		path: &str,
-		stream: S,
-	) -> ClResult<Bytes>
-	where
-		S: Stream<Item = Result<hyper::body::Frame<Bytes>, hyper::Error>> + Send + Sync + 'static,
-	{
-		let host = Self::host_for(id_tag)?;
-		let req = hyper::Request::builder()
-			.method(Method::POST)
-			.uri(format!("https://cl-o.{}/api{}", host, path))
-			.body(to_boxed(StreamBody::new(stream)))?;
 		let res = self.timed_request(req).await?;
 		Self::collect_body(res.into_body()).await
 	}

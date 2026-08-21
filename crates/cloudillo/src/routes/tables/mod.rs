@@ -145,7 +145,7 @@ mod tests {
 	/// Every `pub(crate) fn` in a table file must appear BOTH in
 	/// `all_api_tables()` and at a compose site. Catches the two silent drift
 	/// modes: a table missing from the conflict test, and a table that is never
-	/// mounted at all (which `#![allow(dead_code)]` would otherwise hide).
+	/// mounted at all.
 	#[test]
 	fn every_table_fn_is_registered_and_mounted() {
 		/// Drop whole-line comments so a commented-out `.merge(..)` does not read

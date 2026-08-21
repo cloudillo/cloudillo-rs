@@ -3,8 +3,6 @@
 
 //! File subsystem. File storage, metadata, documents, etc.
 
-#![allow(dead_code)]
-
 pub mod apkg;
 pub(crate) mod audio;
 pub(crate) mod container;

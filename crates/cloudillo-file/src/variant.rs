@@ -151,45 +151,6 @@ impl VariantQuality {
 			_ => None,
 		}
 	}
-
-	/// Get the bounding box size for this quality tier (for images/video)
-	pub fn bounding_box(self) -> Option<u32> {
-		match self {
-			Self::Profile => Some(80),
-			Self::Thumbnail => Some(128),
-			Self::Small => Some(720),
-			Self::Medium => Some(1280),
-			Self::High => Some(1920),
-			Self::Extra => Some(3840),
-			Self::Original => None,
-		}
-	}
-
-	/// Get the audio bitrate in kbps for this quality tier
-	pub fn audio_bitrate(self) -> Option<u32> {
-		match self {
-			Self::Small => Some(64),
-			Self::Medium => Some(128),
-			Self::High => Some(256),
-			Self::Extra => Some(320),
-			Self::Profile | Self::Thumbnail | Self::Original => None,
-		}
-	}
-
-	/// Get the video bitrate in kbps for this quality tier
-	pub fn video_bitrate(self) -> Option<u32> {
-		match self {
-			Self::Small => Some(1500),
-			Self::Medium => Some(3000),
-			Self::High => Some(5000),
-			Self::Extra => Some(15000),
-			Self::Profile | Self::Thumbnail | Self::Original => None,
-		}
-	}
-
-	/// List of standard quality tiers in ascending order (excluding special variants)
-	pub const STANDARD_TIERS: &'static [VariantQuality] =
-		&[Self::Thumbnail, Self::Small, Self::Medium, Self::High, Self::Extra];
 }
 
 impl fmt::Display for VariantQuality {
@@ -214,11 +175,6 @@ pub struct Variant {
 }
 
 impl Variant {
-	/// Create a new variant
-	pub fn new(class: VariantClass, quality: VariantQuality) -> Self {
-		Self { class, quality }
-	}
-
 	/// Parse from string in format "class.quality" (e.g., "vis.sd")
 	/// Special case: "orig" has no class prefix and uses Raw class internally
 	/// Also supports legacy single-level format (e.g., "sd") which defaults to Visual class
@@ -239,47 +195,6 @@ impl Variant {
 			Some(Self { class: VariantClass::Visual, quality })
 		}
 	}
-
-	/// Check if this is a legacy (single-level) variant name
-	/// Note: "orig" is NOT legacy - it's the canonical format for originals
-	pub fn is_legacy_format(s: &str) -> bool {
-		s != "orig" && !s.contains('.') && VariantQuality::from_str_opt(s).is_some()
-	}
-
-	/// Convert legacy variant name to new format
-	/// "sd" → "vis.sd", "tn" → "vis.tn"
-	pub fn upgrade_legacy(s: &str) -> Option<String> {
-		if Self::is_legacy_format(s) {
-			Some(format!("{}.{}", VariantClass::Visual, s))
-		} else {
-			None
-		}
-	}
-
-	// Common variant constants
-	pub const VIS_TN: Self =
-		Self { class: VariantClass::Visual, quality: VariantQuality::Thumbnail };
-	pub const VIS_SD: Self = Self { class: VariantClass::Visual, quality: VariantQuality::Small };
-	pub const VIS_MD: Self = Self { class: VariantClass::Visual, quality: VariantQuality::Medium };
-	pub const VIS_HD: Self = Self { class: VariantClass::Visual, quality: VariantQuality::High };
-	pub const VIS_XD: Self = Self { class: VariantClass::Visual, quality: VariantQuality::Extra };
-	pub const VIS_ORIG: Self =
-		Self { class: VariantClass::Visual, quality: VariantQuality::Original };
-	pub const VIS_PF: Self = Self { class: VariantClass::Visual, quality: VariantQuality::Profile };
-
-	pub const VID_SD: Self = Self { class: VariantClass::Video, quality: VariantQuality::Small };
-	pub const VID_MD: Self = Self { class: VariantClass::Video, quality: VariantQuality::Medium };
-	pub const VID_HD: Self = Self { class: VariantClass::Video, quality: VariantQuality::High };
-	pub const VID_XD: Self = Self { class: VariantClass::Video, quality: VariantQuality::Extra };
-
-	pub const AUD_SD: Self = Self { class: VariantClass::Audio, quality: VariantQuality::Small };
-	pub const AUD_MD: Self = Self { class: VariantClass::Audio, quality: VariantQuality::Medium };
-	pub const AUD_HD: Self = Self { class: VariantClass::Audio, quality: VariantQuality::High };
-
-	pub const DOC_ORIG: Self =
-		Self { class: VariantClass::Document, quality: VariantQuality::Original };
-
-	pub const RAW_ORIG: Self = Self { class: VariantClass::Raw, quality: VariantQuality::Original };
 }
 
 impl fmt::Display for Variant {
@@ -305,41 +220,6 @@ impl FromStr for Variant {
 /// Handles both "hd" (quality only) and "vis.hd" (class.quality) formats.
 pub fn parse_quality(s: &str) -> Option<VariantQuality> {
 	if let Some(v) = Variant::parse(s) { Some(v.quality) } else { VariantQuality::from_str_opt(s) }
-}
-
-/// Get the fallback chain for a given variant (within the same class)
-pub fn get_fallback_chain(variant: Variant) -> Vec<Variant> {
-	let class = variant.class;
-	match variant.quality {
-		VariantQuality::Thumbnail => vec![],
-		VariantQuality::Small => vec![
-			Variant::new(class, VariantQuality::Medium),
-			Variant::new(class, VariantQuality::Thumbnail),
-		],
-		VariantQuality::Medium => vec![
-			Variant::new(class, VariantQuality::Small),
-			Variant::new(class, VariantQuality::Thumbnail),
-		],
-		VariantQuality::High => vec![
-			Variant::new(class, VariantQuality::Medium),
-			Variant::new(class, VariantQuality::Small),
-			Variant::new(class, VariantQuality::Thumbnail),
-		],
-		VariantQuality::Extra => vec![
-			Variant::new(class, VariantQuality::High),
-			Variant::new(class, VariantQuality::Medium),
-			Variant::new(class, VariantQuality::Small),
-			Variant::new(class, VariantQuality::Thumbnail),
-		],
-		VariantQuality::Original => vec![
-			Variant::new(class, VariantQuality::Extra),
-			Variant::new(class, VariantQuality::High),
-			Variant::new(class, VariantQuality::Medium),
-			Variant::new(class, VariantQuality::Small),
-			Variant::new(class, VariantQuality::Thumbnail),
-		],
-		VariantQuality::Profile => vec![Variant::new(class, VariantQuality::Thumbnail)],
-	}
 }
 
 #[cfg(test)]
@@ -397,32 +277,11 @@ mod tests {
 
 	#[test]
 	fn test_variant_display() {
-		assert_eq!(Variant::VIS_SD.to_string(), "vis.sd");
-		assert_eq!(Variant::VID_HD.to_string(), "vid.hd");
-		assert_eq!(Variant::AUD_MD.to_string(), "aud.md");
+		assert_eq!(Variant::parse("vis.sd").unwrap().to_string(), "vis.sd");
+		assert_eq!(Variant::parse("vid.hd").unwrap().to_string(), "vid.hd");
+		assert_eq!(Variant::parse("aud.md").unwrap().to_string(), "aud.md");
 		// Original variants always display as just "orig" regardless of class
-		assert_eq!(Variant::VIS_ORIG.to_string(), "orig");
-		assert_eq!(Variant::RAW_ORIG.to_string(), "orig");
-	}
-
-	#[test]
-	fn test_is_legacy_format() {
-		assert!(Variant::is_legacy_format("sd"));
-		assert!(Variant::is_legacy_format("tn"));
-		assert!(Variant::is_legacy_format("hd"));
-		assert!(!Variant::is_legacy_format("vis.sd"));
-		assert!(!Variant::is_legacy_format("invalid"));
-		// "orig" is NOT legacy - it's the canonical format for originals
-		assert!(!Variant::is_legacy_format("orig"));
-	}
-
-	#[test]
-	fn test_upgrade_legacy() {
-		assert_eq!(Variant::upgrade_legacy("sd"), Some("vis.sd".to_string()));
-		assert_eq!(Variant::upgrade_legacy("tn"), Some("vis.tn".to_string()));
-		assert_eq!(Variant::upgrade_legacy("vis.sd"), None);
-		// "orig" should NOT be upgraded - it's already canonical
-		assert_eq!(Variant::upgrade_legacy("orig"), None);
+		assert_eq!(Variant::parse("orig").unwrap().to_string(), "orig");
 	}
 
 	#[test]
@@ -436,27 +295,8 @@ mod tests {
 		assert_eq!(v.to_string(), "orig");
 
 		// Any variant with Original quality displays as "orig"
-		let vis_orig = Variant::new(VariantClass::Visual, VariantQuality::Original);
+		let vis_orig = Variant { class: VariantClass::Visual, quality: VariantQuality::Original };
 		assert_eq!(vis_orig.to_string(), "orig");
-	}
-
-	#[test]
-	fn test_bounding_box() {
-		assert_eq!(VariantQuality::Thumbnail.bounding_box(), Some(128));
-		assert_eq!(VariantQuality::Small.bounding_box(), Some(720));
-		assert_eq!(VariantQuality::Medium.bounding_box(), Some(1280));
-		assert_eq!(VariantQuality::High.bounding_box(), Some(1920));
-		assert_eq!(VariantQuality::Extra.bounding_box(), Some(3840));
-		assert_eq!(VariantQuality::Original.bounding_box(), None);
-	}
-
-	#[test]
-	fn test_fallback_chain() {
-		let chain = get_fallback_chain(Variant::VIS_HD);
-		assert_eq!(chain.len(), 3);
-		assert_eq!(chain[0], Variant::VIS_MD);
-		assert_eq!(chain[1], Variant::VIS_SD);
-		assert_eq!(chain[2], Variant::VIS_TN);
 	}
 }
 
