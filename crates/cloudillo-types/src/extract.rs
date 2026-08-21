@@ -33,12 +33,15 @@ where
 {
 	type Rejection = Error;
 
-	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-		if let Some(id_tag) = parts.extensions.get::<IdTag>().cloned() {
+	fn from_request_parts(
+		parts: &mut Parts,
+		_state: &S,
+	) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+		std::future::ready(if let Some(id_tag) = parts.extensions.get::<IdTag>().cloned() {
 			Ok(id_tag)
 		} else {
 			Err(Error::PermissionDenied)
-		}
+		})
 	}
 }
 
@@ -48,11 +51,11 @@ where
 {
 	type Rejection = Error;
 
-	async fn from_request_parts(
+	fn from_request_parts(
 		parts: &mut Parts,
 		_state: &S,
-	) -> Result<Option<Self>, Self::Rejection> {
-		Ok(parts.extensions.get::<IdTag>().cloned())
+	) -> impl Future<Output = Result<Option<Self>, Self::Rejection>> + Send {
+		std::future::ready(Ok(parts.extensions.get::<IdTag>().cloned()))
 	}
 }
 
