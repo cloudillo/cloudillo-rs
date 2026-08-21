@@ -32,7 +32,6 @@ webp = "0.3"
 # SVG processing
 resvg = "0.48"
 usvg = "0.48"
-regex = "1.13"
 
 # CRDT support (for file duplication)
 yrs = "0.27"
@@ -41,7 +40,7 @@ yrs = "0.27"
 lru = "0.18"
 parking_lot = "0.12"
 
-# HTML parsing (published-site fragment validation)
+# HTML parsing (published-site fragment validation, SVG sanitisation)
 lol_html = "2"
 
 # Zip parsing (for app packages)

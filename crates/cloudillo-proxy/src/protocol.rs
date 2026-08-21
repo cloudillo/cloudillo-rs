@@ -3,7 +3,14 @@
 
 //! PROXY protocol v1 framing
 
+use std::future::poll_fn;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use hyper::rt::Write as HyperWrite;
+use tower_service::Service;
 
 /// Build a PROXY protocol v1 header line.
 ///
@@ -19,6 +26,62 @@ pub fn proxy_protocol_v1_header(client_addr: &SocketAddr, server_addr: &SocketAd
 		client_addr.port(),
 		server_addr.port(),
 	)
+}
+
+/// Connector wrapper that emits a PROXY protocol v1 header as the very first
+/// bytes of every new backend connection, before any TLS or HTTP traffic.
+///
+/// Wrap the *plain* connector: for HTTPS backends this must sit inside the TLS
+/// layer (`HttpsConnectorBuilder::wrap_connector`) so the header precedes the
+/// ClientHello.
+#[derive(Clone)]
+pub struct ProxyProtocolConnector<C> {
+	inner: C,
+	header: Arc<str>,
+}
+
+impl<C> ProxyProtocolConnector<C> {
+	pub fn new(inner: C, header: Arc<str>) -> Self {
+		Self { inner, header }
+	}
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+impl<C> Service<hyper::Uri> for ProxyProtocolConnector<C>
+where
+	C: Service<hyper::Uri> + Send,
+	C::Response: hyper::rt::Write + Unpin + Send + 'static,
+	C::Error: Into<BoxError>,
+	C::Future: Send + 'static,
+{
+	// The inner stream is handed back untouched, so whatever `Connection` /
+	// `Read` / `Write` impls hyper needs come along for free.
+	type Response = C::Response;
+	type Error = BoxError;
+	type Future = Pin<Box<dyn Future<Output = Result<Self::Response, BoxError>> + Send>>;
+
+	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		self.inner.poll_ready(cx).map_err(Into::into)
+	}
+
+	fn call(&mut self, uri: hyper::Uri) -> Self::Future {
+		let connect = self.inner.call(uri);
+		let header = self.header.clone();
+		Box::pin(async move {
+			let mut io = connect.await.map_err(Into::into)?;
+			let mut buf = header.as_bytes();
+			while !buf.is_empty() {
+				let n = poll_fn(|cx| Pin::new(&mut io).poll_write(cx, buf)).await?;
+				if n == 0 {
+					return Err("backend closed before PROXY header was written".into());
+				}
+				buf = &buf[n..];
+			}
+			poll_fn(|cx| Pin::new(&mut io).poll_flush(cx)).await?;
+			Ok(io)
+		})
+	}
 }
 
 #[cfg(test)]

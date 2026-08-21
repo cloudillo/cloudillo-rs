@@ -54,24 +54,26 @@ pub fn is_svg(data: &[u8]) -> bool {
 		|| start.contains("<svg>")
 }
 
-/// Elements that should be removed from SVG for security.
+/// Elements removed for security. Lowercase: `tag_name()` normalises case.
 const DANGEROUS_ELEMENTS: &[&str] = &[
 	"script",
-	"foreignObject",
+	"foreignobject",
 	"set",
 	"animate",
-	"animateMotion",
-	"animateTransform",
-	"animateColor",
-];
-
-/// Attributes that should be removed from SVG for security.
-const DANGEROUS_ATTR_PREFIXES: &[&str] = &[
-	"on", // All event handlers: onclick, onload, onerror, etc.
+	"animatemotion",
+	"animatetransform",
+	"animatecolor",
 ];
 
 /// URL schemes that should be blocked in href/xlink:href attributes.
 const BLOCKED_URL_SCHEMES: &[&str] = &["javascript:", "data:text/html", "vbscript:"];
+
+/// The part of an XML name after the namespace prefix. Browsers parse `image/svg+xml`
+/// as XML, where names resolve by namespace, not by spelling — `svg:script` is `script`
+/// and `xl:href` (bound to xlink) is `href`.
+fn local_name(name: &str) -> &str {
+	name.rsplit_once(':').map_or(name, |(_, local)| local)
+}
 
 /// Sanitize SVG by removing dangerous elements and attributes.
 ///
@@ -84,45 +86,137 @@ pub fn sanitize_svg(data: &[u8]) -> ClResult<Vec<u8>> {
 	let svg_str = std::str::from_utf8(data)
 		.map_err(|_| Error::ValidationError("Invalid UTF-8 in SVG".into()))?;
 
-	// Use a simple regex-based approach for sanitization
-	// This is more robust than trying to parse and rebuild the SVG
-	let mut result = svg_str.to_string();
+	// Rewrite with a real HTML parser: element names and attribute values are
+	// tokenized, so unquoted attributes and entity-encoded URLs are handled.
+	let mut output = Vec::new();
+	let mut rewriter = lol_html::HtmlRewriter::new(
+		lol_html::Settings {
+			element_content_handlers: vec![
+				lol_html::element!(r"*", |el| {
+					// Match the local name: browsers parse `image/svg+xml` as XML, where
+					// `<svg:script>` is a real script element that a bare `script`
+					// selector never sees.
+					let tag = el.tag_name();
+					if DANGEROUS_ELEMENTS.contains(&local_name(&tag)) {
+						el.remove();
+					}
+					Ok(())
+				}),
+				lol_html::element!(r"*", |el| {
+					let dangerous: Vec<String> = el
+						.attributes()
+						.iter()
+						.map(|attr| attr.name().clone())
+						.filter(|name| name.starts_with("on"))
+						.collect();
+					for name in dangerous {
+						el.remove_attribute(&name);
+					}
+					Ok(())
+				}),
+				lol_html::element!(r"*", |el| {
+					// Match the attribute's local name: `[href]` misses the namespaced
+					// form, and the prefix is arbitrary — `xl:href` bound to the xlink
+					// namespace is the same attribute to a browser as `xlink:href`.
+					let hrefs: Vec<String> = el
+						.attributes()
+						.iter()
+						.map(lol_html::html_content::Attribute::name)
+						.filter(|name| local_name(name) == "href")
+						.collect();
+					for name in hrefs {
+						let Some(href) = el.get_attribute(&name) else { continue };
+						// Browsers drop every TAB/CR/LF before resolving the scheme,
+						// so a decoded one must not hide `javascript:` from us.
+						let scheme: String = decode_char_refs(&href)
+							.chars()
+							.filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+							.collect::<String>()
+							.trim_start()
+							.to_ascii_lowercase();
+						if BLOCKED_URL_SCHEMES.iter().any(|s| scheme.starts_with(s)) {
+							el.set_attribute(&name, "").map_err(|e| {
+								Error::Internal(format!("{} rewrite error: {}", name, e))
+							})?;
+						}
+					}
+					Ok(())
+				}),
+			],
+			..lol_html::Settings::default()
+		},
+		|chunk: &[u8]| output.extend_from_slice(chunk),
+	);
+	rewriter
+		.write(svg_str.as_bytes())
+		.and_then(|()| rewriter.end())
+		.map_err(|e| Error::Internal(format!("SVG rewrite error: {}", e)))?;
 
-	// Remove dangerous elements (with their content)
-	for element in DANGEROUS_ELEMENTS {
-		// Remove self-closing tags: <script/>
-		let self_closing = regex::Regex::new(&format!(r"(?i)<{}\s*[^>]*/\s*>", element))
-			.map_err(|e| Error::Internal(format!("regex error: {}", e)))?;
-		result = self_closing.replace_all(&result, "").to_string();
+	Ok(output)
+}
 
-		// Remove opening and closing tags with content: <script>...</script>
-		let with_content =
-			regex::Regex::new(&format!(r"(?is)<{}\s*[^>]*>.*?</{}\s*>", element, element))
-				.map_err(|e| Error::Internal(format!("regex error: {}", e)))?;
-		result = with_content.replace_all(&result, "").to_string();
+/// Decode HTML character references so a scheme check sees what the browser
+/// would. Covers numeric refs (with or without the closing `;`, as browsers do)
+/// and the named refs that can form a URL scheme
+/// (`&colon;` plus the handful of punctuation refs); no named reference maps
+/// to an ASCII letter, so `javascript:` can only hide behind numeric refs.
+fn decode_char_refs(s: &str) -> String {
+	let mut out = String::with_capacity(s.len());
+	let mut rest = s;
+	while let Some(amp) = rest.find('&') {
+		out.push_str(&rest[..amp]);
+		rest = &rest[amp..];
+		// Numeric reference: browsers emit the character even without the closing
+		// `;`, so consume the digit run directly instead of requiring one.
+		if let Some(num) = rest.strip_prefix("&#") {
+			let (radix, digits) = match num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+				Some(hex) => (16, hex),
+				None => (10, num),
+			};
+			let len = digits.find(|c: char| !c.is_digit(radix)).unwrap_or(digits.len());
+			let decoded = u32::from_str_radix(&digits[..len], radix).ok().and_then(char::from_u32);
+			if let Some(c) = decoded {
+				out.push(c);
+				rest = &rest[rest.len() - digits.len() + len..];
+				rest = rest.strip_prefix(';').unwrap_or(rest);
+				continue;
+			}
+		}
+		if let Some(end) = rest.find(';') {
+			let cand = &rest[1..end];
+			if let Some(c) = decode_char_ref(cand) {
+				out.push(c);
+				rest = &rest[end + 1..];
+				continue;
+			}
+		}
+		// Not a valid reference: keep the ampersand and move past it.
+		out.push('&');
+		rest = &rest[1..];
 	}
+	out.push_str(rest);
+	out
+}
 
-	// Remove event handler attributes (on*)
-	for prefix in DANGEROUS_ATTR_PREFIXES {
-		// Match on* attributes: onclick="...", onload='...', etc.
-		let attr_pattern =
-			regex::Regex::new(&format!(r#"(?i)\s+{}[a-z]*\s*=\s*["'][^"']*["']"#, prefix))
-				.map_err(|e| Error::Internal(format!("regex error: {}", e)))?;
-		result = attr_pattern.replace_all(&result, "").to_string();
+fn decode_char_ref(cand: &str) -> Option<char> {
+	if let Some(hex) = cand.strip_prefix("#x").or_else(|| cand.strip_prefix("#X")) {
+		u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+	} else if let Some(dec) = cand.strip_prefix('#') {
+		dec.parse::<u32>().ok().and_then(char::from_u32)
+	} else {
+		match cand.to_ascii_lowercase().as_str() {
+			"amp" => Some('&'),
+			"lt" => Some('<'),
+			"gt" => Some('>'),
+			"quot" => Some('"'),
+			"apos" => Some('\''),
+			"colon" => Some(':'),
+			"nbsp" => Some('\u{a0}'),
+			"tab" => Some('\t'),
+			"newline" => Some('\n'),
+			_ => None,
+		}
 	}
-
-	// Remove dangerous URL schemes from href and xlink:href
-	for scheme in BLOCKED_URL_SCHEMES {
-		// Match href="javascript:..." or xlink:href="javascript:..."
-		let href_pattern = regex::Regex::new(&format!(
-			r#"(?i)(x?link:)?href\s*=\s*["']{}[^"']*["']"#,
-			regex::escape(scheme)
-		))
-		.map_err(|e| Error::Internal(format!("regex error: {}", e)))?;
-		result = href_pattern.replace_all(&result, r#"href="""#).to_string();
-	}
-
-	Ok(result.into_bytes())
 }
 
 /// Parse SVG dimensions from viewBox or width/height attributes.
@@ -309,6 +403,84 @@ mod tests {
 	}
 
 	#[test]
+	fn test_sanitize_svg_removes_unquoted_event_handlers() {
+		// Unquoted attribute value: `onload=alert(1)`. Attribute values are
+		// tokenized, so quoting must not affect stripping.
+		let malicious = b"<svg onload=alert(1)><rect/></svg>";
+		let sanitized = sanitize_svg(malicious).unwrap();
+		let sanitized_str = std::str::from_utf8(&sanitized).unwrap();
+		assert!(!sanitized_str.contains("onload"), "onload survived: {}", sanitized_str);
+		assert!(sanitized_str.contains("<rect/>"));
+	}
+
+	#[test]
+	fn test_sanitize_svg_removes_javascript_xlink_href() {
+		// `xlink:href` is a namespaced attribute the `[href]` selector misses;
+		// the rewrite must catch it on every element regardless.
+		let malicious =
+			b"<svg xmlns:xlink=\"http://www.w3.org/1999/xlink\"><a xlink:href=\"javascript:alert(1)\"><rect/></a></svg>";
+		let sanitized = sanitize_svg(malicious).unwrap();
+		let sanitized_str = std::str::from_utf8(&sanitized).unwrap();
+		assert!(!sanitized_str.contains("javascript:"), "xlink:href survived: {}", sanitized_str);
+	}
+
+	#[test]
+	fn test_sanitize_svg_blocks_arbitrary_xlink_prefix() {
+		// The prefix bound to the xlink namespace is arbitrary; a browser resolves
+		// `xl:href` to the same attribute as `xlink:href`.
+		let malicious =
+			b"<svg xmlns:xl=\"http://www.w3.org/1999/xlink\"><a xl:href=\"javascript:alert(1)\"><rect/></a></svg>";
+		let sanitized = sanitize_svg(malicious).unwrap();
+		let sanitized_str = std::str::from_utf8(&sanitized).unwrap();
+		assert!(!sanitized_str.contains("javascript:"), "xl:href survived: {}", sanitized_str);
+	}
+
+	#[test]
+	fn test_sanitize_svg_blocks_entity_encoded_javascript_url() {
+		// `java&#x73;cript:` decodes to `javascript:`, so the scheme check must run
+		// on the decoded attribute value, not on the source spelling.
+		let malicious = b"<svg><a href=\"java&#x73;cript:alert(1)\"><rect/></a></svg>";
+		let sanitized = sanitize_svg(malicious).unwrap();
+		let sanitized_str = std::str::from_utf8(&sanitized).unwrap();
+		assert!(!sanitized_str.contains("javascript:"), "scheme survived: {}", sanitized_str);
+		assert!(!sanitized_str.contains("java"), "encoded scheme survived: {}", sanitized_str);
+	}
+
+	#[test]
+	fn test_sanitize_svg_blocks_whitespace_split_scheme() {
+		// A decoded TAB/CR/LF anywhere in the scheme is ignored by the browser's
+		// URL parser, so it must not hide the scheme from us either.
+		for malicious in [
+			&b"<svg><a href=\"java&#9;script:alert(1)\"><rect/></a></svg>"[..],
+			&b"<svg><a href=\"java&#x9;script:alert(1)\"><rect/></a></svg>"[..],
+			&b"<svg><a href=\"java&Tab;script:alert(1)\"><rect/></a></svg>"[..],
+		] {
+			let sanitized = sanitize_svg(malicious).unwrap();
+			let sanitized_str = std::str::from_utf8(&sanitized).unwrap();
+			assert!(!sanitized_str.contains("script:"), "scheme survived: {}", sanitized_str);
+			assert!(!sanitized_str.contains("java"), "scheme survived: {}", sanitized_str);
+		}
+	}
+
+	#[test]
+	fn test_sanitize_svg_blocks_unterminated_numeric_ref() {
+		// `&#115` with no `;` still decodes to `s` in a browser.
+		let malicious = b"<svg><a href=\"java&#115cript:alert(1)\"><rect/></a></svg>";
+		let sanitized = sanitize_svg(malicious).unwrap();
+		let sanitized_str = std::str::from_utf8(&sanitized).unwrap();
+		assert!(!sanitized_str.contains("cript:"), "scheme survived: {}", sanitized_str);
+	}
+
+	#[test]
+	fn test_sanitize_svg_keeps_legitimate_url() {
+		let ok = b"<svg><a href=\"https://example.com/?a=1&amp;b=2\"><rect/></a></svg>";
+		let sanitized = sanitize_svg(ok).unwrap();
+		let sanitized_str = std::str::from_utf8(&sanitized).unwrap();
+		assert!(sanitized_str.contains("https://example.com/?a=1"), "{}", sanitized_str);
+		assert!(sanitized_str.contains("b=2"), "{}", sanitized_str);
+	}
+
+	#[test]
 	fn test_sanitize_svg_removes_foreignobject() {
 		let malicious =
 			b"<svg><foreignObject><body><script>evil()</script></body></foreignObject></svg>";
@@ -316,6 +488,25 @@ mod tests {
 		let sanitized_str = std::str::from_utf8(&sanitized).unwrap();
 		assert!(!sanitized_str.contains("<foreignObject"));
 		assert!(!sanitized_str.contains("<script"));
+	}
+
+	#[test]
+	fn test_sanitize_svg_removes_prefixed_script() {
+		// Served as `image/svg+xml`, so the browser parses XML where a namespace
+		// prefix is legal and `<svg:script>` executes.
+		let malicious = b"<svg:svg xmlns:svg=\"http://www.w3.org/2000/svg\"><svg:script>alert(1)</svg:script></svg:svg>";
+		let sanitized = sanitize_svg(malicious).unwrap();
+		let sanitized_str = std::str::from_utf8(&sanitized).unwrap();
+		assert!(!sanitized_str.contains("script"), "prefixed script survived: {}", sanitized_str);
+		assert!(!sanitized_str.contains("alert"), "script body survived: {}", sanitized_str);
+	}
+
+	#[test]
+	fn test_sanitize_svg_removes_prefixed_foreignobject() {
+		let malicious = b"<svg xmlns:s=\"http://www.w3.org/2000/svg\"><s:foreignObject><p>x</p></s:foreignObject></svg>";
+		let sanitized = sanitize_svg(malicious).unwrap();
+		let sanitized_str = std::str::from_utf8(&sanitized).unwrap().to_ascii_lowercase();
+		assert!(!sanitized_str.contains("foreignobject"), "survived: {}", sanitized_str);
 	}
 
 	#[test]
@@ -343,6 +534,20 @@ mod tests {
 		assert!(!result.bytes.is_empty());
 		assert!(result.width <= 256);
 		assert!(result.height <= 256);
+	}
+
+	#[test]
+	fn test_sanitized_svg_still_parses() {
+		// handler.rs runs sanitize -> parse_svg_dimensions -> rasterize; the
+		// rewrite must not break a well-formed SVG, including one with an XML
+		// declaration.
+		let svg = b"<?xml version=\"1.0\"?>\n<svg width=\"120\" height=\"80\" xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>";
+		let sanitized = sanitize_svg(svg).unwrap();
+		let (w, h) = parse_svg_dimensions(&sanitized).unwrap();
+		assert_eq!(w, 120);
+		assert_eq!(h, 80);
+		let result = rasterize_svg_sync(&sanitized, ImageFormat::Webp, (64, 64)).unwrap();
+		assert!(!result.bytes.is_empty());
 	}
 }
 

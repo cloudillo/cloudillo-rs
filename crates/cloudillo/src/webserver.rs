@@ -240,8 +240,7 @@ pub async fn create_https_server(
 					let host_label: &str = entry.domain.as_ref();
 					debug!("Proxy {} {} {} {}", peer_addr, method, host_label, path);
 					let host_label_owned = host_label.to_string();
-					let res =
-						crate::proxy::handler::handle_proxy_request(entry, req, &peer_addr).await;
+					let res = crate::proxy::handler::handle_proxy_request(entry, req, addr).await;
 					match res {
 						Ok(resp) => {
 							let status = resp.status();
