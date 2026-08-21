@@ -76,6 +76,43 @@ fn test_event_matches_path() {
 	assert!(!event_matches_path(&create_event, "users/doc1/child"));
 }
 
+/// Pins the three subscription scopes against every path relationship an event
+/// can have with a subscription.
+///
+/// Before `scope` existed every subscription used the `Subtree` rule, so a
+/// subscription on `d/site` also received events from documents beneath it, and a
+/// subscription on `users` received events from `users/doc1/c/x` — documents the
+/// equivalent query would never have returned.
+#[test]
+fn test_event_matches_scope() {
+	use cloudillo_types::rtdb_adapter::{ChangeEvent, SubscriptionScope};
+
+	let event = |path: &str| ChangeEvent::Create {
+		path: path.into(),
+		data: Value::Object(serde_json::Map::default()),
+	};
+
+	let doc = event("users/doc1");
+	let grandchild = event("users/doc1/c/x");
+
+	// Document: the exact path and nothing else.
+	assert!(event_matches_scope(&doc, "users/doc1", SubscriptionScope::Document));
+	assert!(!event_matches_scope(&doc, "users", SubscriptionScope::Document));
+	assert!(!event_matches_scope(&grandchild, "users/doc1", SubscriptionScope::Document));
+	// A prefix that is not a path boundary is a different document, not a parent.
+	assert!(!event_matches_scope(&doc, "users/doc", SubscriptionScope::Document));
+
+	// Children: exactly one segment below, and never the path itself.
+	assert!(event_matches_scope(&doc, "users", SubscriptionScope::Children));
+	assert!(!event_matches_scope(&doc, "users/doc1", SubscriptionScope::Children));
+	assert!(!event_matches_scope(&grandchild, "users", SubscriptionScope::Children));
+	assert!(!event_matches_scope(&doc, "users2", SubscriptionScope::Children));
+
+	// Subtree: the pre-scope rule, which delegates to `event_matches_path` — only
+	// the depth-2 case is new here, the rest is `test_event_matches_path` above.
+	assert!(event_matches_scope(&grandchild, "users", SubscriptionScope::Subtree));
+}
+
 #[test]
 fn test_matches_filter() {
 	let doc = serde_json::json!({

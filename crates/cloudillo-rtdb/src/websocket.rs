@@ -855,7 +855,7 @@ async fn handle_rtdb_command(
 		"subscribe" => {
 			// Start real-time updates for a path
 			use cloudillo_types::rtdb_adapter::{
-				AggregateOptions, QueryFilter, QueryOptions, SubscriptionOptions,
+				AggregateOptions, QueryFilter, QueryOptions, SubscriptionOptions, SubscriptionScope,
 			};
 			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			debug!("RTDB subscribe: path={}", path);
@@ -878,11 +878,25 @@ async fn handle_rtdb_command(
 			// the events it emits are groups rather than documents.
 			let select = if aggregate.is_some() { None } else { parse_select(&msg.payload) };
 
+			// How much of the path the subscription covers. An absent or
+			// unrecognised value degrades to `Subtree`, which is what every
+			// subscription did before this field existed — a client that predates
+			// it must keep seeing exactly what it saw.
+			let scope = msg
+				.payload
+				.get("scope")
+				.and_then(|v| serde_json::from_value::<SubscriptionScope>(v.clone()).ok())
+				.unwrap_or_default();
+
 			// For aggregate subscriptions, subscribe without filter at the adapter level.
 			// The aggregate task applies the filter itself to detect filter transitions
 			// (old doc matched but new doesn't, and vice versa).
 			let sub_opts = if aggregate.is_some() {
-				SubscriptionOptions::all(path)
+				// The scope still applies: an aggregate over a `Document` scope is
+				// degenerate (zero or one input row) rather than wrong, and
+				// special-casing it here would put a second, silent notion of scope
+				// in the code.
+				SubscriptionOptions::all(path).with_scope(scope)
 			} else {
 				match &filter {
 					Some(f) => {
@@ -892,6 +906,7 @@ async fn handle_rtdb_command(
 					None => SubscriptionOptions::all(path),
 				}
 				.with_select(select)
+				.with_scope(scope)
 			};
 
 			match app.rtdb_adapter.subscribe(conn.tn_id, &conn.file_id, sub_opts).await {

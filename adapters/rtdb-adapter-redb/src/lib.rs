@@ -26,7 +26,7 @@ pub use error::Error;
 use cloudillo_types::prelude::*;
 use cloudillo_types::rtdb_adapter::{
 	ChangeEvent, DbStats, LockInfo, LockMode, QueryOptions, RtdbAdapter, SubscriptionOptions,
-	Transaction, project_doc, selection_changed,
+	SubscriptionScope, Transaction, project_doc, selection_changed,
 };
 use cloudillo_types::types::CompactReport;
 
@@ -573,30 +573,57 @@ impl RtdbAdapter for RtdbAdapterRedb {
 		drop(guard);
 
 		// Then get all existing documents at the path
-		let initial_docs = {
-			let mut query_opts = QueryOptions::new();
-			if let Some(ref filter) = opts.filter {
-				query_opts = query_opts.with_filter(filter.clone());
+		let initial_docs = match opts.scope {
+			SubscriptionScope::Document => {
+				// The collection query below scans the prefix `path/`, which by
+				// construction cannot contain the document stored at `path` itself.
+				// `get` applies neither the filter nor the projection a query would
+				// have, so both are applied here — the websocket layer does the same
+				// for a plain `get`.
+				match self.get(tn_id, db_id, &opts.path).await? {
+					Some(doc) => {
+						let passes =
+							opts.filter.as_ref().is_none_or(|f| storage::matches_filter(&doc, f));
+						match (passes, &opts.select) {
+							(false, _) => Vec::new(),
+							(true, Some(select)) => vec![project_doc(&doc, select)],
+							(true, None) => vec![doc],
+						}
+					}
+					None => Vec::new(),
+				}
 			}
-			if let Some(ref select) = opts.select {
-				query_opts = query_opts.with_select(select.clone());
+			SubscriptionScope::Children | SubscriptionScope::Subtree => {
+				let mut query_opts = QueryOptions::new();
+				if let Some(ref filter) = opts.filter {
+					query_opts = query_opts.with_filter(filter.clone());
+				}
+				if let Some(ref select) = opts.select {
+					query_opts = query_opts.with_select(select.clone());
+				}
+				self.query(tn_id, db_id, &opts.path, query_opts).await?
 			}
-			self.query(tn_id, db_id, &opts.path, query_opts).await?
 		};
 		let path = opts.path.clone();
 		let filter = opts.filter.clone();
 		let select = opts.select.clone();
+		let scope = opts.scope;
 
 		let stream = async_stream::stream! {
 			// First, yield all existing documents as Create events
 			for doc in initial_docs {
-				if let Some(id) = doc.get("id").and_then(|v| v.as_str()) {
-					let doc_path = format!("{}/{}", path, id);
-					yield ChangeEvent::Create {
-						path: doc_path.into(),
-						data: doc.clone(),
-					};
-				}
+				// Under `Document` scope the subscription path already *is* the
+				// document path; appending the id would yield `d/site/site`, which
+				// matches no path a live event can ever carry.
+				let doc_path: Box<str> = if scope == SubscriptionScope::Document {
+					path.clone()
+				} else {
+					match doc.get("id").and_then(|v| v.as_str()) {
+						Some(id) => format!("{}/{}", path, id).into(),
+						None => continue,
+					}
+				};
+				yield ChangeEvent::Create { path: doc_path, data: doc };
 			}
 
 			// Signal that all initial documents have been yielded
@@ -609,8 +636,7 @@ impl RtdbAdapter for RtdbAdapterRedb {
 			loop {
 				match rx.recv().await {
 					Ok(event) => {
-						// Check if event matches subscription path
-						if !storage::event_matches_path(&event, &path) {
+						if !storage::event_matches_scope(&event, &path, scope) {
 							continue;
 						}
 

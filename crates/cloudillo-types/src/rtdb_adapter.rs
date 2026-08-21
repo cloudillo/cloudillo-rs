@@ -436,6 +436,34 @@ pub fn selection_changed(old: Option<&Value>, new: &Value, select: &[String]) ->
 	select.iter().any(|field| old.get(field) != new.get(field))
 }
 
+/// How much of the path a subscription covers.
+///
+/// The path model alternates collection and document segments, so `d/site` is a
+/// document and `p` is a collection — but nothing on the wire said which, and the
+/// adapter resolved every subscription as a collection scan. A document subscription
+/// therefore replayed nothing and reported its own document as absent.
+///
+/// The subscriber states this rather than the server inferring it from segment
+/// parity: a guess is silently wrong for any path that departs from the convention,
+/// and the failure mode is a document that reads as deleted — the one answer a caller
+/// cannot tell apart from the truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SubscriptionScope {
+	/// The path names one document. Only that document.
+	Document,
+
+	/// The path names a collection. Its direct documents, nothing deeper.
+	Children,
+
+	/// The path and every document beneath it, at any depth.
+	///
+	/// The default, because it is what every subscription did before this field
+	/// existed and an older client sends no scope at all.
+	#[default]
+	Subtree,
+}
+
 /// Options for subscribing to real-time changes.
 #[derive(Debug, Clone)]
 pub struct SubscriptionOptions {
@@ -448,22 +476,36 @@ pub struct SubscriptionOptions {
 	/// Optional field projection, applied to `Create`/`Update` payloads. When
 	/// set, an event touching none of these fields is not delivered at all.
 	pub select: Option<Vec<String>>,
+
+	/// How much of `path` this subscription covers. See [`SubscriptionScope`].
+	pub scope: SubscriptionScope,
 }
 
 impl SubscriptionOptions {
 	/// Create a subscription to all changes at a path.
 	pub fn all(path: impl Into<Box<str>>) -> Self {
-		Self { path: path.into(), filter: None, select: None }
+		Self { path: path.into(), filter: None, select: None, scope: SubscriptionScope::default() }
 	}
 
 	/// Create a subscription with a filter.
 	pub fn filtered(path: impl Into<Box<str>>, filter: QueryFilter) -> Self {
-		Self { path: path.into(), filter: Some(filter), select: None }
+		Self {
+			path: path.into(),
+			filter: Some(filter),
+			select: None,
+			scope: SubscriptionScope::default(),
+		}
 	}
 
 	/// Set the field projection.
 	pub fn with_select(mut self, select: Option<Vec<String>>) -> Self {
 		self.select = select;
+		self
+	}
+
+	/// Set the subscription scope.
+	pub fn with_scope(mut self, scope: SubscriptionScope) -> Self {
+		self.scope = scope;
 		self
 	}
 }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 use cloudillo_types::error::ClResult;
-use cloudillo_types::rtdb_adapter::{ChangeEvent, QueryFilter};
+use cloudillo_types::rtdb_adapter::{ChangeEvent, QueryFilter, SubscriptionScope};
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -168,6 +168,26 @@ pub fn event_matches_path(event: &ChangeEvent, subscription_path: &str) -> bool 
 	}
 
 	false
+}
+
+/// Does this event belong to a subscription on `subscription_path` at `scope`?
+///
+/// `Children` deliberately excludes an event at the subscription path itself: that is
+/// the collection's own document, not one of its documents. `Subtree` keeps the
+/// pre-scope behaviour, which included both it and every descendant at any depth.
+pub fn event_matches_scope(
+	event: &ChangeEvent,
+	subscription_path: &str,
+	scope: SubscriptionScope,
+) -> bool {
+	match scope {
+		SubscriptionScope::Document => event.path() == subscription_path,
+		SubscriptionScope::Children => match event.path().strip_prefix(subscription_path) {
+			Some(rest) => rest.starts_with('/') && !rest[1..].contains('/'),
+			None => false,
+		},
+		SubscriptionScope::Subtree => event_matches_path(event, subscription_path),
+	}
 }
 
 /// Extract document ID from a path (last segment)

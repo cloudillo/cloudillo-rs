@@ -37,6 +37,11 @@ async fn create_test_adapter(per_tenant_files: bool) -> (RtdbAdapterRedb, TempDi
 /// A bare `stream.next().await` turns a suppression regression — an event the
 /// adapter should have delivered but did not — into a suite that hangs forever
 /// instead of a test that fails. The clock is never reached on the happy path.
+/// How long to wait for an event that must never arrive. Every negative below is
+/// pinned by a FIFO follow-up rather than by this wait, so it is a failsafe and
+/// not the assertion — long enough to catch a leak, short enough not to be felt.
+const FAILSAFE: std::time::Duration = std::time::Duration::from_millis(50);
+
 async fn next_event<S>(stream: &mut S, what: &str) -> cloudillo_types::rtdb_adapter::ChangeEvent
 where
 	S: futures::Stream<Item = cloudillo_types::rtdb_adapter::ChangeEvent> + Unpin,
@@ -1448,10 +1453,7 @@ async fn test_subscribe_with_filter_applies_it_to_deletes() {
 
 	{
 		use futures::StreamExt;
-		let leaked = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
-			.await
-			.ok()
-			.flatten();
+		let leaked = tokio::time::timeout(FAILSAFE, stream.next()).await.ok().flatten();
 		assert!(leaked.is_none(), "a filtered-out document's delete leaked: {leaked:?}");
 	}
 
@@ -1694,4 +1696,220 @@ async fn test_dropping_a_transaction_rolls_back() {
 		.await
 		.expect("Failed to query");
 	assert!(results.is_empty(), "a dropped transaction must roll back, not commit");
+}
+
+/// A `Document`-scoped subscription replays the document stored *at* its path.
+///
+/// A collection query scans the redb key range under the prefix `"{tn}/{db}/{path}/"` —
+/// with the trailing slash — so the document at `"{tn}/{db}/d/site"` can never be in the
+/// result. Running one for the initial replay left every document subscription reporting
+/// its own document as absent, indistinguishable from "deleted" to the client; live edits
+/// still arrived, so only a reload was wrong.
+///
+/// The `path` assertion is the second half: `format!("{}/{}", path, id)` produces
+/// `d/site/site`, a path no live event can ever carry.
+#[tokio::test]
+async fn document_scope_replays_the_document_itself() {
+	use cloudillo_types::rtdb_adapter::{ChangeEvent, SubscriptionOptions, SubscriptionScope};
+
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+
+	// `update` upserts at an exact path; `create` would generate an id below it.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.update("d/site", json!({"siteMode": true, "home": "abc"}))
+		.await
+		.expect("Failed to write document");
+	tx.commit().await.expect("Failed to commit");
+
+	let opts = SubscriptionOptions::all("d/site").with_scope(SubscriptionScope::Document);
+	let mut stream = adapter.subscribe(tn_id, db_id, opts).await.expect("Failed to subscribe");
+
+	match next_event(&mut stream, "the initial Create").await {
+		ChangeEvent::Create { path, data } => {
+			assert_eq!(&*path, "d/site", "the subscription path already is the document path");
+			assert_eq!(data["siteMode"], true);
+			assert_eq!(data["home"], "abc");
+			// `get` injects the id from the last path segment, as a query does.
+			assert_eq!(data["id"], "site");
+		}
+		other => panic!("expected Create, got {other:?}"),
+	}
+	assert!(matches!(next_event(&mut stream, "Ready").await, ChangeEvent::Ready { .. }));
+}
+
+/// A document that does not exist replays nothing — not an error, and not a
+/// `Create` with an empty body.
+///
+/// The client reads an empty replay as `exists: false`, which is the truth here.
+#[tokio::test]
+async fn document_scope_on_an_absent_document_is_just_ready() {
+	use cloudillo_types::rtdb_adapter::{ChangeEvent, SubscriptionOptions, SubscriptionScope};
+
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+
+	let opts = SubscriptionOptions::all("d/site").with_scope(SubscriptionScope::Document);
+	let mut stream = adapter.subscribe(tn_id, db_id, opts).await.expect("Failed to subscribe");
+
+	match next_event(&mut stream, "Ready").await {
+		ChangeEvent::Ready { .. } => {}
+		other => panic!("expected Ready with no preceding Create, got {other:?}"),
+	}
+}
+
+/// The initial replay and the live matching have to agree about what the
+/// subscription contains, or the client's snapshot holds documents its updates
+/// never mention. `Document` scope covers one document, so a write beneath it is
+/// not this subscription's business.
+#[tokio::test]
+async fn document_scope_ignores_documents_beneath_it() {
+	use cloudillo_types::rtdb_adapter::{ChangeEvent, SubscriptionOptions, SubscriptionScope};
+
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.update("d/site", json!({"siteMode": true}))
+		.await
+		.expect("Failed to write document");
+	tx.commit().await.expect("Failed to commit");
+
+	let opts = SubscriptionOptions::all("d/site").with_scope(SubscriptionScope::Document);
+	let mut stream = adapter.subscribe(tn_id, db_id, opts).await.expect("Failed to subscribe");
+
+	// Drain the replay so the next read is live.
+	assert!(matches!(
+		next_event(&mut stream, "the initial Create").await,
+		ChangeEvent::Create { .. }
+	));
+	assert!(matches!(next_event(&mut stream, "Ready").await, ChangeEvent::Ready { .. }));
+
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.create("d/site/sub", json!({"ti": "Beneath"}))
+		.await
+		.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	{
+		use futures::StreamExt;
+		let leaked = tokio::time::timeout(FAILSAFE, stream.next()).await.ok().flatten();
+		assert!(leaked.is_none(), "a document subscription received a descendant: {leaked:?}");
+	}
+
+	// Delivery is FIFO, so the write to the document itself arriving first is what
+	// pins the suppression above.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.update("d/site", json!({"siteMode": false}))
+		.await
+		.expect("Failed to write document");
+	tx.commit().await.expect("Failed to commit");
+
+	match next_event(&mut stream, "the document's own Update").await {
+		ChangeEvent::Update { path, .. } => assert_eq!(&*path, "d/site"),
+		other => panic!("expected Update, got {other:?}"),
+	}
+}
+
+/// `Children` scope covers a collection's own documents and nothing deeper.
+///
+/// Before scope existed a subscription on `p` also received events from
+/// `p/<id>/sub/<id>`, and the client keys documents by their last path segment —
+/// so a sub-collection document could overwrite an unrelated page in the same map.
+#[tokio::test]
+async fn children_scope_ignores_grandchildren() {
+	use cloudillo_types::rtdb_adapter::{ChangeEvent, SubscriptionOptions, SubscriptionScope};
+
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+
+	let opts = SubscriptionOptions::all("p").with_scope(SubscriptionScope::Children);
+	let mut stream = adapter.subscribe(tn_id, db_id, opts).await.expect("Failed to subscribe");
+	assert!(matches!(next_event(&mut stream, "Ready").await, ChangeEvent::Ready { .. }));
+
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	let x_id = tx
+		.create("p", json!({"ti": "Direct"}))
+		.await
+		.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	match next_event(&mut stream, "the direct child's Create").await {
+		ChangeEvent::Create { path, .. } => assert_eq!(&*path, &format!("p/{x_id}")),
+		other => panic!("expected Create, got {other:?}"),
+	}
+
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.create(&format!("p/{x_id}/sub"), json!({"ti": "Deeper"}))
+		.await
+		.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	{
+		use futures::StreamExt;
+		let leaked = tokio::time::timeout(FAILSAFE, stream.next()).await.ok().flatten();
+		assert!(leaked.is_none(), "a children subscription received a grandchild: {leaked:?}");
+	}
+
+	// Delivery is FIFO, so a second direct child arriving *first* is what pins the
+	// suppression above — a leaked grandchild would be ahead of it.
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	let z_id = tx
+		.create("p", json!({"ti": "Direct again"}))
+		.await
+		.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	match next_event(&mut stream, "the second direct child's Create").await {
+		ChangeEvent::Create { path, .. } => assert_eq!(&*path, &format!("p/{z_id}")),
+		other => panic!("expected Create, got {other:?}"),
+	}
+}
+
+/// `Subtree` is the default, and it is byte-for-byte the pre-scope behaviour: a
+/// bare `SubscriptionOptions::all` still matches descendants at any depth.
+///
+/// This is the whole back-compatibility story — a client that sends no `scope`
+/// must keep seeing exactly what it saw before the field existed.
+#[tokio::test]
+async fn subtree_scope_is_the_default_and_still_matches_descendants() {
+	use cloudillo_types::rtdb_adapter::{ChangeEvent, SubscriptionOptions};
+
+	let (adapter, _temp) = create_test_adapter(true).await;
+	let tn_id = TnId(1);
+	let db_id = "test_db";
+
+	let mut stream = adapter
+		.subscribe(tn_id, db_id, SubscriptionOptions::all("p"))
+		.await
+		.expect("Failed to subscribe");
+	assert!(matches!(next_event(&mut stream, "Ready").await, ChangeEvent::Ready { .. }));
+
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	let x_id = tx
+		.create("p", json!({"ti": "Direct"}))
+		.await
+		.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+	assert!(matches!(
+		next_event(&mut stream, "the direct child's Create").await,
+		ChangeEvent::Create { .. }
+	));
+
+	let mut tx = adapter.transaction(tn_id, db_id).await.expect("Failed to create transaction");
+	tx.create(&format!("p/{x_id}/sub"), json!({"ti": "Deeper"}))
+		.await
+		.expect("Failed to create document");
+	tx.commit().await.expect("Failed to commit");
+
+	match next_event(&mut stream, "the grandchild's Create").await {
+		ChangeEvent::Create { path, .. } => {
+			assert!(path.starts_with(&format!("p/{x_id}/sub/")), "got {path}");
+		}
+		other => panic!("expected Create, got {other:?}"),
+	}
 }
