@@ -5,15 +5,17 @@
 
 use axum::{
 	Json,
-	extract::{Path, State},
+	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use webauthn_rs::prelude::*;
 
 use cloudillo_core::Auth;
 use cloudillo_core::extract::{IdTag, OptionalRequestId};
+use cloudillo_core::rate_limit::{PenaltyReason, RateLimitApi};
 use cloudillo_types::{auth_adapter, types::ApiResponse};
 
 use crate::prelude::*;
@@ -364,22 +366,25 @@ pub async fn delete_reg(
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// Try to create a login challenge, returning `None` instead of an error when no passkeys exist.
-/// Extracted for reuse by `post_login_init`.
-pub async fn try_login_challenge(
-	app: &App,
-	id_tag: &IdTag,
-	tn_id: TnId,
-) -> Option<LoginChallengeRes> {
-	// Get credentials for this tenant
-	let credentials = app.auth_adapter.list_webauthn_credentials(tn_id).await.ok()?;
-	if credentials.is_empty() {
-		return None;
-	}
+/// The tenant's stored credentials that still deserialize into a usable [`Passkey`].
+async fn valid_passkeys(app: &App, tn_id: TnId) -> Vec<Passkey> {
+	let Ok(credentials) = app.auth_adapter.list_webauthn_credentials(tn_id).await else {
+		return Vec::new();
+	};
+	credentials.iter().filter_map(|c| stored_to_passkey(c).ok()).collect()
+}
 
-	// Convert to Passkey format
-	let passkeys: Vec<Passkey> =
-		credentials.iter().filter_map(|c| stored_to_passkey(c).ok()).collect();
+/// Whether the tenant has at least one usable passkey — all `login-init` needs.
+/// The challenge itself is minted separately by `GET /api/auth/wa/login/challenge`
+/// at the moment the user clicks: `login-init` runs at page load, an unbounded
+/// time earlier, so a challenge minted there would often already be expired.
+pub async fn has_passkeys(app: &App, tn_id: TnId) -> bool {
+	!valid_passkeys(app, tn_id).await.is_empty()
+}
+
+/// Try to create a login challenge, returning `None` instead of an error when no passkeys exist.
+async fn try_login_challenge(app: &App, id_tag: &IdTag, tn_id: TnId) -> Option<LoginChallengeRes> {
+	let passkeys = valid_passkeys(app, tn_id).await;
 
 	if passkeys.is_empty() {
 		warn!("No valid passkeys found for {}", id_tag.0);
@@ -446,17 +451,27 @@ pub async fn get_login_challenge(
 /// POST /api/auth/wa/login - Authenticate with WebAuthn
 pub async fn post_login(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Json(req): Json<LoginReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<super::handler::Login>>)> {
 	info!("Processing WebAuthn login");
 
+	// Credential failures are penalized like a wrong password; server-side faults are not.
+	let penalize = || {
+		if let Err(e) = app.rate_limiter.penalize(&addr.ip(), PenaltyReason::AuthFailure, 1) {
+			warn!("Failed to record auth penalty for {}: {}", addr.ip(), e);
+		}
+	};
+
 	// Get JWT secret and decode challenge token
 	let jwt_secret = app.auth_adapter.read_var(TnId(0), "jwt_secret").await?;
-	let claims: LoginChallengeToken = decode_challenge_jwt(&req.token, &jwt_secret)?;
+	let claims: LoginChallengeToken =
+		decode_challenge_jwt(&req.token, &jwt_secret).inspect_err(|_| penalize())?;
 
 	// Check expiry
 	if claims.exp < now_secs() {
 		warn!("Challenge token expired");
+		penalize();
 		return Err(Error::Unauthorized);
 	}
 
@@ -473,6 +488,7 @@ pub async fn post_login(
 			.finish_passkey_authentication(&req.response, &auth_state)
 			.map_err(|e| {
 				warn!("WebAuthn finish_passkey_authentication error: {:?}", e);
+				penalize();
 				Error::PermissionDenied
 			})?;
 

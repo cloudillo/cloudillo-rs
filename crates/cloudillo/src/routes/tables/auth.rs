@@ -17,8 +17,8 @@
 //! | `/api/auth/proxy-token`              | `session()` ᴱ | | | |
 //! | `/api/auth/access-token`             | `token_exchange()` ᶠ | | | |
 //! | `/api/auth/vapid`                    | `session()` ᴱ | | | |
-//! | `/api/auth/wa/login/challenge`       | `public_login()` ᴿ | | | |
-//! | `/api/auth/wa/login`                 | | `public_login()` ᴿ | | |
+//! | `/api/auth/wa/login/challenge`       | `recovery()` ᴾ | | | |
+//! | `/api/auth/wa/login`                 | | `recovery()` ᴾ | | |
 //! | `/api/auth/wa/reg`                   | `owner_credentials()` ᴸ | `owner_credentials()` ᴸ | | |
 //! | `/api/auth/wa/reg/challenge`         | `owner_credentials()` ᴸ | | | |
 //! | `/api/auth/wa/reg/{key_id}`          | | | | `owner_credentials()` ᴸ |
@@ -95,15 +95,14 @@ pub(crate) fn owner_credentials() -> Router<App> {
 		)
 }
 
-/// Unauthenticated login endpoints. Attack surface: credential stuffing, brute
-/// force, account enumeration — mounted under the strict `"auth"` rate-limit
-/// bucket, ban fully enforced.
+/// Unauthenticated password and QR login endpoints. Attack surface: credential
+/// stuffing, brute force, account enumeration — mounted under the strict
+/// `"auth"` rate-limit bucket, ban fully enforced. The passkey login pair lives
+/// in [`recovery`].
 pub(crate) fn public_login() -> Router<App> {
 	Router::new()
 		.route("/api/auth/login", post(handler::post_login))
 		.route("/api/auth/login-token", get(handler::get_login_token))
-		.route("/api/auth/wa/login/challenge", get(webauthn::get_login_challenge))
-		.route("/api/auth/wa/login", post(webauthn::post_login))
 		.route("/api/auth/qr-login/init", post(qr_login::post_init))
 		// Long-poll.
 		.route("/api/auth/qr-login/{session_id}/status", get(qr_login::get_status))
@@ -120,11 +119,18 @@ pub(crate) fn token_exchange() -> Router<App> {
 /// A failed-login auto-ban must NOT lock a user out of account recovery. These
 /// keep the strict rate limit (429) but skip the 403 ban: set-password /
 /// forgot-password are gated by the secret ref token and a per-tenant app-level
-/// cap; login-init exposes only a login challenge. `POST /api/auth/login` stays
-/// fully ban-enforced in [`public_login`].
+/// cap. The whole passkey login pair — challenge **and** assertion — is here for
+/// the same reason: a passkey is exactly the credential a password-attempt ban
+/// must not lock out, and `POST /api/auth/wa/login` is not guessable, it needs a
+/// server-signed challenge token plus a valid assertion over it. Bypassing the
+/// ban only on the challenge would leave the prompt a dead end. `POST
+/// /api/auth/login` (password) and `GET /api/auth/login-token` stay fully
+/// ban-enforced in [`public_login`].
 pub(crate) fn recovery() -> Router<App> {
 	Router::new()
 		.route("/api/auth/login-init", post(handler::post_login_init))
+		.route("/api/auth/wa/login/challenge", get(webauthn::get_login_challenge))
+		.route("/api/auth/wa/login", post(webauthn::post_login))
 		.route("/api/auth/set-password", post(handler::post_set_password))
 		.route("/api/auth/forgot-password", post(handler::post_forgot_password))
 }
