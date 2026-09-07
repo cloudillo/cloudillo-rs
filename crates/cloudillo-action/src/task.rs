@@ -46,10 +46,30 @@ pub async fn collect_file_deps(
 		.await
 }
 
+/// Create an action issued as `id_tag` (the tenant), acting on its own behalf.
+///
+/// Every system-originated path — hooks, fanout, stat emission, the DSL's `create_action`
+/// operation — is the tenant acting for itself, so the actor and the issuer coincide. Only a
+/// client POST separates them; that path calls [`create_action_as`].
 pub async fn create_action(
 	app: &App,
 	tn_id: TnId,
 	id_tag: &str,
+	action: CreateAction,
+) -> ClResult<Box<str>> {
+	create_action_as(app, tn_id, id_tag, id_tag, action).await
+}
+
+/// Create an action issued as `id_tag` but *posted by* `actor_id_tag`.
+///
+/// On a community tenant those differ: the token is signed by the community, while publication
+/// authority over an attached file belongs to the member who pinned it. See
+/// [`ActionCreatorTask::actor`].
+pub async fn create_action_as(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	actor_id_tag: &str,
 	action: CreateAction,
 ) -> ClResult<Box<str>> {
 	let dsl = app.ext::<Arc<DslEngine>>()?;
@@ -60,18 +80,26 @@ pub async fn create_action(
 	if let Some(audience_tag) = action.audience_tag.as_deref() {
 		helpers::check_identity_field("audience", audience_tag)?;
 	}
+	if let Some(subject) = action.subject.as_deref() {
+		helpers::check_subject_field(subject)?;
+	}
+	// Covers the non-HTTP creation paths too (native hooks, the DSL `create_action`
+	// operation, `DraftPublishTask`'s re-entry).
+	helpers::check_attachment_count(action.attachments.as_deref())?;
 
 	// Check if this is an ephemeral action type
 	let is_ephemeral = dsl
-		.get_behavior(action.typ.as_ref())
-		.is_some_and(|b| b.ephemeral.unwrap_or(false));
+		.definition_for(action.typ.as_ref(), action.sub_typ.as_deref())
+		.is_some_and(|d| d.behavior.ephemeral.unwrap_or(false));
 
 	if is_ephemeral {
 		return create_ephemeral_action(app, tn_id, id_tag, action).await;
 	}
 
 	// Get behavior flags for validation
-	let behavior = dsl.get_behavior(action.typ.as_ref());
+	let behavior = dsl
+		.definition_for(action.typ.as_ref(), action.sub_typ.as_deref())
+		.map(|d| &d.behavior);
 
 	// Outbound validation: allow_unknown
 	// If false, we can only send to recipients we have a relationship with
@@ -266,15 +294,23 @@ pub async fn create_action(
 	// DSL schema is rejected here (4xx to the client) instead of silently by every
 	// receiving peer. Drafts are validated too: they publish later with these fields.
 	// `validate_*` returns `Error::ValidationError`; `?` maps it to a 4xx response.
+	// Resolve the combined `"TYPE:SUBTYPE"` key first, the way the inbound path already
+	// does, so a subType with its own definition is validated against it rather than
+	// against its base type. `unwrap_or_else` keeps today's behaviour for a type with no
+	// definition at all: the bare type goes through and `validate_content` raises its
+	// own `Unknown action type`.
+	let action_key = dsl
+		.resolve_action_type(action.typ.as_ref(), action.sub_typ.as_deref())
+		.unwrap_or_else(|| action.typ.to_string());
 	dsl.validate_field_constraints(
-		action.typ.as_ref(),
+		&action_key,
 		action.content.as_ref().is_some_and(|c| !c.is_null()),
 		action.audience_tag.is_some(),
 		action.subject.is_some(),
 		action.parent_id.is_some(),
 		action.attachments.as_ref().is_some_and(|a| !a.is_empty()),
 	)?;
-	dsl.validate_content(action.typ.as_ref(), action.content.as_ref())?;
+	dsl.validate_content(&action_key, action.content.as_ref())?;
 
 	// Resolve root_id from parent chain (auto-populated, not client-specified)
 	let root_id =
@@ -312,17 +348,19 @@ pub async fn create_action(
 	let key = if is_draft {
 		None
 	} else {
-		dsl.get_key_pattern(action.typ.as_ref()).map(|pattern| {
-			helpers::apply_key_pattern(
-				pattern,
-				action.typ.as_ref(),
-				id_tag,
-				action.audience_tag.as_deref(),
-				action.parent_id.as_deref(),
-				action.subject.as_deref(),
-				action.content.as_ref(),
-			)
-		})
+		dsl.definition_for(action.typ.as_ref(), action.sub_typ.as_deref())
+			.and_then(|d| d.key_pattern.as_deref())
+			.map(|pattern| {
+				helpers::apply_key_pattern(
+					pattern,
+					action.typ.as_ref(),
+					id_tag,
+					action.audience_tag.as_deref(),
+					action.parent_id.as_deref(),
+					action.subject.as_deref(),
+					action.content.as_ref(),
+				)
+			})
 	};
 	let action_result =
 		app.meta_adapter.create_action(tn_id, &pending_action, key.as_deref()).await?;
@@ -348,8 +386,14 @@ pub async fn create_action(
 			};
 			app.meta_adapter.update_action_data(tn_id, &a_id_ref, &update_opts).await?;
 
-			let publish_task =
-				DraftPublishTask::new(tn_id, Box::from(id_tag), a_id, action.clone(), publish_at);
+			let publish_task = DraftPublishTask::new(
+				tn_id,
+				Box::from(id_tag),
+				Box::from(actor_id_tag),
+				a_id,
+				action.clone(),
+				publish_at,
+			);
 			app.scheduler
 				.task(publish_task)
 				.key(format!("draft:{},{}", tn_id, a_id))
@@ -384,7 +428,8 @@ pub async fn create_action(
 	debug!("Task dependencies: {:?}", deps);
 
 	// Create ActionCreatorTask to finalize the action
-	let task = ActionCreatorTask::new(tn_id, Box::from(id_tag), a_id, action);
+	let task =
+		ActionCreatorTask::new(tn_id, Box::from(id_tag), Box::from(actor_id_tag), a_id, action);
 	app.scheduler
 		.task(task)
 		.key(format!("{},{}", tn_id, a_id))
@@ -416,7 +461,8 @@ async fn create_ephemeral_action(
 
 	// Resolve flags: explicit > default_flags from action type definition
 	let flags = action.flags.clone().or_else(|| {
-		dsl.get_behavior(action.typ.as_ref())
+		dsl.definition_for(action.typ.as_ref(), action.sub_typ.as_deref())
+			.map(|d| &d.behavior)
 			.and_then(|b| b.default_flags.as_ref())
 			.map(|f: &String| Box::from(f.as_str()))
 	});
@@ -473,14 +519,33 @@ async fn create_ephemeral_action(
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ActionCreatorTask {
 	tn_id: TnId,
+	/// The issuer — always the tenant. Signs the token (`issuer_tag`) and builds the `SUBS:` keys.
 	id_tag: Box<str>,
+	/// The profile that actually posted, which on a community tenant is a *member*, not the
+	/// tenant. Only `upgrade_file_visibility` reads it: publication authority over a pinned
+	/// attachment belongs to the member who placed it, so passing `id_tag` there refused every
+	/// member-pinned attachment. `None` on a task persisted before this field existed — those
+	/// fall back to `id_tag`, which is what they were built with.
+	#[serde(default)]
+	actor_id_tag: Option<Box<str>>,
 	a_id: u64,
 	action: CreateAction,
 }
 
 impl ActionCreatorTask {
-	pub fn new(tn_id: TnId, id_tag: Box<str>, a_id: u64, action: CreateAction) -> Arc<Self> {
-		Arc::new(Self { tn_id, id_tag, a_id, action })
+	pub fn new(
+		tn_id: TnId,
+		id_tag: Box<str>,
+		actor_id_tag: Box<str>,
+		a_id: u64,
+		action: CreateAction,
+	) -> Arc<Self> {
+		Arc::new(Self { tn_id, id_tag, actor_id_tag: Some(actor_id_tag), a_id, action })
+	}
+
+	/// The profile whose publication authority governs this action's attachments.
+	fn actor(&self) -> &str {
+		self.actor_id_tag.as_deref().unwrap_or(&self.id_tag)
 	}
 }
 
@@ -520,14 +585,22 @@ impl Task<App> for ActionCreatorTask {
 		// 1b. Upgrade attachment visibility to match action visibility
 		if let Some(ref attachment_ids) = attachments {
 			for file_id in attachment_ids {
-				if let Err(e) =
-					upgrade_file_visibility(app, self.tn_id, file_id, self.action.visibility).await
+				// A refusal (`Ok(false)` on a mirrored row the actor did not place) logs at
+				// its own site in `upgrade_file_visibility`; `Ok(false)` also means "already
+				// visible enough", which is the ordinary case and not worth a line.
+				if let Err(e) = upgrade_file_visibility(
+					app,
+					self.tn_id,
+					file_id,
+					self.action.visibility,
+					self.actor(),
+				)
+				.await
 				{
 					warn!(
 						"Failed to upgrade visibility for file {}: {} - continuing anyway",
 						file_id, e
 					);
-					// Continue - don't fail action creation due to visibility upgrade
 				}
 			}
 		}
@@ -549,8 +622,8 @@ impl Task<App> for ActionCreatorTask {
 		// zero recipients (issuer == audience), so the action would never
 		// federate.
 		let is_broadcast = dsl
-			.get_behavior(self.action.typ.as_ref())
-			.and_then(|b| b.broadcast)
+			.definition_for(self.action.typ.as_ref(), self.action.sub_typ.as_deref())
+			.and_then(|d| d.behavior.broadcast)
 			.unwrap_or(false);
 		let resolved_audience = if self.action.audience_tag.is_none() && !is_broadcast {
 			helpers::resolve_parent_audience(
@@ -569,17 +642,19 @@ impl Task<App> for ActionCreatorTask {
 			&& self.action.subject.as_ref().is_some_and(|s| s.starts_with('@'))
 		{
 			// Subject was a reference that got resolved - regenerate the key
-			dsl.get_key_pattern(self.action.typ.as_ref()).map(|pattern| {
-				helpers::apply_key_pattern(
-					pattern,
-					self.action.typ.as_ref(),
-					&self.id_tag,
-					effective_audience.as_deref(),
-					self.action.parent_id.as_deref(),
-					subject.as_deref(),
-					self.action.content.as_ref(),
-				)
-			})
+			dsl.definition_for(self.action.typ.as_ref(), self.action.sub_typ.as_deref())
+				.and_then(|d| d.key_pattern.as_deref())
+				.map(|pattern| {
+					helpers::apply_key_pattern(
+						pattern,
+						self.action.typ.as_ref(),
+						&self.id_tag,
+						effective_audience.as_deref(),
+						self.action.parent_id.as_deref(),
+						subject.as_deref(),
+						self.action.content.as_ref(),
+					)
+				})
 		} else {
 			None
 		};
@@ -674,7 +749,7 @@ impl Task<App> for ActionCreatorTask {
 }
 
 /// Resolve file attachment references (@f_id → file_id)
-async fn resolve_attachments(
+pub(crate) async fn resolve_attachments(
 	app: &App,
 	tn_id: TnId,
 	attachments: Option<&Vec<Box<str>>>,
@@ -732,7 +807,8 @@ async fn generate_action_token(
 
 	// Resolve flags: explicit > default_flags from action type definition
 	let flags = action.flags.clone().or_else(|| {
-		dsl.get_behavior(action.typ.as_ref())
+		dsl.definition_for(action.typ.as_ref(), action.sub_typ.as_deref())
+			.map(|d| &d.behavior)
 			.and_then(|b| b.default_flags.as_ref())
 			.map(|f: &String| Box::from(f.as_str()))
 	});
@@ -823,7 +899,11 @@ async fn schedule_delivery(
 	let dsl = app.ext::<Arc<DslEngine>>()?;
 
 	// Skip federation entirely for local-only action types (e.g., APKG)
-	if dsl.get_behavior(&action.typ).and_then(|b| b.local_only).unwrap_or(false) {
+	if dsl
+		.definition_for(&action.typ, action.sub_typ.as_deref())
+		.and_then(|d| d.behavior.local_only)
+		.unwrap_or(false)
+	{
 		return Ok(());
 	}
 
@@ -833,8 +913,10 @@ async fn schedule_delivery(
 	{
 		// Get the subject action to check its broadcast behavior
 		if let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await {
-			let subject_broadcast =
-				dsl.get_behavior(&subject_action.typ).and_then(|b| b.broadcast).unwrap_or(false);
+			let subject_broadcast = dsl
+				.definition_for(&subject_action.typ, subject_action.sub_typ.as_deref())
+				.and_then(|d| d.behavior.broadcast)
+				.unwrap_or(false);
 
 			if subject_broadcast {
 				debug!(
@@ -860,7 +942,9 @@ async fn schedule_delivery(
 	let mut recipients = determine_recipients(app, tn_id, id_tag, action_id, action).await?;
 
 	// Get behavior flags
-	let behavior = dsl.get_behavior(action.typ.as_ref());
+	let behavior = dsl
+		.definition_for(action.typ.as_ref(), action.sub_typ.as_deref())
+		.map(|d| &d.behavior);
 
 	// Check if this action type should also deliver to subject's owner
 	// This is used by INVT to deliver to both invitee AND the CONV home
@@ -1046,7 +1130,13 @@ async fn schedule_broadcast_delivery(
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DraftPublishTask {
 	tn_id: TnId,
+	/// The issuer — the tenant, as on the direct-post path.
 	id_tag: Box<str>,
+	/// The draft's author. Handed to [`ActionCreatorTask`] so a draft publishes with exactly the
+	/// publication authority the same post would have had gone out directly. `None` on a task
+	/// persisted before this field existed.
+	#[serde(default)]
+	actor_id_tag: Option<Box<str>>,
 	a_id: u64,
 	action: CreateAction,
 	/// Scheduled publish time — included in serialized params so rescheduling
@@ -1058,11 +1148,19 @@ impl DraftPublishTask {
 	pub fn new(
 		tn_id: TnId,
 		id_tag: Box<str>,
+		actor_id_tag: Box<str>,
 		a_id: u64,
 		action: CreateAction,
 		scheduled_at: Timestamp,
 	) -> Arc<Self> {
-		Arc::new(Self { tn_id, id_tag, a_id, action, scheduled_at })
+		Arc::new(Self {
+			tn_id,
+			id_tag,
+			actor_id_tag: Some(actor_id_tag),
+			a_id,
+			action,
+			scheduled_at,
+		})
 	}
 }
 
@@ -1137,8 +1235,14 @@ impl Task<App> for DraftPublishTask {
 		// Schedule ActionCreatorTask to finalize (sign JWT, deliver)
 		let file_deps =
 			collect_file_deps(app, self.tn_id, current_action.attachments.as_ref()).await?;
-		let task =
-			ActionCreatorTask::new(self.tn_id, self.id_tag.clone(), self.a_id, current_action);
+		let actor = self.actor_id_tag.clone().unwrap_or_else(|| self.id_tag.clone());
+		let task = ActionCreatorTask::new(
+			self.tn_id,
+			self.id_tag.clone(),
+			actor,
+			self.a_id,
+			current_action,
+		);
 		app.scheduler
 			.task(task)
 			.key(format!("{},{}", self.tn_id, self.a_id))
@@ -1239,6 +1343,52 @@ impl Task<App> for ActionVerifierTask {
 mod tests {
 	use super::*;
 
+	/// `upgrade_file_visibility` is handed `actor()`, not the issuer. On a community tenant the
+	/// issuer is the community and the actor is the member who pinned the attachment, so passing
+	/// the issuer refused every member-pinned attachment with nothing but a `warn!`. Both creation
+	/// paths — a direct post and a published draft — must arrive at the same actor.
+	#[test]
+	fn both_creation_paths_name_the_same_actor() {
+		let action = CreateAction { typ: "POST".into(), ..Default::default() };
+		let direct = ActionCreatorTask::new(
+			TnId(1),
+			"club.example.com".into(),
+			"alice.example.com".into(),
+			7,
+			action.clone(),
+		);
+		let draft = DraftPublishTask::new(
+			TnId(1),
+			"club.example.com".into(),
+			"alice.example.com".into(),
+			7,
+			action.clone(),
+			Timestamp::now(),
+		);
+		let from_draft = ActionCreatorTask::new(
+			draft.tn_id,
+			draft.id_tag.clone(),
+			draft.actor_id_tag.clone().unwrap_or_else(|| draft.id_tag.clone()),
+			draft.a_id,
+			action,
+		);
+		assert_eq!(direct.actor(), "alice.example.com");
+		assert_eq!(from_draft.actor(), direct.actor());
+		// The issuer is untouched by all this — it is still the community.
+		assert_eq!(direct.id_tag.as_ref(), "club.example.com");
+	}
+
+	/// A task persisted before `actor_id_tag` existed still deserializes, and falls back to the
+	/// issuer — which is exactly what it was scheduled with.
+	#[test]
+	fn a_pre_existing_task_falls_back_to_the_issuer() {
+		let ctx = r#"{"tn_id":1,"id_tag":"alice.example.com","a_id":3,
+			"action":{"type":"POST"}}"#;
+		let task: ActionCreatorTask =
+			serde_json::from_str(ctx).expect("old serialized form still parses");
+		assert_eq!(task.actor(), "alice.example.com");
+	}
+
 	#[test]
 	fn test_create_action_struct() {
 		let action = CreateAction {
@@ -1273,15 +1423,18 @@ mod tests {
 	/// `CreateAction`, so the `CreateAction`-field → validator-arg mapping is under
 	/// test without needing a full `App`. Mirrors the inbound check in `process.rs`.
 	fn run_create_validation(dsl: &crate::dsl::DslEngine, action: &CreateAction) -> ClResult<()> {
+		let action_key = dsl
+			.resolve_action_type(action.typ.as_ref(), action.sub_typ.as_deref())
+			.unwrap_or_else(|| action.typ.to_string());
 		dsl.validate_field_constraints(
-			action.typ.as_ref(),
+			&action_key,
 			action.content.as_ref().is_some_and(|c| !c.is_null()),
 			action.audience_tag.is_some(),
 			action.subject.is_some(),
 			action.parent_id.is_some(),
 			action.attachments.as_ref().is_some_and(|a| !a.is_empty()),
 		)?;
-		dsl.validate_content(action.typ.as_ref(), action.content.as_ref())
+		dsl.validate_content(&action_key, action.content.as_ref())
 	}
 
 	#[test]

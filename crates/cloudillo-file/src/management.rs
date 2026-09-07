@@ -43,12 +43,46 @@ pub struct PatchFileResponse {
 	pub file_id: String,
 }
 
+/// May `caller` write the two publication columns (`visibility`, `status`) of a row?
+///
+/// A row that originates here (`upstream_tag` NULL) is open — every other field of
+/// `UpdateFileOptions` is record state and stays open regardless. On a *mirrored* row those two
+/// columns are the placer's alone: `handler::post_file_cross_context` records the placer in the
+/// raw `files.owner_tag`, while an FSHR-accepted row leaves that column NULL — nobody placed it,
+/// so nobody may republish it. The **raw** column is load-bearing: the resolved `FileView::owner`
+/// falls back to the tenant, which on a personal tenant is the recipient themselves.
+pub(crate) fn may_publish(
+	upstream_tag: Option<&str>,
+	owner_tag: Option<&str>,
+	caller: &str,
+) -> bool {
+	upstream_tag.is_none() || owner_tag == Some(caller)
+}
+
 pub async fn patch_file(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(file_id): Path<String>,
 	Json(opts): Json<UpdateFileOptions>,
 ) -> ClResult<Json<PatchFileResponse>> {
+	// `status` rides along on the same read as `visibility`. Blocking it is harmless today
+	// because `delete_file` trashes via `parent_id`, never through this field.
+	//
+	// Every other field in `UpdateFileOptions` is record state and stays open, so only this
+	// rare path pays the read. See `may_publish` for the rule.
+	if !opts.visibility.is_undefined() || !opts.status.is_undefined() {
+		let file =
+			app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or(Error::NotFound)?;
+		if !may_publish(file.upstream_tag.as_deref(), file.owner_tag.as_deref(), &auth.id_tag) {
+			warn!(
+				subject = %auth.id_tag,
+				file_id = %file_id,
+				"Refused visibility/status write on a mirrored row the caller did not place"
+			);
+			return Err(Error::PermissionDenied);
+		}
+	}
+
 	app.meta_adapter.update_file_data(auth.tn_id, &file_id, &opts).await?;
 	invalidate_dir_cache(&app, auth.tn_id, &file_id);
 	if opts.affects_search_index() {
@@ -460,7 +494,7 @@ pub async fn duplicate_file(
 				orig_variant_id: Some(new_file_id.clone().into()),
 				file_id: Some(new_file_id.clone().into()),
 				parent_id,
-				creator_tag: Some(auth.id_tag.clone()),
+				owner_tag: Some(auth.id_tag.clone()),
 				content_type: file.content_type.unwrap_or_else(|| "application/json".into()),
 				file_name: new_file_name.into(),
 				file_tp: file.file_tp,
@@ -486,18 +520,34 @@ pub async fn duplicate_file(
 /// restrictive visibility than the post, we upgrade the file's visibility
 /// so recipients can access it.
 ///
-/// Returns true if upgrade was performed, false if no change needed.
+/// Returns true if upgrade was performed, false if no change needed or the caller may not
+/// publish this row. The refusal is logged here, not by the caller: `Ok(false)` also covers the
+/// ordinary "already visible enough" case, which is not worth a line.
 pub async fn upgrade_file_visibility(
 	app: &App,
 	tn_id: TnId,
 	file_id: &str,
 	target_visibility: Option<char>,
+	caller_id_tag: &str,
 ) -> ClResult<bool> {
 	// Get current file data
 	let file = app.meta_adapter.read_file(tn_id, file_id).await?.ok_or_else(|| {
 		warn!("upgrade_file_visibility: File {} not found", file_id);
 		Error::NotFound
 	})?;
+
+	// Same gate `patch_file` applies to a direct `visibility` write — attaching a file to an
+	// action must not become the way around it. `Ok(false)` rather than `Err`: the only caller
+	// (`ActionCreatorTask::run`) already treats a failure here as non-fatal and continues.
+	if !may_publish(file.upstream_tag.as_deref(), file.owner_tag.as_deref(), caller_id_tag) {
+		warn!(
+			subject = %caller_id_tag,
+			file_id = %file_id,
+			"Refused visibility upgrade on a mirrored row the caller did not place — \
+			 recipients of the attaching action may not be able to read it"
+		);
+		return Ok(false);
+	}
 
 	let current = VisibilityLevel::from_char(file.visibility);
 	let target = VisibilityLevel::from_char(target_visibility);
@@ -530,6 +580,41 @@ pub async fn upgrade_file_visibility(
 			file_id, current, target
 		);
 		Ok(false)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::may_publish;
+
+	#[test]
+	fn publication_columns_are_open_on_a_row_that_originates_here() {
+		assert!(may_publish(None, None, "alice.example"));
+		assert!(may_publish(None, Some("bob.example"), "alice.example"));
+	}
+
+	#[test]
+	fn a_pin_answers_only_to_its_placer() {
+		assert!(may_publish(Some("carol.example"), Some("alice.example"), "alice.example"));
+		assert!(!may_publish(Some("carol.example"), Some("bob.example"), "alice.example"));
+	}
+
+	/// The bug: `fshr::on_accept` leaves `owner_tag` NULL, so the resolved `FileView::owner`
+	/// answers the tenant — which on a personal tenant is the recipient. Nobody placed this row,
+	/// so nobody republishes it, the tenant account included.
+	#[test]
+	fn an_fshr_accepted_row_is_republishable_by_nobody() {
+		assert!(!may_publish(Some("carol.example"), None, "alice.example"));
+		assert!(!may_publish(Some("carol.example"), None, "tenant.example"));
+	}
+
+	/// `upgrade_file_visibility` is the second caller of this gate: attaching a file to an
+	/// action widens the file's visibility to the action's, with the *tenant's* id_tag as the
+	/// caller. A row a member pinned answers to that member, not to the tenant, so the
+	/// attachment path cannot republish it either.
+	#[test]
+	fn the_tenant_cannot_republish_a_row_a_member_pinned() {
+		assert!(!may_publish(Some("carol.example"), Some("bob.example"), "tenant.example"));
 	}
 }
 

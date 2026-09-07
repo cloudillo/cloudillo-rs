@@ -130,7 +130,7 @@ pub type SearchObjectFn =
 /// wrappers below.
 ///
 /// Call this right after a write that changes a column the index reads — a file's
-/// `file_name`, `tags`, `status`, `visibility`, `owner_tag`, `root_id` or
+/// `file_name`, `tags`, `status`, `visibility`, `upstream_tag`, `root_id` or
 /// `content_type`; a profile's `name` or `id_tag`; an action's `content`, `type`,
 /// `sub_type`, `status`, `visibility` or `root_id`. Writes that only bump timestamps
 /// or counters need nothing.

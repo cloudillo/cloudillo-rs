@@ -5,12 +5,14 @@
 //!
 //! Provides functions to determine user access levels to files based on:
 //! - Scoped tokens (file:{file_id}:{R|C|W} grants Read/Comment/Write access)
-//! - Ownership (owner has Admin access — write, plus share management)
-//! - FSHR action grants, but only from the file's owner (ADMIN subtype = Admin, WRITE = Write,
-//!   COMMENT = Comment, else Read)
+//! - Ownership (the owner of a locally originating row has Admin access — write, plus share
+//!   management)
+//! - FSHR action grants, but only from the row's upstream source (ADMIN subtype = Admin,
+//!   WRITE = Write, COMMENT = Comment, else Read)
 
 use std::sync::Arc;
 
+use crate::abac;
 use crate::dir_cache::{DirCache, DirEntry};
 use crate::prelude::*;
 use cloudillo_types::meta_adapter;
@@ -39,6 +41,45 @@ pub struct FileAccessCtx<'a> {
 	pub user_id_tag: &'a str,
 	pub tenant_id_tag: &'a str,
 	pub user_roles: &'a [Box<str>],
+}
+
+/// The object side of a file access check: which row, plus its two ownership facts.
+///
+/// Kept apart from [`FileAccessCtx`], which describes the *subject*: mixing the two would let a
+/// caller hand in an upstream that does not belong to the row it is asking about.
+#[derive(Clone, Copy)]
+pub struct FileRef<'a> {
+	/// Authority. A NULL `files.owner_tag` resolves to the tenant.
+	pub owner_id_tag: &'a str,
+	/// Provenance, not authority. `None` means the row originates here, which is what gates the
+	/// owner shortcut and role access below. Never falls back to the tenant.
+	pub upstream_id_tag: Option<&'a str>,
+	pub file_id: &'a str,
+}
+
+impl<'a> FileRef<'a> {
+	/// Resolve both ownership facts off a loaded row, so callers cannot forget the upstream and
+	/// hand a mirrored row role access. An absent *or empty* profile counts as absent.
+	///
+	/// The NULL-owner fallback to the tenant rests on an invariant worth naming: **every locally
+	/// originating row a profile creates carries a non-NULL `owner_tag`.** Every user-facing
+	/// creation path stamps `auth.id_tag` — `file::handler`'s upload and cross-context-post sites,
+	/// `file::management::duplicate_file`, `profile::media`. The three sites that leave it NULL
+	/// create tenant infrastructure with no member creator to lose anything: `file::sync`'s variant
+	/// cache (profile pics and inbound action attachments; user uploads never reach it), and
+	/// `websocket`'s `s~{app_id}` store and `{file_id}~meta` rows. So the fallback never demotes a
+	/// real creator — in particular not in `share_access::is_share_manager`, which reads ownership
+	/// straight off the resulting `AccessLevel`.
+	pub fn from_view(view: &'a FileView, tenant_id_tag: &'a str) -> Self {
+		let tag = |p: Option<&'a meta_adapter::ProfileInfo>| {
+			p.map(|p| p.id_tag.as_ref()).filter(|s| !s.is_empty())
+		};
+		Self {
+			owner_id_tag: tag(view.owner.as_ref()).unwrap_or(tenant_id_tag),
+			upstream_id_tag: tag(view.upstream.as_ref()),
+			file_id: &view.file_id,
+		}
+	}
 }
 
 /// Resolve one `(tn, file_id)` → `DirEntry` through the folder cache, falling back
@@ -184,7 +225,7 @@ pub async fn check_share_for_file(
 	walk_parent_chain_for_share(app, tn_id, file_id, user_id_tag).await
 }
 
-/// Access level granted purely by community-role membership on a *tenant-owned*
+/// Access level granted purely by community-role membership on a *locally originating*
 /// file. Only roles from `crate::roles::ROLE_HIERARCHY` count.
 ///
 /// Membership is matched explicitly rather than by testing "the role slice is
@@ -192,7 +233,7 @@ pub async fn check_share_for_file(
 /// federated stranger Read access. Second defence behind `roles::parse_roles`,
 /// which drops empty segments.
 pub fn role_access_level(user_roles: &[Box<str>]) -> AccessLevel {
-	// A leader resolves to `Admin`, not `Write`: leadership over a tenant-owned file *is* the right
+	// A leader resolves to `Admin`, not `Write`: leadership over a local file *is* the right
 	// to manage its share set, so `access_level` alone answers "may manage shares".
 	if user_roles.iter().any(|r| r.as_ref() == "leader") {
 		return AccessLevel::Admin;
@@ -212,33 +253,41 @@ pub fn role_access_level(user_roles: &[Box<str>]) -> AccessLevel {
 /// Resolve the grant an `FSHR:{file_id}:{audience}` action row carries: `ADMIN` → Admin, `WRITE` →
 /// Write, `COMMENT` → Comment, `DEL` → None (a revocation is not a grant), anything else → Read.
 ///
-/// An FSHR is a *claim by its issuer* that they granted access, so only the file's owner can make
-/// it credibly. Without the issuer test the row is a self-service grant: `POST /api/actions` is
-/// gated only by the `contributor` role, the action DSL's `key_pattern` builds the key straight
-/// from the client's `subject` and `aud`, and hooks run *after* the row is stored with no rollback,
-/// so `fshr::on_create` rejecting the write leaves the row behind. Federated peers can post such a
+/// An FSHR is a *claim by its issuer* that they granted access, so only the node the row is
+/// mirrored from — its `upstream_tag` — can make it credibly. Testing the *owner* instead would be
+/// worse than useless on a community tenant: an FSHR-accepted row leaves `owner_tag` NULL, so the
+/// owner resolves to the recipient tenant and any member could forge a grant on their own row. A
+/// row with no upstream originates here, so no FSHR on it is credible from anyone — its live grant
+/// path is the `share_entries` row, resolved earlier.
+///
+/// Without the issuer test the row is a self-service grant: `POST /api/actions` is gated only by
+/// the `contributor` role, the action DSL's `key_pattern` builds the key straight from the
+/// client's `subject` and `aud`, and hooks run *after* the row is stored with no rollback, so
+/// `fshr::on_create` rejecting the write leaves the row behind. Federated peers can post such a
 /// token to the inbox just as easily.
 ///
 /// Both live paths survive the test: on the recipient's node `fshr::on_accept` creates the file row
-/// with `owner_tag = issuer`, and on the owner's node the grantee's access resolves earlier, from
+/// with `upstream_tag = issuer`, and on the owner's node the grantee's access resolves earlier, from
 /// the `share_entries` row.
 fn fshr_grant_level(
 	typ: &str,
 	sub_typ: Option<&str>,
 	issuer_tag: &str,
-	owner_id_tag: &str,
+	upstream_id_tag: Option<&str>,
 	file_id: &str,
 ) -> AccessLevel {
 	if typ != "FSHR" {
 		return AccessLevel::None;
 	}
-	if issuer_tag != owner_id_tag {
+	// Covers both mismatch and a NULL upstream: a locally originating row can carry no credible
+	// FSHR at all.
+	if upstream_id_tag != Some(issuer_tag) {
 		warn!(
 			file_id = %file_id,
 			issuer = %issuer_tag,
-			owner = %owner_id_tag,
+			upstream = ?upstream_id_tag,
 			sub_typ = ?sub_typ,
-			"Ignoring FSHR grant: issuer does not own the file"
+			"Ignoring FSHR grant: issuer is not the file's upstream source"
 		);
 		return AccessLevel::None;
 	}
@@ -256,25 +305,39 @@ fn fshr_grant_level(
 /// Get access level for a user on a file
 ///
 /// Determines access level based on:
-/// 1. Ownership — owner has Admin access
+/// 1. Ownership — the owner of a locally originating row has Admin access
 /// 2. Direct `share_entries` grant on this file, then the caller-supplied `inherited_share`, then a
 ///    parent-chain walk for a folder-inherited grant
-/// 3. Role-based access — tenant-owned files only: leader → Admin, moderator/contributor → Write,
-///    any role → Read
-/// 4. FSHR action issued by the file's owner — ADMIN → Admin, WRITE → Write, COMMENT → Comment,
+/// 3. Role-based access — any locally originating row (`upstream_id_tag` is `None`): leader →
+///    Admin, moderator/contributor → Write, any role → Read. `role_access_level` ignores
+///    `visibility`, so this deliberately reaches a peer member's own upload too.
+/// 4. FSHR action issued by the row's upstream source — ADMIN → Admin, WRITE → Write, COMMENT → Comment,
 ///    DEL → None (a revocation is not a grant), other sub-types → Read (see [`fshr_grant_level`])
-/// 5. No access — returns None
+/// 5. Placer read on a mirrored row with no FSHR at all — a Pin/Place copy stays readable by the
+///    profile that placed it. Read only, and last, so a revoked FSHR does not reach it.
+/// 6. No access — returns None
 pub async fn get_access_level(
 	app: &App,
 	tn_id: TnId,
-	file_id: &str,
-	owner_id_tag: &str,
+	file: FileRef<'_>,
 	ctx: &FileAccessCtx<'_>,
 	inherited_share: Option<AccessLevel>,
 ) -> AccessLevel {
+	let FileRef { file_id, owner_id_tag, upstream_id_tag } = file;
 	// The owner is the file's admin: write plus share management. Callers must test
 	// `can_write()`/`can_manage_shares()` rather than `== AccessLevel::Write`.
-	if ctx.user_id_tag == owner_id_tag {
+	//
+	// Locally originating rows only: owner authority over a mirrored *record* is not authority over
+	// its content. A mirror's access resolves from its share entries and from the FSHR grant below —
+	// otherwise the FSHR recipient on a personal tenant (owner = tenant = caller) would stop here and
+	// never see the level the sharer actually sent, and the placer of a Pin/Place row would gain
+	// share management over someone else's file.
+	//
+	// `abac::PermissionChecker::has_permission`'s ownership branch is deliberately *not* gated
+	// this way: there `owner_id_tag` means authority over the local record (rename, move, hide,
+	// delete, tag), which the placer keeps. Content and shares are decided here and in
+	// `crate::share_access`.
+	if upstream_id_tag.is_none() && ctx.user_id_tag == owner_id_tag {
 		return AccessLevel::Admin;
 	}
 
@@ -295,15 +358,21 @@ pub async fn get_access_level(
 		return level;
 	}
 
-	// Role-based access for tenant-owned files only (owner_id_tag == tenant_id_tag)
-	// When a file has no explicit owner, it belongs to the tenant.
-	// Community members with roles get access based on their role level.
-	// Files owned by other users are NOT accessible via role-based access.
-	if owner_id_tag == ctx.tenant_id_tag {
-		let level = role_access_level(ctx.user_roles);
-		if level != AccessLevel::None {
-			return level;
-		}
+	// Role-based access. A mirrored row (Pin/Place copy, FSHR-accepted share) names its source in
+	// `upstream_tag` and its access is that node's business — roles held here say nothing about it.
+	//
+	// ponytail: on a row that originates here, ANY role reaches it — including a peer member's own
+	// Direct-visibility upload on a community tenant, since `role_access_level` ignores
+	// `visibility`. Deliberate for now: contributors need to be able to write freely. Narrow it by
+	// reintroducing an owner/visibility gate here (leaders exempt, as they were) when the community
+	// model calls for it.
+	let role_level = if upstream_id_tag.is_none() {
+		role_access_level(ctx.user_roles)
+	} else {
+		AccessLevel::None
+	};
+	if role_level != AccessLevel::None {
+		return role_level;
 	}
 
 	// Look up FSHR action: key pattern is "FSHR:{file_id}:{audience}"
@@ -316,9 +385,20 @@ pub async fn get_access_level(
 			&action.typ,
 			action.sub_typ.as_ref().map(AsRef::as_ref),
 			&action.issuer_tag,
-			owner_id_tag,
+			upstream_id_tag,
 			file_id,
 		),
+		// No FSHR row at all — a Pin/Place copy. Its placer keeps *read* over their own pin:
+		// owner standing is withheld (that is the first rung, and it is what keeps a revoked FSHR
+		// recipient out), but on a personal tenant a Pin lands at Direct visibility with no share
+		// of any kind, so every other rung comes up empty. This rung must stay *after* the FSHR
+		// lookup: on such a tenant an FSHR-accepted row also leaves `owner_tag` NULL and so
+		// resolves to the caller, and running it earlier would cap a WRITE share at Read and hand
+		// a `DEL`-revoked one its access back. Read only — content authority and share management
+		// stay with the upstream node.
+		Ok(None) if upstream_id_tag.is_some() && ctx.user_id_tag == owner_id_tag => {
+			AccessLevel::Read
+		}
 		Ok(None) | Err(_) => AccessLevel::None,
 	}
 }
@@ -333,12 +413,12 @@ pub async fn get_access_level(
 pub async fn get_access_level_with_scope(
 	app: &App,
 	tn_id: TnId,
-	file_id: &str,
-	owner_id_tag: &str,
+	file: FileRef<'_>,
 	ctx: &FileAccessCtx<'_>,
 	scope: Option<&str>,
 	root_id: Option<&str>,
 ) -> AccessLevel {
+	let file_id = file.file_id;
 	// Check scope-based access first (for share links)
 	if let Some(scope_str) = scope {
 		// Use typed TokenScope for safe parsing
@@ -416,7 +496,37 @@ pub async fn get_access_level_with_scope(
 	}
 
 	// Fall back to existing logic (ownership, roles, FSHR actions)
-	get_access_level(app, tn_id, file_id, owner_id_tag, ctx, None).await
+	get_access_level(app, tn_id, file, ctx, None).await
+}
+
+/// Whether the file's own `visibility` alone grants a caller `Read`, for the ladder
+/// [`check_file_access_with_scope`] falls back to once every explicit grant has come up
+/// empty. `'P'` is handled separately by that caller and is deliberately not here.
+///
+/// `scope.is_none()` is the one gate: a share-link token carries `sub: None`, so on
+/// re-presentation `auth.id_tag` is the *tenant's own* id_tag and such a guest would be
+/// scored against the tenant's own relationships. It also keeps
+/// `get_access_level_with_scope`'s deliberate `None` for a non-matching scope final.
+///
+/// Provenance is deliberately NOT a gate. A cross-context placement's `visibility` is
+/// authored locally by the placing member — a community Pin lands at `'C'` — so refusing
+/// mirrored rows here hid every pin from the members it was placed for, while `file::list`
+/// and `search` showed it. What a mirror withholds is *owner* standing, and that happens
+/// upstream of this function: `get_access_level` resolves ownership, roles and FSHR first,
+/// so `is_owner` is provably `false` below and `Direct` (a revoked FSHR share) still grants
+/// nothing.
+///
+/// `rel` is the subject's relationship *to the tenant*, loaded by the caller (see
+/// [`abac::subject_relation_to_tenant`]) — `follower` is "they follow us".
+pub fn visibility_grants_read_fallback(
+	scope: Option<&str>,
+	visibility: Option<char>,
+	is_real_auth: bool,
+	rel: meta_adapter::ProfileRelation,
+) -> bool {
+	scope.is_none()
+		&& abac::relationship_level(false, rel.connected, rel.follower, is_real_auth)
+			.can_access(abac::VisibilityLevel::from_char(visibility))
 }
 
 /// Check file access and return file view with access level
@@ -424,7 +534,11 @@ pub async fn get_access_level_with_scope(
 /// This is the main helper for WebSocket handlers. It:
 /// 1. Loads file metadata
 /// 2. Determines access level (considering scoped tokens for share links)
-/// 3. Returns combined result or error
+/// 3. Falls back to the file's `visibility` for unscoped callers on tenant-owned rows —
+///    `'P'` for anyone, `'V'`/`'2'`/`'F'`/`'C'` per the subject's relationship *to the
+///    tenant* (see [`visibility_grants_read_fallback`]). Never grants more than `Read`;
+///    `Direct` (NULL) and `'S'` grant nothing.
+/// 4. Returns combined result or error
 ///
 /// The scope parameter should be auth_ctx.scope.as_deref().
 pub async fn check_file_access_with_scope(
@@ -444,31 +558,43 @@ pub async fn check_file_access_with_scope(
 		Err(e) => return Err(FileAccessError::InternalError(e.to_string())),
 	};
 
-	// Get owner id_tag from file metadata
-	// If no owner, default to tenant (tenant owns all files without explicit owner)
-	let owner_id_tag = file_view
-		.owner
-		.as_ref()
-		.and_then(|p| if p.id_tag.is_empty() { None } else { Some(p.id_tag.as_ref()) })
-		.unwrap_or(ctx.tenant_id_tag);
+	// Both ownership facts come off the row itself, so this function's callers cannot forget the
+	// upstream and hand a mirrored row role access.
+	let file_ref = FileRef::from_view(&file_view, ctx.tenant_id_tag);
 
-	debug!(file_id = file_id, user = ctx.user_id_tag, owner = owner_id_tag, scope = ?scope, "Checking file access");
+	debug!(file_id = file_id, user = ctx.user_id_tag, owner = file_ref.owner_id_tag, scope = ?scope, "Checking file access");
 
 	// Get access level (considering scope for share links and document trees)
-	let mut access_level = get_access_level_with_scope(
-		app,
-		tn_id,
-		file_id,
-		owner_id_tag,
-		ctx,
-		scope,
-		file_view.root_id.as_deref(),
-	)
-	.await;
+	let mut access_level =
+		get_access_level_with_scope(app, tn_id, file_ref, ctx, scope, file_view.root_id.as_deref())
+			.await;
 
-	// Public files are readable by anyone (including unauthenticated guests)
+	// Public files are readable by anyone (including unauthenticated guests).
+	// Deliberately scope-agnostic and separate from the ladder below: a scoped
+	// caller reaching an unrelated *public* file is relied on by
+	// `share::list_shares_by_subject` and `management::duplicate_file`.
 	if access_level == AccessLevel::None && file_view.visibility == Some('P') {
 		access_level = AccessLevel::Read;
+	}
+
+	// The rest of the visibility ladder ('V'/'2'/'F'/'C'); the whole decision lives in
+	// `visibility_grants_read_fallback`, which the integration tests call directly.
+	if access_level == AccessLevel::None {
+		let vis = abac::VisibilityLevel::from_char(file_view.visibility);
+		let is_real_auth = !ctx.user_id_tag.is_empty() && ctx.user_id_tag != "guest";
+		// Only 'F'/'C'/'2' need the profile row; 'V' is settled by authentication alone.
+		// The scope case is not re-tested here — the fallback refuses it anyway, so the
+		// only cost of loading `rel` is one read on a row that was going to be denied.
+		let rel = if is_real_auth && abac::visibility_needs_relation(vis) {
+			abac::subject_relation_to_tenant(app, tn_id, ctx.user_id_tag)
+				.await
+				.map_err(|e| FileAccessError::InternalError(e.to_string()))?
+		} else {
+			meta_adapter::ProfileRelation::default()
+		};
+		if visibility_grants_read_fallback(scope, file_view.visibility, is_real_auth, rel) {
+			access_level = AccessLevel::Read;
+		}
 	}
 
 	// Cap access by file-to-file share entry when opened via embedding
@@ -590,6 +716,17 @@ pub async fn check_scope_allows_create_in(
 	}
 }
 
+/// The scope char a token mint may stamp for a caller who asked for `requested` and
+/// actually holds `held`: never more than they hold, and never share-management
+/// authority — [`AccessLevel::to_scope_char`] caps `Admin` at `'W'`. `None` when nothing
+/// may be granted.
+///
+/// Shared by both minting paths in `cloudillo_auth::handler::get_access_token` so a cap
+/// can never be tightened on one and forgotten on the other.
+pub fn scope_char_within(requested: AccessLevel, held: AccessLevel) -> Option<char> {
+	requested.min(held).to_scope_char()
+}
+
 /// Returns true when a scoped token is itself sufficient authorization for a
 /// collection-level operation, letting the middleware skip the role/quota path.
 ///
@@ -652,7 +789,7 @@ mod tests {
 		assert_eq!(role_access_level(&["supporter".into()]), AccessLevel::Read);
 		assert_eq!(role_access_level(&["contributor".into()]), AccessLevel::Write);
 		assert_eq!(role_access_level(&["moderator".into()]), AccessLevel::Write);
-		// Leadership over a tenant-owned file carries share management, hence Admin not Write.
+		// Leadership over a local file carries share management, hence Admin not Write.
 		assert_eq!(role_access_level(&["leader".into()]), AccessLevel::Admin);
 		// The highest role in a mixed set wins.
 		assert_eq!(
@@ -662,28 +799,31 @@ mod tests {
 		assert_eq!(role_access_level(&["public".into(), "contributor".into()]), AccessLevel::Write);
 	}
 
-	const OWNER: &str = "alice.example.com";
+	/// The node an FSHR-accepted row is mirrored from — `files.upstream_tag`, not its owner.
+	const UPSTREAM: &str = "alice.example.com";
 	const ATTACKER: &str = "mallory.example.com";
 
 	#[test]
-	fn fshr_from_a_non_owner_grants_nothing() {
+	fn fshr_from_a_non_upstream_grants_nothing() {
 		// The action row is stored before `fshr::on_create` runs and a hook denial does not roll it
 		// back, so any contributor — or any followed peer posting to the inbox — can self-address
 		// an FSHR naming someone else's file. Every sub-type must be inert, `ADMIN` above all: it
 		// would otherwise read back as share-manager standing with an admin grant ceiling.
 		for sub_typ in [Some("ADMIN"), Some("WRITE"), Some("COMMENT"), Some("READ"), None] {
 			assert_eq!(
-				fshr_grant_level("FSHR", sub_typ, ATTACKER, OWNER, "f1~doc"),
+				fshr_grant_level("FSHR", sub_typ, ATTACKER, Some(UPSTREAM), "f1~doc"),
 				AccessLevel::None,
-				"{sub_typ:?} from a non-owner must grant nothing"
+				"{sub_typ:?} from a non-upstream issuer must grant nothing"
 			);
 		}
 	}
 
 	#[test]
-	fn fshr_from_the_owner_grants_its_sub_type() {
-		// The live path: on the recipient's node `fshr::on_accept` writes `owner_tag = issuer`, so
-		// the grant resolves exactly as the sender sent it.
+	fn fshr_from_the_upstream_grants_its_sub_type() {
+		// The live path: on the recipient's node `fshr::on_accept` writes `upstream_tag = issuer`, so
+		// the grant resolves exactly as the sender sent it. It stays live because `get_access_level`'s
+		// owner shortcut is gated on `upstream_id_tag.is_none()` — without that gate the recipient
+		// tenant would return `Admin` at step 1 and never reach here.
 		for (sub_typ, level) in [
 			(Some("ADMIN"), AccessLevel::Admin),
 			(Some("WRITE"), AccessLevel::Write),
@@ -691,25 +831,44 @@ mod tests {
 			(Some("READ"), AccessLevel::Read),
 			(None, AccessLevel::Read),
 		] {
-			assert_eq!(fshr_grant_level("FSHR", sub_typ, OWNER, OWNER, "f1~doc"), level);
+			assert_eq!(
+				fshr_grant_level("FSHR", sub_typ, UPSTREAM, Some(UPSTREAM), "f1~doc"),
+				level
+			);
 		}
 	}
 
 	#[test]
-	fn a_del_from_the_owner_revokes_rather_than_granting_read() {
+	fn a_del_from_the_upstream_revokes_rather_than_granting_read() {
 		// `delete_share` drops the `share_entries` row and emits an FSHR `DEL`, which — same key —
 		// overwrites the grant. Falling through to the catch-all would hand the read back.
 		assert_eq!(
-			fshr_grant_level("FSHR", Some("DEL"), OWNER, OWNER, "f1~doc"),
+			fshr_grant_level("FSHR", Some("DEL"), UPSTREAM, Some(UPSTREAM), "f1~doc"),
 			AccessLevel::None
 		);
+	}
+
+	#[test]
+	fn fshr_on_a_locally_originating_row_grants_nothing() {
+		// `upstream_tag` NULL means the row originates here: nobody is in a position to have granted
+		// access to it from elsewhere, so no FSHR on it is credible — not even from the owner, whose
+		// own access already resolved at step 1.
+		for issuer in [UPSTREAM, ATTACKER] {
+			for sub_typ in [Some("ADMIN"), Some("WRITE"), Some("COMMENT"), Some("READ"), None] {
+				assert_eq!(
+					fshr_grant_level("FSHR", sub_typ, issuer, None, "f1~doc"),
+					AccessLevel::None,
+					"{sub_typ:?} on a local row must grant nothing"
+				);
+			}
+		}
 	}
 
 	#[test]
 	fn only_fshr_rows_grant_anything() {
 		// The key is `FSHR:{file}:{audience}`, but `get_action_by_key` does not filter on type.
 		assert_eq!(
-			fshr_grant_level("CONN", Some("ADMIN"), OWNER, OWNER, "f1~doc"),
+			fshr_grant_level("CONN", Some("ADMIN"), UPSTREAM, Some(UPSTREAM), "f1~doc"),
 			AccessLevel::None
 		);
 	}

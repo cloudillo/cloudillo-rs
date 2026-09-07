@@ -29,6 +29,45 @@ pub fn check_identity_field(field: &str, id_tag: &str) -> ClResult<()> {
 	}
 }
 
+/// Gate an action `subject` that carries an identity (`@<id_tag>`) on the same canonical
+/// form [`check_identity_field`] demands of `iss` and `aud`.
+///
+/// [`SubjectRef::Action`] (`a1~…`) and [`SubjectRef::Placeholder`] (`@42`) are not
+/// identities and pass untouched.
+///
+/// The community-INVT lookups build their filter as `format!("@{}", community_tag)` from a
+/// canonical tag (`native_hooks/invt.rs`, `native_hooks/conn.rs`) while the adapter does an
+/// exact `a.subject IN (…)`, so an INVT federated with `sub = "@Club.Example.COM"` stored that
+/// spelling and matched nothing — a since-demoted inviter could not withdraw their own
+/// invitation. Normalising at the comparison sites would have been the wrong fix; the storage
+/// invariant is enforced on write, here.
+pub fn check_subject_field(subject: &str) -> ClResult<()> {
+	match parse_subject_ref(subject) {
+		Some(SubjectRef::Identity(id_tag)) => check_identity_field("subject", id_tag),
+		_ => Ok(()),
+	}
+}
+
+/// Cap on how many files one action may attach.
+///
+/// Each entry costs a full `file_access` ladder walk in `handler::post_action`
+/// (read_file, share entry, parent-chain walk, FSHR lookup, sometimes a relationship
+/// read) plus a `resolve_attachments` lookup in `task.rs`, all sequential on the read
+/// pool — so an unbounded list turns one authenticated POST into ~10^5 queries.
+/// Generous for a media post; raise it only alongside a producer that needs more.
+pub const MAX_ATTACHMENTS: usize = 32;
+
+/// Reject an over-long attachment list before anything walks it.
+pub fn check_attachment_count(attachments: Option<&[Box<str>]>) -> ClResult<()> {
+	let count = attachments.map_or(0, <[_]>::len);
+	if count > MAX_ATTACHMENTS {
+		return Err(Error::ValidationError(format!(
+			"too many attachments ({count}, max {MAX_ATTACHMENTS})"
+		)));
+	}
+	Ok(())
+}
+
 /// Extract type and optional subtype from type string (e.g., "POST:TEXT" -> ("POST", Some("TEXT")))
 pub fn extract_type_and_subtype(type_str: &str) -> (String, Option<String>) {
 	if let Some(colon_pos) = type_str.find(':') {
@@ -83,9 +122,10 @@ pub fn serialize_content(content: Option<&serde_json::Value>) -> Option<String> 
 
 /// Derive a short rendering snippet from an action's content value.
 ///
-/// Handles the common content shapes: a bare `String`, an object with a `text`
-/// or `content` field, or any other value (rendered via `to_string`). Caps the
-/// result at 200 characters. Used by the offline email notification path
+/// Handles the common content shapes: a bare `String`, an object with a `text`,
+/// `content` or `title` field (POST:LDOC carries only the document `title` when the
+/// author adds no commentary), or any other value (rendered via `to_string`). Caps
+/// the result at 200 characters. Used by the offline email notification path
 /// (`process::deliver_notification_email`).
 pub(crate) fn content_snippet(content: Option<&serde_json::Value>) -> String {
 	let raw = match content {
@@ -93,6 +133,7 @@ pub(crate) fn content_snippet(content: Option<&serde_json::Value>) -> String {
 		Some(serde_json::Value::Object(o)) => o
 			.get("text")
 			.or_else(|| o.get("content"))
+			.or_else(|| o.get("title"))
 			.and_then(|v| v.as_str())
 			.map(str::to_string)
 			.unwrap_or_default(),
@@ -263,36 +304,34 @@ impl SubscriptionRole {
 	}
 }
 
-/// Get subscription role from action's metadata
+/// Get subscription role from a stored subscription's server-side metadata (`x.role`).
 ///
-/// Reads from x.role (new location), falling back to content.role for migration.
-/// This supports both Action (content as JSON string) and ActionView (content as Value).
+/// **Only `x`.** `content` is the action token's `c` claim — signed by the *issuer*, i.e.
+/// by the very party whose role is being decided, and the SUBS content schema whitelists
+/// `"admin"`. Inbound processing strips `x` (`process.rs`, `x: None`), so a `content.role`
+/// fallback would let a remote subscriber name its own role and pick up `CONV:UPD`,
+/// `SUBS:DEL` (kick members) and `INVT`.
 ///
-/// Parameters:
-/// - x: The extensible metadata (x field from Action/ActionView)
-/// - content: The action content (as parsed JSON Value)
+/// `x` is not server-side-only, though: `CreateAction.x` and `PatchActionRequest.x` are
+/// deserialized from the client body and stored verbatim, so a client *can* put a `role` there.
+/// What makes it safe is the **key**, not the field. A locally-created action is issued as the
+/// tenant, so a forged `x.role` keys as `SUBS:{subject}:{tenant}` and never matches the
+/// `SUBS:{target}:{action.iss}` lookup in `check_subscription_role_permission`. `content` has no
+/// such protection — it is the issuer's signed `c` claim — which is why the fallback is gone.
+/// The roles that do count are written by the CONV and INVT native hooks, or default to
+/// `Member`, which is what an ordinary federated subscriber gets.
 ///
-/// For Action<S> with content as string, caller should parse it first:
-/// ```ignore
-/// let content_json = action.content.as_ref()
-///     .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-/// get_subscription_role(action.x.as_ref(), content_json.as_ref())
-/// ```
-pub fn get_subscription_role(
-	x: Option<&serde_json::Value>,
-	content: Option<&serde_json::Value>,
-) -> SubscriptionRole {
-	// First try x.role (new location for server-side metadata)
-	if let Some(role_str) = x.and_then(|x| x.get("role")).and_then(|r| r.as_str()) {
-		return role_str.parse().unwrap_or(SubscriptionRole::Observer);
-	}
-
-	// Fallback to content.role for migration compatibility
-	// Default to Member (not Observer) - subscribers should participate by default
-	content
-		.and_then(|c| c.get("role"))
+/// The two "unknown" defaults differ on purpose. **Absent `x`** is the ordinary inbound row —
+/// `process.rs` strips `x` on receipt — so it must resolve to `Member`, the participation
+/// baseline a federated subscriber is entitled to. **A present but unrecognised `x.role`** is
+/// corruption in a value only this server writes (the CONV and INVT native hooks), so it falls
+/// to `Observer`, the least authority. Reversing either one is a privilege change: `Member` for
+/// a bad `x.role` would let a typo confer participation, and `Observer` for an absent `x` would
+/// mute every federated subscriber.
+pub fn get_subscription_role(x: Option<&serde_json::Value>) -> SubscriptionRole {
+	x.and_then(|x| x.get("role"))
 		.and_then(|r| r.as_str())
-		.map_or(SubscriptionRole::Member, |s| s.parse().unwrap_or(SubscriptionRole::Member))
+		.map_or(SubscriptionRole::Member, |s| s.parse().unwrap_or(SubscriptionRole::Observer))
 }
 
 /// Broadcast/Announce recipient set for `tn_id`: every profile with the
@@ -318,6 +357,23 @@ pub(crate) async fn broadcast_recipient_tags(
 mod tests {
 	use super::*;
 
+	/// The subscription role comes from server-side metadata only. `content` is the
+	/// action token's `c` claim, signed by the party whose role is being decided —
+	/// inbound processing strips `x`, so honouring `content.role` let a remote SUBS
+	/// declare itself `admin` and pick up CONV:UPD / SUBS:DEL / INVT.
+	#[test]
+	fn subscription_role_comes_from_server_metadata_only() {
+		let x = serde_json::json!({ "role": "admin" });
+		assert_eq!(get_subscription_role(Some(&x)), SubscriptionRole::Admin);
+
+		// No `x` — an inbound row — is an ordinary member, whatever it claimed.
+		assert_eq!(get_subscription_role(None), SubscriptionRole::Member);
+
+		// An unrecognised server-side role falls to the least authority, not the most.
+		let bogus = serde_json::json!({ "role": "wizard" });
+		assert_eq!(get_subscription_role(Some(&bogus)), SubscriptionRole::Observer);
+	}
+
 	/// Only the field name in the error is this wrapper's own; which identities pass is
 	/// `cloudillo_types::validation::validate_id_tag`'s contract, tested there.
 	#[test]
@@ -331,6 +387,39 @@ mod tests {
 			panic!("expected a validation error");
 		};
 		assert!(msg.contains("issuer"), "error should name the field: {msg}");
+	}
+
+	/// `invt.rs` and `conn.rs` build their lookup as `format!("@{}", tag)` from a canonical
+	/// tag against an exact `a.subject IN (…)`, so a subject stored in a different spelling
+	/// matches nothing — a since-demoted inviter could not withdraw their own invitation.
+	/// Closed here, on write, not by normalising at every compare.
+	#[test]
+	fn an_identity_subject_must_be_canonical() {
+		assert!(check_subject_field("@club.example.com").is_ok());
+
+		let Err(Error::ValidationError(msg)) = check_subject_field("@Club.Example.COM") else {
+			panic!("a non-canonical identity subject must be rejected");
+		};
+		assert!(msg.contains("subject"), "error should name the field: {msg}");
+
+		// The two non-identity forms are untouched: a content-addressed action id and an
+		// in-batch placeholder.
+		assert!(check_subject_field("a1~abc").is_ok());
+		assert!(check_subject_field("@42").is_ok());
+
+		// `@a1~abc` parses as an *identity* (see `subject_ref`), and is not a valid one.
+		assert!(check_subject_field("@a1~abc").is_err());
+	}
+
+	#[test]
+	fn an_over_long_attachment_list_is_refused() {
+		let at_cap: Vec<Box<str>> =
+			(0..MAX_ATTACHMENTS).map(|i| format!("f1~{i}").into()).collect();
+		assert!(check_attachment_count(Some(&at_cap)).is_ok(), "the cap itself is allowed");
+		assert!(check_attachment_count(None).is_ok());
+
+		let over: Vec<Box<str>> = (0..=MAX_ATTACHMENTS).map(|i| format!("f1~{i}").into()).collect();
+		assert!(matches!(check_attachment_count(Some(&over)), Err(Error::ValidationError(_))));
 	}
 
 	#[test]
@@ -498,6 +587,18 @@ mod tests {
 	fn test_content_snippet_object_content() {
 		let value = serde_json::json!({ "content": "world" });
 		assert_eq!(content_snippet(Some(&value)), "world");
+	}
+
+	/// A POST:LDOC body has no `text` when the author adds no commentary — the
+	/// document `title` is the only prose there is, so the notification uses it.
+	#[test]
+	fn test_content_snippet_object_title() {
+		let value = serde_json::json!({
+			"doc": "a.org:f1~x",
+			"contentType": "cloudillo/quillo",
+			"title": "Q3 terv"
+		});
+		assert_eq!(content_snippet(Some(&value)), "Q3 terv");
 	}
 
 	#[test]

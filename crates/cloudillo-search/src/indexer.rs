@@ -228,13 +228,11 @@ pub async fn index_document(app: &App, tn_id: TnId, file_id: &str) -> ClResult<(
 				obj_tp: OBJ_DOC,
 				obj_id: file_id,
 				content_type,
-				// The raw `files.owner_tag` column — NULL for a tenant-owned
-				// file — not the resolved `file.owner`, whose fallback chain
-				// answers the tenant's own profile. The `'F'` row carries the
-				// raw value, so anything else makes the two rows of one
-				// document disagree and turns the adapter's no-op guard into a
-				// full FTS rewrite per part.
-				owner_tag: file.owner_tag.as_deref(),
+				// `search_docs.upstream_tag` mirrors the raw `files.upstream_tag`
+				// column. The 'F' row carries the raw value, so anything else makes
+				// the two rows of one document disagree and turns the adapter's
+				// no-op guard into a full FTS rewrite per part.
+				upstream_tag: file.upstream_tag.as_deref(),
 				visibility: file.visibility,
 				// Deep parts inherit the container's tree root so a file-scoped
 				// token can prefilter them in SQL. A standalone document is its

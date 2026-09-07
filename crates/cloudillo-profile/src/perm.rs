@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::prelude::*;
 use cloudillo_core::abac::Environment;
-use cloudillo_core::extract::Auth;
+use cloudillo_core::extract::{Auth, IdTag};
 use cloudillo_core::middleware::PermissionCheckOutput;
 use cloudillo_types::types::ProfileAttrs;
 
@@ -47,14 +47,15 @@ type IdTagPath = Result<Path<IdTagParam>, PathRejection>;
 /// not by position. Other captures are ignored.
 pub fn check_perm_profile(
 	action: &'static str,
-) -> impl Fn(State<App>, Auth, IdTagPath, Request, Next) -> PermissionCheckOutput + Clone {
-	move |state, auth, params, req, next| {
-		Box::pin(check_profile_permission(state, auth, params, req, next, action))
+) -> impl Fn(State<App>, IdTag, Auth, IdTagPath, Request, Next) -> PermissionCheckOutput + Clone {
+	move |state, tenant, auth, params, req, next| {
+		Box::pin(check_profile_permission(state, tenant, auth, params, req, next, action))
 	}
 }
 
 async fn check_profile_permission(
 	State(app): State<App>,
+	IdTag(tenant_id_tag): IdTag,
 	Auth(auth_ctx): Auth,
 	params: IdTagPath,
 	req: Request,
@@ -68,8 +69,8 @@ async fn check_profile_permission(
 		return Err(Error::PermissionDenied);
 	};
 
-	// Load profile attributes (STUB - Phase 3 will implement)
-	let attrs = load_profile_attrs(&app, auth_ctx.tn_id, &id_tag, &auth_ctx.id_tag).await?;
+	let attrs =
+		load_profile_attrs(&app, auth_ctx.tn_id, &tenant_id_tag, &id_tag, &auth_ctx.id_tag).await?;
 
 	// Check permission
 	let environment = Environment::new();
@@ -83,7 +84,7 @@ async fn check_profile_permission(
 			subject = %auth_ctx.id_tag,
 			action = action,
 			target_id_tag = %id_tag,
-			owner_id_tag = %attrs.tenant_tag,
+			tenant_id_tag = %attrs.tenant_id_tag,
 			profile_type = attrs.profile_type,
 			roles = ?attrs.roles,
 			status = attrs.status,
@@ -99,6 +100,7 @@ async fn check_profile_permission(
 async fn load_profile_attrs(
 	app: &App,
 	tn_id: TnId,
+	tenant_id_tag: &str,
 	id_tag: &str,
 	subject_id_tag: &str,
 ) -> ClResult<ProfileAttrs> {
@@ -117,16 +119,18 @@ async fn load_profile_attrs(
 		Ok(profile_data) => {
 			// Determine if subject is following or connected to target
 			// For now, default to false - in Phase 4 this will query relationship metadata
-			let following = false;
+			let is_follower = false;
 			let connected = false;
 
 			Ok(ProfileAttrs {
 				id_tag: profile_data.id_tag,
 				profile_type: profile_data.r#type,
-				tenant_tag: id_tag.into(), // tenant_tag refers to the profile owner
+				// Owner authority over a profile row is the hosting tenant's, never the
+				// row's subject: a member must not edit the tenant's record about them.
+				tenant_id_tag: tenant_id_tag.into(),
 				roles: subject_roles,
 				status: "active".into(), // TODO: Query actual profile status from MetaAdapter
-				following,
+				is_follower,
 				connected,
 				visibility: "public".into(), // Profiles are publicly readable
 			})
@@ -137,15 +141,66 @@ async fn load_profile_attrs(
 			Ok(ProfileAttrs {
 				id_tag: id_tag.into(),
 				profile_type: "person".into(),
-				tenant_tag: id_tag.into(),
+				tenant_id_tag: tenant_id_tag.into(),
 				roles: subject_roles,
 				status: "unknown".into(),
-				following: false,
+				is_follower: false,
 				connected: false,
 				visibility: "public".into(), // Profiles are publicly readable
 			})
 		}
 		Err(e) => Err(e),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use cloudillo_core::abac::{Environment, PermissionChecker};
+	use cloudillo_types::auth_adapter::AuthCtx;
+	use cloudillo_types::types::{ProfileAttrs, TnId};
+
+	fn attrs(tenant_id_tag: &str) -> ProfileAttrs {
+		ProfileAttrs {
+			id_tag: "bob.example.com".into(),
+			profile_type: "person".into(),
+			tenant_id_tag: tenant_id_tag.into(),
+			roles: vec![],
+			status: "active".into(),
+			is_follower: false,
+			connected: false,
+			visibility: "public".into(),
+		}
+	}
+
+	fn subject(id_tag: &str) -> AuthCtx {
+		AuthCtx {
+			tn_id: TnId(1),
+			id_tag: id_tag.into(),
+			roles: Box::new([]),
+			scope: None,
+			anonymous: false,
+		}
+	}
+
+	/// `tenant_id_tag` must be the hosting tenant, not the *target* profile: ABAC's ownership
+	/// branch would otherwise hand `profile:write` to the row's own subject — letting a
+	/// suspended community member lift their own status.
+	#[test]
+	fn member_has_no_write_authority_over_own_profile_row() {
+		let checker = PermissionChecker::new();
+		let env = Environment::new();
+		let community = attrs("community.example.com");
+		let bob = subject("bob.example.com");
+
+		assert!(!checker.has_permission(&bob, "profile:write", &community, &env));
+		assert!(!checker.has_permission(&bob, "profile:delete", &community, &env));
+
+		// Reading stays open — visibility is hardcoded "public".
+		assert!(checker.has_permission(&bob, "profile:read", &community, &env));
+
+		// The tenant itself keeps owner authority over the rows it hosts.
+		let tenant = subject("community.example.com");
+		assert!(checker.has_permission(&tenant, "profile:write", &community, &env));
 	}
 }
 

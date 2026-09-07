@@ -18,9 +18,10 @@ use super::types::{
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Regex for action type validation: 2-16 uppercase letters/numbers, starting with letter
+/// Regex for action type validation: 2-16 uppercase letters/numbers, starting with a
+/// letter, plus an optional `:SUBTYPE` suffix of the same shape (e.g. `POST:LDOC`).
 static ACTION_TYPE_RE: LazyLock<Regex> = LazyLock::new(|| {
-	Regex::new(r"^[A-Z][A-Z0-9]{1,15}$").unwrap_or_else(|e| {
+	Regex::new(r"^[A-Z][A-Z0-9]{1,15}(:[A-Z][A-Z0-9]{1,15})?$").unwrap_or_else(|e| {
 		// This regex is hardcoded and should never fail to compile
 		// If it does, it's a programming error that should be caught in development
 		unreachable!("ACTION_TYPE_RE regex compilation failed: {}", e)
@@ -100,10 +101,10 @@ pub fn validate_definition(def: &ActionDefinition) -> Result<(), Vec<ValidationE
 }
 
 fn validate_action_type(action_type: &str) -> Result<(), String> {
-	// Must be 2-16 uppercase letters/numbers
 	if !ACTION_TYPE_RE.is_match(action_type) {
 		return Err(format!(
-			"Invalid action type '{}': must be 2-16 uppercase letters/numbers, starting with letter",
+			"Invalid action type '{}': must be 2-16 uppercase letters/numbers, starting with \
+			 letter, optionally followed by ':SUBTYPE' of the same shape",
 			action_type
 		));
 	}
@@ -281,11 +282,15 @@ mod tests {
 		assert!(validate_action_type("CONN").is_ok());
 		assert!(validate_action_type("POST").is_ok());
 		assert!(validate_action_type("REACT").is_ok());
+		assert!(validate_action_type("POST:LDOC").is_ok()); // subType-specific definition
+		assert!(validate_action_type("IDP:REG").is_ok());
 
 		assert!(validate_action_type("conn").is_err()); // lowercase
 		assert!(validate_action_type("C").is_err()); // too short
 		assert!(validate_action_type("VERYLONGACTIONTYPE123").is_err()); // too long
 		assert!(validate_action_type("123").is_err()); // starts with number
+		assert!(validate_action_type("POST:").is_err()); // empty subType
+		assert!(validate_action_type("POST:ldoc").is_err()); // lowercase subType
 	}
 
 	#[test]

@@ -773,10 +773,10 @@ impl TokenScope {
 pub struct ProfileAttrs {
 	pub id_tag: Box<str>,
 	pub profile_type: Box<str>,
-	pub tenant_tag: Box<str>,
+	pub tenant_id_tag: Box<str>,
 	pub roles: Vec<Box<str>>,
 	pub status: Box<str>,
-	pub following: bool,
+	pub is_follower: bool,
 	pub connected: bool,
 	pub visibility: Box<str>,
 }
@@ -786,9 +786,9 @@ impl AttrSet for ProfileAttrs {
 		match key {
 			"id_tag" => Some(&self.id_tag),
 			"profile_type" => Some(&self.profile_type),
-			"tenant_tag" | "owner_id_tag" => Some(&self.tenant_tag),
+			"tenant_id_tag" | "owner_id_tag" => Some(&self.tenant_id_tag),
 			"status" => Some(&self.status),
-			"following" => Some(if self.following { "true" } else { "false" }),
+			"is_follower" => Some(if self.is_follower { "true" } else { "false" }),
 			"connected" => Some(if self.connected { "true" } else { "false" }),
 			"visibility" => Some(&self.visibility),
 			_ => None,
@@ -818,7 +818,7 @@ pub struct ActionAttrs {
 	pub tags: Vec<Box<str>>,
 	pub visibility: Box<str>,
 	/// Whether the subject follows the action issuer
-	pub following: bool,
+	pub is_follower: bool,
 	/// Whether the subject is connected (mutual) with the action issuer
 	pub connected: bool,
 }
@@ -834,7 +834,7 @@ impl AttrSet for ActionAttrs {
 			"parent_id" => self.parent_id.as_deref(),
 			"root_id" => self.root_id.as_deref(),
 			"visibility" => Some(&self.visibility),
-			"following" => Some(if self.following { "true" } else { "false" }),
+			"is_follower" => Some(if self.is_follower { "true" } else { "false" }),
 			"connected" => Some(if self.connected { "true" } else { "false" }),
 			_ => None,
 		}
@@ -854,12 +854,16 @@ impl AttrSet for ActionAttrs {
 pub struct FileAttrs {
 	pub file_id: Box<str>,
 	pub owner_id_tag: Box<str>,
+	/// The upstream (canonical source) tenant of a mirrored row. `None` means the row
+	/// originates on this tenant, i.e. `owner_id_tag` is real content ownership rather than
+	/// mere local record authority.
+	pub upstream_id_tag: Option<Box<str>>,
 	pub mime_type: Box<str>,
 	pub tags: Vec<Box<str>>,
 	pub visibility: Box<str>,
 	pub access_level: AccessLevel,
 	/// Whether the subject follows the file owner
-	pub following: bool,
+	pub is_follower: bool,
 	/// Whether the subject is connected (mutual) with the file owner
 	pub connected: bool,
 }
@@ -869,10 +873,11 @@ impl AttrSet for FileAttrs {
 		match key {
 			"file_id" => Some(&self.file_id),
 			"owner_id_tag" => Some(&self.owner_id_tag),
+			"upstream_id_tag" => self.upstream_id_tag.as_deref(),
 			"mime_type" => Some(&self.mime_type),
 			"visibility" => Some(&self.visibility),
 			"access_level" => Some(self.access_level.as_str()),
-			"following" => Some(if self.following { "true" } else { "false" }),
+			"is_follower" => Some(if self.is_follower { "true" } else { "false" }),
 			"connected" => Some(if self.connected { "true" } else { "false" }),
 			_ => None,
 		}

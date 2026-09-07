@@ -9,8 +9,8 @@
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{
 	Action, ActionId, CreateFile, FileStatus, FileView, ListActionOptions, ListProfileOptions,
-	MetaAdapter, ProfileStatus, ProfileType, UpdateActionDataOptions, UpdateTenantData,
-	UpsertProfileFields,
+	MetaAdapter, ProfileConnectionStatus, ProfileRelation, ProfileStatus, ProfileType,
+	UpdateActionDataOptions, UpdateTenantData, UpsertProfileFields,
 };
 use cloudillo_types::types::{Patch, Timestamp, TnId};
 use cloudillo_types::worker::WorkerPool;
@@ -833,13 +833,94 @@ async fn get_relationships_keys_by_the_callers_id_tag() {
 
 	assert_eq!(
 		rels.get("Alice.Example.COM").copied(),
-		Some((true, false)),
+		Some(ProfileRelation { following: true, follower: false, connected: false }),
 		"the result is keyed by the needle the caller passed, not by the stored id_tag"
 	);
 	assert!(
 		!rels.contains_key("alice.example.com"),
 		"the canonical form is not leaked as a second key"
 	);
+}
+
+// `following` ("we follow them") and `follower` ("they follow us") are opposite
+// directions and the visibility rules only ever mean the latter. Swapping the two
+// columns both denies real followers and hands follower-level access to anyone the
+// tenant follows back, so pin them apart.
+#[tokio::test]
+async fn get_relationships_keeps_the_two_follow_directions_apart() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+
+	adapter
+		.upsert_profile(
+			tn_id,
+			"bob.example.com",
+			&UpsertProfileFields {
+				name: Patch::Value("Bob".into()),
+				typ: Patch::Value(ProfileType::Person),
+				following: Patch::Value(false),
+				follower: Patch::Value(true),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("upsert profile");
+
+	let rels = adapter
+		.get_relationships(tn_id, &["bob.example.com"])
+		.await
+		.expect("get_relationships");
+	let rel = rels.get("bob.example.com").copied().expect("relation row");
+
+	assert!(rel.follower, "bob follows the tenant");
+	assert!(!rel.following, "the tenant does not follow bob");
+}
+
+/// Both flag columns are nullable. Migration 34 backfills `follower = 1` for existing
+/// followers but writes no `0` for everyone else, and never touches `following` — so any
+/// database upgraded from below v34 still holds rows with a NULL `follower`. A strict
+/// `try_get::<bool, _>`
+/// errors the whole batch out, and `abac::subject_relation_to_tenant` swallows that into "no
+/// relationship" — silently hiding every relationship-gated file, action and search hit.
+#[tokio::test]
+async fn get_relationships_reads_a_null_flag_as_false() {
+	let (adapter, temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+
+	adapter
+		.upsert_profile(
+			tn_id,
+			"carol.example.com",
+			&UpsertProfileFields {
+				name: Patch::Value("Carol".into()),
+				typ: Patch::Value(ProfileType::Person),
+				connected: Patch::Value(ProfileConnectionStatus::Connected),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("upsert profile");
+
+	// Reproduce the pre-v34 shape: neither flag column was ever written.
+	let db =
+		sqlx::SqlitePool::connect(&format!("sqlite://{}", temp.path().join("meta.db").display()))
+			.await
+			.expect("raw connection");
+	sqlx::query("UPDATE profiles SET following = NULL, follower = NULL WHERE tn_id = ?")
+		.bind(tn_id.0)
+		.execute(&db)
+		.await
+		.expect("null out the flags");
+
+	let rels = adapter
+		.get_relationships(tn_id, &["carol.example.com"])
+		.await
+		.expect("a NULL flag must not error the whole batch out");
+	let rel = rels.get("carol.example.com").copied().expect("relation row");
+
+	assert!(!rel.follower);
+	assert!(!rel.following);
+	assert!(rel.connected, "the relationship that *is* recorded survives");
 }
 
 // An anonymous share-link visitor has no identity to attribute per-user activity to. The
@@ -889,3 +970,345 @@ async fn recording_activity_with_an_empty_id_tag_writes_no_per_user_row() {
 		assert!(stamp(&after).is_some(), "{entry_point}: the file's own timestamp still advances");
 	}
 }
+
+/// A file the tenant uploads itself carries `owner_tag = <tenant id_tag>`. The tenant has
+/// no row of its own in `profiles`, so the owner join misses — the resolved `owner` must still
+/// be the tenant's profile, not a nameless tag-only stub.
+#[tokio::test]
+async fn own_upload_resolves_owner_to_the_tenant_profile() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice.example").await.expect("create tenant");
+	adapter
+		.update_tenant(
+			tn_id,
+			&UpdateTenantData { name: Patch::Value("Alice".into()), ..Default::default() },
+		)
+		.await
+		.expect("name the tenant");
+
+	adapter
+		.create_file(
+			tn_id,
+			CreateFile {
+				file_id: Some("f1~own".into()),
+				owner_tag: Some("alice.example".into()),
+				content_type: "text/plain".into(),
+				file_name: "own.txt".into(),
+				file_tp: Some("BLOB".into()),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("create file");
+
+	let view = adapter.read_file(tn_id, "f1~own").await.expect("read").expect("exists");
+	let owner = view.owner.expect("owner resolved");
+	assert_eq!(owner.id_tag.as_ref(), "alice.example");
+	assert_eq!(owner.name.as_ref(), "Alice", "the tenant's own profile, not a tag-only stub");
+	assert!(view.upstream.is_none(), "a local upload has no upstream");
+}
+
+/// `profile_settings.id_tag` is canonicalised on write *and* read, like every other
+/// id_tag-keyed table. Without it `Bob.Example.COM` and `bob.example.com` are distinct
+/// primary keys and a leader writing under the non-canonical spelling creates rows the
+/// owner can never read back.
+#[tokio::test]
+async fn profile_settings_are_keyed_by_the_canonical_id_tag() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+
+	adapter
+		.update_profile_setting(tn_id, "Bob.Example.COM", "theme", Some(serde_json::json!("dark")))
+		.await
+		.expect("write under the mixed-case spelling");
+
+	let read = adapter
+		.read_profile_setting(tn_id, "bob.example.com", "theme")
+		.await
+		.expect("read")
+		.expect("the row is reachable under the canonical spelling");
+	assert_eq!(read, serde_json::json!("dark"));
+
+	let listed = adapter
+		.list_profile_settings(tn_id, "bob.example.com", None)
+		.await
+		.expect("list");
+	assert_eq!(listed.get("theme"), Some(&serde_json::json!("dark")));
+
+	// ...and the two spellings are one row, not two.
+	adapter
+		.update_profile_setting(tn_id, "bob.example.com", "theme", Some(serde_json::json!("light")))
+		.await
+		.expect("overwrite under the canonical spelling");
+	assert_eq!(
+		adapter
+			.list_profile_settings(tn_id, "BOB.EXAMPLE.COM", None)
+			.await
+			.expect("list")
+			.len(),
+		1
+	);
+}
+
+/// The prefix filter, shared by `setting::list` and `setting::list_profile`. The
+/// `name LIKE ? ESCAPE '\'` clause is built by hand, so a malformed escape character or a
+/// mis-quoted literal is a runtime SQLite error no type check catches — and `_` and `%` in a
+/// caller's prefix must match themselves, not act as wildcards.
+#[tokio::test]
+async fn setting_prefixes_filter_and_escape_wildcards() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	let id_tag = "bob.example.com";
+
+	for name in ["ui.theme", "ui.lang", "mail.smtp", "a_b.x", "axb.x"] {
+		adapter
+			.update_setting(tn_id, name, Some(serde_json::json!(name)))
+			.await
+			.expect("write tenant setting");
+		adapter
+			.update_profile_setting(tn_id, id_tag, name, Some(serde_json::json!(name)))
+			.await
+			.expect("write profile setting");
+	}
+
+	let prefixes = vec!["ui.".to_string()];
+	let tenant = adapter.list_settings(tn_id, Some(&prefixes)).await.expect("list");
+	let mut keys: Vec<&str> = tenant.keys().map(String::as_str).collect();
+	keys.sort_unstable();
+	assert_eq!(keys, ["ui.lang", "ui.theme"]);
+
+	let profile = adapter
+		.list_profile_settings(tn_id, id_tag, Some(&prefixes))
+		.await
+		.expect("list");
+	let mut keys: Vec<&str> = profile.keys().map(String::as_str).collect();
+	keys.sort_unstable();
+	assert_eq!(keys, ["ui.lang", "ui.theme"], "both readers share one prefix builder");
+
+	// `_` is a LIKE wildcard; escaped, it matches only a literal underscore.
+	let underscore = vec!["a_b".to_string()];
+	let hits = adapter.list_settings(tn_id, Some(&underscore)).await.expect("list");
+	assert_eq!(hits.keys().collect::<Vec<_>>(), vec!["a_b.x"], "`axb.x` must not match");
+
+	// No prefix list at all is "everything".
+	assert_eq!(adapter.list_settings(tn_id, None).await.expect("list").len(), 5);
+	assert_eq!(adapter.list_settings(tn_id, Some(&[])).await.expect("list").len(), 5);
+}
+
+/// The per-profile row cap. Profile settings are free-form and writable by every
+/// member of a community tenant, so a new name past the cap is refused while an overwrite
+/// of an existing one always passes.
+#[tokio::test]
+async fn profile_settings_are_capped_per_profile() {
+	// Mirrors `setting::MAX_PROFILE_SETTINGS`, which is private to the adapter.
+	const MAX: usize = 200;
+
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	let id_tag = "bob.example.com";
+
+	for i in 0..MAX {
+		adapter
+			.update_profile_setting(tn_id, id_tag, &format!("k{i}"), Some(serde_json::json!(i)))
+			.await
+			.unwrap_or_else(|e| panic!("setting {i} within the cap: {e}"));
+	}
+
+	// A new name past the cap is refused...
+	let err = adapter
+		.update_profile_setting(tn_id, id_tag, "overflow", Some(serde_json::json!(1)))
+		.await
+		.expect_err("the cap is enforced");
+	// 409, not 400 — the body is fine, the profile is full.
+	assert!(matches!(err, cloudillo_types::error::Error::Conflict(_)), "{err:?}");
+	assert!(
+		adapter
+			.read_profile_setting(tn_id, id_tag, "overflow")
+			.await
+			.expect("read")
+			.is_none()
+	);
+
+	// ...but overwriting an existing one still works, so a full profile is not frozen.
+	adapter
+		.update_profile_setting(tn_id, id_tag, "k0", Some(serde_json::json!("updated")))
+		.await
+		.expect("overwrite at the cap");
+	assert_eq!(
+		adapter.read_profile_setting(tn_id, id_tag, "k0").await.expect("read"),
+		Some(serde_json::json!("updated"))
+	);
+
+	// Deleting frees a slot.
+	adapter.update_profile_setting(tn_id, id_tag, "k0", None).await.expect("delete");
+	adapter
+		.update_profile_setting(tn_id, id_tag, "overflow", Some(serde_json::json!(1)))
+		.await
+		.expect("a freed slot admits a new name");
+}
+
+/// `profile_settings` is in the tenant cascade, like `settings`.
+#[tokio::test]
+async fn deleting_a_tenant_removes_its_profile_settings() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	let other = TnId(2);
+	adapter.create_tenant(tn_id, "alice").await.ok();
+	adapter.create_tenant(other, "bob").await.ok();
+
+	for tn in [tn_id, other] {
+		adapter
+			.update_profile_setting(tn, "bob.example.com", "theme", Some(serde_json::json!("dark")))
+			.await
+			.expect("write setting");
+	}
+
+	adapter.delete_tenant(tn_id).await.expect("delete tenant");
+
+	assert!(
+		adapter
+			.list_profile_settings(tn_id, "bob.example.com", None)
+			.await
+			.expect("list")
+			.is_empty(),
+		"profile_settings row survived tenant deletion"
+	);
+	// The other tenant's row is untouched — the cascade is keyed, not global.
+	assert_eq!(
+		adapter
+			.list_profile_settings(other, "bob.example.com", None)
+			.await
+			.expect("list")
+			.len(),
+		1
+	);
+}
+
+/// `/api/inbox` stores a bundle's related tokens before the main token is verified, so a failed
+/// verification orphans them forever. The sweep removes acked rows past the cutoff and nothing
+/// else — an un-acked row is the action's own token and goes with the action.
+#[tokio::test]
+async fn orphaned_related_action_tokens_are_pruned_by_age_and_ack() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.ok();
+
+	adapter
+		.create_inbound_action(tn_id, "a1~old", "tok1", Some("a1~aprv"))
+		.await
+		.expect("old");
+	adapter
+		.create_inbound_action(tn_id, "a1~new", "tok2", Some("a1~aprv"))
+		.await
+		.expect("new");
+	adapter.create_inbound_action(tn_id, "a1~own", "tok3", None).await.expect("own");
+
+	// A cutoff in the past is older than every row: nothing is due yet.
+	assert_eq!(
+		adapter
+			.cleanup_orphaned_action_tokens(Timestamp::from_now(-3600))
+			.await
+			.expect("sweep"),
+		0
+	);
+
+	// A cutoff in the future sweeps both acked rows; the un-acked one is not eligible.
+	assert_eq!(
+		adapter
+			.cleanup_orphaned_action_tokens(Timestamp::from_now(3600))
+			.await
+			.expect("sweep"),
+		2
+	);
+	assert!(adapter.get_action_token(tn_id, "a1~own").await.expect("read").is_some());
+	assert!(adapter.get_action_token(tn_id, "a1~old").await.expect("read").is_none());
+}
+
+/// Processing a bundled action re-stores its token with `ack = None`, and that clears `ack`.
+/// Nothing else ever does, so without the clear the sweep eventually deletes the only stored
+/// copy of the signed JWS of every action that ever arrived inside a bundle — the copy outbox
+/// re-delivery and `include_tokens` signature verification both read.
+#[tokio::test]
+async fn a_processed_bundled_token_leaves_the_sweeps_reach() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.ok();
+
+	adapter
+		.create_inbound_action(tn_id, "a1~bundled", "tok", Some("a1~aprv"))
+		.await
+		.expect("pre-store bundled");
+	// The success path in `process.rs`, which passes `None`.
+	adapter
+		.create_inbound_action(tn_id, "a1~bundled", "tok", None)
+		.await
+		.expect("processed");
+
+	assert_eq!(
+		adapter
+			.cleanup_orphaned_action_tokens(Timestamp::from_now(3600))
+			.await
+			.expect("sweep"),
+		0,
+		"a processed row is no longer an orphan"
+	);
+	assert_eq!(
+		adapter.get_action_token(tn_id, "a1~bundled").await.expect("read").as_deref(),
+		Some("tok")
+	);
+}
+
+/// The window every `@<f_id>` attachment lives in: `files.file_id` is NULL until
+/// `FileIdGeneratorTask` calls `finalize_file`, and for video it waits on the transcodes too.
+/// The client posts its action inside that window — that is what `collect_file_deps` exists
+/// for — so the attachment reachability check in `action::handler::post_action` must address
+/// the row in its unresolved `@<f_id>` form. `read_file` does; `get_file_id` decodes a NULL
+/// column and fails, which is the difference this test pins.
+#[tokio::test]
+async fn an_unfinalized_row_is_readable_by_f_id_but_has_no_file_id() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice.example").await.expect("create tenant");
+
+	// No `file_id`: exactly what the upload endpoints leave behind before finalization.
+	let created = adapter
+		.create_file(
+			tn_id,
+			CreateFile {
+				content_type: "image/jpeg".into(),
+				file_name: "photo.jpg".into(),
+				file_tp: Some("BLOB".into()),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("create file");
+	let cloudillo_types::meta_adapter::FileId::FId(f_id) = created else {
+		panic!("an unfinalized row must come back as an f_id, got {created:?}");
+	};
+
+	// The form the upload endpoints hand the client, and the form the check must use.
+	let view = adapter
+		.read_file(tn_id, &format!("@{f_id}"))
+		.await
+		.expect("read by f_id")
+		.expect("row exists");
+	assert_eq!(
+		view.file_id.as_ref(),
+		format!("@{f_id}"),
+		"not finalized yet — the view falls back to the @-form"
+	);
+
+	// Resolving first is what broke the flow: there is nothing to resolve to, and a NULL column
+	// decodes to the empty string rather than failing loudly — so an attachment check that
+	// resolved before testing access looked up `""`, found no row, and denied the post.
+	assert_eq!(
+		adapter.get_file_id(tn_id, f_id).await.expect("no error, just nothing").as_ref(),
+		"",
+		"get_file_id has nothing to return for an unfinalized row"
+	);
+	assert!(adapter.read_file(tn_id, "").await.expect("read").is_none());
+}
+
+// vim: ts=4

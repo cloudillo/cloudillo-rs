@@ -123,6 +123,13 @@ pub async fn validate_api_key(
 				.await
 				.map_err(|_| Error::Unauthorized)?;
 
+			// A scoped key still carries the owner role set, and that is deliberate: a
+			// `carddav:`/`caldav:` capability key reaches routes gated by `require_leader`
+			// (PIM), and its confinement comes from `scope::scope_permits`, which fails
+			// closed on every path outside its family. A *delegated* scope (`file:`,
+			// `apkg:publish`) does not benefit — `require_leader` rejects anything
+			// `TokenScope::parse` recognises, and `abac::check_default_rules` gives a
+			// scoped subject neither the leader override nor tenant ownership.
 			let expanded_roles = crate::auth::build_tenant_owner_roles(roles.as_deref());
 			return Ok(ApiKeyValidation {
 				tn_id: TnId(u32::try_from(tn_id).unwrap_or_default()),

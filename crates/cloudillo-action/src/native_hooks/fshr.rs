@@ -83,8 +83,8 @@ async fn authorize_share_change(
 /// `require_share_manager`. Hooks run post-store with no rollback, so a denial deletes the offending
 /// action row explicitly: leaving it stored would keep it visible to listings, federation relay and
 /// future hooks even though it grants nothing. `cloudillo_core::file_access::fshr_grant_level`
-/// honouring an FSHR row solely when its issuer owns the file remains as defence in depth, covering
-/// the window before the delete and any row that predates this check.
+/// honouring an FSHR row solely when its issuer is the row's upstream source remains as defence in
+/// depth, covering the window before the delete and any row that predates this check.
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	let tn_id = context.tn_id;
 
@@ -120,8 +120,8 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				action_id = %context.action_id,
 				error = %del_err,
 				"FSHR on_create: failed to remove the denied action row; it grants nothing \
-				 (file_access::fshr_grant_level requires the issuer to own the file) but will \
-				 remain visible until the next cleanup"
+				 (file_access::fshr_grant_level requires the issuer to be the file's \
+				 upstream source) but will remain visible until the next cleanup"
 			);
 		} else {
 			cloudillo_core::search_index_action(&app, tn_id, &context.action_id);
@@ -195,7 +195,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// FSHR on_receive hook - Handle incoming file share request
 ///
 /// Logic:
-/// - Refuse a share whose subject file we already hold under a different owner
+/// - Refuse a share whose subject file we already hold from a different upstream source
 /// - If we are the audience and subType is not DEL, set status to 'C' (confirmation required)
 /// - DEL subtype doesn't require confirmation
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
@@ -206,26 +206,28 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 		context.audience
 	);
 
-	// A missing row is the ordinary case — `on_accept` creates it. A row owned by someone other
-	// than the issuer means the sender is claiming authority over content that is not theirs;
-	// refuse outright rather than leaning on `file_access`'s issuer check, so no junk row lands.
+	// This hook only ever runs on the *recipient's* node (`post_store.rs` dispatches `OnCreate`
+	// outbound and `OnReceive` inbound), so a row we already hold for the subject is a mirror an
+	// earlier `on_accept` created, carrying `upstream_tag = issuer`. Judging it by its *owner* would
+	// be wrong twice over: that resolves to the recipient tenant, which is never the issuer, so every
+	// follow-up FSHR — a permission upgrade, a re-share, a `DEL` revocation — would be refused; and
+	// on a community tenant a member could satisfy the test on their own local row.
+	//
+	// A missing row is the ordinary case — `on_accept` creates it. A NULL upstream means we hold a
+	// *local* file whose id collides with the subject, and a different upstream means the sender is
+	// claiming authority over content that is not theirs; refuse either outright rather than leaning
+	// on `file_access`'s issuer check, so no junk row lands. `file_access::fshr_grant_level` tests
+	// the same tag from the other side — the two must agree or one gate contradicts the other.
 	if let Some(file_id) = &context.subject
 		&& let Ok(Some(file)) = app.meta_adapter.read_file(context.tn_id, file_id).await
 	{
-		// Same fallback `file_access::check_file_access_with_scope` uses — no explicit owner means
-		// the tenant owns the row. The two must agree or one gate contradicts the other.
-		let owner = file
-			.owner
-			.as_ref()
-			.map(|p| p.id_tag.as_ref())
-			.filter(|s| !s.is_empty())
-			.unwrap_or(context.tenant_tag.as_str());
-		if owner != context.issuer {
+		let upstream = file.upstream.as_ref().map(|p| p.id_tag.as_ref()).filter(|s| !s.is_empty());
+		if upstream != Some(context.issuer.as_str()) {
 			tracing::warn!(
 				issuer = %context.issuer,
 				subject = %file_id,
-				owner = %owner,
-				"FSHR on_receive refused: issuer does not own the subject file"
+				upstream = ?upstream,
+				"FSHR on_receive refused: issuer is not the subject file's upstream source"
 			);
 			return Err(Error::PermissionDenied);
 		}
@@ -254,7 +256,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 ///
 /// Logic:
 /// - Parse content to get fileName and contentType
-/// - Create file entry with status 'M' (mutable/shared) and owner_tag from issuer
+/// - Create file entry with status 'M' (mutable/shared) and upstream_tag from issuer
 pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 	let tn_id = context.tn_id;
 
@@ -301,7 +303,7 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 	// Create file entry with status 'A' (active) and visibility direct (most restricted - owner and tenant can see)
 	let create_opts = CreateFile {
 		file_id: Some(file_id.clone().into()),
-		owner_tag: Some(context.issuer.clone().into()), // Shared files: owner is the sharer
+		upstream_tag: Some(context.issuer.clone().into()), // Shared files: upstream is the sharer
 		content_type: content_type.into(),
 		file_name: file_name.into(),
 		file_tp: Some(file_tp.into()),
@@ -345,8 +347,8 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 }
 
 /// Only the pure decisions — everything else here needs a whole `App`. The resource-level half is
-/// tested in `cloudillo_core::share_access`, and `on_receive`'s owner guard has its companion check
-/// tested as `cloudillo_core::file_access::fshr_grant_level`.
+/// tested in `cloudillo_core::share_access`, and `on_receive`'s upstream guard has its companion
+/// check tested as `cloudillo_core::file_access::fshr_grant_level`.
 #[cfg(test)]
 mod tests {
 	use super::*;

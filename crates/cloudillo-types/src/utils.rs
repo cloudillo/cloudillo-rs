@@ -49,6 +49,23 @@ pub fn derive_name_from_id_tag(id_tag: &str) -> String {
 /// [`crate::validation::validate_id_tag`] at the boundaries (Action format, federation
 /// client), so a non-canonical value cannot reach storage in the first place.
 ///
+/// **The rule: normalize when turning untrusted external input into a lookup key; never
+/// when comparing two values that are already inside the system.** The read paths in
+/// `adapters/` normalize because their key may have come straight from a URL path segment
+/// (`/api/profiles/{idTag}`), which no extractor validates; the write paths normalize
+/// because they *are* the enforcement of the storage invariant. An in-process comparison
+/// has canonical values on both sides by construction and uses a plain `==` — reaching for
+/// `normalize_id_tag` there papers over a boundary that should have refused the value.
+///
+/// The boundaries, all five of them: the `Host` header (`request.rs` → `validate_id_tag`),
+/// registration (`register.rs`), an action's `iss` and `aud`
+/// (`cloudillo_action::helpers::check_identity_field`), an action's `subject`
+/// (`check_subject_field`), and token minting, whose `sub` is always read from storage.
+///
+/// A route handler that both compares and looks up a `{id_tag}` path segment is a boundary
+/// too, and canonicalizes it on entry — see `cloudillo_core::settings::handler`'s
+/// profile-settings routes. The comparison that follows is still a plain `==`.
+///
 /// Borrows when the input is already canonical, so hot read paths do not allocate.
 pub fn normalize_id_tag(id_tag: &str) -> Cow<'_, str> {
 	crate::validation::canonicalize_id_tag(id_tag).unwrap_or(Cow::Borrowed(id_tag.trim()))

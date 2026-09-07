@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-//! Periodic cleanup task for expired auth data (API keys, verification codes)
+//! Periodic cleanup task for expired auth data (API keys, verification codes) and for
+//! related-action tokens orphaned by an unverified `/api/inbox` bundle.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,20 @@ impl Task<App> for AuthCleanupTask {
 			}
 			Err(e) => {
 				warn!("Failed to cleanup expired verification codes: {}", e);
+			}
+		}
+
+		// Related-action tokens orphaned by an unverified `/api/inbox` bundle. Seven days is
+		// well past any legitimate wait for a main action to arrive.
+		let cutoff = Timestamp::from_now(-7 * 24 * 3600);
+		match app.meta_adapter.cleanup_orphaned_action_tokens(cutoff).await {
+			Ok(count) => {
+				if count > 0 {
+					info!("Cleaned up {} orphaned action tokens", count);
+				}
+			}
+			Err(e) => {
+				warn!("Failed to cleanup orphaned action tokens: {}", e);
 			}
 		}
 

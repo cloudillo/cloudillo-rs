@@ -295,7 +295,84 @@ pub async fn post_action(
 		}
 	}
 
-	let action_id = task::create_action(&app, tn_id, &id_tag, action).await?;
+	// Canonical-form validation before the gate below, not after it: `is_community_invt`
+	// routes on a raw `==` against the tenant tag, so a non-canonical `@Club.Example.COM`
+	// aimed at the local `club.example.com` would miss the gate entirely. `create_action`
+	// checks both fields again — cheap, and it keeps that function self-contained for its
+	// other callers (`DraftPublishTask`).
+	if let Some(audience_tag) = action.audience_tag.as_deref() {
+		helpers::check_identity_field("audience", audience_tag)?;
+	}
+	if let Some(subject) = action.subject.as_deref() {
+		helpers::check_subject_field(subject)?;
+	}
+	// Before the loop below, not downstream in `create_action_as`: the ladder walk per entry
+	// is exactly what must not run.
+	helpers::check_attachment_count(action.attachments.as_deref())?;
+
+	// Attachments are client-supplied file ids, so require the caller can already *read* each
+	// one. Read, not write: publication authority on the attached row is decided separately by
+	// `upgrade_file_visibility`, and demanding write would break attaching a file shared with
+	// the caller at Read. Without this an action could name any file id in the tenant.
+	//
+	// Checked in the **unresolved** `@<f_id>` form: `files.file_id` is NULL until
+	// `FileIdGeneratorTask` finalizes the row, and the whole `collect_file_deps` dependency
+	// machinery exists because the client posts before that happens — resolving here would fail
+	// the ordinary "upload a photo, then post it" flow. `read_file` accepts either form.
+	if let Some(file_ids) = action.attachments.as_ref() {
+		let ctx = cloudillo_core::file_access::FileAccessCtx {
+			user_id_tag: &auth.id_tag,
+			tenant_id_tag: &id_tag,
+			user_roles: &auth.roles,
+		};
+		for file_id in file_ids {
+			cloudillo_core::file_access::check_file_access_with_scope(
+				&app,
+				tn_id,
+				file_id,
+				&ctx,
+				auth.scope.as_deref(),
+				None,
+			)
+			.await
+			.map_err(|e| match e {
+				// Both collapse to 403 on purpose: a 404 here would tell the caller
+				// whether a file id they cannot reach exists.
+				cloudillo_core::file_access::FileAccessError::NotFound
+				| cloudillo_core::file_access::FileAccessError::AccessDenied => {
+					warn!(
+						"Rejecting action by {}: attachment {} not reachable",
+						auth.id_tag, file_id
+					);
+					Error::PermissionDenied
+				}
+				// A database fault is not a denial and must not be logged as one.
+				cloudillo_core::file_access::FileAccessError::InternalError(msg) => {
+					Error::Internal(msg)
+				}
+			})?;
+		}
+	}
+
+	// Community INVT authorization. The `on_create` hook cannot do this: `HookContext` carries
+	// no acting user, and pre-store is the only place a denial prevents the row at all — the
+	// hook runs after `finalize_action` set status 'A', and `continue_processing: false` does
+	// not roll back. An INVT aimed at a *remote* community passes through untouched; that
+	// community gates it on its own side in `check_inbound`.
+	crate::native_hooks::invt::check_community_authority(
+		&app,
+		tn_id,
+		&id_tag,
+		(action.typ.as_ref(), action.sub_typ.as_deref()),
+		action.subject.as_deref(),
+		action.audience_tag.as_deref(),
+		&auth.id_tag,
+	)
+	.await?;
+
+	// Issued as the tenant, posted by `auth.id_tag` — on a community tenant those differ, and the
+	// attachment visibility upgrade needs the member, not the community.
+	let action_id = task::create_action_as(&app, tn_id, &id_tag, &auth.id_tag, action).await?;
 	debug!("actionId {:?}", &action_id);
 
 	let list = app
@@ -325,6 +402,21 @@ pub struct Inbox {
 	token: String,
 	related: Option<Vec<String>>,
 }
+
+/// Hard cap on the `related` bundle `/api/inbox` accepts.
+///
+/// `/api/inbox` is unauthenticated, and every stored related token that is not the primary's
+/// declared subject now takes the fully-checked path in `process_related_actions`, which can
+/// cost one outbound key fetch per distinct issuer. Without a cap a single accepted request
+/// buys an attacker as many outbound requests as fits in the 1 MiB body limit.
+///
+/// `build_outbox_item` is the only producer in this tree and emits at most four (STAT,
+/// subject token, subject STAT, bridged primary), so this is 2x the real ceiling. Raise it
+/// only alongside a producer that actually needs more — the cost of a generous cap is paid
+/// in outbound key fetches on an unauthenticated route.
+/// Shared with `history_sync.rs`, which pre-stores the identical bundle from a peer-controlled
+/// outbox response and must bound the same cost.
+pub(crate) const MAX_RELATED_TOKENS: usize = 8;
 
 #[axum::debug_handler]
 pub async fn post_inbox(
@@ -358,6 +450,16 @@ pub async fn post_inbox(
 	// Related actions are stored with ack_token pointing to the main action
 	// They will be processed AFTER the main action (APRV) is verified
 	if let Some(related_tokens) = inbox.related {
+		// Reject the whole request rather than truncating: a truncated bundle would leave
+		// the APRV referencing tokens that were never stored.
+		if related_tokens.len() > MAX_RELATED_TOKENS {
+			warn!(
+				count = related_tokens.len(),
+				client = %addr.ip(),
+				"inbox: related token bundle over cap, rejecting"
+			);
+			return Err(Error::ValidationError("Too many related tokens".into()));
+		}
 		for related_token in related_tokens {
 			let related_id = hash("a", related_token.as_bytes());
 			debug!(
@@ -492,16 +594,13 @@ pub async fn post_action_accept(
 	// Fetch the action from database
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
-	// Verify the caller is the action's audience (or the tenant owner).
-	// When the action has no audience (broadcast actions like FLLW/SUBS), only
-	// the tenant owner may accept/reject — otherwise any authenticated user
-	// could resolve actions targeted at the tenant.
-	let caller_is_audience = action
-		.audience
-		.as_ref()
-		.is_some_and(|aud| aud.id_tag.as_ref() == auth.id_tag.as_ref());
-	let caller_is_tenant = id_tag.as_ref() == auth.id_tag.as_ref();
-	if !caller_is_audience && !caller_is_tenant {
+	// Applicability: is this action resolvable in this tenant's inbox at all? A denial (403),
+	// not a 400 — "malformed" would leak whether the row is addressed here.
+	if !crate::native_hooks::ownership::accept_applicable(&action, &id_tag, &auth.id_tag) {
+		return Err(Error::PermissionDenied);
+	}
+	// Authority: a moderator of the tenant, or the profile the action is addressed to.
+	if !crate::native_hooks::ownership::accept_authority(&action, &auth.id_tag, &auth.roles) {
 		return Err(Error::PermissionDenied);
 	}
 
@@ -556,7 +655,7 @@ pub async fn post_action_accept(
 
 	// If action type is approvable, create APRV action to signal approval to the issuer
 	let is_approvable = dsl
-		.get_definition(&action.typ)
+		.definition_for(&action.typ, action.sub_typ.as_deref())
 		.is_some_and(|d| d.behavior.approvable.unwrap_or(false));
 
 	if is_approvable {
@@ -617,16 +716,13 @@ pub async fn post_action_reject(
 	// Fetch the action from database
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
-	// Verify the caller is the action's audience (or the tenant owner).
-	// When the action has no audience (broadcast actions like FLLW/SUBS), only
-	// the tenant owner may accept/reject — otherwise any authenticated user
-	// could resolve actions targeted at the tenant.
-	let caller_is_audience = action
-		.audience
-		.as_ref()
-		.is_some_and(|aud| aud.id_tag.as_ref() == auth.id_tag.as_ref());
-	let caller_is_tenant = id_tag.as_ref() == auth.id_tag.as_ref();
-	if !caller_is_audience && !caller_is_tenant {
+	// Applicability: is this action resolvable in this tenant's inbox at all? A denial (403),
+	// not a 400 — "malformed" would leak whether the row is addressed here.
+	if !crate::native_hooks::ownership::accept_applicable(&action, &id_tag, &auth.id_tag) {
+		return Err(Error::PermissionDenied);
+	}
+	// Authority: a moderator of the tenant, or the profile the action is addressed to.
+	if !crate::native_hooks::ownership::accept_authority(&action, &auth.id_tag, &auth.roles) {
 		return Err(Error::PermissionDenied);
 	}
 
@@ -840,7 +936,7 @@ pub async fn publish_draft(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	IdTag(_id_tag): IdTag,
+	IdTag(id_tag): IdTag,
 	Path(action_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<PublishDraftRequest>,
@@ -897,8 +993,16 @@ pub async fn publish_draft(
 		app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
 		cloudillo_core::search_index_action(&app, tn_id, &action_id);
 
-		let publish_task =
-			task::DraftPublishTask::new(tn_id, auth.id_tag.clone(), a_id, draft_action, publish_at);
+		// Tenant as issuer, `auth.id_tag` as actor — the same split `post_action` makes, so a
+		// draft publishes with exactly the authority a direct post would have had.
+		let publish_task = task::DraftPublishTask::new(
+			tn_id,
+			id_tag.as_ref().into(),
+			auth.id_tag.clone(),
+			a_id,
+			draft_action,
+			publish_at,
+		);
 		app.scheduler
 			.task(publish_task)
 			.key(format!("draft:{},{}", tn_id, a_id))
@@ -918,8 +1022,13 @@ pub async fn publish_draft(
 
 		let file_deps =
 			task::collect_file_deps(&app, tn_id, draft_action.attachments.as_ref()).await?;
-		let creator_task =
-			task::ActionCreatorTask::new(tn_id, auth.id_tag.clone(), a_id, draft_action);
+		let creator_task = task::ActionCreatorTask::new(
+			tn_id,
+			id_tag.as_ref().into(),
+			auth.id_tag.clone(),
+			a_id,
+			draft_action,
+		);
 		app.scheduler
 			.task(creator_task)
 			.key(format!("{},{}", tn_id, a_id))
@@ -1036,7 +1145,8 @@ pub struct OutboxResponse {
 /// Today this yields `POST` and `REPOST`; future broadcast user-content types
 /// added to a DSL definition automatically extend history sync.
 fn derive_primary_types(dsl: &DslEngine) -> Vec<String> {
-	dsl.list_action_types()
+	let mut types: Vec<String> = dsl
+		.list_action_types()
 		.into_iter()
 		.filter(|t| {
 			let Some(b) = dsl.get_behavior(t) else {
@@ -1047,7 +1157,17 @@ fn derive_primary_types(dsl: &DslEngine) -> Vec<String> {
 			let is_aux = HISTORY_SYNC_AUXILIARY_TYPES.contains(&t.as_str());
 			broadcast && !local_only && !is_aux
 		})
-		.collect()
+		// `list_action_types` returns definition *keys*, which include combined
+		// `"TYPE:SUBTYPE"` entries (`POST:LDOC`). This list becomes `ListActionOptions::typ`
+		// → `a.type IN (…)`, and `actions.type` stores the base type with the subtype in
+		// `sub_type` — so a combined key matches nothing. Harmless for `POST:LDOC` (the plain
+		// `POST` key covers it) but a subtype-only definition would silently select zero.
+		// `unwrap_or` is an `Option` fallback, not `.unwrap()`: `split` always yields one item.
+		.map(|t| t.split(':').next().unwrap_or(&t).to_string())
+		.collect();
+	types.sort_unstable();
+	types.dedup();
+	types
 }
 
 /// Read the configured per-fetch item cap for history sync, falling back to the default.

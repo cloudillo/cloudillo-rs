@@ -13,7 +13,7 @@
 //! scheduler path that serves deep `'D'` document parts.
 //!
 //! Only the text is decided here. `MetaAdapter::replace_search_row` derives the
-//! ACL columns (`content_type`, `owner_tag`, `visibility`, `root_id`,
+//! ACL columns (`content_type`, `upstream_tag`, `visibility`, `root_id`,
 //! `created_at`) from the source row in the same statement that writes the index
 //! row, so the index and its source cannot disagree about who may see a hit.
 //!

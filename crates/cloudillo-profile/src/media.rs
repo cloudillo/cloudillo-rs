@@ -195,7 +195,7 @@ async fn put_tenant_image(
 			meta_adapter::CreateFile {
 				preset: Some(kind.preset_name().into()),
 				parent_id: Some(meta_adapter::MANAGED_PARENT_ID.into()),
-				creator_tag: Some(auth.id_tag.as_ref().into()),
+				owner_tag: Some(auth.id_tag.as_ref().into()),
 				content_type: content_type.into(),
 				file_name: kind.file_name(&auth.id_tag).into(),
 				file_tp: Some("BLOB".into()),

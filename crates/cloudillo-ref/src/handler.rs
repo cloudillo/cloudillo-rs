@@ -29,6 +29,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
+use cloudillo_core::abac::require_tenant_self;
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
 use cloudillo_core::share_access::{
 	ShareStanding, ensure_grant_within, ensure_standing, require_share_manager, share_standing,
@@ -128,25 +129,6 @@ fn require_admin(auth: &AuthCtx, what: &str) -> ClResult<()> {
 			roles = ?auth.roles,
 			operation = %what,
 			"Ref operation denied - SADM role required"
-		);
-		Err(Error::PermissionDenied)
-	}
-}
-
-/// Require that the caller IS the tenant account (or SADM, which outranks it).
-///
-/// Deliberately stronger than a leader check: on a community tenant `leader` is held by ordinary
-/// member profiles, who are not the account. Holding a `password` / `welcome` / `idp.activation`
-/// refId is power over the account, so leader standing must not reach them.
-fn require_tenant_self(auth: &AuthCtx, tenant_id_tag: &str, what: &str) -> ClResult<()> {
-	if auth.id_tag.as_ref() == tenant_id_tag || cloudillo_core::abac::is_admin(auth) {
-		Ok(())
-	} else {
-		warn!(
-			subject = %auth.id_tag,
-			roles = ?auth.roles,
-			operation = %what,
-			"Ref operation denied - the tenant account itself is required"
 		);
 		Err(Error::PermissionDenied)
 	}
@@ -894,14 +876,17 @@ mod tests {
 		// `reject_scoped` runs BEFORE every gate in every handler, so the scope wins.
 		let scoped_admin = auth(&["SADM"], Some("file:f1:W"));
 		assert!(denied(&reject_scoped(&scoped_admin)));
-		// The ordering is what matters: the gates alone would have let this through.
+		// The ordering is what matters: the role gate alone would have let this through.
+		// (`require_tenant_self` refuses delegated tokens on its own — it also guards
+		// `/api/auth/api-keys` and passkey enrollment, which have no `reject_scoped` —
+		// so it is not the one demonstrating the ordering here.)
 		assert!(require_admin(&scoped_admin, "test").is_ok());
-		assert!(require_tenant_self(&scoped_admin, TENANT, "test").is_ok());
+		assert!(denied(&require_tenant_self(&scoped_admin, TENANT, "test")));
 		// Same for a scoped token that IS the tenant account: an API-key capability scope on the
 		// account's own token still may not touch refs.
-		let scoped_tenant = auth_as(TENANT, &[], Some("carddav:*"));
+		let scoped_tenant = auth_as(TENANT, &["leader"], Some("carddav:*"));
 		assert!(denied(&reject_scoped(&scoped_tenant)));
-		assert!(require_tenant_self(&scoped_tenant, TENANT, "test").is_ok());
+		assert!(denied(&require_tenant_self(&scoped_tenant, TENANT, "test")));
 	}
 
 	#[test]
@@ -915,15 +900,18 @@ mod tests {
 
 	#[test]
 	fn tenant_self_gate_accepts_the_account_and_sadm() {
-		// The account itself, identified by Host header == token subject.
-		assert!(require_tenant_self(&auth_as(TENANT, &[], None), TENANT, "test").is_ok());
+		// The account itself: Host header == token subject, carrying the owner role set.
+		assert!(require_tenant_self(&auth_as(TENANT, &["leader"], None), TENANT, "test").is_ok());
 		// SADM outranks it, so the base tenant keeps its reach over other tenants' refs.
 		assert!(require_tenant_self(&auth_as(MEMBER, &["SADM"], None), TENANT, "test").is_ok());
 		// A bare member of the community is not the community.
 		assert!(denied(&require_tenant_self(&auth_as(MEMBER, &[], None), TENANT, "test")));
+		// A role-less principal on the tenant's own host is not the account either — that is
+		// the shape of an `idp_` management key.
+		assert!(denied(&require_tenant_self(&auth_as(TENANT, &[], None), TENANT, "test")));
 		// Exact match only — no suffix or prefix relationship counts.
 		assert!(denied(&require_tenant_self(
-			&auth_as("sub.community.example.com", &[], None),
+			&auth_as("sub.community.example.com", &["leader"], None),
 			TENANT,
 			"test"
 		)));

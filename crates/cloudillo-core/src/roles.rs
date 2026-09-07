@@ -29,6 +29,12 @@ pub fn is_leader(roles: &[Box<str>]) -> bool {
 	highest_role_level(roles) >= LEADER_LEVEL
 }
 
+/// True iff `roles` reaches the `moderator` level — the bar for moderating the tenant's
+/// own inbox (accepting / rejecting actions addressed to it).
+pub fn is_moderator(roles: &[Box<str>]) -> bool {
+	highest_role_level(roles) >= MODERATOR_LEVEL
+}
+
 /// Lowest hierarchy level permitted to manage (remove / re-role) other members.
 pub const MODERATOR_LEVEL: usize = 4;
 /// Hierarchy level of the "leader" role.

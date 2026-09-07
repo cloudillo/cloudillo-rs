@@ -105,14 +105,33 @@ pub(crate) fn can_access_identity(identity: &Identity, requester_id_tag: &str) -
 	)
 }
 
-/// True iff the caller is an admin of this IDP domain: the literal domain
-/// owner (id_tag == idp_domain) or a community leader (role "leader").
+/// True iff the caller may administer this IDP domain: the literal domain owner
+/// (`id_tag == idp_domain`), a `leader`, or a site admin (`SADM`).
+///
+/// `leader` means leader **of the tenant the request is addressed to** — `auth.roles` are
+/// resolved per tenant against the `TnId` the request runs under, which the `IdTag`/`TnId`
+/// extractors take from the `Host` header (`cloudillo_auth::handler::reread_roles` →
+/// `read_profile_roles(tn_id, ..)`). On `/api/idp/**`, served on the IDP host, that tenant is
+/// the IDP tenant, so `leader` here is the operator's delegate. On a personal tenant the owner
+/// is `leader` of themselves, so this disjunct is not by itself a boundary.
+///
+/// The boundary is [`check_idp_enabled`]: `idp.enabled` is registered at
+/// `PermissionLevel::Admin` (`crate::settings`), which resolves to SADM-only
+/// (`cloudillo-core/src/settings/types.rs`), so only a tenant a site admin explicitly turned
+/// into an IDP host reaches this predicate. That is expected to be an operator/personal
+/// tenant, where `leader` and the account coincide — and delegating IDP administration to a
+/// leader is the point of the role.
+///
+/// Residual: on a *community* tenant with `idp.enabled`, `leader` is held by ordinary member
+/// profiles — the same hazard `cloudillo_core::abac::require_tenant_self` exists for. A
+/// community IDP host would need this predicate tightened alongside it.
 ///
 /// Mirrors the frontend gate `isOwner || roles.includes('leader')` in
-/// shell/src/idp/identities.tsx so leaders see/manage the identities the
-/// management UI already shows them controls for.
+/// `shell/src/idp/identities.tsx`.
 pub(crate) fn is_idp_admin(auth_id_tag: &str, auth_roles: &[Box<str>], idp_domain: &str) -> bool {
-	auth_id_tag == idp_domain || cloudillo_core::roles::is_leader(auth_roles)
+	auth_id_tag == idp_domain
+		|| cloudillo_core::roles::is_leader(auth_roles)
+		|| auth_roles.iter().any(|r| r.as_ref() == "SADM")
 }
 
 /// Response structure for identity details
@@ -337,13 +356,12 @@ pub async fn list_identities(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
 
-	// Authorization: the IDP-domain owner (i.e. the tenant whose id_tag equals
-	// the IDP domain) is the super-admin and may list everything. Any other
-	// authenticated caller is scoped to identities they registered themselves —
-	// otherwise an authenticated user from an unrelated tenant could enumerate
-	// every identity hosted at this IDP.
-	let is_idp_owner = is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref());
-	let registrar_filter = if is_idp_owner {
+	// Authorization: an IDP admin — the domain owner, a `leader` of the IDP tenant, or a
+	// site admin — may list everything. Any other authenticated caller is scoped to
+	// identities they registered themselves — otherwise an authenticated user from an
+	// unrelated tenant could enumerate every identity hosted at this IDP.
+	let is_admin = is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref());
+	let registrar_filter = if is_admin {
 		query_params.registrar_id_tag.clone()
 	} else {
 		Some(auth.id_tag.to_string())
@@ -1400,10 +1418,24 @@ mod tests {
 
 	#[test]
 	fn leader_with_nonmatching_id_tag_is_admin() {
-		// The reported bug: a community leader whose id_tag is NOT the IDP
-		// domain must still be treated as an admin (unfiltered listing).
+		// A community leader whose id_tag is NOT the IDP domain must still be treated as an
+		// admin. `auth.roles` are resolved per tenant (`reread_roles` →
+		// `read_profile_roles(tn_id, ..)`), so on an IDP request `leader` means leader OF THE
+		// IDP TENANT — the operator's delegate.
 		let r = roles(&["leader"]);
 		assert!(is_idp_admin("alice.example.com", &r, "cloudillo.net"));
+	}
+
+	#[test]
+	fn site_admin_is_admin() {
+		assert!(is_idp_admin("alice.example.com", &roles(&["SADM"]), "cloudillo.net"));
+	}
+
+	#[test]
+	fn plain_member_is_not_admin() {
+		for role_set in [roles(&[]), roles(&["contributor"]), roles(&["moderator"])] {
+			assert!(!is_idp_admin("alice.example.com", &role_set, "cloudillo.net"));
+		}
 	}
 
 	#[test]

@@ -39,12 +39,12 @@ use cloudillo_types::{
 		FileVariant, FileView, FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
 		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
 		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
-		ProfileData, PublicProfileRow, PublishSiteDoc, PushSubscription, PushSubscriptionData,
-		RefData, SearchObject, SearchOptions, SearchPart, SearchRow, ShareEntry, Site, SiteDoc,
-		SpaceReport, Task, TaskPatch, Tenant, TenantListMeta, UpdateActionDataOptions,
-		UpdateAddressBookData, UpdateCalendarData, UpdateFileOptions, UpdateRefOptions,
-		UpdateShareEntryOptions, UpdateTenantData, UpsertDocFormat, UpsertProfileFields,
-		UpsertResult, UpsertSite,
+		ProfileData, ProfileRelation, PublicProfileRow, PublishSiteDoc, PushSubscription,
+		PushSubscriptionData, RefData, SearchObject, SearchOptions, SearchPart, SearchRow,
+		ShareEntry, Site, SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
+		UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData, UpdateFileOptions,
+		UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData, UpsertDocFormat,
+		UpsertProfileFields, UpsertResult, UpsertSite,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -148,7 +148,7 @@ impl MetaAdapter for MetaAdapterSqlite {
 		&self,
 		tn_id: TnId,
 		target_id_tags: &[&str],
-	) -> ClResult<std::collections::HashMap<String, (bool, bool)>> {
+	) -> ClResult<std::collections::HashMap<String, ProfileRelation>> {
 		profile::get_relationships(&self.dbr, tn_id, target_id_tags).await
 	}
 
@@ -317,6 +317,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		aprv_action_id: &str,
 	) -> ClResult<Vec<(Box<str>, Box<str>)>> {
 		action::get_related_tokens(&self.dbr, tn_id, aprv_action_id).await
+	}
+
+	async fn cleanup_orphaned_action_tokens(&self, before: Timestamp) -> ClResult<u64> {
+		action::cleanup_orphaned_tokens(&self.db, before).await
 	}
 
 	// File management
@@ -496,6 +500,37 @@ impl MetaAdapter for MetaAdapterSqlite {
 		value: Option<serde_json::Value>,
 	) -> ClResult<()> {
 		setting::update(&self.db, tn_id, name, value).await
+	}
+
+	// Profile Settings Management
+	//****************************
+
+	async fn list_profile_settings(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		prefix: Option<&[String]>,
+	) -> ClResult<std::collections::HashMap<String, serde_json::Value>> {
+		setting::list_profile(&self.dbr, tn_id, id_tag, prefix).await
+	}
+
+	async fn read_profile_setting(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		name: &str,
+	) -> ClResult<Option<serde_json::Value>> {
+		setting::read_profile(&self.dbr, tn_id, id_tag, name).await
+	}
+
+	async fn update_profile_setting(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		name: &str,
+		value: Option<serde_json::Value>,
+	) -> ClResult<()> {
+		setting::update_profile(&self.db, tn_id, id_tag, name, value).await
 	}
 
 	// Reference / Bookmark Management

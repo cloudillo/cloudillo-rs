@@ -66,7 +66,7 @@ async fn get_db_version(tx: &mut Transaction<'_, Sqlite>) -> i64 {
 
 /// Column list shared by every `search_docs` writer below.
 pub(crate) const SEARCH_COLS: &str = "(tn_id, obj_tp, obj_id, part_id, part_kind, title, body, \
-	 tags, content_type, owner_tag, visibility, root_id, created_at, updated_at, fts_cl, obj_hash)";
+	 tags, content_type, upstream_tag, visibility, root_id, created_at, updated_at, fts_cl, obj_hash)";
 
 /// The `DO UPDATE` clause shared by every upsert below. `part_id` is always `''`
 /// for whole-object rows, so `idx_search_docs_key` makes `(tn_id, obj_tp,
@@ -74,7 +74,7 @@ pub(crate) const SEARCH_COLS: &str = "(tn_id, obj_tp, obj_id, part_id, part_kind
 pub(crate) const SEARCH_UPSERT: &str = "ON CONFLICT(tn_id, obj_tp, obj_id, part_id) DO UPDATE SET \
 	 part_kind = excluded.part_kind, title = excluded.title, body = excluded.body, \
 	 tags = excluded.tags, content_type = excluded.content_type, \
-	 owner_tag = excluded.owner_tag, visibility = excluded.visibility, \
+	 upstream_tag = excluded.upstream_tag, visibility = excluded.visibility, \
 	 root_id = excluded.root_id, created_at = excluded.created_at, \
 	 updated_at = excluded.updated_at, fts_cl = excluded.fts_cl, \
 	 obj_hash = excluded.obj_hash";
@@ -135,7 +135,7 @@ const SEARCH_FTS_TRIGGERS: [&str; 3] = [
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 48;
+	const CURRENT_DB_VERSION: i64 = 53;
 
 	let mut tx = db.begin().await?;
 
@@ -200,6 +200,23 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id, name)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// Per-profile settings. Unlike `settings` (tenant-wide, admin-only) each row is owned by
+	// the profile named in `id_tag` — the first entity here whose owner is a member rather
+	// than the tenant.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS profile_settings (
+			tn_id integer NOT NULL,
+			id_tag text NOT NULL,
+			name text NOT NULL,
+			value text,
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			PRIMARY KEY(tn_id, id_tag, name)
 		)",
 	)
 	.execute(&mut *tx)
@@ -275,8 +292,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			file_id text,
 			file_tp char(4),			-- 'BLOB', 'CRDT', 'RTDB' file type (storage type)
 			status char(1),				-- 'A' - Active, 'P' - Pending, 'D' - Deleted
-			owner_tag text,				-- Set only for files owned by someone OTHER than the tenant (e.g., shared files)
-			creator_tag text,			-- The user who actually created the file
+			upstream_tag text,			-- Where the canonical copy lives; NULL => the file originates here
+			owner_tag text,				-- The profile with owner authority; NULL => the tenant
 			preset text,
 			content_type text,
 			file_name text,
@@ -457,6 +474,30 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(action_id, tn_id)
 		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	// `created_at`/`updated_at` entered the descriptor above in the same commit that introduced
+	// `db_version`, with no accompanying `ALTER TABLE` — and `CREATE TABLE IF NOT EXISTS` cannot
+	// add a column to a table that already exists, so databases carried over from the
+	// TypeScript-era schema still lack `created_at`. The index below reads it.
+	//
+	// Here and not in a versioned migration, for the reason already spelled out for
+	// `sites`/`site_docs` further down: the descriptor block runs unconditionally and *before*
+	// every migration, so this is the only placement where the column is guaranteed present by
+	// the time the index is created.
+	//
+	// No `DEFAULT (unixepoch())`: SQLite rejects a non-constant default on `ADD COLUMN` once the
+	// table has rows. The three writers in `action.rs` stamp it explicitly instead.
+	add_column_if_missing(&mut tx, "action_tokens", "created_at", "INTEGER").await?;
+	sqlx::query("UPDATE action_tokens SET created_at = unixepoch() WHERE created_at IS NULL")
+		.execute(&mut *tx)
+		.await?;
+	// Backs `action::cleanup_orphaned_tokens`' daily sweep. Partial: only bundled rows whose
+	// primary never verified are ever eligible, and they are a small minority of the table.
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_action_tokens_orphan \
+		 ON action_tokens(created_at) WHERE ack IS NOT NULL",
 	)
 	.execute(&mut *tx)
 	.await?;
@@ -881,7 +922,10 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			body text,
 			tags text,
 			content_type text,
-			owner_tag text,
+			-- Where the indexed object comes from, mirroring `files.upstream_tag` for
+			-- a 'F'/'D' row (`p.id_tag` for 'P', `a.issuer_tag` for 'A'). Named to match
+			-- `files`: it is *not* the profile with owner authority.
+			upstream_tag text,
 			visibility char(1),
 			root_id text,
 			created_at INTEGER,
@@ -2403,6 +2447,100 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// ALTER. Older rows keep a NULL, which `rollback_doc` reads as "no path to restore".
 		add_column_if_missing(&mut tx, "site_docs", "previous_mount_path", "text").await?;
 		set_db_version(&mut tx, 48).await;
+	}
+
+	if version < 52 {
+		// Ownership model cleanup: the two owner-ish columns held the inverse of what their
+		// names said. `owner_tag` carried the *upstream* node (set only on cross-context
+		// rows) and `creator_tag` carried the profile with owner authority. Migration 9
+		// already put the right values in the right columns, so this is a pure rename —
+		// no data movement. The order matters: the second rename's target collides with the
+		// first's source, so `owner_tag` must vacate the name before `creator_tag` takes it.
+		//
+		// Guarded: unlike an additive ALTER, a RENAME is not replayable. A database whose
+		// `db_version` was rewound over an already-renamed schema would otherwise hit
+		// `duplicate column name: upstream_tag`.
+		let renamed: i64 = sqlx::query_scalar(
+			"SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'upstream_tag'",
+		)
+		.fetch_one(&mut *tx)
+		.await?;
+		if renamed == 0 {
+			sqlx::query("ALTER TABLE files RENAME COLUMN owner_tag TO upstream_tag")
+				.execute(&mut *tx)
+				.await?;
+			sqlx::query("ALTER TABLE files RENAME COLUMN creator_tag TO owner_tag")
+				.execute(&mut *tx)
+				.await?;
+		}
+
+		// `profile_settings` needs nothing here: it is a brand-new table, so the
+		// unconditional `IF NOT EXISTS` descriptor block above already created it for
+		// existing databases too.
+
+		// `helpers::get_subscription_role` no longer falls back to `content.role` — that is
+		// the action token's issuer-signed `c` claim, so a remote subscriber could name its
+		// own role. Rows written before `x.role` existed carry the role only in `content`,
+		// and without this backfill their holders silently drop to `Member`, losing
+		// CONV:UPD, SUBS:DEL and INVT on conversations they administer.
+		//
+		// Self-issued rows only (`issuer_tag` == the tenant's own id_tag). That is exactly
+		// the boundary the removal exists to draw: a *federated* SUBS's `content.role` was
+		// written by the very party whose role it decides, and inbound processing strips
+		// `x` (`process.rs`), so those rows must stay at the `Member` default. The CONV
+		// creator's auto-SUBS (`native_hooks/conv.rs`) and the INVT-accept SUBS
+		// (`native_hooks/invt.rs`) are both locally issued and so are reached.
+		//
+		// `json_valid` guards both extracts: `json_extract` raises on malformed JSON, which
+		// would abort the whole migration transaction over one bad row.
+		// A present `x.role` always wins — this only fills a missing one.
+		sqlx::query(
+			"UPDATE actions SET x = json_set(COALESCE(x, '{}'), '$.role', \
+			   json_extract(content, '$.role')) \
+			 WHERE type = 'SUBS' \
+			   AND content IS NOT NULL AND json_valid(content) \
+			   AND json_extract(content, '$.role') IN \
+			       ('observer', 'member', 'moderator', 'admin') \
+			   AND (x IS NULL OR json_valid(x)) \
+			   AND json_extract(COALESCE(x, '{}'), '$.role') IS NULL \
+			   AND lower(issuer_tag) = (SELECT lower(t.id_tag) FROM tenants t \
+			                            WHERE t.tn_id = actions.tn_id)",
+		)
+		.execute(&mut *tx)
+		.await?;
+
+		// Belt and braces: `profile_settings_insert_at` exists nowhere in this tree, but a dev
+		// database from an intermediate working state may still carry it. It only rewrote
+		// `updated_at` to the value the column default had just set, and never fired on the
+		// upsert path at all — SQLite runs UPDATE triggers, not INSERT triggers, for
+		// `ON CONFLICT ... DO UPDATE`, which is how `setting::update_profile` writes.
+		sqlx::query("DROP TRIGGER IF EXISTS profile_settings_insert_at")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 52).await;
+	}
+
+	if version < 53 {
+		// `search_docs.owner_tag` never held an owner. The indexer fills it from the raw
+		// `files.upstream_tag` (and from `p.id_tag` / `a.issuer_tag` for the other object
+		// types), so after migration 52 renamed the `files` columns the search column was the
+		// one carrying the *old* meaning of the name — `/api/search`'s `ownerTag` and
+		// `/api/files`' `owner` would have named two different profiles for the same row.
+		//
+		// Guarded the same way as 52's rename: a RENAME is not replayable, so a database
+		// whose `db_version` was rewound over an already-renamed schema must not hit
+		// `duplicate column name`.
+		let renamed: i64 = sqlx::query_scalar(
+			"SELECT COUNT(*) FROM pragma_table_info('search_docs') WHERE name = 'upstream_tag'",
+		)
+		.fetch_one(&mut *tx)
+		.await?;
+		if renamed == 0 {
+			sqlx::query("ALTER TABLE search_docs RENAME COLUMN owner_tag TO upstream_tag")
+				.execute(&mut *tx)
+				.await?;
+		}
+		set_db_version(&mut tx, 53).await;
 	}
 
 	tx.commit().await?;

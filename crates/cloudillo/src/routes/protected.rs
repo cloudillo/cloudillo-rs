@@ -57,7 +57,9 @@ use crate::file::perm::check_perm_file;
 use crate::prelude::*;
 use cloudillo_action::perm::check_perm_action;
 use cloudillo_core::create_perm::check_perm_create;
-use cloudillo_core::middleware::{require_auth, require_auth_public_data, require_leader};
+use cloudillo_core::middleware::{
+	require_auth, require_auth_public_data, require_leader, require_tenant_self,
+};
 use cloudillo_core::rate_limit::RateLimitLayer;
 use cloudillo_profile::perm::check_perm_profile;
 
@@ -82,10 +84,17 @@ pub(super) fn init(app: App) -> Router<App> {
 	Router::new()
 		// Auth only — handler self-enforces ownership
 		.merge(tables::auth::session())
+		// The account's *own* credentials. An auth API key authenticates as the tenant
+		// (full owner roles, whatever created it) and a passkey is a login credential for
+		// it, so `leader` is not the right gate — on a community tenant ordinary members
+		// hold `leader`. Same rule the ref subsystem already applies to `password` /
+		// `welcome` refIds.
+		.merge(
+			tables::auth::owner_credentials().layer(middleware::from_fn(require_tenant_self)),
+		)
 		// One `require_leader` gate over every tenant-owned resource
 		.merge(
-			tables::auth::owner_credentials()
-				.merge(tables::pim::contacts())
+			tables::pim::contacts()
 				.merge(tables::pim::calendars())
 				.merge(tables::misc::push_subscriptions())
 				.merge(tables::search::reindex())
@@ -125,6 +134,9 @@ pub(super) fn init(app: App) -> Router<App> {
 		)
 		// Auth only — handler self-enforces ownership
 		.merge(tables::action::reader_state())
+		// Auth only — `accept_applicable` + `accept_authority` in the handlers. The ABAC
+		// tier cannot express "moderator of this tenant", which is the whole point here.
+		.merge(tables::action::moderate())
 		.merge(tables::file::create().layer(middleware::from_fn_with_state(
 			app.clone(),
 			check_perm_create("file", "create"),

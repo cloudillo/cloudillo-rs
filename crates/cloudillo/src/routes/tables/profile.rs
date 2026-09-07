@@ -9,22 +9,24 @@
 //!
 //! ## Method matrix
 //!
-//! | Path | GET | POST | PUT | PATCH |
-//! |---|---|---|---|---|
-//! | `/api/me`                              | `public_discovery()` ᴳ | | | `own()` ᴱ |
-//! | `/api/me/full`                         | `recovery_public()` ᴳ | | | |
-//! | `/api/me/app-domain`                   | `public_discovery()` ᴳ | | | |
-//! | `/api/me/image`                        | | | `own()` ᴱ ᴮ | |
-//! | `/api/me/cover`                        | | | `own()` ᴱ ᴮ | |
-//! | `/api/profiles`                        | `own()` ᴱ | | | |
-//! | `/api/profiles/batch`                  | `batch()` ᴾ | | | |
-//! | `/api/profiles/{id_tag}`               | `read()` ᶜ | | `own()` ᴱ | `write()` ᶜ |
-//! | `/api/profiles/{id_tag}/refresh`       | | `own()` ᴱ | | |
-//! | `/api/profiles/me/idp-status`          | `own()` ᴱ | | | |
-//! | `/api/profiles/me/resend-activation`   | | `own()` ᴱ | | |
-//! | `/api/profiles/register`               | | `registration()` ᴿ | | |
-//! | `/api/profiles/verify`                 | | `registration()` ᴿ | | |
-//! | `/api/admin/profiles/{id_tag}`         | | | | `admin()` ᶜ |
+//! | Path | GET | POST | PUT | PATCH | DELETE |
+//! |---|---|---|---|---|---|
+//! | `/api/me`                              | `public_discovery()` ᴳ | | | `own()` ᴱ | |
+//! | `/api/me/full`                         | `recovery_public()` ᴳ | | | | |
+//! | `/api/me/app-domain`                   | `public_discovery()` ᴳ | | | | |
+//! | `/api/me/image`                        | | | `own()` ᴱ ᴮ | | |
+//! | `/api/me/cover`                        | | | `own()` ᴱ ᴮ | | |
+//! | `/api/profiles`                        | `own()` ᴱ | | | | |
+//! | `/api/profiles/batch`                  | `batch()` ᴾ | | | | |
+//! | `/api/profiles/{id_tag}`               | `read()` ᶜ | | `own()` ᴱ | `write()` ᶜ | |
+//! | `/api/profiles/{id_tag}/refresh`       | | `own()` ᴱ | | | |
+//! | `/api/profiles/{id_tag}/settings`      | `own()` ᴱ | | | | |
+//! | `/api/profiles/{id_tag}/settings/{name}` | `own()` ᴱ | | `own()` ᴱ | | |
+//! | `/api/profiles/me/idp-status`          | `own()` ᴱ | | | | |
+//! | `/api/profiles/me/resend-activation`   | | `own()` ᴱ | | | |
+//! | `/api/profiles/register`               | | `registration()` ᴿ | | | |
+//! | `/api/profiles/verify`                 | | `registration()` ᴿ | | | |
+//! | `/api/admin/profiles/{id_tag}`         | | | | `admin()` ᶜ | |
 //!
 //! ᴳ public + rate-limited only, ᴿ public under the strict `"auth"` bucket,
 //! ᶜ auth + ABAC, ᴱ auth only — handler self-enforces, ᴾ **any valid token,
@@ -50,6 +52,7 @@ use axum::{
 
 use crate::prelude::*;
 use crate::routes::policy::upload_body_limit;
+use crate::settings;
 use cloudillo_profile::{community, handler, idp_status, list, media, register, update};
 
 /// Profile reads, gated by `check_perm_profile("read")`.
@@ -100,6 +103,11 @@ pub(crate) fn admin() -> Router<App> {
 ///   staleness/abandonment window. Auth-only: the handler checks the caller
 ///   already tracks `{id_tag}` before refreshing (mirrors the
 ///   `/api/files/{file_id}/refresh` precedent).
+/// - `/api/profiles/{id_tag}/settings**` are `{id_tag}`'s **own** preferences on this
+///   tenant — the first surface here owned by a member rather than the tenant. The
+///   handlers admit the profile itself and `SADM` only (leaders and moderators excluded)
+///   and refuse scoped tokens outright; see
+///   `cloudillo_core::settings::handler::may_access_profile_settings`.
 pub(crate) fn own() -> Router<App> {
 	Router::new()
 		.route("/api/me", patch(update::patch_own_profile))
@@ -114,6 +122,14 @@ pub(crate) fn own() -> Router<App> {
 		)
 		.route("/api/profiles/{id_tag}", put(community::put_community_profile))
 		.route("/api/profiles/{id_tag}/refresh", post(update::post_profile_refresh))
+		.route(
+			"/api/profiles/{id_tag}/settings",
+			get(settings::handler::list_profile_settings),
+		)
+		.route(
+			"/api/profiles/{id_tag}/settings/{name}",
+			get(settings::handler::get_profile_setting).put(settings::handler::put_profile_setting),
+		)
 }
 
 /// Profile creation. Attack surface: account enumeration, spam registration —

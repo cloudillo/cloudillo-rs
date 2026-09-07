@@ -76,7 +76,7 @@ fn object_hash(obj: &SearchObject<'_>, parts: &[SearchPart<'_>]) -> String {
 	field(Some(&obj.obj_tp.to_string()));
 	field(Some(obj.obj_id));
 	field(obj.content_type);
-	field(obj.owner_tag);
+	field(obj.upstream_tag);
 	field(obj.visibility.map(|c| c.to_string()).as_deref());
 	field(obj.root_id);
 	field(obj.created_at.map(|ts| ts.0.to_string()).as_deref());
@@ -298,7 +298,7 @@ pub async fn replace_object(
 		let mut query = QueryBuilder::<Sqlite>::new(
 			"INSERT INTO search_docs \
 			 (s_id, tn_id, obj_tp, obj_id, part_id, part_kind, parent_part, anchor_id, \
-			  title, body, tags, content_type, owner_tag, visibility, root_id, \
+			  title, body, tags, content_type, upstream_tag, visibility, root_id, \
 			  created_at, updated_at, fts_cl, obj_hash) ",
 		);
 		// `try_from` cannot fail — `i` is bounded by `INSERT_CHUNK` — but the
@@ -322,7 +322,7 @@ pub async fn replace_object(
 				})
 				.push_bind(part.tags)
 				.push_bind(obj.content_type)
-				.push_bind(obj.owner_tag)
+				.push_bind(obj.upstream_tag)
 				.push_bind(visibility.as_deref())
 				.push_bind(obj.root_id)
 				.push_bind(created_at)
@@ -450,7 +450,7 @@ pub async fn delete_deep_by_content_type(
 // (`cloudillo-search`'s `objects` module), because for actions it comes from a
 // manifest in the Action DSL and no SQL statement can read that.
 //
-// The ACL columns stay in SQL: `replace_row` derives `content_type`, `owner_tag`,
+// The ACL columns stay in SQL: `replace_row` derives `content_type`, `upstream_tag`,
 // `visibility`, `root_id` and `created_at` from the source row in the same
 // statement that writes the index row, so the index cannot disagree with its
 // source about who may see a hit — which is what `search()`'s visibility
@@ -750,7 +750,7 @@ async fn replace_parts(
 			let mut query = QueryBuilder::<Sqlite>::new(
 				"INSERT INTO search_docs \
 				 (s_id, tn_id, obj_tp, obj_id, part_id, part_kind, parent_part, anchor_id, \
-				  title, body, tags, content_type, owner_tag, visibility, root_id, \
+				  title, body, tags, content_type, upstream_tag, visibility, root_id, \
 				  created_at, updated_at, fts_cl, obj_hash) ",
 			);
 			// `try_from` cannot fail — `i` is bounded by `INSERT_CHUNK` — but the
@@ -773,7 +773,7 @@ async fn replace_parts(
 						bodies.get(i).and_then(|b| b.as_deref())
 					})
 					.push_bind(part.tags)
-					// content_type, owner_tag, visibility, root_id, created_at:
+					// content_type, upstream_tag, visibility, root_id, created_at:
 					// `refresh_file_acl` fills the first four from `files` and
 					// `fill_part_created_at` the fifth, both inside this
 					// transaction, so no caller value can reach them.
@@ -886,8 +886,9 @@ async fn refresh_file_acl(
 	tn_id: TnId,
 	file_id: &str,
 ) -> ClResult<()> {
+	// `search_docs.upstream_tag` mirrors `files.upstream_tag`.
 	sqlx::query(
-		"UPDATE search_docs SET visibility = f.visibility, owner_tag = f.owner_tag, \
+		"UPDATE search_docs SET visibility = f.visibility, upstream_tag = f.upstream_tag, \
 		   root_id = CASE WHEN search_docs.obj_tp = 'D' \
 		                  THEN COALESCE(f.root_id, f.file_id) ELSE f.root_id END, \
 		   content_type = f.content_type \
@@ -896,7 +897,7 @@ async fn refresh_file_acl(
 		   AND search_docs.tn_id = ? AND search_docs.obj_tp IN ('F','D') \
 		   AND search_docs.obj_id = ? \
 		   AND (search_docs.visibility IS NOT f.visibility \
-		     OR search_docs.owner_tag IS NOT f.owner_tag \
+		     OR search_docs.upstream_tag IS NOT f.upstream_tag \
 		     OR search_docs.root_id IS NOT (CASE WHEN search_docs.obj_tp = 'D' \
 		          THEN COALESCE(f.root_id, f.file_id) ELSE f.root_id END) \
 		     OR search_docs.content_type IS NOT f.content_type)",
@@ -922,7 +923,7 @@ const OBJ_DOC: char = 'D';
 ///
 /// The halves are matched to [`crate::schema::SEARCH_COLS`] by position alone, so
 /// they must be written in that column order: `part_kind`, then `content_type,
-/// owner_tag, visibility, root_id, created_at, updated_at`, sourced
+/// upstream_tag, visibility, root_id, created_at, updated_at`, sourced
 /// `FROM <table> WHERE tn_id = ? AND <id> = ?`.
 struct SourceRow {
 	part_kind: &'static str,
@@ -935,7 +936,7 @@ impl SourceRow {
 		Some(match obj_tp {
 			OBJ_FILE => Self {
 				part_kind: "NULL",
-				acl_cols: "f.content_type, f.owner_tag, f.visibility, f.root_id, f.created_at, \
+				acl_cols: "f.content_type, f.upstream_tag, f.visibility, f.root_id, f.created_at, \
 				           unixepoch()",
 				from_where: "FROM files f WHERE f.tn_id = ? AND f.file_id = ?",
 			},
@@ -1087,7 +1088,7 @@ pub async fn search(
 	let t = fts_table(opts);
 	let mut query = QueryBuilder::<Sqlite>::new(format!(
 		"SELECT d.s_id, d.obj_tp, d.obj_id, d.part_id, d.part_kind, d.parent_part, d.anchor_id, \
-		 d.title, d.tags, d.content_type, d.owner_tag, d.visibility, d.root_id, d.updated_at, \
+		 d.title, d.tags, d.content_type, d.upstream_tag, d.visibility, d.root_id, d.updated_at, \
 		 {snippet} AS snippet, \
 		 bm25({t}, 10.0, 1.0, 5.0, 0.0) AS score \
 		 FROM ",
@@ -1149,7 +1150,7 @@ pub async fn search(
 				title: row.get::<Option<String>, _>("title").map(Into::into),
 				tags: row.get::<Option<String>, _>("tags").map(Into::into),
 				content_type: row.get::<Option<String>, _>("content_type").map(Into::into),
-				owner_tag: row.get::<Option<String>, _>("owner_tag").map(Into::into),
+				upstream_tag: row.get::<Option<String>, _>("upstream_tag").map(Into::into),
 				visibility: row
 					.get::<Option<String>, _>("visibility")
 					.as_deref()

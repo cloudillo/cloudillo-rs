@@ -31,7 +31,7 @@ use crate::{
 	variant::{self, VariantClass},
 	video::VideoTranscoderTask,
 };
-use cloudillo_core::abac::relationship_level;
+use cloudillo_core::abac::{self, relationship_level};
 use cloudillo_core::dir_cache::{DirCache, DirEntry};
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
 use cloudillo_core::file_access;
@@ -516,12 +516,13 @@ pub async fn get_file_list(
 	}
 
 	// Push visibility filtering into SQL for correct pagination
-	let rels = app.meta_adapter.get_relationships(tn_id, &[subject_id_tag]).await?;
-	let (following, connected) = rels.get(subject_id_tag).copied().unwrap_or((false, false));
+	// `follower` ("they follow us"), not `following` ("we follow them") — the
+	// visibility ladder means the former.
+	let rel = abac::subject_relation_to_tenant(&app, tn_id, subject_id_tag).await?;
 	let is_real_auth = is_authenticated && !subject_id_tag.is_empty() && subject_id_tag != "guest";
 	let is_tenant = subject_id_tag == tenant_id_tag.as_ref();
 
-	let access_level = relationship_level(is_tenant, connected, following, is_real_auth);
+	let access_level = relationship_level(is_tenant, rel.connected, rel.follower, is_real_auth);
 	opts.visible_levels = access_level.visible_levels().map(<[char]>::to_vec);
 
 	if !is_tenant {
@@ -1509,7 +1510,7 @@ pub async fn post_file(
 				file_id: Some(file_id.clone().into()),
 				parent_id: req.effective_parent_id()?.map(Into::into),
 				root_id: req.root_id.map(Into::into),
-				creator_tag: Some(auth.id_tag.clone()),
+				owner_tag: Some(auth.id_tag.clone()),
 				content_type: content_type.into(),
 				file_name: req.file_name.clone().unwrap_or_else(|| "file".into()).into(),
 				file_tp: Some(req.file_tp.clone().into()),
@@ -1611,7 +1612,7 @@ async fn default_cross_context_visibility(
 /// Step 2 of the Hand flow; FSHR creation on the source is a prior, separate
 /// frontend call. Creates a new row in the destination tenant (`tn_id`) that
 /// references content owned by another tenant (`source_id_tag`). The
-/// destination row's `owner_tag` is the canonical source owner, never the
+/// destination row's `upstream_tag` is the canonical source, never the
 /// caller and never the destination.
 ///
 /// Source file metadata is fetched via the inter-node HTTP API; this handler
@@ -1636,21 +1637,35 @@ async fn post_file_cross_context(
 
 	// Cycle reject: source must be owned by source_id_tag itself, not be a
 	// cross-tenant placement of yet another tenant's file.
-	let source_owner = source_view.owner.as_ref().map_or(source_id_tag, |o| o.id_tag.as_ref());
-	if source_owner != source_id_tag {
+	//
+	// WIRE COMPATIBILITY — blind against a pre-rename peer. `FileView`'s JSON keys changed
+	// meaning: the old `owner` (the upstream node) is now `upstream`, and the old `creator`
+	// (the local record owner) is now `owner`. A peer on the old build therefore sends the
+	// upstream node under `owner`, `upstream` deserialises to `None`, and this check passes —
+	// so a pin of a pin is accepted during a mixed-version window.
+	//
+	// A serde `alias` cannot fix this: `owner` is a live key with a *different* meaning on
+	// both sides, and aliasing `creator` onto `owner` makes an old peer's payload (which
+	// carries both) fail outright with a duplicate-field error. A real shim needs an
+	// unambiguous version tell on the wire — an always-serialized `upstream` (present as
+	// `null`), or an explicit format marker — read by a custom `Deserialize`.
+	// Required before any node ships to a network running the old build.
+	let source_upstream =
+		source_view.upstream.as_ref().map_or(source_id_tag, |o| o.id_tag.as_ref());
+	if source_upstream != source_id_tag {
 		return Err(Error::FileCycleRejected);
 	}
 
 	// Idempotency check: if a row already exists for the same source file_id
-	// AND the existing row's owner matches the requested source AND the parent
+	// AND the existing row's upstream matches the requested source AND the parent
 	// matches, return 200 with the existing FileView (safe retry).
 	let parent_id_resolved = req.effective_parent_id()?;
 	if let Some(existing) = app.meta_adapter.read_file(tn_id, source_file_id).await? {
-		let existing_owner = existing.owner.as_ref().map(|o| o.id_tag.as_ref());
+		let existing_upstream = existing.upstream.as_ref().map(|o| o.id_tag.as_ref());
 		let existing_parent = existing.parent_id.as_deref();
 		let req_parent = parent_id_resolved.as_deref();
 
-		if existing_owner == Some(source_id_tag) && existing_parent == req_parent {
+		if existing_upstream == Some(source_id_tag) && existing_parent == req_parent {
 			info!("Idempotent cross-context create: returning existing row");
 			let view = app
 				.meta_adapter
@@ -1662,17 +1677,17 @@ async fn post_file_cross_context(
 			return Ok((StatusCode::OK, Json(response)));
 		}
 
-		// Same file_id but different owner: this row was created via a
+		// Same file_id but different upstream: this row was created via a
 		// different path (e.g. an inbound action attachment) and is not
 		// the same logical placement. Semantically a generic conflict.
-		if existing_owner != Some(source_id_tag) {
+		if existing_upstream != Some(source_id_tag) {
 			return Err(Error::Conflict(format!(
-				"file_id '{}' already exists in this tenant with a different owner",
+				"file_id '{}' already exists in this tenant with a different upstream",
 				source_file_id
 			)));
 		}
 
-		// Same owner, different parent: the file is already placed in this
+		// Same upstream, different parent: the file is already placed in this
 		// tenant under a different parent. Frontend behavior matches the
 		// different-owner case ("go to existing location"), so a generic 409
 		// with the existing parent embedded is sufficient.
@@ -1701,8 +1716,8 @@ async fn post_file_cross_context(
 			tn_id,
 			cloudillo_types::meta_adapter::CreateFile {
 				file_id: Some(source_file_id.into()),
-				owner_tag: Some(source_id_tag.into()),
-				creator_tag: Some(auth.id_tag.clone()),
+				upstream_tag: Some(source_id_tag.into()),
+				owner_tag: Some(auth.id_tag.clone()),
 				content_type,
 				file_name: source_view.file_name.clone(),
 				file_tp: source_view.file_tp.clone(),
@@ -1781,13 +1796,13 @@ pub struct RefreshResponse {
 ///
 /// Outcomes:
 /// - 200 + cleared tombstone → source responded; if caller is the row's
-///   creator we sync `file_name` / `content_type` / `file_tp` / `tags` /
-///   `preset` / `x` and clear any prior `broken_*`. Non-creators get a
+///   owner we sync `file_name` / `content_type` / `file_tp` / `tags` /
+///   `preset` / `x` and clear any prior `broken_*`. Non-owners get a
 ///   per-user-only refresh (the cached `access_level` is updated for the
 ///   caller, shared row state is left untouched).
-/// - 200 + `broken_reason = 'deleted'` → source returned 404/410. Creator-only.
-/// - 200 + `broken_reason = 'revoked'` → source returned 403. Creator-only;
-///   non-creators get their cached `access_level` cleared but the shared
+/// - 200 + `broken_reason = 'deleted'` → source returned 404/410. Owner-only.
+/// - 200 + `broken_reason = 'revoked'` → source returned 403. Owner-only;
+///   non-owners get their cached `access_level` cleared but the shared
 ///   tombstone is left alone.
 /// - 200 + `refreshStatus = "unreachable"` → transient network/parse failure.
 ///   No row mutation: the response returns whatever was already on disk.
@@ -1844,27 +1859,32 @@ pub async fn refresh_file(
 	})?
 	.file_view;
 
-	// Refresh only makes sense for cross-context rows — local-owned rows have
-	// no upstream source to fetch. Identify them by `owner_tag` differing
-	// from the local tenant's id_tag.
-	let owner_tag = match existing.owner.as_ref() {
-		Some(o) if o.id_tag.as_ref() != tenant_id_tag.as_ref() => o.id_tag.as_ref(),
-		_ => {
+	// Refresh only makes sense for cross-context rows — rows that originate here have
+	// no upstream source to fetch. Identify them by a set `upstream_tag`; the owner may
+	// be a local member, so the owner is the wrong test.
+	let upstream_tag = match existing.upstream.as_ref() {
+		Some(o) => o.id_tag.as_ref(),
+		None => {
 			return Err(Error::ValidationError(
 				"refresh is only valid for cross-context (hand-pinned) files".into(),
 			));
 		}
 	};
 
-	// Only the row's creator may write shared row state (file_name,
-	// content_type, tags, preset, x, broken_*). Non-creators with read access
+	// Only the row's owner may write shared row state (file_name,
+	// content_type, tags, preset, x, broken_*). Non-owners with read access
 	// can still keep their per-user cached `access_level` in sync, but they
 	// cannot toggle the tombstone or overwrite shared fields for everyone.
-	let is_creator =
-		existing.creator.as_ref().map(|c| c.id_tag.as_ref()) == Some(auth.id_tag.as_ref());
+	//
+	// The **raw** column, not the resolved `owner`: on an FSHR-accepted row `owner_tag` is NULL
+	// and `FileView::owner` falls back to the tenant, which on a personal tenant is the recipient
+	// themselves. Same rule, same reason, as `management::may_publish`.
+	let is_owner = existing.owner_tag.as_deref() == Some(auth.id_tag.as_ref());
 
-	let fetch: Result<types::ApiResponse<meta_adapter::FileView>, Error> =
-		app.request.get(tn_id, owner_tag, &format!("/files/{}/metadata", file_id)).await;
+	let fetch: Result<types::ApiResponse<meta_adapter::FileView>, Error> = app
+		.request
+		.get(tn_id, upstream_tag, &format!("/files/{}/metadata", file_id))
+		.await;
 
 	let mut refresh_status: Option<&'static str> = None;
 
@@ -1872,7 +1892,7 @@ pub async fn refresh_file(
 		Ok(envelope) => {
 			let source = envelope.data;
 			let source_access_level = source.access_level;
-			if is_creator {
+			if is_owner {
 				// Refresh is reconciliation, not authoritative replacement: a
 				// source omitting a field means "no information, preserve
 				// local" (Patch::Undefined). A source that wants to clear a
@@ -1927,7 +1947,7 @@ pub async fn refresh_file(
 			}
 		}
 		Err(Error::NotFound | Error::Gone) => {
-			if is_creator {
+			if is_owner {
 				let opts = meta_adapter::UpdateFileOptions {
 					broken: Patch::Value(meta_adapter::BrokenReason::Deleted),
 					..Default::default()
@@ -1937,7 +1957,7 @@ pub async fn refresh_file(
 			Patch::Null // file gone — clear cached badge for this user
 		}
 		Err(Error::PermissionDenied) => {
-			if is_creator {
+			if is_owner {
 				let opts = meta_adapter::UpdateFileOptions {
 					broken: Patch::Value(meta_adapter::BrokenReason::Revoked),
 					..Default::default()
@@ -2139,7 +2159,7 @@ pub async fn post_file_blob(
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: Some(orig_variant_id.clone()),
-						creator_tag: Some(auth.id_tag.clone()),
+						owner_tag: Some(auth.id_tag.clone()),
 						content_type: if is_svg {
 							"image/svg+xml".into()
 						} else {
@@ -2188,7 +2208,7 @@ pub async fn post_file_blob(
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: Some(orig_variant_id),
-						creator_tag: Some(auth.id_tag.clone()),
+						owner_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
@@ -2254,7 +2274,7 @@ pub async fn post_file_blob(
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: Some(orig_blob_id.clone()),
-						creator_tag: Some(auth.id_tag.clone()),
+						owner_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
@@ -2336,7 +2356,7 @@ pub async fn post_file_blob(
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: Some(orig_blob_id.clone()),
-						creator_tag: Some(auth.id_tag.clone()),
+						owner_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
@@ -2433,7 +2453,7 @@ pub async fn post_file_blob(
 					meta_adapter::CreateFile {
 						preset: Some(preset_name.clone().into()),
 						orig_variant_id: Some(orig_blob_id.clone()),
-						creator_tag: Some(auth.id_tag.clone()),
+						owner_tag: Some(auth.id_tag.clone()),
 						content_type: content_type.into(),
 						file_name: file_name.into(),
 						file_tp: Some("BLOB".into()),
@@ -2489,7 +2509,7 @@ pub async fn get_file_metadata(
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::FileView>>)> {
 	let mut file = app.meta_adapter.read_file(tn_id, &file_id).await?.ok_or(Error::NotFound)?;
 	// Defence in depth for anonymous callers: never expose Direct-visibility
-	// metadata (creator tag, tags, x-extras) without auth. Authed callers are
+	// metadata (owner tag, tags, x-extras) without auth. Authed callers are
 	// already gated by the route-level `check_perm_file("read")` ABAC middleware.
 	if maybe_auth.is_none() && file.visibility.is_none() {
 		return Err(Error::NotFound);
@@ -2502,14 +2522,16 @@ pub async fn get_file_metadata(
 	// fallback query against the actions table to the hot path. Skip it
 	// unless the file is genuinely cross-tenant.
 	if let Some(auth) = maybe_auth.as_ref() {
-		let owner_tag = file.owner.as_ref().map_or(tenant_id_tag.as_ref(), |o| o.id_tag.as_ref());
+		let file_ref = file_access::FileRef::from_view(&file, &tenant_id_tag);
 		// Compute access_level when either (a) the file is from another tenant
 		// (the original cross-context Pin/Place path), or (b) the caller is from
 		// another tenant (federated /refresh from the receiver — the owner's
 		// server must report the receiver's effective level so they can cache
 		// the eye-badge after a permission change). Skipping both cases would
 		// leave `refresh_file` unable to pick up share_entry PATCHes.
-		let is_cross_tenant_file = owner_tag != tenant_id_tag.as_ref();
+		// Provenance, not authority: the row is cross-context when its canonical copy
+		// lives elsewhere, regardless of which local profile owns it.
+		let is_cross_tenant_file = file_ref.upstream_id_tag.is_some();
 		let is_cross_tenant_caller = auth.id_tag.as_ref() != tenant_id_tag.as_ref();
 		if is_cross_tenant_file || is_cross_tenant_caller {
 			let ctx = file_access::FileAccessCtx {
@@ -2520,8 +2542,7 @@ pub async fn get_file_metadata(
 			let level = file_access::get_access_level_with_scope(
 				&app,
 				tn_id,
-				&file_id,
-				owner_tag,
+				file_ref,
 				&ctx,
 				auth.scope.as_deref(),
 				file.root_id.as_deref(),

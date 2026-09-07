@@ -4,7 +4,8 @@
 //! INVT (Invitation) action native hooks
 //!
 //! Handles invitation lifecycle:
-//! - on_create: Validates inviter has moderator+ permission on target
+//! - on_create: resolves the invite target; community-membership authorization runs pre-store
+//!   on the community's own side (see `check_community_authority`)
 //! - on_receive: Notifies invitee about the invitation (status='C')
 //! - on_accept: Creates SUBS action when invitation is accepted
 //! - Subtypes:
@@ -12,10 +13,11 @@
 
 use crate::helpers::{self, SubscriptionRole};
 use crate::hooks::{HookContext, HookResult};
-use crate::native_hooks::conn_follower_patch;
 use crate::prelude::*;
 use crate::subject_ref::{SubjectRef, parse_subject_ref};
 use crate::task::{CreateAction, create_action};
+use cloudillo_core::roles::is_moderator;
+use cloudillo_types::auth_adapter::ActionToken;
 use cloudillo_types::meta_adapter::{ProfileConnectionStatus, UpsertProfileFields};
 
 /// Extract the community id_tag from an identity-typed subject string.
@@ -29,34 +31,170 @@ fn community_id_tag_from_subject(subject: &str) -> Option<&str> {
 	}
 }
 
-/// Resolve a profile id_tag to a local tenant id.
+/// Whether `issuer` may invite people into the community `community_tag`.
 ///
-/// Returns `Some(tn_id)` when the id_tag matches a tenant hosted on this
-/// server, `None` otherwise. Used by the community-membership-invite path
-/// to gate authorization on the issuer's role *inside* the community
-/// tenant.
-async fn lookup_local_tenant(app: &App, id_tag: &str) -> ClResult<Option<TnId>> {
-	match app.auth_adapter.read_tn_id(id_tag).await {
-		Ok(tn_id) => Ok(Some(tn_id)),
-		Err(Error::NotFound) => Ok(None),
-		Err(e) => Err(e),
-	}
+/// The community's own account is exempt — a tenant has no `profiles` row of itself.
+/// Everyone else needs moderator+; `None` (no row, or a NULL `roles` column) is a non-member.
+fn community_invite_allowed(issuer: &str, community_tag: &str, roles: Option<&[Box<str>]>) -> bool {
+	issuer == community_tag || roles.is_some_and(is_moderator)
 }
 
-/// Did the issuer reach moderator+ role in the given community tenant?
-async fn issuer_has_community_authority(
-	app: &App,
-	community_tn_id: TnId,
-	issuer: &str,
-) -> ClResult<bool> {
-	let roles = app.meta_adapter.read_profile_roles(community_tn_id, issuer).await?;
-	let Some(roles) = roles else {
-		return Ok(false);
+/// [`community_invite_allowed`] against the community's own tenant rows. Fails closed on every
+/// read error, including the `Err(NotFound)` a missing profile surfaces as.
+async fn issuer_may_invite(app: &App, tn_id: TnId, issuer: &str, community_tag: &str) -> bool {
+	let roles = match app.meta_adapter.read_profile_roles(tn_id, issuer).await {
+		Ok(roles) => roles,
+		Err(Error::NotFound) => None,
+		Err(e) => {
+			warn!(issuer = %issuer, error = %e, "INVT: role lookup failed, denying invite");
+			None
+		}
 	};
-	Ok(roles.iter().any(|r| {
-		let r = r.as_ref();
-		r == "leader" || r == "moderator"
-	}))
+	community_invite_allowed(issuer, community_tag, roles.as_deref())
+}
+
+/// Whether `issuer` may revoke the community invitation issued by `original_invt_issuer`.
+///
+/// A moderator may withdraw anyone's; otherwise only its issuer may, which is what lets a
+/// since-demoted inviter take their own invitation back. `None` = nothing on record to revoke.
+fn community_revoke_allowed(
+	issuer: &str,
+	original_invt_issuer: Option<&str>,
+	is_moderator: bool,
+) -> bool {
+	is_moderator || original_invt_issuer == Some(issuer)
+}
+
+/// The issuer of the active community invitation on record for `invitee`, if any.
+/// `exclude_sub_typ` filters to bare INVTs in SQL, so the `LIMIT` cannot hide the row
+/// behind `INVT:DEL`s.
+async fn pending_invitation_issuer(
+	app: &App,
+	tn_id: TnId,
+	community_tag: &str,
+	invitee: &str,
+) -> Option<Box<str>> {
+	let opts = cloudillo_types::meta_adapter::ListActionOptions {
+		typ: Some(vec!["INVT".to_string()]),
+		subject: Some(vec![format!("@{}", community_tag)]),
+		audience: Some(invitee.to_string()),
+		status: Some(vec!["A".to_string()]),
+		exclude_sub_typ: Some(Box::new(["DEL".into()])),
+		limit: Some(1),
+		..Default::default()
+	};
+	app.meta_adapter
+		.list_actions(tn_id, &opts)
+		.await
+		.ok()?
+		.into_iter()
+		.next()
+		.map(|a| a.issuer.id_tag)
+}
+
+/// The INVT subtypes [`check_community_authority`] knows how to judge: the invite (`None`) and
+/// its revocation (`DEL`). An allowlist, not a denylist — `conn::has_pending_invitation`
+/// filters bare invites with `exclude_sub_typ: ["DEL"]`, so any unknown subtype that reached
+/// storage would read back as a pending invitation and grant the `connection_mode = 'I'` bypass.
+///
+/// [`check_community_authority`] guards on this before its match, so the allowlist lives in one
+/// place and a new subtype landing in `definitions.rs` cannot silently acquire an arm.
+fn community_invt_subtype_known(subtype: Option<&str>) -> bool {
+	matches!(subtype, None | Some("DEL"))
+}
+
+/// Whether an action is a community-membership INVT addressed to *this* tenant — the only case
+/// [`check_community_authority`] gates.
+///
+/// A raw compare, and safe as one: `helpers::check_subject_field` rejects a non-canonical
+/// identity subject at both boundaries, so `@Club.Example.COM` never reaches storage.
+fn is_community_invt(action_type: &str, subject: Option<&str>, tenant_tag: &str) -> bool {
+	let (base_type, _) = helpers::extract_type_and_subtype(action_type);
+	base_type == "INVT" && subject.and_then(community_id_tag_from_subject) == Some(tenant_tag)
+}
+
+/// Community-membership INVT / INVT:DEL authorization. A no-op for everything but an
+/// identity-subject INVT addressed to this very tenant.
+///
+/// `actor` is who asserts the authority — the token's `iss` inbound, `auth.id_tag` outbound.
+/// Deliberately NOT the stored `issuer_tag`: outbound that is the tenant's own id_tag, which
+/// satisfies [`community_invite_allowed`]'s "the community itself" disjunct unconditionally.
+///
+/// `typ` is `(type, separate subtype)` — outbound `("INVT", Some("DEL"))`, inbound
+/// `("INVT:DEL", None)`.
+///
+/// **Must run pre-store on both paths.** Inbound, key-pattern dedup retires the pending INVT
+/// the moment an INVT:DEL is stored, so a post-store hook can neither prevent a revocation nor
+/// still see the row it must judge. Outbound, `on_create` runs after `finalize_action` set
+/// status 'A', and `continue_processing: false` does not roll back.
+pub(crate) async fn check_community_authority(
+	app: &App,
+	tn_id: TnId,
+	tenant_tag: &str,
+	typ: (&str, Option<&str>),
+	subject: Option<&str>,
+	audience: Option<&str>,
+	actor: &str,
+) -> ClResult<()> {
+	let (typ, sub_typ) = typ;
+	if !is_community_invt(typ, subject, tenant_tag) {
+		return Ok(());
+	}
+	let (_, embedded) = helpers::extract_type_and_subtype(typ);
+	let subtype = sub_typ.map(str::to_owned).or(embedded);
+
+	// Unknown subtypes are refused, not exempted: `conn::has_pending_invitation` filters bare
+	// invites with `exclude_sub_typ: ["DEL"]`, so anything unrecognised that reached storage
+	// would read back as a pending invitation and grant the `connection_mode = 'I'` bypass.
+	if !community_invt_subtype_known(subtype.as_deref()) {
+		warn!("INVT: unknown subtype {:?} for community {}, rejecting", subtype, tenant_tag);
+		return Err(Error::PermissionDenied);
+	}
+
+	let allowed = match subtype.as_deref() {
+		// The invite itself. Storing it at the community home is what `conn::on_receive`'s
+		// `has_pending_invitation` treats as authority to bypass `connection_mode = 'I'`.
+		None => issuer_may_invite(app, tn_id, actor, tenant_tag).await,
+		// The revocation. `pending_invitation_issuer` runs before the dedup retires the row,
+		// so its `status: ['A']` filter still sees the invitation being withdrawn — which is
+		// what keeps the since-demoted inviter's own withdrawal working.
+		Some("DEL") => {
+			let invitee = audience.unwrap_or_default();
+			let original = pending_invitation_issuer(app, tn_id, tenant_tag, invitee).await;
+			let is_mod = issuer_may_invite(app, tn_id, actor, tenant_tag).await;
+			community_revoke_allowed(actor, original.as_deref(), is_mod)
+		}
+		// Unreachable — the guard above already refused these. Defence in depth.
+		_ => false,
+	};
+	if !allowed {
+		warn!(
+			"INVT: {} has no authority for {} in community {}, rejecting",
+			actor, typ, tenant_tag
+		);
+		return Err(Error::PermissionDenied);
+	}
+	Ok(())
+}
+
+/// Pre-store authorization for a federated community INVT / INVT:DEL arriving at this tenant.
+/// Thin wrapper over [`check_community_authority`]: the token's `iss` is the acting identity.
+pub(crate) async fn check_inbound(
+	app: &App,
+	tn_id: TnId,
+	action: &ActionToken,
+	tenant_tag: &str,
+) -> ClResult<()> {
+	check_community_authority(
+		app,
+		tn_id,
+		tenant_tag,
+		(&action.t, None),
+		action.sub.as_deref(),
+		action.aud.as_deref(),
+		&action.iss,
+	)
+	.await
 }
 
 /// INVT on_create hook - Validate inviter permission
@@ -82,7 +220,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	// Identity subjects (`@<id_tag>`) route to the community-membership
 	// branch. Anything else is required to resolve to a known action.
 	if matches!(parse_subject_ref(subject_id), Some(SubjectRef::Identity(_))) {
-		return on_create_community(app, &context, subject_id).await;
+		return on_create_community(&context, subject_id).await;
 	}
 
 	// Get the target action
@@ -106,12 +244,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 		return Ok(HookResult { continue_processing: false, ..Default::default() });
 	};
 
-	// Parse role and check permission using x.role (with fallback to content.role)
-	let content_json = subscription
-		.content
-		.as_ref()
-		.and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
-	let user_role = helpers::get_subscription_role(subscription.x.as_ref(), content_json.as_ref());
+	let user_role = helpers::get_subscription_role(subscription.x.as_ref());
 	let required = SubscriptionRole::required_for_action("INVT", None);
 
 	if user_role < required {
@@ -132,44 +265,21 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// action id). The invitation invites `audience` to become a member of the
 /// community identified by `subject_id`.
 ///
-/// Authorization: TEMPORARILY DEFERRED (issue #3). The moderator/leader role
-/// gate is not enforced here for now — both local and remote communities are
-/// admitted and the community home re-validates authorization on accept. Real
-/// role-gating returns once the invitation picker only offers communities the
-/// operator can actually invite to.
-async fn on_create_community(
-	app: App,
-	context: &HookContext,
-	subject_id: &str,
-) -> ClResult<HookResult> {
+/// Authorization is **not** the inviter side's to do: reading the issuer's role in the
+/// community would mean reading another tenant's rows, which this architecture does not allow,
+/// and it only ever worked for communities that happen to be hosted here. It lives on the
+/// community's own side, pre-store and never in this hook — [`check_inbound`] for a federated
+/// invite, `handler::post_action` for a locally-created one — both via
+/// [`check_community_authority`]. See its doc for why a hook cannot stand in.
+///
+/// So `conn::on_receive`'s `has_pending_invitation` lookup still matches on type / subject /
+/// audience / status only, never on the INVT issuer — but the INVT it finds is trustworthy,
+/// because it could not have been stored without passing that gate.
+async fn on_create_community(context: &HookContext, subject_id: &str) -> ClResult<HookResult> {
 	let Some(community_id_tag) = community_id_tag_from_subject(subject_id) else {
 		warn!("INVT on_create (community): subject {} is not an identity reference", subject_id);
 		return Ok(HookResult { continue_processing: false, ..Default::default() });
 	};
-
-	// TEMP (issue #3): do not gate community INVTs on the inviter's local role.
-	// Local and remote communities are treated identically here — admit the
-	// invite and let the community home enforce authorization on accept. Proper
-	// moderator-role gating returns once the invitation picker only offers
-	// communities the operator can actually invite to (a CommunityRef role/
-	// canInvite field — frontend follow-up below).
-	let local_community_tn_id = lookup_local_tenant(&app, community_id_tag).await?;
-	if let Some(community_tn_id) = local_community_tn_id {
-		let authorized = issuer_has_community_authority(&app, community_tn_id, &context.issuer)
-			.await
-			.unwrap_or(false);
-		if !authorized {
-			warn!(
-				"INVT on_create (community): inviter {} is not moderator+ in {}; admitting anyway (gating deferred, issue #3)",
-				context.issuer, community_id_tag
-			);
-		}
-	} else {
-		warn!(
-			"INVT on_create (community): skipping authz for remote community {} (inviter: {})",
-			community_id_tag, context.issuer
-		);
-	}
 
 	info!(
 		"INVT on_create (community): {} invites {} to community {}",
@@ -199,10 +309,14 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 	// Determine if we're the subject owner (CONV home / community home) or
 	// the invitee. For action subjects, the home is the action's issuer.
 	// For identity subjects, the home is the identity itself.
+	let mut is_community_home = false;
 	let is_conv_home = if let Some(ref subject_id) = context.subject {
 		let tenant_id_tag = app.meta_adapter.read_tenant(tn_id).await.ok().map(|t| t.id_tag);
 		match (parse_subject_ref(subject_id), tenant_id_tag) {
-			(Some(SubjectRef::Identity(id_tag)), Some(tenant)) => id_tag == tenant.as_ref(),
+			(Some(SubjectRef::Identity(id_tag)), Some(tenant)) => {
+				is_community_home = id_tag == tenant.as_ref();
+				is_community_home
+			}
 			(Some(SubjectRef::Action(_)), Some(tenant)) => app
 				.meta_adapter
 				.get_action(tn_id, subject_id)
@@ -215,6 +329,25 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 	} else {
 		false
 	};
+
+	// Authorization for both the invite and its revocation runs pre-store, in
+	// [`check_inbound`] — a post-store hook is too late to stop either. What is left here is
+	// the *effect* of an already-authorized revocation.
+	//
+	// The key-pattern dedup already covers the normal case: `{type}` substitutes the *base*
+	// type, so an `INVT:DEL` builds the same `INVT:@community:invitee` key as the invite it
+	// withdraws and retires it on store. This sweep is for rows that key differently — ones
+	// written before `helpers::check_subject_field` made the `@<id_tag>` subject canonical on
+	// write. Idempotent, so the overlap costs nothing.
+	if is_community_home && context.subtype.as_deref() == Some("DEL") {
+		crate::native_hooks::conn::retire_community_invitations(
+			&app,
+			tn_id,
+			&context.tenant_tag,
+			context.audience.as_deref().unwrap_or_default(),
+		)
+		.await;
+	}
 
 	// Resting status is declared here and written once by the post-store
 	// pipeline (process.rs). The invitee copy must rest at 'C' so it shows as
@@ -244,8 +377,10 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			None
 		}
 		Some(subtype) => {
-			warn!("INVT on_receive: Unknown subtype '{}', ignoring", subtype);
-			None
+			// A rejection, not "no opinion": `process.rs` writes `status.unwrap_or('A')`,
+			// so `None` here would leave an unrecognised INVT resting as an active one.
+			warn!("INVT on_receive: Unknown subtype '{}', rejecting", subtype);
+			Some('D')
 		}
 	};
 
@@ -359,35 +494,13 @@ async fn on_accept_community(
 		);
 	}
 
-	// If the community is hosted locally, also flip the invitee's row in
-	// the community tenant to Connected with a baseline `contributor` role.
-	// `contributor` is the canonical baseline membership role (see
-	// cloudillo-core `roles.rs` ROLE_HIERARCHY) and the minimum tier allowed
-	// to create content (create_perm.rs). A non-canonical role like `member`
-	// would expand to no permissions and render as "Follower" in the UI.
-	if let Ok(Some(community_tn_id)) = lookup_local_tenant(app, community_id_tag).await {
-		let invitee_upsert = UpsertProfileFields {
-			connected: Patch::Value(ProfileConnectionStatus::Connected),
-			follower: conn_follower_patch(app, community_tn_id, audience).await,
-			roles: Patch::Value(Some(vec!["contributor".into()])),
-			..Default::default()
-		};
-		if let Err(e) = app
-			.meta_adapter
-			.upsert_profile(community_tn_id, audience, &invitee_upsert)
-			.await
-		{
-			warn!(
-				"INVT (community): Failed to upsert invitee profile in community tenant {}: {}",
-				community_id_tag, e
-			);
-		}
-	}
-
-	// Federate a CONN action to the community so the connection is
-	// recorded on the community side as well. The community's CONN
-	// on_receive sees the existing INVT and skips the connection_mode
-	// 'I' rejection.
+	// The community learns of the membership the only way it may: as a federated CONN it
+	// processes in its own tenant context. Writing the invitee's row in the community's
+	// tenant directly from here — which this used to do for locally-hosted communities —
+	// is a cross-tenant write, and it granted `contributor` driven entirely from the
+	// invitee's side, with the inviter's authority never established. The community's own
+	// CONN `on_receive` sees the existing INVT and skips the connection_mode 'I'
+	// rejection, so the shortcut was redundant as well as forbidden.
 	let conn_action = CreateAction {
 		typ: "CONN".into(),
 		audience_tag: Some(community_id_tag.to_string().into()),
@@ -398,6 +511,116 @@ async fn on_accept_community(
 	}
 
 	Ok(HookResult::default())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn roles(list: &[&str]) -> Vec<Box<str>> {
+		list.iter().map(|r| Box::from(*r)).collect()
+	}
+
+	/// The revocation gate. An ungated `INVT:DEL` was the escalation path: it rests at 'A'
+	/// like an invite and `ListActionOptions` has no `sub_typ` filter, so `conn.rs` read it
+	/// as a pending invitation and handed its issuer the `connection_mode = 'I'` bypass.
+	#[test]
+	fn only_a_moderator_or_the_original_inviter_may_revoke() {
+		// A moderator may withdraw anyone's, including one with no invitation on record.
+		assert!(community_revoke_allowed("mod.example.com", Some("alice.example.com"), true));
+		assert!(community_revoke_allowed("mod.example.com", None, true));
+
+		// The original inviter keeps the right even after being demoted.
+		assert!(community_revoke_allowed("alice.example.com", Some("alice.example.com"), false));
+
+		// An ordinary member with nothing of their own on record — the bug.
+		assert!(!community_revoke_allowed("mallory.example.com", Some("alice.example.com"), false));
+		assert!(!community_revoke_allowed("mallory.example.com", None, false));
+	}
+
+	/// The subtype allowlist. `exclude_sub_typ: ["DEL"]` in `conn::has_pending_invitation` is a
+	/// denylist, so an unknown subtype slipping past this gate reads back as a pending
+	/// invitation and hands its issuer the `connection_mode = 'I'` bypass.
+	#[test]
+	fn only_the_invite_and_its_revocation_are_judgeable_subtypes() {
+		assert!(community_invt_subtype_known(None));
+		assert!(community_invt_subtype_known(Some("DEL")));
+
+		assert!(!community_invt_subtype_known(Some("XYZ")));
+		assert!(!community_invt_subtype_known(Some("del"))); // subtypes are case-sensitive
+		assert!(!community_invt_subtype_known(Some("")));
+	}
+
+	/// The routing half of the pre-store gate: which inbound actions `check_inbound` judges
+	/// at all. The authority half is the two predicates tested above.
+	#[test]
+	fn only_an_identity_invt_addressed_to_this_tenant_is_gated() {
+		// The invite and its revocation, both aimed at the community we are.
+		assert!(is_community_invt("INVT", Some("@club.example.com"), "club.example.com"));
+		assert!(is_community_invt("INVT:DEL", Some("@club.example.com"), "club.example.com"));
+		// A non-canonical spelling cannot get this far: `helpers::check_subject_field` refuses
+		// it at both boundaries, so it never reaches storage — and here it simply misses.
+		assert!(!is_community_invt("INVT", Some("@Club.Example.COM"), "club.example.com"));
+
+		// Another community's invite merely passing through, an action-subject INVT (the
+		// CONV branch, gated by subscription role instead), a subject-less one, and a
+		// different action type entirely.
+		assert!(!is_community_invt("INVT", Some("@other.example.com"), "club.example.com"));
+		assert!(!is_community_invt("INVT", Some("a1~abc"), "club.example.com"));
+		assert!(!is_community_invt("INVT", None, "club.example.com"));
+		assert!(!is_community_invt("CONN", Some("@club.example.com"), "club.example.com"));
+	}
+
+	/// The community-membership gate. Storing an INVT at the community home is what
+	/// `conn::on_receive`'s `has_pending_invitation` treats as authorization to bypass
+	/// `connection_mode = 'I'`, so anyone below moderator getting one stored is the whole bug.
+	#[test]
+	fn only_the_community_itself_or_a_moderator_may_invite() {
+		// The community's own account — no `profiles` row of itself, so no roles to read.
+		assert!(community_invite_allowed("club.example.com", "club.example.com", None));
+
+		assert!(community_invite_allowed(
+			"mod.example.com",
+			"club.example.com",
+			Some(&roles(&["moderator"]))
+		));
+		assert!(community_invite_allowed(
+			"boss.example.com",
+			"club.example.com",
+			Some(&roles(&["leader"]))
+		));
+
+		// An ordinary member — passes INVT's `allow_unknown: false` reachability test, but
+		// has no standing to invite.
+		assert!(!community_invite_allowed(
+			"member.example.com",
+			"club.example.com",
+			Some(&roles(&["contributor"]))
+		));
+		// No profile row at all (`read_profile_roles` returns `Err(NotFound)`, mapped to
+		// `None`), and a row with a NULL `roles` column — both are non-members.
+		assert!(!community_invite_allowed("stranger.example.com", "club.example.com", None));
+		assert!(!community_invite_allowed(
+			"stranger.example.com",
+			"club.example.com",
+			Some(&roles(&[]))
+		));
+	}
+
+	/// Fed the action's stored `issuer_tag` — the *tenant's own* id_tag on the outbound path —
+	/// the "community's own account" disjunct passes unconditionally on a locally-hosted
+	/// community, and any `contributor` can store an INVT. The authority argument must be the
+	/// authenticated caller; `handler::post_action` supplies `auth.id_tag`.
+	#[test]
+	fn a_plain_member_is_refused_but_the_tenant_tag_as_actor_would_not_be() {
+		let member = "member.example.com";
+		let community = "club.example.com";
+		let member_roles = roles(&["contributor"]);
+
+		assert!(!community_invite_allowed(member, community, Some(&member_roles)));
+		// Passing the tenant tag instead of the caller is what made the gate a no-op.
+		assert!(community_invite_allowed(community, community, Some(&member_roles)));
+	}
 }
 
 // vim: ts=4

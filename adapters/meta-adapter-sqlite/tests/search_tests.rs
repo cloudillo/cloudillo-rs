@@ -420,14 +420,22 @@ one_mode! {
 		let (adapter, _dir) = create_test_adapter().await;
 		let tn_id = TnId(1);
 
-		for (file_id, visibility) in [("f1~pub", Some('P')), ("f1~conn", Some('C')), ("f1~dir", None)] {
+		// `upstream_tag` is the raw `files.upstream_tag` column: NULL for a file that originates
+		// here, set only on a cross-context Pin/Place copy. Both provenances at both levels.
+		for (file_id, visibility, upstream_tag) in [
+			("f1~pub", Some('P'), None),
+			("f1~conn", Some('C'), None),
+			("f1~dir", None, None),
+			("f1~mirror_pub", Some('P'), Some("alice")),
+			("f1~mirror_conn", Some('C'), Some("alice")),
+		] {
 			adapter
 				.replace_search_object(
 					tn_id,
 					&SearchObject {
 						obj_tp: 'F',
 						obj_id: file_id,
-						owner_tag: Some("alice"),
+						upstream_tag,
 						visibility,
 						fts_cl,
 						..Default::default()
@@ -439,27 +447,39 @@ one_mode! {
 		}
 
 		// Owner / tenant: no level filter at all, Direct included.
-		assert_eq!(find(&adapter, tn_id, "secret", fts_cl).await.len(), 3);
+		assert_eq!(find(&adapter, tn_id, "secret", fts_cl).await.len(), 5);
 
 		let public_only = SearchOptions { visible_levels: Some(vec!['P']), ..opts("secret", fts_cl) };
-		assert_eq!(adapter.search(tn_id, &public_only).await.expect("search").len(), 1);
+		assert_eq!(adapter.search(tn_id, &public_only).await.expect("search").len(), 2);
 
+		// Provenance does not narrow the ladder: a cross-context Pin is authored locally at
+		// `'C'` by the placing member, so gating mirrors to `'P'` hid every community pin
+		// from the members it was placed for. Same boundary `file::list` and
+		// `abac::check_visibility` draw — a disagreement here either leaks snippets
+		// `GET /api/files` hides, or hides rows it shows.
 		let connected =
 			SearchOptions { visible_levels: Some(vec!['P', 'V', '2', 'F', 'C']), ..opts("secret", fts_cl) };
-		assert_eq!(adapter.search(tn_id, &connected).await.expect("search").len(), 2);
+		let hits = adapter.search(tn_id, &connected).await.expect("search");
+		let mut ids: Vec<&str> = hits.iter().map(|h| h.obj_id.as_ref()).collect();
+		ids.sort_unstable();
+		assert_eq!(
+			ids,
+			["f1~conn", "f1~mirror_conn", "f1~mirror_pub", "f1~pub"],
+			"the mirrored 'C' row follows the same ladder as the local one"
+		);
+		// Direct (`visibility IS NULL`) is still out at every rung below Owner.
+		assert!(!ids.contains(&"f1~dir"));
 
-		// `owner_tag` does *not* exempt a row from the level predicate. It is the
-		// raw `files.owner_tag` column — NULL for a tenant-owned file, set only on
-		// a cross-context Pin/Place copy — so an exemption here would fire exactly
-		// when a federated peer searches a copy this tenant pinned, and hand them
-		// rows `GET /api/files` denies. `file::list` has no such exemption either.
-		// See `a_pinned_copys_owner_does_not_bypass_the_level_predicate`.
+		// `upstream_tag` does not *exempt* a row either, not even for the peer it names — an
+		// exemption would fire exactly when a federated peer searches a copy this tenant
+		// pinned. `file::list` has no such exemption.
+		// See `a_pinned_copys_upstream_does_not_bypass_the_level_predicate`.
 		let as_owner = SearchOptions {
 			visible_levels: Some(vec!['P']),
 			viewer_id_tag: Some("alice".into()),
 			..opts("secret", fts_cl)
 		};
-		assert_eq!(adapter.search(tn_id, &as_owner).await.expect("search").len(), 1);
+		assert_eq!(adapter.search(tn_id, &as_owner).await.expect("search").len(), 2);
 	}
 }
 
@@ -1336,7 +1356,7 @@ one_mode! {
 					&SearchObject {
 						obj_tp: 'F',
 						obj_id: file_id,
-						owner_tag: Some("alice"),
+						upstream_tag: Some("alice"),
 						visibility,
 						fts_cl,
 						..Default::default()
@@ -1451,13 +1471,14 @@ one_mode! {
 }
 
 one_mode! {
-	/// `search_docs.owner_tag` is the raw `files.owner_tag` column: NULL for a
-	/// tenant-owned file, set only on a cross-context Pin/Place copy. It must not
+	/// `search_docs.upstream_tag` is the raw `files.upstream_tag` column: NULL for a file
+	/// that originates here, set only on
+	/// a cross-context Pin/Place copy. It must not
 	/// exempt a row from the level predicate — `GET /api/files` has no such
 	/// exemption, and for `'F'`/`'D'` the SQL prefilter *is* the authorization,
 	/// so an exemption here would hand a federated peer the titles, tags and
 	/// snippets of every part of a document the tenant has since made Direct.
-	async fn a_pinned_copys_owner_does_not_bypass_the_level_predicate(fts_cl: bool) {
+	async fn a_pinned_copys_upstream_does_not_bypass_the_level_predicate(fts_cl: bool) {
 		let (adapter, _dir) = create_test_adapter().await;
 		let tn_id = TnId(1);
 		adapter.create_tenant(tn_id, "bob").await.ok();
@@ -1469,7 +1490,7 @@ one_mode! {
 				&SearchObject {
 					obj_tp: 'F',
 					obj_id: "f1~pinned",
-					owner_tag: Some("alice"),
+					upstream_tag: Some("alice"),
 					visibility: None,
 					fts_cl,
 					..Default::default()
@@ -1484,7 +1505,7 @@ one_mode! {
 				&SearchObject {
 					obj_tp: 'D',
 					obj_id: "f1~pinned",
-					owner_tag: Some("alice"),
+					upstream_tag: Some("alice"),
 					visibility: None,
 					fts_cl,
 					..Default::default()
@@ -2457,8 +2478,9 @@ one_mode! {
 
 // ── ACL columns denormalised out of `files` ──
 //
-// `search_docs` copies `visibility`, `owner_tag`, `root_id` and `content_type`
-// off the `files` row so a query can filter on them without a join. Two rows
+// `search_docs` copies `visibility`, `upstream_tag` (sourced from `files.upstream_tag`),
+// `root_id` and `content_type` off the `files` row so a query can filter on them
+// without a join. Two rows
 // describe one document — its own `'F'` row and every `'D'` part — and they must
 // agree, or the API reports a hit's owner differently depending on which row
 // matched, and the share-link grant stops finding the pages of the document it
@@ -2469,14 +2491,14 @@ async fn create_doc_file(
 	adapter: &MetaAdapterSqlite,
 	tn_id: TnId,
 	file_id: &str,
-	owner_tag: Option<&str>,
+	upstream_tag: Option<&str>,
 ) {
 	adapter
 		.create_file(
 			tn_id,
 			CreateFile {
 				file_id: Some(file_id.into()),
-				owner_tag: owner_tag.map(Into::into),
+				upstream_tag: upstream_tag.map(Into::into),
 				// Standalone: its own tree root, which is what NULL means here.
 				root_id: None,
 				content_type: "application/x-notillo".into(),
@@ -2491,14 +2513,14 @@ async fn create_doc_file(
 		.expect("create file");
 }
 
-/// The `search_docs` rows of one object, as `(obj_tp, root_id, owner_tag)`.
+/// The `search_docs` rows of one object, as `(obj_tp, root_id, upstream_tag)`.
 async fn acl_rows(
 	db: &sqlx::SqlitePool,
 	tn_id: TnId,
 	obj_id: &str,
 ) -> Vec<(String, Option<String>, Option<String>)> {
 	sqlx::query_as(
-		"SELECT obj_tp, root_id, owner_tag FROM search_docs \
+		"SELECT obj_tp, root_id, upstream_tag FROM search_docs \
 		 WHERE tn_id = ? AND obj_id = ? ORDER BY obj_tp, part_id",
 	)
 	.bind(tn_id.0)
@@ -2509,12 +2531,13 @@ async fn acl_rows(
 }
 
 /// Index a standalone document's `'D'` parts the way `cloudillo_search::indexer`
-/// does: `root_id = COALESCE(files.root_id, file_id)`, `owner_tag` the raw column.
+/// does: `root_id = COALESCE(files.root_id, file_id)`, `upstream_tag` the raw
+/// `files.upstream_tag` column.
 async fn index_doc_parts(
 	adapter: &MetaAdapterSqlite,
 	tn_id: TnId,
 	file_id: &str,
-	owner_tag: Option<&str>,
+	upstream_tag: Option<&str>,
 	fts_cl: bool,
 ) {
 	adapter
@@ -2524,7 +2547,7 @@ async fn index_doc_parts(
 				obj_tp: 'D',
 				obj_id: file_id,
 				content_type: Some("application/x-notillo"),
-				owner_tag,
+				upstream_tag,
 				visibility: Some('P'),
 				root_id: Some(file_id),
 				fts_cl,
@@ -2591,19 +2614,20 @@ one_mode! {
 		);
 	}
 
-	/// The `'D'` and `'F'` rows of one file must report the same `owner_tag`.
+	/// The `'D'` and `'F'` rows of one file must report the same `upstream_tag`.
 	///
 	/// `FileView.owner` resolves through a fallback chain that answers the
-	/// *tenant's* profile when `files.owner_tag` is NULL, so an indexer reading it
+	/// *tenant's* profile when the column is NULL, so an indexer reading it
 	/// wrote the tenant's tag into the `'D'` rows while the `'F'` row kept the raw
-	/// NULL. Both rows are now derived from the same column.
+	/// NULL. Both rows are now derived from the same column — `files.upstream_tag`,
+	/// which `FileView.upstream` exposes without any fallback.
 	async fn the_deep_and_file_rows_agree_on_the_owner(fts_cl: bool) {
 		let (adapter, dir) = create_test_adapter().await;
 		let tn_id = TnId(1);
 		adapter.create_tenant(tn_id, "alice").await.ok();
 		let db = probe(&dir).await;
 
-		// Tenant-owned: `files.owner_tag` is NULL, and both rows must say so.
+		// Originates here: `files.upstream_tag` is NULL, and both rows must say so.
 		create_doc_file(&adapter, tn_id, "f1~mine", None).await;
 		index_doc_parts(&adapter, tn_id, "f1~mine", None, fts_cl).await;
 		index_file(&adapter, tn_id, "f1~mine", fts_cl).await;
@@ -2616,9 +2640,9 @@ one_mode! {
 		for (file_id, expected) in [("f1~mine", None), ("f1~theirs", Some("bob.example.com"))] {
 			let rows = acl_rows(&db, tn_id, file_id).await;
 			assert_eq!(rows.len(), 3, "one 'F' row and two 'D' parts");
-			for (obj_tp, _, owner_tag) in rows {
+			for (obj_tp, _, upstream_tag) in rows {
 				assert_eq!(
-					owner_tag.as_deref(),
+					upstream_tag.as_deref(),
 					expected,
 					"'{obj_tp}' row of {file_id} disagrees on the owner"
 				);
@@ -3021,14 +3045,14 @@ async fn index_file_parts(
 }
 
 /// The part rows of one `'F'` object, as
-/// `(part_id, content_type, owner_tag, visibility, root_id)`.
+/// `(part_id, content_type, upstream_tag, visibility, root_id)`.
 async fn part_acl_rows(
 	db: &sqlx::SqlitePool,
 	tn_id: TnId,
 	obj_id: &str,
 ) -> Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>)> {
 	sqlx::query_as(
-		"SELECT part_id, content_type, owner_tag, visibility, root_id FROM search_docs \
+		"SELECT part_id, content_type, upstream_tag, visibility, root_id FROM search_docs \
 		 WHERE tn_id = ? AND obj_tp = 'F' AND obj_id = ? AND part_id <> '' ORDER BY part_id",
 	)
 	.bind(tn_id.0)
@@ -3174,10 +3198,10 @@ both_modes! {
 
 		let rows = part_acl_rows(&db, tn_id, "f1~site").await;
 		assert_eq!(rows.len(), 1);
-		let (part_id, content_type, owner_tag, visibility, root_id) = &rows[0];
+		let (part_id, content_type, upstream_tag, visibility, root_id) = &rows[0];
 		assert_eq!(part_id, "/");
 		assert_eq!(content_type.as_deref(), Some("application/x-notillo"));
-		assert_eq!(owner_tag.as_deref(), Some("bob.example"));
+		assert_eq!(upstream_tag.as_deref(), Some("bob.example"));
 		assert_eq!(visibility.as_deref(), Some("P"));
 		assert_eq!(root_id.as_deref(), None, "an 'F' part must not resolve root_id");
 

@@ -16,7 +16,7 @@ use crate::{
 	dsl::DslEngine,
 	helpers,
 	key_cache::KeyFetchCache,
-	native_hooks::ownership::owns_subject,
+	native_hooks::{self, ownership::owns_subject},
 	post_store::{self, ProcessingContext},
 	prelude::*,
 };
@@ -123,6 +123,9 @@ pub async fn verify_action_token(
 	if let Some(audience) = action_not_validated.aud.as_deref() {
 		helpers::check_identity_field("audience", audience)
 			.inspect_err(|e| warn!("  rejected: {e}"))?;
+	}
+	if let Some(subject) = action_not_validated.sub.as_deref() {
+		helpers::check_subject_field(subject).inspect_err(|e| warn!("  rejected: {e}"))?;
 	}
 
 	info!("→ VERIFY: from={} key={}", issuer, key_id);
@@ -252,7 +255,7 @@ pub async fn process_inbound_action_token(
 		action_id,
 		token,
 		is_sync,
-		client_address,
+		client_address.clone(),
 		false,
 	)
 	.await?;
@@ -260,10 +263,15 @@ pub async fn process_inbound_action_token(
 	// Process any related actions that came with this action
 	// (only for regular inbound actions, not for pre-approved/related ones to avoid recursion).
 	// Run in the background so a slow remote does not block the primary verifier.
+	//
+	// The caller's address rides along. Without it `verify_pow_if_conn` is a no-op and the
+	// rate-limit penalties are skipped, and CONN is `allow_unknown` — so proof of work is the
+	// only anti-spam gate on an unsolicited connection request. One PoW-paid primary on the
+	// unauthenticated `/api/inbox` would otherwise carry `MAX_RELATED_TOKENS` more for free.
 	let app_clone = app.clone();
 	let action_id_clone: Box<str> = action_id.into();
 	tokio::spawn(async move {
-		process_related_actions(&app_clone, tn_id, &action_id_clone).await;
+		process_related_actions(&app_clone, tn_id, &action_id_clone, client_address).await;
 	});
 
 	Ok(result)
@@ -301,7 +309,7 @@ async fn process_inbound_action_token_inner(
 		verify_and_handle_failure(app, tn_id, token, is_conn_action, client_ip.as_ref()).await?;
 
 	// 3. Resolve definition (try full type, then base type)
-	let (_definition_type, definition) = resolve_definition(app, &action.t)?;
+	let definition = resolve_definition(app, &action.t)?;
 
 	// 3b. Enforce declared field constraints + content schema on inbound actions.
 	// `validate_*` returns `Error::ValidationError`; `?` propagates it to the
@@ -340,6 +348,17 @@ async fn process_inbound_action_token_inner(
 	// 5b. Check flag-based permissions (comments/reactions disabled)
 	if !skip_permission_check {
 		check_inbound_flags(app, tn_id, &action, definition).await?;
+	}
+
+	// 5c. Community INVT authorization, which must precede the store: the key-pattern dedup
+	// retires the pending INVT as soon as an INVT:DEL row lands, so a post-store hook can
+	// neither stop a revocation nor still see the row it needs to judge one.
+	// Deliberately outside the `skip_permission_check` guard: an INVT arriving inside someone
+	// else's pre-approved bundle must still prove community authority.
+	// Base type, not a prefix: `starts_with` would also catch a future `INVT…` type.
+	if action.t.split(':').next() == Some("INVT") {
+		let tenant_tag = app.meta_adapter.read_tenant(tn_id).await?.id_tag;
+		native_hooks::invt::check_inbound(app, tn_id, &action, &tenant_tag).await?;
 	}
 
 	// Check if this is an ephemeral action (forward only, don't persist)
@@ -570,24 +589,15 @@ async fn verify_and_handle_failure(
 	}
 }
 
-/// Resolve action definition (try full type, then base type)
+/// The definition governing `action_type`, resolved via `DslEngine::definition_for`
+/// (combined `"TYPE:SUBTYPE"` key first, then the base type).
 fn resolve_definition<'a>(
 	app: &'a App,
-	action_type: &'a str,
-) -> ClResult<(&'a str, &'a crate::dsl::types::ActionDefinition)> {
-	let dsl = app.ext::<Arc<DslEngine>>()?;
-
-	if let Some(def) = dsl.get_definition(action_type) {
-		return Ok((action_type, def));
-	}
-
-	// Try base type (before colon)
-	let base_type = action_type.find(':').map_or(action_type, |pos| &action_type[..pos]);
-	if let Some(def) = dsl.get_definition(base_type) {
-		return Ok((base_type, def));
-	}
-
-	Err(Error::ValidationError(format!("Action type not supported: {}", action_type)))
+	action_type: &str,
+) -> ClResult<&'a crate::dsl::types::ActionDefinition> {
+	app.ext::<Arc<DslEngine>>()?.definition_for(action_type, None).ok_or_else(|| {
+		Error::ValidationError(format!("Action type not supported: {}", action_type))
+	})
 }
 
 /// Check permissions based on action type's allow_unknown setting
@@ -686,8 +696,8 @@ async fn check_inbound_permissions(
 		&& let Ok(Some(container)) = app.meta_adapter.get_action(tn_id, parent_id).await
 		&& app
 			.ext::<Arc<DslEngine>>()?
-			.get_behavior(&container.typ)
-			.and_then(|b| b.relay_children)
+			.definition_for(&container.typ, container.sub_typ.as_deref())
+			.and_then(|d| d.behavior.relay_children)
 			.unwrap_or(false)
 		&& owns_subject(&container, &action.iss)
 	{
@@ -790,12 +800,7 @@ fn check_subscription_role_permission(
 	action: &ActionToken,
 	subscription: &meta_adapter::Action<Box<str>>,
 ) -> ClResult<()> {
-	// Get role from x.role (with fallback to content.role for migration)
-	let content_json = subscription
-		.content
-		.as_ref()
-		.and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
-	let user_role = helpers::get_subscription_role(subscription.x.as_ref(), content_json.as_ref());
+	let user_role = helpers::get_subscription_role(subscription.x.as_ref());
 
 	// Extract action type and subtype
 	let (action_type, subtype) = helpers::extract_type_and_subtype(&action.t);
@@ -1411,8 +1416,16 @@ async fn send_push_notification(
 /// Process related actions that came with any action
 ///
 /// Related actions are stored in action_tokens with ack = main_action_id.
-/// This verifies and stores them (skipping permission checks as they're pre-approved).
-async fn process_related_actions(app: &App, tn_id: TnId, action_id: &str) {
+/// This verifies and stores them.
+/// `client_address` is the address the *primary* arrived from, and every related token is
+/// charged against it: a related CONN must pay proof of work exactly as a primary CONN does.
+/// `None` means there is no inbound caller to charge — see `history_sync`.
+async fn process_related_actions(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	client_address: Option<String>,
+) {
 	// Get related action tokens that were waiting for this action
 	let Ok(related_tokens) = app.meta_adapter.get_related_action_tokens(tn_id, action_id).await
 	else {
@@ -1425,12 +1438,8 @@ async fn process_related_actions(app: &App, tn_id: TnId, action_id: &str) {
 
 	info!("Processing {} related actions for {}", related_tokens.len(), action_id);
 
-	// Load the stored main action to enforce the APRV→subject binding. An APRV
-	// pre-approves exactly the action named in its `subject`; a bundled related
-	// token with a different id is smuggled (e.g. a captured public owner-APRV
-	// POSTed with an attacker's own token in `related`) and would bypass the
-	// follower/subscription gates. So only the APRV's declared subject may be
-	// processed pre-approved. Fail closed if the main action can't be read back.
+	// Load the stored main action to enforce the primary→subject binding.
+	// Fail closed if the main action can't be read back.
 	let Some(main_action) = app.meta_adapter.get_action(tn_id, action_id).await.ok().flatten()
 	else {
 		warn!(
@@ -1439,23 +1448,57 @@ async fn process_related_actions(app: &App, tn_id: TnId, action_id: &str) {
 		);
 		return;
 	};
-	let main_is_aprv = main_action.typ.as_ref() == "APRV";
-	let aprv_subject: Option<&str> = main_action.subject.as_deref();
+	// `deliver_subject` is what bundled the token; resolve it the way every other behavior
+	// lookup does. Fail closed: no engine, no definition ⇒ `false`, and every bundled token
+	// takes the fully-checked path.
+	let deliver_subject = match app.ext::<Arc<DslEngine>>() {
+		Ok(dsl) => dsl
+			.definition_for(&main_action.typ, main_action.sub_typ.as_deref())
+			.and_then(|d| d.behavior.deliver_subject)
+			.unwrap_or(false),
+		Err(_) => false,
+	};
+	let main_subject: Option<&str> = main_action.subject.as_deref();
 
 	let mut success_count = 0;
 	let mut fail_count = 0;
 
 	for (related_action_id, related_token) in &related_tokens {
-		if main_is_aprv && aprv_subject != Some(&**related_action_id) {
-			warn!(
-				"Skipping related action {} not bound to APRV {} subject {:?}",
-				related_action_id, action_id, aprv_subject
-			);
-			continue;
-		}
-		debug!("Processing related action {}", related_action_id);
+		// Pre-approval is bound to the main action's declared `subject`, and only when the
+		// main action's definition sets `deliver_subject` — that flag is what put the token
+		// in the bundle in the first place (`post_store.rs` and `fanout.rs` set
+		// `related_action_id` nowhere else).
+		//
+		// `process_preapproved_action_token` skips `check_inbound_permissions`,
+		// `check_subscription_permissions`, `check_inbound_flags` and visibility resolution,
+		// so a smuggled token (a captured public owner-APRV re-POSTed with an attacker's own
+		// token in `related`) must not reach it. The checked path is what denies it — nothing
+		// is gained by *dropping* the token instead, and dropping it cost real traffic:
+		// `/api/outbox` (`handler::build_outbox_item`) bundles a STAT of the primary, and for
+		// a primary with a subject the subject's token *and its STAT*, whatever the primary's
+		// type. Under a REPOST or INVT primary those STATs are not the declared subject, so a
+		// third "skip" arm silently discarded every one of them.
+		let result = if deliver_subject && main_subject == Some(&**related_action_id) {
+			debug!("Processing pre-approved related action {}", related_action_id);
+			process_preapproved_action_token(app, tn_id, related_action_id, related_token).await
+		} else {
+			debug!("Processing related action {}", related_action_id);
+			// The `_inner` form, not `process_inbound_action_token`: full checks, but no
+			// nested related-token processing, so a self- or mutually-acking bundle
+			// cannot spawn an unbounded chain of tasks.
+			process_inbound_action_token_inner(
+				app,
+				tn_id,
+				related_action_id,
+				related_token,
+				false,
+				client_address.clone(),
+				false,
+			)
+			.await
+		};
 
-		match process_preapproved_action_token(app, tn_id, related_action_id, related_token).await {
+		match result {
 			Ok(_) => {
 				success_count += 1;
 			}

@@ -236,6 +236,7 @@ const TENANT_CASCADE_TABLES: &[&str] = &[
 	"profiles",
 	"tags",
 	"settings",
+	"profile_settings",
 	"subscriptions",
 	"tenant_data",
 	"key_cache",

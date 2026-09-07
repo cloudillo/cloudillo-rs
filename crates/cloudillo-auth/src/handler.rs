@@ -30,6 +30,13 @@ use cloudillo_types::{
 
 use crate::prelude::*;
 
+/// Longest `exp` a PROXY token may carry to be traded for a session.
+///
+/// `cloudillo_core::request::create_proxy_token` mints them with 60s; the slack covers
+/// clock skew between federated servers. See the `t == "PROXY"` gate in
+/// [`get_access_token`].
+const PROXY_TOKEN_MAX_LIFETIME: i64 = 300;
+
 /// # Login
 #[skip_serializing_none]
 #[derive(Clone, Serialize)]
@@ -128,20 +135,36 @@ pub async fn post_login(
 /// # GET /api/auth/login-token
 pub async fn get_login_token(
 	State(app): State<App>,
+	IdTag(id_tag): IdTag,
 	OptionalAuth(auth): OptionalAuth,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Option<Login>>>)> {
 	if let Some(auth) = auth {
+		// A delegated credential is never the account. A share-link token's `id_tag` *is*
+		// the tenant (it is minted `sub: None`), so it would satisfy the host binding in
+		// `create_tenant_login` and trade a read-only file scope for an owner session.
+		if auth.scope.is_some() {
+			warn!(subject = %auth.id_tag, "login-token denied - delegated token");
+			return Err(Error::PermissionDenied);
+		}
 		info!("login-token for {}", &auth.id_tag);
-		let auth = app.auth_adapter.create_tenant_login(&auth.id_tag).await;
-		if let Ok(auth) = auth {
-			let (_status, Json(login_data)) = return_login(&app, auth).await?;
-			let response =
-				ApiResponse::new(Some(login_data)).with_req_id(req_id.unwrap_or_default());
-			Ok((StatusCode::OK, Json(response)))
-		} else {
-			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-			Err(Error::PermissionDenied)
+		// A session whose `id_tag` is not this host's tenant fails the adapter's host binding.
+		// Tokens here are bearer-only and stored per origin, so an ordinary same-origin session
+		// cannot produce that mismatch — it means a credential minted elsewhere is being
+		// presented. Denied outright, with the delay kept as an anti-enumeration measure for
+		// the adapter's other failure modes (absent or disabled tenant).
+		match app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag).await {
+			Ok(auth_login) => {
+				let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
+				let response =
+					ApiResponse::new(Some(login_data)).with_req_id(req_id.unwrap_or_default());
+				Ok((StatusCode::OK, Json(response)))
+			}
+			Err(e) => {
+				warn!(subject = %auth.id_tag, host = %id_tag, error = %e, "login-token denied");
+				tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+				Err(Error::PermissionDenied)
+			}
 		}
 	} else {
 		// No authentication - return empty result
@@ -299,6 +322,183 @@ fn derived_sub(auth: &auth_adapter::AuthCtx) -> Option<&str> {
 	(!auth.anonymous).then_some(&*auth.id_tag)
 }
 
+/// Whether an inbound action token may be traded for a session.
+///
+/// **PROXY only.** PROXY is minted for exactly this exchange
+/// (`cloudillo_core::request::create_proxy_token`, 60s `exp`); every *other* action type is
+/// handed to third parties by design — `/api/actions?includeTokens=true` is unauthenticated,
+/// `/api/outbox` reaches any follower, CONV fan-out and roster backfill reach every member —
+/// so without this any signed action token naming this tenant in `aud` is a bearer credential
+/// minting a full-role session as its issuer.
+///
+/// **And it must expire soon.** `verify_jwt_signature` in cloudillo-action cannot require `exp`
+/// globally (ordinary federated posts legitimately carry none), so the requirement lives here,
+/// on the one path where a missing or distant expiry turns a captured token into a standing
+/// credential. `max_exp` is `now + PROXY_TOKEN_MAX_LIFETIME`; the slack over PROXY's own 60s
+/// covers clock skew between federated servers.
+fn proxy_exchange_allowed(typ: &str, exp: Option<i64>, max_exp: i64) -> bool {
+	typ == "PROXY" && exp.is_some_and(|e| e <= max_exp)
+}
+
+/// The role set a re-minted session token should carry, re-read from storage rather than
+/// copied from the presented `r` claim — these tokens are renewable indefinitely, so carrying
+/// `r` forward would let an out-of-band revocation never take effect.
+///
+/// The tenant account itself gets the base `leader` hierarchy plus the extras in
+/// `tenants.roles` (`SADM`), mirroring auth-adapter-sqlite's `build_tenant_owner_roles`; a
+/// failed `read_tenant` still leaves the base hierarchy. For everyone else the outcomes are
+/// kept apart: a revocation returns `Ok(None)` (row present, no roles) or `Err(NotFound)`
+/// (profile deleted), and both narrow. Only a genuinely transient `Err` falls back to the
+/// presented claim rather than presenting as a downgrade.
+/// `None` means "no roles" (an empty set never becomes `Some("")`).
+///
+/// The "is this the tenant account" comparison stays a plain `==`; both sides are canonical by
+/// construction — see [`cloudillo_types::utils::normalize_id_tag`] for why that rule holds.
+async fn reread_roles(
+	app: &App,
+	tn_id: TnId,
+	tenant_id_tag: &str,
+	auth: &auth_adapter::AuthCtx,
+) -> ClResult<Option<String>> {
+	// The revocation choke point for the tenant's `status`, for every caller and not just the
+	// account: a soft-deleted tenant (`"X"`, what `assert_tenant_active` rejects at login)
+	// must not keep minting refreshes for a community member either — they take the
+	// `read_profile_roles` branch below. A *failed* read is not a denial; it only narrows.
+	//
+	// ponytail: a community member pays two reads per refresh here, and they cannot be merged —
+	// `read_tenant` is on the **auth** adapter, `read_profile_roles` on the **meta** adapter,
+	// different databases. Revisit only with a measurement, and then by moving the status into
+	// the roles' adapter rather than caching a revocation gate.
+	let tenant = app.auth_adapter.read_tenant(tenant_id_tag).await.ok();
+	if tenant.as_ref().is_some_and(|t| t.status.as_deref() == Some("X")) {
+		warn!(subject = %auth.id_tag, tenant = %tenant_id_tag, "Role re-read denied - tenant deleted");
+		return Err(Error::PermissionDenied);
+	}
+
+	let expanded = if auth.id_tag.as_ref() == tenant_id_tag {
+		let mut roles: Vec<Box<str>> = vec!["leader".into()];
+		// A failed read keeps the plain `leader` hierarchy.
+		if let Some(extra) = tenant.and_then(|t| t.roles) {
+			roles.extend(extra.iter().cloned());
+		}
+		Some(expand_roles_preserving_extras(&roles))
+	} else {
+		match app.meta_adapter.read_profile_roles(tn_id, &auth.id_tag).await {
+			Ok(Some(roles)) => Some(expand_roles(&roles)),
+			// A deleted profile surfaces as `Err(NotFound)`, not `Ok(None)` — that is a
+			// revocation, not a transient fault, so it narrows just like a NULL `roles`.
+			Ok(None) | Err(Error::NotFound) => None,
+			Err(e) => {
+				warn!(
+					"Failed to re-read roles for {} in tn_id {:?}, keeping presented set: {}",
+					auth.id_tag, tn_id, e
+				);
+				Some(auth.roles.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(","))
+			}
+		}
+	};
+	Ok(narrow_to_presented(expanded, &auth.roles).filter(|s| !s.is_empty()))
+}
+
+/// Intersect a re-read role set with the presented one: a re-read may only *narrow*.
+///
+/// Several credential families authenticate *as* the tenant while deliberately carrying no
+/// roles — `cloudillo_core::middleware` builds an `idp_` API key's `AuthCtx` with
+/// `roles: Box::new([])` — so an unintersected re-read turns one into a full owner session.
+/// A JWT session's presented set was minted by the same expansion, so this never costs it a
+/// role it legitimately holds; an out-of-band *promotion* simply waits for the next login.
+fn narrow_to_presented(expanded: Option<String>, presented: &[Box<str>]) -> Option<String> {
+	let presented: std::collections::HashSet<&str> = presented.iter().map(AsRef::as_ref).collect();
+	expanded
+		.map(|s| s.split(',').filter(|r| presented.contains(r)).collect::<Vec<&str>>().join(","))
+}
+
+/// The four DAV capability scopes, comma-separated, normalised — or `None` if `requested`
+/// contains anything else. Whitespace around entries is trimmed, mirroring
+/// `cloudillo_core::scope::has_scope`'s tolerance for `", "` separators.
+fn normalized_dav_scope(requested: &str) -> Option<String> {
+	const DAV_SCOPES: &[&str] = &["carddav:read", "carddav:write", "caldav:read", "caldav:write"];
+
+	// `split` always yields at least one entry, so an empty string fails the membership test.
+	let entries: Vec<&str> = requested.split(',').map(str::trim).collect();
+	entries.iter().all(|e| DAV_SCOPES.contains(e)).then(|| entries.join(","))
+}
+
+/// Validate a client-requested `?scope=` against what the caller can actually reach, returning the
+/// scope string to stamp into the minted token.
+///
+/// Without this, `?scope=file:{id}:W` was a self-service capability mint: `file_access`'s scope
+/// short-circuit treats a matching file scope as *the* grant, on the assumption that only a server
+/// that checked the access ever minted one. Same `min()` cap as the `?via=` branch.
+///
+/// Both call sites reject a *scoped* caller before reaching here (the `auth.scope.is_some()` guard
+/// in the session branch; the federated branch authenticates with an action token, which carries
+/// no scope), so `apkg:publish` only needs the role test.
+///
+/// Its `App`-dependent half — the `check_file_access_with_scope` call — is covered indirectly by
+/// `cloudillo_core::tests::file_access_scope::scope_mint_denies_strangers_and_caps_at_real_access`,
+/// which pins the ladder and the `scope_char_within` cap this composes. There is no `App` test
+/// harness in the tree to pin the composition itself.
+async fn validated_scope(
+	app: &App,
+	tn_id: TnId,
+	tenant_id_tag: &str,
+	caller_id_tag: &str,
+	caller_roles: &[Box<str>],
+	requested: Option<&str>,
+) -> ClResult<Option<String>> {
+	use cloudillo_core::file_access::{self, FileAccessCtx};
+	use cloudillo_types::types::TokenScope;
+	use tracing::warn;
+
+	let Some(requested) = requested else { return Ok(None) };
+
+	// Fail closed on an unrecognised scope: `scope::scope_permits` grants a non-`TokenScope`
+	// string nothing outside the DAV families, so minting one would produce a token that is
+	// useless at best and, on any looser consumer, unrestricted.
+	let Some(token_scope) = TokenScope::parse(requested) else {
+		// The DAV capability families are the one legitimate non-`TokenScope` value here.
+		// They only ever narrow a session (`scope::scope_permits` allowlists them for the
+		// DAV surface and denies everything else), so no authorisation test is needed.
+		return normalized_dav_scope(requested)
+			.map(Some)
+			.ok_or_else(|| Error::ValidationError("Invalid scope format".into()));
+	};
+
+	match token_scope {
+		TokenScope::File { file_id, access } => {
+			let ctx = FileAccessCtx {
+				user_id_tag: caller_id_tag,
+				tenant_id_tag,
+				user_roles: caller_roles,
+			};
+			let result =
+				file_access::check_file_access_with_scope(app, tn_id, &file_id, &ctx, None, None)
+					.await
+					.map_err(|_| {
+						warn!("Scope denied: {} has no access to file {}", caller_id_tag, file_id);
+						Error::PermissionDenied
+					})?;
+
+			// `to_scope_char` caps admin at 'W' — a scope never carries share-management
+			// authority. `None` only for `AccessLevel::None`, which `check_file_access_with_scope`
+			// already turned into `Err`.
+			let scope_char = file_access::scope_char_within(access, result.access_level)
+				.ok_or(Error::PermissionDenied)?;
+			Ok(Some(format!("file:{}:{}", file_id, scope_char)))
+		}
+		// Grants no file access, but `scope::scope_permits` allowlists it for app publishing,
+		// so it must not be self-mintable either. Mirrors `require_leader`.
+		TokenScope::ApkgPublish => {
+			if !cloudillo_core::roles::is_leader(caller_roles) {
+				warn!("apkg:publish scope denied for non-leader {}", caller_id_tag);
+				return Err(Error::PermissionDenied);
+			}
+			Ok(Some(requested.to_string()))
+		}
+	}
+}
+
 pub async fn get_access_token(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -343,13 +543,18 @@ pub async fn get_access_token(
 		let via_bare_file_id =
 			via_file_id.split_once(':').map_or(via_file_id.as_str(), |(_, fid)| fid);
 
-		// Check caller has access to the via (source) file
+		// Check caller has access to the via (source) file, and remember the ceiling that
+		// access imposes. A scoped caller must never hand out more than it holds: a
+		// `file:X:R` guest re-scoping through an embed link stored at `'W'` would
+		// otherwise walk the whole embed graph with write access.
+		let mut caller_cap: Option<AccessLevel> = None;
 		let caller_has_via_access = if let Some(ref caller_scope) = auth.scope {
-			// Must be scoped to the via file (bare id). The level needs no test —
-			// `TokenScope::parse` only yields `R`/`C`/`W`, so any file scope carries read.
-			if let Some(TokenScope::File { file_id: ref scope_fid, .. }) =
+			// Must be scoped to the via file (bare id), and the level it carries caps
+			// whatever is minted below.
+			if let Some(TokenScope::File { file_id: ref scope_fid, access }) =
 				TokenScope::parse(caller_scope)
 			{
+				caller_cap = Some(access);
 				scope_fid == via_bare_file_id
 			} else {
 				false
@@ -362,7 +567,7 @@ pub async fn get_access_token(
 				tenant_id_tag: &id_tag.0,
 				user_roles: &auth.roles,
 			};
-			file_access::check_file_access_with_scope(
+			match file_access::check_file_access_with_scope(
 				&app,
 				tn_id,
 				via_bare_file_id,
@@ -371,7 +576,17 @@ pub async fn get_access_token(
 				None,
 			)
 			.await
-			.is_ok()
+			{
+				Ok(result) => {
+					// The level the caller actually holds on the via file caps the
+					// mint, exactly as the scoped arm's `access` does. `is_ok()`
+					// alone succeeds at `Read`, so discarding this let a read-only
+					// caller mint `:W` off a `'W'` embed link.
+					caller_cap = Some(result.access_level);
+					true
+				}
+				Err(_) => false,
+			}
 		};
 
 		if !caller_has_via_access {
@@ -392,12 +607,18 @@ pub async fn get_access_token(
 				Error::PermissionDenied
 			})?;
 
-		// Determine effective access: min(requested, link_permission)
-		let effective_access = requested_access.min(AccessLevel::from_perm_char(link_perm));
-
-		// `to_scope_char` caps admin at 'W' — a scope never carries share-management authority. Its
-		// `None` arm is unreachable here: the link permission came from a stored share entry.
-		let scope_char = effective_access.to_scope_char().ok_or(Error::PermissionDenied)?;
+		// Determine effective access: min(requested, link_permission, caller's own level).
+		// Both arms above set `caller_cap` whenever `caller_has_via_access` holds, and the
+		// handler has already returned when it does not — so the `None` default is
+		// unreachable and fails closed if a future arm forgets to set it.
+		//
+		// `scope_char_within` caps admin at 'W' — a scope never carries share-management
+		// authority. Its `None` arm is unreachable here: the link permission came from a
+		// stored share entry.
+		let asked = requested_access.min(AccessLevel::from_perm_char(link_perm));
+		let caller_ceiling = caller_cap.unwrap_or(AccessLevel::None);
+		let scope_char = cloudillo_core::file_access::scope_char_within(asked, caller_ceiling)
+			.ok_or(Error::PermissionDenied)?;
 		let target_scope = format!("file:{}:{}", target_file_id, scope_char);
 
 		let token_result = app
@@ -425,8 +646,9 @@ pub async fn get_access_token(
 			"token": token_result,
 			"scope": target_scope,
 			"resourceId": target_file_id,
-			// Same cap as the scope, so the client never sees authority the token cannot exercise.
-			"accessLevel": effective_access.min(AccessLevel::Write).as_str(),
+			// Derived from the minted char, not recomputed: `scope_char_within` is the one
+			// place the cap lives, and `to_scope_char` already caps Admin at 'W'.
+			"accessLevel": AccessLevel::from_perm_char(scope_char).as_str(),
 		}))
 		.with_req_id(req_id.unwrap_or_default());
 		return Ok((StatusCode::OK, Json(response)));
@@ -439,6 +661,26 @@ pub async fn get_access_token(
 		let auth_action = verify_fn(&app, tn_id, &token_param, Some(&addr.ip())).await?;
 		if *auth_action.aud.as_ref().ok_or(Error::PermissionDenied)?.as_ref() != *id_tag.0 {
 			warn!("Auth action issuer {} doesn't match id_tag {}", auth_action.iss, id_tag.0);
+			return Err(Error::PermissionDenied);
+		}
+
+		// See [`proxy_exchange_allowed`] for why PROXY, and only a short-lived one, is the
+		// single action type tradeable for a session.
+		let max_exp = Timestamp::from_now(PROXY_TOKEN_MAX_LIFETIME).0;
+		if !proxy_exchange_allowed(&auth_action.t, auth_action.exp.map(|e| e.0), max_exp) {
+			if auth_action.t.as_ref() == "PROXY" {
+				warn!(
+					issuer = %auth_action.iss,
+					exp = ?auth_action.exp,
+					"Access-token exchange denied - PROXY expiry missing or too distant"
+				);
+			} else {
+				warn!(
+					issuer = %auth_action.iss,
+					action_type = %auth_action.t,
+					"Access-token exchange denied - not a PROXY token"
+				);
+			}
 			return Err(Error::PermissionDenied);
 		}
 		debug!(
@@ -488,6 +730,21 @@ pub async fn get_access_token(
 
 		debug!("Expanded roles for access token: {:?}", expanded_roles);
 
+		// The caller may only be handed a scope for a file they can already reach.
+		let caller_roles = expanded_roles
+			.as_deref()
+			.map(cloudillo_core::roles::parse_roles)
+			.unwrap_or_default();
+		let scope = validated_scope(
+			&app,
+			tn_id,
+			&id_tag.0,
+			&auth_action.iss,
+			&caller_roles,
+			query.scope.as_deref(),
+		)
+		.await?;
+
 		let token_result = app
 			.auth_adapter
 			.create_access_token(
@@ -496,14 +753,14 @@ pub async fn get_access_token(
 					iss: &id_tag.0,
 					sub: Some(&auth_action.iss),
 					r: expanded_roles.as_deref(),
-					scope: query.scope.as_deref(),
+					scope: scope.as_deref(),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
 				},
 			)
 			.await?;
 		info!(
 			"Issued access token: id_tag={} sub={} scope={:?} via=action_token",
-			id_tag.0, auth_action.iss, query.scope
+			id_tag.0, auth_action.iss, scope
 		);
 		let response = ApiResponse::new(json!({ "token": token_result }))
 			.with_req_id(req_id.unwrap_or_default());
@@ -651,33 +908,26 @@ pub async fn get_access_token(
 			query.scope.as_deref()
 		);
 
-		// The tenant owner implicitly has `leader`, plus whatever out-of-band roles the tenant row
-		// carries — plain `expand_roles` emits only `ROLE_HIERARCHY` entries and would drop `SADM`,
-		// costing the site admin every SADM-gated operation.
-		//
-		// Read those extras from the tenant row rather than carrying the presented token's roles
-		// forward, or a role revoked out of band survives indefinitely across refreshes.
-		// `tenants.roles` holds the extras alone, exactly what auth-adapter-sqlite's
-		// `build_tenant_owner_roles` appends to the base hierarchy — mirror it so login and refresh
-		// mint the same set. A failed read degrades to plain `leader`, which only narrows.
-		let expanded_roles = if auth.id_tag == id_tag.0 {
-			let mut roles: Vec<Box<str>> = vec!["leader".into()];
-			if let Ok(tenant) = app.auth_adapter.read_tenant(&id_tag.0).await
-				&& let Some(extra) = tenant.roles
-			{
-				roles.extend(extra.iter().cloned());
-			}
-			Some(expand_roles_preserving_extras(&roles))
-		} else {
-			app.meta_adapter
-				.read_profile_roles(tn_id, &auth.id_tag)
-				.await
-				.ok()
-				.flatten()
-				.as_ref()
-				.map(|roles| expand_roles(roles))
-		}
-		.filter(|s: &String| !s.is_empty());
+		// Re-read rather than copy the presented `r` claim forward; see `reread_roles`.
+		let expanded_roles = reread_roles(&app, tn_id, &id_tag.0, &auth).await?;
+
+		// The caller may only be handed a scope for a file they can already reach.
+		// Scored on the *re-read* set above, not the presented token's `r` claim — that claim
+		// is what the re-read exists to distrust, and it decides both `ApkgPublish` and the
+		// role rung of `file_access`.
+		let caller_roles = expanded_roles
+			.as_deref()
+			.map(cloudillo_core::roles::parse_roles)
+			.unwrap_or_default();
+		let scope = validated_scope(
+			&app,
+			tn_id,
+			&id_tag.0,
+			&auth.id_tag,
+			&caller_roles,
+			query.scope.as_deref(),
+		)
+		.await?;
 
 		let token_result = app
 			.auth_adapter
@@ -687,14 +937,14 @@ pub async fn get_access_token(
 					iss: &id_tag.0,
 					sub: Some(&auth.id_tag),
 					r: expanded_roles.as_deref(),
-					scope: query.scope.as_deref(),
+					scope: scope.as_deref(),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
 				},
 			)
 			.await?;
 		info!(
 			"Issued access token: id_tag={} sub={} scope={:?} via=session",
-			id_tag.0, auth.id_tag, query.scope
+			id_tag.0, auth.id_tag, scope
 		);
 		let response = ApiResponse::new(json!({ "token": token_result }))
 			.with_req_id(req_id.unwrap_or_default());
@@ -727,6 +977,18 @@ pub async fn get_proxy_token(
 	Query(query): Query<ProxyTokenQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxyTokenRes>>)> {
+	// `scope::scope_permits` already keeps every delegated token off this route. Fail closed
+	// here as well, for both branches: a share-link token must never be able to renew itself
+	// past its link's revocation, and re-deriving roles below would hand it the tenant's own
+	// (its `id_tag` *is* the tenant, since it is minted `sub: None`).
+	if auth.scope.is_some() {
+		warn!(subject = %auth.id_tag, scope = ?auth.scope, "Proxy token denied - delegated token");
+		return Err(Error::PermissionDenied);
+	}
+
+	// Re-read rather than copy the presented `r` claim forward; see `reread_roles`.
+	let expanded_roles = reread_roles(&app, auth.tn_id, &own_id_tag, &auth).await?;
+
 	// If target idTag is specified and different from own server, use federation
 	if let Some(ref target_id_tag) = query.id_tag
 		&& target_id_tag != own_id_tag.as_ref()
@@ -737,9 +999,12 @@ pub async fn get_proxy_token(
 		}
 
 		// Federated exchange mints a token in which the *tenant* vouches for the caller
-		// toward a remote server, so it stays owner/leader-only. The local branch below
-		// is an ordinary self-scoped session token and needs only auth.
-		if auth.scope.is_some() || !cloudillo_core::roles::is_leader(&auth.roles) {
+		// toward a remote server, so it stays owner/leader-only — and that standing is
+		// re-read from storage above, not taken from the presented `r` claim, which a
+		// since-revoked leader would otherwise keep presenting until their token expired.
+		// The local branch below is an ordinary self-scoped session token and needs only auth.
+		let reread = cloudillo_core::roles::parse_roles(expanded_roles.as_deref().unwrap_or(""));
+		if !cloudillo_core::roles::is_leader(&reread) {
 			warn!(
 				subject = %auth.id_tag,
 				target = %target_id_tag,
@@ -775,7 +1040,8 @@ pub async fn get_proxy_token(
 
 	// Default: create local access token (valid on own server)
 	debug!("Generating local access token for {}", &auth.id_tag);
-	let roles_str: String = auth.roles.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(",");
+
+	let roles_str = expanded_roles.unwrap_or_default();
 	let token = app
 		.auth_adapter
 		.create_access_token(
@@ -792,7 +1058,11 @@ pub async fn get_proxy_token(
 
 	info!("Issued proxy token: id_tag={} sub={} via=local", own_id_tag, auth.id_tag);
 	// Return roles alongside token for local context
-	let roles: Vec<String> = auth.roles.iter().map(ToString::to_string).collect();
+	let roles: Vec<String> = roles_str
+		.split(',')
+		.filter(|s| !s.is_empty())
+		.map(ToString::to_string)
+		.collect();
 	let response = ApiResponse::new(ProxyTokenRes { token: token.to_string(), roles: Some(roles) })
 		.with_req_id(req_id.unwrap_or_default());
 
@@ -812,6 +1082,7 @@ pub struct SetPasswordReq {
 
 pub async fn post_set_password(
 	State(app): State<App>,
+	IdTag(host_id_tag): IdTag,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<SetPasswordReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
@@ -839,6 +1110,20 @@ pub async fn post_set_password(
 				_ => Error::ValidationError("Invalid reference".into()),
 			}
 		})?;
+
+	// Bind the ref to the host tenant before any mutation. `validate_ref` is
+	// tenant-agnostic, so without this a ref belonging to tenant A could be
+	// posted to tenant B's host and A's password would be changed (a
+	// cross-tenant write) before `create_tenant_login` below refused the
+	// session. Same check as the `?refId=` branch in `get_access_token`.
+	if id_tag.as_ref() != host_id_tag.as_ref() {
+		warn!(
+			ref_owner = %id_tag,
+			host = %host_id_tag,
+			"set-password ref does not belong to the host tenant"
+		);
+		return Err(Error::PermissionDenied);
+	}
 
 	// Defence-in-depth: the frontend gates the password form on
 	// /api/refs/{refId}/idp-status, but a curl client could otherwise post
@@ -899,8 +1184,9 @@ pub async fn post_set_password(
 		"Password set successfully, generating login token"
 	);
 
-	// Create a login token for the user
-	let auth = app.auth_adapter.create_tenant_login(&id_tag).await?;
+	// Create a login token for the user. `id_tag == host_id_tag` is enforced by
+	// the guard above, so the auth adapter's host binding cannot fail here.
+	let auth = app.auth_adapter.create_tenant_login(&id_tag, &host_id_tag).await?;
 
 	// Return login info using the existing return_login helper
 	let (_status, Json(login_data)) = return_login(&app, auth).await?;
@@ -1163,13 +1449,30 @@ pub async fn post_login_init(
 	headers: HeaderMap,
 ) -> ClResult<(StatusCode, Json<ApiResponse<LoginInitResponse>>)> {
 	if let Some(auth) = auth {
+		// Same delegated-credential rejection as `get_login_token`.
+		if auth.scope.is_some() {
+			warn!(subject = %auth.id_tag, "login-init denied - delegated token");
+			return Err(Error::PermissionDenied);
+		}
 		// Authenticated path: create fresh login token (replaces login-token)
 		info!("login-init for authenticated user {}", &auth.id_tag);
-		let auth_login = app.auth_adapter.create_tenant_login(&auth.id_tag).await?;
-		let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
-		let response = ApiResponse::new(LoginInitResponse::Authenticated { login: login_data })
-			.with_req_id(req_id.unwrap_or_default());
-		Ok((StatusCode::OK, Json(response)))
+		// A host-binding miss is not a routine "no account here" — see `get_login_token`.
+		// This route sits in `recovery()`, where the IP ban is deliberately skipped, so it
+		// must not be the softer sibling: deny, and pay the same delay.
+		match app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag.0).await {
+			Ok(auth_login) => {
+				let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
+				let response =
+					ApiResponse::new(LoginInitResponse::Authenticated { login: login_data })
+						.with_req_id(req_id.unwrap_or_default());
+				Ok((StatusCode::OK, Json(response)))
+			}
+			Err(e) => {
+				warn!(subject = %auth.id_tag, host = %id_tag.0, error = %e, "login-init denied");
+				tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+				Err(Error::PermissionDenied)
+			}
+		}
 	} else {
 		// Unauthenticated path: QR init data + a "passkeys exist" flag (the challenge
 		// itself is minted at prompt time) + masked email for forgot-password
@@ -1207,6 +1510,31 @@ mod tests {
 	}
 
 	#[test]
+	fn a_re_read_never_upgrades_a_credential_that_carries_no_roles() {
+		// `middleware.rs` builds an `idp_` API key's `AuthCtx` with an empty role set on
+		// purpose; without the intersection the tenant branch would mint it a full owner.
+		assert_eq!(narrow_to_presented(Some("leader,moderator".into()), &[]), Some(String::new()));
+	}
+
+	#[test]
+	fn a_re_read_keeps_the_roles_a_session_legitimately_holds() {
+		let presented: Vec<Box<str>> = vec!["leader".into(), "moderator".into()];
+		assert_eq!(
+			narrow_to_presented(Some("leader,moderator".into()), &presented),
+			Some("leader,moderator".into())
+		);
+	}
+
+	#[test]
+	fn a_re_read_drops_roles_the_presented_set_never_had() {
+		let presented: Vec<Box<str>> = vec!["moderator".into()];
+		assert_eq!(
+			narrow_to_presented(Some("leader,moderator".into()), &presented),
+			Some("moderator".into())
+		);
+	}
+
+	#[test]
 	fn derived_sub_keeps_a_session_callers_identity() {
 		assert_eq!(derived_sub(&auth_ctx(false, None)), Some("alice.example.com"));
 	}
@@ -1224,6 +1552,44 @@ mod tests {
 		// A share-link visitor's `id_tag` is the tenant owner by `iss` fallback —
 		// there is no person to name.
 		assert_eq!(derived_sub(&auth_ctx(true, Some("file:f1~abc:R"))), None);
+	}
+
+	/// Only PROXY, and only with a near expiry. Every other action type is handed to third
+	/// parties by design, so accepting one here makes it a bearer credential.
+	#[test]
+	fn only_a_short_lived_proxy_token_is_exchangeable() {
+		let max = 1_000;
+		assert!(proxy_exchange_allowed("PROXY", Some(940), max));
+		assert!(proxy_exchange_allowed("PROXY", Some(max), max), "the boundary is inclusive");
+
+		assert!(!proxy_exchange_allowed("PROXY", None, max), "a missing exp never expires");
+		assert!(!proxy_exchange_allowed("PROXY", Some(max + 1), max), "too distant");
+		// The types a third party can legitimately hold.
+		for typ in ["POST", "APRV", "CONN", "STAT", ""] {
+			assert!(!proxy_exchange_allowed(typ, Some(940), max), "{typ} must not be exchangeable");
+		}
+	}
+
+	/// The DAV capability families are not `TokenScope` values, so `validated_scope` would
+	/// otherwise 400 them. They only ever narrow a session, so they pass through — but
+	/// nothing else does, or the fail-closed mint is back to stamping arbitrary strings.
+	#[test]
+	fn only_known_dav_capability_scopes_pass_through() {
+		assert_eq!(normalized_dav_scope("carddav:read").as_deref(), Some("carddav:read"));
+		assert_eq!(
+			normalized_dav_scope("carddav:read,caldav:write").as_deref(),
+			Some("carddav:read,caldav:write")
+		);
+		assert_eq!(
+			normalized_dav_scope("carddav:read, caldav:write").as_deref(),
+			Some("carddav:read,caldav:write"),
+			"`, ` separators are tolerated like scope::has_scope does"
+		);
+
+		assert_eq!(normalized_dav_scope("carddav:reader"), None);
+		assert_eq!(normalized_dav_scope("carddav"), None);
+		assert_eq!(normalized_dav_scope(""), None);
+		assert_eq!(normalized_dav_scope("carddav:read,bogus"), None, "one bad entry sinks it");
 	}
 }
 

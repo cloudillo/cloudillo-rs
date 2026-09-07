@@ -9,8 +9,13 @@ use axum::{
 	http::StatusCode,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use webauthn_rs::prelude::*;
 
 use cloudillo_core::Auth;
@@ -41,6 +46,66 @@ struct LoginChallengeToken {
 	id_tag: String,
 	state: String, // Serialized PasskeyAuthentication
 	exp: u64,
+	/// Single-use marker, see [`consume_challenge`].
+	jti: String,
+}
+
+/// Login challenges spent by an accepted assertion, until they expire on their own.
+///
+/// WebAuthn requires a challenge be single-use, but the whole `PasskeyAuthentication`
+/// state lives in the client-held JWT — without this record an accepted
+/// `{token, response}` pair replays for the full [`CHALLENGE_EXPIRY_SECS`] window (the
+/// signature-counter check does not catch it: the replayed JWT carries the old counter).
+///
+// ponytail: process-local, so a multi-process deployment would need this in the
+// auth adapter's `vars` table or a shared cache instead. Memory within one TTL window is
+// bounded only by the rate limiter on `GET /api/auth/wa/login/challenge`.
+static SPENT_CHALLENGES: LazyLock<DashMap<String, Instant>> = LazyLock::new(DashMap::new);
+
+/// Above this many live entries, drop the expired ones on the next insert. Rescanning past
+/// the threshold is fine — `GET /api/auth/wa/login/challenge` is rate-limited, so the map
+/// cannot get there often.
+const SPENT_SWEEP_ABOVE: usize = 1024;
+
+/// Record `jti` as spent; `Err` if it was already spent and not yet expired.
+/// Called only once an assertion has verified; see [`post_login`].
+fn consume_challenge(jti: &str) -> ClResult<()> {
+	let now = Instant::now();
+	// Entries are only useful until the challenge expires anyway; drop the dead ones rather
+	// than grow without bound under a replay flood.
+	if SPENT_CHALLENGES.len() > SPENT_SWEEP_ABOVE {
+		SPENT_CHALLENGES.retain(|_, expires| now < *expires);
+	}
+	let expires = now + Duration::from_secs(CHALLENGE_EXPIRY_SECS);
+
+	// One `entry`, not `get` then `insert`: those are two operations, and two concurrent
+	// POSTs carrying the same accepted assertion both saw an absent key and both won. That
+	// race IS the attack — an interceptor races the legitimate request rather than replaying
+	// after it.
+	//
+	// A *stale* entry is not a replay: the challenge JWT carries the same TTL, so
+	// `post_login`'s `exp` check already rejected it and "replayed" would be the wrong
+	// verdict. Refresh it and admit. A live entry is refused *without* refreshing, so a
+	// replay flood cannot keep a spent entry alive another full window.
+	match SPENT_CHALLENGES.entry(jti.to_owned()) {
+		Entry::Occupied(mut spent) => {
+			if now < *spent.get() {
+				warn!("WebAuthn challenge replayed");
+				return Err(Error::Unauthorized);
+			}
+			spent.insert(expires);
+		}
+		Entry::Vacant(slot) => {
+			slot.insert(expires);
+		}
+	}
+	Ok(())
+}
+
+/// Fresh 128-bit single-use id for a login challenge.
+fn new_jti() -> String {
+	let bytes: [u8; 16] = rand::rng().random();
+	URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Build a Webauthn instance for the given tenant
@@ -224,11 +289,15 @@ pub async fn list_reg(
 /// GET /api/auth/wa/reg/challenge - Get registration challenge
 pub async fn get_reg_challenge(
 	State(app): State<App>,
+	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
 ) -> ClResult<(StatusCode, Json<ApiResponse<RegChallengeRes>>)> {
 	info!("Getting WebAuthn registration challenge for {}", auth.id_tag);
 
-	let webauthn = build_webauthn(&auth.id_tag)?;
+	// The RP is the *tenant*, not the caller: `post_login` builds it from the tenant's
+	// id_tag, so enrolling under the caller's own domain would store a credential in
+	// this tenant bound to an RP the enroller controls.
+	let webauthn = build_webauthn(&id_tag)?;
 
 	// Get existing credentials to exclude from registration
 	let existing = app.auth_adapter.list_webauthn_credentials(auth.tn_id).await?;
@@ -243,7 +312,7 @@ pub async fn get_reg_challenge(
 
 	// Start passkey registration
 	let (ccr, reg_state) = webauthn
-		.start_passkey_registration(user_id, &auth.id_tag, &auth.id_tag, Some(exclude_credentials))
+		.start_passkey_registration(user_id, &id_tag, &id_tag, Some(exclude_credentials))
 		.map_err(|e| {
 			warn!("WebAuthn start_passkey_registration error: {:?}", e);
 			Error::Internal("WebAuthn registration error".into())
@@ -259,7 +328,7 @@ pub async fn get_reg_challenge(
 	// Create challenge token
 	let claims = RegChallengeToken {
 		tn_id: auth.tn_id.0,
-		id_tag: auth.id_tag.to_string(),
+		id_tag: id_tag.to_string(),
 		state: state_json,
 		exp: now_secs() + CHALLENGE_EXPIRY_SECS,
 	};
@@ -277,6 +346,7 @@ pub async fn get_reg_challenge(
 /// POST /api/auth/wa/reg - Register a new credential
 pub async fn post_reg(
 	State(app): State<App>,
+	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
 	headers: axum::http::HeaderMap,
 	Json(req): Json<RegReq>,
@@ -293,6 +363,14 @@ pub async fn post_reg(
 		return Err(Error::PermissionDenied);
 	}
 
+	// The challenge is signed with the server-wide HS256 secret, so bind it to this host
+	// the way `post_login` does. The `tn_id` test above already implies it (tn_id ↔ id_tag
+	// is 1:1), but the two gates must not be able to drift apart.
+	if claims.id_tag.as_str() != id_tag.as_ref() {
+		warn!(challenge = %claims.id_tag, host = %id_tag, "Registration challenge tenant mismatch");
+		return Err(Error::PermissionDenied);
+	}
+
 	// Check expiry
 	if claims.exp < now_secs() {
 		warn!("Challenge token expired");
@@ -305,8 +383,8 @@ pub async fn post_reg(
 		Error::Internal("Invalid registration state".into())
 	})?;
 
-	// Build webauthn and finish registration
-	let webauthn = build_webauthn(&auth.id_tag)?;
+	// Build webauthn and finish registration — same RP as the challenge and as login.
+	let webauthn = build_webauthn(&id_tag)?;
 	let passkey = webauthn.finish_passkey_registration(&req.response, &reg_state).map_err(|e| {
 		warn!("WebAuthn finish_passkey_registration error: {:?}", e);
 		Error::PermissionDenied
@@ -421,6 +499,7 @@ async fn try_login_challenge(app: &App, id_tag: &IdTag, tn_id: TnId) -> Option<L
 		id_tag: id_tag.0.to_string(),
 		state: state_json,
 		exp: now_secs() + CHALLENGE_EXPIRY_SECS,
+		jti: new_jti(),
 	};
 	let token = create_challenge_jwt(&claims, &jwt_secret)
 		.map_err(|e| warn!("WebAuthn challenge JWT creation error: {:?}", e))
@@ -451,6 +530,7 @@ pub async fn get_login_challenge(
 /// POST /api/auth/wa/login - Authenticate with WebAuthn
 pub async fn post_login(
 	State(app): State<App>,
+	IdTag(host_id_tag): IdTag,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Json(req): Json<LoginReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<super::handler::Login>>)> {
@@ -475,6 +555,14 @@ pub async fn post_login(
 		return Err(Error::Unauthorized);
 	}
 
+	// The challenge is signed with the server-wide HS256 secret, so one minted at
+	// tenant A's host would otherwise be accepted at any host on this server.
+	if claims.id_tag.as_str() != host_id_tag.as_ref() {
+		warn!(challenge = %claims.id_tag, host = %host_id_tag, "Challenge tenant mismatch");
+		penalize();
+		return Err(Error::Unauthorized);
+	}
+
 	// Deserialize authentication state
 	let auth_state: PasskeyAuthentication = serde_json::from_str(&claims.state).map_err(|e| {
 		warn!("Failed to deserialize authentication state: {:?}", e);
@@ -492,6 +580,16 @@ pub async fn post_login(
 				Error::PermissionDenied
 			})?;
 
+	// Spend the challenge now that an assertion has actually been accepted; see
+	// `SPENT_CHALLENGES` for why the record is needed at all.
+	//
+	// Deliberately *after* verification, not before: a rejected assertion (a cancelled
+	// prompt, the wrong authenticator, a dropped connection) never used the challenge, so
+	// burning it there would force the client to refetch on every mistyped tap. There is
+	// nothing to brute-force in the widened window — an acceptable assertion needs the
+	// authenticator's private key — and `penalize()` plus the IP ban cover the attempts.
+	consume_challenge(&claims.jti).inspect_err(|_| penalize())?;
+
 	// Update the counter in the stored credential
 	let cred_id = URL_SAFE_NO_PAD.encode(auth_result.cred_id());
 	app.auth_adapter
@@ -501,11 +599,67 @@ pub async fn post_login(
 	info!("WebAuthn authentication successful for {}", claims.id_tag);
 
 	// Create login session
-	let auth_login = app.auth_adapter.create_tenant_login(&claims.id_tag).await?;
+	let auth_login = app.auth_adapter.create_tenant_login(&claims.id_tag, &host_id_tag).await?;
 
 	// Return login response using existing pattern
 	let (status, json) = return_login(&app, auth_login).await?;
 	Ok((status, Json(ApiResponse::new(json.0))))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{consume_challenge, new_jti};
+
+	/// The property the record exists for: an accepted assertion's challenge cannot be
+	/// spent twice. (`post_login` calls this only after verification succeeds, so a
+	/// failed attempt never reaches here and its challenge stays usable.)
+	#[test]
+	fn a_spent_challenge_cannot_be_spent_again() {
+		let jti = new_jti();
+		assert!(consume_challenge(&jti).is_ok());
+		assert!(consume_challenge(&jti).is_err());
+	}
+
+	#[test]
+	fn distinct_challenges_are_independent() {
+		let a = new_jti();
+		let b = new_jti();
+		assert_ne!(a, b);
+		assert!(consume_challenge(&a).is_ok());
+		assert!(consume_challenge(&b).is_ok());
+	}
+
+	/// The race the `entry` transaction closes: `get` then `insert` let two concurrent
+	/// callers both observe an absent key and both win, which is how an interceptor
+	/// beats the legitimate request rather than replaying after it.
+	#[test]
+	fn concurrent_callers_spend_a_challenge_exactly_once() {
+		use std::sync::{Arc, Barrier};
+
+		const THREADS: usize = 16;
+		let jti = new_jti();
+		let barrier = Arc::new(Barrier::new(THREADS));
+
+		let winners: usize = std::thread::scope(|s| {
+			let handles: Vec<_> = (0..THREADS)
+				.map(|_| {
+					let jti = jti.clone();
+					let barrier = Arc::clone(&barrier);
+					s.spawn(move || {
+						barrier.wait();
+						consume_challenge(&jti).is_ok()
+					})
+				})
+				.collect();
+			handles
+				.into_iter()
+				.map(|h| h.join().unwrap_or(false))
+				.filter(|won| *won)
+				.count()
+		});
+
+		assert_eq!(winners, 1, "a challenge must be spendable exactly once");
+	}
 }
 
 // vim: ts=4

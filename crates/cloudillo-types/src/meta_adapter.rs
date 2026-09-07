@@ -799,19 +799,27 @@ pub struct FileView {
 	pub parent_id: Option<Box<str>>, // Parent folder file_id (None = root)
 	#[serde(default)]
 	pub root_id: Option<Box<str>>, // Document tree root file_id (None = standalone)
+	/// Where the canonical copy lives — `None` when the file originates here.
 	#[serde(default)]
-	pub owner: Option<ProfileInfo>,
-	/// Raw `files.owner_tag` column — `None` for a locally-owned file.
+	pub upstream: Option<ProfileInfo>,
+	/// Raw `files.upstream_tag` column — `None` for a file that originates here.
 	///
-	/// Not part of the API surface: `owner` above carries the resolved owner,
-	/// falling back to the tenant's own profile when this column is NULL.
+	/// Not part of the API surface: `upstream` above carries the resolved profile.
 	/// Consumers that must agree with the stored column rather than the resolved
 	/// profile — the search indexer, which denormalises it into
-	/// `search_docs.owner_tag` — need the raw value.
+	/// `search_docs.upstream_tag` — need the raw value.
+	#[serde(skip)]
+	pub upstream_tag: Option<Box<str>>,
+	/// The profile with owner authority — `None` falls back to the tenant.
+	#[serde(default)]
+	pub owner: Option<ProfileInfo>,
+	/// Raw `files.owner_tag` column — `None` when the tenant owns the row.
+	///
+	/// Not part of the API surface: `owner` above carries the resolved profile, whose NULL
+	/// fallback is the tenant. Consumers that must tell "the tenant owns this" from "nobody
+	/// placed this locally" — `cloudillo_file::management::patch_file` — need the raw value.
 	#[serde(skip)]
 	pub owner_tag: Option<Box<str>>,
-	#[serde(default)]
-	pub creator: Option<ProfileInfo>,
 	#[serde(default)]
 	pub preset: Option<Box<str>>,
 	#[serde(default)]
@@ -999,10 +1007,10 @@ pub struct ListFileOptions {
 	/// Exclude files by this owner id_tag
 	#[serde(rename = "notOwnerIdTag")]
 	pub not_owner_id_tag: Option<String>,
-	/// Restrict to files owned by the active tenant (owner_tag IS NULL), excluding
-	/// remote/federated cached copies. Unlike `owner_id_tag` (which keys off
-	/// COALESCE(creator_tag, owner_tag, tenant) and so matches the *creator*),
-	/// this keys purely off ownership — the right test for "can be embedded".
+	/// Restrict to files that originate on the active tenant (upstream_tag IS NULL),
+	/// excluding remote/federated cached copies. Unlike `owner_id_tag` (which keys off
+	/// COALESCE(owner_tag, upstream_tag, tenant) — *author attribution*, not authority),
+	/// this keys purely off provenance — the right test for "can be embedded".
 	#[serde(default, rename = "localOnly")]
 	pub local_only: bool,
 	/// Filter by pinned status (user-specific)
@@ -1060,8 +1068,8 @@ pub struct CreateFile {
 	pub file_id: Option<Box<str>>,
 	pub parent_id: Option<Box<str>>, // Parent folder file_id (None = root)
 	pub root_id: Option<Box<str>>,   // Document tree root file_id (None = standalone)
-	pub owner_tag: Option<Box<str>>, // Set only for files owned by someone OTHER than the tenant (e.g., shared files)
-	pub creator_tag: Option<Box<str>>, // The user who actually created the file
+	pub upstream_tag: Option<Box<str>>, // Set only when the canonical copy lives elsewhere (e.g., shared files)
+	pub owner_tag: Option<Box<str>>,    // The profile with owner authority; NULL ⇒ the tenant
 	pub preset: Option<Box<str>>,
 	pub content_type: Box<str>,
 	pub file_name: Box<str>,
@@ -1339,7 +1347,10 @@ pub struct SearchObject<'a> {
 	/// file_id / action_id / id_tag; for `'D'` the container file_id.
 	pub obj_id: &'a str,
 	pub content_type: Option<&'a str>,
-	pub owner_tag: Option<&'a str>,
+	/// Where the object comes from: `files.upstream_tag` for a file or document part,
+	/// `p.id_tag` for a profile, `a.issuer_tag` for an action. Not an owner — it mirrors the
+	/// raw column of the same name, and `FileView::owner` is a different profile entirely.
+	pub upstream_tag: Option<&'a str>,
 	/// None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
 	pub visibility: Option<char>,
 	pub root_id: Option<&'a str>,
@@ -1432,7 +1443,7 @@ pub struct SearchRow {
 	pub title: Option<Box<str>>,
 	pub tags: Option<Box<str>>,
 	pub content_type: Option<Box<str>>,
-	pub owner_tag: Option<Box<str>>,
+	pub upstream_tag: Option<Box<str>>,
 	pub visibility: Option<char>,
 	pub root_id: Option<Box<str>>,
 	pub updated_at: Timestamp,
@@ -1859,6 +1870,19 @@ pub struct ListCalendarObjectOptions {
 	pub include_exceptions: bool,
 }
 
+/// One tenant-local view of a peer relationship. The two follow flags are
+/// *directional* and are not interchangeable — see `native_hooks/fllw.rs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProfileRelation {
+	/// This tenant follows the target.
+	pub following: bool,
+	/// The target follows this tenant. **This** is what the visibility rules mean
+	/// by "follower".
+	pub follower: bool,
+	/// Mutually connected (symmetric, so direction-free).
+	pub connected: bool,
+}
+
 #[async_trait]
 pub trait MetaAdapter: Debug + Send + Sync {
 	// Tenant management
@@ -1892,12 +1916,14 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Unbounded (no LIMIT) — unlike `list_profiles`.
 	async fn list_follower_tags(&self, tn_id: TnId) -> ClResult<Vec<Box<str>>>;
 
-	/// Get relationships between the current user and multiple target profiles
+	/// Get relationships between the current tenant and multiple target profiles.
+	/// Mind the direction of the two follow flags — `following` is "this tenant
+	/// follows the target", `follower` is "the target follows this tenant".
 	///
-	/// Efficiently queries relationship status (following, connected) for multiple profiles
-	/// in a single database call, avoiding N+1 query patterns.
-	///
-	/// Returns: HashMap<target_id_tag, (following: bool, connected: bool)>
+	/// Unlike [`Self::read_profile`] this has no `type IS NOT NULL` filter, so it
+	/// also sees never-synced relationship *stubs* — rows carrying a real
+	/// `follower` flag written by `native_hooks/fllw.rs` after a failed profile
+	/// sync. Access decisions must use this, not `read_profile`.
 	///
 	/// Keys are the id_tags in `target_id_tags`, **verbatim** — an implementation
 	/// that canonicalises id_tags for storage (id_tags are case-insensitive DNS
@@ -1907,7 +1933,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		&self,
 		tn_id: TnId,
 		target_id_tags: &[&str],
-	) -> ClResult<HashMap<String, (bool, bool)>>;
+	) -> ClResult<HashMap<String, ProfileRelation>>;
 
 	/// Reads a profile
 	///
@@ -2088,6 +2114,19 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		aprv_action_id: &str,
 	) -> ClResult<Vec<(Box<str>, Box<str>)>>;
 
+	/// Delete related-action tokens (`ack IS NOT NULL`) older than `before`.
+	///
+	/// `/api/inbox` is unauthenticated and stores a bundle's related tokens *before* the main
+	/// token is verified, so a failed verification orphans them permanently. Nothing else ever
+	/// deletes from this table. Returns the number of rows removed, deleted in batches so a
+	/// large backlog does not hold the write connection for one long statement.
+	///
+	/// **Deliberately cross-tenant, and the only such delete.** It takes no `TnId` because
+	/// `AuthCleanupTask` runs it daily with no tenant in hand; every other DELETE in the
+	/// adapters is tenant-scoped and adding a `tn_id` predicate here would be wrong, not
+	/// safer. Not reachable from any request path.
+	async fn cleanup_orphaned_action_tokens(&self, before: Timestamp) -> ClResult<u64>;
+
 	// File management
 	//*****************
 	async fn get_file_id(&self, tn_id: TnId, f_id: u64) -> ClResult<Box<str>>;
@@ -2250,6 +2289,37 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn update_setting(
 		&self,
 		tn_id: TnId,
+		name: &str,
+		value: Option<serde_json::Value>,
+	) -> ClResult<()>;
+
+	// Profile Settings Management
+	//****************************
+	// Per-profile preferences on this tenant. Unlike the tenant `settings` above, each row is
+	// owned by the profile it names — the members of a community tenant store their own
+	// settings here. Keyed `(tn_id, id_tag, name)`.
+
+	/// List all settings of one profile, optionally filtered by prefix
+	async fn list_profile_settings(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		prefix: Option<&[String]>,
+	) -> ClResult<std::collections::HashMap<String, serde_json::Value>>;
+
+	/// Read a single profile setting by name
+	async fn read_profile_setting(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		name: &str,
+	) -> ClResult<Option<serde_json::Value>>;
+
+	/// Update or delete a profile setting (None = delete)
+	async fn update_profile_setting(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
 		name: &str,
 		value: Option<serde_json::Value>,
 	) -> ClResult<()>;
@@ -2507,7 +2577,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Replace the index rows of `(obj_tp, obj_id)` from the source row's own ACL.
 	///
 	/// `obj_tp` selects the source table — `'F'` files, `'P'` profiles, `'A'`
-	/// actions — and the adapter derives `content_type`, `owner_tag`,
+	/// actions — and the adapter derives `content_type`, `upstream_tag`,
 	/// `visibility`, `root_id` and `created_at` from that row, so the index and its
 	/// source can never disagree about who may see it. Only `title`, `body`, `tags`
 	/// and the part addressing come from the caller.

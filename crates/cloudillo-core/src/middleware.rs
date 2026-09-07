@@ -146,6 +146,26 @@ pub async fn require_leader(
 	Ok(next.run(req).await)
 }
 
+/// The tenant account itself. Must be layered *after* `require_auth`.
+///
+/// Strictly stronger than [`require_leader`]: on a community tenant `leader` is held by
+/// ordinary member profiles, who are not the account. Credentials that authenticate *as*
+/// the tenant — an auth API key, a passkey enrollment — must be behind this, not that.
+pub async fn require_tenant_self(
+	Auth(auth_ctx): Auth,
+	req: Request<Body>,
+	next: Next,
+) -> ClResult<Response<Body>> {
+	let id_tag = req
+		.extensions()
+		.get::<IdTag>()
+		.ok_or_else(|| Error::Internal("IdTag not found in request extensions".into()))?
+		.0
+		.clone();
+	crate::abac::require_tenant_self(&auth_ctx, &id_tag, "tenant credentials")?;
+	Ok(next.run(req).await)
+}
+
 /// Whether [`authenticate`] applies [`crate::scope::scope_permits`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScopeGate {

@@ -134,8 +134,7 @@ async fn load_action_attrs(
 	subject_id_tag: &str,
 	tenant_id_tag: &str,
 ) -> ClResult<ActionAttrs> {
-	use cloudillo_core::abac::VisibilityLevel;
-	use tracing::debug;
+	use cloudillo_core::abac::{self, VisibilityLevel};
 
 	// Get action view from MetaAdapter
 	let action_view = app.meta_adapter.get_action(tn_id, action_id).await?;
@@ -152,42 +151,16 @@ async fn load_action_attrs(
 	// Get visibility from action metadata - convert char to string representation
 	let visibility: Box<str> = VisibilityLevel::from_char(action_view.visibility).as_str().into();
 
-	// Look up subject's relationship with the action issuer
-	let (following, connected) = if subject_id_tag != "guest" && !subject_id_tag.is_empty() {
-		// Get profile to check relationship status using list_profiles with id_tag filter
-		let opts = cloudillo_types::meta_adapter::ListProfileOptions {
-			id_tag: Some(subject_id_tag.to_string()),
-			..Default::default()
-		};
-		match app.meta_adapter.list_profiles(tn_id, &opts).await {
-			Ok(profiles) => {
-				if let Some(profile) = profiles.first() {
-					let following = profile.following;
-					let connected = profile.connected.is_connected();
-					debug!(
-						subject = subject_id_tag,
-						issuer = %action_view.issuer.id_tag,
-						following = following,
-						connected = connected,
-						"Loaded relationship status for action permission check"
-					);
-					(following, connected)
-				} else {
-					debug!(subject = subject_id_tag, "Profile not found, assuming no relationship");
-					(false, false)
-				}
-			}
-			Err(e) => {
-				debug!(
-					subject = subject_id_tag,
-					error = %e,
-					"Failed to load profile, assuming no relationship"
-				);
-				(false, false)
-			}
-		}
+	// The reader's relation to *this tenant*: `follower` is "they follow us", which is what the
+	// visibility rules mean. Same value and same guard as `cloudillo_file::perm::load_file_attrs`
+	// — only the SecondDegree/Follower/Connected rungs consult it. `filter::
+	// filter_actions_by_visibility` reads the same pair, so the single-item and list views of one
+	// action can never disagree.
+	let rel = if abac::visibility_needs_relation(VisibilityLevel::from_char(action_view.visibility))
+	{
+		abac::subject_relation_to_tenant(app, tn_id, subject_id_tag).await?
 	} else {
-		(false, false)
+		cloudillo_types::meta_adapter::ProfileRelation::default()
 	};
 
 	Ok(ActionAttrs {
@@ -200,7 +173,7 @@ async fn load_action_attrs(
 		audience_tag,
 		tags: vec![], // TODO: Extract tags from action metadata when available
 		visibility,
-		following,
-		connected,
+		is_follower: rel.follower,
+		connected: rel.connected,
 	})
 }

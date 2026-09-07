@@ -81,6 +81,7 @@ fn all_api_tables() -> axum::Router<crate::prelude::App> {
 	Router::new()
 		.merge(action::create())
 		.merge(action::write())
+		.merge(action::moderate())
 		.merge(action::reader_state())
 		.merge(action::read())
 		.merge(action::inbox())

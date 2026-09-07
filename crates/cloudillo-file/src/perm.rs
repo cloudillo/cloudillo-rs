@@ -138,7 +138,7 @@ async fn load_file_attrs(
 	subject_roles: &[Box<str>],
 	scope: Option<&str>,
 ) -> ClResult<FileAttrs> {
-	use cloudillo_core::abac::VisibilityLevel;
+	use cloudillo_core::abac::{self, VisibilityLevel};
 	use std::borrow::Cow;
 	use tracing::debug;
 
@@ -158,16 +158,10 @@ async fn load_file_attrs(
 
 	let file_view = file_view.ok_or(Error::NotFound)?;
 
-	// Extract owner from nested ProfileInfo
-	// If no owner or owner has empty id_tag, file is owned by the tenant itself
-	let owner_id_tag = file_view
-		.owner
-		.as_ref()
-		.and_then(|p| if p.id_tag.is_empty() { None } else { Some(p.id_tag.clone()) })
-		.unwrap_or_else(|| {
-			debug!("File has no owner, using tenant_id_tag: {}", tenant_id_tag);
-			tenant_id_tag.into()
-		});
+	// Resolves both ownership facts off the row: an absent owner means the tenant owns it, an
+	// absent upstream means it originates here (which is what gates role access in `file_access`).
+	let file_ref = file_access::FileRef::from_view(&file_view, tenant_id_tag);
+	debug!("File access for {}: owner {}", file_id, file_ref.owner_id_tag);
 
 	// Determine access level by looking up scoped tokens, FSHR action grants
 	let ctx = file_access::FileAccessCtx {
@@ -178,8 +172,7 @@ async fn load_file_attrs(
 	let access_level = file_access::get_access_level_with_scope(
 		app,
 		tn_id,
-		&file_id,
-		&owner_id_tag,
+		file_ref,
 		&ctx,
 		scope,
 		file_view.root_id.as_deref(),
@@ -187,56 +180,128 @@ async fn load_file_attrs(
 	.await;
 
 	// Get visibility from file metadata - convert char to string representation
-	let visibility: Box<str> = VisibilityLevel::from_char(file_view.visibility).as_str().into();
+	let vis_level = VisibilityLevel::from_char(file_view.visibility);
+	let visibility: Box<str> = vis_level.as_str().into();
 
-	// Look up subject's relationship with the file owner
-	let (following, connected) = if subject_id_tag != "guest" && !subject_id_tag.is_empty() {
-		// Get profile to check relationship status using list_profiles with id_tag filter
-		let opts = cloudillo_types::meta_adapter::ListProfileOptions {
-			id_tag: Some(subject_id_tag.to_string()),
-			..Default::default()
-		};
-		match app.meta_adapter.list_profiles(tn_id, &opts).await {
-			Ok(profiles) => {
-				if let Some(profile) = profiles.first() {
-					let following = profile.following;
-					let connected = profile.connected.is_connected();
-					debug!(
-						subject = subject_id_tag,
-						owner = %owner_id_tag,
-						following = following,
-						connected = connected,
-						"Loaded relationship status for file permission check"
-					);
-					(following, connected)
-				} else {
-					debug!(subject = subject_id_tag, "Profile not found, assuming no relationship");
-					(false, false)
-				}
-			}
-			Err(e) => {
-				debug!(
-					subject = subject_id_tag,
-					error = %e,
-					"Failed to load profile, assuming no relationship"
-				);
-				(false, false)
-			}
-		}
+	// Owned before the borrow of the row ends, so `FileAttrs` can take it.
+	let owner_id_tag: Box<str> = file_ref.owner_id_tag.into();
+
+	// The subject's relationship **to the tenant**: `follower` is "they follow us", which is
+	// what the visibility rules mean. (`following` is the opposite direction.) Only the
+	// SecondDegree/Follower/Connected rungs consult it, and ABAC's read branch returns on
+	// `can_read()` first — same guard `apkg.rs` and `check_file_access_with_scope` apply.
+	let rel = if !access_level.can_read() && abac::visibility_needs_relation(vis_level) {
+		abac::subject_relation_to_tenant(app, tn_id, subject_id_tag).await?
 	} else {
-		(false, false)
+		cloudillo_types::meta_adapter::ProfileRelation::default()
 	};
 
 	Ok(FileAttrs {
 		file_id: file_view.file_id,
 		owner_id_tag,
+		upstream_id_tag: file_view.upstream_tag,
 		mime_type: file_view.content_type.unwrap_or_else(|| "application/octet-stream".into()),
 		tags: file_view.tags.unwrap_or_default(),
 		visibility,
 		access_level,
-		following,
-		connected,
+		is_follower: rel.follower,
+		connected: rel.connected,
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use cloudillo_core::abac::{Environment, PermissionChecker};
+	use cloudillo_types::auth_adapter::AuthCtx;
+	use cloudillo_types::types::{AccessLevel, FileAttrs, TnId};
+
+	/// The shape a *mirrored* row produces once `load_file_attrs` resolves it: `owner_id_tag` is
+	/// the local placer (or, for an accepted FSHR share on a personal tenant, the tenant itself),
+	/// while `access_level` stays at whatever `file_access` allowed — never `Admin`, because its
+	/// owner shortcut is gated on `upstream_id_tag.is_none()`.
+	fn mirrored_attrs() -> FileAttrs {
+		FileAttrs {
+			file_id: "f1~mirror".into(),
+			owner_id_tag: "alice.example.com".into(),
+			upstream_id_tag: Some("carol.example.com".into()),
+			mime_type: "text/plain".into(),
+			tags: vec![],
+			visibility: "direct".into(),
+			access_level: AccessLevel::Read,
+			is_follower: false,
+			connected: false,
+		}
+	}
+
+	fn subject(id_tag: &str, scope: Option<&str>) -> AuthCtx {
+		AuthCtx {
+			tn_id: TnId(1),
+			id_tag: id_tag.into(),
+			roles: Box::new([]),
+			scope: scope.map(Box::from),
+			anonymous: scope.is_some(),
+		}
+	}
+
+	/// Pins the split between ABAC and `file_access`: ABAC's ownership branch is not
+	/// upstream-gated, so the owner of a mirrored row keeps *record* authority — rename, move,
+	/// hide, soft-delete, tag — even at `AccessLevel::Read`. Content and share management are
+	/// decided elsewhere (`file_access`, `share_access`) and stay denied there.
+	///
+	/// Deliberate, not incidental: changing it is what would strip a placer of the ability to
+	/// remove their own pin.
+	#[test]
+	fn mirrored_row_owner_keeps_record_authority() {
+		let checker = PermissionChecker::new();
+		let env = Environment::new();
+		let attrs = mirrored_attrs();
+		let alice = subject("alice.example.com", None);
+
+		assert!(checker.has_permission(&alice, "file:update", &attrs, &env));
+		assert!(checker.has_permission(&alice, "file:delete", &attrs, &env));
+		assert!(checker.has_permission(&alice, "file:write", &attrs, &env));
+
+		// A delegated (share-link / API-key scoped) caller is judged on `access_level` alone —
+		// a share-link token is minted `sub: None`, so its `id_tag` is the tenant's and would
+		// otherwise walk straight through the ownership branch.
+		let scoped = subject("alice.example.com", Some("file:f1~mirror:R"));
+		assert!(!checker.has_permission(&scoped, "file:update", &attrs, &env));
+		assert!(!checker.has_permission(&scoped, "file:delete", &attrs, &env));
+		assert!(!checker.has_permission(&scoped, "file:write", &attrs, &env));
+
+		// Someone else at the same Read level gets nothing.
+		assert!(!checker.has_permission(
+			&subject("bob.example.com", None),
+			"file:update",
+			&attrs,
+			&env
+		));
+	}
+
+	/// The other half of the split: record authority is *not* content authority. A revoked
+	/// FSHR share drops `access_level` to `None` but deliberately leaves the recipient's
+	/// mirrored row in place so they can still delete their own copy — so if ABAC's read path
+	/// honoured `owner_id_tag` on a mirrored row, revocation would never take effect.
+	#[test]
+	fn mirrored_row_owner_gets_no_read_on_a_revoked_share() {
+		let checker = PermissionChecker::new();
+		let env = Environment::new();
+		let alice = subject("alice.example.com", None);
+
+		let mut revoked = mirrored_attrs();
+		revoked.access_level = AccessLevel::None;
+		assert!(!checker.has_permission(&alice, "file:read", &revoked, &env));
+
+		// Record authority survives revocation — Alice can still remove her own copy.
+		assert!(checker.has_permission(&alice, "file:update", &revoked, &env));
+		assert!(checker.has_permission(&alice, "file:delete", &revoked, &env));
+
+		// A locally-originating row (no upstream) still reads via ownership.
+		let mut local = mirrored_attrs();
+		local.access_level = AccessLevel::None;
+		local.upstream_id_tag = None;
+		assert!(checker.has_permission(&alice, "file:read", &local, &env));
+	}
 }
 
 // vim: ts=4

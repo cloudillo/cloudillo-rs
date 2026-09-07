@@ -13,6 +13,7 @@ use axum::{
 
 use crate::prelude::*;
 use cloudillo_core::IdTag;
+use cloudillo_core::abac;
 use cloudillo_core::extract::{OptionalAuth, OptionalRequestId};
 use cloudillo_core::profile_visibility::{CommunityRole, RequesterTier, SectionVisibility};
 use cloudillo_types::meta_adapter::ProfileType;
@@ -243,10 +244,9 @@ pub async fn get_tenant_profile(
 	let (follows_tenant, connected_to_tenant) = if is_owner || !is_authenticated {
 		(false, false)
 	} else if let Some(a) = auth.as_ref() {
-		let caller = a.id_tag.as_ref();
-		let map = app.meta_adapter.get_relationships(tn_id, &[caller]).await?;
-		let (f, c) = map.get(caller).copied().unwrap_or((false, false));
-		(f, c)
+		// `follower` ("the caller follows this tenant"), not `following`.
+		let rel = abac::subject_relation_to_tenant(&app, tn_id, a.id_tag.as_ref()).await?;
+		(rel.follower, rel.connected)
 	} else {
 		(false, false)
 	};

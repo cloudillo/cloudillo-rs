@@ -454,7 +454,7 @@ async fn schedule_delivery(
 	}
 
 	let dsl = app.ext::<Arc<DslEngine>>()?;
-	let behavior = dsl.get_behavior(&action.typ);
+	let behavior = dsl.definition_for(&action.typ, action.sub_typ.as_deref()).map(|d| &d.behavior);
 
 	// Skip federation entirely for local-only action types (e.g., APKG)
 	if behavior.as_ref().and_then(|b| b.local_only).unwrap_or(false) {
@@ -476,9 +476,13 @@ async fn schedule_delivery(
 		// STAT-scoped and safe for feed POSTs (whose comment STATs hang off a
 		// broadcast=true POST).
 		if let Some(parent_id) = action.parent_id.as_deref() {
-			let parent_broadcasts = match app.meta_adapter.get_action_type(tn_id, parent_id).await?
-			{
-				Some(typ) => dsl.get_behavior(&typ).and_then(|b| b.broadcast).unwrap_or(false),
+			// `get_action`, not `get_action_type`: the latter returns the bare type column,
+			// which cannot resolve a subtyped definition.
+			let parent_broadcasts = match app.meta_adapter.get_action(tn_id, parent_id).await? {
+				Some(parent) => dsl
+					.definition_for(&parent.typ, parent.sub_typ.as_deref())
+					.and_then(|d| d.behavior.broadcast)
+					.unwrap_or(false),
 				None => false,
 			};
 			if !parent_broadcasts {
@@ -511,8 +515,10 @@ async fn schedule_delivery(
 		&& let Some(ref subject_id) = action.subject
 		&& let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await
 	{
-		let subject_broadcast =
-			dsl.get_behavior(&subject_action.typ).and_then(|b| b.broadcast).unwrap_or(false);
+		let subject_broadcast = dsl
+			.definition_for(&subject_action.typ, subject_action.sub_typ.as_deref())
+			.and_then(|d| d.behavior.broadcast)
+			.unwrap_or(false);
 
 		if subject_broadcast {
 			debug!(
@@ -744,7 +750,7 @@ async fn try_auto_approve(app: &App, tn_id: TnId, action: &meta_adapter::Action<
 		debug!("try_auto_approve: DSL engine not available");
 		return;
 	};
-	let Some(definition) = dsl.get_definition(&action.typ) else {
+	let Some(definition) = dsl.definition_for(&action.typ, action.sub_typ.as_deref()) else {
 		debug!(
 			action_type = %action.typ,
 			"try_auto_approve: no definition found for type"

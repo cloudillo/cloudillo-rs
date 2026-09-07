@@ -58,8 +58,8 @@ pub async fn schedule_subscriber_fanout(
 		let deliver_subject = if let Some(a) = app.meta_adapter.get_action(tn_id, action_id).await?
 		{
 			app.ext::<Arc<DslEngine>>()?
-				.get_behavior(&a.typ)
-				.and_then(|b| b.deliver_subject)
+				.definition_for(&a.typ, a.sub_typ.as_deref())
+				.and_then(|d| d.behavior.deliver_subject)
 				.unwrap_or(false)
 		} else {
 			false
@@ -88,8 +88,8 @@ pub async fn schedule_subscriber_fanout(
 
 		let subscribable = app
 			.ext::<Arc<DslEngine>>()?
-			.get_behavior(&parent_action.typ)
-			.and_then(|b| b.subscribable)
+			.definition_for(&parent_action.typ, parent_action.sub_typ.as_deref())
+			.and_then(|d| d.behavior.subscribable)
 			.unwrap_or(false);
 
 		if subscribable {
@@ -182,7 +182,10 @@ async fn resolve_subscribable_root(
 		let Some(act) = app.meta_adapter.get_action(tn_id, &id).await? else {
 			break;
 		};
-		let subscribable = dsl.get_behavior(&act.typ).and_then(|b| b.subscribable).unwrap_or(false);
+		let subscribable = dsl
+			.definition_for(&act.typ, act.sub_typ.as_deref())
+			.and_then(|d| d.behavior.subscribable)
+			.unwrap_or(false);
 		if subscribable {
 			return Ok(Some(act));
 		}
@@ -248,8 +251,10 @@ pub async fn maybe_relay_child_to_subscribers(
 	};
 
 	// Only the container owner vouches its children; others fall through.
-	let relay_children =
-		dsl.get_behavior(&container.typ).and_then(|b| b.relay_children).unwrap_or(false);
+	let relay_children = dsl
+		.definition_for(&container.typ, container.sub_typ.as_deref())
+		.and_then(|d| d.behavior.relay_children)
+		.unwrap_or(false);
 	if !relay_children || !owns_subject(&container, &our_id_tag) {
 		return Ok(false);
 	}

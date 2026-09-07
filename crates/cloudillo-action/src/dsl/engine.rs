@@ -23,6 +23,13 @@ use tokio::time::timeout;
 /// Maximum hook execution time
 const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Cap on a serialized object body when its schema names none. `properties` bounds only the
+/// names a schema lists, so without a default an undeclared key rides the 1 MiB request limit
+/// into a signed, fanned-out token — and `STAT`/`PRES` declare `properties: None`, accepting
+/// any object at all. Every bundled object schema's declared maxima sum well under this
+/// (largest is `APKG` at ~6 KB); `POST:LDOC` raises it explicitly.
+const DEFAULT_OBJECT_MAX_BYTES: usize = 16 * 1024;
+
 /// DSL Engine - loads and executes action type definitions
 #[derive(Debug, Default)]
 pub struct DslEngine {
@@ -122,14 +129,19 @@ impl DslEngine {
 		Ok(count)
 	}
 
-	/// Get action definition
-	pub fn get_definition(&self, action_type: &str) -> Option<&ActionDefinition> {
-		self.definitions.get(action_type)
-	}
-
-	/// Check if action type has DSL definition
-	pub fn has_definition(&self, action_type: &str) -> bool {
-		self.definitions.contains_key(action_type)
+	/// The definition governing an action, resolved the way `resolve_action_type` does:
+	/// the combined `"TYPE:SUBTYPE"` key first, then the base type before the colon.
+	/// Accepts the subType either as `sub_typ` or already embedded in `typ`, because both
+	/// forms reach the store (`helpers::extract_type_and_subtype` exists for that reason).
+	pub fn definition_for(&self, typ: &str, sub_typ: Option<&str>) -> Option<&ActionDefinition> {
+		if let Some(key) = self.resolve_action_type(typ, sub_typ)
+			&& let Some(def) = self.definitions.get(&key)
+		{
+			return Some(def);
+		}
+		// `resolve_action_type` does not split an *embedded* subtype, so `"POST:LDOC"` with
+		// no definition of its own still has to fall back to `"POST"`.
+		typ.split(':').next().and_then(|base| self.definitions.get(base))
 	}
 
 	/// Every loaded definition, for startup validation of fields `load_definition` skips.
@@ -453,19 +465,28 @@ impl DslEngine {
 		}
 	}
 
-	/// Get behavior flags for an action type
+	/// Get behavior flags for an already-resolved definition key.
+	///
+	/// `action_type` is a single string — either a combined `"TYPE:SUBTYPE"` key or a bare
+	/// base type. It carries no separate `sub_typ`, so a caller holding a `(typ, sub_typ)`
+	/// pair must call [`Self::definition_for`] directly or it will silently get the base
+	/// type's behavior.
 	pub fn get_behavior(&self, action_type: &str) -> Option<&BehaviorFlags> {
-		self.definitions.get(action_type).map(|d| &d.behavior)
+		self.definition_for(action_type, None).map(|d| &d.behavior)
 	}
 
-	/// Get field constraints for an action type
+	/// Get field constraints for an already-resolved definition key.
+	///
+	/// Base- or combined-key only; see [`Self::get_behavior`] for the `sub_typ` caveat.
 	pub fn get_field_constraints(&self, action_type: &str) -> Option<&FieldConstraints> {
-		self.definitions.get(action_type).map(|d| &d.fields)
+		self.definition_for(action_type, None).map(|d| &d.fields)
 	}
 
-	/// Get key pattern for an action type
+	/// Get key pattern for an already-resolved definition key.
+	///
+	/// Base- or combined-key only; see [`Self::get_behavior`] for the `sub_typ` caveat.
 	pub fn get_key_pattern(&self, action_type: &str) -> Option<&str> {
-		self.definitions.get(action_type).and_then(|d| d.key_pattern.as_deref())
+		self.definition_for(action_type, None).and_then(|d| d.key_pattern.as_deref())
 	}
 
 	/// Validate action content against the schema defined for an action type.
@@ -477,14 +498,9 @@ impl DslEngine {
 		action_type: &str,
 		content: Option<&serde_json::Value>,
 	) -> ClResult<()> {
-		// Try full type first, then base type (e.g., "REACT:LIKE" -> "REACT")
-		let definition = self
-			.definitions
-			.get(action_type)
-			.or_else(|| action_type.split(':').next().and_then(|base| self.definitions.get(base)))
-			.ok_or_else(|| {
-				Error::ValidationError(format!("Unknown action type: {}", action_type))
-			})?;
+		let definition = self.definition_for(action_type, None).ok_or_else(|| {
+			Error::ValidationError(format!("Unknown action type: {}", action_type))
+		})?;
 
 		// Check field constraints for content
 		if let Some(FieldConstraint::Required) = definition.fields.content
@@ -536,13 +552,9 @@ impl DslEngine {
 		has_parent: bool,
 		has_attachments: bool,
 	) -> ClResult<()> {
-		let definition = self
-			.definitions
-			.get(action_type)
-			.or_else(|| action_type.split(':').next().and_then(|base| self.definitions.get(base)))
-			.ok_or_else(|| {
-				Error::ValidationError(format!("Unknown action type: {}", action_type))
-			})?;
+		let definition = self.definition_for(action_type, None).ok_or_else(|| {
+			Error::ValidationError(format!("Unknown action type: {}", action_type))
+		})?;
 
 		let fields = &definition.fields;
 		for (name, constraint, present) in [
@@ -656,6 +668,20 @@ impl DslEngine {
 				let obj = value
 					.as_object()
 					.ok_or_else(|| Error::ValidationError(format!("{}: expected object", path)))?;
+
+				// `properties` bounds only the names a schema lists; unknown keys pass
+				// untouched, so `max_length` (serialized JSON bytes, same unit as the
+				// string caps) is the only bound below the 1 MiB request limit. An absent
+				// `max_length` is the default cap, not "unbounded" — see
+				// `DEFAULT_OBJECT_MAX_BYTES`.
+				let max = schema.max_length.unwrap_or(DEFAULT_OBJECT_MAX_BYTES);
+				// Fail closed: a body that will not serialize is treated as oversized.
+				let len = serde_json::to_string(value).map_or(usize::MAX, |s| s.len());
+				if len > max {
+					return Err(Error::ValidationError(format!(
+						"{path}: object too large ({len} bytes, max {max})"
+					)));
+				}
 
 				// Check required properties
 				if let Some(ref required) = schema.required {
@@ -895,6 +921,40 @@ mod tests {
 			engine
 				.validate_field_constraints("NOPE", true, false, true, false, false)
 				.is_err()
+		);
+	}
+
+	/// An object schema that names no `max_length` is capped at
+	/// `DEFAULT_OBJECT_MAX_BYTES`, not left unbounded. `STAT` and `PRES` are the shape this
+	/// closes — `properties: None`, so every key is undeclared and nothing else bounds them.
+	#[test]
+	fn an_object_schema_without_max_length_is_capped_by_default() {
+		let mut engine = DslEngine::new();
+		engine
+			.load_definition_from_json(
+				r#"
+				{
+					"type": "TOBJ",
+					"version": "1.0",
+					"description": "Unbounded-object test action",
+					"fields": { "content": "required" },
+					"schema": { "content": { "type": "object" } },
+					"behavior": {},
+					"hooks": {}
+				}
+				"#,
+			)
+			.expect("load definition");
+
+		let small = serde_json::json!({ "anything": "small" });
+		engine
+			.validate_content("TOBJ", Some(&small))
+			.expect("a small object still passes");
+
+		let big = serde_json::json!({ "anything": "x".repeat(20_000) });
+		assert!(
+			engine.validate_content("TOBJ", Some(&big)).is_err(),
+			"~20 KB must be refused by the default cap"
 		);
 	}
 }

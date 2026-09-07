@@ -6,7 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use cloudillo_core::abac::{ViewCheckContext, can_view_item};
+use cloudillo_core::abac::{
+	ViewCheckContext, VisibilityLevel, can_view_item, visibility_needs_relation,
+};
 use cloudillo_types::meta_adapter::{ActionView, ListActionOptions};
 
 use crate::{dsl::DslEngine, prelude::*};
@@ -16,7 +18,7 @@ use crate::{dsl::DslEngine, prelude::*};
 /// This function filters a list of actions to only include those the subject
 /// is allowed to see based on:
 /// - The action's visibility level
-/// - The subject's relationship with the issuer (following/connected)
+/// - The subject's relationship **to this tenant** (`follower` = "they follow us", `connected`)
 /// - Whether the subject is in the audience (for Direct visibility)
 /// - Whether the subject is a subscriber (for subscribable action types with Direct visibility)
 pub async fn filter_actions_by_visibility(
@@ -32,20 +34,24 @@ pub async fn filter_actions_by_visibility(
 		return Ok(actions);
 	}
 
-	// Collect unique issuer id_tags
-	let issuer_tags: HashSet<&str> = actions.iter().map(|a| a.issuer.id_tag.as_ref()).collect();
-
-	// Batch load relationship status for all issuers
-	let relationships = load_relationships(app, tn_id, subject_id_tag, &issuer_tags).await?;
-
-	// For the federation outbox case (subject != tenant, issuer == tenant), the
-	// `relationships` map keyed on issuer.id_tag becomes useless: it would ask
-	// the tenant's profile table "does the tenant follow itself?" Resolve the
-	// subject↔tenant peer-relation explicitly so we can override that lookup.
-	let federation_relation = if subject_id_tag == tenant_id_tag {
-		false
+	// `follower` is "they follow us" — the question the visibility rules ask. Relationship rows
+	// are tenant-scoped, so the reader's relation to *this tenant* is the only one this node can
+	// answer; scoring the issuer's row asked "do we follow the author", which is not the reader's
+	// standing at all. Same value `cloudillo_file::perm::load_file_attrs` and
+	// `file_access::check_file_access_with_scope` read.
+	//
+	// Only loaded when some action in the batch can actually be swayed by it: `can_view_item`
+	// consults the two flags solely to lift the subject from Verified/Public to
+	// Follower/Connected, which changes the answer only for the levels
+	// `visibility_needs_relation` names. Direct and Subscribed are settled by the audience
+	// branch, Public and Verified by `is_real_auth`.
+	let needs_relation = actions
+		.iter()
+		.any(|a| visibility_needs_relation(VisibilityLevel::from_char(a.visibility)));
+	let rel = if needs_relation {
+		cloudillo_core::abac::subject_relation_to_tenant(app, tn_id, subject_id_tag).await?
 	} else {
-		subject_has_peer_relation_to_tenant(app, tn_id, subject_id_tag, tenant_id_tag).await?
+		cloudillo_types::meta_adapter::ProfileRelation::default()
 	};
 
 	// Identify the container ids whose subscriber set gates read access:
@@ -81,15 +87,6 @@ pub async fn filter_actions_by_visibility(
 		.into_iter()
 		.filter(|action| {
 			let issuer_tag = action.issuer.id_tag.as_ref();
-			let (following, connected) =
-				if issuer_tag == tenant_id_tag && subject_id_tag != tenant_id_tag {
-					// Federation case (e.g. /api/outbox). Map peer-relation onto
-					// `connected` since the visibility chart treats Connected ⊇
-					// Follower (abac.rs:128-134).
-					(false, federation_relation)
-				} else {
-					relationships.get(issuer_tag).copied().unwrap_or((false, false))
-				};
 
 			// Build audience list for Direct visibility check
 			let mut audience: Vec<&str> =
@@ -118,8 +115,8 @@ pub async fn filter_actions_by_visibility(
 				item_owner_id_tag: issuer_tag,
 				tenant_id_tag,
 				visibility: action.visibility,
-				subject_following_owner: following,
-				subject_connected_to_owner: connected,
+				subject_is_follower: rel.follower,
+				subject_connected_to_owner: rel.connected,
 				audience_tags: Some(&audience),
 			});
 			if !allowed {
@@ -192,28 +189,6 @@ async fn load_subscribers(
 	subscribers_map
 }
 
-/// Load relationship status between subject and multiple targets
-///
-/// Returns a map of target_id_tag -> (following, connected)
-/// Uses batch query to avoid N+1 problem
-async fn load_relationships(
-	app: &App,
-	tn_id: TnId,
-	subject_id_tag: &str,
-	target_id_tags: &HashSet<&str>,
-) -> ClResult<HashMap<String, (bool, bool)>> {
-	// For anonymous users or empty target sets, return empty map
-	if subject_id_tag.is_empty() || target_id_tags.is_empty() {
-		return Ok(HashMap::new());
-	}
-
-	// Convert HashSet to Vec for batch query
-	let targets: Vec<&str> = target_id_tags.iter().copied().collect();
-
-	// Single batch query instead of N+1 queries
-	app.meta_adapter.get_relationships(tn_id, &targets).await
-}
-
 /// Does `subject` count as a follower of `tenant` in `tn_id`'s DB?
 /// Reads the explicit, directional `follower` flag (set by FLLW/CONN hooks):
 /// true iff `subject` follows `tenant`. Replaces the old symmetric-`connected`
@@ -227,17 +202,19 @@ pub(crate) async fn subject_has_peer_relation_to_tenant(
 	if subject_id_tag == tenant_id_tag {
 		return Ok(true);
 	}
-	match app.meta_adapter.read_profile(tn_id, subject_id_tag).await {
-		Ok((_, p)) => Ok(p.follower),
-		Err(Error::NotFound) => Ok(false),
-		Err(e) => Err(e),
-	}
+	// `subject_relation_to_tenant` reads `get_relationships`, not `read_profile`: the latter
+	// filters out never-synced stubs, which can still carry a real `follower` flag
+	// (`native_hooks/fllw.rs`). A database fault propagates rather than reading as "not a
+	// follower".
+	Ok(cloudillo_core::abac::subject_relation_to_tenant(app, tn_id, subject_id_tag)
+		.await?
+		.follower)
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use cloudillo_types::meta_adapter::{ProfileInfo, ProfileType};
+	use cloudillo_types::meta_adapter::{ProfileInfo, ProfileRelation, ProfileType};
 
 	fn action_view(
 		action_id: &str,
@@ -304,6 +281,32 @@ mod tests {
 		// General rule is root_id ?? subject ?? action_id — root wins when both present.
 		let a = action_view("a5~x", "MSG", Some("a1~root"), Some("a9~subj"));
 		assert_eq!(subscribed_container_id(&a), "a1~root");
+	}
+
+	/// The reader's own standing decides, never the tenant's opinion of the author:
+	/// `follower` ("they follow us"), not `following` ("we follow them"). Passing the wrong
+	/// column is the bug this table exists to catch, and it reads identically on the file paths.
+	#[test]
+	fn a_follower_only_action_admits_our_follower_not_someone_we_follow() {
+		let view = |rel: ProfileRelation| ViewCheckContext {
+			subject_id_tag: "carol.example",
+			is_authenticated: true,
+			item_owner_id_tag: "bob.example",
+			tenant_id_tag: "alice.example",
+			visibility: Some('F'),
+			subject_is_follower: rel.follower,
+			subject_connected_to_owner: rel.connected,
+			audience_tags: None,
+		};
+
+		let we_follow_them = ProfileRelation { following: true, follower: false, connected: false };
+		let they_follow_us = ProfileRelation { following: false, follower: true, connected: false };
+
+		assert!(
+			!can_view_item(&view(we_follow_them)),
+			"our own follow confers nothing on a reader"
+		);
+		assert!(can_view_item(&view(they_follow_us)));
 	}
 }
 

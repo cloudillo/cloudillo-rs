@@ -19,11 +19,11 @@
 //! | `/api/auth/vapid`                    | `session()` ᴱ | | | |
 //! | `/api/auth/wa/login/challenge`       | `recovery()` ᴾ | | | |
 //! | `/api/auth/wa/login`                 | | `recovery()` ᴾ | | |
-//! | `/api/auth/wa/reg`                   | `owner_credentials()` ᴸ | `owner_credentials()` ᴸ | | |
-//! | `/api/auth/wa/reg/challenge`         | `owner_credentials()` ᴸ | | | |
-//! | `/api/auth/wa/reg/{key_id}`          | | | | `owner_credentials()` ᴸ |
-//! | `/api/auth/api-keys`                 | `owner_credentials()` ᴸ | `owner_credentials()` ᴸ | | |
-//! | `/api/auth/api-keys/{key_id}`        | `owner_credentials()` ᴸ | | `owner_credentials()` ᴸ | `owner_credentials()` ᴸ |
+//! | `/api/auth/wa/reg`                   | `owner_credentials()` ᵀ | `owner_credentials()` ᵀ | | |
+//! | `/api/auth/wa/reg/challenge`         | `owner_credentials()` ᵀ | | | |
+//! | `/api/auth/wa/reg/{key_id}`          | | | | `owner_credentials()` ᵀ |
+//! | `/api/auth/api-keys`                 | `owner_credentials()` ᵀ | `owner_credentials()` ᵀ | | |
+//! | `/api/auth/api-keys/{key_id}`        | `owner_credentials()` ᵀ | | `owner_credentials()` ᵀ | `owner_credentials()` ᵀ |
 //! | `/api/auth/qr-login/init`            | | `public_login()` ᴿ | | |
 //! | `/api/auth/qr-login/{session_id}/status`  | `public_login()` ᴿ | | | |
 //! | `/api/auth/qr-login/{session_id}/details` | `session()` ᴱ | | | |
@@ -31,7 +31,7 @@
 //! | `/api/onboarding/complete`           | | `session()` ᴱ | | |
 //!
 //! ᴿ public under the strict `"auth"` bucket, ᴾ same bucket with the ban
-//! bypassed, ᶠ public under the `"federation"` bucket, ᴸ `require_leader`,
+//! bypassed, ᶠ public under the `"federation"` bucket, ᵀ `require_tenant_self`,
 //! ᴱ auth only — handler self-enforces. The guard on each fn is in
 //! `routes/protected.rs` / `routes/public.rs`.
 //!
@@ -55,8 +55,8 @@ use crate::push;
 /// `GET /api/auth/proxy-token` belongs **here, not in [`owner_credentials`]**.
 /// It issues an ordinary self-scoped session token for any authenticated
 /// caller; only the federated (`?idTag=`) branch needs owner/leader standing,
-/// and the handler gates that internally. Moving it under `require_leader`
-/// would break self-scoped token issuance for non-leader users.
+/// and the handler gates that internally. Moving it under `require_tenant_self`
+/// would break self-scoped token issuance for every non-account caller.
 ///
 /// `/api/onboarding/complete` is the single commit point of the reversible
 /// onboarding wizard: it consumes the welcome ref (left intact by
@@ -73,11 +73,12 @@ pub(crate) fn session() -> Router<App> {
 		.route("/api/auth/qr-login/{session_id}/respond", post(qr_login::post_respond))
 }
 
-/// Credentials that control the tenant itself — gated by `require_leader`.
+/// Credentials that control the tenant itself — gated by `require_tenant_self`.
 ///
-/// Only the tenant owner or a community leader may enroll a passkey or mint an
-/// auth API key; federated visitors and share-link tokens carry `roles=[]` and
-/// are rejected.
+/// Only the account itself may enroll a passkey or mint an auth API key. `leader`
+/// is deliberately *not* the gate: on a community tenant ordinary member profiles
+/// hold it, and an auth API key authenticates as the tenant with full owner roles.
+/// See `cloudillo_core::abac::require_tenant_self`.
 ///
 /// WebAuthn enrollment only — the login endpoints are public, in
 /// [`public_login`].

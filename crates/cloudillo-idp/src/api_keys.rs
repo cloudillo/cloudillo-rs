@@ -503,7 +503,10 @@ mod tests {
 
 	#[test]
 	fn leader_role_is_allowed() {
+		// `leader` on an IDP request means leader OF THE IDP TENANT — the operator's
+		// delegate. See `is_idp_admin`.
 		assert!(allowed("someone.example.com", &["leader"], None));
+		assert!(allowed("someone.example.com", &["SADM"], None));
 	}
 
 	#[test]

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use cloudillo_types::worker::Priority;
 
 use crate::prelude::*;
-use cloudillo_core::abac::{Environment, VisibilityLevel};
+use cloudillo_core::abac::{self, Environment, VisibilityLevel};
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth};
 use cloudillo_core::file_access;
 use cloudillo_types::auth_adapter::AuthCtx;
@@ -77,11 +77,7 @@ pub async fn get_container_content(
 			(guest_ctx, "guest".into())
 		};
 
-		let owner_id_tag = file
-			.owner
-			.as_ref()
-			.and_then(|p| if p.id_tag.is_empty() { None } else { Some(p.id_tag.clone()) })
-			.unwrap_or_else(|| tenant_id_tag.clone());
+		let file_ref = file_access::FileRef::from_view(&file, &tenant_id_tag);
 
 		let ctx = file_access::FileAccessCtx {
 			user_id_tag: &subject_id_tag,
@@ -91,19 +87,33 @@ pub async fn get_container_content(
 		let access_level = file_access::get_access_level_with_scope(
 			&app,
 			tn_id,
-			&file_id,
-			&owner_id_tag,
+			file_ref,
 			&ctx,
 			auth_ctx.scope.as_deref(),
 			file.root_id.as_deref(),
 		)
 		.await;
 
-		let visibility: Box<str> = VisibilityLevel::from_char(file.visibility).as_str().into();
+		// Owned before the borrow of the row ends, so `FileAttrs` can take it.
+		let owner_id_tag: Box<str> = file_ref.owner_id_tag.into();
+
+		let vis_level = VisibilityLevel::from_char(file.visibility);
+		let visibility: Box<str> = vis_level.as_str().into();
+
+		// Only the SecondDegree/Follower/Connected rungs consult these, and ABAC's read
+		// branch returns on `access_level.can_read()` before reaching them at all — so on
+		// the app/site asset path this query almost never changes the answer. Same guard
+		// `file_access::check_file_access_with_scope` applies.
+		let rel = if !access_level.can_read() && abac::visibility_needs_relation(vis_level) {
+			abac::subject_relation_to_tenant(&app, tn_id, &subject_id_tag).await?
+		} else {
+			meta_adapter::ProfileRelation::default()
+		};
 
 		let attrs = FileAttrs {
 			file_id: file.file_id.clone(),
 			owner_id_tag,
+			upstream_id_tag: file.upstream_tag.clone(),
 			mime_type: file
 				.content_type
 				.clone()
@@ -111,8 +121,9 @@ pub async fn get_container_content(
 			tags: file.tags.clone().unwrap_or_default(),
 			visibility,
 			access_level,
-			following: false,
-			connected: false,
+			// The helper answers the synthetic "guest" context above without a query.
+			is_follower: rel.follower,
+			connected: rel.connected,
 		};
 
 		let environment = Environment::new();

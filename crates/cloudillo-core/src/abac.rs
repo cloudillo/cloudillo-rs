@@ -11,6 +11,7 @@
 
 use crate::prelude::*;
 use cloudillo_types::auth_adapter::AuthCtx;
+use cloudillo_types::meta_adapter::ProfileRelation;
 use cloudillo_types::types::AccessLevel;
 use std::collections::HashMap;
 
@@ -163,20 +164,58 @@ impl SubjectAccessLevel {
 pub fn relationship_level(
 	is_owner: bool,
 	connected: bool,
-	following: bool,
+	is_follower: bool,
 	is_real_auth: bool,
 ) -> SubjectAccessLevel {
 	if is_owner {
 		SubjectAccessLevel::Owner
 	} else if connected {
 		SubjectAccessLevel::Connected
-	} else if following {
+	} else if is_follower {
 		SubjectAccessLevel::Follower
 	} else if is_real_auth {
 		SubjectAccessLevel::Verified
 	} else {
 		SubjectAccessLevel::Public
 	}
+}
+
+/// The raw `ProfileRelation` row this tenant holds for `subject_id_tag`, whoever that is.
+///
+/// The two columns are opposite directions (`native_hooks/fllw.rs`: `on_create` sets
+/// `following` on an audience we followed; `on_receive` sets `follower` on an issuer who
+/// followed us), so which one a caller should read depends on which party it passed here.
+/// One rule, no exceptions: pass the *subject* and read `follower` ("they follow us"), which
+/// is what every visibility rule means. `following` ("we follow them") is the opposite
+/// direction and answers no visibility question — this tenant's own follows confer nothing
+/// on a reader.
+///
+/// An empty / `"guest"` subject and a missing row both yield the default (no relationship). A
+/// *read error* does not: it propagates. Swallowing it would silently narrow a file list, a
+/// search result set or a profile view on a transient database fault — the same request answering
+/// differently, with only a `warn!` to explain it. A caller that genuinely cannot return an error
+/// (a filter closure) must fall back to the default at its own call site, where the choice is
+/// visible.
+pub async fn subject_relation_to_tenant(
+	app: &App,
+	tn_id: TnId,
+	subject_id_tag: &str,
+) -> ClResult<ProfileRelation> {
+	if subject_id_tag.is_empty() || subject_id_tag == "guest" {
+		return Ok(ProfileRelation::default());
+	}
+	let rels = app.meta_adapter.get_relationships(tn_id, &[subject_id_tag]).await?;
+	Ok(rels.get(subject_id_tag).copied().unwrap_or_default())
+}
+
+/// Whether deciding `vis` needs the profile row at all — the other levels are
+/// answered by `is_real_auth` alone. `SecondDegree` is in the list because
+/// `Verified.can_access(SecondDegree)` is false, so authentication cannot settle it.
+pub fn visibility_needs_relation(vis: VisibilityLevel) -> bool {
+	matches!(
+		vis,
+		VisibilityLevel::SecondDegree | VisibilityLevel::Follower | VisibilityLevel::Connected
+	)
 }
 
 /// Context for checking whether a subject can view an item
@@ -186,7 +225,7 @@ pub struct ViewCheckContext<'a> {
 	pub item_owner_id_tag: &'a str,
 	pub tenant_id_tag: &'a str,
 	pub visibility: Option<char>,
-	pub subject_following_owner: bool,
+	pub subject_is_follower: bool,
 	pub subject_connected_to_owner: bool,
 	pub audience_tags: Option<&'a [&'a str]>,
 }
@@ -207,7 +246,7 @@ pub fn can_view_item(ctx: &ViewCheckContext<'_>) -> bool {
 		SubjectAccessLevel::Owner // Tenant has same access as owner
 	} else if ctx.subject_connected_to_owner {
 		SubjectAccessLevel::Connected
-	} else if ctx.subject_following_owner {
+	} else if ctx.subject_is_follower {
 		SubjectAccessLevel::Follower
 	} else if is_real_auth {
 		SubjectAccessLevel::Verified
@@ -241,6 +280,35 @@ pub use cloudillo_types::abac::AttrSet;
 /// compare role strings inline.
 pub fn is_admin(auth: &AuthCtx) -> bool {
 	auth.roles.iter().any(|r| r.as_ref() == "SADM")
+}
+
+/// Require that the caller IS the tenant account (or SADM, which outranks it).
+///
+/// Deliberately stronger than a leader check: on a community tenant `leader` is held by
+/// ordinary member profiles, who are not the account. Anything that confers power *over*
+/// the account — a `password` / `welcome` / `idp.activation` refId, an auth API key, a
+/// passkey enrollment — must not be reachable by leader standing.
+///
+/// The id_tag match alone is NOT enough: an `idp_` management key is built with
+/// `roles: Box::new([])` and the identity's own `id_tag` (`middleware::authenticate`), so on
+/// its own host it matches. The account itself always carries `leader` via
+/// `build_tenant_owner_roles`, so requiring it costs nothing real and keeps those keys out.
+pub fn require_tenant_self(auth: &AuthCtx, tenant_id_tag: &str, what: &str) -> ClResult<()> {
+	if auth.scope.is_none()
+		&& ((auth.id_tag.as_ref() == tenant_id_tag && crate::roles::is_leader(&auth.roles))
+			|| is_admin(auth))
+	{
+		Ok(())
+	} else {
+		warn!(
+			subject = %auth.id_tag,
+			roles = ?auth.roles,
+			scope = ?auth.scope,
+			operation = %what,
+			"Denied - the tenant account itself is required"
+		);
+		Err(Error::PermissionDenied)
+	}
 }
 
 /// Environment attributes (environmental context)
@@ -510,8 +578,23 @@ impl PermissionChecker {
 	) -> bool {
 		use tracing::debug;
 
+		// A delegated token is confined to its scope, and that confinement is expressed
+		// *only* in the `access_level` attribute, which the caller computes scope-aware
+		// (see `cloudillo_file::perm::load_file_attrs`). Both shortcuts below route
+		// around it:
+		//
+		// - `leader`, because a session token carries `r` and `scope` together — the
+		//   ordinary app-sandbox token is `leader` plus a read-only file scope;
+		// - ownership, because a share-link token is minted `sub: None`, so its
+		//   `AuthCtx::id_tag` *is* the tenant — which owns every locally-created row.
+		//
+		// So a scoped subject is decided by `access_level` (and, for reads, visibility)
+		// alone. A matching scope is still a grant; this only stops a *non*-matching one
+		// from being ignored.
+		let delegated = subject.scope.is_some();
+
 		// Leader override - leaders can do everything
-		if subject.roles.iter().any(|r| r.as_ref() == "leader") {
+		if !delegated && subject.roles.iter().any(|r| r.as_ref() == "leader") {
 			debug!(subject = %subject.id_tag, action = action, "Leader role allows access");
 			return true;
 		}
@@ -524,9 +607,22 @@ impl PermissionChecker {
 		}
 		let operation = parts[1];
 
-		// Ownership check for modify operations
+		// Ownership check for modify operations.
+		//
+		// Deliberately *not* upstream-gated the way `crate::file_access::get_access_level`'s
+		// owner shortcut is. `owner_id_tag` here confers authority over the local *record* —
+		// on files that is rename, move, hide, soft-delete, restore and tag — which the placer
+		// of a Pin/Place row or the recipient of an accepted FSHR share must keep over their
+		// own copy, or they could not remove their own pin. It is never authority over content
+		// or shares: `cloudillo_file::management::patch_file` withholds the two publication
+		// columns of `UpdateFileOptions`, `visibility` and `status`, on a mirrored row, and
+		// content and share resolution go through `crate::file_access` and
+		// `crate::share_access`, both of which gate on provenance and deny on a mirrored
+		// row. Pinned by
+		// `cloudillo_file::perm`'s `mirrored_row_owner_keeps_record_authority`.
 		if matches!(operation, "update" | "delete" | "write") {
-			if let Some(owner) = object.get("owner_id_tag")
+			if !delegated
+				&& let Some(owner) = object.get("owner_id_tag")
 				&& owner == subject.id_tag.as_ref()
 			{
 				debug!(subject = %subject.id_tag, action = action, owner = owner, "Owner access allowed for modify operation");
@@ -556,22 +652,24 @@ impl PermissionChecker {
 			return self.check_visibility(subject, object);
 		}
 
-		// Create operations - check quota/limits in future
-		if operation == "create" {
-			debug!(subject = %subject.id_tag, action = action, "Create operation allowed");
-			return true; // Allow for now
-		}
+		// No `create` branch: resource creation goes through `create_perm::check_perm_create`
+		// → `has_collection_permission`, which never reaches here. An unconditional allow on
+		// this path would hand a delegated token a `create` it was never scoped for.
 
 		// Admin operations (e.g. `profile:admin`) — community moderators and above
 		// pass the gate. Leaders were already allowed by the override at the top of
 		// this function; this admits moderators so they can manage lower-ranked
-		// members. The finer-grained target-rank and field-level rules (a moderator
+		// members. Denied to a delegated token for the same reason the leader
+		// override above is: a scoped subject is decided by its scope, not by the
+		// role claim it happens to carry. (`scope::scope_permits` already keeps every
+		// `TokenScope` variant away from `/api/admin/**`; this is the second lock.)
+		// The finer-grained target-rank and field-level rules (a moderator
 		// may only re-role members strictly below them, never rename or change
 		// status) are enforced in the handler — see `patch_profile_admin`'s
 		// role-hierarchy guard in `cloudillo-profile/src/update.rs`.
 		if operation == "admin" {
 			use crate::roles::{MODERATOR_LEVEL, highest_role_level};
-			if highest_role_level(&subject.roles) >= MODERATOR_LEVEL {
+			if !delegated && highest_role_level(&subject.roles) >= MODERATOR_LEVEL {
 				debug!(subject = %subject.id_tag, action = action, "Moderator+ role allows admin operation");
 				return true;
 			}
@@ -610,16 +708,41 @@ impl PermissionChecker {
 			VisibilityLevel::Direct // No visibility = Direct (most restrictive)
 		};
 
-		// Determine subject's access level based on relationship with resource
-		let is_owner = object.get("owner_id_tag") == Some(subject.id_tag.as_ref());
-		let is_issuer = object.get("issuer_id_tag") == Some(subject.id_tag.as_ref());
+		// Determine subject's access level based on relationship with resource.
+		//
+		// A delegated token gets no owner standing, for the same reason the modify branch
+		// above denies it: a share-link token is minted `sub: None`, so its `id_tag` is
+		// the tenant's — owner of every locally-created row — and it would otherwise read
+		// the tenant's whole Direct-visibility library. Its authority is the scope, which
+		// reaches this function already resolved as `access_level`.
+		let delegated = subject.scope.is_some();
+		// Unlike the modify branch above, the read path *is* upstream-gated. On a mirrored row
+		// (`upstream_id_tag` present) `owner_id_tag` is the local placer, which is record
+		// authority only — never authority over content. Without this an FSHR recipient whose
+		// share was revoked would keep reading it forever off their surviving local row, since
+		// revocation only drops `access_level` to `None` and leaves the record in place.
+		// Objects that carry no `upstream_id_tag` at all (`ActionAttrs`, `ProfileAttrs`) are
+		// unaffected: `get` returns `None` there, so the gate holds open.
+		let is_owner = !delegated
+			&& object.get("upstream_id_tag").is_none()
+			&& object.get("owner_id_tag") == Some(subject.id_tag.as_ref());
+		let is_issuer = !delegated && object.get("issuer_id_tag") == Some(subject.id_tag.as_ref());
+		// Relationship applies to mirrored rows too: a cross-context placement's `visibility`
+		// is authored locally by the placing member, and the list and search paths apply the
+		// same relationship ladder to mirrors. The narrower gate is `is_owner` above — a
+		// mirror never confers owner standing, which is what keeps a revoked FSHR recipient
+		// out of a Direct row.
 		let is_connected = object.get("connected") == Some("true");
-		let is_follower = object.get("following") == Some("true");
+		let is_follower = object.get("is_follower") == Some("true");
 		let in_audience = object.contains("audience_tag", subject.id_tag.as_ref());
 
 		// Calculate subject's effective access level
 		// Note: "guest" id_tag is used for unauthenticated users - treat as Public
-		let is_authenticated = !subject.id_tag.is_empty() && subject.id_tag.as_ref() != "guest";
+		// A delegated token's `id_tag` is the tenant's own (minted `sub: None`), so it is not a
+		// subject at all — its authority is the scope, already resolved into `access_level`.
+		// Same gate `file_access::visibility_grants_read_fallback` applies.
+		let is_authenticated =
+			!delegated && !subject.id_tag.is_empty() && subject.id_tag.as_ref() != "guest";
 		let access_level = if is_owner || is_issuer {
 			SubjectAccessLevel::Owner
 		} else if is_connected {
@@ -799,6 +922,212 @@ mod tests {
 		assert!(!checker.has_permission(&subject, "file:update", &none, &env));
 	}
 
+	/// A row the tenant owns, with a pre-computed access level. This is the shape
+	/// `cloudillo_file::perm::load_file_attrs` produces for every locally-created file:
+	/// no explicit owner, so `owner_id_tag` falls back to the tenant's id_tag.
+	struct TenantOwnedObject(&'static str);
+
+	impl AttrSet for TenantOwnedObject {
+		fn get(&self, key: &str) -> Option<&str> {
+			match key {
+				"owner_id_tag" => Some("alice.example.com"),
+				"access_level" => Some(self.0),
+				"visibility_char" => Some("D"),
+				_ => None,
+			}
+		}
+
+		fn get_list(&self, _key: &str) -> Option<Vec<&str>> {
+			None
+		}
+	}
+
+	/// A Pin/Place row: `upstream_id_tag` names the node whose copy is canonical, while
+	/// `owner_id_tag` is the local placer — record authority, never content authority.
+	struct MirroredObject {
+		upstream: Option<&'static str>,
+		visibility: &'static str,
+	}
+
+	impl AttrSet for MirroredObject {
+		fn get(&self, key: &str) -> Option<&str> {
+			match key {
+				"upstream_id_tag" => self.upstream,
+				"owner_id_tag" => Some("alice.example.com"),
+				"visibility_char" => Some(self.visibility),
+				"connected" => Some("true"),
+				_ => None,
+			}
+		}
+
+		fn get_list(&self, _key: &str) -> Option<Vec<&str>> {
+			None
+		}
+	}
+
+	/// The REST detail path (`check_perm_file("read")`) must draw the same line as the file
+	/// list and search. A cross-context Pin is authored locally at `'C'` by the placing
+	/// member, so relationship applies to mirrors too — what a mirror withholds is *owner*
+	/// standing, which is what keeps a revoked FSHR recipient out of a Direct row.
+	#[test]
+	fn a_mirrored_row_answers_to_relationship_but_confers_no_ownership() {
+		let checker = PermissionChecker::new();
+		let env = Environment::new();
+		let subject = plain_subject();
+
+		let local = MirroredObject { upstream: None, visibility: "C" };
+		assert!(
+			checker.has_permission(&subject, "file:read", &local, &env),
+			"a local 'C' row is readable by a connected caller"
+		);
+
+		let mirror = MirroredObject { upstream: Some("bob.example.com"), visibility: "C" };
+		assert!(
+			checker.has_permission(&subject, "file:read", &mirror, &env),
+			"a community pin is readable by the connected members it was placed for"
+		);
+
+		// Direct still needs Owner, and a mirror never confers it — even though
+		// `owner_id_tag` names this very caller. The revoked-FSHR-recipient case.
+		let direct_mirror = MirroredObject { upstream: Some("bob.example.com"), visibility: "D" };
+		assert!(!checker.has_permission(&subject, "file:read", &direct_mirror, &env));
+		let direct_local = MirroredObject { upstream: None, visibility: "D" };
+		assert!(checker.has_permission(&subject, "file:read", &direct_local, &env));
+	}
+
+	/// A share-link token is minted `sub: None`, so its `AuthCtx::id_tag` *is* the
+	/// tenant — which owns every locally-created row. The ownership shortcut would
+	/// therefore hand a read-only share link write access to the whole tenant; a scoped
+	/// subject must be decided by its (scope-aware) `access_level` alone.
+	#[test]
+	fn a_scoped_subject_does_not_inherit_tenant_ownership() {
+		let checker = PermissionChecker::new();
+		let env = Environment::new();
+		let scoped = AuthCtx { scope: Some("file:f1~other:R".into()), ..plain_subject() };
+
+		// The scope names a different file, so `access_level` came back "read".
+		let object = TenantOwnedObject("read");
+		assert!(!checker.has_permission(&scoped, "file:write", &object, &env));
+		assert!(!checker.has_permission(&scoped, "file:update", &object, &env));
+		assert!(!checker.has_permission(&scoped, "file:delete", &object, &env));
+		// Reading is what the scope actually grants, and still works.
+		assert!(checker.has_permission(&scoped, "file:read", &object, &env));
+
+		// Without a scope the same subject is the tenant owner and may write.
+		let owner = plain_subject();
+		assert!(checker.has_permission(&owner, "file:write", &object, &env));
+	}
+
+	/// A `'V'` (verified) row with no pre-computed access level — the shape that reaches
+	/// `check_visibility` when every explicit grant came up empty.
+	struct VerifiedObject;
+
+	impl AttrSet for VerifiedObject {
+		fn get(&self, key: &str) -> Option<&str> {
+			match key {
+				"owner_id_tag" => Some("someone-else.example.com"),
+				"visibility_char" => Some("V"),
+				_ => None,
+			}
+		}
+
+		fn get_list(&self, _key: &str) -> Option<Vec<&str>> {
+			None
+		}
+	}
+
+	/// A share-link token is minted `sub: None`, so its `id_tag` is the tenant's own —
+	/// never empty, never "guest". Scoring it as an authenticated subject would let a
+	/// guest read every `'V'` row on the tenant via a scope that names one file.
+	#[test]
+	fn a_scoped_subject_is_not_an_authenticated_subject() {
+		let checker = PermissionChecker::new();
+		let env = Environment::new();
+		let object = VerifiedObject;
+
+		let scoped = AuthCtx { scope: Some("file:f1~other:R".into()), ..plain_subject() };
+		assert!(!checker.has_permission(&scoped, "file:read", &object, &env));
+
+		// The same subject without a scope really is authenticated, and 'V' admits them.
+		let unscoped = plain_subject();
+		assert!(checker.has_permission(&unscoped, "file:read", &object, &env));
+	}
+
+	/// The session branch of `get_access_token` mints `r` and `scope` together, so the
+	/// ordinary app-sandbox token is `leader` *plus* a single-file scope. The leader
+	/// override must not carry it past that scope.
+	#[test]
+	fn the_leader_override_does_not_apply_to_a_scoped_subject() {
+		let checker = PermissionChecker::new();
+		let env = Environment::new();
+		let object = TenantOwnedObject("none");
+
+		let scoped_leader = AuthCtx {
+			roles: Box::new(["leader".into()]),
+			scope: Some("file:f1~other:R".into()),
+			..plain_subject()
+		};
+		assert!(!checker.has_permission(&scoped_leader, "file:read", &object, &env));
+		assert!(!checker.has_permission(&scoped_leader, "file:write", &object, &env));
+
+		// The same leader without a scope is unaffected.
+		let leader = AuthCtx { roles: Box::new(["leader".into()]), ..plain_subject() };
+		assert!(checker.has_permission(&leader, "file:write", &object, &env));
+	}
+
+	/// The `delegated` guard covers every branch, not only the two shortcuts.
+	/// `create` is gone from the default rules altogether — resource creation is
+	/// `create_perm::check_perm_create` → `has_collection_permission`, never this path.
+	#[test]
+	fn a_scoped_subject_gets_neither_admin_nor_a_create_default() {
+		let checker = PermissionChecker::new();
+		let env = Environment::new();
+		let object = TenantOwnedObject("none");
+
+		let scoped_mod = AuthCtx {
+			roles: Box::new(["moderator".into()]),
+			scope: Some("file:f1~other:R".into()),
+			..plain_subject()
+		};
+		assert!(!checker.has_permission(&scoped_mod, "profile:admin", &object, &env));
+
+		// The unscoped moderator is unaffected.
+		let moderator = AuthCtx { roles: Box::new(["moderator".into()]), ..plain_subject() };
+		assert!(checker.has_permission(&moderator, "profile:admin", &object, &env));
+
+		// `create` reaches the default deny, scoped or not.
+		assert!(!checker.has_permission(&moderator, "file:create", &object, &env));
+		assert!(!checker.has_permission(&scoped_mod, "file:create", &object, &env));
+	}
+
+	/// `require_tenant_self` is the gate on credentials that ARE the account. `leader`
+	/// must not reach it — on a community tenant ordinary members hold it.
+	#[test]
+	fn require_tenant_self_admits_only_the_account_and_sadm() {
+		// The account: its own id_tag AND `leader`, which `build_tenant_owner_roles` always adds.
+		let account = AuthCtx { roles: Box::new(["leader".into()]), ..plain_subject() };
+		assert!(require_tenant_self(&account, "alice.example.com", "test").is_ok());
+
+		let leader = AuthCtx { roles: Box::new(["leader".into()]), ..plain_subject() };
+		assert!(require_tenant_self(&leader, "community.example.com", "test").is_err());
+
+		let sadm = AuthCtx { roles: Box::new(["SADM".into()]), ..plain_subject() };
+		assert!(require_tenant_self(&sadm, "community.example.com", "test").is_ok());
+
+		// A delegated token is never the account, even when its id_tag is the tenant's.
+		let scoped = AuthCtx { scope: Some("file:f1~abc:W".into()), ..plain_subject() };
+		assert!(require_tenant_self(&scoped, "alice.example.com", "test").is_err());
+	}
+
+	/// An `idp_` management key is minted as `{id_tag: <identity>, roles: [], scope: None}`, so
+	/// on that identity's own host the id_tag matches. Without the role test it would reach
+	/// `POST /api/auth/api-keys` and `POST /api/auth/wa/reg` and mint itself a full owner.
+	#[test]
+	fn require_tenant_self_denies_role_less_principal() {
+		let idp_key = plain_subject(); // roles: []
+		assert!(require_tenant_self(&idp_key, "alice.example.com", "test").is_err());
+	}
+
 	#[test]
 	fn test_subscribed_level_char_roundtrip() {
 		assert_eq!(VisibilityLevel::from_char(Some('S')), VisibilityLevel::Subscribed);
@@ -828,7 +1157,7 @@ mod tests {
 			item_owner_id_tag: "bob.example.com", // a different member
 			tenant_id_tag: "home.example.com",
 			visibility: Some('S'),
-			subject_following_owner: false,
+			subject_is_follower: false,
 			subject_connected_to_owner: false,
 			audience_tags: Some(&[member]),
 		};
@@ -844,7 +1173,7 @@ mod tests {
 			item_owner_id_tag: "bob.example.com",
 			tenant_id_tag: "home.example.com",
 			visibility: Some('S'),
-			subject_following_owner: false,
+			subject_is_follower: false,
 			subject_connected_to_owner: false,
 			audience_tags: Some(&[]),
 		};
@@ -860,7 +1189,7 @@ mod tests {
 			item_owner_id_tag: "bob.example.com",
 			tenant_id_tag: "home.example.com",
 			visibility: Some('S'),
-			subject_following_owner: false,
+			subject_is_follower: false,
 			subject_connected_to_owner: false,
 			audience_tags: Some(&[]),
 		};
@@ -873,7 +1202,7 @@ mod tests {
 			item_owner_id_tag: "bob.example.com",
 			tenant_id_tag: "home.example.com",
 			visibility: Some('S'),
-			subject_following_owner: false,
+			subject_is_follower: false,
 			subject_connected_to_owner: false,
 			audience_tags: Some(&[]),
 		};

@@ -19,7 +19,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-use cloudillo_core::{Auth, extract::OptionalRequestId};
+use cloudillo_core::{
+	Auth,
+	extract::{IdTag, OptionalRequestId},
+};
 use cloudillo_types::types::ApiResponse;
 
 use crate::handler::{Login, return_login};
@@ -317,6 +320,7 @@ pub struct DetailsResponse {
 
 pub async fn get_details(
 	State(app): State<App>,
+	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(session_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -337,6 +341,14 @@ pub async fn get_details(
 
 		// Verify tenant match
 		if auth.tn_id != session.tn_id {
+			return Err(Error::PermissionDenied);
+		}
+
+		// Same binding `post_respond` applies: `auth.tn_id` is always the host tenant, so
+		// the check above admits any visitor holding a session here — who would then read
+		// the desktop's IP and User-Agent off a session they did not start.
+		if auth.id_tag.as_ref() != id_tag.as_ref() || auth.scope.is_some() {
+			warn!(subject = %auth.id_tag, host = %id_tag, "QR details denied - not the account");
 			return Err(Error::PermissionDenied);
 		}
 
@@ -361,6 +373,7 @@ pub struct RespondRequest {
 
 pub async fn post_respond(
 	State(app): State<App>,
+	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(session_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -383,6 +396,17 @@ pub async fn post_respond(
 			return Err(Error::PermissionDenied);
 		}
 
+		// The approver must BE the account, not merely hold a session on its host.
+		// `auth.tn_id` is always the host tenant, so the check above is satisfied by any
+		// visitor with a session here — who could otherwise approve a QR scanned off the
+		// victim's screen and silently hand the desktop *their own* identity (login CSRF).
+		// `create_tenant_login` refuses the mismatch too; failing here keeps the desktop's
+		// long-poll pending instead of resolving it with a foreign login.
+		if auth.id_tag.as_ref() != id_tag.as_ref() || auth.scope.is_some() {
+			warn!(subject = %auth.id_tag, host = %id_tag, "QR login denied - not the account");
+			return Err(Error::PermissionDenied);
+		}
+
 		// Must be pending
 		if session.status != QrLoginStatus::Pending {
 			return Err(Error::ValidationError("Session already responded".into()));
@@ -394,7 +418,7 @@ pub async fn post_respond(
 
 	// Perform async work without holding any DashMap lock
 	if body.approved {
-		let auth_login = app.auth_adapter.create_tenant_login(&auth.id_tag).await?;
+		let auth_login = app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag).await?;
 		let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
 
 		// Re-acquire lock to update session — return error if session vanished or already responded
@@ -406,6 +430,11 @@ pub async fn post_respond(
 		entry.status = QrLoginStatus::Approved;
 	} else {
 		let mut entry = store.sessions.get_mut(&session_id).ok_or(Error::NotFound)?;
+		// Re-check under the re-acquired lock, like the approve branch: a concurrent
+		// approve must not be overwritten by a late deny.
+		if entry.status != QrLoginStatus::Pending {
+			return Err(Error::ValidationError("Session already responded".into()));
+		}
 		entry.status = QrLoginStatus::Denied;
 	}
 

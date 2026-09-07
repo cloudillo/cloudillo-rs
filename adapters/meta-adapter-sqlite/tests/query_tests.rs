@@ -8,11 +8,11 @@
 
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{
-	CreateFile, FileStatus, ListActionOptions, ListFileOptions, ListTaskOptions, MANAGED_PARENT_ID,
-	MetaAdapter, ProfileStatus, ProfileType, TRASH_PARENT_ID, UpdateFileOptions,
+	Action, CreateFile, FileStatus, ListActionOptions, ListFileOptions, ListTaskOptions,
+	MANAGED_PARENT_ID, MetaAdapter, ProfileStatus, ProfileType, TRASH_PARENT_ID, UpdateFileOptions,
 	UpsertProfileFields,
 };
-use cloudillo_types::types::{Patch, TnId};
+use cloudillo_types::types::{Patch, Timestamp, TnId};
 use cloudillo_types::worker::WorkerPool;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -443,25 +443,25 @@ async fn test_list_files_local_only_excludes_remote() {
 	let tn_id = TnId(1);
 	adapter.create_tenant(tn_id, "team-alice").await.ok();
 
-	// Local file created by a community member: owner_tag is NULL, creator_tag
+	// Local file created by a community member: upstream_tag is NULL, owner_tag
 	// is the member (NOT the tenant). This is the case the picker must include.
 	let local = CreateFile {
 		file_id: Some("f_local".into()),
 		content_type: "image/png".into(),
 		file_name: "local.png".into(),
 		file_tp: Some("BLOB".into()),
-		creator_tag: Some("alice.home.w9.hu".into()),
+		owner_tag: Some("alice.home.w9.hu".into()),
 		..Default::default()
 	};
 	adapter.create_file(tn_id, local).await.expect("create local");
 
-	// Remote/federated cached copy: owner_tag set to the origin node.
+	// Remote/federated cached copy: upstream_tag set to the origin node.
 	let remote = CreateFile {
 		file_id: Some("f_remote".into()),
 		content_type: "image/png".into(),
 		file_name: "remote.png".into(),
 		file_tp: Some("BLOB".into()),
-		owner_tag: Some("bob.example.com".into()),
+		upstream_tag: Some("bob.example.com".into()),
 		..Default::default()
 	};
 	adapter.create_file(tn_id, remote).await.expect("create remote");
@@ -483,6 +483,53 @@ async fn test_list_files_local_only_excludes_remote() {
 	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
 	assert!(ids.iter().any(|n| n == "f_local"), "member-created local file must remain");
 	assert!(!ids.iter().any(|n| n == "f_remote"), "remote cached file must be excluded");
+}
+
+/// A mirrored row (`upstream_tag` set) answers to the same relationship ladder as a local one.
+/// A cross-context placement (a community Pin) is created locally at `'C'` by the placing
+/// member — `handler::default_cross_context_visibility` — so gating mirrors to `'P'` made
+/// every community pin permanently invisible to the very members it was placed for.
+/// Provenance is enforced where it belongs: `abac::check_visibility` withholds *owner*
+/// standing from a mirror, so a Direct row (an FSHR share) still needs the share entry.
+#[tokio::test]
+async fn test_list_files_mirrored_rows_follow_the_visibility_ladder() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "team-alice").await.ok();
+
+	let file = |file_id: &str, upstream: Option<&str>, visibility: char| CreateFile {
+		file_id: Some(file_id.into()),
+		content_type: "image/png".into(),
+		file_name: format!("{file_id}.png").into(),
+		file_tp: Some("BLOB".into()),
+		upstream_tag: upstream.map(Into::into),
+		visibility: Some(visibility),
+		..Default::default()
+	};
+	for f in [
+		file("f_local_c", None, 'C'),
+		file("f_local_p", None, 'P'),
+		file("f_mirror_c", Some("bob.example.com"), 'C'),
+		file("f_mirror_p", Some("bob.example.com"), 'P'),
+	] {
+		adapter.create_file(tn_id, f).await.expect("create file");
+	}
+
+	// A connected viewer — a community member seeing a pin. `'C'` is admitted whether the
+	// row originated here or upstream.
+	let connected = ListFileOptions { visible_levels: Some(vec!['P', 'C']), ..Default::default() };
+	let result = adapter.list_files(tn_id, &connected).await.expect("list ok");
+	assert_eq!(file_ids(&result), vec!["f_local_c", "f_local_p", "f_mirror_c", "f_mirror_p"]);
+
+	// An unauthenticated viewer reaches only the Public rung, mirrored or not.
+	let anonymous = ListFileOptions { visible_levels: Some(vec!['P']), ..Default::default() };
+	let result = adapter.list_files(tn_id, &anonymous).await.expect("list ok");
+	assert_eq!(file_ids(&result), vec!["f_local_p", "f_mirror_p"]);
+
+	// Owner / tenant and the inherited-folder-share bypass both leave `visible_levels` at
+	// `None`, which is no filter at all.
+	let result = adapter.list_files(tn_id, &ListFileOptions::default()).await.expect("list ok");
+	assert_eq!(file_ids(&result), vec!["f_local_c", "f_local_p", "f_mirror_c", "f_mirror_p"]);
 }
 
 /// A file at an explicit location, with an explicit `hidden` flag.
@@ -554,4 +601,60 @@ async fn the_sweep_listing_returns_the_rows_a_browse_listing_hides() {
 		file_ids(&sweep),
 		vec!["f1~deleted", "f1~hidden", "f1~managed", "f1~plain", "f1~trashed"]
 	);
+}
+
+/// `exclude_sub_typ` must filter in SQL, before the `LIMIT` — the property both community-INVT
+/// gates rest on (`conn::has_pending_invitation`, `invt::pending_invitation_issuer`). Filtering
+/// the fetched page in Rust instead let a handful of `INVT:DEL` rows push the real invitation
+/// out of the window, silently turning the gate into "no invitation on record".
+#[tokio::test]
+async fn exclude_sub_typ_filters_before_the_limit() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "club.example.com").await.ok();
+
+	let now = Timestamp::now();
+	let invt = |action_id: &'static str, sub_typ, created_at| Action {
+		action_id,
+		typ: "INVT",
+		sub_typ,
+		issuer_tag: "mod.example.com",
+		parent_id: None,
+		root_id: None,
+		audience_tag: Some("stranger.example.com"),
+		content: None,
+		attachments: None,
+		subject: Some("@club.example.com"),
+		created_at,
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+	};
+
+	// The invitation is the oldest row; the revocations sort ahead of it (created_at DESC).
+	adapter
+		.create_action(tn_id, &invt("a1~invt", None, now), None)
+		.await
+		.expect("create invt");
+	let dels = ["a1~d0", "a1~d1", "a1~d2", "a1~d3", "a1~d4", "a1~d5", "a1~d6", "a1~d7", "a1~d8"];
+	for (i, id) in (1i64..).zip(dels) {
+		adapter
+			.create_action(tn_id, &invt(id, Some("DEL"), now.add_seconds(i)), None)
+			.await
+			.expect("create invt:del");
+	}
+
+	let opts = ListActionOptions {
+		typ: Some(vec!["INVT".into()]),
+		subject: Some(vec!["@club.example.com".into()]),
+		audience: Some("stranger.example.com".into()),
+		exclude_sub_typ: Some(Box::from([Box::from("DEL") as Box<str>])),
+		limit: Some(1),
+		..Default::default()
+	};
+	let res = adapter.list_actions(tn_id, &opts).await.expect("list_actions");
+	assert_eq!(res.len(), 1);
+	assert_eq!(res[0].action_id.as_ref(), "a1~invt");
+	assert!(res[0].sub_typ.is_none());
 }

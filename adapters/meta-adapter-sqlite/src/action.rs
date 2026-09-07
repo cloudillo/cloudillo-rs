@@ -1025,19 +1025,84 @@ pub(crate) async fn create_inbound(
 	token: &str,
 	ack_token: Option<&str>,
 ) -> ClResult<()> {
-	sqlx::query(
-		"INSERT OR IGNORE INTO action_tokens (tn_id, action_id, token, status, ack)
-		VALUES (?, ?, ?, ?, ?)",
-	)
-	.bind(tn_id.0)
-	.bind(action_id)
-	.bind(token)
-	.bind("P")
-	.bind(ack_token)
-	.execute(db)
-	.await
-	.db()?;
+	match ack_token {
+		// A bundled token: link it to its primary, but never re-arm `ack` on a row that has
+		// already been processed (its `ack` was cleared by the `None` arm below).
+		Some(ack) => {
+			sqlx::query(
+				"INSERT OR IGNORE INTO action_tokens (tn_id, action_id, token, status, ack, created_at)
+				VALUES (?, ?, ?, 'P', ?, unixepoch())",
+			)
+			.bind(tn_id.0)
+			.bind(action_id)
+			.bind(token)
+			.bind(ack)
+			.execute(db)
+			.await
+			.db()?;
+		}
+		// The action's own token, stored once processing succeeded. Clearing `ack` is what
+		// takes the row out of `cleanup_orphaned_tokens`' reach — but only for the tokens
+		// that get here: `store_inbound_action` returns early on an already-active,
+		// superseded or unexpected-status duplicate, so those keep their `ack` and are
+		// reaped at the 7-day cutoff. See `cleanup_orphaned_tokens`.
+		//
+		// `created_at` is restamped on the conflict too, so it means "when this token was last
+		// stored" for both writers (`store_token` already restamps). Harmless for the sweep:
+		// it only considers `ack IS NOT NULL` rows, and this arm is the one that clears `ack`.
+		None => {
+			sqlx::query(
+				"INSERT INTO action_tokens (tn_id, action_id, token, status, ack, created_at)
+				VALUES (?, ?, ?, 'P', NULL, unixepoch())
+				ON CONFLICT(action_id, tn_id) DO UPDATE SET ack = NULL, created_at = unixepoch()",
+			)
+			.bind(tn_id.0)
+			.bind(action_id)
+			.bind(token)
+			.execute(db)
+			.await
+			.db()?;
+		}
+	}
 	Ok(())
+}
+
+/// Delete related-action tokens orphaned by an `/api/inbox` bundle whose main token never
+/// verified. Only acked rows are eligible: `ack` is cleared when the action itself is stored
+/// (see `create_inbound`'s `None` arm). A bare row — never bundled, or bundled and since
+/// processed — is the action's own token and is deleted with the action.
+///
+/// `ack IS NOT NULL` is a close proxy for "the primary never verified", not a proof of it:
+/// `store_inbound_action` returns `Ok(false)` on a duplicate that is already active,
+/// superseded or in an unexpected status, *before* reaching `create_inbound`, so those rows
+/// keep their `ack` and are reaped here too. The cost is that a `get_related_tokens` re-bundle
+/// past the cutoff comes back short — not a correctness problem, since the peer already holds
+/// the action those tokens duplicate.
+///
+/// Deleted in batches — this runs on the single write connection, and the first sweep after
+/// deployment can face an arbitrarily large backlog. Correctness is unaffected either way.
+pub(crate) async fn cleanup_orphaned_tokens(db: &SqlitePool, before: Timestamp) -> ClResult<u64> {
+	// `rowid IN (SELECT … LIMIT ?)`, not `DELETE … LIMIT`: the latter needs SQLite built with
+	// SQLITE_ENABLE_UPDATE_DELETE_LIMIT. `idx_action_tokens_orphan` backs the subquery.
+	const CLEANUP_BATCH: i64 = 500;
+
+	let mut total = 0u64;
+	loop {
+		let res = sqlx::query(
+			"DELETE FROM action_tokens WHERE rowid IN \
+			 (SELECT rowid FROM action_tokens WHERE ack IS NOT NULL AND created_at < ? LIMIT ?)",
+		)
+		.bind(before.0)
+		.bind(CLEANUP_BATCH)
+		.execute(db)
+		.await
+		.db()?;
+		let n = res.rows_affected();
+		total += n;
+		if n < CLEANUP_BATCH as u64 {
+			return Ok(total);
+		}
+	}
 }
 
 /// Get related action tokens by APRV action_id
@@ -1047,13 +1112,17 @@ pub(crate) async fn get_related_tokens(
 	tn_id: TnId,
 	aprv_action_id: &str,
 ) -> ClResult<Vec<(Box<str>, Box<str>)>> {
-	let rows =
-		sqlx::query("SELECT action_id, token FROM action_tokens WHERE tn_id = ? AND ack = ?")
-			.bind(tn_id.0)
-			.bind(aprv_action_id)
-			.fetch_all(db)
-			.await
-			.db()?;
+	// `ORDER BY rowid` is load-bearing, not decoration: `action_tokens` is an ordinary rowid
+	// table, so this is the order `post_inbox` stored the bundle in. `process.rs`'s rule R2
+	// requires the bridged primary token to be processed before the STAT that references it.
+	let rows = sqlx::query(
+		"SELECT action_id, token FROM action_tokens WHERE tn_id = ? AND ack = ? ORDER BY rowid",
+	)
+	.bind(tn_id.0)
+	.bind(aprv_action_id)
+	.fetch_all(db)
+	.await
+	.db()?;
 
 	let mut result = Vec::with_capacity(rows.len());
 	for row in rows {
@@ -1150,8 +1219,8 @@ pub(crate) async fn store_token(
 	token: &str,
 ) -> ClResult<()> {
 	sqlx::query(
-		"INSERT OR REPLACE INTO action_tokens (tn_id, action_id, token, status)
-		VALUES (?, ?, ?, 'L')",
+		"INSERT OR REPLACE INTO action_tokens (tn_id, action_id, token, status, created_at)
+		VALUES (?, ?, ?, 'L', unixepoch())",
 	)
 	.bind(tn_id.0)
 	.bind(action_id)

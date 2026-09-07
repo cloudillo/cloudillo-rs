@@ -350,7 +350,14 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn count_tenants(&self, opts: &ListTenantsOptions<'_>) -> ClResult<usize>;
 
 	// Password management
-	async fn create_tenant_login(&self, id_tag: &str) -> ClResult<AuthLogin>;
+	/// Mint an owner login for `id_tag`.
+	///
+	/// `host_id_tag` is the tenant the request arrived at (the `IdTag` extractor's
+	/// value). The returned token carries the full owner role hierarchy, so `id_tag`
+	/// — which reaches callers from a token's `sub`, a ref, or a WebAuthn challenge,
+	/// all of which can name a *foreign* tenant — must be that same tenant.
+	/// Implementations reject a mismatch.
+	async fn create_tenant_login(&self, id_tag: &str, host_id_tag: &str) -> ClResult<AuthLogin>;
 	async fn check_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<AuthLogin>;
 	async fn update_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<()>;
 

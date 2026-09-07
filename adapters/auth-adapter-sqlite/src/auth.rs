@@ -203,15 +203,35 @@ pub(crate) async fn create_tenant_login(
 	db: &SqlitePool,
 	worker: &Arc<WorkerPool>,
 	id_tag: &str,
+	host_id_tag: &str,
 	jwt_secret_str: &str,
 ) -> ClResult<AuthLogin> {
+	// An owner login is authority over the account, so the identity being logged in as
+	// must be the tenant this host serves. Every caller reaches `id_tag` from a value a
+	// federated visitor can control — a token's `sub`, a ref, a WebAuthn challenge — and
+	// without this the same call mints `leader` (+ the tenant row's `SADM`) for *any*
+	// id_tag on the server. Checked here rather than at the call sites so a new caller
+	// cannot miss it.
+	if id_tag != host_id_tag {
+		warn!(
+			subject = %id_tag,
+			host = %host_id_tag,
+			"Tenant login denied - caller is not the tenant account"
+		);
+		return Err(Error::PermissionDenied);
+	}
+
 	let res = sqlx::query("SELECT tn_id, id_tag, roles, status FROM tenants WHERE id_tag = ?1")
 		.bind(normalize_id_tag(id_tag).as_ref())
 		.fetch_one(db)
 		.await;
 
 	match res {
-		Err(_) => Err(Error::PermissionDenied),
+		// A missing row means "no tenant of that name here", which the login routes render as
+		// "you have no account here". Every *other* sqlx error is a real fault and must stay
+		// one — swallowing it into `PermissionDenied` told the client they were not logged in.
+		Err(sqlx::Error::RowNotFound) => Err(Error::PermissionDenied),
+		Err(e) => Err::<AuthLogin, _>(e).db(),
 		Ok(row) => {
 			let _tn_id = row.try_get("tn_id").map(TnId).db()?;
 			let status: Option<&str> = row.try_get("status").db()?;

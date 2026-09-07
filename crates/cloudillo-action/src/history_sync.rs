@@ -151,11 +151,26 @@ impl Task<App> for HistoryFetchTask {
 			// inbound action linked to the primary BEFORE processing the primary.
 			// `process_inbound_action_token` then internally drives
 			// `process_related_actions`, which pulls these pre-stored tokens and
-			// runs them via `process_preapproved_action_token`. This makes
-			// history-sync ingestion byte-for-byte the same protocol as inbox
-			// ingestion, including the audience-bridge case where the primary
-			// is an APRV that approves a 3rd-party post in `related`.
+			// runs them; only the primary's own declared subject takes the
+			// `process_preapproved_action_token` path, everything else goes through
+			// the full inbound check. This makes history-sync ingestion the same
+			// protocol as inbox ingestion, including the audience-bridge case where
+			// the primary is an APRV that approves a 3rd-party post in `related`.
 			let primary_id = hash("a", item.token.as_bytes());
+			// Same cap as `/api/inbox`, and for the same reason: every stored related
+			// token costs a potential outbound key fetch, and this bundle came from a
+			// peer-controlled response body. Skip the item rather than abort the sync —
+			// unlike the inbox route there is no request to reject, and one hostile
+			// item must not stall the rest of the tail.
+			if item.related.len() > crate::handler::MAX_RELATED_TOKENS {
+				warn!(
+					peer_id_tag = %self.peer_id_tag,
+					primary_id = %primary_id,
+					count = item.related.len(),
+					"history_sync: related token bundle over cap, skipping item"
+				);
+				continue;
+			}
 			for related_token in &item.related {
 				let related_id = hash("a", related_token.as_bytes());
 				// `create_inbound_action` is `INSERT OR IGNORE` on
@@ -182,6 +197,9 @@ impl Task<App> for HistoryFetchTask {
 			}
 
 			debug!("→ ingesting primary {}", primary_id);
+			// No client address, deliberately: this is a tenant-initiated *outbound* sync we
+			// asked for, not an unauthenticated inbound POST, so there is nobody to charge
+			// proof of work or a rate-limit penalty to.
 			if let Err(e) =
 				process_inbound_action_token(app, self.tn_id, &primary_id, &item.token, false, None)
 					.await

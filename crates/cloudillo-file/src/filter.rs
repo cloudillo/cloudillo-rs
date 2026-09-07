@@ -42,11 +42,7 @@ pub async fn compute_file_access_levels(
 	// For authenticated users, compute access level for each file
 	let mut result = Vec::with_capacity(files.len());
 	for mut file in files {
-		let owner_tag = file
-			.owner
-			.as_ref()
-			.and_then(|o| if o.id_tag.is_empty() { None } else { Some(o.id_tag.as_ref()) })
-			.unwrap_or(ctx.tenant_id_tag);
+		let file_ref = file_access::FileRef::from_view(&file, ctx.tenant_id_tag);
 
 		// Cross-context row: the owner lives on a different tenant. Source
 		// authority is the origin server, not us; the FSHR-fallback path in
@@ -62,25 +58,18 @@ pub async fn compute_file_access_levels(
 		// but better than no badge). The fallback runs once per row until
 		// `refresh_file` populates the cache; that's still cheaper than the
 		// pre-cache behaviour in the common case.
-		let is_cross_context = owner_tag != ctx.tenant_id_tag;
+		// Provenance, not authority: a row is cross-context when its canonical copy lives
+		// elsewhere. The owner may well be a local member on a community tenant.
+		let is_cross_context = file_ref.upstream_id_tag.is_some();
 		let access_level = if is_cross_context {
 			match file.user_data.as_ref().and_then(|u| u.access_level) {
 				Some(lv) => lv,
 				None => {
-					file_access::get_access_level(
-						app,
-						tn_id,
-						&file.file_id,
-						owner_tag,
-						ctx,
-						floor_access,
-					)
-					.await
+					file_access::get_access_level(app, tn_id, file_ref, ctx, floor_access).await
 				}
 			}
 		} else {
-			file_access::get_access_level(app, tn_id, &file.file_id, owner_tag, ctx, floor_access)
-				.await
+			file_access::get_access_level(app, tn_id, file_ref, ctx, floor_access).await
 		};
 
 		let effective = match floor_access {

@@ -108,6 +108,11 @@ pub struct HookResult {
 	pub vars: HashMap<String, serde_json::Value>,
 
 	/// Whether to continue processing (false = abort)
+	///
+	/// "Abort" skips the rest of `process_after_store` (WS forward, fan-out, delivery) but
+	/// does **not** remove the stored row, which by then rests at 'A'. A hook that must
+	/// *deny* rather than merely stop has to delete the row itself (`fshr::on_create`), or
+	/// the check belongs pre-store (`invt::check_community_authority`).
 	pub continue_processing: bool,
 
 	/// Optional early return value

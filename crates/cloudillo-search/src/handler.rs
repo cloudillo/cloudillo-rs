@@ -89,7 +89,7 @@ use axum::{
 	http::StatusCode,
 };
 use cloudillo_core::{
-	abac::{SubjectAccessLevel, relationship_level},
+	abac::{self, SubjectAccessLevel, relationship_level},
 	extract::{IdTag, OptionalAuth, OptionalRequestId},
 	file_access::{self, ScopeCheck},
 };
@@ -194,7 +194,7 @@ pub struct SearchHit {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub tags: Option<Box<[Box<str>]>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub owner_tag: Option<Box<str>>,
+	pub upstream_tag: Option<Box<str>>,
 	/// The profile's picture file id — `'P'` hits only. The file lives on the
 	/// profile's own node, addressed by [`Self::obj_id`], not on the searching
 	/// tenant's.
@@ -261,10 +261,15 @@ pub async fn get_search(
 	// `visible_levels` at `None` for a scoped caller would hand a share-link guest
 	// the tenant-owner level over the whole shared document tree.
 	let subject = auth.id_tag.as_ref();
-	let rels = app.meta_adapter.get_relationships(tn_id, &[subject]).await?;
-	let (following, connected) = rels.get(subject).copied().unwrap_or((false, false));
-	let level =
-		subject_level(auth.scope.as_deref(), subject, tenant_id_tag.as_ref(), connected, following);
+	// `follower` ("they follow us"), not `following` ("we follow them").
+	let rel = abac::subject_relation_to_tenant(&app, tn_id, subject).await?;
+	let level = subject_level(
+		auth.scope.as_deref(),
+		subject,
+		tenant_id_tag.as_ref(),
+		rel.connected,
+		rel.follower,
+	);
 	opts.visible_levels = level.visible_levels().map(<[char]>::to_vec);
 	// Same test `subject_level` uses, so the two can never disagree: a share-link
 	// guest resolves to the tenant's own id_tag, and handing that to the adapter
@@ -540,7 +545,7 @@ fn to_hit(
 		snippet: row.snippet,
 		snippet_matches: row.snippet_matches,
 		tags: row.tags.as_deref().map(split_tags),
-		owner_tag: row.owner_tag,
+		upstream_tag: row.upstream_tag,
 		profile_pic,
 		profile_type,
 		updated_at: row.updated_at,
@@ -736,7 +741,7 @@ mod tests {
 		assert_eq!(subject_level(None, tenant, tenant, false, false), SubjectAccessLevel::Owner);
 	}
 
-	/// Getting this wrong pushes `OR d.owner_tag = '<tenant>'` into the adapter's
+	/// Getting this wrong pushes `OR d.upstream_tag = '<tenant>'` into the adapter's
 	/// visibility predicate and hands an anonymous link holder owner-equivalent
 	/// visibility on every row carrying the tenant's tag.
 	#[test]

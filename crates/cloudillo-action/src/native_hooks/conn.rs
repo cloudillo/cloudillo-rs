@@ -32,12 +32,23 @@ use cloudillo_types::meta_adapter::{ProfileConnectionStatus, UpsertProfileFields
 /// INVTs store their `subject` as the identity reference `@<id_tag>` (the
 /// frontend builds it as `'@' + communityIdTag`), so the lookup must prepend
 /// `@` — querying the bare tag matches nothing.
-async fn retire_community_invitations(app: &App, tn_id: TnId, community_tag: &str, invitee: &str) {
+pub(crate) async fn retire_community_invitations(
+	app: &App,
+	tn_id: TnId,
+	community_tag: &str,
+	invitee: &str,
+) {
 	let invt_opts = cloudillo_types::meta_adapter::ListActionOptions {
 		typ: Some(vec!["INVT".to_string()]),
 		subject: Some(vec![format!("@{}", community_tag)]),
 		audience: Some(invitee.to_string()),
 		status: Some(vec!["A".to_string()]),
+		// Only a bare `INVT` is an invitation; an `INVT:DEL` rests at 'A' too, and without
+		// this we would retire the revocation and leave the invitation standing. Filtered in
+		// SQL, so a `LIMIT` cannot hide the row.
+		// ponytail: means "NULL or not in this list", so a *future* INVT subtype would pass;
+		// `DEL` is the only one today (dsl/definitions.rs). Enumerate if that changes.
+		exclude_sub_typ: Some(Box::new(["DEL".into()])),
 		..Default::default()
 	};
 	let invts = match app.meta_adapter.list_actions(tn_id, &invt_opts).await {
@@ -272,6 +283,10 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				subject: Some(vec![format!("@{}", local_tag)]),
 				audience: Some(context.issuer.clone()),
 				status: Some(vec!["A".to_string()]),
+				// Only a bare `INVT` is an invitation: an `INVT:DEL` rests at 'A' too and
+				// would hand its issuer the connection_mode='I' bypass without ever passing
+				// `invt.rs`'s moderator gate. Filtered in SQL, before the `LIMIT`.
+				exclude_sub_typ: Some(Box::new(["DEL".into()])),
 				limit: Some(1),
 				..Default::default()
 			};

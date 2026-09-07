@@ -11,8 +11,8 @@
 //! | `/api/actions/{action_id}`            | `read()` ᴬ | | | `write()` ᶜ | `write()` ᶜ |
 //! | `/api/actions/{action_id}/publish`    | | `write()` ᶜ | | | |
 //! | `/api/actions/{action_id}/cancel`     | | `write()` ᶜ | | | |
-//! | `/api/actions/{action_id}/accept`     | | `write()` ᶜ | | | |
-//! | `/api/actions/{action_id}/reject`     | | `write()` ᶜ | | | |
+//! | `/api/actions/{action_id}/accept`     | | `moderate()` ᴱ | | | |
+//! | `/api/actions/{action_id}/reject`     | | `moderate()` ᴱ | | | |
 //! | `/api/actions/{action_id}/dismiss`    | | `write()` ᶜ | | | |
 //! | `/api/actions/{action_id}/subscribe`  | | | `reader_state()` ᴱ | | |
 //! | `/api/read-marker`                    | | | `reader_state()` ᴱ | | |
@@ -54,9 +54,25 @@ pub(crate) fn write() -> Router<App> {
 		)
 		.route("/api/actions/{action_id}/publish", post(handler::publish_draft))
 		.route("/api/actions/{action_id}/cancel", post(handler::cancel_scheduled))
+		.route("/api/actions/{action_id}/dismiss", post(handler::post_action_dismiss))
+}
+
+/// Inbox moderation — authentication only, the handlers self-enforce.
+///
+/// Deliberately out of [`write`]: `check_perm_action("write")` reads `ActionAttrs`, which
+/// maps `owner_id_tag` to the *tenant* and carries no `access_level`, so
+/// `abac::check_default_rules` admits only `leader` or the tenant account — 403'ing the
+/// community moderator these endpoints exist for. Widening ABAC instead would change
+/// authorization for every action in the system.
+///
+/// Both handlers run the complete pair before touching anything:
+/// `ownership::accept_applicable` (is this resolvable in this tenant's inbox?) then
+/// `ownership::accept_authority` (moderator of the tenant, or the profile it is addressed
+/// to). `/dismiss` stays in [`write`] — it has no such self-enforcement.
+pub(crate) fn moderate() -> Router<App> {
+	Router::new()
 		.route("/api/actions/{action_id}/accept", post(handler::post_action_accept))
 		.route("/api/actions/{action_id}/reject", post(handler::post_action_reject))
-		.route("/api/actions/{action_id}/dismiss", post(handler::post_action_dismiss))
 }
 
 /// The reader's own state — authentication only, no ABAC guard.
@@ -96,6 +112,38 @@ pub(crate) fn inbox() -> Router<App> {
 /// Mounted under the `"general"` rate-limit bucket.
 pub(crate) fn list_public() -> Router<App> {
 	Router::new().route("/api/actions", get(handler::list_actions))
+}
+
+#[cfg(test)]
+mod tests {
+	/// `/accept` and `/reject` must stay off the `check_perm_action("write")` tier.
+	///
+	/// `ActionAttrs::get` maps `owner_id_tag` to the tenant and carries no `access_level`,
+	/// so `abac::check_default_rules` admits only `leader` or the tenant account — a
+	/// community moderator is 403'd before `accept_authority` ever runs, and its
+	/// `is_moderator` branch is dead. Moving these back into `write()` for tidiness
+	/// silently kills community moderation again; the handlers self-enforce instead.
+	///
+	/// Source scanning because axum's `Router` does not expose its route set — the same
+	/// reason `tables::tests::every_table_fn_is_registered_and_mounted` reads source.
+	#[test]
+	fn inbox_moderation_is_not_on_the_abac_write_tier() {
+		let src = include_str!("action.rs");
+		let (_, rest) = src.split_once("pub(crate) fn write()").expect("write() exists");
+		let (write_body, _) = rest.split_once("\n}").expect("write() body is delimited");
+
+		for route in ["/accept", "/reject"] {
+			assert!(
+				!write_body.contains(route),
+				"{route} is back under check_perm_action(\"write\") — read this test's doc"
+			);
+		}
+
+		// ...and they are mounted somewhere, so the check above cannot pass by deletion.
+		let (_, rest) = src.split_once("pub(crate) fn moderate()").expect("moderate() exists");
+		let (moderate_body, _) = rest.split_once("\n}").expect("moderate() body is delimited");
+		assert!(moderate_body.contains("/accept") && moderate_body.contains("/reject"));
+	}
 }
 
 // vim: ts=4

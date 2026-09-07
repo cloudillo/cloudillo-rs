@@ -121,9 +121,10 @@ pub async fn create_share(
 		input.subject_id = bare_id.to_string();
 	}
 
-	// Manager standing is ownership-derived (a `Read`-level creator of a tenant-owned file
-	// qualifies), so cap the grant at the caller's ceiling or they could hand themselves more than
-	// they hold. Runs after `validate_share_permission`, which makes the char safe to convert.
+	// Manager standing is not Write-derived — a `leader` over a locally originating row qualifies
+	// at `AccessLevel::Read` — so cap the grant at the caller's ceiling or they could hand
+	// themselves more than they hold. Runs after `validate_share_permission`, which makes the
+	// char safe to convert.
 	ensure_grant_within(
 		AccessLevel::from_perm_char(input.permission),
 		authority.grant_ceiling,

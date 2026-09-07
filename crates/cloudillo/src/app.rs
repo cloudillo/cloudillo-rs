@@ -383,7 +383,7 @@ impl AppBuilder {
 		let action_search_rules_fn: cloudillo_core::ActionSearchRulesFn =
 			Box::new(move |typ, sub_typ| {
 				let key = dsl_for_search.resolve_action_type(typ, sub_typ)?;
-				let def = dsl_for_search.get_definition(&key)?;
+				let def = dsl_for_search.definition_for(&key, None)?;
 				Some((key.into(), def.search.clone()))
 			});
 		extensions.insert(action_search_rules_fn);

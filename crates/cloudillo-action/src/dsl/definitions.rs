@@ -19,6 +19,7 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		connection_definition(),
 		follow_definition(),
 		post_definition(),
+		post_ldoc_definition(),
 		react_definition(),
 		comment_definition(),
 		message_definition(),
@@ -174,6 +175,7 @@ fn post_definition() -> ActionDefinition {
 			map.insert("IMG".to_string(), "Image post".to_string());
 			map.insert("VID".to_string(), "Video post".to_string());
 			map.insert("DEL".to_string(), "Delete post".to_string());
+			map.insert("LDOC".to_string(), "Live document post".to_string());
 			map
 		}),
 		fields: FieldConstraints { content: Some(FieldConstraint::Required), ..Default::default() },
@@ -216,6 +218,65 @@ fn post_definition() -> ActionDefinition {
 			"v": 1,
 			"body": [{ "field": "content", "extract": "text" }]
 		})),
+	}
+}
+
+/// A string property with optional length bounds — the only `SchemaField` shape the
+/// bundled definitions use.
+fn str_field(min_length: Option<usize>, max_length: Option<usize>) -> SchemaField {
+	SchemaField { field_type: FieldType::String, min_length, max_length, r#enum: None, items: None }
+}
+
+/// POST:LDOC - Live document post: a `POST` subType whose `content` is an object
+/// referencing a collaborative document instead of a prose string.
+///
+/// Its own `"TYPE:SUBTYPE"` definition rather than a loosened POST schema, which would
+/// drop the `min_length: 1 / max_length: 50000` guard from every ordinary text post.
+/// Built on `..post_definition()` so `behavior` and `permissions` cannot drift out of
+/// step: the inbound path resolves `POST:LDOC` first, and a flag that differed here would
+/// be a different federation policy for the same content.
+fn post_ldoc_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "POST:LDOC".to_string(),
+		description: "Live document post".to_string(),
+		// POST lists LDOC among its subTypes; the derived definition has none of its own.
+		subtypes: None,
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Object,
+				min_length: None,
+				// Serialized-JSON byte cap, raising the engine's
+				// `DEFAULT_OBJECT_MAX_BYTES`: `properties` bounds only the declared
+				// names, so without this an unknown key rides the 1 MiB body limit
+				// into the signed token. Declared maxima sum to ~51 KB, leaving
+				// punctuation room.
+				max_length: Some(65_536),
+				pattern: None,
+				r#enum: None,
+				properties: Some({
+					let mut props = HashMap::new();
+					props.insert("doc".to_string(), str_field(Some(3), Some(512)));
+					props.insert("contentType".to_string(), str_field(Some(1), Some(128)));
+					props.insert("title".to_string(), str_field(None, Some(512)));
+					props.insert("text".to_string(), str_field(None, Some(50000)));
+					props
+				}),
+				required: Some(vec!["doc".to_string(), "contentType".to_string()]),
+				description: Some("Live document reference".to_string()),
+			}),
+		}),
+		// `extract: "string"` — not the whole-`content` walk POST uses: that is a
+		// recursive string-leaf descent, which here would index `doc` and
+		// `contentType` as if they were prose.
+		search: Some(serde_json::json!({
+			"v": 1,
+			"title": [{ "field": "content.title", "extract": "string" }],
+			"body": [{ "field": "content.text", "extract": "string" }]
+		})),
+		// `behavior`, `permissions`, `fields`, `hooks`, `version`, `metadata` and
+		// `key_pattern` are POST's by construction — this is a POST that carries an
+		// object body, and its federation policy must not be able to drift.
+		..post_definition()
 	}
 }
 
@@ -819,22 +880,10 @@ fn subs_definition() -> ActionDefinition {
 				r#enum: None,
 				properties: Some({
 					let mut props = HashMap::new();
-					// Role in the subscription: observer, member, moderator, admin
-					props.insert(
-						"role".to_string(),
-						SchemaField {
-							field_type: FieldType::String,
-							min_length: None,
-							max_length: Some(20),
-							r#enum: Some(vec![
-								serde_json::Value::String("observer".to_string()),
-								serde_json::Value::String("member".to_string()),
-								serde_json::Value::String("moderator".to_string()),
-								serde_json::Value::String("admin".to_string()),
-							]),
-							items: None,
-						},
-					);
+					// No `role` property: the subscription role is server-side metadata
+					// (`x.role`, written by the CONV and INVT native hooks). `content` is
+					// the issuer-signed `c` claim, so a role declared there would be the
+					// subscriber naming its own authority — see `helpers::get_subscription_role`.
 					// Who invited this user (for closed subscriptions)
 					props.insert(
 						"invitedBy".to_string(),
@@ -1444,6 +1493,9 @@ mod tests {
 	/// allowlist. Pinned here so widening it is a deliberate edit rather than a side
 	/// effect of copying a definition: every other type is machine-generated
 	/// relationship or counter traffic that dwarfs real posts in volume.
+	///
+	/// `POST:LDOC` widened it deliberately: its `content.title` and `content.text` are
+	/// prose a reader would search for.
 	#[test]
 	fn only_prose_carrying_action_types_declare_search_rules() {
 		let defs = get_definitions();
@@ -1453,7 +1505,103 @@ mod tests {
 		// FSHR is the tempting omission: its content is `{contentType, fileName,
 		// fileTp}` — metadata, no prose — and the shared file's own `'F'` row
 		// already makes it findable by name.
-		assert_eq!(indexed, ["CMNT", "CONV", "MSG", "POST"]);
+		assert_eq!(indexed, ["CMNT", "CONV", "MSG", "POST", "POST:LDOC"]);
+	}
+
+	/// `POST:LDOC` rides POST's feed paths but takes an object body. The combined key
+	/// must resolve, the object must validate against the four declared properties with
+	/// `doc`/`contentType` required, and POST itself must keep accepting a bare string —
+	/// registering a second definition is what buys all three at once.
+	#[test]
+	fn post_ldoc_schema_accepts_the_object_body_without_loosening_post() {
+		let mut engine = crate::dsl::engine::DslEngine::new();
+		for def in get_definitions() {
+			engine.load_definition(def);
+		}
+
+		assert_eq!(
+			engine.resolve_action_type("POST", Some("LDOC")),
+			Some("POST:LDOC".to_string()),
+			"the subType must resolve to its own definition"
+		);
+
+		let valid = serde_json::json!({ "doc": "a.org:f1~x", "contentType": "cloudillo/quillo" });
+		engine
+			.validate_content("POST:LDOC", Some(&valid))
+			.expect("POST:LDOC must accept a minimal live document reference");
+
+		let missing_doc = serde_json::json!({ "contentType": "cloudillo/quillo" });
+		assert!(
+			engine.validate_content("POST:LDOC", Some(&missing_doc)).is_err(),
+			"`doc` is required — a reference to nothing is not a live document post"
+		);
+		assert!(
+			engine
+				.validate_content("POST:LDOC", Some(&serde_json::json!("a string")))
+				.is_err(),
+			"POST:LDOC content is an object, never a string"
+		);
+		engine
+			.validate_content("POST", Some(&serde_json::json!("a string")))
+			.expect("an ordinary text post must be unaffected");
+	}
+
+	/// `properties` bounds only the names it lists, so an unknown key would otherwise
+	/// ride the 1 MiB body limit into a signed, fanned-out token. The `max_length` on
+	/// an object schema caps the serialized body instead.
+	#[test]
+	fn post_ldoc_rejects_an_oversized_object_body() {
+		let mut engine = crate::dsl::engine::DslEngine::new();
+		for def in get_definitions() {
+			engine.load_definition(def);
+		}
+
+		let minimal = serde_json::json!({ "doc": "a.org:f1~x", "contentType": "cloudillo/quillo" });
+		engine
+			.validate_content("POST:LDOC", Some(&minimal))
+			.expect("the minimal valid object must still pass");
+
+		let bloated = serde_json::json!({
+			"doc": "a.org:f1~x",
+			"contentType": "cloudillo/quillo",
+			"undeclared": "x".repeat(70_000)
+		});
+		assert!(
+			engine.validate_content("POST:LDOC", Some(&bloated)).is_err(),
+			"an undeclared key must not smuggle 70 KB past the schema"
+		);
+	}
+
+	/// Definition lookup must resolve a subType the same way `resolve_action_type` does,
+	/// whether the subType arrives separately or embedded in the type. Before this, an
+	/// action stored as `typ="REACT:LIKE"` lost its dedup key entirely.
+	#[test]
+	fn definition_lookup_resolves_subtypes_and_falls_back_to_the_base_type() {
+		let mut engine = crate::dsl::engine::DslEngine::new();
+		for def in get_definitions() {
+			engine.load_definition(def);
+		}
+
+		assert_eq!(
+			engine.definition_for("POST", Some("LDOC")).map(|d| d.r#type.as_str()),
+			Some("POST:LDOC")
+		);
+		assert_eq!(
+			engine.definition_for("POST:LDOC", None).map(|d| d.r#type.as_str()),
+			Some("POST:LDOC"),
+			"the embedded form must resolve to the same definition"
+		);
+		assert_eq!(
+			engine.definition_for("REACT", Some("LIKE")).map(|d| d.r#type.as_str()),
+			Some("REACT"),
+			"a subType with no definition of its own falls back to the base type"
+		);
+		assert_eq!(
+			engine.get_key_pattern("REACT:LIKE"),
+			engine.get_key_pattern("REACT"),
+			"an embedded subType must not lose the base type's dedup key"
+		);
+		assert!(engine.get_key_pattern("REACT").is_some(), "REACT declares a key pattern");
 	}
 
 	// Regression: CONV defaults to 'S'; MSG/SUBS have no own default and inherit

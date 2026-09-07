@@ -7,8 +7,8 @@ use sqlx::{Row, SqlitePool};
 
 use crate::utils::{Db, collect_res, inspect, map_res, push_patch};
 use cloudillo_types::meta_adapter::{
-	ListProfileOptions, Profile, ProfileConnectionStatus, ProfileData, ProfileStatus, ProfileTrust,
-	ProfileType, PublicProfileRow, UpsertProfileFields, UpsertResult,
+	ListProfileOptions, Profile, ProfileConnectionStatus, ProfileData, ProfileRelation,
+	ProfileStatus, ProfileTrust, ProfileType, PublicProfileRow, UpsertProfileFields, UpsertResult,
 };
 use cloudillo_types::prelude::*;
 use cloudillo_types::utils::normalize_id_tag;
@@ -265,14 +265,14 @@ pub(crate) async fn list(
 
 /// Get relationships for multiple target profiles in a single query
 ///
-/// Returns a HashMap of target_id_tag -> (following, connected), keyed by the
+/// Returns a HashMap of target_id_tag -> `ProfileRelation`, keyed by the
 /// id_tags the caller passed in, verbatim — not by the canonical form the rows
 /// are stored under.
 pub(crate) async fn get_relationships(
 	db: &SqlitePool,
 	tn_id: TnId,
 	target_id_tags: &[&str],
-) -> ClResult<std::collections::HashMap<String, (bool, bool)>> {
+) -> ClResult<std::collections::HashMap<String, ProfileRelation>> {
 	use std::collections::HashMap;
 
 	if target_id_tags.is_empty() {
@@ -280,8 +280,9 @@ pub(crate) async fn get_relationships(
 	}
 
 	// Build query with IN clause for batch lookup
-	let mut query =
-		sqlx::QueryBuilder::new("SELECT id_tag, following, connected FROM profiles WHERE tn_id=");
+	let mut query = sqlx::QueryBuilder::new(
+		"SELECT id_tag, following, follower, connected FROM profiles WHERE tn_id=",
+	);
 	query.push_bind(tn_id.0);
 	query.push(" AND id_tag IN (");
 
@@ -298,10 +299,16 @@ pub(crate) async fn get_relationships(
 	let mut by_canonical = HashMap::with_capacity(rows.len());
 	for row in rows {
 		let id_tag: String = row.try_get("id_tag").db()?;
-		let following: bool = row.try_get("following").db()?;
-		let connected_status = parse_connected(&row);
-		let connected = connected_status.is_connected();
-		by_canonical.insert(id_tag, (following, connected));
+		// Both columns are nullable. Migration 34 backfills `follower = 1` for existing
+		// followers but writes no `0` for everyone else, and `following` is never backfilled
+		// at all — so NULLs survive in both on any upgraded database. Decode them the way
+		// `list`/`read` above already do: a `try_get::<bool, _>` on a NULL errors out the
+		// whole call, and `abac::subject_relation_to_tenant` swallows that into "no
+		// relationship", silently hiding every relationship-gated row.
+		let following: bool = row.try_get::<Option<bool>, _>("following").db()?.unwrap_or(false);
+		let follower: bool = row.try_get::<Option<bool>, _>("follower").db()?.unwrap_or(false);
+		let connected = parse_connected(&row).is_connected();
+		by_canonical.insert(id_tag, ProfileRelation { following, follower, connected });
 	}
 
 	// Rows come back under the canonical id_tag; callers key by the string they

@@ -53,21 +53,26 @@ fn tag_only_profile(tag: &str) -> ProfileInfo {
 	ProfileInfo { id_tag: tag.into(), name: "".into(), typ: ProfileType::Person, profile_pic: None }
 }
 
-/// Build the owner ProfileInfo with fallback chain: owner profile → owner tag-only → tenant.
-fn build_owner_profile(row: &SqliteRow) -> Option<ProfileInfo> {
-	let owner_tag: Option<Box<str>> = row.try_get("owner_tag").ok().flatten();
-	profile_from_row(row, "owner_")
-		.or_else(|| owner_tag.as_deref().map(tag_only_profile))
-		.or_else(|| profile_from_row(row, "tn_"))
+/// Build the upstream ProfileInfo: upstream profile → upstream tag-only → None.
+/// No tenant fallback — a NULL `upstream_tag` means the file originates here.
+fn build_upstream_profile(row: &SqliteRow) -> Option<ProfileInfo> {
+	let upstream_tag: Option<Box<str>> = row.try_get("upstream_tag").ok().flatten();
+	profile_from_row(row, "upstream_").or_else(|| upstream_tag.as_deref().map(tag_only_profile))
 }
 
-/// Build the creator ProfileInfo with fallback chain:
-/// creator profile → creator tag-only → owner profile → owner tag-only → tenant.
-fn build_creator_profile(row: &SqliteRow, owner: Option<&ProfileInfo>) -> Option<ProfileInfo> {
-	let creator_tag: Option<Box<str>> = row.try_get("creator_tag").ok().flatten();
-	profile_from_row(row, "creator_")
-		.or_else(|| creator_tag.as_deref().map(tag_only_profile))
-		.or_else(|| owner.cloned())
+/// Build the owner ProfileInfo with fallback chain:
+/// owner profile → tenant profile (when the owner IS the tenant, which has no `profiles` row
+/// of its own) → owner tag-only → tenant. A NULL `owner_tag` means the tenant owns the row.
+fn build_owner_profile(row: &SqliteRow) -> Option<ProfileInfo> {
+	let owner_tag: Option<Box<str>> = row.try_get("owner_tag").ok().flatten();
+	let tn_id_tag: Option<Box<str>> = row.try_get("tn_id_tag").ok();
+	if let Some(p) = profile_from_row(row, "owner_") {
+		return Some(p);
+	}
+	match owner_tag {
+		Some(tag) if Some(tag.as_ref()) != tn_id_tag.as_deref() => Some(tag_only_profile(&tag)),
+		_ => profile_from_row(row, "tn_"),
+	}
 }
 
 /// Get file_id by numeric f_id
@@ -95,10 +100,10 @@ pub(crate) async fn list(
 			|| matches!(opts.sort.as_deref(), Some("recent" | "modified")));
 
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
+		"SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.upstream_tag, f.owner_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
 		        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
-		        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
-		        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic",
+		        p.id_tag as upstream_id_tag, p.name as upstream_name, p.type as upstream_type, p.profile_pic as upstream_profile_pic,
+		        p2.id_tag as owner_id_tag, p2.name as owner_name, p2.type as owner_type, p2.profile_pic as owner_profile_pic",
 	);
 
 	// Add user data columns if user is authenticated
@@ -109,8 +114,8 @@ pub(crate) async fn list(
 	query.push(
 		" FROM files f
 		 INNER JOIN tenants t ON t.tn_id=f.tn_id
-		 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
-		 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.creator_tag",
+		 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.upstream_tag
+		 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.owner_tag",
 	);
 
 	// Add file_user_data JOIN if needed for filtering/sorting or to include user data
@@ -303,25 +308,26 @@ pub(crate) async fn list(
 			.push(" ESCAPE '\\'");
 	}
 
-	// Filter by owner/creator: uses COALESCE(creator_tag, owner_tag, tenant id_tag)
-	// to determine the effective author of each file
+	// Author attribution, not authority: COALESCE(owner_tag, upstream_tag, tenant id_tag).
+	// A member's file is theirs, a Pin/Place row is the placer's, an FSHR-accepted row is
+	// attributed to the sharer. All three terms are load-bearing — do not shorten.
 	if let Some(owner_id_tag) = &opts.owner_id_tag {
 		query
-			.push(" AND COALESCE(f.creator_tag, f.owner_tag, t.id_tag)=")
+			.push(" AND COALESCE(f.owner_tag, f.upstream_tag, t.id_tag)=")
 			.push_bind(normalize_id_tag(owner_id_tag).into_owned());
 	}
 
-	// Exclude files by owner/creator (for "others" filter)
+	// Exclude files by that same attribution (for "others" filter)
 	if let Some(not_owner_id_tag) = &opts.not_owner_id_tag {
 		query
-			.push(" AND COALESCE(f.creator_tag, f.owner_tag, t.id_tag)!=")
+			.push(" AND COALESCE(f.owner_tag, f.upstream_tag, t.id_tag)!=")
 			.push_bind(normalize_id_tag(not_owner_id_tag).into_owned());
 	}
 
 	// Restrict to tenant-owned files (exclude remote/federated cached copies).
-	// Local files leave owner_tag NULL; only cross-context Pin/Place rows set it.
+	// Local files leave upstream_tag NULL; only cross-context Pin/Place rows set it.
 	if opts.local_only {
-		query.push(" AND f.owner_tag IS NULL");
+		query.push(" AND f.upstream_tag IS NULL");
 	}
 
 	// Filter by visibility levels (push ABAC check into SQL for correct pagination)
@@ -512,8 +518,8 @@ pub(crate) async fn list(
 		let tags_str: Option<Box<str>> = row.try_get("tags")?;
 		let tags = tags_str.map(|s| parse_str_list(&s).to_vec());
 
+		let upstream = build_upstream_profile(row);
 		let owner = build_owner_profile(row);
-		let creator = build_creator_profile(row, owner.as_ref());
 
 		let visibility: Option<String> = row.try_get("visibility").ok().flatten();
 		let visibility = visibility.and_then(|s| s.chars().next());
@@ -571,9 +577,10 @@ pub(crate) async fn list(
 			file_id,
 			parent_id: row.try_get("parent_id").ok().flatten(),
 			root_id: row.try_get("root_id").ok().flatten(),
+			upstream,
+			upstream_tag: row.try_get("upstream_tag").ok().flatten(),
 			owner,
 			owner_tag: row.try_get("owner_tag").ok().flatten(),
-			creator,
 			preset: row.try_get("preset")?,
 			content_type: row.try_get("content_type")?,
 			file_name: row.try_get("file_name")?,
@@ -896,10 +903,10 @@ pub(crate) async fn create(
 	}
 
 	// `profiles.id_tag` is joined by value against both of these columns (see the
-	// `owner_id_tag`/`creator_id_tag` LEFT JOINs in the list and read queries), and
+	// `upstream_id_tag`/`owner_id_tag` LEFT JOINs in the list and read queries), and
 	// profiles are stored canonical — so these must be stored canonical too.
+	let upstream_tag = opts.upstream_tag.as_deref().map(|t| normalize_id_tag(t).into_owned());
 	let owner_tag = opts.owner_tag.as_deref().map(|t| normalize_id_tag(t).into_owned());
-	let creator_tag = opts.creator_tag.as_deref().map(|t| normalize_id_tag(t).into_owned());
 
 	// Conflict-tolerant insert: a racing create() for the same shared file_id
 	// (common during bulk action federation at registration) must not hard-error
@@ -907,13 +914,13 @@ pub(crate) async fn create(
 	// writer created. NULL file_id rows never conflict (SQLite treats NULLs as
 	// distinct), so pending uploads are unaffected.
 	let inserted: Option<i64> = sqlx::query_scalar(
-		"INSERT INTO files (tn_id, file_id, parent_id, root_id, status, owner_tag, creator_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility, hidden) \
+		"INSERT INTO files (tn_id, file_id, parent_id, root_id, status, upstream_tag, owner_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility, hidden) \
 		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
 		 ON CONFLICT(file_id, tn_id) DO NOTHING \
 		 RETURNING f_id",
 	)
 		.bind(tn_id.0).bind(&opts.file_id).bind(opts.parent_id).bind(opts.root_id)
-		.bind(status).bind(owner_tag.as_deref()).bind(creator_tag.as_deref()).bind(opts.preset)
+		.bind(status).bind(upstream_tag.as_deref()).bind(owner_tag.as_deref()).bind(opts.preset)
 		.bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0)
 		.bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility)
 		.bind(i32::from(opts.hidden))
@@ -1199,20 +1206,26 @@ pub(crate) async fn read(
 	file_id: &str,
 ) -> ClResult<Option<FileView>> {
 	// Handle @-prefixed integer IDs vs content-addressable IDs
+	let mut f_id_fallback = None;
 	let row = if let Some(f_id_str) = file_id.strip_prefix('@') {
 		// Integer ID - parse and query by f_id
 		let f_id = f_id_str
 			.parse::<i64>()
 			.map_err(|_| Error::ValidationError("invalid f_id".into()))?;
+		// `files.file_id` is NULL until `FileIdGeneratorTask` finalizes the row, and the `@<f_id>`
+		// form is exactly how a caller addresses one in that window — so the view has to echo it
+		// back rather than the empty string a NULL column decodes to. The other branch matched on
+		// `file_id` by value, so there it is provably non-NULL.
+		f_id_fallback = Some(f_id);
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
+			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.upstream_tag, f.owner_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
 			        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
-			        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
-			        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic
+			        p.id_tag as upstream_id_tag, p.name as upstream_name, p.type as upstream_type, p.profile_pic as upstream_profile_pic,
+			        p2.id_tag as owner_id_tag, p2.name as owner_name, p2.type as owner_type, p2.profile_pic as owner_profile_pic
 			 FROM files f
 			 INNER JOIN tenants t ON t.tn_id=f.tn_id
-			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
-			 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.creator_tag
+			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.upstream_tag
+			 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.owner_tag
 			 WHERE f.tn_id=? AND f.f_id=?"
 		)
 		.bind(tn_id.0)
@@ -1223,14 +1236,14 @@ pub(crate) async fn read(
 	} else {
 		// Content-addressable ID - query by file_id
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
+			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.upstream_tag, f.owner_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
 			        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
-			        p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic,
-			        p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic
+			        p.id_tag as upstream_id_tag, p.name as upstream_name, p.type as upstream_type, p.profile_pic as upstream_profile_pic,
+			        p2.id_tag as owner_id_tag, p2.name as owner_name, p2.type as owner_type, p2.profile_pic as owner_profile_pic
 			 FROM files f
 			 INNER JOIN tenants t ON t.tn_id=f.tn_id
-			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag
-			 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.creator_tag
+			 LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.upstream_tag
+			 LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.owner_tag
 			 WHERE f.tn_id=? AND f.file_id=?"
 		)
 		.bind(tn_id.0)
@@ -1242,14 +1255,14 @@ pub(crate) async fn read(
 
 	match row {
 		None => Ok(None),
-		Some(row) => Ok(Some(row_to_file_view(&row, None, None)?)),
+		Some(row) => Ok(Some(row_to_file_view(&row, f_id_fallback, None)?)),
 	}
 }
 
 /// Project an `f.*` / `t.*` / `p.*` / `p2.*` SQL row into a `FileView`. Shared
-/// by [`read`] (no `f_id`, no `fud.*`) and [`read_with_user_data`] (passes
-/// `f_id` for the `@<f_id>` fallback when `file_id IS NULL`, and `user_data`
-/// from the joined `file_user_data` row).
+/// by [`read`] (no `fud.*`) and [`read_with_user_data`] (which also passes
+/// `user_data` from the joined `file_user_data` row). `f_id_fallback` supplies
+/// the `@<f_id>` form for a row whose `file_id` is still NULL.
 fn row_to_file_view(
 	row: &SqliteRow,
 	f_id_fallback: Option<i64>,
@@ -1265,8 +1278,8 @@ fn row_to_file_view(
 	let tags_str: Option<Box<str>> = row.try_get("tags").ok().flatten();
 	let tags = tags_str.map(|s| parse_str_list(&s).to_vec());
 
+	let upstream = build_upstream_profile(row);
 	let owner = build_owner_profile(row);
-	let creator = build_creator_profile(row, owner.as_ref());
 
 	let visibility: Option<String> = row.try_get("visibility").ok().flatten();
 	let visibility = visibility.and_then(|s| s.chars().next());
@@ -1290,9 +1303,10 @@ fn row_to_file_view(
 		file_id,
 		parent_id: row.try_get("parent_id").ok().flatten(),
 		root_id: row.try_get("root_id").ok().flatten(),
+		upstream,
+		upstream_tag: row.try_get("upstream_tag").ok().flatten(),
 		owner,
 		owner_tag: row.try_get("owner_tag").ok().flatten(),
-		creator,
 		preset: row.try_get("preset").ok().flatten(),
 		content_type: row.try_get("content_type").ok().flatten(),
 		file_name: row.try_get("file_name").db()?,
@@ -1328,18 +1342,18 @@ pub(crate) async fn read_with_user_data(
 ) -> ClResult<Option<FileView>> {
 	let id_tag = normalize_id_tag(id_tag);
 	let base_sql = "SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, \
-		f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.owner_tag, \
-		f.creator_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, \
+		f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.upstream_tag, \
+		f.owner_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, \
 		f.broken_at, f.broken_reason, \
 		t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic, \
-		p.id_tag as owner_id_tag, p.name as owner_name, p.type as owner_type, p.profile_pic as owner_profile_pic, \
-		p2.id_tag as creator_id_tag, p2.name as creator_name, p2.type as creator_type, p2.profile_pic as creator_profile_pic, \
+		p.id_tag as upstream_id_tag, p.name as upstream_name, p.type as upstream_type, p.profile_pic as upstream_profile_pic, \
+		p2.id_tag as owner_id_tag, p2.name as owner_name, p2.type as owner_type, p2.profile_pic as owner_profile_pic, \
 		fud.accessed_at as fud_accessed_at, fud.modified_at as fud_modified_at, \
 		fud.pinned as fud_pinned, fud.starred as fud_starred, fud.access_level as fud_access_level \
 		FROM files f \
 		INNER JOIN tenants t ON t.tn_id=f.tn_id \
-		LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.owner_tag \
-		LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.creator_tag \
+		LEFT JOIN profiles p ON p.tn_id=f.tn_id AND p.id_tag=f.upstream_tag \
+		LEFT JOIN profiles p2 ON p2.tn_id=f.tn_id AND p2.id_tag=f.owner_tag \
 		LEFT JOIN file_user_data fud ON fud.tn_id=f.tn_id AND fud.f_id=f.f_id AND fud.id_tag=?";
 
 	let row = if let Some(f_id_str) = file_id.strip_prefix('@') {
@@ -1786,8 +1800,8 @@ mod tests {
 			file_id: Some(file_id.into()),
 			parent_id: None,
 			root_id: None,
+			upstream_tag: Some("alice.example".into()),
 			owner_tag: Some("alice.example".into()),
-			creator_tag: Some("alice.example".into()),
 			preset: None,
 			content_type: "image/jpeg".into(),
 			file_name: "shared.jpg".into(),
