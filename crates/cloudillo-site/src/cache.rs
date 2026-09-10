@@ -675,7 +675,9 @@ pub(crate) fn fnv_field(state: u32, text: &str) -> u32 {
 ///   `data:`, and a video's *poster* is an `<img>`, so it is `img-src`'s business.
 /// - `connect-src` names `cl-o.<id_tag>` in both schemes so the adopted shell runtime
 ///   can reach the API and the websockets. Narrowing this breaks islands.
-/// - `frame-src 'self'` — app iframes (`documentEmbed`) are same-origin documents.
+/// - `frame-src 'self' https://cl-o.<id_tag>` — app bundles are served from the API
+///   domain, so a `documentEmbed` island's iframe is cross-origin. Without the host
+///   source it silently stops rendering.
 /// - `object-src 'none'`, `base-uri 'none'` — `<base>` in particular would re-point
 ///   every relative href on the page.
 /// - `form-action 'self'` — a published page has no forms of its own, so an injected
@@ -696,7 +698,7 @@ pub(crate) fn content_security_policy(id_tag: &str) -> String {
 		 script-src 'self' 'unsafe-inline'; \
 		 style-src 'self' 'unsafe-inline'; \
 		 connect-src 'self' wss://cl-o.{host} https://cl-o.{host}; \
-		 frame-src 'self'; \
+		 frame-src 'self' https://cl-o.{host}; \
 		 object-src 'none'; \
 		 base-uri 'none'; \
 		 form-action 'self'; \
@@ -1117,6 +1119,10 @@ mod tests {
 		}
 		for source in ["'self'", "wss://cl-o.alice.example", "https://cl-o.alice.example"] {
 			assert!(admits(&csp, "connect-src", source), "{csp}");
+		}
+		// Bundles come from the API domain; losing this silently stops `documentEmbed`.
+		for source in ["'self'", "https://cl-o.alice.example"] {
+			assert!(admits(&csp, "frame-src", source), "{csp}");
 		}
 		for source in ["'self'", "data:", "blob:"] {
 			assert!(admits(&csp, "img-src", source), "{csp}");

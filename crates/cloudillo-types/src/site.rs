@@ -62,10 +62,19 @@ pub const ROBOTS_PATH: &str = "/robots.txt";
 /// First path segments the node answers before a site ever runs, `*` marking a
 /// prefix match.
 ///
-/// Read by `cloudillo::routes::static_files::is_serve_dir_path`, which decides what
-/// reaches `dist/`, and by `cloudillo_site::handler::normalize_mount_path`, which
-/// refuses a mount one would shadow. Widening it permanently reserves a root path.
+/// Read by `cloudillo_site::handler::normalize_mount_path` (through
+/// [`is_reserved_root_segment`]), which refuses a mount one of these would shadow.
+/// Widening it permanently reserves a root path. What the **app domain** actually
+/// answers from `dist/` is the narrower [`APP_DOMAIN_ASSET_ROOTS`].
 pub const RESERVED_ASSET_ROOTS: [&str; 5] = ["assets-*", "apps", "fonts", "sounds", "sw.js"];
+
+/// The subset of [`RESERVED_ASSET_ROOTS`] the **app domain** answers from `dist/`.
+///
+/// `apps` is absent on purpose: app bundles are served from the API domain
+/// (`cl-o.<id_tag>/apps/**`, `cloudillo::routes::init_api_service`) so an app iframe
+/// gets an origin distinct from the shell's. It stays in [`RESERVED_ASSET_ROOTS`]
+/// so no site mount can claim the path the shell used to answer.
+pub const APP_DOMAIN_ASSET_ROOTS: [&str; 4] = ["assets-*", "fonts", "sounds", "sw.js"];
 
 /// Context-free shell routes reached exactly, with no further segment.
 ///
@@ -94,8 +103,9 @@ pub const RESERVED_SHELL_ROOTS: [&str; 3] = ["~", "@*", ".well-known"];
 /// followed by at least one character".
 ///
 /// The one place the rule is spelled: `is_serve_dir_path` runs it over
-/// [`RESERVED_ASSET_ROOTS`] to decide what reaches `dist/`, and
-/// [`is_reserved_root_segment`] over both lists to decide what a mount may claim.
+/// [`APP_DOMAIN_ASSET_ROOTS`] to decide what reaches `dist/` on the app domain, and
+/// [`is_reserved_root_segment`] over [`RESERVED_ASSET_ROOTS`] plus
+/// [`RESERVED_SHELL_ROOTS`] to decide what a mount may claim.
 /// They have to agree on where `assets-` ends and `assets-0.8.18` begins.
 pub fn matches_root_pattern(segment: &str, patterns: &[&str]) -> bool {
 	patterns.iter().any(|pattern| match pattern.strip_suffix('*') {
@@ -262,6 +272,16 @@ mod tests {
 		assert!(published_path_drifted(Some("/blog"), "/news"));
 		// Never published at all: NULL loses rather than comparing NULL.
 		assert!(published_path_drifted(None, "/blog"));
+	}
+
+	/// A root served here but missing from `RESERVED_ASSET_ROOTS` would let a mount publish
+	/// under a path the node already answers, and that mount goes permanently dark with
+	/// nothing reporting it.
+	#[test]
+	fn every_app_domain_root_is_reserved() {
+		for root in APP_DOMAIN_ASSET_ROOTS {
+			assert!(RESERVED_ASSET_ROOTS.contains(&root), "{root} is served but not reserved");
+		}
 	}
 
 	/// A mount under any of these is answered before the site ever runs, so it

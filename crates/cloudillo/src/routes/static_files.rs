@@ -2,10 +2,16 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Static-file serving for the app domain: `ServeDir`, the SPA fallback and the
-//! published-site branches.
+//! published-site branches. Plus [`api_asset_handler`], which serves `/apps/**` and
+//! `/fonts/**` on the API domain — an app iframe must not share the origin holding
+//! the shell's session token, its `swKey` cookie and its ServiceWorker registration.
+//! `cl-o.<id_tag>` is the API origin and the backend sets no cookies there, so a bundle
+//! running on it has no ambient credentials to reach. Bundled apps are first-party build
+//! output and run un-sandboxed — the standing `cloudillo_file::apkg` grants an *installed*
+//! app package; anything else out of a container still gets `CSP: sandbox`.
 //!
-//! Zero coupling to routing — the only entry point is [`static_fallback_handler`],
-//! mounted as the app service's `.fallback(..)`.
+//! Zero coupling to routing — [`static_fallback_handler`] is mounted as the app
+//! service's `.fallback(..)`, [`api_asset_handler`] on two routes of the API service.
 //!
 //! The site branches are routing decisions only: what a site answers with lives
 //! in `cloudillo_site::serve`, which owns the container reads, the wrapper and
@@ -35,15 +41,47 @@ fn is_sw_file(path: &str) -> bool {
 	path.trim_start_matches('/') == "sw.js"
 }
 
-/// Check if a path is in an app directory (microfrontend assets)
-/// Apps are served from /apps/ directory and need CORS for sandboxed iframes
-fn is_app_directory(path: &str) -> bool {
-	let path = path.trim_start_matches('/');
-	path.starts_with("apps/")
+/// The `Cache-Control` a `dist/` asset response carries, or `None` for a response that
+/// must not carry one at all.
+///
+/// `None` on anything but a success or a `304`: `ServeDir` answers a miss with a bodiless
+/// `404` carrying no `Content-Type`, which would otherwise take the `immutable` arm below
+/// and pin the miss in every browser and shared cache for a year — `immutable` suppresses
+/// the revalidation that would repair it. Its directory-redirect `307` is no more
+/// permanent than the directory is.
+///
+/// Every arm reads the **request path**, never the response headers: a `304` carries no
+/// `Content-Type`, and a cache updates its stored headers from one (RFC 9111 §4.3.4), so a
+/// header sniff would pin every revalidated `.html` as `immutable` for a year.
+fn asset_cache_control<B>(
+	response: &axum::http::Response<B>,
+	path: &str,
+	disable_cache: bool,
+) -> Option<HeaderValue> {
+	let status = response.status();
+	if !status.is_success() && status != StatusCode::NOT_MODIFIED {
+		return None;
+	}
+	if disable_cache {
+		return Some(HeaderValue::from_static("no-store, no-cache"));
+	}
+	// A cached worker script would pin the browser to an old shell across a release.
+	if is_sw_file(path) {
+		return Some(HeaderValue::from_static("private, no-store, no-cache"));
+	}
+	// A trailing slash is the directory index `ServeDir` appends.
+	let ext = std::path::Path::new(path).extension().and_then(|ext| ext.to_str());
+	let is_html = matches!(ext, Some("html" | "htm")) || path.ends_with('/');
+	Some(if is_html {
+		HeaderValue::from_static("no-cache, must-revalidate")
+	} else {
+		HeaderValue::from_static("public, max-age=31536000, immutable")
+	})
 }
 
-/// Check if a path is in the fonts directory
-/// Fonts need CORS headers for sandboxed iframes (apps have opaque 'null' origin)
+/// Fonts need CORS: published-site pages and the shell both load them cross-origin.
+/// The API domain serves `/fonts/**` too ([`api_asset_handler`], CORS from its own
+/// layer) because bundle CSS references fonts origin-absolute.
 fn is_font_file(path: &str) -> bool {
 	let path = path.trim_start_matches('/');
 	path.starts_with("fonts/")
@@ -60,10 +98,11 @@ fn is_font_file(path: &str) -> bool {
 ///
 /// It lives in `cloudillo-types` because `cloudillo-site` reads it too —
 /// `normalize_mount_path` refuses a mount one of these would shadow — and that crate cannot
-/// depend on this one.
-use cloudillo_types::site::RESERVED_ASSET_ROOTS as SERVE_DIR_ROOTS;
+/// depend on this one. `apps` is absent here but present in `RESERVED_ASSET_ROOTS`: bundles
+/// are served on the API domain ([`api_asset_handler`]), and the path stays reserved.
+use cloudillo_types::site::APP_DOMAIN_ASSET_ROOTS as SERVE_DIR_ROOTS;
 
-/// May this path be answered from `dist/` at all?
+/// May this path be answered from `dist/` **on the app domain** at all?
 ///
 /// [`ServeDir`] runs before every routing decision, and tower-http's
 /// `append_index_html_on_directories` defaults to true — unscoped, it answers `/` with
@@ -332,8 +371,8 @@ pub(super) async fn static_fallback_handler(
 	let path = request.uri().path();
 	let disable_cache = app.opts.disable_cache;
 
-	// Check if this is an app directory or font (need CORS for sandboxed iframes)
-	let needs_cors = is_app_directory(path) || is_font_file(path);
+	// Fonts need CORS: published-site pages and the shell both load them cross-origin.
+	let needs_cors = is_font_file(path);
 
 	// Store path for potential SPA fallback (request is moved by serve_dir.call)
 	let path_owned = path.to_string();
@@ -417,32 +456,10 @@ pub(super) async fn static_fallback_handler(
 
 	let mut response = response;
 
-	// Determine cache policy based on content type
-	let cache_value = if disable_cache {
-		HeaderValue::from_static("no-store, no-cache")
-	} else {
-		// Check content type to determine cache policy
-		let is_html = response
-			.headers()
-			.get(header::CONTENT_TYPE)
-			.and_then(|v| v.to_str().ok())
-			.is_some_and(|ct| ct.starts_with("text/html"));
+	if let Some(value) = asset_cache_control(&response, &path_owned, disable_cache) {
+		response.headers_mut().insert(header::CACHE_CONTROL, value);
+	}
 
-		if is_sw_file(&path_owned) {
-			// SW files must never be long-cached even via static fallback
-			HeaderValue::from_static("private, no-store, no-cache")
-		} else if is_html {
-			// index.html: ETag-only, must revalidate on every request
-			HeaderValue::from_static("no-cache, must-revalidate")
-		} else {
-			// Assets (JS, CSS, images): long cache with immutable
-			HeaderValue::from_static("public, max-age=31536000, immutable")
-		}
-	};
-
-	response.headers_mut().insert(header::CACHE_CONTROL, cache_value);
-
-	// Add CORS headers for app directories and fonts (sandboxed iframes have opaque 'null' origin)
 	if needs_cors {
 		response
 			.headers_mut()
@@ -452,13 +469,131 @@ pub(super) async fn static_fallback_handler(
 	response.map(Body::new)
 }
 
+/// App bundles and fonts on the **API domain**, so an app iframe runs on an origin
+/// that is not the shell's.
+///
+/// Deliberately not [`static_fallback_handler`]: there is no SPA fallback and no site
+/// on `cl-o.<id_tag>`, so a miss here is simply a miss. Routed, not a fallback, which
+/// is what keeps the API service's `api_not_found` answering everything else — the two
+/// `route(..)` literals in `init_api_service` *are* this handler's path allowlist.
+///
+/// CORS is not set here: it comes from the `CorsLayer` these two routes carry in
+/// `init_api_service`, which is where the reasoning for it lives.
+pub(super) async fn api_asset_handler(
+	State(app): State<App>,
+	request: Request<Body>,
+) -> axum::response::Response {
+	// Captured before `serve_dir.call` moves the request.
+	let path = request.uri().path().to_string();
+	let mut serve_dir = ServeDir::new(&app.opts.dist_dir).precompressed_gzip().precompressed_br();
+	let mut response = match serve_dir.call(request).await {
+		Ok(resp) => resp,
+		Err(infallible) => match infallible {},
+	};
+
+	if let Some(value) = asset_cache_control(&response, &path, app.opts.disable_cache) {
+		response.headers_mut().insert(header::CACHE_CONTROL, value);
+	}
+
+	response.map(Body::new)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::{
-		GUEST_ROOT_PREFIXES, GUEST_ROOTS_EXACT, SERVE_DIR_ROOTS, decode_request_path,
-		is_serve_dir_path, is_shell_route, is_sw_file, shell_etag_matches,
+		GUEST_ROOT_PREFIXES, GUEST_ROOTS_EXACT, SERVE_DIR_ROOTS, StatusCode, asset_cache_control,
+		decode_request_path, is_serve_dir_path, is_shell_route, is_sw_file, shell_etag_matches,
 		should_serve_spa_fallback,
 	};
+
+	/// Build the shape of response `ServeDir` hands back, for `asset_cache_control`.
+	fn served(status: StatusCode) -> axum::http::Response<()> {
+		axum::http::Response::builder().status(status).body(()).expect("build response")
+	}
+
+	/// A miss taking the `immutable` arm pins it in every browser and shared cache for a
+	/// year, reload included.
+	#[test]
+	fn a_response_that_is_not_a_hit_carries_no_cache_control() {
+		assert_eq!(asset_cache_control(&served(StatusCode::NOT_FOUND), "/apps/x.js", false), None);
+		// tower-http redirects a directory with a `307`, no more permanent than the directory.
+		assert_eq!(
+			asset_cache_control(&served(StatusCode::TEMPORARY_REDIRECT), "/apps/quillo", false),
+			None
+		);
+		assert_eq!(
+			asset_cache_control(&served(StatusCode::BAD_REQUEST), "/apps/x.js", false),
+			None
+		);
+		// `disable_cache` does not resurrect a header on a miss either.
+		assert_eq!(asset_cache_control(&served(StatusCode::NOT_FOUND), "/apps/x.js", true), None);
+	}
+
+	#[test]
+	fn a_hit_caches_by_path() {
+		let ok = served(StatusCode::OK);
+		assert_eq!(
+			asset_cache_control(&ok, "/apps/quillo/main.js", false)
+				.as_ref()
+				.and_then(|v| v.to_str().ok()),
+			Some("public, max-age=31536000, immutable")
+		);
+		assert_eq!(
+			asset_cache_control(&ok, "/apps/quillo/index.html", false)
+				.as_ref()
+				.and_then(|v| v.to_str().ok()),
+			Some("no-cache, must-revalidate")
+		);
+		// The directory index `ServeDir` appends is that same `index.html`.
+		assert_eq!(
+			asset_cache_control(&ok, "/apps/quillo/", false)
+				.as_ref()
+				.and_then(|v| v.to_str().ok()),
+			Some("no-cache, must-revalidate")
+		);
+	}
+
+	/// A `304` carries no `Content-Type`, so a header sniff would pin an app's entry point as
+	/// `immutable` on its second load — and the cache stores that (RFC 9111 §4.3.4).
+	#[test]
+	fn a_revalidated_html_asset_does_not_turn_immutable() {
+		let not_modified = served(StatusCode::NOT_MODIFIED);
+		assert_eq!(
+			asset_cache_control(&not_modified, "/apps/quillo/index.html", false)
+				.as_ref()
+				.and_then(|v| v.to_str().ok()),
+			Some("no-cache, must-revalidate")
+		);
+		// A hashed asset still revalidates into `immutable`, which is the whole point of it.
+		assert_eq!(
+			asset_cache_control(&not_modified, "/apps/quillo/main.js", false)
+				.as_ref()
+				.and_then(|v| v.to_str().ok()),
+			Some("public, max-age=31536000, immutable")
+		);
+	}
+
+	/// A cached worker pins the browser to an old shell; `disable_cache` must beat every arm.
+	#[test]
+	fn the_service_worker_and_disable_cache_beat_the_other_arms() {
+		let ok = served(StatusCode::OK);
+		assert_eq!(
+			asset_cache_control(&ok, "/sw.js", false).as_ref().and_then(|v| v.to_str().ok()),
+			Some("private, no-store, no-cache")
+		);
+		assert_eq!(
+			asset_cache_control(&served(StatusCode::NOT_MODIFIED), "/sw.js", false)
+				.as_ref()
+				.and_then(|v| v.to_str().ok()),
+			Some("private, no-store, no-cache")
+		);
+		assert_eq!(
+			asset_cache_control(&ok, "/apps/quillo/main.js", true)
+				.as_ref()
+				.and_then(|v| v.to_str().ok()),
+			Some("no-store, no-cache")
+		);
+	}
 
 	/// The tag went weak when the app service gained a compression layer, and the
 	/// old quote-trimming comparison would never have matched a `W/` prefix again.
@@ -485,16 +620,16 @@ mod tests {
 
 	/// Pins the list. Every entry is a permanently reserved root path, so this is copied —
 	/// never restated from memory — wherever the reserved namespace has to be known again.
+	/// `apps` is absent: served on the API domain, still reserved via `RESERVED_ASSET_ROOTS`.
 	#[test]
 	fn serve_dir_roots_are_pinned() {
-		assert_eq!(SERVE_DIR_ROOTS, ["assets-*", "apps", "fonts", "sounds", "sw.js"]);
+		assert_eq!(SERVE_DIR_ROOTS, ["assets-*", "fonts", "sounds", "sw.js"]);
 	}
 
 	#[test]
 	fn only_the_asset_roots_are_served_from_disk() {
 		assert!(is_serve_dir_path("/assets-0.8.18/shell.js"));
 		assert!(is_serve_dir_path("/assets-0.8.18/manifest.json"));
-		assert!(is_serve_dir_path("/apps/quillo/index.html"));
 		assert!(is_serve_dir_path("/fonts/inter.woff2"));
 		assert!(is_serve_dir_path("/sounds/notify/ping.mp3"));
 		assert!(is_serve_dir_path("/sw.js"));
@@ -507,6 +642,8 @@ mod tests {
 		assert!(!is_serve_dir_path("/"));
 		assert!(!is_serve_dir_path("/index.html"));
 		assert!(!is_serve_dir_path("/shell-apps.json"));
+		// Served on the API domain; here it 404s, not HTML (`should_serve_spa_fallback`).
+		assert!(!is_serve_dir_path("/apps/quillo/index.html"));
 		// Pre-move root assets: they live under `assets-<version>/` now.
 		assert!(!is_serve_dir_path("/manifest.json"));
 		assert!(!is_serve_dir_path("/offline.html"));

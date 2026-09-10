@@ -142,7 +142,8 @@ pub async fn get_container_content(
 	// community, a share-write scope) that is stored XSS against the session origin. So the
 	// question asked is the one the database can answer: is this the package of an app
 	// `install_app` wrote from an `APKG` action's attachment. Everything else is sandboxed,
-	// sites included.
+	// sites included. Bundled apps hold the same standing without a container, served from
+	// `dist/` by `cloudillo::routes::static_files::api_asset_handler`.
 	//
 	// Deliberately below the permission check: it is a read-pool query on every container
 	// entry fetch, and a request about to be refused must not pay it.

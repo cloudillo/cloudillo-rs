@@ -12,7 +12,7 @@
 //! | [`public`] | Compose site for the `optional_auth` API-domain surface. |
 //! | [`dav`] | Compose site for `/dav/**` + its `.well-known` redirects. |
 //! | [`policy`] | Body limits, the compression predicate, security headers. |
-//! | [`static_files`] | SPA fallback, service-worker key injection, asset serving. |
+//! | [`static_files`] | SPA fallback, app-domain asset serving, API-domain app bundles. |
 //! | this file | The three services: API domain, app domain, plain HTTP. |
 //!
 //! To answer "who can reach this endpoint", read [`protected`] or [`public`] —
@@ -64,7 +64,7 @@ use cloudillo_core::acme;
 use cloudillo_core::middleware::request_id_middleware;
 
 use policy::{GLOBAL_BODY_LIMIT, is_compressible_media_type, with_security_headers};
-use static_files::static_fallback_handler;
+use static_files::{api_asset_handler, static_fallback_handler};
 
 async fn api_not_found() -> Error {
 	Error::NotFound
@@ -77,12 +77,29 @@ fn init_api_service(app: App) -> Router {
 	let browser_routes =
 		public::init(app.clone()).merge(protected::init(app.clone())).layer(cors_layer);
 
+	// App bundles live here, not on the app domain: an app iframe must not share
+	// the shell's origin. `/fonts/**` follows because bundle CSS references it
+	// origin-absolute. NOT `/sw.js` — a worker's scope is its own origin.
+	// Not in `routes/tables/*`: they need `App` state for `dist_dir`, which the
+	// table invariant forbids.
+	//
+	// Their own `permissive()` CORS layer, not the `very_permissive()` one above:
+	// `*` with no credentials is what an app iframe's opaque `null` origin needs for
+	// both `@font-face` files and ES module scripts, and the layer answers the
+	// `OPTIONS` preflight these `get`-only routes would otherwise `405`.
+	let asset_routes = Router::new()
+		.route("/apps/{*path}", get(api_asset_handler))
+		.route("/fonts/{*path}", get(api_asset_handler))
+		.layer(tower_http::cors::CorsLayer::permissive())
+		.with_state(app.clone());
+
 	// DAV routes stay OUTSIDE CorsLayer: tower-http 0.6 treats every OPTIONS request as a
 	// CORS preflight and short-circuits it with only CORS headers, stripping the `DAV:`
 	// capability header that DAV clients need for discovery. These routes aren't called
 	// from browsers anyway, so they don't need CORS.
 	let router = browser_routes
 		.merge(dav::init(app.clone()))
+		.merge(asset_routes)
 		.fallback(api_not_found)
 		.layer(middleware::from_fn(request_id_middleware))
 		// Compress only an allowlist of text-based, genuinely-compressible media
