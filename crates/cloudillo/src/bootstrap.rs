@@ -13,6 +13,7 @@ use crate::utils::derive_name_from_id_tag;
 use cloudillo_core::acme;
 use cloudillo_core::acme::handle_renewal_success;
 use cloudillo_types::auth_adapter::TenantCertRenewalRow;
+use cloudillo_types::types::SHARED_TN;
 
 /// Default identity provider domain
 const DEFAULT_IDP_PROVIDER: &str = "cloudillo.net";
@@ -20,7 +21,7 @@ const DEFAULT_IDP_PROVIDER: &str = "cloudillo.net";
 /// Initialize IDP settings with default values if not already configured
 async fn initialize_idp_settings(app: &Arc<AppState>) -> ClResult<()> {
 	// Check if idp.list is already configured (globally)
-	let existing = app.meta_adapter.read_setting(TnId(0), "idp.list").await?;
+	let existing = app.meta_adapter.read_setting(SHARED_TN, "idp.list").await?;
 
 	if existing.is_none() {
 		info!("Initializing IDP settings with default provider: {}", DEFAULT_IDP_PROVIDER);
@@ -29,7 +30,7 @@ async fn initialize_idp_settings(app: &Arc<AppState>) -> ClResult<()> {
 		let value = serde_json::to_value(SettingValue::String(DEFAULT_IDP_PROVIDER.to_string()))
 			.map_err(|e| Error::Internal(format!("Failed to serialize IDP setting: {}", e)))?;
 
-		app.meta_adapter.update_setting(TnId(0), "idp.list", Some(value)).await?;
+		app.meta_adapter.update_setting(SHARED_TN, "idp.list", Some(value)).await?;
 
 		info!("IDP settings initialized successfully");
 	} else {

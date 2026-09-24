@@ -17,6 +17,7 @@ use crate::prelude::*;
 use crate::scheduler::{Task, TaskId};
 use crate::{ScheduleEmailFn, ScheduleEmailParams};
 use cloudillo_types::auth_adapter::{self, TenantCertRenewalRow};
+use cloudillo_types::types::SHARED_TN;
 use cloudillo_types::validation::id_tag_to_ascii_lossy;
 
 use async_trait::async_trait;
@@ -30,7 +31,7 @@ struct X509CertData {
 }
 
 /// Vars-table key for the persisted ACME account credentials. Stored under
-/// `TnId(0)` (global), matching the convention used for other server-wide
+/// [`SHARED_TN`] (global), matching the convention used for other server-wide
 /// secrets like `0:jwt_secret`.
 const ACME_ACCOUNT_VAR: &str = "acme_account";
 
@@ -39,7 +40,7 @@ const ACME_ACCOUNT_VAR: &str = "acme_account";
 /// per-IP account-creation rate limit on every renewal cycle and leak the
 /// account key into the log on every call.
 async fn get_or_create_acme_account(state: &App, acme_email: &str) -> ClResult<Account> {
-	match state.auth_adapter.read_var(TnId(0), ACME_ACCOUNT_VAR).await {
+	match state.auth_adapter.read_var(SHARED_TN, ACME_ACCOUNT_VAR).await {
 		Ok(json) => {
 			let credentials: acme::AccountCredentials = serde_json::from_str(&json)
 				.map_err(|_| Error::Internal("corrupt ACME credentials in vars".into()))?;
@@ -60,7 +61,7 @@ async fn get_or_create_acme_account(state: &App, acme_email: &str) -> ClResult<A
 				)
 				.await?;
 			let json = serde_json::to_string(&credentials)?;
-			state.auth_adapter.update_var(TnId(0), ACME_ACCOUNT_VAR, &json).await?;
+			state.auth_adapter.update_var(SHARED_TN, ACME_ACCOUNT_VAR, &json).await?;
 			Ok(account)
 		}
 		Err(e) => Err(e),

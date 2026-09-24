@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::prelude::*;
 use cloudillo_types::meta_adapter::MetaAdapter;
+use cloudillo_types::types::SHARED_TN;
 
 use super::types::{
 	DefinitionMatch, FrozenSettingsRegistry, Setting, SettingDefinition, SettingScope, SettingValue,
@@ -95,8 +96,8 @@ impl SettingsService {
 			debug!("Setting cache hit: {}.{}", tn_id.0, key);
 			return Ok(Some(value));
 		}
-		if tn_id.0 != 0
-			&& let Some(value) = self.cache.get(TnId(0), key)
+		if tn_id != SHARED_TN
+			&& let Some(value) = self.cache.get(SHARED_TN, key)
 		{
 			debug!("Setting cache hit (global fallback): {}", key);
 			return Ok(Some(value));
@@ -109,7 +110,7 @@ impl SettingsService {
 			.ok_or_else(|| Error::SettingNotFound(format!("Unknown setting: {}", key)))?;
 
 		// Try tenant-specific setting
-		if tn_id.0 != 0
+		if tn_id != SHARED_TN
 			&& let Some(json_value) = self.meta.read_setting(tn_id, key).await?
 		{
 			let value = serde_json::from_value::<SettingValue>(json_value)
@@ -118,11 +119,11 @@ impl SettingsService {
 			return Ok(Some(value));
 		}
 
-		// Try global setting — cache under TnId(0) so tenant overrides aren't masked
-		if let Some(json_value) = self.meta.read_setting(TnId(0), key).await? {
+		// Try global setting — cache under `SHARED_TN` so tenant overrides aren't masked
+		if let Some(json_value) = self.meta.read_setting(SHARED_TN, key).await? {
 			let value = serde_json::from_value::<SettingValue>(json_value)
 				.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
-			self.cache.put(TnId(0), key.to_string(), value.clone());
+			self.cache.put(SHARED_TN, key.to_string(), value.clone());
 			return Ok(Some(value));
 		}
 
@@ -212,7 +213,7 @@ impl SettingsService {
 				if !roles.iter().any(|r| r.as_ref() == "SADM") {
 					return Err(Error::PermissionDenied);
 				}
-				TnId(0)
+				SHARED_TN
 			}
 			(SettingScope::Global, _) => {
 				// Admin users can update global settings from their tenant context
@@ -220,7 +221,7 @@ impl SettingsService {
 				if !roles.iter().any(|r| r.as_ref() == "SADM") {
 					return Err(Error::PermissionDenied);
 				}
-				TnId(0)
+				SHARED_TN
 			}
 			(SettingScope::Tenant, _) => {
 				// OK: the tenant's own row — `def.permission` above already
@@ -249,7 +250,7 @@ impl SettingsService {
 	) -> ClResult<Setting> {
 		let def = self.definition(key)?;
 
-		if def.scope != SettingScope::Tenant || tn_id.0 == 0 {
+		if def.scope != SettingScope::Tenant || tn_id == SHARED_TN {
 			warn!(
 				"System write refused for setting '{}' (scope {:?}, tn_id={})",
 				key, def.scope, tn_id.0
@@ -332,12 +333,12 @@ impl SettingsService {
 			return Err(Error::PermissionDenied);
 		}
 
-		// Same invariant as `set`: clearing the (Tenant|Global, TnId(0)) row
+		// Same invariant as `set`: clearing the (Tenant|Global, `SHARED_TN`) row
 		// touches the shared global default that every tenant resolves
 		// through, and the HTTP `delete_setting` handler already requires
 		// SADM unconditionally for `level=global`. Caller `tn_id == 0`
 		// reaches here only via SADM in practice (auth.tn_id==0 only for the
-		// system tenant; cross-tenant `tenant=` resolves to `TnId(0)` only
+		// system tenant; cross-tenant `tenant=` resolves to `SHARED_TN` only
 		// when caller is SADM).
 		let storage_tn_id = match (def.scope, tn_id.0) {
 			(SettingScope::System, _) => return Err(Error::PermissionDenied),
@@ -348,13 +349,13 @@ impl SettingsService {
 				if !roles.iter().any(|r| r.as_ref() == "SADM") {
 					return Err(Error::PermissionDenied);
 				}
-				TnId(0)
+				SHARED_TN
 			}
 			(SettingScope::Global, _) => {
 				if !roles.iter().any(|r| r.as_ref() == "SADM") {
 					return Err(Error::PermissionDenied);
 				}
-				TnId(0)
+				SHARED_TN
 			}
 			(SettingScope::Tenant, _) => tn_id,
 		};
@@ -374,7 +375,7 @@ impl SettingsService {
 	pub async fn clear_system(&self, tn_id: TnId, key: &str) -> ClResult<()> {
 		let def = self.definition(key)?;
 
-		if def.scope != SettingScope::Tenant || tn_id.0 == 0 {
+		if def.scope != SettingScope::Tenant || tn_id == SHARED_TN {
 			warn!(
 				"System clear refused for setting '{}' (scope {:?}, tn_id={})",
 				key, def.scope, tn_id.0
@@ -414,7 +415,7 @@ impl SettingsService {
 			}
 
 			// This setting is required - check if it's configured globally
-			if self.meta.read_setting(TnId(0), &def.key).await?.is_none() {
+			if self.meta.read_setting(SHARED_TN, &def.key).await?.is_none() {
 				return Err(Error::ValidationError(format!(
 					"Required setting '{}' is not configured",
 					def.key
@@ -560,14 +561,14 @@ impl SettingsService {
 	) -> ClResult<Vec<(String, SettingValue, &SettingDefinition)>> {
 		let prefixes_dotted: Vec<String> = prefixes.iter().map(|p| format!("{}.", p)).collect();
 
-		// Get global settings first (tn_id=0)
-		let global_settings = self.meta.list_settings(TnId(0), Some(&prefixes_dotted)).await?;
+		// Get global settings first (`SHARED_TN`)
+		let global_settings = self.meta.list_settings(SHARED_TN, Some(&prefixes_dotted)).await?;
 
 		// Get tenant-specific settings (override global)
-		let tenant_settings = if tn_id.0 != 0 {
-			self.meta.list_settings(tn_id, Some(&prefixes_dotted)).await?
-		} else {
+		let tenant_settings = if tn_id == SHARED_TN {
 			std::collections::HashMap::new()
+		} else {
+			self.meta.list_settings(tn_id, Some(&prefixes_dotted)).await?
 		};
 
 		// Merge: tenant overrides global

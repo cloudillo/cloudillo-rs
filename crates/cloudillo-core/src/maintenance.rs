@@ -22,9 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 use crate::scheduler::{Task, TaskId};
+use cloudillo_types::types::SHARED_TN;
 
-/// Settings are global-scope, so they are read against the shared tenant.
-const SHARED_TN: TnId = TnId(0);
 const DEFAULT_CRON: &str = "20 4 * * *";
 const DEFAULT_MIN_FREE_PCT: i64 = 20;
 

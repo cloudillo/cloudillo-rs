@@ -22,6 +22,18 @@ impl std::fmt::Display for TnId {
 	}
 }
 
+/// Tenant 0: the node itself rather than any one of its tenants. Two roles, one id.
+///
+/// As a **blob store** it holds one copy for the whole node of a Public or Verified
+/// federated attachment, rather than one per tenant. `cloudillo_file::sync` writes there
+/// when `file.shared_blob_store_enabled`, and records it on the per-tenant
+/// `file_variants` row as `global = true`; `blob_adapter::BlobRef::variant` is what reads
+/// that column back and routes to the right store.
+///
+/// As a **scope** it is what node-wide settings and vars are read and written against —
+/// `SettingScope::Global` resolves here, and a tenant row of the same key overrides it.
+pub const SHARED_TN: TnId = TnId(0);
+
 // Timestamp //
 //***********//
 //pub type Timestamp = u32;

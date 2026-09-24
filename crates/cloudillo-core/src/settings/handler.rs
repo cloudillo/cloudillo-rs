@@ -16,7 +16,11 @@ use crate::{
 	prelude::*,
 	settings::types::{SettingScope, SettingValue},
 };
-use cloudillo_types::{auth_adapter::AuthCtx, types::ApiResponse, utils::normalize_id_tag};
+use cloudillo_types::{
+	auth_adapter::AuthCtx,
+	types::{ApiResponse, SHARED_TN},
+	utils::normalize_id_tag,
+};
 
 /// Response for a single setting with metadata
 #[derive(serde::Serialize)]
@@ -36,7 +40,7 @@ pub struct ListSettingsQuery {
 	pub prefix: Option<String>,
 	/// Resolution level — mirrors GET /settings/:name:
 	///   - omitted: full resolution chain (tenant overrides global).
-	///   - "global": raw rows from TnId(0) only.
+	///   - "global": raw rows from `SHARED_TN` only.
 	///   - "tenant": raw rows from the caller's (or `tenant=` target's) tenant only.
 	pub level: Option<String>,
 	/// SADM-only: target tenant idTag for cross-tenant reads. Only meaningful with level=tenant.
@@ -89,7 +93,7 @@ pub async fn list_settings(
 				if !crate::abac::is_admin(&auth) {
 					return Err(Error::PermissionDenied);
 				}
-				app.settings.list_by_prefix_at(TnId(0), &prefixes).await?
+				app.settings.list_by_prefix_at(SHARED_TN, &prefixes).await?
 			}
 			Some("tenant") => app.settings.list_by_prefix_at(target_tn_id, &prefixes).await?,
 			Some(other) => {
@@ -219,7 +223,7 @@ pub async fn get_setting(
 			{
 				return Err(Error::PermissionDenied);
 			}
-			app.settings.get_raw(TnId(0), &name).await?.ok_or(Error::NotFound)?
+			app.settings.get_raw(SHARED_TN, &name).await?.ok_or(Error::NotFound)?
 		}
 		Some("tenant") => {
 			app.settings.get_raw(target_tn_id, &name).await?.ok_or(Error::NotFound)?
@@ -285,7 +289,7 @@ pub async fn update_setting(
 			if !auth.roles.iter().any(|r| r.as_ref() == "SADM") {
 				return Err(Error::PermissionDenied);
 			}
-			TnId(0)
+			SHARED_TN
 		}
 		Some("tenant") | None => {
 			let acting_tn_id = resolve_target_tn_id(&app, &auth, query.tenant.as_deref()).await?;
@@ -348,7 +352,7 @@ pub async fn delete_setting(
 	let target_tn_id = match query.level.as_deref() {
 		Some("tenant") => {
 			// Global-scoped keys have no per-tenant override row; clearing at
-			// level=tenant would silently route to TnId(0) inside the service
+			// level=tenant would silently route to `SHARED_TN` inside the service
 			// and look like a successful tenant-level reset. Reject it so the
 			// UI's "Reset to default" flow stays honest.
 			if definition.scope == SettingScope::Global {
@@ -370,7 +374,7 @@ pub async fn delete_setting(
 			if !auth.roles.iter().any(|r| r.as_ref() == "SADM") {
 				return Err(Error::PermissionDenied);
 			}
-			TnId(0)
+			SHARED_TN
 		}
 		Some(other) => {
 			return Err(Error::ValidationError(format!("unknown level: {}", other)));
