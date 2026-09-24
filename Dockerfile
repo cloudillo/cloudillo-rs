@@ -145,13 +145,19 @@ RUN ls -lh /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
 #########################
 
 FROM debian:trixie-slim AS poppler-extractor
-RUN apt-get update && apt-get install -y poppler-utils
+# poppler-data carries the predefined CMaps. Without them pdftotext extracts
+# nothing from CJK-encoded PDFs that ship no embedded ToUnicode map.
+RUN apt-get update && apt-get install -y poppler-utils poppler-data
 
 # Create staging directory
-RUN mkdir -p /staging/usr/bin /staging/lib /staging/lib64
+RUN mkdir -p /staging/usr/bin /staging/usr/share /staging/lib /staging/lib64
 
 # Copy the binaries
-RUN cp -L $(which pdftoppm) $(which pdfinfo) /staging/usr/bin/
+RUN cp -L $(which pdftoppm) $(which pdfinfo) $(which pdftotext) $(which prlimit) /staging/usr/bin/
+
+# Poppler's compiled-in data path on Debian, so the same path in the final stage
+# needs no POPPLER_DATADIR.
+RUN cp -a /usr/share/poppler /staging/usr/share/
 
 # Copy all shared library dependencies
 RUN for bin in /staging/usr/bin/*; do \
@@ -194,6 +200,7 @@ COPY --from=ffmpeg-builder /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/bin
 
 # Copy poppler with all its dependencies
 COPY --from=poppler-extractor /staging/usr/bin/ /usr/bin/
+COPY --from=poppler-extractor /staging/usr/share/poppler/ /usr/share/poppler/
 COPY --from=poppler-extractor /staging/lib/ /lib/
 COPY --from=poppler-extractor /staging/lib64/ /lib64/
 

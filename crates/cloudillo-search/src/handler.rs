@@ -564,7 +564,7 @@ fn app_id_of(content_type: &str) -> Option<&str> {
 ///
 /// The prefix exists only to keep `idx_search_docs_key` unique across
 /// collections; the client deep-links with the app's own document id.
-fn strip_kind<'a>(part: &'a str, kind: Option<&str>) -> &'a str {
+pub(crate) fn strip_kind<'a>(part: &'a str, kind: Option<&str>) -> &'a str {
 	kind.and_then(|k| part.strip_prefix(k)?.strip_prefix('/')).unwrap_or(part)
 }
 

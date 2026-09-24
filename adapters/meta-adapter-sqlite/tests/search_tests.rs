@@ -3331,4 +3331,36 @@ async fn a_row_with_an_undecodable_obj_tp_is_skipped_not_reported_as_a_file() {
 	);
 }
 
+both_modes! {
+	/// The PDF stamp lookup: the stamp that matched, plus the whole-object body — which
+	/// the contentless route never stores.
+	async fn read_search_cached_body_returns_the_stamp_and_body(fts_cl: bool) {
+		let (adapter, _dir) = create_test_adapter().await;
+		let tn_id = TnId(1);
+		adapter.create_tenant(tn_id, "alice").await.ok();
+		create_doc_file(&adapter, tn_id, "f1~pdf", None).await;
+		let parts = [
+			SearchPart { title: Some("doc.pdf"), body: Some("hello world"), ..Default::default() },
+			SearchPart { part_id: "pdf/v1:100", ..Default::default() },
+		];
+		adapter.replace_search_row(tn_id, 'F', "f1~pdf", &parts, fts_cl).await.expect("index");
+
+		let read = |tn_id, obj_id, ids: &'static [&'static str]| {
+			let adapter = &adapter;
+			async move {
+				adapter.read_search_cached_body(tn_id, 'F', obj_id, ids).await.expect("read")
+			}
+		};
+		let body = (!fts_cl).then(|| "hello world".to_owned());
+		assert_eq!(
+			read(tn_id, "f1~pdf", &["pdf/v1:100", "pdf/v1:100:fail"]).await,
+			Some(("pdf/v1:100".to_owned(), body))
+		);
+		assert_eq!(read(tn_id, "f1~pdf", &["pdf/other"]).await, None);
+		assert_eq!(read(tn_id, "f1~pdf", &[]).await, None);
+		assert_eq!(read(tn_id, "f1~other", &["pdf/v1:100"]).await, None);
+		assert_eq!(read(TnId(2), "f1~pdf", &["pdf/v1:100"]).await, None);
+	}
+}
+
 // vim: ts=4

@@ -915,6 +915,7 @@ version = "0.8.18"
 dependencies = [
  "cloudillo-types",
  "lol_html",
+ "tempfile",
 ]
 
 [[package]]
@@ -1089,6 +1090,7 @@ dependencies = [
  "cloudillo-extract",
  "cloudillo-file",
  "cloudillo-types",
+ "futures",
  "jsonpath-rust",
  "parking_lot",
  "serde",

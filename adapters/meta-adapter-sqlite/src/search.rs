@@ -461,6 +461,47 @@ pub async fn delete_deep_by_content_type(
 // `VALUES` insert cannot join: see `replace_parts`, `refresh_file_acl` and
 // `fill_part_created_at`.
 
+/// Which of `part_ids` this object carries, and the text on its whole-object row.
+///
+/// See [`cloudillo_types::meta_adapter::MetaAdapter::read_search_cached_body`] for the
+/// contract. `(tn_id, obj_tp, obj_id, part_id)` is the table's unique key, so both the
+/// scan and the correlated subquery are `idx_search_docs_key` lookups; at most one row
+/// comes back, because the caller writes at most one of these stamps.
+pub async fn read_cached_body(
+	dbr: &SqlitePool,
+	tn_id: TnId,
+	obj_tp: char,
+	obj_id: &str,
+	part_ids: &[&str],
+) -> ClResult<Option<(String, Option<String>)>> {
+	if part_ids.is_empty() {
+		return Ok(None);
+	}
+	let mut query =
+		QueryBuilder::<Sqlite>::new("SELECT part_id, (SELECT body FROM search_docs WHERE tn_id=");
+	query.push_bind(tn_id.0);
+	query.push(" AND obj_tp=");
+	query.push_bind(obj_tp.to_string());
+	query.push(" AND obj_id=");
+	query.push_bind(obj_id);
+	query.push(" AND part_id='') FROM search_docs WHERE tn_id=");
+	query.push_bind(tn_id.0);
+	query.push(" AND obj_tp=");
+	query.push_bind(obj_tp.to_string());
+	query.push(" AND obj_id=");
+	query.push_bind(obj_id);
+	query.push(" AND part_id IN (");
+	let mut sep = query.separated(", ");
+	for part_id in part_ids {
+		sep.push_bind(*part_id);
+	}
+	sep.push_unseparated(")");
+
+	let row: Option<(String, Option<String>)> =
+		query.build_query_as().fetch_optional(dbr).await.db()?;
+	Ok(row)
+}
+
 /// Replace every index row of `(obj_tp, obj_id)` from one slice.
 ///
 /// See [`cloudillo_types::meta_adapter::MetaAdapter::replace_search_row`] for

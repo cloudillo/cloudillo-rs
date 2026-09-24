@@ -80,7 +80,7 @@ use cloudillo_types::{error::ClResult, types::TnId};
 /// `search` block on an action type. A tenant whose stored revision differs gets
 /// one full sweep on the next startup and then stops re-extracting; see
 /// [`reindex`].
-pub const INDEX_REV: u32 = 4;
+pub const INDEX_REV: u32 = 6;
 
 /// Serialises document materialisation across the whole process.
 ///
@@ -111,11 +111,63 @@ pub async fn store_text(app: &App, tn_id: TnId) -> bool {
 	app.settings.get_bool(tn_id, "search.store_text").await.unwrap_or(true)
 }
 
+/// Default for `search.index_document_chars`, and the fallback when the stored value
+/// cannot be read. The same budget every other body in the index gets — see
+/// [`crate::objects::MAX_BODY_CHARS`], which this tracks deliberately.
+#[allow(clippy::cast_possible_wrap, reason = "a compile-time constant well under i64::MAX")]
+pub const DEFAULT_DOCUMENT_CHARS: i64 = crate::objects::MAX_BODY_CHARS as i64;
+/// Lower bound of `search.index_document_chars`, shared between the clamp in
+/// [`index_document_chars`] and the setting's validator so the two cannot drift.
+///
+/// Zero is the off switch: `objects::pdf_body` extracts nothing and writes no stamp,
+/// which is also what makes the next sweep drop the bodies already stored — an
+/// operator with no `pdftotext`, or who simply does not want document text in the
+/// index, has a lever that is not "uninstall poppler".
+pub const MIN_DOCUMENT_CHARS: i64 = 0;
+/// Upper bound of `search.index_document_chars`.
+///
+/// A document body is the one deliberate exception to [`crate::objects::MAX_BODY_CHARS`],
+/// because a PDF really is a whole document rather than one page fragment — but the
+/// exception is bounded: 200_000 chars is ~400 pages of prose, stored twice (the
+/// `search_docs.body` extract plus the FTS5 entry), and there is no per-tenant total the
+/// way [`crate::objects::MAX_SITE_BODY_CHARS`] bounds one container. Raising the setting
+/// towards this ceiling is admin-only for that reason — the disk and the re-extraction CPU
+/// are the node's, not the tenant's. See [`MIN_DOCUMENT_CHARS`].
+pub const MAX_DOCUMENT_CHARS: i64 = 200_000;
+
+/// Characters of extracted text indexed per document attachment.
+///
+/// Shared by every document extractor, not just PDF. Read on every index run, like
+/// [`store_text`], and falls back to [`DEFAULT_DOCUMENT_CHARS`] when it cannot be
+/// read. The clamp is belt and braces against a stored value that predates the
+/// validator.
+pub async fn index_document_chars(app: &App, tn_id: TnId) -> usize {
+	let chars = app
+		.settings
+		.get_int(tn_id, "search.index_document_chars")
+		.await
+		.unwrap_or(DEFAULT_DOCUMENT_CHARS)
+		.clamp(MIN_DOCUMENT_CHARS, MAX_DOCUMENT_CHARS);
+	// The clamp leaves a positive value no larger than `MAX_DOCUMENT_CHARS`, so this
+	// is infallible; `try_from` is only the cast-lint-clean spelling of `as usize`.
+	usize::try_from(chars).unwrap_or(usize::MAX)
+}
+
 /// Register the search subsystem's scheduler tasks.
 ///
 /// Must run during app initialization, before the scheduler loads persisted
 /// tasks — an unregistered task kind cannot be rebuilt from its stored row.
 pub fn init(app: &App) -> ClResult<()> {
+	// Probed here rather than on the first PDF: `available()` shells out once per process
+	// and caches, and `init` is the one place where a blocking spawn costs nothing. Logged
+	// because "documents are indexed by name only" is otherwise an invisible node state.
+	if cloudillo_extract::pdf::available() {
+		tracing::debug!("search: pdftotext is available; document text will be indexed");
+	} else {
+		tracing::info!(
+			"search: pdftotext is not installed; PDFs will be indexed by name and tags only"
+		);
+	}
 	app.scheduler.register::<indexer::IndexDocumentTask>()?;
 	app.scheduler.register::<objects::IndexObjectTask>()?;
 	app.scheduler.register::<reindex::ReindexTask>()?;

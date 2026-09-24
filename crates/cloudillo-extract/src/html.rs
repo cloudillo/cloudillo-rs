@@ -10,15 +10,7 @@ use cloudillo_types::prelude::*;
 use lol_html::html_content::TextType;
 use lol_html::{EndTagHandler, HtmlRewriter, Settings, doc_text, element};
 
-/// Flattened visible text, plus whether the budget cut the walk short.
-#[derive(Debug, Default, Clone)]
-pub struct ExtractedText {
-	/// Whitespace-normalised text: no run of blanks, no leading or trailing one.
-	pub text: String,
-	/// `true` when `max_chars` was reached before the end of the input, so the
-	/// caller knows the text is a prefix rather than the whole document.
-	pub truncated: bool,
-}
+use crate::text::{Acc, ExtractedText};
 
 /// Elements whose start is a word boundary.
 ///
@@ -115,32 +107,10 @@ pub fn extract_text(html: &str, max_chars: usize) -> ClResult<ExtractedText> {
 	Ok(acc.take())
 }
 
-/// Whitespace-normalising text accumulator with a character budget.
-struct Acc {
-	out: String,
-	budget: usize,
-	chars: usize,
-	truncated: bool,
-	/// A boundary is owed before the next visible character. Held rather than
-	/// written so the result never opens or closes with a blank.
-	pending: bool,
-	/// A trailing fragment of what may be a character reference, waiting for the
-	/// rest of it to arrive in the next chunk. See [`Acc::push_chunk`].
-	held: String,
-}
-
+/// The entity-aware half of [`Acc`]: the accumulator itself lives in
+/// [`crate::text`], shared with the PDF extractor, which has no references to
+/// resolve and no chunk boundaries to rejoin across.
 impl Acc {
-	fn new(budget: usize) -> Self {
-		Self {
-			out: String::new(),
-			budget,
-			chars: 0,
-			truncated: false,
-			pending: false,
-			held: String::new(),
-		}
-	}
-
 	/// Take one text chunk, resolving its character references *before* they
 	/// reach the whitespace normaliser and the budget.
 	///
@@ -172,52 +142,6 @@ impl Acc {
 	fn separate(&mut self) {
 		self.flush_held();
 		self.mark_boundary();
-	}
-
-	/// The boundary alone, for [`Acc::push`] — flushing the held tail from there
-	/// would re-enter `push` on its own input.
-	fn mark_boundary(&mut self) {
-		if self.chars > 0 {
-			self.pending = true;
-		}
-	}
-
-	fn flush_held(&mut self) {
-		if !self.held.is_empty() {
-			let held = std::mem::take(&mut self.held);
-			self.push(&held);
-		}
-	}
-
-	fn push(&mut self, text: &str) {
-		for c in text.chars() {
-			if self.chars >= self.budget {
-				self.truncated = true;
-				return;
-			}
-			if c.is_whitespace() {
-				self.mark_boundary();
-				continue;
-			}
-			if self.pending {
-				self.out.push(' ');
-				self.chars += 1;
-				self.pending = false;
-				if self.chars >= self.budget {
-					self.truncated = true;
-					return;
-				}
-			}
-			self.out.push(c);
-			self.chars += 1;
-		}
-	}
-
-	fn take(&mut self) -> ExtractedText {
-		// A candidate reference the document ended in the middle of never was one:
-		// it is a bare `&` and whatever followed it, and it is page text.
-		self.flush_held();
-		ExtractedText { text: std::mem::take(&mut self.out), truncated: self.truncated }
 	}
 }
 

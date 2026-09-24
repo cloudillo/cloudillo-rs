@@ -19,5 +19,10 @@ cloudillo-types = { workspace = true }
 # list this crate would have to keep in step with the serializer.
 lol_html = "2"
 
+[dev-dependencies]
+# Scratch files for the extraction tests, so two concurrent runs cannot race on
+# one fixed name in the system temp dir.
+tempfile = "3.27"
+
 [lints]
 workspace = true

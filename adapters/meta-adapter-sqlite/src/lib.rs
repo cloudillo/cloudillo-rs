@@ -793,6 +793,16 @@ impl MetaAdapter for MetaAdapterSqlite {
 		search::replace_row(&self.db, tn_id, obj_tp, obj_id, parts, fts_cl).await
 	}
 
+	async fn read_search_cached_body(
+		&self,
+		tn_id: TnId,
+		obj_tp: char,
+		obj_id: &str,
+		part_ids: &[&str],
+	) -> ClResult<Option<(String, Option<String>)>> {
+		search::read_cached_body(&self.dbr, tn_id, obj_tp, obj_id, part_ids).await
+	}
+
 	async fn delete_search_object(&self, tn_id: TnId, obj_tp: char, obj_id: &str) -> ClResult<()> {
 		search::delete_object(&self.db, tn_id, obj_tp, obj_id).await
 	}

@@ -2610,6 +2610,24 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		fts_cl: bool,
 	) -> ClResult<()>;
 
+	/// The object's stored text, if any of `part_ids` is present on it.
+	///
+	/// `Some((matched_part_id, body))` — which stamp matched, and what the whole-object
+	/// row (`part_id = ''`) holds; `body` is `None` when that row stores no text, which
+	/// is a real answer, not a miss (the contentless `fts_cl` route stores every body as
+	/// NULL). `None` means no stamp matched at all.
+	///
+	/// One statement for both questions: `cloudillo_search::objects::pdf_body` asks
+	/// "has this exact extraction already run, and what did it produce" once per PDF per
+	/// index run, and probing then re-reading would be two round trips for one answer.
+	async fn read_search_cached_body(
+		&self,
+		tn_id: TnId,
+		obj_tp: char,
+		obj_id: &str,
+		part_ids: &[&str],
+	) -> ClResult<Option<(String, Option<String>)>>;
+
 	/// Remove every index row of one object.
 	async fn delete_search_object(&self, tn_id: TnId, obj_tp: char, obj_id: &str) -> ClResult<()>;
 

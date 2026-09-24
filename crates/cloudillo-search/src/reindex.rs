@@ -201,7 +201,7 @@ pub async fn reindex_tenant(app: &App, tn_id: TnId) -> ClResult<SweepStats> {
 
 /// The stamp a tenant's index was last built at.
 ///
-/// [`crate::INDEX_REV`] alone is not enough, for two reasons, and both are folded
+/// [`crate::INDEX_REV`] alone is not enough, for three reasons, and all are folded
 /// in here rather than given persistence of their own — `Startup` already reads
 /// this stamp for every tenant on every boot, so anything that belongs in it
 /// self-heals with one sweep and no new machinery.
@@ -216,9 +216,20 @@ pub async fn reindex_tenant(app: &App, tn_id: TnId) -> ClResult<SweepStats> {
 ///   notice: `INDEX_REV` did not move, and no PUT arrives to schedule the
 ///   content-type sweep. It hashes the `search` blocks only, so a cosmetic
 ///   manifest edit does not re-index the node.
+/// - `search.index_document_chars` bounds how much of a document attachment is
+///   indexed. It is also half the PDF extraction cache key (see
+///   `crate::objects::pdf_body`), so a raised budget re-extracts — but only once the
+///   tenant is swept, which without this it never would be.
 async fn index_stamp(app: &App, tn_id: TnId) -> String {
 	let store_text = crate::store_text(app, tn_id).await;
-	format!("{}:{}:{}", crate::INDEX_REV, u8::from(store_text), app.bundled_apps.rules_hash)
+	let doc_chars = crate::index_document_chars(app, tn_id).await;
+	format!(
+		"{}:{}:{}:{}",
+		crate::INDEX_REV,
+		u8::from(store_text),
+		doc_chars,
+		app.bundled_apps.rules_hash
+	)
 }
 
 /// The startup pass for one tenant: a full sweep only if this build extracts
@@ -345,7 +356,9 @@ async fn index_one_file(
 	whole_row: bool,
 ) -> ClResult<()> {
 	if whole_row {
-		objects::index_file_row(app, tn_id, file).await?;
+		// `Retry`: the sweep is where an extraction that failed for a cause since fixed
+		// — a blob that came back, a newer poppler — gets its second chance.
+		objects::index_file_row(app, tn_id, file, objects::ExtractRetry::Retry).await?;
 	}
 	if matches!(file.file_tp.as_deref(), Some(indexer::STORE_RTDB | indexer::STORE_CRDT)) {
 		indexer::index_document(app, tn_id, &file.file_id).await?;

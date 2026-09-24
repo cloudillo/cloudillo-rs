@@ -21,6 +21,8 @@ cloudillo-types = { workspace = true }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2", "macros"] }
+# Draining a blob stream to the PDF extractor's scratch file.
+futures = "0.3"
 jsonpath-rust = "1.0"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
@@ -28,7 +30,8 @@ serde = { version = "1", features = ["derive"] }
 # inherited from another crate's dependency, so `cargo test -p cloudillo-search`
 # sees what the workspace build sees.
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["rt"] }
+# `sync` for the PDF extraction semaphore, `fs`/`io-util` for its scratch file.
+tokio = { version = "1", features = ["rt", "sync", "fs", "io-util"] }
 tracing = "0.1"
 # Read-only: CRDT documents are materialised for indexing, never written here.
 yrs = "0.27"

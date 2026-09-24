@@ -30,8 +30,8 @@ use std::{
 use async_trait::async_trait;
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_types::meta_adapter::{
-	ActionView, FileStatus, FileView, ListProfileOptions, MANAGED_PARENT_ID, Profile, SearchPart,
-	TRASH_PARENT_ID,
+	ActionView, FileId, FileStatus, FileView, ListProfileOptions, MANAGED_PARENT_ID, Profile,
+	SearchPart, TRASH_PARENT_ID,
 };
 use cloudillo_types::site::{FRAGMENT_EXT, MANIFEST_ENTRY, entry_path, site_path};
 use cloudillo_types::worker::Priority;
@@ -64,7 +64,7 @@ pub const OBJECT_DEBOUNCE_SECS: i64 = 5;
 /// `search_docs.body` plus the FTS5 index.
 const MAX_TITLE_CHARS: usize = 1024;
 const MAX_TAGS_CHARS: usize = 1024;
-const MAX_BODY_CHARS: usize = 16_000;
+pub const MAX_BODY_CHARS: usize = 16_000;
 
 /// Published pages one container contributes to the index.
 ///
@@ -75,7 +75,7 @@ const MAX_BODY_CHARS: usize = 16_000;
 ///
 /// One of the container's two bounds; [`MAX_SITE_BODY_CHARS`] is the other. Both cuts
 /// fall on the same set every run because the pages are sorted by path first.
-const MAX_SITE_PAGES: usize = 2_000;
+pub const MAX_SITE_PAGES: usize = 2_000;
 
 /// Body text one container may contribute in total, in characters.
 ///
@@ -85,7 +85,7 @@ const MAX_SITE_PAGES: usize = 2_000;
 /// still findable, their prose not.
 ///
 /// 4 MB is a judgement call: ~250 full-length pages of prose.
-const MAX_SITE_BODY_CHARS: usize = 4_000_000;
+pub const MAX_SITE_BODY_CHARS: usize = 4_000_000;
 
 /// Ask for one object to be re-indexed once it goes quiet.
 ///
@@ -125,7 +125,8 @@ pub async fn index_object(app: &App, tn_id: TnId, obj_tp: char, obj_id: &str) ->
 /// an action it needs no manifest and gets a fixed mapping.
 pub async fn index_file(app: &App, tn_id: TnId, file_id: &str) -> ClResult<()> {
 	if let Some(file) = app.meta_adapter.read_file(tn_id, file_id).await? {
-		return index_file_row(app, tn_id, &file).await;
+		// `Cached`: this is the per-object path, where a rename must not re-run poppler.
+		return index_file_row(app, tn_id, &file, ExtractRetry::Cached).await;
 	}
 	let fts_cl = !crate::store_text(app, tn_id).await;
 	app.meta_adapter.replace_search_row(tn_id, OBJ_FILE, file_id, &[], fts_cl).await
@@ -143,7 +144,12 @@ pub async fn index_file(app: &App, tn_id: TnId, file_id: &str) -> ClResult<()> {
 /// `'F'` row and parts *and* the deep `'D'` rows [`crate::indexer`] built for it (see
 /// `replace_search_row`'s contract), so trashing a document takes its pages out of the
 /// index in the same call.
-pub async fn index_file_row(app: &App, tn_id: TnId, file: &FileView) -> ClResult<()> {
+pub async fn index_file_row(
+	app: &App,
+	tn_id: TnId,
+	file: &FileView,
+	retry: ExtractRetry,
+) -> ClResult<()> {
 	// Tags are stored comma-joined; the tokenizer needs whitespace to see one
 	// token per tag.
 	let tags = file.tags.as_ref().map(|t| t.join(" ")).filter(|t| !t.is_empty());
@@ -152,16 +158,39 @@ pub async fn index_file_row(app: &App, tn_id: TnId, file: &FileView) -> ClResult
 	// silences every other managed file — see [`is_live_site_indexable`].
 	let live_site = is_live_site_container(app, tn_id, file).await?;
 	let indexable = if live_site { is_live_site_indexable(file) } else { is_indexable(file) };
-	let part = file_part(file, tags.as_deref(), indexable);
 	// Only a file with a metadata row has content parts: the two go in and out of the
 	// index together, so a trashed container cannot leave its pages searchable.
-	let pages = if part.is_some() && live_site {
-		site_page_texts(app, tn_id, file).await?
+	let pages =
+		if indexable && live_site { site_page_texts(app, tn_id, file).await? } else { Vec::new() };
+	let fts_cl = !crate::store_text(app, tn_id).await;
+	// Bound here, not inside the slice below, so the text outlives the borrowed parts.
+	// Every failure propagates, so the object's existing rows are left exactly as they
+	// are: the part set is replaced wholesale, and swallowing an error here would blank
+	// an already-indexed PDF's body over a full `tmp_dir` or a blob store hiccup. Both
+	// callers tolerate that — `reindex::page_files` counts the file in `stats.failed` and
+	// moves on, and the per-object path is a scheduler task whose error is logged, never
+	// propagated to a user write. "poppler is missing" is not in this class: `pdf_body`
+	// answers it with `None` off a once-probed `pdf::available()`.
+	let pdf = if indexable && !live_site {
+		pdf_body(app, tn_id, file, !fts_cl, retry).await?
 	} else {
-		Vec::new()
+		None
 	};
-	let mut parts: Vec<SearchPart<'_>> = Vec::with_capacity(part.iter().len() + pages.len());
+	let body = pdf.as_ref().map(|(_, text)| text.as_str()).filter(|t| !t.is_empty());
+	let part = file_part(file, tags.as_deref(), body, indexable);
+	let mut parts: Vec<SearchPart<'_>> =
+		Vec::with_capacity(part.iter().len() + pages.len() + pdf.iter().len());
 	parts.extend(part);
+	// Body-less by design: the stamp records *what* was extracted and at what budget, so
+	// the next run can skip poppler. An all-empty FTS row matches nothing, so it never
+	// surfaces as a hit.
+	if let Some((stamp_id, _)) = &pdf {
+		parts.push(SearchPart {
+			part_id: stamp_id,
+			part_kind: Some(PDF_PART_KIND),
+			..Default::default()
+		});
+	}
 	for page in &pages {
 		parts.push(SearchPart {
 			part_id: &page.path,
@@ -171,7 +200,6 @@ pub async fn index_file_row(app: &App, tn_id: TnId, file: &FileView) -> ClResult
 			..Default::default()
 		});
 	}
-	let fts_cl = !crate::store_text(app, tn_id).await;
 	app.meta_adapter
 		.replace_search_row(tn_id, OBJ_FILE, &file.file_id, &parts, fts_cl)
 		.await
@@ -484,9 +512,258 @@ pub fn is_live_site_indexable(file: &FileView) -> bool {
 fn file_part<'a>(
 	file: &'a FileView,
 	tags: Option<&'a str>,
+	body: Option<&'a str>,
 	indexable: bool,
 ) -> Option<SearchPart<'a>> {
-	indexable.then(|| SearchPart { title: Some(&*file.file_name), tags, ..Default::default() })
+	indexable.then(|| SearchPart {
+		title: Some(&*file.file_name),
+		tags,
+		body,
+		..Default::default()
+	})
+}
+
+/// Concurrent PDF extractions. Each holds a scratch copy of the blob on disk and
+/// a `pdftotext` child; `cloudillo_file::open_container` guards the analogous load
+/// with `cache.load_permit()` (crates/cloudillo-file/src/lib.rs:119) and this is
+/// the same guard for the same reason.
+static PDF_EXTRACTIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// `part_kind` of the PDF cache stamp. Namespaces its `part_id` the way every other
+/// part kind does — see `handler::strip_kind`.
+const PDF_PART_KIND: &str = "pdf";
+
+/// The stamp part's id: what was extracted, at what budget, and whether it worked.
+/// The first two are in the key because `replace_parts` drops every part missing from
+/// the slice, so a changed variant *or* a changed `search.index_document_chars` misses
+/// the cache and takes the stale stamp out in the same write. The outcome is in it so a
+/// failure is distinguishable from a PDF that genuinely has no text — see
+/// [`ExtractRetry`]. The storage mode is in it so toggling `search.store_text` misses too.
+fn pdf_stamp_id(variant_id: &str, max_chars: usize, store_text: bool, ok: bool) -> String {
+	let mode = if store_text { "" } else { ":cl" };
+	let outcome = if ok { "" } else { ":fail" };
+	format!("{PDF_PART_KIND}/{variant_id}:{max_chars}{mode}{outcome}")
+}
+
+/// Whether this run may re-attempt an extraction that previously failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractRetry {
+	/// Trust the stamp. The per-object path: a rename must not re-run poppler.
+	Cached,
+	/// Re-attempt a `:fail` stamp. The sweep, which is where a cause that has since
+	/// been fixed — a repaired blob, a newer poppler — gets its second chance.
+	Retry,
+}
+
+/// What a stamp lookup means for this run.
+#[derive(Debug, PartialEq, Eq)]
+enum CacheDecision {
+	/// The stamp answers for this run: neither the blob nor poppler is touched. The
+	/// text is the whole-object row's, and empty for a recorded failure.
+	///
+	/// `stamp` is the id that *answered*, carried out of here rather than rebuilt by the
+	/// caller: the part set is replaced wholesale, so re-emitting `ok_id` for a hit on
+	/// `fail_id` would erase the record that this PDF failed.
+	Hit { stamp: String, text: String },
+	/// Extract.
+	Miss,
+}
+
+/// Whether a stamp lookup answers this run.
+///
+/// Split out of [`pdf_body`] so the four combinations can be tested without an `App`.
+fn cache_decision(
+	matched: Option<(&str, Option<&str>)>,
+	ok_id: &str,
+	fail_id: &str,
+	retry: ExtractRetry,
+	store_text: bool,
+) -> CacheDecision {
+	match matched {
+		// The stamp is for this variant at this budget, so whatever the whole-object row
+		// holds is exactly what this run would produce — including nothing, for a scan
+		// with no text layer. A contentless row has no body to hand back.
+		Some((id, body)) if id == ok_id && store_text => {
+			CacheDecision::Hit { stamp: id.to_owned(), text: body.unwrap_or_default().to_owned() }
+		}
+		// A recorded failure. Under `Cached` it stands; under `Retry` it is a miss, which
+		// is the whole reason the outcome is in the key.
+		Some((id, _)) if id == fail_id && retry == ExtractRetry::Cached => {
+			CacheDecision::Hit { stamp: id.to_owned(), text: String::new() }
+		}
+		_ => CacheDecision::Miss,
+	}
+}
+
+/// The text of a PDF attachment and the id of the stamp part that records it — `None`
+/// for every other file, and for one with no locally available `orig` variant.
+///
+/// The text goes on the file's whole-object row, alongside its name and tags, so a
+/// match is one hit that links to the file. What makes the extraction cacheable is a
+/// *second*, deliberately empty part: its id carries the `orig` variant id and the
+/// char budget, so its mere existence says "this exact extraction already ran". On a
+/// hit neither the blob nor `pdftotext` is touched — the whole-object body is read
+/// back instead. Because `replace_search_row` replaces the part set wholesale, a
+/// changed variant or a changed budget misses the cache and takes the stale stamp out
+/// in the same write — no invalidation logic.
+///
+/// An empty string is a real answer, not a failure: the stamp still gets written, so a
+/// scan with no text layer is not re-extracted on every sweep. A *failure* is stamped
+/// too, under a `:fail` id, so it is retryable — see [`ExtractRetry`].
+///
+/// A tenant with `search.store_text` off (the contentless `fts_cl` route, `store_text`
+/// false here) stores no `body` to read back, so an ok stamp does not spare it the
+/// extraction; a `:fail` stamp is honoured all the same.
+///
+/// Extraction happens here, per index run, rather than once at upload: no new blob
+/// variant, no migration, and every PDF already stored becomes searchable on the next
+/// sweep.
+///
+/// Only a transient failure propagates — a blob read that may succeed later must leave
+/// the existing row alone rather than silently blanking a PDF's body. A missing
+/// `pdftotext` is what would otherwise sit in that class, and
+/// [`cloudillo_extract::pdf::available`] keeps it out: it is an operator condition, so it
+/// returns `None` here instead of failing every PDF on the node.
+///
+/// [`cloudillo_extract::ExtractedText::truncated`] is deliberately not stored. The
+/// budget is already half the stamp id, so a document that ran past it is re-extracted —
+/// and the rest of it surfaced — by raising `search.index_document_chars`, which misses
+/// the stamp and re-runs. A flag in the row would answer the same question and need its
+/// own invalidation.
+///
+/// ponytail: one body for the whole document, so a hit links to the file and not to a
+/// page. `pdftotext` separates pages with `\x0C`; splitting on it into one part per page
+/// is the upgrade path when page-level deep links are wanted — the `'F'` part id space
+/// already reserves page ids, and the reindex sweep rebuilds every row anyway.
+///
+/// ponytail: the `store_text = false` tenant re-extracts on an ok stamp (every weekly
+/// sweep and every per-object run), because there is no stored body for the stamp to hand
+/// back; it still honours `:fail` stamps. The upgrade path is a skip gate
+/// in the sweep itself — skip a file whose `search_docs.updated_at` is newer than its
+/// `files.updated_at` — which makes the whole sweep cheap for every object type rather
+/// than fixing PDFs alone. It needs two things checked first: that an ancestor's share
+/// or visibility change bumps the child's `files.updated_at` (else the sweep is what
+/// repairs the child's derived ACL), and that a document edit or a container republish
+/// moves it too (else the sweep stops catching missed deep indexing).
+async fn pdf_body(
+	app: &App,
+	tn_id: TnId,
+	file: &FileView,
+	store_text: bool,
+	retry: ExtractRetry,
+) -> ClResult<Option<(String, String)>> {
+	if file.content_type.as_deref() != Some("application/pdf") {
+		return Ok(None);
+	}
+	// Read before the variant lookup: 0 is the off switch, and it has to cost nothing.
+	// No stamp and no body, so the next sweep also drops whatever is stored.
+	let max_chars = crate::index_document_chars(app, tn_id).await;
+	if max_chars == 0 {
+		return Ok(None);
+	}
+	// Same shape as the `max_chars == 0` off switch above: no stamp and no body, so a
+	// node without poppler indexes every PDF by name and tags and the next sweep picks
+	// them up once the binary is there. Warmed in `crate::init`, so this is a `OnceLock`
+	// read here and never a spawn on the runtime.
+	if !cloudillo_extract::pdf::available() {
+		debug!(tn_id = %tn_id, file_id = %file.file_id,
+			"pdftotext is not available; indexing no document text");
+		return Ok(None);
+	}
+	let variants = app
+		.meta_adapter
+		.list_file_variants(tn_id, FileId::FileId(&file.file_id))
+		.await?;
+	// `available` is part of the lookup, like `descriptor.rs`'s: a partial sync leaves
+	// metadata-only variant stubs with no local blob. `debug`, not `warn`, because a
+	// pinned remote file (`upstream_tag` set) is created with no local variants at all
+	// and indexed immediately — the normal state for that content, not an anomaly.
+	let Some(orig) = variants.iter().find(|v| v.variant.as_ref() == "orig" && v.available) else {
+		debug!(tn_id = %tn_id, file_id = %file.file_id,
+			"PDF has no locally available orig variant; indexing no text");
+		return Ok(None);
+	};
+	let ok_id = pdf_stamp_id(&orig.variant_id, max_chars, store_text, true);
+	let fail_id = pdf_stamp_id(&orig.variant_id, max_chars, store_text, false);
+	// One statement for both halves of the question: which stamp this object carries,
+	// and what its whole-object row holds.
+	let cached = app
+		.meta_adapter
+		.read_search_cached_body(tn_id, OBJ_FILE, &file.file_id, &[&ok_id, &fail_id])
+		.await?;
+	let matched = cached.as_ref().map(|(id, body)| (id.as_str(), body.as_deref()));
+	if let CacheDecision::Hit { stamp, text } =
+		cache_decision(matched, &ok_id, &fail_id, retry, store_text)
+	{
+		return Ok(Some((stamp, text)));
+	}
+	// Off the variant row, before the copy: uploads run with `DefaultBodyLimit::disable()`,
+	// so a 64 MiB ceiling here is what keeps the scratch write bounded — the same guard,
+	// for the same reason, as `cloudillo_file::open_container`'s.
+	if orig.size > cloudillo_extract::pdf::MAX_INPUT_BYTES as u64 {
+		warn!(tn_id = %tn_id, file_id = %file.file_id, size = orig.size,
+			"PDF is past the extraction limit; indexing no text");
+		return Ok(Some((fail_id, String::new())));
+	}
+
+	let _permit = PDF_EXTRACTIONS
+		.acquire()
+		.await
+		.map_err(|e| Error::Internal(format!("PDF extraction semaphore closed: {e}")))?;
+
+	// `pdftotext` needs a seekable input, so the blob is streamed to scratch rather
+	// than buffered whole.
+	let guard = cloudillo_file::TempFileGuard::scratch(&app.opts.tmp_dir, "pdftext", "")?;
+	let tmp_path = guard.path().to_path_buf();
+	// A blob that cannot be read is stamped `:fail` rather than propagated: it is
+	// usually permanent metadata/blob divergence, and the sweep re-attempts it, so a
+	// store that comes back (or a shared store that was not mounted) is picked up
+	// without the file failing on every per-object run in between.
+	let blob = cloudillo_types::blob_adapter::BlobRef::variant(tn_id, orig);
+	let stream = match app.blob_adapter.read_ref_stream(blob).await {
+		Ok(stream) => stream,
+		Err(err @ (Error::NotFound | Error::ValidationError(_))) => {
+			warn!(tn_id = %tn_id, file_id = %file.file_id, %err,
+				"PDF blob cannot be read; indexing no text");
+			return Ok(Some((fail_id, String::new())));
+		}
+		Err(err) => return Err(err),
+	};
+	// Counted while streaming rather than trusted from `orig.size`: a blob larger than
+	// its metadata row claims must not become an unbounded scratch write.
+	let max = cloudillo_extract::pdf::MAX_INPUT_BYTES as u64;
+	if cloudillo_file::write_capped(&tmp_path, stream, max, |_| {}).await?.is_none() {
+		warn!(tn_id = %tn_id, file_id = %file.file_id, size = orig.size,
+			"PDF blob is larger than its metadata row claims; indexing no text");
+		return Ok(Some((fail_id, String::new())));
+	}
+
+	// Queue by calling path: the sweep (`Retry`) is batch work and goes to Low; a
+	// per-object run stays on Medium. `PDF_EXTRACTIONS` holds at most one Medium thread.
+	let extract = move || cloudillo_extract::pdf::extract_text(&tmp_path, max_chars);
+	let result = if retry == ExtractRetry::Retry {
+		app.worker.try_run_slow(extract).await
+	} else {
+		app.worker.try_run(extract).await
+	};
+	match result {
+		Ok(cloudillo_extract::ExtractedText { text, truncated }) => {
+			if truncated {
+				debug!(tn_id = %tn_id, file_id = %file.file_id, max_chars,
+					"PDF ran past the extraction budget; indexing its first {max_chars} chars");
+			}
+			Ok(Some((ok_id, text)))
+		}
+		// A pool failure is `Internal`, so flattening the two results keeps this branch
+		// meaning what it did: a property of *this* PDF — stamped `:fail`, because a
+		// poppler that refuses it today may read it after an upgrade.
+		Err(err @ Error::ValidationError(_)) => {
+			warn!(tn_id = %tn_id, file_id = %file.file_id, %err,
+				"PDF cannot be indexed; indexing no text");
+			Ok(Some((fail_id, String::new())))
+		}
+		Err(err) => Err(err),
+	}
 }
 
 /// Index one profile.
@@ -740,6 +1017,64 @@ mod tests {
 		assert_eq!(clamp_chars("ábc".to_owned(), 2), "áb");
 	}
 
+	/// Every part of the key has to move the id: a changed budget would otherwise read
+	/// back the previous run's text and `search.index_document_chars` could never take
+	/// effect, and a failure would be indistinguishable from a PDF with no text layer.
+	#[test]
+	fn the_pdf_stamp_id_covers_both_the_variant_and_the_budget() {
+		let base = pdf_stamp_id("b1~abc", 16_000, true, true);
+		assert_ne!(base, pdf_stamp_id("b1~def", 16_000, true, true));
+		assert_ne!(base, pdf_stamp_id("b1~abc", 64_000, true, true));
+		assert_ne!(base, pdf_stamp_id("b1~abc", 16_000, true, false));
+		assert_ne!(base, pdf_stamp_id("b1~abc", 16_000, false, true));
+		// And it is namespaced the way `handler::strip_kind` expects, so the API never
+		// shows the raw prefix.
+		assert_eq!(crate::handler::strip_kind(&base, Some(PDF_PART_KIND)), "b1~abc:16000");
+	}
+
+	/// A failure has to stand for the per-object path and fall for the sweep, or a fixed
+	/// cause is never picked up; an ok stamp only answers when there is a body to return.
+	#[test]
+	fn a_failed_extraction_stands_per_object_and_is_retried_by_the_sweep() {
+		let ok = pdf_stamp_id("b1~abc", 16_000, true, true);
+		let fail = pdf_stamp_id("b1~abc", 16_000, true, false);
+		let decide = |matched, retry| cache_decision(matched, &ok, &fail, retry, true);
+
+		// A successful stamp answers for both, with the stored text, and re-emits itself.
+		let hit = Some((ok.as_str(), Some("a dokumentum szövege")));
+		let hit_decision =
+			CacheDecision::Hit { stamp: ok.clone(), text: "a dokumentum szövege".to_owned() };
+		assert_eq!(decide(hit, ExtractRetry::Cached), hit_decision);
+		assert_eq!(decide(hit, ExtractRetry::Retry), hit_decision);
+
+		// A failure stamp: honoured as an empty body per object, re-attempted by the sweep.
+		// The stamp that comes back is the `:fail` one — re-emitting `ok` would erase the
+		// record that this PDF failed.
+		let failed = Some((fail.as_str(), None));
+		assert_eq!(
+			decide(failed, ExtractRetry::Cached),
+			CacheDecision::Hit { stamp: fail.clone(), text: String::new() }
+		);
+		assert_eq!(decide(failed, ExtractRetry::Retry), CacheDecision::Miss);
+
+		// No stamp at all — a first run, or one whose variant or budget moved.
+		assert_eq!(decide(None, ExtractRetry::Cached), CacheDecision::Miss);
+		assert_eq!(decide(None, ExtractRetry::Retry), CacheDecision::Miss);
+
+		// Contentless (`store_text` off): no body behind an ok stamp, but a failure stands.
+		let ok_cl = pdf_stamp_id("b1~abc", 16_000, false, true);
+		let fail_cl = pdf_stamp_id("b1~abc", 16_000, false, false);
+		let decide_cl = |matched, retry| cache_decision(matched, &ok_cl, &fail_cl, retry, false);
+		assert_eq!(
+			decide_cl(Some((ok_cl.as_str(), None)), ExtractRetry::Cached),
+			CacheDecision::Miss
+		);
+		assert_eq!(
+			decide_cl(Some((fail_cl.as_str(), None)), ExtractRetry::Cached),
+			CacheDecision::Hit { stamp: fail_cl.clone(), text: String::new() }
+		);
+	}
+
 	fn rules(json: &serde_json::Value) -> ActionSearchRules {
 		ActionSearchRules::parse(json).expect("rules")
 	}
@@ -818,9 +1153,23 @@ mod tests {
 	#[test]
 	fn a_live_file_contributes_its_name_and_tags() {
 		let file = file_view(None, "A");
-		let part = file_part(&file, Some("munka projekt"), is_indexable(&file)).expect("indexable");
+		let part =
+			file_part(&file, Some("munka projekt"), None, is_indexable(&file)).expect("indexable");
 		assert_eq!(part.title, Some("Jegyzetek"));
 		assert_eq!(part.tags, Some("munka projekt"));
+		assert_eq!(part.body, None);
+	}
+
+	/// A PDF's extracted text rides the whole-object row, so a body match is one hit
+	/// titled with the file name rather than a second, titleless part.
+	#[test]
+	fn extracted_document_text_lands_on_the_file_row() {
+		let file = file_view(None, "A");
+		let part = file_part(&file, None, Some("a dokumentum szövege"), true).expect("indexable");
+		assert_eq!(part.title, Some("Jegyzetek"));
+		assert_eq!(part.body, Some("a dokumentum szövege"));
+		// A rejected gate drops the text with the row.
+		assert!(file_part(&file, None, Some("a dokumentum szövege"), false).is_none());
 	}
 
 	#[test]
@@ -833,7 +1182,7 @@ mod tests {
 		// A file in an ordinary folder is unaffected.
 		assert!(is_indexable(&file_view(Some("f1~folder"), "A")));
 		// A rejected gate produces no part, whichever rule computed it.
-		assert!(file_part(&file_view(None, "D"), None, false).is_none());
+		assert!(file_part(&file_view(None, "D"), None, None, false).is_none());
 	}
 
 	#[test]
@@ -843,7 +1192,7 @@ mod tests {
 		// search. `hidden` is the legacy spelling of the same thing.
 		let managed = file_view(Some(MANAGED_PARENT_ID), "A");
 		assert!(!is_indexable(&managed));
-		assert!(file_part(&managed, None, is_indexable(&managed)).is_none());
+		assert!(file_part(&managed, None, None, is_indexable(&managed)).is_none());
 		let mut hidden = file_view(None, "A");
 		hidden.hidden = true;
 		assert!(!is_indexable(&hidden));
