@@ -17,6 +17,7 @@ pub mod management;
 pub(crate) mod pdf;
 pub mod perm;
 pub mod preset;
+pub mod scratch;
 pub mod settings;
 pub mod share;
 pub mod site_html;
@@ -47,6 +48,12 @@ pub use container::ZipEntryInfo;
 /// `cloudillo-site` and `cloudillo-search` reason about them in their own limits.
 pub use container::{MAX_CONTAINER_BYTES, MAX_ENTRY_BYTES, MAX_MANIFEST_BYTES};
 
+/// RAII cleanup for a scratch file under `opts.tmp_dir`. Re-exported so
+/// `cloudillo-search` guards its PDF scratch copy with the same one the upload
+/// paths use, rather than a second copy of it — and streams into it with the same capped
+/// writer.
+pub use scratch::{TempFileGuard, write_capped};
+
 /// Create a new container cache for registration in extensions
 pub fn new_container_cache() -> Arc<ContainerCache> {
 	Arc::new(ContainerCache::new())
@@ -55,15 +62,19 @@ pub fn new_container_cache() -> Arc<ContainerCache> {
 /// A container resolved once, and everything read out of it afterwards.
 ///
 /// Resolution — fileId → `orig` variant id → parsed index — happens in
-/// [`open_container`] and nowhere else, so serving a page cannot pay for it twice. The
-/// index cache is keyed by fileId, so a warm open costs no database query.
+/// [`open_container`] and nowhere else, so serving a page cannot pay for it twice. A warm
+/// open answers `(tenant, fileId)` out of the cache, so it costs no database query.
 ///
 /// Does **no** permission or preset check: the caller has already established that this
 /// file is a container it may read. `apkg::get_container_content` runs the ABAC path;
 /// `cloudillo-site` reaches its containers through the site cache.
 #[derive(Debug, Clone)]
 pub struct Container {
-	tn_id: TnId,
+	/// The store the container's blob lives in —
+	/// [`cloudillo_types::blob_adapter::BlobRef::variant`]'s answer for the `orig` row,
+	/// *not* the reading tenant: a shared (`global`) container is read from `SHARED_TN`
+	/// and reading it from the tenant's store 404s.
+	blob_tn: TnId,
 	index: Arc<container::ZipIndex>,
 }
 
@@ -95,8 +106,8 @@ pub async fn open_container(
 	let cacheable = !file_id.starts_with('@');
 	let cache = app.ext::<Arc<ContainerCache>>()?;
 
-	if cacheable && let Some(index) = cache.get(file_id) {
-		return Ok(Container { tn_id, index });
+	if cacheable && let Some((blob_tn, index)) = cache.get(tn_id, file_id) {
+		return Ok(Container { blob_tn, index });
 	}
 
 	// Held across the read and the parse below, so a burst of cold requests for one
@@ -108,8 +119,8 @@ pub async fn open_container(
 		None => None,
 	};
 	// Whoever held the gate before us filled the cache.
-	if cacheable && let Some(index) = cache.get(file_id) {
-		return Ok(Container { tn_id, index });
+	if cacheable && let Some((blob_tn, index)) = cache.get(tn_id, file_id) {
+		return Ok(Container { blob_tn, index });
 	}
 
 	// Held across the blob read and the parse below. The gate above collapses a
@@ -130,23 +141,36 @@ pub async fn open_container(
 		return Err(Error::ValidationError("container exceeds the maximum readable size".into()));
 	}
 	let variant_id: Box<str> = orig.variant_id.as_ref().into();
+	// A federated Public/Verified container's blob lives in the shared store, not this
+	// tenant's; `BlobRef` is what knows which.
+	let blob = cloudillo_types::blob_adapter::BlobRef::variant(tn_id, orig);
+	let blob_tn = blob.tn_id;
 
-	let blob_data = app.blob_adapter.read_blob_buf(tn_id, &variant_id).await?;
-	// CPU-bound over up to `MAX_CONTAINER_BYTES`, on the **caller's** queue — the
-	// same rule `Container::read_bytes` and `Container::read_manifest` follow. A
-	// page view takes `Priority::High`; the reindex sweep takes `Priority::Medium`, or
-	// a sweep over a tenant's containers would queue ahead of every live render.
-	let index = Arc::new(
-		app.worker
-			.spawn(priority, move || container::parse_zip_index(&blob_data, &variant_id))
-			.await??,
-	);
+	// The parse is tenant-independent, and the shared key is the `orig` variant id — a hash
+	// of the blob's bytes — so another tenant that parsed the same bytes may already have
+	// paid for it, with no assumption about how a fileId is derived. All this tenant owed
+	// was the variant lookup above, which is what told us its store and its blob id.
+	let index = if let Some(index) = cache.index(&variant_id) {
+		index
+	} else {
+		let blob_data = app.blob_adapter.read_ref_buf(blob).await?;
+		let parse_id = variant_id.clone();
+		// CPU-bound over up to `MAX_CONTAINER_BYTES`, on the **caller's** queue — the
+		// same rule `Container::read_bytes` and `Container::read_manifest` follow. A
+		// page view takes `Priority::High`; the reindex sweep takes `Priority::Medium`, or
+		// a sweep over a tenant's containers would queue ahead of every live render.
+		Arc::new(
+			app.worker
+				.spawn(priority, move || container::parse_zip_index(&blob_data, &parse_id))
+				.await??,
+		)
+	};
 
 	if cacheable {
-		cache.put(file_id, Arc::clone(&index));
+		cache.put(tn_id, file_id, blob_tn, Arc::clone(&index));
 	}
 
-	Ok(Container { tn_id, index })
+	Ok(Container { blob_tn, index })
 }
 
 impl Container {
@@ -179,14 +203,10 @@ impl Container {
 			));
 		}
 
+		let blob = cloudillo_types::blob_adapter::BlobRef::at(self.blob_tn, self.variant_id());
 		let chunks: Vec<axum::body::Bytes> = app
 			.blob_adapter
-			.read_blob_range_stream(
-				self.tn_id,
-				self.variant_id(),
-				info.data_offset,
-				info.compressed_size,
-			)
+			.read_ref_range_stream(blob, info.data_offset, info.compressed_size)
 			.await?
 			.try_collect()
 			.await

@@ -84,12 +84,32 @@ const DEFAULT_CAPACITY: NonZeroUsize = match NonZeroUsize::new(128) {
 /// ones are in flight. Warm opens never touch it.
 const MAX_CONCURRENT_LOADS: usize = 4;
 
-/// Cache of parsed container indexes, keyed by the container's **fileId**.
+/// Capacity of the per-tenant store map. Eight times [`DEFAULT_CAPACITY`], because an
+/// entry is a `TnId` and a variant id beside its key rather than a parsed index — a few
+/// dozen bytes — and one container held by N tenants needs N of them. Same unreachable
+/// `None` fallback.
+const STORES_CAPACITY: NonZeroUsize = match NonZeroUsize::new(8 * DEFAULT_CAPACITY.get()) {
+	Some(n) => n,
+	None => NonZeroUsize::MIN,
+};
+
+/// `(tenant, fileId)` → `(blob store, orig variant id)`. See [`ContainerCache`].
+type StoreCache = LruCache<(TnId, Box<str>), (TnId, Box<str>)>;
+
+/// Cache of parsed container indexes, answering a `(TnId, fileId)` lookup without a
+/// `files JOIN file_variants` round trip.
 ///
 /// A fileId is a hash of the file descriptor, so it names one immutable `orig` blob for
-/// all time and a key is never reused. Keying here rather than by variant id lets a warm
-/// request skip the `files JOIN file_variants` lookup entirely: the variant id rides
-/// inside the cached [`ZipIndex`].
+/// all time and a key is never reused.
+///
+/// Two maps, because the two halves of the answer have different key spaces. The parsed
+/// index is keyed by the **`orig` variant id** it was parsed from and shared across
+/// tenants — a variant id is a hash of the blob's bytes, so two tenants sharing an entry
+/// are provably sharing identical bytes, and a federated Public/Verified container
+/// occupies one entry on a node rather than one per tenant. The per-tenant half, keyed
+/// `(TnId, fileId)`, holds which **store** the blob lives in (`file_variants.global` is a
+/// per-tenant column) *and* that tenant's own variant id, so a `Container` never pairs
+/// this tenant's store with another tenant's blob id.
 ///
 /// A file that has not been finalised is addressed as `@<f_id>`, and that id is
 /// **mutable** — `open_container` bypasses the cache for those.
@@ -102,7 +122,12 @@ const MAX_CONCURRENT_LOADS: usize = 4;
 /// state. The guard is never held across an await.
 #[derive(Debug)]
 pub struct ContainerCache {
+	/// Parsed indexes, shared across tenants. See the struct docs.
 	entries: parking_lot::Mutex<LruCache<Box<str>, Arc<ZipIndex>>>,
+	/// Which blob store one tenant reads a container from, and the `orig` variant id it
+	/// reads there. Both come from that tenant's own `file_variants` row, so a container
+	/// shared with another tenant never lends this one its blob id.
+	stores: parking_lot::Mutex<StoreCache>,
 	/// One gate per container being loaded, so N concurrent cold requests for one
 	/// container cost one blob read and one parse instead of N. See
 	/// [`ContainerCache::loading_gate`].
@@ -125,6 +150,7 @@ impl ContainerCache {
 	pub fn with_capacity(capacity: NonZeroUsize) -> Self {
 		Self {
 			entries: parking_lot::Mutex::new(LruCache::new(capacity)),
+			stores: parking_lot::Mutex::new(LruCache::new(STORES_CAPACITY)),
 			loading: parking_lot::Mutex::new(HashMap::new()),
 			loads: tokio::sync::Semaphore::new(MAX_CONCURRENT_LOADS),
 		}
@@ -136,6 +162,12 @@ impl ContainerCache {
 	/// in the cache when it opens, so a burst of concurrent first requests costs one blob
 	/// read and one parse. That matters because the path reaching here is
 	/// **unauthenticated**, so N is whatever a client chooses.
+	///
+	/// Keyed by fileId alone, unlike the caches it fills: the gate only dedups concurrent
+	/// cold opens, and the first request through it is what learns the variant id the
+	/// parsed index is then shared under. The per-tenant answer — which store the blob was
+	/// read from, and that tenant's variant id — costs only a variant-row lookup, so the
+	/// second tenant through the gate pays for that and reuses the parse.
 	///
 	/// A `tokio::sync::Mutex` because the guard is held across an await; the map around it
 	/// is the sync one, and is never held across one.
@@ -160,24 +192,37 @@ impl ContainerCache {
 			.map_err(|_| Error::Internal("Container load semaphore closed".into()))
 	}
 
-	/// Get a cached index by fileId. A hit also promotes it to most-recently-used.
-	pub fn get(&self, file_id: &str) -> Option<Arc<ZipIndex>> {
-		self.entries.lock().get(file_id).map(Arc::clone)
+	/// A container fully answered for this tenant: the store its blob lives in, and its
+	/// parsed index. `None` unless **both** maps hit, since a store with no index still
+	/// costs the read and the parse. A hit promotes both to most-recently-used.
+	// ponytail: one `Box<str>` per warm lookup, for the tuple key `LruCache::get` has no
+	// borrowed form of. Revisit only on a measured regression of the container-serve path;
+	// every zero-allocation shape costs more than the 24-byte copy.
+	pub fn get(&self, tn_id: TnId, file_id: &str) -> Option<(TnId, Arc<ZipIndex>)> {
+		let (blob_tn, variant_id) = self.stores.lock().get(&(tn_id, file_id.into()))?.clone();
+		Some((blob_tn, self.index(&variant_id)?))
 	}
 
-	/// Store a parsed index under its container's fileId.
+	/// The tenant-independent half: a parsed index by the `orig` variant id it was parsed
+	/// from. A variant id is a hash of the blob's bytes, so two tenants sharing one here
+	/// are provably sharing identical bytes — no assumption about how `file_id` is derived.
+	///
+	/// What lets a second tenant's cold open skip the blob read and the parse and pay only
+	/// for its own variant-row lookup.
+	pub fn index(&self, variant_id: &str) -> Option<Arc<ZipIndex>> {
+		self.entries.lock().get(variant_id).map(Arc::clone)
+	}
+
+	/// Store a parsed index under the variant id it was parsed from, and that variant plus
+	/// its store under this tenant's view of the container.
 	///
 	/// Two requests racing the same cold container would both parse and insert an equal
 	/// index — correct but wasteful on an unauthenticated path. [`Self::loading_gate`]
 	/// collapses the race to one read and one parse.
-	pub fn put(&self, file_id: &str, index: Arc<ZipIndex>) {
-		self.entries.lock().put(file_id.into(), index);
-	}
-
-	/// Invalidate a cached entry
-	#[allow(dead_code)]
-	pub fn invalidate(&self, file_id: &str) {
-		self.entries.lock().pop(file_id);
+	pub fn put(&self, tn_id: TnId, file_id: &str, blob_tn: TnId, index: Arc<ZipIndex>) {
+		let variant_id: Box<str> = index.variant_id.clone();
+		self.entries.lock().put(variant_id.clone(), index);
+		self.stores.lock().put((tn_id, file_id.into()), (blob_tn, variant_id));
 	}
 }
 

@@ -98,9 +98,10 @@ pub async fn generate_pdf_thumbnail_variant(
 	input_path: &Path,
 	thumbnail_size: u32,
 ) -> ClResult<PdfThumbnailResult> {
-	// Create temp file for thumbnail in app's tmp_dir
-	let thumb_name = format!("pdf_thumb_{}.png", f_id);
-	let thumb_path = app.opts.tmp_dir.join(&thumb_name);
+	// Create temp file for thumbnail in app's tmp_dir. The `.png` has to be there:
+	// `generate_pdf_thumbnail` hands `pdftoppm` the path with the extension stripped,
+	// and `-png` puts it back.
+	let thumb_path = crate::scratch::scratch_path(&app.opts.tmp_dir, "pdf_thumb", ".png")?;
 
 	// Get PDF info and generate thumbnail in worker thread
 	let input_path_owned = input_path.to_path_buf();

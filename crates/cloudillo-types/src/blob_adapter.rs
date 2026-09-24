@@ -8,7 +8,9 @@ use futures_core::Stream;
 use std::{fmt::Debug, pin::Pin};
 use tokio::io::AsyncRead;
 
+use crate::meta_adapter::FileVariant;
 use crate::prelude::*;
+use crate::types::SHARED_TN;
 
 #[derive(Clone, Default)]
 pub struct CreateBlobOptions {}
@@ -18,6 +20,37 @@ pub struct BlobStat {
 	pub size: u64,
 	/// Unix epoch seconds of the blob's last modification (or creation).
 	pub modified_at: i64,
+}
+
+/// Where one blob actually lives: its id plus the store that holds it.
+///
+/// Built from the `file_variants` row, never assembled by hand — [`FileVariant::global`]
+/// decides the store, and a caller that passes its own `tn_id` instead reads the wrong
+/// one and gets a spurious [`Error::NotFound`].
+#[derive(Debug, Clone, Copy)]
+pub struct BlobRef<'a> {
+	pub tn_id: TnId,
+	pub blob_id: &'a str,
+}
+
+impl<'a> BlobRef<'a> {
+	/// The store a variant row points at — the only way to route a read of a blob
+	/// that may be shared.
+	pub fn variant<S: AsRef<str> + Debug>(tn_id: TnId, variant: &'a FileVariant<S>) -> Self {
+		Self {
+			tn_id: if variant.global { SHARED_TN } else { tn_id },
+			blob_id: variant.variant_id.as_ref(),
+		}
+	}
+
+	/// A blob whose store is already known, from something other than a variant row.
+	///
+	/// One caller: `cloudillo_file::Container::read_raw`, which range-reads entries out of
+	/// a container whose store [`BlobRef::variant`] resolved once, at open time, and which
+	/// rides in the cache entry from then on.
+	pub fn at(tn_id: TnId, blob_id: &'a str) -> Self {
+		Self { tn_id, blob_id }
+	}
 }
 
 #[async_trait]
@@ -40,13 +73,22 @@ pub trait BlobAdapter: Debug + Send + Sync {
 	) -> ClResult<()>;
 
 	/// Stats a blob. Returns `None` if the blob is not present.
+	///
+	/// `tn_id` is a **store**, not the reading tenant: with a `file_variants` row in
+	/// hand, route it through [`BlobRef::variant`] first.
 	async fn stat_blob(&self, tn_id: TnId, blob_id: &str) -> Option<BlobStat>;
 
 	/// Reads a blob
+	///
+	/// `tn_id` is a **store**, not the reading tenant: with a `file_variants` row in
+	/// hand use [`BlobAdapter::read_ref_buf`].
 	async fn read_blob_buf(&self, tn_id: TnId, blob_id: &str) -> ClResult<Box<[u8]>>;
 
 	/// Reads a byte range from a blob as a stream (no full buffering).
 	/// `offset` is the start byte; `length` is the number of bytes to read.
+	///
+	/// `tn_id` is a **store**, not the reading tenant: with a `file_variants` row in
+	/// hand use [`BlobAdapter::read_ref_range_stream`].
 	async fn read_blob_range_stream(
 		&self,
 		tn_id: TnId,
@@ -56,11 +98,37 @@ pub trait BlobAdapter: Debug + Send + Sync {
 	) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>>;
 
 	/// Reads a blob
+	///
+	/// `tn_id` is a **store**, not the reading tenant: with a `file_variants` row in
+	/// hand use [`BlobAdapter::read_ref_stream`].
 	async fn read_blob_stream(
 		&self,
 		tn_id: TnId,
 		blob_id: &str,
 	) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>>;
+
+	/// [`BlobAdapter::read_blob_buf`] on a located blob.
+	async fn read_ref_buf(&self, blob: BlobRef<'_>) -> ClResult<Box<[u8]>> {
+		self.read_blob_buf(blob.tn_id, blob.blob_id).await
+	}
+
+	/// [`BlobAdapter::read_blob_range_stream`] on a located blob.
+	async fn read_ref_range_stream(
+		&self,
+		blob: BlobRef<'_>,
+		offset: u64,
+		length: u64,
+	) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>> {
+		self.read_blob_range_stream(blob.tn_id, blob.blob_id, offset, length).await
+	}
+
+	/// [`BlobAdapter::read_blob_stream`] on a located blob.
+	async fn read_ref_stream(
+		&self,
+		blob: BlobRef<'_>,
+	) -> ClResult<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>> {
+		self.read_blob_stream(blob.tn_id, blob.blob_id).await
+	}
 
 	/// Creates a new blob by copying a file from a local path (no memory allocation)
 	async fn create_blob_from_path(

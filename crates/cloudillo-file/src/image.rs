@@ -279,12 +279,11 @@ pub async fn generate_image_variants(
 			.await?;
 	}
 
-	// Compute content hash and temp file path for async variant tasks
-	let orig_content_id = {
-		use cloudillo_types::hasher;
-		hasher::hash("b", bytes)
-	};
-	let orig_file = app.opts.tmp_dir.join::<&str>(&orig_content_id);
+	// Temp file path for async variant tasks. Named by nothing about the image: two
+	// concurrent uploads of the same bytes would otherwise write one scratch path while
+	// the other is reading it. Nothing here removes it — the variant tasks outlive this
+	// request, and a restart — so `gc::sweep_scratch` is what reaps it by age.
+	let orig_file = crate::scratch::scratch_path(&app.opts.tmp_dir, "orig", "")?;
 
 	// Only write temp file if there are async variant tasks that need it
 	if !preset.image_variants.is_empty() {

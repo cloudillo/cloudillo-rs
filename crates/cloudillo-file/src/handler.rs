@@ -11,12 +11,7 @@ use axum::{
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{
-	fmt::Debug,
-	path::{Path, PathBuf},
-	pin::Pin,
-};
-use tokio::io::AsyncWriteExt;
+use std::{fmt::Debug, path::Path, pin::Pin};
 
 use crate::prelude::*;
 use crate::{
@@ -27,6 +22,7 @@ use crate::{
 	image::ImageResizerTask,
 	pdf,
 	preset::{self, get_audio_tier, get_image_tier, get_video_tier, presets},
+	scratch::{self, TempFileGuard},
 	site_html, store, svg,
 	variant::{self, VariantClass},
 	video::VideoTranscoderTask,
@@ -77,62 +73,21 @@ pub fn format_from_content_type(content_type: &str) -> Option<&str> {
 /// when the streamed bytes exceed `max_size_bytes`.
 async fn stream_body_to_file(
 	body: Body,
-	path: &PathBuf,
+	path: &Path,
 	max_size_bytes: u64,
 ) -> ClResult<(u64, Box<str>)> {
 	use futures::StreamExt;
 
-	let mut file = tokio::fs::File::create(path).await?;
-	let mut body_stream = body.into_data_stream();
-	let mut total_size: u64 = 0;
+	let stream = body
+		.into_data_stream()
+		.map(|c| c.map_err(|e| Error::Internal(format!("body read error: {}", e))));
 	let mut hasher = hasher::Hasher::new();
-
-	while let Some(chunk) = body_stream.next().await {
-		let chunk = chunk.map_err(|e| Error::Internal(format!("body read error: {}", e)))?;
-		total_size += chunk.len() as u64;
-		if total_size > max_size_bytes {
-			drop(file);
-			let _ = tokio::fs::remove_file(path).await;
-			return Err(Error::ValidationError("upload exceeds maximum file size".into()));
-		}
-		hasher.update(&chunk);
-		file.write_all(&chunk).await?;
-	}
-	file.flush().await?;
+	let total_size =
+		crate::scratch::write_capped(path, stream, max_size_bytes, |c| hasher.update(c))
+			.await?
+			.ok_or_else(|| Error::ValidationError("upload exceeds maximum file size".into()))?;
 
 	Ok((total_size, hasher.finalize("b").into_boxed_str()))
-}
-
-/// Best-effort RAII cleanup for streaming-upload temp files.
-/// On drop, spawns a remove_file task unless `keep()` was called.
-struct TempFileGuard(Option<PathBuf>);
-
-impl TempFileGuard {
-	fn new(p: PathBuf) -> Self {
-		Self(Some(p))
-	}
-
-	fn replace(&mut self, p: PathBuf) {
-		self.0 = Some(p);
-	}
-
-	fn keep(mut self) {
-		self.0 = None;
-	}
-}
-
-impl Drop for TempFileGuard {
-	fn drop(&mut self) {
-		if let Some(p) = self.0.take() {
-			tokio::spawn(async move {
-				if let Err(e) = tokio::fs::remove_file(&p).await
-					&& e.kind() != std::io::ErrorKind::NotFound
-				{
-					warn!("TempFileGuard cleanup failed for {:?}: {}", p, e);
-				}
-			});
-		}
-	}
 }
 
 pub fn content_type_from_format(format: &str) -> &str {
@@ -208,8 +163,7 @@ fn parse_range(value: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
 /// handlers, so the branching lives in exactly one place.
 async fn respond_variant(
 	app: &App,
-	blob_tn: TnId,
-	variant_id: &str,
+	blob: blob_adapter::BlobRef<'_>,
 	variant: &meta_adapter::FileVariant<impl AsRef<str> + Debug>,
 	descriptor: Option<&str>,
 	range: Option<Result<(u64, u64), ()>>,
@@ -218,14 +172,12 @@ async fn respond_variant(
 	match range {
 		Some(Err(())) => Ok(range_not_satisfiable(variant.size)),
 		Some(Ok((start, end))) => {
-			let stream = app
-				.blob_adapter
-				.read_blob_range_stream(blob_tn, variant_id, start, end - start + 1)
-				.await?;
+			let stream =
+				app.blob_adapter.read_ref_range_stream(blob, start, end - start + 1).await?;
 			serve_file(descriptor, variant, stream, disable_cache, Some((start, end)))
 		}
 		None => {
-			let stream = app.blob_adapter.read_blob_stream(blob_tn, variant_id).await?;
+			let stream = app.blob_adapter.read_ref_stream(blob).await?;
 			serve_file(descriptor, variant, stream, disable_cache, None)
 		}
 	}
@@ -647,14 +599,14 @@ pub async fn get_file_variant(
 ) -> ClResult<impl response::IntoResponse> {
 	let variant = app.meta_adapter.read_file_variant(tn_id, &variant_id).await?;
 	info!("variant: {:?}", variant);
-	let blob_tn = if variant.global { TnId(0) } else { tn_id };
 
 	let range = headers
 		.get(header::RANGE)
 		.and_then(|v| v.to_str().ok())
 		.and_then(|v| parse_range(v, variant.size));
 
-	respond_variant(&app, blob_tn, &variant_id, &variant, None, range, app.opts.disable_cache).await
+	let blob = blob_adapter::BlobRef::variant(tn_id, &variant);
+	respond_variant(&app, blob, &variant, None, range, app.opts.disable_cache).await
 }
 
 /// Build a `416 Range Not Satisfiable` response carrying the resource size in
@@ -696,8 +648,6 @@ pub async fn get_file_variant_file_id(
 	debug!("variants: {:?}", variants);
 
 	let variant = descriptor::get_best_file_variant(&variants, &selector)?;
-	let blob_tn = if variant.global { TnId(0) } else { tn_id };
-	let variant_id = variant.variant_id.as_ref().to_string();
 
 	let range = headers
 		.get(header::RANGE)
@@ -722,16 +672,8 @@ pub async fn get_file_variant_file_id(
 		None
 	};
 
-	respond_variant(
-		&app,
-		blob_tn,
-		&variant_id,
-		variant,
-		descriptor.as_deref(),
-		range,
-		app.opts.disable_cache,
-	)
-	.await
+	let blob = blob_adapter::BlobRef::variant(tn_id, variant);
+	respond_variant(&app, blob, variant, descriptor.as_deref(), range, app.opts.disable_cache).await
 }
 
 pub async fn get_file_descriptor(
@@ -1083,7 +1025,8 @@ async fn handle_post_video_stream(
 		.await?;
 
 	// 4. Extract thumbnail synchronously (like images)
-	let frame_path = app.opts.tmp_dir.join(format!("frame_{}.jpg", f_id));
+	// `.jpg`: ffmpeg picks the encoder from the extension.
+	let frame_path = scratch::scratch_path(&app.opts.tmp_dir, "frame", ".jpg")?;
 
 	// Calculate smart seek time (10% of duration, min 3s for long videos)
 	let seek_time = if duration > 10.0 {
@@ -1326,7 +1269,7 @@ async fn handle_post_pdf(
 			.await?;
 
 	// 2. Write to temp file for thumbnail generation
-	let temp_path = app.opts.tmp_dir.join(format!("pdf_{}_{}", tn_id.0, f_id));
+	let temp_path = scratch::scratch_path(&app.opts.tmp_dir, "pdf", "")?;
 	tokio::fs::write(&temp_path, bytes).await?;
 
 	// 3. Generate thumbnail synchronously (so vis.tn is available immediately)
@@ -2238,12 +2181,11 @@ pub async fn post_file_blob(
 		// blob hash, then call create_file with `orig_variant_id` set so the
 		// existing dedup branch in the meta adapter catches re-uploads.
 		VariantClass::Video => {
-			let temp_token = utils::random_id()?;
-			let temp_path =
-				app.opts.tmp_dir.join(format!("upload_{}_pending_{}", tn_id.0, temp_token));
+			// Guarded before the write, so a failed stream leaves nothing behind.
+			let mut temp_guard = TempFileGuard::scratch(&app.opts.tmp_dir, "upload_pending", "")?;
+			let temp_path = temp_guard.path().to_path_buf();
 			let (total_size, orig_blob_id) =
 				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
-			let mut temp_guard = TempFileGuard::new(temp_path.clone());
 			info!(
 				"Video upload streamed to {:?}, size: {} bytes, content id: {}",
 				temp_path, total_size, orig_blob_id
@@ -2290,8 +2232,9 @@ pub async fn post_file_blob(
 
 			match f_id {
 				meta_adapter::FileId::FId(f_id) => {
+					// Renamed so an operator reading `ls` sees which file this is.
 					let final_temp_path =
-						app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
+						scratch::scratch_path(&app.opts.tmp_dir, &format!("upload_{f_id}"), "")?;
 					tokio::fs::rename(&temp_path, &final_temp_path).await?;
 					temp_guard.replace(final_temp_path.clone());
 					let data = handle_post_video_stream(
@@ -2321,12 +2264,11 @@ pub async fn post_file_blob(
 		}
 
 		VariantClass::Audio => {
-			let temp_token = utils::random_id()?;
-			let temp_path =
-				app.opts.tmp_dir.join(format!("upload_{}_pending_{}", tn_id.0, temp_token));
+			// Guarded before the write, so a failed stream leaves nothing behind.
+			let mut temp_guard = TempFileGuard::scratch(&app.opts.tmp_dir, "upload_pending", "")?;
+			let temp_path = temp_guard.path().to_path_buf();
 			let (total_size, orig_blob_id) =
 				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
-			let mut temp_guard = TempFileGuard::new(temp_path.clone());
 			info!(
 				"Audio upload streamed to {:?}, size: {} bytes, content id: {}",
 				temp_path, total_size, orig_blob_id
@@ -2372,8 +2314,9 @@ pub async fn post_file_blob(
 
 			match f_id {
 				meta_adapter::FileId::FId(f_id) => {
+					// Renamed so an operator reading `ls` sees which file this is.
 					let final_temp_path =
-						app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
+						scratch::scratch_path(&app.opts.tmp_dir, &format!("upload_{f_id}"), "")?;
 					tokio::fs::rename(&temp_path, &final_temp_path).await?;
 					temp_guard.replace(final_temp_path.clone());
 					let data = handle_post_audio_stream(
@@ -2402,12 +2345,11 @@ pub async fn post_file_blob(
 		}
 
 		VariantClass::Raw => {
-			let temp_token = utils::random_id()?;
-			let temp_path =
-				app.opts.tmp_dir.join(format!("upload_{}_pending_{}", tn_id.0, temp_token));
+			// Guarded before the write, so a failed stream leaves nothing behind.
+			let mut temp_guard = TempFileGuard::scratch(&app.opts.tmp_dir, "upload_pending", "")?;
+			let temp_path = temp_guard.path().to_path_buf();
 			let (total_size, orig_blob_id) =
 				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
-			let mut temp_guard = TempFileGuard::new(temp_path.clone());
 			info!(
 				"Raw upload streamed to {:?}, size: {} bytes, content id: {}",
 				temp_path, total_size, orig_blob_id
@@ -2469,8 +2411,9 @@ pub async fn post_file_blob(
 
 			match f_id {
 				meta_adapter::FileId::FId(f_id) => {
+					// Renamed so an operator reading `ls` sees which file this is.
 					let final_temp_path =
-						app.opts.tmp_dir.join(format!("upload_{}_{}", tn_id.0, f_id));
+						scratch::scratch_path(&app.opts.tmp_dir, &format!("upload_{f_id}"), "")?;
 					tokio::fs::rename(&temp_path, &final_temp_path).await?;
 					temp_guard.replace(final_temp_path.clone());
 					let data = handle_post_raw_stream(

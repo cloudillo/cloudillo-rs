@@ -16,6 +16,7 @@ use crate::variant::{Variant, VariantClass, VariantQuality};
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter::{CreateFile, FileId, FileVariant, MANAGED_PARENT_ID};
 use cloudillo_types::types::ApiResponse;
+use cloudillo_types::types::SHARED_TN;
 
 /// Lightweight struct for deserializing remote file metadata
 #[derive(Debug, Deserialize)]
@@ -34,9 +35,6 @@ pub struct SyncResult {
 	pub synced_variants: Vec<String>,
 	pub skipped_variants: Vec<String>,
 }
-
-/// The system tenant used as the shared blob cache for federated public/verified attachments.
-const SHARED_TN: TnId = TnId(0);
 
 /// A federated variant is eligible for the shared store iff the action driving
 /// the sync has Public ('P') or Verified ('V') visibility.
@@ -412,7 +410,7 @@ pub async fn sync_file_variants(
 		}
 
 		// Determine blob size, availability, and where the blob lives.
-		// When `shared` is true the blob lives under `TnId(0)`; the per-tenant
+		// When `shared` is true the blob lives under `SHARED_TN`; the per-tenant
 		// `file_variants` row records that via `global=true`. We probe the
 		// shared store first, then fall back to the per-tenant store (covering
 		// the case where this tenant fetched the same blob before this feature
@@ -420,7 +418,10 @@ pub async fn sync_file_variants(
 		let (blob_size, available, stored_global) = if should_sync_content {
 			let mut found: Option<(u64, bool)> = None;
 			if shared && let Some(stat) = app.blob_adapter.stat_blob(SHARED_TN, variant_id).await {
-				info!("  shared variant {} already in TnId(0), skipping download", variant_id);
+				info!(
+					"  shared variant {} already in the shared store, skipping download",
+					variant_id
+				);
 				found = Some((stat.size, true));
 			}
 			if found.is_none()
@@ -437,7 +438,7 @@ pub async fn sync_file_variants(
 				// Fetch variant data from remote — write to shared store when eligible.
 				let store_tn = if shared { SHARED_TN } else { tn_id };
 				if shared {
-					info!("  storing variant {} to shared store TnId(0)", variant_id);
+					info!("  storing variant {} to shared store", variant_id);
 				}
 				match fetch_and_store_blob(
 					app,
@@ -538,7 +539,7 @@ async fn fetch_and_store_blob(
 	let variant_path = format!("/files/variant/{}", variant_id);
 	// The HTTP request itself uses the requesting tenant's identity (so we
 	// authenticate as the tenant the sync is happening for); the blob is
-	// stored under `store_tn` which may be `TnId(0)` for the shared store.
+	// stored under `store_tn` which may be `SHARED_TN` for the shared store.
 	let mut stream = app.request.get_stream(request_tn, remote_id_tag, &variant_path, auth).await?;
 
 	let store_res = tokio::time::timeout(

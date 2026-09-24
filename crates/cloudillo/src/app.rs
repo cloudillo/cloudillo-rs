@@ -21,6 +21,7 @@ use cloudillo_action::hooks::HookRegistry;
 pub use cloudillo_core::app::{Adapters, App, AppBuilderOpts, AppState, ServerMode, VERSION};
 use cloudillo_core::extensions::Extensions;
 use cloudillo_core::{abac, rate_limit::RateLimitManager, request, scheduler};
+use cloudillo_types::types::SHARED_TN;
 use cloudillo_types::worker;
 
 /// Type alias for async initialization callbacks
@@ -119,6 +120,7 @@ impl AppBuilder {
 		self.opts.shell_version = shell_version.into();
 		self
 	}
+	/// Must be a dedicated directory: the file GC removes every stale regular file in it.
 	pub fn tmp_dir(&mut self, tmp_dir: impl Into<Box<std::path::Path>>) -> &mut Self {
 		self.opts.tmp_dir = tmp_dir.into();
 		self
@@ -270,7 +272,7 @@ impl AppBuilder {
 
 		// Initialize key fetch failure cache
 		let key_cache_size: usize = settings_service
-			.get_int(TnId(0), "federation.key_failure_cache_size")
+			.get_int(SHARED_TN, "federation.key_failure_cache_size")
 			.await
 			.unwrap_or(100)
 			.try_into()

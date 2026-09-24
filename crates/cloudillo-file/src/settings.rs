@@ -141,6 +141,21 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.permission(PermissionLevel::Admin)
 			.build()?,
 	)?;
+	registry.register(
+		SettingDefinition::builder("file.gc_scratch_window_secs")
+			.description("Minimum age (seconds) before a scratch file under the temp directory is removed by GC — must outlast the deepest queue of transcode/variant tasks that still need their input")
+			.default(SettingValue::Int(crate::gc::DEFAULT_SCRATCH_WINDOW_SECS))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.validator(|v| match v {
+				SettingValue::Int(i) if *i >= crate::gc::MIN_SCRATCH_WINDOW_SECS => Ok(()),
+				_ => Err(Error::ValidationError(format!(
+					"Scratch GC window must be at least {} seconds",
+					crate::gc::MIN_SCRATCH_WINDOW_SECS
+				))),
+			})
+			.build()?,
+	)?;
 
 	// Storage quota
 	registry.register(

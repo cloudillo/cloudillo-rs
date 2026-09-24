@@ -84,9 +84,9 @@ impl Task<App> for AudioExtractorTask {
 			self.input_path, self.variant, self.bitrate
 		);
 
-		// Create temp file for output in app's tmp_dir
-		let output_name = format!("audio_{}_{}.opus", self.f_id, self.variant.replace('.', "_"));
-		let output_path = app.opts.tmp_dir.join(&output_name);
+		// Create temp file for output in app's tmp_dir. The `.opus` is not decoration:
+		// ffmpeg picks the muxer from it.
+		let output_path = crate::scratch::scratch_path(&app.opts.tmp_dir, "audio", ".opus")?;
 
 		// Run audio extraction in worker thread (CPU-intensive)
 		let input_path = self.input_path.clone();

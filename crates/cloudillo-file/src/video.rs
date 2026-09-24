@@ -91,9 +91,9 @@ impl Task<App> for VideoTranscoderTask {
 			self.input_path, self.variant, self.max_dim, self.bitrate
 		);
 
-		// Create temp file for output in app's tmp_dir
-		let output_name = format!("transcode_{}_{}.mp4", self.f_id, self.variant.replace('.', "_"));
-		let output_path = app.opts.tmp_dir.join(&output_name);
+		// Create temp file for output in app's tmp_dir. The `.mp4` is not decoration:
+		// ffmpeg picks the muxer from it.
+		let output_path = crate::scratch::scratch_path(&app.opts.tmp_dir, "transcode", ".mp4")?;
 
 		// Run transcoding in worker thread (CPU-intensive)
 		let input_path = self.input_path.clone();
