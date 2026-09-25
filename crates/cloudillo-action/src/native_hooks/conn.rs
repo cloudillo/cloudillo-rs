@@ -114,8 +114,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				.meta_adapter
 				.read_profile(tn_id, audience)
 				.await
-				.ok()
-				.is_some_and(|(_, p)| p.connected.is_connected());
+				.is_ok_and(|(_, p)| p.connected.is_connected());
 
 			let profile_upsert = UpsertProfileFields {
 				following: if context.tenant_type == "community" {

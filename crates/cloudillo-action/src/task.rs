@@ -111,8 +111,7 @@ pub async fn create_action_as(
 				.meta_adapter
 				.read_profile(tn_id, audience_tag)
 				.await
-				.ok()
-				.is_some_and(|(_, p)| p.following || p.connected.is_connected());
+				.is_ok_and(|(_, p)| p.following || p.connected.is_connected());
 
 			if !has_relationship {
 				return Err(Error::ValidationError(format!(

@@ -307,7 +307,7 @@ fn encode_pixmap(pixmap: &resvg::tiny_skia::Pixmap, format: ImageFormat) -> ClRe
 	// resvg produces premultiplied alpha, but image crate expects straight alpha
 	// We need to unpremultiply the alpha channel
 	let mut rgba_data = pixmap.data().to_vec();
-	for pixel in rgba_data.chunks_exact_mut(4) {
+	for pixel in rgba_data.as_chunks_mut::<4>().0 {
 		let a = f32::from(pixel[3]) / 255.0;
 		if a > 0.0 {
 			pixel[0] = f32_to_u8(f32::from(pixel[0]) / a);

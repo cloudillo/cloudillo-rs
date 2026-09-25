@@ -79,6 +79,7 @@ pub fn depth(req: &Request<Body>) -> u8 {
 
 /// Read the request body as UTF-8. Both RFC 5545 §3.1 and RFC 6350 §3.1 mandate UTF-8 for
 /// iCalendar / vCard bodies; malformed bytes are rejected rather than silently repaired.
+#[expect(clippy::result_large_err, reason = "Err is the final response, returned immediately")]
 pub async fn read_body(req: Request<Body>, log_prefix: &str) -> Result<String, Response<Body>> {
 	let bytes = to_bytes(req.into_body(), MAX_BODY_BYTES).await.map_err(|e| {
 		// `to_bytes` reports the size cap and transport failures through the same
