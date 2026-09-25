@@ -22,10 +22,10 @@ serde_json = "1"
 tracing = "0.1"
 
 # Web Push crypto (exclusive to this crate)
-ece = "2.3"
+ece = "2.4"
 p256 = { version = "0.14", features = ["pkcs8", "pem"] }
 base64 = "0.23"
-jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.1", features = ["rust_crypto"] }
 url = "2"
 
 # HTTP/2 client for push delivery
