@@ -70,6 +70,7 @@ pub(super) fn init(app: App) -> Router<App> {
 				.layer(middleware::from_fn_with_state(app.clone(), check_perm_file("read"))),
 		)
 		.merge(tables::file::list_public())
+		.merge(tables::profile::channels_public())
 		.layer(RateLimitLayer::new(limiter.clone(), "general", mode));
 
 	Router::new()

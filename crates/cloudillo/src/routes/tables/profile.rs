@@ -27,8 +27,12 @@
 //! | `/api/profiles/register`               | | `registration()` ᴿ | | | |
 //! | `/api/profiles/verify`                 | | `registration()` ᴿ | | | |
 //! | `/api/admin/profiles/{id_tag}`         | | | | `admin()` ᶜ | |
+//! | `/api/channels`                        | `channels_public()` ᴼ | `channels_admin()` ᴱ | | | |
+//! | `/api/channels/{name}`                 | | | | `channels_admin()` ᴱ | `channels_admin()` ᴱ |
+//! | `/api/channels/{name}/members`         | `channels_admin()` ᴱ | | | | |
 //!
-//! ᴳ public + rate-limited only, ᴿ public under the strict `"auth"` bucket,
+//! ᴳ public + rate-limited only, ᴼ optional auth under `"general"` — the handler filters
+//! by the reader, ᴿ public under the strict `"auth"` bucket,
 //! ᶜ auth + ABAC, ᴱ auth only — handler self-enforces, ᴾ **any valid token,
 //! scope ignored** (see [`batch`]). ᴮ carries its own body-limit layer. The guard
 //! on each fn is in `routes/protected.rs` / `routes/public.rs`.
@@ -53,7 +57,7 @@ use axum::{
 use crate::prelude::*;
 use crate::routes::policy::upload_body_limit;
 use crate::settings;
-use cloudillo_profile::{community, handler, idp_status, list, media, register, update};
+use cloudillo_profile::{channel, community, handler, idp_status, list, media, register, update};
 
 /// Profile reads, gated by `check_perm_profile("read")`.
 ///
@@ -89,6 +93,25 @@ pub(crate) fn write() -> Router<App> {
 /// subject must be captured as `{id_tag}`.
 pub(crate) fn admin() -> Router<App> {
 	Router::new().route("/api/admin/profiles/{id_tag}", patch(update::patch_profile_admin))
+}
+
+/// Channel administration — authentication only; every handler self-enforces moderator+
+/// (`cloudillo_profile::channel::require_moderator`). No `{id_tag}` capture, so the
+/// `check_perm_profile` family does not fit.
+pub(crate) fn channels_admin() -> Router<App> {
+	Router::new()
+		.route("/api/channels", post(channel::post_channel))
+		.route(
+			"/api/channels/{name}",
+			patch(channel::patch_channel).delete(channel::delete_channel),
+		)
+		.route("/api/channels/{name}/members", get(channel::list_channel_members))
+}
+
+/// The channel porch: rooms the reader may see, each with whether they can enter.
+/// Optional auth; the handler filters by visibility and computes the status.
+pub(crate) fn channels_public() -> Router<App> {
+	Router::new().route("/api/channels", get(channel::list_channels))
 }
 
 /// The caller's own profile — authentication only, no ABAC guard.

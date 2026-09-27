@@ -102,6 +102,7 @@ async fn check_file_permission(
 		&subject_id_tag,
 		&tenant_id_tag,
 		&auth_ctx.roles,
+		auth_ctx.hat.is_some(),
 		auth_ctx.scope.as_deref(),
 	)
 	.await?;
@@ -130,6 +131,7 @@ async fn check_file_permission(
 }
 
 // Load file attributes from MetaAdapter
+#[expect(clippy::too_many_arguments, reason = "permission check requires all context fields")]
 async fn load_file_attrs(
 	app: &App,
 	tn_id: TnId,
@@ -137,6 +139,7 @@ async fn load_file_attrs(
 	subject_id_tag: &str,
 	tenant_id_tag: &str,
 	subject_roles: &[Box<str>],
+	subject_hatted: bool,
 	scope: Option<&str>,
 ) -> ClResult<FileAttrs> {
 	use cloudillo_core::abac::{self, VisibilityLevel};
@@ -169,6 +172,7 @@ async fn load_file_attrs(
 		user_id_tag: subject_id_tag,
 		tenant_id_tag,
 		user_roles: subject_roles,
+		hatted: subject_hatted,
 	};
 	let access_level = file_access::get_access_level_with_scope(
 		app,

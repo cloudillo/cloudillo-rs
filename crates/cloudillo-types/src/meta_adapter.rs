@@ -654,6 +654,15 @@ pub struct ListActionOptions {
 	/// community (`hat_tag == us`) from the home feed and from everyone but the tenant.
 	#[serde(skip)]
 	pub exclude_hat_tag: Option<String>,
+	/// Channels (absolute `@tenant~name`) the reader can enter. Server-set. `None` = no
+	/// filter (the tenant itself); `Some(empty)` = open floor only.
+	#[serde(skip)]
+	pub enterable_channels: Option<Vec<Box<str>>>,
+	/// Channels the tenant muted from its unfiltered home feed. Server-set.
+	#[serde(skip)]
+	pub muted_channels: Option<Vec<Box<str>>>,
+	/// Feed filter: only actions in this channel (absolute `@tenant~name`).
+	pub channel: Option<String>,
 	/// When true, exclude actions issued by the requesting tenant (issuer == viewer).
 	/// Requires an authenticated request (viewer_id_tag set by the handler).
 	#[serde(rename = "excludeOwnIssuer")]
@@ -707,6 +716,8 @@ pub struct Action<S: AsRef<str>> {
 	pub x: Option<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
 	/// Community whose hat the issuer wore (the signed `h` claim).
 	pub hat_tag: Option<S>,
+	/// Absolute channel (`@tenant~name`); `None` = open floor.
+	pub channel: Option<S>,
 }
 
 #[skip_serializing_none]
@@ -738,6 +749,8 @@ pub struct ActionView {
 	pub subject_profile: Option<ProfileInfo>,
 	/// Community whose hat the issuer wore (`actions.hat_tag`), resolved like `issuer`.
 	pub hat: Option<ProfileInfo>,
+	/// Absolute channel (`@tenant~name`); `None` = open floor.
+	pub channel: Option<Box<str>>,
 	/// Hydrated original action referenced by `subject` (e.g. the post a REPOST
 	/// shares). Populated by the listing path for REPOST rows so the client can
 	/// render the embedded original card without a second fetch. Boxed to keep
@@ -867,6 +880,9 @@ pub struct FileView {
 	pub tags: Option<Vec<Box<str>>>,
 	#[serde(default)]
 	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
+	/// Absolute channel (`@tenant~name`); `None` = open floor.
+	#[serde(default)]
+	pub channel: Option<Box<str>>,
 	/// LEGACY: read-only flag from pre-managed-folder schema. New writes route
 	/// system-managed files into `parent_id = MANAGED_PARENT_ID` instead; the
 	/// `hidden` column is preserved only so existing rows from earlier DB
@@ -1068,6 +1084,10 @@ pub struct ListFileOptions {
 	/// Set by handler based on subject's access level via `SubjectAccessLevel::visible_levels()`.
 	#[serde(skip)]
 	pub visible_levels: Option<Vec<char>>,
+	/// Channels the reader may enter; rows in other rooms are absent. `None` = no filter.
+	/// Set by handler via `cloudillo_core::channels::enterable_channels`.
+	#[serde(skip)]
+	pub enterable_channels: Option<Vec<Box<str>>>,
 	/// Include files that belong to a document tree (`root_id IS NOT NULL`) as
 	/// well as standalone ones. Server-only: set by maintenance sweeps, never by
 	/// a request. The default listing hides tree children because a file browser
@@ -1107,6 +1127,8 @@ pub struct CreateFile {
 	pub tags: Option<Vec<Box<str>>>,
 	pub x: Option<serde_json::Value>,
 	pub visibility: Option<char>, // None: Direct (default), P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
+	/// Absolute channel (`@tenant~name`); `None` = open floor.
+	pub channel: Option<Box<str>>,
 	/// LEGACY: do not set on new rows. System-managed files should be created
 	/// with `parent_id = MANAGED_PARENT_ID` so the file GC can reap them.
 	pub hidden: bool,
@@ -1145,6 +1167,10 @@ pub struct UpdateFileOptions {
 	/// touches neither.
 	#[serde(default, skip_deserializing)]
 	pub broken: Patch<BrokenReason>,
+	/// Absolute channel (`@tenant~name`). Server-set only: stamped on attachments by
+	/// their channel action, never via PATCH.
+	#[serde(default, skip_deserializing)]
+	pub channel: Patch<String>,
 }
 
 impl UpdateFileOptions {
@@ -1166,8 +1192,10 @@ impl UpdateFileOptions {
 				&self.tags,
 				&self.parent_id,
 				&self.hidden,
+				&self.channel,
 			),
 			(
+				Patch::Undefined,
 				Patch::Undefined,
 				Patch::Undefined,
 				Patch::Undefined,
@@ -1429,6 +1457,8 @@ pub struct SearchOptions {
 	/// Visibility levels the caller may see. `None` means "everything",
 	/// including Direct (tenant owner).
 	pub visible_levels: Option<Vec<char>>,
+	/// Channels the caller may enter; hits in other rooms are absent. `None` = no filter.
+	pub enterable_channels: Option<Vec<Box<str>>>,
 	pub viewer_id_tag: Option<String>,
 	/// File-scoped token: only this file and its document tree are visible.
 	pub scope_file_id: Option<String>,
@@ -1763,6 +1793,38 @@ pub struct ListContactOptions {
 	pub limit: Option<u32>,
 }
 
+// Channels
+//***************************************************
+
+/// A named room inside a tenant. `name` is bare (the tenant is `tn_id`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Channel {
+	pub name: Box<str>,
+	pub title: Option<Box<str>>,
+	pub descr: Option<Box<str>>,
+	/// VisibilityLevel char; `None` = Direct (a secret room).
+	pub visibility: Option<char>,
+	/// Bare `ROLE_HIERARCHY` name; `None` = `public`.
+	pub min_role: Option<Box<str>>,
+	/// Closed rooms additionally require a roster row.
+	pub closed: bool,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub updated_at: Timestamp,
+}
+
+/// Partial channel update. The name is the key and never changes.
+#[derive(Debug, Default)]
+pub struct UpdateChannelData {
+	pub title: Patch<String>,
+	pub descr: Patch<String>,
+	pub visibility: Patch<char>,
+	pub min_role: Patch<String>,
+	pub closed: Patch<bool>,
+}
+
 // Calendars / Calendar Objects (CalDAV + JSON REST)
 //***************************************************
 
@@ -1945,6 +2007,10 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Unbounded (no LIMIT) — unlike `list_profiles`.
 	async fn list_follower_tags(&self, tn_id: TnId) -> ClResult<Vec<Box<str>>>;
 
+	/// `list_follower_tags` with each follower's effective roles (a follower with no
+	/// stored role reads as `["follower"]`). Channel fanout intersects on these.
+	async fn list_follower_roles(&self, tn_id: TnId) -> ClResult<Vec<(Box<str>, Box<[Box<str>]>)>>;
+
 	/// Get relationships between the current tenant and multiple target profiles.
 	/// Mind the direction of the two follow flags — `following` is "this tenant
 	/// follows the target", `follower` is "the target follows this tenant".
@@ -1986,7 +2052,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn read_profiles(&self, tn_id: TnId, id_tags: &[&str])
 	-> ClResult<Vec<PublicProfileRow>>;
 
-	/// Read profile roles for access token generation
+	/// Read profile roles for access token generation. A role-less, non-suppressed follower
+	/// reads as `["follower"]` (derived, never stored); stored roles always win.
 	async fn read_profile_roles(
 		&self,
 		tn_id: TnId,
@@ -3041,6 +3108,41 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		start: Option<Timestamp>,
 		end: Option<Timestamp>,
 	) -> ClResult<Vec<CalendarObject>>;
+
+	// Channel management
+	//*******************
+
+	/// List all channels of a tenant.
+	async fn list_channels(&self, tn_id: TnId) -> ClResult<Vec<Channel>>;
+
+	/// Read one channel by bare name. `Error::NotFound` if absent.
+	async fn read_channel(&self, tn_id: TnId, name: &str) -> ClResult<Channel>;
+
+	/// Create a channel. `created_at` / `updated_at` are stamped by the DB.
+	async fn create_channel(&self, tn_id: TnId, channel: &Channel) -> ClResult<()>;
+
+	/// Update a channel's mutable fields. `Error::NotFound` if absent.
+	async fn update_channel(
+		&self,
+		tn_id: TnId,
+		name: &str,
+		data: &UpdateChannelData,
+	) -> ClResult<()>;
+
+	/// Delete a channel and its roster rows. Entity `channel` columns stay stamped.
+	async fn delete_channel(&self, tn_id: TnId, name: &str) -> ClResult<()>;
+
+	/// Roster of a channel (id_tags).
+	async fn list_channel_members(&self, tn_id: TnId, name: &str) -> ClResult<Vec<Box<str>>>;
+
+	/// Add a roster row (idempotent).
+	async fn add_channel_member(&self, tn_id: TnId, name: &str, id_tag: &str) -> ClResult<()>;
+
+	/// Remove a roster row (no-op if absent).
+	async fn remove_channel_member(&self, tn_id: TnId, name: &str, id_tag: &str) -> ClResult<()>;
+
+	/// Bare names of the channels `id_tag` is rostered in.
+	async fn list_member_channels(&self, tn_id: TnId, id_tag: &str) -> ClResult<Vec<Box<str>>>;
 }
 
 #[cfg(test)]

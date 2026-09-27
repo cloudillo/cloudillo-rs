@@ -192,7 +192,7 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		let subs_hooks = ActionTypeHooks {
 			on_create: Some(Arc::new(|app, ctx| Box::pin(subs::on_create(app, ctx)))),
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(subs::on_receive(app, ctx)))),
-			on_accept: None,
+			on_accept: Some(Arc::new(|app, ctx| Box::pin(subs::on_accept(app, ctx)))),
 			on_reject: None,
 		};
 

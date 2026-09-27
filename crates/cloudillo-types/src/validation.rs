@@ -181,9 +181,33 @@ pub fn validate_id_tag(id_tag: &str) -> bool {
 	canonicalize_id_tag(id_tag).is_ok_and(|canonical| canonical == id_tag)
 }
 
+/// Validate a bare channel name: `[a-z0-9][a-z0-9-]*`, 1–64 chars.
+pub fn validate_channel_name(name: &str) -> bool {
+	let b = name.as_bytes();
+	(1..=64).contains(&b.len())
+		&& b.iter()
+			.enumerate()
+			.all(|(i, c)| c.is_ascii_lowercase() || c.is_ascii_digit() || (i > 0 && *c == b'-'))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_validate_channel_name() {
+		assert!(validate_channel_name("campaign"));
+		assert!(validate_channel_name("0"));
+		assert!(validate_channel_name("q3-launch"));
+		assert!(validate_channel_name(&"a".repeat(64)));
+
+		assert!(!validate_channel_name(""));
+		assert!(!validate_channel_name(&"a".repeat(65)));
+		assert!(!validate_channel_name("-club"));
+		assert!(!validate_channel_name("Club"));
+		assert!(!validate_channel_name("club_1"));
+		assert!(!validate_channel_name("a.b"));
+	}
 
 	#[test]
 	fn test_validate_id_tag() {

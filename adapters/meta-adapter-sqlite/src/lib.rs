@@ -5,6 +5,7 @@ use std::{path::Path, sync::Arc};
 
 mod action;
 mod calendar;
+mod channel;
 mod contact;
 mod doc_format;
 mod file;
@@ -34,17 +35,17 @@ use cloudillo_types::{
 	meta_adapter::{
 		Action, ActionData, ActionId, ActionView, AddressBook, Calendar, CalendarObject,
 		CalendarObjectExtracted, CalendarObjectSyncEntry, CalendarObjectView, CalendarObjectWrite,
-		Contact, ContactExtracted, ContactSyncEntry, ContactView, CreateCalendarData, CreateFile,
-		CreateRefOptions, CreateShareEntry, DeleteFileResult, DocFormat, FileId, FileUserData,
-		FileVariant, FileView, FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
-		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
-		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, Profile,
-		ProfileData, ProfileRelation, PublicProfileRow, PublishSiteDoc, PushSubscription,
+		Channel, Contact, ContactExtracted, ContactSyncEntry, ContactView, CreateCalendarData,
+		CreateFile, CreateRefOptions, CreateShareEntry, DeleteFileResult, DocFormat, FileId,
+		FileUserData, FileVariant, FileView, FinalizeActionOptions, InstallApp, InstalledApp,
+		ListActionOptions, ListCalendarObjectOptions, ListContactOptions, ListFileOptions,
+		ListProfileOptions, ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter,
+		Profile, ProfileData, ProfileRelation, PublicProfileRow, PublishSiteDoc, PushSubscription,
 		PushSubscriptionData, RefData, SearchObject, SearchOptions, SearchPart, SearchRow,
 		ShareEntry, Site, SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
-		UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData, UpdateFileOptions,
-		UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData, UpsertDocFormat,
-		UpsertProfileFields, UpsertResult, UpsertSite,
+		UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData, UpdateChannelData,
+		UpdateFileOptions, UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData,
+		UpsertDocFormat, UpsertProfileFields, UpsertResult, UpsertSite,
 	},
 	prelude::*,
 	worker::WorkerPool,
@@ -142,6 +143,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn list_follower_tags(&self, tn_id: TnId) -> ClResult<Vec<Box<str>>> {
 		profile::list_follower_tags(&self.dbr, tn_id).await
+	}
+
+	async fn list_follower_roles(&self, tn_id: TnId) -> ClResult<Vec<(Box<str>, Box<[Box<str>]>)>> {
+		profile::list_follower_roles(&self.dbr, tn_id).await
 	}
 
 	async fn get_relationships(
@@ -1013,6 +1018,50 @@ impl MetaAdapter for MetaAdapterSqlite {
 		limit: Option<u32>,
 	) -> ClResult<Vec<ContactSyncEntry>> {
 		contact::list_contacts_since(&self.dbr, tn_id, ab_id, since, limit).await
+	}
+
+	// Channel management
+	//*******************
+
+	async fn list_channels(&self, tn_id: TnId) -> ClResult<Vec<Channel>> {
+		channel::list_channels(&self.dbr, tn_id).await
+	}
+
+	async fn read_channel(&self, tn_id: TnId, name: &str) -> ClResult<Channel> {
+		channel::read_channel(&self.dbr, tn_id, name).await
+	}
+
+	async fn create_channel(&self, tn_id: TnId, input: &Channel) -> ClResult<()> {
+		channel::create_channel(&self.db, tn_id, input).await
+	}
+
+	async fn update_channel(
+		&self,
+		tn_id: TnId,
+		name: &str,
+		data: &UpdateChannelData,
+	) -> ClResult<()> {
+		channel::update_channel(&self.db, tn_id, name, data).await
+	}
+
+	async fn delete_channel(&self, tn_id: TnId, name: &str) -> ClResult<()> {
+		channel::delete_channel(&self.db, tn_id, name).await
+	}
+
+	async fn list_channel_members(&self, tn_id: TnId, name: &str) -> ClResult<Vec<Box<str>>> {
+		channel::list_channel_members(&self.dbr, tn_id, name).await
+	}
+
+	async fn add_channel_member(&self, tn_id: TnId, name: &str, id_tag: &str) -> ClResult<()> {
+		channel::add_channel_member(&self.db, tn_id, name, id_tag).await
+	}
+
+	async fn remove_channel_member(&self, tn_id: TnId, name: &str, id_tag: &str) -> ClResult<()> {
+		channel::remove_channel_member(&self.db, tn_id, name, id_tag).await
+	}
+
+	async fn list_member_channels(&self, tn_id: TnId, id_tag: &str) -> ClResult<Vec<Box<str>>> {
+		channel::list_member_channels(&self.dbr, tn_id, id_tag).await
 	}
 
 	// Calendar / calendar-object management

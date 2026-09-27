@@ -1684,7 +1684,7 @@ mod tests {
 	}
 
 	// Regression: CONV defaults to 'S'; MSG/SUBS have no own default and inherit
-	// it via `helpers::inherit_visibility`. Do not flip CONV to 'C' — see
+	// it via `helpers::inherit_context`. Do not flip CONV to 'C' — see
 	// `helpers::apply_open_flag_visibility` for why that leaks group content and
 	// the roster.
 	#[test]

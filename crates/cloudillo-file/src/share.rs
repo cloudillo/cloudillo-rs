@@ -383,6 +383,7 @@ pub async fn list_shares_by_subject(
 			user_id_tag: &auth.id_tag,
 			tenant_id_tag: &tenant_id_tag,
 			user_roles: &auth.roles,
+			hatted: auth.hat.is_some(),
 		};
 		match file_access::check_file_access_with_scope(
 			&app,

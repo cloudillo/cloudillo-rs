@@ -421,6 +421,7 @@ mod tests {
 			v: None,
 			nonce: None,
 			h: None,
+			ch: None,
 		}
 	}
 

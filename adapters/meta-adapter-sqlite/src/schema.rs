@@ -135,7 +135,7 @@ const SEARCH_FTS_TRIGGERS: [&str; 3] = [
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 54;
+	const CURRENT_DB_VERSION: i64 = 55;
 
 	let mut tx = db.begin().await?;
 
@@ -312,6 +312,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			updated_at INTEGER DEFAULT (unixepoch()),
 			broken_at INTEGER,			-- Tombstone written by the cross-context refresh endpoint
 			broken_reason TEXT,			-- BrokenReason enum: 'deleted' | 'revoked'
+			channel text,				-- Absolute channel `@tenant~name`; NULL => open floor
 			PRIMARY KEY(f_id)
 		)",
 	)
@@ -411,6 +412,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			root_id text,
 			issuer_tag text NOT NULL,
 			hat_tag text,					-- Community whose hat the issuer wore (signed `h` claim)
+			channel text,					-- Absolute channel `@tenant~name`; NULL => open floor
 			status char(1) DEFAULT 'P',		-- 'P' - Pending, 'A' - Active/finalized, 'D' - Deleted
 			audience text,
 			subject text,
@@ -934,7 +936,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			created_at INTEGER,
 			updated_at INTEGER,
 			fts_cl integer NOT NULL DEFAULT 0,
-			obj_hash text
+			obj_hash text,
+			channel text				-- Absolute channel `@tenant~name`; NULL => open floor
 		)",
 	)
 	.execute(&mut *tx)
@@ -1109,6 +1112,42 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query("CREATE INDEX IF NOT EXISTS idx_calendars_tnid ON calendars(tn_id)")
 		.execute(&mut *tx)
 		.await?;
+
+	// Channels: named rooms inside a tenant. Names are bare here (the tenant is tn_id);
+	// entity `channel` columns carry the absolute `@tenant~name` form.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS channels (
+			tn_id integer NOT NULL,
+			name text NOT NULL,
+			title text,
+			descr text,
+			visibility char(1),			-- NULL: Direct (secret room), else VisibilityLevel char
+			min_role text,				-- Bare ROLE_HIERARCHY name; NULL => public
+			closed integer NOT NULL DEFAULT 0,
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			PRIMARY KEY(tn_id, name)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	// Roster projection of signed SUBS/INVT; not the record of truth.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS channel_members (
+			tn_id integer NOT NULL,
+			channel text NOT NULL,
+			id_tag text NOT NULL,
+			added_at INTEGER DEFAULT (unixepoch()),
+			PRIMARY KEY(tn_id, channel, id_tag)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_channel_members_user ON channel_members(tn_id, id_tag)",
+	)
+	.execute(&mut *tx)
+	.await?;
 
 	// Uniqueness enforced via partial indexes below (not a table-level UNIQUE).
 	// SQLite treats NULLs in a UNIQUE index as distinct, so a plain
@@ -1380,6 +1419,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// Backs the home feed's received_at ordering + keyset cursor (migration 36).
 		sqlx::query(
 			"CREATE INDEX IF NOT EXISTS idx_actions_received ON actions(tn_id, received_at, a_id)",
+		)
+		.execute(&mut *tx)
+		.await?;
+		// Channel-scoped feed pages, same ordering as idx_actions_received (migration 55).
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_actions_channel_received \
+			 ON actions(tn_id, channel, received_at, a_id) WHERE channel IS NOT NULL",
 		)
 		.execute(&mut *tx)
 		.await?;
@@ -2552,6 +2598,21 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		add_column_if_missing(&mut tx, "profiles", "peer_hat_roles", "text").await?;
 		add_column_if_missing(&mut tx, "actions", "hat_tag", "text").await?;
 		set_db_version(&mut tx, 54).await;
+	}
+
+	if version < 55 {
+		// Channels: the channels/channel_members tables are created above; entities get a
+		// `channel` column (NULL = open floor, no backfill).
+		add_column_if_missing(&mut tx, "actions", "channel", "text").await?;
+		add_column_if_missing(&mut tx, "files", "channel", "text").await?;
+		add_column_if_missing(&mut tx, "search_docs", "channel", "text").await?;
+		sqlx::query(
+			"CREATE INDEX IF NOT EXISTS idx_actions_channel_received \
+			 ON actions(tn_id, channel, received_at, a_id) WHERE channel IS NOT NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+		set_db_version(&mut tx, 55).await;
 	}
 
 	tx.commit().await?;

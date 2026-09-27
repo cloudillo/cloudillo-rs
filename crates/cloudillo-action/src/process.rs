@@ -21,6 +21,7 @@ use crate::{
 	native_hooks::{self, ownership::owns_subject},
 	post_store::{self, ProcessingContext},
 	prelude::*,
+	subject_ref::{SubjectRef, parse_subject_ref},
 };
 
 /// Verify JWT signature with a public key
@@ -426,15 +427,17 @@ async fn process_inbound_action_token_inner(
 		return Ok(None);
 	}
 
-	// 5. Resolve visibility once for both store and processing
-	let visibility = helpers::inherit_visibility(
+	// 5. Resolve visibility and channel once for both store and processing
+	let (visibility, inherited) = helpers::inherit_context(
 		app.meta_adapter.as_ref(),
 		tn_id,
 		action.v,
+		action.ch.clone(),
 		action.p.as_deref(),
 		action.sub.as_deref(),
 	)
 	.await;
+	let channel = resolve_inbound_channel(app, tn_id, &action, inherited, via.hat_role).await?;
 
 	let resolved_visibility = if via.pre_approved {
 		visibility
@@ -483,6 +486,7 @@ async fn process_inbound_action_token_inner(
 			is_conn_action,
 			client_ip: client_ip.as_ref(),
 			visibility: resolved_visibility,
+			channel: channel.as_deref(),
 		},
 	)
 	.await?;
@@ -499,6 +503,7 @@ async fn process_inbound_action_token_inner(
 			&action.iss,
 			action.aud.as_deref(),
 			resolved_visibility,
+			channel.as_deref(),
 			attachments.clone(),
 		)
 		.await?;
@@ -528,6 +533,7 @@ async fn process_inbound_action_token_inner(
 		flags: action.f.clone(),
 		x: None,
 		hat_tag: action.h.clone(),
+		channel: channel.clone(),
 	};
 
 	// Convert attachments to AttachmentView (no dimensions for federated actions)
@@ -1045,6 +1051,114 @@ async fn check_inbound_flags(
 	Ok(())
 }
 
+/// Where an inbound action's channel puts it.
+#[derive(Debug, PartialEq, Eq)]
+enum InboundChannel<'a> {
+	/// Open floor: no channel.
+	Open,
+	/// A room we host: write-checked here.
+	Host { channel: &'a str, name: &'a str },
+	/// Another tenant's room: stored as-is.
+	Mirror(&'a str),
+}
+
+/// Classify an inbound action's channel.
+///
+/// `context` is the stored parent's (or action subject's) channel, `None` when no context is
+/// held here (a root, or a reply into a thread we do not mirror): then the signed claim stands.
+/// A held context always wins, so a reply is re-stamped to its thread's room.
+#[expect(clippy::option_option, reason = "no context held vs. an open-floor context")]
+fn classify_inbound_channel<'a>(
+	claim: Option<&'a str>,
+	context: Option<Option<&'a str>>,
+	us: &str,
+	aud: Option<&str>,
+) -> ClResult<InboundChannel<'a>> {
+	let Some(channel) = context.unwrap_or(claim) else {
+		return Ok(InboundChannel::Open);
+	};
+	let Some(SubjectRef::Channel { tenant, name }) = parse_subject_ref(channel) else {
+		return Err(Error::ValidationError("invalid channel".into()));
+	};
+	if tenant == us {
+		Ok(InboundChannel::Host { channel, name })
+	} else if aud == Some(us) {
+		Err(Error::ValidationError("channel must belong to the audience".into()))
+	} else {
+		Ok(InboundChannel::Mirror(channel))
+	}
+}
+
+/// Settle an inbound action's channel: re-stamp it to its stored context, and in a room we
+/// host require it to exist and admit the issuer (the read threshold).
+///
+/// `inherited` is `inherit_context`'s channel. The issuer's roles are its hat's mapped role
+/// when it acts under one, else its profile roles here (which carry the derived `follower`).
+async fn resolve_inbound_channel(
+	app: &App,
+	tn_id: TnId,
+	action: &ActionToken,
+	inherited: Option<Box<str>>,
+	hat_role: Option<&str>,
+) -> ClResult<Option<Box<str>>> {
+	let subject = action
+		.sub
+		.as_deref()
+		.filter(|s| matches!(parse_subject_ref(s), Some(SubjectRef::Action(_))));
+	// `inherit_context` answers `None` both for an open-floor thread and for one not held here;
+	// only the latter lets the claim stand, so look again when the difference matters.
+	let context = if action.p.is_none() && subject.is_none() {
+		None
+	} else if inherited.is_some() || action.ch.is_none() {
+		Some(inherited.as_deref())
+	} else {
+		let mut held = false;
+		for id in [action.p.as_deref(), subject].into_iter().flatten() {
+			if let Ok(Some(_)) = app.meta_adapter.get_action(tn_id, id).await {
+				held = true;
+				break;
+			}
+		}
+		held.then_some(None)
+	};
+
+	let us = app.meta_adapter.read_tenant(tn_id).await?.id_tag;
+	match classify_inbound_channel(action.ch.as_deref(), context, &us, action.aud.as_deref())? {
+		InboundChannel::Open => Ok(None),
+		InboundChannel::Mirror(channel) => Ok(Some(channel.into())),
+		InboundChannel::Host { channel, name } => {
+			match app.meta_adapter.read_channel(tn_id, name).await {
+				Err(Error::NotFound) => {
+					return Err(Error::ValidationError("unknown channel".into()));
+				}
+				r => r?,
+			};
+			let roles = match hat_role {
+				Some(role) => vec![role.into()].into_boxed_slice(),
+				None => app
+					.meta_adapter
+					.read_profile_roles(tn_id, &action.iss)
+					.await?
+					.unwrap_or_default(),
+			};
+			let enterable = cloudillo_core::channels::enterable_channels(
+				app,
+				tn_id,
+				&us,
+				&action.iss,
+				&roles,
+				action.h.is_some(),
+			)
+			.await?;
+			if enterable.is_some_and(|set| !set.iter().any(|c| c.as_ref() == channel)) {
+				warn!(issuer = %action.iss, channel = %channel, "Inbound action outside its room");
+				return Err(Error::PermissionDenied);
+			}
+			Ok(Some(channel.into()))
+		}
+	}
+}
+
 /// Context for storing an inbound action
 struct InboundActionContext<'a> {
 	tn_id: TnId,
@@ -1055,6 +1169,7 @@ struct InboundActionContext<'a> {
 	is_conn_action: bool,
 	client_ip: Option<&'a IpAddr>,
 	visibility: Option<char>,
+	channel: Option<&'a str>,
 }
 
 /// Store inbound action in database.
@@ -1099,6 +1214,7 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) -> ClRe
 		flags: action.f.as_deref(),
 		x: None,
 		hat_tag: action.h.as_deref(),
+		channel: ctx.channel,
 	};
 
 	match app.meta_adapter.create_action(ctx.tn_id, &inbound_action, key.as_deref()).await {
@@ -1182,6 +1298,7 @@ async fn process_inbound_action_attachments(
 	issuer_tag: &str,
 	audience_tag: Option<&str>,
 	visibility: Option<char>,
+	channel: Option<&str>,
 	attachments: Vec<Box<str>>,
 ) -> ClResult<()> {
 	use cloudillo_file::sync::{get_sync_source, is_audience, sync_file_variants};
@@ -1211,13 +1328,14 @@ async fn process_inbound_action_attachments(
 	// which is what excludes inbound attachments from the default file listing.
 	for attachment in attachments.iter().filter(|a| !a.is_empty()) {
 		debug!("  syncing attachment: {} from {}", attachment, source);
-		let result =
-			sync_file_variants(app, tn_id, source, attachment, None, true, visibility, sync_all)
-				.await
-				.map_err(|e| {
-					warn!("  failed to sync attachment {}: {}", attachment, e);
-					e
-				})?;
+		let result = sync_file_variants(
+			app, tn_id, source, attachment, None, true, visibility, channel, sync_all,
+		)
+		.await
+		.map_err(|e| {
+			warn!("  failed to sync attachment {}: {}", attachment, e);
+			e
+		})?;
 		total_synced += result.synced_variants.len();
 		total_skipped += result.skipped_variants.len();
 	}
@@ -1797,3 +1915,39 @@ async fn process_related_actions(
 }
 
 // vim: ts=4
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const US: &str = "host.example";
+
+	#[test]
+	fn inbound_channel_host_mirror_restamp() {
+		let ours = "@host.example~club";
+		let theirs = "@other.example~club";
+		// Open floor.
+		assert_eq!(classify_inbound_channel(None, None, US, None).ok(), Some(InboundChannel::Open));
+		// A root's claim stands: ours is hosted, another tenant's mirrored.
+		assert_eq!(
+			classify_inbound_channel(Some(ours), None, US, Some(US)).ok(),
+			Some(InboundChannel::Host { channel: ours, name: "club" })
+		);
+		assert_eq!(
+			classify_inbound_channel(Some(theirs), None, US, None).ok(),
+			Some(InboundChannel::Mirror(theirs))
+		);
+		// A held context re-stamps: the claim cannot leave an open-floor thread, nor switch rooms.
+		assert_eq!(
+			classify_inbound_channel(Some(ours), Some(None), US, None).ok(),
+			Some(InboundChannel::Open)
+		);
+		assert_eq!(
+			classify_inbound_channel(Some(theirs), Some(Some(ours)), US, Some(US)).ok(),
+			Some(InboundChannel::Host { channel: ours, name: "club" })
+		);
+		// Addressed to us but naming another tenant's room; and a malformed claim.
+		assert!(classify_inbound_channel(Some(theirs), None, US, Some(US)).is_err());
+		assert!(classify_inbound_channel(Some("@host.example~"), None, US, None).is_err());
+	}
+}

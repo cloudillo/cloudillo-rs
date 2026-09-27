@@ -88,6 +88,35 @@ pub async fn list_actions(
 		opts.exclude_hat_tag = Some(tenant_id_tag.to_string());
 	}
 
+	// Channel gate: rows in rooms the reader cannot enter are absent (None = the tenant itself).
+	let (roles, hatted): (&[Box<str>], bool) = match &maybe_auth {
+		Some(auth) => (&auth.roles[..], auth.hat.is_some()),
+		None => (&[], false),
+	};
+	opts.enterable_channels = cloudillo_core::channels::enterable_channels(
+		&app,
+		tn_id,
+		&tenant_id_tag,
+		subject_id_tag,
+		roles,
+		hatted,
+	)
+	.await?;
+	// The tenant's own mutes hide rooms from its unfiltered feed; `?channel=` bypasses them.
+	if is_tenant && opts.channel.is_none() {
+		let muted: Vec<Box<str>> = app
+			.settings
+			.list_by_prefix(tn_id, &["chan.mute".to_string()])
+			.await?
+			.into_iter()
+			.filter(|(_, v, _)| matches!(v, cloudillo_core::settings::SettingValue::Bool(true)))
+			.filter_map(|(k, _, _)| k.strip_prefix("chan.mute.").map(Box::from))
+			.collect();
+		if !muted.is_empty() {
+			opts.muted_channels = Some(muted);
+		}
+	}
+
 	let limit = opts.limit.unwrap_or(20) as usize;
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
 
@@ -330,6 +359,7 @@ pub async fn post_action(
 			user_id_tag: &auth.id_tag,
 			tenant_id_tag: &id_tag,
 			user_roles: &auth.roles,
+			hatted: auth.hat.is_some(),
 		};
 		for file_id in file_ids {
 			cloudillo_core::file_access::check_file_access_with_scope(
@@ -987,6 +1017,7 @@ pub async fn publish_draft(
 		draft: None,
 		publish_at: None,
 		hat: action.hat.as_ref().map(|h| h.id_tag.clone()),
+		channel: action.channel.clone(),
 	};
 
 	if let Some(publish_at) = req.publish_at {

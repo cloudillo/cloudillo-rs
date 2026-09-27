@@ -481,6 +481,18 @@ pub async fn get_file_list(
 		opts.hidden = None;
 	}
 
+	// Channel gate: files in rooms the reader cannot enter are absent (None = the tenant itself).
+	let hatted = maybe_auth.as_ref().is_some_and(|a| a.hat.is_some());
+	opts.enterable_channels = cloudillo_core::channels::enterable_channels(
+		&app,
+		tn_id,
+		&tenant_id_tag,
+		subject_id_tag,
+		subject_roles,
+		hatted,
+	)
+	.await?;
+
 	// Share access: bypass visibility filter when the user has a share entry
 	// on the queried folder (parentId). Per-file share checks are handled
 	// individually by get_access_level in compute_file_access_levels.
@@ -500,6 +512,8 @@ pub async fn get_file_list(
 	}
 	if inherited_share.is_some() {
 		opts.visible_levels = None;
+		// The room never gates a deliberate handoff.
+		opts.enterable_channels = None;
 	}
 
 	let limit = opts.limit.unwrap_or(30) as usize;
@@ -513,6 +527,7 @@ pub async fn get_file_list(
 		user_id_tag: subject_id_tag,
 		tenant_id_tag: &tenant_id_tag,
 		user_roles: subject_roles,
+		hatted,
 	};
 	let mut filtered =
 		filter::compute_file_access_levels(&app, tn_id, &access_ctx, inherited_share, files)
@@ -707,6 +722,8 @@ pub struct PostFileQuery {
 	tags: Option<String>,
 	/// Visibility level: P=Public, V=Verified, F=Follower, C=Connected, NULL=Direct
 	visibility: Option<char>,
+	/// Absolute channel (`@tenant~name`) the file is uploaded into.
+	channel: Option<String>,
 	/// `as=managed` routes the new file into the hidden per-tenant managed folder
 	/// (parent_id = `__managed__`). Used for system-managed uploads (action
 	/// attachments, profile/cover images) so the file GC can reap unreferenced
@@ -764,6 +781,8 @@ pub struct PostFileRequest {
 	tags: Option<String>,
 	/// Visibility level: P=Public, V=Verified, F=Follower, C=Connected, NULL=Direct
 	visibility: Option<char>,
+	/// Absolute channel (`@tenant~name`) the file is created in.
+	channel: Option<String>,
 	/// `as: "managed"` routes the new file into the hidden per-tenant managed folder.
 	/// Mirrors the `?as=managed` query param on the blob upload endpoint.
 	#[serde(rename = "as")]
@@ -1374,9 +1393,46 @@ async fn handle_post_raw_stream(
 ///   "createdAt": optional timestamp,
 ///   "tags": optional comma-separated tags
 /// }
+/// Validate an upload-time channel: a channel of this tenant that the uploader can enter.
+async fn resolve_upload_channel(
+	app: &App,
+	tn_id: TnId,
+	tenant_id_tag: &str,
+	auth: &cloudillo_types::auth_adapter::AuthCtx,
+	channel: Option<&str>,
+) -> ClResult<Option<Box<str>>> {
+	let Some(channel) = channel else {
+		return Ok(None);
+	};
+	let name = channel
+		.strip_prefix('@')
+		.and_then(|c| c.strip_prefix(tenant_id_tag))
+		.and_then(|c| c.strip_prefix('~'))
+		.filter(|n| cloudillo_types::validation::validate_channel_name(n))
+		.ok_or_else(|| Error::ValidationError("channel must be a channel of this tenant".into()))?;
+	match app.meta_adapter.read_channel(tn_id, name).await {
+		Err(Error::NotFound) => return Err(Error::ValidationError("unknown channel".into())),
+		r => r?,
+	};
+	let enterable = cloudillo_core::channels::enterable_channels(
+		app,
+		tn_id,
+		tenant_id_tag,
+		&auth.id_tag,
+		&auth.roles,
+		auth.hat.is_some(),
+	)
+	.await?;
+	if enterable.is_some_and(|set| !set.iter().any(|c| c.as_ref() == channel)) {
+		return Err(Error::PermissionDenied);
+	}
+	Ok(Some(channel.into()))
+}
+
 pub async fn post_file(
 	State(app): State<App>,
 	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	extract::Json(req): extract::Json<PostFileRequest>,
@@ -1415,6 +1471,9 @@ pub async fn post_file(
 		)
 		.await;
 	}
+
+	let channel =
+		resolve_upload_channel(&app, tn_id, &tenant_id_tag, &auth, req.channel.as_deref()).await?;
 
 	// Generate file_id
 	let file_id = utils::random_id()?;
@@ -1460,6 +1519,7 @@ pub async fn post_file(
 				created_at: req.created_at,
 				tags: req.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 				visibility,
+				channel,
 				..Default::default()
 			},
 		)
@@ -1785,6 +1845,7 @@ pub async fn refresh_file(
 		user_id_tag: &auth.id_tag,
 		tenant_id_tag: &tenant_id_tag,
 		user_roles: &auth.roles,
+		hatted: auth.hat.is_some(),
 	};
 	let existing = file_access::check_file_access_with_scope(
 		&app,
@@ -1980,6 +2041,7 @@ async fn build_dedup_response(
 pub async fn post_file_blob(
 	State(app): State<App>,
 	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	extract::Path((preset_name, file_name)): extract::Path<(String, String)>,
 	query: Query<PostFileQuery>,
@@ -2013,6 +2075,10 @@ pub async fn post_file_blob(
 		"post_file_blob: preset={}, content_type={}, root_id={:?}, parent_id={:?}",
 		preset_name, content_type, query.root_id, query.parent_id
 	);
+
+	let channel =
+		resolve_upload_channel(&app, tn_id, &tenant_id_tag, &auth, query.channel.as_deref())
+			.await?;
 
 	// Default visibility to 'C' (Connected) for community tenants
 	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
@@ -2116,6 +2182,7 @@ pub async fn post_file_blob(
 						root_id: query.root_id.clone().map(Into::into),
 						parent_id: query.effective_parent_id()?.map(Into::into),
 						visibility,
+						channel: channel.clone(),
 						..Default::default()
 					},
 				)
@@ -2160,6 +2227,7 @@ pub async fn post_file_blob(
 						root_id: query.root_id.clone().map(Into::into),
 						parent_id: query.effective_parent_id()?.map(Into::into),
 						visibility,
+						channel: channel.clone(),
 						..Default::default()
 					},
 				)
@@ -2225,6 +2293,7 @@ pub async fn post_file_blob(
 						root_id: query.root_id.clone().map(Into::into),
 						parent_id: query.effective_parent_id()?.map(Into::into),
 						visibility,
+						channel: channel.clone(),
 						..Default::default()
 					},
 				)
@@ -2307,6 +2376,7 @@ pub async fn post_file_blob(
 						root_id: query.root_id.clone().map(Into::into),
 						parent_id: query.effective_parent_id()?.map(Into::into),
 						visibility,
+						channel: channel.clone(),
 						..Default::default()
 					},
 				)
@@ -2404,6 +2474,7 @@ pub async fn post_file_blob(
 						root_id: query.root_id.clone().map(Into::into),
 						parent_id: query.effective_parent_id()?.map(Into::into),
 						visibility,
+						channel: channel.clone(),
 						..Default::default()
 					},
 				)
@@ -2481,6 +2552,7 @@ pub async fn get_file_metadata(
 				user_id_tag: &auth.id_tag,
 				tenant_id_tag: &tenant_id_tag,
 				user_roles: &auth.roles,
+				hatted: auth.hat.is_some(),
 			};
 			let level = file_access::get_access_level_with_scope(
 				&app,

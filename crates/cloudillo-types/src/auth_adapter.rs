@@ -64,6 +64,9 @@ pub struct ActionToken {
 	/// Hat - id_tag of the community whose role the issuer acts in (relayed and endorsed by it).
 	pub h: Option<Box<str>>,
 
+	/// Channel - absolute `@tenant~name` of the room the action belongs to.
+	pub ch: Option<Box<str>>,
+
 	/// Nonce - Proof-of-work nonce for rate limiting (CONN actions only).
 	#[serde(rename = "_", default, skip_serializing_if = "Option::is_none")]
 	pub nonce: Option<Box<str>>,

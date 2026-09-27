@@ -379,6 +379,7 @@ async fn test_list_actions_exclude_issuer_profile_status() {
 			flags: None,
 			x: None,
 			hat_tag: None,
+			channel: None,
 		};
 		adapter.create_action(tn_id, &action, None).await.expect("create action");
 	}
@@ -443,6 +444,7 @@ async fn test_list_actions_status_filter_active_excludes_notif_and_confirmation(
 			flags: None,
 			x: None,
 			hat_tag: None,
+			channel: None,
 		};
 		adapter.create_action(tn_id, &action, None).await.expect("create action");
 	}
@@ -525,6 +527,7 @@ async fn test_retired_invitation_excluded_from_pending_lookup() {
 		flags: None,
 		x: None,
 		hat_tag: None,
+		channel: None,
 	};
 	adapter.create_action(tn_id, &action, None).await.expect("create action");
 
@@ -621,6 +624,7 @@ async fn test_create_action_redelivered_soft_deleted_is_idempotent() {
 		flags: None,
 		x: None,
 		hat_tag: None,
+		channel: None,
 	};
 
 	// First inbound STAT for the shared key.
@@ -693,6 +697,7 @@ async fn test_get_action_by_key_skips_soft_deleted() {
 		flags: None,
 		x: None,
 		hat_tag: None,
+		channel: None,
 	};
 
 	// First inbound STAT for the shared key.
@@ -1337,6 +1342,7 @@ fn hatted_post<'a>(action_id: &'a str, issuer: &'a str, hat: Option<&'a str>) ->
 		flags: None,
 		x: None,
 		hat_tag: hat,
+		channel: None,
 	}
 }
 
@@ -1462,6 +1468,7 @@ async fn test_conn_upd_keeps_the_conn_row_and_orders_by_created_at() {
 		flags: None,
 		x: None,
 		hat_tag: None,
+		channel: None,
 	};
 	let (conn_key, upd_key) = ("CONN:alice:owner", "CONN:UPD:alice:owner");
 	adapter

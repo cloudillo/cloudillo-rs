@@ -396,6 +396,7 @@ pub async fn get_ws_rtdb(
 		user_id_tag: &user_id,
 		tenant_id_tag: &tenant_id_tag,
 		user_roles: &user_roles,
+		hatted: auth.as_ref().is_some_and(|a| a.hat.is_some()),
 	};
 	let access_result = file_access::check_file_access_with_scope(
 		&app,
@@ -531,6 +532,7 @@ pub async fn get_ws_crdt(
 		user_id_tag: &user_id,
 		tenant_id_tag: &tenant_id_tag,
 		user_roles: &user_roles,
+		hatted: auth.as_ref().is_some_and(|a| a.hat.is_some()),
 	};
 	let access_result = file_access::check_file_access_with_scope(
 		&app,

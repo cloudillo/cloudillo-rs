@@ -11,7 +11,7 @@ use cloudillo_types::meta_adapter::{
 	ProfileStatus, ProfileTrust, ProfileType, PublicProfileRow, UpsertProfileFields, UpsertResult,
 };
 use cloudillo_types::prelude::*;
-use cloudillo_types::utils::normalize_id_tag;
+use cloudillo_types::utils::{normalize_id_tag, parse_roles};
 
 /// Parse the `status` CHAR(1) column into a `ProfileStatus` value.
 fn parse_status(row: &sqlx::sqlite::SqliteRow) -> Result<Option<ProfileStatus>, sqlx::Error> {
@@ -449,24 +449,63 @@ pub(crate) async fn list_follower_tags(db: &SqlitePool, tn_id: TnId) -> ClResult
 	collect_res(rows.iter().map(|row| row.try_get::<Box<str>, _>("id_tag")))
 }
 
-/// Read profile roles for access token generation
+/// Every follower with its effective roles (same WHERE as `list_follower_tags`).
+pub(crate) async fn list_follower_roles(
+	db: &SqlitePool,
+	tn_id: TnId,
+) -> ClResult<Vec<(Box<str>, Box<[Box<str>]>)>> {
+	let rows = sqlx::query(
+		"SELECT id_tag, roles, status FROM profiles \
+		 WHERE tn_id=? AND follower=1 \
+		   AND (status IS NULL OR status NOT IN ('S','B','X'))",
+	)
+	.bind(tn_id.0)
+	.fetch_all(db)
+	.await
+	.db()?;
+	collect_res(rows.iter().map(|row| {
+		let id_tag: Box<str> = row.try_get("id_tag")?;
+		let roles: Option<String> = row.try_get("roles")?;
+		let status: Option<String> = row.try_get("status")?;
+		let roles = effective_roles(roles.as_deref(), true, status.as_deref()).unwrap_or_default();
+		Ok((id_tag, roles))
+	}))
+}
+
+/// Roles a profile holds for access purposes. Stored roles always win; a profile with none
+/// that follows the tenant and is not Suspended/Blocked/Banned reads as `["follower"]`
+/// (same status filter as `list_follower_tags`). The `follower` rung is derived, never stored.
+pub(crate) fn effective_roles(
+	roles: Option<&str>,
+	follower: bool,
+	status: Option<&str>,
+) -> Option<Box<[Box<str>]>> {
+	if let Some(roles) = roles.map(parse_roles).filter(|r| !r.is_empty()) {
+		return Some(roles);
+	}
+	(follower && !matches!(status, Some("S" | "B" | "X")))
+		.then(|| Box::from([Box::from("follower")]))
+}
+
+/// Read profile roles for access token generation (includes the derived `follower`)
 pub(crate) async fn read_roles(
 	db: &SqlitePool,
 	tn_id: TnId,
 	id_tag: &str,
 ) -> ClResult<Option<Box<[Box<str>]>>> {
 	let id_tag = normalize_id_tag(id_tag);
-	let res = sqlx::query("SELECT roles FROM profiles WHERE tn_id=? AND id_tag=?")
-		.bind(tn_id.0)
-		.bind(id_tag.as_ref())
-		.fetch_one(db)
-		.await;
+	let res =
+		sqlx::query("SELECT roles, follower, status FROM profiles WHERE tn_id=? AND id_tag=?")
+			.bind(tn_id.0)
+			.bind(id_tag.as_ref())
+			.fetch_one(db)
+			.await;
 
 	map_res(res, |row| {
-		let roles_str: Option<String> = row.try_get("roles")?;
-		Ok(roles_str.map(|s| {
-			s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
-		}))
+		let roles: Option<String> = row.try_get("roles")?;
+		let follower: bool = row.try_get::<Option<bool>, _>("follower")?.unwrap_or(false);
+		let status: Option<String> = row.try_get("status")?;
+		Ok(effective_roles(roles.as_deref(), follower, status.as_deref()))
 	})
 }
 
@@ -892,6 +931,74 @@ mod tests {
 			vec![Box::from("active.example"), Box::from("muted.example")],
 			"only active + muted followers are returned"
 		);
+	}
+
+	// `list_follower_roles` keeps `list_follower_tags`' filter and derives `follower`
+	// for a follower with no stored roles.
+	#[tokio::test]
+	async fn list_follower_roles_derives_follower() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+
+		for (tag, status, roles) in [
+			("plain.example", None, None),
+			("leader.example", None, Some("leader")),
+			("banned.example", Some("X"), Some("leader")),
+		] {
+			insert_profile(&db, tn_id, tag, "P", status).await;
+			sqlx::query("UPDATE profiles SET follower=1, roles=? WHERE tn_id=? AND id_tag=?")
+				.bind(roles)
+				.bind(tn_id.0)
+				.bind(tag)
+				.execute(&db)
+				.await
+				.expect("set follower");
+		}
+		insert_profile(&db, tn_id, "nonfollower.example", "P", None).await;
+
+		let mut rows = list_follower_roles(&db, tn_id).await.expect("list_follower_roles");
+		rows.sort();
+		let roles = |r: &[&str]| r.iter().map(|&s| Box::from(s)).collect::<Box<[Box<str>]>>();
+		assert_eq!(
+			rows,
+			vec![
+				(Box::from("leader.example"), roles(&["leader"])),
+				(Box::from("plain.example"), roles(&["follower"])),
+			]
+		);
+	}
+
+	#[test]
+	fn effective_roles_derives_follower() {
+		let roles = |r: Option<Box<[Box<str>]>>| {
+			r.map(|r| r.iter().map(ToString::to_string).collect::<Vec<_>>())
+		};
+		assert_eq!(roles(effective_roles(Some("leader"), true, None)), Some(vec!["leader".into()]));
+		assert_eq!(roles(effective_roles(None, true, None)), Some(vec!["follower".into()]));
+		assert_eq!(
+			roles(effective_roles(Some(""), true, Some("M"))),
+			Some(vec!["follower".into()])
+		);
+		assert_eq!(roles(effective_roles(None, true, Some("S"))), None);
+		assert_eq!(roles(effective_roles(None, false, None)), None);
+	}
+
+	#[tokio::test]
+	async fn read_roles_returns_derived_follower() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		insert_profile(&db, tn_id, "fan.example", "P", None).await;
+		sqlx::query("UPDATE profiles SET follower=1 WHERE tn_id=? AND id_tag=?")
+			.bind(tn_id.0)
+			.bind("fan.example")
+			.execute(&db)
+			.await
+			.expect("set follower");
+
+		let roles = read_roles(&db, tn_id, "fan.example").await.expect("read_roles");
+		assert_eq!(roles.as_deref(), Some(&[Box::from("follower")][..]));
 	}
 
 	// The v34 migration backfills `follower` from existing relationship actions:

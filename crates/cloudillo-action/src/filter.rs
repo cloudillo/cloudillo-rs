@@ -250,6 +250,7 @@ mod tests {
 			sub_level: None,
 			x: None,
 			hat: None,
+			channel: None,
 			token: None,
 		}
 	}

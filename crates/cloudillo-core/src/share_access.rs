@@ -47,7 +47,12 @@ pub async fn require_unscoped_file_access(
 		return Err(Error::PermissionDenied);
 	}
 
-	let ctx = FileAccessCtx { user_id_tag: &auth.id_tag, tenant_id_tag, user_roles: &auth.roles };
+	let ctx = FileAccessCtx {
+		user_id_tag: &auth.id_tag,
+		tenant_id_tag,
+		user_roles: &auth.roles,
+		hatted: auth.hat.is_some(),
+	};
 	// Scope `None` — scoped callers were rejected above.
 	match file_access::check_file_access_with_scope(app, tn_id, file_id, &ctx, None, None).await {
 		Err(file_access::FileAccessError::NotFound) => Err(Error::NotFound),

@@ -328,6 +328,7 @@ async fn sync_profile_pic_variant(
 		Some(&[PROFILE_PIC_VARIANT]),
 		false,
 		Some('P'),
+		None,
 		false,
 	)
 	.await?;

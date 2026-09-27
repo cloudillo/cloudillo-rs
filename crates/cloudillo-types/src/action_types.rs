@@ -39,6 +39,8 @@ pub struct CreateAction {
 	pub publish_at: Option<Timestamp>,
 	/// Hat community id_tag (signed as `h`): the action is relayed through and endorsed by it
 	pub hat: Option<Box<str>>,
+	/// Absolute channel (`@tenant~name`). Honoured only on a root; replies inherit their thread's.
+	pub channel: Option<Box<str>>,
 }
 
 /// Action status codes for tracking action lifecycle state

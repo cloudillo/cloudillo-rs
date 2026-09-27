@@ -932,7 +932,7 @@ async fn refresh_file_acl(
 		"UPDATE search_docs SET visibility = f.visibility, upstream_tag = f.upstream_tag, \
 		   root_id = CASE WHEN search_docs.obj_tp = 'D' \
 		                  THEN COALESCE(f.root_id, f.file_id) ELSE f.root_id END, \
-		   content_type = f.content_type \
+		   content_type = f.content_type, channel = f.channel \
 		 FROM files f \
 		 WHERE f.tn_id = search_docs.tn_id AND f.file_id = search_docs.obj_id \
 		   AND search_docs.tn_id = ? AND search_docs.obj_tp IN ('F','D') \
@@ -941,7 +941,8 @@ async fn refresh_file_acl(
 		     OR search_docs.upstream_tag IS NOT f.upstream_tag \
 		     OR search_docs.root_id IS NOT (CASE WHEN search_docs.obj_tp = 'D' \
 		          THEN COALESCE(f.root_id, f.file_id) ELSE f.root_id END) \
-		     OR search_docs.content_type IS NOT f.content_type)",
+		     OR search_docs.content_type IS NOT f.content_type \
+		     OR search_docs.channel IS NOT f.channel)",
 	)
 	.bind(tn_id.0)
 	.bind(file_id)
@@ -1389,7 +1390,40 @@ fn push_search_filters(
 		query.push(")");
 	}
 
+	// Channel gate. File rows carry the room in `d.channel` (via `refresh_file_acl`); actions
+	// are gated on the live `actions` row, as their visibility is above. The share grant is
+	// exempt: the room never gates a deliberate handoff.
+	if let Some(enterable) = &opts.enterable_channels {
+		query.push(" AND (d.obj_tp='P' OR (d.obj_tp IN ('F','D') AND (");
+		push_channel_in(query, "d.channel", enterable);
+		if let Some(grant) = opts.scope_grant_file_id.as_deref() {
+			query.push(" OR d.obj_id=").push_bind(grant.to_owned());
+			query.push(" OR (d.root_id=").push_bind(grant.to_owned());
+			query.push(" AND d.obj_tp='D')");
+		}
+		query.push(
+			")) OR (d.obj_tp='A' AND EXISTS (SELECT 1 FROM actions a \
+			 WHERE a.tn_id=d.tn_id AND a.action_id=d.obj_id AND ",
+		);
+		push_channel_in(query, "a.channel", enterable);
+		query.push(")))");
+	}
+
 	Ok(())
+}
+
+/// `(<col> IS NULL OR <col> IN (:enterable))`; an empty set leaves the open floor only.
+fn push_channel_in(query: &mut QueryBuilder<Sqlite>, col: &str, enterable: &[Box<str>]) {
+	if enterable.is_empty() {
+		query.push(format!("{col} IS NULL"));
+		return;
+	}
+	query.push(format!("({col} IS NULL OR {col} IN ("));
+	let mut sep = query.separated(", ");
+	for c in enterable {
+		sep.push_bind(c.to_string());
+	}
+	sep.push_unseparated("))");
 }
 
 /// Which FTS table a tenant's rows are in. A selected name rather than two copies

@@ -276,9 +276,23 @@ pub async fn get_search(
 	// guest resolves to the tenant's own id_tag, and handing that to the adapter
 	// as the viewer would match every row the tenant owns. `None` is an
 	// unidentified viewer.
-	opts.viewer_id_tag =
-		(!is_anonymous_share(auth.scope.as_deref(), subject, tenant_id_tag.as_ref()))
-			.then(|| subject.to_owned());
+	let anonymous_share =
+		is_anonymous_share(auth.scope.as_deref(), subject, tenant_id_tag.as_ref());
+	opts.viewer_id_tag = (!anonymous_share).then(|| subject.to_owned());
+
+	// Channel gate. A share-link guest carries the tenant's own id_tag, which would read as
+	// "no filter", so it is gated as a plain guest; the shared tree itself is exempt in SQL.
+	let (reader, roles): (&str, &[Box<str>]) =
+		if anonymous_share { ("guest", &[]) } else { (subject, &auth.roles[..]) };
+	opts.enterable_channels = cloudillo_core::channels::enterable_channels(
+		&app,
+		tn_id,
+		&tenant_id_tag,
+		reader,
+		roles,
+		auth.hat.is_some(),
+	)
+	.await?;
 
 	// Applied before the scope narrowing below, so a file scope still narrows on
 	// top of it.

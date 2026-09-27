@@ -407,6 +407,7 @@ pub async fn duplicate_file(
 		user_id_tag: &auth.id_tag,
 		tenant_id_tag: &tenant_id_tag,
 		user_roles: &auth.roles,
+		hatted: auth.hat.is_some(),
 	};
 	let access = file_access::check_file_access_with_scope(
 		&app,

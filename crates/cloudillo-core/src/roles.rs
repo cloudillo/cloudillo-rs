@@ -39,6 +39,9 @@ pub fn is_moderator(roles: &[Box<str>]) -> bool {
 	highest_role_level(roles) >= MODERATOR_LEVEL
 }
 
+/// Hierarchy level of the "follower" role — derived for every role-less follower, so it
+/// counts as membership nowhere; "a real role" means strictly above it.
+pub const FOLLOWER_LEVEL: usize = 1;
 /// Hierarchy level of the "contributor" role, the floor for writing as a hatted member.
 pub const CONTRIBUTOR_LEVEL: usize = 3;
 /// Lowest hierarchy level permitted to manage (remove / re-role) other members.
@@ -46,7 +49,8 @@ pub const MODERATOR_LEVEL: usize = 4;
 /// Hierarchy level of the "leader" role.
 pub const LEADER_LEVEL: usize = 5;
 
-/// A member's highest real role, or `None` when absent, role-less or access-restricted.
+/// A member's highest real role, or `None` when absent, role-less, a mere follower or
+/// access-restricted.
 ///
 /// Checked for a real role before `highest_role_level`, which reads "none" as public.
 pub async fn active_member_role(
@@ -61,7 +65,7 @@ pub async fn active_member_role(
 		Err(e) => return Err(e),
 	}
 	let roles = match app.meta_adapter.read_profile_roles(tn_id, member).await {
-		Ok(Some(roles)) if roles.iter().any(|r| role_level(r).is_some()) => roles,
+		Ok(Some(roles)) if highest_role_level(&roles) > FOLLOWER_LEVEL => roles,
 		Ok(_) | Err(Error::NotFound) => return Ok(None),
 		Err(e) => return Err(e),
 	};
@@ -102,6 +106,7 @@ mod tests {
 
 	#[test]
 	fn test_level_consts_match_hierarchy() {
+		assert_eq!(role_level("follower"), Some(FOLLOWER_LEVEL));
 		assert_eq!(role_level("contributor"), Some(CONTRIBUTOR_LEVEL));
 		assert_eq!(role_level("moderator"), Some(MODERATOR_LEVEL));
 		assert_eq!(role_level("leader"), Some(LEADER_LEVEL));

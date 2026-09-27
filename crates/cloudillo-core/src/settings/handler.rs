@@ -422,10 +422,11 @@ const PROFILE_SETTING_MAX_VALUE_BYTES: usize = 8 * 1024;
 /// `share_access::require_unscoped_file_access`); a bare owner check would hand its holder
 /// the tenant owner's settings on a personal tenant.
 ///
-/// The owner test also requires that the caller carries *any* role at all. An `idp_`
+/// The owner test also requires a role above `follower` (the derived rung every role-less
+/// follower carries, alongside `public`, is not membership). An `idp_`
 /// management key carries the identity's own `id_tag` with `roles: []`
 /// (`middleware::authenticate`), so the id_tag match alone would hand it every one of that
-/// identity's profile settings. "Any role" keeps that key out while still admitting an
+/// identity's profile settings. "Above follower" keeps that key out while still admitting an
 /// ordinary community member, who holds `contributor`/`moderator` and never `leader`.
 ///
 /// Both sides are compared raw, and both are canonical by construction: `auth.id_tag` comes
@@ -435,7 +436,8 @@ const PROFILE_SETTING_MAX_VALUE_BYTES: usize = 8 * 1024;
 /// `cloudillo_types::utils::normalize_id_tag`.
 pub fn may_access_profile_settings(auth: &AuthCtx, id_tag: &str) -> bool {
 	auth.scope.is_none()
-		&& ((auth.id_tag.as_ref() == id_tag && !auth.roles.is_empty())
+		&& ((auth.id_tag.as_ref() == id_tag
+			&& crate::roles::highest_role_level(&auth.roles) > crate::roles::FOLLOWER_LEVEL)
 			|| crate::abac::is_admin(auth))
 }
 
@@ -608,6 +610,8 @@ mod tests {
 		// A role-less principal on the target's own id_tag is an `idp_` management key, not
 		// the profile — it must not read or overwrite that identity's settings.
 		assert!(!may_access_profile_settings(&auth(target, &[], None), target));
+		// Nor is a plain follower, whose token carries the derived `public,follower`.
+		assert!(!may_access_profile_settings(&auth(target, &["public", "follower"], None), target));
 
 		// A non-canonical `auth.id_tag` is still a miss: that value comes from a minted
 		// token and is canonical by construction, so a mismatch means something upstream

@@ -84,6 +84,7 @@ pub async fn get_container_content(
 			user_id_tag: &subject_id_tag,
 			tenant_id_tag: &tenant_id_tag,
 			user_roles: &auth_ctx.roles,
+			hatted: auth_ctx.hat.is_some(),
 		};
 		let access_level = file_access::get_access_level_with_scope(
 			&app,

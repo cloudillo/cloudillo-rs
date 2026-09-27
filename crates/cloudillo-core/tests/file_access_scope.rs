@@ -584,7 +584,9 @@ fn any_role_reaches_a_locally_originating_row() {
 		("leader", AccessLevel::Admin),
 		("moderator", AccessLevel::Write),
 		("contributor", AccessLevel::Write),
-		("follower", AccessLevel::Read),
+		("supporter", AccessLevel::Read),
+		// `follower` is derived for every plain follower, so it must grant nothing here
+		("follower", AccessLevel::None),
 	] {
 		assert_eq!(file_access::role_access_level(&roles(&[role])), want, "{role}");
 	}

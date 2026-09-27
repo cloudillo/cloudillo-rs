@@ -3,6 +3,7 @@
 
 //! Profile subsystem. Manages profile information, profile sync, etc.
 
+pub mod channel;
 pub mod community;
 pub mod handler;
 pub mod idp_status;

@@ -41,6 +41,8 @@ pub struct FileAccessCtx<'a> {
 	pub user_id_tag: &'a str,
 	pub tenant_id_tag: &'a str,
 	pub user_roles: &'a [Box<str>],
+	/// The subject wears a hat (`AuthCtx.hat.is_some()`), which bypasses closed-room rosters.
+	pub hatted: bool,
 }
 
 /// The object side of a file access check: which row, plus its two ownership facts.
@@ -55,6 +57,8 @@ pub struct FileRef<'a> {
 	/// owner shortcut and role access below. Never falls back to the tenant.
 	pub upstream_id_tag: Option<&'a str>,
 	pub file_id: &'a str,
+	/// Absolute channel (`@tenant~name`); `None` = open floor. Gates only the ambient rungs.
+	pub channel: Option<&'a str>,
 }
 
 impl<'a> FileRef<'a> {
@@ -78,6 +82,7 @@ impl<'a> FileRef<'a> {
 			owner_id_tag: tag(view.owner.as_ref()).unwrap_or(tenant_id_tag),
 			upstream_id_tag: tag(view.upstream.as_ref()),
 			file_id: &view.file_id,
+			channel: view.channel.as_deref(),
 		}
 	}
 }
@@ -232,6 +237,10 @@ pub async fn check_share_for_file(
 /// non-empty": a `[""]` slice reads as "has a role" and would hand every
 /// federated stranger Read access. Second defence behind `roles::parse_roles`,
 /// which drops empty segments.
+///
+/// `public` and `follower` grant nothing: every role-less follower reads back as `follower`
+/// (derived in the meta adapter), and this tier ignores visibility, so counting it would
+/// hand every follower Read on every local file, Direct ones included.
 pub fn role_access_level(user_roles: &[Box<str>]) -> AccessLevel {
 	// A leader resolves to `Admin`, not `Write`: leadership over a local file *is* the right
 	// to manage its share set, so `access_level` alone answers "may manage shares".
@@ -241,13 +250,43 @@ pub fn role_access_level(user_roles: &[Box<str>]) -> AccessLevel {
 	if user_roles.iter().any(|r| matches!(r.as_ref(), "moderator" | "contributor")) {
 		return AccessLevel::Write;
 	}
-	if user_roles
-		.iter()
-		.any(|r| matches!(r.as_ref(), "public" | "follower" | "supporter"))
-	{
+	// Not `public` / `follower`: see the doc comment (derived follower rung).
+	if user_roles.iter().any(|r| r.as_ref() == "supporter") {
 		return AccessLevel::Read;
 	}
 	AccessLevel::None
+}
+
+/// Whether a file in `channel` is within the subject's ambient reach: open floor always is,
+/// a room only when the subject can enter it. Fails closed on a lookup error.
+async fn channel_admits(
+	app: &App,
+	tn_id: TnId,
+	channel: Option<&str>,
+	ctx: &FileAccessCtx<'_>,
+) -> bool {
+	let Some(channel) = channel else { return true };
+	match crate::channels::enterable_channels(
+		app,
+		tn_id,
+		ctx.tenant_id_tag,
+		ctx.user_id_tag,
+		ctx.user_roles,
+		ctx.hatted,
+	)
+	.await
+	{
+		Ok(set) => channel_in(channel, set.as_deref()),
+		Err(e) => {
+			warn!("enterable_channels failed, denying ambient file access: {}", e);
+			false
+		}
+	}
+}
+
+/// `None` = the tenant itself, unrestricted.
+fn channel_in(channel: &str, enterable: Option<&[Box<str>]>) -> bool {
+	enterable.is_none_or(|set| set.iter().any(|c| c.as_ref() == channel))
 }
 
 /// Resolve the grant an `FSHR:{file_id}:{audience}` action row carries: `ADMIN` → Admin, `WRITE` →
@@ -309,7 +348,7 @@ fn fshr_grant_level(
 /// 2. Direct `share_entries` grant on this file, then the caller-supplied `inherited_share`, then a
 ///    parent-chain walk for a folder-inherited grant
 /// 3. Role-based access — any locally originating row (`upstream_id_tag` is `None`): leader →
-///    Admin, moderator/contributor → Write, any role → Read. `role_access_level` ignores
+///    Admin, moderator/contributor → Write, supporter → Read. `role_access_level` ignores
 ///    `visibility`, so this deliberately reaches a peer member's own upload too.
 /// 4. FSHR action issued by the row's upstream source — ADMIN → Admin, WRITE → Write, COMMENT → Comment,
 ///    DEL → None (a revocation is not a grant), other sub-types → Read (see [`fshr_grant_level`])
@@ -323,7 +362,7 @@ pub async fn get_access_level(
 	ctx: &FileAccessCtx<'_>,
 	inherited_share: Option<AccessLevel>,
 ) -> AccessLevel {
-	let FileRef { file_id, owner_id_tag, upstream_id_tag } = file;
+	let FileRef { file_id, owner_id_tag, upstream_id_tag, channel } = file;
 	// The owner is the file's admin: write plus share management. Callers must test
 	// `can_write()`/`can_manage_shares()` rather than `== AccessLevel::Write`.
 	//
@@ -371,7 +410,8 @@ pub async fn get_access_level(
 	} else {
 		AccessLevel::None
 	};
-	if role_level != AccessLevel::None {
+	// The room governs ambient reach: a role grants nothing inside a room it cannot enter.
+	if role_level != AccessLevel::None && channel_admits(app, tn_id, channel, ctx).await {
 		return role_level;
 	}
 
@@ -568,6 +608,12 @@ pub async fn check_file_access_with_scope(
 	let mut access_level =
 		get_access_level_with_scope(app, tn_id, file_ref, ctx, scope, file_view.root_id.as_deref())
 			.await;
+
+	// Everything below is ambient reach, which the room governs. The grants above are not.
+	if access_level == AccessLevel::None && !channel_admits(app, tn_id, file_ref.channel, ctx).await
+	{
+		return Err(FileAccessError::AccessDenied);
+	}
 
 	// Public files are readable by anyone (including unauthenticated guests).
 	// Deliberately scope-agnostic and separate from the ladder below: a scoped
@@ -784,8 +830,10 @@ mod tests {
 
 	#[test]
 	fn role_access_level_maps_community_roles() {
-		assert_eq!(role_access_level(&["public".into()]), AccessLevel::Read);
-		assert_eq!(role_access_level(&["follower".into()]), AccessLevel::Read);
+		// A derived follower (expanded to public+follower) gets no file access.
+		assert_eq!(role_access_level(&["public".into()]), AccessLevel::None);
+		assert_eq!(role_access_level(&["follower".into()]), AccessLevel::None);
+		assert_eq!(role_access_level(&["public".into(), "follower".into()]), AccessLevel::None);
 		assert_eq!(role_access_level(&["supporter".into()]), AccessLevel::Read);
 		assert_eq!(role_access_level(&["contributor".into()]), AccessLevel::Write);
 		assert_eq!(role_access_level(&["moderator".into()]), AccessLevel::Write);
@@ -797,6 +845,16 @@ mod tests {
 			AccessLevel::Admin
 		);
 		assert_eq!(role_access_level(&["public".into(), "contributor".into()]), AccessLevel::Write);
+	}
+
+	#[test]
+	fn channel_gate_only_admits_enterable_rooms() {
+		let set: &[Box<str>] = &["@t.example~open".into()];
+		assert!(channel_in("@t.example~open", Some(set)));
+		assert!(!channel_in("@t.example~closed", Some(set)));
+		assert!(!channel_in("@t.example~open", Some(&[])));
+		// The tenant itself is unrestricted.
+		assert!(channel_in("@t.example~closed", None));
 	}
 
 	/// The node an FSHR-accepted row is mirrored from — `files.upstream_tag`, not its owner.

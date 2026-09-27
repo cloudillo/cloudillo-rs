@@ -497,6 +497,7 @@ async fn validated_scope(
 	tenant_id_tag: &str,
 	caller_id_tag: &str,
 	caller_roles: &[Box<str>],
+	caller_hatted: bool,
 	requested: Option<&str>,
 ) -> ClResult<Option<String>> {
 	use cloudillo_core::file_access::{self, FileAccessCtx};
@@ -523,6 +524,7 @@ async fn validated_scope(
 				user_id_tag: caller_id_tag,
 				tenant_id_tag,
 				user_roles: caller_roles,
+				hatted: caller_hatted,
 			};
 			let result =
 				file_access::check_file_access_with_scope(app, tn_id, &file_id, &ctx, None, None)
@@ -622,6 +624,7 @@ pub async fn get_access_token(
 				user_id_tag: &auth.id_tag,
 				tenant_id_tag: &id_tag.0,
 				user_roles: &auth.roles,
+				hatted: auth.hat.is_some(),
 			};
 			match file_access::check_file_access_with_scope(
 				&app,
@@ -835,6 +838,7 @@ pub async fn get_access_token(
 			&id_tag.0,
 			&auth_action.iss,
 			&caller_roles,
+			hat.is_some(),
 			query.scope.as_deref(),
 		)
 		.await?;
@@ -1031,6 +1035,7 @@ pub async fn get_access_token(
 			&id_tag.0,
 			&auth.id_tag,
 			&caller_roles,
+			auth.hat.is_some(),
 			query.scope.as_deref(),
 		)
 		.await?;

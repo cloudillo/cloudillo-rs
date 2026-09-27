@@ -67,7 +67,12 @@ pub async fn schedule_subscriber_fanout(
 		if deliver_subject {
 			match parse_subject_ref(subject_ref) {
 				Some(SubjectRef::Action(_)) => Some(subject_ref.into()),
-				_ => None,
+				Some(
+					SubjectRef::Identity(_)
+					| SubjectRef::Placeholder(_)
+					| SubjectRef::Channel { .. },
+				)
+				| None => None,
 			}
 		} else {
 			None

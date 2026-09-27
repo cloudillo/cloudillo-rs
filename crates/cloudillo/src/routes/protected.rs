@@ -120,6 +120,8 @@ pub(super) fn init(app: App) -> Router<App> {
 			tables::profile::admin()
 				.layer(middleware::from_fn_with_state(app.clone(), check_perm_profile("admin"))),
 		)
+		// Auth only — handlers self-enforce moderator+
+		.merge(tables::profile::channels_admin())
 		.merge(
 			tables::admin::tenant()
 				.layer(middleware::from_fn_with_state(app.clone(), admin::perm::require_admin)),

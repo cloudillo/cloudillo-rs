@@ -12,6 +12,7 @@ pub mod acme;
 pub mod app;
 pub mod bootstrap_types;
 pub mod bundled_apps;
+pub mod channels;
 pub mod core_settings;
 pub mod create_perm;
 pub mod dir_cache;

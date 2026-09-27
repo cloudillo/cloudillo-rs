@@ -7,7 +7,7 @@
 //! - on_create: resolves the invite target; community-membership authorization runs pre-store
 //!   on the community's own side (see `check_community_authority`)
 //! - on_receive: Notifies invitee about the invitation (status='C')
-//! - on_accept: Creates SUBS action when invitation is accepted
+//! - on_accept: Creates SUBS action when invitation is accepted (to the host, for a channel)
 //! - Subtypes:
 //!   - DEL: Revoke invitation
 
@@ -23,11 +23,39 @@ use cloudillo_types::meta_adapter::{ProfileConnectionStatus, UpsertProfileFields
 /// Extract the community id_tag from an identity-typed subject string.
 ///
 /// Identity subjects are always `@<id_tag>`; bare-id_tag subjects are not
-/// supported. Returns `None` for placeholder/action subjects.
+/// supported. Returns `None` for placeholder/action/channel subjects.
 fn community_id_tag_from_subject(subject: &str) -> Option<&str> {
 	match parse_subject_ref(subject) {
 		Some(SubjectRef::Identity(id_tag)) => Some(id_tag),
-		_ => None,
+		Some(SubjectRef::Action(_) | SubjectRef::Placeholder(_) | SubjectRef::Channel { .. })
+		| None => None,
+	}
+}
+
+/// The tenant whose membership an INVT subject grants: the community itself (`@<id_tag>`) or
+/// the channel's host (`@<tenant>~<name>`). `None` for action / placeholder subjects.
+fn membership_host_from_subject(subject: &str) -> Option<&str> {
+	match parse_subject_ref(subject) {
+		Some(SubjectRef::Identity(id_tag)) => Some(id_tag),
+		Some(SubjectRef::Channel { tenant, .. }) => Some(tenant),
+		Some(SubjectRef::Action(_) | SubjectRef::Placeholder(_)) | None => None,
+	}
+}
+
+/// Where an accepted INVT goes on the invitee's node. A channel subject must never reach
+/// [`on_accept_community`]: that sends a CONN, while a channel needs a SUBS to its host.
+#[derive(Debug, PartialEq, Eq)]
+enum AcceptRoute<'a> {
+	Community,
+	Channel { host: &'a str },
+	Action,
+}
+
+fn accept_route(subject: &str) -> AcceptRoute<'_> {
+	match parse_subject_ref(subject) {
+		Some(SubjectRef::Identity(_)) => AcceptRoute::Community,
+		Some(SubjectRef::Channel { tenant, .. }) => AcceptRoute::Channel { host: tenant },
+		Some(SubjectRef::Action(_) | SubjectRef::Placeholder(_)) | None => AcceptRoute::Action,
 	}
 }
 
@@ -65,18 +93,18 @@ fn community_revoke_allowed(
 	is_moderator || original_invt_issuer == Some(issuer)
 }
 
-/// The issuer of the active community invitation on record for `invitee`, if any.
-/// `exclude_sub_typ` filters to bare INVTs in SQL, so the `LIMIT` cannot hide the row
-/// behind `INVT:DEL`s.
+/// The issuer of the active invitation to `subject` (a community or channel) on record for
+/// `invitee`, if any. `exclude_sub_typ` filters to bare INVTs in SQL, so the `LIMIT` cannot
+/// hide the row behind `INVT:DEL`s.
 async fn pending_invitation_issuer(
 	app: &App,
 	tn_id: TnId,
-	community_tag: &str,
+	subject: &str,
 	invitee: &str,
 ) -> Option<Box<str>> {
 	let opts = cloudillo_types::meta_adapter::ListActionOptions {
 		typ: Some(vec!["INVT".to_string()]),
-		subject: Some(vec![format!("@{}", community_tag)]),
+		subject: Some(vec![subject.to_string()]),
 		audience: Some(invitee.to_string()),
 		status: Some(vec!["A".to_string()]),
 		exclude_sub_typ: Some(Box::new(["DEL".into()])),
@@ -103,18 +131,19 @@ fn community_invt_subtype_known(subtype: Option<&str>) -> bool {
 	matches!(subtype, None | Some("DEL"))
 }
 
-/// Whether an action is a community-membership INVT addressed to *this* tenant — the only case
-/// [`check_community_authority`] gates.
+/// Whether an action is a membership INVT for *this* tenant — to the community itself or to one
+/// of the channels it hosts. The only case [`check_community_authority`] gates.
 ///
 /// A raw compare, and safe as one: `helpers::check_subject_field` rejects a non-canonical
 /// identity subject at both boundaries, so `@Club.Example.COM` never reaches storage.
 fn is_community_invt(action_type: &str, subject: Option<&str>, tenant_tag: &str) -> bool {
 	let (base_type, _) = helpers::extract_type_and_subtype(action_type);
-	base_type == "INVT" && subject.and_then(community_id_tag_from_subject) == Some(tenant_tag)
+	base_type == "INVT" && subject.and_then(membership_host_from_subject) == Some(tenant_tag)
 }
 
-/// Community-membership INVT / INVT:DEL authorization. A no-op for everything but an
-/// identity-subject INVT addressed to this very tenant.
+/// Membership INVT / INVT:DEL authorization. A no-op for everything but an INVT to this very
+/// tenant or to a channel it hosts — both follow the same rules (moderator+ invites; the
+/// original inviter or a moderator revokes).
 ///
 /// `actor` is who asserts the authority — the token's `iss` inbound, `auth.id_tag` outbound.
 /// Deliberately NOT the stored `issuer_tag`: outbound that is the tenant's own id_tag, which
@@ -137,9 +166,9 @@ pub(crate) async fn check_community_authority(
 	actor: &str,
 ) -> ClResult<()> {
 	let (typ, sub_typ) = typ;
-	if !is_community_invt(typ, subject, tenant_tag) {
+	let Some(subject) = subject.filter(|_| is_community_invt(typ, subject, tenant_tag)) else {
 		return Ok(());
-	}
+	};
 	let (_, embedded) = helpers::extract_type_and_subtype(typ);
 	let subtype = sub_typ.map(str::to_owned).or(embedded);
 
@@ -160,7 +189,7 @@ pub(crate) async fn check_community_authority(
 		// what keeps the since-demoted inviter's own withdrawal working.
 		Some("DEL") => {
 			let invitee = audience.unwrap_or_default();
-			let original = pending_invitation_issuer(app, tn_id, tenant_tag, invitee).await;
+			let original = pending_invitation_issuer(app, tn_id, subject, invitee).await;
 			let is_mod = issuer_may_invite(app, tn_id, actor, tenant_tag).await;
 			community_revoke_allowed(actor, original.as_deref(), is_mod)
 		}
@@ -219,8 +248,17 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 
 	// Identity subjects (`@<id_tag>`) route to the community-membership
 	// branch. Anything else is required to resolve to a known action.
-	if matches!(parse_subject_ref(subject_id), Some(SubjectRef::Identity(_))) {
-		return on_create_community(&context, subject_id).await;
+	match parse_subject_ref(subject_id) {
+		Some(SubjectRef::Identity(_)) => return on_create_community(&context, subject_id).await,
+		// Like the community branch, authority is the host's, decided pre-store. What is left is
+		// the effect of an already-authorized revocation created on the host itself.
+		Some(SubjectRef::Channel { tenant, name }) => {
+			if tenant == &*context.tenant_tag && context.subtype.as_deref() == Some("DEL") {
+				remove_invitee_from_channel(&app, tn_id, name, audience).await;
+			}
+			return Ok(HookResult::default());
+		}
+		Some(SubjectRef::Action(_) | SubjectRef::Placeholder(_)) | None => {}
 	}
 
 	// Get the target action
@@ -290,6 +328,14 @@ async fn on_create_community(context: &HookContext, subject_id: &str) -> ClResul
 	Ok(HookResult::default())
 }
 
+/// The effect of an authorized channel `INVT:DEL` at the host: the invitee leaves the roster.
+/// Idempotent, so a revocation of a never-accepted invitation costs nothing.
+async fn remove_invitee_from_channel(app: &App, tn_id: TnId, name: &str, invitee: &str) {
+	if let Err(e) = app.meta_adapter.remove_channel_member(tn_id, name, invitee).await {
+		warn!("INVT:DEL: failed to remove {} from channel {}: {}", invitee, name, e);
+	}
+}
+
 /// INVT on_receive hook - Handle invitation receipt
 ///
 /// Logic:
@@ -310,6 +356,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 	// the invitee. For action subjects, the home is the action's issuer.
 	// For identity subjects, the home is the identity itself.
 	let mut is_community_home = false;
+	let mut home_channel: Option<&str> = None;
 	let is_conv_home = if let Some(ref subject_id) = context.subject {
 		let tenant_id_tag = app.meta_adapter.read_tenant(tn_id).await.ok().map(|t| t.id_tag);
 		match (parse_subject_ref(subject_id), tenant_id_tag) {
@@ -324,6 +371,13 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				.ok()
 				.flatten()
 				.is_some_and(|sa| sa.issuer.id_tag.as_ref() == tenant.as_ref()),
+			// The channel's host is the home; `check_inbound` authorized it pre-store.
+			(Some(SubjectRef::Channel { tenant: host, name }), Some(tenant)) => {
+				if host == tenant.as_ref() {
+					home_channel = Some(name);
+				}
+				home_channel.is_some()
+			}
 			_ => false,
 		}
 	} else {
@@ -347,6 +401,12 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			context.audience.as_deref().unwrap_or_default(),
 		)
 		.await;
+	}
+	if let Some(name) = home_channel
+		&& context.subtype.as_deref() == Some("DEL")
+	{
+		let invitee = context.audience.as_deref().unwrap_or_default();
+		remove_invitee_from_channel(&app, tn_id, name, invitee).await;
 	}
 
 	// Resting status is declared here and written once by the post-store
@@ -413,9 +473,28 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 
 	info!("INVT: {} accepted invitation from {} to join {}", audience, context.issuer, subject);
 
-	// Identity subjects route straight to the community-membership branch.
-	if matches!(parse_subject_ref(subject), Some(SubjectRef::Identity(_))) {
-		return on_accept_community(&app, &context, subject, audience).await;
+	match accept_route(subject) {
+		AcceptRoute::Community => {
+			return on_accept_community(&app, &context, subject, audience).await;
+		}
+		// Knock on the host with a SUBS. No local roster write — that would be cross-tenant:
+		// the host's `subs::on_receive` finds its stored INVT and writes the row itself.
+		AcceptRoute::Channel { host } => {
+			let subs_action = CreateAction {
+				typ: "SUBS".into(),
+				audience_tag: Some(host.into()),
+				subject: Some(subject.into()),
+				..Default::default()
+			};
+			if let Err(e) = create_action(&app, tn_id, audience, subs_action).await {
+				error!(
+					"INVT: Failed to create channel SUBS for {} on {}: {}",
+					audience, subject, e
+				);
+			}
+			return Ok(HookResult::default());
+		}
+		AcceptRoute::Action => {}
 	}
 
 	// Get the target action to find its owner. If the subject does not
@@ -569,6 +648,41 @@ mod tests {
 		assert!(!is_community_invt("INVT", Some("a1~abc"), "club.example.com"));
 		assert!(!is_community_invt("INVT", None, "club.example.com"));
 		assert!(!is_community_invt("CONN", Some("@club.example.com"), "club.example.com"));
+
+		// A channel we host is gated like the community itself; another tenant's channel is
+		// the invitee's copy or outbound, and not ours to judge.
+		assert!(is_community_invt("INVT", Some("@club.example.com~crew"), "club.example.com"));
+		assert!(is_community_invt("INVT:DEL", Some("@club.example.com~crew"), "club.example.com"));
+		assert!(!is_community_invt("INVT", Some("@other.example.com~crew"), "club.example.com"));
+		assert!(!is_community_invt("SUBS", Some("@club.example.com~crew"), "club.example.com"));
+	}
+
+	/// `check_community_authority`'s two halves for a channel we host: it is gated, and only
+	/// a moderator (or the host itself) passes the invite rule.
+	#[test]
+	fn a_channel_invt_needs_a_moderator_of_the_host() {
+		let (host, subject) = ("club.example.com", "@club.example.com~crew");
+		assert!(is_community_invt("INVT", Some(subject), host));
+		assert_eq!(membership_host_from_subject(subject), Some(host));
+
+		assert!(community_invite_allowed("mod.example.com", host, Some(&roles(&["moderator"]))));
+		assert!(!community_invite_allowed(
+			"member.example.com",
+			host,
+			Some(&roles(&["contributor"]))
+		));
+		assert!(!community_invite_allowed("stranger.example.com", host, None));
+	}
+
+	/// An accepted channel INVT must send a SUBS to the host, never the community CONN.
+	#[test]
+	fn a_channel_invt_does_not_route_to_on_accept_community() {
+		assert_eq!(
+			accept_route("@club.example.com~crew"),
+			AcceptRoute::Channel { host: "club.example.com" }
+		);
+		assert_eq!(accept_route("@club.example.com"), AcceptRoute::Community);
+		assert_eq!(accept_route("a1~abc"), AcceptRoute::Action);
 	}
 
 	/// The community-membership gate. Storing an INVT at the community home is what

@@ -46,6 +46,68 @@ pub async fn collect_file_deps(
 		.await
 }
 
+/// Validate an explicit channel on a root action.
+///
+/// A local channel must exist and admit the *actor* (the issuer is always the tenant, which
+/// enters everything). A channel of the audience's tenant is checked by that host on
+/// inbound, so only its syntax is checked here. Any other tenant is rejected.
+async fn check_root_channel(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	actor_id_tag: &str,
+	audience_tag: Option<&str>,
+	channel: &str,
+) -> ClResult<()> {
+	let Some(SubjectRef::Channel { tenant, name }) = parse_subject_ref(channel) else {
+		return Err(Error::ValidationError("invalid channel".into()));
+	};
+	if tenant != id_tag {
+		return if audience_tag == Some(tenant) {
+			Ok(())
+		} else {
+			Err(Error::ValidationError("channel must belong to this tenant or the audience".into()))
+		};
+	}
+	match app.meta_adapter.read_channel(tn_id, name).await {
+		Err(Error::NotFound) => return Err(Error::ValidationError("unknown channel".into())),
+		r => r?,
+	};
+	let roles = app
+		.meta_adapter
+		.read_profile_roles(tn_id, actor_id_tag)
+		.await?
+		.unwrap_or_default();
+	let enterable = cloudillo_core::channels::enterable_channels(
+		app,
+		tn_id,
+		id_tag,
+		actor_id_tag,
+		&roles,
+		false,
+	)
+	.await?;
+	if enterable.is_some_and(|set| !set.iter().any(|c| c.as_ref() == channel)) {
+		return Err(Error::PermissionDenied);
+	}
+	Ok(())
+}
+
+/// Stamp an attachment with its action's channel, unless it already has one.
+async fn stamp_file_channel(app: &App, tn_id: TnId, file_id: &str, channel: &str) -> ClResult<()> {
+	let file = app.meta_adapter.read_file(tn_id, file_id).await?;
+	if file.is_none_or(|f| f.channel.is_some()) {
+		return Ok(());
+	}
+	let opts = meta_adapter::UpdateFileOptions {
+		channel: Patch::Value(channel.into()),
+		..Default::default()
+	};
+	app.meta_adapter.update_file_data(tn_id, file_id, &opts).await?;
+	cloudillo_core::search_index_file(app, tn_id, file_id);
+	Ok(())
+}
+
 /// Create an action issued as `id_tag` (the tenant), acting on its own behalf.
 ///
 /// Every system-originated path — hooks, fanout, stat emission, the DSL's `create_action`
@@ -86,6 +148,27 @@ pub async fn create_action_as(
 	// Covers the non-HTTP creation paths too (native hooks, the DSL `create_action`
 	// operation, `DraftPublishTask`'s re-entry).
 	helpers::check_attachment_count(action.attachments.as_deref())?;
+
+	// An explicit channel is honoured only on a root; a reply takes its thread's room.
+	let mut action = action;
+	let is_root = action.parent_id.is_none()
+		&& !matches!(
+			action.subject.as_deref().and_then(parse_subject_ref),
+			Some(SubjectRef::Action(_))
+		);
+	if !is_root {
+		action.channel = None;
+	} else if let Some(channel) = action.channel.as_deref() {
+		check_root_channel(
+			app,
+			tn_id,
+			id_tag,
+			actor_id_tag,
+			action.audience_tag.as_deref(),
+			channel,
+		)
+		.await?;
+	}
 
 	// Check if this is an ephemeral action type
 	let definition = dsl.definition_for(action.typ.as_ref(), action.sub_typ.as_deref());
@@ -220,11 +303,12 @@ pub async fn create_action_as(
 	let content_str = helpers::serialize_content(action.content.as_ref());
 
 	// Resolve visibility: explicit > parent-inherit > subject-inherit > type-default
-	// > user-default > 'F'.
-	let visibility = helpers::inherit_visibility(
+	// > user-default > 'F'. Channel: parent > subject > explicit (roots only).
+	let (visibility, channel) = helpers::inherit_context(
 		app.meta_adapter.as_ref(),
 		tn_id,
 		action.visibility,
+		action.channel.take(),
 		action.parent_id.as_deref(),
 		action.subject.as_deref(),
 	)
@@ -250,6 +334,7 @@ pub async fn create_action_as(
 
 	let mut action = action;
 	action.visibility = visibility;
+	action.channel = channel;
 
 	// REPOST validation + canonicalization. Public-only, no self-repost, explicit
 	// audience required, and reposts never nest (subject is flattened to the true
@@ -363,6 +448,7 @@ pub async fn create_action_as(
 		flags: action.flags.as_deref(),
 		x: action.x.clone(),
 		hat_tag: action.hat.as_deref(),
+		channel: action.channel.as_deref(),
 	};
 
 	// Generate key from key_pattern for deduplication (e.g., REACT uses {type}:{parent}:{issuer})
@@ -441,7 +527,8 @@ pub async fn create_action_as(
 	// (`@<id_tag>`) and resolved action IDs do not.
 	let subject_key = action.subject.as_deref().and_then(|s| match parse_subject_ref(s) {
 		Some(SubjectRef::Placeholder(a_id)) => Some(format!("{},{}", tn_id, a_id).into_boxed_str()),
-		_ => None,
+		Some(SubjectRef::Action(_) | SubjectRef::Identity(_) | SubjectRef::Channel { .. })
+		| None => None,
 	});
 	if let Some(ref key) = subject_key {
 		let keys = vec![key.clone()];
@@ -499,6 +586,7 @@ async fn create_ephemeral_action(
 		subject: action.subject.clone(),
 		expires_at: action.expires_at,
 		visibility: action.visibility,
+		channel: action.channel.clone(),
 		flags,
 		x: None, // Ephemeral actions don't use x metadata
 		..Default::default()
@@ -624,6 +712,11 @@ impl Task<App> for ActionCreatorTask {
 						file_id, e
 					);
 				}
+				if let Some(channel) = self.action.channel.as_deref()
+					&& let Err(e) = stamp_file_channel(app, self.tn_id, file_id, channel).await
+				{
+					warn!("Failed to stamp channel on file {}: {} - continuing anyway", file_id, e);
+				}
 			}
 		}
 
@@ -743,6 +836,7 @@ impl Task<App> for ActionCreatorTask {
 			flags: action_with_resolved.flags.clone(),
 			x: action_with_resolved.x.clone(),
 			hat_tag: action_with_resolved.hat.clone(),
+			channel: action_with_resolved.channel.clone(),
 		};
 
 		// Fetch attachment views (with dimensions) for WebSocket forwarding
@@ -798,6 +892,7 @@ pub(crate) async fn resolve_attachments(
 /// - `@<digits>` (in-batch placeholder) → fetches the action's `action_id`.
 /// - `@<id_tag>` (identity reference) → preserved verbatim through
 ///   federation; the receiver sees the same string.
+/// - `@<id_tag>~<name>` (channel) → preserved verbatim.
 /// - bare action id (e.g. `a1~…`) → preserved verbatim.
 async fn resolve_subject(
 	app: &App,
@@ -813,7 +908,9 @@ async fn resolve_subject(
 			let action_id = app.meta_adapter.get_action_id(tn_id, a_id).await?;
 			Ok(Some(action_id))
 		}
-		Some(SubjectRef::Identity(_) | SubjectRef::Action(_)) => Ok(Some(subject.into())),
+		Some(SubjectRef::Identity(_) | SubjectRef::Action(_) | SubjectRef::Channel { .. }) => {
+			Ok(Some(subject.into()))
+		}
 		None => Ok(None),
 	}
 }
@@ -846,6 +943,7 @@ async fn generate_action_token(
 		subject: subject.map(Into::into), // Use resolved subject
 		expires_at: action.expires_at,
 		visibility: action.visibility,
+		channel: action.channel.clone(),
 		flags,
 		hat: action.hat.clone(),
 		x: None, // x is stored in DB but not in JWT token
@@ -956,6 +1054,7 @@ async fn schedule_delivery(
 					action_id,
 					Some(subject_id.as_ref()),
 					action.audience_tag.as_deref(),
+					subject_action.channel.as_deref(),
 				)
 				.await;
 			}
@@ -993,6 +1092,8 @@ async fn schedule_delivery(
 				.ok()
 				.flatten()
 				.map(|sa| sa.issuer.id_tag),
+			// Channel: the host tenant owns the room.
+			SubjectRef::Channel { tenant, .. } => Some(tenant.into()),
 			SubjectRef::Placeholder(_) => None,
 		};
 
@@ -1051,7 +1152,11 @@ async fn schedule_delivery(
 	let related_action_id = if deliver_subject {
 		action.subject.as_deref().and_then(|s| match parse_subject_ref(s) {
 			Some(SubjectRef::Action(_)) => Some(s.into()),
-			_ => None,
+			// A channel, like an identity, is not an action: no related token.
+			Some(
+				SubjectRef::Identity(_) | SubjectRef::Placeholder(_) | SubjectRef::Channel { .. },
+			)
+			| None => None,
 		})
 	} else {
 		None
@@ -1095,10 +1200,12 @@ async fn schedule_broadcast_delivery(
 	action_id: &str,
 	related_action_id: Option<&str>,
 	author_id_tag: Option<&str>,
+	channel: Option<&str>,
 ) -> ClResult<()> {
-	// Recipient set = profiles with the directional `follower` flag; see
-	// `helpers::broadcast_recipient_tags` for the full rationale.
-	let mut recipients = crate::helpers::broadcast_recipient_tags(app, tn_id, id_tag).await?;
+	// Recipient set = profiles with the directional `follower` flag, narrowed to the
+	// approved action's room; see `helpers::broadcast_recipient_tags`.
+	let mut recipients =
+		crate::helpers::broadcast_recipient_tags(app, tn_id, id_tag, channel).await?;
 
 	// Always send to author (they need to know their action was approved, even if not a follower)
 	if let Some(author) = author_id_tag
@@ -1248,6 +1355,7 @@ impl Task<App> for DraftPublishTask {
 			draft: None,
 			publish_at: None,
 			hat: action_view.hat.as_ref().map(|h| h.id_tag.clone()),
+			channel: action_view.channel.clone(),
 		};
 
 		// Transition status from 'S' (scheduled) to 'P' (pending)

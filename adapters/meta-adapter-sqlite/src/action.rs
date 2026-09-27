@@ -39,6 +39,22 @@ fn hat_info(row: &sqlx::sqlite::SqliteRow) -> ClResult<Option<ProfileInfo>> {
 	}))
 }
 
+/// Append `AND (<col> IS NULL OR <col> IN (:enterable))`; an empty set leaves the open floor only.
+pub(crate) fn push_channel_gate(
+	mut query: sqlx::QueryBuilder<sqlx::Sqlite>,
+	col: &str,
+	enterable: &[Box<str>],
+) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+	if enterable.is_empty() {
+		query.push(format!(" AND {col} IS NULL"));
+		return query;
+	}
+	query.push(format!(" AND ({col} IS NULL OR {col} IN "));
+	query = push_in(query, enterable);
+	query.push(")");
+	query
+}
+
 /// Append the WHERE filters shared by `list`, `count`, and `count_grouped`.
 /// Caller has already emitted `... WHERE a.tn_id=<bind>`; this appends `AND ...`
 /// clauses. Operates on alias `a`, with `pi` (issuer profile) and `pa`
@@ -96,6 +112,17 @@ fn push_action_filters(
 			.push(" AND (a.hat_tag IS NULL OR a.hat_tag!=")
 			.push_bind(normalize_id_tag(hat).into_owned())
 			.push(")");
+	}
+	if let Some(enterable) = &opts.enterable_channels {
+		query = push_channel_gate(query, "a.channel", enterable);
+	}
+	if let Some(muted) = opts.muted_channels.as_ref().filter(|v| !v.is_empty()) {
+		query.push(" AND (a.channel IS NULL OR a.channel NOT IN ");
+		query = push_in(query, muted.as_slice());
+		query.push(")");
+	}
+	if let Some(channel) = &opts.channel {
+		query.push(" AND a.channel=").push_bind(channel.clone());
 	}
 	if let Some(audience_type) = opts.audience_type {
 		// Filter on the effective-audience profile's type. `pa` joins on
@@ -460,7 +487,7 @@ pub(crate) async fn list(
 		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 		a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
-		a.hat_tag, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
+		a.hat_tag, a.channel, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 		a.content, a.created_at, a.received_at, a.expires_at,
 		own.sub_type as own_reaction,
 		a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
@@ -703,6 +730,7 @@ pub(crate) async fn list(
 				None => None,
 			},
 			hat: hat_info(&row)?,
+			channel: row.try_get("channel").ok().flatten(),
 			// Hydrated below for REPOST rows.
 			subject_action: None,
 			content: row
@@ -853,8 +881,8 @@ pub(crate) async fn create(
 	// ALTER without a default (SQLite forbids a non-constant default there), so
 	// the default only exists on fresh DBs. See schema migration 36.
 	let res = sqlx::query(
-		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, received_at, expires_at, attachments, status, visibility, flags, x, hat_tag)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, ?, ?, ?, ?, ?, ?) RETURNING a_id"
+		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, received_at, expires_at, attachments, status, visibility, flags, x, hat_tag, channel)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, ?, ?, ?, ?, ?, ?, ?) RETURNING a_id"
 	)
 		.bind(tn_id.0)
 		.bind(if action.action_id.is_empty() { None } else { Some(action.action_id) })
@@ -875,6 +903,7 @@ pub(crate) async fn create(
 		.bind(action.flags)
 		.bind(x_json)
 		.bind(action.hat_tag.map(|h| normalize_id_tag(h).into_owned()))
+		.bind(action.channel)
 		.fetch_one(db)
 		.await
 		.db()?;
@@ -1197,7 +1226,7 @@ pub(crate) async fn get_by_key(
 	tn_id: TnId,
 	action_key: &str,
 ) -> ClResult<Option<Action<Box<str>>>> {
-	let res = sqlx::query("SELECT action_id, type, sub_type, issuer_tag, parent_id, root_id, audience, content, attachments, subject, created_at, expires_at, visibility, flags, x, hat_tag
+	let res = sqlx::query("SELECT action_id, type, sub_type, issuer_tag, parent_id, root_id, audience, content, attachments, subject, created_at, expires_at, visibility, flags, x, hat_tag, channel
 		FROM actions WHERE tn_id=? AND key=? AND coalesce(status, 'A')!='D'
 		ORDER BY a_id DESC LIMIT 1")
 		.bind(tn_id.0)
@@ -1235,6 +1264,7 @@ pub(crate) async fn get_by_key(
 					.flatten()
 					.and_then(|s| serde_json::from_str(&s).ok()),
 				hat_tag: row.try_get("hat_tag").ok().flatten(),
+				channel: row.try_get("channel").ok().flatten(),
 			}))
 		}
 		Ok(None) => Ok(None),
@@ -1522,7 +1552,7 @@ pub(crate) async fn get(
 			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
-			a.hat_tag, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
+			a.hat_tag, a.channel, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 			a.content, a.created_at, a.received_at, a.expires_at,
 			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
 			FROM actions a
@@ -1545,7 +1575,7 @@ pub(crate) async fn get(
 			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
-			a.hat_tag, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
+			a.hat_tag, a.channel, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 			a.content, a.created_at, a.received_at, a.expires_at,
 			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
 			FROM actions a
@@ -1748,6 +1778,7 @@ pub(crate) async fn get(
 		},
 		// Hydrated below for REPOST rows (see post-construction embed).
 		hat: hat_info(&row)?,
+		channel: row.try_get("channel").ok().flatten(),
 		subject_action: None,
 		content: row
 			.try_get::<Option<String>, _>("content")

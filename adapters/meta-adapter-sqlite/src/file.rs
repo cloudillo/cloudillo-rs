@@ -100,7 +100,7 @@ pub(crate) async fn list(
 			|| matches!(opts.sort.as_deref(), Some("recent" | "modified")));
 
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.upstream_tag, f.owner_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
+		"SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.upstream_tag, f.owner_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason, f.channel,
 		        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
 		        p.id_tag as upstream_id_tag, p.name as upstream_name, p.type as upstream_type, p.profile_pic as upstream_profile_pic,
 		        p2.id_tag as owner_id_tag, p2.name as owner_name, p2.type as owner_type, p2.profile_pic as owner_profile_pic",
@@ -338,6 +338,10 @@ pub(crate) async fn list(
 			sep.push_bind(level.to_string());
 		}
 		sep.push_unseparated(")");
+	}
+
+	if let Some(enterable) = &opts.enterable_channels {
+		query = crate::action::push_channel_gate(query, "f.channel", enterable);
 	}
 
 	// Filter by status - if no status specified, exclude deleted files by default
@@ -591,6 +595,7 @@ pub(crate) async fn list(
 			status,
 			tags,
 			visibility,
+			channel: row.try_get("channel").ok().flatten(),
 			hidden,
 			access_level: None, // Computed later by filter_files_by_visibility
 			user_data,
@@ -914,8 +919,8 @@ pub(crate) async fn create(
 	// writer created. NULL file_id rows never conflict (SQLite treats NULLs as
 	// distinct), so pending uploads are unaffected.
 	let inserted: Option<i64> = sqlx::query_scalar(
-		"INSERT INTO files (tn_id, file_id, parent_id, root_id, status, upstream_tag, owner_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility, hidden) \
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+		"INSERT INTO files (tn_id, file_id, parent_id, root_id, status, upstream_tag, owner_tag, preset, content_type, file_name, file_tp, created_at, tags, x, visibility, hidden, channel) \
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
 		 ON CONFLICT(file_id, tn_id) DO NOTHING \
 		 RETURNING f_id",
 	)
@@ -923,7 +928,7 @@ pub(crate) async fn create(
 		.bind(status).bind(upstream_tag.as_deref()).bind(owner_tag.as_deref()).bind(opts.preset)
 		.bind(opts.content_type).bind(opts.file_name).bind(file_tp).bind(created_at.0)
 		.bind(opts.tags.map(|tags| tags.join(","))).bind(opts.x).bind(visibility)
-		.bind(i32::from(opts.hidden))
+		.bind(i32::from(opts.hidden)).bind(opts.channel)
 		.fetch_optional(db).await.db()?;
 
 	if let Some(f_id) = inserted {
@@ -1146,6 +1151,7 @@ pub(crate) async fn update_data(
 		push_patch!(query, has_updates, "visibility", &opts.visibility, |c| c.to_string());
 	has_updates = push_patch!(query, has_updates, "status", &opts.status, |c| c.to_string());
 	has_updates = push_patch!(query, has_updates, "hidden", &opts.hidden, |b| i32::from(*b));
+	has_updates = push_patch!(query, has_updates, "channel", &opts.channel, |v| v.as_str());
 	has_updates =
 		push_patch!(query, has_updates, "content_type", &opts.content_type, |v| v.as_str());
 	has_updates = push_patch!(query, has_updates, "file_tp", &opts.file_tp, |v| v.as_str());
@@ -1218,7 +1224,7 @@ pub(crate) async fn read(
 		// `file_id` by value, so there it is provably non-NULL.
 		f_id_fallback = Some(f_id);
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.upstream_tag, f.owner_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
+			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.upstream_tag, f.owner_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason, f.channel,
 			        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
 			        p.id_tag as upstream_id_tag, p.name as upstream_name, p.type as upstream_type, p.profile_pic as upstream_profile_pic,
 			        p2.id_tag as owner_id_tag, p2.name as owner_name, p2.type as owner_type, p2.profile_pic as owner_profile_pic
@@ -1236,7 +1242,7 @@ pub(crate) async fn read(
 	} else {
 		// Content-addressable ID - query by file_id
 		sqlx::query(
-			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.upstream_tag, f.owner_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason,
+			"SELECT f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.upstream_tag, f.owner_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, f.broken_at, f.broken_reason, f.channel,
 			        t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic,
 			        p.id_tag as upstream_id_tag, p.name as upstream_name, p.type as upstream_type, p.profile_pic as upstream_profile_pic,
 			        p2.id_tag as owner_id_tag, p2.name as owner_name, p2.type as owner_type, p2.profile_pic as owner_profile_pic
@@ -1317,6 +1323,7 @@ fn row_to_file_view(
 		status,
 		tags,
 		visibility,
+		channel: row.try_get("channel").ok().flatten(),
 		hidden,
 		access_level: None, // Computed later by filter_files_by_visibility
 		user_data,
@@ -1344,7 +1351,7 @@ pub(crate) async fn read_with_user_data(
 	let base_sql = "SELECT f.f_id, f.file_id, f.parent_id, f.root_id, f.file_name, f.file_tp, \
 		f.created_at, f.accessed_at, f.modified_at, f.status, f.tags, f.upstream_tag, \
 		f.owner_tag, f.preset, f.content_type, f.visibility, f.hidden, f.x, \
-		f.broken_at, f.broken_reason, \
+		f.broken_at, f.broken_reason, f.channel, \
 		t.id_tag as tn_id_tag, t.name as tn_name, t.type as tn_type, t.profile_pic as tn_profile_pic, \
 		p.id_tag as upstream_id_tag, p.name as upstream_name, p.type as upstream_type, p.profile_pic as upstream_profile_pic, \
 		p2.id_tag as owner_id_tag, p2.name as owner_name, p2.type as owner_type, p2.profile_pic as owner_profile_pic, \
@@ -1810,6 +1817,7 @@ mod tests {
 			tags: None,
 			x: None,
 			visibility: None,
+			channel: None,
 			hidden: false,
 			status: Some(FileStatus::Active),
 		}

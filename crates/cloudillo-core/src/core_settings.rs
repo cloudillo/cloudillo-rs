@@ -96,6 +96,17 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Wildcard pattern for per-channel reader state, one row per channel
+	// (e.g. `chan.mute.@tenant~name = true`)
+	registry.register(
+		SettingDefinition::builder("chan.*")
+			.description("Per-channel reader preferences")
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.optional(true)
+			.build()?,
+	)?;
+
 	Ok(())
 }
 

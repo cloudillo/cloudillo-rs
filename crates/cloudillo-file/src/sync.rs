@@ -140,6 +140,7 @@ fn verify_content_hash(data: &[u8], expected_id: &str) -> ClResult<()> {
 /// * `variants` - Optional list of specific variants to sync (None = all up to max setting)
 /// * `auth` - Whether to use authenticated requests (true for direct-visibility files, false for public)
 /// * `visibility` - Visibility character to assign to a newly created file row (None → 'D')
+/// * `channel` - Channel to stamp on a newly created file row
 /// * `sync_all` - When true and `variants` is None, bypass the per-class
 ///   `file.sync_max_*` settings filter and sync every variant on the remote
 ///   descriptor. Used when the local tenant is the audience and acts as the
@@ -156,6 +157,7 @@ pub async fn sync_file_variants(
 	variants: Option<&[&str]>,
 	auth: bool,
 	visibility: Option<char>,
+	channel: Option<&str>,
 	sync_all: bool,
 ) -> ClResult<SyncResult> {
 	let mut result = SyncResult { file_id: file_id.to_string(), ..Default::default() };
@@ -364,6 +366,7 @@ pub async fn sync_file_variants(
 			file_name: remote_file.file_name.into(),
 			created_at: Some(remote_file.created_at),
 			visibility: Some(visibility.unwrap_or('D')),
+			channel: channel.map(Into::into),
 			x: remote_file.x,
 			..Default::default()
 		};

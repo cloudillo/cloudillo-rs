@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use crate::prelude::*;
 use crate::subject_ref::{SubjectRef, parse_subject_ref};
-use cloudillo_types::meta_adapter::MetaAdapter;
+use cloudillo_types::meta_adapter::{Channel, MetaAdapter};
 
 /// Gate an identity-valued action field (`iss`, `aud`) on being a **canonical**
 /// id_tag — a UTS #46 U-label, per [`cloudillo_types::validation::validate_id_tag`].
@@ -32,8 +32,9 @@ pub fn check_identity_field(field: &str, id_tag: &str) -> ClResult<()> {
 /// Gate an action `subject` that carries an identity (`@<id_tag>`) on the same canonical
 /// form [`check_identity_field`] demands of `iss` and `aud`.
 ///
+/// A [`SubjectRef::Channel`] (`@tenant~name`) has its tenant checked the same way.
 /// [`SubjectRef::Action`] (`a1~…`) and [`SubjectRef::Placeholder`] (`@42`) are not
-/// identities and pass untouched.
+/// identities and pass untouched. An unparsable subject also passes here.
 ///
 /// The community-INVT lookups build their filter as `format!("@{}", community_tag)` from a
 /// canonical tag (`native_hooks/invt.rs`, `native_hooks/conn.rs`) while the adapter does an
@@ -43,8 +44,10 @@ pub fn check_identity_field(field: &str, id_tag: &str) -> ClResult<()> {
 /// invariant is enforced on write, here.
 pub fn check_subject_field(subject: &str) -> ClResult<()> {
 	match parse_subject_ref(subject) {
-		Some(SubjectRef::Identity(id_tag)) => check_identity_field("subject", id_tag),
-		_ => Ok(()),
+		Some(SubjectRef::Identity(id_tag) | SubjectRef::Channel { tenant: id_tag, .. }) => {
+			check_identity_field("subject", id_tag)
+		}
+		Some(SubjectRef::Action(_) | SubjectRef::Placeholder(_)) | None => Ok(()),
 	}
 }
 
@@ -143,34 +146,36 @@ pub(crate) fn content_snippet(content: Option<&serde_json::Value>) -> String {
 	raw.chars().take(200).collect()
 }
 
-/// Inherit visibility from the parent action, else from an action `subject`.
+/// Inherit visibility and channel from the parent action, else from an action `subject`.
 ///
 /// MSG inherits from `parent_id`; SUBS/INVT (which forbid a parent and reference
 /// their container CONV via `subject`) inherit from that subject action. Only
-/// **action** subjects count — identity subjects (`@community`) have no action
-/// to inherit from and fall through to the type/user default.
-pub async fn inherit_visibility<M: MetaAdapter + ?Sized>(
+/// **action** subjects count — identity (`@community`) and channel
+/// (`@tenant~name`) subjects have no action to inherit from and fall through to
+/// the type/user default.
+///
+/// Visibility: explicit > inherited. Channel: inherited > explicit, and the explicit one
+/// is honoured only on a root (no `parent_id`, no action subject), so a reply can never
+/// leave its thread's room.
+pub async fn inherit_context<M: MetaAdapter + ?Sized>(
 	meta_adapter: &M,
 	tn_id: TnId,
 	visibility: Option<char>,
+	channel: Option<Box<str>>,
 	parent_id: Option<&str>,
 	subject: Option<&str>,
-) -> Option<char> {
-	if visibility.is_some() {
-		return visibility;
+) -> (Option<char>, Option<Box<str>>) {
+	let subject = subject.filter(|s| matches!(parse_subject_ref(s), Some(SubjectRef::Action(_))));
+	if parent_id.is_none() && subject.is_none() {
+		return (visibility, channel);
 	}
-	if let Some(parent_id) = parent_id
-		&& let Ok(Some(parent)) = meta_adapter.get_action(tn_id, parent_id).await
-	{
-		return parent.visibility;
+	for id in [parent_id, subject].into_iter().flatten() {
+		if let Ok(Some(ctx)) = meta_adapter.get_action(tn_id, id).await {
+			return (visibility.or(ctx.visibility), ctx.channel);
+		}
 	}
-	if let Some(subject) = subject
-		&& matches!(parse_subject_ref(subject), Some(SubjectRef::Action(_)))
-		&& let Ok(Some(subj)) = meta_adapter.get_action(tn_id, subject).await
-	{
-		return subj.visibility;
-	}
-	None
+	// Not a root, but the context is unknown here: never fall back to the explicit channel.
+	(visibility, None)
 }
 
 /// Resolve audience tag from parent action for federation.
@@ -245,7 +250,7 @@ pub fn is_open(flags: Option<&str>) -> bool {
 /// Apply the open ('O') flag visibility promotion for new actions.
 ///
 /// Open actions get Connected ('C') visibility, but a resolved 'S' (Subscribed)
-/// is NEVER promoted: visibility cascades via `inherit_visibility`, so promoting
+/// is NEVER promoted: visibility cascades via `inherit_context`, so promoting
 /// an open CONV to 'C' would expose its MSG children and SUBS roster rows to mere
 /// connections. Open-group discovery happens at the community-profile layer, so
 /// keeping 'S' costs no discoverability.
@@ -339,23 +344,136 @@ pub fn get_subscription_role(x: Option<&serde_json::Value>) -> SubscriptionRole 
 /// excluding `exclude_id_tag` (the author/self). `list_follower_tags` already
 /// drops Suspended/Blocked/Banned issuers. Callers append any extra direct
 /// recipients (e.g. the action author) themselves.
+///
+/// With a `channel` (absolute `@tenant~name`), only followers who can enter the room
+/// remain. A channel of another tenant, or one that no longer exists, yields no
+/// recipients (fails closed). `exclude_id_tag` is the tenant itself, so it is also the
+/// only tenant whose rooms this node can resolve.
 pub(crate) async fn broadcast_recipient_tags(
 	app: &App,
 	tn_id: TnId,
 	exclude_id_tag: &str,
+	channel: Option<&str>,
 ) -> ClResult<HashSet<Box<str>>> {
-	Ok(app
-		.meta_adapter
-		.list_follower_tags(tn_id)
-		.await?
+	let Some(channel) = channel else {
+		return Ok(app
+			.meta_adapter
+			.list_follower_tags(tn_id)
+			.await?
+			.into_iter()
+			.filter(|tag| tag.as_ref() != exclude_id_tag)
+			.collect());
+	};
+	let Some(SubjectRef::Channel { tenant, name }) = parse_subject_ref(channel) else {
+		return Ok(HashSet::new());
+	};
+	if tenant != exclude_id_tag {
+		return Ok(HashSet::new());
+	}
+	let room = match app.meta_adapter.read_channel(tn_id, name).await {
+		Ok(room) => room,
+		Err(Error::NotFound) => return Ok(HashSet::new()),
+		Err(e) => return Err(e),
+	};
+	let roster = if room.closed {
+		app.meta_adapter.list_channel_members(tn_id, name).await?
+	} else {
+		Vec::new()
+	};
+	let followers = app.meta_adapter.list_follower_roles(tn_id).await?;
+	Ok(room_recipients(&room, &roster, followers, exclude_id_tag))
+}
+
+/// A follower's id tag and its roles on this tenant.
+type FollowerRoles = (Box<str>, Box<[Box<str>]>);
+
+/// The followers who can enter `room`, minus `exclude_id_tag`. Federated followers are never
+/// hatted here: a hat is worn on an action, not on a follow.
+fn room_recipients(
+	room: &Channel,
+	roster: &[Box<str>],
+	followers: Vec<FollowerRoles>,
+	exclude_id_tag: &str,
+) -> HashSet<Box<str>> {
+	followers
 		.into_iter()
-		.filter(|tag| tag.as_ref() != exclude_id_tag)
-		.collect())
+		.filter(|(tag, roles)| {
+			tag.as_ref() != exclude_id_tag
+				&& cloudillo_core::channels::can_enter(
+					room.min_role.as_deref(),
+					room.closed,
+					roles,
+					roster.contains(tag),
+					false,
+				)
+		})
+		.map(|(tag, _)| tag)
+		.collect()
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn room(min_role: Option<&str>, closed: bool) -> Channel {
+		Channel {
+			name: "organising".into(),
+			title: None,
+			descr: None,
+			visibility: Some('F'),
+			min_role: min_role.map(Into::into),
+			closed,
+			created_at: Timestamp::now(),
+			updated_at: Timestamp::now(),
+		}
+	}
+
+	fn followers() -> Vec<FollowerRoles> {
+		let f = |tag: &str, roles: &[&str]| -> FollowerRoles {
+			(tag.into(), roles.iter().map(|&r| r.into()).collect())
+		};
+		vec![
+			f("club.example.com", &["leader"]),
+			f("fan.example.com", &["follower"]),
+			f("mod.example.com", &["moderator"]),
+			f("lead.example.com", &["leader"]),
+		]
+	}
+
+	fn sorted(tags: HashSet<Box<str>>) -> Vec<Box<str>> {
+		let mut v: Vec<_> = tags.into_iter().collect();
+		v.sort_unstable();
+		v
+	}
+
+	/// Fanout does not over-deliver: a post in a `moderator` room reaches
+	/// only moderator+ followers; an open-floor room reaches every follower but the author.
+	#[test]
+	fn fanout_does_not_over_deliver() {
+		let floored =
+			room_recipients(&room(Some("moderator"), false), &[], followers(), "club.example.com");
+		assert_eq!(sorted(floored), [Box::from("lead.example.com"), Box::from("mod.example.com")]);
+
+		let open = room_recipients(&room(None, false), &[], followers(), "club.example.com");
+		assert_eq!(
+			sorted(open),
+			[
+				Box::from("fan.example.com"),
+				Box::from("lead.example.com"),
+				Box::from("mod.example.com")
+			]
+		);
+
+		// A closed room narrows the floor to its roster.
+		let roster: [Box<str>; 1] = [Box::from("mod.example.com")];
+		let closed = room_recipients(
+			&room(Some("moderator"), true),
+			&roster,
+			followers(),
+			"club.example.com",
+		);
+		assert_eq!(sorted(closed), [Box::from("mod.example.com")]);
+	}
 
 	/// The subscription role comes from server-side metadata only. `content` is the
 	/// action token's `c` claim, signed by the party whose role is being decided —
@@ -407,8 +525,13 @@ mod tests {
 		assert!(check_subject_field("a1~abc").is_ok());
 		assert!(check_subject_field("@42").is_ok());
 
-		// `@a1~abc` parses as an *identity* (see `subject_ref`), and is not a valid one.
+		// `@a1~abc` parses as a *channel* of tenant `a1` (see `subject_ref`), which is
+		// not a valid id_tag.
 		assert!(check_subject_field("@a1~abc").is_err());
+
+		// A channel subject's tenant must be canonical too.
+		assert!(check_subject_field("@club.example.com~campaign").is_ok());
+		assert!(check_subject_field("@Club.Example.COM~campaign").is_err());
 	}
 
 	#[test]

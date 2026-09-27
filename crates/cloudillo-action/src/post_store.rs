@@ -545,6 +545,7 @@ async fn schedule_delivery(
 			&action.issuer_tag,
 			&action.action_id,
 			None,
+			action.channel.as_deref(),
 		)
 		.await;
 	}
@@ -574,6 +575,7 @@ async fn schedule_delivery(
 				&action.issuer_tag,
 				&action.action_id,
 				Some(subject_id.as_ref()),
+				subject_action.channel.as_deref(),
 			)
 			.await;
 		}
@@ -601,6 +603,8 @@ async fn schedule_delivery(
 				.ok()
 				.flatten()
 				.map(|sa| sa.issuer.id_tag),
+			// Channel: the host tenant owns the room.
+			SubjectRef::Channel { tenant, .. } => Some(tenant.into()),
 			SubjectRef::Placeholder(_) => None,
 		};
 	}
@@ -672,7 +676,11 @@ async fn schedule_delivery(
 	let related_action_id = if deliver_subject {
 		action.subject.as_deref().and_then(|s| match parse_subject_ref(s) {
 			Some(SubjectRef::Action(_)) => Some(s.into()),
-			_ => None,
+			// A channel, like an identity, is not an action: no related token.
+			Some(
+				SubjectRef::Identity(_) | SubjectRef::Placeholder(_) | SubjectRef::Channel { .. },
+			)
+			| None => None,
 		})
 	} else {
 		None
@@ -711,10 +719,11 @@ async fn schedule_broadcast_delivery(
 	id_tag: &str,
 	action_id: &str,
 	related_action_id: Option<&str>,
+	channel: Option<&str>,
 ) -> ClResult<()> {
-	// Recipient set = profiles with the directional `follower` flag; see
-	// `helpers::broadcast_recipient_tags` for the full rationale.
-	let recipients = crate::helpers::broadcast_recipient_tags(app, tn_id, id_tag).await?;
+	// Recipient set = profiles with the directional `follower` flag, narrowed to the
+	// room (the approved action's, for an APRV); see `helpers::broadcast_recipient_tags`.
+	let recipients = crate::helpers::broadcast_recipient_tags(app, tn_id, id_tag, channel).await?;
 
 	if recipients.is_empty() {
 		debug!("No followers to broadcast {} to", action_id);
