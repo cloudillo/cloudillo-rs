@@ -10,6 +10,10 @@
 /// callers. Empty segments must be dropped — see the definition for why.
 pub use cloudillo_types::utils::parse_roles;
 
+use cloudillo_types::meta_adapter::ProfileStatus;
+
+use crate::prelude::*;
+
 /// The hierarchy itself and its expansion live in `cloudillo-types` so the auth adapters can mint
 /// role strings through the same code the token-refresh path uses — see that module for why.
 pub use cloudillo_types::roles::{
@@ -35,10 +39,34 @@ pub fn is_moderator(roles: &[Box<str>]) -> bool {
 	highest_role_level(roles) >= MODERATOR_LEVEL
 }
 
+/// Hierarchy level of the "contributor" role, the floor for writing as a hatted member.
+pub const CONTRIBUTOR_LEVEL: usize = 3;
 /// Lowest hierarchy level permitted to manage (remove / re-role) other members.
 pub const MODERATOR_LEVEL: usize = 4;
 /// Hierarchy level of the "leader" role.
 pub const LEADER_LEVEL: usize = 5;
+
+/// A member's highest real role, or `None` when absent, role-less or access-restricted.
+///
+/// Checked for a real role before `highest_role_level`, which reads "none" as public.
+pub async fn active_member_role(
+	app: &App,
+	tn_id: TnId,
+	member: &str,
+) -> ClResult<Option<Box<str>>> {
+	match app.meta_adapter.read_profile(tn_id, member).await {
+		Ok((_, p)) if p.status.is_some_and(ProfileStatus::restricts_access) => return Ok(None),
+		Ok(_) => {}
+		Err(Error::NotFound) => return Ok(None),
+		Err(e) => return Err(e),
+	}
+	let roles = match app.meta_adapter.read_profile_roles(tn_id, member).await {
+		Ok(Some(roles)) if roles.iter().any(|r| role_level(r).is_some()) => roles,
+		Ok(_) | Err(Error::NotFound) => return Ok(None),
+		Err(e) => return Err(e),
+	};
+	Ok(ROLE_HIERARCHY.get(highest_role_level(&roles)).map(|r| (*r).into()))
+}
 
 /// Whether an actor at `actor_level` may manage (remove or re-role) a member at
 /// `target_level`. Rule: the actor must be moderator+ and strictly outrank the
@@ -74,6 +102,7 @@ mod tests {
 
 	#[test]
 	fn test_level_consts_match_hierarchy() {
+		assert_eq!(role_level("contributor"), Some(CONTRIBUTOR_LEVEL));
 		assert_eq!(role_level("moderator"), Some(MODERATOR_LEVEL));
 		assert_eq!(role_level("leader"), Some(LEADER_LEVEL));
 	}

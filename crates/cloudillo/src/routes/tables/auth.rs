@@ -16,6 +16,7 @@
 //! | `/api/auth/password`                 | | `session()` ᴱ | | |
 //! | `/api/auth/proxy-token`              | `session()` ᴱ | | | |
 //! | `/api/auth/access-token`             | `token_exchange()` ᶠ | | | |
+//! | `/api/auth/hat-endorse`              | `token_exchange()` ᶠ | | | |
 //! | `/api/auth/vapid`                    | `session()` ᴱ | | | |
 //! | `/api/auth/wa/login/challenge`       | `recovery()` ᴾ | | | |
 //! | `/api/auth/wa/login`                 | | `recovery()` ᴾ | | |
@@ -112,7 +113,9 @@ pub(crate) fn public_login() -> Router<App> {
 /// Server-to-server token exchange. Called in batches during federation, so it
 /// gets the `"federation"` bucket rather than the much tighter `"auth"` one.
 pub(crate) fn token_exchange() -> Router<App> {
-	Router::new().route("/api/auth/access-token", get(handler::get_access_token))
+	Router::new()
+		.route("/api/auth/access-token", get(handler::get_access_token))
+		.route("/api/auth/hat-endorse", get(handler::get_hat_endorse))
 }
 
 /// Account recovery — the `"auth"` bucket with the ban **bypassed**.

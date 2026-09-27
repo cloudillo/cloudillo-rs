@@ -630,6 +630,7 @@ async fn exclude_sub_typ_filters_before_the_limit() {
 		visibility: None,
 		flags: None,
 		x: None,
+		hat_tag: None,
 	};
 
 	// The invitation is the oldest row; the revocations sort ahead of it (created_at DESC).

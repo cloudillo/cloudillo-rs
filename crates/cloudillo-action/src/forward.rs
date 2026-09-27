@@ -194,8 +194,8 @@ fn build_action_message(params: &ForwardActionParams<'_>) -> BroadcastMessage {
 /// Returns true if the action type is configured to send push notifications
 /// when the user is offline.
 pub fn should_push_notify(action_type: &str, sub_type: Option<&str>) -> bool {
-	// DEL subtypes don't trigger notifications
-	if sub_type.is_some_and(|s| s == "DEL") {
+	// DEL subtypes don't trigger notifications, nor does a CONN map update
+	if sub_type == Some("DEL") || (action_type == "CONN" && sub_type == Some("UPD")) {
 		return false;
 	}
 
@@ -312,7 +312,7 @@ pub fn get_push_setting_key(action_type: &str) -> &'static str {
 /// `get_email_setting_key` maps to something other than the bare `notify.email`
 /// master-switch fallback. DEL subtypes never notify.
 pub fn is_email_notifiable(action_type: &str, sub_type: Option<&str>) -> bool {
-	if sub_type == Some("DEL") {
+	if sub_type == Some("DEL") || (action_type == "CONN" && sub_type == Some("UPD")) {
 		return false;
 	}
 	// A type-specific cadence key exists (not the bare master-switch fallback).
@@ -355,6 +355,9 @@ mod tests {
 		// DEL subtypes don't notify
 		assert!(!should_push_notify("MSG", Some("DEL")));
 		assert!(!should_push_notify("CONN", Some("DEL")));
+		// A hat role map update is not a connection request
+		assert!(!should_push_notify("CONN", Some("UPD")));
+		assert!(!is_email_notifiable("CONN", Some("UPD")));
 	}
 
 	#[test]
@@ -417,6 +420,7 @@ mod tests {
 			f: None,
 			v: None,
 			nonce: None,
+			h: None,
 		}
 	}
 

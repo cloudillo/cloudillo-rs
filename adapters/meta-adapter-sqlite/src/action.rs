@@ -20,6 +20,25 @@ fn db_visibility_to_action(s: Option<String>) -> Option<char> {
 	s.and_then(|s| s.chars().next()).filter(|c| *c != 'D')
 }
 
+/// Build `ActionView.hat` from the `ph` join columns (`hat_tag`, `hat_name`,
+/// `hat_profile_pic`). A hat community with no local profile row (a mirror
+/// node) still resolves, named by its id_tag, so attribution never vanishes.
+fn hat_info(row: &sqlx::sqlite::SqliteRow) -> ClResult<Option<ProfileInfo>> {
+	let Some(id_tag) = row.try_get::<Option<Box<str>>, _>("hat_tag").db()? else {
+		return Ok(None);
+	};
+	let name = row
+		.try_get::<Option<Box<str>>, _>("hat_name")
+		.db()?
+		.unwrap_or_else(|| id_tag.clone());
+	Ok(Some(ProfileInfo {
+		id_tag,
+		name,
+		typ: ProfileType::Community,
+		profile_pic: row.try_get::<Option<Box<str>>, _>("hat_profile_pic").db()?,
+	}))
+}
+
 /// Append the WHERE filters shared by `list`, `count`, and `count_grouped`.
 /// Caller has already emitted `... WHERE a.tn_id=<bind>`; this appends `AND ...`
 /// clauses. Operates on alias `a`, with `pi` (issuer profile) and `pa`
@@ -70,6 +89,13 @@ fn push_action_filters(
 		let codes: Vec<&str> = excluded_aud.iter().map(String::as_str).collect();
 		query.push(" AND coalesce(a.audience, a.issuer_tag) NOT IN ");
 		query = push_in(query, codes.as_slice());
+	}
+	if let Some(hat) = &opts.exclude_hat_tag {
+		// Hide posts this tenant only relayed as a hat community.
+		query
+			.push(" AND (a.hat_tag IS NULL OR a.hat_tag!=")
+			.push_bind(normalize_id_tag(hat).into_owned())
+			.push(")");
 	}
 	if let Some(audience_type) = opts.audience_type {
 		// Filter on the effective-audience profile's type. `pa` joins on
@@ -434,6 +460,7 @@ pub(crate) async fn list(
 		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 		a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
+		a.hat_tag, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 		a.content, a.created_at, a.received_at, a.expires_at,
 		own.sub_type as own_reaction,
 		a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
@@ -443,6 +470,7 @@ pub(crate) async fn list(
 		LEFT JOIN profiles ps ON ps.tn_id=a.tn_id
 			AND a.subject LIKE '@%'
 			AND ps.id_tag = substr(a.subject, 2)
+		LEFT JOIN profiles ph ON ph.tn_id=a.tn_id AND ph.id_tag=a.hat_tag
 		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.subject=a.action_id AND own.issuer_tag=",
 	);
 	query.push_bind(opts.viewer_id_tag.as_deref().map(|v| normalize_id_tag(v).into_owned()));
@@ -674,6 +702,7 @@ pub(crate) async fn list(
 				}),
 				None => None,
 			},
+			hat: hat_info(&row)?,
 			// Hydrated below for REPOST rows.
 			subject_action: None,
 			content: row
@@ -824,8 +853,8 @@ pub(crate) async fn create(
 	// ALTER without a default (SQLite forbids a non-constant default there), so
 	// the default only exists on fresh DBs. See schema migration 36.
 	let res = sqlx::query(
-		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, received_at, expires_at, attachments, status, visibility, flags, x)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, ?, ?, ?, ?, ?) RETURNING a_id"
+		"INSERT INTO actions (tn_id, action_id, key, type, sub_type, parent_id, root_id, issuer_tag, audience, subject, content, created_at, received_at, expires_at, attachments, status, visibility, flags, x, hat_tag)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, ?, ?, ?, ?, ?, ?) RETURNING a_id"
 	)
 		.bind(tn_id.0)
 		.bind(if action.action_id.is_empty() { None } else { Some(action.action_id) })
@@ -845,6 +874,7 @@ pub(crate) async fn create(
 		.bind(visibility)
 		.bind(action.flags)
 		.bind(x_json)
+		.bind(action.hat_tag.map(|h| normalize_id_tag(h).into_owned()))
 		.fetch_one(db)
 		.await
 		.db()?;
@@ -1167,7 +1197,7 @@ pub(crate) async fn get_by_key(
 	tn_id: TnId,
 	action_key: &str,
 ) -> ClResult<Option<Action<Box<str>>>> {
-	let res = sqlx::query("SELECT action_id, type, sub_type, issuer_tag, parent_id, root_id, audience, content, attachments, subject, created_at, expires_at, visibility, flags, x
+	let res = sqlx::query("SELECT action_id, type, sub_type, issuer_tag, parent_id, root_id, audience, content, attachments, subject, created_at, expires_at, visibility, flags, x, hat_tag
 		FROM actions WHERE tn_id=? AND key=? AND coalesce(status, 'A')!='D'
 		ORDER BY a_id DESC LIMIT 1")
 		.bind(tn_id.0)
@@ -1204,6 +1234,7 @@ pub(crate) async fn get_by_key(
 					.ok()
 					.flatten()
 					.and_then(|s| serde_json::from_str(&s).ok()),
+				hat_tag: row.try_get("hat_tag").ok().flatten(),
 			}))
 		}
 		Ok(None) => Ok(None),
@@ -1491,6 +1522,7 @@ pub(crate) async fn get(
 			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
+			a.hat_tag, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 			a.content, a.created_at, a.received_at, a.expires_at,
 			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
 			FROM actions a
@@ -1499,6 +1531,7 @@ pub(crate) async fn get(
 			LEFT JOIN profiles ps ON ps.tn_id=a.tn_id
 				AND a.subject LIKE '@%'
 				AND ps.id_tag = substr(a.subject, 2)
+			LEFT JOIN profiles ph ON ph.tn_id=a.tn_id AND ph.id_tag=a.hat_tag
 			WHERE a.tn_id=? AND a.a_id=? AND coalesce(a.status, 'A') NOT IN ('D')",
 		)
 		.bind(tn_id.0)
@@ -1512,6 +1545,7 @@ pub(crate) async fn get(
 			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
+			a.hat_tag, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 			a.content, a.created_at, a.received_at, a.expires_at,
 			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
 			FROM actions a
@@ -1520,6 +1554,7 @@ pub(crate) async fn get(
 			LEFT JOIN profiles ps ON ps.tn_id=a.tn_id
 				AND a.subject LIKE '@%'
 				AND ps.id_tag = substr(a.subject, 2)
+			LEFT JOIN profiles ph ON ph.tn_id=a.tn_id AND ph.id_tag=a.hat_tag
 			WHERE a.tn_id=? AND a.action_id=? AND coalesce(a.status, 'A') NOT IN ('D')",
 		)
 		.bind(tn_id.0)
@@ -1712,6 +1747,7 @@ pub(crate) async fn get(
 			None => None,
 		},
 		// Hydrated below for REPOST rows (see post-construction embed).
+		hat: hat_info(&row)?,
 		subject_action: None,
 		content: row
 			.try_get::<Option<String>, _>("content")

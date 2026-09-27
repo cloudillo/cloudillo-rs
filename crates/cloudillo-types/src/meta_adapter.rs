@@ -67,6 +67,11 @@ impl ProfileStatus {
 			ProfileStatus::Banned => "banned",
 		}
 	}
+
+	/// Suspended, blocked or banned: the profile's actions and sessions are refused.
+	pub fn restricts_access(self) -> bool {
+		matches!(self, ProfileStatus::Suspended | ProfileStatus::Blocked | ProfileStatus::Banned)
+	}
 }
 
 /// Per-profile proxy-token preference for passive reads of a remote profile's content.
@@ -285,6 +290,12 @@ pub struct Profile<S: AsRef<str>> {
 	/// hidden from the merged home feed (shown only in its own feed); `None` =
 	/// shown (the default). Only meaningful for community profiles.
 	pub hidden_in_home: Option<bool>,
+	/// My role map for this peer community's members (`peer_role:local_role,…`).
+	/// Authoritative; `None` ⇒ no hat from this peer is honoured.
+	pub hat_roles: Option<Box<str>>,
+	/// The peer's role map for my members, mirrored from its `CONN:ACC`/`CONN:UPD`.
+	/// Advisory only: never read by an access decision.
+	pub peer_hat_roles: Option<Box<str>>,
 }
 
 /// Reduced, public-safe profile projection returned by
@@ -364,6 +375,11 @@ pub struct UpdateProfileData {
 	/// feed (column → 1), `Null`/`Value(false)` clears it (column → NULL = shown).
 	#[serde(default)]
 	pub hidden_in_home: Patch<bool>,
+	/// Inter-community role maps (see `Profile::hat_roles` / `peer_hat_roles`).
+	#[serde(default)]
+	pub hat_roles: Patch<Option<Box<str>>>,
+	#[serde(default)]
+	pub peer_hat_roles: Patch<Option<Box<str>>>,
 
 	// Sync metadata
 	#[serde(default)]
@@ -415,6 +431,8 @@ pub struct UpsertProfileFields {
 	/// NULL (shown). Callers normalize a `false` request to `Null` so the column
 	/// stays in the NULL/1 encoding.
 	pub hidden_in_home: Patch<bool>,
+	pub hat_roles: Patch<Option<Box<str>>>,
+	pub peer_hat_roles: Patch<Option<Box<str>>>,
 	pub etag: Patch<Box<str>>,
 }
 
@@ -447,6 +465,8 @@ impl UpsertProfileFields {
 			connected: Patch::Undefined,
 			trust: update.trust,
 			hidden_in_home: update.hidden_in_home,
+			hat_roles: update.hat_roles,
+			peer_hat_roles: update.peer_hat_roles,
 			etag: update.etag,
 		}
 	}
@@ -629,6 +649,11 @@ pub struct ListActionOptions {
 	/// (`profiles.hidden_in_home = 1`).
 	#[serde(skip)]
 	pub exclude_audiences: Option<Box<[String]>>,
+	/// Exclude actions whose `hat_tag` equals this id_tag. Server-set: `list_actions`
+	/// passes the tenant's own id_tag to hide actions it merely relayed as a hat
+	/// community (`hat_tag == us`) from the home feed and from everyone but the tenant.
+	#[serde(skip)]
+	pub exclude_hat_tag: Option<String>,
 	/// When true, exclude actions issued by the requesting tenant (issuer == viewer).
 	/// Requires an authenticated request (viewer_id_tag set by the handler).
 	#[serde(rename = "excludeOwnIssuer")]
@@ -680,6 +705,8 @@ pub struct Action<S: AsRef<str>> {
 	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
 	pub flags: Option<S>,         // Action flags: R/r (reactions), C/c (comments), O/o (open)
 	pub x: Option<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
+	/// Community whose hat the issuer wore (the signed `h` claim).
+	pub hat_tag: Option<S>,
 }
 
 #[skip_serializing_none]
@@ -709,6 +736,8 @@ pub struct ActionView {
 	pub attachments: Option<Vec<AttachmentView>>,
 	pub subject: Option<Box<str>>,
 	pub subject_profile: Option<ProfileInfo>,
+	/// Community whose hat the issuer wore (`actions.hat_tag`), resolved like `issuer`.
+	pub hat: Option<ProfileInfo>,
 	/// Hydrated original action referenced by `subject` (e.g. the post a REPOST
 	/// shares). Populated by the listing path for REPOST rows so the client can
 	/// render the embedded original card without a second fetch. Boxed to keep

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 pub fn get_definitions() -> Vec<ActionDefinition> {
 	vec![
 		connection_definition(),
+		connection_upd_definition(),
 		follow_definition(),
 		post_definition(),
 		post_ldoc_definition(),
@@ -51,6 +52,8 @@ fn connection_definition() -> ActionDefinition {
 		}),
 		subtypes: Some({
 			let mut map = HashMap::new();
+			map.insert("ACC".to_string(), "Accept a connection request".to_string());
+			map.insert("UPD".to_string(), "Publish an updated hat role map".to_string());
 			map.insert("DEL".to_string(), "Remove existing connection".to_string());
 			map
 		}),
@@ -63,14 +66,22 @@ fn connection_definition() -> ActionDefinition {
 		},
 		schema: Some(ContentSchemaWrapper {
 			content: Some(ContentSchema {
-				content_type: ContentType::String,
+				content_type: ContentType::Object,
 				min_length: None,
-				max_length: Some(500),
+				max_length: None,
 				pattern: None,
 				r#enum: None,
-				properties: None,
+				properties: Some({
+					let mut props = HashMap::new();
+					props.insert("msg".to_string(), str_field(None, Some(500)));
+					// Hat role map `peer_role:local_role,…` (ACC / UPD)
+					props.insert("roles".to_string(), str_field(None, Some(1024)));
+					props
+				}),
 				required: None,
-				description: Some("Optional connection message".to_string()),
+				// A bare string `c` is the connection message
+				wrap_scalar: Some("msg".to_string()),
+				description: Some("Optional connection message and hat role map".to_string()),
 			}),
 		}),
 		behavior: BehaviorFlags {
@@ -94,6 +105,18 @@ fn connection_definition() -> ActionDefinition {
 		}),
 		key_pattern: Some("{type}:{issuer}:{audience}".to_string()),
 		search: None,
+	}
+}
+
+/// CONN:UPD - hat role map publication. Its own key: a UPD must never retire the CONN row
+/// that carries the relationship (mutual detection, ACC gating, fan-out read it by key).
+fn connection_upd_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "CONN:UPD".to_string(),
+		// CONN lists UPD among its subTypes; the derived definition has none of its own.
+		subtypes: None,
+		key_pattern: Some("{type}:UPD:{issuer}:{audience}".to_string()),
+		..connection_definition()
 	}
 }
 
@@ -130,6 +153,7 @@ fn follow_definition() -> ActionDefinition {
 				r#enum: None,
 				properties: None,
 				required: None,
+				wrap_scalar: None,
 				description: Some("Optional follow message".to_string()),
 			}),
 		}),
@@ -188,10 +212,12 @@ fn post_definition() -> ActionDefinition {
 				r#enum: None,
 				properties: None,
 				required: None,
+				wrap_scalar: None,
 				description: Some("Post content".to_string()),
 			}),
 		}),
 		behavior: BehaviorFlags {
+			allow_hat: Some(true),
 			broadcast: Some(true),
 			allow_unknown: Some(false),
 			requires_acceptance: Some(false),
@@ -262,6 +288,7 @@ fn post_ldoc_definition() -> ActionDefinition {
 					props
 				}),
 				required: Some(vec!["doc".to_string(), "contentType".to_string()]),
+				wrap_scalar: None,
 				description: Some("Live document reference".to_string()),
 			}),
 		}),
@@ -312,6 +339,7 @@ fn react_definition() -> ActionDefinition {
 		},
 		schema: None,
 		behavior: BehaviorFlags {
+			allow_hat: Some(true),
 			broadcast: Some(false),
 			allow_unknown: Some(true),
 			requires_acceptance: Some(false),
@@ -368,10 +396,12 @@ fn comment_definition() -> ActionDefinition {
 				r#enum: None,
 				properties: None,
 				required: None,
+				wrap_scalar: None,
 				description: Some("Comment content".to_string()),
 			}),
 		}),
 		behavior: BehaviorFlags {
+			allow_hat: Some(true),
 			broadcast: Some(false),
 			allow_unknown: Some(true),
 			requires_acceptance: Some(false),
@@ -437,10 +467,12 @@ fn message_definition() -> ActionDefinition {
 				r#enum: None,
 				properties: None,
 				required: None,
+				wrap_scalar: None,
 				description: Some("Message content".to_string()),
 			}),
 		}),
 		behavior: BehaviorFlags {
+			allow_hat: Some(true),
 			broadcast: Some(false),
 			allow_unknown: Some(false),
 			requires_acceptance: Some(false),
@@ -506,10 +538,12 @@ fn repost_definition() -> ActionDefinition {
 				r#enum: None,
 				properties: None,
 				required: None,
+				wrap_scalar: None,
 				description: Some("Optional comment on repost".to_string()),
 			}),
 		}),
 		behavior: BehaviorFlags {
+			allow_hat: Some(true),
 			broadcast: Some(true),
 			allow_unknown: Some(false),
 			requires_acceptance: Some(false),
@@ -571,7 +605,8 @@ fn aprv_definition() -> ActionDefinition {
 		}),
 		subtypes: None,
 		fields: FieldConstraints {
-			content: Some(FieldConstraint::Forbidden),
+			// Optional: a hat endorsement carries `{ r }`
+			content: None,
 			// Optional: the owner-vouched relay APRV has no single audience (it fans
 			// to subscribers via parent=container). The auto-approve-to-followers
 			// path still sets audience explicitly.
@@ -580,7 +615,24 @@ fn aprv_definition() -> ActionDefinition {
 			attachments: Some(FieldConstraint::Forbidden),
 			subject: Some(FieldConstraint::Required),
 		},
-		schema: None,
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Object,
+				min_length: None,
+				max_length: None,
+				pattern: None,
+				r#enum: None,
+				properties: Some({
+					let mut props = HashMap::new();
+					// Hat endorsement: the member's role at the endorsing community
+					props.insert("r".to_string(), str_field(Some(1), Some(64)));
+					props
+				}),
+				required: None,
+				wrap_scalar: None,
+				description: Some("Optional hat endorsement role".to_string()),
+			}),
+		}),
 		behavior: BehaviorFlags {
 			broadcast: Some(true),
 			allow_unknown: Some(false),
@@ -637,6 +689,7 @@ fn stat_definition() -> ActionDefinition {
 				r#enum: None,
 				properties: None, // TODO: Add properties for reactions, comments, shares
 				required: None,
+				wrap_scalar: None,
 				description: Some("Action statistics".to_string()),
 			}),
 		}),
@@ -746,6 +799,7 @@ fn idp_reg_definition() -> ActionDefinition {
 				}),
 				// Only idTag is required; email is optional when ownerIdTag is provided
 				required: Some(vec!["idTag".to_string()]),
+				wrap_scalar: None,
 				description: Some("Identity registration content with idTag, optional email/owner, address and language".to_string()),
 			}),
 		}),
@@ -810,6 +864,7 @@ fn pres_definition() -> ActionDefinition {
 				r#enum: None,
 				properties: None, // Flexible presence data
 				required: None,
+				wrap_scalar: None,
 				description: Some("Optional presence metadata".to_string()),
 			}),
 		}),
@@ -909,6 +964,7 @@ fn subs_definition() -> ActionDefinition {
 					props
 				}),
 				required: None, // All fields are optional
+				wrap_scalar: None,
 				description: Some(
 					"Subscription content with role, invitedBy, and optional message".to_string(),
 				),
@@ -1017,6 +1073,7 @@ fn fileshare_definition() -> ActionDefinition {
 					"fileName".to_string(),
 					"fileTp".to_string(),
 				]),
+				wrap_scalar: None,
 				description: Some(
 					"File share content with contentType, fileName, and fileTp".to_string(),
 				),
@@ -1109,6 +1166,7 @@ fn conv_definition() -> ActionDefinition {
 					props
 				}),
 				required: Some(vec!["name".to_string()]),
+				wrap_scalar: None,
 				description: Some(
 					"Conversation settings with name and optional description".to_string(),
 				),
@@ -1214,6 +1272,7 @@ fn invt_definition() -> ActionDefinition {
 					props
 				}),
 				required: None,
+				wrap_scalar: None,
 				description: Some("Invitation content with optional role and message".to_string()),
 			}),
 		}),
@@ -1307,6 +1366,7 @@ fn prinvt_definition() -> ActionDefinition {
 					props
 				}),
 				required: Some(vec!["refId".to_string()]),
+				wrap_scalar: None,
 				description: Some(
 					"Profile invite details with ref ID and optional message".to_string(),
 				),
@@ -1454,6 +1514,7 @@ fn apkg_definition() -> ActionDefinition {
 					props
 				}),
 				required: Some(vec!["name".to_string(), "version".to_string()]),
+				wrap_scalar: None,
 				description: Some(
 					"App package metadata with name, version, description, and capabilities"
 						.to_string(),
@@ -1602,6 +1663,24 @@ mod tests {
 			"an embedded subType must not lose the base type's dedup key"
 		);
 		assert!(engine.get_key_pattern("REACT").is_some(), "REACT declares a key pattern");
+	}
+
+	/// A `CONN:UPD` keys apart from the relationship row, so storing one never retires it.
+	#[test]
+	fn conn_upd_has_its_own_key() {
+		let mut engine = crate::dsl::engine::DslEngine::new();
+		for def in get_definitions() {
+			engine.load_definition(def);
+		}
+		let key = |typ: &str, sub: Option<&str>| {
+			engine.definition_for(typ, sub).and_then(|d| d.key_pattern.as_deref()).map(|p| {
+				crate::helpers::apply_key_pattern(p, "CONN", "a", Some("b"), None, None, None)
+			})
+		};
+		assert_eq!(key("CONN", Some("UPD")).as_deref(), Some("CONN:UPD:a:b"));
+		assert_eq!(key("CONN:UPD", None).as_deref(), Some("CONN:UPD:a:b"));
+		assert_eq!(key("CONN", None).as_deref(), Some("CONN:a:b"));
+		assert_eq!(key("CONN", Some("ACC")).as_deref(), Some("CONN:a:b"));
 	}
 
 	// Regression: CONV defaults to 'S'; MSG/SUBS have no own default and inherit

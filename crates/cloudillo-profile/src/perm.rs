@@ -179,6 +179,7 @@ mod tests {
 			roles: Box::new([]),
 			scope: None,
 			anonymous: false,
+			hat: None,
 		}
 	}
 

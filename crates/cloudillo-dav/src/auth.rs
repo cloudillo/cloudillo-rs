@@ -186,6 +186,7 @@ pub async fn dav_basic_auth(
 			.unwrap_or_default(),
 		scope: validation.scopes,
 		anonymous: false,
+		hat: None,
 	};
 	req.extensions_mut().insert(Auth(ctx));
 

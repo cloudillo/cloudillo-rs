@@ -9,12 +9,14 @@ use std::sync::Arc;
 
 use cloudillo_core::abac::VisibilityLevel;
 use cloudillo_core::rate_limit::{PenaltyReason, PowPenaltyReason, RateLimitApi};
+use cloudillo_core::roles::{CONTRIBUTOR_LEVEL, role_level};
 use cloudillo_types::auth_adapter::ActionToken;
-use cloudillo_types::meta_adapter::{self, AttachmentView};
+use cloudillo_types::meta_adapter::{self, AttachmentView, ProfileStatus, ProfileType};
+use cloudillo_types::roles::hat_peer;
 
 use crate::{
 	dsl::DslEngine,
-	helpers,
+	hat, helpers,
 	key_cache::KeyFetchCache,
 	native_hooks::{self, ownership::owns_subject},
 	post_store::{self, ProcessingContext},
@@ -237,10 +239,20 @@ pub async fn verify_action_token(
 	}
 }
 
+/// How an inbound token reached us.
+#[derive(Clone, Copy, Default)]
+struct Via<'a> {
+	/// Subject of a `deliver_subject` primary: the permission checks are skipped.
+	pre_approved: bool,
+	/// `(type, issuer)` of the primary it was bundled with.
+	primary: Option<(&'a str, &'a str)>,
+	/// Local role mapped under its hat's endorsement.
+	hat_role: Option<&'a str>,
+	/// The hat's own endorsement, bundled as a mirror's evidence.
+	hat_evidence: Option<&'a str>,
+}
+
 /// Process an inbound action token
-///
-/// # Parameters
-/// - `skip_permission_check`: If true, skip permission/relation checks (used for pre-approved related actions)
 pub async fn process_inbound_action_token(
 	app: &App,
 	tn_id: TnId,
@@ -256,7 +268,7 @@ pub async fn process_inbound_action_token(
 		token,
 		is_sync,
 		client_address.clone(),
-		false,
+		Via::default(),
 	)
 	.await?;
 
@@ -278,14 +290,27 @@ pub async fn process_inbound_action_token(
 }
 
 /// Process an inbound action token that is pre-approved (related action from APRV)
-/// Skips permission checks since the action was already approved by the APRV issuer
+/// Skips permission checks since the action was already approved by the APRV issuer.
+/// `primary` is the approving action's `(type, issuer)`. `hat_evidence` is the hat's own
+/// endorsement bundled alongside, which a mirror needs to admit a token carrying `h`.
 pub async fn process_preapproved_action_token(
 	app: &App,
 	tn_id: TnId,
 	action_id: &str,
 	token: &str,
+	primary: Option<(&str, &str)>,
+	hat_evidence: Option<&str>,
 ) -> ClResult<Option<serde_json::Value>> {
-	process_inbound_action_token_inner(app, tn_id, action_id, token, false, None, true).await
+	process_inbound_action_token_inner(
+		app,
+		tn_id,
+		action_id,
+		token,
+		false,
+		None,
+		Via { pre_approved: true, primary, hat_evidence, ..Via::default() },
+	)
+	.await
 }
 
 async fn process_inbound_action_token_inner(
@@ -295,7 +320,7 @@ async fn process_inbound_action_token_inner(
 	token: &str,
 	is_sync: bool,
 	client_address: Option<String>,
-	skip_permission_check: bool,
+	via: Via<'_>,
 ) -> ClResult<Option<serde_json::Value>> {
 	let client_ip: Option<IpAddr> = client_address.as_ref().and_then(|addr| addr.parse().ok());
 
@@ -305,7 +330,7 @@ async fn process_inbound_action_token_inner(
 	verify_pow_if_conn(app, is_conn_action, client_ip.as_ref(), token, &action_preview.iss)?;
 
 	// 2. Verify action token (signature verification - always required!)
-	let action =
+	let mut action =
 		verify_and_handle_failure(app, tn_id, token, is_conn_action, client_ip.as_ref()).await?;
 
 	// 3. Resolve definition (try full type, then base type)
@@ -328,8 +353,33 @@ async fn process_inbound_action_token_inner(
 		dsl.validate_content(&action.t, action.c.as_ref())?;
 	}
 
-	// 4. Check permissions (skip for pre-approved related actions)
-	if skip_permission_check {
+	// 3c. Hatted actions (`h`) are admitted only under an endorsement, or relayed by the hat.
+	// Checked on every side (hat, destination, mirror): only some types may carry a hat.
+	let mut relay: Option<(Box<str>, Box<str>)> = None; // (our id_tag, member role)
+	if action.h.is_some() {
+		if !definition.behavior.allow_hat.unwrap_or(false) {
+			warn!(action_id = %action_id, action_type = %action.t, "Hat not allowed for type");
+			return Err(Error::PermissionDenied);
+		}
+		let us = app.meta_adapter.read_tenant(tn_id).await?.id_tag;
+		let facts = hat_facts(app, tn_id, action_id, &action, &us, via).await?;
+		match hat::admit_hatted(&action, &us, via.primary, facts) {
+			hat::Admission::Store => {}
+			hat::Admission::StoreUnhatted => action.h = None,
+			hat::Admission::Relay => {
+				let role = hat_relay_role(app, tn_id, &action).await?;
+				relay = Some((us, role));
+			}
+			hat::Admission::Reject => {
+				warn!(action_id = %action_id, issuer = %action.iss, "Unendorsed hatted action");
+				return Err(Error::PermissionDenied);
+			}
+		}
+	}
+
+	// 4. Check permissions (skip for pre-approved related actions). A relay skips them
+	// too: the member role replaces them, and the action targets content we do not host.
+	if via.pre_approved || relay.is_some() {
 		debug!(
 			action_id = %action_id,
 			action_type = %action.t,
@@ -337,23 +387,23 @@ async fn process_inbound_action_token_inner(
 			"Skipping permission check for pre-approved related action"
 		);
 	} else {
-		check_inbound_permissions(app, tn_id, &action, definition).await?;
+		check_inbound_permissions(app, tn_id, action_id, &action, definition, via.hat_role).await?;
 	}
 
 	// 5. Check subscription-based permissions (skip for pre-approved related actions)
-	if !skip_permission_check {
+	if !via.pre_approved && relay.is_none() {
 		check_subscription_permissions(app, tn_id, &action, definition).await?;
 	}
 
 	// 5b. Check flag-based permissions (comments/reactions disabled)
-	if !skip_permission_check {
+	if !via.pre_approved && relay.is_none() {
 		check_inbound_flags(app, tn_id, &action, definition).await?;
 	}
 
 	// 5c. Community INVT authorization, which must precede the store: the key-pattern dedup
 	// retires the pending INVT as soon as an INVT:DEL row lands, so a post-store hook can
 	// neither stop a revocation nor still see the row it needs to judge one.
-	// Deliberately outside the `skip_permission_check` guard: an INVT arriving inside someone
+	// Deliberately outside the `via.pre_approved` guard: an INVT arriving inside someone
 	// else's pre-approved bundle must still prove community authority.
 	// Base type, not a prefix: `starts_with` would also catch a future `INVT…` type.
 	if action.t.split(':').next() == Some("INVT") {
@@ -386,7 +436,7 @@ async fn process_inbound_action_token_inner(
 	)
 	.await;
 
-	let resolved_visibility = if skip_permission_check {
+	let resolved_visibility = if via.pre_approved {
 		visibility
 	} else {
 		let visibility = if visibility.is_some() {
@@ -477,6 +527,7 @@ async fn process_inbound_action_token_inner(
 		visibility: resolved_visibility,
 		flags: action.f.clone(),
 		x: None,
+		hat_tag: action.h.clone(),
 	};
 
 	// Convert attachments to AttachmentView (no dimensions for federated actions)
@@ -491,7 +542,7 @@ async fn process_inbound_action_token_inner(
 	});
 
 	let ctx =
-		ProcessingContext::Inbound { client_address, is_sync, pre_approved: skip_permission_check };
+		ProcessingContext::Inbound { client_address, is_sync, pre_approved: via.pre_approved };
 	let result = post_store::process_after_store(
 		app,
 		tn_id,
@@ -512,6 +563,15 @@ async fn process_inbound_action_token_inner(
 	// confirmation ('C') / rejected ('D') status the hook intended (the bug
 	// where INVT invitee copies ended at 'A' instead of 'C'). The write is
 	// idempotent on repeated verifier runs.
+	// Endorse before the final status write: a failure leaves the row at 'V', so the
+	// verifier retries. Only an accepted action is endorsed, never an aborted or rejected one.
+	if let Some((us, role)) = &relay
+		&& result.ws_forward_deferred
+		&& result.status.is_none_or(|s| s == 'A')
+	{
+		hat::relay_hatted_action(app, tn_id, us, action_id, &action, role).await?;
+	}
+
 	let final_status = result.status.unwrap_or('A');
 	let activate_opts = meta_adapter::UpdateActionDataOptions {
 		status: cloudillo_types::types::Patch::Value(final_status),
@@ -522,8 +582,11 @@ async fn process_inbound_action_token_inner(
 		return Err(e);
 	}
 	// The 'V' → 'A' transition is where a federated action becomes searchable;
-	// the earlier 'P'/'V' writes never were.
-	cloudillo_core::search_index_action(app, tn_id, action_id);
+	// the earlier 'P'/'V' writes never were. A relayed hatted action is not: it is addressed
+	// elsewhere and readable here by the tenant only.
+	if relay.is_none() {
+		cloudillo_core::search_index_action(app, tn_id, action_id);
+	}
 
 	// Forward to WS clients now that the row holds its final status. Deferred
 	// from process_after_store so the push (and any client refetch) never sees
@@ -542,6 +605,75 @@ async fn process_inbound_action_token_inner(
 	}
 
 	Ok(result.hook_result)
+}
+
+/// What the hat admission needs to know about an inbound hatted action.
+async fn hat_facts(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	action: &ActionToken,
+	us: &str,
+	via: Via<'_>,
+) -> ClResult<hat::HatFacts> {
+	// A mirror verifies the hat's bundled endorsement itself, against the approving host.
+	let attested = match (via.hat_evidence, via.primary) {
+		(Some(evidence), Some((_, host))) if via.pre_approved => {
+			match verify_action_token(app, tn_id, evidence, None).await {
+				Ok(aprv) => hat::check_hat_attestation(&aprv, action, action_id, host),
+				Err(e) => {
+					warn!(action_id = %action_id, "Hat evidence failed to verify: {e}");
+					false
+				}
+			}
+		}
+		_ => false,
+	};
+	let owns = if via.primary.is_none()
+		&& action.aud.as_deref() != Some(us)
+		&& let Some(sub) = action.sub.as_deref()
+		&& let Some(subject) = app.meta_adapter.get_action(tn_id, sub).await?
+	{
+		owns_subject(&subject, us)
+	} else {
+		false
+	};
+	Ok(hat::HatFacts {
+		pre_approved: via.pre_approved,
+		endorsed: via.hat_role.is_some(),
+		attested,
+		owns_subject: owns,
+	})
+}
+
+/// The role a member needs for us to relay their hatted action: a real, unrestricted role
+/// here at contributor or above, toward a connected community. `peer_hat_roles` is advisory
+/// and not consulted.
+async fn hat_relay_role(app: &App, tn_id: TnId, action: &ActionToken) -> ClResult<Box<str>> {
+	let aud = action.aud.as_deref().ok_or(Error::PermissionDenied)?;
+	let connected_community = match app.meta_adapter.read_profile(tn_id, aud).await {
+		Ok((_, p)) => {
+			let (typ, usable, _) = hat_peer(&p);
+			typ == ProfileType::Community && usable
+		}
+		Err(Error::NotFound) => false,
+		Err(e) => return Err(e),
+	};
+	if !connected_community {
+		warn!(member = %action.iss, audience = %aud, "Hat relay denied - not a connected community");
+		return Err(Error::PermissionDenied);
+	}
+	let role = cloudillo_core::roles::active_member_role(app, tn_id, &action.iss)
+		.await?
+		.ok_or_else(|| {
+			warn!(member = %action.iss, "Hat relay denied - not an active member");
+			Error::PermissionDenied
+		})?;
+	if role_level(&role).is_none_or(|l| l < CONTRIBUTOR_LEVEL) {
+		warn!(member = %action.iss, role = %role, "Hat relay denied - role below contributor");
+		return Err(Error::PermissionDenied);
+	}
+	Ok(role)
 }
 
 /// Verify PoW for CONN actions before signature verification
@@ -604,9 +736,46 @@ fn resolve_definition<'a>(
 async fn check_inbound_permissions(
 	app: &App,
 	tn_id: TnId,
+	action_id: &str,
 	action: &ActionToken,
 	definition: &crate::dsl::types::ActionDefinition,
+	hat_role: Option<&str>,
 ) -> ClResult<()> {
+	// A hatted action endorsed by its hat: the mapped `hat_role` replaces the follow/connected
+	// gate, and must be contributor or above. Ahead of `allow_unknown`, so a restricted issuer
+	// is refused even for a type that admits strangers.
+	if let Some(role) = hat_role {
+		match app.meta_adapter.read_profile(tn_id, &action.iss).await {
+			Ok((_, p)) if p.status.is_some_and(ProfileStatus::restricts_access) => {
+				warn!(issuer = %action.iss, status = ?p.status, "Hatted action refused: issuer restricted");
+				return Err(Error::PermissionDenied);
+			}
+			Ok(_) | Err(Error::NotFound) => {}
+			Err(e) => return Err(e),
+		}
+		if role_level(role).is_none_or(|l| l < CONTRIBUTOR_LEVEL) {
+			warn!(issuer = %action.iss, role = %role, "Hatted action refused: role below contributor");
+			return Err(Error::PermissionDenied);
+		}
+		return Ok(());
+	}
+
+	// Ahead of every shortcut: an APRV whose bundled subject carries `h == APRV.iss` is a
+	// hat endorsement and is admitted only by the map check. It never widens admission.
+	if helpers::extract_type_and_subtype(&action.t).0 == "APRV"
+		&& let Some(sub) = action.sub.as_deref()
+	{
+		let related = app.meta_adapter.get_related_action_tokens(tn_id, action_id).await?;
+		if let Some((_, token)) = related.iter().find(|(id, _)| id.as_ref() == sub)
+			&& decode_jwt_no_verify::<ActionToken>(token)
+				.is_ok_and(|claims| hat::is_hat_endorsement(action, &claims))
+		{
+			// Only a hat endorsement is verified here; other bundles are checked when processed.
+			let related = verify_action_token(app, tn_id, token, None).await?;
+			hat::endorsed_role(app, tn_id, action, &related).await?;
+		}
+	}
+
 	if definition.behavior.allow_unknown.unwrap_or(false) {
 		return Ok(());
 	}
@@ -624,20 +793,16 @@ async fn check_inbound_permissions(
 		issuer_profile.as_ref().is_some_and(|p| p.connected.is_connected())
 	);
 
-	if let Some(ref p) = issuer_profile {
-		use cloudillo_types::meta_adapter::ProfileStatus;
-		if matches!(
-			p.status,
-			Some(ProfileStatus::Suspended | ProfileStatus::Blocked | ProfileStatus::Banned)
-		) {
-			warn!(
-				issuer = %action.iss,
-				action_type = %action.t,
-				status = ?p.status,
-				"Inbound action refused: issuer profile is deactivated/blocked/banned"
-			);
-			return Err(Error::PermissionDenied);
-		}
+	if let Some(ref p) = issuer_profile
+		&& p.status.is_some_and(ProfileStatus::restricts_access)
+	{
+		warn!(
+			issuer = %action.iss,
+			action_type = %action.t,
+			status = ?p.status,
+			"Inbound action refused: issuer profile is deactivated/blocked/banned"
+		);
+		return Err(Error::PermissionDenied);
 	}
 
 	let allowed = issuer_profile
@@ -933,6 +1098,7 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) -> ClRe
 		visibility: ctx.visibility,
 		flags: action.f.as_deref(),
 		x: None,
+		hat_tag: action.h.as_deref(),
 	};
 
 	match app.meta_adapter.create_action(ctx.tn_id, &inbound_action, key.as_deref()).await {
@@ -1413,6 +1579,25 @@ async fn send_push_notification(
 	}
 }
 
+/// The mapped local role of a hat-endorsed `subject`; the stored primary `aprv_id` must endorse it.
+async fn hat_endorsement_role(
+	app: &App,
+	tn_id: TnId,
+	aprv_id: &str,
+	subject: &ActionToken,
+) -> ClResult<Box<str>> {
+	let token = app
+		.meta_adapter
+		.get_action_token(tn_id, aprv_id)
+		.await?
+		.ok_or(Error::NotFound)?;
+	let aprv: ActionToken = decode_jwt_no_verify(&token)?;
+	if !hat::is_hat_endorsement(&aprv, subject) {
+		return Err(Error::PermissionDenied);
+	}
+	hat::endorsed_role(app, tn_id, &aprv, subject).await
+}
+
 /// Process related actions that came with any action
 ///
 /// Related actions are stored in action_tokens with ack = main_action_id.
@@ -1459,6 +1644,57 @@ async fn process_related_actions(
 		Err(_) => false,
 	};
 	let main_subject: Option<&str> = main_action.subject.as_deref();
+	let primary = Some((&*main_action.typ, &*main_action.issuer.id_tag));
+
+	// A hatted subject routes by who approved it. Claims are read unverified for routing
+	// only: every token is signature-verified before it is used.
+	let subject_claims: Option<ActionToken> = deliver_subject
+		.then(|| related_tokens.iter().find(|(id, _)| Some(&**id) == main_subject))
+		.flatten()
+		.and_then(|(_, token)| decode_jwt_no_verify(token).ok());
+	let subject_hat = subject_claims.as_ref().and_then(|c| c.h.as_deref());
+	// (a) The primary is the hat's own endorsement: its map gives the role, and the subject takes
+	// the fully checked path under it. `Some(None)`: the map denied it, so the subject is skipped.
+	let endorsement: Option<Option<Box<str>>> = match (&subject_claims, subject_hat) {
+		(Some(subject), Some(hat)) if hat == &*main_action.issuer.id_tag => Some(
+			hat_endorsement_role(app, tn_id, action_id, subject)
+				.await
+				.inspect_err(|e| {
+					warn!("Hat endorsement {} denied for its subject: {}", action_id, e);
+				})
+				.ok(),
+		),
+		_ => None,
+	};
+	// (b) Anyone else approved it (a host approving for its mirrors): the hat's own
+	// endorsement rides along as evidence and is consumed, not processed.
+	let evidence: Option<&(Box<str>, Box<str>)> = match subject_hat {
+		Some(hat) if endorsement.is_none() => related_tokens.iter().find(|(_, token)| {
+			decode_jwt_no_verify::<ActionToken>(token)
+				.is_ok_and(|a| hat::is_hat_evidence(&a, main_subject, hat))
+		}),
+		_ => None,
+	};
+	// A hat-endorsed subject's own `deliver_subject` subject (a hatted REPOST's original)
+	// rides along too. It is taken pre-approved under that subject once admitted, as it
+	// would be under a REPOST primary.
+	let nested = match (&subject_claims, &endorsement) {
+		(Some(subject), Some(Some(_)))
+			if app.ext::<Arc<DslEngine>>().is_ok_and(|dsl| {
+				dsl.definition_for(&subject.t, None)
+					.and_then(|d| d.behavior.deliver_subject)
+					.unwrap_or(false)
+			}) =>
+		{
+			subject
+				.sub
+				.as_deref()
+				.and_then(|sub| related_tokens.iter().find(|(id, _)| &**id == sub))
+				.map(|entry| (entry, subject))
+		}
+		_ => None,
+	};
+	let mut subject_admitted = false;
 
 	let mut success_count = 0;
 	let mut fail_count = 0;
@@ -1478,9 +1714,40 @@ async fn process_related_actions(
 		// a primary with a subject the subject's token *and its STAT*, whatever the primary's
 		// type. Under a REPOST or INVT primary those STATs are not the declared subject, so a
 		// third "skip" arm silently discarded every one of them.
-		let result = if deliver_subject && main_subject == Some(&**related_action_id) {
+		if evidence.is_some_and(|(id, _)| id == related_action_id)
+			|| nested.is_some_and(|((id, _), _)| id == related_action_id)
+		{
+			continue;
+		}
+		let is_subject = deliver_subject && main_subject == Some(&**related_action_id);
+		let result = if let (true, Some(role)) = (is_subject, &endorsement) {
+			debug!("Processing hat-endorsed related action {}", related_action_id);
+			match role {
+				Some(role) => process_inbound_action_token_inner(
+					app,
+					tn_id,
+					related_action_id,
+					related_token,
+					false,
+					client_address.clone(),
+					Via { primary, hat_role: Some(role), ..Via::default() },
+				)
+				.await
+				.inspect(|_| subject_admitted = true),
+				None => Err(Error::PermissionDenied),
+			}
+		} else if is_subject {
 			debug!("Processing pre-approved related action {}", related_action_id);
-			process_preapproved_action_token(app, tn_id, related_action_id, related_token).await
+			let evidence = evidence.map(|(_, token)| &**token);
+			process_preapproved_action_token(
+				app,
+				tn_id,
+				related_action_id,
+				related_token,
+				primary,
+				evidence,
+			)
+			.await
 		} else {
 			debug!("Processing related action {}", related_action_id);
 			// The `_inner` form, not `process_inbound_action_token`: full checks, but no
@@ -1493,7 +1760,7 @@ async fn process_related_actions(
 				related_token,
 				false,
 				client_address.clone(),
-				false,
+				Via { primary, ..Via::default() },
 			)
 			.await
 		};
@@ -1505,6 +1772,19 @@ async fn process_related_actions(
 			Err(e) => {
 				fail_count += 1;
 				warn!("Failed to process related action {}: {}", related_action_id, e);
+			}
+		}
+	}
+
+	if subject_admitted && let Some(((nested_id, nested_token), subject)) = nested {
+		let under = Some((&*subject.t, &*subject.iss));
+		match process_preapproved_action_token(app, tn_id, nested_id, nested_token, under, None)
+			.await
+		{
+			Ok(_) => success_count += 1,
+			Err(e) => {
+				fail_count += 1;
+				warn!("Failed to process related action {}: {}", nested_id, e);
 			}
 		}
 	}

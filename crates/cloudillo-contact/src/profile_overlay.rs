@@ -137,6 +137,8 @@ mod tests {
 			feed_read_at: None,
 			msg_read_at: None,
 			hidden_in_home: None,
+			hat_roles: None,
+			peer_hat_roles: None,
 		}
 	}
 

@@ -102,6 +102,7 @@ mod tests {
 			flags: None,
 			sub_level: None,
 			x: None,
+			hat: None,
 			token: None,
 		}
 	}

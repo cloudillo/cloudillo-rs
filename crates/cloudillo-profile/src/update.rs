@@ -12,13 +12,17 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
+use cloudillo_core::CreateActionFn;
 use cloudillo_core::extract::{Auth, OptionalRequestId};
 use cloudillo_core::roles::{
 	LEADER_LEVEL, can_assign_role, can_manage_member_by_roles, highest_role_level,
 };
+use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::meta_adapter::{
-	ProfileStatus, ProfileTrust, UpdateProfileData, UpdateTenantData, UpsertProfileFields,
+	ProfileStatus, ProfileTrust, ProfileType, UpdateProfileData, UpdateTenantData,
+	UpsertProfileFields,
 };
+use cloudillo_types::roles::parse_hat_roles;
 use cloudillo_types::types::{AdminProfilePatch, ApiResponse, ProfileInfo, ProfilePatch};
 
 #[derive(Serialize)]
@@ -100,6 +104,56 @@ pub async fn patch_own_profile(
 	Ok((StatusCode::OK, Json(UpdateProfileResponse { profile })))
 }
 
+/// Send `CONN:UPD` carrying our hat map for `peer` (`None` = map cleared), issued as the tenant.
+async fn send_hat_map(app: &App, tn_id: TnId, peer: &str, map: Option<String>) -> ClResult<()> {
+	let our_id_tag = app.auth_adapter.read_id_tag(tn_id).await?;
+	let create_action = app.ext::<CreateActionFn>()?;
+	create_action(
+		app,
+		tn_id,
+		&our_id_tag,
+		CreateAction {
+			typ: "CONN".into(),
+			sub_typ: Some("UPD".into()),
+			audience_tag: Some(peer.into()),
+			content: map.map(|m| serde_json::json!({ "roles": m })),
+			..Default::default()
+		},
+	)
+	.await?;
+	Ok(())
+}
+
+/// Check a hat role map PATCH: leader-only, and only on an existing community row (a map
+/// on a person is meaningless). `prev_peer` is the target's `(type, connected)`.
+///
+/// Returns the map to publish over CONN:UPD (`None` = cleared) and whether the peer is
+/// connected, or `None` when the map is untouched.
+fn check_hat_roles_patch(
+	actor_roles: &[Box<str>],
+	prev_peer: Option<(ProfileType, bool)>,
+	p: &Patch<Option<String>>,
+) -> ClResult<Option<(Option<String>, bool)>> {
+	let map = match p {
+		Patch::Undefined => return Ok(None),
+		Patch::Null | Patch::Value(None) => None,
+		Patch::Value(Some(map)) => Some(map.clone()),
+	};
+	if highest_role_level(actor_roles) < LEADER_LEVEL {
+		return Err(Error::PermissionDenied);
+	}
+	let Some((typ, connected)) = prev_peer else {
+		return Err(Error::NotFound);
+	};
+	if typ != ProfileType::Community {
+		return Err(Error::ValidationError("hatRoles requires a community profile".into()));
+	}
+	if map.as_deref().is_some_and(|m| parse_hat_roles(m).is_none()) {
+		return Err(Error::ValidationError("invalid hatRoles".into()));
+	}
+	Ok(Some((map, connected)))
+}
+
 /// PATCH /admin/profile/:idTag - Update another user's profile data (admin only)
 ///
 /// The route is mounted behind `check_perm_profile("admin")` ABAC middleware
@@ -122,12 +176,19 @@ pub async fn patch_profile_admin(
 	// profile row, and there is genuinely no refresh trigger. Any other error
 	// aborts the request: we can't safely reason about whether the side-effect
 	// was needed, so the patch must not land.
-	let (prev_status, prev_synced, prev_roles) =
+	let (prev_status, prev_synced, prev_roles, prev_peer) =
 		match app.meta_adapter.read_profile(tn_id, &id_tag).await {
-			Ok((_, p)) => (p.status, p.synced_at, p.roles),
-			Err(Error::NotFound) => (None, None, None),
+			Ok((_, p)) => {
+				(p.status, p.synced_at, p.roles, Some((p.typ, p.connected.is_connected())))
+			}
+			Err(Error::NotFound) => (None, None, None, None),
 			Err(e) => return Err(e),
 		};
+
+	let hat_update =
+		check_hat_roles_patch(&auth.roles, prev_peer, &patch.hat_roles).inspect_err(|e| {
+			warn!("Rejecting hat map change by {} against {}: {e}", auth.id_tag, id_tag);
+		})?;
 
 	// Extract roles for response before consuming patch
 	let response_roles = match &patch.roles {
@@ -218,6 +279,7 @@ pub async fn patch_profile_admin(
 			.roles
 			.map(|opt_roles| opt_roles.map(|roles| roles.into_iter().map(Into::into).collect())),
 		status: patch.status,
+		hat_roles: patch.hat_roles.map(|opt| opt.map(Into::into)),
 		..Default::default()
 	};
 
@@ -227,6 +289,14 @@ pub async fn patch_profile_admin(
 	app.meta_adapter.upsert_profile(tn_id, &id_tag, &upsert).await?;
 	if upsert.affects_search_index() {
 		cloudillo_core::search_index_profile(&app, tn_id, &id_tag);
+	}
+
+	// Publish the changed map to a connected peer. The column is already written, so
+	// a failed send only leaves the peer's advisory mirror stale; it does not fail the PATCH.
+	if let Some((map, true)) = hat_update
+		&& let Err(e) = send_hat_map(&app, tn_id, &id_tag, map).await
+	{
+		warn!(peer = %id_tag, error = %e, "Failed to send CONN:UPD with hat map");
 	}
 
 	// If the admin lifted a Suspended state on a peer that has previously
@@ -415,6 +485,62 @@ pub async fn post_profile_refresh(
 		response = response.with_req_id(id);
 	}
 	Ok((StatusCode::OK, Json(response)))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn roles(r: &str) -> Vec<Box<str>> {
+		vec![r.into()]
+	}
+
+	const COMM: Option<(ProfileType, bool)> = Some((ProfileType::Community, true));
+	const MAP: &str = "contributor:supporter";
+
+	#[test]
+	fn hat_roles_patch_checks() {
+		let leader = roles("leader");
+		let set = Patch::Value(Some(MAP.to_string()));
+
+		assert!(matches!(check_hat_roles_patch(&leader, COMM, &Patch::Undefined), Ok(None)));
+		// Untouched is fine for anyone, on any profile.
+		assert!(matches!(check_hat_roles_patch(&[], None, &Patch::Undefined), Ok(None)));
+
+		assert!(matches!(
+			check_hat_roles_patch(&roles("moderator"), COMM, &set),
+			Err(Error::PermissionDenied)
+		));
+		assert!(matches!(check_hat_roles_patch(&leader, None, &set), Err(Error::NotFound)));
+		let person = Some((ProfileType::Person, true));
+		assert!(matches!(
+			check_hat_roles_patch(&leader, person, &set),
+			Err(Error::ValidationError(_))
+		));
+		let bad = Patch::Value(Some("contributor:leader".to_string()));
+		assert!(matches!(
+			check_hat_roles_patch(&leader, COMM, &bad),
+			Err(Error::ValidationError(_))
+		));
+
+		assert!(matches!(
+			check_hat_roles_patch(&leader, COMM, &set),
+			Ok(Some((Some(ref m), true))) if m == MAP
+		));
+		let unconnected = Some((ProfileType::Community, false));
+		assert!(matches!(
+			check_hat_roles_patch(&leader, unconnected, &set),
+			Ok(Some((Some(_), false)))
+		));
+		assert!(matches!(
+			check_hat_roles_patch(&leader, COMM, &Patch::Null),
+			Ok(Some((None, true)))
+		));
+		assert!(matches!(
+			check_hat_roles_patch(&leader, COMM, &Patch::Value(None)),
+			Ok(Some((None, true)))
+		));
+	}
 }
 
 // vim: ts=4

@@ -15,17 +15,22 @@ use cloudillo_core::{
 	ActionVerifyFn, Auth,
 	extract::{IdTag, OptionalAuth, OptionalRequestId},
 	rate_limit::{PenaltyReason, RateLimitApi},
-	roles::{expand_roles, expand_roles_preserving_extras},
+	roles::{active_member_role, expand_roles, expand_roles_preserving_extras},
 	settings::SettingValue,
 };
 use cloudillo_email::{EmailModule, EmailTaskParams, get_tenant_lang};
 use cloudillo_ref::service::{CreateRefInternalParams, create_ref_internal};
 use cloudillo_types::{
-	action_types::ACCESS_TOKEN_EXPIRY,
-	auth_adapter::{self, ListTenantsOptions},
-	meta_adapter::{ListRefsOptions, PASSWORD_REF_TYPE, SHARE_FILE_REF_TYPE, WELCOME_REF_TYPE},
+	action_types::{ACCESS_TOKEN_EXPIRY, CreateAction},
+	auth_adapter::{self, ActionToken, ListTenantsOptions},
+	meta_adapter::{
+		ListRefsOptions, PASSWORD_REF_TYPE, ProfileStatus, ProfileType, SHARE_FILE_REF_TYPE,
+		WELCOME_REF_TYPE,
+	},
+	roles::{check_hat_aprv, hat_peer, map_hat_role, parse_hat_roles},
 	types::{AccessLevel, ApiResponse},
 	utils::decode_jwt_no_verify,
+	validation::validate_id_tag,
 };
 
 use crate::prelude::*;
@@ -305,6 +310,53 @@ pub struct GetAccessTokenQuery {
 	refresh: Option<bool>,
 	/// Source file_id for cross-document link access (requires scope param with target file)
 	via: Option<String>,
+	/// Hat endorsement (an `APRV` from the hat community, see [`get_hat_endorse`]). Only
+	/// with `token`; the session then carries the mapped role and `h`.
+	hat: Option<String>,
+}
+
+/// `hat=` rides only on a bare PROXY exchange: combined with any other mode it would mean a
+/// hatted session that is also scoped, share-linked or API-keyed, which nothing defines.
+fn hat_params_valid(query: &GetAccessTokenQuery) -> bool {
+	query.hat.is_none()
+		|| (query.token.is_some()
+			&& query.scope.is_none()
+			&& query.ref_id.is_none()
+			&& query.api_key.is_none()
+			&& query.via.is_none())
+}
+
+/// B-side check of a session hat endorsement, returning the local role it maps to.
+///
+/// `proxy` is the caller's verified PROXY (already `aud`/expiry-checked), `endorsement` the
+/// verified `APRV` from the hat community, `peer` that community's local profile row as
+/// [`hat_peer`] gives it. The shared part is [`check_hat_aprv`]. Signature
+/// verification does not require `exp`, so the endorsement's expiry is checked here.
+fn check_session_hat(
+	proxy: &ActionToken,
+	endorsement: &ActionToken,
+	us: &str,
+	now: i64,
+	peer: Option<(ProfileType, bool, Option<&str>)>,
+) -> ClResult<Box<str>> {
+	let deny = |why: &str| {
+		warn!(member = %proxy.iss, hat = %endorsement.iss, "Hat session denied - {why}");
+		Err(Error::PermissionDenied)
+	};
+	let local = match check_hat_aprv(endorsement, us, peer) {
+		Ok(local) => local,
+		Err(why) => return deny(why),
+	};
+	if endorsement.iss.as_ref() == us || endorsement.iss == proxy.iss {
+		return deny("self-endorsement");
+	}
+	if endorsement.sub.as_deref().and_then(|s| s.strip_prefix('@')) != Some(&*proxy.iss) {
+		return deny("endorsement names another member");
+	}
+	match endorsement.exp.map(|e| e.0) {
+		Some(exp) if exp > now && exp <= now + PROXY_TOKEN_MAX_LIFETIME => Ok(local),
+		_ => deny("endorsement expiry missing, past or too distant"),
+	}
 }
 
 /// The `sub` a *derived* token (`?via=` cross-document link) should carry.
@@ -512,6 +564,10 @@ pub async fn get_access_token(
 
 	debug!("Got access token request for id_tag={} with scope={:?}", id_tag.0, query.scope);
 
+	if !hat_params_valid(&query) {
+		return Err(Error::ValidationError("hat requires token and excludes other modes".into()));
+	}
+
 	// Cross-document link: get scoped token for target file via source file
 	if let Some(ref via_file_id) = query.via {
 		use cloudillo_types::types::TokenScope;
@@ -631,6 +687,7 @@ pub async fn get_access_token(
 					r: None,
 					scope: Some(&target_scope),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
+					h: None,
 				},
 			)
 			.await?;
@@ -688,6 +745,28 @@ pub async fn get_access_token(
 			auth_action.iss, auth_action.sub, auth_action.exp
 		);
 
+		// Hatted session: `(hat community, local role)`. The mapped role *replaces* whatever
+		// the member holds here directly, and is never persisted — it lives in the token only.
+		let hat = match query.hat.as_deref() {
+			Some(hat_token) => {
+				let endorsement = verify_fn(&app, tn_id, hat_token, Some(&addr.ip())).await?;
+				let peer = match app.meta_adapter.read_profile(tn_id, &endorsement.iss).await {
+					Ok((_, p)) => Some(p),
+					Err(Error::NotFound) => None,
+					Err(e) => return Err(e),
+				};
+				let local = check_session_hat(
+					&auth_action,
+					&endorsement,
+					&id_tag.0,
+					Timestamp::now().0,
+					peer.as_ref().map(hat_peer),
+				)?;
+				Some((endorsement.iss, local))
+			}
+			None => None,
+		};
+
 		debug!(
 			"Creating access token with t={}, u={}, scope={:?}",
 			id_tag.0,
@@ -696,8 +775,23 @@ pub async fn get_access_token(
 		);
 
 		// Fetch profile roles from meta adapter and expand them
-		let profile_roles = match app.meta_adapter.read_profile_roles(tn_id, &auth_action.iss).await
-		{
+		// Hat replaces, never adds: a hatted session does not consult the direct roles at all.
+		let read = match &hat {
+			Some((_, local)) => {
+				// The hat never lifts a restriction we placed on the member directly.
+				match app.meta_adapter.read_profile(tn_id, &auth_action.iss).await {
+					Ok((_, p)) if p.status.is_some_and(ProfileStatus::restricts_access) => {
+						warn!(member = %auth_action.iss, "Hat session denied - member restricted");
+						return Err(Error::PermissionDenied);
+					}
+					Ok(_) | Err(Error::NotFound) => {}
+					Err(e) => return Err(e),
+				}
+				Ok(Some(vec![local.clone()].into()))
+			}
+			None => app.meta_adapter.read_profile_roles(tn_id, &auth_action.iss).await,
+		};
+		let profile_roles = match read {
 			Ok(roles) => {
 				debug!(
 					"Found profile roles for {} in tn_id {:?}: {:?}",
@@ -755,15 +849,20 @@ pub async fn get_access_token(
 					r: expanded_roles.as_deref(),
 					scope: scope.as_deref(),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
+					h: hat.as_ref().map(|(h, _)| &**h),
 				},
 			)
 			.await?;
 		info!(
-			"Issued access token: id_tag={} sub={} scope={:?} via=action_token",
-			id_tag.0, auth_action.iss, scope
+			"Issued access token: id_tag={} sub={} scope={:?} hat={:?} via=action_token",
+			id_tag.0, auth_action.iss, scope, hat
 		);
-		let response = ApiResponse::new(json!({ "token": token_result }))
-			.with_req_id(req_id.unwrap_or_default());
+		let mut body = json!({ "token": token_result });
+		if let Some((hat_tag, role)) = &hat {
+			body["hat"] = json!(hat_tag);
+			body["role"] = json!(role);
+		}
+		let response = ApiResponse::new(body).with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else if let Some(ref_id) = query.ref_id {
 		// Exchange share link ref for scoped access token (no auth required)
@@ -824,6 +923,7 @@ pub async fn get_access_token(
 					r: None,   // No roles for share link access
 					scope: Some(&scope),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
+					h: None,
 				},
 			)
 			.await?;
@@ -877,6 +977,7 @@ pub async fn get_access_token(
 					r: validation.roles.as_deref(),
 					scope: validation.scopes.as_deref(),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
+					h: None,
 				},
 			)
 			.await?;
@@ -900,6 +1001,11 @@ pub async fn get_access_token(
 		if auth.scope.is_some() {
 			warn!("Scoped token attempted to mint an unscoped session token");
 			return Err(Error::PermissionDenied);
+		}
+		// A hatted session is refreshed by re-running the handshake, never by a role re-read:
+		// the mapped roles are not stored here, so a re-read would mint a role-less session.
+		if auth.hat.is_some() {
+			return Err(Error::Unauthorized);
 		}
 
 		debug!(
@@ -939,6 +1045,7 @@ pub async fn get_access_token(
 					r: expanded_roles.as_deref(),
 					scope: scope.as_deref(),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
+					h: None,
 				},
 			)
 			.await?;
@@ -952,6 +1059,94 @@ pub async fn get_access_token(
 	}
 }
 
+/// # GET /api/auth/hat-endorse
+/// Runs at the hat community: vouches, to `peer`, for the PROXY issuer's role here. The
+/// endorsement is a plain 60s `APRV` minted straight through the auth adapter and never
+/// stored — a credential for one `access-token?hat=` exchange, not an action.
+#[derive(Deserialize)]
+pub struct HatEndorseQuery {
+	peer: String,
+	token: String,
+}
+
+pub async fn get_hat_endorse(
+	State(app): State<App>,
+	tn_id: TnId,
+	id_tag: IdTag,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	Query(query): Query<HatEndorseQuery>,
+	OptionalRequestId(req_id): OptionalRequestId,
+) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+	let verify_fn = app.ext::<ActionVerifyFn>()?;
+	let proxy = verify_fn(&app, tn_id, &query.token, Some(&addr.ip())).await?;
+	let max_exp = Timestamp::from_now(PROXY_TOKEN_MAX_LIFETIME).0;
+	if proxy.aud.as_deref() != Some(&*id_tag.0)
+		|| !proxy_exchange_allowed(&proxy.t, proxy.exp.map(|e| e.0), max_exp)
+	{
+		warn!(issuer = %proxy.iss, "Hat endorsement denied - not a short-lived PROXY to us");
+		return Err(Error::PermissionDenied);
+	}
+	if !validate_id_tag(&query.peer) || query.peer == *id_tag.0 || query.peer == *proxy.iss {
+		return Err(Error::ValidationError("invalid peer".into()));
+	}
+
+	// No active role here, no hat.
+	let role = active_member_role(&app, tn_id, &proxy.iss).await?.ok_or(Error::NotFound)?;
+
+	let peer = match app.meta_adapter.read_profile(tn_id, &query.peer).await {
+		Ok((_, p)) => Some(p),
+		Err(Error::NotFound) => None,
+		Err(e) => return Err(e),
+	};
+	let peer = peer.as_ref().map(|p| {
+		let (typ, usable, _) = hat_peer(p);
+		(typ, usable, p.peer_hat_roles.as_deref())
+	});
+	check_endorse_peer(peer, &role).inspect_err(|e| {
+		if matches!(e, Error::PermissionDenied) {
+			warn!(peer = %query.peer, "Hat endorsement denied - not a usable connected community");
+		}
+	})?;
+
+	let token = app
+		.auth_adapter
+		.create_action_token(
+			tn_id,
+			CreateAction {
+				typ: "APRV".into(),
+				audience_tag: Some(query.peer.as_str().into()),
+				subject: Some(format!("@{}", proxy.iss).into()),
+				content: Some(json!({ "r": role })),
+				expires_at: Some(Timestamp::from_now(60)),
+				..Default::default()
+			},
+		)
+		.await?;
+	info!(
+		"Issued hat endorsement: hat={} member={} peer={} role={}",
+		id_tag.0, proxy.iss, query.peer, role
+	);
+	let response =
+		ApiResponse::new(json!({ "token": token })).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
+}
+
+/// May we endorse `role` to `peer`, given as `(type, usable, peer_hat_roles)`? Only to a
+/// connected, unrestricted community (`PermissionDenied`). Advisory skip (`NotFound`): the
+/// peer's published map already refuses this role. An absent or unparsable map endorses
+/// anyway — the peer decides.
+fn check_endorse_peer(peer: Option<(ProfileType, bool, Option<&str>)>, role: &str) -> ClResult<()> {
+	let Some((ProfileType::Community, true, map)) = peer else {
+		return Err(Error::PermissionDenied);
+	};
+	if let Some(map) = map.and_then(parse_hat_roles)
+		&& map_hat_role(&map, role).is_none()
+	{
+		return Err(Error::NotFound);
+	}
+	Ok(())
+}
+
 /// # GET /api/auth/proxy-token
 /// Generate a proxy token for federation (allows this user to authenticate on behalf of the server)
 /// If `idTag` query parameter is provided and different from the current server, this will
@@ -962,12 +1157,76 @@ pub struct ProxyTokenRes {
 	token: String,
 	/// User's roles in this context (extracted from JWT for federated tokens)
 	roles: Option<Vec<String>>,
+	/// Hat community the session was entered with (`?hat=` only)
+	hat: Option<String>,
+	/// Local role the target mapped the hat to (`?hat=` only)
+	role: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct ProxyTokenQuery {
 	#[serde(rename = "idTag")]
 	id_tag: Option<String>,
+	/// Enter `idTag` wearing this community's hat (requires a federated `idTag`)
+	hat: Option<String>,
+}
+
+/// `data` of the `ApiResponse` envelope around a federated token exchange.
+#[derive(Deserialize)]
+struct TokenEnvelope {
+	data: TokenData,
+}
+
+#[derive(Deserialize)]
+struct TokenData {
+	token: String,
+	role: Option<String>,
+}
+
+/// Hat session handshake from the member's own node: a PROXY to the hat community buys a
+/// short-lived endorsement, which a second PROXY presents at the target. Returns the target's
+/// access token and the local role it mapped the hat to.
+///
+/// Errors keep the remote's status class (`request::get_bin`): 404 → `NotFound` (no
+/// role at the hat, or the hat's published map for the target skips it), 401/403 →
+/// `PermissionDenied`, anything else → `NetworkError`.
+async fn hat_session(
+	app: &App,
+	tn_id: TnId,
+	target: &str,
+	hat: &str,
+) -> ClResult<(String, Option<String>)> {
+	let mint_proxy = |aud: &str| {
+		app.auth_adapter.create_action_token(
+			tn_id,
+			CreateAction {
+				typ: "PROXY".into(),
+				audience_tag: Some(aud.into()),
+				expires_at: Some(Timestamp::from_now(60)),
+				..Default::default()
+			},
+		)
+	};
+	let proxy = mint_proxy(hat).await?;
+	let endorsement: TokenEnvelope = app
+		.request
+		.get_noauth(tn_id, hat, &format!("/auth/hat-endorse?peer={target}&token={proxy}"))
+		.await?;
+	let hat_token = endorsement.data.token;
+	// Goes into the target's query string verbatim: only a JWT's base64url segments pass.
+	if !hat_token
+		.bytes()
+		.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+	{
+		warn!(hat = %hat, "Hat endorsement is not a JWT");
+		return Err(Error::PermissionDenied);
+	}
+	let proxy = mint_proxy(target).await?;
+	let session: TokenEnvelope = app
+		.request
+		.get_noauth(tn_id, target, &format!("/auth/access-token?token={proxy}&hat={hat_token}"))
+		.await?;
+	Ok((session.data.token, session.data.role))
 }
 
 pub async fn get_proxy_token(
@@ -984,6 +1243,21 @@ pub async fn get_proxy_token(
 	if auth.scope.is_some() {
 		warn!(subject = %auth.id_tag, scope = ?auth.scope, "Proxy token denied - delegated token");
 		return Err(Error::PermissionDenied);
+	}
+	// Before `reread_roles`, which falls back to the presented `r` on a transient error: a
+	// hatted session re-enters through the handshake, in either branch.
+	if auth.hat.is_some() {
+		return Err(Error::Unauthorized);
+	}
+	if let Some(hat) = query.hat.as_deref() {
+		// Both go into a remote's query string, so they must be canonical id_tags.
+		let bad_target = |t: &str| !validate_id_tag(t) || t == hat || t == own_id_tag.as_ref();
+		if !validate_id_tag(hat)
+			|| hat == own_id_tag.as_ref()
+			|| query.id_tag.as_deref().is_none_or(bad_target)
+		{
+			return Err(Error::ValidationError("hat needs a distinct federated idTag".into()));
+		}
 	}
 
 	// Re-read rather than copy the presented `r` claim forward; see `reread_roles`.
@@ -1016,7 +1290,13 @@ pub async fn get_proxy_token(
 		debug!("Getting federated proxy token for {} -> {}", &auth.id_tag, target_id_tag);
 
 		// Mint fresh on each call: clients want full TTL, cache is for server-to-server only.
-		let token = app.request.create_proxy_token(auth.tn_id, target_id_tag, None).await?;
+		let (token, role) = match query.hat.as_deref() {
+			Some(hat) => hat_session(&app, auth.tn_id, target_id_tag, hat).await?,
+			None => (
+				app.request.create_proxy_token(auth.tn_id, target_id_tag, None).await?.into(),
+				None,
+			),
+		};
 
 		let roles: Option<Vec<String>> = match decode_jwt_no_verify::<AccessTokenClaims>(&token) {
 			Ok(claims) => {
@@ -1030,11 +1310,12 @@ pub async fn get_proxy_token(
 		};
 
 		info!(
-			"Issued proxy token: id_tag={} sub={} target={} via=federation",
-			own_id_tag, auth.id_tag, target_id_tag
+			"Issued proxy token: id_tag={} sub={} target={} hat={:?} via=federation",
+			own_id_tag, auth.id_tag, target_id_tag, query.hat
 		);
-		let response = ApiResponse::new(ProxyTokenRes { token: token.to_string(), roles })
-			.with_req_id(req_id.unwrap_or_default());
+		let response =
+			ApiResponse::new(ProxyTokenRes { token, roles, hat: query.hat.clone(), role })
+				.with_req_id(req_id.unwrap_or_default());
 		return Ok((StatusCode::OK, Json(response)));
 	}
 
@@ -1052,6 +1333,7 @@ pub async fn get_proxy_token(
 				r: if roles_str.is_empty() { None } else { Some(&roles_str) },
 				scope: None,
 				exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
+				h: None,
 			},
 		)
 		.await?;
@@ -1063,8 +1345,13 @@ pub async fn get_proxy_token(
 		.filter(|s| !s.is_empty())
 		.map(ToString::to_string)
 		.collect();
-	let response = ApiResponse::new(ProxyTokenRes { token: token.to_string(), roles: Some(roles) })
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(ProxyTokenRes {
+		token: token.to_string(),
+		roles: Some(roles),
+		hat: None,
+		role: None,
+	})
+	.with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -1506,6 +1793,7 @@ mod tests {
 			roles: Box::default(),
 			scope: scope.map(Box::from),
 			anonymous,
+			hat: None,
 		}
 	}
 
@@ -1568,6 +1856,114 @@ mod tests {
 		for typ in ["POST", "APRV", "CONN", "STAT", ""] {
 			assert!(!proxy_exchange_allowed(typ, Some(940), max), "{typ} must not be exchangeable");
 		}
+	}
+
+	const NOW: i64 = 1_000;
+
+	fn proxy() -> ActionToken {
+		ActionToken { iss: "alice.example".into(), t: "PROXY".into(), ..Default::default() }
+	}
+
+	fn endorsement() -> ActionToken {
+		ActionToken {
+			iss: "a.example".into(),
+			t: "APRV".into(),
+			aud: Some("b.example".into()),
+			sub: Some("@alice.example".into()),
+			c: Some(json!({ "r": "contributor" })),
+			exp: Some(Timestamp(NOW + 60)),
+			..Default::default()
+		}
+	}
+
+	const PEER: Option<(ProfileType, bool, Option<&str>)> =
+		Some((ProfileType::Community, true, Some("contributor:supporter")));
+
+	fn check(
+		e: &ActionToken,
+		peer: Option<(ProfileType, bool, Option<&str>)>,
+	) -> ClResult<Box<str>> {
+		check_session_hat(&proxy(), e, "b.example", NOW, peer)
+	}
+
+	#[test]
+	fn a_valid_hat_endorsement_maps_the_role() {
+		assert_eq!(check(&endorsement(), PEER).ok().as_deref(), Some("supporter"));
+	}
+
+	/// Session-plane rejections, each on its own.
+	#[test]
+	fn session_hat_rejections() {
+		let denied = |e: ActionToken, peer| matches!(check(&e, peer), Err(Error::PermissionDenied));
+		let e = endorsement;
+
+		assert!(
+			denied(ActionToken { sub: Some("@mallory.example".into()), ..e() }, PEER),
+			"wrong member"
+		);
+		assert!(denied(ActionToken { aud: Some("c.example".into()), ..e() }, PEER), "wrong aud");
+		assert!(denied(ActionToken { t: "POST".into(), ..e() }, PEER), "not an APRV");
+		assert!(denied(ActionToken { exp: Some(Timestamp(NOW - 1)), ..e() }, PEER), "expired");
+		assert!(denied(ActionToken { exp: None, ..e() }, PEER), "missing exp");
+		let far = Some(Timestamp(NOW + PROXY_TOKEN_MAX_LIFETIME + 1));
+		assert!(denied(ActionToken { exp: far, ..e() }, PEER), "exp too distant");
+		assert!(
+			denied(ActionToken { c: Some(json!({ "r": "king" })), ..e() }, PEER),
+			"unknown role"
+		);
+		assert!(denied(ActionToken { c: Some(json!("contributor")), ..e() }, PEER), "no c.r");
+
+		assert!(denied(e(), None), "no peer profile");
+		assert!(denied(e(), Some((ProfileType::Community, true, None))), "NULL map");
+		assert!(
+			denied(e(), Some((ProfileType::Community, false, Some("contributor:supporter")))),
+			"not connected"
+		);
+		assert!(
+			denied(e(), Some((ProfileType::Person, true, Some("contributor:supporter")))),
+			"not a community"
+		);
+		assert!(
+			denied(e(), Some((ProfileType::Community, true, Some("moderator:supporter")))),
+			"unmapped"
+		);
+		assert!(
+			denied(e(), Some((ProfileType::Community, true, Some("contributor:leader")))),
+			"a hand-edited leader target is refused on read"
+		);
+	}
+
+	#[test]
+	fn endorse_peer_checks() {
+		const C: ProfileType = ProfileType::Community;
+		let denied = |r: ClResult<()>| matches!(r, Err(Error::PermissionDenied));
+		assert!(denied(check_endorse_peer(None, "contributor")), "no profile");
+		let person = Some((ProfileType::Person, true, None));
+		assert!(denied(check_endorse_peer(person, "contributor")), "a person");
+		assert!(denied(check_endorse_peer(Some((C, false, None)), "contributor")), "unusable");
+		let skips = Some((C, true, Some("moderator:contributor")));
+		assert!(matches!(check_endorse_peer(skips, "contributor"), Err(Error::NotFound)));
+		let maps = Some((C, true, Some("contributor:supporter")));
+		assert!(check_endorse_peer(maps, "contributor").is_ok());
+		assert!(check_endorse_peer(Some((C, true, None)), "contributor").is_ok(), "no map");
+		let invalid = Some((C, true, Some("contributor:leader")));
+		assert!(check_endorse_peer(invalid, "moderator").is_ok(), "invalid map: the peer decides");
+	}
+
+	#[test]
+	fn hat_rides_only_on_a_bare_proxy_exchange() {
+		let q = |token: bool, scope: bool| GetAccessTokenQuery {
+			token: token.then(|| "t".into()),
+			scope: scope.then(|| "file:f1~x:R".into()),
+			ref_id: None,
+			api_key: None,
+			refresh: None,
+			via: None,
+			hat: Some("h".into()),
+		};
+		assert!(hat_params_valid(&q(true, false)));
+		assert!(!hat_params_valid(&q(true, true)), "hat with scope");
+		assert!(!hat_params_valid(&q(false, false)), "hat without token");
 	}
 
 	/// The DAV capability families are not `TokenScope` values, so `validated_scope` would

@@ -14,6 +14,7 @@ use super::types::{
 use super::validator;
 use crate::hooks::{HookContext, HookResult, HookType};
 use crate::prelude::*;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -489,6 +490,23 @@ impl DslEngine {
 		self.definition_for(action_type, None).and_then(|d| d.key_pattern.as_deref())
 	}
 
+	/// Resolve the content shorthand: when the schema for `action_type` (resolved like
+	/// [`Self::validate_content`]) sets `wrap_scalar` and `c` is a non-null non-object,
+	/// the content means `{ <wrap_scalar>: c }`. Anything else is returned as is.
+	pub fn normalize_content<'a>(
+		&self,
+		action_type: &str,
+		c: Option<&'a serde_json::Value>,
+	) -> Option<Cow<'a, serde_json::Value>> {
+		let c = c?;
+		let wrap = self
+			.definition_for(action_type, None)
+			.and_then(|d| d.schema.as_ref())
+			.and_then(|w| w.content.as_ref())
+			.and_then(|s| s.wrap_scalar.as_deref());
+		Some(wrap_scalar(wrap, c))
+	}
+
 	/// Validate action content against the schema defined for an action type.
 	///
 	/// Returns Ok(()) if content is valid or no schema is defined.
@@ -533,8 +551,8 @@ impl DslEngine {
 			return Ok(());
 		};
 
-		// Validate content against schema
-		self.validate_value_against_schema(content, schema, "content")
+		let content = wrap_scalar(schema.wrap_scalar.as_deref(), content);
+		self.validate_value_against_schema(&content, schema, "content")
 	}
 
 	/// Validate an action instance's field presence against the type's declared
@@ -821,6 +839,18 @@ impl DslEngine {
 	}
 }
 
+/// Wrap a non-null, non-object `c` as `{ key: c }` when the schema names a `wrap_scalar` key.
+fn wrap_scalar<'a>(key: Option<&str>, c: &'a serde_json::Value) -> Cow<'a, serde_json::Value> {
+	match key {
+		Some(key) if !c.is_null() && !c.is_object() => {
+			let mut obj = serde_json::Map::new();
+			obj.insert(key.to_string(), c.clone());
+			Cow::Owned(serde_json::Value::Object(obj))
+		}
+		_ => Cow::Borrowed(c),
+	}
+}
+
 /// DSL engine statistics
 #[derive(Debug, Clone)]
 pub struct DslEngineStats {
@@ -957,6 +987,53 @@ mod tests {
 			"~20 KB must be refused by the default cap"
 		);
 	}
-}
 
-// vim: ts=4
+	fn builtin_engine() -> DslEngine {
+		let mut engine = DslEngine::new();
+		for def in crate::dsl::definitions::get_definitions() {
+			engine.load_definition(def);
+		}
+		engine
+	}
+
+	#[test]
+	fn conn_content_accepts_the_scalar_shorthand_and_the_object_form() {
+		let engine = builtin_engine();
+		let bare = serde_json::json!("hello");
+		assert_eq!(
+			engine.normalize_content("CONN", Some(&bare)).map(Cow::into_owned),
+			Some(serde_json::json!({ "msg": "hello" }))
+		);
+		engine.validate_content("CONN", Some(&bare)).expect("bare string is `{msg}`");
+		let obj = serde_json::json!({ "msg": "hello", "roles": "member:member" });
+		engine.validate_content("CONN", Some(&obj)).expect("object form");
+		// The raw inbound type resolves to the base CONN schema
+		engine
+			.validate_content("CONN:UPD", Some(&obj))
+			.expect("CONN:UPD resolves to CONN");
+		assert_eq!(
+			engine.normalize_content("CONN:UPD", Some(&bare)).map(Cow::into_owned),
+			Some(serde_json::json!({ "msg": "hello" }))
+		);
+
+		let long = "x".repeat(501);
+		assert!(engine.validate_content("CONN", Some(&serde_json::json!(long))).is_err());
+		assert!(
+			engine
+				.validate_content("CONN", Some(&serde_json::json!({ "msg": long })))
+				.is_err()
+		);
+	}
+
+	#[test]
+	fn aprv_content_is_an_optional_object_without_shorthand() {
+		let engine = builtin_engine();
+		engine.validate_content("APRV", None).expect("content stays optional");
+		engine
+			.validate_content("APRV", Some(&serde_json::json!({ "r": "contributor" })))
+			.expect("hat endorsement content");
+		let bare = serde_json::json!("contributor");
+		assert!(engine.validate_content("APRV", Some(&bare)).is_err());
+		assert_eq!(engine.normalize_content("APRV", Some(&bare)).map(Cow::into_owned), Some(bare));
+	}
+}

@@ -439,6 +439,39 @@ pub(crate) async fn forward_to_websocket(
 	}
 }
 
+/// Does the issuer host an APRV'd subject addressed to `subject_audience`? Only the host fans
+/// it out: an APRV of an action addressed elsewhere (a hat endorsement) goes to its audience
+/// only, which keeps the bundled action off our followers' feeds.
+fn we_host(subject_audience: Option<&str>, issuer: &str) -> bool {
+	subject_audience.is_none_or(|a| a == issuer)
+}
+
+/// The explicit recipients of a non-broadcast action: its hat (a hatted action goes to its hat
+/// only, never straight to its audience), else its audience, plus the subject's owner when the
+/// type delivers to it.
+fn direct_recipients(
+	issuer: &str,
+	audience: Option<&str>,
+	hat: Option<&str>,
+	subject_owner: Option<&str>,
+) -> Vec<Box<str>> {
+	let mut recipients: Vec<Box<str>> = Vec::new();
+	if let Some(hat) = hat {
+		recipients.push(hat.into());
+	} else if let Some(audience) = audience.filter(|a| *a != issuer) {
+		recipients.push(audience.into());
+	}
+	if let Some(owner) = subject_owner
+		&& owner != issuer
+		&& !recipients.iter().any(|r| r.as_ref() == owner)
+		// A hatted action reaches its audience only through the hat's endorsement.
+		&& (hat.is_none() || audience != Some(owner))
+	{
+		recipients.push(owner.into());
+	}
+	recipients
+}
+
 /// Schedule delivery tasks based on action type and behavior flags
 async fn schedule_delivery(
 	app: &App,
@@ -468,7 +501,13 @@ async fn schedule_delivery(
 	// Check if this action should broadcast to followers (e.g., POST to own wall)
 	let should_broadcast = behavior.as_ref().and_then(|b| b.broadcast).unwrap_or(false);
 
-	if should_broadcast && action.audience_tag.is_none() {
+	// A hatted action goes to its hat community, which endorses it and relays it to the
+	// audience; the audience and its followers would reject it directly (see `hat.rs`).
+	// The subject owner's copy is the exception: it is engagement with the owner's own
+	// content, admitted there without the hat.
+	let hat = action.hat_tag.as_ref();
+
+	if hat.is_none() && should_broadcast && action.audience_tag.is_none() {
 		// A broadcast action on a non-broadcast parent (e.g. a STAT under a
 		// member-scoped CONV) must NOT fan out to followers — subscriber fan-out
 		// already reaches members, so a follower broadcast is pure leak. Only STAT
@@ -511,7 +550,8 @@ async fn schedule_delivery(
 	}
 
 	// For APRV actions: check if the subject action should be broadcast to followers
-	if action.typ.as_ref() == "APRV"
+	if hat.is_none()
+		&& action.typ.as_ref() == "APRV"
 		&& let Some(ref subject_id) = action.subject
 		&& let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await
 	{
@@ -520,7 +560,9 @@ async fn schedule_delivery(
 			.and_then(|d| d.behavior.broadcast)
 			.unwrap_or(false);
 
-		if subject_broadcast {
+		let subject_audience = subject_action.audience.as_ref().map(|a| a.id_tag.as_ref());
+
+		if subject_broadcast && we_host(subject_audience, &action.issuer_tag) {
 			debug!(
 				"APRV {} subject {} has broadcast=true, fanning out to followers",
 				action.action_id, subject_id
@@ -537,18 +579,11 @@ async fn schedule_delivery(
 		}
 	}
 
-	// Standard delivery: send to specific audience only
-	let mut recipients = Vec::new();
-	if let Some(ref audience_tag) = action.audience_tag
-		&& audience_tag.as_ref() != action.issuer_tag.as_ref()
-	{
-		recipients.push(audience_tag.clone());
-	}
-
 	// Check if this action type should also deliver to subject's owner
 	let deliver_to_subject_owner =
 		behavior.as_ref().and_then(|b| b.deliver_to_subject_owner).unwrap_or(false);
 
+	let mut subject_owner: Option<Box<str>> = None;
 	if deliver_to_subject_owner
 		&& let Some(subject_id) = action.subject.as_deref()
 		&& let Some(sref) = parse_subject_ref(subject_id)
@@ -557,7 +592,7 @@ async fn schedule_delivery(
 		// - Identity: the subject IS the tenant.
 		// - Action: look up the action and use its issuer.
 		// - Placeholder: should already be resolved before this point.
-		let subject_owner: Option<Box<str>> = match sref {
+		subject_owner = match sref {
 			SubjectRef::Identity(id_tag) => Some(id_tag.into()),
 			SubjectRef::Action(_) => app
 				.meta_adapter
@@ -568,18 +603,15 @@ async fn schedule_delivery(
 				.map(|sa| sa.issuer.id_tag),
 			SubjectRef::Placeholder(_) => None,
 		};
-
-		if let Some(subject_owner) = subject_owner
-			&& subject_owner.as_ref() != action.issuer_tag.as_ref()
-			&& !recipients.iter().any(|r| r.as_ref() == subject_owner.as_ref())
-		{
-			info!(
-				"→ DUAL DELIVERY: Adding subject owner {} for {} (deliver_to_subject_owner)",
-				subject_owner, action.action_id
-			);
-			recipients.push(subject_owner);
-		}
 	}
+
+	// Standard delivery: send to specific audience only (plus the subject's owner)
+	let mut recipients = direct_recipients(
+		&action.issuer_tag,
+		action.audience_tag.as_deref(),
+		hat.map(AsRef::as_ref),
+		subject_owner.as_deref(),
+	);
 
 	// Add fanout recipients (delivery tasks were already scheduled, just log)
 	// Don't add to recipients list - they're already handled by schedule_subscriber_fanout
@@ -597,10 +629,7 @@ async fn schedule_delivery(
 	let mut kept: Vec<Box<str>> = Vec::with_capacity(recipients.len());
 	for recipient in recipients.drain(..) {
 		let suppressed = match app.meta_adapter.read_profile(tn_id, recipient.as_ref()).await {
-			Ok((_, p)) => matches!(
-				p.status,
-				Some(ProfileStatus::Suspended | ProfileStatus::Blocked | ProfileStatus::Banned)
-			),
+			Ok((_, p)) => p.status.is_some_and(ProfileStatus::restricts_access),
 			// Missing local profile is the open-federation default — recipient kept.
 			Err(Error::NotFound) => false,
 			// Any other adapter error fails the whole scheduling call, matching the
@@ -804,12 +833,15 @@ async fn try_auto_approve(app: &App, tn_id: TnId, action: &meta_adapter::Action<
 		return;
 	}
 
-	// Check if issuer is trusted (connected = bidirectional connection established)
-	let issuer_profile = match app.meta_adapter.read_profile(tn_id, &action.issuer_tag).await {
+	// Check if issuer is trusted (connected = bidirectional connection established).
+	// A hatted action is vouched for by its hat community, not its member-issuer:
+	// admission already required that community's endorsement to pass its role-map check.
+	let trusted_tag = action.hat_tag.as_deref().unwrap_or(&action.issuer_tag);
+	let issuer_profile = match app.meta_adapter.read_profile(tn_id, trusted_tag).await {
 		Ok((_etag, profile)) => profile,
 		Err(e) => {
 			debug!(
-				issuer = %action.issuer_tag,
+				issuer = %trusted_tag,
 				error = %e,
 				"try_auto_approve: read_profile failed"
 			);
@@ -819,7 +851,7 @@ async fn try_auto_approve(app: &App, tn_id: TnId, action: &meta_adapter::Action<
 
 	if !issuer_profile.connected.is_connected() {
 		debug!(
-			issuer = %action.issuer_tag,
+			issuer = %trusted_tag,
 			connected = ?issuer_profile.connected,
 			"try_auto_approve: issuer not connected"
 		);
@@ -869,6 +901,43 @@ async fn try_auto_approve(app: &App, tn_id: TnId, action: &meta_adapter::Action<
 				"Auto-approve: Failed to create APRV action"
 			);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const ALICE: &str = "alice.example";
+	const A: &str = "a.example";
+	const B: &str = "b.example";
+	const OWNER: &str = "owner.example";
+
+	fn tags(v: &[&str]) -> Vec<Box<str>> {
+		v.iter().map(|t| (*t).into()).collect()
+	}
+
+	#[test]
+	fn direct_recipient_cases() {
+		// A hatted action goes to its hat only.
+		assert_eq!(direct_recipients(ALICE, Some(B), Some(A), None), tags(&[A]));
+		// ... plus a subject owner other than the audience, never the audience itself.
+		assert_eq!(direct_recipients(ALICE, Some(B), Some(A), Some(OWNER)), tags(&[A, OWNER]));
+		assert_eq!(direct_recipients(ALICE, Some(B), Some(A), Some(B)), tags(&[A]));
+		// An unhatted action goes to its audience, and its subject owner once.
+		assert_eq!(direct_recipients(ALICE, Some(B), None, None), tags(&[B]));
+		assert_eq!(direct_recipients(ALICE, Some(B), None, Some(OWNER)), tags(&[B, OWNER]));
+		assert_eq!(direct_recipients(ALICE, Some(B), None, Some(B)), tags(&[B]));
+		// Nothing to self.
+		assert!(direct_recipients(ALICE, Some(ALICE), None, None).is_empty());
+		assert!(direct_recipients(ALICE, None, None, Some(ALICE)).is_empty());
+	}
+
+	#[test]
+	fn we_host_cases() {
+		assert!(we_host(None, A));
+		assert!(we_host(Some(A), A));
+		assert!(!we_host(Some(B), A));
 	}
 }
 

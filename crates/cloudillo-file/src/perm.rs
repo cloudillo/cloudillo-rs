@@ -89,6 +89,7 @@ async fn check_file_permission(
 			roles: vec![].into(),
 			scope: None,
 			anonymous: true,
+			hat: None,
 		};
 		(guest_ctx, "guest".into())
 	};
@@ -240,6 +241,7 @@ mod tests {
 			roles: Box::new([]),
 			scope: scope.map(Box::from),
 			anonymous: scope.is_some(),
+			hat: None,
 		}
 	}
 

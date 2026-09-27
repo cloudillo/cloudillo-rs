@@ -53,6 +53,7 @@ pub(crate) async fn validate_access_token(
 		id_tag: token_data.claims.sub.unwrap_or(token_data.claims.iss),
 		roles: parse_roles(token_data.claims.r.as_deref().unwrap_or("")),
 		scope: token_data.claims.scope,
+		hat: token_data.claims.h,
 	})
 }
 
@@ -145,6 +146,7 @@ pub(crate) async fn check_tenant_password(
 				scope: None,
 				r: Some(roles_str.clone()),
 				exp: Timestamp::from_now(action_types::ACCESS_TOKEN_EXPIRY),
+				h: None,
 			};
 			let token = crypto::generate_access_token(
 				worker,
@@ -245,6 +247,7 @@ pub(crate) async fn create_tenant_login(
 				scope: None,
 				r: Some(roles_str.clone()),
 				exp: Timestamp::from_now(action_types::ACCESS_TOKEN_EXPIRY),
+				h: None,
 			};
 			let token = crypto::generate_access_token(
 				worker,
@@ -287,6 +290,7 @@ pub(crate) async fn create_access_token(
 		scope: data.scope.map(Box::from),
 		r: data.r.map(Box::from),
 		exp: data.exp,
+		h: data.h.map(Box::from),
 	};
 
 	let token = crypto::generate_access_token(
@@ -338,6 +342,7 @@ pub(crate) async fn create_action_token(
 		f: action.flags,
 		v: action.visibility,
 		nonce: None, // PoW nonce is added by clients, not server
+		h: action.hat,
 	};
 	let token = crypto::generate_action_token(worker, action_data, private_key).await?;
 
@@ -356,6 +361,7 @@ mod tests {
 			scope: None::<&str>,
 			r: roles,
 			exp: Timestamp::from_now(3600),
+			h: None,
 		};
 		encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
 			.expect("encode token")
@@ -374,6 +380,7 @@ mod tests {
 			scope: Some(scope),
 			r: None,
 			exp: Timestamp::from_now(3600),
+			h: None,
 		};
 		encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
 			.expect("encode token")
@@ -412,6 +419,7 @@ mod tests {
 			scope: Some("file:f1~abc:W"),
 			r: Some("public"),
 			exp: Timestamp::from_now(3600),
+			h: None,
 		};
 		let token =
 			encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
@@ -422,6 +430,32 @@ mod tests {
 			.expect("token accepted");
 		assert!(!ctx.anonymous, "a token carrying `sub` names a person");
 		assert_eq!(ctx.id_tag.as_ref(), "bob.example");
+		assert_eq!(ctx.hat, None, "a token without `h` carries no hat");
+	}
+
+	/// A hatted session's `h` claim survives into `AuthCtx.hat`, next to its mapped roles.
+	#[tokio::test]
+	async fn validate_access_token_round_trips_hat() {
+		let secret = b"test-secret-bytes-for-hs256-signing";
+		let dec = DecodingKey::from_secret(secret);
+		let claims = AccessToken {
+			iss: "b.example",
+			sub: Some("alice.example"),
+			scope: None,
+			r: Some("public,follower,supporter,contributor"),
+			exp: Timestamp::from_now(3600),
+			h: Some("a.example"),
+		};
+		let token =
+			encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
+				.expect("encode token");
+
+		let ctx = validate_access_token(&dec, TnId(1), "b.example", &token)
+			.await
+			.expect("token accepted");
+		assert_eq!(ctx.hat.as_deref(), Some("a.example"));
+		assert_eq!(ctx.id_tag.as_ref(), "alice.example");
+		assert_eq!(ctx.scope, None, "a hat is not a scope");
 	}
 
 	#[test]

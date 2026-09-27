@@ -135,7 +135,7 @@ const SEARCH_FTS_TRIGGERS: [&str; 3] = [
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 53;
+	const CURRENT_DB_VERSION: i64 = 54;
 
 	let mut tx = db.begin().await?;
 
@@ -257,6 +257,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			feed_read_at INTEGER,			-- Reader's feed read-watermark for this context
 			msg_read_at INTEGER,			-- Reader's DM read-watermark for this peer
 			hidden_in_home INTEGER,			-- Composition: NULL = community shown in home feed (default), 1 = hidden
+			hat_roles text,					-- My role map for this peer's members (peer_role:local_role,...)
+			peer_hat_roles text,			-- Peer's role map for my members (advisory mirror)
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id, id_tag)
@@ -408,6 +410,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			parent_id text,
 			root_id text,
 			issuer_tag text NOT NULL,
+			hat_tag text,					-- Community whose hat the issuer wore (signed `h` claim)
 			status char(1) DEFAULT 'P',		-- 'P' - Pending, 'A' - Active/finalized, 'D' - Deleted
 			audience text,
 			subject text,
@@ -2541,6 +2544,14 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 				.await?;
 		}
 		set_db_version(&mut tx, 53).await;
+	}
+
+	if version < 54 {
+		// Inter-community hats: per-peer role maps and the hat an action was signed under.
+		add_column_if_missing(&mut tx, "profiles", "hat_roles", "text").await?;
+		add_column_if_missing(&mut tx, "profiles", "peer_hat_roles", "text").await?;
+		add_column_if_missing(&mut tx, "actions", "hat_tag", "text").await?;
+		set_db_version(&mut tx, 54).await;
 	}
 
 	tx.commit().await?;

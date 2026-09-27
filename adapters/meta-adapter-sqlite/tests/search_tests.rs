@@ -244,6 +244,7 @@ async fn publish_action(adapter: &MetaAdapterSqlite, tn_id: TnId, a: NewAction<'
 				visibility: a.visibility,
 				flags: None,
 				x: None,
+				hat_tag: None,
 			},
 			None,
 		)
@@ -864,6 +865,7 @@ one_mode! {
 					visibility: Some('P'),
 					flags: None,
 					x: None,
+					hat_tag: None,
 				},
 				None,
 			)

@@ -384,6 +384,7 @@ impl HookContextBuilder {
 }
 
 /// All hooks for a specific action type
+#[derive(Clone)]
 pub struct ActionTypeHooks {
 	pub on_create: Option<HookFunction>,
 	pub on_receive: Option<HookFunction>,

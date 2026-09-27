@@ -88,9 +88,31 @@ pub async fn create_action_as(
 	helpers::check_attachment_count(action.attachments.as_deref())?;
 
 	// Check if this is an ephemeral action type
-	let is_ephemeral = dsl
-		.definition_for(action.typ.as_ref(), action.sub_typ.as_deref())
-		.is_some_and(|d| d.behavior.ephemeral.unwrap_or(false));
+	let definition = dsl.definition_for(action.typ.as_ref(), action.sub_typ.as_deref());
+	let is_ephemeral = definition.is_some_and(|d| d.behavior.ephemeral.unwrap_or(false));
+	let allows_hat = definition.is_some_and(|d| d.behavior.allow_hat.unwrap_or(false));
+
+	// A hat is relayed through the hat community to the audience, so it needs an
+	// audience distinct from both the hat and the issuer, and a stored action.
+	if let Some(hat) = action.hat.as_deref() {
+		helpers::check_identity_field("hat", hat)?;
+		match action.audience_tag.as_deref() {
+			None => return Err(Error::ValidationError("hat requires an audience".into())),
+			Some(aud) if aud == hat => {
+				return Err(Error::ValidationError("hat must differ from the audience".into()));
+			}
+			Some(_) if hat == id_tag => {
+				return Err(Error::ValidationError("hat must differ from the issuer".into()));
+			}
+			// Ephemeral types never allow one: a hat needs a stored action to endorse.
+			Some(_) if !allows_hat => {
+				return Err(Error::ValidationError(
+					"hat is not allowed for this action type".into(),
+				));
+			}
+			Some(_) => {}
+		}
+	}
 
 	if is_ephemeral {
 		return create_ephemeral_action(app, tn_id, id_tag, action).await;
@@ -340,6 +362,7 @@ pub async fn create_action_as(
 		visibility,
 		flags: action.flags.as_deref(),
 		x: action.x.clone(),
+		hat_tag: action.hat.as_deref(),
 	};
 
 	// Generate key from key_pattern for deduplication (e.g., REACT uses {type}:{parent}:{issuer})
@@ -719,6 +742,7 @@ impl Task<App> for ActionCreatorTask {
 			visibility: action_with_resolved.visibility,
 			flags: action_with_resolved.flags.clone(),
 			x: action_with_resolved.x.clone(),
+			hat_tag: action_with_resolved.hat.clone(),
 		};
 
 		// Fetch attachment views (with dimensions) for WebSocket forwarding
@@ -823,6 +847,7 @@ async fn generate_action_token(
 		expires_at: action.expires_at,
 		visibility: action.visibility,
 		flags,
+		hat: action.hat.clone(),
 		x: None, // x is stored in DB but not in JWT token
 		..Default::default()
 	};
@@ -1222,6 +1247,7 @@ impl Task<App> for DraftPublishTask {
 			x: action_view.x.clone(),
 			draft: None,
 			publish_at: None,
+			hat: action_view.hat.as_ref().map(|h| h.id_tag.clone()),
 		};
 
 		// Transition status from 'S' (scheduled) to 'P' (pending)

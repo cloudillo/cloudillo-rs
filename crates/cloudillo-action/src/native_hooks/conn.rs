@@ -12,6 +12,7 @@
 //! Subtypes:
 //! - None: Normal connection request
 //! - ACC: Connection acceptance response
+//! - UPD: Updated hat role map (`c.roles`), sent while connected
 //! - DEL: Connection deletion/disconnect
 
 use crate::history_sync::schedule_history_sync;
@@ -20,6 +21,87 @@ use crate::native_hooks::conn_follower_patch;
 use crate::prelude::*;
 use crate::task::{CreateAction, create_action};
 use cloudillo_types::meta_adapter::{ProfileConnectionStatus, UpsertProfileFields};
+use cloudillo_types::roles::parse_hat_roles;
+
+/// Content for an outbound `CONN:ACC`: our hat role map for `peer`'s members, when set
+async fn acc_content(app: &App, tn_id: TnId, peer: &str) -> Option<serde_json::Value> {
+	let (_, profile) = app.meta_adapter.read_profile(tn_id, peer).await.ok()?;
+	profile.hat_roles.map(|roles| serde_json::json!({ "roles": roles }))
+}
+
+/// Publish our hat map for `peer` over `CONN:UPD`, when set: the requester side of a
+/// connection sends no `CONN:ACC` to carry it.
+async fn publish_hat_map(app: &App, tn_id: TnId, us: &str, peer: &str) {
+	let Some(content) = acc_content(app, tn_id, peer).await else { return };
+	let upd = CreateAction {
+		typ: "CONN".into(),
+		sub_typ: Some("UPD".into()),
+		audience_tag: Some(peer.into()),
+		content: Some(content),
+		..Default::default()
+	};
+	if let Err(e) = create_action(app, tn_id, us, upd).await {
+		warn!(peer = %peer, "CONN: failed to publish hat map: {e}");
+	}
+}
+
+/// Do we have a pending outgoing connection request (a bare `CONN`) to `peer`?
+async fn our_pending_request(app: &App, tn_id: TnId, local: &str, peer: &str) -> bool {
+	app.meta_adapter
+		.get_action_by_key(tn_id, &format!("CONN:{local}:{peer}"))
+		.await
+		.ok()
+		.flatten()
+		.is_some_and(|req| req.sub_typ.is_none())
+}
+
+/// Has `issuer` sent us a `CONN:UPD` created after `created_at`? A retried older UPD must not
+/// overwrite the map a newer one carried. Retired ('D') rows count: storing the older UPD
+/// retires the newer one under their shared key.
+async fn newer_upd_exists(
+	app: &App,
+	tn_id: TnId,
+	local: &str,
+	issuer: &str,
+	created_at: &str,
+) -> bool {
+	let Ok(created_at) = created_at.parse::<i64>() else { return false };
+	let opts = cloudillo_types::meta_adapter::ListActionOptions {
+		typ: Some(vec!["CONN".into()]),
+		issuer: Some(issuer.into()),
+		audience: Some(local.into()),
+		status: Some(vec!["A".into(), "D".into()]),
+		created_after: Some(Timestamp(created_at)),
+		// Only UPD remains besides the bare CONN, which is filtered below.
+		exclude_sub_typ: Some(Box::new(["ACC".into(), "DEL".into()])),
+		..Default::default()
+	};
+	match app.meta_adapter.list_actions(tn_id, &opts).await {
+		Ok(rows) => rows.iter().any(|a| a.sub_typ.as_deref() == Some("UPD")),
+		Err(e) => {
+			warn!(issuer = %issuer, "CONN:UPD: failed to look up newer maps: {e}");
+			false
+		}
+	}
+}
+
+/// `peer_hat_roles` patch from a received `CONN:ACC` / `CONN:UPD`: a valid `c.roles`
+/// is mirrored, an absent or invalid one clears it
+fn peer_hat_roles_patch(app: &App, context: &HookContext) -> Patch<Option<Box<str>>> {
+	let c = app
+		.ext::<std::sync::Arc<crate::dsl::DslEngine>>()
+		.ok()
+		.and_then(|dsl| dsl.normalize_content("CONN", context.content.as_ref()));
+	roles_patch(c.as_deref())
+}
+
+/// [`peer_hat_roles_patch`] over the normalized content
+fn roles_patch(c: Option<&serde_json::Value>) -> Patch<Option<Box<str>>> {
+	let roles = c
+		.and_then(|c| c.get("roles")?.as_str())
+		.filter(|r| parse_hat_roles(r).is_some());
+	roles.map_or(Patch::Null, |r| Patch::Value(Some(r.into())))
+}
 
 /// Retire (soft-delete) any active community-membership invitations on record
 /// for `invitee` in this community tenant. Called when the invitation is
@@ -166,6 +248,8 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			let profile_upsert = UpsertProfileFields {
 				connected: Patch::Null,
 				roles: Patch::Null,
+				hat_roles: Patch::Null,
+				peer_hat_roles: Patch::Null,
 				..Default::default()
 			};
 
@@ -181,6 +265,9 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 					.await;
 			}
 		}
+		Some("UPD") => {
+			// Map publication only; the local map was already written by the caller
+		}
 		Some(subtype) => {
 			warn!("CONN on_create: Unknown subtype '{}', ignoring", subtype);
 		}
@@ -195,6 +282,8 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// - None: mutual/auto-accept rests at 'A' (default); ignore-mode rests at 'D';
 ///   normal requests rest at 'C' (confirmation)
 /// - DEL: Update profile, rests at 'N' (informational)
+/// - UPD: mirrors a connected (or pending) peer's hat role map; from a stranger, or older
+///   than one on record, rests at 'D'
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
 	let tn_id = context.tn_id;
 	// The local tenant tag is the authoritative "to whom" — `context.audience`
@@ -220,16 +309,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 			// Check if we have a pending outgoing request to this issuer
 			// If so, this is a mutual connection - auto-accept
-			let our_request = app
-				.meta_adapter
-				.get_action_by_key(tn_id, &format!("CONN:{}:{}", local_tag, context.issuer))
-				.await
-				.ok()
-				.flatten();
-
-			if let Some(ref req) = our_request
-				&& req.sub_typ.is_none()
-			{
+			if our_pending_request(&app, tn_id, local_tag, &context.issuer).await {
 				// We have a pending request - this is mutual, auto-connect
 				info!(
 					"CONN: Mutual connection detected between {} and {}",
@@ -255,6 +335,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				}
 
 				schedule_history_sync(&app, tn_id, &context.issuer).await;
+				publish_hat_map(&app, tn_id, &context.tenant_tag, &context.issuer).await;
 
 				// Mutual connection auto-accepted — rests at 'A' (default) so the
 				// status=['A'] fan-out/broadcast/filter queries include it.
@@ -309,6 +390,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					typ: "CONN".into(),
 					sub_typ: Some("ACC".into()),
 					audience_tag: Some(context.issuer.clone().into()),
+					content: acc_content(&app, tn_id, &context.issuer).await,
 					..Default::default()
 				};
 				if let Err(e) =
@@ -371,6 +453,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 						typ: "CONN".into(),
 						sub_typ: Some("ACC".into()),
 						audience_tag: Some(context.issuer.clone().into()),
+						content: acc_content(&app, tn_id, &context.issuer).await,
 						..Default::default()
 					};
 
@@ -478,6 +561,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					Patch::Value(true)
 				},
 				follower: conn_follower_patch(&app, tn_id, &context.issuer).await,
+				peer_hat_roles: peer_hat_roles_patch(&app, &context),
 				..Default::default()
 			};
 
@@ -490,6 +574,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			}
 
 			schedule_history_sync(&app, tn_id, &context.issuer).await;
+			publish_hat_map(&app, tn_id, &context.tenant_tag, &context.issuer).await;
 
 			// Connection accepted — rests at 'A' (default) so fan-out/broadcast/
 			// filter (status=['A']) include the established relationship.
@@ -498,8 +583,12 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			info!("CONN:DEL: Received disconnect request from {} to {}", context.issuer, local_tag);
 
 			// Update issuer's profile to not connected
-			let profile_upsert =
-				UpsertProfileFields { connected: Patch::Null, ..Default::default() };
+			let profile_upsert = UpsertProfileFields {
+				connected: Patch::Null,
+				hat_roles: Patch::Null,
+				peer_hat_roles: Patch::Null,
+				..Default::default()
+			};
 
 			if let Err(e) =
 				app.meta_adapter.upsert_profile(tn_id, &context.issuer, &profile_upsert).await
@@ -515,6 +604,43 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			// relationship is severed, so it must NOT be 'A' (which would keep
 			// it in fan-out/broadcast queries).
 			return Ok(HookResult { status: Some('N'), ..Default::default() });
+		}
+		Some("UPD") => {
+			// The peer's hat role map for our members. Advisory only (no access decision
+			// reads `peer_hat_roles`), so it is taken from a connected peer, or one we have a
+			// pending request to (crossed CONNs: its UPD may overtake its CONN).
+			let connected = app
+				.meta_adapter
+				.read_profile(tn_id, &context.issuer)
+				.await
+				.is_ok_and(|(_, p)| p.connected.is_connected());
+			let accepted =
+				connected || our_pending_request(&app, tn_id, local_tag, &context.issuer).await;
+			if !accepted {
+				// A stranger's map is not recorded. Rest at 'D', off the fan-out lists.
+				debug!("CONN:UPD: Ignoring map from unconnected {}", context.issuer);
+				return Ok(HookResult {
+					continue_processing: false,
+					status: Some('D'),
+					..Default::default()
+				});
+			}
+			let issuer = &context.issuer;
+			if newer_upd_exists(&app, tn_id, local_tag, issuer, &context.created_at).await {
+				debug!("CONN:UPD: Ignoring map from {issuer}, a newer one is on record");
+				return Ok(HookResult {
+					continue_processing: false,
+					status: Some('D'),
+					..Default::default()
+				});
+			}
+			let profile_upsert = UpsertProfileFields {
+				peer_hat_roles: peer_hat_roles_patch(&app, &context),
+				..Default::default()
+			};
+			if let Err(e) = app.meta_adapter.upsert_profile(tn_id, issuer, &profile_upsert).await {
+				warn!("CONN:UPD: Failed to update issuer profile {}: {}", issuer, e);
+			}
 		}
 		Some(subtype) => {
 			warn!("CONN on_receive: Unknown subtype '{}', ignoring", subtype);
@@ -541,6 +667,7 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 		typ: "CONN".into(),
 		sub_typ: Some("ACC".into()),
 		audience_tag: Some(context.issuer.clone().into()),
+		content: acc_content(&app, tn_id, &context.issuer).await,
 		..Default::default()
 	};
 
@@ -575,6 +702,24 @@ pub async fn on_reject(app: App, context: HookContext) -> ClResult<HookResult> {
 	debug!("CONN: Updated issuer profile (following=false, connected=Disconnected)");
 
 	Ok(HookResult::default())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use serde_json::json;
+
+	#[test]
+	fn a_valid_roles_map_is_mirrored_anything_else_clears() {
+		let map = "contributor:supporter";
+		let got = roles_patch(Some(&json!({ "roles": map })));
+		assert!(matches!(got, Patch::Value(Some(ref r)) if &**r == map));
+		assert!(matches!(roles_patch(None), Patch::Null));
+		assert!(matches!(roles_patch(Some(&json!({}))), Patch::Null));
+		assert!(matches!(roles_patch(Some(&json!({ "roles": 3 }))), Patch::Null));
+		let leader = json!({ "roles": "contributor:leader" });
+		assert!(matches!(roles_patch(Some(&leader)), Patch::Null), "invalid map clears");
+	}
 }
 
 // vim: ts=4

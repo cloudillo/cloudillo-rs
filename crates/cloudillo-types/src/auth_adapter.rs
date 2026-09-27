@@ -61,6 +61,9 @@ pub struct ActionToken {
 	/// Visibility - P=Public, V=Verified, 2=2ndDegree, F=Follower, C=Connected, None=Direct
 	pub v: Option<char>,
 
+	/// Hat - id_tag of the community whose role the issuer acts in (relayed and endorsed by it).
+	pub h: Option<Box<str>>,
+
 	/// Nonce - Proof-of-work nonce for rate limiting (CONN actions only).
 	#[serde(rename = "_", default, skip_serializing_if = "Option::is_none")]
 	pub nonce: Option<Box<str>>,
@@ -74,6 +77,8 @@ pub struct AccessToken<S> {
 	pub sub: Option<S>,
 	pub scope: Option<S>,
 	pub r: Option<S>,
+	/// Hat - id_tag of the peer community whose mapped role `r` holds (hatted session).
+	pub h: Option<S>,
 	pub exp: Timestamp,
 }
 
@@ -120,6 +125,10 @@ pub struct AuthCtx {
 	/// identity to assert". Authorization must NOT read this: a share link's
 	/// authority comes from `scope`, and that is unchanged.
 	pub anonymous: bool,
+	/// Peer community this session wears as a hat (token claim `h`). Attribution and refresh
+	/// gating only: `roles` already holds the mapped roles. Not a delegated credential, so it
+	/// is never treated like `scope`.
+	pub hat: Option<Box<str>>,
 }
 
 #[derive(Debug)]
@@ -488,6 +497,7 @@ mod tests {
 			sub: Some("b@b".into()),
 			scope: None,
 			r: None,
+			h: None,
 			exp: Timestamp::now(),
 		};
 

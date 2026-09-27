@@ -67,7 +67,8 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 	let hook_registry = app.ext::<Arc<tokio::sync::RwLock<HookRegistry>>>()?;
 	let mut registry = hook_registry.write().await;
 
-	// CONN hooks
+	// CONN hooks. `CONN:UPD` has its own definition (its own key), and hooks are looked up by
+	// the resolved type, so it is registered too; the UPD arms in `conn` handle it.
 	{
 		let conn_hooks = ActionTypeHooks {
 			on_create: Some(Arc::new(|app, ctx| Box::pin(conn::on_create(app, ctx)))),
@@ -76,7 +77,8 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 			on_reject: Some(Arc::new(|app, ctx| Box::pin(conn::on_reject(app, ctx)))),
 		};
 
-		registry.register_type("CONN", conn_hooks);
+		registry.register_type("CONN", conn_hooks.clone());
+		registry.register_type("CONN:UPD", conn_hooks);
 		tracing::info!("Registered native hooks for CONN action type");
 	}
 

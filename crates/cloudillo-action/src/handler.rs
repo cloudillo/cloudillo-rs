@@ -81,6 +81,13 @@ pub async fn list_actions(
 		}
 	}
 
+	// Hatted actions we relayed as the hat (hat_tag == us) are addressed elsewhere, under the
+	// destination's visibility: only the tenant itself lists them.
+	let is_tenant = is_authenticated && subject_id_tag == tenant_id_tag.as_ref();
+	if is_home_feed || !is_tenant {
+		opts.exclude_hat_tag = Some(tenant_id_tag.to_string());
+	}
+
 	let limit = opts.limit.unwrap_or(20) as usize;
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
 
@@ -92,8 +99,7 @@ pub async fn list_actions(
 	if opts.count == Some(true) {
 		// Tenant/owner sees everything (Owner level); everyone else is guarded to
 		// what they may view; guest → Public only.
-		let sees_all = is_authenticated && subject_id_tag == tenant_id_tag.as_ref();
-		opts.visibility_guard = if sees_all {
+		opts.visibility_guard = if is_tenant {
 			types::Patch::Undefined // tenant/owner: sees everything
 		} else if is_authenticated {
 			types::Patch::Value(subject_id_tag.to_string())
@@ -980,6 +986,7 @@ pub async fn publish_draft(
 		x: action.x.clone(),
 		draft: None,
 		publish_at: None,
+		hat: action.hat.as_ref().map(|h| h.id_tag.clone()),
 	};
 
 	if let Some(publish_at) = req.publish_at {
@@ -1405,6 +1412,18 @@ async fn build_outbox_item(
 			return None;
 		};
 		related.insert(0, action_token);
+		// A hatted primary: the hat's endorsement proves the attribution to the mirror.
+		if let Some(hat) = action.hat.as_ref().map(|h| &*h.id_tag)
+			&& hat != tenant_id_tag
+		{
+			match crate::hat::find_hat_endorsement_token(app, tn_id, &action.action_id, hat).await {
+				Ok(Some(evidence)) => related.push(evidence),
+				Ok(None) => debug!(action_id = %action.action_id, "outbox: no hat endorsement"),
+				Err(e) => {
+					warn!(action_id = %action.action_id, error = %e, "outbox: hat endorsement fetch failed");
+				}
+			}
+		}
 		Some(OutboxItem { token: aprv_token, related })
 	}
 }

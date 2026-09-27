@@ -96,6 +96,7 @@ async fn check_action_permission(
 			roles: vec![].into(),
 			scope: None,
 			anonymous: true,
+			hat: None,
 		};
 		(guest_ctx, "guest".into())
 	};
@@ -140,6 +141,13 @@ async fn load_action_attrs(
 	let action_view = app.meta_adapter.get_action(tn_id, action_id).await?;
 
 	let action_view = action_view.ok_or(Error::NotFound)?;
+
+	// A hatted action we relayed is readable here by the tenant only (see `list_actions`).
+	if action_view.hat.as_ref().is_some_and(|h| &*h.id_tag == tenant_id_tag)
+		&& subject_id_tag != tenant_id_tag
+	{
+		return Err(Error::PermissionDenied);
+	}
 
 	// Extract audience as list of profile id_tags
 	let audience_tag = action_view

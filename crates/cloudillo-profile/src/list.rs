@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::prelude::*;
-use cloudillo_core::extract::OptionalRequestId;
+use cloudillo_core::extract::{Auth, OptionalRequestId};
+use cloudillo_core::roles::is_leader;
 use cloudillo_types::meta_adapter::{
 	ListProfileOptions, ProfileConnectionStatus, ProfileStatus, ProfileTrust,
 };
@@ -50,6 +51,10 @@ pub struct ProfileWithStatus {
 		skip_serializing_if = "Option::is_none"
 	)]
 	pub msg_read_at: Option<Timestamp>,
+	/// Our hat role map for this peer community (leaders only)
+	pub hat_roles: Option<String>,
+	/// The peer community's hat map for our members, mirrored and advisory (leaders only)
+	pub peer_hat_roles: Option<String>,
 }
 
 /// Reduced, deliberately public projection returned by `GET /api/profiles/batch`.
@@ -350,12 +355,21 @@ pub async fn list_profiles(
 pub async fn get_profile_by_id_tag(
 	State(app): State<App>,
 	tn_id: TnId,
+	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Path(id_tag): Path<String>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Option<ProfileWithStatus>>>)> {
 	// Lookup profile in local profiles table (relationship data)
 	let profile = match app.meta_adapter.read_profile(tn_id, &id_tag).await {
 		Ok((_etag, p)) => {
+			let (hat_roles, peer_hat_roles) =
+				if matches!(p.typ, cloudillo_types::meta_adapter::ProfileType::Community)
+					&& is_leader(&auth.roles)
+				{
+					(p.hat_roles.map(Into::into), p.peer_hat_roles.map(Into::into))
+				} else {
+					(None, None)
+				};
 			let typ = match p.typ {
 				cloudillo_types::meta_adapter::ProfileType::Person => None,
 				cloudillo_types::meta_adapter::ProfileType::Community => {
@@ -374,6 +388,8 @@ pub async fn get_profile_by_id_tag(
 				trust: p.trust,
 				feed_read_at: p.feed_read_at,
 				msg_read_at: p.msg_read_at,
+				hat_roles,
+				peer_hat_roles,
 			})
 		}
 		Err(Error::NotFound) => None, // Return empty when not found locally

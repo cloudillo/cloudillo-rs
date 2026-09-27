@@ -378,6 +378,7 @@ async fn test_list_actions_exclude_issuer_profile_status() {
 			visibility: None,
 			flags: None,
 			x: None,
+			hat_tag: None,
 		};
 		adapter.create_action(tn_id, &action, None).await.expect("create action");
 	}
@@ -441,6 +442,7 @@ async fn test_list_actions_status_filter_active_excludes_notif_and_confirmation(
 			visibility: None,
 			flags: None,
 			x: None,
+			hat_tag: None,
 		};
 		adapter.create_action(tn_id, &action, None).await.expect("create action");
 	}
@@ -522,6 +524,7 @@ async fn test_retired_invitation_excluded_from_pending_lookup() {
 		visibility: None,
 		flags: None,
 		x: None,
+		hat_tag: None,
 	};
 	adapter.create_action(tn_id, &action, None).await.expect("create action");
 
@@ -617,6 +620,7 @@ async fn test_create_action_redelivered_soft_deleted_is_idempotent() {
 		visibility: None,
 		flags: None,
 		x: None,
+		hat_tag: None,
 	};
 
 	// First inbound STAT for the shared key.
@@ -688,6 +692,7 @@ async fn test_get_action_by_key_skips_soft_deleted() {
 		visibility: None,
 		flags: None,
 		x: None,
+		hat_tag: None,
 	};
 
 	// First inbound STAT for the shared key.
@@ -1312,3 +1317,175 @@ async fn an_unfinalized_row_is_readable_by_f_id_but_has_no_file_id() {
 }
 
 // vim: ts=4
+
+/// A POST by `issuer`, optionally wearing `hat`.
+fn hatted_post<'a>(action_id: &'a str, issuer: &'a str, hat: Option<&'a str>) -> Action<&'a str> {
+	Action {
+		action_id,
+		typ: "POST",
+		sub_typ: None,
+		issuer_tag: issuer,
+		parent_id: None,
+		root_id: None,
+		audience_tag: Some("host.example"),
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: Timestamp::now(),
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+		hat_tag: hat,
+	}
+}
+
+#[tokio::test]
+async fn test_hat_tag_round_trips_and_resolves() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	// `comm.example` has a local community profile, `bare.example` has none.
+	let fields = UpsertProfileFields {
+		name: Patch::Value("The Community".into()),
+		typ: Patch::Value(ProfileType::Community),
+		..Default::default()
+	};
+	adapter.upsert_profile(tn_id, "comm.example", &fields).await.expect("upsert");
+
+	let key = "POST:hatted";
+	adapter
+		.create_action(tn_id, &hatted_post("a1~h1", "alice", Some("comm.example")), Some(key))
+		.await
+		.expect("create");
+	adapter
+		.create_action(tn_id, &hatted_post("a1~h2", "alice", Some("bare.example")), None)
+		.await
+		.expect("create");
+
+	let got = adapter.get_action(tn_id, "a1~h1").await.expect("get").expect("exists");
+	let hat = got.hat.expect("hat resolved");
+	assert_eq!(hat.id_tag.as_ref(), "comm.example");
+	assert_eq!(hat.name.as_ref(), "The Community", "resolved through the profile join");
+
+	let bare = adapter.get_action(tn_id, "a1~h2").await.expect("get").expect("exists");
+	assert_eq!(bare.hat.expect("hat").id_tag.as_ref(), "bare.example", "id_tag fallback");
+
+	let by_key = adapter.get_action_by_key(tn_id, key).await.expect("by key").expect("exists");
+	assert_eq!(by_key.hat_tag.as_deref(), Some("comm.example"));
+
+	let opts = ListActionOptions { typ: Some(vec!["POST".into()]), ..Default::default() };
+	let listed = adapter.list_actions(tn_id, &opts).await.expect("list");
+	let h1 = listed.iter().find(|a| a.action_id.as_ref() == "a1~h1").expect("listed");
+	assert_eq!(h1.hat.as_ref().map(|h| h.id_tag.as_ref()), Some("comm.example"));
+}
+
+#[tokio::test]
+async fn test_list_actions_exclude_hat_tag() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	for (id, hat) in [("a1~x", Some("x.example")), ("a1~y", Some("y.example")), ("a1~n", None)] {
+		adapter
+			.create_action(tn_id, &hatted_post(id, "alice", hat), None)
+			.await
+			.expect("create");
+	}
+	let opts = ListActionOptions {
+		typ: Some(vec!["POST".into()]),
+		exclude_hat_tag: Some("x.example".into()),
+		..Default::default()
+	};
+	let res = adapter.list_actions(tn_id, &opts).await.expect("list");
+	let ids: Vec<&str> = res.iter().map(|a| a.action_id.as_ref()).collect();
+	assert!(!ids.contains(&"a1~x"), "the excluded hat is hidden");
+	assert!(ids.contains(&"a1~y"), "another hat is kept");
+	assert!(ids.contains(&"a1~n"), "no hat (NULL) is kept");
+}
+
+#[tokio::test]
+async fn test_hat_roles_upsert_on_insert_and_update() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	// Created branch: the INSERT must carry both maps.
+	let fields = UpsertProfileFields {
+		typ: Patch::Value(ProfileType::Community),
+		hat_roles: Patch::Value(Some("contributor:supporter".into())),
+		peer_hat_roles: Patch::Value(Some("moderator:contributor".into())),
+		..Default::default()
+	};
+	adapter.upsert_profile(tn_id, "comm.example", &fields).await.expect("insert");
+	let (_, p) = adapter.read_profile(tn_id, "comm.example").await.expect("read");
+	assert_eq!(p.hat_roles.as_deref(), Some("contributor:supporter"));
+	assert_eq!(p.peer_hat_roles.as_deref(), Some("moderator:contributor"));
+
+	// Update branch: one map changed, the other cleared.
+	let fields = UpsertProfileFields {
+		hat_roles: Patch::Value(Some("contributor:contributor".into())),
+		peer_hat_roles: Patch::Null,
+		..Default::default()
+	};
+	adapter.upsert_profile(tn_id, "comm.example", &fields).await.expect("update");
+	let (_, p) = adapter.read_profile(tn_id, "comm.example").await.expect("read");
+	assert_eq!(p.hat_roles.as_deref(), Some("contributor:contributor"));
+	assert_eq!(p.peer_hat_roles, None);
+}
+
+/// `CONN:UPD` keys apart from the relationship row (`CONN:<iss>:<aud>`), so storing a UPD
+/// never retires the CONN. A retried older UPD retires the newer one under their shared key,
+/// and the `conn` hook's ordering lookup must still find the newer, retired row.
+#[tokio::test]
+async fn test_conn_upd_keeps_the_conn_row_and_orders_by_created_at() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	let t0 = Timestamp::now().0;
+	let conn = |action_id: &'static str, sub_typ: Option<&'static str>, at: i64| Action {
+		action_id,
+		typ: "CONN",
+		sub_typ,
+		issuer_tag: "alice",
+		parent_id: None,
+		root_id: None,
+		audience_tag: Some("owner"),
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: Timestamp(at),
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+		hat_tag: None,
+	};
+	let (conn_key, upd_key) = ("CONN:alice:owner", "CONN:UPD:alice:owner");
+	adapter
+		.create_action(tn_id, &conn("a1~conn", None, t0), Some(conn_key))
+		.await
+		.expect("conn");
+	let newer = conn("a1~upd-new", Some("UPD"), t0 + 10);
+	adapter.create_action(tn_id, &newer, Some(upd_key)).await.expect("newer upd");
+	let older = conn("a1~upd-old", Some("UPD"), t0 + 5);
+	adapter.create_action(tn_id, &older, Some(upd_key)).await.expect("older upd");
+
+	let live = adapter.get_action_by_key(tn_id, conn_key).await.expect("by key");
+	assert_eq!(live.map(|a| a.action_id), Some("a1~conn".into()), "the CONN row stays live");
+
+	let opts = ListActionOptions {
+		typ: Some(vec!["CONN".into()]),
+		issuer: Some("alice".into()),
+		audience: Some("owner".into()),
+		status: Some(vec!["A".into(), "D".into()]),
+		created_after: Some(Timestamp(t0 + 5)),
+		exclude_sub_typ: Some(Box::new(["ACC".into(), "DEL".into()])),
+		..Default::default()
+	};
+	let rows = adapter.list_actions(tn_id, &opts).await.expect("list");
+	let ids: Vec<&str> = rows.iter().map(|a| a.action_id.as_ref()).collect();
+	assert_eq!(ids, ["a1~upd-new"], "the retired newer UPD is found, the older is not");
+}

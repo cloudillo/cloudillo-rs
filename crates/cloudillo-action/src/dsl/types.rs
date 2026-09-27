@@ -118,6 +118,9 @@ pub struct ContentSchema {
 	/// Required properties (for object type)
 	pub required: Option<Vec<String>>,
 
+	/// A non-object content value is shorthand for `{ <wrap_scalar>: value }`
+	pub wrap_scalar: Option<String>,
+
 	/// Description
 	pub description: Option<String>,
 }
@@ -239,6 +242,10 @@ pub struct BehaviorFlags {
 	/// Same logic but checks the subject action.
 	/// E.g., 'R' for REACT: if subject has 'r' (reactions disabled), reject.
 	pub gated_by_subject_flag: Option<char>,
+
+	/// May carry a hat (`h`): the issuer acts at the audience as a member of another community.
+	/// Unset refuses a hatted action, at creation and inbound (`process.rs`, step 3c).
+	pub allow_hat: Option<bool>,
 
 	// === Reserved (Not Implemented) ===
 	/// RESERVED: Requires user confirmation before activation.

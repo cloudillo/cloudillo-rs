@@ -233,6 +233,7 @@ pub async fn get_search(
 		// contexts. Inert here: visibility below derives from `scope` + `id_tag`, never
 		// from this flag, which must not be used for authorization.
 		anonymous: true,
+		hat: None,
 	});
 	if q.q.chars().count() > MAX_QUERY_CHARS {
 		return Err(Error::ValidationError("Search query too long".into()));

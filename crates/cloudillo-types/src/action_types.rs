@@ -37,6 +37,8 @@ pub struct CreateAction {
 	/// Scheduled publish time (implies draft=true). Sets created_at to this time.
 	#[serde(rename = "publishAt")]
 	pub publish_at: Option<Timestamp>,
+	/// Hat community id_tag (signed as `h`): the action is relayed through and endorsed by it
+	pub hat: Option<Box<str>>,
 }
 
 /// Action status codes for tracking action lifecycle state

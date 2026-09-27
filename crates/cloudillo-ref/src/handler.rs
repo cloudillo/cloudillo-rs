@@ -782,6 +782,7 @@ mod tests {
 			roles: roles.iter().map(|r| Box::from(*r)).collect(),
 			scope: scope.map(Box::from),
 			anonymous: false,
+			hat: None,
 		}
 	}
 

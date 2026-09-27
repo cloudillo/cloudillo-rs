@@ -9,6 +9,7 @@ pub mod fanout;
 pub mod filter;
 pub mod forward;
 pub mod handler;
+pub(crate) mod hat;
 pub(crate) mod helpers;
 pub mod history_sync;
 pub mod hooks;

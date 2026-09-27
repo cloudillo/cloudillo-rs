@@ -73,6 +73,7 @@ pub async fn get_container_content(
 				roles: vec![].into(),
 				scope: None,
 				anonymous: true,
+				hat: None,
 			};
 			(guest_ctx, "guest".into())
 		};

@@ -345,6 +345,9 @@ pub struct AdminProfilePatch {
 	pub roles: Patch<Option<Vec<String>>>,
 	#[serde(default)]
 	pub status: Patch<crate::meta_adapter::ProfileStatus>,
+	/// Hat role map for a peer community (`peer_role:local_role,…`), leader-only
+	#[serde(default)]
+	pub hat_roles: Patch<Option<String>>,
 }
 
 /// Profile information response

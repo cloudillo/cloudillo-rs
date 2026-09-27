@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use cloudillo_core::scheduler::{Task, TaskId};
+use cloudillo_types::auth_adapter::ActionToken;
+use cloudillo_types::utils::decode_jwt_no_verify;
+
+use crate::dsl::DslEngine;
+use crate::subject_ref::{SubjectRef, parse_subject_ref};
 
 use crate::prelude::*;
 
@@ -104,7 +109,14 @@ impl Task<App> for ActionDeliveryTask {
 			if let Ok(Some(related_token)) =
 				app.meta_adapter.get_action_token(self.tn_id, related_id).await
 			{
-				payload["related"] = serde_json::json!([related_token]);
+				let mut related = vec![related_token.clone()];
+				match hat_extra(app, self.tn_id, related_id, &related_token).await {
+					Ok(extra) => related.extend(extra),
+					Err(e) => {
+						warn!(related_id = %related_id, error = %e, "delivery: hat bundle skipped");
+					}
+				}
+				payload["related"] = serde_json::json!(related);
 				debug!(
 					"Including related action {} token in delivery to {}",
 					related_id, self.target_instance
@@ -137,6 +149,53 @@ impl Task<App> for ActionDeliveryTask {
 	}
 }
 
+/// What a hatted related action needs besides itself.
+#[derive(Debug, PartialEq, Eq)]
+enum Extra<'a> {
+	/// Another community's hat is on it: that hat's endorsement, the proof a mirror needs to
+	/// admit it with the attribution.
+	Endorsement(&'a str),
+	/// We are its hat, relaying it: its own `deliver_subject` subject (a REPOST's original),
+	/// which the audience takes pre-approved under it, as for any REPOST.
+	Subject(&'a str),
+}
+
+/// [`Extra`] for the related action `t`, as the tenant `us`; `deliver_subject` is its type's flag.
+fn hat_extra_choice<'a>(t: &'a ActionToken, us: &str, deliver_subject: bool) -> Option<Extra<'a>> {
+	let hat = t.h.as_deref()?;
+	if hat != us {
+		return Some(Extra::Endorsement(hat));
+	}
+	let sub = t.sub.as_deref().filter(|_| deliver_subject)?;
+	matches!(parse_subject_ref(sub), Some(SubjectRef::Action(_))).then_some(Extra::Subject(sub))
+}
+
+/// The token [`hat_extra_choice`] picks for `related_token`, if any.
+async fn hat_extra(
+	app: &App,
+	tn_id: TnId,
+	related_id: &str,
+	related_token: &str,
+) -> ClResult<Option<Box<str>>> {
+	let related = decode_jwt_no_verify::<ActionToken>(related_token)?;
+	if related.h.is_none() {
+		return Ok(None);
+	}
+	let us = app.meta_adapter.read_tenant(tn_id).await?.id_tag;
+	let deliver_subject = app
+		.ext::<Arc<DslEngine>>()?
+		.definition_for(&related.t, None)
+		.and_then(|d| d.behavior.deliver_subject)
+		.unwrap_or(false);
+	match hat_extra_choice(&related, &us, deliver_subject) {
+		Some(Extra::Endorsement(hat)) => {
+			crate::hat::find_hat_endorsement_token(app, tn_id, related_id, hat).await
+		}
+		Some(Extra::Subject(sub)) => app.meta_adapter.get_action_token(tn_id, sub).await,
+		None => Ok(None),
+	}
+}
+
 impl Clone for ActionDeliveryTask {
 	fn clone(&self) -> Self {
 		Self {
@@ -146,6 +205,35 @@ impl Clone for ActionDeliveryTask {
 			target_id_tag: self.target_id_tag.clone(),
 			related_action_id: self.related_action_id.clone(),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const US: &str = "a.example";
+
+	fn repost(hat: Option<&str>, sub: &str) -> ActionToken {
+		ActionToken {
+			iss: "alice.example".into(),
+			t: "REPOST".into(),
+			aud: Some("b.example".into()),
+			sub: Some(sub.into()),
+			h: hat.map(Into::into),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn hat_extra_choices() {
+		assert_eq!(hat_extra_choice(&repost(None, "a1~orig"), US, true), None);
+		let foreign = repost(Some("c.example"), "a1~orig");
+		assert_eq!(hat_extra_choice(&foreign, US, true), Some(Extra::Endorsement("c.example")));
+		let ours = repost(Some(US), "a1~orig");
+		assert_eq!(hat_extra_choice(&ours, US, true), Some(Extra::Subject("a1~orig")));
+		assert_eq!(hat_extra_choice(&ours, US, false), None);
+		assert_eq!(hat_extra_choice(&repost(Some(US), "@alice.example"), US, true), None);
 	}
 }
 

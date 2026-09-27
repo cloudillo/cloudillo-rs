@@ -251,6 +251,7 @@ async fn authenticate(
 				roles: validation.roles.map(|r| crate::roles::parse_roles(&r)).unwrap_or_default(),
 				scope: validation.scopes,
 				anonymous: false,
+				hat: None,
 			}
 		}
 		Some(ApiKeyType::Idp) => {
@@ -278,6 +279,7 @@ async fn authenticate(
 				roles: Box::new([]), // IDP keys don't have roles
 				scope: None,
 				anonymous: false,
+				hat: None,
 			}
 		}
 		None => {
@@ -402,6 +404,7 @@ pub async fn optional_auth(
 										.unwrap_or_default(),
 									scope: validation.scopes,
 									anonymous: false,
+									hat: None,
 								})
 							})
 						}
@@ -415,6 +418,7 @@ pub async fn optional_auth(
 										roles: Box::new([]),
 										scope: None,
 										anonymous: false,
+										hat: None,
 									})),
 									Ok(None) => {
 										warn!(
@@ -516,6 +520,7 @@ mod tests {
 			roles: roles.iter().map(|r| Box::from(*r)).collect(),
 			scope: scope.map(Box::from),
 			anonymous: false,
+			hat: None,
 		}
 	}
 
