@@ -21,6 +21,17 @@ const DEFAULT_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(100) {
 	None => unreachable!(),
 };
 
+/// Max prefixes cached per `list_by_prefix` call (mirrors the sqlite adapter's `MAX_PREFIXES`)
+const MAX_LISTING_PREFIXES: usize = 20;
+
+/// Synthetic cache key for the merged `list_by_prefix` listing of one prefix.
+/// `*:` can't start a registered setting key, so it never collides with a value entry.
+/// ponytail: listings share the 100-entry LRU with single values; raise the capacity if
+/// chan.mute listings measurably evict hot keys.
+fn listing_cache_key(prefix: &str) -> String {
+	format!("*:{}", prefix)
+}
+
 /// LRU cache for settings values.
 /// Uses Mutex because LruCache::get mutates internal recency state.
 pub struct SettingsCache {
@@ -297,6 +308,7 @@ impl SettingsService {
 		// any tenant whose value resolved through the now-stale (tenant or
 		// global) row re-resolves on next read.
 		self.cache.invalidate_key(key);
+		self.invalidate_listings(storage_tn_id, key);
 
 		info!("Setting '{}' updated for tn_id={}", key, storage_tn_id.0);
 
@@ -313,6 +325,7 @@ impl SettingsService {
 	pub async fn delete(&self, tn_id: TnId, key: &str) -> ClResult<bool> {
 		self.meta.update_setting(tn_id, key, None).await?;
 		self.cache.invalidate_key(key);
+		self.invalidate_listings(tn_id, key);
 
 		info!("Setting '{}' deleted for tn_id={}", key, tn_id.0);
 		Ok(true)
@@ -401,6 +414,7 @@ impl SettingsService {
 		// per-tenant override, any other tenant whose cached resolution
 		// flowed through the same `key` should still re-resolve on next read.
 		self.cache.invalidate_key(key);
+		self.invalidate_listings(storage_tn_id, key);
 
 		info!("Setting '{}' cleared for tn_id={}", key, storage_tn_id.0);
 		Ok(())
@@ -554,26 +568,36 @@ impl SettingsService {
 	/// This queries the database for actual stored settings matching the prefixes,
 	/// then resolves each against the registry (supporting wildcard patterns like "ui.*").
 	/// Global settings are merged with tenant-specific settings (tenant overrides global).
+	///
+	/// Each prefix's merged listing is cached per tenant under [`listing_cache_key`]
+	/// and invalidated by [`Self::invalidate_listings`] on every write.
 	pub async fn list_by_prefix(
 		&self,
 		tn_id: TnId,
 		prefixes: &[String],
 	) -> ClResult<Vec<(String, SettingValue, &SettingDefinition)>> {
-		let prefixes_dotted: Vec<String> = prefixes.iter().map(|p| format!("{}.", p)).collect();
-
-		// Get global settings first (`SHARED_TN`)
-		let global_settings = self.meta.list_settings(SHARED_TN, Some(&prefixes_dotted)).await?;
-
-		// Get tenant-specific settings (override global)
-		let tenant_settings = if tn_id == SHARED_TN {
-			std::collections::HashMap::new()
+		let merged = if prefixes.is_empty() {
+			// No prefix = every stored setting; not worth caching
+			self.fetch_merged(tn_id, &[]).await?
 		} else {
-			self.meta.list_settings(tn_id, Some(&prefixes_dotted)).await?
+			let mut merged = serde_json::Map::new();
+			// Same cap as the adapter's prefix filter, so one request can't flood the LRU
+			for prefix in prefixes.iter().take(MAX_LISTING_PREFIXES) {
+				let cache_key = listing_cache_key(prefix);
+				let listing = if let Some(SettingValue::Json(serde_json::Value::Object(listing))) =
+					self.cache.get(tn_id, &cache_key)
+				{
+					listing
+				} else {
+					let listing = self.fetch_merged(tn_id, &[format!("{}.", prefix)]).await?;
+					let cached = SettingValue::Json(serde_json::Value::Object(listing.clone()));
+					self.cache.put(tn_id, cache_key, cached);
+					listing
+				};
+				merged.extend(listing);
+			}
+			merged
 		};
-
-		// Merge: tenant overrides global
-		let mut merged = global_settings;
-		merged.extend(tenant_settings);
 
 		let mut result = Vec::new();
 		for (key, json_value) in merged {
@@ -585,6 +609,37 @@ impl SettingsService {
 		}
 
 		Ok(result)
+	}
+
+	/// Global rows merged with the tenant's own (tenant overrides global).
+	async fn fetch_merged(
+		&self,
+		tn_id: TnId,
+		prefixes_dotted: &[String],
+	) -> ClResult<serde_json::Map<String, serde_json::Value>> {
+		let mut merged: serde_json::Map<String, serde_json::Value> = self
+			.meta
+			.list_settings(SHARED_TN, Some(prefixes_dotted))
+			.await?
+			.into_iter()
+			.collect();
+		if tn_id != SHARED_TN {
+			merged.extend(self.meta.list_settings(tn_id, Some(prefixes_dotted)).await?);
+		}
+		Ok(merged)
+	}
+
+	/// Drop cached `list_by_prefix` listings a write to `key` at `storage_tn_id` could
+	/// change. A global row feeds every tenant's listing, so a `SHARED_TN` write clears
+	/// the whole cache (admin-rare); otherwise drop the listing of every dotted ancestor.
+	fn invalidate_listings(&self, storage_tn_id: TnId, key: &str) {
+		if storage_tn_id == SHARED_TN {
+			self.cache.clear();
+			return;
+		}
+		for (i, _) in key.match_indices('.') {
+			self.cache.invalidate_key(&listing_cache_key(&key[..i]));
+		}
 	}
 
 	/// List stored settings at exactly one level (no merge, no fallback).
