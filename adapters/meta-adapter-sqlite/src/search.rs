@@ -1299,6 +1299,15 @@ fn push_search_filters(
 		}
 	}
 
+	// Document children (`'F'` rows inside a tree) are never search hits; their
+	// container's row and `'D'` parts stand for them — except a scope's own child row,
+	// which is the one thing a token scoped to it can find.
+	query.push(" AND NOT (d.obj_tp='F' AND d.root_id IS NOT NULL");
+	if let Some(grant) = opts.scope_grant_file_id.as_deref() {
+		query.push(" AND d.obj_id<>").push_bind(grant.to_owned());
+	}
+	query.push(")");
+
 	// A file-scoped token and an explicit `fileId` filter narrow the same way:
 	// the container file's own row, plus every row in its document tree.
 	for file_id in [opts.scope_file_id.as_deref(), opts.file_id.as_deref()].into_iter().flatten() {
@@ -1337,15 +1346,13 @@ fn push_search_filters(
 	// - `'P'` profiles — none beyond requiring an *identified* caller.
 	// - `'F'` files and `'D'` deep parts — the level predicate, correct because
 	//   the tenant owns both.
-	// - `'A'` actions — the canonical issuer-keyed predicate shared with
-	//   `GET /api/actions`. Keying on the *issuer* is the point: a viewer who
-	//   follows the tenant is not thereby a follower of every issuer whose posts
-	//   the tenant has federated in. It reads the live `actions` row through an
-	//   indexed point lookup rather than the denormalised mirror, so an action's
-	//   index row cannot go stale with respect to its own ACL.
+	// - `'A'` actions — the predicate shared with `GET /api/actions`, keyed on the
+	//   *reader's* relation to the tenant (`opts.viewer_relation`), as a single GET
+	//   is. A leader skips it (`opts.actions_unguarded`). It reads the live
+	//   `actions` row through an indexed point lookup rather than the denormalised
+	//   mirror, so an action's index row cannot go stale with respect to its own ACL.
+	let viewer = opts.viewer_id_tag.as_deref().filter(|v| !v.is_empty() && *v != "guest");
 	if let Some(levels) = &opts.visible_levels {
-		let viewer = opts.viewer_id_tag.as_deref().filter(|v| !v.is_empty() && *v != "guest");
-
 		query.push(" AND (");
 		// Profiles are tenant-scoped and findable by any *identified* caller, as
 		// `GET /api/profiles` already allows — but not by an anonymous one. This
@@ -1363,14 +1370,18 @@ fn push_search_filters(
 		// A delegated token's grant: the shared file's own row and the deep `'D'`
 		// parts of its tree are visible whatever their `visibility` says, because
 		// the share *is* the permission to read them. Child `'F'` rows in the same
-		// tree are deliberately not included — they keep the level predicate, which
-		// is what `GET /api/files`' document-scope branch does. This widens only
-		// within the subtree `scope_file_id` already confined the results to.
+		// tree never get here: tree children are excluded outright above. This
+		// widens only within the subtree `scope_file_id` already confined the
+		// results to.
 		if let Some(grant) = opts.scope_grant_file_id.as_deref() {
 			query.push(" OR d.obj_id=").push_bind(grant.to_owned());
 			query.push(" OR (d.root_id=").push_bind(grant.to_owned());
 			query.push(" AND d.obj_tp='D')");
 		}
+		if opts.role_grant {
+			query.push(" OR d.upstream_tag IS NULL");
+		}
+		push_share_arm(query, tn_id, opts);
 		query.push("))");
 
 		// The status test mirrors `push_action_filters`' default and `get_action`:
@@ -1378,16 +1389,34 @@ fn push_search_filters(
 		// retracted or key-superseded action stays a search hit while
 		// `GET /api/actions` already hides it — the raw-SQL dedup paths in
 		// `action.rs` set the status without notifying the index, so nothing else
-		// would correct it before the weekly full reindex.
+		// would correct it before the weekly full reindex. Drafts and scheduled
+		// rows are the issuer's alone, as in `push_action_filters`.
 		query.push(
 			" OR (d.obj_tp='A' AND EXISTS (SELECT 1 FROM actions a \
 			 WHERE a.tn_id=d.tn_id AND a.action_id=d.obj_id \
 			 AND coalesce(a.status, 'A') NOT IN ('D', 'V', 'F') AND ",
 		);
-		crate::action::push_action_visibility_predicate(query, "a", viewer);
+		crate::action::push_draft_guard(query, "a", viewer);
+		if !opts.actions_unguarded {
+			query.push(" AND ");
+			crate::action::push_action_visibility_predicate(
+				query,
+				"a",
+				viewer.map(|v| (v, opts.viewer_relation)),
+			);
+		}
 		query.push("))");
 
 		query.push(")");
+	} else {
+		// Unfiltered caller: no visibility predicate, but status and draft rules still hold.
+		query.push(
+			" AND (d.obj_tp<>'A' OR EXISTS (SELECT 1 FROM actions a \
+			 WHERE a.tn_id=d.tn_id AND a.action_id=d.obj_id \
+			 AND coalesce(a.status, 'A') NOT IN ('D', 'V', 'F') AND ",
+		);
+		crate::action::push_draft_guard(query, "a", viewer);
+		query.push("))");
 	}
 
 	// Channel gate. File rows carry the room in `d.channel` (via `refresh_file_acl`); actions
@@ -1401,6 +1430,7 @@ fn push_search_filters(
 			query.push(" OR (d.root_id=").push_bind(grant.to_owned());
 			query.push(" AND d.obj_tp='D')");
 		}
+		push_share_arm(query, tn_id, opts);
 		query.push(
 			")) OR (d.obj_tp='A' AND EXISTS (SELECT 1 FROM actions a \
 			 WHERE a.tn_id=d.tn_id AND a.action_id=d.obj_id AND ",
@@ -1410,6 +1440,14 @@ fn push_search_filters(
 	}
 
 	Ok(())
+}
+
+/// ` OR <shared>`: rows `opts.share_subject` holds a share on (directly or via an ancestor
+/// folder) — the file's own `'F'` row and its `'D'` parts. Nothing without a subject.
+fn push_share_arm(query: &mut QueryBuilder<Sqlite>, tn_id: TnId, opts: &SearchOptions) {
+	let Some(subject) = opts.share_subject.as_deref() else { return };
+	query.push(" OR (CASE d.obj_tp WHEN 'D' THEN d.root_id ELSE d.obj_id END) IN ");
+	crate::file::push_shared_file_ids(query, tn_id, subject);
 }
 
 /// `(<col> IS NULL OR <col> IN (:enterable))`; an empty set leaves the open floor only.

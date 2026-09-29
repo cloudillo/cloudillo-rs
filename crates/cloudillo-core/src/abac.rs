@@ -740,7 +740,7 @@ impl PermissionChecker {
 		// Note: "guest" id_tag is used for unauthenticated users - treat as Public
 		// A delegated token's `id_tag` is the tenant's own (minted `sub: None`), so it is not a
 		// subject at all — its authority is the scope, already resolved into `access_level`.
-		// Same gate `file_access::visibility_grants_read_fallback` applies.
+		// Same rule `file_access::get_access_level`'s visibility rung applies (scoped = guest).
 		let is_authenticated =
 			!delegated && !subject.id_tag.is_empty() && subject.id_tag.as_ref() != "guest";
 		let access_level = if is_owner || is_issuer {

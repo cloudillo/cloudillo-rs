@@ -17,9 +17,9 @@ use cloudillo_types::{
 	error::Error,
 	meta_adapter::{
 		Action, ActionId, CreateFile, FileStatus, FinalizeActionOptions, ListActionOptions,
-		ListFileOptions, ListProfileOptions, MANAGED_PARENT_ID, MetaAdapter, ProfileType,
-		SearchObject, SearchOptions, SearchPart, SearchRow, TRASH_PARENT_ID, UpdateFileOptions,
-		UpsertProfileFields,
+		ListFileOptions, ListProfileOptions, MANAGED_PARENT_ID, MetaAdapter, ProfileRelation,
+		ProfileType, SearchObject, SearchOptions, SearchPart, SearchRow, TRASH_PARENT_ID,
+		UpdateFileOptions, UpsertProfileFields,
 	},
 	types::{Patch, Timestamp, TnId},
 	worker::WorkerPool,
@@ -619,9 +619,9 @@ one_mode! {
 			.replace_search_object(
 				tn_id,
 				&SearchObject {
-					obj_tp: 'A',
-					obj_id: "a1~b",
-					content_type: Some("cloudillo/action"),
+					obj_tp: 'P',
+					obj_id: "bob.example",
+					content_type: Some("cloudillo/profile"),
 					fts_cl,
 						..Default::default()
 				},
@@ -1198,13 +1198,14 @@ one_mode! {
 // --- per-object-type visibility --------------------------------------------
 
 one_mode! {
-	async fn action_visibility_follows_the_issuer_not_the_tenant(fts_cl: bool) {
+	async fn action_visibility_follows_the_reader_not_the_issuer(fts_cl: bool) {
 		let (adapter, _dir) = create_test_adapter().await;
 		let tn_id = TnId(1);
 		adapter.create_tenant(tn_id, "alice").await.ok();
 
-		// A follower-only post federated in from an issuer the tenant does not
-		// follow. `bob` following the *tenant* says nothing about `carol`.
+		// A follower-only post from an issuer the tenant follows. Following the
+		// *issuer* says nothing about `bob`; only bob's relation to the tenant,
+		// bound by the handler as `viewer_relation`, decides.
 		adapter
 			.upsert_profile(
 				tn_id,
@@ -1212,7 +1213,7 @@ one_mode! {
 				&UpsertProfileFields {
 					name: Patch::Value("Carol".into()),
 					typ: Patch::Value(ProfileType::Person),
-					following: Patch::Value(false),
+					following: Patch::Value(true),
 					..Default::default()
 				},
 			)
@@ -1236,22 +1237,19 @@ one_mode! {
 
 		assert!(
 			find_as(&adapter, tn_id, "kovetoknek", "bob.example", fts_cl).await.is_empty(),
-			"a follower-only post must stay hidden while its issuer is not followed"
+			"a follower-only post must stay hidden from a reader who does not follow the tenant"
 		);
 
-		adapter
-			.upsert_profile(
-				tn_id,
-				"carol.example",
-				&UpsertProfileFields { following: Patch::Value(true), ..Default::default() },
-			)
-			.await
-			.expect("follow issuer");
-
+		let o = SearchOptions {
+			visible_levels: Some(vec!['P', 'V', '2', 'F']),
+			viewer_id_tag: Some("bob.example".into()),
+			viewer_relation: ProfileRelation { follower: true, ..Default::default() },
+			..opts("kovetoknek", fts_cl)
+		};
 		assert_eq!(
-			find_as(&adapter, tn_id, "kovetoknek", "bob.example", fts_cl).await.len(),
+			adapter.search(tn_id, &o).await.expect("search").len(),
 			1,
-			"following the issuer must reveal their follower-only post"
+			"a reader following the tenant sees the follower-only post"
 		);
 	}
 }
@@ -1754,7 +1752,7 @@ both_modes! {
 	/// then routes anything but an Active row to the deletion path — mirrored here
 	/// by `index_action`.
 	async fn the_action_sweep_un_indexes_a_retracted_action(fts_cl: bool) {
-		let (adapter, _dir) = create_test_adapter().await;
+		let (adapter, dir) = create_test_adapter().await;
 		let tn_id = TnId(1);
 		adapter.create_tenant(tn_id, "alice").await.ok();
 
@@ -1775,11 +1773,18 @@ both_modes! {
 		assert_eq!(find(&adapter, tn_id, "titkos", fts_cl).await.len(), 1);
 
 		adapter.delete_action(tn_id, "a1~visszavont").await.expect("retract");
-		assert_eq!(
-			find(&adapter, tn_id, "titkos", fts_cl).await.len(),
-			1,
-			"a soft delete alone leaves the index row behind — that is the bug"
-		);
+		// The query-time status guard already hides it; the row itself is still there.
+		assert!(find(&adapter, tn_id, "titkos", fts_cl).await.is_empty());
+		let db = probe(&dir).await;
+		let indexed = || async {
+			sqlx::query_scalar::<_, i64>(
+				"SELECT count(*) FROM search_docs WHERE obj_id='a1~visszavont'",
+			)
+			.fetch_one(&db)
+			.await
+			.expect("count")
+		};
+		assert_eq!(indexed().await, 1, "a soft delete alone leaves the index row behind");
 
 		// The default listing cannot see it — a sweep using it would miss the row.
 		let browse = adapter
@@ -1798,10 +1803,7 @@ both_modes! {
 		for action in &sweep {
 			index_action(&adapter, tn_id, &action.action_id, fts_cl).await;
 		}
-		assert!(
-			find(&adapter, tn_id, "titkos", fts_cl).await.is_empty(),
-			"a retracted action stayed searchable"
-		);
+		assert_eq!(indexed().await, 0, "the sweep left the retracted action indexed");
 	}
 }
 
@@ -1881,6 +1883,44 @@ one_mode! {
 			);
 			assert_eq!(adapter.count_search(tn_id, &viewer).await.expect("count"), 1);
 		}
+	}
+
+	/// An unfiltered (owner/leader) search skips the visibility predicate but not
+	/// the status and draft rules: another member's draft and a deleted row stay
+	/// hidden, the viewer's own draft does not.
+	async fn an_unfiltered_search_still_hides_drafts_and_dead_actions(fts_cl: bool) {
+		let (adapter, dir) = create_test_adapter().await;
+		let tn_id = TnId(1);
+		adapter.create_tenant(tn_id, "alice").await.ok();
+
+		for (action_id, issuer_tag) in
+			[("a1~sajat", "bob"), ("a1~masik", "carol"), ("a1~torolt", "alice")]
+		{
+			let a = NewAction {
+				action_id,
+				typ: "POST",
+				issuer_tag,
+				visibility: Some('P'),
+				text: "vazlat szoveg",
+				..Default::default()
+			};
+			publish_action(&adapter, tn_id, a, fts_cl).await;
+		}
+		let db = probe(&dir).await;
+		force_action_status(&db, tn_id, "a1~sajat", Some("R")).await;
+		force_action_status(&db, tn_id, "a1~masik", Some("R")).await;
+		force_action_status(&db, tn_id, "a1~torolt", Some("D")).await;
+
+		let owner = SearchOptions { viewer_id_tag: Some("bob".into()), ..opts("vazlat", fts_cl) };
+		let got: Vec<String> = adapter
+			.search(tn_id, &owner)
+			.await
+			.expect("search")
+			.iter()
+			.map(|r| r.obj_id.to_string())
+			.collect();
+		assert_eq!(got, vec!["a1~sajat".to_string()]);
+		assert_eq!(adapter.count_search(tn_id, &owner).await.expect("count"), 1);
 	}
 }
 
@@ -2911,6 +2951,23 @@ one_mode! {
 		// Same query without the grant: a Public-level caller sees no Direct row.
 		let ungranted = SearchOptions { scope_grant_file_id: None, ..granted };
 		assert!(adapter.search(tn_id, &ungranted).await.expect("search").is_empty());
+
+		// A share of the tree child itself: its own `'F'` row is exempt from the
+		// tree-children exclusion, or the scoped search would find nothing.
+		let child_scope = SearchOptions {
+			scope_file_id: Some("f1~child".into()),
+			scope_grant_file_id: Some("f1~child".into()),
+			..ungranted
+		};
+		let mut got: Vec<(char, String)> = adapter
+			.search(tn_id, &child_scope)
+			.await
+			.expect("search")
+			.iter()
+			.map(|r| (r.obj_tp, r.obj_id.to_string()))
+			.collect();
+		got.sort();
+		assert_eq!(got, vec![('D', "f1~child".to_string()), ('F', "f1~child".to_string())]);
 	}
 }
 

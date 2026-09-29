@@ -78,8 +78,9 @@ async fn check_action_permission(
 	if action_id.starts_with('@') {
 		let auth_ctx = maybe_auth_ctx.ok_or(Error::PermissionDenied)?;
 		let draft = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+		// Someone else's draft does not exist for this caller.
 		if draft.issuer.id_tag.as_ref() != auth_ctx.id_tag.as_ref() {
-			return Err(Error::PermissionDenied);
+			return Err(Error::NotFound);
 		}
 		return Ok(next.run(req).await);
 	}
@@ -127,6 +128,26 @@ async fn check_action_permission(
 	Ok(next.run(req).await)
 }
 
+/// Require read on `action_id` through the same path as `GET /api/actions/{id}`.
+/// NotFound on denial, so a hidden (or deleted) parent is indistinguishable from a missing one.
+pub(crate) async fn check_action_read(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	auth_ctx: &AuthCtx,
+	tenant_id_tag: &str,
+) -> ClResult<()> {
+	let attrs = load_action_attrs(app, tn_id, action_id, &auth_ctx.id_tag, tenant_id_tag)
+		.await
+		.map_err(|e| if matches!(e, Error::PermissionDenied) { Error::NotFound } else { e })?;
+	let checker = app.permission_checker.read().await;
+	if checker.has_permission(auth_ctx, "action:read", &attrs, &Environment::new()) {
+		Ok(())
+	} else {
+		Err(Error::NotFound)
+	}
+}
+
 // Load action attributes from MetaAdapter
 async fn load_action_attrs(
 	app: &App,
@@ -150,11 +171,21 @@ async fn load_action_attrs(
 	}
 
 	// Extract audience as list of profile id_tags
-	let audience_tag = action_view
+	let mut audience_tag = action_view
 		.audience
 		.as_ref()
 		.map(|p| vec![p.id_tag.clone()])
 		.unwrap_or_default();
+
+	// Subscriber bridge — the same container rule the list filter applies.
+	if let Some(c) = crate::filter::subscriber_container(&action_view)
+		&& crate::filter::load_subscribers(app, tn_id, &[c])
+			.await
+			.get(c)
+			.is_some_and(|subs| subs.contains(subject_id_tag))
+	{
+		audience_tag.push(subject_id_tag.into());
+	}
 
 	// Get visibility from action metadata - convert char to string representation
 	let visibility: Box<str> = VisibilityLevel::from_char(action_view.visibility).as_str().into();

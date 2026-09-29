@@ -120,6 +120,12 @@ pub async fn list_actions(
 	let limit = opts.limit.unwrap_or(20) as usize;
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
 
+	// A leader sees what a single GET lets them see: `abac`'s leader override, which a
+	// delegated (scoped) token never gets.
+	let is_leader = maybe_auth
+		.as_ref()
+		.is_some_and(|a| a.scope.is_none() && cloudillo_core::roles::is_leader(&a.roles[..]));
+
 	// Aggregate-only path: return a COUNT(*) of matching rows. Runs the SQL
 	// visibility guard (`push_visibility_guard`, the query-level equivalent of
 	// `filter_actions_by_visibility` below) so it can't leak private aggregates on
@@ -128,9 +134,12 @@ pub async fn list_actions(
 	if opts.count == Some(true) {
 		// Tenant/owner sees everything (Owner level); everyone else is guarded to
 		// what they may view; guest → Public only.
-		opts.visibility_guard = if is_tenant {
-			types::Patch::Undefined // tenant/owner: sees everything
+		opts.visibility_guard = if is_tenant || is_leader {
+			types::Patch::Undefined // tenant/owner/leader: sees everything
 		} else if is_authenticated {
+			opts.viewer_relation =
+				cloudillo_core::abac::subject_relation_to_tenant(&app, tn_id, subject_id_tag)
+					.await?;
 			types::Patch::Value(subject_id_tag.to_string())
 		} else {
 			types::Patch::Null // guest → only Public rows
@@ -144,15 +153,19 @@ pub async fn list_actions(
 
 	let actions = app.meta_adapter.list_actions(tn_id, &opts).await?;
 
-	let mut filtered = filter_actions_by_visibility(
-		&app,
-		tn_id,
-		subject_id_tag,
-		is_authenticated,
-		&tenant_id_tag,
-		actions,
-	)
-	.await?;
+	let mut filtered = if is_leader {
+		actions
+	} else {
+		filter_actions_by_visibility(
+			&app,
+			tn_id,
+			subject_id_tag,
+			is_authenticated,
+			&tenant_id_tag,
+			actions,
+		)
+		.await?
+	};
 
 	// Check if there are more results (we fetched limit+1)
 	let has_more = filtered.len() > limit;
@@ -295,6 +308,17 @@ pub async fn post_action(
 		return Err(Error::PermissionDenied);
 	}
 
+	// A child of a parent held here needs read on it, through the same path as GET (subscriber
+	// bridge included); a deleted parent reads as missing there, so it rejects new children too.
+	// A parent absent locally (a remote thread not mirrored here) is allowed, as inbound does.
+	// `get_action_type` sees every status; an `@a_id` reference is always local.
+	if let Some(parent_id) = action.parent_id.as_deref()
+		&& (parent_id.starts_with('@')
+			|| app.meta_adapter.get_action_type(tn_id, parent_id).await?.is_some())
+	{
+		crate::perm::check_action_read(&app, tn_id, parent_id, &auth, &id_tag).await?;
+	}
+
 	// Role-hierarchy guard on community member removal (CONN:DEL). The authoritative
 	// outbound check: only moderators+ may remove a member, and an actor may only remove a
 	// member strictly below them (leaders may also remove peer leaders). Self-leave
@@ -355,38 +379,26 @@ pub async fn post_action(
 	// machinery exists because the client posts before that happens — resolving here would fail
 	// the ordinary "upload a photo, then post it" flow. `read_file` accepts either form.
 	if let Some(file_ids) = action.attachments.as_ref() {
-		let ctx = cloudillo_core::file_access::FileAccessCtx {
-			user_id_tag: &auth.id_tag,
-			tenant_id_tag: &id_tag,
-			user_roles: &auth.roles,
-			hatted: auth.hat.is_some(),
-		};
+		let ctx = cloudillo_core::file_access::FileAccessCtx::from_auth(Some(&auth), &id_tag);
 		for file_id in file_ids {
-			cloudillo_core::file_access::check_file_access_with_scope(
-				&app,
-				tn_id,
-				file_id,
-				&ctx,
-				auth.scope.as_deref(),
-				None,
-			)
-			.await
-			.map_err(|e| match e {
-				// Both collapse to 403 on purpose: a 404 here would tell the caller
-				// whether a file id they cannot reach exists.
-				cloudillo_core::file_access::FileAccessError::NotFound
-				| cloudillo_core::file_access::FileAccessError::AccessDenied => {
-					warn!(
-						"Rejecting action by {}: attachment {} not reachable",
-						auth.id_tag, file_id
-					);
-					Error::PermissionDenied
-				}
-				// A database fault is not a denial and must not be logged as one.
-				cloudillo_core::file_access::FileAccessError::InternalError(msg) => {
-					Error::Internal(msg)
-				}
-			})?;
+			cloudillo_core::file_access::check_file_access(&app, tn_id, file_id, &ctx, None)
+				.await
+				.map_err(|e| match e {
+					// Both collapse to 403 on purpose: a 404 here would tell the caller
+					// whether a file id they cannot reach exists.
+					cloudillo_core::file_access::FileAccessError::NotFound
+					| cloudillo_core::file_access::FileAccessError::AccessDenied => {
+						warn!(
+							"Rejecting action by {}: attachment {} not reachable",
+							auth.id_tag, file_id
+						);
+						Error::PermissionDenied
+					}
+					// A database fault is not a denial and must not be logged as one.
+					cloudillo_core::file_access::FileAccessError::InternalError(msg) => {
+						Error::Internal(msg)
+					}
+				})?;
 		}
 	}
 
@@ -411,21 +423,11 @@ pub async fn post_action(
 	let action_id = task::create_action_as(&app, tn_id, &id_tag, &auth.id_tag, action).await?;
 	debug!("actionId {:?}", &action_id);
 
-	let list = app
-		.meta_adapter
-		.list_actions(
-			tn_id,
-			&meta_adapter::ListActionOptions {
-				action_id: Some(action_id.to_string()),
-				..Default::default()
-			},
-		)
-		.await?;
-	if list.len() != 1 {
-		return Err(Error::NotFound);
-	}
+	// `get_action`, not a viewer-less `list_actions`: the list's draft guard hides the caller's
+	// own fresh draft ('R') when no viewer is named.
+	let created = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
-	let mut response = ApiResponse::new(list[0].clone());
+	let mut response = ApiResponse::new(created);
 	if let Some(id) = req_id {
 		response = response.with_req_id(id);
 	}
@@ -630,14 +632,13 @@ pub async fn post_action_accept(
 	// Fetch the action from database
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
-	// Applicability: is this action resolvable in this tenant's inbox at all? A denial (403),
-	// not a 400 — "malformed" would leak whether the row is addressed here.
-	if !crate::native_hooks::ownership::accept_applicable(&action, &id_tag, &auth.id_tag) {
-		return Err(Error::PermissionDenied);
-	}
-	// Authority: a moderator of the tenant, or the profile the action is addressed to.
+	// Authority first: a moderator of the tenant, or the profile the action is addressed to.
+	// Only an authorized caller learns (400) that the action is not resolvable here.
 	if !crate::native_hooks::ownership::accept_authority(&action, &auth.id_tag, &auth.roles) {
 		return Err(Error::PermissionDenied);
+	}
+	if !crate::native_hooks::ownership::accept_applicable(&action, &id_tag, &auth.id_tag) {
+		return Err(Error::ValidationError("action is not resolvable in this inbox".into()));
 	}
 
 	// Execute DSL on_accept hook if action type has one
@@ -752,14 +753,13 @@ pub async fn post_action_reject(
 	// Fetch the action from database
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
-	// Applicability: is this action resolvable in this tenant's inbox at all? A denial (403),
-	// not a 400 — "malformed" would leak whether the row is addressed here.
-	if !crate::native_hooks::ownership::accept_applicable(&action, &id_tag, &auth.id_tag) {
-		return Err(Error::PermissionDenied);
-	}
-	// Authority: a moderator of the tenant, or the profile the action is addressed to.
+	// Authority first: a moderator of the tenant, or the profile the action is addressed to.
+	// Only an authorized caller learns (400) that the action is not resolvable here.
 	if !crate::native_hooks::ownership::accept_authority(&action, &auth.id_tag, &auth.roles) {
 		return Err(Error::PermissionDenied);
+	}
+	if !crate::native_hooks::ownership::accept_applicable(&action, &id_tag, &auth.id_tag) {
+		return Err(Error::ValidationError("action is not resolvable in this inbox".into()));
 	}
 
 	// Execute DSL on_reject hook if action type has one
@@ -1075,15 +1075,8 @@ pub async fn publish_draft(
 			.await?;
 	}
 
-	// Re-fetch the action
-	let updated = app
-		.meta_adapter
-		.list_actions(
-			tn_id,
-			&meta_adapter::ListActionOptions { action_id: Some(action_id), ..Default::default() },
-		)
-		.await?;
-	let result = updated.into_iter().next().ok_or(Error::NotFound)?;
+	// Re-fetch the action (`get_action`: the list's draft guard would hide a scheduled 'S' row)
+	let result = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
 	let response = ApiResponse::new(result).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::OK, Json(response)))

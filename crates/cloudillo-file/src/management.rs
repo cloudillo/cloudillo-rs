@@ -3,8 +3,6 @@
 
 //! File management (PATCH, DELETE, restore, duplicate) handlers
 
-use std::collections::HashSet;
-
 use axum::{
 	Json,
 	extract::{Path, Query, State},
@@ -111,8 +109,29 @@ pub struct DeleteFileResponse {
 	pub permanent: bool,
 }
 
+/// Gate delete / restore on [`file_access::can_manage_lifecycle`]. A trashed row the caller may
+/// not manage is `NotFound` (the permission guard already hides it); an active one is denied.
+async fn require_lifecycle(
+	app: &App,
+	auth: &cloudillo_types::auth_adapter::AuthCtx,
+	tenant_id_tag: &str,
+	file: &meta_adapter::FileView,
+) -> ClResult<()> {
+	let ctx = file_access::FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
+	let file_ref = file_access::FileRef::from_view(file, tenant_id_tag);
+	let level = file_access::get_access_level(app, auth.tn_id, file_ref, &ctx, None).await;
+	if file_access::can_manage_lifecycle(&file_ref, &ctx, level) {
+		Ok(())
+	} else if file.parent_id.as_deref() == Some(TRASH_FOLDER_ID) {
+		Err(Error::NotFound)
+	} else {
+		Err(Error::PermissionDenied)
+	}
+}
+
 pub async fn delete_file(
 	State(app): State<App>,
+	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(file_id): Path<String>,
 	Query(query): Query<DeleteFileQuery>,
@@ -122,6 +141,7 @@ pub async fn delete_file(
 		warn!("delete_file: File {} not found", file_id);
 		Error::NotFound
 	})?;
+	require_lifecycle(&app, &auth, &tenant_id_tag, &file).await?;
 
 	if query.permanent {
 		// Permanent delete - only allowed if file is in trash
@@ -195,6 +215,7 @@ pub struct RestoreFileResponse {
 
 pub async fn restore_file(
 	State(app): State<App>,
+	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(file_id): Path<String>,
 	Json(req): Json<RestoreFileRequest>,
@@ -204,6 +225,7 @@ pub async fn restore_file(
 		warn!("restore_file: File {} not found", file_id);
 		Error::NotFound
 	})?;
+	require_lifecycle(&app, &auth, &tenant_id_tag, &file).await?;
 
 	if file.parent_id.as_deref() != Some(TRASH_FOLDER_ID) {
 		return Err(Error::ValidationError("File is not in trash".into()));
@@ -248,7 +270,15 @@ pub struct EmptyTrashResponse {
 pub async fn empty_trash(
 	State(app): State<App>,
 	Auth(auth): Auth,
+	IdTag(tenant_id_tag): IdTag,
 ) -> ClResult<Json<EmptyTrashResponse>> {
+	// A scope carries no lifecycle authority. Everyone else purges the rows they may manage
+	// (`file_access::can_manage_lifecycle`, per row) and leaves the rest in place.
+	if auth.scope.is_some() {
+		return Err(Error::PermissionDenied);
+	}
+	let ctx = file_access::FileAccessCtx::from_auth(Some(&auth), &tenant_id_tag);
+
 	// List all files in trash
 	let trash_files = app
 		.meta_adapter
@@ -261,30 +291,28 @@ pub async fn empty_trash(
 		)
 		.await?;
 
-	// Same cascade the permanent single-file delete runs. A trashed file's document-tree children
-	// may themselves be listed here, and `delete_file` takes the whole tree, so track what each
-	// call purged and skip entries already covered rather than counting them twice.
-	let mut purged_ids: HashSet<Box<str>> = HashSet::new();
+	// Same cascade the permanent single-file delete runs. The listing holds trash roots only
+	// (tree children are not listed; `delete_file` tombstones them through `root_id`).
+	let mut deleted_count = 0usize;
 	let mut files_deleted = 0u64;
 	let mut refs_removed = 0u64;
 	let mut share_entries_removed = 0u64;
 	for file in &trash_files {
-		if purged_ids.contains(&file.file_id) {
+		let file_ref = file_access::FileRef::from_view(file, &tenant_id_tag);
+		let level = file_access::get_access_level(&app, auth.tn_id, file_ref, &ctx, None).await;
+		if !file_access::can_manage_lifecycle(&file_ref, &ctx, level) {
 			continue;
 		}
 		let purged = app.meta_adapter.delete_file(auth.tn_id, &file.file_id).await?;
 		for id in &purged.file_ids {
 			invalidate_dir_cache(&app, auth.tn_id, id);
 			cloudillo_core::search_index_file(&app, auth.tn_id, id);
-			purged_ids.insert(id.clone());
 		}
+		deleted_count += 1;
 		files_deleted += purged.files_deleted;
 		refs_removed += purged.refs_removed;
 		share_entries_removed += purged.share_entries_removed;
 	}
-	// Every listed trash entry is deleted, whether directly or as part of an earlier entry's tree —
-	// so the response keeps meaning "trash entries removed". The wider cascade totals stay in the log.
-	let deleted_count = trash_files.len();
 
 	info!(
 		"User {} emptied trash ({} trash entries, {} rows tombstoned, {} share links, \
@@ -327,16 +355,24 @@ pub struct PatchFileUserDataResponse {
 pub async fn patch_file_user_data(
 	State(app): State<App>,
 	Auth(auth): Auth,
+	IdTag(tenant_id_tag): IdTag,
 	Path(file_id): Path<String>,
 	Json(req): Json<PatchFileUserDataRequest>,
 ) -> ClResult<Json<PatchFileUserDataResponse>> {
+	// Pins and stars are kept per user: a share link (`sub`-less and scoped, so its id_tag
+	// names the tenant) or a guest has no user to keep them for. The owner's own session is
+	// `sub`-less too, but unscoped.
+	let share_link = auth.anonymous && auth.scope.is_some();
+	if share_link || auth.id_tag.is_empty() || auth.id_tag.as_ref() == "guest" {
+		return Err(Error::PermissionDenied);
+	}
 	// Check if file exists
 	let file = app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or_else(|| {
 		warn!("patch_file_user_data: File {} not found", file_id);
 		Error::NotFound
 	})?;
 
-	// Scope check: file must be within scope
+	// A scoped token (app iframe, file API key) marks only the file it is scoped to.
 	if matches!(
 		file_access::check_scope_allows_file(
 			auth.scope.as_deref(),
@@ -346,6 +382,16 @@ pub async fn patch_file_user_data(
 		file_access::ScopeCheck::Denied
 	) {
 		return Err(Error::PermissionDenied);
+	}
+
+	// Caller must be able to read the file; otherwise it is absent to them.
+	let ctx = file_access::FileAccessCtx::from_auth(Some(&auth), &tenant_id_tag);
+	let file_ref = file_access::FileRef::from_view(&file, &tenant_id_tag);
+	if !file_access::get_access_level(&app, auth.tn_id, file_ref, &ctx, None)
+		.await
+		.can_read()
+	{
+		return Err(Error::NotFound);
 	}
 
 	// Update user-specific data
@@ -403,29 +449,17 @@ pub async fn duplicate_file(
 	// Read access to the *source* is required before copying its contents, otherwise
 	// any private CRDT/RTDB document could be exfiltrated by duplicating it. The check
 	// loads the row, so its `file_view` doubles as the source metadata.
-	let ctx = file_access::FileAccessCtx {
-		user_id_tag: &auth.id_tag,
-		tenant_id_tag: &tenant_id_tag,
-		user_roles: &auth.roles,
-		hatted: auth.hat.is_some(),
-	};
-	let access = file_access::check_file_access_with_scope(
-		&app,
-		tn_id,
-		&file_id,
-		&ctx,
-		auth.scope.as_deref(),
-		None,
-	)
-	.await
-	.map_err(|e| match e {
-		file_access::FileAccessError::NotFound => Error::NotFound,
-		file_access::FileAccessError::AccessDenied => Error::PermissionDenied,
-		file_access::FileAccessError::InternalError(m) => Error::Internal(m),
-	})?;
+	let ctx = file_access::FileAccessCtx::from_auth(Some(&auth), &tenant_id_tag);
+	let access = file_access::check_file_access(&app, tn_id, &file_id, &ctx, None)
+		.await
+		.map_err(|e| match e {
+			file_access::FileAccessError::NotFound => Error::NotFound,
+			file_access::FileAccessError::AccessDenied => Error::PermissionDenied,
+			file_access::FileAccessError::InternalError(m) => Error::Internal(m),
+		})?;
 
 	// A scoped (share-link) caller needs editor access, and only within its own scope —
-	// `check_file_access_with_scope` resolved both, returning the scope's own level for
+	// `check_file_access` resolved both, returning the scope's own level for
 	// a covered file and AccessDenied otherwise. An unscoped caller needs only read
 	// here; creation is gated by `check_perm_create("file", "create")` on the route.
 	if auth.scope.is_some() && !access.access_level.can_write() {
@@ -466,6 +500,7 @@ pub async fn duplicate_file(
 		file.root_id.as_deref(),
 	)
 	.await?;
+	super::handler::reject_trashed_parent(&app, tn_id, parent_id.as_deref()).await?;
 
 	let new_file_id = utils::random_id()?;
 
@@ -502,6 +537,7 @@ pub async fn duplicate_file(
 				tags: file.tags,
 				x: file.x,
 				visibility: file.visibility,
+				status: Some(meta_adapter::FileStatus::Active),
 				..Default::default()
 			},
 		)

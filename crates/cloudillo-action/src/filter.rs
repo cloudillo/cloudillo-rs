@@ -4,14 +4,13 @@
 //! Visibility filtering for actions
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use cloudillo_core::abac::{
 	ViewCheckContext, VisibilityLevel, can_view_item, visibility_needs_relation,
 };
 use cloudillo_types::meta_adapter::{ActionView, ListActionOptions};
 
-use crate::{dsl::DslEngine, prelude::*};
+use crate::prelude::*;
 
 /// Filter actions by visibility based on the subject's access level
 ///
@@ -20,7 +19,7 @@ use crate::{dsl::DslEngine, prelude::*};
 /// - The action's visibility level
 /// - The subject's relationship **to this tenant** (`follower` = "they follow us", `connected`)
 /// - Whether the subject is in the audience (for Direct visibility)
-/// - Whether the subject is a subscriber (for subscribable action types with Direct visibility)
+/// - Whether the subject subscribes to the action's container (visibility `S` or none)
 pub async fn filter_actions_by_visibility(
 	app: &App,
 	tn_id: TnId,
@@ -38,7 +37,7 @@ pub async fn filter_actions_by_visibility(
 	// are tenant-scoped, so the reader's relation to *this tenant* is the only one this node can
 	// answer; scoring the issuer's row asked "do we follow the author", which is not the reader's
 	// standing at all. Same value `cloudillo_file::perm::load_file_attrs` and
-	// `file_access::check_file_access_with_scope` read.
+	// `file_access::check_file_access` read.
 	//
 	// Only loaded when some action in the batch can actually be swayed by it: `can_view_item`
 	// consults the two flags solely to lift the subject from Verified/Public to
@@ -54,25 +53,10 @@ pub async fn filter_actions_by_visibility(
 		cloudillo_types::meta_adapter::ProfileRelation::default()
 	};
 
-	// Identify the container ids whose subscriber set gates read access:
-	// - subscribable actions with Direct visibility (legacy subscriber-bridge):
-	//   the container is the action itself.
-	// - actions with Subscribed ('S') visibility: the container is resolved via
-	//   `root_id ?? subject ?? action_id` (CONV → itself, MSG → root CONV,
-	//   SUBS/INVT → subject CONV).
-	let mut container_ids: HashSet<&str> = actions
-		.iter()
-		.filter(|a| a.visibility.is_none() && is_subscribable(app, &a.typ))
-		.map(|a| a.action_id.as_ref())
-		.collect();
-	for a in &actions {
-		if a.visibility == Some('S') {
-			container_ids.insert(subscribed_container_id(a));
-		}
-	}
+	// Batch load subscribers for every distinct container that gates a row (see
+	// `subscriber_container`).
+	let container_ids: HashSet<&str> = actions.iter().filter_map(subscriber_container).collect();
 	let container_ids: Vec<&str> = container_ids.into_iter().collect();
-
-	// Batch load subscribers for every distinct container
 	let subscribers_map = load_subscribers(app, tn_id, &container_ids).await;
 
 	// Filter actions based on visibility
@@ -92,19 +76,9 @@ pub async fn filter_actions_by_visibility(
 			let mut audience: Vec<&str> =
 				action.audience.as_ref().map(|a| vec![a.id_tag.as_ref()]).unwrap_or_default();
 
-			// For subscribable Direct-visibility actions, check if subject is a subscriber
-			if action.visibility.is_none()
-				&& let Some(subs) = subscribers_map.get(action.action_id.as_ref())
-				&& subs.contains(subject_id_tag)
-			{
-				audience.push(subject_id_tag);
-			}
-
-			// For Subscribed ('S') actions, admit the reader if they are an active
-			// subscriber of the action's container (i.e. a group member).
-			if action.visibility == Some('S')
-				&& let Some(subs) = subscribers_map.get(subscribed_container_id(action))
-				&& subs.contains(subject_id_tag)
+			// Active subscribers of the row's container join its audience.
+			if let Some(c) = subscriber_container(action)
+				&& subscribers_map.get(c).is_some_and(|subs| subs.contains(subject_id_tag))
 			{
 				audience.push(subject_id_tag);
 			}
@@ -151,19 +125,24 @@ fn subscribed_container_id(action: &ActionView) -> &str {
 		.unwrap_or(action.action_id.as_ref())
 }
 
-/// Check if action type is subscribable based on DSL definition
-fn is_subscribable(app: &App, action_type: &str) -> bool {
-	app.ext::<Arc<DslEngine>>()
-		.ok()
-		.and_then(|dsl| dsl.get_behavior(action_type))
-		.and_then(|b| b.subscribable)
-		.unwrap_or(false)
+/// The container whose active subscribers may read `action`, or `None` when no subscriber
+/// bridge applies. Subscribed ('S') rows resolve via `subscribed_container_id`; Direct rows
+/// (no visibility) only via `root_id` or themselves, never via `subject`: a Direct INVT/APRV
+/// naming a CONV must not open to that CONV's subscribers. Shared by the list filter and
+/// the single-action GET (`perm::load_action_attrs`), so the two never disagree; the SQL
+/// twin is the subscriber EXISTS in the meta adapter's `push_visibility_guard`.
+pub(crate) fn subscriber_container(action: &ActionView) -> Option<&str> {
+	match action.visibility {
+		Some('S') => Some(subscribed_container_id(action)),
+		None | Some('D') => Some(action.root_id.as_deref().unwrap_or(&action.action_id)),
+		_ => None,
+	}
 }
 
 /// Load subscribers for a list of action IDs
 ///
 /// Returns a map of action_id -> set of subscriber id_tags
-async fn load_subscribers(
+pub(crate) async fn load_subscribers(
 	app: &App,
 	tn_id: TnId,
 	action_ids: &[&str],
@@ -283,6 +262,18 @@ mod tests {
 		// General rule is root_id ?? subject ?? action_id — root wins when both present.
 		let a = action_view("a5~x", "MSG", Some("a1~root"), Some("a9~subj"));
 		assert_eq!(subscribed_container_id(&a), "a1~root");
+	}
+
+	#[test]
+	fn direct_row_never_bridges_through_subject() {
+		// A Direct INVT naming a CONV resolves to itself (no SUBS row targets it).
+		let mut invt = action_view("a4~invt", "INVT", None, Some("a1~conv"));
+		invt.visibility = None;
+		assert_eq!(subscriber_container(&invt), Some("a4~invt"));
+		// A Direct child still inherits its root container.
+		let mut cmnt = action_view("a6~cmnt", "CMNT", Some("a1~conv"), None);
+		cmnt.visibility = None;
+		assert_eq!(subscriber_container(&cmnt), Some("a1~conv"));
 	}
 
 	/// The reader's own standing decides, never the tenant's opinion of the author:

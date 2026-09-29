@@ -125,13 +125,24 @@ pub struct AuthCtx {
 	/// `iss` and names the *tenant*, not a person — an anonymous share-link
 	/// token. Anything that asserts an identity on the holder's behalf (CRDT
 	/// awareness stamping, activity attribution) must treat this as "no
-	/// identity to assert". Authorization must NOT read this: a share link's
-	/// authority comes from `scope`, and that is unchanged.
+	/// identity to assert". Scope checks must NOT read this: a share link's
+	/// authority comes from `scope`, and that is unchanged. An owner session is
+	/// sub-less too, so owner-only rungs use [`AuthCtx::names_holder`], not this.
 	pub anonymous: bool,
 	/// Peer community this session wears as a hat (token claim `h`). Attribution and refresh
 	/// gating only: `roles` already holds the mapped roles. Not a delegated credential, so it
 	/// is never treated like `scope`.
 	pub hat: Option<Box<str>>,
+}
+
+impl AuthCtx {
+	/// Whether `id_tag` names the credential's holder, for owner-only rungs that match it
+	/// (pending uploads). False only for a sub-less *scoped* token (share link, via-embed),
+	/// whose `id_tag` is the tenant's. An owner session is sub-less but unscoped: the tenant
+	/// is its holder.
+	pub fn names_holder(&self) -> bool {
+		!(self.anonymous && self.scope.is_some())
+	}
 }
 
 #[derive(Debug)]

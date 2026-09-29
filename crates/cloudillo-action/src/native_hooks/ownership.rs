@@ -47,8 +47,8 @@ pub(crate) fn accept_applicable(
 	owns_subject(subject, tenant_tag) || caller_id_tag == tenant_tag
 }
 
-/// Authority gate for accepting / rejecting an action, once `accept_applicable` has already
-/// established that the action is resolvable in this tenant's inbox at all.
+/// Authority gate for accepting / rejecting an action. Runs before `accept_applicable`,
+/// so an unauthorized caller learns nothing about applicability.
 ///
 /// A moderator may resolve anything in the tenant's inbox; so may the profile the action
 /// is addressed to, on whatever node it happens to be hosted.

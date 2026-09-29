@@ -119,6 +119,7 @@ async fn make_folder(
 		content_type: "application/x-folder".into(),
 		file_name: name.into(),
 		file_tp: Some("FLDR".into()),
+		status: Some(FileStatus::Active),
 		..Default::default()
 	};
 	adapter.create_file(tn_id, opts).await.expect("create folder");
@@ -137,6 +138,7 @@ async fn make_file(
 		content_type: "text/plain".into(),
 		file_name: name.into(),
 		file_tp: Some("BLOB".into()),
+		status: Some(FileStatus::Active),
 		..Default::default()
 	};
 	adapter.create_file(tn_id, opts).await.expect("create file");
@@ -158,6 +160,7 @@ async fn include_tree_children_returns_document_tree_members() {
 				content_type: "text/plain".into(),
 				file_name: "tree.txt".into(),
 				file_tp: Some("BLOB".into()),
+				status: Some(FileStatus::Active),
 				..Default::default()
 			},
 		)
@@ -337,6 +340,7 @@ async fn make_image(
 		content_type: "image/png".into(),
 		file_name: name.into(),
 		file_tp: Some("BLOB".into()),
+		status: Some(FileStatus::Active),
 		..Default::default()
 	};
 	adapter.create_file(tn_id, opts).await.expect("create image");
@@ -451,6 +455,7 @@ async fn test_list_files_local_only_excludes_remote() {
 		file_name: "local.png".into(),
 		file_tp: Some("BLOB".into()),
 		owner_tag: Some("alice.home.w9.hu".into()),
+		status: Some(FileStatus::Active),
 		..Default::default()
 	};
 	adapter.create_file(tn_id, local).await.expect("create local");
@@ -462,6 +467,7 @@ async fn test_list_files_local_only_excludes_remote() {
 		file_name: "remote.png".into(),
 		file_tp: Some("BLOB".into()),
 		upstream_tag: Some("bob.example.com".into()),
+		status: Some(FileStatus::Active),
 		..Default::default()
 	};
 	adapter.create_file(tn_id, remote).await.expect("create remote");
@@ -504,6 +510,7 @@ async fn test_list_files_mirrored_rows_follow_the_visibility_ladder() {
 		file_tp: Some("BLOB".into()),
 		upstream_tag: upstream.map(Into::into),
 		visibility: Some(visibility),
+		status: Some(FileStatus::Active),
 		..Default::default()
 	};
 	for f in [
@@ -564,6 +571,58 @@ fn file_ids(files: &[cloudillo_types::meta_adapter::FileView]) -> Vec<&str> {
 	let mut ids: Vec<&str> = files.iter().map(|f| &*f.file_id).collect();
 	ids.sort_unstable();
 	ids
+}
+
+/// A pending upload is never browsed (by parent), not even by its owner; by id and by an
+/// explicit `status=P` only the owner named in `pending_viewer` sees it.
+#[tokio::test]
+async fn pending_rows_are_listed_to_their_owner_only() {
+	let (adapter, _dir) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "club").await.ok();
+	make_folder(&adapter, tn_id, "fld_p", "Uploads", None).await;
+	let pending = CreateFile {
+		file_id: Some("f_pend".into()),
+		parent_id: Some("fld_p".into()),
+		owner_tag: Some("bob".into()),
+		content_type: "text/plain".into(),
+		file_name: "upload.txt".into(),
+		file_tp: Some("BLOB".into()),
+		status: Some(FileStatus::Pending),
+		..Default::default()
+	};
+	adapter.create_file(tn_id, pending).await.expect("create pending");
+
+	let by_parent = |viewer: Option<&str>| ListFileOptions {
+		parent_id: Some("fld_p".into()),
+		pending_viewer: viewer.map(Into::into),
+		..Default::default()
+	};
+	let by_id = |viewer: Option<&str>| ListFileOptions {
+		file_id: Some(vec!["f_pend".into()]),
+		pending_viewer: viewer.map(Into::into),
+		..Default::default()
+	};
+	let by_status = |viewer: Option<&str>| ListFileOptions {
+		status: Some(FileStatus::Pending),
+		pending_viewer: viewer.map(Into::into),
+		..Default::default()
+	};
+	// Browse never lists a pending row, not even to its owner.
+	for viewer in [None, Some("carol"), Some("club"), Some("bob")] {
+		let rows = adapter.list_files(tn_id, &by_parent(viewer)).await.expect("list");
+		assert!(file_ids(&rows).is_empty(), "parent: {viewer:?} must not browse the pending row");
+	}
+	for (what, opts) in
+		[("id", by_id as fn(Option<&str>) -> ListFileOptions), ("status", by_status)]
+	{
+		for other in [None, Some("carol"), Some("club")] {
+			let rows = adapter.list_files(tn_id, &opts(other)).await.expect("list");
+			assert!(file_ids(&rows).is_empty(), "{what}: {other:?} must not see bob's pending row");
+		}
+		let rows = adapter.list_files(tn_id, &opts(Some("bob"))).await.expect("list");
+		assert_eq!(file_ids(&rows), vec!["f_pend"], "{what}: the owner sees it");
+	}
 }
 
 /// `sweep_all` is what lets the weekly search sweep *remove* index rows, not only

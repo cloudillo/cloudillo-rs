@@ -24,7 +24,7 @@
 //!    deep `'D'` parts of its tree bypass the level filter, because the share
 //!    *is* permission to read that document — without it a link to a private
 //!    note would search to zero hits inside a note its holder can open. Child
-//!    `'F'` rows in the tree keep the level filter.
+//!    `'F'` rows in the tree are never hits; their container stands for them.
 //!
 //!    A scoped token is never the owner, whatever its subject says: share-link
 //!    tokens are minted with `sub: None` and `iss` = the tenant, and validation
@@ -99,7 +99,7 @@ use cloudillo_types::{
 		ProfileType, SEARCH_MAX_CONTENT_TYPES, SEARCH_MAX_LIMIT, SEARCH_MAX_OFFSET,
 		SEARCH_MAX_TAGS, SearchMatch, SearchOptions, SearchRow,
 	},
-	types::{ApiResponse, TokenScope, serialize_timestamp_iso},
+	types::{AccessLevel, ApiResponse, TokenScope, serialize_timestamp_iso},
 };
 use serde::{Deserialize, Serialize};
 
@@ -279,6 +279,14 @@ pub async fn get_search(
 	let anonymous_share =
 		is_anonymous_share(auth.scope.as_deref(), subject, tenant_id_tag.as_ref());
 	opts.viewer_id_tag = (!anonymous_share).then(|| subject.to_owned());
+	// Identity grants (roles, shares) never reach a scoped token: scope = guest + grant.
+	if auth.scope.is_none() && !subject.is_empty() && subject != "guest" {
+		opts.role_grant = file_access::role_access_level(&auth.roles[..]) > AccessLevel::None;
+		opts.share_subject = Some(subject.to_owned());
+		// Same leader override `abac` grants a single action GET.
+		opts.actions_unguarded = cloudillo_core::roles::is_leader(&auth.roles[..]);
+	}
+	opts.viewer_relation = rel;
 
 	// Channel gate. A share-link guest carries the tenant's own id_tag, which would read as
 	// "no filter", so it is gated as a plain guest; the shared tree itself is exempt in SQL.
@@ -310,10 +318,18 @@ pub async fn get_search(
 		// The share itself is the grant: the shared file's own row and the deep
 		// parts of its document tree stay visible even at Direct visibility, or a
 		// share link to a private document would search to zero hits inside a
-		// document its holder can open. Child `'F'` rows in the tree keep the level
-		// filter — same split `GET /api/files` makes.
+		// document its holder can open. Child `'F'` rows in the tree are never hits;
+		// their container stands for them.
 		opts.scope_grant_file_id = Some(file_id.clone().into());
 		opts.obj_tp = Some(scope_obj_tp(opts.obj_tp.take()));
+	}
+
+	// Tree children are never hits, so a `fileId` naming one narrows to its container. A
+	// scope is not resolved: it grants the child alone, never the container's tree.
+	if let Some(fid) = opts.file_id.as_deref()
+		&& let Some(root_id) = app.meta_adapter.read_file(tn_id, fid).await?.and_then(|f| f.root_id)
+	{
+		opts.file_id = Some(root_id.into());
 	}
 
 	// Redundant cross-check, not a second gate — see the module docs.

@@ -86,6 +86,32 @@ pub(crate) async fn get_id(db: &SqlitePool, tn_id: TnId, f_id: u64) -> ClResult<
 	map_res(res, |row| row.try_get("file_id"))
 }
 
+/// Push `(<subquery>)` yielding every file_id `subject` holds a live `'U'` share entry on,
+/// directly or through an ancestor folder (descends `parent_id`, capped at 64 hops like
+/// `file_access::MAX_PARENT_DEPTH`). A recursive CTE rather than a `DirCache` walk: the
+/// grant must filter in SQL so pagination stays correct.
+pub(crate) fn push_shared_file_ids(
+	query: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+	tn_id: TnId,
+	subject: &str,
+) {
+	query
+		.push(
+			"(WITH RECURSIVE shared(id, depth) AS (\
+			 SELECT resource_id, 0 FROM share_entries WHERE tn_id=",
+		)
+		.push_bind(tn_id.0)
+		.push(" AND resource_type='F' AND subject_type='U' AND subject_id=")
+		.push_bind(normalize_id_tag(subject).into_owned())
+		.push(
+			" AND (expires_at IS NULL OR expires_at > unixepoch()) \
+			 UNION SELECT c.file_id, s.depth + 1 FROM shared s \
+			 JOIN files c ON c.tn_id=",
+		)
+		.push_bind(tn_id.0)
+		.push(" AND c.parent_id=s.id WHERE s.depth < 64) SELECT id FROM shared)");
+}
+
 /// List files with filtering and pagination
 pub(crate) async fn list(
 	db: &SqlitePool,
@@ -222,6 +248,13 @@ pub(crate) async fn list(
 	// else (fileId present, no parentId): no parent-folder predicate — return the
 	// file regardless of folder.
 
+	// Pending uploads are not browsable — default or `parentId` browse — not even by their
+	// owner (lifecycle ruling). A `fileId` lookup or an explicit `status` filter reaches the
+	// caller's own (owner guard below).
+	if opts.status.is_none() && opts.file_id.is_none() && !opts.sweep_all {
+		query.push(" AND f.status != 'P'");
+	}
+
 	// Exclude files inside a specific folder (used by the "outside this
 	// folder" probe). `parent_id IS NULL` rows are kept (they live at root,
 	// not inside the excluded folder).
@@ -330,19 +363,30 @@ pub(crate) async fn list(
 		query.push(" AND f.upstream_tag IS NULL");
 	}
 
-	// Filter by visibility levels (push ABAC check into SQL for correct pagination)
+	// Visibility + channel gate (ABAC pushed into SQL for correct pagination). A share
+	// entry for the caller, on the row or an ancestor folder, bypasses both.
+	query.push(" AND ((1=1");
 	if let Some(levels) = &opts.visible_levels {
-		query.push(" AND f.visibility IN (");
+		query.push(" AND (f.visibility IN (");
 		let mut sep = query.separated(", ");
 		for level in levels {
 			sep.push_bind(level.to_string());
 		}
 		sep.push_unseparated(")");
+		if opts.role_grant {
+			query.push(" OR f.upstream_tag IS NULL");
+		}
+		query.push(")");
 	}
-
 	if let Some(enterable) = &opts.enterable_channels {
 		query = crate::action::push_channel_gate(query, "f.channel", enterable);
 	}
+	query.push(")");
+	if let Some(subject) = opts.share_subject.as_deref() {
+		query.push(" OR f.file_id IN ");
+		push_shared_file_ids(&mut query, tn_id, subject);
+	}
+	query.push(")");
 
 	// Filter by status - if no status specified, exclude deleted files by default
 	// (except under `sweep_all`, which must see a soft-deleted row to clean up after it)
@@ -356,6 +400,18 @@ pub(crate) async fn list(
 	} else if !opts.sweep_all {
 		// By default, exclude deleted files
 		query.push(" AND f.status != 'D'");
+	}
+	// Pending uploads are their owner's alone on the paths that reach them at all (by id, by
+	// status; browse drops them above). Only `sweep_all` sees everyone's.
+	if !opts.sweep_all {
+		if let Some(viewer) = opts.pending_viewer.as_deref() {
+			query
+				.push(" AND (f.status != 'P' OR COALESCE(f.owner_tag, t.id_tag)=")
+				.push_bind(normalize_id_tag(viewer).into_owned())
+				.push(")");
+		} else {
+			query.push(" AND f.status != 'P'");
+		}
 	}
 
 	// Filter by hidden flag. `sweep_all` with no explicit `hidden` pushes nothing:

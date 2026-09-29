@@ -379,22 +379,8 @@ pub async fn list_shares_by_subject(
 
 		// The scope is passed through, not ignored: the link that admitted this caller is the grant
 		// that gives them reach into the embedded file.
-		let ctx = FileAccessCtx {
-			user_id_tag: &auth.id_tag,
-			tenant_id_tag: &tenant_id_tag,
-			user_roles: &auth.roles,
-			hatted: auth.hat.is_some(),
-		};
-		match file_access::check_file_access_with_scope(
-			&app,
-			tn_id,
-			&query.subject_id,
-			&ctx,
-			auth.scope.as_deref(),
-			None,
-		)
-		.await
-		{
+		let ctx = FileAccessCtx::from_auth(Some(&auth), &tenant_id_tag);
+		match file_access::check_file_access(&app, tn_id, &query.subject_id, &ctx, None).await {
 			Err(file_access::FileAccessError::NotFound) => return Err(Error::NotFound),
 			Err(file_access::FileAccessError::AccessDenied) => return Err(Error::PermissionDenied),
 			Err(file_access::FileAccessError::InternalError(msg)) => {

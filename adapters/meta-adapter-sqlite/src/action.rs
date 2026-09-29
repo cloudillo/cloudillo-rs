@@ -8,7 +8,8 @@ use sqlx::{Row, SqlitePool};
 use crate::utils::{Db, escape_like, inspect, parse_str_list, push_in};
 use cloudillo_types::meta_adapter::{
 	Action, ActionData, ActionId, ActionView, AttachmentView, AudienceType, FinalizeActionOptions,
-	ListActionOptions, ProfileInfo, ProfileStatus, ProfileType, UpdateActionDataOptions,
+	ListActionOptions, ProfileInfo, ProfileRelation, ProfileStatus, ProfileType,
+	UpdateActionDataOptions,
 };
 use cloudillo_types::prelude::*;
 use cloudillo_types::utils::normalize_id_tag;
@@ -73,6 +74,10 @@ fn push_action_filters(
 		// ('F', verifier exhausted retries) rows.
 		query.push(" AND coalesce(a.status, 'A') NOT IN ('D', 'V', 'F')");
 	}
+	// Drafts ('R') and scheduled ('S') rows are private to their issuer, whether
+	// the status was asked for explicitly or not. No viewer → never visible.
+	query.push(" AND ");
+	push_draft_guard(&mut query, "a", opts.viewer_id_tag.as_deref());
 	if let Some(typ) = &opts.typ {
 		query.push(" AND a.type IN ");
 		query = push_in(query, typ.as_slice());
@@ -293,9 +298,8 @@ fn push_count_from_where(
 			" LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)",
 		);
 	}
-	// No join for the visibility guard: `push_action_visibility_predicate`
-	// reaches the issuer's profile through an `EXISTS` subquery, so the guard
-	// costs nothing on the queries that do not use it.
+	// No join for the visibility guard: `push_action_visibility_predicate` reads
+	// the reader's relation from bound values, not from a profile row.
 	query.push(" WHERE a.tn_id=");
 	query.push_bind(tn_id.0);
 	query
@@ -311,8 +315,8 @@ fn push_count_from_where(
 /// - `Patch::Undefined` → no guard (tenant see-all / internal callers).
 /// - `Patch::Null` → guest: only Public ('P') rows.
 /// - `Patch::Value(v)` → viewer `v`: full OR-group (Public/Verified,
-///   follow/connect on the issuer, own-issuer, addressed audience,
-///   Subscribed 'S').
+///   the reader's follow/connect relation to the tenant from
+///   `opts.viewer_relation`, own-issuer, addressed audience, Subscribed 'S').
 ///
 /// Omits `subject_has_peer_relation_to_tenant`, which only *widens* audience for
 /// Direct rows the viewer is already addressed on — can under-count, never leak.
@@ -328,7 +332,7 @@ fn push_visibility_guard(
 		}
 		Patch::Value(v) => {
 			query.push(" AND ");
-			push_action_visibility_predicate(&mut query, "a", Some(v));
+			push_action_visibility_predicate(&mut query, "a", Some((v, opts.viewer_relation)));
 		}
 	}
 	query
@@ -336,10 +340,12 @@ fn push_visibility_guard(
 
 /// The query-level translation of `abac::can_view_item` for one action row.
 ///
-/// Written against an arbitrary row alias, and with the issuer's profile reached
-/// through an `EXISTS` subquery rather than a join, so `crate::search` can apply
-/// the *same* predicate to a `search_docs` row without reproducing `list`'s FROM
-/// clause.
+/// Written against an arbitrary row alias, so `crate::search` can apply the
+/// *same* predicate to a `search_docs` row without reproducing `list`'s FROM
+/// clause. The follower / connected arms test the **reader's** relation to the
+/// tenant (`abac::subject_relation_to_tenant`, resolved once by the handler and
+/// bound here), exactly as `abac::check_visibility` does for a single GET — never
+/// the issuer's profile.
 ///
 /// Emits a self-contained parenthesised boolean expression — no leading `AND` —
 /// so a caller can drop it anywhere an expression is legal. `viewer = None` is
@@ -351,38 +357,55 @@ fn push_visibility_guard(
 pub(crate) fn push_action_visibility_predicate(
 	query: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
 	alias: &'static str,
-	viewer: Option<&str>,
+	viewer: Option<(&str, ProfileRelation)>,
 ) {
-	let Some(viewer) = viewer else {
+	let Some((viewer, rel)) = viewer else {
 		query.push(format!("({alias}.visibility = 'P')"));
 		return;
 	};
-	// `connected` is stored as int 1 (mutual) or 'R' (requested, not yet
-	// mutual); test for the canonical int 1, which excludes 'R'.
+	// Connected implies follower-level access, as in `SubjectAccessLevel`.
 	query.push(format!(
 		"({alias}.visibility = 'P' OR {alias}.visibility = 'V' \
-		 OR ({alias}.visibility IN ('2','F') AND EXISTS (SELECT 1 FROM profiles pv \
-		      WHERE pv.tn_id = {alias}.tn_id AND pv.id_tag = {alias}.issuer_tag \
-		        AND (pv.following = 1 OR pv.connected = 1))) \
-		 OR ({alias}.visibility = 'C' AND EXISTS (SELECT 1 FROM profiles pv \
-		      WHERE pv.tn_id = {alias}.tn_id AND pv.id_tag = {alias}.issuer_tag \
-		        AND pv.connected = 1)) \
-		 OR {alias}.issuer_tag = "
+		 OR ({alias}.visibility IN ('2','F') AND "
 	));
+	query.push_bind(rel.follower || rel.connected);
+	query.push(format!(") OR ({alias}.visibility = 'C' AND "));
+	query.push_bind(rel.connected);
+	query.push(format!(") OR {alias}.issuer_tag = "));
 	let viewer = normalize_id_tag(viewer);
 	query.push_bind(viewer.clone().into_owned());
 	query.push(format!(" OR {alias}.audience = "));
 	query.push_bind(viewer.clone().into_owned());
 	query.push(format!(
-		" OR ({alias}.visibility = 'S' AND EXISTS (SELECT 1 FROM actions s \
+		" OR (coalesce({alias}.visibility, 'D') IN ('S', 'D') \
+		      AND EXISTS (SELECT 1 FROM actions s \
 		      WHERE s.tn_id = {alias}.tn_id AND s.type = 'SUBS' AND s.status = 'A' \
 		        AND (s.sub_type IS NULL OR s.sub_type <> 'DEL') \
 		        AND s.issuer_tag = "
 	));
 	query.push_bind(viewer.into_owned());
+	// Mirrors `filter::subscriber_container`: only 'S' rows bridge through `subject`.
 	query.push(format!(
-		" AND s.subject = COALESCE({alias}.root_id, {alias}.subject, {alias}.action_id))))"
+		" AND s.subject = CASE WHEN {alias}.visibility = 'S' \
+		   THEN COALESCE({alias}.root_id, {alias}.subject, {alias}.action_id) \
+		   ELSE COALESCE({alias}.root_id, {alias}.action_id) END)))"
 	));
+}
+
+/// Drafts ('R') and scheduled ('S') rows are visible only to their issuer.
+/// Self-contained parenthesised expression, like the visibility predicate;
+/// `viewer = None` hides every draft.
+pub(crate) fn push_draft_guard(
+	query: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+	alias: &'static str,
+	viewer: Option<&str>,
+) {
+	query.push(format!("(coalesce({alias}.status, 'A') NOT IN ('R', 'S')"));
+	if let Some(viewer) = viewer.filter(|v| !v.is_empty() && *v != "guest") {
+		query.push(format!(" OR {alias}.issuer_tag = "));
+		query.push_bind(normalize_id_tag(viewer).into_owned());
+	}
+	query.push(")");
 }
 
 /// Count actions matching `opts` (same filters as `list`), with NO limit/sort/
@@ -1897,6 +1920,7 @@ mod tests {
 	/// bare OR-chain that would bind loosely against a surrounding `AND`.
 	fn predicate_sql(alias: &'static str, viewer: Option<&str>) -> String {
 		let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new("");
+		let viewer = viewer.map(|v| (v, ProfileRelation::default()));
 		push_action_visibility_predicate(&mut q, alias, viewer);
 		q.into_sql().as_str().to_owned()
 	}
@@ -1931,9 +1955,8 @@ mod tests {
 		let sql = predicate_sql("d", Some("bob.example"));
 		assert!(sql.contains("d.issuer_tag"), "{sql}");
 		assert!(!sql.contains("a.issuer_tag"), "the alias must not be hard-coded: {sql}");
-		// The subquery on `profiles` is the issuer relationship — keyed on the
-		// row's issuer, never on the tenant.
-		assert!(sql.contains("pv.id_tag = d.issuer_tag"), "{sql}");
+		// The reader's relation is bound, never looked up per row on the issuer.
+		assert!(!sql.contains("profiles"), "{sql}");
 		// Viewer values are bound, never interpolated.
 		assert!(!sql.contains("bob.example"), "{sql}");
 	}
@@ -2709,29 +2732,6 @@ mod tests {
 		.expect("insert subs membership");
 	}
 
-	// Insert the viewer's relationship row, keyed on the issuer's id_tag (the
-	// guard joins on the action's issuer_tag).
-	async fn insert_relationship(
-		db: &SqlitePool,
-		tn_id: TnId,
-		id_tag: &str,
-		following: bool,
-		connected: bool,
-	) {
-		sqlx::query(
-			"INSERT INTO profiles (tn_id, id_tag, name, following, connected)
-			VALUES (?, ?, ?, ?, ?)",
-		)
-		.bind(tn_id.0)
-		.bind(id_tag)
-		.bind(id_tag)
-		.bind(following)
-		.bind(connected)
-		.execute(db)
-		.await
-		.expect("insert relationship");
-	}
-
 	// Seed one row per visibility level ('P','V','2','F','C','S','D') from
 	// VIS_ISSUER, plus own-issuer and addressed-audience rows (both Direct, so they
 	// match only via the issuer/audience arms). The 'S' row's action_id is its
@@ -2751,10 +2751,15 @@ mod tests {
 	// Count only the seeded POST content rows (excludes SUBS membership rows) under
 	// the given visibility guard.
 	fn vis_count_opts(guard: Patch<String>) -> ListActionOptions {
+		vis_count_opts_rel(guard, ProfileRelation::default())
+	}
+
+	fn vis_count_opts_rel(guard: Patch<String>, rel: ProfileRelation) -> ListActionOptions {
 		ListActionOptions {
 			typ: Some(vec!["POST".into()]),
 			status: Some(vec!["A".into()]),
 			visibility_guard: guard,
+			viewer_relation: rel,
 			..Default::default()
 		}
 	}
@@ -2791,11 +2796,10 @@ mod tests {
 		let db = test_pool(dir.path()).await;
 		let tn_id = TnId(1);
 		seed_vis_rows(&db, tn_id).await;
-		insert_relationship(&db, tn_id, VIS_ISSUER, true, false).await;
-
-		// following=1 adds the '2' (2nd-degree) and 'F' (follower) rows.
+		// A reader who follows the tenant sees the '2' (2nd-degree) and 'F' rows.
+		let rel = ProfileRelation { follower: true, ..Default::default() };
 		let guard = Patch::Value(VIS_VIEWER.to_string());
-		let n = count(&db, tn_id, &vis_count_opts(guard)).await.expect("count");
+		let n = count(&db, tn_id, &vis_count_opts_rel(guard, rel)).await.expect("count");
 		assert_eq!(n, 6, "following adds the 2nd-degree and follower rows");
 	}
 
@@ -2805,12 +2809,11 @@ mod tests {
 		let db = test_pool(dir.path()).await;
 		let tn_id = TnId(1);
 		seed_vis_rows(&db, tn_id).await;
-		insert_relationship(&db, tn_id, VIS_ISSUER, false, true).await;
-
-		// connected=1 satisfies the 2nd-degree/follower OR-arm AND the connected
+		// Connected satisfies the 2nd-degree/follower OR-arm AND the connected
 		// arm: P, V, own, aud, 2, F, C.
+		let rel = ProfileRelation { connected: true, ..Default::default() };
 		let guard = Patch::Value(VIS_VIEWER.to_string());
-		let n = count(&db, tn_id, &vis_count_opts(guard)).await.expect("count");
+		let n = count(&db, tn_id, &vis_count_opts_rel(guard, rel)).await.expect("count");
 		assert_eq!(n, 7, "connected adds the 2nd-degree, follower, and connected rows");
 	}
 

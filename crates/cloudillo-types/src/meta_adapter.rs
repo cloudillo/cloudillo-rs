@@ -683,6 +683,10 @@ pub struct ListActionOptions {
 	/// keep the "no guard" behavior.
 	#[serde(skip)]
 	pub visibility_guard: Patch<String>,
+	/// The guarded viewer's relation to the tenant (`abac::subject_relation_to_tenant`),
+	/// read by `visibility_guard = Value(_)` for the follower / connected arms. Server-set.
+	#[serde(skip)]
+	pub viewer_relation: ProfileRelation,
 }
 
 #[skip_serializing_none]
@@ -1088,6 +1092,19 @@ pub struct ListFileOptions {
 	/// Set by handler via `cloudillo_core::channels::enterable_channels`.
 	#[serde(skip)]
 	pub enterable_channels: Option<Vec<Box<str>>>,
+	/// Caller holds a community role: local rows (`upstream_tag` NULL) pass the
+	/// `visible_levels` filter. The channel gate still applies. Set by handler.
+	#[serde(skip)]
+	pub role_grant: bool,
+	/// Caller id_tag whose direct or inherited (ancestor folder) share entries admit a row
+	/// past both `visible_levels` and the channel gate. Set by handler; never for scoped tokens.
+	#[serde(skip)]
+	pub share_subject: Option<String>,
+	/// Caller id_tag whose own pending uploads (`status = 'P'`) are listed. Pending rows
+	/// are otherwise absent from every listing except `sweep_all`. Set by handler for
+	/// non-anonymous callers only.
+	#[serde(skip)]
+	pub pending_viewer: Option<String>,
 	/// Include files that belong to a document tree (`root_id IS NOT NULL`) as
 	/// well as standalone ones. Server-only: set by maintenance sweeps, never by
 	/// a request. The default listing hides tree children because a file browser
@@ -1464,9 +1481,17 @@ pub struct SearchOptions {
 	pub scope_file_id: Option<String>,
 	/// File id a delegated (share-link / app) token was scoped to. Its own row and
 	/// the deep `'D'` parts of its document tree bypass the visibility filter —
-	/// the share itself is the grant. Child `'F'` rows in the same tree stay
-	/// visibility-filtered, matching `GET /api/files`' document-scope branch.
+	/// the share itself is the grant. Child `'F'` rows in the same tree are never
+	/// search hits; their container stands for them.
 	pub scope_grant_file_id: Option<Box<str>>,
+	/// Same as [`ListFileOptions::role_grant`], on `'F'`/`'D'` rows.
+	pub role_grant: bool,
+	/// Same as [`ListFileOptions::share_subject`]: a shared file's row and its `'D'` parts.
+	pub share_subject: Option<String>,
+	/// The viewer's relation to the tenant, for the `'A'` rows' follower / connected arms.
+	pub viewer_relation: ProfileRelation,
+	/// Leader bypass: `'A'` rows skip the visibility predicate, as `GET /api/actions/{id}` does.
+	pub actions_unguarded: bool,
 	/// Query the contentless index instead of the external-content one. Must
 	/// match the tenant's `search.store_text` setting, since a tenant's rows live
 	/// in exactly one of the two. Hits from the contentless index carry no

@@ -78,34 +78,20 @@ async fn check_file_permission(
 	};
 
 	// Create auth context or guest context if not authenticated
-	let (auth_ctx, subject_id_tag) = if let Some(auth_ctx) = maybe_auth_ctx {
-		let id_tag = auth_ctx.id_tag.clone();
-		(auth_ctx, id_tag)
-	} else {
+	let auth_ctx = maybe_auth_ctx.unwrap_or_else(|| {
 		// For unauthenticated requests, create a guest context
-		let guest_ctx = AuthCtx {
+		AuthCtx {
 			tn_id,
 			id_tag: "guest".into(),
 			roles: vec![].into(),
 			scope: None,
 			anonymous: true,
 			hat: None,
-		};
-		(guest_ctx, "guest".into())
-	};
+		}
+	});
 
-	// Load file attributes (pass scope from auth context for scoped token access)
-	let attrs = load_file_attrs(
-		&app,
-		tn_id,
-		&file_id,
-		&subject_id_tag,
-		&tenant_id_tag,
-		&auth_ctx.roles,
-		auth_ctx.hat.is_some(),
-		auth_ctx.scope.as_deref(),
-	)
-	.await?;
+	// Load file attributes (the auth context carries scope, roles, hat and anonymity)
+	let attrs = load_file_attrs(&app, tn_id, &file_id, &tenant_id_tag, &auth_ctx).await?;
 
 	// Check permission
 	let environment = Environment::new();
@@ -131,16 +117,12 @@ async fn check_file_permission(
 }
 
 // Load file attributes from MetaAdapter
-#[expect(clippy::too_many_arguments, reason = "permission check requires all context fields")]
 async fn load_file_attrs(
 	app: &App,
 	tn_id: TnId,
 	file_or_variant_id: &str,
-	subject_id_tag: &str,
 	tenant_id_tag: &str,
-	subject_roles: &[Box<str>],
-	subject_hatted: bool,
-	scope: Option<&str>,
+	auth: &AuthCtx,
 ) -> ClResult<FileAttrs> {
 	use cloudillo_core::abac::{self, VisibilityLevel};
 	use std::borrow::Cow;
@@ -168,21 +150,21 @@ async fn load_file_attrs(
 	debug!("File access for {}: owner {}", file_id, file_ref.owner_id_tag);
 
 	// Determine access level by looking up scoped tokens, FSHR action grants
-	let ctx = file_access::FileAccessCtx {
-		user_id_tag: subject_id_tag,
-		tenant_id_tag,
-		user_roles: subject_roles,
-		hatted: subject_hatted,
-	};
-	let access_level = file_access::get_access_level_with_scope(
+	let subject_id_tag: &str = &auth.id_tag;
+	let ctx = file_access::FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
+	let access_level = file_access::get_access_level(app, tn_id, file_ref, &ctx, None).await;
+
+	// Lifecycle, on read and write routes alike.
+	file_access::check_lifecycle(
 		app,
 		tn_id,
-		file_ref,
+		&file_view,
+		&file_ref,
 		&ctx,
-		scope,
-		file_view.root_id.as_deref(),
+		access_level,
+		auth.names_holder(),
 	)
-	.await;
+	.await?;
 
 	// Get visibility from file metadata - convert char to string representation
 	let vis_level = VisibilityLevel::from_char(file_view.visibility);
@@ -194,7 +176,7 @@ async fn load_file_attrs(
 	// The subject's relationship **to the tenant**: `follower` is "they follow us", which is
 	// what the visibility rules mean. (`following` is the opposite direction.) Only the
 	// SecondDegree/Follower/Connected rungs consult it, and ABAC's read branch returns on
-	// `can_read()` first — same guard `apkg.rs` and `check_file_access_with_scope` apply.
+	// `can_read()` first — same guard `apkg.rs` and `check_file_access` apply.
 	let rel = if !access_level.can_read() && abac::visibility_needs_relation(vis_level) {
 		abac::subject_relation_to_tenant(app, tn_id, subject_id_tag).await?
 	} else {

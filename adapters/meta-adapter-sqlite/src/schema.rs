@@ -135,7 +135,7 @@ const SEARCH_FTS_TRIGGERS: [&str; 3] = [
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 55;
+	const CURRENT_DB_VERSION: i64 = 56;
 
 	let mut tx = db.begin().await?;
 
@@ -2613,6 +2613,16 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 		set_db_version(&mut tx, 55).await;
+	}
+
+	if version < 56 {
+		// Non-blob files are created final, but `post_file` / `duplicate_file` used to leave
+		// them at the 'P' default that only blob finalization clears. Any client-supplied
+		// `file_tp` counts; NULL stays pending, since `create_file` reads a missing type as BLOB.
+		sqlx::query("UPDATE files SET status='A' WHERE status='P' AND file_tp<>'BLOB'")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 56).await;
 	}
 
 	tx.commit().await?;

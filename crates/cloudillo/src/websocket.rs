@@ -280,6 +280,92 @@ fn ws_close_type_mismatch(ws: WebSocketUpgrade) -> Response {
 	ws.on_upgrade(|socket| close_with_error(socket, 4409, "Store type mismatch"))
 }
 
+/// Which file WebSocket endpoint is asking
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsKind {
+	Crdt,
+	Rtdb,
+}
+
+/// Why `ws_file_access` refused a connection
+pub enum WsDeny {
+	/// The file access check failed (not found / denied / internal)
+	Access(FileAccessError),
+	/// `?access=` asked for more than the subject has
+	WriteDenied,
+	/// An `s~` store file exists with the other endpoint's type
+	TypeMismatch,
+}
+
+impl std::fmt::Display for WsDeny {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(match self {
+			WsDeny::Access(FileAccessError::NotFound) => "not_found",
+			WsDeny::Access(FileAccessError::AccessDenied) => "access_denied",
+			WsDeny::Access(FileAccessError::InternalError(_)) => "internal_error",
+			WsDeny::WriteDenied => "write_denied",
+			WsDeny::TypeMismatch => "type_mismatch",
+		})
+	}
+}
+
+fn ws_close_for_deny(ws: WebSocketUpgrade, deny: &WsDeny) -> Response {
+	match deny {
+		WsDeny::Access(e) => ws_close_for_error(ws, e),
+		WsDeny::WriteDenied => ws_close_write_denied(ws),
+		WsDeny::TypeMismatch => ws_close_type_mismatch(ws),
+	}
+}
+
+/// The pre-upgrade access decision for `/ws/rtdb/{id}` and `/ws/crdt/{id}`.
+///
+/// Pure with respect to the connection: no store/meta auto-creation (the handlers do
+/// that first). A `{parent}~meta` RTDB file is checked against its parent. Guests
+/// (`auth: None`) get Read; RTDB downgrades Comment to Read outside meta databases.
+pub async fn ws_file_access(
+	app: &crate::app::App,
+	tn_id: crate::types::TnId,
+	tenant_id_tag: &str,
+	auth: Option<&cloudillo_types::auth_adapter::AuthCtx>,
+	file_id: &str,
+	query: &AccessQuery,
+	kind: WsKind,
+) -> Result<AccessLevel, WsDeny> {
+	let (store_tp, meta_parent) = match kind {
+		WsKind::Crdt => ("CRDT", None),
+		WsKind::Rtdb => ("RTDB", validate_meta_id(file_id)),
+	};
+
+	// Check file access (with scope for share links)
+	let ctx = file_access::FileAccessCtx::from_auth(auth, tenant_id_tag);
+	let result = file_access::check_file_access(
+		app,
+		tn_id,
+		meta_parent.unwrap_or(file_id),
+		&ctx,
+		query.via.as_deref(),
+	)
+	.await
+	.map_err(WsDeny::Access)?;
+
+	// Verify store type matches endpoint
+	if file_id.starts_with("s~") && result.file_view.file_tp.as_deref() != Some(store_tp) {
+		return Err(WsDeny::TypeMismatch);
+	}
+
+	// Guests are always read-only
+	if auth.is_none() {
+		return Ok(AccessLevel::Read);
+	}
+	let al = resolve_access(query, result.access_level).map_err(|()| WsDeny::WriteDenied)?;
+	// For non-meta RTDB, downgrade Comment to Read (comment users can only write to
+	// meta databases, not the main document RTDB)
+	if kind == WsKind::Rtdb && meta_parent.is_none() && al == AccessLevel::Comment {
+		return Ok(AccessLevel::Read);
+	}
+	Ok(al)
+}
+
 /// WebSocket upgrade handler for the notification bus
 ///
 /// Requires authentication. Routes to ws_bus handler.
@@ -344,16 +430,8 @@ pub async fn get_ws_rtdb(
 		.filter(|ctx| !ctx.anonymous)
 		.map(|ctx| normalize_id_tag(&ctx.id_tag).into_owned());
 
-	let (user_id, user_tn_id, user_roles, scope) = if let Some(ref auth_ctx) = auth {
-		(
-			auth_ctx.id_tag.to_string(),
-			auth_ctx.tn_id,
-			auth_ctx.roles.clone(),
-			auth_ctx.scope.clone(),
-		)
-	} else {
-		(String::new(), crate::types::TnId(tn_id), Box::default(), None::<Box<str>>)
-	};
+	let user_id = auth.as_ref().map(|a| a.id_tag.to_string()).unwrap_or_default();
+	let user_tn_id = auth.as_ref().map_or(crate::types::TnId(tn_id), |a| a.tn_id);
 
 	// Auto-create store file only for authenticated users
 	if !is_guest {
@@ -376,88 +454,52 @@ pub async fn get_ws_rtdb(
 
 	// Auto-create meta database for authenticated users
 	// Meta DBs ({parent_file_id}~meta) store comments and metadata
-	let meta_parent = validate_meta_id(&file_id);
-	let is_meta = meta_parent.is_some();
-	let access_file_id = if let Some(parent_file_id) = meta_parent {
-		if !is_guest
-			&& let Err(e) =
-				ensure_meta_file(&app, crate::types::TnId(tn_id), &file_id, parent_file_id).await
-		{
-			return ws_close_for_error(ws, &e);
-		}
-		// Check access against the parent file, not the meta file itself
-		parent_file_id.to_string()
-	} else {
-		file_id.clone()
-	};
+	if !is_guest
+		&& let Some(parent_file_id) = validate_meta_id(&file_id)
+		&& let Err(e) =
+			ensure_meta_file(&app, crate::types::TnId(tn_id), &file_id, parent_file_id).await
+	{
+		return ws_close_for_error(ws, &e);
+	}
 
-	// Check file access (with scope for share links)
-	let ctx = file_access::FileAccessCtx {
-		user_id_tag: &user_id,
-		tenant_id_tag: &tenant_id_tag,
-		user_roles: &user_roles,
-		hatted: auth.as_ref().is_some_and(|a| a.hat.is_some()),
-	};
-	let access_result = file_access::check_file_access_with_scope(
+	let access_level = match ws_file_access(
 		&app,
 		crate::types::TnId(tn_id),
-		&access_file_id,
-		&ctx,
-		scope.as_deref(),
-		query.via.as_deref(),
+		&tenant_id_tag,
+		auth.as_ref(),
+		&file_id,
+		&query,
+		WsKind::Rtdb,
 	)
-	.await;
-
-	match access_result {
-		Ok(result) => {
-			// Verify store type matches endpoint
-			if file_id.starts_with("s~") && result.file_view.file_tp.as_deref() != Some("RTDB") {
-				warn!("Store type mismatch: {} is not RTDB", file_id);
-				return ws_close_type_mismatch(ws);
-			}
-
-			// Guests are always read-only
-			let access_level = if is_guest {
-				AccessLevel::Read
-			} else {
-				let Ok(al) = resolve_access(&query, result.access_level) else {
-					warn!(
-						"RTDB WebSocket rejected - requested access not available: user={}, file={}",
-						user_id, file_id
-					);
-					return ws_close_write_denied(ws);
-				};
-				// For non-meta DBs, downgrade Comment to Read (comment users
-				// can only write to meta databases, not main document RTDB)
-				if !is_meta && al == AccessLevel::Comment { AccessLevel::Read } else { al }
-			};
-			info!(
-				"RTDB WebSocket ({}): user={}, file={}",
-				access_level.as_str(),
-				if is_guest { "*guest" } else { &user_id },
-				file_id
-			);
-			ws.on_upgrade(move |socket| {
-				// `identity_id_tag`, deliberately *not* `is_guest` — that still governs
-				// store-file auto-creation and the read-only downgrade above, and a
-				// `file:{id}:W` share-link visitor keeps write access while losing only
-				// the asserted identity.
-				rtdb::handle_rtdb_connection(
-					socket,
-					identity_id_tag,
-					file_id,
-					app,
-					user_tn_id,
-					access_level,
-					presence_enabled,
-				)
-			})
+	.await
+	{
+		Ok(al) => al,
+		Err(deny) => {
+			warn!("RTDB WebSocket rejected ({}): user={}, file={}", deny, user_id, file_id);
+			return ws_close_for_deny(ws, &deny);
 		}
-		Err(e) => {
-			warn!("RTDB WebSocket rejected: user={}, file={}", user_id, file_id);
-			ws_close_for_error(ws, &e)
-		}
-	}
+	};
+	info!(
+		"RTDB WebSocket ({}): user={}, file={}",
+		access_level.as_str(),
+		if is_guest { "*guest" } else { &user_id },
+		file_id
+	);
+	ws.on_upgrade(move |socket| {
+		// `identity_id_tag`, deliberately *not* `is_guest` — that still governs
+		// store-file auto-creation and the read-only downgrade in `ws_file_access`, and a
+		// `file:{id}:W` share-link visitor keeps write access while losing only
+		// the asserted identity.
+		rtdb::handle_rtdb_connection(
+			socket,
+			identity_id_tag,
+			file_id,
+			app,
+			user_tn_id,
+			access_level,
+			presence_enabled,
+		)
+	})
 }
 
 /// WebSocket upgrade handler for CRDT documents
@@ -497,16 +539,8 @@ pub async fn get_ws_crdt(
 		.filter(|ctx| !ctx.anonymous)
 		.map(|ctx| normalize_id_tag(&ctx.id_tag).into_owned());
 
-	let (user_id, user_tn_id, user_roles, scope) = if let Some(ref auth_ctx) = auth {
-		(
-			auth_ctx.id_tag.to_string(),
-			auth_ctx.tn_id,
-			auth_ctx.roles.clone(),
-			auth_ctx.scope.clone(),
-		)
-	} else {
-		(String::new(), crate::types::TnId(tn_id), Box::default(), None::<Box<str>>)
-	};
+	let user_id = auth.as_ref().map(|a| a.id_tag.to_string()).unwrap_or_default();
+	let user_tn_id = auth.as_ref().map_or(crate::types::TnId(tn_id), |a| a.tn_id);
 
 	// Auto-create store file only for authenticated users
 	if !is_guest {
@@ -527,71 +561,38 @@ pub async fn get_ws_crdt(
 		}
 	}
 
-	// Check file access (with scope for share links)
-	let ctx = file_access::FileAccessCtx {
-		user_id_tag: &user_id,
-		tenant_id_tag: &tenant_id_tag,
-		user_roles: &user_roles,
-		hatted: auth.as_ref().is_some_and(|a| a.hat.is_some()),
-	};
-	let access_result = file_access::check_file_access_with_scope(
+	let access_level = match ws_file_access(
 		&app,
 		crate::types::TnId(tn_id),
+		&tenant_id_tag,
+		auth.as_ref(),
 		&doc_id,
-		&ctx,
-		scope.as_deref(),
-		query.via.as_deref(),
+		&query,
+		WsKind::Crdt,
 	)
-	.await;
-
-	match access_result {
-		Ok(result) => {
-			// Verify store type matches endpoint
-			if doc_id.starts_with("s~") && result.file_view.file_tp.as_deref() != Some("CRDT") {
-				warn!("Store type mismatch: {} is not CRDT", doc_id);
-				return ws_close_type_mismatch(ws);
-			}
-
-			// Guests are always read-only; Comment treated as read-only for CRDT
-			let read_only = if is_guest {
-				true
-			} else {
-				let Ok(al) = resolve_access(&query, result.access_level) else {
-					warn!(
-						"CRDT WebSocket rejected - requested access not available: user={}, doc={}",
-						user_id, doc_id
-					);
-					return ws_close_write_denied(ws);
-				};
-				// CRDT: only Write-or-better can edit; Comment is read-only
-				!al.can_write()
-			};
-			info!(
-				"CRDT WebSocket ({}): user={}, doc={}",
-				if read_only { "read-only" } else { "read-write" },
-				if is_guest { "*guest" } else { &user_id },
-				doc_id
-			);
-			ws.on_upgrade(move |socket| {
-				// `awareness_id_tag`, deliberately *not* `is_guest` — that still governs
-				// store-file auto-creation and read-only above, and a `file:{id}:W`
-				// share-link visitor keeps write access while losing only the asserted
-				// identity.
-				crdt::handle_crdt_connection(
-					socket,
-					awareness_id_tag,
-					doc_id,
-					app,
-					user_tn_id,
-					read_only,
-				)
-			})
+	.await
+	{
+		Ok(al) => al,
+		Err(deny) => {
+			warn!("CRDT WebSocket rejected ({}): user={}, doc={}", deny, user_id, doc_id);
+			return ws_close_for_deny(ws, &deny);
 		}
-		Err(e) => {
-			warn!("CRDT WebSocket rejected: user={}, doc={}", user_id, doc_id);
-			ws_close_for_error(ws, &e)
-		}
-	}
+	};
+	// CRDT: only Write-or-better can edit; Comment (and a guest's Read) is read-only
+	let read_only = !access_level.can_write();
+	info!(
+		"CRDT WebSocket ({}): user={}, doc={}",
+		if read_only { "read-only" } else { "read-write" },
+		if is_guest { "*guest" } else { &user_id },
+		doc_id
+	);
+	ws.on_upgrade(move |socket| {
+		// `awareness_id_tag`, deliberately *not* `is_guest` — that still governs
+		// store-file auto-creation and read-only above, and a `file:{id}:W`
+		// share-link visitor keeps write access while losing only the asserted
+		// identity.
+		crdt::handle_crdt_connection(socket, awareness_id_tag, doc_id, app, user_tn_id, read_only)
+	})
 }
 
 // vim: ts=4

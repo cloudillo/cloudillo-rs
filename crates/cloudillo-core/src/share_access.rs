@@ -47,14 +47,9 @@ pub async fn require_unscoped_file_access(
 		return Err(Error::PermissionDenied);
 	}
 
-	let ctx = FileAccessCtx {
-		user_id_tag: &auth.id_tag,
-		tenant_id_tag,
-		user_roles: &auth.roles,
-		hatted: auth.hat.is_some(),
-	};
-	// Scope `None` — scoped callers were rejected above.
-	match file_access::check_file_access_with_scope(app, tn_id, file_id, &ctx, None, None).await {
+	// Scoped callers were rejected above, so the ctx carries no scope.
+	let ctx = FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
+	match file_access::check_file_access(app, tn_id, file_id, &ctx, None).await {
 		Err(file_access::FileAccessError::NotFound) => Err(Error::NotFound),
 		Err(file_access::FileAccessError::AccessDenied) => Err(Error::PermissionDenied),
 		Err(file_access::FileAccessError::InternalError(msg)) => Err(Error::Internal(msg)),
@@ -217,7 +212,7 @@ pub async fn share_standing_for_actor(
 /// A share manager may not hand out more access than [`ShareAuthority::grant_ceiling`] allows.
 ///
 /// Manager standing is not Write-derived (a `Read`-level leader qualifies), and
-/// `file_access::get_access_level_with_scope` returns a share-link scope's level uncapped by the
+/// `file_access::get_access_level` returns a share-link scope's level uncapped by the
 /// holder's own ACL — so without this a `Read` manager could mint a `write` link and redeem it to
 /// escalate themselves.
 pub fn ensure_grant_within(

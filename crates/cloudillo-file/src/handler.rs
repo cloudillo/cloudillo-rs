@@ -343,6 +343,26 @@ async fn build_path(
 	acc
 }
 
+/// A trashed folder, or any folder below one, takes no new children (lifecycle ruling, FC-18).
+pub(crate) async fn reject_trashed_parent(
+	app: &App,
+	tn_id: TnId,
+	parent_id: Option<&str>,
+) -> ClResult<()> {
+	let Some(parent_id) = parent_id.filter(|p| !is_terminal_parent(p) && *p != ROOT_PARENT_ID)
+	else {
+		return Ok(());
+	};
+	let Some(parent) = app.meta_adapter.read_file(tn_id, parent_id).await? else {
+		return Ok(());
+	};
+	if file_access::in_trash(app, tn_id, &parent).await? {
+		Err(Error::PermissionDenied)
+	} else {
+		Ok(())
+	}
+}
+
 /// GET /api/files
 pub async fn get_file_list(
 	State(app): State<App>,
@@ -363,6 +383,11 @@ pub async fn get_file_list(
 			"withPath requires fileId or limit<={}",
 			MAX_BULK_WITHPATH_LIMIT
 		)));
+	}
+
+	// Tombstones are server-internal (`sweep_all`); no caller lists them.
+	if matches!(opts.status, Some(meta_adapter::FileStatus::Deleted)) {
+		return Err(Error::ValidationError("status=D is not listable".into()));
 	}
 
 	// Set user_id_tag for user-specific data (pinned, starred, sorting by recent/modified)
@@ -476,6 +501,20 @@ pub async fn get_file_list(
 
 	let access_level = relationship_level(is_tenant, rel.connected, rel.follower, is_real_auth);
 	opts.visible_levels = access_level.visible_levels().map(<[char]>::to_vec);
+	// Identity grants (roles, shares) never reach a scoped token: scope = guest + grant.
+	if scope.is_none() && is_real_auth {
+		opts.role_grant = file_access::role_access_level(subject_roles) > AccessLevel::None;
+		opts.share_subject = Some(subject_id_tag.to_owned());
+	}
+	// Pending uploads are listed to their real owner only. A scoped token that carries a `sub`
+	// still names that person; a share-link token's id_tag is the tenant's.
+	if is_real_auth
+		&& maybe_auth
+			.as_ref()
+			.is_some_and(cloudillo_types::auth_adapter::AuthCtx::names_holder)
+	{
+		opts.pending_viewer = Some(subject_id_tag.to_owned());
+	}
 
 	if !is_tenant {
 		opts.hidden = None;
@@ -510,7 +549,9 @@ pub async fn get_file_list(
 		inherited_share =
 			file_access::check_share_for_file(&app, tn_id, parent_id, subject_id_tag).await;
 	}
-	if inherited_share.is_some() {
+	// A scope-tree listing is confined to that tree by `scope_file_id`, and the scope is the
+	// read grant there, so it bypasses visibility the same way.
+	if inherited_share.is_some() || opts.scope_file_id.is_some() {
 		opts.visible_levels = None;
 		// The room never gates a deliberate handoff.
 		opts.enterable_channels = None;
@@ -523,12 +564,7 @@ pub async fn get_file_list(
 
 	// Compute access_level (Read/Write) for each file
 	// (visibility is already filtered at SQL level via visible_levels)
-	let access_ctx = file_access::FileAccessCtx {
-		user_id_tag: subject_id_tag,
-		tenant_id_tag: &tenant_id_tag,
-		user_roles: subject_roles,
-		hatted,
-	};
+	let access_ctx = file_access::FileAccessCtx::from_auth(maybe_auth.as_ref(), &tenant_id_tag);
 	let mut filtered =
 		filter::compute_file_access_levels(&app, tn_id, &access_ctx, inherited_share, files)
 			.await?;
@@ -598,6 +634,20 @@ pub async fn get_file_list(
 	} else {
 		None
 	};
+
+	// Trashed rows, however reached (trash view or `?fileId`): only those the caller may
+	// manage (lifecycle ruling).
+	// ponytail: filtered after the SQL page, so a trash page can come back short or empty; the
+	// cursor above is built from the unfiltered page, so clients must page on `has_more`, not on
+	// an empty page. An owner filter in SQL would drop Admin-level grantees' rows.
+	filtered.retain(|f| {
+		f.parent_id.as_deref() != Some(TRASH_PARENT_ID)
+			|| file_access::can_manage_lifecycle(
+				&file_access::FileRef::from_view(f, &tenant_id_tag),
+				&access_ctx,
+				f.access_level.unwrap_or(AccessLevel::None),
+			)
+	});
 
 	let response = ApiResponse::with_cursor_pagination(filtered, next_cursor, has_more)
 		.with_req_id(req_id.unwrap_or_default());
@@ -1453,6 +1503,7 @@ pub async fn post_file(
 		req.root_id.as_deref(),
 	)
 	.await?;
+	reject_trashed_parent(&app, tn_id, req.effective_parent_id()?.as_deref()).await?;
 
 	// Cross-context creation (Hand verbs: Pin / Place) routes through a dedicated
 	// branch before the normal new-blob path. Triggered by the presence of
@@ -1520,6 +1571,7 @@ pub async fn post_file(
 				tags: req.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 				visibility,
 				channel,
+				status: Some(meta_adapter::FileStatus::Active),
 				..Default::default()
 			},
 		)
@@ -1801,12 +1853,13 @@ pub struct RefreshResponse {
 /// - 200 + cleared tombstone → source responded; if caller is the row's
 ///   owner we sync `file_name` / `content_type` / `file_tp` / `tags` /
 ///   `preset` / `x` and clear any prior `broken_*`. Non-owners get a
-///   per-user-only refresh (the cached `access_level` is updated for the
-///   caller, shared row state is left untouched).
+///   per-user-only refresh (shared row state is left untouched). The cached
+///   `access_level` is written only when the caller is the tenant: the source
+///   is queried as the tenant, so its level is the tenant's.
 /// - 200 + `broken_reason = 'deleted'` → source returned 404/410. Owner-only.
 /// - 200 + `broken_reason = 'revoked'` → source returned 403. Owner-only;
-///   non-owners get their cached `access_level` cleared but the shared
-///   tombstone is left alone.
+///   the tenant's cached `access_level` is cleared, the shared tombstone is
+///   left alone for non-owners.
 /// - 200 + `refreshStatus = "unreachable"` → transient network/parse failure.
 ///   No row mutation: the response returns whatever was already on disk.
 ///   The hint is non-sticky, so a successful retry simply omits the field.
@@ -1836,32 +1889,25 @@ pub async fn refresh_file(
 			"refresh requires a content-addressed file_id, not an @-prefixed id".into(),
 		));
 	}
+	// Anonymous callers (guest, or a delegated / share-link token) never refresh, whatever
+	// their read level: it triggers an upstream fetch and writes per-user state.
+	if auth.scope.is_some() || auth.id_tag.is_empty() || auth.id_tag.as_ref() == "guest" {
+		return Err(Error::PermissionDenied);
+	}
 
 	// Caller must have read access to the destination row. We don't have a
 	// cheap-and-direct ABAC check at the handler layer, so reuse
-	// `check_file_access_with_scope` (the same gate that
+	// `check_file_access` (the same gate that
 	// `GET /metadata` uses for authed callers).
-	let ctx = file_access::FileAccessCtx {
-		user_id_tag: &auth.id_tag,
-		tenant_id_tag: &tenant_id_tag,
-		user_roles: &auth.roles,
-		hatted: auth.hat.is_some(),
-	};
-	let existing = file_access::check_file_access_with_scope(
-		&app,
-		tn_id,
-		&file_id,
-		&ctx,
-		auth.scope.as_deref(),
-		None,
-	)
-	.await
-	.map_err(|e| match e {
-		file_access::FileAccessError::NotFound => Error::NotFound,
-		file_access::FileAccessError::AccessDenied => Error::PermissionDenied,
-		file_access::FileAccessError::InternalError(m) => Error::Internal(m),
-	})?
-	.file_view;
+	let ctx = file_access::FileAccessCtx::from_auth(Some(&auth), &tenant_id_tag);
+	let existing = file_access::check_file_access(&app, tn_id, &file_id, &ctx, None)
+		.await
+		.map_err(|e| match e {
+			file_access::FileAccessError::NotFound => Error::NotFound,
+			file_access::FileAccessError::AccessDenied => Error::PermissionDenied,
+			file_access::FileAccessError::InternalError(m) => Error::Internal(m),
+		})?
+		.file_view;
 
 	// Refresh only makes sense for cross-context rows — rows that originate here have
 	// no upstream source to fetch. Identify them by a set `upstream_tag`; the owner may
@@ -1877,7 +1923,6 @@ pub async fn refresh_file(
 
 	// Only the row's owner may write shared row state (file_name,
 	// content_type, tags, preset, x, broken_*). Non-owners with read access
-	// can still keep their per-user cached `access_level` in sync, but they
 	// cannot toggle the tombstone or overwrite shared fields for everyone.
 	//
 	// The **raw** column, not the resolved `owner`: on an FSHR-accepted row `owner_tag` is NULL
@@ -1992,7 +2037,11 @@ pub async fn refresh_file(
 	// failure via Patch::Undefined). Subsequent list responses read this back
 	// via the file_user_data JOIN, so the eye badge survives reloads instead
 	// of being recomputed from stale FSHR actions.
-	if !access_level_update.is_undefined() {
+	//
+	// The upstream fetch runs as the tenant, so the level it reports is the tenant's standing.
+	// Cache it only for the tenant itself; on a community a member's row must not inherit it.
+	let is_tenant = ctx.user_id_tag == ctx.tenant_id_tag;
+	if is_tenant && !access_level_update.is_undefined() {
 		app.meta_adapter
 			.update_file_user_data(
 				tn_id,
@@ -2066,6 +2115,7 @@ pub async fn post_file_blob(
 		query.root_id.as_deref(),
 	)
 	.await?;
+	reject_trashed_parent(&app, tn_id, query.effective_parent_id()?.as_deref()).await?;
 
 	let content_type = header
 		.get(axum::http::header::CONTENT_TYPE)
@@ -2528,48 +2578,16 @@ pub async fn get_file_metadata(
 	if maybe_auth.is_none() && file.visibility.is_none() {
 		return Err(Error::NotFound);
 	}
-	// Compute the caller's effective access level so cross-context callers
-	// (e.g. `POST /files/{id}/refresh` on a peer) can cache it. Same-tenant
-	// access is already fully described by the route-level ABAC role check —
-	// running `get_access_level_with_scope` for every authed request to this
-	// endpoint (hit by virtually every file view) would add a needless FSHR-
-	// fallback query against the actions table to the hot path. Skip it
-	// unless the file is genuinely cross-tenant.
-	if let Some(auth) = maybe_auth.as_ref() {
-		let file_ref = file_access::FileRef::from_view(&file, &tenant_id_tag);
-		// Compute access_level when either (a) the file is from another tenant
-		// (the original cross-context Pin/Place path), or (b) the caller is from
-		// another tenant (federated /refresh from the receiver — the owner's
-		// server must report the receiver's effective level so they can cache
-		// the eye-badge after a permission change). Skipping both cases would
-		// leave `refresh_file` unable to pick up share_entry PATCHes.
-		// Provenance, not authority: the row is cross-context when its canonical copy
-		// lives elsewhere, regardless of which local profile owns it.
-		let is_cross_tenant_file = file_ref.upstream_id_tag.is_some();
-		let is_cross_tenant_caller = auth.id_tag.as_ref() != tenant_id_tag.as_ref();
-		if is_cross_tenant_file || is_cross_tenant_caller {
-			let ctx = file_access::FileAccessCtx {
-				user_id_tag: &auth.id_tag,
-				tenant_id_tag: &tenant_id_tag,
-				user_roles: &auth.roles,
-				hatted: auth.hat.is_some(),
-			};
-			let level = file_access::get_access_level_with_scope(
-				&app,
-				tn_id,
-				file_ref,
-				&ctx,
-				auth.scope.as_deref(),
-				file.root_id.as_deref(),
-			)
-			.await;
-			// Map AccessLevel::None → None so we don't lie about a non-grant.
-			file.access_level = match level {
-				AccessLevel::None => None,
-				other => Some(other),
-			};
-		}
-	}
+	// Always report the caller's effective level: clients read it for the eye badge, and a peer's
+	// `POST /files/{id}/refresh` caches it. Anonymous callers get the visibility rung.
+	let ctx = file_access::FileAccessCtx::from_auth(maybe_auth.as_ref(), &tenant_id_tag);
+	let file_ref = file_access::FileRef::from_view(&file, &tenant_id_tag);
+	let level = file_access::get_access_level(&app, tn_id, file_ref, &ctx, None).await;
+	// Map AccessLevel::None → None so we don't lie about a non-grant.
+	file.access_level = match level {
+		AccessLevel::None => None,
+		other => Some(other),
+	};
 	Ok((StatusCode::OK, Json(ApiResponse::new(file).with_req_id(req_id.unwrap_or_default()))))
 }
 

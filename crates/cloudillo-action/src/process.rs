@@ -747,6 +747,12 @@ async fn check_inbound_permissions(
 	definition: &crate::dsl::types::ActionDefinition,
 	hat_role: Option<&str>,
 ) -> ClResult<()> {
+	// Ahead of every shortcut, the hat one included: an APRV needs authority over its subject.
+	// It never widens admission; the follow / hat gates below still apply.
+	if helpers::extract_type_and_subtype(&action.t).0 == "APRV" {
+		check_aprv_authority(app, tn_id, action_id, action).await?;
+	}
+
 	// A hatted action endorsed by its hat: the mapped `hat_role` replaces the follow/connected
 	// gate, and must be contributor or above. Ahead of `allow_unknown`, so a restricted issuer
 	// is refused even for a type that admits strangers.
@@ -764,22 +770,6 @@ async fn check_inbound_permissions(
 			return Err(Error::PermissionDenied);
 		}
 		return Ok(());
-	}
-
-	// Ahead of every shortcut: an APRV whose bundled subject carries `h == APRV.iss` is a
-	// hat endorsement and is admitted only by the map check. It never widens admission.
-	if helpers::extract_type_and_subtype(&action.t).0 == "APRV"
-		&& let Some(sub) = action.sub.as_deref()
-	{
-		let related = app.meta_adapter.get_related_action_tokens(tn_id, action_id).await?;
-		if let Some((_, token)) = related.iter().find(|(id, _)| id.as_ref() == sub)
-			&& decode_jwt_no_verify::<ActionToken>(token)
-				.is_ok_and(|claims| hat::is_hat_endorsement(action, &claims))
-		{
-			// Only a hat endorsement is verified here; other bundles are checked when processed.
-			let related = verify_action_token(app, tn_id, token, None).await?;
-			hat::endorsed_role(app, tn_id, action, &related).await?;
-		}
 	}
 
 	if definition.behavior.allow_unknown.unwrap_or(false) {
@@ -811,9 +801,15 @@ async fn check_inbound_permissions(
 		return Err(Error::PermissionDenied);
 	}
 
+	// `requires_connected` (e.g. PRINVT): a mutual connection; following is not enough.
+	let connected_only = definition
+		.permissions
+		.as_ref()
+		.and_then(|p| p.requires_connected)
+		.unwrap_or(false);
 	let allowed = issuer_profile
 		.as_ref()
-		.is_some_and(|p| p.following || p.connected.is_connected());
+		.is_some_and(|p| p.connected.is_connected() || (!connected_only && p.following));
 
 	if allowed {
 		return Ok(());
@@ -864,13 +860,7 @@ async fn check_inbound_permissions(
 	// process_related_actions. Keyed on relay_children, so generic across types.
 	if action.t.as_ref() == "APRV"
 		&& let Some(parent_id) = action.p.as_deref()
-		&& let Ok(Some(container)) = app.meta_adapter.get_action(tn_id, parent_id).await
-		&& app
-			.ext::<Arc<DslEngine>>()?
-			.definition_for(&container.typ, container.sub_typ.as_deref())
-			.and_then(|d| d.behavior.relay_children)
-			.unwrap_or(false)
-		&& owns_subject(&container, &action.iss)
+		&& owns_relay_container(app, tn_id, parent_id, &action.iss).await?
 	{
 		return Ok(());
 	}
@@ -881,6 +871,83 @@ async fn check_inbound_permissions(
 		"Permission denied - sender not following/connected"
 	);
 	Err(Error::PermissionDenied)
+}
+
+/// Is `container_id` a stored `relay_children` container owned by `id_tag`?
+async fn owns_relay_container(
+	app: &App,
+	tn_id: TnId,
+	container_id: &str,
+	id_tag: &str,
+) -> ClResult<bool> {
+	let Ok(Some(container)) = app.meta_adapter.get_action(tn_id, container_id).await else {
+		return Ok(false);
+	};
+	Ok(app
+		.ext::<Arc<DslEngine>>()?
+		.definition_for(&container.typ, container.sub_typ.as_deref())
+		.and_then(|d| d.behavior.relay_children)
+		.unwrap_or(false)
+		&& owns_subject(&container, id_tag))
+}
+
+/// An APRV has authority over its subject X only when its issuer is X's audience (direct /
+/// broadcast approval), X's hat (and the hat endorsement verifies), or the owner of the
+/// `relay_children` container `APRV.p` that X hangs off (roster vouch). X is the bundled
+/// related token, else the stored action.
+async fn check_aprv_authority(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	aprv: &ActionToken,
+) -> ClResult<()> {
+	let deny = |why: &str| {
+		warn!(issuer = %aprv.iss, subject = ?aprv.sub, "APRV refused - {why}");
+		Err(Error::PermissionDenied)
+	};
+	let Some(sub) = aprv.sub.as_deref() else {
+		return deny("no subject");
+	};
+	let related = app.meta_adapter.get_related_action_tokens(tn_id, action_id).await?;
+	// A bundled subject is verified here; a stored one was verified on arrival.
+	let subject = if let Some((_, token)) = related.iter().find(|(id, _)| id.as_ref() == sub) {
+		let Ok(claims) = verify_action_token(app, tn_id, token, None).await else {
+			return deny("bundled subject unverified");
+		};
+		claims
+	} else if let Some(view) = app.meta_adapter.get_action(tn_id, sub).await? {
+		let t = match view.sub_typ {
+			Some(st) => format!("{}:{}", view.typ, st).into(),
+			None => view.typ,
+		};
+		ActionToken {
+			iss: view.issuer.id_tag,
+			t,
+			p: view.parent_id,
+			aud: view.audience.map(|p| p.id_tag),
+			sub: view.subject,
+			h: view.hat.map(|p| p.id_tag),
+			..Default::default()
+		}
+	} else {
+		return deny("subject unknown");
+	};
+
+	if subject.aud.as_deref() == Some(&*aprv.iss) {
+		return Ok(());
+	}
+	if hat::is_hat_endorsement(aprv, &subject) {
+		hat::endorsed_role(app, tn_id, aprv, &subject).await?;
+		return Ok(());
+	}
+	if let Some(container_id) = aprv.p.as_deref()
+		&& (subject.p.as_deref() == Some(container_id)
+			|| subject.sub.as_deref() == Some(container_id))
+		&& owns_relay_container(app, tn_id, container_id, &aprv.iss).await?
+	{
+		return Ok(());
+	}
+	deny("issuer is not the subject's audience, hat or relay container owner")
 }
 
 /// Check subscription-based permissions for actions that require active subscriptions

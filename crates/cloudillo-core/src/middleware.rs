@@ -258,7 +258,7 @@ async fn authenticate(
 			// Validate IDP API key (idp_ prefix)
 			let idp_adapter = state.idp_adapter.as_ref().ok_or_else(|| {
 				warn!("IDP API key used but Identity Provider not available");
-				Error::ServiceUnavailable("Identity Provider not available".to_string())
+				Error::Unauthorized
 			})?;
 
 			let auth_id_tag = idp_adapter
@@ -428,14 +428,12 @@ pub async fn optional_auth(
 									}
 									Err(e) => {
 										warn!("IDP API key validation error: {:?}", e);
-										Err(Error::PermissionDenied)
+										Err(e)
 									}
 								}
 							} else {
 								warn!("IDP API key used but Identity Provider not available");
-								Err(Error::ServiceUnavailable(
-									"Identity Provider not available".to_string(),
-								))
+								Err(Error::Unauthorized)
 							}
 						}
 						None => {
@@ -467,11 +465,20 @@ pub async fn optional_auth(
 							);
 						}
 					}
+					// A presented token that fails validation is a 401, never a
+					// silent step-down to anonymous.
 					Ok(Err(e)) => {
 						warn!("Token validation failed (tenant mismatch): {:?}", e);
+						return Err(Error::Unauthorized);
 					}
-					Err(e) => {
+					Err(e @ (Error::Unauthorized | Error::PermissionDenied)) => {
 						warn!("Token validation failed: {:?}", e);
+						return Err(Error::Unauthorized);
+					}
+					// A backend fault is not a bad credential: surface it as such.
+					Err(e) => {
+						warn!("Token validation error: {:?}", e);
+						return Err(e);
 					}
 				}
 			}

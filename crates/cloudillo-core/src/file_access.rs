@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::abac;
 use crate::dir_cache::{DirCache, DirEntry};
 use crate::prelude::*;
+use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::meta_adapter;
 use cloudillo_types::meta_adapter::FileView;
 use cloudillo_types::types::{AccessLevel, TokenScope};
@@ -37,12 +38,53 @@ pub enum FileAccessError {
 }
 
 /// Context describing the subject requesting file access
+#[derive(Clone, Copy)]
 pub struct FileAccessCtx<'a> {
 	pub user_id_tag: &'a str,
 	pub tenant_id_tag: &'a str,
 	pub user_roles: &'a [Box<str>],
 	/// The subject wears a hat (`AuthCtx.hat.is_some()`), which bypasses closed-room rosters.
 	pub hatted: bool,
+	/// Delegated token scope (`AuthCtx.scope`). A scoped caller is scope grant + guest: the
+	/// identity rungs are never evaluated for it, whatever `user_id_tag` holds (the holder's
+	/// `sub`, or the tenant's own for an anonymous share-link token).
+	pub scope: Option<&'a str>,
+	/// [`AuthCtx::names_holder`]; false when unauthenticated.
+	pub names_holder: bool,
+}
+
+impl<'a> FileAccessCtx<'a> {
+	/// The subject of `auth` (`None` = unauthenticated: no identity, roles, hat or scope).
+	pub fn from_auth(auth: Option<&'a AuthCtx>, tenant_id_tag: &'a str) -> Self {
+		match auth {
+			Some(a) => Self {
+				user_id_tag: &a.id_tag,
+				tenant_id_tag,
+				user_roles: &a.roles,
+				hatted: a.hat.is_some(),
+				scope: a.scope.as_deref(),
+				names_holder: a.names_holder(),
+			},
+			None => Self {
+				user_id_tag: "",
+				tenant_id_tag,
+				user_roles: &[],
+				hatted: false,
+				scope: None,
+				names_holder: false,
+			},
+		}
+	}
+
+	/// The subject the visibility ladder sees: a scoped caller is a guest there (scope =
+	/// guest + grant), so its identity, roles and hat are stripped.
+	fn visibility_subject(&self) -> Self {
+		if self.scope.is_some() {
+			Self { user_id_tag: "", user_roles: &[], hatted: false, scope: None, ..*self }
+		} else {
+			*self
+		}
+	}
 }
 
 /// The object side of a file access check: which row, plus its two ownership facts.
@@ -59,6 +101,10 @@ pub struct FileRef<'a> {
 	pub file_id: &'a str,
 	/// Absolute channel (`@tenant~name`); `None` = open floor. Gates only the ambient rungs.
 	pub channel: Option<&'a str>,
+	/// Document-tree root; a scope for the root grants its children.
+	pub root_id: Option<&'a str>,
+	/// `files.visibility`, read by the final visibility rung.
+	pub visibility: Option<char>,
 }
 
 impl<'a> FileRef<'a> {
@@ -83,6 +129,8 @@ impl<'a> FileRef<'a> {
 			upstream_id_tag: tag(view.upstream.as_ref()),
 			file_id: &view.file_id,
 			channel: view.channel.as_deref(),
+			root_id: view.root_id.as_deref(),
+			visibility: view.visibility,
 		}
 	}
 }
@@ -244,7 +292,7 @@ pub async fn check_share_for_file(
 pub fn role_access_level(user_roles: &[Box<str>]) -> AccessLevel {
 	// A leader resolves to `Admin`, not `Write`: leadership over a local file *is* the right
 	// to manage its share set, so `access_level` alone answers "may manage shares".
-	if user_roles.iter().any(|r| r.as_ref() == "leader") {
+	if crate::roles::is_leader(user_roles) {
 		return AccessLevel::Admin;
 	}
 	if user_roles.iter().any(|r| matches!(r.as_ref(), "moderator" | "contributor")) {
@@ -255,6 +303,81 @@ pub fn role_access_level(user_roles: &[Box<str>]) -> AccessLevel {
 		return AccessLevel::Read;
 	}
 	AccessLevel::None
+}
+
+/// The one lifecycle gate: delete, restore and trash visibility (trash view, trashed
+/// metadata/content). `level` is the subject's [`get_access_level`] for `file`.
+///
+/// Record authority (the owner, i.e. the placer of a mirrored row) always passes. On a mirrored
+/// row nothing else does — the remote owner and the community leader included. On a local row,
+/// Admin level or the community `moderator` role pass too; Write grantees may edit, not delete.
+/// Scoped callers never pass: a scope carries no lifecycle authority, whoever holds it.
+pub fn can_manage_lifecycle(
+	file: &FileRef<'_>,
+	ctx: &FileAccessCtx<'_>,
+	level: AccessLevel,
+) -> bool {
+	if ctx.scope.is_some() {
+		return false;
+	}
+	if file.owner_id_tag == ctx.user_id_tag {
+		return true;
+	}
+	file.upstream_id_tag.is_none()
+		&& (level == AccessLevel::Admin || crate::roles::is_moderator(ctx.user_roles))
+}
+
+/// Whether `view` sits in the trash: trashed itself, a document-tree child of a trashed root, or
+/// a descendant of a trashed folder. Soft delete moves only the root row, so the ancestors decide.
+pub async fn in_trash(app: &App, tn_id: TnId, view: &FileView) -> ClResult<bool> {
+	use meta_adapter::TRASH_PARENT_ID;
+	if view.parent_id.as_deref() == Some(TRASH_PARENT_ID) {
+		return Ok(true);
+	}
+	// A tree child stands behind its root; the root's own ancestry decides from there.
+	let root;
+	let view = match view.root_id.as_deref() {
+		Some(root_id) => {
+			root = app.meta_adapter.read_file(tn_id, root_id).await?;
+			let Some(root) = root.as_ref() else { return Ok(false) };
+			if root.parent_id.as_deref() == Some(TRASH_PARENT_ID) {
+				return Ok(true);
+			}
+			root
+		}
+		None => view,
+	};
+	let Some(parent_id) = view.parent_id.as_deref() else { return Ok(false) };
+	let cache = app.ext::<DirCache>()?;
+	is_descendant_of(&app.meta_adapter, cache, tn_id, parent_id, TRASH_PARENT_ID).await
+}
+
+/// The lifecycle gate every file read and write passes: a tombstone exists for nobody, a trashed
+/// row (see [`in_trash`]) only for those who [`can_manage_lifecycle`], a pending upload only for
+/// its real owner. `names_holder` is [`AuthCtx::names_holder`]: a share-link token's `id_tag` is
+/// the tenant's, so it never owns a pending upload. Everything else is `NotFound`.
+pub async fn check_lifecycle(
+	app: &App,
+	tn_id: TnId,
+	view: &FileView,
+	file: &FileRef<'_>,
+	ctx: &FileAccessCtx<'_>,
+	level: AccessLevel,
+	names_holder: bool,
+) -> ClResult<()> {
+	use meta_adapter::FileStatus;
+	if matches!(view.status, FileStatus::Deleted) {
+		return Err(Error::NotFound);
+	}
+	if matches!(view.status, FileStatus::Pending)
+		&& (!names_holder || file.owner_id_tag != ctx.user_id_tag)
+	{
+		return Err(Error::NotFound);
+	}
+	if !can_manage_lifecycle(file, ctx, level) && in_trash(app, tn_id, view).await? {
+		return Err(Error::NotFound);
+	}
+	Ok(())
 }
 
 /// Whether a file in `channel` is within the subject's ambient reach: open floor always is,
@@ -341,9 +464,10 @@ fn fshr_grant_level(
 	}
 }
 
-/// Get access level for a user on a file
+/// Get access level for a subject on a file — the one level function.
 ///
-/// Determines access level based on:
+/// Scoped caller (`ctx.scope` set): the scope rung (see [`scope_grant`]); on a mismatch the
+/// identity rungs are skipped. Unscoped caller, first match wins:
 /// 1. Ownership — the owner of a locally originating row has Admin access
 /// 2. Direct `share_entries` grant on this file, then the caller-supplied `inherited_share`, then a
 ///    parent-chain walk for a folder-inherited grant
@@ -354,7 +478,9 @@ fn fshr_grant_level(
 ///    DEL → None (a revocation is not a grant), other sub-types → Read (see [`fshr_grant_level`])
 /// 5. Placer read on a mirrored row with no FSHR at all — a Pin/Place copy stays readable by the
 ///    profile that placed it. Read only, and last, so a revoked FSHR does not reach it.
-/// 6. No access — returns None
+///
+/// Both end in the visibility rung (see [`visibility_level`]): at most Read, scoped callers scored
+/// as guest, so a scope never yields less than the anonymous view.
 pub async fn get_access_level(
 	app: &App,
 	tn_id: TnId,
@@ -362,7 +488,25 @@ pub async fn get_access_level(
 	ctx: &FileAccessCtx<'_>,
 	inherited_share: Option<AccessLevel>,
 ) -> AccessLevel {
-	let FileRef { file_id, owner_id_tag, upstream_id_tag, channel } = file;
+	let level = match ctx.scope {
+		Some(scope) => scope_grant(app, tn_id, &file, scope).await.unwrap_or(AccessLevel::None),
+		None => identity_level(app, tn_id, file, ctx, inherited_share).await,
+	};
+	if level != AccessLevel::None {
+		return level;
+	}
+	visibility_level(app, tn_id, &file, ctx).await
+}
+
+/// Rungs 1–5 of [`get_access_level`], for an unscoped caller.
+async fn identity_level(
+	app: &App,
+	tn_id: TnId,
+	file: FileRef<'_>,
+	ctx: &FileAccessCtx<'_>,
+	inherited_share: Option<AccessLevel>,
+) -> AccessLevel {
+	let FileRef { file_id, owner_id_tag, upstream_id_tag, channel, .. } = file;
 	// The owner is the file's admin: write plus share management. Callers must test
 	// `can_write()`/`can_manage_shares()` rather than `== AccessLevel::Write`.
 	//
@@ -443,110 +587,95 @@ pub async fn get_access_level(
 	}
 }
 
-/// Get access level for a user on a file, considering scoped tokens
+/// The scope rung: what a `file:{file_id}:{R|C|W}` scope grants on `file`. `None` on a mismatch,
+/// an `ApkgPublish` scope, or an unparseable one — the caller then falls to the visibility rung.
 ///
-/// Determines access level based on:
-/// 1. Scoped token — file:{file_id}:{R|C|W} grants Read/Comment/Write access
-///    (also checks document tree: a token for a root grants access to children)
-/// 2. Everything [`get_access_level`] resolves, in its order
-/// 3. No access — returns None
-pub async fn get_access_level_with_scope(
+/// Matches, in order: the scoped file itself; a child in its document tree (`root_id`); a file
+/// linked from it by an `'F'` share entry, capped at that entry; a descendant of a scoped folder.
+async fn scope_grant(
 	app: &App,
 	tn_id: TnId,
-	file: FileRef<'_>,
-	ctx: &FileAccessCtx<'_>,
-	scope: Option<&str>,
-	root_id: Option<&str>,
-) -> AccessLevel {
+	file: &FileRef<'_>,
+	scope: &str,
+) -> Option<AccessLevel> {
+	let Some(TokenScope::File { file_id: scope_file_id, access }) = TokenScope::parse(scope) else {
+		return None;
+	};
 	let file_id = file.file_id;
-	// Check scope-based access first (for share links)
-	if let Some(scope_str) = scope {
-		// Use typed TokenScope for safe parsing
-		if let Some(token_scope) = TokenScope::parse(scope_str) {
-			match &token_scope {
-				TokenScope::File { file_id: scope_file_id, access } => {
-					// Direct match: scope matches this file_id
-					if scope_file_id == file_id {
-						return *access;
-					}
-
-					// Document tree check: scope is for a root, this file is a child
-					// Depth-1 invariant: root_id always points directly to a top-level file
-					if let Some(root) = root_id
-						&& scope_file_id.as_str() == root
-					{
-						return *access;
-					}
-
-					// Cross-document link: file-type share entry ('F')
-					// If scope grants access to file A, check if there's a share entry
-					// linking file A → target file
-					// resource=container (scope_file_id), subject=target (file_id)
-					if let Ok(Some(perm)) = app
-						.meta_adapter
-						.check_share_access(tn_id, 'F', scope_file_id, 'F', file_id)
-						.await
-					{
-						// Cap at min(scope_access, share_permission)
-						return (*access).min(AccessLevel::from_perm_char(perm));
-					}
-
-					// Folder share: scope targets a folder; grant the scope's level
-					// to any file nested under it (linked via parent_id). Gated on
-					// the scoped target actually being a folder, so a document/file
-					// share link does not leak access across its parent_id siblings.
-					// Fails closed — a missing cache or read error yields no grant,
-					// since returning a bare AccessLevel here cannot signal a 5xx.
-					// DirCache is a required process-wide extension registered at app
-					// build (see crates/cloudillo/src/app.rs), so the else arm only
-					// fires on misconfiguration — log rather than fail silently.
-					if let Ok(cache) = app.ext::<DirCache>() {
-						let target_is_folder =
-							scope_target_is_folder(&app.meta_adapter, cache, tn_id, scope_file_id)
-								.await
-								.unwrap_or(false);
-						let nested_under_scope = target_is_folder
-							&& is_descendant_of(
-								&app.meta_adapter,
-								cache,
-								tn_id,
-								file_id,
-								scope_file_id,
-							)
-							.await
-							.unwrap_or(false);
-						if nested_under_scope {
-							return *access;
-						}
-					} else {
-						warn!("DirCache extension missing; folder-share scope grant skipped");
-					}
-
-					// Scope exists for a different file - deny access
-					return AccessLevel::None;
-				}
-				TokenScope::ApkgPublish => {
-					// APKG publish scope has no file access
-					return AccessLevel::None;
-				}
-			}
-		}
-		// Scope string present but unparseable — deny access (least privilege)
-		return AccessLevel::None;
+	// Direct match, or document tree (depth-1: root_id always points to a top-level file)
+	if scope_file_id == file_id || file.root_id == Some(scope_file_id.as_str()) {
+		return Some(access);
 	}
 
-	// Fall back to existing logic (ownership, roles, FSHR actions)
-	get_access_level(app, tn_id, file, ctx, None).await
+	// Cross-document link: an `'F'` share entry with resource = target (`file_id`) and
+	// subject = the scoped container — the order `share::post_share` writes.
+	if let Ok(Some(perm)) = app
+		.meta_adapter
+		.check_share_access(tn_id, 'F', file_id, 'F', &scope_file_id)
+		.await
+	{
+		return Some(access.min(AccessLevel::from_perm_char(perm)));
+	}
+
+	// Folder share: scope targets a folder; grant the scope's level to any file nested under
+	// it (linked via parent_id). Gated on the scoped target actually being a folder, so a
+	// document/file share link does not leak access across its parent_id siblings. Fails
+	// closed — a missing cache or read error yields no grant. DirCache is a required
+	// process-wide extension registered at app build (see crates/cloudillo/src/app.rs), so
+	// the else arm only fires on misconfiguration — log rather than fail silently.
+	let Ok(cache) = app.ext::<DirCache>() else {
+		warn!("DirCache extension missing; folder-share scope grant skipped");
+		return None;
+	};
+	let nested_under_scope =
+		scope_target_is_folder(&app.meta_adapter, cache, tn_id, &scope_file_id)
+			.await
+			.unwrap_or(false)
+			&& is_descendant_of(&app.meta_adapter, cache, tn_id, file_id, &scope_file_id)
+				.await
+				.unwrap_or(false);
+	nested_under_scope.then_some(access)
 }
 
-/// Whether the file's own `visibility` alone grants a caller `Read`, for the ladder
-/// [`check_file_access_with_scope`] falls back to once every explicit grant has come up
-/// empty. `'P'` is handled separately by that caller and is deliberately not here.
-///
-/// `scope.is_none()` is the one gate: a share-link token carries `sub: None`, so on
-/// re-presentation `auth.id_tag` is the *tenant's own* id_tag and such a guest would be
-/// scored against the tenant's own relationships. It also keeps
-/// `get_access_level_with_scope`'s deliberate `None` for a non-matching scope final.
+/// The visibility rung: `Read` when the file's `visibility` admits the caller and its channel is
+/// within their ambient reach, else `None`. A scoped caller is scored as an anonymous guest — its
+/// `user_id_tag` is the tenant's own and must not be scored against the tenant's relationships.
+/// Fails closed on a relation lookup error.
+async fn visibility_level(
+	app: &App,
+	tn_id: TnId,
+	file: &FileRef<'_>,
+	ctx: &FileAccessCtx<'_>,
+) -> AccessLevel {
+	let ctx = &ctx.visibility_subject();
+	let is_real_auth = !ctx.user_id_tag.is_empty() && ctx.user_id_tag != "guest";
+	// Only 'F'/'C'/'2' need the profile row; 'V' is settled by authentication alone.
+	let rel = if is_real_auth
+		&& abac::visibility_needs_relation(abac::VisibilityLevel::from_char(file.visibility))
+	{
+		match abac::subject_relation_to_tenant(app, tn_id, ctx.user_id_tag).await {
+			Ok(rel) => rel,
+			Err(e) => {
+				warn!("subject_relation_to_tenant failed, denying visibility read: {}", e);
+				return AccessLevel::None;
+			}
+		}
+	} else {
+		meta_adapter::ProfileRelation::default()
+	};
+	// The room governs ambient reach, visibility included.
+	if visibility_grants_read(file.visibility, is_real_auth, rel)
+		&& channel_admits(app, tn_id, file.channel, ctx).await
+	{
+		AccessLevel::Read
+	} else {
+		AccessLevel::None
+	}
+}
+
+/// Whether the file's own `visibility` alone grants a caller `Read` — the decision of
+/// [`get_access_level`]'s final rung, which has already replaced a scoped caller by a guest
+/// (`is_real_auth = false`, default `rel`). `'P'` grants anyone.
 ///
 /// Provenance is deliberately NOT a gate. A cross-context placement's `visibility` is
 /// authored locally by the placing member — a community Pin lands at `'C'` — so refusing
@@ -558,35 +687,28 @@ pub async fn get_access_level_with_scope(
 ///
 /// `rel` is the subject's relationship *to the tenant*, loaded by the caller (see
 /// [`abac::subject_relation_to_tenant`]) — `follower` is "they follow us".
-pub fn visibility_grants_read_fallback(
-	scope: Option<&str>,
+pub fn visibility_grants_read(
 	visibility: Option<char>,
 	is_real_auth: bool,
 	rel: meta_adapter::ProfileRelation,
 ) -> bool {
-	scope.is_none()
-		&& abac::relationship_level(false, rel.connected, rel.follower, is_real_auth)
-			.can_access(abac::VisibilityLevel::from_char(visibility))
+	abac::relationship_level(false, rel.connected, rel.follower, is_real_auth)
+		.can_access(abac::VisibilityLevel::from_char(visibility))
 }
 
 /// Check file access and return file view with access level
 ///
 /// This is the main helper for WebSocket handlers. It:
 /// 1. Loads file metadata
-/// 2. Determines access level (considering scoped tokens for share links)
-/// 3. Falls back to the file's `visibility` for unscoped callers on tenant-owned rows —
-///    `'P'` for anyone, `'V'`/`'2'`/`'F'`/`'C'` per the subject's relationship *to the
-///    tenant* (see [`visibility_grants_read_fallback`]). Never grants more than `Read`;
-///    `Direct` (NULL) and `'S'` grant nothing.
+/// 2. Determines the access level via [`get_access_level`] (scope, identity and visibility
+///    rungs; `ctx.scope` carries the delegated scope)
+/// 3. Caps it by the `'F'` share entry when opened `?via=` an embedding (unscoped callers only)
 /// 4. Returns combined result or error
-///
-/// The scope parameter should be auth_ctx.scope.as_deref().
-pub async fn check_file_access_with_scope(
+pub async fn check_file_access(
 	app: &App,
 	tn_id: TnId,
 	file_id: &str,
 	ctx: &FileAccessCtx<'_>,
-	scope: Option<&str>,
 	via: Option<&str>,
 ) -> Result<FileAccessResult, FileAccessError> {
 	use tracing::debug;
@@ -602,53 +724,31 @@ pub async fn check_file_access_with_scope(
 	// upstream and hand a mirrored row role access.
 	let file_ref = FileRef::from_view(&file_view, ctx.tenant_id_tag);
 
-	debug!(file_id = file_id, user = ctx.user_id_tag, owner = file_ref.owner_id_tag, scope = ?scope, "Checking file access");
+	debug!(
+		file_id = file_id,
+		user = ctx.user_id_tag,
+		owner = file_ref.owner_id_tag,
+		scope = ?ctx.scope,
+		"Checking file access"
+	);
 
-	// Get access level (considering scope for share links and document trees)
-	let mut access_level =
-		get_access_level_with_scope(app, tn_id, file_ref, ctx, scope, file_view.root_id.as_deref())
-			.await;
+	let mut access_level = get_access_level(app, tn_id, file_ref, ctx, None).await;
 
-	// Everything below is ambient reach, which the room governs. The grants above are not.
-	if access_level == AccessLevel::None && !channel_admits(app, tn_id, file_ref.channel, ctx).await
+	match check_lifecycle(app, tn_id, &file_view, &file_ref, ctx, access_level, ctx.names_holder)
+		.await
 	{
-		return Err(FileAccessError::AccessDenied);
-	}
-
-	// Public files are readable by anyone (including unauthenticated guests).
-	// Deliberately scope-agnostic and separate from the ladder below: a scoped
-	// caller reaching an unrelated *public* file is relied on by
-	// `share::list_shares_by_subject` and `management::duplicate_file`.
-	if access_level == AccessLevel::None && file_view.visibility == Some('P') {
-		access_level = AccessLevel::Read;
-	}
-
-	// The rest of the visibility ladder ('V'/'2'/'F'/'C'); the whole decision lives in
-	// `visibility_grants_read_fallback`, which the integration tests call directly.
-	if access_level == AccessLevel::None {
-		let vis = abac::VisibilityLevel::from_char(file_view.visibility);
-		let is_real_auth = !ctx.user_id_tag.is_empty() && ctx.user_id_tag != "guest";
-		// Only 'F'/'C'/'2' need the profile row; 'V' is settled by authentication alone.
-		// The scope case is not re-tested here — the fallback refuses it anyway, so the
-		// only cost of loading `rel` is one read on a row that was going to be denied.
-		let rel = if is_real_auth && abac::visibility_needs_relation(vis) {
-			abac::subject_relation_to_tenant(app, tn_id, ctx.user_id_tag)
-				.await
-				.map_err(|e| FileAccessError::InternalError(e.to_string()))?
-		} else {
-			meta_adapter::ProfileRelation::default()
-		};
-		if visibility_grants_read_fallback(scope, file_view.visibility, is_real_auth, rel) {
-			access_level = AccessLevel::Read;
-		}
+		Ok(()) => {}
+		Err(Error::NotFound) => return Err(FileAccessError::NotFound),
+		Err(e) => return Err(FileAccessError::InternalError(e.to_string())),
 	}
 
 	// Cap access by file-to-file share entry when opened via embedding
+	// (resource = target, subject = the embedding container)
 	if let Some(via_file_id) = via
-		&& scope.is_none()
+		&& ctx.scope.is_none()
 		&& access_level != AccessLevel::None
 	{
-		match app.meta_adapter.check_share_access(tn_id, 'F', via_file_id, 'F', file_id).await {
+		match app.meta_adapter.check_share_access(tn_id, 'F', file_id, 'F', via_file_id).await {
 			Ok(Some(perm)) => {
 				access_level = access_level.min(AccessLevel::from_perm_char(perm));
 			}
@@ -792,6 +892,31 @@ pub fn scope_grants_collection_op(scope: Option<&str>, resource_type: &str, acti
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn visibility_subject_strips_a_scoped_caller_to_a_guest() {
+		let roles: [Box<str>; 1] = ["leader".into()];
+		let scoped = FileAccessCtx {
+			user_id_tag: "alice",
+			tenant_id_tag: "club",
+			user_roles: &roles,
+			hatted: true,
+			scope: Some("file:f1~x:R"),
+			names_holder: true,
+		};
+		let g = scoped.visibility_subject();
+		assert_eq!(
+			(g.user_id_tag, g.tenant_id_tag, g.user_roles.len(), g.hatted, g.scope),
+			("", "club", 0, false, None)
+		);
+
+		let plain = FileAccessCtx { scope: None, ..scoped };
+		let p = plain.visibility_subject();
+		assert_eq!(
+			(p.user_id_tag, p.tenant_id_tag, p.user_roles.len(), p.hatted, p.scope),
+			("alice", "club", 1, true, None)
+		);
+	}
 
 	#[test]
 	fn folder_write_scope_grants_file_create() {

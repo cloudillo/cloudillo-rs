@@ -401,7 +401,7 @@ async fn folder_inherited_admin_grant_reaches_nested_files() {
 }
 
 /// A `?scope=file:{id}:{R|C|W}` on `/api/auth/access-token` used to be stamped into the minted
-/// token verbatim, and `get_access_level_with_scope` treats a matching file scope as *the* grant —
+/// token verbatim, and `get_access_level` treats a matching file scope as *the* grant —
 /// so naming any file id handed out a capability for it. The mint now runs the same access check
 /// first and caps with `min()` (`cloudillo_auth::handler::validated_scope`).
 ///
@@ -462,7 +462,7 @@ async fn scope_mint_denies_strangers_and_caps_at_real_access() {
 	assert_eq!(file_access::scope_char_within(AccessLevel::Write, AccessLevel::None), None);
 }
 
-/// The visibility ladder in `file_access::check_file_access_with_scope` scores a row on the
+/// The visibility rung of `file_access::get_access_level` scores a row on the
 /// caller's relationship to the tenant, whatever the row's provenance. A cross-context Pin is
 /// authored locally at `'C'`/`'F'` by the placing member, so a provenance gate here made every
 /// community pin unreadable on the detail path while `file::list` and `search` showed it.
@@ -470,8 +470,8 @@ async fn scope_mint_denies_strangers_and_caps_at_real_access() {
 /// What a mirror withholds is *owner* standing, and that is resolved before this runs — so
 /// `Direct` (the shape of a revoked FSHR share) still grants nothing.
 ///
-/// `check_file_access_with_scope` itself needs a full `App`, but the decision it falls back to
-/// is `file_access::visibility_grants_read_fallback` — called here directly, on a relation row
+/// `get_access_level` itself needs a full `App`, but the decision its last rung makes
+/// is `file_access::visibility_grants_read` — called here directly, on a relation row
 /// loaded from the real adapter.
 #[tokio::test]
 async fn visibility_ladder_scores_mirrored_and_local_rows_alike() {
@@ -530,15 +530,16 @@ async fn visibility_ladder_scores_mirrored_and_local_rows_alike() {
 		// Owner identity is not what the ladder reads: neither row is tenant-owned.
 		assert_ne!(r.owner_id_tag, tenant);
 		assert!(
-			file_access::visibility_grants_read_fallback(None, f.visibility, true, rel),
+			file_access::visibility_grants_read(f.visibility, true, rel),
 			"{file_id}: a follower must reach an 'F' row whatever its provenance"
 		);
-		// ...and a scoped caller never reaches the ladder, on either row.
-		assert!(!file_access::visibility_grants_read_fallback(
-			Some("file:MEMBER:R"),
+		// ...and an unauthenticated caller (no relation) reaches neither row. The scoped →
+		// guest swap that routes a scoped caller here is `visibility_subject`'s unit test;
+		// the end-to-end denial is the access matrix's scoped subjects.
+		assert!(!file_access::visibility_grants_read(
 			f.visibility,
-			true,
-			rel
+			false,
+			cloudillo_types::meta_adapter::ProfileRelation::default()
 		));
 	}
 }
@@ -565,7 +566,7 @@ fn visibility_grants_read_ladder() {
 	];
 	for (vis, auth, connected, follower, want) in cases {
 		assert_eq!(
-			file_access::visibility_grants_read_fallback(None, vis, auth, rel(connected, follower)),
+			file_access::visibility_grants_read(vis, auth, rel(connected, follower)),
 			want,
 			"{vis:?} auth={auth} connected={connected} follower={follower}"
 		);
@@ -628,8 +629,7 @@ async fn a_pin_into_a_personal_tenant_names_its_placer_as_owner() {
 
 	// Direct visibility, so the fallback ladder grants a stranger nothing — the placer rung is
 	// the only thing that can make this row readable.
-	assert!(!file_access::visibility_grants_read_fallback(
-		None,
+	assert!(!file_access::visibility_grants_read(
 		f.visibility,
 		true,
 		cloudillo_types::meta_adapter::ProfileRelation::default()

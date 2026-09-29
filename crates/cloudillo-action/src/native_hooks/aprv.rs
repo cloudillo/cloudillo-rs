@@ -10,7 +10,7 @@
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 use crate::status;
-use cloudillo_types::meta_adapter::UpdateActionDataOptions;
+use cloudillo_types::meta_adapter::{ProfileInfo, UpdateActionDataOptions};
 
 /// APRV on_receive hook - Handle incoming approval
 ///
@@ -35,7 +35,19 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 	if let Some(ref action) = original_action {
 		// We have the original action - check if we're the issuer
-		if action.issuer.id_tag.as_ref() == context.tenant_tag {
+		// Only the action's audience or hat may approve it (rulings: APRV).
+		let is_tag = |p: &Option<ProfileInfo>| {
+			p.as_ref().is_some_and(|p| p.id_tag.as_ref() == context.issuer)
+		};
+		if action.issuer.id_tag.as_ref() == context.tenant_tag
+			&& !(is_tag(&action.audience) || is_tag(&action.hat))
+		{
+			tracing::warn!(
+				"APRV on_receive: {} is not the audience or hat of {}",
+				context.issuer,
+				subject_action_id
+			);
+		} else if action.issuer.id_tag.as_ref() == context.tenant_tag {
 			// Direct approval - we issued this action and it was approved
 			tracing::info!(
 				"APRV: {} approved {} → status=ACTIVE",

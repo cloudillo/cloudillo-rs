@@ -487,7 +487,7 @@ fn normalized_dav_scope(requested: &str) -> Option<String> {
 /// in the session branch; the federated branch authenticates with an action token, which carries
 /// no scope), so `apkg:publish` only needs the role test.
 ///
-/// Its `App`-dependent half — the `check_file_access_with_scope` call — is covered indirectly by
+/// Its `App`-dependent half — the `check_file_access` call — is covered indirectly by
 /// `cloudillo_core::tests::file_access_scope::scope_mint_denies_strangers_and_caps_at_real_access`,
 /// which pins the ladder and the `scope_char_within` cap this composes. There is no `App` test
 /// harness in the tree to pin the composition itself.
@@ -525,17 +525,18 @@ async fn validated_scope(
 				tenant_id_tag,
 				user_roles: caller_roles,
 				hatted: caller_hatted,
+				scope: None,
+				names_holder: true,
 			};
-			let result =
-				file_access::check_file_access_with_scope(app, tn_id, &file_id, &ctx, None, None)
-					.await
-					.map_err(|_| {
-						warn!("Scope denied: {} has no access to file {}", caller_id_tag, file_id);
-						Error::PermissionDenied
-					})?;
+			let result = file_access::check_file_access(app, tn_id, &file_id, &ctx, None)
+				.await
+				.map_err(|_| {
+					warn!("Scope denied: {} has no access to file {}", caller_id_tag, file_id);
+					Error::PermissionDenied
+				})?;
 
 			// `to_scope_char` caps admin at 'W' — a scope never carries share-management
-			// authority. `None` only for `AccessLevel::None`, which `check_file_access_with_scope`
+			// authority. `None` only for `AccessLevel::None`, which `check_file_access`
 			// already turned into `Err`.
 			let scope_char = file_access::scope_char_within(access, result.access_level)
 				.ok_or(Error::PermissionDenied)?;
@@ -550,6 +551,25 @@ async fn validated_scope(
 			}
 			Ok(Some(requested.to_string()))
 		}
+	}
+}
+
+/// A presented token that cannot be verified is a 401. A bad signature against a cached key
+/// surfaces as the failed key refetch (`NetworkError` / blocked `ServiceUnavailable`), so
+/// those count too; local faults (DB, I/O, internal) stay 5xx.
+fn verify_failure_is_401(e: Error) -> Error {
+	match e {
+		Error::Parse
+		| Error::NotFound
+		| Error::PermissionDenied
+		| Error::ValidationError(_)
+		| Error::NetworkError(_)
+		| Error::Timeout
+		| Error::ServiceUnavailable(_) => {
+			warn!("Presented token failed verification: {:?}", e);
+			Error::Unauthorized
+		}
+		e => e,
 	}
 }
 
@@ -620,22 +640,9 @@ pub async fn get_access_token(
 		} else {
 			// Session-authenticated user: verify actual file access using bare file_id
 			use cloudillo_core::file_access::{self, FileAccessCtx};
-			let ctx = FileAccessCtx {
-				user_id_tag: &auth.id_tag,
-				tenant_id_tag: &id_tag.0,
-				user_roles: &auth.roles,
-				hatted: auth.hat.is_some(),
-			};
-			match file_access::check_file_access_with_scope(
-				&app,
-				tn_id,
-				via_bare_file_id,
-				&ctx,
-				None,
-				None,
-			)
-			.await
-			{
+			// Unscoped branch: `from_auth` carries `scope: None`.
+			let ctx = FileAccessCtx::from_auth(Some(auth), &id_tag.0);
+			match file_access::check_file_access(&app, tn_id, via_bare_file_id, &ctx, None).await {
 				Ok(result) => {
 					// The level the caller actually holds on the via file caps the
 					// mint, exactly as the scoped arm's `access` does. `is_ok()`
@@ -718,7 +725,9 @@ pub async fn get_access_token(
 	if let Some(token_param) = query.token {
 		debug!("Verifying action token from query parameter");
 		let verify_fn = app.ext::<ActionVerifyFn>()?;
-		let auth_action = verify_fn(&app, tn_id, &token_param, Some(&addr.ip())).await?;
+		let auth_action = verify_fn(&app, tn_id, &token_param, Some(&addr.ip()))
+			.await
+			.map_err(verify_failure_is_401)?;
 		if *auth_action.aud.as_ref().ok_or(Error::PermissionDenied)?.as_ref() != *id_tag.0 {
 			warn!("Auth action issuer {} doesn't match id_tag {}", auth_action.iss, id_tag.0);
 			return Err(Error::PermissionDenied);
@@ -752,7 +761,9 @@ pub async fn get_access_token(
 		// the member holds here directly, and is never persisted — it lives in the token only.
 		let hat = match query.hat.as_deref() {
 			Some(hat_token) => {
-				let endorsement = verify_fn(&app, tn_id, hat_token, Some(&addr.ip())).await?;
+				let endorsement = verify_fn(&app, tn_id, hat_token, Some(&addr.ip()))
+					.await
+					.map_err(verify_failure_is_401)?;
 				let peer = match app.meta_adapter.read_profile(tn_id, &endorsement.iss).await {
 					Ok((_, p)) => Some(p),
 					Err(Error::NotFound) => None,
@@ -962,6 +973,16 @@ pub async fn get_access_token(
 				"API key tenant mismatch: key belongs to {:?} but request is for {:?}",
 				validation.tn_id, tn_id
 			);
+			return Err(Error::PermissionDenied);
+		}
+
+		// A capability key (DAV scope) reaches its PIM routes directly; it is never exchanged.
+		if validation
+			.scopes
+			.as_deref()
+			.is_some_and(|s| s.split(',').any(|e| normalized_dav_scope(e).is_some()))
+		{
+			warn!("API key exchange refused: capability (DAV) key");
 			return Err(Error::PermissionDenied);
 		}
 

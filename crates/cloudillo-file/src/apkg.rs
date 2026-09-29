@@ -80,21 +80,18 @@ pub async fn get_container_content(
 
 		let file_ref = file_access::FileRef::from_view(&file, &tenant_id_tag);
 
-		let ctx = file_access::FileAccessCtx {
-			user_id_tag: &subject_id_tag,
-			tenant_id_tag: &tenant_id_tag,
-			user_roles: &auth_ctx.roles,
-			hatted: auth_ctx.hat.is_some(),
-		};
-		let access_level = file_access::get_access_level_with_scope(
+		let ctx = file_access::FileAccessCtx::from_auth(Some(&auth_ctx), &tenant_id_tag);
+		let access_level = file_access::get_access_level(&app, tn_id, file_ref, &ctx, None).await;
+		file_access::check_lifecycle(
 			&app,
 			tn_id,
-			file_ref,
+			&file,
+			&file_ref,
 			&ctx,
-			auth_ctx.scope.as_deref(),
-			file.root_id.as_deref(),
+			access_level,
+			auth_ctx.names_holder(),
 		)
-		.await;
+		.await?;
 
 		// Owned before the borrow of the row ends, so `FileAttrs` can take it.
 		let owner_id_tag: Box<str> = file_ref.owner_id_tag.into();
@@ -105,7 +102,7 @@ pub async fn get_container_content(
 		// Only the SecondDegree/Follower/Connected rungs consult these, and ABAC's read
 		// branch returns on `access_level.can_read()` before reaching them at all — so on
 		// the app/site asset path this query almost never changes the answer. Same guard
-		// `file_access::check_file_access_with_scope` applies.
+		// `file_access::check_file_access` applies.
 		let rel = if !access_level.can_read() && abac::visibility_needs_relation(vis_level) {
 			abac::subject_relation_to_tenant(&app, tn_id, &subject_id_tag).await?
 		} else {
