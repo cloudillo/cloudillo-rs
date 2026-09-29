@@ -471,7 +471,7 @@ pub fn expected_inbox(c: &InboxCell) -> Expect {
 		"APKG" => deny("inbox.local-only"),
 		// allow_unknown, but no identity provider is configured on the host.
 		"IDP:REG" => deny("inbox.idp-reg?"),
-		// Hat endorsement: APRV authority over X when `APRV.iss == X.h` (rulings: APRV).
+		// Hat endorsement: APRV authority over X when `APRV.iss == X.h`.
 		"APRV" if c.hat && c.rel == Relation::PeerHat && c.target => allow("inbox.aprv.hat"),
 		// A hat-admitted APRV still needs authority over its own subject.
 		"APRV" if c.hat && c.rel == Relation::PeerHat => deny("inbox.aprv.hat.subject-authority"),

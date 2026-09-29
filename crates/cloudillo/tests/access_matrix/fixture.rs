@@ -4,7 +4,7 @@
 //! Shared, lazily built fixture: two tenants, remote identities, routers.
 //!
 //! Seeding is by direct adapter writes only; credentials are minted through
-//! the real exchange endpoints (later phases).
+//! the real exchange endpoints.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -94,16 +94,16 @@ pub struct Remotes {
 	pub peer: RemoteId,
 	/// Member of `peer` (hat role `contributor` on `peer`); no direct relation to club.
 	pub hatted: RemoteId,
-	/// U-share grantees (shares seeded in Phase 3).
+	/// U-share grantees.
 	pub g_read: RemoteId,
 	pub g_comment: RemoteId,
 	pub g_write: RemoteId,
 	pub g_admin: RemoteId,
 	pub g_folder: RemoteId,
 	pub g_expired: RemoteId,
-	/// Audience of Direct actions (Phase 4).
+	/// Audience of Direct actions.
 	pub direct: RemoteId,
-	/// Holder of `SUBS` rows (Phase 4).
+	/// Holder of `SUBS` rows.
 	pub subscriber: RemoteId,
 }
 

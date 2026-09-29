@@ -572,7 +572,7 @@ async fn seed_extras(app: &App, o: &FileObj) {
 		.unwrap();
 	}
 	// The adapter does not validate `access_level`; only the ref route refuses 'A' — so the
-	// 'A' ref (Decision 9) is seeded by calling the adapter directly, like the others.
+	// 'A' ref is seeded by calling the adapter directly, like the others.
 	for rf in &o.refs {
 		meta.create_ref(
 			o.tn_id,
