@@ -52,11 +52,12 @@ impl AppBuilder {
 		});
 		let fmt_layer = tracing_subscriber::fmt::layer()
 			.event_format(cloudillo_core::log::CloudilloFormat::new());
-		tracing_subscriber::registry()
+		// `try_init`: a subscriber installed earlier (e.g. by a test) wins.
+		let _ = tracing_subscriber::registry()
 			.with(filter)
 			.with(cloudillo_core::log::RequestSpanLayer)
 			.with(fmt_layer)
-			.init();
+			.try_init();
 		AppBuilder {
 			opts: AppBuilderOpts {
 				mode: ServerMode::Standalone,
@@ -182,16 +183,10 @@ impl AppBuilder {
 		self
 	}
 
-	pub async fn run(self) -> ClResult<()> {
-		info!("     ______");
-		info!("    /  __  \\ ___        ____ _                 _ _ _ _");
-		info!("  _|  (  )  V _ \\__    / ___| | ___  _   _  __| (_) | | ___");
-		info!(" / __  ‾‾___ (_) _ \\  | |   | |/ _ \\| | | |/ _` | | | |/ _ \\");
-		info!("| (__)  /   \\   (_) | | |___| | (_) | |_| | (_| | | | | (_) |");
-		info!(" \\------\\___/------/   \\____|_|\\___/ \\__,_|\\__,_|_|_|_|\\___/");
-		info!("V{}", VERSION);
-		info!("");
-
+	/// Construct and wire the app without starting the scheduler, listeners or bootstrap.
+	///
+	/// Returns `(app, api_router, app_router, http_router)` as `routes::init` builds them.
+	pub async fn build(self) -> ClResult<(App, axum::Router, axum::Router, axum::Router)> {
 		// Validate that all local addresses are the same type
 		if let Err(e) =
 			cloudillo_types::address::validate_address_type_consistency(&self.opts.local_address)
@@ -200,13 +195,12 @@ impl AppBuilder {
 			return Err(e);
 		}
 
-		rustls::crypto::CryptoProvider::install_default(
-			rustls::crypto::aws_lc_rs::default_provider(),
-		)
-		.map_err(|e| {
-			error!("FATAL: Failed to install default crypto provider: {:?}", e);
-			Error::Internal("Failed to install default crypto provider".to_string())
-		})?;
+		// Guarded: `build` may run more than once per process (tests).
+		if rustls::crypto::CryptoProvider::get_default().is_none() {
+			let _ = rustls::crypto::CryptoProvider::install_default(
+				rustls::crypto::aws_lc_rs::default_provider(),
+			);
+		}
 		let Some(auth_adapter) = self.adapters.auth_adapter else {
 			error!("FATAL: No auth adapter configured");
 			return Err(Error::Internal("No auth adapter configured".to_string()));
@@ -500,6 +494,21 @@ impl AppBuilder {
 		for callback in self.on_init {
 			callback(app.clone()).await?;
 		}
+
+		Ok((app, api_router, app_router, http_router))
+	}
+
+	pub async fn run(self) -> ClResult<()> {
+		info!("     ______");
+		info!("    /  __  \\ ___        ____ _                 _ _ _ _");
+		info!("  _|  (  )  V _ \\__    / ___| | ___  _   _  __| (_) | | ___");
+		info!(" / __  ‾‾___ (_) _ \\  | |   | |/ _ \\| | | |/ _` | | | |/ _ \\");
+		info!("| (__)  /   \\   (_) | | |___| | (_) | |_| | (_| | | | | (_) |");
+		info!(" \\------\\___/------/   \\____|_|\\___/ \\__,_|\\__,_|_|_|_|\\___/");
+		info!("V{}", VERSION);
+		info!("");
+
+		let (app, api_router, app_router, http_router) = self.build().await?;
 
 		// Schedule recurring file-subsystem jobs (blob GC). Needs scheduler
 		// registration done above and settings service available.
