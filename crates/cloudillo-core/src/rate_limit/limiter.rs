@@ -168,6 +168,7 @@ impl RateLimitManager {
 		categories.insert("dav".to_string(), CategoryLimiters::new(&config.dav));
 		categories.insert("federation".to_string(), CategoryLimiters::new(&config.federation));
 		categories.insert("general".to_string(), CategoryLimiters::new(&config.general));
+		categories.insert("qr_poll".to_string(), CategoryLimiters::new(&config.qr_poll));
 		categories.insert("search".to_string(), CategoryLimiters::new(&config.search));
 		categories.insert("websocket".to_string(), CategoryLimiters::new(&config.websocket));
 
@@ -458,6 +459,8 @@ mod tests {
 		// A `RateLimitLayer` naming a missing bucket 500s every request; `/api/search`
 		// names this one.
 		assert!(manager.categories.contains_key("search"));
+		// `/api/auth/qr-login/{session_id}/status` names this one.
+		assert!(manager.categories.contains_key("qr_poll"));
 		assert!(manager.categories.contains_key("websocket"));
 	}
 

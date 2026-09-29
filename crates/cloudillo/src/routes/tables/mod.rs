@@ -90,6 +90,7 @@ fn all_api_tables() -> axum::Router<crate::prelude::App> {
 		.merge(auth::session())
 		.merge(auth::owner_credentials())
 		.merge(auth::public_login())
+		.merge(auth::qr_login_status())
 		.merge(auth::token_exchange())
 		.merge(auth::recovery())
 		// `/dav/**` is on the API surface too: `routes/mod.rs` merges

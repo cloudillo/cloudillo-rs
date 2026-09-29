@@ -26,15 +26,15 @@
 //! | `/api/auth/api-keys`                 | `owner_credentials()` ᵀ | `owner_credentials()` ᵀ | | |
 //! | `/api/auth/api-keys/{key_id}`        | `owner_credentials()` ᵀ | | `owner_credentials()` ᵀ | `owner_credentials()` ᵀ |
 //! | `/api/auth/qr-login/init`            | | `public_login()` ᴿ | | |
-//! | `/api/auth/qr-login/{session_id}/status`  | `public_login()` ᴿ | | | |
+//! | `/api/auth/qr-login/{session_id}/status`  | `qr_login_status()` ᴽ | | | |
 //! | `/api/auth/qr-login/{session_id}/details` | `session()` ᴱ | | | |
 //! | `/api/auth/qr-login/{session_id}/respond` | | `session()` ᴱ | | |
 //! | `/api/onboarding/complete`           | | `session()` ᴱ | | |
 //!
 //! ᴿ public under the strict `"auth"` bucket, ᴾ same bucket with the ban
 //! bypassed, ᶠ public under the `"federation"` bucket, ᵀ `require_tenant_self`,
-//! ᴱ auth only — handler self-enforces. The guard on each fn is in
-//! `routes/protected.rs` / `routes/public.rs`.
+//! ᴱ auth only — handler self-enforces, ᴽ public under the `"qr_poll"` bucket. The guard on
+//! each fn is in `routes/protected.rs` / `routes/public.rs`.
 //!
 //! The `/api/auth/wa/**` and `/api/auth/qr-login/**` families each split across
 //! the public and protected tiers — login-side endpoints are unauthenticated by
@@ -100,14 +100,18 @@ pub(crate) fn owner_credentials() -> Router<App> {
 /// Unauthenticated password and QR login endpoints. Attack surface: credential
 /// stuffing, brute force, account enumeration — mounted under the strict
 /// `"auth"` rate-limit bucket, ban fully enforced. The passkey login pair lives
-/// in [`recovery`].
+/// in [`recovery`]; the QR status poll in [`qr_login_status`].
 pub(crate) fn public_login() -> Router<App> {
 	Router::new()
 		.route("/api/auth/login", post(handler::post_login))
 		.route("/api/auth/login-token", get(handler::get_login_token))
 		.route("/api/auth/qr-login/init", post(qr_login::post_init))
-		// Long-poll.
-		.route("/api/auth/qr-login/{session_id}/status", get(qr_login::get_status))
+}
+
+/// QR-login status long-poll. Its own `"qr_poll"` bucket: an idle `/login` tab
+/// polls ~4/min, which in `"auth"` would lock out real logins behind one NAT.
+pub(crate) fn qr_login_status() -> Router<App> {
+	Router::new().route("/api/auth/qr-login/{session_id}/status", get(qr_login::get_status))
 }
 
 /// Server-to-server token exchange. Called in batches during federation, so it

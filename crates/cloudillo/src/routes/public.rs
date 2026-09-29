@@ -20,6 +20,7 @@
 //! |---|---|---|
 //! | `"auth"` | enforced | login, registration, activation-email resend |
 //! | `"auth"` | **skipped** | account recovery — a failed-login ban must not lock a user out |
+//! | `"qr_poll"` | enforced | QR-login status long-poll — one per open login tab |
 //! | `"federation"` | enforced | server-to-server: token exchange, inbox |
 //! | `"websocket"` | enforced | `/ws/*` — see [`super::tables::websocket`] |
 //! | `"search"` | enforced | `/api/search` — a full-corpus FTS scan |
@@ -77,6 +78,10 @@ pub(super) fn init(app: App) -> Router<App> {
 		.merge(
 			tables::auth::public_login()
 				.layer(RateLimitLayer::new(limiter.clone(), "auth", mode)),
+		)
+		.merge(
+			tables::auth::qr_login_status()
+				.layer(RateLimitLayer::new(limiter.clone(), "qr_poll", mode)),
 		)
 		.merge(
 			tables::profile::registration()

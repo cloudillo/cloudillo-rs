@@ -60,6 +60,9 @@ pub struct RateLimitConfig {
 	pub dav: EndpointCategoryConfig,
 	/// Federation endpoints (inbox)
 	pub federation: EndpointCategoryConfig,
+	/// QR-login status long-poll — its own bucket so an idle `/login` page does
+	/// not drain `auth`
+	pub qr_poll: EndpointCategoryConfig,
 	/// General public endpoints (profile, refs)
 	pub general: EndpointCategoryConfig,
 	/// Full-text search — its own bucket: unauthenticated, and far more expensive
@@ -104,6 +107,15 @@ impl Default for RateLimitConfig {
 				ipv4_network: RateLimitTierConfig::new(500, 750, 5000, 500),
 				ipv6_subnet: RateLimitTierConfig::new(100, 200, 1000, 100),
 				ipv6_provider: RateLimitTierConfig::new(500, 750, 5000, 500),
+			},
+			qr_poll: EndpointCategoryConfig {
+				name: "qr_poll",
+				// One long-poll per open login tab: ~15s hold + 1s re-poll ≈ 4/min,
+				// 240/h. Room for ~5 tabs per IP and a busy NAT per network.
+				ipv4_individual: RateLimitTierConfig::new(2, 10, 1200, 100),
+				ipv4_network: RateLimitTierConfig::new(5, 30, 5000, 300),
+				ipv6_subnet: RateLimitTierConfig::new(2, 10, 1200, 100),
+				ipv6_provider: RateLimitTierConfig::new(5, 30, 5000, 300),
 			},
 			general: EndpointCategoryConfig {
 				name: "general",
