@@ -1441,6 +1441,113 @@ async fn test_hat_roles_upsert_on_insert_and_update() {
 	assert_eq!(p.peer_hat_roles, None);
 }
 
+#[tokio::test]
+async fn test_hats_upsert_round_trip() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+	let hats = |v: &[&str]| v.iter().map(|&s| Box::from(s)).collect::<Vec<Box<str>>>();
+
+	// Created branch: the INSERT writes the list, `""` included.
+	let fields = UpsertProfileFields {
+		typ: Patch::Value(ProfileType::Community),
+		hats: Patch::Value(hats(&["a.example", ""])),
+		..Default::default()
+	};
+	adapter.upsert_profile(tn_id, "comm.example", &fields).await.expect("insert");
+	let (_, p) = adapter.read_profile(tn_id, "comm.example").await.expect("read");
+	assert_eq!(p.hats.as_deref(), Some(hats(&["a.example", ""]).as_slice()));
+
+	// Update branch: a lone `""` stays distinct from an empty list, then `Null` clears.
+	let fields = UpsertProfileFields { hats: Patch::Value(hats(&[""])), ..Default::default() };
+	adapter.upsert_profile(tn_id, "comm.example", &fields).await.expect("update");
+	let (_, p) = adapter.read_profile(tn_id, "comm.example").await.expect("read");
+	assert_eq!(p.hats.as_deref(), Some(hats(&[""]).as_slice()));
+
+	let fields = UpsertProfileFields { hats: Patch::Null, ..Default::default() };
+	adapter.upsert_profile(tn_id, "comm.example", &fields).await.expect("clear");
+	let (_, p) = adapter.read_profile(tn_id, "comm.example").await.expect("read");
+	assert_eq!(p.hats, None);
+}
+
+#[tokio::test]
+async fn test_partner_edges() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+	let tags = |v: &[&str]| v.iter().map(|&s| Box::from(s)).collect::<Vec<Box<str>>>();
+	let edges = || async {
+		let mut e: Vec<(String, String)> = adapter
+			.list_partner_edges(tn_id)
+			.await
+			.expect("list")
+			.into_iter()
+			.map(|e| (e.community.into(), e.partner.into()))
+			.collect();
+		e.sort();
+		e
+	};
+	let pair = |c: &str, p: &str| (c.to_owned(), p.to_owned());
+
+	// Upsert is idempotent.
+	adapter
+		.upsert_partner_edge(tn_id, "a.example", "x.example")
+		.await
+		.expect("upsert");
+	adapter
+		.upsert_partner_edge(tn_id, "a.example", "x.example")
+		.await
+		.expect("upsert again");
+	adapter
+		.upsert_partner_edge(tn_id, "b.example", "x.example")
+		.await
+		.expect("upsert b");
+	assert_eq!(edges().await, [pair("a.example", "x.example"), pair("b.example", "x.example")]);
+
+	// Replace touches only that community's edges.
+	let replaced = tags(&["y.example", "z.example"]);
+	adapter
+		.replace_partner_edges(tn_id, "a.example", &replaced)
+		.await
+		.expect("replace");
+	assert_eq!(
+		edges().await,
+		[
+			pair("a.example", "y.example"),
+			pair("a.example", "z.example"),
+			pair("b.example", "x.example"),
+		]
+	);
+
+	// Delete drops one edge; deleting it again is a no-op.
+	adapter
+		.delete_partner_edge(tn_id, "a.example", "y.example")
+		.await
+		.expect("delete");
+	adapter
+		.delete_partner_edge(tn_id, "a.example", "y.example")
+		.await
+		.expect("delete again");
+	assert_eq!(edges().await, [pair("a.example", "z.example"), pair("b.example", "x.example")]);
+
+	// Delete-of drops one community's edges only.
+	adapter
+		.upsert_partner_edge(tn_id, "c.example", "x.example")
+		.await
+		.expect("upsert c");
+	adapter.delete_partner_edges_of(tn_id, "c.example").await.expect("delete of");
+	assert_eq!(edges().await, [pair("a.example", "z.example"), pair("b.example", "x.example")]);
+
+	// Delete-except keeps only the listed communities.
+	adapter
+		.delete_partner_edges_except(tn_id, &tags(&["b.example"]))
+		.await
+		.expect("prune");
+	assert_eq!(edges().await, [pair("b.example", "x.example")]);
+	adapter.delete_partner_edges_except(tn_id, &[]).await.expect("prune all");
+	assert!(edges().await.is_empty());
+}
+
 /// `CONN:UPD` keys apart from the relationship row (`CONN:<iss>:<aud>`), so storing a UPD
 /// never retires the CONN. A retried older UPD retires the newer one under their shared key,
 /// and the `conn` hook's ordering lookup must still find the newer, retired row.

@@ -105,8 +105,9 @@ pub(crate) fn can_access_identity(identity: &Identity, requester_id_tag: &str) -
 	)
 }
 
-/// True iff the caller may administer this IDP domain: the literal domain owner
-/// (`id_tag == idp_domain`), a `leader`, or a site admin (`SADM`).
+/// True iff the caller may administer this IDP domain: a `leader` (the domain's account
+/// carries it) or a site admin (`SADM`). The id_tag alone is not standing: an `idp_` key
+/// names its identity but holds no roles.
 ///
 /// `leader` means leader **of the tenant the request is addressed to** — `auth.roles` are
 /// resolved per tenant against the `TnId` the request runs under, which the `IdTag`/`TnId`
@@ -128,10 +129,8 @@ pub(crate) fn can_access_identity(identity: &Identity, requester_id_tag: &str) -
 ///
 /// Mirrors the frontend gate `isOwner || roles.includes('leader')` in
 /// `shell/src/idp/identities.tsx`.
-pub(crate) fn is_idp_admin(auth_id_tag: &str, auth_roles: &[Box<str>], idp_domain: &str) -> bool {
-	auth_id_tag == idp_domain
-		|| cloudillo_core::roles::is_leader(auth_roles)
-		|| auth_roles.iter().any(|r| r.as_ref() == "SADM")
+pub(crate) fn is_idp_admin(auth_roles: &[Box<str>]) -> bool {
+	cloudillo_core::roles::is_leader(auth_roles) || auth_roles.iter().any(|r| r.as_ref() == "SADM")
 }
 
 /// Response structure for identity details
@@ -310,7 +309,7 @@ pub async fn get_identity_by_id(
 	let is_self = auth.id_tag.as_ref() == target_id_tag;
 	if !is_self
 		&& !can_access_identity(&identity, auth.id_tag.as_ref())
-		&& !is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref())
+		&& !is_idp_admin(&auth.roles)
 	{
 		warn!(
 			identity_id = %identity_id,
@@ -360,7 +359,7 @@ pub async fn list_identities(
 	// site admin — may list everything. Any other authenticated caller is scoped to
 	// identities they registered themselves — otherwise an authenticated user from an
 	// unrelated tenant could enumerate every identity hosted at this IDP.
-	let is_admin = is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref());
+	let is_admin = is_idp_admin(&auth.roles);
 	let registrar_filter = if is_admin {
 		query_params.registrar_id_tag.clone()
 	} else {
@@ -419,7 +418,7 @@ pub async fn create_identity(
 	// Admin-only: external self-registration has its own quota-gated REG-token flow
 	// (registration.rs), so a federated visitor or share-link token must not mint
 	// identities on the tenant's IDP domain here.
-	if !is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref()) {
+	if !is_idp_admin(&auth.roles) {
 		warn!(
 			requested_by = %auth.id_tag,
 			idp_domain = %idp_domain,
@@ -805,7 +804,7 @@ pub async fn delete_identity(
 	let is_self = auth.id_tag.as_ref() == target_id_tag;
 	if !is_self
 		&& !can_access_identity(&existing, auth.id_tag.as_ref())
-		&& !is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref())
+		&& !is_idp_admin(&auth.roles)
 	{
 		warn!(
 			identity_id = %identity_id,
@@ -884,7 +883,7 @@ pub async fn update_identity_settings(
 	let is_self = auth.id_tag.as_ref() == target_id_tag;
 	if !is_self
 		&& !can_access_identity(&existing, auth.id_tag.as_ref())
-		&& !is_idp_admin(auth.id_tag.as_ref(), &auth.roles, idp_domain.as_ref())
+		&& !is_idp_admin(&auth.roles)
 	{
 		warn!(
 			identity_id = %identity_id,
@@ -1423,32 +1422,31 @@ mod tests {
 		// `read_profile_roles(tn_id, ..)`), so on an IDP request `leader` means leader OF THE
 		// IDP TENANT — the operator's delegate.
 		let r = roles(&["leader"]);
-		assert!(is_idp_admin("alice.example.com", &r, "cloudillo.net"));
+		assert!(is_idp_admin(&r));
 	}
 
 	#[test]
 	fn site_admin_is_admin() {
-		assert!(is_idp_admin("alice.example.com", &roles(&["SADM"]), "cloudillo.net"));
+		assert!(is_idp_admin(&roles(&["SADM"])));
 	}
 
 	#[test]
 	fn plain_member_is_not_admin() {
 		for role_set in [roles(&[]), roles(&["contributor"]), roles(&["moderator"])] {
-			assert!(!is_idp_admin("alice.example.com", &role_set, "cloudillo.net"));
+			assert!(!is_idp_admin(&role_set));
 		}
 	}
 
 	#[test]
-	fn literal_domain_owner_is_admin() {
-		let r = roles(&[]);
-		assert!(is_idp_admin("cloudillo.net", &r, "cloudillo.net"));
+	fn role_less_domain_credential_is_not_admin() {
+		// An `idp_` key for the domain identity carries no roles.
+		assert!(!is_idp_admin(&roles(&[])));
 	}
 
 	#[test]
 	fn non_leader_non_owner_is_not_admin() {
 		// Empty roles (e.g. IDP API-key callers) and unrelated roles stay scoped.
-		assert!(!is_idp_admin("alice.example.com", &roles(&[]), "cloudillo.net"));
-		assert!(!is_idp_admin("alice.example.com", &roles(&["member", "editor"]), "cloudillo.net"));
+		assert!(!is_idp_admin(&roles(&["member", "editor"])));
 	}
 }
 

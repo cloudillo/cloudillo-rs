@@ -29,6 +29,17 @@ pub struct PorchEntry {
 	title: Option<Box<str>>,
 	descr: Option<Box<str>>,
 	status: String,
+	/// Admin fields — only for the tenant and moderator+ readers.
+	#[serde(flatten)]
+	admin: Option<PorchAdmin>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PorchAdmin {
+	visibility: Option<char>,
+	min_role: Option<Box<str>>,
+	closed: bool,
 }
 
 #[derive(Deserialize)]
@@ -110,8 +121,10 @@ pub async fn list_channels(
 		Some(auth) => (auth.id_tag.as_ref(), &auth.roles[..], auth.hat.is_some()),
 		None => ("", &[], false),
 	};
-	let is_tenant = reader == tenant_id_tag.as_ref();
+	let is_tenant = maybe_auth.as_ref().is_some_and(|a| abac::is_tenant_self(a, &tenant_id_tag));
 	let is_real_auth = maybe_auth.is_some() && !reader.is_empty() && reader != "guest";
+	let is_admin = is_tenant
+		|| maybe_auth.as_ref().is_some_and(|a| a.scope.is_none() && is_moderator(&a.roles));
 
 	// `follower` ("they follow us") is the direction the visibility ladder means.
 	let rel = abac::subject_relation_to_tenant(&app, tn_id, reader).await?;
@@ -126,14 +139,19 @@ pub async fn list_channels(
 
 	let entries = channels
 		.into_iter()
-		.filter(|c| access.can_access(VisibilityLevel::from_char(c.visibility)))
+		.filter(|c| is_admin || access.can_access(VisibilityLevel::from_char(c.visibility)))
 		.map(|c| {
 			let status = if is_tenant {
 				"in".into()
 			} else {
 				porch_status(&c, roles, roster.contains(&c.name), hatted)
 			};
-			PorchEntry { name: c.name, title: c.title, descr: c.descr, status }
+			let admin = is_admin.then_some(PorchAdmin {
+				visibility: c.visibility,
+				min_role: c.min_role,
+				closed: c.closed,
+			});
+			PorchEntry { name: c.name, title: c.title, descr: c.descr, status, admin }
 		})
 		.collect();
 

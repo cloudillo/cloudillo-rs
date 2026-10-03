@@ -24,11 +24,17 @@ use tower::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
 use cloudillo::bootstrap::{CreateCompleteTenantOptions, create_complete_tenant};
+use cloudillo::error::ClResult;
+use cloudillo::identity_provider_adapter::{
+	AddressType, ApiKey, CreateApiKeyOptions, CreateIdentityOptions, CreatedApiKey, Identity,
+	IdentityProviderAdapter, IdentityStatus, ListApiKeyOptions, ListIdentityOptions,
+	RegistrarQuota, UpdateIdentityOptions,
+};
 use cloudillo::meta_adapter::{
-	ProfileConnectionStatus, ProfileType, UpdateTenantData, UpsertProfileFields,
+	Channel, ProfileConnectionStatus, ProfileType, UpdateTenantData, UpsertProfileFields,
 };
 use cloudillo::settings::SettingValue;
-use cloudillo::types::{Patch, TnId};
+use cloudillo::types::{Patch, Timestamp, TnId};
 use cloudillo::websocket::{AccessQuery, WsKind, ws_file_access};
 use cloudillo::{App, AppBuilder, worker};
 use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
@@ -46,6 +52,104 @@ pub const ADMIN: &str = "admin.test";
 pub const TRASH: &str = "trash.test";
 /// Password of every tenant owner.
 pub const PASSWORD: &str = "matrix-pass-0";
+
+/// The one `idp_` key [`StubIdp`] accepts; it names alice's account.
+pub const IDP_KEY: &str = "idp_zqmatrix-alice";
+
+/// Identity provider that only verifies [`IDP_KEY`]; nothing else is reached.
+#[derive(Debug)]
+struct StubIdp;
+
+#[async_trait::async_trait]
+impl IdentityProviderAdapter for StubIdp {
+	async fn verify_api_key(&self, key: &str) -> ClResult<Option<String>> {
+		Ok((key == IDP_KEY).then(|| ALICE.to_owned()))
+	}
+	async fn create_identity(&self, _: CreateIdentityOptions<'_>) -> ClResult<Identity> {
+		unimplemented!()
+	}
+	async fn read_identity(&self, _: &str, _: &str) -> ClResult<Option<Identity>> {
+		Ok(None)
+	}
+	async fn read_identity_by_email(&self, _: &str) -> ClResult<Option<Identity>> {
+		Ok(None)
+	}
+	async fn update_identity(
+		&self,
+		_: &str,
+		_: &str,
+		_: UpdateIdentityOptions,
+	) -> ClResult<Identity> {
+		unimplemented!()
+	}
+	async fn update_identity_address(
+		&self,
+		_: &str,
+		_: &str,
+		_: &str,
+		_: AddressType,
+	) -> ClResult<Identity> {
+		unimplemented!()
+	}
+	async fn delete_identity(&self, _: &str, _: &str) -> ClResult<()> {
+		unimplemented!()
+	}
+	async fn list_identities(&self, _: ListIdentityOptions) -> ClResult<Vec<Identity>> {
+		Ok(Vec::new())
+	}
+	async fn cleanup_expired_identities(&self) -> ClResult<u32> {
+		Ok(0)
+	}
+	async fn renew_identity(&self, _: &str, _: &str, _: Timestamp) -> ClResult<Identity> {
+		unimplemented!()
+	}
+	async fn create_api_key(&self, _: CreateApiKeyOptions<'_>) -> ClResult<CreatedApiKey> {
+		unimplemented!()
+	}
+	async fn list_api_keys(&self, _: ListApiKeyOptions) -> ClResult<Vec<ApiKey>> {
+		Ok(Vec::new())
+	}
+	async fn delete_api_key(&self, _: i32) -> ClResult<()> {
+		unimplemented!()
+	}
+	async fn delete_api_key_for_identity(&self, _: i32, _: &str, _: &str) -> ClResult<bool> {
+		unimplemented!()
+	}
+	async fn cleanup_expired_api_keys(&self) -> ClResult<u32> {
+		Ok(0)
+	}
+	async fn list_identities_by_registrar(
+		&self,
+		_: &str,
+		_: Option<u32>,
+		_: Option<u32>,
+	) -> ClResult<Vec<Identity>> {
+		Ok(Vec::new())
+	}
+	async fn get_quota(&self, _: &str) -> ClResult<RegistrarQuota> {
+		unimplemented!()
+	}
+	async fn set_quota_limits(&self, _: &str, _: i32, _: i64) -> ClResult<RegistrarQuota> {
+		unimplemented!()
+	}
+	async fn check_quota(&self, _: &str, _: i64) -> ClResult<bool> {
+		unimplemented!()
+	}
+	async fn increment_quota(&self, _: &str, _: i64) -> ClResult<RegistrarQuota> {
+		unimplemented!()
+	}
+	async fn decrement_quota(&self, _: &str, _: i64) -> ClResult<RegistrarQuota> {
+		unimplemented!()
+	}
+	async fn update_quota_on_status_change(
+		&self,
+		_: &str,
+		_: IdentityStatus,
+		_: IdentityStatus,
+	) -> ClResult<RegistrarQuota> {
+		unimplemented!()
+	}
+}
 
 pub struct Tenant {
 	pub id_tag: &'static str,
@@ -136,6 +240,21 @@ impl Remotes {
 /// club's role map for `peer.test` members (`peer_role:local_role`).
 pub const PEER_HAT_ROLES: &str = "contributor:contributor";
 
+/// Room `(tenant, name, min_role, visibility, closed)`.
+type Room = (&'static str, &'static str, Option<&'static str>, Option<char>, bool);
+
+/// Rooms; each gets `cur-chan-{name}-*` objects.
+pub const CHANNELS: [Room; 5] = [
+	(CLUB, "open-contrib", Some("contributor"), Some('P'), false),
+	(CLUB, "mods", Some("moderator"), Some('P'), false),
+	// Secret and closed; roster = `m_contributor`.
+	(CLUB, "closed-w", Some("supporter"), None, true),
+	(CLUB, GONE_CHANNEL, Some("supporter"), Some('P'), false),
+	(ALICE, "close-friends", Some("supporter"), Some('P'), false),
+];
+/// Deleted after its objects are seeded and indexed (their `channel` stays stamped).
+pub const GONE_CHANNEL: &str = "gone";
+
 pub use crate::objects::Obj;
 use crate::objects::{index_all, seed_actions, seed_api_keys, seed_files};
 use crate::subjects::mint_subjects;
@@ -201,6 +320,7 @@ async fn build() -> Fixture {
 		.blob_adapter(blob)
 		.crdt_adapter(crdt)
 		.rtdb_adapter(rtdb)
+		.idp_adapter(Arc::new(StubIdp))
 		.worker(worker);
 	let (app, api, _app_router, _http_router) = builder.build().await.unwrap();
 
@@ -255,9 +375,11 @@ async fn build() -> Fixture {
 		subscriber: remote("subscriber"),
 	};
 	seed_remotes(&app, &tenants, &remotes).await;
+	seed_channels(&app, &tenants, &remotes).await;
 	let mut objs = seed_files(&app, &tenants, &remotes).await;
 	objs.extend(seed_actions(&app, &tenants, &remotes).await);
 	index_all(&app, &objs).await;
+	app.meta_adapter.delete_channel(tenants.club.tn_id, GONE_CHANNEL).await.unwrap();
 	let api_keys = seed_api_keys(&app, &tenants).await;
 	let (subjects, mints) = mint_subjects(&app, &api, &tenants, &remotes, &objs, &api_keys).await;
 
@@ -297,6 +419,9 @@ pub fn remote(name: &str) -> RemoteId {
 	RemoteId { id_tag: format!("{name}.test"), key_id: "k1".into(), spki_b64: body(&spki), pem }
 }
 
+/// The `hats` entry seeded on alice's `connected.test` and club's `peer.test`.
+const HAT_SEED: &str = "zqm-hat.test";
+
 /// Profile row fields for a remote; every remote is `synced` so nothing is fetched.
 pub fn prof(typ: ProfileType) -> UpsertProfileFields {
 	UpsertProfileFields { typ: Patch::Value(typ), synced: Patch::Value(true), ..Default::default() }
@@ -333,9 +458,10 @@ async fn seed_remotes(app: &App, t: &Tenants, r: &Remotes) {
 	let mut f = prof(ProfileType::Person);
 	f.following = Patch::Value(true);
 	meta.upsert_profile(alice, &r.we_follow.id_tag, &f).await.unwrap();
-	meta.upsert_profile(alice, &r.connected.id_tag, &linked(prof(ProfileType::Person)))
-		.await
-		.unwrap();
+	// `hats` is the tenant account's alone: seeded so a leak shows.
+	let mut f = linked(prof(ProfileType::Person));
+	f.hats = Patch::Value(vec![HAT_SEED.into()]);
+	meta.upsert_profile(alice, &r.connected.id_tag, &f).await.unwrap();
 
 	// club members.
 	let club = t.club.tn_id;
@@ -361,7 +487,29 @@ async fn seed_remotes(app: &App, t: &Tenants, r: &Remotes) {
 	// club ↔ peer community, with a hat map for peer's members.
 	let mut f = linked(prof(ProfileType::Community));
 	f.hat_roles = Patch::Value(Some(PEER_HAT_ROLES.into()));
+	f.hats = Patch::Value(vec![HAT_SEED.into()]);
 	meta.upsert_profile(club, &r.peer.id_tag, &f).await.unwrap();
+}
+
+async fn seed_channels(app: &App, t: &Tenants, r: &Remotes) {
+	let meta = &app.meta_adapter;
+	for (tn, name, min_role, visibility, closed) in CHANNELS {
+		let tn_id = if tn == CLUB { t.club.tn_id } else { t.alice.tn_id };
+		let ch = Channel {
+			name: name.into(),
+			title: None,
+			descr: None,
+			visibility,
+			min_role: min_role.map(Into::into),
+			closed,
+			created_at: Timestamp::now(),
+			updated_at: Timestamp::now(),
+		};
+		meta.create_channel(tn_id, &ch).await.unwrap();
+	}
+	meta.add_channel_member(t.club.tn_id, "closed-w", &r.m_contributor.id_tag)
+		.await
+		.unwrap();
 }
 
 /// ES384-sign any claims (action tokens, PROXY tokens) with a remote's key.

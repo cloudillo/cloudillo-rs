@@ -783,6 +783,7 @@ mod tests {
 			scope: scope.map(Box::from),
 			anonymous: false,
 			hat: None,
+			exp: None,
 		}
 	}
 

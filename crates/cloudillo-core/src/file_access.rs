@@ -481,6 +481,8 @@ fn fshr_grant_level(
 ///
 /// Both end in the visibility rung (see [`visibility_level`]): at most Read, scoped callers scored
 /// as guest, so a scope never yields less than the anonymous view.
+///
+/// Beside it, opt-in per request: [`action_attachment_level`] when the caller names an action.
 pub async fn get_access_level(
 	app: &App,
 	tn_id: TnId,
@@ -496,6 +498,43 @@ pub async fn get_access_level(
 		return level;
 	}
 	visibility_level(app, tn_id, &file, ctx).await
+}
+
+/// `Read` when `action_id` is an active action here, issued by the file's owner, addressed to
+/// the caller and attaching the file: the action named its audience. An unscoped caller only,
+/// on a row that originates here. One point lookup, made only when the caller names the action
+/// (`?action=`, sent by the audience's attachment sync).
+pub async fn action_attachment_level(
+	app: &App,
+	tn_id: TnId,
+	file: &FileRef<'_>,
+	ctx: &FileAccessCtx<'_>,
+	action_id: &str,
+) -> AccessLevel {
+	// Unscoped: share links and `idp_` keys carry the tenant id_tag. Local row: a mirror's
+	// access belongs to its upstream.
+	if ctx.scope.is_some()
+		|| file.upstream_id_tag.is_some()
+		|| ctx.user_id_tag.is_empty()
+		|| ctx.user_id_tag == "guest"
+	{
+		return AccessLevel::None;
+	}
+	let view = match app.meta_adapter.get_action(tn_id, action_id).await {
+		Ok(Some(view)) => view,
+		Ok(None) => return AccessLevel::None,
+		Err(e) => {
+			warn!(action_id, error = %e, "action attachment lookup failed");
+			return AccessLevel::None;
+		}
+	};
+	// Issuer = owner: a remote's action stored here cannot grant our file by attaching it.
+	// Audience = caller: a third party who knows the action id gains nothing.
+	let grants = view.status.as_deref() == Some("A")
+		&& &*view.issuer.id_tag == file.owner_id_tag
+		&& view.audience.as_ref().map(|p| &*p.id_tag) == Some(ctx.user_id_tag)
+		&& view.attachments.iter().flatten().any(|a| &*a.file_id == file.file_id);
+	if grants { AccessLevel::Read } else { AccessLevel::None }
 }
 
 /// Rungs 1–5 of [`get_access_level`], for an unscoped caller.

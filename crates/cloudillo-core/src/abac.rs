@@ -294,10 +294,7 @@ pub fn is_admin(auth: &AuthCtx) -> bool {
 /// its own host it matches. The account itself always carries `leader` via
 /// `build_tenant_owner_roles`, so requiring it costs nothing real and keeps those keys out.
 pub fn require_tenant_self(auth: &AuthCtx, tenant_id_tag: &str, what: &str) -> ClResult<()> {
-	if auth.scope.is_none()
-		&& ((auth.id_tag.as_ref() == tenant_id_tag && crate::roles::is_leader(&auth.roles))
-			|| is_admin(auth))
-	{
+	if is_tenant_self(auth, tenant_id_tag) {
 		Ok(())
 	} else {
 		warn!(
@@ -309,6 +306,21 @@ pub fn require_tenant_self(auth: &AuthCtx, tenant_id_tag: &str, what: &str) -> C
 		);
 		Err(Error::PermissionDenied)
 	}
+}
+
+/// Whether `auth` is the tenant account itself (or SADM): [`require_tenant_self`]'s test.
+/// Use it for every "is this the owner" check — a bare `auth.id_tag == tenant` also admits a
+/// share-link token and an `idp_` management key.
+pub fn is_tenant_self(auth: &AuthCtx, tenant_id_tag: &str) -> bool {
+	auth.scope.is_none()
+		&& ((auth.id_tag.as_ref() == tenant_id_tag && crate::roles::is_leader(&auth.roles))
+			|| is_admin(auth))
+}
+
+/// A credential carrying the tenant's id_tag without being the tenant account
+/// (share link, via-embed, `idp_` key): treat it as an anonymous guest.
+pub fn names_tenant_without_being_it(auth: &AuthCtx, tenant_id_tag: &str) -> bool {
+	auth.id_tag.as_ref() == tenant_id_tag && !is_tenant_self(auth, tenant_id_tag)
 }
 
 /// Environment attributes (environmental context)
@@ -889,6 +901,7 @@ mod tests {
 			scope: None,
 			anonymous: false,
 			hat: None,
+			exp: None,
 		}
 	}
 
@@ -1127,6 +1140,22 @@ mod tests {
 	fn require_tenant_self_denies_role_less_principal() {
 		let idp_key = plain_subject(); // roles: []
 		assert!(require_tenant_self(&idp_key, "alice.example.com", "test").is_err());
+	}
+
+	#[test]
+	fn names_tenant_without_being_it_flags_impostors() {
+		let tenant = "alice.example.com";
+		let owner = AuthCtx { roles: Box::new(["leader".into()]), ..plain_subject() };
+		assert!(!names_tenant_without_being_it(&owner, tenant));
+
+		let share = AuthCtx { scope: Some("file:f1~abc:R".into()), ..owner.clone() };
+		assert!(names_tenant_without_being_it(&share, tenant));
+
+		let idp_key = plain_subject(); // roles: [], scope: None
+		assert!(names_tenant_without_being_it(&idp_key, tenant));
+
+		let other = AuthCtx { id_tag: "bob.example.com".into(), ..plain_subject() };
+		assert!(!names_tenant_without_being_it(&other, tenant));
 	}
 
 	#[test]

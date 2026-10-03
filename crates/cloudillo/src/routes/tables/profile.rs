@@ -16,7 +16,7 @@
 //! | `/api/me/app-domain`                   | `public_discovery()` ᴳ | | | | |
 //! | `/api/me/image`                        | | | `own()` ᴱ ᴮ | | |
 //! | `/api/me/cover`                        | | | `own()` ᴱ ᴮ | | |
-//! | `/api/profiles`                        | `own()` ᴱ | | | | |
+//! | `/api/profiles`                        | `own()` ᴱ ᵀ | | | | |
 //! | `/api/profiles/batch`                  | `batch()` ᴾ | | | | |
 //! | `/api/profiles/{id_tag}`               | `read()` ᶜ | | `own()` ᴱ | `write()` ᶜ | |
 //! | `/api/profiles/{id_tag}/refresh`       | | `own()` ᴱ | | | |
@@ -30,11 +30,17 @@
 //! | `/api/channels`                        | `channels_public()` ᴼ | `channels_admin()` ᴱ | | | |
 //! | `/api/channels/{name}`                 | | | | `channels_admin()` ᴱ | `channels_admin()` ᴱ |
 //! | `/api/channels/{name}/members`         | `channels_admin()` ᴱ | | | | |
+//! | `/api/partners`                        | `partners_list()` ᴼ | | | | |
+//! | `/api/partners/map`                    | `partners_own()` ᴱ | | | | |
+//! | `/api/partners/sync`                   | | `partners_own()` ᴱ | | | |
 //!
 //! ᴳ public + rate-limited only, ᴼ optional auth under `"general"` — the handler filters
 //! by the reader, ᴿ public under the strict `"auth"` bucket,
 //! ᶜ auth + ABAC, ᴱ auth only — handler self-enforces, ᴾ **any valid token,
-//! scope ignored** (see [`batch`]). ᴮ carries its own body-limit layer. The guard
+//! scope ignored** (see [`batch`]). ᴮ carries its own body-limit layer. ᵀ any token
+//! lists, but the handler projects per caller tier — only an unscoped leader sees hidden
+//! statuses and relationship fields, and connections follow `profile.connection_visibility`
+//! (`cloudillo_core::profile_visibility::RequesterTier::from_auth`). The guard
 //! on each fn is in `routes/protected.rs` / `routes/public.rs`.
 //!
 //! `/api/profiles/{id_tag}` spans three guards — `GET` under
@@ -57,7 +63,9 @@ use axum::{
 use crate::prelude::*;
 use crate::routes::policy::upload_body_limit;
 use crate::settings;
-use cloudillo_profile::{channel, community, handler, idp_status, list, media, register, update};
+use cloudillo_profile::{
+	channel, community, handler, idp_status, list, media, partners, register, update,
+};
 
 /// Profile reads, gated by `check_perm_profile("read")`.
 ///
@@ -112,6 +120,20 @@ pub(crate) fn channels_admin() -> Router<App> {
 /// Optional auth; the handler filters by visibility and computes the status.
 pub(crate) fn channels_public() -> Router<App> {
 	Router::new().route("/api/channels", get(channel::list_channels))
+}
+
+/// The tenant's partner communities. Optional auth; the handler shows the list to whoever
+/// `profile.connection_visibility.community` admits.
+pub(crate) fn partners_list() -> Router<App> {
+	Router::new().route("/api/partners", get(partners::list_partners))
+}
+
+/// The owner's connection map and its sync trigger. Auth only; handlers require the
+/// unscoped tenant owner.
+pub(crate) fn partners_own() -> Router<App> {
+	Router::new()
+		.route("/api/partners/map", get(partners::get_partner_map))
+		.route("/api/partners/sync", post(partners::sync_partners))
 }
 
 /// The caller's own profile — authentication only, no ABAC guard.

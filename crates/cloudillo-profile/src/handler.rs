@@ -13,21 +13,9 @@ use axum::{
 
 use crate::prelude::*;
 use cloudillo_core::IdTag;
-use cloudillo_core::abac;
 use cloudillo_core::extract::{OptionalAuth, OptionalRequestId};
-use cloudillo_core::profile_visibility::{CommunityRole, RequesterTier, SectionVisibility};
-use cloudillo_types::meta_adapter::ProfileType;
+use cloudillo_core::profile_visibility::{RequesterTier, SectionVisibility};
 use cloudillo_types::types::{ApiResponse, AppDomainRes, Profile, ProfileBase};
-
-/// Wire-format string for a `ProfileType`. Shared between the full and base
-/// `/api/me` handlers and `list::get_profiles_batch` so they can't drift — the
-/// batch projection's whole justification is that it is `/api/me` minus `keys`.
-pub(crate) fn profile_type_str(t: ProfileType) -> &'static str {
-	match t {
-		ProfileType::Person => "person",
-		ProfileType::Community => "community",
-	}
-}
 
 /// Suffix appended to a section field name to mark its required visibility.
 const VIS_SUFFIX: &str = ".vis";
@@ -175,7 +163,7 @@ pub async fn get_tenant_profile_base(
 	let profile = ProfileBase {
 		id_tag: auth_profile.id_tag.to_string(),
 		name: tenant_meta.name.to_string(),
-		r#type: profile_type_str(tenant_meta.typ).to_string(),
+		r#type: tenant_meta.typ.as_str().to_string(),
 		profile_pic: tenant_meta.profile_pic.map(|s| s.to_string()),
 		keys: auth_profile.keys,
 	};
@@ -235,31 +223,14 @@ pub async fn get_tenant_profile(
 	let tn_id = auth_profile.tn_id;
 	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
 
-	let is_owner = auth.as_ref().is_some_and(|a| a.id_tag.as_ref() == &*id_tag);
-	let is_authenticated = auth.is_some();
-	let max_role = auth
-		.as_ref()
-		.and_then(|a| a.roles.iter().filter_map(|r| CommunityRole::parse(r)).max());
-
-	let (follows_tenant, connected_to_tenant) = if is_owner || !is_authenticated {
-		(false, false)
-	} else if let Some(a) = auth.as_ref() {
-		// `follower` ("the caller follows this tenant"), not `following`.
-		let rel = abac::subject_relation_to_tenant(&app, tn_id, a.id_tag.as_ref()).await?;
-		(rel.follower, rel.connected)
-	} else {
-		(false, false)
-	};
-
-	let tier =
-		RequesterTier { is_owner, is_authenticated, follows_tenant, connected_to_tenant, max_role };
+	let tier = RequesterTier::from_auth(&app, tn_id, &id_tag, auth.as_ref()).await?;
 
 	let x_map = filter_sections(tenant_meta.x, tier);
 
 	let profile = Profile {
 		id_tag: auth_profile.id_tag.to_string(),
 		name: tenant_meta.name.to_string(),
-		r#type: profile_type_str(tenant_meta.typ).to_string(),
+		r#type: tenant_meta.typ.as_str().to_string(),
 		profile_pic: tenant_meta.profile_pic.map(|s| s.to_string()),
 		cover_pic: tenant_meta.cover_pic.map(|s| s.to_string()),
 		keys: auth_profile.keys,
@@ -277,6 +248,7 @@ pub async fn get_tenant_profile(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use cloudillo_core::profile_visibility::CommunityRole;
 
 	fn input() -> HashMap<Box<str>, Box<str>> {
 		let mut x: HashMap<Box<str>, Box<str>> = HashMap::new();

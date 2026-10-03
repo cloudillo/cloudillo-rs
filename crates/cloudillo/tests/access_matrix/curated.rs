@@ -15,8 +15,8 @@ use crate::fixture::{Fixture, call, req};
 use crate::levels::{Cell as OracleCell, run_cells};
 use crate::objects::Obj;
 use crate::ops::{
-	ActionOp, Actual, FileOp, Op, bearer, classify, count_actions, list_presence, obj_key,
-	status_class,
+	ActionOp, Actual, FileOp, MARK, Op, bearer, classify, count_actions, list_paged, list_presence,
+	obj_key, status_class,
 };
 use crate::oracle::{Outcome, expected};
 use crate::report::{Mismatch, Report};
@@ -58,6 +58,43 @@ pub enum Route {
 	/// `?access=` value (`None` = omitted).
 	WsCrdt(Option<&'static str>),
 	WsRtdb(Option<&'static str>),
+	/// `GET /api/channels`: the room's porch `status`, or `Absent` when unlisted.
+	ChanPorch(&'static str),
+	/// `POST /api/channels {name}`.
+	ChanCreate(&'static str),
+	/// `PATCH /api/channels/{name} {title}`.
+	ChanPatch(&'static str),
+	ChanDelete(&'static str),
+	/// `GET /api/channels/{name}/members`.
+	ChanMembers(&'static str),
+	/// `GET /api/actions?channel=@{host}~{room}`: Present = the object is listed.
+	ChanFeed(&'static str),
+	/// `POST /api/files` (CRDT) with this raw `channel` value.
+	ChanUpload(&'static str),
+	/// `GET /api/profiles?{query}`, summarised by [`profiles`].
+	Profiles(&'static str),
+	/// `GET /api/partners`, summarised by [`partners`].
+	Partners,
+	/// `GET /api/partners/map`.
+	PartnersMap,
+	/// `POST /api/partners/sync`.
+	PartnersSync,
+	/// `POST /api/actions {type: PTNR, subject: @peer.test}`.
+	PtnrCreate,
+	/// `POST /api/actions {type: "PTNR:DEL", subject: @peer.test}`: the subtype in `type`.
+	PtnrDelCreate,
+	/// `GET /api/actions?{query}`: Present = the object is listed.
+	ActListQ(&'static str),
+	/// `GET {uri}` of profile rows: `Empty` or `Listed`.
+	Ids(&'static str),
+	/// `GET {uri}` of profile rows: `Present` if the id_tag is listed, else `Absent`.
+	IdIn(&'static str, &'static str),
+	/// `PATCH /api/profiles/{id_tag} {hats: [...]}`.
+	HatsPatch(&'static str),
+	/// `GET {uri}` (one row or a list): `Clean`, or `Leak:{field}` for the first field set.
+	Fields(&'static str, &'static [&'static str]),
+	/// `GET {uri}`: Allow / Deny.
+	Get(&'static str),
 }
 use Route::*;
 
@@ -100,17 +137,20 @@ impl Route {
 			ActPublish => Op::Action(A::Publish),
 			ActCancel => Op::Action(A::Cancel),
 			ActDelete => Op::Action(A::Delete),
-			ActList | ActCount => Op::Action(A::List),
+			ActList | ActCount | ChanFeed(_) | ActListQ(_) => Op::Action(A::List),
 			Search => Op::Search,
 			Outbox => Op::Outbox,
 			WsCrdt(a) => Op::Ws(WsKind::Crdt, a),
 			WsRtdb(a) => Op::Ws(WsKind::Rtdb, a),
-			FileUser | ReadMarker | Subscribe => return None,
+			FileUser | ReadMarker | Subscribe | ChanPorch(_) | ChanCreate(_) | ChanPatch(_)
+			| ChanDelete(_) | ChanMembers(_) | ChanUpload(_) | Profiles(_) | Partners
+			| PartnersMap | PartnersSync | PtnrCreate | PtnrDelCreate | Ids(_) | IdIn(..)
+			| HatsPatch(_) | Fields(..) | Get(_) => return None,
 		})
 	}
 
 	fn is_listing(self) -> bool {
-		matches!(self, FileList | ActList | ActCount | Search | Outbox)
+		matches!(self, FileList | ActList | ActCount | Search | Outbox | ChanFeed(_) | ActListQ(_))
 	}
 }
 
@@ -249,7 +289,16 @@ pub const FC: &[Row] = &[
 	("FC-47", "m_leader@club", "cur-mirror-del-leader@club", FileDelete, "Deny"),
 	// Share-link guest reads the public row, yet refresh is gated for anonymous callers.
 	("FC-48", "sharelink-r@alice", "mirroredplacer-blob-p-active@alice", FileRefresh, "Deny"),
+	// A user's share map: self or tenant only; neither credential naming alice is either.
+	("FC-49", "sharelink-r@alice", "", Get(SHARES_ALICE), "Deny"),
+	("FC-50", "idp-mgmt@alice", "", Get(SHARES_ALICE), "Deny"),
+	("FC-51", "owner@alice", "", Get(SHARES_ALICE), "Allow"),
+	// An `idp_` key gets no identity grants. No object is shared to alice's own id_tag, so this
+	// cannot catch a leaked `share_subject`; it pins the guest level only.
+	("FC-52", "idp-mgmt@alice", "tenant-crdt-d-active@alice", Search, "Absent"),
 ];
+
+const SHARES_ALICE: &str = "/api/shares?subjectType=U&subjectId=alice.test";
 
 /// Action curated rows.
 pub const AC: &[Row] = &[
@@ -334,6 +383,10 @@ pub const WS: &[Row] = &[
 	),
 	("WS-21", "g_comment@alice", "tenant-rtdb-d-active@alice", WsRtdb(None), "Allow@Read"),
 	("WS-22", "g_read@alice", "tenant-rtdb-d-active@alice", WsRtdb(Some("write")), "Deny"),
+	// Hatted `file:` scope mint: opens its root for Read only; the closed room stays shut.
+	("WS-23", "hatted-scoped@club", "root@club", WsCrdt(None), "Allow@Read"),
+	("WS-24", "hatted-scoped@club", "root@club", WsCrdt(Some("write")), "Deny"),
+	("WS-25", "hatted-scoped@club", "cur-chan-closed-w-crdt@club", WsCrdt(None), "Deny"),
 ];
 
 /// Self-enforcing routes.
@@ -354,6 +407,363 @@ pub const SE: &[Row] = &[
 	("SE-13", "subscriber@alice", "container-s-tenant-active@alice", Subscribe, "Deny"),
 	("SE-14", "stranger@alice", "container-d-tenant-active@alice", Subscribe, "Deny"),
 	("SE-15", "owner-scoped-w@alice", "container-p-tenant-active@alice", Subscribe, "Deny"),
+];
+
+const OC_POST: &str = "cur-chan-open-contrib-post@club";
+const OC_FILE: &str = "cur-chan-open-contrib-file@club";
+const OC_CRDT: &str = "cur-chan-open-contrib-crdt@club";
+const MODS_POST: &str = "cur-chan-mods-post@club";
+const CW_POST: &str = "cur-chan-closed-w-post@club";
+const CW_FILE: &str = "cur-chan-closed-w-file@club";
+const CW_CRDT: &str = "cur-chan-closed-w-crdt@club";
+const GONE_POST: &str = "cur-chan-gone-post@club";
+const GONE_FILE: &str = "cur-chan-gone-file@club";
+const CF_POST: &str = "cur-chan-close-friends-post@alice";
+const CF_FILE: &str = "cur-chan-close-friends-file@alice";
+
+/// Channel rooms. club: `open-contrib` (contributor+), `mods` (moderator+), `closed-w`
+/// (closed, secret, only `m_contributor` rostered), `gone` (deleted); alice: `close-friends`
+/// (supporter+). Room objects are Public, so only the room gates them: absent, not redacted.
+/// `hatted` maps to contributor. `zqm-scratch` is created by the layer before the rows run.
+pub const CH: &[Row] = &[
+	// Feed.
+	("CH-01", "owner@club", CW_POST, ActList, "Present"),
+	("CH-02", "m_contributor@club", OC_POST, ActList, "Present"),
+	("CH-03", "m_supporter@club", OC_POST, ActList, "Absent"),
+	("CH-04", "m_follower@club", OC_POST, ActList, "Absent"),
+	("CH-05", "stranger@club", OC_POST, ActList, "Absent"),
+	("CH-06", "anon@club", OC_POST, ActList, "Absent"),
+	("CH-07", "hatted@club", OC_POST, ActList, "Present"),
+	("CH-08", "m_contributor@club", MODS_POST, ActList, "Absent"),
+	("CH-09", "m_moderator@club", MODS_POST, ActList, "Present"),
+	("CH-10", "m_contributor@club", CW_POST, ActList, "Present"),
+	("CH-11", "m_supporter@club", CW_POST, ActList, "Absent"),
+	// A closed room admits the roster only, whatever the role.
+	("CH-12", "m_moderator@club", CW_POST, ActList, "Absent"),
+	("CH-13", "hatted@club", CW_POST, ActList, "Absent"),
+	("CH-14", "owner@club", GONE_POST, ActList, "Present"),
+	("CH-15", "m_leader@club", GONE_POST, ActList, "Absent"),
+	("CH-16", "owner@alice", CF_POST, ActList, "Present"),
+	("CH-17", "anon@alice", CF_POST, ActList, "Absent"),
+	// Single-action reads follow the feed.
+	("CH-18", "m_contributor@club", CW_POST, ActGet, "Allow"),
+	("CH-19", "m_moderator@club", CW_POST, ActGet, "Deny"),
+	("CH-20", "hatted@club", CW_POST, ActGet, "Deny"),
+	("CH-21", "m_contributor@club", GONE_POST, ActGet, "Deny"),
+	// `?channel=` filter.
+	("CH-22", "m_contributor@club", OC_POST, ChanFeed("open-contrib"), "Present"),
+	("CH-23", "m_contributor@club", CW_POST, ChanFeed("open-contrib"), "Absent"),
+	("CH-24", "m_supporter@club", OC_POST, ChanFeed("open-contrib"), "Absent"),
+	("CH-25", "hatted@club", CW_POST, ChanFeed("closed-w"), "Absent"),
+	// Files.
+	("CH-26", "m_contributor@club", CW_FILE, FileList, "Present"),
+	("CH-27", "m_moderator@club", CW_FILE, FileList, "Absent"),
+	("CH-28", "m_supporter@club", OC_FILE, FileList, "Absent"),
+	("CH-29", "hatted@club", CW_FILE, FileList, "Absent"),
+	("CH-30", "owner@club", GONE_FILE, FileList, "Present"),
+	("CH-31", "m_contributor@club", GONE_FILE, FileList, "Absent"),
+	("CH-32", "m_contributor@club", CW_FILE, FileMeta, "Allow"),
+	("CH-33", "m_moderator@club", CW_FILE, FileMeta, "Deny"),
+	("CH-34", "hatted@club", CW_FILE, FileMeta, "Deny"),
+	("CH-35", "stranger@club", OC_FILE, FileMeta, "Deny"),
+	("CH-36", "anon@club", OC_FILE, FileMeta, "Deny"),
+	("CH-37", "m_contributor@club", GONE_FILE, FileMeta, "Deny"),
+	("CH-38", "owner@club", GONE_FILE, FileMeta, "Allow"),
+	("CH-39", "stranger@alice", CF_FILE, FileMeta, "Deny"),
+	("CH-40", "owner@alice", CF_FILE, FileMeta, "Allow"),
+	("CH-41", "m_contributor@club", CW_CRDT, WsCrdt(None), "Allow"),
+	("CH-42", "m_moderator@club", CW_CRDT, WsCrdt(None), "Deny"),
+	("CH-43", "hatted@club", CW_CRDT, WsCrdt(None), "Deny"),
+	("CH-44", "hatted@club", OC_CRDT, WsCrdt(None), "Allow"),
+	("CH-45", "m_supporter@club", OC_CRDT, WsCrdt(None), "Deny"),
+	// A share grant bypasses the room.
+	("CH-46", "g_read@club", CW_FILE, FileMeta, "Allow@Read"),
+	("CH-47", "g_read@club", CW_CRDT, WsCrdt(None), "Allow@Read"),
+	// Search.
+	("CH-48", "m_contributor@club", CW_POST, Search, "Present"),
+	("CH-49", "m_moderator@club", CW_POST, Search, "Absent"),
+	("CH-50", "stranger@club", OC_FILE, Search, "Absent"),
+	("CH-51", "m_contributor@club", OC_FILE, Search, "Present"),
+	("CH-52", "m_contributor@club", GONE_POST, Search, "Absent"),
+	("CH-53", "owner@club", GONE_POST, Search, "Present"),
+	// Porch.
+	("CH-54", "m_contributor@club", "", ChanPorch("open-contrib"), "in"),
+	("CH-55", "m_supporter@club", "", ChanPorch("open-contrib"), "needs:contributor"),
+	("CH-56", "stranger@club", "", ChanPorch("open-contrib"), "needs:contributor"),
+	("CH-57", "anon@club", "", ChanPorch("open-contrib"), "needs:contributor"),
+	("CH-58", "m_contributor@club", "", ChanPorch("mods"), "needs:moderator"),
+	("CH-59", "hatted@club", "", ChanPorch("open-contrib"), "in"),
+	("CH-60", "hatted@club", "", ChanPorch("mods"), "needs:moderator"),
+	("CH-61", "m_moderator@club", "", ChanPorch("closed-w"), "invitation-only"),
+	// Secret room: only the tenant and admins see it on the porch.
+	("CH-62", "m_contributor@club", "", ChanPorch("closed-w"), "Absent"),
+	("CH-63", "stranger@club", "", ChanPorch("closed-w"), "Absent"),
+	("CH-64", "hatted@club", "", ChanPorch("closed-w"), "Absent"),
+	("CH-65", "owner@club", "", ChanPorch("closed-w"), "in"),
+	("CH-66", "owner@club", "", ChanPorch("gone"), "Absent"),
+	// Admin: moderator+ and un-scoped; a hat mapped below moderator is refused.
+	("CH-67", "m_contributor@club", "", ChanCreate("zqm-contrib-new"), "Deny"),
+	("CH-68", "hatted@club", "", ChanCreate("zqm-hat-new"), "Deny"),
+	("CH-69", "anon@club", "", ChanCreate("zqm-anon-new"), "Deny"),
+	("CH-70", "m_moderator@club", "", ChanCreate("zqm-mod-new"), "Allow"),
+	("CH-71", "m_contributor@club", "", ChanPatch("zqm-scratch"), "Deny"),
+	("CH-72", "hatted@club", "", ChanPatch("zqm-scratch"), "Deny"),
+	("CH-73", "m_moderator@club", "", ChanPatch("zqm-scratch"), "Allow"),
+	("CH-74", "m_contributor@club", "", ChanMembers("closed-w"), "Deny"),
+	("CH-75", "hatted@club", "", ChanMembers("closed-w"), "Deny"),
+	("CH-76", "anon@club", "", ChanMembers("closed-w"), "Deny"),
+	("CH-77", "m_moderator@club", "", ChanMembers("closed-w"), "Allow"),
+	("CH-78", "m_contributor@club", "", ChanDelete("zqm-scratch"), "Deny"),
+	("CH-79", "hatted@club", "", ChanDelete("zqm-scratch"), "Deny"),
+	// Last Allow row: runs after CH-73's patch.
+	("CH-80", "m_leader@club", "", ChanDelete("zqm-scratch"), "Allow"),
+	// Upload into a room: enterable Allow, not enterable Deny, bad or foreign room 400.
+	("CH-81", "m_contributor@club", "", ChanUpload("@club.test~open-contrib"), "Allow"),
+	("CH-82", "m_contributor@club", "", ChanUpload("@club.test~closed-w"), "Allow"),
+	("CH-83", "m_contributor@club", "", ChanUpload("@club.test~mods"), "Deny"),
+	("CH-84", "m_moderator@club", "", ChanUpload("@club.test~closed-w"), "Deny"),
+	("CH-85", "hatted@club", "", ChanUpload("@club.test~closed-w"), "Deny"),
+	("CH-86", "m_contributor@club", "", ChanUpload("@alice.test~close-friends"), "400"),
+	("CH-87", "m_contributor@club", "", ChanUpload("@club.test~zqm-nope"), "400"),
+	("CH-88", "m_contributor@club", "", ChanUpload("@club.test~gone"), "400"),
+	("CH-89", "m_contributor@club", "", ChanUpload("open-contrib"), "400"),
+	// Credentials naming the tenant without being it are gated as guests, not as the tenant.
+	("CH-90", "idp-mgmt@alice", CF_POST, ActGet, "Deny"),
+	("CH-91", "idp-mgmt@alice", CF_POST, ActList, "Absent"),
+	("CH-92", "sharelink-r@club", CW_POST, ActGet, "Deny"),
+	("CH-93", "sharelink-r@club", CW_POST, ActList, "Absent"),
+];
+
+/// Blocked profile the partners layer seeds on club before [`PT`] runs.
+pub const PT_BLOCKED: &str = "zqm-blocked.test";
+
+/// Connected community the partners layer seeds on alice (a person): her membership.
+pub const PT_MEMBERSHIP: &str = "zqm-membership.test";
+
+/// Profile listing projection and partner lists on club (`connection_visibility.community` =
+/// `public`). club's one partner is `peer.test`. Leader tier (owner, `m_leader`) sees hidden
+/// statuses; members keep `roles`; others (incl. the derived-follower `m_follower`) see
+/// neither.
+pub const PT: &[Row] = &[
+	("PT-01", "owner@club", "", Profiles("status=B,X"), "Hidden"),
+	("PT-02", "m_leader@club", "", Profiles("status=B,X"), "Hidden"),
+	("PT-03", "m_contributor@club", "", Profiles("status=B,X"), "Roles"),
+	("PT-04", "m_follower@club", "", Profiles("status=B,X"), "Bare"),
+	("PT-05", "stranger@club", "", Profiles("status=B,X"), "Bare"),
+	("PT-06", "anon@club", "", Profiles("status=B,X"), "Deny"),
+	// A hat is a member.
+	("PT-07", "hatted@club", "", Profiles("status=B,X"), "Roles"),
+	("PT-08", "m_supporter@club", "", Profiles("status=B,X"), "Roles"),
+	("PT-10", "m_contributor@club", "", Partners, "Listed"),
+	("PT-11", "stranger@club", "", Partners, "Listed"),
+	("PT-12", "anon@club", "", Partners, "Listed"),
+	("PT-17", "hatted@club", "", Partners, "Listed"),
+	// A person's list is its memberships, at the default `connected` visibility.
+	("PT-13", "stranger@alice", "", Partners, "Empty"),
+	("PT-14", "anon@alice", "", Partners, "Empty"),
+	("PT-15", "owner@alice", "", Partners, PT_MEMBERSHIP),
+	("PT-38", "connected@alice", "", Partners, PT_MEMBERSHIP),
+	// Carry alice's id_tag without being alice: a guest.
+	("PT-19", "sharelink-r@alice", "", Partners, "Empty"),
+	("PT-09", "idp-mgmt@alice", "", Partners, "Empty"),
+	// PTNR is server-emitted only, whatever subtype rides in `type`.
+	("PT-16", "m_contributor@club", "", PtnrCreate, "Deny"),
+	("PT-18", "m_contributor@club", "", PtnrDelCreate, "Deny"),
+	("PT-47", "sharelink-w@alice", "", PtnrCreate, "Deny"),
+	("PT-48", "idp-mgmt@alice", "", PtnrCreate, "Deny"),
+	("PT-49", "idp-key@alice", "", PtnrDelCreate, "Deny"),
+	("PT-50", "owner@alice", "", PtnrCreate, "Deny"),
+	// Owner only: remote leader, scoped hat, scoped owner, anon refused.
+	("PT-20", "m_leader@club", "", PartnersMap, "Deny"),
+	("PT-21", "stranger@club", "", PartnersMap, "Deny"),
+	("PT-22", "hatted-scoped@club", "", PartnersMap, "Deny"),
+	("PT-23", "owner-scoped-r@alice", "", PartnersMap, "Deny"),
+	("PT-24", "anon@club", "", PartnersMap, "Deny"),
+	("PT-25", "owner@club", "", PartnersMap, "Allow"),
+	("PT-26", "idp-mgmt@alice", "", PartnersMap, "Deny"),
+	("PT-27", "sharelink-r@alice", "", PartnersMap, "Deny"),
+	("PT-30", "m_leader@club", "", PartnersSync, "Deny"),
+	("PT-31", "stranger@club", "", PartnersSync, "Deny"),
+	("PT-32", "hatted-scoped@club", "", PartnersSync, "Deny"),
+	("PT-33", "owner-scoped-r@alice", "", PartnersSync, "Deny"),
+	("PT-34", "anon@club", "", PartnersSync, "Deny"),
+	("PT-35", "owner@club", "", PartnersSync, "Allow"),
+	// idp-mgmt@alice: LV-91.
+	("PT-37", "sharelink-r@alice", "", PartnersSync, "Deny"),
+];
+
+/// [`PT`] partner rows re-run with club's `connection_visibility.community` = `supporter`:
+/// non-members get an empty list, members still see the partner.
+pub const PT_PRIVATE: &[Row] = &[
+	("PT-40", "stranger@club", "", Partners, "Empty"),
+	("PT-41", "anon@club", "", Partners, "Empty"),
+	("PT-42", "m_follower@club", "", Partners, "Empty"),
+	("PT-43", "m_contributor@club", "", Partners, "Listed"),
+	("PT-44", "owner@club", "", Partners, "Listed"),
+	// A hat is a member; `supporter` is the floor.
+	("PT-45", "hatted@club", "", Partners, "Listed"),
+	("PT-46", "m_supporter@club", "", Partners, "Listed"),
+];
+
+/// Pending connection request the list-visibility layer seeds on alice.
+pub const LV_PENDING: &str = "zqm-pending.test";
+/// Followed-only (not connected) community the list-visibility layer seeds on club.
+pub const LV_FOLLOWED: &str = "zqm-followed-comm.test";
+const COMM: &str = "/api/profiles?type=community";
+const COMM_UNCONN: &str = "/api/profiles?type=community&connected=false";
+const HATS: &[&str] = &["hats"];
+const ALICE_CONN: &str = "/api/profiles/connected.test";
+const CLUB_PEER: &str = "/api/profiles/peer.test";
+
+const CONN: &str = "/api/profiles?connected=true";
+const CONN_COMM: &str = "/api/profiles?type=community&connected=true";
+const CONN_PERSON: &str = "/api/profiles?type=person&connected=true";
+const CONN_REQ: &str = "/api/profiles?connected=R";
+const CONNECTED: &[&str] = &["connected"];
+const EVERY_STATUS: &str = "status=A,C,D,N,V,F";
+
+/// List visibility: relationship-revealing filters and fields, explicit action statuses,
+/// settings reads and an `idp_` management key. alice keeps the default
+/// `profile.connection_visibility` (`connected`); the layer sets club's `.person` override to
+/// `supporter` and `.community` to `public`, and seeds a membership and [`LV_PENDING`] on
+/// alice.
+pub const LV: &[Row] = &[
+	// alice's connections: her connections only.
+	("LV-01", "anon@alice", "", Ids(CONN), "Deny"),
+	("LV-02", "stranger@alice", "", Ids(CONN), "Empty"),
+	("LV-03", "follower@alice", "", Ids(CONN), "Empty"),
+	("LV-04", "connected@alice", "", Ids(CONN), "Listed"),
+	("LV-05", "owner@alice", "", Ids(CONN), "Listed"),
+	("LV-06", "stranger@alice", "", Ids(CONN_COMM), "Empty"),
+	("LV-07", "follower@alice", "", Ids(CONN_COMM), "Empty"),
+	("LV-08", "connected@alice", "", Ids(CONN_COMM), "Listed"),
+	("LV-09", "owner@alice", "", Ids(CONN_COMM), "Listed"),
+	("LV-10", "stranger@alice", "", Ids(CONN_REQ), "Empty"),
+	("LV-11", "follower@alice", "", Ids(CONN_REQ), "Empty"),
+	// Pending requests are the owner's inbox.
+	("LV-12", "connected@alice", "", Ids(CONN_REQ), "Empty"),
+	("LV-13", "owner@alice", "", Ids(CONN_REQ), "Listed"),
+	// Every listed profile is a contact: no filter is no bypass.
+	("LV-14", "stranger@alice", "", Ids("/api/profiles"), "Empty"),
+	("LV-15", "stranger@alice", "", Ids("/api/profiles?connected=false"), "Empty"),
+	// club: members from `supporter` (a hat counts), partner communities to everyone.
+	("LV-20", "anon@club", "", Ids(CONN_PERSON), "Deny"),
+	("LV-21", "stranger@club", "", Ids(CONN_PERSON), "Empty"),
+	("LV-22", "m_follower@club", "", Ids(CONN_PERSON), "Empty"),
+	("LV-23", "m_supporter@club", "", Ids(CONN_PERSON), "Listed"),
+	("LV-24", "hatted@club", "", Ids(CONN_PERSON), "Listed"),
+	("LV-25", "owner@club", "", Ids(CONN_PERSON), "Listed"),
+	("LV-26", "stranger@club", "", Ids(CONN_COMM), "Listed"),
+	("LV-27", "m_follower@club", "", Ids(CONN_COMM), "Listed"),
+	// No `type`: narrowed to the types the caller may see (here club's partner communities).
+	("LV-28", "stranger@club", "", Ids(CONN), "Listed"),
+	("LV-29", "m_follower@club", "", Ids(CONN), "Listed"),
+	("LV-30", "m_supporter@club", "", Ids(CONN), "Listed"),
+	("LV-31", "hatted@club", "", Ids(CONN), "Listed"),
+	("LV-32", "stranger@club", "", Ids("/api/profiles?type=person"), "Empty"),
+	("LV-33", "m_supporter@club", "", Ids("/api/profiles?type=person"), "Listed"),
+	// The `connected` field follows the same rule, per row type.
+	("LV-40", "stranger@alice", "", Fields("/api/profiles", CONNECTED), "Clean"),
+	("LV-41", "follower@alice", "", Fields("/api/profiles", CONNECTED), "Clean"),
+	("LV-42", "connected@alice", "", Fields("/api/profiles", CONNECTED), "Leak:connected"),
+	("LV-43", "owner@alice", "", Fields("/api/profiles", CONNECTED), "Leak:connected"),
+	("LV-44", "stranger@alice", "", Fields("/api/profiles/connected.test", CONNECTED), "Clean"),
+	(
+		"LV-45",
+		"owner@alice",
+		"",
+		Fields("/api/profiles/connected.test", CONNECTED),
+		"Leak:connected",
+	),
+	("LV-46", "stranger@club", "", Fields("/api/profiles?type=person", CONNECTED), "Clean"),
+	(
+		"LV-47",
+		"stranger@club",
+		"",
+		Fields("/api/profiles?type=community", CONNECTED),
+		"Leak:connected",
+	),
+	("LV-48", "m_follower@club", "", Fields("/api/profiles?type=person", CONNECTED), "Clean"),
+	// The single read projects like the list: relationship fields are the owner tier's.
+	(
+		"LV-49",
+		"stranger@alice",
+		"",
+		Fields("/api/profiles/connected.test", PROFILE_PRIVATE),
+		"Clean",
+	),
+	// A visible type lists its connections only: never followed or disconnected contacts.
+	("LV-50", "stranger@club", "", IdIn(COMM_UNCONN, LV_FOLLOWED), "Absent"),
+	("LV-51", "m_follower@club", "", IdIn(COMM_UNCONN, LV_FOLLOWED), "Absent"),
+	("LV-52", "stranger@club", "", IdIn(COMM, LV_FOLLOWED), "Absent"),
+	("LV-53", "m_follower@club", "", IdIn(COMM, LV_FOLLOWED), "Absent"),
+	("LV-54", "owner@club", "", IdIn(COMM_UNCONN, LV_FOLLOWED), "Present"),
+	// `hats` is the tenant account's alone, not the full (leader) tier's.
+	("LV-55", "owner@alice", "", Fields(ALICE_CONN, HATS), "Leak:hats"),
+	("LV-56", "stranger@alice", "", Fields(ALICE_CONN, HATS), "Clean"),
+	("LV-57", "follower@alice", "", Fields(ALICE_CONN, HATS), "Clean"),
+	("LV-58", "sharelink-r@alice", "", Fields(ALICE_CONN, HATS), "Deny"),
+	("LV-59", "idp-mgmt@alice", "", Fields(ALICE_CONN, HATS), "Clean"),
+	("LV-160", "owner@club", "", Fields(CLUB_PEER, HATS), "Leak:hats"),
+	("LV-161", "m_leader@club", "", Fields(CLUB_PEER, HATS), "Clean"),
+	("LV-162", "m_moderator@club", "", Fields(CLUB_PEER, HATS), "Clean"),
+	("LV-163", "stranger@alice", "", HatsPatch("connected.test"), "Deny"),
+	("LV-164", "sharelink-w@alice", "", HatsPatch("connected.test"), "Deny"),
+	("LV-165", "idp-mgmt@alice", "", HatsPatch("connected.test"), "Deny"),
+	("LV-166", "m_contributor@club", "", HatsPatch("peer.test"), "Deny"),
+	("LV-167", "m_leader@club", "", HatsPatch("peer.test"), "Deny"),
+	("LV-168", "owner@alice", "", HatsPatch("connected.test"), "Allow"),
+	("LV-169", "owner@club", "", HatsPatch("peer.test"), "Allow"),
+	// The list carries `hats` too, for the tenant account alone.
+	("LV-170", "owner@alice", "", Fields("/api/profiles", HATS), "Leak:hats"),
+	("LV-171", "connected@alice", "", Fields("/api/profiles", HATS), "Clean"),
+	("LV-172", "idp-mgmt@alice", "", Fields("/api/profiles", HATS), "Clean"),
+	("LV-173", "sharelink-r@alice", "", Fields("/api/profiles", HATS), "Deny"),
+	("LV-174", "owner@club", "", Fields(COMM, HATS), "Leak:hats"),
+	("LV-175", "m_leader@club", "", Fields(COMM, HATS), "Clean"),
+	// Explicit `status=` never widens the list: deleted / verifying / failed rows stay out,
+	// pending moderation (`C`) is the tenant's and its leaders'.
+	("LV-60", "anon@alice", "post-p-tenant-deleted@alice", ActListQ("status=D"), "Absent"),
+	("LV-61", "stranger@alice", "post-p-tenant-deleted@alice", ActListQ("status=D"), "Absent"),
+	("LV-62", "anon@alice", "post-p-tenant-deleted@alice", ActListQ("status=D,V,F"), "Absent"),
+	("LV-63", "anon@alice", "post-p-tenant-pending@alice", ActListQ("status=C"), "Absent"),
+	("LV-64", "stranger@alice", "post-p-tenant-pending@alice", ActListQ("status=C"), "Absent"),
+	("LV-65", "anon@alice", "post-p-tenant-deleted@alice", ActListQ(EVERY_STATUS), "Absent"),
+	("LV-66", "stranger@alice", "post-p-tenant-pending@alice", ActListQ(EVERY_STATUS), "Absent"),
+	("LV-67", "anon@alice", "post-p-tenant-dismissed@alice", ActListQ("status=N"), "Present"),
+	("LV-68", "anon@alice", "post-p-tenant-active@alice", ActListQ(EVERY_STATUS), "Present"),
+	("LV-69", "owner@alice", "post-p-tenant-deleted@alice", ActListQ("status=D"), "Absent"),
+	("LV-70", "owner@alice", "post-p-tenant-deleted@alice", ActListQ(EVERY_STATUS), "Absent"),
+	("LV-71", "owner@alice", "post-p-tenant-pending@alice", ActListQ("status=C"), "Present"),
+	("LV-72", "owner@alice", "post-p-tenant-dismissed@alice", ActListQ("status=N"), "Present"),
+	("LV-73", "owner@alice", "post-p-tenant-active@alice", ActListQ("status=A"), "Present"),
+	("LV-74", "m_leader@club", "post-p-tenant-pending@club", ActListQ("status=C"), "Present"),
+	("LV-75", "m_contributor@club", "post-p-tenant-pending@club", ActListQ("status=C"), "Absent"),
+	// Settings are read with the standing that writes them.
+	("LV-80", "stranger@alice", "", Get("/api/settings"), "Deny"),
+	("LV-81", "follower@alice", "", Get("/api/settings?prefix=profile"), "Deny"),
+	("LV-82", "connected@alice", "", Get("/api/settings/profile.connection_visibility"), "Deny"),
+	("LV-83", "m_contributor@club", "", Get("/api/settings?prefix=profile"), "Deny"),
+	("LV-84", "hatted@club", "", Get("/api/settings?prefix=profile"), "Deny"),
+	("LV-85", "owner@alice", "", Get("/api/settings"), "Allow"),
+	("LV-86", "owner@alice", "", Get("/api/settings/profile.connection_visibility"), "Allow"),
+	("LV-87", "m_leader@club", "", Get("/api/settings?prefix=profile"), "Allow"),
+	// An `idp_` management key names the account but is not it.
+	("LV-90", "idp-mgmt@alice", "", PartnersMap, "Deny"),
+	("LV-91", "idp-mgmt@alice", "", PartnersSync, "Deny"),
+	("LV-92", "idp-mgmt@alice", "", Get("/api/settings"), "Deny"),
+	("LV-93", "idp-mgmt@alice", "", Ids(CONN), "Empty"),
+	("LV-94", "idp-mgmt@alice", "", Fields("/api/profiles", CONNECTED), "Clean"),
+	("LV-95", "idp-mgmt@alice", "tenant-blob-d-active@alice", FileList, "Absent"),
+	("LV-96", "idp-mgmt@alice", "post-d-tenant-active@alice", ActList, "Absent"),
+	("LV-97", "idp-mgmt@alice", "post-p-tenant-pending@alice", ActListQ("status=C"), "Absent"),
+];
+
+/// [`LV`] boundary rows re-run with alice's `connection_visibility.community` = `verified`:
+/// an `idp_` key naming alice is an anonymous guest, not an authenticated caller.
+pub const LV_VERIFIED: &[Row] = &[
+	("LV-100", "stranger@alice", "", Ids(CONN_COMM), "Listed"),
+	("LV-101", "idp-mgmt@alice", "", Ids(CONN_COMM), "Empty"),
 ];
 
 /// Oracle-judged curated cells: `(id, subject, object, op)`, no literal expectation — the
@@ -565,6 +975,39 @@ fn request(s: &Subject, route: Route, tgt: &Tgt) -> Request<Body> {
 		(Subscribe, _) => {
 			raw(Method::PUT, &format!("/api/actions/{key}/subscribe"), j(json!({ "level": "W" })))
 		}
+		(ChanCreate(name), _) => raw(Method::POST, "/api/channels", j(json!({ "name": name }))),
+		(ChanPatch(name), _) => {
+			raw(Method::PATCH, &format!("/api/channels/{name}"), j(json!({ "title": MARK })))
+		}
+		(ChanDelete(name), _) => {
+			raw(Method::DELETE, &format!("/api/channels/{name}"), Body::empty())
+		}
+		(ChanMembers(name), _) => {
+			raw(Method::GET, &format!("/api/channels/{name}/members"), Body::empty())
+		}
+		(ChanUpload(ch), _) => {
+			let body = json!({
+				"fileTp": "CRDT",
+				"contentType": "cloudillo/quillo",
+				"fileName": "zqm-chan",
+				"channel": ch,
+			});
+			raw(Method::POST, "/api/files", j(body))
+		}
+		(PartnersMap, _) => raw(Method::GET, "/api/partners/map", Body::empty()),
+		(HatsPatch(id_tag), _) => {
+			let body = j(json!({ "hats": ["zqm-hat.test"] }));
+			raw(Method::PATCH, &format!("/api/profiles/{id_tag}"), body)
+		}
+		(Get(uri), _) => raw(Method::GET, uri, Body::empty()),
+		(PartnersSync, _) => raw(Method::POST, "/api/partners/sync", Body::empty()),
+		(PtnrCreate, _) => {
+			raw(Method::POST, "/api/actions", j(json!({ "type": "PTNR", "subject": "@peer.test" })))
+		}
+		(PtnrDelCreate, _) => {
+			let body = json!({ "type": "PTNR:DEL", "subject": "@peer.test" });
+			raw(Method::POST, "/api/actions", j(body))
+		}
 		(_, Tgt::Obj(o)) => route.op().expect("route has an op").request(s, o),
 		(WsCrdt(None), Tgt::Raw(_)) => raw(Method::GET, &format!("/ws/crdt/{key}"), Body::empty()),
 		(WsRtdb(None), Tgt::Raw(_)) => raw(Method::GET, &format!("/ws/rtdb/{key}"), Body::empty()),
@@ -586,7 +1029,14 @@ async fn observe(fx: &Fixture, s: &Subject, route: Route, tgt: &Tgt<'_>) -> Obse
 		return (a, l, status.as_u16());
 	}
 	let op = route.op().expect("listing route has an op");
-	let rows = list_presence(fx, s, op).await;
+	let rows = match route {
+		ChanFeed(room) => {
+			let path = format!("/api/actions?channel=@{}~{room}&", s.host);
+			list_paged(fx, s, &path, "actionId").await
+		}
+		ActListQ(q) => list_paged(fx, s, &format!("/api/actions?{q}&"), "actionId").await,
+		_ => list_presence(fx, s, op).await,
+	};
 	let Tgt::Obj(o) = tgt else {
 		// No object: the listing itself is the cell.
 		return (rows.err().unwrap_or(Actual::Allow), None, 0);
@@ -630,6 +1080,127 @@ fn render(want: &str, (a, level, status): Observed) -> Result<String, String> {
 	})
 }
 
+/// Porch `status` of `room` on `s.host`'s `GET /api/channels`; `Absent` when unlisted.
+async fn porch(fx: &Fixture, s: &Subject, room: &str) -> Result<String, String> {
+	let r = req(&s.host, Method::GET, "/api/channels", bearer(s), Body::empty());
+	let (status, body) = call(&fx.api, r).await;
+	match status_class(status) {
+		Actual::Allow => {}
+		Actual::HarnessError(e) => return Err(e),
+		a => return Ok(format!("{a:?}")),
+	}
+	let entry = body["data"].as_array().and_then(|a| a.iter().find(|e| e["name"] == room));
+	Ok(entry.and_then(|e| e["status"].as_str()).unwrap_or("Absent").to_owned())
+}
+
+/// `data` of a GET on `s.host` as rows (a single object is one row, `null` none);
+/// `Err(Ok(outcome))` when refused.
+async fn get_data(
+	fx: &Fixture,
+	s: &Subject,
+	uri: &str,
+) -> Result<Vec<Value>, Result<String, String>> {
+	let r = req(&s.host, Method::GET, uri, bearer(s), Body::empty());
+	let (status, body) = call(&fx.api, r).await;
+	match status_class(status) {
+		Actual::Allow => {}
+		Actual::HarnessError(e) => return Err(Err(e)),
+		a => return Err(Ok(format!("{a:?}"))),
+	}
+	match &body["data"] {
+		Value::Array(a) => Ok(a.clone()),
+		Value::Null => Ok(Vec::new()),
+		o @ Value::Object(_) => Ok(vec![o.clone()]),
+		_ => Err(Err(format!("no data rows: {body}"))),
+	}
+}
+
+/// Relationship fields a non-leader never sees on `/api/profiles` rows.
+const PROFILE_PRIVATE: &[&str] = &[
+	"status",
+	"trust",
+	"following",
+	"follower",
+	"feedReadAt",
+	"msgReadAt",
+	"hatRoles",
+	"peerHatRoles",
+	"hiddenInHome",
+];
+
+/// `/api/profiles` projection: `Hidden` = a Blocked/Banned row listed; `Leak` = a
+/// [`PROFILE_PRIVATE`] field set; `Roles` = only roles shown; `Bare` = neither.
+async fn profiles(fx: &Fixture, s: &Subject, query: &str) -> Result<String, String> {
+	let rows = match get_data(fx, s, &format!("/api/profiles?{query}")).await {
+		Ok(rows) => rows,
+		Err(r) => return r,
+	};
+	let set = |r: &Value, k: &str| !r[k].is_null();
+	let hidden = |r: &Value| matches!(r["status"].as_str(), Some("B" | "X"));
+	let leak = |r: &Value| PROFILE_PRIVATE.iter().any(|k| set(r, k));
+	Ok(if rows.iter().any(hidden) {
+		"Hidden"
+	} else if rows.iter().any(leak) {
+		"Leak"
+	} else if rows.iter().any(|r| set(r, "roles")) {
+		"Roles"
+	} else {
+		"Bare"
+	}
+	.into())
+}
+
+/// Sorted `idTag`s of the rows at `uri`.
+async fn id_tags(
+	fx: &Fixture,
+	s: &Subject,
+	uri: &str,
+) -> Result<Vec<String>, Result<String, String>> {
+	let rows = get_data(fx, s, uri).await?;
+	let mut tags: Vec<String> =
+		rows.iter().filter_map(|r| r["idTag"].as_str().map(str::to_owned)).collect();
+	tags.sort();
+	Ok(tags)
+}
+
+/// `Empty` or `Listed`: other layers add rows to the shared tenants, so membership is not exact.
+async fn ids(fx: &Fixture, s: &Subject, uri: &str) -> Result<String, String> {
+	match id_tags(fx, s, uri).await {
+		Ok(t) => Ok(if t.is_empty() { "Empty" } else { "Listed" }.into()),
+		Err(r) => r,
+	}
+}
+
+/// `Clean`, or `Leak:{field}` for the first of `forbidden` set on any row at `uri`.
+async fn fields(
+	fx: &Fixture,
+	s: &Subject,
+	uri: &str,
+	forbidden: &[&str],
+) -> Result<String, String> {
+	let rows = match get_data(fx, s, uri).await {
+		Ok(rows) => rows,
+		Err(r) => return r,
+	};
+	Ok(forbidden
+		.iter()
+		.find(|k| rows.iter().any(|r| !r[**k].is_null()))
+		.map_or_else(|| "Clean".into(), |k| format!("Leak:{k}")))
+}
+
+/// `/api/partners`: `Listed` = exactly club's partner `peer.test`, `Empty`, else the idTags.
+async fn partners(fx: &Fixture, s: &Subject) -> Result<String, String> {
+	let tags = match id_tags(fx, s, "/api/partners").await {
+		Ok(t) => t,
+		Err(r) => return r,
+	};
+	Ok(match tags.as_slice() {
+		[] => "Empty".into(),
+		[p] if p == "peer.test" => "Listed".into(),
+		t => t.join(","),
+	})
+}
+
 /// Runs `cells` serially: refusals before allows, so an Allow row's mutation (accept,
 /// delete) never precedes a Deny row on the same object.
 pub async fn run(fx: &Fixture, layer: &'static str, mut cells: Vec<Cell>) -> Report {
@@ -640,7 +1211,22 @@ pub async fn run(fx: &Fixture, layer: &'static str, mut cells: Vec<Cell>) -> Rep
 		match (subject(fx, c.subject), target(fx, c.object)) {
 			(Some(s), Some(tgt)) => {
 				let want = c.want.trim_end_matches('*');
-				match render(c.want, observe(fx, s, c.route, &tgt).await) {
+				let got = match c.route {
+					ChanPorch(room) => porch(fx, s, room).await,
+					Profiles(q) => profiles(fx, s, q).await,
+					Partners => partners(fx, s).await,
+					Ids(uri) => ids(fx, s, uri).await,
+					IdIn(uri, id_tag) => match id_tags(fx, s, uri).await {
+						Ok(t) => {
+							Ok(if t.iter().any(|t| t == id_tag) { "Present" } else { "Absent" }
+								.into())
+						}
+						Err(r) => r,
+					},
+					Fields(uri, f) => fields(fx, s, uri, f).await,
+					r => render(c.want, observe(fx, s, r, &tgt).await),
+				};
+				match got {
 					Ok(actual) if actual == want => {}
 					Ok(actual) => rep.add(Mismatch {
 						op: c.op,

@@ -23,7 +23,8 @@ use futures::stream::{self, StreamExt};
 use crate::fixture::{ALICE, CLUB, Fixture, call};
 use crate::objects::{ActionShape, FileKind, FileLife, FileShape, Obj, is_level};
 use crate::ops::{
-	ActionOp, Actual, FileOp, Op, classify_obj, count_actions, list_presence, obj_host, obj_key,
+	ActionOp, Actual, FileOp, Op, classify_obj, count_actions, list_paged, list_presence, obj_host,
+	obj_key,
 };
 use crate::oracle::{Outcome, expected, listing};
 use crate::report::{Mismatch, Report};
@@ -278,10 +279,28 @@ pub async fn action_levels(fx: &Fixture) -> Report {
 	for (s, op, rows) in run_lists(fx, &subs, ACTION_LISTS).await {
 		if op == Op::Action(ActionOp::List) {
 			check_count(&mut rep, s, &rows, &counts[s.name.as_str()]);
+			check_narrows(fx, &mut rep, s, &rows).await;
 		}
 		join_listing(&mut rep, op, s, rows, &level_objs(fx, &s.host, false));
 	}
 	rep
+}
+
+/// A filter narrows a list, never widens it: `status=` naming every status lists no row the
+/// plain list hides.
+async fn check_narrows(fx: &Fixture, rep: &mut Report, s: &Subject, plain: &Rows) {
+	let wide = list_paged(fx, s, "/api/actions?status=A,C,D,N,V,F&", "actionId").await;
+	let (Ok(plain), Ok(wide)) = (plain, wide) else { return };
+	for key in wide.keys().filter(|k| !plain.contains_key(*k)) {
+		rep.add(Mismatch {
+			op: Op::Action(ActionOp::List).name(),
+			rule: "list.narrows",
+			expected: "Absent".into(),
+			actual: "Present".into(),
+			subject: s.name.clone(),
+			object: key.clone(),
+		});
+	}
 }
 
 /// `count=true` must equal the default list's length, and be refused exactly when it is.

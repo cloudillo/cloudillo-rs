@@ -8,8 +8,8 @@ use sqlx::{Row, SqlitePool};
 use crate::utils::{Db, escape_like, inspect, parse_str_list, push_in};
 use cloudillo_types::meta_adapter::{
 	Action, ActionData, ActionId, ActionView, AttachmentView, AudienceType, FinalizeActionOptions,
-	ListActionOptions, ProfileInfo, ProfileRelation, ProfileStatus, ProfileType,
-	UpdateActionDataOptions,
+	HIDDEN_ACTION_STATUSES, ListActionOptions, ProfileInfo, ProfileRelation, ProfileStatus,
+	ProfileType, UpdateActionDataOptions,
 };
 use cloudillo_types::prelude::*;
 use cloudillo_types::utils::normalize_id_tag;
@@ -69,10 +69,8 @@ fn push_action_filters(
 		query.push(" AND coalesce(a.status, 'A') IN ");
 		query = push_in(query, status);
 	} else {
-		// Default: hide deleted ('D'), inbound-verifying ('V', attachments not yet
-		// synced — surfacing would leak half-synced posts), and permanently-failed
-		// ('F', verifier exhausted retries) rows.
-		query.push(" AND coalesce(a.status, 'A') NOT IN ('D', 'V', 'F')");
+		query.push(" AND coalesce(a.status, 'A') NOT IN ");
+		query = push_in(query, &HIDDEN_ACTION_STATUSES);
 	}
 	// Drafts ('R') and scheduled ('S') rows are private to their issuer, whether
 	// the status was asked for explicitly or not. No viewer → never visible.
@@ -1390,6 +1388,9 @@ pub(crate) async fn update_data(
 	if !opts.stat_at.is_undefined() {
 		set_clauses.push("stat_at = ?");
 	}
+	if !opts.channel.is_undefined() {
+		set_clauses.push("channel = ?");
+	}
 
 	if set_clauses.is_empty() {
 		return Ok(()); // Nothing to update
@@ -1529,6 +1530,14 @@ pub(crate) async fn update_data(
 		let val: Option<i64> = match &opts.stat_at {
 			Patch::Null => None,
 			Patch::Value(ts) => Some(ts.0),
+			Patch::Undefined => unreachable!(),
+		};
+		query = query.bind(val);
+	}
+	if !opts.channel.is_undefined() {
+		let val: Option<&str> = match &opts.channel {
+			Patch::Null => None,
+			Patch::Value(v) => Some(v.as_str()),
 			Patch::Undefined => unreachable!(),
 		};
 		query = query.bind(val);

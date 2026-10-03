@@ -87,6 +87,8 @@ pub struct InboxCell {
 	pub hat: bool,
 	/// APRV whose bundled subject claims `aud = issuer` but is not validly signed by its `iss`.
 	pub forged: bool,
+	/// Token `ch` (absolute `@tenant~room`); `None` = no room.
+	pub ch: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -200,14 +202,15 @@ pub fn all_ops() -> Vec<Op> {
 		for &rel in rels {
 			for (typ, need) in INBOX_TYPES {
 				for target in need.map_or(vec![true, false], |b| vec![b]) {
-					let c = InboxCell { host, typ, rel, target, hat: false, forged: false };
+					let c =
+						InboxCell { host, typ, rel, target, hat: false, forged: false, ch: None };
 					ops.push(Op::Inbox(c));
 				}
 			}
 		}
 	}
 	let aprv = |host, rel, target, hat, forged| {
-		Op::Inbox(InboxCell { host, typ: "APRV", rel, target, hat, forged })
+		Op::Inbox(InboxCell { host, typ: "APRV", rel, target, hat, forged, ch: None })
 	};
 	for rel in [Relation::PeerHat, Relation::None] {
 		ops.push(aprv(CLUB, rel, true, true, false));
@@ -260,13 +263,14 @@ impl Op {
 			Op::Ws(k, a) => format!("Ws({},{})", ws_kind(*k), a.unwrap_or("-")),
 			Op::Mint => "Mint".into(),
 			Op::Inbox(c) => format!(
-				"Inbox({},{},{:?},{}{}{})",
+				"Inbox({},{},{:?},{}{}{}{})",
 				c.host,
 				c.typ,
 				c.rel,
 				if c.target { "target" } else { "bare" },
 				if c.hat { ",hat" } else { "" },
-				if c.forged { ",forged" } else { "" }
+				if c.forged { ",forged" } else { "" },
+				c.ch.map_or(String::new(), |ch| format!(",ch={ch}"))
 			),
 			Op::Probe(m, p) => format!("Probe({m} {p})"),
 		}
@@ -518,31 +522,15 @@ pub async fn list_presence(
 				Op::File(_) => ("/api/files?".to_owned(), "fileId"),
 				_ => ("/api/actions?".to_owned(), "actionId"),
 			};
-			let mut cursor: Option<String> = None;
-			loop {
-				let c = cursor.as_ref().map_or(String::new(), |c| format!("&cursor={c}"));
-				let body = match get(fx, s, &format!("{path}limit={PAGE}{c}")).await {
-					// A refused status filter lists nothing.
-					Err(Actual::HarnessError(e))
-						if e == "400" && matches!(op, Op::File(FileOp::ByStatus(_))) =>
-					{
-						break;
-					}
-					r => r?,
-				};
-				for row in rows(&body) {
-					if let Some(id) = row.get(id_key).and_then(Value::as_str) {
-						out.insert(id.to_owned(), level_of_row(row));
-					}
+			return match list_paged(fx, s, &path, id_key).await {
+				// A refused status filter lists nothing.
+				Err(Actual::HarnessError(e))
+					if e == "400" && matches!(op, Op::File(FileOp::ByStatus(_))) =>
+				{
+					Ok(out)
 				}
-				cursor = body
-					.pointer("/cursorPagination/nextCursor")
-					.and_then(Value::as_str)
-					.map(str::to_owned);
-				if cursor.is_none() {
-					break;
-				}
-			}
+				r => r,
+			};
 		}
 		Op::Search => {
 			let mut offset = 0;
@@ -581,6 +569,34 @@ pub async fn list_presence(
 		_ => panic!("{} is not a listing op", op.name()),
 	}
 	Ok(out)
+}
+
+/// Every row of the cursor-paged listing at `path` (ending in `?` or `&`), keyed by `id_key`;
+/// value = the row's own `accessLevel`.
+pub async fn list_paged(
+	fx: &Fixture,
+	s: &Subject,
+	path: &str,
+	id_key: &str,
+) -> Result<HashMap<String, Option<AccessLevel>>, Actual> {
+	let mut out = HashMap::new();
+	let mut cursor: Option<String> = None;
+	loop {
+		let c = cursor.as_ref().map_or(String::new(), |c| format!("&cursor={c}"));
+		let body = get(fx, s, &format!("{path}limit={PAGE}{c}")).await?;
+		for row in rows(&body) {
+			if let Some(id) = row.get(id_key).and_then(Value::as_str) {
+				out.insert(id.to_owned(), level_of_row(row));
+			}
+		}
+		cursor = body
+			.pointer("/cursorPagination/nextCursor")
+			.and_then(Value::as_str)
+			.map(str::to_owned);
+		if cursor.is_none() {
+			return Ok(out);
+		}
+	}
 }
 
 /// A list row's own `accessLevel` (not a nested one).
@@ -634,12 +650,12 @@ fn hat_post(fx: &Fixture, host: &str) -> String {
 		.expect("seeded hat-relayed action")
 }
 
-fn action_hash(token: &str) -> String {
+pub fn action_hash(token: &str) -> String {
 	cloudillo::hasher::hash("a", token.as_bytes()).to_string()
 }
 
 /// Polls (≤ 3 s) for the background related-token pass to admit `action_id` (status `A`).
-async fn admitted(fx: &Fixture, tn: TnId, action_id: &str) -> Actual {
+pub async fn admitted(fx: &Fixture, tn: TnId, action_id: &str) -> Actual {
 	for _ in 0..30 {
 		if let Ok(Some(a)) = fx.app.meta_adapter.get_action(tn, action_id).await
 			&& a.status.as_deref() == Some("A")
@@ -725,6 +741,7 @@ impl InboxCell {
 			k: issuer.key_id.as_str().into(),
 			t: self.typ.into(),
 			iat: Timestamp::now(),
+			ch: self.ch.map(Into::into),
 			..Default::default()
 		};
 		let aud = Some(host.into());

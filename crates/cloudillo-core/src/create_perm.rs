@@ -66,6 +66,9 @@ async fn check_create_permission(
 			resource_type = resource_type,
 			action = action,
 			roles = ?auth_ctx.roles,
+			hat = ?auth_ctx.hat,
+			scope = ?auth_ctx.scope,
+			exp = ?auth_ctx.exp,
 			"CREATE permission denied: requires at least 'contributor' role"
 		);
 		return Err(Error::PermissionDenied);

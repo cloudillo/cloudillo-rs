@@ -96,8 +96,8 @@ use cloudillo_core::{
 use cloudillo_types::{
 	auth_adapter::AuthCtx,
 	meta_adapter::{
-		ProfileType, SEARCH_MAX_CONTENT_TYPES, SEARCH_MAX_LIMIT, SEARCH_MAX_OFFSET,
-		SEARCH_MAX_TAGS, SearchMatch, SearchOptions, SearchRow,
+		ProfileRelation, ProfileType, SEARCH_MAX_CONTENT_TYPES, SEARCH_MAX_LIMIT,
+		SEARCH_MAX_OFFSET, SEARCH_MAX_TAGS, SearchMatch, SearchOptions, SearchRow,
 	},
 	types::{AccessLevel, ApiResponse, TokenScope, serialize_timestamp_iso},
 };
@@ -234,6 +234,7 @@ pub async fn get_search(
 		// from this flag, which must not be used for authorization.
 		anonymous: true,
 		hat: None,
+		exp: None,
 	});
 	if q.q.chars().count() > MAX_QUERY_CHARS {
 		return Err(Error::ValidationError("Search query too long".into()));
@@ -264,23 +265,16 @@ pub async fn get_search(
 	let subject = auth.id_tag.as_ref();
 	// `follower` ("they follow us"), not `following` ("we follow them").
 	let rel = abac::subject_relation_to_tenant(&app, tn_id, subject).await?;
-	let level = subject_level(
-		auth.scope.as_deref(),
-		subject,
-		tenant_id_tag.as_ref(),
-		rel.connected,
-		rel.follower,
-	);
+	// A share-link guest or `idp_` key resolves to the tenant's own id_tag without being it.
+	let anonymous_share = abac::names_tenant_without_being_it(&auth, &tenant_id_tag);
+	let level = subject_level(&auth, &tenant_id_tag, rel);
 	opts.visible_levels = level.visible_levels().map(<[char]>::to_vec);
-	// Same test `subject_level` uses, so the two can never disagree: a share-link
-	// guest resolves to the tenant's own id_tag, and handing that to the adapter
-	// as the viewer would match every row the tenant owns. `None` is an
+	// Same flag `subject_level` uses, so the two can never disagree: handing the tenant's own
+	// id_tag to the adapter as the viewer would match every row the tenant owns. `None` is an
 	// unidentified viewer.
-	let anonymous_share =
-		is_anonymous_share(auth.scope.as_deref(), subject, tenant_id_tag.as_ref());
 	opts.viewer_id_tag = (!anonymous_share).then(|| subject.to_owned());
 	// Identity grants (roles, shares) never reach a scoped token: scope = guest + grant.
-	if auth.scope.is_none() && !subject.is_empty() && subject != "guest" {
+	if auth.scope.is_none() && !anonymous_share && !subject.is_empty() && subject != "guest" {
 		opts.role_grant = file_access::role_access_level(&auth.roles[..]) > AccessLevel::None;
 		opts.share_subject = Some(subject.to_owned());
 		// Same leader override `abac` grants a single action GET.
@@ -398,22 +392,6 @@ fn total_from_page(offset: u32, len: usize, limit: u32) -> Option<i64> {
 		.then(|| i64::try_from(len).unwrap_or(i64::MAX))
 }
 
-/// Is this caller a scoped token holder who identifies nobody the handler can
-/// tell apart from the tenant?
-///
-/// A share-link token is minted with `sub: None`, so token validation resolves
-/// its `id_tag` to `iss` — the tenant itself. Everything that would otherwise
-/// hand such a caller the tenant's own privileges must test for it the same way:
-/// [`subject_level`] for the visibility level, and the `viewer_id_tag` assignment
-/// in [`get_search`]. A viewer tag makes the caller *identified* to the adapter —
-/// admitting every `'P'` profile row and feeding the issuer-keyed action
-/// predicate — so passing the tenant's own tag would hand an anonymous link
-/// holder the tenant's contact graph. What such a caller may see comes from
-/// [`SearchOptions::scope_grant_file_id`] alone.
-fn is_anonymous_share(scope: Option<&str>, subject: &str, tenant_id_tag: &str) -> bool {
-	scope.is_some() && subject == tenant_id_tag
-}
-
 /// Which visibility levels a caller may see.
 ///
 /// Pure, so the rule is testable without an `App`, and because getting it wrong
@@ -436,18 +414,17 @@ fn is_anonymous_share(scope: Option<&str>, subject: &str, tenant_id_tag: &str) -
 /// whoever's session minted it. The observable consequence — not a bug — is that
 /// the tenant owner searching from inside their own app iframe sees only
 /// `visibility='P'` rows outside the `scope_grant_file_id` exemption.
-fn subject_level(
-	scope: Option<&str>,
-	subject: &str,
-	tenant_id_tag: &str,
-	connected: bool,
-	following: bool,
-) -> SubjectAccessLevel {
-	if is_anonymous_share(scope, subject, tenant_id_tag) {
+///
+/// The anonymous test is `abac::names_tenant_without_being_it` (share link, `idp_` key), the
+/// owner test `abac::is_tenant_self`.
+fn subject_level(auth: &AuthCtx, tenant_id_tag: &str, rel: ProfileRelation) -> SubjectAccessLevel {
+	if abac::names_tenant_without_being_it(auth, tenant_id_tag) {
 		return SubjectAccessLevel::Public;
 	}
+	let subject = auth.id_tag.as_ref();
 	let is_real_auth = !subject.is_empty() && subject != "guest";
-	relationship_level(subject == tenant_id_tag, connected, following, is_real_auth)
+	let is_self = abac::is_tenant_self(auth, tenant_id_tag);
+	relationship_level(is_self, rel.connected, rel.follower, is_real_auth)
 }
 
 /// Look up the deep-link query param of every content type on this page.
@@ -759,49 +736,34 @@ mod tests {
 		assert_eq!(scope_obj_tp(Some(vec![])), Vec::<char>::new());
 	}
 
+	fn ctx(id_tag: &str, scope: Option<&str>, roles: &[&str]) -> AuthCtx {
+		AuthCtx {
+			tn_id: TnId(1),
+			id_tag: id_tag.into(),
+			roles: roles.iter().map(|r| (*r).into()).collect(),
+			scope: scope.map(Into::into),
+			anonymous: false,
+			hat: None,
+			exp: None,
+		}
+	}
+
 	/// A share-link token resolves its `id_tag` to the tenant's own, so testing
 	/// the subject alone would derive `Owner` for every share-link guest. The
-	/// scope is what tells the two apart.
+	/// scope is what tells the two apart; an `idp_` key is told apart by its roles.
 	#[test]
 	fn a_scoped_token_is_never_the_owner() {
 		let tenant = "alice.example.com";
-		assert_eq!(
-			subject_level(Some("file:f1~x:R"), tenant, tenant, false, false),
-			SubjectAccessLevel::Public
-		);
-		assert_eq!(subject_level(None, tenant, tenant, false, false), SubjectAccessLevel::Owner);
-	}
-
-	/// Getting this wrong pushes `OR d.upstream_tag = '<tenant>'` into the adapter's
-	/// visibility predicate and hands an anonymous link holder owner-equivalent
-	/// visibility on every row carrying the tenant's tag.
-	#[test]
-	fn an_anonymous_share_is_not_handed_the_tenants_own_tag() {
-		let tenant = "alice.example.com";
-		// A scoped token naming nobody resolves its subject to the tenant.
-		assert!(is_anonymous_share(Some("file:f1~x:R"), tenant, tenant));
+		let level = |a: &AuthCtx| subject_level(a, tenant, ProfileRelation::default());
+		let share = ctx(tenant, Some("file:f1~x:R"), &["leader"]);
+		assert_eq!(level(&share), SubjectAccessLevel::Public);
+		assert_eq!(level(&ctx(tenant, None, &["leader"])), SubjectAccessLevel::Owner);
+		// Naming the tenant without being its account (an `idp_` key) is an anonymous guest.
+		assert_eq!(level(&ctx(tenant, None, &[])), SubjectAccessLevel::Public);
 		// A logged-in user holding a file-scoped credential is still themselves.
-		assert!(!is_anonymous_share(Some("file:f1~x:R"), "bob.example.com", tenant));
-		// An unscoped call by the tenant is the real owner.
-		assert!(!is_anonymous_share(None, tenant, tenant));
-		assert!(!is_anonymous_share(None, "bob.example.com", tenant));
-	}
-
-	/// The two derivations agree by construction: whenever `is_anonymous_share`
-	/// holds, `subject_level` drops to `Public` and the caller gets no viewer tag.
-	#[test]
-	fn the_anonymity_test_and_the_visibility_level_agree() {
-		let tenant = "alice.example.com";
-		for scope in [None, Some("file:f1~x:R")] {
-			for subject in [tenant, "bob.example.com"] {
-				if is_anonymous_share(scope, subject, tenant) {
-					assert_eq!(
-						subject_level(scope, subject, tenant, false, false),
-						SubjectAccessLevel::Public
-					);
-				}
-			}
-		}
+		let bob = ctx("bob.example.com", Some("file:f1~x:R"), &[]);
+		assert!(!abac::names_tenant_without_being_it(&bob, tenant));
+		assert_eq!(level(&bob), SubjectAccessLevel::Verified);
 	}
 
 	/// A scope does not *lower* a caller below what their relationship earns
@@ -809,19 +771,14 @@ mod tests {
 	#[test]
 	fn a_scope_leaves_the_relationship_levels_alone() {
 		let tenant = "alice.example.com";
-		assert_eq!(
-			subject_level(Some("file:f1~x:R"), "bob.example.com", tenant, true, false),
-			SubjectAccessLevel::Connected
-		);
-		assert_eq!(
-			subject_level(Some("file:f1~x:R"), "bob.example.com", tenant, false, true),
-			SubjectAccessLevel::Follower
-		);
-		assert_eq!(subject_level(None, "guest", tenant, false, false), SubjectAccessLevel::Public);
-		assert_eq!(
-			subject_level(None, "bob.example.com", tenant, false, false),
-			SubjectAccessLevel::Verified
-		);
+		let bob = ctx("bob.example.com", Some("file:f1~x:R"), &[]);
+		let rel =
+			|connected, follower| ProfileRelation { connected, follower, ..Default::default() };
+		assert_eq!(subject_level(&bob, tenant, rel(true, false)), SubjectAccessLevel::Connected);
+		assert_eq!(subject_level(&bob, tenant, rel(false, true)), SubjectAccessLevel::Follower);
+		assert_eq!(subject_level(&bob, tenant, rel(false, false)), SubjectAccessLevel::Verified);
+		let guest = ctx("guest", None, &[]);
+		assert_eq!(subject_level(&guest, tenant, rel(false, false)), SubjectAccessLevel::Public);
 	}
 
 	#[test]

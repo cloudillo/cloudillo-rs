@@ -24,6 +24,7 @@ use serde_json::json;
 
 use crate::prelude::*;
 use cloudillo_core::CreateActionFn;
+use cloudillo_core::abac;
 use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
 use cloudillo_core::file_access::{self, FileAccessCtx};
 use cloudillo_core::share_access::{
@@ -398,8 +399,10 @@ pub async fn list_shares_by_subject(
 			// A user subject: "which files is this user shared into" — their own share map, so
 			// without this gate any member could enumerate anyone's.
 			Some('U') => {
-				let is_self = auth.id_tag.as_ref() == subject_id;
-				let is_tenant = auth.id_tag == tenant_id_tag;
+				// A share link or `idp_` key carries the tenant's id_tag without being the tenant.
+				let impostor = abac::names_tenant_without_being_it(&auth, &tenant_id_tag);
+				let is_self = !impostor && auth.id_tag.as_ref() == subject_id;
+				let is_tenant = abac::is_tenant_self(&auth, &tenant_id_tag);
 				if !is_self && !is_tenant && !cloudillo_core::roles::is_leader(&auth.roles) {
 					warn!(
 						subject = %auth.id_tag,
@@ -411,7 +414,7 @@ pub async fn list_shares_by_subject(
 			}
 			// A link subject: the subject_id IS a bearer credential. Tenant account only.
 			Some('L') => {
-				if auth.id_tag != tenant_id_tag {
+				if !abac::is_tenant_self(&auth, &tenant_id_tag) {
 					warn!(
 						subject = %auth.id_tag,
 						"Share-by-subject listing denied - link subjects are the tenant account's"

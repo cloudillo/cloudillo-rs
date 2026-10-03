@@ -42,6 +42,16 @@ pub enum ProfileType {
 	Community,
 }
 
+impl ProfileType {
+	/// Wire-format string (the serde name).
+	pub fn as_str(self) -> &'static str {
+		match self {
+			ProfileType::Person => "person",
+			ProfileType::Community => "community",
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProfileStatus {
 	#[serde(rename = "A")]
@@ -296,6 +306,10 @@ pub struct Profile<S: AsRef<str>> {
 	/// The peer's role map for my members, mirrored from its `CONN:ACC`/`CONN:UPD`.
 	/// Advisory only: never read by an access decision.
 	pub peer_hat_roles: Option<Box<str>>,
+	/// Identities the viewer has used at this peer, most recent first (`""` = as
+	/// themselves). Owner-only UI preference: never federated, never read by an
+	/// access decision.
+	pub hats: Option<Box<[Box<str>]>>,
 }
 
 /// Reduced, public-safe profile projection returned by
@@ -380,6 +394,9 @@ pub struct UpdateProfileData {
 	pub hat_roles: Patch<Option<Box<str>>>,
 	#[serde(default)]
 	pub peer_hat_roles: Patch<Option<Box<str>>>,
+	/// See `Profile::hats`. `Null` clears the list.
+	#[serde(default)]
+	pub hats: Patch<Vec<Box<str>>>,
 
 	// Sync metadata
 	#[serde(default)]
@@ -433,6 +450,7 @@ pub struct UpsertProfileFields {
 	pub hidden_in_home: Patch<bool>,
 	pub hat_roles: Patch<Option<Box<str>>>,
 	pub peer_hat_roles: Patch<Option<Box<str>>>,
+	pub hats: Patch<Vec<Box<str>>>,
 	pub etag: Patch<Box<str>>,
 }
 
@@ -467,6 +485,7 @@ impl UpsertProfileFields {
 			hidden_in_home: update.hidden_in_home,
 			hat_roles: update.hat_roles,
 			peer_hat_roles: update.peer_hat_roles,
+			hats: update.hats,
 			etag: update.etag,
 		}
 	}
@@ -522,6 +541,8 @@ pub struct UpdateActionDataOptions {
 	/// status, leave this `Patch::Undefined` — overwriting `created_at` on a
 	/// finalized (`A`) action would corrupt the timeline.
 	pub created_at: Patch<Timestamp>,
+	/// Absolute room (`@tenant~name`); drafts only — the PATCH handler validates it.
+	pub channel: Patch<String>,
 }
 
 impl UpdateActionDataOptions {
@@ -574,6 +595,10 @@ pub enum AudienceType {
 pub enum ActionCountGroupBy {
 	SubType,
 }
+
+/// Action statuses no listing returns: deleted, inbound-verifying (attachments not yet synced),
+/// permanently failed. The default when `status` is unset, and stripped from an explicit one.
+pub const HIDDEN_ACTION_STATUSES: [&str; 3] = ["D", "V", "F"];
 
 /// Options for listing actions
 #[derive(Debug, Default, Deserialize)]
@@ -1848,6 +1873,26 @@ pub struct UpdateChannelData {
 	pub visibility: Patch<char>,
 	pub min_role: Patch<String>,
 	pub closed: Patch<bool>,
+}
+
+/// A synced partnership: `partner` is a connected community peer of the membership `community`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PartnerEdge {
+	pub community: Box<str>,
+	pub partner: Box<str>,
+}
+
+/// An element of a remote `GET /api/partners`; only the `idTag` is read.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePartner {
+	pub id_tag: Box<str>,
+}
+
+/// A remote `GET /api/partners` response.
+#[derive(Debug, Deserialize)]
+pub struct RemotePartners {
+	pub data: Vec<RemotePartner>,
 }
 
 // Calendars / Calendar Objects (CalDAV + JSON REST)
@@ -3168,6 +3213,46 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Bare names of the channels `id_tag` is rostered in.
 	async fn list_member_channels(&self, tn_id: TnId, id_tag: &str) -> ClResult<Vec<Box<str>>>;
+
+	// Partner edges
+	//**************
+
+	/// Replace all edges of `community` with `partners`, in one transaction.
+	async fn replace_partner_edges(
+		&self,
+		tn_id: TnId,
+		community: &str,
+		partners: &[Box<str>],
+	) -> ClResult<()>;
+
+	/// Insert one edge; a no-op if it exists.
+	async fn upsert_partner_edge(
+		&self,
+		tn_id: TnId,
+		community: &str,
+		partner: &str,
+	) -> ClResult<()>;
+
+	/// Delete one edge; a no-op if absent.
+	async fn delete_partner_edge(
+		&self,
+		tn_id: TnId,
+		community: &str,
+		partner: &str,
+	) -> ClResult<()>;
+
+	/// Delete every edge of `community`.
+	async fn delete_partner_edges_of(&self, tn_id: TnId, community: &str) -> ClResult<()>;
+
+	/// Delete the edges of every community not in `communities` (ex-memberships).
+	async fn delete_partner_edges_except(
+		&self,
+		tn_id: TnId,
+		communities: &[Box<str>],
+	) -> ClResult<()>;
+
+	/// All edges of a tenant.
+	async fn list_partner_edges(&self, tn_id: TnId) -> ClResult<Vec<PartnerEdge>>;
 }
 
 #[cfg(test)]

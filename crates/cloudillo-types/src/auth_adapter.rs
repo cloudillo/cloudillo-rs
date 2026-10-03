@@ -133,6 +133,9 @@ pub struct AuthCtx {
 	/// gating only: `roles` already holds the mapped roles. Not a delegated credential, so it
 	/// is never treated like `scope`.
 	pub hat: Option<Box<str>>,
+	/// Expiry of the presented access token; `None` for credentials that are not one (API keys,
+	/// DAV passwords, synthetic contexts). Caps the hatted `file:` scope mint.
+	pub exp: Option<Timestamp>,
 }
 
 impl AuthCtx {

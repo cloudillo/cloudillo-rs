@@ -18,6 +18,7 @@
 use crate::history_sync::schedule_history_sync;
 use crate::hooks::{HookContext, HookResult};
 use crate::native_hooks::conn_follower_patch;
+use crate::native_hooks::ptnr::{announce_partnership, connection_ended};
 use crate::prelude::*;
 use crate::task::{CreateAction, create_action};
 use cloudillo_types::meta_adapter::{ProfileConnectionStatus, UpsertProfileFields};
@@ -174,11 +175,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			info!("CONN: Establishing connection from {} to {}", context.issuer, audience);
 
 			// Ensure audience profile exists locally (sync from remote if needed)
-			let ensure_profile = app.ext::<cloudillo_core::EnsureProfileFn>();
-			if let Err(e) = match ensure_profile {
-				Ok(f) => f(&app, tn_id, audience).await,
-				Err(e) => Err(e),
-			} {
+			if let Err(e) = cloudillo_core::ensure_profile(&app, tn_id, audience).await {
 				warn!(
 					"CONN: Failed to sync audience profile {}: {} - continuing anyway",
 					audience, e
@@ -264,6 +261,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				retire_community_invitations(&app, tn_id, context.tenant_tag.as_str(), audience)
 					.await;
 			}
+			connection_ended(&app, tn_id, &context.tenant_type, audience).await;
 		}
 		Some("UPD") => {
 			// Map publication only; the local map was already written by the caller
@@ -296,11 +294,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			info!("CONN: Received connection request from {} to {}", context.issuer, local_tag);
 
 			// Ensure issuer profile exists locally (sync from remote if needed)
-			let ensure_profile = app.ext::<cloudillo_core::EnsureProfileFn>();
-			if let Err(e) = match ensure_profile {
-				Ok(f) => f(&app, tn_id, &context.issuer).await,
-				Err(e) => Err(e),
-			} {
+			if let Err(e) = cloudillo_core::ensure_profile(&app, tn_id, &context.issuer).await {
 				warn!(
 					"CONN: Failed to sync issuer profile {}: {} - continuing anyway",
 					context.issuer, e
@@ -335,6 +329,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				}
 
 				schedule_history_sync(&app, tn_id, &context.issuer).await;
+				announce_partnership(&app, &context).await;
 				publish_hat_map(&app, tn_id, &context.tenant_tag, &context.issuer).await;
 
 				// Mutual connection auto-accepted — rests at 'A' (default) so the
@@ -417,6 +412,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				}
 
 				schedule_history_sync(&app, tn_id, &context.issuer).await;
+				announce_partnership(&app, &context).await;
 
 				// The invitation has now been consumed (membership established); retire it so
 				// it doesn't linger at 'A' and reappear as "pending" if this member later leaves.
@@ -483,6 +479,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					}
 
 					schedule_history_sync(&app, tn_id, &context.issuer).await;
+					announce_partnership(&app, &context).await;
 
 					// Auto-accepted (connection_mode=A) — rests at 'A' (default) so
 					// fan-out/broadcast/filter (status=['A']) include it.
@@ -574,6 +571,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			}
 
 			schedule_history_sync(&app, tn_id, &context.issuer).await;
+			announce_partnership(&app, &context).await;
 			publish_hat_map(&app, tn_id, &context.tenant_tag, &context.issuer).await;
 
 			// Connection accepted — rests at 'A' (default) so fan-out/broadcast/
@@ -599,6 +597,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			if context.tenant_type == "community" {
 				retire_community_invitations(&app, tn_id, local_tag, &context.issuer).await;
 			}
+			connection_ended(&app, tn_id, &context.tenant_type, &context.issuer).await;
 
 			// Disconnect notification — rest at 'N' (informational). The
 			// relationship is severed, so it must NOT be 'A' (which would keep
@@ -679,6 +678,7 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 	}
 
 	schedule_history_sync(&app, tn_id, &context.issuer).await;
+	announce_partnership(&app, &context).await;
 
 	Ok(HookResult::default())
 }

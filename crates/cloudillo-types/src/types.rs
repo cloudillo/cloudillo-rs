@@ -390,6 +390,13 @@ pub struct ProfileInfo {
 	/// Composition control for the home feed (community profiles): `Some(true)` =
 	/// hidden from the merged home feed. Absent/`None` = shown (the default).
 	pub hidden_in_home: Option<bool>,
+	/// Hat role map we grant this peer community (`peer_role:local_role,…`), leader-only
+	pub hat_roles: Option<String>,
+	/// Hat role map this peer community grants us, leader-only
+	pub peer_hat_roles: Option<String>,
+	/// Hat communities I wear toward this peer, in remembered order (`""` = as myself).
+	/// The tenant account's own UI preference: served to the tenant itself only.
+	pub hats: Option<Vec<String>>,
 	/// Extensible metadata (profile sections, tab config, etc.)
 	pub x: Option<HashMap<String, String>>,
 }

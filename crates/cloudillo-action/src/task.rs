@@ -46,12 +46,19 @@ pub async fn collect_file_deps(
 		.await
 }
 
+/// A thread root: no parent and no action subject. Only a root takes an explicit room; a
+/// reply takes its thread's.
+pub(crate) fn is_root_action(parent_id: Option<&str>, subject: Option<&str>) -> bool {
+	parent_id.is_none()
+		&& !matches!(subject.and_then(parse_subject_ref), Some(SubjectRef::Action(_)))
+}
+
 /// Validate an explicit channel on a root action.
 ///
 /// A local channel must exist and admit the *actor* (the issuer is always the tenant, which
 /// enters everything). A channel of the audience's tenant is checked by that host on
 /// inbound, so only its syntax is checked here. Any other tenant is rejected.
-async fn check_root_channel(
+pub(crate) async fn check_root_channel(
 	app: &App,
 	tn_id: TnId,
 	id_tag: &str,
@@ -93,8 +100,25 @@ async fn check_root_channel(
 	Ok(())
 }
 
+/// Whether `channel` is one of `id_tag`'s own rooms.
+fn is_local_channel(channel: &str, id_tag: &str) -> bool {
+	matches!(parse_subject_ref(channel), Some(SubjectRef::Channel { tenant, .. }) if tenant == id_tag)
+}
+
 /// Stamp an attachment with its action's channel, unless it already has one.
-async fn stamp_file_channel(app: &App, tn_id: TnId, file_id: &str, channel: &str) -> ClResult<()> {
+///
+/// Only a room of this tenant (`id_tag`) is stamped. A foreign room (the audience's) means nothing
+/// here: stamping it would put our own file behind a room gate no local subject can pass.
+pub async fn stamp_file_channel(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	file_id: &str,
+	channel: &str,
+) -> ClResult<()> {
+	if !is_local_channel(channel, id_tag) {
+		return Ok(());
+	}
 	let file = app.meta_adapter.read_file(tn_id, file_id).await?;
 	if file.is_none_or(|f| f.channel.is_some()) {
 		return Ok(());
@@ -151,12 +175,7 @@ pub async fn create_action_as(
 
 	// An explicit channel is honoured only on a root; a reply takes its thread's room.
 	let mut action = action;
-	let is_root = action.parent_id.is_none()
-		&& !matches!(
-			action.subject.as_deref().and_then(parse_subject_ref),
-			Some(SubjectRef::Action(_))
-		);
-	if !is_root {
+	if !is_root_action(action.parent_id.as_deref(), action.subject.as_deref()) {
 		action.channel = None;
 	} else if let Some(channel) = action.channel.as_deref() {
 		check_root_channel(
@@ -212,16 +231,35 @@ pub async fn create_action_as(
 	if !allow_unknown && let Some(ref audience_tag) = action.audience_tag {
 		// Skip validation if audience is ourselves
 		if audience_tag.as_ref() != id_tag {
+			// A hatted action is relayed by the hat, so the relationship that matters is with the hat.
+			let recipient = action.hat.as_deref().unwrap_or(audience_tag);
 			let has_relationship = app
 				.meta_adapter
-				.read_profile(tn_id, audience_tag)
+				.read_profile(tn_id, recipient)
 				.await
 				.is_ok_and(|(_, p)| p.following || p.connected.is_connected());
 
-			if !has_relationship {
+			// An APRV answering the issuer of an action addressed to us (e.g. a hatted post we
+			// admitted via its hat) needs no relationship with that issuer.
+			let is_aprv_reply = if !has_relationship
+				&& helpers::extract_type_and_subtype(&action.typ).0 == "APRV"
+				&& let Some(subject_id) = action.subject.as_deref()
+				&& let Ok(Some(subject)) = app.meta_adapter.get_action(tn_id, subject_id).await
+			{
+				is_aprv_reply_to_issuer(
+					&subject.issuer.id_tag,
+					subject.audience.as_ref().map(|a| a.id_tag.as_ref()),
+					audience_tag,
+					id_tag,
+				)
+			} else {
+				false
+			};
+
+			if !has_relationship && !is_aprv_reply {
 				return Err(Error::ValidationError(format!(
 					"Cannot send {} to unknown recipient {}",
-					action.typ, audience_tag
+					action.typ, recipient
 				)));
 			}
 		}
@@ -713,7 +751,8 @@ impl Task<App> for ActionCreatorTask {
 					);
 				}
 				if let Some(channel) = self.action.channel.as_deref()
-					&& let Err(e) = stamp_file_channel(app, self.tn_id, file_id, channel).await
+					&& let Err(e) =
+						stamp_file_channel(app, self.tn_id, &self.id_tag, file_id, channel).await
 				{
 					warn!("Failed to stamp channel on file {}: {} - continuing anyway", file_id, e);
 				}
@@ -1472,9 +1511,49 @@ impl Task<App> for ActionVerifierTask {
 	}
 }
 
+/// Is an APRV to `aud` a reply to the issuer of a subject that was addressed to us (`us`)?
+fn is_aprv_reply_to_issuer(
+	subject_issuer: &str,
+	subject_audience: Option<&str>,
+	aud: &str,
+	us: &str,
+) -> bool {
+	subject_audience == Some(us) && subject_issuer == aud
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn aprv_reply_needs_subject_addressed_to_us_from_recipient() {
+		assert!(is_aprv_reply_to_issuer(
+			"member.example",
+			Some("team.example"),
+			"member.example",
+			"team.example"
+		));
+		assert!(!is_aprv_reply_to_issuer(
+			"member.example",
+			Some("other.example"),
+			"member.example",
+			"team.example"
+		));
+		assert!(!is_aprv_reply_to_issuer(
+			"member.example",
+			Some("team.example"),
+			"stranger.example",
+			"team.example"
+		));
+	}
+
+	#[test]
+	fn only_own_rooms_are_local() {
+		assert!(is_local_channel("@club.example~room", "club.example"));
+		assert!(!is_local_channel("@club.example~room", "alice.example"));
+		assert!(!is_local_channel("club.example~room", "club.example"));
+		assert!(!is_local_channel("@club.example", "club.example"));
+	}
 
 	/// `upgrade_file_visibility` is handed `actor()`, not the issuer. On a community tenant the
 	/// issuer is the community and the actor is the member who pinned the attachment, so passing

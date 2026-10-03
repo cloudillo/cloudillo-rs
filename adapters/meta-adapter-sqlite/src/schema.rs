@@ -135,7 +135,7 @@ const SEARCH_FTS_TRIGGERS: [&str; 3] = [
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 56;
+	const CURRENT_DB_VERSION: i64 = 57;
 
 	let mut tx = db.begin().await?;
 
@@ -259,6 +259,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			hidden_in_home INTEGER,			-- Composition: NULL = community shown in home feed (default), 1 = hidden
 			hat_roles text,					-- My role map for this peer's members (peer_role:local_role,...)
 			peer_hat_roles text,			-- Peer's role map for my members (advisory mirror)
+			hats text,						-- My identities used at this peer, JSON array (empty string = as myself)
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id, id_tag)
@@ -1145,6 +1146,24 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.await?;
 	sqlx::query(
 		"CREATE INDEX IF NOT EXISTS idx_channel_members_user ON channel_members(tn_id, id_tag)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	// Partner edges: a membership community's connected community peers, synced from its
+	// `GET /api/partners` and from received PTNR actions. Feeds the connection map.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS partner_edge (
+			tn_id integer NOT NULL,
+			community text NOT NULL,
+			partner text NOT NULL,
+			PRIMARY KEY(tn_id, community, partner)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_partner_edge_partner ON partner_edge(tn_id, partner)",
 	)
 	.execute(&mut *tx)
 	.await?;
@@ -2623,6 +2642,12 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 		set_db_version(&mut tx, 56).await;
+	}
+
+	if version < 57 {
+		// Hats: the viewer's remembered identities at a peer, as a JSON array.
+		add_column_if_missing(&mut tx, "profiles", "hats", "text").await?;
+		set_db_version(&mut tx, 57).await;
 	}
 
 	tx.commit().await?;

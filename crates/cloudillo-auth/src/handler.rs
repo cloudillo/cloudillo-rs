@@ -483,9 +483,9 @@ fn normalized_dav_scope(requested: &str) -> Option<String> {
 /// short-circuit treats a matching file scope as *the* grant, on the assumption that only a server
 /// that checked the access ever minted one. Same `min()` cap as the `?via=` branch.
 ///
-/// Both call sites reject a *scoped* caller before reaching here (the `auth.scope.is_some()` guard
-/// in the session branch; the federated branch authenticates with an action token, which carries
-/// no scope), so `apkg:publish` only needs the role test.
+/// Every call site rejects a *scoped* caller before reaching here (the `auth.scope.is_some()` guard
+/// in the session branch, hatted or not; the federated branch authenticates with an action token,
+/// which carries no scope), so `apkg:publish` only needs the role test.
 ///
 /// Its `App`-dependent half — the `check_file_access` call — is covered indirectly by
 /// `cloudillo_core::tests::file_access_scope::scope_mint_denies_strangers_and_caps_at_real_access`,
@@ -552,6 +552,23 @@ async fn validated_scope(
 			Ok(Some(requested.to_string()))
 		}
 	}
+}
+
+/// Expiry for a hatted session's child token, which may only be a `file:` scope and never
+/// outlives its parent. Anything else is 401: the param-less refresh would re-read roles and drop
+/// the mapped one, and other scopes would widen the hat's reach. No parent `exp` fails closed.
+fn hatted_scope_exp(
+	parent_exp: Option<Timestamp>,
+	requested: Option<&str>,
+	now: Timestamp,
+) -> ClResult<Timestamp> {
+	use cloudillo_types::types::TokenScope;
+
+	if !matches!(requested.and_then(TokenScope::parse), Some(TokenScope::File { .. })) {
+		return Err(Error::Unauthorized);
+	}
+	let parent = parent_exp.ok_or(Error::Unauthorized)?;
+	Ok(Timestamp((now.0 + ACCESS_TOKEN_EXPIRY).min(parent.0)))
 }
 
 /// A presented token that cannot be verified is a 401. A bad signature against a cached key
@@ -1029,8 +1046,41 @@ pub async fn get_access_token(
 		}
 		// A hatted session is refreshed by re-running the handshake, never by a role re-read:
 		// the mapped roles are not stored here, so a re-read would mint a role-less session.
-		if auth.hat.is_some() {
-			return Err(Error::Unauthorized);
+		// Its one mint is a `file:` scope for iframe apps, keeping the presented `r` and `h`.
+		if let Some(hat) = auth.hat.as_deref() {
+			let exp = hatted_scope_exp(auth.exp, query.scope.as_deref(), Timestamp::now())?;
+			let scope = validated_scope(
+				&app,
+				tn_id,
+				&id_tag.0,
+				&auth.id_tag,
+				&auth.roles,
+				true,
+				query.scope.as_deref(),
+			)
+			.await?;
+			let roles = auth.roles.join(",");
+			let token_result = app
+				.auth_adapter
+				.create_access_token(
+					tn_id,
+					&auth_adapter::AccessToken {
+						iss: &id_tag.0,
+						sub: Some(&auth.id_tag),
+						r: Some(roles.as_str()).filter(|r| !r.is_empty()),
+						scope: scope.as_deref(),
+						exp,
+						h: Some(hat),
+					},
+				)
+				.await?;
+			info!(
+				"Issued access token: id_tag={} sub={} scope={:?} hat={} via=hatted_session",
+				id_tag.0, auth.id_tag, scope, hat
+			);
+			let response = ApiResponse::new(json!({ "token": token_result }))
+				.with_req_id(req_id.unwrap_or_default());
+			return Ok((StatusCode::OK, Json(response)));
 		}
 
 		debug!(
@@ -1820,6 +1870,7 @@ mod tests {
 			scope: scope.map(Box::from),
 			anonymous,
 			hat: None,
+			exp: None,
 		}
 	}
 
@@ -1959,6 +2010,28 @@ mod tests {
 		);
 	}
 
+	/// A hatted session mints a `file:` scope only, capped at the parent token's expiry.
+	#[test]
+	fn hatted_scope_mint_is_file_only_and_capped() {
+		let now = Timestamp(NOW);
+		let file = Some("file:f1~abc:R");
+		let parent = |d| Some(Timestamp(NOW + d));
+
+		let exp = |p, s| hatted_scope_exp(p, s, now).map(|t| t.0);
+		assert_eq!(exp(parent(10), file).ok(), Some(NOW + 10), "capped at parent exp");
+		assert_eq!(
+			exp(parent(ACCESS_TOKEN_EXPIRY * 2), file).ok(),
+			Some(NOW + ACCESS_TOKEN_EXPIRY),
+			"capped at the access-token TTL"
+		);
+
+		let unauthorized = |p, s| matches!(exp(p, s), Err(Error::Unauthorized));
+		assert!(unauthorized(parent(10), None), "param-less refresh");
+		assert!(unauthorized(parent(10), Some("apkg:publish")), "non-file scope");
+		assert!(unauthorized(parent(10), Some("dav:rw")), "DAV scope");
+		assert!(unauthorized(None, file), "no parent exp fails closed");
+	}
+
 	#[test]
 	fn endorse_peer_checks() {
 		const C: ProfileType = ProfileType::Community;
@@ -1971,6 +2044,7 @@ mod tests {
 		assert!(matches!(check_endorse_peer(skips, "contributor"), Err(Error::NotFound)));
 		let maps = Some((C, true, Some("contributor:supporter")));
 		assert!(check_endorse_peer(maps, "contributor").is_ok());
+		assert!(check_endorse_peer(maps, "leader").is_ok(), "falls back to a lower mapped role");
 		assert!(check_endorse_peer(Some((C, true, None)), "contributor").is_ok(), "no map");
 		let invalid = Some((C, true, Some("contributor:leader")));
 		assert!(check_endorse_peer(invalid, "moderator").is_ok(), "invalid map: the peer decides");

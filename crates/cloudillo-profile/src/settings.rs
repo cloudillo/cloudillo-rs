@@ -4,9 +4,19 @@
 //! Profile-related settings registration
 
 use crate::prelude::*;
+use cloudillo_core::profile_visibility::{CONNECTION_VISIBILITY, SectionVisibility};
 use cloudillo_core::settings::{
 	PermissionLevel, SettingDefinition, SettingScope, SettingValue, SettingsRegistry,
 };
+
+fn validate_visibility(v: &SettingValue) -> ClResult<()> {
+	match v {
+		SettingValue::String(s) if SectionVisibility::parse(s).is_some() => Ok(()),
+		_ => Err(Error::ValidationError(
+			"Visibility must be public, verified, follower, connected or a role".into(),
+		)),
+	}
+}
 
 /// Register all profile-related settings
 pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
@@ -65,6 +75,41 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.default(SettingValue::Bool(true))
 			.scope(SettingScope::Tenant)
 			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	// Who sees the tenant's connections (`GET /api/profiles?connected=`, the `connected`
+	// field, `GET /api/partners`); the typed keys override it per connected profile type.
+	registry.register(
+		SettingDefinition::builder(CONNECTION_VISIBILITY)
+			.description(
+				"Who sees your connections: public, verified, follower, connected or a role",
+			)
+			.default(SettingValue::String("connected".into()))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.validator(validate_visibility)
+			.build()?,
+	)?;
+	for (typ, what) in [("person", "person connections (members)"), ("community", "communities")] {
+		registry.register(
+			SettingDefinition::builder(format!("{CONNECTION_VISIBILITY}.{typ}"))
+				.description(format!("Who sees your {what}; unset = {CONNECTION_VISIBILITY}"))
+				.scope(SettingScope::Tenant)
+				.permission(PermissionLevel::User)
+				.optional(true)
+				.validator(validate_visibility)
+				.build()?,
+		)?;
+	}
+
+	// Last successful full partner sync (unix seconds, 0 = never); written by the sync task
+	registry.register(
+		SettingDefinition::builder("partners.synced_at")
+			.description("Last successful partner sync")
+			.default(SettingValue::Int(0))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::System)
 			.build()?,
 	)?;
 

@@ -252,6 +252,31 @@ pub type EnsureProfileFn = Box<
 		+ Sync,
 >;
 
+/// Syncs `id_tag`'s profile through [`EnsureProfileFn`]; a missing extension is an error.
+pub async fn ensure_profile(
+	app: &app::App,
+	tn_id: cloudillo_types::types::TnId,
+	id_tag: &str,
+) -> cloudillo_types::error::ClResult<()> {
+	let f = app.ext::<EnsureProfileFn>()?;
+	f(app, tn_id, id_tag).await?;
+	Ok(())
+}
+
+/// Fetches `id_tag`'s profile through [`ensure_profile`] (failures are logged), then reads
+/// the local row.
+pub async fn fetch_profile(
+	app: &app::App,
+	tn_id: cloudillo_types::types::TnId,
+	id_tag: &str,
+) -> cloudillo_types::error::ClResult<(Box<str>, cloudillo_types::meta_adapter::Profile<Box<str>>)>
+{
+	if let Err(e) = ensure_profile(app, tn_id, id_tag).await {
+		tracing::debug!(%id_tag, "ensure_profile failed: {}", e);
+	}
+	app.meta_adapter.read_profile(tn_id, id_tag).await
+}
+
 /// Type-erased hook asking for one tenant's cached **owner profile** to be refreshed.
 /// Delegates to `cloudillo_site::cache::refresh_tenant_profile`, which patches the two
 /// columns a profile write can change rather than rebuilding the entry — the rebuild

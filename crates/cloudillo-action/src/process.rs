@@ -500,8 +500,10 @@ async fn process_inbound_action_token_inner(
 		process_inbound_action_attachments(
 			app,
 			tn_id,
+			action_id,
 			&action.iss,
-			action.aud.as_deref(),
+			// The relaying hat syncs from the issuer: the audience has nothing until we relay.
+			if relay.is_some() { None } else { action.aud.as_deref() },
 			resolved_visibility,
 			channel.as_deref(),
 			attachments.clone(),
@@ -865,6 +867,18 @@ async fn check_inbound_permissions(
 		return Ok(());
 	}
 
+	// Accept an APRV of an action we issued. `check_aprv_authority` above already proved the
+	// issuer is the subject's audience / hat / relay owner, so this only lifts the follow gate:
+	// e.g. a hatted post's audience approving it back to a member who doesn't follow that audience.
+	if action.t.as_ref() == "APRV"
+		&& let Some(subject_id) = action.sub.as_deref()
+		&& let Ok(Some(subject)) = app.meta_adapter.get_action(tn_id, subject_id).await
+		&& let Ok(tenant) = app.meta_adapter.read_tenant(tn_id).await
+		&& subject.issuer.id_tag == tenant.id_tag
+	{
+		return Ok(());
+	}
+
 	warn!(
 		issuer = %action.iss,
 		action_type = %action.t,
@@ -927,11 +941,16 @@ async fn check_aprv_authority(
 			aud: view.audience.map(|p| p.id_tag),
 			sub: view.subject,
 			h: view.hat.map(|p| p.id_tag),
+			ch: view.channel,
 			..Default::default()
 		}
 	} else {
 		return deny("subject unknown");
 	};
+	// The room gate skips APRVs (`resolve_inbound_channel`), so one may only claim its subject's.
+	if aprv.ch.is_some() && aprv.ch != subject.ch {
+		return deny("room differs from the subject's");
+	}
 
 	if subject.aud.as_deref() == Some(&*aprv.iss) {
 		return Ok(());
@@ -1200,6 +1219,11 @@ async fn resolve_inbound_channel(
 				}
 				r => r?,
 			};
+			// An APRV's room is its subject's: the subject is gated on its own pass, and the
+			// APRV's authority over it was checked in `check_inbound_permissions`.
+			if helpers::extract_type_and_subtype(&action.t).0 == "APRV" {
+				return Ok(Some(channel.into()));
+			}
 			let roles = match hat_role {
 				Some(role) => vec![role.into()].into_boxed_slice(),
 				None => app
@@ -1359,9 +1383,11 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) -> ClRe
 	Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_inbound_action_attachments(
 	app: &App,
 	tn_id: TnId,
+	action_id: &str,
 	issuer_tag: &str,
 	audience_tag: Option<&str>,
 	visibility: Option<char>,
@@ -1396,7 +1422,16 @@ async fn process_inbound_action_attachments(
 	for attachment in attachments.iter().filter(|a| !a.is_empty()) {
 		debug!("  syncing attachment: {} from {}", attachment, source);
 		let result = sync_file_variants(
-			app, tn_id, source, attachment, None, true, visibility, channel, sync_all,
+			app,
+			tn_id,
+			source,
+			attachment,
+			Some(action_id),
+			None,
+			true,
+			visibility,
+			channel,
+			sync_all,
 		)
 		.await
 		.map_err(|e| {

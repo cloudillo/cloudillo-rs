@@ -257,6 +257,9 @@ const TENANT_CASCADE_TABLES: &[&str] = &[
 	// `tn_id` is an *FTS column*, so a plain `DELETE ... WHERE tn_id=?` on either
 	// virtual table would not work anyway.
 	"search_docs",
+	"channels",
+	"channel_members",
+	"partner_edge",
 ];
 
 /// Delete a tenant and all its associated data (cascading delete)

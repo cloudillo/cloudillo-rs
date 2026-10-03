@@ -12,6 +12,7 @@ mod file;
 mod file_user_data;
 mod installed_app;
 mod maintenance;
+mod partner;
 mod profile;
 mod push;
 mod reference;
@@ -40,9 +41,9 @@ use cloudillo_types::{
 		FileUserData, FileVariant, FileView, FinalizeActionOptions, InstallApp, InstalledApp,
 		ListActionOptions, ListCalendarObjectOptions, ListContactOptions, ListFileOptions,
 		ListProfileOptions, ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter,
-		Profile, ProfileData, ProfileRelation, PublicProfileRow, PublishSiteDoc, PushSubscription,
-		PushSubscriptionData, RefData, SearchObject, SearchOptions, SearchPart, SearchRow,
-		ShareEntry, Site, SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
+		PartnerEdge, Profile, ProfileData, ProfileRelation, PublicProfileRow, PublishSiteDoc,
+		PushSubscription, PushSubscriptionData, RefData, SearchObject, SearchOptions, SearchPart,
+		SearchRow, ShareEntry, Site, SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
 		UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData, UpdateChannelData,
 		UpdateFileOptions, UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData,
 		UpsertDocFormat, UpsertProfileFields, UpsertResult, UpsertSite,
@@ -1062,6 +1063,52 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn list_member_channels(&self, tn_id: TnId, id_tag: &str) -> ClResult<Vec<Box<str>>> {
 		channel::list_member_channels(&self.dbr, tn_id, id_tag).await
+	}
+
+	// Partner edges
+	//**************
+
+	async fn replace_partner_edges(
+		&self,
+		tn_id: TnId,
+		community: &str,
+		partners: &[Box<str>],
+	) -> ClResult<()> {
+		partner::replace_partner_edges(&self.db, tn_id, community, partners).await
+	}
+
+	async fn upsert_partner_edge(
+		&self,
+		tn_id: TnId,
+		community: &str,
+		partner: &str,
+	) -> ClResult<()> {
+		partner::upsert_partner_edge(&self.db, tn_id, community, partner).await
+	}
+
+	async fn delete_partner_edge(
+		&self,
+		tn_id: TnId,
+		community: &str,
+		partner: &str,
+	) -> ClResult<()> {
+		partner::delete_partner_edge(&self.db, tn_id, community, partner).await
+	}
+
+	async fn delete_partner_edges_of(&self, tn_id: TnId, community: &str) -> ClResult<()> {
+		partner::delete_partner_edges_of(&self.db, tn_id, community).await
+	}
+
+	async fn delete_partner_edges_except(
+		&self,
+		tn_id: TnId,
+		communities: &[Box<str>],
+	) -> ClResult<()> {
+		partner::delete_partner_edges_except(&self.db, tn_id, communities).await
+	}
+
+	async fn list_partner_edges(&self, tn_id: TnId) -> ClResult<Vec<PartnerEdge>> {
+		partner::list_partner_edges(&self.dbr, tn_id).await
 	}
 
 	// Calendar / calendar-object management

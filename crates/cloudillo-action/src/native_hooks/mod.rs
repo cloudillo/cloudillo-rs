@@ -16,6 +16,7 @@
 //! - idp: Identity provider operations (IDP:REG)
 //! - invt: Invitation management (INVT)
 //! - prinvt: Profile invite notification (PRINVT)
+//! - ptnr: Community partnership announcement (PTNR)
 //! - react: Reaction management (REACT)
 //! - stat: Statistics action normalization (STAT)
 //! - subs: Subscription management (SUBS)
@@ -31,6 +32,7 @@ pub mod invt;
 pub mod msg;
 pub(crate) mod ownership;
 pub mod prinvt;
+pub mod ptnr;
 pub mod react;
 pub mod repost;
 pub mod stat;
@@ -106,6 +108,19 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 
 		registry.register_type("IDP:REG", idp_reg_hooks);
 		tracing::info!("Registered native hooks for IDP:REG action type");
+	}
+
+	// PTNR hooks (emitted from the CONN hooks via `ptnr::announce_partnership`)
+	{
+		let ptnr_hooks = ActionTypeHooks {
+			on_create: None,
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(ptnr::on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("PTNR", ptnr_hooks);
+		tracing::info!("Registered native hooks for PTNR action type");
 	}
 
 	// FSHR hooks

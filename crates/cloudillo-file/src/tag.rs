@@ -34,6 +34,8 @@ pub async fn list_tags(
 	Auth(auth): Auth,
 	Query(q): Query<ListTagsQuery>,
 ) -> ClResult<Json<ListTagsResponse>> {
+	// TODO: tag visibility — derived from file visibility or user-set per tag; today every tag
+	// name/count is listed to any authenticated caller.
 	let with_counts = q.with_counts.unwrap_or(false);
 	let tags = app
 		.meta_adapter

@@ -99,10 +99,7 @@ pub fn merge_profile_into_input(input: &mut ContactInput, profile: Option<&Profi
 /// Build a `ProfileOverlay` object for the JSON response, combining live profile state with
 /// the same derived fields that drive the smart merge.
 pub fn build_overlay(profile: &Profile<Box<str>>) -> ProfileOverlay {
-	let r#type = match profile.typ {
-		ProfileType::Person => "person",
-		ProfileType::Community => "community",
-	};
+	let r#type = profile.typ.as_str();
 	ProfileOverlay {
 		id_tag: profile.id_tag.to_string(),
 		name: Some(profile.name.to_string()),
@@ -139,6 +136,7 @@ mod tests {
 			hidden_in_home: None,
 			hat_roles: None,
 			peer_hat_roles: None,
+			hats: None,
 		}
 	}
 

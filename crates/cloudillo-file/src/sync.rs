@@ -130,6 +130,14 @@ fn verify_content_hash(data: &[u8], expected_id: &str) -> ClResult<()> {
 	Ok(())
 }
 
+/// Appends `?action=<id>` naming the action that attaches the file. Action ids are URL-safe.
+fn with_action(path: String, via: Option<&str>) -> String {
+	match via {
+		Some(a) => format!("{}?action={}", path, a),
+		None => path,
+	}
+}
+
 /// Sync file variants from a remote instance
 ///
 /// # Arguments
@@ -137,6 +145,8 @@ fn verify_content_hash(data: &[u8], expected_id: &str) -> ClResult<()> {
 /// * `tn_id` - Tenant ID
 /// * `remote_id_tag` - Remote instance id_tag to fetch from
 /// * `file_id` - The file ID to sync
+/// * `via_action` - Action attaching the file, sent as `?action=` so the source can grant
+///   its audience read access (`file_access::action_attachment_level`)
 /// * `variants` - Optional list of specific variants to sync (None = all up to max setting)
 /// * `auth` - Whether to use authenticated requests (true for direct-visibility files, false for public)
 /// * `visibility` - Visibility character to assign to a newly created file row (None → 'D')
@@ -154,6 +164,7 @@ pub async fn sync_file_variants(
 	tn_id: TnId,
 	remote_id_tag: &str,
 	file_id: &str,
+	via_action: Option<&str>,
 	variants: Option<&[&str]>,
 	auth: bool,
 	visibility: Option<char>,
@@ -185,7 +196,7 @@ pub async fn sync_file_variants(
 	let shared = shared_store_enabled && use_shared_store(visibility);
 
 	// 1. Fetch file descriptor from remote
-	let descriptor_path = format!("/files/{}/descriptor", file_id);
+	let descriptor_path = with_action(format!("/files/{}/descriptor", file_id), via_action);
 	let descriptor_response: ApiResponse<String> = if auth {
 		app.request.get(tn_id, remote_id_tag, &descriptor_path).await?
 	} else {
@@ -339,7 +350,7 @@ pub async fn sync_file_variants(
 		(Some(f_id), false)
 	} else {
 		// Fetch file metadata from remote to get correct content_type and file_name
-		let metadata_path = format!("/files/{}/metadata", file_id);
+		let metadata_path = with_action(format!("/files/{}/metadata", file_id), via_action);
 		let remote_meta: ApiResponse<RemoteFileMetadata> = if auth {
 			app.request.get(tn_id, remote_id_tag, &metadata_path).await?
 		} else {
@@ -450,6 +461,7 @@ pub async fn sync_file_variants(
 					tn_id,
 					variant_id,
 					variant_name,
+					via_action,
 					auth,
 					variant_timeout,
 				)
@@ -536,10 +548,11 @@ async fn fetch_and_store_blob(
 	request_tn: TnId,
 	variant_id: &str,
 	variant_name: &str,
+	via_action: Option<&str>,
 	auth: bool,
 	timeout: Duration,
 ) -> ClResult<u64> {
-	let variant_path = format!("/files/variant/{}", variant_id);
+	let variant_path = with_action(format!("/files/variant/{}", variant_id), via_action);
 	// The HTTP request itself uses the requesting tenant's identity (so we
 	// authenticate as the tenant the sync is happening for); the blob is
 	// stored under `store_tn` which may be `SHARED_TN` for the shared store.

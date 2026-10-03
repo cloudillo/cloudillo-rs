@@ -76,6 +76,16 @@ async fn api_created_files_are_active() {
 	assert_eq!(find_str(&res, "fileId").as_deref(), Some(doc.as_str()), "browsed: {res}");
 }
 
+/// A hatted visitor whose hat maps to contributor creates a document the way the Files sidebar
+/// does: no parent, no channel.
+#[tokio::test]
+async fn hatted_contributor_creates_file() {
+	let _g = FIXTURE_LOCK.read().await;
+	let fx = setup().await;
+	post_file(fx, "hatted@club", &json!({ "fileTp": "CRDT", "contentType": "cloudillo/quillo" }))
+		.await;
+}
+
 /// Soft delete moves only the root row, so the gate reads trash off the ancestors: a folder's
 /// descendants and a document's tree children are gone with it for everyone who may not manage
 /// it, on the shared access path (websockets, duplicate, scope minting, …) too. A pending upload

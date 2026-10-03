@@ -251,10 +251,7 @@ impl<'a> OperationExecutor<'a> {
 			let profile_json = serde_json::json!({
 				"id_tag": profile.id_tag,
 				"name": profile.name,
-				"type": match profile.typ {
-					cloudillo_types::meta_adapter::ProfileType::Person => "person",
-					cloudillo_types::meta_adapter::ProfileType::Community => "community",
-				},
+				"type": profile.typ.as_str(),
 				"profile_pic": profile.profile_pic,
 				"following": profile.following,
 				"connected": profile.connected.is_connected(),

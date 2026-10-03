@@ -87,11 +87,18 @@ async fn check_file_permission(
 			scope: None,
 			anonymous: true,
 			hat: None,
+			exp: None,
 		}
 	});
 
+	// `?action=<id>`: the syncing audience names the action that attaches the file.
+	let via_action = req.uri().query().and_then(|q| {
+		q.split('&').find_map(|kv| kv.strip_prefix("action=")).filter(|a| !a.is_empty())
+	});
+
 	// Load file attributes (the auth context carries scope, roles, hat and anonymity)
-	let attrs = load_file_attrs(&app, tn_id, &file_id, &tenant_id_tag, &auth_ctx).await?;
+	let attrs =
+		load_file_attrs(&app, tn_id, &file_id, &tenant_id_tag, &auth_ctx, via_action).await?;
 
 	// Check permission
 	let environment = Environment::new();
@@ -123,6 +130,7 @@ async fn load_file_attrs(
 	file_or_variant_id: &str,
 	tenant_id_tag: &str,
 	auth: &AuthCtx,
+	via_action: Option<&str>,
 ) -> ClResult<FileAttrs> {
 	use cloudillo_core::abac::{self, VisibilityLevel};
 	use std::borrow::Cow;
@@ -153,6 +161,13 @@ async fn load_file_attrs(
 	let subject_id_tag: &str = &auth.id_tag;
 	let ctx = file_access::FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
 	let access_level = file_access::get_access_level(app, tn_id, file_ref, &ctx, None).await;
+	// The syncing audience names the action that attaches the file (`sync_file_variants`).
+	let access_level = match via_action {
+		Some(a) if !access_level.can_read() => {
+			file_access::action_attachment_level(app, tn_id, &file_ref, &ctx, a).await
+		}
+		_ => access_level,
+	};
 
 	// Lifecycle, on read and write routes alike.
 	file_access::check_lifecycle(
@@ -165,6 +180,12 @@ async fn load_file_attrs(
 		auth.names_holder(),
 	)
 	.await?;
+
+	// In a room, `get_access_level` already weighed visibility behind the room gate; ABAC's own
+	// visibility rung must not grant it back (share grants are in `access_level`).
+	if file_view.channel.is_some() && !access_level.can_read() {
+		return Err(Error::PermissionDenied);
+	}
 
 	// Get visibility from file metadata - convert char to string representation
 	let vis_level = VisibilityLevel::from_char(file_view.visibility);
@@ -228,6 +249,7 @@ mod tests {
 			scope: scope.map(Box::from),
 			anonymous: scope.is_some(),
 			hat: None,
+			exp: None,
 		}
 	}
 

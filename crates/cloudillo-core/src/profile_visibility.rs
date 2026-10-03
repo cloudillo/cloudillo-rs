@@ -8,7 +8,49 @@
 //! markers and deciding whether a particular caller may view each section.
 //!
 //! The `cloudillo-profile` crate uses these primitives to strip gated sections
-//! from `/api/me` and `/api/me/full` responses.
+//! from `/api/me` and `/api/me/full` responses, and [`RequesterTier::from_auth`] is the
+//! one classifier every list endpoint gates its relationship-revealing filters and fields
+//! through.
+
+use crate::prelude::*;
+use cloudillo_types::auth_adapter::AuthCtx;
+use cloudillo_types::meta_adapter::{ProfileType, RemotePartners};
+
+/// Base key of the connection-visibility settings; `.person` / `.community` override it per
+/// connected profile type (registered by `cloudillo-profile`).
+pub const CONNECTION_VISIBILITY: &str = "profile.connection_visibility";
+
+/// Who may see this tenant's connections to profiles of type `typ`.
+///
+/// Resolution: `profile.connection_visibility.{person|community}`, else the base key (default
+/// `connected`). `None` = a value that does not parse: hidden from all but the owner.
+pub async fn connection_visibility(
+	app: &App,
+	tn_id: TnId,
+	typ: ProfileType,
+) -> ClResult<Option<SectionVisibility>> {
+	let typed = typ.as_str();
+	let label = match app
+		.settings
+		.get_string_opt(tn_id, &format!("{CONNECTION_VISIBILITY}.{typed}"))
+		.await?
+	{
+		Some(v) => v,
+		None => app.settings.get_string(tn_id, CONNECTION_VISIBILITY).await?,
+	};
+	Ok(SectionVisibility::parse(&label))
+}
+
+/// `id_tag`'s public partner list (anonymous `GET /partners`); `None` on any failure.
+pub async fn public_partner_list(app: &App, id_tag: &str) -> Option<Vec<Box<str>>> {
+	match app.request.get_public::<RemotePartners>(id_tag, "/partners").await {
+		Ok(r) => Some(r.data.into_iter().map(|p| p.id_tag).collect()),
+		Err(e) => {
+			tracing::debug!(%id_tag, "partner list unavailable: {}", e);
+			None
+		}
+	}
+}
 
 /// Community role labels recognised in `<field>.vis` markers and in
 /// `AuthCtx.roles`. Ordered: `Supporter < Contributor < Moderator < Leader`.
@@ -35,6 +77,13 @@ impl CommunityRole {
 			"leader" => Some(Self::Leader),
 			_ => None,
 		}
+	}
+
+	/// Highest role in `roles`, on the shared ladder (`roles::ROLE_HIERARCHY`); `None` below
+	/// `supporter`.
+	pub fn highest(roles: &[Box<str>]) -> Option<Self> {
+		let level = crate::roles::highest_role_level(roles);
+		crate::roles::ROLE_HIERARCHY.get(level).and_then(|r| Self::parse(r))
 	}
 }
 
@@ -88,16 +137,70 @@ impl RequesterTier {
 		}
 	}
 
+	/// Classify the caller of a request on tenant `tenant` — once per request.
+	///
+	/// - No auth, or a credential naming the tenant without being it (share link, `idp_` key):
+	///   anonymous, as in `GET /api/search`.
+	/// - Any other scoped token keeps its identity's relationships, never owner or roles.
+	/// - Owner: the tenant account itself or an unscoped leader (on a community the leader
+	///   tier administers the tenant).
+	/// - Roles are the token's, hat-mapped ones included: a hat is a member.
+	pub async fn from_auth(
+		app: &App,
+		tn_id: TnId,
+		tenant: &str,
+		auth: Option<&AuthCtx>,
+	) -> ClResult<Self> {
+		let Some(auth) = auth else { return Ok(Self::anonymous()) };
+		let scoped = auth.scope.is_some();
+		if crate::abac::names_tenant_without_being_it(auth, tenant) {
+			return Ok(Self::anonymous());
+		}
+		let is_owner = crate::abac::is_tenant_self(auth, tenant)
+			|| (!scoped && crate::roles::is_leader(&auth.roles));
+		let rel = if is_owner {
+			cloudillo_types::meta_adapter::ProfileRelation::default()
+		} else {
+			crate::abac::subject_relation_to_tenant(app, tn_id, &auth.id_tag).await?
+		};
+		Ok(Self {
+			is_owner,
+			is_authenticated: true,
+			follows_tenant: rel.follower,
+			connected_to_tenant: rel.connected,
+			max_role: if scoped { None } else { CommunityRole::highest(&auth.roles) },
+		})
+	}
+
+	/// Whether this tier may see the tenant's connections to profiles of type `typ`
+	/// ([`connection_visibility`]).
+	pub async fn sees_connections(
+		self,
+		app: &App,
+		tn_id: TnId,
+		typ: ProfileType,
+	) -> ClResult<bool> {
+		Ok(connection_visibility(app, tn_id, typ)
+			.await?
+			.map_or(self.is_owner, |v| self.can_view(v)))
+	}
+
 	/// Decide whether this tier may view a section gated by `required`.
+	///
+	/// A member (any role from `supporter`, hats included) counts as connected: a hat brings
+	/// no CONN of its own, and a member must not be hidden from members by `connected`.
 	pub fn can_view(self, required: SectionVisibility) -> bool {
 		if self.is_owner {
 			return true;
 		}
+		let member = self.max_role.is_some();
 		match required {
 			SectionVisibility::Public => true,
 			SectionVisibility::Verified => self.is_authenticated,
-			SectionVisibility::Follower => self.follows_tenant || self.connected_to_tenant,
-			SectionVisibility::Connected => self.connected_to_tenant,
+			SectionVisibility::Follower => {
+				self.follows_tenant || self.connected_to_tenant || member
+			}
+			SectionVisibility::Connected => self.connected_to_tenant || member,
 			SectionVisibility::Role(r) => {
 				self.is_authenticated && self.max_role.is_some_and(|m| m >= r)
 			}
@@ -251,6 +354,26 @@ mod tests {
 		assert!(t.can_view(SectionVisibility::Role(CommunityRole::Contributor)));
 		assert!(t.can_view(SectionVisibility::Role(CommunityRole::Moderator)));
 		assert!(t.can_view(SectionVisibility::Role(CommunityRole::Leader)));
+	}
+
+	#[test]
+	fn highest_role_reads_the_shared_ladder() {
+		let roles = |r: &[&str]| r.iter().map(|&s| s.into()).collect::<Vec<Box<str>>>();
+		assert_eq!(CommunityRole::highest(&roles(&[])), None);
+		assert_eq!(CommunityRole::highest(&roles(&["follower"])), None);
+		assert_eq!(CommunityRole::highest(&roles(&["supporter"])), Some(CommunityRole::Supporter));
+		assert_eq!(
+			CommunityRole::highest(&roles(&["supporter", "moderator", "x"])),
+			Some(CommunityRole::Moderator)
+		);
+	}
+
+	/// A member — a hat included, which brings no CONN — is not hidden by `connected`.
+	#[test]
+	fn a_member_counts_as_connected() {
+		let t = tier_role(CommunityRole::Supporter);
+		assert!(t.can_view(SectionVisibility::Connected));
+		assert!(t.can_view(SectionVisibility::Follower));
 	}
 
 	#[test]

@@ -32,11 +32,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			info!("FLLW: {} is now following {}", context.issuer, audience);
 
 			// Ensure audience profile exists locally (sync from remote if needed)
-			let ensure_profile = app.ext::<cloudillo_core::EnsureProfileFn>();
-			if let Err(e) = match ensure_profile {
-				Ok(f) => f(&app, tn_id, audience).await,
-				Err(e) => Err(e),
-			} {
+			if let Err(e) = cloudillo_core::ensure_profile(&app, tn_id, audience).await {
 				warn!(
 					"FLLW: Failed to sync audience profile {}: {} - continuing anyway",
 					audience, e
@@ -115,11 +111,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 			// Ensure issuer profile exists locally (sync from remote if needed)
 			// This ensures we have info about our new follower
-			let ensure_profile = app.ext::<cloudillo_core::EnsureProfileFn>();
-			if let Err(e) = match ensure_profile {
-				Ok(f) => f(&app, tn_id, &context.issuer).await,
-				Err(e) => Err(e),
-			} {
+			if let Err(e) = cloudillo_core::ensure_profile(&app, tn_id, &context.issuer).await {
 				warn!(
 					"FLLW: Failed to sync follower profile {}: {} - continuing anyway",
 					context.issuer, e

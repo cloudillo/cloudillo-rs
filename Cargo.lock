@@ -647,6 +647,7 @@ dependencies = [
 name = "cloudillo"
 version = "0.8.19"
 dependencies = [
+ "async-trait",
  "axum",
  "axum-server",
  "cloudillo-action",

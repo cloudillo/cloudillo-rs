@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 use cloudillo_core::CreateActionFn;
-use cloudillo_core::extract::{Auth, OptionalRequestId};
+use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
 use cloudillo_core::roles::{
 	LEADER_LEVEL, can_assign_role, can_manage_member_by_roles, highest_role_level,
 };
@@ -379,16 +379,46 @@ pub struct PatchProfileRelationshipRequest {
 	/// the column returns to the NULL = shown default).
 	#[serde(default)]
 	pub hidden_in_home: Patch<bool>,
+	/// Identities used at this peer, most recent first (`""` = as yourself).
+	/// `null` clears the list.
+	#[serde(default)]
+	pub hats: Patch<Vec<Box<str>>>,
+}
+
+const MAX_HATS: usize = 10;
+
+/// Dedup `hats` keeping the first occurrence; every entry must be `""` or a valid id_tag.
+fn validate_hats(hats: Vec<Box<str>>) -> ClResult<Vec<Box<str>>> {
+	let mut out: Vec<Box<str>> = Vec::with_capacity(hats.len());
+	for hat in hats {
+		if !hat.is_empty() && !cloudillo_types::validation::validate_id_tag(&hat) {
+			return Err(Error::ValidationError(format!("invalid hat: {hat}")));
+		}
+		if !out.contains(&hat) {
+			out.push(hat);
+		}
+	}
+	if out.len() > MAX_HATS {
+		return Err(Error::ValidationError(format!("too many hats (max {MAX_HATS})")));
+	}
+	Ok(out)
 }
 
 /// PATCH /profile/:idTag - Update relationship data with another user
+///
+/// `hats` is the tenant account's own UI preference: only the tenant itself may set it, not a
+/// leader the `write` guard admits, nor an `idp_` key naming the account.
 pub async fn patch_profile_relationship(
 	State(app): State<App>,
+	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(id_tag): Path<String>,
 	Json(patch): Json<PatchProfileRelationshipRequest>,
 ) -> ClResult<StatusCode> {
 	let tn_id = auth.tn_id;
+	if !patch.hats.is_undefined() {
+		cloudillo_core::abac::require_tenant_self(&auth, &tenant_id_tag, "hats")?;
+	}
 
 	// Upsert relationship state on the target id_tag. If the profile cache row
 	// is missing (race with federation sync), upsert creates a stub so the
@@ -400,10 +430,16 @@ pub async fn patch_profile_relationship(
 		Patch::Value(false) | Patch::Null => Patch::Null,
 		Patch::Undefined => Patch::Undefined,
 	};
+	let hats = match patch.hats {
+		Patch::Value(v) => Patch::Value(validate_hats(v)?),
+		Patch::Null => Patch::Null,
+		Patch::Undefined => Patch::Undefined,
+	};
 	let update = UpdateProfileData {
 		status: patch.status,
 		trust: patch.trust,
 		hidden_in_home,
+		hats,
 		..Default::default()
 	};
 	let upsert = UpsertProfileFields::from_update(update);
@@ -497,6 +533,18 @@ mod tests {
 
 	const COMM: Option<(ProfileType, bool)> = Some((ProfileType::Community, true));
 	const MAP: &str = "contributor:supporter";
+
+	#[test]
+	fn hats_validation() {
+		let hats = |v: &[&str]| v.iter().map(|&s| Box::from(s)).collect::<Vec<Box<str>>>();
+		assert_eq!(
+			validate_hats(hats(&["a.example", "", "a.example"])).ok(),
+			Some(hats(&["a.example", ""]))
+		);
+		assert!(validate_hats(hats(&["Not Valid"])).is_err());
+		let eleven: Vec<String> = (0..11).map(|i| format!("h{i}.example")).collect();
+		assert!(validate_hats(eleven.iter().map(|s| Box::from(s.as_str())).collect()).is_err());
+	}
 
 	#[test]
 	fn hat_roles_patch_checks() {

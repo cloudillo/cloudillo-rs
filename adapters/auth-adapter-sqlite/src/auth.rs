@@ -54,6 +54,7 @@ pub(crate) async fn validate_access_token(
 		roles: parse_roles(token_data.claims.r.as_deref().unwrap_or("")),
 		scope: token_data.claims.scope,
 		hat: token_data.claims.h,
+		exp: Some(token_data.claims.exp),
 	})
 }
 

@@ -44,6 +44,7 @@ pub fn init(app: &App) -> ClResult<()> {
 	app.scheduler.register::<delivery::ActionDeliveryTask>()?;
 	app.scheduler.register::<history_sync::HistoryFetchTask>()?;
 	app.scheduler.register::<native_hooks::stat_emit_task::StatEmitTask>()?;
+	app.scheduler.register::<native_hooks::ptnr::PtnrAnnounceTask>()?;
 
 	// Register native hooks (must be called after app is fully initialized)
 	// This is done asynchronously during bootstrap

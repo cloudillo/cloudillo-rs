@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::{
 	extract::{Auth, OptionalRequestId},
 	prelude::*,
-	settings::types::{SettingScope, SettingValue},
+	settings::types::{PermissionLevel, SettingScope, SettingValue},
 };
 use cloudillo_types::{
 	auth_adapter::AuthCtx,
@@ -47,6 +47,17 @@ pub struct ListSettingsQuery {
 	pub tenant: Option<String>,
 }
 
+/// Settings are read with the standing that writes them (`PermissionLevel::User`): the
+/// tenant account or an unscoped leader, or SADM. They hold the tenant's privacy and
+/// configuration decisions, which are not a member's business.
+fn require_settings_reader(auth: &AuthCtx) -> ClResult<()> {
+	if auth.scope.is_none() && PermissionLevel::User.check(&auth.roles) {
+		Ok(())
+	} else {
+		Err(Error::PermissionDenied)
+	}
+}
+
 /// GET /settings - List all settings for authenticated tenant
 /// Returns metadata about available settings and their current values
 /// Supports optional `prefix` query parameter to filter settings by key prefix
@@ -56,6 +67,7 @@ pub async fn list_settings(
 	Query(query): Query<ListSettingsQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<SettingResponse>>>)> {
+	require_settings_reader(&auth)?;
 	let mut settings_response = Vec::new();
 
 	// `level` requires `prefix`: the no-prefix branch iterates registry
@@ -196,6 +208,7 @@ pub async fn get_setting(
 	Query(query): Query<SettingScopeQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SettingResponse>>)> {
+	require_settings_reader(&auth)?;
 	// Get setting definition (supports wildcard patterns like "ui.*")
 	let definition = app.settings_registry.get(&name).ok_or(Error::NotFound)?;
 
@@ -581,6 +594,7 @@ mod tests {
 			scope: scope.map(Box::from),
 			anonymous: scope.is_some(),
 			hat: None,
+			exp: None,
 		}
 	}
 

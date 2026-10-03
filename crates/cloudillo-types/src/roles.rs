@@ -90,6 +90,8 @@ pub fn expand_roles_preserving_extras(roles: &[Box<str>]) -> String {
 ///
 /// Both sides must be in [`ROLE_HIERARCHY`], targets are `contributor` or below, keys unique.
 /// Any violation rejects the whole map. An empty string is a valid map that maps nothing.
+/// An omitted role falls back to the closest lower mapped role; below the lowest mapped role
+/// there is no access (see [`map_hat_role`]).
 pub fn parse_hat_roles(s: &str) -> Option<Vec<(Box<str>, Box<str>)>> {
 	let s = s.trim();
 	if s.is_empty() {
@@ -112,9 +114,15 @@ pub fn parse_hat_roles(s: &str) -> Option<Vec<(Box<str>, Box<str>)>> {
 	Some(map)
 }
 
-/// Look up the local role a peer's `peer_role` maps to. An omitted role denies (`None`).
+/// Look up the local role a peer's `peer_role` maps to. An omitted role falls back to the
+/// closest lower mapped role; below the lowest mapped role (or an unknown role) there is no
+/// access (`None`).
 pub fn map_hat_role(map: &[(Box<str>, Box<str>)], peer_role: &str) -> Option<Box<str>> {
-	map.iter().find(|(p, _)| p.as_ref() == peer_role).map(|(_, l)| l.clone())
+	let level = role_level(peer_role)?;
+	map.iter()
+		.filter_map(|(p, l)| role_level(p).filter(|&pl| pl <= level).map(|pl| (pl, l)))
+		.max_by_key(|(pl, _)| *pl)
+		.map(|(_, l)| l.clone())
 }
 
 /// The known role a bare hat `APRV` (no parent, no attachments) vouches for in `c.r`.
@@ -272,8 +280,12 @@ mod tests {
 		let map = parse_hat_roles("contributor:supporter,leader:contributor").unwrap_or_default();
 		assert_eq!(map_hat_role(&map, "contributor"), Some("supporter".into()));
 		assert_eq!(map_hat_role(&map, "leader"), Some("contributor".into()));
-		// Omitted role denies
-		assert_eq!(map_hat_role(&map, "moderator"), None);
+		// Omitted role falls back to the closest lower mapped role
+		assert_eq!(map_hat_role(&map, "moderator"), Some("supporter".into()));
+		// Below the lowest mapped role, or unknown: no access
+		assert_eq!(map_hat_role(&map, "supporter"), None);
+		assert_eq!(map_hat_role(&map, "follower"), None);
+		assert_eq!(map_hat_role(&map, "king"), None);
 		assert_eq!(map_hat_role(&[], "contributor"), None);
 	}
 
@@ -311,7 +323,7 @@ mod tests {
 		let map = Some("contributor:supporter");
 		assert!(check_hat_aprv(&ok, B, peer(ProfileType::Person, true, map)).is_err());
 		assert!(check_hat_aprv(&ok, B, peer(ProfileType::Community, false, map)).is_err());
-		let unmapped = peer(ProfileType::Community, true, Some("follower:follower"));
+		let unmapped = peer(ProfileType::Community, true, Some("leader:follower"));
 		assert!(check_hat_aprv(&ok, B, unmapped).is_err());
 		let leader = peer(ProfileType::Community, true, Some("contributor:leader"));
 		assert!(check_hat_aprv(&ok, B, leader).is_err());
@@ -337,6 +349,7 @@ mod tests {
 			hidden_in_home: None,
 			hat_roles: Some("contributor:supporter".into()),
 			peer_hat_roles: None,
+			hats: None,
 		};
 		let p = profile(None);
 		assert_eq!(hat_peer(&p), (ProfileType::Community, true, Some("contributor:supporter")));

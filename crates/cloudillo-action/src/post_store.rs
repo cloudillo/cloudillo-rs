@@ -219,15 +219,8 @@ pub async fn process_after_store(
 		if !targets.is_empty() {
 			let app_ref = app.clone();
 			tokio::spawn(async move {
-				let ensure = match app_ref.ext::<cloudillo_core::EnsureProfileFn>() {
-					Ok(f) => f,
-					Err(e) => {
-						debug!(error = %e, "ensure_profile (inbound): extension not registered");
-						return;
-					}
-				};
 				for id_tag in targets {
-					if let Err(e) = ensure(&app_ref, tn_id, &id_tag).await {
+					if let Err(e) = cloudillo_core::ensure_profile(&app_ref, tn_id, &id_tag).await {
 						debug!(id_tag = %id_tag, error = %e, "ensure_profile (inbound) failed");
 					}
 				}
@@ -285,14 +278,7 @@ async fn execute_hook(
 		)
 		.created_at(format!("{}", action.created_at.0))
 		.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
-		.tenant(
-			tn_id,
-			tenant.id_tag.to_string(),
-			match tenant.typ {
-				meta_adapter::ProfileType::Community => "community",
-				meta_adapter::ProfileType::Person => "person",
-			},
-		)
+		.tenant(tn_id, tenant.id_tag.to_string(), tenant.typ.as_str())
 		.client_address(ctx.client_address().map(String::from))
 		.pre_approved(matches!(ctx, ProcessingContext::Inbound { pre_approved: true, .. }));
 

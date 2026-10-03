@@ -9,6 +9,7 @@ pub mod handler;
 pub mod idp_status;
 pub mod list;
 pub mod media;
+pub mod partners;
 pub mod perm;
 pub mod register;
 pub mod settings;
@@ -44,6 +45,7 @@ pub fn init(app: &App) -> ClResult<()> {
 	app.scheduler.register::<media::TenantImageUpdaterTask>()?;
 	app.scheduler.register::<sync::ProfileRefreshBatchTask>()?;
 	app.scheduler.register::<sync::ProfilePicSyncTask>()?;
+	app.scheduler.register::<partners::PartnerSyncTask>()?;
 	Ok(())
 }
 

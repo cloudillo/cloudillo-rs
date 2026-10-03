@@ -122,6 +122,8 @@ pub(super) fn init(app: App) -> Router<App> {
 		)
 		// Auth only — handlers self-enforce moderator+
 		.merge(tables::profile::channels_admin())
+		// Auth only — handlers self-enforce the unscoped tenant owner
+		.merge(tables::profile::partners_own())
 		.merge(
 			tables::admin::tenant()
 				.layer(middleware::from_fn_with_state(app.clone(), admin::perm::require_admin)),

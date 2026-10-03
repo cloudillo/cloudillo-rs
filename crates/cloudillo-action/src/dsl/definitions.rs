@@ -35,6 +35,7 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		invt_definition(),
 		prinvt_definition(),
 		apkg_definition(),
+		ptnr_definition(),
 	]
 }
 
@@ -244,6 +245,57 @@ fn post_definition() -> ActionDefinition {
 			"v": 1,
 			"body": [{ "field": "content", "extract": "text" }]
 		})),
+	}
+}
+
+/// PTNR - Partnership announcement: the issuing community is now connected to the
+/// community in `subject` (`@idTag`). Broadcast to followers, no content. Server-emitted
+/// only: issued once per side by the CONN hooks, `POST /api/actions` refuses it.
+/// `PTNR:DEL` retracts it (same key) when the connection ends.
+fn ptnr_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "PTNR".to_string(),
+		version: "1.0".to_string(),
+		description: "Announce a partnership between two communities".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("social".to_string()),
+			tags: Some(vec!["partnership".to_string(), "community".to_string()]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: Some({
+			let mut map = HashMap::new();
+			map.insert("DEL".to_string(), "Retract a partnership".to_string());
+			map
+		}),
+		fields: FieldConstraints {
+			content: Some(FieldConstraint::Forbidden),
+			audience: Some(FieldConstraint::Forbidden),
+			parent: Some(FieldConstraint::Forbidden),
+			attachments: Some(FieldConstraint::Forbidden),
+			subject: Some(FieldConstraint::Required),
+		},
+		schema: None,
+		behavior: BehaviorFlags {
+			broadcast: Some(true),
+			allow_unknown: Some(false),
+			requires_acceptance: Some(false),
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None,
+			on_receive: HookImplementation::None, // Native implementation registered via registry
+			on_accept: HookImplementation::None,
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("followers".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(false),
+		}),
+		key_pattern: Some("{type}:{issuer}:{subject}".to_string()),
+		search: None,
 	}
 }
 

@@ -117,6 +117,8 @@ pub struct MintCell {
 	pub status: StatusCode,
 	/// Claims of the minted token read back through `validate_access_token`.
 	pub claims: Option<AuthCtx>,
+	/// Expiry of the bearer this cell was minted from, when a child must not outlive it.
+	pub parent_exp: Option<Timestamp>,
 }
 
 fn tn_of(t: &Tenants, host: &str) -> TnId {
@@ -188,6 +190,7 @@ impl Minter<'_> {
 			req_desc: format!("{method} {uri}"),
 			status,
 			claims,
+			parent_exp: None,
 		});
 		tok
 	}
@@ -352,16 +355,49 @@ pub async fn mint_subjects(
 			..Default::default()
 		},
 	);
-	let tok = m.proxy("proxy-hat-hatted@club", CLUB, &r.hatted, &format!("&hat={aprv}")).await;
+	let hat_tok = m.proxy("proxy-hat-hatted@club", CLUB, &r.hatted, &format!("&hat={aprv}")).await;
+	let hat_exp = m.mints.last().and_then(|c| c.claims.as_ref()).and_then(|c| c.exp);
 	m.add(
 		"hatted@club",
 		CLUB,
-		tok,
+		hat_tok.clone(),
 		SubjectFacts {
 			id_tag: Some(r.hatted.id_tag.clone()),
 			kind: CredKind::Proxy,
 			relation: Relation::PeerHat,
 			roles: vec!["contributor".into()],
+			..Default::default()
+		},
+	);
+
+	// Hatted session: only a `file:` scope mint is open, capped by the room gate and parent exp.
+	let club_scope = format!("file:{}:R", canon_root(CLUB));
+	let closed_scope = "file:f1~zqm-club-cur-chan-closed-w-crdt:R";
+	let hat = hat_tok.as_deref();
+	let scoped = m
+		.get("scope-hatted@club", CLUB, &format!("/api/auth/access-token?scope={club_scope}"), hat)
+		.await;
+	if let Some(c) = m.mints.last_mut() {
+		c.parent_exp = hat_exp;
+	}
+	m.get(
+		"scope-hatted-closed@club",
+		CLUB,
+		&format!("/api/auth/access-token?scope={closed_scope}"),
+		hat,
+	)
+	.await;
+	m.get("refresh-hatted@club", CLUB, "/api/auth/access-token", hat).await;
+	// Not `proxy-…`: that prefix marks mints `smoke` requires to succeed.
+	m.get("proxytoken-hatted@club", CLUB, "/api/auth/proxy-token", hat).await;
+	m.add(
+		"hatted-scoped@club",
+		CLUB,
+		scoped,
+		SubjectFacts {
+			id_tag: Some(r.hatted.id_tag.clone()),
+			kind: CredKind::Proxy,
+			scope: Some(club_scope),
 			..Default::default()
 		},
 	);
@@ -488,6 +524,12 @@ pub async fn mint_subjects(
 		Some("idp_zqmatrix-unknown".into()),
 		SubjectFacts { kind: CredKind::Idp, ..Default::default() },
 	);
+	m.add(
+		"idp-mgmt@alice",
+		ALICE,
+		Some(crate::fixture::IDP_KEY.into()),
+		SubjectFacts { id_tag: Some(ALICE.into()), kind: CredKind::Idp, ..Default::default() },
+	);
 
 	hostile_subjects(&mut m, club_owner, alice_owner).await;
 	hostile_proxy_mints(&mut m).await;
@@ -497,8 +539,7 @@ pub async fn mint_subjects(
 }
 
 /// Subjects no curated row uses.
-const UNUSED_SUBJECTS: [&str; 13] = [
-	"sharelink-r@club",
+const UNUSED_SUBJECTS: [&str; 12] = [
 	"sharelink-c@club",
 	"sharelink-w@club",
 	"sharelink-a@club",

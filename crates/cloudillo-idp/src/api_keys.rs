@@ -37,10 +37,9 @@ fn api_key_access_allowed(
 	auth_id_tag: &str,
 	auth_roles: &[Box<str>],
 	target_id_tag: &str,
-	idp_domain: &str,
 	identity: Option<&Identity>,
 ) -> bool {
-	if auth_id_tag == target_id_tag || is_idp_admin(auth_id_tag, auth_roles, idp_domain) {
+	if auth_id_tag == target_id_tag || is_idp_admin(auth_roles) {
 		return true;
 	}
 	identity.is_some_and(|i| can_access_identity(i, auth_id_tag))
@@ -56,19 +55,12 @@ async fn authorize_api_key_access(
 	target_id_tag: &str,
 	id_tag_prefix: &str,
 	id_tag_domain: &str,
-	idp_domain: &str,
 ) -> ClResult<()> {
-	if api_key_access_allowed(&auth.id_tag, &auth.roles, target_id_tag, idp_domain, None) {
+	if api_key_access_allowed(&auth.id_tag, &auth.roles, target_id_tag, None) {
 		return Ok(());
 	}
 	let identity = idp_adapter.read_identity(id_tag_prefix, id_tag_domain).await?;
-	if api_key_access_allowed(
-		&auth.id_tag,
-		&auth.roles,
-		target_id_tag,
-		idp_domain,
-		identity.as_ref(),
-	) {
+	if api_key_access_allowed(&auth.id_tag, &auth.roles, target_id_tag, identity.as_ref()) {
 		return Ok(());
 	}
 	warn!(
@@ -216,7 +208,6 @@ pub async fn create_api_key(
 		&create_req.id_tag,
 		&id_tag_prefix,
 		&id_tag_domain,
-		&tenant_domain,
 	)
 	.await?;
 
@@ -290,15 +281,7 @@ pub async fn list_api_keys(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
 
-	authorize_api_key_access(
-		idp_adapter,
-		&auth,
-		id_tag,
-		&id_tag_prefix,
-		&id_tag_domain,
-		&tenant_domain,
-	)
-	.await?;
+	authorize_api_key_access(idp_adapter, &auth, id_tag, &id_tag_prefix, &id_tag_domain).await?;
 
 	let opts = ListApiKeyOptions {
 		id_tag_prefix: Some(id_tag_prefix),
@@ -360,15 +343,8 @@ pub async fn get_api_key(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
 
-	authorize_api_key_access(
-		idp_adapter,
-		&auth,
-		&query.id_tag,
-		&id_tag_prefix,
-		&id_tag_domain,
-		&tenant_domain,
-	)
-	.await?;
+	authorize_api_key_access(idp_adapter, &auth, &query.id_tag, &id_tag_prefix, &id_tag_domain)
+		.await?;
 
 	// List all keys for this identity and find the one with matching ID
 	let opts = ListApiKeyOptions {
@@ -420,15 +396,8 @@ pub async fn delete_api_key(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
 
-	authorize_api_key_access(
-		idp_adapter,
-		&auth,
-		&query.id_tag,
-		&id_tag_prefix,
-		&id_tag_domain,
-		&tenant_domain,
-	)
-	.await?;
+	authorize_api_key_access(idp_adapter, &auth, &query.id_tag, &id_tag_prefix, &id_tag_domain)
+		.await?;
 
 	// Use the ownership-scoped deletion to ensure the key belongs to this identity
 	let deleted = idp_adapter
@@ -488,7 +457,7 @@ mod tests {
 
 	fn allowed(auth: &str, roles: &[&str], identity: Option<&Identity>) -> bool {
 		let roles: Vec<Box<str>> = roles.iter().map(|r| Box::from(*r)).collect();
-		api_key_access_allowed(auth, &roles, TARGET, IDP_DOMAIN, identity)
+		api_key_access_allowed(auth, &roles, TARGET, identity)
 	}
 
 	#[test]
@@ -497,8 +466,9 @@ mod tests {
 	}
 
 	#[test]
-	fn idp_domain_owner_is_allowed() {
-		assert!(allowed(IDP_DOMAIN, &[], None));
+	fn role_less_idp_domain_credential_is_refused() {
+		// An `idp_` key naming the domain identity holds no roles.
+		assert!(!allowed(IDP_DOMAIN, &[], None));
 	}
 
 	#[test]

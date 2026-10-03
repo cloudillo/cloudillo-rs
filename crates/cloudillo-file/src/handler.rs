@@ -497,7 +497,11 @@ pub async fn get_file_list(
 	// visibility ladder means the former.
 	let rel = abac::subject_relation_to_tenant(&app, tn_id, subject_id_tag).await?;
 	let is_real_auth = is_authenticated && !subject_id_tag.is_empty() && subject_id_tag != "guest";
-	let is_tenant = subject_id_tag == tenant_id_tag.as_ref();
+	// The owner's own `file:` app token (it carries `sub`) keeps tenant level; scope only narrows.
+	let is_tenant = maybe_auth.as_ref().is_some_and(|a| {
+		abac::is_tenant_self(a, &tenant_id_tag)
+			|| (a.scope.is_some() && !a.anonymous && a.id_tag.as_ref() == tenant_id_tag.as_ref())
+	});
 
 	let access_level = relationship_level(is_tenant, rel.connected, rel.follower, is_real_auth);
 	opts.visible_levels = access_level.visible_levels().map(<[char]>::to_vec);
@@ -521,13 +525,19 @@ pub async fn get_file_list(
 	}
 
 	// Channel gate: files in rooms the reader cannot enter are absent (None = the tenant itself).
+	// A caller naming the tenant without being it (share link, `idp_` key) is gated as a guest.
 	let hatted = maybe_auth.as_ref().is_some_and(|a| a.hat.is_some());
+	let impostor = maybe_auth
+		.as_ref()
+		.is_some_and(|a| abac::names_tenant_without_being_it(a, &tenant_id_tag));
+	let (reader, reader_roles) =
+		if impostor { ("guest", &[][..]) } else { (subject_id_tag, subject_roles) };
 	opts.enterable_channels = cloudillo_core::channels::enterable_channels(
 		&app,
 		tn_id,
 		&tenant_id_tag,
-		subject_id_tag,
-		subject_roles,
+		reader,
+		reader_roles,
 		hatted,
 	)
 	.await?;

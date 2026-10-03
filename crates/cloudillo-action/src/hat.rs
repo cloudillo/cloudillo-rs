@@ -300,7 +300,7 @@ mod tests {
 		let unconnected = Some((ProfileType::Community, false, Some("contributor:supporter")));
 		assert!(check_hat_endorsement(&e, &p, unconnected, B).is_err());
 		// mapped (a `leader` target in a hand-edited map is rejected too)
-		assert!(check_hat_endorsement(&e, &p, peer(Some("follower:follower")), B).is_err());
+		assert!(check_hat_endorsement(&e, &p, peer(Some("leader:follower")), B).is_err());
 		assert!(check_hat_endorsement(&e, &p, peer(Some("contributor:leader")), B).is_err());
 		// hat matches
 		assert!(check(&e, &rel(|t| t.h = Some("c.example".into()))).is_err());

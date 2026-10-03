@@ -105,6 +105,15 @@ fn parse_trust(row: &sqlx::sqlite::SqliteRow) -> Result<Option<ProfileTrust>, sq
 	})
 }
 
+/// `hats` is stored as a JSON array so `""` (as yourself) round-trips unambiguously.
+/// An unparseable value reads as no list: it is a UI preference, not access state.
+fn parse_hats(row: &sqlx::sqlite::SqliteRow) -> Result<Option<Box<[Box<str>]>>, sqlx::Error> {
+	Ok(row
+		.try_get::<Option<String>, _>("hats")?
+		.and_then(|s| serde_json::from_str::<Vec<Box<str>>>(&s).ok())
+		.map(Vec::into_boxed_slice))
+}
+
 /// Convert a `ProfileTrust` to its CHAR(1) database representation.
 fn trust_to_db(trust: ProfileTrust) -> &'static str {
 	match trust {
@@ -120,7 +129,7 @@ pub(crate) async fn list(
 	opts: &ListProfileOptions,
 ) -> ClResult<Vec<Profile<Box<str>>>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT id_tag, name, type, profile_pic, status, synced_at, following, follower, connected, roles, trust, feed_read_at, msg_read_at, hidden_in_home, hat_roles, peer_hat_roles
+		"SELECT id_tag, name, type, profile_pic, status, synced_at, following, follower, connected, roles, trust, feed_read_at, msg_read_at, hidden_in_home, hat_roles, peer_hat_roles, hats
 		 FROM profiles WHERE type IS NOT NULL AND tn_id=",
 	);
 	query.push_bind(tn_id.0);
@@ -261,6 +270,7 @@ pub(crate) async fn list(
 			hidden_in_home: row.try_get::<Option<i64>, _>("hidden_in_home")?.map(|v| v != 0),
 			hat_roles: row.try_get("hat_roles")?,
 			peer_hat_roles: row.try_get("peer_hat_roles")?,
+			hats: parse_hats(row)?,
 		})
 	}))
 }
@@ -333,7 +343,7 @@ pub(crate) async fn read(
 ) -> ClResult<(Box<str>, Profile<Box<str>>)> {
 	let id_tag = normalize_id_tag(id_tag);
 	let res = sqlx::query(
-		"SELECT id_tag, type, name, profile_pic, status, synced_at, perm, following, follower, connected, roles, trust, feed_read_at, msg_read_at, hidden_in_home, hat_roles, peer_hat_roles, etag
+		"SELECT id_tag, type, name, profile_pic, status, synced_at, perm, following, follower, connected, roles, trust, feed_read_at, msg_read_at, hidden_in_home, hat_roles, peer_hat_roles, hats, etag
 		FROM profiles WHERE tn_id=? AND id_tag=?",
 	)
 	.bind(tn_id.0)
@@ -369,6 +379,7 @@ pub(crate) async fn read(
 			hidden_in_home: row.try_get::<Option<i64>, _>("hidden_in_home")?.map(|v| v != 0),
 			hat_roles: row.try_get("hat_roles")?,
 			peer_hat_roles: row.try_get("peer_hat_roles")?,
+			hats: parse_hats(&row)?,
 		};
 		Ok((etag, profile))
 	})
@@ -582,15 +593,19 @@ pub(crate) async fn upsert(
 		Patch::Value(Some(v)) => Some(v.as_ref()),
 		Patch::Value(None) | Patch::Null | Patch::Undefined => None,
 	};
+	let insert_hats: Option<String> = match &fields.hats {
+		Patch::Value(v) => Some(serde_json::to_string(v)?),
+		Patch::Null | Patch::Undefined => None,
+	};
 	let synced_at_now = matches!(&fields.synced, Patch::Value(true));
 
 	let insert_sql = if synced_at_now {
-		"INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, status, following, follower, connected, roles, trust, synced_at, etag, hat_roles, peer_hat_roles, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, ?, ?, unixepoch())
+		"INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, status, following, follower, connected, roles, trust, synced_at, etag, hat_roles, peer_hat_roles, hats, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, ?, ?, ?, unixepoch())
 		 ON CONFLICT(tn_id, id_tag) DO NOTHING"
 	} else {
-		"INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, status, following, follower, connected, roles, trust, etag, hat_roles, peer_hat_roles, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+		"INSERT INTO profiles (tn_id, id_tag, name, type, profile_pic, status, following, follower, connected, roles, trust, etag, hat_roles, peer_hat_roles, hats, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
 		 ON CONFLICT(tn_id, id_tag) DO NOTHING"
 	};
 
@@ -609,6 +624,7 @@ pub(crate) async fn upsert(
 		.bind(insert_etag)
 		.bind(insert_hat_roles)
 		.bind(insert_peer_hat_roles)
+		.bind(insert_hats)
 		.execute(&mut *tx)
 		.await
 		.db()?;
@@ -667,6 +683,8 @@ pub(crate) async fn upsert(
 	has_updates = push_patch!(query, has_updates, "peer_hat_roles", &fields.peer_hat_roles, |v| {
 		v.as_ref().map(AsRef::as_ref)
 	});
+	has_updates =
+		push_patch!(query, has_updates, "hats", &fields.hats, |v| serde_json::to_string(v)?);
 	has_updates = push_patch!(query, has_updates, "etag", &fields.etag, |v| v.as_ref());
 
 	if has_updates {

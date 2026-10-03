@@ -39,6 +39,38 @@ pub async fn list_actions(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Query(mut opts): Query<meta_adapter::ListActionOptions>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<meta_adapter::ActionView>>>)> {
+	let is_tenant = maybe_auth
+		.as_ref()
+		.is_some_and(|a| cloudillo_core::abac::is_tenant_self(a, &tenant_id_tag));
+	// A credential that names the tenant without being its account (a share link, an `idp_`
+	// key) is anonymous here: every visibility rule below reads the tenant's id_tag as owner.
+	let maybe_auth = maybe_auth
+		.filter(|a| !cloudillo_core::abac::names_tenant_without_being_it(a, &tenant_id_tag));
+	// A leader sees what a single GET lets them see: `abac`'s leader override, which a
+	// delegated (scoped) token never gets.
+	let is_leader = maybe_auth
+		.as_ref()
+		.is_some_and(|a| a.scope.is_none() && cloudillo_core::roles::is_leader(&a.roles[..]));
+
+	// `status=` narrows, never widens: hidden statuses stay out, and pending moderation (`C`)
+	// is the tenant's and its leaders'.
+	if let Some(status) = opts.status.take() {
+		let status: Vec<String> = status
+			.into_iter()
+			.filter(|s| !meta_adapter::HIDDEN_ACTION_STATUSES.contains(&s.as_str()))
+			.filter(|s| is_tenant || is_leader || s != "C")
+			.collect();
+		if status.is_empty() {
+			let response = if opts.count == Some(true) {
+				ApiResponse::with_count(0)
+			} else {
+				ApiResponse::with_cursor_pagination(Vec::new(), None, false)
+			};
+			return Ok((StatusCode::OK, Json(response.with_req_id(req_id.unwrap_or_default()))));
+		}
+		opts.status = Some(status);
+	}
+
 	// Filter actions by visibility based on subject's access level
 	let (subject_id_tag, is_authenticated) = match &maybe_auth {
 		Some(auth) => (auth.id_tag.as_ref(), true),
@@ -83,7 +115,6 @@ pub async fn list_actions(
 
 	// Hatted actions we relayed as the hat (hat_tag == us) are addressed elsewhere, under the
 	// destination's visibility: only the tenant itself lists them.
-	let is_tenant = is_authenticated && subject_id_tag == tenant_id_tag.as_ref();
 	if is_home_feed || !is_tenant {
 		opts.exclude_hat_tag = Some(tenant_id_tag.to_string());
 	}
@@ -119,12 +150,6 @@ pub async fn list_actions(
 
 	let limit = opts.limit.unwrap_or(20) as usize;
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
-
-	// A leader sees what a single GET lets them see: `abac`'s leader override, which a
-	// delegated (scoped) token never gets.
-	let is_leader = maybe_auth
-		.as_ref()
-		.is_some_and(|a| a.scope.is_none() && cloudillo_core::roles::is_leader(&a.roles[..]));
 
 	// Aggregate-only path: return a COUNT(*) of matching rows. Runs the SQL
 	// visibility guard (`push_visibility_guard`, the query-level equivalent of
@@ -305,6 +330,10 @@ pub async fn post_action(
 		&& scope.as_ref() == "apkg:publish"
 		&& action.typ.as_ref() != "APKG"
 	{
+		return Err(Error::PermissionDenied);
+	}
+	// PTNR is emitted only by the CONN hooks (`native_hooks::ptnr::announce_partnership`).
+	if helpers::extract_type_and_subtype(&action.typ).0 == "PTNR" {
 		return Err(Error::PermissionDenied);
 	}
 
@@ -646,6 +675,7 @@ pub async fn post_action_accept(
 	if let Some(resolved_type) = dsl.resolve_action_type(&action.typ, action.sub_typ.as_deref()) {
 		use crate::hooks::{HookContext, HookType};
 
+		let tenant_type = app.meta_adapter.read_tenant(tn_id).await?.typ.as_str();
 		let hook_context = HookContext::builder()
 			.action_id(&*action.action_id)
 			.action_type(&*action.typ)
@@ -663,7 +693,7 @@ pub async fn post_action_accept(
 			)
 			.created_at(format!("{}", action.created_at.0))
 			.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
-			.tenant(tn_id, &*id_tag, "person")
+			.tenant(tn_id, &*id_tag, tenant_type)
 			.inbound()
 			.build();
 
@@ -767,6 +797,7 @@ pub async fn post_action_reject(
 	if let Some(resolved_type) = dsl.resolve_action_type(&action.typ, action.sub_typ.as_deref()) {
 		use crate::hooks::{HookContext, HookType};
 
+		let tenant_type = app.meta_adapter.read_tenant(tn_id).await?.typ.as_str();
 		let hook_context = HookContext::builder()
 			.action_id(&*action.action_id)
 			.action_type(&*action.typ)
@@ -784,7 +815,7 @@ pub async fn post_action_reject(
 			)
 			.created_at(format!("{}", action.created_at.0))
 			.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
-			.tenant(tn_id, &*id_tag, "person")
+			.tenant(tn_id, &*id_tag, tenant_type)
 			.inbound()
 			.build();
 
@@ -878,6 +909,9 @@ pub struct PatchActionRequest {
 	pub x: Option<serde_json::Value>,
 	#[serde(rename = "publishAt")]
 	pub publish_at: Option<cloudillo_types::types::Timestamp>,
+	/// Room of a root draft; `null` moves it back to the open floor.
+	#[serde(default)]
+	pub channel: cloudillo_types::types::Patch<String>,
 }
 
 /// PATCH /api/actions/:action_id - Update a draft action
@@ -885,7 +919,7 @@ pub async fn patch_action(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	IdTag(_id_tag): IdTag,
+	IdTag(id_tag): IdTag,
 	Path(action_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<PatchActionRequest>,
@@ -902,6 +936,24 @@ pub async fn patch_action(
 	}
 	if action.issuer.id_tag.as_ref() != auth.id_tag.as_ref() {
 		return Err(Error::PermissionDenied);
+	}
+	// Same rule as create: only a root takes an explicit room, and it must be enterable.
+	// A null would clear the channel a reply inherited from its thread, so it is refused too.
+	if !req.channel.is_undefined()
+		&& !task::is_root_action(action.parent_id.as_deref(), action.subject.as_deref())
+	{
+		return Err(Error::ValidationError("only a root action takes a channel".into()));
+	}
+	if let cloudillo_types::types::Patch::Value(channel) = &req.channel {
+		task::check_root_channel(
+			&app,
+			tn_id,
+			&id_tag,
+			&auth.id_tag,
+			action.audience.as_ref().map(|a| a.id_tag.as_ref()),
+			channel,
+		)
+		.await?;
 	}
 
 	// Build update options
@@ -944,6 +996,7 @@ pub async fn patch_action(
 			Some(ts) => cloudillo_types::types::Patch::Value(ts),
 			None => cloudillo_types::types::Patch::Undefined,
 		},
+		channel: req.channel,
 		..Default::default()
 	};
 

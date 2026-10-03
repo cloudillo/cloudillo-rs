@@ -14,10 +14,12 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::prelude::*;
-use cloudillo_core::extract::{Auth, OptionalRequestId};
-use cloudillo_core::roles::is_leader;
+use cloudillo_core::abac;
+use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
+use cloudillo_core::profile_visibility::RequesterTier;
 use cloudillo_types::meta_adapter::{
-	ListProfileOptions, ProfileConnectionStatus, ProfileStatus, ProfileTrust,
+	ListProfileOptions, Profile, ProfileConnectionStatus, ProfileStatus, ProfileTrust, ProfileType,
+	PublicProfileRow,
 };
 use cloudillo_types::types::{ApiResponse, ProfileInfo};
 use cloudillo_types::utils::normalize_id_tag;
@@ -55,6 +57,8 @@ pub struct ProfileWithStatus {
 	pub hat_roles: Option<String>,
 	/// The peer community's hat map for our members, mirrored and advisory (leaders only)
 	pub peer_hat_roles: Option<String>,
+	/// Identities the tenant owner has used at this peer (`""` = as themselves; owner only)
+	pub hats: Option<Vec<String>>,
 }
 
 /// Reduced, deliberately public projection returned by `GET /api/profiles/batch`.
@@ -78,6 +82,24 @@ pub struct PublicProfile {
 	#[serde(rename = "type")]
 	pub r#type: String,
 	pub profile_pic: Option<String>,
+}
+
+impl From<Profile<Box<str>>> for PublicProfile {
+	fn from(p: Profile<Box<str>>) -> Self {
+		PublicProfileRow { id_tag: p.id_tag, name: p.name, typ: p.typ, profile_pic: p.profile_pic }
+			.into()
+	}
+}
+
+impl From<PublicProfileRow> for PublicProfile {
+	fn from(p: PublicProfileRow) -> Self {
+		Self {
+			id_tag: p.id_tag.to_string(),
+			name: p.name.to_string(),
+			r#type: p.typ.as_str().to_string(),
+			profile_pic: p.profile_pic.map(|s| s.to_string()),
+		}
+	}
 }
 
 /// Hard server-side cap on `?idTags=` entries. Matches the shell's existing
@@ -181,12 +203,7 @@ pub async fn get_profiles_batch(
 		.read_profiles(tn_id, &tag_refs)
 		.await?
 		.into_iter()
-		.map(|p| PublicProfile {
-			id_tag: p.id_tag.to_string(),
-			name: p.name.to_string(),
-			r#type: crate::handler::profile_type_str(p.typ).to_string(),
-			profile_pic: p.profile_pic.map(|s| s.to_string()),
-		})
+		.map(PublicProfile::from)
 		.collect();
 
 	let response = ApiResponse::new(profiles).with_req_id(req_id.unwrap_or_default());
@@ -286,26 +303,73 @@ fn parse_status_list(value: &str) -> ClResult<Option<Box<[ProfileStatus]>>> {
 /// `status IS NULL` rows as Active, so legacy rows surface under this default
 /// and under any explicit filter that includes Active. Suspended, Blocked,
 /// and Banned are only returned when explicitly requested via `?status=...`.
+///
+/// Per-caller projection ([`RequesterTier::from_auth`]): only the owner tier gets the above.
+/// For everyone else `status` is forced to `[Active, Muted]` and the `trustSet`,
+/// `following` and `follower` filters are ignored; each row drops `status`, `following`,
+/// `follower`, `trust`, `feedReadAt`, `msgReadAt`, `hiddenInHome`, `hatRoles` and
+/// `peerHatRoles`, and non-members also drop `roles`. `hats` is the tenant account's alone.
+/// Connections follow the tenant's `profile.connection_visibility` per connected profile type:
+/// a non-owner lists only the types it may see (none → empty list, a forbidden `type=` → empty
+/// list), and only ever the Connected rows: `connected` is forced to Connected, and
+/// `connected=R` / `connected=false` give an empty list (followed, follower and disconnected
+/// contacts are not connections).
 pub async fn list_profiles(
 	State(app): State<App>,
 	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
+	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Query(params): Query<ListProfilesQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ProfileInfo>>>)> {
+	let is_self = abac::is_tenant_self(&auth, &tenant_id_tag);
+	let tier = RequesterTier::from_auth(&app, tn_id, &tenant_id_tag, Some(&auth)).await?;
+	let full = tier.is_owner;
+	let member = tier.max_role.is_some();
+	let sees = ConnectionSight::new(&app, tn_id, tier).await?;
+
+	let empty = |req_id: Option<String>| {
+		let response = ApiResponse::new(Vec::new()).with_req_id(req_id.unwrap_or_default());
+		Ok((StatusCode::OK, Json(response)))
+	};
+	let parsed = params.connected.as_deref().and_then(parse_connected);
+	// Non-owners list only the profile types whose connections they may see: every row is
+	// one of the tenant's contacts, so the list itself reveals the relationship.
+	let typ = if full {
+		params.typ
+	} else {
+		// Pending requests are the tenant's inbox; non-connections are not shown at all.
+		if parsed.is_some_and(|c| !c.is_connected()) {
+			return empty(req_id);
+		}
+		match params.typ {
+			Some(t) if !sees.of(t) => return empty(req_id),
+			Some(t) => Some(t),
+			None => match (sees.person, sees.community) {
+				(true, true) => None,
+				(true, false) => Some(ProfileType::Person),
+				(false, true) => Some(ProfileType::Community),
+				(false, false) => return empty(req_id),
+			},
+		}
+	};
+
+	let connected = if full { parsed } else { Some(ProfileConnectionStatus::Connected) };
+
 	// Build options for list_profiles
 	let status = match params.status.as_deref() {
-		Some(s) => parse_status_list(s)?,
-		None => Some(Box::from([ProfileStatus::Active, ProfileStatus::Muted])),
+		Some(s) if full => parse_status_list(s)?,
+		_ => Some(Box::from([ProfileStatus::Active, ProfileStatus::Muted])),
 	};
 	let opts = ListProfileOptions {
-		typ: params.typ,
+		typ,
 		status,
-		connected: params.connected.as_deref().and_then(parse_connected),
-		following: params.following,
-		follower: params.follower,
+		connected,
+		following: params.following.filter(|_| full),
+		follower: params.follower.filter(|_| full),
 		q: params.search.as_ref().map(|s| s.to_lowercase()),
 		id_tag: params.id_tag,
-		trust_set: params.trust_set,
+		trust_set: params.trust_set.filter(|_| full),
 		hidden_in_home: None,
 		// Unset: this endpoint keeps the name-ordered top-100 listing.
 		limit: None,
@@ -321,25 +385,26 @@ pub async fn list_profiles(
 		.map(|p| ProfileInfo {
 			id_tag: p.id_tag.to_string(),
 			name: p.name.to_string(),
-			r#type: Some(
-				match p.typ {
-					cloudillo_types::meta_adapter::ProfileType::Person => "person",
-					cloudillo_types::meta_adapter::ProfileType::Community => "community",
-				}
-				.to_string(),
-			),
+			r#type: Some(p.typ.as_str().to_string()),
 			profile_pic: p.profile_pic.map(|s| s.to_string()),
-			status: p.status,
+			status: p.status.filter(|_| full),
 			connected: Some(p.connected.is_connected()),
-			following: Some(p.following),
-			follower: Some(p.follower),
-			trust: p.trust,
-			roles: p.roles.map(|r| r.iter().map(ToString::to_string).collect()),
+			following: Some(p.following).filter(|_| full),
+			follower: Some(p.follower).filter(|_| full),
+			trust: p.trust.filter(|_| full),
+			roles: p
+				.roles
+				.filter(|_| full || member)
+				.map(|r| r.iter().map(ToString::to_string).collect()),
 			created_at: None, // Not available in Profile type
-			feed_read_at: p.feed_read_at,
-			msg_read_at: p.msg_read_at,
+			feed_read_at: p.feed_read_at.filter(|_| full),
+			msg_read_at: p.msg_read_at.filter(|_| full),
 			// NULL/0 in the column both mean "shown" → only surface a positive flag.
-			hidden_in_home: p.hidden_in_home.filter(|&h| h),
+			hidden_in_home: p.hidden_in_home.filter(|&h| h && full),
+			hat_roles: p.hat_roles.filter(|_| full).map(Into::into),
+			peer_hat_roles: p.peer_hat_roles.filter(|_| full).map(Into::into),
+			// `is_self` implies the owner tier.
+			hats: tenant_hats(p.hats, is_self),
 			x: None,
 		})
 		.collect();
@@ -349,47 +414,79 @@ pub async fn list_profiles(
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// The profile's hats, shown only to the tenant account itself.
+fn tenant_hats(hats: Option<Box<[Box<str>]>>, is_self: bool) -> Option<Vec<String>> {
+	hats.filter(|_| is_self).map(|h| h.iter().map(ToString::to_string).collect())
+}
+
+/// Which of the tenant's connections a caller may see, per connected profile type.
+struct ConnectionSight {
+	person: bool,
+	community: bool,
+}
+
+impl ConnectionSight {
+	async fn new(app: &App, tn_id: TnId, tier: RequesterTier) -> ClResult<Self> {
+		Ok(Self {
+			person: tier.sees_connections(app, tn_id, ProfileType::Person).await?,
+			community: tier.sees_connections(app, tn_id, ProfileType::Community).await?,
+		})
+	}
+
+	fn of(&self, typ: ProfileType) -> bool {
+		match typ {
+			ProfileType::Person => self.person,
+			ProfileType::Community => self.community,
+		}
+	}
+}
+
 /// GET /profile/:idTag - Get specific profile's local relationship state
 /// Returns the locally cached relationship data (connected, following, status)
 /// Returns empty/null if the profile is not known locally
+///
+/// Same projection as [`list_profiles`]: the relationship fields are the owner tier's,
+/// `connected` follows `profile.connection_visibility` for the profile's type, `hats` is the
+/// tenant account's alone.
 pub async fn get_profile_by_id_tag(
 	State(app): State<App>,
 	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Path(id_tag): Path<String>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Option<ProfileWithStatus>>>)> {
+	let is_self = abac::is_tenant_self(&auth, &tenant_id_tag);
+	let tier = RequesterTier::from_auth(&app, tn_id, &tenant_id_tag, Some(&auth)).await?;
+	let full = tier.is_owner;
 	// Lookup profile in local profiles table (relationship data)
 	let profile = match app.meta_adapter.read_profile(tn_id, &id_tag).await {
 		Ok((_etag, p)) => {
-			let (hat_roles, peer_hat_roles) =
-				if matches!(p.typ, cloudillo_types::meta_adapter::ProfileType::Community)
-					&& is_leader(&auth.roles)
-				{
-					(p.hat_roles.map(Into::into), p.peer_hat_roles.map(Into::into))
-				} else {
-					(None, None)
-				};
-			let typ = match p.typ {
-				cloudillo_types::meta_adapter::ProfileType::Person => None,
-				cloudillo_types::meta_adapter::ProfileType::Community => {
-					Some("community".to_string())
-				}
+			let (hat_roles, peer_hat_roles) = if p.typ == ProfileType::Community && full {
+				(p.hat_roles.map(Into::into), p.peer_hat_roles.map(Into::into))
+			} else {
+				(None, None)
 			};
+			let typ = match p.typ {
+				ProfileType::Person => None,
+				ProfileType::Community => Some("community".to_string()),
+			};
+			let sees = tier.sees_connections(&app, tn_id, p.typ).await?;
 			Some(ProfileWithStatus {
 				id_tag: p.id_tag.to_string(),
 				name: p.name.to_string(),
 				r#type: typ,
 				profile_pic: p.profile_pic.map(|s| s.to_string()),
-				status: p.status,
-				connected: Some(p.connected.is_connected()),
-				following: Some(p.following),
-				follower: Some(p.follower),
-				trust: p.trust,
-				feed_read_at: p.feed_read_at,
-				msg_read_at: p.msg_read_at,
+				status: p.status.filter(|_| full),
+				connected: Some(p.connected.is_connected()).filter(|_| sees),
+				following: Some(p.following).filter(|_| full),
+				follower: Some(p.follower).filter(|_| full),
+				trust: p.trust.filter(|_| full),
+				feed_read_at: p.feed_read_at.filter(|_| full),
+				msg_read_at: p.msg_read_at.filter(|_| full),
 				hat_roles,
 				peer_hat_roles,
+				hats: tenant_hats(p.hats, is_self),
 			})
 		}
 		Err(Error::NotFound) => None, // Return empty when not found locally

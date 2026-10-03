@@ -252,6 +252,7 @@ async fn authenticate(
 				scope: validation.scopes,
 				anonymous: false,
 				hat: None,
+				exp: None,
 			}
 		}
 		Some(ApiKeyType::Idp) => {
@@ -280,6 +281,7 @@ async fn authenticate(
 				scope: None,
 				anonymous: false,
 				hat: None,
+				exp: None,
 			}
 		}
 		None => {
@@ -405,6 +407,7 @@ pub async fn optional_auth(
 									scope: validation.scopes,
 									anonymous: false,
 									hat: None,
+									exp: None,
 								})
 							})
 						}
@@ -419,6 +422,7 @@ pub async fn optional_auth(
 										scope: None,
 										anonymous: false,
 										hat: None,
+										exp: None,
 									})),
 									Ok(None) => {
 										warn!(
@@ -528,6 +532,7 @@ mod tests {
 			scope: scope.map(Box::from),
 			anonymous: false,
 			hat: None,
+			exp: None,
 		}
 	}
 

@@ -180,6 +180,7 @@ mod tests {
 			scope: None,
 			anonymous: false,
 			hat: None,
+			exp: None,
 		}
 	}
 

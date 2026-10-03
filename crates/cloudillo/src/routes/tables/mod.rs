@@ -123,6 +123,8 @@ fn all_api_tables() -> axum::Router<crate::prelude::App> {
 		.merge(profile::own())
 		.merge(profile::channels_admin())
 		.merge(profile::channels_public())
+		.merge(profile::partners_list())
+		.merge(profile::partners_own())
 		.merge(profile::registration())
 		.merge(profile::public_discovery())
 		.merge(profile::recovery_public())

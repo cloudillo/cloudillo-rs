@@ -332,7 +332,7 @@ pub async fn delete_doc_format(
 /// document's index lives on its owner's node. The shell memoises the 403 for
 /// the session, so the app degrades to file-level hits without retry storms.
 fn require_tenant_admin(auth: &AuthCtx, tenant_id_tag: &str) -> ClResult<()> {
-	if abac::is_admin(auth) || &*auth.id_tag == tenant_id_tag {
+	if abac::is_tenant_self(auth, tenant_id_tag) {
 		return Ok(());
 	}
 	Err(Error::PermissionDenied)
@@ -350,9 +350,8 @@ fn require_tenant_admin(auth: &AuthCtx, tenant_id_tag: &str) -> ClResult<()> {
 /// group would lock a site admin out of the sibling `PUT`/`DELETE` routes
 /// [`require_tenant_admin`] deliberately admits them to.
 fn require_format_reader(auth: &AuthCtx, tenant_id_tag: &str) -> ClResult<()> {
-	if abac::is_admin(auth)
-		|| &*auth.id_tag == tenant_id_tag
-		|| cloudillo_core::roles::is_leader(&auth.roles)
+	if abac::is_tenant_self(auth, tenant_id_tag)
+		|| (auth.scope.is_none() && cloudillo_core::roles::is_leader(&auth.roles))
 	{
 		return Ok(());
 	}
@@ -498,6 +497,7 @@ mod tests {
 			scope: None,
 			anonymous: false,
 			hat: None,
+			exp: None,
 		}
 	}
 
@@ -512,7 +512,9 @@ mod tests {
 	fn reading_formats_is_one_step_looser_than_writing_them() {
 		// (who, may read, may write)
 		let cases = [
-			("the tenant owner", auth("alice.example", &[]), true, true),
+			("the tenant owner", auth("alice.example", &["leader"]), true, true),
+			// Names the account but holds no roles: an `idp_` management key.
+			("a role-less tenant credential", auth("alice.example", &[]), false, false),
 			("a site admin", auth("root.example", &["SADM"]), true, true),
 			("a community leader", auth("bob.example", &["leader"]), true, false),
 			// A member below leader is still a visitor as far as this route goes.

@@ -496,6 +496,13 @@ pub fn expected_inbox(c: &InboxCell) -> Expect {
 /// Expected outcome of a token-exchange cell, by its fixture name.
 pub fn expected_mint(c: &MintCell) -> Expect {
 	let n = c.name.as_str();
+	match n {
+		// A hatted session mints only `file:` scopes, and the room gate still applies.
+		"scope-hatted@club" => return allow("mint.hat.scoped"),
+		"scope-hatted-closed@club" => return deny("mint.hat.closed-room"),
+		"refresh-hatted@club" | "proxytoken-hatted@club" => return deny("mint.hat.refresh"),
+		_ => {}
+	}
 	let legit = [
 		"login-",
 		"proxy-",
@@ -538,6 +545,8 @@ pub fn check_mint_claims(c: &MintCell) -> Result<(), String> {
 	} else if n.starts_with("xchg-apikey-file@") || n == "scope-g-read-overask@alice" {
 		// The over-ask (`W`) is capped to g_read's own `R`.
 		Some(format!("file:{root}:R"))
+	} else if n == "scope-hatted@club" {
+		Some(format!("file:{root}:R"))
 	} else if n.starts_with("scope-apkg@") || n == "scope-apkg-m-leader@club" {
 		Some("apkg:publish".into())
 	} else {
@@ -549,6 +558,18 @@ pub fn check_mint_claims(c: &MintCell) -> Result<(), String> {
 	let has = |r: &str| cl.roles.iter().any(|x| &**x == r);
 	if n == "proxy-hat-hatted@club" && !(cl.hat.is_some() && has("contributor")) {
 		return Err("hat: missing hat or mapped contributor role".into());
+	}
+	if n == "scope-hatted@club" {
+		if cl.hat.as_deref() != Some("peer.test") || !has("contributor") {
+			return Err(format!(
+				"hat: {:?} / roles {:?}, want peer.test + contributor",
+				cl.hat, cl.roles
+			));
+		}
+		match (cl.exp, c.parent_exp) {
+			(Some(e), Some(p)) if e.0 <= p.0 => {}
+			(e, p) => return Err(format!("exp {e:?} not <= parent {p:?}")),
+		}
 	}
 	if n.starts_with("proxy-") && !n.contains("m-leader") && has("leader") {
 		return Err("roles: remote PROXY session carries leader".into());

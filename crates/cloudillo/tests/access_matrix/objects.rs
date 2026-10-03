@@ -21,9 +21,10 @@ use cloudillo::meta_adapter::{
 	UpdateActionDataOptions,
 };
 use cloudillo::types::{Patch, Timestamp, TnId};
+use cloudillo_core::channels::absolute_channel;
 use serde_json::json;
 
-use crate::fixture::{CLUB, RemoteId, Remotes, Tenant, Tenants, sign};
+use crate::fixture::{CHANNELS, CLUB, RemoteId, Remotes, Tenant, Tenants, sign};
 
 /// Visibility axis: `P V 2 F C S` and Direct (`None`).
 pub const VIS: [Option<char>; 7] =
@@ -80,6 +81,8 @@ pub struct FileSpec {
 	pub shape: FileShape,
 	pub kind: FileKind,
 	pub life: FileLife,
+	/// Bare room name; seeded as `@{tn}~{name}`.
+	pub channel: Option<&'static str>,
 }
 
 /// A seeded share entry on a file.
@@ -186,6 +189,8 @@ pub struct ActionSpec {
 	pub life: ActionLife,
 	/// `audience = tenant` (curated accept/reject objects).
 	pub to_tenant: bool,
+	/// Bare room name; seeded as `@{tn}~{name}` on the row and the token.
+	pub channel: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -205,6 +210,8 @@ pub struct ActionObj {
 	/// Container `action_id` the row names as `subject` (OnContainer).
 	pub subject: Option<String>,
 	pub hat_tag: Option<String>,
+	/// Absolute `@{tn}~{name}` of `spec.channel`.
+	pub channel: Option<Box<str>>,
 	pub content: serde_json::Value,
 	/// The stored signed token (`None` for drafts).
 	pub token: Option<String>,
@@ -328,7 +335,8 @@ fn specs(t: &Tenants) -> Vec<(FileSpec, TnId)> {
 						let name = format!("{shape:?}-{kind:?}-{}-{life:?}", vis_name(vis))
 							.to_ascii_lowercase()
 							.replace("tenantowned", "tenant");
-						let s = FileSpec { name, tn: tn.id_tag, vis, shape, kind, life };
+						let s =
+							FileSpec { name, tn: tn.id_tag, vis, shape, kind, life, channel: None };
 						if meaningful(is_club, &s) {
 							out.push((s, tn.tn_id));
 						}
@@ -339,10 +347,33 @@ fn specs(t: &Tenants) -> Vec<(FileSpec, TnId)> {
 	}
 	// Dedicated objects of mutating curated rows.
 	let cur = |name: &str, tn: &Tenant, shape, vis, life| {
-		let s =
-			FileSpec { name: name.into(), tn: tn.id_tag, vis, shape, kind: FileKind::Blob, life };
+		let s = FileSpec {
+			name: name.into(),
+			tn: tn.id_tag,
+			vis,
+			shape,
+			kind: FileKind::Blob,
+			life,
+			channel: None,
+		};
 		(s, tn.tn_id)
 	};
+	// Room-stamped `cur-chan-{room}-{file|crdt}`: tenant-owned, public, so only the room gates.
+	for (tn, room, ..) in CHANNELS {
+		let tn = if tn == CLUB { &t.club } else { &t.alice };
+		for (suffix, kind) in [("file", FileKind::Blob), ("crdt", FileKind::Crdt)] {
+			let s = FileSpec {
+				name: format!("cur-chan-{room}-{suffix}"),
+				tn: tn.id_tag,
+				vis: Some('P'),
+				shape: FileShape::TenantOwned,
+				kind,
+				life: FileLife::Active,
+				channel: Some(room),
+			};
+			out.push((s, tn.tn_id));
+		}
+	}
 	out.extend([
 		cur("cur-del-owner", &t.alice, TenantOwned, None, FileLife::Active),
 		cur("cur-del-gadmin", &t.alice, TenantOwned, None, FileLife::Active),
@@ -510,7 +541,7 @@ async fn seed_file(app: &App, o: &FileObj) {
 				tags: None,
 				x: None,
 				visibility: s.vis,
-				channel: None,
+				channel: s.channel.map(|c| absolute_channel(s.tn, c)),
 				hidden: false,
 				status: Some(FileStatus::Pending),
 			},
@@ -680,6 +711,7 @@ fn action_specs(t: &Tenants) -> Vec<(ActionSpec, TnId)> {
 							issuer,
 							life,
 							to_tenant: false,
+							channel: None,
 						};
 						if action_meaningful(is_club, &s) {
 							out.push((s, tn.tn_id));
@@ -699,6 +731,7 @@ fn action_specs(t: &Tenants) -> Vec<(ActionSpec, TnId)> {
 			issuer,
 			life,
 			to_tenant,
+			channel: None,
 		};
 		(s, tn.tn_id)
 	};
@@ -717,6 +750,14 @@ fn action_specs(t: &Tenants) -> Vec<(ActionSpec, TnId)> {
 		cur("cur-reject-owner", c, Issuer::Remote, Pending, true),
 		cur("cur-reject-mod", c, Issuer::Remote, Pending, true),
 	]);
+	// Room-stamped `cur-chan-{room}-post`: tenant-issued root, public.
+	for (tn, room, ..) in CHANNELS {
+		let tn = if tn == CLUB { c } else { a };
+		let (mut s, tn_id) =
+			cur(&format!("cur-chan-{room}-post"), tn, Issuer::Tenant, Active, false);
+		s.channel = Some(room);
+		out.push((s, tn_id));
+	}
 	out
 }
 
@@ -793,6 +834,7 @@ async fn seed_action(
 	let mut o = ActionObj {
 		issuer_tag: remote.map_or_else(|| spec.tn.to_string(), |x| x.id_tag.clone()),
 		hat_tag: (spec.typ == HatRelayed).then(|| r.peer.id_tag.clone()),
+		channel: spec.channel.map(|c| absolute_channel(spec.tn, c)),
 		spec,
 		tn_id,
 		action_id: String::new(),
@@ -823,6 +865,7 @@ async fn seed_action(
 					subject: o.subject.as_deref().map(Into::into),
 					content: Some(o.content.clone()),
 					visibility: o.spec.vis,
+					channel: o.channel.clone(),
 					..Default::default()
 				},
 			)
@@ -839,6 +882,7 @@ async fn seed_action(
 				sub: o.subject.as_deref().map(Into::into),
 				v: o.spec.vis,
 				h: o.hat_tag.as_deref().map(Into::into),
+				ch: o.channel.clone(),
 				..token_base(rm)
 			},
 		),
@@ -921,7 +965,7 @@ fn obj_row<'a>(o: &'a ActionObj, content: &'a str) -> Action<&'a str> {
 		created_at: Timestamp::now(),
 		visibility: o.spec.vis,
 		hat_tag: o.hat_tag.as_deref(),
-		channel: None,
+		channel: o.channel.as_deref(),
 		..Default::default()
 	}
 }

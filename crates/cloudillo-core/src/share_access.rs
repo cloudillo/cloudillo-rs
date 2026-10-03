@@ -205,6 +205,7 @@ pub async fn share_standing_for_actor(
 		scope: None,
 		anonymous: false,
 		hat: None,
+		exp: None,
 	};
 	share_standing(app, tn_id, file_id, &auth, tenant_id_tag).await
 }

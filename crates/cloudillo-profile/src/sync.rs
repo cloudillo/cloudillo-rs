@@ -325,6 +325,7 @@ async fn sync_profile_pic_variant(
 		tn_id,
 		id_tag,
 		file_id,
+		None,
 		Some(&[PROFILE_PIC_VARIANT]),
 		false,
 		Some('P'),
