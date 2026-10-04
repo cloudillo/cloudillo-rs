@@ -34,6 +34,8 @@ pub enum Route {
 	FileRefresh,
 	FileList,
 	FileContent,
+	/// `GET …/descriptor`: the variant list of the content held here.
+	FileDescriptor,
 	FileDelete,
 	FileRestore,
 	FileTag,
@@ -60,6 +62,9 @@ pub enum Route {
 	WsRtdb(Option<&'static str>),
 	/// `GET /api/channels`: the room's porch `status`, or `Absent` when unlisted.
 	ChanPorch(&'static str),
+	/// `GET /api/channels`: which of `minRole` / `closed` / `memberCount` the room's porch
+	/// entry carries (`+`-joined, `none`), or `Absent` when unlisted.
+	ChanPorchKeys(&'static str),
 	/// `POST /api/channels {name}`.
 	ChanCreate(&'static str),
 	/// `PATCH /api/channels/{name} {title}`.
@@ -85,6 +90,8 @@ pub enum Route {
 	PtnrDelCreate,
 	/// `GET /api/actions?{query}`: Present = the object is listed.
 	ActListQ(&'static str),
+	/// `GET /api/files?{query}`: Present = the object is listed.
+	FileListQ(&'static str),
 	/// `GET {uri}` of profile rows: `Empty` or `Listed`.
 	Ids(&'static str),
 	/// `GET {uri}` of profile rows: `Present` if the id_tag is listed, else `Absent`.
@@ -122,8 +129,9 @@ impl Route {
 			FilePatch => Op::File(F::Patch),
 			FileCreate => Op::File(F::CreateCrdt),
 			FileRefresh => Op::File(F::Refresh),
-			FileList => Op::File(F::List),
+			FileList | FileListQ(_) => Op::File(F::List),
 			FileContent => Op::File(F::Content),
+			FileDescriptor => Op::File(F::Descriptor),
 			FileDelete => Op::File(F::Delete),
 			FileRestore => Op::File(F::Restore),
 			FileTag => Op::File(F::Tag),
@@ -142,15 +150,23 @@ impl Route {
 			Outbox => Op::Outbox,
 			WsCrdt(a) => Op::Ws(WsKind::Crdt, a),
 			WsRtdb(a) => Op::Ws(WsKind::Rtdb, a),
-			FileUser | ReadMarker | Subscribe | ChanPorch(_) | ChanCreate(_) | ChanPatch(_)
-			| ChanDelete(_) | ChanMembers(_) | ChanUpload(_) | Profiles(_) | Partners
-			| PartnersMap | PartnersSync | PtnrCreate | PtnrDelCreate | Ids(_) | IdIn(..)
-			| HatsPatch(_) | Fields(..) | Get(_) => return None,
+			FileUser | ReadMarker | Subscribe | ChanPorch(_) | ChanPorchKeys(_) | ChanCreate(_)
+			| ChanPatch(_) | ChanDelete(_) | ChanMembers(_) | ChanUpload(_) | Profiles(_)
+			| Partners | PartnersMap | PartnersSync | PtnrCreate | PtnrDelCreate | Ids(_)
+			| IdIn(..) | HatsPatch(_) | Fields(..) | Get(_) => return None,
 		})
 	}
 
 	fn is_listing(self) -> bool {
-		matches!(self, FileList | ActList | ActCount | Search | Outbox | ChanFeed(_) | ActListQ(_))
+		matches!(
+			self,
+			FileList
+				| FileListQ(_)
+				| ActList | ActCount
+				| Search | Outbox
+				| ChanFeed(_)
+				| ActListQ(_)
+		)
 	}
 }
 
@@ -296,6 +312,41 @@ pub const FC: &[Row] = &[
 	// An `idp_` key gets no identity grants. No object is shared to alice's own id_tag, so this
 	// cannot catch a leaked `share_subject`; it pins the guest level only.
 	("FC-52", "idp-mgmt@alice", "tenant-crdt-d-active@alice", Search, "Absent"),
+	// v58 entry split on a non-folder BLOB: the direct share (keyed by entry_id) still grants,
+	// and nothing else reaches it. Links to a non-folder doc: G2-05..07 (root) and G2-10 (embed);
+	// API-created shares and multi-entry links: `share_lifecycle` /
+	// `share_link_sees_only_its_entry`.
+	("FC-53", "g_read@alice", "tenant-blob-d-active@alice", FileMeta, "Allow@Read"),
+	("FC-54", "stranger@alice", "tenant-blob-d-active@alice", FileMeta, "Deny"),
+	("FC-55", "follower@alice", "tenant-blob-d-active@alice", FileMeta, "Deny"),
+	("FC-56", "anon@alice", "tenant-blob-d-active@alice", FileMeta, "Deny"),
+	("FC-57", "sharelink-a@alice", "tenant-blob-d-active@alice", FileMeta, "Deny"),
+	("FC-58", "idp-key@alice", "tenant-blob-d-active@alice", FileMeta, "Deny"),
+	// Restore and duplicate from outside the tenant's grants, or with a credential that carries
+	// its id_tag without being the tenant. Same-drive moves: `same_drive_moves`.
+	("FC-59", "stranger@alice", "tenant-blob-p-trashed@alice", FileRestore, "Deny"),
+	("FC-60", "anon@alice", "tenant-blob-p-trashed@alice", FileRestore, "Deny"),
+	("FC-61", "sharelink-w@alice", "tenant-blob-p-trashed@alice", FileRestore, "Deny"),
+	("FC-62", "idp-key@alice", "tenant-blob-p-trashed@alice", FileRestore, "Deny"),
+	("FC-63", "stranger@alice", "tenant-blob-d-active@alice", FileDuplicate, "Deny"),
+	("FC-64", "anon@alice", "tenant-blob-d-active@alice", FileDuplicate, "Deny"),
+	("FC-65", "sharelink-r@alice", "tenant-blob-d-active@alice", FileDuplicate, "Deny"),
+	("FC-66", "idp-key@alice", "tenant-blob-p-active@alice", FileDuplicate, "Deny"),
+	// A reference (Pin / Place / FSHR) holds no bytes here: no reader, its placer and the FSHR
+	// audience included, gets content through it. Scenarios with local content under the same
+	// id: `a_pin_holds_no_local_bytes`, `a_forged_fshr_exposes_no_local_bytes`, and for a
+	// reference claiming to be a folder, `a_remote_folder_never_shadows_a_local_id`. Nor does it
+	// lend an attach or duplicate right, or a name: `a_pin_cannot_launder_attach_rights`,
+	// `duplicating_a_crdt_reference_does_not_copy_local_doc`,
+	// `attachment_name_never_comes_from_a_sibling`; nor may one name local content:
+	// `a_reference_cannot_name_local_content`.
+	("FC-67", "owner@alice", "tenant-blob-d-active@alice", FileDescriptor, "Allow"),
+	("FC-68", "owner@alice", "mirroredplacer-blob-p-active@alice", FileDescriptor, "Deny"),
+	("FC-69", "connected@alice", "mirroredplacer-blob-p-active@alice", FileDescriptor, "Deny"),
+	("FC-70", "m_leader@club", "mirroredplacer-blob-p-active@club", FileDescriptor, "Deny"),
+	("FC-71", "owner@alice", "mirroredfshr-blob-d-active@alice", FileDescriptor, "Deny"),
+	("FC-72", "anon@alice", "mirroredplacer-blob-p-active@alice", FileDescriptor, "Deny"),
+	("FC-73", "sharelink-r@alice", "mirroredplacer-blob-p-active@alice", FileDescriptor, "Deny"),
 ];
 
 const SHARES_ALICE: &str = "/api/shares?subjectType=U&subjectId=alice.test";
@@ -387,6 +438,16 @@ pub const WS: &[Row] = &[
 	("WS-23", "hatted-scoped@club", "root@club", WsCrdt(None), "Allow@Read"),
 	("WS-24", "hatted-scoped@club", "root@club", WsCrdt(Some("write")), "Deny"),
 	("WS-25", "hatted-scoped@club", "cur-chan-closed-w-crdt@club", WsCrdt(None), "Deny"),
+	// A room doc's `~meta` is gated by the room like the doc itself.
+	(
+		"WS-26",
+		"m_contributor@club",
+		"f1~zqm-club-cur-chan-closed-w-crdt~meta",
+		WsRtdb(None),
+		"Allow",
+	),
+	("WS-27", "m_moderator@club", "f1~zqm-club-cur-chan-closed-w-crdt~meta", WsRtdb(None), "Deny"),
+	("WS-28", "stranger@club", "f1~zqm-club-cur-chan-closed-w-crdt~meta", WsRtdb(None), "Deny"),
 ];
 
 /// Self-enforcing routes.
@@ -501,6 +562,13 @@ pub const CH: &[Row] = &[
 	("CH-64", "hatted@club", "", ChanPorch("closed-w"), "Absent"),
 	("CH-65", "owner@club", "", ChanPorch("closed-w"), "in"),
 	("CH-66", "owner@club", "", ChanPorch("gone"), "Absent"),
+	// Room facts beyond `status` go to members and admins only.
+	("CH-66a", "m_contributor@club", "", ChanPorchKeys("open-contrib"), "minRole+closed"),
+	("CH-66b", "m_supporter@club", "", ChanPorchKeys("open-contrib"), "none"),
+	("CH-66c", "stranger@club", "", ChanPorchKeys("open-contrib"), "none"),
+	("CH-66d", "anon@club", "", ChanPorchKeys("open-contrib"), "none"),
+	("CH-66e", "m_moderator@club", "", ChanPorchKeys("closed-w"), "minRole+closed+memberCount"),
+	("CH-66f", "owner@club", "", ChanPorchKeys("closed-w"), "minRole+closed+memberCount"),
 	// Admin: moderator+ and un-scoped; a hat mapped below moderator is refused.
 	("CH-67", "m_contributor@club", "", ChanCreate("zqm-contrib-new"), "Deny"),
 	("CH-68", "hatted@club", "", ChanCreate("zqm-hat-new"), "Deny"),
@@ -532,7 +600,28 @@ pub const CH: &[Row] = &[
 	("CH-91", "idp-mgmt@alice", CF_POST, ActList, "Absent"),
 	("CH-92", "sharelink-r@club", CW_POST, ActGet, "Deny"),
 	("CH-93", "sharelink-r@club", CW_POST, ActList, "Absent"),
+	// A drive's root listing (`parentId=__root__&channel=…`) applies the room gate too.
+	("CH-94", "owner@club", "tenant-blob-p-active@club", FileListQ(MAIN_ROOT), "Present"),
+	("CH-95", "owner@club", CW_FILE, FileListQ(CW_ROOT), "Present"),
+	("CH-96", "m_contributor@club", CW_FILE, FileListQ(CW_ROOT), "Present"),
+	("CH-97", "m_moderator@club", CW_FILE, FileListQ(CW_ROOT), "Absent"),
+	("CH-98", "m_supporter@club", CW_FILE, FileListQ(CW_ROOT), "Absent"),
+	("CH-99", "m_follower@club", CW_FILE, FileListQ(CW_ROOT), "Absent"),
+	("CH-100", "stranger@club", CW_FILE, FileListQ(CW_ROOT), "Absent"),
+	("CH-101", "anon@club", CW_FILE, FileListQ(CW_ROOT), "Absent"),
+	("CH-102", "hatted@club", CW_FILE, FileListQ(CW_ROOT), "Absent"),
+	("CH-103", "sharelink-r@club", CW_FILE, FileListQ(CW_ROOT), "Absent"),
+	// A share grant bypasses the room, at the root as in a by-id read (CH-46).
+	("CH-104", "g_read@club", CW_FILE, FileListQ(CW_ROOT), "Present"),
+	("CH-105", "idp-key@alice", CF_FILE, FileListQ(CF_ROOT), "Absent"),
+	("CH-106", "stranger@alice", CF_FILE, FileListQ(CF_ROOT), "Absent"),
+	// A room's object never lists at the main drive's root.
+	("CH-107", "owner@club", CW_FILE, FileListQ(MAIN_ROOT), "Absent"),
 ];
+
+const MAIN_ROOT: &str = "parentId=__root__&channel=";
+const CW_ROOT: &str = "parentId=__root__&channel=@club.test~closed-w";
+const CF_ROOT: &str = "parentId=__root__&channel=@alice.test~close-friends";
 
 /// Blocked profile the partners layer seeds on club before [`PT`] runs.
 pub const PT_BLOCKED: &str = "zqm-blocked.test";
@@ -558,8 +647,9 @@ pub const PT: &[Row] = &[
 	("PT-11", "stranger@club", "", Partners, "Listed"),
 	("PT-12", "anon@club", "", Partners, "Listed"),
 	("PT-17", "hatted@club", "", Partners, "Listed"),
-	// A person's list is its memberships, at the default `connected` visibility.
-	("PT-13", "stranger@alice", "", Partners, "Empty"),
+	// A person's list is its memberships, at the default `connected` visibility. An
+	// authenticated refusal is 403 (a syncing home node keeps its edges); anonymous is empty.
+	("PT-13", "stranger@alice", "", Partners, "Deny"),
 	("PT-14", "anon@alice", "", Partners, "Empty"),
 	("PT-15", "owner@alice", "", Partners, PT_MEMBERSHIP),
 	("PT-38", "connected@alice", "", Partners, PT_MEMBERSHIP),
@@ -595,9 +685,10 @@ pub const PT: &[Row] = &[
 /// [`PT`] partner rows re-run with club's `connection_visibility.community` = `supporter`:
 /// non-members get an empty list, members still see the partner.
 pub const PT_PRIVATE: &[Row] = &[
-	("PT-40", "stranger@club", "", Partners, "Empty"),
+	// Below the floor: authenticated callers get 403, anonymous an empty list.
+	("PT-40", "stranger@club", "", Partners, "Deny"),
 	("PT-41", "anon@club", "", Partners, "Empty"),
-	("PT-42", "m_follower@club", "", Partners, "Empty"),
+	("PT-42", "m_follower@club", "", Partners, "Deny"),
 	("PT-43", "m_contributor@club", "", Partners, "Listed"),
 	("PT-44", "owner@club", "", Partners, "Listed"),
 	// A hat is a member; `supporter` is the floor.
@@ -1035,6 +1126,7 @@ async fn observe(fx: &Fixture, s: &Subject, route: Route, tgt: &Tgt<'_>) -> Obse
 			list_paged(fx, s, &path, "actionId").await
 		}
 		ActListQ(q) => list_paged(fx, s, &format!("/api/actions?{q}&"), "actionId").await,
+		FileListQ(q) => list_paged(fx, s, &format!("/api/files?{q}&"), "fileId").await,
 		_ => list_presence(fx, s, op).await,
 	};
 	let Tgt::Obj(o) = tgt else {
@@ -1091,6 +1183,22 @@ async fn porch(fx: &Fixture, s: &Subject, room: &str) -> Result<String, String> 
 	}
 	let entry = body["data"].as_array().and_then(|a| a.iter().find(|e| e["name"] == room));
 	Ok(entry.and_then(|e| e["status"].as_str()).unwrap_or("Absent").to_owned())
+}
+
+/// Disclosure keys present on `room`'s porch entry, in [`ChanPorchKeys`] form.
+async fn porch_keys(fx: &Fixture, s: &Subject, room: &str) -> Result<String, String> {
+	let rows = match get_data(fx, s, "/api/channels").await {
+		Ok(rows) => rows,
+		Err(r) => return r,
+	};
+	let Some(e) = rows.iter().find(|e| e["name"] == room) else {
+		return Ok("Absent".into());
+	};
+	let keys: Vec<_> = ["minRole", "closed", "memberCount"]
+		.into_iter()
+		.filter(|k| e.get(*k).is_some_and(|v| !v.is_null() || *k == "minRole"))
+		.collect();
+	Ok(if keys.is_empty() { "none".into() } else { keys.join("+") })
 }
 
 /// `data` of a GET on `s.host` as rows (a single object is one row, `null` none);
@@ -1207,12 +1315,14 @@ pub async fn run(fx: &Fixture, layer: &'static str, mut cells: Vec<Cell>) -> Rep
 	let mut rep = Report::new(layer);
 	cells.sort_by_key(|c| c.want.starts_with("Allow"));
 	for c in cells {
+		rep.cell();
 		let obj = c.object.to_owned();
 		match (subject(fx, c.subject), target(fx, c.object)) {
 			(Some(s), Some(tgt)) => {
 				let want = c.want.trim_end_matches('*');
 				let got = match c.route {
 					ChanPorch(room) => porch(fx, s, room).await,
+					ChanPorchKeys(room) => porch_keys(fx, s, room).await,
 					Profiles(q) => profiles(fx, s, q).await,
 					Partners => partners(fx, s).await,
 					Ids(uri) => ids(fx, s, uri).await,

@@ -57,8 +57,9 @@ async fn connected_communities(app: &App, tn_id: TnId) -> ClResult<Vec<Profile<B
 /// GET /api/partners — connected community profiles of this tenant.
 ///
 /// These are the tenant's community connections, so `profile.connection_visibility.community`
-/// (else the base key, default `connected`) decides who sees them. Refusals are an empty
-/// list (200, so neither the setting nor the tenant's memberships are revealed).
+/// (else the base key, default `connected`) decides who sees them. An anonymous refusal is an
+/// empty list (200); an authenticated one is 403, so a syncing home node keeps its old edges
+/// instead of reading the refusal as "no partners".
 pub async fn list_partners(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -68,6 +69,9 @@ pub async fn list_partners(
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<PublicProfile>>>)> {
 	let tier = RequesterTier::from_auth(&app, tn_id, &tenant_id_tag, maybe_auth.as_ref()).await?;
 	let visible = tier.sees_connections(&app, tn_id, ProfileType::Community).await?;
+	if !visible && tier.is_authenticated {
+		return Err(Error::PermissionDenied);
+	}
 
 	let partners = if visible {
 		connected_communities(&app, tn_id)

@@ -4,15 +4,14 @@
 //! File management (PATCH, DELETE, restore, duplicate) handlers
 
 use axum::{
-	Json,
+	Extension, Json,
 	extract::{Path, Query, State},
 	http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
+use crate::perm::ResolvedEntry;
 use crate::prelude::*;
-use cloudillo_core::abac::VisibilityLevel;
 use cloudillo_core::dir_cache::DirCache;
 use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
 use cloudillo_core::file_access;
@@ -36,60 +35,269 @@ const TRASH_FOLDER_ID: &str = cloudillo_types::meta_adapter::TRASH_PARENT_ID;
 /// Uses UpdateFileOptions with Patch<> fields for proper null/undefined handling
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PatchFileResponse {
-	#[serde(rename = "fileId")]
-	pub file_id: String,
+	pub entry_id: String,
+	pub file_id: Option<String>,
 }
 
 /// May `caller` write the two publication columns (`visibility`, `status`) of a row?
 ///
-/// A row that originates here (`upstream_tag` NULL) is open — every other field of
+/// An entry that originates here (its own `upstream_tag` NULL) is open — every other field of
 /// `UpdateFileOptions` is record state and stays open regardless. On a *mirrored* row those two
 /// columns are the placer's alone: `handler::post_file_cross_context` records the placer in the
-/// raw `files.owner_tag`, while an FSHR-accepted row leaves that column NULL — nobody placed it,
+/// raw `entries.owner_tag`, while an FSHR-accepted row leaves that column NULL — nobody placed it,
 /// so nobody may republish it. The **raw** column is load-bearing: the resolved `FileView::owner`
 /// falls back to the tenant, which on a personal tenant is the recipient themselves.
-pub(crate) fn may_publish(
-	upstream_tag: Option<&str>,
-	owner_tag: Option<&str>,
-	caller: &str,
-) -> bool {
+pub fn may_publish(upstream_tag: Option<&str>, owner_tag: Option<&str>, caller: &str) -> bool {
 	upstream_tag.is_none() || owner_tag == Some(caller)
+}
+
+/// [`may_publish`] for a loaded entry. A managed mirror (`MANAGED_PARENT_ID` over synced
+/// content, `preset = 'sync'`: an inbound attachment or profile picture) is published by its
+/// action alone: its NULL `upstream_tag` would otherwise read as local and open it to everyone.
+/// A local managed upload (a post's own attachment) stays the uploader's.
+pub fn may_publish_entry(file: &meta_adapter::FileView, caller: &str) -> bool {
+	let mirror = file.parent_id.as_deref()
+		== Some(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+		&& file.preset.as_deref() == Some("sync");
+	!mirror && may_publish(file.upstream_tag.as_deref(), file.owner_tag.as_deref(), caller)
+}
+
+/// Refuse a reference from `upstream` over `file_id` when the id names a local non-BLOB or a
+/// reference from another upstream. A local BLOB is fine: the reference beside it never touches
+/// the local bytes. A lookup error refuses too. Shared by FSHR receive and Pin / Place.
+pub async fn check_reference_subject(
+	app: &App,
+	tn_id: TnId,
+	file_id: &str,
+	upstream: &str,
+) -> ClResult<()> {
+	let entries = file_access::access_entries(app, tn_id, file_id).await?;
+	let refused = entries.iter().find(|e| match e.upstream_tag.as_deref() {
+		Some(held_from) => held_from != upstream,
+		None => e.file_tp.as_deref() != Some("BLOB"),
+	});
+	if let Some(e) = refused {
+		warn!(
+			upstream = %upstream,
+			subject = %file_id,
+			held_from = ?e.upstream_tag,
+			"Reference refused: subject held from another origin"
+		);
+		return Err(Error::PermissionDenied);
+	}
+	Ok(())
+}
+
+/// PATCH body: the placement fields, plus the target drive of a root move.
+#[derive(Deserialize)]
+pub struct PatchFileRequest {
+	#[serde(flatten)]
+	pub opts: UpdateFileOptions,
+	/// Target drive of a root move, valid only with `parentId: null`: `null` = the main drive,
+	/// `@tenant~name` = that room. Absent = stay in the current drive.
+	#[serde(default)]
+	pub channel: Patch<String>,
+}
+
+/// Where a move lands, as `(parent entry, drive)`: a real folder and its drive, or the root and
+/// the requested drive (default: the current one). `None` when the patch is not a placement move.
+async fn move_target(
+	app: &App,
+	tn_id: TnId,
+	file: &meta_adapter::FileView,
+	parent_id: &Patch<String>,
+	channel: &Patch<String>,
+) -> ClResult<Option<(Option<String>, Option<Box<str>>)>> {
+	Ok(match (parent_id, channel) {
+		(Patch::Null, Patch::Undefined) => Some((None, file.channel.clone())),
+		(Patch::Value(p), Patch::Undefined) if p == meta_adapter::ROOT_PARENT_ID => {
+			Some((None, file.channel.clone()))
+		}
+		(Patch::Null, Patch::Null) => Some((None, None)),
+		(Patch::Null, Patch::Value(c)) => Some((None, Some(c.as_str().into()))),
+		(_, Patch::Null | Patch::Value(_)) => {
+			return Err(Error::ValidationError("channel is only valid with parentId: null".into()));
+		}
+		(Patch::Value(p), Patch::Undefined) if super::handler::is_terminal_parent(p) => {
+			return Err(Error::ValidationError("use DELETE to trash a file".into()));
+		}
+		(Patch::Value(p), Patch::Undefined) => {
+			let parent = app
+				.meta_adapter
+				.read_file(tn_id, p)
+				.await?
+				.ok_or_else(|| Error::ValidationError("parent folder not found".into()))?;
+			Some((Some(parent.entry_id.to_string()), parent.channel))
+		}
+		(Patch::Undefined, Patch::Undefined) => None,
+	})
+}
+
+/// Gate for any move: the target must take a new child from the caller (Write on the folder,
+/// or an enterable drive at the root — the create rules, share-link scope included; never the
+/// root for a credential that names the tenant without being it), and a folder never lands
+/// inside its own subtree. `channel` is the target drive, used only for a root target. Write on
+/// the moved entry is the route's `check_perm_file("write")`.
+async fn check_move_target(
+	app: &App,
+	auth: &cloudillo_types::auth_adapter::AuthCtx,
+	tenant_id_tag: &str,
+	file: &meta_adapter::FileView,
+	parent: Option<&str>,
+	channel: Option<&str>,
+) -> ClResult<()> {
+	if parent.is_none() && cloudillo_core::abac::names_tenant_without_being_it(auth, tenant_id_tag)
+	{
+		return Err(Error::PermissionDenied);
+	}
+	file_access::check_scope_allows_create_in(
+		&app.meta_adapter,
+		app.ext::<DirCache>()?,
+		auth.tn_id,
+		auth.scope.as_deref(),
+		parent,
+		None,
+	)
+	.await?;
+	if let Some(parent) = parent
+		&& file.file_tp.as_deref() == Some("FLDR")
+		&& (parent == &*file.entry_id
+			|| cloudillo_core::file_access::is_descendant_of(
+				&app.meta_adapter,
+				app.ext::<DirCache>()?,
+				auth.tn_id,
+				parent,
+				&file.entry_id,
+			)
+			.await?)
+	{
+		return Err(Error::ValidationError("cannot move a folder into itself".into()));
+	}
+	super::handler::reject_trashed_parent(app, auth.tn_id, parent).await?;
+	let root_channel = if parent.is_none() { channel } else { None };
+	super::handler::resolve_child_channel(
+		app,
+		auth.tn_id,
+		tenant_id_tag,
+		auth,
+		parent,
+		root_channel,
+	)
+	.await?;
+	Ok(())
+}
+
+/// Gate for a move into another drive: [`check_move_target`], and when the moved subtree holds
+/// entries the caller does not own, the caller must be moderator or higher in the source drive
+/// (the tenant itself for the main drive).
+async fn check_cross_drive_move(
+	app: &App,
+	auth: &cloudillo_types::auth_adapter::AuthCtx,
+	tenant_id_tag: &str,
+	file: &meta_adapter::FileView,
+	parent: Option<&str>,
+	channel: Option<&str>,
+) -> ClResult<()> {
+	if cloudillo_core::abac::names_tenant_without_being_it(auth, tenant_id_tag) {
+		return Err(Error::PermissionDenied);
+	}
+	check_move_target(app, auth, tenant_id_tag, file, parent, channel).await?;
+	if auth.id_tag.as_ref() == tenant_id_tag
+		|| (file.channel.is_some() && cloudillo_core::roles::is_moderator(&auth.roles))
+		|| app
+			.meta_adapter
+			.subtree_owned_by(auth.tn_id, &file.entry_id, &auth.id_tag)
+			.await?
+	{
+		Ok(())
+	} else {
+		Err(Error::PermissionDenied)
+	}
+}
+
+/// Move `file` to `(parent, channel)`: another drive → [`check_cross_drive_move`] and re-stamp
+/// the subtree; same drive → [`check_move_target`] and a `parent_id` write.
+async fn relocate(
+	app: &App,
+	auth: &cloudillo_types::auth_adapter::AuthCtx,
+	tenant_id_tag: &str,
+	file: &meta_adapter::FileView,
+	parent: Option<&str>,
+	channel: Option<&str>,
+) -> ClResult<()> {
+	if channel != file.channel.as_deref() {
+		check_cross_drive_move(app, auth, tenant_id_tag, file, parent, channel).await?;
+		return app
+			.meta_adapter
+			.move_entry_subtree(auth.tn_id, &file.entry_id, parent, channel)
+			.await;
+	}
+	check_move_target(app, auth, tenant_id_tag, file, parent, channel).await?;
+	let parent_id = parent.map_or(Patch::Null, |p| Patch::Value(p.to_owned()));
+	app.meta_adapter
+		.update_file_data(
+			auth.tn_id,
+			&file.entry_id,
+			&UpdateFileOptions { parent_id, ..Default::default() },
+		)
+		.await
 }
 
 pub async fn patch_file(
 	State(app): State<App>,
+	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(file_id): Path<String>,
-	Json(opts): Json<UpdateFileOptions>,
+	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
+	Json(req): Json<PatchFileRequest>,
 ) -> ClResult<Json<PatchFileResponse>> {
-	// `status` rides along on the same read as `visibility`. Blocking it is harmless today
-	// because `delete_file` trashes via `parent_id`, never through this field.
+	let mut opts = req.opts;
+	// `status` rides along on the same read as `visibility`, and is further held to `'A'` under
+	// the lifecycle gate below: `'D'` is a tombstone the GC hard-deletes, and delete / restore
+	// go through their own routes.
 	//
-	// Every other field in `UpdateFileOptions` is record state and stays open, so only this
-	// rare path pays the read. See `may_publish` for the rule.
-	if !opts.visibility.is_undefined() || !opts.status.is_undefined() {
-		let file =
-			app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or(Error::NotFound)?;
-		if !may_publish(file.upstream_tag.as_deref(), file.owner_tag.as_deref(), &auth.id_tag) {
-			warn!(
-				subject = %auth.id_tag,
-				file_id = %file_id,
-				"Refused visibility/status write on a mirrored row the caller did not place"
-			);
-			return Err(Error::PermissionDenied);
+	// Every other field in `UpdateFileOptions` is record state and stays open. See
+	// `may_publish` for the rule. `file` is the entry the guard resolved `{id}` to.
+	let entry_id = file.entry_id.to_string();
+	if (!opts.visibility.is_undefined() || !opts.status.is_undefined())
+		&& !may_publish_entry(&file, &auth.id_tag)
+	{
+		warn!(
+			subject = %auth.id_tag,
+			file_id = %file_id,
+			"Refused visibility/status write on a mirrored row the caller did not place"
+		);
+		return Err(Error::PermissionDenied);
+	}
+	if let Patch::Value(status) = &opts.status {
+		if *status != 'A' {
+			return Err(Error::ValidationError("status must be 'A'; use DELETE".into()));
 		}
+		require_lifecycle(&app, &auth, &tenant_id_tag, &file).await?;
 	}
 
-	app.meta_adapter.update_file_data(auth.tn_id, &file_id, &opts).await?;
-	invalidate_dir_cache(&app, auth.tn_id, &file_id);
-	if opts.affects_search_index() {
-		cloudillo_core::search_index_file(&app, auth.tn_id, &file_id);
+	// A move goes first; the rest of the patch follows.
+	let reindex = opts.affects_search_index();
+	let target = move_target(&app, auth.tn_id, &file, &opts.parent_id, &req.channel).await?;
+	if let Some((parent, channel)) = &target
+		&& (*channel != file.channel || parent.as_deref() != file.parent_id.as_deref())
+	{
+		relocate(&app, &auth, &tenant_id_tag, &file, parent.as_deref(), channel.as_deref()).await?;
+	}
+	if target.is_some() {
+		opts.parent_id = Patch::Undefined;
+	}
+	app.meta_adapter.update_file_data(auth.tn_id, &entry_id, &opts).await?;
+	invalidate_dir_cache(&app, auth.tn_id, &entry_id);
+	if reindex {
+		cloudillo_core::search_index_file(&app, auth.tn_id, &entry_id);
 	}
 
-	info!("User {} patched file {}", auth.id_tag, file_id);
+	info!("User {} patched file {}", auth.id_tag, entry_id);
 
-	Ok(Json(PatchFileResponse { file_id }))
+	Ok(Json(PatchFileResponse { file_id: file.file_id.as_deref().map(Into::into), entry_id }))
 }
 
 /// DELETE /file/:fileId - Move file to trash (soft delete)
@@ -102,9 +310,10 @@ pub struct DeleteFileQuery {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteFileResponse {
-	#[serde(rename = "fileId")]
-	pub file_id: String,
+	pub entry_id: String,
+	pub file_id: Option<String>,
 	/// True if file was permanently deleted, false if moved to trash
 	pub permanent: bool,
 }
@@ -133,15 +342,12 @@ pub async fn delete_file(
 	State(app): State<App>,
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
-	Path(file_id): Path<String>,
+	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
 	Query(query): Query<DeleteFileQuery>,
 ) -> ClResult<Json<DeleteFileResponse>> {
-	// Check if file exists
-	let file = app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or_else(|| {
-		warn!("delete_file: File {} not found", file_id);
-		Error::NotFound
-	})?;
 	require_lifecycle(&app, &auth, &tenant_id_tag, &file).await?;
+	let entry_id = file.entry_id.to_string();
+	let file_id = file.file_id.as_deref().map(Into::into);
 
 	if query.permanent {
 		// Permanent delete - only allowed if file is in trash
@@ -156,22 +362,22 @@ pub async fn delete_file(
 		// content-addressed, re-uploading identical content would resurrect the row along with any
 		// stale link or `'A'` grant still pointing at it. Soft delete deliberately keeps both, so
 		// restoring from trash keeps links and grants working.
-		let purged = app.meta_adapter.delete_file(auth.tn_id, &file_id).await?;
-		// Every id in the subtree, root first: one index call per removed row.
-		for id in &purged.file_ids {
+		let purged = app.meta_adapter.delete_file(auth.tn_id, &entry_id).await?;
+		// Every entry in the subtree, root first: one index call per removed entry.
+		for id in &purged.entry_ids {
 			invalidate_dir_cache(&app, auth.tn_id, id);
 			cloudillo_core::search_index_file(&app, auth.tn_id, id);
 		}
 		info!(
 			"User {} permanently deleted file {} ({} rows, {} share links, {} share entries)",
 			auth.id_tag,
-			file_id,
-			purged.file_ids.len(),
+			entry_id,
+			purged.entry_ids.len(),
 			purged.refs_removed,
 			purged.share_entries_removed
 		);
 
-		Ok(Json(DeleteFileResponse { file_id, permanent: true }))
+		Ok(Json(DeleteFileResponse { entry_id, file_id, permanent: true }))
 	} else {
 		// Soft delete - move to trash folder
 		// No cascade to document tree children: they follow the root implicitly
@@ -179,37 +385,37 @@ pub async fn delete_file(
 		app.meta_adapter
 			.update_file_data(
 				auth.tn_id,
-				&file_id,
+				&entry_id,
 				&UpdateFileOptions {
 					parent_id: Patch::Value(TRASH_FOLDER_ID.to_string()),
 					..Default::default()
 				},
 			)
 			.await?;
-		invalidate_dir_cache(&app, auth.tn_id, &file_id);
+		invalidate_dir_cache(&app, auth.tn_id, &entry_id);
 		// Trashing must take the file and its deep document parts out of the index
 		// here — nothing else would, since the sweep never pages the trash.
-		cloudillo_core::search_index_file(&app, auth.tn_id, &file_id);
+		cloudillo_core::search_index_file(&app, auth.tn_id, &entry_id);
 
-		info!("User {} moved file {} to trash", auth.id_tag, file_id);
+		info!("User {} moved file {} to trash", auth.id_tag, entry_id);
 
-		Ok(Json(DeleteFileResponse { file_id, permanent: false }))
+		Ok(Json(DeleteFileResponse { entry_id, file_id, permanent: false }))
 	}
 }
 
 /// POST /file/:fileId/restore - Restore file from trash
 #[derive(Debug, Deserialize)]
 pub struct RestoreFileRequest {
-	/// Target folder to restore to. If null/missing, restores to root.
+	/// Target folder to restore to. If null/missing, restores to the root of the entry's drive.
 	#[serde(rename = "parentId")]
 	pub parent_id: Option<String>,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RestoreFileResponse {
-	#[serde(rename = "fileId")]
-	pub file_id: String,
-	#[serde(rename = "parentId")]
+	pub entry_id: String,
+	pub file_id: Option<String>,
 	pub parent_id: Option<String>,
 }
 
@@ -217,45 +423,58 @@ pub async fn restore_file(
 	State(app): State<App>,
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
-	Path(file_id): Path<String>,
+	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
 	Json(req): Json<RestoreFileRequest>,
 ) -> ClResult<Json<RestoreFileResponse>> {
-	// Check if file exists and is in trash
-	let file = app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or_else(|| {
-		warn!("restore_file: File {} not found", file_id);
-		Error::NotFound
-	})?;
 	require_lifecycle(&app, &auth, &tenant_id_tag, &file).await?;
 
 	if file.parent_id.as_deref() != Some(TRASH_FOLDER_ID) {
 		return Err(Error::ValidationError("File is not in trash".into()));
 	}
 
-	// Move file to target folder (or root if not specified)
-	let target_parent_id = req.parent_id.clone();
-	app.meta_adapter
-		.update_file_data(
-			auth.tn_id,
-			&file_id,
-			&UpdateFileOptions {
-				parent_id: match &target_parent_id {
-					Some(id) => Patch::Value(id.clone()),
-					None => Patch::Null, // Move to root
-				},
-				..Default::default()
+	// Drive root only: trashing keeps no original folder, so without an explicit target the
+	// entry goes back to the root of its drive — the main drive when that room is gone.
+	let entry_id = file.entry_id.to_string();
+	let (target_parent_id, channel) = if let Some(p) = req.parent_id.as_deref() {
+		let parent = app
+			.meta_adapter
+			.read_file(auth.tn_id, p)
+			.await?
+			.ok_or_else(|| Error::ValidationError("parent folder not found".into()))?;
+		(Some(parent.entry_id.to_string()), parent.channel)
+	} else {
+		let room = file
+			.channel
+			.as_deref()
+			.and_then(|c| c.strip_prefix('@'))
+			.and_then(|c| c.strip_prefix(&*tenant_id_tag))
+			.and_then(|c| c.strip_prefix('~'));
+		let channel = match room {
+			Some(name) => match app.meta_adapter.read_channel(auth.tn_id, name).await {
+				Ok(_) => file.channel.clone(),
+				Err(Error::NotFound) => None,
+				Err(e) => return Err(e),
 			},
-		)
+			None => None,
+		};
+		(None, channel)
+	};
+	relocate(&app, &auth, &tenant_id_tag, &file, target_parent_id.as_deref(), channel.as_deref())
 		.await?;
-	invalidate_dir_cache(&app, auth.tn_id, &file_id);
+	invalidate_dir_cache(&app, auth.tn_id, &entry_id);
 	// Both halves of what trashing removed: the file's own row and its deep document
 	// parts. The document hook is a no-op for a file with no document store behind
 	// it, so it needs no `file_tp` check.
-	cloudillo_core::search_index_file(&app, auth.tn_id, &file_id);
-	cloudillo_core::search_index_document(&app, auth.tn_id, &file_id);
+	cloudillo_core::search_index_file(&app, auth.tn_id, &entry_id);
+	cloudillo_core::search_index_document(&app, auth.tn_id, file.index_id());
 
-	info!("User {} restored file {} to {:?}", auth.id_tag, file_id, target_parent_id);
+	info!("User {} restored file {} to {:?}", auth.id_tag, entry_id, target_parent_id);
 
-	Ok(Json(RestoreFileResponse { file_id, parent_id: target_parent_id }))
+	Ok(Json(RestoreFileResponse {
+		entry_id,
+		file_id: file.file_id.as_deref().map(Into::into),
+		parent_id: target_parent_id,
+	}))
 }
 
 /// DELETE /trash - Empty trash (permanently delete all files in trash)
@@ -303,8 +522,8 @@ pub async fn empty_trash(
 		if !file_access::can_manage_lifecycle(&file_ref, &ctx, level) {
 			continue;
 		}
-		let purged = app.meta_adapter.delete_file(auth.tn_id, &file.file_id).await?;
-		for id in &purged.file_ids {
+		let purged = app.meta_adapter.delete_file(auth.tn_id, &file.entry_id).await?;
+		for id in &purged.entry_ids {
 			invalidate_dir_cache(&app, auth.tn_id, id);
 			cloudillo_core::search_index_file(&app, auth.tn_id, id);
 		}
@@ -336,8 +555,8 @@ pub struct PatchFileUserDataRequest {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchFileUserDataResponse {
-	#[serde(rename = "fileId")]
-	pub file_id: String,
+	pub entry_id: String,
+	pub file_id: Option<String>,
 	#[serde(
 		serialize_with = "cloudillo_types::types::serialize_timestamp_iso_opt",
 		skip_serializing_if = "Option::is_none"
@@ -366,32 +585,34 @@ pub async fn patch_file_user_data(
 	if share_link || auth.id_tag.is_empty() || auth.id_tag.as_ref() == "guest" {
 		return Err(Error::PermissionDenied);
 	}
-	// Check if file exists
-	let file = app.meta_adapter.read_file(auth.tn_id, &file_id).await?.ok_or_else(|| {
-		warn!("patch_file_user_data: File {} not found", file_id);
-		Error::NotFound
-	})?;
+	// The entry the caller's context admits; one they cannot read is absent to them.
+	let ctx = file_access::FileAccessCtx::from_auth(Some(&auth), &tenant_id_tag);
+	let file = match file_access::resolve_placement(
+		&app,
+		auth.tn_id,
+		&file_id,
+		&ctx,
+		cloudillo_types::types::AccessLevel::Read,
+	)
+	.await
+	{
+		Ok(access) => access.file_view,
+		Err(Error::PermissionDenied) => return Err(Error::NotFound),
+		Err(e) => return Err(e),
+	};
 
 	// A scoped token (app iframe, file API key) marks only the file it is scoped to.
 	if matches!(
 		file_access::check_scope_allows_file(
+			&app.meta_adapter,
+			auth.tn_id,
 			auth.scope.as_deref(),
-			&file_id,
-			file.root_id.as_deref()
-		),
+			&file
+		)
+		.await,
 		file_access::ScopeCheck::Denied
 	) {
 		return Err(Error::PermissionDenied);
-	}
-
-	// Caller must be able to read the file; otherwise it is absent to them.
-	let ctx = file_access::FileAccessCtx::from_auth(Some(&auth), &tenant_id_tag);
-	let file_ref = file_access::FileRef::from_view(&file, &tenant_id_tag);
-	if !file_access::get_access_level(&app, auth.tn_id, file_ref, &ctx, None)
-		.await
-		.can_read()
-	{
-		return Err(Error::NotFound);
 	}
 
 	// Update user-specific data
@@ -408,7 +629,7 @@ pub async fn patch_file_user_data(
 		.update_file_user_data(
 			auth.tn_id,
 			&auth.id_tag,
-			&file_id,
+			&file.entry_id,
 			pinned,
 			starred,
 			Patch::Undefined,
@@ -417,11 +638,12 @@ pub async fn patch_file_user_data(
 
 	info!(
 		"User {} updated file {} user data: pinned={}, starred={}",
-		auth.id_tag, file_id, user_data.pinned, user_data.starred
+		auth.id_tag, file.entry_id, user_data.pinned, user_data.starred
 	);
 
 	Ok(Json(PatchFileUserDataResponse {
-		file_id,
+		entry_id: file.entry_id.to_string(),
+		file_id: file.file_id.as_deref().map(Into::into),
 		accessed_at: user_data.accessed_at,
 		modified_at: user_data.modified_at,
 		pinned: user_data.pinned,
@@ -429,7 +651,9 @@ pub async fn patch_file_user_data(
 	}))
 }
 
-/// POST /api/files/:fileId/duplicate - Duplicate a CRDT or RTDB file
+/// POST /api/files/:fileId/duplicate - Copy a file.
+///
+/// CRDT / RTDB: new content (a deep copy). BLOB: a new entry over the same content.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DuplicateFileRequest {
@@ -466,11 +690,16 @@ pub async fn duplicate_file(
 		return Err(Error::PermissionDenied);
 	}
 	let file = access.file_view;
+	// A reference holds no local bytes, whatever its type: its `file_id` is the upstream's id,
+	// chosen by the upstream, and may name local content the caller cannot read.
+	if file.upstream_tag.is_some() {
+		return Err(Error::ValidationError("a reference holds no bytes to duplicate".into()));
+	}
 
 	let file_tp = file.file_tp.as_deref().unwrap_or("BLOB");
-	if file_tp != "CRDT" && file_tp != "RTDB" {
+	if !matches!(file_tp, "CRDT" | "RTDB" | "BLOB") {
 		return Err(Error::ValidationError(format!(
-			"Only CRDT and RTDB files can be duplicated, got '{}'",
+			"Only BLOB, CRDT and RTDB files can be duplicated, got '{}'",
 			file_tp
 		)));
 	}
@@ -480,11 +709,13 @@ pub async fn duplicate_file(
 	// which fails the `parent_id IS NULL` filter the listing uses for
 	// `parentId=__root__`, hiding the duplicate from the root view even though
 	// the source row is correctly NULL.
+	// A sentinel parent (`__trash__`, `__managed__`) — requested or inherited — lands at the root.
 	let parent_id = req
 		.parent_id
 		.filter(|s| !s.is_empty())
 		.map(Box::from)
-		.or_else(|| file.parent_id.clone().filter(|s| !s.is_empty()));
+		.or_else(|| file.parent_id.clone().filter(|s| !s.is_empty()))
+		.filter(|p| !super::handler::is_terminal_parent(p));
 
 	// A scoped (share-link) caller may only place the duplicate inside its own subtree —
 	// the same boundary `post_file` enforces for direct creation. Without it the
@@ -501,17 +732,69 @@ pub async fn duplicate_file(
 	)
 	.await?;
 	super::handler::reject_trashed_parent(&app, tn_id, parent_id.as_deref()).await?;
+	// The copy lands in its parent folder's drive, or at the root of the source's drive.
+	let root_channel = if parent_id.is_none() { file.channel.as_deref() } else { None };
+	let channel = super::handler::resolve_child_channel(
+		&app,
+		tn_id,
+		&tenant_id_tag,
+		&auth,
+		parent_id.as_deref(),
+		root_channel,
+	)
+	.await?;
+
+	let new_file_name = req.file_name.unwrap_or_else(|| format!("Copy of {}", file.file_name));
+	// BLOB / CRDT / RTDB only (checked above): each has a content id.
+	let content_id = file.file_id.clone().ok_or(Error::NotFound)?;
+
+	if file_tp == "BLOB" {
+		// Same content, new placement: a new entry over the existing content row.
+		if !matches!(file.status, meta_adapter::FileStatus::Active) {
+			return Err(Error::ValidationError("File content is not finalized".into()));
+		}
+		// A part belongs to its document tree; a top-level copy cannot carry its `root_id`.
+		if file.root_id.is_some() {
+			return Err(Error::ValidationError("Document parts cannot be duplicated".into()));
+		}
+		// A copy is the caller's to publish, so only a source they may publish is copied:
+		// duplicating a mirror cannot launder the right to republish it.
+		if !may_publish_entry(&file, &auth.id_tag) {
+			return Err(Error::PermissionDenied);
+		}
+		let entry_id = app
+			.meta_adapter
+			.create_entry_for_content(
+				tn_id,
+				&content_id,
+				meta_adapter::CreateFile {
+					parent_id,
+					owner_tag: Some(auth.id_tag.clone()),
+					file_name: new_file_name.into(),
+					tags: file.tags,
+					visibility: file.visibility,
+					channel,
+					..Default::default()
+				},
+			)
+			.await?;
+		info!("User {} copied file {} -> entry {}", auth.id_tag, file_id, entry_id);
+		cloudillo_core::search_index_file(&app, tn_id, &entry_id);
+		let data = super::handler::created_response(&entry_id, Some(&content_id));
+		let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+		return Ok((StatusCode::CREATED, Json(response)));
+	}
 
 	let new_file_id = utils::random_id()?;
 
-	let new_file_name = req.file_name.unwrap_or_else(|| format!("Copy of {}", file.file_name));
-
 	match file_tp {
 		"CRDT" => {
-			super::duplicate::duplicate_crdt_content(&app, tn_id, &file_id, &new_file_id).await?;
+			super::duplicate::duplicate_crdt_content(&app, tn_id, &content_id, &new_file_id)
+				.await?;
 		}
 		"RTDB" => {
-			super::duplicate::duplicate_rtdb_content(&app, tn_id, &file_id, &new_file_id).await?;
+			super::duplicate::duplicate_rtdb_content(&app, tn_id, &content_id, &new_file_id)
+				.await?;
 		}
 		_ => {
 			return Err(Error::ValidationError(format!(
@@ -521,7 +804,7 @@ pub async fn duplicate_file(
 		}
 	}
 
-	let _f_id = app
+	let created = app
 		.meta_adapter
 		.create_file(
 			tn_id,
@@ -537,6 +820,7 @@ pub async fn duplicate_file(
 				tags: file.tags,
 				x: file.x,
 				visibility: file.visibility,
+				channel,
 				status: Some(meta_adapter::FileStatus::Active),
 				..Default::default()
 			},
@@ -546,78 +830,9 @@ pub async fn duplicate_file(
 	info!("User {} duplicated file {} -> {}", auth.id_tag, file_id, new_file_id);
 	cloudillo_core::search_index_file(&app, tn_id, &new_file_id);
 
-	let data = json!({"fileId": new_file_id});
+	let data = super::handler::created_response(&created.entry_id, Some(&new_file_id));
 	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::CREATED, Json(response)))
-}
-
-/// Upgrade file visibility to match target visibility (only if more permissive)
-///
-/// This function is used when attaching files to posts. If a file has more
-/// restrictive visibility than the post, we upgrade the file's visibility
-/// so recipients can access it.
-///
-/// Returns true if upgrade was performed, false if no change needed or the caller may not
-/// publish this row. The refusal is logged here, not by the caller: `Ok(false)` also covers the
-/// ordinary "already visible enough" case, which is not worth a line.
-pub async fn upgrade_file_visibility(
-	app: &App,
-	tn_id: TnId,
-	file_id: &str,
-	target_visibility: Option<char>,
-	caller_id_tag: &str,
-) -> ClResult<bool> {
-	// Get current file data
-	let file = app.meta_adapter.read_file(tn_id, file_id).await?.ok_or_else(|| {
-		warn!("upgrade_file_visibility: File {} not found", file_id);
-		Error::NotFound
-	})?;
-
-	// Same gate `patch_file` applies to a direct `visibility` write — attaching a file to an
-	// action must not become the way around it. `Ok(false)` rather than `Err`: the only caller
-	// (`ActionCreatorTask::run`) already treats a failure here as non-fatal and continues.
-	if !may_publish(file.upstream_tag.as_deref(), file.owner_tag.as_deref(), caller_id_tag) {
-		warn!(
-			subject = %caller_id_tag,
-			file_id = %file_id,
-			"Refused visibility upgrade on a mirrored row the caller did not place — \
-			 recipients of the attaching action may not be able to read it"
-		);
-		return Ok(false);
-	}
-
-	let current = VisibilityLevel::from_char(file.visibility);
-	let target = VisibilityLevel::from_char(target_visibility);
-
-	// VisibilityLevel ordering: Public < Verified < ... < Connected < Direct
-	// Smaller value = more permissive
-	// Only upgrade if target is MORE permissive (smaller Ord value)
-	if target < current {
-		info!("Upgrading file {} visibility from {:?} to {:?}", file_id, current, target);
-
-		app.meta_adapter
-			.update_file_data(
-				tn_id,
-				file_id,
-				&UpdateFileOptions {
-					visibility: match target_visibility {
-						Some(c) => Patch::Value(c),
-						None => Patch::Null,
-					},
-					..Default::default()
-				},
-			)
-			.await?;
-		cloudillo_core::search_index_file(app, tn_id, file_id);
-
-		Ok(true)
-	} else {
-		debug!(
-			"File {} visibility {:?} already meets or exceeds target {:?}",
-			file_id, current, target
-		);
-		Ok(false)
-	}
 }
 
 #[cfg(test)]
@@ -645,10 +860,10 @@ mod tests {
 		assert!(!may_publish(Some("carol.example"), None, "tenant.example"));
 	}
 
-	/// `upgrade_file_visibility` is the second caller of this gate: attaching a file to an
-	/// action widens the file's visibility to the action's, with the *tenant's* id_tag as the
-	/// caller. A row a member pinned answers to that member, not to the tenant, so the
-	/// attachment path cannot republish it either.
+	/// The action attachment gate (`may_attach` in `cloudillo-action`) is the second caller:
+	/// attaching a file publishes it to the action's audience, and the tenant's id_tag must not
+	/// stand in for the actor. A row a member pinned answers to that member, not to the tenant, so
+	/// the attachment path cannot republish it either.
 	#[test]
 	fn the_tenant_cannot_republish_a_row_a_member_pinned() {
 		assert!(!may_publish(Some("carol.example"), Some("bob.example"), "tenant.example"));

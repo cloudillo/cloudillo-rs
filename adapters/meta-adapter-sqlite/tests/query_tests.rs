@@ -171,7 +171,7 @@ async fn include_tree_children_returns_document_tree_members() {
 	let opts = ListFileOptions { file_name: Some("tree".into()), ..Default::default() };
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
 	assert_eq!(result.len(), 1, "tree children must stay hidden by default");
-	assert_eq!(&*result[0].file_id, "f_root");
+	assert_eq!(result[0].index_id(), "f_root");
 
 	// The maintenance sweeps set the flag, and must see every document.
 	let opts = ListFileOptions {
@@ -180,7 +180,8 @@ async fn include_tree_children_returns_document_tree_members() {
 		..Default::default()
 	};
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let ids: Vec<&str> = result.iter().map(|f| &*f.file_id).collect();
+	let ids: Vec<&str> =
+		result.iter().map(cloudillo_types::meta_adapter::FileView::index_id).collect();
 	assert_eq!(ids.len(), 2, "got {ids:?}");
 	assert!(ids.contains(&"f_child"), "the sweep must reach documents inside a tree: {ids:?}");
 }
@@ -198,7 +199,7 @@ async fn test_list_files_not_parent_id_excludes_in_folder() {
 	// Without not_parent_id: both rows visible
 	let opts = ListFileOptions { file_name: Some("needle".into()), ..Default::default() };
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let names: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let names: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(names.iter().any(|n| n == "f_in"), "in-folder file should be present");
 	assert!(names.iter().any(|n| n == "f_out"), "out-of-folder file should be present");
 
@@ -209,7 +210,7 @@ async fn test_list_files_not_parent_id_excludes_in_folder() {
 		..Default::default()
 	};
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let names: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let names: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(!names.iter().any(|n| n == "f_in"), "in-folder file must be excluded");
 	assert!(names.iter().any(|n| n == "f_out"), "out-of-folder file should remain");
 }
@@ -230,7 +231,7 @@ async fn test_list_files_not_parent_id_nonexistent_passes_all() {
 		..Default::default()
 	};
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let names: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let names: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(names.iter().any(|n| n == "f_b1"));
 	assert!(names.iter().any(|n| n == "f_b2"));
 }
@@ -246,13 +247,13 @@ async fn test_list_files_by_id_includes_managed() {
 	// By-id lookup without parent_id must return the managed file.
 	let opts = ListFileOptions { file_id: Some(vec!["f_mgd".into()]), ..Default::default() };
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let names: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let names: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(names.iter().any(|n| n == "f_mgd"), "by-id lookup should return managed file");
 
 	// A plain browse must NOT return the managed file.
 	let opts = ListFileOptions { file_name: Some("avatar".into()), ..Default::default() };
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let names: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let names: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(!names.iter().any(|n| n == "f_mgd"), "browse must exclude managed file");
 }
 
@@ -267,13 +268,13 @@ async fn test_list_files_by_id_includes_trash() {
 	// By-id lookup without parent_id must return the trashed file.
 	let opts = ListFileOptions { file_id: Some(vec!["f_trash".into()]), ..Default::default() };
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let names: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let names: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(names.iter().any(|n| n == "f_trash"), "by-id lookup should return trashed file");
 
 	// A plain browse must NOT return the trashed file.
 	let opts = ListFileOptions { file_name: Some("deleted".into()), ..Default::default() };
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let names: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let names: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(!names.iter().any(|n| n == "f_trash"), "browse must exclude trashed file");
 }
 
@@ -359,7 +360,7 @@ async fn test_list_files_content_type_filter_with_include_folders() {
 	// content_type=image/* without include_folders: only the image (folders excluded)
 	let opts = ListFileOptions { content_type: Some(vec!["image/*".into()]), ..Default::default() };
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let ids: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(ids.iter().any(|n| n == "f_img"), "image must be present");
 	assert!(!ids.iter().any(|n| n == "f_txt"), "text file must be filtered out");
 	assert!(!ids.iter().any(|n| n == "fld_imgs"), "folder excluded without include_folders");
@@ -371,7 +372,7 @@ async fn test_list_files_content_type_filter_with_include_folders() {
 		..Default::default()
 	};
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let ids: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(ids.iter().any(|n| n == "f_img"), "image must be present");
 	assert!(ids.iter().any(|n| n == "fld_imgs"), "folder must pass via include_folders");
 	assert!(!ids.iter().any(|n| n == "f_txt"), "text file must stay filtered out");
@@ -394,14 +395,14 @@ async fn test_list_files_file_type_filter_with_include_folders() {
 		..Default::default()
 	};
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let ids: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(ids.iter().any(|n| n == "f_pic"), "BLOB file must be present");
 	assert!(ids.iter().any(|n| n == "fld_docs"), "folder must pass via include_folders");
 
 	// Without include_folders the folder is excluded.
 	let opts = ListFileOptions { file_type: Some(vec!["BLOB".into()]), ..Default::default() };
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let ids: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(ids.iter().any(|n| n == "f_pic"), "BLOB file must be present");
 	assert!(!ids.iter().any(|n| n == "fld_docs"), "folder excluded without include_folders");
 }
@@ -475,7 +476,7 @@ async fn test_list_files_local_only_excludes_remote() {
 	// Without local_only: both rows visible.
 	let opts = ListFileOptions { content_type: Some(vec!["image/*".into()]), ..Default::default() };
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let ids: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(ids.iter().any(|n| n == "f_local"));
 	assert!(ids.iter().any(|n| n == "f_remote"));
 
@@ -486,7 +487,7 @@ async fn test_list_files_local_only_excludes_remote() {
 		..Default::default()
 	};
 	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
-	let ids: Vec<String> = result.iter().map(|f| f.file_id.to_string()).collect();
+	let ids: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
 	assert!(ids.iter().any(|n| n == "f_local"), "member-created local file must remain");
 	assert!(!ids.iter().any(|n| n == "f_remote"), "remote cached file must be excluded");
 }
@@ -568,7 +569,8 @@ async fn create_file_at(
 }
 
 fn file_ids(files: &[cloudillo_types::meta_adapter::FileView]) -> Vec<&str> {
-	let mut ids: Vec<&str> = files.iter().map(|f| &*f.file_id).collect();
+	let mut ids: Vec<&str> =
+		files.iter().map(cloudillo_types::meta_adapter::FileView::index_id).collect();
 	ids.sort_unstable();
 	ids
 }

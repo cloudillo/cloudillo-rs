@@ -4,11 +4,12 @@
 //! File tag management handlers
 
 use axum::{
-	Json,
+	Extension, Json,
 	extract::{Path, Query, State},
 };
 use serde::{Deserialize, Serialize};
 
+use crate::perm::ResolvedEntry;
 use crate::prelude::*;
 use cloudillo_core::extract::Auth;
 
@@ -47,40 +48,46 @@ pub async fn list_tags(
 
 /// PUT /file/:fileId/tag/:tag - Add a tag to a file
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TagResponse {
+	pub entry_id: String,
 	pub tags: Vec<String>,
 }
 
 pub async fn put_file_tag(
 	State(app): State<App>,
 	Auth(auth): Auth,
-	Path((file_id, tag)): Path<(String, String)>,
+	Path((_, tag)): Path<(String, String)>,
+	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
 ) -> ClResult<Json<TagResponse>> {
 	// Validate tag - no forbidden characters
 	if tag.chars().any(|c| TAG_FORBIDDEN_CHARS.contains(&c)) {
 		return Err(Error::PermissionDenied);
 	}
 
-	let tags = app.meta_adapter.add_tag(auth.tn_id, &file_id, &tag).await?;
-	cloudillo_core::search_index_file(&app, auth.tn_id, &file_id);
+	let entry_id: String = file.entry_id.into();
+	let tags = app.meta_adapter.add_tag(auth.tn_id, &entry_id, &tag).await?;
+	cloudillo_core::search_index_file(&app, auth.tn_id, &entry_id);
 
-	info!("User {} added tag {} to file {}", auth.id_tag, tag, file_id);
+	info!("User {} added tag {} to file {}", auth.id_tag, tag, entry_id);
 
-	Ok(Json(TagResponse { tags }))
+	Ok(Json(TagResponse { entry_id, tags }))
 }
 
 /// DELETE /file/:fileId/tag/:tag - Remove a tag from a file
 pub async fn delete_file_tag(
 	State(app): State<App>,
 	Auth(auth): Auth,
-	Path((file_id, tag)): Path<(String, String)>,
+	Path((_, tag)): Path<(String, String)>,
+	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
 ) -> ClResult<Json<TagResponse>> {
-	let tags = app.meta_adapter.remove_tag(auth.tn_id, &file_id, &tag).await?;
-	cloudillo_core::search_index_file(&app, auth.tn_id, &file_id);
+	let entry_id: String = file.entry_id.into();
+	let tags = app.meta_adapter.remove_tag(auth.tn_id, &entry_id, &tag).await?;
+	cloudillo_core::search_index_file(&app, auth.tn_id, &entry_id);
 
-	info!("User {} removed tag {} from file {}", auth.id_tag, tag, file_id);
+	info!("User {} removed tag {} from file {}", auth.id_tag, tag, entry_id);
 
-	Ok(Json(TagResponse { tags }))
+	Ok(Json(TagResponse { entry_id, tags }))
 }
 
 // vim: ts=4

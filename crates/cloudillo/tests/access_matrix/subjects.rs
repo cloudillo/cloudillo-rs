@@ -539,9 +539,8 @@ pub async fn mint_subjects(
 }
 
 /// Subjects no curated row uses.
-const UNUSED_SUBJECTS: [&str; 12] = [
+const UNUSED_SUBJECTS: [&str; 11] = [
 	"sharelink-c@club",
-	"sharelink-w@club",
 	"sharelink-a@club",
 	"sharelink-c@alice",
 	"owner-scoped-c@alice",

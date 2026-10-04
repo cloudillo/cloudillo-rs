@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::prelude::*;
 use crate::variant::{Variant, VariantClass, VariantQuality};
 use cloudillo_types::hasher;
-use cloudillo_types::meta_adapter::{CreateFile, FileId, FileVariant, MANAGED_PARENT_ID};
+use cloudillo_types::meta_adapter::FileVariant;
 use cloudillo_types::types::ApiResponse;
 use cloudillo_types::types::SHARED_TN;
 
@@ -24,7 +24,6 @@ use cloudillo_types::types::SHARED_TN;
 struct RemoteFileMetadata {
 	content_type: Option<String>,
 	file_name: String,
-	created_at: Timestamp,
 	x: Option<serde_json::Value>,
 }
 
@@ -155,6 +154,9 @@ fn with_action(path: String, via: Option<&str>) -> String {
 ///   `file.sync_max_*` settings filter and sync every variant on the remote
 ///   descriptor. Used when the local tenant is the audience and acts as the
 ///   canonical mirror for downstream followers.
+/// * `prove` - Fetch the smallest selected variant from the remote even when it is held here,
+///   so the remote proves it has the bytes before the caller places an entry over content
+///   someone else brought in. A failed proof fails the sync.
 ///
 /// # Returns
 /// Ok(SyncResult) with details of what was synced
@@ -170,6 +172,7 @@ pub async fn sync_file_variants(
 	visibility: Option<char>,
 	channel: Option<&str>,
 	sync_all: bool,
+	prove: bool,
 ) -> ClResult<SyncResult> {
 	let mut result = SyncResult { file_id: file_id.to_string(), ..Default::default() };
 
@@ -321,6 +324,13 @@ pub async fn sync_file_variants(
 
 	// Build a set of variant names that should have their content synced
 	let variants_to_sync_set: HashSet<&str> = variants_to_sync.iter().map(|v| v.variant).collect();
+	// The variant fetched as proof of possession (`prove`), held or not.
+	let proof_variant = if prove {
+		let v = variants_to_sync.iter().min_by_key(|v| v.size).map(|v| v.variant);
+		Some(v.ok_or_else(|| Error::ValidationError("no variant to prove possession".into()))?)
+	} else {
+		None
+	};
 
 	debug!(
 		"Variants to sync content for: {:?}, total variants: {}",
@@ -329,12 +339,16 @@ pub async fn sync_file_variants(
 	);
 
 	// 6. Check if file already exists by file_id and get its f_id
-	let existing_f_id = app.meta_adapter.read_f_id_by_file_id(tn_id, file_id).await.ok();
+	let existing = match app.meta_adapter.read_content(tn_id, file_id).await {
+		Ok(c) => Some(c),
+		Err(Error::NotFound) => None,
+		Err(e) => return Err(e),
+	};
 
 	// Also get existing variant records to know which ones need to be created.
 	// Preserve the `available` flag so we can distinguish fully-synced rows from
 	// metadata-only stubs (available=false) created by an earlier partial sync.
-	let existing_variants: HashMap<String, bool> = if existing_f_id.is_some() {
+	let existing_variants: HashMap<String, bool> = if existing.is_some() {
 		app.meta_adapter
 			.list_file_variants(tn_id, cloudillo_types::meta_adapter::FileId::FileId(file_id))
 			.await
@@ -344,10 +358,15 @@ pub async fn sync_file_variants(
 		HashMap::new()
 	};
 
-	let (f_id, is_new_file): (Option<u64>, bool) = if let Some(f_id) = existing_f_id {
-		// File already exists - use its f_id to add missing variants
-		debug!("File {} already exists (f_id={}), syncing missing variants", file_id, f_id);
-		(Some(f_id), false)
+	// The entry comes only after the variants are synced (step 8): fresh content, sync content a
+	// failed sync left without one, or — for an action-free sync (a profile picture) — sync
+	// content only action entries hold, which would otherwise die with those actions
+	// (`create_managed_entry` is idempotent, so an existing action-free entry is kept). Content
+	// that is not a sync mirror never gets one here, so a sync never re-exposes a local row.
+	let (f_id, is_sync, needs_entry, file_name) = if let Some(c) = existing {
+		debug!("File {} already exists (f_id={}), syncing missing variants", file_id, c.f_id);
+		let is_sync = c.preset.as_deref() == Some("sync");
+		(c.f_id, is_sync, is_sync && (!c.has_entries || via_action.is_none()), None)
 	} else {
 		// Fetch file metadata from remote to get correct content_type and file_name
 		let metadata_path = with_action(format!("/files/{}/metadata", file_id), via_action);
@@ -358,47 +377,16 @@ pub async fn sync_file_variants(
 		};
 		let remote_file = remote_meta.data;
 
-		// Create file entry with file_id and status='P' (pending).
-		// Variants can be added to pending files, then finalize sets status='A'.
-		// All sync_file_variants callers create row-owned cached content
-		// (profile-pic sync, inbound action-attachment sync); user-uploaded
-		// files never reach this path. Park the row in the managed folder so
-		// the file GC can reap it once the owning row drops its reference.
-		let first_variant = &parsed_variants[0];
-		let create_opts = CreateFile {
-			orig_variant_id: Some(first_variant.variant_id.into()),
-			file_id: Some(file_id.into()),
-			preset: Some("sync".into()),
-			parent_id: Some(MANAGED_PARENT_ID.into()),
-			content_type: remote_file
-				.content_type
-				.unwrap_or_else(|| "application/octet-stream".into())
-				.into(),
-			file_name: remote_file.file_name.into(),
-			created_at: Some(remote_file.created_at),
-			visibility: Some(visibility.unwrap_or('D')),
-			channel: channel.map(Into::into),
-			x: remote_file.x,
-			..Default::default()
-		};
-
-		match app.meta_adapter.create_file(tn_id, create_opts).await {
-			Ok(FileId::FId(f_id)) => {
-				// The row already carries its `file_id`, so it is searchable before
-				// `finalize_file` flips it to Active.
-				cloudillo_core::search_index_file(app, tn_id, file_id);
-				(Some(f_id), true)
-			}
-			Ok(FileId::FileId(_)) => {
-				// Matched by orig_variant_id - shouldn't happen often but handle it
-				debug!("File {} matched existing by orig_variant_id", file_id);
-				(None, false)
-			}
-			Err(e) => {
-				warn!("Failed to create file entry for {}: {}", file_id, e);
-				return Err(e);
-			}
-		}
+		// A content row with no entry yet. `root_id` was verified above: it is hashed into
+		// `file_id`, so the mirrored descriptor still matches.
+		let content_type =
+			remote_file.content_type.as_deref().unwrap_or("application/octet-stream");
+		let f_id = app
+			.meta_adapter
+			.create_sync_content(tn_id, file_id, root_id, content_type, remote_file.x)
+			.await
+			.inspect_err(|e| warn!("Failed to create file content for {}: {}", file_id, e))?;
+		(f_id, true, true, Some::<Box<str>>(remote_file.file_name.into()))
 	};
 
 	// 7. Process ALL variants from the descriptor
@@ -407,11 +395,13 @@ pub async fn sync_file_variants(
 		let variant_id = variant.variant_id;
 		let variant_name = variant.variant;
 		let should_sync_content = variants_to_sync_set.contains(variant_name);
+		let is_proof = proof_variant == Some(variant_name);
 
-		// Skip only if the row is already AVAILABLE. If it's a metadata-only stub
+		// Skip only if the row is already AVAILABLE (never the proof variant, which is fetched
+		// whatever is held). If it's a metadata-only stub
 		// (available=false) and we're about to fetch the content, fall through so
 		// `create_file_variant`'s ON CONFLICT clause can upgrade it.
-		if matches!(existing_variants.get(variant_name), Some(true)) {
+		if !is_proof && matches!(existing_variants.get(variant_name), Some(true)) {
 			debug!("  variant {} record already available, skipping", variant_name);
 			result.skipped_variants.push(variant_name.to_string());
 			continue;
@@ -431,14 +421,18 @@ pub async fn sync_file_variants(
 		// shipped — no backfill).
 		let (blob_size, available, stored_global) = if should_sync_content {
 			let mut found: Option<(u64, bool)> = None;
-			if shared && let Some(stat) = app.blob_adapter.stat_blob(SHARED_TN, variant_id).await {
+			if shared
+				&& !is_proof && let Some(stat) =
+				app.blob_adapter.stat_blob(SHARED_TN, variant_id).await
+			{
 				info!(
 					"  shared variant {} already in the shared store, skipping download",
 					variant_id
 				);
 				found = Some((stat.size, true));
 			}
-			if found.is_none()
+			if !is_proof
+				&& found.is_none()
 				&& let Some(stat) = app.blob_adapter.stat_blob(tn_id, variant_id).await
 			{
 				debug!("  variant {} blob already exists", variant_name);
@@ -473,12 +467,10 @@ pub async fn sync_file_variants(
 						(size, true, shared)
 					}
 					Err(e) => {
-						// Atomic sync: any fetch failure aborts. The file row
-						// stays in status='P' and finalize_file is never reached.
-						// The caller (ActionVerifierTask) retries with exponential
-						// back-off; on the retry, variant_record_exists short-
-						// circuits already-synced variants and stat_blob short-
-						// circuits already-stored blobs.
+						// Atomic sync: any fetch failure aborts before the content gets an
+						// entry. The caller (ActionVerifierTask) retries with exponential
+						// back-off; on the retry, existing variant records and stored blobs
+						// are skipped, and step 8 adds the entry.
 						warn!("  failed to sync variant {}: {} — aborting sync", variant_name, e);
 						return Err(e);
 					}
@@ -492,34 +484,42 @@ pub async fn sync_file_variants(
 		};
 
 		// Create file variant record in MetaAdapter
-		if let Some(f_id) = f_id {
-			let file_variant = FileVariant {
-				variant_id,
-				variant: variant_name,
-				format: variant.format,
-				resolution: variant.resolution,
-				size: blob_size,
-				available,
-				global: stored_global,
-				duration: variant.duration,
-				bitrate: variant.bitrate,
-				page_count: variant.page_count,
-			};
+		let file_variant = FileVariant {
+			variant_id,
+			variant: variant_name,
+			format: variant.format,
+			resolution: variant.resolution,
+			size: blob_size,
+			available,
+			global: stored_global,
+			duration: variant.duration,
+			bitrate: variant.bitrate,
+			page_count: variant.page_count,
+		};
 
-			if let Err(e) = app.meta_adapter.create_file_variant(tn_id, f_id, file_variant).await {
-				warn!("  failed to create variant record for {}: {}", variant_name, e);
-			}
+		if let Err(e) = app.meta_adapter.create_file_variant(tn_id, f_id, file_variant).await {
+			warn!("  failed to create variant record for {}: {}", variant_name, e);
 		}
 	}
 
-	// 8. Finalize the file by setting file_id (only if we created a new file entry)
-	if is_new_file && let Some(f_id) = f_id {
-		if let Err(e) = app.meta_adapter.finalize_file(tn_id, f_id, file_id).await {
-			warn!("Failed to finalize file {}: {}", file_id, e);
-			// Variants are synced, just finalization failed
-		} else {
-			cloudillo_core::search_index_file(app, tn_id, file_id);
-		}
+	// 8. Finalize sync content (idempotent: it already carries its id), then give fresh content,
+	// or content a failed sync left without one, its entry.
+	if is_sync {
+		app.meta_adapter.finalize_file(tn_id, f_id, file_id).await?;
+		cloudillo_core::search_index_file(app, tn_id, file_id);
+	}
+	if needs_entry {
+		let name = file_name.as_deref().unwrap_or(file_id);
+		app.meta_adapter
+			.create_managed_entry(
+				tn_id,
+				file_id,
+				name,
+				via_action,
+				Some(visibility.unwrap_or('D')),
+				channel,
+			)
+			.await?;
 	}
 
 	info!(

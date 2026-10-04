@@ -231,7 +231,7 @@ fn validate_meta_id(file_id: &str) -> Option<&str> {
 /// separate from the document content. They are lazily created on first
 /// WebSocket connection. Access is inherited from the parent file.
 /// Creation is idempotent — concurrent calls for the same file_id are safe.
-async fn ensure_meta_file(
+pub async fn ensure_meta_file(
 	app: &crate::app::App,
 	tn_id: crate::types::TnId,
 	meta_file_id: &str,
@@ -244,6 +244,12 @@ async fn ensure_meta_file(
 		Err(e) => return Err(FileAccessError::InternalError(e.to_string())),
 	}
 
+	// A part joins its root's drive: the tree's channel filters must see it with the root.
+	let channel = match app.meta_adapter.read_file(tn_id, parent_file_id).await {
+		Ok(root) => root.and_then(|r| r.channel),
+		Err(e) => return Err(FileAccessError::InternalError(e.to_string())),
+	};
+
 	// Create meta file — idempotent (create_file with explicit file_id)
 	let create_opts = CreateFile {
 		file_id: Some(meta_file_id.into()),
@@ -252,6 +258,7 @@ async fn ensure_meta_file(
 		file_name: meta_file_id.into(),
 		status: Some(FileStatus::Active),
 		root_id: Some(parent_file_id.into()),
+		channel,
 		..Default::default()
 	};
 
@@ -322,6 +329,9 @@ fn ws_close_for_deny(ws: WebSocketUpgrade, deny: &WsDeny) -> Response {
 /// Pure with respect to the connection: no store/meta auto-creation (the handlers do
 /// that first). A `{parent}~meta` RTDB file is checked against its parent. Guests
 /// (`auth: None`) get Read; RTDB downgrades Comment to Read outside meta databases.
+///
+/// Returns the level and the resolved content id (`{content}~meta` for a meta id): an entry id
+/// in the path must open the content's document, not a new one named after the entry.
 pub async fn ws_file_access(
 	app: &crate::app::App,
 	tn_id: crate::types::TnId,
@@ -330,7 +340,7 @@ pub async fn ws_file_access(
 	file_id: &str,
 	query: &AccessQuery,
 	kind: WsKind,
-) -> Result<AccessLevel, WsDeny> {
+) -> Result<(AccessLevel, String), WsDeny> {
 	let (store_tp, meta_parent) = match kind {
 		WsKind::Crdt => ("CRDT", None),
 		WsKind::Rtdb => ("RTDB", validate_meta_id(file_id)),
@@ -347,23 +357,35 @@ pub async fn ws_file_access(
 	)
 	.await
 	.map_err(WsDeny::Access)?;
+	// A reference (Pin / Place / FSHR) holds no content here: its document lives upstream.
+	if result.file_view.upstream_tag.is_some() {
+		return Err(WsDeny::Access(FileAccessError::NotFound));
+	}
 
 	// Verify store type matches endpoint
 	if file_id.starts_with("s~") && result.file_view.file_tp.as_deref() != Some(store_tp) {
 		return Err(WsDeny::TypeMismatch);
 	}
 
+	// A folder has no content to open.
+	let Some(file_id) = result.file_view.file_id.as_deref() else {
+		return Err(WsDeny::Access(FileAccessError::NotFound));
+	};
+	let content_id = match meta_parent {
+		Some(_) => format!("{file_id}~meta"),
+		None => file_id.to_string(),
+	};
 	// Guests are always read-only
 	if auth.is_none() {
-		return Ok(AccessLevel::Read);
+		return Ok((AccessLevel::Read, content_id));
 	}
 	let al = resolve_access(query, result.access_level).map_err(|()| WsDeny::WriteDenied)?;
 	// For non-meta RTDB, downgrade Comment to Read (comment users can only write to
 	// meta databases, not the main document RTDB)
 	if kind == WsKind::Rtdb && meta_parent.is_none() && al == AccessLevel::Comment {
-		return Ok(AccessLevel::Read);
+		return Ok((AccessLevel::Read, content_id));
 	}
-	Ok(al)
+	Ok((al, content_id))
 }
 
 /// WebSocket upgrade handler for the notification bus
@@ -452,17 +474,7 @@ pub async fn get_ws_rtdb(
 		}
 	}
 
-	// Auto-create meta database for authenticated users
-	// Meta DBs ({parent_file_id}~meta) store comments and metadata
-	if !is_guest
-		&& let Some(parent_file_id) = validate_meta_id(&file_id)
-		&& let Err(e) =
-			ensure_meta_file(&app, crate::types::TnId(tn_id), &file_id, parent_file_id).await
-	{
-		return ws_close_for_error(ws, &e);
-	}
-
-	let access_level = match ws_file_access(
+	let (access_level, content_id) = match ws_file_access(
 		&app,
 		crate::types::TnId(tn_id),
 		&tenant_id_tag,
@@ -473,12 +485,22 @@ pub async fn get_ws_rtdb(
 	)
 	.await
 	{
-		Ok(al) => al,
+		Ok(res) => res,
 		Err(deny) => {
 			warn!("RTDB WebSocket rejected ({}): user={}, file={}", deny, user_id, file_id);
 			return ws_close_for_deny(ws, &deny);
 		}
 	};
+
+	// Auto-create meta database for authenticated users, once access is granted.
+	// Meta DBs ({parent_content_id}~meta) store comments and metadata
+	if !is_guest
+		&& let Some(parent_id) = validate_meta_id(&content_id)
+		&& let Err(e) =
+			ensure_meta_file(&app, crate::types::TnId(tn_id), &content_id, parent_id).await
+	{
+		return ws_close_for_error(ws, &e);
+	}
 	info!(
 		"RTDB WebSocket ({}): user={}, file={}",
 		access_level.as_str(),
@@ -493,7 +515,7 @@ pub async fn get_ws_rtdb(
 		rtdb::handle_rtdb_connection(
 			socket,
 			identity_id_tag,
-			file_id,
+			content_id,
 			app,
 			user_tn_id,
 			access_level,
@@ -561,7 +583,7 @@ pub async fn get_ws_crdt(
 		}
 	}
 
-	let access_level = match ws_file_access(
+	let (access_level, content_id) = match ws_file_access(
 		&app,
 		crate::types::TnId(tn_id),
 		&tenant_id_tag,
@@ -572,7 +594,7 @@ pub async fn get_ws_crdt(
 	)
 	.await
 	{
-		Ok(al) => al,
+		Ok(res) => res,
 		Err(deny) => {
 			warn!("CRDT WebSocket rejected ({}): user={}, doc={}", deny, user_id, doc_id);
 			return ws_close_for_deny(ws, &deny);
@@ -591,7 +613,14 @@ pub async fn get_ws_crdt(
 		// store-file auto-creation and read-only above, and a `file:{id}:W`
 		// share-link visitor keeps write access while losing only the asserted
 		// identity.
-		crdt::handle_crdt_connection(socket, awareness_id_tag, doc_id, app, user_tn_id, read_only)
+		crdt::handle_crdt_connection(
+			socket,
+			awareness_id_tag,
+			content_id,
+			app,
+			user_tn_id,
+			read_only,
+		)
 	})
 }
 

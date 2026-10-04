@@ -125,7 +125,7 @@ async fn action_ids(adapter: &MetaAdapterSqlite, opts: &ListActionOptions) -> Ve
 async fn file_ids(adapter: &MetaAdapterSqlite, enterable: Option<Vec<Box<str>>>) -> Vec<String> {
 	let opts = ListFileOptions { enterable_channels: enterable, ..Default::default() };
 	let rows = adapter.list_files(TN, &opts).await.expect("list files");
-	let mut ids: Vec<String> = rows.iter().map(|f| f.file_id.to_string()).collect();
+	let mut ids: Vec<String> = rows.iter().map(|f| f.index_id().to_string()).collect();
 	ids.sort_unstable();
 	ids
 }

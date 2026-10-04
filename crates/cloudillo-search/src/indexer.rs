@@ -157,6 +157,9 @@ pub async fn index_document(app: &App, tn_id: TnId, file_id: &str) -> ClResult<(
 	let Some(file) = app.meta_adapter.read_file(tn_id, file_id).await? else {
 		return forget(app, tn_id, file_id).await;
 	};
+	// Deep rows and the document store are keyed by content `file_id`; the caller may have
+	// named the document's entry.
+	let file_id: &str = file.index_id();
 	// The same rule the `'F'` row uses, not just the deleted half of it: the sweep
 	// visits the trash, and `reindex::index_one_file` calls
 	// `objects::index_file_row` (which drops both the `'F'` and the `'D'` rows of a
@@ -226,18 +229,17 @@ pub async fn index_document(app: &App, tn_id: TnId, file_id: &str) -> ClResult<(
 			tn_id,
 			&SearchObject {
 				obj_tp: OBJ_DOC,
-				obj_id: file_id,
+				obj_id: file.index_id(),
 				content_type,
-				// `search_docs.upstream_tag` mirrors the raw `files.upstream_tag`
-				// column. The 'F' row carries the raw value, so anything else makes
-				// the two rows of one document disagree and turns the adapter's
-				// no-op guard into a full FTS rewrite per part.
-				upstream_tag: file.upstream_tag.as_deref(),
-				visibility: file.visibility,
+				// Provenance is per entry, read live at query time: the 'F' row
+				// stores NULL, so this must too, or the two rows of one document
+				// disagree and the adapter's no-op guard turns into a full FTS
+				// rewrite per part.
+				upstream_tag: None,
 				// Deep parts inherit the container's tree root so a file-scoped
 				// token can prefilter them in SQL. A standalone document is its
-				// own root.
-				root_id: Some(file.root_id.as_deref().unwrap_or(file_id)),
+				// own root (its content `file_id`, whatever id the caller named).
+				root_id: Some(file.root_id.as_deref().unwrap_or(file.index_id())),
 				created_at: Some(file.created_at),
 				fts_cl,
 			},

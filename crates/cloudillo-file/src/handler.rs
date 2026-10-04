@@ -4,7 +4,7 @@
 use axum::{
 	Json,
 	body::{Body, to_bytes},
-	extract::{self, Query, State},
+	extract::{self, Extension, Query, State},
 	http::{HeaderMap, StatusCode, header},
 	response,
 };
@@ -21,6 +21,7 @@ use crate::{
 	ffmpeg, filter, image,
 	image::ImageResizerTask,
 	pdf,
+	perm::{ResolvedEntry, ResolvedLevel},
 	preset::{self, get_audio_tier, get_image_tier, get_video_tier, presets},
 	scratch::{self, TempFileGuard},
 	site_html, store, svg,
@@ -236,7 +237,7 @@ fn serve_file<S: AsRef<str> + Debug>(
 /// is intentionally NOT listed here: root rows store `parent_id = NULL` in the
 /// DB, so a `Some("__root__")` value never appears on a `FileView` from the
 /// adapter.
-fn is_terminal_parent(parent_id: &str) -> bool {
+pub(crate) fn is_terminal_parent(parent_id: &str) -> bool {
 	parent_id == TRASH_PARENT_ID || parent_id == MANAGED_PARENT_ID
 }
 
@@ -290,7 +291,7 @@ async fn populate_parent_names(
 	}
 
 	for f in files.iter_mut() {
-		if Some(f.file_id.as_ref()) == share_root {
+		if Some(f.entry_id.as_ref()) == share_root {
 			continue; // do not disclose the share root's own parent
 		}
 		let Some(pid) = f.parent_id.as_deref() else { continue };
@@ -402,9 +403,9 @@ pub async fn get_file_list(
 	// For scoped tokens, push the scope constraint into the DB query.
 	//
 	// A document-tree scope (`file:<doc>:*`) constrains the listing to that tree
-	// via `scope_file_id` (matches `file_id` or `root_id`). A folder-share scope
+	// via `scope_entry_id` (matches the entry or its `root_id`). A folder-share scope
 	// (`file:<folder>:*`) instead grants access across the folder's subtree:
-	//   - `parentId` within the subtree → browse: leave `scope_file_id` unset so
+	//   - `parentId` within the subtree → browse: leave `scope_entry_id` unset so
 	//     the `parent_id` predicate returns the folder's direct children.
 	//   - by-id lookup (`fileId`) → keep only the ids that are the folder or a
 	//     descendant of it and narrow the `file_id` predicate to those; drop the
@@ -427,6 +428,13 @@ pub async fn get_file_list(
 			TokenScope::File { file_id, access } => Some((file_id, access)),
 			TokenScope::ApkgPublish => None,
 		}) {
+		// The list filter matches entries. An unknown id, or a BLOB content id (bound to no
+		// entry), stays as given and matches nothing.
+		let scope_fid =
+			match file_access::resolve_scope_entry(&app.meta_adapter, tn_id, &scope_fid).await {
+				Some(view) => view.entry_id.into(),
+				None => scope_fid,
+			};
 		let scope_is_folder =
 			file_access::scope_target_is_folder(&app.meta_adapter, &dir_cache, tn_id, &scope_fid)
 				.await?;
@@ -485,10 +493,10 @@ pub async fn get_file_list(
 			} else {
 				// No parentId / fileId: fall back to the scope-tree constraint
 				// (returns only the folder's own row, matching document-scope).
-				opts.scope_file_id = Some(scope_fid);
+				opts.scope_entry_id = Some(scope_fid);
 			}
 		} else {
-			opts.scope_file_id = Some(scope_fid);
+			opts.scope_entry_id = Some(scope_fid);
 		}
 	}
 
@@ -559,9 +567,9 @@ pub async fn get_file_list(
 		inherited_share =
 			file_access::check_share_for_file(&app, tn_id, parent_id, subject_id_tag).await;
 	}
-	// A scope-tree listing is confined to that tree by `scope_file_id`, and the scope is the
+	// A scope-tree listing is confined to that tree by `scope_entry_id`, and the scope is the
 	// read grant there, so it bypasses visibility the same way.
-	if inherited_share.is_some() || opts.scope_file_id.is_some() {
+	if inherited_share.is_some() || opts.scope_entry_id.is_some() {
 		opts.visible_levels = None;
 		// The room never gates a deliberate handoff.
 		opts.enterable_channels = None;
@@ -602,7 +610,7 @@ pub async fn get_file_list(
 			for f in &mut filtered {
 				// The shared-folder row itself must not disclose any ancestor above
 				// the share root, so start the walk from nothing for that row.
-				let start = if Some(f.file_id.as_ref()) == folder_scope_root.as_deref() {
+				let start = if Some(f.entry_id.as_ref()) == folder_scope_root.as_deref() {
 					None
 				} else {
 					f.parent_id.as_deref()
@@ -639,7 +647,7 @@ pub async fn get_file_list(
 			"name" => serde_json::Value::String(last.file_name.to_string()),
 			_ => serde_json::Value::Number(last.created_at.0.into()),
 		};
-		let cursor = types::CursorData::new(sort_field, sort_value, &last.file_id);
+		let cursor = types::CursorData::new(sort_field, sort_value, &last.entry_id);
 		Some(cursor.encode())
 	} else {
 		None
@@ -665,13 +673,25 @@ pub async fn get_file_list(
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// The content `entry` holds locally. A reference (Pin / Place / FSHR) holds no local bytes and
+/// is never served — its content loads from the upstream — even if this node happens to hold
+/// content under the same id: the reference's placer never proved possession of it.
+fn local_content(entry: &meta_adapter::FileView) -> ClResult<&str> {
+	if entry.upstream_tag.is_some() {
+		return Err(Error::NotFound);
+	}
+	entry.file_id.as_deref().ok_or(Error::NotFound)
+}
+
 /// GET /api/files/variant/{variant_id}
 pub async fn get_file_variant(
 	State(app): State<App>,
 	tn_id: TnId,
 	extract::Path(variant_id): extract::Path<String>,
+	Extension(ResolvedEntry(entry)): Extension<ResolvedEntry>,
 	headers: HeaderMap,
 ) -> ClResult<impl response::IntoResponse> {
+	local_content(&entry)?;
 	let variant = app.meta_adapter.read_file_variant(tn_id, &variant_id).await?;
 	info!("variant: {:?}", variant);
 
@@ -711,13 +731,14 @@ pub struct GetFileVariantSelector {
 pub async fn get_file_variant_file_id(
 	State(app): State<App>,
 	tn_id: TnId,
-	extract::Path(file_id): extract::Path<String>,
 	extract::Query(selector): extract::Query<GetFileVariantSelector>,
+	Extension(ResolvedEntry(entry)): Extension<ResolvedEntry>,
 	headers: HeaderMap,
 ) -> ClResult<impl response::IntoResponse> {
+	let file_id = local_content(&entry)?;
 	let mut variants = app
 		.meta_adapter
-		.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id))
+		.list_file_variants(tn_id, meta_adapter::FileId::FileId(file_id))
 		.await?;
 	variants.sort();
 	debug!("variants: {:?}", variants);
@@ -741,8 +762,7 @@ pub async fn get_file_variant_file_id(
 		Some(Err(())) => false, // unsatisfiable → 416, no body/descriptor
 	};
 	let descriptor = if needs_descriptor {
-		let root_id = app.meta_adapter.read_file(tn_id, &file_id).await?.and_then(|f| f.root_id);
-		Some(descriptor::get_file_descriptor(&variants, root_id.as_deref()))
+		Some(descriptor::get_file_descriptor(&variants, entry.root_id.as_deref()))
 	} else {
 		None
 	};
@@ -754,17 +774,17 @@ pub async fn get_file_variant_file_id(
 pub async fn get_file_descriptor(
 	State(app): State<App>,
 	tn_id: TnId,
-	extract::Path(file_id): extract::Path<String>,
+	Extension(ResolvedEntry(entry)): Extension<ResolvedEntry>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<String>>)> {
+	let file_id = local_content(&entry)?;
 	let mut variants = app
 		.meta_adapter
-		.list_file_variants(tn_id, meta_adapter::FileId::FileId(&file_id))
+		.list_file_variants(tn_id, meta_adapter::FileId::FileId(file_id))
 		.await?;
 	variants.sort();
 
-	let root_id = app.meta_adapter.read_file(tn_id, &file_id).await?.and_then(|f| f.root_id);
-	let descriptor = descriptor::get_file_descriptor(&variants, root_id.as_deref());
+	let descriptor = descriptor::get_file_descriptor(&variants, entry.root_id.as_deref());
 
 	let response = ApiResponse::new(descriptor).with_req_id(req_id.unwrap_or_default());
 
@@ -1454,7 +1474,7 @@ async fn handle_post_raw_stream(
 ///   "tags": optional comma-separated tags
 /// }
 /// Validate an upload-time channel: a channel of this tenant that the uploader can enter.
-async fn resolve_upload_channel(
+pub(crate) async fn resolve_upload_channel(
 	app: &App,
 	tn_id: TnId,
 	tenant_id_tag: &str,
@@ -1489,6 +1509,74 @@ async fn resolve_upload_channel(
 	Ok(Some(channel.into()))
 }
 
+/// The drive a new child lands in. Under a real parent folder it is that folder's channel:
+/// the caller needs Write on the folder, an explicit differing `channel` is a 400, and the
+/// inherited room must pass [`resolve_upload_channel`] (a scoped token is a deliberate handoff
+/// the room does not gate). At the root it is the explicit `channel`, validated the same way,
+/// or the main drive.
+pub(crate) async fn resolve_child_channel(
+	app: &App,
+	tn_id: TnId,
+	tenant_id_tag: &str,
+	auth: &cloudillo_types::auth_adapter::AuthCtx,
+	parent_id: Option<&str>,
+	channel: Option<&str>,
+) -> ClResult<Option<Box<str>>> {
+	let Some(parent_id) = parent_id.filter(|p| !is_terminal_parent(p) && *p != ROOT_PARENT_ID)
+	else {
+		return resolve_upload_channel(app, tn_id, tenant_id_tag, auth, channel).await;
+	};
+	let ctx = file_access::FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
+	let parent =
+		file_access::resolve_placement(app, tn_id, parent_id, &ctx, AccessLevel::Write).await?;
+	if !parent.access_level.can_write() {
+		return Err(Error::PermissionDenied);
+	}
+	let inherited = parent.file_view.channel;
+	if channel.is_some_and(|c| inherited.as_deref() != Some(c)) {
+		return Err(Error::ValidationError("channel must match the parent folder's drive".into()));
+	}
+	if auth.scope.is_some() {
+		return Ok(inherited);
+	}
+	resolve_upload_channel(app, tn_id, tenant_id_tag, auth, inherited.as_deref()).await
+}
+
+/// A new document-tree part under `root_id`: the root must be a top-level file the caller may
+/// write. Returns the root entry's drive, which the part joins — tree scopes reach only parts in
+/// the root's drive.
+async fn check_tree_root(
+	app: &App,
+	tn_id: TnId,
+	tenant_id_tag: &str,
+	auth: &cloudillo_types::auth_adapter::AuthCtx,
+	root_id: &str,
+) -> ClResult<Option<Box<str>>> {
+	let ctx = file_access::FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
+	let root = file_access::check_file_access(app, tn_id, root_id, &ctx, None).await.map_err(
+		|e| match e {
+			file_access::FileAccessError::NotFound => {
+				Error::ValidationError(format!("root file '{}' not found", root_id))
+			}
+			file_access::FileAccessError::AccessDenied => Error::PermissionDenied,
+			file_access::FileAccessError::InternalError(m) => Error::Internal(m),
+		},
+	)?;
+	if !root.access_level.can_write() {
+		return Err(Error::PermissionDenied);
+	}
+	if root.file_view.root_id.is_some() {
+		return Err(Error::ValidationError(
+			"root_id must reference a top-level file (not a file that itself has a root_id)".into(),
+		));
+	}
+	// The tree is keyed by content id, which a reference does not hold here.
+	if root.file_view.upstream_tag.is_some() {
+		return Err(Error::ValidationError("root_id must reference local content".into()));
+	}
+	Ok(root.file_view.channel)
+}
+
 pub async fn post_file(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -1514,6 +1602,15 @@ pub async fn post_file(
 	)
 	.await?;
 	reject_trashed_parent(&app, tn_id, req.effective_parent_id()?.as_deref()).await?;
+	let channel = resolve_child_channel(
+		&app,
+		tn_id,
+		&tenant_id_tag,
+		&auth,
+		req.effective_parent_id()?.as_deref(),
+		req.channel.as_deref(),
+	)
+	.await?;
 
 	// Cross-context creation (Hand verbs: Pin / Place) routes through a dedicated
 	// branch before the normal new-blob path. Triggered by the presence of
@@ -1529,29 +1626,19 @@ pub async fn post_file(
 			&req,
 			source_file_id,
 			source_id_tag,
+			&tenant_id_tag,
+			channel,
 		)
 		.await;
 	}
 
-	let channel =
-		resolve_upload_channel(&app, tn_id, &tenant_id_tag, &auth, req.channel.as_deref()).await?;
-
 	// Generate file_id
 	let file_id = utils::random_id()?;
 
-	// Validate root_id if provided - the root file must exist and be a top-level file
-	if let Some(ref root_id) = req.root_id {
-		let root_file =
-			app.meta_adapter.read_file(tn_id, root_id).await?.ok_or_else(|| {
-				Error::ValidationError(format!("root file '{}' not found", root_id))
-			})?;
-		if root_file.root_id.is_some() {
-			return Err(Error::ValidationError(
-				"root_id must reference a top-level file (not a file that itself has a root_id)"
-					.into(),
-			));
-		}
-	}
+	let channel = match req.root_id.as_deref() {
+		Some(root_id) => check_tree_root(&app, tn_id, &tenant_id_tag, &auth, root_id).await?,
+		None => channel,
+	};
 
 	// Default visibility to 'C' (Connected) for community tenants
 	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
@@ -1563,7 +1650,7 @@ pub async fn post_file(
 
 	// Create file metadata with specified fileTp
 	let content_type = req.content_type.clone().unwrap_or_else(|| "application/json".to_string());
-	let _f_id = app
+	let created = app
 		.meta_adapter
 		.create_file(
 			tn_id,
@@ -1590,7 +1677,8 @@ pub async fn post_file(
 	info!("Created file metadata for fileTp={} by {}", req.file_tp, auth.id_tag);
 	cloudillo_core::search_index_file(&app, tn_id, &file_id);
 
-	let data = json!({"fileId": file_id});
+	let content_id = (req.file_tp != "FLDR").then_some(&*file_id);
+	let data = created_response(&created.entry_id, content_id);
 
 	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 
@@ -1682,6 +1770,7 @@ async fn default_cross_context_visibility(
 ///
 /// Source file metadata is fetched via the inter-node HTTP API; this handler
 /// never touches the source tenant's adapters.
+#[expect(clippy::too_many_arguments, reason = "file processing requires multiple parameters")]
 async fn post_file_cross_context(
 	app: App,
 	tn_id: types::TnId,
@@ -1690,7 +1779,13 @@ async fn post_file_cross_context(
 	req: &PostFileRequest,
 	source_file_id: &str,
 	source_id_tag: &str,
+	tenant_id_tag: &str,
+	channel: Option<Box<str>>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+	// The tenant's own content is never a reference: it would shadow local bytes.
+	if utils::normalize_id_tag(source_id_tag) == utils::normalize_id_tag(tenant_id_tag) {
+		return Err(Error::PermissionDenied);
+	}
 	info!(
 		"POST /api/files cross-context: source={}@{} -> dest tn_id={}",
 		source_file_id, source_id_tag, tn_id.0
@@ -1720,47 +1815,36 @@ async fn post_file_cross_context(
 	if source_upstream != source_id_tag {
 		return Err(Error::FileCycleRejected);
 	}
+	// The source's id must not name local content, nor a reference from another upstream.
+	super::management::check_reference_subject(&app, tn_id, source_file_id, source_id_tag).await?;
 
-	// Idempotency check: if a row already exists for the same source file_id
-	// AND the existing row's upstream matches the requested source AND the parent
-	// matches, return 200 with the existing FileView (safe retry).
+	// Idempotency is per reference `(ref_file_id, upstream_tag)`: a reference never links local
+	// content, so local entries of the same id play no part. `list_content_entries` yields live
+	// entries only; every entry with an upstream is a reference.
 	let parent_id_resolved = req.effective_parent_id()?;
-	if let Some(existing) = app.meta_adapter.read_file(tn_id, source_file_id).await? {
-		let existing_upstream = existing.upstream.as_ref().map(|o| o.id_tag.as_ref());
-		let existing_parent = existing.parent_id.as_deref();
-		let req_parent = parent_id_resolved.as_deref();
-
-		if existing_upstream == Some(source_id_tag) && existing_parent == req_parent {
-			info!("Idempotent cross-context create: returning existing row");
-			let view = app
-				.meta_adapter
-				.read_file_with_user_data(tn_id, source_file_id, &auth.id_tag)
-				.await?
-				.ok_or_else(|| Error::Internal("idempotent row vanished".into()))?;
-			let data = serde_json::to_value(&view)?;
-			let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-			return Ok((StatusCode::OK, Json(response)));
-		}
-
-		// Same file_id but different upstream: this row was created via a
-		// different path (e.g. an inbound action attachment) and is not
-		// the same logical placement. Semantically a generic conflict.
-		if existing_upstream != Some(source_id_tag) {
+	let entries = app.meta_adapter.list_content_entries(tn_id, source_file_id).await?;
+	if let Some(existing) = entries.iter().find(|e| {
+		e.upstream_tag.as_deref() == Some(source_id_tag)
+			&& e.parent_id.as_deref() != Some(MANAGED_PARENT_ID)
+	}) {
+		// Same upstream, different parent: already placed in this context. The frontend
+		// offers "go to existing location", so a 409 with the existing parent is sufficient.
+		if existing.parent_id.as_deref() != parent_id_resolved.as_deref() {
 			return Err(Error::Conflict(format!(
-				"file_id '{}' already exists in this tenant with a different upstream",
-				source_file_id
+				"file_id '{}' is already placed in this context (parent: {})",
+				source_file_id,
+				existing.parent_id.as_deref().unwrap_or("<root>")
 			)));
 		}
-
-		// Same upstream, different parent: the file is already placed in this
-		// tenant under a different parent. Frontend behavior matches the
-		// different-owner case ("go to existing location"), so a generic 409
-		// with the existing parent embedded is sufficient.
-		return Err(Error::Conflict(format!(
-			"file_id '{}' is already placed in this context (parent: {})",
-			source_file_id,
-			existing.parent_id.as_deref().unwrap_or("<root>")
-		)));
+		info!("Idempotent cross-context create: returning existing row");
+		let view = app
+			.meta_adapter
+			.read_file_with_user_data(tn_id, &existing.entry_id, &auth.id_tag)
+			.await?
+			.ok_or_else(|| Error::Internal("idempotent row vanished".into()))?;
+		let data = serde_json::to_value(&view)?;
+		let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
+		return Ok((StatusCode::OK, Json(response)));
 	}
 
 	let visibility = default_cross_context_visibility(&app, tn_id, req.visibility).await?;
@@ -1776,7 +1860,8 @@ async fn post_file_cross_context(
 	// supplied tags layer on top of source tags rather than replacing them.
 	let combined_tags = merge_cross_context_tags(source_view.tags.as_deref(), req.tags.as_deref());
 
-	app.meta_adapter
+	let created = app
+		.meta_adapter
 		.create_file(
 			tn_id,
 			cloudillo_types::meta_adapter::CreateFile {
@@ -1787,6 +1872,7 @@ async fn post_file_cross_context(
 				file_name: source_view.file_name.clone(),
 				file_tp: source_view.file_tp.clone(),
 				parent_id: parent_id_resolved.map(Into::into),
+				channel,
 				preset: source_view.preset.clone(),
 				tags: combined_tags,
 				x: source_view.x.clone(),
@@ -1796,7 +1882,8 @@ async fn post_file_cross_context(
 			},
 		)
 		.await?;
-	cloudillo_core::search_index_file(&app, tn_id, source_file_id);
+	let entry_id = created.entry_id;
+	cloudillo_core::search_index_file(&app, tn_id, &entry_id);
 
 	// Seed the caller's cached access_level so the response carries the eye
 	// badge without a follow-up `/refresh` round-trip. Mirrors what FSHR
@@ -1817,7 +1904,7 @@ async fn post_file_cross_context(
 			.update_file_user_data(
 				tn_id,
 				&auth.id_tag,
-				source_file_id,
+				&entry_id,
 				Patch::Undefined,
 				Patch::Undefined,
 				access_patch,
@@ -1830,7 +1917,7 @@ async fn post_file_cross_context(
 
 	let view = app
 		.meta_adapter
-		.read_file_with_user_data(tn_id, source_file_id, &auth.id_tag)
+		.read_file_with_user_data(tn_id, &entry_id, &auth.id_tag)
 		.await?
 		.ok_or_else(|| Error::Internal("freshly created row missing".into()))?;
 	let data = serde_json::to_value(&view)?;
@@ -1861,8 +1948,8 @@ pub struct RefreshResponse {
 ///
 /// Outcomes:
 /// - 200 + cleared tombstone → source responded; if caller is the row's
-///   owner we sync `file_name` / `content_type` / `file_tp` / `tags` /
-///   `preset` / `x` and clear any prior `broken_*`. Non-owners get a
+///   owner we sync `file_name` / `content_type` / `file_tp` / `tags` / `x`
+///   onto the reference entry and clear any prior `broken_*`. Non-owners get a
 ///   per-user-only refresh (shared row state is left untouched). The cached
 ///   `access_level` is written only when the caller is the tenant: the source
 ///   is queried as the tenant, so its level is the tenant's.
@@ -1889,16 +1976,6 @@ pub async fn refresh_file(
 	extract::Path(file_id): extract::Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<RefreshResponse>>)> {
-	// Cross-context placements always use content-addressed ids (`f1~…`); the
-	// `@<f_id>` form addresses local-only rows and cannot have an upstream
-	// source. Reject early so callers see a clear validation error rather
-	// than a later "refresh is only valid for cross-context" message that
-	// looks like a permission / state issue.
-	if file_id.starts_with('@') {
-		return Err(Error::ValidationError(
-			"refresh requires a content-addressed file_id, not an @-prefixed id".into(),
-		));
-	}
 	// Anonymous callers (guest, or a delegated / share-link token) never refresh, whatever
 	// their read level: it triggers an upstream fetch and writes per-user state.
 	if auth.scope.is_some() || auth.id_tag.is_empty() || auth.id_tag.as_ref() == "guest" {
@@ -1918,10 +1995,17 @@ pub async fn refresh_file(
 			file_access::FileAccessError::InternalError(m) => Error::Internal(m),
 		})?
 		.file_view;
+	// Refresh addresses one placement: a content id may name a local entry and a reference at
+	// once, so only the entry id is unambiguous.
+	if *existing.entry_id != *file_id {
+		return Err(Error::ValidationError("refresh requires the entry id".into()));
+	}
+	let entry_id = existing.entry_id.clone();
 
-	// Refresh only makes sense for cross-context rows — rows that originate here have
-	// no upstream source to fetch. Identify them by a set `upstream_tag`; the owner may
-	// be a local member, so the owner is the wrong test.
+	// Refresh only makes sense for references (Pin / Place / FSHR) — entries that originate here,
+	// verified mirrors included, have no upstream to fetch. Every entry with a set `upstream_tag`
+	// is a reference; the owner may be a local member, so the owner is the wrong test. The
+	// upstream knows the content id (`existing.file_id` = `ref_file_id`), never our entry id.
 	let upstream_tag = match existing.upstream.as_ref() {
 		Some(o) => o.id_tag.as_ref(),
 		None => {
@@ -1932,7 +2016,7 @@ pub async fn refresh_file(
 	};
 
 	// Only the row's owner may write shared row state (file_name,
-	// content_type, tags, preset, x, broken_*). Non-owners with read access
+	// content_type, tags, x, broken_*). Non-owners with read access
 	// cannot toggle the tombstone or overwrite shared fields for everyone.
 	//
 	// The **raw** column, not the resolved `owner`: on an FSHR-accepted row `owner_tag` is NULL
@@ -1940,9 +2024,10 @@ pub async fn refresh_file(
 	// themselves. Same rule, same reason, as `management::may_publish`.
 	let is_owner = existing.owner_tag.as_deref() == Some(auth.id_tag.as_ref());
 
+	let content_id = existing.file_id.as_deref().ok_or(Error::NotFound)?;
 	let fetch: Result<types::ApiResponse<meta_adapter::FileView>, Error> = app
 		.request
-		.get(tn_id, upstream_tag, &format!("/files/{}/metadata", file_id))
+		.get(tn_id, upstream_tag, &format!("/files/{content_id}/metadata"))
 		.await;
 
 	let mut refresh_status: Option<&'static str> = None;
@@ -1979,10 +2064,6 @@ pub async fn refresh_file(
 						}
 						None => Patch::Undefined,
 					},
-					preset: match source.preset.as_deref() {
-						Some(p) => Patch::Value(p.to_string()),
-						None => Patch::Undefined,
-					},
 					x: match &source.x {
 						Some(v) => Patch::Value(v.clone()),
 						None => Patch::Undefined,
@@ -1990,10 +2071,11 @@ pub async fn refresh_file(
 					broken: Patch::Null,
 					..Default::default()
 				};
-				app.meta_adapter.update_file_data(tn_id, &file_id, &opts).await?;
-				crate::management::invalidate_dir_cache(&app, tn_id, &file_id);
+				// Writes this reference's own `ref_*` fields; no local content row is touched.
+				app.meta_adapter.update_file_data(tn_id, &entry_id, &opts).await?;
+				crate::management::invalidate_dir_cache(&app, tn_id, &entry_id);
 				// `file_name`, `content_type` and `tags` all reach the index.
-				cloudillo_core::search_index_file(&app, tn_id, &file_id);
+				cloudillo_core::search_index_file(&app, tn_id, &entry_id);
 			}
 			// Source server populated access_level → cache it; otherwise preserve
 			// whatever we already had (older peer servers may omit the field).
@@ -2011,7 +2093,7 @@ pub async fn refresh_file(
 					broken: Patch::Value(meta_adapter::BrokenReason::Deleted),
 					..Default::default()
 				};
-				app.meta_adapter.update_file_data(tn_id, &file_id, &opts).await?;
+				app.meta_adapter.update_file_data(tn_id, &entry_id, &opts).await?;
 			}
 			Patch::Null // file gone — clear cached badge for this user
 		}
@@ -2021,7 +2103,7 @@ pub async fn refresh_file(
 					broken: Patch::Value(meta_adapter::BrokenReason::Revoked),
 					..Default::default()
 				};
-				app.meta_adapter.update_file_data(tn_id, &file_id, &opts).await?;
+				app.meta_adapter.update_file_data(tn_id, &entry_id, &opts).await?;
 			}
 			Patch::Null // caller's grant revoked — clear their cached badge
 		}
@@ -2056,7 +2138,7 @@ pub async fn refresh_file(
 			.update_file_user_data(
 				tn_id,
 				&auth.id_tag,
-				&file_id,
+				&entry_id,
 				Patch::Undefined, // pinned
 				Patch::Undefined, // starred
 				access_level_update,
@@ -2066,7 +2148,7 @@ pub async fn refresh_file(
 
 	let mut view = app
 		.meta_adapter
-		.read_file_with_user_data(tn_id, &file_id, &auth.id_tag)
+		.read_file_with_user_data(tn_id, &entry_id, &auth.id_tag)
 		.await?
 		.ok_or(Error::NotFound)?;
 	// Mirror the persisted user_data.access_level onto the top-level field so the
@@ -2080,20 +2162,46 @@ async fn build_dedup_response(
 	app: &App,
 	tn_id: types::TnId,
 	id_tag: &str,
-	file_id: &str,
+	entry_id: &str,
 	req_id: Option<String>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
-	info!("Dedup hit: file_id={}", file_id);
-	app.meta_adapter.record_file_access(tn_id, id_tag, file_id).await?;
+	info!("Dedup hit: entry_id={}", entry_id);
+	app.meta_adapter.record_file_access(tn_id, id_tag, entry_id).await?;
 
-	let view = app.meta_adapter.read_file(tn_id, file_id).await?.ok_or(Error::NotFound)?;
+	let view = app.meta_adapter.read_file(tn_id, entry_id).await?.ok_or(Error::NotFound)?;
 
-	let mut data = serde_json::to_value(&view).unwrap_or_else(|_| json!({"fileId": file_id}));
+	let mut data = serde_json::to_value(&view).unwrap_or_else(|_| json!({"entryId": entry_id}));
 	if let Some(obj) = data.as_object_mut() {
 		obj.insert("existed".into(), serde_json::Value::Bool(true));
 	}
 	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::OK, Json(response)))
+}
+
+/// Add the new entry's id to an upload response (`{"fileId": "@<f_id>", ...}`).
+fn with_entry_id(mut data: serde_json::Value, entry_id: &str) -> serde_json::Value {
+	data["entryId"] = entry_id.into();
+	data
+}
+
+/// The body of a `201 Created` for a new entry: its placement id and its content id (null on a
+/// folder, which has no content row).
+pub(crate) fn created_response(entry_id: &str, file_id: Option<&str>) -> serde_json::Value {
+	json!({"entryId": entry_id, "fileId": file_id})
+}
+
+/// Create an upload's entry: `(entry_id, Some(f_id))` for new content, `None` on a dedup hit.
+async fn create_upload(
+	app: &App,
+	tn_id: TnId,
+	opts: meta_adapter::CreateFile,
+) -> ClResult<(Box<str>, Option<u64>)> {
+	let created = app.meta_adapter.create_file(tn_id, opts).await?;
+	let f_id = match created.file_id {
+		meta_adapter::FileId::FId(f_id) => Some(f_id),
+		meta_adapter::FileId::FileId(_) => None,
+	};
+	Ok((created.entry_id, f_id))
 }
 
 #[expect(clippy::too_many_arguments, reason = "file processing requires multiple parameters")]
@@ -2136,9 +2244,15 @@ pub async fn post_file_blob(
 		preset_name, content_type, query.root_id, query.parent_id
 	);
 
-	let channel =
-		resolve_upload_channel(&app, tn_id, &tenant_id_tag, &auth, query.channel.as_deref())
-			.await?;
+	let channel = resolve_child_channel(
+		&app,
+		tn_id,
+		&tenant_id_tag,
+		&auth,
+		query.effective_parent_id()?.as_deref(),
+		query.channel.as_deref(),
+	)
+	.await?;
 
 	// Default visibility to 'C' (Connected) for community tenants
 	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
@@ -2148,19 +2262,10 @@ pub async fn post_file_blob(
 		None => None,
 	};
 
-	// Validate root_id if provided - the root file must exist and be a top-level file
-	if let Some(ref root_id) = query.root_id {
-		let root_file =
-			app.meta_adapter.read_file(tn_id, root_id).await?.ok_or_else(|| {
-				Error::ValidationError(format!("root file '{}' not found", root_id))
-			})?;
-		if root_file.root_id.is_some() {
-			return Err(Error::ValidationError(
-				"root_id must reference a top-level file (not a file that itself has a root_id)"
-					.into(),
-			));
-		}
-	}
+	let channel = match query.root_id.as_deref() {
+		Some(root_id) => check_tree_root(&app, tn_id, &tenant_id_tag, &auth, root_id).await?,
+		None => channel,
+	};
 
 	// 1. Get preset (or default)
 	let preset = presets::get(&preset_name).unwrap_or_else(presets::default);
@@ -2201,8 +2306,24 @@ pub async fn post_file_blob(
 	let max_streaming_bytes =
 		u64::try_from(max_streaming_mib).unwrap_or(100) * BYTES_PER_MIB as u64;
 
-	// 4. Route to handler - some need bytes (in-memory), some need streaming Body
-	match media_class {
+	let base = meta_adapter::CreateFile {
+		preset: Some(preset_name.clone().into()),
+		owner_tag: Some(auth.id_tag.clone()),
+		content_type: content_type.into(),
+		file_name: file_name.into(),
+		file_tp: Some("BLOB".into()),
+		created_at: query.created_at,
+		tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
+		root_id: query.root_id.clone().map(Into::into),
+		parent_id: query.effective_parent_id()?.map(Into::into),
+		visibility,
+		channel,
+		..Default::default()
+	};
+
+	// 4. Route to handler - some need bytes (in-memory), some need streaming Body.
+	// A dedup hit returns the existing entry; a streamed arm's TempFileGuard drops the temp file.
+	let (data, entry_id) = match media_class {
 		// In-memory processing (small files)
 		VariantClass::Visual => {
 			let bytes = to_bytes(body, max_size_bytes).await?;
@@ -2221,49 +2342,23 @@ pub async fn post_file_blob(
 			};
 			info!("Image dimensions: {}/{} (SVG: {})", dim.0, dim.1, is_svg);
 
-			let f_id = app
-				.meta_adapter
-				.create_file(
-					tn_id,
-					meta_adapter::CreateFile {
-						preset: Some(preset_name.clone().into()),
-						orig_variant_id: Some(orig_variant_id.clone()),
-						owner_tag: Some(auth.id_tag.clone()),
-						content_type: if is_svg {
-							"image/svg+xml".into()
-						} else {
-							content_type.into()
-						},
-						file_name: file_name.into(),
-						file_tp: Some("BLOB".into()),
-						created_at: query.created_at,
-						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
-						x: Some(json!({ "dim": dim })),
-						root_id: query.root_id.clone().map(Into::into),
-						parent_id: query.effective_parent_id()?.map(Into::into),
-						visibility,
-						channel: channel.clone(),
-						..Default::default()
-					},
-				)
-				.await?;
-
-			match f_id {
-				meta_adapter::FileId::FId(f_id) => {
-					// Route to SVG or raster image handler
-					let data = if is_svg {
-						handle_post_svg(&app, tn_id, f_id, &bytes, &orig_variant_id, &preset)
-							.await?
-					} else {
-						handle_post_image(&app, tn_id, f_id, content_type, &bytes, &preset).await?
-					};
-					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-					Ok((StatusCode::CREATED, Json(response)))
-				}
-				meta_adapter::FileId::FileId(file_id) => {
-					return build_dedup_response(&app, tn_id, &auth.id_tag, &file_id, req_id).await;
-				}
-			}
+			let opts = meta_adapter::CreateFile {
+				orig_variant_id: Some(orig_variant_id.clone()),
+				content_type: if is_svg { "image/svg+xml".into() } else { content_type.into() },
+				x: Some(json!({ "dim": dim })),
+				..base
+			};
+			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
+			let Some(f_id) = f_id else {
+				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id, req_id).await;
+			};
+			// Route to SVG or raster image handler
+			let data = if is_svg {
+				handle_post_svg(&app, tn_id, f_id, &bytes, &orig_variant_id, &preset).await?
+			} else {
+				handle_post_image(&app, tn_id, f_id, content_type, &bytes, &preset).await?
+			};
+			(data, entry_id)
 		}
 
 		VariantClass::Document => {
@@ -2271,38 +2366,12 @@ pub async fn post_file_blob(
 			let orig_variant_id = hasher::hash("b", &bytes);
 			info!("Content id: {} ({} bytes)", orig_variant_id, bytes.len());
 
-			let f_id = app
-				.meta_adapter
-				.create_file(
-					tn_id,
-					meta_adapter::CreateFile {
-						preset: Some(preset_name.clone().into()),
-						orig_variant_id: Some(orig_variant_id),
-						owner_tag: Some(auth.id_tag.clone()),
-						content_type: content_type.into(),
-						file_name: file_name.into(),
-						file_tp: Some("BLOB".into()),
-						created_at: query.created_at,
-						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
-						root_id: query.root_id.clone().map(Into::into),
-						parent_id: query.effective_parent_id()?.map(Into::into),
-						visibility,
-						channel: channel.clone(),
-						..Default::default()
-					},
-				)
-				.await?;
-
-			match f_id {
-				meta_adapter::FileId::FId(f_id) => {
-					let data = handle_post_pdf(&app, tn_id, f_id, &bytes).await?;
-					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-					Ok((StatusCode::CREATED, Json(response)))
-				}
-				meta_adapter::FileId::FileId(file_id) => {
-					return build_dedup_response(&app, tn_id, &auth.id_tag, &file_id, req_id).await;
-				}
-			}
+			let opts = meta_adapter::CreateFile { orig_variant_id: Some(orig_variant_id), ..base };
+			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
+			let Some(f_id) = f_id else {
+				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id, req_id).await;
+			};
+			(handle_post_pdf(&app, tn_id, f_id, &bytes).await?, entry_id)
 		}
 
 		// Streaming to disk (large files) - stream first so we know the orig
@@ -2337,59 +2406,34 @@ pub async fn post_file_blob(
 					.await?;
 			}
 
-			let f_id = app
-				.meta_adapter
-				.create_file(
-					tn_id,
-					meta_adapter::CreateFile {
-						preset: Some(preset_name.clone().into()),
-						orig_variant_id: Some(orig_blob_id.clone()),
-						owner_tag: Some(auth.id_tag.clone()),
-						content_type: content_type.into(),
-						file_name: file_name.into(),
-						file_tp: Some("BLOB".into()),
-						created_at: query.created_at,
-						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
-						root_id: query.root_id.clone().map(Into::into),
-						parent_id: query.effective_parent_id()?.map(Into::into),
-						visibility,
-						channel: channel.clone(),
-						..Default::default()
-					},
-				)
-				.await?;
-
-			match f_id {
-				meta_adapter::FileId::FId(f_id) => {
-					// Renamed so an operator reading `ls` sees which file this is.
-					let final_temp_path =
-						scratch::scratch_path(&app.opts.tmp_dir, &format!("upload_{f_id}"), "")?;
-					tokio::fs::rename(&temp_path, &final_temp_path).await?;
-					temp_guard.replace(final_temp_path.clone());
-					let data = handle_post_video_stream(
-						&app,
-						tn_id,
-						f_id,
-						content_type,
-						&final_temp_path,
-						resolution,
-						duration,
-						&orig_blob_id,
-						blob_stored,
-						total_size,
-						&preset,
-					)
-					.await?;
-					// Transcode tasks consume the temp file; keep it past this request.
-					temp_guard.keep();
-					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-					Ok((StatusCode::CREATED, Json(response)))
-				}
-				meta_adapter::FileId::FileId(file_id) => {
-					// Dedup hit: keep relying on TempFileGuard's Drop to clean up.
-					return build_dedup_response(&app, tn_id, &auth.id_tag, &file_id, req_id).await;
-				}
-			}
+			let opts =
+				meta_adapter::CreateFile { orig_variant_id: Some(orig_blob_id.clone()), ..base };
+			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
+			let Some(f_id) = f_id else {
+				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id, req_id).await;
+			};
+			// Renamed so an operator reading `ls` sees which file this is.
+			let final_temp_path =
+				scratch::scratch_path(&app.opts.tmp_dir, &format!("upload_{f_id}"), "")?;
+			tokio::fs::rename(&temp_path, &final_temp_path).await?;
+			temp_guard.replace(final_temp_path.clone());
+			let data = handle_post_video_stream(
+				&app,
+				tn_id,
+				f_id,
+				content_type,
+				&final_temp_path,
+				resolution,
+				duration,
+				&orig_blob_id,
+				blob_stored,
+				total_size,
+				&preset,
+			)
+			.await?;
+			// Transcode tasks consume the temp file; keep it past this request.
+			temp_guard.keep();
+			(data, entry_id)
 		}
 
 		VariantClass::Audio => {
@@ -2420,58 +2464,33 @@ pub async fn post_file_blob(
 					.await?;
 			}
 
-			let f_id = app
-				.meta_adapter
-				.create_file(
-					tn_id,
-					meta_adapter::CreateFile {
-						preset: Some(preset_name.clone().into()),
-						orig_variant_id: Some(orig_blob_id.clone()),
-						owner_tag: Some(auth.id_tag.clone()),
-						content_type: content_type.into(),
-						file_name: file_name.into(),
-						file_tp: Some("BLOB".into()),
-						created_at: query.created_at,
-						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
-						root_id: query.root_id.clone().map(Into::into),
-						parent_id: query.effective_parent_id()?.map(Into::into),
-						visibility,
-						channel: channel.clone(),
-						..Default::default()
-					},
-				)
-				.await?;
-
-			match f_id {
-				meta_adapter::FileId::FId(f_id) => {
-					// Renamed so an operator reading `ls` sees which file this is.
-					let final_temp_path =
-						scratch::scratch_path(&app.opts.tmp_dir, &format!("upload_{f_id}"), "")?;
-					tokio::fs::rename(&temp_path, &final_temp_path).await?;
-					temp_guard.replace(final_temp_path.clone());
-					let data = handle_post_audio_stream(
-						&app,
-						tn_id,
-						f_id,
-						content_type,
-						&final_temp_path,
-						duration,
-						&orig_blob_id,
-						blob_stored,
-						total_size,
-						&preset,
-					)
-					.await?;
-					// Audio extractor task consumes the temp file; keep it past this request.
-					temp_guard.keep();
-					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-					Ok((StatusCode::CREATED, Json(response)))
-				}
-				meta_adapter::FileId::FileId(file_id) => {
-					// Dedup hit: keep relying on TempFileGuard's Drop to clean up.
-					return build_dedup_response(&app, tn_id, &auth.id_tag, &file_id, req_id).await;
-				}
-			}
+			let opts =
+				meta_adapter::CreateFile { orig_variant_id: Some(orig_blob_id.clone()), ..base };
+			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
+			let Some(f_id) = f_id else {
+				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id, req_id).await;
+			};
+			// Renamed so an operator reading `ls` sees which file this is.
+			let final_temp_path =
+				scratch::scratch_path(&app.opts.tmp_dir, &format!("upload_{f_id}"), "")?;
+			tokio::fs::rename(&temp_path, &final_temp_path).await?;
+			temp_guard.replace(final_temp_path.clone());
+			let data = handle_post_audio_stream(
+				&app,
+				tn_id,
+				f_id,
+				content_type,
+				&final_temp_path,
+				duration,
+				&orig_blob_id,
+				blob_stored,
+				total_size,
+				&preset,
+			)
+			.await?;
+			// Audio extractor task consumes the temp file; keep it past this request.
+			temp_guard.keep();
+			(data, entry_id)
 		}
 
 		VariantClass::Raw => {
@@ -2518,81 +2537,52 @@ pub async fn post_file_blob(
 					})??;
 			}
 
-			let f_id = app
-				.meta_adapter
-				.create_file(
-					tn_id,
-					meta_adapter::CreateFile {
-						preset: Some(preset_name.clone().into()),
-						orig_variant_id: Some(orig_blob_id.clone()),
-						owner_tag: Some(auth.id_tag.clone()),
-						content_type: content_type.into(),
-						file_name: file_name.into(),
-						file_tp: Some("BLOB".into()),
-						created_at: query.created_at,
-						tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
-						root_id: query.root_id.clone().map(Into::into),
-						parent_id: query.effective_parent_id()?.map(Into::into),
-						visibility,
-						channel: channel.clone(),
-						..Default::default()
-					},
-				)
-				.await?;
-
-			match f_id {
-				meta_adapter::FileId::FId(f_id) => {
-					// Renamed so an operator reading `ls` sees which file this is.
-					let final_temp_path =
-						scratch::scratch_path(&app.opts.tmp_dir, &format!("upload_{f_id}"), "")?;
-					tokio::fs::rename(&temp_path, &final_temp_path).await?;
-					temp_guard.replace(final_temp_path.clone());
-					let data = handle_post_raw_stream(
-						&app,
-						tn_id,
-						f_id,
-						content_type,
-						&final_temp_path,
-						&orig_blob_id,
-						total_size,
-					)
-					.await?;
-					// handle_post_raw_stream removed the temp file on success.
-					temp_guard.keep();
-					let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-					Ok((StatusCode::CREATED, Json(response)))
-				}
-				meta_adapter::FileId::FileId(file_id) => {
-					let _ = tokio::fs::remove_file(&temp_path).await;
-					temp_guard.keep();
-					return build_dedup_response(&app, tn_id, &auth.id_tag, &file_id, req_id).await;
-				}
-			}
+			let opts =
+				meta_adapter::CreateFile { orig_variant_id: Some(orig_blob_id.clone()), ..base };
+			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
+			let Some(f_id) = f_id else {
+				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id, req_id).await;
+			};
+			// Renamed so an operator reading `ls` sees which file this is.
+			let final_temp_path =
+				scratch::scratch_path(&app.opts.tmp_dir, &format!("upload_{f_id}"), "")?;
+			tokio::fs::rename(&temp_path, &final_temp_path).await?;
+			temp_guard.replace(final_temp_path.clone());
+			let data = handle_post_raw_stream(
+				&app,
+				tn_id,
+				f_id,
+				content_type,
+				&final_temp_path,
+				&orig_blob_id,
+				total_size,
+			)
+			.await?;
+			// handle_post_raw_stream removed the temp file on success.
+			temp_guard.keep();
+			(data, entry_id)
 		}
-	}
+	};
+	let response =
+		ApiResponse::new(with_entry_id(data, &entry_id)).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// GET /api/files/{file_id}/metadata
 pub async fn get_file_metadata(
-	State(app): State<App>,
-	tn_id: TnId,
-	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth): OptionalAuth,
-	extract::Path(file_id): extract::Path<String>,
+	Extension(ResolvedEntry(mut file)): Extension<ResolvedEntry>,
+	Extension(ResolvedLevel(level)): Extension<ResolvedLevel>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::FileView>>)> {
-	let mut file = app.meta_adapter.read_file(tn_id, &file_id).await?.ok_or(Error::NotFound)?;
+	// Always report the caller's effective level: clients read it for the eye badge, and a peer's
+	// `POST /files/{id}/refresh` caches it. The guard resolved both, `?action=` grant included.
 	// Defence in depth for anonymous callers: never expose Direct-visibility
 	// metadata (owner tag, tags, x-extras) without auth. Authed callers are
 	// already gated by the route-level `check_perm_file("read")` ABAC middleware.
 	if maybe_auth.is_none() && file.visibility.is_none() {
 		return Err(Error::NotFound);
 	}
-	// Always report the caller's effective level: clients read it for the eye badge, and a peer's
-	// `POST /files/{id}/refresh` caches it. Anonymous callers get the visibility rung.
-	let ctx = file_access::FileAccessCtx::from_auth(maybe_auth.as_ref(), &tenant_id_tag);
-	let file_ref = file_access::FileRef::from_view(&file, &tenant_id_tag);
-	let level = file_access::get_access_level(&app, tn_id, file_ref, &ctx, None).await;
 	// Map AccessLevel::None → None so we don't lie about a non-grant.
 	file.access_level = match level {
 		AccessLevel::None => None,

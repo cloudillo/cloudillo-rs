@@ -289,7 +289,7 @@ impl Op {
 			(Op::Action(op), Obj::Action(a)) => action_req(*op, a),
 			(Op::Ws(k, access), Obj::File(f)) => {
 				let q = access.map_or(String::new(), |a| format!("?access={a}"));
-				(Method::GET, format!("/ws/{}/{}{q}", ws_kind(*k), f.file_id), Body::empty())
+				(Method::GET, format!("/ws/{}/{}{q}", ws_kind(*k), f.path_id()), Body::empty())
 			}
 			(Op::Probe(m, p), o) => probe_req(m, p, o),
 			_ => panic!("{} has no per-object request", self.name()),
@@ -309,7 +309,7 @@ fn probe_req(m: &str, path: &str, o: &Obj) -> (Method, String, Body) {
 	uri = uri.replace("{file_name}", "zqm-probe.txt");
 	uri = match o {
 		Obj::File(f) => uri
-			.replace("{file_id}", &f.file_id)
+			.replace("{file_id}", f.path_id())
 			.replace("{variant_id}", f.blob_id.as_deref().unwrap_or_default()),
 		Obj::Action(a) => uri.replace("{action_id}", &a.key()),
 	};
@@ -320,12 +320,12 @@ fn probe_req(m: &str, path: &str, o: &Obj) -> (Method, String, Body) {
 
 fn file_req(op: FileOp, f: &FileObj) -> (Method, String, Body) {
 	use FileOp as F;
-	let id = &f.file_id;
+	let id = f.path_id();
 	let base = format!("/api/files/{id}");
 	let post = |uri: String| (Method::POST, uri, j(json!({})));
 	match op {
 		F::List | F::ByStatus(_) => panic!("{op:?} is a listing op: use list_presence"),
-		F::ById => (Method::GET, format!("/api/files?fileId={id}"), Body::empty()),
+		F::ById => (Method::GET, format!("/api/files?fileId={}", f.file_id), Body::empty()),
 		F::ByParent => {
 			let parent = f.parent_id.as_deref().unwrap_or(ROOT_PARENT_ID);
 			let uri = format!("/api/files?parentId={parent}&fileName={}", f.spec.name);
@@ -347,7 +347,8 @@ fn file_req(op: FileOp, f: &FileObj) -> (Method, String, Body) {
 		F::Restore => post(format!("{base}/restore")),
 		F::Tag => (Method::PUT, format!("{base}/tag/zqtag"), Body::empty()),
 		F::UserData => (Method::PATCH, format!("{base}/user"), j(json!({ "starred": true }))),
-		F::Refresh => post(format!("{base}/refresh")),
+		// Refresh addresses one placement: entry id only.
+		F::Refresh => post(format!("/api/files/{}/refresh", f.entry_id)),
 		F::Duplicate => post(format!("{base}/duplicate")),
 		F::CreateBlob => (
 			Method::POST,
@@ -461,8 +462,7 @@ pub fn classify_obj(
 	match op {
 		Op::File(FileOp::ById | FileOp::ByParent) if status.is_success() => {
 			let key = obj_key(o);
-			let hit =
-				rows(body).iter().any(|r| r.get("fileId").and_then(Value::as_str) == Some(&key));
+			let hit = rows(body).iter().any(|r| row_id(r, "fileId") == Some(&key));
 			(if hit { Actual::Present } else { Actual::Absent }, None)
 		}
 		_ => classify(op, status, body),
@@ -585,7 +585,7 @@ pub async fn list_paged(
 		let c = cursor.as_ref().map_or(String::new(), |c| format!("&cursor={c}"));
 		let body = get(fx, s, &format!("{path}limit={PAGE}{c}")).await?;
 		for row in rows(&body) {
-			if let Some(id) = row.get(id_key).and_then(Value::as_str) {
+			if let Some(id) = row_id(row, id_key) {
 				out.insert(id.to_owned(), level_of_row(row));
 			}
 		}
@@ -597,6 +597,15 @@ pub async fn list_paged(
 			return Ok(out);
 		}
 	}
+}
+
+/// A row's id under `id_key`; a folder's `fileId` is null, so it falls back to its `entryId`.
+fn row_id<'a>(row: &'a Value, id_key: &str) -> Option<&'a str> {
+	row.get(id_key).and_then(Value::as_str).or_else(|| {
+		(id_key == "fileId")
+			.then(|| row.get("entryId").and_then(Value::as_str))
+			.flatten()
+	})
 }
 
 /// A list row's own `accessLevel` (not a nested one).

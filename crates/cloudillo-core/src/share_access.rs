@@ -49,12 +49,7 @@ pub async fn require_unscoped_file_access(
 
 	// Scoped callers were rejected above, so the ctx carries no scope.
 	let ctx = FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
-	match file_access::check_file_access(app, tn_id, file_id, &ctx, None).await {
-		Err(file_access::FileAccessError::NotFound) => Err(Error::NotFound),
-		Err(file_access::FileAccessError::AccessDenied) => Err(Error::PermissionDenied),
-		Err(file_access::FileAccessError::InternalError(msg)) => Err(Error::Internal(msg)),
-		Ok(access) => Ok(access),
-	}
+	file_access::resolve_placement(app, tn_id, file_id, &ctx, AccessLevel::Read).await
 }
 
 /// Pure share-management decision.

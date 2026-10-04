@@ -331,6 +331,8 @@ async fn sync_profile_pic_variant(
 		Some('P'),
 		None,
 		false,
+		// The picture may land over content another peer's action brought in.
+		true,
 	)
 	.await?;
 

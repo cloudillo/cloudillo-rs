@@ -18,7 +18,7 @@ use cloudillo_core::file_access;
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::error::Error;
 use cloudillo_types::meta_adapter::{
-	CreateFile, CreateShareEntry, MetaAdapter, ProfileType, UpsertProfileFields,
+	CreateFile, CreateShareEntry, FileStatus, MetaAdapter, ProfileType, UpsertProfileFields,
 };
 use cloudillo_types::types::Patch;
 use cloudillo_types::types::{AccessLevel, TnId};
@@ -47,6 +47,7 @@ async fn make_folder(
 		content_type: "application/x-folder".into(),
 		file_name: name.into(),
 		file_tp: Some("FLDR".into()),
+		status: Some(FileStatus::Active),
 		..Default::default()
 	};
 	adapter.create_file(tn_id, opts).await.expect("create folder");
@@ -64,16 +65,19 @@ async fn make_file(
 		parent_id: parent.map(Into::into),
 		content_type: "text/plain".into(),
 		file_name: name.into(),
-		file_tp: Some("BLOB".into()),
+		file_tp: Some("CRDT".into()),
+		status: Some(FileStatus::Active),
 		..Default::default()
 	};
 	adapter.create_file(tn_id, opts).await.expect("create file");
 }
 
 /// Seed the shared tree under TnId(1):
-///   F0 (FLDR, root) ─ F1 (FLDR) ─ X (BLOB)
-///   Z  (BLOB, root) ─ Zc (BLOB)
-///   Y  (BLOB, root, unrelated)
+///   F0 (FLDR, root) ─ F1 (FLDR) ─ X (CRDT)
+///   Z  (CRDT, root) ─ Zc (CRDT)
+///   Y  (CRDT, root, unrelated)
+///
+/// Not BLOBs: a BLOB content id binds no scope entry, while a document's id names its one.
 async fn seed() -> (Arc<dyn MetaAdapter>, TnId, TempDir) {
 	let (adapter, temp) = create_test_adapter().await;
 	let tn_id = TnId(1);
@@ -177,7 +181,21 @@ async fn create_allowed_via_document_tree_rule() {
 	let (meta, tn_id, _temp) = seed().await;
 	let cache = DirCache::new(64);
 
-	// root_id == scope_file_id: document-tree rule, unconditional on folder type.
+	// root_id == the scoped document's content id: document-tree rule, any parent.
+	assert!(matches!(
+		file_access::check_scope_allows_create_in(
+			&meta,
+			&cache,
+			tn_id,
+			Some("file:Z:W"),
+			None,
+			Some("Z")
+		)
+		.await,
+		Ok(())
+	));
+	// A folder has no content id, so no `root_id` matches a folder scope: `None == None` must
+	// not read as a tree match.
 	assert!(matches!(
 		file_access::check_scope_allows_create_in(
 			&meta,
@@ -188,7 +206,7 @@ async fn create_allowed_via_document_tree_rule() {
 			Some("F0")
 		)
 		.await,
-		Ok(())
+		Err(Error::PermissionDenied)
 	));
 }
 
@@ -515,6 +533,7 @@ async fn visibility_ladder_scores_mirrored_and_local_rows_alike() {
 				content_type: "text/plain".into(),
 				file_name: format!("{file_id}.txt").into(),
 				file_tp: Some("BLOB".into()),
+				status: Some(FileStatus::Active),
 				..Default::default()
 			},
 		)
@@ -615,6 +634,7 @@ async fn a_pin_into_a_personal_tenant_names_its_placer_as_owner() {
 			content_type: "text/plain".into(),
 			file_name: "pin.txt".into(),
 			file_tp: Some("BLOB".into()),
+			status: Some(FileStatus::Active),
 			..Default::default()
 		},
 	)

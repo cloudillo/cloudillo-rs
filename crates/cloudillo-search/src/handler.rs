@@ -48,9 +48,9 @@
 //!    An owner — caller `id_tag` == tenant `id_tag` *and* no scope — gets
 //!    `visible_levels = None`, and then no predicate is emitted at all.
 //! 3. **Redundant post-check.** The SQL prefilter above *is* the authorization.
-//!    [`file_access::check_scope_allows_file`] is exactly
-//!    `file_id == scope || root_id == scope`, the same predicate the adapter
-//!    already pushed down for `scope_file_id`, so under a correct prefilter it
+//!    It is `file_id == scope || root_id == scope` against the scope's resolved
+//!    content id, the same predicate the adapter already pushed down for
+//!    `scope_file_id`, so under a correct prefilter it
 //!    never drops a row. Kept as a cross-check against future drift in either
 //!    half, and loud: a non-zero drop count logs at `warn!`.
 //!
@@ -91,13 +91,14 @@ use axum::{
 use cloudillo_core::{
 	abac::{self, SubjectAccessLevel, relationship_level},
 	extract::{IdTag, OptionalAuth, OptionalRequestId},
-	file_access::{self, ScopeCheck},
+	file_access,
 };
 use cloudillo_types::{
 	auth_adapter::AuthCtx,
 	meta_adapter::{
-		ProfileRelation, ProfileType, SEARCH_MAX_CONTENT_TYPES, SEARCH_MAX_LIMIT,
-		SEARCH_MAX_OFFSET, SEARCH_MAX_TAGS, SearchMatch, SearchOptions, SearchRow,
+		ENTRY_PART_KIND, FileResolution, ProfileRelation, ProfileType, SEARCH_MAX_CONTENT_TYPES,
+		SEARCH_MAX_LIMIT, SEARCH_MAX_OFFSET, SEARCH_MAX_TAGS, SearchMatch, SearchOptions,
+		SearchRow,
 	},
 	types::{AccessLevel, ApiResponse, TokenScope, serialize_timestamp_iso},
 };
@@ -308,26 +309,39 @@ pub async fn get_search(
 		let Some(TokenScope::File { file_id, .. }) = TokenScope::parse(scope) else {
 			return Err(Error::PermissionDenied);
 		};
-		opts.scope_file_id = Some(file_id.clone());
+		// The scope names an entry; index rows are keyed by content `file_id` (a folder's is
+		// its entry id), so narrow on the content the entry places. A BLOB content id binds
+		// no entry: it narrows, but grants nothing past the ordinary gate.
+		let entry =
+			cloudillo_core::file_access::resolve_scope_entry(&app.meta_adapter, tn_id, &file_id)
+				.await;
+		let content_id =
+			entry.as_ref().map_or_else(|| file_id.clone(), |f| f.index_id().to_string());
+		opts.scope_file_id = Some(content_id.clone());
 		// The share itself is the grant: the shared file's own row and the deep
 		// parts of its document tree stay visible even at Direct visibility, or a
 		// share link to a private document would search to zero hits inside a
 		// document its holder can open. Child `'F'` rows in the tree are never hits;
 		// their container stands for them.
-		opts.scope_grant_file_id = Some(file_id.clone().into());
+		if let Some(entry) = entry {
+			opts.scope_grant_file_id = Some(entry.entry_id);
+		}
 		opts.obj_tp = Some(scope_obj_tp(opts.obj_tp.take()));
 	}
 
 	// Tree children are never hits, so a `fileId` naming one narrows to its container. A
 	// scope is not resolved: it grants the child alone, never the container's tree.
+	// An entry id resolves to the content `file_id` the index rows are keyed by.
+	// A content id placed by several entries is a BLOB: no tree, already the row key.
 	if let Some(fid) = opts.file_id.as_deref()
-		&& let Some(root_id) = app.meta_adapter.read_file(tn_id, fid).await?.and_then(|f| f.root_id)
+		&& let FileResolution::Entry(f) = app.meta_adapter.resolve_file(tn_id, fid).await?
 	{
-		opts.file_id = Some(root_id.into());
+		opts.file_id = Some(f.root_id.as_deref().unwrap_or(f.index_id()).into());
 	}
 
-	// Redundant cross-check, not a second gate — see the module docs.
-	let scope = auth.scope.as_deref();
+	// Redundant cross-check, not a second gate — see the module docs. Checked against the
+	// resolved content id, as the rows carry content ids, not the scope's entry id.
+	let scope_content = opts.scope_file_id.as_deref();
 	let fetched = app.meta_adapter.search(tn_id, &opts).await?;
 	let fetched_len = fetched.len();
 
@@ -345,14 +359,8 @@ pub async fn get_search(
 		.into_iter()
 		.filter(|row| {
 			!matches!(row.obj_tp, OBJ_FILE | OBJ_DOC)
-				|| !matches!(
-					file_access::check_scope_allows_file(
-						scope,
-						&row.obj_id,
-						row.root_id.as_deref()
-					),
-					ScopeCheck::Denied
-				)
+				|| scope_content
+					.is_none_or(|sc| *row.obj_id == *sc || row.root_id.as_deref() == Some(sc))
 		})
 		.collect();
 	if rows.len() < fetched_len {
@@ -512,10 +520,15 @@ async fn read_profile_meta(
 /// [`read_nav_params`] and [`read_profile_meta`], so this is a plain synchronous
 /// mapping with no database access of its own.
 fn to_hit(
-	row: SearchRow,
+	mut row: SearchRow,
 	nav_params: &HashMap<Box<str>, Option<Box<str>>>,
 	profile_meta: &HashMap<Box<str>, ProfileMeta>,
 ) -> SearchHit {
+	// An entry part is a file's own name: it is a whole-file hit, never a deep link.
+	if row.part_kind.as_deref() == Some(ENTRY_PART_KIND) {
+		row.part_id = "".into();
+		row.part_kind = None;
+	}
 	let content_type = row.content_type;
 	let nav_param = match (&content_type, row.part_id.is_empty()) {
 		(Some(ct), false) => nav_params.get(ct.as_ref()).cloned().flatten(),

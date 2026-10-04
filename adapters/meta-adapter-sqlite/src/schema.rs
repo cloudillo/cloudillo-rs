@@ -66,7 +66,7 @@ async fn get_db_version(tx: &mut Transaction<'_, Sqlite>) -> i64 {
 
 /// Column list shared by every `search_docs` writer below.
 pub(crate) const SEARCH_COLS: &str = "(tn_id, obj_tp, obj_id, part_id, part_kind, title, body, \
-	 tags, content_type, upstream_tag, visibility, root_id, created_at, updated_at, fts_cl, obj_hash)";
+	 tags, content_type, upstream_tag, root_id, created_at, updated_at, fts_cl, obj_hash)";
 
 /// The `DO UPDATE` clause shared by every upsert below. `part_id` is always `''`
 /// for whole-object rows, so `idx_search_docs_key` makes `(tn_id, obj_tp,
@@ -74,8 +74,8 @@ pub(crate) const SEARCH_COLS: &str = "(tn_id, obj_tp, obj_id, part_id, part_kind
 pub(crate) const SEARCH_UPSERT: &str = "ON CONFLICT(tn_id, obj_tp, obj_id, part_id) DO UPDATE SET \
 	 part_kind = excluded.part_kind, title = excluded.title, body = excluded.body, \
 	 tags = excluded.tags, content_type = excluded.content_type, \
-	 upstream_tag = excluded.upstream_tag, visibility = excluded.visibility, \
-	 root_id = excluded.root_id, created_at = excluded.created_at, \
+	 upstream_tag = excluded.upstream_tag, root_id = excluded.root_id, \
+	 created_at = excluded.created_at, \
 	 updated_at = excluded.updated_at, fts_cl = excluded.fts_cl, \
 	 obj_hash = excluded.obj_hash";
 
@@ -132,10 +132,235 @@ const SEARCH_FTS_TRIGGERS: [&str; 3] = [
 	 VALUES (new.s_id, new.title, new.body, new.tags, new.tn_id); END",
 ];
 
+/// Touches `entries.updated_at` on every change. No `CREATE TRIGGER` prefix, so the v58
+/// migration can drop and recreate it around its own writes.
+const ENTRIES_UPDATED_AT_TRIGGER: &str = "entries_updated_at AFTER UPDATE ON entries \
+	FOR EACH ROW BEGIN UPDATE entries SET updated_at = unixepoch() WHERE e_id = NEW.e_id; END";
+
+/// v58 managed backfill: the live actions' attachment items, one per row.
+const SPLIT: &str = "WITH RECURSIVE split(tn_id, a_id, action_id, item, rest) AS ( \
+	   SELECT tn_id, a_id, action_id, NULL, attachments || ',' FROM actions \
+	    WHERE attachments IS NOT NULL AND attachments != '' \
+	      AND action_id IS NOT NULL AND coalesce(status, 'A') != 'D' \
+	   UNION ALL \
+	   SELECT tn_id, a_id, action_id, substr(rest, 1, instr(rest, ',') - 1), \
+	     substr(rest, instr(rest, ',') + 1) FROM split WHERE rest != '' \
+	 ) ";
+/// v58 managed backfill: split row `s` names entry `entries`' content (`f` its file).
+const ITEM_MATCH: &str = "s.tn_id = entries.tn_id AND s.item IS NOT NULL AND s.item != '' \
+	  AND ((s.item LIKE '@%' AND f.f_id = (SELECT COALESCE(o.merged_into, o.f_id) \
+	        FROM files o WHERE o.tn_id = s.tn_id \
+	        AND o.f_id = CAST(substr(s.item, 2) AS INTEGER))) \
+	    OR (s.item NOT LIKE '@%' AND f.file_id = s.item))";
+
+/// Migration 58 body: split the legacy `files` table into `entries` + `files`.
+async fn migrate_v58_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sqlx::Error> {
+	// The migration's own rewrites must keep each row's `updated_at`; recreated at the end.
+	sqlx::query("DROP TRIGGER IF EXISTS entries_updated_at")
+		.execute(&mut **tx)
+		.await?;
+	// SQLite refuses to drop an indexed column.
+	sqlx::query("DROP INDEX IF EXISTS idx_files_parent").execute(&mut **tx).await?;
+
+	// Placeholder entry_id (the content id, or `@<f_id>` while pending) is unique per
+	// tenant; content rows get their random id below.
+	sqlx::query(
+		"INSERT INTO entries (e_id, tn_id, entry_id, f_id, status, owner_tag, upstream_tag, \
+		   file_name, tags, visibility, hidden, parent_id, channel, created_at, updated_at, \
+		   broken_at, broken_reason) \
+		 SELECT f_id, tn_id, COALESCE(file_id, '@' || f_id), \
+		   CASE WHEN file_tp = 'FLDR' THEN NULL ELSE f_id END, status, owner_tag, upstream_tag, \
+		   file_name, tags, visibility, hidden, parent_id, channel, created_at, updated_at, \
+		   broken_at, broken_reason \
+		 FROM files",
+	)
+	.execute(&mut **tx)
+	.await?;
+
+	let content: Vec<i64> = sqlx::query_scalar("SELECT e_id FROM entries WHERE f_id IS NOT NULL")
+		.fetch_all(&mut **tx)
+		.await?;
+	for e_id in content {
+		let entry_id = cloudillo_types::utils::random_id()
+			.map_err(|e| sqlx::Error::Protocol(format!("random_id: {e}")))?;
+		sqlx::query("UPDATE entries SET entry_id = ? WHERE e_id = ?")
+			.bind(entry_id)
+			.bind(e_id)
+			.execute(&mut **tx)
+			.await?;
+	}
+
+	// Shares and file-to-file links name the entry now. Folder ids are unchanged.
+	for col in ["resource", "subject"] {
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"UPDATE share_entries SET {col}_id = \
+			   (SELECT e.entry_id FROM files f JOIN entries e ON e.f_id = f.f_id \
+			    WHERE f.tn_id = share_entries.tn_id AND f.file_id = share_entries.{col}_id) \
+			 WHERE {col}_type = 'F' AND EXISTS \
+			   (SELECT 1 FROM files f WHERE f.tn_id = share_entries.tn_id \
+			    AND f.file_id = share_entries.{col}_id AND f.file_tp IS NOT 'FLDR')"
+		)))
+		.execute(&mut **tx)
+		.await?;
+	}
+	sqlx::query(
+		"UPDATE refs SET resource_id = \
+		   (SELECT e.entry_id FROM files f JOIN entries e ON e.f_id = f.f_id \
+		    WHERE f.tn_id = refs.tn_id AND f.file_id = refs.resource_id) \
+		 WHERE type = 'share.file' AND EXISTS \
+		   (SELECT 1 FROM files f WHERE f.tn_id = refs.tn_id AND f.file_id = refs.resource_id \
+		    AND f.file_tp IS NOT 'FLDR')",
+	)
+	.execute(&mut **tx)
+	.await?;
+
+	// A remote folder is a reference like any other placement: a fresh entry id, the upstream's
+	// folder id on `ref_file_id`, and every local pointer at the old id repointed. Its legacy
+	// `files` row (`f_id` = the entry's `e_id`) still holds the content type.
+	let remote_folders: Vec<(i64, i64, Box<str>)> = sqlx::query_as(
+		"SELECT e_id, tn_id, entry_id FROM entries \
+		 WHERE upstream_tag IS NOT NULL AND f_id IS NULL AND ref_file_id IS NULL",
+	)
+	.fetch_all(&mut **tx)
+	.await?;
+	for (e_id, tn_id, old_id) in remote_folders {
+		let entry_id = cloudillo_types::utils::random_id()
+			.map_err(|e| sqlx::Error::Protocol(format!("random_id: {e}")))?;
+		sqlx::query(
+			"UPDATE entries SET entry_id = ?1, ref_file_id = entry_id, ref_file_tp = 'FLDR', \
+			   ref_content_type = (SELECT content_type FROM files WHERE f_id = ?2) \
+			 WHERE e_id = ?2",
+		)
+		.bind(&entry_id)
+		.bind(e_id)
+		.execute(&mut **tx)
+		.await?;
+		for sql in [
+			"UPDATE entries SET parent_id = ?1 WHERE tn_id = ?2 AND parent_id = ?3",
+			"UPDATE share_entries SET resource_id = ?1 \
+			 WHERE tn_id = ?2 AND resource_type = 'F' AND resource_id = ?3",
+			"UPDATE share_entries SET subject_id = ?1 \
+			 WHERE tn_id = ?2 AND subject_type = 'F' AND subject_id = ?3",
+			"UPDATE refs SET resource_id = ?1 \
+			 WHERE tn_id = ?2 AND type = 'share.file' AND resource_id = ?3",
+		] {
+			sqlx::query(sql)
+				.bind(&entry_id)
+				.bind(tn_id)
+				.bind(old_id.as_ref())
+				.execute(&mut **tx)
+				.await?;
+		}
+	}
+
+	// Folders are entries without a file.
+	sqlx::query(
+		"DELETE FROM file_variants WHERE f_id IN (SELECT f_id FROM files WHERE file_tp = 'FLDR')",
+	)
+	.execute(&mut **tx)
+	.await?;
+	sqlx::query("DELETE FROM files WHERE file_tp = 'FLDR'")
+		.execute(&mut **tx)
+		.await?;
+
+	// Pins / Places / FSHR placements become references: the upstream content id and display
+	// fields move onto the entry, and the entry never links a local `files` row again.
+	sqlx::query(
+		"UPDATE entries SET \
+		   ref_file_id = (SELECT f.file_id FROM files f WHERE f.f_id = entries.f_id), \
+		   ref_file_tp = (SELECT f.file_tp FROM files f WHERE f.f_id = entries.f_id), \
+		   ref_content_type = (SELECT f.content_type FROM files f WHERE f.f_id = entries.f_id), \
+		   ref_x = (SELECT f.x FROM files f WHERE f.f_id = entries.f_id), \
+		   ref_preset = (SELECT f.preset FROM files f WHERE f.f_id = entries.f_id), \
+		   f_id = NULL \
+		 WHERE upstream_tag IS NOT NULL AND f_id IS NOT NULL",
+	)
+	.execute(&mut **tx)
+	.await?;
+	// A document part (`{root}~meta`) joins its root's drive, as a new one does.
+	sqlx::query(
+		"UPDATE entries SET channel = (SELECT r.channel FROM entries r \
+		   JOIN files rf ON rf.f_id = r.f_id JOIN files pf ON pf.f_id = entries.f_id \
+		   WHERE rf.tn_id = pf.tn_id AND rf.file_id = pf.root_id AND r.status <> 'D' \
+		   ORDER BY r.e_id LIMIT 1) \
+		 WHERE channel IS NULL AND f_id IN \
+		   (SELECT f_id FROM files WHERE root_id IS NOT NULL AND file_id LIKE '%~meta')",
+	)
+	.execute(&mut **tx)
+	.await?;
+	// Legacy managed attachment entries get their owning action: the latest live action whose
+	// attachments name the content (by id or `@<f_id>`); every other such action gets a copy of the
+	// entry, so each lives and dies with its own action. One no live action names stays NULL, and
+	// the file GC reaps it.
+	sqlx::query(sqlx::AssertSqlSafe(format!(
+		"{SPLIT} UPDATE entries SET action_id = ( \
+		   SELECT s.action_id FROM split s JOIN files f ON f.f_id = entries.f_id \
+		    WHERE {ITEM_MATCH} ORDER BY s.a_id DESC LIMIT 1) \
+		 WHERE parent_id = ? AND action_id IS NULL AND f_id IS NOT NULL"
+	)))
+	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.execute(&mut **tx)
+	.await?;
+	let extra: Vec<(i64, Box<str>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+		"{SPLIT} SELECT DISTINCT entries.e_id, s.action_id FROM entries \
+		   JOIN files f ON f.f_id = entries.f_id JOIN split s ON {ITEM_MATCH} \
+		 WHERE entries.parent_id = ? AND entries.action_id IS NOT s.action_id"
+	)))
+	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.fetch_all(&mut **tx)
+	.await?;
+	for (e_id, action_id) in extra {
+		let entry_id = cloudillo_types::utils::random_id()
+			.map_err(|e| sqlx::Error::Protocol(format!("random_id: {e}")))?;
+		sqlx::query(
+			"INSERT INTO entries (tn_id, entry_id, f_id, status, owner_tag, file_name, tags, \
+			   visibility, hidden, parent_id, channel, action_id, created_at, updated_at) \
+			 SELECT tn_id, ?, f_id, status, owner_tag, file_name, tags, visibility, hidden, \
+			   parent_id, channel, ?, created_at, updated_at FROM entries WHERE e_id = ?",
+		)
+		.bind(entry_id)
+		.bind(action_id.as_ref())
+		.bind(e_id)
+		.execute(&mut **tx)
+		.await?;
+	}
+	// A reference's former row goes when it held nothing here. One with local variants (a Pin
+	// that landed on local bytes) stays: the file GC reaps it once no entry wants it.
+	sqlx::query(
+		"DELETE FROM files WHERE NOT EXISTS (SELECT 1 FROM entries e WHERE e.f_id = files.f_id) \
+		 AND NOT EXISTS (SELECT 1 FROM file_variants v WHERE v.f_id = files.f_id)",
+	)
+	.execute(&mut **tx)
+	.await?;
+
+	for col in [
+		"status",
+		"owner_tag",
+		"upstream_tag",
+		"file_name",
+		"tags",
+		"visibility",
+		"hidden",
+		"parent_id",
+		"channel",
+		"created_at",
+		"broken_at",
+		"broken_reason",
+	] {
+		drop_column_if_exists(tx, "files", col).await?;
+	}
+	sqlx::query(sqlx::AssertSqlSafe(format!(
+		"CREATE TRIGGER IF NOT EXISTS {ENTRIES_UPDATED_AT_TRIGGER}"
+	)))
+	.execute(&mut **tx)
+	.await?;
+	Ok(())
+}
+
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 57;
+	const CURRENT_DB_VERSION: i64 = 58;
 
 	let mut tx = db.begin().await?;
 
@@ -287,33 +512,22 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
-	// Files
+	// Files: pure content. Placement (folder, name, trash, visibility, …) lives on `entries`,
+	// so one immutable BLOB can sit in several folders/rooms under the same `file_id`.
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS files (
 			f_id integer NOT NULL,
 			tn_id integer NOT NULL,
 			file_id text,
 			file_tp char(4),			-- 'BLOB', 'CRDT', 'RTDB' file type (storage type)
-			status char(1),				-- 'A' - Active, 'P' - Pending, 'D' - Deleted
-			upstream_tag text,			-- Where the canonical copy lives; NULL => the file originates here
-			owner_tag text,				-- The profile with owner authority; NULL => the tenant
 			preset text,
 			content_type text,
-			file_name text,
-			tags json,
-			x json,
-			visibility char(1),			-- NULL: Direct (owner only), P: Public, V: Verified,
-										-- 2: 2nd degree, F: Follower, C: Connected
-			hidden INTEGER DEFAULT 0,
-			parent_id text,				-- Folder hierarchy: references file_id of parent folder
+			x json,						-- Content metadata, e.g. image dim [w,h]
 			root_id text,				-- Document tree: access control root file_id
+			merged_into integer,		-- Deduped pending upload: the surviving f_id
 			accessed_at INTEGER,		-- Global: when anyone last accessed this file
 			modified_at INTEGER,		-- Global: when anyone last modified this file
-			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
-			broken_at INTEGER,			-- Tombstone written by the cross-context refresh endpoint
-			broken_reason TEXT,			-- BrokenReason enum: 'deleted' | 'revoked'
-			channel text,				-- Absolute channel `@tenant~name`; NULL => open floor
 			PRIMARY KEY(f_id)
 		)",
 	)
@@ -322,9 +536,72 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_fileid ON files(file_id, tn_id)")
 		.execute(&mut *tx)
 		.await?;
-	sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(tn_id, parent_id)")
+
+	// Entries: one placement of a file. Folders are entries without a file (`f_id` NULL).
+	// Only BLOB files may have more than one entry.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS entries (
+			e_id integer NOT NULL,
+			tn_id integer NOT NULL,
+			entry_id text NOT NULL,		-- random_id(); a migrated folder keeps its old file_id
+			f_id integer,				-- files.f_id; NULL => folder
+			status char(1),				-- 'A' - Active, 'P' - Pending, 'D' - Deleted
+			owner_tag text,				-- The profile with owner authority; NULL => the tenant
+			upstream_tag text,			-- Where this placement's canonical copy lives; NULL => originates here
+			file_name text,
+			tags json,
+			visibility char(1),			-- NULL: Direct (owner only), P: Public, V: Verified,
+										-- 2: 2nd degree, F: Follower, C: Connected
+			hidden INTEGER DEFAULT 0,
+			parent_id text,				-- Folder hierarchy: entry_id of the parent folder
+			channel text,				-- Absolute channel `@tenant~name`; NULL => open floor
+			action_id text,				-- Managed attachment entry: the action that owns it
+			-- Reference (`upstream_tag` set, `f_id` NULL): the upstream content, never held here
+			ref_file_id text,
+			ref_file_tp char(4),
+			ref_content_type text,
+			ref_x json,
+			ref_preset text,
+			created_at INTEGER DEFAULT (unixepoch()),
+			updated_at INTEGER DEFAULT (unixepoch()),
+			broken_at INTEGER,			-- Tombstone written by the cross-context refresh endpoint
+			broken_reason TEXT,			-- BrokenReason enum: 'deleted' | 'revoked'
+			PRIMARY KEY(e_id)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_entryid ON entries(entry_id, tn_id)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(tn_id, parent_id)")
 		.execute(&mut *tx)
 		.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_entries_file ON entries(f_id) WHERE f_id IS NOT NULL",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_entries_channel ON entries(tn_id, channel) \
+		 WHERE channel IS NOT NULL",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_entries_action ON entries(tn_id, action_id) \
+		 WHERE action_id IS NOT NULL",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_entries_ref ON entries(tn_id, ref_file_id, upstream_tag) \
+		 WHERE ref_file_id IS NOT NULL",
+	)
+	.execute(&mut *tx)
+	.await?;
 	// Note: idx_files_root is created in migration 10 after the root_id column is added
 	// Do NOT add it here as it would fail for existing databases being migrated
 
@@ -557,7 +834,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		"CREATE TABLE IF NOT EXISTS file_user_data (
 			tn_id INTEGER NOT NULL,
 			id_tag TEXT NOT NULL,
-			f_id INTEGER NOT NULL,
+			e_id INTEGER NOT NULL,		-- entries.e_id
 			accessed_at INTEGER,
 			modified_at INTEGER,
 			pinned INTEGER DEFAULT 0,
@@ -565,7 +842,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			access_level CHAR(1),
 			created_at INTEGER NOT NULL DEFAULT (unixepoch()),
 			updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-			PRIMARY KEY (tn_id, id_tag, f_id)
+			PRIMARY KEY (tn_id, id_tag, e_id)
 		)",
 	)
 	.execute(&mut *tx)
@@ -718,7 +995,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.await?;
 	sqlx::query(
 			"CREATE TRIGGER IF NOT EXISTS file_user_data_insert_at AFTER INSERT ON file_user_data FOR EACH ROW \
-			BEGIN UPDATE file_user_data SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND id_tag = NEW.id_tag AND f_id = NEW.f_id; END",
+			BEGIN UPDATE file_user_data SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND id_tag = NEW.id_tag AND e_id = NEW.e_id; END",
 		)
 		.execute(&mut *tx)
 		.await?;
@@ -778,6 +1055,11 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	)
 	.execute(&mut *tx)
 	.await?;
+	sqlx::query(sqlx::AssertSqlSafe(format!(
+		"CREATE TRIGGER IF NOT EXISTS {ENTRIES_UPDATED_AT_TRIGGER}"
+	)))
+	.execute(&mut *tx)
+	.await?;
 	sqlx::query(
 			"CREATE TRIGGER IF NOT EXISTS file_variants_updated_at AFTER UPDATE ON file_variants FOR EACH ROW \
 			BEGIN UPDATE file_variants SET updated_at = unixepoch() WHERE f_id = NEW.f_id AND variant_id = NEW.variant_id AND tn_id = NEW.tn_id; END",
@@ -822,7 +1104,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.await?;
 	sqlx::query(
 		"CREATE TRIGGER IF NOT EXISTS file_user_data_updated_at AFTER UPDATE ON file_user_data FOR EACH ROW \
-		BEGIN UPDATE file_user_data SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND id_tag = NEW.id_tag AND f_id = NEW.f_id; END",
+		BEGIN UPDATE file_user_data SET updated_at = unixepoch() WHERE tn_id = NEW.tn_id AND id_tag = NEW.id_tag AND e_id = NEW.e_id; END",
 	)
 	.execute(&mut *tx)
 	.await?;
@@ -928,17 +1210,15 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			body text,
 			tags text,
 			content_type text,
-			-- Where the indexed object comes from, mirroring `files.upstream_tag` for
-			-- a 'F'/'D' row (`p.id_tag` for 'P', `a.issuer_tag` for 'A'). Named to match
-			-- `files`: it is *not* the profile with owner authority.
+			-- Where the indexed object comes from: `p.id_tag` for 'P', `a.issuer_tag`
+			-- for 'A'. NULL for 'F'/'D' rows: provenance is per entry, read live from
+			-- `entries.upstream_tag`. It is *not* the profile with owner authority.
 			upstream_tag text,
-			visibility char(1),
 			root_id text,
 			created_at INTEGER,
 			updated_at INTEGER,
 			fts_cl integer NOT NULL DEFAULT 0,
-			obj_hash text,
-			channel text				-- Absolute channel `@tenant~name`; NULL => open floor
+			obj_hash text
 		)",
 	)
 	.execute(&mut *tx)
@@ -1391,6 +1671,9 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// statement is idempotent and these triggers only ever existed in unreleased
 	// development databases.
 	sqlx::query("DROP TRIGGER IF EXISTS sites_insert_at").execute(&mut *tx).await?;
+	sqlx::query("DROP TRIGGER IF EXISTS entries_insert_at")
+		.execute(&mut *tx)
+		.await?;
 	sqlx::query("DROP TRIGGER IF EXISTS site_docs_insert_at")
 		.execute(&mut *tx)
 		.await?;
@@ -1452,6 +1735,15 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, CURRENT_DB_VERSION).await;
 		version = CURRENT_DB_VERSION;
 	}
+
+	// Whether `files` still carries the pre-v58 placement columns. Migrations that write
+	// those columns run only then: a replay over the current schema (a test that rewinds
+	// `db_version`) must not touch columns that now live on `entries`.
+	let legacy_files: bool = sqlx::query_scalar::<_, i64>(
+		"SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'parent_id'",
+	)
+	.fetch_one(&mut *tx)
+	.await? > 0;
 
 	// Migrations for existing databases (ALTER TABLE only)
 	if version < 2 {
@@ -2424,23 +2716,25 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// on an existing row, so only this migration can repair them. The `<> 'P'`
 		// guard makes it idempotent, and it only ever loosens.
 		// `updated_at` is stamped by the `files_updated_at` AFTER UPDATE trigger.
-		sqlx::query(
-			"UPDATE files SET visibility = 'P' \
-			 WHERE (visibility IS NULL OR visibility <> 'P') \
-			   AND EXISTS (SELECT 1 FROM profiles p \
-			               WHERE p.tn_id = files.tn_id AND p.profile_pic = files.file_id)",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
-			"UPDATE files SET visibility = 'P' \
-			 WHERE (visibility IS NULL OR visibility <> 'P') \
-			   AND EXISTS (SELECT 1 FROM tenants t \
-			               WHERE t.tn_id = files.tn_id \
-			                 AND files.file_id IN (t.profile_pic, t.cover_pic))",
-		)
-		.execute(&mut *tx)
-		.await?;
+		if legacy_files {
+			sqlx::query(
+				"UPDATE files SET visibility = 'P' \
+				 WHERE (visibility IS NULL OR visibility <> 'P') \
+				   AND EXISTS (SELECT 1 FROM profiles p \
+				               WHERE p.tn_id = files.tn_id AND p.profile_pic = files.file_id)",
+			)
+			.execute(&mut *tx)
+			.await?;
+			sqlx::query(
+				"UPDATE files SET visibility = 'P' \
+				 WHERE (visibility IS NULL OR visibility <> 'P') \
+				   AND EXISTS (SELECT 1 FROM tenants t \
+				               WHERE t.tn_id = files.tn_id \
+				                 AND files.file_id IN (t.profile_pic, t.cover_pic))",
+			)
+			.execute(&mut *tx)
+			.await?;
+		}
 		set_db_version(&mut tx, 37).await;
 	}
 
@@ -2527,13 +2821,14 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		//
 		// Guarded: unlike an additive ALTER, a RENAME is not replayable. A database whose
 		// `db_version` was rewound over an already-renamed schema would otherwise hit
-		// `duplicate column name: upstream_tag`.
-		let renamed: i64 = sqlx::query_scalar(
-			"SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'upstream_tag'",
+		// `duplicate column name: upstream_tag`. Keyed on `creator_tag`, which only a
+		// pre-52 table has: `upstream_tag` has since moved to `entries` (v58).
+		let legacy: i64 = sqlx::query_scalar(
+			"SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'creator_tag'",
 		)
 		.fetch_one(&mut *tx)
 		.await?;
-		if renamed == 0 {
+		if legacy > 0 {
 			sqlx::query("ALTER TABLE files RENAME COLUMN owner_tag TO upstream_tag")
 				.execute(&mut *tx)
 				.await?;
@@ -2623,7 +2918,9 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// Channels: the channels/channel_members tables are created above; entities get a
 		// `channel` column (NULL = open floor, no backfill).
 		add_column_if_missing(&mut tx, "actions", "channel", "text").await?;
-		add_column_if_missing(&mut tx, "files", "channel", "text").await?;
+		if legacy_files {
+			add_column_if_missing(&mut tx, "files", "channel", "text").await?;
+		}
 		add_column_if_missing(&mut tx, "search_docs", "channel", "text").await?;
 		sqlx::query(
 			"CREATE INDEX IF NOT EXISTS idx_actions_channel_received \
@@ -2638,9 +2935,11 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// Non-blob files are created final, but `post_file` / `duplicate_file` used to leave
 		// them at the 'P' default that only blob finalization clears. Any client-supplied
 		// `file_tp` counts; NULL stays pending, since `create_file` reads a missing type as BLOB.
-		sqlx::query("UPDATE files SET status='A' WHERE status='P' AND file_tp<>'BLOB'")
-			.execute(&mut *tx)
-			.await?;
+		if legacy_files {
+			sqlx::query("UPDATE files SET status='A' WHERE status='P' AND file_tp<>'BLOB'")
+				.execute(&mut *tx)
+				.await?;
+		}
 		set_db_version(&mut tx, 56).await;
 	}
 
@@ -2650,9 +2949,251 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, 57).await;
 	}
 
+	if version < 58 || legacy_files {
+		// Also runs while `files` still has the placement columns: repairs a DB stamped v58 by
+		// a pre-split dev build. Every step is idempotent.
+		// Storage split: `files` keeps content, `entries` takes placement. 1:1 — every row
+		// becomes one entry, and every non-folder row keeps its `files` row. `e_id` = old
+		// `f_id`, so `file_user_data` rekeys by a column rename. Folders keep their old
+		// `file_id` as `entry_id`, so every `parent_id` stays valid unchanged; content entries
+		// get a fresh `random_id()`. Guarded like 52: replaying over the split schema is a no-op.
+		// A pending upload deduped at finalize redirects its `@<f_id>` to the surviving content.
+		add_column_if_missing(&mut tx, "files", "merged_into", "integer").await?;
+		if legacy_files {
+			migrate_v58_entries(&mut tx).await?;
+		}
+		// Search rows gate on the live `entries` / `actions` placement, never on a mirror.
+		drop_column_if_exists(&mut tx, "search_docs", "visibility").await?;
+		drop_column_if_exists(&mut tx, "search_docs", "channel").await?;
+		set_db_version(&mut tx, 58).await;
+	}
+
+	// Unversioned and idempotent: a DB that reached v58 on a pre-rename build still has
+	// `f_id`. e_id = old f_id, so the rename is the whole rekey; SQLite rewrites the PK and
+	// the `file_user_data_*_at` trigger bodies along with it.
+	let fud_legacy: i64 = sqlx::query_scalar(
+		"SELECT COUNT(*) FROM pragma_table_info('file_user_data') WHERE name = 'f_id'",
+	)
+	.fetch_one(&mut *tx)
+	.await?;
+	if fud_legacy > 0 {
+		sqlx::query("ALTER TABLE file_user_data RENAME COLUMN f_id TO e_id")
+			.execute(&mut *tx)
+			.await?;
+	}
+
 	tx.commit().await?;
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use sqlx::sqlite::SqlitePoolOptions;
+
+	// A DB stamped v58 by a build that split `files` but kept `file_user_data.f_id`.
+	#[tokio::test]
+	async fn fud_f_id_renamed_on_already_v58_db() {
+		let db = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.expect("connect");
+		super::init_db(&db).await.expect("init");
+		for sql in [
+			"ALTER TABLE file_user_data RENAME COLUMN e_id TO f_id",
+			"INSERT INTO file_user_data (tn_id, id_tag, f_id, starred) VALUES (1, 'bob', 7, 1)",
+		] {
+			sqlx::query(sql).execute(&db).await.expect("seed");
+		}
+		super::init_db(&db).await.expect("re-init");
+		let ids: Vec<i64> = sqlx::query_scalar("SELECT e_id FROM file_user_data")
+			.fetch_all(&db)
+			.await
+			.expect("e_id");
+		assert_eq!(ids, vec![7]);
+	}
+
+	// Turns a freshly initialized `files` back into its pre-v58 shape.
+	async fn add_legacy_files_columns(db: &sqlx::SqlitePool) {
+		for col in [
+			"status char(1)",
+			"owner_tag text",
+			"upstream_tag text",
+			"file_name text",
+			"tags json",
+			"visibility char(1)",
+			"hidden INTEGER",
+			"parent_id text",
+			"channel text",
+			"created_at INTEGER",
+			"broken_at INTEGER",
+			"broken_reason TEXT",
+		] {
+			sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE files ADD COLUMN {col}")))
+				.execute(db)
+				.await
+				.expect("legacy column");
+		}
+		// The legacy schema's `files` triggers would overwrite the seeded `updated_at`.
+		for sql in ["DROP TRIGGER files_insert_at", "DROP TRIGGER files_updated_at"] {
+			sqlx::query(sql).execute(db).await.expect("drop trigger");
+		}
+	}
+
+	// A DB stamped v58 by a pre-split build: `files` still holds placement, `entries` is empty.
+	#[tokio::test]
+	async fn split_runs_on_v58_db_with_legacy_files() {
+		let db = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.expect("connect");
+		super::init_db(&db).await.expect("init");
+		add_legacy_files_columns(&db).await;
+		sqlx::query(
+			"INSERT INTO files (f_id, tn_id, file_id, file_tp, status, parent_id) \
+			 VALUES (1, 1, 'f1~abc', 'BLOB', 'A', NULL), (2, 1, 'fold1', 'FLDR', 'A', NULL)",
+		)
+		.execute(&db)
+		.await
+		.expect("seed");
+		super::init_db(&db).await.expect("re-init");
+		let entries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+			.fetch_one(&db)
+			.await
+			.expect("entries");
+		assert_eq!(entries, 2);
+		let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE f_id = 1")
+			.fetch_one(&db)
+			.await
+			.expect("files");
+		assert_eq!(files, 1);
+		let legacy: i64 = sqlx::query_scalar(
+			"SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'parent_id'",
+		)
+		.fetch_one(&db)
+		.await
+		.expect("pragma");
+		assert_eq!(legacy, 0);
+	}
+
+	// v57 shape: share_entries and `share.file` refs name a file by its content `file_id`.
+	// After v58 a file's links name its new entry; a folder's keep their id (= its entry_id).
+	#[tokio::test]
+	async fn v58_rewrites_file_shares_and_links_to_entry_ids() {
+		let db = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.expect("connect");
+		super::init_db(&db).await.expect("init");
+		add_legacy_files_columns(&db).await;
+		for sql in [
+			"INSERT INTO files (f_id, tn_id, file_id, file_tp, status, x, parent_id, updated_at) \
+			 VALUES (1, 1, 'f1~abc', 'BLOB', 'A', '{\"dim\":[4,3]}', 'fold1', 1000), \
+			 (2, 1, 'fold1', 'FLDR', 'A', NULL, NULL, 1000)",
+			"INSERT INTO file_user_data (tn_id, id_tag, e_id, starred) \
+			 VALUES (1, 'bob', 1, 1), (1, 'bob', 2, 1)",
+			"INSERT INTO share_entries (tn_id, resource_type, resource_id, subject_type, \
+			 subject_id, permission, created_by) \
+			 VALUES (1, 'F', 'f1~abc', 'U', 'bob', 'R', 'me'), \
+			 (1, 'F', 'fold1', 'U', 'bob', 'R', 'me')",
+			"INSERT INTO refs (tn_id, ref_id, type, resource_id) \
+			 VALUES (1, 'r1', 'share.file', 'f1~abc'), (1, 'r2', 'share.file', 'fold1')",
+		] {
+			sqlx::query(sql).execute(&db).await.expect("seed");
+		}
+
+		let mut tx = db.begin().await.expect("tx");
+		super::migrate_v58_entries(&mut tx).await.expect("migrate");
+		tx.commit().await.expect("commit");
+
+		let file_entry: String = sqlx::query_scalar("SELECT entry_id FROM entries WHERE f_id = 1")
+			.fetch_one(&db)
+			.await
+			.expect("file entry");
+		assert_ne!(file_entry, "f1~abc");
+		for (table, col) in [("share_entries", "id"), ("refs", "ref_id")] {
+			let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+				"SELECT resource_id FROM {table} ORDER BY {col}"
+			)))
+			.fetch_all(&db)
+			.await
+			.expect("ids");
+			assert_eq!(ids, [file_entry.clone(), "fold1".to_string()], "{table}");
+		}
+		let parent: Option<String> =
+			sqlx::query_scalar("SELECT parent_id FROM entries WHERE entry_id = ?")
+				.bind(&file_entry)
+				.fetch_one(&db)
+				.await
+				.expect("parent");
+		assert_eq!(parent.as_deref(), Some("fold1"), "parent link survives");
+		let starred: Vec<String> = sqlx::query_scalar(
+			"SELECT e.entry_id FROM file_user_data u JOIN entries e ON e.e_id = u.e_id \
+			 WHERE u.id_tag = 'bob' AND u.starred = 1 ORDER BY e.e_id",
+		)
+		.fetch_all(&db)
+		.await
+		.expect("stars");
+		assert_eq!(starred, [file_entry.clone(), "fold1".to_string()], "stars follow the entry");
+		let x: Option<String> = sqlx::query_scalar("SELECT x FROM files WHERE f_id = 1")
+			.fetch_one(&db)
+			.await
+			.expect("x stays on files");
+		assert_eq!(x.as_deref(), Some("{\"dim\":[4,3]}"));
+		let stamps: Vec<i64> = sqlx::query_scalar("SELECT updated_at FROM entries ORDER BY e_id")
+			.fetch_all(&db)
+			.await
+			.expect("updated_at");
+		assert_eq!(stamps, [1000, 1000], "the migration keeps each entry's updated_at");
+	}
+
+	// Legacy managed attachment rows get the latest live action naming them (by id or `@<f_id>`);
+	// one only a deleted action names stays unowned, for the file GC.
+	#[tokio::test]
+	async fn v58_backfills_managed_entry_action_id() {
+		let db = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.expect("connect");
+		super::init_db(&db).await.expect("init");
+		add_legacy_files_columns(&db).await;
+		for sql in [
+			"INSERT INTO files (f_id, tn_id, file_id, file_tp, status, parent_id) \
+			 VALUES (1, 1, 'f1~live', 'BLOB', 'A', '__managed__'), \
+			 (2, 1, 'f1~dead', 'BLOB', 'A', '__managed__'), \
+			 (3, 1, 'f1~draft', 'BLOB', 'A', '__managed__')",
+			"INSERT INTO actions (tn_id, action_id, type, issuer_tag, status, attachments) \
+			 VALUES (1, 'a1~old', 'POST', 'me', 'A', 'f1~live'), \
+			 (1, 'a1~new', 'POST', 'me', 'A', 'f1~live,@3'), \
+			 (1, 'a1~gone', 'POST', 'me', 'D', 'f1~dead')",
+		] {
+			sqlx::query(sql).execute(&db).await.expect("seed");
+		}
+
+		let mut tx = db.begin().await.expect("tx");
+		super::migrate_v58_entries(&mut tx).await.expect("migrate");
+		tx.commit().await.expect("commit");
+
+		// Each live action that names the content owns its own entry.
+		let owners: Vec<(i64, Option<String>)> =
+			sqlx::query_as("SELECT f_id, action_id FROM entries ORDER BY f_id, action_id")
+				.fetch_all(&db)
+				.await
+				.expect("owners");
+		assert_eq!(
+			owners,
+			[
+				(1, Some("a1~new".into())),
+				(1, Some("a1~old".into())),
+				(2, None),
+				(3, Some("a1~new".into())),
+			]
+		);
+	}
 }
 
 // vim: ts=4

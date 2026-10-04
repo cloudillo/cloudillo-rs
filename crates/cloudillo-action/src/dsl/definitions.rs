@@ -29,6 +29,7 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		stat_definition(),
 		idp_reg_definition(),
 		fileshare_definition(),
+		fileshare_del_definition(),
 		pres_definition(),
 		subs_definition(),
 		conv_definition(),
@@ -1046,6 +1047,21 @@ fn subs_definition() -> ActionDefinition {
 	}
 }
 
+/// FSHR:DEL - a revocation names its subject and audience only, so it needs no content. Optional
+/// rather than forbidden, and unchecked: older senders still attach empty display fields.
+/// Everything else is FSHR's; `native_hooks` registers the FSHR hooks under this key too.
+fn fileshare_del_definition() -> ActionDefinition {
+	let base = fileshare_definition();
+	ActionDefinition {
+		r#type: "FSHR:DEL".to_string(),
+		description: "Revoke a file share".to_string(),
+		subtypes: None,
+		fields: FieldConstraints { content: None, ..base.fields },
+		schema: None,
+		..base
+	}
+}
+
 /// FSHR - File share action
 fn fileshare_definition() -> ActionDefinition {
 	ActionDefinition {
@@ -1619,6 +1635,24 @@ mod tests {
 		// fileTp}` — metadata, no prose — and the shared file's own `'F'` row
 		// already makes it findable by name.
 		assert_eq!(indexed, ["CMNT", "CONV", "MSG", "POST", "POST:LDOC"]);
+	}
+
+	/// FSHR:DEL carries no content (older senders' empty display fields still pass), while a
+	/// grant keeps its strict schema. Both share one key, so a revocation replaces the grant.
+	#[test]
+	fn fshr_del_needs_no_content_but_a_grant_does() {
+		let mut engine = crate::dsl::engine::DslEngine::new();
+		for def in get_definitions() {
+			engine.load_definition(def);
+		}
+		engine.validate_content("FSHR:DEL", None).expect("DEL without content");
+		let legacy = serde_json::json!({ "contentType": "", "fileName": "", "fileTp": "BLOB" });
+		engine.validate_content("FSHR:DEL", Some(&legacy)).expect("legacy DEL shape");
+		assert!(engine.validate_content("FSHR", None).is_err(), "a grant needs content");
+		assert!(engine.validate_content("FSHR", Some(&legacy)).is_err(), "a grant needs a name");
+		let del = engine.definition_for("FSHR", Some("DEL")).expect("FSHR:DEL");
+		let grant = engine.definition_for("FSHR", None).expect("FSHR");
+		assert_eq!(del.key_pattern, grant.key_pattern, "a DEL must replace the grant's row");
 	}
 
 	/// `POST:LDOC` rides POST's feed paths but takes an object body. The combined key

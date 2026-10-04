@@ -46,7 +46,7 @@ impl TenantImageType {
 		}
 	}
 
-	/// `files.tags` entry
+	/// `entries.tags` entry
 	fn tag(self) -> &'static str {
 		match self {
 			Self::ProfilePic => "profile",
@@ -206,7 +206,8 @@ async fn put_tenant_image(
 				..Default::default()
 			},
 		)
-		.await?;
+		.await?
+		.file_id;
 
 	let f_id = match f_id {
 		meta_adapter::FileId::FId(fid) => fid,

@@ -31,7 +31,7 @@ use cloudillo_core::share_access::{
 	ensure_grant_within, require_share_manager, require_share_reader, require_unscoped_file_access,
 };
 use cloudillo_types::action_types::CreateAction;
-use cloudillo_types::meta_adapter::{CreateShareEntry, ShareEntry, UpdateShareEntryOptions};
+use cloudillo_types::meta_adapter::{self, CreateShareEntry, ShareEntry, UpdateShareEntryOptions};
 use cloudillo_types::types::{AccessLevel, ApiResponse};
 
 /// Validate the share-permission vocabulary. The 4 valid values match the
@@ -62,6 +62,12 @@ fn validate_admin_subject(permission: char, subject_type: char) -> ClResult<()> 
 	Ok(())
 }
 
+/// The FSHR subject (`FSHR:{subject}:{audience}`): the content id, which the recipient mirrors
+/// and asks the sender back for; a folder has none and goes by its entry id.
+fn fshr_subject(file_view: &meta_adapter::FileView) -> Box<str> {
+	file_view.file_id.as_deref().unwrap_or(&file_view.entry_id).into()
+}
+
 /// GET /api/files/{file_id}/shares — List share entries for a file
 pub async fn list_shares(
 	State(app): State<App>,
@@ -71,9 +77,11 @@ pub async fn list_shares(
 	Path(file_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ShareEntry>>>)> {
-	require_share_reader(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	let authority = require_share_reader(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	// Share entries are keyed by the placement (`entry_id`), not the id the path named.
+	let entry_id = &authority.access.file_view.entry_id;
 
-	let entries = app.meta_adapter.list_share_entries(tn_id, 'F', &file_id).await?;
+	let entries = app.meta_adapter.list_share_entries(tn_id, 'F', entry_id).await?;
 
 	let response = ApiResponse::new(entries).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::OK, Json(response)))
@@ -121,6 +129,15 @@ pub async fn create_share(
 		}
 		input.subject_id = bare_id.to_string();
 	}
+	// A file subject is stored as its entry id: the one entry of it the caller's context admits.
+	if input.subject_type == 'F' {
+		let ctx = FileAccessCtx::from_auth(Some(&auth), &tenant_id_tag);
+		let subject =
+			file_access::resolve_placement(&app, tn_id, &input.subject_id, &ctx, AccessLevel::Read)
+				.await?;
+		input.subject_id = subject.file_view.entry_id.into();
+	}
+	let entry_id = &authority.access.file_view.entry_id;
 
 	// Manager standing is not Write-derived — a `leader` over a locally originating row qualifies
 	// at `AccessLevel::Read` — so cap the grant at the caller's ceiling or they could hand
@@ -136,7 +153,7 @@ pub async fn create_share(
 	// Create share entry
 	let entry = app
 		.meta_adapter
-		.create_share_entry(tn_id, 'F', &file_id, &auth.id_tag, &input)
+		.create_share_entry(tn_id, 'F', entry_id, &auth.id_tag, &input)
 		.await?;
 
 	// For user shares, also create FSHR action for federation (best-effort)
@@ -158,7 +175,7 @@ pub async fn create_share(
 			typ: "FSHR".into(),
 			sub_typ,
 			audience_tag: Some(input.subject_id.clone().into()),
-			subject: Some(file_id.clone().into()),
+			subject: Some(fshr_subject(file_view)),
 			content: Some(json!({
 				"contentType": content_type,
 				"fileName": file_view.file_name,
@@ -190,14 +207,15 @@ pub async fn delete_share(
 	Path((file_id, share_id)): Path<(String, i64)>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	let authority = require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	let file_view = &authority.access.file_view;
 
 	// Load share entry before deleting (need subject info for FSHR revocation)
 	let maybe_entry = app.meta_adapter.read_share_entry(tn_id, share_id).await?;
 
 	// Verify the share entry belongs to this file (prevent cross-file deletion)
 	if let Some(ref entry) = maybe_entry {
-		if entry.resource_type != 'F' || *entry.resource_id != *file_id {
+		if entry.resource_type != 'F' || entry.resource_id != file_view.entry_id {
 			return Err(Error::NotFound);
 		}
 	} else {
@@ -207,20 +225,26 @@ pub async fn delete_share(
 	// Delete the share entry
 	app.meta_adapter.delete_share_entry(tn_id, share_id).await?;
 
-	// For user shares, also create FSHR DEL action (best-effort)
+	// For user shares, also create FSHR DEL action (best-effort). The FSHR is keyed by content, so
+	// while a sibling entry still shares it to the same user, a DEL would overwrite that grant's
+	// row: skip it, and the last revocation federates.
+	let sibling_grant = match (&maybe_entry, file_view.file_id.as_deref()) {
+		(Some(entry), Some(content)) if entry.subject_type == 'U' => !app
+			.meta_adapter
+			.check_content_share_access(tn_id, content, &entry.subject_id)
+			.await?
+			.is_empty(),
+		_ => false,
+	};
 	if let Some(entry) = maybe_entry
 		&& entry.subject_type == 'U'
+		&& !sibling_grant
 	{
 		let action = CreateAction {
 			typ: "FSHR".into(),
 			sub_typ: Some("DEL".into()),
 			audience_tag: Some(entry.subject_id.clone()),
-			subject: Some(entry.resource_id.clone()),
-			content: Some(json!({
-				"contentType": "",
-				"fileName": "",
-				"fileTp": "BLOB",
-			})),
+			subject: Some(fshr_subject(file_view)),
 			..Default::default()
 		};
 
@@ -289,7 +313,9 @@ pub async fn update_share(
 					.read_share_entry(tn_id, share_id)
 					.await?
 					.ok_or(Error::NotFound)?;
-				if entry.resource_type != 'F' || *entry.resource_id != *file_id {
+				if entry.resource_type != 'F'
+					|| entry.resource_id != authority.access.file_view.entry_id
+				{
 					return Err(Error::NotFound);
 				}
 				validate_admin_subject(c, entry.subject_type)?;
@@ -316,7 +342,7 @@ pub async fn update_share(
 
 	let updated = app
 		.meta_adapter
-		.update_share_entry(tn_id, share_id, 'F', &file_id, &opts)
+		.update_share_entry(tn_id, share_id, 'F', &authority.access.file_view.entry_id, &opts)
 		.await?;
 
 	// No FSHR emission on PATCH: the action is a one-shot notification, not the
@@ -367,6 +393,8 @@ pub async fn list_shares_by_subject(
 	// query. Normalizing only for the gate let `@alice.example.com` clear it and then match nothing.
 	// The file-access checks below keep the raw value: `@{f_id}` is a live file address form.
 	let subject_id = query.subject_id.strip_prefix('@').unwrap_or(&query.subject_id);
+	// A file subject is stored as its entry id; set from the access check that resolves it.
+	let mut file_entry_id: Option<Box<str>> = None;
 
 	if auth.scope.is_some() {
 		if query.subject_type != Some('F') {
@@ -387,14 +415,21 @@ pub async fn list_shares_by_subject(
 			Err(file_access::FileAccessError::InternalError(msg)) => {
 				return Err(Error::Internal(msg));
 			}
-			Ok(_) => {}
+			Ok(res) => file_entry_id = Some(res.file_view.entry_id),
 		}
 	} else {
 		match query.subject_type {
 			// A file subject: "which containers embed this file". Plain read access to the file.
 			None | Some('F') => {
-				require_unscoped_file_access(&app, tn_id, &query.subject_id, &auth, &tenant_id_tag)
-					.await?;
+				let res = require_unscoped_file_access(
+					&app,
+					tn_id,
+					&query.subject_id,
+					&auth,
+					&tenant_id_tag,
+				)
+				.await?;
+				file_entry_id = Some(res.file_view.entry_id);
 			}
 			// A user subject: "which files is this user shared into" — their own share map, so
 			// without this gate any member could enumerate anyone's.
@@ -430,7 +465,11 @@ pub async fn list_shares_by_subject(
 
 	let entries = app
 		.meta_adapter
-		.list_share_entries_by_subject(tn_id, subject_type, subject_id)
+		.list_share_entries_by_subject(
+			tn_id,
+			subject_type,
+			file_entry_id.as_deref().unwrap_or(subject_id),
+		)
 		.await?;
 
 	let response = ApiResponse::new(entries).with_req_id(req_id.unwrap_or_default());

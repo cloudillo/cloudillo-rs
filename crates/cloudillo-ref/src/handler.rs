@@ -308,9 +308,11 @@ pub async fn list_refs(
 	reject_scoped(&auth)?;
 
 	let mut redact = false;
+	// Share links are keyed by the placement's `entry_id`, whatever id the caller named.
+	let mut list_resource_id = query_params.resource_id;
 	match query_params.r#type.as_deref().map(ref_gate) {
 		Some(RefGate::FileShare) => {
-			let resource_id = query_params.resource_id.as_deref().ok_or_else(|| {
+			let resource_id = list_resource_id.as_deref().ok_or_else(|| {
 				Error::ValidationError(
 					"resourceId is required when listing share.file refs".to_string(),
 				)
@@ -318,6 +320,7 @@ pub async fn list_refs(
 			let authority = share_standing(&app, tn_id, resource_id, &auth, &tenant_id_tag).await?;
 			ensure_standing(authority.standing, ShareStanding::Reader, &auth.id_tag, resource_id)?;
 			redact = authority.standing < ShareStanding::Manager;
+			list_resource_id = Some(authority.access.file_view.entry_id.to_string());
 		}
 		// `None` spans the account-scoped types, so it takes their gate rather than SADM — which,
 		// being the base tenant's alone, would lock every other tenant out of its own refs.
@@ -330,7 +333,7 @@ pub async fn list_refs(
 	let opts = ListRefsOptions {
 		typ: query_params.r#type,
 		filter: query_params.filter.or(Some("active".to_string())),
-		resource_id: query_params.resource_id,
+		resource_id: list_resource_id,
 	};
 
 	let refs = app.meta_adapter.list_refs(tn_id, &opts).await?;
@@ -416,6 +419,8 @@ pub async fn create_ref(
 	//
 	// The CREATE gate, not `ref_gate`: minting is strictly more privileged than managing an
 	// existing row, and `share.file` is the only type a client may mint at all.
+	// Share links are keyed by the placement's `entry_id`, whatever id the caller named.
+	let mut stored_resource_id = create_req.resource_id.clone();
 	match ref_create_gate(&create_req.r#type) {
 		RefGate::FileShare => {
 			let resource_id = create_req.resource_id.as_deref().ok_or_else(|| {
@@ -434,6 +439,7 @@ pub async fn create_ref(
 					resource_id,
 				)?;
 			}
+			stored_resource_id = Some(authority.access.file_view.entry_id.to_string());
 		}
 		// Unreachable today; deny rather than fall through, so widening `ref_create_gate` cannot
 		// silently inherit an open gate.
@@ -458,7 +464,7 @@ pub async fn create_ref(
 		description: create_req.description.clone(),
 		expires_at: create_req.expires_at,
 		count,
-		resource_id: create_req.resource_id.clone(),
+		resource_id: stored_resource_id,
 		access_level: access_level_char,
 		params: create_req.params.clone(),
 	};

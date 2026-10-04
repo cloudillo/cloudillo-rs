@@ -7,18 +7,19 @@ use axum::{
 	Json,
 	extract::{Path, State},
 	http::StatusCode,
+	response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 use cloudillo_core::IdTag;
 use cloudillo_core::abac::{self, VisibilityLevel, relationship_level};
-use cloudillo_core::channels::{can_enter, reader_roster};
+use cloudillo_core::channels::{absolute_channel, can_enter, reader_roster};
 use cloudillo_core::extract::{Auth, OptionalAuth, OptionalRequestId};
 use cloudillo_core::roles::{is_moderator, role_level};
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::meta_adapter::{Channel, UpdateChannelData};
-use cloudillo_types::types::ApiResponse;
+use cloudillo_types::types::{ApiResponse, ErrorResponse};
 use cloudillo_types::validation::validate_channel_name;
 
 /// One room on the porch. `status` is `in`, `needs:<role>` or `invitation-only`.
@@ -32,14 +33,25 @@ pub struct PorchEntry {
 	/// Admin fields — only for the tenant and moderator+ readers.
 	#[serde(flatten)]
 	admin: Option<PorchAdmin>,
+	/// Member fields — for readers with status `in` and admins.
+	#[serde(flatten)]
+	member: Option<PorchMember>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PorchAdmin {
 	visibility: Option<char>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PorchMember {
 	min_role: Option<Box<str>>,
 	closed: bool,
+	/// Roster size; closed rooms only.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	member_count: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -137,23 +149,37 @@ pub async fn list_channels(
 		Vec::new()
 	};
 
-	let entries = channels
-		.into_iter()
-		.filter(|c| is_admin || access.can_access(VisibilityLevel::from_char(c.visibility)))
-		.map(|c| {
-			let status = if is_tenant {
-				"in".into()
+	let mut entries = Vec::new();
+	for c in channels {
+		if !is_admin && !access.can_access(VisibilityLevel::from_char(c.visibility)) {
+			continue;
+		}
+		let status = if is_tenant {
+			"in".into()
+		} else {
+			porch_status(&c, roles, roster.contains(&c.name), hatted)
+		};
+		let member = if is_admin || status == "in" {
+			// One roster query per closed room; add a grouped count if porches grow.
+			let member_count = if c.closed {
+				Some(app.meta_adapter.list_channel_members(tn_id, &c.name).await?.len())
 			} else {
-				porch_status(&c, roles, roster.contains(&c.name), hatted)
+				None
 			};
-			let admin = is_admin.then_some(PorchAdmin {
-				visibility: c.visibility,
-				min_role: c.min_role,
-				closed: c.closed,
-			});
-			PorchEntry { name: c.name, title: c.title, descr: c.descr, status, admin }
-		})
-		.collect();
+			Some(PorchMember { min_role: c.min_role, closed: c.closed, member_count })
+		} else {
+			None
+		};
+		let admin = is_admin.then_some(PorchAdmin { visibility: c.visibility });
+		entries.push(PorchEntry {
+			name: c.name,
+			title: c.title,
+			descr: c.descr,
+			status,
+			admin,
+			member,
+		});
+	}
 
 	Ok((StatusCode::OK, Json(ApiResponse::new(entries).with_req_id(req_id.unwrap_or_default()))))
 }
@@ -225,16 +251,30 @@ pub async fn patch_channel(
 	Ok((StatusCode::OK, Json(ApiResponse::new(channel).with_req_id(req_id.unwrap_or_default()))))
 }
 
-/// DELETE /api/channels/{name} — delete a room and its roster (moderator+). Its content
-/// stays stamped and fails closed for everyone but the tenant.
+/// DELETE /api/channels/{name} — delete a room and its roster (moderator+). Refused with 409
+/// and `details.fileCount` while the room's drive holds live entries; trashed and attachment
+/// content stays stamped and fails closed for everyone but the tenant.
 pub async fn delete_channel(
 	State(app): State<App>,
 	Auth(auth): Auth,
+	IdTag(tenant_id_tag): IdTag,
 	Path(name): Path<String>,
-) -> ClResult<StatusCode> {
+) -> ClResult<Response> {
 	require_moderator(&auth)?;
+	// Count and delete are not one transaction; an upload in between is left stamped
+	// and fails closed like trashed content.
+	let channel = absolute_channel(&tenant_id_tag, &name);
+	let file_count = app.meta_adapter.count_channel_entries(auth.tn_id, &channel).await?;
+	if file_count > 0 {
+		let body = ErrorResponse::new(
+			"E-CORE-CONFLICT".into(),
+			format!("Resource conflict: room {name} still holds {file_count} files"),
+		)
+		.with_details(serde_json::json!({ "fileCount": file_count }));
+		return Ok((StatusCode::CONFLICT, Json(body)).into_response());
+	}
 	app.meta_adapter.delete_channel(auth.tn_id, &name).await?;
-	Ok(StatusCode::NO_CONTENT)
+	Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// GET /api/channels/{name}/members — a closed room's roster (moderator+).

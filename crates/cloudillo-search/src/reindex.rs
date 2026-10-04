@@ -315,7 +315,7 @@ async fn page_files(
 			let deep =
 				matches!(file.file_tp.as_deref(), Some(indexer::STORE_RTDB | indexer::STORE_CRDT));
 			if let Err(e) = index_one_file(app, tn_id, file, whole_rows).await {
-				warn!(tn_id = %tn_id, file_id = %file.file_id, error = %e,
+				warn!(tn_id = %tn_id, file_id = %file.index_id(), error = %e,
 					"Search reindex: file failed");
 				stats.failed += 1;
 				continue;
@@ -336,7 +336,8 @@ async fn page_files(
 			cloudillo_types::types::CursorData::new(
 				"created",
 				last.created_at.0.into(),
-				&last.file_id,
+				// The entry id: a content `file_id` placed in several entries is ambiguous.
+				&last.entry_id,
 			)
 			.encode(),
 		);
@@ -356,12 +357,16 @@ async fn index_one_file(
 	whole_row: bool,
 ) -> ClResult<()> {
 	if whole_row {
+		// One content can sit in several entries; its representative stands for the row
+		// (see `objects::representative`), whichever entry the sweep is on.
+		let rep = objects::representative(app, tn_id, &file.entry_id).await?;
+		let file = rep.as_ref().unwrap_or(file);
 		// `Retry`: the sweep is where an extraction that failed for a cause since fixed
 		// — a blob that came back, a newer poppler — gets its second chance.
 		objects::index_file_row(app, tn_id, file, objects::ExtractRetry::Retry).await?;
 	}
 	if matches!(file.file_tp.as_deref(), Some(indexer::STORE_RTDB | indexer::STORE_CRDT)) {
-		indexer::index_document(app, tn_id, &file.file_id).await?;
+		indexer::index_document(app, tn_id, file.index_id()).await?;
 	}
 	Ok(())
 }

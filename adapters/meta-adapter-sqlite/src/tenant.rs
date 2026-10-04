@@ -230,6 +230,7 @@ const TENANT_CASCADE_TABLES: &[&str] = &[
 	"actions",
 	"file_variants",
 	"files",
+	"entries",
 	"file_user_data",
 	"share_entries",
 	"refs",

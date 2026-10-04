@@ -822,6 +822,31 @@ pub enum FileId<S: AsRef<str>> {
 	FId(u64),
 }
 
+/// Result of [`MetaAdapter::create_file`]: the new entry plus the content it points at.
+#[derive(Debug)]
+pub struct CreatedFile {
+	pub entry_id: Box<str>,
+	pub file_id: FileId<Box<str>>,
+}
+
+/// Result of [`MetaAdapter::read_content`]: a content row's state.
+#[derive(Debug)]
+pub struct ContentInfo {
+	pub f_id: u64,
+	pub preset: Option<Box<str>>,
+	/// Whether any entry (any status) points at the content.
+	pub has_entries: bool,
+}
+
+/// Result of [`MetaAdapter::resolve_file`].
+#[derive(Debug)]
+pub enum FileResolution {
+	NotFound,
+	Entry(Box<FileView>),
+	/// A content id naming several entries; resolve it against a caller context instead.
+	Ambiguous,
+}
+
 pub enum ActionId<S: AsRef<str>> {
 	ActionId(S),
 	AId(u64),
@@ -865,32 +890,43 @@ pub struct FileUserData {
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileView {
-	pub file_id: Box<str>,
+	/// Placement id (`entries.entry_id`). Every placement method takes this id.
 	#[serde(default)]
-	pub parent_id: Option<Box<str>>, // Parent folder file_id (None = root)
+	pub entry_id: Box<str>,
+	/// Content id (`files.file_id`). Several entries may share it (BLOB only).
+	/// `None` for a local folder (no `files` row); a reference folder carries its upstream id.
+	#[serde(default)]
+	#[serialize_always]
+	pub file_id: Option<Box<str>>,
+	#[serde(default)]
+	pub parent_id: Option<Box<str>>, // Parent folder entry_id (None = root)
 	#[serde(default)]
 	pub root_id: Option<Box<str>>, // Document tree root file_id (None = standalone)
 	/// Where the canonical copy lives — `None` when the file originates here.
 	#[serde(default)]
 	pub upstream: Option<ProfileInfo>,
-	/// Raw `files.upstream_tag` column — `None` for a file that originates here.
+	/// Raw `entries.upstream_tag`, per placement — `None` for an entry that originates here.
+	/// One BLOB content can carry local and mirrored entries side by side.
 	///
 	/// Not part of the API surface: `upstream` above carries the resolved profile.
 	/// Consumers that must agree with the stored column rather than the resolved
-	/// profile — the search indexer, which denormalises it into
-	/// `search_docs.upstream_tag` — need the raw value.
+	/// profile — the publish and attach checks — need the raw value.
 	#[serde(skip)]
 	pub upstream_tag: Option<Box<str>>,
 	/// The profile with owner authority — `None` falls back to the tenant.
 	#[serde(default)]
 	pub owner: Option<ProfileInfo>,
-	/// Raw `files.owner_tag` column — `None` when the tenant owns the row.
+	/// Raw `entries.owner_tag` column — `None` when the tenant owns the row.
 	///
 	/// Not part of the API surface: `owner` above carries the resolved profile, whose NULL
 	/// fallback is the tenant. Consumers that must tell "the tenant owns this" from "nobody
 	/// placed this locally" — `cloudillo_file::management::patch_file` — need the raw value.
 	#[serde(skip)]
 	pub owner_tag: Option<Box<str>>,
+	/// Raw `entries.action_id` — set on an action-managed attachment entry, which lives and dies
+	/// with its action. Not part of the API surface.
+	#[serde(skip)]
+	pub action_id: Option<Box<str>>,
 	#[serde(default)]
 	pub preset: Option<Box<str>>,
 	#[serde(default)]
@@ -948,6 +984,13 @@ pub struct FileView {
 	pub broken_reason: Option<BrokenReason>,
 }
 
+impl FileView {
+	/// Search-index / ABAC key: content id, or `entry_id` for a folder.
+	pub fn index_id(&self) -> &str {
+		self.file_id.as_deref().unwrap_or(&self.entry_id)
+	}
+}
+
 /// Reason a cross-context file row is tombstoned. Written by the refresh
 /// endpoint based on the source's response. Tombstones are sticky, so this
 /// is reserved for permanent / authoritative source signals — transient
@@ -975,6 +1018,7 @@ impl BrokenReason {
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathSegment {
+	/// Folder `entry_id`.
 	pub id: Box<str>,
 	pub name: Box<str>,
 }
@@ -1081,7 +1125,7 @@ pub struct ListFileOptions {
 	/// Exclude files by this owner id_tag
 	#[serde(rename = "notOwnerIdTag")]
 	pub not_owner_id_tag: Option<String>,
-	/// Restrict to files that originate on the active tenant (upstream_tag IS NULL),
+	/// Restrict to entries that originate on the active tenant (`entries.upstream_tag` IS NULL),
 	/// excluding remote/federated cached copies. Unlike `owner_id_tag` (which keys off
 	/// COALESCE(owner_tag, upstream_tag, tenant) — *author attribution*, not authority),
 	/// this keys purely off provenance — the right test for "can be embedded".
@@ -1104,20 +1148,24 @@ pub struct ListFileOptions {
 	/// User id_tag for user-specific data (set by handler, not from query)
 	#[serde(skip)]
 	pub user_id_tag: Option<String>,
-	/// Scope file_id filter: returns files matching this file_id OR having this root_id.
+	/// Scope entry id: returns that entry and entries whose root_id is it.
 	/// Overrides the normal root_id IS NULL constraint. Set by handler for scoped tokens.
 	#[serde(skip)]
-	pub scope_file_id: Option<String>,
+	pub scope_entry_id: Option<String>,
 	/// Allowed visibility levels for SQL-level filtering (correct pagination).
 	/// None = no filter (owner sees all including NULL/Direct).
 	/// Set by handler based on subject's access level via `SubjectAccessLevel::visible_levels()`.
 	#[serde(skip)]
 	pub visible_levels: Option<Vec<char>>,
+	/// Drive filter for a root listing (`parentId=__root__`): absent = every drive, `""` = the
+	/// main drive (`channel IS NULL`), `@tenant~name` = that room. Ignored below the root.
+	#[serde(default)]
+	pub channel: Option<String>,
 	/// Channels the reader may enter; rows in other rooms are absent. `None` = no filter.
 	/// Set by handler via `cloudillo_core::channels::enterable_channels`.
 	#[serde(skip)]
 	pub enterable_channels: Option<Vec<Box<str>>>,
-	/// Caller holds a community role: local rows (`upstream_tag` NULL) pass the
+	/// Caller holds a community role: local entries (`upstream_tag` NULL) pass the
 	/// `visible_levels` filter. The channel gate still applies. Set by handler.
 	#[serde(skip)]
 	pub role_grant: bool,
@@ -1157,10 +1205,12 @@ pub struct ListFileOptions {
 pub struct CreateFile {
 	pub orig_variant_id: Option<Box<str>>,
 	pub file_id: Option<Box<str>>,
-	pub parent_id: Option<Box<str>>, // Parent folder file_id (None = root)
+	pub parent_id: Option<Box<str>>, // Parent folder entry_id (None = root)
 	pub root_id: Option<Box<str>>,   // Document tree root file_id (None = standalone)
-	pub upstream_tag: Option<Box<str>>, // Set only when the canonical copy lives elsewhere (e.g., shared files)
-	pub owner_tag: Option<Box<str>>,    // The profile with owner authority; NULL ⇒ the tenant
+	/// The new entry's origin. Set, the entry is a reference (Pin / Place / FSHR): it names
+	/// `file_id` upstream, holds no local bytes and never links a local `files` row.
+	pub upstream_tag: Option<Box<str>>,
+	pub owner_tag: Option<Box<str>>, // The profile with owner authority; NULL ⇒ the tenant
 	pub preset: Option<Box<str>>,
 	pub content_type: Box<str>,
 	pub file_name: Box<str>,
@@ -1171,6 +1221,8 @@ pub struct CreateFile {
 	pub visibility: Option<char>, // None: Direct (default), P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
 	/// Absolute channel (`@tenant~name`); `None` = open floor.
 	pub channel: Option<Box<str>>,
+	/// Managed attachment entry: the action that owns it (removed with that action).
+	pub action_id: Option<Box<str>>,
 	/// LEGACY: do not set on new rows. System-managed files should be created
 	/// with `parent_id = MANAGED_PARENT_ID` so the file GC can reap them.
 	pub hidden: bool,
@@ -1192,16 +1244,15 @@ pub struct UpdateFileOptions {
 	/// managed folder via `parent_id = MANAGED_PARENT_ID`.
 	#[serde(default)]
 	pub hidden: Patch<bool>,
-	// Fields below (content_type, file_tp, tags, preset, x, broken) are set
-	// only by the cross-context refresh handler; not exposed as PATCH fields.
+	// Fields below (content_type, file_tp, tags, x, broken) are set only by the cross-context
+	// refresh handler; not exposed as PATCH fields. `content_type`, `file_tp` and `x` write a
+	// reference's `ref_*` columns and nothing else.
 	#[serde(default, rename = "contentType", skip_deserializing)]
 	pub content_type: Patch<String>,
 	#[serde(default, rename = "fileTp", skip_deserializing)]
 	pub file_tp: Patch<String>,
 	#[serde(default, skip_deserializing)]
 	pub tags: Patch<Vec<String>>,
-	#[serde(default, skip_deserializing)]
-	pub preset: Patch<String>,
 	#[serde(default, skip_deserializing)]
 	pub x: Patch<serde_json::Value>,
 	/// Paired tombstone field. `Patch::Value(reason)` sets `broken_reason` and
@@ -1222,7 +1273,7 @@ impl UpdateFileOptions {
 	/// `parent_id` and `hidden` are here not as indexed text but because they
 	/// decide whether the file has an index row at all: moving into
 	/// [`TRASH_PARENT_ID`] or hiding it must drop it from `search_docs`
-	/// (`objects::is_indexable` gates on `!file.hidden`). `file_tp`, `preset`, `x`
+	/// (`objects::is_indexable` gates on `!file.hidden`). `file_tp`, `x`
 	/// and `broken` are deliberately absent: none of them reaches `search_docs`.
 	pub fn affects_search_index(&self) -> bool {
 		!matches!(
@@ -1253,12 +1304,10 @@ impl UpdateFileOptions {
 /// What [`MetaAdapter::delete_file`] removed.
 #[derive(Debug, Clone, Default)]
 pub struct DeleteFileResult {
-	/// Every file id deleted, root first, so the caller can evict each from its folder cache.
-	/// Content ids only — a row whose `file_id` is still NULL (an unfinalized upload) is tombstoned
-	/// but has no cache key and nothing that can reference it, so it is absent here.
-	pub file_ids: Vec<Box<str>>,
-	/// How many `files` rows were actually tombstoned, including the NULL-`file_id` ones missing
-	/// from `file_ids`. Always `>= file_ids.len()`.
+	/// Every entry id tombstoned, root first, then its document tree, so the caller can evict
+	/// each from its folder cache and search index.
+	pub entry_ids: Vec<Box<str>>,
+	/// How many entries were actually tombstoned.
 	pub files_deleted: u64,
 	pub refs_removed: u64,
 	pub share_entries_removed: u64,
@@ -1413,6 +1462,10 @@ pub struct InstalledApp {
 // Full-text search
 //******************
 
+/// `part_kind` of a file's per-entry part: `part_id` = the entry id, the entry's own name and
+/// tags, no body. Gated on that entry alone, so one placement's name never shows for another.
+pub const ENTRY_PART_KIND: &str = "entry";
+
 /// One indexable unit of an object.
 ///
 /// A whole object (a file, an action, a profile) has a single part with
@@ -1446,12 +1499,10 @@ pub struct SearchObject<'a> {
 	/// file_id / action_id / id_tag; for `'D'` the container file_id.
 	pub obj_id: &'a str,
 	pub content_type: Option<&'a str>,
-	/// Where the object comes from: `files.upstream_tag` for a file or document part,
-	/// `p.id_tag` for a profile, `a.issuer_tag` for an action. Not an owner — it mirrors the
-	/// raw column of the same name, and `FileView::owner` is a different profile entirely.
+	/// Where the object comes from: `p.id_tag` for a profile, `a.issuer_tag` for an action.
+	/// Always `None` for a file or document part: provenance is per entry, so search reads it
+	/// live from the admitted entry. Not an owner — `FileView::owner` is a different profile.
 	pub upstream_tag: Option<&'a str>,
-	/// None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
-	pub visibility: Option<char>,
 	pub root_id: Option<&'a str>,
 	pub created_at: Option<Timestamp>,
 	/// Which of the two FTS indexes these rows belong to. `false` (the default)
@@ -1502,12 +1553,13 @@ pub struct SearchOptions {
 	/// Channels the caller may enter; hits in other rooms are absent. `None` = no filter.
 	pub enterable_channels: Option<Vec<Box<str>>>,
 	pub viewer_id_tag: Option<String>,
-	/// File-scoped token: only this file and its document tree are visible.
+	/// File-scoped token: only this content and its document tree are visible (a content id).
 	pub scope_file_id: Option<String>,
-	/// File id a delegated (share-link / app) token was scoped to. Its own row and
-	/// the deep `'D'` parts of its document tree bypass the visibility filter —
-	/// the share itself is the grant. Child `'F'` rows in the same tree are never
-	/// search hits; their container stands for them.
+	/// The **entry id** a delegated (share-link / app) token was scoped to. That entry's own
+	/// rows and, while it is live, the deep `'D'` parts of its document tree bypass the
+	/// visibility filter — the share itself is the grant. A sibling entry of the same content
+	/// gains nothing. Child `'F'` rows in the same tree are never search hits; their container
+	/// stands for them.
 	pub scope_grant_file_id: Option<Box<str>>,
 	/// Same as [`ListFileOptions::role_grant`], on `'F'`/`'D'` rows.
 	pub role_grant: bool,
@@ -1552,8 +1604,8 @@ pub struct SearchRow {
 	pub title: Option<Box<str>>,
 	pub tags: Option<Box<str>>,
 	pub content_type: Option<Box<str>>,
+	/// A file or document part: the admitted entry's origin (read live, like `title`).
 	pub upstream_tag: Option<Box<str>>,
-	pub visibility: Option<char>,
 	pub root_id: Option<Box<str>>,
 	pub updated_at: Timestamp,
 	/// Server-built excerpt as **plain text** — no markup of any kind.
@@ -2322,9 +2374,23 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	) -> ClResult<FileVariant<Box<str>>>;
 	/// Look up the file_id for a given variant_id
 	async fn read_file_id_by_variant(&self, tn_id: TnId, variant_id: &str) -> ClResult<Box<str>>;
-	/// Look up the internal f_id for a given file_id (for adding variants to existing files)
-	async fn read_f_id_by_file_id(&self, tn_id: TnId, file_id: &str) -> ClResult<u64>;
-	async fn create_file(&self, tn_id: TnId, opts: CreateFile) -> ClResult<FileId<Box<str>>>;
+	/// The content row named `file_id`. `NotFound` when absent.
+	async fn read_content(&self, tn_id: TnId, file_id: &str) -> ClResult<ContentInfo>;
+	/// Create a verified sync mirror's content row (`preset = 'sync'`) with **no entry**, or
+	/// return the existing row's `f_id`. The caller adds the entry once the variants are synced
+	/// and [`Self::finalize_file`] ran, so nobody holds an id to a half-synced mirror.
+	async fn create_sync_content(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		root_id: Option<&str>,
+		content_type: &str,
+		x: Option<serde_json::Value>,
+	) -> ClResult<u64>;
+	/// Always inserts a new entry. `file_id` is `FileId(..)` for a dedup hit (the entry points at
+	/// the existing content) or a folder (its `entry_id`), `FId(f_id)` for a new pending file.
+	async fn create_file(&self, tn_id: TnId, opts: CreateFile) -> ClResult<CreatedFile>;
+	/// `f_id` is a content `files.f_id`.
 	async fn create_file_variant<'a>(
 		&'a self,
 		tn_id: TnId,
@@ -2332,23 +2398,31 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		opts: FileVariant<&'a str>,
 	) -> ClResult<&'a str>;
 
-	/// Finalize a pending file - sets file_id and transitions status from 'P' to 'A' atomically
+	/// Finalize a pending file: sets `file_id` and flips its entry's status from 'P' to 'A'
+	/// atomically. `f_id` is the **content** `files.f_id` (the `FId` from [`create_file`]).
+	/// If a `files` row with `file_id` already exists (of any origin — each entry keeps its own
+	/// `upstream_tag`), the entry is repointed to it, the pending row's variants move over where
+	/// the existing content lacks an available one, and the pending `files` row stays as a
+	/// `merged_into` redirect.
 	async fn finalize_file(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
 
-	/// List internal `f_id`s of files whose `parent_id` equals the given sentinel
-	/// (e.g. [`MANAGED_PARENT_ID`]) and whose `created_at` is strictly before
-	/// `before`. Used by the file GC to enumerate candidates inside the managed
-	/// folder while honouring the safety window.
+	/// `(e_id, f_id)` of entries whose `parent_id` (an **entry** id, e.g. the sentinel
+	/// [`MANAGED_PARENT_ID`]) matches and whose `created_at` is strictly before `before`.
+	/// `f_id` is the entry's **content** `files.f_id` whose references keep it: `None` for
+	/// folders and for an action-owned entry, which is listed only once its action is gone or
+	/// deleted. Used by the file GC:
+	/// it skips candidates whose `f_id` is in [`list_referenced_managed_fids`] and
+	/// hard-deletes the rest by `e_id`.
 	async fn list_files_by_parent(
 		&self,
 		tn_id: TnId,
 		parent_id: &str,
 		before: Timestamp,
-	) -> ClResult<Vec<u64>>;
+	) -> ClResult<Vec<(u64, Option<u64>)>>;
 
-	/// Internal `f_id`s of files in the managed folder that are still referenced
-	/// by at least one canonical column. The file GC keeps any candidate whose
-	/// `f_id` is in this set.
+	/// **Content** `files.f_id`s of files with an entry in the managed folder that are
+	/// still referenced by at least one canonical column. The file GC keeps any
+	/// candidate whose content `f_id` is in this set (never compare with an `e_id`).
 	///
 	/// Returning numeric `f_id`s (instead of string `file_id`s) keeps the
 	/// reference set small — it is naturally scoped to managed-folder rows by
@@ -2356,8 +2430,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// distinct managed-file count in memory.
 	///
 	/// Current sources:
-	/// - `actions.attachments` (CSV-split, every action regardless of
-	///   `actions.status`). Both raw `file_id` tokens and `@<f_id>` draft-time
+	/// - `actions.attachments` (CSV-split, every action not deleted (`status = 'D'`);
+	///   drafts count). Both raw `file_id` tokens and `@<f_id>` draft-time
 	///   placeholders resolve via the `files` table — the latter must not be
 	///   dropped, or files attached to drafts that finalized after the draft
 	///   was saved would be reaped.
@@ -2373,13 +2447,53 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// referenced elsewhere.
 	async fn list_referenced_managed_fids(&self, tn_id: TnId) -> ClResult<HashSet<u64>>;
 
-	/// Hard-delete a file: removes all `file_variants` rows and then the
-	/// `files` row inside a single transaction. Intended for the file GC.
+	/// Hard-delete an entry (`e_id` is an **entry** id) and its `file_user_data` inside a single
+	/// transaction. Intended for the file GC. Content is never deleted here: content left with no
+	/// entry goes with [`Self::reap_orphan_files`].
 	///
-	/// Returns the deleted row's `file_id`, which the caller needs to drop the
-	/// search index entry: an `f_id` alone cannot be mapped back to one once the
-	/// row is gone. `None` for an unfinalized upload, which never had one.
-	async fn hard_delete_file(&self, tn_id: TnId, f_id: u64) -> ClResult<Option<Box<str>>>;
+	/// Returns the search object the entry belonged to (its content id; a folder's entry id),
+	/// for the caller to reindex. `None` when absent.
+	async fn hard_delete_file(&self, tn_id: TnId, e_id: u64) -> ClResult<Option<Box<str>>>;
+
+	/// Delete content (`files` rows and their `file_variants`) no entry references and last
+	/// touched before `before`, plus dedup redirects pointing at it. Returns the reaped content
+	/// ids. The blob sweep reclaims the bytes.
+	async fn reap_orphan_files(&self, tn_id: TnId, before: Timestamp) -> ClResult<Vec<Box<str>>>;
+
+	/// Hard-delete every tombstoned (`status = 'D'`) entry, as [`Self::hard_delete_file`] does, in
+	/// one transaction. Content they leave unreferenced goes with [`Self::reap_orphan_files`].
+	/// Returns the number purged.
+	async fn purge_tombstones(&self, tn_id: TnId) -> ClResult<u64>;
+
+	/// A new entry over existing content `file_id` (BLOB), placed from `opts`'s placement fields.
+	/// No content row is written. `NotFound` for unknown content. Returns the entry id.
+	async fn create_entry_for_content(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		opts: CreateFile,
+	) -> ClResult<Box<str>>;
+
+	/// Add a managed attachment entry (`parent_id` = [`MANAGED_PARENT_ID`]) for content
+	/// `file_id`, named `file_name`, owned by `action_id` (`None`: a profile pic mirror, kept by
+	/// the GC's other sources) and carrying its audience. Idempotent per `(file_id, action_id)`;
+	/// returns the entry id. The entry goes when the action is deleted or
+	/// superseded (`delete_action`, key dedup). The entry originates here (`upstream_tag` NULL):
+	/// callers create it only over content this node holds verified bytes of. `NotFound` for
+	/// unknown or non-BLOB content.
+	async fn create_managed_entry(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		file_name: &str,
+		action_id: Option<&str>,
+		visibility: Option<char>,
+		channel: Option<&str>,
+	) -> ClResult<Box<str>>;
+
+	/// Hard-delete `action_id`'s managed attachment entries — the undo of
+	/// [`Self::create_managed_entry`] when the action never got finalized.
+	async fn delete_managed_entries(&self, tn_id: TnId, action_id: &str) -> ClResult<()>;
 
 	// Task scheduler
 	//****************
@@ -2423,12 +2537,14 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	async fn get_action_type(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<Box<str>>>;
 
 	/// Delete an action (soft delete with cleanup)
+	/// Soft-deletes a published action (hard-deletes an `@a_id` draft). Its managed attachment
+	/// entries are hard-deleted in the same transaction.
 	async fn delete_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()>;
 
 	// Phase 2: File Management Enhancements
 	//**************************************
 	/// Delete `file_id` and its document-tree children (tombstoned as `status = 'D'`; the file GC
-	/// reclaims blobs and hard-deletes later), cascading everything that would otherwise outlive
+	/// purges them with [`Self::purge_tombstones`]), cascading everything that would otherwise outlive
 	/// them: [`SHARE_FILE_REF_TYPE`] refs naming any of the ids, and `share_entries` where any of
 	/// the ids is either the resource or the subject.
 	///
@@ -2436,7 +2552,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// resurrects the row, and a half-run cascade would resurrect stale grants with it. Not soft
 	/// delete — that moves the file to the trash folder and keeps links and grants working.
 	///
-	/// `file_id` may be `@{f_id}`; the result reports the resolved content ids.
+	/// `file_id` is resolved like [`read_file`] (entry id, single-entry content id, or
+	/// `@{f_id}`); the cascade runs on entries and the result reports the resolved content ids.
 	async fn delete_file(&self, tn_id: TnId, file_id: &str) -> ClResult<DeleteFileResult>;
 
 	// Settings Management
@@ -2550,15 +2667,16 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		limit: Option<u32>,
 	) -> ClResult<Vec<TagInfo>>;
 
-	/// Add a tag to a file
+	/// Add a tag to an entry (`file_id` resolved like [`read_file`]; tags live on the entry)
 	async fn add_tag(&self, tn_id: TnId, file_id: &str, tag: &str) -> ClResult<Vec<String>>;
 
-	/// Remove a tag from a file
+	/// Remove a tag from an entry (`file_id` resolved like [`read_file`])
 	async fn remove_tag(&self, tn_id: TnId, file_id: &str, tag: &str) -> ClResult<Vec<String>>;
 
 	// File Management Enhancements
 	//****************************
-	/// Update file metadata (name, visibility, status)
+	/// Update entry placement (name, parent, visibility, channel, status). `file_id` is
+	/// resolved like [`read_file`]; only that one entry changes, never its siblings.
 	async fn update_file_data(
 		&self,
 		tn_id: TnId,
@@ -2566,7 +2684,38 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		opts: &UpdateFileOptions,
 	) -> ClResult<()>;
 
-	/// Read file metadata
+	/// Move an entry to `parent_id` (`None` = root) and stamp `channel` on it and its whole
+	/// subtree (child folders and document-tree parts), in one transaction. `entry_id` is
+	/// resolved like [`read_file`].
+	async fn move_entry_subtree(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		parent_id: Option<&str>,
+		channel: Option<&str>,
+	) -> ClResult<()>;
+
+	/// Whether every entry in `entry_id`'s folder subtree (itself included) has the raw
+	/// `owner_tag` `owner_tag`.
+	async fn subtree_owned_by(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		owner_tag: &str,
+	) -> ClResult<bool>;
+
+	/// Resolve `file_id` to one entry joined with its content, in this fixed order (ids are not
+	/// distinguishable by format):
+	/// 1. `entries.entry_id`;
+	/// 2. else a content id: `files.file_id` of a linked entry, or a reference's `ref_file_id`
+	///    (live entries only for a BLOB and for a reference);
+	/// 3. else `@<f_id>`, a **content** `files.f_id`, resolving to that file's single entry.
+	///
+	/// A content id with several candidate entries is [`FileResolution::Ambiguous`].
+	async fn resolve_file(&self, tn_id: TnId, file_id: &str) -> ClResult<FileResolution>;
+
+	/// [`Self::resolve_file`] for HTTP callers: `Ambiguous` maps to `Error::Conflict` (409).
+	/// Every other method that takes a `file_id: &str` placement id resolves it the same way.
 	async fn read_file(&self, tn_id: TnId, file_id: &str) -> ClResult<Option<FileView>>;
 
 	/// Like [`read_file`] but also populates `user_data` (pinned, starred,
@@ -2582,6 +2731,9 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	// File User Data (per-user file activity tracking)
 	//**************************************************
 
+	/// `file_user_data` is keyed by entry (`e_id`); the `file_id` params below are resolved
+	/// like [`read_file`].
+	///
 	/// Record file access for a user (upserts record, updates accessed_at timestamp)
 	async fn record_file_access(&self, tn_id: TnId, id_tag: &str, file_id: &str) -> ClResult<()>;
 
@@ -2640,6 +2792,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	// Share Entry Management
 	//***********************
+	// For `resource_type` / `subject_type` 'F' the id is an **entry** id (`entries.entry_id`).
 
 	/// Create a share entry (idempotent on unique constraint)
 	async fn create_share_entry(
@@ -2696,6 +2849,20 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		subject_id: &str,
 	) -> ClResult<Option<char>>;
 
+	/// Every live entry (`Active`, not trashed) placing content `file_id` (`files.file_id`, a
+	/// reference's `ref_file_id`, or `@<f_id>`), managed included, ordered by `e_id`. An `@<f_id>`
+	/// also yields its pending entries. Empty for an unknown id or an entry id.
+	async fn list_content_entries(&self, tn_id: TnId, file_id: &str) -> ClResult<Vec<FileView>>;
+
+	/// The direct `'U'` shares `id_tag` holds on the active entries of content `file_id`, highest
+	/// permission first: `(entry_id, permission)`. One query, for the access union over entries.
+	async fn check_content_share_access(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		id_tag: &str,
+	) -> ClResult<Vec<(Box<str>, char)>>;
+
 	/// Read a single share entry by ID (for delete validation)
 	async fn read_share_entry(&self, tn_id: TnId, id: i64) -> ClResult<Option<ShareEntry>>;
 
@@ -2743,8 +2910,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Replace the index rows of `(obj_tp, obj_id)` from the source row's own ACL.
 	///
 	/// `obj_tp` selects the source table — `'F'` files, `'P'` profiles, `'A'`
-	/// actions — and the adapter derives `content_type`, `upstream_tag`,
-	/// `visibility`, `root_id` and `created_at` from that row, so the index and its
+	/// actions — and the adapter derives `content_type`, `upstream_tag` (profiles and
+	/// actions only), `visibility`, `root_id` and `created_at` from that row, so the index and its
 	/// source can never disagree about who may see it. Only `title`, `body`, `tags`
 	/// and the part addressing come from the caller.
 	///
@@ -3201,6 +3368,10 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Delete a channel and its roster rows. Entity `channel` columns stay stamped.
 	async fn delete_channel(&self, tn_id: TnId, name: &str) -> ClResult<()>;
+
+	/// Live entries in drive `channel` (absolute): root entries and their folder subtrees,
+	/// excluding trash and managed entries.
+	async fn count_channel_entries(&self, tn_id: TnId, channel: &str) -> ClResult<u32>;
 
 	/// Roster of a channel (id_tags).
 	async fn list_channel_members(&self, tn_id: TnId, name: &str) -> ClResult<Vec<Box<str>>>;

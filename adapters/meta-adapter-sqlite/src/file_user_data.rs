@@ -17,7 +17,7 @@ use cloudillo_types::utils::normalize_id_tag;
 /// An empty `id_tag` means the caller has no identity to attribute the access to — an
 /// anonymous share-link visitor on a CRDT/RTDB socket. The file's own `accessed_at` still
 /// advances (an anonymous read *is* a read); only the per-user row is skipped, because
-/// `(tn_id, id_tag, f_id)` is the primary key and every anonymous visitor would otherwise
+/// `(tn_id, id_tag, e_id)` is the primary key and every anonymous visitor would otherwise
 /// collapse into one `id_tag = ''` row.
 pub(crate) async fn record_access(
 	db: &SqlitePool,
@@ -25,37 +25,7 @@ pub(crate) async fn record_access(
 	id_tag: &str,
 	file_id: &str,
 ) -> ClResult<()> {
-	// Update global access timestamp on files table first, get f_id via RETURNING
-	let row = sqlx::query(
-		"UPDATE files SET accessed_at = unixepoch() WHERE tn_id = ? AND file_id = ? RETURNING f_id",
-	)
-	.bind(tn_id.0)
-	.bind(file_id)
-	.fetch_optional(db)
-	.await
-	.db()?;
-
-	// If file exists, update per-user access timestamp using the returned f_id
-	let id_tag = normalize_id_tag(id_tag);
-	if let Some(row) = row.filter(|_| !id_tag.is_empty()) {
-		let f_id: i64 = row.try_get("f_id").db()?;
-
-		sqlx::query(
-			"INSERT INTO file_user_data (tn_id, id_tag, f_id, accessed_at, created_at, updated_at)
-			 VALUES (?, ?, ?, unixepoch(), unixepoch(), unixepoch())
-			 ON CONFLICT (tn_id, id_tag, f_id) DO UPDATE SET
-			 accessed_at = unixepoch(),
-			 updated_at = unixepoch()",
-		)
-		.bind(tn_id.0)
-		.bind(id_tag.as_ref())
-		.bind(f_id)
-		.execute(db)
-		.await
-		.db()?;
-	}
-
-	Ok(())
+	touch(db, tn_id, id_tag, file_id, "accessed_at").await
 }
 
 /// Record file modification for a user (upserts record, updates modified_at timestamp)
@@ -69,31 +39,43 @@ pub(crate) async fn record_modification(
 	id_tag: &str,
 	file_id: &str,
 ) -> ClResult<()> {
-	// Update global modification timestamp on files table first, get f_id via RETURNING
-	let row = sqlx::query(
-		"UPDATE files SET modified_at = unixepoch() WHERE tn_id = ? AND file_id = ? RETURNING f_id",
-	)
-	.bind(tn_id.0)
-	.bind(file_id)
-	.fetch_optional(db)
+	touch(db, tn_id, id_tag, file_id, "modified_at").await
+}
+
+/// Shared body of [`record_access`] / [`record_modification`]: `col` is advanced on the entry's
+/// content row (`files`, none for a folder) and on the per-user row keyed by the entry.
+async fn touch(
+	db: &SqlitePool,
+	tn_id: TnId,
+	id_tag: &str,
+	file_id: &str,
+	col: &'static str,
+) -> ClResult<()> {
+	let Some(e_id) = crate::file::resolve_entry(db, tn_id, file_id).await? else {
+		return Ok(());
+	};
+
+	sqlx::query(sqlx::AssertSqlSafe(format!(
+		"UPDATE files SET {col} = unixepoch() \
+		 WHERE f_id = (SELECT f_id FROM entries WHERE e_id = ?)"
+	)))
+	.bind(e_id)
+	.execute(db)
 	.await
 	.db()?;
 
-	// If file exists, update per-user modification timestamp using the returned f_id
 	let id_tag = normalize_id_tag(id_tag);
-	if let Some(row) = row.filter(|_| !id_tag.is_empty()) {
-		let f_id: i64 = row.try_get("f_id").db()?;
-
-		sqlx::query(
-			"INSERT INTO file_user_data (tn_id, id_tag, f_id, modified_at, created_at, updated_at)
+	if !id_tag.is_empty() {
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"INSERT INTO file_user_data (tn_id, id_tag, e_id, {col}, created_at, updated_at)
 			 VALUES (?, ?, ?, unixepoch(), unixepoch(), unixepoch())
-			 ON CONFLICT (tn_id, id_tag, f_id) DO UPDATE SET
-			 modified_at = unixepoch(),
-			 updated_at = unixepoch()",
-		)
+			 ON CONFLICT (tn_id, id_tag, e_id) DO UPDATE SET
+			 {col} = unixepoch(),
+			 updated_at = unixepoch()"
+		)))
 		.bind(tn_id.0)
 		.bind(id_tag.as_ref())
-		.bind(f_id)
+		.bind(e_id)
 		.execute(db)
 		.await
 		.db()?;
@@ -121,6 +103,9 @@ pub(crate) async fn update(
 		// Nothing to update, just return current data
 		return get(db, tn_id, id_tag, file_id).await.map(Option::unwrap_or_default);
 	}
+	let Some(e_id) = crate::file::resolve_entry(db, tn_id, file_id).await? else {
+		return Ok(FileUserData::default());
+	};
 
 	// Build dynamic upsert. Columns and the ON CONFLICT clause both adapt to
 	// which fields the caller wants to touch — leaving unmentioned columns
@@ -139,11 +124,11 @@ pub(crate) async fn update(
 		Patch::Value(c) => Some(c.to_string()),
 	};
 
-	let mut insert_cols = vec!["tn_id", "id_tag", "f_id", "created_at", "updated_at"];
+	let mut insert_cols = vec!["tn_id", "id_tag", "e_id", "created_at", "updated_at"];
 	let mut select_exprs = vec![
 		"?".to_string(),
 		"?".to_string(),
-		"f_id".to_string(),
+		"e_id".to_string(),
 		"unixepoch()".to_string(),
 		"unixepoch()".to_string(),
 	];
@@ -170,8 +155,8 @@ pub(crate) async fn update(
 	let query_str = format!(
 		"INSERT INTO file_user_data ({})
 		 SELECT {}
-		 FROM files WHERE tn_id = ? AND file_id = ?
-		 ON CONFLICT (tn_id, id_tag, f_id) DO UPDATE SET {}",
+		 FROM entries WHERE e_id = ?
+		 ON CONFLICT (tn_id, id_tag, e_id) DO UPDATE SET {}",
 		insert_cols.join(", "),
 		select_exprs.join(", "),
 		update_clause
@@ -188,7 +173,7 @@ pub(crate) async fn update(
 	if !access_level.is_undefined() {
 		q = q.bind(access_level_val);
 	}
-	q = q.bind(tn_id.0).bind(file_id);
+	q = q.bind(e_id);
 
 	q.execute(db).await.db()?;
 
@@ -203,15 +188,16 @@ pub(crate) async fn get(
 	id_tag: &str,
 	file_id: &str,
 ) -> ClResult<Option<FileUserData>> {
+	let Some(e_id) = crate::file::resolve_entry(db, tn_id, file_id).await? else {
+		return Ok(None);
+	};
 	let res = sqlx::query(
-		"SELECT fud.accessed_at, fud.modified_at, fud.pinned, fud.starred, fud.access_level
-		 FROM file_user_data fud
-		 JOIN files f ON f.tn_id = fud.tn_id AND f.f_id = fud.f_id
-		 WHERE fud.tn_id = ? AND fud.id_tag = ? AND f.file_id = ?",
+		"SELECT accessed_at, modified_at, pinned, starred, access_level
+		 FROM file_user_data WHERE tn_id = ? AND id_tag = ? AND e_id = ?",
 	)
 	.bind(tn_id.0)
 	.bind(normalize_id_tag(id_tag).as_ref())
-	.bind(file_id)
+	.bind(e_id)
 	.fetch_optional(db)
 	.await
 	.db()?;

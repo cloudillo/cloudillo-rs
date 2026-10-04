@@ -1417,9 +1417,28 @@ async fn process_inbound_action_attachments(
 	// Atomic across attachments: the first failure aborts the whole sync. The
 	// inbound action stays in status='P', and the verifier task retries with
 	// exponential back-off until every attachment is fully synced.
-	// sync_file_variants creates each row with parent_id = MANAGED_PARENT_ID,
-	// which is what excludes inbound attachments from the default file listing.
+	//
+	// A managed entry widens a file's audience, so it may only sit over content the issuer
+	// proved it holds: every attachment is synced from the source, which verifies the descriptor
+	// hashes to the content id (local bytes are reused, never trusted by id alone). Only then
+	// does this action get its managed entry, over the new or the existing content row.
 	for attachment in attachments.iter().filter(|a| !a.is_empty()) {
+		// Content already held here and not an inbound mirror: naming it proves nothing (the
+		// descriptor alone passes the sync, which skips what is held), and a managed entry
+		// would widen local content to this action's audience. Skipped, not failed: an error
+		// would leave the action pending and retrying forever. A mirror is judged by its content
+		// row (`preset = 'sync'`), not its entries: a sync that failed midway leaves the row with
+		// no entry, and the retry must finish it. Sync content counts as a mirror until
+		// `reap_orphan_files` deletes it.
+		let (existed, mirror) = match app.meta_adapter.read_content(tn_id, attachment).await {
+			Ok(c) => (true, c.preset.as_deref() == Some("sync")),
+			Err(Error::NotFound) => (false, false),
+			Err(e) => return Err(e),
+		};
+		if existed && !mirror {
+			warn!("  refusing attachment {}: local content, not an inbound mirror", attachment);
+			continue;
+		}
 		debug!("  syncing attachment: {} from {}", attachment, source);
 		let result = sync_file_variants(
 			app,
@@ -1432,12 +1451,33 @@ async fn process_inbound_action_attachments(
 			visibility,
 			channel,
 			sync_all,
+			// Mirror content another issuer brought in: this issuer must prove it has the bytes.
+			existed,
 		)
 		.await
 		.map_err(|e| {
 			warn!("  failed to sync attachment {}: {}", attachment, e);
 			e
 		})?;
+		// Idempotent: content the sync just created already has this action's managed entry.
+		// This attaches mirror content that another action brought in. An inbound action carries
+		// no file name: the entry goes by its content id.
+		match app
+			.meta_adapter
+			.create_managed_entry(
+				tn_id,
+				attachment,
+				attachment,
+				Some(action_id),
+				visibility,
+				channel,
+			)
+			.await
+		{
+			// A descriptor with no variants creates nothing to attach.
+			Ok(_) | Err(Error::NotFound) => {}
+			Err(e) => return Err(e),
+		}
 		total_synced += result.synced_variants.len();
 		total_skipped += result.skipped_variants.len();
 	}

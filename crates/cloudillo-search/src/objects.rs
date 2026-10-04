@@ -13,8 +13,8 @@
 //! scheduler path that serves deep `'D'` document parts.
 //!
 //! Only the text is decided here. `MetaAdapter::replace_search_row` derives the
-//! ACL columns (`content_type`, `upstream_tag`, `visibility`, `root_id`,
-//! `created_at`) from the source row in the same statement that writes the index
+//! ACL columns (`content_type`, `root_id`, `created_at`, and `upstream_tag` for
+//! profiles and actions) from the source row in the same statement that writes the index
 //! row, so the index and its source cannot disagree about who may see a hit.
 //!
 //! The cost: a write path can forget to call [`schedule_object`], where a trigger
@@ -30,8 +30,8 @@ use std::{
 use async_trait::async_trait;
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_types::meta_adapter::{
-	ActionView, FileId, FileStatus, FileView, ListProfileOptions, MANAGED_PARENT_ID, Profile,
-	SearchPart, TRASH_PARENT_ID,
+	ActionView, ENTRY_PART_KIND, FileId, FileResolution, FileStatus, FileView, ListProfileOptions,
+	MANAGED_PARENT_ID, Profile, SearchPart, TRASH_PARENT_ID,
 };
 use cloudillo_types::site::{FRAGMENT_EXT, MANIFEST_ENTRY, entry_path, site_path};
 use cloudillo_types::worker::Priority;
@@ -124,12 +124,71 @@ pub async fn index_object(app: &App, tn_id: TnId, obj_tp: char, obj_id: &str) ->
 /// A file's indexable text is server-owned — a name and a tag list — so unlike
 /// an action it needs no manifest and gets a fixed mapping.
 pub async fn index_file(app: &App, tn_id: TnId, file_id: &str) -> ClResult<()> {
-	if let Some(file) = app.meta_adapter.read_file(tn_id, file_id).await? {
+	if let Some(file) = representative(app, tn_id, file_id).await? {
 		// `Cached`: this is the per-object path, where a rename must not re-run poppler.
 		return index_file_row(app, tn_id, &file, ExtractRetry::Cached).await;
 	}
 	let fts_cl = !crate::store_text(app, tn_id).await;
 	app.meta_adapter.replace_search_row(tn_id, OBJ_FILE, file_id, &[], fts_cl).await
+}
+
+/// The entry that stands for `id`'s content in the index. The rows are keyed by content
+/// `file_id` and hold no placement columns, so any live entry serves: [`pick_representative`]
+/// over the content's entries. Search picks the caller's admitted entry at query time. With no
+/// live entry, the entry `id` names (which then drops the rows). Not `file_access::access_entries`:
+/// that drops the fallback to a non-live entry, which the index needs to clear its rows.
+pub async fn representative(app: &App, tn_id: TnId, id: &str) -> ClResult<Option<FileView>> {
+	let file = match app.meta_adapter.resolve_file(tn_id, id).await? {
+		FileResolution::Entry(file) => Some(*file),
+		FileResolution::NotFound | FileResolution::Ambiguous => None,
+	};
+	if file.as_ref().is_some_and(|f| f.file_tp.as_deref() == Some("FLDR")) {
+		return Ok(file);
+	}
+	let content_id = file.as_ref().map_or(id, FileView::index_id);
+	let entries = app.meta_adapter.list_content_entries(tn_id, content_id).await?;
+	Ok(pick_representative(&entries).cloned().or(file))
+}
+
+/// The first live entry (`Active`, not trashed) of a content by `e_id` (`entries` comes ordered
+/// by `e_id`, as `list_content_entries` returns it), an entry holding the bytes here before a
+/// reference; else `None`. Managed entries are never searchable, so they never stand for the
+/// rows; the search gate skips them too.
+pub fn pick_representative(entries: &[FileView]) -> Option<&FileView> {
+	entries
+		.iter()
+		.filter(|e| {
+			matches!(e.status, FileStatus::Active)
+				&& !matches!(e.parent_id.as_deref(), Some(TRASH_PARENT_ID | MANAGED_PARENT_ID))
+		})
+		.min_by_key(|e| e.upstream_tag.is_some())
+}
+
+/// One searchable entry's own part: `part_id` = its entry id, its name and tags.
+struct EntryText {
+	entry_id: Box<str>,
+	title: Box<str>,
+	tags: Option<String>,
+}
+
+/// The searchable entries of `file`'s content ([`is_indexable`], active), each as its own part.
+async fn entry_texts(app: &App, tn_id: TnId, file: &FileView) -> ClResult<Vec<EntryText>> {
+	let entries = if file.file_tp.as_deref() == Some("FLDR") {
+		vec![file.clone()]
+	} else {
+		app.meta_adapter.list_content_entries(tn_id, file.index_id()).await?
+	};
+	Ok(entries
+		.into_iter()
+		.filter(|e| matches!(e.status, FileStatus::Active) && is_indexable(e))
+		.map(|e| EntryText {
+			// Tags are stored comma-joined; the tokenizer needs whitespace to see one
+			// token per tag.
+			tags: e.tags.as_ref().map(|t| t.join(" ")).filter(|t| !t.is_empty()),
+			entry_id: e.entry_id,
+			title: e.file_name,
+		})
+		.collect())
 }
 
 /// Index a file already in hand — what the sweep uses, so paging a tenant's
@@ -150,9 +209,6 @@ pub async fn index_file_row(
 	file: &FileView,
 	retry: ExtractRetry,
 ) -> ClResult<()> {
-	// Tags are stored comma-joined; the tokenizer needs whitespace to see one
-	// token per tag.
-	let tags = file.tags.as_ref().map(|t| t.join(" ")).filter(|t| !t.is_empty());
 	// Which gate applies is decided first: a live published site container is served to
 	// anonymous crawlers and so is exempt from the managed-folder disclosure rule that
 	// silences every other managed file — see [`is_live_site_indexable`].
@@ -171,16 +227,30 @@ pub async fn index_file_row(
 	// moves on, and the per-object path is a scheduler task whose error is logged, never
 	// propagated to a user write. "poppler is missing" is not in this class: `pdf_body`
 	// answers it with `None` off a once-probed `pdf::available()`.
-	let pdf = if indexable && !live_site {
+	// A reference holds no bytes here: no body, whatever this node holds under the same id.
+	let pdf = if indexable && !live_site && file.upstream_tag.is_none() {
 		pdf_body(app, tn_id, file, !fts_cl, retry).await?
 	} else {
 		None
 	};
 	let body = pdf.as_ref().map(|(_, text)| text.as_str()).filter(|t| !t.is_empty());
-	let part = file_part(file, tags.as_deref(), body, indexable);
+	let part = indexable.then(|| SearchPart { body, ..Default::default() });
+	// Names and tags are per placement: one part per searchable entry, gated on that entry.
+	// A rename rewrites the whole part set (one hash covers it), site pages included;
+	// a per-part upsert if large containers make renames slow.
+	let entries = if indexable { entry_texts(app, tn_id, file).await? } else { Vec::new() };
 	let mut parts: Vec<SearchPart<'_>> =
-		Vec::with_capacity(part.iter().len() + pages.len() + pdf.iter().len());
+		Vec::with_capacity(part.iter().len() + entries.len() + pages.len() + pdf.iter().len());
 	parts.extend(part);
+	for entry in &entries {
+		parts.push(SearchPart {
+			part_id: &entry.entry_id,
+			part_kind: Some(ENTRY_PART_KIND),
+			title: Some(&entry.title),
+			tags: entry.tags.as_deref(),
+			..Default::default()
+		});
+	}
 	// Body-less by design: the stamp records *what* was extracted and at what budget, so
 	// the next run can skip poppler. An all-empty FTS row matches nothing, so it never
 	// surfaces as a hit.
@@ -201,7 +271,7 @@ pub async fn index_file_row(
 		});
 	}
 	app.meta_adapter
-		.replace_search_row(tn_id, OBJ_FILE, &file.file_id, &parts, fts_cl)
+		.replace_search_row(tn_id, OBJ_FILE, file.index_id(), &parts, fts_cl)
 		.await
 }
 
@@ -265,16 +335,18 @@ async fn is_live_site_container(app: &App, tn_id: TnId, file: &FileView) -> ClRe
 	let docs = app.meta_adapter.list_site_docs(tn_id).await?;
 	// A row with no published container has nothing to match — `None` never equals
 	// a real file id.
-	Ok(docs
-		.iter()
-		.any(|doc| doc.published_file_id.as_deref() == Some(file.file_id.as_ref())))
+	Ok(docs.iter().any(|doc| {
+		file.file_id
+			.as_deref()
+			.is_some_and(|id| doc.published_file_id.as_deref() == Some(id))
+	}))
 }
 
 /// The published pages of `file`, which the caller has already established to be
 /// a live site container via [`is_live_site_container`].
 ///
-/// Visibility still comes from the container's own `files` row, derived in SQL by
-/// the adapter; nothing here decides who may see a hit.
+/// Who may see a hit is decided at query time by the container's live entries (see
+/// `push_gated_entries` in the SQLite adapter); nothing here decides it.
 ///
 /// Errors propagate rather than degrading to "no pages": a blob read that failed must
 /// leave the existing rows alone. The exception is one permanently unreadable entry —
@@ -301,11 +373,12 @@ async fn site_page_texts(app: &App, tn_id: TnId, file: &FileView) -> ClResult<Ve
 	// the sweep sits *below* a live page render (`Priority::High`) and *above* work
 	// nothing waits on, and all three calls here share one queue — so a container cannot
 	// be half-swept across two priorities.
+	let content_id = file.file_id.as_deref().ok_or(Error::NotFound)?;
 	let container =
-		match cloudillo_file::open_container(app, tn_id, &file.file_id, Priority::Medium).await {
+		match cloudillo_file::open_container(app, tn_id, content_id, Priority::Medium).await {
 			Ok(container) => container,
 			Err(err @ Error::ValidationError(_)) => {
-				warn!(tn_id = %tn_id, file_id = %file.file_id, %err,
+				warn!(tn_id = %tn_id, file_id = %file.index_id(), %err,
 				"Live site container cannot be opened; indexing no pages");
 				return Ok(Vec::new());
 			}
@@ -316,7 +389,7 @@ async fn site_page_texts(app: &App, tn_id: TnId, file: &FileView) -> ClResult<Ve
 	let manifest = match container.read_manifest::<SiteManifest>(app, Priority::Medium).await {
 		Ok(Some(manifest)) => manifest,
 		Ok(None) => {
-			warn!(tn_id = %tn_id, file_id = %file.file_id,
+			warn!(tn_id = %tn_id, file_id = %file.index_id(),
 				"Live site container has no {MANIFEST_ENTRY}; indexing no pages");
 			return Ok(Vec::new());
 		}
@@ -324,7 +397,7 @@ async fn site_page_texts(app: &App, tn_id: TnId, file: &FileView) -> ClResult<Ve
 		// container, like the unreadable fragment further down, so it is indexed without
 		// pages rather than failing the whole file and being retried forever.
 		Err(err @ Error::ValidationError(_)) => {
-			warn!(tn_id = %tn_id, file_id = %file.file_id, %err,
+			warn!(tn_id = %tn_id, file_id = %file.index_id(), %err,
 				"Live site container's {MANIFEST_ENTRY} cannot be read; indexing no pages");
 			return Ok(Vec::new());
 		}
@@ -344,7 +417,7 @@ async fn site_page_texts(app: &App, tn_id: TnId, file: &FileView) -> ClResult<Ve
 	let mut body_budget = MAX_SITE_BODY_CHARS;
 	for page in &entries {
 		if pages.len() >= MAX_SITE_PAGES {
-			warn!(tn_id = %tn_id, file_id = %file.file_id, total = entries.len(),
+			warn!(tn_id = %tn_id, file_id = %file.index_id(), total = entries.len(),
 				"Site container lists over {MAX_SITE_PAGES} pages; indexing the first ones");
 			break;
 		}
@@ -353,7 +426,7 @@ async fn site_page_texts(app: &App, tn_id: TnId, file: &FileView) -> ClResult<Ve
 		// would violate it and take the container's whole index write down. The manifest is
 		// publisher-written, so two pages can slugify alike; the first wins.
 		if !seen.insert(site_path.clone()) {
-			warn!(tn_id = %tn_id, file_id = %file.file_id, path = %site_path,
+			warn!(tn_id = %tn_id, file_id = %file.index_id(), path = %site_path,
 				"Two site pages resolve to one path; indexing only the first");
 			continue;
 		}
@@ -375,7 +448,7 @@ async fn site_page_texts(app: &App, tn_id: TnId, file: &FileView) -> ClResult<Ve
 		let Some(entry) = container.entry(&entry_path) else {
 			// One publish writes the manifest and the fragments, so this is a corrupt
 			// container, not a race. Skip the page; the rest of the site stays searchable.
-			warn!(tn_id = %tn_id, file_id = %file.file_id, %entry_path,
+			warn!(tn_id = %tn_id, file_id = %file.index_id(), %entry_path,
 				"Site container lists a page with no fragment; skipping it");
 			continue;
 		};
@@ -387,7 +460,7 @@ async fn site_page_texts(app: &App, tn_id: TnId, file: &FileView) -> ClResult<Ve
 		let bytes = match container.read_bytes(app, entry, Priority::Medium).await {
 			Ok(bytes) => bytes,
 			Err(err @ Error::ValidationError(_)) => {
-				warn!(tn_id = %tn_id, file_id = %file.file_id, %entry_path, %err,
+				warn!(tn_id = %tn_id, file_id = %file.index_id(), %entry_path, %err,
 					"Site page fragment cannot be read; skipping it");
 				continue;
 			}
@@ -409,7 +482,7 @@ async fn site_page_texts(app: &App, tn_id: TnId, file: &FileView) -> ClResult<Ve
 		let text = match extracted {
 			Ok(text) => text,
 			Err(err @ Error::ValidationError(_)) => {
-				warn!(tn_id = %tn_id, file_id = %file.file_id, %entry_path, %err,
+				warn!(tn_id = %tn_id, file_id = %file.index_id(), %entry_path, %err,
 					"Site page fragment cannot be indexed; skipping it");
 				continue;
 			}
@@ -419,7 +492,7 @@ async fn site_page_texts(app: &App, tn_id: TnId, file: &FileView) -> ClResult<Ve
 		// Once, on the transition — not per page, which would be one line per page of
 		// the tail.
 		if body_budget == 0 {
-			warn!(tn_id = %tn_id, file_id = %file.file_id,
+			warn!(tn_id = %tn_id, file_id = %file.index_id(),
 				"Site container contributes over {MAX_SITE_BODY_CHARS} chars of body text; \
 				 indexing the rest by title alone");
 		}
@@ -503,24 +576,6 @@ pub fn is_indexable(file: &FileView) -> bool {
 pub fn is_live_site_indexable(file: &FileView) -> bool {
 	file.parent_id.as_deref() != Some(TRASH_PARENT_ID)
 		&& !matches!(file.status, FileStatus::Deleted)
-}
-
-/// What one file contributes to the index, or `None` if it should have no row.
-///
-/// The gate is the caller's, not this function's: an ordinary file is judged by
-/// [`is_indexable`], a live published site container by [`is_live_site_indexable`].
-fn file_part<'a>(
-	file: &'a FileView,
-	tags: Option<&'a str>,
-	body: Option<&'a str>,
-	indexable: bool,
-) -> Option<SearchPart<'a>> {
-	indexable.then(|| SearchPart {
-		title: Some(&*file.file_name),
-		tags,
-		body,
-		..Default::default()
-	})
 }
 
 /// Concurrent PDF extractions. Each holds a scratch copy of the blob on disk and
@@ -666,20 +721,18 @@ async fn pdf_body(
 	// them up once the binary is there. Warmed in `crate::init`, so this is a `OnceLock`
 	// read here and never a spawn on the runtime.
 	if !cloudillo_extract::pdf::available() {
-		debug!(tn_id = %tn_id, file_id = %file.file_id,
+		debug!(tn_id = %tn_id, file_id = %file.index_id(),
 			"pdftotext is not available; indexing no document text");
 		return Ok(None);
 	}
-	let variants = app
-		.meta_adapter
-		.list_file_variants(tn_id, FileId::FileId(&file.file_id))
-		.await?;
+	let content_id = file.file_id.as_deref().ok_or(Error::NotFound)?;
+	let variants = app.meta_adapter.list_file_variants(tn_id, FileId::FileId(content_id)).await?;
 	// `available` is part of the lookup, like `descriptor.rs`'s: a partial sync leaves
 	// metadata-only variant stubs with no local blob. `debug`, not `warn`, because a
 	// pinned remote file (`upstream_tag` set) is created with no local variants at all
 	// and indexed immediately — the normal state for that content, not an anomaly.
 	let Some(orig) = variants.iter().find(|v| v.variant.as_ref() == "orig" && v.available) else {
-		debug!(tn_id = %tn_id, file_id = %file.file_id,
+		debug!(tn_id = %tn_id, file_id = %file.index_id(),
 			"PDF has no locally available orig variant; indexing no text");
 		return Ok(None);
 	};
@@ -689,7 +742,7 @@ async fn pdf_body(
 	// and what its whole-object row holds.
 	let cached = app
 		.meta_adapter
-		.read_search_cached_body(tn_id, OBJ_FILE, &file.file_id, &[&ok_id, &fail_id])
+		.read_search_cached_body(tn_id, OBJ_FILE, content_id, &[&ok_id, &fail_id])
 		.await?;
 	let matched = cached.as_ref().map(|(id, body)| (id.as_str(), body.as_deref()));
 	if let CacheDecision::Hit { stamp, text } =
@@ -701,7 +754,7 @@ async fn pdf_body(
 	// so a 64 MiB ceiling here is what keeps the scratch write bounded — the same guard,
 	// for the same reason, as `cloudillo_file::open_container`'s.
 	if orig.size > cloudillo_extract::pdf::MAX_INPUT_BYTES as u64 {
-		warn!(tn_id = %tn_id, file_id = %file.file_id, size = orig.size,
+		warn!(tn_id = %tn_id, file_id = %file.index_id(), size = orig.size,
 			"PDF is past the extraction limit; indexing no text");
 		return Ok(Some((fail_id, String::new())));
 	}
@@ -723,7 +776,7 @@ async fn pdf_body(
 	let stream = match app.blob_adapter.read_ref_stream(blob).await {
 		Ok(stream) => stream,
 		Err(err @ (Error::NotFound | Error::ValidationError(_))) => {
-			warn!(tn_id = %tn_id, file_id = %file.file_id, %err,
+			warn!(tn_id = %tn_id, file_id = %file.index_id(), %err,
 				"PDF blob cannot be read; indexing no text");
 			return Ok(Some((fail_id, String::new())));
 		}
@@ -733,7 +786,7 @@ async fn pdf_body(
 	// its metadata row claims must not become an unbounded scratch write.
 	let max = cloudillo_extract::pdf::MAX_INPUT_BYTES as u64;
 	if cloudillo_file::write_capped(&tmp_path, stream, max, |_| {}).await?.is_none() {
-		warn!(tn_id = %tn_id, file_id = %file.file_id, size = orig.size,
+		warn!(tn_id = %tn_id, file_id = %file.index_id(), size = orig.size,
 			"PDF blob is larger than its metadata row claims; indexing no text");
 		return Ok(Some((fail_id, String::new())));
 	}
@@ -749,7 +802,7 @@ async fn pdf_body(
 	match result {
 		Ok(cloudillo_extract::ExtractedText { text, truncated }) => {
 			if truncated {
-				debug!(tn_id = %tn_id, file_id = %file.file_id, max_chars,
+				debug!(tn_id = %tn_id, file_id = %file.index_id(), max_chars,
 					"PDF ran past the extraction budget; indexing its first {max_chars} chars");
 			}
 			Ok(Some((ok_id, text)))
@@ -758,7 +811,7 @@ async fn pdf_body(
 		// meaning what it did: a property of *this* PDF — stamped `:fail`, because a
 		// poppler that refuses it today may read it after an upgrade.
 		Err(err @ Error::ValidationError(_)) => {
-			warn!(tn_id = %tn_id, file_id = %file.file_id, %err,
+			warn!(tn_id = %tn_id, file_id = %file.index_id(), %err,
 				"PDF cannot be indexed; indexing no text");
 			Ok(Some((fail_id, String::new())))
 		}
@@ -1151,28 +1204,6 @@ mod tests {
 	}
 
 	#[test]
-	fn a_live_file_contributes_its_name_and_tags() {
-		let file = file_view(None, "A");
-		let part =
-			file_part(&file, Some("munka projekt"), None, is_indexable(&file)).expect("indexable");
-		assert_eq!(part.title, Some("Jegyzetek"));
-		assert_eq!(part.tags, Some("munka projekt"));
-		assert_eq!(part.body, None);
-	}
-
-	/// A PDF's extracted text rides the whole-object row, so a body match is one hit
-	/// titled with the file name rather than a second, titleless part.
-	#[test]
-	fn extracted_document_text_lands_on_the_file_row() {
-		let file = file_view(None, "A");
-		let part = file_part(&file, None, Some("a dokumentum szövege"), true).expect("indexable");
-		assert_eq!(part.title, Some("Jegyzetek"));
-		assert_eq!(part.body, Some("a dokumentum szövege"));
-		// A rejected gate drops the text with the row.
-		assert!(file_part(&file, None, Some("a dokumentum szövege"), false).is_none());
-	}
-
-	#[test]
 	fn a_trashed_file_is_dropped_from_the_index_like_a_deleted_one() {
 		// A hit on either would deep-link nowhere. The sweep pages with
 		// `sweep_all`, so it sees both and takes their rows back out even when the
@@ -1181,8 +1212,32 @@ mod tests {
 		assert!(!is_indexable(&file_view(None, "D")));
 		// A file in an ordinary folder is unaffected.
 		assert!(is_indexable(&file_view(Some("f1~folder"), "A")));
-		// A rejected gate produces no part, whichever rule computed it.
-		assert!(file_part(&file_view(None, "D"), None, None, false).is_none());
+	}
+
+	#[test]
+	fn the_representative_is_the_first_placed_live_entry() {
+		let entries = [
+			file_view(Some(MANAGED_PARENT_ID), "A"),
+			file_view(Some(TRASH_PARENT_ID), "A"),
+			file_view(None, "D"),
+			file_view(Some("f1~folder"), "A"),
+			file_view(None, "A"),
+		];
+		let rep = pick_representative(&entries).expect("live entry");
+		assert_eq!(rep.parent_id.as_deref(), Some("f1~folder"), "first placed live entry");
+		assert!(
+			pick_representative(&entries[..3]).is_none(),
+			"managed / trashed / deleted never stand"
+		);
+		// A reference holds no bytes here: a local entry stands before it, whatever the order.
+		let mut pin = file_view(Some("f1~pins"), "A");
+		pin.upstream_tag = Some("bob.example".into());
+		let local = file_view(Some("f1~mine"), "A");
+		let rep = pick_representative(std::slice::from_ref(&pin)).expect("reference alone");
+		assert_eq!(rep.parent_id.as_deref(), Some("f1~pins"));
+		let both = [pin, local];
+		let rep = pick_representative(&both).expect("live entry");
+		assert_eq!(rep.parent_id.as_deref(), Some("f1~mine"), "local before reference");
 	}
 
 	#[test]
@@ -1192,7 +1247,6 @@ mod tests {
 		// search. `hidden` is the legacy spelling of the same thing.
 		let managed = file_view(Some(MANAGED_PARENT_ID), "A");
 		assert!(!is_indexable(&managed));
-		assert!(file_part(&managed, None, None, is_indexable(&managed)).is_none());
 		let mut hidden = file_view(None, "A");
 		hidden.hidden = true;
 		assert!(!is_indexable(&hidden));

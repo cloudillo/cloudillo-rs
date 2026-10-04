@@ -27,7 +27,7 @@ use cloudillo_types::types::FileAttrs;
 #[derive(Deserialize)]
 pub struct FileIdParam {
 	/// `/api/files/variant/{variant_id}` captures under a different name;
-	/// `load_file_attrs` below detects the `b` prefix and resolves the variant
+	/// `resolve_entry` below detects the `b…~` shape and resolves the variant
 	/// id to its file id.
 	#[serde(alias = "variant_id")]
 	file_id: String,
@@ -96,17 +96,24 @@ async fn check_file_permission(
 		q.split('&').find_map(|kv| kv.strip_prefix("action=")).filter(|a| !a.is_empty())
 	});
 
-	// Load file attributes (the auth context carries scope, roles, hat and anonymity)
-	let attrs =
-		load_file_attrs(&app, tn_id, &file_id, &tenant_id_tag, &auth_ctx, via_action).await?;
+	// Resolve the entry and its attributes (the auth context carries scope, roles, hat and
+	// anonymity).
+	let full_action = format!("file:{}", action);
+	let (file_view, attrs) = resolve_entry(
+		&app,
+		tn_id,
+		&file_id,
+		&tenant_id_tag,
+		&auth_ctx,
+		via_action,
+		&full_action,
+		action != "read",
+	)
+	.await?;
 
 	// Check permission
 	let environment = Environment::new();
 	let checker = app.permission_checker.read().await;
-
-	// Format action as "file:operation" for ABAC checker
-	let full_action = format!("file:{}", action);
-
 	if !checker.has_permission(&auth_ctx, &full_action, &attrs, &environment) {
 		warn!(
 			subject = %auth_ctx.id_tag,
@@ -119,67 +126,96 @@ async fn check_file_permission(
 		);
 		return Err(Error::PermissionDenied);
 	}
+	drop(checker);
 
+	let mut req = req;
+	req.extensions_mut().insert(ResolvedLevel(attrs.access_level));
+	req.extensions_mut().insert(ResolvedEntry(file_view));
 	Ok(next.run(req).await)
 }
 
-// Load file attributes from MetaAdapter
-async fn load_file_attrs(
+/// The entry the guard resolved `{file_id}` to, for the handler behind it: placement handlers act
+/// on this entry and never re-resolve the path id.
+#[derive(Clone)]
+pub struct ResolvedEntry(pub cloudillo_types::meta_adapter::FileView);
+
+/// The caller's effective level on the [`ResolvedEntry`], `?action=` grant included.
+#[derive(Clone)]
+pub struct ResolvedLevel(pub cloudillo_types::types::AccessLevel);
+
+/// Resolve `{file_id}` to the entry the caller's context admits, with its ABAC attributes. A read
+/// takes the admitted entry granting the most; a placement takes the one admitted entry ABAC lets
+/// `full_action` through on — several is `Conflict` ("use the entry id").
+#[expect(clippy::too_many_arguments, reason = "permission check requires all context fields")]
+async fn resolve_entry(
 	app: &App,
 	tn_id: TnId,
 	file_or_variant_id: &str,
 	tenant_id_tag: &str,
 	auth: &AuthCtx,
 	via_action: Option<&str>,
-) -> ClResult<FileAttrs> {
-	use cloudillo_core::abac::{self, VisibilityLevel};
+	full_action: &str,
+	placement: bool,
+) -> ClResult<(cloudillo_types::meta_adapter::FileView, FileAttrs)> {
 	use std::borrow::Cow;
 	use tracing::debug;
 
-	// Detect if this is a variant_id (starts with 'b') and look up the file_id
-	let file_id: Cow<str> = if file_or_variant_id.starts_with('b') {
-		// This is a variant_id, look up the file_id
-		debug!("Looking up file_id for variant_id: {}", file_or_variant_id);
-		let fid = app.meta_adapter.read_file_id_by_variant(tn_id, file_or_variant_id).await?;
-		debug!("Found file_id: {} for variant_id: {}", fid, file_or_variant_id);
-		Cow::Owned(fid.to_string())
-	} else {
-		Cow::Borrowed(file_or_variant_id)
-	};
+	// A variant id (`b…~hash`) resolves to its file id. A random entry id can start with `b`
+	// too, but never carries a `~`.
+	let file_id: Cow<str> =
+		if file_or_variant_id.starts_with('b') && file_or_variant_id.contains('~') {
+			debug!("Looking up file_id for variant_id: {}", file_or_variant_id);
+			let fid = app.meta_adapter.read_file_id_by_variant(tn_id, file_or_variant_id).await?;
+			Cow::Owned(fid.to_string())
+		} else {
+			Cow::Borrowed(file_or_variant_id)
+		};
 
-	// Get file view from MetaAdapter
-	let file_view = app.meta_adapter.read_file(tn_id, &file_id).await?;
+	let ctx = file_access::FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
+	let entries = file_access::access_entries(app, tn_id, &file_id).await?;
+	if !placement {
+		let (view, level) =
+			file_access::union_access(app, tn_id, entries, &ctx, via_action).await?;
+		let attrs = load_file_attrs(app, tn_id, &view, level, tenant_id_tag, auth).await?;
+		return Ok((view, attrs));
+	}
 
-	let file_view = file_view.ok_or(Error::NotFound)?;
+	let mut candidates = file_access::admitted(app, tn_id, entries, &ctx, via_action).await?;
+	if candidates.len() == 1 {
+		let (view, level) = file_access::single_placement(candidates)?;
+		let attrs = load_file_attrs(app, tn_id, &view, level, tenant_id_tag, auth).await?;
+		return Ok((view, attrs));
+	}
+	// Several admitted entries of one content: keep those ABAC lets the action through on.
+	let environment = Environment::new();
+	let mut passing = Vec::new();
+	for (view, level) in candidates.drain(..) {
+		let Ok(attrs) = load_file_attrs(app, tn_id, &view, level, tenant_id_tag, auth).await else {
+			continue;
+		};
+		let checker = app.permission_checker.read().await;
+		if checker.has_permission(auth, full_action, &attrs, &environment) {
+			passing.push((view, attrs));
+		}
+	}
+	file_access::single_placement(passing)
+}
+
+/// ABAC attributes of the resolved entry `file_view`, at the `access_level` the caller holds on it.
+async fn load_file_attrs(
+	app: &App,
+	tn_id: TnId,
+	file_view: &cloudillo_types::meta_adapter::FileView,
+	access_level: cloudillo_types::types::AccessLevel,
+	tenant_id_tag: &str,
+	auth: &AuthCtx,
+) -> ClResult<FileAttrs> {
+	use cloudillo_core::abac::{self, VisibilityLevel};
 
 	// Resolves both ownership facts off the row: an absent owner means the tenant owns it, an
 	// absent upstream means it originates here (which is what gates role access in `file_access`).
-	let file_ref = file_access::FileRef::from_view(&file_view, tenant_id_tag);
-	debug!("File access for {}: owner {}", file_id, file_ref.owner_id_tag);
-
-	// Determine access level by looking up scoped tokens, FSHR action grants
+	let file_ref = file_access::FileRef::from_view(file_view, tenant_id_tag);
 	let subject_id_tag: &str = &auth.id_tag;
-	let ctx = file_access::FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
-	let access_level = file_access::get_access_level(app, tn_id, file_ref, &ctx, None).await;
-	// The syncing audience names the action that attaches the file (`sync_file_variants`).
-	let access_level = match via_action {
-		Some(a) if !access_level.can_read() => {
-			file_access::action_attachment_level(app, tn_id, &file_ref, &ctx, a).await
-		}
-		_ => access_level,
-	};
-
-	// Lifecycle, on read and write routes alike.
-	file_access::check_lifecycle(
-		app,
-		tn_id,
-		&file_view,
-		&file_ref,
-		&ctx,
-		access_level,
-		auth.names_holder(),
-	)
-	.await?;
 
 	// In a room, `get_access_level` already weighed visibility behind the room gate; ABAC's own
 	// visibility rung must not grant it back (share grants are in `access_level`).
@@ -190,9 +226,6 @@ async fn load_file_attrs(
 	// Get visibility from file metadata - convert char to string representation
 	let vis_level = VisibilityLevel::from_char(file_view.visibility);
 	let visibility: Box<str> = vis_level.as_str().into();
-
-	// Owned before the borrow of the row ends, so `FileAttrs` can take it.
-	let owner_id_tag: Box<str> = file_ref.owner_id_tag.into();
 
 	// The subject's relationship **to the tenant**: `follower` is "they follow us", which is
 	// what the visibility rules mean. (`following` is the opposite direction.) Only the
@@ -205,11 +238,14 @@ async fn load_file_attrs(
 	};
 
 	Ok(FileAttrs {
-		file_id: file_view.file_id,
-		owner_id_tag,
-		upstream_id_tag: file_view.upstream_tag,
-		mime_type: file_view.content_type.unwrap_or_else(|| "application/octet-stream".into()),
-		tags: file_view.tags.unwrap_or_default(),
+		file_id: file_view.index_id().into(),
+		owner_id_tag: file_ref.owner_id_tag.into(),
+		upstream_id_tag: file_view.upstream_tag.clone(),
+		mime_type: file_view
+			.content_type
+			.clone()
+			.unwrap_or_else(|| "application/octet-stream".into()),
+		tags: file_view.tags.clone().unwrap_or_default(),
 		visibility,
 		access_level,
 		is_follower: rel.follower,

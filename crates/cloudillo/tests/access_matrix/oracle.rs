@@ -11,7 +11,7 @@
 use cloudillo::types::AccessLevel;
 
 use crate::objects::{
-	ActionLife, ActionObj, ActionShape, FileLife, FileObj, FileShape, Obj, canon_root,
+	ActionLife, ActionObj, ActionShape, FileKind, FileLife, FileObj, FileShape, Obj, canon_root,
 };
 use crate::ops::{ActionOp, FileOp, InboxCell, Op};
 use crate::subjects::{CredKind, Grant, Hostile, MintCell, Relation, SubjectFacts};
@@ -230,7 +230,12 @@ fn file_ladder(w: &Who, f: &FileObj) -> (AccessLevel, &'static str) {
 		&& w.id == Some(aud.as_str())
 		&& f.upstream_tag.as_ref() == Some(iss)
 	{
-		let l = if *sub == "WRITE" { AccessLevel::Write } else { AccessLevel::Read };
+		// Keyed by the content, which on a BLOB may back several entries: capped at Read there.
+		let l = if *sub == "WRITE" && f.spec.kind != FileKind::Blob {
+			AccessLevel::Write
+		} else {
+			AccessLevel::Read
+		};
 		return (l, "file.fshr");
 	}
 	// The placer (the tenant) of a Pin/Place copy.

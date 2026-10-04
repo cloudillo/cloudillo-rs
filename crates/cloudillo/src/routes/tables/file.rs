@@ -129,8 +129,8 @@ pub(crate) fn tags() -> Router<App> {
 /// Every route here **must** capture the file id as `{file_id}` — the guard
 /// reads it by name. `/api/files/variant/{variant_id}` is the deliberate
 /// exception: `FileIdParam` in `crates/cloudillo-file/src/perm.rs` carries a
-/// `#[serde(alias = "variant_id")]`, and `load_file_attrs` there detects the
-/// `b`-prefixed variant id and resolves it to a file id. Keep it here.
+/// `#[serde(alias = "variant_id")]`, and `resolve_entry` there detects the
+/// `b…~`-shaped variant id and resolves it to a file id. Keep it here.
 pub(crate) fn read() -> Router<App> {
 	Router::new()
 		.route("/api/files/variant/{variant_id}", get(handler::get_file_variant))

@@ -36,10 +36,17 @@ async fn send(
 async fn post_file(fx: &Fixture, who: &str, body: &Value) -> String {
 	let (status, res) = send(fx, CLUB, who, Method::POST, "/api/files", body).await;
 	assert!(status.is_success(), "POST /api/files {body}: {status} {res}");
-	find_str(&res, "fileId").expect("created fileId")
+	find_str(&res, "entryId").expect("created entryId")
 }
 
-async fn seed(fx: &Fixture, id: &str, tp: &str, parent: Option<&str>, root: Option<&str>) {
+/// Seed one row with content id `id`: its entry id.
+async fn seed(
+	fx: &Fixture,
+	id: &str,
+	tp: &str,
+	parent: Option<&str>,
+	root: Option<&str>,
+) -> String {
 	let tn_id = fx.tenants.alice.tn_id;
 	let opts = CreateFile {
 		file_id: Some(id.into()),
@@ -52,7 +59,7 @@ async fn seed(fx: &Fixture, id: &str, tp: &str, parent: Option<&str>, root: Opti
 		status: Some(if id.ends_with("pend") { FileStatus::Pending } else { FileStatus::Active }),
 		..Default::default()
 	};
-	fx.app.meta_adapter.create_file(tn_id, opts).await.unwrap();
+	fx.app.meta_adapter.create_file(tn_id, opts).await.unwrap().entry_id.into()
 }
 
 /// A CRDT (and the folder it sits in) created through `POST /api/files` is final at once: it
@@ -73,7 +80,7 @@ async fn api_created_files_are_active() {
 	let list = format!("/api/files?parentId={folder}");
 	let (status, res) = send(fx, CLUB, reader, Method::GET, &list, &Value::Null).await;
 	assert_eq!(status, StatusCode::OK, "{res}");
-	assert_eq!(find_str(&res, "fileId").as_deref(), Some(doc.as_str()), "browsed: {res}");
+	assert_eq!(find_str(&res, "entryId").as_deref(), Some(doc.as_str()), "browsed: {res}");
 }
 
 /// A hatted visitor whose hat maps to contributor creates a document the way the Files sidebar
@@ -101,7 +108,9 @@ async fn trash_reaches_descendants_on_the_shared_access_path() {
 	seed(fx, leaf, "CRDT", Some(sub), None).await;
 	seed(fx, root, "CRDT", Some(TRASH_PARENT_ID), None).await;
 	seed(fx, child, "CRDT", None, Some(root)).await;
-	seed(fx, pend, "BLOB", None, None).await;
+	// A pending BLOB is reachable only by its entry id.
+	let pend = seed(fx, pend, "BLOB", None, None).await;
+	let pend = pend.as_str();
 	seed(fx, live, "CRDT", None, None).await;
 
 	let tn_id = fx.tenants.alice.tn_id;
@@ -150,12 +159,13 @@ async fn empty_trash_leaves_rows_the_caller_may_not_manage() {
 		status: Some(FileStatus::Active),
 		..Default::default()
 	};
-	fx.app.meta_adapter.create_file(tn_id, opts).await.unwrap();
+	// A reference: a trashed one is reachable by its entry id only.
+	let mirror = fx.app.meta_adapter.create_file(tn_id, opts).await.unwrap().entry_id;
 
 	let who = "m-moderator@trash.test";
 	let (status, res) = send(fx, TRASH, who, Method::DELETE, "/api/trash", &Value::Null).await;
 	assert!(status.is_success(), "moderator empties the trash: {status} {res}");
-	let row = fx.app.meta_adapter.read_file(tn_id, mirror).await.unwrap();
+	let row = fx.app.meta_adapter.read_file(tn_id, &mirror).await.unwrap();
 	let row = row.expect("the mirrored row survives");
 	assert!(!matches!(row.status, FileStatus::Deleted), "the mirrored row is not tombstoned");
 }

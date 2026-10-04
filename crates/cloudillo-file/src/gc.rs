@@ -13,10 +13,12 @@
 //!
 //!   1. tmp-blob cleanup — stale `tmp-*` upload artifacts that live above the
 //!      sharded hash dirs and are never reached by `list_blobs`.
-//!   2. managed-file sweep — hard-deletes unreferenced rows whose
-//!      `parent_id = MANAGED_PARENT_ID`, freeing their `file_variants` so the
-//!      blob sweep below can reap the underlying blobs in the same pass.
-//!   3. blob sweep — iterates the blob store and deletes blobs that no longer
+//!   2. managed-file sweep — hard-deletes unreferenced entries whose
+//!      `parent_id = MANAGED_PARENT_ID`. Content is never deleted with an entry. Then the
+//!      tombstone purge hard-deletes entries a permanent delete left at `status = 'D'`.
+//!   3. orphan-content sweep — deletes content no entry references, older than the
+//!      safety window, with its `file_variants`, so the blob sweep can reap the blobs.
+//!   4. blob sweep — iterates the blob store and deletes blobs that no longer
 //!      have a corresponding `file_variants` row (including `SHARED_TN`, the
 //!      shared store used for deduplicated federated public/verified content).
 //!
@@ -145,7 +147,7 @@ impl Task<App> for GcTask {
 	}
 }
 
-/// Run the three sub-sweeps for a single tenant. Order matters: managed-file
+/// Run the four sub-sweeps for a single tenant. Order matters: managed-file
 /// sweep must precede blob sweep so freshly-orphaned blobs are reaped in the
 /// same pass. Each sub-sweep warns-and-continues on failure so partial
 /// accounting from earlier sub-sweeps is preserved in the final summary line.
@@ -168,8 +170,30 @@ async fn sweep_tenant(app: &App, tn_id: TnId, cutoff: i64) -> (u64, u64, u64, u6
 			(0, 0)
 		});
 
-	// 3. Blob sweep — reaps blobs no longer referenced by any `file_variants`
-	// row, including those just freed by step 2.
+	// 2b. Tombstone purge — deleted entries go, so their content can turn orphan below.
+	match app.meta_adapter.purge_tombstones(tn_id).await {
+		Ok(n) if n > 0 => info!("gc: tenant {} purged {} deleted entries", tn_id, n),
+		Ok(_) => {}
+		Err(e) => warn!("gc: tenant {} tombstone purge failed: {}", tn_id, e),
+	}
+
+	// 3. Orphan-content sweep — content no entry references any more (its last entry was
+	// removed) outlives it by the safety window, so a superseding action can re-attach it;
+	// then its `file_variants` go and the blob sweep below takes the bytes.
+	match app.meta_adapter.reap_orphan_files(tn_id, Timestamp(cutoff)).await {
+		Ok(reaped) => {
+			for file_id in &reaped {
+				cloudillo_core::search_index_file(app, tn_id, file_id);
+			}
+			if !reaped.is_empty() {
+				info!("gc: tenant {} reaped {} orphan files", tn_id, reaped.len());
+			}
+		}
+		Err(e) => warn!("gc: tenant {} orphan-content sweep failed: {}", tn_id, e),
+	}
+
+	// 4. Blob sweep — reaps blobs no longer referenced by any `file_variants`
+	// row, including those just freed by steps 2 and 3.
 	let (blobs_scanned, blobs_deleted) =
 		sweep_blobs(app, tn_id, cutoff).await.unwrap_or_else(|e| {
 			warn!("gc: tenant {} blob sweep failed: {}", tn_id, e);
@@ -267,19 +291,19 @@ async fn sweep_managed_files(app: &App, tn_id: TnId, cutoff: Timestamp) -> ClRes
 
 	let scanned = candidates.len() as u64;
 	let mut deleted: u64 = 0;
-	for f_id in candidates {
-		if referenced.contains(&f_id) {
+	for (e_id, f_id) in candidates {
+		if f_id.is_some_and(|f_id| referenced.contains(&f_id)) {
 			continue;
 		}
-		match app.meta_adapter.hard_delete_file(tn_id, f_id).await {
-			Ok(file_id) => {
-				debug!("gc: tenant {} hard-deleted managed file f_id={}", tn_id, f_id);
-				if let Some(file_id) = &file_id {
-					cloudillo_core::search_index_file(app, tn_id, file_id);
+		match app.meta_adapter.hard_delete_file(tn_id, e_id).await {
+			Ok(key) => {
+				debug!("gc: tenant {} hard-deleted managed entry e_id={}", tn_id, e_id);
+				if let Some(key) = &key {
+					cloudillo_core::search_index_file(app, tn_id, key);
 				}
 				deleted += 1;
 			}
-			Err(e) => warn!("gc: tenant {} failed to hard-delete f_id={}: {}", tn_id, f_id, e),
+			Err(e) => warn!("gc: tenant {} failed to hard-delete e_id={}: {}", tn_id, e_id, e),
 		}
 	}
 

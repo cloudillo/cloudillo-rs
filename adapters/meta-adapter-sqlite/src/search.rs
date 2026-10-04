@@ -37,14 +37,15 @@
 use cloudillo_types::{
 	hasher::Hasher,
 	meta_adapter::{
-		SEARCH_MAX_CONTENT_TYPES, SEARCH_MAX_LIMIT, SEARCH_MAX_OFFSET, SEARCH_MAX_TAGS,
-		SearchMatch, SearchObject, SearchOptions, SearchPart, SearchRow,
+		ENTRY_PART_KIND, SEARCH_MAX_CONTENT_TYPES, SEARCH_MAX_LIMIT, SEARCH_MAX_OFFSET,
+		SEARCH_MAX_TAGS, SearchMatch, SearchObject, SearchOptions, SearchPart, SearchRow,
 	},
 	prelude::*,
 };
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 
-use crate::utils::{Db, escape_fts_query};
+use crate::file::{LIVE_ENTRY, NOT_MANAGED};
+use crate::utils::{Db, escape_fts_query, push_channel_in};
 
 /// Rows per multi-row INSERT. Each row binds 18 variables — the 19th column,
 /// `updated_at`, is a `unixepoch()` literal — so 500 rows is 9000, comfortably
@@ -77,7 +78,6 @@ fn object_hash(obj: &SearchObject<'_>, parts: &[SearchPart<'_>]) -> String {
 	field(Some(obj.obj_id));
 	field(obj.content_type);
 	field(obj.upstream_tag);
-	field(obj.visibility.map(|c| c.to_string()).as_deref());
 	field(obj.root_id);
 	field(obj.created_at.map(|ts| ts.0.to_string()).as_deref());
 	field(Some(if obj.fts_cl { "1" } else { "0" }));
@@ -261,17 +261,11 @@ pub async fn replace_object(
 	let hash = object_hash(obj, parts);
 	// Nothing an index row carries has moved, so the delete/re-insert — and the
 	// FTS churn it would cause — is pure waste. An RTDB commit touching no
-	// indexed field lands here.
-	//
-	// The hash is built from text alone, so a pure visibility flip takes this
-	// arm — which is why a `'D'` write still has to run the ACL refresh before
-	// leaving. Any other type writes nothing here, so dropping `tx` uncommitted
-	// is fine.
+	// indexed field lands here. The ACL columns a `'D'` row denormalises (`root_id`,
+	// `content_type`) come from immutable content and were set when the rows went in;
+	// placement is gated live on `entries`. Nothing was written, so dropping `tx`
+	// uncommitted is fine.
 	if !parts.is_empty() && existing.hash.as_deref() == Some(hash.as_str()) {
-		if obj.obj_tp == OBJ_DOC {
-			refresh_file_acl(&mut tx, tn_id, obj.obj_id).await?;
-			tx.commit().await.db()?;
-		}
 		return Ok(());
 	}
 
@@ -286,7 +280,6 @@ pub async fn replace_object(
 		.db()?;
 
 	let created_at = obj.created_at.map(|ts| ts.0);
-	let visibility = obj.visibility.map(|c| c.to_string());
 	let mut next_s_id = if parts.is_empty() { 0 } else { alloc_s_ids(&mut tx).await? };
 
 	for chunk in parts.chunks(INSERT_CHUNK) {
@@ -298,7 +291,7 @@ pub async fn replace_object(
 		let mut query = QueryBuilder::<Sqlite>::new(
 			"INSERT INTO search_docs \
 			 (s_id, tn_id, obj_tp, obj_id, part_id, part_kind, parent_part, anchor_id, \
-			  title, body, tags, content_type, upstream_tag, visibility, root_id, \
+			  title, body, tags, content_type, upstream_tag, root_id, \
 			  created_at, updated_at, fts_cl, obj_hash) ",
 		);
 		// `try_from` cannot fail — `i` is bounded by `INSERT_CHUNK` — but the
@@ -323,7 +316,6 @@ pub async fn replace_object(
 				.push_bind(part.tags)
 				.push_bind(obj.content_type)
 				.push_bind(obj.upstream_tag)
-				.push_bind(visibility.as_deref())
 				.push_bind(obj.root_id)
 				.push_bind(created_at)
 				.push("unixepoch()")
@@ -450,8 +442,9 @@ pub async fn delete_deep_by_content_type(
 // (`cloudillo-search`'s `objects` module), because for actions it comes from a
 // manifest in the Action DSL and no SQL statement can read that.
 //
-// The ACL columns stay in SQL: `replace_row` derives `content_type`, `upstream_tag`,
-// `visibility`, `root_id` and `created_at` from the source row in the same
+// The ACL columns stay in SQL: `replace_row` derives `content_type`, `upstream_tag`
+// (NULL for a file: provenance is per entry, read live at query time),
+// `root_id` and `created_at` from the source row in the same
 // statement that writes the index row, so the index cannot disagree with its
 // source about who may see a hit — which is what `search()`'s visibility
 // prefilter relies on. Only `title`, `body` and `tags` are bound from the caller.
@@ -737,11 +730,11 @@ pub async fn replace_row(
 /// The caller has already established that the source file row is there, so no row can be
 /// written with no ACL to derive.
 ///
-/// The five ACL columns go in NULL: a chunked `VALUES` insert cannot join `files`, so the
+/// The four ACL columns go in NULL: a chunked `VALUES` insert cannot join `files`, so the
 /// derivation [`SourceRow`] does inline takes separate statements here. [`replace_row`]
-/// runs [`refresh_file_acl`] for the four it owns immediately after this returns, and
-/// [`fill_part_created_at`] stamps the fifth — both inside this transaction, before any
-/// reader sees the rows.
+/// runs [`refresh_file_acl`] for the three content columns it owns immediately after this
+/// returns, and [`fill_part_created_at`] stamps `created_at` — both inside this transaction,
+/// before any reader sees the rows.
 async fn replace_parts(
 	tx: &mut Transaction<'_, Sqlite>,
 	tn_id: TnId,
@@ -757,9 +750,8 @@ async fn replace_parts(
 		return Ok(());
 	}
 	// The same short-circuit as `replace_object`: the ACL columns are out of the hash
-	// because they come from `files`, so a hash match means the *text* is unchanged. A
-	// visibility flip still reaches these rows — `replace_row` calls `refresh_file_acl` for
-	// every `'F'` write, this arm included.
+	// because they come from `files`, so a hash match means the *text* is unchanged and the
+	// rows already carry their (immutable) content columns.
 	let obj = SearchObject { obj_tp: OBJ_FILE, obj_id, fts_cl, ..Default::default() };
 	let hash = object_hash(&obj, parts);
 	if !parts.is_empty() && existing.hash.as_deref() == Some(hash.as_str()) {
@@ -791,7 +783,7 @@ async fn replace_parts(
 			let mut query = QueryBuilder::<Sqlite>::new(
 				"INSERT INTO search_docs \
 				 (s_id, tn_id, obj_tp, obj_id, part_id, part_kind, parent_part, anchor_id, \
-				  title, body, tags, content_type, upstream_tag, visibility, root_id, \
+				  title, body, tags, content_type, upstream_tag, root_id, \
 				  created_at, updated_at, fts_cl, obj_hash) ",
 			);
 			// `try_from` cannot fail — `i` is bounded by `INSERT_CHUNK` — but the
@@ -814,11 +806,10 @@ async fn replace_parts(
 						bodies.get(i).and_then(|b| b.as_deref())
 					})
 					.push_bind(part.tags)
-					// content_type, upstream_tag, visibility, root_id, created_at:
-					// `refresh_file_acl` fills the first four from `files` and
-					// `fill_part_created_at` the fifth, both inside this
-					// transaction, so no caller value can reach them.
-					.push("NULL")
+					// content_type, upstream_tag, root_id, created_at: `refresh_file_acl`
+					// fills content_type and root_id from `files`, `fill_part_created_at`
+					// the last, both inside this transaction. upstream_tag stays NULL: a
+					// file's provenance is per entry, read live by `search`.
 					.push("NULL")
 					.push("NULL")
 					.push("NULL")
@@ -857,9 +848,10 @@ async fn replace_parts(
 	Ok(())
 }
 
-/// Stamp `created_at` onto an `'F'` object's freshly inserted part rows.
+/// Stamp `created_at` onto an `'F'` object's freshly inserted part rows — the earliest
+/// placement of the content (`created_at` lives on `entries`).
 ///
-/// The four ACL columns are [`refresh_file_acl`]'s — it already covers `'F'` part rows,
+/// The three content ACL columns are [`refresh_file_acl`]'s — it already covers `'F'` part rows,
 /// so deriving them here too would be the same `root_id` CASE expression written twice.
 /// `created_at` is the one column that statement deliberately leaves alone, and a row
 /// inserted by [`replace_parts`] goes in with it NULL, so this fills it and nothing else.
@@ -869,10 +861,10 @@ async fn fill_part_created_at(
 	file_id: &str,
 ) -> ClResult<()> {
 	sqlx::query(
-		"UPDATE search_docs SET created_at = f.created_at \
-		 FROM files f \
-		 WHERE f.tn_id = search_docs.tn_id AND f.file_id = search_docs.obj_id \
-		   AND search_docs.tn_id = ? AND search_docs.obj_tp = 'F' \
+		"UPDATE search_docs SET created_at = (SELECT MIN(e.created_at) \
+		   FROM files f JOIN entries e ON e.f_id = f.f_id \
+		   WHERE f.tn_id = search_docs.tn_id AND f.file_id = search_docs.obj_id) \
+		 WHERE search_docs.tn_id = ? AND search_docs.obj_tp = 'F' \
 		   AND search_docs.obj_id = ? AND search_docs.part_id <> '' \
 		   AND search_docs.created_at IS NULL",
 	)
@@ -884,65 +876,40 @@ async fn fill_part_created_at(
 	Ok(())
 }
 
-/// Re-derive from `files` the four ACL columns `search_docs` denormalises out of
-/// it, for the file's own `'F'` row, its `'F'` part rows *and* its deep `'D'`
-/// parts — the `WHERE` carries no `part_id` filter, so this statement is the sole
-/// owner of those four columns for every row of the file.
+/// Derive from `files` the two content columns `search_docs` denormalises out of it
+/// (`root_id`, `content_type`), for the file's own `'F'` row, its `'F'` part rows *and* its
+/// deep `'D'` parts — the `WHERE` carries no `part_id` filter, so this statement is the sole
+/// owner of those columns for every row of the file.
 ///
-/// Called from both write paths, because each owns a different half of the
-/// problem:
-///
-/// - [`replace_row`] calls it for an `'F'` write, on *every* path through that
-///   function, not just the upsert one: the `'F'` short-circuit compares a hash
-///   built from the text alone — the ACL columns are out of it, since they come
-///   from the source row rather than the caller — so a visibility flip that
-///   leaves title and tags alone takes the hash-match arm, and this is then the
-///   only statement that re-derives the four columns.
-/// - [`replace_object`] calls it for a `'D'` write, on both the insert path and
-///   the hash short-circuit, for the same reason. A `'D'` write's `obj_id` *is*
-///   the container `file_id`, so the same statement corrects the rows the indexer
-///   just inserted, inside the transaction that inserted them.
-///
-/// Between the two, SQL is the sole authority on the four columns. Deep rows are
-/// otherwise only rewritten on a document edit, so without the `'D'` call a file
-/// flipped from Public to Direct would keep every page body searchable until the
-/// next edit or weekly sweep.
-///
-/// Only these four columns are touched — `title`/`body`/`tags` belong to the deep
-/// indexer and must not be clobbered.
+/// Placement (`visibility`, `channel`, `upstream_tag`) is not denormalised: one content can sit
+/// in several entries, so [`search`] gates file rows on the live `entries` instead (see
+/// `push_gated_entries`). Content is never rewritten after creation, so the columns only need
+/// filling, not tracking: rows inserted by [`replace_parts`] and [`replace_object`] go in with
+/// them NULL or caller-supplied, and this corrects them inside the inserting transaction.
 ///
 /// `root_id` is type-aware. A `'D'` part inherits its container's tree root so a
 /// file-scoped share token can prefilter deep rows in SQL, and a standalone
-/// document (`files.root_id IS NULL`) is its own root. Writing plain `f.root_id`
-/// here would NULL every `'D'` row on the next rename and a share link to a
-/// standalone document would search to zero hits on its own pages.
+/// document (`files.root_id IS NULL`) is its own root.
 ///
 /// The trailing `IS NOT` guard (null-safe inequality) makes the statement a no-op
-/// when no ACL column moved. The UPDATE is cheap; the `search_docs_au` trigger it
-/// fires is not — every touched row is an FTS5 `'delete'` plus a re-insert, so
-/// without the guard a rename or tag edit on a 5000-page document rewrites 5000
-/// FTS rows for nothing.
+/// when no column moved: every touched row fires the `search_docs_au` trigger, an FTS5
+/// `'delete'` plus a re-insert.
 async fn refresh_file_acl(
 	tx: &mut Transaction<'_, Sqlite>,
 	tn_id: TnId,
 	file_id: &str,
 ) -> ClResult<()> {
-	// `search_docs.upstream_tag` mirrors `files.upstream_tag`.
 	sqlx::query(
-		"UPDATE search_docs SET visibility = f.visibility, upstream_tag = f.upstream_tag, \
-		   root_id = CASE WHEN search_docs.obj_tp = 'D' \
+		"UPDATE search_docs SET root_id = CASE WHEN search_docs.obj_tp = 'D' \
 		                  THEN COALESCE(f.root_id, f.file_id) ELSE f.root_id END, \
-		   content_type = f.content_type, channel = f.channel \
+		   content_type = f.content_type \
 		 FROM files f \
 		 WHERE f.tn_id = search_docs.tn_id AND f.file_id = search_docs.obj_id \
 		   AND search_docs.tn_id = ? AND search_docs.obj_tp IN ('F','D') \
 		   AND search_docs.obj_id = ? \
-		   AND (search_docs.visibility IS NOT f.visibility \
-		     OR search_docs.upstream_tag IS NOT f.upstream_tag \
-		     OR search_docs.root_id IS NOT (CASE WHEN search_docs.obj_tp = 'D' \
+		   AND (search_docs.root_id IS NOT (CASE WHEN search_docs.obj_tp = 'D' \
 		          THEN COALESCE(f.root_id, f.file_id) ELSE f.root_id END) \
-		     OR search_docs.content_type IS NOT f.content_type \
-		     OR search_docs.channel IS NOT f.channel)",
+		     OR search_docs.content_type IS NOT f.content_type)",
 	)
 	.bind(tn_id.0)
 	.bind(file_id)
@@ -965,12 +932,12 @@ const OBJ_DOC: char = 'D';
 ///
 /// The halves are matched to [`crate::schema::SEARCH_COLS`] by position alone, so
 /// they must be written in that column order: `part_kind`, then `content_type,
-/// upstream_tag, visibility, root_id, created_at, updated_at`, sourced
+/// upstream_tag, root_id, created_at, updated_at`, sourced
 /// `FROM <table> WHERE tn_id = ? AND <id> = ?`.
 struct SourceRow {
 	part_kind: &'static str,
 	acl_cols: &'static str,
-	from_where: &'static str,
+	from_where: std::borrow::Cow<'static, str>,
 }
 
 impl SourceRow {
@@ -978,23 +945,37 @@ impl SourceRow {
 		Some(match obj_tp {
 			OBJ_FILE => Self {
 				part_kind: "NULL",
-				acl_cols: "f.content_type, f.upstream_tag, f.visibility, f.root_id, f.created_at, \
-				           unixepoch()",
-				from_where: "FROM files f WHERE f.tn_id = ? AND f.file_id = ?",
+				// Keyed by content `file_id` (a folder: its `entry_id`; a reference: its
+				// `ref_file_id`). Any entry serves the ACL columns (the index holds no placement
+				// columns): live and non-managed first (`file::LIVE_ENTRY`, `NOT_MANAGED`), then
+				// lowest e_id. Search picks the admitted entry at query time.
+				// `WHERE true` keeps the trailing `ON CONFLICT` from parsing as a join's `ON`.
+				acl_cols: "COALESCE(f.content_type, e.ref_content_type), NULL, f.root_id, \
+				           e.created_at, unixepoch()",
+				from_where: format!(
+					"FROM (SELECT ? AS tn, ? AS id) k \
+					 JOIN entries e ON e.e_id = COALESCE(\
+					   (SELECT e.e_id FROM entries e LEFT JOIN files f1 \
+					    ON f1.f_id = e.f_id WHERE e.tn_id = k.tn \
+					    AND (f1.file_id = k.id OR e.ref_file_id = k.id) \
+					    ORDER BY NOT ({LIVE_ENTRY} AND {NOT_MANAGED}), e.e_id \
+					    LIMIT 1), \
+					   (SELECT e2.e_id FROM entries e2 \
+					    WHERE e2.tn_id = k.tn AND e2.entry_id = k.id AND e2.f_id IS NULL \
+					    AND e2.ref_file_id IS NULL)) \
+					 LEFT JOIN files f ON f.f_id = e.f_id WHERE true"
+				)
+				.into(),
 			},
-			// Profiles are tenant-scoped and visible to any authenticated caller
-			// in the tenant, so the row carries Public visibility rather than
-			// inventing a per-profile ACL that does not exist.
 			'P' => Self {
 				part_kind: "NULL",
-				acl_cols: "NULL, p.id_tag, 'P', NULL, p.created_at, unixepoch()",
-				from_where: "FROM profiles p WHERE p.tn_id = ? AND p.id_tag = ?",
+				acl_cols: "NULL, p.id_tag, NULL, p.created_at, unixepoch()",
+				from_where: "FROM profiles p WHERE p.tn_id = ? AND p.id_tag = ?".into(),
 			},
 			'A' => Self {
 				part_kind: "a.type",
-				acl_cols: "NULL, a.issuer_tag, a.visibility, a.root_id, a.created_at, \
-				           unixepoch()",
-				from_where: "FROM actions a WHERE a.tn_id = ? AND a.action_id = ?",
+				acl_cols: "NULL, a.issuer_tag, a.root_id, a.created_at, unixepoch()",
+				from_where: "FROM actions a WHERE a.tn_id = ? AND a.action_id = ?".into(),
 			},
 			_ => return None,
 		})
@@ -1048,7 +1029,10 @@ pub async fn reap_orphans(db: &SqlitePool, tn_id: TnId) -> ClResult<()> {
 	let preds = [
 		"tn_id = ? AND obj_tp = 'F' \
 		 AND NOT EXISTS (SELECT 1 FROM files f \
-		   WHERE f.tn_id = search_docs.tn_id AND f.file_id = search_docs.obj_id)",
+		   WHERE f.tn_id = search_docs.tn_id AND f.file_id = search_docs.obj_id) \
+		 AND NOT EXISTS (SELECT 1 FROM entries e \
+		   WHERE e.tn_id = search_docs.tn_id AND (e.ref_file_id = search_docs.obj_id \
+		     OR (e.entry_id = search_docs.obj_id AND e.f_id IS NULL)))",
 		"tn_id = ? AND obj_tp = 'P' \
 		 AND NOT EXISTS (SELECT 1 FROM profiles p \
 		   WHERE p.tn_id = search_docs.tn_id AND p.id_tag = search_docs.obj_id)",
@@ -1058,6 +1042,10 @@ pub async fn reap_orphans(db: &SqlitePool, tn_id: TnId) -> ClResult<()> {
 		"tn_id = ? AND obj_tp = 'D' \
 		 AND NOT EXISTS (SELECT 1 FROM files f \
 		   WHERE f.tn_id = search_docs.tn_id AND f.file_id = search_docs.obj_id)",
+		// An entry part whose entry is gone (a GC hard delete names no content to reindex).
+		"tn_id = ? AND obj_tp = 'F' AND part_kind = 'entry' \
+		 AND NOT EXISTS (SELECT 1 FROM entries e \
+		   WHERE e.tn_id = search_docs.tn_id AND e.entry_id = search_docs.part_id)",
 	];
 	let mut tx = db.begin().await.db()?;
 	for pred in preds {
@@ -1128,9 +1116,20 @@ pub async fn search(
 	// MATCH expression can narrow to one tenant before ranking, and a tenant id
 	// matching itself must not move a row up the list.
 	let t = fts_table(opts);
-	let mut query = QueryBuilder::<Sqlite>::new(format!(
+	// A file's display name, tags and origin are those of the first entry the caller's context
+	// admits; a deep `'D'` part takes its container's origin the same way.
+	let mut query = QueryBuilder::<Sqlite>::new(
 		"SELECT d.s_id, d.obj_tp, d.obj_id, d.part_id, d.part_kind, d.parent_part, d.anchor_id, \
-		 d.title, d.tags, d.content_type, d.upstream_tag, d.visibility, d.root_id, d.updated_at, \
+		 CASE WHEN d.obj_tp='F' THEN (",
+	);
+	push_gated_entries(&mut query, "e.file_name", tn_id, opts);
+	query.push(") ELSE d.title END AS title, CASE WHEN d.obj_tp='F' THEN (");
+	push_gated_entries(&mut query, "replace(e.tags, ',', ' ')", tn_id, opts);
+	query.push(") ELSE d.tags END AS tags, CASE WHEN d.obj_tp IN ('F','D') THEN (");
+	push_gated_entries(&mut query, "e.upstream_tag", tn_id, opts);
+	query.push(format!(
+		") ELSE d.upstream_tag END AS upstream_tag, \
+		 d.content_type, d.root_id, d.updated_at, \
 		 {snippet} AS snippet, \
 		 bm25({t}, 10.0, 1.0, 5.0, 0.0) AS score \
 		 FROM ",
@@ -1142,8 +1141,9 @@ pub async fn search(
 	));
 	push_search_filters(&mut query, tn_id, opts)?;
 
+	// `s_id` breaks score ties, so offset pages neither skip nor repeat equal-scored hits.
 	query
-		.push(" ORDER BY score LIMIT ")
+		.push(" ORDER BY score, d.s_id LIMIT ")
 		.push_bind(i64::from(opts.limit.clamp(1, SEARCH_MAX_LIMIT)));
 	query.push(" OFFSET ").push_bind(i64::from(opts.offset.min(SEARCH_MAX_OFFSET)));
 
@@ -1193,10 +1193,6 @@ pub async fn search(
 				tags: row.get::<Option<String>, _>("tags").map(Into::into),
 				content_type: row.get::<Option<String>, _>("content_type").map(Into::into),
 				upstream_tag: row.get::<Option<String>, _>("upstream_tag").map(Into::into),
-				visibility: row
-					.get::<Option<String>, _>("visibility")
-					.as_deref()
-					.and_then(first_char),
 				root_id: row.get::<Option<String>, _>("root_id").map(Into::into),
 				updated_at: Timestamp(row.get::<Option<i64>, _>("updated_at").unwrap_or(0)),
 				snippet,
@@ -1303,8 +1299,10 @@ fn push_search_filters(
 	// container's row and `'D'` parts stand for them — except a scope's own child row,
 	// which is the one thing a token scoped to it can find.
 	query.push(" AND NOT (d.obj_tp='F' AND d.root_id IS NOT NULL");
-	if let Some(grant) = opts.scope_grant_file_id.as_deref() {
-		query.push(" AND d.obj_id<>").push_bind(grant.to_owned());
+	if opts.scope_grant_file_id.is_some()
+		&& let Some(content) = opts.scope_file_id.as_deref()
+	{
+		query.push(" AND d.obj_id<>").push_bind(content.to_owned());
 	}
 	query.push(")");
 
@@ -1352,7 +1350,7 @@ fn push_search_filters(
 	//   `actions` row through an indexed point lookup rather than the denormalised
 	//   mirror, so an action's index row cannot go stale with respect to its own ACL.
 	let viewer = opts.viewer_id_tag.as_deref().filter(|v| !v.is_empty() && *v != "guest");
-	if let Some(levels) = &opts.visible_levels {
+	if opts.visible_levels.is_some() {
 		query.push(" AND (");
 		// Profiles are tenant-scoped and findable by any *identified* caller, as
 		// `GET /api/profiles` already allows — but not by an anonymous one. This
@@ -1361,27 +1359,12 @@ fn push_search_filters(
 		if viewer.is_some() {
 			query.push("d.obj_tp='P' OR ");
 		}
-		query.push("(d.obj_tp IN ('F','D') AND (d.visibility IN (");
-		let mut sep = query.separated(", ");
-		for level in levels {
-			sep.push_bind(level.to_string());
-		}
-		sep.push_unseparated(")");
-		// A delegated token's grant: the shared file's own row and the deep `'D'`
-		// parts of its tree are visible whatever their `visibility` says, because
-		// the share *is* the permission to read them. Child `'F'` rows in the same
-		// tree never get here: tree children are excluded outright above. This
-		// widens only within the subtree `scope_file_id` already confined the
-		// results to.
-		if let Some(grant) = opts.scope_grant_file_id.as_deref() {
-			query.push(" OR d.obj_id=").push_bind(grant.to_owned());
-			query.push(" OR (d.root_id=").push_bind(grant.to_owned());
-			query.push(" AND d.obj_tp='D')");
-		}
-		if opts.role_grant {
-			query.push(" OR d.upstream_tag IS NULL");
-		}
-		push_share_arm(query, tn_id, opts);
+		// Visibility and the channel gate are tested together, on the content's representative
+		// entry: a private placement is never found through a public sibling.
+		query.push("(d.obj_tp IN ('F','D') AND (EXISTS (");
+		push_gated_entries(query, "1", tn_id, opts);
+		query.push(")");
+		push_file_grants(query, tn_id, opts);
 		query.push("))");
 
 		// The status test mirrors `push_action_filters`' default and `get_action`:
@@ -1419,18 +1402,20 @@ fn push_search_filters(
 		query.push("))");
 	}
 
-	// Channel gate. File rows carry the room in `d.channel` (via `refresh_file_acl`); actions
-	// are gated on the live `actions` row, as their visibility is above. The share grant is
-	// exempt: the room never gates a deliberate handoff.
+	// Channel gate. File rows are gated on their live entries' rooms — already done above,
+	// together with visibility, when `visible_levels` is set; actions are gated on the live
+	// `actions` row, as their visibility is above. The share grant is exempt: the room never
+	// gates a deliberate handoff.
 	if let Some(enterable) = &opts.enterable_channels {
 		query.push(" AND (d.obj_tp='P' OR (d.obj_tp IN ('F','D') AND (");
-		push_channel_in(query, "d.channel", enterable);
-		if let Some(grant) = opts.scope_grant_file_id.as_deref() {
-			query.push(" OR d.obj_id=").push_bind(grant.to_owned());
-			query.push(" OR (d.root_id=").push_bind(grant.to_owned());
-			query.push(" AND d.obj_tp='D')");
+		if opts.visible_levels.is_some() {
+			query.push("1=1");
+		} else {
+			query.push("EXISTS (");
+			push_gated_entries(query, "1", tn_id, opts);
+			query.push(")");
+			push_file_grants(query, tn_id, opts);
 		}
-		push_share_arm(query, tn_id, opts);
 		query.push(
 			")) OR (d.obj_tp='A' AND EXISTS (SELECT 1 FROM actions a \
 			 WHERE a.tn_id=d.tn_id AND a.action_id=d.obj_id AND ",
@@ -1444,24 +1429,92 @@ fn push_search_filters(
 
 /// ` OR <shared>`: rows `opts.share_subject` holds a share on (directly or via an ancestor
 /// folder) — the file's own `'F'` row and its `'D'` parts. Nothing without a subject.
+///
+/// Shares name entries; index rows are keyed by content `file_id` (folders: `entry_id`), so the
+/// shared entries are mapped to the content they place.
 fn push_share_arm(query: &mut QueryBuilder<Sqlite>, tn_id: TnId, opts: &SearchOptions) {
 	let Some(subject) = opts.share_subject.as_deref() else { return };
-	query.push(" OR (CASE d.obj_tp WHEN 'D' THEN d.root_id ELSE d.obj_id END) IN ");
+	query
+		.push(
+			" OR ((CASE d.obj_tp WHEN 'D' THEN d.root_id ELSE d.obj_id END) IN \
+			 (SELECT COALESCE(sf.file_id, se.entry_id) FROM entries se \
+			 LEFT JOIN files sf ON sf.f_id=se.f_id WHERE se.tn_id=",
+		)
+		.push_bind(tn_id.0)
+		.push(" AND se.entry_id IN ");
 	crate::file::push_shared_file_ids(query, tn_id, subject);
+	// The content's body rows, but of its entry rows only the shared placement's own: a
+	// sibling's name and tags never ride on a share of another entry.
+	query.push(format!(") AND (d.part_kind IS NOT '{ENTRY_PART_KIND}' OR d.part_id IN "));
+	crate::file::push_shared_file_ids(query, tn_id, subject);
+	query.push("))");
 }
 
-/// `(<col> IS NULL OR <col> IN (:enterable))`; an empty set leaves the open floor only.
-fn push_channel_in(query: &mut QueryBuilder<Sqlite>, col: &str, enterable: &[Box<str>]) {
-	if enterable.is_empty() {
-		query.push(format!("{col} IS NULL"));
-		return;
+/// `SELECT <cols> FROM entries e WHERE …`: the first (lowest `e_id`) live, non-managed entry
+/// ([`crate::file::LIVE_ENTRY`], [`crate::file::NOT_MANAGED`] — managed entries are never
+/// searchable) that row `d` stands for and the caller's context admits.
+///
+/// An entry part (`part_kind = ENTRY_PART_KIND`) stands for its own entry alone (`part_id`), so
+/// its title and tags are only ever that entry's. Every other `'F'` row and the deep `'D'` rows
+/// carry the content's body and stand for the entries that hold it here: content rows match by
+/// `files.file_id`, folder rows by `entry_id`. A reference holds no bytes here, so it never
+/// admits a body row — only its own entry part.
+///
+/// Admitted: its `visible_levels` (or the role grant on a local entry) together with the
+/// channel gate, or a share the caller holds on that entry, or the delegated scope's entry.
+/// Every test runs on the one entry, so a hit's name always comes from an admitted placement,
+/// never from a sibling.
+///
+/// A file inside a trashed *folder* (its own parent is not the trash) still passes;
+/// `file_access` walks ancestors, this gate does not. Walk the parent chain if that leaks.
+fn push_gated_entries(
+	query: &mut QueryBuilder<Sqlite>,
+	cols: &str,
+	tn_id: TnId,
+	opts: &SearchOptions,
+) {
+	query.push(format!(
+		"SELECT {cols} FROM entries e WHERE e.tn_id=d.tn_id AND {LIVE_ENTRY} AND {NOT_MANAGED} \
+		 AND (CASE WHEN d.part_kind IS '{ENTRY_PART_KIND}' THEN e.entry_id=d.part_id \
+		 ELSE (e.f_id=(SELECT f.f_id FROM files f WHERE f.tn_id=d.tn_id AND f.file_id=d.obj_id) \
+		 OR (e.f_id IS NULL AND e.ref_file_id IS NULL AND e.entry_id=d.obj_id)) END) AND "
+	));
+	crate::file::push_entry_gate(
+		query,
+		tn_id,
+		opts.visible_levels.as_deref(),
+		opts.role_grant,
+		opts.enterable_channels.as_deref(),
+		opts.share_subject.as_deref(),
+	);
+	// The scope names one entry: never a sibling placement of the same content.
+	if let Some(grant) = opts.scope_grant_file_id.as_deref() {
+		query.push(" OR e.entry_id=").push_bind(grant.to_owned());
 	}
-	query.push(format!("({col} IS NULL OR {col} IN ("));
-	let mut sep = query.separated(", ");
-	for c in enterable {
-		sep.push_bind(c.to_string());
+	query.push(") ORDER BY e.e_id LIMIT 1");
+}
+
+/// ` OR …` arms that admit a file row past the entry gate. A delegated token's grant (the
+/// scoped entry, live): the deep `'D'` parts of its document tree are visible whatever their
+/// placements say, because the share *is* the permission to read them. The scoped entry's own
+/// rows already pass [`push_gated_entries`]. Child `'F'` rows in the same tree never get here:
+/// tree children are excluded outright. This widens only within the subtree `scope_file_id`
+/// already confined the results to. Then the share arm.
+fn push_file_grants(query: &mut QueryBuilder<Sqlite>, tn_id: TnId, opts: &SearchOptions) {
+	if let (Some(grant), Some(content)) =
+		(opts.scope_grant_file_id.as_deref(), opts.scope_file_id.as_deref())
+	{
+		query
+			.push(" OR (d.obj_tp='D' AND d.root_id=")
+			.push_bind(content.to_owned())
+			.push(format!(
+				" AND EXISTS (SELECT 1 FROM entries e WHERE e.tn_id=d.tn_id AND {} AND e.entry_id=",
+				crate::file::LIVE_ENTRY
+			))
+			.push_bind(grant.to_owned())
+			.push("))");
 	}
-	sep.push_unseparated("))");
+	push_share_arm(query, tn_id, opts);
 }
 
 /// Which FTS table a tenant's rows are in. A selected name rather than two copies

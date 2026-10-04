@@ -528,19 +528,40 @@ async fn validated_scope(
 				scope: None,
 				names_holder: true,
 			};
-			let result = file_access::check_file_access(app, tn_id, &file_id, &ctx, None)
-				.await
-				.map_err(|_| {
-					warn!("Scope denied: {} has no access to file {}", caller_id_tag, file_id);
-					Error::PermissionDenied
-				})?;
+			let denied = || {
+				warn!("Scope denied: {} has no access to file {}", caller_id_tag, file_id);
+				Error::PermissionDenied
+			};
+			// A write scope is a placement: by content id it resolves to the one entry the
+			// caller is admitted to (409 when several), then caps as any scope. A read scope
+			// takes the read union.
+			let result = if access > AccessLevel::Read {
+				let floor = AccessLevel::Read;
+				match file_access::resolve_placement(app, tn_id, &file_id, &ctx, floor).await {
+					Ok(r) => r,
+					Err(e @ Error::Conflict(_)) => return Err(e),
+					Err(_) => return Err(denied()),
+				}
+			} else {
+				file_access::check_file_access(app, tn_id, &file_id, &ctx, None)
+					.await
+					.map_err(|_| denied())?
+			};
 
 			// `to_scope_char` caps admin at 'W' — a scope never carries share-management
 			// authority. `None` only for `AccessLevel::None`, which `check_file_access`
 			// already turned into `Err`.
+			// A BLOB content id is granted through one of its entries: bind the scope to that
+			// entry, so it never reaches a private sibling of the same content.
+			let fv = &result.file_view;
+			let scope_id = if fv.file_tp.as_deref() == Some("BLOB") && *fv.entry_id != *file_id {
+				&*fv.entry_id
+			} else {
+				&*file_id
+			};
 			let scope_char = file_access::scope_char_within(access, result.access_level)
 				.ok_or(Error::PermissionDenied)?;
-			Ok(Some(format!("file:{}:{}", file_id, scope_char)))
+			Ok(Some(format!("file:{}:{}", scope_id, scope_char)))
 		}
 		// Grants no file access, but `scope::scope_permits` allowlists it for app publishing,
 		// so it must not be self-mintable either. Mirrors `require_leader`.
@@ -638,6 +659,26 @@ pub async fn get_access_token(
 		let via_bare_file_id =
 			via_file_id.split_once(':').map_or(via_file_id.as_str(), |(_, fid)| fid);
 
+		// Share entries and scopes name entries; resolve both ids like `read_file` does. A
+		// missing or ambiguous id grants nothing.
+		let via_entry_id = app
+			.meta_adapter
+			.read_file(tn_id, via_bare_file_id)
+			.await
+			.ok()
+			.flatten()
+			.ok_or(Error::PermissionDenied)?
+			.entry_id;
+		// The scope is minted on the linked entry, never a content id (which binds no entry).
+		let target_entry_id = app
+			.meta_adapter
+			.read_file(tn_id, target_file_id)
+			.await
+			.ok()
+			.flatten()
+			.ok_or(Error::PermissionDenied)?
+			.entry_id;
+
 		// Check caller has access to the via (source) file, and remember the ceiling that
 		// access imposes. A scoped caller must never hand out more than it holds: a
 		// `file:X:R` guest re-scoping through an embed link stored at `'W'` would
@@ -650,7 +691,17 @@ pub async fn get_access_token(
 				TokenScope::parse(caller_scope)
 			{
 				caller_cap = Some(access);
-				scope_fid == via_bare_file_id
+				// The same resolution file access applies: a content-id scope binds no entry.
+				match cloudillo_core::file_access::resolve_scope_entry(
+					&app.meta_adapter,
+					tn_id,
+					scope_fid,
+				)
+				.await
+				{
+					Some(v) => v.entry_id == via_entry_id,
+					None => false,
+				}
 			} else {
 				false
 			}
@@ -680,7 +731,7 @@ pub async fn get_access_token(
 		// Look up share entry: resource=target/embedded, subject=via/container
 		let link_perm = app
 			.meta_adapter
-			.check_share_access(tn_id, 'F', target_file_id, 'F', via_bare_file_id)
+			.check_share_access(tn_id, 'F', &target_entry_id, 'F', &via_entry_id)
 			.await?
 			.ok_or_else(|| {
 				warn!(
@@ -702,7 +753,7 @@ pub async fn get_access_token(
 		let caller_ceiling = caller_cap.unwrap_or(AccessLevel::None);
 		let scope_char = cloudillo_core::file_access::scope_char_within(asked, caller_ceiling)
 			.ok_or(Error::PermissionDenied)?;
-		let target_scope = format!("file:{}:{}", target_file_id, scope_char);
+		let target_scope = format!("file:{}:{}", target_entry_id, scope_char);
 
 		let token_result = app
 			.auth_adapter

@@ -27,7 +27,7 @@ mod prelude;
 pub use cloudillo_types::action_types::status;
 pub use key_cache::KeyFetchCache;
 
-pub use process::verify_action_token;
+pub use process::{process_inbound_action_token, verify_action_token};
 
 use crate::prelude::*;
 

@@ -16,6 +16,7 @@ use cloudillo_types::utils::decode_jwt_no_verify;
 use cloudillo_core::{
 	IdTag,
 	extract::{Auth, OptionalAuth, OptionalRequestId},
+	file_access,
 	rate_limit::RateLimitApi,
 	roles,
 };
@@ -316,6 +317,60 @@ pub async fn put_action_subscribe(
 	Ok(StatusCode::NO_CONTENT)
 }
 
+/// Attachments are client-supplied file ids, so require the caller can already *read* each
+/// one through a **local** entry the caller may publish (`may_publish_entry`, the gate
+/// `task.rs::may_attach` re-applies when signing), so a refusal is a 4xx up front rather than a
+/// creator task failing on every retry. Without this an action could name any file id in the
+/// tenant.
+///
+/// Checked in the **unresolved** `@<f_id>` form: `files.file_id` is NULL until
+/// `FileIdGeneratorTask` finalizes the row, and the whole `collect_file_deps` dependency
+/// machinery exists because the client posts before that happens — resolving here would fail
+/// the ordinary "upload a photo, then post it" flow. `resolve_file` accepts either form.
+///
+/// Only a BLOB attaches, and each id is rewritten to its content id, never the caller's entry
+/// id: the granting entry's `file_id` is the content id, or `@<f_id>` while still pending.
+///
+/// Shared by create, draft PATCH and draft publish: a draft is re-checked on publish, which
+/// also catches access revoked after it was saved.
+async fn check_attachments(
+	app: &App,
+	tn_id: TnId,
+	auth: &cloudillo_types::auth_adapter::AuthCtx,
+	id_tag: &str,
+	file_ids: &mut [Box<str>],
+) -> ClResult<()> {
+	// Before the loop, not downstream in `create_action_as`: the ladder walk per entry is
+	// exactly what must not run.
+	helpers::check_attachment_count(Some(file_ids))?;
+	let ctx = file_access::FileAccessCtx::from_auth(Some(auth), id_tag);
+	for file_id in file_ids.iter_mut() {
+		// Local entries only: a reference (Pin / Place / FSHR) holds no local bytes, so it must
+		// not lend a grant to the local content it names.
+		let mut entries = file_access::access_entries(app, tn_id, file_id).await?;
+		entries.retain(|e| e.upstream_tag.is_none());
+		let admitted = match file_access::admitted(app, tn_id, entries, &ctx, None).await {
+			Ok(admitted) => admitted,
+			// Both collapse to 403 on purpose: a 404 here would tell the caller whether a file
+			// id they cannot reach exists.
+			Err(Error::NotFound | Error::PermissionDenied) => Vec::new(),
+			// A database fault is not a denial and must not be logged as one.
+			Err(e) => return Err(e),
+		};
+		let Some((view, _)) = admitted.into_iter().find(|(v, level)| {
+			level.can_read() && cloudillo_file::management::may_publish_entry(v, &auth.id_tag)
+		}) else {
+			warn!("Rejecting action by {}: attachment {} not reachable", auth.id_tag, file_id);
+			return Err(Error::PermissionDenied);
+		};
+		if view.file_tp.as_deref() != Some("BLOB") {
+			return Err(Error::ValidationError("only a BLOB file can be attached".into()));
+		}
+		*file_id = view.file_id.ok_or(Error::NotFound)?;
+	}
+	Ok(())
+}
+
 #[axum::debug_handler]
 pub async fn post_action(
 	State(app): State<App>,
@@ -323,7 +378,7 @@ pub async fn post_action(
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
-	Json(action): Json<CreateAction>,
+	Json(mut action): Json<CreateAction>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
 	// Defense-in-depth: apkg:publish scoped keys can only create APKG actions
 	if let Some(ref scope) = auth.scope
@@ -394,41 +449,8 @@ pub async fn post_action(
 	if let Some(subject) = action.subject.as_deref() {
 		helpers::check_subject_field(subject)?;
 	}
-	// Before the loop below, not downstream in `create_action_as`: the ladder walk per entry
-	// is exactly what must not run.
-	helpers::check_attachment_count(action.attachments.as_deref())?;
-
-	// Attachments are client-supplied file ids, so require the caller can already *read* each
-	// one. Read, not write: publication authority on the attached row is decided separately by
-	// `upgrade_file_visibility`, and demanding write would break attaching a file shared with
-	// the caller at Read. Without this an action could name any file id in the tenant.
-	//
-	// Checked in the **unresolved** `@<f_id>` form: `files.file_id` is NULL until
-	// `FileIdGeneratorTask` finalizes the row, and the whole `collect_file_deps` dependency
-	// machinery exists because the client posts before that happens — resolving here would fail
-	// the ordinary "upload a photo, then post it" flow. `read_file` accepts either form.
-	if let Some(file_ids) = action.attachments.as_ref() {
-		let ctx = cloudillo_core::file_access::FileAccessCtx::from_auth(Some(&auth), &id_tag);
-		for file_id in file_ids {
-			cloudillo_core::file_access::check_file_access(&app, tn_id, file_id, &ctx, None)
-				.await
-				.map_err(|e| match e {
-					// Both collapse to 403 on purpose: a 404 here would tell the caller
-					// whether a file id they cannot reach exists.
-					cloudillo_core::file_access::FileAccessError::NotFound
-					| cloudillo_core::file_access::FileAccessError::AccessDenied => {
-						warn!(
-							"Rejecting action by {}: attachment {} not reachable",
-							auth.id_tag, file_id
-						);
-						Error::PermissionDenied
-					}
-					// A database fault is not a denial and must not be logged as one.
-					cloudillo_core::file_access::FileAccessError::InternalError(msg) => {
-						Error::Internal(msg)
-					}
-				})?;
-		}
+	if let Some(file_ids) = action.attachments.as_mut() {
+		check_attachments(&app, tn_id, &auth, &id_tag, file_ids).await?;
 	}
 
 	// Community INVT authorization. The `on_create` hook cannot do this: `HookContext` carries
@@ -922,7 +944,7 @@ pub async fn patch_action(
 	IdTag(id_tag): IdTag,
 	Path(action_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
-	Json(req): Json<PatchActionRequest>,
+	Json(mut req): Json<PatchActionRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
 	// Only drafts can be updated
 	if !action_id.starts_with('@') {
@@ -954,6 +976,10 @@ pub async fn patch_action(
 			channel,
 		)
 		.await?;
+	}
+
+	if let Some(file_ids) = req.attachments.as_mut() {
+		check_attachments(&app, tn_id, &auth, &id_tag, file_ids).await?;
 	}
 
 	// Build update options
@@ -1051,6 +1077,14 @@ pub async fn publish_draft(
 		.parse()
 		.map_err(|_| Error::NotFound)?;
 
+	let mut attachments: Option<Vec<Box<str>>> = action
+		.attachments
+		.as_ref()
+		.map(|a| a.iter().map(|av| av.file_id.clone()).collect());
+	if let Some(file_ids) = attachments.as_mut() {
+		check_attachments(&app, tn_id, &auth, &id_tag, file_ids).await?;
+	}
+
 	// Reconstruct CreateAction from the stored draft data
 	let draft_action = task::CreateAction {
 		typ: action.typ.clone(),
@@ -1058,10 +1092,7 @@ pub async fn publish_draft(
 		parent_id: action.parent_id.clone(),
 		audience_tag: action.audience.as_ref().map(|a| a.id_tag.clone()),
 		content: action.content.clone(),
-		attachments: action
-			.attachments
-			.as_ref()
-			.map(|a| a.iter().map(|av| av.file_id.clone()).collect()),
+		attachments,
 		subject: action.subject.clone(),
 		expires_at: action.expires_at,
 		visibility: action.visibility,

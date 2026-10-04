@@ -46,13 +46,8 @@ pub(crate) fn push_channel_gate(
 	col: &str,
 	enterable: &[Box<str>],
 ) -> sqlx::QueryBuilder<sqlx::Sqlite> {
-	if enterable.is_empty() {
-		query.push(format!(" AND {col} IS NULL"));
-		return query;
-	}
-	query.push(format!(" AND ({col} IS NULL OR {col} IN "));
-	query = push_in(query, enterable);
-	query.push(")");
+	query.push(" AND ");
+	crate::utils::push_channel_in(&mut query, col, enterable);
 	query
 }
 
@@ -626,11 +621,14 @@ pub(crate) async fn list(
 				let query_result = if let Some(f_id_str) = a.file_id.strip_prefix('@') {
 					// Query by f_id
 					if let Ok(f_id) = f_id_str.parse::<i64>() {
-						sqlx::query("SELECT x->>'dim' as dim FROM files WHERE tn_id=? AND f_id=?")
-							.bind(tn_id.0)
-							.bind(f_id)
-							.fetch_one(db)
-							.await
+						sqlx::query(concat!(
+							"SELECT x->>'dim' as dim FROM files o WHERE o.tn_id=? AND o.f_id=",
+							canon_f_id!("o.tn_id")
+						))
+						.bind(tn_id.0)
+						.bind(f_id)
+						.fetch_one(db)
+						.await
 					} else {
 						Err(sqlx::Error::RowNotFound)
 					}
@@ -878,14 +876,9 @@ pub(crate) async fn create(
 		&& let Some(key) = key
 	{
 		info!("Inbound action with key: {}, deleting old entries", key);
-		sqlx::query(
-			"UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND coalesce(status, 'A')!='D'",
-		)
-		.bind(tn_id.0)
-		.bind(key)
-		.execute(db)
-		.await
-		.db()?;
+		let mut tx = db.begin().await.db()?;
+		supersede_by_key(&mut tx, tn_id, key, None).await?;
+		tx.commit().await.db()?;
 	}
 
 	let status = "P";
@@ -1046,15 +1039,7 @@ pub(crate) async fn finalize(
 	if let Some(key) = &key {
 		info!("Finalizing with key: {}", key);
 		// Delete old entries with the same key (key-based deduplication)
-		sqlx::query(
-			"UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND a_id!=? AND coalesce(status, 'A')!='D'",
-		)
-		.bind(tn_id.0)
-		.bind(key)
-		.bind(a_id.cast_signed())
-		.execute(&mut *tx)
-		.await
-		.db()?;
+		supersede_by_key(&mut tx, tn_id, key, Some(a_id)).await?;
 	}
 
 	tx.commit().await.db()?;
@@ -1644,11 +1629,14 @@ pub(crate) async fn get(
 			// Query file dimensions
 			let query_result = if let Some(f_id_str) = a.file_id.strip_prefix('@') {
 				if let Ok(f_id) = f_id_str.parse::<i64>() {
-					sqlx::query("SELECT x->>'dim' as dim FROM files WHERE tn_id=? AND f_id=?")
-						.bind(tn_id.0)
-						.bind(f_id)
-						.fetch_one(db)
-						.await
+					sqlx::query(concat!(
+						"SELECT x->>'dim' as dim FROM files o WHERE o.tn_id=? AND o.f_id=",
+						canon_f_id!("o.tn_id")
+					))
+					.bind(tn_id.0)
+					.bind(f_id)
+					.fetch_one(db)
+					.await
 				} else {
 					Err(sqlx::Error::RowNotFound)
 				}
@@ -1849,7 +1837,43 @@ pub(crate) async fn get(
 	Ok(Some(action))
 }
 
-/// Delete action (soft delete for published, hard delete for drafts)
+/// Soft-delete the live actions holding `key` (except `keep`, the superseding draft), and their
+/// managed attachment entries with them.
+async fn supersede_by_key(
+	tx: &mut sqlx::SqliteConnection,
+	tn_id: TnId,
+	key: &str,
+	keep: Option<u64>,
+) -> ClResult<()> {
+	let keep = keep.map(u64::cast_signed);
+	let old: Vec<Box<str>> = sqlx::query_scalar(
+		"SELECT action_id FROM actions WHERE tn_id=? AND key=? AND a_id IS NOT ? \
+		 AND coalesce(status, 'A')!='D' AND action_id IS NOT NULL",
+	)
+	.bind(tn_id.0)
+	.bind(key)
+	.bind(keep)
+	.fetch_all(&mut *tx)
+	.await
+	.db()?;
+	for action_id in &old {
+		crate::file::delete_action_entries(tx, tn_id, action_id).await?;
+	}
+	sqlx::query(
+		"UPDATE actions SET status='D' WHERE tn_id=? AND key=? AND a_id IS NOT ? \
+		 AND coalesce(status, 'A')!='D'",
+	)
+	.bind(tn_id.0)
+	.bind(key)
+	.bind(keep)
+	.execute(&mut *tx)
+	.await
+	.db()?;
+	Ok(())
+}
+
+/// Delete action (soft delete for published, hard delete for drafts). A published action's
+/// managed attachment entries go in the same transaction (drafts never have any).
 pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClResult<()> {
 	if let Some(a_id_str) = action_id.strip_prefix('@') {
 		// Draft action: hard delete by a_id, only if status='R'
@@ -1862,12 +1886,15 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClR
 			.db()?;
 	} else {
 		// Published action: soft delete by marking status as 'D'
+		let mut tx = db.begin().await.db()?;
+		crate::file::delete_action_entries(&mut tx, tn_id, action_id).await?;
 		sqlx::query("UPDATE actions SET status = 'D' WHERE tn_id = ? AND action_id = ?")
 			.bind(tn_id.0)
 			.bind(action_id)
-			.execute(db)
+			.execute(&mut *tx)
 			.await
 			.db()?;
+		tx.commit().await.db()?;
 	}
 
 	Ok(())

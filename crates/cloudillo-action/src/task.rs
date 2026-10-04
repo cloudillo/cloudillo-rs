@@ -10,9 +10,9 @@ pub use cloudillo_types::action_types::{ACCESS_TOKEN_EXPIRY, CreateAction};
 
 use cloudillo_core::scheduler::{RetryPolicy, Task, TaskId};
 use cloudillo_file::descriptor;
-use cloudillo_file::management::upgrade_file_visibility;
+use cloudillo_file::management::may_publish_entry;
 use cloudillo_types::hasher;
-use cloudillo_types::meta_adapter;
+use cloudillo_types::meta_adapter::{self, FileResolution};
 
 use crate::{
 	delivery::ActionDeliveryTask,
@@ -105,31 +105,33 @@ fn is_local_channel(channel: &str, id_tag: &str) -> bool {
 	matches!(parse_subject_ref(channel), Some(SubjectRef::Channel { tenant, .. }) if tenant == id_tag)
 }
 
-/// Stamp an attachment with its action's channel, unless it already has one.
+/// May `actor` publish content `file_id` as an action attachment? The same gate `patch_file`
+/// applies to a direct visibility write (`may_publish_entry`), judged per entry, over entries that
+/// hold the content here: a reference (Pin / Place / FSHR) holds no local bytes, so a local post
+/// cannot attach through it. Only a BLOB attaches.
 ///
-/// Only a room of this tenant (`id_tag`) is stamped. A foreign room (the audience's) means nothing
-/// here: stamping it would put our own file behind a room gate no local subject can pass.
-pub async fn stamp_file_channel(
+/// A non-BLOB is a `ValidationError`. `None` when it may not. `Some(name)` when it may: the file
+/// name of the actor's own entry (an entry with no owner is the tenant's, `tenant_tag`), else the
+/// content id — never a sibling's name, which may sit in a room the actor cannot enter.
+pub(crate) async fn may_attach(
 	app: &App,
 	tn_id: TnId,
-	id_tag: &str,
 	file_id: &str,
-	channel: &str,
-) -> ClResult<()> {
-	if !is_local_channel(channel, id_tag) {
-		return Ok(());
+	actor: &str,
+	tenant_tag: &str,
+) -> ClResult<Option<Box<str>>> {
+	let mut entries = app.meta_adapter.list_content_entries(tn_id, file_id).await?;
+	entries.retain(|e| e.upstream_tag.is_none());
+	let Some(first) = entries.first() else { return Err(Error::NotFound) };
+	if first.file_tp.as_deref() != Some("BLOB") {
+		return Err(Error::ValidationError("only a BLOB can be an action attachment".into()));
 	}
-	let file = app.meta_adapter.read_file(tn_id, file_id).await?;
-	if file.is_none_or(|f| f.channel.is_some()) {
-		return Ok(());
+	let passing: Vec<_> = entries.iter().filter(|e| may_publish_entry(e, actor)).collect();
+	if passing.is_empty() {
+		return Ok(None);
 	}
-	let opts = meta_adapter::UpdateFileOptions {
-		channel: Patch::Value(channel.into()),
-		..Default::default()
-	};
-	app.meta_adapter.update_file_data(tn_id, file_id, &opts).await?;
-	cloudillo_core::search_index_file(app, tn_id, file_id);
-	Ok(())
+	let own = passing.iter().find(|e| e.owner_tag.as_deref().unwrap_or(tenant_tag) == actor);
+	Ok(Some(own.map_or_else(|| file_id.into(), |e| e.file_name.clone())))
 }
 
 /// Create an action issued as `id_tag` (the tenant), acting on its own behalf.
@@ -670,9 +672,9 @@ pub struct ActionCreatorTask {
 	/// The issuer — always the tenant. Signs the token (`issuer_tag`) and builds the `SUBS:` keys.
 	id_tag: Box<str>,
 	/// The profile that actually posted, which on a community tenant is a *member*, not the
-	/// tenant. Only `upgrade_file_visibility` reads it: publication authority over a pinned
-	/// attachment belongs to the member who placed it, so passing `id_tag` there refused every
-	/// member-pinned attachment. `None` on a task persisted before this field existed — those
+	/// tenant. Only the attachment gate (`may_attach`) reads it: publication authority over a
+	/// pinned attachment belongs to the member who placed it, so passing `id_tag` there refused
+	/// every member-pinned attachment. `None` on a task persisted before this field existed — those
 	/// fall back to `id_tag`, which is what they were built with.
 	#[serde(default)]
 	actor_id_tag: Option<Box<str>>,
@@ -730,33 +732,22 @@ impl Task<App> for ActionCreatorTask {
 		let attachments =
 			resolve_attachments(app, self.tn_id, self.action.attachments.as_ref()).await?;
 
-		// 1b. Upgrade attachment visibility to match action visibility
-		if let Some(ref attachment_ids) = attachments {
-			for file_id in attachment_ids {
-				// A refusal (`Ok(false)` on a mirrored row the actor did not place) logs at
-				// its own site in `upgrade_file_visibility`; `Ok(false)` also means "already
-				// visible enough", which is the ordinary case and not worth a line.
-				if let Err(e) = upgrade_file_visibility(
-					app,
-					self.tn_id,
-					file_id,
-					self.action.visibility,
-					self.actor(),
-				)
-				.await
-				{
-					warn!(
-						"Failed to upgrade visibility for file {}: {} - continuing anyway",
-						file_id, e
-					);
-				}
-				if let Some(channel) = self.action.channel.as_deref()
-					&& let Err(e) =
-						stamp_file_channel(app, self.tn_id, &self.id_tag, file_id, channel).await
-				{
-					warn!("Failed to stamp channel on file {}: {} - continuing anyway", file_id, e);
-				}
-			}
+		// 1b. Attaching publishes the file to the action's audience: refuse what the actor may
+		// not publish. The managed entries themselves are created once the action id exists (3).
+		let mut attachment_names = Vec::new();
+		for file_id in attachments.iter().flatten() {
+			let Some(name) =
+				may_attach(app, self.tn_id, file_id, self.actor(), &self.id_tag).await?
+			else {
+				warn!(
+					subject = %self.actor(),
+					file_id = %file_id,
+					"Refused action: attachment is not publishable by the actor \
+					 (mirror or another owner's entry)"
+				);
+				return Err(Error::PermissionDenied);
+			};
+			attachment_names.push(name);
 		}
 
 		// 1c. Resolve subject reference (@a_id → action_id)
@@ -830,23 +821,53 @@ impl Task<App> for ActionCreatorTask {
 		)
 		.await?;
 
-		// 3. Finalize action in database (including resolved audience)
+		// 3. Each attachment gets a managed entry carrying this action's audience, before the
+		// action goes live so a finalized action never lacks one. Granting it early widens
+		// nothing: `may_attach` already proved the actor may publish the content. A foreign
+		// room (the audience's) gates nothing here, so it is not stamped: no local subject
+		// could pass it.
+		// 3b then finalizes the action; a failure in either undoes the managed entries.
+		let channel = self.action.channel.as_deref().filter(|c| is_local_channel(c, &self.id_tag));
 		let attachments_refs: Option<Vec<&str>> =
 			attachments.as_ref().map(|v| v.iter().map(AsRef::as_ref).collect());
-		finalize_action(
-			app,
-			self.tn_id,
-			self.a_id,
-			&action_id,
-			&action_token,
-			meta_adapter::FinalizeActionOptions {
-				attachments: attachments_refs.as_deref(),
-				subject: subject.as_deref(),
-				audience_tag: effective_audience.as_deref(),
-				key: resolved_key.as_deref(),
-			},
-		)
-		.await?;
+		let stored = async {
+			for (file_id, name) in attachments.iter().flatten().zip(&attachment_names) {
+				app.meta_adapter
+					.create_managed_entry(
+						self.tn_id,
+						file_id,
+						name,
+						Some(&action_id),
+						self.action.visibility,
+						channel,
+					)
+					.await?;
+			}
+			// 3b. Finalize action in database (including resolved audience)
+			finalize_action(
+				app,
+				self.tn_id,
+				self.a_id,
+				&action_id,
+				&action_token,
+				meta_adapter::FinalizeActionOptions {
+					attachments: attachments_refs.as_deref(),
+					subject: subject.as_deref(),
+					audience_tag: effective_audience.as_deref(),
+					key: resolved_key.as_deref(),
+				},
+			)
+			.await
+		}
+		.await;
+		if let Err(e) = stored {
+			if let Err(cleanup) =
+				app.meta_adapter.delete_managed_entries(self.tn_id, &action_id).await
+			{
+				warn!(action_id = %action_id, "managed entry cleanup failed: {}", cleanup);
+			}
+			return Err(e);
+		}
 
 		// 4. Process after storage (unified: hooks, WebSocket, fanout, delivery)
 		let temp_id = format!("@{}", self.a_id);
@@ -904,7 +925,9 @@ impl Task<App> for ActionCreatorTask {
 	}
 }
 
-/// Resolve file attachment references (@f_id → file_id)
+/// Resolve file attachment references to content ids (`@f_id` → file_id, an entry id → its
+/// content id). The HTTP handler already rewrites to content ids; this covers the other
+/// creators (drafts, hooks).
 pub(crate) async fn resolve_attachments(
 	app: &App,
 	tn_id: TnId,
@@ -916,12 +939,19 @@ pub(crate) async fn resolve_attachments(
 
 	let mut resolved = Vec::with_capacity(attachments.len());
 	for a in attachments {
-		if let Some(f_id) = a.strip_prefix('@') {
-			let file_id = app.meta_adapter.get_file_id(tn_id, f_id.parse()?).await?;
-			resolved.push(file_id.clone());
+		let id = if a.starts_with('@') {
+			a.clone()
 		} else {
-			resolved.push(a.clone());
-		}
+			match app.meta_adapter.resolve_file(tn_id, a).await? {
+				FileResolution::Entry(view) => view.file_id.unwrap_or_else(|| a.clone()),
+				// Several entries: only a content id names them, keep it.
+				FileResolution::NotFound | FileResolution::Ambiguous => a.clone(),
+			}
+		};
+		resolved.push(match id.strip_prefix('@') {
+			Some(f_id) => app.meta_adapter.get_file_id(tn_id, f_id.parse()?).await?,
+			None => id,
+		});
 	}
 	Ok(Some(resolved))
 }
@@ -1019,8 +1049,10 @@ async fn finalize_action(
 	action_token: &str,
 	options: meta_adapter::FinalizeActionOptions<'_>,
 ) -> ClResult<()> {
-	app.meta_adapter.finalize_action(tn_id, a_id, action_id, options).await?;
+	// Token first: once `finalize_action` commits `status='A'`, a failure here would make the
+	// caller's cleanup delete managed entries of an already Active action.
 	app.meta_adapter.store_action_token(tn_id, action_id, action_token).await?;
+	app.meta_adapter.finalize_action(tn_id, a_id, action_id, options).await?;
 	// Where a locally created action first gets an `action_id` and goes Active;
 	// until now the row could not be indexed at all.
 	cloudillo_core::search_index_action(app, tn_id, action_id);
@@ -1555,9 +1587,9 @@ mod tests {
 		assert!(!is_local_channel("@club.example", "club.example"));
 	}
 
-	/// `upgrade_file_visibility` is handed `actor()`, not the issuer. On a community tenant the
-	/// issuer is the community and the actor is the member who pinned the attachment, so passing
-	/// the issuer refused every member-pinned attachment with nothing but a `warn!`. Both creation
+	/// The attachment gate (`may_attach`) is handed `actor()`, not the issuer. On a community
+	/// tenant the issuer is the community and the actor is the member who pinned the attachment,
+	/// so passing the issuer would refuse every member-pinned attachment. Both creation
 	/// paths — a direct post and a published draft — must arrive at the same actor.
 	#[test]
 	fn both_creation_paths_name_the_same_actor() {

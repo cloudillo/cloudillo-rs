@@ -309,32 +309,34 @@ pub async fn publish_site(
 		.read_file(tn_id, &body.doc_file_id)
 		.await?
 		.ok_or_else(|| Error::ValidationError("source document not found".into()))?;
-	let container = app
-		.meta_adapter
-		.read_file(tn_id, &body.container_file_id)
-		.await?
-		.ok_or_else(|| Error::ValidationError("container not found".into()))?;
-
-	if container.preset.as_deref() != Some("site") {
+	// A re-uploaded identical container dedups onto the same content: its id then names several
+	// entries, any public site entry of which will do.
+	let entries =
+		cloudillo_core::file_access::access_entries(&app, tn_id, &body.container_file_id).await?;
+	if entries.is_empty() {
+		return Err(Error::ValidationError("container not found".into()));
+	}
+	if !entries.iter().any(|e| e.preset.as_deref() == Some("site")) {
 		return Err(Error::ValidationError("container is not a site container".into()));
 	}
 	// The upload asks for `?visibility=P`; this is the last place that can catch
 	// a container that did not get it.
-	if container.visibility != Some('P') {
-		return Err(Error::ValidationError("container is not public".into()));
-	}
+	let container = entries
+		.into_iter()
+		.find(|e| e.preset.as_deref() == Some("site") && e.visibility == Some('P'))
+		.ok_or_else(|| Error::ValidationError("container is not public".into()))?;
 	// A pending container's `file_id` is still the `@{f_id}` placeholder the upload's
 	// 201 handed the client, but `list_referenced_managed_fids` and the indexer's
 	// liveness check both join on `files.file_id` — a placeholder would make `GcTask`
 	// blind to a live container and leave its pages unindexed.
-	if container.file_id.starts_with('@') {
+	let content_id = container.file_id.as_deref().ok_or(Error::NotFound)?;
+	if content_id.starts_with('@') {
 		return Err(Error::ValidationError("container is not finalized yet".into()));
 	}
 
 	// Read before the row, because an unreadable or wrong-version manifest is a
 	// container that must not go live whatever the row says.
-	let manifest: ContainerManifest =
-		read_manifest_as(&app, tn_id, &body.container_file_id).await?;
+	let manifest: ContainerManifest = read_manifest_as(&app, tn_id, content_id).await?;
 	if manifest.version != MANIFEST_VERSION {
 		return Err(Error::ValidationError(format!(
 			"unsupported container manifest version {}",
@@ -407,13 +409,13 @@ pub async fn publish_site(
 				mount_path,
 				// The resolved row's id, not the one the request named: only the
 				// content id works for what later joins on this column.
-				published_file_id: &container.file_id,
+				published_file_id: content_id,
 			},
 		)
 		.await?;
 	info!(
 		"User {} published document {} at {} (container {})",
-		auth.id_tag, body.doc_file_id, mount_path, container.file_id
+		auth.id_tag, body.doc_file_id, mount_path, content_id
 	);
 
 	// The cache is push-triggered, so nothing serves the new generation until this

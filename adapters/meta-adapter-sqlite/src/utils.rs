@@ -242,6 +242,24 @@ pub(crate) fn collect_res<T>(
 	Ok(items)
 }
 
+/// `(<col> IS NULL OR <col> IN (:enterable))`; an empty set leaves the open floor only.
+pub(crate) fn push_channel_in(
+	query: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+	col: &str,
+	enterable: &[Box<str>],
+) {
+	if enterable.is_empty() {
+		query.push(format!("{col} IS NULL"));
+		return;
+	}
+	query.push(format!("({col} IS NULL OR {col} IN ("));
+	let mut sep = query.separated(", ");
+	for c in enterable {
+		sep.push_bind(c.to_string());
+	}
+	sep.push_unseparated("))");
+}
+
 #[cfg(test)]
 mod tests {
 	use super::{escape_fts_query, parse_str_list};

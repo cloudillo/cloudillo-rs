@@ -18,7 +18,7 @@ use cloudillo_types::meta_adapter::{
 	CreateFile, CreateRefOptions, CreateShareEntry, FileId, FileStatus, MetaAdapter,
 	PROFILE_INVITE_REF_TYPE, PublishSiteDoc, SHARE_FILE_REF_TYPE, UpsertSite,
 };
-use cloudillo_types::types::{Patch, TnId};
+use cloudillo_types::types::{Patch, Timestamp, TnId};
 use cloudillo_types::worker::WorkerPool;
 use tempfile::TempDir;
 
@@ -56,7 +56,11 @@ async fn mint(adapter: &MetaAdapterSqlite, tn_id: TnId, ref_id: &str, typ: &str,
 			ref_id,
 			&CreateRefOptions {
 				typ: typ.to_string(),
-				resource_id: Some(resource.to_string()),
+				resource_id: Some(if typ == SHARE_FILE_REF_TYPE {
+					eid(adapter, tn_id, resource).await
+				} else {
+					resource.to_string()
+				}),
 				count: Some(1),
 				..Default::default()
 			},
@@ -70,7 +74,7 @@ async fn grant_user(adapter: &MetaAdapterSqlite, tn_id: TnId, resource: &str, su
 		.create_share_entry(
 			tn_id,
 			'F',
-			resource,
+			&eid(adapter, tn_id, resource).await,
 			"alice.example.com",
 			&CreateShareEntry {
 				subject_type: 'U',
@@ -89,11 +93,11 @@ async fn embed(adapter: &MetaAdapterSqlite, tn_id: TnId, container: &str, subjec
 		.create_share_entry(
 			tn_id,
 			'F',
-			container,
+			&eid(adapter, tn_id, container).await,
 			"alice.example.com",
 			&CreateShareEntry {
 				subject_type: 'F',
-				subject_id: subject.to_string(),
+				subject_id: eid(adapter, tn_id, subject).await,
 				permission: 'R',
 				expires_at: None,
 			},
@@ -102,12 +106,41 @@ async fn embed(adapter: &MetaAdapterSqlite, tn_id: TnId, container: &str, subjec
 		.expect("create embed share entry");
 }
 
-/// `FileStatus` is not `PartialEq`, so match rather than compare.
-async fn is_deleted(adapter: &MetaAdapterSqlite, tn_id: TnId, file_id: &str) -> bool {
-	let status = adapter.read_file(tn_id, file_id).await.expect("read file").map(|f| f.status);
-	matches!(status, Some(FileStatus::Deleted))
+/// The `entry_id` placing `id` — what share rows and `share.file` links are keyed by since v58.
+async fn eid(adapter: &MetaAdapterSqlite, tn_id: TnId, id: &str) -> String {
+	adapter
+		.read_file(tn_id, id)
+		.await
+		.expect("read file")
+		.expect("file exists")
+		.entry_id
+		.into()
 }
 
+/// The entry `e_id` placing content `file_id` — not on the adapter's public surface, so read it
+/// through a second connection to the same `meta.db`.
+async fn e_id_of_content(temp: &TempDir, file_id: &str) -> u64 {
+	let pool = sqlx::sqlite::SqlitePoolOptions::new()
+		.connect(&format!("sqlite://{}/meta.db", temp.path().display()))
+		.await
+		.expect("open meta.db");
+	let e_id: i64 = sqlx::query_scalar(
+		"SELECT e.e_id FROM entries e JOIN files f ON f.f_id = e.f_id WHERE f.file_id = ?",
+	)
+	.bind(file_id)
+	.fetch_one(&pool)
+	.await
+	.expect("read e_id");
+	pool.close().await;
+	u64::try_from(e_id).expect("e_id")
+}
+
+/// A tombstone is never reachable by content id, so a purged file no longer resolves.
+async fn is_deleted(adapter: &MetaAdapterSqlite, tn_id: TnId, file_id: &str) -> bool {
+	adapter.read_file(tn_id, file_id).await.expect("read file").is_none()
+}
+
+/// `FileStatus` is not `PartialEq`, so match rather than compare.
 async fn is_active(adapter: &MetaAdapterSqlite, tn_id: TnId, file_id: &str) -> bool {
 	let status = adapter.read_file(tn_id, file_id).await.expect("read file").map(|f| f.status);
 	matches!(status, Some(FileStatus::Active))
@@ -150,13 +183,21 @@ async fn purging_a_tree_cascades_its_links_and_grants_and_nothing_else() {
 	// Another tenant's grant on the same resource id (must survive).
 	grant_user(&adapter, other_tn_id, "f1~doomed", "bob.example.com").await;
 
+	// A tombstone is reachable only by its entry id: take them before the purge.
+	let (doomed_eid, child_a_eid, child_b_eid) = (
+		eid(&adapter, tn_id, "f1~doomed").await,
+		eid(&adapter, tn_id, "f1~child-a").await,
+		eid(&adapter, tn_id, "f1~child-b").await,
+	);
 	let purged = adapter.delete_file(tn_id, "f1~doomed").await.expect("purge file tree");
 
 	// Root first, then its children — the caller evicts each from its folder cache in this order.
-	assert_eq!(purged.file_ids.first().map(AsRef::as_ref), Some("f1~doomed"));
-	assert_eq!(purged.file_ids.len(), 3, "root + 2 children, no duplicate root");
+	assert_eq!(purged.entry_ids.first().map(AsRef::as_ref), Some(doomed_eid.as_str()));
+	assert_eq!(purged.entry_ids.len(), 3, "root + 2 children, no duplicate root");
+	for eid in [&doomed_eid, &child_a_eid, &child_b_eid] {
+		assert!(purged.entry_ids.iter().any(|e| **e == **eid), "{eid} missing from result");
+	}
 	for id in ["f1~doomed", "f1~child-a", "f1~child-b"] {
-		assert!(purged.file_ids.iter().any(|f| f.as_ref() == id), "{id} missing from result");
 		assert!(is_deleted(&adapter, tn_id, id).await, "{id} should be deleted");
 	}
 	assert!(is_active(&adapter, tn_id, "f1~keep").await);
@@ -177,22 +218,32 @@ async fn purging_a_tree_cascades_its_links_and_grants_and_nothing_else() {
 	assert!(adapter.get_ref(other_tn_id, "link-other-tenant").await.unwrap().is_some());
 
 	// Resource side cleared...
-	for gone in ["f1~doomed", "f1~child-b"] {
+	for gone in [&doomed_eid, &child_b_eid] {
 		let entries = adapter.list_share_entries(tn_id, 'F', gone).await.unwrap();
 		assert!(entries.is_empty(), "{gone} still has share entries: {entries:?}");
 	}
 	// ...and the subject side too, so the surviving container no longer lists the dead embed.
 	let by_subject = adapter
-		.list_share_entries_by_subject(tn_id, Some('F'), "f1~child-a")
+		.list_share_entries_by_subject(tn_id, Some('F'), &child_a_eid)
 		.await
 		.unwrap();
 	assert!(by_subject.is_empty(), "embed row survived: {by_subject:?}");
-	let keep_entries = adapter.list_share_entries(tn_id, 'F', "f1~keep").await.unwrap();
+	let keep_entries = adapter
+		.list_share_entries(tn_id, 'F', &eid(&adapter, tn_id, "f1~keep").await)
+		.await
+		.unwrap();
 	assert_eq!(keep_entries.len(), 1, "only the embed should have been swept from f1~keep");
 	assert_eq!(keep_entries[0].subject_id.as_ref(), "dave.example.com");
 
 	// Another tenant's grant on the same resource id is untouched.
-	assert_eq!(adapter.list_share_entries(other_tn_id, 'F', "f1~doomed").await.unwrap().len(), 1);
+	assert_eq!(
+		adapter
+			.list_share_entries(other_tn_id, 'F', &eid(&adapter, other_tn_id, "f1~doomed").await)
+			.await
+			.unwrap()
+			.len(),
+		1
+	);
 }
 
 #[tokio::test]
@@ -203,11 +254,11 @@ async fn purging_a_standalone_file_still_reports_it() {
 	let tn_id = TnId(1);
 	adapter.create_tenant(tn_id, "alice").await.ok();
 	make_file(&adapter, tn_id, "f1~alone", None).await;
+	let alone_eid = eid(&adapter, tn_id, "f1~alone").await;
 
 	let purged = adapter.delete_file(tn_id, "f1~alone").await.expect("purge file tree");
 
-	assert_eq!(purged.file_ids.len(), 1);
-	assert_eq!(purged.file_ids[0].as_ref(), "f1~alone");
+	assert_eq!(purged.entry_ids, vec![Box::<str>::from(alone_eid)]);
 	assert_eq!(purged.refs_removed, 0);
 	assert_eq!(purged.share_entries_removed, 0);
 	assert!(is_deleted(&adapter, tn_id, "f1~alone").await);
@@ -226,7 +277,7 @@ async fn a_root_listed_among_its_own_children_is_not_deleted_twice() {
 
 	let purged = adapter.delete_file(tn_id, "f1~self-rooted").await.expect("purge file tree");
 
-	assert_eq!(purged.file_ids.len(), 2, "got {:?}", purged.file_ids);
+	assert_eq!(purged.entry_ids.len(), 2, "got {:?}", purged.entry_ids);
 	// One link, counted once — a duplicated root would report the same delete twice.
 	assert_eq!(purged.refs_removed, 1);
 	assert!(is_deleted(&adapter, tn_id, "f1~child").await);
@@ -243,17 +294,17 @@ async fn deleting_by_f_id_resolves_the_content_id() {
 	mint(&adapter, tn_id, "link-int", SHARE_FILE_REF_TYPE, "f1~by-int").await;
 	grant_user(&adapter, tn_id, "f1~by-int", "bob.example.com").await;
 
-	let f_id = adapter.read_f_id_by_file_id(tn_id, "f1~by-int").await.expect("read f_id");
+	let by_int_eid = eid(&adapter, tn_id, "f1~by-int").await;
+	let f_id = adapter.read_content(tn_id, "f1~by-int").await.expect("read f_id").f_id;
 	let purged = adapter.delete_file(tn_id, &format!("@{f_id}")).await.expect("delete by f_id");
 
-	// The reported ids must be content ids — the handler uses them as folder-cache keys.
-	assert_eq!(purged.file_ids.len(), 1);
-	assert_eq!(purged.file_ids[0].as_ref(), "f1~by-int");
+	// The reported ids are entry ids — the handler uses them as folder-cache keys.
+	assert_eq!(purged.entry_ids, vec![Box::<str>::from(by_int_eid.as_str())]);
 	assert_eq!(purged.refs_removed, 1);
 	assert_eq!(purged.share_entries_removed, 1);
 	assert!(is_deleted(&adapter, tn_id, "f1~by-int").await);
 	assert!(adapter.get_ref(tn_id, "link-int").await.unwrap().is_none());
-	assert!(adapter.list_share_entries(tn_id, 'F', "f1~by-int").await.unwrap().is_empty());
+	assert!(adapter.list_share_entries(tn_id, 'F', &by_int_eid).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -268,28 +319,24 @@ async fn an_already_tombstoned_child_still_has_its_links_swept() {
 
 	// Tombstone the child alone, then re-share it: a link or grant against an already-deleted row
 	// is exactly what the root's purge must still find.
+	// A tombstone is reachable only by its entry id.
+	let dead_eid = eid(&adapter, tn_id, "f1~dead-child").await;
 	adapter.delete_file(tn_id, "f1~dead-child").await.expect("delete child");
 	assert!(is_deleted(&adapter, tn_id, "f1~dead-child").await);
-	mint(&adapter, tn_id, "link-dead-child", SHARE_FILE_REF_TYPE, "f1~dead-child").await;
-	grant_user(&adapter, tn_id, "f1~dead-child", "bob.example.com").await;
+	mint(&adapter, tn_id, "link-dead-child", SHARE_FILE_REF_TYPE, &dead_eid).await;
+	grant_user(&adapter, tn_id, &dead_eid, "bob.example.com").await;
 
 	let purged = adapter.delete_file(tn_id, "f1~root").await.expect("delete root");
 
 	assert!(
-		purged.file_ids.iter().any(|f| f.as_ref() == "f1~dead-child"),
+		purged.entry_ids.iter().any(|e| **e == *dead_eid),
 		"tombstoned child missing from the cascade: {:?}",
-		purged.file_ids
+		purged.entry_ids
 	);
 	assert_eq!(purged.refs_removed, 1);
 	assert_eq!(purged.share_entries_removed, 1);
 	assert!(adapter.get_ref(tn_id, "link-dead-child").await.unwrap().is_none());
-	assert!(
-		adapter
-			.list_share_entries(tn_id, 'F', "f1~dead-child")
-			.await
-			.unwrap()
-			.is_empty()
-	);
+	assert!(adapter.list_share_entries(tn_id, 'F', &dead_eid).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -304,6 +351,8 @@ async fn an_unfinalized_upload_in_the_tree_is_tombstoned_not_fatal() {
 
 	make_file(&adapter, tn_id, "f1~root", None).await;
 	make_file(&adapter, tn_id, "f1~named-child", Some("f1~root")).await;
+	let (root_eid, child_eid) =
+		(eid(&adapter, tn_id, "f1~root").await, eid(&adapter, tn_id, "f1~named-child").await);
 	let pending = adapter
 		.create_file(
 			tn_id,
@@ -316,7 +365,7 @@ async fn an_unfinalized_upload_in_the_tree_is_tombstoned_not_fatal() {
 		)
 		.await
 		.expect("create pending upload row");
-	let pending_f_id = match pending {
+	let pending_f_id = match pending.file_id {
 		FileId::FId(f_id) => f_id,
 		FileId::FileId(id) => panic!("expected an f_id for a NULL-file_id row, got {id}"),
 	};
@@ -325,10 +374,11 @@ async fn an_unfinalized_upload_in_the_tree_is_tombstoned_not_fatal() {
 
 	// ...counted in `files_deleted`...
 	assert_eq!(purged.files_deleted, 3, "root + named child + the pending upload");
-	// ...but absent from `file_ids`, which the handler uses as folder-cache keys.
-	assert_eq!(purged.file_ids.len(), 2, "got {:?}", purged.file_ids);
-	assert_eq!(purged.file_ids[0].as_ref(), "f1~root");
-	assert!(purged.file_ids.iter().any(|f| f.as_ref() == "f1~named-child"));
+	// ...and reported by entry id, root first, like any other.
+	assert_eq!(purged.entry_ids.len(), 3, "got {:?}", purged.entry_ids);
+	assert_eq!(*purged.entry_ids[0], *root_eid);
+	assert!(purged.entry_ids.iter().any(|e| **e == *child_eid));
+	assert!(purged.entry_ids.iter().any(|e| **e == *pending.entry_id));
 
 	assert!(is_deleted(&adapter, tn_id, "f1~root").await);
 	assert!(is_deleted(&adapter, tn_id, "f1~named-child").await);
@@ -340,7 +390,7 @@ async fn hard_deleting_a_file_sweeps_its_links_and_grants_too() {
 	// The GC's row-removing path. A row can reach `status = 'D'` by routes other than `delete_file`,
 	// and file ids are content-addressed — a link or grant left behind is resurrected the moment
 	// identical content is re-uploaded.
-	let (adapter, _temp) = create_test_adapter().await;
+	let (adapter, temp) = create_test_adapter().await;
 	let tn_id = TnId(1);
 	adapter.create_tenant(tn_id, "alice").await.ok();
 
@@ -353,23 +403,55 @@ async fn hard_deleting_a_file_sweeps_its_links_and_grants_too() {
 	embed(&adapter, tn_id, "f1~keep", "f1~gc-me").await;
 	grant_user(&adapter, tn_id, "f1~keep", "dave.example.com").await;
 
-	let f_id = adapter.read_f_id_by_file_id(tn_id, "f1~gc-me").await.expect("read f_id");
-	adapter.hard_delete_file(tn_id, f_id).await.expect("hard delete");
+	let (gc_eid, keep_eid) =
+		(eid(&adapter, tn_id, "f1~gc-me").await, eid(&adapter, tn_id, "f1~keep").await);
+	let e_id = e_id_of_content(&temp, "f1~gc-me").await;
+	adapter.hard_delete_file(tn_id, e_id).await.expect("hard delete");
 
 	assert!(adapter.read_file(tn_id, "f1~gc-me").await.unwrap().is_none(), "row should be gone");
 	assert!(adapter.get_ref(tn_id, "link-gc").await.unwrap().is_none());
-	assert!(adapter.list_share_entries(tn_id, 'F', "f1~gc-me").await.unwrap().is_empty());
-	let by_subject = adapter
-		.list_share_entries_by_subject(tn_id, Some('F'), "f1~gc-me")
-		.await
-		.unwrap();
+	assert!(adapter.list_share_entries(tn_id, 'F', &gc_eid).await.unwrap().is_empty());
+	let by_subject =
+		adapter.list_share_entries_by_subject(tn_id, Some('F'), &gc_eid).await.unwrap();
 	assert!(by_subject.is_empty(), "embed row survived: {by_subject:?}");
 
 	// Everything naming another file is untouched.
 	assert!(adapter.get_ref(tn_id, "link-keep").await.unwrap().is_some());
-	let keep_entries = adapter.list_share_entries(tn_id, 'F', "f1~keep").await.unwrap();
+	let keep_entries = adapter.list_share_entries(tn_id, 'F', &keep_eid).await.unwrap();
 	assert_eq!(keep_entries.len(), 1, "only the embed should have been swept from f1~keep");
 	assert_eq!(keep_entries[0].subject_id.as_ref(), "dave.example.com");
+}
+
+#[tokio::test]
+async fn a_purged_tree_frees_its_content_for_the_reaper() {
+	// A permanent delete only tombstones; the GC's purge removes the entries, so content no
+	// other entry places turns orphan and the reaper (and then the blob sweep) can take it.
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.ok();
+	make_file(&adapter, tn_id, "f1~p-root", None).await;
+	make_file(&adapter, tn_id, "f1~p-part", Some("f1~p-root")).await;
+	// A BLOB placed twice: deleting one placement must not free the content.
+	make_file(&adapter, tn_id, "f1~p-shared", None).await;
+	let second = adapter
+		.create_entry_for_content(
+			tn_id,
+			"f1~p-shared",
+			CreateFile { file_name: "copy.txt".into(), ..Default::default() },
+		)
+		.await
+		.expect("second entry");
+
+	adapter.delete_file(tn_id, "f1~p-root").await.expect("delete tree");
+	adapter.delete_file(tn_id, &second).await.expect("delete one placement");
+	assert_eq!(adapter.purge_tombstones(tn_id).await.expect("purge"), 3);
+
+	let reaped = adapter.reap_orphan_files(tn_id, Timestamp(i64::MAX)).await.expect("reap");
+	for id in ["f1~p-root", "f1~p-part"] {
+		assert!(reaped.iter().any(|r| **r == *id), "{id} not reaped: {reaped:?}");
+	}
+	assert!(!reaped.iter().any(|r| &**r == "f1~p-shared"), "shared content reaped");
+	assert!(is_active(&adapter, tn_id, "f1~p-shared").await);
 }
 
 /// Every `tn_id`-keyed table takes part in the tenant cascade, and the site tables

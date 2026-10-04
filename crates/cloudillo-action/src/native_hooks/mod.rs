@@ -132,6 +132,8 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 			on_reject: None,
 		};
 
+		// FSHR:DEL has its own definition (content-free), so dispatch resolves to that key.
+		registry.register_type("FSHR:DEL", fshr_hooks.clone());
 		registry.register_type("FSHR", fshr_hooks);
 		tracing::info!("Registered native hooks for FSHR action type");
 	}

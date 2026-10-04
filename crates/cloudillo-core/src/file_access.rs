@@ -93,18 +93,24 @@ impl<'a> FileAccessCtx<'a> {
 /// caller hand in an upstream that does not belong to the row it is asking about.
 #[derive(Clone, Copy)]
 pub struct FileRef<'a> {
-	/// Authority. A NULL `files.owner_tag` resolves to the tenant.
+	/// Authority. A NULL `entries.owner_tag` resolves to the tenant.
 	pub owner_id_tag: &'a str,
 	/// Provenance, not authority. `None` means the row originates here, which is what gates the
 	/// owner shortcut and role access below. Never falls back to the tenant.
 	pub upstream_id_tag: Option<&'a str>,
-	pub file_id: &'a str,
+	/// Content id: FSHR keys, attachments, document trees. `None` for a local folder.
+	pub file_id: Option<&'a str>,
+	/// Placement id: share entries and share-link scopes name this.
+	pub entry_id: &'a str,
 	/// Absolute channel (`@tenant~name`); `None` = open floor. Gates only the ambient rungs.
 	pub channel: Option<&'a str>,
 	/// Document-tree root; a scope for the root grants its children.
 	pub root_id: Option<&'a str>,
-	/// `files.visibility`, read by the final visibility rung.
+	/// `entries.visibility`, read by the final visibility rung.
 	pub visibility: Option<char>,
+	/// `files.file_tp`. A `BLOB` is the only kind with several entries, so a content-keyed grant
+	/// on one is capped at Read and never reaches a placement write.
+	pub file_tp: Option<&'a str>,
 }
 
 impl<'a> FileRef<'a> {
@@ -127,10 +133,12 @@ impl<'a> FileRef<'a> {
 		Self {
 			owner_id_tag: tag(view.owner.as_ref()).unwrap_or(tenant_id_tag),
 			upstream_id_tag: tag(view.upstream.as_ref()),
-			file_id: &view.file_id,
+			file_id: view.file_id.as_deref(),
+			entry_id: &view.entry_id,
 			channel: view.channel.as_deref(),
 			root_id: view.root_id.as_deref(),
 			visibility: view.visibility,
+			file_tp: view.file_tp.as_deref(),
 		}
 	}
 }
@@ -416,7 +424,7 @@ fn channel_in(channel: &str, enterable: Option<&[Box<str>]>) -> bool {
 /// Write, `COMMENT` → Comment, `DEL` → None (a revocation is not a grant), anything else → Read.
 ///
 /// An FSHR is a *claim by its issuer* that they granted access, so only the node the row is
-/// mirrored from — its `upstream_tag` — can make it credibly. Testing the *owner* instead would be
+/// mirrored from — the entry's own `upstream_tag` — can make it credibly. Testing the *owner* instead would be
 /// worse than useless on a community tenant: an FSHR-accepted row leaves `owner_tag` NULL, so the
 /// owner resolves to the recipient tenant and any member could forge a grant on their own row. A
 /// row with no upstream originates here, so no FSHR on it is credible from anyone — its live grant
@@ -428,7 +436,7 @@ fn channel_in(channel: &str, enterable: Option<&[Box<str>]>) -> bool {
 /// `fshr::on_create` rejecting the write leaves the row behind. Federated peers can post such a
 /// token to the inbox just as easily.
 ///
-/// Both live paths survive the test: on the recipient's node `fshr::on_accept` creates the file row
+/// Both live paths survive the test: on the recipient's node `fshr::on_accept` creates an entry
 /// with `upstream_tag = issuer`, and on the owner's node the grantee's access resolves earlier, from
 /// the `share_entries` row.
 fn fshr_grant_level(
@@ -490,9 +498,22 @@ pub async fn get_access_level(
 	ctx: &FileAccessCtx<'_>,
 	inherited_share: Option<AccessLevel>,
 ) -> AccessLevel {
+	access_level(app, tn_id, file, ctx, inherited_share, false).await
+}
+
+/// [`get_access_level`]; `skip_direct` when the caller already looked up the direct share (the
+/// union's one query) and passes its hit, if any, as `inherited_share`.
+async fn access_level(
+	app: &App,
+	tn_id: TnId,
+	file: FileRef<'_>,
+	ctx: &FileAccessCtx<'_>,
+	inherited_share: Option<AccessLevel>,
+	skip_direct: bool,
+) -> AccessLevel {
 	let level = match ctx.scope {
 		Some(scope) => scope_grant(app, tn_id, &file, scope).await.unwrap_or(AccessLevel::None),
-		None => identity_level(app, tn_id, file, ctx, inherited_share).await,
+		None => identity_level(app, tn_id, file, ctx, inherited_share, skip_direct).await,
 	};
 	if level != AccessLevel::None {
 		return level;
@@ -533,7 +554,7 @@ pub async fn action_attachment_level(
 	let grants = view.status.as_deref() == Some("A")
 		&& &*view.issuer.id_tag == file.owner_id_tag
 		&& view.audience.as_ref().map(|p| &*p.id_tag) == Some(ctx.user_id_tag)
-		&& view.attachments.iter().flatten().any(|a| &*a.file_id == file.file_id);
+		&& view.attachments.iter().flatten().any(|a| file.file_id == Some(&*a.file_id));
 	if grants { AccessLevel::Read } else { AccessLevel::None }
 }
 
@@ -544,8 +565,11 @@ async fn identity_level(
 	file: FileRef<'_>,
 	ctx: &FileAccessCtx<'_>,
 	inherited_share: Option<AccessLevel>,
+	skip_direct: bool,
 ) -> AccessLevel {
-	let FileRef { file_id, owner_id_tag, upstream_id_tag, channel, .. } = file;
+	let FileRef { file_id, entry_id, owner_id_tag, upstream_id_tag, channel, .. } = file;
+	// FSHR keys name the content id, or a folder's entry id.
+	let file_id = file_id.unwrap_or(entry_id);
 	// The owner is the file's admin: write plus share management. Callers must test
 	// `can_write()`/`can_manage_shares()` rather than `== AccessLevel::Write`.
 	//
@@ -564,10 +588,11 @@ async fn identity_level(
 	}
 
 	// Direct share on this specific file
-	if let Ok(Some(perm)) = app
-		.meta_adapter
-		.check_share_access(tn_id, 'F', file_id, 'U', ctx.user_id_tag)
-		.await
+	if !skip_direct
+		&& let Ok(Some(perm)) = app
+			.meta_adapter
+			.check_share_access(tn_id, 'F', entry_id, 'U', ctx.user_id_tag)
+			.await
 	{
 		return AccessLevel::from_perm_char(perm);
 	}
@@ -576,12 +601,13 @@ async fn identity_level(
 		return level;
 	}
 	// No known inheritance — walk the parent chain
-	if let Some(level) = walk_parent_chain_for_share(app, tn_id, file_id, ctx.user_id_tag).await {
+	if let Some(level) = walk_parent_chain_for_share(app, tn_id, entry_id, ctx.user_id_tag).await {
 		return level;
 	}
 
-	// Role-based access. A mirrored row (Pin/Place copy, FSHR-accepted share) names its source in
-	// `upstream_tag` and its access is that node's business — roles held here say nothing about it.
+	// Role-based access. A mirrored entry (Pin/Place copy, FSHR-accepted share) names its source in
+	// its own `upstream_tag` and its access is that node's business — roles held here say nothing
+	// about it. Provenance is per entry: a local entry of the same BLOB content still qualifies.
 	//
 	// ponytail: on a row that originates here, ANY role reaches it — including a peer member's own
 	// Direct-visibility upload on a community tenant, since `role_access_level` ignores
@@ -598,19 +624,32 @@ async fn identity_level(
 		return role_level;
 	}
 
-	// Look up FSHR action: key pattern is "FSHR:{file_id}:{audience}"
-	let action_key = format!("FSHR:{}:{}", file_id, ctx.user_id_tag);
-
+	// FSHR action keyed `FSHR:{file_id}:{audience}`: the content id, which for a folder is its
+	// entry id. The grant reaches only placements the context admits — the room gates it like the
+	// role rung — and `fshr_grant_level` only honours the content's own upstream.
+	//
 	// `get_action_by_key` does not filter on action status, so a pending ('C') or rejected FSHR
 	// resolves here too. Moot in practice: the local file row only exists once `on_accept` ran.
-	match app.meta_adapter.get_action_by_key(tn_id, &action_key).await {
-		Ok(Some(action)) => fshr_grant_level(
-			&action.typ,
-			action.sub_typ.as_ref().map(AsRef::as_ref),
-			&action.issuer_tag,
-			upstream_id_tag,
-			file_id,
-		),
+	let found = app
+		.meta_adapter
+		.get_action_by_key(tn_id, &format!("FSHR:{}:{}", file_id, ctx.user_id_tag))
+		.await;
+	match found {
+		Ok(Some(action)) => {
+			if !channel_admits(app, tn_id, channel, ctx).await {
+				return AccessLevel::None;
+			}
+			let level = fshr_grant_level(
+				&action.typ,
+				action.sub_typ.as_ref().map(AsRef::as_ref),
+				&action.issuer_tag,
+				upstream_id_tag,
+				file_id,
+			);
+			// The key names content, and a BLOB's content may back several entries: the grant
+			// never reaches a placement write on one.
+			if file.file_tp == Some("BLOB") { level.min(AccessLevel::Read) } else { level }
+		}
 		// No FSHR row at all — a Pin/Place copy. Its placer keeps *read* over their own pin:
 		// owner standing is withheld (that is the first rung, and it is what keeps a revoked FSHR
 		// recipient out), but on a personal tenant a Pin lands at Direct visibility with no share
@@ -640,17 +679,23 @@ async fn scope_grant(
 	let Some(TokenScope::File { file_id: scope_file_id, access }) = TokenScope::parse(scope) else {
 		return None;
 	};
-	let file_id = file.file_id;
-	// Direct match, or document tree (depth-1: root_id always points to a top-level file)
-	if scope_file_id == file_id || file.root_id == Some(scope_file_id.as_str()) {
+	let entry_id = file.entry_id;
+	let scope_view = resolve_scope_entry(&app.meta_adapter, tn_id, &scope_file_id).await?;
+	// Direct match, or document tree (depth-1: root_id always points to a top-level file) in the
+	// scoped entry's drive: another drive's placement of a tree part is not under this scope.
+	if *scope_view.entry_id == *entry_id
+		|| (file.root_id.is_some_and(|r| Some(r) == scope_view.file_id.as_deref())
+			&& file.channel == scope_view.channel.as_deref())
+	{
 		return Some(access);
 	}
+	let scope_entry_id = &*scope_view.entry_id;
 
-	// Cross-document link: an `'F'` share entry with resource = target (`file_id`) and
+	// Cross-document link: an `'F'` share entry with resource = target (`entry_id`) and
 	// subject = the scoped container — the order `share::post_share` writes.
 	if let Ok(Some(perm)) = app
 		.meta_adapter
-		.check_share_access(tn_id, 'F', file_id, 'F', &scope_file_id)
+		.check_share_access(tn_id, 'F', entry_id, 'F', scope_entry_id)
 		.await
 	{
 		return Some(access.min(AccessLevel::from_perm_char(perm)));
@@ -667,13 +712,179 @@ async fn scope_grant(
 		return None;
 	};
 	let nested_under_scope =
-		scope_target_is_folder(&app.meta_adapter, cache, tn_id, &scope_file_id)
+		scope_target_is_folder(&app.meta_adapter, cache, tn_id, scope_entry_id)
 			.await
 			.unwrap_or(false)
-			&& is_descendant_of(&app.meta_adapter, cache, tn_id, file_id, &scope_file_id)
+			&& is_descendant_of(&app.meta_adapter, cache, tn_id, entry_id, scope_entry_id)
 				.await
 				.unwrap_or(false);
 	nested_under_scope.then_some(access)
+}
+
+/// What an id names, in `resolve_file`'s lookup order.
+enum IdTarget {
+	/// An entry id, or a non-BLOB content id naming a single entry.
+	Entry(Box<FileView>),
+	/// A BLOB content id, possibly shared by several entries.
+	Content(Box<str>),
+}
+
+/// Classify `id`. `None` when it names nothing.
+async fn classify_id(
+	meta: &Arc<dyn meta_adapter::MetaAdapter>,
+	tn_id: TnId,
+	id: &str,
+) -> ClResult<Option<IdTarget>> {
+	Ok(match meta.resolve_file(tn_id, id).await? {
+		meta_adapter::FileResolution::Entry(v)
+			if *v.entry_id == *id || v.file_tp.as_deref() != Some("BLOB") =>
+		{
+			Some(IdTarget::Entry(v))
+		}
+		meta_adapter::FileResolution::Entry(v) => v.file_id.map(IdTarget::Content),
+		// Several entries: a BLOB, or local content beside references to it.
+		meta_adapter::FileResolution::Ambiguous => Some(IdTarget::Content(id.into())),
+		// A deduped pending `@<f_id>`: `resolve` stays raw, the content listing follows
+		// `merged_into` to the survivor.
+		meta_adapter::FileResolution::NotFound if id.starts_with('@') => {
+			Some(IdTarget::Content(id.into()))
+		}
+		meta_adapter::FileResolution::NotFound => None,
+	})
+}
+
+/// The entry a `file:{id}` scope is bound to. A BLOB content id binds no entry, so it grants
+/// nothing: scopes are minted on the granting entry id (see the access-token handler).
+pub async fn resolve_scope_entry(
+	meta: &Arc<dyn meta_adapter::MetaAdapter>,
+	tn_id: TnId,
+	scope_id: &str,
+) -> Option<FileView> {
+	match classify_id(meta, tn_id, scope_id).await {
+		Ok(Some(IdTarget::Entry(v))) => Some(*v),
+		Ok(Some(IdTarget::Content(_)) | None) | Err(_) => None,
+	}
+}
+
+/// The entries an access check on `id` weighs: the entry `id` names, or every entry of the
+/// content it names, managed ones included.
+pub async fn access_entries(app: &App, tn_id: TnId, id: &str) -> ClResult<Vec<FileView>> {
+	match classify_id(&app.meta_adapter, tn_id, id).await? {
+		Some(IdTarget::Entry(v)) => Ok(vec![*v]),
+		Some(IdTarget::Content(c)) => app.meta_adapter.list_content_entries(tn_id, &c).await,
+		None => Ok(Vec::new()),
+	}
+}
+
+/// The entries of `entries` the caller's context admits, each with its level, in input order.
+/// An entry the lifecycle gate hides ([`check_lifecycle`]: trashed, pending, tombstone) drops out;
+/// direct shares come from one query over the active entries.
+///
+/// One entry: it alone, at its level — `AccessLevel::None` too, so ABAC can still weigh record
+/// ownership. Several: only the entries that grant something. `PermissionDenied` when entries pass
+/// the lifecycle gate but none grants; `NotFound` when none passes.
+pub async fn admitted(
+	app: &App,
+	tn_id: TnId,
+	mut entries: Vec<FileView>,
+	ctx: &FileAccessCtx<'_>,
+	via_action: Option<&str>,
+) -> ClResult<Vec<(FileView, AccessLevel)>> {
+	if entries.len() <= 1 {
+		let view = entries.pop().ok_or(Error::NotFound)?;
+		let level = entry_level(app, tn_id, &view, ctx, via_action, None, false).await;
+		let file = FileRef::from_view(&view, ctx.tenant_id_tag);
+		check_lifecycle(app, tn_id, &view, &file, ctx, level, ctx.names_holder).await?;
+		return Ok(vec![(view, level)]);
+	}
+	let direct = match (ctx.scope, entries.first().and_then(|e| e.file_id.as_deref())) {
+		(None, Some(content_id)) if !ctx.user_id_tag.is_empty() => {
+			app.meta_adapter
+				.check_content_share_access(tn_id, content_id, ctx.user_id_tag)
+				.await?
+		}
+		_ => Vec::new(),
+	};
+	let mut out = Vec::new();
+	let mut visible = false;
+	for view in entries {
+		let inherited = direct
+			.iter()
+			.find(|(eid, _)| *eid == view.entry_id)
+			.map(|(_, perm)| AccessLevel::from_perm_char(*perm));
+		let level = entry_level(app, tn_id, &view, ctx, via_action, inherited, true).await;
+		let file = FileRef::from_view(&view, ctx.tenant_id_tag);
+		match check_lifecycle(app, tn_id, &view, &file, ctx, level, ctx.names_holder).await {
+			Ok(()) => visible = true,
+			Err(Error::NotFound) => continue,
+			Err(e) => return Err(e),
+		}
+		if level != AccessLevel::None {
+			out.push((view, level));
+		}
+	}
+	match out.is_empty() {
+		false => Ok(out),
+		true if visible => Err(Error::PermissionDenied),
+		true => Err(Error::NotFound),
+	}
+}
+
+/// The read resolver: of the entries the context [`admitted`], the one granting the highest level
+/// (on a tie a local entry over a reference, which holds no bytes here, then lowest `e_id`). The
+/// returned view is that admitted entry, so no sibling's metadata reaches the caller.
+pub async fn union_access(
+	app: &App,
+	tn_id: TnId,
+	entries: Vec<FileView>,
+	ctx: &FileAccessCtx<'_>,
+	via_action: Option<&str>,
+) -> ClResult<(FileView, AccessLevel)> {
+	let mut best: Option<(FileView, AccessLevel)> = None;
+	for (view, level) in admitted(app, tn_id, entries, ctx, via_action).await? {
+		if best.as_ref().is_none_or(|(b_view, b)| {
+			level > *b
+				|| (level == *b && b_view.upstream_tag.is_some() && view.upstream_tag.is_none())
+		}) {
+			best = Some((view, level));
+		}
+	}
+	best.ok_or(Error::NotFound)
+}
+
+/// Exactly one of `candidates`, or `Conflict` when the id names several ("use the entry id").
+/// Empty is `PermissionDenied`.
+pub fn single_placement<T>(mut candidates: Vec<(FileView, T)>) -> ClResult<(FileView, T)> {
+	// A content id never targets an action-managed entry while a user entry qualifies: managed
+	// entries live and die with their action.
+	if candidates.iter().any(|(v, _)| v.action_id.is_none()) {
+		candidates.retain(|(v, _)| v.action_id.is_none());
+	}
+	match candidates.len() {
+		0 => Err(Error::PermissionDenied),
+		1 => candidates.pop().ok_or(Error::PermissionDenied),
+		_ => Err(Error::Conflict("file id names several entries; use the entry id".into())),
+	}
+}
+
+/// One entry's level, with the opt-in [`action_attachment_level`] when the caller names an action.
+async fn entry_level(
+	app: &App,
+	tn_id: TnId,
+	view: &FileView,
+	ctx: &FileAccessCtx<'_>,
+	via_action: Option<&str>,
+	inherited_share: Option<AccessLevel>,
+	skip_direct: bool,
+) -> AccessLevel {
+	let file = FileRef::from_view(view, ctx.tenant_id_tag);
+	let level = access_level(app, tn_id, file, ctx, inherited_share, skip_direct).await;
+	match via_action {
+		Some(action_id) if !level.can_read() => {
+			action_attachment_level(app, tn_id, &file, ctx, action_id).await
+		}
+		_ => level,
+	}
 }
 
 /// The visibility rung: `Read` when the file's `visibility` admits the caller and its channel is
@@ -738,11 +949,12 @@ pub fn visibility_grants_read(
 /// Check file access and return file view with access level
 ///
 /// This is the main helper for WebSocket handlers. It:
-/// 1. Loads file metadata
-/// 2. Determines the access level via [`get_access_level`] (scope, identity and visibility
-///    rungs; `ctx.scope` carries the delegated scope)
+/// 1. Loads the entries `file_id` names ([`access_entries`]: one entry, or every entry of a
+///    content id)
+/// 2. Takes the union over them ([`union_access`]: scope, identity and visibility rungs per
+///    entry; `ctx.scope` carries the delegated scope)
 /// 3. Caps it by the `'F'` share entry when opened `?via=` an embedding (unscoped callers only)
-/// 4. Returns combined result or error
+/// 4. Returns combined result (`file_view` = the granting entry) or error
 pub async fn check_file_access(
 	app: &App,
 	tn_id: TnId,
@@ -750,36 +962,42 @@ pub async fn check_file_access(
 	ctx: &FileAccessCtx<'_>,
 	via: Option<&str>,
 ) -> Result<FileAccessResult, FileAccessError> {
-	use tracing::debug;
+	let entries = access_entries(app, tn_id, file_id)
+		.await
+		.map_err(|e| FileAccessError::InternalError(e.to_string()))?;
+	access_result(app, tn_id, entries, ctx, via).await
+}
 
-	// Load file metadata
-	let file_view = match app.meta_adapter.read_file(tn_id, file_id).await {
-		Ok(Some(f)) => f,
-		Ok(None) => return Err(FileAccessError::NotFound),
+/// The placement resolver: of the entries of `id` the context [`admitted`], those granting at
+/// least `needed`. Exactly one → it; none → `PermissionDenied`; several → `Conflict` (409, "use
+/// the entry id"). An entry id resolves to itself, then is access-checked.
+pub async fn resolve_placement(
+	app: &App,
+	tn_id: TnId,
+	id: &str,
+	ctx: &FileAccessCtx<'_>,
+	needed: AccessLevel,
+) -> ClResult<FileAccessResult> {
+	let entries = access_entries(app, tn_id, id).await?;
+	let mut candidates = admitted(app, tn_id, entries, ctx, None).await?;
+	candidates.retain(|(_, level)| *level != AccessLevel::None && *level >= needed);
+	let (file_view, access_level) = single_placement(candidates)?;
+	Ok(FileAccessResult { file_view, access_level, read_only: !access_level.can_write() })
+}
+
+async fn access_result(
+	app: &App,
+	tn_id: TnId,
+	entries: Vec<FileView>,
+	ctx: &FileAccessCtx<'_>,
+	via: Option<&str>,
+) -> Result<FileAccessResult, FileAccessError> {
+	let (file_view, mut access_level) = match union_access(app, tn_id, entries, ctx, None).await {
+		Ok(r) => r,
+		Err(Error::NotFound) => return Err(FileAccessError::NotFound),
+		Err(Error::PermissionDenied) => return Err(FileAccessError::AccessDenied),
 		Err(e) => return Err(FileAccessError::InternalError(e.to_string())),
 	};
-
-	// Both ownership facts come off the row itself, so this function's callers cannot forget the
-	// upstream and hand a mirrored row role access.
-	let file_ref = FileRef::from_view(&file_view, ctx.tenant_id_tag);
-
-	debug!(
-		file_id = file_id,
-		user = ctx.user_id_tag,
-		owner = file_ref.owner_id_tag,
-		scope = ?ctx.scope,
-		"Checking file access"
-	);
-
-	let mut access_level = get_access_level(app, tn_id, file_ref, ctx, None).await;
-
-	match check_lifecycle(app, tn_id, &file_view, &file_ref, ctx, access_level, ctx.names_holder)
-		.await
-	{
-		Ok(()) => {}
-		Err(Error::NotFound) => return Err(FileAccessError::NotFound),
-		Err(e) => return Err(FileAccessError::InternalError(e.to_string())),
-	}
 
 	// Cap access by file-to-file share entry when opened via embedding
 	// (resource = target, subject = the embedding container)
@@ -787,15 +1005,23 @@ pub async fn check_file_access(
 		&& ctx.scope.is_none()
 		&& access_level != AccessLevel::None
 	{
-		match app.meta_adapter.check_share_access(tn_id, 'F', file_id, 'F', via_file_id).await {
-			Ok(Some(perm)) => {
-				access_level = access_level.min(AccessLevel::from_perm_char(perm));
-			}
-			Ok(None) | Err(_) => {
-				// No file-to-file share entry — embedding doesn't exist, deny
-				access_level = AccessLevel::None;
+		// The embedding container is named by any file id — a deduplicated content id names
+		// several placements. Share entries hold entry ids: weigh every placement the caller
+		// reaches, and take the best link. None (or a lookup failure) means no embedding: deny.
+		let vias = access_entries(app, tn_id, via_file_id).await.unwrap_or_default();
+		let reachable = admitted(app, tn_id, vias, ctx, None).await.unwrap_or_default();
+		let mut link: Option<AccessLevel> = None;
+		for (v, _) in &reachable {
+			if let Ok(Some(perm)) = app
+				.meta_adapter
+				.check_share_access(tn_id, 'F', &file_view.entry_id, 'F', &v.entry_id)
+				.await
+			{
+				let perm = AccessLevel::from_perm_char(perm);
+				link = Some(link.map_or(perm, |l| l.max(perm)));
 			}
 		}
+		access_level = link.map_or(AccessLevel::None, |p| access_level.min(p));
 	}
 
 	if access_level == AccessLevel::None {
@@ -822,23 +1048,28 @@ pub enum ScopeCheck {
 /// Returns `ScopeCheck::NoScope` when there is no scope restriction,
 /// `ScopeCheck::Allowed(level)` when the file is within scope,
 /// or `ScopeCheck::Denied` when the file is outside scope.
-pub fn check_scope_allows_file(
+///
+/// The scope names an entry; it is resolved like `read_file` and matched against `file`'s
+/// `entry_id`, or against its `root_id` by the scope target's content `file_id`.
+pub async fn check_scope_allows_file(
+	meta: &Arc<dyn meta_adapter::MetaAdapter>,
+	tn_id: TnId,
 	scope: Option<&str>,
-	file_id: &str,
-	root_id: Option<&str>,
+	file: &FileView,
 ) -> ScopeCheck {
 	let Some(scope_str) = scope else { return ScopeCheck::NoScope };
 	// If a scope string is present but can't be parsed, deny access (least privilege)
 	let Some(token_scope) = TokenScope::parse(scope_str) else { return ScopeCheck::Denied };
 	match &token_scope {
 		TokenScope::File { file_id: scope_file_id, access } => {
-			// Direct match: scope matches this file_id
-			if scope_file_id == file_id {
-				return ScopeCheck::Allowed(*access);
-			}
-			// Document tree check: scope is for a root, this file is a child
-			if let Some(root) = root_id
-				&& scope_file_id.as_str() == root
+			let Some(target) = resolve_scope_entry(meta, tn_id, scope_file_id).await else {
+				return ScopeCheck::Denied;
+			};
+			// Direct match, or document tree: scope is for a root, this file is a child in the
+			// root entry's drive
+			if target.entry_id == file.entry_id
+				|| (file.root_id.as_deref().is_some_and(|r| Some(r) == target.file_id.as_deref())
+					&& file.channel == target.channel)
 			{
 				return ScopeCheck::Allowed(*access);
 			}
@@ -880,8 +1111,13 @@ pub async fn check_scope_allows_create_in(
 			if !access.can_write() {
 				return Err(Error::PermissionDenied);
 			}
+			// The scope names an entry; `root_id` names content. Resolve the scope target.
+			let Some(target) = resolve_scope_entry(meta, tn_id, scope_file_id).await else {
+				return Err(Error::PermissionDenied);
+			};
+			let scope_file_id = &*target.entry_id;
 			// Document-tree rule: new file is a child in the scoped document tree.
-			if root_id == Some(scope_file_id.as_str()) {
+			if root_id.is_some_and(|r| Some(r) == target.file_id.as_deref()) {
 				return Ok(());
 			}
 			// Folder-subtree rule: new file's parent is the scoped folder or nested
@@ -890,7 +1126,7 @@ pub async fn check_scope_allows_create_in(
 			// parent_id siblings.
 			if let Some(parent) = parent_id
 				&& scope_target_is_folder(meta, cache, tn_id, scope_file_id).await?
-				&& (parent == scope_file_id.as_str()
+				&& (parent == scope_file_id
 					|| is_descendant_of(meta, cache, tn_id, parent, scope_file_id).await?)
 			{
 				return Ok(());
@@ -1021,7 +1257,7 @@ mod tests {
 		assert!(channel_in("@t.example~closed", None));
 	}
 
-	/// The node an FSHR-accepted row is mirrored from — `files.upstream_tag`, not its owner.
+	/// The node an FSHR-accepted entry is mirrored from — `entries.upstream_tag`, not its owner.
 	const UPSTREAM: &str = "alice.example.com";
 	const ATTACKER: &str = "mallory.example.com";
 
@@ -1093,6 +1329,34 @@ mod tests {
 			fshr_grant_level("CONN", Some("ADMIN"), UPSTREAM, Some(UPSTREAM), "f1~doc"),
 			AccessLevel::None
 		);
+	}
+
+	fn entry(entry_id: &str, action_id: Option<&str>) -> (FileView, ()) {
+		let json = serde_json::json!({
+			"entryId": entry_id, "fileId": "f1~c", "fileName": "x", "createdAt": 0, "status": "A",
+		});
+		let Ok(mut view) = serde_json::from_value::<FileView>(json) else {
+			unreachable!("file view");
+		};
+		view.action_id = action_id.map(Into::into);
+		(view, ())
+	}
+
+	/// PMG-04: a content id skips managed entries while a user entry qualifies; managed only →
+	/// one is picked, several are a `Conflict`.
+	#[test]
+	fn single_placement_skips_managed_entries() {
+		let picked = single_placement(vec![entry("m1", Some("a1~x")), entry("u1", None)]);
+		assert!(matches!(picked, Ok((v, ())) if &*v.entry_id == "u1"));
+
+		let picked = single_placement(vec![entry("m1", Some("a1~x"))]);
+		assert!(matches!(picked, Ok((v, ())) if &*v.entry_id == "m1"));
+
+		let picked = single_placement(vec![entry("m1", Some("a1~x")), entry("m2", Some("a1~y"))]);
+		assert!(matches!(picked, Err(Error::Conflict(_))));
+
+		let picked = single_placement(vec![entry("u1", None), entry("u2", None)]);
+		assert!(matches!(picked, Err(Error::Conflict(_))));
 	}
 }
 

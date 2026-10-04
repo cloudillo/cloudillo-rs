@@ -55,6 +55,11 @@ impl Report {
 		Self { layer, cells: 0, groups: BTreeMap::new(), errors: BTreeMap::new() }
 	}
 
+	/// Count one cell whose outcome the caller judges itself.
+	pub fn cell(&mut self) {
+		self.cells += 1;
+	}
+
 	pub fn add(&mut self, m: Mismatch) {
 		let g = self.groups.entry((m.op, m.rule, m.expected, m.actual)).or_default();
 		push(g, m.subject, m.object);
@@ -120,7 +125,10 @@ impl Report {
 			let _ = writeln!(out, "| {op} | {rule} | {e} | {a} | {} | {} |", g.0, samples(g));
 		}
 		std::fs::write(&path, &out).expect("write access-matrix report");
-		println!("access matrix report: {path}");
+		tracing::info!(
+			"access matrix [{layer}]: {} cells, {n_mis} mismatches, {n_err} harness errors — {path}",
+			self.cells
+		);
 		assert!(
 			n_err == 0 && self.groups.is_empty(),
 			"access matrix [{layer}]: {n_err} harness errors, {} mismatch groups — see {path}",

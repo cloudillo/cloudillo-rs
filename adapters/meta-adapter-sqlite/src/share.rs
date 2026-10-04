@@ -199,6 +199,23 @@ pub(crate) async fn update(
 	row.map(|r| row_to_share_entry(&r)).ok_or(Error::NotFound)
 }
 
+/// `SELECT … FROM` for the share listings, with the subject file's display fields (a folder
+/// entry, which has no `files` row, reports `'FLDR'`). Ends with a space: append the `WHERE`.
+macro_rules! share_select {
+	() => {
+		"SELECT se.id, se.resource_type, se.resource_id, se.subject_type, se.subject_id, \
+			se.permission, se.expires_at, se.created_by, se.created_at, \
+			e.file_name AS subject_file_name, \
+			f.content_type AS subject_content_type, \
+			CASE WHEN e.e_id IS NOT NULL AND e.f_id IS NULL THEN 'FLDR' ELSE f.file_tp END \
+				AS subject_file_tp \
+		 FROM share_entries se \
+		 LEFT JOIN entries e ON se.subject_type = 'F' \
+			AND e.tn_id = se.tn_id AND e.entry_id = se.subject_id \
+		 LEFT JOIN files f ON f.f_id = e.f_id "
+	};
+}
+
 /// List share entries for a resource, excluding expired entries
 pub(crate) async fn list_by_resource(
 	db: &SqlitePool,
@@ -208,18 +225,12 @@ pub(crate) async fn list_by_resource(
 ) -> ClResult<Vec<ShareEntry>> {
 	let resource_type_str = resource_type.to_string();
 
-	let rows = sqlx::query(
-		"SELECT se.id, se.resource_type, se.resource_id, se.subject_type, se.subject_id, \
-			se.permission, se.expires_at, se.created_by, se.created_at, \
-			f.file_name AS subject_file_name, \
-			f.content_type AS subject_content_type, \
-			f.file_tp AS subject_file_tp \
-		 FROM share_entries se \
-		 LEFT JOIN files f ON se.subject_type = 'F' AND f.tn_id = se.tn_id AND f.file_id = se.subject_id \
-		 WHERE se.tn_id = ? AND se.resource_type = ? AND se.resource_id = ? \
+	let rows = sqlx::query(concat!(
+		share_select!(),
+		"WHERE se.tn_id = ? AND se.resource_type = ? AND se.resource_id = ? \
 			AND (se.expires_at IS NULL OR se.expires_at > unixepoch()) \
-		 ORDER BY se.created_at DESC",
-	)
+			ORDER BY se.created_at DESC"
+	))
 	.bind(tn_id.0)
 	.bind(&resource_type_str)
 	.bind(resource_id)
@@ -243,19 +254,12 @@ pub(crate) async fn list_by_subject(
 	let subject_id = subject_type
 		.map_or(std::borrow::Cow::Borrowed(subject_id), |t| subject_id_needle(t, subject_id));
 
-	let rows = sqlx::query(
-		"SELECT se.id, se.resource_type, se.resource_id, se.subject_type, se.subject_id, \
-			se.permission, se.expires_at, se.created_by, se.created_at, \
-			f.file_name AS subject_file_name, \
-			f.content_type AS subject_content_type, \
-			f.file_tp AS subject_file_tp \
-		 FROM share_entries se \
-		 LEFT JOIN files f ON se.subject_type = 'F' \
-			AND f.tn_id = se.tn_id AND f.file_id = se.subject_id \
-		 WHERE se.tn_id = ? AND (? IS NULL OR se.subject_type = ?) AND se.subject_id = ? \
+	let rows = sqlx::query(concat!(
+		share_select!(),
+		"WHERE se.tn_id = ? AND (? IS NULL OR se.subject_type = ?) AND se.subject_id = ? \
 			AND (se.expires_at IS NULL OR se.expires_at > unixepoch()) \
-		 ORDER BY se.created_at DESC",
-	)
+			ORDER BY se.created_at DESC"
+	))
 	.bind(tn_id.0)
 	.bind(&subject_type_str)
 	.bind(&subject_type_str)

@@ -1006,6 +1006,7 @@ async fn own_upload_resolves_owner_to_the_tenant_profile() {
 				content_type: "text/plain".into(),
 				file_name: "own.txt".into(),
 				file_tp: Some("BLOB".into()),
+				status: Some(FileStatus::Active),
 				..Default::default()
 			},
 		)
@@ -1294,7 +1295,7 @@ async fn an_unfinalized_row_is_readable_by_f_id_but_has_no_file_id() {
 		)
 		.await
 		.expect("create file");
-	let cloudillo_types::meta_adapter::FileId::FId(f_id) = created else {
+	let cloudillo_types::meta_adapter::FileId::FId(f_id) = created.file_id else {
 		panic!("an unfinalized row must come back as an f_id, got {created:?}");
 	};
 
@@ -1305,7 +1306,7 @@ async fn an_unfinalized_row_is_readable_by_f_id_but_has_no_file_id() {
 		.expect("read by f_id")
 		.expect("row exists");
 	assert_eq!(
-		view.file_id.as_ref(),
+		view.index_id(),
 		format!("@{f_id}"),
 		"not finalized yet — the view falls back to the @-form"
 	);

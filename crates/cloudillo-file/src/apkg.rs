@@ -50,8 +50,28 @@ pub async fn get_container_content(
 		return Err(Error::NotFound);
 	}
 
-	// Look up the file metadata
-	let file = app.meta_adapter.read_file(tn_id, &file_id).await?.ok_or(Error::NotFound)?;
+	// The guest context stands in for an unauthenticated reader.
+	let (auth_ctx, subject_id_tag) = if let Some(auth_ctx) = maybe_auth {
+		let id_tag = auth_ctx.id_tag.clone();
+		(auth_ctx, id_tag)
+	} else {
+		let guest_ctx = AuthCtx {
+			tn_id,
+			id_tag: "guest".into(),
+			roles: vec![].into(),
+			scope: None,
+			anonymous: true,
+			hat: None,
+			exp: None,
+		};
+		(guest_ctx, "guest".into())
+	};
+
+	// A published package's content id also names its action-managed entries: resolve over all
+	// of them (lifecycle-gated) and take the one granting most.
+	let ctx = file_access::FileAccessCtx::from_auth(Some(&auth_ctx), &tenant_id_tag);
+	let entries = file_access::access_entries(&app, tn_id, &file_id).await?;
+	let (file, access_level) = file_access::union_access(&app, tn_id, entries, &ctx, None).await?;
 
 	// `site` joins `apkg` here so a published site container is readable through the same
 	// route: the `OptionalAuth` path below is what lets an unauthenticated reader fetch out
@@ -63,36 +83,7 @@ pub async fn get_container_content(
 
 	// ABAC permission check for file read access
 	{
-		let (auth_ctx, subject_id_tag) = if let Some(auth_ctx) = maybe_auth {
-			let id_tag = auth_ctx.id_tag.clone();
-			(auth_ctx, id_tag)
-		} else {
-			let guest_ctx = AuthCtx {
-				tn_id,
-				id_tag: "guest".into(),
-				roles: vec![].into(),
-				scope: None,
-				anonymous: true,
-				hat: None,
-				exp: None,
-			};
-			(guest_ctx, "guest".into())
-		};
-
 		let file_ref = file_access::FileRef::from_view(&file, &tenant_id_tag);
-
-		let ctx = file_access::FileAccessCtx::from_auth(Some(&auth_ctx), &tenant_id_tag);
-		let access_level = file_access::get_access_level(&app, tn_id, file_ref, &ctx, None).await;
-		file_access::check_lifecycle(
-			&app,
-			tn_id,
-			&file,
-			&file_ref,
-			&ctx,
-			access_level,
-			auth_ctx.names_holder(),
-		)
-		.await?;
 
 		// Owned before the borrow of the row ends, so `FileAttrs` can take it.
 		let owner_id_tag: Box<str> = file_ref.owner_id_tag.into();
@@ -111,7 +102,7 @@ pub async fn get_container_content(
 		};
 
 		let attrs = FileAttrs {
-			file_id: file.file_id.clone(),
+			file_id: file.index_id().into(),
 			owner_id_tag,
 			upstream_id_tag: file.upstream_tag.clone(),
 			mime_type: file
@@ -147,12 +138,14 @@ pub async fn get_container_content(
 	//
 	// Deliberately below the permission check: it is a read-pool query on every container
 	// entry fetch, and a request about to be refused must not pay it.
+	let content_id = file.file_id.as_deref().ok_or(Error::NotFound)?;
 	let trusted = file.preset.as_deref() == Some("apkg")
-		&& app.meta_adapter.is_installed_app_file(tn_id, &file_id).await?;
+		&& app.meta_adapter.is_installed_app_file(tn_id, content_id).await?;
 
 	// The index lookup and the entry's range read live behind `crate::Container`, which
 	// `cloudillo-site` reads its fragments through too. Resolves once per request.
-	let container = crate::open_container(&app, tn_id, &file_id, Priority::High).await?;
+	// The path may name the entry; the container is the content.
+	let container = crate::open_container(&app, tn_id, content_id, Priority::High).await?;
 	let Some(info) = container.entry(&path) else {
 		return Err(Error::NotFound);
 	};

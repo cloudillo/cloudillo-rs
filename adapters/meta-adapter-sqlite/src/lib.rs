@@ -3,6 +3,15 @@
 
 use std::{path::Path, sync::Arc};
 
+/// SQL subquery yielding the canonical `f_id` for the `@<f_id>` bound at its `?`: a pending
+/// upload deduped by `file::finalize_file` redirects through `files.merged_into`. `$tn` names
+/// the outer tenant column.
+macro_rules! canon_f_id {
+	($tn:literal) => {
+		concat!("(SELECT COALESCE(merged_into, f_id) FROM files WHERE tn_id=", $tn, " AND f_id=?)")
+	};
+}
+
 mod action;
 mod calendar;
 mod channel;
@@ -36,14 +45,15 @@ use cloudillo_types::{
 	meta_adapter::{
 		Action, ActionData, ActionId, ActionView, AddressBook, Calendar, CalendarObject,
 		CalendarObjectExtracted, CalendarObjectSyncEntry, CalendarObjectView, CalendarObjectWrite,
-		Channel, Contact, ContactExtracted, ContactSyncEntry, ContactView, CreateCalendarData,
-		CreateFile, CreateRefOptions, CreateShareEntry, DeleteFileResult, DocFormat, FileId,
-		FileUserData, FileVariant, FileView, FinalizeActionOptions, InstallApp, InstalledApp,
-		ListActionOptions, ListCalendarObjectOptions, ListContactOptions, ListFileOptions,
-		ListProfileOptions, ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter,
-		PartnerEdge, Profile, ProfileData, ProfileRelation, PublicProfileRow, PublishSiteDoc,
-		PushSubscription, PushSubscriptionData, RefData, SearchObject, SearchOptions, SearchPart,
-		SearchRow, ShareEntry, Site, SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
+		Channel, Contact, ContactExtracted, ContactSyncEntry, ContactView, ContentInfo,
+		CreateCalendarData, CreateFile, CreateRefOptions, CreateShareEntry, CreatedFile,
+		DeleteFileResult, DocFormat, FileId, FileResolution, FileUserData, FileVariant, FileView,
+		FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
+		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
+		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, PartnerEdge,
+		Profile, ProfileData, ProfileRelation, PublicProfileRow, PublishSiteDoc, PushSubscription,
+		PushSubscriptionData, RefData, SearchObject, SearchOptions, SearchPart, SearchRow,
+		ShareEntry, Site, SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
 		UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData, UpdateChannelData,
 		UpdateFileOptions, UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData,
 		UpsertDocFormat, UpsertProfileFields, UpsertResult, UpsertSite,
@@ -371,11 +381,22 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::read_file_id_by_variant(&self.dbr, tn_id, variant_id).await
 	}
 
-	async fn read_f_id_by_file_id(&self, tn_id: TnId, file_id: &str) -> ClResult<u64> {
-		file::read_f_id_by_file_id(&self.dbr, tn_id, file_id).await
+	async fn read_content(&self, tn_id: TnId, file_id: &str) -> ClResult<ContentInfo> {
+		file::read_content(&self.dbr, tn_id, file_id).await
 	}
 
-	async fn create_file(&self, tn_id: TnId, opts: CreateFile) -> ClResult<FileId<Box<str>>> {
+	async fn create_sync_content(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		root_id: Option<&str>,
+		content_type: &str,
+		x: Option<serde_json::Value>,
+	) -> ClResult<u64> {
+		file::create_sync_content(&self.db, tn_id, file_id, root_id, content_type, x).await
+	}
+
+	async fn create_file(&self, tn_id: TnId, opts: CreateFile) -> ClResult<CreatedFile> {
 		file::create(&self.db, tn_id, opts).await
 	}
 
@@ -397,7 +418,7 @@ impl MetaAdapter for MetaAdapterSqlite {
 		tn_id: TnId,
 		parent_id: &str,
 		before: Timestamp,
-	) -> ClResult<Vec<u64>> {
+	) -> ClResult<Vec<(u64, Option<u64>)>> {
 		file::list_files_by_parent(&self.dbr, tn_id, parent_id, before).await
 	}
 
@@ -408,8 +429,44 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::list_referenced_managed_fids(&self.dbr, tn_id).await
 	}
 
-	async fn hard_delete_file(&self, tn_id: TnId, f_id: u64) -> ClResult<Option<Box<str>>> {
-		file::hard_delete_file(&self.db, tn_id, f_id).await
+	async fn hard_delete_file(&self, tn_id: TnId, e_id: u64) -> ClResult<Option<Box<str>>> {
+		file::hard_delete_file(&self.db, tn_id, e_id).await
+	}
+
+	async fn reap_orphan_files(&self, tn_id: TnId, before: Timestamp) -> ClResult<Vec<Box<str>>> {
+		file::reap_orphan_files(&self.db, tn_id, before).await
+	}
+
+	async fn purge_tombstones(&self, tn_id: TnId) -> ClResult<u64> {
+		file::purge_tombstones(&self.db, tn_id).await
+	}
+
+	async fn create_entry_for_content(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		opts: CreateFile,
+	) -> ClResult<Box<str>> {
+		file::create_entry_for_content(&self.db, tn_id, file_id, opts).await
+	}
+
+	async fn create_managed_entry(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		file_name: &str,
+		action_id: Option<&str>,
+		visibility: Option<char>,
+		channel: Option<&str>,
+	) -> ClResult<Box<str>> {
+		file::create_managed_entry(
+			&self.db, tn_id, file_id, file_name, action_id, visibility, channel,
+		)
+		.await
+	}
+
+	async fn delete_managed_entries(&self, tn_id: TnId, action_id: &str) -> ClResult<()> {
+		file::delete_managed_entries(&self.db, tn_id, action_id).await
 	}
 
 	// Task scheduler
@@ -621,6 +678,29 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::update_data(&self.db, tn_id, file_id, opts).await
 	}
 
+	async fn move_entry_subtree(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		parent_id: Option<&str>,
+		channel: Option<&str>,
+	) -> ClResult<()> {
+		file::move_entry_subtree(&self.db, tn_id, entry_id, parent_id, channel).await
+	}
+
+	async fn subtree_owned_by(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		owner_tag: &str,
+	) -> ClResult<bool> {
+		file::subtree_owned_by(&self.dbr, tn_id, entry_id, owner_tag).await
+	}
+
+	async fn resolve_file(&self, tn_id: TnId, file_id: &str) -> ClResult<FileResolution> {
+		file::resolve_file(&self.dbr, tn_id, file_id).await
+	}
+
 	async fn read_file(&self, tn_id: TnId, file_id: &str) -> ClResult<Option<FileView>> {
 		file::read(&self.dbr, tn_id, file_id).await
 	}
@@ -739,6 +819,19 @@ impl MetaAdapter for MetaAdapterSqlite {
 	) -> ClResult<Option<char>> {
 		share::check_access(&self.dbr, tn_id, resource_type, resource_id, subject_type, subject_id)
 			.await
+	}
+
+	async fn list_content_entries(&self, tn_id: TnId, file_id: &str) -> ClResult<Vec<FileView>> {
+		file::list_content_entries(&self.dbr, tn_id, file_id).await
+	}
+
+	async fn check_content_share_access(
+		&self,
+		tn_id: TnId,
+		file_id: &str,
+		id_tag: &str,
+	) -> ClResult<Vec<(Box<str>, char)>> {
+		file::check_content_share_access(&self.dbr, tn_id, file_id, id_tag).await
 	}
 
 	async fn read_share_entry(&self, tn_id: TnId, id: i64) -> ClResult<Option<ShareEntry>> {
@@ -1047,6 +1140,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn delete_channel(&self, tn_id: TnId, name: &str) -> ClResult<()> {
 		channel::delete_channel(&self.db, tn_id, name).await
+	}
+
+	async fn count_channel_entries(&self, tn_id: TnId, channel: &str) -> ClResult<u32> {
+		file::count_channel_entries(&self.dbr, tn_id, channel).await
 	}
 
 	async fn list_channel_members(&self, tn_id: TnId, name: &str) -> ClResult<Vec<Box<str>>> {

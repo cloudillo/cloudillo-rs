@@ -107,6 +107,8 @@ pub struct FileObj {
 	pub spec: FileSpec,
 	pub tn_id: TnId,
 	pub file_id: String,
+	/// The seeded entry's id (empty until seeded).
+	pub entry_id: String,
 	pub parent_id: Option<String>,
 	pub root_id: Option<String>,
 	pub owner_tag: Option<String>,
@@ -120,6 +122,17 @@ pub struct FileObj {
 	pub blob_id: Option<String>,
 	/// `(app_name, publisher_tag)` when installed.
 	pub installed: Option<(String, String)>,
+}
+
+impl FileObj {
+	/// The id a per-file route names: the content id, except for a trashed or pending row,
+	/// which only its own entry id reaches.
+	pub fn path_id(&self) -> &str {
+		match self.spec.life {
+			FileLife::Trashed | FileLife::Pending => &self.entry_id,
+			FileLife::Active | FileLife::Tombstoned => &self.file_id,
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -396,9 +409,9 @@ fn specs(t: &Tenants) -> Vec<(FileSpec, TnId)> {
 pub async fn seed_files(app: &App, t: &Tenants, r: &Remotes) -> Vec<Obj> {
 	let mut objs = Vec::new();
 	for (spec, tn_id) in specs(t) {
-		let obj = plan_file(spec, tn_id, r);
-		seed_file(app, &obj).await;
-		seed_extras(app, &obj).await;
+		let mut obj = plan_file(spec, tn_id, r);
+		obj.entry_id = seed_file(app, &obj).await;
+		seed_extras(app, &obj, &obj.entry_id).await;
 		if obj.spec.life == FileLife::Tombstoned {
 			app.meta_adapter.delete_file(obj.tn_id, &obj.file_id).await.unwrap();
 		}
@@ -482,7 +495,8 @@ fn plan_file(spec: FileSpec, tn_id: TnId, r: &Remotes) -> FileObj {
 	} else {
 		Vec::new()
 	};
-	let blob_id = (spec.kind == FileKind::Blob && spec.shape != Folder)
+	// A reference (upstream set) holds no bytes here.
+	let blob_id = (spec.kind == FileKind::Blob && spec.shape != Folder && upstream_tag.is_none())
 		.then(|| cloudillo::hasher::hash("b1", blob_data(&spec, &id).as_slice()).to_string());
 	let installed = (spec.shape == Apkg && spec.life == FileLife::Active)
 		.then(|| (format!("zqmatrix-{}", spec.name), tn.to_string()));
@@ -491,6 +505,7 @@ fn plan_file(spec: FileSpec, tn_id: TnId, r: &Remotes) -> FileObj {
 		spec,
 		tn_id,
 		file_id: id,
+		entry_id: String::new(),
 		parent_id,
 		root_id,
 		owner_tag,
@@ -511,8 +526,9 @@ fn blob_data(spec: &FileSpec, file_id: &str) -> Vec<u8> {
 	}
 }
 
-/// Write the file row (and its blob variant). Idempotent only on a missing row.
-async fn seed_file(app: &App, o: &FileObj) {
+/// Write the file row (and its blob variant) and return its `entry_id`. Idempotent only on a
+/// missing row.
+async fn seed_file(app: &App, o: &FileObj) -> String {
 	let s = &o.spec;
 	let (file_tp, content_type) = match (s.shape, s.kind) {
 		(FileShape::Folder, _) => ("FLDR", "cloudillo/folder"),
@@ -522,7 +538,7 @@ async fn seed_file(app: &App, o: &FileObj) {
 		(_, FileKind::Rtdb) => ("RTDB", "cloudillo/rtdb"),
 	};
 	// Always created pending: variants can only be attached to a pending row.
-	let fid = app
+	let created = app
 		.meta_adapter
 		.create_file(
 			o.tn_id,
@@ -543,12 +559,27 @@ async fn seed_file(app: &App, o: &FileObj) {
 				visibility: s.vis,
 				channel: s.channel.map(|c| absolute_channel(s.tn, c)),
 				hidden: false,
-				status: Some(FileStatus::Pending),
+				// A folder or a reference has nothing to finalize; it starts in its final state.
+				status: Some(
+					if (s.shape == FileShape::Folder || o.upstream_tag.is_some())
+						&& s.life != FileLife::Pending
+					{
+						FileStatus::Active
+					} else {
+						FileStatus::Pending
+					},
+				),
+				action_id: None,
 			},
 		)
 		.await
 		.unwrap();
-	let FileId::FId(f_id) = fid else { panic!("file {} already existed", o.file_id) };
+	// A folder is an entry without content, a reference (upstream set) one whose content lives
+	// upstream: nothing to attach or finalize.
+	if s.shape == FileShape::Folder || o.upstream_tag.is_some() {
+		return created.entry_id.into();
+	}
+	let FileId::FId(f_id) = created.file_id else { panic!("file {} already existed", o.file_id) };
 
 	if let Some(blob_id) = &o.blob_id {
 		let data = blob_data(s, &o.file_id);
@@ -579,22 +610,29 @@ async fn seed_file(app: &App, o: &FileObj) {
 	if s.life != FileLife::Pending {
 		app.meta_adapter.finalize_file(o.tn_id, f_id, &o.file_id).await.unwrap();
 	}
+	created.entry_id.into()
 }
 
 /// Shares, refs, the FSHR row and the app install — everything beside the file row.
-async fn seed_extras(app: &App, o: &FileObj) {
+/// Share entries and `share.file` refs name the entry, not the content.
+async fn seed_extras(app: &App, o: &FileObj, entry_id: &str) {
 	let meta = &app.meta_adapter;
 	let now = Timestamp::now();
 	for sh in &o.shares {
 		let expires_at = sh.expired.then(|| Timestamp(now.0 - 3600));
+		let subject_id = if sh.subject_type == 'F' {
+			meta.read_file(o.tn_id, &sh.subject_id).await.unwrap().unwrap().entry_id.into()
+		} else {
+			sh.subject_id.clone()
+		};
 		meta.create_share_entry(
 			o.tn_id,
 			'F',
-			&o.file_id,
+			entry_id,
 			o.spec.tn,
 			&CreateShareEntry {
 				subject_type: sh.subject_type,
-				subject_id: sh.subject_id.clone(),
+				subject_id,
 				permission: sh.perm,
 				expires_at,
 			},
@@ -613,7 +651,7 @@ async fn seed_extras(app: &App, o: &FileObj) {
 				description: Some("zqmatrix".into()),
 				expires_at: None,
 				count: None,
-				resource_id: Some(o.file_id.clone()),
+				resource_id: Some(entry_id.to_owned()),
 				access_level: Some(rf.access),
 				params: None,
 			},

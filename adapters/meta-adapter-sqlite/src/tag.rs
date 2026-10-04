@@ -26,7 +26,7 @@ pub(crate) async fn list(
 	if with_counts {
 		// Get all files with tags to count occurrences
 		let rows = sqlx::query(
-			"SELECT tags FROM files WHERE tn_id = ? AND tags IS NOT NULL AND tags != ''",
+			"SELECT tags FROM entries WHERE tn_id = ? AND tags IS NOT NULL AND tags != ''",
 		)
 		.bind(tn_id.0)
 		.fetch_all(db)
@@ -111,10 +111,12 @@ pub(crate) async fn add(
 	file_id: &str,
 	tag: &str,
 ) -> ClResult<Vec<String>> {
-	// Fetch current tags
-	let row = sqlx::query("SELECT tags FROM files WHERE tn_id = ? AND file_id = ?")
-		.bind(tn_id.0)
-		.bind(file_id)
+	// Tags live on the entry; resolve the id like read_file
+	let Some(e_id) = crate::file::resolve_entry(db, tn_id, file_id).await? else {
+		return Err(Error::NotFound);
+	};
+	let row = sqlx::query("SELECT tags FROM entries WHERE e_id = ?")
+		.bind(e_id)
 		.fetch_optional(db)
 		.await
 		.db()?;
@@ -135,10 +137,9 @@ pub(crate) async fn add(
 
 	// Update file tags
 	let tags_str = tags.join(",");
-	sqlx::query("UPDATE files SET tags = ? WHERE tn_id = ? AND file_id = ?")
+	sqlx::query("UPDATE entries SET tags = ? WHERE e_id = ?")
 		.bind(&tags_str)
-		.bind(tn_id.0)
-		.bind(file_id)
+		.bind(e_id)
 		.execute(db)
 		.await
 		.db()?;
@@ -161,10 +162,12 @@ pub(crate) async fn remove(
 	file_id: &str,
 	tag: &str,
 ) -> ClResult<Vec<String>> {
-	// Fetch current tags
-	let row = sqlx::query("SELECT tags FROM files WHERE tn_id = ? AND file_id = ?")
-		.bind(tn_id.0)
-		.bind(file_id)
+	// Tags live on the entry; resolve the id like read_file
+	let Some(e_id) = crate::file::resolve_entry(db, tn_id, file_id).await? else {
+		return Err(Error::NotFound);
+	};
+	let row = sqlx::query("SELECT tags FROM entries WHERE e_id = ?")
+		.bind(e_id)
 		.fetch_optional(db)
 		.await
 		.db()?;
@@ -183,18 +186,16 @@ pub(crate) async fn remove(
 
 	// Update file tags (or set to NULL if empty)
 	if tags.is_empty() {
-		sqlx::query("UPDATE files SET tags = NULL WHERE tn_id = ? AND file_id = ?")
-			.bind(tn_id.0)
-			.bind(file_id)
+		sqlx::query("UPDATE entries SET tags = NULL WHERE e_id = ?")
+			.bind(e_id)
 			.execute(db)
 			.await
 			.db()?;
 	} else {
 		let tags_str = tags.join(",");
-		sqlx::query("UPDATE files SET tags = ? WHERE tn_id = ? AND file_id = ?")
+		sqlx::query("UPDATE entries SET tags = ? WHERE e_id = ?")
 			.bind(&tags_str)
-			.bind(tn_id.0)
-			.bind(file_id)
+			.bind(e_id)
 			.execute(db)
 			.await
 			.db()?;

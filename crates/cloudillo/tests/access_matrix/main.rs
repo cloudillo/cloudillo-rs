@@ -141,9 +141,10 @@ async fn probe() {
 	rep.finish();
 }
 
+/// Alone: `Search` pages by offset, and a curated cell's new `MARK` blob shifts the pages.
 #[tokio::test]
 async fn file_levels() {
-	let _g = FIXTURE_LOCK.read().await;
+	let _g = FIXTURE_LOCK.write().await;
 	levels::file_levels(setup().await).await.finish();
 }
 
@@ -192,6 +193,24 @@ async fn mint() {
 	let fx = setup().await;
 	let mut rep = Report::new("mint");
 	for c in &fx.mints {
+		// A share link scopes its entry (`entry_id`, random); compare by the content it
+		// resolves to, which is what the oracle names.
+		let mut c = subjects::MintCell {
+			name: c.name.clone(),
+			host: c.host.clone(),
+			req_desc: c.req_desc.clone(),
+			status: c.status,
+			claims: c.claims.clone(),
+			parent_exp: c.parent_exp,
+		};
+		if let Some(cl) = c.claims.as_mut()
+			&& let Some(rest) = cl.scope.as_deref().and_then(|s| s.strip_prefix("file:"))
+			&& let Some((id, lvl)) = rest.rsplit_once(':')
+			&& let Ok(Some(v)) = fx.app.meta_adapter.read_file(cl.tn_id, id).await
+		{
+			cl.scope = Some(format!("file:{}:{lvl}", v.index_id()).into());
+		}
+		let c = &c;
 		let act = classify_mint(c);
 		let allowed = act == Actual::Allow;
 		rep.check(Op::Mint.name(), expected_mint(c), act, None, c.name.clone(), c.host.clone());
@@ -249,6 +268,7 @@ async fn channel() {
 
 	let mut rep = curated::run(fx, "channel", curated::cells(curated::CH)).await;
 	for (i, &(id, role, ch, want)) in CH_INBOX.iter().enumerate() {
+		rep.cell();
 		let c = InboxCell {
 			host: CLUB,
 			typ: "POST",
@@ -609,43 +629,40 @@ async fn channel_patch() {
 	assert_eq!(channel(reply).await, inherited, "the inherited room is unchanged");
 }
 
-/// A post into a remote community's room must not stamp the issuer's own attachment with that
-/// room: no local subject enters a foreign room, so only the owner could read the file.
+/// An action's managed attachment entry carries the action's audience: a stranger reads
+/// alice's Follower file through it, and loses that read when the action is deleted.
 ///
-/// The fixture runs no scheduler and alice has no pending action to finish, so this drives
-/// `stamp_file_channel` — the step `ActionCreatorTask::run` takes per attachment — directly.
+/// The fixture runs no scheduler, so this drives the adapter steps `ActionCreatorTask::run` and
+/// the action delete take, under an action id with no `actions` row. Which rooms are stamped on
+/// the entry (own rooms only) is unit-tested next to `is_local_channel` in `task.rs`.
 #[tokio::test]
-async fn foreign_channel_stamp() {
-	use cloudillo::action::task::stamp_file_channel;
-	use cloudillo::meta_adapter::UpdateFileOptions;
+async fn managed_attachment_entry() {
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
-	let room = "@club.test~open-contrib";
-	let file_of =
-		|tn: &str| format!("f1~zqm-{}-tenant-blob-f-active", tn.trim_end_matches(".test"));
-	let channel = |tn_id, file: String| async move {
-		let f = fx.app.meta_adapter.read_file(tn_id, &file).await.unwrap().expect("file");
-		f.channel.map(String::from)
-	};
-
-	// alice posts into club's room: alice's own file stays unstamped.
-	let (alice, alice_file) = (fx.tenants.alice.tn_id, file_of(ALICE));
-	stamp_file_channel(&fx.app, alice, ALICE, &alice_file, room).await.unwrap();
-	assert_eq!(channel(alice, alice_file.clone()).await, None, "a foreign room is not stamped");
-	// Visibility is unchanged: a stranger still cannot read the Follower file.
+	let alice = fx.tenants.alice.tn_id;
+	let file = "f1~zqm-alice-tenant-blob-f-active";
 	let stranger = fx.subjects.iter().find(|s| s.name == "stranger@alice.test").expect("stranger");
-	let uri = format!("/api/files/{alice_file}/descriptor");
-	let (status, _) =
-		call(&fx.api, req(ALICE, Method::GET, &uri, bearer(stranger), Body::empty())).await;
-	assert!(!status.is_success(), "stranger reads alice's Follower file: {status}");
+	let uri = format!("/api/files/{file}/descriptor");
+	let read = || call(&fx.api, req(ALICE, Method::GET, &uri, bearer(stranger), Body::empty()));
 
-	// club posts into its own room: the stamp lands.
-	let (club, club_file) = (fx.tenants.club.tn_id, file_of(CLUB));
-	stamp_file_channel(&fx.app, club, CLUB, &club_file, room).await.unwrap();
-	let stamped = channel(club, club_file.clone()).await;
-	let opts = UpdateFileOptions { channel: Patch::Null, ..Default::default() };
-	fx.app.meta_adapter.update_file_data(club, &club_file, &opts).await.unwrap();
-	assert_eq!(stamped.as_deref(), Some(room), "an own room is stamped");
+	assert!(!read().await.0.is_success(), "stranger reads alice's Follower file");
+	let action = "a1~managed-entry-test";
+	let ma = &fx.app.meta_adapter;
+	let entry = ma
+		.create_managed_entry(alice, file, "zqm", Some(action), Some('P'), None)
+		.await
+		.unwrap();
+	let again = ma
+		.create_managed_entry(alice, file, "zqm", Some(action), Some('P'), None)
+		.await
+		.unwrap();
+	assert_eq!(entry, again, "one managed entry per (file, action)");
+	let (status, _) = read().await;
+	assert!(status.is_success(), "stranger reads through the public managed entry: {status}");
+
+	ma.delete_action(alice, action).await.unwrap();
+	assert!(!read().await.0.is_success(), "the managed entry goes with its action");
+	assert!(ma.read_file(alice, file).await.unwrap().is_some(), "the user entry stays");
 }
 
 /// The owner's own `file:` app token keeps tenant level inside its scope: it lists a hidden
@@ -723,6 +740,7 @@ async fn hat_aprv_room() {
 	let club = fx.tenants.club.tn_id;
 	let mut rep = Report::new("hat-aprv-room");
 	for (i, &(id, signer, post_ch, aprv_ch, want)) in HAT_APRV_ROOM.iter().enumerate() {
+		rep.cell();
 		let stranger;
 		let signer = if signer == "peer" {
 			&fx.peer
@@ -905,6 +923,7 @@ async fn attachment_audience() {
 	let mut rep = Report::new("attachment-audience");
 	let mut check =
 		|id: &'static str, subject: &'static str, object: &str, want: &str, act: &str| {
+			rep.cell();
 			if act != want {
 				rep.add(Mismatch {
 					op: "file:read:action-hint".into(),
@@ -928,6 +947,39 @@ async fn attachment_audience() {
 	let act = probe("AAT-02v", "direct@alice.test", path.clone()).await;
 	check("AAT-02v", "direct@alice.test", &path, "Allow", act);
 
+	// Metadata shares the guard and reports the level the `?action=` grant gives. Probed again
+	// once the content also has the managed entry publishing adds: the id then names two
+	// entries, which must not 409.
+	let meta_rows: &[AttachRow] = &[
+		("AAT-02m", "direct@alice.test", 'D', "A2", "Allow"),
+		("AAT-03m", "direct@alice.test", 'D', "-", "Deny"),
+		("AAT-06m", "stranger@alice.test", 'D', "A3", "Deny"),
+	];
+	let a2 = "a1~zqm-attach-A2";
+	for managed in [false, true] {
+		if managed {
+			fx.app
+				.meta_adapter
+				.create_managed_entry(alice, &d_file.file_id, "x", Some(a2), Some('F'), None)
+				.await
+				.unwrap();
+		}
+		for &(id, subject, _, action, want) in meta_rows {
+			let path = format!("/api/files/{}/metadata{}", d_file.file_id, query(action));
+			let s = fx.subjects.iter().find(|s| s.name == subject).expect(subject);
+			let (status, body) =
+				call(&fx.api, req(ALICE, Method::GET, &path, bearer(s), Body::empty())).await;
+			assert!(status.is_success() || status.is_client_error(), "{id}: {status} {body}");
+			if status.is_success() {
+				assert_eq!(body["data"]["accessLevel"], "read", "{id}: {body}");
+			}
+			assert_ne!(status, StatusCode::CONFLICT, "{id}: {body}");
+			let act = if status.is_success() { "Allow" } else { "Deny" };
+			check(id, subject, &path, want, act);
+		}
+	}
+	fx.app.meta_adapter.delete_managed_entries(alice, a2).await.unwrap();
+
 	// A deleted action grants nothing.
 	let opts = UpdateActionDataOptions { status: Patch::Value('D'), ..Default::default() };
 	fx.app
@@ -942,3 +994,2804 @@ async fn attachment_audience() {
 }
 
 // vim: ts=4
+
+/// A direct share created through the API after v58 is keyed by the entry: it grants, and
+/// PATCH / DELETE find it again. The stranger is denied before and after.
+#[tokio::test]
+async fn share_lifecycle() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let file = fx
+		.objs
+		.iter()
+		.find_map(|o| match o {
+			fixture::Obj::File(f) if f.spec.name == "tenant-blob-d-active" && f.tn_id == alice => {
+				Some(f.file_id.clone())
+			}
+			_ => None,
+		})
+		.expect("tenant-blob-d-active@alice");
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let (owner, stranger) = (subj("owner@alice"), subj("stranger@alice.test"));
+	let stranger_tag = stranger.facts.id_tag.clone().expect("stranger id_tag");
+	let send = |s: &'static subjects::Subject, m: Method, uri: String, body: String| async move {
+		call(&fx.api, req(ALICE, m, &uri, bearer(s), Body::from(body))).await
+	};
+	let meta = format!("/api/files/{file}/metadata");
+	let shares = format!("/api/files/{file}/shares");
+
+	let (st, _) = send(stranger, Method::GET, meta.clone(), String::new()).await;
+	assert!(!st.is_success(), "stranger reads a private file: {st}");
+
+	let body = format!(r#"{{"subjectType":"U","subjectId":"{stranger_tag}","permission":"R"}}"#);
+	let (st, created) = send(owner, Method::POST, shares.clone(), body).await;
+	assert!(st.is_success(), "create share: {st} {created}");
+	let id = created["data"]["id"].as_i64().expect("share id");
+	let entry_id = fx.app.meta_adapter.read_file(alice, &file).await.unwrap().unwrap().entry_id;
+	assert_eq!(created["data"]["resourceId"].as_str(), Some(&*entry_id), "keyed by entry");
+
+	let (st, body) = send(stranger, Method::GET, meta.clone(), String::new()).await;
+	assert!(st.is_success(), "the new share grants: {st} {body}");
+
+	let one = format!("{shares}/{id}");
+	let (st, body) = send(owner, Method::PATCH, one.clone(), r#"{"permission":"W"}"#.into()).await;
+	assert!(st.is_success(), "update share: {st} {body}");
+	let (st, body) = send(owner, Method::DELETE, one, String::new()).await;
+	assert!(st.is_success(), "delete share: {st} {body}");
+
+	let (st, _) = send(stranger, Method::GET, meta, String::new()).await;
+	assert!(!st.is_success(), "the deleted share still grants: {st}");
+}
+
+/// One BLOB, two entries: a public one behind a share link and a Direct one in a room. The
+/// link lists only its own entry; the room placement's name and id never leak.
+#[tokio::test]
+async fn share_link_sees_only_its_entry() {
+	use cloudillo::meta_adapter::{CreateRefOptions, SHARE_FILE_REF_TYPE};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let room = format!("@{ALICE}~close-friends");
+	let public = seed_blob(fx, alice, "multi", "zqm-multi-public", Some('P'), None, None).await;
+	let secret = seed_blob(fx, alice, "multi", "zqm-multi-secret", None, Some(&room), None).await;
+	let secret_content = meta.read_file(alice, &secret).await.unwrap().expect("secret entry");
+	assert_eq!(
+		secret_content.index_id(),
+		"f1~zqm-multi",
+		"the second upload must dedup onto the same content"
+	);
+	meta.create_ref(
+		alice,
+		"zqref-multi",
+		&CreateRefOptions {
+			typ: SHARE_FILE_REF_TYPE.into(),
+			description: None,
+			expires_at: None,
+			count: None,
+			resource_id: Some(public.to_string()),
+			access_level: Some('R'),
+			params: None,
+		},
+	)
+	.await
+	.unwrap();
+
+	let mint =
+		req(ALICE, Method::GET, "/api/auth/access-token?refId=zqref-multi", None, Body::empty());
+	let (st, body) = call(&fx.api, mint).await;
+	assert!(st.is_success(), "mint: {st} {body}");
+	let token = find_str(&body, "token").expect("link token");
+	let get = |uri: String| {
+		let token = token.clone();
+		async move { call(&fx.api, req(ALICE, Method::GET, &uri, Some(&token), Body::empty())).await }
+	};
+
+	let (st, list) = get("/api/files".into()).await;
+	assert!(st.is_success(), "list: {st} {list}");
+	let list = list.to_string();
+	assert!(list.contains(&*public), "the link's own entry is listed: {list}");
+	assert!(!list.contains(&*secret), "the room entry leaked: {list}");
+	assert!(!list.contains("zqm-multi-secret"), "the room entry's name leaked: {list}");
+
+	let (st, _) = get(format!("/api/files/{}/metadata", secret)).await;
+	assert!(!st.is_success(), "the link reads the room entry: {st}");
+
+	// Search: the link's hits carry its own entry's name, never the sibling's.
+	cloudillo_search::objects::index_file(&fx.app, alice, "f1~zqm-multi")
+		.await
+		.unwrap();
+	let (st, hits) = get("/api/search?q=multi".into()).await;
+	assert!(st.is_success(), "search: {st} {hits}");
+	let hits = hits.to_string();
+	assert!(hits.contains("zqm-multi-public"), "the linked entry is found: {hits}");
+	assert!(!hits.contains("zqm-multi-secret"), "the sibling's name leaked: {hits}");
+
+	// The link token does no placement write on the sibling entry.
+	let secret_uri = format!("/api/files/{}", secret);
+	for (m, body) in [(Method::PATCH, r#"{"fileName":"zqm-pwned"}"#), (Method::DELETE, "")] {
+		let r = req(ALICE, m.clone(), &secret_uri, Some(&token), Body::from(body));
+		let (st, _) = call(&fx.api, r).await;
+		assert!(!st.is_success(), "link token {m} on the sibling entry: {st}");
+	}
+
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let (owner, stranger) = (subj("owner@alice"), subj("stranger@alice.test"));
+	let send = |s: &'static subjects::Subject, m: Method, uri: String, body: &'static str| async move {
+		call(&fx.api, req(ALICE, m, &uri, bearer(s), Body::from(body))).await
+	};
+	let descriptor = "/api/files/f1~zqm-multi/descriptor".to_owned();
+
+	// Union over entries: a stranger reads the content through the public entry, but cannot list or
+	// read the room entry.
+	let (st, body) = send(stranger, Method::GET, descriptor.clone(), "").await;
+	assert!(st.is_success(), "stranger reads via the public entry: {st} {body}");
+	let (st, _) = send(stranger, Method::GET, format!("{secret_uri}/metadata"), "").await;
+	assert!(!st.is_success(), "stranger reads the room entry: {st}");
+	let (_, list) = send(stranger, Method::GET, "/api/files?fileId=f1~zqm-multi".into(), "").await;
+	let list = list.to_string();
+	assert!(!list.contains(&*secret), "stranger lists the room entry: {list}");
+	assert!(!list.contains("zqm-multi-secret"), "stranger sees the room entry's name: {list}");
+
+	// A content id naming two entries is ambiguous on a placement endpoint.
+	let content_uri = "/api/files/f1~zqm-multi".to_owned();
+	let (st, body) = send(owner, Method::PATCH, content_uri, r#"{"fileName":"zqm-x"}"#).await;
+	assert_eq!(st, StatusCode::CONFLICT, "ambiguous content id: {body}");
+
+	// Trashing the public entry leaves the stranger nothing: the room entry is Direct.
+	let (st, body) = send(owner, Method::DELETE, format!("/api/files/{}", public), "").await;
+	assert!(st.is_success(), "trash the public entry: {st} {body}");
+	let (st, _) = send(stranger, Method::GET, descriptor, "").await;
+	assert!(!st.is_success(), "a trashed public entry still grants: {st}");
+	// Nor does the link to it find anything any more.
+	cloudillo_search::objects::index_file(&fx.app, alice, "f1~zqm-multi")
+		.await
+		.unwrap();
+	let (st, hits) = get("/api/search?q=multi".into()).await;
+	assert!(st.is_success(), "search: {st} {hits}");
+	assert!(!hits.to_string().contains("f1~zqm-multi"), "a trashed link finds the content: {hits}");
+}
+
+/// Seed one Active BLOB entry over content `f1~zqm-{key}` (dedup on a repeat): its `entry_id`.
+/// With `upstream` set it is a reference instead: an entry naming the content, holding no bytes.
+async fn seed_blob(
+	fx: &Fixture,
+	tn: cloudillo::types::TnId,
+	key: &str,
+	name: &str,
+	visibility: Option<char>,
+	channel: Option<&str>,
+	upstream: Option<&str>,
+) -> Box<str> {
+	use cloudillo::meta_adapter::{CreateFile, FileId, FileVariant};
+	let meta = &fx.app.meta_adapter;
+	let blob = format!("b1~zqm-{key}");
+	let created = meta
+		.create_file(
+			tn,
+			CreateFile {
+				preset: Some("default".into()),
+				orig_variant_id: Some(blob.as_str().into()),
+				// A reference names its content up front; an upload learns it at finalize.
+				file_id: upstream.map(|_| format!("f1~zqm-{key}").into()),
+				content_type: "text/plain".into(),
+				file_name: name.into(),
+				file_tp: Some("BLOB".into()),
+				visibility,
+				channel: channel.map(Into::into),
+				upstream_tag: upstream.map(Into::into),
+				status: upstream.map(|_| cloudillo::meta_adapter::FileStatus::Active),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	if let FileId::FId(f_id) = created.file_id {
+		let variant = FileVariant {
+			variant_id: blob.as_str(),
+			variant: "orig",
+			format: "txt",
+			size: 1,
+			resolution: (0, 0),
+			available: true,
+			global: false,
+			duration: None,
+			bitrate: None,
+			page_count: None,
+		};
+		meta.create_file_variant(tn, f_id, variant).await.unwrap();
+		meta.finalize_file(tn, f_id, &format!("f1~zqm-{key}")).await.unwrap();
+	}
+	created.entry_id
+}
+
+/// Rooms as drives on club: a room folder's child lands in the room and
+/// only who may enter the room creates there; a cross-drive move of a folder the caller does not
+/// own needs a moderator and re-stamps the subtree; a room holding files cannot be deleted; one
+/// image in two rooms is read by each room's members through its own entry.
+#[tokio::test]
+async fn room_drives() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let send = |n: &'static str, m: Method, uri: String, v: serde_json::Value| async move {
+		let body = if v.is_null() { Body::empty() } else { Body::from(v.to_string()) };
+		call(&fx.api, req(CLUB, m, &uri, bearer(subj(n)), body)).await
+	};
+	let room = "@club.test~open-contrib";
+	let mk = |n: &'static str, v: serde_json::Value| send(n, Method::POST, "/api/files".into(), v);
+	let (st, body) = mk(
+		"owner@club",
+		serde_json::json!({ "fileTp": "FLDR", "fileName": "zqm-room-dir", "channel": room }),
+	)
+	.await;
+	assert!(st.is_success(), "room folder: {st} {body}");
+	let dir = find_str(&body, "entryId").expect("folder entryId");
+	let child = |name: &str| {
+		serde_json::json!({
+			"fileTp": "CRDT", "contentType": "cloudillo/quillo", "fileName": name, "parentId": dir,
+		})
+	};
+
+	// The child takes the folder's room.
+	let (st, body) = mk("owner@club", child("zqm-room-child")).await;
+	assert!(st.is_success(), "create in room folder: {st} {body}");
+	let kid = find_str(&body, "entryId").expect("child entryId");
+	let channel = |id: String| async move {
+		meta.read_file(club, &id)
+			.await
+			.unwrap()
+			.expect("entry")
+			.channel
+			.map(String::from)
+	};
+	assert_eq!(channel(kid.clone()).await.as_deref(), Some(room), "child stamped with the room");
+
+	for n in [
+		"m-follower@club.test",
+		"m-supporter@club.test",
+		"stranger@club.test",
+		"g-write@club.test",
+	] {
+		let (st, body) = mk(n, child("zqm-room-intruder")).await;
+		assert!(st.is_client_error(), "{n} creates in a room folder: {st} {body}");
+	}
+
+	// Cross-drive move of the tenant's folder to the main drive.
+	let to_main = serde_json::json!({ "parentId": null, "channel": null });
+	let uri = format!("/api/files/{dir}");
+	for n in [
+		"m-contributor@club.test",
+		"m-follower@club.test",
+		"m-supporter@club.test",
+		"g-write@club.test",
+		"stranger@club.test",
+		"anon@club.test",
+		"sharelink-w@club",
+	] {
+		let (st, body) = send(n, Method::PATCH, uri.clone(), to_main.clone()).await;
+		assert!(st.is_client_error(), "{n} moves another's folder across drives: {st} {body}");
+		assert_eq!(channel(kid.clone()).await.as_deref(), Some(room), "{n}: subtree unchanged");
+	}
+
+	// The room holds files, so it cannot be deleted.
+	let (st, body) = send(
+		"owner@club",
+		Method::DELETE,
+		"/api/channels/open-contrib".into(),
+		serde_json::Value::Null,
+	)
+	.await;
+	assert_eq!(st, StatusCode::CONFLICT, "delete a room with files: {body}");
+	let count = body["error"]["details"]["fileCount"].as_u64().unwrap_or(0);
+	assert!(count >= 2, "fileCount counts the folder subtree: {body}");
+
+	// The moderator's move re-stamps the whole subtree; ids do not change.
+	let (st, body) = send("m-moderator@club.test", Method::PATCH, uri, to_main).await;
+	assert!(st.is_success(), "moderator moves across drives: {st} {body}");
+	assert_eq!(channel(dir.clone()).await, None, "folder in the main drive");
+	assert_eq!(channel(kid.clone()).await, None, "child re-stamped to the main drive");
+
+	// One image, two rooms; each room's member reads it through that room's entry.
+	let key = "two-rooms";
+	seed_blob(fx, club, key, "zqm-oc", Some('P'), Some(room), None).await;
+	seed_blob(fx, club, key, "zqm-mods", Some('P'), Some("@club.test~mods"), None).await;
+	let desc = format!("/api/files/f1~zqm-{key}/descriptor");
+	for (n, ok) in [
+		("m-contributor@club.test", true),
+		("m-moderator@club.test", true),
+		("m-supporter@club.test", false),
+		("stranger@club.test", false),
+	] {
+		let (st, body) = send(n, Method::GET, desc.clone(), serde_json::Value::Null).await;
+		assert_eq!(st.is_success(), ok, "{n} reads the two-room image: {st} {body}");
+	}
+}
+
+/// Same-drive moves on alice: the target folder must take the entry (Write), a folder never
+/// lands inside itself, and leaving `__trash__` is a move like any other.
+#[tokio::test]
+async fn same_drive_moves() {
+	use cloudillo::meta_adapter::CreateShareEntry;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let send = |n: &'static str, m: Method, uri: String, v: serde_json::Value| async move {
+		let body = if v.is_null() { Body::empty() } else { Body::from(v.to_string()) };
+		call(&fx.api, req(ALICE, m, &uri, bearer(subj(n)), body)).await
+	};
+	let mk = |tp: &str, name: &str, parent: Option<&str>| {
+		let v = serde_json::json!({
+			"fileTp": tp, "contentType": "cloudillo/quillo", "fileName": name, "parentId": parent,
+		});
+		async move {
+			let (st, body) = send("owner@alice", Method::POST, "/api/files".into(), v).await;
+			assert!(st.is_success(), "create {st} {body}");
+			find_str(&body, "entryId").expect("entryId")
+		}
+	};
+	let share = |n: &'static str, entry: String, permission: char| async move {
+		let id_tag = subj(n).facts.id_tag.clone().expect("grantee id_tag");
+		let sh = CreateShareEntry {
+			subject_type: 'U',
+			subject_id: id_tag,
+			permission,
+			expires_at: None,
+		};
+		meta.create_share_entry(alice, 'F', &entry, ALICE, &sh).await.unwrap();
+	};
+	let parent_of = |id: String| async move {
+		meta.read_file(alice, &id)
+			.await
+			.unwrap()
+			.expect("entry")
+			.parent_id
+			.map(String::from)
+	};
+	let move_to = |n: &'static str, id: &str, parent: &str| {
+		let v = serde_json::json!({ "parentId": parent });
+		send(n, Method::PATCH, format!("/api/files/{id}"), v)
+	};
+
+	// g-folder writes `dir` (and its subtree), nothing else.
+	let dir = mk("FLDR", "zqm-mv-dir", None).await;
+	let sub = mk("FLDR", "zqm-mv-sub", Some(&dir)).await;
+	let other = mk("FLDR", "zqm-mv-other", None).await;
+	let doc = mk("CRDT", "zqm-mv-doc", Some(&dir)).await;
+	share("g-folder@alice.test", dir.clone(), 'W').await;
+
+	let (st, body) = move_to("g-folder@alice.test", &doc, &other).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "move into a folder without Write: {body}");
+	assert_eq!(parent_of(doc.clone()).await.as_deref(), Some(dir.as_str()), "doc unmoved");
+
+	// No grant on the entry at all, or a credential that carries none: no move.
+	for n in [
+		"stranger@alice.test",
+		"follower@alice.test",
+		"anon@alice.test",
+		"sharelink-r@alice",
+		"sharelink-w@alice",
+		"idp-key@alice",
+		"g-read@alice.test",
+	] {
+		let (st, body) = move_to(n, &doc, &sub).await;
+		assert!(st.is_client_error(), "{n} moves the doc: {st} {body}");
+		assert_eq!(parent_of(doc.clone()).await.as_deref(), Some(dir.as_str()), "{n}: doc unmoved");
+	}
+
+	let (st, body) = move_to("g-folder@alice.test", &doc, &sub).await;
+	assert!(st.is_success(), "move into a writable folder: {st} {body}");
+	assert_eq!(parent_of(doc.clone()).await.as_deref(), Some(sub.as_str()), "doc moved");
+
+	// The lifecycle sentinels are no move target: trashing is DELETE (with its own gate), and
+	// the managed folder is internal. Not even the owner moves there by PATCH.
+	for target in ["__trash__", "__managed__"] {
+		for n in ["g-folder@alice.test", "owner@alice"] {
+			let (st, body) = move_to(n, &doc, target).await;
+			assert_eq!(st, StatusCode::BAD_REQUEST, "{n} moves into {target}: {body}");
+		}
+		for n in [
+			"stranger@alice.test",
+			"follower@alice.test",
+			"anon@alice.test",
+			"sharelink-r@alice",
+			"sharelink-w@alice",
+			"idp-key@alice",
+			"g-read@alice.test",
+		] {
+			let (st, body) = move_to(n, &doc, target).await;
+			assert!(st.is_client_error(), "{n} moves the doc into {target}: {st} {body}");
+		}
+		let parent = parent_of(doc.clone()).await;
+		assert_eq!(parent.as_deref(), Some(sub.as_str()), "doc moved into {target}");
+	}
+
+	// Cycle guard: even the owner cannot put a folder inside itself or its descendant.
+	for target in [&dir, &sub] {
+		let (st, body) = move_to("owner@alice", &dir, target).await;
+		assert_eq!(st, StatusCode::BAD_REQUEST, "folder into its own subtree: {body}");
+	}
+	assert_eq!(parent_of(dir.clone()).await, None, "dir unmoved");
+
+	// Out of the trash into a folder the caller cannot write. An Admin grantee still sees the
+	// trashed entry (a Write grantee gets 404, so it never reaches the target check).
+	let loose = mk("CRDT", "zqm-mv-trashed", None).await;
+	share("g-admin@alice.test", loose.clone(), 'A').await;
+	let (st, body) =
+		send("owner@alice", Method::DELETE, format!("/api/files/{loose}"), serde_json::Value::Null)
+			.await;
+	assert!(st.is_success(), "trash: {st} {body}");
+	let (st, body) = move_to("g-admin@alice.test", &loose, &other).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "leave the trash into a non-writable folder: {body}");
+	assert_eq!(parent_of(loose).await.as_deref(), Some("__trash__"), "still trashed");
+
+	// A move to the root is a create there: a folder-scoped write link stays inside its folder,
+	// and a credential that names alice without being her never reaches the root.
+	let scoped = mk("FLDR", "zqm-mv-scoped", None).await;
+	let inner = mk("FLDR", "zqm-mv-inner", Some(&scoped)).await;
+	let leaf = mk("CRDT", "zqm-mv-leaf", Some(&scoped)).await;
+	let standalone = mk("CRDT", "zqm-mv-standalone", None).await;
+	let token = link_token(fx, alice, ALICE, "zqref-mv-w", &scoped, 'W').await;
+	let link = |m: Method, uri: String, v: serde_json::Value| {
+		let token = token.clone();
+		async move {
+			let body = if v.is_null() { Body::empty() } else { Body::from(v.to_string()) };
+			call(&fx.api, req(ALICE, m, &uri, Some(&token), body)).await
+		}
+	};
+	let to_root = serde_json::json!({ "parentId": null });
+	let (st, body) = link(Method::PATCH, format!("/api/files/{leaf}"), to_root.clone()).await;
+	assert!(st.is_client_error(), "folder link moves to the root: {st} {body}");
+	for n in ["sharelink-w@alice", "idp-key@alice"] {
+		let (st, body) =
+			send(n, Method::PATCH, format!("/api/files/{leaf}"), to_root.clone()).await;
+		assert!(st.is_client_error(), "{n} moves to the root: {st} {body}");
+	}
+	assert_eq!(parent_of(leaf.clone()).await.as_deref(), Some(scoped.as_str()), "leaf unmoved");
+	// A folder has no content id: its scope never matches a standalone file's (absent) root.
+	let uri = format!("/api/files/{standalone}/metadata");
+	let (st, body) = link(Method::GET, uri, serde_json::Value::Null).await;
+	assert!(!st.is_success(), "folder link reads a standalone file: {st} {body}");
+	let v = serde_json::json!({ "parentId": inner });
+	let (st, body) = link(Method::PATCH, format!("/api/files/{leaf}"), v).await;
+	assert!(st.is_success(), "folder link moves inside its folder: {st} {body}");
+	assert_eq!(parent_of(leaf).await.as_deref(), Some(inner.as_str()), "leaf moved");
+}
+
+/// `PATCH {status}` is no back door around DELETE: `'D'` is a tombstone the GC hard-deletes.
+/// Only `'A'` is accepted, and only under the lifecycle gate. Semantic twin of curated `FC-02`
+/// (a Write grantee may not delete).
+#[tokio::test]
+async fn patch_status_is_lifecycle_gated() {
+	use cloudillo::meta_adapter::{CreateShareEntry, FileStatus};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let send = |n: &'static str, m: Method, uri: String, v: serde_json::Value| async move {
+		call(&fx.api, req(ALICE, m, &uri, bearer(subj(n)), Body::from(v.to_string()))).await
+	};
+	let mk = |tp: &str, name: &str, parent: Option<&str>| {
+		let v = serde_json::json!({
+			"fileTp": tp, "contentType": "cloudillo/quillo", "fileName": name, "parentId": parent,
+		});
+		async move {
+			let (st, body) = send("owner@alice", Method::POST, "/api/files".into(), v).await;
+			assert!(st.is_success(), "create {st} {body}");
+			find_str(&body, "entryId").expect("entryId")
+		}
+	};
+	let dir = mk("FLDR", "zqm-st-dir", None).await;
+	let doc = mk("CRDT", "zqm-st-doc", Some(&dir)).await;
+	let id_tag = subj("g-folder@alice.test").facts.id_tag.clone().expect("grantee id_tag");
+	let sh = CreateShareEntry {
+		subject_type: 'U',
+		subject_id: id_tag,
+		permission: 'W',
+		expires_at: None,
+	};
+	meta.create_share_entry(alice, 'F', &dir, ALICE, &sh).await.unwrap();
+	let uri = format!("/api/files/{doc}");
+
+	for n in ["g-folder@alice.test", "sharelink-w@alice", "idp-key@alice"] {
+		let (st, body) =
+			send(n, Method::PATCH, uri.clone(), serde_json::json!({"status": "D"})).await;
+		assert!(st.is_client_error(), "{n} tombstones via PATCH: {st} {body}");
+		let row = meta.read_file(alice, &doc).await.unwrap().expect("doc");
+		assert!(matches!(row.status, FileStatus::Active), "{n}: doc no longer active");
+	}
+	let (st, body) =
+		send("owner@alice", Method::PATCH, uri.clone(), serde_json::json!({"status": "X"})).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "owner writes an unknown status: {body}");
+	let (st, body) =
+		send("owner@alice", Method::PATCH, uri, serde_json::json!({"status": "D"})).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "even the owner deletes through DELETE: {body}");
+	let row = meta.read_file(alice, &doc).await.unwrap().expect("doc");
+	assert!(matches!(row.status, FileStatus::Active), "doc no longer active");
+}
+
+/// An FSHR-accepted reference (owner NULL) is republishable by nobody, and duplicating it — which
+/// would copy bytes it does not hold — must not hand the copier that right either.
+#[tokio::test]
+async fn duplicating_a_mirror_does_not_launder_publish_rights() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let send = |n: &'static str, m: Method, uri: String, v: serde_json::Value| async move {
+		call(&fx.api, req(ALICE, m, &uri, bearer(subj(n)), Body::from(v.to_string()))).await
+	};
+	let up = subj("connected@alice.test").facts.id_tag.clone().expect("connected id_tag");
+	let mirror = seed_blob(fx, alice, "dup-mirror", "zqm-dup-mirror", None, None, Some(&up)).await;
+	let publish = serde_json::json!({ "visibility": "P" });
+
+	let (st, body) =
+		send("owner@alice", Method::PATCH, format!("/api/files/{mirror}"), publish.clone()).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "the mirror itself is not republishable: {body}");
+
+	// A reference holds no bytes here, so there is nothing to copy, let alone republish.
+	let dup = format!("/api/files/{mirror}/duplicate");
+	let (st, body) = send("owner@alice", Method::POST, dup, serde_json::json!({})).await;
+	assert!(!st.is_success(), "duplicated a reference: {st} {body}");
+
+	// A managed sync mirror (an inbound attachment) is published by its action alone; a copy
+	// would be the copier's, so it is refused, whatever the target parent.
+	let sync = "f1~zqm-dup-sync";
+	fx.app
+		.meta_adapter
+		.create_file(
+			alice,
+			cloudillo::meta_adapter::CreateFile {
+				preset: Some("sync".into()),
+				orig_variant_id: Some("b1~zqm-dup-sync".into()),
+				content_type: "text/plain".into(),
+				file_name: "zqm-dup-sync".into(),
+				file_tp: Some("BLOB".into()),
+				parent_id: Some(cloudillo::meta_adapter::MANAGED_PARENT_ID.into()),
+				action_id: Some("a1~zqm-dup-sync".into()),
+				status: Some(cloudillo::meta_adapter::FileStatus::Active),
+				file_id: Some(sync.into()),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	seed_action(fx, alice, "a1~zqm-dup-sync", &up).await;
+	for v in [serde_json::json!({ "parentId": null }), serde_json::json!({})] {
+		let dup = format!("/api/files/{sync}/duplicate");
+		let (st, body) = send("owner@alice", Method::POST, dup, v.clone()).await;
+		assert_eq!(st, StatusCode::FORBIDDEN, "duplicated a sync mirror with {v}: {body}");
+	}
+	let entries = fx.app.meta_adapter.list_content_entries(alice, sync).await.unwrap();
+	assert_eq!(entries.len(), 1, "a refused duplicate left an entry: {entries:?}");
+}
+
+/// A document-tree part is not duplicable: a top-level copy cannot carry `root_id`, so it would
+/// miss the upload dedup. Refused before anything is written — no junk entry is left behind.
+#[tokio::test]
+async fn duplicating_a_tree_part_is_refused_and_writes_nothing() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let owner = fx.subjects.iter().find(|s| s.name == "owner@alice").expect("owner");
+	let send = |uri: &str, v: serde_json::Value| {
+		call(&fx.api, req(ALICE, Method::POST, uri, bearer(owner), Body::from(v.to_string())))
+	};
+	let doc = serde_json::json!({
+		"fileTp": "CRDT", "contentType": "cloudillo/quillo", "fileName": "zqm-m4-doc"
+	});
+	let (st, body) = send("/api/files", doc).await;
+	assert!(st.is_success(), "doc: {st} {body}");
+	let doc = find_str(&body, "fileId").expect("doc fileId");
+	let part =
+		seed_part(fx, alice, "b1~zqm-m4-bytes", Some(&doc), None, "zqm-m4-part", "f1~zqm-m4").await;
+
+	let copy = serde_json::json!({ "fileName": "zqm-m4-copy" });
+	let (st, body) = send(&format!("/api/files/{part}/duplicate"), copy).await;
+	assert!(st.is_client_error(), "duplicated a tree part: {st} {body}");
+	let opts = cloudillo::meta_adapter::ListFileOptions {
+		file_name: Some("zqm-m4-copy".into()),
+		..Default::default()
+	};
+	let left = fx.app.meta_adapter.list_files(alice, &opts).await.unwrap();
+	assert!(left.is_empty(), "a refused duplicate left an entry: {left:?}");
+	// Non-owners are refused too (they cannot even read the part).
+	for n in ["stranger@alice.test", "sharelink-w@alice", "idp-key@alice"] {
+		let s = fx.subjects.iter().find(|s| s.name == n).expect(n);
+		let uri = format!("/api/files/{part}/duplicate");
+		let r = req(ALICE, Method::POST, &uri, bearer(s), Body::from("{}"));
+		let (st, _) = call(&fx.api, r).await;
+		assert!(!st.is_success(), "{n} duplicates a tree part: {st}");
+	}
+}
+
+/// A fresh remote with its key cached and a Connected profile on alice.
+async fn connected_remote(fx: &Fixture, name: &str) -> fixture::RemoteId {
+	let id = remote(name);
+	let meta = &fx.app.meta_adapter;
+	meta.add_profile_public_key(&id.id_tag, &id.key_id, &id.spki_b64, None)
+		.await
+		.unwrap();
+	let mut f = prof(ProfileType::Person);
+	f.follower = Patch::Value(true);
+	f.following = Patch::Value(true);
+	f.connected = Patch::Value(ProfileConnectionStatus::Connected);
+	meta.upsert_profile(fx.tenants.alice.tn_id, &id.id_tag, &f).await.unwrap();
+	id
+}
+
+/// POST `claims` signed by `issuer` to alice's `/api/inbox/sync`: the status and action id.
+async fn inbox_sync(
+	fx: &Fixture,
+	issuer: &fixture::RemoteId,
+	claims: &cloudillo::auth_adapter::ActionToken,
+) -> (StatusCode, Box<str>) {
+	let token = fixture::sign(issuer, claims);
+	let action_id = cloudillo::hasher::hash("a", token.as_bytes());
+	let body = Body::from(serde_json::json!({ "token": token }).to_string());
+	let (st, _) = call(&fx.api, req(ALICE, Method::POST, "/api/inbox/sync", None, body)).await;
+	(st, action_id)
+}
+
+/// An `FSHR` action token from `issuer` to alice naming `subject`.
+fn fshr_token(
+	issuer: &fixture::RemoteId,
+	sub_typ: &str,
+	subject: &str,
+) -> cloudillo::auth_adapter::ActionToken {
+	cloudillo::auth_adapter::ActionToken {
+		iss: issuer.id_tag.as_str().into(),
+		k: issuer.key_id.as_str().into(),
+		t: format!("FSHR:{sub_typ}").into(),
+		c: Some(serde_json::json!({
+			"contentType": "text/plain", "fileName": "zqm-fshr-in", "fileTp": "BLOB"
+		})),
+		aud: Some(ALICE.into()),
+		sub: Some(subject.into()),
+		iat: cloudillo::types::Timestamp::now(),
+		..Default::default()
+	}
+}
+
+/// FSHR names the *content*: a received share, once accepted, mirrors the sender's content hash
+/// as the recipient row's `file_id`. A forged FSHR naming content we mirror from someone else
+/// is refused at receive.
+#[tokio::test]
+async fn fshr_receive_mirrors_the_content_id() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let up = connected_remote(fx, "zqm-fshr-up").await;
+	let forger = connected_remote(fx, "zqm-fshr-forger").await;
+	let owner = fx.subjects.iter().find(|s| s.name == "owner@alice").expect("owner");
+
+	let shared = "f1~zqm-fshr-received";
+	let (st, action_id) = inbox_sync(fx, &up, &fshr_token(&up, "WRITE", shared)).await;
+	assert!(st.is_success(), "FSHR delivery: {st}");
+	let uri = format!("/api/actions/{action_id}/accept");
+	let (st, body) =
+		call(&fx.api, req(ALICE, Method::POST, &uri, bearer(owner), Body::empty())).await;
+	assert!(st.is_success(), "accept: {st} {body}");
+	let row = meta.read_file(alice, shared).await.unwrap().expect("the accepted share's row");
+	assert_eq!(row.index_id(), shared, "the row mirrors the sender's content id");
+	assert_eq!(row.upstream_tag.as_deref(), Some(up.id_tag.as_str()));
+
+	// Another node claims the same content: refused, and no grant lands.
+	let (st, _) = inbox_sync(fx, &forger, &fshr_token(&forger, "ADMIN", shared)).await;
+	assert!(!st.is_success(), "a forged FSHR over another upstream's content: {st}");
+	let ctx = cloudillo_core::file_access::FileAccessCtx {
+		user_id_tag: ALICE,
+		tenant_id_tag: ALICE,
+		user_roles: &[],
+		hatted: false,
+		scope: None,
+		names_holder: true,
+	};
+	let r = cloudillo_core::file_access::resolve_placement(
+		&fx.app,
+		alice,
+		shared,
+		&ctx,
+		cloudillo::types::AccessLevel::Admin,
+	)
+	.await;
+	assert!(r.is_err(), "the forged FSHR grants Admin: {:?}", r.map(|a| a.access_level));
+}
+
+/// Upstream is per entry. One BLOB held as a local Direct entry, and named by a Public reference
+/// to a connected remote: the reference holds no bytes, so outsiders read no content through it
+/// (its metadata only) and write neither; nobody but its placer republishes the reference; a
+/// community role reaches the local entry, never the reference; and only the reference's own
+/// upstream may send an FSHR for it.
+#[tokio::test]
+async fn mixed_origin_entries_are_judged_apart() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let up = connected_remote(fx, "zqm-mixed-up").await;
+	let forger = connected_remote(fx, "zqm-mixed-forger").await;
+	let key = "mixed";
+	let content = format!("f1~zqm-{key}");
+	let local = seed_blob(fx, alice, key, "zqm-mixed-local", None, None, None).await;
+	let mirror =
+		seed_blob(fx, alice, key, "zqm-mixed-mirror", Some('P'), None, Some(&up.id_tag)).await;
+	for (entry, upstream) in [(&local, None), (&mirror, Some(up.id_tag.as_str()))] {
+		let view = meta.read_file(alice, entry).await.unwrap().expect("entry");
+		assert_eq!(view.index_id(), &*content, "both entries place one content");
+		assert_eq!(view.upstream_tag.as_deref(), upstream, "each entry keeps its own origin");
+	}
+
+	let send = |host: &'static str, n: &str, m: Method, uri: String, body: &'static str| {
+		call(&fx.api, req(host, m, &uri, bearer(subj(n)), Body::from(body)))
+	};
+	for n in ["stranger@alice.test", "follower@alice.test", "g-read@alice.test"] {
+		for id in [&*content, &*mirror] {
+			for tail in ["/descriptor", ""] {
+				let uri = format!("/api/files/{id}{tail}");
+				let (st, body) = send(ALICE, n, Method::GET, uri.clone(), "").await;
+				assert!(
+					!st.is_success(),
+					"{n} reads local bytes through the reference: {uri} {st} {body}"
+				);
+			}
+		}
+		let (st, body) =
+			send(ALICE, n, Method::GET, format!("/api/files/{mirror}/metadata"), "").await;
+		assert!(st.is_success(), "{n} reads the public reference's metadata: {st} {body}");
+	}
+	for n in [
+		"stranger@alice.test",
+		"follower@alice.test",
+		"g-read@alice.test",
+		"sharelink-r@alice",
+	] {
+		let (st, _) = send(ALICE, n, Method::GET, format!("/api/files/{local}/metadata"), "").await;
+		assert!(!st.is_success(), "{n} reads the Direct local entry: {st}");
+		for entry in [&local, &mirror] {
+			let uri = format!("/api/files/{entry}");
+			let (st, _) = send(ALICE, n, Method::PATCH, uri, r#"{"fileName":"zqm-pwned"}"#).await;
+			assert!(!st.is_success(), "{n} writes entry {entry}: {st}");
+		}
+	}
+
+	// Publication: the mirror is nobody's to republish; the local entry stays open.
+	let (st, body) = send(
+		ALICE,
+		"owner@alice",
+		Method::PATCH,
+		format!("/api/files/{mirror}"),
+		r#"{"visibility":null}"#,
+	)
+	.await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "republishing the mirror: {body}");
+	let (st, body) = send(
+		ALICE,
+		"owner@alice",
+		Method::PATCH,
+		format!("/api/files/{local}"),
+		r#"{"visibility":"F"}"#,
+	)
+	.await;
+	assert!(st.is_success(), "the local entry is publishable: {st} {body}");
+
+	// Inbound FSHR: only the mirror's upstream speaks for this content.
+	let (st, _) = inbox_sync(fx, &forger, &fshr_token(&forger, "WRITE", &content)).await;
+	assert!(!st.is_success(), "an FSHR from a non-upstream issuer: {st}");
+	let (st, _) = inbox_sync(fx, &up, &fshr_token(&up, "WRITE", &content)).await;
+	assert!(st.is_success(), "an FSHR from the mirror's upstream: {st}");
+
+	// Community roles reach the local entry only.
+	let club = fx.tenants.club.tn_id;
+	let key = "mixed-club";
+	let local = seed_blob(fx, club, key, "zqm-mixed-club-local", None, None, None).await;
+	let mirror =
+		seed_blob(fx, club, key, "zqm-mixed-club-mirror", None, None, Some("zqm-up.test")).await;
+	let read = |n: &'static str, entry: Box<str>| {
+		send(CLUB, n, Method::GET, format!("/api/files/{entry}/metadata"), "")
+	};
+	// Not `m-leader`: abac's leader override admits every file whatever its origin.
+	let (st, body) = read("m-contributor@club.test", local.clone()).await;
+	assert!(st.is_success(), "the role reaches the local entry: {st} {body}");
+	let (st, body) = read("m-contributor@club.test", mirror.clone()).await;
+	assert!(!st.is_success(), "the role reaches the mirrored entry: {st} {body}");
+	for n in ["stranger@club.test", "m-follower@club.test", "sharelink-r@club"] {
+		for entry in [&local, &mirror] {
+			let (st, _) = read(n, entry.clone()).await;
+			assert!(!st.is_success(), "{n} reads Direct entry {entry}: {st}");
+		}
+	}
+}
+
+/// FSHR grants are keyed by the content id. On a BLOB referenced from `connected`, placed on the
+/// main drive and in `close-friends`, a WRITE grant to `stranger` yields Read only — a content
+/// key on a BLOB never reaches a placement write — on the main-drive entry, and nothing on the
+/// room entry they cannot enter. A grant row whose issuer is not the upstream grants nothing; a
+/// share link and an ungranted remote get nothing. The grant is swept with the content's last
+/// live entry, not before.
+#[tokio::test]
+async fn fshr_content_key() {
+	use cloudillo::meta_adapter::Action;
+	use cloudillo::types::{AccessLevel, Timestamp};
+	use cloudillo_core::file_access::{FileAccessCtx, resolve_placement};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let tag = |n: &str| subj(n).facts.id_tag.clone().expect("id_tag");
+	let up = tag("connected@alice.test");
+	let grantee = tag("stranger@alice.test");
+	let forged_grantee = tag("follower@alice.test");
+	let key = "fshr-content";
+	let content = format!("f1~zqm-{key}");
+	let main = seed_blob(fx, alice, key, "zqm-fshr-main", None, None, Some(&up)).await;
+	let room = Some("@alice.test~close-friends");
+	let in_room = seed_blob(fx, alice, key, "zqm-fshr-room", None, room, Some(&up)).await;
+	let fshr = |audience: String, issuer: String| {
+		let content = content.clone();
+		async move {
+			let action_id = format!("a1~zqm-fshr-{}", audience.replace('.', "-"));
+			let fshr_key = format!("FSHR:{content}:{audience}");
+			meta.create_action(
+				alice,
+				&Action {
+					action_id: action_id.as_str(),
+					typ: "FSHR",
+					sub_typ: Some("WRITE"),
+					issuer_tag: issuer.as_str(),
+					parent_id: None,
+					root_id: None,
+					audience_tag: Some(audience.as_str()),
+					content: None,
+					attachments: None,
+					subject: Some(content.as_str()),
+					created_at: Timestamp::now(),
+					expires_at: None,
+					visibility: None,
+					flags: None,
+					x: None,
+					hat_tag: None,
+					channel: None,
+				},
+				Some(&fshr_key),
+			)
+			.await
+			.unwrap();
+		}
+	};
+	fshr(grantee.clone(), up.clone()).await;
+	// Issued by someone other than the content's upstream.
+	fshr(forged_grantee.clone(), grantee.clone()).await;
+
+	let ctx = |user: &'static str| FileAccessCtx {
+		user_id_tag: user,
+		tenant_id_tag: ALICE,
+		user_roles: &[],
+		hatted: false,
+		scope: None,
+		names_holder: true,
+	};
+	let grantee: &'static str = Box::leak(grantee.into_boxed_str());
+	let forged_grantee: &'static str = Box::leak(forged_grantee.into_boxed_str());
+	let w = resolve_placement(&fx.app, alice, &content, &ctx(grantee), AccessLevel::Write).await;
+	assert!(w.is_err(), "a content grant on a BLOB writes: {:?}", w.map(|a| a.access_level));
+	let r = resolve_placement(&fx.app, alice, &content, &ctx(grantee), AccessLevel::Read)
+		.await
+		.expect("the WRITE grant admits the main-drive entry for reading");
+	assert_eq!(r.file_view.entry_id, main, "the room entry is not admitted");
+	assert_eq!(r.access_level, AccessLevel::Read, "capped at Read");
+	let r = resolve_placement(&fx.app, alice, &in_room, &ctx(grantee), AccessLevel::Read).await;
+	assert!(r.is_err(), "the grant admits a room the grantee cannot enter");
+	let r =
+		resolve_placement(&fx.app, alice, &content, &ctx(forged_grantee), AccessLevel::Read).await;
+	assert!(r.is_err(), "a grant not issued by the upstream admits");
+
+	// Over REST: the grantee reads and tags by content id, and only ever sees the main entry.
+	let get = |n: &str, uri: String| {
+		call(&fx.api, req(ALICE, Method::GET, &uri, bearer(subj(n)), Body::empty()))
+	};
+	let (st, body) = get("stranger@alice.test", format!("/api/files/{content}/metadata")).await;
+	assert!(st.is_success(), "grantee metadata: {st} {body}");
+	let body = body.to_string();
+	assert!(body.contains(&*main), "grantee gets the main entry: {body}");
+	assert!(!body.contains("close-friends") && !body.contains("zqm-fshr-room"), "{body}");
+	for id in [&*content, &*main] {
+		let uri = format!("/api/files/{id}/tag/zqm-fshr");
+		let r = req(ALICE, Method::PUT, &uri, bearer(subj("stranger@alice.test")), Body::empty());
+		let (st, body) = call(&fx.api, r).await;
+		assert!(!st.is_success(), "the content grant tags {id}: {st} {body}");
+		let uri = format!("/api/files/{id}");
+		let r = req(
+			ALICE,
+			Method::PATCH,
+			&uri,
+			bearer(subj("stranger@alice.test")),
+			Body::from(r#"{"fileName":"zqm-pwned"}"#),
+		);
+		let (st, body) = call(&fx.api, r).await;
+		assert!(!st.is_success(), "the content grant renames {id}: {st} {body}");
+	}
+	for n in ["direct@alice.test", "sharelink-r@alice", "idp-key@alice"] {
+		let (st, _) = get(n, format!("/api/files/{content}/metadata")).await;
+		assert!(!st.is_success(), "{n} reads the shared content: {st}");
+	}
+
+	// Sweep: the grant outlives one placement and goes with the last.
+	let owner = subj("owner@alice");
+	let rm = |id: &str, q: &'static str| {
+		let uri = format!("/api/files/{id}{q}");
+		call(&fx.api, req(ALICE, Method::DELETE, &uri, bearer(owner), Body::empty()))
+	};
+	let fshr_key = format!("FSHR:{content}:{grantee}");
+	for q in ["", "?permanent=true"] {
+		let (st, body) = rm(&main, q).await;
+		assert!(st.is_success(), "delete main {q}: {st} {body}");
+	}
+	assert!(meta.get_action_by_key(alice, &fshr_key).await.unwrap().is_some(), "swept early");
+	for q in ["", "?permanent=true"] {
+		let (st, body) = rm(&in_room, q).await;
+		assert!(st.is_success(), "delete room entry {q}: {st} {body}");
+	}
+	assert!(meta.get_action_by_key(alice, &fshr_key).await.unwrap().is_none(), "never swept");
+}
+
+/// The context filter: a content id resolves to the entries of that content the caller's
+/// context admits. One BLOB on club, placed privately in `closed-w` (first) and publicly on the
+/// main drive. A stranger reading by content id gets the public entry's own metadata, never the
+/// room sibling's; a moderator (who writes the main drive but cannot enter the closed room)
+/// tags by content id and lands on the public entry; the tenant, who writes both, gets 409 and
+/// must name the entry.
+#[tokio::test]
+async fn content_id_resolves_in_the_callers_context() {
+	use ops::MARK;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let key = "ctx-filter";
+	let content = format!("f1~zqm-{key}");
+	let room = Some("@club.test~closed-w");
+	let secret_name = format!("{MARK} zqmctx secret");
+	let secret = seed_blob(fx, club, key, &secret_name, None, room, None).await;
+	let public =
+		seed_blob(fx, club, key, &format!("{MARK} zqmctx public"), Some('P'), None, None).await;
+	let send = |n: &str, m: Method, uri: String| {
+		call(&fx.api, req(CLUB, m, &uri, bearer(subj(n)), Body::empty()))
+	};
+
+	// Read: only the admitted entry's name, channel and parent.
+	let (st, body) =
+		send("stranger@club.test", Method::GET, format!("/api/files/{content}/metadata")).await;
+	assert!(st.is_success(), "stranger reads the public entry: {st} {body}");
+	let body = body.to_string();
+	assert!(body.contains(&*public), "{body}");
+	assert!(!body.contains(&*secret), "the room sibling's entry leaks: {body}");
+	assert!(!body.contains("zqmctx secret") && !body.contains("closed-w"), "{body}");
+
+	// Placement by content id: one admitted writable entry → that one.
+	let tag = format!("/api/files/{content}/tag/zqm-ctx");
+	let (st, body) = send("m-moderator@club.test", Method::PUT, tag.clone()).await;
+	assert!(st.is_success(), "moderator tags the main-drive entry: {st} {body}");
+	assert!(body.to_string().contains(&*public), "tagged the public entry: {body}");
+	// Several → 409; the entry id resolves to itself.
+	let (st, body) = send("owner@club", Method::PUT, tag).await;
+	assert_eq!(st, StatusCode::CONFLICT, "the tenant writes both: {body}");
+	let (st, body) =
+		send("owner@club", Method::PUT, format!("/api/files/{secret}/tag/zqm-ctx")).await;
+	assert!(st.is_success(), "by entry id: {st} {body}");
+	// Denied subjects place nothing, and a reader without write is not resolved to a sibling.
+	for n in ["stranger@club.test", "m-follower@club.test", "sharelink-r@club"] {
+		let (st, _) = send(n, Method::PUT, format!("/api/files/{content}/tag/zqm-ctx-x")).await;
+		assert!(!st.is_success(), "{n} tags by content id: {st}");
+	}
+	let (st, _) =
+		send("m-moderator@club.test", Method::GET, format!("/api/files/{secret}/metadata")).await;
+	assert!(!st.is_success(), "moderator reads the closed room entry: {st}");
+
+	// Search: the same rule at query time. The stranger's hit carries the public name.
+	cloudillo_search::objects::index_file(&fx.app, club, &content).await.unwrap();
+	let search = |n: &'static str, q: &'static str| async move {
+		let (st, body) = send(n, Method::GET, format!("/api/search?q={q}")).await;
+		assert!(st.is_success(), "search {n}: {st} {body}");
+		body.to_string()
+	};
+	let hits = search("stranger@club.test", "zqmctx").await;
+	assert!(hits.contains(&content), "the public entry admits: {hits}");
+	assert!(hits.contains("zqmctx public") && !hits.contains("zqmctx secret"), "{hits}");
+
+	// Private-only content: no hit for anyone outside the room.
+	let key = "ctx-private";
+	let content = format!("f1~zqm-{key}");
+	seed_blob(fx, club, key, &format!("{MARK} zqmctxonly"), None, room, None).await;
+	cloudillo_search::objects::index_file(&fx.app, club, &content).await.unwrap();
+	assert!(search("owner@club", "zqmctxonly").await.contains(&content), "owner finds it");
+	for n in [
+		"stranger@club.test",
+		"m-follower@club.test",
+		"g-read@club.test",
+		"sharelink-r@club",
+	] {
+		let hits = search(n, "zqmctxonly").await;
+		assert!(!hits.contains(&content), "{n} finds a private room entry: {hits}");
+	}
+}
+
+/// Restoring into another drive is a cross-drive move whatever the target: a writer who does not
+/// own the subtree is refused even without an explicit parent.
+#[tokio::test]
+async fn restore_into_another_drive_needs_cross_drive_rights() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let send = |n: &str, m: Method, uri: String, body: &'static str| {
+		call(&fx.api, req(CLUB, m, &uri, bearer(subj(n)), Body::from(body)))
+	};
+	// A tenant-owned entry in a room, trashed; then the room goes, so a restore lands on the
+	// main drive.
+	let owner = "owner@club";
+	let (st, body) =
+		send(owner, Method::POST, "/api/channels".into(), r#"{"name":"zqm-restore"}"#).await;
+	assert!(st.is_success(), "create room: {st} {body}");
+	let room = Some("@club.test~zqm-restore");
+	let entry = seed_blob(fx, club, "restore-xdrive", "zqm-restore", Some('P'), room, None).await;
+	let (st, body) = send(owner, Method::DELETE, format!("/api/files/{entry}"), "").await;
+	assert!(st.is_success(), "trash: {st} {body}");
+	let (st, body) = send(owner, Method::DELETE, "/api/channels/zqm-restore".into(), "").await;
+	assert!(st.is_success(), "delete room: {st} {body}");
+
+	let restore = format!("/api/files/{entry}/restore");
+	let (st, body) = send("m-contributor@club.test", Method::POST, restore.clone(), "{}").await;
+	assert!(!st.is_success(), "a non-owner writer restores across drives: {st} {body}");
+	let (st, body) = send(owner, Method::POST, restore, "{}").await;
+	assert!(st.is_success(), "the tenant restores: {st} {body}");
+}
+
+/// A content token does no placement write. A write scope by content id is a placement: the
+/// owner, who writes both entries, gets 409 and must name the entry. A read scope by content id
+/// renames, moves, trashes, re-shares and re-publishes none of the content's entries, though its
+/// holder owns them. An `idp_` key and a share link carry alice's id_tag but do no tenant
+/// placement write either.
+#[tokio::test]
+async fn content_token_no_placement() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let key = "content-token";
+	let a = seed_blob(fx, alice, key, "zqm-ct-a", Some('P'), None, None).await;
+	let b = seed_blob(fx, alice, key, "zqm-ct-b", None, None, None).await;
+	let owner = fx.subjects.iter().find(|s| s.name == "owner@alice").expect("owner");
+	let mint = |lvl: char| {
+		let uri = format!("/api/auth/access-token?scope=file:f1~zqm-{key}:{lvl}");
+		call(&fx.api, req(ALICE, Method::GET, &uri, bearer(owner), Body::empty()))
+	};
+	let (st, body) = mint('W').await;
+	assert_eq!(st, StatusCode::CONFLICT, "a write scope by an ambiguous content id: {body}");
+	let (st, body) = mint('R').await;
+	assert!(st.is_success(), "mint: {st} {body}");
+	let token = find_str(&body, "token").expect("token");
+	let writes = |id: &str| {
+		let base = format!("/api/files/{id}");
+		[
+			(Method::PATCH, base.clone(), r#"{"fileName":"zqm-ct-pwned"}"#),
+			(
+				Method::PATCH,
+				base.clone(),
+				r#"{"parentId":null,"channel":"@alice.test~close-friends"}"#,
+			),
+			(Method::PATCH, base.clone(), r#"{"visibility":"P"}"#),
+			(Method::DELETE, base.clone(), ""),
+			(
+				Method::POST,
+				format!("{base}/shares"),
+				r#"{"subjectType":"U","subjectId":"zqm.test","permission":"R"}"#,
+			),
+		]
+	};
+	for id in [&*a, &*b] {
+		for (m, uri, body) in writes(id) {
+			let r = req(ALICE, m.clone(), &uri, Some(&token), Body::from(body));
+			let (st, _) = call(&fx.api, r).await;
+			assert!(!st.is_success(), "content token {m} {uri} {body}: {st}");
+		}
+	}
+	for n in ["idp-key@alice", "sharelink-w@alice"] {
+		let s = fx.subjects.iter().find(|s| s.name == n).expect(n);
+		for (m, uri, body) in writes(&b) {
+			let r = req(ALICE, m.clone(), &uri, bearer(s), Body::from(body));
+			let (st, _) = call(&fx.api, r).await;
+			assert!(!st.is_success(), "{n} {m} {uri} {body}: {st}");
+		}
+	}
+}
+
+/// Inbound guard (`process_inbound_action_attachments`): an inbound action adds a managed entry
+/// only over content its source proved it holds — every attachment is synced and its descriptor
+/// verified against the content id first. End to end: an inbound action naming a local private
+/// file or another issuer's sync file, from a peer that cannot serve it, adds no managed entry,
+/// and a stranger stays denied. The positive path needs the issuer's host for
+/// `sync_file_variants`, which the fixture lacks (no remote peer serves files).
+#[tokio::test]
+async fn inbound_attachment_guard() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let local = "f1~zqm-alice-tenant-blob-f-active";
+
+	let other = fx
+		.subjects
+		.iter()
+		.find(|s| s.name == "connected@alice.test")
+		.expect("connected");
+	let other = other.facts.id_tag.clone().expect("id_tag");
+	let key = "sync-other";
+	let blob = format!("b1~zqm-{key}");
+	meta.create_file(
+		alice,
+		cloudillo::meta_adapter::CreateFile {
+			preset: Some("sync".into()),
+			orig_variant_id: Some(blob.as_str().into()),
+			content_type: "text/plain".into(),
+			file_name: "zqm-sync".into(),
+			file_tp: Some("BLOB".into()),
+			parent_id: Some(cloudillo::meta_adapter::MANAGED_PARENT_ID.into()),
+			action_id: Some("a1~zqm-sync-other".into()),
+			status: Some(cloudillo::meta_adapter::FileStatus::Active),
+			file_id: Some(format!("f1~zqm-{key}").into()),
+			..Default::default()
+		},
+	)
+	.await
+	.unwrap();
+	// The managed entry's action must exist for the issuer join.
+	seed_action(fx, alice, "a1~zqm-sync-other", &other).await;
+	let file = format!("f1~zqm-{key}");
+
+	let issuer = connected_remote(fx, "zqm-attach-issuer").await;
+	for f in [local, file.as_str()] {
+		let before = meta.list_content_entries(alice, f).await.unwrap().len();
+		let token = fixture::sign(
+			&issuer,
+			&cloudillo::auth_adapter::ActionToken {
+				iss: issuer.id_tag.as_str().into(),
+				k: issuer.key_id.as_str().into(),
+				t: "POST".into(),
+				c: Some(serde_json::json!("zqm inbound attachment")),
+				a: Some(vec![f.into()]),
+				aud: Some(ALICE.into()),
+				iat: cloudillo::types::Timestamp::now(),
+				..Default::default()
+			},
+		);
+		let body = Body::from(serde_json::json!({ "token": token }).to_string());
+		let (st, body) =
+			call(&fx.api, req(ALICE, Method::POST, "/api/inbox/sync", None, body)).await;
+		assert!(st.is_success(), "inbound POST naming {f}: {st} {body}");
+		let after = meta.list_content_entries(alice, f).await.unwrap().len();
+		assert_eq!(before, after, "an inbound action added a managed entry to {f}");
+	}
+
+	let stranger = fx.subjects.iter().find(|s| s.name == "stranger@alice.test").expect("stranger");
+	for f in [local, file.as_str()] {
+		let uri = format!("/api/files/{f}/descriptor");
+		let (st, _) =
+			call(&fx.api, req(ALICE, Method::GET, &uri, bearer(stranger), Body::empty())).await;
+		assert!(!st.is_success(), "stranger reads {f}: {st}");
+	}
+}
+
+/// An issuer naming a sync mirror another issuer brought in must prove it holds the bytes:
+/// `sync_file_variants(prove = true)` fetches a variant from the source even though it is held
+/// here. The fixture has no remote peer, so the proof fetch (and the success path) is
+/// unreachable; what is reachable: the sync fails, the action stays pending (`Err`, retried) and
+/// no managed entry joins the mirror.
+#[tokio::test]
+async fn naming_anothers_mirror_adds_no_entry_without_proof() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let first = connected_remote(fx, "zqm-l2-first").await;
+	let content = "f1~zqm-l2-mirror";
+	meta.create_sync_content(alice, content, None, "text/plain", None)
+		.await
+		.unwrap();
+	seed_action(fx, alice, "a1~zqm-l2-first", &first.id_tag).await;
+	meta.create_managed_entry(alice, content, content, Some("a1~zqm-l2-first"), Some('D'), None)
+		.await
+		.unwrap();
+	let before = meta.list_content_entries(alice, content).await.unwrap().len();
+
+	let issuer = connected_remote(fx, "zqm-l2-second").await;
+	let claims = cloudillo::auth_adapter::ActionToken {
+		iss: issuer.id_tag.as_str().into(),
+		k: issuer.key_id.as_str().into(),
+		t: "POST".into(),
+		c: Some(serde_json::json!("zqm l2 reuse")),
+		a: Some(vec![content.into()]),
+		aud: Some(ALICE.into()),
+		v: Some('P'),
+		iat: cloudillo::types::Timestamp::now(),
+		..Default::default()
+	};
+	let token = fixture::sign(&issuer, &claims);
+	let action_id = cloudillo::hasher::hash("a", token.as_bytes());
+	let r = cloudillo_action::process_inbound_action_token(
+		&fx.app, alice, &action_id, &token, false, None,
+	)
+	.await;
+	assert!(r.is_err(), "an unproven reuse must stay pending: {r:?}");
+	let after = meta.list_content_entries(alice, content).await.unwrap().len();
+	assert_eq!(before, after, "the second issuer got a managed entry without proof");
+	let uri = format!("/api/files/{content}/descriptor");
+	for n in ["anon@alice.test", "stranger@alice.test"] {
+		let s = fx.subjects.iter().find(|s| s.name == n).expect(n);
+		let (st, _) = call(&fx.api, req(ALICE, Method::GET, &uri, bearer(s), Body::empty())).await;
+		assert!(!st.is_success(), "{n} reads the mirror: {st}");
+	}
+	meta.delete_action(alice, &action_id).await.ok();
+	meta.delete_managed_entries(alice, "a1~zqm-l2-first").await.unwrap();
+}
+
+/// An inbound public action naming local private content proves nothing: `sync_file_variants`
+/// skips what is already held, so the descriptor alone would pass. The guard refuses held
+/// content that is not an inbound mirror *before* the sync, so no managed entry widens it and
+/// the action settles (the attachment skipped) rather than retrying forever.
+///
+/// Driven through `process_inbound_action_token` in async mode, as `ActionVerifierTask` would:
+/// `/api/inbox/sync` skips attachments and the fixture runs no scheduler. It has no remote peer
+/// either, so the sync-succeeds path is unreachable; without the guard the sync is attempted and
+/// fails, which the `Ok` below catches.
+#[tokio::test]
+async fn an_inbound_public_action_never_widens_local_content() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	seed_blob(fx, alice, "h1-private", "zqm-h1-private", None, None, None).await;
+	let content = "f1~zqm-h1-private";
+	let before = meta.list_content_entries(alice, content).await.unwrap().len();
+
+	let issuer = connected_remote(fx, "zqm-h1-issuer").await;
+	let claims = cloudillo::auth_adapter::ActionToken {
+		iss: issuer.id_tag.as_str().into(),
+		k: issuer.key_id.as_str().into(),
+		t: "POST".into(),
+		c: Some(serde_json::json!("zqm h1 public")),
+		a: Some(vec![content.into()]),
+		aud: Some(ALICE.into()),
+		v: Some('P'),
+		iat: cloudillo::types::Timestamp::now(),
+		..Default::default()
+	};
+	let token = fixture::sign(&issuer, &claims);
+	let action_id = cloudillo::hasher::hash("a", token.as_bytes());
+	let r = cloudillo_action::process_inbound_action_token(
+		&fx.app, alice, &action_id, &token, false, None,
+	)
+	.await;
+	assert!(r.is_ok(), "the refused attachment is skipped, not retried: {r:?}");
+	let after = meta.list_content_entries(alice, content).await.unwrap().len();
+	assert_eq!(before, after, "an inbound public action added a managed entry");
+
+	let uri = format!("/api/files/{content}/descriptor");
+	for n in ["anon@alice.test", "stranger@alice.test", "follower@alice.test"] {
+		let s = fx.subjects.iter().find(|s| s.name == n).expect(n);
+		let (st, _) = call(&fx.api, req(ALICE, Method::GET, &uri, bearer(s), Body::empty())).await;
+		assert!(!st.is_success(), "{n} reads the private content: {st}");
+	}
+	// The shared fixture's outbox shows the newest public posts only (SE-07): leave none behind.
+	meta.delete_action(alice, &action_id).await.unwrap();
+}
+
+/// A sync that failed midway leaves a `preset = 'sync'` content row with no entry. An inbound
+/// action naming it must retry the sync (it is a mirror), not skip it as local content; until a
+/// sync completes, the row stays entry-less and unreadable. The fixture has no remote peer, so
+/// the retry fails and the action stays pending; the entry a completed sync adds is covered by
+/// the adapter test `sync_content_gets_its_entry_only_after_finalize`.
+#[tokio::test]
+async fn a_half_synced_mirror_is_retried_not_refused() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let content = "f1~zqm-half-synced";
+	meta.create_sync_content(alice, content, None, "text/plain", None)
+		.await
+		.unwrap();
+
+	let issuer = connected_remote(fx, "zqm-half-issuer").await;
+	let claims = cloudillo::auth_adapter::ActionToken {
+		iss: issuer.id_tag.as_str().into(),
+		k: issuer.key_id.as_str().into(),
+		t: "POST".into(),
+		c: Some(serde_json::json!("zqm half-synced")),
+		a: Some(vec![content.into()]),
+		aud: Some(ALICE.into()),
+		v: Some('P'),
+		iat: cloudillo::types::Timestamp::now(),
+		..Default::default()
+	};
+	let token = fixture::sign(&issuer, &claims);
+	let action_id = cloudillo::hasher::hash("a", token.as_bytes());
+	let r = cloudillo_action::process_inbound_action_token(
+		&fx.app, alice, &action_id, &token, false, None,
+	)
+	.await;
+	assert!(r.is_err(), "the half-synced mirror was skipped instead of retried");
+	let c = meta.read_content(alice, content).await.unwrap();
+	assert!(!c.has_entries, "a failed sync left an entry behind");
+
+	let uri = format!("/api/files/{content}/descriptor");
+	for n in ["owner@alice", "anon@alice.test", "stranger@alice.test"] {
+		let s = fx.subjects.iter().find(|s| s.name == n).expect(n);
+		let (st, _) = call(&fx.api, req(ALICE, Method::GET, &uri, bearer(s), Body::empty())).await;
+		assert!(!st.is_success(), "{n} reads the half-synced mirror: {st}");
+	}
+	meta.delete_action(alice, &action_id).await.ok();
+}
+
+/// An Active POST row `action_id` issued by `issuer`.
+async fn seed_action(fx: &Fixture, tn: cloudillo::types::TnId, action_id: &str, issuer: &str) {
+	use cloudillo::meta_adapter::Action;
+	use cloudillo::types::Timestamp;
+	let action = Action {
+		action_id,
+		typ: "POST",
+		sub_typ: None,
+		issuer_tag: issuer,
+		parent_id: None,
+		root_id: None,
+		audience_tag: None,
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: Timestamp::now(),
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+		hat_tag: None,
+		channel: None,
+	};
+	fx.app.meta_adapter.create_action(tn, &action, None).await.unwrap();
+}
+
+/// A `file:` scope minted on a BLOB content id binds the entry that granted it: a stranger or
+/// follower admitted through a public managed entry never reaches the private placed sibling.
+/// A hand-signed scope naming the content id itself grants nothing.
+#[tokio::test]
+async fn content_scope_binds_granting_entry() {
+	use cloudillo::auth_adapter::AccessToken;
+	use cloudillo::types::Timestamp;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let key = "scope-bind";
+	let content = format!("f1~zqm-{key}");
+	let private = seed_blob(fx, alice, key, "zqm-sb-secret", None, None, None).await;
+	let managed = fx
+		.app
+		.meta_adapter
+		.create_managed_entry(
+			alice,
+			&content,
+			"zqm-sb-managed",
+			Some("a1~zqm-scope-bind"),
+			Some('P'),
+			None,
+		)
+		.await
+		.unwrap();
+	let get = |uri: String, tok: String| async move {
+		call(&fx.api, req(ALICE, Method::GET, &uri, Some(&tok), Body::empty())).await
+	};
+
+	for n in ["stranger@alice.test", "follower@alice.test"] {
+		let s = fx.subjects.iter().find(|s| s.name == n).expect(n);
+		let mint = format!("/api/auth/access-token?scope=file:{content}:R");
+		let (st, body) =
+			call(&fx.api, req(ALICE, Method::GET, &mint, bearer(s), Body::empty())).await;
+		assert!(st.is_success(), "{n} mint: {st} {body}");
+		let tok = find_str(&body, "token").expect("token");
+		let claims = fx.app.auth_adapter.validate_access_token(alice, ALICE, &tok).await.unwrap();
+		assert_eq!(
+			claims.scope.as_deref(),
+			Some(format!("file:{managed}:R").as_str()),
+			"{n}: the scope names the granting entry"
+		);
+
+		let (st, _) = get(format!("/api/files/{private}/metadata"), tok.clone()).await;
+		assert!(!st.is_success(), "{n} reads the private entry: {st}");
+		// The managed entry carries the attachment's name by design: tell entries apart by id.
+		let (_, body) = get(format!("/api/files/{content}/metadata"), tok.clone()).await;
+		let body = body.to_string();
+		assert!(!body.contains(&*private), "{n} gets the private entry: {body}");
+		let (_, list) = get("/api/files".into(), tok.clone()).await;
+		let list = list.to_string();
+		assert!(!list.contains(&*private), "{n} lists the private entry: {list}");
+	}
+
+	// A content-id scope (as a peer or an older mint would carry) binds no entry.
+	let claims = AccessToken {
+		iss: ALICE,
+		sub: None,
+		scope: Some(&format!("file:{content}:R")),
+		r: None,
+		h: None,
+		exp: Timestamp::from_now(600),
+	};
+	let tok = fx
+		.app
+		.auth_adapter
+		.create_access_token(alice, &claims)
+		.await
+		.unwrap()
+		.into_string();
+	// The public managed entry still admits it as a guest; the private entry stays shut.
+	let (st, _) = get(format!("/api/files/{private}/metadata"), tok.clone()).await;
+	assert!(!st.is_success(), "content-id scope grants the private entry: {st}");
+	let (_, list) = get("/api/files".into(), tok).await;
+	let list = list.to_string();
+	assert!(!list.contains(&*private), "content-id scope lists the private entry: {list}");
+}
+
+/// `?via=` re-mint: the caller's scope must bind the via entry. A scope naming a BLOB content id
+/// binds no entry, even where the content has a single entry, so it re-mints nothing; the same
+/// scope on the entry id does.
+#[tokio::test]
+async fn a_content_id_scope_cannot_remint_through_via() {
+	use cloudillo::auth_adapter::AccessToken;
+	use cloudillo::meta_adapter::CreateShareEntry;
+	use cloudillo::types::Timestamp;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let src = seed_blob(fx, alice, "via-src", "zqm-via-src", None, None, None).await;
+	let dst = seed_blob(fx, alice, "via-dst", "zqm-via-dst", None, None, None).await;
+	let link = CreateShareEntry {
+		subject_type: 'F',
+		subject_id: src.to_string(),
+		permission: 'R',
+		expires_at: None,
+	};
+	fx.app
+		.meta_adapter
+		.create_share_entry(alice, 'F', &dst, ALICE, &link)
+		.await
+		.unwrap();
+
+	let uri = format!("/api/auth/access-token?via={src}&scope=file:{dst}:R");
+	for (scope_id, ok) in [(&*src, true), ("f1~zqm-via-src", false)] {
+		let scope = format!("file:{scope_id}:R");
+		let claims = AccessToken {
+			iss: ALICE,
+			sub: None,
+			scope: Some(&scope),
+			r: None,
+			h: None,
+			exp: Timestamp::from_now(600),
+		};
+		let tok = fx.app.auth_adapter.create_access_token(alice, &claims).await.unwrap();
+		let tok = tok.into_string();
+		let (st, body) =
+			call(&fx.api, req(ALICE, Method::GET, &uri, Some(&tok), Body::empty())).await;
+		assert_eq!(st.is_success(), ok, "via re-mint from {scope}: {st} {body}");
+	}
+}
+
+/// Search gates a content row on its representative entry only (live, placed before managed):
+/// a public managed sibling does not expose a private placement, and a trashed public entry
+/// never admits.
+#[tokio::test]
+async fn search_gates_on_representative() {
+	use ops::MARK;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let (owner, stranger) = (subj("owner@alice"), subj("stranger@alice.test"));
+	let search = |s: &'static subjects::Subject, q: &'static str| async move {
+		let uri = format!("/api/search?q={q}");
+		let (st, body) =
+			call(&fx.api, req(ALICE, Method::GET, &uri, bearer(s), Body::empty())).await;
+		assert!(st.is_success(), "search {}: {st} {body}", s.name);
+		body.to_string()
+	};
+	let index = |id: String| async move {
+		cloudillo_search::objects::index_file(&fx.app, alice, &id).await.unwrap();
+	};
+
+	// Private placed entry + public managed sibling.
+	let key = "search-rep";
+	let content = format!("f1~zqm-{key}");
+	seed_blob(fx, alice, key, &format!("{MARK} zqmrepsecret"), None, None, None).await;
+	fx.app
+		.meta_adapter
+		.create_managed_entry(
+			alice,
+			&content,
+			"zqm-managed",
+			Some("a1~zqm-search-rep"),
+			Some('P'),
+			None,
+		)
+		.await
+		.unwrap();
+	index(content.clone()).await;
+	assert!(search(owner, "zqmrepsecret").await.contains(&content), "owner finds the content");
+	let hits = search(stranger, "zqmrepsecret").await;
+	assert!(!hits.contains(&content), "a public managed sibling exposes the private entry: {hits}");
+
+	// Only a public entry, then trashed.
+	let key = "search-trash";
+	let content = format!("f1~zqm-{key}");
+	let entry =
+		seed_blob(fx, alice, key, &format!("{MARK} zqmreptrash"), Some('P'), None, None).await;
+	index(content.clone()).await;
+	assert!(search(stranger, "zqmreptrash").await.contains(&content), "a public entry admits");
+	let r =
+		req(ALICE, Method::DELETE, &format!("/api/files/{entry}"), bearer(owner), Body::empty());
+	let (st, body) = call(&fx.api, r).await;
+	assert!(st.is_success(), "trash: {st} {body}");
+	index(content.clone()).await;
+	let hits = search(stranger, "zqmreptrash").await;
+	assert!(!hits.contains(&content), "a trashed entry admits: {hits}");
+}
+
+/// A deduped BLOB (one content, two placed entries) serves its variant by content id — never an
+/// ambiguity 409 — to who may read it, and still not to a stranger.
+#[tokio::test]
+async fn deduped_variant_fetch_ok() {
+	use cloudillo::blob_adapter::CreateBlobOptions;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let key = "variant-dedup";
+	fx.app
+		.blob_adapter
+		.create_blob_buf(alice, &format!("b1~zqm-{key}"), b"x", &CreateBlobOptions {})
+		.await
+		.unwrap();
+	seed_blob(fx, alice, key, "zqm-vd-a", None, None, None).await;
+	seed_blob(fx, alice, key, "zqm-vd-b", None, None, None).await;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let uri = format!("/api/files/f1~zqm-{key}");
+	let get = |s: &'static subjects::Subject| {
+		call(&fx.api, req(ALICE, Method::GET, &uri, bearer(s), Body::empty()))
+	};
+	let (st, body) = get(subj("owner@alice")).await;
+	assert_eq!(st, StatusCode::OK, "owner variant fetch: {body}");
+	let (st, _) = get(subj("stranger@alice.test")).await;
+	assert!(!st.is_success(), "stranger variant fetch: {st}");
+}
+
+/// Attachments: only a BLOB attaches, and the stored action names its content id even when the
+/// client sent an entry id. The fixture runs no scheduler, so `ActionCreatorTask` never signs:
+/// this asserts on what the handler stores (a draft, so nothing is queued at all).
+#[tokio::test]
+async fn attachment_rules() {
+	use cloudillo::meta_adapter::{CreateFile, FileStatus};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let owner = fx.subjects.iter().find(|s| s.name == "owner@alice").expect("owner");
+	let post = |attachment: String| async move {
+		let body = serde_json::json!({
+			"type": "POST", "content": "zqm attach", "draft": true, "attachments": [attachment]
+		});
+		let r =
+			req(ALICE, Method::POST, "/api/actions", bearer(owner), Body::from(body.to_string()));
+		call(&fx.api, r).await
+	};
+
+	let crdt = "f1~zqm-attach-crdt";
+	fx.app
+		.meta_adapter
+		.create_file(
+			alice,
+			CreateFile {
+				file_id: Some(crdt.into()),
+				file_name: "zqm-attach-crdt".into(),
+				file_tp: Some("CRDT".into()),
+				status: Some(FileStatus::Active),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	let (st, body) = post(crdt.into()).await;
+	assert!(st.is_client_error(), "a CRDT attaches: {st} {body}");
+
+	let key = "attach";
+	let entry = seed_blob(fx, alice, key, "zqm-attach-blob", Some('P'), None, None).await;
+	let (st, body) = post(entry.to_string()).await;
+	assert!(st.is_success(), "attach by entry id: {st} {body}");
+	let body = body.to_string();
+	assert!(body.contains(&format!("f1~zqm-{key}")), "the content id is stored: {body}");
+	assert!(!body.contains(&*entry), "the entry id is stored: {body}");
+}
+
+/// Draft PATCH and publish run the create-time attachment check too. A reference (Pin) holds
+/// no local bytes, so naming it is a 4xx up front on create, PATCH and publish alike, not a
+/// creator task failing on every retry; publish re-checks a draft whose attachments were
+/// written behind the API. PATCH and publish are tenant/leader-only
+/// (`check_perm_action("write")`) and the scope gate keeps `apkg:publish` and file-scoped tokens
+/// off them, so those are refused before the attachment check: the negative rows below pin that.
+#[tokio::test]
+async fn draft_patch_and_publish_check_attachments() {
+	use cloudillo::meta_adapter::UpdateActionDataOptions;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let send = |n: &'static str, m: Method, uri: String, v: serde_json::Value| async move {
+		call(&fx.api, req(ALICE, m, &uri, bearer(subj(n)), Body::from(v.to_string()))).await
+	};
+	let owner = "owner@alice";
+	let draft = || async move {
+		let v = serde_json::json!({ "type": "POST", "content": "zqm m2", "draft": true });
+		let (st, body) = send(owner, Method::POST, "/api/actions".into(), v).await;
+		assert!(st.is_success(), "draft: {st} {body}");
+		find_str(&body, "actionId").expect("draft actionId")
+	};
+	let up = subj("connected@alice.test").facts.id_tag.clone().expect("connected id_tag");
+	let pin = seed_blob(fx, alice, "m2-pin", "zqm-m2-pin", None, None, Some(&up)).await;
+	let private = seed_blob(fx, alice, "m2-private", "zqm-m2-private", None, None, None).await;
+
+	let v = serde_json::json!({
+		"type": "POST", "content": "zqm m2 pin", "draft": true, "attachments": [pin.to_string()]
+	});
+	let (st, body) = send(owner, Method::POST, "/api/actions".into(), v).await;
+	assert!(st.is_client_error(), "a reference attaches: {st} {body}");
+
+	let id = draft().await;
+	let patch = serde_json::json!({ "attachments": [pin.to_string()] });
+	let (st, body) = send(owner, Method::PATCH, format!("/api/actions/{id}"), patch).await;
+	assert!(st.is_client_error(), "PATCH attaches a reference: {st} {body}");
+
+	let id = draft().await;
+	let opts = UpdateActionDataOptions {
+		attachments: Patch::Value("f1~zqm-m2-pin".into()),
+		..Default::default()
+	};
+	fx.app.meta_adapter.update_action_data(alice, &id, &opts).await.unwrap();
+	let uri = format!("/api/actions/{id}/publish");
+	let (st, body) = send(owner, Method::POST, uri, serde_json::json!({})).await;
+	assert!(st.is_client_error(), "publish attaches a reference: {st} {body}");
+
+	// Same-id_tag credentials that read no files never get to attach one.
+	let id = draft().await;
+	for n in [
+		"apkg-publish@alice",
+		"owner-scoped-w@alice",
+		"idp-key@alice",
+		"sharelink-w@alice",
+	] {
+		let patch = serde_json::json!({ "attachments": [private.to_string()] });
+		let (st, _) = send(n, Method::PATCH, format!("/api/actions/{id}"), patch).await;
+		assert!(!st.is_success(), "{n} PATCHes an attachment into the tenant's draft: {st}");
+		let uri = format!("/api/actions/{id}/publish");
+		let (st, _) = send(n, Method::POST, uri, serde_json::json!({})).await;
+		assert!(!st.is_success(), "{n} publishes the tenant's draft: {st}");
+	}
+}
+
+/// FSHR `on_create` over content placed twice, where the grant already exists: the "already
+/// settled" shortcut still authorizes, so a non-manager cannot re-emit (store, federate, notify)
+/// it — nor a DEL that revokes nothing. Called directly: the fixture runs no scheduler, so a
+/// local POST never reaches the hook.
+#[tokio::test]
+async fn a_settled_fshr_still_needs_a_share_manager() {
+	use cloudillo::meta_adapter::CreateShareEntry;
+	use cloudillo_action::hooks::HookContext;
+	use cloudillo_action::native_hooks::fshr;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let tag = |n: &str| {
+		let s = fx.subjects.iter().find(|s| s.name == n).expect(n);
+		s.facts.id_tag.clone().expect("id_tag")
+	};
+	let key = "l4-settled";
+	let content = format!("f1~zqm-{key}");
+	let first = seed_blob(fx, alice, key, "zqm-l4-a", None, None, None).await;
+	seed_blob(fx, alice, key, "zqm-l4-b", None, None, None).await;
+	let grantee = tag("direct@alice.test");
+	let grant = CreateShareEntry {
+		subject_type: 'U',
+		subject_id: grantee.clone(),
+		permission: 'R',
+		expires_at: None,
+	};
+	fx.app
+		.meta_adapter
+		.create_share_entry(alice, 'F', &first, ALICE, &grant)
+		.await
+		.unwrap();
+
+	let fshr = |issuer: String, sub_typ: &'static str, audience: String| {
+		let ctx = HookContext::builder()
+			.action_id("a1~zqm-l4")
+			.action_type("FSHR")
+			.subtype(Some(sub_typ.into()))
+			.issuer(issuer)
+			.audience(Some(audience))
+			.subject(Some(content.clone()))
+			.tenant(alice, ALICE, "person")
+			.build();
+		fshr::on_create(fx.app.clone(), ctx)
+	};
+	for n in ["follower@alice.test", "g-read@alice.test", "stranger@alice.test"] {
+		let r = fshr(tag(n), "READ", grantee.clone()).await;
+		assert!(r.is_err(), "{n} re-emits a settled grant");
+		let r = fshr(tag(n), "DEL", tag("connected@alice.test")).await;
+		assert!(r.is_err(), "{n} emits a DEL that revokes nothing");
+	}
+	let r = fshr(ALICE.into(), "READ", grantee.clone()).await;
+	assert!(r.is_ok(), "the tenant re-emits a settled grant: {r:?}");
+}
+
+/// A random entry id may start with `b`; the file guard must not take it for a variant id
+/// (`b…~hash`). Seeds Direct entries until one starts with `b` (1 in 62 per draw).
+#[tokio::test]
+async fn an_entry_id_starting_with_b_is_not_a_variant() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let mut entry = None;
+	for i in 0..1000 {
+		let e = seed_blob(fx, alice, &format!("b-entry-{i}"), "zqm-b", None, None, None).await;
+		if e.starts_with('b') {
+			entry = Some(e);
+			break;
+		}
+	}
+	let entry = entry.expect("no b-prefixed entry id in 1000 draws");
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let get = |n: &str| {
+		let uri = format!("/api/files/{entry}/metadata");
+		call(&fx.api, req(ALICE, Method::GET, &uri, bearer(subj(n)), Body::empty()))
+	};
+	let (st, body) = get("owner@alice").await;
+	assert!(st.is_success(), "owner reads a b-prefixed entry id: {st} {body}");
+	for n in ["stranger@alice.test", "sharelink-r@alice", "idp-key@alice"] {
+		let (st, _) = get(n).await;
+		assert!(!st.is_success(), "{n} reads a Direct entry: {st}");
+	}
+	let uri = format!("/api/files/{entry}/tag/zqm-b");
+	let r = req(ALICE, Method::PUT, &uri, bearer(subj("owner@alice")), Body::empty());
+	let (st, body) = call(&fx.api, r).await;
+	assert!(st.is_success(), "owner tags a b-prefixed entry id: {st} {body}");
+}
+
+/// A share-link token on `entry` (`access` R/C/W), minted through the ref route.
+async fn link_token(
+	fx: &Fixture,
+	tn: cloudillo::types::TnId,
+	host: &str,
+	ref_id: &str,
+	entry: &str,
+	access: char,
+) -> String {
+	use cloudillo::meta_adapter::{CreateRefOptions, SHARE_FILE_REF_TYPE};
+	fx.app
+		.meta_adapter
+		.create_ref(
+			tn,
+			ref_id,
+			&CreateRefOptions {
+				typ: SHARE_FILE_REF_TYPE.into(),
+				description: None,
+				expires_at: None,
+				count: None,
+				resource_id: Some(entry.to_string()),
+				access_level: Some(access),
+				params: None,
+			},
+		)
+		.await
+		.unwrap();
+	let uri = format!("/api/auth/access-token?refId={ref_id}");
+	let (st, body) = call(&fx.api, req(host, Method::GET, &uri, None, Body::empty())).await;
+	assert!(st.is_success(), "mint {ref_id}: {st} {body}");
+	find_str(&body, "token").expect("link token")
+}
+
+/// One BLOB upload of `orig` bytes into document tree `root` (or none) and drive `channel`,
+/// finalized as `file_id` unless it dedups: its `entry_id`.
+async fn seed_part(
+	fx: &Fixture,
+	tn: cloudillo::types::TnId,
+	orig: &str,
+	root: Option<&str>,
+	channel: Option<&str>,
+	name: &str,
+	file_id: &str,
+) -> Box<str> {
+	use cloudillo::meta_adapter::{CreateFile, FileId, FileVariant};
+	let meta = &fx.app.meta_adapter;
+	let created = meta
+		.create_file(
+			tn,
+			CreateFile {
+				preset: Some("default".into()),
+				orig_variant_id: Some(orig.into()),
+				root_id: root.map(Into::into),
+				channel: channel.map(Into::into),
+				content_type: "text/plain".into(),
+				file_name: name.into(),
+				file_tp: Some("BLOB".into()),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	if let FileId::FId(f_id) = created.file_id {
+		let variant = FileVariant {
+			variant_id: orig,
+			variant: "orig",
+			format: "txt",
+			size: 1,
+			resolution: (0, 0),
+			available: true,
+			global: false,
+			duration: None,
+			bitrate: None,
+			page_count: None,
+		};
+		meta.create_file_variant(tn, f_id, variant).await.unwrap();
+		meta.finalize_file(tn, f_id, file_id).await.unwrap();
+	}
+	created.entry_id
+}
+
+/// A document link reaches its own tree, in the document's own drive, and nothing else. The
+/// same bytes uploaded privately (no `rootId`) are other content — the upload dedup keys on the
+/// tree root — and another drive's placement of a tree part is outside the link. Neither a read
+/// (R) nor a write (W) link reads, lists, renames or trashes them, and deleting the document
+/// tombstones neither. A tree part needs write access to its root.
+#[tokio::test]
+async fn doc_link_stays_inside_its_tree_and_drive() {
+	use cloudillo::meta_adapter::FileStatus;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let owner = subj("owner@alice");
+	let post = |s: &'static subjects::Subject, host: &'static str, v: serde_json::Value| async move {
+		let r = req(host, Method::POST, "/api/files", bearer(s), Body::from(v.to_string()));
+		call(&fx.api, r).await
+	};
+	let doc_json = serde_json::json!({
+		"fileTp": "CRDT", "contentType": "cloudillo/quillo", "fileName": "zqm-h1-doc"
+	});
+	let (st, body) = post(owner, ALICE, doc_json).await;
+	assert!(st.is_success(), "doc: {st} {body}");
+	let doc_entry = find_str(&body, "entryId").expect("doc entryId");
+	let doc = find_str(&body, "fileId").expect("doc fileId");
+
+	let orig = "b1~zqm-h1-bytes";
+	let room = format!("@{ALICE}~close-friends");
+	let part = seed_part(fx, alice, orig, Some(&doc), None, "zqm-h1-part", "f1~zqm-h1-tree").await;
+	let private = seed_part(fx, alice, orig, None, None, "zqm-h1-private", "f1~zqm-h1-priv").await;
+	let in_room =
+		seed_part(fx, alice, orig, Some(&doc), Some(&room), "zqm-h1-room", "f1~zqm-h1-x").await;
+	let private_view = meta.read_file(alice, &private).await.unwrap().expect("private");
+	assert_eq!(private_view.index_id(), "f1~zqm-h1-priv", "no dedup across tree roots");
+	assert!(private_view.root_id.is_none());
+
+	for (access, ref_id) in [('R', "zqref-h1-r"), ('W', "zqref-h1-w")] {
+		let token = link_token(fx, alice, ALICE, ref_id, &doc_entry, access).await;
+		let send = |m: Method, uri: String, body: &'static str| {
+			let token = token.clone();
+			async move { call(&fx.api, req(ALICE, m, &uri, Some(&token), Body::from(body))).await }
+		};
+		let (st, body) = send(Method::GET, format!("/api/files/{part}/metadata"), "").await;
+		assert!(st.is_success(), "{access} link reads its own tree part: {st} {body}");
+		let (st, list) = send(Method::GET, "/api/files".into(), "").await;
+		assert!(st.is_success(), "{access} list: {st} {list}");
+		let list = list.to_string();
+		for (entry, what) in [(&private, "private upload"), (&in_room, "room placement")] {
+			assert!(!list.contains(&**entry), "{access} link lists the {what}: {list}");
+			let (st, _) = send(Method::GET, format!("/api/files/{entry}/metadata"), "").await;
+			assert!(!st.is_success(), "{access} link reads the {what}: {st}");
+			let uri = format!("/api/files/{entry}");
+			let (st, _) = send(Method::PATCH, uri.clone(), r#"{"fileName":"zqm-pwned"}"#).await;
+			assert!(!st.is_success(), "{access} link renames the {what}: {st}");
+			let (st, _) = send(Method::DELETE, uri, "").await;
+			assert!(!st.is_success(), "{access} link trashes the {what}: {st}");
+		}
+	}
+
+	// Deleting the document takes its own drive's tree with it, nothing else.
+	for q in ["", "?permanent=true"] {
+		let uri = format!("/api/files/{doc_entry}{q}");
+		let (st, body) =
+			call(&fx.api, req(ALICE, Method::DELETE, &uri, bearer(owner), Body::empty())).await;
+		assert!(st.is_success(), "delete doc {q}: {st} {body}");
+	}
+	let status =
+		|e: Box<str>| async move { meta.read_file(alice, &e).await.unwrap().unwrap().status };
+	assert!(matches!(status(part.clone()).await, FileStatus::Deleted), "the tree part goes");
+	assert!(!matches!(status(private.clone()).await, FileStatus::Deleted), "private tombstoned");
+	assert!(!matches!(status(in_room.clone()).await, FileStatus::Deleted), "room part tombstoned");
+
+	// A tree part needs write access to its root: a contributor who cannot enter the root's room
+	// is refused; the owner's part joins the root's drive.
+	// Moderators only: a contributor cannot enter it.
+	let club_room = "@club.test~mods";
+	let club_owner = subj("owner@club");
+	let doc_json = serde_json::json!({
+		"fileTp": "CRDT", "contentType": "cloudillo/quillo", "fileName": "zqm-h1-club-doc",
+		"channel": club_room
+	});
+	let (st, body) = post(club_owner, CLUB, doc_json).await;
+	assert!(st.is_success(), "club doc: {st} {body}");
+	let club_doc = find_str(&body, "fileId").expect("club doc fileId");
+	let child = serde_json::json!({
+		"fileTp": "CRDT", "contentType": "cloudillo/quillo", "fileName": "zqm-h1-child",
+		"rootId": club_doc
+	});
+	for n in ["m-contributor@club.test", "stranger@club.test", "sharelink-w@club"] {
+		let (st, body) = post(subj(n), CLUB, child.clone()).await;
+		assert!(!st.is_success(), "{n} adds a part under a root it cannot write: {st} {body}");
+	}
+	let (st, body) = post(club_owner, CLUB, child).await;
+	assert!(st.is_success(), "owner adds a part: {st} {body}");
+	let child = find_str(&body, "entryId").expect("child entryId");
+	let view = meta.read_file(fx.tenants.club.tn_id, &child).await.unwrap().expect("child");
+	assert_eq!(view.channel.as_deref(), Some(club_room), "the part joins its root's drive");
+}
+
+/// A Pin / Place reference holds no local bytes, even over content this node holds under the
+/// same id: neither its placer — a community member, or a stranger on a personal tenant — nor
+/// anyone else reads bytes through it, by its entry id, the content id or the variant id. The
+/// local owner still reads their own content. The fixture has no upstream to fetch Pin metadata
+/// from, so the reference is written as `post_file_cross_context` writes it.
+#[tokio::test]
+async fn a_pin_holds_no_local_bytes() {
+	use cloudillo::meta_adapter::{CreateFile, FileStatus};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let meta = &fx.app.meta_adapter;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let cases = [
+		// A room the contributor cannot enter (moderators only).
+		(
+			fx.tenants.club.tn_id,
+			CLUB,
+			"m-contributor@club.test",
+			"owner@club",
+			Some("@club.test~mods"),
+		),
+		(fx.tenants.alice.tn_id, ALICE, "stranger@alice.test", "owner@alice", None),
+	];
+	for (i, (tn, host, placer, owner, room)) in cases.into_iter().enumerate() {
+		let key = format!("pin-local-{i}");
+		let content = format!("f1~zqm-{key}");
+		seed_blob(fx, tn, &key, "zqm-pin-local", None, room, None).await;
+		let placer_tag = subj(placer).facts.id_tag.clone().expect("placer id_tag");
+		let pin = meta
+			.create_file(
+				tn,
+				CreateFile {
+					file_id: Some(content.as_str().into()),
+					upstream_tag: Some("zqm-pin-up.test".into()),
+					owner_tag: Some(placer_tag.as_str().into()),
+					content_type: "text/plain".into(),
+					file_name: "zqm-pin-ref".into(),
+					file_tp: Some("BLOB".into()),
+					visibility: Some('C'),
+					status: Some(FileStatus::Active),
+					..Default::default()
+				},
+			)
+			.await
+			.unwrap()
+			.entry_id;
+		let view = meta.read_file(tn, &pin).await.unwrap().expect("pin");
+		assert!(view.preset.is_none(), "{placer}: the reference links local content");
+
+		let get = |n: &str, uri: String| {
+			call(&fx.api, req(host, Method::GET, &uri, bearer(subj(n)), Body::empty()))
+		};
+		let (st, body) = get(placer, format!("/api/files/{pin}/metadata")).await;
+		assert!(st.is_success(), "{placer} reads their own pin's metadata: {st} {body}");
+		for uri in [
+			format!("/api/files/{pin}/descriptor"),
+			format!("/api/files/{pin}"),
+			format!("/api/files/{content}/descriptor"),
+			format!("/api/files/{content}"),
+			format!("/api/files/variant/b1~zqm-{key}"),
+		] {
+			let (st, body) = get(placer, uri.clone()).await;
+			assert!(!st.is_success(), "{placer} reads local bytes via {uri}: {st} {body}");
+		}
+		let (st, body) = get(owner, format!("/api/files/{content}/descriptor")).await;
+		assert!(st.is_success(), "{owner} reads their own content: {st} {body}");
+	}
+}
+
+/// A reference claiming to be a folder naming a local content id gets a fresh entry id: it never
+/// takes the id as its own `entry_id`, which `resolve` checks first and would shadow the local
+/// content with. A Pin is written as `post_file_cross_context` writes it (no upstream in the
+/// fixture); an inbound FSHR with `fileTp: FLDR` is refused at delivery by its content schema.
+#[tokio::test]
+async fn a_remote_folder_never_shadows_a_local_id() {
+	use cloudillo::meta_adapter::{CreateFile, FileStatus};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let owner = fx.subjects.iter().find(|s| s.name == "owner@alice").expect("owner");
+	let forger = connected_remote(fx, "zqm-fldr-forger").await;
+
+	for (key, via_fshr) in [("fldr-pin", false), ("fldr-fshr", true)] {
+		let content = format!("f1~zqm-{key}");
+		let local = seed_blob(fx, alice, key, "zqm-fldr-local", None, None, None).await;
+		if via_fshr {
+			let mut claims = fshr_token(&forger, "WRITE", &content);
+			claims.c = Some(serde_json::json!({
+				"contentType": "cloudillo/folder", "fileName": "zqm-fldr", "fileTp": "FLDR"
+			}));
+			let (st, _) = inbox_sync(fx, &forger, &claims).await;
+			assert_eq!(st, StatusCode::BAD_REQUEST, "FSHR of a folder delivered");
+		} else {
+			let pin = CreateFile {
+				file_id: Some(content.as_str().into()),
+				upstream_tag: Some("zqm-fldr-up.test".into()),
+				content_type: "cloudillo/folder".into(),
+				file_name: "zqm-fldr".into(),
+				file_tp: Some("FLDR".into()),
+				status: Some(FileStatus::Active),
+				..Default::default()
+			};
+			let reference = meta.create_file(alice, pin).await.unwrap().entry_id;
+			assert_ne!(&*reference, content, "the reference took the local id");
+		}
+
+		let l = meta.read_file(alice, &local).await.unwrap().expect("local");
+		assert!(l.upstream_tag.is_none(), "{key}: local entry changed");
+		assert_eq!(l.file_tp.as_deref(), Some("BLOB"), "{key}: local entry changed");
+		if let Ok(Some(v)) = meta.read_file(alice, &content).await {
+			assert!(v.upstream_tag.is_none(), "{key}: the content id resolves to the reference");
+		}
+		let uri = format!("/api/files/{content}/descriptor");
+		let (st, body) =
+			call(&fx.api, req(ALICE, Method::GET, &uri, bearer(owner), Body::empty())).await;
+		assert!(st.is_success(), "{key}: owner reads their own content: {st} {body}");
+	}
+}
+
+/// A forged inbound FSHR naming a private local content id, accepted, lands as a reference: it
+/// links no local bytes, rewrites nothing on the local content, and serves none.
+#[tokio::test]
+async fn a_forged_fshr_exposes_no_local_bytes() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let owner = subj("owner@alice");
+	let forger = connected_remote(fx, "zqm-forge-peer").await;
+	let content = "f1~zqm-forge";
+	let local = seed_blob(fx, alice, "forge", "zqm-forge-local", None, None, None).await;
+
+	let mut claims = fshr_token(&forger, "WRITE", content);
+	claims.c = Some(serde_json::json!({
+		"contentType": "application/x-forged", "fileName": "zqm-forged", "fileTp": "CRDT"
+	}));
+	let (st, action_id) = inbox_sync(fx, &forger, &claims).await;
+	assert!(st.is_success(), "FSHR delivery: {st}");
+	let uri = format!("/api/actions/{action_id}/accept");
+	let (st, body) =
+		call(&fx.api, req(ALICE, Method::POST, &uri, bearer(owner), Body::empty())).await;
+	assert!(st.is_success(), "accept: {st} {body}");
+
+	let entries = meta.list_content_entries(alice, content).await.unwrap();
+	let reference = entries
+		.iter()
+		.find(|e| e.upstream_tag.as_deref() == Some(forger.id_tag.as_str()))
+		.expect("the accepted share's reference")
+		.entry_id
+		.clone();
+	let l = meta.read_file(alice, &local).await.unwrap().expect("local");
+	assert_eq!(l.content_type.as_deref(), Some("text/plain"), "local content rewritten");
+	assert_eq!(l.file_tp.as_deref(), Some("BLOB"), "local content type flipped");
+
+	let get = |n: &str, uri: String| {
+		call(&fx.api, req(ALICE, Method::GET, &uri, bearer(subj(n)), Body::empty()))
+	};
+	for uri in [format!("/api/files/{reference}/descriptor"), format!("/api/files/{reference}")] {
+		let (st, body) = get("owner@alice", uri.clone()).await;
+		assert_eq!(st, StatusCode::NOT_FOUND, "bytes served through the reference: {uri} {body}");
+	}
+	for n in [
+		"stranger@alice.test",
+		"follower@alice.test",
+		"sharelink-r@alice",
+		"idp-key@alice",
+	] {
+		let (st, _) = get(n, format!("/api/files/{content}/descriptor")).await;
+		assert!(!st.is_success(), "{n} reads the private content: {st}");
+	}
+	// Refresh names one placement; a content id naming two is refused.
+	let uri = format!("/api/files/{content}/refresh");
+	let (st, body) =
+		call(&fx.api, req(ALICE, Method::POST, &uri, bearer(owner), Body::empty())).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "refresh by content id: {body}");
+}
+
+/// Seeded file `name` on alice.
+fn alice_file<'a>(fx: &'a Fixture, name: &str) -> &'a objects::FileObj {
+	let alice = fx.tenants.alice.tn_id;
+	fx.objs
+		.iter()
+		.find_map(|o| match o {
+			fixture::Obj::File(f) if f.tn_id == alice && f.spec.name == name => Some(f),
+			_ => None,
+		})
+		.expect(name)
+}
+
+/// A published package's content id also names its action-managed entry. Container content
+/// resolves over both entries — never 409 — and still denies who neither admits.
+#[tokio::test]
+async fn container_content_multi_entry() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let (p_file, d_file) =
+		(alice_file(fx, "apkg-blob-p-active"), alice_file(fx, "apkg-blob-d-active"));
+	let action = "a1~zqm-apkg-pub";
+	for (f, vis) in [(p_file, 'P'), (d_file, 'D')] {
+		fx.app
+			.meta_adapter
+			.create_managed_entry(alice, &f.file_id, "x", Some(action), Some(vis), None)
+			.await
+			.unwrap();
+	}
+	let rows = [
+		("ACM-01", "anon@alice.test", p_file, true),
+		("ACM-02", "owner@alice", d_file, true),
+		("ACM-03", "stranger@alice.test", d_file, false),
+		("ACM-04", "sharelink-r@alice", d_file, false),
+		("ACM-05", "idp-key@alice", d_file, false),
+	];
+	for (id, subject, f, allow) in rows {
+		let s = fx.subjects.iter().find(|s| s.name == subject).expect(subject);
+		let path = format!("/api/files/{}/content/index.html", f.file_id);
+		let (status, body) =
+			call(&fx.api, req(ALICE, Method::GET, &path, bearer(s), Body::empty())).await;
+		assert_ne!(status, StatusCode::CONFLICT, "{id}: {body}");
+		assert_eq!(status.is_success(), allow, "{id} {subject}: {status} {body}");
+	}
+	fx.app.meta_adapter.delete_managed_entries(alice, action).await.unwrap();
+}
+
+/// `?via=` naming a deduplicated content id: the embedding counts through every placement of the
+/// container the caller reaches, and only those.
+#[tokio::test]
+async fn via_a_content_id_weighs_reachable_placements() {
+	use cloudillo::meta_adapter::{CreateFile, CreateShareEntry};
+	use cloudillo_core::file_access::{FileAccessCtx, check_file_access};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	// The container: entry #1 public, entry #2 Direct, one content.
+	let first = seed_blob(fx, alice, "via-multi", "zqm-via-multi", Some('P'), None, None).await;
+	let container = "f1~zqm-via-multi";
+	let second = meta
+		.create_entry_for_content(
+			alice,
+			container,
+			CreateFile { file_name: "zqm-via-multi-2".into(), ..Default::default() },
+		)
+		.await
+		.unwrap();
+	let link = |entry: &str| CreateShareEntry {
+		subject_type: 'F',
+		subject_id: entry.to_string(),
+		permission: 'R',
+		expires_at: None,
+	};
+	// Embedded via entry #2 only; `unlinked` is embedded nowhere; `public` is public and linked
+	// via entry #2 only.
+	let linked = seed_blob(fx, alice, "via-linked", "zqm-via-linked", None, None, None).await;
+	let unlinked = seed_blob(fx, alice, "via-unlinked", "zqm-via-unlinked", None, None, None).await;
+	let public = seed_blob(fx, alice, "via-public", "zqm-via-public", Some('P'), None, None).await;
+	for target in [&linked, &public] {
+		meta.create_share_entry(alice, 'F', target, ALICE, &link(&second))
+			.await
+			.unwrap();
+	}
+	assert_ne!(first, second);
+
+	let ctx = |user: &'static str, names_holder: bool| FileAccessCtx {
+		user_id_tag: user,
+		tenant_id_tag: ALICE,
+		user_roles: &[],
+		hatted: false,
+		scope: None,
+		names_holder,
+	};
+	let owner = ctx(ALICE, true);
+	let r = check_file_access(&fx.app, alice, &linked, &owner, Some(container)).await;
+	assert!(r.is_ok(), "owner opens the embed via the content id");
+	let r = check_file_access(&fx.app, alice, &unlinked, &owner, Some(container)).await;
+	assert!(r.is_err(), "no link from any placement: no embedding");
+
+	// A stranger reaches only the public entry #1; the link sits on entry #2.
+	let stranger = fx.subjects.iter().find(|s| s.name == "stranger@alice.test").expect("stranger");
+	let stranger_tag: &'static str =
+		Box::leak(stranger.facts.id_tag.clone().expect("stranger id_tag").into_boxed_str());
+	let r = check_file_access(&fx.app, alice, &public, &ctx(stranger_tag, false), Some(container))
+		.await;
+	assert!(r.is_err(), "a link on an unreachable placement embeds nothing");
+	let r = check_file_access(&fx.app, alice, &public, &ctx(stranger_tag, false), None).await;
+	assert!(r.is_ok(), "the fixture: the stranger reads the public target directly");
+}
+
+/// A write by content id targets the user entry, never a post's managed entry of the same
+/// content (that one lives and dies with its action). Managed-only content is unit-tested next to
+/// `single_placement`.
+#[tokio::test]
+async fn placement_skips_managed() {
+	use cloudillo::types::AccessLevel;
+	use cloudillo_core::file_access::{FileAccessCtx, resolve_placement};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let f = alice_file(fx, "tenant-blob-d-active");
+	let action = "a1~zqm-place-1";
+	fx.app
+		.meta_adapter
+		.create_managed_entry(alice, &f.file_id, "x", Some(action), Some('F'), None)
+		.await
+		.unwrap();
+	let send = |n: &str, m: Method, uri: String| {
+		let s = fx.subjects.iter().find(|s| s.name == n).expect(n);
+		call(&fx.api, req(ALICE, m, &uri, bearer(s), Body::empty()))
+	};
+	let tag = format!("/api/files/{}/tag/pmg", f.file_id);
+
+	// PMG-01: the owner tags by content id; the tag lands on the upload entry.
+	let (st, body) = send("owner@alice", Method::PUT, tag.clone()).await;
+	assert!(st.is_success(), "PMG-01: {st} {body}");
+	let uri = format!("/api/files/{}/metadata", f.entry_id);
+	let (st, body) = send("owner@alice", Method::GET, uri).await;
+	assert!(st.is_success(), "PMG-01 metadata: {st} {body}");
+	assert!(body["data"]["tags"].to_string().contains("\"pmg\""), "PMG-01: {body}");
+	let (st, body) = send("owner@alice", Method::DELETE, tag.clone()).await;
+	assert!(st.is_success(), "PMG-01 untag: {st} {body}");
+
+	// PMG-02: the resolver picks the upload entry.
+	let ctx = FileAccessCtx {
+		user_id_tag: ALICE,
+		tenant_id_tag: ALICE,
+		user_roles: &[],
+		hatted: false,
+		scope: None,
+		names_holder: true,
+	};
+	let r = resolve_placement(&fx.app, alice, &f.file_id, &ctx, AccessLevel::Write)
+		.await
+		.expect("PMG-02");
+	assert_eq!(&*r.file_view.entry_id, f.entry_id, "PMG-02");
+
+	// PMG-03: denied subjects, including credentials carrying alice's id_tag, never 409.
+	for n in ["stranger@alice.test", "sharelink-r@alice", "idp-key@alice"] {
+		let (st, body) = send(n, Method::PUT, tag.clone()).await;
+		assert_ne!(st, StatusCode::CONFLICT, "PMG-03 {n}: {body}");
+		assert!(!st.is_success(), "PMG-03 {n}: {st} {body}");
+	}
+	fx.app.meta_adapter.delete_managed_entries(alice, action).await.unwrap();
+}
+
+/// A reference over content `content` placed by `placer` (as `post_file_cross_context` writes it;
+/// the fixture has no upstream to fetch Pin metadata from), readable by `placer` itself.
+async fn seed_reference(
+	fx: &Fixture,
+	tn: cloudillo::types::TnId,
+	content: &str,
+	file_tp: &str,
+	placer: &str,
+) -> Box<str> {
+	use cloudillo::meta_adapter::{CreateFile, FileStatus};
+	let s = fx.subjects.iter().find(|s| s.name == placer).expect(placer);
+	let placer_tag = s.facts.id_tag.clone().expect("placer id_tag");
+	fx.app
+		.meta_adapter
+		.create_file(
+			tn,
+			CreateFile {
+				file_id: Some(content.into()),
+				upstream_tag: Some("zqm-ref-up.test".into()),
+				owner_tag: Some(placer_tag.as_str().into()),
+				content_type: "text/plain".into(),
+				file_name: "zqm-ref".into(),
+				file_tp: Some(file_tp.into()),
+				visibility: Some('C'),
+				status: Some(FileStatus::Active),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap()
+		.entry_id
+}
+
+/// A Pin over local content lends no attach right: the attach grant must come from a local
+/// entry. The placer reads its own Pin, but not the private local content under the same id, so
+/// create, draft PATCH and publish all refuse the attachment.
+#[tokio::test]
+async fn a_pin_cannot_launder_attach_rights() {
+	use cloudillo::meta_adapter::UpdateActionDataOptions;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let cases = [
+		(fx.tenants.alice.tn_id, ALICE, "connected@alice.test", None),
+		// A room the contributor cannot enter (moderators only).
+		(fx.tenants.club.tn_id, CLUB, "m-contributor@club.test", Some("@club.test~mods")),
+	];
+	for (i, (tn, host, placer, room)) in cases.into_iter().enumerate() {
+		let key = format!("launder-{i}");
+		let content = format!("f1~zqm-{key}");
+		seed_blob(fx, tn, &key, "zqm-launder", None, room, None).await;
+		seed_reference(fx, tn, &content, "BLOB", placer).await;
+		let send = |m: Method, uri: String, v: serde_json::Value| {
+			call(&fx.api, req(host, m, &uri, bearer(subj(placer)), Body::from(v.to_string())))
+		};
+
+		let v = serde_json::json!({
+			"type": "POST", "content": "zqm launder", "visibility": "P", "attachments": [content]
+		});
+		let (st, body) = send(Method::POST, "/api/actions".into(), v).await;
+		assert!(st.is_client_error(), "{placer} attaches through a Pin: {st} {body}");
+
+		let v = serde_json::json!({ "type": "POST", "content": "zqm launder", "draft": true });
+		let (st, body) = send(Method::POST, "/api/actions".into(), v).await;
+		// A placer that may not post at all is refused before the attachment check; the other
+		// arms above and below still run.
+		let Some(id) = st.is_success().then(|| find_str(&body, "actionId")).flatten() else {
+			assert!(st.is_client_error(), "{placer} draft: {st} {body}");
+			continue;
+		};
+		let patch = serde_json::json!({ "attachments": [content] });
+		let (st, body) = send(Method::PATCH, format!("/api/actions/{id}"), patch).await;
+		assert!(st.is_client_error(), "{placer} PATCHes an attachment through a Pin: {st} {body}");
+		let opts = UpdateActionDataOptions {
+			attachments: Patch::Value(content.clone()),
+			..Default::default()
+		};
+		fx.app.meta_adapter.update_action_data(tn, &id, &opts).await.unwrap();
+		let uri = format!("/api/actions/{id}/publish");
+		let (st, body) = send(Method::POST, uri, serde_json::json!({})).await;
+		assert!(st.is_client_error(), "{placer} publishes through a Pin: {st} {body}");
+	}
+}
+
+/// A reference holds no local bytes whatever its type: duplicating a CRDT reference whose id
+/// names a local document must not copy that document.
+#[tokio::test]
+async fn duplicating_a_crdt_reference_does_not_copy_local_doc() {
+	use cloudillo::meta_adapter::{CreateFile, FileStatus, ListFileOptions};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let cases = [
+		(fx.tenants.alice.tn_id, ALICE, "connected@alice.test", None),
+		(fx.tenants.club.tn_id, CLUB, "m-contributor@club.test", Some("@club.test~mods")),
+	];
+	for (i, (tn, host, placer, room)) in cases.into_iter().enumerate() {
+		let doc = format!("f1~zqm-dupref-{i}");
+		fx.app
+			.meta_adapter
+			.create_file(
+				tn,
+				CreateFile {
+					file_id: Some(doc.as_str().into()),
+					content_type: "cloudillo/quillo".into(),
+					file_name: "zqm-dupref-doc".into(),
+					file_tp: Some("CRDT".into()),
+					channel: room.map(Into::into),
+					status: Some(FileStatus::Active),
+					..Default::default()
+				},
+			)
+			.await
+			.unwrap();
+		let reference = seed_reference(fx, tn, &doc, "CRDT", placer).await;
+
+		let copy = format!("zqm-dupref-copy-{i}");
+		let v = serde_json::json!({ "fileName": copy });
+		let uri = format!("/api/files/{reference}/duplicate");
+		let r = req(host, Method::POST, &uri, bearer(subj(placer)), Body::from(v.to_string()));
+		let (st, body) = call(&fx.api, r).await;
+		assert!(!st.is_success(), "{placer} duplicates a CRDT reference: {st} {body}");
+		let opts = ListFileOptions { file_name: Some(copy), ..Default::default() };
+		let left = fx.app.meta_adapter.list_files(tn, &opts).await.unwrap();
+		assert!(left.is_empty(), "{placer}: a refused duplicate left an entry: {left:?}");
+	}
+}
+
+/// Two local entries share one BLOB: a Direct entry in a room the member cannot enter, and a
+/// public one by another owner. The member attaches the content through the public entry; the
+/// Direct entry's name must never surface. The fixture runs no scheduler, so the managed entry
+/// `ActionCreatorTask` names (`may_attach`) is never written here: this asserts on what the
+/// handler stores and returns.
+#[tokio::test]
+async fn attachment_name_never_comes_from_a_sibling() {
+	use cloudillo::meta_adapter::CreateFile;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+	let member = fx.subjects.iter().find(|s| s.name == "m-contributor@club.test").expect("m");
+	let key = "sibling-name";
+	let content = format!("f1~zqm-{key}");
+	seed_blob(fx, club, key, "zqm-secret-name", None, Some("@club.test~mods"), None).await;
+	fx.app
+		.meta_adapter
+		.create_entry_for_content(
+			club,
+			&content,
+			CreateFile {
+				owner_tag: Some("zqm-other-owner.test".into()),
+				file_name: "zqm-public-name".into(),
+				visibility: Some('P'),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+
+	let v = serde_json::json!({
+		"type": "POST", "content": "zqm sibling", "draft": true, "attachments": [content]
+	});
+	let r = req(CLUB, Method::POST, "/api/actions", bearer(member), Body::from(v.to_string()));
+	let (st, body) = call(&fx.api, r).await;
+	assert!(!body.to_string().contains("zqm-secret-name"), "sibling name leaked: {st} {body}");
+	if st.is_success() {
+		assert!(body.to_string().contains(&content), "the content id is stored: {body}");
+	}
+}
+
+/// `check_reference_subject` refuses a reference over local non-BLOB content and over content
+/// another upstream already holds. Called directly: the API path (`POST /api/files` with
+/// `sourceIdTag`) fetches the source from a remote peer the fixture does not have. A forged FSHR
+/// runs the same helper (`fshr::on_receive`).
+#[tokio::test]
+async fn a_reference_cannot_name_local_content() {
+	use cloudillo::error::Error;
+	use cloudillo::meta_adapter::{CreateFile, FileStatus};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let doc = "f1~zqm-refsubj-doc";
+	fx.app
+		.meta_adapter
+		.create_file(
+			alice,
+			CreateFile {
+				file_id: Some(doc.into()),
+				content_type: "cloudillo/quillo".into(),
+				file_name: "zqm-refsubj-doc".into(),
+				file_tp: Some("CRDT".into()),
+				status: Some(FileStatus::Active),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	let r =
+		cloudillo::file::management::check_reference_subject(&fx.app, alice, doc, "zqm-up.test")
+			.await;
+	assert!(matches!(r, Err(Error::PermissionDenied)), "local CRDT: {r:?}");
+
+	// Held from `zqm-ref-up.test` already: another upstream is refused, the same one is not.
+	let held = "f1~zqm-refsubj-held";
+	seed_reference(fx, alice, held, "BLOB", "connected@alice.test").await;
+	let check = |up: &'static str| {
+		cloudillo::file::management::check_reference_subject(&fx.app, alice, held, up)
+	};
+	let r = check("zqm-up.test").await;
+	assert!(matches!(r, Err(Error::PermissionDenied)), "another upstream: {r:?}");
+	assert!(check("zqm-ref-up.test").await.is_ok(), "the same upstream");
+}
+
+/// Re-uploading an identical container dedups onto the same content: its id then names two user
+/// entries, and container content resolves over both — never 409.
+#[tokio::test]
+async fn container_content_after_reupload() {
+	use cloudillo::meta_adapter::CreateFile;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let f = alice_file(fx, "apkg-blob-p-active");
+	let again = fx
+		.app
+		.meta_adapter
+		.create_entry_for_content(
+			alice,
+			&f.file_id,
+			CreateFile {
+				file_name: "zqm-apkg-again".into(),
+				visibility: Some('P'),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	let anon = fx.subjects.iter().find(|s| s.name == "anon@alice.test").expect("anon");
+	let path = format!("/api/files/{}/content/index.html", f.file_id);
+	let (st, body) =
+		call(&fx.api, req(ALICE, Method::GET, &path, bearer(anon), Body::empty())).await;
+	fx.app.meta_adapter.delete_file(alice, &again).await.unwrap();
+	assert!(st.is_success(), "container content over two entries: {st} {body}");
+}
+
+/// Duplicating a BLOB adds an entry over the same content, even into the same folder, and
+/// writes no content row.
+#[tokio::test]
+async fn duplicating_a_blob_adds_an_entry_only() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let owner = fx.subjects.iter().find(|s| s.name == "owner@alice").expect("owner");
+	let key = "dup-blob";
+	let content = format!("f1~zqm-{key}");
+	let entry = seed_blob(fx, alice, key, "zqm-dup-blob", None, None, None).await;
+	let before = fx.app.meta_adapter.list_content_entries(alice, &content).await.unwrap().len();
+
+	let uri = format!("/api/files/{entry}/duplicate");
+	let r = req(ALICE, Method::POST, &uri, bearer(owner), Body::from("{}"));
+	let (st, body) = call(&fx.api, r).await;
+	assert!(st.is_success(), "duplicate a BLOB: {st} {body}");
+	assert_eq!(find_str(&body, "fileId").as_deref(), Some(content.as_str()), "same content");
+	let copy = find_str(&body, "entryId").expect("entryId");
+	assert_ne!(copy, &*entry, "a new entry");
+	let after = fx.app.meta_adapter.list_content_entries(alice, &content).await.unwrap().len();
+	assert_eq!(after, before + 1, "one more entry over the same content");
+}
+
+/// A draft names its attachment `@<f_id>` while the upload is pending. When that upload dedups
+/// into existing content, `@<f_id>` resolves to nothing directly, but its content listing follows
+/// the redirect: publishing still checks (and passes) the surviving content's entries. Credentials
+/// that read no files never attach it.
+#[tokio::test]
+async fn a_deduped_draft_attachment_still_publishes() {
+	use cloudillo::meta_adapter::{CreateFile, FileId};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let subj = |n: &str| fx.subjects.iter().find(|s| s.name == n).expect(n);
+	let send = |n: &'static str, m: Method, uri: String, v: serde_json::Value| async move {
+		call(&fx.api, req(ALICE, m, &uri, bearer(subj(n)), Body::from(v.to_string()))).await
+	};
+	seed_blob(fx, alice, "dd", "zqm-dd", None, None, None).await;
+	let created = meta
+		.create_file(
+			alice,
+			CreateFile {
+				preset: Some("default".into()),
+				orig_variant_id: Some("b1~zqm-dd-2".into()),
+				owner_tag: Some(ALICE.into()),
+				content_type: "text/plain".into(),
+				file_name: "zqm-dd-2".into(),
+				file_tp: Some("BLOB".into()),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	let FileId::FId(old) = created.file_id else { panic!("a fresh upload: {created:?}") };
+	let att = format!("@{old}");
+
+	let v = serde_json::json!({
+		"type": "POST", "content": "zqm dd", "draft": true, "attachments": [att.clone()]
+	});
+	let (st, body) = send("owner@alice", Method::POST, "/api/actions".into(), v).await;
+	assert!(st.is_success(), "draft with a pending attachment: {st} {body}");
+	let id = find_str(&body, "actionId").expect("draft actionId");
+
+	meta.finalize_file(alice, old, "f1~zqm-dd").await.unwrap();
+	let uri = format!("/api/actions/{id}/publish");
+	let (st, body) = send("owner@alice", Method::POST, uri, serde_json::json!({})).await;
+	assert!(st.is_success(), "publish a deduped attachment: {st} {body}");
+
+	for n in ["owner-scoped-w@alice", "idp-key@alice", "sharelink-w@alice"] {
+		let v = serde_json::json!({ "type": "POST", "content": "zqm dd", "draft": true });
+		let (st, body) = send("owner@alice", Method::POST, "/api/actions".into(), v).await;
+		assert!(st.is_success(), "draft: {st} {body}");
+		let id = find_str(&body, "actionId").expect("draft actionId");
+		let patch = serde_json::json!({ "attachments": [att.clone()] });
+		let (st, _) = send(n, Method::PATCH, format!("/api/actions/{id}"), patch).await;
+		assert!(!st.is_success(), "{n} PATCHes the deduped attachment: {st}");
+		let uri = format!("/api/actions/{id}/publish");
+		let (st, _) = send(n, Method::POST, uri, serde_json::json!({})).await;
+		assert!(!st.is_success(), "{n} publishes the tenant's draft: {st}");
+	}
+}
+
+/// A room doc's `~meta` part joins the doc's drive, so the room's tree queries see it with its
+/// root, and a permanent delete takes it along.
+#[tokio::test]
+async fn room_doc_meta_joins_its_drive() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let owner = fx.subjects.iter().find(|s| s.name == "owner@club").expect("owner");
+	let send = |m: Method, uri: String, v: serde_json::Value| async move {
+		let body = if v.is_null() { Body::empty() } else { Body::from(v.to_string()) };
+		call(&fx.api, req(CLUB, m, &uri, bearer(owner), body)).await
+	};
+	let room = "@club.test~open-contrib";
+	let v = serde_json::json!({
+		"fileTp": "CRDT", "contentType": "cloudillo/quillo", "fileName": "zqm-meta-doc",
+		"channel": room,
+	});
+	let (st, body) = send(Method::POST, "/api/files".into(), v).await;
+	assert!(st.is_success(), "room doc: {st} {body}");
+	let entry = find_str(&body, "entryId").expect("entryId");
+	let content = find_str(&body, "fileId").expect("fileId");
+	let meta_id = format!("{content}~meta");
+
+	// What the RTDB upgrade runs once access is granted.
+	cloudillo::websocket::ensure_meta_file(&fx.app, club, &meta_id, &content)
+		.await
+		.unwrap_or_else(|_| panic!("ensure {meta_id}"));
+	let part = meta.read_file(club, &meta_id).await.unwrap().expect("meta part");
+	assert_eq!(part.channel.as_deref(), Some(room), "the meta part joins the room");
+
+	for q in ["", "?permanent=true"] {
+		let uri = format!("/api/files/{entry}{q}");
+		let (st, body) = send(Method::DELETE, uri, serde_json::Value::Null).await;
+		assert!(st.is_success(), "delete {q}: {st} {body}");
+	}
+	let gone = meta.read_file(club, &meta_id).await.unwrap();
+	assert!(gone.is_none(), "the meta part outlived its doc: {gone:?}");
+}
+
+/// Two entries of one BLOB share it with the same remote user. FSHR is keyed by content, so
+/// revoking one share while the sibling's still grants emits no DEL (it would overwrite the
+/// live grant's row); the last revocation does.
+#[tokio::test]
+async fn revoking_one_sibling_share_keeps_the_content_fshr() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let owner = fx.subjects.iter().find(|s| s.name == "owner@alice").expect("owner");
+	let send = |m: Method, uri: String, body: String| {
+		call(&fx.api, req(ALICE, m, &uri, bearer(owner), Body::from(body)))
+	};
+	let key = "sib-share";
+	let content = format!("f1~zqm-{key}");
+	let a = seed_blob(fx, alice, key, "zqm-sib-a", None, None, None).await;
+	let opts =
+		cloudillo::meta_adapter::CreateFile { file_name: "zqm-sib-b".into(), ..Default::default() };
+	let b = meta.create_entry_for_content(alice, &content, opts).await.unwrap();
+	let peer = connected_remote(fx, "zqm-sib-peer").await;
+	let body = format!(r#"{{"subjectType":"U","subjectId":"{}","permission":"R"}}"#, peer.id_tag);
+	let mut ids = Vec::new();
+	for entry in [&a, &b] {
+		let uri = format!("/api/files/{entry}/shares");
+		let (st, created) = send(Method::POST, uri, body.clone()).await;
+		assert!(st.is_success(), "share {entry}: {st} {created}");
+		ids.push(created["data"]["id"].as_i64().expect("share id"));
+	}
+	let fshr_key = format!("FSHR:{content}:{}", peer.id_tag);
+	let sub_typ = || async {
+		let row = meta.get_action_by_key(alice, &fshr_key).await.unwrap().expect("FSHR row");
+		row.sub_typ.map(String::from)
+	};
+	assert_eq!(sub_typ().await, None, "the grant's FSHR");
+
+	let uri = format!("/api/files/{a}/shares/{}", ids[0]);
+	let (st, body) = send(Method::DELETE, uri, String::new()).await;
+	assert!(st.is_success(), "revoke A: {st} {body}");
+	assert_eq!(sub_typ().await, None, "a DEL overwrote the sibling's live grant");
+
+	let uri = format!("/api/files/{b}/shares/{}", ids[1]);
+	let (st, body) = send(Method::DELETE, uri, String::new()).await;
+	assert!(st.is_success(), "revoke B: {st} {body}");
+	assert_eq!(sub_typ().await.as_deref(), Some("DEL"), "the last revocation federates");
+}
+
+/// One BLOB, two entries, a direct share on each to the same user: each entry is admitted at
+/// its own share's level, never the sibling's.
+#[tokio::test]
+async fn each_sibling_keeps_its_own_direct_share() {
+	use cloudillo::meta_adapter::CreateShareEntry;
+	use cloudillo::types::AccessLevel;
+	use cloudillo_core::file_access::{FileAccessCtx, resolve_placement};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let tag = |n: &str| -> &'static str {
+		let s = fx.subjects.iter().find(|s| s.name == n).expect(n);
+		Box::leak(s.facts.id_tag.clone().expect("id_tag").into_boxed_str())
+	};
+	let key = "sib-direct";
+	let content = format!("f1~zqm-{key}");
+	let a = seed_blob(fx, alice, key, "zqm-sibd-a", None, None, None).await;
+	let opts = cloudillo::meta_adapter::CreateFile {
+		file_name: "zqm-sibd-b".into(),
+		..Default::default()
+	};
+	let b = meta.create_entry_for_content(alice, &content, opts).await.unwrap();
+	let grantee = tag("g-read@alice.test");
+	for (entry, permission) in [(&a, 'R'), (&b, 'W')] {
+		let sh = CreateShareEntry {
+			subject_type: 'U',
+			subject_id: grantee.to_owned(),
+			permission,
+			expires_at: None,
+		};
+		meta.create_share_entry(alice, 'F', entry, ALICE, &sh).await.unwrap();
+	}
+	let ctx = |user: &'static str| FileAccessCtx {
+		user_id_tag: user,
+		tenant_id_tag: ALICE,
+		user_roles: &[],
+		hatted: false,
+		scope: None,
+		names_holder: true,
+	};
+	let r = resolve_placement(&fx.app, alice, &content, &ctx(grantee), AccessLevel::Read).await;
+	assert!(
+		matches!(r, Err(cloudillo::error::Error::Conflict(_))),
+		"both entries read, so a content id names neither: {:?}",
+		r.map(|a| a.file_view.entry_id)
+	);
+	let w = resolve_placement(&fx.app, alice, &content, &ctx(grantee), AccessLevel::Write)
+		.await
+		.expect("B's own Write share");
+	assert_eq!(w.file_view.entry_id, b, "only B writes");
+	assert_eq!(w.access_level, AccessLevel::Write);
+	let stranger = tag("stranger@alice.test");
+	let r = resolve_placement(&fx.app, alice, &content, &ctx(stranger), AccessLevel::Read).await;
+	assert!(r.is_err(), "a stranger reads a sibling-shared BLOB");
+}
+
+/// An FSHR is checked at receive, but another origin's reference to the same content can land
+/// while it waits (a Pin, or another accepted share). Accepting it then must not add a second
+/// origin's reference. Two FSHRs to one audience share a key, so the race is staged with a
+/// seeded reference. The accept route only logs hook errors, so the state is asserted.
+#[tokio::test]
+async fn a_pending_fshr_accepts_only_while_its_origin_is_unclaimed() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let owner = fx.subjects.iter().find(|s| s.name == "owner@alice").expect("owner");
+	let pending = connected_remote(fx, "zqm-dual-pending").await;
+	let held = connected_remote(fx, "zqm-dual-held").await;
+	let shared = "f1~zqm-dual";
+	let (st, action_id) = inbox_sync(fx, &pending, &fshr_token(&pending, "WRITE", shared)).await;
+	assert!(st.is_success(), "FSHR delivery: {st}");
+	seed_blob(fx, alice, "dual", "zqm-dual", None, None, Some(&held.id_tag)).await;
+
+	let uri = format!("/api/actions/{action_id}/accept");
+	let _ = call(&fx.api, req(ALICE, Method::POST, &uri, bearer(owner), Body::empty())).await;
+	let entries = meta.list_content_entries(alice, shared).await.unwrap();
+	assert_eq!(entries.len(), 1, "a second origin's reference landed: {entries:?}");
+	assert_eq!(entries[0].upstream_tag.as_deref(), Some(held.id_tag.as_str()));
+}

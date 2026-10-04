@@ -10,16 +10,18 @@
 
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
+mod common;
+
 use std::sync::Arc;
 
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::{
 	error::Error,
 	meta_adapter::{
-		Action, ActionId, CreateFile, FileStatus, FinalizeActionOptions, ListActionOptions,
-		ListFileOptions, ListProfileOptions, MANAGED_PARENT_ID, MetaAdapter, ProfileRelation,
-		ProfileType, SearchObject, SearchOptions, SearchPart, SearchRow, TRASH_PARENT_ID,
-		UpdateFileOptions, UpsertProfileFields,
+		Action, ActionId, CreateFile, CreateShareEntry, ENTRY_PART_KIND, FileStatus,
+		FinalizeActionOptions, ListActionOptions, ListFileOptions, ListProfileOptions,
+		MANAGED_PARENT_ID, MetaAdapter, ProfileRelation, ProfileType, SearchObject, SearchOptions,
+		SearchPart, SearchRow, TRASH_PARENT_ID, UpdateFileOptions, UpsertProfileFields,
 	},
 	types::{Patch, Timestamp, TnId},
 	worker::WorkerPool,
@@ -102,7 +104,6 @@ async fn index_text(
 				obj_tp: 'D',
 				obj_id: file_id,
 				content_type: Some("cloudillo/notillo"),
-				visibility: Some('P'),
 				fts_cl,
 				..Default::default()
 			},
@@ -422,8 +423,8 @@ one_mode! {
 		let (adapter, _dir) = create_test_adapter().await;
 		let tn_id = TnId(1);
 
-		// `upstream_tag` is the raw `files.upstream_tag` column: NULL for a file that originates
-		// here, set only on a cross-context Pin/Place copy. Both provenances at both levels.
+		// `upstream_tag` is the entry's own column: NULL for an entry that originates here, set
+		// only on a cross-context Pin/Place copy. Both provenances at both levels.
 		for (file_id, visibility, upstream_tag) in [
 			("f1~pub", Some('P'), None),
 			("f1~conn", Some('C'), None),
@@ -431,6 +432,18 @@ one_mode! {
 			("f1~mirror_pub", Some('P'), Some("alice")),
 			("f1~mirror_conn", Some('C'), Some("alice")),
 		] {
+			let entry_id = back_file(&adapter, tn_id, file_id, visibility, upstream_tag).await;
+			// A reference holds no bytes here, so it is found by its own entry part, never by a
+			// body row.
+			let parts = match upstream_tag {
+				None => vec![SearchPart { body: Some("shared secret"), ..Default::default() }],
+				Some(_) => vec![SearchPart {
+					part_id: &entry_id,
+					part_kind: Some(ENTRY_PART_KIND),
+					title: Some("shared secret"),
+					..Default::default()
+				}],
+			};
 			adapter
 				.replace_search_object(
 					tn_id,
@@ -438,11 +451,10 @@ one_mode! {
 						obj_tp: 'F',
 						obj_id: file_id,
 						upstream_tag,
-						visibility,
 						fts_cl,
 						..Default::default()
 					},
-					&[SearchPart { body: Some("shared secret"), ..Default::default() }],
+					&parts,
 				)
 				.await
 				.expect("index");
@@ -547,6 +559,8 @@ one_mode! {
 		let tn_id = TnId(1);
 		adapter.create_tenant(tn_id, "alice").await.ok();
 
+		back_file(&adapter, tn_id, "f1~root", Some('P'), None).await;
+		back_file(&adapter, tn_id, "f1~child", None, None).await;
 		// A Public container...
 		adapter
 			.replace_search_object(
@@ -554,7 +568,6 @@ one_mode! {
 				&SearchObject {
 					obj_tp: 'F',
 					obj_id: "f1~root",
-					visibility: Some('P'),
 					fts_cl,
 					..Default::default()
 				},
@@ -570,7 +583,6 @@ one_mode! {
 					obj_tp: 'D',
 					obj_id: "f1~child",
 					root_id: Some("f1~root"),
-					visibility: None,
 					fts_cl,
 					..Default::default()
 				},
@@ -1352,6 +1364,7 @@ one_mode! {
 		adapter.create_tenant(tn_id, "alice").await.ok();
 
 		for (file_id, visibility) in [("f1~pub", Some('P')), ("f1~conn", Some('C'))] {
+			back_file(&adapter, tn_id, file_id, visibility, None).await;
 			adapter
 				.replace_search_object(
 					tn_id,
@@ -1359,7 +1372,6 @@ one_mode! {
 						obj_tp: 'F',
 						obj_id: file_id,
 						upstream_tag: Some("alice"),
-						visibility,
 						fts_cl,
 						..Default::default()
 					},
@@ -1473,9 +1485,8 @@ one_mode! {
 }
 
 one_mode! {
-	/// `search_docs.upstream_tag` is the raw `files.upstream_tag` column: NULL for a file
-	/// that originates here, set only on
-	/// a cross-context Pin/Place copy. It must not
+	/// A file hit's `upstream_tag` is the admitted entry's own column: NULL for an entry
+	/// that originates here, set only on a cross-context Pin/Place copy. It must not
 	/// exempt a row from the level predicate — `GET /api/files` has no such
 	/// exemption, and for `'F'`/`'D'` the SQL prefilter *is* the authorization,
 	/// so an exemption here would hand a federated peer the titles, tags and
@@ -1493,7 +1504,6 @@ one_mode! {
 					obj_tp: 'F',
 					obj_id: "f1~pinned",
 					upstream_tag: Some("alice"),
-					visibility: None,
 					fts_cl,
 					..Default::default()
 				},
@@ -1508,7 +1518,6 @@ one_mode! {
 					obj_tp: 'D',
 					obj_id: "f1~pinned",
 					upstream_tag: Some("alice"),
-					visibility: None,
 					fts_cl,
 					..Default::default()
 				},
@@ -1704,6 +1713,34 @@ async fn reap_spans_a_large_tenant() {
 
 // --- what a sweep can see --------------------------------------------------
 
+/// The `files` row and entry behind a hand-built `'F'`/`'D'` index row: since v58 `search()`
+/// gates file hits on a live entry, so an index row with no placement is never a hit.
+async fn back_file(
+	adapter: &MetaAdapterSqlite,
+	tn_id: TnId,
+	file_id: &str,
+	visibility: Option<char>,
+	upstream_tag: Option<&str>,
+) -> Box<str> {
+	adapter
+		.create_file(
+			tn_id,
+			CreateFile {
+				file_id: Some(file_id.into()),
+				upstream_tag: upstream_tag.map(Into::into),
+				content_type: "text/plain".into(),
+				file_name: file_id.into(),
+				file_tp: Some("BLOB".into()),
+				status: Some(FileStatus::Active),
+				visibility,
+				..Default::default()
+			},
+		)
+		.await
+		.expect("create backing file")
+		.entry_id
+}
+
 /// A file at an explicit location, with an explicit `hidden` flag.
 async fn create_file_at(
 	adapter: &MetaAdapterSqlite,
@@ -1733,7 +1770,8 @@ async fn create_file_at(
 }
 
 fn file_ids(files: &[cloudillo_types::meta_adapter::FileView]) -> Vec<&str> {
-	let mut ids: Vec<&str> = files.iter().map(|f| &*f.file_id).collect();
+	let mut ids: Vec<&str> =
+		files.iter().map(cloudillo_types::meta_adapter::FileView::index_id).collect();
 	ids.sort_unstable();
 	ids
 }
@@ -1998,7 +2036,7 @@ both_modes! {
 		let files = adapter.list_files(tn_id, &opts).await.expect("sweep");
 		assert_eq!(file_ids(&files), vec!["f1~doc"], "the sweep must reach a trashed file");
 		for file in &files {
-			index_file(&adapter, tn_id, &file.file_id, fts_cl).await;
+			index_file(&adapter, tn_id, file.index_id(), fts_cl).await;
 		}
 
 		assert!(find(&adapter, tn_id, "Jegyzetek", fts_cl).await.is_empty(), "the 'F' row survived the sweep");
@@ -2026,7 +2064,6 @@ async fn index_tagged_page(
 				obj_tp: 'D',
 				obj_id: file_id,
 				content_type: Some("cloudillo/notillo"),
-				visibility: Some('P'),
 				fts_cl,
 				..Default::default()
 			},
@@ -2522,10 +2559,8 @@ one_mode! {
 
 // ── ACL columns denormalised out of `files` ──
 //
-// `search_docs` copies `visibility`, `upstream_tag` (sourced from `files.upstream_tag`),
-// `root_id` and `content_type` off the `files` row so a query can filter on them
-// without a join. Two rows
-// describe one document — its own `'F'` row and every `'D'` part — and they must
+// `search_docs` copies `upstream_tag`, `root_id` and `content_type` off the `files` row so a
+// query can filter on them without a join. Two rows describe one document — its own `'F'` row and every `'D'` part — and they must
 // agree, or the API reports a hit's owner differently depending on which row
 // matched, and the share-link grant stops finding the pages of the document it
 // was minted for.
@@ -2574,9 +2609,9 @@ async fn acl_rows(
 	.expect("read acl columns")
 }
 
-/// Index a standalone document's `'D'` parts the way `cloudillo_search::indexer`
-/// does: `root_id = COALESCE(files.root_id, file_id)`, `upstream_tag` the raw
-/// `files.upstream_tag` column.
+/// Index a standalone document's `'D'` parts: `root_id = COALESCE(files.root_id, file_id)`.
+/// `cloudillo_search::indexer` passes `upstream_tag: None` (provenance is per entry);
+/// a non-`None` value here stands for a stale or buggy caller.
 async fn index_doc_parts(
 	adapter: &MetaAdapterSqlite,
 	tn_id: TnId,
@@ -2592,7 +2627,6 @@ async fn index_doc_parts(
 				obj_id: file_id,
 				content_type: Some("application/x-notillo"),
 				upstream_tag,
-				visibility: Some('P'),
 				root_id: Some(file_id),
 				fts_cl,
 				..Default::default()
@@ -2622,6 +2656,21 @@ one_mode! {
 		let db = probe(&dir).await;
 
 		create_doc_file(&adapter, tn_id, "f1~note", None).await;
+		// Private, so only the grant can reach the pages.
+		adapter
+			.update_file_data(
+				tn_id,
+				"f1~note",
+				&UpdateFileOptions { visibility: Patch::Null, ..Default::default() },
+			)
+			.await
+			.expect("make private");
+		let entry_id = adapter
+			.read_file(tn_id, "f1~note")
+			.await
+			.expect("read")
+			.expect("note")
+			.entry_id;
 		index_doc_parts(&adapter, tn_id, "f1~note", None, fts_cl).await;
 		index_file(&adapter, tn_id, "f1~note", fts_cl).await;
 
@@ -2648,7 +2697,7 @@ one_mode! {
 		let granted = SearchOptions {
 			visible_levels: Some(vec!['P']),
 			scope_file_id: Some("f1~note".into()),
-			scope_grant_file_id: Some("f1~note".into()),
+			scope_grant_file_id: Some(entry_id),
 			..opts("oldal", fts_cl)
 		};
 		assert_eq!(
@@ -2656,39 +2705,54 @@ one_mode! {
 			2,
 			"a share link must still find the document's own pages after a rename"
 		);
+		// The grant is keyed by the granting entry, never the content id.
+		let by_content =
+			SearchOptions { scope_grant_file_id: Some("f1~note".into()), ..granted };
+		assert_eq!(adapter.search(tn_id, &by_content).await.expect("search").len(), 0);
 	}
 
 	/// The `'D'` and `'F'` rows of one file must report the same `upstream_tag`.
 	///
-	/// `FileView.owner` resolves through a fallback chain that answers the
-	/// *tenant's* profile when the column is NULL, so an indexer reading it
-	/// wrote the tenant's tag into the `'D'` rows while the `'F'` row kept the raw
-	/// NULL. Both rows are now derived from the same column — `files.upstream_tag`,
-	/// which `FileView.upstream` exposes without any fallback.
+	/// Provenance is per entry, so neither row stores it (the column is NULL for
+	/// both); every hit reads it live from the admitted entry, `'D'` parts through
+	/// their container — so the two always agree, whatever a caller passed in.
 	async fn the_deep_and_file_rows_agree_on_the_owner(fts_cl: bool) {
 		let (adapter, dir) = create_test_adapter().await;
 		let tn_id = TnId(1);
 		adapter.create_tenant(tn_id, "alice").await.ok();
 		let db = probe(&dir).await;
 
-		// Originates here: `files.upstream_tag` is NULL, and both rows must say so.
+		// Originates here: the entry's `upstream_tag` is NULL.
 		create_doc_file(&adapter, tn_id, "f1~mine", None).await;
 		index_doc_parts(&adapter, tn_id, "f1~mine", None, fts_cl).await;
 		index_file(&adapter, tn_id, "f1~mine", fts_cl).await;
 
-		// Federated: owned by someone else, and both rows must carry their tag.
+		// Federated: the entry is mirrored from bob. The `'D'` caller even passes the tag,
+		// which the hit must not need.
 		create_doc_file(&adapter, tn_id, "f1~theirs", Some("bob.example.com")).await;
 		index_doc_parts(&adapter, tn_id, "f1~theirs", Some("bob.example.com"), fts_cl).await;
 		index_file(&adapter, tn_id, "f1~theirs", fts_cl).await;
 
-		for (file_id, expected) in [("f1~mine", None), ("f1~theirs", Some("bob.example.com"))] {
+		for file_id in ["f1~mine", "f1~theirs"] {
 			let rows = acl_rows(&db, tn_id, file_id).await;
 			assert_eq!(rows.len(), 3, "one 'F' row and two 'D' parts");
 			for (obj_tp, _, upstream_tag) in rows {
+				if obj_tp == "F" {
+					assert_eq!(upstream_tag, None, "'F' row of {file_id} stores provenance");
+				}
+			}
+		}
+
+		for (q, file_id, expected) in [("oldal", "f1~mine", None), ("Jegyzet", "f1~mine", None)] {
+			let hits = find(&adapter, tn_id, q, fts_cl).await;
+			let hits: Vec<_> = hits.iter().filter(|h| &*h.obj_id == file_id).collect();
+			assert!(!hits.is_empty(), "{q} finds nothing of {file_id}");
+			for hit in hits {
 				assert_eq!(
-					upstream_tag.as_deref(),
+					hit.upstream_tag.as_deref(),
 					expected,
-					"'{obj_tp}' row of {file_id} disagrees on the owner"
+					"'{}' hit of {file_id} disagrees on the origin",
+					hit.obj_tp
 				);
 			}
 		}
@@ -2713,22 +2777,17 @@ one_mode! {
 		adapter.create_tenant(tn_id, "alice").await.ok();
 		let db = probe(&dir).await;
 
-		let visibilities = async |db: &sqlx::SqlitePool| -> Vec<Option<String>> {
-			sqlx::query_scalar(
-				"SELECT visibility FROM search_docs \
-				 WHERE tn_id = ? AND obj_tp = 'D' AND obj_id = ? ORDER BY part_id",
-			)
-			.bind(tn_id.0)
-			.bind("f1~note")
-			.fetch_all(db)
-			.await
-			.expect("read deep visibility")
+		// Since v58 a `'D'` hit is gated on the file's live entry, not on a column the deep write
+		// copied, so a stale write has nothing to re-publish. Check it as an anonymous caller.
+		let public = async |adapter: &MetaAdapterSqlite| -> bool {
+			let anon = SearchOptions { visible_levels: Some(vec!['P']), ..opts("oldal", fts_cl) };
+			!adapter.search(tn_id, &anon).await.expect("search").is_empty()
 		};
 
 		create_doc_file(&adapter, tn_id, "f1~note", None).await;
 		index_doc_parts(&adapter, tn_id, "f1~note", None, fts_cl).await;
 		index_file(&adapter, tn_id, "f1~note", fts_cl).await;
-		assert_eq!(visibilities(&db).await, vec![Some("P".into()), Some("P".into())]);
+		assert!(public(&adapter).await);
 
 		// The flip. `Patch::Null` is Direct — owner-only.
 		adapter
@@ -2740,15 +2799,11 @@ one_mode! {
 			.await
 			.expect("make direct");
 		index_file(&adapter, tn_id, "f1~note", fts_cl).await;
-		assert_eq!(visibilities(&db).await, vec![None, None], "the 'F' write must cascade");
+		assert!(!public(&adapter).await, "the flip must hide the parts");
 
 		// The debounced deep write finally lands, still carrying `Some('P')`.
 		index_doc_parts(&adapter, tn_id, "f1~note", None, fts_cl).await;
-		assert_eq!(
-			visibilities(&db).await,
-			vec![None, None],
-			"a stale deep write re-published a non-public document"
-		);
+		assert!(!public(&adapter).await, "a stale deep write re-published a non-public document");
 
 		// Same again, but reaching the hash short-circuit: identical text, so the
 		// insert path is skipped entirely.
@@ -2761,11 +2816,7 @@ one_mode! {
 			.await
 			.expect("make public");
 		index_doc_parts(&adapter, tn_id, "f1~note", None, fts_cl).await;
-		assert_eq!(
-			visibilities(&db).await,
-			vec![Some("P".into()), Some("P".into())],
-			"the short-circuit must still re-derive the ACL columns"
-		);
+		assert!(public(&adapter).await, "the short-circuit must not hide a public document");
 		assert_indexes_intact(&db).await;
 	}
 
@@ -2896,29 +2947,47 @@ one_mode! {
 	async fn a_share_link_scope_grants_its_document_tree(fts_cl: bool) {
 		let (adapter, _dir) = create_test_adapter().await;
 		let tn_id = TnId(1);
+		// The grant names the scoped *entry*, which must be live.
+		let doc_entry = back_file(&adapter, tn_id, "f1~doc", None, None).await;
+		let child_entry = adapter
+			.create_file(
+				tn_id,
+				CreateFile {
+					file_id: Some("f1~child".into()),
+					root_id: Some("f1~doc".into()),
+					content_type: "text/plain".into(),
+					file_name: "child".into(),
+					file_tp: Some("BLOB".into()),
+					status: Some(FileStatus::Active),
+					..Default::default()
+				},
+			)
+			.await
+			.expect("child")
+			.entry_id;
 
 		// The shared container itself: Direct (NULL visibility).
 		let root = SearchObject {
-			obj_tp: 'F', obj_id: "f1~doc", visibility: None, fts_cl, ..Default::default()
+			obj_tp: 'F', obj_id: "f1~doc", fts_cl, ..Default::default()
 		};
 		index_row(&adapter, tn_id, &root, "").await;
 		// Its own deep part.
 		let root_part = SearchObject {
-			obj_tp: 'D', obj_id: "f1~doc", visibility: None, root_id: Some("f1~doc"),
+			obj_tp: 'D', obj_id: "f1~doc", root_id: Some("f1~doc"),
 			fts_cl, ..Default::default()
 		};
 		index_row(&adapter, tn_id, &root_part, "page1").await;
 		// A deep part belonging to a child file of the same tree — the row the
 		// `root_id` half of the grant exists for.
 		let child_part = SearchObject {
-			obj_tp: 'D', obj_id: "f1~child", visibility: None, root_id: Some("f1~doc"),
+			obj_tp: 'D', obj_id: "f1~child", root_id: Some("f1~doc"),
 			fts_cl, ..Default::default()
 		};
 		index_row(&adapter, tn_id, &child_part, "page1").await;
 		// The child file's own row. Direct, in the tree, and deliberately *not*
 		// granted.
 		let child = SearchObject {
-			obj_tp: 'F', obj_id: "f1~child", visibility: None, root_id: Some("f1~doc"),
+			obj_tp: 'F', obj_id: "f1~child", root_id: Some("f1~doc"),
 			fts_cl, ..Default::default()
 		};
 		index_row(&adapter, tn_id, &child, "").await;
@@ -2926,7 +2995,7 @@ one_mode! {
 		let granted = SearchOptions {
 			visible_levels: Some(vec!['P']),
 			scope_file_id: Some("f1~doc".into()),
-			scope_grant_file_id: Some("f1~doc".into()),
+			scope_grant_file_id: Some(doc_entry),
 			..opts("kozos", fts_cl)
 		};
 		let mut got: Vec<(char, String)> = adapter
@@ -2956,7 +3025,7 @@ one_mode! {
 		// tree-children exclusion, or the scoped search would find nothing.
 		let child_scope = SearchOptions {
 			scope_file_id: Some("f1~child".into()),
-			scope_grant_file_id: Some("f1~child".into()),
+			scope_grant_file_id: Some(child_entry),
 			..ungranted
 		};
 		let mut got: Vec<(char, String)> = adapter
@@ -3106,14 +3175,14 @@ async fn index_file_parts(
 }
 
 /// The part rows of one `'F'` object, as
-/// `(part_id, content_type, upstream_tag, visibility, root_id)`.
+/// `(part_id, content_type, upstream_tag, root_id)`.
 async fn part_acl_rows(
 	db: &sqlx::SqlitePool,
 	tn_id: TnId,
 	obj_id: &str,
-) -> Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>)> {
+) -> Vec<(String, Option<String>, Option<String>, Option<String>)> {
 	sqlx::query_as(
-		"SELECT part_id, content_type, upstream_tag, visibility, root_id FROM search_docs \
+		"SELECT part_id, content_type, upstream_tag, root_id FROM search_docs \
 		 WHERE tn_id = ? AND obj_tp = 'F' AND obj_id = ? AND part_id <> '' ORDER BY part_id",
 	)
 	.bind(tn_id.0)
@@ -3241,7 +3310,7 @@ both_modes! {
 }
 
 both_modes! {
-	/// Every ACL column on an `'F'` part comes from the container's `files` row.
+	/// Every stored ACL column on an `'F'` part comes from the container's `files` row.
 	///
 	/// `SearchPart` carries no ACL field, so `refresh_file_acl` (and
 	/// `fill_part_created_at` for `created_at`) is the only thing that can give one a
@@ -3254,31 +3323,31 @@ both_modes! {
 		adapter.create_tenant(tn_id, "alice").await.ok();
 		let db = probe(&dir).await;
 
-		create_doc_file(&adapter, tn_id, "f1~site", Some("bob.example")).await;
+		create_doc_file(&adapter, tn_id, "f1~site", None).await;
 		index_file_parts(&adapter, tn_id, "f1~site", &[("/", "kezdolap szoveg")], fts_cl).await;
 
 		let rows = part_acl_rows(&db, tn_id, "f1~site").await;
 		assert_eq!(rows.len(), 1);
-		let (part_id, content_type, upstream_tag, visibility, root_id) = &rows[0];
+		let (part_id, content_type, upstream_tag, root_id) = &rows[0];
 		assert_eq!(part_id, "/");
 		assert_eq!(content_type.as_deref(), Some("application/x-notillo"));
-		assert_eq!(upstream_tag.as_deref(), Some("bob.example"));
-		assert_eq!(visibility.as_deref(), Some("P"));
+		assert_eq!(upstream_tag.as_deref(), None, "provenance is per entry, read live");
+		let hits = find(&adapter, tn_id, "kezdolap", fts_cl).await;
+		assert_eq!(hits[0].upstream_tag.as_deref(), None, "from the (local) entry");
 		assert_eq!(root_id.as_deref(), None, "an 'F' part must not resolve root_id");
 
-		// A republish that changed no text takes the hash short-circuit, which
-		// skips the upsert but must still re-derive — it is then the only statement
-		// that carries a visibility flip onto the part rows.
-		sqlx::query("UPDATE files SET visibility = 'D' WHERE tn_id = ? AND file_id = ?")
-			.bind(tn_id.0)
-			.bind("f1~site")
-			.execute(&db)
+		// A republish that changed no text takes the hash short-circuit; the visibility flip
+		// reaches the hit through the entry gate, not through a column the write re-derives.
+		adapter
+			.update_file_data(
+				tn_id,
+				"f1~site",
+				&UpdateFileOptions { visibility: Patch::Null, ..Default::default() },
+			)
 			.await
 			.expect("flip visibility");
 		index_file_parts(&adapter, tn_id, "f1~site", &[("/", "kezdolap szoveg")], fts_cl).await;
 
-		let rows = part_acl_rows(&db, tn_id, "f1~site").await;
-		assert_eq!(rows[0].3.as_deref(), Some("D"), "the hash short-circuit skipped the derive");
 		// `find` is the tenant-owner search (`visible_levels: None`), which is
 		// unfiltered and keeps seeing the row; an anonymous caller gets `['P']`.
 		let anon = SearchOptions { visible_levels: Some(vec!['P']), ..opts("kezdolap", fts_cl) };
@@ -3425,3 +3494,293 @@ both_modes! {
 }
 
 // vim: ts=4
+
+/// One placement of the deduped BLOB `f1~shared` under `parent`.
+async fn place_blob(
+	adapter: &MetaAdapterSqlite,
+	tn_id: TnId,
+	name: &str,
+	parent: Option<&str>,
+	visibility: Option<char>,
+	channel: Option<&str>,
+) -> cloudillo_types::meta_adapter::CreatedFile {
+	let file = CreateFile {
+		parent_id: parent.map(Into::into),
+		orig_variant_id: Some("b1~shared".into()),
+		file_name: name.into(),
+		visibility,
+		channel: channel.map(Into::into),
+		..Default::default()
+	};
+	common::upload(adapter, tn_id, file, "f1~shared").await
+}
+
+one_mode! {
+	/// A content hit is gated per entry by the caller's context, and its name comes from the
+	/// first entry that context admits: a stranger finds the public placement under its own
+	/// name, never the earlier private sibling's; a public *managed* entry admits nothing
+	/// (managed files are never searchable); a private-only content is no hit; a trashed entry
+	/// never admits.
+	async fn a_blob_is_gated_on_the_admitted_entry(fts_cl: bool) {
+		let (adapter, _dir) = create_test_adapter().await;
+		let tn_id = TnId(1);
+		adapter.create_tenant(tn_id, "alice").await.ok();
+
+		let private =
+			place_blob(&adapter, tn_id, "secret.png", None, None, Some("@alice~room")).await;
+		let managed =
+			place_blob(&adapter, tn_id, "managed.png", Some(MANAGED_PARENT_ID), Some('P'), None)
+				.await;
+		let public = place_blob(&adapter, tn_id, "public.png", None, Some('P'), None).await;
+		assert_ne!(managed.entry_id, private.entry_id);
+		adapter
+			.replace_search_row(
+				tn_id,
+				'F',
+				"f1~shared",
+				&[SearchPart { body: Some("napfeny"), ..Default::default() }],
+				fts_cl,
+			)
+			.await
+			.expect("index");
+
+		let stranger = SearchOptions {
+			visible_levels: Some(vec!['P']),
+			viewer_id_tag: Some("guest".into()),
+			enterable_channels: Some(vec![]),
+			..opts("napfeny", fts_cl)
+		};
+		let hits = adapter.search(tn_id, &stranger).await.expect("search");
+		assert_eq!(hits.len(), 1, "the public placement admits the stranger: {hits:?}");
+		assert_eq!(hits[0].title.as_deref(), Some("public.png"), "never the private name");
+		let hits = adapter.search(tn_id, &opts("napfeny", fts_cl)).await.expect("search");
+		assert_eq!(hits.len(), 1, "{hits:?}");
+		assert_eq!(hits[0].title.as_deref(), Some("secret.png"), "the tenant: first entry");
+
+		// Only the private placement and the public managed entry left: no hit.
+		adapter.delete_file(tn_id, &public.entry_id).await.expect("delete public entry");
+		let hits = adapter.search(tn_id, &stranger).await.expect("search");
+		assert!(hits.is_empty(), "neither private nor managed admits: {hits:?}");
+
+		// Only a trashed public entry left: it never admits.
+		adapter.delete_file(tn_id, &private.entry_id).await.expect("delete private entry");
+		adapter.delete_file(tn_id, &managed.entry_id).await.expect("delete managed entry");
+		place_blob(&adapter, tn_id, "trashed.png", Some(TRASH_PARENT_ID), Some('P'), None).await;
+		let hits = adapter.search(tn_id, &stranger).await.expect("search");
+		assert!(hits.is_empty(), "a trashed entry never admits: {hits:?}");
+	}
+}
+
+one_mode! {
+	/// The role grant is per entry: a content held as a Direct mirror (older entry) and a Direct
+	/// local placement is found by a role holder through the local entry only, and the hit
+	/// reports that entry's origin. Without the role, Direct admits nothing.
+	async fn the_role_grant_admits_only_a_local_entry(fts_cl: bool) {
+		let (adapter, _dir) = create_test_adapter().await;
+		let tn_id = TnId(1);
+		adapter.create_tenant(tn_id, "alice").await.ok();
+
+		for upstream in [Some("bob.example"), None] {
+			let file = CreateFile {
+				file_id: Some("f1~mixed".into()),
+				upstream_tag: upstream.map(Into::into),
+				content_type: "image/png".into(),
+				file_name: "kep.png".into(),
+				file_tp: Some("BLOB".into()),
+				status: Some(FileStatus::Active),
+				..Default::default()
+			};
+			adapter.create_file(tn_id, file).await.expect("create entry");
+		}
+		adapter
+			.replace_search_row(
+				tn_id,
+				'F',
+				"f1~mixed",
+				&[SearchPart { body: Some("hajnal"), ..Default::default() }],
+				fts_cl,
+			)
+			.await
+			.expect("index");
+
+		let member = SearchOptions {
+			visible_levels: Some(vec!['P', 'V', '2', 'F', 'C']),
+			role_grant: true,
+			..opts("hajnal", fts_cl)
+		};
+		let hits = adapter.search(tn_id, &member).await.expect("search");
+		assert_eq!(hits.len(), 1, "{hits:?}");
+		assert_eq!(hits[0].upstream_tag, None, "admitted through the local entry");
+
+		let no_role = SearchOptions { role_grant: false, ..member };
+		assert!(adapter.search(tn_id, &no_role).await.expect("search").is_empty());
+	}
+}
+
+one_mode! {
+	/// A user share names one entry too. A share of `linked` admits the content's body rows,
+	/// but of its entry parts only `linked`'s: the sibling's name is never a hit.
+	async fn a_user_share_admits_its_entry_never_a_sibling(fts_cl: bool) {
+		let (adapter, _dir) = create_test_adapter().await;
+		let tn_id = TnId(1);
+		adapter.create_tenant(tn_id, "alice").await.ok();
+		let create = |parent: &'static str, name: &'static str| {
+			let adapter = &adapter;
+			async move {
+				adapter
+					.create_file(
+						tn_id,
+						CreateFile {
+							file_id: Some("f1~blob".into()),
+							parent_id: Some(parent.into()),
+							content_type: "text/plain".into(),
+							file_name: name.into(),
+							file_tp: Some("BLOB".into()),
+							status: Some(FileStatus::Active),
+							..Default::default()
+						},
+					)
+					.await
+					.expect("entry")
+					.entry_id
+			}
+		};
+		let linked = create("fold-shared", "kozos linked").await;
+		let sibling = create("fold-private", "kozos sibling").await;
+		adapter
+			.replace_search_row(
+				tn_id,
+				'F',
+				"f1~blob",
+				&[
+					SearchPart { body: Some("kozos titok"), ..Default::default() },
+					SearchPart {
+						part_id: &linked,
+						part_kind: Some(ENTRY_PART_KIND),
+						title: Some("kozos linked"),
+						..Default::default()
+					},
+					SearchPart {
+						part_id: &sibling,
+						part_kind: Some(ENTRY_PART_KIND),
+						title: Some("kozos sibling"),
+						..Default::default()
+					},
+				],
+				fts_cl,
+			)
+			.await
+			.expect("index");
+		let grant = CreateShareEntry {
+			subject_type: 'U',
+			subject_id: "bob".into(),
+			permission: 'R',
+			expires_at: None,
+		};
+		adapter
+			.create_share_entry(tn_id, 'F', &linked, "alice", &grant)
+			.await
+			.expect("share");
+
+		let bob = |q: &str| SearchOptions {
+			visible_levels: Some(vec![]),
+			share_subject: Some("bob".into()),
+			..opts(q, fts_cl)
+		};
+		let hits = adapter.search(tn_id, &bob("sibling")).await.expect("search");
+		assert!(hits.is_empty(), "the sibling's own part leaked: {hits:?}");
+		let hits = adapter.search(tn_id, &bob("kozos")).await.expect("search");
+		assert_eq!(hits.len(), 2, "the body row and the shared entry's own part: {hits:?}");
+		for hit in &hits {
+			assert_ne!(&*hit.part_id, &*sibling, "the sibling's part leaked");
+		}
+	}
+}
+
+one_mode! {
+	/// A share link names one entry. A BLOB's other placements share its content row, but the
+	/// grant never admits them: a hit shows the linked entry's own name, never a sibling's, and
+	/// the sibling's own part is not found at all. A trashed link finds nothing.
+	async fn a_share_link_grant_admits_its_entry_never_a_sibling(fts_cl: bool) {
+		let (adapter, _dir) = create_test_adapter().await;
+		let tn_id = TnId(1);
+		adapter.create_tenant(tn_id, "alice").await.ok();
+		let create = |parent: &'static str, name: &'static str| {
+			let adapter = &adapter;
+			async move {
+				adapter
+					.create_file(
+						tn_id,
+						CreateFile {
+							file_id: Some("f1~blob".into()),
+							parent_id: Some(parent.into()),
+							content_type: "text/plain".into(),
+							file_name: name.into(),
+							file_tp: Some("BLOB".into()),
+							status: Some(FileStatus::Active),
+							..Default::default()
+						},
+					)
+					.await
+					.expect("entry")
+					.entry_id
+			}
+		};
+		let linked = create("fold-shared", "kozos linked").await;
+		let sibling = create("fold-private", "kozos sibling").await;
+		adapter
+			.replace_search_row(
+				tn_id,
+				'F',
+				"f1~blob",
+				&[
+					SearchPart { body: Some("kozos titok"), ..Default::default() },
+					SearchPart {
+						part_id: &linked,
+						part_kind: Some(ENTRY_PART_KIND),
+						title: Some("kozos linked"),
+						..Default::default()
+					},
+					SearchPart {
+						part_id: &sibling,
+						part_kind: Some(ENTRY_PART_KIND),
+						title: Some("kozos sibling"),
+						..Default::default()
+					},
+				],
+				fts_cl,
+			)
+			.await
+			.expect("index");
+
+		let link = SearchOptions {
+			visible_levels: Some(vec!['P']),
+			scope_file_id: Some("f1~blob".into()),
+			scope_grant_file_id: Some(linked.clone()),
+			..opts("kozos", fts_cl)
+		};
+		let hits = adapter.search(tn_id, &link).await.expect("search");
+		assert_eq!(hits.len(), 2, "the body row and the linked entry's own part: {hits:?}");
+		for hit in &hits {
+			assert_eq!(hit.title.as_deref(), Some("kozos linked"), "{hit:?}");
+			assert_ne!(&*hit.part_id, &*sibling, "the sibling's part leaked");
+		}
+		assert_eq!(adapter.count_search(tn_id, &link).await.expect("count"), 2);
+
+		adapter
+			.update_file_data(
+				tn_id,
+				&linked,
+				&UpdateFileOptions {
+					parent_id: Patch::Value(TRASH_PARENT_ID.into()),
+					..Default::default()
+				},
+			)
+			.await
+			.expect("trash");
+		assert!(
+			adapter.search(tn_id, &link).await.expect("search").is_empty(),
+			"a trashed link still finds the content"
+		);
+	}
+}

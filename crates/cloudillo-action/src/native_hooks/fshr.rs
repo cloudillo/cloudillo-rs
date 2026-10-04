@@ -101,32 +101,81 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	let is_del = context.subtype.as_deref() == Some("DEL");
 	let permission = perm_char_for_sub_typ(context.subtype.as_deref());
 
-	if !(is_del && is_self_revocation(&context.issuer, audience))
-		&& let Err(e) =
-			authorize_share_change(&app, &context, resource_id, (!is_del).then_some(permission))
-				.await
-	{
-		tracing::warn!(
-			issuer = %context.issuer,
-			subject = %resource_id,
-			sub_typ = ?context.subtype,
-			audience = %audience,
-			"FSHR on_create denied: issuer may not manage this file's share set"
-		);
-		// Best effort: a failed cleanup must never turn a denial into a success, so the original
-		// error is returned either way.
-		if let Err(del_err) = app.meta_adapter.delete_action(tn_id, &context.action_id).await {
-			tracing::warn!(
-				action_id = %context.action_id,
-				error = %del_err,
-				"FSHR on_create: failed to remove the denied action row; it grants nothing \
-				 (file_access::fshr_grant_level requires the issuer to be the file's \
-				 upstream source) but will remain visible until the next cleanup"
-			);
-		} else {
-			cloudillo_core::search_index_action(&app, tn_id, &context.action_id);
+	// The subject is a content id (a folder: its entry id); share entries are keyed by the
+	// placement. A content placed several times names no single entry: `create_share` /
+	// `delete_share` already wrote the entry they resolved, so the hook only checks it is settled.
+	let entries = cloudillo_core::file_access::access_entries(&app, tn_id, resource_id).await?;
+	// Narrowed to the one entry that settles it, and still authorized below: the early return
+	// must not let a non-manager re-emit (store, federate, notify) a grant that already exists.
+	let mut settled = false;
+	let entries = if entries.len() > 1 {
+		let mut holder = None;
+		for file in &entries {
+			let shares = app.meta_adapter.list_share_entries(tn_id, 'F', &file.entry_id).await?;
+			if shares.iter().any(|e| {
+				e.subject_type == 'U'
+					&& e.subject_id.as_ref() == audience.as_str()
+					&& (is_del || e.permission == permission)
+			}) {
+				holder = Some(file.clone());
+				break;
+			}
 		}
-		return Err(e);
+		match (holder, is_del) {
+			// The grant is already stored.
+			(Some(file), false) => {
+				settled = true;
+				vec![file]
+			}
+			// Nothing to revoke.
+			(None, true) => {
+				settled = true;
+				entries.into_iter().take(1).collect()
+			}
+			// Ambiguous: Conflict below.
+			_ => entries,
+		}
+	} else {
+		entries
+	};
+	let check = match entries.as_slice() {
+		[file] if is_del && is_self_revocation(&context.issuer, audience) => Ok(&file.entry_id),
+		[file] => {
+			authorize_share_change(&app, &context, &file.entry_id, (!is_del).then_some(permission))
+				.await
+				.map(|()| &file.entry_id)
+		}
+		[] => Err(Error::NotFound),
+		_ => Err(Error::Conflict("FSHR subject names several entries".into())),
+	};
+	let resource_id: &str = match check {
+		Ok(entry_id) => entry_id,
+		Err(e) => {
+			tracing::warn!(
+				issuer = %context.issuer,
+				subject = %resource_id,
+				sub_typ = ?context.subtype,
+				audience = %audience,
+				"FSHR on_create denied: issuer may not manage this file's share set"
+			);
+			// Best effort: a failed cleanup must never turn a denial into a success, so the
+			// original error is returned either way.
+			if let Err(del_err) = app.meta_adapter.delete_action(tn_id, &context.action_id).await {
+				tracing::warn!(
+					action_id = %context.action_id,
+					error = %del_err,
+					"FSHR on_create: failed to remove the denied action row; it grants nothing \
+					 (file_access::fshr_grant_level requires the issuer to be the file's \
+					 upstream source) but will remain visible until the next cleanup"
+				);
+			} else {
+				cloudillo_core::search_index_action(&app, tn_id, &context.action_id);
+			}
+			return Err(e);
+		}
+	};
+	if settled {
+		return Ok(HookResult::default());
 	}
 
 	if is_del {
@@ -195,7 +244,8 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// FSHR on_receive hook - Handle incoming file share request
 ///
 /// Logic:
-/// - Refuse a share whose subject file we already hold from a different upstream source
+/// - Refuse a share whose subject we hold mirrored from a different upstream source, or as a
+///   local non-BLOB
 /// - If we are the audience and subType is not DEL, set status to 'C' (confirmation required)
 /// - DEL subtype doesn't require confirmation
 pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> {
@@ -207,30 +257,28 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 	);
 
 	// This hook only ever runs on the *recipient's* node (`post_store.rs` dispatches `OnCreate`
-	// outbound and `OnReceive` inbound), so a row we already hold for the subject is a mirror an
-	// earlier `on_accept` created, carrying `upstream_tag = issuer`. Judging it by its *owner* would
-	// be wrong twice over: that resolves to the recipient tenant, which is never the issuer, so every
-	// follow-up FSHR — a permission upgrade, a re-share, a `DEL` revocation — would be refused; and
-	// on a community tenant a member could satisfy the test on their own local row.
+	// outbound and `OnReceive` inbound), so a mirrored entry we already hold for the subject is one
+	// an earlier `on_accept` created, carrying `upstream_tag = issuer`. Judging it by its *owner*
+	// would be wrong twice over: that resolves to the recipient tenant, which is never the issuer,
+	// so every follow-up FSHR — a permission upgrade, a re-share, a `DEL` revocation — would be
+	// refused; and on a community tenant a member could satisfy the test on their own local entry.
 	//
-	// A missing row is the ordinary case — `on_accept` creates it. A NULL upstream means we hold a
-	// *local* file whose id collides with the subject, and a different upstream means the sender is
-	// claiming authority over content that is not theirs; refuse either outright rather than leaning
-	// on `file_access`'s issuer check, so no junk row lands. `file_access::fshr_grant_level` tests
-	// the same tag from the other side — the two must agree or one gate contradicts the other.
-	if let Some(file_id) = &context.subject
-		&& let Ok(Some(file)) = app.meta_adapter.read_file(context.tn_id, file_id).await
-	{
-		let upstream = file.upstream.as_ref().map(|p| p.id_tag.as_ref()).filter(|s| !s.is_empty());
-		if upstream != Some(context.issuer.as_str()) {
-			tracing::warn!(
-				issuer = %context.issuer,
-				subject = %file_id,
-				upstream = ?upstream,
-				"FSHR on_receive refused: issuer is not the subject file's upstream source"
-			);
-			return Err(Error::PermissionDenied);
-		}
+	// Upstream is a placement column, so every entry is judged on its own. A missing entry is the
+	// ordinary case — `on_accept` creates a reference for it. A reference from a different upstream
+	// means the sender is claiming authority over content that is not theirs. A local entry is fine
+	// for a BLOB (the reference beside it never touches the local bytes), but any other type carries
+	// a single entry, so a reference beside a local one would make its id ambiguous. Refuse
+	// outright rather than leaning on `file_access`'s issuer check, so no junk row lands. `file_access::fshr_grant_level` tests the
+	// same tag from the other side — the two must agree or one gate contradicts the other.
+	// A lookup error refuses too: failing open would let the sender skip the check.
+	if let Some(file_id) = &context.subject {
+		cloudillo_file::management::check_reference_subject(
+			&app,
+			context.tn_id,
+			file_id,
+			&context.issuer,
+		)
+		.await?;
 	}
 
 	// Check if we are the audience
@@ -300,6 +348,12 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 		file_tp
 	);
 
+	// Another origin's reference or a local non-BLOB already holds this id (e.g. a second
+	// pending FSHR for it from a different upstream): `on_receive` checked before either was
+	// accepted, so check again now.
+	cloudillo_file::management::check_reference_subject(&app, tn_id, file_id, &context.issuer)
+		.await?;
+
 	// Create file entry with status 'A' (active) and visibility direct (most restricted - owner and tenant can see)
 	let create_opts = CreateFile {
 		file_id: Some(file_id.clone().into()),
@@ -311,16 +365,17 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 		..Default::default()
 	};
 
-	match app.meta_adapter.create_file(tn_id, create_opts).await {
+	let entry_id = match app.meta_adapter.create_file(tn_id, create_opts).await {
 		Ok(file_result) => {
 			tracing::info!("FSHR: Created shared file entry: {:?}", file_result);
-			cloudillo_core::search_index_file(&app, tn_id, file_id);
+			cloudillo_core::search_index_file(&app, tn_id, &file_result.entry_id);
+			file_result.entry_id
 		}
 		Err(e) => {
 			tracing::error!("FSHR: Failed to create file entry: {}", e);
 			return Err(e);
 		}
-	}
+	};
 
 	// Seed the recipient's cached access_level so the badge appears on first list without a refresh
 	// round-trip; matches what `refresh_file` writes on subsequent reconciliations.
@@ -330,7 +385,7 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 		.update_file_user_data(
 			tn_id,
 			&context.tenant_tag,
-			file_id,
+			&entry_id,
 			Patch::Undefined,
 			Patch::Undefined,
 			Patch::Value(access_perm),

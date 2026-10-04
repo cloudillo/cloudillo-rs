@@ -286,9 +286,11 @@ pub async fn fixture() -> &'static Fixture {
 
 async fn build() -> Fixture {
 	let _ = tracing_subscriber::fmt()
-		.with_test_writer()
+		// Plain stderr bypasses libtest capture, so the per-family summary always shows.
+		.with_writer(std::io::stderr)
 		.with_env_filter(
-			EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("off")),
+			EnvFilter::try_from_default_env()
+				.unwrap_or_else(|_| EnvFilter::new("off,access_matrix=info")),
 		)
 		.try_init();
 
@@ -600,7 +602,7 @@ async fn ws_probe_handler(
 		_ => return (StatusCode::NOT_FOUND, Json(json!({ "deny": "bad_kind" }))),
 	};
 	match ws_file_access(&app, tn_id, &id_tag, auth.as_ref(), &id, &query, kind).await {
-		Ok(level) => (StatusCode::OK, Json(json!({ "ok": level }))),
+		Ok((level, _)) => (StatusCode::OK, Json(json!({ "ok": level }))),
 		Err(deny) => (StatusCode::OK, Json(json!({ "deny": deny.to_string() }))),
 	}
 }
