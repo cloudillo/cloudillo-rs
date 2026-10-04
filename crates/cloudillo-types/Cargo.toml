@@ -38,9 +38,9 @@ idna = "1"
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-serde_with = "3.23.0"
+serde_with = "3.24.0"
 sha2 = "0.11.0"
-tokio = { version = "1.53.1", features = ["io-util", "rt"] }
+tokio = { version = "1.53.2", features = ["io-util", "rt"] }
 tracing = "0.1.44"
 
 # Optional server-specific deps (for From<X> impls on Error)
