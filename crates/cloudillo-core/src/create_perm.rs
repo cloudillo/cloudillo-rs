@@ -13,7 +13,7 @@ use axum::{
 };
 
 use crate::{abac::Environment, extract::Auth, middleware::PermissionCheckOutput, prelude::*};
-use cloudillo_types::types::SubjectAttrs;
+use cloudillo_types::types::{SubjectAttrs, scope_for_log};
 
 /// Middleware factory for collection permission checks
 ///
@@ -58,16 +58,15 @@ async fn check_create_permission(
 		return Ok(next.run(req).await);
 	}
 
-	// Check if user has a role that allows content creation
 	// Minimum role for creating content: "contributor"
-	if !auth_ctx.roles.iter().any(|r| r.as_ref() == "contributor") {
+	if !crate::roles::is_contributor(&auth_ctx.roles) {
 		warn!(
 			subject = %auth_ctx.id_tag,
 			resource_type = resource_type,
 			action = action,
 			roles = ?auth_ctx.roles,
 			hat = ?auth_ctx.hat,
-			scope = ?auth_ctx.scope,
+			scope = ?auth_ctx.scope.as_deref().map(scope_for_log),
 			exp = ?auth_ctx.exp,
 			"CREATE permission denied: requires at least 'contributor' role"
 		);

@@ -436,11 +436,10 @@ const PROFILE_SETTING_MAX_VALUE_BYTES: usize = 8 * 1024;
 /// the tenant owner's settings on a personal tenant.
 ///
 /// The owner test also requires a role above `follower` (the derived rung every role-less
-/// follower carries, alongside `public`, is not membership). An `idp_`
-/// management key carries the identity's own `id_tag` with `roles: []`
-/// (`middleware::authenticate`), so the id_tag match alone would hand it every one of that
-/// identity's profile settings. "Above follower" keeps that key out while still admitting an
-/// ordinary community member, who holds `contributor`/`moderator` and never `leader`.
+/// follower carries, alongside `public`, is not membership). Defence in depth: a role-less
+/// credential naming the identity would otherwise get every one of its profile settings from
+/// the id_tag match alone. "Above follower" keeps it out while still admitting an ordinary
+/// community member, who holds `contributor`/`moderator` and never `leader`.
 ///
 /// Both sides are compared raw, and both are canonical by construction: `auth.id_tag` comes
 /// from a token this server minted (whose `sub` is read from storage), and the handlers
@@ -621,8 +620,8 @@ mod tests {
 			target
 		));
 
-		// A role-less principal on the target's own id_tag is an `idp_` management key, not
-		// the profile — it must not read or overwrite that identity's settings.
+		// A role-less credential naming the target is not the profile — it must not read or
+		// overwrite that identity's settings.
 		assert!(!may_access_profile_settings(&auth(target, &[], None), target));
 		// Nor is a plain follower, whose token carries the derived `public,follower`.
 		assert!(!may_access_profile_settings(&auth(target, &["public", "follower"], None), target));

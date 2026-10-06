@@ -489,12 +489,12 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					// but *following* needs no consent — turn on the directional
 					// `follower` flag now so the issuer receives our broadcasts
 					// immediately, exactly as FLLW on_receive does. Gated on the same
-					// privacy.allow_followers setting FLLW honors.
+					// profile.allow_followers setting FLLW honors.
 					info!("CONN: Connection request from {} requires confirmation", context.issuer);
 
 					let allow_followers = app
 						.settings
-						.get_bool(tn_id, "privacy.allow_followers")
+						.get_bool(tn_id, "profile.allow_followers")
 						.await
 						.unwrap_or(true);
 					if allow_followers {

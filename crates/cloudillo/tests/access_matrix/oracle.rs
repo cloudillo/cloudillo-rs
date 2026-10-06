@@ -11,7 +11,8 @@
 use cloudillo::types::AccessLevel;
 
 use crate::objects::{
-	ActionLife, ActionObj, ActionShape, FileKind, FileLife, FileObj, FileShape, Obj, canon_root,
+	ActionLife, ActionObj, ActionShape, FileKind, FileLife, FileObj, FileShape, Obj, canon_folder,
+	canon_root,
 };
 use crate::ops::{ActionOp, FileOp, InboxCell, Op};
 use crate::subjects::{CredKind, Grant, Hostile, MintCell, Relation, SubjectFacts};
@@ -468,14 +469,16 @@ pub fn expected_inbox(c: &InboxCell) -> Expect {
 	let known = matches!(c.rel, Relation::WeFollow | Relation::Connected | Relation::Member);
 	let connected = matches!(c.rel, Relation::Connected | Relation::Member);
 	match c.typ {
+		// A blocked issuer is refused ahead of every type rule, `allow_unknown` included.
+		_ if c.rel == Relation::Blocked => deny("inbox.issuer-restricted"),
 		// CONN (incl. CONN:UPD) is allow_unknown; an update is inert unless the issuer is
-		// connected or pending (`native_hooks/conn.rs`).
-		"CONN" | "CONN:UPD" | "FLLW" | "REACT" | "CMNT" | "PRES" | "SUBS" => {
-			allow("inbox.allow-unknown")
-		}
+		// connected or pending (`native_hooks/conn.rs`). The receive-side subtypes ride their
+		// base type's definition; what they may change is `inbound_effects`'.
+		"CONN" | "CONN:UPD" | "CONN:ACC" | "CONN:DEL" | "FLLW" | "FLLW:DEL" | "REACT" | "CMNT"
+		| "PRES" | "SUBS" | "SUBS:UPD" => allow("inbox.allow-unknown"),
 		"APKG" => deny("inbox.local-only"),
-		// allow_unknown, but no identity provider is configured on the host.
-		"IDP:REG" => deny("inbox.idp-reg?"),
+		// allow_unknown, but `idp.enabled` is off on the host (the hook refuses).
+		"IDP:REG" => deny("inbox.idp-reg.disabled"),
 		// Hat endorsement: APRV authority over X when `APRV.iss == X.h`.
 		"APRV" if c.hat && c.rel == Relation::PeerHat && c.target => allow("inbox.aprv.hat"),
 		// A hat-admitted APRV still needs authority over its own subject.
@@ -488,12 +491,17 @@ pub fn expected_inbox(c: &InboxCell) -> Expect {
 		"PRINVT" if connected => allow("inbox.connected"),
 		"PRINVT" => deny("inbox.requires-connected"),
 		"MSG" if c.target => deny("inbox.msg.requires-subscription"),
+		// An INVT on our CONV is the tenant's or a moderator subscriber's; a revocation also the
+		// original inviter's. A fresh issuer is none of them, whatever its relation.
+		"INVT" | "INVT:DEL" => deny("inbox.invt.conv-authority"),
 		_ if known => allow("inbox.known"),
 		// Subject-anchored rules override `allow_unknown: false`: R1 (REPOST on the tenant's
 		// own public subject) and R2 (STAT from anyone).
 		"REPOST" => allow("inbox.repost-r1"),
-		"STAT" => allow("inbox.stat-r2"),
-		// POST, POST:LDOC, MSG (bare), CONV, FSHR, INVT.
+		"STAT" if c.target => allow("inbox.stat-r2"),
+		// R2 holds only for content held here.
+		"STAT" => deny("inbox.stat-r2.not-held"),
+		// POST, POST:LDOC, MSG (bare), CONV, FSHR, FSHR:DEL, INVT.
 		_ => deny("inbox.unknown-issuer"),
 	}
 }
@@ -506,6 +514,14 @@ pub fn expected_mint(c: &MintCell) -> Expect {
 		"scope-hatted@club" => return allow("mint.hat.scoped"),
 		"scope-hatted-closed@club" => return deny("mint.hat.closed-room"),
 		"refresh-hatted@club" | "proxytoken-hatted@club" => return deny("mint.hat.refresh"),
+		_ => {}
+	}
+	match n {
+		// Via mints over a `W` link: capped to the caller's own `R`, refused without access to
+		// the source or without a link.
+		"via-gread-overask@alice" | "via-scoped-overask@alice" => return allow("mint.via.capped"),
+		"via-noaccess-stranger@alice" => return deny("mint.via.no-access"),
+		"via-nolink@alice" => return deny("mint.via.no-link"),
 		_ => {}
 	}
 	let legit = [
@@ -529,6 +545,33 @@ pub fn expected_mint(c: &MintCell) -> Expect {
 		"scope-apkg-m-contributor@club" => deny("mint.apkg.role"),
 		// Capability keys reach PIM routes directly; a scoped key is never exchanged.
 		"xchg-apikey-dav@alice" => deny("mint.capability-key"),
+		// A key, or a ref, is its own tenant's: refused on another host.
+		"xchg-apikey-xtenant@club" | "ref-xtenant@club" | "ref-once-xtenant@club" => {
+			deny("mint.cross-tenant")
+		}
+		// The wrong-host attempt left the single-use ref unspent.
+		"ref-once@alice" => allow("mint.ref.not-burned"),
+		// A scoped bearer never mints a session, not even its own refresh.
+		"refresh-sharelink-r@alice" | "refresh-sharelink-w@alice" | "refresh-apikey-file@alice" => {
+			deny("mint.refresh.scoped")
+		}
+		"ref-deleted@alice" => deny("mint.ref.deleted"),
+		"ref-folderlink-r@alice" => allow("mint.ref.folder"),
+		// Open gap: `refresh=true` re-validates uncounted and tokenless; once fixed, a Deny.
+		"ref-refresh@alice" => allow("mint.ref.refresh"),
+		// Unrecognised scopes fail closed (400); a DAV capability only narrows a session.
+		"scope-foreign-ask@alice" => deny("mint.scope.unrecognised"),
+		"scope-carddav@alice" => allow("mint.scope.dav"),
+		// A scope is only for a file the caller already reaches.
+		"scope-stranger-root@alice" => deny("mint.scope.no-access"),
+		// `hat=` excludes every other mode, `scope=` included (400).
+		"hatscope-hatted@club" => deny("mint.hat.with-scope"),
+		// SADM narrows its own session to a document like any owner.
+		"scope-sadm@admin" => allow("mint.sadm.scoped"),
+		// A Blocked profile still exchanges a PROXY, for a session with no role (claims); a
+		// hat never lifts the block.
+		"blocked-session@club" => allow("mint.blocked.no-roles"),
+		"blocked-hat@club" => deny("mint.blocked.hat"),
 		_ if n.starts_with("hostile-proxy-") => deny("mint.hostile-proxy"),
 		_ => deny("mint.unlisted?"),
 	}
@@ -545,17 +588,39 @@ pub fn check_mint_claims(c: &MintCell) -> Result<(), String> {
 		Some(format!("file:{root}:{}", if l == 'a' { 'W' } else { l.to_ascii_uppercase() }))
 	} else if let Some(l) = lvl("scope-owner-scoped-").or_else(|| lvl("scope-g-write-scoped-")) {
 		Some(format!("file:{root}:{}", l.to_ascii_uppercase()))
+	} else if n == "via-gread-overask@alice" || n == "via-scoped-overask@alice" {
+		Some(format!("file:{}:R", root.replace("tenant-crdt-d-active", "cur-linktarget-w")))
 	} else if n.starts_with("via-") {
 		Some(format!("file:{}:R", root.replace("-tenant-crdt-", "-linktarget-crdt-")))
 	} else if n.starts_with("xchg-apikey-file@") || n == "scope-g-read-overask@alice" {
 		// The over-ask (`W`) is capped to g_read's own `R`.
 		Some(format!("file:{root}:R"))
-	} else if n == "scope-hatted@club" {
+	} else if n == "scope-hatted@club" || n == "ref-refresh@alice" || n == "ref-once@alice" {
 		Some(format!("file:{root}:R"))
+	} else if n == "ref-folderlink-r@alice" {
+		Some(format!("file:{}:R", canon_folder(&c.host)))
+	} else if n == "scope-sadm@admin" {
+		Some("file:f1~zqm-admin-doc:R".into())
+	} else if n == "scope-carddav@alice" {
+		Some("carddav:read".into())
 	} else if n.starts_with("scope-apkg@") || n == "scope-apkg-m-leader@club" {
 		Some("apkg:publish".into())
 	} else {
 		None
+	};
+	// A link-minted token names its ref; a via embed minted from a link carries the link's.
+	let link_ref = match n {
+		"via-guest@alice" | "ref-refresh@alice" => Some("zqref-alice-r".to_owned()),
+		"ref-once@alice" => Some("zqref-alice-once".to_owned()),
+		"ref-folderlink-r@alice" => Some("zqref-alice-folder".to_owned()),
+		_ => n
+			.strip_prefix("ref-sharelink-")
+			.and_then(|r| r.split_once('@'))
+			.map(|(l, h)| format!("zqref-{h}-{l}")),
+	};
+	let want = match (want, link_ref) {
+		(Some(w), Some(r)) => Some(format!("{w}:{r}")),
+		(w, _) => w,
 	};
 	if cl.scope.as_deref() != want.as_deref() {
 		return Err(format!("scope {:?} != {want:?}", cl.scope));
@@ -575,6 +640,9 @@ pub fn check_mint_claims(c: &MintCell) -> Result<(), String> {
 			(Some(e), Some(p)) if e.0 <= p.0 => {}
 			(e, p) => return Err(format!("exp {e:?} not <= parent {p:?}")),
 		}
+	}
+	if n == "blocked-session@club" && !cl.roles.is_empty() {
+		return Err(format!("blocked session carries roles {:?}", cl.roles));
 	}
 	if n.starts_with("proxy-") && !n.contains("m-leader") && has("leader") {
 		return Err("roles: remote PROXY session carries leader".into());

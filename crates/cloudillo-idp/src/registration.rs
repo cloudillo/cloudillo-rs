@@ -181,6 +181,7 @@ pub async fn process_registration(
 	app: &App,
 	params: ProcessRegistrationParams<'_>,
 ) -> ClResult<RegistrationResult> {
+	crate::handler::check_idp_enabled(app, params.tn_id).await?;
 	let reg_content = params.reg_content;
 	let registrar_id_tag = params.issuer;
 	let target_idp = params.audience;

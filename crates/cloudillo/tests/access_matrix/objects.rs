@@ -145,6 +145,8 @@ pub enum ActionShape {
 	Child,
 	/// club only: `POST` by `hatted` wearing `peer`'s hat (`h`), endorsed by a peer `APRV`.
 	HatRelayed,
+	/// club only: `m_contributor`'s `POST` to `peer` wearing club's own hat — one club relayed.
+	HatRelay,
 	/// `POST` at Direct with `audience = direct`.
 	DirectAudience,
 	/// `INVT` at Direct with `audience = direct` and `subject` = the tenant's active Direct
@@ -256,12 +258,17 @@ pub struct ApiKeys {
 	/// `file:{alice doc root}:R`.
 	pub file_read: String,
 	pub dav: String,
+	/// Unscoped, `expires_at` in the past.
+	pub expired: String,
+	/// `carddav:read` only.
+	pub carddav_r: String,
 }
 
 /// Non-level files the curated rows use (both tenants); `tenant-crdt-d-active` is also the
 /// canonical doc root; `linktarget-crdt-d-active` is the `via-embed` scope target.
-const CURATED_FILES: [&str; 13] = [
+const CURATED_FILES: [&str; 14] = [
 	"linktarget-crdt-d-active",
+	"mirroredfshr-crdt-p-active",
 	"tenant-blob-p-trashed",
 	"tenant-blob-p-pending",
 	"tenant-blob-p-tombstoned",
@@ -305,13 +312,13 @@ fn vis_name(v: Option<char>) -> char {
 	v.map_or('d', |c| c.to_ascii_lowercase())
 }
 
-fn file_id(tn: &str, name: &str) -> String {
+pub fn file_id(tn: &str, name: &str) -> String {
 	// base64url-safe characters only (blob path validation).
 	format!("f1~zqm-{}-{name}", tn.trim_end_matches(".test"))
 }
 
 /// The tenant's canonical folder (Direct, active) — parent of every `FolderChild`.
-fn canon_folder(tn: &str) -> String {
+pub fn canon_folder(tn: &str) -> String {
 	file_id(tn, "folder-blob-d-active")
 }
 
@@ -401,7 +408,13 @@ fn specs(t: &Tenants) -> Vec<(FileSpec, TnId)> {
 		// `DELETE /api/trash` purges a whole tenant's trash: its cells run on `trash` only.
 		cur("cur-emptytrash-owner", &t.trash, TenantOwned, Some('P'), FileLife::Trashed),
 		cur("cur-emptytrash-mod", &t.trash, TenantOwned, Some('P'), FileLife::Trashed),
+		cur("cur-linktarget-expired", &t.alice, LinkTarget, None, FileLife::Active),
+		cur("cur-linktarget-w", &t.alice, LinkTarget, None, FileLife::Active),
 	]);
+	// In the closed room, shared `R` to a leader and a moderator who are off its roster.
+	let (mut s, tn_id) = cur("cur-room-shared", &t.club, TenantOwned, Some('P'), FileLife::Active);
+	s.channel = Some("closed-w");
+	out.push((s, tn_id));
 	out
 }
 
@@ -426,20 +439,44 @@ pub async fn seed_api_keys(app: &App, t: &Tenants) -> ApiKeys {
 	let root = canon_root(t.alice.id_tag);
 	let file_scope = format!("file:{root}:R");
 	let mut keys = Vec::new();
-	for (name, scopes) in [
-		("zqmatrix-unscoped", None),
-		("zqmatrix-file", Some(file_scope.as_str())),
-		("zqmatrix-dav", Some("carddav:read,caldav:read")),
+	let past = Some(Timestamp::from_now(-60));
+	for (name, scopes, expires_at) in [
+		("zqmatrix-unscoped", None, None),
+		("zqmatrix-file", Some(file_scope.as_str()), None),
+		("zqmatrix-dav", Some("carddav:read,caldav:read"), None),
+		("zqmatrix-expired", None, past),
+		("zqmatrix-carddav-r", Some("carddav:read"), None),
 	] {
 		let k = app
 			.auth_adapter
-			.create_api_key(tn, CreateApiKeyOptions { name: Some(name), scopes, expires_at: None })
+			.create_api_key(tn, CreateApiKeyOptions { name: Some(name), scopes, expires_at })
 			.await
 			.unwrap();
+		if name == "zqmatrix-unscoped" {
+			assert_eq!(k.info.key_id, 1, "curated rows name alice's key as /api/auth/api-keys/1");
+		}
 		keys.push(k.plaintext_key.to_string());
 	}
-	let [unscoped, file_read, dav] = <[String; 3]>::try_from(keys).unwrap();
-	ApiKeys { unscoped, file_read, dav }
+	let [unscoped, file_read, dav, expired, carddav_r] = <[String; 5]>::try_from(keys).unwrap();
+	// club's own key, for the leader-on-its-own-keys rows.
+	let opts = CreateApiKeyOptions { name: Some("zqmatrix-club"), scopes: None, expires_at: None };
+	let club = app.auth_adapter.create_api_key(t.club.tn_id, opts).await.unwrap();
+	assert_eq!(club.info.key_id, 6, "curated rows name club's key as /api/auth/api-keys/6");
+	ApiKeys { unscoped, file_read, dav, expired, carddav_r }
+}
+
+/// The one proxy site, which the admin rows aim at (`/api/admin/proxy-sites/1`).
+pub async fn seed_proxy_site(app: &App) {
+	let config = cloudillo::auth_adapter::ProxySiteConfig::default();
+	let data = cloudillo::auth_adapter::CreateProxySiteData {
+		domain: "zqm-proxy.test",
+		backend_url: "http://127.0.0.1:9",
+		proxy_type: "basic",
+		config: &config,
+		created_by: None,
+	};
+	let site = app.auth_adapter.create_proxy_site(&data).await.unwrap();
+	assert_eq!(site.site_id, 1, "curated rows name the proxy site as 1");
 }
 
 /// Derive every fact of a file object from its spec (pure).
@@ -466,6 +503,13 @@ fn plan_file(spec: FileSpec, tn_id: TnId, r: &Remotes) -> FileObj {
 		expired,
 	};
 	let shares = match spec.shape {
+		_ if spec.name == "cur-room-shared" => {
+			vec![
+				u(&r.m_leader, 'R', false),
+				u(&r.m_moderator, 'R', false),
+				u(&r.g_write, 'W', false),
+			]
+		}
 		TenantOwned | MemberOwned => vec![
 			u(&r.g_read, 'R', false),
 			u(&r.g_comment, 'C', false),
@@ -475,23 +519,30 @@ fn plan_file(spec: FileSpec, tn_id: TnId, r: &Remotes) -> FileObj {
 		],
 		Folder => vec![u(&r.g_folder, 'W', false)],
 		LinkTarget => {
-			vec![Share { subject_type: 'F', subject_id: canon_root(tn), perm: 'R', expired: false }]
+			// `cur-linktarget-expired`: the same link, lapsed; `cur-linktarget-w`: a `W` link.
+			let expired = spec.name == "cur-linktarget-expired";
+			let perm = if spec.name == "cur-linktarget-w" { 'W' } else { 'R' };
+			vec![Share { subject_type: 'F', subject_id: canon_root(tn), perm, expired }]
 		}
 		_ => Vec::new(),
 	};
 	// Share-link refs on the canonical doc root only (R/C/W + the bypass-seeded 'A').
+	// Plus `zqref-{tn}-del` and `zqref-{tn}-patch` (R), which curated rows revoke and edit.
 	let refs = if id == canon_root(tn) {
-		['R', 'C', 'W', 'A']
+		let short = tn.trim_end_matches(".test");
+		let mut refs: Vec<_> = ['R', 'C', 'W', 'A']
 			.into_iter()
 			.map(|access| ShareRef {
-				ref_id: format!(
-					"zqref-{}-{}",
-					tn.trim_end_matches(".test"),
-					access.to_ascii_lowercase()
-				),
+				ref_id: format!("zqref-{short}-{}", access.to_ascii_lowercase()),
 				access,
 			})
-			.collect()
+			.collect();
+		refs.push(ShareRef { ref_id: format!("zqref-{short}-del"), access: 'R' });
+		refs.push(ShareRef { ref_id: format!("zqref-{short}-patch"), access: 'R' });
+		refs
+	} else if id == canon_folder(tn) {
+		let short = tn.trim_end_matches(".test");
+		vec![ShareRef { ref_id: format!("zqref-{short}-folder"), access: 'R' }]
 	} else {
 		Vec::new()
 	};
@@ -787,7 +838,11 @@ fn action_specs(t: &Tenants) -> Vec<(ActionSpec, TnId)> {
 		cur("cur-accept-mod", c, Issuer::Remote, Pending, true),
 		cur("cur-reject-owner", c, Issuer::Remote, Pending, true),
 		cur("cur-reject-mod", c, Issuer::Remote, Pending, true),
+		cur("cur-aprv-target", c, Issuer::Remote, Pending, true),
 	]);
+	let (mut s, tn_id) = cur("cur-hatrelay-own", c, Issuer::Remote, Active, false);
+	s.typ = HatRelay;
+	out.push((s, tn_id));
 	// Room-stamped `cur-chan-{room}-post`: tenant-issued root, public.
 	for (tn, room, ..) in CHANNELS {
 		let tn = if tn == CLUB { c } else { a };
@@ -866,12 +921,17 @@ async fn seed_action(
 	let audience_tag = match spec.typ {
 		DirectAudience | OnContainer => Some(r.direct.id_tag.clone()),
 		HatRelayed => Some(spec.tn.to_string()),
+		HatRelay => Some(r.peer.id_tag.clone()),
 		_ if spec.to_tenant => Some(spec.tn.to_string()),
 		_ => None,
 	};
 	let mut o = ActionObj {
 		issuer_tag: remote.map_or_else(|| spec.tn.to_string(), |x| x.id_tag.clone()),
-		hat_tag: (spec.typ == HatRelayed).then(|| r.peer.id_tag.clone()),
+		hat_tag: match spec.typ {
+			HatRelayed => Some(r.peer.id_tag.clone()),
+			HatRelay => Some(spec.tn.to_string()),
+			_ => None,
+		},
 		channel: spec.channel.map(|c| absolute_channel(spec.tn, c)),
 		spec,
 		tn_id,

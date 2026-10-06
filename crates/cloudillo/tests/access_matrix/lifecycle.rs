@@ -17,8 +17,7 @@ use crate::ops::bearer;
 use crate::{FIXTURE_LOCK, setup};
 
 fn token<'a>(fx: &'a Fixture, name: &str) -> &'a str {
-	let s = fx.subjects.iter().find(|s| s.name == name);
-	bearer(s.unwrap_or_else(|| panic!("no subject {name}"))).expect("bearer subject")
+	bearer(fx.subject(name)).expect("bearer subject")
 }
 
 async fn send(

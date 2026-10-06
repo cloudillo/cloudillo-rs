@@ -319,13 +319,11 @@ impl Task<App> for FileIdGeneratorTask {
 			.await?;
 		variants.sort();
 
-		// Read root_id from file metadata (for document tree support)
+		// Read root_id (document tree support) and the uploader from file metadata
 		let file_id_str = format!("@{}", self.f_id);
-		let root_id = app
-			.meta_adapter
-			.read_file(self.tn_id, &file_id_str)
-			.await?
-			.and_then(|f| f.root_id);
+		let file = app.meta_adapter.read_file(self.tn_id, &file_id_str).await?;
+		let root_id = file.as_ref().and_then(|f| f.root_id.clone());
+		let owner_tag = file.and_then(|f| f.owner_tag);
 
 		let descriptor = get_file_descriptor(&variants, root_id.as_deref());
 
@@ -339,8 +337,9 @@ impl Task<App> for FileIdGeneratorTask {
 		// `file_id` at all.
 		cloudillo_core::search_index_file(app, self.tn_id, &file_id);
 
-		// Broadcast FILE_ID_GENERATED event to all connections on this tenant
-		// Frontend clients will filter based on whether they're tracking this temp ID
+		// Send FILE_ID_GENERATED to the uploader's connections (`owner_tag`), or to the
+		// tenant account's bus for the tenant's own upload. Frontend clients filter on
+		// whether they're tracking this temp ID.
 		let msg = cloudillo_core::ws_broadcast::BroadcastMessage::new(
 			"FILE_ID_GENERATED",
 			serde_json::json!({
@@ -350,8 +349,13 @@ impl Task<App> for FileIdGeneratorTask {
 			}),
 			"system",
 		);
-		let delivered = app.broadcast.send_to_tenant(self.tn_id, msg).await;
-		debug!("FILE_ID_GENERATED broadcast delivered to {} connections", delivered);
+		if let Some(owner) = owner_tag {
+			let result = app.broadcast.send_to_user(self.tn_id, &owner, msg).await;
+			debug!("FILE_ID_GENERATED sent to {}: {:?}", owner, result);
+		} else {
+			let delivered = app.broadcast.send_to_tenant(self.tn_id, msg).await;
+			debug!("FILE_ID_GENERATED delivered to {} tenant connections", delivered);
+		}
 
 		info!("Finished task file.id-generate {} → {}", descriptor, file_id);
 		Ok(())

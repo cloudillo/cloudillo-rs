@@ -135,8 +135,7 @@ pub async fn list_channels(
 	};
 	let is_tenant = maybe_auth.as_ref().is_some_and(|a| abac::is_tenant_self(a, &tenant_id_tag));
 	let is_real_auth = maybe_auth.is_some() && !reader.is_empty() && reader != "guest";
-	let is_admin = is_tenant
-		|| maybe_auth.as_ref().is_some_and(|a| a.scope.is_none() && is_moderator(&a.roles));
+	let is_admin = is_tenant || maybe_auth.as_ref().is_some_and(abac::is_unscoped_moderator);
 
 	// `follower` ("they follow us") is the direction the visibility ladder means.
 	let rel = abac::subject_relation_to_tenant(&app, tn_id, reader).await?;

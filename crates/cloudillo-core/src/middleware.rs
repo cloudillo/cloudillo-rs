@@ -13,7 +13,7 @@ use axum::{
 	middleware::Next,
 };
 use cloudillo_types::auth_adapter::AuthCtx;
-use cloudillo_types::types::TokenScope;
+use cloudillo_types::types::{TokenScope, scope_for_log};
 use std::pin::Pin;
 
 /// Tenant API key prefix (validated by auth adapter)
@@ -130,7 +130,7 @@ pub async fn require_leader(
 	if auth_ctx.scope.as_deref().and_then(TokenScope::parse).is_some() {
 		warn!(
 			subject = %auth_ctx.id_tag,
-			scope = ?auth_ctx.scope,
+			scope = ?auth_ctx.scope.as_deref().map(scope_for_log),
 			"Owner/leader permission denied - delegated token"
 		);
 		return Err(Error::PermissionDenied);
@@ -173,6 +173,15 @@ enum ScopeGate {
 	Enforce,
 	/// The scope-agnostic tier — see [`require_auth_public_data`].
 	Skip,
+}
+
+/// An `idp_` key manages identities from its IdP's host, which is the identity's parent domain
+/// (the IdP splits an identity at its first dot). Anywhere else (the identity's own tenant, a
+/// community it belongs to) the key is not that identity's credential.
+fn idp_key_on_its_host(key_id_tag: &str, host: &str) -> bool {
+	key_id_tag
+		.split_once('.')
+		.is_some_and(|(label, parent)| !label.is_empty() && parent == host)
 }
 
 /// Full credential validation for the protected API surface.
@@ -274,6 +283,13 @@ async fn authenticate(
 					Error::PermissionDenied
 				})?;
 
+			// Only on its IdP's host: on the identity's own tenant it would name the tenant
+			// without being it, and elsewhere it is not that identity's credential either.
+			if !idp_key_on_its_host(&auth_id_tag, &id_tag.0) {
+				warn!(id_tag = %auth_id_tag, host = %id_tag.0, "IDP API key refused off its IdP's host");
+				return Err(Error::PermissionDenied);
+			}
+
 			AuthCtx {
 				tn_id, // From request host lookup
 				id_tag: auth_id_tag.into(),
@@ -289,6 +305,7 @@ async fn authenticate(
 			state.auth_adapter.validate_access_token(tn_id, &id_tag.0, &token).await?
 		}
 	};
+	share_link_live(&state, &claims).await?;
 
 	// Enforce scope restrictions centrally and fail-closed: a scope string the
 	// matcher doesn't recognise grants nothing anywhere (see `crate::scope`).
@@ -296,7 +313,7 @@ async fn authenticate(
 		&& !crate::scope::scope_permits(claims.scope.as_deref(), req.method(), req.uri().path())
 	{
 		warn!(
-			scope = ?claims.scope,
+			scope = ?claims.scope.as_deref().map(scope_for_log),
 			path = %req.uri().path(),
 			"Scoped token denied access to non-matching endpoint"
 		);
@@ -361,6 +378,33 @@ pub async fn require_auth_public_data(
 	authenticate(state, req, next, ScopeGate::Skip).await
 }
 
+/// A share-link token (a `file:` scope carrying its ref id) lives only as long as its ref: gone,
+/// expired, or downgraded below the token's level is `Unauthorized`.
+// One PK lookup per link request; LRU by ref_id invalidated on ref PATCH/DELETE if it shows
+// in profiles.
+async fn share_link_live(app: &App, auth: &AuthCtx) -> ClResult<()> {
+	use cloudillo_types::types::AccessLevel;
+	let Some(TokenScope::File { file_id, ref_id: Some(ref_id), access }) =
+		auth.scope.as_deref().and_then(TokenScope::parse)
+	else {
+		return Ok(());
+	};
+	let now = Timestamp::now();
+	let live = app.meta_adapter.get_ref(auth.tn_id, &ref_id).await?.is_some_and(|r| {
+		r.expires_at.is_none_or(|e| e.0 > now.0)
+			&& AccessLevel::from_perm_char(r.access_level.unwrap_or('R')) >= access
+	});
+	if live {
+		Ok(())
+	} else {
+		warn!(
+			tn_id = %auth.tn_id.0, file_id = %file_id,
+			"Share-link token refused: its ref is gone, expired or downgraded"
+		);
+		Err(Error::Unauthorized)
+	}
+}
+
 pub async fn optional_auth(
 	State(state): State<App>,
 	mut req: Request<Body>,
@@ -415,6 +459,13 @@ pub async fn optional_auth(
 							// Validate IDP API key (idp_ prefix)
 							if let Some(idp_adapter) = state.idp_adapter.as_ref() {
 								match idp_adapter.verify_api_key(token).await {
+									// Off its IdP's host: `authenticate` refuses it with 403;
+									// here, like every refused credential in this tier, it is
+									// a 401 — never a guest.
+									Ok(Some(t)) if !idp_key_on_its_host(&t, &id_tag.0) => {
+										warn!(id_tag = %t, "IDP API key refused off its IdP's host");
+										Err(Error::PermissionDenied)
+									}
 									Ok(Some(auth_id_tag)) => Ok(Ok(AuthCtx {
 										tn_id,
 										id_tag: auth_id_tag.into(),
@@ -452,6 +503,7 @@ pub async fn optional_auth(
 
 				match claims_result {
 					Ok(Ok(claims)) => {
+						share_link_live(&state, &claims).await?;
 						// Same fail-closed decision as `require_auth`, but a denial
 						// here degrades to unauthenticated rather than 403.
 						let allowed = crate::scope::scope_permits(
@@ -463,7 +515,7 @@ pub async fn optional_auth(
 							req.extensions_mut().insert(Auth(claims));
 						} else {
 							warn!(
-								scope = ?claims.scope,
+								scope = ?claims.scope.as_deref().map(scope_for_log),
 								path = %req.uri().path(),
 								"Scoped token denied access in optional_auth, treating as unauthenticated"
 							);
@@ -523,6 +575,17 @@ mod tests {
 	use super::*;
 	use axum::{Router, http::StatusCode, middleware, routing::get};
 	use tower::ServiceExt;
+
+	#[test]
+	fn idp_key_only_on_its_idp_host() {
+		assert!(idp_key_on_its_host("bob.idp.test", "idp.test"));
+		assert!(!idp_key_on_its_host("idp.test", "idp.test"));
+		assert!(!idp_key_on_its_host("alice.test", "club.test"));
+		assert!(!idp_key_on_its_host("xidp.test", "idp.test"));
+		assert!(!idp_key_on_its_host(".idp.test", "idp.test"));
+		assert!(!idp_key_on_its_host("alice.b.idp.test", "idp.test"));
+		assert!(idp_key_on_its_host("alice.b.idp.test", "b.idp.test"));
+	}
 
 	fn auth_ctx(roles: &[&str], scope: Option<&str>) -> AuthCtx {
 		AuthCtx {

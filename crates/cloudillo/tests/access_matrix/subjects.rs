@@ -13,14 +13,16 @@ use serde_json::json;
 
 use cloudillo::App;
 use cloudillo::auth_adapter::{AccessToken, ActionToken, AuthCtx};
-use cloudillo::meta_adapter::ProfileType;
+use cloudillo::meta_adapter::{
+	CreateFile, CreateRefOptions, FileStatus, ProfileStatus, ProfileType, SHARE_FILE_REF_TYPE,
+};
 use cloudillo::types::{Patch, Timestamp, TnId};
 
 use crate::fixture::{
 	ADMIN, ALICE, CLUB, PASSWORD, RemoteId, Remotes, TRASH, Tenants, call, find_str, prof, remote,
 	req, sign,
 };
-use crate::objects::{ApiKeys, Obj, canon_root};
+use crate::objects::{ApiKeys, Obj, canon_folder, canon_root};
 
 pub struct Subject {
 	pub name: String,
@@ -50,7 +52,8 @@ pub enum CredKind {
 	Via,
 	/// `cl_` API key sent as the bearer itself.
 	ApiKey,
-	/// `idp_` key; no identity provider is configured.
+	/// `idp_` key, verified by the fixture's stub identity provider; accepted only on its IdP's
+	/// host, which no fixture tenant is.
 	Idp,
 	/// Hand-forged (hostile subjects only).
 	Forged,
@@ -71,6 +74,8 @@ pub enum Relation {
 	Member,
 	/// Member of a peer community wearing its hat; mapped role in `roles`.
 	PeerHat,
+	/// Profile status Blocked on the host.
+	Blocked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,7 +307,24 @@ pub async fn mint_subjects(
 	let club_owner = m.login(CLUB).await;
 	m.add("owner@club", CLUB, club_owner.clone(), owner_facts(CLUB, &[]));
 	let admin_owner = m.login(ADMIN).await;
-	m.add("owner-sadm@admin", ADMIN, admin_owner, owner_facts(ADMIN, &["SADM"]));
+	m.add("owner-sadm@admin", ADMIN, admin_owner.clone(), owner_facts(ADMIN, &["SADM"]));
+	// SADM's own session scoped down to a document: no longer SADM anywhere.
+	let admin_doc = "f1~zqm-admin-doc";
+	let doc = CreateFile {
+		file_id: Some(admin_doc.into()),
+		file_tp: Some("CRDT".into()),
+		content_type: "cloudillo/quillo".into(),
+		file_name: "zqm-admin-doc".into(),
+		status: Some(FileStatus::Active),
+		..Default::default()
+	};
+	app.meta_adapter.create_file(t.admin.tn_id, doc).await.unwrap();
+	let scope = format!("file:{admin_doc}:R");
+	let uri = format!("/api/auth/access-token?scope={scope}");
+	let tok = m.get("scope-sadm@admin", ADMIN, &uri, admin_owner.as_deref()).await;
+	let mut facts = owner_facts(ADMIN, &["SADM"]);
+	facts.scope = Some(scope);
+	m.add("sadm-scoped@admin", ADMIN, tok, facts);
 
 	// Remotes on alice.
 	for (id, rel) in [
@@ -369,6 +391,36 @@ pub async fn mint_subjects(
 			..Default::default()
 		},
 	);
+
+	// A Blocked profile with a role on club: its plain session carries no role, its hat none.
+	let blocked = remote("zqm-blocked-member");
+	let meta = &app.meta_adapter;
+	meta.add_profile_public_key(&blocked.id_tag, &blocked.key_id, &blocked.spki_b64, None)
+		.await
+		.unwrap();
+	let mut f = prof(ProfileType::Person);
+	f.status = Patch::Value(ProfileStatus::Blocked);
+	f.roles = Patch::Value(Some(vec!["contributor".into()]));
+	meta.upsert_profile(t.club.tn_id, &blocked.id_tag, &f).await.unwrap();
+	let tok = m.proxy("blocked-session@club", CLUB, &blocked, "").await;
+	m.add(
+		"blocked-session@club",
+		CLUB,
+		tok,
+		SubjectFacts {
+			id_tag: Some(blocked.id_tag.clone()),
+			kind: CredKind::Proxy,
+			relation: Relation::Blocked,
+			..Default::default()
+		},
+	);
+	let mut endorsement = proxy_claims(&r.peer, CLUB);
+	endorsement.t = "APRV".into();
+	endorsement.c = Some(json!({ "r": "contributor" }));
+	endorsement.sub = Some(format!("@{}", blocked.id_tag).into());
+	let endorsement = sign(&r.peer, &endorsement);
+	m.proxy("blocked-hat@club", CLUB, &blocked, &format!("&hat={endorsement}"))
+		.await;
 
 	// Hatted session: only a `file:` scope mint is open, capped by the room gate and parent exp.
 	let club_scope = format!("file:{}:R", canon_root(CLUB));
@@ -454,6 +506,20 @@ pub async fn mint_subjects(
 			},
 		);
 	}
+	// A share link on the canonical folder: reaches its descendants only.
+	let uri = "/api/auth/access-token?refId=zqref-alice-folder";
+	let tok = m.get("ref-folderlink-r@alice", ALICE, uri, None).await;
+	m.add(
+		"folderlink-r@alice",
+		ALICE,
+		tok,
+		SubjectFacts {
+			kind: CredKind::ShareLink,
+			scope: Some(format!("file:{}:R", canon_folder(ALICE))),
+			..Default::default()
+		},
+	);
+
 	// Over-ask by a read grantee (mint cell only).
 	let scope = format!("file:{alice_root}:W");
 	m.proxy("scope-g-read-overask@alice", ALICE, &r.g_read, &format!("&scope={scope}"))
@@ -530,6 +596,41 @@ pub async fn mint_subjects(
 		Some(crate::fixture::IDP_KEY.into()),
 		SubjectFacts { id_tag: Some(ALICE.into()), kind: CredKind::Idp, ..Default::default() },
 	);
+	// An identity's own key on its IdP's host (alice): that identity, nothing of alice's.
+	let ident = || SubjectFacts {
+		id_tag: Some(crate::fixture::IDP_IDENT.into()),
+		kind: CredKind::Idp,
+		..Default::default()
+	};
+	m.add("idp-ident@alice", ALICE, Some(crate::fixture::IDP_IDENT_KEY.into()), ident());
+	m.add("idp-ident@club", CLUB, Some(crate::fixture::IDP_IDENT_KEY.into()), ident());
+	// The same key on a community alice may belong to: not its IdP's host, so refused.
+	m.add(
+		"idp-mgmt@club",
+		CLUB,
+		Some(crate::fixture::IDP_KEY.into()),
+		SubjectFacts { id_tag: Some(ALICE.into()), kind: CredKind::Idp, ..Default::default() },
+	);
+	let key_facts = |scope: Option<&str>, hostile| SubjectFacts {
+		id_tag: Some(ALICE.into()),
+		kind: CredKind::ApiKey,
+		relation: Relation::Owner,
+		scope: scope.map(Into::into),
+		hostile,
+		..Default::default()
+	};
+	// alice's unscoped key presented on club's host; an expired key; a one-capability key.
+	let xtenant = key_facts(None, Some(Hostile::CrossTenant));
+	m.add("apikey-xtenant@club", CLUB, Some(keys.unscoped.clone()), xtenant);
+	let expired = key_facts(None, Some(Hostile::Expired));
+	m.add("apikey-expired@alice", ALICE, Some(keys.expired.clone()), expired);
+	let carddav = key_facts(Some("carddav:read"), None);
+	m.add("apikey-carddav-r@alice", ALICE, Some(keys.carddav_r.clone()), carddav);
+	// alice's DAV key presented on club's host.
+	let dav_xtenant = key_facts(Some("carddav:read,caldav:read"), Some(Hostile::CrossTenant));
+	m.add("apikey-dav@club", CLUB, Some(keys.dav.clone()), dav_xtenant);
+
+	edge_mints(&mut m, &r.hatted, keys, &aprv, alice_owner.as_deref()).await;
 
 	hostile_subjects(&mut m, club_owner, alice_owner).await;
 	hostile_proxy_mints(&mut m).await;
@@ -538,11 +639,86 @@ pub async fn mint_subjects(
 	(m.subjects, m.mints)
 }
 
+/// Exchange edges (mint cells only): a scoped bearer's bare refresh, a ref off its tenant or
+/// deleted, `refresh=true`, odd `scope=` values, a hat with a scope, a key off its tenant.
+async fn edge_mints(
+	m: &mut Minter<'_>,
+	hatted: &RemoteId,
+	keys: &ApiKeys,
+	aprv: &str,
+	owner: Option<&str>,
+) {
+	let bearer_of = |m: &Minter<'_>, name: &str| {
+		m.subjects.iter().find(|s| s.name == name).and_then(|s| match &s.cred {
+			Cred::Bearer(t) => Some(t.clone()),
+			Cred::None => None,
+		})
+	};
+	let uri = "/api/auth/access-token";
+	for name in ["sharelink-r@alice", "sharelink-w@alice", "apikey-file@alice"] {
+		let tok = bearer_of(m, name);
+		m.get(&format!("refresh-{name}"), ALICE, uri, tok.as_deref()).await;
+	}
+	m.get("ref-xtenant@club", CLUB, &format!("{uri}?refId=zqref-alice-r"), None)
+		.await;
+	let meta = &m.app.meta_adapter;
+	let opts = CreateRefOptions {
+		typ: SHARE_FILE_REF_TYPE.into(),
+		description: None,
+		expires_at: None,
+		count: None,
+		resource_id: Some("zqm".into()),
+		access_level: Some('R'),
+		params: None,
+	};
+	meta.create_ref(m.t.alice.tn_id, "zqref-alice-gone", &opts).await.unwrap();
+	meta.delete_ref(m.t.alice.tn_id, "zqref-alice-gone").await.unwrap();
+	m.get("ref-deleted@alice", ALICE, &format!("{uri}?refId=zqref-alice-gone"), None)
+		.await;
+	m.get("ref-refresh@alice", ALICE, &format!("{uri}?refId=zqref-alice-r&refresh=true"), None)
+		.await;
+	// A single-use ref tried on the wrong host first: refused there, and not burned by it.
+	let once = CreateRefOptions { count: Some(1), resource_id: Some(canon_root(ALICE)), ..opts };
+	meta.create_ref(m.t.alice.tn_id, "zqref-alice-once", &once).await.unwrap();
+	m.get("ref-once-xtenant@club", CLUB, &format!("{uri}?refId=zqref-alice-once"), None)
+		.await;
+	m.get("ref-once@alice", ALICE, &format!("{uri}?refId=zqref-alice-once"), None)
+		.await;
+	m.get("scope-foreign-ask@alice", ALICE, &format!("{uri}?scope=foo:bar"), owner)
+		.await;
+	m.get("scope-carddav@alice", ALICE, &format!("{uri}?scope=carddav:read"), owner)
+		.await;
+	let stranger = bearer_of(m, "stranger@alice.test");
+	let scope = format!("file:{}:R", canon_root(ALICE));
+	m.get("scope-stranger-root@alice", ALICE, &format!("{uri}?scope={scope}"), stranger.as_deref())
+		.await;
+	m.proxy("hatscope-hatted@club", CLUB, hatted, &format!("&hat={aprv}&scope={scope}"))
+		.await;
+	let key = &keys.unscoped;
+	m.get("xchg-apikey-xtenant@club", CLUB, &format!("{uri}?apiKey={key}"), None)
+		.await;
+
+	// Via over a `W` link: the caller's own level caps the mint; no access or no link refuses.
+	let root = canon_root(ALICE);
+	let w_target = canon_root(ALICE).replace("tenant-crdt-d-active", "cur-linktarget-w");
+	let via_w = format!("{uri}?via={root}&scope=file:{w_target}:W");
+	for (name, who) in [
+		("via-gread-overask@alice", "g-read@alice.test"),
+		("via-scoped-overask@alice", "owner-scoped-r@alice"),
+		("via-noaccess-stranger@alice", "stranger@alice.test"),
+	] {
+		let tok = bearer_of(m, who);
+		m.get(name, ALICE, &via_w, tok.as_deref()).await;
+	}
+	let unlinked = canon_root(ALICE).replace("tenant-crdt-d-active", "tenant-blob-d-active");
+	m.get("via-nolink@alice", ALICE, &format!("{uri}?via={root}&scope=file:{unlinked}:R"), owner)
+		.await;
+}
+
 /// Subjects no curated row uses.
-const UNUSED_SUBJECTS: [&str; 11] = [
+const UNUSED_SUBJECTS: [&str; 9] = [
 	"sharelink-c@club",
 	"sharelink-a@club",
-	"sharelink-c@alice",
 	"owner-scoped-c@alice",
 	"g-write-scoped-c@alice",
 	"g-write-scoped-w@alice",
@@ -550,7 +726,6 @@ const UNUSED_SUBJECTS: [&str; 11] = [
 	"g-admin@club.test",
 	"g-folder@club.test",
 	"g-expired@club.test",
-	"owner-sadm@admin",
 ];
 
 /// Level-layer representatives, one per subject equivalence class.

@@ -121,6 +121,7 @@ fn all_api_tables() -> axum::Router<crate::prelude::App> {
 		.merge(profile::write())
 		.merge(profile::admin())
 		.merge(profile::own())
+		.merge(profile::tenant_profile())
 		.merge(profile::channels_admin())
 		.merge(profile::channels_public())
 		.merge(profile::partners_list())

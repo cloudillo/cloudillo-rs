@@ -153,8 +153,16 @@ pub async fn share_standing(
 ) -> ClResult<ShareAuthority> {
 	let access = require_unscoped_file_access(app, tn_id, file_id, auth, tenant_id_tag).await?;
 
+	// The room caps roles: a leader outside the file's room manages nothing there.
 	let leader_over_local_row =
-		leader_over_local_row(&auth.roles, access.file_view.upstream.as_ref());
+		leader_over_local_row(&auth.roles, access.file_view.upstream.as_ref())
+			&& file_access::channel_admits(
+				app,
+				tn_id,
+				access.file_view.channel.as_deref(),
+				&FileAccessCtx::from_auth(Some(auth), tenant_id_tag),
+			)
+			.await;
 
 	// No extra query needed: an explicit `'A'` entry (direct or folder-inherited) and ownership of a
 	// local row both already reached `access_level` as `Admin`.

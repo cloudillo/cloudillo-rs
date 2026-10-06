@@ -302,6 +302,8 @@ pub enum WsDeny {
 	WriteDenied,
 	/// An `s~` store file exists with the other endpoint's type
 	TypeMismatch,
+	/// An `s~` id with an invalid app id
+	InvalidStore,
 }
 
 impl std::fmt::Display for WsDeny {
@@ -312,6 +314,7 @@ impl std::fmt::Display for WsDeny {
 			WsDeny::Access(FileAccessError::InternalError(_)) => "internal_error",
 			WsDeny::WriteDenied => "write_denied",
 			WsDeny::TypeMismatch => "type_mismatch",
+			WsDeny::InvalidStore => "invalid_store",
 		})
 	}
 }
@@ -321,7 +324,37 @@ fn ws_close_for_deny(ws: WebSocketUpgrade, deny: &WsDeny) -> Response {
 		WsDeny::Access(e) => ws_close_for_error(ws, e),
 		WsDeny::WriteDenied => ws_close_write_denied(ws),
 		WsDeny::TypeMismatch => ws_close_type_mismatch(ws),
+		WsDeny::InvalidStore => ws_close_invalid_store(ws),
 	}
+}
+
+/// Lazily creates an `s~` store row ahead of [`ws_file_access`], but only for a caller who may
+/// create content (unscoped, contributor or above, as `check_perm_create`); for anyone
+/// else the missing row is refused there. Anything but a store id is left alone.
+pub async fn ws_prepare_store(
+	app: &crate::app::App,
+	tn_id: crate::types::TnId,
+	auth: Option<&cloudillo_types::auth_adapter::AuthCtx>,
+	file_id: &str,
+	kind: WsKind,
+) -> Result<(), WsDeny> {
+	let app_id = match validate_store_id(file_id) {
+		Ok(Some(app_id)) => app_id,
+		Ok(None) => return Ok(()),
+		Err(()) => return Err(WsDeny::InvalidStore),
+	};
+	let creator =
+		auth.is_some_and(|a| a.scope.is_none() && cloudillo_core::roles::is_contributor(&a.roles));
+	if !creator {
+		return Ok(());
+	}
+	let file_tp = match kind {
+		WsKind::Crdt => "CRDT",
+		WsKind::Rtdb => "RTDB",
+	};
+	ensure_store_file(app, tn_id, file_id, file_tp, app_id)
+		.await
+		.map_err(WsDeny::Access)
 }
 
 /// The pre-upgrade access decision for `/ws/rtdb/{id}` and `/ws/crdt/{id}`.
@@ -388,12 +421,19 @@ pub async fn ws_file_access(
 	Ok((al, content_id))
 }
 
-/// WebSocket upgrade handler for the notification bus
-///
-/// Requires authentication. Routes to ws_bus handler.
+/// Who may open the tenant bus: the tenant account's own session, nobody else. The bus carries
+/// the tenant's traffic (inbound actions, file and maintenance events), and the shell only ever
+/// connects to its own tenant's bus. A member, a visitor, a scoped token or an API key (`cl_`,
+/// `idp_`; no `exp`) is refused.
+pub fn ws_bus_admission(a: &cloudillo_types::auth_adapter::AuthCtx, tenant_id_tag: &str) -> bool {
+	a.exp.is_some() && cloudillo_core::abac::is_tenant_account(a, tenant_id_tag)
+}
+
+/// WebSocket upgrade handler for the notification bus; admission is [`ws_bus_admission`].
 pub async fn get_ws_bus(
 	ws: WebSocketUpgrade,
 	State(app): State<crate::app::App>,
+	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(auth): OptionalAuth,
 ) -> Response {
 	use tracing::{debug, warn};
@@ -405,6 +445,10 @@ pub async fn get_ws_bus(
 		warn!("Bus WebSocket rejected - no authentication");
 		return ws_close_unauthenticated(ws);
 	};
+	if !ws_bus_admission(&auth_ctx, &tenant_id_tag) {
+		warn!(subject = %auth_ctx.id_tag, "Bus WebSocket rejected - not the tenant account");
+		return ws_close_for_error(ws, &FileAccessError::AccessDenied);
+	}
 
 	let user_id = auth_ctx.id_tag.to_string();
 	let tn_id = auth_ctx.tn_id;
@@ -455,23 +499,12 @@ pub async fn get_ws_rtdb(
 	let user_id = auth.as_ref().map(|a| a.id_tag.to_string()).unwrap_or_default();
 	let user_tn_id = auth.as_ref().map_or(crate::types::TnId(tn_id), |a| a.tn_id);
 
-	// Auto-create store file only for authenticated users
-	if !is_guest {
-		match validate_store_id(&file_id) {
-			Ok(Some(app_id)) => {
-				if let Err(e) =
-					ensure_store_file(&app, crate::types::TnId(tn_id), &file_id, "RTDB", app_id)
-						.await
-				{
-					return ws_close_for_error(ws, &e);
-				}
-			}
-			Ok(None) => {} // Not a store ID, proceed normally
-			Err(()) => {
-				warn!("RTDB WebSocket rejected - invalid store ID: {}", file_id);
-				return ws_close_invalid_store(ws);
-			}
-		}
+	let kind = WsKind::Rtdb;
+	if let Err(deny) =
+		ws_prepare_store(&app, crate::types::TnId(tn_id), auth.as_ref(), &file_id, kind).await
+	{
+		warn!("RTDB WebSocket rejected ({}): user={}, file={}", deny, user_id, file_id);
+		return ws_close_for_deny(ws, &deny);
 	}
 
 	let (access_level, content_id) = match ws_file_access(
@@ -481,7 +514,7 @@ pub async fn get_ws_rtdb(
 		auth.as_ref(),
 		&file_id,
 		&query,
-		WsKind::Rtdb,
+		kind,
 	)
 	.await
 	{
@@ -508,10 +541,9 @@ pub async fn get_ws_rtdb(
 		file_id
 	);
 	ws.on_upgrade(move |socket| {
-		// `identity_id_tag`, deliberately *not* `is_guest` — that still governs
-		// store-file auto-creation and the read-only downgrade in `ws_file_access`, and a
-		// `file:{id}:W` share-link visitor keeps write access while losing only
-		// the asserted identity.
+		// `identity_id_tag`, deliberately *not* `is_guest` — that only governs meta-file
+		// auto-creation above, and a `file:{id}:W` share-link visitor keeps write access while
+		// losing only the asserted identity.
 		rtdb::handle_rtdb_connection(
 			socket,
 			identity_id_tag,
@@ -564,23 +596,12 @@ pub async fn get_ws_crdt(
 	let user_id = auth.as_ref().map(|a| a.id_tag.to_string()).unwrap_or_default();
 	let user_tn_id = auth.as_ref().map_or(crate::types::TnId(tn_id), |a| a.tn_id);
 
-	// Auto-create store file only for authenticated users
-	if !is_guest {
-		match validate_store_id(&doc_id) {
-			Ok(Some(app_id)) => {
-				if let Err(e) =
-					ensure_store_file(&app, crate::types::TnId(tn_id), &doc_id, "CRDT", app_id)
-						.await
-				{
-					return ws_close_for_error(ws, &e);
-				}
-			}
-			Ok(None) => {} // Not a store ID, proceed normally
-			Err(()) => {
-				warn!("CRDT WebSocket rejected - invalid store ID: {}", doc_id);
-				return ws_close_invalid_store(ws);
-			}
-		}
+	let kind = WsKind::Crdt;
+	if let Err(deny) =
+		ws_prepare_store(&app, crate::types::TnId(tn_id), auth.as_ref(), &doc_id, kind).await
+	{
+		warn!("CRDT WebSocket rejected ({}): user={}, file={}", deny, user_id, doc_id);
+		return ws_close_for_deny(ws, &deny);
 	}
 
 	let (access_level, content_id) = match ws_file_access(
@@ -590,7 +611,7 @@ pub async fn get_ws_crdt(
 		auth.as_ref(),
 		&doc_id,
 		&query,
-		WsKind::Crdt,
+		kind,
 	)
 	.await
 	{
@@ -609,10 +630,8 @@ pub async fn get_ws_crdt(
 		doc_id
 	);
 	ws.on_upgrade(move |socket| {
-		// `awareness_id_tag`, deliberately *not* `is_guest` — that still governs
-		// store-file auto-creation and read-only above, and a `file:{id}:W`
-		// share-link visitor keeps write access while losing only the asserted
-		// identity.
+		// `awareness_id_tag`, deliberately *not* `is_guest`: a `file:{id}:W` share-link
+		// visitor keeps write access while losing only the asserted identity.
 		crdt::handle_crdt_connection(
 			socket,
 			awareness_id_tag,
@@ -622,6 +641,41 @@ pub async fn get_ws_crdt(
 			read_only,
 		)
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::ws_bus_admission;
+	use cloudillo_types::auth_adapter::AuthCtx;
+	use cloudillo_types::types::{Timestamp, TnId};
+
+	fn ctx(scope: Option<&str>, exp: Option<Timestamp>, roles: &[&str]) -> AuthCtx {
+		AuthCtx {
+			tn_id: TnId(1),
+			id_tag: "alice.idp.test".into(),
+			roles: roles.iter().map(|r| Box::from(*r)).collect(),
+			scope: scope.map(Box::from),
+			anonymous: false,
+			hat: None,
+			exp,
+		}
+	}
+
+	#[test]
+	fn bus_admits_only_the_tenant_account() {
+		let exp = Some(Timestamp::from_now(60));
+		let host = "alice.idp.test";
+		// The account's own session.
+		assert!(ws_bus_admission(&ctx(None, exp, &["leader"]), host));
+		// An `idp_` key on its own IdP host (no scope, no expiry, no roles); a key or an
+		// API key of the account (no expiry); a scoped token.
+		assert!(!ws_bus_admission(&ctx(None, None, &[]), host));
+		assert!(!ws_bus_admission(&ctx(None, None, &["leader"]), host));
+		assert!(!ws_bus_admission(&ctx(Some("file:f1~x:R"), exp, &["leader"]), host));
+		// Another tenant's session, a leader or moderator there included.
+		assert!(!ws_bus_admission(&ctx(None, exp, &["leader"]), "club.test"));
+		assert!(!ws_bus_admission(&ctx(None, exp, &["moderator"]), "club.test"));
+	}
 }
 
 // vim: ts=4

@@ -39,6 +39,11 @@ pub fn is_moderator(roles: &[Box<str>]) -> bool {
 	highest_role_level(roles) >= MODERATOR_LEVEL
 }
 
+/// True iff `roles` reaches the `contributor` level — the bar for creating content.
+pub fn is_contributor(roles: &[Box<str>]) -> bool {
+	highest_role_level(roles) >= CONTRIBUTOR_LEVEL
+}
+
 /// Hierarchy level of the "follower" role — derived for every role-less follower, so it
 /// counts as membership nowhere; "a real role" means strictly above it.
 pub const FOLLOWER_LEVEL: usize = 1;

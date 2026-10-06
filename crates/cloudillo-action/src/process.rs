@@ -387,6 +387,8 @@ async fn process_inbound_action_token_inner(
 			issuer = %action.iss,
 			"Skipping permission check for pre-approved related action"
 		);
+		// The block holds whoever vouches for the action.
+		refuse_restricted_issuer(app, tn_id, &action).await?;
 	} else {
 		check_inbound_permissions(app, tn_id, action_id, &action, definition, via.hat_role).await?;
 	}
@@ -740,6 +742,72 @@ fn resolve_definition<'a>(
 	})
 }
 
+/// The issuer's local profile, if any; a deactivated, blocked or banned issuer is refused.
+async fn refuse_restricted_issuer(
+	app: &App,
+	tn_id: TnId,
+	action: &ActionToken,
+) -> ClResult<Option<meta_adapter::Profile<Box<str>>>> {
+	match app.meta_adapter.read_profile(tn_id, &action.iss).await {
+		Ok((_, p)) if p.status.is_some_and(ProfileStatus::restricts_access) => {
+			warn!(
+				issuer = %action.iss,
+				action_type = %action.t,
+				status = ?p.status,
+				"Inbound action refused: issuer profile is deactivated/blocked/banned"
+			);
+			Err(Error::PermissionDenied)
+		}
+		Ok((_, p)) => Ok(Some(p)),
+		Err(Error::NotFound) => Ok(None),
+		// Fail closed: the verifier task retries a transient error.
+		Err(e) => Err(e),
+	}
+}
+
+/// An action addressed to a third tenant is not ours to store: `aud` must be unset, us, or the
+/// issuer. Exempt, as they legitimately name someone else: an APRV (fan-out addresses it to the
+/// approved issuer), an INVT to our community or one of its rooms, anything whose subject is a
+/// local action we own (REPOST / INVT copies sent to the subject's owner, a hatted engagement
+/// stored unhatted), a child of an action we hold (subscriber fan-out of a thread; the
+/// subscription and flag gates still apply), and a relay we hat. Pre-approved, relayed and
+/// hat-endorsed deliveries never reach here.
+async fn refuse_foreign_audience(app: &App, tn_id: TnId, action: &ActionToken) -> ClResult<()> {
+	let Some(aud) = action.aud.as_deref() else { return Ok(()) };
+	if aud == action.iss.as_ref() || helpers::extract_type_and_subtype(&action.t).0 == "APRV" {
+		return Ok(());
+	}
+	let us = app.meta_adapter.read_tenant(tn_id).await?.id_tag;
+	if aud == us.as_ref() || action.h.as_deref() == Some(us.as_ref()) {
+		return Ok(());
+	}
+	if let Some(p) = action.p.as_deref()
+		&& app.meta_adapter.get_action(tn_id, p).await?.is_some()
+	{
+		return Ok(());
+	}
+	if let Some(sub) = action.sub.as_deref() {
+		let community = sub.strip_prefix('@').is_some_and(|s| {
+			s == us.as_ref() || s.split_once('~').is_some_and(|(t, _)| t == us.as_ref())
+		});
+		if community {
+			return Ok(());
+		}
+		if let Ok(Some(subject)) = app.meta_adapter.get_action(tn_id, sub).await
+			&& owns_subject(&subject, &us)
+		{
+			return Ok(());
+		}
+	}
+	warn!(
+		issuer = %action.iss,
+		audience = %aud,
+		action_type = %action.t,
+		"Inbound action names another tenant"
+	);
+	Err(Error::PermissionDenied)
+}
+
 /// Check permissions based on action type's allow_unknown setting
 async fn check_inbound_permissions(
 	app: &App,
@@ -755,35 +823,20 @@ async fn check_inbound_permissions(
 		check_aprv_authority(app, tn_id, action_id, action).await?;
 	}
 
+	// A restricted issuer is refused ahead of every admission shortcut (hat, `allow_unknown`).
+	let issuer_profile = refuse_restricted_issuer(app, tn_id, action).await?;
 	// A hatted action endorsed by its hat: the mapped `hat_role` replaces the follow/connected
-	// gate, and must be contributor or above. Ahead of `allow_unknown`, so a restricted issuer
-	// is refused even for a type that admits strangers.
+	// gate, and must be contributor or above.
 	if let Some(role) = hat_role {
-		match app.meta_adapter.read_profile(tn_id, &action.iss).await {
-			Ok((_, p)) if p.status.is_some_and(ProfileStatus::restricts_access) => {
-				warn!(issuer = %action.iss, status = ?p.status, "Hatted action refused: issuer restricted");
-				return Err(Error::PermissionDenied);
-			}
-			Ok(_) | Err(Error::NotFound) => {}
-			Err(e) => return Err(e),
-		}
 		if role_level(role).is_none_or(|l| l < CONTRIBUTOR_LEVEL) {
 			warn!(issuer = %action.iss, role = %role, "Hatted action refused: role below contributor");
 			return Err(Error::PermissionDenied);
 		}
 		return Ok(());
 	}
+	// After the hat shortcut: a hat endorsement already requires the action be addressed to us.
+	refuse_foreign_audience(app, tn_id, action).await?;
 
-	if definition.behavior.allow_unknown.unwrap_or(false) {
-		return Ok(());
-	}
-
-	let issuer_profile =
-		if let Ok((_etag, profile)) = app.meta_adapter.read_profile(tn_id, &action.iss).await {
-			Some(profile)
-		} else {
-			None
-		};
 	debug!(
 		"  profile: {} following={} connected={}",
 		action.iss,
@@ -791,16 +844,8 @@ async fn check_inbound_permissions(
 		issuer_profile.as_ref().is_some_and(|p| p.connected.is_connected())
 	);
 
-	if let Some(ref p) = issuer_profile
-		&& p.status.is_some_and(ProfileStatus::restricts_access)
-	{
-		warn!(
-			issuer = %action.iss,
-			action_type = %action.t,
-			status = ?p.status,
-			"Inbound action refused: issuer profile is deactivated/blocked/banned"
-		);
-		return Err(Error::PermissionDenied);
+	if definition.behavior.allow_unknown.unwrap_or(false) {
+		return Ok(());
 	}
 
 	// `requires_connected` (e.g. PRINVT): a mutual connection; following is not enough.

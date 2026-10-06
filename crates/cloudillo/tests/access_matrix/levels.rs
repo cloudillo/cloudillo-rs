@@ -81,13 +81,6 @@ pub fn level_objs<'a>(fx: &'a Fixture, host: &str, file: bool) -> Vec<&'a Obj> {
 		.collect()
 }
 
-fn subject<'a>(fx: &'a Fixture, name: &str) -> &'a Subject {
-	fx.subjects
-		.iter()
-		.find(|s| s.name == name)
-		.unwrap_or_else(|| panic!("layer subject {name}"))
-}
-
 fn named<'a>(fx: &'a Fixture, host: &str, name: &str) -> &'a Obj {
 	fx.objs
 		.iter()
@@ -139,7 +132,7 @@ pub fn file_layers(fx: &Fixture) -> Vec<(&'static str, Vec<Cell<'_>>)> {
 	let mut shape_l = Vec::new();
 	for (host, names) in SHAPE_FILE_SUBJECTS {
 		for n in names {
-			let s = subject(fx, n);
+			let s = fx.subject(n);
 			for o in level_objs(fx, host, true) {
 				if matches!(o, Obj::File(f) if f.spec.vis.is_none()) {
 					push_file(&mut shape_l, s, o);
@@ -149,7 +142,7 @@ pub fn file_layers(fx: &Fixture) -> Vec<(&'static str, Vec<Cell<'_>>)> {
 	}
 	let mut vis_l = Vec::new();
 	for n in VIS_SUBJECTS {
-		let s = subject(fx, n);
+		let s = fx.subject(n);
 		for o in level_objs(fx, &s.host, true) {
 			if matches!(o, Obj::File(f) if f.spec.shape == FileShape::TenantOwned) {
 				push_file(&mut vis_l, s, o);
@@ -158,7 +151,7 @@ pub fn file_layers(fx: &Fixture) -> Vec<(&'static str, Vec<Cell<'_>>)> {
 	}
 	let mut life_l = Vec::new();
 	for n in LIFE_SUBJECTS {
-		let s = subject(fx, n);
+		let s = fx.subject(n);
 		for o in life_objs(fx, &s.host) {
 			for op in [FileOp::Metadata, FileOp::ById, FileOp::ByParent] {
 				life_l.push((Op::File(op), s, o));
@@ -180,7 +173,7 @@ pub fn action_layers(fx: &Fixture) -> Vec<(&'static str, Vec<Cell<'_>>)> {
 	let mut shape_l = Vec::new();
 	for (host, names) in SHAPE_ACTION_SUBJECTS {
 		for n in names {
-			let s = subject(fx, n);
+			let s = fx.subject(n);
 			for o in level_objs(fx, host, false) {
 				if matches!(o, Obj::Action(a) if a.spec.vis.is_none()) {
 					shape_l.push((get, s, o));
@@ -190,7 +183,7 @@ pub fn action_layers(fx: &Fixture) -> Vec<(&'static str, Vec<Cell<'_>>)> {
 	}
 	let mut vis_l = Vec::new();
 	for n in VIS_SUBJECTS {
-		let s = subject(fx, n);
+		let s = fx.subject(n);
 		for o in level_objs(fx, &s.host, false) {
 			if matches!(o, Obj::Action(a) if a.spec.typ == ActionShape::Post) {
 				vis_l.push((get, s, o));
@@ -201,7 +194,7 @@ pub fn action_layers(fx: &Fixture) -> Vec<(&'static str, Vec<Cell<'_>>)> {
 }
 
 fn life_subjects(fx: &Fixture) -> Vec<&Subject> {
-	LIFE_SUBJECTS.iter().map(|n| subject(fx, n)).collect()
+	LIFE_SUBJECTS.iter().map(|n| fx.subject(n)).collect()
 }
 
 pub(crate) async fn run_cells(fx: &Fixture, rep: &mut Report, cells: Vec<Cell<'_>>) {
@@ -256,6 +249,9 @@ pub async fn file_levels(fx: &Fixture) -> Report {
 	let cells = file_layers(fx).into_iter().flat_map(|(_, c)| c).collect();
 	run_cells(fx, &mut rep, cells).await;
 	for (s, op, rows) in run_lists(fx, &subs, FILE_LISTS).await {
+		if op == Op::File(FileOp::List) {
+			check_narrows(fx, &mut rep, s, &rows, op, &FILE_NARROWS).await;
+		}
 		join_listing(&mut rep, op, s, rows, &level_objs(fx, &s.host, true));
 	}
 	for (s, op, rows) in run_lists(fx, &life_subjects(fx), LIFE_LISTS).await {
@@ -279,27 +275,54 @@ pub async fn action_levels(fx: &Fixture) -> Report {
 	for (s, op, rows) in run_lists(fx, &subs, ACTION_LISTS).await {
 		if op == Op::Action(ActionOp::List) {
 			check_count(&mut rep, s, &rows, &counts[s.name.as_str()]);
-			check_narrows(fx, &mut rep, s, &rows).await;
+			check_narrows(fx, &mut rep, s, &rows, op, &ACTION_NARROWS).await;
 		}
 		join_listing(&mut rep, op, s, rows, &level_objs(fx, &s.host, false));
 	}
 	rep
 }
 
-/// A filter narrows a list, never widens it: `status=` naming every status lists no row the
-/// plain list hides.
-async fn check_narrows(fx: &Fixture, rep: &mut Report, s: &Subject, plain: &Rows) {
-	let wide = list_paged(fx, s, "/api/actions?status=A,C,D,N,V,F&", "actionId").await;
-	let (Ok(plain), Ok(wide)) = (plain, wide) else { return };
-	for key in wide.keys().filter(|k| !plain.contains_key(*k)) {
-		rep.add(Mismatch {
-			op: Op::Action(ActionOp::List).name(),
-			rule: "list.narrows",
-			expected: "Absent".into(),
-			actual: "Present".into(),
-			subject: s.name.clone(),
-			object: key.clone(),
-		});
+/// `/api/actions` parameters; `status=` names every status, hidden ones included.
+const ACTION_NARROWS: [&str; 6] = [
+	"status=A,C,D,N,V,F",
+	"includeTokens=true",
+	"includeSubject=true",
+	"visibility=P",
+	"visibility=D",
+	"subscribed=true",
+];
+/// `/api/files` parameters; `{host}` is the subject's host.
+const FILE_NARROWS: [&str; 3] = ["ownerIdTag={host}", "pinned=true", "starred=true"];
+
+/// A filter narrows a list, never widens it: no query lists a row the plain list hides. A
+/// refused query lists nothing.
+async fn check_narrows(
+	fx: &Fixture,
+	rep: &mut Report,
+	s: &Subject,
+	plain: &Rows,
+	op: Op,
+	queries: &[&str],
+) {
+	let Ok(plain) = plain else { return };
+	let (base, id_key) = if op == Op::File(FileOp::List) {
+		("/api/files", "fileId")
+	} else {
+		("/api/actions", "actionId")
+	};
+	for q in queries {
+		let q = q.replace("{host}", &s.host);
+		let Ok(wide) = list_paged(fx, s, &format!("{base}?{q}&"), id_key).await else { continue };
+		for key in wide.keys().filter(|k| !plain.contains_key(*k)) {
+			rep.add(Mismatch {
+				op: op.name(),
+				rule: "list.narrows",
+				expected: "Absent".into(),
+				actual: "Present".into(),
+				subject: s.name.clone(),
+				object: format!("{key} ({q})"),
+			});
+		}
 	}
 }
 

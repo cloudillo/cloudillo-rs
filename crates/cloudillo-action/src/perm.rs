@@ -152,7 +152,7 @@ async fn load_action_attrs(
 ) -> ClResult<ActionAttrs> {
 	use cloudillo_core::abac::{self, VisibilityLevel};
 
-	// A credential naming the tenant without being it (share link, `idp_` key) is a guest here:
+	// A credential naming the tenant without being it (share link, via-embed) is a guest here:
 	// handed to `enterable_channels` as the tenant's id_tag it would lift the channel gate.
 	let is_tenant = abac::is_tenant_self(auth, tenant_id_tag);
 	let impostor = abac::names_tenant_without_being_it(auth, tenant_id_tag);

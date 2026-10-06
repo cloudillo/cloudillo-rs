@@ -25,14 +25,14 @@
 //! | `/api/tags`                           | `tags()` ᴱ | | | | |
 //! | `/api/trash`                          | | | | | `trash()` ᶜ |
 //! | `/api/apps`                           | `list_public()` ᴳ | | | | |
-//! | `/api/apps/install`                   | | `app_management()` ᶜ | | | |
-//! | `/api/apps/installed`                 | `app_management()` ᶜ | | | | |
-//! | `/api/apps/@{publisher}/{name}`       | | | | | `app_management()` ᶜ |
+//! | `/api/apps/install`                   | | `app_management()` ᴸ | | | |
+//! | `/api/apps/installed`                 | `app_management()` ᴸ | | | | |
+//! | `/api/apps/@{publisher}/{name}`       | | | | | `app_management()` ᴸ |
 //!
 //! ᴬ public surface (`optional_auth`) but ABAC-guarded, ᴳ public + rate-limited
-//! only, ᶜ auth + ABAC, ᴱ auth only — handler self-enforces. ᴮ carries its own
-//! body-limit layer. The guard on each fn is in `routes/protected.rs` /
-//! `routes/public.rs`.
+//! only, ᶜ auth + ABAC, ᴸ `require_leader` (unscoped leader), ᴱ auth only — handler
+//! self-enforces. ᴮ carries its own body-limit layer. The guard on each fn is in
+//! `routes/protected.rs` / `routes/public.rs`.
 //!
 //! Note `/api/files/{file_id}` spans two guards: `GET` is a public ABAC read,
 //! `PATCH`/`DELETE` are protected ABAC writes. They cannot be chained.
@@ -86,8 +86,8 @@ pub(crate) fn trash() -> Router<App> {
 	Router::new().route("/api/trash", delete(management::empty_trash))
 }
 
-/// App install / uninstall, gated by `check_perm_create("app", "create")`
-/// (a leader-level check).
+/// App install / list / uninstall, gated by `require_leader`: the owner or an unscoped
+/// community leader. An `apkg:publish` token does not reach it (`scope::scope_permits`).
 pub(crate) fn app_management() -> Router<App> {
 	Router::new()
 		.route("/api/apps/install", post(apkg::install_app))

@@ -425,7 +425,7 @@ pub async fn get_file_list(
 	let mut folder_scope_root: Option<String> = None;
 	if let Some((scope_fid, scope_access)) =
 		scope.and_then(TokenScope::parse).and_then(|ts| match ts {
-			TokenScope::File { file_id, access } => Some((file_id, access)),
+			TokenScope::File { file_id, access, .. } => Some((file_id, access)),
 			TokenScope::ApkgPublish => None,
 		}) {
 		// The list filter matches entries. An unknown id, or a BLOB content id (bound to no
@@ -533,7 +533,7 @@ pub async fn get_file_list(
 	}
 
 	// Channel gate: files in rooms the reader cannot enter are absent (None = the tenant itself).
-	// A caller naming the tenant without being it (share link, `idp_` key) is gated as a guest.
+	// A caller naming the tenant without being it (share link, via-embed) is gated as a guest.
 	let hatted = maybe_auth.as_ref().is_some_and(|a| a.hat.is_some());
 	let impostor = maybe_auth
 		.as_ref()
@@ -658,14 +658,22 @@ pub async fn get_file_list(
 	// ponytail: filtered after the SQL page, so a trash page can come back short or empty; the
 	// cursor above is built from the unfiltered page, so clients must page on `has_more`, not on
 	// an empty page. An owner filter in SQL would drop Admin-level grantees' rows.
-	filtered.retain(|f| {
-		f.parent_id.as_deref() != Some(TRASH_PARENT_ID)
+	let mut kept = Vec::with_capacity(filtered.len());
+	for f in filtered {
+		if f.parent_id.as_deref() != Some(TRASH_PARENT_ID)
 			|| file_access::can_manage_lifecycle(
-				&file_access::FileRef::from_view(f, &tenant_id_tag),
+				&app,
+				tn_id,
+				&file_access::FileRef::from_view(&f, &tenant_id_tag),
 				&access_ctx,
 				f.access_level.unwrap_or(AccessLevel::None),
 			)
-	});
+			.await
+		{
+			kept.push(f);
+		}
+	}
+	let filtered = kept;
 
 	let response = ApiResponse::with_cursor_pagination(filtered, next_cursor, has_more)
 		.with_req_id(req_id.unwrap_or_default());

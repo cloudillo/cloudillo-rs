@@ -266,7 +266,7 @@ pub async fn get_search(
 	let subject = auth.id_tag.as_ref();
 	// `follower` ("they follow us"), not `following` ("we follow them").
 	let rel = abac::subject_relation_to_tenant(&app, tn_id, subject).await?;
-	// A share-link guest or `idp_` key resolves to the tenant's own id_tag without being it.
+	// A share-link or via-embed guest resolves to the tenant's own id_tag without being it.
 	let anonymous_share = abac::names_tenant_without_being_it(&auth, &tenant_id_tag);
 	let level = subject_level(&auth, &tenant_id_tag, rel);
 	opts.visible_levels = level.visible_levels().map(<[char]>::to_vec);
@@ -423,7 +423,7 @@ fn total_from_page(offset: u32, len: usize, limit: u32) -> Option<i64> {
 /// the tenant owner searching from inside their own app iframe sees only
 /// `visibility='P'` rows outside the `scope_grant_file_id` exemption.
 ///
-/// The anonymous test is `abac::names_tenant_without_being_it` (share link, `idp_` key), the
+/// The anonymous test is `abac::names_tenant_without_being_it` (share link, via-embed), the
 /// owner test `abac::is_tenant_self`.
 fn subject_level(auth: &AuthCtx, tenant_id_tag: &str, rel: ProfileRelation) -> SubjectAccessLevel {
 	if abac::names_tenant_without_being_it(auth, tenant_id_tag) {
@@ -763,7 +763,7 @@ mod tests {
 
 	/// A share-link token resolves its `id_tag` to the tenant's own, so testing
 	/// the subject alone would derive `Owner` for every share-link guest. The
-	/// scope is what tells the two apart; an `idp_` key is told apart by its roles.
+	/// scope is what tells the two apart; a role-less credential by its roles.
 	#[test]
 	fn a_scoped_token_is_never_the_owner() {
 		let tenant = "alice.example.com";
@@ -771,7 +771,7 @@ mod tests {
 		let share = ctx(tenant, Some("file:f1~x:R"), &["leader"]);
 		assert_eq!(level(&share), SubjectAccessLevel::Public);
 		assert_eq!(level(&ctx(tenant, None, &["leader"])), SubjectAccessLevel::Owner);
-		// Naming the tenant without being its account (an `idp_` key) is an anonymous guest.
+		// Naming the tenant without being its account (no roles) is an anonymous guest.
 		assert_eq!(level(&ctx(tenant, None, &[])), SubjectAccessLevel::Public);
 		// A logged-in user holding a file-scoped credential is still themselves.
 		let bob = ctx("bob.example.com", Some("file:f1~x:R"), &[]);

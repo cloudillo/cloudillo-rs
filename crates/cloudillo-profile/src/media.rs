@@ -10,7 +10,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::prelude::*;
-use cloudillo_core::extract::Auth;
+use cloudillo_core::extract::{Auth, IdTag};
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_file::{image, preset};
 use cloudillo_types::{auth_adapter, meta_adapter};
@@ -151,24 +151,27 @@ impl Task<App> for TenantImageUpdaterTask {
 pub async fn put_profile_image(
 	State(app): State<App>,
 	Auth(auth): Auth,
+	IdTag(tenant): IdTag,
 	body: Bytes,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
-	put_tenant_image(app, auth, body, TenantImageType::ProfilePic).await
+	put_tenant_image(app, auth, &tenant, body, TenantImageType::ProfilePic).await
 }
 
 /// PUT /me/cover - Upload cover image
 pub async fn put_cover_image(
 	State(app): State<App>,
 	Auth(auth): Auth,
+	IdTag(tenant): IdTag,
 	body: Bytes,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
-	put_tenant_image(app, auth, body, TenantImageType::CoverPic).await
+	put_tenant_image(app, auth, &tenant, body, TenantImageType::CoverPic).await
 }
 
 /// Shared body of the profile-picture and cover-image upload handlers.
 async fn put_tenant_image(
 	app: App,
 	auth: auth_adapter::AuthCtx,
+	tenant: &str,
 	body: Bytes,
 	kind: TenantImageType,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
@@ -195,9 +198,10 @@ async fn put_tenant_image(
 			meta_adapter::CreateFile {
 				preset: Some(kind.preset_name().into()),
 				parent_id: Some(meta_adapter::MANAGED_PARENT_ID.into()),
-				owner_tag: Some(auth.id_tag.as_ref().into()),
+				// The tenant's image, whoever (owner or leader) uploads it
+				owner_tag: None,
 				content_type: content_type.into(),
-				file_name: kind.file_name(&auth.id_tag).into(),
+				file_name: kind.file_name(tenant).into(),
 				file_tp: Some("BLOB".into()),
 				tags: Some(vec![kind.tag().into()]),
 				x: Some(json!({ "dim": dim })),

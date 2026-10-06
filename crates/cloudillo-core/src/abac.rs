@@ -12,7 +12,7 @@
 use crate::prelude::*;
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::meta_adapter::ProfileRelation;
-use cloudillo_types::types::AccessLevel;
+use cloudillo_types::types::{AccessLevel, scope_for_log};
 use std::collections::HashMap;
 
 /// Visibility levels for resources (files, actions, profile fields)
@@ -289,10 +289,11 @@ pub fn is_admin(auth: &AuthCtx) -> bool {
 /// the account — a `password` / `welcome` / `idp.activation` refId, an auth API key, a
 /// passkey enrollment — must not be reachable by leader standing.
 ///
-/// The id_tag match alone is NOT enough: an `idp_` management key is built with
-/// `roles: Box::new([])` and the identity's own `id_tag` (`middleware::authenticate`), so on
-/// its own host it matches. The account itself always carries `leader` via
-/// `build_tenant_owner_roles`, so requiring it costs nothing real and keeps those keys out.
+/// The id_tag match alone is NOT enough: a share-link or via-embed token carries the tenant's
+/// id_tag without being the account. (An `idp_` key never names the host: `middleware`
+/// accepts it only on its IdP's host, a strict parent of every identity it names.) The
+/// account itself always carries `leader` via `build_tenant_owner_roles`, so requiring it
+/// costs nothing real.
 pub fn require_tenant_self(auth: &AuthCtx, tenant_id_tag: &str, what: &str) -> ClResult<()> {
 	if is_tenant_self(auth, tenant_id_tag) {
 		Ok(())
@@ -300,7 +301,7 @@ pub fn require_tenant_self(auth: &AuthCtx, tenant_id_tag: &str, what: &str) -> C
 		warn!(
 			subject = %auth.id_tag,
 			roles = ?auth.roles,
-			scope = ?auth.scope,
+			scope = ?auth.scope.as_deref().map(scope_for_log),
 			operation = %what,
 			"Denied - the tenant account itself is required"
 		);
@@ -310,15 +311,31 @@ pub fn require_tenant_self(auth: &AuthCtx, tenant_id_tag: &str, what: &str) -> C
 
 /// Whether `auth` is the tenant account itself (or SADM): [`require_tenant_self`]'s test.
 /// Use it for every "is this the owner" check — a bare `auth.id_tag == tenant` also admits a
-/// share-link token and an `idp_` management key.
+/// share-link or via-embed token.
 pub fn is_tenant_self(auth: &AuthCtx, tenant_id_tag: &str) -> bool {
 	auth.scope.is_none()
 		&& ((auth.id_tag.as_ref() == tenant_id_tag && crate::roles::is_leader(&auth.roles))
 			|| is_admin(auth))
 }
 
-/// A credential carrying the tenant's id_tag without being the tenant account
-/// (share link, via-embed, `idp_` key): treat it as an anonymous guest.
+/// The account itself — unlike [`is_tenant_self`], SADM does not count: unscoped, its own
+/// id_tag, holding the owner roles.
+pub fn is_tenant_account(auth: &AuthCtx, tenant_id_tag: &str) -> bool {
+	is_tenant_self(auth, tenant_id_tag) && auth.id_tag.as_ref() == tenant_id_tag
+}
+
+/// An unscoped credential holding `leader` on the host: the owner, a community leader, SADM.
+pub fn is_unscoped_leader(auth: &AuthCtx) -> bool {
+	auth.scope.is_none() && crate::roles::is_leader(&auth.roles)
+}
+
+/// An unscoped credential holding `moderator` or above on the host.
+pub fn is_unscoped_moderator(auth: &AuthCtx) -> bool {
+	auth.scope.is_none() && crate::roles::is_moderator(&auth.roles)
+}
+
+/// A credential carrying the tenant's id_tag without being the tenant account (share link,
+/// via-embed): treat it as an anonymous guest.
 pub fn names_tenant_without_being_it(auth: &AuthCtx, tenant_id_tag: &str) -> bool {
 	auth.id_tag.as_ref() == tenant_id_tag && !is_tenant_self(auth, tenant_id_tag)
 }
@@ -1133,13 +1150,13 @@ mod tests {
 		assert!(require_tenant_self(&scoped, "alice.example.com", "test").is_err());
 	}
 
-	/// An `idp_` management key is minted as `{id_tag: <identity>, roles: [], scope: None}`, so
-	/// on that identity's own host the id_tag matches. Without the role test it would reach
-	/// `POST /api/auth/api-keys` and `POST /api/auth/wa/reg` and mint itself a full owner.
+	/// Defence in depth: a role-less, unscoped credential naming the tenant matches its id_tag.
+	/// Without the role test it would reach `POST /api/auth/api-keys` and
+	/// `POST /api/auth/wa/reg` and mint itself a full owner.
 	#[test]
 	fn require_tenant_self_denies_role_less_principal() {
-		let idp_key = plain_subject(); // roles: []
-		assert!(require_tenant_self(&idp_key, "alice.example.com", "test").is_err());
+		let roleless = plain_subject(); // roles: []
+		assert!(require_tenant_self(&roleless, "alice.example.com", "test").is_err());
 	}
 
 	#[test]
@@ -1151,8 +1168,8 @@ mod tests {
 		let share = AuthCtx { scope: Some("file:f1~abc:R".into()), ..owner.clone() };
 		assert!(names_tenant_without_being_it(&share, tenant));
 
-		let idp_key = plain_subject(); // roles: [], scope: None
-		assert!(names_tenant_without_being_it(&idp_key, tenant));
+		let roleless = plain_subject(); // roles: [], scope: None
+		assert!(names_tenant_without_being_it(&roleless, tenant));
 
 		let other = AuthCtx { id_tag: "bob.example.com".into(), ..plain_subject() };
 		assert!(!names_tenant_without_being_it(&other, tenant));

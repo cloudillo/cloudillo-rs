@@ -139,7 +139,7 @@ impl RequesterTier {
 
 	/// Classify the caller of a request on tenant `tenant` — once per request.
 	///
-	/// - No auth, or a credential naming the tenant without being it (share link, `idp_` key):
+	/// - No auth, or a credential naming the tenant without being it (share link, via-embed):
 	///   anonymous, as in `GET /api/search`.
 	/// - Any other scoped token keeps its identity's relationships, never owner or roles.
 	/// - Owner: the tenant account itself or an unscoped leader (on a community the leader
@@ -156,8 +156,8 @@ impl RequesterTier {
 		if crate::abac::names_tenant_without_being_it(auth, tenant) {
 			return Ok(Self::anonymous());
 		}
-		let is_owner = crate::abac::is_tenant_self(auth, tenant)
-			|| (!scoped && crate::roles::is_leader(&auth.roles));
+		let is_owner =
+			crate::abac::is_tenant_self(auth, tenant) || crate::abac::is_unscoped_leader(auth);
 		let rel = if is_owner {
 			cloudillo_types::meta_adapter::ProfileRelation::default()
 		} else {

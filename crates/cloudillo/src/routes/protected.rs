@@ -99,6 +99,8 @@ pub(super) fn init(app: App) -> Router<App> {
 				.merge(tables::misc::push_subscriptions())
 				.merge(tables::search::reindex())
 				.merge(tables::site::config())
+				.merge(tables::profile::tenant_profile())
+				.merge(tables::file::app_management())
 				.layer(middleware::from_fn(require_leader)),
 		)
 		// Auth only — handler self-enforces ownership
@@ -155,10 +157,6 @@ pub(super) fn init(app: App) -> Router<App> {
 		)))
 		// Auth only — handler self-enforces ownership
 		.merge(tables::file::user_data())
-		.merge(tables::file::app_management().layer(middleware::from_fn_with_state(
-			app.clone(),
-			check_perm_create("app", "create"),
-		)))
 		// Auth only — handler self-enforces ownership
 		.merge(tables::file::shares())
 		// Auth only — handler self-enforces ownership

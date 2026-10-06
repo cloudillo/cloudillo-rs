@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::prelude::*;
+use cloudillo_core::abac;
 use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
 use cloudillo_core::settings::SettingValue;
 use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso};
@@ -222,8 +223,6 @@ pub async fn get_me_idp_status(
 	IdTag(host_id_tag): IdTag,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<MeIdpStatusResponse>>)> {
-	let id_tag = auth.id_tag.as_ref();
-
 	// Allow either:
 	//   (a) the active tenant authenticating as itself (the personal verify-idp
 	//       onboarding flow on a user's own home); or
@@ -234,9 +233,8 @@ pub async fn get_me_idp_status(
 	// so accepting a leader proxy token here cannot let a non-owner forge
 	// IDP status from elsewhere; the local guard is just preventing
 	// unrelated members from clearing `ui.onboarding`.
-	let is_self = host_id_tag.as_ref() == id_tag;
-	let is_leader = cloudillo_core::roles::is_leader(&auth.roles);
-	if !(is_self || is_leader) {
+	// `is_tenant_self` adds SADM; every other admitted caller is an unscoped leader.
+	if !abac::is_tenant_self(&auth, &host_id_tag) && !abac::is_unscoped_leader(&auth) {
 		return Err(Error::PermissionDenied);
 	}
 
@@ -277,20 +275,15 @@ pub async fn post_me_resend_activation(
 	IdTag(host_id_tag): IdTag,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<MeResendActivationResponse>>)> {
+	// Same guard as get_me_idp_status (rationale there).
+	if !abac::is_tenant_self(&auth, &host_id_tag) && !abac::is_unscoped_leader(&auth) {
+		return Err(Error::PermissionDenied);
+	}
+
 	if !is_verify_idp(&app, auth.tn_id).await {
 		return Err(Error::ValidationError(
 			"Identity is already activated; no resend needed".into(),
 		));
-	}
-
-	let id_tag = auth.id_tag.as_ref();
-
-	// Same guard as get_me_idp_status: tenant self-auth, or proxy-token
-	// leader. See get_me_idp_status for the rationale.
-	let is_self = host_id_tag.as_ref() == id_tag;
-	let is_leader = cloudillo_core::roles::is_leader(&auth.roles);
-	if !(is_self || is_leader) {
-		return Err(Error::PermissionDenied);
 	}
 
 	// Resend for the active tenant's identity (`host_id_tag`), not the
@@ -301,6 +294,16 @@ pub async fn post_me_resend_activation(
 		response = response.with_req_id(id);
 	}
 	Ok((StatusCode::OK, Json(response)))
+}
+
+/// `validate_ref` is tenant-agnostic: a ref is honoured on its own tenant's host only, as
+/// `post_set_password` binds it.
+fn ensure_ref_on_host(ref_owner: &str, host_id_tag: &str) -> ClResult<()> {
+	if ref_owner != host_id_tag {
+		warn!(ref_owner = %ref_owner, host = %host_id_tag, "ref does not belong to the host tenant");
+		return Err(Error::PermissionDenied);
+	}
+	Ok(())
 }
 
 /// `GET /api/refs/{refId}/idp-status` — unauthenticated.
@@ -319,6 +322,7 @@ pub async fn post_me_resend_activation(
 #[axum::debug_handler]
 pub async fn get_ref_idp_status(
 	State(app): State<App>,
+	IdTag(host_id_tag): IdTag,
 	Path(ref_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<MeIdpStatusResponse>>)> {
@@ -330,6 +334,7 @@ pub async fn get_ref_idp_status(
 				_ => Error::ValidationError("Invalid reference".into()),
 			},
 		)?;
+	ensure_ref_on_host(&id_tag, &host_id_tag)?;
 
 	// No-op short-circuit for tenants that are not gated. Returning a synthetic
 	// "active" response lets the frontend treat the endpoint as
@@ -357,6 +362,7 @@ pub async fn get_ref_idp_status(
 #[axum::debug_handler]
 pub async fn post_ref_resend_activation(
 	State(app): State<App>,
+	IdTag(host_id_tag): IdTag,
 	Path(ref_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<MeResendActivationResponse>>)> {
@@ -374,6 +380,7 @@ pub async fn post_ref_resend_activation(
 				_ => Error::ValidationError("Invalid reference".into()),
 			},
 		)?;
+	ensure_ref_on_host(&id_tag, &host_id_tag)?;
 
 	if !is_verify_idp(&app, tn_id).await {
 		return Err(Error::ValidationError(

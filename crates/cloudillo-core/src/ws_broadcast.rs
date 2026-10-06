@@ -196,9 +196,8 @@ impl BroadcastManager {
 		DeliveryResult::UserOffline
 	}
 
-	/// Send a message to all users in a tenant
-	///
-	/// Broadcasts the message to all connections for all users in the tenant.
+	/// Send a message to every connection in the tenant: the bus admits only the tenant
+	/// account, whose own traffic (inbound actions, file and maintenance events) this is.
 	/// Returns the total number of connections that received the message.
 	pub async fn send_to_tenant(&self, tn_id: TnId, msg: BroadcastMessage) -> usize {
 		let users = self.users.read().await;
@@ -322,6 +321,20 @@ mod tests {
 
 		let received = rx.recv().await.unwrap();
 		assert_eq!(received.cmd, "ACTION");
+	}
+
+	#[tokio::test]
+	async fn test_send_to_tenant_reaches_every_connection() {
+		let manager = BroadcastManager::new();
+		let tn_id = TnId(1);
+
+		let mut rx1 = manager.register_user(tn_id, "alice", "conn-1").await;
+		let mut rx2 = manager.register_user(tn_id, "alice", "conn-2").await;
+
+		let msg = BroadcastMessage::new("ACTION", serde_json::json!({}), "system");
+		assert_eq!(manager.send_to_tenant(tn_id, msg).await, 2);
+		assert_eq!(rx1.recv().await.unwrap().cmd, "ACTION");
+		assert_eq!(rx2.recv().await.unwrap().cmd, "ACTION");
 	}
 
 	#[tokio::test]

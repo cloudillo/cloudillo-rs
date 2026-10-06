@@ -28,7 +28,7 @@ use cloudillo_types::{
 		WELCOME_REF_TYPE,
 	},
 	roles::{check_hat_aprv, hat_peer, map_hat_role, parse_hat_roles},
-	types::{AccessLevel, ApiResponse},
+	types::{AccessLevel, ApiResponse, scope_for_log},
 	utils::decode_jwt_no_verify,
 	validation::validate_id_tag,
 };
@@ -145,11 +145,12 @@ pub async fn get_login_token(
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Option<Login>>>)> {
 	if let Some(auth) = auth {
-		// A delegated credential is never the account. A share-link token's `id_tag` *is*
-		// the tenant (it is minted `sub: None`), so it would satisfy the host binding in
-		// `create_tenant_login` and trade a read-only file scope for an owner session.
-		if auth.scope.is_some() {
-			warn!(subject = %auth.id_tag, "login-token denied - delegated token");
+		// Only the account itself (or SADM) trades a session for an owner login. A share-link
+		// token's `id_tag` *is* the tenant (it is minted `sub: None`), so it would satisfy the
+		// host binding in `create_tenant_login` and trade a read-only file scope for an owner
+		// session; a role-less credential naming the tenant must not either. Denied at once.
+		if !cloudillo_core::abac::is_tenant_self(&auth, &id_tag) {
+			warn!(subject = %auth.id_tag, "login-token denied - not the account");
 			return Err(Error::PermissionDenied);
 		}
 		info!("login-token for {}", &auth.id_tag);
@@ -454,9 +455,8 @@ async fn reread_roles(
 
 /// Intersect a re-read role set with the presented one: a re-read may only *narrow*.
 ///
-/// Several credential families authenticate *as* the tenant while deliberately carrying no
-/// roles — `cloudillo_core::middleware` builds an `idp_` API key's `AuthCtx` with
-/// `roles: Box::new([])` — so an unintersected re-read turns one into a full owner session.
+/// Defence in depth: a credential that names the tenant while carrying no roles must not be
+/// turned into a full owner session by an unintersected re-read.
 /// A JWT session's presented set was minted by the same expansion, so this never costs it a
 /// role it legitimately holds; an out-of-band *promotion* simply waits for the next login.
 fn narrow_to_presented(expanded: Option<String>, presented: &[Box<str>]) -> Option<String> {
@@ -519,7 +519,7 @@ async fn validated_scope(
 	};
 
 	match token_scope {
-		TokenScope::File { file_id, access } => {
+		TokenScope::File { file_id, access, .. } => {
 			let ctx = FileAccessCtx {
 				user_id_tag: caller_id_tag,
 				tenant_id_tag,
@@ -641,7 +641,7 @@ pub async fn get_access_token(
 		let token_scope = TokenScope::parse(scope_str)
 			.ok_or_else(|| Error::ValidationError("Invalid scope format".into()))?;
 
-		let TokenScope::File { file_id: ref target_file_id, access: requested_access } =
+		let TokenScope::File { file_id: ref target_file_id, access: requested_access, .. } =
 			token_scope
 		else {
 			return Err(Error::ValidationError("scope must be a file scope".into()));
@@ -684,13 +684,16 @@ pub async fn get_access_token(
 		// `file:X:R` guest re-scoping through an embed link stored at `'W'` would
 		// otherwise walk the whole embed graph with write access.
 		let mut caller_cap: Option<AccessLevel> = None;
+		// A link-minted caller's ref rides along: the embed dies with its link.
+		let mut caller_ref: Option<String> = None;
 		let caller_has_via_access = if let Some(ref caller_scope) = auth.scope {
 			// Must be scoped to the via file (bare id), and the level it carries caps
 			// whatever is minted below.
-			if let Some(TokenScope::File { file_id: ref scope_fid, access }) =
+			if let Some(TokenScope::File { file_id: ref scope_fid, access, ref_id }) =
 				TokenScope::parse(caller_scope)
 			{
 				caller_cap = Some(access);
+				caller_ref = ref_id;
 				// The same resolution file access applies: a content-id scope binds no entry.
 				match cloudillo_core::file_access::resolve_scope_entry(
 					&app.meta_adapter,
@@ -753,7 +756,10 @@ pub async fn get_access_token(
 		let caller_ceiling = caller_cap.unwrap_or(AccessLevel::None);
 		let scope_char = cloudillo_core::file_access::scope_char_within(asked, caller_ceiling)
 			.ok_or(Error::PermissionDenied)?;
-		let target_scope = format!("file:{}:{}", target_entry_id, scope_char);
+		let target_scope = match &caller_ref {
+			Some(r) => format!("file:{}:{}:{}", target_entry_id, scope_char, r),
+			None => format!("file:{}:{}", target_entry_id, scope_char),
+		};
 
 		let token_result = app
 			.auth_adapter
@@ -774,9 +780,9 @@ pub async fn get_access_token(
 			"Issued access token: id_tag={} sub={} scope={} via=cross_doc_link",
 			id_tag.0,
 			derived_sub(auth).unwrap_or("anonymous"),
-			target_scope
+			format_args!("file:{}:{}", target_entry_id, scope_char)
 		);
-		debug!("Created via token for {} with scope {}", target_file_id, target_scope);
+		debug!("Created via token for {} at level {}", target_file_id, scope_char);
 		let response = ApiResponse::new(json!({
 			"token": token_result,
 			"scope": target_scope,
@@ -950,36 +956,35 @@ pub async fn get_access_token(
 	} else if let Some(ref_id) = query.ref_id {
 		// Exchange share link ref for scoped access token (no auth required)
 		let is_refresh = query.refresh.unwrap_or(false);
-		debug!("Exchanging ref_id {} for scoped access token (refresh={})", ref_id, is_refresh);
+		debug!("Exchanging share-link ref for scoped access token (refresh={})", is_refresh);
 
-		// For refresh: validate without decrementing counter
-		// For initial access: validate and decrement counter
-		let (ref_tn_id, _ref_id_tag, ref_data) = if is_refresh {
-			app.meta_adapter.validate_ref(&ref_id, &[SHARE_FILE_REF_TYPE]).await
-		} else {
-			app.meta_adapter.use_ref(&ref_id, &[SHARE_FILE_REF_TYPE]).await
-		}
-		.map_err(|e| {
-			warn!(
-				"Failed to {} ref {}: {}",
-				if is_refresh { "validate" } else { "use" },
-				ref_id,
-				e
-			);
+		let link_err = |e: Error| {
+			warn!("Failed to resolve share-link ref: {}", e);
 			match e {
 				Error::NotFound => Error::ValidationError("Invalid or expired share link".into()),
 				Error::ValidationError(_) => e,
 				_ => Error::ValidationError("Invalid share link".into()),
 			}
-		})?;
-
-		// Validate ref belongs to this tenant
+		};
+		// Validate, bind to this tenant, and only then consume (initial access decrements the
+		// counter; a refresh does not), so a wrong-host request cannot burn the ref.
+		let (ref_tn_id, _ref_id_tag, ref_data) = app
+			.meta_adapter
+			.validate_ref(&ref_id, &[SHARE_FILE_REF_TYPE])
+			.await
+			.map_err(link_err)?;
 		if ref_tn_id != tn_id {
 			warn!(
 				"Ref tenant mismatch: ref belongs to {:?} but request is for {:?}",
 				ref_tn_id, tn_id
 			);
 			return Err(Error::PermissionDenied);
+		}
+		if !is_refresh {
+			app.meta_adapter
+				.use_ref(&ref_id, &[SHARE_FILE_REF_TYPE])
+				.await
+				.map_err(link_err)?;
 		}
 
 		// Extract resource_id (file_id) and access_level
@@ -992,8 +997,12 @@ pub async fn get_access_token(
 
 		// Scope format: "file:{file_id}:{R|C|W}". `from_perm_char` never returns `None`, so
 		// `to_scope_char`'s `None` arm is unreachable; deny rather than mint an unsupported scope.
+		// The token's own claim adds `:{ref_id}`, so the middleware can refuse it once the ref is
+		// revoked; the client is shown the plain scope. Accepted: the claim is readable by whoever
+		// holds the token (app iframes included), and the holder already knows the link.
 		let scope_char = access_level.to_scope_char().ok_or(Error::PermissionDenied)?;
 		let scope = format!("file:{}:{}", file_id, scope_char);
+		let token_scope = format!("{}:{}", scope, ref_id);
 		debug!("Creating scoped access token with scope={}", scope);
 
 		let token_result = app
@@ -1004,7 +1013,7 @@ pub async fn get_access_token(
 					iss: &id_tag.0,
 					sub: None, // Anonymous/guest access
 					r: None,   // No roles for share link access
-					scope: Some(&scope),
+					scope: Some(&token_scope),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
 					h: None,
 				},
@@ -1368,7 +1377,7 @@ pub async fn get_proxy_token(
 	// past its link's revocation, and re-deriving roles below would hand it the tenant's own
 	// (its `id_tag` *is* the tenant, since it is minted `sub: None`).
 	if auth.scope.is_some() {
-		warn!(subject = %auth.id_tag, scope = ?auth.scope, "Proxy token denied - delegated token");
+		warn!(subject = %auth.id_tag, scope = ?auth.scope.as_deref().map(scope_for_log), "Proxy token denied - delegated token");
 		return Err(Error::PermissionDenied);
 	}
 	// Before `reread_roles`, which falls back to the presented `r` on a transient error: a
@@ -1863,9 +1872,9 @@ pub async fn post_login_init(
 	headers: HeaderMap,
 ) -> ClResult<(StatusCode, Json<ApiResponse<LoginInitResponse>>)> {
 	if let Some(auth) = auth {
-		// Same delegated-credential rejection as `get_login_token`.
-		if auth.scope.is_some() {
-			warn!(subject = %auth.id_tag, "login-init denied - delegated token");
+		// Same up-front account check as `get_login_token`.
+		if !cloudillo_core::abac::is_tenant_self(&auth, &id_tag.0) {
+			warn!(subject = %auth.id_tag, "login-init denied - not the account");
 			return Err(Error::PermissionDenied);
 		}
 		// Authenticated path: create fresh login token (replaces login-token)
@@ -1927,8 +1936,8 @@ mod tests {
 
 	#[test]
 	fn a_re_read_never_upgrades_a_credential_that_carries_no_roles() {
-		// `middleware.rs` builds an `idp_` API key's `AuthCtx` with an empty role set on
-		// purpose; without the intersection the tenant branch would mint it a full owner.
+		// A role-less credential naming the tenant: without the intersection the tenant
+		// branch would mint it a full owner.
 		assert_eq!(narrow_to_presented(Some("leader,moderator".into()), &[]), Some(String::new()));
 	}
 

@@ -11,11 +11,11 @@
 //!
 //! | Path | GET | POST | PUT | PATCH | DELETE |
 //! |---|---|---|---|---|---|
-//! | `/api/me`                              | `public_discovery()` ᴳ | | | `own()` ᴱ | |
+//! | `/api/me`                              | `public_discovery()` ᴳ | | | `tenant_profile()` ᴸ | |
 //! | `/api/me/full`                         | `recovery_public()` ᴳ | | | | |
 //! | `/api/me/app-domain`                   | `public_discovery()` ᴳ | | | | |
-//! | `/api/me/image`                        | | | `own()` ᴱ ᴮ | | |
-//! | `/api/me/cover`                        | | | `own()` ᴱ ᴮ | | |
+//! | `/api/me/image`                        | | | `tenant_profile()` ᴸ ᴮ | | |
+//! | `/api/me/cover`                        | | | `tenant_profile()` ᴸ ᴮ | | |
 //! | `/api/profiles`                        | `own()` ᴱ ᵀ | | | | |
 //! | `/api/profiles/batch`                  | `batch()` ᴾ | | | | |
 //! | `/api/profiles/{id_tag}`               | `read()` ᶜ | | `own()` ᴱ | `write()` ᶜ | |
@@ -36,7 +36,8 @@
 //!
 //! ᴳ public + rate-limited only, ᴼ optional auth under `"general"` — the handler filters
 //! by the reader, ᴿ public under the strict `"auth"` bucket,
-//! ᶜ auth + ABAC, ᴱ auth only — handler self-enforces, ᴾ **any valid token,
+//! ᶜ auth + ABAC, ᴱ auth only — handler self-enforces, ᴸ `require_leader` (unscoped
+//! leader), ᴾ **any valid token,
 //! scope ignored** (see [`batch`]). ᴮ carries its own body-limit layer. ᵀ any token
 //! lists, but the handler projects per caller tier — only an unscoped leader sees hidden
 //! statuses and relationship fields, and connections follow `profile.connection_visibility`
@@ -53,7 +54,9 @@
 //! pins that.
 //!
 //! `/api/me` spans the public and protected tiers: the `GET` is unauthenticated
-//! tenant discovery, the `PATCH` is the owner editing their own profile.
+//! tenant discovery, the `PATCH` edits the **tenant's** record (its name, `x`, images), so
+//! it sits under `require_leader` with the other tenant-owned resources: the owner, or a
+//! community's leader. A session merely held on the host is not enough.
 
 use axum::{
 	Router,
@@ -155,26 +158,26 @@ pub(crate) fn partners_own() -> Router<App> {
 ///   `cloudillo_core::settings::handler::may_access_profile_settings`.
 pub(crate) fn own() -> Router<App> {
 	Router::new()
-		.route("/api/me", patch(update::patch_own_profile))
-		// Profile/cover images are buffered whole into memory (`Bytes`).
-		.route("/api/me/image", put(media::put_profile_image).layer(upload_body_limit()))
-		.route("/api/me/cover", put(media::put_cover_image).layer(upload_body_limit()))
 		.route("/api/profiles", get(list::list_profiles))
 		.route("/api/profiles/me/idp-status", get(idp_status::get_me_idp_status))
-		.route(
-			"/api/profiles/me/resend-activation",
-			post(idp_status::post_me_resend_activation),
-		)
+		.route("/api/profiles/me/resend-activation", post(idp_status::post_me_resend_activation))
 		.route("/api/profiles/{id_tag}", put(community::put_community_profile))
 		.route("/api/profiles/{id_tag}/refresh", post(update::post_profile_refresh))
-		.route(
-			"/api/profiles/{id_tag}/settings",
-			get(settings::handler::list_profile_settings),
-		)
+		.route("/api/profiles/{id_tag}/settings", get(settings::handler::list_profile_settings))
 		.route(
 			"/api/profiles/{id_tag}/settings/{name}",
 			get(settings::handler::get_profile_setting).put(settings::handler::put_profile_setting),
 		)
+}
+
+/// The tenant's own profile record (name, `x`, profile and cover image), gated by
+/// `require_leader`: the owner, or an unscoped community leader.
+pub(crate) fn tenant_profile() -> Router<App> {
+	Router::new()
+		.route("/api/me", patch(update::patch_own_profile))
+		// Profile/cover images are buffered whole into memory (`Bytes`).
+		.route("/api/me/image", put(media::put_profile_image).layer(upload_body_limit()))
+		.route("/api/me/cover", put(media::put_cover_image).layer(upload_body_limit()))
 }
 
 /// Profile creation. Attack surface: account enumeration, spam registration —

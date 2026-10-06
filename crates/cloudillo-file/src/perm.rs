@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::prelude::*;
 use cloudillo_core::abac::Environment;
-use cloudillo_core::extract::{IdTag, OptionalAuth};
+use cloudillo_core::extract::{Auth, IdTag, OptionalAuth};
 use cloudillo_core::file_access;
 use cloudillo_core::middleware::PermissionCheckOutput;
 use cloudillo_types::auth_adapter::AuthCtx;
@@ -78,6 +78,7 @@ async fn check_file_permission(
 	};
 
 	// Create auth context or guest context if not authenticated
+	let authenticated = maybe_auth_ctx.is_some();
 	let auth_ctx = maybe_auth_ctx.unwrap_or_else(|| {
 		// For unauthenticated requests, create a guest context
 		AuthCtx {
@@ -110,6 +111,15 @@ async fn check_file_permission(
 		action != "read",
 	)
 	.await?;
+	// The room caps roles, for ABAC here and for every handler behind the guard.
+	let auth_ctx = file_access::room_capped(
+		&app,
+		tn_id,
+		&tenant_id_tag,
+		&auth_ctx,
+		file_view.channel.as_deref(),
+	)
+	.await;
 
 	// Check permission
 	let environment = Environment::new();
@@ -129,6 +139,9 @@ async fn check_file_permission(
 	drop(checker);
 
 	let mut req = req;
+	if authenticated {
+		req.extensions_mut().insert(Auth(auth_ctx));
+	}
 	req.extensions_mut().insert(ResolvedLevel(attrs.access_level));
 	req.extensions_mut().insert(ResolvedEntry(file_view));
 	Ok(next.run(req).await)
@@ -193,8 +206,11 @@ async fn resolve_entry(
 		let Ok(attrs) = load_file_attrs(app, tn_id, &view, level, tenant_id_tag, auth).await else {
 			continue;
 		};
+		let capped =
+			file_access::room_capped(app, tn_id, tenant_id_tag, auth, view.channel.as_deref())
+				.await;
 		let checker = app.permission_checker.read().await;
-		if checker.has_permission(auth, full_action, &attrs, &environment) {
+		if checker.has_permission(&capped, full_action, &attrs, &environment) {
 			passing.push((view, attrs));
 		}
 	}

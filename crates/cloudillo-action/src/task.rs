@@ -167,6 +167,10 @@ pub async fn create_action_as(
 	// issuer is this tenant's own id_tag and is not re-checked here.
 	if let Some(audience_tag) = action.audience_tag.as_deref() {
 		helpers::check_identity_field("audience", audience_tag)?;
+		// A CONN (any subtype) addressed to its own issuer is no relationship.
+		if audience_tag == id_tag && helpers::extract_type_and_subtype(&action.typ).0 == "CONN" {
+			return Err(Error::ValidationError("CONN audience must differ from the issuer".into()));
+		}
 	}
 	if let Some(subject) = action.subject.as_deref() {
 		helpers::check_subject_field(subject)?;

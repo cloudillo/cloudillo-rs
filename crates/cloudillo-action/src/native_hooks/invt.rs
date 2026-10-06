@@ -141,9 +141,10 @@ fn is_community_invt(action_type: &str, subject: Option<&str>, tenant_tag: &str)
 	base_type == "INVT" && subject.and_then(membership_host_from_subject) == Some(tenant_tag)
 }
 
-/// Membership INVT / INVT:DEL authorization. A no-op for everything but an INVT to this very
-/// tenant or to a channel it hosts — both follow the same rules (moderator+ invites; the
-/// original inviter or a moderator revokes).
+/// Membership INVT / INVT:DEL authorization, and authority over an INVT whose subject is a
+/// local action. A no-op for everything else. A membership INVT (to this very tenant or to a
+/// channel it hosts) follows one rule set: moderator+ invites; the original inviter or a
+/// moderator revokes.
 ///
 /// `actor` is who asserts the authority — the token's `iss` inbound, `auth.id_tag` outbound.
 /// Deliberately NOT the stored `issuer_tag`: outbound that is the tenant's own id_tag, which
@@ -166,11 +167,18 @@ pub(crate) async fn check_community_authority(
 	actor: &str,
 ) -> ClResult<()> {
 	let (typ, sub_typ) = typ;
+	let (base, embedded) = helpers::extract_type_and_subtype(typ);
+	let subtype = sub_typ.map(str::to_owned).or(embedded);
+	if let Some(subject) = subject
+		&& base == "INVT"
+		&& matches!(parse_subject_ref(subject), Some(SubjectRef::Action(_)))
+	{
+		return action_invt_authority(app, tn_id, tenant_tag, subject, subtype, audience, actor)
+			.await;
+	}
 	let Some(subject) = subject.filter(|_| is_community_invt(typ, subject, tenant_tag)) else {
 		return Ok(());
 	};
-	let (_, embedded) = helpers::extract_type_and_subtype(typ);
-	let subtype = sub_typ.map(str::to_owned).or(embedded);
 
 	// Unknown subtypes are refused, not exempted: `conn::has_pending_invitation` filters bare
 	// invites with `exclude_sub_typ: ["DEL"]`, so anything unrecognised that reached storage
@@ -206,6 +214,51 @@ pub(crate) async fn check_community_authority(
 	Ok(())
 }
 
+/// INVT / INVT:DEL on a local action the tenant issued (a CONV and the like): the tenant or a
+/// moderator+ subscriber invites; a revocation also admits the original inviter. An action
+/// issued elsewhere is its issuer's node to gate.
+async fn action_invt_authority(
+	app: &App,
+	tn_id: TnId,
+	tenant_tag: &str,
+	subject: &str,
+	subtype: Option<String>,
+	audience: Option<&str>,
+	actor: &str,
+) -> ClResult<()> {
+	let Some(target) = app.meta_adapter.get_action(tn_id, subject).await? else {
+		return Ok(());
+	};
+	if target.issuer.id_tag.as_ref() != tenant_tag {
+		return Ok(());
+	}
+	let moderator = actor == tenant_tag
+		|| app
+			.meta_adapter
+			.get_action_by_key(tn_id, &format!("SUBS:{subject}:{actor}"))
+			.await?
+			.is_some_and(|s| {
+				helpers::get_subscription_role(s.x.as_ref())
+					>= SubscriptionRole::required_for_action("INVT", None)
+			});
+	let allowed = match subtype.as_deref() {
+		None => moderator,
+		Some("DEL") => {
+			moderator
+				|| pending_invitation_issuer(app, tn_id, subject, audience.unwrap_or_default())
+					.await
+					.as_deref() == Some(actor)
+		}
+		_ => false,
+	};
+	if allowed {
+		Ok(())
+	} else {
+		warn!("INVT: {} has no authority to invite to {}, rejecting", actor, subject);
+		Err(Error::PermissionDenied)
+	}
+}
+
 /// Pre-store authorization for a federated community INVT / INVT:DEL arriving at this tenant.
 /// Thin wrapper over [`check_community_authority`]: the token's `iss` is the acting identity.
 pub(crate) async fn check_inbound(
@@ -226,11 +279,7 @@ pub(crate) async fn check_inbound(
 	.await
 }
 
-/// INVT on_create hook - Validate inviter permission
-///
-/// Logic:
-/// - Check inviter has active SUBS on target with moderator+ role
-/// - Creator of target action can always invite
+/// INVT on_create hook: the effects of an INVT already authorized pre-store.
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	let tn_id = context.tn_id;
 
@@ -261,39 +310,8 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 		Some(SubjectRef::Action(_) | SubjectRef::Placeholder(_)) | None => {}
 	}
 
-	// Get the target action
-	let Some(target_action) = app.meta_adapter.get_action(tn_id, subject_id).await? else {
-		warn!("INVT on_create: subject {} does not resolve to a known action", subject_id);
-		return Ok(HookResult { continue_processing: false, ..Default::default() });
-	};
-
-	// Creator of target can always invite
-	if context.issuer == target_action.issuer.id_tag.as_ref() {
-		debug!("INVT: Inviter is target creator, permission granted");
-		return Ok(HookResult::default());
-	}
-
-	// Check inviter's subscription
-	let subs_key = format!("SUBS:{}:{}", subject_id, context.issuer);
-	let subscription = app.meta_adapter.get_action_by_key(tn_id, &subs_key).await.ok().flatten();
-
-	let Some(subscription) = subscription else {
-		warn!("INVT on_create: Inviter {} has no subscription to {}", context.issuer, subject_id);
-		return Ok(HookResult { continue_processing: false, ..Default::default() });
-	};
-
-	let user_role = helpers::get_subscription_role(subscription.x.as_ref());
-	let required = SubscriptionRole::required_for_action("INVT", None);
-
-	if user_role < required {
-		warn!(
-			"INVT on_create: Inviter {} has insufficient role ({:?}) for INVT (requires {:?})",
-			context.issuer, user_role, required
-		);
-		return Ok(HookResult { continue_processing: false, ..Default::default() });
-	}
-
-	info!("INVT: Permission granted for {} to invite to {}", context.issuer, subject_id);
+	// Authority over an action subject is decided pre-store too (`check_community_authority`):
+	// this hook runs after the row is stored, and refusing here could not roll it back.
 	Ok(HookResult::default())
 }
 

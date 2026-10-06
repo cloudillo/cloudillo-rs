@@ -736,12 +736,13 @@ impl AccessLevel {
 
 /// Token scope for scoped access tokens (e.g., share links)
 ///
-/// Format in JWT: "file:{file_id}:{R|C|W}"
+/// Format in JWT: "file:{file_id}:{R|C|W}[:{ref_id}]"
 /// This enum provides type-safe parsing instead of manual string splitting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenScope {
-	/// File-scoped access with specific access level
-	File { file_id: String, access: AccessLevel },
+	/// File-scoped access with specific access level. `ref_id` names the share-link ref the
+	/// token was minted from; the middleware refuses the token once that ref is gone.
+	File { file_id: String, access: AccessLevel, ref_id: Option<String> },
 	/// APKG publish scope — restricts to package upload and APKG action creation
 	ApkgPublish,
 }
@@ -753,12 +754,13 @@ impl TokenScope {
 	/// - "file:{file_id}:R" -> File scope with Read access
 	/// - "file:{file_id}:C" -> File scope with Comment access
 	/// - "file:{file_id}:W" -> File scope with Write access
+	/// - "file:{file_id}:R:{ref_id}" -> minted from share-link ref `ref_id`
 	pub fn parse(s: &str) -> Option<Self> {
 		if s == "apkg:publish" {
 			return Some(Self::ApkgPublish);
 		}
 		let parts: Vec<&str> = s.split(':').collect();
-		if parts.len() == 3 && parts[0] == "file" {
+		if matches!(parts.len(), 3 | 4) && parts[0] == "file" {
 			// Exhaustive on purpose: an unrecognized level char (including `'A'`, which
 			// `to_scope_char` never emits) makes the whole scope unparseable, which callers treat
 			// as "deny". A `Read` fallback would silently *widen* a malformed scope.
@@ -768,7 +770,11 @@ impl TokenScope {
 				"W" => AccessLevel::Write,
 				_ => return None,
 			};
-			return Some(Self::File { file_id: parts[1].to_string(), access });
+			let ref_id = match parts.get(3) {
+				Some(&"") => return None,
+				r => r.map(|r| (*r).to_string()),
+			};
+			return Some(Self::File { file_id: parts[1].to_string(), access, ref_id });
 		}
 		None
 	}
@@ -788,6 +794,18 @@ impl TokenScope {
 			Self::ApkgPublish => None,
 		}
 	}
+}
+
+/// `scope` without a share link's trailing `:{ref_id}`, for logging: logs must not print the ref.
+pub fn scope_for_log(scope: &str) -> &str {
+	if !scope.starts_with("file:") {
+		return scope;
+	}
+	scope
+		.match_indices(':')
+		.nth(2)
+		.and_then(|(i, _)| scope.get(..i))
+		.unwrap_or(scope)
 }
 
 /// Profile attributes for ABAC
@@ -951,7 +969,15 @@ impl AttrSet for SubjectAttrs {
 
 #[cfg(test)]
 mod access_level_tests {
-	use super::{AccessLevel, TokenScope};
+	use super::{AccessLevel, TokenScope, scope_for_log};
+
+	#[test]
+	fn scope_for_log_drops_share_link_ref() {
+		assert_eq!(scope_for_log("file:F:R:ref"), "file:F:R");
+		assert_eq!(scope_for_log("file:F:R"), "file:F:R");
+		assert_eq!(scope_for_log("apkg:publish"), "apkg:publish");
+		assert_eq!(scope_for_log("carddav:read,caldav:read"), "carddav:read,caldav:read");
+	}
 
 	#[test]
 	fn perm_char_keeps_admin_distinct() {
@@ -1031,12 +1057,30 @@ mod access_level_tests {
 		assert_eq!(TokenScope::parse("file:f1~abc:X"), None);
 		assert_eq!(
 			TokenScope::parse("file:f1~abc:W"),
-			Some(TokenScope::File { file_id: "f1~abc".to_string(), access: AccessLevel::Write })
+			Some(TokenScope::File {
+				file_id: "f1~abc".to_string(),
+				access: AccessLevel::Write,
+				ref_id: None
+			})
 		);
 		assert_eq!(
 			TokenScope::parse("file:f1~abc:R"),
-			Some(TokenScope::File { file_id: "f1~abc".to_string(), access: AccessLevel::Read })
+			Some(TokenScope::File {
+				file_id: "f1~abc".to_string(),
+				access: AccessLevel::Read,
+				ref_id: None
+			})
 		);
+		assert_eq!(
+			TokenScope::parse("file:f1~abc:C:zqref"),
+			Some(TokenScope::File {
+				file_id: "f1~abc".to_string(),
+				access: AccessLevel::Comment,
+				ref_id: Some("zqref".into())
+			})
+		);
+		assert_eq!(TokenScope::parse("file:f1~abc:C:"), None);
+		assert_eq!(TokenScope::parse("file:f1~abc:C:r:x"), None);
 	}
 }
 

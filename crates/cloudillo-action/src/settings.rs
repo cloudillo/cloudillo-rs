@@ -11,16 +11,6 @@ use cloudillo_core::settings::{
 /// Register all federation/action settings (admin-only infrastructure)
 /// Note: User-facing settings are in profile/settings.rs under the profile.* prefix
 pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
-	// Federation auto-accept followers
-	registry.register(
-		SettingDefinition::builder("federation.auto_accept_followers")
-			.description("Automatically accept follow requests")
-			.default(SettingValue::Bool(false))
-			.scope(SettingScope::Tenant)
-			.permission(PermissionLevel::Admin)
-			.build()?,
-	)?;
-
 	// Key fetch failure cache size
 	registry.register(
 		SettingDefinition::builder("federation.key_failure_cache_size")

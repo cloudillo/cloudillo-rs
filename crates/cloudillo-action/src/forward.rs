@@ -81,8 +81,8 @@ pub async fn forward_outbound_action(
 
 /// Forward an inbound action (received from federation) to WebSocket clients
 ///
-/// Broadcasts to all connected clients in the tenant.
-/// Any client can filter what they're interested in.
+/// Broadcasts to the tenant account's bus connections, see
+/// `BroadcastManager::send_to_tenant`.
 pub async fn forward_inbound_action(
 	app: &App,
 	tn_id: TnId,

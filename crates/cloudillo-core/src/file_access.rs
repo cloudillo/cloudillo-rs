@@ -319,8 +319,11 @@ pub fn role_access_level(user_roles: &[Box<str>]) -> AccessLevel {
 /// Record authority (the owner, i.e. the placer of a mirrored row) always passes. On a mirrored
 /// row nothing else does — the remote owner and the community leader included. On a local row,
 /// Admin level or the community `moderator` role pass too; Write grantees may edit, not delete.
+/// The room caps the role: a moderator outside the file's room does not pass on that.
 /// Scoped callers never pass: a scope carries no lifecycle authority, whoever holds it.
-pub fn can_manage_lifecycle(
+pub async fn can_manage_lifecycle(
+	app: &App,
+	tn_id: TnId,
 	file: &FileRef<'_>,
 	ctx: &FileAccessCtx<'_>,
 	level: AccessLevel,
@@ -332,7 +335,9 @@ pub fn can_manage_lifecycle(
 		return true;
 	}
 	file.upstream_id_tag.is_none()
-		&& (level == AccessLevel::Admin || crate::roles::is_moderator(ctx.user_roles))
+		&& (level == AccessLevel::Admin
+			|| (crate::roles::is_moderator(ctx.user_roles)
+				&& channel_admits(app, tn_id, file.channel, ctx).await))
 }
 
 /// Whether `view` sits in the trash: trashed itself, a document-tree child of a trashed root, or
@@ -382,7 +387,9 @@ pub async fn check_lifecycle(
 	{
 		return Err(Error::NotFound);
 	}
-	if !can_manage_lifecycle(file, ctx, level) && in_trash(app, tn_id, view).await? {
+	if !can_manage_lifecycle(app, tn_id, file, ctx, level).await
+		&& in_trash(app, tn_id, view).await?
+	{
 		return Err(Error::NotFound);
 	}
 	Ok(())
@@ -390,7 +397,7 @@ pub async fn check_lifecycle(
 
 /// Whether a file in `channel` is within the subject's ambient reach: open floor always is,
 /// a room only when the subject can enter it. Fails closed on a lookup error.
-async fn channel_admits(
+pub async fn channel_admits(
 	app: &App,
 	tn_id: TnId,
 	channel: Option<&str>,
@@ -413,6 +420,32 @@ async fn channel_admits(
 			false
 		}
 	}
+}
+
+/// The room caps roles: inside a room the caller cannot enter, `auth` with its roles dropped
+/// (no leader override, share ceiling or moderator lifecycle). A share grant and record
+/// ownership are not roles, so they still count; the tenant always enters.
+pub async fn room_capped(
+	app: &App,
+	tn_id: TnId,
+	tenant_id_tag: &str,
+	auth: &AuthCtx,
+	channel: Option<&str>,
+) -> AuthCtx {
+	let mut capped = auth.clone();
+	if channel.is_some()
+		&& !auth.roles.is_empty()
+		&& !channel_admits(
+			app,
+			tn_id,
+			channel,
+			&FileAccessCtx::from_auth(Some(auth), tenant_id_tag),
+		)
+		.await
+	{
+		capped.roles = Box::default();
+	}
+	capped
 }
 
 /// `None` = the tenant itself, unrestricted.
@@ -532,7 +565,7 @@ pub async fn action_attachment_level(
 	ctx: &FileAccessCtx<'_>,
 	action_id: &str,
 ) -> AccessLevel {
-	// Unscoped: share links and `idp_` keys carry the tenant id_tag. Local row: a mirror's
+	// Unscoped: share links carry the tenant id_tag. Local row: a mirror's
 	// access belongs to its upstream.
 	if ctx.scope.is_some()
 		|| file.upstream_id_tag.is_some()
@@ -676,7 +709,8 @@ async fn scope_grant(
 	file: &FileRef<'_>,
 	scope: &str,
 ) -> Option<AccessLevel> {
-	let Some(TokenScope::File { file_id: scope_file_id, access }) = TokenScope::parse(scope) else {
+	let Some(TokenScope::File { file_id: scope_file_id, access, .. }) = TokenScope::parse(scope)
+	else {
 		return None;
 	};
 	let entry_id = file.entry_id;
@@ -1061,7 +1095,7 @@ pub async fn check_scope_allows_file(
 	// If a scope string is present but can't be parsed, deny access (least privilege)
 	let Some(token_scope) = TokenScope::parse(scope_str) else { return ScopeCheck::Denied };
 	match &token_scope {
-		TokenScope::File { file_id: scope_file_id, access } => {
+		TokenScope::File { file_id: scope_file_id, access, .. } => {
 			let Some(target) = resolve_scope_entry(meta, tn_id, scope_file_id).await else {
 				return ScopeCheck::Denied;
 			};
@@ -1107,7 +1141,7 @@ pub async fn check_scope_allows_create_in(
 		return Err(Error::PermissionDenied);
 	};
 	match &token_scope {
-		TokenScope::File { file_id: scope_file_id, access } => {
+		TokenScope::File { file_id: scope_file_id, access, .. } => {
 			if !access.can_write() {
 				return Err(Error::PermissionDenied);
 			}

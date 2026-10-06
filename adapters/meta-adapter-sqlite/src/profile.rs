@@ -483,19 +483,22 @@ pub(crate) async fn list_follower_roles(
 	}))
 }
 
-/// Roles a profile holds for access purposes. Stored roles always win; a profile with none
-/// that follows the tenant and is not Suspended/Blocked/Banned reads as `["follower"]`
-/// (same status filter as `list_follower_tags`). The `follower` rung is derived, never stored.
+/// Roles a profile holds for access purposes. A Suspended/Blocked/Banned profile holds none.
+/// Otherwise stored roles win; a profile with none that follows the tenant reads as
+/// `["follower"]` (same status filter as `list_follower_tags`). The `follower` rung is
+/// derived, never stored.
 pub(crate) fn effective_roles(
 	roles: Option<&str>,
 	follower: bool,
 	status: Option<&str>,
 ) -> Option<Box<[Box<str>]>> {
+	if matches!(status, Some("S" | "B" | "X")) {
+		return None;
+	}
 	if let Some(roles) = roles.map(parse_roles).filter(|r| !r.is_empty()) {
 		return Some(roles);
 	}
-	(follower && !matches!(status, Some("S" | "B" | "X")))
-		.then(|| Box::from([Box::from("follower")]))
+	follower.then(|| Box::from([Box::from("follower")]))
 }
 
 /// Read profile roles for access token generation (includes the derived `follower`)
@@ -999,6 +1002,9 @@ mod tests {
 			Some(vec!["follower".into()])
 		);
 		assert_eq!(roles(effective_roles(None, true, Some("S"))), None);
+		for st in ["S", "B", "X"] {
+			assert_eq!(roles(effective_roles(Some("leader"), false, Some(st))), None);
+		}
 		assert_eq!(roles(effective_roles(None, false, None)), None);
 	}
 

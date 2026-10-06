@@ -38,9 +38,10 @@ fn profile_type_label(db_type: &str) -> &str {
 	}
 }
 
-/// PATCH /me - Update own profile
+/// PATCH /me - Update the tenant's profile (its owner or a community leader)
 pub async fn patch_own_profile(
 	State(app): State<App>,
+	IdTag(tenant): IdTag,
 	Auth(auth): Auth,
 	Json(patch): Json<ProfilePatch>,
 ) -> ClResult<(StatusCode, Json<UpdateProfileResponse>)> {
@@ -71,14 +72,15 @@ pub async fn patch_own_profile(
 	app.profile_me.invalidate(tn_id);
 	// `update_tenant` syncs `name` into the tenant's `profiles` row, which the index reads.
 	if !matches!(tenant_update.name, Patch::Undefined) {
-		cloudillo_core::search_index_profile(&app, tn_id, &auth.id_tag);
+		cloudillo_core::search_index_profile(&app, tn_id, &tenant);
 		// A published site caches the owner's display name too. Only `name` is
 		// copied there, so an `x`-only patch needs no reload.
 		crate::reload_site_cache_after_profile_change(&app, tn_id).await;
 	}
 
 	// Fetch updated profile and tenant data (for x field)
-	let profile_data = app.meta_adapter.get_profile_info(tn_id, &auth.id_tag).await?;
+	// The tenant's record, not the caller's: a community leader edits the community.
+	let profile_data = app.meta_adapter.get_profile_info(tn_id, &tenant).await?;
 	let tenant_data = app.meta_adapter.read_tenant(tn_id).await?;
 
 	let x_map: std::collections::HashMap<String, String> =
@@ -100,7 +102,7 @@ pub async fn patch_own_profile(
 		..Default::default()
 	};
 
-	info!("User {} updated their profile", auth.id_tag);
+	info!("User {} updated the profile of {}", auth.id_tag, tenant);
 	Ok((StatusCode::OK, Json(UpdateProfileResponse { profile })))
 }
 
@@ -407,7 +409,7 @@ fn validate_hats(hats: Vec<Box<str>>) -> ClResult<Vec<Box<str>>> {
 /// PATCH /profile/:idTag - Update relationship data with another user
 ///
 /// `hats` is the tenant account's own UI preference: only the tenant itself may set it, not a
-/// leader the `write` guard admits, nor an `idp_` key naming the account.
+/// leader the `write` guard admits, nor a role-less credential naming the account.
 pub async fn patch_profile_relationship(
 	State(app): State<App>,
 	IdTag(tenant_id_tag): IdTag,

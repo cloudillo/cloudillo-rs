@@ -914,8 +914,7 @@ mod tests {
 		assert!(require_tenant_self(&auth_as(MEMBER, &["SADM"], None), TENANT, "test").is_ok());
 		// A bare member of the community is not the community.
 		assert!(denied(&require_tenant_self(&auth_as(MEMBER, &[], None), TENANT, "test")));
-		// A role-less principal on the tenant's own host is not the account either — that is
-		// the shape of an `idp_` management key.
+		// A role-less credential naming the tenant is not the account either.
 		assert!(denied(&require_tenant_self(&auth_as(TENANT, &[], None), TENANT, "test")));
 		// Exact match only — no suffix or prefix relationship counts.
 		assert!(denied(&require_tenant_self(

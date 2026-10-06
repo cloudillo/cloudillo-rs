@@ -31,9 +31,8 @@ use crate::prelude::*;
 /// explicitly (`PUT /api/settings/idp.enabled`, per tenant or as the global `TnId(0)`
 /// row) before any `/api/idp/*` endpoint stops returning `NotFound`.
 ///
-/// The federated `IDP:REG` path (`crate::registration::process_registration`) does
-/// **not** consult this setting, so a tenant can be serving registrations while
-/// every `/api/idp/*` HTTP endpoint returns 404.
+/// The federated `IDP:REG` path (`crate::registration::process_registration`) checks it
+/// too, so a tenant with IdP off neither serves the API nor accepts registrations.
 pub(crate) async fn check_idp_enabled(app: &App, tn_id: TnId) -> ClResult<()> {
 	match app.settings.get(tn_id, "idp.enabled").await {
 		Ok(Some(SettingValue::Bool(true))) => {
@@ -1316,23 +1315,28 @@ pub async fn activate_identity(
 		"Identity Provider not available on this instance".to_string(),
 	))?;
 
-	// Use and validate the activation ref
+	let ref_err = |e: Error| {
+		warn!(ref_id = %activate_req.ref_id, error = ?e, "Invalid activation ref");
+		e
+	};
 	let (ref_tn_id, _ref_id_tag, ref_data) = app
 		.meta_adapter
-		.use_ref(&activate_req.ref_id, &[IDP_ACTIVATION_REF_TYPE])
+		.validate_ref(&activate_req.ref_id, &[IDP_ACTIVATION_REF_TYPE])
 		.await
-		.map_err(|e| {
-			warn!(ref_id = %activate_req.ref_id, error = ?e, "Invalid activation ref");
-			e
-		})?;
+		.map_err(ref_err)?;
 
-	// `use_ref` resolves globally, with no `tn_id` predicate, but `send_activation_email` creates
-	// the ref under the IdP tenant's own `tn_id`. Bind the two so a ref minted elsewhere cannot
-	// activate an identity here.
+	// Refs resolve globally, with no `tn_id` predicate, but `send_activation_email` creates the
+	// ref under the IdP tenant's own `tn_id`. Bind the two so a ref minted elsewhere cannot
+	// activate an identity here, and consume only after that, so a wrong-host request leaves
+	// the ref intact.
 	if ref_tn_id != tn_id {
 		warn!(?ref_tn_id, ?tn_id, "Activation ref belongs to another tenant");
 		return Err(Error::PermissionDenied);
 	}
+	app.meta_adapter
+		.use_ref(&activate_req.ref_id, &[IDP_ACTIVATION_REF_TYPE])
+		.await
+		.map_err(ref_err)?;
 
 	// Get the identity id_tag from the ref's resource_id
 	let identity_id = ref_data

@@ -347,7 +347,7 @@ pub async fn get_details(
 		// Same binding `post_respond` applies: `auth.tn_id` is always the host tenant, so
 		// the check above admits any visitor holding a session here — who would then read
 		// the desktop's IP and User-Agent off a session they did not start.
-		if auth.id_tag.as_ref() != id_tag.as_ref() || auth.scope.is_some() {
+		if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
 			warn!(subject = %auth.id_tag, host = %id_tag, "QR details denied - not the account");
 			return Err(Error::PermissionDenied);
 		}
@@ -402,7 +402,7 @@ pub async fn post_respond(
 		// victim's screen and silently hand the desktop *their own* identity (login CSRF).
 		// `create_tenant_login` refuses the mismatch too; failing here keeps the desktop's
 		// long-poll pending instead of resolving it with a foreign login.
-		if auth.id_tag.as_ref() != id_tag.as_ref() || auth.scope.is_some() {
+		if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
 			warn!(subject = %auth.id_tag, host = %id_tag, "QR login denied - not the account");
 			return Err(Error::PermissionDenied);
 		}

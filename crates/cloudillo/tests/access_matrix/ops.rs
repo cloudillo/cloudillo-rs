@@ -116,10 +116,16 @@ pub enum Actual {
 	HarnessError(String),
 }
 
-/// The 19 DSL definitions with their target need: `Some(b)` fixed, `None` optional (both cells).
-pub const INBOX_TYPES: [(&str, Option<bool>); 19] = [
+/// The 19 DSL definitions plus the receive-side subtypes, with their target need: `Some(b)`
+/// fixed, `None` optional (both cells).
+pub const INBOX_TYPES: [(&str, Option<bool>); 25] = [
 	("CONN", Some(true)),
 	("CONN:UPD", Some(true)),
+	("CONN:ACC", Some(true)),
+	("CONN:DEL", Some(true)),
+	("FLLW:DEL", Some(true)),
+	("SUBS:UPD", Some(true)),
+	("FSHR:DEL", Some(true)),
 	("FLLW", Some(true)),
 	("POST", Some(false)),
 	("POST:LDOC", Some(false)),
@@ -128,21 +134,32 @@ pub const INBOX_TYPES: [(&str, Option<bool>); 19] = [
 	("MSG", None),
 	("REPOST", Some(true)),
 	("APRV", Some(true)),
-	("STAT", Some(true)),
+	// Untargeted: `p` names an action not held here.
+	("STAT", None),
 	("IDP:REG", Some(true)),
 	("PRES", Some(true)),
 	("SUBS", Some(true)),
 	("FSHR", Some(true)),
 	("CONV", Some(false)),
 	("INVT", Some(true)),
+	("INVT:DEL", Some(true)),
 	("PRINVT", Some(true)),
 	("APKG", Some(false)),
 ];
 
 /// Issuer relations the runner seeds per inbox host.
 pub const INBOX_RELS: [(&str, &[Relation]); 2] = [
-	(ALICE, &[Relation::None, Relation::Follower, Relation::WeFollow, Relation::Connected]),
-	(CLUB, &[Relation::None, Relation::Member]),
+	(
+		ALICE,
+		&[
+			Relation::None,
+			Relation::Follower,
+			Relation::WeFollow,
+			Relation::Connected,
+			Relation::Blocked,
+		],
+	),
+	(CLUB, &[Relation::None, Relation::Member, Relation::Blocked]),
 ];
 
 pub fn all_ops() -> Vec<Op> {
@@ -432,7 +449,10 @@ pub fn classify(op: Op, status: StatusCode, body: &Value) -> (Actual, Option<Acc
 				return (Actual::Deny, None);
 			}
 			match body.get("deny").and_then(Value::as_str) {
-				Some("not_found" | "access_denied" | "write_denied") => (Actual::Deny, None),
+				Some(
+					"not_found" | "access_denied" | "write_denied" | "type_mismatch"
+					| "invalid_store",
+				) => (Actual::Deny, None),
 				other => (Actual::HarnessError(format!("ws:{}", other.unwrap_or("?"))), None),
 			}
 		}
@@ -469,12 +489,13 @@ pub fn classify_obj(
 	}
 }
 
-/// A mint cell's outcome (the mint request already ran in the fixture).
+/// A mint cell's outcome (the mint request already ran in the fixture). A refused parameter
+/// (400) mints nothing: a Deny.
 pub fn classify_mint(c: &MintCell) -> Actual {
-	status_class(c.status)
+	if c.status == StatusCode::BAD_REQUEST { Actual::Deny } else { status_class(c.status) }
 }
 
-async fn get(fx: &Fixture, s: &Subject, uri: &str) -> Result<Value, Actual> {
+pub(crate) async fn get(fx: &Fixture, s: &Subject, uri: &str) -> Result<Value, Actual> {
 	let (status, body) =
 		call(&fx.api, req(&s.host, Method::GET, uri, bearer(s), Body::empty())).await;
 	match status_class(status) {
@@ -484,7 +505,7 @@ async fn get(fx: &Fixture, s: &Subject, uri: &str) -> Result<Value, Actual> {
 }
 
 /// Row array of a list response: `data`, or the first array inside a `data` object.
-fn rows(body: &Value) -> &[Value] {
+pub(crate) fn rows(body: &Value) -> &[Value] {
 	let d = &body["data"];
 	d.as_array()
 		.or_else(|| d.as_object().and_then(|m| m.values().find_map(Value::as_array)))
@@ -762,7 +783,7 @@ impl InboxCell {
 			return t;
 		}
 		match self.typ {
-			"CONN" | "CONN:UPD" | "FLLW" => t.aud = aud,
+			"CONN" | "CONN:UPD" | "CONN:ACC" | "CONN:DEL" | "FLLW" | "FLLW:DEL" => t.aud = aud,
 			"POST" => t.c = text,
 			"POST:LDOC" => {
 				t.c = Some(json!({
@@ -776,7 +797,7 @@ impl InboxCell {
 				t.c = text;
 			}
 			"STAT" => {
-				t.p = post();
+				t.p = if self.target { post() } else { Some("a1~zqm-not-held".into()) };
 				t.c = Some(json!({}));
 			}
 			"MSG" => {
@@ -793,9 +814,13 @@ impl InboxCell {
 				t.sub = conv();
 				t.c = Some(json!({}));
 			}
-			"SUBS" => {
+			"SUBS" | "SUBS:UPD" => {
 				t.aud = aud;
 				t.sub = conv();
+			}
+			"FSHR:DEL" => {
+				t.aud = aud;
+				t.sub = Some("f1~zqm-remote-share".into());
 			}
 			"FSHR" => {
 				t.aud = aud;
@@ -805,7 +830,7 @@ impl InboxCell {
 				);
 			}
 			"CONV" => t.c = Some(json!({ "name": format!("{MARK} inbox") })),
-			"INVT" => {
+			"INVT" | "INVT:DEL" => {
 				t.aud = aud;
 				t.sub = conv();
 				t.c = Some(json!({ "role": "member" }));

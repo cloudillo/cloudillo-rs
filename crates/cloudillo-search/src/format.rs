@@ -350,9 +350,7 @@ fn require_tenant_admin(auth: &AuthCtx, tenant_id_tag: &str) -> ClResult<()> {
 /// group would lock a site admin out of the sibling `PUT`/`DELETE` routes
 /// [`require_tenant_admin`] deliberately admits them to.
 fn require_format_reader(auth: &AuthCtx, tenant_id_tag: &str) -> ClResult<()> {
-	if abac::is_tenant_self(auth, tenant_id_tag)
-		|| (auth.scope.is_none() && cloudillo_core::roles::is_leader(&auth.roles))
-	{
+	if abac::is_tenant_self(auth, tenant_id_tag) || abac::is_unscoped_leader(auth) {
 		return Ok(());
 	}
 	Err(Error::PermissionDenied)
@@ -513,7 +511,7 @@ mod tests {
 		// (who, may read, may write)
 		let cases = [
 			("the tenant owner", auth("alice.example", &["leader"]), true, true),
-			// Names the account but holds no roles: an `idp_` management key.
+			// Names the account but holds no roles: defence in depth.
 			("a role-less tenant credential", auth("alice.example", &[]), false, false),
 			("a site admin", auth("root.example", &["SADM"]), true, true),
 			("a community leader", auth("bob.example", &["leader"]), true, false),

@@ -78,7 +78,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 /// This hook is called when someone follows or unfollows us.
 /// The action itself (stored in DB) represents the follow relationship.
 /// We just need to:
-/// - Check if user allows followers (privacy.allow_followers setting)
+/// - Check if user allows followers (profile.allow_followers setting)
 /// - Sync the issuer's profile (the follower) if not already known
 /// - Record the directional `follower` flag on the issuer's profile
 /// - Log the event for auditing
@@ -90,7 +90,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 	// Check if target user allows followers
 	let allow_followers =
-		app.settings.get_bool(tn_id, "privacy.allow_followers").await.unwrap_or(true);
+		app.settings.get_bool(tn_id, "profile.allow_followers").await.unwrap_or(true);
 
 	if !allow_followers {
 		// Silently drop the follow rather than returning PermissionDenied.

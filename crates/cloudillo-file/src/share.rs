@@ -12,7 +12,7 @@
 //! apply the same rule: a `refId` is a bearer credential, so handing one out is re-sharing.
 //!
 //! [`list_shares_by_subject`] is the one exception: it gates per `subjectType` rather than on share
-//! standing, and admits a scoped caller for `subjectType=F` alone.
+//! standing. Scoped credentials never reach it (`scope_permits`).
 
 use axum::{
 	Json,
@@ -366,11 +366,8 @@ pub struct ListSharesBySubjectQuery {
 
 /// GET /api/shares?subject_id={id}[&subject_type=F] — List share entries by subject
 ///
-/// A scoped (share-link) caller is admitted only for `subjectType=F`, because embed resolution is
-/// exactly what a link guest needs. Every other `subjectType` is refused outright, so a guest can
-/// never turn the link that admitted them into a view of the share set.
-///
-/// Unscoped callers are gated per `subjectType`, since each answers a different question:
+/// Scoped credentials never reach this route (`scope_permits`). Callers are gated per
+/// `subjectType`, since each answers a different question:
 /// - `F` (or absent) — plain access to the subject file, not share standing
 /// - `U` — the subject themselves, the tenant account, or a leader
 /// - `L` — the tenant account alone
@@ -385,81 +382,49 @@ pub async fn list_shares_by_subject(
 	Query(query): Query<ListSharesBySubjectQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ShareEntry>>>)> {
-	// Narrowed to `Some('F')` in the scoped branch, so however the query was written the response
-	// can only carry file-to-file embed rows.
-	let mut subject_type = query.subject_type;
-
 	// `create_share` strips the `@` before storing, so normalize once here — for the gate AND the
 	// query. Normalizing only for the gate let `@alice.example.com` clear it and then match nothing.
-	// The file-access checks below keep the raw value: `@{f_id}` is a live file address form.
+	// The file-access check below keeps the raw value: `@{f_id}` is a live file address form.
 	let subject_id = query.subject_id.strip_prefix('@').unwrap_or(&query.subject_id);
 	// A file subject is stored as its entry id; set from the access check that resolves it.
 	let mut file_entry_id: Option<Box<str>> = None;
 
-	if auth.scope.is_some() {
-		if query.subject_type != Some('F') {
-			warn!(
-				subject = %auth.id_tag,
-				"Scoped token may only list file-to-file share entries (subjectType=F)"
-			);
-			return Err(Error::PermissionDenied);
+	match query.subject_type {
+		// A file subject: "which containers embed this file". Plain read access to the file.
+		None | Some('F') => {
+			let res =
+				require_unscoped_file_access(&app, tn_id, &query.subject_id, &auth, &tenant_id_tag)
+					.await?;
+			file_entry_id = Some(res.file_view.entry_id);
 		}
-		subject_type = Some('F');
-
-		// The scope is passed through, not ignored: the link that admitted this caller is the grant
-		// that gives them reach into the embedded file.
-		let ctx = FileAccessCtx::from_auth(Some(&auth), &tenant_id_tag);
-		match file_access::check_file_access(&app, tn_id, &query.subject_id, &ctx, None).await {
-			Err(file_access::FileAccessError::NotFound) => return Err(Error::NotFound),
-			Err(file_access::FileAccessError::AccessDenied) => return Err(Error::PermissionDenied),
-			Err(file_access::FileAccessError::InternalError(msg)) => {
-				return Err(Error::Internal(msg));
+		// A user subject: "which files is this user shared into" — their own share map, so
+		// without this gate any member could enumerate anyone's.
+		Some('U') => {
+			// A share link or via-embed carries the tenant's id_tag without being the tenant.
+			let impostor = abac::names_tenant_without_being_it(&auth, &tenant_id_tag);
+			let is_self = !impostor && auth.id_tag.as_ref() == subject_id;
+			let is_tenant = abac::is_tenant_self(&auth, &tenant_id_tag);
+			if !is_self && !is_tenant && !cloudillo_core::roles::is_leader(&auth.roles) {
+				warn!(
+					subject = %auth.id_tag,
+					target = %subject_id,
+					"Share-by-subject listing denied - self, tenant account or leader required"
+				);
+				return Err(Error::PermissionDenied);
 			}
-			Ok(res) => file_entry_id = Some(res.file_view.entry_id),
 		}
-	} else {
-		match query.subject_type {
-			// A file subject: "which containers embed this file". Plain read access to the file.
-			None | Some('F') => {
-				let res = require_unscoped_file_access(
-					&app,
-					tn_id,
-					&query.subject_id,
-					&auth,
-					&tenant_id_tag,
-				)
-				.await?;
-				file_entry_id = Some(res.file_view.entry_id);
+		// A link subject: the subject_id IS a bearer credential. Tenant account only.
+		Some('L') => {
+			if !abac::is_tenant_self(&auth, &tenant_id_tag) {
+				warn!(
+					subject = %auth.id_tag,
+					"Share-by-subject listing denied - link subjects are the tenant account's"
+				);
+				return Err(Error::PermissionDenied);
 			}
-			// A user subject: "which files is this user shared into" — their own share map, so
-			// without this gate any member could enumerate anyone's.
-			Some('U') => {
-				// A share link or `idp_` key carries the tenant's id_tag without being the tenant.
-				let impostor = abac::names_tenant_without_being_it(&auth, &tenant_id_tag);
-				let is_self = !impostor && auth.id_tag.as_ref() == subject_id;
-				let is_tenant = abac::is_tenant_self(&auth, &tenant_id_tag);
-				if !is_self && !is_tenant && !cloudillo_core::roles::is_leader(&auth.roles) {
-					warn!(
-						subject = %auth.id_tag,
-						target = %subject_id,
-						"Share-by-subject listing denied - self, tenant account or leader required"
-					);
-					return Err(Error::PermissionDenied);
-				}
-			}
-			// A link subject: the subject_id IS a bearer credential. Tenant account only.
-			Some('L') => {
-				if !abac::is_tenant_self(&auth, &tenant_id_tag) {
-					warn!(
-						subject = %auth.id_tag,
-						"Share-by-subject listing denied - link subjects are the tenant account's"
-					);
-					return Err(Error::PermissionDenied);
-				}
-			}
-			Some(other) => {
-				return Err(Error::ValidationError(format!("unsupported subjectType '{other}'")));
-			}
+		}
+		Some(other) => {
+			return Err(Error::ValidationError(format!("unsupported subjectType '{other}'")));
 		}
 	}
 
@@ -467,7 +432,7 @@ pub async fn list_shares_by_subject(
 		.meta_adapter
 		.list_share_entries_by_subject(
 			tn_id,
-			subject_type,
+			query.subject_type,
 			file_entry_id.as_deref().unwrap_or(subject_id),
 		)
 		.await?;

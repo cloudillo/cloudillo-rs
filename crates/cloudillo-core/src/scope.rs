@@ -80,11 +80,11 @@ pub fn scope_permits(scope: Option<&str>, method: &Method, path: &str) -> bool {
 				|| path == "/api/auth/access-token"
 		}
 		// Deliberately narrow: only what app publishing needs, to limit the blast
-		// radius of a compromised token.
+		// radius of a compromised token. Installing or removing apps is the leader's
+		// (`require_leader`), not the publisher's.
 		Some(TokenScope::ApkgPublish) => {
 			path.starts_with("/api/files/apkg/")
 				|| (path == "/api/actions" && method == Method::POST)
-				|| path.starts_with("/api/apps")
 		}
 		// Not a delegated token — treat it as a capability list.
 		None => {
@@ -162,7 +162,8 @@ mod tests {
 		assert!(scope_permits(s, &Method::POST, "/api/files/apkg/upload"));
 		assert!(scope_permits(s, &Method::POST, "/api/actions"));
 		assert!(!scope_permits(s, &Method::GET, "/api/actions"));
-		assert!(scope_permits(s, &Method::GET, "/api/apps/installed"));
+		assert!(!scope_permits(s, &Method::GET, "/api/apps/installed"));
+		assert!(!scope_permits(s, &Method::POST, "/api/apps/install"));
 		assert!(!scope_permits(s, &Method::POST, "/api/idp/identities"));
 	}
 

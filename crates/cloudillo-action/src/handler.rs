@@ -43,23 +43,22 @@ pub async fn list_actions(
 	let is_tenant = maybe_auth
 		.as_ref()
 		.is_some_and(|a| cloudillo_core::abac::is_tenant_self(a, &tenant_id_tag));
-	// A credential that names the tenant without being its account (a share link, an `idp_`
-	// key) is anonymous here: every visibility rule below reads the tenant's id_tag as owner.
+	// A credential that names the tenant without being its account (a share link, via-embed)
+	// is anonymous here: every visibility rule below reads the tenant's id_tag as owner.
 	let maybe_auth = maybe_auth
 		.filter(|a| !cloudillo_core::abac::names_tenant_without_being_it(a, &tenant_id_tag));
 	// A leader sees what a single GET lets them see: `abac`'s leader override, which a
 	// delegated (scoped) token never gets.
-	let is_leader = maybe_auth
-		.as_ref()
-		.is_some_and(|a| a.scope.is_none() && cloudillo_core::roles::is_leader(&a.roles[..]));
+	let is_leader = maybe_auth.as_ref().is_some_and(cloudillo_core::abac::is_unscoped_leader);
+	let is_moderator = maybe_auth.as_ref().is_some_and(cloudillo_core::abac::is_unscoped_moderator);
 
 	// `status=` narrows, never widens: hidden statuses stay out, and pending moderation (`C`)
-	// is the tenant's and its leaders'.
+	// is the tenant's and its moderators'.
 	if let Some(status) = opts.status.take() {
 		let status: Vec<String> = status
 			.into_iter()
 			.filter(|s| !meta_adapter::HIDDEN_ACTION_STATUSES.contains(&s.as_str()))
-			.filter(|s| is_tenant || is_leader || s != "C")
+			.filter(|s| is_tenant || is_moderator || s != "C")
 			.collect();
 		if status.is_empty() {
 			let response = if opts.count == Some(true) {
@@ -197,6 +196,43 @@ pub async fn list_actions(
 	let has_more = filtered.len() > limit;
 	if has_more {
 		filtered.truncate(limit);
+	}
+
+	// `includeSubject` embeds each subject as the adapter read it: hold it to a listed row's
+	// read rules, or a public REPOST carries a post the caller cannot read.
+	if opts.include_subject == Some(true) {
+		let enterable = opts.enterable_channels.as_deref();
+		let hidden_hat = opts.exclude_hat_tag.as_deref();
+		let subjects: Vec<_> = filtered
+			.iter_mut()
+			.filter_map(|a| a.subject_action.take().map(|s| *s))
+			.filter(|s| {
+				let status = s.status.as_deref().unwrap_or("A");
+				!meta_adapter::HIDDEN_ACTION_STATUSES.contains(&status)
+					&& (status != "C" || is_tenant || is_moderator)
+					&& s.channel.as_ref().is_none_or(|c| enterable.is_none_or(|e| e.contains(c)))
+					&& s.hat.as_ref().is_none_or(|h| hidden_hat != Some(&*h.id_tag))
+			})
+			.collect();
+		let subjects = if is_leader {
+			subjects
+		} else {
+			filter_actions_by_visibility(
+				&app,
+				tn_id,
+				subject_id_tag,
+				is_authenticated,
+				&tenant_id_tag,
+				subjects,
+			)
+			.await?
+		};
+		let by_id: std::collections::HashMap<_, _> =
+			subjects.into_iter().map(|s| (s.action_id.clone(), s)).collect();
+		for a in &mut filtered {
+			a.subject_action =
+				a.subject.as_deref().and_then(|id| by_id.get(id)).map(|s| Box::new(s.clone()));
+		}
 	}
 
 	// Build next cursor from last item. The cursor's sort value must be the same
@@ -387,8 +423,30 @@ pub async fn post_action(
 	{
 		return Err(Error::PermissionDenied);
 	}
+	let (typ, embedded_sub) = helpers::extract_type_and_subtype(&action.typ);
 	// PTNR is emitted only by the CONN hooks (`native_hooks::ptnr::announce_partnership`).
-	if helpers::extract_type_and_subtype(&action.typ).0 == "PTNR" {
+	if typ == "PTNR" {
+		return Err(Error::PermissionDenied);
+	}
+	// The subtype may ride in `type` or in `subType`; both gates below read it from here, and
+	// the rest of the pipeline reads the embedded one, so the two must not disagree.
+	if let (Some(embedded), Some(explicit)) = (embedded_sub.as_deref(), action.sub_typ.as_deref())
+		&& embedded != explicit
+	{
+		return Err(Error::ValidationError("conflicting subtype in type and subType".into()));
+	}
+	let sub_typ = action.sub_typ.as_deref().map(str::to_owned).or(embedded_sub);
+	// Actions signed as the tenant that commit it to a relationship or endorsement: an APRV or
+	// an accepted join request is the moderator's (as `/accept`); every other CONN (request,
+	// UPD, empty or unknown subtype) and every FLLW the leader's (as the relationship PATCH).
+	let needed = match (typ.as_str(), sub_typ.as_deref()) {
+		("APRV", _) | ("CONN", Some("ACC")) => roles::MODERATOR_LEVEL,
+		// `CONN:DEL` is the hierarchy guard's below.
+		("CONN", Some("DEL")) => 0,
+		("CONN" | "FLLW", _) => roles::LEADER_LEVEL,
+		_ => 0,
+	};
+	if roles::highest_role_level(&auth.roles) < needed {
 		return Err(Error::PermissionDenied);
 	}
 
@@ -405,35 +463,32 @@ pub async fn post_action(
 
 	// Role-hierarchy guard on community member removal (CONN:DEL). The authoritative
 	// outbound check: only moderators+ may remove a member, and an actor may only remove a
-	// member strictly below them (leaders may also remove peer leaders). Self-leave
-	// (audience == the community itself) and personal disconnects are skipped.
+	// member strictly below them (leaders may also remove peer leaders). Personal disconnects
+	// are skipped, as is audience == the tenant itself, which `create_action_as` refuses.
+	if typ == "CONN"
+		&& sub_typ.as_deref() == Some("DEL")
+		&& let Some(ref audience_tag) = action.audience_tag
+		&& audience_tag.as_ref() != id_tag.as_ref()
 	{
-		let (action_type, sub_type) = helpers::extract_type_and_subtype(&action.typ);
-		if action_type == "CONN"
-			&& sub_type.as_deref() == Some("DEL")
-			&& let Some(ref audience_tag) = action.audience_tag
-			&& audience_tag.as_ref() != id_tag.as_ref()
-		{
-			let tenant = app.meta_adapter.read_tenant(tn_id).await?;
-			if tenant.typ == meta_adapter::ProfileType::Community {
-				let target_roles =
-					match app.meta_adapter.read_profile_roles(tn_id, audience_tag).await {
-						Ok(roles) => roles,
-						Err(Error::NotFound) => None,
-						Err(e) => return Err(e),
-					}
-					.unwrap_or_default();
-				if !roles::can_manage_member_by_roles(&auth.roles, &target_roles) {
-					warn!(
-						"Rejecting CONN:DEL by {} against {} in community {}: insufficient role (actor_level={}, target_level={})",
-						auth.id_tag,
-						audience_tag,
-						tn_id,
-						roles::highest_role_level(&auth.roles),
-						roles::highest_role_level(&target_roles)
-					);
-					return Err(Error::PermissionDenied);
-				}
+		let tenant = app.meta_adapter.read_tenant(tn_id).await?;
+		if tenant.typ == meta_adapter::ProfileType::Community {
+			let target_roles = match app.meta_adapter.read_profile_roles(tn_id, audience_tag).await
+			{
+				Ok(roles) => roles,
+				Err(Error::NotFound) => None,
+				Err(e) => return Err(e),
+			}
+			.unwrap_or_default();
+			if !roles::can_manage_member_by_roles(&auth.roles, &target_roles) {
+				warn!(
+					"Rejecting CONN:DEL by {} against {} in community {}: insufficient role (actor_level={}, target_level={})",
+					auth.id_tag,
+					audience_tag,
+					tn_id,
+					roles::highest_role_level(&auth.roles),
+					roles::highest_role_level(&target_roles)
+				);
+				return Err(Error::PermissionDenied);
 			}
 		}
 	}

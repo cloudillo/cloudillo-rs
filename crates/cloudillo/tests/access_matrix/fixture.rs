@@ -8,7 +8,7 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, State};
@@ -35,7 +35,9 @@ use cloudillo::meta_adapter::{
 };
 use cloudillo::settings::SettingValue;
 use cloudillo::types::{Patch, Timestamp, TnId};
-use cloudillo::websocket::{AccessQuery, WsKind, ws_file_access};
+use cloudillo::websocket::{
+	AccessQuery, WsKind, ws_bus_admission, ws_file_access, ws_prepare_store,
+};
 use cloudillo::{App, AppBuilder, worker};
 use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
 use cloudillo_blob_adapter_fs::BlobAdapterFs;
@@ -53,23 +55,59 @@ pub const TRASH: &str = "trash.test";
 /// Password of every tenant owner.
 pub const PASSWORD: &str = "matrix-pass-0";
 
-/// The one `idp_` key [`StubIdp`] accepts; it names alice's account.
+/// An `idp_` key [`StubIdp`] accepts; it names alice's account.
 pub const IDP_KEY: &str = "idp_zqmatrix-alice";
+/// An `idp_` key naming [`IDP_IDENT`], an identity alice hosts as its IdP.
+pub const IDP_IDENT_KEY: &str = "idp_zqmatrix-ident";
+pub const IDP_IDENT: &str = "zqm-ident.alice.test";
+/// Another identity alice hosts, registered by someone else.
+pub const IDP_OTHER: &str = "zqm-other.alice.test";
 
-/// Identity provider that only verifies [`IDP_KEY`]; nothing else is reached.
+/// Identities [`StubIdp`] was asked to create; a refused registration leaves it unchanged.
+pub static IDP_CREATED: AtomicUsize = AtomicUsize::new(0);
+
+fn stub() -> cloudillo::error::Error {
+	cloudillo::error::Error::ServiceUnavailable("stub".into())
+}
+
+/// Identity provider that verifies [`IDP_KEY`] and [`IDP_IDENT_KEY`]; every write is refused.
 #[derive(Debug)]
 struct StubIdp;
 
 #[async_trait::async_trait]
 impl IdentityProviderAdapter for StubIdp {
 	async fn verify_api_key(&self, key: &str) -> ClResult<Option<String>> {
-		Ok((key == IDP_KEY).then(|| ALICE.to_owned()))
+		Ok(match key {
+			IDP_KEY => Some(ALICE.to_owned()),
+			IDP_IDENT_KEY => Some(IDP_IDENT.to_owned()),
+			_ => None,
+		})
 	}
 	async fn create_identity(&self, _: CreateIdentityOptions<'_>) -> ClResult<Identity> {
-		unimplemented!()
+		IDP_CREATED.fetch_add(1, Ordering::Relaxed);
+		Err(stub())
 	}
-	async fn read_identity(&self, _: &str, _: &str) -> ClResult<Option<Identity>> {
-		Ok(None)
+	async fn read_identity(&self, prefix: &str, domain: &str) -> ClResult<Option<Identity>> {
+		let id_tag = format!("{prefix}.{domain}");
+		if id_tag != IDP_IDENT && id_tag != IDP_OTHER {
+			return Ok(None);
+		}
+		Ok(Some(Identity {
+			id_tag_prefix: prefix.into(),
+			id_tag_domain: domain.into(),
+			email: Some("zqm@zqm.test".into()),
+			registrar_id_tag: "zqm-registrar.test".into(),
+			owner_id_tag: None,
+			address: None,
+			address_type: None,
+			address_updated_at: None,
+			dyndns: false,
+			lang: None,
+			status: IdentityStatus::Active,
+			created_at: Timestamp::now(),
+			updated_at: Timestamp::now(),
+			expires_at: Timestamp::from_now(86400),
+		}))
 	}
 	async fn read_identity_by_email(&self, _: &str) -> ClResult<Option<Identity>> {
 		Ok(None)
@@ -80,7 +118,7 @@ impl IdentityProviderAdapter for StubIdp {
 		_: &str,
 		_: UpdateIdentityOptions,
 	) -> ClResult<Identity> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn update_identity_address(
 		&self,
@@ -89,10 +127,10 @@ impl IdentityProviderAdapter for StubIdp {
 		_: &str,
 		_: AddressType,
 	) -> ClResult<Identity> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn delete_identity(&self, _: &str, _: &str) -> ClResult<()> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn list_identities(&self, _: ListIdentityOptions) -> ClResult<Vec<Identity>> {
 		Ok(Vec::new())
@@ -101,19 +139,19 @@ impl IdentityProviderAdapter for StubIdp {
 		Ok(0)
 	}
 	async fn renew_identity(&self, _: &str, _: &str, _: Timestamp) -> ClResult<Identity> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn create_api_key(&self, _: CreateApiKeyOptions<'_>) -> ClResult<CreatedApiKey> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn list_api_keys(&self, _: ListApiKeyOptions) -> ClResult<Vec<ApiKey>> {
 		Ok(Vec::new())
 	}
 	async fn delete_api_key(&self, _: i32) -> ClResult<()> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn delete_api_key_for_identity(&self, _: i32, _: &str, _: &str) -> ClResult<bool> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn cleanup_expired_api_keys(&self) -> ClResult<u32> {
 		Ok(0)
@@ -127,19 +165,19 @@ impl IdentityProviderAdapter for StubIdp {
 		Ok(Vec::new())
 	}
 	async fn get_quota(&self, _: &str) -> ClResult<RegistrarQuota> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn set_quota_limits(&self, _: &str, _: i32, _: i64) -> ClResult<RegistrarQuota> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn check_quota(&self, _: &str, _: i64) -> ClResult<bool> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn increment_quota(&self, _: &str, _: i64) -> ClResult<RegistrarQuota> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn decrement_quota(&self, _: &str, _: i64) -> ClResult<RegistrarQuota> {
-		unimplemented!()
+		Err(stub())
 	}
 	async fn update_quota_on_status_change(
 		&self,
@@ -147,7 +185,7 @@ impl IdentityProviderAdapter for StubIdp {
 		_: IdentityStatus,
 		_: IdentityStatus,
 	) -> ClResult<RegistrarQuota> {
-		unimplemented!()
+		Err(stub())
 	}
 }
 
@@ -256,14 +294,15 @@ pub const CHANNELS: [Room; 5] = [
 pub const GONE_CHANNEL: &str = "gone";
 
 pub use crate::objects::Obj;
-use crate::objects::{index_all, seed_actions, seed_api_keys, seed_files};
+use crate::objects::{index_all, seed_actions, seed_api_keys, seed_files, seed_proxy_site};
 use crate::subjects::mint_subjects;
 pub use crate::subjects::{MintCell, Subject};
 
 pub struct Fixture {
 	pub app: App,
 	pub api: Router,
-	/// ws probe router: `/ws/{crdt|rtdb}/{file_id}` → `{"ok": level}` / `{"deny": "..."}`.
+	/// ws probe router: `/ws/{crdt|rtdb}/{file_id}` → `{"ok": level}` / `{"deny": "..."}`;
+	/// `/ws/bus` → 200 / 403.
 	pub ws: Router,
 	pub tenants: Tenants,
 	pub objs: Vec<Obj>,
@@ -276,6 +315,15 @@ pub struct Fixture {
 	/// Key-cached identity a forged bundled subject claims to be.
 	pub stranger: RemoteId,
 	_tmp: TempDir,
+}
+
+impl Fixture {
+	pub fn subject(&self, name: &str) -> &Subject {
+		self.subjects
+			.iter()
+			.find(|s| s.name == name)
+			.unwrap_or_else(|| panic!("subject {name}"))
+	}
 }
 
 static FIXTURE: OnceCell<Fixture> = OnceCell::const_new();
@@ -354,6 +402,11 @@ async fn build() -> Fixture {
 		)
 		.await
 		.unwrap();
+	// The outbox serves the newest `federation.history_sync.limit` wall actions (default 10);
+	// at the protocol cap, actions other layers add do not push the seeded ones out (SE-07).
+	let limit = SettingValue::Int(100);
+	let key = "federation.history_sync.limit";
+	app.settings.set(tenants.alice.tn_id, key, limit, &["SADM"]).await.unwrap();
 
 	let remotes = Remotes {
 		stranger: remote("stranger"),
@@ -383,6 +436,7 @@ async fn build() -> Fixture {
 	index_all(&app, &objs).await;
 	app.meta_adapter.delete_channel(tenants.club.tn_id, GONE_CHANNEL).await.unwrap();
 	let api_keys = seed_api_keys(&app, &tenants).await;
+	seed_proxy_site(&app).await;
 	let (subjects, mints) = mint_subjects(&app, &api, &tenants, &remotes, &objs, &api_keys).await;
 
 	let ws = ws_probe(app.clone());
@@ -391,7 +445,7 @@ async fn build() -> Fixture {
 	Fixture { app, api, ws, tenants, objs, subjects, mints, peer, hatted, stranger, _tmp: tmp }
 }
 
-async fn tenant(app: &App, id_tag: &'static str, roles: Option<&[&str]>) -> Tenant {
+pub async fn tenant(app: &App, id_tag: &'static str, roles: Option<&[&str]>) -> Tenant {
 	let tn_id = create_complete_tenant(
 		app,
 		CreateCompleteTenantOptions {
@@ -581,11 +635,18 @@ pub fn find_str(v: &Value, key: &str) -> Option<String> {
 fn ws_probe(app: App) -> Router {
 	Router::new()
 		.route("/ws/{kind}/{id}", get(ws_probe_handler))
+		.route("/ws/bus", get(ws_bus_probe))
 		.route_layer(axum::middleware::from_fn_with_state(
 			app.clone(),
 			cloudillo_core::middleware::optional_auth,
 		))
 		.with_state(app)
+}
+
+/// `get_ws_bus`'s pre-upgrade decision.
+async fn ws_bus_probe(IdTag(tenant): IdTag, OptionalAuth(auth): OptionalAuth) -> StatusCode {
+	let admitted = auth.as_ref().is_some_and(|a| ws_bus_admission(a, &tenant));
+	if admitted { StatusCode::OK } else { StatusCode::FORBIDDEN }
 }
 
 async fn ws_probe_handler(
@@ -601,6 +662,9 @@ async fn ws_probe_handler(
 		"rtdb" => WsKind::Rtdb,
 		_ => return (StatusCode::NOT_FOUND, Json(json!({ "deny": "bad_kind" }))),
 	};
+	if let Err(deny) = ws_prepare_store(&app, tn_id, auth.as_ref(), &id, kind).await {
+		return (StatusCode::OK, Json(json!({ "deny": deny.to_string() })));
+	}
 	match ws_file_access(&app, tn_id, &id_tag, auth.as_ref(), &id, &query, kind).await {
 		Ok((level, _)) => (StatusCode::OK, Json(json!({ "ok": level }))),
 		Err(deny) => (StatusCode::OK, Json(json!({ "deny": deny.to_string() }))),

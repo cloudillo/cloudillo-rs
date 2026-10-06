@@ -67,7 +67,7 @@ impl BusMessage {
 	}
 }
 
-/// Handle a bus connection
+/// Handle a bus connection (the tenant account's, see `get_ws_bus`).
 pub async fn handle_bus_connection(
 	ws: WebSocket,
 	user_id: String,

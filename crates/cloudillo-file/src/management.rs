@@ -205,6 +205,7 @@ async fn check_cross_drive_move(
 	}
 	check_move_target(app, auth, tenant_id_tag, file, parent, channel).await?;
 	if auth.id_tag.as_ref() == tenant_id_tag
+		// roles are already room-capped by check_perm_file
 		|| (file.channel.is_some() && cloudillo_core::roles::is_moderator(&auth.roles))
 		|| app
 			.meta_adapter
@@ -329,7 +330,7 @@ async fn require_lifecycle(
 	let ctx = file_access::FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
 	let file_ref = file_access::FileRef::from_view(file, tenant_id_tag);
 	let level = file_access::get_access_level(app, auth.tn_id, file_ref, &ctx, None).await;
-	if file_access::can_manage_lifecycle(&file_ref, &ctx, level) {
+	if file_access::can_manage_lifecycle(app, auth.tn_id, &file_ref, &ctx, level).await {
 		Ok(())
 	} else if file.parent_id.as_deref() == Some(TRASH_FOLDER_ID) {
 		Err(Error::NotFound)
@@ -519,7 +520,7 @@ pub async fn empty_trash(
 	for file in &trash_files {
 		let file_ref = file_access::FileRef::from_view(file, &tenant_id_tag);
 		let level = file_access::get_access_level(&app, auth.tn_id, file_ref, &ctx, None).await;
-		if !file_access::can_manage_lifecycle(&file_ref, &ctx, level) {
+		if !file_access::can_manage_lifecycle(&app, auth.tn_id, &file_ref, &ctx, level).await {
 			continue;
 		}
 		let purged = app.meta_adapter.delete_file(auth.tn_id, &file.entry_id).await?;
