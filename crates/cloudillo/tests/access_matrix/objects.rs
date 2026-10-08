@@ -262,6 +262,10 @@ pub struct ApiKeys {
 	pub expired: String,
 	/// `carddav:read` only.
 	pub carddav_r: String,
+	/// `carddav:read,carddav:write,caldav:read,caldav:write` (key 7).
+	pub dav_rw: String,
+	/// club's own unscoped key (key 6).
+	pub club: String,
 }
 
 /// Non-level files the curated rows use (both tenants); `tenant-crdt-d-active` is also the
@@ -433,7 +437,7 @@ pub async fn seed_files(app: &App, t: &Tenants, r: &Remotes) -> Vec<Obj> {
 	objs
 }
 
-/// Seed the API keys on alice.
+/// Seed the API keys on alice (and club's key 6).
 pub async fn seed_api_keys(app: &App, t: &Tenants) -> ApiKeys {
 	let tn = t.alice.tn_id;
 	let root = canon_root(t.alice.id_tag);
@@ -462,7 +466,12 @@ pub async fn seed_api_keys(app: &App, t: &Tenants) -> ApiKeys {
 	let opts = CreateApiKeyOptions { name: Some("zqmatrix-club"), scopes: None, expires_at: None };
 	let club = app.auth_adapter.create_api_key(t.club.tn_id, opts).await.unwrap();
 	assert_eq!(club.info.key_id, 6, "curated rows name club's key as /api/auth/api-keys/6");
-	ApiKeys { unscoped, file_read, dav, expired, carddav_r }
+	let scopes = Some("carddav:read,carddav:write,caldav:read,caldav:write");
+	let opts = CreateApiKeyOptions { name: Some("zqmatrix-dav-rw"), scopes, expires_at: None };
+	let dav_rw = app.auth_adapter.create_api_key(tn, opts).await.unwrap();
+	assert_eq!(dav_rw.info.key_id, 7, "alice's read-write DAV key is key 7");
+	let (club, dav_rw) = (club.plaintext_key.to_string(), dav_rw.plaintext_key.to_string());
+	ApiKeys { unscoped, file_read, dav, expired, carddav_r, dav_rw, club }
 }
 
 /// The one proxy site, which the admin rows aim at (`/api/admin/proxy-sites/1`).
@@ -477,6 +486,70 @@ pub async fn seed_proxy_site(app: &App) {
 	};
 	let site = app.auth_adapter.create_proxy_site(&data).await.unwrap();
 	assert_eq!(site.site_id, 1, "curated rows name the proxy site as 1");
+}
+
+/// Recurrence id of the exception [`seed_pim`] puts on `zqm-ev1`; a macro so curated
+/// `const` URIs can `concat!` it.
+macro_rules! pim_rid {
+	() => {
+		"2026-01-02T10:00:00Z"
+	};
+}
+pub(crate) use pim_rid;
+pub const PIM_RID: &str = pim_rid!();
+
+/// Seed PIM rows through the API as each tenant's owner, asserting the ids curated rows name:
+/// address books alice `zqm-ab` 1 (contact `zqm-c1`), club `zqm-ab` 2 (`zqm-c1club`), alice
+/// `zqm-ab2` 3 (empty); calendars alice `zqm-cal` 1 (daily `zqm-ev1` with an exception at
+/// [`PIM_RID`]), club 2 (`zqm-ev1club`), alice `zqm-cal2` 3 (empty).
+pub async fn seed_pim(api: &axum::Router, subjects: &[crate::subjects::Subject]) {
+	use crate::subjects::Subject;
+	use axum::body::Body;
+	use axum::http::Method;
+	let send = |method: Method, owner: &Subject, uri: String, body: serde_json::Value| {
+		let host = owner.host.clone();
+		let body = Body::from(body.to_string());
+		let r = crate::fixture::req(&host, method, &uri, crate::ops::bearer(owner), body);
+		async move {
+			let (status, body) = crate::fixture::call(api, r).await;
+			assert!(status.is_success(), "seed {uri} on {host}: {status} {body}");
+			body
+		}
+	};
+	let owner = |name: &str| subjects.iter().find(|s| s.name == name).unwrap();
+	let (alice, club) = (owner("owner@alice"), owner("owner@club"));
+	for (owner, name, ab_id, uid) in [
+		(alice, "zqm-ab", 1, Some("zqm-c1")),
+		(club, "zqm-ab", 2, Some("zqm-c1club")),
+		(alice, "zqm-ab2", 3, None),
+	] {
+		let b =
+			send(Method::POST, owner, "/api/address-books".into(), json!({ "name": name })).await;
+		assert_eq!(b["data"]["abId"], ab_id, "address book {name} on {}", owner.host);
+		if let Some(uid) = uid {
+			let uri = format!("/api/address-books/{ab_id}/contacts");
+			send(Method::POST, owner, uri, json!({ "uid": uid, "fn": "Zqm" })).await;
+		}
+	}
+	let event = |rrule: Option<&str>| {
+		json!({ "summary": "zqm", "dtstart": "2026-01-01T10:00:00Z",
+			"dtend": "2026-01-01T11:00:00Z", "rrule": rrule })
+	};
+	for (owner, name, cal_id, uid) in [
+		(alice, "zqm-cal", 1, Some("zqm-ev1")),
+		(club, "zqm-cal", 2, Some("zqm-ev1club")),
+		(alice, "zqm-cal2", 3, None),
+	] {
+		let b = send(Method::POST, owner, "/api/calendars".into(), json!({ "name": name })).await;
+		assert_eq!(b["data"]["calId"], cal_id, "calendar {name} on {}", owner.host);
+		if let Some(uid) = uid {
+			let uri = format!("/api/calendars/{cal_id}/objects");
+			let body = json!({ "uid": uid, "event": event(Some("FREQ=DAILY;COUNT=5")) });
+			send(Method::POST, owner, uri, body).await;
+		}
+	}
+	let uri = format!("/api/calendars/1/objects/zqm-ev1/exceptions/{PIM_RID}");
+	send(Method::PUT, alice, uri, json!({ "event": event(None) })).await;
 }
 
 /// Derive every fact of a file object from its spec (pure).
@@ -839,6 +912,8 @@ fn action_specs(t: &Tenants) -> Vec<(ActionSpec, TnId)> {
 		cur("cur-reject-owner", c, Issuer::Remote, Pending, true),
 		cur("cur-reject-mod", c, Issuer::Remote, Pending, true),
 		cur("cur-aprv-target", c, Issuer::Remote, Pending, true),
+		cur("cur-accept-alice", a, Issuer::Remote, Pending, true),
+		cur("cur-reject-alice", a, Issuer::Remote, Pending, true),
 	]);
 	let (mut s, tn_id) = cur("cur-hatrelay-own", c, Issuer::Remote, Active, false);
 	s.typ = HatRelay;

@@ -839,7 +839,11 @@ impl InboxCell {
 				t.aud = aud;
 				t.c = Some(json!({ "refId": "zqm-ref" }));
 			}
-			"APKG" => t.c = Some(json!({ "name": "zqm-app", "version": "1.0.0" })),
+			"APKG" => {
+				// A well-formed package (attachment included), so only `local_only` refuses it.
+				t.c = Some(json!({ "name": "zqm-app", "version": "1.0.0" }));
+				t.a = Some(vec!["f1~zqm-apkg".into()]);
+			}
 			other => panic!("unknown inbox type {other}"),
 		}
 		t

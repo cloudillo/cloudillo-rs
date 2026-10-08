@@ -279,6 +279,7 @@ fn ptnr_definition() -> ActionDefinition {
 		schema: None,
 		behavior: BehaviorFlags {
 			broadcast: Some(true),
+			server_emitted: Some(true),
 			allow_unknown: Some(false),
 			requires_acceptance: Some(false),
 			..Default::default()
@@ -748,6 +749,7 @@ fn stat_definition() -> ActionDefinition {
 		}),
 		behavior: BehaviorFlags {
 			broadcast: Some(true),
+			server_emitted: Some(true),
 			allow_unknown: Some(false),
 			requires_acceptance: Some(false),
 			ttl: None,
@@ -858,6 +860,7 @@ fn idp_reg_definition() -> ActionDefinition {
 		}),
 		behavior: BehaviorFlags {
 			broadcast: Some(false),
+			server_emitted: Some(true),
 			allow_unknown: Some(true),
 			requires_acceptance: Some(false),
 			ttl: None,
@@ -1149,6 +1152,7 @@ fn fileshare_definition() -> ActionDefinition {
 		}),
 		behavior: BehaviorFlags {
 			broadcast: Some(false),
+			server_emitted: Some(true),
 			allow_unknown: Some(false),
 			requires_acceptance: Some(true),
 			..Default::default()
@@ -1442,6 +1446,7 @@ fn prinvt_definition() -> ActionDefinition {
 		}),
 		behavior: BehaviorFlags {
 			broadcast: Some(false),
+			server_emitted: Some(true),
 			allow_unknown: Some(false), // Only send to known connected users
 			requires_acceptance: Some(false),
 			..Default::default()
@@ -1464,12 +1469,13 @@ fn prinvt_definition() -> ActionDefinition {
 }
 
 /// APKG - App package release action
-/// Signed JWT carrying app metadata + package attachment for federated app distribution
+/// Signed JWT carrying app metadata + package attachment. `local_only`: never delivered, read
+/// only by the local app store (`cloudillo-file/src/apkg.rs`).
 fn apkg_definition() -> ActionDefinition {
 	ActionDefinition {
 		r#type: "APKG".to_string(),
 		version: "1.0".to_string(),
-		description: "Publish an app package for federated distribution".to_string(),
+		description: "Publish an app package locally".to_string(),
 		metadata: Some(ActionMetadata {
 			category: Some("app-store".to_string()),
 			tags: Some(vec!["app".to_string(), "package".to_string(), "distribution".to_string()]),
@@ -1591,9 +1597,7 @@ fn apkg_definition() -> ActionDefinition {
 		}),
 		behavior: BehaviorFlags {
 			broadcast: Some(false),
-			allow_unknown: Some(true),
 			requires_acceptance: Some(false),
-			approvable: Some(true),
 			local_only: Some(true),
 			..Default::default()
 		},

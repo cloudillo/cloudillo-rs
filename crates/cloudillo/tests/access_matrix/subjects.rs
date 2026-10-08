@@ -629,6 +629,11 @@ pub async fn mint_subjects(
 	// alice's DAV key presented on club's host.
 	let dav_xtenant = key_facts(Some("carddav:read,caldav:read"), Some(Hostile::CrossTenant));
 	m.add("apikey-dav@club", CLUB, Some(keys.dav.clone()), dav_xtenant);
+	// alice's read-write DAV key; club's own unscoped key.
+	let dav_rw = key_facts(Some("carddav:read,carddav:write,caldav:read,caldav:write"), None);
+	m.add("apikey-dav-rw@alice", ALICE, Some(keys.dav_rw.clone()), dav_rw);
+	let club_key = SubjectFacts { id_tag: Some(CLUB.into()), ..key_facts(None, None) };
+	m.add("apikey-unscoped@club", CLUB, Some(keys.club.clone()), club_key);
 
 	edge_mints(&mut m, &r.hatted, keys, &aprv, alice_owner.as_deref()).await;
 

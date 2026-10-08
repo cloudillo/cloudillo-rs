@@ -70,8 +70,9 @@ pub enum Route {
 	WsQuery(WsKind, Option<&'static str>),
 	/// `GET {uri}` with the bearer in `?token=`, no header.
 	GetQ(&'static str),
-	/// `GET {uri}` with `Authorization: Basic …` instead of the bearer.
-	GetBasic(&'static str),
+	/// `{method} {uri}` with `Authorization: Basic …` instead of the bearer, and a raw body
+	/// (`""` = none).
+	CallBasic(&'static str, &'static str, &'static str),
 	/// `GET /api/channels`: the room's porch `status`, or `Absent` when unlisted.
 	ChanPorch(&'static str),
 	/// `GET /api/channels`: which of `minRole` / `closed` / `memberCount` the room's porch
@@ -174,7 +175,8 @@ impl Route {
 			FileUser | ReadMarker | Subscribe | ChanPorch(_) | ChanPorchKeys(_) | ChanCreate(_)
 			| ChanPatch(_) | ChanDelete(_) | ChanMembers(_) | ChanUpload(_) | Profiles(_)
 			| Partners | PartnersMap | PartnersSync | PtnrCreate | PtnrDelCreate | Ids(_)
-			| IdIn(..) | HatsPatch(_) | Fields(..) | Get(_) | GetQ(_) | GetBasic(_) | Call(..) => {
+			| IdIn(..) | HatsPatch(_) | Fields(..) | Get(_) | GetQ(_) | CallBasic(..)
+			| Call(..) => {
 				return None;
 			}
 		})
@@ -280,6 +282,8 @@ pub const G2: &[(&str, &str, [&str; 6])] = &[
 	// and an expired key: refused, not dropped to a guest.
 	("G2-21", "apikey-xtenant@club", DENY6),
 	("G2-22", "apikey-expired@alice", DENY6),
+	// An identity's own `idp_` key on its IdP's host: that identity, a stranger to alice.
+	("G2-23", "idp-ident@alice", ["Allow@Read", "Deny", "Allow", "Deny", "Deny", "Deny"]),
 ];
 
 /// File curated rows.
@@ -481,6 +485,22 @@ pub const FC: &[Row] = &[
 	("FC-141", "sharelink-c@alice", "root@alice", FilePatch, "Deny"),
 	("FC-142", "wefollow@alice", "tenant-blob-f-active@alice", FileMeta, "Deny"),
 	("FC-143", "follower@alice", "tenant-blob-f-active@alice", FileMeta, "Allow@Read"),
+	// Browsing a shared folder (`?parentId=`) lists at the share's level; a share on a sibling
+	// file is no folder share.
+	("FC-147", "g_folder@alice", FOLDER_CHILD, FileListQ("parentId={parent}"), "Present@Write"),
+	("FC-148", "g_read@alice", FOLDER_CHILD, FileListQ("parentId={parent}"), "Absent"),
+	// A `W` link writes inside its document tree: a new part under its root.
+	(
+		"FC-154",
+		"sharelink-w@alice",
+		"root@alice",
+		Call(
+			"POST",
+			"/api/files",
+			r#"{"fileTp":"CRDT","contentType":"cloudillo/quillo","fileName":"zqm-part","rootId":"{obj}"}"#,
+		),
+		"Allow",
+	),
 ];
 const FOLDER_CHILD: &str = "folderchild-blob-d-active@alice";
 
@@ -573,7 +593,166 @@ pub const AC: &[Row] = &[
 	// F reaches followers, not those alice follows.
 	("AC-69", "wefollow@alice", "post-f-tenant-active@alice", ActGet, "Deny"),
 	("AC-70", "follower@alice", "post-f-tenant-active@alice", ActGet, "Allow"),
+	// Server-emitted types are never a client's to sign as the tenant, whoever asks.
+	("AC-71", "m_contributor@club", "tenant-blob-d-active@club", FSHR_CLUB, "Deny"),
+	("AC-72", "owner@alice", "tenant-blob-d-active@alice", FSHR_ALICE, "Deny"),
+	("AC-73", "m_contributor@club", "tenant-blob-d-active@club", FSHR_DEL_CLUB, "Deny"),
+	("AC-74", "owner@alice", "tenant-blob-d-active@alice", FSHR_DEL_ALICE, "Deny"),
+	("AC-75", "m_contributor@club", "post-p-tenant-active@club", STAT_POST, "Deny"),
+	("AC-76", "owner@alice", "post-p-tenant-active@alice", STAT_POST, "Deny"),
+	("AC-77", "owner@alice", "", IDP_REG_POST, "Deny"),
+	("AC-118", "m_contributor@club", "", PRINVT_CLUB, "Deny"),
+	("AC-119", "owner@alice", "", PRINVT_ALICE, "Deny"),
+	// The revocation subtype in `subType` instead of embedded in `type`.
+	("AC-120", "m_contributor@club", "tenant-blob-d-active@club", FSHR_SUB_DEL_CLUB, "Deny"),
+	// A root's explicit room: enterable by the actor, a room of this tenant or the audience's.
+	("AC-78", "m_supporter@club", "", POST_OC, "Deny"),
+	("AC-79", "m_contributor@club", "", POST_OC, "Allow*"),
+	("AC-80", "m_moderator@club", "", POST_CW, "Deny"),
+	("AC-81", "m_contributor@club", "", POST_NOPE, "400"),
+	("AC-82", "m_contributor@club", "", POST_CF, "400"),
+	("AC-83", "m_contributor@club", "", POST_GONE, "400"),
+	// A hat needs an audience other than itself, on a type that allows one.
+	("AC-84", "owner@alice", "", HAT_NO_AUD, "400"),
+	("AC-85", "owner@alice", "", HAT_IS_AUD, "400"),
+	("AC-86", "owner@alice", "", HAT_ON_CONV, "400"),
+	// A community invitation to a known profile (MG-300: unknown, 400).
+	("AC-87", "m_moderator@club", "", INVT_KNOWN, "Allow*"),
+	// No `allow_unknown`: a POST to an unknown audience.
+	("AC-88", "owner@alice", "", POST_TO_NOBODY, "400"),
+	// REPOST: public, not one's own, with an explicit audience.
+	("AC-95", "owner@alice", "post-f-remote-active@alice", REPOST_ALICE, "400"),
+	("AC-96", "owner@alice", "post-p-tenant-active@alice", REPOST_ALICE, "400"),
+	("AC-97", "owner@alice", "post-p-remote-active@alice", REPOST_NO_AUD, "400"),
+	("AC-98", "owner@alice", "post-p-remote-active@alice", REPOST_ALICE, "Allow"),
+	// Unfollowing as the community is a leader's, as following is (MG-188..198).
+	("AC-99", "m_moderator@club", "", FLLW_DEL_NOBODY, "Deny"),
+	("AC-100", "m_contributor@club", "", FLLW_DEL_NOBODY, "Deny"),
+	("AC-101", "m_leader@club", "", FLLW_DEL_NOBODY, "Allow*"),
+	// A reply needs read on its parent, room gate included (`check_action_read`).
+	("AC-103", "m_supporter@club", OC_POST, CMNT_PARENT, "Deny"),
+	("AC-104", "m_contributor@club", MODS_POST, CMNT_PARENT, "Deny"),
+	("AC-105", "m_contributor@club", OC_POST, CMNT_PARENT, "Allow*"),
+	// An invitation into a room is a moderator's (`invt.rs` `check_community_authority`).
+	("AC-106", "m_contributor@club", "", INVT_ROOM, "Deny"),
+	("AC-107", "m_moderator@club", "", INVT_ROOM, "Allow*"),
+	// Accepting or rejecting what was sent to the tenant: the tenant account, never a link or
+	// a scoped or `idp_` credential (`scope_permits`).
+	("AC-110", "sharelink-r@alice", "cur-accept-alice@alice", ActAccept, "Deny"),
+	("AC-111", "owner-scoped-r@alice", "cur-accept-alice@alice", ActAccept, "Deny"),
+	("AC-112", "idp-ident@alice", "cur-accept-alice@alice", ActAccept, "Deny"),
+	("AC-113", "owner@alice", "cur-accept-alice@alice", ActAccept, "Allow"),
+	("AC-114", "sharelink-r@alice", "cur-reject-alice@alice", ActReject, "Deny"),
+	("AC-115", "idp-ident@alice", "cur-reject-alice@alice", ActReject, "Deny"),
+	("AC-116", "owner@alice", "cur-reject-alice@alice", ActReject, "Allow"),
+	("AC-117", "sharelink-r@alice", "container-p-tenant-active@alice", Subscribe, "Deny"),
 ];
+
+/// FSHR to a profile connected to the host (`m-follower.test` on club, `connected.test` on alice),
+/// so only the type itself can refuse it.
+const FSHR_CLUB: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"FSHR","subType":"WRITE","subject":"{obj}","audienceTag":"m-follower.test","content":{"contentType":"text/plain","fileName":"zqm","fileTp":"BLOB"}}"#,
+);
+const FSHR_ALICE: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"FSHR","subType":"WRITE","subject":"{obj}","audienceTag":"connected.test","content":{"contentType":"text/plain","fileName":"zqm","fileTp":"BLOB"}}"#,
+);
+const FSHR_DEL_CLUB: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"FSHR:DEL","subject":"{obj}","audienceTag":"m-follower.test"}"#,
+);
+const FSHR_DEL_ALICE: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"FSHR:DEL","subject":"{obj}","audienceTag":"connected.test"}"#,
+);
+const FSHR_SUB_DEL_CLUB: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"FSHR","subType":"DEL","subject":"{obj}","audienceTag":"m-follower.test"}"#,
+);
+/// PRINVT is `post_invite_community`'s alone, never a member's or the owner's to sign.
+const PRINVT_CLUB: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"PRINVT","audienceTag":"m-follower.test","content":{"refId":"zqm-ref"}}"#,
+);
+const PRINVT_ALICE: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"PRINVT","audienceTag":"connected.test","content":{"refId":"zqm-ref"}}"#,
+);
+const STAT_POST: Route =
+	Call("POST", "/api/actions", r#"{"type":"STAT","parentId":"{obj}","content":{"c":1}}"#);
+const IDP_REG_POST: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"IDP:REG","audienceTag":"connected.test","content":{"idTag":"zqm.connected.test"}}"#,
+);
+/// A root POST into a room (`channel`), one literal per room.
+const POST_OC: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"POST","content":"zqm","channel":"@club.test~open-contrib"}"#,
+);
+const POST_CW: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"POST","content":"zqm","channel":"@club.test~closed-w"}"#,
+);
+const POST_NOPE: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"POST","content":"zqm","channel":"@club.test~zqm-nope"}"#,
+);
+const POST_CF: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"POST","content":"zqm","channel":"@alice.test~close-friends"}"#,
+);
+const POST_GONE: Route =
+	Call("POST", "/api/actions", r#"{"type":"POST","content":"zqm","channel":"@club.test~gone"}"#);
+const HAT_NO_AUD: Route =
+	Call("POST", "/api/actions", r#"{"type":"POST","content":"zqm","hat":"peer.test"}"#);
+const HAT_IS_AUD: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"POST","content":"zqm","hat":"connected.test","audienceTag":"connected.test"}"#,
+);
+const HAT_ON_CONV: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"CONV","content":{"name":"zqm"},"hat":"peer.test","audienceTag":"connected.test"}"#,
+);
+const INVT_KNOWN: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"INVT","subject":"@club.test","audienceTag":"m-follower.test"}"#,
+);
+const POST_TO_NOBODY: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"POST","content":"zqm","audienceTag":"zqm-nobody.test"}"#,
+);
+const REPOST_ALICE: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"REPOST","subject":"{obj}","audienceTag":"alice.test"}"#,
+);
+const REPOST_NO_AUD: Route = Call("POST", "/api/actions", r#"{"type":"REPOST","subject":"{obj}"}"#);
+const FLLW_DEL_NOBODY: Route =
+	Call("POST", "/api/actions", r#"{"type":"FLLW:DEL","audienceTag":"zqm-nobody.test"}"#);
+const CMNT_PARENT: Route =
+	Call("POST", "/api/actions", r#"{"type":"CMNT","content":"zqm","parentId":"{obj}"}"#);
+const INVT_ROOM: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"INVT","subject":"@club.test~closed-w","audienceTag":"m-follower.test"}"#,
+);
 const APKG_POST: Route = Call(
 	"POST",
 	"/api/actions",
@@ -711,6 +890,22 @@ pub const WS: &[Row] = &[
 	),
 	("WS-79", "owner@alice", "folder@alice", WsCrdt(None), "Deny"),
 	("WS-80", "owner@alice", "mirroredplacer-blob-p-active@alice", WsCrdt(None), "Deny"),
+	// `?via=` caps every caller at the link's level, the owner too; a file the source does not
+	// link is refused (`file_access.rs` via resolution).
+	(
+		"WS-93",
+		"owner@alice",
+		"f1~zqm-alice-linktarget-crdt-d-active?via=f1~zqm-alice-tenant-crdt-d-active",
+		WsCrdt(None),
+		"Allow@Read",
+	),
+	(
+		"WS-94",
+		"owner@alice",
+		"f1~zqm-alice-linktarget-crdt-d-active?via=f1~zqm-alice-tenant-blob-d-active",
+		WsCrdt(None),
+		"Deny",
+	),
 ];
 
 const WS_BUS: Route = Call("GET", "/ws/bus", "");
@@ -1352,7 +1547,9 @@ pub const MG: &[Row] = &[
 	// A community invitation is a moderator's; its revocation the inviter's or a moderator's;
 	// an unknown subtype nobody's.
 	("MG-299", "m_contributor@club", "", INVT_CLUB, "Deny"),
-	("MG-300", "m_moderator@club", "", INVT_CLUB, "Allow*"),
+	// `zqm-invitee.test` is unknown to club and INVT is not `allow_unknown`: 400 past the gate
+	// (`task.rs` outbound `allow_unknown`); AC-87 is the live Allow.
+	("MG-300", "m_moderator@club", "", INVT_CLUB, "400"),
 	(
 		"MG-301",
 		"m_contributor@club",
@@ -1379,8 +1576,8 @@ pub const MG: &[Row] = &[
 	("MG-303", "owner@alice", "", GetQ("/api/settings"), "Allow"),
 	// A non-Bearer `Authorization` is refused where auth is required, and is no credential at
 	// all where it is optional (an anonymous listing).
-	("MG-304", "anon@alice", "", GetBasic("/api/settings"), "Deny"),
-	("MG-305", "anon@alice", "", GetBasic("/api/files"), "Allow"),
+	("MG-304", "anon@alice", "", CallBasic("GET", "/api/settings", ""), "Deny"),
+	("MG-305", "anon@alice", "", CallBasic("GET", "/api/files", ""), "Allow"),
 	// Accepting a join request is a moderator's, in either subtype form; a removal in the
 	// `subType` form meets the same hierarchy guard. Refused before any target lookup.
 	("MG-306", "m_contributor@club", "", CONN_ACC_NOBODY, "Deny"),
@@ -1499,9 +1696,9 @@ pub const MG: &[Row] = &[
 		"400",
 	),
 	// DAV takes a `cl_` key as the Basic password, on its own tenant only.
-	("MG-361", "apikey-dav@alice", "", GetBasic(DAV_PRINCIPAL), "Allow*"),
-	("MG-362", "apikey-xtenant@club", "", GetBasic(DAV_PRINCIPAL), "Deny"),
-	("MG-363", "apikey-dav@club", "", GetBasic(DAV_PRINCIPAL), "Deny"),
+	("MG-361", "apikey-dav@alice", "", CallBasic("GET", DAV_PRINCIPAL, ""), "Allow*"),
+	("MG-362", "apikey-xtenant@club", "", CallBasic("GET", DAV_PRINCIPAL, ""), "Deny"),
+	("MG-363", "apikey-dav@club", "", CallBasic("GET", DAV_PRINCIPAL, ""), "Deny"),
 	// Past the gate: SADM creating a profile of an unknown type is a validation error.
 	("MG-364", "owner-sadm@admin", "", PUT_ZQM_TYPE, "400"),
 	("MG-365", "owner@alice", "cur-tag-gwrite@alice", Call("DELETE", UNTAG_OBJ, ""), "Allow"),
@@ -1544,7 +1741,146 @@ pub const MG: &[Row] = &[
 		),
 		"400",
 	),
+	// PIM by id (seeded by `seed_pim`): the owner reads; a DAV key reaches its own capability.
+	("MG-415", "owner@alice", "", Get("/api/calendars/1"), "Allow"),
+	("MG-416", "owner@alice", "", Get("/api/calendars/1/objects"), "Allow"),
+	("MG-417", "owner@alice", "", Get(CAL_EV1), "Allow"),
+	("MG-418", "owner@alice", "", Get(CAL_EXCS), "Allow"),
+	("MG-419", "owner@alice", "", Get(CAL_EXC), "Allow"),
+	("MG-420", "owner@alice", "", Get("/api/address-books/1/contacts"), "Allow"),
+	("MG-421", "owner@alice", "", Get(AB_C1), "Allow"),
+	("MG-422", "apikey-dav@alice", "", Get(CAL_EV1), "Allow"),
+	("MG-423", "apikey-dav@alice", "", Call("PUT", CAL_EV1, "{}"), "Deny"),
+	("MG-424", "apikey-carddav-r@alice", "", Get(AB_C1), "Allow"),
+	("MG-425", "apikey-dav-rw@alice", "", CAL_OBJECT_POST_1, "Allow*"),
+	("MG-426", "apikey-carddav-r@alice", "", Call("DELETE", AB_C1, ""), "Deny"),
+	// A community's PIM is its leaders'.
+	("MG-427", "m_leader@club", "", Get("/api/calendars/2"), "Allow"),
+	("MG-428", "m_contributor@club", "", Get("/api/calendars/2"), "Deny"),
+	("MG-429", "m_leader@club", "", Get("/api/address-books/2/contacts"), "Allow"),
+	("MG-430", "m_contributor@club", "", Get("/api/address-books/2/contacts"), "Deny"),
+	// Another tenant's id, or a row of another collection: 404 (the SQL is scoped by tenant
+	// and collection).
+	("MG-431", "owner@alice", "", Get("/api/calendars/2"), "Deny"),
+	("MG-432", "owner@alice", "", Get("/api/calendars/3/objects/zqm-ev1"), "Deny"),
+	("MG-433", "owner@alice", "", Get("/api/address-books/3/contacts/zqm-c1"), "Deny"),
+	("MG-434", "owner@alice", "", Get("/api/address-books/2/contacts/zqm-c1club"), "Deny"),
+	("MG-435", "owner@alice", "", Get(CAL3_EXC), "Deny"),
+	("MG-436", "owner@alice", "", Call("DELETE", CAL3_EXC, ""), "Deny"),
+	("MG-437", "owner@alice", "", Call("POST", "/api/address-books/2/import", ""), "Deny"),
+	// DAV collections and resources: a `cl_` key's own capability, on its own tenant.
+	("MG-438", "apikey-dav@alice", "", CallBasic("PROPFIND", DAV_AB, ""), "Allow*"),
+	("MG-439", "apikey-dav@alice", "", CallBasic("PROPFIND", DAV_CAL, ""), "Allow*"),
+	("MG-440", "apikey-dav@alice", "", CallBasic("GET", DAV_C1, ""), "Allow*"),
+	("MG-441", "apikey-dav@alice", "", CallBasic("GET", DAV_EV1, ""), "Allow*"),
+	("MG-442", "apikey-carddav-r@alice", "", CallBasic("PROPFIND", DAV_CAL, ""), "Deny"),
+	("MG-443", "apikey-carddav-r@alice", "", CallBasic("PROPFIND", DAV_AB_ZQM, ""), "Allow*"),
+	("MG-444", "apikey-dav@alice", "", CallBasic("PUT", DAV_C1, VCARD), "Deny"),
+	("MG-445", "apikey-dav@alice", "", CallBasic("DELETE", DAV_EV1, ""), "Deny"),
+	(
+		"MG-446",
+		"apikey-dav@alice",
+		"",
+		CallBasic("MKCOL", "/dav/addressbooks/zqm-new/", ""),
+		"Deny",
+	),
+	(
+		"MG-447",
+		"apikey-dav@alice",
+		"",
+		CallBasic("MKCALENDAR", "/dav/calendars/zqm-new/", ""),
+		"Deny",
+	),
+	("MG-448", "apikey-dav-rw@alice", "", CallBasic("PUT", DAV_NEW_VCF, VCARD), "Allow*"),
+	// An empty scope reaches no DAV path; an expired key, a key off its tenant, a session
+	// bearer and no credential are refused.
+	("MG-449", "apikey-unscoped@club", "", CallBasic("GET", DAV_PRINCIPAL, ""), "Deny"),
+	("MG-450", "apikey-expired@alice", "", CallBasic("GET", DAV_PRINCIPAL, ""), "Deny"),
+	("MG-451", "apikey-xtenant@club", "", CallBasic("PROPFIND", DAV_AB, ""), "Deny"),
+	("MG-452", "owner@alice", "", Get(DAV_PRINCIPAL), "Deny"),
+	("MG-453", "anon@alice", "", CallBasic("GET", DAV_CAL, ""), "Deny"),
+	// Public: DAV discovery redirects (301). The passkey login challenge is pinned at 404: no
+	// passkey is seeded (`webauthn.rs:525`), so the route is reached but has nothing to offer.
+	("MG-454", "anon@alice", "", Get("/.well-known/carddav"), "Allow*"),
+	("MG-455", "anon@alice", "", Get("/.well-known/caldav"), "Allow*"),
+	("MG-456", "anon@alice", "", Get("/api/auth/wa/login/challenge"), "Deny"),
+	("MG-457", "owner@alice", "", Call("POST", "/api/auth/logout", "{}"), "Allow"),
+	// A DAV key reaches no push or reindex route (it reads PIM only).
+	(
+		"MG-474",
+		"apikey-dav@alice",
+		"",
+		Call("DELETE", "/api/notifications/subscription/1", ""),
+		"Deny",
+	),
+	("MG-475", "apikey-dav@alice", "", REINDEX, "Deny"),
+	(
+		"MG-476",
+		"m_contributor@club",
+		"",
+		Call("DELETE", "/api/settings/file.sync_max_vis?level=tenant", ""),
+		"Deny",
+	),
+	// A member's own settings: no anonymous caller, no link naming the community.
+	("MG-477", "anon@club", "", PROF_SETTINGS, "Deny"),
+	("MG-478", "anon@club", "", PROF_SETTING_PUT, "Deny"),
+	("MG-479", "sharelink-r@club", "", PROF_SETTINGS, "Deny"),
+	("MG-480", "sharelink-r@club", "", PROF_SETTING_PUT, "Deny"),
+	("MG-481", "sharelink-w@alice", "", UNTAG, "Deny"),
+	// Another tenant's key and refs are not the owner's, by id.
+	("MG-482", "owner@alice", "", Get("/api/auth/api-keys/6"), "Deny"),
+	("MG-483", "owner@alice", "", Call("DELETE", "/api/auth/api-keys/6", ""), "Deny"),
+	("MG-484", "owner@alice", "", Get("/api/refs/zqref-club-r"), "Deny"),
+	("MG-485", "owner@alice", "", Call("DELETE", "/api/refs/zqref-club-del", ""), "Deny"),
+	(
+		"MG-486",
+		"owner@alice",
+		"",
+		Call("PATCH", "/api/refs/zqref-club-patch", r#"{"description":"zqm"}"#),
+		"Deny",
+	),
+	// Pinned like MG-129: an authenticated identity reads a ref's details; a link is a guest on
+	// this optional-auth route (the `GUEST6` rule), so it gets the reduced view (MG-128).
+	("MG-487", "sharelink-r@alice", "", REF_FIELDS, "Clean"),
+	("MG-488", "idp-ident@alice", "", REF_FIELDS, "Leak:resourceId"),
+	// `/api/me/full` `x` sections by tier (seeded by the layer): `follower` reaches followers,
+	// an unknown tier fails closed to the owner tier, a role tier reaches that role and above.
+	("MG-490", "follower@alice", "", Fields("/api/me/full", &["x.zqmfollow"]), "Leak:x.zqmfollow"),
+	("MG-491", "stranger@alice", "", Fields("/api/me/full", &["x.zqmfollow"]), "Clean"),
+	("MG-492", "connected@alice", "", Fields("/api/me/full", &["x.zqmbad"]), "Clean"),
+	("MG-493", "owner@alice", "", Fields("/api/me/full", &["x.zqmbad"]), "Leak:x.zqmbad"),
+	("MG-494", "m_supporter@club", "", Fields("/api/me/full", &["x.zqmrole"]), "Leak:x.zqmrole"),
+	("MG-495", "m_follower@club", "", Fields("/api/me/full", &["x.zqmrole"]), "Clean"),
+	// A mount names a document of the community's own: another tenant's id is not found
+	// (scoped `read_file`, `cloudillo-site/src/handler.rs:494`).
+	(
+		"MG-489",
+		"m_leader@club",
+		"",
+		Call(
+			"POST",
+			"/api/sites/mounts",
+			r#"{"docFileId":"f1~zqm-alice-tenant-crdt-d-active","mountPath":"/zqm"}"#,
+		),
+		"400",
+	),
 ];
+
+const CAL_EV1: &str = "/api/calendars/1/objects/zqm-ev1";
+const CAL_EXCS: &str = "/api/calendars/1/objects/zqm-ev1/exceptions";
+const CAL_EXC: &str =
+	concat!("/api/calendars/1/objects/zqm-ev1/exceptions/", crate::objects::pim_rid!());
+const CAL3_EXC: &str =
+	concat!("/api/calendars/3/objects/zqm-ev1/exceptions/", crate::objects::pim_rid!());
+const AB_C1: &str = "/api/address-books/1/contacts/zqm-c1";
+const CAL_OBJECT_POST_1: Route = Call("POST", "/api/calendars/1/objects", "{}");
+const DAV_AB: &str = "/dav/addressbooks/";
+const DAV_AB_ZQM: &str = "/dav/addressbooks/zqm-ab/";
+const DAV_CAL: &str = "/dav/calendars/";
+const DAV_C1: &str = "/dav/addressbooks/zqm-ab/zqm-c1.vcf";
+const DAV_NEW_VCF: &str = "/dav/addressbooks/zqm-ab/zqm-dav.vcf";
+const DAV_EV1: &str = "/dav/calendars/zqm-cal/zqm-ev1.ics";
+const VCARD: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:zqm-dav\r\nFN:Zqm\r\nEND:VCARD\r\n";
 
 const DAV_PRINCIPAL: &str = "/dav/principal/";
 const PUT_ZQM_TYPE: Route = Call("PUT", "/api/profiles/zqm-new.test", r#"{"type":"zqm"}"#);
@@ -1615,7 +1951,7 @@ const ADMIN_ROUTES: &[(&str, Route)] = &[
 ];
 
 /// Every credential short of SADM's unscoped session: SADM itself is scoped down last.
-const ADMIN_DENIED: [&str; 12] = [
+const ADMIN_DENIED: &[&str] = &[
 	"owner@alice",
 	"follower@alice",
 	"idp-mgmt@alice",
@@ -1628,6 +1964,7 @@ const ADMIN_DENIED: [&str; 12] = [
 	"sadm-scoped@admin",
 	"stranger@alice",
 	"sharelink-r@alice",
+	"idp-ident@alice",
 ];
 
 /// The account's own credentials (`require_tenant_self`), refused to every
@@ -1639,9 +1976,19 @@ const OWNER_CRED_ROUTES: &[(&str, Route)] = &[
 	("MG-318", Call("POST", "/api/auth/api-keys", "{}")),
 	("MG-319", Call("POST", "/api/auth/wa/reg", "{}")),
 	("MG-320", Get("/api/auth/wa/reg/challenge")),
+	("MG-391", Call("DELETE", "/api/auth/wa/reg/zqm", "")),
 ];
 
-const OWNER_CRED_DENIED: [&str; 3] = ["stranger@alice", "sharelink-r@alice", "anon@alice"];
+const OWNER_CRED_DENIED: &[&str] = &[
+	"stranger@alice",
+	"sharelink-r@alice",
+	"anon@alice",
+	"idp-ident@alice",
+	"follower@alice",
+	"apkg-publish@alice",
+	"apikey-dav@alice",
+	"owner-scoped-r@alice",
+];
 
 /// Room management on club, refused below a leader and to every non-member credential.
 const CHAN_WRITE_ROUTES: &[(&str, Route)] = &[
@@ -1656,6 +2003,25 @@ const CHAN_WRITE_DENIED: &[&str] = &[
 	"sharelink-r@club",
 	"idp-mgmt@club",
 	"anon@club",
+	"hatted-scoped@club",
+];
+
+/// Room management on alice, refused to every non-account credential.
+const CHAN_WRITE_ALICE: &[(&str, Route)] = &[
+	("CH-125", ChanCreate("zqm-grid-a")),
+	("CH-126", ChanPatch("close-friends")),
+	("CH-127", ChanDelete("close-friends")),
+	("CH-128", ChanMembers("close-friends")),
+];
+const CHAN_WRITE_ALICE_DENIED: &[&str] = &[
+	"stranger@alice",
+	"follower@alice",
+	"sharelink-r@alice",
+	"owner-scoped-r@alice",
+	"apkg-publish@alice",
+	"apikey-dav@alice",
+	"idp-ident@alice",
+	"anon@alice",
 ];
 
 /// Settings are read with the standing that writes them: no link or capability credential.
@@ -1663,8 +2029,81 @@ const SETTINGS_READ_ROUTES: &[(&str, Route)] = &[
 	("MG-381", Get("/api/settings")),
 	("MG-382", Get("/api/settings?prefix=profile")),
 ];
-const SETTINGS_READ_DENIED: &[&str] =
-	&["sharelink-r@alice", "apikey-dav@alice", "apkg-publish@alice"];
+const SETTINGS_READ_DENIED: &[&str] = &[
+	"sharelink-r@alice",
+	"apikey-dav@alice",
+	"apkg-publish@alice",
+	"idp-ident@alice",
+	"anon@alice",
+	"owner-scoped-r@alice",
+];
+
+/// Settings writes at the User level: the unscoped tenant or a leader (MG-11..18).
+const SETTINGS_WRITE_ROUTES: &[(&str, Route)] = &[
+	("MG-470", SET_USER),
+	("MG-471", Call("DELETE", "/api/settings/file.sync_max_vis?level=tenant", "")),
+];
+const SETTINGS_WRITE_DENIED: &[&str] = &[
+	"sharelink-r@alice",
+	"anon@alice",
+	"apkg-publish@alice",
+	"idp-ident@alice",
+	"follower@alice",
+];
+
+/// The site routes beyond `GET /api/sites` (`require_leader`).
+const SITE_ROUTES: &[(&str, Route)] = &[
+	("MG-461", SITES_PATCH),
+	("MG-462", Get("/api/sites/pages")),
+	("MG-463", SITES_PUBLISH),
+	("MG-464", SITE_MOUNT),
+	("MG-465", SITE_UNMOUNT),
+	("MG-466", SITE_ROLLBACK),
+];
+const SITE_DENIED: &[&str] = &[
+	"stranger@alice",
+	"follower@alice",
+	"sharelink-r@alice",
+	"anon@alice",
+	"apkg-publish@alice",
+	"apikey-dav@alice",
+	"idp-ident@alice",
+	"owner-scoped-r@alice",
+];
+
+/// Push, reindex and the contact listing (`require_leader`); `apikey-dav` reads contacts
+/// (MG-246), so it is in neither list (MG-474, 475 for the rest).
+const LEADER_MISC_ROUTES: &[(&str, Route)] = &[
+	("MG-467", Call("DELETE", "/api/notifications/subscription/1", "")),
+	("MG-468", REINDEX),
+	("MG-469", Get("/api/contacts")),
+];
+const LEADER_MISC_DENIED: &[&str] = &[
+	"stranger@alice",
+	"follower@alice",
+	"sharelink-r@alice",
+	"anon@alice",
+	"apkg-publish@alice",
+	"idp-ident@alice",
+	"owner-scoped-r@alice",
+];
+
+/// A file's share by id: its managers'. The manager check runs before the share-id lookup
+/// (`cloudillo-file/src/share.rs:216`), so share 1 need not belong to the file.
+const SHARE_WRITE_ROUTES: &[(&str, Route)] = &[
+	("MG-472", Call("PATCH", "/api/files/f1~zqm-alice-tenant-blob-d-active/shares/1", "{}")),
+	("MG-473", Call("DELETE", "/api/files/f1~zqm-alice-tenant-blob-d-active/shares/1", "")),
+];
+const SHARE_WRITE_DENIED: &[&str] = &[
+	"anon@alice",
+	"follower@alice",
+	"stranger@alice",
+	"g_read@alice",
+	"apkg-publish@alice",
+	"apikey-dav@alice",
+	"idp-ident@alice",
+	"sharelink-w@alice",
+];
 
 /// The account's own PIM, sites, refs, apps and push: never a link's or an `idp_` key's.
 const ACCOUNT_ROUTES: &[(&str, Route)] = &[
@@ -1675,18 +2114,85 @@ const ACCOUNT_ROUTES: &[(&str, Route)] = &[
 	("MG-387", APPS_INSTALLED),
 	("MG-388", PUSH_SUB),
 ];
-const ACCOUNT_DENIED: &[&str] = &["sharelink-r@alice", "idp-mgmt@alice"];
+/// Not `apikey-dav`: it reads address books and calendars (MG-59, MG-66).
+const ACCOUNT_DENIED: &[&str] = &[
+	"sharelink-r@alice",
+	"idp-mgmt@alice",
+	"idp-ident@alice",
+	"stranger@alice",
+	"follower@alice",
+	"anon@alice",
+	"apkg-publish@alice",
+	"owner-scoped-r@alice",
+];
+
+/// The PIM by-id routes (`require_leader`; a DAV key its own capability), refused to every
+/// [`CAL_DENIED`] credential. Bodies are empty: the gate refuses before any handler.
+const CAL_ROUTES: &[(&str, Route)] = &[
+	("MG-392", Get("/api/calendars/1")),
+	("MG-393", Get("/api/calendars/1/objects")),
+	("MG-394", Get(CAL_EV1)),
+	("MG-395", Call("PUT", CAL_EV1, "")),
+	("MG-396", Call("PATCH", CAL_EV1, "")),
+	("MG-397", Call("DELETE", CAL_EV1, "")),
+	("MG-398", Call("POST", "/api/calendars/1/objects/zqm-ev1/split", "")),
+	("MG-399", Get(CAL_EXCS)),
+	("MG-400", Get(CAL_EXC)),
+	("MG-401", Call("PUT", CAL_EXC, "")),
+	("MG-402", Call("PATCH", CAL_EXC, "")),
+	("MG-403", Call("DELETE", CAL_EXC, "")),
+	("MG-404", Call("POST", "/api/calendars", "")),
+	("MG-405", Call("DELETE", "/api/calendars/1", "")),
+];
+const CAL_DENIED: &[&str] = &[
+	"stranger@alice",
+	"follower@alice",
+	"sharelink-r@alice",
+	"owner-scoped-r@alice",
+	"apkg-publish@alice",
+	"idp-ident@alice",
+	"anon@alice",
+	"apikey-carddav-r@alice",
+];
+const AB_ROUTES: &[(&str, Route)] = &[
+	("MG-406", Get("/api/address-books/1/contacts")),
+	("MG-407", Get(AB_C1)),
+	("MG-408", Call("PUT", AB_C1, "")),
+	("MG-409", Call("PATCH", AB_C1, "")),
+	("MG-410", Call("DELETE", AB_C1, "")),
+	("MG-411", Call("POST", "/api/address-books/1/import", "")),
+	("MG-412", Call("POST", "/api/address-books", "")),
+	("MG-413", Call("DELETE", "/api/address-books/1", "")),
+	("MG-414", Call("POST", "/api/address-books/1/contacts", "")),
+];
+/// [`CAL_DENIED`] less `apikey-carddav-r`, which reads address books (MG-424).
+const AB_DENIED: &[&str] = &[
+	"stranger@alice",
+	"follower@alice",
+	"sharelink-r@alice",
+	"owner-scoped-r@alice",
+	"apkg-publish@alice",
+	"idp-ident@alice",
+	"anon@alice",
+];
 
 /// `(id, route)` rows of a Deny grid.
 type GridRoutes = &'static [(&'static str, Route)];
 
 /// `(routes, denied subjects)`: every cell is a Deny.
 const GRIDS: &[(GridRoutes, &[&str])] = &[
-	(ADMIN_ROUTES, &ADMIN_DENIED),
-	(OWNER_CRED_ROUTES, &OWNER_CRED_DENIED),
+	(ADMIN_ROUTES, ADMIN_DENIED),
+	(OWNER_CRED_ROUTES, OWNER_CRED_DENIED),
 	(CHAN_WRITE_ROUTES, CHAN_WRITE_DENIED),
 	(SETTINGS_READ_ROUTES, SETTINGS_READ_DENIED),
 	(ACCOUNT_ROUTES, ACCOUNT_DENIED),
+	(CAL_ROUTES, CAL_DENIED),
+	(AB_ROUTES, AB_DENIED),
+	(SITE_ROUTES, SITE_DENIED),
+	(LEADER_MISC_ROUTES, LEADER_MISC_DENIED),
+	(SETTINGS_WRITE_ROUTES, SETTINGS_WRITE_DENIED),
+	(SHARE_WRITE_ROUTES, SHARE_WRITE_DENIED),
+	(CHAN_WRITE_ALICE, CHAN_WRITE_ALICE_DENIED),
 ];
 
 /// [`MG`] plus the [`GRIDS`].
@@ -1880,6 +2386,9 @@ pub const CH: &[Row] = &[
 	("CH-118", "m_moderator@club", ROOM_SHARED, FileDelete, "Deny"),
 	// Control: a `W` share still writes there.
 	("CH-119", "g_write@club", ROOM_SHARED, FilePatch, "Allow"),
+	// A deleted or unknown room has no roster to show, even to the tenant.
+	("CH-129", "owner@club", "", ChanMembers("gone"), "Deny"),
+	("CH-130", "owner@club", "", ChanMembers("zqm-nope"), "Deny"),
 ];
 
 const MAIN_ROOT: &str = "parentId=__root__&channel=";
@@ -1943,6 +2452,12 @@ pub const PT: &[Row] = &[
 	("PT-35", "owner@club", "", PartnersSync, "Allow"),
 	// idp-mgmt@alice: LV-91.
 	("PT-37", "sharelink-r@alice", "", PartnersSync, "Deny"),
+	// The account's own unscoped key is the account; a capability key or an `idp_` key is not.
+	("PT-51", "apikey-unscoped@club", "", PartnersMap, "Allow"),
+	("PT-52", "apikey-unscoped@club", "", PartnersSync, "Allow*"),
+	("PT-53", "apikey-dav@alice", "", PartnersMap, "Deny"),
+	("PT-54", "apkg-publish@alice", "", PartnersMap, "Deny"),
+	("PT-55", "idp-ident@alice", "", PartnersMap, "Deny"),
 ];
 
 /// [`PT`] partner rows re-run with club's `connection_visibility.community` = `supporter`:
@@ -2444,15 +2959,8 @@ fn request(s: &Subject, route: Route, tgt: &Tgt) -> Request<Body> {
 			let uri = format!("{uri}{}token={}", if uri.contains('?') { '&' } else { '?' }, tok(s));
 			req(&s.host, Method::GET, &uri, None, Body::empty())
 		}
-		(GetBasic(uri), _) => {
-			use base64::Engine;
-			let mut r = req(&s.host, Method::GET, uri, None, Body::empty());
-			// A `cl_` key goes in as the DAV password; anyone else sends `x:x`.
-			let pair = bearer(s).filter(|t| t.starts_with("cl_")).unwrap_or("x");
-			let b64 = base64::engine::general_purpose::STANDARD.encode(format!("x:{pair}"));
-			let basic = HeaderValue::from_str(&format!("Basic {b64}")).expect("header");
-			r.headers_mut().insert(header::AUTHORIZATION, basic);
-			r
+		(CallBasic(m, uri, body), _) => {
+			basic(s, Method::from_bytes(m.as_bytes()).expect("method"), uri, body)
 		}
 		(WsQuery(kind, access), Tgt::Obj(Obj::File(file))) => {
 			let kind = if kind == WsKind::Crdt { "crdt" } else { "rtdb" };
@@ -2465,6 +2973,23 @@ fn request(s: &Subject, route: Route, tgt: &Tgt) -> Request<Body> {
 		(WsRtdb(None), Tgt::Raw(_)) => raw(Method::GET, &format!("/ws/rtdb/{key}"), Body::empty()),
 		_ => panic!("{route:?} needs a seeded object"),
 	}
+}
+
+/// `{method} {uri}` with `Authorization: Basic …`: a `cl_` key goes in as the DAV password;
+/// anyone else sends `x:x`.
+fn basic(s: &Subject, m: Method, uri: &str, body: &'static str) -> Request<Body> {
+	let body = if body.is_empty() { Body::empty() } else { Body::from(body) };
+	let mut r = req(&s.host, m, uri, None, body);
+	let pair = bearer(s).filter(|t| t.starts_with("cl_")).unwrap_or("x");
+	r.headers_mut().insert(header::AUTHORIZATION, basic_auth(&format!("x:{pair}")));
+	r
+}
+
+/// `Basic base64(pair)`, `pair` being `user:password`.
+pub(crate) fn basic_auth(pair: &str) -> HeaderValue {
+	use base64::Engine;
+	let b64 = base64::engine::general_purpose::STANDARD.encode(pair);
+	HeaderValue::from_str(&format!("Basic {b64}")).expect("header")
 }
 
 /// A list query with `{obj}` (the object's key), `{parent}` and `{root}` (its parent's and

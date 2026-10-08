@@ -174,10 +174,11 @@ pub enum FieldType {
 /// - `subscribable` - Enables SUBS-based permissions and visibility
 /// - `deliver_to_subject_owner` - Dual delivery to subject owner
 /// - `default_flags` - Applied during action creation
+/// - `local_only` - Never delivered (`schedule_delivery`), and refused inbound
+/// - `server_emitted` - Emitted only by the server; `POST /api/actions` refuses it
 ///
 /// ## Reserved (Not Implemented)
 /// - `requires_acceptance` - RESERVED: Would set initial status to CONFIRMATION
-/// - `local_only` - RESERVED: Would skip federation in schedule_delivery
 /// - `ttl` - RESERVED: Time-to-live for action expiration
 /// - `sync` - RESERVED: Synchronous processing mode
 /// - `federated` - RESERVED: Cross-instance federation control
@@ -247,13 +248,16 @@ pub struct BehaviorFlags {
 	/// Unset refuses a hatted action, at creation and inbound (`process.rs`, step 3c).
 	pub allow_hat: Option<bool>,
 
+	/// Emitted only by the server (hooks, dedicated endpoints); `POST /api/actions` refuses it.
+	pub server_emitted: Option<bool>,
+
 	// === Reserved (Not Implemented) ===
 	/// RESERVED: Requires user confirmation before activation.
 	/// When implemented, would set initial status to CONFIRMATION.
 	pub requires_acceptance: Option<bool>,
 
-	/// RESERVED: Never federate this action type.
-	/// When implemented, would skip federation in schedule_delivery.
+	/// Never federate this action type: `schedule_delivery` skips it, and the inbound path
+	/// refuses it (`process.rs`).
 	pub local_only: Option<bool>,
 
 	/// RESERVED: Time to live in seconds.

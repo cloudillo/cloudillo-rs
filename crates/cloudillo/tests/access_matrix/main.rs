@@ -206,10 +206,17 @@ async fn management() {
 		let (status, body) = call(&fx.api, r).await;
 		assert!(status.is_success(), "seed zqm/held on {host}: {status} {body}");
 	}
-	let x = r#"{"x":{"zqmconn":"zqm","zqmconn.vis":"connected"}}"#;
-	let r = req(ALICE, Method::PATCH, "/api/me", bearer(owner(ALICE)), Body::from(x));
-	let (status, body) = call(&fx.api, r).await;
-	assert!(status.is_success(), "seed alice's x: {status} {body}");
+	let alice_x = concat!(
+		r#"{"x":{"zqmconn":"zqm","zqmconn.vis":"connected","#,
+		r#""zqmfollow":"zqm","zqmfollow.vis":"follower","#,
+		r#""zqmbad":"zqm","zqmbad.vis":"zqm-unknown"}}"#,
+	);
+	let club_x = r#"{"x":{"zqmrole":"zqm","zqmrole.vis":"supporter"}}"#;
+	for (host, x) in [(ALICE, alice_x), (CLUB, club_x)] {
+		let r = req(host, Method::PATCH, "/api/me", bearer(owner(host)), Body::from(x));
+		let (status, body) = call(&fx.api, r).await;
+		assert!(status.is_success(), "seed {host}'s x: {status} {body}");
+	}
 	let welcome = cloudillo::meta_adapter::CreateRefOptions {
 		typ: cloudillo::meta_adapter::WELCOME_REF_TYPE.into(),
 		description: None,
@@ -742,18 +749,7 @@ async fn channel_patch() {
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
 	let owner = fx.subject("owner@club");
-	let parent = fx
-		.objs
-		.iter()
-		.find_map(|o| match o {
-			fixture::Obj::Action(a)
-				if a.spec.name == "post-p-tenant-active" && a.spec.tn == CLUB =>
-			{
-				Some(a.action_id.clone())
-			}
-			_ => None,
-		})
-		.expect("post-p-tenant-active@club");
+	let parent = inbound_flows::obj_id(fx, CLUB, "post-p-tenant-active");
 	let send = |m: Method, uri: String, v: serde_json::Value| {
 		call(&fx.api, req(CLUB, m, &uri, bearer(owner), Body::from(v.to_string())))
 	};
@@ -794,18 +790,7 @@ async fn channel_patch() {
 	assert_eq!(channel(root).await, None, "null clears the room");
 
 	// A reply inherits its thread's room; `null` must not clear it either.
-	let room_root = fx
-		.objs
-		.iter()
-		.find_map(|o| match o {
-			fixture::Obj::Action(a)
-				if a.spec.name == "cur-chan-open-contrib-post" && a.spec.tn == CLUB =>
-			{
-				Some(a.action_id.clone())
-			}
-			_ => None,
-		})
-		.expect("cur-chan-open-contrib-post@club");
+	let room_root = inbound_flows::obj_id(fx, CLUB, "cur-chan-open-contrib-post");
 	let reply = draft(serde_json::json!({ "parentId": room_root })).await;
 	let inherited = channel(reply.clone()).await;
 	assert_eq!(inherited.as_deref(), Some("@club.test~open-contrib"), "reply inherits the room");
@@ -858,18 +843,7 @@ async fn owner_scoped_hidden() {
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
 	let alice = fx.tenants.alice.tn_id;
-	let file = fx
-		.objs
-		.iter()
-		.find_map(|o| match o {
-			fixture::Obj::File(f)
-				if f.spec.name == "docchild-crdt-d-active" && f.tn_id == alice =>
-			{
-				Some(f.file_id.clone())
-			}
-			_ => None,
-		})
-		.expect("docchild-crdt-d-active@alice");
+	let file = alice_file(fx, "docchild-crdt-d-active").file_id.clone();
 	let set_hidden = |hidden: bool| {
 		let opts = UpdateFileOptions { hidden: Patch::Value(hidden), ..Default::default() };
 		let file = file.clone();
@@ -1025,21 +999,8 @@ async fn attachment_audience() {
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
 	let alice = fx.tenants.alice.tn_id;
-	let file = |vis: char| {
-		fx.objs
-			.iter()
-			.find_map(|o| match o {
-				fixture::Obj::File(f)
-					if f.tn_id == alice
-						&& f.spec.name
-							== format!("tenant-blob-{}-active", vis.to_ascii_lowercase()) =>
-				{
-					Some(f)
-				}
-				_ => None,
-			})
-			.expect("tenant blob")
-	};
+	let file =
+		|vis: char| alice_file(fx, &format!("tenant-blob-{}-active", vis.to_ascii_lowercase()));
 	let (f_file, d_file) = (file('F'), file('D'));
 	let id_tag = |name: &str| {
 		let s = fx.subject(name);
@@ -1163,6 +1124,19 @@ async fn attachment_audience() {
 	}
 	fx.app.meta_adapter.delete_managed_entries(alice, a2).await.unwrap();
 
+	// FC-164: a mirror's access is its upstream's; naming an action that attaches it grants
+	// nothing (`action_attachment_level`). Metadata is the probe: a reference has no bytes.
+	let mirror = alice_file(fx, "mirroredplacer-blob-d-active");
+	let a4 = "a1~zqm-attach-A4";
+	let attachments = [mirror.file_id.as_str()];
+	let mut a = row(a4, "POST", ALICE);
+	a.audience_tag = Some(direct.as_str());
+	a.attachments = Some(attachments.to_vec());
+	seed_row(fx, alice, &a, None).await;
+	let path = format!("/api/files/{}/metadata?action={a4}", mirror.file_id);
+	let act = probe("FC-164", "direct@alice.test", path.clone()).await;
+	check("FC-164", "direct@alice.test", &path, "Deny", act);
+
 	// A deleted action grants nothing.
 	let opts = UpdateActionDataOptions { status: Patch::Value('D'), ..Default::default() };
 	fx.app
@@ -1186,16 +1160,7 @@ async fn share_lifecycle() {
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
 	let alice = fx.tenants.alice.tn_id;
-	let file = fx
-		.objs
-		.iter()
-		.find_map(|o| match o {
-			fixture::Obj::File(f) if f.spec.name == "tenant-blob-d-active" && f.tn_id == alice => {
-				Some(f.file_id.clone())
-			}
-			_ => None,
-		})
-		.expect("tenant-blob-d-active@alice");
+	let file = alice_file(fx, "tenant-blob-d-active").file_id.clone();
 	let subj = |n: &str| fx.subject(n);
 	let (owner, stranger) = (subj("owner@alice"), subj("stranger@alice.test"));
 	let stranger_tag = stranger.facts.id_tag.clone().expect("stranger id_tag");
@@ -4064,7 +4029,6 @@ async fn attachment_name_never_comes_from_a_sibling() {
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
 	let club = fx.tenants.club.tn_id;
-	let member = fx.subject("m-contributor@club.test");
 	let key = "sibling-name";
 	let content = format!("f1~zqm-{key}");
 	seed_blob(fx, club, key, "zqm-secret-name", None, Some("@club.test~mods"), None).await;
@@ -4086,8 +4050,7 @@ async fn attachment_name_never_comes_from_a_sibling() {
 	let v = serde_json::json!({
 		"type": "POST", "content": "zqm sibling", "draft": true, "attachments": [content]
 	});
-	let r = req(CLUB, Method::POST, "/api/actions", bearer(member), Body::from(v.to_string()));
-	let (st, body) = call(&fx.api, r).await;
+	let (st, body) = post_action_as(fx, "m-contributor@club.test", &v).await;
 	assert!(!body.to_string().contains("zqm-secret-name"), "sibling name leaked: {st} {body}");
 	if st.is_success() {
 		assert!(body.to_string().contains(&content), "the content id is stored: {body}");
@@ -4451,23 +4414,7 @@ async fn outbound_hooks() {
 	let fx = setup().await;
 	let (alice, club) = (fx.tenants.alice.tn_id, fx.tenants.club.tn_id);
 	let meta = &fx.app.meta_adapter;
-	let subj = |n: &str| fx.subject(n);
-	let post = |n: &'static str, host: &'static str, v: serde_json::Value| async move {
-		let r = req(host, Method::POST, "/api/actions", bearer(subj(n)), Body::from(v.to_string()));
-		call(&fx.api, r).await
-	};
-	let conv = fx
-		.objs
-		.iter()
-		.find_map(|o| match o {
-			fixture::Obj::Action(a)
-				if a.spec.tn == CLUB && a.spec.name == "container-p-tenant-active" =>
-			{
-				Some(a.action_id.clone())
-			}
-			_ => None,
-		})
-		.expect("club CONV");
+	let conv = inbound_flows::obj_id(fx, CLUB, "container-p-tenant-active");
 	// m_moderator holds a moderator SUBS on it.
 	let mod_tag = "m-moderator.test";
 	let subs_id = "a1~zqm-ob-subs-mod";
@@ -4488,9 +4435,9 @@ async fn outbound_hooks() {
 			"type": "INVT", "subject": conv, "audienceTag": aud, "content": { "role": "member" },
 		})
 	};
-	let (st, body) = post("m-contributor@club.test", CLUB, invt("m-supporter.test")).await;
+	let (st, body) = post_action_as(fx, "m-contributor@club.test", &invt("m-supporter.test")).await;
 	assert_eq!(st, StatusCode::FORBIDDEN, "a contributor invites to the CONV: {body}");
-	let (st, body) = post("m-moderator@club.test", CLUB, invt("m-follower.test")).await;
+	let (st, body) = post_action_as(fx, "m-moderator@club.test", &invt("m-follower.test")).await;
 	assert!(st.is_success(), "a moderator subscriber invites: {st} {body}");
 	let a_id = find_str(&body, "actionId").expect("actionId");
 	finalize(fx, club, &a_id).await;
@@ -4499,7 +4446,7 @@ async fn outbound_hooks() {
 
 	let v =
 		serde_json::json!({ "type": "CONV", "content": { "name": format!("{} ob", ops::MARK) } });
-	let (st, body) = post("owner@alice", ALICE, v).await;
+	let (st, body) = post_action_as(fx, "owner@alice", &v).await;
 	assert!(st.is_success(), "owner creates a CONV: {st} {body}");
 	let a_id = find_str(&body, "actionId").expect("actionId");
 	finalize(fx, alice, &a_id).await;
@@ -4507,4 +4454,425 @@ async fn outbound_hooks() {
 	let key = format!("SUBS:{}:{ALICE}", row.action_id);
 	let creator = meta.get_action_by_key(alice, &key).await.unwrap();
 	assert!(creator.is_some(), "the CONV's creator SUBS ({key}) is missing");
+}
+
+/// `POST /api/actions` as the subject `name`, on its host.
+async fn post_action_as(
+	fx: &Fixture,
+	name: &str,
+	body: &serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+	let s = fx.subject(name);
+	let r = req(&s.host, Method::POST, "/api/actions", bearer(s), Body::from(body.to_string()));
+	call(&fx.api, r).await
+}
+
+/// `requires_subscription` (MSG): a message under a remote CONV needs the tenant's own SUBS on
+/// it (AC-89 refused before, AC-90 admitted after; `task.rs` outbound `requires_subscription`).
+#[tokio::test]
+async fn outbound_requires_subscription() {
+	use cloudillo::meta_adapter::Action;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let conv = "a1~zqm-rs-conv";
+	let c = Action { audience_tag: Some(ALICE), ..row(conv, "CONV", "connected.test") };
+	seed_row(fx, alice, &c, None).await;
+	let msg = serde_json::json!({ "type": "MSG", "content": "zqm", "parentId": conv });
+	let (st, b) = post_action_as(fx, "owner@alice", &msg).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "AC-89: a MSG with no subscription: {b}");
+	let subs = Action {
+		subject: Some(conv),
+		audience_tag: Some("connected.test"),
+		..row("a1~zqm-rs-subs", "SUBS", ALICE)
+	};
+	seed_row(fx, alice, &subs, Some(&format!("SUBS:{conv}:{ALICE}"))).await;
+	let (st, b) = post_action_as(fx, "owner@alice", &msg).await;
+	assert!(st.is_success(), "AC-90: a MSG under a subscribed CONV: {st} {b}");
+}
+
+/// Capability flags: a lowercase `c` disables comments on the parent, `r` reactions on the
+/// subject (`helpers::is_capability_enabled`); a flag-free post takes both (AC-91..94).
+#[tokio::test]
+async fn outbound_flag_gates() {
+	use cloudillo::meta_adapter::Action;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let (no_c, no_r, free) = ("a1~zqm-fg-c", "a1~zqm-fg-r", "a1~zqm-fg-free");
+	for (id, flags) in [(no_c, Some("c")), (no_r, Some("r")), (free, None)] {
+		seed_row(fx, alice, &Action { flags, ..row(id, "POST", "connected.test") }, None).await;
+	}
+	let cmnt = |p: &str| serde_json::json!({ "type": "CMNT", "content": "zqm", "parentId": p });
+	let react = |s: &str| serde_json::json!({ "type": "REACT:LIKE", "subject": s });
+	for (id, body, allowed) in [
+		("AC-91", cmnt(no_c), false),
+		("AC-92", react(no_r), false),
+		("AC-93", cmnt(free), true),
+		("AC-94", react(free), true),
+	] {
+		let (st, b) = post_action_as(fx, "owner@alice", &body).await;
+		if allowed {
+			assert!(st.is_success(), "{id} {body}: {st} {b}");
+		} else {
+			assert_eq!(st, StatusCode::BAD_REQUEST, "{id} {body}: {b}");
+		}
+	}
+}
+
+/// A community invitation is revoked by a moderator or by its original inviter, even one
+/// since demoted (`invt.rs` `community_revoke_allowed`): the inviter on record is the INVT's
+/// issuer, so the seeded row is one `m-contributor.test` issued. Another contributor (`hatted`,
+/// mapped to contributor) may not (AC-108, 109).
+#[tokio::test]
+async fn invt_del_by_original_inviter() {
+	use cloudillo::meta_adapter::Action;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+	let invitee = "zqm-invitee-del.test";
+	let mut f = prof(ProfileType::Person);
+	f.following = Patch::Value(true);
+	f.connected = Patch::Value(ProfileConnectionStatus::Connected);
+	fx.app.meta_adapter.upsert_profile(club, invitee, &f).await.unwrap();
+	let subject = format!("@{CLUB}");
+	let invt = Action {
+		subject: Some(subject.as_str()),
+		audience_tag: Some(invitee),
+		..row("a1~zqm-invt-del", "INVT", "m-contributor.test")
+	};
+	seed_row(fx, club, &invt, None).await;
+	let del = serde_json::json!({ "type": "INVT:DEL", "subject": subject, "audienceTag": invitee });
+	let (st, b) = post_action_as(fx, "hatted@club", &del).await;
+	assert_eq!(ops::status_class(st), Actual::Deny, "AC-108: a non-inviter revokes: {st} {b}");
+	let (st, b) = post_action_as(fx, "m-contributor@club.test", &del).await;
+	assert!(st.is_success(), "AC-109: the original inviter revokes: {st} {b}");
+}
+
+/// AC-121: a draft's subtype is fixed at creation. `post_action` gates on it and neither publish
+/// path re-checks, so a PATCH must not swap it. Only the draft's issuer edits it, and a draft is
+/// issued as the tenant, so the tenant account is the one caller that reaches the check; a
+/// member's PATCH of a draft it posted on the community is refused before it.
+#[tokio::test]
+async fn draft_subtype_is_frozen() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+	let target = "zqm-freeze-target.test";
+	let mut f = prof(ProfileType::Person);
+	f.following = Patch::Value(true);
+	f.connected = Patch::Value(ProfileConnectionStatus::Connected);
+	f.roles = Patch::Value(Some(vec!["contributor".into()]));
+	fx.app.meta_adapter.upsert_profile(club, target, &f).await.unwrap();
+	let draft = |n: &'static str, mut body: serde_json::Value| async move {
+		body["draft"] = serde_json::json!(true);
+		let (st, b) = post_action_as(fx, n, &body).await;
+		assert!(st.is_success(), "{n} drafts {body}: {st} {b}");
+		find_str(&b, "actionId").expect("draft actionId")
+	};
+	let send = |n: &str, m: Method, uri: String, v: serde_json::Value| {
+		call(&fx.api, req(CLUB, m, &uri, bearer(fx.subject(n)), Body::from(v.to_string())))
+	};
+	let conn_del = serde_json::json!({ "type": "CONN:DEL", "audienceTag": target });
+
+	let n = "m-moderator@club.test";
+	let id = draft(n, conn_del.clone()).await;
+	let patch = serde_json::json!({ "subType": "UPD" });
+	let (st, b) = send(n, Method::PATCH, format!("/api/actions/{id}"), patch).await;
+	assert!(st.is_client_error(), "{n} PATCHes the draft it posted: {st} {b}");
+
+	let subject = format!("@{CLUB}");
+	let invt_del =
+		serde_json::json!({ "type": "INVT:DEL", "subject": subject, "audienceTag": target });
+	let n = "owner@club";
+	for (body, to) in [(conn_del, "UPD"), (invt_del, "")] {
+		let id = draft(n, body).await;
+		let sub_typ = || async {
+			let a = fx.app.meta_adapter.get_action(club, &id).await.unwrap().expect("draft");
+			// The subtype may be stored embedded in `type`.
+			let typ = a.typ.split_once(':').map(|(_, sub)| sub.to_owned());
+			a.sub_typ.map(String::from).or(typ)
+		};
+		let uri = format!("/api/actions/{id}");
+		let (st, b) =
+			send(n, Method::PATCH, uri.clone(), serde_json::json!({ "subType": to })).await;
+		assert_eq!(st, StatusCode::BAD_REQUEST, "{n} re-subtypes its draft to {to:?}: {b}");
+		assert_eq!(sub_typ().await.as_deref(), Some("DEL"), "the subtype changed to {to:?}");
+		// The same value stays a no-op.
+		let (st, b) = send(n, Method::PATCH, uri, serde_json::json!({ "subType": "DEL" })).await;
+		assert!(st.is_success(), "{n} re-sends its own subtype: {st} {b}");
+		let v = serde_json::json!({ "publishAt": cloudillo::types::Timestamp::now().0 + 86400 });
+		let (st, b) = send(n, Method::POST, format!("/api/actions/{id}/publish"), v).await;
+		assert!(st.is_success(), "{n} publishes its draft: {st} {b}");
+		assert_eq!(sub_typ().await.as_deref(), Some("DEL"), "published a new subtype");
+	}
+}
+
+/// The listed level of `file_id` on alice for `s` (`GET /api/files?fileId=`): `None` = unlisted.
+async fn listed_level(fx: &Fixture, s: &subjects::Subject, file_id: &str) -> Option<String> {
+	let uri = format!("/api/files?fileId={file_id}");
+	let (st, b) = call(&fx.api, req(&s.host, Method::GET, &uri, bearer(s), Body::empty())).await;
+	assert!(st.is_success(), "list {uri}: {st} {b}");
+	b["data"]
+		.as_array()?
+		.iter()
+		.find(|r| r["fileId"] == file_id)
+		.map(|r| r["accessLevel"].as_str().unwrap_or("none").to_owned())
+}
+
+/// A mirrored document's list badge follows the live FSHR grant: accepted at WRITE it lists at
+/// Write (FC-144); once the upstream sends `FSHR:DEL` the grant is gone (FC-145: the tenant still
+/// reads its own record's metadata, at no level — `file_access::admitted` keeps a `None` entry for
+/// record ownership) and the cached badge no longer claims Write (FC-146, `fshr.rs` `on_receive`
+/// clears it). A forged `FSHR:DEL` from a peer that is not the upstream leaves it (FC-165).
+#[tokio::test]
+async fn mirror_badge_follows_the_live_grant() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let owner = fx.subject("owner@alice");
+	let up = connected_remote(fx, "zqm-fshr-badge").await;
+	let shared = "f1~zqm-fshr-badge";
+	let mut t = fshr_token(&up, "WRITE", shared);
+	t.c = Some(serde_json::json!({
+		"contentType": "cloudillo/quillo", "fileName": "zqm-fshr-badge", "fileTp": "CRDT"
+	}));
+	let (st, action_id) = inbox_sync(fx, &up, &t).await;
+	assert!(st.is_success(), "FSHR delivery: {st}");
+	let uri = format!("/api/actions/{action_id}/accept");
+	let (st, b) = call(&fx.api, req(ALICE, Method::POST, &uri, bearer(owner), Body::empty())).await;
+	assert!(st.is_success(), "accept: {st} {b}");
+	let before = listed_level(fx, owner, shared).await;
+	let write = |l: &Option<String>| {
+		l.as_deref().and_then(cloudillo::types::AccessLevel::from_str_name)
+			== Some(cloudillo::types::AccessLevel::Write)
+	};
+	assert!(write(&before), "FC-144: listed at {before:?}");
+
+	// FC-165: a connected peer that is not the upstream revokes nothing.
+	let forger = connected_remote(fx, "zqm-fshr-badge-forger").await;
+	let mut del = fshr_token(&forger, "DEL", shared);
+	del.c = None;
+	let (st, _) = inbox_sync(fx, &forger, &del).await;
+	let kept = listed_level(fx, owner, shared).await;
+	assert!(write(&kept), "FC-165: a forged FSHR:DEL ({st}) moved the badge to {kept:?}");
+
+	let mut del = fshr_token(&up, "DEL", shared);
+	del.c = None;
+	let (st, _) = inbox_sync(fx, &up, &del).await;
+	assert!(st.is_success(), "FSHR:DEL delivery: {st}");
+	let uri = format!("/api/files/{shared}/metadata");
+	let (st, b) = call(&fx.api, req(ALICE, Method::GET, &uri, bearer(owner), Body::empty())).await;
+	let level = b["data"]["accessLevel"].as_str();
+	assert!(st.is_success() && level.is_none(), "FC-145: metadata after FSHR:DEL: {st} {b}");
+	// The live grant is gone, so the row lists at no level rather than the cached Write.
+	let after = listed_level(fx, owner, shared).await;
+	assert_eq!(after.as_deref(), Some("none"), "FC-146: listed at {after:?} after FSHR:DEL");
+}
+
+/// Create a file on alice as its owner (`POST /api/files`): its `entryId`.
+async fn owner_creates(fx: &Fixture, tp: &str, name: &str, parent: Option<&str>) -> String {
+	let v = serde_json::json!({
+		"fileTp": tp, "contentType": "cloudillo/quillo", "fileName": name, "parentId": parent,
+	});
+	let owner = fx.subject("owner@alice");
+	let r = req(ALICE, Method::POST, "/api/files", bearer(owner), Body::from(v.to_string()));
+	let (st, body) = call(&fx.api, r).await;
+	assert!(st.is_success(), "create {name}: {st} {body}");
+	find_str(&body, "entryId").expect("entryId")
+}
+
+/// A folder link on a folder nested under another: a `fileId` batch keeps only the subtree's
+/// ids (FC-149, 150), breadcrumbs stop at the share root (FC-151), the share root's own parent
+/// stays unnamed (FC-152), and a grandchild reads at the link's level (FC-153).
+#[tokio::test]
+async fn folder_scope_listing_edges() {
+	use cloudillo::types::AccessLevel;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let outer = owner_creates(fx, "FLDR", "zqm-fs-outer", None).await;
+	let shared = owner_creates(fx, "FLDR", "zqm-fs-shared", Some(&outer)).await;
+	let child = owner_creates(fx, "CRDT", "zqm-fs-child", Some(&shared)).await;
+	let sub = owner_creates(fx, "FLDR", "zqm-fs-sub", Some(&shared)).await;
+	let grand = owner_creates(fx, "CRDT", "zqm-fs-grand", Some(&sub)).await;
+	let outside = owner_creates(fx, "CRDT", "zqm-fs-outside", Some(&outer)).await;
+	let tok = link_token(fx, alice, ALICE, "zqref-alice-fs", &shared, 'R').await;
+	let get = |uri: String| {
+		let tok = tok.clone();
+		async move { call(&fx.api, req(ALICE, Method::GET, &uri, Some(&tok), Body::empty())).await }
+	};
+	let rows = |b: &serde_json::Value| b["data"].as_array().cloned().unwrap_or_default();
+	let entries = |b: &serde_json::Value| -> Vec<String> {
+		rows(b)
+			.iter()
+			.filter_map(|r| r["entryId"].as_str().map(str::to_owned))
+			.collect()
+	};
+
+	let (st, b) = get(format!("/api/files?fileId={child},{outside}")).await;
+	assert!(st.is_success(), "FC-149: {st} {b}");
+	assert_eq!(entries(&b), vec![child.clone()], "FC-149: a mixed batch keeps the subtree only");
+	let (st, b) = get(format!("/api/files?fileId={outside}")).await;
+	assert!(st.is_success() && entries(&b).is_empty(), "FC-150: {st} {b}");
+	let (_, b) = get(format!("/api/files?fileId={child}&withPath=true")).await;
+	let path = rows(&b).first().map(|r| r["path"].clone()).unwrap_or_default();
+	let ids: Vec<&str> = path
+		.as_array()
+		.map(|a| a.iter().filter_map(|s| s["id"].as_str()).collect())
+		.unwrap_or_default();
+	assert_eq!(ids, vec![shared.as_str()], "FC-151: breadcrumbs past the share root: {b}");
+	let (_, b) = get(format!("/api/files?fileId={shared}&withParent=true")).await;
+	let row = rows(&b).first().cloned().unwrap_or_default();
+	assert_eq!(row["entryId"], shared.as_str(), "FC-152: the share root is listed: {b}");
+	assert!(row["parentName"].is_null(), "FC-152: the share root's parent is named: {b}");
+	let (st, b) = get(format!("/api/files/{grand}/metadata")).await;
+	let level = b["data"]["accessLevel"].as_str().and_then(AccessLevel::from_str_name);
+	assert!(st.is_success() && level == Some(AccessLevel::Read), "FC-153: {st} {b}");
+}
+
+/// A `W` folder link writes inside its folder: uploads into it and its subfolders, moves within
+/// it (FC-155, 156, 159); never at the drive root, out of the tree, or through an `R` link
+/// (FC-157, 160, 158). `file_access.rs` scope parent checks, `create_perm.rs`,
+/// `management.rs` move target.
+#[tokio::test]
+async fn folder_link_writes() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let folder = owner_creates(fx, "FLDR", "zqm-fw-folder", None).await;
+	let sub = owner_creates(fx, "FLDR", "zqm-fw-sub", Some(&folder)).await;
+	let child = owner_creates(fx, "CRDT", "zqm-fw-child", Some(&folder)).await;
+	let w = link_token(fx, alice, ALICE, "zqref-alice-fw-w", &folder, 'W').await;
+	let r = link_token(fx, alice, ALICE, "zqref-alice-fw-r", &folder, 'R').await;
+	let send = |tok: &str, m: Method, uri: String, body: String| {
+		let r = req(ALICE, m, &uri, Some(tok), Body::from(body));
+		async move { call(&fx.api, r).await }
+	};
+	let upload = |parent: Option<&str>| match parent {
+		Some(p) => format!("/api/files/file/zqm-fw.txt?parentId={p}"),
+		None => "/api/files/file/zqm-fw.txt".to_owned(),
+	};
+	for (id, tok, parent, allowed) in [
+		("FC-155", &w, Some(folder.as_str()), true),
+		("FC-156", &w, Some(sub.as_str()), true),
+		("FC-157", &w, None, false),
+		("FC-158", &r, Some(folder.as_str()), false),
+	] {
+		let (st, b) = send(tok, Method::POST, upload(parent), "zqm".into()).await;
+		if allowed {
+			assert!(st.is_success(), "{id}: upload: {st} {b}");
+		} else {
+			assert_eq!(ops::status_class(st), Actual::Deny, "{id}: upload: {st} {b}");
+		}
+	}
+	let mv = |to: &str| serde_json::json!({ "parentId": to }).to_string();
+	let uri = format!("/api/files/{child}");
+	let (st, b) = send(&w, Method::PATCH, uri.clone(), mv("__root__")).await;
+	assert_eq!(ops::status_class(st), Actual::Deny, "FC-160: moved out of the tree: {st} {b}");
+	let (st, b) = send(&w, Method::PATCH, uri, mv(&sub)).await;
+	assert!(st.is_success(), "FC-159: a move within the tree: {st} {b}");
+}
+
+/// A Subscribed INVT whose `subject` is a container reads by that container's active
+/// subscribers (`action/filter.rs` `subscriber_container`): an active SUBS lists it (LV-200); a
+/// stranger, a pending (`C`) SUBS and a `SUBS:DEL` do not (LV-201..203).
+#[tokio::test]
+async fn subject_bridge_and_subscriber_status() {
+	use cloudillo::meta_adapter::{Action, UpdateActionDataOptions};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let conv = "a1~zqm-sb-conv";
+	seed_row(fx, alice, &Action { visibility: Some('S'), ..row(conv, "CONV", ALICE) }, None).await;
+	let invt = "a1~zqm-sb-invt";
+	let i = Action {
+		subject: Some(conv),
+		audience_tag: Some("zqm-sb-invitee.test"),
+		visibility: Some('S'),
+		..row(invt, "INVT", ALICE)
+	};
+	seed_row(fx, alice, &i, None).await;
+	for (holder, sub_typ, status) in [
+		("subscriber.test", None, 'A'),
+		("direct.test", None, 'C'),
+		("follower.test", Some("DEL"), 'A'),
+	] {
+		let id = format!("a1~zqm-sb-subs-{holder}");
+		let s = Action {
+			sub_typ,
+			subject: Some(conv),
+			audience_tag: Some(ALICE),
+			x: Some(serde_json::json!({ "role": "member" })),
+			..row(&id, "SUBS", holder)
+		};
+		meta.create_action(alice, &s, Some(&format!("SUBS:{conv}:{holder}")))
+			.await
+			.unwrap();
+		let opts = UpdateActionDataOptions { status: Patch::Value(status), ..Default::default() };
+		meta.update_action_data(alice, &id, &opts).await.unwrap();
+	}
+	for (id, who, want) in [
+		("LV-200", "subscriber@alice.test", true),
+		("LV-201", "stranger@alice.test", false),
+		("LV-202", "direct@alice.test", false),
+		("LV-203", "follower@alice.test", false),
+	] {
+		let s = fx.subject(who);
+		let rows = ops::list_paged(fx, s, &format!("/api/actions?actionId={invt}&"), "actionId")
+			.await
+			.unwrap_or_default();
+		assert_eq!(rows.contains_key(invt), want, "{id}: {who} lists the INVT");
+	}
+}
+
+/// A Pin's publication columns are its placer's (`management.rs` `may_publish`): the placing
+/// member republishes it (FC-161), another member does not (FC-162), and an FSHR-accepted row
+/// (no placer) is nobody's to republish, the tenant's included (FC-163).
+#[tokio::test]
+async fn pin_placer_publishes() {
+	use cloudillo::meta_adapter::{CreateFile, FileStatus};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let (alice, club) = (fx.tenants.alice.tn_id, fx.tenants.club.tn_id);
+	let pin = seed_reference(fx, club, "f1~zqm-pin-pub", "BLOB", "m-contributor@club.test").await;
+	let patch = |who: &str, host: &str, entry: &str| {
+		let s = fx.subject(who);
+		let body = Body::from(r#"{"visibility":"P"}"#);
+		let r = req(host, Method::PATCH, &format!("/api/files/{entry}"), bearer(s), body);
+		async move { call(&fx.api, r).await }
+	};
+	let (st, b) = patch("m-moderator@club.test", CLUB, &pin).await;
+	assert_eq!(
+		ops::status_class(st),
+		Actual::Deny,
+		"FC-162: another member republishes the Pin: {st} {b}"
+	);
+	let (st, b) = patch("m-contributor@club.test", CLUB, &pin).await;
+	assert!(st.is_success(), "FC-161: the placer republishes its Pin: {st} {b}");
+	let fshr = fx
+		.app
+		.meta_adapter
+		.create_file(
+			alice,
+			CreateFile {
+				file_id: Some("f1~zqm-pin-fshr".into()),
+				upstream_tag: Some("connected.test".into()),
+				content_type: "text/plain".into(),
+				file_name: "zqm-pin-fshr".into(),
+				file_tp: Some("BLOB".into()),
+				visibility: Some('C'),
+				status: Some(FileStatus::Active),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap()
+		.entry_id;
+	let (st, b) = patch("owner@alice", ALICE, &fshr).await;
+	assert_eq!(
+		ops::status_class(st),
+		Actual::Deny,
+		"FC-163: the tenant republishes an FSHR row: {st} {b}"
+	);
 }

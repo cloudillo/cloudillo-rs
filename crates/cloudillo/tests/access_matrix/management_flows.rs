@@ -58,6 +58,8 @@ async fn admin_profile_roles() {
 		("stranger@club.test", uri.as_str(), supporter),
 		("hatted@club", uri.as_str(), supporter),
 		("idp-mgmt@club", uri.as_str(), supporter),
+		("anon@club.test", uri.as_str(), supporter),
+		("hatted-scoped@club", uri.as_str(), supporter),
 	];
 	for (n, u, body) in denied {
 		let (st, b) = send(fx, fx.subject(n), Method::PATCH, u, body).await;
@@ -77,9 +79,9 @@ async fn admin_profile_roles() {
 }
 
 /// `CONN:DEL` on a community member: moderator+ and strictly above the member (a leader also
-/// removes a peer leader); a CONN addressed to the community itself is refused. The
-/// subtype rides in `type` or in `subType`; each form gets fresh targets, as an allowed removal
-/// consumes its target.
+/// removes a peer leader, a moderator no peer moderator); a CONN addressed to the community
+/// itself is refused. The subtype rides in `type` or in `subType`; each form gets fresh targets,
+/// as an allowed removal consumes its target.
 #[tokio::test]
 async fn member_removal_hierarchy() {
 	let _g = FIXTURE_LOCK.write().await;
@@ -89,6 +91,7 @@ async fn member_removal_hierarchy() {
 		for (t, role) in [
 			("supporter", "supporter"),
 			("contributor", "contributor"),
+			("moderator", "moderator"),
 			("leader", "leader"),
 			("leader2", "leader"),
 		] {
@@ -107,6 +110,8 @@ async fn member_removal_hierarchy() {
 			("m-contributor@club.test", tag("supporter"), false),
 			("m-moderator@club.test", tag("leader"), false),
 			("m-moderator@club.test", tag("contributor"), true),
+			// AC-102: a peer moderator is not strictly below.
+			("m-moderator@club.test", tag("moderator"), false),
 			("m-leader@club.test", tag("leader2"), true),
 			("m-contributor@club.test", CLUB.to_owned(), false),
 		];
@@ -176,7 +181,8 @@ async fn idp_management() {
 	let mut fails = Vec::new();
 	for n in [
 		"stranger@alice.test",
-		"m-leader@club.test",
+		"follower@alice.test",
+		"connected@alice.test",
 		"sharelink-r@alice",
 		"sharelink-w@alice",
 		"idp-key@alice",
@@ -254,12 +260,51 @@ async fn idp_management() {
 			String::new(),
 		),
 	];
-	for n in ["stranger@alice.test", "sharelink-r@alice", "m-leader@club.test"] {
+	for n in [
+		"stranger@alice.test",
+		"sharelink-r@alice",
+		"follower@alice.test",
+		"connected@alice.test",
+	] {
 		for (m, u, body) in &writes {
 			let (st, b) = send(fx, fx.subject(n), m.clone(), u, body).await;
 			if status_class(st) != Actual::Deny {
 				fails.push(format!("{n} {m} {u}: {st} {b}"));
 			}
+		}
+	}
+	// The identity's own key reaches its identity's writes (the stub answers 503 past the
+	// gate) and its own API keys; never another identity's.
+	let ident = crate::fixture::IDP_IDENT;
+	let other_tag = crate::fixture::IDP_OTHER;
+	let own_key = format!("/api/idp/api-keys/1?idTag={ident}");
+	let other_key = format!("/api/idp/api-keys/1?idTag={other_tag}");
+	let own_key_body = format!(r#"{{"idTag":"{ident}"}}"#);
+	let addr = r#"{"address":"192.0.2.1"}"#;
+	let cells = [
+		("idp-ident@alice", Method::PATCH, mine.clone(), "{}", "Allow*"),
+		("idp-ident@alice", Method::PUT, format!("{mine}/address"), addr, "Allow*"),
+		("idp-ident@alice", Method::GET, format!("{other}/status"), "", "Deny"),
+		("idp-ident@alice", Method::POST, format!("{other}/resend"), "", "Deny"),
+		("idp-ident@alice", Method::PUT, format!("{other}/address"), addr, "Deny"),
+		("idp-ident@alice", Method::PATCH, other.clone(), "{}", "Deny"),
+		("idp-ident@alice", Method::DELETE, other.clone(), "", "Deny"),
+		("idp-ident@alice", Method::GET, own_key.clone(), "", "Allow"),
+		("stranger@alice.test", Method::GET, own_key, "", "Deny"),
+		("idp-ident@alice", Method::GET, other_key.clone(), "", "Deny"),
+		("idp-ident@alice", Method::DELETE, other_key, "", "Deny"),
+		("idp-ident@alice", Method::POST, "/api/idp/api-keys".into(), &own_key_body, "Allow*"),
+	];
+	for (n, m, u, body, want) in cells {
+		let (st, b) = send(fx, fx.subject(n), m.clone(), &u, body).await;
+		let got = match status_class(st) {
+			Actual::Deny => "Deny",
+			_ if want == "Allow*" => "Allow*",
+			Actual::Allow => "Allow",
+			_ => "other",
+		};
+		if got != want {
+			fails.push(format!("{n} {m} {u}: {st} {b} (want {want})"));
 		}
 	}
 	fx.app.settings.delete(alice, "idp.enabled").await.unwrap();
@@ -688,6 +733,32 @@ async fn password_and_onboarding() {
 	assert!(st.is_success(), "owner completes onboarding: {st} {b}");
 	let gone = meta.validate_ref("zqref-trash-welcome", &[WELCOME_REF_TYPE]).await;
 	assert!(gone.is_err(), "the welcome ref survived onboarding");
+
+	// MG-458..460, MG-496..499: the tenant's own welcome ref is the account's to retire, not a
+	// visitor's, a link's, an `idp_` key's or a narrowed session's that names the tenant.
+	// SADM visiting another tenant (`is_tenant_self` admits it, `is_tenant_account` does not)
+	// has no fixture subject: SADM sessions here live on `admin` only.
+	meta.create_ref(fx.tenants.alice.tn_id, "zqref-alice-onboard", &welcome())
+		.await
+		.unwrap();
+	let body = r#"{"refId":"zqref-alice-onboard"}"#;
+	for n in [
+		"stranger@alice.test",
+		"follower@alice.test",
+		"sharelink-r@alice",
+		"idp-key@alice",
+		"g-read@alice.test",
+		"owner-scoped-r@alice",
+	] {
+		let (st, b) = send(fx, fx.subject(n), Method::POST, done, body).await;
+		assert_eq!(status_class(st), Actual::Deny, "{n} completes alice's onboarding: {st} {b}");
+		let kept = meta.validate_ref("zqref-alice-onboard", &[WELCOME_REF_TYPE]).await;
+		assert!(kept.is_ok(), "{n} burned alice's welcome ref");
+	}
+	let (st, b) = send(fx, fx.subject("owner@alice"), Method::POST, done, body).await;
+	assert!(st.is_success(), "alice completes onboarding: {st} {b}");
+	let gone = meta.validate_ref("zqref-alice-onboard", &[WELCOME_REF_TYPE]).await;
+	assert!(gone.is_err(), "alice's welcome ref survived onboarding");
 }
 
 /// The account's address book, calendar and push subscription: created, edited and removed by
@@ -713,7 +784,10 @@ async fn pim_edits() {
 		let (st, b) = send(fx, owner, Method::DELETE, &uri, "").await;
 		assert!(st.is_success(), "owner DELETE {uri}: {st} {b}");
 	}
-	let sub = r#"{"subscription":{"endpoint":"https://push.zqm.test/1","keys":{"p256dh":"zqm","auth":"zqm"}}}"#;
+	let sub = concat!(
+		r#"{"subscription":{"endpoint":"https://push.zqm.test/1","#,
+		r#""keys":{"p256dh":"zqm","auth":"zqm"}}}"#,
+	);
 	let (st, b) = send(fx, owner, Method::POST, "/api/notifications/subscription", sub).await;
 	assert!(st.is_success(), "push subscribe: {st} {b}");
 	let id = b["id"]
@@ -725,6 +799,22 @@ async fn pim_edits() {
 	assert_eq!(status_class(st), Actual::Deny, "stranger drops the subscription: {st} {b}");
 	let (st, b) = send(fx, owner, Method::DELETE, &uri, "").await;
 	assert!(st.is_success(), "owner drops the subscription: {st} {b}");
+
+	// A community's subscriptions are the tenant's rows (`cloudillo-push/src/handler.rs:77,105`):
+	// any leader removes one the owner made; a contributor none.
+	let sub = sub.replace("/1", "/2");
+	let club_owner = fx.subject("owner@club");
+	let (st, b) = send(fx, club_owner, Method::POST, "/api/notifications/subscription", &sub).await;
+	assert!(st.is_success(), "club push subscribe: {st} {b}");
+	let id = b["id"]
+		.as_u64()
+		.or_else(|| b["data"]["id"].as_u64())
+		.unwrap_or_else(|| panic!("id: {b}"));
+	let uri = format!("/api/notifications/subscription/{id}");
+	let (st, b) = send(fx, fx.subject("m-contributor@club.test"), Method::DELETE, &uri, "").await;
+	assert_eq!(status_class(st), Actual::Deny, "a contributor drops club's subscription: {b}");
+	let (st, b) = send(fx, fx.subject("m-leader@club.test"), Method::DELETE, &uri, "").await;
+	assert!(st.is_success(), "a leader drops club's subscription: {st} {b}");
 }
 
 /// `idp/activate` validates and binds its ref to the host before consuming it: an unknown ref
@@ -780,6 +870,22 @@ async fn pending_actions_listed_to_moderators() {
 		let (st, b) = send(fx, fx.subject(n), Method::GET, uri, "").await;
 		assert!(st.is_success(), "{n} {uri}: {st} {b}");
 		assert_eq!(b["data"].as_array().map(Vec::len), Some(0), "{n} {uri}: {b}");
+	}
+}
+
+/// DAV takes only a `cl_` key as the Basic password: never the account's password, never a
+/// session token (MG-438..453 for keys).
+#[tokio::test]
+async fn dav_rejects_passwords() {
+	let _g = FIXTURE_LOCK.read().await;
+	let fx = setup().await;
+	let jwt = bearer(fx.subject("owner@alice")).unwrap();
+	for pair in [format!("{ALICE}:{PASSWORD}"), format!("x:{jwt}")] {
+		let mut r = req(ALICE, Method::GET, "/dav/principal/", None, Body::empty());
+		let basic = crate::curated::basic_auth(&pair);
+		r.headers_mut().insert(axum::http::header::AUTHORIZATION, basic);
+		let (st, b) = call(&fx.api, r).await;
+		assert_eq!(st, StatusCode::UNAUTHORIZED, "Basic {}…: {st} {b}", &pair[..12]);
 	}
 }
 

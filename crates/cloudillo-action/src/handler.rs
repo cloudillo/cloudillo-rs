@@ -424,10 +424,6 @@ pub async fn post_action(
 		return Err(Error::PermissionDenied);
 	}
 	let (typ, embedded_sub) = helpers::extract_type_and_subtype(&action.typ);
-	// PTNR is emitted only by the CONN hooks (`native_hooks::ptnr::announce_partnership`).
-	if typ == "PTNR" {
-		return Err(Error::PermissionDenied);
-	}
 	// The subtype may ride in `type` or in `subType`; both gates below read it from here, and
 	// the rest of the pipeline reads the embedded one, so the two must not disagree.
 	if let (Some(embedded), Some(explicit)) = (embedded_sub.as_deref(), action.sub_typ.as_deref())
@@ -436,6 +432,17 @@ pub async fn post_action(
 		return Err(Error::ValidationError("conflicting subtype in type and subType".into()));
 	}
 	let sub_typ = action.sub_typ.as_deref().map(str::to_owned).or(embedded_sub);
+	// `server_emitted` types (PTNR, FSHR, STAT, IDP:REG, PRINVT) come from hooks and dedicated
+	// endpoints, never a client's to sign as the tenant. An outbound hook cannot gate them: its
+	// `issuer` is the tenant. Unknown types fall through to validation.
+	let dsl = app.ext::<Arc<DslEngine>>()?;
+	if dsl
+		.definition_for(&typ, sub_typ.as_deref())
+		.and_then(|d| d.behavior.server_emitted)
+		== Some(true)
+	{
+		return Err(Error::PermissionDenied);
+	}
 	// Actions signed as the tenant that commit it to a relationship or endorsement: an APRV or
 	// an accepted join request is the moderator's (as `/accept`); every other CONN (request,
 	// UPD, empty or unknown subtype) and every FLLW the leader's (as the relationship PATCH).
@@ -1014,6 +1021,15 @@ pub async fn patch_action(
 	if action.issuer.id_tag.as_ref() != auth.id_tag.as_ref() {
 		return Err(Error::PermissionDenied);
 	}
+	// post_action gated on the subtype; changing it here would bypass those gates on publish.
+	// The stored subtype may ride embedded in `type` (`CONN:DEL`), as `post_action` accepts.
+	let stored_sub = action
+		.sub_typ
+		.clone()
+		.or(helpers::extract_type_and_subtype(&action.typ).1.map(Into::into));
+	if req.sub_typ.is_some() && req.sub_typ != stored_sub {
+		return Err(Error::ValidationError("subType cannot change on a draft".into()));
+	}
 	// Same rule as create: only a root takes an explicit room, and it must be enterable.
 	// A null would clear the channel a reply inherited from its thread, so it is refused too.
 	if !req.channel.is_undefined()
@@ -1059,10 +1075,6 @@ pub async fn patch_action(
 		},
 		flags: match req.flags {
 			Some(ref f) => cloudillo_types::types::Patch::Value(f.to_string()),
-			None => cloudillo_types::types::Patch::Undefined,
-		},
-		sub_typ: match req.sub_typ {
-			Some(ref s) => cloudillo_types::types::Patch::Value(s.to_string()),
 			None => cloudillo_types::types::Patch::Undefined,
 		},
 		x: match req.x {

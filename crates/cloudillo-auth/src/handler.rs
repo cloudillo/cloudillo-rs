@@ -1576,7 +1576,6 @@ pub async fn post_set_password(
 	info!(
 		tn_id = ?tn_id,
 		id_tag = %id_tag,
-		ref_id = %req.ref_id,
 		"Setting password via reference"
 	);
 
@@ -1623,8 +1622,8 @@ pub async fn post_set_password(
 ///
 /// `post_set_password` deliberately leaves the `welcome` ref intact so the user
 /// can re-enter the flow from the welcome link (resume on reopen) until they
-/// commit. This authenticated endpoint is the single commit point: it validates
-/// that `refId` is a `welcome` ref belonging to the caller's own tenant and then
+/// commit. This endpoint is the single commit point, for the tenant account itself: it
+/// validates that `refId` is a `welcome` ref belonging to this tenant and then
 /// consumes it, retiring the link. Clearing the `ui.onboarding` gate is done by
 /// the frontend via `settings.update` to avoid a double-clear race.
 ///
@@ -1639,10 +1638,16 @@ pub struct CompleteOnboardingReq {
 
 pub async fn post_complete_onboarding(
 	State(app): State<App>,
+	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<CompleteOnboardingReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+	// The account itself, SADM excluded: no other session may retire its welcome link.
+	if !cloudillo_core::abac::is_tenant_account(&auth, &tenant_id_tag) {
+		warn!(caller = %auth.id_tag, "complete-onboarding: not the account itself");
+		return Err(Error::PermissionDenied);
+	}
 	// Validate the ref is a welcome ref and belongs to the caller. We validate
 	// first (non-destructive) so an unrelated/already-consumed ref can't be
 	// used to tamper, and so we can treat "already gone" as success below.
@@ -1651,23 +1656,21 @@ pub async fn post_complete_onboarding(
 			if tn_id != auth.tn_id {
 				warn!(
 					caller = %auth.id_tag,
-					ref_id = %req.ref_id,
 					"complete-onboarding: welcome ref belongs to a different tenant"
 				);
 				return Err(Error::PermissionDenied);
 			}
 			// Consume the welcome ref, retiring the onboarding link.
 			if let Err(e) = app.meta_adapter.use_ref(&req.ref_id, &[WELCOME_REF_TYPE]).await {
-				warn!("complete-onboarding: failed to consume welcome ref {}: {}", req.ref_id, e);
+				warn!(id_tag = %auth.id_tag, "complete-onboarding: failed to consume welcome ref: {}", e);
 			} else {
-				info!(id_tag = %auth.id_tag, ref_id = %req.ref_id, "Onboarding completed");
+				info!(id_tag = %auth.id_tag, "Onboarding completed");
 			}
 		}
 		Err(Error::NotFound | Error::ValidationError(_)) => {
 			// Ref already consumed/expired — onboarding is effectively complete.
 			info!(
 				id_tag = %auth.id_tag,
-				ref_id = %req.ref_id,
 				"complete-onboarding: welcome ref already retired; treating as complete"
 			);
 		}

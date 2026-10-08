@@ -337,6 +337,12 @@ async fn process_inbound_action_token_inner(
 	// 3. Resolve definition (try full type, then base type)
 	let definition = resolve_definition(app, &action.t)?;
 
+	// A `local_only` type never leaves its node: an inbound one is forged (APKG's
+	// `{type}:{content.name}` key would also supersede our own package of that name).
+	if definition.behavior.local_only.unwrap_or(false) {
+		return Err(Error::PermissionDenied);
+	}
+
 	// 3b. Enforce declared field constraints + content schema on inbound actions.
 	// `validate_*` returns `Error::ValidationError`; `?` propagates it to the
 	// inbox/HTTP error response. Runs for normal inbound AND pre-approved related
@@ -866,17 +872,12 @@ async fn check_inbound_permissions(
 	// gate (any rule granting is sufficient). These are type-agnostic: they make
 	// stranger-engagement on public content work without per-type branches.
 	//
-	// R1 — accept engagement on your own content. If an engagement action
-	// (REACT/REPOST only) references a locally-owned action via `subject` whose
-	// visibility admits the sender (public ⇒ anyone), accept regardless of
-	// follow state. This is what lets the original poster accept a REPOST/REACT
-	// from a non-follower. Restricting to the engagement allowlist keeps the
-	// rule from broadening stranger access to arbitrary subject-bearing types
-	// (e.g. a stranger commenting on a public post still requires the follow
-	// gate). The owner predicate (audience if set, else issuer) is the shared
-	// `owns_subject` helper.
+	// R1 — accept a REPOST of your own public content from a non-follower: a
+	// subject that is a locally-owned, public action admits anyone. The owner
+	// predicate (audience if set, else issuer) is the shared `owns_subject`
+	// helper. A stranger's REACT never reaches here: `allow_unknown` admits it above.
 	let (base_type, _sub) = helpers::extract_type_and_subtype(&action.t);
-	if matches!(base_type.as_str(), "REACT" | "REPOST")
+	if base_type == "REPOST"
 		&& let Some(subject_id) = action.sub.as_deref()
 		&& let Ok(Some(subject)) = app.meta_adapter.get_action(tn_id, subject_id).await
 		&& let Ok(tenant) = app.meta_adapter.read_tenant(tn_id).await

@@ -38,11 +38,12 @@ fn is_self_revocation(issuer: &str, audience: &str) -> bool {
 /// Gate an FSHR-driven `share_entries` write against the subject file, exactly as
 /// `POST /api/files/{id}/shares` gates the direct write.
 ///
-/// The hook is the *second* door to `share_entries`. `POST /api/actions` is gated only by
-/// `check_perm_create("action", "create")`, which asks for the `contributor` role and nothing about
-/// the file named in `subject`, so without this any member could emit an FSHR naming someone else's
-/// file and — the adapter's upsert being create-or-overwrite — grant themselves `'A'` on it, or
-/// drop another user's grant via `DEL`.
+/// The hook is the *second* door to `share_entries`. `POST /api/actions` refuses FSHR outright
+/// (`handler::post_action`: the `server_emitted` DSL flag), so the only emitters are
+/// `cloudillo_file::share::{create_share, delete_share}`, which cleared `require_share_manager`.
+/// This check is defence in depth behind them. Note that `context.issuer` is always the tenant on
+/// the outbound path, which is why the door had to close in `post_action`: a member's FSHR would
+/// pass here as the tenant's.
 ///
 /// `permission` is `Some` only for granting sub-types; a revocation hands out nothing, so it needs
 /// manager standing but no grant ceiling.
@@ -74,15 +75,16 @@ async fn authorize_share_change(
 
 /// FSHR on_create hook - Create share_entry on the sender's side
 ///
-/// When a user shares a file/directory via the action API, this hook ensures
+/// When a file/directory is shared (`/api/files/{id}/shares`), this hook ensures
 /// the corresponding share_entry is created so that the recipient can access
 /// the shared content. For DEL subtype, removes the share_entry instead.
 ///
-/// Every write here passes [`authorize_share_change`] first — defence in depth for the legitimate
+/// Every write here passes [`authorize_share_change`] first — defence in depth for the only
 /// emitters (`cloudillo_file::share::create_share` / `delete_share`), which already cleared
-/// `require_share_manager`. Hooks run post-store with no rollback, so a denial deletes the offending
-/// action row explicitly: leaving it stored would keep it visible to listings, federation relay and
-/// future hooks even though it grants nothing. `cloudillo_core::file_access::fshr_grant_level`
+/// `require_share_manager`; `POST /api/actions` refuses FSHR before this hook could run. Hooks run
+/// post-store with no rollback, so a denial deletes the offending action row explicitly: leaving
+/// it stored would keep it visible to listings, federation relay and future hooks even though it
+/// grants nothing. `cloudillo_core::file_access::fshr_grant_level`
 /// honouring an FSHR row solely when its issuer is the row's upstream source remains as defence in
 /// depth, covering the window before the delete and any row that predates this check.
 pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
@@ -283,6 +285,40 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 	// Check if we are the audience
 	let is_audience = context.audience.as_ref() == Some(&context.tenant_tag);
+
+	// The upstream revoking our grant: the badge `on_accept` cached in `file_user_data` goes with
+	// it, or `cloudillo_file::filter` (which prefers the cache for a reference) keeps listing the
+	// old level. Cleared, the list falls back to the live grant.
+	if is_audience
+		&& context.subtype.as_deref() == Some("DEL")
+		&& let Some(file_id) = &context.subject
+	{
+		let entries = cloudillo_core::file_access::access_entries(&app, context.tn_id, file_id)
+			.await
+			.unwrap_or_else(|err| {
+				tracing::warn!("FSHR on_receive: failed to look up the mirror entries: {}", err);
+				Vec::new()
+			});
+		let mirrors = entries
+			.iter()
+			.filter(|e| e.upstream_tag.as_deref() == Some(context.issuer.as_str()));
+		for e in mirrors {
+			if let Err(err) = app
+				.meta_adapter
+				.update_file_user_data(
+					context.tn_id,
+					&context.tenant_tag,
+					&e.entry_id,
+					Patch::Undefined,
+					Patch::Undefined,
+					Patch::Null,
+				)
+				.await
+			{
+				tracing::warn!("FSHR on_receive: failed to clear the cached access_level: {}", err);
+			}
+		}
+	}
 
 	// Only require confirmation for non-DEL subtypes when we are the audience.
 	// The resting status is declared here and written once by the post-store

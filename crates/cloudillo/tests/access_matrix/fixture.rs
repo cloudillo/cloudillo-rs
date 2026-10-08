@@ -144,8 +144,26 @@ impl IdentityProviderAdapter for StubIdp {
 	async fn create_api_key(&self, _: CreateApiKeyOptions<'_>) -> ClResult<CreatedApiKey> {
 		Err(stub())
 	}
-	async fn list_api_keys(&self, _: ListApiKeyOptions) -> ClResult<Vec<ApiKey>> {
-		Ok(Vec::new())
+	/// [`IDP_IDENT`] holds key 1; nobody else holds any.
+	async fn list_api_keys(&self, opts: ListApiKeyOptions) -> ClResult<Vec<ApiKey>> {
+		let id_tag = format!(
+			"{}.{}",
+			opts.id_tag_prefix.unwrap_or_default(),
+			opts.id_tag_domain.unwrap_or_default()
+		);
+		if id_tag != IDP_IDENT {
+			return Ok(Vec::new());
+		}
+		Ok(vec![ApiKey {
+			id: 1,
+			id_tag_prefix: "zqm-ident".into(),
+			id_tag_domain: ALICE.into(),
+			key_prefix: "idp_zqmat".into(),
+			name: None,
+			created_at: Timestamp::now(),
+			last_used_at: None,
+			expires_at: None,
+		}])
 	}
 	async fn delete_api_key(&self, _: i32) -> ClResult<()> {
 		Err(stub())
@@ -294,7 +312,9 @@ pub const CHANNELS: [Room; 5] = [
 pub const GONE_CHANNEL: &str = "gone";
 
 pub use crate::objects::Obj;
-use crate::objects::{index_all, seed_actions, seed_api_keys, seed_files, seed_proxy_site};
+use crate::objects::{
+	index_all, seed_actions, seed_api_keys, seed_files, seed_pim, seed_proxy_site,
+};
 use crate::subjects::mint_subjects;
 pub use crate::subjects::{MintCell, Subject};
 
@@ -438,6 +458,7 @@ async fn build() -> Fixture {
 	let api_keys = seed_api_keys(&app, &tenants).await;
 	seed_proxy_site(&app).await;
 	let (subjects, mints) = mint_subjects(&app, &api, &tenants, &remotes, &objs, &api_keys).await;
+	seed_pim(&api, &subjects).await;
 
 	let ws = ws_probe(app.clone());
 	let (peer, hatted, stranger) =

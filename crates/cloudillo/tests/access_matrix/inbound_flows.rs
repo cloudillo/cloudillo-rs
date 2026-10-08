@@ -50,7 +50,7 @@ async fn deliver(fx: &Fixture, host: &str, token: &str) -> Actual {
 }
 
 /// `action_id` of the seeded object `name` on `host`.
-fn obj_id(fx: &Fixture, host: &str, name: &str) -> String {
+pub(crate) fn obj_id(fx: &Fixture, host: &str, name: &str) -> String {
 	fx.objs
 		.iter()
 		.find_map(|o| match o {
@@ -839,6 +839,278 @@ async fn inbound_audience_names_another_tenant() {
 	t.c = Some(json!(format!("{MARK} other audience")));
 	t.aud = Some(CLUB.into());
 	assert_eq!(deliver(fx, ALICE, &sign(&r, &t)).await, Actual::Deny, "IB-22");
+}
+
+/// Inbound edges by id (report `inbound-edges`): PoW on CONN only, the token's own algorithm,
+/// key id and key expiry, a bundle's unrelated token, a non-authoritative STAT, channel knocks
+/// and their acceptance, SUBS:UPD on a pending row, unknown INVT subtypes, community INVT:DEL
+/// authority, PTNR on a community, a foreign audience on an ephemeral type, and the room gate
+/// on a reply.
+#[tokio::test]
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+async fn inbound_edges() {
+	use Actual::{Allow, Deny};
+	use cloudillo::action::task::ActionVerifierTask;
+	use cloudillo_core::rate_limit::{PowPenaltyReason, RateLimitApi};
+	use cloudillo_core::scheduler::Task;
+	use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let (alice, club) = (fx.tenants.alice.tn_id, fx.tenants.club.tn_id);
+	let meta = &fx.app.meta_adapter;
+	let mut rep = Report::new("inbound-edges");
+	let text = || Some(json!(format!("{MARK} inbound edge")));
+	let not_active = |s: Option<String>| if s.as_deref() == Some("A") { Allow } else { Deny };
+
+	// A PoW debt on an address gates its CONNs only (`verify_pow_if_conn`): 428, while a POST
+	// from the same address is processed. Four penalties: a token never ends in `AAAA` by chance.
+	let ip = IpAddr::V6(Ipv6Addr::new(0xfd00, 0xfffe, 0x64, 0, 0, 0, 0, 1));
+	for _ in 0..4 {
+		fx.app
+			.rate_limiter
+			.increment_pow_counter(&ip, PowPenaltyReason::ConnSignatureFailure)
+			.unwrap();
+	}
+	let from_ip = |token: String| async move {
+		let body = Body::from(json!({ "token": token }).to_string());
+		let mut r = req(ALICE, Method::POST, "/api/inbox/sync", None, body);
+		r.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::new(ip, 443)));
+		call(&fx.api, r).await.0
+	};
+	let r = issuer(fx, ALICE, Relation::None, "", "ie-pow-conn").await;
+	let mut t = claims(&r, "CONN");
+	t.aud = Some(ALICE.into());
+	let st = from_ip(sign(&r, &t)).await;
+	check(&mut rep, "IB-64", &r, Deny, if st.as_u16() == 428 { Deny } else { Allow });
+	let r = issuer(fx, ALICE, Relation::Connected, "", "ie-pow-post").await;
+	let mut t = claims(&r, "POST");
+	t.c = text();
+	let st = from_ip(sign(&r, &t)).await;
+	check(&mut rep, "IB-65", &r, Allow, if st.is_success() { Allow } else { Deny });
+
+	// The token itself: HS256 instead of ES384; a key id the issuer never published; a cached
+	// key past its expiry. Each issuer is fresh, so no shared key cache is touched.
+	let r = issuer(fx, ALICE, Relation::Connected, "", "ie-hs256").await;
+	let mut t = claims(&r, "POST");
+	t.c = text();
+	let hs = jsonwebtoken::encode(
+		&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+		&t,
+		&jsonwebtoken::EncodingKey::from_secret(b"zqm"),
+	)
+	.unwrap();
+	check(&mut rep, "IB-66", &r, Deny, deliver(fx, ALICE, &hs).await);
+	let r = issuer(fx, ALICE, Relation::Connected, "", "ie-bad-kid").await;
+	let mut t = claims(&r, "POST");
+	t.k = "k9".into();
+	t.c = text();
+	check(&mut rep, "IB-67", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+	let r = crate::fixture::remote("ie-expired-key");
+	meta.add_profile_public_key(&r.id_tag, &r.key_id, &r.spki_b64, Some(Timestamp::from_now(-60)))
+		.await
+		.unwrap();
+	let mut f = crate::fixture::prof(cloudillo::meta_adapter::ProfileType::Person);
+	f.following = Patch::Value(true);
+	f.connected = Patch::Value(cloudillo::meta_adapter::ProfileConnectionStatus::Connected);
+	meta.upsert_profile(alice, &r.id_tag, &f).await.unwrap();
+	let mut t = claims(&r, "POST");
+	t.c = text();
+	check(&mut rep, "IB-68", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+
+	// `/api/inbox`: a related token the primary does not name is not admitted with it.
+	let primary_by = issuer(fx, ALICE, Relation::Connected, "", "ie-bundle-primary").await;
+	let stranger = issuer(fx, ALICE, Relation::None, "", "ie-bundle-stranger").await;
+	let mut t = claims(&primary_by, "POST");
+	t.c = text();
+	let primary = sign(&primary_by, &t);
+	let mut t = claims(&stranger, "POST");
+	t.c = text();
+	let related = sign(&stranger, &t);
+	let body = json!({ "token": primary, "related": [related] }).to_string();
+	let (st, _) =
+		call(&fx.api, req(ALICE, Method::POST, "/api/inbox", None, Body::from(body))).await;
+	assert!(st.is_success(), "IB-69 bundle delivery: {st}");
+	ActionVerifierTask::new(alice, primary.as_str().into(), None)
+		.run(&fx.app)
+		.await
+		.unwrap();
+	check(&mut rep, "IB-69", &primary_by, Allow, admitted(fx, alice, &action_hash(&primary)).await);
+	check(&mut rep, "IB-69", &stranger, Deny, admitted(fx, alice, &action_hash(&related)).await);
+
+	// A STAT on a held remote post from someone not its author: stored (R2), never applied.
+	let parent = "a1~zqm-ie-stat-parent";
+	seed_row(fx, alice, &row(parent, "POST", "zqm-ie-stat-author.test"), None).await;
+	let r = issuer(fx, ALICE, Relation::None, "", "ie-stat").await;
+	let mut t = claims(&r, "STAT");
+	t.p = Some(parent.into());
+	t.c = Some(json!({ "r": 99, "c": 99 }));
+	deliver(fx, ALICE, &sign(&r, &t)).await;
+	let applied = meta.get_action_data(alice, parent).await.unwrap().and_then(|d| d.stat_at);
+	check(&mut rep, "IB-70", &r, Deny, if applied.is_some() { Allow } else { Deny });
+
+	// Channel knocks that must not rest at `A`: below the room's floor, a hat on a closed room,
+	// another host's room, a room that does not exist.
+	let knock = |r: &RemoteId, room: &str| {
+		let mut t = claims(r, "SUBS");
+		t.aud = Some(CLUB.into());
+		t.sub = Some(room.into());
+		t
+	};
+	let r = issuer(fx, CLUB, Relation::Member, "supporter", "ie-knock-supporter").await;
+	let tok = sign(&r, &knock(&r, "@club.test~open-contrib"));
+	deliver(fx, CLUB, &tok).await;
+	check(&mut rep, "IB-71", &r, Deny, not_active(status_of(fx, club, &action_hash(&tok)).await));
+	// The hatted member's knock rides a `contributor` endorsement from the hat (as IB-09).
+	let h = &fx.hatted;
+	let mut t = knock(h, "@club.test~closed-w");
+	t.h = Some(fx.peer.id_tag.as_str().into());
+	let tok = sign(h, &t);
+	let mut aprv = claims(&fx.peer, "APRV");
+	aprv.aud = Some(CLUB.into());
+	aprv.sub = Some(action_hash(&tok).into());
+	aprv.c = Some(json!({ "r": "contributor" }));
+	let aprv = sign(&fx.peer, &aprv);
+	meta.create_inbound_action(club, &action_hash(&tok), &tok, Some(&action_hash(&aprv)))
+		.await
+		.unwrap();
+	deliver(fx, CLUB, &aprv).await;
+	let s = status_of(fx, club, &action_hash(&tok)).await;
+	check(&mut rep, "IB-72", h, Deny, not_active(s));
+	let roster = meta.list_channel_members(club, "closed-w").await.unwrap();
+	assert!(!roster.iter().any(|m| m.as_ref() == h.id_tag), "IB-72 put the hat on the roster");
+	for (id, name, room) in [
+		("IB-73", "ie-knock-foreign", "@alice.test~close-friends"),
+		("IB-74", "ie-knock-missing", "@club.test~zqm-nope"),
+	] {
+		let r = issuer(fx, CLUB, Relation::Member, "contributor", name).await;
+		let tok = sign(&r, &knock(&r, room));
+		deliver(fx, CLUB, &tok).await;
+		check(&mut rep, id, &r, Deny, not_active(status_of(fx, club, &action_hash(&tok)).await));
+	}
+
+	// SUBS:UPD on a pending (`C`) row never activates it (`subs.rs`: only an `A` row updates).
+	// As IB-42 records, the UPD supersedes the row by key before the hook refuses it, so the
+	// pending row is dropped rather than kept: what must not happen is an `A` under the key.
+	let container = obj_id(fx, ALICE, "container-p-tenant-active");
+	let r = issuer(fx, ALICE, Relation::Connected, "", "ie-upd-pending").await;
+	let pending = "a1~zqm-ie-subs-pending";
+	let mut s = row(pending, "SUBS", &r.id_tag);
+	s.audience_tag = Some(ALICE);
+	s.subject = Some(&container);
+	s.x = Some(json!({ "role": "observer" }));
+	let key = format!("SUBS:{container}:{}", r.id_tag);
+	meta.create_action(alice, &s, Some(&key)).await.unwrap();
+	let c = cloudillo::meta_adapter::UpdateActionDataOptions {
+		status: Patch::Value('C'),
+		..Default::default()
+	};
+	meta.update_action_data(alice, pending, &c).await.unwrap();
+	let mut t = claims(&r, "SUBS:UPD");
+	t.aud = Some(ALICE.into());
+	t.sub = Some(container.as_str().into());
+	t.c = Some(json!({ "role": "moderator" }));
+	let tok = sign(&r, &t);
+	deliver(fx, ALICE, &tok).await;
+	let upd = status_of(fx, alice, &action_hash(&tok)).await;
+	let live = match meta.get_action_by_key(alice, &key).await.unwrap() {
+		Some(a) => meta.get_action(alice, &a.action_id).await.unwrap().and_then(|a| a.status),
+		None => None,
+	};
+	let active = upd.as_deref() == Some("A") || live.as_deref() == Some("A");
+	check(&mut rep, "IB-75", &r, Deny, if active { Allow } else { Deny });
+
+	// A knock pending on a closed room, its knocker demoted below the floor, then accepted by a
+	// moderator: no roster row (`subs.rs` `on_accept` re-reads the standing).
+	let r = issuer(fx, CLUB, Relation::Member, "contributor", "ie-knock-demoted").await;
+	let tok = sign(&r, &knock(&r, "@club.test~closed-w"));
+	deliver(fx, CLUB, &tok).await;
+	let knock_id = action_hash(&tok);
+	assert_eq!(status_of(fx, club, &knock_id).await.as_deref(), Some("C"), "IB-76 knock pending");
+	let demote = cloudillo::meta_adapter::UpsertProfileFields {
+		roles: Patch::Value(Some(vec!["follower".into()])),
+		..Default::default()
+	};
+	meta.upsert_profile(club, &r.id_tag, &demote).await.unwrap();
+	let m = fx.subject("m-moderator@club.test");
+	let uri = format!("/api/actions/{knock_id}/accept");
+	let (st, b) =
+		call(&fx.api, req(CLUB, Method::POST, &uri, crate::ops::bearer(m), Body::empty())).await;
+	assert!(st.is_success() || st.as_u16() == 403, "IB-76 accept: {st} {b}");
+	let roster = meta.list_channel_members(club, "closed-w").await.unwrap();
+	let rostered = roster.iter().any(|m| m.as_ref() == r.id_tag);
+	check(&mut rep, "IB-76", &r, Deny, if rostered { Allow } else { Deny });
+
+	// An unknown community INVT subtype is refused, whoever sends it.
+	let community = format!("@{CLUB}");
+	let r = issuer(fx, CLUB, Relation::Member, "moderator", "ie-invt-xyz").await;
+	let mut t = claims(&r, "INVT:XYZ");
+	t.aud = Some("zqm-invitee.test".into());
+	t.sub = Some(community.as_str().into());
+	t.c = Some(json!({ "role": "member" }));
+	check(&mut rep, "IB-77", &r, Deny, deliver(fx, CLUB, &sign(&r, &t)).await);
+
+	// A community invitation on record from someone else: a contributor may not revoke it, a
+	// moderator may.
+	let invitee = "zqm-ie-invitee.test";
+	let mut i = row("a1~zqm-ie-invt", "INVT", "zqm-ie-inviter.test");
+	i.audience_tag = Some(invitee);
+	i.subject = Some(&community);
+	seed_row(fx, club, &i, Some(&format!("INVT:{community}:{invitee}"))).await;
+	for (id, role, want) in [("IB-78", "contributor", Deny), ("IB-79", "moderator", Allow)] {
+		let r = issuer(fx, CLUB, Relation::Member, role, &format!("ie-invt-del-{role}")).await;
+		let mut t = claims(&r, "INVT:DEL");
+		t.aud = Some(invitee.into());
+		t.sub = Some(community.as_str().into());
+		check(&mut rep, id, &r, want, deliver(fx, CLUB, &sign(&r, &t)).await);
+	}
+
+	// A community keeps no partner map: a connected community's PTNR records no edge on club.
+	let r = issuer(fx, CLUB, Relation::Connected, "", "ie-ptnr-comm").await;
+	let comm = cloudillo::meta_adapter::UpsertProfileFields {
+		typ: Patch::Value(cloudillo::meta_adapter::ProfileType::Community),
+		..Default::default()
+	};
+	meta.upsert_profile(club, &r.id_tag, &comm).await.unwrap();
+	meta.upsert_profile(
+		club,
+		"zqm-ie-ptnr-peer.test",
+		&crate::fixture::prof(cloudillo::meta_adapter::ProfileType::Community),
+	)
+	.await
+	.unwrap();
+	let mut t = claims(&r, "PTNR");
+	t.sub = Some("@zqm-ie-ptnr-peer.test".into());
+	deliver(fx, CLUB, &sign(&r, &t)).await;
+	let edges = meta.list_partner_edges(club).await.unwrap();
+	let recorded = edges.iter().any(|e| e.community.as_ref() == r.id_tag);
+	check(&mut rep, "IB-80", &r, Deny, if recorded { Allow } else { Deny });
+	// Back to a person: a connected community would join club's partner list (PT-10..17).
+	let person = cloudillo::meta_adapter::UpsertProfileFields {
+		typ: Patch::Value(cloudillo::meta_adapter::ProfileType::Person),
+		..Default::default()
+	};
+	meta.upsert_profile(club, &r.id_tag, &person).await.unwrap();
+
+	// An ephemeral PRES addressed to another tenant is refused like any other (IB-22). Its
+	// subject is a CONV we hold but do not own: one of ours would be exempt.
+	let held_conv = "a1~zqm-ie-pres-conv";
+	seed_row(fx, alice, &row(held_conv, "CONV", "zqm-ie-pres-host.test"), None).await;
+	let r = issuer(fx, ALICE, Relation::Connected, "", "ie-pres-foreign").await;
+	let mut t = claims(&r, "PRES");
+	t.aud = Some(CLUB.into());
+	t.sub = Some(held_conv.into());
+	t.c = Some(json!({}));
+	check(&mut rep, "IB-81", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+
+	// A reply in a closed room from a moderator off its roster (`room_of_inbound`).
+	let r = issuer(fx, CLUB, Relation::Member, "moderator", "ie-cw-reply").await;
+	let mut t = claims(&r, "CMNT");
+	t.aud = Some(CLUB.into());
+	t.p = Some(obj_id(fx, CLUB, "cur-chan-closed-w-post").into());
+	t.c = text();
+	check(&mut rep, "IB-82", &r, Deny, deliver(fx, CLUB, &sign(&r, &t)).await);
+
+	rep.finish();
 }
 
 // vim: ts=4
