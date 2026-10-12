@@ -1455,8 +1455,18 @@ pub struct InstalledApp {
 	pub status: Box<str>,
 	pub capabilities: Option<Vec<Box<str>>>,
 	pub auto_update: bool,
+	/// Runs on the shared `cl-o.<idTag>` origin instead of a CSP-sandboxed opaque one.
+	pub trusted: bool,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub installed_at: Timestamp,
+}
+
+/// Standing of a container's content as an installed app (`MetaAdapter::installed_app_trust`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppTrust {
+	NotApp,
+	Untrusted,
+	Trusted,
 }
 
 // Full-text search
@@ -2883,16 +2893,16 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		search: Option<&str>,
 	) -> ClResult<Vec<InstalledApp>>;
 
-	/// Is `file_id` the package of an app this tenant has actually installed?
+	/// Standing of `file_id` as the package of an app this tenant has actually installed.
 	///
-	/// The trust signal `cloudillo_file::apkg::get_container_content` gates script-capable
+	/// The signal `cloudillo_file::apkg::get_container_content` gates script-capable
 	/// HTML on. The `apkg` **preset** is not one: it is a client-chosen URL segment gated
 	/// only by the collection-level `check_perm_create`, so anyone who may upload may claim
 	/// it. An installed row is written by `install_app` from an `APKG` action's attachment,
 	/// which is the curation the preset only implied.
 	///
 	/// `status = 'A'` only: an inactive row is not an app the tenant is running.
-	async fn is_installed_app_file(&self, tn_id: TnId, file_id: &str) -> ClResult<bool>;
+	async fn installed_app_trust(&self, tn_id: TnId, file_id: &str) -> ClResult<AppTrust>;
 
 	// Full-text search
 	//******************

@@ -23,7 +23,7 @@ use cloudillo_core::abac::{self, Environment, VisibilityLevel};
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth};
 use cloudillo_core::file_access;
 use cloudillo_types::auth_adapter::AuthCtx;
-use cloudillo_types::meta_adapter;
+use cloudillo_types::meta_adapter::{self, AppTrust};
 use cloudillo_types::types::FileAttrs;
 
 // ============================================================================
@@ -124,23 +124,26 @@ pub async fn get_container_content(
 		}
 	}
 
-	// Whether an HTML entry out of this container may run scripts on
-	// `cl-o.<idTag>` — the origin holding every session on this tenant.
+	// How much an entry out of this container may do on `cl-o.<idTag>` — the origin holding
+	// every session on this tenant. See `container_csp` for the three answers.
 	//
 	// The **preset** answers nothing here. `apkg` is an ordinary preset taken straight from
 	// the upload path and gated only by the collection-level `check_perm_create`, so anyone
 	// who may upload may claim it — and where more than one principal may upload (a
 	// community, a share-write scope) that is stored XSS against the session origin. So the
 	// question asked is the one the database can answer: is this the package of an app
-	// `install_app` wrote from an `APKG` action's attachment. Everything else is sandboxed,
-	// sites included. Bundled apps hold the same standing without a container, served from
-	// `dist/` by `cloudillo::routes::static_files::api_asset_handler`.
+	// `install_app` wrote from an `APKG` action's attachment, and is that app trusted.
+	// Bundled apps hold trusted standing without a container, served from `dist/` by
+	// `cloudillo::routes::static_files::api_asset_handler`.
 	//
 	// Deliberately below the permission check: it is a read-pool query on every container
 	// entry fetch, and a request about to be refused must not pay it.
 	let content_id = file.file_id.as_deref().ok_or(Error::NotFound)?;
-	let trusted = file.preset.as_deref() == Some("apkg")
-		&& app.meta_adapter.is_installed_app_file(tn_id, content_id).await?;
+	let trust = if file.preset.as_deref() == Some("apkg") {
+		app.meta_adapter.installed_app_trust(tn_id, content_id).await?
+	} else {
+		AppTrust::NotApp
+	};
 
 	// The index lookup and the entry's range read live behind `crate::Container`, which
 	// `cloudillo-site` reads its fragments through too. Resolves once per request.
@@ -175,12 +178,12 @@ pub async fn get_container_content(
 		.header(header::VARY, "Accept-Encoding")
 		.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
 
-	// Sandbox unless the container was proven installed above: `sandbox` with no tokens
-	// puts the response in a unique opaque origin and blocks script execution outright, so
-	// an entry can no longer reach the session origin. An installed app package is exempt —
-	// it is iframed and must run its scripts.
-	if !trusted {
-		builder = builder.header(header::CONTENT_SECURITY_POLICY, "sandbox");
+	if let Some(csp) = container_csp(trust) {
+		builder = builder.header(header::CONTENT_SECURITY_POLICY, csp);
+	}
+	if trust == AppTrust::Trusted {
+		// Severs the opener handle an untrusted app gets from `window.open` on a trusted page.
+		builder = builder.header("cross-origin-opener-policy", "same-origin");
 	}
 
 	if let Some(encoding) = content_encoding {
@@ -190,6 +193,40 @@ pub async fn get_container_content(
 	builder
 		.body(Body::from(body_bytes))
 		.map_err(|e| Error::Internal(format!("Failed to build response: {e}")))
+}
+
+/// The sandbox an installed, untrusted app runs under. MUST match `APP_SANDBOX` in
+/// `cloudillo/libs/core/src/iframe-sandbox.ts`; never add `allow-same-origin`, which would
+/// hand the entry the shared `cl-o.<idTag>` origin back.
+const UNTRUSTED_APP_CSP: &str =
+	"sandbox allow-scripts allow-forms allow-downloads allow-popups allow-popups-to-escape-sandbox";
+
+/// The `Content-Security-Policy` for an entry out of a container:
+///
+/// - `NotApp` — bare `sandbox`: opaque origin, no scripts, so an uploaded entry never reaches
+///   the session origin.
+/// - `Untrusted` — `UNTRUSTED_APP_CSP`: scripts run, but always in an opaque origin, even
+///   when a popup escapes the shell's iframe sandbox or the URL is opened top-level.
+/// - `Trusted` — none: runs on the shared API origin by design (and may register a service
+///   worker for offline use).
+fn container_csp(trust: AppTrust) -> Option<&'static str> {
+	match trust {
+		AppTrust::NotApp => Some("sandbox"),
+		AppTrust::Untrusted => Some(UNTRUSTED_APP_CSP),
+		AppTrust::Trusted => None,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{AppTrust, UNTRUSTED_APP_CSP, container_csp};
+
+	#[test]
+	fn csp_per_trust_level() {
+		assert_eq!(container_csp(AppTrust::NotApp), Some("sandbox"));
+		assert_eq!(container_csp(AppTrust::Untrusted), Some(UNTRUSTED_APP_CSP));
+		assert_eq!(container_csp(AppTrust::Trusted), None);
+	}
 }
 
 // ============================================================================

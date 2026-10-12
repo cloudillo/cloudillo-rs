@@ -360,7 +360,7 @@ async fn migrate_v58_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sql
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 58;
+	const CURRENT_DB_VERSION: i64 = 59;
 
 	let mut tx = db.begin().await?;
 
@@ -1128,6 +1128,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			status CHAR(1) DEFAULT 'A',
 			capabilities TEXT,
 			auto_update INTEGER DEFAULT 0,
+			trusted INTEGER NOT NULL DEFAULT 0,
 			installed_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id, app_name, publisher_tag)
@@ -2015,6 +2016,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 				status CHAR(1) DEFAULT 'A',
 				capabilities TEXT,
 				auto_update INTEGER DEFAULT 0,
+				trusted INTEGER NOT NULL DEFAULT 0,
 				installed_at INTEGER DEFAULT (unixepoch()),
 				updated_at INTEGER DEFAULT (unixepoch()),
 				PRIMARY KEY(tn_id, app_name, publisher_tag)
@@ -2968,6 +2970,14 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, 58).await;
 	}
 
+	if version < 59 {
+		// Per-app trust level: a trusted app runs on the shared `cl-o.<idTag>` origin, an
+		// untrusted one is CSP-sandboxed to an opaque origin (`cloudillo_file::apkg`).
+		add_column_if_missing(&mut tx, "installed_apps", "trusted", "INTEGER NOT NULL DEFAULT 0")
+			.await?;
+		set_db_version(&mut tx, 59).await;
+	}
+
 	// Unversioned and idempotent: a DB that reached v58 on a pre-rename build still has
 	// `f_id`. e_id = old f_id, so the rename is the whole rekey; SQLite rewrites the PK and
 	// the `file_user_data_*_at` trigger bodies along with it.
@@ -2990,6 +3000,31 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 #[cfg(test)]
 mod tests {
 	use sqlx::sqlite::SqlitePoolOptions;
+
+	// v59 on a DB whose `installed_apps` predates `trusted`: existing apps come out untrusted.
+	#[tokio::test]
+	async fn installed_apps_trusted_defaults_false() {
+		let db = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.expect("connect");
+		super::init_db(&db).await.expect("init");
+		for sql in [
+			"ALTER TABLE installed_apps DROP COLUMN trusted",
+			"INSERT INTO installed_apps (tn_id, app_name, publisher_tag, version, action_id, file_id, blob_id) \
+			 VALUES (1, 'a', 'pub', '1', 'act', 'f1', 'b1')",
+			"UPDATE vars SET value = '58' WHERE key = 'db_version'",
+		] {
+			sqlx::query(sql).execute(&db).await.expect("seed");
+		}
+		super::init_db(&db).await.expect("re-init");
+		let trusted: i64 = sqlx::query_scalar("SELECT trusted FROM installed_apps")
+			.fetch_one(&db)
+			.await
+			.expect("trusted");
+		assert_eq!(trusted, 0);
+	}
 
 	// A DB stamped v58 by a build that split `files` but kept `file_user_data.f_id`.
 	#[tokio::test]

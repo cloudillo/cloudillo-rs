@@ -494,6 +494,11 @@ pub(super) async fn api_asset_handler(
 	if let Some(value) = asset_cache_control(&response, &path, app.opts.disable_cache) {
 		response.headers_mut().insert(header::CACHE_CONTROL, value);
 	}
+	// Bundled apps are trusted pages; see the COOP note in `cloudillo-file/src/apkg.rs`.
+	response.headers_mut().insert(
+		header::HeaderName::from_static("cross-origin-opener-policy"),
+		HeaderValue::from_static("same-origin"),
+	);
 
 	response.map(Body::new)
 }

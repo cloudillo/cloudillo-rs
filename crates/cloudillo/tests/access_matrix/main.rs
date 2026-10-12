@@ -3723,6 +3723,71 @@ async fn a_forged_fshr_exposes_no_local_bytes() {
 	assert_eq!(st, StatusCode::BAD_REQUEST, "refresh by content id: {body}");
 }
 
+/// Container entries carry the CSP for their installed-app trust (`apkg::container_csp`):
+/// an installed, untrusted app runs scripts in an opaque origin; the same package once
+/// uninstalled gets bare `sandbox`. The CSP gate sits below the permission check, so denied
+/// subjects are refused before it.
+///
+/// Not covered: the trusted case (nothing writes `installed_apps.trusted` yet; the unit test
+/// pins the mapping). The trashed, never-installed package is not served at all (404).
+#[tokio::test]
+async fn apkg_container_csp() {
+	use cloudillo::meta_adapter::InstallApp;
+	use tower::ServiceExt;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let get = |subject: &str, name: &str| {
+		let uri = format!("/api/files/{}/content/index.html", alice_file(fx, name).file_id);
+		let r = req(ALICE, Method::GET, &uri, bearer(fx.subject(subject)), Body::empty());
+		fx.api.clone().oneshot(r)
+	};
+	let csp = |res: &axum::response::Response| {
+		res.headers()
+			.get(axum::http::header::CONTENT_SECURITY_POLICY)
+			.map(|v| v.to_str().unwrap().to_owned())
+	};
+
+	let res = get("owner@alice", "apkg-blob-p-active").await.unwrap();
+	assert_eq!(res.status(), StatusCode::OK, "installed app entry");
+	assert_eq!(
+		csp(&res).as_deref(),
+		Some(
+			"sandbox allow-scripts allow-forms allow-downloads allow-popups \
+			 allow-popups-to-escape-sandbox"
+		),
+		"installed, untrusted app: scripts in an opaque origin"
+	);
+	// No trusted fixture exists; COOP is checked only for its absence here.
+	assert!(
+		!res.headers().contains_key("cross-origin-opener-policy"),
+		"untrusted app entry: no COOP"
+	);
+
+	// Uninstall, fetch, reinstall — restore the shared fixture before asserting.
+	let o = alice_file(fx, "apkg-blob-p-active");
+	let (app_name, publisher) = o.installed.as_ref().unwrap();
+	let ma = &fx.app.meta_adapter;
+	ma.uninstall_app(o.tn_id, app_name, publisher).await.unwrap();
+	let res = get("owner@alice", "apkg-blob-p-active").await.unwrap();
+	let install = InstallApp {
+		app_name: app_name.as_str().into(),
+		publisher_tag: publisher.as_str().into(),
+		version: "1.0.0".into(),
+		action_id: format!("a1~zqm-apkg-{}", o.file_id.trim_start_matches("f1~zqm-")).into(),
+		file_id: o.file_id.as_str().into(),
+		blob_id: o.blob_id.as_deref().unwrap().into(),
+		capabilities: None,
+	};
+	ma.install_app(o.tn_id, &install).await.unwrap();
+	assert_eq!(res.status(), StatusCode::OK, "apkg-preset entry, not installed");
+	assert_eq!(csp(&res).as_deref(), Some("sandbox"), "not an installed app: no scripts");
+
+	for subject in ["stranger@alice.test", "sharelink-r@alice", "idp-key@alice"] {
+		let res = get(subject, "apkg-blob-d-active").await.unwrap();
+		assert!(!res.status().is_success(), "{subject} reads a Direct app package");
+	}
+}
+
 /// Seeded file `name` on alice.
 fn alice_file<'a>(fx: &'a Fixture, name: &str) -> &'a objects::FileObj {
 	let alice = fx.tenants.alice.tn_id;

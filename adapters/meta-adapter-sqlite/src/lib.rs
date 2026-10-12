@@ -43,7 +43,7 @@ use tokio::fs;
 
 use cloudillo_types::{
 	meta_adapter::{
-		Action, ActionData, ActionId, ActionView, AddressBook, Calendar, CalendarObject,
+		Action, ActionData, ActionId, ActionView, AddressBook, AppTrust, Calendar, CalendarObject,
 		CalendarObjectExtracted, CalendarObjectSyncEntry, CalendarObjectView, CalendarObjectWrite,
 		Channel, Contact, ContactExtracted, ContactSyncEntry, ContactView, ContentInfo,
 		CreateCalendarData, CreateFile, CreateRefOptions, CreateShareEntry, CreatedFile,
@@ -862,8 +862,8 @@ impl MetaAdapter for MetaAdapterSqlite {
 		installed_app::list(&self.dbr, tn_id, search).await
 	}
 
-	async fn is_installed_app_file(&self, tn_id: TnId, file_id: &str) -> ClResult<bool> {
-		installed_app::is_installed_file(&self.dbr, tn_id, file_id).await
+	async fn installed_app_trust(&self, tn_id: TnId, file_id: &str) -> ClResult<AppTrust> {
+		installed_app::installed_app_trust(&self.dbr, tn_id, file_id).await
 	}
 
 	// Full-text search

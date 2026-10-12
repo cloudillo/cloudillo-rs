@@ -5,7 +5,7 @@
 
 use crate::utils::Db;
 use cloudillo_types::{
-	meta_adapter::{InstallApp, InstalledApp},
+	meta_adapter::{AppTrust, InstallApp, InstalledApp},
 	prelude::*,
 	utils::normalize_id_tag,
 };
@@ -83,7 +83,7 @@ pub async fn list(
 		let pattern = format!("%{}%", crate::utils::escape_like(search));
 		sqlx::query(
 			"SELECT app_name, publisher_tag, version, action_id, file_id, blob_id,
-				status, capabilities, auto_update, installed_at
+				status, capabilities, auto_update, trusted, installed_at
 			 FROM installed_apps
 			 WHERE tn_id = ? AND status = 'A' AND app_name LIKE ? ESCAPE '\\'
 			 ORDER BY app_name",
@@ -96,7 +96,7 @@ pub async fn list(
 	} else {
 		sqlx::query(
 			"SELECT app_name, publisher_tag, version, action_id, file_id, blob_id,
-				status, capabilities, auto_update, installed_at
+				status, capabilities, auto_update, trusted, installed_at
 			 FROM installed_apps
 			 WHERE tn_id = ? AND status = 'A'
 			 ORDER BY app_name",
@@ -128,6 +128,7 @@ pub async fn list(
 			status: row.get::<String, _>("status").into(),
 			capabilities,
 			auto_update: row.get::<i32, _>("auto_update") != 0,
+			trusted: row.get::<i32, _>("trusted") != 0,
 			installed_at: Timestamp(row.get::<i64, _>("installed_at")),
 		});
 	}
@@ -135,21 +136,33 @@ pub async fn list(
 	Ok(apps)
 }
 
-/// Is this file the package of an installed, active app?
+/// Trust level of the installed, active app whose package is this file.
+///
+/// `MIN`: content-addressed packages may back several rows; the strictest wins, and an
+/// aggregate answers deterministically (one NULL row when nothing matches).
 ///
 /// The read pool: it is on the container-serving path, which must not queue
 /// behind a write.
-pub async fn is_installed_file(db: &SqlitePool, tn_id: TnId, file_id: &str) -> ClResult<bool> {
-	let row = sqlx::query(
-		"SELECT 1 FROM installed_apps WHERE tn_id = ? AND file_id = ? AND status = 'A' LIMIT 1",
+pub async fn installed_app_trust(
+	db: &SqlitePool,
+	tn_id: TnId,
+	file_id: &str,
+) -> ClResult<AppTrust> {
+	let trusted: Option<i64> = sqlx::query_scalar(
+		"SELECT MIN(trusted) FROM installed_apps
+		 WHERE tn_id = ? AND file_id = ? AND status = 'A'",
 	)
 	.bind(tn_id.0)
 	.bind(file_id)
-	.fetch_optional(db)
+	.fetch_one(db)
 	.await
 	.db()?;
 
-	Ok(row.is_some())
+	Ok(match trusted {
+		None => AppTrust::NotApp,
+		Some(0) => AppTrust::Untrusted,
+		Some(_) => AppTrust::Trusted,
+	})
 }
 
 // vim: ts=4
