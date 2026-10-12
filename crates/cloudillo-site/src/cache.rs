@@ -662,7 +662,7 @@ pub(crate) fn fnv_field(state: u32, text: &str) -> u32 {
 ///   enumerates (fonts, `<link rel="manifest">`, `<track>`) resolve rather than being
 ///   blocked by a policy written before them. `script-src` and `style-src` stay
 ///   narrow deliberately — `/api/files/<id>` serves publisher-controlled uploads and
-///   only `image/svg+xml` gets a defensive `script-src 'none'`, while the runtime
+///   only `image/svg+xml` gets a defensive `sandbox; default-src 'none'`, while the runtime
 ///   this wrapper loads is same-origin. `worker-src` is left unset so it inherits
 ///   `script-src` through `child-src`, which is what same-origin `/sw.js` wants.
 /// - `img-src 'self' https: data: blob:` — media is referenced, never bundled, and a

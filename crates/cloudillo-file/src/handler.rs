@@ -223,10 +223,15 @@ fn serve_file<S: AsRef<str> + Debug>(
 		response = response.header("X-Cloudillo-Variants", descriptor);
 	}
 
-	// Add CSP headers for SVG files to prevent script execution in federated content
+	// CSP for SVG files: no scripts, and `sandbox` gives an SVG opened top-level an opaque
+	// origin, so it is never a document on the API origin trusted apps run on.
+	// Not for PDFs: Chrome won't render a sandboxed one.
 	if content_type == "image/svg+xml" {
 		response = response
-			.header("Content-Security-Policy", "script-src 'none'; object-src 'none'")
+			.header(
+				"Content-Security-Policy",
+				"sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+			)
 			.header("X-Content-Type-Options", "nosniff");
 	}
 
@@ -1017,11 +1022,9 @@ async fn handle_post_svg(
 	//
 	// When `store_original` is set we persist the original (unsanitized) bytes as
 	// a blob and mark the variant `available: true`. Serving the original is safe:
-	// `serve_file` attaches `Content-Security-Policy: script-src 'none';
-	// object-src 'none'` and `X-Content-Type-Options: nosniff` to EVERY
-	// image/svg+xml response regardless of variant name, so an original SVG cannot
-	// execute scripts. When `store_original` is false we record the row with
-	// `available: false` (dedup key only, no blob stored).
+	// `serve_file` gives EVERY image/svg+xml response, whatever the variant, CSP `sandbox;
+	// default-src 'none'; …` and `nosniff`, so an original SVG cannot execute scripts.
+	// When `store_original` is false the row is `available: false` (dedup key only, no blob).
 	//
 	// Collision guard: when sanitization is byte-stable (`sanitized == bytes`),
 	// `orig_variant_id` equals `sd_variant_id` and the PRIMARY KEY
