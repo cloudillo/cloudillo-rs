@@ -38,7 +38,7 @@ Start the container:
 
 ```bash
 docker run -d --name cloudillo \
-  -v /var/vol/cloudillo:/data \
+  -v /var/vol/cloudillo:/cloudillo/data \
   -p 443:443 -p 80:80 \
   -e LOCAL_ADDRESS=1.2.3.4 \
   -e BASE_ID_TAG=agatha.example.com \
@@ -48,7 +48,7 @@ docker run -d --name cloudillo \
   cloudillo/cloudillo:latest
 ```
 
-Mount a local directory to `/data` inside the container and expose ports 443 (HTTPS) and 80 (HTTP for ACME challenges).
+Mount a local directory to `/cloudillo/data` inside the container and expose ports 443 (HTTPS) and 80 (HTTP for ACME challenges).
 
 > **Important:** For Let's Encrypt certificate issuance, ensure both `$BASE_APP_DOMAIN` and `cl-o.$BASE_ID_TAG` have DNS A or CNAME records pointing to `$LOCAL_ADDRESS` before starting the container.
 
@@ -60,7 +60,7 @@ services:
     image: cloudillo/cloudillo:latest
     container_name: cloudillo
     volumes:
-      - /var/vol/cloudillo:/data
+      - /var/vol/cloudillo:/cloudillo/data
     ports:
       - "443:443"
       - "80:80"
@@ -78,9 +78,11 @@ Use proxy mode when running Cloudillo behind a reverse proxy (nginx, Traefik, Ca
 
 ```bash
 docker run -d --name cloudillo \
-  -v /var/vol/cloudillo:/data \
-  -p 1443:1443 \
+  -v /var/vol/cloudillo:/cloudillo/data \
+  -p 127.0.0.1:1443:1443 \
   -e MODE=proxy \
+  -e LISTEN=0.0.0.0:1443 \
+  -e LISTEN_HTTP=none \
   -e LOCAL_ADDRESS=1.2.3.4 \
   -e BASE_ID_TAG=agatha.example.com \
   -e BASE_APP_DOMAIN=agatha.example.com \
@@ -88,7 +90,9 @@ docker run -d --name cloudillo \
   cloudillo/cloudillo:latest
 ```
 
-In proxy mode, Cloudillo serves HTTP on port 1443. Configure your reverse proxy to handle TLS and forward requests.
+In proxy mode, Cloudillo serves HTTP on port 1443. The image defaults to `LISTEN=0.0.0.0:443` and `LISTEN_HTTP=0.0.0.0:80`, so set both explicitly as above. Configure your reverse proxy to handle TLS and forward requests.
+
+> **Security:** In proxy mode Cloudillo takes the client IP from the `X-Forwarded-For` header (leftmost entry) for rate limiting and bans. Never expose port 1443 directly — publish it on `127.0.0.1` only — and make sure your proxy **replaces** a client-supplied `X-Forwarded-For` instead of appending to it. nginx does with `proxy_set_header X-Forwarded-For $remote_addr;` as shown below (not `$proxy_add_x_forwarded_for`). Caddy and Traefik drop client-supplied forwarded headers by default; keep it that way: don't list untrusted networks in Caddy's `trusted_proxies` or Traefik's `forwardedHeaders.trustedIPs`, and don't set `forwardedHeaders.insecure`.
 
 ### Nginx Configuration Example
 
@@ -117,15 +121,17 @@ server {
         return 200 '{"idTag":"agatha.example.com"}\n';
     }
     location /api/ {
-        proxy_pass http://localhost:1443/;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://localhost:1443;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host $host;
         client_max_body_size 100M;
     }
     location /ws {
         proxy_pass http://localhost:1443;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host $host;
         proxy_set_header Upgrade $http_upgrade;
@@ -148,16 +154,16 @@ server {
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MODE` | Server mode: `standalone`, `proxy`, or `stream-proxy` | `standalone` |
-| `LISTEN` | HTTPS bind address | `0.0.0.0:443` |
-| `LISTEN_HTTP` | HTTP bind address (for ACME challenges in standalone mode) | - |
+| `LISTEN` | HTTPS bind address (plain HTTP in proxy mode) | `0.0.0.0:443` in the image (`0.0.0.0:1443` outside it) |
+| `LISTEN_HTTP` | HTTP bind address for ACME challenges; `none` disables it | `0.0.0.0:80` in the image (`0.0.0.0:1080` outside it) |
 | `LOCAL_ADDRESS` | Comma-separated IP addresses this node serves | - |
 | `BASE_ID_TAG` | ID tag for the initial admin user (**required**) | - |
 | `BASE_APP_DOMAIN` | App domain for the admin user | Same as `BASE_ID_TAG` |
 | `BASE_PASSWORD` | Password for the initial admin user | - |
 | `ACME_EMAIL` | Email for Let's Encrypt registration | - |
-| `DATA_DIR` | Blob storage directory | `/data` |
-| `DB_DIR` | Database directory (SQLite + redb) | `/data` |
-| `DIST_DIR` | Frontend distribution directory | `/dist` |
+| `DATA_DIR` | Blob storage directory | `./data` (`/cloudillo/data` in the image) |
+| `DB_DIR` | Database directory (SQLite + redb) | `./data` (`/cloudillo/data` in the image) |
+| `DIST_DIR` | Frontend distribution directory | `./dist` (`/cloudillo/dist` in the image) |
 | `RUST_LOG` | Logging level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `DISABLE_CACHE` | Disable caching (set to any value to enable) | - |
 
@@ -184,7 +190,7 @@ website on the same domain).
 
 ## Data Persistence
 
-Mount a volume to `/data` to persist:
+Mount a volume to `/cloudillo/data` to persist:
 - SQLite databases (authentication, metadata)
 - Blob storage (uploaded files)
 - CRDT documents (collaborative editing data)
@@ -192,7 +198,7 @@ Mount a volume to `/data` to persist:
 
 Example:
 ```bash
--v /var/vol/cloudillo:/data
+-v /var/vol/cloudillo:/cloudillo/data
 ```
 
 ## Container Permissions
