@@ -507,9 +507,9 @@ async fn set_club(fx: &Fixture, key: &str, value: &str) {
 	fx.app.settings.set(fx.tenants.club.tn_id, key, v, &["SADM"]).await.unwrap();
 }
 
-/// Profile listing projection and partner lists: the `PT` rows with a Blocked profile seeded
-/// on club, a membership on alice and club's community connections public, then the
-/// `PT_PRIVATE` rows with them at `supporter`.
+/// Profile listing projection and partner lists: the `PT` rows with a Blocked profile, an
+/// uncontracted connected community and Banned/Suspended contracted ones seeded on club and
+/// club's community connections public, then the `PT_PRIVATE` rows with them at `supporter`.
 #[tokio::test]
 async fn partners() {
 	let _g = FIXTURE_LOCK.write().await;
@@ -518,7 +518,29 @@ async fn partners() {
 	let mut f = prof(ProfileType::Person);
 	f.status = Patch::Value(ProfileStatus::Blocked);
 	fx.app.meta_adapter.upsert_profile(club, curated::PT_BLOCKED, &f).await.unwrap();
-	seed_membership(fx, fx.tenants.alice.tn_id, curated::PT_MEMBERSHIP).await;
+	seed_membership(fx, club, curated::PT_NOCONTRACT).await;
+	let f = cloudillo::meta_adapter::UpsertProfileFields {
+		peer_hat_roles: Patch::Value(Some("".into())),
+		..Default::default()
+	};
+	fx.app
+		.meta_adapter
+		.upsert_profile(club, curated::PT_NOCONTRACT, &f)
+		.await
+		.unwrap();
+	for (tag, status) in [
+		(curated::PT_BANNED, ProfileStatus::Banned),
+		(curated::PT_SUSPENDED, ProfileStatus::Suspended),
+	] {
+		seed_membership(fx, club, tag).await;
+		let f = cloudillo::meta_adapter::UpsertProfileFields {
+			status: Patch::Value(status),
+			hat_roles: Patch::Value(Some(fixture::PEER_HAT_ROLES.into())),
+			peer_hat_roles: Patch::Value(Some(fixture::PEER_HAT_ROLES_COPY.into())),
+			..Default::default()
+		};
+		fx.app.meta_adapter.upsert_profile(club, tag, &f).await.unwrap();
+	}
 
 	set_club(fx, COMMUNITY_VIS, "public").await;
 	let open = curated::run(fx, "partners", curated::cells(curated::PT)).await;
@@ -527,6 +549,55 @@ async fn partners() {
 	fx.app.settings.delete(club, COMMUNITY_VIS).await.unwrap();
 	open.finish();
 	private.finish();
+}
+
+/// `/api/me/full` serves a stable ETag over club's `x` sections (a `HashMap` read in random
+/// order once broke it), answers its own ETag with a 304, and is `Cache-Control: private`
+/// (`x` follows the caller's tier).
+///
+/// The home-node side (`partners::sync_membership`, `sync::refresh_profile`,
+/// `Request::get_conditional_auth`) fetches `/me/full` from a remote community, and the fixture
+/// has no remote peer: the anonymous `/me` fallback and the etag clearing after a partial
+/// resolution are not exercised here. Only its decisions are unit-tested in
+/// `cloudillo-profile` (`send_etag`, `is_connected_community`, `via_me_full`).
+#[tokio::test]
+async fn me_full_etag_stable() {
+	use axum::http::header;
+	use cloudillo::meta_adapter::UpdateTenantData;
+	use tower::ServiceExt;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+	let keys = ["zq-about", "zq-bio", "zq-links", "zq-misc"];
+	let set_x = |v: Option<&str>| UpdateTenantData {
+		x: Some(keys.iter().map(|k| ((*k).to_owned(), v.map(str::to_owned))).collect()),
+		..Default::default()
+	};
+	fx.app.meta_adapter.update_tenant(club, &set_x(Some("v"))).await.unwrap();
+
+	let get = |inm: Option<&str>| {
+		let mut r = req(CLUB, Method::GET, "/api/me/full", None, Body::empty());
+		if let Some(e) = inm {
+			r.headers_mut().insert(header::IF_NONE_MATCH, e.parse().unwrap());
+		}
+		fx.api.clone().oneshot(r)
+	};
+	let etag = |res: &axum::response::Response| {
+		res.headers().get(header::ETAG).map(|v| v.to_str().unwrap().to_owned())
+	};
+	let first = get(None).await.unwrap();
+	let second = get(None).await.unwrap();
+	let third = get(etag(&first).as_deref()).await.unwrap();
+	fx.app.meta_adapter.update_tenant(club, &set_x(None)).await.unwrap();
+
+	assert_eq!(first.status(), StatusCode::OK);
+	assert!(etag(&first).is_some(), "200 carries an ETag");
+	assert_eq!(etag(&first), etag(&second), "same content, same ETag");
+	assert_eq!(third.status(), StatusCode::NOT_MODIFIED, "If-None-Match of its own ETag");
+	for res in [&first, &third] {
+		let cc = res.headers().get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok());
+		assert!(cc.is_some_and(|v| v.contains("private")), "Cache-Control: private");
+	}
 }
 
 /// List visibility (`curated::LV`): club's members visible from `supporter`, its partner
@@ -707,8 +778,8 @@ async fn accept_conn(fx: &Fixture, name: &str, host: &'static str, typ: ProfileT
 }
 
 /// `announce_partnership` on the CONN accept path schedules no announcement for a person
-/// tenant, a person peer, or community connections that are not public. An eligible pair gets
-/// the announcement task, which emits nothing while the peer's partner list does not show us
+/// tenant or a person peer. A community pair gets the announcement task whatever club's
+/// `connection_visibility`; it emits nothing while the peer's partner list does not show us
 /// (no fixture peer serves one, so the emitting path itself is not reachable here).
 #[tokio::test]
 async fn ptnr_announce() {
@@ -731,12 +802,8 @@ async fn ptnr_announce() {
 	let peer = accept_conn(fx, "zqm-ann-person-peer", CLUB, ProfileType::Person).await;
 	assert!(!scheduled(club, &peer).await, "a person peer is no partner");
 
-	let peer = accept_conn(fx, "zqm-ann-private", CLUB, ProfileType::Community).await;
-	assert!(!scheduled(club, &peer).await, "community connections not public");
-
-	set_club(fx, COMMUNITY_VIS, "public").await;
+	// Default (non-public) community visibility: it does not gate the announcement.
 	let peer = accept_conn(fx, "zqm-ann-unlisted", CLUB, ProfileType::Community).await;
-	fx.app.settings.delete(club, COMMUNITY_VIS).await.unwrap();
 	assert!(scheduled(club, &peer).await, "an eligible pair gets the announcement task");
 	assert!(!announced(club, CLUB, &peer).await, "the peer's partner list does not show us");
 }

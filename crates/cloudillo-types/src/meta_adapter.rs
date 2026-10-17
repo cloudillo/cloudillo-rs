@@ -1944,19 +1944,6 @@ pub struct PartnerEdge {
 	pub partner: Box<str>,
 }
 
-/// An element of a remote `GET /api/partners`; only the `idTag` is read.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemotePartner {
-	pub id_tag: Box<str>,
-}
-
-/// A remote `GET /api/partners` response.
-#[derive(Debug, Deserialize)]
-pub struct RemotePartners {
-	pub data: Vec<RemotePartner>,
-}
-
 // Calendars / Calendar Objects (CalDAV + JSON REST)
 //***************************************************
 

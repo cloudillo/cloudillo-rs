@@ -18,8 +18,7 @@ use cloudillo_core::abac;
 use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
 use cloudillo_core::profile_visibility::RequesterTier;
 use cloudillo_types::meta_adapter::{
-	ListProfileOptions, Profile, ProfileConnectionStatus, ProfileStatus, ProfileTrust, ProfileType,
-	PublicProfileRow,
+	ListProfileOptions, ProfileConnectionStatus, ProfileStatus, ProfileTrust, ProfileType,
 };
 use cloudillo_types::types::{ApiResponse, ProfileInfo};
 use cloudillo_types::utils::normalize_id_tag;
@@ -61,46 +60,8 @@ pub struct ProfileWithStatus {
 	pub hats: Option<Vec<String>>,
 }
 
-/// Reduced, deliberately public projection returned by `GET /api/profiles/batch`.
-///
-/// **Every field here is already obtainable without authentication** at that profile's
-/// own node, from `GET /api/me` (`routes/public.rs` → `handler::get_tenant_profile_base`)
-/// — this is exactly that response minus `keys`. That equivalence is what admits the
-/// route to the scope-agnostic tier whose rule is on
-/// `cloudillo_core::middleware::require_auth_public_data`.
-///
-/// It is **not** [`ProfileWithStatus`], which leaks the reading tenant's private
-/// relationship state (`status` including Blocked/Muted/Banned, `connected`,
-/// `following`, `follower`, `trust`, and the `feedReadAt`/`msgReadAt` DM read
-/// watermarks), and **not** `ProfileBase`, which carries `keys`.
-#[skip_serializing_none]
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PublicProfile {
-	pub id_tag: String,
-	pub name: String,
-	#[serde(rename = "type")]
-	pub r#type: String,
-	pub profile_pic: Option<String>,
-}
-
-impl From<Profile<Box<str>>> for PublicProfile {
-	fn from(p: Profile<Box<str>>) -> Self {
-		PublicProfileRow { id_tag: p.id_tag, name: p.name, typ: p.typ, profile_pic: p.profile_pic }
-			.into()
-	}
-}
-
-impl From<PublicProfileRow> for PublicProfile {
-	fn from(p: PublicProfileRow) -> Self {
-		Self {
-			id_tag: p.id_tag.to_string(),
-			name: p.name.to_string(),
-			r#type: p.typ.as_str().to_string(),
-			profile_pic: p.profile_pic.map(|s| s.to_string()),
-		}
-	}
-}
+/// Public profile projection; defined in `cloudillo-types` so `/api/me/full` can carry it.
+pub use cloudillo_types::types::PublicProfile;
 
 /// Hard server-side cap on `?idTags=` entries. Matches the shell's existing
 /// client-side cap.

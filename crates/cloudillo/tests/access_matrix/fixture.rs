@@ -250,7 +250,8 @@ pub struct Remotes {
 	pub m_contributor: RemoteId,
 	pub m_moderator: RemoteId,
 	pub m_leader: RemoteId,
-	/// club: connected peer community, `hat_roles = PEER_HAT_ROLES`.
+	/// club: connected peer community, `hat_roles = PEER_HAT_ROLES`,
+	/// `peer_hat_roles = PEER_HAT_ROLES_COPY`.
 	pub peer: RemoteId,
 	/// Member of `peer` (hat role `contributor` on `peer`); no direct relation to club.
 	pub hatted: RemoteId,
@@ -295,6 +296,9 @@ impl Remotes {
 
 /// club's role map for `peer.test` members (`peer_role:local_role`).
 pub const PEER_HAT_ROLES: &str = "contributor:contributor";
+
+/// club's copy of `peer.test`'s role map for club members (`peer_hat_roles`).
+pub const PEER_HAT_ROLES_COPY: &str = "contributor:supporter";
 
 /// Room `(tenant, name, min_role, visibility, closed)`.
 type Room = (&'static str, &'static str, Option<&'static str>, Option<char>, bool);
@@ -564,6 +568,7 @@ async fn seed_remotes(app: &App, t: &Tenants, r: &Remotes) {
 	// club ↔ peer community, with a hat map for peer's members.
 	let mut f = linked(prof(ProfileType::Community));
 	f.hat_roles = Patch::Value(Some(PEER_HAT_ROLES.into()));
+	f.peer_hat_roles = Patch::Value(Some(PEER_HAT_ROLES_COPY.into()));
 	f.hats = Patch::Value(vec![HAT_SEED.into()]);
 	meta.upsert_profile(club, &r.peer.id_tag, &f).await.unwrap();
 }

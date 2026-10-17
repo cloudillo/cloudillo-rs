@@ -72,7 +72,6 @@ pub(super) fn init(app: App) -> Router<App> {
 		)
 		.merge(tables::file::list_public())
 		.merge(tables::profile::channels_public())
-		.merge(tables::profile::partners_list())
 		.layer(RateLimitLayer::new(limiter.clone(), "general", mode));
 
 	Router::new()

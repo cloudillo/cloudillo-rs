@@ -7,7 +7,7 @@ use crate::prelude::*;
 use cloudillo_core::request::ConditionalResult;
 use cloudillo_core::scheduler::{RetryPolicy, Task, TaskId};
 use cloudillo_types::meta_adapter::{
-	ProfileStatus, ProfileType, UpsertProfileFields, UpsertResult,
+	Profile, ProfileStatus, ProfileType, UpsertProfileFields, UpsertResult,
 };
 use cloudillo_types::types::{ApiResponse, ProfileBase};
 
@@ -131,23 +131,75 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 	}
 }
 
-/// Refresh an existing profile from remote instance using conditional request.
-///
-/// This function:
-/// 1. Sends a conditional GET request with If-None-Match header using stored etag
-/// 2. If 304 Not Modified: only updates synced_at timestamp
-/// 3. If 200 OK: updates profile data (name, profile_pic) and synced_at
-/// 4. Syncs profile picture if changed
-///
-/// Returns Ok(true) if profile data was updated, Ok(false) if not modified or on error.
+/// Refresh one profile, and whether it was modified: a person tenant's membership (see
+/// [`via_me_full`]) goes through [`crate::partners::sync_membership`] (profile + partner edges
+/// from `/me/full`, no outbound fetch budget), so its stored etag is always a `/me/full` one;
+/// anything else (incl. a community tenant's partners) through [`refresh_me`].
 pub async fn refresh_profile(
 	app: &App,
 	tn_id: TnId,
 	id_tag: &str,
 	etag: Option<&str>,
 ) -> ClResult<bool> {
-	tracing::debug!("Refreshing profile {} (etag: {:?})", id_tag, etag);
+	let tenant_typ = app.meta_adapter.read_tenant(tn_id).await?.typ;
+	let membership = app
+		.meta_adapter
+		.read_profile(tn_id, id_tag)
+		.await
+		.is_ok_and(|(_, p)| via_me_full(tenant_typ, &p));
+	if !membership {
+		return refresh_me(app, tn_id, id_tag, etag).await;
+	}
+	let own_id_tag = app.auth_adapter.read_id_tag(tn_id).await?;
+	let old = app
+		.meta_adapter
+		.list_partner_edges(tn_id)
+		.await?
+		.into_iter()
+		.filter(|e| e.community.as_ref() == id_tag)
+		.map(|e| (e.community, e.partner))
+		.collect();
+	// Unattended paths fetch nothing: unknown partners resolve on the next map-open sync,
+	// which an unresolved one brings forward.
+	let mut fetches = crate::partners::Fetches::exhausted();
+	let (modified, resolved) =
+		crate::partners::sync_membership(app, tn_id, &own_id_tag, id_tag, etag, &old, &mut fetches)
+			.await?;
+	if !resolved {
+		crate::partners::mark_partners_partial(app, tn_id).await?;
+	}
+	Ok(modified)
+}
 
+/// Whether a tenant of `tenant_typ` refreshes `p` via `/me/full`: a person tenant's membership.
+fn via_me_full<S: AsRef<str>>(tenant_typ: ProfileType, p: &Profile<S>) -> bool {
+	tenant_typ != ProfileType::Community && crate::partners::is_connected_community(p)
+}
+
+/// Refresh an existing profile with a conditional `GET /me` (`If-None-Match: etag`), stored by
+/// [`apply_refresh`]: a 304 bumps `synced_at`, a 200 updates name, type, status, etag and the
+/// picture. Returns whether the profile was modified. A failed fetch is `Ok(false)` (it counts
+/// toward suspension); store errors propagate.
+pub(crate) async fn refresh_me(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	etag: Option<&str>,
+) -> ClResult<bool> {
+	tracing::debug!("Refreshing profile {} (etag: {:?})", id_tag, etag);
+	let result: ClResult<ConditionalResult<ApiResponse<ProfileBase>>> =
+		app.request.get_conditional(id_tag, "/me", etag).await;
+	apply_refresh(app, tn_id, id_tag, result.map(|r| r.map(|d| d.data))).await
+}
+
+/// Store a fetched remote profile (see [`refresh_me`]). Only the base fields are
+/// written; `Err` is a failed fetch (counts toward suspension, never bumps `synced_at`).
+pub(crate) async fn apply_refresh(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	result: ClResult<ConditionalResult<ProfileBase>>,
+) -> ClResult<bool> {
 	// Snapshot prior status so both success branches can recover S → A.
 	let prev_status = app
 		.meta_adapter
@@ -160,10 +212,6 @@ pub async fn refresh_profile(
 	} else {
 		Patch::Undefined
 	};
-
-	// Make conditional request to remote /me endpoint
-	let result: ClResult<ConditionalResult<ApiResponse<ProfileBase>>> =
-		app.request.get_conditional(id_tag, "/me", etag).await;
 
 	match result {
 		Ok(ConditionalResult::NotModified) => {
@@ -194,8 +242,7 @@ pub async fn refresh_profile(
 			}
 			Ok(false)
 		}
-		Ok(ConditionalResult::Modified { data: api_response, etag: new_etag }) => {
-			let remote = api_response.data;
+		Ok(ConditionalResult::Modified { data: remote, etag: new_etag }) => {
 			tracing::info!(
 				"Profile {} modified, updating (name={}, profile_pic={:?}, etag={:?})",
 				id_tag,
@@ -604,6 +651,41 @@ impl Task<App> for ProfileRefreshBatchTask {
 		);
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use cloudillo_types::meta_adapter::ProfileConnectionStatus;
+
+	#[test]
+	fn via_me_full_only_for_memberships() {
+		let comm = |status| Profile::<&str> {
+			id_tag: "club.test",
+			name: "Club",
+			typ: ProfileType::Community,
+			profile_pic: None,
+			status,
+			synced_at: None,
+			following: true,
+			follower: true,
+			connected: ProfileConnectionStatus::Connected,
+			roles: None,
+			trust: None,
+			feed_read_at: None,
+			msg_read_at: None,
+			hidden_in_home: None,
+			hat_roles: None,
+			peer_hat_roles: None,
+			hats: None,
+		};
+		assert!(via_me_full(ProfileType::Person, &comm(None)));
+		// A community tenant's connected communities are its partners.
+		assert!(!via_me_full(ProfileType::Community, &comm(None)));
+		let person = Profile { typ: ProfileType::Person, ..comm(None) };
+		assert!(!via_me_full(ProfileType::Person, &person));
+		assert!(!via_me_full(ProfileType::Person, &comm(Some(ProfileStatus::Suspended))));
 	}
 }
 

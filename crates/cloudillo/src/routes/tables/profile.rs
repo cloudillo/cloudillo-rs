@@ -30,7 +30,6 @@
 //! | `/api/channels`                        | `channels_public()` ᴼ | `channels_admin()` ᴱ | | | |
 //! | `/api/channels/{name}`                 | | | | `channels_admin()` ᴱ | `channels_admin()` ᴱ |
 //! | `/api/channels/{name}/members`         | `channels_admin()` ᴱ | | | | |
-//! | `/api/partners`                        | `partners_list()` ᴼ | | | | |
 //! | `/api/partners/map`                    | `partners_own()` ᴱ | | | | |
 //! | `/api/partners/sync`                   | | `partners_own()` ᴱ | | | |
 //!
@@ -123,12 +122,6 @@ pub(crate) fn channels_admin() -> Router<App> {
 /// Optional auth; the handler filters by visibility and computes the status.
 pub(crate) fn channels_public() -> Router<App> {
 	Router::new().route("/api/channels", get(channel::list_channels))
-}
-
-/// The tenant's partner communities. Optional auth; the handler shows the list to whoever
-/// `profile.connection_visibility.community` admits.
-pub(crate) fn partners_list() -> Router<App> {
-	Router::new().route("/api/partners", get(partners::list_partners))
 }
 
 /// The owner's connection map and its sync trigger. Auth only; handlers require the

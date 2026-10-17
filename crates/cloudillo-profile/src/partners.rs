@@ -13,15 +13,15 @@ use std::sync::Arc;
 use crate::list::PublicProfile;
 use crate::prelude::*;
 use cloudillo_core::abac;
-use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
-use cloudillo_core::profile_visibility::RequesterTier;
+use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
+use cloudillo_core::request::ConditionalResult;
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_core::settings::SettingValue;
 use cloudillo_types::meta_adapter::{
 	ListProfileOptions, PartnerEdge, Profile, ProfileConnectionStatus, ProfileStatus, ProfileType,
-	RemotePartner, RemotePartners,
+	UpsertProfileFields,
 };
-use cloudillo_types::types::ApiResponse;
+use cloudillo_types::types::{self, ApiResponse, ProfileBase};
 use cloudillo_types::validation::validate_id_tag;
 
 /// A map older than this is re-synced when opened.
@@ -36,74 +36,74 @@ const MAX_REMOTE_PARTNERS: usize = 1000;
 /// Max unknown partner profiles fetched per sync, across all memberships.
 const MAX_PROFILE_FETCHES: usize = 100;
 
+/// Max picture refreshes of known partners per sync; separate, so they never starve
+/// [`MAX_PROFILE_FETCHES`].
+const MAX_PIC_REFRESHES: usize = 10;
+
 /// A manual sync request this soon after the last sync is not scheduled.
 const SYNC_COOLDOWN_SECS: i64 = 300;
+
+/// Whether `p` is one of [`connected_communities`].
+pub(crate) fn is_connected_community<S: AsRef<str>>(p: &Profile<S>) -> bool {
+	p.typ == ProfileType::Community
+		&& p.connected == ProfileConnectionStatus::Connected
+		&& matches!(p.status, None | Some(ProfileStatus::Active | ProfileStatus::Muted))
+}
 
 /// Connected community profiles of this tenant (Active/Muted only).
 ///
 /// On a community tenant these are its partners; on a person tenant its memberships.
-async fn connected_communities(app: &App, tn_id: TnId) -> ClResult<Vec<Profile<Box<str>>>> {
+pub(crate) async fn connected_communities(
+	app: &App,
+	tn_id: TnId,
+) -> ClResult<Vec<Profile<Box<str>>>> {
 	let opts = ListProfileOptions {
 		typ: Some(ProfileType::Community),
 		connected: Some(ProfileConnectionStatus::Connected),
-		status: Some(Box::from([ProfileStatus::Active, ProfileStatus::Muted])),
+		status: Some([ProfileStatus::Active, ProfileStatus::Muted].into()),
 		// Single page (adapter max), add paging if a tenant ever has >1000 of these
 		limit: Some(1000),
 		..Default::default()
 	};
-	app.meta_adapter.list_profiles(tn_id, &opts).await
-}
-
-/// GET /api/partners — connected community profiles of this tenant.
-///
-/// These are the tenant's community connections, so `profile.connection_visibility.community`
-/// (else the base key, default `connected`) decides who sees them. An anonymous refusal is an
-/// empty list (200); an authenticated one is 403, so a syncing home node keeps its old edges
-/// instead of reading the refusal as "no partners".
-pub async fn list_partners(
-	State(app): State<App>,
-	tn_id: TnId,
-	IdTag(tenant_id_tag): IdTag,
-	OptionalAuth(maybe_auth): OptionalAuth,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<Vec<PublicProfile>>>)> {
-	let tier = RequesterTier::from_auth(&app, tn_id, &tenant_id_tag, maybe_auth.as_ref()).await?;
-	let visible = tier.sees_connections(&app, tn_id, ProfileType::Community).await?;
-	if !visible && tier.is_authenticated {
-		return Err(Error::PermissionDenied);
-	}
-
-	let partners = if visible {
-		connected_communities(&app, tn_id)
-			.await?
-			.into_iter()
-			.map(PublicProfile::from)
-			.collect()
-	} else {
-		Vec::new()
-	};
-
-	let response = ApiResponse::new(partners).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	let mut list = app.meta_adapter.list_profiles(tn_id, &opts).await?;
+	// Guard: the SQL filter above already selects these.
+	list.retain(is_connected_community);
+	Ok(list)
 }
 
 // Sync task
 //***********
 
-/// A remote partner list reduced to valid, distinct id_tags other than `own` and
+/// A remote partner list reduced to the valid, distinct id_tags other than `own` and
 /// `community`, capped at [`MAX_REMOTE_PARTNERS`].
-fn sanitize_remote_partners(data: Vec<RemotePartner>, own: &str, community: &str) -> Vec<Box<str>> {
+fn sanitize_remote_partners(data: Vec<PublicProfile>, own: &str, community: &str) -> Vec<Box<str>> {
 	let mut seen = HashSet::new();
 	data.into_iter()
-		.map(|p| p.id_tag)
+		.map(|p| Box::<str>::from(p.id_tag))
 		.filter(|p| validate_id_tag(p) && p.as_ref() != own && p.as_ref() != community)
 		.filter(|p| seen.insert(p.clone()))
 		.take(MAX_REMOTE_PARTNERS)
 		.collect()
 }
 
+/// Outbound fetches spent by one sync, across all memberships.
+#[derive(Default)]
+pub(crate) struct Fetches {
+	/// Unknown partner profiles, capped at [`MAX_PROFILE_FETCHES`].
+	profiles: usize,
+	/// Picture refreshes, capped at [`MAX_PIC_REFRESHES`].
+	pics: usize,
+}
+
+impl Fetches {
+	/// A spent budget, for unattended syncs: only [`PartnerSyncTask`] fetches.
+	pub(crate) fn exhausted() -> Self {
+		Self { profiles: MAX_PROFILE_FETCHES, pics: MAX_PIC_REFRESHES }
+	}
+}
+
 /// The `partners` of `community` that are community profiles here, and whether every one was
-/// resolved. An unknown one is fetched first while `fetches` stays under
+/// resolved. An unknown one is fetched first while `fetches.profiles` stays under
 /// [`MAX_PROFILE_FETCHES`]. One that stays unresolved (budget spent or fetch failed) sets the
 /// flag `false`, so a later sync retries it; it is kept if `old` already has its edge (it was
 /// a verified community then), else dropped.
@@ -113,17 +113,30 @@ async fn community_partners(
 	community: &str,
 	partners: Vec<Box<str>>,
 	old: &HashSet<(Box<str>, Box<str>)>,
-	fetches: &mut usize,
+	fetches: &mut Fetches,
 ) -> (Vec<Box<str>>, bool) {
 	let mut resolved = true;
 	let mut out = Vec::new();
+	let stale = Timestamp::now().0 - STALE_SECS;
 	for partner in partners {
 		let mut known = app.meta_adapter.read_profile(tn_id, &partner).await;
-		if matches!(known, Err(Error::NotFound)) && *fetches < MAX_PROFILE_FETCHES {
-			*fetches += 1;
+		if matches!(known, Err(Error::NotFound)) && fetches.profiles < MAX_PROFILE_FETCHES {
+			fetches.profiles += 1;
 			known = cloudillo_core::fetch_profile(app, tn_id, &partner).await;
 		}
 		let keep = if let Ok((_, p)) = known {
+			// `refresh_me` bumps `synced_at`, so a pictureless one is retried daily at most.
+			if p.typ == ProfileType::Community
+				&& p.profile_pic.is_none()
+				&& p.synced_at.is_none_or(|t| t.0 < stale)
+				&& fetches.pics < MAX_PIC_REFRESHES
+			{
+				fetches.pics += 1;
+				// No etag: a 304 would skip the picture (see `refresh_me`).
+				if let Err(e) = crate::sync::refresh_me(app, tn_id, &partner, None).await {
+					debug!(%partner, "partner sync: picture refresh failed: {}", e);
+				}
+			}
 			p.typ == ProfileType::Community
 		} else {
 			resolved = false;
@@ -134,6 +147,81 @@ async fn community_partners(
 		}
 	}
 	(out, resolved)
+}
+
+/// The stored `etag` worth sending for `community`'s `/me/full`: none when `old` holds no edge
+/// of it, so a membership whose edges were dropped (disconnect, a left membership) is never
+/// answered by a 304 that leaves them empty.
+// A membership with zero partners never gets a 304; one full fetch per sync
+fn send_etag<'a>(
+	etag: Option<&'a str>,
+	old: &HashSet<(Box<str>, Box<str>)>,
+	community: &str,
+) -> Option<&'a str> {
+	etag.filter(|e| !e.is_empty() && old.iter().any(|(c, _)| c.as_ref() == community))
+}
+
+/// Refresh membership `community` from its authenticated `/me/full` (profile and partner
+/// edges in one round): `(modified, resolved)`. A failed fetch keeps the old edges; partners
+/// left unresolved keep only theirs (see [`community_partners`]). The etag is stored after the
+/// edges, and cleared on a partial resolution, so the next sync is not answered by a 304. A
+/// `/me/full` without `partners` lists none: the old edges are cleared.
+///
+/// A failed `/me/full` (e.g. our membership token refused) falls back to the anonymous `/me`,
+/// whose failure alone counts toward suspending the community.
+pub(crate) async fn sync_membership(
+	app: &App,
+	tn_id: TnId,
+	own_id_tag: &str,
+	community: &str,
+	etag: Option<&str>,
+	old: &HashSet<(Box<str>, Box<str>)>,
+	fetches: &mut Fetches,
+) -> ClResult<(bool, bool)> {
+	let etag = send_etag(etag, old, community);
+	let result: ClResult<ConditionalResult<ApiResponse<types::Profile>>> =
+		app.request.get_conditional_auth(tn_id, community, "/me/full", etag).await;
+	let result = match result {
+		Ok(r) => r,
+		Err(e) => {
+			let modified = crate::sync::refresh_me(app, tn_id, community, None).await?;
+			warn!(%community, "partner sync: /me/full failed, keeping old edges: {}", e);
+			return Ok((modified, false));
+		}
+	};
+	let ConditionalResult::Modified { data, etag: new_etag } = result else {
+		let modified =
+			crate::sync::apply_refresh(app, tn_id, community, Ok(ConditionalResult::NotModified))
+				.await?;
+		return Ok((modified, true));
+	};
+	let types::Profile { id_tag, name, r#type, profile_pic, keys, partners, .. } = data.data;
+	// No etag yet: it is stored only once the edges are.
+	let base = ProfileBase { id_tag, name, r#type, profile_pic, keys };
+	let base = ConditionalResult::Modified { data: base, etag: None };
+	let modified = crate::sync::apply_refresh(app, tn_id, community, Ok(base)).await?;
+
+	let partners = sanitize_remote_partners(partners.unwrap_or_default(), own_id_tag, community);
+	let (partners, resolved) =
+		community_partners(app, tn_id, community, partners, old, fetches).await;
+	app.meta_adapter.replace_partner_edges(tn_id, community, &partners).await?;
+	// `""`, not NULL: `read_profile` decodes `etag` as non-null.
+	let etag = if resolved { new_etag.unwrap_or_default() } else { "".into() };
+	let fields = UpsertProfileFields { etag: Patch::Value(etag), ..Default::default() };
+	app.meta_adapter.upsert_profile(tn_id, community, &fields).await?;
+	Ok((modified, resolved))
+}
+
+/// Backdate `partners.synced_at` like a partial sync, so the next map open runs a full
+/// [`PartnerSyncTask`] within [`PARTIAL_RETRY_SECS`]. Never moves it forward.
+pub(crate) async fn mark_partners_partial(app: &App, tn_id: TnId) -> ClResult<()> {
+	let at = Timestamp::now().0 - STALE_SECS + PARTIAL_RETRY_SECS;
+	if app.settings.get_int(tn_id, "partners.synced_at").await? > at {
+		app.settings
+			.set_system(tn_id, "partners.synced_at", SettingValue::Int(at))
+			.await?;
+	}
+	Ok(())
 }
 
 /// Pulls every membership's partner list into `partner_edge`.
@@ -177,6 +265,11 @@ impl Task<App> for PartnerSyncTask {
 	async fn run(&self, app: &App) -> ClResult<()> {
 		let tn_id = self.tn_id;
 		debug!("→ PARTNER_SYNC: tenant={}", tn_id);
+		// A community keeps no edges (see `ptnr::on_receive`): its connected communities are
+		// its partners, not memberships.
+		if app.meta_adapter.read_tenant(tn_id).await?.typ == ProfileType::Community {
+			return Ok(());
+		}
 		let own_id_tag = app.auth_adapter.read_id_tag(tn_id).await?;
 		let memberships: Vec<Box<str>> =
 			connected_communities(app, tn_id).await?.into_iter().map(|p| p.id_tag).collect();
@@ -190,23 +283,19 @@ impl Task<App> for PartnerSyncTask {
 
 		// A partial sync backdates `synced_at`, so a map open retries after PARTIAL_RETRY_SECS.
 		let mut complete = true;
-		let mut fetches = 0;
+		let mut fetches = Fetches::default();
 		for community in &memberships {
-			// A failed fetch keeps the community's previous edges.
-			let response: RemotePartners =
-				match app.request.get(tn_id, community, "/partners").await {
-					Ok(r) => r,
-					Err(e) => {
-						warn!(%community, "partner sync: fetch failed, keeping old edges: {}", e);
-						complete = false;
-						continue;
-					}
-				};
-			let partners = sanitize_remote_partners(response.data, &own_id_tag, community);
-			let (partners, resolved) =
-				community_partners(app, tn_id, community, partners, &old, &mut fetches).await;
-			complete &= resolved;
-			app.meta_adapter.replace_partner_edges(tn_id, community, &partners).await?;
+			let etag = app.meta_adapter.read_profile(tn_id, community).await.ok().map(|(e, _)| e);
+			let etag = etag.as_deref();
+			match sync_membership(app, tn_id, &own_id_tag, community, etag, &old, &mut fetches)
+				.await
+			{
+				Ok((_, resolved)) => complete &= resolved,
+				Err(e) => {
+					warn!(%community, "partner sync: membership failed, keeping old edges: {}", e);
+					complete = false;
+				}
+			}
 		}
 
 		app.meta_adapter.delete_partner_edges_except(tn_id, &memberships).await?;
@@ -401,20 +490,55 @@ mod tests {
 	}
 
 	#[test]
+	fn connected_community_is_a_usable_one() {
+		use ProfileConnectionStatus::{Connected, Disconnected};
+		let comm = |connected, status| Profile::<&str> {
+			id_tag: "club.test",
+			name: "Club",
+			typ: ProfileType::Community,
+			profile_pic: None,
+			status,
+			synced_at: None,
+			following: true,
+			follower: true,
+			connected,
+			roles: None,
+			trust: None,
+			feed_read_at: None,
+			msg_read_at: None,
+			hidden_in_home: None,
+			hat_roles: None,
+			peer_hat_roles: None,
+			hats: None,
+		};
+		assert!(is_connected_community(&comm(Connected, None)));
+		assert!(is_connected_community(&comm(Connected, Some(ProfileStatus::Muted))));
+		assert!(!is_connected_community(&comm(Connected, Some(ProfileStatus::Suspended))));
+		assert!(!is_connected_community(&comm(Connected, Some(ProfileStatus::Banned))));
+		assert!(!is_connected_community(&comm(Disconnected, None)));
+		let person = Profile { typ: ProfileType::Person, ..comm(Connected, None) };
+		assert!(!is_connected_community(&person));
+	}
+
+	#[test]
+	fn send_etag_needs_an_edge() {
+		let old: HashSet<(Box<str>, Box<str>)> = [("club.test".into(), "x.test".into())].into();
+		assert_eq!(send_etag(Some("e"), &old, "club.test"), Some("e"));
+		// Edges dropped (or never stored): a full fetch, never a 304.
+		assert_eq!(send_etag(Some("e"), &old, "other.test"), None);
+		assert_eq!(send_etag(Some("e"), &HashSet::new(), "club.test"), None);
+		// A cleared etag (partial resolution) is not sent.
+		assert_eq!(send_etag(Some(""), &old, "club.test"), None);
+		assert_eq!(send_etag(None, &old, "club.test"), None);
+	}
+
+	#[test]
 	fn sanitize_remote_partners_filters() {
-		let remote = |t: &str| RemotePartner { id_tag: t.into() };
-		let data = vec![
-			remote("x.test"),
-			remote("Bad_Tag"),
-			remote("own.test"),
-			remote("club.test"),
-			remote("x.test"),
-			remote("y.test"),
-		];
-		let got = sanitize_remote_partners(data, "own.test", "club.test");
+		let data = ["x.test", "Bad_Tag", "own.test", "club.test", "x.test", "y.test"].map(prof);
+		let got = sanitize_remote_partners(data.into(), "own.test", "club.test");
 		assert_eq!(got, [Box::from("x.test"), Box::from("y.test")]);
 
-		let many = (0..MAX_REMOTE_PARTNERS + 5).map(|i| remote(&format!("p{i}.test"))).collect();
+		let many = (0..MAX_REMOTE_PARTNERS + 5).map(|i| prof(&format!("p{i}.test"))).collect();
 		assert_eq!(
 			sanitize_remote_partners(many, "own.test", "club.test").len(),
 			MAX_REMOTE_PARTNERS

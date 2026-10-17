@@ -14,7 +14,8 @@
 
 use crate::prelude::*;
 use cloudillo_types::auth_adapter::AuthCtx;
-use cloudillo_types::meta_adapter::{ProfileType, RemotePartners};
+use cloudillo_types::meta_adapter::ProfileType;
+use cloudillo_types::types::{ApiResponse, Profile};
 
 /// Base key of the connection-visibility settings; `.person` / `.community` override it per
 /// connected profile type (registered by `cloudillo-profile`).
@@ -41,10 +42,11 @@ pub async fn connection_visibility(
 	Ok(SectionVisibility::parse(&label))
 }
 
-/// `id_tag`'s public partner list (anonymous `GET /partners`); `None` on any failure.
+/// `id_tag`'s public partner list (anonymous `GET /me/full` `partners`: only partners holding a
+/// hat contract for its members); `None` on any failure or when the peer does not publish it.
 pub async fn public_partner_list(app: &App, id_tag: &str) -> Option<Vec<Box<str>>> {
-	match app.request.get_public::<RemotePartners>(id_tag, "/partners").await {
-		Ok(r) => Some(r.data.into_iter().map(|p| p.id_tag).collect()),
+	match app.request.get_public::<ApiResponse<Profile>>(id_tag, "/me/full").await {
+		Ok(r) => Some(r.data.partners?.into_iter().map(|p| p.id_tag.into()).collect()),
 		Err(e) => {
 			tracing::debug!(%id_tag, "partner list unavailable: {}", e);
 			None

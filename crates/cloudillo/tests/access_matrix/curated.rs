@@ -91,7 +91,7 @@ pub enum Route {
 	ChanUpload(&'static str),
 	/// `GET /api/profiles?{query}`, summarised by [`profiles`].
 	Profiles(&'static str),
-	/// `GET /api/partners`, summarised by [`partners`].
+	/// `GET /api/me/full` `partners`, summarised by [`partners`].
 	Partners,
 	/// `GET /api/partners/map`.
 	PartnersMap,
@@ -2398,11 +2398,21 @@ const CF_ROOT: &str = "parentId=__root__&channel=@alice.test~close-friends";
 /// Blocked profile the partners layer seeds on club before [`PT`] runs.
 pub const PT_BLOCKED: &str = "zqm-blocked.test";
 
-/// Connected community the partners layer seeds on alice (a person): her membership.
+/// Connected, contracted communities the partners layer seeds on club as Banned and
+/// Suspended: never listed as partners (PT-67).
+pub const PT_BANNED: &str = "zqm-banned.test";
+pub const PT_SUSPENDED: &str = "zqm-suspended.test";
+
+/// Connected community the list-visibility layer seeds on alice (a person): her membership.
 pub const PT_MEMBERSHIP: &str = "zqm-membership.test";
 
+/// Connected community the partners layer seeds on club with no hat contract (an empty
+/// `peer_hat_roles`): never listed as a partner.
+pub const PT_NOCONTRACT: &str = "zqm-nocontract.test";
+
 /// Profile listing projection and partner lists on club (`connection_visibility.community` =
-/// `public`). club's one partner is `peer.test`. Leader tier (owner, `m_leader`) sees hidden
+/// `public`). club's one listed partner is `peer.test` ([`PT_NOCONTRACT`], [`PT_BANNED`] and
+/// [`PT_SUSPENDED`] are filtered out). Leader tier (owner, `m_leader`) sees hidden
 /// statuses; members keep `roles`; others (incl. the derived-follower `m_follower`) see
 /// neither.
 pub const PT: &[Row] = &[
@@ -2419,14 +2429,18 @@ pub const PT: &[Row] = &[
 	("PT-11", "stranger@club", "", Partners, "Listed"),
 	("PT-12", "anon@club", "", Partners, "Listed"),
 	("PT-17", "hatted@club", "", Partners, "Listed"),
-	// A person's list is its memberships, at the default `connected` visibility. An
-	// authenticated refusal is 403 (a syncing home node keeps its edges); anonymous is empty.
-	("PT-13", "stranger@alice", "", Partners, "Deny"),
-	("PT-14", "anon@alice", "", Partners, "Empty"),
-	("PT-15", "owner@alice", "", Partners, PT_MEMBERSHIP),
-	("PT-38", "connected@alice", "", Partners, PT_MEMBERSHIP),
+	// Banned and suspended contracted partners stay out (every `Listed` row checks it).
+	("PT-67", "anon@club", "", Partners, "Listed"),
+	// The list is public: a share link sees no more than anon; a foreign key is refused (401).
+	("PT-65", "sharelink-r@club", "", Partners, "Listed"),
+	("PT-66", "apikey-xtenant@club", "", Partners, "Deny"),
+	// A person publishes no partners (its connected communities are memberships), whoever asks.
+	("PT-13", "stranger@alice", "", Partners, "Hidden"),
+	("PT-14", "anon@alice", "", Partners, "Hidden"),
+	("PT-15", "owner@alice", "", Partners, "Hidden"),
+	("PT-38", "connected@alice", "", Partners, "Hidden"),
 	// Carry alice's id_tag without being alice: a guest; an `idp_` key is refused (401).
-	("PT-19", "sharelink-r@alice", "", Partners, "Empty"),
+	("PT-19", "sharelink-r@alice", "", Partners, "Hidden"),
 	("PT-09", "idp-mgmt@alice", "", Partners, "Deny"),
 	// PTNR is server-emitted only, whatever subtype rides in `type`.
 	("PT-16", "m_contributor@club", "", PtnrCreate, "Deny"),
@@ -2458,21 +2472,14 @@ pub const PT: &[Row] = &[
 	("PT-53", "apikey-dav@alice", "", PartnersMap, "Deny"),
 	("PT-54", "apkg-publish@alice", "", PartnersMap, "Deny"),
 	("PT-55", "idp-ident@alice", "", PartnersMap, "Deny"),
+	("PT-63", "idp-mgmt@club", "", Partners, "Deny"),
+	// `GET /api/partners` is gone (`partners` moved into `/api/me/full`).
+	("PT-64", "owner@club", "", Get("/api/partners"), "Deny"),
 ];
 
-/// [`PT`] partner rows re-run with club's `connection_visibility.community` = `supporter`:
-/// non-members get an empty list, members still see the partner.
-pub const PT_PRIVATE: &[Row] = &[
-	// Below the floor: authenticated callers get 403, anonymous an empty list.
-	("PT-40", "stranger@club", "", Partners, "Deny"),
-	("PT-41", "anon@club", "", Partners, "Empty"),
-	("PT-42", "m_follower@club", "", Partners, "Deny"),
-	("PT-43", "m_contributor@club", "", Partners, "Listed"),
-	("PT-44", "owner@club", "", Partners, "Listed"),
-	// A hat is a member; `supporter` is the floor.
-	("PT-45", "hatted@club", "", Partners, "Listed"),
-	("PT-46", "m_supporter@club", "", Partners, "Listed"),
-];
+/// Club's `connection_visibility.community` = `supporter`: the setting does not govern
+/// `partners` (partner contracts are public), so anon still sees the partner.
+pub const PT_PRIVATE: &[Row] = &[("PT-40", "anon@club", "", Partners, "Listed")];
 
 /// Pending connection request the list-visibility layer seeds on alice.
 pub const LV_PENDING: &str = "zqm-pending.test";
@@ -3213,15 +3220,21 @@ async fn fields(
 		.map_or_else(|| "Clean".into(), |k| format!("Leak:{k}")))
 }
 
-/// `/api/partners`: `Listed` = exactly club's partner `peer.test`, `Empty`, else the idTags.
+/// `/api/me/full` `partners`: `Listed` = exactly club's contracted partner `peer.test`,
+/// `Empty`, `Hidden` when the field is absent (not a community), else the idTags.
 async fn partners(fx: &Fixture, s: &Subject) -> Result<String, String> {
-	let tags = match id_tags(fx, s, "/api/partners").await {
-		Ok(t) => t,
+	let rows = match get_data(fx, s, "/api/me/full").await {
+		Ok(rows) => rows,
 		Err(r) => return r,
 	};
+	let Some(Value::Array(list)) = rows.first().and_then(|r| r.get("partners")) else {
+		return Ok("Hidden".into());
+	};
+	let mut tags: Vec<&str> = list.iter().filter_map(|p| p["idTag"].as_str()).collect();
+	tags.sort_unstable();
 	Ok(match tags.as_slice() {
 		[] => "Empty".into(),
-		[p] if p == "peer.test" => "Listed".into(),
+		["peer.test"] => "Listed".into(),
 		t => t.join(","),
 	})
 }

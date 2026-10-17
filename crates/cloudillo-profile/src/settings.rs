@@ -79,7 +79,8 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 	)?;
 
 	// Who sees the tenant's connections (`GET /api/profiles?connected=`, the `connected`
-	// field, `GET /api/partners`); the typed keys override it per connected profile type.
+	// field); the typed keys override it per connected profile type. Partner contracts
+	// (`GET /api/me/full` `partners`) are public and not governed by it.
 	registry.register(
 		SettingDefinition::builder(CONNECTION_VISIBILITY)
 			.description(

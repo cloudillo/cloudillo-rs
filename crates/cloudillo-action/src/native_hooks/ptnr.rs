@@ -11,10 +11,6 @@
 //!   partner edges.
 //! - on_receive: a PTNR from one of our memberships naming a known community records the edge
 //!   in `partner_edge`; a `PTNR:DEL` from one drops it.
-//!
-//! A later `profile.connection_visibility.community` change away from public does not
-//! retract announced partnerships; the settings system has no on-change hook. Add it when one
-//! exists.
 
 use std::sync::Arc;
 
@@ -25,14 +21,14 @@ use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 use crate::subject_ref::{SubjectRef, parse_subject_ref};
 use crate::task::{CreateAction, create_action};
-use cloudillo_core::profile_visibility::{
-	SectionVisibility, connection_visibility, public_partner_list,
-};
+use cloudillo_core::profile_visibility::public_partner_list;
 use cloudillo_core::scheduler::{RetryPolicy, Task, TaskId};
 use cloudillo_types::meta_adapter::ProfileType;
 use cloudillo_types::validation::validate_id_tag;
 
-/// Whether `peer`'s anonymous `GET /api/partners` lists `us`; any failure reads as no.
+/// Whether `peer`'s anonymous `GET /api/me/full` `partners` lists `us`; any failure reads as no.
+/// It lists only partners it holds a hat contract for, so a partnership verifies only once the
+/// peer has one for us.
 async fn peer_lists_us(app: &App, peer: &str, us: &str) -> bool {
 	public_partner_list(app, peer)
 		.await
@@ -41,8 +37,8 @@ async fn peer_lists_us(app: &App, peer: &str, us: &str) -> bool {
 
 /// Announce that we (`context.tenant_tag`) are now partners with `context.issuer`.
 ///
-/// Only when both sides are communities and our community connections are public
-/// (`profile.connection_visibility.community`, else the base key). The rest waits in
+/// Only when both sides are communities; partner contracts are public (the
+/// `profile.connection_visibility` settings do not govern them). The rest waits in
 /// [`PtnrAnnounceTask`]: community peers do not follow each other, so neither side sees the
 /// other's PTNR, and the accepting side runs before the requester has recorded CONN:ACC.
 pub async fn announce_partnership(app: &App, context: &HookContext) {
@@ -68,19 +64,14 @@ pub async fn announce_partnership(app: &App, context: &HookContext) {
 }
 
 /// Whether a partnership with `peer` may be announced: it is a community (and, with
-/// `connected`, still a connection) and our community connections are public.
+/// `connected`, still a connection).
 async fn may_announce(app: &App, tn_id: TnId, peer: &str, connected: bool) -> bool {
 	// The peer's `typ` comes from its own signed `/me`; the real gate is the
 	// `connected` status we negotiated. Verify the type in the CONN token, or fetch `/me`
 	// once on connect, if a self-declared community type ever matters.
-	let peer_ok = app.meta_adapter.read_profile(tn_id, peer).await.is_ok_and(|(_, p)| {
+	app.meta_adapter.read_profile(tn_id, peer).await.is_ok_and(|(_, p)| {
 		p.typ == ProfileType::Community && (!connected || p.connected.is_connected())
-	});
-	peer_ok
-		&& matches!(
-			connection_visibility(app, tn_id, ProfileType::Community).await,
-			Ok(Some(SectionVisibility::Public))
-		)
+	})
 }
 
 /// The live (not retracted) `PTNR:{us}:@{peer}` row, pending ones included: the key is
@@ -131,10 +122,10 @@ pub fn announce_task_key(tn_id: TnId, peer: &str) -> String {
 	format!("ptnr-announce:{}:{peer}", tn_id.0)
 }
 
-/// Emits `PTNR:{us}:@{peer}` once the peer's public partner list shows us (it has not opted
-/// out); fails, and so retries, until it does. Emitted at most once per pair: a live row
-/// suppresses it (a retracted or deleted one does not, so a reconnect re-announces). Ends
-/// quietly if the peer disconnected or our visibility changed meanwhile. The scheduler key
+/// Emits `PTNR:{us}:@{peer}` once the peer's public partner list shows us (it holds a hat
+/// contract for us); fails, and so retries, until it does. Emitted at most once per pair: a
+/// live row suppresses it (a retracted or deleted one does not, so a reconnect re-announces).
+/// Ends quietly if the peer disconnected meanwhile. The scheduler key
 /// keeps one task per pair.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PtnrAnnounceTask {

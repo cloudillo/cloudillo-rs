@@ -6,7 +6,7 @@
 use crate::abac::AttrSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::skip_serializing_none;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 // TnId //
@@ -292,8 +292,58 @@ pub struct Profile {
 	pub profile_pic: Option<String>,
 	pub cover_pic: Option<String>,
 	pub keys: Vec<crate::auth_adapter::AuthKey>,
-	/// Extensible metadata (profile sections, tab config, etc.)
-	pub x: Option<HashMap<String, String>>,
+	/// Extensible metadata (profile sections, tab config, etc.). Ordered, so the `/me/full`
+	/// ETag hashed over it is stable.
+	pub x: Option<BTreeMap<String, String>>,
+	/// A community's partner communities: connected peers holding a hat contract for our
+	/// members. `None` = not a community; `Some([])` = no contracted partners.
+	pub partners: Option<Vec<PublicProfile>>,
+}
+
+/// Reduced, deliberately public projection returned by `GET /api/profiles/batch` and as
+/// `/api/me/full` `partners`.
+///
+/// **Every field here is already obtainable without authentication** at that profile's
+/// own node, from `GET /api/me` — this is exactly that response minus `keys`. That
+/// equivalence is what admits the batch route to the scope-agnostic tier whose rule is on
+/// `cloudillo_core::middleware::require_auth_public_data`.
+///
+/// It is **not** `ProfileWithStatus`, which leaks the reading tenant's private
+/// relationship state (`status` including Blocked/Muted/Banned, `connected`,
+/// `following`, `follower`, `trust`, and the `feedReadAt`/`msgReadAt` DM read
+/// watermarks), and **not** [`ProfileBase`], which carries `keys`.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicProfile {
+	pub id_tag: String,
+	pub name: String,
+	#[serde(rename = "type")]
+	pub r#type: String,
+	pub profile_pic: Option<String>,
+}
+
+impl From<crate::meta_adapter::Profile<Box<str>>> for PublicProfile {
+	fn from(p: crate::meta_adapter::Profile<Box<str>>) -> Self {
+		crate::meta_adapter::PublicProfileRow {
+			id_tag: p.id_tag,
+			name: p.name,
+			typ: p.typ,
+			profile_pic: p.profile_pic,
+		}
+		.into()
+	}
+}
+
+impl From<crate::meta_adapter::PublicProfileRow> for PublicProfile {
+	fn from(p: crate::meta_adapter::PublicProfileRow) -> Self {
+		Self {
+			id_tag: p.id_tag.to_string(),
+			name: p.name.to_string(),
+			r#type: p.typ.as_str().to_string(),
+			profile_pic: p.profile_pic.map(|s| s.to_string()),
+		}
+	}
 }
 
 /// Terse self-profile shape returned by `/api/me`.

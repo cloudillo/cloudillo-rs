@@ -20,6 +20,9 @@ use tokio::time::timeout;
 /// Default HTTP request timeout (10 seconds)
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Cap on a collected response body; blobs go through `get_stream`, not `collect_body`.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 use crate::prelude::*;
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::auth_adapter::AuthAdapter;
@@ -50,6 +53,15 @@ pub enum ConditionalResult<T> {
 	Modified { data: T, etag: Option<Box<str>> },
 	/// 304 Not Modified - etag unchanged
 	NotModified,
+}
+
+impl<T> ConditionalResult<T> {
+	pub fn map<U>(self, f: impl FnOnce(T) -> U) -> ConditionalResult<U> {
+		match self {
+			Self::Modified { data, etag } => ConditionalResult::Modified { data: f(data), etag },
+			Self::NotModified => ConditionalResult::NotModified,
+		}
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -109,9 +121,9 @@ impl Request {
 		id_tag_to_ascii(id_tag)
 	}
 
-	/// Collect response body with timeout
+	/// Collect response body with timeout, capped at [`MAX_RESPONSE_BYTES`]
 	async fn collect_body(body: hyper::body::Incoming) -> ClResult<Bytes> {
-		timeout(REQUEST_TIMEOUT, body.collect())
+		timeout(REQUEST_TIMEOUT, http_body_util::Limited::new(body, MAX_RESPONSE_BYTES).collect())
 			.await
 			.map_err(|_| Error::Timeout)?
 			.map_err(|_| Error::NetworkError("body collection error".into()))
@@ -176,6 +188,46 @@ impl Request {
 		Ok(token)
 	}
 
+	/// A body-less GET to `uri`, with a bearer `token` and an `If-None-Match` `etag` when given.
+	fn get_request(
+		uri: &str,
+		token: Option<&str>,
+		etag: Option<&str>,
+	) -> ClResult<hyper::Request<BoxBody<Bytes, Error>>> {
+		let mut req = hyper::Request::builder().method(Method::GET).uri(uri);
+		if let Some(token) = token {
+			req = req.header("Authorization", format!("Bearer {}", token));
+		}
+		if let Some(etag) = etag {
+			req = req.header("If-None-Match", etag);
+		}
+		Ok(req.body(to_boxed(Empty::new()))?)
+	}
+
+	/// Send `build(token)` with the tenant's cached proxy token; on 401/403 invalidate it and
+	/// retry once with a fresh one. The last response is returned whatever its status.
+	async fn send_authed(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		build: impl Fn(&str) -> ClResult<hyper::Request<BoxBody<Bytes, Error>>>,
+	) -> ClResult<hyper::Response<hyper::body::Incoming>> {
+		let mut attempt = 0u8;
+		loop {
+			let token = self.get_or_mint_proxy_token(tn_id, id_tag).await?;
+			let res = self.timed_request(build(&token)?).await?;
+			if matches!(res.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+				&& attempt == 0
+			{
+				debug!(id_tag = %id_tag, "auth rejected, refreshing cached token and retrying");
+				self.proxy_tokens.invalidate(tn_id, id_tag);
+				attempt += 1;
+				continue;
+			}
+			return Ok(res);
+		}
+	}
+
 	pub async fn get_bin(
 		&self,
 		tn_id: TnId,
@@ -183,40 +235,20 @@ impl Request {
 		path: &str,
 		auth: bool,
 	) -> ClResult<Bytes> {
-		let host = Self::host_for(id_tag)?;
-		let mut attempt = 0u8;
-		loop {
-			let req = hyper::Request::builder()
-				.method(Method::GET)
-				.uri(format!("https://cl-o.{}/api{}", host, path));
-			let req = if auth {
-				req.header(
-					"Authorization",
-					format!("Bearer {}", self.get_or_mint_proxy_token(tn_id, id_tag).await?),
-				)
-			} else {
-				req
-			};
-			let req = req.body(to_boxed(Empty::new()))?;
-			let res = self.timed_request(req).await?;
-			debug!(status = %res.status(), "federated GET response");
-			match res.status() {
-				StatusCode::OK => return Self::collect_body(res.into_body()).await,
-				StatusCode::NOT_FOUND => return Err(Error::NotFound),
-				StatusCode::GONE => return Err(Error::Gone),
-				StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if auth && attempt == 0 => {
-					debug!(id_tag = %id_tag, path = %path,
-						"auth rejected, refreshing cached token and retrying");
-					self.proxy_tokens.invalidate(tn_id, id_tag);
-					attempt += 1;
-				}
-				StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-					return Err(Error::PermissionDenied);
-				}
-				code => {
-					return Err(Error::NetworkError(format!("unexpected HTTP status: {}", code)));
-				}
-			}
+		let uri = format!("https://cl-o.{}/api{}", Self::host_for(id_tag)?, path);
+		let res = if auth {
+			self.send_authed(tn_id, id_tag, |t| Self::get_request(&uri, Some(t), None))
+				.await?
+		} else {
+			self.timed_request(Self::get_request(&uri, None, None)?).await?
+		};
+		debug!(status = %res.status(), "federated GET response");
+		match res.status() {
+			StatusCode::OK => Self::collect_body(res.into_body()).await,
+			StatusCode::NOT_FOUND => Err(Error::NotFound),
+			StatusCode::GONE => Err(Error::Gone),
+			StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
+			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
 		}
 	}
 
@@ -232,40 +264,21 @@ impl Request {
 		path: &str,
 		auth: bool,
 	) -> ClResult<impl AsyncRead + Send + Unpin + use<>> {
-		let host = Self::host_for(id_tag)?;
-		let mut attempt = 0u8;
-		loop {
-			let req = hyper::Request::builder()
-				.method(Method::GET)
-				.uri(format!("https://cl-o.{}/api{}", host, path));
-			let req = if auth {
-				let token = self.get_or_mint_proxy_token(tn_id, id_tag).await?;
-				debug!("Got proxy token (len={})", token.len());
-				req.header("Authorization", format!("Bearer {}", token))
-			} else {
-				req
-			};
-			let req = req.body(to_boxed(Empty::new()))?;
-			let res = self.timed_request(req).await?;
-			match res.status() {
-				StatusCode::OK => {
-					let stream = res.into_body().into_data_stream().map_err(std::io::Error::other);
-					return Ok(tokio_util::io::StreamReader::new(stream));
-				}
-				StatusCode::NOT_FOUND => return Err(Error::NotFound),
-				StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if auth && attempt == 0 => {
-					debug!(id_tag = %id_tag, path = %path,
-						"auth rejected on stream, refreshing cached token and retrying");
-					self.proxy_tokens.invalidate(tn_id, id_tag);
-					attempt += 1;
-				}
-				StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-					return Err(Error::PermissionDenied);
-				}
-				code => {
-					return Err(Error::NetworkError(format!("unexpected HTTP status: {}", code)));
-				}
+		let uri = format!("https://cl-o.{}/api{}", Self::host_for(id_tag)?, path);
+		let res = if auth {
+			self.send_authed(tn_id, id_tag, |t| Self::get_request(&uri, Some(t), None))
+				.await?
+		} else {
+			self.timed_request(Self::get_request(&uri, None, None)?).await?
+		};
+		match res.status() {
+			StatusCode::OK => {
+				let stream = res.into_body().into_data_stream().map_err(std::io::Error::other);
+				Ok(tokio_util::io::StreamReader::new(stream))
 			}
+			StatusCode::NOT_FOUND => Err(Error::NotFound),
+			StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
+			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
 		}
 	}
 
@@ -323,19 +336,37 @@ impl Request {
 	where
 		Res: DeserializeOwned,
 	{
-		let host = Self::host_for(id_tag)?;
-		let mut builder = hyper::Request::builder()
-			.method(Method::GET)
-			.uri(format!("https://cl-o.{}/api{}", host, path));
+		let uri = format!("https://cl-o.{}/api{}", Self::host_for(id_tag)?, path);
+		let req = Self::get_request(&uri, None, etag)?;
+		Self::conditional_result(self.timed_request(req).await?).await
+	}
 
-		// Add If-None-Match header if we have an etag
-		if let Some(etag) = etag {
-			builder = builder.header("If-None-Match", etag);
-		}
+	/// [`Self::get_conditional`] with the tenant's proxy token, retried once on 401/403 with a
+	/// fresh token (like [`Self::get_bin`]).
+	pub async fn get_conditional_auth<Res>(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		path: &str,
+		etag: Option<&str>,
+	) -> ClResult<ConditionalResult<Res>>
+	where
+		Res: DeserializeOwned,
+	{
+		let uri = format!("https://cl-o.{}/api{}", Self::host_for(id_tag)?, path);
+		let res = self
+			.send_authed(tn_id, id_tag, |t| Self::get_request(&uri, Some(t), etag))
+			.await?;
+		Self::conditional_result(res).await
+	}
 
-		let req = builder.body(to_boxed(Empty::new()))?;
-		let res = self.timed_request(req).await?;
-
+	/// Map a conditional GET response: 304 → `NotModified`, 200 → body + `ETag`.
+	async fn conditional_result<Res>(
+		res: hyper::Response<hyper::body::Incoming>,
+	) -> ClResult<ConditionalResult<Res>>
+	where
+		Res: DeserializeOwned,
+	{
 		match res.status() {
 			StatusCode::NOT_MODIFIED => Ok(ConditionalResult::NotModified),
 			StatusCode::OK => {
@@ -351,7 +382,7 @@ impl Request {
 				Ok(ConditionalResult::Modified { data: parsed, etag: new_etag })
 			}
 			StatusCode::NOT_FOUND => Err(Error::NotFound),
-			StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
+			StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
 			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
 		}
 	}
@@ -438,41 +469,26 @@ impl Request {
 		path: &str,
 		data: Bytes,
 	) -> ClResult<Bytes> {
-		let host = Self::host_for(id_tag)?;
-		let mut attempt = 0u8;
-		loop {
-			let token = self.get_or_mint_proxy_token(tn_id, id_tag).await?;
-			let req = hyper::Request::builder()
-				.method(Method::POST)
-				.uri(format!("https://cl-o.{}/api{}", host, path))
-				.header("Content-Type", "application/json")
-				.header("Authorization", format!("Bearer {}", token))
-				.body(to_boxed(Full::from(data.clone())))?;
-			let res = self.timed_request(req).await?;
-			debug!(status = %res.status(), "federated POST response");
-			match res.status() {
-				StatusCode::NOT_FOUND => return Err(Error::NotFound),
-				StatusCode::GONE => return Err(Error::Gone),
-				StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if attempt == 0 => {
-					debug!(id_tag = %id_tag, path = %path,
-						"auth rejected on POST, refreshing cached token and retrying");
-					self.proxy_tokens.invalidate(tn_id, id_tag);
-					attempt += 1;
-				}
-				StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-					return Err(Error::PermissionDenied);
-				}
-				code if code.is_success() => {
-					// Accept any 2xx — the wire shape is up to the caller.
-					// `204 No Content` returns empty bytes; the typed
-					// `post_authed` wrapper will surface that as a JSON parse
-					// error, which is acceptable for callers that opted in.
-					return Self::collect_body(res.into_body()).await;
-				}
-				code => {
-					return Err(Error::NetworkError(format!("unexpected HTTP status: {}", code)));
-				}
-			}
+		let uri = format!("https://cl-o.{}/api{}", Self::host_for(id_tag)?, path);
+		let res = self
+			.send_authed(tn_id, id_tag, |token| {
+				Ok(hyper::Request::builder()
+					.method(Method::POST)
+					.uri(&uri)
+					.header("Content-Type", "application/json")
+					.header("Authorization", format!("Bearer {}", token))
+					.body(to_boxed(Full::from(data.clone())))?)
+			})
+			.await?;
+		debug!(status = %res.status(), "federated POST response");
+		match res.status() {
+			StatusCode::NOT_FOUND => Err(Error::NotFound),
+			StatusCode::GONE => Err(Error::Gone),
+			StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
+			// Any 2xx: the wire shape is the caller's. A `204` yields empty bytes, which
+			// `post_authed` surfaces as a JSON parse error.
+			code if code.is_success() => Self::collect_body(res.into_body()).await,
+			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
 		}
 	}
 

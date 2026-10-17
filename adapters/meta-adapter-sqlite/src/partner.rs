@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Partner edges: each membership community's connected community peers, as synced from
-//! its `GET /api/partners` and from received PTNR actions.
+//! its `GET /api/me/full` `partners` and from received PTNR actions.
 
 use cloudillo_types::{meta_adapter::PartnerEdge, prelude::*};
 use sqlx::{Row, SqlitePool};

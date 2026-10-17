@@ -1432,7 +1432,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.await?;
 
 	// Partner edges: a membership community's connected community peers, synced from its
-	// `GET /api/partners` and from received PTNR actions. Feeds the connection map.
+	// `GET /api/me/full` `partners` and from received PTNR actions. Feeds the connection map.
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS partner_edge (
 			tn_id integer NOT NULL,

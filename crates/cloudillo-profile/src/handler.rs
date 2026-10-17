@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::{
 	Json,
@@ -15,7 +15,9 @@ use crate::prelude::*;
 use cloudillo_core::IdTag;
 use cloudillo_core::extract::{OptionalAuth, OptionalRequestId};
 use cloudillo_core::profile_visibility::{RequesterTier, SectionVisibility};
-use cloudillo_types::types::{ApiResponse, AppDomainRes, Profile, ProfileBase};
+use cloudillo_types::meta_adapter::{self, ProfileType};
+use cloudillo_types::roles::{hat_peer, parse_hat_roles};
+use cloudillo_types::types::{ApiResponse, AppDomainRes, Profile, ProfileBase, PublicProfile};
 
 /// Suffix appended to a section field name to mark its required visibility.
 const VIS_SUFFIX: &str = ".vis";
@@ -32,7 +34,10 @@ const VIS_SUFFIX: &str = ".vis";
 /// - the `<field>.vis` marker (so anonymous callers see no hint),
 /// - the `<field>` entry from the comma-separated `sections` list (dropped
 ///   entirely if the list becomes empty).
-fn filter_sections(x: HashMap<Box<str>, Box<str>>, tier: RequesterTier) -> HashMap<String, String> {
+fn filter_sections(
+	x: HashMap<Box<str>, Box<str>>,
+	tier: RequesterTier,
+) -> BTreeMap<String, String> {
 	let mut hidden: HashSet<String> = HashSet::new();
 	for (k, v) in &x {
 		let Some(field) = k.strip_suffix(VIS_SUFFIX) else {
@@ -49,7 +54,7 @@ fn filter_sections(x: HashMap<Box<str>, Box<str>>, tier: RequesterTier) -> HashM
 		}
 	}
 
-	let mut out: HashMap<String, String> = HashMap::with_capacity(x.len());
+	let mut out = BTreeMap::new();
 	for (k, v) in x {
 		let key = k.to_string();
 		// Filter the comma-separated `sections` list before the hidden-key
@@ -152,11 +157,7 @@ pub async fn get_tenant_profile_base(
 		// Sliding expiry: a hot tenant under constant polling stays warm instead
 		// of expiring every TTL and paying a full auth + meta rebuild.
 		app.profile_me.touch(tn_id);
-		return Response::builder()
-			.status(StatusCode::NOT_MODIFIED)
-			.header(header::ETAG, etag_header(&cached))
-			.body(Body::empty())
-			.map_err(|e| Error::Internal(format!("failed to build 304 response: {}", e)));
+		return not_modified(&cached);
 	}
 
 	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
@@ -173,11 +174,7 @@ pub async fn get_tenant_profile_base(
 
 	// Cold/expired cache but content unchanged → still 304.
 	if if_none_match.as_deref() == Some(etag.as_str()) {
-		return Response::builder()
-			.status(StatusCode::NOT_MODIFIED)
-			.header(header::ETAG, etag_header(&etag))
-			.body(Body::empty())
-			.map_err(|e| Error::Internal(format!("failed to build 304 response: {}", e)));
+		return not_modified(&etag);
 	}
 
 	let mut response = ApiResponse::new(profile);
@@ -213,17 +210,58 @@ pub async fn get_tenant_app_domain(
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// Build a `304 Not Modified` carrying `etag`.
+fn not_modified(etag: &str) -> ClResult<Response> {
+	Response::builder()
+		.status(StatusCode::NOT_MODIFIED)
+		.header(header::ETAG, etag_header(etag))
+		.body(Body::empty())
+		.map_err(|e| Error::Internal(format!("failed to build 304 response: {}", e)))
+}
+
+/// Whether connected community `p` is listed as a partner: usable, and our copy of its role
+/// map for our members grants at least one role (a hat contract).
+fn lists_partner(p: &meta_adapter::Profile<Box<str>>) -> bool {
+	hat_peer(p).1
+		&& p.peer_hat_roles
+			.as_deref()
+			.and_then(parse_hat_roles)
+			.is_some_and(|m| !m.is_empty())
+}
+
+/// `GET /api/me/full` — the tier-filtered profile, plus a community's `partners` (public: only
+/// contracted ones, see [`lists_partner`]).
+///
+/// The `ETag` is hashed over the serialized `Profile` on every request (no cache), so it
+/// follows the partner list and the caller's tier with no invalidation hooks. `x` depends on
+/// the tier, so both the 200 and the 304 are `Cache-Control: private`.
 pub async fn get_tenant_profile(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
 	OptionalAuth(auth): OptionalAuth,
 	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<Profile>>)> {
+	headers: HeaderMap,
+) -> ClResult<Response> {
 	let auth_profile = app.auth_adapter.read_tenant(&id_tag).await?;
 	let tn_id = auth_profile.tn_id;
 	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
 
 	let tier = RequesterTier::from_auth(&app, tn_id, &id_tag, auth.as_ref()).await?;
+
+	// Uncached list query on public, ban-bypassed /me/full; add a per-tn TTL cache
+	// invalidated on CONN/PTNR/peer_hat_roles changes if it shows up in load
+	let partners = if tenant_meta.typ == ProfileType::Community {
+		Some(
+			crate::partners::connected_communities(&app, tn_id)
+				.await?
+				.into_iter()
+				.filter(lists_partner)
+				.map(PublicProfile::from)
+				.collect(),
+		)
+	} else {
+		None
+	};
 
 	let x_map = filter_sections(tenant_meta.x, tier);
 
@@ -235,14 +273,30 @@ pub async fn get_tenant_profile(
 		cover_pic: tenant_meta.cover_pic.map(|s| s.to_string()),
 		keys: auth_profile.keys,
 		x: if x_map.is_empty() { None } else { Some(x_map) },
+		partners,
 	};
 
-	let mut response = ApiResponse::new(profile);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
-
-	Ok((StatusCode::OK, Json(response)))
+	let etag = compute_etag(&serde_json::to_vec(&profile)?);
+	let if_none_match = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
+	let mut response = if if_none_match.map(unquote_etag) == Some(etag.as_str()) {
+		not_modified(&etag)?
+	} else {
+		let mut response = ApiResponse::new(profile);
+		if let Some(id) = req_id {
+			response = response.with_req_id(id);
+		}
+		let json = serde_json::to_vec(&response)?;
+		Response::builder()
+			.status(StatusCode::OK)
+			.header(header::CONTENT_TYPE, "application/json")
+			.header(header::ETAG, etag_header(&etag))
+			.body(Body::from(json))
+			.map_err(|e| Error::Internal(format!("failed to build 200 response: {}", e)))?
+	};
+	response
+		.headers_mut()
+		.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("private"));
+	Ok(response)
 }
 
 #[cfg(test)]
@@ -273,6 +327,95 @@ mod tests {
 
 	fn owner() -> RequesterTier {
 		RequesterTier { is_owner: true, ..RequesterTier::anonymous() }
+	}
+
+	#[test]
+	fn lists_only_contracted_partners() {
+		use meta_adapter::{ProfileConnectionStatus, ProfileStatus};
+		let comm = |peer_hat_roles: Option<&str>| meta_adapter::Profile::<Box<str>> {
+			id_tag: "peer.test".into(),
+			name: "Peer".into(),
+			typ: ProfileType::Community,
+			profile_pic: None,
+			status: None,
+			synced_at: None,
+			following: true,
+			follower: true,
+			connected: ProfileConnectionStatus::Connected,
+			roles: None,
+			trust: None,
+			feed_read_at: None,
+			msg_read_at: None,
+			hidden_in_home: None,
+			hat_roles: None,
+			peer_hat_roles: peer_hat_roles.map(Into::into),
+			hats: None,
+		};
+		let granting = Some("contributor:supporter");
+		assert!(lists_partner(&comm(granting)));
+		assert!(!lists_partner(&comm(None)));
+		assert!(!lists_partner(&comm(Some(""))));
+		assert!(!lists_partner(&comm(Some("bogus"))));
+		let gone = meta_adapter::Profile {
+			connected: ProfileConnectionStatus::Disconnected,
+			..comm(granting)
+		};
+		assert!(!lists_partner(&gone));
+		let banned =
+			meta_adapter::Profile { status: Some(ProfileStatus::Banned), ..comm(granting) };
+		assert!(!lists_partner(&banned));
+	}
+
+	#[test]
+	fn full_etag_follows_partners() {
+		let partner = |t: &str| PublicProfile {
+			id_tag: t.into(),
+			name: t.into(),
+			r#type: "community".into(),
+			profile_pic: None,
+		};
+		let profile = |partners| Profile {
+			id_tag: "club.test".into(),
+			name: "Club".into(),
+			r#type: "community".into(),
+			profile_pic: None,
+			cover_pic: None,
+			keys: Vec::new(),
+			x: None,
+			partners,
+		};
+		let etag = |p: &Profile| compute_etag(&serde_json::to_vec(p).unwrap());
+		let hidden = etag(&profile(None));
+		let none = etag(&profile(Some(Vec::new())));
+		let one = etag(&profile(Some(vec![partner("a.test")])));
+		let other = etag(&profile(Some(vec![partner("b.test")])));
+		assert_ne!(hidden, none);
+		assert_ne!(none, one);
+		assert_ne!(one, other);
+		assert_eq!(one, etag(&profile(Some(vec![partner("a.test")]))));
+	}
+
+	#[test]
+	fn full_etag_ignores_x_insertion_order() {
+		let entries = [("about", "a"), ("bio", "b"), ("links", "c"), ("sections", "about,bio")];
+		let fwd: HashMap<Box<str>, Box<str>> =
+			entries.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect();
+		let rev: HashMap<Box<str>, Box<str>> =
+			entries.iter().rev().map(|(k, v)| ((*k).into(), (*v).into())).collect();
+		let etag = |x| {
+			let p = Profile {
+				id_tag: "club.test".into(),
+				name: "Club".into(),
+				r#type: "community".into(),
+				profile_pic: None,
+				cover_pic: None,
+				keys: Vec::new(),
+				x: Some(filter_sections(x, anon())),
+				partners: None,
+			};
+			compute_etag(&serde_json::to_vec(&p).unwrap())
+		};
+		assert_eq!(etag(fwd), etag(rev));
 	}
 
 	#[test]
