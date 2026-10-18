@@ -408,6 +408,23 @@ async fn test_list_files_file_type_filter_with_include_folders() {
 }
 
 #[tokio::test]
+async fn test_list_files_file_type_fldr_matches_local_folders() {
+	// A local folder has no `files` row, so its type is only derived ('FLDR'); the
+	// filter must match that (the files sidebar lists pinned folders with fileTp=FLDR).
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "test_user").await.ok();
+
+	make_folder(&adapter, tn_id, "fld_docs", "Docs", None).await;
+	make_image(&adapter, tn_id, "f_pic", "pic.png", None).await;
+
+	let opts = ListFileOptions { file_type: Some(vec!["FLDR".into()]), ..Default::default() };
+	let result = adapter.list_files(tn_id, &opts).await.expect("list ok");
+	let ids: Vec<String> = result.iter().map(|f| f.index_id().to_string()).collect();
+	assert_eq!(ids, vec!["fld_docs".to_string()]);
+}
+
+#[tokio::test]
 async fn test_list_files_empty_filter_vectors_apply_no_constraint() {
 	// An empty filter vector must behave as "no constraint" rather than emitting
 	// broken SQL (e.g. `IN ()` or a dangling `AND ()`). Not reachable from HTTP

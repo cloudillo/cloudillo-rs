@@ -731,6 +731,12 @@ impl AccessLevel {
 		}
 	}
 
+	/// A share link's level: never admin (a link does not delegate share management), so a
+	/// legacy `'A'` row reads as write.
+	pub fn from_link_char(c: char) -> Self {
+		Self::from_perm_char(c).min(Self::Write)
+	}
+
 	/// Map an access level back to its single-char wire form.
 	///
 	/// Injective inverse of [`AccessLevel::from_perm_char`]. `None` has no char — the caller

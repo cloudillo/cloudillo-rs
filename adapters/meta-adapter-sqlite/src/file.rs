@@ -10,8 +10,9 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 use crate::utils::{Db, collect_res, map_res, parse_str_list, push_patch};
 use cloudillo_types::meta_adapter::{
 	BrokenReason, ContentInfo, CreateFile, CreatedFile, DeleteFileResult, FileId, FileResolution,
-	FileStatus, FileUserData, FileVariant, FileView, ListFileOptions, ProfileInfo, ProfileType,
-	ROOT_PARENT_ID, SHARE_FILE_REF_TYPE, UpdateFileOptions,
+	FileStatus, FileUserData, FileVariant, FileView, ListFileOptions, MANAGED_PARENT_ID,
+	MAX_PARENT_DEPTH, ProfileInfo, ProfileType, ROOT_PARENT_ID, SHARE_FILE_REF_TYPE,
+	TRASH_PARENT_ID, UpdateFileOptions,
 };
 use cloudillo_types::prelude::*;
 use cloudillo_types::types::AccessLevel;
@@ -210,30 +211,45 @@ pub(crate) async fn resolve_entry(db: &SqlitePool, tn_id: TnId, id: &str) -> ClR
 	}
 }
 
+/// `(WITH RECURSIVE dsc(id, depth) AS (SELECT <seed> UNION <children>) SELECT id FROM dsc)`:
+/// the seed ids and every descendant, at most `MAX_PARENT_DEPTH` hops. `seed` pushes
+/// `<id expr>, 0[ FROM …]`; `folders_only` follows only into local folders.
+fn push_descendant_ids(
+	q: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+	tn_id: TnId,
+	folders_only: bool,
+	seed: impl FnOnce(&mut sqlx::QueryBuilder<sqlx::Sqlite>),
+) {
+	q.push("(WITH RECURSIVE dsc(id, depth) AS (SELECT ");
+	seed(q);
+	q.push(" UNION SELECT c.entry_id, dsc.depth + 1 FROM dsc JOIN entries c ON c.tn_id=")
+		.push_bind(tn_id.0)
+		.push(" AND c.parent_id=dsc.id");
+	if folders_only {
+		q.push(" AND c.f_id IS NULL AND c.ref_file_id IS NULL");
+	}
+	q.push(" WHERE dsc.depth < ")
+		.push_bind(i64::try_from(MAX_PARENT_DEPTH).unwrap_or(i64::MAX))
+		.push(") SELECT id FROM dsc)");
+}
+
 /// Push `(<subquery>)` yielding every entry_id `subject` holds a live `'U'` share entry on,
-/// directly or through an ancestor folder (descends `parent_id`, capped at 64 hops like
-/// `file_access::MAX_PARENT_DEPTH`). A recursive CTE rather than a `DirCache` walk: the
+/// directly or through an ancestor folder. A recursive CTE rather than a `DirCache` walk: the
 /// grant must filter in SQL so pagination stays correct.
 pub(crate) fn push_shared_file_ids(
 	query: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
 	tn_id: TnId,
 	subject: &str,
 ) {
-	query
-		.push(
-			"(WITH RECURSIVE shared(id, depth) AS (\
-			 SELECT resource_id, 0 FROM share_entries WHERE tn_id=",
-		)
-		.push_bind(tn_id.0)
-		.push(" AND resource_type='F' AND subject_type='U' AND subject_id=")
-		.push_bind(normalize_id_tag(subject).into_owned())
-		.push(
-			" AND (expires_at IS NULL OR expires_at > unixepoch()) \
-			 UNION SELECT c.entry_id, s.depth + 1 FROM shared s \
-			 JOIN entries c ON c.tn_id=",
-		)
-		.push_bind(tn_id.0)
-		.push(" AND c.parent_id=s.id WHERE s.depth < 64) SELECT id FROM shared)");
+	push_descendant_ids(query, tn_id, false, |q| {
+		q.push("resource_id, 0 FROM share_entries WHERE tn_id=")
+			.push_bind(tn_id.0)
+			.push(" AND resource_type='F' AND subject_type='U' AND subject_id=")
+			.push_bind(normalize_id_tag(subject).into_owned())
+			.push(" AND (expires_at IS NULL OR expires_at > ")
+			.push_bind(Timestamp::now().0)
+			.push(")");
+	});
 }
 
 /// `((1=1 [AND visibility|role] [AND channel]) [OR shared]` — the caller closes the outer `)`.
@@ -271,6 +287,113 @@ pub(crate) fn push_entry_gate(
 	}
 }
 
+/// ` AND <entry e is neither trashed nor managed, nor below such an entry>`. Soft delete
+/// re-parents only the deleted row, so a trashed folder's descendants keep their parent.
+fn push_not_under_trash_or_managed(q: &mut sqlx::QueryBuilder<sqlx::Sqlite>, tn_id: TnId) {
+	// Direct trash/managed children go by the cheap check (managed rows never have children);
+	// anything deeper sits in a folder under a trashed folder.
+	q.push(" AND (e.parent_id IS NULL OR (e.parent_id NOT IN (")
+		.push_bind(TRASH_PARENT_ID)
+		.push(", ")
+		.push_bind(MANAGED_PARENT_ID)
+		.push(") AND e.parent_id NOT IN ");
+	// walks every trashed subtree once per listing (uncorrelated, materialised);
+	// materialise a trashed flag (schema migration) if trash gets large
+	push_descendant_ids(q, tn_id, true, |q| {
+		q.push("entry_id, 0 FROM entries WHERE tn_id=")
+			.push_bind(tn_id.0)
+			.push(" AND parent_id=")
+			.push_bind(TRASH_PARENT_ID)
+			.push(" AND f_id IS NULL AND ref_file_id IS NULL");
+	});
+	q.push("))");
+}
+
+/// Drive filter (`ListFileOptions::channel`): `""` = the main drive, otherwise that room.
+fn push_drive_channel(q: &mut sqlx::QueryBuilder<sqlx::Sqlite>, channel: Option<&str>) {
+	match channel {
+		Some("") => {
+			q.push(" AND e.channel IS NULL");
+		}
+		Some(channel) => {
+			q.push(" AND e.channel=").push_bind(channel.to_owned());
+		}
+		None => {}
+	}
+}
+
+/// ` AND (<option> OR …)` for the exposure filter (`ListFileOptions::access`) on entry `e`.
+/// `people` and `link` count what was granted on this entry itself, never on an ancestor.
+fn push_access_filter(q: &mut sqlx::QueryBuilder<sqlx::Sqlite>, access: &[String]) -> ClResult<()> {
+	const VIS_DIRECT: &str = "(e.visibility IS NULL OR e.visibility='D')";
+	const COMMUNITY: &str = "EXISTS (SELECT 1 FROM tenants t WHERE t.tn_id=e.tn_id AND t.type='C')";
+	let now = Timestamp::now();
+	let live_user_share = |q: &mut sqlx::QueryBuilder<sqlx::Sqlite>| {
+		q.push(
+			"EXISTS (SELECT 1 FROM share_entries se WHERE se.tn_id=e.tn_id \
+			 AND se.resource_type='F' AND se.resource_id=e.entry_id AND se.subject_type='U' \
+			 AND se.subject_id <> COALESCE(NULLIF(e.owner_tag,''), \
+			 (SELECT t.id_tag FROM tenants t WHERE t.tn_id=e.tn_id)) \
+			 AND (se.expires_at IS NULL OR se.expires_at > ",
+		)
+		.push_bind(now.0)
+		.push("))");
+	};
+	// `share.file` refs hold the entry_id in `resource_id` (see `sweep_file_shares`).
+	let live_link = |q: &mut sqlx::QueryBuilder<sqlx::Sqlite>| {
+		q.push("EXISTS (SELECT 1 FROM refs r WHERE r.tn_id=e.tn_id AND r.type=")
+			.push_bind(SHARE_FILE_REF_TYPE)
+			.push(" AND r.resource_id=e.entry_id AND ");
+		crate::reference::push_live_ref(q, "r.", now);
+		q.push(")");
+	};
+	q.push(" AND (");
+	for (i, option) in access.iter().enumerate() {
+		if i > 0 {
+			q.push(" OR ");
+		}
+		match option.as_str() {
+			// Direct (NULL or 'D') is seen by the owner alone on a personal main drive. In a room
+			// or on a community it is the members' (`audience`), as `/access` reports it.
+			"private" => {
+				q.push("(")
+					.push(VIS_DIRECT)
+					.push(" AND e.channel IS NULL AND NOT ")
+					.push(COMMUNITY)
+					.push(" AND NOT ");
+				live_user_share(q);
+				q.push(" AND NOT ");
+				live_link(q);
+				q.push(")");
+			}
+			// The room gates every visibility (`push_entry_gate`), so `/access` reports any
+			// room entry as the room.
+			"audience" => {
+				q.push("(e.channel IS NOT NULL OR (")
+					.push(VIS_DIRECT)
+					.push(" AND ")
+					.push(COMMUNITY)
+					.push("))");
+			}
+			// Mirrors the `VisibilityLevel` match in cloudillo-file `access.rs`; the access-matrix
+			// scenario `access_filter_agrees_with_access_endpoint` checks both, exhaustively.
+			"network" => {
+				q.push("(e.visibility IN ('V','2','F','C','S') AND e.channel IS NULL)");
+			}
+			"people" => live_user_share(q),
+			"link" => live_link(q),
+			"public" => {
+				q.push("(e.visibility='P' AND e.channel IS NULL)");
+			}
+			other => {
+				return Err(Error::ValidationError(format!("unknown access filter: {other}")));
+			}
+		}
+	}
+	q.push(")");
+	Ok(())
+}
+
 /// List files with filtering and pagination
 pub(crate) async fn list(
 	db: &SqlitePool,
@@ -282,6 +405,7 @@ pub(crate) async fn list(
 	let needs_user_join = has_user
 		&& (opts.pinned.is_some()
 			|| opts.starred.is_some()
+			|| opts.opened_since.is_some()
 			|| matches!(opts.sort.as_deref(), Some("recent" | "modified")));
 
 	let mut query = sqlx::QueryBuilder::new("SELECT ");
@@ -296,8 +420,12 @@ pub(crate) async fn list(
 
 	// Add file_user_data JOIN if needed for filtering/sorting or to include user data
 	if has_user {
-		if needs_user_join && (opts.pinned == Some(true) || opts.starred == Some(true)) {
-			// INNER JOIN when filtering by pinned/starred (must have the data)
+		if needs_user_join
+			&& (opts.pinned == Some(true)
+				|| opts.starred == Some(true)
+				|| opts.opened_since.is_some())
+		{
+			// INNER JOIN when filtering by pinned/starred/openedSince (must have the data)
 			query.push(
 				" INNER JOIN file_user_data fud ON fud.tn_id=e.tn_id AND fud.e_id=e.e_id AND fud.id_tag=",
 			);
@@ -374,36 +502,38 @@ pub(crate) async fn list(
 	}
 
 	// Filter by parent folder
+	let recursive = opts.recursive;
 	if let Some(parent_id) = &opts.parent_id {
 		if parent_id == ROOT_PARENT_ID {
-			// Explicit root: files with no parent (not in any folder, not in trash)
-			query.push(" AND e.parent_id IS NULL");
-			// Drive filter: `""` = the main drive, otherwise that room.
-			match opts.channel.as_deref() {
-				Some("") => {
-					query.push(" AND e.channel IS NULL");
-				}
-				Some(channel) => {
-					query.push(" AND e.channel=").push_bind(channel);
-				}
-				None => {}
+			if recursive {
+				// The whole drive: every live entry, wherever it is nested.
+				push_not_under_trash_or_managed(&mut query, tn_id);
+			} else {
+				// Explicit root: files with no parent (not in any folder, not in trash)
+				query.push(" AND e.parent_id IS NULL");
 			}
+			push_drive_channel(&mut query, opts.channel.as_deref());
+		} else if recursive && parent_id != TRASH_PARENT_ID && parent_id != MANAGED_PARENT_ID {
+			// Every descendant: the parent is the folder itself or any folder below it. A
+			// subquery (not the `SUBTREE_CTE` statement prefix) so it composes with the builder.
+			query.push(" AND e.parent_id IN ");
+			push_descendant_ids(&mut query, tn_id, true, |q| {
+				q.push_bind(parent_id.as_str()).push(", 0");
+			});
 		} else {
 			// Specific folder (including "__trash__" / "__managed__" for those contents)
 			query.push(" AND e.parent_id=").push_bind(parent_id.as_str());
 		}
 	} else if opts.file_id.is_none() && !opts.sweep_all {
+		if recursive {
+			push_drive_channel(&mut query, opts.channel.as_deref());
+		}
 		// Default browse listing (no targeted fileId): exclude trashed and managed
 		// files. A by-id lookup with no parentId deliberately skips this so it
 		// returns the file wherever it lives (managed or trash included), and so
 		// does `sweep_all`, which must see a trashed file to take its derived
 		// state back out.
-		query
-			.push(" AND (e.parent_id IS NULL OR e.parent_id NOT IN (")
-			.push_bind(cloudillo_types::meta_adapter::TRASH_PARENT_ID)
-			.push(", ")
-			.push_bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
-			.push("))");
+		push_not_under_trash_or_managed(&mut query, tn_id);
 	}
 	// else (fileId present, no parentId): no parent-folder predicate — return the
 	// file regardless of folder.
@@ -466,13 +596,15 @@ pub(crate) async fn list(
 	if let Some(file_types) = &opts.file_type
 		&& !file_types.is_empty()
 	{
+		// Same `file_tp` as `FILE_VIEW_COLS` reports: a local folder has no `files` row, so a
+		// plain COALESCE is NULL for it and `fileTp=FLDR` would never match one.
+		const FILE_TP: &str = "CASE WHEN e.ref_file_id IS NOT NULL THEN e.ref_file_tp \
+			WHEN e.f_id IS NULL THEN 'FLDR' ELSE f.file_tp END";
 		query.push(" AND (");
 		if file_types.len() == 1 {
-			query
-				.push("COALESCE(f.file_tp, e.ref_file_tp)=")
-				.push_bind(file_types[0].as_str());
+			query.push(FILE_TP).push("=").push_bind(file_types[0].as_str());
 		} else {
-			query.push("COALESCE(f.file_tp, e.ref_file_tp) IN ");
+			query.push(FILE_TP).push(" IN ");
 			query = crate::utils::push_in(query, file_types.as_slice());
 		}
 		if opts.include_folders {
@@ -592,6 +724,57 @@ pub(crate) async fn list(
 		if opts.starred == Some(true) {
 			query.push(" AND fud.starred = 1");
 		}
+	}
+
+	// The browse filters below only narrow: all are ANDed after the entry gate.
+	if let Some(since) = opts.opened_since {
+		if has_user {
+			query.push(" AND fud.accessed_at >= ").push_bind(since.0);
+		} else {
+			// No caller, no `fud`: nothing was opened by them.
+			query.push(" AND 1=0");
+		}
+	}
+
+	// Exact tags, case-sensitive, ANDed; `entries.tags` is comma-joined (see `insert_entry`).
+	if let Some(tags) = &opts.tags {
+		for tag in tags {
+			query
+				.push(" AND instr(',' || e.tags || ',', ',' || ")
+				.push_bind(tag.as_str())
+				.push(" || ',') > 0");
+		}
+	}
+
+	if let Some(access) = &opts.access
+		&& !access.is_empty()
+	{
+		push_access_filter(&mut query, access)?;
+		// Mirrors `file_access::get_access_level` on a local row: the owner (Admin), or a
+		// Write role in a room the caller can enter (the handler's gate ensures the role).
+		// rows reachable only via an explicit W/A share are omitted; add a closest-grant CTE
+		// if grantees need them
+		if let Some(reader) = &opts.share_set_reader {
+			query
+				.push(" AND e.upstream_tag IS NULL AND (e.owner_tag=")
+				.push_bind(normalize_id_tag(&reader.id_tag).into_owned())
+				.push(" OR ");
+			match &reader.rooms {
+				Some(rooms) => crate::utils::push_channel_in(&mut query, "e.channel", rooms),
+				None => {
+					query.push("1=1");
+				}
+			}
+			query.push(")");
+		}
+	}
+
+	// A folder has no `files` row, so it falls back to the entry's own `updated_at`.
+	if let Some(after) = opts.modified_after {
+		query.push(" AND COALESCE(f.modified_at, e.updated_at) >= ").push_bind(after.0);
+	}
+	if let Some(before) = opts.modified_before {
+		query.push(" AND COALESCE(f.modified_at, e.updated_at) < ").push_bind(before.0);
 	}
 
 	// Determine sort order
@@ -1519,6 +1702,9 @@ pub(crate) async fn update_data(
 	Ok(())
 }
 
+// The literal `64` in `SUBTREE_CTE` and `count_channel_entries` is `MAX_PARENT_DEPTH`.
+const _: () = assert!(MAX_PARENT_DEPTH == 64);
+
 /// `sub(e_id)`: the entry `?` and its folder subtree, for a `WITH RECURSIVE` prefix. Binds
 /// `tn_id`, root `e_id`, `tn_id`.
 const SUBTREE_CTE: &str = "WITH RECURSIVE sub(e_id, entry_id, depth) AS (\
@@ -1927,7 +2113,7 @@ pub(crate) async fn list_referenced_managed_fids(
 		   )"
 	)))
 	.bind(tn_id.0)
-	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.bind(MANAGED_PARENT_ID)
 	.fetch_all(db)
 	.await
 	.db()?;
@@ -1942,7 +2128,7 @@ pub(crate) async fn list_referenced_managed_fids(
 		   AND (t.profile_pic = f.file_id OR t.cover_pic = f.file_id)"
 	)))
 	.bind(tn_id.0)
-	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.bind(MANAGED_PARENT_ID)
 	.fetch_all(db)
 	.await
 	.db()?;
@@ -1957,7 +2143,7 @@ pub(crate) async fn list_referenced_managed_fids(
 		 WHERE f.tn_id = ?1 AND {IN_MANAGED}"
 	)))
 	.bind(tn_id.0)
-	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.bind(MANAGED_PARENT_ID)
 	.fetch_all(db)
 	.await
 	.db()?;
@@ -1977,7 +2163,7 @@ pub(crate) async fn list_referenced_managed_fids(
 		 WHERE f.tn_id = ?1 AND {IN_MANAGED}"
 	)))
 	.bind(tn_id.0)
-	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.bind(MANAGED_PARENT_ID)
 	.fetch_all(db)
 	.await
 	.db()?;
@@ -2232,7 +2418,7 @@ pub(crate) async fn delete_action_entries(
 	)
 	.bind(tn_id.0)
 	.bind(action_id)
-	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.bind(MANAGED_PARENT_ID)
 	.fetch_all(&mut *tx)
 	.await
 	.db()?;
@@ -2294,7 +2480,7 @@ pub(crate) async fn create_managed_entry(
 	.bind(tn_id.0)
 	.bind(f_id)
 	.bind(action_id)
-	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.bind(MANAGED_PARENT_ID)
 	.fetch_optional(&mut *tx)
 	.await
 	.db()?;
@@ -2309,7 +2495,7 @@ pub(crate) async fn create_managed_entry(
 		visibility,
 		channel: channel.map(Into::into),
 		action_id: action_id.map(Into::into),
-		parent_id: Some(cloudillo_types::meta_adapter::MANAGED_PARENT_ID.into()),
+		parent_id: Some(MANAGED_PARENT_ID.into()),
 		..Default::default()
 	};
 	insert_entry(&mut tx, tn_id, &entry_id, Some(f_id), "A", &opts).await?;
@@ -2412,7 +2598,14 @@ pub(crate) async fn delete(
 #[cfg(test)]
 mod tests {
 	use super::parse_broken_reason;
-	use cloudillo_types::meta_adapter::BrokenReason;
+	use cloudillo_types::meta_adapter::{
+		BrokenReason, CreateFile, FileId, FileStatus, ListFileOptions, ROOT_PARENT_ID,
+		ShareSetReader, TRASH_PARENT_ID,
+	};
+	use cloudillo_types::prelude::TnId;
+	use cloudillo_types::types::Timestamp;
+	use sqlx::Row;
+	use sqlx::sqlite::{self, SqlitePool};
 
 	#[test]
 	fn test_parse_broken_reason_roundtrip() {
@@ -2431,11 +2624,6 @@ mod tests {
 	fn test_parse_broken_reason_unknown_value() {
 		assert_eq!(parse_broken_reason(Some("not-a-real-reason")), None);
 	}
-
-	use cloudillo_types::meta_adapter::{CreateFile, FileId, FileStatus};
-	use cloudillo_types::prelude::TnId;
-	use sqlx::Row;
-	use sqlx::sqlite::{self, SqlitePool};
 
 	// Build a production-like single-connection write pool over a temp DB file
 	// (mirrors `MetaAdapterSqlite::new`: WAL, single write connection).
@@ -2529,5 +2717,321 @@ mod tests {
 				.get(0);
 			assert_eq!(entries, 1, "iter {iter}: expected exactly one entry");
 		}
+	}
+
+	/// Create an active entry; returns its entry_id (a folder's is its `id`).
+	async fn make_entry(
+		db: &SqlitePool,
+		id: &str,
+		folder: bool,
+		parent: Option<&str>,
+		tags: &[&str],
+		visibility: Option<char>,
+	) -> Box<str> {
+		let opts = CreateFile {
+			file_id: Some(id.into()),
+			parent_id: parent.map(Into::into),
+			content_type: (if folder { "cloudillo/folder" } else { "text/plain" }).into(),
+			file_name: id.into(),
+			file_tp: Some((if folder { "FLDR" } else { "BLOB" }).into()),
+			tags: (!tags.is_empty()).then(|| tags.iter().map(|&t| t.into()).collect()),
+			visibility,
+			status: Some(FileStatus::Active),
+			..Default::default()
+		};
+		super::create(db, TnId(1), opts).await.expect("create entry").entry_id
+	}
+
+	async fn names(db: &SqlitePool, opts: &ListFileOptions) -> Vec<String> {
+		let mut v: Vec<String> = super::list(db, TnId(1), opts)
+			.await
+			.expect("list")
+			.into_iter()
+			.map(|f| f.file_name.to_string())
+			.collect();
+		v.sort();
+		v
+	}
+
+	struct Seeded {
+		_dir: tempfile::TempDir,
+		db: SqlitePool,
+		fa: Box<str>,
+		fb: Box<str>,
+		fc: Box<str>,
+		fv: Box<str>,
+		fr: Box<str>,
+		fp: Box<str>,
+	}
+
+	// Tree: A/{B/{fb}, fa}, fc at the root. Exposure: A plain; B has a live link; fa a live
+	// user share; fb is 'D' with only an expired share and an exhausted link; fc is public.
+	async fn seed() -> Seeded {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		sqlx::query("INSERT INTO tenants (tn_id, id_tag, type) VALUES (1, 'owner.test', 'P')")
+			.execute(&db)
+			.await
+			.expect("tenant");
+
+		make_entry(&db, "A", true, None, &[], None).await;
+		let b = make_entry(&db, "B", true, Some("A"), &[], None).await;
+		let fa = make_entry(&db, "fa", false, Some("A"), &["x", "y"], None).await;
+		let fb = make_entry(&db, "fb", false, Some("B"), &["x"], Some('D')).await;
+		let fc = make_entry(&db, "fc", false, None, &["xy"], Some('P')).await;
+		let fv = make_entry(&db, "fv", false, None, &["5%"], Some('V')).await;
+		let fr = make_entry(&db, "fr", false, None, &[], Some('D')).await;
+		let fp = make_entry(&db, "fp", false, None, &["X"], Some('P')).await;
+		for entry in [&fr, &fp] {
+			sqlx::query("UPDATE entries SET channel='@owner.test~room' WHERE entry_id=?")
+				.bind(&**entry)
+				.execute(&db)
+				.await
+				.expect("channel");
+		}
+		make_entry(&db, "T", true, Some(TRASH_PARENT_ID), &[], None).await;
+		// Soft delete re-parents only the folder: its child keeps `parent_id = T`.
+		make_entry(&db, "ft", false, Some("T"), &[], None).await;
+		make_entry(&db, "TS", true, Some("T"), &[], None).await;
+		make_entry(&db, "fts", false, Some("TS"), &[], None).await;
+
+		for (entry, expires) in [(&fa, None), (&fb, Some(1_i64))] {
+			sqlx::query(
+				"INSERT INTO share_entries (tn_id, resource_type, resource_id, subject_type, \
+				 subject_id, permission, expires_at, created_by) \
+				 VALUES (1, 'F', ?, 'U', 'friend.test', 'R', ?, 'owner.test')",
+			)
+			.bind(&**entry)
+			.bind(expires)
+			.execute(&db)
+			.await
+			.expect("share entry");
+		}
+		// The owner's self-grant on A exposes it to nobody: A stays private, not people.
+		sqlx::query(
+			"INSERT INTO share_entries (tn_id, resource_type, resource_id, subject_type, \
+			 subject_id, permission, created_by) \
+			 VALUES (1, 'F', 'A', 'U', 'owner.test', 'W', 'owner.test')",
+		)
+		.execute(&db)
+		.await
+		.expect("self share entry");
+		for (ref_id, entry, count) in [("r1", &b, None), ("r2", &fb, Some(0_i64))] {
+			sqlx::query(
+				"INSERT INTO refs (tn_id, ref_id, type, resource_id, access_level, count) \
+				 VALUES (1, ?, 'share.file', ?, 'R', ?)",
+			)
+			.bind(ref_id)
+			.bind(&**entry)
+			.bind(count)
+			.execute(&db)
+			.await
+			.expect("ref");
+		}
+		Seeded { _dir: dir, db, fa, fb, fc, fv, fr, fp }
+	}
+
+	fn access(a: &[&str]) -> ListFileOptions {
+		ListFileOptions {
+			access: Some(a.iter().map(ToString::to_string).collect()),
+			..Default::default()
+		}
+	}
+
+	#[tokio::test]
+	async fn list_recursive_and_trash() {
+		let s = seed().await;
+		// Recursive: descendants at depth 2, vs direct children only.
+		let mut opts = ListFileOptions { parent_id: Some("A".into()), ..Default::default() };
+		assert_eq!(names(&s.db, &opts).await, ["B", "fa"]);
+		opts.recursive = true;
+		assert_eq!(names(&s.db, &opts).await, ["B", "fa", "fb"]);
+		let opts = ListFileOptions {
+			parent_id: Some(ROOT_PARENT_ID.into()),
+			recursive: true,
+			..Default::default()
+		};
+		assert_eq!(names(&s.db, &opts).await, ["A", "B", "fa", "fb", "fc", "fp", "fr", "fv"]);
+		// No parentId: the default listing, flat or recursive, never shows the trashed child,
+		// nor a file in a trashed folder's subfolder (fts).
+		let mut opts = ListFileOptions::default();
+		assert_eq!(names(&s.db, &opts).await, ["A", "B", "fa", "fb", "fc", "fp", "fr", "fv"]);
+		opts.recursive = true;
+		assert_eq!(names(&s.db, &opts).await, ["A", "B", "fa", "fb", "fc", "fp", "fr", "fv"]);
+		opts.channel = Some(String::new());
+		assert_eq!(names(&s.db, &opts).await, ["A", "B", "fa", "fb", "fc", "fv"]);
+		opts.channel = Some("@owner.test~room".into());
+		assert_eq!(names(&s.db, &opts).await, ["fp", "fr"]);
+		// The trash sentinel ignores `recursive`: its direct rows only.
+		let opts = ListFileOptions {
+			parent_id: Some(TRASH_PARENT_ID.into()),
+			recursive: true,
+			..Default::default()
+		};
+		assert_eq!(names(&s.db, &opts).await, ["T"]);
+	}
+
+	#[tokio::test]
+	async fn list_tags() {
+		let s = seed().await;
+		// Tags: exact and ANDed ("xy" is not "x").
+		let tags = |t: &[&str]| ListFileOptions {
+			tags: Some(t.iter().map(ToString::to_string).collect()),
+			..Default::default()
+		};
+		assert_eq!(names(&s.db, &tags(&["x", "y"])).await, ["fa"]);
+		assert_eq!(names(&s.db, &tags(&["x"])).await, ["fa", "fb"]);
+		// Case-sensitive: "X" is not "x".
+		assert_eq!(names(&s.db, &tags(&["X"])).await, ["fp"]);
+		// LIKE wildcards in a tag are literal.
+		assert_eq!(names(&s.db, &tags(&["5%"])).await, ["fv"]);
+		assert!(names(&s.db, &tags(&["%"])).await.is_empty());
+	}
+
+	#[tokio::test]
+	async fn list_access() {
+		let s = seed().await;
+		// Exposure, each value and an OR of two.
+		// Subscribed counts as network, like `/access`'s `subscribers`.
+		make_entry(&s.db, "fs", false, None, &[], Some('S')).await;
+		// Direct is stored NULL (A) or 'D' (fb); B and fa are exposed by a live link / share.
+		assert_eq!(names(&s.db, &access(&["private"])).await, ["A", "fb"]);
+		// Any room entry is the room's audience: direct (fr) is not private, public (fp) is not
+		// public.
+		assert_eq!(names(&s.db, &access(&["audience"])).await, ["fp", "fr"]);
+		assert_eq!(names(&s.db, &access(&["network"])).await, ["fs", "fv"]);
+		assert_eq!(names(&s.db, &access(&["people"])).await, ["fa"]);
+		assert_eq!(names(&s.db, &access(&["link"])).await, ["B"]);
+		assert_eq!(names(&s.db, &access(&["public"])).await, ["fc"]);
+		assert_eq!(names(&s.db, &access(&["people", "public"])).await, ["fa", "fc"]);
+		assert!(super::list(&s.db, TnId(1), &access(&["bogus"])).await.is_err());
+	}
+
+	#[tokio::test]
+	async fn list_access_community() {
+		let s = seed().await;
+		// On a community tenant a direct main-drive entry is seen by its members.
+		sqlx::query("INSERT INTO tenants (tn_id, id_tag, type) VALUES (2, 'club.test', 'C')")
+			.execute(&s.db)
+			.await
+			.expect("community tenant");
+		let opts = CreateFile {
+			file_id: Some("fm".into()),
+			content_type: "text/plain".into(),
+			file_name: "fm".into(),
+			file_tp: Some("BLOB".into()),
+			status: Some(FileStatus::Active),
+			..Default::default()
+		};
+		super::create(&s.db, TnId(2), opts).await.expect("community entry");
+		let in_club = |a: &'static str| {
+			let db = s.db.clone();
+			async move { super::list(&db, TnId(2), &access(&[a])).await.expect("list").len() }
+		};
+		assert_eq!(in_club("audience").await, 1);
+		assert_eq!(in_club("private").await, 0);
+	}
+
+	#[tokio::test]
+	async fn list_opened_since() {
+		let s = seed().await;
+		// openedSince: the calling user's own `accessed_at`; no caller matches nothing.
+		for (entry, at) in [(&s.fa, 1000_i64), (&s.fb, 3000)] {
+			sqlx::query(
+				"INSERT INTO file_user_data (tn_id, id_tag, e_id, accessed_at) \
+				 SELECT 1, 'owner.test', e_id, ? FROM entries WHERE entry_id=?",
+			)
+			.bind(at)
+			.bind(&**entry)
+			.execute(&s.db)
+			.await
+			.expect("file user data");
+		}
+		let mut opts = ListFileOptions {
+			opened_since: Some(Timestamp(2000)),
+			user_id_tag: Some("owner.test".into()),
+			..Default::default()
+		};
+		assert_eq!(names(&s.db, &opts).await, ["fb"]);
+		opts.user_id_tag = None;
+		assert!(names(&s.db, &opts).await.is_empty());
+	}
+
+	#[tokio::test]
+	async fn list_modified_range() {
+		let s = seed().await;
+		// Modified range: files by `files.modified_at`, folders by `entries.updated_at` (now; the
+		// `entries_updated_at` trigger overrides any test UPDATE of it).
+		// fa and fc sit exactly on the `>=` / `<` bounds below.
+		for (entry, at) in [
+			(&s.fa, 200_i64),
+			(&s.fb, 500),
+			(&s.fc, 600),
+			(&s.fv, 50),
+			(&s.fr, 50),
+			(&s.fp, 50),
+		] {
+			sqlx::query(
+				"UPDATE files SET modified_at=? \
+				 WHERE f_id=(SELECT f_id FROM entries WHERE entry_id=?)",
+			)
+			.bind(at)
+			.bind(&**entry)
+			.execute(&s.db)
+			.await
+			.expect("modified_at");
+		}
+		let opts = ListFileOptions {
+			modified_after: Some(Timestamp(200)),
+			modified_before: Some(Timestamp(600)),
+			..Default::default()
+		};
+		assert_eq!(names(&s.db, &opts).await, ["fa", "fb"]);
+		let opts = ListFileOptions { modified_after: Some(Timestamp(1000)), ..Default::default() };
+		assert_eq!(names(&s.db, &opts).await, ["A", "B"]);
+	}
+
+	#[tokio::test]
+	async fn list_share_set_reader() {
+		let s = seed().await;
+		// Share-set reader: friend's own local room row (ff), a tenant row in the room (fo) and
+		// a mirror (fu), each with a live user share like fa.
+		let ff = make_entry(&s.db, "ff", false, None, &[], None).await;
+		let fo = make_entry(&s.db, "fo", false, None, &[], None).await;
+		let fu = make_entry(&s.db, "fu", false, None, &[], None).await;
+		let room = Some("@owner.test~room");
+		for (entry, owner, channel, upstream) in [
+			(&ff, Some("friend.test"), room, None),
+			(&fo, None, room, None),
+			(&fu, None, None, Some("remote.test")),
+		] {
+			sqlx::query(
+				"UPDATE entries SET owner_tag=?, channel=?, upstream_tag=? WHERE entry_id=?",
+			)
+			.bind(owner)
+			.bind(channel)
+			.bind(upstream)
+			.bind(&**entry)
+			.execute(&s.db)
+			.await
+			.expect("update entry");
+			sqlx::query(
+				"INSERT INTO share_entries (tn_id, resource_type, resource_id, subject_type, \
+				 subject_id, permission, created_by) \
+				 VALUES (1, 'F', ?, 'U', 'other.test', 'R', 'owner.test')",
+			)
+			.bind(&**entry)
+			.execute(&s.db)
+			.await
+			.expect("share entry");
+		}
+		let reader = |rooms: Option<Vec<Box<str>>>| ListFileOptions {
+			share_set_reader: Some(ShareSetReader { id_tag: "friend.test".into(), rooms }),
+			..access(&["people"])
+		};
+		assert_eq!(names(&s.db, &access(&["people"])).await, ["fa", "ff", "fo", "fu"]);
+		// No room: the main drive (fa) and friend's own row; never the mirror.
+		assert_eq!(names(&s.db, &reader(Some(Vec::new()))).await, ["fa", "ff"]);
+		assert_eq!(names(&s.db, &reader(None)).await, ["fa", "ff", "fo"]);
 	}
 }

@@ -16,7 +16,9 @@ use cloudillo_core::IdTag;
 use cloudillo_core::abac::{self, VisibilityLevel, relationship_level};
 use cloudillo_core::channels::{absolute_channel, can_enter, reader_roster};
 use cloudillo_core::extract::{Auth, OptionalAuth, OptionalRequestId};
-use cloudillo_core::roles::{is_moderator, role_level};
+use cloudillo_core::roles::{
+	FOLLOWER_LEVEL, MODERATOR_LEVEL, highest_role_level, is_moderator, role_level,
+};
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::meta_adapter::{Channel, UpdateChannelData};
 use cloudillo_types::types::{ApiResponse, ErrorResponse};
@@ -84,10 +86,41 @@ pub struct PatchChannelRequest {
 	closed: Patch<bool>,
 }
 
+/// Scoped tokens (share links, app tokens) never administer the tenant's rooms.
+fn reject_scoped(auth: &AuthCtx, what: &str) -> ClResult<()> {
+	if auth.scope.is_some() {
+		warn!("Rejecting {} by {}: scoped token", what, auth.id_tag);
+		return Err(Error::PermissionDenied);
+	}
+	Ok(())
+}
+
 fn require_moderator(auth: &AuthCtx) -> ClResult<()> {
-	// Scoped tokens (share links, app tokens) never administer the tenant's rooms.
-	if auth.scope.is_some() || !is_moderator(&auth.roles) {
+	reject_scoped(auth, "channel admin")?;
+	if !is_moderator(&auth.roles) {
 		warn!("Rejecting channel admin by {}: moderator+ required", auth.id_tag);
+		return Err(Error::PermissionDenied);
+	}
+	Ok(())
+}
+
+/// Room creation: moderator+, or the tenant's `room.create_role` floor. A stored value
+/// outside the member roles (unknown, or `follower` and below) falls back to moderator.
+async fn require_room_creator(app: &App, auth: &AuthCtx) -> ClResult<()> {
+	reject_scoped(auth, "room creation")?;
+	if is_moderator(&auth.roles) {
+		return Ok(());
+	}
+	let need = app
+		.settings
+		.get_string(auth.tn_id, "room.create_role")
+		.await
+		.ok()
+		.and_then(|r| role_level(&r))
+		.filter(|&l| l > FOLLOWER_LEVEL)
+		.unwrap_or(MODERATOR_LEVEL);
+	if highest_role_level(&auth.roles) < need {
+		warn!("Rejecting room creation by {}: below room.create_role", auth.id_tag);
 		return Err(Error::PermissionDenied);
 	}
 	Ok(())
@@ -183,14 +216,14 @@ pub async fn list_channels(
 	Ok((StatusCode::OK, Json(ApiResponse::new(entries).with_req_id(req_id.unwrap_or_default()))))
 }
 
-/// POST /api/channels — create a room (moderator+).
+/// POST /api/channels — create a room (moderator+, or down to `room.create_role`).
 pub async fn post_channel(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<CreateChannelRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Channel>>)> {
-	require_moderator(&auth)?;
+	require_room_creator(&app, &auth).await?;
 	if !validate_channel_name(&req.name) {
 		return Err(Error::ValidationError(format!("invalid channel name: {}", req.name)));
 	}
@@ -276,17 +309,27 @@ pub async fn delete_channel(
 	Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// GET /api/channels/{name}/members — a closed room's roster (moderator+).
+/// GET /api/channels/{name}/members — a closed room's roster (moderator+, or a member of it).
 pub async fn list_channel_members(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(name): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<Box<str>>>>)> {
-	require_moderator(&auth)?;
-	// Distinguish a missing room from an empty roster.
-	app.meta_adapter.read_channel(auth.tn_id, &name).await?;
-	let members = app.meta_adapter.list_channel_members(auth.tn_id, &name).await?;
+	reject_scoped(&auth, "member list")?;
+	let members = if is_moderator(&auth.roles) {
+		// Distinguish a missing room from an empty roster.
+		app.meta_adapter.read_channel(auth.tn_id, &name).await?;
+		app.meta_adapter.list_channel_members(auth.tn_id, &name).await?
+	} else {
+		// Members see their own roster. A non-member gets 403 whether or not the room exists.
+		let members = app.meta_adapter.list_channel_members(auth.tn_id, &name).await?;
+		if !members.contains(&auth.id_tag) {
+			warn!("Rejecting member list of {} by {}: not a member", name, auth.id_tag);
+			return Err(Error::PermissionDenied);
+		}
+		members
+	};
 	Ok((StatusCode::OK, Json(ApiResponse::new(members).with_req_id(req_id.unwrap_or_default()))))
 }
 

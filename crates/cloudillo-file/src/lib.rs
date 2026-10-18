@@ -3,6 +3,7 @@
 
 //! File subsystem. File storage, metadata, documents, etc.
 
+pub mod access;
 pub mod apkg;
 pub(crate) mod audio;
 pub(crate) mod container;

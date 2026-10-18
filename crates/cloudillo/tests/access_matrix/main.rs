@@ -374,6 +374,30 @@ async fn channel() {
 	assert!(status.is_success(), "create zqm-scratch: {status} {body}");
 
 	let mut rep = curated::run(fx, "channel", curated::cells(curated::CH)).await;
+	set_club(fx, "room.create_role", "supporter").await;
+	let policy = curated::run(fx, "channel-policy", curated::cells(curated::CH_ROOM_POLICY)).await;
+	let club = fx.tenants.club.tn_id;
+	// Past the validator: the raw row, with the settings cache dropped first.
+	fx.app
+		.settings
+		.delete(club, "room.create_role")
+		.await
+		.expect("clear room.create_role");
+	let follower = serde_json::to_value(SettingValue::String("follower".into())).expect("json");
+	fx.app
+		.meta_adapter
+		.update_setting(club, "room.create_role", Some(follower))
+		.await
+		.expect("raw room.create_role");
+	let fallback =
+		curated::run(fx, "channel-fallback", curated::cells(curated::CH_ROOM_FALLBACK)).await;
+	fx.app
+		.settings
+		.delete(club, "room.create_role")
+		.await
+		.expect("clear room.create_role");
+	policy.finish();
+	fallback.finish();
 	for (i, &(id, role, ch, want)) in CH_INBOX.iter().enumerate() {
 		rep.cell();
 		let c = InboxCell {
@@ -1732,6 +1756,260 @@ async fn inherited_shares_take_the_closest_ancestor() {
 	let (st, body) =
 		send(n, Method::GET, format!("/api/files/{doc}/metadata"), serde_json::Value::Null).await;
 	assert!(st.is_client_error(), "an expired inherited share reads: {st} {body}");
+}
+
+/// `n`'s request to its own host; a null `v` sends no body.
+async fn send_as(
+	fx: &Fixture,
+	n: &str,
+	m: Method,
+	uri: String,
+	v: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+	let body = if v.is_null() { Body::empty() } else { Body::from(v.to_string()) };
+	call(&fx.api, req(&fx.subject(n).host, m, &uri, bearer(fx.subject(n)), body)).await
+}
+
+fn id_tag_of(fx: &Fixture, n: &str) -> String {
+	fx.subject(n).facts.id_tag.clone().expect("id_tag")
+}
+
+/// A permanent `'U'` share of `entry` to `who`, issued by `issuer`.
+async fn share_to(
+	fx: &Fixture,
+	tn_id: cloudillo::types::TnId,
+	issuer: &str,
+	entry: String,
+	who: String,
+	permission: char,
+) {
+	use cloudillo::meta_adapter::CreateShareEntry;
+	let sh = CreateShareEntry { subject_type: 'U', subject_id: who, permission, expires_at: None };
+	fx.app
+		.meta_adapter
+		.create_share_entry(tn_id, 'F', &entry, issuer, &sh)
+		.await
+		.unwrap();
+}
+
+/// `/access` reports effective grants. FC-183, FC-248: the ancestor walk stops at the first
+/// folder whose share set the caller may not read, so its grants are absent, while the folder's
+/// writer sees them named (FC-249).
+/// FC-207: per idTag the closest grant wins (a direct `R` over an inherited `W`). FC-208: the
+/// audience follows the visibility, FC-237 for Direct. FC-209: room details go only to who may
+/// enter the room; FC-238: a deleted room has none.
+#[tokio::test]
+async fn access_reports_effective_grants() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let id_tag = |n: &str| id_tag_of(fx, n);
+	let send = |n: &'static str, m, uri, v| send_as(fx, n, m, uri, v);
+	let access = |n: &'static str, entry: &str| {
+		let uri = format!("/api/files/{entry}/access");
+		async move {
+			let (st, body) = send(n, Method::GET, uri, serde_json::Value::Null).await;
+			assert!(st.is_success(), "{n} reads access: {st} {body}");
+			body
+		}
+	};
+	let mk = |tp: &str, name: &str, parent: Option<&str>| {
+		let v = serde_json::json!({
+			"fileTp": tp, "contentType": "cloudillo/quillo", "fileName": name, "parentId": parent,
+		});
+		async move {
+			let (st, body) = send("owner@alice", Method::POST, "/api/files".into(), v).await;
+			assert!(st.is_success(), "create {st} {body}");
+			find_str(&body, "entryId").expect("entryId")
+		}
+	};
+	let share = |entry, who, permission| share_to(fx, alice, ALICE, entry, who, permission);
+	let person = |body: &serde_json::Value, n: &str| {
+		let tag = id_tag(n);
+		body["data"]["people"]
+			.as_array()
+			.and_then(|p| p.iter().find(|p| p["idTag"] == tag.as_str()).cloned())
+	};
+	let (outer, inner) = ("g-folder@alice.test", "g-read@alice.test");
+
+	let folder = mk("FLDR", "zqm-acc-folder", None).await;
+	let doc = mk("CRDT", "zqm-acc-doc", Some(&folder)).await;
+	share(folder.clone(), id_tag(outer), 'W').await;
+	share(doc.clone(), id_tag(inner), 'W').await;
+
+	// FC-183: the inner writer cannot read the folder, so the walk stops below it.
+	let body = access(inner, &doc).await;
+	assert!(person(&body, outer).is_none(), "FC-183: folder grant leaked: {body}");
+	let me = person(&body, inner).unwrap_or_else(|| panic!("FC-183: own grant missing: {body}"));
+	assert!(me.get("inheritedFrom").is_none(), "FC-183: own grant is direct: {body}");
+	let body = access(outer, &doc).await;
+	let o = person(&body, outer).unwrap_or_else(|| panic!("FC-183: not listed: {body}"));
+	assert_eq!(o["inheritedFrom"]["entryId"], folder.as_str(), "FC-183: {body}");
+
+	// FC-248: reading a folder is not reading its share set. A reader of the folder who writes
+	// the doc gets the doc's grants, not the folder's; FC-249: the folder's writer does.
+	let reader = "g-comment@alice.test";
+	let folder2 = mk("FLDR", "zqm-acc-folder2", None).await;
+	let doc3 = mk("CRDT", "zqm-acc-doc3", Some(&folder2)).await;
+	share(folder2.clone(), id_tag(outer), 'W').await;
+	share(folder2.clone(), id_tag(reader), 'R').await;
+	share(doc3.clone(), id_tag(reader), 'W').await;
+	let body = access(reader, &doc3).await;
+	assert!(person(&body, outer).is_none(), "FC-248: folder grant leaked: {body}");
+	assert!(person(&body, reader).is_some(), "FC-248: own grant missing: {body}");
+	let body = access(outer, &doc3).await;
+	let o = person(&body, outer).unwrap_or_else(|| panic!("FC-249: not listed: {body}"));
+	assert_eq!(o["inheritedFrom"]["entryId"], folder2.as_str(), "FC-249: {body}");
+
+	// FC-207: a direct `R` beats the folder's `W` for the same idTag.
+	let doc2 = mk("CRDT", "zqm-acc-doc2", Some(&folder)).await;
+	share(doc2.clone(), id_tag(outer), 'R').await;
+	let body = access("owner@alice", &doc2).await;
+	let o = person(&body, outer).unwrap_or_else(|| panic!("FC-207: not listed: {body}"));
+	assert_eq!(o["permission"], "R", "FC-207: the closest grant wins: {body}");
+	assert!(o.get("inheritedFrom").is_none(), "FC-207: direct: {body}");
+
+	// FC-208: audience by visibility.
+	for (obj, kind) in [("tenant-blob-p-active", "public"), ("tenant-blob-f-active", "followers")] {
+		let body = access("owner@alice", &objects::file_id(ALICE, obj)).await;
+		assert_eq!(body["data"]["audience"]["kind"], kind, "FC-208 {obj}: {body}");
+	}
+	// FC-237: Direct is the owner's alone on a personal tenant, the members' on a community.
+	let body = access("owner@alice", &objects::file_id(ALICE, "tenant-blob-d-active")).await;
+	assert_eq!(body["data"]["audience"]["kind"], "owner", "FC-237: {body}");
+	let body = access("owner@club", &objects::file_id(CLUB, "tenant-blob-d-active")).await;
+	assert_eq!(body["data"]["audience"]["kind"], "members", "FC-237: {body}");
+	// FC-238: the room is gone (deleted after seeding), so no details are left to report.
+	let gone = objects::file_id(CLUB, &format!("cur-chan-{}-file", fixture::GONE_CHANNEL));
+	let body = access("owner@club", &gone).await;
+	let a = &body["data"]["audience"];
+	assert!(a["kind"] == "room" && a.get("channel").is_none(), "FC-238: {body}");
+
+	// FC-209: `cur-room-shared` sits in the closed room, shared `R` to the off-roster moderator;
+	// the rostered contributor gets the room's details.
+	let room_file = objects::file_id(CLUB, "cur-room-shared");
+	let body = access("m-moderator@club.test", &room_file).await;
+	let a = &body["data"]["audience"];
+	assert!(a["kind"] == "room" && a.get("channel").is_none(), "FC-209: room leaked: {body}");
+	let body = access("m-contributor@club.test", &room_file).await;
+	assert_eq!(body["data"]["audience"]["channel"]["name"], "closed-w", "FC-209: {body}");
+}
+
+/// The browse filters only narrow. FC-224..226: `tags`, `modifiedAfter` and `openedSince` list
+/// an owner-only file to the owner and to no denied subject. FC-227: a recursive listing under a
+/// folder share reports each row's closest grant, not the browsed folder's. FC-228: it lets the
+/// browsed folder's room through to a grantee off its roster; FC-229: a listing with no parentId
+/// lets no room through. FC-239: `access=` paging reveals nothing about a row the caller only
+/// reads.
+#[tokio::test]
+async fn browse_filters_keep_the_gates() {
+	use cloudillo::types::{AccessLevel, Timestamp};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let (alice, club) = (fx.tenants.alice.tn_id, fx.tenants.club.tn_id);
+	let meta = &fx.app.meta_adapter;
+	let id_tag = |n: &str| id_tag_of(fx, n);
+	let send = |n: &'static str, m, uri, v| send_as(fx, n, m, uri, v);
+	// The rows `n` lists, or `None` when refused.
+	let list = |n: &'static str, q: String| async move {
+		let uri = format!("/api/files?{q}&limit=100");
+		let (st, b) = send(n, Method::GET, uri, serde_json::Value::Null).await;
+		st.is_success().then(|| b["data"].as_array().cloned().unwrap_or_default())
+	};
+	let level = |rows: &Option<Vec<serde_json::Value>>, entry: &str| {
+		rows.iter()
+			.flatten()
+			.find(|r| r["entryId"] == entry || r["fileId"] == entry)
+			.map(|r| r["accessLevel"].as_str().and_then(AccessLevel::from_str_name))
+	};
+	let mk = |n: &'static str, v: serde_json::Value| async move {
+		let (st, body) = send(n, Method::POST, "/api/files".into(), v).await;
+		assert!(st.is_success(), "create {st} {body}");
+		find_str(&body, "entryId").expect("entryId")
+	};
+	let doc = |name: &str, parent: Option<&str>| {
+		serde_json::json!({
+			"fileTp": "CRDT",
+			"contentType": "cloudillo/quillo",
+			"fileName": name,
+			"parentId": parent,
+		})
+	};
+	let dir = |name: &str, parent: Option<&str>| {
+		serde_json::json!({
+			"fileTp": "FLDR",
+			"fileName": name,
+			"parentId": parent,
+		})
+	};
+	let share =
+		|tn_id, issuer, entry, who, permission| share_to(fx, tn_id, issuer, entry, who, permission);
+
+	// FC-224..226: an owner-only (Direct) file, tagged and opened by the owner.
+	let since = Timestamp::now().0 - 1;
+	let file = mk("owner@alice", doc("zqm-bf-file", None)).await;
+	let tag = format!("/api/files/{file}/tag/zqm-bf");
+	let (st, body) = send("owner@alice", Method::PUT, tag, serde_json::Value::Null).await;
+	assert!(st.is_success(), "tag: {st} {body}");
+	meta.record_file_access(alice, &id_tag("owner@alice"), &file).await.unwrap();
+	let denied = [
+		"stranger@alice.test",
+		"follower@alice.test",
+		"idp-key@alice",
+		"sharelink-r@alice",
+	];
+	for (fc, q) in [
+		("FC-224", "tags=zqm-bf".to_owned()),
+		("FC-225", format!("modifiedAfter={since}")),
+		("FC-226", "openedSince=0".to_owned()),
+	] {
+		let rows = list("owner@alice", q.clone()).await;
+		assert!(level(&rows, &file).is_some(), "{fc}: owner misses it on {q}: {rows:?}");
+		for n in denied {
+			let rows = list(n, q.clone()).await;
+			assert!(level(&rows, &file).is_none(), "{fc}: {n} lists it on {q}: {rows:?}");
+		}
+	}
+
+	// FC-227: folder `W` to g-folder, its subfolder `R` to the same idTag.
+	let grantee = "g-folder@alice.test";
+	let folder = mk("owner@alice", dir("zqm-bf-dir", None)).await;
+	let sub = mk("owner@alice", dir("zqm-bf-sub", Some(&folder))).await;
+	let near = mk("owner@alice", doc("zqm-bf-near", Some(&folder))).await;
+	let deep = mk("owner@alice", doc("zqm-bf-deep", Some(&sub))).await;
+	share(alice, ALICE, folder.clone(), id_tag(grantee), 'W').await;
+	share(alice, ALICE, sub.clone(), id_tag(grantee), 'R').await;
+	let rows = list(grantee, format!("parentId={folder}&recursive=true")).await;
+	assert_eq!(level(&rows, &near), Some(Some(AccessLevel::Write)), "FC-227 near: {rows:?}");
+	assert_eq!(level(&rows, &deep), Some(Some(AccessLevel::Read)), "FC-227 deep: {rows:?}");
+
+	// FC-228: a `closed-w` folder shared `R` to the off-roster supporter.
+	let closed = "@club.test~closed-w";
+	let v = serde_json::json!({ "fileTp": "FLDR", "fileName": "zqm-bf-room", "channel": closed });
+	let room_dir = mk("owner@club", v).await;
+	let room_doc = mk("owner@club", doc("zqm-bf-room-doc", Some(&room_dir))).await;
+	share(club, CLUB, room_dir.clone(), id_tag("m-supporter@club.test"), 'R').await;
+	let rows = list("m-supporter@club.test", format!("parentId={room_dir}&recursive=true")).await;
+	assert!(level(&rows, &room_doc).is_some(), "FC-228: the room's child: {rows:?}");
+	// FC-229: the room's own file stays out of a drive-wide listing.
+	let cw = objects::file_id(CLUB, "cur-chan-closed-w-file");
+	let rows = list("m-supporter@club.test", format!("recursive=true&channel={closed}")).await;
+	assert!(level(&rows, &room_doc).is_some(), "FC-229: the shared child: {rows:?}");
+	assert!(level(&rows, &cw).is_none(), "FC-229: the room file leaked: {rows:?}");
+
+	// FC-239: the off-roster moderator passes the `access=` gate by role, but SQL drops the room
+	// file it only reads, so neither the page nor `hasMore` nor a cursor reveals its grants.
+	let shared = objects::file_id(CLUB, "cur-room-shared");
+	let uri = format!("/api/files?fileId={shared}&access=people&limit=1");
+	let (st, b) = send("m-moderator@club.test", Method::GET, uri, serde_json::Value::Null).await;
+	let page = &b["cursorPagination"];
+	assert!(
+		st.is_success()
+			&& b["data"].as_array().is_some_and(Vec::is_empty)
+			&& page["hasMore"] == false
+			&& page["nextCursor"].is_null(),
+		"FC-239: {st} {b}"
+	);
 }
 
 /// A cross-drive move needs no moderator when the caller owns the whole subtree.
@@ -4813,9 +5091,117 @@ async fn owner_creates(fx: &Fixture, tp: &str, name: &str, parent: Option<&str>)
 	find_str(&body, "entryId").expect("entryId")
 }
 
+/// A recursive listing under a user share reaches a subfolder whose own grant to the caller has
+/// lapsed: the expired grant is skipped, so the file there reads at the folder's grant (FC-250);
+/// a stranger lists nothing of it (FC-251).
+// The handler also drops any recursive row resolving to `None`; no fixture state reaches that
+// (an expired grant never stops the walk), so these rows pin the outcome, not the drop.
+#[tokio::test]
+async fn recursive_listing_below_a_lapsed_grant() {
+	use cloudillo::meta_adapter::CreateShareEntry;
+	use cloudillo::types::{AccessLevel, Timestamp};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let outer = owner_creates(fx, "FLDR", "zqm-lapse-outer", None).await;
+	let sub = owner_creates(fx, "FLDR", "zqm-lapse-sub", Some(&outer)).await;
+	let file = owner_creates(fx, "CRDT", "zqm-lapse-file", Some(&sub)).await;
+	let who = "g-comment@alice.test";
+	share_to(fx, alice, ALICE, outer.clone(), id_tag_of(fx, who), 'R').await;
+	let sh = CreateShareEntry {
+		subject_type: 'U',
+		subject_id: id_tag_of(fx, who),
+		permission: 'W',
+		expires_at: Some(Timestamp::from_now(-3600)),
+	};
+	fx.app
+		.meta_adapter
+		.create_share_entry(alice, 'F', &sub, ALICE, &sh)
+		.await
+		.unwrap();
+	let uri = format!("/api/files?parentId={outer}&recursive=true&limit=100");
+	let row = |b: &serde_json::Value| {
+		b["data"]
+			.as_array()
+			.and_then(|a| a.iter().find(|r| r["entryId"] == file.as_str()).cloned())
+	};
+	let (st, b) = send_as(fx, who, Method::GET, uri.clone(), serde_json::Value::Null).await;
+	let level =
+		row(&b).and_then(|r| r["accessLevel"].as_str().and_then(AccessLevel::from_str_name));
+	assert!(st.is_success() && level == Some(AccessLevel::Read), "FC-250: {st} {b}");
+	let (st, b) =
+		send_as(fx, "stranger@alice.test", Method::GET, uri, serde_json::Value::Null).await;
+	assert!(st.is_success() && row(&b).is_none(), "FC-251: {st} {b}");
+}
+
+/// `/access`'s audience and the `access=` list filter state the same rules twice (Rust and
+/// SQL): every fixture object the owner's `/access` reports lists under the matching filter
+/// (FC-252).
+#[tokio::test]
+async fn access_filter_agrees_with_access_endpoint() {
+	use crate::objects::file_id;
+	use cloudillo_core::abac::VisibilityLevel as V;
+	let _g = FIXTURE_LOCK.read().await;
+	let fx = setup().await;
+	// Exhaustive: a new variant fails to compile until it gets a fixture and a
+	// `push_access_filter` case (adapters/meta-adapter-sqlite/src/file.rs).
+	let fixture = |v: V| match v {
+		V::Public => "tenant-blob-p-active",
+		V::Verified => "tenant-blob-v-active",
+		V::SecondDegree => "tenant-blob-2-active",
+		V::Follower => "tenant-blob-f-active",
+		V::Connected => "tenant-blob-c-active",
+		V::Subscribed => "tenant-blob-s-active",
+		V::Direct => "tenant-blob-d-active",
+	};
+	let levels = [
+		V::Public,
+		V::Verified,
+		V::SecondDegree,
+		V::Follower,
+		V::Connected,
+		V::Subscribed,
+		V::Direct,
+	];
+	let objects = levels.map(|v| (ALICE, fixture(v))).into_iter().chain([
+		(ALICE, "folderchild-blob-d-active"),
+		(CLUB, "tenant-blob-d-active"),
+		(CLUB, "cur-chan-open-contrib-file"),
+	]);
+	for (host, name) in objects {
+		let owner = if host == ALICE { "owner@alice" } else { "owner@club" };
+		let id = file_id(host, name);
+		let uri = format!("/api/files/{id}/access");
+		let (st, b) = send_as(fx, owner, Method::GET, uri, serde_json::Value::Null).await;
+		assert!(st.is_success(), "FC-252 {name}@{host}: {st} {b}");
+		let d = &b["data"];
+		// `access=` counts grants and links on the entry itself, never inherited ones.
+		let direct = |k: &str| {
+			let items = if k == "links" { &d[k]["items"] } else { &d[k] };
+			items
+				.as_array()
+				.is_some_and(|a| a.iter().any(|x| x.get("inheritedFrom").is_none()))
+		};
+		let filter = match d["audience"]["kind"].as_str().unwrap_or_default() {
+			"owner" if direct("people") => "people",
+			"owner" if direct("links") => "link",
+			"owner" => "private",
+			"members" | "room" => "audience",
+			"public" => "public",
+			"verified" | "secondDegree" | "followers" | "connections" | "subscribers" => "network",
+			other => panic!("FC-252 {name}@{host}: unmapped audience {other}: {b}"),
+		};
+		let uri = format!("/api/files?fileId={id}&access={filter}");
+		let (st, l) = send_as(fx, owner, Method::GET, uri, serde_json::Value::Null).await;
+		let listed = l["data"].as_array().is_some_and(|a| !a.is_empty());
+		assert!(st.is_success() && listed, "FC-252 {name}@{host}: not under {filter}: {b} {l}");
+	}
+}
+
 /// A folder link on a folder nested under another: a `fileId` batch keeps only the subtree's
 /// ids (FC-149, 150), breadcrumbs stop at the share root (FC-151), the share root's own parent
-/// stays unnamed (FC-152), and a grandchild reads at the link's level (FC-153).
+/// stays unnamed (FC-152), a grandchild reads at the link's level (FC-153), and a recursive
+/// listing of the share root returns its whole subtree but nothing beside it (FC-172).
 #[tokio::test]
 async fn folder_scope_listing_edges() {
 	use cloudillo::types::AccessLevel;
@@ -4860,6 +5246,12 @@ async fn folder_scope_listing_edges() {
 	let (st, b) = get(format!("/api/files/{grand}/metadata")).await;
 	let level = b["data"]["accessLevel"].as_str().and_then(AccessLevel::from_str_name);
 	assert!(st.is_success() && level == Some(AccessLevel::Read), "FC-153: {st} {b}");
+	let (st, b) = get(format!("/api/files?parentId={shared}&recursive=true&limit=100")).await;
+	let mut got = entries(&b);
+	got.sort();
+	let mut want = vec![child.clone(), sub.clone(), grand.clone()];
+	want.sort();
+	assert!(st.is_success() && got == want, "FC-172: the subtree, and only it: {st} {b}");
 }
 
 /// A `W` folder link writes inside its folder: uploads into it and its subfolders, moves within

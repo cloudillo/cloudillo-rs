@@ -32,10 +32,13 @@ use cloudillo_core::abac::{self, relationship_level};
 use cloudillo_core::dir_cache::{DirCache, DirEntry};
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
 use cloudillo_core::file_access;
+use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::blob_adapter;
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter;
-use cloudillo_types::meta_adapter::{MANAGED_PARENT_ID, ROOT_PARENT_ID, TRASH_PARENT_ID};
+use cloudillo_types::meta_adapter::{
+	MANAGED_PARENT_ID, ROOT_PARENT_ID, ShareSetReader, TRASH_PARENT_ID,
+};
 use cloudillo_types::types::{self, AccessLevel, ApiResponse, TokenScope};
 use cloudillo_types::utils;
 
@@ -318,7 +321,7 @@ async fn populate_parent_names(
 /// walk reaches that folder it pushes that segment (its name is already known
 /// to the guest) and stops, so ancestor folder names above the shared root are
 /// never disclosed to a share-link holder.
-async fn build_path(
+pub(crate) async fn build_path(
 	app: &App,
 	cache: &DirCache,
 	tn_id: TnId,
@@ -525,11 +528,7 @@ pub async fn get_file_list(
 	}
 	// Pending uploads are listed to their real owner only. A scoped token that carries a `sub`
 	// still names that person; a share-link token's id_tag is the tenant's.
-	if is_real_auth
-		&& maybe_auth
-			.as_ref()
-			.is_some_and(cloudillo_types::auth_adapter::AuthCtx::names_holder)
-	{
+	if is_real_auth && maybe_auth.as_ref().is_some_and(AuthCtx::names_holder) {
 		opts.pending_viewer = Some(subject_id_tag.to_owned());
 	}
 
@@ -537,23 +536,39 @@ pub async fn get_file_list(
 		opts.hidden = None;
 	}
 
+	// Exposure is the share set, which only writers may list (`share_access::is_share_reader`).
+	if opts.access.as_ref().is_some_and(|a| !a.is_empty())
+		&& !(scope.is_none()
+			&& is_real_auth
+			&& (is_tenant || file_access::role_access_level(subject_roles).can_write()))
+	{
+		return Err(Error::PermissionDenied);
+	}
+	// A share-link token carries the tenant's id_tag and would read the owner's `accessed_at`.
+	if opts.opened_since.is_some()
+		&& !(is_real_auth && maybe_auth.as_ref().is_some_and(AuthCtx::names_holder))
+	{
+		return Err(Error::PermissionDenied);
+	}
+
 	// Channel gate: files in rooms the reader cannot enter are absent (None = the tenant itself).
-	// A caller naming the tenant without being it (share link, via-embed) is gated as a guest.
-	let hatted = maybe_auth.as_ref().is_some_and(|a| a.hat.is_some());
-	let impostor = maybe_auth
-		.as_ref()
-		.is_some_and(|a| abac::names_tenant_without_being_it(a, &tenant_id_tag));
-	let (reader, reader_roles) =
-		if impostor { ("guest", &[][..]) } else { (subject_id_tag, subject_roles) };
-	opts.enterable_channels = cloudillo_core::channels::enterable_channels(
+	opts.enterable_channels = cloudillo_core::channels::reader_enterable_channels(
 		&app,
 		tn_id,
 		&tenant_id_tag,
-		reader,
-		reader_roles,
-		hatted,
+		maybe_auth.as_ref(),
+		subject_id_tag,
+		subject_roles,
 	)
 	.await?;
+	// Exposure is the share set: a non-tenant lists only rows whose set they may read, in SQL so
+	// the page, `hasMore` and the cursor never see the others.
+	if !is_tenant && opts.access.as_ref().is_some_and(|a| !a.is_empty()) {
+		opts.share_set_reader = Some(ShareSetReader {
+			id_tag: subject_id_tag.into(),
+			rooms: opts.enterable_channels.clone(),
+		});
+	}
 
 	// Share access: bypass visibility filter when the user has a share entry
 	// on the queried folder (parentId). Per-file share checks are handled
@@ -576,8 +591,31 @@ pub async fn get_file_list(
 	// read grant there, so it bypasses visibility the same way.
 	if inherited_share.is_some() || opts.scope_entry_id.is_some() {
 		opts.visible_levels = None;
-		// The room never gates a deliberate handoff.
-		opts.enterable_channels = None;
+		// The room never gates a deliberate handoff. A recursive listing reaches below the
+		// share root, so there only the browsed folder's own room is let through.
+		// Without a parentId the listing is the scope tree, which is the handoff itself.
+		if !opts.recursive || opts.parent_id.is_none() {
+			opts.enterable_channels = None;
+		} else if let Some(channels) = opts.enterable_channels.as_mut()
+			&& let Some(parent_id) = opts.parent_id.as_deref()
+		{
+			// An id naming several entries has no single room to let through.
+			let parent = match app.meta_adapter.read_file(tn_id, parent_id).await {
+				Err(Error::Conflict(_)) => None,
+				r => r?,
+			};
+			if let Some(channel) = parent.and_then(|f| f.channel) {
+				channels.push(channel);
+			}
+		}
+	}
+
+	// A recursive listing mixes folders, so each row names its parent (like non-browse views).
+	// The trash/managed sentinels ignore `recursive` (the adapter lists their direct rows).
+	if opts.recursive
+		&& !matches!(opts.parent_id.as_deref(), Some(TRASH_PARENT_ID | MANAGED_PARENT_ID))
+	{
+		opts.with_parent = true;
 	}
 
 	let limit = opts.limit.unwrap_or(30) as usize;
@@ -588,9 +626,11 @@ pub async fn get_file_list(
 	// Compute access_level (Read/Write) for each file
 	// (visibility is already filtered at SQL level via visible_levels)
 	let access_ctx = file_access::FileAccessCtx::from_auth(maybe_auth.as_ref(), &tenant_id_tag);
+	// A recursive listing under a user share reaches subfolders with grants of their own, so each
+	// row resolves its closest grant instead of taking the browsed folder's. A link is one level.
+	let floor = if opts.recursive && folder_scope_level.is_none() { None } else { inherited_share };
 	let mut filtered =
-		filter::compute_file_access_levels(&app, tn_id, &access_ctx, inherited_share, files)
-			.await?;
+		filter::compute_file_access_levels(&app, tn_id, &access_ctx, floor, files).await?;
 
 	// Check if there are more results (we fetched limit+1)
 	let has_more = filtered.len() > limit;
@@ -663,8 +703,13 @@ pub async fn get_file_list(
 	// ponytail: filtered after the SQL page, so a trash page can come back short or empty; the
 	// cursor above is built from the unfiltered page, so clients must page on `has_more`, not on
 	// an empty page. An owner filter in SQL would drop Admin-level grantees' rows.
+	// A recursive listing has no access floor, so a row below a subfolder whose own grant has
+	// lapsed can resolve to `None`; it is dropped here, same short-page caveat.
 	let mut kept = Vec::with_capacity(filtered.len());
 	for f in filtered {
+		if opts.recursive && f.access_level == Some(AccessLevel::None) {
+			continue;
+		}
 		if f.parent_id.as_deref() != Some(TRASH_PARENT_ID)
 			|| file_access::can_manage_lifecycle(
 				&app,

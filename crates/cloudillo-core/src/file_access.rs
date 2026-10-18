@@ -20,8 +20,7 @@ use cloudillo_types::meta_adapter;
 use cloudillo_types::meta_adapter::FileView;
 use cloudillo_types::types::{AccessLevel, TokenScope};
 
-/// Maximum parent-chain depth for bounded folder-tree traversals.
-pub const MAX_PARENT_DEPTH: usize = 64;
+pub use cloudillo_types::meta_adapter::MAX_PARENT_DEPTH;
 
 /// Result of checking file access
 pub struct FileAccessResult {

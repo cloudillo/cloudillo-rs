@@ -204,9 +204,9 @@ impl From<RefData> for RefResponse {
 			resource_id: ref_data.resource_id.map(|s| s.to_string()),
 			// A share link never delegates share management (`parse_access_level` refuses
 			// "admin"), so cap at write or a legacy 'A' row renders as a value PATCH rejects.
-			access_level: ref_data.access_level.map(|c| {
-				AccessLevel::from_perm_char(c).min(AccessLevel::Write).as_str().to_string()
-			}),
+			access_level: ref_data
+				.access_level
+				.map(|c| AccessLevel::from_link_char(c).as_str().to_string()),
 			params: ref_data.params.map(|p| p.to_string()),
 			redacted: false,
 		}
@@ -220,7 +220,7 @@ impl RefResponse {
 	/// content-addressed id convention, and paired with `redacted: true` so no client mistakes it
 	/// for a usable link.
 	pub fn redact(mut self) -> Self {
-		self.ref_id = cloudillo_types::hasher::hash("r", self.ref_id.as_bytes()).into();
+		self.ref_id = cloudillo_types::hasher::ref_surrogate(&self.ref_id).into();
 		self.redacted = true;
 		self
 	}

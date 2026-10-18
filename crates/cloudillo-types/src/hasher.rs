@@ -54,4 +54,9 @@ pub fn hash(prefix: &str, data: &[u8]) -> Box<str> {
 	hash_v1(prefix, data)
 }
 
+/// Stable, non-invertible stand-in for a share-link `ref_id` shown to someone who may not use it.
+pub fn ref_surrogate(ref_id: &str) -> Box<str> {
+	hash("r", ref_id.as_bytes())
+}
+
 // vim: ts=4

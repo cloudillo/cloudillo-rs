@@ -6,6 +6,9 @@
 /// Special parent_id value for trashed files
 pub const TRASH_PARENT_ID: &str = "__trash__";
 
+/// Maximum parent-chain depth for bounded folder-tree traversals.
+pub const MAX_PARENT_DEPTH: usize = 64;
+
 /// Special parent_id value for system-managed files (action attachments, profile/cover
 /// images, cached remote profile images). Files in this hidden per-tenant folder are
 /// reaped by the file GC when no canonical column still references them.
@@ -577,6 +580,25 @@ where
 	if values.is_empty() { Ok(None) } else { Ok(Some(values)) }
 }
 
+/// Query-string timestamp: unix seconds or RFC 3339. `Timestamp`'s own `Deserialize` cannot
+/// take unix seconds here, since `serde_urlencoded` hands every value over as a string.
+fn deserialize_query_timestamp<'de, D>(deserializer: D) -> Result<Option<Timestamp>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	let s = String::deserialize(deserializer)?;
+	let s = s.trim();
+	if s.is_empty() {
+		return Ok(None);
+	}
+	if let Ok(secs) = s.parse::<i64>() {
+		return Ok(Some(Timestamp(secs)));
+	}
+	chrono::DateTime::parse_from_rfc3339(s)
+		.map(|dt| Some(Timestamp(dt.timestamp())))
+		.map_err(|_| serde::de::Error::custom("expected unix seconds or an RFC 3339 timestamp"))
+}
+
 /// Audience filter axis: classify actions by the **type of the effective wall
 /// owner** (`coalesce(audience, issuer_tag)` joined to `profiles.type`).
 /// `Personal` matches `pa.type='P'` (with NULL→Personal fallback for unknown
@@ -1079,6 +1101,15 @@ impl<S: AsRef<str> + Debug + Ord> Ord for FileVariant<S> {
 	}
 }
 
+/// Reader of share sets in a non-tenant `access=` listing (`ListFileOptions::share_set_reader`).
+#[derive(Debug, Clone)]
+pub struct ShareSetReader {
+	pub id_tag: String,
+	/// Rooms the caller may enter; `None` = every room (no gate). A snapshot of
+	/// `enterable_channels`: the folder-share handoff clears that, but this gate still applies.
+	pub rooms: Option<Vec<Box<str>>>,
+}
+
 /// Options for listing files
 ///
 /// By default (when `status` is `None`), deleted files (status 'D') are excluded.
@@ -1145,6 +1176,26 @@ pub struct ListFileOptions {
 	/// Sort direction: 'asc' or 'desc' (default: desc for dates, asc for name)
 	#[serde(rename = "sortDir")]
 	pub sort_dir: Option<String>,
+	/// List every descendant of `parent_id` (up to `MAX_PARENT_DEPTH` hops) instead of its
+	/// direct children. With no `parent_id` or the root, the whole drive (`channel` still
+	/// applies). Ignored for the trash and managed sentinels.
+	#[serde(default)]
+	pub recursive: bool,
+	/// Exact tags, ANDed: a file must carry every one. The legacy `tag` is a substring match.
+	#[serde(default, deserialize_with = "deserialize_split")]
+	pub tags: Option<Vec<String>>,
+	/// Exposure filter, ORed: `private|audience|network|people|link|public`.
+	#[serde(default, deserialize_with = "deserialize_split")]
+	pub access: Option<Vec<String>>,
+	/// Only entries the calling user opened (`file_user_data.accessed_at`) at or after this.
+	#[serde(default, rename = "openedSince", deserialize_with = "deserialize_query_timestamp")]
+	pub opened_since: Option<Timestamp>,
+	/// Entry modified (`COALESCE(files.modified_at, entries.updated_at)`) at or after this.
+	#[serde(default, rename = "modifiedAfter", deserialize_with = "deserialize_query_timestamp")]
+	pub modified_after: Option<Timestamp>,
+	/// Entry modified strictly before this.
+	#[serde(default, rename = "modifiedBefore", deserialize_with = "deserialize_query_timestamp")]
+	pub modified_before: Option<Timestamp>,
 	/// User id_tag for user-specific data (set by handler, not from query)
 	#[serde(skip)]
 	pub user_id_tag: Option<String>,
@@ -1178,6 +1229,10 @@ pub struct ListFileOptions {
 	/// non-anonymous callers only.
 	#[serde(skip)]
 	pub pending_viewer: Option<String>,
+	/// Narrows the exposure filter for a non-tenant caller to rows whose share set they may read
+	/// (set by the handler, never from the query).
+	#[serde(skip)]
+	pub share_set_reader: Option<ShareSetReader>,
 	/// Include files that belong to a document tree (`root_id IS NOT NULL`) as
 	/// well as standalone ones. Server-only: set by maintenance sweeps, never by
 	/// a request. The default listing hides tree children because a file browser
@@ -3524,6 +3579,33 @@ mod tests {
 		assert_eq!(v.len(), 2);
 		assert_eq!(v[0].as_str(), "D");
 		assert_eq!(v[1].as_str(), "F");
+	}
+
+	#[test]
+	fn test_deserialize_list_file_options_new_filters() {
+		let opts: ListFileOptions = serde_urlencoded::from_str(
+			"recursive=true&tags=a,%20b&access=people,link&openedSince=1700000000\
+			 &modifiedAfter=2024-01-01T00:00:00Z&modifiedBefore=1800000000",
+		)
+		.expect("should deserialize");
+		assert!(opts.recursive);
+		assert_eq!(opts.tags, Some(vec!["a".to_string(), "b".to_string()]));
+		assert_eq!(opts.access, Some(vec!["people".to_string(), "link".to_string()]));
+		assert_eq!(opts.opened_since.map(|t| t.0), Some(1_700_000_000));
+		assert_eq!(opts.modified_after.map(|t| t.0), Some(1_704_067_200));
+		assert_eq!(opts.modified_before.map(|t| t.0), Some(1_800_000_000));
+
+		let res: Result<ListFileOptions, _> = serde_urlencoded::from_str("openedSince=yesterday");
+		assert!(res.is_err(), "garbage openedSince should error");
+
+		let opts: ListFileOptions =
+			serde_urlencoded::from_str("openedSince=&modifiedAfter=2024-01-01T02:00:00%2B02:00")
+				.expect("should deserialize");
+		assert!(opts.opened_since.is_none(), "empty openedSince is no filter");
+		assert_eq!(opts.modified_after.map(|t| t.0), Some(1_704_067_200));
+		let opts: ListFileOptions =
+			serde_urlencoded::from_str("openedSince=%201700000000%20").expect("should deserialize");
+		assert_eq!(opts.opened_since.map(|t| t.0), Some(1_700_000_000));
 	}
 
 	#[test]

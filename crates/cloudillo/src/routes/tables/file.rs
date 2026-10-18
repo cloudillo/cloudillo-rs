@@ -12,6 +12,7 @@
 //! | `/api/files/{file_id}`                | `read()` ᴬ | | | `write()` ᶜ | `write()` ᶜ |
 //! | `/api/files/{file_id}/descriptor`     | `read()` ᴬ | | | | |
 //! | `/api/files/{file_id}/metadata`       | `read()` ᴬ | | | | |
+//! | `/api/files/{file_id}/access`         | `read()` ᴬ | | | | |
 //! | `/api/files/variant/{variant_id}`     | `read()` ᴬ | | | | |
 //! | `/api/files/{file_id}/content/{*path}`| `list_public()` ᴳ | | | | |
 //! | `/api/files/{file_id}/duplicate`      | | `create()` ᶜ | | | |
@@ -43,7 +44,7 @@ use axum::{
 	routing::{delete, get, patch, post, put},
 };
 
-use crate::file::{apkg, handler, management, share, tag};
+use crate::file::{access, apkg, handler, management, share, tag};
 use crate::prelude::*;
 
 /// File and app-package creation, gated by `check_perm_create("file", "create")`.
@@ -136,6 +137,7 @@ pub(crate) fn read() -> Router<App> {
 		.route("/api/files/variant/{variant_id}", get(handler::get_file_variant))
 		.route("/api/files/{file_id}/descriptor", get(handler::get_file_descriptor))
 		.route("/api/files/{file_id}/metadata", get(handler::get_file_metadata))
+		.route("/api/files/{file_id}/access", get(access::get_file_access))
 		.route("/api/files/{file_id}", get(handler::get_file_variant_file_id))
 }
 

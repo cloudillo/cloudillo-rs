@@ -31,6 +31,18 @@ fn row_to_ref_data(row: &sqlx::sqlite::SqliteRow) -> RefData {
 	}
 }
 
+/// `<ref is live>` on the `refs` columns behind `prefix` (`""` or an alias like `"r."`): neither
+/// expired nor used up. The one definition of a live link.
+pub(crate) fn push_live_ref(
+	q: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+	prefix: &str,
+	now: Timestamp,
+) {
+	q.push(format!("({prefix}expires_at IS NULL OR {prefix}expires_at > "))
+		.push_bind(now.0)
+		.push(format!(") AND ({prefix}count IS NULL OR {prefix}count > 0)"));
+}
+
 /// List references with optional filtering
 pub(crate) async fn list(
 	db: &SqlitePool,
@@ -56,9 +68,8 @@ pub(crate) async fn list(
 		let now = Timestamp::now();
 		match filter.as_ref() {
 			"active" => {
-				query.push(" AND (expires_at IS NULL OR expires_at > ");
-				query.push_bind(now.0);
-				query.push(") AND (count IS NULL OR count > 0)");
+				query.push(" AND ");
+				push_live_ref(&mut query, "", now);
 			}
 			"used" => {
 				query.push(" AND count IS NOT NULL AND count = 0");

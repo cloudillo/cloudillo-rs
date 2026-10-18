@@ -6,6 +6,7 @@
 
 use crate::prelude::*;
 use crate::roles::{highest_role_level, role_level};
+use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::meta_adapter::Channel;
 
 /// Whether a reader may enter a channel.
@@ -73,6 +74,24 @@ pub async fn enterable_channels(
 			.map(|c| absolute_channel(tenant_id_tag, &c.name))
 			.collect(),
 	))
+}
+
+/// Channels the caller may enter (`None` = the tenant itself, no gate). A caller naming the
+/// tenant without being it (share link, via-embed) is gated as a guest.
+pub async fn reader_enterable_channels(
+	app: &App,
+	tn_id: TnId,
+	tenant_id_tag: &str,
+	maybe_auth: Option<&AuthCtx>,
+	subject_id_tag: &str,
+	subject_roles: &[Box<str>],
+) -> ClResult<Option<Vec<Box<str>>>> {
+	let hatted = maybe_auth.is_some_and(|a| a.hat.is_some());
+	let impostor =
+		maybe_auth.is_some_and(|a| crate::abac::names_tenant_without_being_it(a, tenant_id_tag));
+	let (reader, reader_roles) =
+		if impostor { ("guest", &[][..]) } else { (subject_id_tag, subject_roles) };
+	enterable_channels(app, tn_id, tenant_id_tag, reader, reader_roles, hatted).await
 }
 
 #[cfg(test)]

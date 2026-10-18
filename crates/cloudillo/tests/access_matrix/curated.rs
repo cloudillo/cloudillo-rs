@@ -115,6 +115,12 @@ pub enum Route {
 	HatsPatch(&'static str),
 	/// `GET {uri}` (one row or a list): `Clean`, or `Leak:{field}` for the first field set.
 	Fields(&'static str, &'static [&'static str]),
+	/// `GET /api/files/{obj}/access`, summarised by [`access_shape`]: the `+`-joined facts among
+	/// `shared people perm links items redacted real manage`, or `none`.
+	AccessShape,
+	/// `GET /api/files/{obj}/access`: how this subject's idTag is listed in `people` —
+	/// `Absent`, `Direct` or `Inherited`.
+	AccessPerson(&'static str),
 	/// `GET {uri}`: Allow / Deny.
 	Get(&'static str),
 	/// `{method} {uri}` with a JSON body (`""` = none): Allow / Deny. `{obj}` in either is the
@@ -175,8 +181,8 @@ impl Route {
 			FileUser | ReadMarker | Subscribe | ChanPorch(_) | ChanPorchKeys(_) | ChanCreate(_)
 			| ChanPatch(_) | ChanDelete(_) | ChanMembers(_) | ChanUpload(_) | Profiles(_)
 			| Partners | PartnersMap | PartnersSync | PtnrCreate | PtnrDelCreate | Ids(_)
-			| IdIn(..) | HatsPatch(_) | Fields(..) | Get(_) | GetQ(_) | CallBasic(..)
-			| Call(..) => {
+			| IdIn(..) | HatsPatch(_) | Fields(..) | AccessShape | AccessPerson(_) | Get(_)
+			| GetQ(_) | CallBasic(..) | Call(..) => {
 				return None;
 			}
 		})
@@ -489,6 +495,190 @@ pub const FC: &[Row] = &[
 	// file is no folder share.
 	("FC-147", "g_folder@alice", FOLDER_CHILD, FileListQ("parentId={parent}"), "Present@Write"),
 	("FC-148", "g_read@alice", FOLDER_CHILD, FileListQ("parentId={parent}"), "Absent"),
+	// A recursive listing of a shared folder carries the share (or the link) to its subtree,
+	// and only to it: a sibling stays out, and a folder link gains nothing from the root.
+	(
+		"FC-166",
+		"g_folder@alice",
+		FOLDER_CHILD,
+		FileListQ("parentId={parent}&recursive=true"),
+		"Present@Write",
+	),
+	(
+		"FC-167",
+		"folderlink-r@alice",
+		FOLDER_CHILD,
+		FileListQ("parentId={parent}&recursive=true"),
+		"Present",
+	),
+	("FC-168", "owner@alice", "tenant-blob-d-active@alice", FileListQ(FOLDER_TREE), "Absent"),
+	(
+		"FC-169",
+		"folderlink-r@alice",
+		"tenant-blob-d-active@alice",
+		FileListQ("parentId=__root__&recursive=true"),
+		"Absent",
+	),
+	// `access=people` audits direct grants: the shared folder matches, its child (which only
+	// inherits the grant) does not.
+	(
+		"FC-170",
+		"owner@alice",
+		"folder@alice",
+		FileListQ("parentId=__root__&channel=&access=people"),
+		"Present",
+	),
+	("FC-171", "owner@alice", FOLDER_CHILD, FileListQ("parentId={parent}&access=people"), "Absent"),
+	// FC-172 and FC-183 are scenario tests in main.rs.
+	// `/access` is shaped by the caller: grantees and links are the share set, so a reader gets
+	// neither; a writer gets the grants and (surrogate) link items, a manager the real refIds; a
+	// link guest only `shared`.
+	("FC-173", "g_read@alice", "root@alice", AccessShape, "none"),
+	("FC-174", "g_write@alice", "root@alice", AccessShape, "people+perm+links+items+redacted"),
+	("FC-175", "g_admin@alice", "root@alice", AccessShape, "people+perm+links+items+real+manage"),
+	("FC-176", "owner@alice", "root@alice", AccessShape, "people+perm+links+items+real+manage"),
+	("FC-177", "sharelink-r@alice", "root@alice", AccessShape, "shared"),
+	// A folder grant shows on its child as inherited from the (readable) folder; an expired
+	// grant is not listed at all. FC-183 (main.rs) covers the walk stopping at an unreadable
+	// ancestor.
+	("FC-178", "g_folder@alice", FOLDER_CHILD, AccessPerson("g_folder@alice"), "Inherited"),
+	("FC-179", "g_write@alice", "root@alice", AccessPerson("g_expired@alice"), "Absent"),
+	("FC-180", "g_write@alice", "root@alice", AccessPerson("g_read@alice"), "Direct"),
+	// The `read()` guard refuses whoever cannot read the entry.
+	("FC-181", "stranger@alice", "root@alice", Get(ACCESS), "Deny"),
+	("FC-182", "anon@alice", "root@alice", Get(ACCESS), "Deny"),
+	// More `/access` shapes: lower readers get none, a folder link `shared` in its tree only;
+	// an `idp_` key is refused.
+	("FC-184", "g_comment@alice", "root@alice", AccessShape, "none"),
+	("FC-185", "follower@alice", "tenant-blob-f-active@alice", AccessShape, "none"),
+	("FC-186", "anon@alice", "tenant-blob-p-active@alice", AccessShape, "none"),
+	("FC-187", "idp-key@alice", "root@alice", AccessShape, "Deny"),
+	("FC-188", "folderlink-r@alice", FOLDER_CHILD, AccessShape, "shared"),
+	("FC-189", "folderlink-r@alice", "tenant-blob-d-active@alice", Get(ACCESS), "Deny"),
+	// `access=` lists the share set: tenant and writer roles only. A file grant (g_write) is no
+	// tenant-wide standing, and no scoped or impostor credential gets it.
+	("FC-190", "g_read@alice", "root@alice", Get(LIST_PEOPLE), "Deny"),
+	("FC-191", "g_write@alice", "root@alice", Get(LIST_PEOPLE), "Deny"),
+	("FC-192", "follower@alice", "root@alice", Get(LIST_PEOPLE), "Deny"),
+	("FC-193", "folderlink-r@alice", "root@alice", Get(LIST_PEOPLE), "Deny"),
+	("FC-194", "idp-key@alice", "root@alice", Get(LIST_PEOPLE), "Deny"),
+	("FC-195", "owner@alice", "root@alice", Get(LIST_PEOPLE), "Allow"),
+	("FC-196", "m_contributor@club", "tenant-blob-d-active@club", Get(LIST_PEOPLE), "Allow"),
+	("FC-197", "m_supporter@club", "tenant-blob-d-active@club", Get(LIST_PEOPLE), "Deny"),
+	// `openedSince` reads the caller's own `accessed_at`: a link token names the tenant.
+	("FC-198", "sharelink-r@alice", "root@alice", Get(LIST_OPENED), "Deny"),
+	("FC-199", "folderlink-r@alice", "root@alice", Get(LIST_OPENED), "Deny"),
+	("FC-200", "owner@alice", "root@alice", Get(LIST_OPENED), "Allow"),
+	// A recursive whole-drive listing keeps the visibility gate.
+	(
+		"FC-201",
+		"stranger@alice",
+		"tenant-blob-d-active@alice",
+		FileListQ("recursive=true"),
+		"Absent",
+	),
+	(
+		"FC-202",
+		"follower@alice",
+		"tenant-blob-d-active@alice",
+		FileListQ("recursive=true"),
+		"Absent",
+	),
+	(
+		"FC-203",
+		"idp-key@alice",
+		"tenant-blob-d-active@alice",
+		FileListQ("recursive=true"),
+		"Absent",
+	),
+	("FC-204", "stranger@alice", "tenant-blob-d-active@alice", FileListQ(RECURSIVE_ROOT), "Absent"),
+	("FC-205", "follower@alice", "tenant-blob-d-active@alice", FileListQ(RECURSIVE_ROOT), "Absent"),
+	("FC-206", "idp-key@alice", "tenant-blob-d-active@alice", FileListQ(RECURSIVE_ROOT), "Absent"),
+	// `access=` is per row too: the moderator's role passes the gate, but its direct `R` share
+	// on the room file is its level there, and a reader does not see the share set.
+	("FC-210", "m_moderator@club", ROOM_SHARED, FileListQ("access=people"), "Absent"),
+	("FC-211", "owner@club", ROOM_SHARED, FileListQ("access=people"), "Present"),
+	// `openedSince` and `recursive` keep the gates.
+	("FC-212", "anon@alice", "tenant-blob-d-active@alice", FileListQ(OPENED), "Absent"),
+	("FC-213", "stranger@alice", "tenant-blob-d-active@alice", FileListQ(OPENED), "Absent"),
+	("FC-214", "idp-key@alice", "tenant-blob-d-active@alice", FileListQ(OPENED), "Absent"),
+	("FC-215", "anon@alice", "tenant-blob-d-active@alice", FileListQ(RECURSIVE_ROOT), "Absent"),
+	("FC-216", "anon@alice", "tenant-blob-d-active@alice", FileListQ(RECURSIVE), "Absent"),
+	(
+		"FC-217",
+		"sharelink-r@alice",
+		"tenant-blob-d-active@alice",
+		FileListQ(RECURSIVE_ROOT),
+		"Absent",
+	),
+	("FC-218", "sharelink-r@alice", "tenant-blob-d-active@alice", FileListQ(RECURSIVE), "Absent"),
+	("FC-219", "m_supporter@club", CW_FILE, FileListQ(RECURSIVE), "Absent"),
+	// A recursive listing with no parentId is the whole drive, filtered by `channel`; a document
+	// link keeps its tree (as FC-41).
+	("FC-220", "owner@alice", FOLDER_CHILD, FileListQ(RECURSIVE), "Present"),
+	("FC-221", "owner@club", CW_FILE, FileListQ("recursive=true&channel="), "Absent"),
+	(
+		"FC-222",
+		"owner@club",
+		CW_FILE,
+		FileListQ("recursive=true&channel=@club.test~closed-w"),
+		"Present",
+	),
+	("FC-223", "sharelink-r@alice", "root@alice", FileListQ(RECURSIVE), "Present@Read"),
+	// SQL lists a non-tenant only the local rows they own or reach by a Write role in a room
+	// they can enter: the rostered contributor sees the closed room's file, while the
+	// off-roster leader and a hat (never rostered) do not.
+	("FC-230", "m_contributor@club", ROOM_SHARED, FileListQ("access=people"), "Present"),
+	("FC-231", "m_leader@club", ROOM_SHARED, FileListQ("access=people"), "Absent"),
+	("FC-232", "hatted@club", ROOM_SHARED, FileListQ("access=people"), "Absent"),
+	// `recursive` with `fileId` keeps the visibility gate.
+	(
+		"FC-233",
+		"owner@alice",
+		"tenant-blob-d-active@alice",
+		FileListQ("recursive=true&fileId={obj}"),
+		"Present",
+	),
+	(
+		"FC-234",
+		"stranger@alice",
+		"tenant-blob-d-active@alice",
+		FileListQ("recursive=true&fileId={obj}"),
+		"Absent",
+	),
+	// `/access` in the closed room: a hat cannot enter it, so cannot read; the rostered
+	// contributor writes through its role, so gets the writer shape (the file has no links,
+	// hence no `redacted` item; still no `real` or `manage`).
+	("FC-235", "hatted@club", CW_FILE, AccessShape, "Deny"),
+	("FC-236", "m_contributor@club", CW_FILE, AccessShape, "people+perm+links+items"),
+	// `/access` for credentials beside the plain ones: a hat writes the open room by its mapped
+	// contributor role, so it gets the writer shape (as FC-236); a hat scoped to club's root
+	// reads nothing outside it and gets the reader shape inside; so does a non-anonymous scoped
+	// session.
+	("FC-240", "hatted@club", OPEN_FILE, AccessShape, "people+perm+links+items"),
+	("FC-241", "hatted-scoped@club", OPEN_FILE, AccessShape, "Deny"),
+	("FC-253", "hatted-scoped@club", "root@club", AccessShape, "none"),
+	("FC-242", "owner-scoped-w@alice", "root@alice", AccessShape, "none"),
+	// Combined filters keep their gates: `access=` is a writer's, `openedSince` the holder's
+	// own; inside a shared folder `tags` still filters (no seeded file carries a tag), and
+	// `access=` stays refused to a file grant.
+	("FC-243", "anon@alice", "root@alice", Get(LIST_PEOPLE), "Deny"),
+	("FC-244", "anon@club", "root@club", Get(LIST_PEOPLE), "Deny"),
+	("FC-245", "hatted@club", "root@club", Get("/api/files?openedSince=1"), "Allow"),
+	(
+		"FC-246",
+		"g_folder@alice",
+		FOLDER_CHILD,
+		FileListQ("parentId={parent}&recursive=true&tags=zqm-nope"),
+		"Absent",
+	),
+	(
+		"FC-247",
+		"g_folder@alice",
+		FOLDER_CHILD,
+		Get("/api/files?parentId=f1~zqm-alice-folder-blob-d-active&recursive=true&access=people"),
+		"Deny",
+	),
 	// A `W` link writes inside its document tree: a new part under its root.
 	(
 		"FC-154",
@@ -503,9 +693,19 @@ pub const FC: &[Row] = &[
 	),
 ];
 const FOLDER_CHILD: &str = "folderchild-blob-d-active@alice";
+/// club's open-room file (`open-contrib`, floor contributor).
+const OPEN_FILE: &str = "cur-chan-open-contrib-file@club";
+/// The subtree of alice's canonical folder (`objects::canon_folder`).
+const FOLDER_TREE: &str = "parentId=f1~zqm-alice-folder-blob-d-active&recursive=true";
 
 const SHARES_L: &str = "/api/shares?subjectType=L&subjectId=zqm";
 const SHARES_OBJ: &str = "/api/files/{obj}/shares";
+const ACCESS: &str = "/api/files/{obj}/access";
+const LIST_PEOPLE: &str = "/api/files?access=people";
+const LIST_OPENED: &str = "/api/files?openedSince=0";
+const RECURSIVE_ROOT: &str = "parentId=__root__&recursive=true";
+const RECURSIVE: &str = "recursive=true";
+const OPENED: &str = "openedSince=0";
 const REFS_ROOT: &str = "/api/refs?type=share.file&resourceId=f1~zqm-alice-tenant-crdt-d-active";
 
 const SHARES_F_ROOT: &str = "/api/shares?subjectType=F&subjectId=f1~zqm-alice-tenant-crdt-d-active";
@@ -2328,13 +2528,24 @@ pub const CH: &[Row] = &[
 	("CH-68", "hatted@club", "", ChanCreate("zqm-hat-new"), "Deny"),
 	("CH-69", "anon@club", "", ChanCreate("zqm-anon-new"), "Deny"),
 	("CH-70", "m_moderator@club", "", ChanCreate("zqm-mod-new"), "Allow"),
+	// The default `room.create_role` is moderator: a supporter may not either.
+	("CH-145", "m_supporter@club", "", ChanCreate("zqm-sup-default"), "Deny"),
 	("CH-71", "m_contributor@club", "", ChanPatch("zqm-scratch"), "Deny"),
 	("CH-72", "hatted@club", "", ChanPatch("zqm-scratch"), "Deny"),
 	("CH-73", "m_moderator@club", "", ChanPatch("zqm-scratch"), "Allow"),
-	("CH-74", "m_contributor@club", "", ChanMembers("closed-w"), "Deny"),
+	// The roster is readable by moderator+ and by its own members; m_contributor is on closed-w's.
+	("CH-74", "m_contributor@club", "", ChanMembers("closed-w"), "Allow"),
 	("CH-75", "hatted@club", "", ChanMembers("closed-w"), "Deny"),
+	("CH-139", "m_supporter@club", "", ChanMembers("closed-w"), "Deny"),
+	("CH-140", "stranger@club", "", ChanMembers("closed-w"), "Deny"),
+	("CH-141", "hatted-scoped@club", "", ChanMembers("closed-w"), "Deny"),
+	// A non-member cannot probe for rooms: a missing one is refused the same way.
+	("CH-142", "m_supporter@club", "", ChanMembers("zqm-nope"), "Deny"),
 	("CH-76", "anon@club", "", ChanMembers("closed-w"), "Deny"),
 	("CH-77", "m_moderator@club", "", ChanMembers("closed-w"), "Allow"),
+	// Credentials naming club without being it: a share link and an `idp_` key.
+	("CH-143", "sharelink-r@club", "", ChanMembers("closed-w"), "Deny"),
+	("CH-144", "idp-mgmt@club", "", ChanMembers("closed-w"), "Deny"),
 	("CH-78", "m_contributor@club", "", ChanDelete("zqm-scratch"), "Deny"),
 	("CH-79", "hatted@club", "", ChanDelete("zqm-scratch"), "Deny"),
 	// Last Allow row: runs after CH-73's patch.
@@ -2390,6 +2601,32 @@ pub const CH: &[Row] = &[
 	("CH-129", "owner@club", "", ChanMembers("gone"), "Deny"),
 	("CH-130", "owner@club", "", ChanMembers("zqm-nope"), "Deny"),
 ];
+
+/// Room creation with club's `room.create_role` lowered to `supporter`: any member role may
+/// create, a role-less follower and non-members still may not, a scoped token never.
+pub const CH_ROOM_POLICY: &[Row] = &[
+	("CH-131", "m_supporter@club", "", ChanCreate("zqm-sup-new"), "Allow"),
+	("CH-132", "m_contributor@club", "", ChanCreate("zqm-contrib-new2"), "Allow"),
+	("CH-133", "hatted@club", "", ChanCreate("zqm-hat-new2"), "Allow"),
+	("CH-134", "m_follower@club", "", ChanCreate("zqm-fol-new"), "Deny"),
+	("CH-135", "stranger@club", "", ChanCreate("zqm-str-new"), "Deny"),
+	("CH-136", "anon@club", "", ChanCreate("zqm-anon-new2"), "Deny"),
+	("CH-137", "hatted-scoped@club", "", ChanCreate("zqm-hats-new"), "Deny"),
+	("CH-138", "sharelink-r@club", "", ChanCreate("zqm-link-new"), "Deny"),
+	("CH-146", "idp-mgmt@club", "", ChanCreate("zqm-idp-new"), "Deny"),
+	// Writing the policy is the leader's (same value, so the rows above are unaffected).
+	("CH-147", "m_moderator@club", "", SET_ROOM_ROLE, "Deny"),
+	("CH-148", "m_contributor@club", "", SET_ROOM_ROLE, "Deny"),
+	("CH-149", "m_leader@club", "", SET_ROOM_ROLE, "Allow"),
+];
+
+const SET_ROOM_ROLE: Route =
+	Call("PUT", "/api/settings/room.create_role", r#"{"value":"supporter"}"#);
+
+/// Room creation with an invalid stored `room.create_role` (`follower`, written past the
+/// validator): it falls back to moderator.
+pub const CH_ROOM_FALLBACK: &[Row] =
+	&[("CH-150", "m_supporter@club", "", ChanCreate("zqm-sup-fallback"), "Deny")];
 
 const MAIN_ROOT: &str = "parentId=__root__&channel=";
 const CW_ROOT: &str = "parentId=__root__&channel=@club.test~closed-w";
@@ -3220,6 +3457,46 @@ async fn fields(
 		.map_or_else(|| "Clean".into(), |k| format!("Leak:{k}")))
 }
 
+/// `data` of `GET /api/files/{obj}/access`; `Err(Ok(outcome))` when refused.
+async fn access(fx: &Fixture, s: &Subject, tgt: &Tgt<'_>) -> Result<Value, Result<String, String>> {
+	let Tgt::Obj(o) = tgt else {
+		return Err(Err("needs a seeded object".into()));
+	};
+	let rows = get_data(fx, s, &ACCESS.replace("{obj}", &obj_key(o))).await?;
+	rows.into_iter().next().ok_or_else(|| Err("no access data".into()))
+}
+
+/// [`AccessShape`] facts of an `/access` response, in a fixed order.
+fn access_shape(a: &Value) -> String {
+	let set = |v: &Value| !v.is_null();
+	let people = a["people"].as_array().map_or(&[][..], Vec::as_slice);
+	let items = a["links"]["items"].as_array().map_or(&[][..], Vec::as_slice);
+	let redacted = |l: &Value| l["redacted"] == true;
+	let facts = [
+		("shared", a["audience"]["kind"] == "shared"),
+		("people", !people.is_empty()),
+		("perm", people.iter().any(|p| set(&p["permission"]))),
+		("links", set(&a["links"])),
+		("items", set(&a["links"]["items"])),
+		("redacted", items.iter().any(redacted)),
+		("real", items.iter().any(|l| !redacted(l))),
+		("manage", a["canManage"] == true),
+	];
+	let on: Vec<_> = facts.iter().filter(|f| f.1).map(|f| f.0).collect();
+	if on.is_empty() { "none".into() } else { on.join("+") }
+}
+
+/// [`AccessPerson`] listing of `id_tag` in an `/access` response.
+fn access_person(a: &Value, id_tag: &str) -> String {
+	let people = a["people"].as_array().map_or(&[][..], Vec::as_slice);
+	match people.iter().find(|p| p["idTag"] == id_tag) {
+		None => "Absent",
+		Some(p) if p.get("inheritedFrom").is_some() => "Inherited",
+		Some(_) => "Direct",
+	}
+	.into()
+}
+
 /// `/api/me/full` `partners`: `Listed` = exactly club's contracted partner `peer.test`,
 /// `Empty`, `Hidden` when the field is absent (not a community), else the idTags.
 async fn partners(fx: &Fixture, s: &Subject) -> Result<String, String> {
@@ -3264,6 +3541,18 @@ pub async fn run(fx: &Fixture, layer: &'static str, mut cells: Vec<Cell>) -> Rep
 						Err(r) => r,
 					},
 					Fields(uri, f) => fields(fx, s, uri, f).await,
+					AccessShape => {
+						access(fx, s, &tgt).await.map(|a| access_shape(&a)).or_else(|r| r)
+					}
+					AccessPerson(who) => {
+						match subject(fx, who).and_then(|w| w.facts.id_tag.as_deref()) {
+							Some(id_tag) => access(fx, s, &tgt)
+								.await
+								.map(|a| access_person(&a, id_tag))
+								.or_else(|r| r),
+							None => Err(format!("{who}: no idTag")),
+						}
+					}
 					r => render(c.want, observe(fx, s, r, &tgt).await),
 				};
 				match got {

@@ -6,6 +6,7 @@
 //! Registers global server-level settings for logging, features, etc.
 
 use crate::prelude::*;
+use crate::roles::{FOLLOWER_LEVEL, MODERATOR_LEVEL, role_level};
 use crate::scheduler::CronSchedule;
 use crate::settings::{
 	PermissionLevel, SettingDefinition, SettingScope, SettingValue, SettingsRegistry,
@@ -104,6 +105,28 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.scope(SettingScope::Tenant)
 			.permission(PermissionLevel::User)
 			.optional(true)
+			.build()?,
+	)?;
+
+	// Lowest role that may create rooms (`post_channel`); moderators always may. `follower`
+	// and below would hand room creation to any federated visitor.
+	registry.register(
+		SettingDefinition::builder("room.create_role")
+			.description("Lowest community role allowed to create rooms")
+			.default(SettingValue::String("moderator".into()))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.validator(|v| match v {
+				SettingValue::String(s)
+					if role_level(s)
+						.is_some_and(|l| (FOLLOWER_LEVEL + 1..=MODERATOR_LEVEL).contains(&l)) =>
+				{
+					Ok(())
+				}
+				_ => Err(Error::ValidationError(
+					"Room creation role must be supporter, contributor or moderator".into(),
+				)),
+			})
 			.build()?,
 	)?;
 
