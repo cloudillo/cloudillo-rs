@@ -22,12 +22,11 @@ pub(crate) fn push_ns_scope(stack: &mut Vec<Vec<(String, String)>>, e: &BytesSta
 	let mut scope = stack.last().cloned().unwrap_or_default();
 	for attr in e.attributes().with_checks(false).flatten() {
 		let key = attr.key.as_ref();
-		let val = String::from_utf8_lossy(&attr.value).to_string();
-		if key == b"xmlns" {
-			upsert_prefix(&mut scope, "", &val);
-		} else if let Some(prefix) = key.strip_prefix(b"xmlns:") {
-			let prefix = String::from_utf8_lossy(prefix).to_string();
-			upsert_prefix(&mut scope, &prefix, &val);
+		let val = &attr.value;
+		if key == "xmlns" {
+			upsert_prefix(&mut scope, "", val);
+		} else if let Some(prefix) = key.strip_prefix("xmlns:") {
+			upsert_prefix(&mut scope, prefix, val);
 		}
 	}
 	stack.push(scope);
@@ -41,11 +40,10 @@ fn upsert_prefix(scope: &mut Vec<(String, String)>, prefix: &str, ns: &str) {
 	}
 }
 
-pub(crate) fn resolve_name(stack: &[Vec<(String, String)>], qname: &[u8]) -> (String, String) {
-	let qname_str = String::from_utf8_lossy(qname);
-	let (prefix, local) = match qname_str.split_once(':') {
+pub(crate) fn resolve_name(stack: &[Vec<(String, String)>], qname: &str) -> (String, String) {
+	let (prefix, local) = match qname.split_once(':') {
 		Some((p, l)) => (p.to_string(), l.to_string()),
-		None => (String::new(), qname_str.to_string()),
+		None => (String::new(), qname.to_string()),
 	};
 	let ns = stack
 		.last()
@@ -98,15 +96,15 @@ mod tests {
 		assert_eq!(stack.len(), 2);
 
 		// Use resolve_name to verify both bindings land on the top-of-stack scope.
-		let (ns_default, _) = resolve_name(&stack, b"anything");
+		let (ns_default, _) = resolve_name(&stack, "anything");
 		assert_eq!(ns_default, "DAV:");
-		let (ns_carddav, _) = resolve_name(&stack, b"C:anything");
+		let (ns_carddav, _) = resolve_name(&stack, "C:anything");
 		assert_eq!(ns_carddav, "urn:ietf:params:xml:ns:carddav");
 	}
 
 	#[test]
 	fn resolve_name_with_empty_stack_returns_no_namespace() {
-		let (ns, local) = resolve_name(&[], b"displayname");
+		let (ns, local) = resolve_name(&[], "displayname");
 		assert!(ns.is_empty());
 		assert_eq!(local, "displayname");
 	}
@@ -114,7 +112,7 @@ mod tests {
 	#[test]
 	fn resolve_name_uses_default_binding() {
 		let stack = vec![vec![(String::new(), "DAV:".to_string())]];
-		let (ns, local) = resolve_name(&stack, b"displayname");
+		let (ns, local) = resolve_name(&stack, "displayname");
 		assert_eq!(ns, "DAV:");
 		assert_eq!(local, "displayname");
 	}
@@ -125,7 +123,7 @@ mod tests {
 			(String::new(), "DAV:".to_string()),
 			("C".to_string(), "urn:ietf:params:xml:ns:carddav".to_string()),
 		]];
-		let (ns, local) = resolve_name(&stack, b"C:addressbook-home-set");
+		let (ns, local) = resolve_name(&stack, "C:addressbook-home-set");
 		assert_eq!(ns, "urn:ietf:params:xml:ns:carddav");
 		assert_eq!(local, "addressbook-home-set");
 	}
@@ -133,7 +131,7 @@ mod tests {
 	#[test]
 	fn resolve_name_unknown_prefix_falls_back_to_empty() {
 		let stack = vec![vec![(String::new(), "DAV:".to_string())]];
-		let (ns, local) = resolve_name(&stack, b"X:unknown");
+		let (ns, local) = resolve_name(&stack, "X:unknown");
 		assert!(ns.is_empty());
 		assert_eq!(local, "unknown");
 	}

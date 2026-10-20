@@ -34,14 +34,14 @@ resvg = "0.48"
 usvg = "0.48"
 
 # CRDT support (for file duplication)
-yrs = "0.27"
+yrs = "0.28"
 
 # LRU cache for the shared directory name cache
-lru = "0.18"
+lru = "0.19"
 parking_lot = "0.12"
 
 # HTML parsing (published-site fragment validation, SVG sanitisation)
-lol_html = "2"
+lol_html = "3"
 
 # Zip parsing (for app packages)
 rawzip = "0.5"

@@ -30,7 +30,7 @@ tracing = "0.1"
 dashmap = "6.2"
 sha2 = "0.11"
 tokio = { version = "1", features = ["rt", "time"] }
-uuid = { version = "1.27", features = ["v4"] }
+uuid = { version = "1.28", features = ["v4"] }
 
 # Auth-specific (exclusive to this crate)
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }

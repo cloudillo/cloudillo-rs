@@ -90,61 +90,57 @@ pub fn sanitize_svg(data: &[u8]) -> ClResult<Vec<u8>> {
 	// tokenized, so unquoted attributes and entity-encoded URLs are handled.
 	let mut output = Vec::new();
 	let mut rewriter = lol_html::HtmlRewriter::new(
-		lol_html::Settings {
-			element_content_handlers: vec![
-				lol_html::element!(r"*", |el| {
-					// Match the local name: browsers parse `image/svg+xml` as XML, where
-					// `<svg:script>` is a real script element that a bare `script`
-					// selector never sees.
-					let tag = el.tag_name();
-					if DANGEROUS_ELEMENTS.contains(&local_name(&tag)) {
-						el.remove();
+		lol_html::Settings::new()
+			.append_element_content_handler(lol_html::element!(r"*", |el| {
+				// Match the local name: browsers parse `image/svg+xml` as XML, where
+				// `<svg:script>` is a real script element that a bare `script`
+				// selector never sees.
+				let tag = el.tag_name();
+				if DANGEROUS_ELEMENTS.contains(&local_name(&tag)) {
+					el.remove();
+				}
+				Ok(())
+			}))
+			.append_element_content_handler(lol_html::element!(r"*", |el| {
+				let dangerous: Vec<String> = el
+					.attributes()
+					.iter()
+					.map(|attr| attr.name().clone())
+					.filter(|name| name.starts_with("on"))
+					.collect();
+				for name in dangerous {
+					el.remove_attribute(&name);
+				}
+				Ok(())
+			}))
+			.append_element_content_handler(lol_html::element!(r"*", |el| {
+				// Match the attribute's local name: `[href]` misses the namespaced
+				// form, and the prefix is arbitrary — `xl:href` bound to the xlink
+				// namespace is the same attribute to a browser as `xlink:href`.
+				let hrefs: Vec<String> = el
+					.attributes()
+					.iter()
+					.map(lol_html::html_content::Attribute::name)
+					.filter(|name| local_name(name) == "href")
+					.collect();
+				for name in hrefs {
+					let Some(href) = el.get_attribute(&name) else { continue };
+					// Browsers drop every TAB/CR/LF before resolving the scheme,
+					// so a decoded one must not hide `javascript:` from us.
+					let scheme: String = decode_char_refs(&href)
+						.chars()
+						.filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+						.collect::<String>()
+						.trim_start()
+						.to_ascii_lowercase();
+					if BLOCKED_URL_SCHEMES.iter().any(|s| scheme.starts_with(s)) {
+						el.set_attribute(&name, "").map_err(|e| {
+							Error::Internal(format!("{} rewrite error: {}", name, e))
+						})?;
 					}
-					Ok(())
-				}),
-				lol_html::element!(r"*", |el| {
-					let dangerous: Vec<String> = el
-						.attributes()
-						.iter()
-						.map(|attr| attr.name().clone())
-						.filter(|name| name.starts_with("on"))
-						.collect();
-					for name in dangerous {
-						el.remove_attribute(&name);
-					}
-					Ok(())
-				}),
-				lol_html::element!(r"*", |el| {
-					// Match the attribute's local name: `[href]` misses the namespaced
-					// form, and the prefix is arbitrary — `xl:href` bound to the xlink
-					// namespace is the same attribute to a browser as `xlink:href`.
-					let hrefs: Vec<String> = el
-						.attributes()
-						.iter()
-						.map(lol_html::html_content::Attribute::name)
-						.filter(|name| local_name(name) == "href")
-						.collect();
-					for name in hrefs {
-						let Some(href) = el.get_attribute(&name) else { continue };
-						// Browsers drop every TAB/CR/LF before resolving the scheme,
-						// so a decoded one must not hide `javascript:` from us.
-						let scheme: String = decode_char_refs(&href)
-							.chars()
-							.filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-							.collect::<String>()
-							.trim_start()
-							.to_ascii_lowercase();
-						if BLOCKED_URL_SCHEMES.iter().any(|s| scheme.starts_with(s)) {
-							el.set_attribute(&name, "").map_err(|e| {
-								Error::Internal(format!("{} rewrite error: {}", name, e))
-							})?;
-						}
-					}
-					Ok(())
-				}),
-			],
-			..lol_html::Settings::default()
-		},
+				}
+				Ok(())
+			})),
 		|chunk: &[u8]| output.extend_from_slice(chunk),
 	);
 	rewriter

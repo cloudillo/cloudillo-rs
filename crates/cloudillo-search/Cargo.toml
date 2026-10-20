@@ -34,7 +34,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt", "sync", "fs", "io-util"] }
 tracing = "0.1"
 # Read-only: CRDT documents are materialised for indexing, never written here.
-yrs = "0.27"
+yrs = "0.28"
 
 [lints]
 workspace = true

@@ -52,8 +52,8 @@ pub fn extract_text(html: &str, max_chars: usize) -> ClResult<ExtractedText> {
 	let sep_acc = Rc::clone(&acc);
 
 	let mut rewriter = HtmlRewriter::new(
-		Settings {
-			element_content_handlers: vec![element!(BLOCK_ELEMENTS, move |el| {
+		Settings::new()
+			.append_element_content_handler(element!(BLOCK_ELEMENTS, move |el| {
 				if let Ok(mut acc) = sep_acc.try_borrow_mut() {
 					acc.separate();
 				}
@@ -73,24 +73,21 @@ pub fn extract_text(html: &str, max_chars: usize) -> ClResult<ExtractedText> {
 					handlers.push(handler);
 				}
 				Ok(())
-			})],
-			document_content_handlers: vec![doc_text!(move |chunk| {
+			}))
+			.append_document_content_handler(doc_text!(move |chunk| {
 				if matches!(chunk.text_type(), TextType::Data | TextType::CDataSection)
 					&& let Ok(mut acc) = text_acc.try_borrow_mut()
 				{
 					acc.push_chunk(chunk.as_str());
 				}
 				Ok(())
-			})],
-			// `Settings::default()` leaves the arena at `usize::MAX`, so a
+			}))
+			// `Settings::new()` leaves the arena at `usize::MAX`, so a
 			// document that fits [`MAX_INPUT_BYTES`] could still make the
 			// rewriter's internal buffers grow without bound.
-			memory_settings: lol_html::MemorySettings {
-				max_allowed_memory_usage: MAX_INPUT_BYTES,
-				..lol_html::MemorySettings::default()
-			},
-			..Settings::default()
-		},
+			.with_memory_settings(
+				lol_html::MemorySettings::new().with_max_allowed_memory_usage(MAX_INPUT_BYTES),
+			),
 		|_: &[u8]| {},
 	);
 	rewriter

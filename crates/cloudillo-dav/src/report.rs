@@ -218,8 +218,8 @@ pub fn parse(body: &str) -> Report {
 					&& ns == NS_CALDAV
 					&& local == "time-range"
 				{
-					let start = read_attr(&e, b"start");
-					let end = read_attr(&e, b"end");
+					let start = read_attr(&e, "start");
+					let end = read_attr(&e, "end");
 					cal_query.time_range = Some((start, end));
 				} else if matches!(root_kind, Some(ReportKind::CalendarQuery))
 					&& ns == NS_CALDAV
@@ -244,16 +244,10 @@ pub fn parse(body: &str) -> Report {
 					|| sync_token_depth.is_some()
 					|| nresults_depth.is_some() =>
 			{
-				match t.decode() {
-					Ok(decoded) => match quick_xml::escape::unescape(&decoded) {
-						Ok(s) => current_text.push_str(&s),
-						Err(e) => {
-							warn!("REPORT body has malformed XML entity: {e}");
-							had_unescape_error = true;
-						}
-					},
+				match quick_xml::escape::unescape(&t) {
+					Ok(s) => current_text.push_str(&s),
 					Err(e) => {
-						warn!("REPORT body has invalid encoding: {e}");
+						warn!("REPORT body has malformed XML entity: {e}");
 						had_unescape_error = true;
 					}
 				}
@@ -317,17 +311,17 @@ pub fn parse(body: &str) -> Report {
 	}
 }
 
-fn read_attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
+fn read_attr(e: &quick_xml::events::BytesStart<'_>, key: &str) -> Option<String> {
 	for attr in e.attributes().flatten() {
 		if attr.key.as_ref() == key {
-			return std::str::from_utf8(&attr.value).ok().map(str::to_string);
+			return Some(attr.value.into_owned());
 		}
 	}
 	None
 }
 
 fn read_name_attr(e: &quick_xml::events::BytesStart<'_>) -> Option<String> {
-	read_attr(e, b"name")
+	read_attr(e, "name")
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -17,7 +17,7 @@ cloudillo-types = { workspace = true }
 # Streaming tokenizer, no DOM allocation. Its `TextType` is what lets script and
 # style content be skipped as a property of the tokenizer rather than by a tag
 # list this crate would have to keep in step with the serializer.
-lol_html = "2"
+lol_html = "3"
 
 [dev-dependencies]
 # Scratch files for the extraction tests, so two concurrent runs cannot race on

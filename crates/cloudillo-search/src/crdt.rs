@@ -285,8 +285,10 @@ fn any_to_json(any: &Any, depth: usize, truncated: &mut bool) -> Value {
 	match any {
 		Any::Null | Any::Undefined | Any::Buffer(_) => Value::Null,
 		Any::Bool(b) => Value::Bool(*b),
-		Any::Number(n) => serde_json::Number::from_f64(*n).map_or(Value::Null, Value::Number),
-		Any::BigInt(i) => Value::Number((*i).into()),
+		Any::Number(yrs::any::Number::Float(n)) => {
+			serde_json::Number::from_f64(*n).map_or(Value::Null, Value::Number)
+		}
+		Any::Number(yrs::any::Number::Int(i)) => Value::Number((*i).into()),
 		Any::String(s) => Value::String(s.to_string()),
 		Any::Array(_) | Any::Map(_) if depth == 0 => {
 			*truncated = true;
@@ -536,7 +538,7 @@ mod tests {
 		let nums = doc.get_or_insert_array("n");
 		{
 			let mut txn = doc.transact_mut();
-			nums.push_back(&mut txn, Any::Number(1.0));
+			nums.push_back(&mut txn, Any::Number(yrs::any::Number::Float(1.0)));
 			nums.push_back(&mut txn, Any::Bool(true));
 		}
 
@@ -574,8 +576,8 @@ mod tests {
 	#[test]
 	fn binary_and_non_finite_values_become_null_rather_than_noise() {
 		assert_eq!(to_json(&Any::Buffer(Arc::from([1u8, 2, 3]))), Value::Null);
-		assert_eq!(to_json(&Any::Number(f64::NAN)), Value::Null);
-		assert_eq!(to_json(&Any::BigInt(-7)), serde_json::json!(-7));
+		assert_eq!(to_json(&Any::Number(yrs::any::Number::Float(f64::NAN))), Value::Null);
+		assert_eq!(to_json(&Any::Number(yrs::any::Number::Int(-7))), serde_json::json!(-7));
 	}
 
 	/// The bound that keeps peer-authored nesting from overflowing the worker

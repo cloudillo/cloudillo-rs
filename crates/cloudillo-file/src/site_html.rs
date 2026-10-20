@@ -159,16 +159,15 @@ pub fn validate_fragment(html: &str) -> ClResult<()> {
 	let doctype_sink = Rc::clone(&found);
 
 	let mut rewriter = HtmlRewriter::new(
-		Settings {
-			element_content_handlers: vec![
-				element!("*", move |el| {
+		Settings::new()
+			.append_element_content_handler(element!("*", move |el| {
 					if let Ok(mut slot) = el_sink.try_borrow_mut()
 						&& slot.is_none()
 					{
 						*slot = violation(el);
 					}
 					Ok(())
-				}),
+				}))
 				// The metadata payload is the one region `cloudillo_site::wrapper::parse_fragment`
 				// delimits with a plain byte scan for `</script>` rather than a tokenizer. A raw
 				// `<` is what lets the two disagree: `<!--<script>` puts a spec tokenizer into
@@ -177,7 +176,7 @@ pub fn validate_fragment(html: &str) -> ClResult<()> {
 				// mid-element and hoists an unterminated `<head>`. `renderPageMetaScript` in
 				// `libs/core/src/site.ts` already escapes every `<`; this makes it a rule.
 				// Per chunk with no carry-over state: `<` is one byte, so no boundary splits it.
-				text!("script", move |chunk| {
+				.append_element_content_handler(text!("script", move |chunk| {
 					if chunk.as_str().contains('<')
 						&& let Ok(mut slot) = text_sink.try_borrow_mut()
 						&& slot.is_none()
@@ -185,25 +184,21 @@ pub fn validate_fragment(html: &str) -> ClResult<()> {
 						*slot = Some("contains a <script> whose payload holds a raw `<`".into());
 					}
 					Ok(())
-				}),
-			],
-			document_content_handlers: vec![doctype!(move |_| {
+				}))
+			.append_document_content_handler(doctype!(move |_| {
 				if let Ok(mut slot) = doctype_sink.try_borrow_mut()
 					&& slot.is_none()
 				{
 					*slot = Some("contains a doctype, which a page fragment may not".into());
 				}
 				Ok(())
-			})],
-			// `Settings::default()` leaves the arena at `usize::MAX`, so a document
+			}))
+			// `Settings::new()` leaves the arena at `usize::MAX`, so a document
 			// that fits [`MAX_INPUT_BYTES`] could still make the rewriter's internal
 			// buffers grow without bound.
-			memory_settings: lol_html::MemorySettings {
-				max_allowed_memory_usage: MAX_INPUT_BYTES,
-				..lol_html::MemorySettings::default()
-			},
-			..Settings::default()
-		},
+			.with_memory_settings(
+				lol_html::MemorySettings::new().with_max_allowed_memory_usage(MAX_INPUT_BYTES),
+			),
 		// Validating, not rewriting: the output is thrown away.
 		|_: &[u8]| {},
 	);

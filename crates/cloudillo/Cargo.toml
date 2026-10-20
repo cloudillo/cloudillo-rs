@@ -34,12 +34,12 @@ cloudillo-dav = { workspace = true }
 axum = { version = "0.8.9", features = ["http2", "macros", "multipart", "ws"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 futures = "0.3.34"
-hyper = "1.11.1"
-rustls = "0.23.45"
+hyper = "1.12.0"
+rustls = "0.23.46"
 rustls-pki-types = { version = "1.15.1", features = ["alloc"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-tokio = { version = "1.53.2", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["cors", "fs", "set-header", "trace", "compression-gzip", "compression-zstd"] }
 tracing = "0.1.44"
@@ -55,9 +55,9 @@ jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 p384 = { version = "0.14.0", features = ["pkcs8", "pem", "getrandom"] }
 tempfile = "3.27"
 base64 = "0.23"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 async-trait = "0.1.92"
-tokio = { version = "1.53.2", features = ["rt", "rt-multi-thread", "macros", "fs", "sync", "net", "time"] }
+tokio = { version = "1.54.0", features = ["rt", "rt-multi-thread", "macros", "fs", "sync", "net", "time"] }
 
 [lints]
 workspace = true
