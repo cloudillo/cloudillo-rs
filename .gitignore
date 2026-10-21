@@ -2,8 +2,6 @@
 /data
 /tmp
 /perf.data
-/Cargo.lock
-/supply-chain
 *.sw?
 *.tmp
 *.bak
