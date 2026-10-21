@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! `create_tenant_login` mints an owner session (full `leader` hierarchy plus the
 //! tenant row's extras), so the identity it is asked for must be the tenant the

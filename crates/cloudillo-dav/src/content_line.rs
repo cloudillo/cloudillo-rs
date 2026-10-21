@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! RFC 5545 §3.1 / RFC 6350 §3.2 content-line grammar, shared by the iCalendar
 //! (CalDAV) and vCard (CardDAV) crates.

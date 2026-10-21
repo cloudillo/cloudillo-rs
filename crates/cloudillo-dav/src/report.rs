@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Parse REPORT request bodies (RFC 6352 §8, RFC 6578 §3, RFC 4791 §7).
 //!

@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! The v58 entry/file split: one immutable BLOB placed by several entries.
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]

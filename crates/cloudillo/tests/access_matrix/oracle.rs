@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Independent oracle: the *intended* access policy (file access ladder, community roles,
 //! ABAC visibility, token scopes) and the DSL behaviour flags, re-stated from scratch.

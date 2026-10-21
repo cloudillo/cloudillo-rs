@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Helpers shared by the adapter test binaries; each binary uses a subset.
 #![allow(dead_code, clippy::expect_used)]

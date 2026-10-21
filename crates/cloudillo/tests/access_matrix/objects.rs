@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Matrix objects, seeded by direct adapter writes: the level-layer set (every Active Blob file
 //! shape × visibility, every Active action shape × visibility × issuer) plus the objects the

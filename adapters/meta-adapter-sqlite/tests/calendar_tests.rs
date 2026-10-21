@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Calendar adapter tests — focused on the transactional paths that aren't
 //! trivially verifiable from reading the SQL.

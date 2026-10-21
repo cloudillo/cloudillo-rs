@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Matrix operations: one variant per in-scope route, its request builder, applicability and
 //! response classification. Request shapes only — expectations live in the oracle.

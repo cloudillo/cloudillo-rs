@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! `GET /api/files/{file_id}/access` — the **effective** access of an entry: its audience, the user
 //! grants on it and on every ancestor folder, and its share links, shaped by the caller's standing.

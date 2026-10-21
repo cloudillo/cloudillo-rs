@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! `on_first_cert_issued` hook — flushes the deferred welcome email after
 //! ACME issues the tenant's first certificate.

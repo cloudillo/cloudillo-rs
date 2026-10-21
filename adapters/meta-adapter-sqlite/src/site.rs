@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Site builder storage: the per-tenant `sites` singleton and the `site_docs` rows
 //! binding documents to mount paths.

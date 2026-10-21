@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Inbound federation branches the inbox matrix cells cannot shape (community invitations,
 //! hats, APRV authority, subscriptions and flags), and the rows a 2xx delivery may leave behind.

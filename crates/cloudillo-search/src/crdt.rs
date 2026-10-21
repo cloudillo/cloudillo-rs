@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Reading a Yjs/CRDT document as plain JSON, so the same index manifest works
 //! for CRDT apps (prezillo, ideallo, quillo, calcillo) as for RTDB ones.

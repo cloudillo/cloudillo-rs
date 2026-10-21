@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! File lifecycle paths the matrix objects do not reach: rows created through the API (the
 //! matrix seeds rows directly), trash reached through an ancestor, per-row `DELETE /api/trash`

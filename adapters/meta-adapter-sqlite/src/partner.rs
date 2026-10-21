@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Partner edges: each membership community's connected community peers, as synced from
 //! its `GET /api/me/full` `partners` and from received PTNR actions.

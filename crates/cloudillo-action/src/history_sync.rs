@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Federated history sync: pull a bounded tail of a peer's recent broadcast actions
 //! when a new federation link forms (FLLW or CONN reaching Connected).

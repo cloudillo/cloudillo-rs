@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Real WebSocket upgrades over a loopback listener. The probe router (`fixture::ws_probe`)
 //! judges the pre-upgrade decision for the `ws` layer; these cells pin the close codes a
