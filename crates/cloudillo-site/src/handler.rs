@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! `/api/sites` — a tenant's site configuration.
 //!
@@ -11,9 +11,9 @@
 //! and publishing a site is one owner/leader decision, so a mount may name any
 //! document of the tenant.
 //!
-//! The guard is not the whole check. Published pages are served under a CSP that
-//! must carry `script-src 'unsafe-inline'` (`cache::content_security_policy`), so
-//! their markup is held to an element/attribute allowlist by
+//! The guard is not the whole check. Published pages are served under a CSP
+//! without `script-src 'unsafe-inline'` (`cache::content_security_policy`), and
+//! their markup is also held to an element/attribute allowlist by
 //! `cloudillo_file::site_html` at **upload** time, long before this route commits
 //! them. A leader can publish any *content*; they cannot publish script.
 //!
@@ -938,8 +938,8 @@ mod tests {
 		assert!(validate_nav(&items).is_err());
 	}
 
-	/// The target lands in an `href` and the site CSP carries `script-src
-	/// 'unsafe-inline'`, which does not stop a `javascript:` URL — and `require_leader`
+	/// The target lands in an `href`, where a `javascript:` URL would rest on the site
+	/// CSP alone (it carries no `script-src 'unsafe-inline'`) — and `require_leader`
 	/// makes this reachable on a community tenant by someone who does not own it.
 	#[test]
 	fn a_nav_target_that_is_not_a_path_or_an_http_url_is_refused() {

@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! HTTP routing — the only place in the workspace where routes are declared.
 //!
@@ -63,7 +63,9 @@ use crate::prelude::*;
 use cloudillo_core::acme;
 use cloudillo_core::middleware::request_id_middleware;
 
-use policy::{GLOBAL_BODY_LIMIT, is_compressible_media_type, with_security_headers};
+use policy::{
+	GLOBAL_BODY_LIMIT, is_compressible_media_type, with_json_api_csp, with_security_headers,
+};
 use static_files::{api_asset_handler, static_fallback_handler};
 
 async fn api_not_found() -> Error {
@@ -148,7 +150,7 @@ fn init_api_service(app: App) -> Router {
 		// inline with `upload_body_limit()` / `DefaultBodyLimit::disable()`.
 		.layer(DefaultBodyLimit::max(GLOBAL_BODY_LIMIT))
 		.with_state(app);
-	with_security_headers(router)
+	with_security_headers(with_json_api_csp(router))
 }
 
 fn init_app_service(app: App) -> Router {

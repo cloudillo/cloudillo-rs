@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! The site wrapper — the HTML document a stored fragment is served inside.
 //!
@@ -178,7 +178,7 @@ pub fn render_page(ctx: &WrapperCtx, fragment: &str) -> String {
 	let parsed = parse_fragment(fragment);
 	let assets = format!("/assets-{}", ctx.shell_version);
 
-	let mut out = String::with_capacity(fragment.len() + BASE_STYLE.len() + PREPAINT.len() + 1024);
+	let mut out = String::with_capacity(fragment.len() + BASE_STYLE.len() + 1024);
 	// A malformed value cannot break out of the attribute — it goes through
 	// `push_escaped` like any other head text — and its *shape* is deliberately not
 	// validated: a wrong-but-well-formed tag is the publisher's business.
@@ -234,9 +234,12 @@ pub fn render_page(ctx: &WrapperCtx, fragment: &str) -> String {
 	push_boot_seed(&mut out, &ctx.chrome);
 	out.push_str("</head>\n<body class=\"");
 	out.push_str(PREBOOT_BODY_CLASS);
-	out.push_str("\">\n<script>\n");
-	out.push_str(PREPAINT);
-	out.push_str("</script>\n");
+	// The pre-paint theme script (`shell/src/boot.js`): plain, blocking and first in
+	// `<body>`, so the theme classes land before first paint. External, not inline, so
+	// the site CSP needs no `script-src 'unsafe-inline'`.
+	out.push_str("\">\n<script src=\"");
+	out.push_str(&assets);
+	out.push_str("/boot.js\"></script>\n");
 	push_chrome(&mut out, &ctx.chrome);
 	out.push_str("<div id=\"");
 	out.push_str(CONTENT_ELEMENT_ID);
@@ -364,8 +367,8 @@ fn push_nav_item(out: &mut String, item: &SiteNavItem, path: &str) {
 ///
 /// The scheme is re-checked here rather than trusted from the cache entry:
 /// `handler::validate_nav_entry` rejects an unsafe target on the way in, but a row
-/// written straight into the column would otherwise reach an `href` that the site
-/// CSP's `script-src 'unsafe-inline'` does not stop. A failing target renders as a
+/// written straight into the column would otherwise reach an `href`, with only the site
+/// CSP (no `script-src 'unsafe-inline'`) left to stop it. A failing target renders as a
 /// `<span>`: the bar keeps its shape and loses the link.
 fn push_nav_link(out: &mut String, label: &str, target: &str, path: &str) {
 	let safe = cloudillo_types::site::is_safe_nav_target(target);
@@ -519,45 +522,6 @@ body.theme-opaque,
 body.theme-opaque.dark {
 	background: var(--col-surface);
 }
-";
-
-/// The pre-paint mode script, copied verbatim from `shell/src/index.html` so drift is
-/// visible in a diff.
-///
-/// It runs before first paint and puts `theme-glass`/`theme-opaque` and `light`/`dark`
-/// on `<body>` from `localStorage` and `prefers-color-scheme`. Without it a site page
-/// paints in the wrong theme until the bundle boots — on a prerendered page, the whole
-/// visible load.
-const PREPAINT: &str = r"(function () {
-	try {
-		window.__cloudilloBootStart = performance.now()
-		let theme = null
-		let colors = null
-		try {
-			theme = localStorage.getItem('cloudillo.theme')
-			colors = localStorage.getItem('cloudillo.colors')
-		} catch (_e) {
-			/* localStorage may be unavailable */
-		}
-		const cl = document.body.classList
-		if (theme === 'opaque') {
-			cl.add('theme-opaque')
-		} else {
-			cl.add('theme-glass')
-		}
-		let dark
-		if (colors === 'dark') {
-			dark = true
-		} else if (colors === 'light') {
-			dark = false
-		} else {
-			dark = !!window.matchMedia?.('(prefers-color-scheme: dark)')?.matches
-		}
-		cl.add(dark ? 'dark' : 'light')
-	} catch (_e) {
-		/* never block first paint */
-	}
-})()
 ";
 
 #[cfg(test)]
@@ -780,8 +744,8 @@ mod tests {
 	}
 
 	/// A row written before the input validation existed — or straight into the
-	/// column — must not reach an `href`: the site CSP's `script-src
-	/// 'unsafe-inline'` is exactly what makes a `javascript:` target run.
+	/// column — must not reach an `href`: a `javascript:` target would otherwise rest on
+	/// the site CSP alone, and that layer is not the one meant to hold.
 	#[test]
 	fn a_nav_target_that_could_run_a_script_renders_without_a_link() {
 		let nav = [

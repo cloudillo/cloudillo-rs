@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! The site cache — everything serving one HTTP request for a published page
 //! needs, resolved once and held in memory.
@@ -647,10 +647,10 @@ pub(crate) fn fnv_field(state: u32, text: &str) -> u32 {
 /// `<script>`, an `on*` handler, a `<base>` or a `javascript:` href fails the upload
 /// outright and never reaches storage.
 ///
-/// This policy cannot do that job: it must carry `'unsafe-inline'` on both
-/// `script-src` and `style-src` — the wrapper's pre-paint theme script and boot seed
-/// are inline, and the serializer emits inline `style` attributes — so it does not
-/// stop inline script and is not meant to. What it buys is the rest of the surface,
+/// This policy backs that up: `script-src` admits no inline script (the wrapper's
+/// pre-paint script is the external `boot.js`, and its page-meta and boot-seed
+/// `<script>`s are non-executable JSON types). `style-src` keeps `'unsafe-inline'`
+/// because the serializer emits inline `style` attributes. It also buys the rest of the surface,
 /// which matters because publishing is gated on `require_leader`, not owner-only: on
 /// a community tenant any leader can publish content that renders on the origin
 /// holding every member's session.
@@ -695,7 +695,7 @@ pub(crate) fn content_security_policy(id_tag: &str) -> String {
 		"default-src 'self' https://cl-o.{host}; \
 		 img-src 'self' https: data: blob:; \
 		 media-src 'self' https: blob:; \
-		 script-src 'self' 'unsafe-inline'; \
+		 script-src 'self'; \
 		 style-src 'self' 'unsafe-inline'; \
 		 connect-src 'self' wss://cl-o.{host} https://cl-o.{host}; \
 		 frame-src 'self' https://cl-o.{host}; \
@@ -1099,10 +1099,10 @@ mod tests {
 		sources(csp, directive).contains(&source)
 	}
 
-	/// The two `'unsafe-inline'`s are deliberate and load-bearing — the wrapper's
-	/// pre-paint script is inline, and the serializer emits inline `style`
-	/// attributes for colours and alignment — which is exactly why the
-	/// serializer's own allowlist is the layer that has to hold.
+	/// No inline script: the wrapper loads its pre-paint script as `boot.js`, so an
+	/// injected inline `<script>` or `on*` handler that slipped past the upload
+	/// allowlist still does not run. Inline style stays — the serializer emits
+	/// `style` attributes for colours and alignment.
 	///
 	/// `frame-ancestors 'self'`: a published page boots the shell on the origin
 	/// that holds the owner's session, so it must not be framable cross-origin.
@@ -1111,10 +1111,10 @@ mod tests {
 	/// `.c-site-logo` from inline `data:` SVGs — without it a published page loses
 	/// its background and its logo, silently apart from the console violations.
 	#[test]
-	fn the_csp_admits_inline_script_and_style_and_the_owners_own_instance() {
+	fn the_csp_refuses_inline_script_admits_inline_style_and_the_owners_own_instance() {
 		let csp = content_security_policy("alice.example");
+		assert_eq!(sources(&csp, "script-src"), ["'self'"], "{csp}");
 		for source in ["'self'", "'unsafe-inline'"] {
-			assert!(admits(&csp, "script-src", source), "{csp}");
 			assert!(admits(&csp, "style-src", source), "{csp}");
 		}
 		for source in ["'self'", "wss://cl-o.alice.example", "https://cl-o.alice.example"] {

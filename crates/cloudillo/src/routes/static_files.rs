@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Static-file serving for the app domain: `ServeDir`, the SPA fallback and the
 //! published-site branches. Plus [`api_asset_handler`], which serves `/apps/**` and
@@ -197,6 +197,19 @@ fn shell_etag_matches(if_none_match: &str, etag: &str) -> bool {
 	})
 }
 
+/// The shell document's CSP. `script-src 'self'`: `index.html` carries no inline script
+/// (the pre-paint theme script is `/assets-<version>/boot.js`). `style-src 'unsafe-inline'`
+/// stays for React inline styles. `connect-src`/`frame-src` admit any `https:` origin
+/// because the shell calls other instances and frames their `cl-o.<idTag>` app bundles.
+/// `frame-ancestors 'self'` applies to the shell document only, never to app iframes.
+/// `worker-src blob:` is qr-scanner's worker (`URL.createObjectURL`, used without a native
+/// BarcodeDetector); `'self'` keeps the service worker.
+const SHELL_CSP: &str = "default-src 'self'; script-src 'self'; \
+	style-src 'self' 'unsafe-inline'; img-src 'self' https: data: blob:; \
+	media-src 'self' https: blob:; connect-src 'self' https: wss:; frame-src 'self' https:; \
+	worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; \
+	frame-ancestors 'self'";
+
 /// Serve shell's index.html for SPA fallback (client-side routing)
 ///
 /// Only used for shell routes (e.g., /~/app/feed, /@comm.tld/settings) - apps use iframes with
@@ -232,6 +245,8 @@ async fn serve_shell_index_html(
 			.status(StatusCode::NOT_MODIFIED)
 			.header(header::CACHE_CONTROL, cache_value)
 			.header(header::ETAG, etag.as_str())
+			// On the 304 too: a cache refreshing its stored headers keeps the policy.
+			.header(header::CONTENT_SECURITY_POLICY, SHELL_CSP)
 			.body(Body::empty())?);
 	}
 
@@ -247,7 +262,8 @@ async fn serve_shell_index_html(
 			let mut builder = Response::builder()
 				.status(StatusCode::OK)
 				.header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-				.header(header::CACHE_CONTROL, cache_value);
+				.header(header::CACHE_CONTROL, cache_value)
+				.header(header::CONTENT_SECURITY_POLICY, SHELL_CSP);
 			if let Some(etag) = &etag {
 				builder = builder.header(header::ETAG, etag.as_str());
 			}
@@ -506,9 +522,9 @@ pub(super) async fn api_asset_handler(
 #[cfg(test)]
 mod tests {
 	use super::{
-		GUEST_ROOT_PREFIXES, GUEST_ROOTS_EXACT, SERVE_DIR_ROOTS, StatusCode, asset_cache_control,
-		decode_request_path, is_serve_dir_path, is_shell_route, is_sw_file, shell_etag_matches,
-		should_serve_spa_fallback,
+		GUEST_ROOT_PREFIXES, GUEST_ROOTS_EXACT, SERVE_DIR_ROOTS, SHELL_CSP, StatusCode,
+		asset_cache_control, decode_request_path, is_serve_dir_path, is_shell_route, is_sw_file,
+		shell_etag_matches, should_serve_spa_fallback,
 	};
 
 	/// Build the shape of response `ServeDir` hands back, for `asset_cache_control`.
@@ -609,6 +625,25 @@ mod tests {
 		assert!(shell_etag_matches("W/\"12345\"", etag));
 		assert!(shell_etag_matches("\"other\", W/\"12345\"", etag));
 		assert!(!shell_etag_matches("\"54321\"", etag));
+	}
+
+	/// Pins the shell CSP: no inline script, and app iframes from other instances still load.
+	#[test]
+	fn the_shell_csp_forbids_inline_script_and_admits_app_frames() {
+		let directive = |name: &str| {
+			SHELL_CSP
+				.split(';')
+				.map(str::trim)
+				.find(|d| d.split_whitespace().next() == Some(name))
+				.unwrap_or_default()
+		};
+		assert_eq!(directive("script-src"), "script-src 'self'");
+		assert_eq!(directive("worker-src"), "worker-src 'self' blob:");
+		assert!(directive("style-src").contains("'unsafe-inline'"));
+		assert_eq!(directive("frame-src"), "frame-src 'self' https:");
+		assert_eq!(directive("frame-ancestors"), "frame-ancestors 'self'");
+		assert_eq!(directive("object-src"), "object-src 'none'");
+		assert_eq!(directive("base-uri"), "base-uri 'none'");
 	}
 
 	/// One script, one URL. The version moved into the query (`/sw.js?v=<version>`), which

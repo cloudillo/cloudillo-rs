@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! HTTP policy layers shared by the API and app services.
 //!
@@ -9,7 +9,8 @@
 use axum::{
 	Router,
 	extract::DefaultBodyLimit,
-	http::{HeaderValue, header},
+	http::{HeaderMap, HeaderValue, header},
+	response::Response,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -82,9 +83,13 @@ pub(super) fn is_compressible_media_type(
 /// router.
 ///
 /// Deliberately scoped to three headers and **no framing policy**: the shell
-/// embeds sandboxed apps in iframes (including, in future, apps served from
-/// external origins), so we must not add `X-Frame-Options` or a restrictive
-/// `frame-ancestors`/`frame-src` CSP that would block that embedding.
+/// embeds sandboxed apps in iframes (including apps served from other
+/// instances), so no router-wide `X-Frame-Options` or `frame-ancestors` CSP may
+/// be added here — it would land on the app bundles too. Document CSPs are set
+/// per response instead: the shell's in `static_files.rs` (`SHELL_CSP`, set by
+/// `serve_shell_index_html`; `frame-src 'self' https:`, `frame-ancestors 'self'`
+/// on the shell document only), published sites' in
+/// `cloudillo-site/src/cache.rs::content_security_policy`.
 ///
 /// All three use `if_not_present` so handler- or file-specific headers (e.g.
 /// the per-SVG `Content-Security-Policy` set when serving uploaded files) are
@@ -108,10 +113,66 @@ pub(super) fn with_security_headers(router: Router) -> Router {
 		))
 }
 
+/// Add `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` to
+/// every `application/json` response of a router (API router only).
+///
+/// A JSON body is never meant to be rendered or framed, so a deny-all policy costs
+/// nothing. Non-JSON responses (app bundles, uploaded files, assets, websocket
+/// upgrades) keep their own CSP or none; an existing CSP is never overwritten.
+pub(super) fn with_json_api_csp(router: Router) -> Router {
+	router.layer(axum::middleware::map_response(json_api_csp))
+}
+
+async fn json_api_csp(mut res: Response) -> Response {
+	set_json_csp(res.headers_mut());
+	res
+}
+
+fn set_json_csp(headers: &mut HeaderMap) {
+	if headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+		return;
+	}
+	let essence = headers
+		.get(header::CONTENT_TYPE)
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or("")
+		.split(';')
+		.next()
+		.unwrap_or("")
+		.trim();
+	if essence.eq_ignore_ascii_case("application/json") {
+		headers.insert(
+			header::CONTENT_SECURITY_POLICY,
+			HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+		);
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use super::is_compressible_media_type;
-	use axum::http::{Extensions, HeaderMap, StatusCode, Version, header};
+	use super::{is_compressible_media_type, set_json_csp};
+	use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode, Version, header};
+
+	#[test]
+	fn json_csp_only_on_json_and_never_overwrites() {
+		let csp = |ct: &str, existing: Option<&'static str>| {
+			let mut h = HeaderMap::new();
+			h.insert(header::CONTENT_TYPE, ct.parse().unwrap_or(HeaderValue::from_static("")));
+			if let Some(e) = existing {
+				h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(e));
+			}
+			set_json_csp(&mut h);
+			h.get(header::CONTENT_SECURITY_POLICY)
+				.and_then(|v| v.to_str().ok())
+				.map(String::from)
+		};
+		let deny = Some("default-src 'none'; frame-ancestors 'none'".to_string());
+		assert_eq!(csp("application/json", None), deny);
+		assert_eq!(csp("application/json; charset=utf-8", None), deny);
+		assert_eq!(csp("text/html", None), None);
+		assert_eq!(csp("image/svg+xml", None), None);
+		assert_eq!(csp("application/json", Some("sandbox")).as_deref(), Some("sandbox"));
+	}
 
 	/// Run `is_compressible_media_type` for a given content-type header value at
 	/// `200 OK`. `None` means no `content-type` header is set at all.
