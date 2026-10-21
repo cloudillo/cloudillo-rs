@@ -1,23 +1,31 @@
 # BUILD ARGUMENTS #
 ###################
 
-ARG RS_REF=main
-ARG FRONTEND_REF=main
-ARG OPALUI_REF=
+# Source refs default to the release tag of this version (bump with the workspace
+# version in Cargo.toml). Never a branch. Tag-pinned, not commit-pinned: tags are mutable;
+# pass a commit SHA via `--build-arg RS_REF=<sha>` (and FRONTEND_REF) for byte-reproducible
+# builds.
+ARG RS_REF=v0.8.21
+ARG FRONTEND_REF=v0.8.21
 ARG UID=10001
 ARG GID=10001
 
 # RUST BUILDER STAGE #
 ######################
 
-FROM rust:1-slim-trixie AS rust-builder
+# rust:1-slim-trixie
+FROM rust:1-slim-trixie@sha256:4df2ae8cfdfebdfc13a65da7f253b73d68983dc0339f2719bc17a279c913b13d AS rust-builder
 ARG RS_REF
 WORKDIR /app
 RUN apt-get update && apt-get install -y libssl-dev pkg-config git
-RUN git clone --depth 1 --branch ${RS_REF} https://github.com/cloudillo/cloudillo-rs.git .
+# fetch, not `clone --branch`: takes a tag or a commit SHA
+RUN git init -q && git fetch --depth 1 https://github.com/cloudillo/cloudillo-rs.git ${RS_REF} && git checkout -q FETCH_HEAD
 # Disable sccache wrapper (not available in Docker)
 ENV RUSTC_WRAPPER=""
-RUN cargo build --profile release-lto
+# cargo auditable embeds the resolved crate list in the binary (kept by strip), so scanners
+# read it from the image; release.sh's syft cross-check relies on it.
+RUN cargo install cargo-auditable --locked --version 0.7.7
+RUN cargo auditable build --profile release-lto
 RUN strip /app/target/release-lto/cloudillo-server
 ARG UID
 ARG GID
@@ -31,20 +39,18 @@ RUN mkdir -p /cloudillo-data && touch /cloudillo-data/.keep && chmod 0755 /cloud
 # FRONTEND BUILDER STAGE #
 ##########################
 
-FROM node:22-slim AS frontend-builder
+# node:22-slim
+FROM node:22-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS frontend-builder
 ARG FRONTEND_REF
-ARG OPALUI_REF
 WORKDIR /app
 RUN apt-get update && apt-get install -y git python3 python3-pip && rm -rf /var/lib/apt/lists/*
 RUN pip3 install --break-system-packages fonttools brotli
-RUN npm install -g pnpm
-RUN git clone --depth 1 --branch ${FRONTEND_REF} https://github.com/cloudillo/cloudillo.git .
-RUN if [ -n "${OPALUI_REF}" ]; then \
-        git clone --depth 1 --branch ${OPALUI_REF} https://github.com/szilu/opalui.git local/opalui; \
-        pnpm install --no-frozen-lockfile; \
-    else \
-        pnpm install --frozen-lockfile; \
-    fi
+# Matches packageManager in the frontend's package.json
+RUN npm install -g pnpm@11.4.0
+# fetch, not `clone --branch`: takes a tag or a commit SHA
+RUN git init -q && git fetch --depth 1 https://github.com/cloudillo/cloudillo.git ${FRONTEND_REF} && git checkout -q FETCH_HEAD
+# Lockfile-bound only; @symbion/opalui comes from npm, pinned by the lockfile.
+RUN pnpm install --frozen-lockfile
 # Ensure fonts are downloaded with TTF files (postinstall may run before wawoff2 is ready)
 RUN node libs/fonts/scripts/download-fonts.js --force
 ENV COMPRESS=true
@@ -63,7 +69,8 @@ RUN mkdir -p /dist/apps \
 # FFMPEG STATIC BUILD STAGE #
 #############################
 
-FROM debian:trixie-slim AS ffmpeg-builder
+# debian:trixie-slim
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS ffmpeg-builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -79,9 +86,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
+# Pinned sources; versions and hashes are mirrored in sbom/native-components.cdx.json
+ARG X264_COMMIT=0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee
+ARG X264_SHA256=d0967a1348c85dfde363bb52610403be898171493100561efa0dd05d5fd1ae50
+ARG OPUS_VERSION=1.4
+ARG OPUS_SHA256=c9b32b4253be5ae63d1ff16eea06b94b5f0f2951b7a02aceef58e3a3ce49c51f
+ARG FFMPEG_VERSION=7.0.2
+ARG FFMPEG_SHA256=8646515b638a3ad303e23af6a3587734447cb8fc0a0c064ecdb8e95c4fd8b389
+
 # Build x264 (static)
-RUN curl -fsSL https://code.videolan.org/videolan/x264/-/archive/master/x264-master.tar.gz | tar xz \
-    && cd x264-master \
+RUN curl -fsSLo x264.tar.gz https://code.videolan.org/videolan/x264/-/archive/${X264_COMMIT}/x264-${X264_COMMIT}.tar.gz \
+    && echo "${X264_SHA256}  x264.tar.gz" | sha256sum -c - \
+    && tar xzf x264.tar.gz \
+    && cd x264-${X264_COMMIT} \
     && ./configure \
         --prefix=/usr/local \
         --enable-static \
@@ -92,8 +109,10 @@ RUN curl -fsSL https://code.videolan.org/videolan/x264/-/archive/master/x264-mas
     && make install
 
 # Build opus (static)
-RUN curl -fsSL https://downloads.xiph.org/releases/opus/opus-1.4.tar.gz | tar xz \
-    && cd opus-1.4 \
+RUN curl -fsSLo opus.tar.gz https://downloads.xiph.org/releases/opus/opus-${OPUS_VERSION}.tar.gz \
+    && echo "${OPUS_SHA256}  opus.tar.gz" | sha256sum -c - \
+    && tar xzf opus.tar.gz \
+    && cd opus-${OPUS_VERSION} \
     && ./configure \
         --prefix=/usr/local \
         --enable-static \
@@ -104,8 +123,10 @@ RUN curl -fsSL https://downloads.xiph.org/releases/opus/opus-1.4.tar.gz | tar xz
     && make install
 
 # Build ffmpeg (static, minimal codecs)
-RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-7.0.2.tar.xz | tar xJ \
-    && cd ffmpeg-7.0.2 \
+RUN curl -fsSLo ffmpeg.tar.xz https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz \
+    && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - \
+    && tar xJf ffmpeg.tar.xz \
+    && cd ffmpeg-${FFMPEG_VERSION} \
     && PKG_CONFIG_PATH="/usr/local/lib/pkgconfig" ./configure \
         --prefix=/usr/local \
         --enable-static \
@@ -144,9 +165,12 @@ RUN ls -lh /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
 # POPPLER EXTRACT STAGE #
 #########################
 
-FROM debian:trixie-slim AS poppler-extractor
+# debian:trixie-slim
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS poppler-extractor
 # poppler-data carries the predefined CMaps. Without them pdftotext extracts
 # nothing from CJK-encoded PDFs that ship no embedded ToUnicode map.
+# Package versions are recorded in sbom/native-components.cdx.json; the base digest
+# pins the Debian point release, apt still resolves current trixie(-security) versions.
 RUN apt-get update && apt-get install -y poppler-utils poppler-data
 
 # Create staging directory
