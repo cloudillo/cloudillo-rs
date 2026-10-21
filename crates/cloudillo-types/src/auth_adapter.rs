@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Adapter that manages and stores authentication, authorization and other sensitive data.
 
@@ -111,7 +111,23 @@ pub struct AuthProfile {
 	pub roles: Option<Box<[Box<str>]>>,
 	/// Tenant status — typically `'A'` (Active) or `'S'` (Suspended).
 	pub status: Option<Box<str>>,
+	#[serde(skip)]
+	pub suspended_at: Option<Timestamp>,
+	#[serde(skip)]
+	pub expires_at: Option<Timestamp>,
 	pub keys: Vec<AuthKey>,
+}
+
+/// False for tenants that may not authenticate: soft-deleted (status='X' = purging in progress),
+/// suspended by an admin (`suspended_at` set) or past their `expires_at`.
+pub fn tenant_active(
+	status: Option<&str>,
+	suspended_at: Option<i64>,
+	expires_at: Option<i64>,
+) -> bool {
+	!(status == Some("X")
+		|| suspended_at.is_some()
+		|| expires_at.is_some_and(|exp| exp <= Timestamp::now().0))
 }
 
 /// Context struct for an authenticated user
@@ -190,6 +206,12 @@ pub struct TenantListItem {
 	pub email: Option<Box<str>>,
 	pub roles: Option<Box<[Box<str>]>>,
 	pub status: Option<Box<str>>,
+	/// Set while an admin has suspended the tenant (login refused)
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	pub suspended_at: Option<Timestamp>,
+	/// Account expiry; login refused once reached
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	pub expires_at: Option<Timestamp>,
 	#[serde(serialize_with = "serialize_timestamp_iso")]
 	pub created_at: Timestamp,
 }
@@ -201,6 +223,97 @@ pub struct ListTenantsOptions<'a> {
 	pub q: Option<&'a str>,
 	pub limit: Option<u32>,
 	pub offset: Option<u32>,
+}
+
+/// Audit trail category. `Auth` and `Admin` are always recorded; `Sharing` and `Access`
+/// only when enabled in `audit.categories` ∪ `audit.tenant_categories`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditCategory {
+	Auth,
+	Admin,
+	Sharing,
+	Access,
+}
+
+impl AuditCategory {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Auth => "auth",
+			Self::Admin => "admin",
+			Self::Sharing => "sharing",
+			Self::Access => "access",
+		}
+	}
+
+	pub fn parse(s: &str) -> Option<Self> {
+		match s {
+			"auth" => Some(Self::Auth),
+			"admin" => Some(Self::Admin),
+			"sharing" => Some(Self::Sharing),
+			"access" => Some(Self::Access),
+			_ => None,
+		}
+	}
+}
+
+/// One audit trail entry. `tn_id = None` is a server-wide event (SADM-only).
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEvent {
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub ts: Timestamp,
+	pub tn_id: Option<TnId>,
+	pub actor: Option<Box<str>>,
+	pub event: Box<str>,
+	pub category: AuditCategory,
+	pub ip: Option<Box<str>>,
+	/// `"success"` or `"fail"`.
+	pub outcome: Box<str>,
+	pub details: Option<serde_json::Value>,
+}
+
+impl AuditEvent {
+	/// Event stamped now, with every optional field empty. Fill the rest with struct update
+	/// syntax: `AuditEvent { tn_id: Some(tn_id), ..AuditEvent::new(cat, "x.y", "success") }`.
+	/// `outcome` is `"success"` or `"fail"`.
+	pub fn new(category: AuditCategory, event: &str, outcome: &str) -> Self {
+		Self {
+			ts: Timestamp::now(),
+			tn_id: None,
+			actor: None,
+			event: event.into(),
+			category,
+			ip: None,
+			outcome: outcome.into(),
+			details: None,
+		}
+	}
+}
+
+/// Stored audit entry: the event plus its row id (the paging cursor).
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditEventRow {
+	pub id: i64,
+	#[serde(flatten)]
+	pub event: AuditEvent,
+}
+
+/// Filters for listing audit events. Every `None` is "no filter"; `tn_id: None` includes
+/// server-wide rows. Results are newest first; `cursor` returns rows with `id < cursor`.
+/// `from`/`to` are inclusive. `event_prefix` matches by plain string prefix.
+#[derive(Debug, Default, Clone)]
+pub struct AuditQuery {
+	pub tn_id: Option<TnId>,
+	pub from: Option<Timestamp>,
+	pub to: Option<Timestamp>,
+	pub category: Option<AuditCategory>,
+	pub event_prefix: Option<Box<str>>,
+	pub actor: Option<Box<str>>,
+	pub outcome: Option<Box<str>>,
+	pub limit: Option<u32>,
+	pub cursor: Option<i64>,
 }
 
 /// Certificate associated with a tenant
@@ -420,6 +533,14 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	/// blocked and a retry of the purge endpoint resumes destructive cleanup).
 	async fn update_tenant_status(&self, tn_id: TnId, status: char) -> ClResult<()>;
 
+	/// Admin suspension, independent of `status`. `true` stamps `suspended_at`; `false`
+	/// (resume) clears both `suspended_at` and `expires_at`. Login, login-token refresh and
+	/// API-key exchange are refused while suspended; issued access tokens run out (<= 1 h).
+	async fn set_tenant_suspended(&self, tn_id: TnId, suspended: bool) -> ClResult<()>;
+
+	/// Set (`Some`) or clear (`None`) the account expiry; login is refused once it is reached.
+	async fn set_tenant_expiry(&self, tn_id: TnId, expires_at: Option<Timestamp>) -> ClResult<()>;
+
 	// Key management
 	async fn list_profile_keys(&self, tn_id: TnId) -> ClResult<Vec<AuthKey>>;
 	async fn create_profile_key(
@@ -501,6 +622,27 @@ pub trait AuthAdapter: Debug + Send + Sync {
 		&self,
 		renewal_days: u32,
 	) -> ClResult<Vec<ProxySiteData>>;
+
+	// TOTP MFA (`tenants.totp_secret` base32, `tenants.totp_last_step` RFC 6238 counter)
+	/// `None` = not enrolled; `Some((secret, last_accepted_step))`. `NotFound` for no tenant.
+	async fn get_totp(&self, tn_id: TnId) -> ClResult<Option<(Box<str>, Option<i64>)>>;
+	/// Store the secret and its first accepted step only if the account is not enrolled;
+	/// `false` = already enrolled.
+	async fn enroll_totp(&self, tn_id: TnId, secret: &str, step: i64) -> ClResult<bool>;
+	/// Remove the secret and the last accepted step. `NotFound` for no tenant.
+	async fn clear_totp(&self, tn_id: TnId) -> ClResult<()>;
+	/// Store `step` only if newer than the stored one; `false` = replayed/stale step.
+	async fn set_totp_last_step(&self, tn_id: TnId, step: i64) -> ClResult<bool>;
+
+	// Audit trail (append-only; write through `cloudillo_core::audit::record`)
+	async fn append_audit_event(&self, ev: &AuditEvent) -> ClResult<()>;
+	async fn list_audit_events(&self, q: &AuditQuery) -> ClResult<Vec<AuditEventRow>>;
+	/// Delete events with `ts < before`; returns the number of rows deleted.
+	async fn purge_audit_events(&self, before: Timestamp) -> ClResult<u64>;
+
+	/// Write a consistent online copy of this store into the existing directory `dest`.
+	/// Writes `auth.db` (SQLite `VACUUM INTO`).
+	async fn snapshot(&self, dest: &std::path::Path) -> ClResult<crate::snapshot::SnapshotPart>;
 }
 
 #[cfg(test)]

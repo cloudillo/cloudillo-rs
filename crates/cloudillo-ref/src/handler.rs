@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Reference (Ref) REST endpoints for managing shareable tokens and authentication workflows
 //!
@@ -23,18 +23,20 @@
 
 use axum::{
 	Json,
-	extract::{Path, Query, State},
+	extract::{ConnectInfo, Path, Query, State},
 	http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::prelude::*;
 use cloudillo_core::abac::require_tenant_self;
+use cloudillo_core::audit;
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
 use cloudillo_core::share_access::{
 	ShareStanding, ensure_grant_within, ensure_standing, require_share_manager, share_standing,
 };
-use cloudillo_types::auth_adapter::AuthCtx;
+use cloudillo_types::auth_adapter::{AuditCategory, AuditEvent, AuthCtx};
 // The ref-type constants live in cloudillo-types so the gate tables below and the redemption
 // allowlists in cloudillo-auth / -profile / -idp share one definition.
 use cloudillo_types::meta_adapter::{
@@ -362,6 +364,7 @@ pub async fn list_refs(
 #[axum::debug_handler]
 pub async fn create_ref(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
@@ -421,6 +424,7 @@ pub async fn create_ref(
 	// existing row, and `share.file` is the only type a client may mint at all.
 	// Share links are keyed by the placement's `entry_id`, whatever id the caller named.
 	let mut stored_resource_id = create_req.resource_id.clone();
+	let share_link = matches!(ref_create_gate(&create_req.r#type), RefGate::FileShare);
 	match ref_create_gate(&create_req.r#type) {
 		RefGate::FileShare => {
 			let resource_id = create_req.resource_id.as_deref().ok_or_else(|| {
@@ -473,6 +477,22 @@ pub async fn create_ref(
 		warn!("Failed to create ref: {}", e);
 		e
 	})?;
+
+	// Share links only. The ref id is the link's bearer secret, so it stays out of the audit row.
+	if share_link {
+		let details = Some(serde_json::json!({
+			"resourceId": opts.resource_id,
+			"accessLevel": opts.access_level,
+			"expiresAt": opts.expires_at,
+			"count": opts.count,
+		}));
+		let ev = AuditEvent {
+			tn_id: Some(tn_id),
+			details,
+			..AuditEvent::new(AuditCategory::Sharing, "sharing.ref.create", "success")
+		};
+		audit::record_by(&app, ev, Some(&auth.id_tag), &addr).await;
+	}
 
 	let response_data = RefResponse::from(ref_data);
 	let mut response = ApiResponse::new(response_data);

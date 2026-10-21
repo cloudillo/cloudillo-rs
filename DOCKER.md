@@ -57,7 +57,8 @@ Mount a local directory to `/cloudillo/data` inside the container and expose por
 ```yaml
 services:
   cloudillo:
-    image: cloudillo/cloudillo:latest
+    # Pin the verified digest from cloudillo-X.Y.Z.image-digest.txt (see below), never :latest.
+    image: cloudillo/cloudillo@sha256:<digest>
     container_name: cloudillo
     volumes:
       - /var/vol/cloudillo:/cloudillo/data
@@ -71,6 +72,35 @@ services:
       BASE_PASSWORD: "YourSecretPassword"
       ACME_EMAIL: "user@example.com"
 ```
+
+`:latest` (and the moving `:X.Y`) are for trying Cloudillo out. In production, reference the
+image by the digest of a verified release, as in the compose example above.
+
+### Verifying a release
+
+Every release `vX.Y.Z` of [cloudillo-rs](https://github.com/cloudillo/cloudillo-rs/releases) is
+signed with the project's `cosign` key. Before installing or upgrading, download the release
+assets and the public key
+`https://raw.githubusercontent.com/cloudillo/cloudillo-rs/vX.Y.Z/cosign.pub`, and run these on an
+administration host with `cosign`, `jq` and `sha256sum` (replace `X.Y.Z`):
+
+```bash
+# 1. The checksum file, then every asset
+cosign verify-blob --key cosign.pub --bundle SHA256SUMS.sigstore.json SHA256SUMS
+sha256sum -c SHA256SUMS
+
+# 2. The image signature
+DIGEST=$(cat cloudillo-X.Y.Z.image-digest.txt)
+cosign verify --key cosign.pub "cloudillo/cloudillo@${DIGEST}"
+
+# 3. The SBOM attestation, compared with the downloaded SBOM
+cosign verify-attestation --key cosign.pub --type cyclonedx "cloudillo/cloudillo@${DIGEST}" \
+  | jq -r '.payload' | head -n1 | base64 -d | jq '.predicate' > attested.cdx.json
+diff <(jq -S . attested.cdx.json) <(jq -S . cloudillo-X.Y.Z.cdx.json)
+```
+
+Then put `cloudillo/cloudillo@${DIGEST}` in `compose.yaml`. If any step fails, do not install;
+report it as described in [SECURITY.md](SECURITY.md).
 
 ## Proxy Mode
 
@@ -154,6 +184,7 @@ server {
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MODE` | Server mode: `standalone`, `proxy`, or `stream-proxy` | `standalone` |
+| `PROXY_PROTOCOL` | Comma-separated IPs/CIDRs of the trusted proxies, e.g. `127.0.0.1,172.16.0.0/12`: only they may connect, and each connection must carry a PROXY protocol v1/v2 header (`stream-proxy` only; nginx `proxy_protocol on;`, HAProxy `send-proxy-v2`). Without it, `stream-proxy` sees the proxy's IP — forwarding headers are never trusted in that mode | - |
 | `LISTEN` | HTTPS bind address (plain HTTP in proxy mode) | `0.0.0.0:443` in the image (`0.0.0.0:1443` outside it) |
 | `LISTEN_HTTP` | HTTP bind address for ACME challenges; `none` disables it | `0.0.0.0:80` in the image (`0.0.0.0:1080` outside it) |
 | `LOCAL_ADDRESS` | Comma-separated IP addresses this node serves | - |
@@ -163,6 +194,7 @@ server {
 | `ACME_EMAIL` | Email for Let's Encrypt registration | - |
 | `DATA_DIR` | Blob storage directory | `./data` (`/cloudillo/data` in the image) |
 | `DB_DIR` | Database directory (SQLite + redb) | `./data` (`/cloudillo/data` in the image) |
+| `BACKUP_DIR` | Backup snapshot directory (see [Backup and Restore](#backup-and-restore)) | `$DATA_DIR/backup` (`/cloudillo/data/backup` in the image) |
 | `DIST_DIR` | Frontend distribution directory | `./dist` (`/cloudillo/dist` in the image) |
 | `RUST_LOG` | Logging level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `DISABLE_CACHE` | Disable caching (set to any value to enable) | - |
@@ -201,6 +233,70 @@ Example:
 -v /var/vol/cloudillo:/cloudillo/data
 ```
 
+## Backup and Restore
+
+The server takes **online** snapshots of every store (SQLite, redb, blobs) while it runs; no
+downtime. Each store's snapshot is consistent on its own, but the stores are snapshotted one
+after another, not at a single point in time: a tenant created or purged during the run may be
+half-present in a restore. Each snapshot is a directory `BACKUP_DIR/<yyyymmddThhmmssZ>/` with
+`auth/`, `meta/`, `crdt/`, `rtdb/`, `blob/` and a `manifest.json` listing every file with its size and sha256.
+A run in progress writes to `<name>.partial/`, so a directory without that suffix is complete.
+
+`BACKUP_DIR` defaults to `$DATA_DIR/backup`, inside the data volume; the server sets it to mode
+`0700`. To keep snapshots on another disk, mount a separate volume owned by `10001:10001` and
+point `BACKUP_DIR` at it:
+
+```bash
+-v /var/vol/cloudillo-backup:/cloudillo/backup -e BACKUP_DIR=/cloudillo/backup
+```
+
+Blob snapshots hard-link the previous snapshot's blobs; keep each `BACKUP_DIR` on one filesystem.
+
+Blobs are content-addressed and never change, so each snapshot hard-links the blobs it shares
+with the previous one; daily snapshots only cost the new files.
+
+**Schedule** (admin settings, server-wide):
+
+| Setting | Meaning | Default |
+|---------|---------|---------|
+| `backup.time` | Daily run, UTC `HH:MM`; empty disables it. Read at startup — restart after changing it | empty |
+| `backup.keep` | Snapshots to keep; older ones are deleted after each run | `7` |
+
+**On demand:** `POST /api/admin/backup` starts a run (`202`, or `409` while one runs);
+`GET /api/admin/backup` returns `{running, last: {at, ok, bytes, error?}, snapshots: [{name,
+createdAt, bytes}]}`. Every run is recorded in the audit log as `admin.backup`.
+
+**Off-site copy and encryption are your job.** Copy `BACKUP_DIR` elsewhere after the nightly
+run, encrypted, e.g. with `restic backup /var/vol/cloudillo/backup` or `rsync -aH` to another
+host (`-H` keeps the blob hard links). Skip `*.partial` directories.
+
+### Restore
+
+Restore is **offline**: stop the server first. Run the image's binary with the `restore`
+subcommand against the same volumes:
+
+```bash
+docker stop cloudillo
+docker run --rm \
+  -v /var/vol/cloudillo:/cloudillo/data \
+  cloudillo/cloudillo:latest /usr/bin/cloudillo restore /cloudillo/data/backup/20261020T040000Z
+docker start cloudillo
+```
+
+Usage: `cloudillo restore <snapshot-dir> [--force]`. It verifies every file against the manifest
+(and changes nothing if one does not match), moves the current `DB_DIR/{auth,meta,crdt,rtdb}` and
+`DATA_DIR/blob` aside to `*.pre-restore-<unix-time>`, and copies the snapshot in. Delete the
+`*.pre-restore-*` directories once the restored server works. It refuses while a server holds
+`DB_DIR/cloudillo.lock`, even with `--force`, which only allows a snapshot from a newer version.
+Pass the same `DB_DIR`/`DATA_DIR` as the server if you changed them.
+
+**Restore drill:** once a quarter, restore the latest off-site copy into a scratch machine or
+volume and start a server on it. A backup that was never restored is not a backup.
+
+**Suspended tenants:** suspending (or expiring) a tenant refuses new logins, API-key exchanges
+and access-token refreshes, but access tokens already issued stay valid for up to one hour.
+A restore does not change that either way.
+
 ## Container Permissions
 
 The Cloudillo container runs as a non-root user for security:
@@ -211,11 +307,11 @@ The Cloudillo container runs as a non-root user for security:
 | UID | `10001` |
 | GID | `10001` |
 
-**Important:** The data directory must be writable by this user. Set the correct ownership before starting the container:
+**Important:** The data directory (and a separate backup directory, if you use one) must be writable by this user. Set the correct ownership before starting the container:
 
 ```bash
-sudo mkdir -p /var/vol/cloudillo
-sudo chown -R 10001:10001 /var/vol/cloudillo
+sudo mkdir -p /var/vol/cloudillo /var/vol/cloudillo-backup
+sudo chown -R 10001:10001 /var/vol/cloudillo /var/vol/cloudillo-backup
 ```
 
 If you need a different UID/GID (e.g., to match an existing user), rebuild the image with custom build arguments:

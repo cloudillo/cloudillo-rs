@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Share entry management handlers
 //!
@@ -16,21 +16,24 @@
 
 use axum::{
 	Json,
-	extract::{Path, Query, State},
+	extract::{ConnectInfo, Path, Query, State},
 	http::StatusCode,
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::net::SocketAddr;
 
 use crate::prelude::*;
 use cloudillo_core::CreateActionFn;
 use cloudillo_core::abac;
+use cloudillo_core::audit;
 use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
 use cloudillo_core::file_access::{self, FileAccessCtx};
 use cloudillo_core::share_access::{
 	ensure_grant_within, require_share_manager, require_share_reader, require_unscoped_file_access,
 };
 use cloudillo_types::action_types::CreateAction;
+use cloudillo_types::auth_adapter::AuditCategory;
 use cloudillo_types::meta_adapter::{self, CreateShareEntry, ShareEntry, UpdateShareEntryOptions};
 use cloudillo_types::types::{AccessLevel, ApiResponse};
 
@@ -62,6 +65,26 @@ fn validate_admin_subject(permission: char, subject_type: char) -> ClResult<()> 
 	Ok(())
 }
 
+/// The audited `subjectId`: a link's ('L') subject id is its bearer secret, so it stays out.
+fn audit_subject(t: char, id: &str) -> Option<&str> {
+	(t != 'L').then_some(id)
+}
+
+/// Record one `sharing.*` / `access.*` audit event; `audit::record` drops it when the category
+/// is off for this tenant. `actor` is `None` for an anonymous caller.
+pub(crate) async fn record_audit(
+	app: &App,
+	category: AuditCategory,
+	event: &str,
+	tn_id: TnId,
+	actor: Option<&str>,
+	addr: &SocketAddr,
+	details: serde_json::Value,
+) {
+	let (tn_id, details) = (Some(tn_id), Some(details));
+	audit::record_event(app, category, event, "success", tn_id, actor, addr, details).await;
+}
+
 /// The FSHR subject (`FSHR:{subject}:{audience}`): the content id, which the recipient mirrors
 /// and asks the sender back for; a folder has none and goes by its entry id.
 fn fshr_subject(file_view: &meta_adapter::FileView) -> Box<str> {
@@ -88,8 +111,10 @@ pub async fn list_shares(
 }
 
 /// POST /api/files/{file_id}/shares — Create a share entry
+#[expect(clippy::too_many_arguments, reason = "axum extractors")]
 pub async fn create_share(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
@@ -155,6 +180,23 @@ pub async fn create_share(
 		.meta_adapter
 		.create_share_entry(tn_id, 'F', entry_id, &auth.id_tag, &input)
 		.await?;
+	record_audit(
+		&app,
+		AuditCategory::Sharing,
+		"sharing.share.create",
+		tn_id,
+		Some(&auth.id_tag),
+		&addr,
+		json!({
+			"shareId": entry.id,
+			"fileId": entry_id,
+			"subjectType": entry.subject_type,
+			"subjectId": audit_subject(entry.subject_type, &entry.subject_id),
+			"permission": entry.permission,
+			"expiresAt": entry.expires_at,
+		}),
+	)
+	.await;
 
 	// For user shares, also create FSHR action for federation (best-effort)
 	if input.subject_type == 'U' {
@@ -201,6 +243,7 @@ pub async fn create_share(
 /// DELETE /api/files/{file_id}/shares/{share_id} — Delete a share entry
 pub async fn delete_share(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
@@ -224,6 +267,24 @@ pub async fn delete_share(
 
 	// Delete the share entry
 	app.meta_adapter.delete_share_entry(tn_id, share_id).await?;
+	if let Some(entry) = &maybe_entry {
+		record_audit(
+			&app,
+			AuditCategory::Sharing,
+			"sharing.share.delete",
+			tn_id,
+			Some(&auth.id_tag),
+			&addr,
+			json!({
+				"shareId": entry.id,
+				"fileId": entry.resource_id,
+				"subjectType": entry.subject_type,
+				"subjectId": audit_subject(entry.subject_type, &entry.subject_id),
+				"permission": entry.permission,
+			}),
+		)
+		.await;
+	}
 
 	// For user shares, also create FSHR DEL action (best-effort). The FSHR is keyed by content, so
 	// while a sibling entry still shares it to the same user, a DEL would overwrite that grant's
@@ -280,8 +341,10 @@ pub struct UpdateShareRequest {
 /// PATCH /api/files/{file_id}/shares/{share_id} — Update a share entry's
 /// permission level and/or expiration. Does not emit any FSHR action; the
 /// share entry is the source of truth, the FSHR is a one-shot notification.
+#[expect(clippy::too_many_arguments, reason = "axum extractors")]
 pub async fn update_share(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
@@ -344,6 +407,23 @@ pub async fn update_share(
 		.meta_adapter
 		.update_share_entry(tn_id, share_id, 'F', &authority.access.file_view.entry_id, &opts)
 		.await?;
+	record_audit(
+		&app,
+		AuditCategory::Sharing,
+		"sharing.share.update",
+		tn_id,
+		Some(&auth.id_tag),
+		&addr,
+		json!({
+			"shareId": updated.id,
+			"fileId": updated.resource_id,
+			"subjectType": updated.subject_type,
+			"subjectId": audit_subject(updated.subject_type, &updated.subject_id),
+			"permission": updated.permission,
+			"expiresAt": updated.expires_at,
+		}),
+	)
+	.await;
 
 	// No FSHR emission on PATCH: the action is a one-shot notification, not the
 	// source of truth. Re-emitting would re-introduce duplicate-FSHR rows.

@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 use std::{
 	fmt::Debug,
@@ -10,12 +10,15 @@ use std::{
 use async_trait::async_trait;
 use futures_core::Stream;
 use tokio::{
-	fs::{File, create_dir_all, metadata, read_dir, remove_dir_all, remove_file, rename},
+	fs::{
+		File, copy, create_dir_all, hard_link, metadata, read_dir, remove_dir_all, remove_file,
+		rename,
+	},
 	io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
 };
 use tokio_util::{bytes::Bytes, io::ReaderStream};
 
-use cloudillo_types::{blob_adapter, hasher, prelude::*};
+use cloudillo_types::{blob_adapter, hasher, prelude::*, snapshot::SnapshotPart};
 
 /// Validates that a file_id hash portion contains only safe characters (base64url alphabet)
 fn validate_hash(hash: &str) -> ClResult<()> {
@@ -89,9 +92,20 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		info!("create_blob_buf: {:?}", obj_file_path(&self.base_dir, tn_id, file_id)?);
 		create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
 
-		let mut file = File::create(obj_file_path(&self.base_dir, tn_id, file_id)?).await?;
-		file.write_all(data).await?;
-		file.sync_all().await?;
+		// tmp+rename: a fresh inode, so hard-linked snapshots keep the old bytes
+		let tmp_path = obj_tmp_file_path(&self.base_dir, tn_id, file_id)?;
+		let res = async {
+			let mut file = File::create(&tmp_path).await?;
+			file.write_all(data).await?;
+			file.sync_all().await?;
+			rename(&tmp_path, obj_file_path(&self.base_dir, tn_id, file_id)?).await?;
+			Ok::<(), Error>(())
+		}
+		.await;
+		if let Err(e) = res {
+			let _ = remove_file(&tmp_path).await;
+			return Err(e);
+		}
 
 		Ok(())
 	}
@@ -207,7 +221,21 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 		_opts: &blob_adapter::CreateBlobOptions,
 	) -> ClResult<()> {
 		create_dir_all(obj_dir(&self.base_dir, tn_id, file_id)?).await?;
-		tokio::fs::copy(source, obj_file_path(&self.base_dir, tn_id, file_id)?).await?;
+
+		// tmp+rename, as in `create_blob_buf`: copying straight onto the target would
+		// rewrite an inode that backup snapshots may hard-link.
+		let tmp_path = obj_tmp_file_path(&self.base_dir, tn_id, file_id)?;
+		let res = async {
+			copy(source, &tmp_path).await?;
+			File::open(&tmp_path).await?.sync_all().await?;
+			rename(&tmp_path, obj_file_path(&self.base_dir, tn_id, file_id)?).await?;
+			Ok::<(), Error>(())
+		}
+		.await;
+		if let Err(e) = res {
+			let _ = remove_file(&tmp_path).await;
+			return Err(e);
+		}
 		Ok(())
 	}
 
@@ -323,6 +351,67 @@ impl blob_adapter::BlobAdapter for BlobAdapterFs {
 			}
 		};
 		Ok(Box::pin(stream))
+	}
+
+	async fn snapshot(&self, dest: &Path, prev: Option<&Path>) -> ClResult<SnapshotPart> {
+		let mut part = SnapshotPart::default();
+		// Relative directories still to walk; the empty path is the store root.
+		let mut dirs = vec![PathBuf::new()];
+		while let Some(dir) = dirs.pop() {
+			// A directory may vanish under us (tenant purge): skip it, not the run.
+			let mut rd = match read_dir(self.base_dir.join(&dir)).await {
+				Ok(rd) => rd,
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+				Err(e) => return Err(Error::from(e)),
+			};
+			while let Some(entry) = rd.next_entry().await? {
+				let name = entry.file_name();
+				// In-progress uploads, see `obj_tmp_file_path`.
+				if name.to_str().is_some_and(|n| n.starts_with("tmp-")) {
+					continue;
+				}
+				let rel = dir.join(&name);
+				let ft = entry.file_type().await?;
+				if ft.is_dir() {
+					create_dir_all(dest.join(&rel)).await?;
+					dirs.push(rel);
+					continue;
+				}
+				if !ft.is_file() {
+					continue;
+				}
+				let to = dest.join(&rel);
+				// A hard link to the live file: an unchanged blob is the same inode as in
+				// the previous snapshot, so it dedups, and a rewritten one (tmp+rename) is a
+				// new inode, so the snapshot gets the new bytes.
+				let mut linked = hard_link(entry.path(), &to).await.is_ok();
+				// Cross-device: reuse the previous snapshot's copy when the size matches and
+				// the live file is not newer than it. Writes are tmp+rename, never in place,
+				// so a rewrite after the previous snapshot has a later mtime and gets copied.
+				// An unreadable mtime means no reuse.
+				if !linked && let Some(prev) = prev {
+					let prev_file = prev.join(&rel);
+					if let (Ok(a), Ok(b)) = (metadata(&prev_file).await, entry.metadata().await)
+						&& a.len() == b.len()
+						&& let (Ok(pm), Ok(lm)) = (a.modified(), b.modified())
+						&& lm <= pm
+					{
+						linked = hard_link(prev_file, &to).await.is_ok();
+					}
+				}
+				if !linked {
+					match copy(entry.path(), &to).await {
+						Ok(_) => {}
+						// Deleted by GC since the directory was listed.
+						Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+						Err(e) => return Err(Error::from(e)),
+					}
+				}
+				part.bytes += metadata(&to).await?.len();
+				part.files.push(rel);
+			}
+		}
+		Ok(part)
 	}
 }
 

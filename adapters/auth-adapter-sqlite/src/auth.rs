@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Authentication and token management
 
@@ -107,12 +107,26 @@ pub(crate) fn build_tenant_owner_roles(db_roles: Option<&str>) -> Box<str> {
 	expand_roles_preserving_extras(&roles).into()
 }
 
-/// Reject soft-deleted tenants (status='X' = purging in progress).
-fn assert_tenant_active(status: Option<&str>) -> ClResult<()> {
-	if status == Some("X") {
+/// Reject tenants that may not log in: soft-deleted (status='X' = purging in progress),
+/// suspended by an admin (`suspended_at` set) or past their `expires_at`.
+/// Already issued access tokens are not revoked (they run out within `ACCESS_TOKEN_EXPIRY`).
+pub(crate) fn assert_tenant_active(
+	status: Option<&str>,
+	suspended_at: Option<i64>,
+	expires_at: Option<i64>,
+) -> ClResult<()> {
+	if !cloudillo_types::auth_adapter::tenant_active(status, suspended_at, expires_at) {
 		return Err(Error::PermissionDenied);
 	}
 	Ok(())
+}
+
+/// Columns `assert_tenant_active` reads, for the login SELECTs below.
+fn assert_tenant_row_active(row: &sqlx::sqlite::SqliteRow) -> ClResult<()> {
+	let status: Option<&str> = row.try_get("status").db()?;
+	let suspended_at: Option<i64> = row.try_get("suspended_at").db()?;
+	let expires_at: Option<i64> = row.try_get("expires_at").db()?;
+	assert_tenant_active(status, suspended_at, expires_at)
 }
 
 /// Check tenant password
@@ -123,18 +137,19 @@ pub(crate) async fn check_tenant_password(
 	password: &str,
 	jwt_secret_str: &str,
 ) -> ClResult<AuthLogin> {
-	let res =
-		sqlx::query("SELECT tn_id, id_tag, password, roles, status FROM tenants WHERE id_tag = ?1")
-			.bind(normalize_id_tag(id_tag).as_ref())
-			.fetch_one(db)
-			.await;
+	let res = sqlx::query(
+		"SELECT tn_id, id_tag, password, roles, status, suspended_at, expires_at
+		FROM tenants WHERE id_tag = ?1",
+	)
+	.bind(normalize_id_tag(id_tag).as_ref())
+	.fetch_one(db)
+	.await;
 
 	match res {
 		Err(_) => Err(Error::PermissionDenied),
 		Ok(row) => {
 			let _tn_id: TnId = row.try_get("tn_id").map(TnId).db()?;
-			let status: Option<&str> = row.try_get("status").db()?;
-			assert_tenant_active(status)?;
+			assert_tenant_row_active(&row)?;
 			let password_hash: Box<str> = row.try_get("password").db()?;
 			let db_roles: Option<&str> = row.try_get("roles").db()?;
 
@@ -201,6 +216,73 @@ pub(crate) async fn update_idp_api_key(
 	Ok(())
 }
 
+/// Read the TOTP secret and last accepted step of a tenant (`None` = not enrolled)
+pub(crate) async fn get_totp(
+	db: &SqlitePool,
+	tn_id: TnId,
+) -> ClResult<Option<(Box<str>, Option<i64>)>> {
+	let row = sqlx::query("SELECT totp_secret, totp_last_step FROM tenants WHERE tn_id = ?1")
+		.bind(tn_id.0)
+		.fetch_one(db)
+		.await;
+	map_res(row, |row| {
+		let secret: Option<Box<str>> = row.try_get("totp_secret")?;
+		let last_step: Option<i64> = row.try_get("totp_last_step")?;
+		Ok(secret.map(|s| (s, last_step)))
+	})
+}
+
+/// Enroll the TOTP secret with its first accepted step, only if not enrolled yet.
+/// `false` = already enrolled (the stored secret is left alone).
+pub(crate) async fn enroll_totp(
+	db: &SqlitePool,
+	tn_id: TnId,
+	secret: &str,
+	step: i64,
+) -> ClResult<bool> {
+	let res = sqlx::query(
+		"UPDATE tenants SET totp_secret = ?2, totp_last_step = ?3
+		WHERE tn_id = ?1 AND totp_secret IS NULL",
+	)
+	.bind(tn_id.0)
+	.bind(secret)
+	.bind(step)
+	.execute(db)
+	.await
+	.db()?;
+	Ok(res.rows_affected() > 0)
+}
+
+/// Clear (disable) the TOTP secret and the last accepted step
+pub(crate) async fn clear_totp(db: &SqlitePool, tn_id: TnId) -> ClResult<()> {
+	let res = sqlx::query(
+		"UPDATE tenants SET totp_secret = NULL, totp_last_step = NULL WHERE tn_id = ?1",
+	)
+	.bind(tn_id.0)
+	.execute(db)
+	.await
+	.db()?;
+	if res.rows_affected() == 0 {
+		return Err(Error::NotFound);
+	}
+	Ok(())
+}
+
+/// Record an accepted TOTP step. Compare-and-set: returns `false` when `step` is not newer
+/// than the stored one, so two concurrent logins cannot both spend the same code.
+pub(crate) async fn set_totp_last_step(db: &SqlitePool, tn_id: TnId, step: i64) -> ClResult<bool> {
+	let res = sqlx::query(
+		"UPDATE tenants SET totp_last_step = ?2
+		WHERE tn_id = ?1 AND (totp_last_step IS NULL OR totp_last_step < ?2)",
+	)
+	.bind(tn_id.0)
+	.bind(step)
+	.execute(db)
+	.await
+	.db()?;
+	Ok(res.rows_affected() > 0)
+}
+
 /// Create a login session and return auth token
 pub(crate) async fn create_tenant_login(
 	db: &SqlitePool,
@@ -224,10 +306,12 @@ pub(crate) async fn create_tenant_login(
 		return Err(Error::PermissionDenied);
 	}
 
-	let res = sqlx::query("SELECT tn_id, id_tag, roles, status FROM tenants WHERE id_tag = ?1")
-		.bind(normalize_id_tag(id_tag).as_ref())
-		.fetch_one(db)
-		.await;
+	let res = sqlx::query(
+		"SELECT tn_id, id_tag, roles, status, suspended_at, expires_at FROM tenants WHERE id_tag = ?1",
+	)
+	.bind(normalize_id_tag(id_tag).as_ref())
+	.fetch_one(db)
+	.await;
 
 	match res {
 		// A missing row means "no tenant of that name here", which the login routes render as
@@ -237,8 +321,7 @@ pub(crate) async fn create_tenant_login(
 		Err(e) => Err::<AuthLogin, _>(e).db(),
 		Ok(row) => {
 			let _tn_id = row.try_get("tn_id").map(TnId).db()?;
-			let status: Option<&str> = row.try_get("status").db()?;
-			assert_tenant_active(status)?;
+			assert_tenant_row_active(&row)?;
 			let db_roles: Option<&str> = row.try_get("roles").db()?;
 
 			let roles_str = build_tenant_owner_roles(db_roles);
@@ -557,5 +640,41 @@ mod tests {
 			.expect("token accepted");
 		let roles: Vec<&str> = ctx.roles.iter().map(AsRef::as_ref).collect();
 		assert_eq!(roles, vec!["public", "leader"]);
+	}
+
+	/// Suspended and expired tenants are refused at password login; resume restores it.
+	#[tokio::test]
+	async fn suspended_and_expired_tenants_cannot_log_in() {
+		use cloudillo_types::auth_adapter::{AuthAdapter, CreateTenantData};
+
+		let tmp = tempfile::TempDir::new().unwrap();
+		let adapter = crate::AuthAdapterSqlite::new(Arc::new(WorkerPool::new(1, 1, 1)), tmp.path())
+			.await
+			.unwrap();
+		let id_tag = "alice.example";
+		let data = CreateTenantData {
+			vfy_code: None,
+			email: Some("alice@example.com"),
+			password: Some("correct horse"),
+			roles: None,
+		};
+		let tn_id = adapter.create_tenant(id_tag, data).await.unwrap();
+		adapter.check_tenant_password(id_tag, "correct horse").await.unwrap();
+
+		adapter.set_tenant_suspended(tn_id, true).await.unwrap();
+		assert!(adapter.check_tenant_password(id_tag, "correct horse").await.is_err());
+		assert!(adapter.create_tenant_login(id_tag, id_tag).await.is_err());
+
+		adapter.set_tenant_suspended(tn_id, false).await.unwrap();
+		adapter.check_tenant_password(id_tag, "correct horse").await.unwrap();
+
+		adapter
+			.set_tenant_expiry(tn_id, Some(Timestamp(Timestamp::now().0 - 1)))
+			.await
+			.unwrap();
+		assert!(adapter.check_tenant_password(id_tag, "correct horse").await.is_err());
+
+		adapter.set_tenant_expiry(tn_id, Some(Timestamp::from_now(3600))).await.unwrap();
+		adapter.check_tenant_password(id_tag, "correct horse").await.unwrap();
 	}
 }

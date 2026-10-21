@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Webserver implementation
 
@@ -179,12 +179,20 @@ pub async fn create_https_server(
 	server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
 	let addr = SocketAddr::from_str(listen).map_err(|_| std::io::ErrorKind::Other)?;
-	let https_server = axum_server::bind_rustls(
-		addr,
-		axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config)),
-	);
+	let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
 
+	let mode = state.opts.mode;
+	let proxy_protocol =
+		!state.opts.proxy_protocol.is_empty() && matches!(mode, crate::ServerMode::StreamProxy);
+	if !state.opts.proxy_protocol.is_empty() && !proxy_protocol {
+		warn!("PROXY_PROTOCOL is only honoured with MODE=stream-proxy, ignoring it");
+	}
+	let proxy_acceptor =
+		crate::proxy_protocol::ProxyProtocolAcceptor::new(&state.opts.proxy_protocol);
 	let svc = tower::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+		// First, so every handler, the rate limiter, the proxy and the access log
+		// see the real client rather than the reverse proxy.
+		cloudillo_core::rate_limit::rewrite_client_ip(&mut req, &mode);
 		let api_router = api_router.clone();
 		let app_router = app_router.clone();
 		let proxy_cache = state
@@ -282,12 +290,19 @@ pub async fn create_https_server(
 		.instrument(span)
 	});
 
-	info!("Listening on HTTPS {}", &listen);
-	let handle = tokio::spawn(async move {
-		https_server
-			.serve(svc.into_make_service_with_connect_info::<SocketAddr>())
-			.await
-	});
+	info!(
+		"Listening on HTTPS {}{}",
+		&listen,
+		if proxy_protocol { " (PROXY protocol)" } else { "" }
+	);
+	let make_svc = svc.into_make_service_with_connect_info::<SocketAddr>();
+	let handle = if proxy_protocol {
+		// The PROXY header precedes the ClientHello, so its acceptor is the inner one.
+		let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(tls).acceptor(proxy_acceptor);
+		tokio::spawn(axum_server::bind(addr).acceptor(acceptor).serve(make_svc))
+	} else {
+		tokio::spawn(axum_server::bind_rustls(addr, tls).serve(make_svc))
+	};
 
 	Ok(handle)
 }

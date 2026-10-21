@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! WebAuthn (Passkey) authentication handlers
 
@@ -18,9 +18,9 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use webauthn_rs::prelude::*;
 
+use crate::audit::record_auth;
 use cloudillo_core::Auth;
 use cloudillo_core::extract::{IdTag, OptionalRequestId};
-use cloudillo_core::rate_limit::{PenaltyReason, RateLimitApi};
 use cloudillo_types::{auth_adapter, types::ApiResponse};
 
 use crate::prelude::*;
@@ -346,6 +346,7 @@ pub async fn get_reg_challenge(
 /// POST /api/auth/wa/reg - Register a new credential
 pub async fn post_reg(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
 	headers: axum::http::HeaderMap,
@@ -420,6 +421,16 @@ pub async fn post_reg(
 		description: Some(description.as_str().into()),
 	};
 	app.auth_adapter.create_webauthn_credential(auth.tn_id, &webauthn_data).await?;
+	record_auth(
+		&app,
+		"auth.passkey.add",
+		"success",
+		Some(auth.tn_id),
+		&auth.id_tag,
+		&addr,
+		Some(serde_json::json!({ "credentialId": cred_id })),
+	)
+	.await;
 
 	info!("WebAuthn credential registered: {}", cred_id);
 
@@ -432,6 +443,7 @@ pub async fn post_reg(
 /// DELETE /api/auth/wa/reg/{key_id} - Delete a credential
 pub async fn delete_reg(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	Path(key_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -439,6 +451,16 @@ pub async fn delete_reg(
 	info!("Deleting WebAuthn credential {} for {}", key_id, auth.id_tag);
 
 	app.auth_adapter.delete_webauthn_credential(auth.tn_id, &key_id).await?;
+	record_auth(
+		&app,
+		"auth.passkey.remove",
+		"success",
+		Some(auth.tn_id),
+		&auth.id_tag,
+		&addr,
+		Some(serde_json::json!({ "credentialId": key_id })),
+	)
+	.await;
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::OK, Json(response)))
@@ -536,11 +558,16 @@ pub async fn post_login(
 ) -> ClResult<(StatusCode, Json<ApiResponse<super::handler::Login>>)> {
 	info!("Processing WebAuthn login");
 
-	// Credential failures are penalized like a wrong password; server-side faults are not.
+	// Credential failures are penalized like a wrong password (and audited); server-side
+	// faults are not. The closure is sync, so the audit write is spawned.
 	let penalize = || {
-		if let Err(e) = app.rate_limiter.penalize(&addr.ip(), PenaltyReason::AuthFailure, 1) {
-			warn!("Failed to record auth penalty for {}: {}", addr.ip(), e);
-		}
+		crate::audit::penalize(&app, &addr);
+		let (app, actor) = (app.clone(), host_id_tag.clone());
+		tokio::spawn(async move {
+			let tn_id = app.auth_adapter.read_tn_id(&actor).await.ok();
+			let details = serde_json::json!({ "method": "passkey" });
+			crate::audit::record_auth_fail(&app, "auth.login", tn_id, &actor, &addr, details).await;
+		});
 	};
 
 	// Get JWT secret and decode challenge token
@@ -600,6 +627,16 @@ pub async fn post_login(
 
 	// Create login session
 	let auth_login = app.auth_adapter.create_tenant_login(&claims.id_tag, &host_id_tag).await?;
+	record_auth(
+		&app,
+		"auth.login",
+		"success",
+		Some(auth_login.tn_id),
+		&auth_login.id_tag,
+		&addr,
+		Some(serde_json::json!({ "method": "passkey" })),
+	)
+	.await;
 
 	// Return login response using existing pattern
 	let (status, json) = return_login(&app, auth_login).await?;

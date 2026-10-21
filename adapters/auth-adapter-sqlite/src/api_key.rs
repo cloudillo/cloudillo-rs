@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! API Key management for the SQLite auth adapter
 
@@ -15,7 +15,18 @@ use cloudillo_types::{
 use crate::crypto;
 
 /// Row type for API key validation candidates
-type ApiKeyCandidateRow = (i64, i32, String, Option<String>, Option<i64>, Option<String>);
+/// (key_id, tn_id, key_hash, scopes, expires_at, roles, status, suspended_at, tenant expires_at)
+type ApiKeyCandidateRow = (
+	i64,
+	i32,
+	String,
+	Option<String>,
+	Option<i64>,
+	Option<String>,
+	Option<String>,
+	Option<i64>,
+	Option<i64>,
+);
 
 /// Row type for API key info (key_id, key_prefix, name, scopes, expires_at, last_used_at, created_at)
 type ApiKeyInfoRow = (i64, String, Option<String>, Option<String>, Option<i64>, Option<i64>, i64);
@@ -77,7 +88,8 @@ pub async fn validate_api_key(
 
 	// Find API keys with matching prefix
 	let candidates: Vec<ApiKeyCandidateRow> = sqlx::query_as(
-		"SELECT ak.key_id, ak.tn_id, ak.key_hash, ak.scopes, ak.expires_at, t.roles
+		"SELECT ak.key_id, ak.tn_id, ak.key_hash, ak.scopes, ak.expires_at, t.roles,
+				t.status, t.suspended_at, t.expires_at
 			FROM api_keys ak
 			JOIN tenants t ON ak.tn_id = t.tn_id
 			WHERE ak.key_prefix = ?",
@@ -95,7 +107,24 @@ pub async fn validate_api_key(
 	}
 
 	// Try to verify against each candidate (usually just one due to unique prefix)
-	for (key_id, tn_id, key_hash, scopes, expires_at, roles) in candidates {
+	for (
+		key_id,
+		tn_id,
+		key_hash,
+		scopes,
+		expires_at,
+		roles,
+		tn_status,
+		tn_suspended_at,
+		tn_expires_at,
+	) in candidates
+	{
+		// Purging, suspended or expired tenants get no API-key access
+		if crate::auth::assert_tenant_active(tn_status.as_deref(), tn_suspended_at, tn_expires_at)
+			.is_err()
+		{
+			continue;
+		}
 		// Check expiration first (cheap check)
 		if let Some(exp) = expires_at {
 			let now = std::time::SystemTime::now()

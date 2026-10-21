@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 use std::{path::Path, sync::Arc};
 
@@ -59,8 +59,11 @@ use cloudillo_types::{
 		UpsertDocFormat, UpsertProfileFields, UpsertResult, UpsertSite,
 	},
 	prelude::*,
+	snapshot::SnapshotPart,
 	worker::WorkerPool,
 };
+
+use crate::utils::Db;
 
 #[derive(Debug)]
 pub struct MetaAdapterSqlite {
@@ -924,6 +927,20 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn reclaim_space(&self, min_free_pct: i64) -> ClResult<SpaceReport> {
 		maintenance::reclaim_space(&self.db, min_free_pct).await
+	}
+
+	// On the read-only pool: `VACUUM INTO` only reads the source, and the single writer
+	// connection stays free.
+	// Keep in sync with auth-adapter-sqlite snapshot()
+	async fn snapshot(&self, dest: &Path) -> ClResult<SnapshotPart> {
+		let file = dest.join("meta.db");
+		let target = file
+			.to_str()
+			.ok_or_else(|| Error::Internal("non-UTF-8 snapshot path".into()))?
+			.to_owned();
+		sqlx::query("VACUUM INTO ?").bind(target).execute(&self.dbr).await.db()?;
+		let bytes = fs::metadata(&file).await?.len();
+		Ok(SnapshotPart { files: vec!["meta.db".into()], bytes })
 	}
 
 	async fn search(&self, tn_id: TnId, opts: &SearchOptions) -> ClResult<Vec<SearchRow>> {

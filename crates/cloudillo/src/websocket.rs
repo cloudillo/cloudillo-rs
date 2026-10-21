@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! WebSocket upgrade handlers
 //!
@@ -10,21 +10,41 @@
 
 use axum::{
 	extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
-	extract::{Path, Query, State},
+	extract::{ConnectInfo, Path, Query, State},
 	response::Response,
 };
 use futures::SinkExt;
 use serde::Deserialize;
+use std::net::SocketAddr;
 
 use crate::crdt;
 use crate::rtdb;
 use cloudillo_core::OptionalAuth;
+use cloudillo_core::audit;
 use cloudillo_core::extract::IdTag;
 use cloudillo_core::file_access::{self, FileAccessError};
 use cloudillo_core::ws_bus;
+use cloudillo_types::auth_adapter::{AuditCategory, AuditEvent};
 use cloudillo_types::meta_adapter::{CreateFile, FileStatus};
 use cloudillo_types::types::AccessLevel;
 use cloudillo_types::utils::normalize_id_tag;
+
+/// Record `access.doc.open` once per accepted connection (gated by the `access` category).
+/// `actor` is the asserted identity: `None` for a guest or an anonymous share-link token.
+async fn audit_doc_open(
+	app: &crate::app::App,
+	tn_id: u32,
+	actor: Option<&str>,
+	addr: &SocketAddr,
+	details: serde_json::Value,
+) {
+	let ev = AuditEvent {
+		tn_id: Some(crate::types::TnId(tn_id)),
+		details: Some(details),
+		..AuditEvent::new(AuditCategory::Access, "access.doc.open", "success")
+	};
+	audit::record_by(app, ev, actor, addr).await;
+}
 
 /// Maximum size of a single inbound WebSocket frame.
 ///
@@ -464,8 +484,10 @@ pub async fn get_ws_bus(
 /// Requires authentication.
 /// Connects to real-time database changes for a specific file.
 /// Checks file access level and passes read_only flag to connection handler.
+#[expect(clippy::too_many_arguments, reason = "axum extractors")]
 pub async fn get_ws_rtdb(
 	ws: WebSocketUpgrade,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Path(file_id): Path<String>,
 	Query(query): Query<AccessQuery>,
 	State(app): State<crate::app::App>,
@@ -540,6 +562,19 @@ pub async fn get_ws_rtdb(
 		if is_guest { "*guest" } else { &user_id },
 		file_id
 	);
+	audit_doc_open(
+		&app,
+		tn_id,
+		identity_id_tag.as_deref(),
+		&addr,
+		serde_json::json!({
+			"fileId": file_id,
+			"contentId": content_id,
+			"access": access_level.as_str(),
+			"kind": "rtdb",
+		}),
+	)
+	.await;
 	ws.on_upgrade(move |socket| {
 		// `identity_id_tag`, deliberately *not* `is_guest` — that only governs meta-file
 		// auto-creation above, and a `file:{id}:W` share-link visitor keeps write access while
@@ -563,8 +598,10 @@ pub async fn get_ws_rtdb(
 /// Supports authenticated and guest (unauthenticated) access.
 /// Guest access is read-only and only allowed for public files.
 /// Checks file access level and passes read_only flag to connection handler.
+#[expect(clippy::too_many_arguments, reason = "axum extractors")]
 pub async fn get_ws_crdt(
 	ws: WebSocketUpgrade,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Path(doc_id): Path<String>,
 	Query(query): Query<AccessQuery>,
 	State(app): State<crate::app::App>,
@@ -629,6 +666,20 @@ pub async fn get_ws_crdt(
 		if is_guest { "*guest" } else { &user_id },
 		doc_id
 	);
+	audit_doc_open(
+		&app,
+		tn_id,
+		awareness_id_tag.as_deref(),
+		&addr,
+		serde_json::json!({
+			"fileId": doc_id,
+			"contentId": content_id,
+			"access": access_level.as_str(),
+			"readOnly": read_only,
+			"kind": "crdt",
+		}),
+	)
+	.await;
 	ws.on_upgrade(move |socket| {
 		// `awareness_id_tag`, deliberately *not* `is_guest`: a `file:{id}:W` share-link
 		// visitor keeps write access while losing only the asserted identity.

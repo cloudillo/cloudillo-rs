@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 mod error;
 mod index;
@@ -28,6 +28,7 @@ use cloudillo_types::rtdb_adapter::{
 	ChangeEvent, DbStats, LockInfo, LockMode, QueryOptions, RtdbAdapter, SubscriptionOptions,
 	SubscriptionScope, Transaction, project_doc, selection_changed,
 };
+use cloudillo_types::snapshot::SnapshotPart;
 use cloudillo_types::types::CompactReport;
 
 /// Lazily-initialized `redb::Database` handle. Wrapped in `OnceCell` so
@@ -1160,6 +1161,82 @@ impl RtdbAdapter for RtdbAdapterRedb {
 			.map_err(error::Error::from)??;
 			Ok(())
 		}
+	}
+
+	/// Copies each redb file under its own name. A file with an open handle is copied
+	/// table by table inside one read transaction, so writers keep going; a file
+	/// nothing has open is copied byte for byte under its maintenance barrier's write
+	/// guard, which keeps it closed for the length of the copy. Never opens a file it
+	/// would not otherwise open, so no fd is pinned for idle tenants.
+	// Keep in sync with crdt-adapter-redb snapshot(); the drift tests are
+	// `test_snapshot_round_trip_and_tables` here and `test_snapshot_round_trip` in crdt.
+	async fn snapshot(&self, dest: &Path) -> ClResult<SnapshotPart> {
+		let mut all: Vec<PathBuf> = self.file_databases.read().await.keys().cloned().collect();
+		if let Ok(mut dir) = tokio::fs::read_dir(&self.storage_dir).await {
+			while let Ok(Some(entry)) = dir.next_entry().await {
+				let path = entry.path();
+				let is_db = path.extension().is_some_and(|e| e == "db" || e == "redb");
+				if is_db && !all.contains(&path) {
+					all.push(path);
+				}
+			}
+		}
+
+		let mut part = SnapshotPart::default();
+		for path in all {
+			let Some(name) = path.file_name().map(PathBuf::from) else {
+				continue;
+			};
+			let to = dest.join(&name);
+			let is_open = |cache: &HashMap<PathBuf, DbCell>| {
+				cache.get(&path).is_some_and(|cell| cell.initialized())
+			};
+			let mut copied = false;
+			if !is_open(&*self.file_databases.read().await) {
+				let barrier = self.path_barrier(&path).await;
+				let _guard = barrier.write_owned().await;
+				// Re-check: it may have been opened while we waited for the guard.
+				if !is_open(&*self.file_databases.read().await) {
+					match tokio::fs::copy(&path, &to).await {
+						Ok(_) => copied = true,
+						// Deleted (tenant purge) since the directory was listed.
+						Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+						Err(e) => return Err(error::Error::from(e).into()),
+					}
+				}
+			}
+			if !copied {
+				// The path-barrier read guard, which crdt's `get_or_open_db_file` handle carries.
+				let _guard = self.path_barrier(&path).await.read_owned().await;
+				let db = self.open_db_file_guarded(path.clone()).await?;
+				let out = to.clone();
+				tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+					use redb::{ReadableDatabase, ReadableTable};
+
+					let rtx = db.begin_read()?;
+					let target = redb::Database::create(&out)?;
+					let wtx = target.begin_write()?;
+					for def in
+						[storage::TABLE_DOCUMENTS, storage::TABLE_INDEXES, storage::TABLE_METADATA]
+					{
+						let src = rtx.open_table(def)?;
+						let mut dst = wtx.open_table(def)?;
+						for item in src.iter()? {
+							let (k, v) = item?;
+							dst.insert(k.value(), v.value())?;
+						}
+					}
+					wtx.commit()?;
+					Ok(())
+				})
+				.await
+				.map_err(error::Error::from)?
+				.map_err(error::from_redb_error)?;
+			}
+			part.bytes += tokio::fs::metadata(&to).await.map_err(error::Error::from)?.len();
+			part.files.push(name);
+		}
+		Ok(part)
 	}
 }
 

@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 use axum::{
 	Json,
@@ -11,10 +11,11 @@ use serde_json::json;
 use serde_with::skip_serializing_none;
 use std::net::SocketAddr;
 
+use crate::audit::{penalize, record_auth};
+use crate::totp;
 use cloudillo_core::{
 	ActionVerifyFn, Auth,
 	extract::{IdTag, OptionalAuth, OptionalRequestId},
-	rate_limit::{PenaltyReason, RateLimitApi},
 	roles::{active_member_role, expand_roles, expand_roles_preserving_extras},
 	settings::SettingValue,
 };
@@ -115,26 +116,128 @@ pub struct LoginReq {
 	password: String,
 }
 
+/// Password-login result: a session, or the MFA step (see [`totp::MfaChallenge`]).
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum LoginRes {
+	Login(Login),
+	Mfa(totp::MfaChallenge),
+}
+
 pub async fn post_login(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(login): Json<LoginReq>,
-) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<LoginRes>>)> {
 	let auth = app.auth_adapter.check_tenant_password(&login.id_tag, &login.password).await;
 
 	if let Ok(auth) = auth {
+		let (tn_id, actor) = (auth.tn_id, auth.id_tag.clone());
+		// Password is right but MFA applies: drop the token just minted; the session is
+		// minted in `post_login_mfa` once the code checks out.
+		if let Some(challenge) = totp::login_challenge(&app, tn_id, &actor).await? {
+			let response =
+				ApiResponse::new(LoginRes::Mfa(challenge)).with_req_id(req_id.unwrap_or_default());
+			return Ok((StatusCode::OK, Json(response)));
+		}
 		let (_status, Json(login_data)) = return_login(&app, auth).await?;
-		let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
+		record_auth(
+			&app,
+			"auth.login",
+			"success",
+			Some(tn_id),
+			&actor,
+			&addr,
+			Some(json!({ "method": "password" })),
+		)
+		.await;
+		let response =
+			ApiResponse::new(LoginRes::Login(login_data)).with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
 	} else {
 		// Penalize rate limit for failed login attempt
-		if let Err(e) = app.rate_limiter.penalize(&addr.ip(), PenaltyReason::AuthFailure, 1) {
-			warn!("Failed to record auth penalty for {}: {}", addr.ip(), e);
-		}
+		penalize(&app, &addr);
+		let tn_id = app.auth_adapter.read_tn_id(&login.id_tag).await.ok();
+		let details = json!({ "method": "password" });
+		crate::audit::record_auth_fail(&app, "auth.login", tn_id, &login.id_tag, &addr, details)
+			.await;
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		Err(Error::PermissionDenied)
 	}
+}
+
+/// # POST /api/auth/login/mfa
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginMfaReq {
+	mfa_token: String,
+	code: String,
+}
+
+/// Second step of a password login: trade `{mfaToken, code}` for the session `Login`.
+/// The token is single use; a wrong code re-parks it, up to 5 attempts in its 5 min TTL.
+/// 403 = wrong code, the token is still live; 410 = the token is gone (unknown, expired,
+/// or out of attempts), the user must enter the password again.
+pub async fn post_login_mfa(
+	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	OptionalRequestId(req_id): OptionalRequestId,
+	Json(req): Json<LoginMfaReq>,
+) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
+	let store = app.ext::<totp::MfaStore>()?;
+	let Some(pending) = store.take_login(&req.mfa_token) else {
+		penalize(&app, &addr);
+		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+		return Err(Error::Gone);
+	};
+	let (tn_id, id_tag) = (pending.tn_id, pending.id_tag.clone());
+	// A DB error re-parks the token (using up one attempt) instead of dropping the login
+	let ok = match totp::check_login_code(&app, &pending, &req.code).await {
+		Ok(ok) => ok,
+		Err(e) => {
+			let _ = store.retry_login(req.mfa_token, pending);
+			return Err(e);
+		}
+	};
+	if !ok {
+		penalize(&app, &addr);
+		let details = json!({ "method": "mfa" });
+		crate::audit::record_auth_fail(&app, "auth.login", Some(tn_id), &id_tag, &addr, details)
+			.await;
+		let live = store.retry_login(req.mfa_token, pending);
+		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+		return Err(if live { Error::PermissionDenied } else { Error::Gone });
+	}
+	if pending.enroll_secret.is_some() {
+		record_auth(
+			&app,
+			"auth.mfa.enroll",
+			"success",
+			Some(tn_id),
+			&id_tag,
+			&addr,
+			Some(json!({ "forced": true })),
+		)
+		.await;
+		totp::notify_mfa_enrolled(&app, tn_id, &id_tag, &addr).await;
+	}
+	// Host binding is trivially met: `id_tag` is the tenant whose password was just checked,
+	// the same identity `check_tenant_password` mints for.
+	let auth = app.auth_adapter.create_tenant_login(&id_tag, &id_tag).await?;
+	let (_status, Json(login_data)) = return_login(&app, auth).await?;
+	record_auth(
+		&app,
+		"auth.login",
+		"success",
+		Some(tn_id),
+		&id_tag,
+		&addr,
+		Some(json!({ "method": "mfa" })),
+	)
+	.await;
+	let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
 }
 
 /// # GET /api/auth/login-token
@@ -191,6 +294,7 @@ pub struct LogoutReq {
 /// POST /auth/logout - Invalidate current access token
 pub async fn post_logout(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<LogoutReq>,
@@ -223,6 +327,7 @@ pub async fn post_logout(
 	}
 
 	info!("User {} logged out", auth.id_tag);
+	record_auth(&app, "auth.logout", "success", Some(auth.tn_id), &auth.id_tag, &addr, None).await;
 
 	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
 
@@ -268,17 +373,35 @@ pub async fn post_password(
 
 	if verification.is_err() {
 		// Penalize rate limit for failed password verification
-		if let Err(e) = app.rate_limiter.penalize(&addr.ip(), PenaltyReason::AuthFailure, 1) {
-			warn!("Failed to record auth penalty for {}: {}", addr.ip(), e);
-		}
+		penalize(&app, &addr);
 		// Delay to prevent timing attacks
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		warn!("Failed password verification for user {}", auth.id_tag);
+		record_auth(
+			&app,
+			"auth.password.change",
+			"fail",
+			Some(auth.tn_id),
+			&auth.id_tag,
+			&addr,
+			None,
+		)
+		.await;
 		return Err(Error::PermissionDenied);
 	}
 
 	// Update to new password
 	app.auth_adapter.update_tenant_password(&auth.id_tag, &req.new_password).await?;
+	record_auth(
+		&app,
+		"auth.password.change",
+		"success",
+		Some(auth.tn_id),
+		&auth.id_tag,
+		&addr,
+		None,
+	)
+	.await;
 
 	info!("User {} successfully changed their password", auth.id_tag);
 
@@ -413,9 +536,9 @@ async fn reread_roles(
 	tenant_id_tag: &str,
 	auth: &auth_adapter::AuthCtx,
 ) -> ClResult<Option<String>> {
-	// The revocation choke point for the tenant's `status`, for every caller and not just the
-	// account: a soft-deleted tenant (`"X"`, what `assert_tenant_active` rejects at login)
-	// must not keep minting refreshes for a community member either — they take the
+	// The revocation choke point for the tenant's active state, for every caller and not just
+	// the account: a deleted, suspended or expired tenant (what `assert_tenant_active` rejects
+	// at login) must not keep minting refreshes for a community member either — they take the
 	// `read_profile_roles` branch below. A *failed* read is not a denial; it only narrows.
 	//
 	// ponytail: a community member pays two reads per refresh here, and they cannot be merged —
@@ -423,8 +546,18 @@ async fn reread_roles(
 	// different databases. Revisit only with a measurement, and then by moving the status into
 	// the roles' adapter rather than caching a revocation gate.
 	let tenant = app.auth_adapter.read_tenant(tenant_id_tag).await.ok();
-	if tenant.as_ref().is_some_and(|t| t.status.as_deref() == Some("X")) {
-		warn!(subject = %auth.id_tag, tenant = %tenant_id_tag, "Role re-read denied - tenant deleted");
+	if tenant.as_ref().is_some_and(|t| {
+		!auth_adapter::tenant_active(
+			t.status.as_deref(),
+			t.suspended_at.map(|t| t.0),
+			t.expires_at.map(|t| t.0),
+		)
+	}) {
+		warn!(
+			subject = %auth.id_tag,
+			tenant = %tenant_id_tag,
+			"Role re-read denied - tenant inactive"
+		);
 		return Err(Error::PermissionDenied);
 	}
 
@@ -1052,6 +1185,9 @@ pub async fn get_access_token(
 			);
 			return Err(Error::PermissionDenied);
 		}
+		if cloudillo_core::middleware::api_key_refused_by_mfa(&app, &validation).await? {
+			return Err(Error::PermissionDenied);
+		}
 
 		// A capability key (DAV scope) reaches its PIM routes directly; it is never exchanged.
 		if validation
@@ -1494,21 +1630,27 @@ pub async fn get_proxy_token(
 
 /// # POST /auth/set-password
 /// Set password using a reference (welcome or password reset)
-/// This endpoint is used during registration (welcome ref) and password reset flows
+/// This endpoint is used during registration (welcome ref) and password reset flows.
+/// An account with TOTP set up must also send `code`: missing → 400 `mfa code required`,
+/// wrong → 403; either way the ref is kept and the password is unchanged.
 #[derive(Deserialize)]
 pub struct SetPasswordReq {
 	#[serde(rename = "refId")]
 	ref_id: String,
 	#[serde(rename = "newPassword")]
 	new_password: String,
+	/// TOTP code; required when the account has MFA set up
+	#[serde(default)]
+	code: Option<String>,
 }
 
 pub async fn post_set_password(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(host_id_tag): IdTag,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<SetPasswordReq>,
-) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<LoginRes>>)> {
 	// Validate new password strength
 	if req.new_password.trim().is_empty() {
 		return Err(Error::ValidationError("Password cannot be empty or only whitespace".into()));
@@ -1573,6 +1715,30 @@ pub async fn post_set_password(
 		}
 	}
 
+	// A reset link proves email access only: an enrolled account also needs its code, checked
+	// before anything changes.
+	let enrolled = app.auth_adapter.get_totp(tn_id).await?;
+	if let Some((secret, last_step)) = &enrolled {
+		let Some(code) = req.code.as_deref() else {
+			return Err(Error::ValidationError("mfa code required".into()));
+		};
+		let check = totp::spend_code(&app, &addr, tn_id, secret, *last_step, code).await?;
+		if let totp::CodeCheck::Wrong = check {
+			let details = json!({ "method": "set-password" });
+			crate::audit::record_auth_fail(
+				&app,
+				"auth.login",
+				Some(tn_id),
+				&id_tag,
+				&addr,
+				details,
+			)
+			.await;
+			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+			return Err(Error::PermissionDenied);
+		}
+	}
+
 	info!(
 		tn_id = ?tn_id,
 		id_tag = %id_tag,
@@ -1606,13 +1772,25 @@ pub async fn post_set_password(
 		"Password set successfully, generating login token"
 	);
 
+	// Not enrolled but `auth.mfa = required`: hand out the same forced-enroll step as
+	// `post_login` instead of a session (finished at `/api/auth/login/mfa`). An enrolled
+	// account already passed its code above.
+	if enrolled.is_none()
+		&& let Some(challenge) = totp::login_challenge(&app, tn_id, &id_tag).await?
+	{
+		let response =
+			ApiResponse::new(LoginRes::Mfa(challenge)).with_req_id(req_id.unwrap_or_default());
+		return Ok((StatusCode::OK, Json(response)));
+	}
+
 	// Create a login token for the user. `id_tag == host_id_tag` is enforced by
 	// the guard above, so the auth adapter's host binding cannot fail here.
 	let auth = app.auth_adapter.create_tenant_login(&id_tag, &host_id_tag).await?;
 
 	// Return login info using the existing return_login helper
 	let (_status, Json(login_data)) = return_login(&app, auth).await?;
-	let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
+	let response =
+		ApiResponse::new(LoginRes::Login(login_data)).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }

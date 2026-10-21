@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! App builder - constructs and runs the Cloudillo application
 
@@ -19,6 +19,8 @@ use cloudillo_action::KeyFetchCache;
 use cloudillo_action::dsl::DslEngine;
 use cloudillo_action::hooks::HookRegistry;
 pub use cloudillo_core::app::{Adapters, App, AppBuilderOpts, AppState, ServerMode, VERSION};
+/// For the server binary's offline `cloudillo restore`.
+pub use cloudillo_core::backup::{Manifest, PARTS as BACKUP_PARTS, copy_verified, verify_snapshot};
 use cloudillo_core::extensions::Extensions;
 use cloudillo_core::{abac, rate_limit::RateLimitManager, request, scheduler};
 use cloudillo_types::types::SHARED_TN;
@@ -33,6 +35,7 @@ pub struct AppBuilder {
 	worker: Option<Arc<worker::WorkerPool>>,
 	adapters: Adapters,
 	on_init: Vec<InitCallback>,
+	backup_dir: PathBuf,
 }
 
 impl AppBuilder {
@@ -61,6 +64,7 @@ impl AppBuilder {
 		AppBuilder {
 			opts: AppBuilderOpts {
 				mode: ServerMode::Standalone,
+				proxy_protocol: Vec::new(),
 				listen: "127.0.0.1:443".into(),
 				listen_http: Some("127.0.0.1:80".into()),
 				base_id_tag: None,
@@ -83,12 +87,17 @@ impl AppBuilder {
 				idp_adapter: None,
 			},
 			on_init: Vec::new(),
+			backup_dir: PathBuf::from("./backup"),
 		}
 	}
 
 	// Opts
 	pub fn mode(&mut self, mode: ServerMode) -> &mut Self {
 		self.opts.mode = mode;
+		self
+	}
+	pub fn proxy_protocol(&mut self, proxy_protocol: Vec<ipnet::IpNet>) -> &mut Self {
+		self.opts.proxy_protocol = proxy_protocol;
 		self
 	}
 	pub fn listen(&mut self, listen: impl Into<Box<str>>) -> &mut Self {
@@ -124,6 +133,11 @@ impl AppBuilder {
 	/// Must be a dedicated directory: the file GC removes every stale regular file in it.
 	pub fn tmp_dir(&mut self, tmp_dir: impl Into<Box<std::path::Path>>) -> &mut Self {
 		self.opts.tmp_dir = tmp_dir.into();
+		self
+	}
+	/// Where online backups go; best on a separate volume.
+	pub fn backup_dir(&mut self, backup_dir: impl Into<PathBuf>) -> &mut Self {
+		self.backup_dir = backup_dir.into();
 		self
 	}
 	pub fn acme_email(&mut self, acme_email: impl Into<Box<str>>) -> &mut Self {
@@ -314,6 +328,8 @@ impl AppBuilder {
 		extensions.insert(email_module);
 		extensions.insert(proxy::new_proxy_cache());
 		extensions.insert(crate::auth::new_qr_login_store());
+		extensions.insert(crate::auth::new_mfa_store());
+		extensions.insert(crate::auth::new_login_fails());
 		extensions.insert(cloudillo_file::new_container_cache());
 		extensions.insert(cloudillo_core::dir_cache::new_dir_cache());
 		extensions.insert(cloudillo_site::cache::new_site_cache());
@@ -388,6 +404,7 @@ impl AppBuilder {
 		extensions.insert(cloudillo_search::objects::new_action_rules_cache());
 		// Same shape, for the `doc_formats` resolution — see `DocFormatCache`.
 		extensions.insert(cloudillo_core::doc_format::new_doc_format_cache());
+		extensions.insert(cloudillo_core::backup::BackupState::new(self.backup_dir.clone()));
 
 		// Register schedule_email for core-side tasks (e.g. ACME renewal)
 		let schedule_email_fn: cloudillo_core::ScheduleEmailFn = Box::new(|app, tn_id, params| {
@@ -484,6 +501,21 @@ impl AppBuilder {
 		crate::email::init(&app)?;
 		cloudillo_search::init(&app)?;
 		cloudillo_core::maintenance::init(&app)?;
+		cloudillo_core::audit::init(&app)?;
+		cloudillo_core::backup::init(&app)?;
+		// Bans go to the audit trail. Weak ref: the limiter lives inside `app`.
+		let weak_app = Arc::downgrade(&app);
+		app.rate_limiter.set_ban_hook(Box::new(move |ip, reason| {
+			let Some(app) = weak_app.upgrade() else { return };
+			let mut ev = cloudillo_types::auth_adapter::AuditEvent::new(
+				cloudillo_types::auth_adapter::AuditCategory::Auth,
+				"security.ban",
+				"success",
+			);
+			ev.ip = Some(ip.to_string().into());
+			ev.details = Some(serde_json::json!({ "reason": reason }));
+			tokio::spawn(async move { cloudillo_core::audit::record(&app, ev).await });
+		}));
 		cloudillo_core::acme::register_tasks(&app)?;
 		let (api_router, app_router, http_router) = routes::init(app.clone());
 
@@ -520,6 +552,12 @@ impl AppBuilder {
 
 		// Nightly FTS merge + WAL checkpoint + conditional VACUUM of meta.db.
 		cloudillo_core::maintenance::schedule(&app).await?;
+
+		// Nightly purge of audit events older than `audit.retention_days`.
+		cloudillo_core::audit::schedule(&app).await?;
+
+		// Daily online backup at `backup.time`, if set.
+		cloudillo_core::backup::schedule(&app).await?;
 
 		// Start scheduler
 		app.scheduler.start(app.clone());

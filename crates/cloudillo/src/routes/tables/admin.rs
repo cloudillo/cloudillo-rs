@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! `/api/admin/**` — server-administration surface.
 //!
@@ -13,7 +13,7 @@
 
 use axum::{
 	Router,
-	routing::{get, post},
+	routing::{get, patch, post},
 };
 
 use crate::admin;
@@ -25,14 +25,21 @@ use crate::proxy;
 pub(crate) fn tenant() -> Router<App> {
 	Router::new()
 		.route("/api/admin/tenants", get(admin::tenant::list_tenants))
+		.route("/api/admin/tenants/{id_tag}", patch(admin::tenant::patch_tenant))
 		.route(
 			"/api/admin/tenants/{id_tag}/password-reset",
 			post(admin::tenant::send_password_reset),
 		)
+		.route("/api/admin/tenants/{id_tag}/mfa-reset", post(admin::tenant::reset_mfa))
+		.route("/api/admin/tenants/{id_tag}/suspend", post(admin::tenant::suspend_tenant))
+		.route("/api/admin/tenants/{id_tag}/resume", post(admin::tenant::resume_tenant))
 		.route("/api/admin/tenants/{id_tag}/purge", post(admin::tenant::purge_tenant_handler))
+		.route("/api/admin/audit", get(admin::audit::list_audit))
+		.route("/api/admin/audit.csv", get(admin::audit::export_audit_csv))
 		.route("/api/admin/email/test", post(admin::email::send_test_email))
 		.route("/api/admin/cert-status", get(admin::cert::get_cert_status))
 		.route("/api/admin/db-maintenance", post(admin::maintenance::post_db_maintenance))
+		.route("/api/admin/backup", get(admin::backup::get_backup).post(admin::backup::post_backup))
 		// Handlers live in `cloudillo-proxy`; kept here to match their URL prefix.
 		.route(
 			"/api/admin/proxy-sites",

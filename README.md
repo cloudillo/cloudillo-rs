@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/cloudillo/cloudillo-rs/actions/workflows/general.yaml"><img src="https://github.com/cloudillo/cloudillo-rs/actions/workflows/general.yaml/badge.svg" alt="CI"></a>
   <a href="https://crates.io/crates/cloudillo"><img src="https://img.shields.io/crates/v/cloudillo.svg" alt="crates.io"></a>
-  <a href="https://github.com/cloudillo/cloudillo-rs/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/cloudillo.svg" alt="License: LGPL-3.0-only"></a>
+  <a href="https://github.com/cloudillo/cloudillo-rs/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/cloudillo.svg" alt="License: MPL-2.0"></a>
 </p>
 
 ## What is Cloudillo?
@@ -103,6 +103,7 @@ The server is configured through environment variables:
 | `BASE_PASSWORD` | Initial admin password | — |
 | `ACME_EMAIL` | Email for Let's Encrypt certificates | — |
 | `MODE` | `standalone`, `proxy`, or `stream-proxy` | `standalone` |
+| `PROXY_PROTOCOL` | Comma-separated IPs/CIDRs of the trusted proxies, e.g. `127.0.0.1,172.16.0.0/12`: only they may connect, and each connection must carry a PROXY protocol v1/v2 header (`stream-proxy` only; nginx `proxy_protocol on;`, HAProxy `send-proxy-v2`). Without it, `stream-proxy` sees the proxy's IP — forwarding headers are never trusted in that mode | — |
 | `LISTEN` | HTTPS bind address | `127.0.0.1:1443` |
 | `LISTEN_HTTP` | HTTP bind address (ACME challenges) | `127.0.0.1:1080` |
 | `DB_DIR` | Database directory | `./data` |
@@ -134,13 +135,63 @@ cargo fmt
 
 CI runs tests, formatting checks, and Clippy on every push and pull request.
 
+## Releasing
+
+Releases are built, signed and published from the maintainer's workstation with
+[`release.sh`](release.sh): `./release.sh vX.Y.Z`.
+
+Prerequisites: `git`, `jq`, `cargo` with `cargo-deny`, `cargo-llvm-cov` and `cargo-cyclonedx`,
+the `cyclonedx` CLI, `syft`, `cosign`, `docker` with `buildx` (a builder that can push
+attestations), `gh`, `pnpm`, `npx` and `sha256sum`; logged in with `docker login`, `cargo login`
+and `gh auth login`; the release key from the one-time setup below. The frontend checkout is
+`../cloudillo` (override with `FRONTEND_DIR`), the key `~/.cosign/cloudillo.key` (`COSIGN_KEY`).
+
+1. Set the same version `X.Y.Z` in the workspace `Cargo.toml` and the frontend's `package.json`,
+   and rename `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) to `## [X.Y.Z] - YYYY-MM-DD`,
+   keeping its **Security** section.
+2. Push the same annotated tag to both repositories, the frontend first (the image build clones
+   both from GitHub at the tag). Both local checkouts must be clean and checked out at the tag:
+   ```bash
+   git -C ../cloudillo tag -a vX.Y.Z -m "Cloudillo X.Y.Z" && git -C ../cloudillo push origin vX.Y.Z
+   git tag -a vX.Y.Z -m "Cloudillo X.Y.Z" && git push origin vX.Y.Z
+   ```
+   `vX.Y.0` is tagged on `main`. Later `vX.Y.Z` are tagged on `release/X.Y` or `lts/X.Y` once the
+   line has such a branch (on `main` before that). A patch release (`Z > 0`) that adds a schema
+   migration is refused unless the tag message contains the line `Release-Allow-Migration: yes`.
+3. `./release.sh vX.Y.Z` checks that both tags are pushed unchanged, the versions and the
+   changelog, runs `cargo deny check`, the frontend `pnpm audit` and the full test suite with
+   coverage (including the access matrix), then asks you to type `X.Y.Z` to go on. Nothing is
+   pushed before that.
+4. It builds the image from the tag, generates the CycloneDX SBOMs, cross-checks them with
+   `syft`, signs the image and the SBOM attestation with the project's `cosign` key, tags the
+   image `X.Y.Z`, `X.Y` and (for the newest release) `latest`, publishes the crates, and creates
+   the GitHub release `vX.Y.Z` with these assets:
+   `cloudillo-X.Y.Z.cdx.json` (release SBOM), `cloudillo-X.Y.Z-{server,frontend,native}.cdx.json`
+   (SBOM parts), `cloudillo-X.Y.Z.image-digest.txt`, `cloudillo-X.Y.Z-access-matrix.md`,
+   `cloudillo-X.Y.Z-coverage.txt`, `SHA256SUMS` and `SHA256SUMS.sigstore.json`.
+
+Verify a release before installing it (full steps, including the SBOM attestation, in
+[DOCKER.md](DOCKER.md#verifying-a-release)):
+
+```bash
+# cosign.pub from the repository at the release tag
+cosign verify-blob --key cosign.pub --bundle SHA256SUMS.sigstore.json SHA256SUMS
+sha256sum -c SHA256SUMS
+cosign verify --key cosign.pub "cloudillo/cloudillo@$(cat cloudillo-X.Y.Z.image-digest.txt)"
+```
+
+One-time setup: generate the release key pair with
+`cosign generate-key-pair --output-key-prefix ~/.cosign/cloudillo`, commit
+`~/.cosign/cloudillo.pub` as `cosign.pub` in this repository, and back up the private key
+offline. Tag protection for `v*` in both repositories.
+
 ## Project Status
 
 Cloudillo is in **alpha**. The core platform is functional, but APIs may change and some features are still in development. Feedback, bug reports, and contributions are welcome.
 
 ## License
 
-[LGPL-3.0-only](LICENSE)
+[MPL-2.0](LICENSE)
 
 ## Links
 

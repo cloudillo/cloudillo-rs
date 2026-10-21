@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Real-Time Database Adapter
 //!
@@ -823,6 +823,10 @@ pub trait RtdbAdapter: Debug + Send + Sync {
 	async fn compact_storage(&self) -> ClResult<CompactReport> {
 		Ok(CompactReport::default())
 	}
+
+	/// Write a consistent online copy of this store into the existing directory `dest`.
+	/// Writes one file per storage file, under the same file name.
+	async fn snapshot(&self, dest: &std::path::Path) -> ClResult<crate::snapshot::SnapshotPart>;
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! HTTP-level access-matrix integration test: drives the real `api_router`.
 //!
@@ -30,7 +30,7 @@ use cloudillo::meta_adapter::{ProfileConnectionStatus, ProfileStatus, ProfileTyp
 use cloudillo::settings::SettingValue;
 use cloudillo::types::Patch;
 
-use fixture::{ALICE, CLUB, Fixture, PASSWORD, call, find_str, fixture, prof, remote, req};
+use fixture::{ALICE, CLUB, Fixture, PASSWORD, TRASH, call, find_str, fixture, prof, remote, req};
 use ops::{Actual, InboxCell, Op, all_ops, bearer, classify_mint};
 use oracle::{check_mint_claims, expected_inbox, expected_mint};
 use report::{Mismatch, Report};
@@ -573,6 +573,89 @@ async fn partners() {
 	fx.app.settings.delete(club, COMMUNITY_VIS).await.unwrap();
 	open.finish();
 	private.finish();
+}
+
+/// `auth.mfa=required` (global): the `MFA_REQ` rows, plus the `?apiKey=` exchange, refused
+/// for an unscoped key and still served for a scoped one.
+#[tokio::test]
+async fn mfa_required_api_keys() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let shared = cloudillo::types::SHARED_TN;
+	let v = SettingValue::String("required".into());
+	fx.app.settings.set(shared, "auth.mfa", v, &["SADM"]).await.unwrap();
+
+	let rep = curated::run(fx, "mfa_required", curated::cells(curated::MFA_REQ)).await;
+	let mut xchg = Vec::new();
+	for name in ["apikey-unscoped@alice", "apikey-file@alice"] {
+		let key = bearer(fx.subject(name)).unwrap();
+		let uri = format!("/api/auth/access-token?apiKey={key}");
+		xchg.push(call(&fx.api, req(ALICE, Method::GET, &uri, None, Body::empty())).await.0);
+	}
+
+	fx.app.settings.delete(shared, "auth.mfa").await.unwrap();
+	rep.finish();
+	assert_eq!(xchg, [StatusCode::FORBIDDEN, StatusCode::OK], "apiKey exchange");
+}
+
+/// `GET /api/auth/audit` serves only the caller's tenant: alice sees neither club's row nor a
+/// server-wide (`tn_id: None`) one; club sees its own.
+#[tokio::test]
+async fn audit_tenant_isolation() {
+	use cloudillo::auth_adapter::{AuditCategory, AuditEvent};
+	let _g = FIXTURE_LOCK.read().await;
+	let fx = setup().await;
+	let (club_mark, global_mark) = ("zqm-audit-club-marker", "zqm-audit-global-marker");
+	for (tn_id, mark) in [(Some(fx.tenants.club.tn_id), club_mark), (None, global_mark)] {
+		let ev = AuditEvent {
+			tn_id,
+			details: Some(serde_json::json!({ "marker": mark })),
+			..AuditEvent::new(AuditCategory::Auth, "auth.zqm", "success")
+		};
+		fx.app.auth_adapter.append_audit_event(&ev).await.unwrap();
+	}
+	let list = |host: &'static str, owner: &'static str| async move {
+		let r = req(
+			host,
+			Method::GET,
+			"/api/auth/audit?limit=1000",
+			bearer(fx.subject(owner)),
+			Body::empty(),
+		);
+		let (status, body) = call(&fx.api, r).await;
+		assert_eq!(status, StatusCode::OK, "{owner}: {body}");
+		body.to_string()
+	};
+	let alice = list(ALICE, "owner@alice").await;
+	assert!(!alice.contains(club_mark) && !alice.contains(global_mark), "alice sees: {alice}");
+	let club = list(CLUB, "owner@club").await;
+	assert!(club.contains(club_mark) && !club.contains(global_mark), "club sees: {club}");
+}
+
+/// A spoofed `X-Forwarded-For` does not reach the audit row's `ip`. The fixture runs
+/// `ServerMode::Standalone` (it never calls `.mode()`) and drives `api_router` directly, so this
+/// checks that nothing inside the router reads the header; the StreamProxy / PROXY protocol
+/// paths of `rewrite_client_ip` are covered by the unit tests in `rate_limit::extractors` and
+/// `cloudillo::proxy_protocol`.
+#[tokio::test]
+async fn xff_ignored_in_standalone() {
+	use axum::extract::ConnectInfo;
+	use cloudillo::auth_adapter::AuditQuery;
+	let _g = FIXTURE_LOCK.read().await;
+	let fx = setup().await;
+	// Unknown user: a server-wide row, so the per-tenant failed-login collapse cannot hide it.
+	let who = "zqm-xff-nobody.test";
+	let body = serde_json::json!({ "idTag": who, "password": "wrong" }).to_string();
+	let mut r = req(ALICE, Method::POST, "/api/auth/login", None, Body::from(body));
+	r.headers_mut().insert("x-forwarded-for", "203.0.113.66".parse().unwrap());
+	let peer = r.extensions().get::<ConnectInfo<std::net::SocketAddr>>().unwrap().0.ip();
+	let (status, _) = call(&fx.api, r).await;
+	assert!(status.is_client_error(), "login: {status}");
+
+	let q = AuditQuery { actor: Some(who.into()), ..Default::default() };
+	let rows = fx.app.auth_adapter.list_audit_events(&q).await.unwrap();
+	let ips: Vec<_> = rows.iter().map(|r| r.event.ip.as_deref().unwrap_or_default()).collect();
+	assert_eq!(ips, [peer.to_string()], "audit ip");
 }
 
 /// `/api/me/full` serves a stable ETag over club's `x` sections (a `HashMap` read in random
@@ -5399,4 +5482,37 @@ async fn pin_placer_publishes() {
 		Actual::Deny,
 		"FC-163: the tenant republishes an FSHR row: {st} {b}"
 	);
+}
+
+/// MG-519..524: a suspended or expired tenant mints no fresh access token by bare refresh —
+/// neither for its owner nor for a community member — and an active one does.
+#[tokio::test]
+async fn inactive_tenant_refresh_denied() {
+	use cloudillo::types::Timestamp;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let trash = fx.tenants.trash.tn_id;
+	let auth = &fx.app.auth_adapter;
+	let refresh = |name: &str| {
+		let s = fx.subject(name);
+		let r = req(TRASH, Method::GET, "/api/auth/access-token", bearer(s), Body::empty());
+		call(&fx.api, r)
+	};
+	let check = async |id: &str, want: Actual| {
+		for name in ["owner@trash", "m-moderator@trash.test"] {
+			let (st, b) = refresh(name).await;
+			assert_eq!(ops::status_class(st), want, "{id}: {name} refresh: {st} {b}");
+		}
+	};
+
+	check("MG-519/520", Actual::Allow).await;
+	auth.set_tenant_suspended(trash, true).await.unwrap();
+	check("MG-521/522", Actual::Deny).await;
+	// Resume clears both stamps, so the fixture is active again for later tests.
+	auth.set_tenant_suspended(trash, false).await.unwrap();
+	auth.set_tenant_expiry(trash, Some(Timestamp(Timestamp::now().0 - 1)))
+		.await
+		.unwrap();
+	check("MG-523/524", Actual::Deny).await;
+	auth.set_tenant_expiry(trash, None).await.unwrap();
 }

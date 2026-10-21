@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Compose site for the authenticated API-domain surface — **the audit file**.
 //!
@@ -91,6 +91,11 @@ pub(super) fn init(app: App) -> Router<App> {
 		// `welcome` refIds.
 		.merge(
 			tables::auth::owner_credentials().layer(middleware::from_fn(require_tenant_self)),
+		)
+		.merge(
+			tables::auth::owner_totp()
+				.layer(middleware::from_fn(require_tenant_self))
+				.route_layer(RateLimitLayer::new(limiter.clone(), "auth", mode)),
 		)
 		// One `require_leader` gate over every tenant-owned resource
 		.merge(

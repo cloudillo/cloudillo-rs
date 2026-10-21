@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Cloudillo is open-source, self-hosted collaboration application platform.
 //!
@@ -58,6 +58,7 @@ pub use cloudillo_site as site;
 pub mod app;
 pub mod bootstrap;
 pub mod prelude;
+pub mod proxy_protocol;
 pub mod routes;
 pub mod webserver;
 pub mod websocket;

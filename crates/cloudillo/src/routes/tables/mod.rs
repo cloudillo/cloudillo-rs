@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Route tables, grouped by URL prefix / subsystem.
 //!
@@ -89,6 +89,7 @@ fn all_api_tables() -> axum::Router<crate::prelude::App> {
 		.merge(admin::tenant())
 		.merge(auth::session())
 		.merge(auth::owner_credentials())
+		.merge(auth::owner_totp())
 		.merge(auth::public_login())
 		.merge(auth::qr_login_status())
 		.merge(auth::token_exchange())

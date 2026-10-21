@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Rate Limit Manager
 //!
@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use governor::clock::{Clock, DefaultClock};
@@ -133,8 +133,13 @@ struct PenaltyEntry {
 	reason: Option<PenaltyReason>,
 }
 
+/// Called after every ban with the banned address and the reason (`Debug` form).
+pub type BanHook = Box<dyn Fn(IpAddr, &str) + Send + Sync>;
+
 /// Main rate limit manager
 pub struct RateLimitManager {
+	/// Optional observer of bans (the audit trail); set once at startup
+	ban_hook: OnceLock<BanHook>,
 	/// Per-category limiters
 	categories: HashMap<String, CategoryLimiters>,
 	/// Global ban list
@@ -177,6 +182,7 @@ impl RateLimitManager {
 			NonZeroUsize::new(config.max_tracked_ips / 5).unwrap_or(Self::TWENTY_THOUSAND);
 
 		Self {
+			ban_hook: OnceLock::new(),
 			categories,
 			bans: RwLock::new(LruCache::new(ban_cap)),
 			penalties: RwLock::new(LruCache::new(penalty_cap)),
@@ -267,6 +273,15 @@ impl RateLimitManager {
 			if let Err(e) = self.ban(addr, reason.ban_duration(), reason) {
 				warn!("Failed to auto-ban address: {}", e);
 			}
+		}
+	}
+}
+
+impl RateLimitManager {
+	/// Install the ban observer. Only the first call takes effect.
+	pub fn set_ban_hook(&self, hook: BanHook) {
+		if self.ban_hook.set(hook).is_err() {
+			warn!("Rate limiter ban hook already set; ignoring");
 		}
 	}
 }
@@ -372,8 +387,12 @@ impl RateLimitApi for RateLimitManager {
 			bans.put(key, entry);
 		}
 
+		drop(bans);
 		self.total_bans.fetch_add(1, Ordering::Relaxed);
 		debug!("Banned {:?} for {:?} due to {:?}", addr, duration, reason);
+		if let Some(hook) = self.ban_hook.get() {
+			hook(*addr, &format!("{:?}", reason));
+		}
 
 		Ok(())
 	}
@@ -499,6 +518,18 @@ mod tests {
 
 		manager.unban(&ip).unwrap();
 		assert!(!manager.is_banned(&ip));
+	}
+
+	#[test]
+	fn ban_hook_sees_every_ban() {
+		let manager = RateLimitManager::default();
+		let seen = Arc::new(parking_lot::Mutex::new(Vec::<(IpAddr, String)>::new()));
+		let sink = seen.clone();
+		manager.set_ban_hook(Box::new(move |ip, reason| sink.lock().push((ip, reason.into()))));
+		let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 101));
+
+		manager.ban(&ip, Duration::from_mins(1), PenaltyReason::AuthFailure).unwrap();
+		assert_eq!(*seen.lock(), vec![(ip, "AuthFailure".to_string())]);
 	}
 
 	#[test]

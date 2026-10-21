@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Subjects (who calls) and the token mints that produce their credentials.
 //!
@@ -325,6 +325,25 @@ pub async fn mint_subjects(
 	let mut facts = owner_facts(ADMIN, &["SADM"]);
 	facts.scope = Some(scope);
 	m.add("sadm-scoped@admin", ADMIN, tok, facts);
+	// SADM on alice's host. No route mints this (a session's roles come from the host
+	// tenant), so it is signed directly: `require_tenant_self` admits it, while the TOTP and
+	// audit handlers' `is_tenant_account` must not.
+	let claims = AccessToken {
+		iss: ALICE,
+		sub: Some(ADMIN),
+		scope: None,
+		r: Some("SADM"),
+		h: None,
+		exp: Timestamp::from_now(600),
+	};
+	let tok = app.auth_adapter.create_access_token(t.alice.tn_id, &claims).await.unwrap();
+	let facts = SubjectFacts {
+		id_tag: Some(ADMIN.into()),
+		kind: CredKind::Session,
+		roles: vec!["SADM".into()],
+		..Default::default()
+	};
+	m.add("sadm-visit@alice", ALICE, Some(tok.into_string()), facts);
 
 	// Remotes on alice.
 	for (id, rel) in [

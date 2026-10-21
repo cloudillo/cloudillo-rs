@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Shared, lazily built fixture: two tenants, remote identities, routers.
 //!
@@ -338,7 +338,7 @@ pub struct Fixture {
 	pub hatted: RemoteId,
 	/// Key-cached identity a forged bundled subject claims to be.
 	pub stranger: RemoteId,
-	_tmp: TempDir,
+	tmp: TempDir,
 }
 
 impl Fixture {
@@ -347,6 +347,11 @@ impl Fixture {
 			.iter()
 			.find(|s| s.name == name)
 			.unwrap_or_else(|| panic!("subject {name}"))
+	}
+
+	/// `BACKUP_DIR` of the fixture app.
+	pub fn backup_dir(&self) -> std::path::PathBuf {
+		self.tmp.path().join("backup")
 	}
 }
 
@@ -389,6 +394,7 @@ async fn build() -> Fixture {
 		.base_app_domain(ALICE)
 		.dist_dir(dir.join("dist"))
 		.tmp_dir(dir.join("tmp"))
+		.backup_dir(dir.join("backup"))
 		.auth_adapter(auth)
 		.meta_adapter(meta)
 		.blob_adapter(blob)
@@ -467,7 +473,7 @@ async fn build() -> Fixture {
 	let ws = ws_probe(app.clone());
 	let (peer, hatted, stranger) =
 		(remotes.peer.clone(), remotes.hatted.clone(), remotes.stranger.clone());
-	Fixture { app, api, ws, tenants, objs, subjects, mints, peer, hatted, stranger, _tmp: tmp }
+	Fixture { app, api, ws, tenants, objs, subjects, mints, peer, hatted, stranger, tmp }
 }
 
 pub async fn tenant(app: &App, id_tag: &'static str, roles: Option<&[&str]>) -> Tenant {

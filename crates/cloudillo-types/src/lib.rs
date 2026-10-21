@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Shared types, adapter traits, and core utilities for the Cloudillo platform.
 //!
@@ -24,6 +24,7 @@ pub mod reactions;
 pub mod roles;
 pub mod rtdb_adapter;
 pub mod site;
+pub mod snapshot;
 pub mod types;
 pub mod utils;
 pub mod validation;

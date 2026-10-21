@@ -18,8 +18,12 @@ cloudillo-meta-adapter-sqlite = { workspace = true }
 cloudillo-crdt-adapter-redb = { workspace = true }
 cloudillo-rtdb-adapter-redb = { workspace = true }
 cloudillo = { workspace = true }
+ipnet = "2.12.1"
 mimalloc = "0.1"
 tokio = { version = "1.54.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+
+[dev-dependencies]
+tempfile = "3.27"
 
 [lints]
 workspace = true

@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Authentication subsystem.
 
 pub mod api_key;
+pub mod audit;
 pub mod cleanup;
 pub mod handler;
 pub mod qr_login;
 pub mod settings;
+pub mod totp;
 pub mod webauthn;
 
 mod prelude;
@@ -28,4 +30,14 @@ pub fn init(app: &App) -> ClResult<()> {
 /// Create the QR login store (call during app building, insert into extensions)
 pub fn new_qr_login_store() -> qr_login::QrLoginStore {
 	qr_login::QrLoginStore::new()
+}
+
+/// Create the MFA challenge store (call during app building, insert into extensions)
+pub fn new_mfa_store() -> totp::MfaStore {
+	totp::MfaStore::default()
+}
+
+/// Create the failed-login audit window store (call during app building, insert into extensions)
+pub fn new_login_fails() -> audit::LoginFails {
+	audit::LoginFails::default()
 }

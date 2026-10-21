@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! `/api/auth/**`, `/api/onboarding/**`.
 //!
@@ -8,12 +8,14 @@
 //! | Path | GET | POST | PATCH | DELETE |
 //! |---|---|---|---|---|
 //! | `/api/auth/login`                    | | `public_login()` ᴿ | | |
+//! | `/api/auth/login/mfa`                | | `public_login()` ᴿ | | |
 //! | `/api/auth/login-token`              | `public_login()` ᴿ | | | |
 //! | `/api/auth/login-init`               | | `recovery()` ᴾ | | |
 //! | `/api/auth/set-password`             | | `recovery()` ᴾ | | |
 //! | `/api/auth/forgot-password`          | | `recovery()` ᴾ | | |
 //! | `/api/auth/logout`                   | | `session()` ᴱ | | |
 //! | `/api/auth/password`                 | | `session()` ᴱ | | |
+//! | `/api/auth/audit`                    | `session()` ᴱ | | | |
 //! | `/api/auth/proxy-token`              | `session()` ᴱ | | | |
 //! | `/api/auth/access-token`             | `token_exchange()` ᶠ | | | |
 //! | `/api/auth/hat-endorse`              | `token_exchange()` ᶠ | | | |
@@ -25,6 +27,9 @@
 //! | `/api/auth/wa/reg/{key_id}`          | | | | `owner_credentials()` ᵀ |
 //! | `/api/auth/api-keys`                 | `owner_credentials()` ᵀ | `owner_credentials()` ᵀ | | |
 //! | `/api/auth/api-keys/{key_id}`        | `owner_credentials()` ᵀ | | `owner_credentials()` ᵀ | `owner_credentials()` ᵀ |
+//! | `/api/auth/totp`                     | `owner_credentials()` ᵀ | | | `owner_credentials()` ᵀ |
+//! | `/api/auth/totp/enroll`              | | `owner_credentials()` ᵀ | | |
+//! | `/api/auth/totp/confirm`             | | `owner_credentials()` ᵀ | | |
 //! | `/api/auth/qr-login/init`            | | `public_login()` ᴿ | | |
 //! | `/api/auth/qr-login/{session_id}/status`  | `qr_login_status()` ᴽ | | | |
 //! | `/api/auth/qr-login/{session_id}/details` | `session()` ᴱ | | | |
@@ -46,7 +51,7 @@ use axum::{
 	routing::{delete, get, post},
 };
 
-use crate::auth::{api_key, handler, qr_login, webauthn};
+use crate::auth::{api_key, audit, handler, qr_login, totp, webauthn};
 use crate::prelude::*;
 use crate::push;
 
@@ -66,6 +71,8 @@ pub(crate) fn session() -> Router<App> {
 	Router::new()
 		.route("/api/auth/logout", post(handler::post_logout))
 		.route("/api/auth/password", post(handler::post_password))
+		// Owner-only: gated inside the handler (`is_tenant_account`).
+		.route("/api/auth/audit", get(audit::get_audit))
 		.route("/api/auth/proxy-token", get(handler::get_proxy_token))
 		// Handler lives in `cloudillo-push`; kept here to match its URL prefix.
 		.route("/api/auth/vapid", get(push::handler::get_vapid_public_key))
@@ -97,6 +104,16 @@ pub(crate) fn owner_credentials() -> Router<App> {
 		)
 }
 
+/// TOTP enrollment, mounted like [`owner_credentials`] plus the `"auth"` bucket: each wrong
+/// code or password penalizes the IP, and only the ban stops guessing. Handlers also require
+/// `is_tenant_account` (SADM visiting is refused).
+pub(crate) fn owner_totp() -> Router<App> {
+	Router::new()
+		.route("/api/auth/totp", get(totp::get_totp).delete(totp::delete_totp))
+		.route("/api/auth/totp/enroll", post(totp::post_enroll))
+		.route("/api/auth/totp/confirm", post(totp::post_confirm))
+}
+
 /// Unauthenticated password and QR login endpoints. Attack surface: credential
 /// stuffing, brute force, account enumeration — mounted under the strict
 /// `"auth"` rate-limit bucket, ban fully enforced. The passkey login pair lives
@@ -104,6 +121,7 @@ pub(crate) fn owner_credentials() -> Router<App> {
 pub(crate) fn public_login() -> Router<App> {
 	Router::new()
 		.route("/api/auth/login", post(handler::post_login))
+		.route("/api/auth/login/mfa", post(handler::post_login_mfa))
 		.route("/api/auth/login-token", get(handler::get_login_token))
 		.route("/api/auth/qr-login/init", post(qr_login::post_init))
 }

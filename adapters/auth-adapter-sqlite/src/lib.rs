@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 use std::{fmt::Debug, path::Path, sync::Arc};
 
@@ -11,16 +11,18 @@ use tokio::fs;
 use crate::utils::Db;
 use cloudillo_types::{
 	auth_adapter::{
-		AccessToken, ApiKeyInfo, ApiKeyValidation, AuthAdapter, AuthCtx, AuthKey, AuthLogin,
-		AuthProfile, CertData, CreateApiKeyOptions, CreateProxySiteData, CreateTenantData,
-		CreatedApiKey, KeyPair, ListTenantsOptions, ProxySiteData, TenantCertRenewalRow,
-		TenantListItem, UpdateProxySiteData, Webauthn,
+		AccessToken, ApiKeyInfo, ApiKeyValidation, AuditEvent, AuditEventRow, AuditQuery,
+		AuthAdapter, AuthCtx, AuthKey, AuthLogin, AuthProfile, CertData, CreateApiKeyOptions,
+		CreateProxySiteData, CreateTenantData, CreatedApiKey, KeyPair, ListTenantsOptions,
+		ProxySiteData, TenantCertRenewalRow, TenantListItem, UpdateProxySiteData, Webauthn,
 	},
 	prelude::*,
+	snapshot::SnapshotPart,
 	worker::WorkerPool,
 };
 
 mod api_key;
+mod audit;
 mod auth;
 mod cert;
 mod crypto;
@@ -179,6 +181,14 @@ impl AuthAdapter for AuthAdapterSqlite {
 
 	async fn update_tenant_status(&self, tn_id: TnId, status: char) -> ClResult<()> {
 		tenant::update_tenant_status(&self.db, tn_id, status).await
+	}
+
+	async fn set_tenant_suspended(&self, tn_id: TnId, suspended: bool) -> ClResult<()> {
+		tenant::set_tenant_suspended(&self.db, tn_id, suspended).await
+	}
+
+	async fn set_tenant_expiry(&self, tn_id: TnId, expires_at: Option<Timestamp>) -> ClResult<()> {
+		tenant::set_tenant_expiry(&self.db, tn_id, expires_at).await
 	}
 
 	async fn list_profile_keys(&self, tn_id: TnId) -> ClResult<Vec<AuthKey>> {
@@ -346,6 +356,48 @@ impl AuthAdapter for AuthAdapterSqlite {
 		renewal_days: u32,
 	) -> ClResult<Vec<ProxySiteData>> {
 		proxy_site::list_proxy_sites_needing_cert_renewal(&self.db, renewal_days).await
+	}
+
+	// TOTP MFA
+	async fn get_totp(&self, tn_id: TnId) -> ClResult<Option<(Box<str>, Option<i64>)>> {
+		auth::get_totp(&self.db, tn_id).await
+	}
+
+	async fn enroll_totp(&self, tn_id: TnId, secret: &str, step: i64) -> ClResult<bool> {
+		auth::enroll_totp(&self.db, tn_id, secret, step).await
+	}
+
+	async fn clear_totp(&self, tn_id: TnId) -> ClResult<()> {
+		auth::clear_totp(&self.db, tn_id).await
+	}
+
+	async fn set_totp_last_step(&self, tn_id: TnId, step: i64) -> ClResult<bool> {
+		auth::set_totp_last_step(&self.db, tn_id, step).await
+	}
+
+	// Audit trail
+	async fn append_audit_event(&self, ev: &AuditEvent) -> ClResult<()> {
+		audit::append_audit_event(&self.db, ev).await
+	}
+
+	async fn list_audit_events(&self, q: &AuditQuery) -> ClResult<Vec<AuditEventRow>> {
+		audit::list_audit_events(&self.db, q).await
+	}
+
+	async fn purge_audit_events(&self, before: Timestamp) -> ClResult<u64> {
+		audit::purge_audit_events(&self.db, before).await
+	}
+
+	// Keep in sync with meta-adapter-sqlite snapshot()
+	async fn snapshot(&self, dest: &Path) -> ClResult<SnapshotPart> {
+		let file = dest.join("auth.db");
+		let target = file
+			.to_str()
+			.ok_or_else(|| Error::Internal("non-UTF-8 snapshot path".into()))?
+			.to_owned();
+		sqlx::query("VACUUM INTO ?").bind(target).execute(&self.db).await.db()?;
+		let bytes = fs::metadata(&file).await?.len();
+		Ok(SnapshotPart { files: vec!["auth.db".into()], bytes })
 	}
 }
 

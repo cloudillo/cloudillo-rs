@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Adapter that manages metadata. Everything including tenants, profiles, actions, file metadata, etc.
 
@@ -3476,6 +3476,10 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// All edges of a tenant.
 	async fn list_partner_edges(&self, tn_id: TnId) -> ClResult<Vec<PartnerEdge>>;
+
+	/// Write a consistent online copy of this store into the existing directory `dest`.
+	/// Writes `meta.db` (SQLite `VACUUM INTO`).
+	async fn snapshot(&self, dest: &std::path::Path) -> ClResult<crate::snapshot::SnapshotPart>;
 }
 
 #[cfg(test)]

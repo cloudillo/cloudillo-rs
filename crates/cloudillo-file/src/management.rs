@@ -1,20 +1,22 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! File management (PATCH, DELETE, restore, duplicate) handlers
 
 use axum::{
 	Extension, Json,
-	extract::{Path, Query, State},
+	extract::{ConnectInfo, Path, Query, State},
 	http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::perm::ResolvedEntry;
 use crate::prelude::*;
 use cloudillo_core::dir_cache::DirCache;
 use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
 use cloudillo_core::file_access;
+use cloudillo_types::auth_adapter::AuditCategory;
 use cloudillo_types::meta_adapter::{self, UpdateFileOptions};
 use cloudillo_types::types::ApiResponse;
 use cloudillo_types::utils;
@@ -248,6 +250,7 @@ async fn relocate(
 
 pub async fn patch_file(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(file_id): Path<String>,
@@ -279,6 +282,13 @@ pub async fn patch_file(
 		require_lifecycle(&app, &auth, &tenant_id_tag, &file).await?;
 	}
 
+	// `visibility` is the only access-bearing field of the patch: audit it as a permission change.
+	let visibility_change = match opts.visibility {
+		Patch::Undefined => None,
+		Patch::Null => Some(serde_json::Value::Null),
+		Patch::Value(v) => Some(serde_json::json!(v)),
+	};
+
 	// A move goes first; the rest of the patch follows.
 	let reindex = opts.affects_search_index();
 	let target = move_target(&app, auth.tn_id, &file, &opts.parent_id, &req.channel).await?;
@@ -292,6 +302,18 @@ pub async fn patch_file(
 	}
 	app.meta_adapter.update_file_data(auth.tn_id, &entry_id, &opts).await?;
 	invalidate_dir_cache(&app, auth.tn_id, &entry_id);
+	if let Some(visibility) = visibility_change {
+		crate::share::record_audit(
+			&app,
+			AuditCategory::Sharing,
+			"sharing.file.permissions",
+			auth.tn_id,
+			Some(&auth.id_tag),
+			&addr,
+			serde_json::json!({ "entryId": entry_id, "fileId": file_id, "visibility": visibility }),
+		)
+		.await;
+	}
 	if reindex {
 		cloudillo_core::search_index_file(&app, auth.tn_id, &entry_id);
 	}

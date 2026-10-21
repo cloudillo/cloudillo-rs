@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Database schema initialization and migrations
 //!
@@ -33,7 +33,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 }
 
 // Current schema version - update this when adding new migrations
-const CURRENT_DB_VERSION: i64 = 6;
+const CURRENT_DB_VERSION: i64 = 9;
 
 /// Initialize the database schema and run migrations
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -61,6 +61,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// cert has expired with renewal still failing — flipped back to 'A' on next success).
 	// 'X' = Purging (soft-deleted; admin force-purge in progress. Login is blocked.
 	// A retry of the purge endpoint resumes destructive cleanup from the failed step.)
+	// Admin suspension/expiry is NOT a status letter (ACME owns 'S'): `suspended_at` (set =
+	// suspended) and `expires_at` (unix secs; login refused once reached) are separate columns.
 	sqlx::query(
 		"CREATE TABLE IF NOT EXISTS tenants (
 			tn_id integer NOT NULL,
@@ -72,6 +74,10 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			vapid_public_key text,
 			vapid_private_key text,
 			idp_api_key text,
+			totp_secret text,
+			totp_last_step INTEGER,
+			suspended_at INTEGER,
+			expires_at INTEGER,
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
 			PRIMARY KEY(tn_id)
@@ -359,6 +365,29 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
+	// Audit trail (append-only; tn_id NULL = server-wide event)
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS audit_event (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		ts INTEGER NOT NULL,
+		tn_id INTEGER,
+		actor TEXT,
+		event TEXT NOT NULL,
+		category TEXT NOT NULL,
+		ip TEXT,
+		outcome TEXT NOT NULL,
+		details TEXT
+	)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_event_tn_ts ON audit_event (tn_id, ts)")
+		.execute(&mut *tx)
+		.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_event_ts ON audit_event (ts)")
+		.execute(&mut *tx)
+		.await?;
+
 	// Fresh database: skip migrations (schema already has all columns)
 	if version == 0 {
 		set_db_version(&mut tx, CURRENT_DB_VERSION).await;
@@ -411,13 +440,84 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 		set_db_version(&mut tx, 6).await;
+		version = 6;
+	}
+
+	// Version 7: audit_event table (created above with IF NOT EXISTS), just bump version
+	if version == 6 {
+		set_db_version(&mut tx, 7).await;
+		version = 7;
+	}
+
+	// Version 8: TOTP MFA columns on tenants
+	if version == 7 {
+		sqlx::query("ALTER TABLE tenants ADD COLUMN totp_secret TEXT")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("ALTER TABLE tenants ADD COLUMN totp_last_step INTEGER")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 8).await;
+		version = 8;
+	}
+
+	// Version 9: admin suspension and expiry columns on tenants
+	if version == 8 {
+		sqlx::query("ALTER TABLE tenants ADD COLUMN suspended_at INTEGER")
+			.execute(&mut *tx)
+			.await?;
+		sqlx::query("ALTER TABLE tenants ADD COLUMN expires_at INTEGER")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 9).await;
 		#[allow(unused_assignments)]
 		{
-			version = 6;
+			version = 9;
 		}
 	}
 
 	tx.commit().await?;
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use sqlx::sqlite::SqlitePoolOptions;
+
+	use super::*;
+
+	/// A v6 database (before audit, TOTP and suspension) migrates to the current version.
+	#[tokio::test]
+	async fn migrates_v6_to_current() {
+		let db = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.unwrap();
+		init_db(&db).await.unwrap();
+		// Roll the fresh schema back to its v6 shape.
+		for sql in [
+			"DROP TABLE audit_event",
+			"ALTER TABLE tenants DROP COLUMN totp_secret",
+			"ALTER TABLE tenants DROP COLUMN totp_last_step",
+			"ALTER TABLE tenants DROP COLUMN suspended_at",
+			"ALTER TABLE tenants DROP COLUMN expires_at",
+			"UPDATE vars SET value = '6' WHERE key = 'db_version'",
+		] {
+			sqlx::query(sql).execute(&db).await.unwrap();
+		}
+		init_db(&db).await.unwrap();
+		let version: String = sqlx::query_scalar("SELECT value FROM vars WHERE key = 'db_version'")
+			.fetch_one(&db)
+			.await
+			.unwrap();
+		assert_eq!(version, CURRENT_DB_VERSION.to_string());
+		for sql in [
+			"SELECT totp_secret, totp_last_step, suspended_at, expires_at FROM tenants",
+			"SELECT id, ts, tn_id, actor, event, category, ip, outcome, details FROM audit_event",
+		] {
+			sqlx::query(sql).fetch_all(&db).await.unwrap();
+		}
+	}
 }

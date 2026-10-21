@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! App state type
 
@@ -95,6 +95,10 @@ pub struct Adapters {
 #[derive(Debug)]
 pub struct AppBuilderOpts {
 	pub mode: ServerMode,
+	/// Peers whose inbound PROXY protocol header names the client; when non-empty, every HTTPS
+	/// connection must come from one and carry a header. Honoured only in
+	/// [`ServerMode::StreamProxy`].
+	pub proxy_protocol: Vec<ipnet::IpNet>,
 	pub listen: Box<str>,
 	pub listen_http: Option<Box<str>>,
 	pub base_id_tag: Option<Box<str>>,

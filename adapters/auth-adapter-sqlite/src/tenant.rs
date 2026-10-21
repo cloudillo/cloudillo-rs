@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Tenant management operations
 
@@ -39,11 +39,13 @@ pub(crate) async fn read_tn_id(db: &SqlitePool, id_tag: &str) -> ClResult<TnId> 
 
 /// Read full tenant profile
 pub(crate) async fn read_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<AuthProfile> {
-	let res =
-		sqlx::query("SELECT tn_id, id_tag, email, roles, status FROM tenants WHERE id_tag = ?1")
-			.bind(normalize_id_tag(id_tag).as_ref())
-			.fetch_one(db)
-			.await;
+	let res = sqlx::query(
+		"SELECT tn_id, id_tag, email, roles, status, suspended_at, expires_at \
+			FROM tenants WHERE id_tag = ?1",
+	)
+	.bind(normalize_id_tag(id_tag).as_ref())
+	.fetch_one(db)
+	.await;
 
 	async_map_res(res, async |row| {
 		let tn_id = TnId(row.try_get("tn_id")?);
@@ -61,6 +63,8 @@ pub(crate) async fn read_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<AuthP
 			email: row.try_get("email")?,
 			roles: parse_str_list_optional(roles.as_deref()),
 			status: row.try_get("status")?,
+			suspended_at: row.try_get::<Option<i64>, _>("suspended_at")?.map(Timestamp),
+			expires_at: row.try_get::<Option<i64>, _>("expires_at")?.map(Timestamp),
 			keys,
 		})
 	})
@@ -77,6 +81,37 @@ pub(crate) async fn update_tenant_status(
 	let status_str: &str = status.encode_utf8(&mut buf);
 	sqlx::query("UPDATE tenants SET status = ?1, updated_at = unixepoch() WHERE tn_id = ?2")
 		.bind(status_str)
+		.bind(tn_id.0)
+		.execute(db)
+		.await
+		.db()?;
+	Ok(())
+}
+
+/// Suspend (`suspended_at = now`) or resume a tenant. Resume also clears `expires_at`.
+pub(crate) async fn set_tenant_suspended(
+	db: &SqlitePool,
+	tn_id: TnId,
+	suspended: bool,
+) -> ClResult<()> {
+	let sql = if suspended {
+		"UPDATE tenants SET suspended_at = unixepoch(), updated_at = unixepoch() WHERE tn_id = ?1"
+	} else {
+		"UPDATE tenants SET suspended_at = NULL, expires_at = NULL, updated_at = unixepoch()
+		WHERE tn_id = ?1"
+	};
+	sqlx::query(sql).bind(tn_id.0).execute(db).await.db()?;
+	Ok(())
+}
+
+/// Set or clear the tenant's account expiry (login refused once `expires_at <= now`).
+pub(crate) async fn set_tenant_expiry(
+	db: &SqlitePool,
+	tn_id: TnId,
+	expires_at: Option<Timestamp>,
+) -> ClResult<()> {
+	sqlx::query("UPDATE tenants SET expires_at = ?1, updated_at = unixepoch() WHERE tn_id = ?2")
+		.bind(expires_at.map(|t| t.0))
 		.bind(tn_id.0)
 		.execute(db)
 		.await
@@ -183,7 +218,8 @@ pub(crate) async fn create_tenant(
 /// `api_keys` has `FOREIGN KEY ... ON DELETE CASCADE`, but `PRAGMA foreign_keys`
 /// is not enabled on this connection pool — the cascade does not fire, so it
 /// must be listed explicitly here. `webauthn` has no FK at all.
-const TENANT_CASCADE_TABLES: &[&str] = &["certs", "keys", "events", "webauthn", "api_keys"];
+const TENANT_CASCADE_TABLES: &[&str] =
+	&["certs", "keys", "events", "webauthn", "api_keys", "audit_event"];
 
 /// Delete a tenant and all associated data
 pub(crate) async fn delete_tenant(db: &SqlitePool, id_tag: &str) -> ClResult<()> {
@@ -242,7 +278,8 @@ pub(crate) async fn list_tenants(
 	opts: &ListTenantsOptions<'_>,
 ) -> ClResult<Vec<TenantListItem>> {
 	let mut query = sqlx::QueryBuilder::new(
-		"SELECT tn_id, id_tag, email, roles, status, created_at FROM tenants WHERE 1=1",
+		"SELECT tn_id, id_tag, email, roles, status, suspended_at, expires_at, created_at
+		FROM tenants WHERE 1=1",
 	);
 
 	if let Some(status) = opts.status {
@@ -281,6 +318,8 @@ pub(crate) async fn list_tenants(
 				email: row.try_get("email").db()?,
 				roles: parse_str_list_optional(roles_str.as_deref()),
 				status: row.try_get("status").db()?,
+				suspended_at: row.try_get::<Option<i64>, _>("suspended_at").db()?.map(Timestamp),
+				expires_at: row.try_get::<Option<i64>, _>("expires_at").db()?.map(Timestamp),
 				created_at: Timestamp(row.try_get("created_at").db()?),
 			})
 		})

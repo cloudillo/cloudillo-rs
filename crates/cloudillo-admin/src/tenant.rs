@@ -1,21 +1,22 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Admin tenant management handlers
 
 use axum::{
 	Json,
-	extract::{Path, Query, State},
+	extract::{ConnectInfo, Path, Query, State},
 	http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use cloudillo_core::extract::Auth;
 use cloudillo_email::{EmailModule, EmailTaskParams, get_tenant_lang};
 use cloudillo_ref::service::{CreateRefInternalParams, create_ref_internal};
-use cloudillo_types::auth_adapter::ListTenantsOptions;
+use cloudillo_types::auth_adapter::{AuthCtx, ListTenantsOptions};
 use cloudillo_types::meta_adapter::{ListTenantsMetaOptions, ProfileType};
 use cloudillo_types::types::ApiResponse;
 
@@ -35,6 +36,10 @@ pub struct TenantView {
 	pub status: Option<String>,
 	pub roles: Option<Vec<String>>,
 	pub profile_pic: Option<String>,
+	/// Unix seconds; set while the tenant is suspended by an admin
+	pub suspended_at: Option<i64>,
+	/// Unix seconds; login is refused once reached
+	pub expires_at: Option<i64>,
 	pub created_at: i64,
 }
 
@@ -101,6 +106,8 @@ pub async fn list_tenants(
 				status: auth.status.map(|s| s.to_string()),
 				roles: auth.roles.map(|r| r.iter().map(ToString::to_string).collect()),
 				profile_pic: meta.and_then(|m| m.profile_pic.as_ref().map(ToString::to_string)),
+				suspended_at: auth.suspended_at.map(|t| t.0),
+				expires_at: auth.expires_at.map(|t| t.0),
 				created_at,
 			}
 		})
@@ -114,10 +121,132 @@ pub async fn list_tenants(
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// POST /api/admin/tenants/{id_tag}/mfa-reset - Remove the tenant's TOTP second factor
+/// (lost authenticator). The next password login re-enrolls if `auth.mfa = required`.
+#[axum::debug_handler]
+pub async fn reset_mfa(
+	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	Auth(auth_ctx): Auth,
+	Path(id_tag): Path<String>,
+) -> ClResult<StatusCode> {
+	let tn_id = app.auth_adapter.read_tn_id(&id_tag).await?;
+	app.auth_adapter.clear_totp(tn_id).await?;
+	crate::audit::record_admin(
+		&app,
+		"admin.tenant.mfa_reset",
+		"success",
+		Some(tn_id),
+		&auth_ctx.id_tag,
+		&addr,
+		serde_json::json!({ "idTag": id_tag }),
+	)
+	.await;
+	info!(tn_id = ?tn_id, id_tag = %id_tag, "TOTP MFA reset by admin");
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/admin/tenants/{id_tag}/suspend - Refuse every new login / API-key exchange.
+/// Already issued access tokens are not revoked; they run out within an hour.
+#[axum::debug_handler]
+pub async fn suspend_tenant(
+	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	Auth(auth_ctx): Auth,
+	Path(id_tag): Path<String>,
+) -> ClResult<StatusCode> {
+	set_suspended(&app, &addr, &auth_ctx, &id_tag, true).await
+}
+
+/// POST /api/admin/tenants/{id_tag}/resume - Lift a suspension and clear the expiry date.
+#[axum::debug_handler]
+pub async fn resume_tenant(
+	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	Auth(auth_ctx): Auth,
+	Path(id_tag): Path<String>,
+) -> ClResult<StatusCode> {
+	set_suspended(&app, &addr, &auth_ctx, &id_tag, false).await
+}
+
+async fn set_suspended(
+	app: &App,
+	addr: &SocketAddr,
+	actor: &AuthCtx,
+	id_tag: &str,
+	suspended: bool,
+) -> ClResult<StatusCode> {
+	// Compared by tn_id: `read_tn_id` canonicalizes, so a differently spelled tag is still you
+	let tn_id = app.auth_adapter.read_tn_id(id_tag).await?;
+	// An admin locking themselves out would leave the site without one
+	if suspended && tn_id == actor.tn_id {
+		return Err(Error::ValidationError("cannot suspend your own account".into()));
+	}
+	app.auth_adapter.set_tenant_suspended(tn_id, suspended).await?;
+	let event = if suspended { "admin.tenant.suspend" } else { "admin.tenant.resume" };
+	crate::audit::record_admin(
+		app,
+		event,
+		"success",
+		Some(tn_id),
+		&actor.id_tag,
+		addr,
+		serde_json::json!({ "idTag": id_tag }),
+	)
+	.await;
+	info!(tn_id = ?tn_id, id_tag = %id_tag, suspended, "tenant suspension changed by admin");
+	Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchTenantBody {
+	/// Unix seconds or ISO 8601; `null` clears the expiry. Required: `{}` is refused, not
+	/// read as a clear.
+	#[serde(default)]
+	pub expires_at: Patch<Timestamp>,
+}
+
+/// PATCH /api/admin/tenants/{id_tag} - Set or clear the account expiry date
+#[axum::debug_handler]
+pub async fn patch_tenant(
+	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	Auth(auth_ctx): Auth,
+	Path(id_tag): Path<String>,
+	Json(body): Json<PatchTenantBody>,
+) -> ClResult<StatusCode> {
+	let expires_at = match body.expires_at {
+		Patch::Undefined => return Err(Error::ValidationError("expiresAt is required".into())),
+		Patch::Null => None,
+		Patch::Value(t) => Some(t),
+	};
+	let tn_id = app.auth_adapter.read_tn_id(&id_tag).await?;
+	// Clearing your own expiry stays allowed; setting one could lock you out
+	if expires_at.is_some() && tn_id == auth_ctx.tn_id {
+		return Err(Error::ValidationError("cannot set an expiry on your own account".into()));
+	}
+	app.auth_adapter.set_tenant_expiry(tn_id, expires_at).await?;
+	crate::audit::record_admin(
+		&app,
+		"admin.tenant.expiry",
+		"success",
+		Some(tn_id),
+		&auth_ctx.id_tag,
+		&addr,
+		serde_json::json!({ "idTag": id_tag, "expiresAt": expires_at.map(|t| t.0) }),
+	)
+	.await;
+	info!(tn_id = ?tn_id, id_tag = %id_tag, expires_at = ?expires_at, "tenant expiry set");
+	Ok(StatusCode::NO_CONTENT)
+}
+
 /// POST /api/admin/tenants/{id_tag}/password-reset - Send password reset email
 #[axum::debug_handler]
 pub async fn send_password_reset(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	Auth(auth_ctx): Auth,
 	Path(id_tag): Path<String>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<PasswordResetResponse>>)> {
 	info!(
@@ -186,6 +315,16 @@ pub async fn send_password_reset(
 	};
 
 	EmailModule::schedule_email_task(&app.scheduler, &app.settings, tn_id, email_params).await?;
+	crate::audit::record_admin(
+		&app,
+		"admin.tenant.password_reset",
+		"success",
+		Some(tn_id),
+		&auth_ctx.id_tag,
+		&addr,
+		serde_json::json!({ "idTag": id_tag }),
+	)
+	.await;
 
 	info!(
 		tn_id = ?tn_id,
@@ -302,6 +441,7 @@ pub struct PurgeTenantResponse {
 #[axum::debug_handler]
 pub async fn purge_tenant_handler(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth_ctx): Auth,
 	Path(id_tag): Path<String>,
 	Json(body): Json<PurgeTenantBody>,
@@ -328,7 +468,25 @@ pub async fn purge_tenant_handler(
 		"tenant force-purge requested"
 	);
 
-	let report = purge_tenant(&app, tn_id).await?;
+	let res = purge_tenant(&app, tn_id).await;
+	// Server-wide row: the tenant is gone, and its tn_id must not leak into a reused id.
+	// A failure is audited too, with a generic error: the detail stays in the server log.
+	let mut details = serde_json::json!({ "idTag": id_tag, "tnId": tn_id.0 });
+	if res.is_err() {
+		details["error"] = "purge failed".into();
+	}
+	let outcome = if res.is_ok() { "success" } else { "fail" };
+	crate::audit::record_admin(
+		&app,
+		"admin.tenant.purge",
+		outcome,
+		None,
+		&auth_ctx.id_tag,
+		&addr,
+		details,
+	)
+	.await;
+	let report = res?;
 
 	let response = ApiResponse::new(PurgeTenantResponse {
 		tn_id: report.tn_id.0,

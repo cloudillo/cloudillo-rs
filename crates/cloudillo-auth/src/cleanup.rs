@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Periodic cleanup task for expired auth data (API keys, verification codes) and for
 //! related-action tokens orphaned by an unverified `/api/inbox` bundle.
@@ -83,6 +83,19 @@ impl Task<App> for AuthCleanupTask {
 			let count = store.cleanup_expired();
 			if count > 0 {
 				info!("Cleaned up {} expired QR login sessions", count);
+			}
+		}
+
+		if let Ok(store) = app.ext::<crate::totp::MfaStore>() {
+			let count = store.cleanup_expired();
+			if count > 0 {
+				info!("Cleaned up {} expired MFA login/enroll entries", count);
+			}
+		}
+		if let Ok(fails) = app.ext::<crate::audit::LoginFails>() {
+			let count = crate::audit::prune_login_fails(fails);
+			if count > 0 {
+				info!("Cleaned up {} expired failed-login windows", count);
 			}
 		}
 

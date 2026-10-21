@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! HTTP Basic auth middleware that accepts a scoped API token as the "password".
 //!
@@ -160,6 +160,13 @@ pub async fn dav_basic_auth(
 			"DAV: token tenant {:?} doesn't match Host tenant {:?} (host idTag '{}')",
 			validation.tn_id, host_tn_id, host_id_tag.0
 		);
+		return unauthorized();
+	}
+	// Normally a no-op: DAV keys are scoped. A settings read error fails closed.
+	if !matches!(
+		cloudillo_core::middleware::api_key_refused_by_mfa(&app, &validation).await,
+		Ok(false)
+	) {
 		return unauthorized();
 	}
 

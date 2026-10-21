@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Core server settings registration
 //!
@@ -29,13 +29,13 @@ pub fn cron_validator(v: &SettingValue) -> ClResult<()> {
 
 /// Register all core settings
 pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
-	// Server registration enabled
+	// Single-character keyboard shortcuts (WCAG 2.1.4: the user must be able to turn them off)
 	registry.register(
-		SettingDefinition::builder("server.registration_enabled")
-			.description("Allow new user registrations")
+		SettingDefinition::builder("ui.single_key_shortcuts")
+			.description("Enable single-character keyboard shortcuts")
 			.default(SettingValue::Bool(true))
-			.scope(SettingScope::Global)
-			.permission(PermissionLevel::Admin)
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
 			.build()?,
 	)?;
 

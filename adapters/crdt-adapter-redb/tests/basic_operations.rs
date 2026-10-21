@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Basic CRDT adapter operation tests
 //!
@@ -320,4 +320,50 @@ async fn concurrent_writes_survive_compaction() {
 
 	let updates = adapter.get_updates(tn_id, doc_id).await.expect("test failed");
 	assert_eq!(updates.len(), 21, "an update was lost across the compaction");
+}
+
+#[tokio::test]
+async fn test_snapshot_round_trip() {
+	let (adapter, temp) = create_test_adapter().await;
+	let update = CrdtUpdate { data: vec![7, 8, 9], client_id: None, seq: None };
+	adapter.store_update(TnId(1), "snap", update).await.unwrap();
+
+	let dest = TempDir::new().unwrap();
+	adapter.snapshot(dest.path()).await.unwrap();
+
+	let config = AdapterConfig {
+		max_instances: 10,
+		idle_timeout_secs: 60,
+		broadcast_capacity: 100,
+		auto_evict: false,
+	};
+	let restored = CrdtAdapterRedb::new(dest.path(), true, config).await.unwrap();
+	let updates = restored.get_updates(TnId(1), "snap").await.unwrap();
+	assert_eq!(updates.len(), 1);
+	assert_eq!(updates[0].data, vec![7, 8, 9]);
+
+	// Table drift: a table added to the store must be added to `snapshot()` too.
+	drop((adapter, restored));
+	for entry in std::fs::read_dir(dest.path()).unwrap() {
+		let name = entry.unwrap().file_name();
+		assert_eq!(
+			table_names(&dest.path().join(&name)),
+			table_names(&temp.path().join(&name)),
+			"{name:?}"
+		);
+	}
+}
+
+fn table_names(path: &std::path::Path) -> Vec<String> {
+	use redb::{ReadableDatabase, TableHandle};
+	let db = redb::Database::open(path).unwrap();
+	let mut names: Vec<String> = db
+		.begin_read()
+		.unwrap()
+		.list_tables()
+		.unwrap()
+		.map(|t| t.name().to_string())
+		.collect();
+	names.sort();
+	names
 }

@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Meta adapter CRUD operation tests
 //!
@@ -1603,4 +1603,30 @@ async fn test_conn_upd_keeps_the_conn_row_and_orders_by_created_at() {
 	let rows = adapter.list_actions(tn_id, &opts).await.expect("list");
 	let ids: Vec<&str> = rows.iter().map(|a| a.action_id.as_ref()).collect();
 	assert_eq!(ids, ["a1~upd-new"], "the retired newer UPD is found, the older is not");
+}
+
+/// `snapshot()` writes a `meta.db` with the live rows and every live table.
+#[tokio::test]
+async fn test_snapshot_round_trip() {
+	let (adapter, temp) = create_test_adapter().await;
+	adapter.create_tenant(TnId(1), "alice").await.unwrap();
+	let dest = TempDir::new().unwrap();
+	let part = adapter.snapshot(dest.path()).await.unwrap();
+	assert_eq!(part.files, [std::path::PathBuf::from("meta.db")]);
+
+	let open = async |dir: &std::path::Path| {
+		let url = format!("sqlite://{}/meta.db", dir.display());
+		sqlx::sqlite::SqlitePoolOptions::new().connect(&url).await.unwrap()
+	};
+	let (src, snap) = (open(temp.path()).await, open(dest.path()).await);
+	let id_tag: String = sqlx::query_scalar("SELECT id_tag FROM tenants WHERE tn_id = 1")
+		.fetch_one(&snap)
+		.await
+		.unwrap();
+	assert_eq!(id_tag, "alice");
+	let tables = |pool| async move {
+		let q = "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name";
+		sqlx::query_scalar::<_, String>(q).fetch_all(&pool).await.unwrap()
+	};
+	assert_eq!(tables(snap).await, tables(src).await);
 }

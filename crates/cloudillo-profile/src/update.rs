@@ -1,23 +1,26 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Profile update handlers
 
 use axum::{
 	Json,
-	extract::{Path, State},
+	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 };
+use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 use cloudillo_core::CreateActionFn;
+use cloudillo_core::audit;
 use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
 use cloudillo_core::roles::{
 	LEADER_LEVEL, can_assign_role, can_manage_member_by_roles, highest_role_level,
 };
 use cloudillo_types::action_types::CreateAction;
+use cloudillo_types::auth_adapter::{AuditCategory, AuditEvent};
 use cloudillo_types::meta_adapter::{
 	ProfileStatus, ProfileTrust, ProfileType, UpdateProfileData, UpdateTenantData,
 	UpsertProfileFields,
@@ -166,6 +169,7 @@ fn check_hat_roles_patch(
 /// changes are bounded by `can_manage_member`.
 pub async fn patch_profile_admin(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	Path(id_tag): Path<String>,
 	Json(patch): Json<AdminProfilePatch>,
@@ -291,6 +295,21 @@ pub async fn patch_profile_admin(
 	app.meta_adapter.upsert_profile(tn_id, &id_tag, &upsert).await?;
 	if upsert.affects_search_index() {
 		cloudillo_core::search_index_profile(&app, tn_id, &id_tag);
+	}
+
+	if response_roles.is_some() || hat_update.is_some() {
+		let details = Some(serde_json::json!({
+			"target": id_tag,
+			"prevRoles": prev_roles,
+			"roles": response_roles,
+			"hatRoles": hat_update.as_ref().map(|(map, _)| map),
+		}));
+		let ev = AuditEvent {
+			tn_id: Some(tn_id),
+			details,
+			..AuditEvent::new(AuditCategory::Sharing, "sharing.role.change", "success")
+		};
+		audit::record_by(&app, ev, Some(&auth.id_tag), &addr).await;
 	}
 
 	// Publish the changed map to a connected peer. The column is already written, so

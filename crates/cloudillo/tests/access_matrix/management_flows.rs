@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Management flows the curated rows cannot express: dynamic ids, seeded targets, response
 //! bodies.
+//!
+//! Not driven here: a tenant purge followed by a new tenant reusing its tn_id — the fixture's
+//! tenants are shared by every test. That a purge drops the tenant's audit rows is checked by
+//! `delete_tenant_drops_its_audit_events` in the auth adapter's `tests/totp_and_audit.rs`.
 
 use axum::body::Body;
 use axum::http::{Method, StatusCode};
@@ -13,7 +17,7 @@ use cloudillo::settings::SettingValue;
 use cloudillo::types::Patch;
 
 use crate::fixture::{
-	ALICE, CLUB, Fixture, PASSWORD, PEER_HAT_ROLES, call, find_str, prof, req, sign,
+	ADMIN, ALICE, CLUB, Fixture, PASSWORD, PEER_HAT_ROLES, call, find_str, prof, req, sign,
 };
 use crate::ops::{Actual, bearer, status_class};
 use crate::subjects::Subject;
@@ -690,6 +694,40 @@ async fn admin_proxy_site_crud() {
 	assert!(!matches!(st.as_u16(), 401 | 403 | 404), "SADM email test: {st} {b}");
 }
 
+/// SADM runs a real backup into the fixture's backup dir; a plain owner cannot start one.
+#[tokio::test]
+async fn admin_backup_run() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let sadm = fx.subject("owner-sadm@admin");
+	let (st, b) = send(fx, sadm, Method::POST, "/api/admin/backup", "{}").await;
+	assert!(matches!(st.as_u16(), 202 | 409), "start: {st} {b}");
+	let mut status = Value::Null;
+	for _ in 0..100 {
+		let (st, b) = send(fx, sadm, Method::GET, "/api/admin/backup", "").await;
+		assert!(st.is_success(), "status: {st} {b}");
+		status = b["data"].clone();
+		if status["running"] == false {
+			break;
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+	assert_eq!(status["running"], false, "backup still running after 10s: {status}");
+	assert_eq!(status["last"]["ok"], true, "backup run failed: {status}");
+	assert!(status["snapshots"].as_array().is_some_and(|s| !s.is_empty()), "no snapshot: {status}");
+	// The snapshot the server just wrote passes the offline restore's check.
+	let name = status["snapshots"][0]["name"].as_str().unwrap();
+	let manifest = cloudillo::app::verify_snapshot(&fx.backup_dir().join(name))
+		.unwrap_or_else(|e| panic!("verify {name}: {e}"));
+	for part in ["auth", "meta"] {
+		let prefix = format!("{part}/");
+		assert!(manifest.files.iter().any(|f| f.path.starts_with(&prefix)), "no {part} files");
+	}
+	let (st, b) =
+		send(fx, fx.subject("owner@alice"), Method::POST, "/api/admin/backup", "{}").await;
+	assert_eq!(status_class(st), Actual::Deny, "a plain owner starts a backup: {st} {b}");
+}
+
 /// The trash owner changes its own password (and back); a member cannot. Completing onboarding
 /// consumes the tenant's own welcome ref, never another tenant's.
 #[tokio::test]
@@ -886,6 +924,311 @@ async fn dav_rejects_passwords() {
 		r.headers_mut().insert(axum::http::header::AUTHORIZATION, basic);
 		let (st, b) = call(&fx.api, r).await;
 		assert_eq!(st, StatusCode::UNAUTHORIZED, "Basic {}…: {st} {b}", &pair[..12]);
+	}
+}
+
+/// Suspension, expiry and TOTP gate every credential path. A suspended or expired tenant is
+/// refused at password login and at API-key exchange, and a resume or a cleared expiry
+/// restores both. An enrolled account gets the MFA step, not a session, at password login and
+/// at set-password (a welcome link never bypasses TOTP); a wrong code and a bogus token are
+/// refused; an SADM reset lifts the step. The correct-code path is covered by the
+/// `cloudillo_auth::totp` unit test: the fixture cannot read the authenticator clock.
+#[tokio::test]
+async fn suspension_expiry_and_mfa() {
+	use cloudillo::auth::totp;
+	use cloudillo::auth_adapter::CreateApiKeyOptions;
+	use cloudillo::types::Timestamp;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let sadm = fx.subject("owner-sadm@admin");
+	let susp = "zqm-susp.test";
+	let tn = crate::fixture::tenant(&fx.app, susp, None).await.tn_id;
+	let opts = CreateApiKeyOptions { name: Some("zqm-susp"), scopes: None, expires_at: None };
+	let key = fx.app.auth_adapter.create_api_key(tn, opts).await.unwrap().plaintext_key;
+	let post = |uri: &'static str, body: String| {
+		call(&fx.api, req(susp, Method::POST, uri, None, Body::from(body)))
+	};
+	let login =
+		|| post("/api/auth/login", format!(r#"{{"idTag":"{susp}","password":"{PASSWORD}"}}"#));
+	let keyed = || {
+		let r = req(susp, Method::GET, "/api/auth/api-keys", Some(&key), Body::empty());
+		call(&fx.api, r)
+	};
+	let admin = |m: Method, path: &str, body: &str| {
+		let uri = format!("/api/admin/tenants/{susp}{path}");
+		let body = body.to_owned();
+		async move { send(fx, sadm, m, &uri, &body).await }
+	};
+	let open = |why: &'static str| async move {
+		let (st, b) = login().await;
+		assert!(find_str(&b, "token").is_some(), "{why}: login {st} {b}");
+		let (st, b) = keyed().await;
+		assert!(st.is_success(), "{why}: API key {st} {b}");
+	};
+	let shut = |why: &'static str| async move {
+		let (st, b) = login().await;
+		assert_eq!(status_class(st), Actual::Deny, "{why}: login {st} {b}");
+		let (st, b) = keyed().await;
+		assert_eq!(status_class(st), Actual::Deny, "{why}: API key {st} {b}");
+	};
+
+	open("active").await;
+	let (st, b) = admin(Method::POST, "/suspend", "").await;
+	assert!(st.is_success(), "suspend: {st} {b}");
+	shut("suspended").await;
+	let (st, b) = admin(Method::POST, "/resume", "").await;
+	assert!(st.is_success(), "resume: {st} {b}");
+	open("resumed").await;
+	let past = Timestamp::from_now(-60).0;
+	let (st, b) = admin(Method::PATCH, "", &format!(r#"{{"expiresAt":{past}}}"#)).await;
+	assert!(st.is_success(), "expire: {st} {b}");
+	shut("expired").await;
+	let (st, b) = admin(Method::PATCH, "", r#"{"expiresAt":null}"#).await;
+	assert!(st.is_success(), "clear expiry: {st} {b}");
+	open("expiry cleared").await;
+
+	// Enrolled: the password is not enough, even with `auth.mfa` off.
+	let secret = totp::generate_secret();
+	fx.app.auth_adapter.enroll_totp(tn, &secret, 0).await.unwrap();
+	// An unscoped key is a full-owner login without the second factor: refused once enrolled.
+	let (st, b) = keyed().await;
+	assert_eq!(status_class(st), Actual::Deny, "unscoped API key after enrollment: {st} {b}");
+	// Enrollment is once only (`/api/auth/totp/confirm` maps `false` to 409; `auth.mfa` is off
+	// in the fixture, so the route refuses earlier).
+	assert!(!fx.app.auth_adapter.enroll_totp(tn, &secret, 0).await.unwrap());
+	let mfa_step = || async {
+		let (st, b) = login().await;
+		assert!(find_str(&b, "token").is_none(), "enrolled login minted a session: {st} {b}");
+		find_str(&b, "mfaToken").unwrap_or_else(|| panic!("MFA step: {st} {b}"))
+	};
+	let mfa_code = |tok: String, code: String| {
+		post("/api/auth/login/mfa", format!(r#"{{"mfaToken":"{tok}","code":"{code}"}}"#))
+	};
+	let now = Timestamp::now().0;
+	let wrong = ["000000", "000001"]
+		.into_iter()
+		.find(|c| totp::verify(&secret, c, now, None).is_none())
+		.unwrap();
+	// A wrong code keeps the token live (403); an unknown token is gone (410).
+	let (st, b) = mfa_code(mfa_step().await, wrong.into()).await;
+	assert_eq!(st.as_u16(), 403, "wrong MFA code: {st} {b}");
+	let (st, b) = mfa_code("zqm-bogus".into(), "123456".into()).await;
+	assert_eq!(st.as_u16(), 410, "unknown MFA token: {st} {b}");
+	let code = totp::code_at_time(&secret, now).unwrap();
+	let (st, b) = mfa_code(mfa_step().await, code.clone()).await;
+	assert!(find_str(&b, "token").is_some(), "correct MFA code: {st} {b}");
+	let (st, b) = mfa_code(mfa_step().await, code).await;
+	assert_eq!(status_class(st), Actual::Deny, "replayed MFA code: {st} {b}");
+	let q = cloudillo::auth_adapter::AuditQuery {
+		tn_id: Some(tn),
+		event_prefix: Some("auth.login".into()),
+		outcome: Some("success".into()),
+		..Default::default()
+	};
+	let rows = fx.app.auth_adapter.list_audit_events(&q).await.unwrap();
+	assert!(
+		rows.iter()
+			.any(|r| r.event.details.as_ref().is_some_and(|d| d["method"] == "mfa")),
+		"no MFA login audit row: {rows:?}"
+	);
+
+	// Set-password on an enrolled account needs a fresh code; refusals keep ref and password.
+	let welcome = cloudillo::meta_adapter::CreateRefOptions {
+		typ: cloudillo::meta_adapter::WELCOME_REF_TYPE.into(),
+		..Default::default()
+	};
+	fx.app
+		.meta_adapter
+		.create_ref(tn, "zqref-susp-welcome", &welcome)
+		.await
+		.unwrap();
+	let set = |code: Option<&str>| {
+		let code = code.map(|c| format!(r#","code":"{c}""#)).unwrap_or_default();
+		let body =
+			format!(r#"{{"refId":"zqref-susp-welcome","newPassword":"zqm-new-0000"{code}}}"#);
+		post("/api/auth/set-password", body)
+	};
+	let new_login =
+		|| post("/api/auth/login", format!(r#"{{"idTag":"{susp}","password":"zqm-new-0000"}}"#));
+	let (st, b) = set(None).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "set-password without code: {b}");
+	let kept = fx
+		.app
+		.meta_adapter
+		.validate_ref("zqref-susp-welcome", &[cloudillo::meta_adapter::WELCOME_REF_TYPE])
+		.await;
+	assert!(kept.is_ok(), "set-password without code burned the ref");
+	let (st, b) = new_login().await;
+	assert_eq!(status_class(st), Actual::Deny, "password changed without code: {st} {b}");
+	let (st, b) = set(Some(wrong)).await;
+	assert_eq!(status_class(st), Actual::Deny, "set-password with wrong code: {st} {b}");
+	let next = totp::code_at_time(&secret, now + 30).unwrap();
+	let (st, b) = set(Some(&next)).await;
+	assert!(find_str(&b, "token").is_some(), "set-password with code: {st} {b}");
+
+	// Per-token cap: 5 wrong codes spend the token (410); there is no per-account lockout (the
+	// per-IP ban caps guessing), so a fresh token still takes a correct code.
+	fx.app.auth_adapter.clear_totp(tn).await.unwrap();
+	fx.app.auth_adapter.enroll_totp(tn, &secret, 0).await.unwrap();
+	let new_step = || async {
+		let (st, b) = new_login().await;
+		find_str(&b, "mfaToken").unwrap_or_else(|| panic!("MFA step: {st} {b}"))
+	};
+	let tok = new_step().await;
+	// The token lives through 4 wrong codes; the 5th spends it (410)
+	for i in 1..=5 {
+		let (st, b) = mfa_code(tok.clone(), wrong.into()).await;
+		let want = if i < 5 { 403 } else { 410 };
+		assert_eq!(st.as_u16(), want, "wrong MFA code #{i}: {st} {b}");
+	}
+	let (st, b) = mfa_code(tok, wrong.into()).await;
+	assert_eq!(st.as_u16(), 410, "spent MFA token reused: {st} {b}");
+	let code = totp::code_at_time(&secret, Timestamp::now().0).unwrap();
+	let (st, b) = mfa_code(new_step().await, code).await;
+	assert!(find_str(&b, "token").is_some(), "correct code after a spent token: {st} {b}");
+
+	// SADM reset: the new password alone logs in again.
+	let (st, b) = admin(Method::POST, "/mfa-reset", "").await;
+	assert!(st.is_success(), "mfa-reset: {st} {b}");
+	let body = format!(r#"{{"idTag":"{susp}","password":"zqm-new-0000"}}"#);
+	let (st, b) = post("/api/auth/login", body).await;
+	assert!(find_str(&b, "token").is_some(), "login after reset: {st} {b}");
+}
+
+/// An admin-gated setting changed at tenant level is audited as `admin.settings.change` with
+/// `level: tenant` and the tenant's id; the value is never logged.
+#[tokio::test]
+async fn admin_tenant_setting_change_is_audited() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let sadm = fx.subject("owner-sadm@admin");
+	let uri = "/api/settings/audit.tenant_categories?level=tenant";
+	let (st, b) = send(fx, sadm, Method::PUT, uri, r#"{"value":[]}"#).await;
+	assert!(st.is_success(), "PUT audit.tenant_categories: {st} {b}");
+
+	let tn = fx.app.auth_adapter.read_tn_id(ADMIN).await.unwrap();
+	let q = cloudillo::auth_adapter::AuditQuery {
+		tn_id: Some(tn),
+		event_prefix: Some("admin.settings.change".into()),
+		..Default::default()
+	};
+	let rows = fx.app.auth_adapter.list_audit_events(&q).await.unwrap();
+	let row = rows
+		.iter()
+		.find(|r| r.event.details.as_ref().is_some_and(|d| d["key"] == "audit.tenant_categories"))
+		.unwrap_or_else(|| panic!("no admin.settings.change row: {rows:?}"));
+	let details = row.event.details.as_ref().unwrap();
+	assert_eq!(details["level"], "tenant");
+	assert!(details.get("value").is_none(), "value logged: {details}");
+	assert!(row.event.ip.is_some(), "no IP on admin.settings.change: {row:?}");
+}
+
+/// The tenant's own audit list shows admin rows without the admin's IP; its own rows keep theirs.
+#[tokio::test]
+async fn tenant_audit_hides_admin_ip() {
+	use cloudillo::auth_adapter::{AuditCategory, AuditEvent};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let tn = fx.app.auth_adapter.read_tn_id(ALICE).await.unwrap();
+	for (category, event) in [
+		(AuditCategory::Admin, "admin.zqm-hide-ip"),
+		(AuditCategory::Auth, "auth.zqm-hide-ip"),
+	] {
+		let mut ev = AuditEvent::new(category, event, "success");
+		ev.tn_id = Some(tn);
+		ev.actor = Some(ADMIN.into());
+		ev.ip = Some("203.0.113.7".into());
+		fx.app.auth_adapter.append_audit_event(&ev).await.unwrap();
+	}
+	let owner = fx.subject("owner@alice");
+	let (st, b) = send(fx, owner, Method::GET, "/api/auth/audit?limit=100", "").await;
+	assert!(st.is_success(), "GET /api/auth/audit: {st} {b}");
+	let events = b["data"]["events"].as_array().unwrap();
+	let row = |event: &str| {
+		events
+			.iter()
+			.find(|r| r["event"] == event)
+			.unwrap_or_else(|| panic!("no {event} row: {b}"))
+	};
+	let admin = row("admin.zqm-hide-ip");
+	assert_eq!(admin["actor"], ADMIN, "admin row lost its actor: {admin}");
+	assert!(admin["ip"].is_null(), "admin IP shown to the tenant: {admin}");
+	assert_eq!(row("auth.zqm-hide-ip")["ip"], "203.0.113.7");
+}
+
+/// `POST /api/auth/totp/enroll` needs the account password: a session alone cannot link an
+/// authenticator.
+#[tokio::test]
+async fn totp_enroll_needs_password() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let host = "zqm-enroll.test";
+	crate::fixture::tenant(&fx.app, host, None).await;
+	let shared = cloudillo::types::SHARED_TN;
+	let v = SettingValue::String("optional".into());
+	fx.app.settings.set(shared, "auth.mfa", v, &["SADM"]).await.unwrap();
+
+	let body = format!(r#"{{"idTag":"{host}","password":"{PASSWORD}"}}"#);
+	let r = req(host, Method::POST, "/api/auth/login", None, Body::from(body));
+	let (st, b) = call(&fx.api, r).await;
+	let token = find_str(&b, "token").unwrap_or_else(|| panic!("login: {st} {b}"));
+	let enroll = |pw: &str| {
+		let body = Body::from(format!(r#"{{"password":"{pw}"}}"#));
+		call(&fx.api, req(host, Method::POST, "/api/auth/totp/enroll", Some(&token), body))
+	};
+	let (wrong, wb) = enroll("zqm-wrong-0000").await;
+	let (right, rb) = enroll(PASSWORD).await;
+	fx.app.settings.delete(shared, "auth.mfa").await.unwrap();
+
+	assert_eq!(status_class(wrong), Actual::Deny, "enroll with a wrong password: {wrong} {wb}");
+	assert!(right.is_success(), "enroll with the password: {right} {rb}");
+}
+
+/// A share link's subject id is its bearer secret: the `sharing.share.*` audit rows of its
+/// create, update and delete carry the share id, never the link id.
+#[tokio::test]
+async fn link_share_audit_omits_secret() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let owner = fx.subject("owner@alice");
+	let tn = fx.app.auth_adapter.read_tn_id(ALICE).await.unwrap();
+	let cats = SettingValue::Json(serde_json::json!(["sharing"]));
+	fx.app
+		.settings
+		.set(tn, "audit.tenant_categories", cats, &["SADM"])
+		.await
+		.unwrap();
+
+	let body = r#"{"fileTp":"CRDT","contentType":"cloudillo/quillo","fileName":"zqm-link"}"#;
+	let (st, b) = send(fx, owner, Method::POST, "/api/files", body).await;
+	let file_id = find_str(&b, "fileId").unwrap_or_else(|| panic!("create file: {st} {b}"));
+	let link = "zqm-link-secret-0001";
+	let uri = format!("/api/files/{file_id}/shares");
+	let body = format!(r#"{{"subjectType":"L","subjectId":"{link}","permission":"R"}}"#);
+	let (st, b) = send(fx, owner, Method::POST, &uri, &body).await;
+	assert!(st.is_success(), "create link share: {st} {b}");
+	let share = &b["data"]["id"];
+	let uri = format!("/api/files/{file_id}/shares/{share}");
+	let (st, b) = send(fx, owner, Method::PATCH, &uri, r#"{"permission":"W"}"#).await;
+	assert!(st.is_success(), "update link share: {st} {b}");
+	let (st, b) = send(fx, owner, Method::DELETE, &uri, "").await;
+	assert!(st.is_success(), "delete link share: {st} {b}");
+	fx.app.settings.delete(tn, "audit.tenant_categories").await.unwrap();
+
+	let q = cloudillo::auth_adapter::AuditQuery {
+		tn_id: Some(tn),
+		event_prefix: Some("sharing.share.".into()),
+		..Default::default()
+	};
+	let rows = fx.app.auth_adapter.list_audit_events(&q).await.unwrap();
+	let ours: Vec<_> = rows
+		.iter()
+		.filter(|r| r.event.details.as_ref().is_some_and(|d| d["shareId"] == *share))
+		.collect();
+	assert_eq!(ours.len(), 3, "create, update and delete rows: {rows:?}");
+	for r in ours {
+		let d = r.event.details.as_ref().unwrap();
+		assert!(!d.to_string().contains(link), "link id in {}: {d}", r.event.event);
 	}
 }
 

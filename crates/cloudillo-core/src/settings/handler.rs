@@ -1,15 +1,16 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Settings management handlers
 
 use axum::{
 	Json,
-	extract::{Path, Query, State},
+	extract::{ConnectInfo, Path, Query, State},
 	http::StatusCode,
 	response::{IntoResponse, Response},
 };
 use serde::Deserialize;
+use std::net::SocketAddr;
 
 use crate::{
 	extract::{Auth, OptionalRequestId},
@@ -17,7 +18,7 @@ use crate::{
 	settings::types::{PermissionLevel, SettingScope, SettingValue},
 };
 use cloudillo_types::{
-	auth_adapter::AuthCtx,
+	auth_adapter::{AuditCategory, AuthCtx},
 	types::{ApiResponse, SHARED_TN},
 	utils::normalize_id_tag,
 };
@@ -270,6 +271,7 @@ pub struct UpdateSettingRequest {
 pub async fn update_setting(
 	State(app): State<App>,
 	Auth(auth): Auth,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Path(name): Path<String>,
 	Query(query): Query<SettingScopeQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -323,6 +325,8 @@ pub async fn update_setting(
 
 	// Update the setting using the service
 	app.settings.set(target_tn_id, &name, req.value.clone(), &auth.roles).await?;
+	let (scope, permission) = (definition.scope, definition.permission);
+	audit_setting_change(&app, &auth, &addr, &name, target_tn_id, scope, permission).await;
 
 	info!(
 		"User {} updated setting {} for tn_id={} (level={})",
@@ -348,6 +352,29 @@ pub async fn update_setting(
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// Record `admin.settings.change` for a server-wide setting change, or an admin-gated
+/// setting changed for one tenant. The value is never logged.
+async fn audit_setting_change(
+	app: &App,
+	auth: &AuthCtx,
+	addr: &SocketAddr,
+	name: &str,
+	target_tn_id: TnId,
+	scope: SettingScope,
+	permission: PermissionLevel,
+) {
+	let (tn_id, level) = if target_tn_id == SHARED_TN || scope == SettingScope::Global {
+		(None, "global")
+	} else if permission == PermissionLevel::Admin {
+		(Some(target_tn_id), "tenant")
+	} else {
+		return;
+	};
+	let details = Some(serde_json::json!({ "key": name, "level": level }));
+	let (cat, event, actor) = (AuditCategory::Admin, "admin.settings.change", Some(&*auth.id_tag));
+	crate::audit::record_event(app, cat, event, "success", tn_id, actor, addr, details).await;
+}
+
 /// DELETE /settings/:name - Clear a setting at the given level.
 /// Used by the UI's "Reset to default" affordance for tenant overrides.
 ///
@@ -357,6 +384,7 @@ pub async fn update_setting(
 pub async fn delete_setting(
 	State(app): State<App>,
 	Auth(auth): Auth,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Path(name): Path<String>,
 	Query(query): Query<SettingScopeQuery>,
 ) -> ClResult<StatusCode> {
@@ -398,6 +426,8 @@ pub async fn delete_setting(
 	};
 
 	app.settings.clear(target_tn_id, &name, &auth.roles).await?;
+	let (scope, permission) = (definition.scope, definition.permission);
+	audit_setting_change(&app, &auth, &addr, &name, target_tn_id, scope, permission).await;
 
 	info!("User {} cleared setting {} at tn_id={}", auth.id_tag, name, target_tn_id.0);
 

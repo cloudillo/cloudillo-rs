@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! QR-code login: scan a QR on the login page with a phone that already
 //! has an active session to approve the desktop login.
@@ -373,6 +373,7 @@ pub struct RespondRequest {
 
 pub async fn post_respond(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(session_id): Path<String>,
@@ -421,13 +422,28 @@ pub async fn post_respond(
 		let auth_login = app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag).await?;
 		let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
 
-		// Re-acquire lock to update session — return error if session vanished or already responded
-		let mut entry = store.sessions.get_mut(&session_id).ok_or(Error::NotFound)?;
-		if entry.status != QrLoginStatus::Pending {
-			return Err(Error::ValidationError("Session already responded".into()));
+		// Re-acquire lock to update session — return error if session vanished or already
+		// responded. The guard drops before the audit write's `.await`.
+		{
+			let mut entry = store.sessions.get_mut(&session_id).ok_or(Error::NotFound)?;
+			if entry.status != QrLoginStatus::Pending {
+				return Err(Error::ValidationError("Session already responded".into()));
+			}
+			entry.login_data = Some(login_data);
+			entry.status = QrLoginStatus::Approved;
 		}
-		entry.login_data = Some(login_data);
-		entry.status = QrLoginStatus::Approved;
+		// Only once the session holds the login. `addr` is the approving phone's; the
+		// desktop's IP is not known here.
+		crate::audit::record_auth(
+			&app,
+			"auth.login",
+			"success",
+			Some(auth.tn_id),
+			&auth.id_tag,
+			&addr,
+			Some(serde_json::json!({ "method": "qr" })),
+		)
+		.await;
 	} else {
 		let mut entry = store.sessions.get_mut(&session_id).ok_or(Error::NotFound)?;
 		// Re-check under the re-acquired lock, like the approve branch: a concurrent

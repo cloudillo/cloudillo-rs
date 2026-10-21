@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! API Key management endpoints
 
 use axum::{
 	Json,
-	extract::{Path, State},
+	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
+use std::net::SocketAddr;
+
+use crate::audit::record_auth;
 
 use cloudillo_core::Auth;
 use cloudillo_core::extract::OptionalRequestId;
@@ -91,6 +94,7 @@ pub struct UpdateApiKeyReq {
 /// POST /api/auth/api-keys - Create a new API key
 pub async fn create_api_key(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<CreateApiKeyReq>,
@@ -104,6 +108,19 @@ pub async fn create_api_key(
 	};
 
 	let created = app.auth_adapter.create_api_key(auth.tn_id, opts).await?;
+	record_auth(
+		&app,
+		"auth.apikey.create",
+		"success",
+		Some(auth.tn_id),
+		&auth.id_tag,
+		&addr,
+		Some(serde_json::json!({
+			"keyId": created.info.key_id,
+			"keyPrefix": &*created.info.key_prefix,
+		})),
+	)
+	.await;
 
 	let response_data = CreateApiKeyRes {
 		key_id: created.info.key_id,
@@ -185,6 +202,7 @@ pub async fn update_api_key(
 /// DELETE /api/auth/api-keys/{key_id} - Delete an API key
 pub async fn delete_api_key(
 	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	Path(key_id): Path<i64>,
 	OptionalRequestId(req_id): OptionalRequestId,
@@ -192,6 +210,16 @@ pub async fn delete_api_key(
 	info!("Deleting API key {} for tenant {}", key_id, auth.id_tag);
 
 	app.auth_adapter.delete_api_key(auth.tn_id, key_id).await?;
+	record_auth(
+		&app,
+		"auth.apikey.delete",
+		"success",
+		Some(auth.tn_id),
+		&auth.id_tag,
+		&addr,
+		Some(serde_json::json!({ "keyId": key_id })),
+	)
+	.await;
 
 	info!("Deleted API key {} for tenant {}", key_id, auth.id_tag);
 

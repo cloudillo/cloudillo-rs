@@ -27,6 +27,7 @@ hyper = "1.12"
 hyper-rustls = "0.27"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2"] }
 instant-acme = "0.8"
+ipnet = "2"
 itertools = "0.15"
 lru = "0.19"
 parking_lot = "0.12"

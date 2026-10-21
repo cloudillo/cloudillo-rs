@@ -40,6 +40,17 @@ Sent when an admin initiates a password reset for a user.
 - `instance_name` - Name of the instance
 - `expire_hours` - Hours until the reset link expires
 
+### MFA Enrolled (`mfa_enrolled.{html,txt}.hbs`)
+
+Sent when a login forces two-factor enrollment, so the owner learns about an authenticator
+linked with the password alone.
+
+**Variables:**
+- `identity_tag` - User's display name
+- `idTag` - User's id_tag
+- `instance_name` - Name of the instance
+- `ip` - IP address the enrollment came from
+
 ## Creating New Templates
 
 1. Create both `.html.hbs` and `.txt.hbs` files

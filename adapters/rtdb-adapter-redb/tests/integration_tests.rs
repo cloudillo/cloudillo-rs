@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 #![allow(clippy::panic, clippy::expect_used)]
 
@@ -1912,4 +1912,48 @@ async fn subtree_scope_is_the_default_and_still_matches_descendants() {
 		}
 		other => panic!("expected Create, got {other:?}"),
 	}
+}
+
+#[tokio::test]
+async fn test_snapshot_round_trip_and_tables() {
+	let (adapter, temp) = create_test_adapter(true).await;
+	let mut tx = adapter.transaction(TnId(1), "snap_db").await.expect("transaction");
+	let id = tx.create("notes", json!({"text": "kept"})).await.expect("create");
+	tx.commit().await.expect("commit");
+
+	let dest = TempDir::new().expect("dest dir");
+	adapter.snapshot(dest.path()).await.expect("snapshot");
+
+	let config = AdapterConfig {
+		max_instances: 10,
+		idle_timeout_secs: 300,
+		broadcast_capacity: 100,
+		auto_evict: false,
+	};
+	let restored = RtdbAdapterRedb::new(PathBuf::from(dest.path()), true, config)
+		.await
+		.expect("restored adapter");
+	let doc = restored.get(TnId(1), "snap_db", &format!("notes/{id}")).await.expect("get");
+	assert_eq!(doc.expect("document in the snapshot")["text"], "kept");
+
+	// Table drift: a table added to the store must be added to `snapshot()` too.
+	drop((adapter, restored));
+	for entry in std::fs::read_dir(dest.path()).expect("read dest") {
+		let name = entry.expect("dest entry").file_name();
+		assert_eq!(
+			table_names(&dest.path().join(&name)),
+			table_names(&temp.path().join(&name)),
+			"{name:?}"
+		);
+	}
+}
+
+fn table_names(path: &std::path::Path) -> Vec<String> {
+	use redb::{ReadableDatabase, TableHandle};
+	let db = redb::Database::open(path).expect("open redb file");
+	let rtx = db.begin_read().expect("read transaction");
+	let mut names: Vec<String> =
+		rtx.list_tables().expect("list tables").map(|t| t.name().to_string()).collect();
+	names.sort();
+	names
 }

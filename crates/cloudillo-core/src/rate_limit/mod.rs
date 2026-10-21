@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Rate Limiting System
 //!
@@ -20,7 +20,7 @@ pub use api::{
 };
 pub use config::{PowConfig, RateLimitConfig, RateLimitTierConfig};
 pub use error::{PowError, RateLimitError};
-pub use extractors::{AddressKey, extract_client_ip};
+pub use extractors::{AddressKey, ProxiedPeer, extract_client_ip, rewrite_client_ip};
 pub use limiter::RateLimitManager;
 pub use middleware::RateLimitLayer;
 

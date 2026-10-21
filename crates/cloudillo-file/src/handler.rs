@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 use axum::{
 	Json,
@@ -11,7 +11,7 @@ use axum::{
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{fmt::Debug, path::Path, pin::Pin};
+use std::{fmt::Debug, net::SocketAddr, path::Path, pin::Pin};
 
 use crate::prelude::*;
 use crate::{
@@ -32,7 +32,7 @@ use cloudillo_core::abac::{self, relationship_level};
 use cloudillo_core::dir_cache::{DirCache, DirEntry};
 use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
 use cloudillo_core::file_access;
-use cloudillo_types::auth_adapter::AuthCtx;
+use cloudillo_types::auth_adapter::{AuditCategory, AuthCtx};
 use cloudillo_types::blob_adapter;
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter;
@@ -788,6 +788,8 @@ pub struct GetFileVariantSelector {
 
 pub async fn get_file_variant_file_id(
 	State(app): State<App>,
+	extract::ConnectInfo(addr): extract::ConnectInfo<SocketAddr>,
+	OptionalAuth(maybe_auth): OptionalAuth,
 	tn_id: TnId,
 	extract::Query(selector): extract::Query<GetFileVariantSelector>,
 	Extension(ResolvedEntry(entry)): Extension<ResolvedEntry>,
@@ -824,6 +826,22 @@ pub async fn get_file_variant_file_id(
 	} else {
 		None
 	};
+
+	// One row per open, not per media seek: seeks past byte 0 are not recorded. An anonymous
+	// share-link token carries the owner's id_tag, so it is recorded with no actor.
+	if needs_descriptor {
+		let actor = maybe_auth.as_ref().filter(|a| !a.anonymous).map(|a| &*a.id_tag);
+		crate::share::record_audit(
+			&app,
+			AuditCategory::Access,
+			"access.file.read",
+			tn_id,
+			actor,
+			&addr,
+			json!({ "fileId": file_id, "entryId": entry.entry_id, "variant": variant.variant }),
+		)
+		.await;
+	}
 
 	let blob = blob_adapter::BlobRef::variant(tn_id, variant);
 	respond_variant(&app, blob, variant, descriptor.as_deref(), range, app.opts.disable_cache).await

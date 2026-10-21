@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Address Key Extractors
 //!
@@ -106,39 +106,71 @@ impl AddressKey {
 	}
 }
 
+/// Real client address read from an inbound PROXY protocol header (`MODE=stream-proxy` with
+/// `PROXY_PROTOCOL` listing the trusted proxy IPs/CIDRs), set per connection by the listener's
+/// acceptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProxiedPeer(pub SocketAddr);
+
 /// Extract client IP from request based on ServerMode
 ///
-/// - Standalone mode: Use peer IP directly from ConnectInfo
-/// - Proxy/StreamProxy mode: Check forwarding headers first
+/// - Standalone / StreamProxy: the peer IP from `ConnectInfo` (in StreamProxy already
+///   replaced by the PROXY protocol address, see [`rewrite_client_ip`])
+/// - Proxy: forwarding headers first
 ///
 /// # Security: forwarding-header trust model
 ///
 /// Client-supplied forwarding headers (`X-Forwarded-For`, `X-Real-IP`,
-/// `Forwarded`) are **only** trusted in [`ServerMode::Proxy`] /
-/// [`ServerMode::StreamProxy`]. In the default [`ServerMode::Standalone`]
-/// deployment (direct-to-internet, see `server/src/main.rs`), they are ignored
-/// entirely and the kernel-reported peer IP is used, so a client cannot spoof
-/// its address to evade IP-based rate limiting or bans.
+/// `Forwarded`) are **only** trusted in [`ServerMode::Proxy`]. In
+/// [`ServerMode::Standalone`] (direct-to-internet, see `server/src/main.rs`) and in
+/// [`ServerMode::StreamProxy`] (a TCP proxy that never sees HTTP, so it cannot strip
+/// them) they are ignored entirely, so a client cannot spoof its address to evade
+/// IP-based rate limiting or bans.
 ///
-/// The Proxy modes trust these headers because the IP is taken from them. They
-/// are therefore **only safe behind a trusted reverse proxy that strips any
-/// client-supplied forwarding headers and sets its own** — otherwise a client
-/// could forge an arbitrary client IP. Do not enable a Proxy mode while exposed
-/// directly to the internet.
+/// Proxy mode is therefore **only safe behind a trusted reverse proxy that strips any
+/// client-supplied forwarding headers and sets its own** — otherwise a client could forge
+/// an arbitrary client IP. Do not enable it while exposed directly to the internet.
 pub fn extract_client_ip<B>(req: &Request<B>, mode: &ServerMode) -> Option<IpAddr> {
+	let peer = || req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0.ip());
 	match mode {
-		ServerMode::Standalone => {
-			// Direct connection - use peer IP. Forwarding headers are NOT
-			// consulted here, so they cannot be spoofed by the client.
-			req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0.ip())
-		}
-		ServerMode::Proxy | ServerMode::StreamProxy => {
+		// Forwarding headers are NOT consulted, so they cannot be spoofed by the client.
+		ServerMode::Standalone | ServerMode::StreamProxy => peer(),
+		ServerMode::Proxy => {
 			// Behind reverse proxy - check headers first. Only safe when the
 			// proxy strips client-supplied forwarding headers (see fn docs).
 			extract_from_xff(req)
 				.or_else(|| extract_from_x_real_ip(req))
 				.or_else(|| extract_from_forwarded(req))
-				.or_else(|| req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0.ip()))
+				.or_else(peer)
+		}
+	}
+}
+
+/// Replace the request's `ConnectInfo` peer with the real client in the proxy modes.
+///
+/// Behind a proxy the socket peer is the proxy, so audit rows, emails and IP penalties
+/// would all name (and ban) the proxy. Run once on every request, ahead of routing, so
+/// every `ConnectInfo` consumer sees the client.
+///
+/// - Proxy: the forwarding headers, same trust model as [`extract_client_ip`]; the peer
+///   port is kept.
+/// - StreamProxy: the [`ProxiedPeer`] from the PROXY protocol header, when the listener
+///   reads one; otherwise the socket peer stays. Headers are never read.
+pub fn rewrite_client_ip<B>(req: &mut Request<B>, mode: &ServerMode) {
+	match mode {
+		ServerMode::Standalone => {}
+		ServerMode::StreamProxy => {
+			if let Some(ProxiedPeer(addr)) = req.extensions().get::<ProxiedPeer>().copied() {
+				req.extensions_mut().insert(ConnectInfo(addr));
+			}
+		}
+		ServerMode::Proxy => {
+			let Some(peer) = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0)
+			else {
+				return;
+			};
+			let ip = extract_client_ip(req, mode).unwrap_or(peer.ip());
+			req.extensions_mut().insert(ConnectInfo(SocketAddr::new(ip, peer.port())));
 		}
 	}
 }
@@ -232,6 +264,51 @@ mod tests {
 		// IPv6 individual falls back to subnet
 		assert_eq!(AddressKey::from_ip_individual(&ipv6).level_name(), "ipv6_subnet");
 		assert_eq!(AddressKey::from_ip_network(&ipv6).level_name(), "ipv6_subnet");
+	}
+
+	fn proxied_request() -> Request<()> {
+		let mut req = Request::builder()
+			.header("x-forwarded-for", "203.0.113.7")
+			.body(())
+			.unwrap_or_default();
+		req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+		req
+	}
+
+	fn peer_of(req: &Request<()>) -> Option<SocketAddr> {
+		req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0)
+	}
+
+	#[test]
+	fn rewrite_client_ip_uses_forwarded_ip_only_behind_proxy() {
+		let mut req = proxied_request();
+		rewrite_client_ip(&mut req, &ServerMode::Proxy);
+		assert_eq!(peer_of(&req), Some(SocketAddr::from(([203, 0, 113, 7], 1))));
+
+		let mut req = proxied_request();
+		rewrite_client_ip(&mut req, &ServerMode::Standalone);
+		assert_eq!(peer_of(&req), Some(SocketAddr::from(([127, 0, 0, 1], 1))));
+	}
+
+	#[test]
+	fn stream_proxy_ignores_spoofed_headers() {
+		let mut req = proxied_request();
+		assert_eq!(
+			extract_client_ip(&req, &ServerMode::StreamProxy),
+			Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+		);
+		rewrite_client_ip(&mut req, &ServerMode::StreamProxy);
+		assert_eq!(peer_of(&req), Some(SocketAddr::from(([127, 0, 0, 1], 1))));
+	}
+
+	#[test]
+	fn stream_proxy_uses_proxied_peer() {
+		let mut req = proxied_request();
+		let real = SocketAddr::from(([198, 51, 100, 4], 5555));
+		req.extensions_mut().insert(ProxiedPeer(real));
+		rewrite_client_ip(&mut req, &ServerMode::StreamProxy);
+		assert_eq!(peer_of(&req), Some(real));
+		assert_eq!(extract_client_ip(&req, &ServerMode::StreamProxy), Some(real.ip()));
 	}
 }
 

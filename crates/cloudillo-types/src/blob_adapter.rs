@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Adapter that manages and stores blobs (immutable file data)
 use async_trait::async_trait;
@@ -159,6 +159,16 @@ pub trait BlobAdapter: Debug + Send + Sync {
 	/// are invisible to `list_blobs`. Returns the number of files removed.
 	/// Adapters with no notion of tmp files may return `Ok(0)`.
 	async fn cleanup_tmp_files(&self, tn_id: TnId, cutoff_secs: i64) -> ClResult<u64>;
+
+	/// Write a consistent online copy of this store into the existing directory `dest`.
+	/// Mirrors the store layout, skipping in-progress uploads. Blobs are immutable, so a
+	/// file already present at the same relative path under `prev` (an earlier snapshot)
+	/// is hard-linked from there.
+	async fn snapshot(
+		&self,
+		dest: &std::path::Path,
+		prev: Option<&std::path::Path>,
+	) -> ClResult<crate::snapshot::SnapshotPart>;
 }
 
 // vim: ts=4

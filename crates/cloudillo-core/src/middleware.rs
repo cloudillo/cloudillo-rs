@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Custom middlewares
 
@@ -253,6 +253,9 @@ async fn authenticate(
 				);
 				return Err(Error::PermissionDenied);
 			}
+			if api_key_refused_by_mfa(&state, &validation).await? {
+				return Err(Error::PermissionDenied);
+			}
 
 			AuthCtx {
 				tn_id: validation.tn_id,
@@ -323,6 +326,28 @@ async fn authenticate(
 	req.extensions_mut().insert(Auth(claims));
 
 	Ok(next.run(req).await)
+}
+
+/// An unscoped tenant API key (a full-owner login token minted without a second factor) is
+/// refused when the account has TOTP enrolled, or under `auth.mfa=required`. Scoped keys, DAV
+/// app passwords included, stay usable. A read error propagates, so this fails closed.
+pub async fn api_key_refused_by_mfa(
+	app: &App,
+	validation: &cloudillo_types::auth_adapter::ApiKeyValidation,
+) -> ClResult<bool> {
+	if validation.scopes.is_some() {
+		return Ok(false);
+	}
+	let refused = app.auth_adapter.get_totp(validation.tn_id).await?.is_some()
+		|| app.settings.get_string(cloudillo_types::types::SHARED_TN, "auth.mfa").await?
+			== "required";
+	if refused {
+		warn!(
+			key_id = validation.key_id,
+			"Unscoped API key refused: auth.mfa=required or TOTP enrolled"
+		);
+	}
+	Ok(refused)
 }
 
 pub async fn require_auth(
@@ -436,12 +461,15 @@ pub async fn optional_auth(
 					match get_api_key_type(token) {
 						Some(ApiKeyType::Tenant) => {
 							// Validate tenant API key (cl_ prefix)
-							state.auth_adapter.validate_api_key(token).await.map(|validation| {
+							async {
+								let validation = state.auth_adapter.validate_api_key(token).await?;
 								// Verify API key belongs to requested tenant
-								if validation.tn_id != tn_id {
-									return Err(Error::PermissionDenied);
+								if validation.tn_id != tn_id
+									|| api_key_refused_by_mfa(&state, &validation).await?
+								{
+									return Ok(Err(Error::PermissionDenied));
 								}
-								Ok(AuthCtx {
+								Ok(Ok(AuthCtx {
 									tn_id: validation.tn_id,
 									id_tag: validation.id_tag,
 									roles: validation
@@ -452,8 +480,9 @@ pub async fn optional_auth(
 									anonymous: false,
 									hat: None,
 									exp: None,
-								})
-							})
+								}))
+							}
+							.await
 						}
 						Some(ApiKeyType::Idp) => {
 							// Validate IDP API key (idp_ prefix)

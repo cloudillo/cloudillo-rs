@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Curated layers: literal hand-picked rows, each with a stable case id, and their runner.
 //! Names are short case names; [`subject`] and [`target`] map them to fixture names. The
@@ -1148,6 +1148,8 @@ pub const SE: &[Row] = &[
 const ADMIN_TENANTS: Route = Call("GET", "/api/admin/tenants", "");
 const ADMIN_PROXY: Route = Call("GET", "/api/admin/proxy-sites", "");
 const SET_USER: Route = Call("PUT", "/api/settings/file.sync_max_vis", r#"{"value":"md"}"#);
+const SET_SHORTCUTS: Route =
+	Call("PUT", "/api/settings/ui.single_key_shortcuts", r#"{"value":false}"#);
 const PROF_SETTINGS: Route = Call("GET", "/api/profiles/m-contributor.test/settings", "");
 const PROF_SETTING_PUT: Route =
 	Call("PUT", "/api/profiles/m-contributor.test/settings/zqm.k", r#"{"value":1}"#);
@@ -1268,6 +1270,17 @@ pub const MG: &[Row] = &[
 		"stranger@alice",
 		"",
 		Call("DELETE", "/api/settings/file.sync_max_vis?level=tenant", ""),
+		"Deny",
+	),
+	// A tenant/User key: the account sets it, a stranger does not.
+	("MG-529", "owner@alice", "", SET_SHORTCUTS, "Allow"),
+	("MG-530", "stranger@alice", "", SET_SHORTCUTS, "Deny"),
+	// Admin-level although tenant-scoped: `access` auditing costs the whole node.
+	(
+		"MG-525",
+		"owner@alice",
+		"",
+		Call("PUT", "/api/settings/audit.tenant_categories", r#"{"value":["sharing"]}"#),
 		"Deny",
 	),
 	// A member's own settings: the member itself (or SADM), not the community's leaders.
@@ -1525,13 +1538,7 @@ pub const MG: &[Row] = &[
 		"Allow",
 	),
 	// The raw global row of a Global-scoped key, and any global listing, are SADM's.
-	(
-		"MG-232",
-		"owner@alice",
-		"",
-		Get("/api/settings/server.registration_enabled?level=global"),
-		"Deny",
-	),
+	("MG-232", "owner@alice", "", Get("/api/settings/backup.keep?level=global"), "Deny"),
 	("MG-233", "owner@alice", "", Get("/api/settings?prefix=file&level=global"), "Deny"),
 	// Clearing a row needs the key's write level: Admin is SADM's, System nobody's.
 	(
@@ -2051,6 +2058,69 @@ pub const MG: &[Row] = &[
 	("MG-493", "owner@alice", "", Fields("/api/me/full", &["x.zqmbad"]), "Leak:x.zqmbad"),
 	("MG-494", "m_supporter@club", "", Fields("/api/me/full", &["x.zqmrole"]), "Leak:x.zqmrole"),
 	("MG-495", "m_follower@club", "", Fields("/api/me/full", &["x.zqmrole"]), "Clean"),
+	// Audit and TOTP: the account reads its own; SADM reads all through the admin routes;
+	// a community leader is not the account (MG-496..506 deny the rest).
+	("MG-507", "owner@alice", "", Get("/api/auth/audit"), "Allow"),
+	("MG-508", "m_leader@club", "", Get("/api/auth/audit"), "Deny"),
+	("MG-509", "owner-sadm@admin", "", Get("/api/auth/audit"), "Allow"),
+	("MG-510", "owner-sadm@admin", "", Get("/api/admin/audit"), "Allow"),
+	("MG-511", "owner-sadm@admin", "", Get("/api/admin/audit.csv"), "Allow"),
+	// `{}` is refused, not read as "clear the expiry".
+	("MG-526", "owner-sadm@admin", "", Call("PATCH", "/api/admin/tenants/trash.test", "{}"), "400"),
+	// The self-lockout guards match the canonical tenant, not the path's spelling. Were they
+	// to pass, these would suspend / expire the fixture's own SADM.
+	(
+		"MG-527",
+		"owner-sadm@admin",
+		"",
+		Call("POST", "/api/admin/tenants/ADMIN.TEST/suspend", "{}"),
+		"400",
+	),
+	(
+		"MG-528",
+		"owner-sadm@admin",
+		"",
+		Call("PATCH", "/api/admin/tenants/ADMIN.TEST", r#"{"expiresAt":4102444800}"#),
+		"400",
+	),
+	// SADM visiting alice passes `require_tenant_self` but is not the account.
+	("MG-531", "sadm-visit@alice", "", Get("/api/auth/totp"), "Deny"),
+	(
+		"MG-532",
+		"sadm-visit@alice",
+		"",
+		Call("POST", "/api/auth/totp/enroll", r#"{"password":"zqm"}"#),
+		"Deny",
+	),
+	(
+		"MG-533",
+		"sadm-visit@alice",
+		"",
+		Call("POST", "/api/auth/totp/confirm", r#"{"code":"123456"}"#),
+		"Deny",
+	),
+	(
+		"MG-534",
+		"sadm-visit@alice",
+		"",
+		Call("DELETE", "/api/auth/totp", r#"{"code":"123456"}"#),
+		"Deny",
+	),
+	("MG-535", "sadm-visit@alice", "", Get("/api/auth/audit"), "Deny"),
+	// POST Allow starts a real run: covered by the `admin_backup_run` scenario test.
+	("MG-518", "owner-sadm@admin", "", Get("/api/admin/backup"), "Allow"),
+	("MG-512", "owner@alice", "", Get("/api/auth/totp"), "Allow"),
+	("MG-513", "m_leader@club", "", Get("/api/auth/totp"), "Deny"),
+	// `auth.mfa` is off in the fixture: enrollment is refused even to the account.
+	(
+		"MG-514",
+		"owner@alice",
+		"",
+		Call("POST", "/api/auth/totp/enroll", r#"{"password":"zqm"}"#),
+		"Deny",
+	),
+	// An unknown MFA token is gone (410), not forbidden: the client goes back to the password.
+	("MG-515", "anon@alice", "", Call("POST", "/api/auth/login/mfa", MFA_BOGUS), "410"),
 	// A mount names a document of the community's own: another tenant's id is not found
 	// (scoped `read_file`, `cloudillo-site/src/handler.rs:494`).
 	(
@@ -2131,6 +2201,7 @@ const SHARE_U: &str = r#"{"subjectType":"U","subjectId":"zqm-l.test","permission
 const POST_ZQM: Route = Call("POST", "/api/actions", r#"{"type":"POST","content":"zqm"}"#);
 const REF_REGISTER: Route = Call("POST", "/api/refs", r#"{"type":"register"}"#);
 const FORMAT_HELD_DEL: Route = Call("DELETE", "/api/doc-formats/zqm%2Fheld", "");
+const MFA_BOGUS: &str = r#"{"mfaToken":"zqm-bogus","code":"123456"}"#;
 const ME_FULL: Route = Fields("/api/me/full", &["x.zqmconn"]);
 
 /// `/api/admin/*` routes beyond the two listings, each refused to every [`ADMIN_DENIED`]
@@ -2148,6 +2219,14 @@ const ADMIN_ROUTES: &[(&str, Route)] = &[
 	("MG-222", Call("DELETE", "/api/admin/proxy-sites/1", "")),
 	("MG-223", Call("POST", "/api/admin/proxy-sites/1/renew-cert", "{}")),
 	("MG-224", Call("POST", "/api/admin/invite-community", "{}")),
+	("MG-496", Get("/api/admin/audit")),
+	("MG-497", Get("/api/admin/audit.csv")),
+	("MG-498", Call("POST", "/api/admin/tenants/trash.test/mfa-reset", "{}")),
+	("MG-499", Call("POST", "/api/admin/tenants/trash.test/suspend", "{}")),
+	("MG-500", Call("POST", "/api/admin/tenants/trash.test/resume", "{}")),
+	("MG-501", Call("PATCH", "/api/admin/tenants/trash.test", r#"{"expiresAt":null}"#)),
+	("MG-516", Get("/api/admin/backup")),
+	("MG-517", Call("POST", "/api/admin/backup", "{}")),
 ];
 
 /// Every credential short of SADM's unscoped session: SADM itself is scoped down last.
@@ -2177,13 +2256,22 @@ const OWNER_CRED_ROUTES: &[(&str, Route)] = &[
 	("MG-319", Call("POST", "/api/auth/wa/reg", "{}")),
 	("MG-320", Get("/api/auth/wa/reg/challenge")),
 	("MG-391", Call("DELETE", "/api/auth/wa/reg/zqm", "")),
+	("MG-502", Get("/api/auth/totp")),
+	("MG-503", Call("POST", "/api/auth/totp/enroll", r#"{"password":"zqm"}"#)),
+	("MG-504", Call("POST", "/api/auth/totp/confirm", r#"{"code":"123456"}"#)),
+	("MG-505", Call("DELETE", "/api/auth/totp", r#"{"code":"123456"}"#)),
+	// In `session()`, gated by `is_tenant_account` inside the handler.
+	("MG-506", Get("/api/auth/audit")),
 ];
 
+/// SADM visiting alice is not here: `require_tenant_self` admits it to the key and passkey
+/// routes; only the TOTP and audit handlers refuse it (MG-531..535).
 const OWNER_CRED_DENIED: &[&str] = &[
 	"stranger@alice",
 	"sharelink-r@alice",
 	"anon@alice",
 	"idp-ident@alice",
+	"idp-mgmt@alice",
 	"follower@alice",
 	"apkg-publish@alice",
 	"apikey-dav@alice",
@@ -3066,6 +3154,19 @@ pub fn probe_cells(fx: &Fixture) -> Vec<OracleCell<'_>> {
 	out
 }
 
+/// Run with the global `auth.mfa=required` (`main::mfa_required_api_keys`): an unscoped API
+/// key is a full-owner login without a second factor and is refused; scoped keys (file, DAV)
+/// and sessions are not affected.
+pub const MFA_REQ: &[Row] = &[
+	("MF-01", "apikey-unscoped@alice", "", API_KEYS, "Deny"),
+	("MF-02", "apikey-unscoped@alice", "", ADDR_BOOKS, "Deny"),
+	("MF-03", "apikey-file@alice", "root@alice", Search, "Present"),
+	("MF-04", "apikey-dav@alice", "", ADDR_BOOKS, "Allow"),
+	("MF-05", "owner@alice", "", API_KEYS, "Allow"),
+	// club's own unscoped key: the setting is server-wide.
+	("MF-06", "apikey-unscoped@club", "", API_KEYS, "Deny"),
+];
+
 pub fn cells(rows: &[Row]) -> Vec<Cell> {
 	rows.iter()
 		.map(|&(id, subject, object, route, want)| Cell {
@@ -3318,7 +3419,7 @@ fn render(want: &str, (a, level, status): Observed) -> Result<String, String> {
 	let denied = matches!(status, 401 | 403 | 404);
 	let s = match a {
 		_ if want == "Allow*" && status != 0 && !denied => "Allow".to_owned(),
-		Actual::HarnessError(_) if want == "400" && status == 400 => return Ok("400".into()),
+		Actual::HarnessError(_) if want == status.to_string() => return Ok(want.into()),
 		Actual::HarnessError(d) => return Err(d),
 		a => format!("{a:?}"),
 	};

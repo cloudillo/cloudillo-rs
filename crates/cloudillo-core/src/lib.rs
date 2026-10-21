@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! Core infrastructure for the Cloudillo platform.
 //!
@@ -10,6 +10,8 @@
 pub mod abac;
 pub mod acme;
 pub mod app;
+pub mod audit;
+pub mod backup;
 pub mod bootstrap_types;
 pub mod bundled_apps;
 pub mod channels;
@@ -350,7 +352,9 @@ pub async fn reload_site_cache_for_tenant(
 pub fn register_settings(
 	registry: &mut settings::SettingsRegistry,
 ) -> cloudillo_types::error::ClResult<()> {
-	core_settings::register_settings(registry)
+	core_settings::register_settings(registry)?;
+	audit::register_settings(registry)?;
+	backup::register_settings(registry)
 }
 
 // vim: ts=4
