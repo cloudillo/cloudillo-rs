@@ -21,7 +21,7 @@ flume = { version = "0.12", features = ["async"] }
 futures = "0.3"
 futures-core = "0.3"
 governor = "0.10"
-hickory-resolver = "0.26"
+hickory-resolver = { version = "0.26", features = ["dnssec-ring"] }
 http-body-util = "0.1"
 hyper = "1.12"
 hyper-rustls = "0.27"

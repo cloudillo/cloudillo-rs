@@ -4,15 +4,19 @@
 //! Request client implementation
 
 use futures::TryStreamExt;
+use hickory_resolver::{TokioResolver, proto::dnssec::Proof};
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::http::StatusCode;
 use hyper::{Method, body::Body, body::Bytes};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::client::legacy::{Client, connect::HttpConnector, connect::dns::Name};
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::borrow::Cow;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::AsyncRead;
 use tokio::time::timeout;
@@ -23,10 +27,58 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on a collected response body; blobs go through `get_stream`, not `collect_body`.
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
+use crate::federation_policy::check_peer;
 use crate::prelude::*;
+use crate::settings::service::SettingsService;
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::auth_adapter::AuthAdapter;
 use cloudillo_types::validation::{id_tag_to_ascii, validate_id_tag};
+
+/// Resolver of the federation client: hickory with DNSSEC validation, built from the
+/// system configuration (`/etc/resolv.conf`). Bogus answers are refused; unsigned
+/// (insecure) zones still resolve. On unless `DISABLE_DNSSEC` is set.
+#[derive(Clone)]
+struct DnssecResolver(TokioResolver);
+
+fn build_dnssec_resolver(validate: bool) -> ClResult<TokioResolver> {
+	let mut builder = TokioResolver::builder_tokio()
+		.map_err(|e| Error::ConfigError(format!("system DNS config: {e}")))?;
+	builder.options_mut().validate = validate;
+	builder
+		.build()
+		.map_err(|e| Error::ConfigError(format!("DNSSEC resolver build: {e}")))
+}
+
+impl tower::Service<Name> for DnssecResolver {
+	type Response = std::vec::IntoIter<SocketAddr>;
+	type Error = std::io::Error;
+	type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+	fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		Poll::Ready(Ok(()))
+	}
+
+	fn call(&mut self, name: Name) -> Self::Future {
+		let resolver = self.0.clone();
+		Box::pin(async move {
+			let lookup = resolver.lookup_ip(name.as_str()).await.map_err(std::io::Error::other)?;
+			// The validator annotates rather than drops: refuse the whole answer on any bogus record.
+			if any_bogus(lookup.as_lookup().answers().iter().map(|r| r.proof)) {
+				return Err(std::io::Error::other(format!(
+					"DNSSEC validation failed for {}",
+					name.as_str()
+				)));
+			}
+			// Port 0: `HttpConnector` sets the URI's port on every address.
+			Ok(lookup.iter().map(|ip| SocketAddr::new(ip, 0)).collect::<Vec<_>>().into_iter())
+		})
+	}
+}
+
+/// Whether any record of an answer failed DNSSEC validation
+fn any_bogus(proofs: impl IntoIterator<Item = Proof>) -> bool {
+	proofs.into_iter().any(|p| p.is_bogus())
+}
 
 fn to_boxed<B>(body: B) -> BoxBody<Bytes, Error>
 where
@@ -64,29 +116,50 @@ impl<T> ConditionalResult<T> {
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Request {
 	pub auth_adapter: Arc<dyn AuthAdapter>,
-	client: Client<HttpsConnector<HttpConnector>, BoxBody<Bytes, Error>>,
+	client: Client<HttpsConnector<HttpConnector<DnssecResolver>>, BoxBody<Bytes, Error>>,
 	proxy_tokens: Arc<crate::ProxyTokenCache>,
+	/// Source of the `federation.peers` policy checked by [`Self::peer_host`].
+	settings: Arc<SettingsService>,
+}
+
+// Manual: `SettingsService` is not `Debug`.
+impl std::fmt::Debug for Request {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Request")
+			.field("auth_adapter", &self.auth_adapter)
+			.finish_non_exhaustive()
+	}
 }
 
 impl Request {
 	pub fn new(
 		auth_adapter: Arc<dyn AuthAdapter>,
 		proxy_tokens: Arc<crate::ProxyTokenCache>,
+		settings: Arc<SettingsService>,
+		dnssec: bool,
 	) -> ClResult<Self> {
+		if !dnssec {
+			warn!("DNSSEC validation disabled for federation requests");
+		}
+		let resolver = DnssecResolver(build_dnssec_resolver(dnssec)?);
+		let mut http = HttpConnector::new_with_resolver(resolver);
+		// `https_only()` below enforces the scheme; the inner connector must accept https URIs.
+		http.enforce_http(false);
 		let client = HttpsConnectorBuilder::new()
 			.with_native_roots()
 			.map_err(|_| Error::ConfigError("no native root CA certificates found".into()))?
 			.https_only()
 			.enable_http1()
-			.build();
+			.wrap_connector(http);
 
 		Ok(Request {
 			auth_adapter,
 			client: Client::builder(TokioExecutor::new()).build(client),
 			proxy_tokens,
+			settings,
 		})
 	}
 
@@ -121,6 +194,14 @@ impl Request {
 		id_tag_to_ascii(id_tag)
 	}
 
+	/// [`Self::host_for`] plus the `federation.peers` policy: every outbound federation URL is
+	/// built through here, so a peer the instance policy refuses is never contacted.
+	async fn peer_host<'a>(&self, id_tag: &'a str) -> ClResult<Cow<'a, str>> {
+		let host = Self::host_for(id_tag)?;
+		check_peer(&self.settings, self.auth_adapter.as_ref(), id_tag).await?;
+		Ok(host)
+	}
+
 	/// Collect response body with timeout, capped at [`MAX_RESPONSE_BYTES`]
 	async fn collect_body(body: hyper::body::Incoming) -> ClResult<Bytes> {
 		timeout(REQUEST_TIMEOUT, http_body_util::Limited::new(body, MAX_RESPONSE_BYTES).collect())
@@ -141,7 +222,7 @@ impl Request {
 		id_tag: &str,
 		subject: Option<&str>,
 	) -> ClResult<Box<str>> {
-		let host = Self::host_for(id_tag)?;
+		let host = self.peer_host(id_tag).await?;
 		let auth_token = self
 			.auth_adapter
 			.create_action_token(
@@ -235,7 +316,7 @@ impl Request {
 		path: &str,
 		auth: bool,
 	) -> ClResult<Bytes> {
-		let uri = format!("https://cl-o.{}/api{}", Self::host_for(id_tag)?, path);
+		let uri = format!("https://cl-o.{}/api{}", self.peer_host(id_tag).await?, path);
 		let res = if auth {
 			self.send_authed(tn_id, id_tag, |t| Self::get_request(&uri, Some(t), None))
 				.await?
@@ -264,7 +345,7 @@ impl Request {
 		path: &str,
 		auth: bool,
 	) -> ClResult<impl AsyncRead + Send + Unpin + use<>> {
-		let uri = format!("https://cl-o.{}/api{}", Self::host_for(id_tag)?, path);
+		let uri = format!("https://cl-o.{}/api{}", self.peer_host(id_tag).await?, path);
 		let res = if auth {
 			self.send_authed(tn_id, id_tag, |t| Self::get_request(&uri, Some(t), None))
 				.await?
@@ -305,7 +386,7 @@ impl Request {
 	where
 		Res: DeserializeOwned,
 	{
-		let host = Self::host_for(id_tag)?;
+		let host = self.peer_host(id_tag).await?;
 		let req = hyper::Request::builder()
 			.method(Method::GET)
 			.uri(format!("https://cl-o.{}/api{}", host, path))
@@ -336,7 +417,7 @@ impl Request {
 	where
 		Res: DeserializeOwned,
 	{
-		let uri = format!("https://cl-o.{}/api{}", Self::host_for(id_tag)?, path);
+		let uri = format!("https://cl-o.{}/api{}", self.peer_host(id_tag).await?, path);
 		let req = Self::get_request(&uri, None, etag)?;
 		Self::conditional_result(self.timed_request(req).await?).await
 	}
@@ -353,7 +434,7 @@ impl Request {
 	where
 		Res: DeserializeOwned,
 	{
-		let uri = format!("https://cl-o.{}/api{}", Self::host_for(id_tag)?, path);
+		let uri = format!("https://cl-o.{}/api{}", self.peer_host(id_tag).await?, path);
 		let res = self
 			.send_authed(tn_id, id_tag, |t| Self::get_request(&uri, Some(t), etag))
 			.await?;
@@ -393,7 +474,7 @@ impl Request {
 		Req: Serialize,
 		Res: DeserializeOwned,
 	{
-		let host = Self::host_for(id_tag)?;
+		let host = self.peer_host(id_tag).await?;
 		let json_data = serde_json::to_vec(data)?;
 		let req = hyper::Request::builder()
 			.method(Method::POST)
@@ -428,7 +509,7 @@ impl Request {
 		path: &str,
 		data: Bytes,
 	) -> ClResult<Bytes> {
-		let host = Self::host_for(id_tag)?;
+		let host = self.peer_host(id_tag).await?;
 		let req = hyper::Request::builder()
 			.method(Method::POST)
 			.uri(format!("https://cl-o.{}/api{}", host, path))
@@ -469,7 +550,7 @@ impl Request {
 		path: &str,
 		data: Bytes,
 	) -> ClResult<Bytes> {
-		let uri = format!("https://cl-o.{}/api{}", Self::host_for(id_tag)?, path);
+		let uri = format!("https://cl-o.{}/api{}", self.peer_host(id_tag).await?, path);
 		let res = self
 			.send_authed(tn_id, id_tag, |token| {
 				Ok(hyper::Request::builder()
@@ -514,6 +595,29 @@ impl Request {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn bogus_record_rejects_answer() {
+		assert!(!any_bogus([Proof::Secure, Proof::Insecure]));
+		assert!(any_bogus([Proof::Secure, Proof::Bogus]));
+		assert!(!any_bogus([]));
+	}
+
+	/// Network test: a signed zone must not come back bogus through the system's upstream
+	/// (a stub that strips RRSIGs, e.g. Docker's 127.0.0.11, would make it so).
+	/// `cargo test -p cloudillo-core -- --ignored dnssec`
+	#[tokio::test]
+	#[ignore = "needs network access"]
+	async fn dnssec_signed_zone_not_bogus() {
+		let resolver = build_dnssec_resolver(true).unwrap();
+		for name in ["isc.org.", "cloudflare.com."] {
+			let lookup = resolver.lookup_ip(name).await.unwrap();
+			let proofs: Vec<_> = lookup.as_lookup().answers().iter().map(|r| r.proof).collect();
+			eprintln!("{name}: {proofs:?}");
+			assert!(!proofs.is_empty(), "{name}: no answers");
+			assert!(proofs.iter().all(|p| !p.is_bogus()), "{name}: bogus answer");
+		}
+	}
 
 	#[test]
 	fn host_for_accepts_valid() {

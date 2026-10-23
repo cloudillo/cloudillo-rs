@@ -71,6 +71,16 @@ pub fn format_from_content_type(content_type: &str) -> Option<&str> {
 	})
 }
 
+/// Refuse an upload of `size` bytes that would take usage past the storage quota. Zero bytes
+/// (content already stored) always pass, even over quota.
+fn check_quota(tn_id: TnId, used: u64, size: u64, quota_bytes: u64) -> ClResult<()> {
+	if size > 0 && used.saturating_add(size) > quota_bytes {
+		warn!(tn_id = tn_id.0, used, size, quota_bytes, "upload refused - storage quota");
+		return Err(Error::QuotaExceeded);
+	}
+	Ok(())
+}
+
 /// Stream request body directly to a temp file (for large uploads).
 /// Hashes bytes inline so callers receive both the size and the orig blob id
 /// without re-reading the file from disk. Aborts and removes the partial file
@@ -2380,6 +2390,21 @@ pub async fn post_file_blob(
 	let max_streaming_bytes =
 		u64::try_from(max_streaming_mib).unwrap_or(100) * BYTES_PER_MIB as u64;
 
+	// Storage quota (`limits.max_storage_gb`, GiB) over the tenant's own blob store. This
+	// pre-check on the declared Content-Length (0 when chunked) is advisory; each arm below
+	// re-checks with the real size once the body is read, which is authoritative.
+	// Derived variants are not counted ahead, so usage can overshoot by their size;
+	// reserve an estimate per preset if that ever matters.
+	let max_storage_gb = app.settings.get_int(tn_id, "limits.max_storage_gb").await.unwrap_or(100);
+	let quota_bytes = u64::try_from(max_storage_gb).unwrap_or(0).saturating_mul(1 << 30);
+	let incoming = header
+		.get(axum::http::header::CONTENT_LENGTH)
+		.and_then(|v| v.to_str().ok())
+		.and_then(|v| v.parse::<u64>().ok())
+		.unwrap_or(0);
+	let used = app.meta_adapter.get_storage_usage(tn_id).await?;
+	check_quota(tn_id, used, incoming, quota_bytes)?;
+
 	let base = meta_adapter::CreateFile {
 		preset: Some(preset_name.clone().into()),
 		owner_tag: Some(auth.id_tag.clone()),
@@ -2402,6 +2427,9 @@ pub async fn post_file_blob(
 		VariantClass::Visual => {
 			let bytes = to_bytes(body, max_size_bytes).await?;
 			let orig_variant_id = hasher::hash("b", &bytes);
+			let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+			let stored = app.meta_adapter.is_variant_referenced(tn_id, &orig_variant_id).await?;
+			check_quota(tn_id, used, if stored { 0 } else { len }, quota_bytes)?;
 			info!("Content id: {} ({} bytes)", orig_variant_id, bytes.len());
 
 			// Detect if this is an SVG (check content-type or content itself)
@@ -2438,6 +2466,9 @@ pub async fn post_file_blob(
 		VariantClass::Document => {
 			let bytes = to_bytes(body, max_size_bytes).await?;
 			let orig_variant_id = hasher::hash("b", &bytes);
+			let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+			let stored = app.meta_adapter.is_variant_referenced(tn_id, &orig_variant_id).await?;
+			check_quota(tn_id, used, if stored { 0 } else { len }, quota_bytes)?;
 			info!("Content id: {} ({} bytes)", orig_variant_id, bytes.len());
 
 			let opts = meta_adapter::CreateFile { orig_variant_id: Some(orig_variant_id), ..base };
@@ -2457,6 +2488,8 @@ pub async fn post_file_blob(
 			let temp_path = temp_guard.path().to_path_buf();
 			let (total_size, orig_blob_id) =
 				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
+			let stored = app.meta_adapter.is_variant_referenced(tn_id, &orig_blob_id).await?;
+			check_quota(tn_id, used, if stored { 0 } else { total_size }, quota_bytes)?;
 			info!(
 				"Video upload streamed to {:?}, size: {} bytes, content id: {}",
 				temp_path, total_size, orig_blob_id
@@ -2516,6 +2549,8 @@ pub async fn post_file_blob(
 			let temp_path = temp_guard.path().to_path_buf();
 			let (total_size, orig_blob_id) =
 				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
+			let stored = app.meta_adapter.is_variant_referenced(tn_id, &orig_blob_id).await?;
+			check_quota(tn_id, used, if stored { 0 } else { total_size }, quota_bytes)?;
 			info!(
 				"Audio upload streamed to {:?}, size: {} bytes, content id: {}",
 				temp_path, total_size, orig_blob_id
@@ -2573,6 +2608,8 @@ pub async fn post_file_blob(
 			let temp_path = temp_guard.path().to_path_buf();
 			let (total_size, orig_blob_id) =
 				stream_body_to_file(body, &temp_path, max_streaming_bytes).await?;
+			let stored = app.meta_adapter.is_variant_referenced(tn_id, &orig_blob_id).await?;
+			check_quota(tn_id, used, if stored { 0 } else { total_size }, quota_bytes)?;
 			info!(
 				"Raw upload streamed to {:?}, size: {} bytes, content id: {}",
 				temp_path, total_size, orig_blob_id

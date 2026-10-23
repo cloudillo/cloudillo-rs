@@ -131,6 +131,11 @@ pub async fn verify_action_token(
 		helpers::check_subject_field(subject).inspect_err(|e| warn!("  rejected: {e}"))?;
 	}
 
+	// Instance federation policy (`federation.peers`), also before the key fetch: a refused
+	// peer gets no outbound request and no further processing.
+	cloudillo_core::federation_policy::check_peer(&app.settings, app.auth_adapter.as_ref(), issuer)
+		.await?;
+
 	info!("→ VERIFY: from={} key={}", issuer, key_id);
 
 	let key_cache = app.ext::<Arc<KeyFetchCache>>()?;

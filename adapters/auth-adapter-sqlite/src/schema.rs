@@ -33,7 +33,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 }
 
 // Current schema version - update this when adding new migrations
-const CURRENT_DB_VERSION: i64 = 9;
+const CURRENT_DB_VERSION: i64 = 10;
 
 /// Initialize the database schema and run migrations
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -294,6 +294,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		scopes TEXT,
 		expires_at INTEGER,
 		last_used_at INTEGER,
+		auth_time INTEGER,
 		created_at INTEGER DEFAULT (unixepoch()),
 		updated_at INTEGER DEFAULT (unixepoch()),
 		FOREIGN KEY (tn_id) REFERENCES tenants(tn_id) ON DELETE CASCADE
@@ -470,9 +471,18 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 		set_db_version(&mut tx, 9).await;
+		version = 9;
+	}
+
+	// Version 10: original login time behind an API key
+	if version == 9 {
+		sqlx::query("ALTER TABLE api_keys ADD COLUMN auth_time INTEGER")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 10).await;
 		#[allow(unused_assignments)]
 		{
-			version = 9;
+			version = 10;
 		}
 	}
 
@@ -503,6 +513,7 @@ mod tests {
 			"ALTER TABLE tenants DROP COLUMN totp_last_step",
 			"ALTER TABLE tenants DROP COLUMN suspended_at",
 			"ALTER TABLE tenants DROP COLUMN expires_at",
+			"ALTER TABLE api_keys DROP COLUMN auth_time",
 			"UPDATE vars SET value = '6' WHERE key = 'db_version'",
 		] {
 			sqlx::query(sql).execute(&db).await.unwrap();
@@ -515,6 +526,7 @@ mod tests {
 		assert_eq!(version, CURRENT_DB_VERSION.to_string());
 		for sql in [
 			"SELECT totp_secret, totp_last_step, suspended_at, expires_at FROM tenants",
+			"SELECT auth_time FROM api_keys",
 			"SELECT id, ts, tn_id, actor, event, category, ip, outcome, details FROM audit_event",
 		] {
 			sqlx::query(sql).fetch_all(&db).await.unwrap();

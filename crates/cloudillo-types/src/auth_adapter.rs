@@ -83,6 +83,18 @@ pub struct AccessToken<S> {
 	/// Hat - id_tag of the peer community whose mapped role `r` holds (hatted session).
 	pub h: Option<S>,
 	pub exp: Timestamp,
+	/// Time of the interactive login this session descends from (unix seconds). Renewals
+	/// copy it unchanged, so `auth.session_timeout` bounds the session's absolute lifetime.
+	/// Tokens issued before this claim existed lack it; read them as
+	/// `exp - ACCESS_TOKEN_EXPIRY` (see `AccessToken::auth_time_or_fallback`).
+	pub auth_time: Option<Timestamp>,
+}
+
+impl<S> AccessToken<S> {
+	/// `auth_time`, or `exp - ACCESS_TOKEN_EXPIRY` for a token minted before the claim existed.
+	pub fn auth_time_or_fallback(&self) -> Timestamp {
+		self.auth_time.unwrap_or(self.exp.add_seconds(-ACCESS_TOKEN_EXPIRY))
+	}
 }
 
 /// Represents a profile key
@@ -94,6 +106,22 @@ pub struct AuthKey {
 	#[serde(rename = "publicKey")]
 	pub public_key: Box<str>,
 	#[serde(rename = "expiresAt", serialize_with = "serialize_timestamp_iso_opt")]
+	pub expires_at: Option<Timestamp>,
+}
+
+/// A profile signing key as the owner sees it (`GET /api/auth/keys`); never public.
+///
+/// `status`: `'A'` active (signs; legacy NULL rows read as `'A'`), `'V'` verify-only
+/// (published, no longer signs), `'R'` revoked (not published).
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyInfo {
+	pub key_id: Box<str>,
+	pub status: char,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
 	pub expires_at: Option<Timestamp>,
 }
 
@@ -152,6 +180,10 @@ pub struct AuthCtx {
 	/// Expiry of the presented access token; `None` for credentials that are not one (API keys,
 	/// DAV passwords, synthetic contexts). Caps the hatted `file:` scope mint.
 	pub exp: Option<Timestamp>,
+	/// When the session behind the credential began (access token `auth_time`, or a `cl_`
+	/// key's original login). `None` for synthetic contexts; session-age checks treat that
+	/// as epoch, i.e. stale.
+	pub auth_time: Option<Timestamp>,
 }
 
 impl AuthCtx {
@@ -368,6 +400,8 @@ pub struct CreateApiKeyOptions<'a> {
 	pub name: Option<&'a str>,
 	pub scopes: Option<&'a str>,
 	pub expires_at: Option<Timestamp>,
+	/// Login time of the session that created the key, carried into sessions it mints
+	pub auth_time: Option<Timestamp>,
 }
 
 /// Result of creating an API key (includes plaintext key shown only once)
@@ -385,6 +419,9 @@ pub struct ApiKeyValidation {
 	pub key_id: i64,
 	pub scopes: Option<Box<str>>,
 	pub roles: Option<Box<str>>,
+	/// Scoped key: original login time behind it (`created_at` for keys without one).
+	/// Unscoped key: now — each use counts as a fresh login, bounded by `auth.remember_days`.
+	pub auth_time: Option<Timestamp>,
 }
 
 // Proxy site types
@@ -496,7 +533,15 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	/// — which reaches callers from a token's `sub`, a ref, or a WebAuthn challenge,
 	/// all of which can name a *foreign* tenant — must be that same tenant.
 	/// Implementations reject a mismatch.
-	async fn create_tenant_login(&self, id_tag: &str, host_id_tag: &str) -> ClResult<AuthLogin>;
+	///
+	/// `auth_time` becomes the token's `auth_time` claim: `Timestamp::now()` at an interactive
+	/// login, the presenting token's value on a renewal.
+	async fn create_tenant_login(
+		&self,
+		id_tag: &str,
+		host_id_tag: &str,
+		auth_time: Timestamp,
+	) -> ClResult<AuthLogin>;
 	async fn check_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<AuthLogin>;
 	async fn update_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<()>;
 
@@ -508,6 +553,9 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn read_cert_by_tn_id(&self, tn_id: TnId) -> ClResult<CertData>;
 	async fn read_cert_by_id_tag(&self, id_tag: &str) -> ClResult<CertData>;
 	async fn read_cert_by_domain(&self, domain: &str) -> ClResult<CertData>;
+	/// Tenant id_tag a host names (`<id_tag>`, `cl-o.<id_tag>` or a custom app domain),
+	/// without requiring a certificate. `NotFound` when no tenant matches.
+	async fn read_id_tag_by_domain(&self, domain: &str) -> ClResult<Box<str>>;
 	async fn list_all_certs(&self) -> ClResult<Vec<CertData>>;
 	async fn list_tenants_needing_cert_renewal(
 		&self,
@@ -548,6 +596,12 @@ pub trait AuthAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		expires_at: Option<Timestamp>,
 	) -> ClResult<AuthKey>;
+	/// Create a new active signing key and demote every active key to verify-only.
+	async fn rotate_profile_key(&self, tn_id: TnId) -> ClResult<AuthKey>;
+	/// Mark a key revoked. Refused (`Conflict`) if it is the only active key.
+	async fn revoke_profile_key(&self, tn_id: TnId, key_id: &str) -> ClResult<()>;
+	/// Every key of the tenant, revoked ones included, with status (owner listing).
+	async fn list_profile_keys_admin(&self, tn_id: TnId) -> ClResult<Vec<KeyInfo>>;
 	async fn create_access_token(
 		&self,
 		tn_id: TnId,
@@ -658,6 +712,7 @@ mod tests {
 			r: None,
 			h: None,
 			exp: Timestamp::now(),
+			auth_time: None,
 		};
 
 		assert_eq!(token.iss, "a@a");

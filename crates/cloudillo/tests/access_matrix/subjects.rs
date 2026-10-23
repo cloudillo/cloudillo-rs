@@ -335,6 +335,7 @@ pub async fn mint_subjects(
 		r: Some("SADM"),
 		h: None,
 		exp: Timestamp::from_now(600),
+		auth_time: None,
 	};
 	let tok = app.auth_adapter.create_access_token(t.alice.tn_id, &claims).await.unwrap();
 	let facts = SubjectFacts {
@@ -830,6 +831,7 @@ async fn hostile_subjects(
 				r: sub.map(|_| r.as_str()),
 				h: None,
 				exp,
+				auth_time: None,
 			};
 			auth.create_access_token(alice, &tok).await.unwrap().into_string()
 		}
@@ -851,6 +853,7 @@ async fn hostile_subjects(
 		r: Some(r.as_str()),
 		h: None,
 		exp: Timestamp::from_now(600),
+		auth_time: None,
 	};
 	let tok = jsonwebtoken::encode(
 		&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),

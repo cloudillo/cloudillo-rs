@@ -13,10 +13,11 @@ use cloudillo_types::{
 	auth_adapter::{
 		AccessToken, ApiKeyInfo, ApiKeyValidation, AuditEvent, AuditEventRow, AuditQuery,
 		AuthAdapter, AuthCtx, AuthKey, AuthLogin, AuthProfile, CertData, CreateApiKeyOptions,
-		CreateProxySiteData, CreateTenantData, CreatedApiKey, KeyPair, ListTenantsOptions,
+		CreateProxySiteData, CreateTenantData, CreatedApiKey, KeyInfo, KeyPair, ListTenantsOptions,
 		ProxySiteData, TenantCertRenewalRow, TenantListItem, UpdateProxySiteData, Webauthn,
 	},
 	prelude::*,
+	secret_box::{self, SecretBox},
 	snapshot::SnapshotPart,
 	worker::WorkerPool,
 };
@@ -40,6 +41,126 @@ pub struct AuthAdapterSqlite {
 	worker: Arc<WorkerPool>,
 	jwt_secret_str: String,
 	jwt_secret: DecodingKey,
+	secret_box: Arc<SecretBox>,
+}
+
+/// `(table, column)` of each secret column: the first two parts of its AAD (`secret_box::aad`)
+pub(crate) const KEY_PRIVATE_KEY: (&str, &str) = ("keys", "private_key");
+pub(crate) const VAPID_PRIVATE_KEY: (&str, &str) = ("tenants", "vapid_private_key");
+pub(crate) const TOTP_SECRET: (&str, &str) = ("tenants", "totp_secret");
+pub(crate) const CERT_KEY: (&str, &str) = ("certs", "key");
+pub(crate) const IDP_API_KEY: (&str, &str) = ("tenants", "idp_api_key");
+pub(crate) const PROXY_CERT_KEY: (&str, &str) = ("proxy_sites", "cert_key");
+pub(crate) const VAR_VALUE: (&str, &str) = ("vars", "value");
+
+/// Secret columns encrypted at rest: `(table, column, logical id expression, extra WHERE
+/// filter)`. The id is the one the column's readers bind into the AAD (`secret_box::aad`).
+#[doc(hidden)]
+pub fn secret_columns() -> [(&'static str, &'static str, &'static str, String); 7] {
+	let vars = variable::SECRET_VARS.iter().map(|v| format!("'{v}'")).collect::<Vec<_>>();
+	let vars = format!(" AND substr(key, instr(key, ':') + 1) IN ({})", vars.join(", "));
+	[
+		(KEY_PRIVATE_KEY.0, KEY_PRIVATE_KEY.1, "tn_id || ':' || key_id", String::new()),
+		(VAPID_PRIVATE_KEY.0, VAPID_PRIVATE_KEY.1, "tn_id", String::new()),
+		(TOTP_SECRET.0, TOTP_SECRET.1, "tn_id", String::new()),
+		(CERT_KEY.0, CERT_KEY.1, "tn_id", String::new()),
+		// Raw id_tag matches the writer's `normalize_id_tag`: tenants are inserted normalized
+		(IDP_API_KEY.0, IDP_API_KEY.1, "id_tag", String::new()),
+		(PROXY_CERT_KEY.0, PROXY_CERT_KEY.1, "site_id", String::new()),
+		(VAR_VALUE.0, VAR_VALUE.1, "key", vars),
+	]
+}
+
+/// `vars` key of the canary proving the configured `SECRET_KEY` is the one the data uses
+const SECRET_CANARY_KEY: &str = "0:secret_canary";
+
+/// Startup check and in-place encryption of the secret columns.
+///
+/// With a key: verify the canary (create it on the first keyed start), then encrypt every
+/// remaining plaintext secret. Without a key: refuse when the canary or any `enc1:` value exists.
+async fn init_secrets(db: &SqlitePool, sb: &SecretBox) -> ClResult<()> {
+	use sqlx::Row;
+
+	let canary_aad = variable::var_aad(SECRET_CANARY_KEY);
+	let canary: Option<String> = sqlx::query("SELECT value FROM vars WHERE key = ?1")
+		.bind(SECRET_CANARY_KEY)
+		.fetch_optional(db)
+		.await
+		.db()?
+		.map(|row| row.try_get("value"))
+		.transpose()
+		.db()?;
+
+	if !sb.is_enabled() {
+		let mut encrypted = canary.is_some();
+		for (table, col, _, filter) in secret_columns() {
+			if encrypted {
+				break;
+			}
+			encrypted = sqlx::query(sqlx::AssertSqlSafe(format!(
+				"SELECT 1 FROM {table} WHERE substr({col}, 1, 5) = 'enc1:'{filter} LIMIT 1"
+			)))
+			.fetch_optional(db)
+			.await
+			.db()?
+			.is_some();
+		}
+		if encrypted {
+			return Err(Error::ConfigError(
+				"auth database holds encrypted secrets but SECRET_KEY is not set".into(),
+			));
+		}
+		return Ok(());
+	}
+
+	let mut tx = db.begin().await.db()?;
+	match canary {
+		Some(canary) => {
+			if sb.decrypt(&canary, &canary_aad).is_err() {
+				return Err(Error::ConfigError(
+					"SECRET_KEY does not match the key the auth database was encrypted with".into(),
+				));
+			}
+		}
+		None => {
+			sqlx::query("INSERT INTO vars (key, value) VALUES (?1, ?2)")
+				.bind(SECRET_CANARY_KEY)
+				.bind(sb.encrypt("cloudillo-secret-canary", &canary_aad)?)
+				.execute(&mut *tx)
+				.await
+				.db()?;
+		}
+	}
+
+	let mut sealed = 0usize;
+	for (table, col, id, filter) in secret_columns() {
+		let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+			"SELECT rowid AS rowid, {col} AS v, CAST({id} AS TEXT) AS id FROM {table}
+			WHERE {col} IS NOT NULL AND substr({col}, 1, 5) <> 'enc1:'{filter}"
+		)))
+		.fetch_all(&mut *tx)
+		.await
+		.db()?;
+		for row in rows {
+			let rowid: i64 = row.try_get("rowid").db()?;
+			let value: String = row.try_get("v").db()?;
+			let id: String = row.try_get("id").db()?;
+			sqlx::query(sqlx::AssertSqlSafe(format!(
+				"UPDATE {table} SET {col} = ?1 WHERE rowid = ?2"
+			)))
+			.bind(sb.encrypt(&value, &secret_box::aad(table, col, &id))?)
+			.bind(rowid)
+			.execute(&mut *tx)
+			.await
+			.db()?;
+			sealed += 1;
+		}
+	}
+	tx.commit().await.db()?;
+	if sealed > 0 {
+		info!("Encrypted {sealed} plaintext secret value(s) in the auth database");
+	}
+	Ok(())
 }
 
 impl Debug for AuthAdapterSqlite {
@@ -49,7 +170,17 @@ impl Debug for AuthAdapterSqlite {
 }
 
 impl AuthAdapterSqlite {
+	/// Adapter without encryption at rest (refuses to open a database holding encrypted secrets)
 	pub async fn new(worker: Arc<WorkerPool>, path: impl AsRef<Path>) -> ClResult<Self> {
+		Self::new_with_secret_box(worker, path, Arc::new(SecretBox::disabled())).await
+	}
+
+	/// Adapter encrypting its secret columns with `secret_box` (no-op when it is disabled)
+	pub async fn new_with_secret_box(
+		worker: Arc<WorkerPool>,
+		path: impl AsRef<Path>,
+		secret_box: Arc<SecretBox>,
+	) -> ClResult<Self> {
 		let db_path = path.as_ref().join("auth.db");
 		fs::create_dir_all(&path)
 			.await
@@ -71,11 +202,14 @@ impl AuthAdapterSqlite {
 			.inspect_err(|err| println!("DbError: {:#?}", err))
 			.or(Err(Error::DbError))?;
 
+		// Must run before the JWT secret is read and cached
+		init_secrets(&db, &secret_box).await?;
+
 		// Get or generate JWT secret
-		let jwt_secret_str = auth::ensure_jwt_secret(&db).await?;
+		let jwt_secret_str = auth::ensure_jwt_secret(&db, &secret_box).await?;
 		let jwt_secret = DecodingKey::from_secret(jwt_secret_str.as_bytes());
 
-		Ok(Self { db, worker, jwt_secret_str, jwt_secret })
+		Ok(Self { db, worker, jwt_secret_str, jwt_secret, secret_box })
 	}
 }
 
@@ -122,9 +256,21 @@ impl AuthAdapter for AuthAdapterSqlite {
 		tenant::count_tenants(&self.db, opts).await
 	}
 
-	async fn create_tenant_login(&self, id_tag: &str, host_id_tag: &str) -> ClResult<AuthLogin> {
-		auth::create_tenant_login(&self.db, &self.worker, id_tag, host_id_tag, &self.jwt_secret_str)
-			.await
+	async fn create_tenant_login(
+		&self,
+		id_tag: &str,
+		host_id_tag: &str,
+		auth_time: Timestamp,
+	) -> ClResult<AuthLogin> {
+		auth::create_tenant_login(
+			&self.db,
+			&self.worker,
+			id_tag,
+			host_id_tag,
+			auth_time,
+			&self.jwt_secret_str,
+		)
+		.await
 	}
 
 	async fn check_tenant_password(&self, id_tag: &str, password: &str) -> ClResult<AuthLogin> {
@@ -137,27 +283,31 @@ impl AuthAdapter for AuthAdapterSqlite {
 	}
 
 	async fn update_idp_api_key(&self, id_tag: &str, api_key: &str) -> ClResult<()> {
-		auth::update_idp_api_key(&self.db, id_tag, api_key).await
+		auth::update_idp_api_key(&self.db, &self.secret_box, id_tag, api_key).await
 	}
 
 	async fn create_cert(&self, cert_data: &CertData) -> ClResult<()> {
-		cert::create_cert(&self.db, cert_data).await
+		cert::create_cert(&self.db, &self.secret_box, cert_data).await
 	}
 
 	async fn read_cert_by_tn_id(&self, tn_id: TnId) -> ClResult<CertData> {
-		cert::read_cert_by_tn_id(&self.db, tn_id).await
+		cert::read_cert_by_tn_id(&self.db, &self.secret_box, tn_id).await
 	}
 
 	async fn read_cert_by_id_tag(&self, id_tag: &str) -> ClResult<CertData> {
-		cert::read_cert_by_id_tag(&self.db, id_tag).await
+		cert::read_cert_by_id_tag(&self.db, &self.secret_box, id_tag).await
 	}
 
 	async fn read_cert_by_domain(&self, domain: &str) -> ClResult<CertData> {
-		cert::read_cert_by_domain(&self.db, domain).await
+		cert::read_cert_by_domain(&self.db, &self.secret_box, domain).await
+	}
+
+	async fn read_id_tag_by_domain(&self, domain: &str) -> ClResult<Box<str>> {
+		cert::read_id_tag_by_domain(&self.db, domain).await
 	}
 
 	async fn list_all_certs(&self) -> ClResult<Vec<CertData>> {
-		cert::list_all_certs(&self.db).await
+		cert::list_all_certs(&self.db, &self.secret_box).await
 	}
 
 	async fn list_tenants_needing_cert_renewal(
@@ -200,7 +350,20 @@ impl AuthAdapter for AuthAdapterSqlite {
 		tn_id: TnId,
 		expires_at: Option<Timestamp>,
 	) -> ClResult<AuthKey> {
-		profile_key::create_profile_key(&self.db, &self.worker, tn_id, expires_at).await
+		profile_key::create_profile_key(&self.db, &self.worker, &self.secret_box, tn_id, expires_at)
+			.await
+	}
+
+	async fn rotate_profile_key(&self, tn_id: TnId) -> ClResult<AuthKey> {
+		profile_key::rotate_profile_key(&self.db, &self.worker, &self.secret_box, tn_id).await
+	}
+
+	async fn revoke_profile_key(&self, tn_id: TnId, key_id: &str) -> ClResult<()> {
+		profile_key::revoke_profile_key(&self.db, tn_id, key_id).await
+	}
+
+	async fn list_profile_keys_admin(&self, tn_id: TnId) -> ClResult<Vec<KeyInfo>> {
+		profile_key::list_profile_keys_admin(&self.db, tn_id).await
 	}
 
 	async fn create_access_token(
@@ -216,11 +379,11 @@ impl AuthAdapter for AuthAdapterSqlite {
 		tn_id: TnId,
 		action: cloudillo_types::action_types::CreateAction,
 	) -> ClResult<Box<str>> {
-		auth::create_action_token(&self.db, &self.worker, tn_id, action).await
+		auth::create_action_token(&self.db, &self.worker, &self.secret_box, tn_id, action).await
 	}
 
 	async fn read_vapid_key(&self, tn_id: TnId) -> ClResult<KeyPair> {
-		vapid::read_vapid_key(&self.db, tn_id).await
+		vapid::read_vapid_key(&self.db, &self.secret_box, tn_id).await
 	}
 
 	async fn read_vapid_public_key(&self, tn_id: TnId) -> ClResult<Box<str>> {
@@ -229,20 +392,20 @@ impl AuthAdapter for AuthAdapterSqlite {
 
 	async fn create_vapid_key(&self, tn_id: TnId) -> ClResult<KeyPair> {
 		let keypair = crypto::generate_vapid_key(&self.worker).await?;
-		vapid::update_vapid_key(&self.db, tn_id, &keypair).await?;
+		vapid::update_vapid_key(&self.db, &self.secret_box, tn_id, &keypair).await?;
 		Ok(keypair)
 	}
 
 	async fn update_vapid_key(&self, tn_id: TnId, key: &KeyPair) -> ClResult<()> {
-		vapid::update_vapid_key(&self.db, tn_id, key).await
+		vapid::update_vapid_key(&self.db, &self.secret_box, tn_id, key).await
 	}
 
 	async fn read_var(&self, tn_id: TnId, var: &str) -> ClResult<Box<str>> {
-		variable::read_var(&self.db, tn_id, var).await
+		variable::read_var(&self.db, &self.secret_box, tn_id, var).await
 	}
 
 	async fn update_var(&self, tn_id: TnId, var: &str, value: &str) -> ClResult<()> {
-		variable::update_var(&self.db, tn_id, var, value).await
+		variable::update_var(&self.db, &self.secret_box, tn_id, var, value).await
 	}
 
 	async fn list_webauthn_credentials(&self, tn_id: TnId) -> ClResult<Box<[Webauthn]>> {
@@ -318,11 +481,11 @@ impl AuthAdapter for AuthAdapterSqlite {
 
 	// Proxy site management
 	async fn create_proxy_site(&self, data: &CreateProxySiteData<'_>) -> ClResult<ProxySiteData> {
-		proxy_site::create_proxy_site(&self.db, data).await
+		proxy_site::create_proxy_site(&self.db, &self.secret_box, data).await
 	}
 
 	async fn read_proxy_site(&self, site_id: i64) -> ClResult<ProxySiteData> {
-		proxy_site::read_proxy_site(&self.db, site_id).await
+		proxy_site::read_proxy_site(&self.db, &self.secret_box, site_id).await
 	}
 
 	async fn update_proxy_site(
@@ -330,7 +493,7 @@ impl AuthAdapter for AuthAdapterSqlite {
 		site_id: i64,
 		data: &UpdateProxySiteData<'_>,
 	) -> ClResult<ProxySiteData> {
-		proxy_site::update_proxy_site(&self.db, site_id, data).await
+		proxy_site::update_proxy_site(&self.db, &self.secret_box, site_id, data).await
 	}
 
 	async fn delete_proxy_site(&self, site_id: i64) -> ClResult<()> {
@@ -338,7 +501,7 @@ impl AuthAdapter for AuthAdapterSqlite {
 	}
 
 	async fn list_proxy_sites(&self) -> ClResult<Vec<ProxySiteData>> {
-		proxy_site::list_proxy_sites(&self.db).await
+		proxy_site::list_proxy_sites(&self.db, &self.secret_box).await
 	}
 
 	async fn update_proxy_site_cert(
@@ -348,23 +511,32 @@ impl AuthAdapter for AuthAdapterSqlite {
 		key: &str,
 		expires_at: Timestamp,
 	) -> ClResult<()> {
-		proxy_site::update_proxy_site_cert(&self.db, site_id, cert, key, expires_at).await
+		proxy_site::update_proxy_site_cert(
+			&self.db,
+			&self.secret_box,
+			site_id,
+			cert,
+			key,
+			expires_at,
+		)
+		.await
 	}
 
 	async fn list_proxy_sites_needing_cert_renewal(
 		&self,
 		renewal_days: u32,
 	) -> ClResult<Vec<ProxySiteData>> {
-		proxy_site::list_proxy_sites_needing_cert_renewal(&self.db, renewal_days).await
+		proxy_site::list_proxy_sites_needing_cert_renewal(&self.db, &self.secret_box, renewal_days)
+			.await
 	}
 
 	// TOTP MFA
 	async fn get_totp(&self, tn_id: TnId) -> ClResult<Option<(Box<str>, Option<i64>)>> {
-		auth::get_totp(&self.db, tn_id).await
+		auth::get_totp(&self.db, &self.secret_box, tn_id).await
 	}
 
 	async fn enroll_totp(&self, tn_id: TnId, secret: &str, step: i64) -> ClResult<bool> {
-		auth::enroll_totp(&self.db, tn_id, secret, step).await
+		auth::enroll_totp(&self.db, &self.secret_box, tn_id, secret, step).await
 	}
 
 	async fn clear_totp(&self, tn_id: TnId) -> ClResult<()> {

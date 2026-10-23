@@ -7,6 +7,7 @@ pub mod api_key;
 pub mod audit;
 pub mod cleanup;
 pub mod handler;
+pub mod keys;
 pub mod qr_login;
 pub mod settings;
 pub mod totp;

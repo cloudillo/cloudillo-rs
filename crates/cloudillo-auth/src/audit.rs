@@ -19,7 +19,7 @@ use cloudillo_core::{
 	rate_limit::{PenaltyReason, RateLimitApi},
 };
 use cloudillo_types::{
-	auth_adapter::{AuditCategory, AuditEventRow, AuditQuery},
+	auth_adapter::{AuditCategory, AuditEventRow, AuditQuery, AuthCtx},
 	types::{ApiResponse, SHARED_TN},
 };
 
@@ -95,6 +95,10 @@ pub(crate) async fn record_auth_fail(
 	addr: &SocketAddr,
 	mut details: serde_json::Value,
 ) {
+	// The alert counts every failure; the row gate below would hide most of a burst.
+	if event == "auth.login" {
+		cloudillo_core::alert::login_failed(app, tn_id, actor, &addr.ip().to_string());
+	}
 	// No store: record every row ungated rather than lose it.
 	let gate = app
 		.ext::<LoginFails>()
@@ -117,6 +121,26 @@ pub(crate) fn prune_login_fails(fails: &LoginFails) -> usize {
 		.0
 		.retain(|_, (start, n)| *n > 0 || now.duration_since(*start) < LOGIN_FAIL_WINDOW);
 	before - fails.0.len()
+}
+
+/// Re-check the session tenant's own password before a sensitive change. A failure is
+/// penalized, delayed, and recorded as a failed `event`; a same-server visitor's password fails.
+pub(crate) async fn verify_own_password(
+	app: &App,
+	addr: &SocketAddr,
+	auth: &AuthCtx,
+	password: &str,
+	event: &'static str,
+	details: serde_json::Value,
+) -> ClResult<()> {
+	let login = app.auth_adapter.check_tenant_password(&auth.id_tag, password).await;
+	if login.is_ok_and(|login| login.tn_id == auth.tn_id) {
+		return Ok(());
+	}
+	penalize(app, addr);
+	tokio::time::sleep(Duration::from_secs(1)).await;
+	record_auth_fail(app, event, Some(auth.tn_id), &auth.id_tag, addr, details).await;
+	Err(Error::PermissionDenied)
 }
 
 /// Penalize the client IP for an auth failure.

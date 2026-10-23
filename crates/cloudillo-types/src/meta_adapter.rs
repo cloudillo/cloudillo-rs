@@ -2267,6 +2267,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		public_key: &str,
 		expires_at: Option<Timestamp>,
 	) -> ClResult<()>;
+	/// Remove a cached profile public key (no-op if absent).
+	async fn delete_profile_public_key(&self, id_tag: &str, key_id: &str) -> ClResult<()>;
 	/// List stale profiles that need refreshing
 	///
 	/// Returns profiles where:
@@ -2419,6 +2421,14 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// `tn_id`-scoped `global=0` row. Used to close the race between the
 	/// referenced-set snapshot and the actual `delete_blob` call.
 	async fn is_variant_referenced(&self, tn_id: TnId, variant_id: &str) -> ClResult<bool>;
+	/// Bytes the tenant holds in its own blob store: the sizes of its distinct `global=0`
+	/// variant blobs (each blob counted once however many files share it). Checked against
+	/// `limits.max_storage_gb`. `global=1` blobs live in the shared store and are not counted.
+	async fn get_storage_usage(&self, tn_id: TnId) -> ClResult<u64>;
+	/// Entry ids of the tenant's trash roots (`parent_id = TRASH_PARENT_ID`, live status) whose
+	/// `updated_at` is strictly before `before`. Used by the trash-retention purge.
+	async fn list_trashed_entries(&self, tn_id: TnId, before: Timestamp)
+	-> ClResult<Vec<Box<str>>>;
 	async fn read_file_variant(
 		&self,
 		tn_id: TnId,
@@ -2616,6 +2626,9 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		tn_id: TnId,
 		prefix: Option<&[String]>,
 	) -> ClResult<std::collections::HashMap<String, serde_json::Value>>;
+
+	/// Every tn_id holding a row for setting `name`
+	async fn list_setting_tn_ids(&self, name: &str) -> ClResult<Vec<TnId>>;
 
 	/// Read a single setting by name
 	async fn read_setting(&self, tn_id: TnId, name: &str) -> ClResult<Option<serde_json::Value>>;

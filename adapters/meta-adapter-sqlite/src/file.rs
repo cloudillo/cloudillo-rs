@@ -794,68 +794,67 @@ pub(crate) async fn list(
 		&& let Some(cursor) = cloudillo_types::types::CursorData::decode(cursor_str)
 	{
 		// Look up the cursor row's e_id (lookup order: entry_id, then file_id, then `@<f_id>`)
-		let cursor_e_id: Option<i64> = resolve_entry(db, tn_id, &cursor.id).await?;
+		// A vanished row keeps paging from its sort value `v` with a sentinel tie-breaker (rows
+		// sharing that exact value may repeat), never a restart at page 1.
+		let cursor_e_id: i64 = resolve_entry(db, tn_id, &cursor.id).await?.unwrap_or(if is_desc {
+			i64::MAX
+		} else {
+			i64::MIN
+		});
+		// Add keyset pagination WHERE clause based on sort field
+		// For DESC: (sort_field, f_id) < (cursor_value, cursor_e_id)
+		// For ASC: (sort_field, f_id) > (cursor_value, cursor_e_id)
+		// Note: push_bind() adds bind placeholders, don't use ? in push() strings
+		let comparison = if is_desc { "<" } else { ">" };
 
-		if let Some(cursor_e_id) = cursor_e_id {
-			// Add keyset pagination WHERE clause based on sort field
-			// For DESC: (sort_field, f_id) < (cursor_value, cursor_e_id)
-			// For ASC: (sort_field, f_id) > (cursor_value, cursor_e_id)
-			// Note: push_bind() adds bind placeholders, don't use ? in push() strings
-			let comparison = if is_desc { "<" } else { ">" };
-
-			match sort_field {
-				"recent" if has_user => {
-					if let Some(ts) = cursor.timestamp() {
-						query.push(format!(
-							" AND ((fud.accessed_at IS NULL AND e.e_id {} ",
-							comparison
-						));
-						query.push_bind(cursor_e_id);
-						query.push(format!(
-							") OR (fud.accessed_at IS NOT NULL AND (fud.accessed_at, e.e_id) {} (",
-							comparison
-						));
-						query.push_bind(ts);
-						query.push(", ");
-						query.push_bind(cursor_e_id);
-						query.push(")))");
-					}
+		match sort_field {
+			"recent" if has_user => {
+				if let Some(ts) = cursor.timestamp() {
+					query
+						.push(format!(" AND ((fud.accessed_at IS NULL AND e.e_id {} ", comparison));
+					query.push_bind(cursor_e_id);
+					query.push(format!(
+						") OR (fud.accessed_at IS NOT NULL AND (fud.accessed_at, e.e_id) {} (",
+						comparison
+					));
+					query.push_bind(ts);
+					query.push(", ");
+					query.push_bind(cursor_e_id);
+					query.push(")))");
 				}
-				"modified" if has_user => {
-					if let Some(ts) = cursor.timestamp() {
-						query.push(format!(
-							" AND ((fud.modified_at IS NULL AND e.e_id {} ",
-							comparison
-						));
-						query.push_bind(cursor_e_id);
-						query.push(format!(
-							") OR (fud.modified_at IS NOT NULL AND (fud.modified_at, e.e_id) {} (",
-							comparison
-						));
-						query.push_bind(ts);
-						query.push(", ");
-						query.push_bind(cursor_e_id);
-						query.push(")))");
-					}
+			}
+			"modified" if has_user => {
+				if let Some(ts) = cursor.timestamp() {
+					query
+						.push(format!(" AND ((fud.modified_at IS NULL AND e.e_id {} ", comparison));
+					query.push_bind(cursor_e_id);
+					query.push(format!(
+						") OR (fud.modified_at IS NOT NULL AND (fud.modified_at, e.e_id) {} (",
+						comparison
+					));
+					query.push_bind(ts);
+					query.push(", ");
+					query.push_bind(cursor_e_id);
+					query.push(")))");
 				}
-				"name" => {
-					if let Some(name) = cursor.string_value() {
-						query.push(format!(" AND (e.file_name, e.e_id) {} (", comparison));
-						query.push_bind(name.to_string());
-						query.push(", ");
-						query.push_bind(cursor_e_id);
-						query.push(")");
-					}
+			}
+			"name" => {
+				if let Some(name) = cursor.string_value() {
+					query.push(format!(" AND (e.file_name, e.e_id) {} (", comparison));
+					query.push_bind(name.to_string());
+					query.push(", ");
+					query.push_bind(cursor_e_id);
+					query.push(")");
 				}
-				_ => {
-					// "created" or default
-					if let Some(ts) = cursor.timestamp() {
-						query.push(format!(" AND (e.created_at, e.e_id) {} (", comparison));
-						query.push_bind(ts);
-						query.push(", ");
-						query.push_bind(cursor_e_id);
-						query.push(")");
-					}
+			}
+			_ => {
+				// "created" or default
+				if let Some(ts) = cursor.timestamp() {
+					query.push(format!(" AND (e.created_at, e.e_id) {} (", comparison));
+					query.push_bind(ts);
+					query.push(", ");
+					query.push_bind(cursor_e_id);
+					query.push(")");
 				}
 			}
 		}
@@ -1021,6 +1020,43 @@ pub(crate) async fn list_referenced_variant_ids(
 	};
 
 	collect_res(res.iter().map(|row| row.try_get("variant_id")))
+}
+
+/// Bytes in the tenant's own blob store: each distinct `global=0` variant blob counted once
+/// (the same set `list_referenced_variant_ids` returns for a non-zero `tn_id`).
+pub(crate) async fn get_storage_usage(db: &SqlitePool, tn_id: TnId) -> ClResult<u64> {
+	let used: i64 = sqlx::query_scalar(
+		"SELECT COALESCE(SUM(size), 0) FROM (
+			SELECT MAX(size) AS size FROM file_variants
+			WHERE tn_id = ? AND COALESCE(global, 0) = 0 AND variant_id IS NOT NULL
+			GROUP BY variant_id
+		)",
+	)
+	.bind(tn_id.0)
+	.fetch_one(db)
+	.await
+	.db()?;
+	Ok(u64::try_from(used).unwrap_or(0))
+}
+
+/// Entry ids of trash roots (`parent_id = TRASH_PARENT_ID`) not touched since `before`.
+/// Tombstones (`'D'`) are already deleted and skipped.
+pub(crate) async fn list_trashed_entries(
+	db: &SqlitePool,
+	tn_id: TnId,
+	before: Timestamp,
+) -> ClResult<Vec<Box<str>>> {
+	let rows: Vec<(String,)> = sqlx::query_as(
+		"SELECT entry_id FROM entries
+		 WHERE tn_id = ? AND parent_id = ? AND status IN ('A', 'P') AND updated_at < ?",
+	)
+	.bind(tn_id.0)
+	.bind(cloudillo_types::meta_adapter::TRASH_PARENT_ID)
+	.bind(before.0)
+	.fetch_all(db)
+	.await
+	.db()?;
+	Ok(rows.into_iter().map(|(id,)| id.into()).collect())
 }
 
 /// Targeted check used by the blob GC just before a delete: is there

@@ -104,7 +104,18 @@ report it as described in [SECURITY.md](SECURITY.md).
 
 ## Proxy Mode
 
-Use proxy mode when running Cloudillo behind a reverse proxy (nginx, Traefik, Caddy, etc.) that handles TLS termination.
+Two modes put Cloudillo behind a reverse proxy. Pick by who holds the certificates.
+
+| Mode | TLS terminated by | Certificates | Client IP from |
+|------|-------------------|--------------|----------------|
+| `MODE=proxy` | the proxy | the proxy obtains them; Cloudillo runs no ACME | `X-Forwarded-For` |
+| `MODE=stream-proxy` | Cloudillo | Cloudillo (ACME), as in standalone mode | PROXY protocol header |
+
+### HTTP proxy (`MODE=proxy`)
+
+Cloudillo serves **plain HTTP** on `LISTEN`. It starts no `LISTEN_HTTP` listener and does no ACME
+work (`ACME_EMAIL` is ignored, and certificate renewal tasks left over from a standalone run are
+skipped). The proxy terminates TLS and forwards every path with the original `Host` header.
 
 ```bash
 docker run -d --name cloudillo \
@@ -112,7 +123,6 @@ docker run -d --name cloudillo \
   -p 127.0.0.1:1443:1443 \
   -e MODE=proxy \
   -e LISTEN=0.0.0.0:1443 \
-  -e LISTEN_HTTP=none \
   -e LOCAL_ADDRESS=1.2.3.4 \
   -e BASE_ID_TAG=agatha.example.com \
   -e BASE_APP_DOMAIN=agatha.example.com \
@@ -120,20 +130,51 @@ docker run -d --name cloudillo \
   cloudillo/cloudillo:latest
 ```
 
-In proxy mode, Cloudillo serves HTTP on port 1443. The image defaults to `LISTEN=0.0.0.0:443` and `LISTEN_HTTP=0.0.0.0:80`, so set both explicitly as above. Configure your reverse proxy to handle TLS and forward requests.
+The image defaults to `LISTEN=0.0.0.0:443`, so set it explicitly as above.
+
+Every tenant needs a certificate for two names: `<id_tag>` (the app) and `cl-o.<id_tag>` (the
+API). Tenants are created at runtime (registration, communities), so let the proxy obtain
+certificates on demand and ask Cloudillo first:
+
+`GET /.well-known/cloudillo/tenant?domain=<host>` answers `200` when `<host>` is `<id_tag>` or
+`cl-o.<id_tag>` of a tenant on this server, or a custom app domain that has a certificate row on
+this server (e.g. one issued in an earlier standalone run), else `404`. No auth, empty body.
 
 > **Security:** In proxy mode Cloudillo takes the client IP from the `X-Forwarded-For` header (leftmost entry) for rate limiting and bans. Never expose port 1443 directly — publish it on `127.0.0.1` only — and make sure your proxy **replaces** a client-supplied `X-Forwarded-For` instead of appending to it. nginx does with `proxy_set_header X-Forwarded-For $remote_addr;` as shown below (not `$proxy_add_x_forwarded_for`). Caddy and Traefik drop client-supplied forwarded headers by default; keep it that way: don't list untrusted networks in Caddy's `trusted_proxies` or Traefik's `forwardedHeaders.trustedIPs`, and don't set `forwardedHeaders.insecure`.
 
-### Nginx Configuration Example
+#### Caddy (on-demand TLS)
+
+```caddyfile
+{
+	email admin@example.com
+	on_demand_tls {
+		# Caddy appends ?domain=<host>; only hosts Cloudillo answers 200 for get a certificate.
+		ask http://127.0.0.1:1443/.well-known/cloudillo/tenant
+	}
+}
+
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy 127.0.0.1:1443
+}
+```
+
+Caddy keeps the `Host` header, sets `X-Forwarded-For` from the client address and proxies
+WebSockets without extra configuration.
+
+#### nginx
+
+nginx has no on-demand certificates; issue them with certbot for both names of each tenant.
 
 ```nginx
 server {
     listen 80;
     server_name agatha.example.com cl-o.agatha.example.com;
 
-    location /.well-known/ {
+    location /.well-known/acme-challenge/ {
         root /var/www/certbot;
-        autoindex off;
     }
     location / {
         return 301 https://$host$request_uri;
@@ -145,37 +186,73 @@ server {
     server_name agatha.example.com cl-o.agatha.example.com;
     ssl_certificate /etc/letsencrypt/live/agatha.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/agatha.example.com/privkey.pem;
+    client_max_body_size 100M;
 
-    location /.well-known/cloudillo/id-tag {
-        add_header 'Access-Control-Allow-Origin' '*';
-        return 200 '{"idTag":"agatha.example.com"}\n';
-    }
-    location /api/ {
-        proxy_pass http://localhost:1443;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-Host $host;
-        client_max_body_size 100M;
-    }
-    location /ws {
-        proxy_pass http://localhost:1443;
+    location / {
+        proxy_pass http://127.0.0.1:1443;
+        proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host $host;
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "Upgrade";
+        proxy_set_header Connection $connection_upgrade;
     }
-    location / {
-        # Serve the Cloudillo shell locally or proxy it
-        root /home/agatha/cloudillo/shell;
-        try_files $uri /index.html;
-        autoindex off;
-        expires 0;
+}
+
+# In the http block:
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+```
+
+### TLS passthrough (`MODE=stream-proxy`)
+
+Use this to share port 443 with other services while Cloudillo keeps its own certificates. The
+proxy routes by SNI without decrypting and passes the client address in a PROXY protocol header;
+`PROXY_PROTOCOL` lists the addresses allowed to connect (with Docker port publishing, the
+connection arrives from the bridge gateway, hence `172.16.0.0/12`).
+
+```bash
+docker run -d --name cloudillo \
+  -v /var/vol/cloudillo:/cloudillo/data \
+  -p 127.0.0.1:1443:1443 \
+  -p 127.0.0.1:1080:1080 \
+  -e MODE=stream-proxy \
+  -e PROXY_PROTOCOL=127.0.0.1,172.16.0.0/12 \
+  -e LISTEN=0.0.0.0:1443 \
+  -e LISTEN_HTTP=0.0.0.0:1080 \
+  -e ACME_EMAIL=admin@example.com \
+  -e LOCAL_ADDRESS=1.2.3.4 \
+  -e BASE_ID_TAG=agatha.example.com \
+  -e BASE_PASSWORD=YourSecretPassword \
+  cloudillo/cloudillo:latest
+```
+
+```nginx
+stream {
+    # Cloudillo's names go to Cloudillo, everything else to the existing web server.
+    map $ssl_preread_server_name $tls_backend {
+        ~(^|\.)agatha\.example\.com$  cloudillo;
+        default                        other_https;
+    }
+    upstream cloudillo   { server 127.0.0.1:1443; }
+    upstream other_https { server 127.0.0.1:8443; }
+
+    server {
+        listen 443;
+        ssl_preread on;
+        proxy_pass $tls_backend;
+        proxy_protocol on;
     }
 }
 ```
+
+`proxy_protocol on` here also reaches `other_https`; drop it there, or give that upstream its
+own `server` block, if it does not expect the header. Cloudillo answers ACME HTTP-01 challenges
+on `LISTEN_HTTP`, which takes no PROXY header: forward `/.well-known/acme-challenge/` on port 80
+for Cloudillo's names to `http://127.0.0.1:1080` with an ordinary `http` block.
 
 ## Configuration Reference
 
@@ -186,18 +263,21 @@ server {
 | `MODE` | Server mode: `standalone`, `proxy`, or `stream-proxy` | `standalone` |
 | `PROXY_PROTOCOL` | Comma-separated IPs/CIDRs of the trusted proxies, e.g. `127.0.0.1,172.16.0.0/12`: only they may connect, and each connection must carry a PROXY protocol v1/v2 header (`stream-proxy` only; nginx `proxy_protocol on;`, HAProxy `send-proxy-v2`). Without it, `stream-proxy` sees the proxy's IP — forwarding headers are never trusted in that mode | - |
 | `LISTEN` | HTTPS bind address (plain HTTP in proxy mode) | `0.0.0.0:443` in the image (`0.0.0.0:1443` outside it) |
-| `LISTEN_HTTP` | HTTP bind address for ACME challenges; `none` disables it | `0.0.0.0:80` in the image (`0.0.0.0:1080` outside it) |
+| `LISTEN_HTTP` | HTTP bind address for ACME challenges; `none` disables it; not started in proxy mode | `0.0.0.0:80` in the image (`0.0.0.0:1080` outside it) |
 | `LOCAL_ADDRESS` | Comma-separated IP addresses this node serves | - |
 | `BASE_ID_TAG` | ID tag for the initial admin user (**required**) | - |
 | `BASE_APP_DOMAIN` | App domain for the admin user | Same as `BASE_ID_TAG` |
 | `BASE_PASSWORD` | Password for the initial admin user | - |
-| `ACME_EMAIL` | Email for Let's Encrypt registration | - |
+| `ACME_EMAIL` | Email for Let's Encrypt registration; ignored in proxy mode | - |
 | `DATA_DIR` | Blob storage directory | `./data` (`/cloudillo/data` in the image) |
 | `DB_DIR` | Database directory (SQLite + redb) | `./data` (`/cloudillo/data` in the image) |
 | `BACKUP_DIR` | Backup snapshot directory (see [Backup and Restore](#backup-and-restore)) | `$DATA_DIR/backup` (`/cloudillo/data/backup` in the image) |
+| `SECRET_KEY` | Key for encryption at rest: base64 of exactly 32 bytes, e.g. `openssl rand -base64 32`. Encrypts profile signing keys, TLS and proxy-site certificate keys, TOTP secrets, the JWT secret, the ACME account, IdP API keys and secret settings (SMTP password). The first start with a key encrypts existing plaintext; a wrong key, or encrypted data without a key, refuses to start. Never generated — back it up (see [Backup and Restore](#backup-and-restore)). Unset = no encryption at rest | - |
+| `SECRET_KEY_FILE` | Path of a file holding `SECRET_KEY`, e.g. `/run/secrets/cloudillo_key`. Set only one of the two; prefer this one, as an environment variable is visible in `docker inspect` and `/proc/<pid>/environ` | - |
 | `DIST_DIR` | Frontend distribution directory | `./dist` (`/cloudillo/dist` in the image) |
 | `RUST_LOG` | Logging level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `DISABLE_CACHE` | Disable caching (set to any value to enable) | - |
+| `DISABLE_DNSSEC` | Skip DNSSEC validation of federation DNS lookups (set to any value). Needed when the resolver strips RRSIGs, e.g. Docker's embedded DNS `127.0.0.11` | - |
 
 ### Cloudillo Identity System
 
@@ -270,6 +350,11 @@ createdAt, bytes}]}`. Every run is recorded in the audit log as `admin.backup`.
 run, encrypted, e.g. with `restic backup /var/vol/cloudillo/backup` or `rsync -aH` to another
 host (`-H` keeps the blob hard links). Skip `*.partial` directories.
 
+**`SECRET_KEY`:** with a key set, snapshots hold the secrets only as ciphertext, and a restore
+needs the same key. Store the key apart from `BACKUP_DIR` and the off-site copy (a password
+manager, a secrets store), never next to them. Removing the key once data is encrypted is not
+supported.
+
 ### Restore
 
 Restore is **offline**: stop the server first. Run the image's binary with the `restore`
@@ -291,7 +376,8 @@ Usage: `cloudillo restore <snapshot-dir> [--force]`. It verifies every file agai
 Pass the same `DB_DIR`/`DATA_DIR` as the server if you changed them.
 
 **Restore drill:** once a quarter, restore the latest off-site copy into a scratch machine or
-volume and start a server on it. A backup that was never restored is not a backup.
+volume and start a server on it. A backup that was never restored is not a backup. Use the
+`SECRET_KEY` from where you store it, not from the running server: the drill proves you have it.
 
 **Suspended tenants:** suspending (or expiring) a tenant refuses new logins, API-key exchanges
 and access-token refreshes, but access tokens already issued stay valid for up to one hour.

@@ -554,32 +554,38 @@ pub(crate) async fn list(
 	if let Some(cursor_str) = &opts.cursor
 		&& let Some(cursor) = cloudillo_types::types::CursorData::decode(cursor_str)
 	{
-		// Look up internal a_id from cursor's external action_id
-		let cursor_a_id: Option<i64> =
-			match sqlx::query_scalar("SELECT a_id FROM actions WHERE tn_id=? AND action_id=?")
+		// Resolve the cursor row's a_id: `@<a_id>` for pending actions (NULL action_id),
+		// otherwise by action_id. A vanished row keeps paging from the cursor timestamp with a
+		// sentinel tie-breaker (rows sharing it may repeat), never a restart at page 1.
+		let cursor_a_id: Option<i64> = if let Some(a_id_str) = cursor.id.strip_prefix('@') {
+			match a_id_str.parse::<i64>() {
+				Ok(a_id) => sqlx::query_scalar("SELECT a_id FROM actions WHERE tn_id=? AND a_id=?")
+					.bind(tn_id.0)
+					.bind(a_id)
+					.fetch_optional(db)
+					.await
+					.db()?,
+				Err(_) => None,
+			}
+		} else {
+			sqlx::query_scalar("SELECT a_id FROM actions WHERE tn_id=? AND action_id=?")
 				.bind(tn_id.0)
 				.bind(&cursor.id)
 				.fetch_optional(db)
 				.await
-			{
-				Ok(v) => v,
-				Err(e) => {
-					warn!("cursor a_id lookup failed: {}", e);
-					None
-				}
-			};
+				.db()?
+		};
+		let cursor_a_id = cursor_a_id.unwrap_or(if is_desc { i64::MAX } else { i64::MIN });
 
-		if let Some(cursor_a_id) = cursor_a_id {
-			// Keyset pagination: (created_at, a_id) < (cursor_ts, cursor_a_id) for DESC
-			// Note: push_bind() adds bind placeholders, don't use ? in push() strings
-			let comparison = if is_desc { "<" } else { ">" };
-			if let Some(ts) = cursor.timestamp() {
-				query.push(format!(" AND ({}, a.a_id) {} (", order_col, comparison));
-				query.push_bind(ts);
-				query.push(", ");
-				query.push_bind(cursor_a_id);
-				query.push(")");
-			}
+		// Keyset pagination: (created_at, a_id) < (cursor_ts, cursor_a_id) for DESC
+		// Note: push_bind() adds bind placeholders, don't use ? in push() strings
+		let comparison = if is_desc { "<" } else { ">" };
+		if let Some(ts) = cursor.timestamp() {
+			query.push(format!(" AND ({}, a.a_id) {} (", order_col, comparison));
+			query.push_bind(ts);
+			query.push(", ");
+			query.push_bind(cursor_a_id);
+			query.push(")");
 		}
 	}
 
@@ -2638,6 +2644,69 @@ mod tests {
 			vec![500, 400, 300, 200, 100],
 			"cursor + involved + parentId paginate the CONV thread with no gaps/dupes and exclude the decoy"
 		);
+	}
+
+	// A cursor naming a vanished row pages on from its timestamp, never restarts at page 1.
+	#[tokio::test]
+	async fn stale_cursor_pages_forward() {
+		use cloudillo_types::types::CursorData;
+
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		insert_msg(&db, tn_id, "a1~m", "", "a1~c", "alice.example", "bob.example", 100).await;
+		let page = async |v: i64| {
+			let cursor = CursorData::new("created", v.into(), "a1~gone").encode();
+			let opts = ListActionOptions { cursor: Some(cursor), ..Default::default() };
+			list(&db, tn_id, &opts).await.expect("stale cursor pages on").len()
+		};
+		assert_eq!(page(101).await, 1, "older row is listed");
+		assert_eq!(page(100).await, 1, "a row sharing the timestamp may repeat");
+		assert_eq!(page(99).await, 0, "no restart at page 1");
+	}
+
+	// A pending action (NULL action_id, listed as `@<a_id>`) on a page
+	// boundary must still page forward with no duplicates.
+	#[tokio::test]
+	async fn pending_action_cursor_pages_forward() {
+		use cloudillo_types::types::CursorData;
+
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		for (i, ts) in [100, 200, 300, 400].into_iter().enumerate() {
+			let id = format!("a1~msg-{i}");
+			insert_msg(&db, tn_id, &id, "", "a1~c", "alice.example", "bob.example", ts).await;
+		}
+		// The second-newest row is pending: it lands last on page 1.
+		sqlx::query("UPDATE actions SET action_id=NULL WHERE action_id='a1~msg-2'")
+			.execute(&db)
+			.await
+			.expect("null action_id");
+
+		let mut seen: Vec<i64> = Vec::new();
+		let mut cursor: Option<String> = None;
+		for _ in 0..5 {
+			let opts =
+				ListActionOptions { limit: Some(2), cursor: cursor.take(), ..Default::default() };
+			let page = list(&db, tn_id, &opts).await.expect("page");
+			let has_more = page.len() > 2;
+			let kept: Vec<_> = page.into_iter().take(2).collect();
+			seen.extend(kept.iter().map(|a| a.created_at.0));
+			match kept.last() {
+				Some(last) if has_more => {
+					if seen.len() == 2 {
+						assert!(last.action_id.starts_with('@'), "page 1 ends on the pending row");
+					}
+					cursor = Some(
+						CursorData::new("created", last.created_at.0.into(), &last.action_id)
+							.encode(),
+					);
+				}
+				_ => break,
+			}
+		}
+		assert_eq!(seen, vec![400, 300, 200, 100]);
 	}
 
 	// A3 regression: `involved:<viewer>` (self-branch) returns every row where the

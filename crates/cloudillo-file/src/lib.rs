@@ -7,8 +7,10 @@ pub mod access;
 pub mod apkg;
 pub(crate) mod audio;
 pub(crate) mod container;
+pub mod crdt_export;
 pub mod descriptor;
 pub(crate) mod duplicate;
+pub mod export;
 pub(crate) mod ffmpeg;
 pub mod filter;
 pub mod gc;
@@ -26,6 +28,7 @@ pub(crate) mod store;
 pub(crate) mod svg;
 pub mod sync;
 pub mod tag;
+pub mod trash_purge;
 pub(crate) mod variant;
 pub(crate) mod video;
 
@@ -386,13 +389,16 @@ pub fn init(app: &App) -> ClResult<()> {
 	app.scheduler.register::<audio::AudioExtractorTask>()?;
 	app.scheduler.register::<pdf::PdfProcessorTask>()?;
 	app.scheduler.register::<gc::GcTask>()?;
+	app.scheduler.register::<trash_purge::TrashPurgeTask>()?;
+	app.scheduler.register::<export::ExportTask>()?;
 	Ok(())
 }
 
-/// Schedule recurring file-subsystem maintenance jobs (currently the file+blob GC).
+/// Schedule recurring file-subsystem maintenance jobs (file+blob GC, trash-retention purge).
 /// Call after settings have been initialized so defaults are readable.
 pub async fn schedule_recurring(app: &App) -> ClResult<()> {
 	gc::schedule(app).await?;
+	trash_purge::schedule(app).await?;
 	Ok(())
 }
 

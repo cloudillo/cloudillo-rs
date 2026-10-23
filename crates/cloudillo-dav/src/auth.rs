@@ -195,6 +195,7 @@ pub async fn dav_basic_auth(
 		anonymous: false,
 		hat: None,
 		exp: None,
+		auth_time: None,
 	};
 	req.extensions_mut().insert(Auth(ctx));
 

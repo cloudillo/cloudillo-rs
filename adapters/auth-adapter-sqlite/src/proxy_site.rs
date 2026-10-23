@@ -5,11 +5,24 @@
 
 use sqlx::{Row, SqlitePool};
 
+use crate::PROXY_CERT_KEY;
 use crate::utils::{Db, inspect, map_res};
 use cloudillo_types::{
 	auth_adapter::{CreateProxySiteData, ProxySiteConfig, ProxySiteData, UpdateProxySiteData},
 	prelude::*,
+	secret_box::{self, SecretBox},
 };
+
+fn cert_key_aad(site_id: i64) -> String {
+	secret_box::aad(PROXY_CERT_KEY.0, PROXY_CERT_KEY.1, &site_id.to_string())
+}
+
+fn open_site(sb: &SecretBox, mut site: ProxySiteData) -> ClResult<ProxySiteData> {
+	if let Some(key) = &site.cert_key {
+		site.cert_key = Some(sb.decrypt(key, &cert_key_aad(site.site_id))?.into());
+	}
+	Ok(site)
+}
 
 /// Parse a proxy site row from the database
 fn parse_proxy_site_row(row: &sqlx::sqlite::SqliteRow) -> Result<ProxySiteData, sqlx::Error> {
@@ -40,6 +53,7 @@ fn parse_proxy_site_row(row: &sqlx::sqlite::SqliteRow) -> Result<ProxySiteData, 
 /// Create a new proxy site
 pub(crate) async fn create_proxy_site(
 	db: &SqlitePool,
+	sb: &SecretBox,
 	data: &CreateProxySiteData<'_>,
 ) -> ClResult<ProxySiteData> {
 	let config_json =
@@ -67,11 +81,15 @@ pub(crate) async fn create_proxy_site(
 	})?;
 
 	let site_id = result.last_insert_rowid();
-	read_proxy_site(db, site_id).await
+	read_proxy_site(db, sb, site_id).await
 }
 
 /// Read a proxy site by ID
-pub(crate) async fn read_proxy_site(db: &SqlitePool, site_id: i64) -> ClResult<ProxySiteData> {
+pub(crate) async fn read_proxy_site(
+	db: &SqlitePool,
+	sb: &SecretBox,
+	site_id: i64,
+) -> ClResult<ProxySiteData> {
 	let res = sqlx::query(
 		"SELECT site_id, domain, backend_url, status, proxy_type, cert, cert_key, cert_expires_at,
 			config, created_by, created_at, updated_at
@@ -81,12 +99,13 @@ pub(crate) async fn read_proxy_site(db: &SqlitePool, site_id: i64) -> ClResult<P
 	.fetch_one(db)
 	.await;
 
-	map_res(res, parse_proxy_site_row)
+	open_site(sb, map_res(res, parse_proxy_site_row)?)
 }
 
 /// Update a proxy site
 pub(crate) async fn update_proxy_site(
 	db: &SqlitePool,
+	sb: &SecretBox,
 	site_id: i64,
 	data: &UpdateProxySiteData<'_>,
 ) -> ClResult<ProxySiteData> {
@@ -125,7 +144,7 @@ pub(crate) async fn update_proxy_site(
 	}
 
 	if !has_updates {
-		return read_proxy_site(db, site_id).await;
+		return read_proxy_site(db, sb, site_id).await;
 	}
 
 	query.push(" WHERE site_id=").push_bind(site_id);
@@ -134,7 +153,7 @@ pub(crate) async fn update_proxy_site(
 
 	match result {
 		Ok(r) if r.rows_affected() == 0 => Err(Error::NotFound),
-		Ok(_) => read_proxy_site(db, site_id).await,
+		Ok(_) => read_proxy_site(db, sb, site_id).await,
 		Err(e) => {
 			inspect(&e);
 			Err(Error::DbError)
@@ -160,7 +179,10 @@ pub(crate) async fn delete_proxy_site(db: &SqlitePool, site_id: i64) -> ClResult
 }
 
 /// List all proxy sites
-pub(crate) async fn list_proxy_sites(db: &SqlitePool) -> ClResult<Vec<ProxySiteData>> {
+pub(crate) async fn list_proxy_sites(
+	db: &SqlitePool,
+	sb: &SecretBox,
+) -> ClResult<Vec<ProxySiteData>> {
 	let rows = sqlx::query(
 		"SELECT site_id, domain, backend_url, status, proxy_type, cert, cert_key, cert_expires_at,
 			config, created_by, created_at, updated_at
@@ -172,7 +194,7 @@ pub(crate) async fn list_proxy_sites(db: &SqlitePool) -> ClResult<Vec<ProxySiteD
 
 	let mut sites = Vec::new();
 	for row in rows {
-		sites.push(parse_proxy_site_row(&row).db()?);
+		sites.push(open_site(sb, parse_proxy_site_row(&row).db()?)?);
 	}
 	Ok(sites)
 }
@@ -180,6 +202,7 @@ pub(crate) async fn list_proxy_sites(db: &SqlitePool) -> ClResult<Vec<ProxySiteD
 /// Update a proxy site's certificate
 pub(crate) async fn update_proxy_site_cert(
 	db: &SqlitePool,
+	sb: &SecretBox,
 	site_id: i64,
 	cert: &str,
 	key: &str,
@@ -190,7 +213,7 @@ pub(crate) async fn update_proxy_site_cert(
 		WHERE site_id = ?4",
 	)
 	.bind(cert)
-	.bind(key)
+	.bind(sb.encrypt(key, &cert_key_aad(site_id))?)
 	.bind(expires_at.0)
 	.bind(site_id)
 	.execute(db)
@@ -209,6 +232,7 @@ pub(crate) async fn update_proxy_site_cert(
 /// List proxy sites needing certificate renewal
 pub(crate) async fn list_proxy_sites_needing_cert_renewal(
 	db: &SqlitePool,
+	sb: &SecretBox,
 	renewal_days: u32,
 ) -> ClResult<Vec<ProxySiteData>> {
 	let now = Timestamp::now().0;
@@ -229,7 +253,7 @@ pub(crate) async fn list_proxy_sites_needing_cert_renewal(
 
 	let mut sites = Vec::new();
 	for row in rows {
-		sites.push(parse_proxy_site_row(&row).db()?);
+		sites.push(open_site(sb, parse_proxy_site_row(&row).db()?)?);
 	}
 	Ok(sites)
 }

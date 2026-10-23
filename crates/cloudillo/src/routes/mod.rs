@@ -162,6 +162,10 @@ fn init_app_service(app: App) -> Router {
 	// Add CORS layer only to the id-tag discovery endpoint
 	let well_known_router = Router::new()
 		.route("/.well-known/cloudillo/id-tag", get(auth::handler::get_id_tag))
+		// Not rate-limited: the caller is the TLS proxy over loopback (one IP bucket), so a limit
+		// would let random-SNI floods block real certificate asks; cost is two unique-index
+		// lookups, same as id-tag.
+		.route("/.well-known/cloudillo/tenant", get(auth::handler::get_tenant_domain))
 		// CardDAV / CalDAV discovery redirects to the API domain's /dav/principal/ — mounted
 		// here so clients probing the app domain (what users actually type) can find it.
 		.merge(tables::shared::well_known_dav())

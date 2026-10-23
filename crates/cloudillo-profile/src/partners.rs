@@ -195,9 +195,11 @@ pub(crate) async fn sync_membership(
 				.await?;
 		return Ok((modified, true));
 	};
-	let types::Profile { id_tag, name, r#type, profile_pic, keys, partners, .. } = data.data;
+	let types::Profile {
+		id_tag, name, r#type, profile_pic, keys, partners, protocol_version, ..
+	} = data.data;
 	// No etag yet: it is stored only once the edges are.
-	let base = ProfileBase { id_tag, name, r#type, profile_pic, keys };
+	let base = ProfileBase { id_tag, name, r#type, profile_pic, keys, protocol_version };
 	let base = ConditionalResult::Modified { data: base, etag: None };
 	let modified = crate::sync::apply_refresh(app, tn_id, community, Ok(base)).await?;
 

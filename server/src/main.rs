@@ -114,11 +114,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let _lock = restore::lock(&config.db_dir)?;
 	//tracing_subscriber::fmt::init();
 
+	let secret_box = Arc::new(cloudillo::app::SecretBox::from_env()?);
 	let worker = Arc::new(worker::WorkerPool::new(1, 2, 1));
+	// `?`, not unwrap: a missing or wrong SECRET_KEY must read as a clear startup error
 	let auth_adapter = Arc::new(
-		AuthAdapterSqlite::new(worker.clone(), &config.db_dir.join("auth"))
-			.await
-			.unwrap(),
+		AuthAdapterSqlite::new_with_secret_box(
+			worker.clone(),
+			&config.db_dir.join("auth"),
+			secret_box.clone(),
+		)
+		.await?,
 	);
 	let meta_adapter = Arc::new(
 		MetaAdapterSqlite::new(worker.clone(), &config.db_dir.join("meta"))
@@ -169,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.blob_adapter(blob_adapter)
 		.crdt_adapter(crdt_adapter)
 		.rtdb_adapter(rtdb_adapter)
+		.secret_box(secret_box)
 		.worker(worker);
 	if let Some(listen_http) = config.listen_http {
 		cloudillo.listen_http(listen_http);
@@ -184,6 +190,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}
 	if env::var("DISABLE_CACHE").is_ok() {
 		cloudillo.disable_cache(true);
+	}
+	if env::var("DISABLE_DNSSEC").is_ok() {
+		cloudillo.disable_dnssec(true);
 	}
 	cloudillo.run().await?;
 	Ok(())

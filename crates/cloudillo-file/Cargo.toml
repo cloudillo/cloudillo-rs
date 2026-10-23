@@ -24,6 +24,7 @@ itertools = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "fs", "sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
 
 # Image processing (heavy deps — the whole point of extraction)
 image = "0.25"

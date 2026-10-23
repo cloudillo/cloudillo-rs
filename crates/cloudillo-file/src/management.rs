@@ -33,6 +33,24 @@ pub(crate) fn invalidate_dir_cache(app: &App, tn_id: TnId, file_id: &str) {
 /// Special folder ID for trash
 const TRASH_FOLDER_ID: &str = cloudillo_types::meta_adapter::TRASH_PARENT_ID;
 
+/// Permanently delete one trash entry: the meta cascade (files, their `share.file` refs and
+/// `share_entries`), then evict every removed entry from the folder cache and search index.
+/// Shared by `delete_file?permanent`, `empty_trash` and the trash-retention purge. Blobs are
+/// left for `GcTask`.
+pub(crate) async fn purge_entry(
+	app: &App,
+	tn_id: TnId,
+	entry_id: &str,
+) -> ClResult<meta_adapter::DeleteFileResult> {
+	let purged = app.meta_adapter.delete_file(tn_id, entry_id).await?;
+	// Every entry in the subtree, root first: one index call per removed entry.
+	for id in &purged.entry_ids {
+		invalidate_dir_cache(app, tn_id, id);
+		cloudillo_core::search_index_file(app, tn_id, id);
+	}
+	Ok(purged)
+}
+
 /// PATCH /file/:fileId - Update file metadata
 /// Uses UpdateFileOptions with Patch<> fields for proper null/undefined handling
 
@@ -385,12 +403,7 @@ pub async fn delete_file(
 		// content-addressed, re-uploading identical content would resurrect the row along with any
 		// stale link or `'A'` grant still pointing at it. Soft delete deliberately keeps both, so
 		// restoring from trash keeps links and grants working.
-		let purged = app.meta_adapter.delete_file(auth.tn_id, &entry_id).await?;
-		// Every entry in the subtree, root first: one index call per removed entry.
-		for id in &purged.entry_ids {
-			invalidate_dir_cache(&app, auth.tn_id, id);
-			cloudillo_core::search_index_file(&app, auth.tn_id, id);
-		}
+		let purged = purge_entry(&app, auth.tn_id, &entry_id).await?;
 		info!(
 			"User {} permanently deleted file {} ({} rows, {} share links, {} share entries)",
 			auth.id_tag,
@@ -545,11 +558,7 @@ pub async fn empty_trash(
 		if !file_access::can_manage_lifecycle(&app, auth.tn_id, &file_ref, &ctx, level).await {
 			continue;
 		}
-		let purged = app.meta_adapter.delete_file(auth.tn_id, &file.entry_id).await?;
-		for id in &purged.entry_ids {
-			invalidate_dir_cache(&app, auth.tn_id, id);
-			cloudillo_core::search_index_file(&app, auth.tn_id, id);
-		}
+		let purged = purge_entry(&app, auth.tn_id, &file.entry_id).await?;
 		deleted_count += 1;
 		files_deleted += purged.files_deleted;
 		refs_removed += purged.refs_removed;

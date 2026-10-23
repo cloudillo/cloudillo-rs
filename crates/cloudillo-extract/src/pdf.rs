@@ -48,6 +48,7 @@ pub fn available() -> bool {
 	static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 	*AVAILABLE.get_or_init(|| {
 		Command::new("pdftotext")
+			.env_remove("SECRET_KEY")
 			.arg("-v")
 			.stdin(Stdio::null())
 			.stdout(Stdio::null())
@@ -63,6 +64,7 @@ fn prlimit_available() -> bool {
 	static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 	*AVAILABLE.get_or_init(|| {
 		let ok = Command::new("prlimit")
+			.env_remove("SECRET_KEY")
 			.arg("--version")
 			.stdin(Stdio::null())
 			.stdout(Stdio::null())
@@ -159,6 +161,7 @@ pub fn extract_text(path: &Path, max_chars: usize) -> ClResult<ExtractedText> {
 	};
 	// `stdin` must be set explicitly: unlike `output()`, `spawn()` leaves it inherited.
 	let mut child = cmd
+		.env_remove("SECRET_KEY")
 		.args(["-q", "-enc", "UTF-8"])
 		.arg(path)
 		.arg("-")

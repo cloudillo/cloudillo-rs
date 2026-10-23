@@ -31,7 +31,7 @@ use cloudillo_core::{
 use cloudillo_email::{EmailModule, EmailTaskParams, get_tenant_lang};
 use cloudillo_types::types::{ApiResponse, SHARED_TN};
 
-use crate::audit::{penalize, record_auth, record_auth_fail};
+use crate::audit::{penalize, record_auth, record_auth_fail, verify_own_password};
 use crate::prelude::*;
 
 const STEP_SECS: i64 = 30;
@@ -364,16 +364,6 @@ pub(crate) async fn notify_mfa_enrolled(app: &App, tn_id: TnId, id_tag: &str, ad
 // Owner routes: /api/auth/totp
 // ============================================================================
 
-fn require_account(auth: &cloudillo_types::auth_adapter::AuthCtx, id_tag: &str) -> ClResult<()> {
-	// SADM visiting passes `require_tenant_self` but must not enroll or drop a second factor
-	// on someone else's account.
-	if cloudillo_core::abac::is_tenant_account(auth, id_tag) {
-		Ok(())
-	} else {
-		Err(Error::PermissionDenied)
-	}
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TotpStatus {
@@ -405,7 +395,7 @@ pub async fn get_totp(
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<TotpStatus>>)> {
-	require_account(&auth, &id_tag)?;
+	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
 	let mode = mfa_mode(&app).await?;
 	let enrolled = app.auth_adapter.get_totp(auth.tn_id).await?.is_some();
 	let response =
@@ -423,24 +413,20 @@ pub async fn post_enroll(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<TotpEnrollReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<TotpEnrollRes>>)> {
-	require_account(&auth, &id_tag)?;
+	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
 	if mfa_mode(&app).await? == "off" {
 		return Err(Error::PermissionDenied);
 	}
 	// A stolen session alone must not link the thief's authenticator
-	if app
-		.auth_adapter
-		.check_tenant_password(&auth.id_tag, &req.password)
-		.await
-		.is_err()
-	{
-		penalize(&app, &addr);
-		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-		let (tn_id, actor) = (Some(auth.tn_id), &auth.id_tag);
-		record_auth_fail(&app, "auth.mfa.enroll", tn_id, actor, &addr, serde_json::Value::Null)
-			.await;
-		return Err(Error::PermissionDenied);
-	}
+	verify_own_password(
+		&app,
+		&addr,
+		&auth,
+		&req.password,
+		"auth.mfa.enroll",
+		serde_json::Value::Null,
+	)
+	.await?;
 	if app.auth_adapter.get_totp(auth.tn_id).await?.is_some() {
 		return Err(Error::Conflict("TOTP already enrolled".into()));
 	}
@@ -459,7 +445,7 @@ pub async fn post_confirm(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<TotpCodeReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<TotpStatus>>)> {
-	require_account(&auth, &id_tag)?;
+	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
 	let mode = mfa_mode(&app).await?;
 	if mode == "off" {
 		return Err(Error::PermissionDenied);
@@ -496,7 +482,7 @@ pub async fn delete_totp(
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<TotpCodeReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<TotpStatus>>)> {
-	require_account(&auth, &id_tag)?;
+	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
 	let mode = mfa_mode(&app).await?;
 	if mode == "required" {
 		return Err(Error::PermissionDenied);

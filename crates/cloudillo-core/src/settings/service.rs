@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::prelude::*;
 use cloudillo_types::meta_adapter::MetaAdapter;
+use cloudillo_types::secret_box::{self, SecretBox};
 use cloudillo_types::types::SHARED_TN;
 
 use super::types::{
@@ -23,6 +24,11 @@ const DEFAULT_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(100) {
 
 /// Max prefixes cached per `list_by_prefix` call (mirrors the sqlite adapter's `MAX_PREFIXES`)
 const MAX_LISTING_PREFIXES: usize = 20;
+
+/// Associated data of a secret setting stored at `tn_id`
+fn secret_aad(tn_id: TnId, key: &str) -> String {
+	secret_box::aad("settings", "value", &format!("{}:{key}", tn_id.0))
+}
 
 /// Synthetic cache key for the merged `list_by_prefix` listing of one prefix.
 /// `*:` can't start a registered setting key, so it never collides with a value entry.
@@ -81,6 +87,7 @@ pub struct SettingsService {
 	registry: Arc<FrozenSettingsRegistry>,
 	cache: SettingsCache,
 	meta: Arc<dyn MetaAdapter>,
+	secret_box: Arc<SecretBox>,
 }
 
 impl SettingsService {
@@ -88,8 +95,73 @@ impl SettingsService {
 		registry: Arc<FrozenSettingsRegistry>,
 		meta: Arc<dyn MetaAdapter>,
 		cache_size: usize,
+		secret_box: Arc<SecretBox>,
 	) -> Self {
-		Self { registry, cache: SettingsCache::new(cache_size), meta }
+		Self { registry, cache: SettingsCache::new(cache_size), meta, secret_box }
+	}
+
+	/// Deserialize a stored row (without decrypting)
+	fn parse(json_value: serde_json::Value) -> ClResult<SettingValue> {
+		serde_json::from_value::<SettingValue>(json_value)
+			.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))
+	}
+
+	/// Deserialize the row stored at `tn_id`, decrypting it when the setting is secret
+	fn decode(
+		&self,
+		tn_id: TnId,
+		key: &str,
+		json_value: serde_json::Value,
+	) -> ClResult<SettingValue> {
+		match Self::parse(json_value)? {
+			SettingValue::String(s) if self.registry.get(key).is_some_and(|d| d.secret) => {
+				Ok(SettingValue::String(self.secret_box.decrypt(&s, &secret_aad(tn_id, key))?))
+			}
+			value => Ok(value),
+		}
+	}
+
+	/// Startup check and in-place encryption of secret settings, at every level.
+	///
+	/// With a key: every plaintext secret row is encrypted, and an `enc1:` row that does not
+	/// decrypt (wrong key) refuses the start. Without a key: any `enc1:` row refuses the start.
+	pub async fn init_secrets(&self) -> ClResult<()> {
+		// By the rows themselves, not `list_tenants`: that skips half-filled tenant rows
+		for def in self.registry.list().filter(|d| d.secret) {
+			for tn_id in self.meta.list_setting_tn_ids(&def.key).await? {
+				self.init_secret(tn_id, &def.key).await?;
+			}
+		}
+		Ok(())
+	}
+
+	async fn init_secret(&self, tn_id: TnId, key: &str) -> ClResult<()> {
+		let Some(json_value) = self.meta.read_setting(tn_id, key).await? else {
+			return Ok(());
+		};
+		let Some(stored) = json_value.as_str() else {
+			return Ok(());
+		};
+		let aad = secret_aad(tn_id, key);
+		if secret_box::is_encrypted(stored) {
+			if !self.secret_box.is_enabled() {
+				return Err(Error::ConfigError(format!(
+					"setting '{key}' is encrypted but SECRET_KEY is not set"
+				)));
+			}
+			self.secret_box.decrypt(stored, &aad).map_err(|_| {
+				Error::ConfigError(format!(
+					"SECRET_KEY does not decrypt setting '{key}' (wrong key)"
+				))
+			})?;
+		} else if self.secret_box.is_enabled() {
+			let sealed = SettingValue::String(self.secret_box.encrypt(stored, &aad)?);
+			let sealed = serde_json::to_value(sealed)
+				.map_err(|e| Error::Internal(format!("Failed to serialize setting: {e}")))?;
+			self.meta.update_setting(tn_id, key, Some(sealed)).await?;
+			info!("Encrypted plaintext secret setting '{key}' (tenant {})", tn_id.0);
+		}
+		Ok(())
 	}
 
 	/// Get setting value with full resolution (tenant -> global -> default).
@@ -124,16 +196,14 @@ impl SettingsService {
 		if tn_id != SHARED_TN
 			&& let Some(json_value) = self.meta.read_setting(tn_id, key).await?
 		{
-			let value = serde_json::from_value::<SettingValue>(json_value)
-				.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
+			let value = self.decode(tn_id, key, json_value)?;
 			self.cache.put(tn_id, key.to_string(), value.clone());
 			return Ok(Some(value));
 		}
 
 		// Try global setting — cache under `SHARED_TN` so tenant overrides aren't masked
 		if let Some(json_value) = self.meta.read_setting(SHARED_TN, key).await? {
-			let value = serde_json::from_value::<SettingValue>(json_value)
-				.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
+			let value = self.decode(SHARED_TN, key, json_value)?;
 			self.cache.put(SHARED_TN, key.to_string(), value.clone());
 			return Ok(Some(value));
 		}
@@ -172,11 +242,7 @@ impl SettingsService {
 			.ok_or_else(|| Error::SettingNotFound(format!("Unknown setting: {}", key)))?;
 
 		match self.meta.read_setting(tn_id, key).await? {
-			Some(json_value) => {
-				let value = serde_json::from_value::<SettingValue>(json_value)
-					.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
-				Ok(Some(value))
-			}
+			Some(json_value) => Ok(Some(self.decode(tn_id, key, json_value)?)),
 			None => Ok(None),
 		}
 	}
@@ -294,14 +360,25 @@ impl SettingsService {
 			)));
 		}
 
+		// Only strings are encrypted, so a secret of any other type would be stored in clear
+		if def.secret && !matches!(value, SettingValue::String(_)) {
+			return Err(Error::ValidationError(format!("secret setting '{key}' must be a string")));
+		}
+
 		// Run custom validator if present
 		if let Some(validator) = &def.validator {
 			validator(&value)?;
 		}
 
-		// Convert to JSON and save to database
-		let json_value = serde_json::to_value(&value)
-			.map_err(|e| Error::ValidationError(format!("Failed to serialize setting: {}", e)))?;
+		// Convert to JSON (secret strings encrypted) and save to database
+		let json_value = match &value {
+			SettingValue::String(s) if def.secret => {
+				let aad = secret_aad(storage_tn_id, key);
+				serde_json::to_value(SettingValue::String(self.secret_box.encrypt(s, &aad)?))
+			}
+			value => serde_json::to_value(value),
+		}
+		.map_err(|e| Error::ValidationError(format!("Failed to serialize setting: {}", e)))?;
 		self.meta.update_setting(storage_tn_id, key, Some(json_value)).await?;
 
 		// Invalidate cached entries for this key (across all tenants), so
@@ -602,8 +679,7 @@ impl SettingsService {
 		let mut result = Vec::new();
 		for (key, json_value) in merged {
 			if let Some(definition) = self.registry.get(&key) {
-				let value = serde_json::from_value::<SettingValue>(json_value)
-					.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
+				let value = Self::parse(json_value)?;
 				result.push((key, value, definition));
 			}
 		}
@@ -611,20 +687,25 @@ impl SettingsService {
 		Ok(result)
 	}
 
-	/// Global rows merged with the tenant's own (tenant overrides global).
+	/// Global rows merged with the tenant's own (tenant overrides global). Secret rows come
+	/// back decrypted: their AAD names the level they were read from, lost by the merge.
 	async fn fetch_merged(
 		&self,
 		tn_id: TnId,
 		prefixes_dotted: &[String],
 	) -> ClResult<serde_json::Map<String, serde_json::Value>> {
-		let mut merged: serde_json::Map<String, serde_json::Value> = self
-			.meta
-			.list_settings(SHARED_TN, Some(prefixes_dotted))
-			.await?
-			.into_iter()
-			.collect();
-		if tn_id != SHARED_TN {
-			merged.extend(self.meta.list_settings(tn_id, Some(prefixes_dotted)).await?);
+		let mut merged = serde_json::Map::new();
+		let levels = if tn_id == SHARED_TN { &[SHARED_TN][..] } else { &[SHARED_TN, tn_id][..] };
+		for &level in levels {
+			for (key, json_value) in self.meta.list_settings(level, Some(prefixes_dotted)).await? {
+				let json_value = if self.registry.get(&key).is_some_and(|d| d.secret) {
+					serde_json::to_value(self.decode(level, &key, json_value)?)
+						.map_err(|e| Error::Internal(format!("Failed to serialize setting: {e}")))?
+				} else {
+					json_value
+				};
+				merged.insert(key, json_value);
+			}
 		}
 		Ok(merged)
 	}
@@ -654,8 +735,7 @@ impl SettingsService {
 		let mut result = Vec::new();
 		for (key, json_value) in rows {
 			if let Some(definition) = self.registry.get(&key) {
-				let value = serde_json::from_value::<SettingValue>(json_value)
-					.map_err(|e| Error::ValidationError(format!("Invalid setting value: {}", e)))?;
+				let value = self.decode(tn_id, &key, json_value)?;
 				result.push((key, value, definition));
 			}
 		}

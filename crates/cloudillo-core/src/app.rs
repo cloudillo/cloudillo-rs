@@ -6,7 +6,7 @@
 use rustls::sign::CertifiedKey;
 use std::{
 	collections::HashMap,
-	path::Path,
+	path::{Path, PathBuf},
 	sync::{Arc, RwLock},
 };
 
@@ -79,6 +79,25 @@ impl AppState {
 			Error::Internal(format!("Extension {} not registered", std::any::type_name::<T>()))
 		})
 	}
+
+	/// A tenant's bulk export: `{tmp_dir}/export_{tn_id}.{ext}` (`zip`, or the `json` status).
+	/// Fixed, not random, so the export task, its status and the tenant purge agree on it.
+	pub fn export_path(&self, tn_id: TnId, ext: &str) -> PathBuf {
+		self.opts.tmp_dir.join(format!("export_{}.{ext}", tn_id.0))
+	}
+
+	/// Remove a tenant's export and its status. Without the status a running export task
+	/// discards its ZIP. Failures other than `NotFound` are logged, not returned.
+	pub async fn remove_export(&self, tn_id: TnId) {
+		for ext in ["json", "zip"] {
+			let path = self.export_path(tn_id, ext);
+			if let Err(e) = tokio::fs::remove_file(&path).await
+				&& e.kind() != std::io::ErrorKind::NotFound
+			{
+				warn!(tn_id = ?tn_id, error = ?e, "removing export {:?} failed", path);
+			}
+		}
+	}
 }
 
 pub type App = Arc<AppState>;
@@ -120,6 +139,8 @@ pub struct AppBuilderOpts {
 	pub local_address: Box<[Box<str>]>,
 	/// Disable HTTP caching (for development)
 	pub disable_cache: bool,
+	/// Skip DNSSEC validation of federation lookups (resolvers that strip RRSIGs)
+	pub disable_dnssec: bool,
 }
 
 // vim: ts=4

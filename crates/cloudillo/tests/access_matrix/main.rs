@@ -3387,6 +3387,7 @@ async fn content_scope_binds_granting_entry() {
 		r: None,
 		h: None,
 		exp: Timestamp::from_now(600),
+		auth_time: None,
 	};
 	let tok = fx
 		.app
@@ -3438,6 +3439,7 @@ async fn a_content_id_scope_cannot_remint_through_via() {
 			r: None,
 			h: None,
 			exp: Timestamp::from_now(600),
+			auth_time: None,
 		};
 		let tok = fx.app.auth_adapter.create_access_token(alice, &claims).await.unwrap();
 		let tok = tok.into_string();

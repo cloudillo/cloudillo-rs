@@ -257,6 +257,18 @@ pub struct RegReq {
 pub struct LoginReq {
 	token: String,
 	response: PublicKeyCredential,
+	/// Also mint a "remember me" API key (see [`crate::api_key::mint_remember_key`])
+	#[serde(default)]
+	remember: Option<bool>,
+	device_name: Option<String>,
+}
+
+/// A passkey assertion answering a login challenge; also the re-authentication proof
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Assertion {
+	token: String,
+	response: PublicKeyCredential,
 }
 
 // ============================================================================
@@ -558,11 +570,49 @@ pub async fn post_login(
 ) -> ClResult<(StatusCode, Json<ApiResponse<super::handler::Login>>)> {
 	info!("Processing WebAuthn login");
 
-	// Credential failures are penalized like a wrong password (and audited); server-side
-	// faults are not. The closure is sync, so the audit write is spawned.
+	let (_, id_tag) =
+		verify_assertion(&app, &addr, &host_id_tag, &req.token, &req.response).await?;
+
+	// Create login session
+	let auth_login = app
+		.auth_adapter
+		.create_tenant_login(&id_tag, &host_id_tag, Timestamp::now())
+		.await?;
+	record_auth(
+		&app,
+		"auth.login",
+		"success",
+		Some(auth_login.tn_id),
+		&auth_login.id_tag,
+		&addr,
+		Some(serde_json::json!({ "method": "passkey" })),
+	)
+	.await;
+
+	// Return login response using existing pattern
+	let tn_id = auth_login.tn_id;
+	let (status, Json(mut login)) = return_login(&app, auth_login).await?;
+	if req.remember == Some(true) {
+		let name = req.device_name.as_deref();
+		login.api_key = crate::api_key::mint_remember_key(&app, &addr, tn_id, &id_tag, name).await;
+	}
+	Ok((status, Json(ApiResponse::new(login))))
+}
+
+/// Verify a passkey assertion against a login challenge minted at `host_id_tag` and spend the
+/// challenge. Returns the challenge's tenant. Credential failures are penalized like a wrong
+/// password (and audited); server-side faults are not.
+pub(crate) async fn verify_assertion(
+	app: &App,
+	addr: &SocketAddr,
+	host_id_tag: &str,
+	token: &str,
+	response: &PublicKeyCredential,
+) -> ClResult<(TnId, String)> {
+	// The closure is sync, so the audit write is spawned.
 	let penalize = || {
-		crate::audit::penalize(&app, &addr);
-		let (app, actor) = (app.clone(), host_id_tag.clone());
+		crate::audit::penalize(app, addr);
+		let (app, actor, addr) = (app.clone(), host_id_tag.to_owned(), *addr);
 		tokio::spawn(async move {
 			let tn_id = app.auth_adapter.read_tn_id(&actor).await.ok();
 			let details = serde_json::json!({ "method": "passkey" });
@@ -573,7 +623,7 @@ pub async fn post_login(
 	// Get JWT secret and decode challenge token
 	let jwt_secret = app.auth_adapter.read_var(TnId(0), "jwt_secret").await?;
 	let claims: LoginChallengeToken =
-		decode_challenge_jwt(&req.token, &jwt_secret).inspect_err(|_| penalize())?;
+		decode_challenge_jwt(token, &jwt_secret).inspect_err(|_| penalize())?;
 
 	// Check expiry
 	if claims.exp < now_secs() {
@@ -584,7 +634,7 @@ pub async fn post_login(
 
 	// The challenge is signed with the server-wide HS256 secret, so one minted at
 	// tenant A's host would otherwise be accepted at any host on this server.
-	if claims.id_tag.as_str() != host_id_tag.as_ref() {
+	if claims.id_tag.as_str() != host_id_tag {
 		warn!(challenge = %claims.id_tag, host = %host_id_tag, "Challenge tenant mismatch");
 		penalize();
 		return Err(Error::Unauthorized);
@@ -599,13 +649,11 @@ pub async fn post_login(
 	// Build webauthn and finish authentication
 	let webauthn = build_webauthn(&claims.id_tag)?;
 	let auth_result =
-		webauthn
-			.finish_passkey_authentication(&req.response, &auth_state)
-			.map_err(|e| {
-				warn!("WebAuthn finish_passkey_authentication error: {:?}", e);
-				penalize();
-				Error::PermissionDenied
-			})?;
+		webauthn.finish_passkey_authentication(response, &auth_state).map_err(|e| {
+			warn!("WebAuthn finish_passkey_authentication error: {:?}", e);
+			penalize();
+			Error::PermissionDenied
+		})?;
 
 	// Spend the challenge now that an assertion has actually been accepted; see
 	// `SPENT_CHALLENGES` for why the record is needed at all.
@@ -624,23 +672,24 @@ pub async fn post_login(
 		.await?;
 
 	info!("WebAuthn authentication successful for {}", claims.id_tag);
+	Ok((TnId(claims.tn_id), claims.id_tag))
+}
 
-	// Create login session
-	let auth_login = app.auth_adapter.create_tenant_login(&claims.id_tag, &host_id_tag).await?;
-	record_auth(
-		&app,
-		"auth.login",
-		"success",
-		Some(auth_login.tn_id),
-		&auth_login.id_tag,
-		&addr,
-		Some(serde_json::json!({ "method": "passkey" })),
-	)
-	.await;
-
-	// Return login response using existing pattern
-	let (status, json) = return_login(&app, auth_login).await?;
-	Ok((status, Json(ApiResponse::new(json.0))))
+/// Re-authentication with a fresh passkey assertion for tenant `tn_id` (see
+/// [`crate::api_key::require_reauth`]).
+pub(crate) async fn verify_reauth(
+	app: &App,
+	addr: &SocketAddr,
+	tn_id: TnId,
+	id_tag: &str,
+	assertion: &Assertion,
+) -> ClResult<()> {
+	let (asserted, _) =
+		verify_assertion(app, addr, id_tag, &assertion.token, &assertion.response).await?;
+	if asserted != tn_id {
+		return Err(Error::PermissionDenied);
+	}
+	Ok(())
 }
 
 #[cfg(test)]

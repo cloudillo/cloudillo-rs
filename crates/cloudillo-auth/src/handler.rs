@@ -11,7 +11,7 @@ use serde_json::json;
 use serde_with::skip_serializing_none;
 use std::net::SocketAddr;
 
-use crate::audit::{penalize, record_auth};
+use crate::audit::{penalize, record_auth, verify_own_password};
 use crate::totp;
 use cloudillo_core::{
 	ActionVerifyFn, Auth,
@@ -59,6 +59,9 @@ pub struct Login {
 	#[serde(rename = "profilePic")]
 	profile_pic: String,
 	settings: Vec<(String, String)>,
+	/// The "remember me" API key, when the login asked for one (`remember`)
+	#[serde(rename = "apiKey")]
+	pub(crate) api_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -77,9 +80,31 @@ pub async fn get_id_tag(
 		.host()
 		.or_else(|| req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()))
 		.unwrap_or_default();
-	let cert_data = app.auth_adapter.read_cert_by_domain(host).await?;
+	let id_tag = app.auth_adapter.read_id_tag_by_domain(host).await?;
 
-	Ok((StatusCode::OK, Json(IdTagRes { id_tag: cert_data.id_tag.to_string() })))
+	Ok((StatusCode::OK, Json(IdTagRes { id_tag: id_tag.into() })))
+}
+
+#[derive(Deserialize)]
+pub struct TenantDomainQuery {
+	domain: String,
+}
+
+/// `GET /.well-known/cloudillo/tenant?domain=<host>` — the reverse proxy's on-demand TLS
+/// `ask` hook: 200 when the host names a tenant here, else 404. No auth, empty body, so it
+/// reveals only yes/no.
+pub async fn get_tenant_domain(
+	State(app): State<App>,
+	Query(q): Query<TenantDomainQuery>,
+) -> StatusCode {
+	match app.auth_adapter.read_id_tag_by_domain(&q.domain).await {
+		Ok(_) => StatusCode::OK,
+		Err(Error::NotFound) => StatusCode::NOT_FOUND,
+		Err(e) => {
+			warn!("tenant domain check failed: {}", e);
+			StatusCode::INTERNAL_SERVER_ERROR
+		}
+	}
 }
 
 pub async fn return_login(
@@ -103,6 +128,7 @@ pub async fn return_login(
 		name,
 		profile_pic: profile_pic.unwrap_or_default(),
 		settings: vec![],
+		api_key: None,
 	};
 
 	Ok((StatusCode::OK, Json(login)))
@@ -110,10 +136,15 @@ pub async fn return_login(
 
 /// # POST /api/auth/login
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LoginReq {
-	#[serde(rename = "idTag")]
 	id_tag: String,
 	password: String,
+	/// Also mint a "remember me" API key (see [`crate::api_key::mint_remember_key`]). Skipped
+	/// (no `apiKey`) while MFA is enrolled or required: the MFA middleware refuses unscoped keys.
+	#[serde(default)]
+	remember: Option<bool>,
+	device_name: Option<String>,
 }
 
 /// Password-login result: a session, or the MFA step (see [`totp::MfaChallenge`]).
@@ -141,7 +172,7 @@ pub async fn post_login(
 				ApiResponse::new(LoginRes::Mfa(challenge)).with_req_id(req_id.unwrap_or_default());
 			return Ok((StatusCode::OK, Json(response)));
 		}
-		let (_status, Json(login_data)) = return_login(&app, auth).await?;
+		let (_status, Json(mut login_data)) = return_login(&app, auth).await?;
 		record_auth(
 			&app,
 			"auth.login",
@@ -152,6 +183,11 @@ pub async fn post_login(
 			Some(json!({ "method": "password" })),
 		)
 		.await;
+		if login.remember == Some(true) {
+			let name = login.device_name.as_deref();
+			login_data.api_key =
+				crate::api_key::mint_remember_key(&app, &addr, tn_id, &actor, name).await;
+		}
 		let response =
 			ApiResponse::new(LoginRes::Login(login_data)).with_req_id(req_id.unwrap_or_default());
 		Ok((StatusCode::OK, Json(response)))
@@ -173,6 +209,10 @@ pub async fn post_login(
 pub struct LoginMfaReq {
 	mfa_token: String,
 	code: String,
+	/// See [`LoginReq::remember`]
+	#[serde(default)]
+	remember: Option<bool>,
+	device_name: Option<String>,
 }
 
 /// Second step of a password login: trade `{mfaToken, code}` for the session `Login`.
@@ -224,8 +264,8 @@ pub async fn post_login_mfa(
 	}
 	// Host binding is trivially met: `id_tag` is the tenant whose password was just checked,
 	// the same identity `check_tenant_password` mints for.
-	let auth = app.auth_adapter.create_tenant_login(&id_tag, &id_tag).await?;
-	let (_status, Json(login_data)) = return_login(&app, auth).await?;
+	let auth = app.auth_adapter.create_tenant_login(&id_tag, &id_tag, Timestamp::now()).await?;
+	let (_status, Json(mut login_data)) = return_login(&app, auth).await?;
 	record_auth(
 		&app,
 		"auth.login",
@@ -236,8 +276,34 @@ pub async fn post_login_mfa(
 		Some(json!({ "method": "mfa" })),
 	)
 	.await;
+	if req.remember == Some(true) {
+		let name = req.device_name.as_deref();
+		login_data.api_key =
+			crate::api_key::mint_remember_key(&app, &addr, tn_id, &id_tag, name).await;
+	}
 	let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::OK, Json(response)))
+}
+
+/// Absolute session lifetime: refuse to extend a session that began more than the tenant's
+/// `auth.session_timeout` seconds ago. Every path that mints a fresh session from a presented
+/// one (`get_login_token`, `post_login_init`, the session, `via` and hatted branches of
+/// `get_access_token`, `get_proxy_token`, QR approval) calls this
+/// with `AuthCtx::auth_time` and copies it forward.
+pub(crate) async fn check_session_age(
+	app: &App,
+	tn_id: TnId,
+	auth_time: Timestamp,
+) -> ClResult<()> {
+	let timeout = app.settings.get_int(tn_id, "auth.session_timeout").await?;
+	if Timestamp::now().0 - auth_time.0 > timeout {
+		warn!(
+			auth_time = auth_time.0,
+			timeout, "session past auth.session_timeout - renewal refused"
+		);
+		return Err(Error::PermissionDenied);
+	}
+	Ok(())
 }
 
 /// # GET /api/auth/login-token
@@ -257,12 +323,14 @@ pub async fn get_login_token(
 			return Err(Error::PermissionDenied);
 		}
 		info!("login-token for {}", &auth.id_tag);
+		let auth_time = auth.auth_time.unwrap_or(Timestamp(0));
+		check_session_age(&app, auth.tn_id, auth_time).await?;
 		// A session whose `id_tag` is not this host's tenant fails the adapter's host binding.
 		// Tokens here are bearer-only and stored per origin, so an ordinary same-origin session
 		// cannot produce that mismatch — it means a credential minted elsewhere is being
 		// presented. Denied outright, with the delay kept as an anti-enumeration measure for
 		// the adapter's other failure modes (absent or disabled tenant).
-		match app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag).await {
+		match app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag, auth_time).await {
 			Ok(auth_login) => {
 				let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
 				let response =
@@ -365,30 +433,8 @@ pub async fn post_password(
 		));
 	}
 
-	// Verify current password using authenticated user's id_tag
-	let verification = app
-		.auth_adapter
-		.check_tenant_password(&auth.id_tag, &req.current_password)
-		.await;
-
-	if verification.is_err() {
-		// Penalize rate limit for failed password verification
-		penalize(&app, &addr);
-		// Delay to prevent timing attacks
-		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-		warn!("Failed password verification for user {}", auth.id_tag);
-		record_auth(
-			&app,
-			"auth.password.change",
-			"fail",
-			Some(auth.tn_id),
-			&auth.id_tag,
-			&addr,
-			None,
-		)
-		.await;
-		return Err(Error::PermissionDenied);
-	}
+	let (pw, event) = (&req.current_password, "auth.password.change");
+	verify_own_password(&app, &addr, &auth, pw, event, serde_json::Value::Null).await?;
 
 	// Update to new password
 	app.auth_adapter.update_tenant_password(&auth.id_tag, &req.new_password).await?;
@@ -894,6 +940,10 @@ pub async fn get_access_token(
 			None => format!("file:{}:{}", target_entry_id, scope_char),
 		};
 
+		// Re-scoping a session is a renewal too; see `check_session_age`.
+		let auth_time = auth.auth_time.unwrap_or(Timestamp(0));
+		check_session_age(&app, tn_id, auth_time).await?;
+
 		let token_result = app
 			.auth_adapter
 			.create_access_token(
@@ -905,6 +955,7 @@ pub async fn get_access_token(
 					scope: Some(&target_scope),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
 					h: None,
+					auth_time: Some(auth_time),
 				},
 			)
 			.await?;
@@ -1072,6 +1123,7 @@ pub async fn get_access_token(
 					scope: scope.as_deref(),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
 					h: hat.as_ref().map(|(h, _)| &**h),
+					auth_time: None,
 				},
 			)
 			.await?;
@@ -1149,6 +1201,7 @@ pub async fn get_access_token(
 					scope: Some(&token_scope),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
 					h: None,
+					auth_time: None,
 				},
 			)
 			.await?;
@@ -1216,6 +1269,7 @@ pub async fn get_access_token(
 					scope: validation.scopes.as_deref(),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
 					h: None,
+					auth_time: validation.auth_time,
 				},
 			)
 			.await?;
@@ -1243,7 +1297,9 @@ pub async fn get_access_token(
 		// A hatted session is refreshed by re-running the handshake, never by a role re-read:
 		// the mapped roles are not stored here, so a re-read would mint a role-less session.
 		// Its one mint is a `file:` scope for iframe apps, keeping the presented `r` and `h`.
+		let auth_time = auth.auth_time.unwrap_or(Timestamp(0));
 		if let Some(hat) = auth.hat.as_deref() {
+			check_session_age(&app, tn_id, auth_time).await?;
 			let exp = hatted_scope_exp(auth.exp, query.scope.as_deref(), Timestamp::now())?;
 			let scope = validated_scope(
 				&app,
@@ -1267,6 +1323,7 @@ pub async fn get_access_token(
 						scope: scope.as_deref(),
 						exp,
 						h: Some(hat),
+						auth_time: Some(auth_time),
 					},
 				)
 				.await?;
@@ -1284,6 +1341,9 @@ pub async fn get_access_token(
 			auth.id_tag,
 			query.scope.as_deref()
 		);
+
+		// A session token minted here is a renewal too; see `check_session_age`.
+		check_session_age(&app, tn_id, auth_time).await?;
 
 		// Re-read rather than copy the presented `r` claim forward; see `reread_roles`.
 		let expanded_roles = reread_roles(&app, tn_id, &id_tag.0, &auth).await?;
@@ -1318,6 +1378,7 @@ pub async fn get_access_token(
 					scope: scope.as_deref(),
 					exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
 					h: None,
+					auth_time: Some(auth_time),
 				},
 			)
 			.await?;
@@ -1521,6 +1582,9 @@ pub async fn get_proxy_token(
 	if auth.hat.is_some() {
 		return Err(Error::Unauthorized);
 	}
+	// Both branches mint from the presented session; see `check_session_age`.
+	let auth_time = auth.auth_time.unwrap_or(Timestamp(0));
+	check_session_age(&app, auth.tn_id, auth_time).await?;
 	if let Some(hat) = query.hat.as_deref() {
 		// Both go into a remote's query string, so they must be canonical id_tags.
 		let bad_target = |t: &str| !validate_id_tag(t) || t == hat || t == own_id_tag.as_ref();
@@ -1606,6 +1670,7 @@ pub async fn get_proxy_token(
 				scope: None,
 				exp: Timestamp::from_now(ACCESS_TOKEN_EXPIRY),
 				h: None,
+				auth_time: Some(auth_time),
 			},
 		)
 		.await?;
@@ -1785,7 +1850,10 @@ pub async fn post_set_password(
 
 	// Create a login token for the user. `id_tag == host_id_tag` is enforced by
 	// the guard above, so the auth adapter's host binding cannot fail here.
-	let auth = app.auth_adapter.create_tenant_login(&id_tag, &host_id_tag).await?;
+	let auth = app
+		.auth_adapter
+		.create_tenant_login(&id_tag, &host_id_tag, Timestamp::now())
+		.await?;
 
 	// Return login info using the existing return_login helper
 	let (_status, Json(login_data)) = return_login(&app, auth).await?;
@@ -2060,10 +2128,12 @@ pub async fn post_login_init(
 		}
 		// Authenticated path: create fresh login token (replaces login-token)
 		info!("login-init for authenticated user {}", &auth.id_tag);
+		let auth_time = auth.auth_time.unwrap_or(Timestamp(0));
+		check_session_age(&app, tn_id, auth_time).await?;
 		// A host-binding miss is not a routine "no account here" — see `get_login_token`.
 		// This route sits in `recovery()`, where the IP ban is deliberately skipped, so it
 		// must not be the softer sibling: deny, and pay the same delay.
-		match app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag.0).await {
+		match app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag.0, auth_time).await {
 			Ok(auth_login) => {
 				let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
 				let response =
@@ -2112,6 +2182,7 @@ mod tests {
 			anonymous,
 			hat: None,
 			exp: None,
+			auth_time: None,
 		}
 	}
 

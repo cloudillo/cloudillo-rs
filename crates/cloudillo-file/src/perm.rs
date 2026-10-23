@@ -89,6 +89,7 @@ async fn check_file_permission(
 			anonymous: true,
 			hat: None,
 			exp: None,
+			auth_time: None,
 		}
 	});
 
@@ -302,6 +303,7 @@ mod tests {
 			anonymous: scope.is_some(),
 			hat: None,
 			exp: None,
+			auth_time: None,
 		}
 	}
 

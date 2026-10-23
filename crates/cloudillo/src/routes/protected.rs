@@ -92,6 +92,9 @@ pub(super) fn init(app: App) -> Router<App> {
 		.merge(
 			tables::auth::owner_credentials().layer(middleware::from_fn(require_tenant_self)),
 		)
+		// The tenant's whole data set: the account itself only (the handlers also refuse a
+		// visiting SADM, who has `/api/admin/tenants/{id_tag}/export`).
+		.merge(tables::file::data_export().layer(middleware::from_fn(require_tenant_self)))
 		.merge(
 			tables::auth::owner_totp()
 				.layer(middleware::from_fn(require_tenant_self))

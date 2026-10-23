@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::prelude::*;
 use cloudillo_core::extract::{Auth, OptionalRequestId};
 use cloudillo_types::meta_adapter::{PushSubscriptionData, PushSubscriptionKeys};
-use cloudillo_types::types::ApiResponse;
+use cloudillo_types::types::{ApiResponse, SHARED_TN};
 
 /// Request body for creating a push subscription
 #[derive(Debug, Deserialize)]
@@ -56,6 +56,18 @@ pub async fn post_subscription(
 	Auth(auth): Auth,
 	Json(body): Json<CreateSubscriptionRequest>,
 ) -> Result<Json<SubscriptionResponse>, (StatusCode, String)> {
+	// Server-wide off switch (`notify.push_allowed`), above any tenant `notify.push` choice.
+	let allowed = app.settings.get_bool(SHARED_TN, "notify.push_allowed").await.map_err(|e| {
+		tracing::error!(error = %e, "Failed to read notify.push_allowed");
+		(StatusCode::INTERNAL_SERVER_ERROR, "Failed to read settings".to_string())
+	})?;
+	if !allowed {
+		return Err((
+			StatusCode::FORBIDDEN,
+			"Push notifications are disabled on this server".to_string(),
+		));
+	}
+
 	tracing::info!(
 		tn_id = %auth.tn_id.0,
 		endpoint = %body.subscription.endpoint,

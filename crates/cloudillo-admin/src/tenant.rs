@@ -41,6 +41,9 @@ pub struct TenantView {
 	/// Unix seconds; login is refused once reached
 	pub expires_at: Option<i64>,
 	pub created_at: i64,
+	/// Bytes in the tenant's own blob store (`MetaAdapter::get_storage_usage`), the figure
+	/// `limits.max_storage_gb` is checked against.
+	pub storage_used: u64,
 }
 
 /// Query parameters for listing tenants
@@ -89,7 +92,7 @@ pub async fn list_tenants(
 	let meta_map: HashMap<u32, _> = meta_tenants.into_iter().map(|t| (t.tn_id.0, t)).collect();
 
 	// Combine auth and meta data
-	let tenants: Vec<TenantView> = auth_tenants
+	let mut tenants: Vec<TenantView> = auth_tenants
 		.into_iter()
 		.map(|auth| {
 			let meta = meta_map.get(&auth.tn_id.0);
@@ -109,9 +112,14 @@ pub async fn list_tenants(
 				suspended_at: auth.suspended_at.map(|t| t.0),
 				expires_at: auth.expires_at.map(|t| t.0),
 				created_at,
+				storage_used: 0,
 			}
 		})
 		.collect();
+	// One usage query per row; acceptable on a paginated admin list.
+	for t in &mut tenants {
+		t.storage_used = app.meta_adapter.get_storage_usage(TnId(t.tn_id)).await?;
+	}
 
 	let total = app.auth_adapter.count_tenants(&auth_opts).await?;
 	let offset = query.offset.unwrap_or(0) as usize;
@@ -143,6 +151,56 @@ pub async fn reset_mfa(
 	)
 	.await;
 	info!(tn_id = ?tn_id, id_tag = %id_tag, "TOTP MFA reset by admin");
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/admin/tenants/{id_tag}/keys/rotate - New active signing key for the tenant;
+/// the previous active keys become verify-only.
+#[axum::debug_handler]
+pub async fn rotate_key(
+	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	Auth(auth_ctx): Auth,
+	Path(id_tag): Path<String>,
+) -> ClResult<StatusCode> {
+	let tn_id = app.auth_adapter.read_tn_id(&id_tag).await?;
+	let key = cloudillo_core::profile_keys::rotate_profile_key(&app, tn_id).await?;
+	crate::audit::record_admin(
+		&app,
+		"key.rotate",
+		"success",
+		Some(tn_id),
+		&auth_ctx.id_tag,
+		&addr,
+		serde_json::json!({ "idTag": id_tag, "keyId": key.key_id }),
+	)
+	.await;
+	info!(tn_id = ?tn_id, id_tag = %id_tag, key_id = %key.key_id, "Signing key rotated by admin");
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/admin/tenants/{id_tag}/keys/{key_id}/revoke - Stop publishing a signing key
+/// (refused with 409 for the tenant's only active key).
+#[axum::debug_handler]
+pub async fn revoke_key(
+	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	Auth(auth_ctx): Auth,
+	Path((id_tag, key_id)): Path<(String, String)>,
+) -> ClResult<StatusCode> {
+	let tn_id = app.auth_adapter.read_tn_id(&id_tag).await?;
+	cloudillo_core::profile_keys::revoke_profile_key(&app, tn_id, &id_tag, &key_id).await?;
+	crate::audit::record_admin(
+		&app,
+		"key.revoke",
+		"success",
+		Some(tn_id),
+		&auth_ctx.id_tag,
+		&addr,
+		serde_json::json!({ "idTag": id_tag, "keyId": key_id }),
+	)
+	.await;
+	info!(tn_id = ?tn_id, id_tag = %id_tag, key_id = %key_id, "Signing key revoked by admin");
 	Ok(StatusCode::NO_CONTENT)
 }
 
@@ -387,6 +445,9 @@ pub async fn purge_tenant(app: &App, tn_id: TnId) -> ClResult<PurgeReport> {
 	if let Err(e) = cloudillo_core::reload_site_cache_for_tenant(app, tn_id).await {
 		warn!(tn_id = ?tn_id, %id_tag, error = ?e, "tenant purge: site cache reload failed");
 	}
+
+	// A pending or ready bulk export. Non-fatal, like the site cache above.
+	app.remove_export(tn_id).await;
 
 	// Phase B — destructive cleanup. Each step hard-fails on error.
 

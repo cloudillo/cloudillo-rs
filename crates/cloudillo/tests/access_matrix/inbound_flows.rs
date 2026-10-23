@@ -1113,4 +1113,41 @@ async fn inbound_edges() {
 	rep.finish();
 }
 
+/// `federation.peers` in `allowlist` mode, inbound (`verify_action_token` on `iss`, before the
+/// key fetch): an allowed peer's POST is processed; a peer outside the list is refused, and so is
+/// a forged token naming the allowed peer as `iss` but signed with another key. Tenants on this
+/// instance always pass, so both issuers are remote ids, not tenants. The outbound guard
+/// (`Request::peer_host`) needs a reachable remote peer, which the fixture has none of; it is
+/// covered by the `peer_allowed` unit tests in `cloudillo-core` only.
+#[tokio::test]
+async fn federation_peers_allowlist() {
+	use Actual::{Allow, Deny};
+	use cloudillo_core::federation_policy::PEERS_SETTING;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let mut rep = Report::new("federation-peers");
+	let post = |r: &RemoteId| {
+		let mut t = claims(r, "POST");
+		t.c = Some(json!(format!("{MARK} federation peers")));
+		t
+	};
+	let ok = issuer(fx, ALICE, Relation::Connected, "", "fp-allowed").await;
+	let other = issuer(fx, ALICE, Relation::Connected, "", "fp-other").await;
+	let shared = cloudillo::types::SHARED_TN;
+	let policy = SettingValue::Json(json!({"mode": "allowlist", "allow": [ok.id_tag.as_str()]}));
+	fx.app.settings.set(shared, PEERS_SETTING, policy, &["SADM"]).await.unwrap();
+	let got = deliver(fx, ALICE, &sign(&ok, &post(&ok))).await;
+	check(&mut rep, "IB-83", &ok, Allow, got);
+	let got = deliver(fx, ALICE, &sign(&other, &post(&other))).await;
+	check(&mut rep, "IB-84", &other, Deny, got);
+	// Forged: the allowed peer's `iss` and key id, `other`'s key.
+	let got = deliver(fx, ALICE, &sign(&other, &post(&ok))).await;
+	check(&mut rep, "IB-85", &ok, Deny, got);
+	fx.app.settings.delete(shared, PEERS_SETTING).await.unwrap();
+	// Back to `open` (the default): the refused peer is processed.
+	let got = deliver(fx, ALICE, &sign(&other, &post(&other))).await;
+	check(&mut rep, "IB-86", &other, Allow, got);
+	rep.finish();
+}
+
 // vim: ts=4

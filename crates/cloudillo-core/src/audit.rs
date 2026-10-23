@@ -97,6 +97,7 @@ pub async fn record(app: &App, ev: AuditEvent) {
 	if let Err(e) = app.auth_adapter.append_audit_event(&ev).await {
 		warn!(error = %e, event = &*ev.event, "audit: failed to store event");
 	}
+	crate::alert::notify(app, &ev);
 }
 
 /// The `category` query parameter of the audit list APIs.
@@ -209,6 +210,14 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 					"Audit retention must be a positive number of days".into(),
 				)),
 			})
+			.build()?,
+	)?;
+	registry.register(
+		SettingDefinition::builder(crate::alert::ALERT_EMAIL_SETTING)
+			.description("E-mail address for security alerts (empty = off)")
+			.default(SettingValue::String(String::new()))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
 			.build()?,
 	)?;
 	Ok(())

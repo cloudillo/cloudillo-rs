@@ -23,6 +23,7 @@ pub mod prelude;
 pub mod reactions;
 pub mod roles;
 pub mod rtdb_adapter;
+pub mod secret_box;
 pub mod site;
 pub mod snapshot;
 pub mod types;

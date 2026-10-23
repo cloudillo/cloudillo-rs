@@ -236,6 +236,25 @@ async fn test_list_files_not_parent_id_nonexistent_passes_all() {
 	assert!(names.iter().any(|n| n == "f_b2"));
 }
 
+// A cursor whose row is gone pages on from its sort value (never restarts at page 1).
+#[tokio::test]
+async fn test_list_files_stale_cursor_pages_forward() {
+	use cloudillo_types::types::{CursorData, Timestamp};
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "test_user").await.ok();
+	make_file(&adapter, tn_id, "f_c", "c.txt", None).await;
+
+	let page = async |v: i64| {
+		let cursor = CursorData::new("created", v.into(), "nonexistent").encode();
+		let opts = ListFileOptions { cursor: Some(cursor), ..Default::default() };
+		let files = adapter.list_files(tn_id, &opts).await.expect("stale cursor pages on");
+		files.iter().map(|f| f.index_id().to_string()).collect::<Vec<_>>()
+	};
+	assert_eq!(page(Timestamp::now().0 + 1_000).await, ["f_c"], "older row is listed");
+	assert!(page(1_000).await.is_empty(), "no restart at page 1");
+}
+
 #[tokio::test]
 async fn test_list_files_by_id_includes_managed() {
 	let (adapter, _temp) = create_test_adapter().await;

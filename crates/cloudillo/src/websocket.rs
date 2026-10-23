@@ -709,6 +709,7 @@ mod tests {
 			anonymous: false,
 			hat: None,
 			exp,
+			auth_time: None,
 		}
 	}
 

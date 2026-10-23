@@ -29,6 +29,7 @@ pub struct PdfInfo {
 /// Get PDF page count using pdfinfo
 pub fn get_pdf_info(input: &Path) -> ClResult<PdfInfo> {
 	let output = Command::new("pdfinfo")
+		.env_remove("SECRET_KEY")
 		.arg(input.to_str().ok_or(Error::Internal("invalid path".into()))?)
 		.output()
 		.map_err(|e| Error::Internal(format!("pdfinfo failed: {}", e)))?;
@@ -59,6 +60,7 @@ pub fn generate_pdf_thumbnail(input: &Path, output: &Path, dpi: u32) -> ClResult
 		.to_string();
 
 	let status = Command::new("pdftoppm")
+		.env_remove("SECRET_KEY")
 		.args([
 			"-png",
 			"-f",

@@ -1,0 +1,20 @@
+---
+layout: default
+subject: "[{{base_id_tag}}] Biztonsági riasztás: {{event}}"
+---
+Biztonsági riasztás
+===================
+
+Biztonsági szempontból fontos esemény történt a {{instance_name}} szervereden.
+
+Esemény:    {{event}} ({{outcome}})
+Kategória:  {{category}}
+Időpont:    {{time}}
+{{#if tnId}}Bérlő:      {{tnId}}
+{{/if}}{{#if actor}}Szereplő:   {{actor}}
+{{/if}}{{#if ip}}IP-cím:     {{ip}}
+{{/if}}{{#if failures}}Sikertelen bejelentkezések az elmúlt 15 percben: {{failures}}
+{{/if}}{{#if details}}Részletek:  {{details}}
+{{/if}}
+A teljes előzményt az auditnaplóban találod. Az ilyen típusú további
+riasztásokat 15 percig visszatartjuk.

@@ -17,6 +17,17 @@ use cloudillo_core::settings::{
 
 /// Register all push notification settings
 pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
+	// Server-wide off switch, above every tenant's `notify.push`: false refuses new
+	// subscriptions and sends nothing (`handler::post_subscription`, `send::send_to_tenant`).
+	registry.register(
+		SettingDefinition::builder("notify.push_allowed")
+			.description("Allow push notifications on this server")
+			.default(SettingValue::Bool(true))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.build()?,
+	)?;
+
 	// Master switch for push notifications
 	registry.register(
 		SettingDefinition::builder("notify.push")

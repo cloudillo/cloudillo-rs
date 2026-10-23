@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use crate::{
 	extract::{Auth, OptionalRequestId},
 	prelude::*,
-	settings::types::{PermissionLevel, SettingScope, SettingValue},
+	settings::types::{PermissionLevel, SettingDefinition, SettingScope, SettingValue},
 };
 use cloudillo_types::{
 	auth_adapter::{AuditCategory, AuthCtx},
@@ -31,6 +31,21 @@ pub struct SettingResponse {
 	pub scope: String,
 	pub permission: String,
 	pub description: String,
+}
+
+impl SettingResponse {
+	/// The only constructor: secret settings are write-only, so their value is always
+	/// masked, for every caller (SADM included) and whether or not a `SECRET_KEY` is set.
+	fn new(key: String, value: SettingValue, definition: &SettingDefinition) -> Self {
+		let value = if definition.secret { SettingValue::String("***".into()) } else { value };
+		Self {
+			key,
+			value,
+			scope: format!("{:?}", definition.scope),
+			permission: format!("{:?}", definition.permission),
+			description: definition.description.clone(),
+		}
+	}
 }
 
 /// Query parameters for listing settings
@@ -116,13 +131,7 @@ pub async fn list_settings(
 		};
 
 		for (key, value, definition) in rows {
-			settings_response.push(SettingResponse {
-				key,
-				value,
-				scope: format!("{:?}", definition.scope),
-				permission: format!("{:?}", definition.permission),
-				description: definition.description.clone(),
-			});
+			settings_response.push(SettingResponse::new(key, value, definition));
 		}
 	} else {
 		// No prefix: iterate over all definitions and get their values.
@@ -132,13 +141,11 @@ pub async fn list_settings(
 		// swallowed, so propagate `Err` via `?`.
 		for definition in app.settings_registry.list() {
 			match app.settings.get(auth.tn_id, &definition.key).await {
-				Ok(Some(value)) => settings_response.push(SettingResponse {
-					key: definition.key.clone(),
+				Ok(Some(value)) => settings_response.push(SettingResponse::new(
+					definition.key.clone(),
 					value,
-					scope: format!("{:?}", definition.scope),
-					permission: format!("{:?}", definition.permission),
-					description: definition.description.clone(),
-				}),
+					definition,
+				)),
 				// `Ok(None)` is a wildcard-namespace key with no stored value;
 				// `SettingNotFound` is an exact-match key with no default and
 				// no row. Both are silently skipped here (matches the previous
@@ -209,9 +216,16 @@ pub async fn get_setting(
 	Query(query): Query<SettingScopeQuery>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SettingResponse>>)> {
-	require_settings_reader(&auth)?;
 	// Get setting definition (supports wildcard patterns like "ui.*")
-	let definition = app.settings_registry.get(&name).ok_or(Error::NotFound)?;
+	let definition = app.settings_registry.get(&name);
+	// `readable_by_all` keys (instance-wide UI config) are readable by any unscoped
+	// authenticated caller; scoped tokens stay denied (`scope_permits` already refuses them).
+	// `tenant=` and `level=global` below keep their own SADM gates. Unknown keys fall
+	// through to the reader check so they answer 403, not 404, to non-readers.
+	if !(auth.scope.is_none() && definition.is_some_and(|d| d.readable_by_all)) {
+		require_settings_reader(&auth)?;
+	}
+	let definition = definition.ok_or(Error::NotFound)?;
 
 	// Resolve the value at the requested level.
 	// - `tenant`/`global`: raw row at that level, no fallback (404 if unset).
@@ -248,13 +262,7 @@ pub async fn get_setting(
 		None => app.settings.get(target_tn_id, &name).await?.ok_or(Error::NotFound)?,
 	};
 
-	let response_data = SettingResponse {
-		key: definition.key.clone(),
-		value,
-		scope: format!("{:?}", definition.scope),
-		permission: format!("{:?}", definition.permission),
-		description: definition.description.clone(),
-	};
+	let response_data = SettingResponse::new(definition.key.clone(), value, definition);
 
 	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
 
@@ -324,9 +332,9 @@ pub async fn update_setting(
 	};
 
 	// Update the setting using the service
+	let prev = prev_alert_email(&app, target_tn_id, &name).await;
 	app.settings.set(target_tn_id, &name, req.value.clone(), &auth.roles).await?;
-	let (scope, permission) = (definition.scope, definition.permission);
-	audit_setting_change(&app, &auth, &addr, &name, target_tn_id, scope, permission).await;
+	audit_setting_change(&app, &auth, &addr, &name, target_tn_id, definition, prev).await;
 
 	info!(
 		"User {} updated setting {} for tn_id={} (level={})",
@@ -339,38 +347,46 @@ pub async fn update_setting(
 	// Return updated setting
 	let value = app.settings.get(target_tn_id, &name).await?.ok_or(Error::NotFound)?;
 
-	let response_data = SettingResponse {
-		key: definition.key.clone(),
-		value,
-		scope: format!("{:?}", definition.scope),
-		permission: format!("{:?}", definition.permission),
-		description: definition.description.clone(),
-	};
+	let response_data = SettingResponse::new(definition.key.clone(), value, definition);
 
 	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// The current `audit.alert_email`, read before it is changed so the old address is alerted
+/// too (see `crate::alert`). `None` for every other setting.
+async fn prev_alert_email(app: &App, tn_id: TnId, name: &str) -> Option<String> {
+	if name != crate::alert::ALERT_EMAIL_SETTING {
+		return None;
+	}
+	app.settings.get_string_opt(tn_id, name).await.ok().flatten()
+}
+
 /// Record `admin.settings.change` for a server-wide setting change, or an admin-gated
-/// setting changed for one tenant. The value is never logged.
+/// setting changed for one tenant. The value is never logged, except the previous
+/// `audit.alert_email` (`prev`), which the alert is also sent to.
 async fn audit_setting_change(
 	app: &App,
 	auth: &AuthCtx,
 	addr: &SocketAddr,
 	name: &str,
 	target_tn_id: TnId,
-	scope: SettingScope,
-	permission: PermissionLevel,
+	definition: &SettingDefinition,
+	prev: Option<String>,
 ) {
-	let (tn_id, level) = if target_tn_id == SHARED_TN || scope == SettingScope::Global {
+	let (tn_id, level) = if target_tn_id == SHARED_TN || definition.scope == SettingScope::Global {
 		(None, "global")
-	} else if permission == PermissionLevel::Admin {
+	} else if definition.permission == PermissionLevel::Admin {
 		(Some(target_tn_id), "tenant")
 	} else {
 		return;
 	};
-	let details = Some(serde_json::json!({ "key": name, "level": level }));
+	let mut details = serde_json::json!({ "key": name, "level": level });
+	if let Some(prev) = prev {
+		details["prevAlertEmail"] = prev.into();
+	}
+	let details = Some(details);
 	let (cat, event, actor) = (AuditCategory::Admin, "admin.settings.change", Some(&*auth.id_tag));
 	crate::audit::record_event(app, cat, event, "success", tn_id, actor, addr, details).await;
 }
@@ -425,9 +441,9 @@ pub async fn delete_setting(
 		}
 	};
 
+	let prev = prev_alert_email(&app, target_tn_id, &name).await;
 	app.settings.clear(target_tn_id, &name, &auth.roles).await?;
-	let (scope, permission) = (definition.scope, definition.permission);
-	audit_setting_change(&app, &auth, &addr, &name, target_tn_id, scope, permission).await;
+	audit_setting_change(&app, &auth, &addr, &name, target_tn_id, definition, prev).await;
 
 	info!("User {} cleared setting {} at tn_id={}", auth.id_tag, name, target_tn_id.0);
 
@@ -624,6 +640,7 @@ mod tests {
 			anonymous: scope.is_some(),
 			hat: None,
 			exp: None,
+			auth_time: None,
 		}
 	}
 

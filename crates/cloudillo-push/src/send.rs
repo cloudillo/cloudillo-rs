@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::prelude::*;
 use cloudillo_types::meta_adapter::PushSubscriptionData;
+use cloudillo_types::types::SHARED_TN;
 
 /// Notification payload to send to the client
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +280,11 @@ pub async fn send_to_tenant(
 	tn_id: TnId,
 	payload: &NotificationPayload,
 ) -> ClResult<usize> {
+	// Server-wide off switch: nothing is sent, whatever the tenant's own `notify.push`.
+	if !app.settings.get_bool(SHARED_TN, "notify.push_allowed").await? {
+		return Ok(0);
+	}
+
 	let subscriptions = app.meta_adapter.list_push_subscriptions(tn_id).await?;
 	let mut success_count = 0;
 

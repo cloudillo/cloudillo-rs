@@ -540,6 +540,8 @@ pub async fn sync_file_variants(
 /// operation is bounded by `timeout` to guard against stalled connections.
 ///
 /// Returns the blob size on success.
+// Not checked against `limits.max_storage_gb` — only `post_file_blob` is. A peer's
+// attachments land here even past quota; add the same usage check if that ever matters.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_and_store_blob(
 	app: &App,

@@ -181,6 +181,7 @@ mod tests {
 			anonymous: false,
 			hat: None,
 			exp: None,
+			auth_time: None,
 		}
 	}
 

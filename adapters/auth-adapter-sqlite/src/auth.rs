@@ -10,11 +10,13 @@ use sqlx::{Row, SqlitePool};
 
 use crate::crypto;
 use crate::utils::{Db, map_res};
+use crate::{IDP_API_KEY, TOTP_SECRET};
 use cloudillo_types::{
 	action_types,
 	auth_adapter::{AccessToken, ActionToken, AuthCtx, AuthLogin},
 	prelude::*,
 	roles::expand_roles_preserving_extras,
+	secret_box::{self, SecretBox},
 	utils::{normalize_id_tag, parse_roles},
 	worker::WorkerPool,
 };
@@ -47,6 +49,7 @@ pub(crate) async fn validate_access_token(
 	// Use `sub` (the actual user identity) when present, fall back to `iss`.
 	// Access tokens always set `iss` to the local tenant; for federated and
 	// external users `sub` carries the real user identity (id_tag).
+	let auth_time = Some(token_data.claims.auth_time_or_fallback());
 	Ok(AuthCtx {
 		tn_id,
 		anonymous: token_data.claims.sub.is_none(),
@@ -55,41 +58,28 @@ pub(crate) async fn validate_access_token(
 		scope: token_data.claims.scope,
 		hat: token_data.claims.h,
 		exp: Some(token_data.claims.exp),
+		auth_time,
 	})
 }
 
 /// Get or generate the JWT secret for HS256 signing
-pub(crate) async fn ensure_jwt_secret(db: &SqlitePool) -> ClResult<String> {
+pub(crate) async fn ensure_jwt_secret(db: &SqlitePool, sb: &SecretBox) -> ClResult<String> {
 	use base64::Engine;
 	use rand::Rng;
 
-	// Try to read existing secret
-	let res = sqlx::query("SELECT value FROM vars WHERE key = ?1")
-		.bind("0:jwt_secret")
-		.fetch_optional(db)
-		.await
-		.db()?;
-
-	if let Some(row) = res {
-		return row.try_get("value").db();
+	match crate::variable::read_var(db, sb, TnId(0), "jwt_secret").await {
+		Ok(secret) => Ok(secret.into()),
+		Err(Error::NotFound) => {
+			// Generate new secret (32 random bytes, base64 encoded)
+			let mut secret_bytes = [0u8; 32];
+			rand::rng().fill_bytes(&mut secret_bytes);
+			let secret_str = base64::engine::general_purpose::STANDARD.encode(secret_bytes);
+			crate::variable::update_var(db, sb, TnId(0), "jwt_secret", &secret_str).await?;
+			info!("Generated new JWT secret");
+			Ok(secret_str)
+		}
+		Err(e) => Err(e),
 	}
-
-	// Generate new secret (32 random bytes, base64 encoded)
-	let mut secret_bytes = [0u8; 32];
-	let mut rng = rand::rng();
-	rng.fill_bytes(&mut secret_bytes);
-	let secret_str = base64::engine::general_purpose::STANDARD.encode(secret_bytes);
-
-	// Store in database
-	sqlx::query("INSERT OR REPLACE INTO vars (key, value) VALUES (?1, ?2)")
-		.bind("0:jwt_secret")
-		.bind(&secret_str)
-		.execute(db)
-		.await
-		.db()?;
-
-	info!("Generated new JWT secret");
-	Ok(secret_str)
 }
 
 /// Build tenant owner roles string by merging base leader roles with DB roles.
@@ -163,6 +153,7 @@ pub(crate) async fn check_tenant_password(
 				r: Some(roles_str.clone()),
 				exp: Timestamp::from_now(action_types::ACCESS_TOKEN_EXPIRY),
 				h: None,
+				auth_time: Some(Timestamp::now()),
 			};
 			let token = crypto::generate_access_token(
 				worker,
@@ -204,38 +195,57 @@ pub(crate) async fn update_tenant_password(
 /// Update IDP API key for federated identity
 pub(crate) async fn update_idp_api_key(
 	db: &SqlitePool,
+	sb: &SecretBox,
 	id_tag: &str,
 	api_key: &str,
 ) -> ClResult<()> {
+	let id_tag = normalize_id_tag(id_tag);
+	let sealed = sb.encrypt(api_key, &idp_aad(&id_tag))?;
 	sqlx::query("UPDATE tenants SET idp_api_key=?2 WHERE id_tag = ?1")
-		.bind(normalize_id_tag(id_tag).as_ref())
-		.bind(api_key)
+		.bind(id_tag.as_ref())
+		.bind(sealed)
 		.execute(db)
 		.await
 		.db()?;
 	Ok(())
 }
 
+fn idp_aad(id_tag: &str) -> String {
+	secret_box::aad(IDP_API_KEY.0, IDP_API_KEY.1, id_tag)
+}
+
+fn totp_aad(tn_id: TnId) -> String {
+	secret_box::aad(TOTP_SECRET.0, TOTP_SECRET.1, &tn_id.0.to_string())
+}
+
 /// Read the TOTP secret and last accepted step of a tenant (`None` = not enrolled)
 pub(crate) async fn get_totp(
 	db: &SqlitePool,
+	sb: &SecretBox,
 	tn_id: TnId,
 ) -> ClResult<Option<(Box<str>, Option<i64>)>> {
 	let row = sqlx::query("SELECT totp_secret, totp_last_step FROM tenants WHERE tn_id = ?1")
 		.bind(tn_id.0)
 		.fetch_one(db)
 		.await;
-	map_res(row, |row| {
+	let res: Option<(Box<str>, Option<i64>)> = map_res(row, |row| {
 		let secret: Option<Box<str>> = row.try_get("totp_secret")?;
 		let last_step: Option<i64> = row.try_get("totp_last_step")?;
 		Ok(secret.map(|s| (s, last_step)))
-	})
+	})?;
+	match res {
+		Some((secret, last_step)) => {
+			Ok(Some((sb.decrypt(&secret, &totp_aad(tn_id))?.into(), last_step)))
+		}
+		None => Ok(None),
+	}
 }
 
 /// Enroll the TOTP secret with its first accepted step, only if not enrolled yet.
 /// `false` = already enrolled (the stored secret is left alone).
 pub(crate) async fn enroll_totp(
 	db: &SqlitePool,
+	sb: &SecretBox,
 	tn_id: TnId,
 	secret: &str,
 	step: i64,
@@ -245,7 +255,7 @@ pub(crate) async fn enroll_totp(
 		WHERE tn_id = ?1 AND totp_secret IS NULL",
 	)
 	.bind(tn_id.0)
-	.bind(secret)
+	.bind(sb.encrypt(secret, &totp_aad(tn_id))?)
 	.bind(step)
 	.execute(db)
 	.await
@@ -289,6 +299,7 @@ pub(crate) async fn create_tenant_login(
 	worker: &Arc<WorkerPool>,
 	id_tag: &str,
 	host_id_tag: &str,
+	auth_time: Timestamp,
 	jwt_secret_str: &str,
 ) -> ClResult<AuthLogin> {
 	// An owner login is authority over the account, so the identity being logged in as
@@ -332,6 +343,7 @@ pub(crate) async fn create_tenant_login(
 				r: Some(roles_str.clone()),
 				exp: Timestamp::from_now(action_types::ACCESS_TOKEN_EXPIRY),
 				h: None,
+				auth_time: Some(auth_time),
 			};
 			let token = crypto::generate_access_token(
 				worker,
@@ -375,6 +387,7 @@ pub(crate) async fn create_access_token(
 		r: data.r.map(Box::from),
 		exp: data.exp,
 		h: data.h.map(Box::from),
+		auth_time: data.auth_time,
 	};
 
 	let token = crypto::generate_access_token(
@@ -391,13 +404,15 @@ pub(crate) async fn create_access_token(
 pub(crate) async fn create_action_token(
 	db: &SqlitePool,
 	worker: &Arc<WorkerPool>,
+	sb: &SecretBox,
 	tn_id: TnId,
 	action: action_types::CreateAction,
 ) -> ClResult<Box<str>> {
 	let res = sqlx::query(
 		"SELECT t.id_tag, k.key_id, k.private_key FROM tenants t
 		JOIN keys k ON t.tn_id = k.tn_id
-		WHERE t.tn_id=? ORDER BY k.key_id DESC LIMIT 1",
+		WHERE t.tn_id=? AND (k.status IS NULL OR k.status='A')
+		ORDER BY k.key_id DESC LIMIT 1",
 	)
 	.bind(tn_id.0)
 	.fetch_optional(db)
@@ -406,7 +421,9 @@ pub(crate) async fn create_action_token(
 	.ok_or_else(|| Error::Internal("no signing key for tenant".into()))?;
 	let id_tag: &str = res.try_get("id_tag").db()?;
 	let key_id: Box<str> = res.try_get("key_id").db()?;
-	let private_key: Box<str> = res.try_get("private_key").db()?;
+	let sealed: &str = res.try_get("private_key").db()?;
+	let private_key: Box<str> =
+		sb.decrypt(sealed, &crate::profile_key::key_aad(tn_id, &key_id))?.into();
 
 	let mut typ = action.typ.to_string();
 	if let Some(sub_typ) = &action.sub_typ {
@@ -447,6 +464,7 @@ mod tests {
 			r: roles,
 			exp: Timestamp::from_now(3600),
 			h: None,
+			auth_time: None,
 		};
 		encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
 			.expect("encode token")
@@ -466,6 +484,7 @@ mod tests {
 			r: None,
 			exp: Timestamp::from_now(3600),
 			h: None,
+			auth_time: None,
 		};
 		encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
 			.expect("encode token")
@@ -505,6 +524,7 @@ mod tests {
 			r: Some("public"),
 			exp: Timestamp::from_now(3600),
 			h: None,
+			auth_time: None,
 		};
 		let token =
 			encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
@@ -530,6 +550,7 @@ mod tests {
 			r: Some("public,follower,supporter,contributor"),
 			exp: Timestamp::from_now(3600),
 			h: Some("a.example"),
+			auth_time: None,
 		};
 		let token =
 			encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret))
@@ -663,7 +684,7 @@ mod tests {
 
 		adapter.set_tenant_suspended(tn_id, true).await.unwrap();
 		assert!(adapter.check_tenant_password(id_tag, "correct horse").await.is_err());
-		assert!(adapter.create_tenant_login(id_tag, id_tag).await.is_err());
+		assert!(adapter.create_tenant_login(id_tag, id_tag, Timestamp::now()).await.is_err());
 
 		adapter.set_tenant_suspended(tn_id, false).await.unwrap();
 		adapter.check_tenant_password(id_tag, "correct horse").await.unwrap();

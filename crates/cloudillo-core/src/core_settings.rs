@@ -12,6 +12,10 @@ use crate::settings::{
 	PermissionLevel, SettingDefinition, SettingScope, SettingValue, SettingsRegistry,
 };
 
+/// OpenStreetMap attribution shared by the default `map.tile_sources` layers.
+const OSM: &str =
+	"&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors";
+
 /// Validator for any setting whose value is handed to `TaskSchedulerBuilder::cron`.
 /// Exported for the other crates that register `*_cron` settings.
 ///
@@ -130,6 +134,100 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Federation peer policy, enforced in both directions (`crate::federation_policy`).
+	// Registered here rather than in `cloudillo-action` because `Request` reads it.
+	registry.register(
+		SettingDefinition::builder(crate::federation_policy::PEERS_SETTING)
+			.description(
+				"Federation peers: {\"mode\": \"open\"|\"allowlist\"|\"off\", \"allow\": \
+				 [\"id.tag\", \"*.domain\"]}. Tenants on this instance are always allowed.",
+			)
+			.default(SettingValue::Json(serde_json::json!({"mode": "open", "allow": []})))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.validator(crate::federation_policy::peers_validator)
+			.build()?,
+	)?;
+
+	// Community suggested at onboarding; empty hides the card. Read by every user's shell.
+	registry.register(
+		SettingDefinition::builder("onboarding.community")
+			.description("Community id_tag suggested at onboarding (empty = no suggestion)")
+			.default(SettingValue::String("cloudillo.net".into()))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.readable_by_all(true)
+			.validator(|v| match v {
+				SettingValue::String(_) => Ok(()),
+				_ => Err(Error::ValidationError("onboarding.community must be a string".into())),
+			})
+			.build()?,
+	)?;
+
+	// Map tile sources offered by Mapillo; an empty list disables Mapillo. Read by the shell
+	// (unscoped), which hands the list to the Mapillo iframe.
+	// Default mirrors the first five layers of `cloudillo/apps/mapillo/src/styles.ts`.
+	let carto = format!("{OSM} &copy; <a href=\"https://carto.com/\">CARTO</a>");
+	registry.register(
+		SettingDefinition::builder("map.tile_sources")
+			.description(
+				"Map tile sources: [{\"name\", \"url\", \"attribution\"}] (empty = no maps)",
+			)
+			.default(SettingValue::Json(serde_json::json!([
+				{
+					"name": "OpenStreetMap",
+					"url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+					"attribution": OSM,
+				},
+				{
+					"name": "Positron",
+					"url": "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}@2x.png",
+					"attribution": carto,
+				},
+				{
+					"name": "Positron (No Labels)",
+					"url": "https://basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}@2x.png",
+					"attribution": carto,
+				},
+				{
+					"name": "Dark Matter",
+					"url": "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png",
+					"attribution": carto,
+				},
+				{
+					"name": "Voyager",
+					"url": "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png",
+					"attribution": carto,
+				},
+			])))
+			.scope(SettingScope::Global)
+			.permission(PermissionLevel::Admin)
+			.readable_by_all(true)
+			.validator(tile_sources_validator)
+			.build()?,
+	)?;
+
+	Ok(())
+}
+
+/// `map.tile_sources`: a JSON array of `{name, url, attribution}` string objects.
+fn tile_sources_validator(v: &SettingValue) -> ClResult<()> {
+	#[derive(serde::Deserialize)]
+	#[serde(deny_unknown_fields)]
+	#[allow(dead_code)]
+	struct TileSource {
+		name: String,
+		url: String,
+		attribution: String,
+	}
+	let SettingValue::Json(json) = v else {
+		return Err(Error::ValidationError("map.tile_sources must be a JSON array".into()));
+	};
+	let sources: Vec<TileSource> = serde_json::from_value(json.clone())
+		.map_err(|e| Error::ValidationError(format!("invalid map.tile_sources: {e}")))?;
+	if sources.iter().any(|s| !s.url.starts_with("https://")) {
+		return Err(Error::ValidationError("map.tile_sources urls must be https".into()));
+	}
 	Ok(())
 }
 

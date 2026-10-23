@@ -21,6 +21,24 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Lifetime of an unscoped ("stay logged in") API key, in days. Such a key logs in directly,
+	// so its expiry is the only bound on that session; `api_key::create_api_key` and
+	// `update_api_key` clamp it to `days` from the key's creation. 0 = unscoped keys disabled.
+	registry.register(
+		SettingDefinition::builder("auth.remember_days")
+			.description("Days an unscoped (stay logged in) API key stays valid; 0 disables them")
+			.default(SettingValue::Int(30))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::Admin)
+			.validator(|v| match v {
+				SettingValue::Int(d) if *d >= 0 => Ok(()),
+				_ => Err(Error::ValidationError(
+					"auth.remember_days must be a non-negative integer".into(),
+				)),
+			})
+			.build()?,
+	)?;
+
 	// TOTP MFA for password login. An enrolled account always needs the code; this only
 	// governs offering (`optional`) and forcing at login (`required`) for unenrolled ones.
 	// Passkey login (`webauthn::post_login`) counts as a second factor and is never

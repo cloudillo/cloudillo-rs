@@ -103,6 +103,7 @@ impl FFmpeg {
 	/// Probe a media file and get its information
 	pub fn probe(input: &Path) -> ClResult<MediaInfo> {
 		let output = Command::new("ffprobe")
+			.env_remove("SECRET_KEY")
 			.args([
 				"-v",
 				"quiet",
@@ -225,6 +226,7 @@ impl FFmpeg {
 	/// Extract a frame from a video at a specific timestamp
 	pub fn extract_frame(input: &Path, output: &Path, seek_seconds: f64) -> ClResult<()> {
 		let status = Command::new("ffmpeg")
+			.env_remove("SECRET_KEY")
 			.args([
 				"-y",
 				"-ss",
@@ -263,6 +265,7 @@ impl FFmpeg {
 		);
 
 		let status = Command::new("ffmpeg")
+			.env_remove("SECRET_KEY")
 			.args([
 				"-y",
 				"-i",
@@ -302,6 +305,7 @@ impl FFmpeg {
 	/// Extract audio from a video or transcode audio file
 	pub fn extract_audio(input: &Path, output: &Path, opts: &AudioExtractOpts) -> ClResult<f64> {
 		let status = Command::new("ffmpeg")
+			.env_remove("SECRET_KEY")
 			.args([
 				"-y",
 				"-i",

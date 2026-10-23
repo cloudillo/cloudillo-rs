@@ -309,6 +309,12 @@ pub fn require_tenant_self(auth: &AuthCtx, tenant_id_tag: &str, what: &str) -> C
 	}
 }
 
+/// Require the tenant account itself, SADM excluded: for routes acting on the account's own
+/// credentials (signing keys, TOTP, export). SADM has its `/api/admin/tenants/{id_tag}/*` twins.
+pub fn require_tenant_account(auth: &AuthCtx, id_tag: &str) -> ClResult<()> {
+	if is_tenant_account(auth, id_tag) { Ok(()) } else { Err(Error::PermissionDenied) }
+}
+
 /// Whether `auth` is the tenant account itself (or SADM): [`require_tenant_self`]'s test.
 /// Use it for every "is this the owner" check — a bare `auth.id_tag == tenant` also admits a
 /// share-link or via-embed token.
@@ -919,6 +925,7 @@ mod tests {
 			anonymous: false,
 			hat: None,
 			exp: None,
+			auth_time: None,
 		}
 	}
 

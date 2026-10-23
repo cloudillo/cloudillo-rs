@@ -419,7 +419,12 @@ pub async fn post_respond(
 
 	// Perform async work without holding any DashMap lock
 	if body.approved {
-		let auth_login = app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag).await?;
+		// Approval mints a fresh owner session from the approver's, so it is a renewal: it
+		// may not outlive the approver's own login.
+		let auth_time = auth.auth_time.unwrap_or(Timestamp(0));
+		crate::handler::check_session_age(&app, auth.tn_id, auth_time).await?;
+		let auth_login =
+			app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag, auth_time).await?;
 		let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
 
 		// Re-acquire lock to update session — return error if session vanished or already

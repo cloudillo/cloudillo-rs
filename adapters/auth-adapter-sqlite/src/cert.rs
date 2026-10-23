@@ -5,17 +5,23 @@
 
 use sqlx::{Row, SqlitePool};
 
+use crate::CERT_KEY;
 use crate::utils::{Db, map_res};
 use cloudillo_types::{
 	auth_adapter::{CertData, TenantCertRenewalRow},
 	prelude::*,
+	secret_box::{self, SecretBox},
 	utils::normalize_id_tag,
-	validation::dns_host_to_unicode_lossy,
+	validation::{dns_host_to_unicode_lossy, strip_host_port},
 };
 
 /// Create or update a certificate. INSERT OR REPLACE clears the failure-tracking
 /// columns; renewal success is otherwise recorded via `record_renewal_success`.
-pub(crate) async fn create_cert(db: &SqlitePool, cert_data: &CertData) -> ClResult<()> {
+pub(crate) async fn create_cert(
+	db: &SqlitePool,
+	sb: &SecretBox,
+	cert_data: &CertData,
+) -> ClResult<()> {
 	debug!("create_cert {}", &cert_data.id_tag);
 	sqlx::query(
 		"INSERT OR REPLACE INTO certs (
@@ -30,12 +36,22 @@ pub(crate) async fn create_cert(db: &SqlitePool, cert_data: &CertData) -> ClResu
 	.bind(dns_host_to_unicode_lossy(&cert_data.domain).as_ref())
 	.bind(cert_data.expires_at.0)
 	.bind(&cert_data.cert)
-	.bind(&cert_data.key)
+	.bind(sb.encrypt(&cert_data.key, &cert_aad(cert_data.tn_id))?)
 	.execute(db)
 	.await
 	.db()?;
 
 	Ok(())
+}
+
+/// Decrypt the private key of a mapped cert row
+fn open_cert(sb: &SecretBox, mut cert: CertData) -> ClResult<CertData> {
+	cert.key = sb.decrypt(&cert.key, &cert_aad(cert.tn_id))?.into();
+	Ok(cert)
+}
+
+fn cert_aad(tn_id: TnId) -> String {
+	secret_box::aad(CERT_KEY.0, CERT_KEY.1, &tn_id.0.to_string())
 }
 
 fn map_cert_row(row: &sqlx::sqlite::SqliteRow) -> Result<CertData, sqlx::Error> {
@@ -76,40 +92,72 @@ const CERT_SELECT_VALID: &str = "SELECT tn_id, id_tag, domain, cert, key, expire
 	FROM certs WHERE cert IS NOT NULL AND key IS NOT NULL";
 
 /// Read a certificate by tenant ID
-pub(crate) async fn read_cert_by_tn_id(db: &SqlitePool, tn_id: TnId) -> ClResult<CertData> {
+pub(crate) async fn read_cert_by_tn_id(
+	db: &SqlitePool,
+	sb: &SecretBox,
+	tn_id: TnId,
+) -> ClResult<CertData> {
 	let res = sqlx::query(CERT_SELECT_BY_TN_ID).bind(tn_id.0).fetch_one(db).await;
 
-	map_res(res, map_cert_row)
+	open_cert(sb, map_res(res, map_cert_row)?)
 }
 
 /// Read a certificate by id_tag
-pub(crate) async fn read_cert_by_id_tag(db: &SqlitePool, id_tag: &str) -> ClResult<CertData> {
+pub(crate) async fn read_cert_by_id_tag(
+	db: &SqlitePool,
+	sb: &SecretBox,
+	id_tag: &str,
+) -> ClResult<CertData> {
 	let res = sqlx::query(CERT_SELECT_BY_ID_TAG)
 		.bind(normalize_id_tag(id_tag).as_ref())
 		.fetch_one(db)
 		.await;
 
-	map_res(res, map_cert_row)
+	open_cert(sb, map_res(res, map_cert_row)?)
 }
 
 /// Read a certificate by domain. The needle is canonicalised the same way
 /// `create_cert` canonicalises the column.
-pub(crate) async fn read_cert_by_domain(db: &SqlitePool, domain: &str) -> ClResult<CertData> {
+pub(crate) async fn read_cert_by_domain(
+	db: &SqlitePool,
+	sb: &SecretBox,
+	domain: &str,
+) -> ClResult<CertData> {
 	let res = sqlx::query(CERT_SELECT_BY_DOMAIN)
 		.bind(dns_host_to_unicode_lossy(domain).as_ref())
 		.fetch_one(db)
 		.await;
 
-	map_res(res, map_cert_row)
+	open_cert(sb, map_res(res, map_cert_row)?)
+}
+
+/// Resolve a request host to the tenant id_tag it names, without needing a certificate
+/// (proxy mode has none). Matches `<id_tag>` or `cl-o.<id_tag>` against `tenants`, then a
+/// custom app domain that has a stored certificate against `certs.domain` (stub rows, with a
+/// NULL `id_tag`, are excluded). `:port` is ignored.
+pub(crate) async fn read_id_tag_by_domain(db: &SqlitePool, domain: &str) -> ClResult<Box<str>> {
+	let host = dns_host_to_unicode_lossy(strip_host_port(domain));
+	let id_tag = host.strip_prefix("cl-o.").unwrap_or(&host);
+	let res = sqlx::query(
+		"SELECT id_tag FROM tenants WHERE id_tag = ?1
+		UNION ALL SELECT id_tag FROM certs WHERE domain = ?2 AND id_tag IS NOT NULL
+		LIMIT 1",
+	)
+	.bind(normalize_id_tag(id_tag).as_ref())
+	.bind(host.as_ref())
+	.fetch_one(db)
+	.await;
+
+	map_res(res, |row| row.try_get("id_tag"))
 }
 
 /// List all valid certificates for cache pre-population
-pub(crate) async fn list_all_certs(db: &SqlitePool) -> ClResult<Vec<CertData>> {
+pub(crate) async fn list_all_certs(db: &SqlitePool, sb: &SecretBox) -> ClResult<Vec<CertData>> {
 	let rows = sqlx::query(CERT_SELECT_VALID).fetch_all(db).await.db()?;
 
 	let mut certs = Vec::new();
 	for row in rows {
-		certs.push(map_cert_row(&row).db()?);
+		certs.push(open_cert(sb, map_cert_row(&row).db()?)?);
 	}
 	Ok(certs)
 }

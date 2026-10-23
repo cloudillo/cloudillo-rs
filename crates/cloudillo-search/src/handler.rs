@@ -236,6 +236,7 @@ pub async fn get_search(
 		anonymous: true,
 		hat: None,
 		exp: None,
+		auth_time: None,
 	});
 	if q.q.chars().count() > MAX_QUERY_CHARS {
 		return Err(Error::ValidationError("Search query too long".into()));
@@ -758,6 +759,7 @@ mod tests {
 			anonymous: false,
 			hat: None,
 			exp: None,
+			auth_time: None,
 		}
 	}
 

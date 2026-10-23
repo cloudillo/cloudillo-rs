@@ -164,6 +164,24 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.default(SettingValue::Int(100))
 			.scope(SettingScope::Tenant)
 			.permission(PermissionLevel::Admin)
+			.validator(|v| match v {
+				SettingValue::Int(i) if *i >= 0 => Ok(()),
+				_ => Err(Error::ValidationError("Storage quota must be >= 0 GB".into())),
+			})
+			.build()?,
+	)?;
+
+	// Trash retention (purged daily by `trash_purge::TrashPurgeTask`)
+	registry.register(
+		SettingDefinition::builder("file.trash_retention_days")
+			.description("Days before trashed files are permanently deleted (0 = never)")
+			.default(SettingValue::Int(30))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::Admin)
+			.validator(|v| match v {
+				SettingValue::Int(i) if *i >= 0 => Ok(()),
+				_ => Err(Error::ValidationError("Trash retention must be >= 0 days".into())),
+			})
 			.build()?,
 	)?;
 

@@ -166,22 +166,25 @@ pub fn prepopulate_cert_cache(app: &App, certs: &[crate::auth_adapter::CertData]
 	loaded
 }
 
-pub async fn create_https_server(
+/// The main listener on `listen`: HTTPS with per-tenant certificates, or plain HTTP in
+/// `MODE=proxy`, where the reverse proxy terminates TLS. Same service either way.
+pub async fn create_server(
 	state: App,
 	listen: &str,
 	api_router: axum::Router,
 	app_router: axum::Router,
 ) -> Result<tokio::task::JoinHandle<Result<(), std::io::Error>>, std::io::Error> {
-	let cert_resolver = Arc::new(CertResolver::new(state.clone()));
-	let mut server_config = rustls::ServerConfig::builder()
-		.with_no_client_auth()
-		.with_cert_resolver(cert_resolver);
-	server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
 	let addr = SocketAddr::from_str(listen).map_err(|_| std::io::ErrorKind::Other)?;
-	let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
-
 	let mode = state.opts.mode;
+	let tls = (!matches!(mode, crate::ServerMode::Proxy)).then(|| {
+		let cert_resolver = Arc::new(CertResolver::new(state.clone()));
+		let mut server_config = rustls::ServerConfig::builder()
+			.with_no_client_auth()
+			.with_cert_resolver(cert_resolver);
+		server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+		axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config))
+	});
+
 	let proxy_protocol =
 		!state.opts.proxy_protocol.is_empty() && matches!(mode, crate::ServerMode::StreamProxy);
 	if !state.opts.proxy_protocol.is_empty() && !proxy_protocol {
@@ -290,12 +293,16 @@ pub async fn create_https_server(
 		.instrument(span)
 	});
 
+	let make_svc = svc.into_make_service_with_connect_info::<SocketAddr>();
+	let Some(tls) = tls else {
+		info!("Listening on HTTP {} (proxy mode)", &listen);
+		return Ok(tokio::spawn(axum_server::bind(addr).serve(make_svc)));
+	};
 	info!(
 		"Listening on HTTPS {}{}",
 		&listen,
 		if proxy_protocol { " (PROXY protocol)" } else { "" }
 	);
-	let make_svc = svc.into_make_service_with_connect_info::<SocketAddr>();
 	let handle = if proxy_protocol {
 		// The PROXY header precedes the ClientHello, so its acceptor is the inner one.
 		let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(tls).acceptor(proxy_acceptor);

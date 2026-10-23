@@ -17,7 +17,7 @@ use cloudillo::settings::SettingValue;
 use cloudillo::types::Patch;
 
 use crate::fixture::{
-	ADMIN, ALICE, CLUB, Fixture, PASSWORD, PEER_HAT_ROLES, call, find_str, prof, req, sign,
+	ADMIN, ALICE, CLUB, Fixture, PASSWORD, PEER_HAT_ROLES, TRASH, call, find_str, prof, req, sign,
 };
 use crate::ops::{Actual, bearer, status_class};
 use crate::subjects::Subject;
@@ -658,8 +658,8 @@ async fn owner_api_key_crud() {
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
 	let owner = fx.subject("owner@alice");
-	let (st, b) =
-		send(fx, owner, Method::POST, "/api/auth/api-keys", r#"{"name":"zqm-crud"}"#).await;
+	let body = format!(r#"{{"name":"zqm-crud","reauth":{{"password":"{PASSWORD}"}}}}"#);
+	let (st, b) = send(fx, owner, Method::POST, "/api/auth/api-keys", &body).await;
 	assert!(st.is_success(), "create: {st} {b}");
 	let id = b["data"]["keyId"].as_i64().expect("keyId");
 	let uri = format!("/api/auth/api-keys/{id}");
@@ -943,7 +943,12 @@ async fn suspension_expiry_and_mfa() {
 	let sadm = fx.subject("owner-sadm@admin");
 	let susp = "zqm-susp.test";
 	let tn = crate::fixture::tenant(&fx.app, susp, None).await.tn_id;
-	let opts = CreateApiKeyOptions { name: Some("zqm-susp"), scopes: None, expires_at: None };
+	let opts = CreateApiKeyOptions {
+		name: Some("zqm-susp"),
+		scopes: None,
+		expires_at: None,
+		auth_time: None,
+	};
 	let key = fx.app.auth_adapter.create_api_key(tn, opts).await.unwrap().plaintext_key;
 	let post = |uri: &'static str, body: String| {
 		call(&fx.api, req(susp, Method::POST, uri, None, Body::from(body)))
@@ -1015,8 +1020,32 @@ async fn suspension_expiry_and_mfa() {
 	let (st, b) = mfa_code("zqm-bogus".into(), "123456".into()).await;
 	assert_eq!(st.as_u16(), 410, "unknown MFA token: {st} {b}");
 	let code = totp::code_at_time(&secret, now).unwrap();
-	let (st, b) = mfa_code(mfa_step().await, code.clone()).await;
-	assert!(find_str(&b, "token").is_some(), "correct MFA code: {st} {b}");
+	// Remember-me is skipped once enrolled: the MFA middleware would refuse the unscoped key.
+	let tok = mfa_step().await;
+	let body = format!(r#"{{"mfaToken":"{tok}","code":"{code}","remember":true}}"#);
+	let (st, b) = post("/api/auth/login/mfa", body).await;
+	let session = find_str(&b, "token").unwrap_or_else(|| panic!("correct MFA code: {st} {b}"));
+	assert!(find_str(&b, "apiKey").is_none(), "remember-me minted a dead unscoped key: {b}");
+	// Nor can the owner mint one by hand, password re-auth or not.
+	let body = format!(r#"{{"name":"zqm-mfa","reauth":{{"password":"{PASSWORD}"}}}}"#);
+	let r = req(susp, Method::POST, "/api/auth/api-keys", Some(session.as_str()), Body::from(body));
+	let (st, b) = call(&fx.api, r).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "unscoped create while enrolled: {b}");
+	// Nor by dropping a scoped key's scopes: the key stays scoped.
+	let scoped = CreateApiKeyOptions {
+		name: Some("zqm-mfa-scoped"),
+		scopes: Some("carddav:read"),
+		expires_at: None,
+		auth_time: None,
+	};
+	let id = fx.app.auth_adapter.create_api_key(tn, scoped).await.unwrap().info.key_id;
+	let body = format!(r#"{{"scopes":null,"reauth":{{"password":"{PASSWORD}"}}}}"#);
+	let uri = format!("/api/auth/api-keys/{id}");
+	let r = req(susp, Method::PATCH, &uri, Some(session.as_str()), Body::from(body));
+	let (st, b) = call(&fx.api, r).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "unscoping patch while enrolled: {b}");
+	let key = fx.app.auth_adapter.read_api_key(tn, id).await.unwrap();
+	assert_eq!(key.scopes.as_deref(), Some("carddav:read"), "unscoping patch wrote: {key:?}");
 	let (st, b) = mfa_code(mfa_step().await, code).await;
 	assert_eq!(status_class(st), Actual::Deny, "replayed MFA code: {st} {b}");
 	let q = cloudillo::auth_adapter::AuditQuery {
@@ -1230,6 +1259,610 @@ async fn link_share_audit_omits_secret() {
 		let d = r.event.details.as_ref().unwrap();
 		assert!(!d.to_string().contains(link), "link id in {}: {d}", r.event.event);
 	}
+}
+
+/// `auth.session_timeout` bounds a session's absolute lifetime: the renewals `login-token` and
+/// `proxy-token` refuse an owner token whose `auth_time` is past the tenant's timeout, and
+/// renew the same token with a fresh `auth_time`.
+#[tokio::test]
+async fn renewal_refused_past_session_timeout() {
+	use cloudillo::auth_adapter::AccessToken;
+	use cloudillo::types::Timestamp;
+	let _g = FIXTURE_LOCK.read().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let timeout = fx.app.settings.get_int(alice, "auth.session_timeout").await.unwrap();
+	let mint = |auth_time: Timestamp| async move {
+		let claims = AccessToken {
+			iss: ALICE,
+			sub: None,
+			scope: None,
+			r: Some("leader"),
+			h: None,
+			exp: Timestamp::from_now(600),
+			auth_time: Some(auth_time),
+		};
+		fx.app
+			.auth_adapter
+			.create_access_token(alice, &claims)
+			.await
+			.unwrap()
+			.into_string()
+	};
+	let stale = mint(Timestamp(Timestamp::now().0 - timeout - 60)).await;
+	let fresh = mint(Timestamp::now()).await;
+	for (m, uri) in [
+		(Method::GET, "/api/auth/login-token"),
+		(Method::GET, "/api/auth/proxy-token"),
+		(Method::GET, "/api/auth/access-token"),
+		(Method::POST, "/api/auth/login-init"),
+	] {
+		for (tok, want) in [(&stale, StatusCode::FORBIDDEN), (&fresh, StatusCode::OK)] {
+			let r = req(ALICE, m.clone(), uri, Some(tok.as_str()), Body::empty());
+			let (st, b) = call(&fx.api, r).await;
+			assert_eq!(st, want, "{m} {uri} (stale = {}): {b}", want == StatusCode::FORBIDDEN);
+		}
+	}
+	// Federated proxy token: the fixture has no remote peer, so only the stale refusal is
+	// reachable (a fresh session would go on to dial the peer).
+	let uri = "/api/auth/proxy-token?idTag=zqm-peer.example.test";
+	let (st, b) = call(&fx.api, req(ALICE, Method::GET, uri, Some(&stale), Body::empty())).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "stale federated proxy-token: {b}");
+	// QR approval: stale only, since a fresh approval would consume the session.
+	let init = req(ALICE, Method::POST, "/api/auth/qr-login/init", None, Body::empty());
+	let (st, body) = call(&fx.api, init).await;
+	assert!(st.is_success(), "qr init: {st} {body}");
+	let id = find_str(&body, "sessionId").expect("sessionId");
+	let uri = format!("/api/auth/qr-login/{id}/respond");
+	let yes = Body::from(r#"{"approved":true}"#);
+	let (st, b) = call(&fx.api, req(ALICE, Method::POST, &uri, Some(&stale), yes)).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "stale QR approval: {b}");
+	// Unscoped API key creation is covered in `api_key_unscoped_lifetime` (it writes keys).
+}
+
+/// Unscoped API keys (full-owner, "stay logged in"): `auth.remember_days` bounds their lifetime
+/// (0 refuses them, blank scopes included), PATCH merges against the stored row instead of
+/// wiping it, and a scoped key carries its creator's login time so a key → session → key chain
+/// stops at `auth.session_timeout`; an unscoped key counts as a fresh login on each use.
+#[tokio::test]
+async fn api_key_unscoped_lifetime() {
+	const REAUTH: &str = concat!(r#""reauth":{"password":""#, "matrix-pass-0", r#""}"#);
+	use cloudillo::auth_adapter::CreateApiKeyOptions;
+	use cloudillo::types::Timestamp;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let owner = fx.subject("owner@alice");
+	let keys = "/api/auth/api-keys";
+	let far = Timestamp::from_now(400 * 86400).0;
+	let mut created = Vec::new();
+
+	// remember_days = 0: no unscoped key, however "unscoped" is spelled.
+	let days = SettingValue::Int;
+	fx.app
+		.settings
+		.set(alice, "auth.remember_days", days(0), &["SADM"])
+		.await
+		.unwrap();
+	for body in [
+		r#"{"name":"k"}"#,
+		r#"{"name":"k","scopes":""}"#,
+		r#"{"name":"k","scopes":"   "}"#,
+	] {
+		let (st, b) = send(fx, owner, Method::POST, keys, body).await;
+		assert_eq!(status_class(st), Actual::Deny, "{body} with remember_days=0: {st} {b}");
+	}
+
+	// remember_days = 1: a far-future expiry is clamped, on create and on PATCH.
+	fx.app
+		.settings
+		.set(alice, "auth.remember_days", days(1), &["SADM"])
+		.await
+		.unwrap();
+	let max = Timestamp::now().0 + 86400 + 60;
+	let body = format!(r#"{{"name":"zqm-unscoped","expiresAt":{far},{REAUTH}}}"#);
+	let (st, b) = send(fx, owner, Method::POST, keys, &body).await;
+	assert!(st.is_success(), "unscoped create: {st} {b}");
+	let id = b["data"]["keyId"].as_i64().expect("keyId");
+	created.push(id);
+	assert!(b["data"]["expiresAt"].as_i64().is_some_and(|e| e <= max), "not clamped: {b}");
+	let uri = format!("{keys}/{id}");
+	let (st, b) = send(fx, owner, Method::PATCH, &uri, &format!(r#"{{"expiresAt":{far}}}"#)).await;
+	assert!(st.is_success(), "unscoped patch: {st} {b}");
+	assert!(b["data"]["expiresAt"].as_i64().is_some_and(|e| e <= max), "patch not clamped: {b}");
+
+	// A rename keeps the scopes (and expiry) it does not mention.
+	let body = r#"{"name":"zqm-scoped","scopes":"carddav:read","expiresAt":1999999999}"#;
+	let (st, b) = send(fx, owner, Method::POST, keys, body).await;
+	assert!(st.is_success(), "scoped create: {st} {b}");
+	let id = b["data"]["keyId"].as_i64().expect("keyId");
+	created.push(id);
+	let uri = format!("{keys}/{id}");
+	let (st, b) = send(fx, owner, Method::PATCH, &uri, r#"{"name":"renamed"}"#).await;
+	assert!(st.is_success(), "rename: {st} {b}");
+	let (st, b) = send(fx, owner, Method::GET, &uri, "").await;
+	assert!(st.is_success(), "read: {st} {b}");
+	assert_eq!(b["data"]["scopes"], "carddav:read", "rename wiped the scopes: {b}");
+	assert_eq!(b["data"]["expiresAt"], 1_999_999_999, "rename wiped the expiry: {b}");
+	assert_eq!(b["data"]["name"], "renamed", "{b}");
+
+	// Re-authentication: an unscoped key (or dropping a key's scopes) needs the password.
+	let scoped = CreateApiKeyOptions {
+		name: Some("zqm-unscope"),
+		scopes: Some("carddav:read"),
+		expires_at: None,
+		auth_time: Some(Timestamp::now()),
+	};
+	let unscope_id = fx.app.auth_adapter.create_api_key(alice, scoped).await.unwrap().info.key_id;
+	created.push(unscope_id);
+	let unscope_uri = format!("{keys}/{unscope_id}");
+	// A well-formed assertion, so `verify_reauth` (not the JSON extractor) refuses it. No TOTP
+	// reauth: enrolled accounts get no unscoped key at all (`suspension_expiry_and_mfa`).
+	let bad_passkey = concat!(
+		r#","reauth":{"webauthn":{"token":"zqm","response":{"id":"AA","rawId":"AA","#,
+		r#""type":"public-key","response":{"clientDataJSON":"AA","authenticatorData":"AA","#,
+		r#""signature":"AA"}}}}"#
+	);
+	for (what, reauth) in [
+		("no reauth", ""),
+		("wrong password", r#","reauth":{"password":"x"}"#),
+		("bad passkey", bad_passkey),
+	] {
+		let body = format!(r#"{{"name":"zqm-sess"{reauth}}}"#);
+		let (st, b) = send(fx, owner, Method::POST, keys, &body).await;
+		assert_eq!(status_class(st), Actual::Deny, "unscoped create, {what}: {st} {b}");
+		let body = format!(r#"{{"scopes":null{reauth}}}"#);
+		let (st, b) = send(fx, owner, Method::PATCH, &unscope_uri, &body).await;
+		assert_eq!(status_class(st), Actual::Deny, "unscope, {what}: {st} {b}");
+	}
+	let (st, b) =
+		send(fx, owner, Method::POST, keys, &format!(r#"{{"name":"zqm-sess",{REAUTH}}}"#)).await;
+	assert_eq!(status_class(st), Actual::Allow, "unscoped create with the password: {st} {b}");
+	let sess_key = b["data"]["plaintextKey"].as_str().expect("plaintextKey").to_owned();
+	created.push(b["data"]["keyId"].as_i64().expect("keyId"));
+	let body = format!(r#"{{"scopes":null,{REAUTH}}}"#);
+	let (st, b) = send(fx, owner, Method::PATCH, &unscope_uri, &body).await;
+	assert_eq!(status_class(st), Actual::Allow, "unscope with the password: {st} {b}");
+
+	// The unscoped key cannot mint its successor: neither as bearer nor through the session
+	// it exchanges for (that one has `exp`, but no proof). Scoped keys stay mintable.
+	let uri = format!("/api/auth/access-token?apiKey={sess_key}");
+	let (st, b) = call(&fx.api, req(ALICE, Method::GET, &uri, None, Body::empty())).await;
+	let xchg = find_str(&b, "token").unwrap_or_else(|| panic!("key exchange: {st} {b}"));
+	for (what, tok) in [("key", sess_key.as_str()), ("exchanged session", xchg.as_str())] {
+		let body = Body::from(r#"{"name":"zqm-chain"}"#);
+		let (st, b) = call(&fx.api, req(ALICE, Method::POST, keys, Some(tok), body)).await;
+		assert_eq!(status_class(st), Actual::Deny, "{what} mints an unscoped key: {st} {b}");
+		let body = Body::from(r#"{"name":"zqm-chain","scopes":"carddav:read"}"#);
+		let (st, b) = call(&fx.api, req(ALICE, Method::POST, keys, Some(tok), body)).await;
+		assert_eq!(status_class(st), Actual::Allow, "{what} mints a scoped key: {st} {b}");
+		created.push(b["data"]["keyId"].as_i64().expect("keyId"));
+	}
+	let timeout = fx.app.settings.get_int(alice, "auth.session_timeout").await.unwrap();
+	let stale_at = Timestamp(Timestamp::now().0 - timeout - 60);
+
+	// Key chain: a scoped `cl_` key carries its creator's login time.
+	let mk = |scopes, auth_time| CreateApiKeyOptions {
+		name: Some("zqm-chain"),
+		scopes,
+		expires_at: None,
+		auth_time: Some(auth_time),
+	};
+	let key = fx.app.auth_adapter.create_api_key(alice, mk(Some("carddav:read"), stale_at));
+	let key = key.await.unwrap();
+	created.push(key.info.key_id);
+	let v = fx.app.auth_adapter.validate_api_key(&key.plaintext_key).await.unwrap();
+	assert_eq!(v.auth_time, Some(stale_at), "scoped key lost its creator's login time");
+
+	// An unscoped key is a fresh login on each use: a stored `auth_time` past the session
+	// timeout still exchanges for a session that renews.
+	let key = fx.app.auth_adapter.create_api_key(alice, mk(None, stale_at)).await.unwrap();
+	created.push(key.info.key_id);
+	let uri = format!("/api/auth/access-token?apiKey={}", key.plaintext_key);
+	let (st, b) = call(&fx.api, req(ALICE, Method::GET, &uri, None, Body::empty())).await;
+	let tok = find_str(&b, "token").unwrap_or_else(|| panic!("unscoped key exchange: {st} {b}"));
+	let r = req(ALICE, Method::GET, "/api/auth/login-token", Some(&tok), Body::empty());
+	let (st, b) = call(&fx.api, r).await;
+	assert_eq!(status_class(st), Actual::Allow, "stale unscoped key session renews: {st} {b}");
+
+	// A rename of an unscoped key older than remember_days (refused, never written with a
+	// past expiry) is not reachable here: the adapter stamps `created_at` itself.
+
+	fx.app.settings.delete(alice, "auth.remember_days").await.unwrap();
+	for id in created {
+		fx.app.auth_adapter.delete_api_key(alice, id).await.unwrap();
+	}
+}
+
+/// A password login with `remember` mints the device key itself (the only unscoped key minted
+/// without `reauth`), and the key works as bearer. `auth.remember_days = 0` logs in without one.
+/// The passkey and MFA paths share `mint_remember_key`; the fixture has no authenticator, and
+/// `auth.mfa` is off.
+#[tokio::test]
+async fn remember_me_login_mints_the_device_key() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let login = async || {
+		let body = format!(
+			r#"{{"idTag":"{ALICE}","password":"{PASSWORD}","remember":true,"deviceName":"zqm-dev"}}"#
+		);
+		let r = req(ALICE, Method::POST, "/api/auth/login", None, Body::from(body));
+		let (st, b) = call(&fx.api, r).await;
+		assert_eq!(st, StatusCode::OK, "login: {b}");
+		assert!(b["data"]["token"].is_string(), "a session: {b}");
+		b["data"]["apiKey"].as_str().map(str::to_owned)
+	};
+
+	let key = login().await.expect("remember mints a key");
+	let r = req(ALICE, Method::GET, "/api/auth/api-keys", Some(&key), Body::empty());
+	let (st, b) = call(&fx.api, r).await;
+	assert_eq!(status_class(st), Actual::Allow, "the device key as bearer: {st} {b}");
+	let minted: Vec<i64> = b["data"]
+		.as_array()
+		.into_iter()
+		.flatten()
+		.filter(|k| k["name"] == "zqm-dev")
+		.filter_map(|k| k["keyId"].as_i64())
+		.collect();
+	assert_eq!(minted.len(), 1, "named after the device: {b}");
+
+	let off = SettingValue::Int(0);
+	fx.app.settings.set(alice, "auth.remember_days", off, &["SADM"]).await.unwrap();
+	let none = login().await;
+	fx.app.settings.delete(alice, "auth.remember_days").await.unwrap();
+	assert_eq!(none, None, "remember_days = 0 logs in without a key");
+	for id in minted {
+		fx.app.auth_adapter.delete_api_key(alice, id).await.unwrap();
+	}
+}
+
+/// `notify.push_allowed = false` (instance-wide) refuses a push subscription even to the owner,
+/// whose tenant `notify.push` is untouched. The body is valid, so the switch is what refuses
+/// (MG-78's empty body fails after the gate instead).
+#[tokio::test]
+async fn push_subscription_refused_when_disallowed() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let shared = cloudillo::types::SHARED_TN;
+	let off = SettingValue::Bool(false);
+	fx.app
+		.settings
+		.set(shared, "notify.push_allowed", off, &["SADM"])
+		.await
+		.unwrap();
+	let body = r#"{"subscription":{"endpoint":"https://push.zqm.test/1",
+		"keys":{"p256dh":"zqm","auth":"zqm"}}}"#;
+	let uri = "/api/notifications/subscription";
+	let (st, b) = send(fx, fx.subject("owner@alice"), Method::POST, uri, body).await;
+	fx.app.settings.delete(shared, "notify.push_allowed").await.unwrap();
+	assert_eq!(st, StatusCode::FORBIDDEN, "subscribe with push disallowed: {b}");
+}
+
+/// `limits.max_storage_gb = 0`: a blob upload with a body is refused with 507 before anything
+/// is stored, and so is one without a Content-Length (chunked), whose pre-check sees 0 bytes
+/// and whose post-read check refuses. The chunked case runs on admin, which stores nothing
+/// (on a tenant with stored blobs the pre-check refuses on its own). The federated attachment
+/// fetch is not quota-checked (a documented ceiling in `cloudillo-file` `sync.rs`), and no
+/// remote peer exists in the fixture to drive it.
+#[tokio::test]
+async fn upload_refused_over_quota() {
+	use axum::http::{HeaderValue, header};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let uri = "/api/files/file/zqm-quota.txt";
+	for (tn, host, owner, chunked) in [
+		(fx.tenants.alice.tn_id, ALICE, "owner@alice", false),
+		(fx.tenants.admin.tn_id, ADMIN, "owner-sadm@admin", true),
+	] {
+		let zero = SettingValue::Int(0);
+		fx.app.settings.set(tn, "limits.max_storage_gb", zero, &["SADM"]).await.unwrap();
+		let used = fx.app.meta_adapter.get_storage_usage(tn).await.unwrap();
+		let mut r = req(host, Method::POST, uri, bearer(fx.subject(owner)), Body::from("zqm"));
+		if !chunked {
+			r.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from_static("3"));
+		}
+		let (st, b) = call(&fx.api, r).await;
+		fx.app.settings.delete(tn, "limits.max_storage_gb").await.unwrap();
+		assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "{owner} (chunked = {chunked}): {b}");
+		assert!(!chunked || used == 0, "{host} stores {used} bytes; the chunked case needs none");
+	}
+}
+
+/// Over quota, re-uploading bytes the tenant already stores adds nothing and is allowed (the
+/// dedup hit counts as 0 bytes); new bytes are still refused. Chunked, so the advisory
+/// Content-Length pre-check sees 0 bytes. On a fresh tenant, to keep the shared ones clean.
+#[tokio::test]
+async fn upload_dedup_over_quota() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let host = "zqm-dedup.test";
+	let tn = crate::fixture::tenant(&fx.app, host, None).await.tn_id;
+	let body = format!(r#"{{"idTag":"{host}","password":"{PASSWORD}"}}"#);
+	let (st, b) =
+		call(&fx.api, req(host, Method::POST, "/api/auth/login", None, body.into())).await;
+	let tok = find_str(&b, "token").unwrap_or_else(|| panic!("login: {st} {b}"));
+	let upload = |bytes: &'static str| {
+		let r = req(
+			host,
+			Method::POST,
+			"/api/files/file/zqm-dedup.txt",
+			Some(tok.as_str()),
+			bytes.into(),
+		);
+		call(&fx.api, r)
+	};
+	let (st, b) = upload("zqm-dedup").await;
+	assert!(st.is_success(), "first upload: {st} {b}");
+	let zero = SettingValue::Int(0);
+	fx.app.settings.set(tn, "limits.max_storage_gb", zero, &["SADM"]).await.unwrap();
+	let (st, b) = upload("zqm-dedup").await;
+	assert!(st.is_success(), "re-upload of stored bytes over quota: {st} {b}");
+	let (st, b) = upload("zqm-new").await;
+	assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "new bytes over quota: {b}");
+}
+
+/// `GET /.well-known/cloudillo/tenant?domain=` (the reverse proxy's on-demand TLS `ask` hook):
+/// no credential; 200 for a tenant's `<id_tag>` and `cl-o.<id_tag>` (port stripped), 404 for an
+/// unknown host; an empty body either way, so it reveals only yes/no. A custom app domain with a
+/// cert row answers 200 too. The fixture's `api` router does not serve `/.well-known/*`, so the
+/// handler is mounted alone.
+#[tokio::test]
+async fn tenant_ask_route() {
+	use axum::routing::get;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	// A custom app domain, as a standalone run's ACME would have stored it.
+	let trash = &fx.tenants.trash;
+	let cert = cloudillo::auth_adapter::CertData {
+		tn_id: trash.tn_id,
+		id_tag: trash.id_tag.into(),
+		domain: "zqm-app.example.test".into(),
+		cert: "zqm".into(),
+		key: "zqm".into(),
+		expires_at: cloudillo::types::Timestamp::from_now(86400),
+		last_renewal_attempt_at: None,
+		last_renewal_error: None,
+		failure_count: 0,
+		notified_at: None,
+	};
+	fx.app.auth_adapter.create_cert(&cert).await.unwrap();
+	let ask = axum::Router::new()
+		.route("/.well-known/cloudillo/tenant", get(cloudillo::auth::handler::get_tenant_domain))
+		.with_state(fx.app.clone());
+	for (domain, want) in [
+		(ALICE, StatusCode::OK),
+		("cl-o.alice.test", StatusCode::OK),
+		("cl-o.alice.test:8443", StatusCode::OK),
+		("zqm-nobody.test", StatusCode::NOT_FOUND),
+		("cl-o.zqm-nobody.test", StatusCode::NOT_FOUND),
+		("zqm-app.example.test", StatusCode::OK),
+		("zqm-other-app.example.test", StatusCode::NOT_FOUND),
+	] {
+		let uri = format!("/.well-known/cloudillo/tenant?domain={domain}");
+		let (st, b) = call(&ask, req(ALICE, Method::GET, &uri, None, Body::empty())).await;
+		assert_eq!(st, want, "{domain}: {b}");
+		assert!(b.is_null(), "{domain} answered with a body: {b}");
+	}
+}
+
+/// `keys` of `GET /api/auth/keys` as `(keyId, status)`.
+async fn keys(fx: &Fixture, s: &Subject) -> Vec<(String, String)> {
+	let (st, b) = send(fx, s, Method::GET, "/api/auth/keys", "").await;
+	assert_eq!(st, StatusCode::OK, "list keys: {b}");
+	let rows = b["data"].as_array().cloned().unwrap_or_default();
+	rows.iter()
+		.map(|k| {
+			let f = |n: &str| k[n].as_str().unwrap_or_default().to_owned();
+			(f("keyId"), f("status"))
+		})
+		.collect()
+}
+
+/// On trash: the owner lists, rotates (the old key becomes verify-only) and revokes a
+/// verify-only key, which `/api/me` stops publishing; revoking the only active key is refused
+/// (409), an unknown key is not found. SADM rotates and revokes through the admin twins. A
+/// community member is refused every owner route. Key ids are per second, hence the sleeps.
+#[tokio::test]
+async fn signing_key_rotation() {
+	use std::time::Duration;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let owner = fx.subject("owner@trash");
+	let sadm = fx.subject("owner-sadm@admin");
+	let member = fx.subject("m-moderator@trash.test");
+	for (m, uri) in [
+		(Method::GET, "/api/auth/keys"),
+		(Method::POST, "/api/auth/keys/rotate"),
+		(Method::POST, "/api/auth/keys/zqm/revoke"),
+	] {
+		let (st, b) = send(fx, member, m.clone(), uri, "").await;
+		assert_eq!(status_class(st), Actual::Deny, "member {m} {uri}: {st} {b}");
+	}
+
+	let before = keys(fx, owner).await;
+	assert!(before.iter().any(|(_, s)| s == "A"), "no active key: {before:?}");
+	tokio::time::sleep(Duration::from_millis(1100)).await;
+	let (st, b) = send(fx, owner, Method::POST, "/api/auth/keys/rotate", "").await;
+	assert_eq!(st, StatusCode::CREATED, "rotate: {b}");
+	let new = b["data"]["keyId"].as_str().unwrap_or_default().to_owned();
+	let after = keys(fx, owner).await;
+	for (id, status) in &after {
+		let want = if *id == new {
+			"A"
+		} else if before.iter().any(|(k, _)| k == id) {
+			"V"
+		} else {
+			""
+		};
+		assert!(want.is_empty() || status == want, "{id} after rotate: {after:?}");
+	}
+	assert!(after.iter().any(|(k, s)| *k == new && s == "A"), "new key not active: {after:?}");
+
+	let rev = |id: &str| format!("/api/auth/keys/{id}/revoke");
+	let (st, b) = send(fx, owner, Method::POST, &rev(&new), "").await;
+	assert_eq!(st, StatusCode::CONFLICT, "revoke the only active key: {b}");
+	let (st, b) = send(fx, owner, Method::POST, &rev("zqm-none"), "").await;
+	assert_eq!(st, StatusCode::NOT_FOUND, "revoke an unknown key: {b}");
+	// A revoked key is evicted from this server's key cache, so it stops verifying here.
+	let meta = &fx.app.meta_adapter;
+	let cached = async |id: &str| meta.read_profile_public_key("trash.test", id).await.is_ok();
+	let old = &before[0].0;
+	meta.add_profile_public_key("trash.test", old, "zqm-pk", None).await.unwrap();
+	assert!(cached(old).await, "seeding the key cache failed");
+	let (st, b) = send(fx, owner, Method::POST, &rev(old), "").await;
+	assert_eq!(st, StatusCode::OK, "revoke verify-only {old}: {b}");
+	assert!(!cached(old).await, "revoked {old} still in the key cache");
+	assert!(keys(fx, owner).await.iter().any(|(k, s)| k == old && s == "R"), "{old} not revoked");
+	let (st, b) = send(fx, owner, Method::GET, "/api/me", "").await;
+	assert!(st.is_success(), "GET /api/me: {st} {b}");
+	assert!(!b.to_string().contains(old.as_str()), "revoked {old} still published: {b}");
+
+	// SADM: rotate, then revoke the demoted key; the new active one alone is refused.
+	tokio::time::sleep(Duration::from_millis(1100)).await;
+	let admin = |rest: &str| format!("/api/admin/tenants/trash.test/keys/{rest}");
+	let (st, b) = send(fx, sadm, Method::POST, &admin("rotate"), "").await;
+	assert_eq!(st, StatusCode::NO_CONTENT, "SADM rotate: {b}");
+	meta.add_profile_public_key("trash.test", &new, "zqm-pk", None).await.unwrap();
+	let (st, b) = send(fx, sadm, Method::POST, &admin(&format!("{new}/revoke")), "").await;
+	assert_eq!(st, StatusCode::NO_CONTENT, "SADM revoke {new}: {b}");
+	assert!(!cached(&new).await, "SADM-revoked {new} still in the key cache");
+	let active: Vec<_> = keys(fx, owner).await.into_iter().filter(|(_, s)| s == "A").collect();
+	assert_eq!(active.len(), 1, "one active key after SADM rotate: {active:?}");
+	let (st, b) =
+		send(fx, sadm, Method::POST, &admin(&format!("{}/revoke", active[0].0)), "").await;
+	assert_eq!(st, StatusCode::CONFLICT, "SADM revoke the only active key: {b}");
+}
+
+/// On trash: the owner requests an export (202; a second request while it is pending is
+/// 409), reads its status, downloads the ZIP once (a second download is 404). SADM requests one
+/// through the admin twin. A community member is refused every owner route. The fixture runs no
+/// scheduler, so the queued `ExportTask` is run here, as it would be.
+#[tokio::test]
+async fn data_export_flow() {
+	use cloudillo::file::export::{ExportStatus, ExportTask};
+	use cloudillo_core::scheduler::Task;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let owner = fx.subject("owner@trash");
+	let sadm = fx.subject("owner-sadm@admin");
+	let member = fx.subject("m-moderator@trash.test");
+	let tn = fx.tenants.trash.tn_id.0;
+	for (m, uri) in [
+		(Method::POST, "/api/export"),
+		(Method::GET, "/api/export"),
+		(Method::GET, "/api/export/download"),
+	] {
+		let (st, b) = send(fx, member, m.clone(), uri, "").await;
+		assert_eq!(status_class(st), Actual::Deny, "member {m} {uri}: {st} {b}");
+	}
+	let tn_id = fx.tenants.trash.tn_id;
+	let run_ctx = async |ctx: &str| {
+		let task = ExportTask::build(0, ctx).unwrap();
+		task.run(&fx.app).await.unwrap();
+	};
+	// Runs the queued task (the one naming the pending request); returns the final status.
+	let run_task = async || {
+		let raw = tokio::fs::read(fx.app.export_path(tn_id, "json")).await.unwrap();
+		let status: ExportStatus = serde_json::from_slice(&raw).unwrap();
+		run_ctx(&format!("{tn}:{}", status.created_at.0)).await;
+		let (st, b) = send(fx, owner, Method::GET, "/api/export", "").await;
+		assert_eq!(st, StatusCode::OK, "export status: {b}");
+		b["data"]["status"].as_str().unwrap_or_default().to_owned()
+	};
+
+	let (st, b) = send(fx, owner, Method::POST, "/api/export", "").await;
+	assert_eq!(st, StatusCode::ACCEPTED, "request export: {b}");
+	assert_eq!(b["data"]["status"], "pending", "{b}");
+	let (st, b) = send(fx, owner, Method::POST, "/api/export", "").await;
+	assert_eq!(st, StatusCode::CONFLICT, "second request while pending: {b}");
+	// A stale task from an earlier request leaves the pending one alone.
+	run_ctx(&format!("{tn}:1")).await;
+	let (_, b) = send(fx, owner, Method::GET, "/api/export", "").await;
+	assert_eq!(b["data"]["status"], "pending", "a stale task finished the export: {b}");
+	assert!(!fx.app.export_path(tn_id, "zip").exists(), "a stale task wrote a ZIP");
+	assert_eq!(run_task().await, "ready");
+	let r = req(TRASH, Method::GET, "/api/export/download", bearer(owner), Body::empty());
+	let resp = tower::ServiceExt::oneshot(fx.api.clone(), r).await.unwrap();
+	assert_eq!(resp.status(), StatusCode::OK, "download");
+	let zip = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+	assert!(zip.starts_with(b"PK"), "not a ZIP: {} bytes", zip.len());
+	let (st, b) = send(fx, owner, Method::GET, "/api/export/download", "").await;
+	assert_eq!(st, StatusCode::NOT_FOUND, "second download: {b}");
+
+	let (st, b) = send(fx, sadm, Method::POST, "/api/admin/tenants/trash.test/export", "").await;
+	assert_eq!(st, StatusCode::ACCEPTED, "SADM export: {b}");
+	assert_eq!(run_task().await, "ready");
+	for ext in ["zip", "json"] {
+		let path = fx.app.export_path(tn_id, ext);
+		let _ = tokio::fs::remove_file(path).await;
+	}
+}
+
+/// `TrashPurgeTask` on trash: retention 0 never purges, retention 30 leaves a freshly trashed
+/// file alone (no over-purge). Aging an entry past the cutoff is not reachable here (the
+/// adapter stamps `updated_at` itself); the cutoff math is `trash_purge::tests::purge_cutoff`.
+#[tokio::test]
+async fn trash_purge_keeps_fresh_trash() {
+	use cloudillo::file::trash_purge::TrashPurgeTask;
+	use cloudillo::meta_adapter::{CreateFile, FileStatus, TRASH_PARENT_ID};
+	use cloudillo_core::scheduler::Task;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let tn_id = fx.tenants.trash.tn_id;
+	let opts = CreateFile {
+		file_id: Some("f1~zqm-purge".into()),
+		parent_id: Some(TRASH_PARENT_ID.into()),
+		owner_tag: Some(TRASH.into()),
+		content_type: "application/json".into(),
+		file_name: "zqm-purge".into(),
+		file_tp: Some("CRDT".into()),
+		status: Some(FileStatus::Active),
+		..Default::default()
+	};
+	let entry = fx.app.meta_adapter.create_file(tn_id, opts).await.unwrap().entry_id;
+	for days in [0, 30] {
+		let val = SettingValue::Int(days);
+		fx.app
+			.settings
+			.set(tn_id, "file.trash_retention_days", val, &["SADM"])
+			.await
+			.unwrap();
+		TrashPurgeTask.run(&fx.app).await.unwrap();
+		let row = fx.app.meta_adapter.read_file(tn_id, &entry).await.unwrap();
+		let row = row.unwrap_or_else(|| panic!("retention {days} dropped the row"));
+		assert!(!matches!(row.status, FileStatus::Deleted), "retention {days} purged fresh trash");
+	}
+	fx.app.settings.delete(tn_id, "file.trash_retention_days").await.unwrap();
+}
+
+/// `email.smtp.password` is write-only. Neither the owner's nor SADM's settings listing
+/// (with and without a prefix) carries its value, and a direct read shows `***`.
+#[tokio::test]
+async fn smtp_password_never_listed() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let shared = cloudillo::types::SHARED_TN;
+	let secret = "zqm-smtp-secret";
+	let key = "email.smtp.password";
+	let val = SettingValue::String(secret.into());
+	fx.app.settings.set(shared, key, val, &["SADM"]).await.unwrap();
+	let mut seen = Vec::new();
+	for n in ["owner@alice", "owner-sadm@admin"] {
+		for uri in ["/api/settings", "/api/settings?prefix=email"] {
+			let (st, b) = send(fx, fx.subject(n), Method::GET, uri, "").await;
+			seen.push((n, uri, st, b.to_string().contains(secret), b));
+		}
+	}
+	let sadm = fx.subject("owner-sadm@admin");
+	let (st, b) = send(fx, sadm, Method::GET, &format!("/api/settings/{key}"), "").await;
+	fx.app.settings.delete(shared, key).await.unwrap();
+	for (n, uri, st, leak, b) in seen {
+		assert!(st.is_success(), "{n} GET {uri}: {st} {b}");
+		assert!(!leak, "{n} GET {uri} leaks the SMTP password: {b}");
+	}
+	assert!(st.is_success(), "SADM GET {key}: {st} {b}");
+	assert_eq!(b["data"]["value"], "***", "SADM GET {key}: {b}");
 }
 
 // vim: ts=4

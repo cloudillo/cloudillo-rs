@@ -29,10 +29,14 @@
 //! | `/api/apps/install`                   | | `app_management()` ᴸ | | | |
 //! | `/api/apps/installed`                 | `app_management()` ᴸ | | | | |
 //! | `/api/apps/@{publisher}/{name}`       | | | | | `app_management()` ᴸ |
+//! | `/api/export`                         | `data_export()` ᵀ | `data_export()` ᵀ | | | |
+//! | `/api/export/download`                | `data_export()` ᵀ | | | | |
 //!
 //! ᴬ public surface (`optional_auth`) but ABAC-guarded, ᴳ public + rate-limited
 //! only, ᶜ auth + ABAC, ᴸ `require_leader` (unscoped leader), ᴱ auth only — handler
-//! self-enforces. ᴮ carries its own body-limit layer. The guard on each fn is in
+//! self-enforces, ᵀ `require_tenant_self` + the handler's `is_tenant_account` (the
+//! account itself; SADM uses `/api/admin/tenants/{id_tag}/export`).
+//! ᴮ carries its own body-limit layer. The guard on each fn is in
 //! `routes/protected.rs` / `routes/public.rs`.
 //!
 //! Note `/api/files/{file_id}` spans two guards: `GET` is a public ABAC read,
@@ -44,8 +48,15 @@ use axum::{
 	routing::{delete, get, patch, post, put},
 };
 
-use crate::file::{access, apkg, handler, management, share, tag};
+use crate::file::{access, apkg, export, handler, management, share, tag};
 use crate::prelude::*;
+
+/// Bulk export of the tenant's own data, gated by `require_tenant_self`.
+pub(crate) fn data_export() -> Router<App> {
+	Router::new()
+		.route("/api/export", get(export::get_export).post(export::post_export))
+		.route("/api/export/download", get(export::get_export_download))
+}
 
 /// File and app-package creation, gated by `check_perm_create("file", "create")`.
 ///

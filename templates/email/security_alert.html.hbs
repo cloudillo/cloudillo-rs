@@ -1,0 +1,28 @@
+---
+layout: default
+subject: "[{{base_id_tag}}] Security alert: {{event}}"
+---
+<p style="font-size: 16px; color: #1f2937; margin: 0 0 20px 0;"><strong>Security alert</strong></p>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
+	A security-relevant event was recorded on your {{instance_name}} instance.
+</p>
+
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0; background-color: #f9fafb; border-radius: 6px;">
+	<tr>
+		<td style="padding: 15px 20px;">
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Event:</strong> {{event}} ({{outcome}})</p>
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Category:</strong> {{category}}</p>
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Time:</strong> {{time}}</p>
+			{{#if tnId}}<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Tenant:</strong> {{tnId}}</p>{{/if}}
+			{{#if actor}}<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Actor:</strong> {{actor}}</p>{{/if}}
+			{{#if ip}}<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>IP:</strong> {{ip}}</p>{{/if}}
+			{{#if failures}}<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Failed logins in the last 15 minutes:</strong> {{failures}}</p>{{/if}}
+			{{#if details}}<p style="font-size: 13px; color: #1f2937; margin: 0;"><strong>Details:</strong> <code>{{details}}</code></p>{{/if}}
+		</td>
+	</tr>
+</table>
+
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0;">
+	Review the audit log for the full history. Further alerts of this type are
+	held back for 15 minutes.
+</p>

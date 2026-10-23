@@ -34,6 +34,10 @@ impl std::fmt::Display for TnId {
 /// `SettingScope::Global` resolves here, and a tenant row of the same key overrides it.
 pub const SHARED_TN: TnId = TnId(0);
 
+/// Federation protocol version this node speaks, advertised as `protocolVersion` in `/api/me`
+/// and `/api/me/full`. Bump on a breaking federation change.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 // Timestamp //
 //***********//
 //pub type Timestamp = u32;
@@ -298,6 +302,8 @@ pub struct Profile {
 	/// A community's partner communities: connected peers holding a hat contract for our
 	/// members. `None` = not a community; `Some([])` = no contracted partners.
 	pub partners: Option<Vec<PublicProfile>>,
+	/// [`PROTOCOL_VERSION`] of the serving node; `None` from a node predating it.
+	pub protocol_version: Option<u32>,
 }
 
 /// Reduced, deliberately public projection returned by `GET /api/profiles/batch` and as
@@ -361,6 +367,8 @@ pub struct ProfileBase {
 	pub r#type: String,
 	pub profile_pic: Option<String>,
 	pub keys: Vec<crate::auth_adapter::AuthKey>,
+	/// [`PROTOCOL_VERSION`] of the serving node; `None` from a node predating it.
+	pub protocol_version: Option<u32>,
 }
 
 /// Public app/web domain of a tenant (the cert `domain`). Used by clients on the

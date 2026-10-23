@@ -17,6 +17,7 @@ use axum::{
 };
 
 use crate::admin;
+use crate::file;
 use crate::prelude::*;
 use crate::proxy;
 
@@ -31,6 +32,13 @@ pub(crate) fn tenant() -> Router<App> {
 			post(admin::tenant::send_password_reset),
 		)
 		.route("/api/admin/tenants/{id_tag}/mfa-reset", post(admin::tenant::reset_mfa))
+		.route("/api/admin/tenants/{id_tag}/keys/rotate", post(admin::tenant::rotate_key))
+		.route(
+			"/api/admin/tenants/{id_tag}/keys/{key_id}/revoke",
+			post(admin::tenant::revoke_key),
+		)
+		// Handler lives in `cloudillo-file` (admin does not depend on it).
+		.route("/api/admin/tenants/{id_tag}/export", post(file::export::post_admin_export))
 		.route("/api/admin/tenants/{id_tag}/suspend", post(admin::tenant::suspend_tenant))
 		.route("/api/admin/tenants/{id_tag}/resume", post(admin::tenant::resume_tenant))
 		.route("/api/admin/tenants/{id_tag}/purge", post(admin::tenant::purge_tenant_handler))

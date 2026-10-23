@@ -198,7 +198,7 @@ pub async fn index_document(app: &App, tn_id: TnId, file_id: &str) -> ClResult<(
 		// Both stores hand back the same `"{collection}/{doc_id}"` shape, so the
 		// manifest and everything below it are store-agnostic.
 		let mut docs = if store_tp == Some(STORE_CRDT) {
-			crate::crdt::export_all(app, tn_id, file_id).await?
+			cloudillo_file::crdt_export::export_all(app, tn_id, file_id).await?
 		} else {
 			app.rtdb_adapter.export_all(tn_id, file_id).await?
 		};
@@ -378,9 +378,10 @@ fn build_parts(
 			// `(tn_id, obj_tp, obj_id, part_id)` and does *not* include
 			// `part_kind`: two emitting rules over documents sharing an id would
 			// otherwise collide and abort the whole object's INSERT. CRDT roots
-			// make that certain — `crdt::collect_root` names array entries by
-			// position, so two root arrays both export `…/0`. This fixes the
-			// collision, not the instability of those positional ids.
+			// make that certain — `cloudillo_file::crdt_export::collect_root`
+			// names array entries by position, so two root arrays both export
+			// `…/0`. This fixes the collision, not the instability of those
+			// positional ids.
 			// `handler::strip_kind` takes the prefix back off for the wire.
 			part_id: format!("{kind}/{doc_id}"),
 			part_kind: kind.to_owned(),

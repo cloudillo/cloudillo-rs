@@ -23,6 +23,7 @@ pub use cloudillo_core::app::{Adapters, App, AppBuilderOpts, AppState, ServerMod
 pub use cloudillo_core::backup::{Manifest, PARTS as BACKUP_PARTS, copy_verified, verify_snapshot};
 use cloudillo_core::extensions::Extensions;
 use cloudillo_core::{abac, rate_limit::RateLimitManager, request, scheduler};
+pub use cloudillo_types::secret_box::SecretBox;
 use cloudillo_types::types::SHARED_TN;
 use cloudillo_types::worker;
 
@@ -36,6 +37,7 @@ pub struct AppBuilder {
 	adapters: Adapters,
 	on_init: Vec<InitCallback>,
 	backup_dir: PathBuf,
+	secret_box: Arc<SecretBox>,
 }
 
 impl AppBuilder {
@@ -76,6 +78,7 @@ impl AppBuilder {
 				acme_email: None,
 				local_address: Box::new([]),
 				disable_cache: false,
+				disable_dnssec: false,
 			},
 			worker: None,
 			adapters: Adapters {
@@ -88,6 +91,7 @@ impl AppBuilder {
 			},
 			on_init: Vec::new(),
 			backup_dir: PathBuf::from("./backup"),
+			secret_box: Arc::new(SecretBox::disabled()),
 		}
 	}
 
@@ -155,6 +159,10 @@ impl AppBuilder {
 		self.opts.disable_cache = disable;
 		self
 	}
+	pub fn disable_dnssec(&mut self, disable: bool) -> &mut Self {
+		self.opts.disable_dnssec = disable;
+		self
+	}
 	pub fn worker(&mut self, worker: Arc<worker::WorkerPool>) -> &mut Self {
 		self.worker = Some(worker);
 		self
@@ -183,6 +191,11 @@ impl AppBuilder {
 	}
 	pub fn idp_adapter(&mut self, idp_adapter: Arc<dyn IdentityProviderAdapter>) -> &mut Self {
 		self.adapters.idp_adapter = Some(idp_adapter);
+		self
+	}
+	/// Encryption at rest for secret settings (default: disabled, plaintext as before)
+	pub fn secret_box(&mut self, secret_box: Arc<SecretBox>) -> &mut Self {
+		self.secret_box = secret_box;
 		self
 	}
 
@@ -249,7 +262,11 @@ impl AppBuilder {
 			frozen_registry.clone(),
 			meta_adapter.clone(),
 			1000, // LRU cache size
+			self.secret_box.clone(),
 		));
+
+		// Refuse a missing/wrong SECRET_KEY, then encrypt plaintext secret settings in place
+		settings_service.init_secrets().await?;
 
 		// Validate required settings are configured
 		settings_service.validate_required_settings().await?;
@@ -461,12 +478,25 @@ impl AppBuilder {
 		let app: App = Arc::new(AppState {
 			scheduler: scheduler::Scheduler::new(task_store.clone()),
 			worker,
-			request: request::Request::new(auth_adapter.clone(), proxy_tokens.clone())?,
+			request: request::Request::new(
+				auth_adapter.clone(),
+				proxy_tokens.clone(),
+				settings_service.clone(),
+				!self.opts.disable_dnssec,
+			)?,
 			proxy_tokens,
 			profile_me,
 			acme_challenge_map: std::sync::RwLock::new(std::collections::HashMap::new()),
 			certs: std::sync::RwLock::new(std::collections::HashMap::new()),
-			opts: self.opts,
+			opts: {
+				let mut opts = self.opts;
+				// Proxy mode: the reverse proxy owns certificates, so no ACME anywhere.
+				// Every cert-issuing path and `acme::init` are keyed on `acme_email`.
+				if matches!(opts.mode, ServerMode::Proxy) {
+					opts.acme_email = None;
+				}
+				opts
+			},
 			broadcast: cloudillo_core::BroadcastManager::new(),
 			permission_checker: Arc::new(tokio::sync::RwLock::new(abac::PermissionChecker::new())),
 			bundled_apps,
@@ -612,7 +642,13 @@ impl AppBuilder {
 		// it answers nothing but `/.well-known/acme-challenge/{token}`, which is
 		// the HTTP-01 responder `bootstrap` needs to be reachable while it asks
 		// for a first certificate.
-		let http_server = if let Some(listen_http) = &app.opts.listen_http {
+		// Not in proxy mode: the proxy terminates TLS and answers ACME itself.
+		let http_server = if let Some(listen_http) = app
+			.opts
+			.listen_http
+			.as_ref()
+			.filter(|_| !matches!(app.opts.mode, ServerMode::Proxy))
+		{
 			let http_listener = tokio::net::TcpListener::bind(listen_http.as_ref()).await?;
 			let http = tokio::spawn(async move { axum::serve(http_listener, http_router).await });
 			info!("Listening on HTTP {}", listen_http);
@@ -654,8 +690,7 @@ impl AppBuilder {
 		// A cache load failure stays non-fatal: the node comes up with an empty site cache
 		// and the next publish fills it.
 		let https_server =
-			webserver::create_https_server(app.clone(), &app.opts.listen, api_router, app_router)
-				.await?;
+			webserver::create_server(app.clone(), &app.opts.listen, api_router, app_router).await?;
 
 		if let Some(http_server) = http_server {
 			let _ = tokio::try_join!(https_server, http_server)?;

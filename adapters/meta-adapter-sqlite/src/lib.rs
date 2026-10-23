@@ -222,6 +222,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		profile::add_public_key(&self.db, id_tag, key_id, public_key, expires_at).await
 	}
 
+	async fn delete_profile_public_key(&self, id_tag: &str, key_id: &str) -> ClResult<()> {
+		profile::delete_public_key(&self.db, id_tag, key_id).await
+	}
+
 	async fn list_stale_profiles(
 		&self,
 		max_age_secs: i64,
@@ -370,6 +374,18 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn is_variant_referenced(&self, tn_id: TnId, variant_id: &str) -> ClResult<bool> {
 		file::is_variant_referenced(&self.dbr, tn_id, variant_id).await
+	}
+
+	async fn get_storage_usage(&self, tn_id: TnId) -> ClResult<u64> {
+		file::get_storage_usage(&self.dbr, tn_id).await
+	}
+
+	async fn list_trashed_entries(
+		&self,
+		tn_id: TnId,
+		before: Timestamp,
+	) -> ClResult<Vec<Box<str>>> {
+		file::list_trashed_entries(&self.dbr, tn_id, before).await
 	}
 
 	async fn read_file_variant(
@@ -557,6 +573,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn read_setting(&self, tn_id: TnId, name: &str) -> ClResult<Option<serde_json::Value>> {
 		setting::read(&self.dbr, tn_id, name).await
+	}
+
+	async fn list_setting_tn_ids(&self, name: &str) -> ClResult<Vec<TnId>> {
+		setting::list_tn_ids(&self.dbr, name).await
 	}
 
 	async fn update_setting(

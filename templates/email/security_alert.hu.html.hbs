@@ -1,0 +1,28 @@
+---
+layout: default
+subject: "[{{base_id_tag}}] Biztonsági riasztás: {{event}}"
+---
+<p style="font-size: 16px; color: #1f2937; margin: 0 0 20px 0;"><strong>Biztonsági riasztás</strong></p>
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0 0 20px 0;">
+	Biztonsági szempontból fontos esemény történt a {{instance_name}} szervereden.
+</p>
+
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 20px 0; background-color: #f9fafb; border-radius: 6px;">
+	<tr>
+		<td style="padding: 15px 20px;">
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Esemény:</strong> {{event}} ({{outcome}})</p>
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Kategória:</strong> {{category}}</p>
+			<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Időpont:</strong> {{time}}</p>
+			{{#if tnId}}<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Bérlő:</strong> {{tnId}}</p>{{/if}}
+			{{#if actor}}<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Szereplő:</strong> {{actor}}</p>{{/if}}
+			{{#if ip}}<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>IP-cím:</strong> {{ip}}</p>{{/if}}
+			{{#if failures}}<p style="font-size: 13px; color: #1f2937; margin: 0 0 8px 0;"><strong>Sikertelen bejelentkezések az elmúlt 15 percben:</strong> {{failures}}</p>{{/if}}
+			{{#if details}}<p style="font-size: 13px; color: #1f2937; margin: 0;"><strong>Részletek:</strong> <code>{{details}}</code></p>{{/if}}
+		</td>
+	</tr>
+</table>
+
+<p style="font-size: 14px; color: #4b5563; line-height: 1.6; margin: 0;">
+	A teljes előzményt az auditnaplóban találod. Az ilyen típusú további
+	riasztásokat 15 percig visszatartjuk.
+</p>

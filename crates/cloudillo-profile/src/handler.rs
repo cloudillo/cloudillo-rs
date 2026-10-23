@@ -17,7 +17,9 @@ use cloudillo_core::extract::{OptionalAuth, OptionalRequestId};
 use cloudillo_core::profile_visibility::{RequesterTier, SectionVisibility};
 use cloudillo_types::meta_adapter::{self, ProfileType};
 use cloudillo_types::roles::{hat_peer, parse_hat_roles};
-use cloudillo_types::types::{ApiResponse, AppDomainRes, Profile, ProfileBase, PublicProfile};
+use cloudillo_types::types::{
+	ApiResponse, AppDomainRes, PROTOCOL_VERSION, Profile, ProfileBase, PublicProfile,
+};
 
 /// Suffix appended to a section field name to mark its required visibility.
 const VIS_SUFFIX: &str = ".vis";
@@ -167,6 +169,7 @@ pub async fn get_tenant_profile_base(
 		r#type: tenant_meta.typ.as_str().to_string(),
 		profile_pic: tenant_meta.profile_pic.map(|s| s.to_string()),
 		keys: auth_profile.keys,
+		protocol_version: Some(PROTOCOL_VERSION),
 	};
 	let body = serde_json::to_vec(&profile)?;
 	let etag = compute_etag(&body);
@@ -274,6 +277,7 @@ pub async fn get_tenant_profile(
 		keys: auth_profile.keys,
 		x: if x_map.is_empty() { None } else { Some(x_map) },
 		partners,
+		protocol_version: Some(PROTOCOL_VERSION),
 	};
 
 	let etag = compute_etag(&serde_json::to_vec(&profile)?);
@@ -383,6 +387,7 @@ mod tests {
 			keys: Vec::new(),
 			x: None,
 			partners,
+			protocol_version: None,
 		};
 		let etag = |p: &Profile| compute_etag(&serde_json::to_vec(p).unwrap());
 		let hidden = etag(&profile(None));
@@ -412,6 +417,7 @@ mod tests {
 				keys: Vec::new(),
 				x: Some(filter_sections(x, anon())),
 				partners: None,
+				protocol_version: None,
 			};
 			compute_etag(&serde_json::to_vec(&p).unwrap())
 		};

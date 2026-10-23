@@ -265,6 +265,7 @@ async fn authenticate(
 				anonymous: false,
 				hat: None,
 				exp: None,
+				auth_time: validation.auth_time,
 			}
 		}
 		Some(ApiKeyType::Idp) => {
@@ -301,6 +302,8 @@ async fn authenticate(
 				anonymous: false,
 				hat: None,
 				exp: None,
+				// IdP keys are not session-derived: each use counts as a fresh login
+				auth_time: Some(Timestamp::now()),
 			}
 		}
 		None => {
@@ -328,9 +331,16 @@ async fn authenticate(
 	Ok(next.run(req).await)
 }
 
-/// An unscoped tenant API key (a full-owner login token minted without a second factor) is
-/// refused when the account has TOTP enrolled, or under `auth.mfa=required`. Scoped keys, DAV
-/// app passwords included, stay usable. A read error propagates, so this fails closed.
+/// Unscoped tenant API keys (full-owner login tokens minted without a second factor) are
+/// refused when the account has TOTP enrolled, or under `auth.mfa=required`.
+pub async fn unscoped_key_refused(app: &App, tn_id: TnId) -> ClResult<bool> {
+	Ok(app.auth_adapter.get_totp(tn_id).await?.is_some()
+		|| app.settings.get_string(cloudillo_types::types::SHARED_TN, "auth.mfa").await?
+			== "required")
+}
+
+/// [`unscoped_key_refused`] applied to a presented key. Scoped keys, DAV app passwords
+/// included, stay usable. A read error propagates, so this fails closed.
 pub async fn api_key_refused_by_mfa(
 	app: &App,
 	validation: &cloudillo_types::auth_adapter::ApiKeyValidation,
@@ -338,9 +348,7 @@ pub async fn api_key_refused_by_mfa(
 	if validation.scopes.is_some() {
 		return Ok(false);
 	}
-	let refused = app.auth_adapter.get_totp(validation.tn_id).await?.is_some()
-		|| app.settings.get_string(cloudillo_types::types::SHARED_TN, "auth.mfa").await?
-			== "required";
+	let refused = unscoped_key_refused(app, validation.tn_id).await?;
 	if refused {
 		warn!(
 			key_id = validation.key_id,
@@ -480,6 +488,7 @@ pub async fn optional_auth(
 									anonymous: false,
 									hat: None,
 									exp: None,
+									auth_time: validation.auth_time,
 								}))
 							}
 							.await
@@ -503,6 +512,8 @@ pub async fn optional_auth(
 										anonymous: false,
 										hat: None,
 										exp: None,
+										// IdP keys are not session-derived: each use counts as a fresh login
+										auth_time: Some(Timestamp::now()),
 									})),
 									Ok(None) => {
 										warn!(
@@ -581,7 +592,7 @@ pub async fn optional_auth(
 /// (`crate::log::CloudilloFormat`) uses the `request` span's `id` field to
 /// prefix every event line with `REQ:<short>`.
 ///
-/// If the outer transport layer (see `cloudillo::webserver::create_https_server`)
+/// If the outer transport layer (see `cloudillo::webserver::create_server`)
 /// has already inserted a `RequestId` extension and entered the `request` span,
 /// `RequestId::install` returns a span that just re-uses the existing id.
 pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Response<Body> {
@@ -625,6 +636,7 @@ mod tests {
 			anonymous: false,
 			hat: None,
 			exp: None,
+			auth_time: None,
 		}
 	}
 

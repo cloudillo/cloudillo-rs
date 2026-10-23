@@ -100,6 +100,16 @@ pub(crate) async fn read(
 	}))
 }
 
+/// Every tn_id holding a row for setting `name`
+pub(crate) async fn list_tn_ids(db: &SqlitePool, name: &str) -> ClResult<Vec<TnId>> {
+	let rows = sqlx::query("SELECT DISTINCT tn_id FROM settings WHERE name = ?1")
+		.bind(name)
+		.fetch_all(db)
+		.await
+		.db()?;
+	rows.iter().map(|r| r.try_get("tn_id").map(TnId).db()).collect()
+}
+
 /// Update or create a setting
 pub(crate) async fn update(
 	db: &SqlitePool,

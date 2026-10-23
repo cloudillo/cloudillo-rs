@@ -36,7 +36,7 @@ async fn tenant_login_is_minted_for_the_host_tenant() {
 	let (adapter, _tmp) = adapter_with_tenants(&["alice.example"]).await;
 
 	let login = adapter
-		.create_tenant_login("alice.example", "alice.example")
+		.create_tenant_login("alice.example", "alice.example", Timestamp::now())
 		.await
 		.expect("the tenant may log into its own host");
 	assert_eq!(login.id_tag.as_ref(), "alice.example");
@@ -52,7 +52,9 @@ async fn tenant_login_refuses_a_foreign_identity() {
 	// host binding can reject this.
 	let (adapter, _tmp) = adapter_with_tenants(&["alice.example", "mallory.example"]).await;
 
-	let res = adapter.create_tenant_login("alice.example", "mallory.example").await;
+	let res = adapter
+		.create_tenant_login("alice.example", "mallory.example", Timestamp::now())
+		.await;
 	assert!(
 		matches!(res, Err(Error::PermissionDenied)),
 		"a visitor at mallory's host must not mint alice's owner login, got {:?}",

@@ -15,7 +15,8 @@ use cloudillo_types::{
 use crate::crypto;
 
 /// Row type for API key validation candidates
-/// (key_id, tn_id, key_hash, scopes, expires_at, roles, status, suspended_at, tenant expires_at)
+/// (key_id, tn_id, key_hash, scopes, expires_at, roles, status, suspended_at, tenant expires_at,
+/// auth_time)
 type ApiKeyCandidateRow = (
 	i64,
 	i32,
@@ -26,6 +27,7 @@ type ApiKeyCandidateRow = (
 	Option<String>,
 	Option<i64>,
 	Option<i64>,
+	i64,
 );
 
 /// Row type for API key info (key_id, key_prefix, name, scopes, expires_at, last_used_at, created_at)
@@ -46,8 +48,8 @@ pub async fn create_api_key(
 
 	// Insert into database
 	let key_id = sqlx::query_scalar::<_, i64>(
-		"INSERT INTO api_keys (tn_id, key_prefix, key_hash, name, scopes, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		"INSERT INTO api_keys (tn_id, key_prefix, key_hash, name, scopes, expires_at, auth_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		RETURNING key_id",
 	)
 	.bind(tn_id.0)
@@ -56,6 +58,7 @@ pub async fn create_api_key(
 	.bind(opts.name)
 	.bind(opts.scopes)
 	.bind(opts.expires_at.map(|t| t.0))
+	.bind(opts.auth_time.map(|t| t.0))
 	.fetch_one(db)
 	.await
 	.map_err(|e| {
@@ -89,7 +92,9 @@ pub async fn validate_api_key(
 	// Find API keys with matching prefix
 	let candidates: Vec<ApiKeyCandidateRow> = sqlx::query_as(
 		"SELECT ak.key_id, ak.tn_id, ak.key_hash, ak.scopes, ak.expires_at, t.roles,
-				t.status, t.suspended_at, t.expires_at
+				t.status, t.suspended_at, t.expires_at,
+				CASE WHEN TRIM(COALESCE(ak.scopes, '')) = '' THEN unixepoch()
+					ELSE COALESCE(ak.auth_time, ak.created_at, 0) END
 			FROM api_keys ak
 			JOIN tenants t ON ak.tn_id = t.tn_id
 			WHERE ak.key_prefix = ?",
@@ -117,6 +122,7 @@ pub async fn validate_api_key(
 		tn_status,
 		tn_suspended_at,
 		tn_expires_at,
+		auth_time,
 	) in candidates
 	{
 		// Purging, suspended or expired tenants get no API-key access
@@ -168,6 +174,7 @@ pub async fn validate_api_key(
 				// zero capabilities it would deny everything in `scope::scope_permits`.
 				scopes: scopes.filter(|s| !s.trim().is_empty()).map(Into::into),
 				roles: Some(expanded_roles),
+				auth_time: Some(Timestamp(auth_time)),
 			});
 		}
 	}

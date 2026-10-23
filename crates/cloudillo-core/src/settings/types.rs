@@ -125,6 +125,14 @@ pub struct SettingDefinition {
 	/// If true, the setting can be None and won't fail validation
 	pub optional: bool,
 
+	/// Readable through `GET /api/settings/{key}` by any unscoped authenticated caller,
+	/// bypassing `require_settings_reader`. Scoped tokens stay denied. Writing is unaffected.
+	pub readable_by_all: bool,
+
+	/// Secret (e.g. a password): encrypted at rest when a `SECRET_KEY` is configured, and never
+	/// returned by the settings REST handlers (write-only, masked for everyone including SADM).
+	pub secret: bool,
+
 	/// Optional validation function
 	pub validator: Option<SettingValidator>,
 }
@@ -138,6 +146,8 @@ impl Clone for SettingDefinition {
 			scope: self.scope,
 			permission: self.permission,
 			optional: self.optional,
+			readable_by_all: self.readable_by_all,
+			secret: self.secret,
 			validator: None, // Don't clone the validator function
 		}
 	}
@@ -152,6 +162,8 @@ impl Debug for SettingDefinition {
 			.field("scope", &self.scope)
 			.field("permission", &self.permission)
 			.field("optional", &self.optional)
+			.field("readable_by_all", &self.readable_by_all)
+			.field("secret", &self.secret)
 			.field("validator", &self.validator.is_some())
 			.finish()
 	}
@@ -172,6 +184,8 @@ pub struct SettingDefinitionBuilder {
 	scope: SettingScope,
 	permission: PermissionLevel,
 	optional: bool,
+	readable_by_all: bool,
+	secret: bool,
 	validator: Option<SettingValidator>,
 }
 
@@ -184,6 +198,8 @@ impl SettingDefinitionBuilder {
 			scope: SettingScope::Tenant,        // Default to most flexible
 			permission: PermissionLevel::Admin, // Default to admin-only for safety
 			optional: false,                    // Default to required for safety
+			readable_by_all: false,
+			secret: false,
 			validator: None,
 		}
 	}
@@ -216,6 +232,18 @@ impl SettingDefinitionBuilder {
 	/// Use this for settings that should not fail validation if missing
 	pub fn optional(mut self, optional: bool) -> Self {
 		self.optional = optional;
+		self
+	}
+
+	/// Let any authenticated caller read this setting (see [`SettingDefinition::readable_by_all`])
+	pub fn readable_by_all(mut self, readable_by_all: bool) -> Self {
+		self.readable_by_all = readable_by_all;
+		self
+	}
+
+	/// Mark this setting as secret (see [`SettingDefinition::secret`])
+	pub fn secret(mut self, secret: bool) -> Self {
+		self.secret = secret;
 		self
 	}
 
@@ -259,6 +287,8 @@ impl SettingDefinitionBuilder {
 			scope: self.scope,
 			permission: self.permission,
 			optional: self.optional,
+			readable_by_all: self.readable_by_all,
+			secret: self.secret,
 			validator: self.validator,
 		})
 	}

@@ -97,6 +97,7 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.scope(SettingScope::Global)
 			.permission(PermissionLevel::Admin)
 			.optional(true)
+			.secret(true)
 			.build()?, // No default - optional
 	)?;
 

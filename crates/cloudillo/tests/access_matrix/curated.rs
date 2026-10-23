@@ -1148,6 +1148,24 @@ pub const SE: &[Row] = &[
 const ADMIN_TENANTS: Route = Call("GET", "/api/admin/tenants", "");
 const ADMIN_PROXY: Route = Call("GET", "/api/admin/proxy-sites", "");
 const SET_USER: Route = Call("PUT", "/api/settings/file.sync_max_vis", r#"{"value":"md"}"#);
+// Instance-wide (Global/Admin) and tenant Admin settings: SADM writes them, nobody else.
+const SET_PEERS: Route =
+	Call("PUT", "/api/settings/federation.peers", r#"{"value":{"mode":"open","allow":[]}}"#);
+const SET_PUSH_ALLOWED: Route =
+	Call("PUT", "/api/settings/notify.push_allowed", r#"{"value":true}"#);
+const SET_COMMUNITY: Route =
+	Call("PUT", "/api/settings/onboarding.community", r#"{"value":"cloudillo.net"}"#);
+const SET_TILES: Route = Call(
+	"PUT",
+	"/api/settings/map.tile_sources",
+	r#"{"value":[{"name":"zqm","url":"https://zqm.test/tiles.png","attribution":"zqm"}]}"#,
+);
+const SET_ALERT_EMAIL: Route = Call("PUT", "/api/settings/audit.alert_email", r#"{"value":""}"#);
+const SET_REMEMBER: Route = Call("PUT", "/api/settings/auth.remember_days", r#"{"value":30}"#);
+const SET_TRASH_DAYS: Route =
+	Call("PUT", "/api/settings/file.trash_retention_days", r#"{"value":30}"#);
+const GET_COMMUNITY: Route = Get("/api/settings/onboarding.community");
+const GET_TILES: Route = Get("/api/settings/map.tile_sources");
 const SET_SHORTCUTS: Route =
 	Call("PUT", "/api/settings/ui.single_key_shortcuts", r#"{"value":false}"#);
 const PROF_SETTINGS: Route = Call("GET", "/api/profiles/m-contributor.test/settings", "");
@@ -1172,6 +1190,7 @@ const SITES: Route = Call("GET", "/api/sites", "");
 const PUSH_SUB: Route = Call("POST", "/api/notifications/subscription", "{}");
 const REINDEX: Route = Call("POST", "/api/search/reindex", "");
 const API_KEYS: Route = Call("GET", "/api/auth/api-keys", "");
+const API_KEY_MINT: Route = Call("POST", "/api/auth/api-keys", r#"{"name":"zqm-mint"}"#);
 const WA_REG: Route = Call("GET", "/api/auth/wa/reg", "");
 const PROXY_TOKEN: Route = Call("GET", "/api/auth/proxy-token", "");
 const VAPID: Route = Call("GET", "/api/auth/vapid", "");
@@ -1283,6 +1302,30 @@ pub const MG: &[Row] = &[
 		Call("PUT", "/api/settings/audit.tenant_categories", r#"{"value":["sharing"]}"#),
 		"Deny",
 	),
+	// Admin-level settings (Global, or Tenant/Admin): SADM writes them, each at its current
+	// default so later rows see no change. Denied subjects: `ADMIN_SETTINGS_DENIED`.
+	("MG-536", "owner-sadm@admin", "", SET_PEERS, "Allow"),
+	("MG-537", "owner-sadm@admin", "", SET_PUSH_ALLOWED, "Allow"),
+	("MG-538", "owner-sadm@admin", "", SET_COMMUNITY, "Allow"),
+	("MG-539", "owner-sadm@admin", "", SET_TILES, "Allow"),
+	// Back to the default list.
+	(
+		"MG-540",
+		"owner-sadm@admin",
+		"",
+		Call("DELETE", "/api/settings/map.tile_sources?level=global", ""),
+		"Allow",
+	),
+	("MG-541", "owner-sadm@admin", "", SET_ALERT_EMAIL, "Allow"),
+	("MG-542", "owner-sadm@admin", "", SET_REMEMBER, "Allow"),
+	("MG-543", "owner-sadm@admin", "", SET_TRASH_DAYS, "Allow"),
+	// `readable_by_all` keys: any unscoped authenticated caller reads them (a follower or a
+	// remote stranger too: instance UI config, not tenant data); scoped and link credentials do
+	// not (`READABLE_ALL_DENIED`).
+	("MG-544", "follower@alice", "", GET_COMMUNITY, "Allow"),
+	("MG-545", "follower@alice", "", GET_TILES, "Allow"),
+	("MG-579", "stranger@alice", "", GET_COMMUNITY, "Allow"),
+	("MG-580", "stranger@alice", "", GET_TILES, "Allow"),
 	// A member's own settings: the member itself (or SADM), not the community's leaders.
 	("MG-26", "m_contributor@club", "", PROF_SETTINGS, "Allow"),
 	("MG-27", "owner@club", "", PROF_SETTINGS, "Deny"),
@@ -1368,6 +1411,14 @@ pub const MG: &[Row] = &[
 	("MG-93", "sharelink-r@alice", "", API_KEYS, "Deny"),
 	("MG-94", "owner-scoped-r@alice", "", API_KEYS, "Deny"),
 	("MG-95", "apikey-dav@alice", "", API_KEYS, "Deny"),
+	// An unscoped key needs re-authentication: never from the key itself (it would renew
+	// itself forever), nor from a session without `reauth`. Allow is `api_key_unscoped_lifetime`.
+	("MG-573", "apikey-unscoped@alice", "", API_KEY_MINT, "Deny"),
+	("MG-574", "owner@alice", "", API_KEY_MINT, "Deny"),
+	("MG-575", "idp-key@alice", "", API_KEY_MINT, "Deny"),
+	("MG-576", "idp-mgmt@alice", "", API_KEY_MINT, "Deny"),
+	("MG-577", "sharelink-r@alice", "", API_KEY_MINT, "Deny"),
+	("MG-578", "apikey-dav@alice", "", API_KEY_MINT, "Deny"),
 	("MG-96", "owner@alice", "", WA_REG, "Allow"),
 	("MG-97", "owner@club", "", WA_REG, "Allow"),
 	("MG-98", "apikey-unscoped@alice", "", WA_REG, "Allow"),
@@ -2107,6 +2158,21 @@ pub const MG: &[Row] = &[
 		"Deny",
 	),
 	("MG-535", "sadm-visit@alice", "", Get("/api/auth/audit"), "Deny"),
+	// Signing keys and data export. Rotate, revoke and export Allow write state:
+	// covered by the `signing_key_rotation` and `data_export_flow` scenario tests.
+	("MG-555", "owner@alice", "", Get("/api/auth/keys"), "Allow"),
+	// No export of alice is ever ready, and the key is unknown: both 404, which reads as Deny.
+	// The 409 on the last active key is in `signing_key_rotation`.
+	("MG-556", "owner@alice", "", Get("/api/export/download"), "Deny"),
+	("MG-557", "owner@alice", "", Call("POST", "/api/auth/keys/zqm/revoke", ""), "Deny"),
+	// SADM visiting alice passes `require_tenant_self`: it may read the key list, but rotate,
+	// revoke and export check `is_tenant_account` (SADM uses the admin twins).
+	("MG-558", "sadm-visit@alice", "", Get("/api/auth/keys"), "Allow"),
+	("MG-559", "sadm-visit@alice", "", Call("POST", "/api/auth/keys/rotate", ""), "Deny"),
+	("MG-560", "sadm-visit@alice", "", Call("POST", "/api/auth/keys/zqm/revoke", ""), "Deny"),
+	("MG-561", "sadm-visit@alice", "", Call("POST", "/api/export", ""), "Deny"),
+	("MG-562", "sadm-visit@alice", "", Get("/api/export"), "Deny"),
+	("MG-563", "sadm-visit@alice", "", Get("/api/export/download"), "Deny"),
 	// POST Allow starts a real run: covered by the `admin_backup_run` scenario test.
 	("MG-518", "owner-sadm@admin", "", Get("/api/admin/backup"), "Allow"),
 	("MG-512", "owner@alice", "", Get("/api/auth/totp"), "Allow"),
@@ -2227,6 +2293,9 @@ const ADMIN_ROUTES: &[(&str, Route)] = &[
 	("MG-501", Call("PATCH", "/api/admin/tenants/trash.test", r#"{"expiresAt":null}"#)),
 	("MG-516", Get("/api/admin/backup")),
 	("MG-517", Call("POST", "/api/admin/backup", "{}")),
+	("MG-564", Call("POST", "/api/admin/tenants/trash.test/keys/rotate", "")),
+	("MG-565", Call("POST", "/api/admin/tenants/trash.test/keys/zqm/revoke", "")),
+	("MG-566", Call("POST", "/api/admin/tenants/trash.test/export", "")),
 ];
 
 /// Every credential short of SADM's unscoped session: SADM itself is scoped down last.
@@ -2244,6 +2313,7 @@ const ADMIN_DENIED: &[&str] = &[
 	"stranger@alice",
 	"sharelink-r@alice",
 	"idp-ident@alice",
+	"idp-key@alice",
 ];
 
 /// The account's own credentials (`require_tenant_self`), refused to every
@@ -2276,6 +2346,29 @@ const OWNER_CRED_DENIED: &[&str] = &[
 	"apkg-publish@alice",
 	"apikey-dav@alice",
 	"owner-scoped-r@alice",
+];
+
+/// Signing keys and data export (`owner_credentials()`, `data_export()`: `require_tenant_self`),
+/// refused to everyone but the account. Community members are club rows: the routes are
+/// host-relative. The unknown key id is never reached: the gate refuses first.
+const OWNER_DATA_ROUTES: &[(&str, Route)] = &[
+	("MG-567", Get("/api/auth/keys")),
+	("MG-568", Call("POST", "/api/auth/keys/rotate", "")),
+	("MG-569", Call("POST", "/api/auth/keys/zqm/revoke", "")),
+	("MG-570", Call("POST", "/api/export", "")),
+	("MG-571", Get("/api/export")),
+	("MG-572", Get("/api/export/download")),
+];
+const OWNER_DATA_DENIED: &[&str] = &[
+	"stranger@alice",
+	"follower@alice",
+	"sharelink-r@alice",
+	"idp-key@alice",
+	"idp-ident@alice",
+	"owner-scoped-r@alice",
+	"anon@alice",
+	"m_leader@club",
+	"m_contributor@club",
 ];
 
 /// Room management on club, refused below a leader and to every non-member credential.
@@ -2338,6 +2431,35 @@ const SETTINGS_WRITE_DENIED: &[&str] = &[
 	"idp-ident@alice",
 	"follower@alice",
 ];
+
+/// Admin-level settings writes (MG-536..543 are SADM's Allow rows). The tenant owner is refused
+/// too: Global keys are instance-wide, and Tenant/Admin keys bound the owner's own session,
+/// API keys and trash (as `auth.session_timeout`, MG-20).
+const ADMIN_SETTINGS_ROUTES: &[(&str, Route)] = &[
+	("MG-546", SET_PEERS),
+	("MG-547", SET_PUSH_ALLOWED),
+	("MG-548", SET_COMMUNITY),
+	("MG-549", SET_TILES),
+	("MG-550", SET_ALERT_EMAIL),
+	("MG-551", SET_REMEMBER),
+	("MG-552", SET_TRASH_DAYS),
+];
+const ADMIN_SETTINGS_DENIED: &[&str] = &[
+	"owner@alice",
+	"follower@alice",
+	"stranger@alice",
+	"sharelink-r@alice",
+	"idp-key@alice",
+	"owner-scoped-r@alice",
+	"apikey-unscoped@alice",
+	"m_leader@club",
+	"anon@alice",
+];
+
+/// `readable_by_all` keys stay closed to scoped tokens, links and keys (MG-544/545 allow).
+const READABLE_ALL_ROUTES: &[(&str, Route)] = &[("MG-553", GET_COMMUNITY), ("MG-554", GET_TILES)];
+const READABLE_ALL_DENIED: &[&str] =
+	&["owner-scoped-r@alice", "sharelink-r@alice", "idp-key@alice", "anon@alice"];
 
 /// The site routes beyond `GET /api/sites` (`require_leader`).
 const SITE_ROUTES: &[(&str, Route)] = &[
@@ -2471,6 +2593,7 @@ type GridRoutes = &'static [(&'static str, Route)];
 const GRIDS: &[(GridRoutes, &[&str])] = &[
 	(ADMIN_ROUTES, ADMIN_DENIED),
 	(OWNER_CRED_ROUTES, OWNER_CRED_DENIED),
+	(OWNER_DATA_ROUTES, OWNER_DATA_DENIED),
 	(CHAN_WRITE_ROUTES, CHAN_WRITE_DENIED),
 	(SETTINGS_READ_ROUTES, SETTINGS_READ_DENIED),
 	(ACCOUNT_ROUTES, ACCOUNT_DENIED),
@@ -2479,6 +2602,8 @@ const GRIDS: &[(GridRoutes, &[&str])] = &[
 	(SITE_ROUTES, SITE_DENIED),
 	(LEADER_MISC_ROUTES, LEADER_MISC_DENIED),
 	(SETTINGS_WRITE_ROUTES, SETTINGS_WRITE_DENIED),
+	(ADMIN_SETTINGS_ROUTES, ADMIN_SETTINGS_DENIED),
+	(READABLE_ALL_ROUTES, READABLE_ALL_DENIED),
 	(SHARE_WRITE_ROUTES, SHARE_WRITE_DENIED),
 	(CHAN_WRITE_ALICE, CHAN_WRITE_ALICE_DENIED),
 ];

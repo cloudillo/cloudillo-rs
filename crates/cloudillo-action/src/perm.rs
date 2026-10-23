@@ -94,6 +94,7 @@ async fn check_action_permission(
 		anonymous: true,
 		hat: None,
 		exp: None,
+		auth_time: None,
 	});
 
 	// Load action attributes

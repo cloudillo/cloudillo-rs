@@ -11,6 +11,9 @@ use cloudillo_core::settings::{
 /// Register all federation/action settings (admin-only infrastructure)
 /// Note: User-facing settings are in profile/settings.rs under the profile.* prefix
 pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
+	// `federation.peers` (peer allow-list) is registered in `cloudillo_core::core_settings`,
+	// because the core `Request` client enforces it; see `cloudillo_core::federation_policy`.
+
 	// Key fetch failure cache size
 	registry.register(
 		SettingDefinition::builder("federation.key_failure_cache_size")

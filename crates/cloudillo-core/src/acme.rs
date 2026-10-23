@@ -378,6 +378,12 @@ impl Task<App> for CertRenewalTask {
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
+		// A task persisted by an earlier standalone run still fires in proxy mode, where the
+		// proxy owns the certificates; left to run, it would suspend tenants on "expiry".
+		if matches!(app.opts.mode, crate::ServerMode::Proxy) {
+			info!("Proxy mode: skipping certificate renewal check");
+			return Ok(());
+		}
 		info!("Running certificate renewal check (renewal threshold: {} days)", self.renewal_days);
 
 		let tenants = app.auth_adapter.list_tenants_needing_cert_renewal(self.renewal_days).await?;
@@ -557,6 +563,11 @@ impl Task<App> for AcmeEarlyRetryTask {
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
+		// Same as `CertRenewalTask`: a retry persisted by a standalone run is moot here.
+		if matches!(app.opts.mode, crate::ServerMode::Proxy) {
+			info!(id_tag = %self.id_tag, "Proxy mode: skipping ACME early retry");
+			return Ok(());
+		}
 		// `read_cert_by_tn_id` filters `cert IS NOT NULL AND key IS NOT NULL`,
 		// so Ok(_) ⇒ cert installed (by an earlier retry or the daily renewal
 		// task) and we should stop. Err(NotFound) ⇒ proceed.

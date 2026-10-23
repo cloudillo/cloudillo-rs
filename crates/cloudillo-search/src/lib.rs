@@ -49,14 +49,12 @@
 //! | [`prune`] | Deleting manifest-named nodes from a document before extraction |
 //! | [`objects`] | File / profile / action → its one index row; the debounced per-object task |
 //! | [`indexer`] | Stored document → deep index rows; the debounced per-document task |
-//! | [`crdt`] | Yjs document → the same JSON shape RTDB exports |
 //! | [`reindex`] | Bulk sweeps: startup backfill, weekly cron, rules-changed |
 //! | [`format`] | `/api/doc-formats` handlers |
 //! | [`admin`] | `POST /api/search/reindex` |
 //! | [`handler`] | `GET /api/search` |
 
 pub mod admin;
-pub mod crdt;
 pub mod extract;
 pub mod format;
 pub mod handler;

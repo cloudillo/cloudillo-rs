@@ -9,9 +9,11 @@
 //! [`cloudillo_types::crdt_adapter::CrdtAdapter`] stores opaque binary updates
 //! and must stay that way — teaching a storage adapter to parse content would
 //! put document semantics in the persistence layer. This module reads the same
-//! updates back through the adapter's public API and materialises them, which
-//! keeps the knowledge of *what a document means* in the search crate where the
-//! rest of it already lives.
+//! updates back through the adapter's public API and materialises them.
+//!
+//! It lives in the file crate, not in `cloudillo-search`, because two callers need
+//! it: the search indexer and the bulk export ([`crate::export`]). Search depends
+//! on this crate, not the other way round.
 //!
 //! # The collection model
 //!

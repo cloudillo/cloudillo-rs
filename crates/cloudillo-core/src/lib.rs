@@ -9,6 +9,7 @@
 
 pub mod abac;
 pub mod acme;
+pub mod alert;
 pub mod app;
 pub mod audit;
 pub mod backup;
@@ -22,11 +23,13 @@ pub mod dns;
 pub mod doc_format;
 pub mod extensions;
 pub mod extract;
+pub mod federation_policy;
 pub mod file_access;
 pub mod log;
 pub mod maintenance;
 pub mod middleware;
 pub mod prelude;
+pub mod profile_keys;
 pub mod profile_me_cache;
 pub mod profile_visibility;
 pub mod proxy_token_cache;

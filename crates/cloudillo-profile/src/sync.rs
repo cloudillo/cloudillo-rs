@@ -6,10 +6,11 @@
 use crate::prelude::*;
 use cloudillo_core::request::ConditionalResult;
 use cloudillo_core::scheduler::{RetryPolicy, Task, TaskId};
+use cloudillo_types::auth_adapter::{AuditCategory, AuditEvent};
 use cloudillo_types::meta_adapter::{
 	Profile, ProfileStatus, ProfileType, UpsertProfileFields, UpsertResult,
 };
-use cloudillo_types::types::{ApiResponse, ProfileBase};
+use cloudillo_types::types::{ApiResponse, PROTOCOL_VERSION, ProfileBase};
 
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
@@ -27,6 +28,44 @@ const DISABLE_REFRESH_AFTER_DAYS: i64 = 7;
 const SECS_PER_DAY: i64 = 86400;
 /// The single profile-picture variant we mirror locally (public, hashed thumbnail).
 const PROFILE_PIC_VARIANT: &str = "vis.pf";
+
+/// Cap of [`PROTOCOL_MISMATCH_SEEN`]
+const MAX_PROTOCOL_MISMATCH_SEEN: usize = 1024;
+
+/// Peers already reported with a different `protocolVersion`, once per process lifetime.
+static PROTOCOL_MISMATCH_SEEN: std::sync::LazyLock<
+	parking_lot::Mutex<std::collections::HashSet<Box<str>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Log and audit a peer whose advertised protocol version differs from ours, once per peer.
+/// A missing version (a node predating it) is not a mismatch. Nothing is dropped.
+async fn check_protocol_version(app: &App, id_tag: &str, remote: &ProfileBase) {
+	let Some(version) = remote.protocol_version.filter(|v| *v != PROTOCOL_VERSION) else {
+		return;
+	};
+	let first = {
+		let mut seen = PROTOCOL_MISMATCH_SEEN.lock();
+		// Clear-on-full, a peer may be re-reported after 1024 distinct mismatches
+		if seen.len() >= MAX_PROTOCOL_MISMATCH_SEEN {
+			seen.clear();
+		}
+		seen.insert(id_tag.into())
+	};
+	if !first {
+		return;
+	}
+	warn!(peer = %id_tag, remote = version, local = PROTOCOL_VERSION,
+		"federation protocol version mismatch");
+	let ev = AuditEvent {
+		details: Some(serde_json::json!({
+			"peer": id_tag,
+			"remoteVersion": version,
+			"localVersion": PROTOCOL_VERSION,
+		})),
+		..AuditEvent::new(AuditCategory::Admin, "federation.protocol_mismatch", "fail")
+	};
+	cloudillo_core::audit::record(app, ev).await;
+}
 
 /// Returns true if the local `vis.pf` variant of a remote profile picture is
 /// already cached in `file_variants`. Used to retry the picture-only sync
@@ -67,6 +106,7 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 	match result {
 		Ok(ConditionalResult::Modified { data: api_response, etag: new_etag }) => {
 			let remote = api_response.data;
+			check_protocol_version(app, id_tag, &remote).await;
 
 			// Determine profile type
 			let typ = match remote.r#type.as_str() {
@@ -243,6 +283,7 @@ pub(crate) async fn apply_refresh(
 			Ok(false)
 		}
 		Ok(ConditionalResult::Modified { data: remote, etag: new_etag }) => {
+			check_protocol_version(app, id_tag, &remote).await;
 			tracing::info!(
 				"Profile {} modified, updating (name={}, profile_pic={:?}, etag={:?})",
 				id_tag,

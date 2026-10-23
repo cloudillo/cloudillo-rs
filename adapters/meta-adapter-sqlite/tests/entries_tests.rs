@@ -1100,3 +1100,53 @@ async fn an_entry_for_content_never_reuses_the_source_placement() {
 	let r = adapter.create_entry_for_content(TN, "f1~nope", copy).await;
 	assert!(matches!(r, Err(Error::NotFound)), "{r:?}");
 }
+
+/// The trash purge sees only live trash roots: not live files, tombstones, nested children
+/// or another tenant's trash.
+#[tokio::test]
+async fn list_trashed_entries_returns_only_live_trash_roots() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let to_trash =
+		UpdateFileOptions { parent_id: Patch::Value(TRASH_PARENT_ID.into()), ..Default::default() };
+
+	let a = folder(&adapter, "t-a").await;
+	adapter.update_file_data(TN, &a.entry_id, &to_trash).await.expect("trash A");
+	folder(&adapter, "t-b").await;
+	let c = folder(&adapter, "t-c").await;
+	adapter.update_file_data(TN, &c.entry_id, &to_trash).await.expect("trash C");
+	adapter.delete_file(TN, &c.entry_id).await.expect("delete C");
+	let d_parent = folder(&adapter, "t-dp").await;
+	upload(&adapter, &d_parent.entry_id, None, "b1~t-d", "f1~t-d").await;
+	adapter
+		.update_file_data(TN, &d_parent.entry_id, &to_trash)
+		.await
+		.expect("trash D parent");
+
+	let other = TnId(2);
+	adapter.create_tenant(other, "bob").await.expect("create tenant");
+	let o = adapter
+		.create_file(
+			other,
+			CreateFile {
+				file_id: Some("t-o".into()),
+				file_name: "t-o".into(),
+				file_tp: Some("FLDR".into()),
+				status: Some(FileStatus::Active),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("other folder");
+	adapter
+		.update_file_data(other, &o.entry_id, &to_trash)
+		.await
+		.expect("trash other");
+
+	let later = Timestamp(Timestamp::now().0 + 10);
+	let mut got = adapter.list_trashed_entries(TN, later).await.expect("list");
+	got.sort();
+	let mut want = vec![a.entry_id, d_parent.entry_id];
+	want.sort();
+	assert_eq!(got, want, "only live trash roots (the D child stays under its folder)");
+	assert!(adapter.list_trashed_entries(TN, Timestamp(0)).await.expect("list").is_empty());
+}

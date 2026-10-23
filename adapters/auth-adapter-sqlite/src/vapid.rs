@@ -5,11 +5,20 @@
 
 use sqlx::{Row, SqlitePool};
 
+use crate::VAPID_PRIVATE_KEY;
 use crate::utils::Db;
-use cloudillo_types::{auth_adapter::KeyPair, prelude::*};
+use cloudillo_types::{
+	auth_adapter::KeyPair,
+	prelude::*,
+	secret_box::{self, SecretBox},
+};
 
 /// Read VAPID key pair (public and private keys)
-pub(crate) async fn read_vapid_key(db: &SqlitePool, tn_id: TnId) -> ClResult<KeyPair> {
+pub(crate) async fn read_vapid_key(
+	db: &SqlitePool,
+	sb: &SecretBox,
+	tn_id: TnId,
+) -> ClResult<KeyPair> {
 	let res =
 		sqlx::query("SELECT vapid_public_key, vapid_private_key FROM tenants WHERE tn_id = ?1")
 			.bind(tn_id.0)
@@ -26,10 +35,15 @@ pub(crate) async fn read_vapid_key(db: &SqlitePool, tn_id: TnId) -> ClResult<Key
 
 	match (public_key, private_key) {
 		(Some(pub_key), Some(priv_key)) => {
-			Ok(KeyPair { public_key: pub_key.into(), private_key: priv_key.into() })
+			let private_key = sb.decrypt(&priv_key, &vapid_aad(tn_id))?.into();
+			Ok(KeyPair { public_key: pub_key.into(), private_key })
 		}
 		_ => Err(Error::NotFound),
 	}
+}
+
+fn vapid_aad(tn_id: TnId) -> String {
+	secret_box::aad(VAPID_PRIVATE_KEY.0, VAPID_PRIVATE_KEY.1, &tn_id.0.to_string())
 }
 
 /// Read VAPID public key only
@@ -49,12 +63,17 @@ pub(crate) async fn read_vapid_public_key(db: &SqlitePool, tn_id: TnId) -> ClRes
 }
 
 /// Update VAPID key pair
-pub(crate) async fn update_vapid_key(db: &SqlitePool, tn_id: TnId, key: &KeyPair) -> ClResult<()> {
+pub(crate) async fn update_vapid_key(
+	db: &SqlitePool,
+	sb: &SecretBox,
+	tn_id: TnId,
+	key: &KeyPair,
+) -> ClResult<()> {
 	sqlx::query(
 		"UPDATE tenants SET vapid_public_key = ?1, vapid_private_key = ?2 WHERE tn_id = ?3",
 	)
 	.bind(key.public_key.as_ref())
-	.bind(key.private_key.as_ref())
+	.bind(sb.encrypt(&key.private_key, &vapid_aad(tn_id))?)
 	.bind(tn_id.0)
 	.execute(db)
 	.await

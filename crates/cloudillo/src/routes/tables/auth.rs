@@ -27,6 +27,9 @@
 //! | `/api/auth/wa/reg/{key_id}`          | | | | `owner_credentials()` ᵀ |
 //! | `/api/auth/api-keys`                 | `owner_credentials()` ᵀ | `owner_credentials()` ᵀ | | |
 //! | `/api/auth/api-keys/{key_id}`        | `owner_credentials()` ᵀ | | `owner_credentials()` ᵀ | `owner_credentials()` ᵀ |
+//! | `/api/auth/keys`                     | `owner_credentials()` ᵀ | | | |
+//! | `/api/auth/keys/rotate`              | | `owner_credentials()` ᵀ | | |
+//! | `/api/auth/keys/{key_id}/revoke`     | | `owner_credentials()` ᵀ | | |
 //! | `/api/auth/totp`                     | `owner_credentials()` ᵀ | | | `owner_credentials()` ᵀ |
 //! | `/api/auth/totp/enroll`              | | `owner_credentials()` ᵀ | | |
 //! | `/api/auth/totp/confirm`             | | `owner_credentials()` ᵀ | | |
@@ -51,7 +54,7 @@ use axum::{
 	routing::{delete, get, post},
 };
 
-use crate::auth::{api_key, audit, handler, qr_login, totp, webauthn};
+use crate::auth::{api_key, audit, handler, keys, qr_login, totp, webauthn};
 use crate::prelude::*;
 use crate::push;
 
@@ -102,6 +105,10 @@ pub(crate) fn owner_credentials() -> Router<App> {
 				.patch(api_key::update_api_key)
 				.delete(api_key::delete_api_key),
 		)
+		// Rotate/revoke also require `is_tenant_account` (SADM uses the admin twins).
+		.route("/api/auth/keys", get(keys::list_keys))
+		.route("/api/auth/keys/rotate", post(keys::post_rotate))
+		.route("/api/auth/keys/{key_id}/revoke", post(keys::post_revoke))
 }
 
 /// TOTP enrollment, mounted like [`owner_credentials`] plus the `"auth"` bucket: each wrong

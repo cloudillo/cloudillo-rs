@@ -106,6 +106,7 @@ fn all_api_tables() -> axum::Router<crate::prelude::App> {
 		.merge(file::tags())
 		.merge(file::read())
 		.merge(file::list_public())
+		.merge(file::data_export())
 		.merge(idp::management())
 		.merge(idp::api_keys())
 		.merge(idp::public_discovery())

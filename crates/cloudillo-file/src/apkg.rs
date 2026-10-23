@@ -63,6 +63,7 @@ pub async fn get_container_content(
 			anonymous: true,
 			hat: None,
 			exp: None,
+			auth_time: None,
 		};
 		(guest_ctx, "guest".into())
 	};

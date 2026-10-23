@@ -453,7 +453,10 @@ pub async fn seed_api_keys(app: &App, t: &Tenants) -> ApiKeys {
 	] {
 		let k = app
 			.auth_adapter
-			.create_api_key(tn, CreateApiKeyOptions { name: Some(name), scopes, expires_at })
+			.create_api_key(
+				tn,
+				CreateApiKeyOptions { name: Some(name), scopes, expires_at, auth_time: None },
+			)
 			.await
 			.unwrap();
 		if name == "zqmatrix-unscoped" {
@@ -463,11 +466,21 @@ pub async fn seed_api_keys(app: &App, t: &Tenants) -> ApiKeys {
 	}
 	let [unscoped, file_read, dav, expired, carddav_r] = <[String; 5]>::try_from(keys).unwrap();
 	// club's own key, for the leader-on-its-own-keys rows.
-	let opts = CreateApiKeyOptions { name: Some("zqmatrix-club"), scopes: None, expires_at: None };
+	let opts = CreateApiKeyOptions {
+		name: Some("zqmatrix-club"),
+		scopes: None,
+		expires_at: None,
+		auth_time: None,
+	};
 	let club = app.auth_adapter.create_api_key(t.club.tn_id, opts).await.unwrap();
 	assert_eq!(club.info.key_id, 6, "curated rows name club's key as /api/auth/api-keys/6");
 	let scopes = Some("carddav:read,carddav:write,caldav:read,caldav:write");
-	let opts = CreateApiKeyOptions { name: Some("zqmatrix-dav-rw"), scopes, expires_at: None };
+	let opts = CreateApiKeyOptions {
+		name: Some("zqmatrix-dav-rw"),
+		scopes,
+		expires_at: None,
+		auth_time: None,
+	};
 	let dav_rw = app.auth_adapter.create_api_key(tn, opts).await.unwrap();
 	assert_eq!(dav_rw.info.key_id, 7, "alice's read-write DAV key is key 7");
 	let (club, dav_rw) = (club.plaintext_key.to_string(), dav_rw.plaintext_key.to_string());

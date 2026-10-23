@@ -754,6 +754,17 @@ pub(crate) async fn add_public_key(
 	Ok(())
 }
 
+/// Evict a cached public key (on local revocation, so it stops verifying here at once).
+pub(crate) async fn delete_public_key(db: &SqlitePool, id_tag: &str, key_id: &str) -> ClResult<()> {
+	sqlx::query("DELETE FROM key_cache WHERE id_tag=? AND key_id=?")
+		.bind(normalize_id_tag(id_tag).as_ref())
+		.bind(key_id)
+		.execute(db)
+		.await
+		.db()?;
+	Ok(())
+}
+
 /// List stale profiles that need refreshing
 ///
 /// Returns profiles that are:

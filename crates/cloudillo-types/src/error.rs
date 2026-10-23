@@ -53,6 +53,7 @@ pub enum Error {
 	FileSourceForbidden,   // 403: Caller has no READ on the source
 	FileSourceUnreachable, // 503: Source server unreachable during synchronous resolve
 	FileCycleRejected,     // 400: sourceFileId is itself a cross-context row
+	QuotaExceeded,         // 507: upload would pass the tenant's `limits.max_storage_gb`
 
 	// externals
 	Io(std::io::Error),
@@ -218,6 +219,11 @@ impl IntoResponse for Error {
 				StatusCode::BAD_REQUEST,
 				"E-FILE-CYCLEREJ".to_string(),
 				"cycle_rejected".to_string(),
+			),
+			Error::QuotaExceeded => (
+				StatusCode::INSUFFICIENT_STORAGE,
+				"E-FILE-QUOTA".to_string(),
+				"storage quota exceeded".to_string(),
 			),
 		};
 

@@ -1,0 +1,20 @@
+---
+layout: default
+subject: "[{{base_id_tag}}] Security alert: {{event}}"
+---
+Security Alert
+==============
+
+A security-relevant event was recorded on your {{instance_name}} instance.
+
+Event:    {{event}} ({{outcome}})
+Category: {{category}}
+Time:     {{time}}
+{{#if tnId}}Tenant:   {{tnId}}
+{{/if}}{{#if actor}}Actor:    {{actor}}
+{{/if}}{{#if ip}}IP:       {{ip}}
+{{/if}}{{#if failures}}Failed logins in the last 15 minutes: {{failures}}
+{{/if}}{{#if details}}Details:  {{details}}
+{{/if}}
+Review the audit log for the full history. Further alerts of this type are
+held back for 15 minutes.
