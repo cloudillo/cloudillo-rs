@@ -252,8 +252,12 @@ pub struct CrdtAdapterRedb {
 	/// Configuration
 	config: AdapterConfig,
 
-	/// Cache of redb Database instances (one per file)
+	/// Cache of redb Database instances (one per file). Idle files are closed by the
+	/// eviction sweep ([`evict_db_files`]).
 	file_databases: Arc<RwLock<HashMap<PathBuf, DbCell>>>,
+
+	/// Last use (unix seconds) of each redb file, stamped by `get_or_open_db_file`.
+	db_last_used: Arc<DashMap<PathBuf, u64>>,
 
 	/// Cache of document instances (with broadcasters)
 	doc_instances: Arc<DashMap<String, Arc<DocumentInstance>>>,
@@ -294,14 +298,41 @@ impl CrdtAdapterRedb {
 			storage_path, per_tenant_files
 		);
 
-		Ok(Self {
+		let adapter = Self {
 			storage_path,
 			per_tenant_files,
 			config,
 			file_databases: Arc::new(RwLock::new(HashMap::new())),
+			db_last_used: Arc::new(DashMap::new()),
 			doc_instances: Arc::new(DashMap::new()),
 			maintenance: Arc::new(RwLock::new(HashMap::new())),
-		})
+		};
+		if adapter.config.auto_evict {
+			adapter.spawn_eviction_task();
+		}
+		Ok(adapter)
+	}
+
+	/// Background sweep honouring `idle_timeout_secs` and `max_instances`, after
+	/// rtdb-adapter-redb's `spawn_eviction_task`: every minute it drops idle document
+	/// instances and closes idle redb files.
+	/// The `max_instances` cap is enforced per sweep, not at insert, so it can be
+	/// overshot for up to a minute; add an insert-time cap if that matters.
+	fn spawn_eviction_task(&self) {
+		let doc_instances = Arc::clone(&self.doc_instances);
+		let file_databases = Arc::clone(&self.file_databases);
+		let db_last_used = Arc::clone(&self.db_last_used);
+		let maintenance = Arc::clone(&self.maintenance);
+		let (idle, max) = (self.config.idle_timeout_secs, self.config.max_instances);
+		tokio::spawn(async move {
+			let mut interval = tokio::time::interval(std::time::Duration::from_mins(1));
+			loop {
+				interval.tick().await;
+				let now = Timestamp::now().0.cast_unsigned();
+				evict_doc_instances(&doc_instances, now, idle, max);
+				evict_db_files(&file_databases, &db_last_used, &maintenance, now, idle, max).await;
+			}
+		});
 	}
 
 	/// The maintenance barrier for one redb file, created on first use.
@@ -331,6 +362,7 @@ impl CrdtAdapterRedb {
 	/// and a document instance must take the instance first — see
 	/// [`Self::store_update`].
 	async fn get_or_open_db_file(&self, db_path: PathBuf) -> ClResult<DbHandle> {
+		self.db_last_used.insert(db_path.clone(), Timestamp::now().0.cast_unsigned());
 		// Taken *before* the handle and released only with it — see `DbHandle`.
 		let barrier = self.path_barrier(&db_path).await;
 		let guard = barrier.read_owned().await;
@@ -447,6 +479,70 @@ impl CrdtAdapterRedb {
 		self.doc_instances.insert(doc_id.to_string(), Arc::clone(&instance));
 
 		Ok(instance)
+	}
+}
+
+/// Drops document instances idle for more than `idle` seconds, then the least recently used
+/// beyond `max`. Only instances nothing else holds: one with a live subscriber would split
+/// its broadcaster, and one held by an in-flight `store_update` owns sequence numbers that a
+/// recreated instance (which re-derives them from the DB) would hand out again. `remove_if`
+/// checks under the shard lock, so no new clone can appear between check and removal.
+fn evict_doc_instances(
+	map: &DashMap<String, Arc<DocumentInstance>>,
+	now: u64,
+	idle: u64,
+	max: usize,
+) {
+	let mut order: Vec<(u64, String)> = map
+		.iter()
+		.map(|e| (e.last_accessed.load(Ordering::Relaxed), e.key().clone()))
+		.collect();
+	order.sort_unstable();
+	for (last, key) in order {
+		if now.saturating_sub(last) <= idle && map.len() <= max {
+			break;
+		}
+		map.remove_if(&key, |_, inst| {
+			Arc::strong_count(inst) == 1
+				&& inst.broadcaster.receiver_count() == 0
+				&& inst.last_accessed.load(Ordering::Relaxed) == last
+		});
+	}
+}
+
+/// Closes redb files unused for more than `idle` seconds, then the least recently used
+/// beyond `max`. Each cell leaves the cache under its path barrier's *write* guard, taken
+/// with `try_write_owned`: success means no `DbHandle` for the file is alive (an in-use or
+/// compacting file is skipped), and holding it while the cell is dropped means the next
+/// open cannot overlap a live `redb::Database` for the same file — the contract
+/// `compact_storage` relies on.
+async fn evict_db_files(
+	cache: &RwLock<HashMap<PathBuf, DbCell>>,
+	last_used: &DashMap<PathBuf, u64>,
+	maintenance: &RwLock<HashMap<PathBuf, PathBarrier>>,
+	now: u64,
+	idle: u64,
+	max: usize,
+) {
+	let mut order: Vec<(u64, PathBuf)> = {
+		let cache = cache.read().await;
+		cache.keys().map(|p| (last_used.get(p).map_or(0, |t| *t), p.clone())).collect()
+	};
+	order.sort_unstable();
+	let mut open = order.len();
+	for (last, path) in order {
+		if now.saturating_sub(last) <= idle && open <= max {
+			break;
+		}
+		let barrier = maintenance.read().await.get(&path).map(Arc::clone);
+		let Some(Ok(_guard)) = barrier.map(RwLock::try_write_owned) else {
+			continue;
+		};
+		cache.write().await.remove(&path);
+		// Keeps a fresher timestamp written by a concurrent opener.
+		last_used.remove_if(&path, |_, t| *t == last);
+		open -= 1;
+		debug!("Evicted idle CRDT database {}", path.display());
 	}
 }
 
@@ -806,9 +902,9 @@ impl CrdtAdapter for CrdtAdapterRedb {
 			//
 			// Only for a path that *was* cached, though: that warmth argument holds
 			// for a file something opened, not for one this sweep found by walking
-			// the directory. `file_databases` is never evicted, so reopening every
-			// file on disk would pin an fd and a redb page cache for every tenant
-			// that has ever existed.
+			// the directory. Reopening every file on disk would pin an fd and a redb
+			// page cache for every tenant that has ever existed, until the eviction
+			// sweep closed them again.
 			if cached.contains(&path)
 				&& let Err(e) = self.open_db_file_guarded(path.clone()).await
 			{
@@ -1001,6 +1097,53 @@ impl std::fmt::Debug for CrdtAdapterRedb {
 			.field("per_tenant_files", &self.per_tenant_files)
 			.field("config", &self.config)
 			.finish_non_exhaustive()
+	}
+}
+
+#[cfg(test)]
+mod eviction_tests {
+	use super::*;
+
+	fn instance(last: u64) -> Arc<DocumentInstance> {
+		let (tx, _) = tokio::sync::broadcast::channel(4);
+		let inst = DocumentInstance::new_with_seq(tx, 0);
+		inst.last_accessed.store(last, Ordering::Relaxed);
+		Arc::new(inst)
+	}
+
+	#[test]
+	fn evicts_only_idle_unheld_unsubscribed_instances() {
+		let map = DashMap::new();
+		map.insert("idle".to_string(), instance(0));
+		map.insert("fresh".to_string(), instance(1000));
+		let subscribed = instance(0);
+		let _rx = subscribed.broadcaster.subscribe();
+		map.insert("subscribed".to_string(), subscribed);
+		let held = instance(0);
+		map.insert("held".to_string(), Arc::clone(&held));
+
+		evict_doc_instances(&map, 1000, 300, 100);
+		let mut left: Vec<String> = map.iter().map(|e| e.key().clone()).collect();
+		left.sort();
+		assert_eq!(left, ["fresh", "held", "subscribed"]);
+
+		// Over the cap, the least recently used evictable instance goes even if not idle.
+		map.insert("fresh2".to_string(), instance(999));
+		evict_doc_instances(&map, 1000, 300, 3);
+		assert!(!map.contains_key("fresh2"));
+		assert_eq!(map.len(), 3);
+	}
+
+	#[tokio::test]
+	async fn evicting_a_db_file_drops_its_last_used_entry() {
+		let path = PathBuf::from("idle.db");
+		let cache = RwLock::new(HashMap::from([(path.clone(), DbCell::default())]));
+		let last_used = DashMap::from_iter([(path.clone(), 0)]);
+		let maintenance = RwLock::new(HashMap::from([(path, Arc::new(RwLock::new(())))]));
+
+		evict_db_files(&cache, &last_used, &maintenance, 1000, 300, 100).await;
+		assert!(cache.read().await.is_empty());
+		assert!(last_used.is_empty());
 	}
 }
 
