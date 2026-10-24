@@ -275,6 +275,9 @@ fn parse_status_list(value: &str) -> ClResult<Option<Box<[ProfileStatus]>>> {
 /// list), and only ever the Connected rows: `connected` is forced to Connected, and
 /// `connected=R` / `connected=false` give an empty list (followed, follower and disconnected
 /// contacts are not connections).
+///
+/// The tenant's own row is never listed (it is not a contact), so `?idTag=<own>` is empty;
+/// read it with `GET /api/profiles/{idTag}`.
 pub async fn list_profiles(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -330,6 +333,7 @@ pub async fn list_profiles(
 		follower: params.follower.filter(|_| full),
 		q: params.search.as_ref().map(|s| s.to_lowercase()),
 		id_tag: params.id_tag,
+		exclude_id_tag: Some(tenant_id_tag.to_string()),
 		trust_set: params.trust_set.filter(|_| full),
 		hidden_in_home: None,
 		// Unset: this endpoint keeps the name-ordered top-100 listing.

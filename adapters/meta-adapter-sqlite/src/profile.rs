@@ -211,6 +211,10 @@ pub(crate) async fn list(
 		query.push(" AND id_tag=").push_bind(normalize_id_tag(id_tag).into_owned());
 	}
 
+	if let Some(id_tag) = &opts.exclude_id_tag {
+		query.push(" AND id_tag!=").push_bind(normalize_id_tag(id_tag).into_owned());
+	}
+
 	if let Some(trust_set) = opts.trust_set {
 		if trust_set {
 			query.push(" AND trust IS NOT NULL");

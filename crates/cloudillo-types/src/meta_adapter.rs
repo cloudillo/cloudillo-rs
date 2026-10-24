@@ -338,6 +338,8 @@ pub struct ListProfileOptions {
 	pub follower: Option<bool>,
 	pub q: Option<String>,
 	pub id_tag: Option<String>,
+	/// Leave out the profile with this id_tag (e.g. the tenant's own row).
+	pub exclude_id_tag: Option<String>,
 	/// Filter profiles by whether a trust preference is set.
 	/// `Some(true)` returns only profiles with a non-null trust value;
 	/// `Some(false)` returns only profiles with NULL trust; `None` does not filter.

@@ -206,6 +206,7 @@ async fn test_list_profiles() {
 		follower: None,
 		q: None,
 		id_tag: None,
+		exclude_id_tag: None,
 		trust_set: None,
 		hidden_in_home: None,
 		limit: None,
@@ -220,6 +221,25 @@ async fn test_list_profiles() {
 		// May be empty or have profiles
 		let _ = profiles; // Just verify we got a result
 	}
+}
+
+#[tokio::test]
+async fn test_list_profiles_exclude_id_tag() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.expect("Should create tenant");
+	insert_profile_with_status(&adapter, tn_id, "bob", Patch::Undefined).await;
+
+	let opts = ListProfileOptions { exclude_id_tag: Some("alice".into()), ..Default::default() };
+	let profiles = adapter.list_profiles(tn_id, &opts).await.expect("Should list profiles");
+	let id_tags: Vec<&str> = profiles.iter().map(|p| p.id_tag.as_ref()).collect();
+	assert!(!id_tags.contains(&"alice"), "excluded own row must not be listed");
+	assert!(id_tags.contains(&"bob"));
+
+	// Without the option the own row is listed (search reindex relies on this).
+	let opts = ListProfileOptions::default();
+	let profiles = adapter.list_profiles(tn_id, &opts).await.expect("Should list profiles");
+	assert!(profiles.iter().any(|p| &*p.id_tag == "alice"), "own row must be listed by default");
 }
 
 /// Helper: insert a Person profile with a given status (or NULL).
