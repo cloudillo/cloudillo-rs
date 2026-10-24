@@ -350,7 +350,11 @@ impl From<hyper::Error> for Error {
 #[cfg(feature = "server")]
 impl From<hyper_util::client::legacy::Error> for Error {
 	fn from(err: hyper_util::client::legacy::Error) -> Self {
-		warn!("hyper error: {}", err);
+		if let Some(src) = std::error::Error::source(&err) {
+			warn!("hyper error: {} ({})", err, src);
+		} else {
+			warn!("hyper error: {}", err);
+		}
 		Error::NetworkError("HTTP client error".into())
 	}
 }
