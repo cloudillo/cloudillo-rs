@@ -139,8 +139,8 @@ pub struct AppBuilderOpts {
 	pub local_address: Box<[Box<str>]>,
 	/// Disable HTTP caching (for development)
 	pub disable_cache: bool,
-	/// Skip DNSSEC validation of federation lookups (resolvers that strip RRSIGs)
-	pub disable_dnssec: bool,
+	/// Validate DNSSEC on federation lookups (needs a resolver that passes RRSIG/DS/NSEC)
+	pub enable_dnssec: bool,
 }
 
 // vim: ts=4

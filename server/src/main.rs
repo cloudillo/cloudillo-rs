@@ -191,8 +191,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	if env::var("DISABLE_CACHE").is_ok() {
 		cloudillo.disable_cache(true);
 	}
-	if env::var("DISABLE_DNSSEC").is_ok() {
-		cloudillo.disable_dnssec(true);
+	if env::var("ENABLE_DNSSEC").is_ok() {
+		cloudillo.enable_dnssec(true);
 	}
 	cloudillo.run().await?;
 	Ok(())

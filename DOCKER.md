@@ -277,7 +277,7 @@ for Cloudillo's names to `http://127.0.0.1:1080` with an ordinary `http` block.
 | `DIST_DIR` | Frontend distribution directory | `./dist` (`/cloudillo/dist` in the image) |
 | `RUST_LOG` | Logging level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `DISABLE_CACHE` | Disable caching (set to any value to enable) | - |
-| `DISABLE_DNSSEC` | Skip DNSSEC validation of federation DNS lookups (set to any value). Needed when the resolver strips RRSIGs, e.g. Docker's embedded DNS `127.0.0.11` | - |
+| `ENABLE_DNSSEC` | Validate DNSSEC on federation DNS lookups (set to any value). Requires an upstream resolver that passes DNSSEC records; Docker's embedded DNS `127.0.0.11` and many home routers don't | - |
 
 ### Cloudillo Identity System
 

@@ -78,7 +78,7 @@ impl AppBuilder {
 				acme_email: None,
 				local_address: Box::new([]),
 				disable_cache: false,
-				disable_dnssec: false,
+				enable_dnssec: false,
 			},
 			worker: None,
 			adapters: Adapters {
@@ -159,8 +159,8 @@ impl AppBuilder {
 		self.opts.disable_cache = disable;
 		self
 	}
-	pub fn disable_dnssec(&mut self, disable: bool) -> &mut Self {
-		self.opts.disable_dnssec = disable;
+	pub fn enable_dnssec(&mut self, enable: bool) -> &mut Self {
+		self.opts.enable_dnssec = enable;
 		self
 	}
 	pub fn worker(&mut self, worker: Arc<worker::WorkerPool>) -> &mut Self {
@@ -482,7 +482,7 @@ impl AppBuilder {
 				auth_adapter.clone(),
 				proxy_tokens.clone(),
 				settings_service.clone(),
-				!self.opts.disable_dnssec,
+				self.opts.enable_dnssec,
 			)?,
 			proxy_tokens,
 			profile_me,

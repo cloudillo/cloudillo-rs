@@ -34,9 +34,9 @@ use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::auth_adapter::AuthAdapter;
 use cloudillo_types::validation::{id_tag_to_ascii, validate_id_tag};
 
-/// Resolver of the federation client: hickory with DNSSEC validation, built from the
-/// system configuration (`/etc/resolv.conf`). Bogus answers are refused; unsigned
-/// (insecure) zones still resolve. On unless `DISABLE_DNSSEC` is set.
+/// Resolver of the federation client: hickory, built from the system configuration
+/// (`/etc/resolv.conf`). With `ENABLE_DNSSEC` it validates DNSSEC: bogus answers are
+/// refused, unsigned (insecure) zones still resolve.
 #[derive(Clone)]
 struct DnssecResolver(TokioResolver);
 
@@ -141,8 +141,12 @@ impl Request {
 		settings: Arc<SettingsService>,
 		dnssec: bool,
 	) -> ClResult<Self> {
-		if !dnssec {
-			warn!("DNSSEC validation disabled for federation requests");
+		if dnssec {
+			info!("DNSSEC validation enabled for federation requests");
+		} else {
+			info!(
+				"DNSSEC validation disabled for federation requests (set ENABLE_DNSSEC to enable)"
+			);
 		}
 		let resolver = DnssecResolver(build_dnssec_resolver(dnssec)?);
 		let mut http = HttpConnector::new_with_resolver(resolver);
