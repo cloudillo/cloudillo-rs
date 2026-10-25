@@ -37,6 +37,9 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		prinvt_definition(),
 		apkg_definition(),
 		ptnr_definition(),
+		bdg_definition(),
+		bdg_slot_definition("STD", cloudillo_types::badges::BADGE_STD_LEVELS),
+		bdg_slot_definition("PAT", cloudillo_types::badges::BADGE_PAT_LEVELS),
 	]
 }
 
@@ -1465,6 +1468,103 @@ fn prinvt_definition() -> ActionDefinition {
 		}),
 		key_pattern: Some("{type}:{issuer}:{audience}".to_string()),
 		search: None,
+	}
+}
+
+/// BDG - Community badge issued to a person (catalog: `cloudillo_types::badges`).
+///
+/// The base type is never postable or receivable on its own: `subtypes` is documentation only,
+/// so an unknown subtype (`BDG:DEL`, `BDG:XYZ`) resolves here, and `server_emitted` makes
+/// `post_action` refuse it. Inbound, `native_hooks::bdg::check_inbound` rejects it pre-store.
+/// Only the derived `BDG:STD` / `BDG:PAT` definitions are issuable.
+fn bdg_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "BDG".to_string(),
+		version: "1.0".to_string(),
+		description: "Community badge issued to a member".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("social".to_string()),
+			tags: Some(vec!["badge".to_string(), "community".to_string()]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: Some({
+			let mut map = HashMap::new();
+			map.insert("STD".to_string(), "Standing badge (verified, trusted)".to_string());
+			map.insert("PAT".to_string(), "Patron badge (bronze … diamond)".to_string());
+			map
+		}),
+		fields: FieldConstraints {
+			content: Some(FieldConstraint::Required),
+			audience: Some(FieldConstraint::Required),
+			parent: Some(FieldConstraint::Forbidden),
+			attachments: Some(FieldConstraint::Forbidden),
+			subject: Some(FieldConstraint::Forbidden),
+		},
+		schema: Some(bdg_schema(None)),
+		behavior: BehaviorFlags {
+			broadcast: Some(false),
+			server_emitted: Some(true),
+			allow_unknown: Some(true),
+			requires_acceptance: Some(false),
+			// Connected, never the tenant default: hidden badges must not list to followers
+			default_visibility: Some('C'),
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None,
+			on_receive: HookImplementation::None, // Native hook registered via registry
+			on_accept: HookImplementation::None,
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("any".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(false),
+		}),
+		key_pattern: Some("{type}:{issuer}:{audience}".to_string()),
+		search: None,
+	}
+}
+
+/// Badge content `{ "b": "<level>" }`; `levels` restricts `b` to one slot's catalog.
+fn bdg_schema(levels: Option<&[&str]>) -> ContentSchemaWrapper {
+	let b = SchemaField {
+		field_type: FieldType::String,
+		min_length: Some(1),
+		max_length: Some(32),
+		r#enum: levels
+			.map(|l| l.iter().map(|s| serde_json::Value::String((*s).to_string())).collect()),
+		items: None,
+	};
+	ContentSchemaWrapper {
+		content: Some(ContentSchema {
+			content_type: ContentType::Object,
+			min_length: None,
+			max_length: Some(64), // caps undeclared keys in a signed, delivered token
+			pattern: None,
+			r#enum: None,
+			properties: Some(HashMap::from([("b".to_string(), b)])),
+			required: Some(vec!["b".to_string()]),
+			wrap_scalar: None,
+			description: Some("Badge level".to_string()),
+		}),
+	}
+}
+
+/// A postable badge slot. Its own key per slot, so a new tier replaces the old one in the same
+/// slot but never the other slot's badge. `allow_unknown`: the outbound gate would refuse a
+/// follower-only audience; the pre-store checks (`post_action`, `bdg::check_inbound`) gate it.
+fn bdg_slot_definition(slot: &str, levels: &[&str]) -> ActionDefinition {
+	let base = bdg_definition();
+	ActionDefinition {
+		r#type: format!("BDG:{slot}"),
+		subtypes: None,
+		schema: Some(bdg_schema(Some(levels))),
+		behavior: BehaviorFlags { server_emitted: Some(false), ..base.behavior.clone() },
+		key_pattern: Some(format!("{{type}}:{slot}:{{issuer}}:{{audience}}")),
+		..base
 	}
 }
 

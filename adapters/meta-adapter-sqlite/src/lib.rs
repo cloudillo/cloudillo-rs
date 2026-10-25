@@ -51,9 +51,9 @@ use cloudillo_types::{
 		FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
 		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
 		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, PartnerEdge,
-		Profile, ProfileData, ProfileRelation, PublicProfileRow, PublishSiteDoc, PushSubscription,
-		PushSubscriptionData, RefData, SearchObject, SearchOptions, SearchPart, SearchRow,
-		ShareEntry, Site, SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
+		Profile, ProfileBadgeRow, ProfileData, ProfileRelation, PublicProfileRow, PublishSiteDoc,
+		PushSubscription, PushSubscriptionData, RefData, SearchObject, SearchOptions, SearchPart,
+		SearchRow, ShareEntry, Site, SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
 		UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData, UpdateChannelData,
 		UpdateFileOptions, UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData,
 		UpsertDocFormat, UpsertProfileFields, UpsertResult, UpsertSite,
@@ -1243,6 +1243,34 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn list_partner_edges(&self, tn_id: TnId) -> ClResult<Vec<PartnerEdge>> {
 		partner::list_partner_edges(&self.dbr, tn_id).await
+	}
+
+	// Profile badges
+	//****************
+
+	async fn replace_profile_badges(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		rows: &[ProfileBadgeRow],
+	) -> ClResult<()> {
+		profile::replace_badges(&self.db, tn_id, id_tag, rows).await
+	}
+
+	async fn list_profile_badge_holders(
+		&self,
+		tn_id: TnId,
+		community: &str,
+	) -> ClResult<Vec<Box<str>>> {
+		profile::list_badge_holders(&self.dbr, tn_id, community).await
+	}
+
+	async fn list_profile_badges_for(
+		&self,
+		tn_id: TnId,
+		id_tags: &[&str],
+	) -> ClResult<std::collections::HashMap<Box<str>, Vec<cloudillo_types::types::BadgeView>>> {
+		profile::list_badges_for(&self.dbr, tn_id, id_tags).await
 	}
 
 	// Calendar / calendar-object management

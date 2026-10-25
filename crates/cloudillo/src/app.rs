@@ -375,6 +375,12 @@ impl AppBuilder {
 		});
 		extensions.insert(ensure_profile_fn);
 
+		// Register badge resync scheduling for action hooks (joining/following a community)
+		let badge_resync_fn: cloudillo_core::BadgeResyncFn = Box::new(|app, tn_id, community| {
+			Box::pin(cloudillo_profile::sync::schedule_badge_resync(app, tn_id, community))
+		});
+		extensions.insert(badge_resync_fn);
+
 		// So the profile crate can invalidate the cached owner name and picture without
 		// depending on cloudillo-site. The narrow refresh: a profile write changes those
 		// two columns and nothing a container contributes, so `refresh_tenant` would

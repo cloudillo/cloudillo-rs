@@ -237,6 +237,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			} else {
 				debug!("CONN:ACC: Updated audience profile to Connected");
 			}
+			cloudillo_core::schedule_badge_resync(&app, tn_id, audience).await;
 		}
 		Some("DEL") => {
 			// Deletion: remove connection
@@ -328,6 +329,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					warn!("CONN: Failed to update issuer profile {}: {}", context.issuer, e);
 				}
 
+				cloudillo_core::schedule_badge_resync(&app, tn_id, &context.issuer).await;
 				schedule_history_sync(&app, tn_id, &context.issuer).await;
 				announce_partnership(&app, &context).await;
 				publish_hat_map(&app, tn_id, &context.tenant_tag, &context.issuer).await;
@@ -411,6 +413,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					warn!("CONN: Failed to update issuer profile {}: {}", context.issuer, e);
 				}
 
+				cloudillo_core::schedule_badge_resync(&app, tn_id, &context.issuer).await;
 				schedule_history_sync(&app, tn_id, &context.issuer).await;
 				announce_partnership(&app, &context).await;
 
@@ -478,6 +481,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 						warn!("CONN: Failed to update issuer profile {}: {}", context.issuer, e);
 					}
 
+					cloudillo_core::schedule_badge_resync(&app, tn_id, &context.issuer).await;
 					schedule_history_sync(&app, tn_id, &context.issuer).await;
 					announce_partnership(&app, &context).await;
 
@@ -570,6 +574,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				debug!("CONN:ACC: Updated issuer profile to Connected");
 			}
 
+			cloudillo_core::schedule_badge_resync(&app, tn_id, &context.issuer).await;
 			schedule_history_sync(&app, tn_id, &context.issuer).await;
 			announce_partnership(&app, &context).await;
 			publish_hat_map(&app, tn_id, &context.tenant_tag, &context.issuer).await;
@@ -698,6 +703,8 @@ pub async fn on_reject(app: App, context: HookContext) -> ClResult<HookResult> {
 	};
 
 	app.meta_adapter.upsert_profile(tn_id, &context.issuer, &profile_upsert).await?;
+	// `/me` serves badges only from issuers in good standing.
+	app.profile_me.invalidate(tn_id);
 
 	debug!("CONN: Updated issuer profile (following=false, connected=Disconnected)");
 

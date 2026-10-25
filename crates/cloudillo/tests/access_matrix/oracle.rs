@@ -494,6 +494,10 @@ pub fn expected_inbox(c: &InboxCell) -> Expect {
 		// An INVT on our CONV is the tenant's or a moderator subscriber's; a revocation also the
 		// original inviter's. A fresh issuer is none of them, whatever its relation.
 		"INVT" | "INVT:DEL" => deny("inbox.invt.conv-authority"),
+		// `bdg::check_inbound`: only from a followed/connected *community*, with `aud`, `exp`
+		// and a catalog level. Every generated issuer is a person (`seed_issuer`); the cell is
+		// otherwise well-formed (ops.rs).
+		"BDG:STD" | "BDG:PAT" => deny("inbox.bdg.community-issuer"),
 		_ if known => allow("inbox.known"),
 		// Subject-anchored rules override `allow_unknown: false`: R1 (REPOST on the tenant's
 		// own public subject) and R2 (STAT from anyone).

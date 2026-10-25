@@ -4,13 +4,18 @@
 //! Profile synchronization from remote instances
 
 use crate::prelude::*;
+use crate::settings::MAX_SHOWN_BADGES;
 use cloudillo_core::request::ConditionalResult;
 use cloudillo_core::scheduler::{RetryPolicy, Task, TaskId};
-use cloudillo_types::auth_adapter::{AuditCategory, AuditEvent};
+use cloudillo_types::auth_adapter::{ActionToken, AuditCategory, AuditEvent};
+use cloudillo_types::badges::{BADGE_EXP_SLACK_SECS, badge_claims, read_badge_issuer};
 use cloudillo_types::meta_adapter::{
-	Profile, ProfileStatus, ProfileType, UpsertProfileFields, UpsertResult,
+	Profile, ProfileBadgeRow, ProfileStatus, ProfileType, UpsertProfileFields, UpsertResult,
+	VerifiedBadge,
 };
 use cloudillo_types::types::{ApiResponse, PROTOCOL_VERSION, ProfileBase};
+use cloudillo_types::utils::{decode_jwt_no_verify, normalize_id_tag};
+use cloudillo_types::validation::validate_id_tag;
 
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
@@ -113,24 +118,27 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 				"community" => ProfileType::Community,
 				_ => ProfileType::Person,
 			};
+			let badges = person_badges(app, tn_id, id_tag, typ, &remote).await;
 
 			// Create the row WITHOUT profile_pic; the picture is fetched by a
 			// retryable background task (uniform with `refresh_profile`). Store
 			// the real etag if the peer provided one, otherwise leave it empty
-			// (`Patch::Null`) — never a synthetic `sync-<ts>` placeholder.
+			// (`Patch::Null`) — never a synthetic `sync-<ts>` placeholder. A badge
+			// that failed to verify transiently also leaves it empty (see `badge_rows`).
 			let fields = UpsertProfileFields {
 				name: Patch::Value(remote.name.clone().into()),
 				typ: Patch::Value(typ),
 				synced: Patch::Value(true),
 				following: Patch::Undefined,
 				connected: Patch::Undefined,
-				etag: match new_etag.as_deref() {
-					Some(e) => Patch::Value(e.into()),
-					None => Patch::Null,
-				},
+				etag: badge_etag(badges.as_ref(), new_etag.as_deref()).unwrap_or(Patch::Null),
 				..Default::default()
 			};
 
+			// Badges before the etag: a failed upsert stores no etag, so the next refresh retries.
+			if let Some(b) = &badges {
+				app.meta_adapter.replace_profile_badges(tn_id, id_tag, &b.rows).await?;
+			}
 			let upsert_result = app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
 			if fields.affects_search_index() {
 				cloudillo_core::search_index_profile(app, tn_id, id_tag);
@@ -232,6 +240,17 @@ pub(crate) async fn refresh_me(
 	apply_refresh(app, tn_id, id_tag, result.map(|r| r.map(|d| d.data))).await
 }
 
+/// Test seam for the access-matrix suite (`badge_sync`).
+#[cfg(feature = "test-util")]
+pub async fn apply_refresh_for_test(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	result: ClResult<ConditionalResult<ProfileBase>>,
+) -> ClResult<bool> {
+	apply_refresh(app, tn_id, id_tag, result).await
+}
+
 /// Store a fetched remote profile (see [`refresh_me`]). Only the base fields are
 /// written; `Err` is a failed fetch (counts toward suspension, never bumps `synced_at`).
 pub(crate) async fn apply_refresh(
@@ -247,11 +266,9 @@ pub(crate) async fn apply_refresh(
 		.await
 		.ok()
 		.and_then(|(_, p)| p.status);
-	let reactivate_status = if matches!(prev_status, Some(ProfileStatus::Suspended)) {
-		Patch::Value(ProfileStatus::Active)
-	} else {
-		Patch::Undefined
-	};
+	let reactivate = matches!(prev_status, Some(ProfileStatus::Suspended));
+	let reactivate_status =
+		if reactivate { Patch::Value(ProfileStatus::Active) } else { Patch::Undefined };
 
 	match result {
 		Ok(ConditionalResult::NotModified) => {
@@ -265,6 +282,10 @@ pub(crate) async fn apply_refresh(
 			};
 
 			app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
+			if reactivate {
+				// The status gates whether `/me` serves this issuer's badges.
+				app.profile_me.invalidate(tn_id);
+			}
 			if fields.affects_search_index() {
 				cloudillo_core::search_index_profile(app, tn_id, id_tag);
 			}
@@ -310,16 +331,18 @@ pub(crate) async fn apply_refresh(
 			// reachable `/api/me` permanently out of the abandonment window.
 			// The etag is stored whenever the remote provided one, unconditional
 			// of picture sync (which is now a separate background job).
+			// Badges of a person only — `partners::sync_membership` refreshes communities
+			// through here too. A transient verify failure clears the etag so the next
+			// refresh refetches the body instead of a 304 hiding the badge.
+			let badges = person_badges(app, tn_id, id_tag, typ, &remote).await;
 			let mut fields = UpsertProfileFields {
 				name: Patch::Value(remote.name.clone().into()),
 				typ: Patch::Value(typ),
 				synced: Patch::Value(true),
 				status: reactivate_status,
+				etag: badge_etag(badges.as_ref(), new_etag.as_deref()).unwrap_or_default(),
 				..Default::default()
 			};
-			if let Some(etag) = new_etag.as_deref() {
-				fields.etag = Patch::Value(etag.into());
-			}
 
 			// Picture removed upstream → clear immediately (no blob needed).
 			// Otherwise leave `profile_pic` untouched (`Patch::Undefined`) so the
@@ -329,7 +352,14 @@ pub(crate) async fn apply_refresh(
 				fields.profile_pic = Patch::Null;
 			}
 
+			// Badges before the etag (see ensure_profile).
+			if let Some(b) = &badges {
+				app.meta_adapter.replace_profile_badges(tn_id, id_tag, &b.rows).await?;
+			}
 			app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await?;
+			if reactivate {
+				app.profile_me.invalidate(tn_id);
+			}
 			if fields.affects_search_index() {
 				cloudillo_core::search_index_profile(app, tn_id, id_tag);
 			}
@@ -375,13 +405,127 @@ pub(crate) async fn apply_refresh(
 					status: Patch::Value(ProfileStatus::Suspended),
 					..Default::default()
 				};
-				if let Err(e) = app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await {
-					warn!(id_tag = %id_tag, error = %e, "failed to mark profile Suspended");
+				match app.meta_adapter.upsert_profile(tn_id, id_tag, &fields).await {
+					Ok(_) => app.profile_me.invalidate(tn_id),
+					Err(e) => {
+						warn!(id_tag = %id_tag, error = %e, "failed to mark profile Suspended");
+					}
 				}
 			}
 			Ok(false)
 		}
 	}
+}
+
+/// Result of [`badge_rows`].
+struct BadgeSync {
+	rows: Vec<ProfileBadgeRow>,
+	/// A verification failed transiently: store no etag, so the next refresh refetches.
+	transient: bool,
+}
+
+/// The etag to store after a sync that fetched `etag`: `Null` after a transient badge
+/// failure, `None` (caller's default) when the peer sent none.
+fn badge_etag(badges: Option<&BadgeSync>, etag: Option<&str>) -> Option<Patch<Box<str>>> {
+	if badges.is_some_and(|b| b.transient) {
+		return Some(Patch::Null);
+	}
+	etag.map(|e| Patch::Value(e.into()))
+}
+
+/// [`badge_rows`] of `remote` when it is a person (communities never hold badges), else `None`.
+async fn person_badges(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	typ: ProfileType,
+	remote: &ProfileBase,
+) -> Option<BadgeSync> {
+	if typ != ProfileType::Person {
+		return None;
+	}
+	Some(badge_rows(app, tn_id, id_tag, remote.badges.as_deref().unwrap_or_default()).await)
+}
+
+/// The `profile_badges` rows for `id_tag`'s `/me` badge `tokens`, and whether a verification
+/// failed transiently. Issuers are compared normalized.
+///
+/// The body is untrusted: at most [`MAX_SHOWN_BADGES`] tokens are read, and only the first
+/// row per `(community, slot)` is kept. Each token is first only decoded, to read `iss`.
+/// Only when `iss` is a community this tenant follows or is connected to is it verified
+/// through [`cloudillo_core::ActionVerifyFn`] (which may fetch the issuer's key), then stored
+/// with its fields or silently dropped. Any other issuer costs no fetch and leaves an
+/// unverified index row (`verified: None`), if the decoded claims are a well-formed badge
+/// ([`verified_badge_row`]). A failed issuer read, or a verify error other than
+/// [`Error::is_invalid_token`] (e.g. the issuer's key could not be fetched), drops the token
+/// and sets `transient`.
+async fn badge_rows(app: &App, tn_id: TnId, id_tag: &str, tokens: &[String]) -> BadgeSync {
+	let mut rows: Vec<ProfileBadgeRow> = Vec::new();
+	let mut transient = false;
+	for token in tokens.iter().take(MAX_SHOWN_BADGES) {
+		let Ok(claims) = decode_jwt_no_verify::<ActionToken>(token) else {
+			continue;
+		};
+		let iss = normalize_id_tag(&claims.iss);
+		if !validate_id_tag(&iss) {
+			continue;
+		}
+		let known = match read_badge_issuer(app.meta_adapter.as_ref(), tn_id, &iss).await {
+			Ok(p) => p.is_some(),
+			Err(e) => {
+				tracing::debug!(%id_tag, issuer = %iss, "badge issuer read failed: {}", e);
+				transient = true;
+				continue;
+			}
+		};
+		let row = if known {
+			let verified = match app.ext::<cloudillo_core::ActionVerifyFn>() {
+				Ok(verify) => verify(app, tn_id, token.as_str(), None).await,
+				Err(e) => Err(e),
+			};
+			match verified {
+				Ok(t) => match verified_badge_row(&t, id_tag) {
+					Some(row) => row,
+					None => continue,
+				},
+				Err(e) if e.is_invalid_token() => continue,
+				Err(e) => {
+					tracing::debug!(%id_tag, issuer = %claims.iss, "badge verify failed: {}", e);
+					transient = true;
+					continue;
+				}
+			}
+		} else {
+			// unverified, so a holder can still name any community; bounded by
+			// MAX_SHOWN_BADGES refetches per holder per follow. Upgrade: verify the issuer key
+			// before keeping an index row.
+			if verified_badge_row(&claims, id_tag).is_none() {
+				continue;
+			}
+			ProfileBadgeRow { community: iss.into(), verified: None }
+		};
+		let slot = row.verified.as_ref().map(|v| &v.slot);
+		if !rows
+			.iter()
+			.any(|r| r.community == row.community && r.verified.as_ref().map(|v| &v.slot) == slot)
+		{
+			rows.push(row);
+		}
+	}
+	BadgeSync { rows, transient }
+}
+
+/// The row a *verified* badge token yields: `None` unless [`badge_claims`] accepts it for
+/// `id_tag` (`exp` is required there: `ActionVerifyFn` rejects an expired token but accepts
+/// one without `exp`).
+///
+/// No downgrade check: see the module doc of cloudillo_action's native_hooks::bdg.
+fn verified_badge_row(t: &ActionToken, id_tag: &str) -> Option<ProfileBadgeRow> {
+	let (slot, level, exp) = badge_claims(t, &normalize_id_tag(id_tag), BADGE_EXP_SLACK_SECS)?;
+	Some(ProfileBadgeRow {
+		community: normalize_id_tag(&t.iss).into(),
+		verified: Some(VerifiedBadge { slot: slot.into(), level: level.into(), exp }),
+	})
 }
 
 /// Sync the 'pf' (profile) variant of a profile picture from a remote instance.
@@ -695,10 +839,140 @@ impl Task<App> for ProfileRefreshBatchTask {
 	}
 }
 
+/// Most holders one [`BadgeResyncTask`] run refetches.
+const MAX_BADGE_RESYNC_HOLDERS: usize = 200;
+
+/// Refetches (no `If-None-Match`) every profile holding a `profile_badges` row from
+/// `community`, which this tenant just connected to or followed: until now its badges from
+/// there were stored as unverified index rows only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BadgeResyncTask {
+	pub tn_id: TnId,
+	pub community: Box<str>,
+}
+
+/// Schedule a [`BadgeResyncTask`]; a no-op unless this tenant is a person. Whether
+/// `community` is one is left to the task, which can sync a row the hook saw unsynced.
+/// Fire-and-forget: logs on enqueue failure. The action hooks reach it through
+/// `cloudillo_core::BadgeResyncFn`.
+pub async fn schedule_badge_resync(app: &App, tn_id: TnId, community: &str) {
+	let person = app
+		.meta_adapter
+		.read_tenant(tn_id)
+		.await
+		.is_ok_and(|t| t.typ == ProfileType::Person);
+	if !person {
+		return;
+	}
+	// No dedup key: a keyed duplicate would be dropped while one is pending, losing a re-trigger.
+	// Refreshes are idempotent, so a duplicate run is harmless.
+	let task = Arc::new(BadgeResyncTask { tn_id, community: community.into() });
+	if let Err(e) = app.scheduler.task(task).now().await {
+		warn!("Failed to enqueue badge resync of {} for tenant {}: {}", community, tn_id, e);
+	}
+}
+
+#[async_trait]
+impl Task<App> for BadgeResyncTask {
+	fn kind() -> &'static str {
+		"profile.badge_resync"
+	}
+
+	fn kind_of(&self) -> &'static str {
+		Self::kind()
+	}
+
+	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
+		let task: BadgeResyncTask = serde_json::from_str(ctx)?;
+		Ok(Arc::new(task))
+	}
+
+	fn serialize(&self) -> String {
+		serde_json::to_string(self).unwrap_or_else(|e| {
+			tracing::error!("Failed to serialize BadgeResyncTask: {}", e);
+			"{}".to_string()
+		})
+	}
+
+	async fn run(&self, app: &App) -> ClResult<()> {
+		async fn is_community(app: &App, tn_id: TnId, id_tag: &str) -> bool {
+			app.meta_adapter
+				.read_profile(tn_id, id_tag)
+				.await
+				.is_ok_and(|(_, p)| p.typ == ProfileType::Community)
+		}
+		// `ensure_profile` skips an existing row, so an unsynced one is refreshed instead.
+		if !is_community(app, self.tn_id, &self.community).await {
+			if let Err(e) = refresh_profile(app, self.tn_id, &self.community, None).await {
+				warn!("Badge resync: sync of {} failed: {}", self.community, e);
+			}
+			if !is_community(app, self.tn_id, &self.community).await {
+				return Ok(());
+			}
+		}
+		let holders =
+			app.meta_adapter.list_profile_badge_holders(self.tn_id, &self.community).await?;
+		// holders past the cap keep unverified rows until their `/me` changes;
+		// paginate across task runs if communities outgrow it.
+		stream::iter(holders.into_iter().take(MAX_BADGE_RESYNC_HOLDERS))
+			.for_each_concurrent(10, |id_tag| async move {
+				if let Err(e) = refresh_profile(app, self.tn_id, &id_tag, None).await {
+					warn!("Badge resync of {} for tenant {} failed: {}", id_tag, self.tn_id, e);
+				}
+			})
+			.await;
+		Ok(())
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use cloudillo_types::meta_adapter::ProfileConnectionStatus;
+
+	#[test]
+	fn verified_badge_row_requires_exp_aud_and_catalog() {
+		let tok = |t: &str, b: &str, aud: Option<&str>, exp: Option<i64>| ActionToken {
+			iss: "club.test".into(),
+			t: t.into(),
+			c: Some(serde_json::json!({ "b": b })),
+			aud: aud.map(Into::into),
+			exp: exp.map(Timestamp),
+			..Default::default()
+		};
+		let ok = |t: &ActionToken| verified_badge_row(t, "bob.test");
+		let row = ok(&tok("BDG:PAT", "gold", Some("bob.test"), Some(9))).expect("valid badge");
+		let v = row.verified.expect("verified");
+		assert_eq!(
+			(&*row.community, &*v.slot, &*v.level, v.exp.0),
+			("club.test", "PAT", "gold", 9)
+		);
+		assert!(ok(&tok("BDG:STD", "verified", Some("bob.test"), Some(9))).is_some());
+		assert!(ok(&tok("BDG:PAT", "gold", Some("bob.test"), None)).is_none(), "no exp");
+		assert!(ok(&tok("BDG:PAT", "gold", Some("eve.test"), Some(9))).is_none(), "foreign aud");
+		assert!(ok(&tok("BDG:PAT", "gold", None, Some(9))).is_none(), "no aud");
+		let holder_mixed = tok("BDG:STD", "verified", Some("bob.test"), Some(9));
+		assert!(verified_badge_row(&holder_mixed, "Bob.Test").is_some(), "normalized aud");
+		assert!(ok(&tok("BDG:STD", "gold", Some("bob.test"), Some(9))).is_none(), "wrong slot");
+		assert!(ok(&tok("BDG:DEL", "gold", Some("bob.test"), Some(9))).is_none(), "bad subtype");
+		assert!(ok(&tok("POST", "gold", Some("bob.test"), Some(9))).is_none(), "not a badge");
+		let far = Some(i64::MAX / 2);
+		assert!(ok(&tok("BDG:PAT", "gold", Some("bob.test"), far)).is_none(), "exp too far");
+		let mixed = ActionToken {
+			iss: "Club.Test".into(),
+			..tok("BDG:STD", "verified", Some("bob.test"), Some(9))
+		};
+		assert_eq!(&*ok(&mixed).expect("valid badge").community, "club.test", "normalized iss");
+	}
+
+	#[test]
+	fn badge_etag_clears_on_transient() {
+		let sync = |transient| BadgeSync { rows: Vec::new(), transient };
+		assert!(matches!(badge_etag(None, Some("e")), Some(Patch::Value(e)) if &*e == "e"));
+		assert!(matches!(badge_etag(Some(&sync(false)), Some("e")), Some(Patch::Value(_))));
+		assert!(matches!(badge_etag(Some(&sync(true)), Some("e")), Some(Patch::Null)));
+		assert!(badge_etag(Some(&sync(false)), None).is_none());
+	}
 
 	#[test]
 	fn via_me_full_only_for_memberships() {

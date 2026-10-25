@@ -293,6 +293,8 @@ pub async fn patch_profile_admin(
 	// upsert creates a stub so the admin's intent isn't blocked by an empty cache.
 	let upsert = UpsertProfileFields::from_update(profile_update);
 	app.meta_adapter.upsert_profile(tn_id, &id_tag, &upsert).await?;
+	// `/me` serves badges only from issuers in good standing.
+	app.profile_me.invalidate(tn_id);
 	if upsert.affects_search_index() {
 		cloudillo_core::search_index_profile(&app, tn_id, &id_tag);
 	}
@@ -465,6 +467,8 @@ pub async fn patch_profile_relationship(
 	};
 	let upsert = UpsertProfileFields::from_update(update);
 	app.meta_adapter.upsert_profile(tn_id, &id_tag, &upsert).await?;
+	// `/me` serves badges only from issuers in good standing.
+	app.profile_me.invalidate(tn_id);
 	if upsert.affects_search_index() {
 		cloudillo_core::search_index_profile(&app, tn_id, &id_tag);
 	}

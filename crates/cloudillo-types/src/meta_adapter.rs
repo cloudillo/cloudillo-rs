@@ -85,6 +85,11 @@ impl ProfileStatus {
 	pub fn restricts_access(self) -> bool {
 		matches!(self, ProfileStatus::Suspended | ProfileStatus::Blocked | ProfileStatus::Banned)
 	}
+
+	/// None, Active or Muted: the profile may hold and issue badges.
+	pub fn in_good_standing(status: Option<Self>) -> bool {
+		matches!(status, None | Some(Self::Active | Self::Muted))
+	}
 }
 
 /// Per-profile proxy-token preference for passive reads of a remote profile's content.
@@ -2001,6 +2006,24 @@ pub struct PartnerEdge {
 	pub partner: Box<str>,
 }
 
+/// One badge of a viewed person profile, synced from its `GET /api/me` `badges` tokens.
+#[derive(Debug, Clone)]
+pub struct ProfileBadgeRow {
+	pub community: Box<str>,
+	/// `None`: index row for an issuer this tenant does not trust (token never verified); it
+	/// exists so joining that community can resync.
+	pub verified: Option<VerifiedBadge>,
+}
+
+/// The verified fields of a [`ProfileBadgeRow`].
+#[derive(Debug, Clone)]
+pub struct VerifiedBadge {
+	/// `"STD"` / `"PAT"`.
+	pub slot: Box<str>,
+	pub level: Box<str>,
+	pub exp: Timestamp,
+}
+
 // Calendars / Calendar Objects (CalDAV + JSON REST)
 //***************************************************
 
@@ -3491,6 +3514,34 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// All edges of a tenant.
 	async fn list_partner_edges(&self, tn_id: TnId) -> ClResult<Vec<PartnerEdge>>;
+
+	// Profile badges
+	//****************
+
+	/// Replace all badge rows of profile `id_tag` with `rows` (their index is the display
+	/// order), in one transaction. Rows must be unique per `(community, slot)`.
+	async fn replace_profile_badges(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		rows: &[ProfileBadgeRow],
+	) -> ClResult<()>;
+
+	/// The profiles holding any badge row (verified or index) from `community`.
+	async fn list_profile_badge_holders(
+		&self,
+		tn_id: TnId,
+		community: &str,
+	) -> ClResult<Vec<Box<str>>>;
+
+	/// Displayable badges of `id_tags`, keyed by id_tag: verified rows, unexpired, from a
+	/// community profile this tenant is connected to or follows (status none/Active/Muted),
+	/// in display order. Profiles with none are absent.
+	async fn list_profile_badges_for(
+		&self,
+		tn_id: TnId,
+		id_tags: &[&str],
+	) -> ClResult<HashMap<Box<str>, Vec<crate::types::BadgeView>>>;
 
 	/// Write a consistent online copy of this store into the existing directory `dest`.
 	/// Writes `meta.db` (SQLite `VACUUM INTO`).

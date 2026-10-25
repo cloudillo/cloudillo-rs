@@ -116,9 +116,11 @@ pub enum Actual {
 	HarnessError(String),
 }
 
-/// The 19 DSL definitions plus the receive-side subtypes, with their target need: `Some(b)`
-/// fixed, `None` optional (both cells).
-pub const INBOX_TYPES: [(&str, Option<bool>); 25] = [
+/// The DSL definitions (the base `BDG` aside: only its slots are issuable) plus the
+/// receive-side subtypes, with their target need: `Some(b)` fixed, `None` optional (both cells).
+pub const INBOX_TYPES: [(&str, Option<bool>); 27] = [
+	("BDG:STD", Some(true)),
+	("BDG:PAT", Some(true)),
 	("CONN", Some(true)),
 	("CONN:UPD", Some(true)),
 	("CONN:ACC", Some(true)),
@@ -838,6 +840,14 @@ impl InboxCell {
 			"PRINVT" => {
 				t.aud = aud;
 				t.c = Some(json!({ "refId": "zqm-ref" }));
+			}
+			// Well-formed, so only the person issuer (`seed_issuer`) refuses it.
+			"BDG:STD" | "BDG:PAT" => {
+				t.aud = aud;
+				t.v = Some('C');
+				t.exp = Some(Timestamp::from_now(86_400));
+				let b = if self.typ == "BDG:STD" { "verified" } else { "bronze" };
+				t.c = Some(json!({ "b": b }));
 			}
 			"APKG" => {
 				// A well-formed package (attachment included), so only `local_only` refuses it.

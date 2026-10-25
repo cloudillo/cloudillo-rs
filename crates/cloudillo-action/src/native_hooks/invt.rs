@@ -590,6 +590,7 @@ async fn on_accept_community(
 			community_id_tag, e
 		);
 	}
+	cloudillo_core::schedule_badge_resync(app, tn_id, community_id_tag).await;
 
 	// The community learns of the membership the only way it may: as a federated CONN it
 	// processes in its own tenant context. Writing the invitee's row in the community's

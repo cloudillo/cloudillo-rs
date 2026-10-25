@@ -302,6 +302,9 @@ pub struct Profile {
 	/// A community's partner communities: connected peers holding a hat contract for our
 	/// members. `None` = not a community; `Some([])` = no contracted partners.
 	pub partners: Option<Vec<PublicProfile>>,
+	/// Raw signed `BDG` tokens of the badges the owner chose to show (`profile.badges` order,
+	/// unexpired, max 10). `None` = none shown.
+	pub badges: Option<Vec<String>>,
 	/// [`PROTOCOL_VERSION`] of the serving node; `None` from a node predating it.
 	pub protocol_version: Option<u32>,
 }
@@ -309,10 +312,15 @@ pub struct Profile {
 /// Reduced, deliberately public projection returned by `GET /api/profiles/batch` and as
 /// `/api/me/full` `partners`.
 ///
-/// **Every field here is already obtainable without authentication** at that profile's
-/// own node, from `GET /api/me` — this is exactly that response minus `keys`. That
-/// equivalence is what admits the batch route to the scope-agnostic tier whose rule is on
-/// `cloudillo_core::middleware::require_auth_public_data`.
+/// **Every field but `badges` is already obtainable without authentication** at that
+/// profile's own node, from `GET /api/me` — this is exactly that response minus `keys`.
+/// That equivalence is what admits the batch route to the scope-agnostic tier whose rule is
+/// on `cloudillo_core::middleware::require_auth_public_data`.
+///
+/// `badges` is the one exception: which of the profile's badges *this* node verified and
+/// can display reveals the reading tenant's own community memberships, so the batch
+/// handler fills it only for the tenant account itself (`abac::is_tenant_account`) and
+/// every other caller gets the field omitted. It is always `None` on `/me/full` `partners`.
 ///
 /// It is **not** `ProfileWithStatus`, which leaks the reading tenant's private
 /// relationship state (`status` including Blocked/Muted/Banned, `connected`,
@@ -327,6 +335,25 @@ pub struct PublicProfile {
 	#[serde(rename = "type")]
 	pub r#type: String,
 	pub profile_pic: Option<String>,
+	/// Owner-only (see above): the verified, unexpired badges of this profile from
+	/// communities the reading tenant is connected to or follows, in the profile's order.
+	pub badges: Option<Vec<BadgeView>>,
+}
+
+/// One displayable badge in [`PublicProfile::badges`].
+///
+/// Serialized as `{ community: { idTag, name, type, profilePic }, slot, level, exp }`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BadgeView {
+	/// The issuing community; its own `badges` is always `None` (omitted).
+	pub community: PublicProfile,
+	/// `"STD"` or `"PAT"` (`crate::badges`).
+	pub slot: String,
+	/// A level of that slot's catalog, e.g. `"verified"`.
+	pub level: String,
+	/// Expiry, Unix seconds.
+	pub exp: Timestamp,
 }
 
 impl From<crate::meta_adapter::Profile<Box<str>>> for PublicProfile {
@@ -348,6 +375,7 @@ impl From<crate::meta_adapter::PublicProfileRow> for PublicProfile {
 			name: p.name.to_string(),
 			r#type: p.typ.as_str().to_string(),
 			profile_pic: p.profile_pic.map(|s| s.to_string()),
+			badges: None,
 		}
 	}
 }
@@ -367,6 +395,8 @@ pub struct ProfileBase {
 	pub r#type: String,
 	pub profile_pic: Option<String>,
 	pub keys: Vec<crate::auth_adapter::AuthKey>,
+	/// Same as [`Profile::badges`].
+	pub badges: Option<Vec<String>>,
 	/// [`PROTOCOL_VERSION`] of the serving node; `None` from a node predating it.
 	pub protocol_version: Option<u32>,
 }

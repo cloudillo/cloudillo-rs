@@ -5518,3 +5518,271 @@ async fn inactive_tenant_refresh_denied() {
 	check("MG-523/524", Actual::Deny).await;
 	auth.set_tenant_expiry(trash, None).await.unwrap();
 }
+
+/// `GET /api/profiles/batch` carries `badges` for the tenant account only: a share link, an
+/// anonymous caller (refused by the tier) and a visitor get no `badges`.
+#[tokio::test]
+async fn profiles_batch_badges_owner_only() {
+	use cloudillo::meta_adapter::{ProfileBadgeRow, VerifiedBadge};
+	use cloudillo::types::Timestamp;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let (holder, community) = ("zqm-badge-holder.test", "zqm-badge-club.test");
+	fx.app
+		.meta_adapter
+		.upsert_profile(alice, holder, &prof(ProfileType::Person))
+		.await
+		.unwrap();
+	let mut f = prof(ProfileType::Community);
+	f.following = Patch::Value(true);
+	fx.app.meta_adapter.upsert_profile(alice, community, &f).await.unwrap();
+	let row = ProfileBadgeRow {
+		community: community.into(),
+		verified: Some(VerifiedBadge {
+			slot: "STD".into(),
+			level: "verified".into(),
+			exp: Timestamp::from_now(86_400),
+		}),
+	};
+	fx.app.meta_adapter.replace_profile_badges(alice, holder, &[row]).await.unwrap();
+	let uri = format!("/api/profiles/batch?idTags={holder}");
+	let get = |cred: Option<&str>| {
+		let r = req(ALICE, Method::GET, &uri, cred, Body::empty());
+		call(&fx.api, r)
+	};
+	let (st, b) = get(bearer(fx.subject("owner@alice"))).await;
+	assert!(st.is_success(), "owner: {st} {b}");
+	let badge = &b["data"][0]["badges"][0];
+	assert_eq!(badge["community"]["idTag"], community, "owner: {b}");
+	assert_eq!(badge["community"]["type"], "community", "owner: {b}");
+	assert_eq!(badge["slot"], "STD", "owner: {b}");
+	assert_eq!(badge["level"], "verified", "owner: {b}");
+	assert!(badge["exp"].is_i64(), "owner: {b}");
+	// The public-data tier admits any valid token but no anonymous caller.
+	let (st, b) = get(None).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "anonymous: {b}");
+	assert!(!b.to_string().contains("badges"), "anonymous sees badges: {b}");
+	for who in ["sharelink-r@alice", "stranger@alice.test"] {
+		let (st, b) = get(bearer(fx.subject(who))).await;
+		assert!(st.is_success(), "{who}: {st} {b}");
+		assert_eq!(b["data"][0]["idTag"], holder, "{who}: {b}");
+		assert!(b["data"][0].get("badges").is_none(), "{who} sees badges: {b}");
+	}
+	// Credentials carrying another identity, or alice's id_tag without being her: whatever
+	// the status, no badges.
+	for who in ["idp-key@alice", "idp-ident@alice", "owner-sadm@admin"] {
+		let (st, b) = get(bearer(fx.subject(who))).await;
+		assert!(!b.to_string().contains("\"badges\""), "{who} sees badges: {st} {b}");
+	}
+}
+
+/// `POST /api/actions/verify` (with `sync`, an outbound fetch) is the tenant account's only:
+/// share links and `idp_` credentials carry alice's id_tag without being her.
+///
+/// The fixture cannot reach the handler's `is_tenant_account` check with a non-owner
+/// credential: `scope_permits` (middleware) already refuses every scoped token here and no
+/// fixture subject is unscoped with alice's id_tag but without the owner roles. These rows pin
+/// the outcome; the handler check is defense in depth.
+#[tokio::test]
+async fn actions_verify_owner_only() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let post = |cred: Option<&str>| {
+		let body = Body::from(r#"{"tokens":["x.y.z"],"sync":true}"#);
+		call(&fx.api, req(ALICE, Method::POST, "/api/actions/verify", cred, body))
+	};
+	let (st, b) = post(bearer(fx.subject("owner@alice"))).await;
+	assert!(st.is_success(), "owner: {st} {b}");
+	assert_eq!(b["data"][0]["status"], "invalid", "owner: {b}");
+	for who in [
+		"sharelink-r@alice",
+		"idp-key@alice",
+		"idp-ident@alice",
+		"stranger@alice.test",
+		"follower@alice.test",
+		"g-read@alice.test",
+		"owner-sadm@admin",
+		"sadm-visit@alice",
+		"owner-scoped-r@alice",
+		"owner-scoped-w@alice",
+	] {
+		let (st, b) = post(bearer(fx.subject(who))).await;
+		// 401: admin's token is not valid on alice's host at all.
+		assert!(matches!(st, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED), "{who}: {st} {b}");
+		assert!(b.get("data").is_none(), "{who}: {b}");
+	}
+	let (st, b) = post(None).await;
+	assert!(st.is_client_error(), "anonymous: {st} {b}");
+	assert!(b.get("data").is_none(), "anonymous: {b}");
+}
+
+/// `profile.badges` defaults to `[]`: a tenant that never set it reads an empty list, not 404.
+#[tokio::test]
+async fn profile_badges_setting_defaults_empty() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let s = fx.subject("owner@alice");
+	let r = req(ALICE, Method::GET, "/api/settings/profile.badges", bearer(s), Body::empty());
+	let (st, b) = call(&fx.api, r).await;
+	assert!(st.is_success(), "{st} {b}");
+	assert_eq!(b["data"]["value"], serde_json::json!([]), "{b}");
+}
+
+/// `profile.badges` is the tenant's own: the owner sets and reads it back (dropping the cached
+/// `/api/me`), an invalid value is a 400, and a stranger, a share link, an `idp_` key or an
+/// anonymous caller can neither set nor delete it.
+#[tokio::test]
+async fn profile_badges_setting_write_gate() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let uri = "/api/settings/profile.badges?level=tenant";
+	let send = |who: Option<&str>, m: Method, body: &str| {
+		let cred = who.and_then(|w| bearer(fx.subject(w)));
+		call(&fx.api, req(ALICE, m, uri, cred, Body::from(body.to_owned())))
+	};
+	let owner = Some("owner@alice");
+	let alice = fx.tenants.alice.tn_id;
+	let denied = |st: StatusCode| matches!(st, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
+
+	// Warm the `/api/me` cache, so the PUT has an entry to drop.
+	let (st, b) = call(&fx.api, req(ALICE, Method::GET, "/api/me", None, Body::empty())).await;
+	assert!(st.is_success(), "GET /api/me: {st} {b}");
+	assert!(fx.app.profile_me.get(alice).is_some(), "/api/me not cached");
+
+	let (st, b) = send(owner, Method::PUT, r#"{"value":["zqm-club.test:STD"]}"#).await;
+	assert!(st.is_success(), "owner PUT: {st} {b}");
+	assert!(fx.app.profile_me.get(alice).is_none(), "PUT left the cached /api/me");
+	let (st, b) = send(owner, Method::GET, "").await;
+	assert!(st.is_success(), "owner GET: {st} {b}");
+	assert_eq!(b["data"]["value"], serde_json::json!(["zqm-club.test:STD"]), "{b}");
+
+	for bad in [
+		r#"{"value":["a:STD","a:STD"]}"#,
+		r#"{"value":[1]}"#,
+		r#"{"value":"a:STD"}"#,
+		r#"{"value":["Zqm-Club.test:STD"]}"#,
+	] {
+		let (st, b) = send(owner, Method::PUT, bad).await;
+		assert_eq!(st, StatusCode::BAD_REQUEST, "owner PUT {bad}: {b}");
+	}
+
+	for who in [
+		Some("stranger@alice.test"),
+		Some("sharelink-r@alice"),
+		Some("idp-key@alice"),
+		None,
+	] {
+		let (st, b) = send(who, Method::PUT, r#"{"value":["zqm-evil.test:STD"]}"#).await;
+		assert!(denied(st), "{who:?} PUT: {st} {b}");
+		let (st, b) = send(who, Method::DELETE, "").await;
+		assert!(denied(st), "{who:?} DELETE: {st} {b}");
+	}
+	let (_, b) = send(owner, Method::GET, "").await;
+	assert_eq!(b["data"]["value"], serde_json::json!(["zqm-club.test:STD"]), "changed: {b}");
+
+	let (st, b) = send(owner, Method::DELETE, "").await;
+	assert!(st.is_success(), "owner DELETE: {st} {b}");
+}
+
+/// `list_profile_badges_for` shows only verified, unexpired rows from a community this tenant
+/// follows or is connected to and has not blocked, in `ord` order; the community is stored
+/// and matched normalized.
+#[tokio::test]
+async fn profile_badges_adapter_filters() {
+	use cloudillo::meta_adapter::{ProfileBadgeRow, VerifiedBadge};
+	use cloudillo::types::Timestamp;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let meta = &fx.app.meta_adapter;
+	let alice = fx.tenants.alice.tn_id;
+	let holder = "zqm-bf-holder.test";
+	let (follow, conn, blocked, none) =
+		("zqm-bf-follow.test", "zqm-bf-conn.test", "zqm-bf-blocked.test", "zqm-bf-none.test");
+	meta.upsert_profile(alice, holder, &prof(ProfileType::Person)).await.unwrap();
+	let mut f = prof(ProfileType::Community);
+	f.following = Patch::Value(true);
+	meta.upsert_profile(alice, follow, &f).await.unwrap();
+	let mut f = prof(ProfileType::Community);
+	f.connected = Patch::Value(ProfileConnectionStatus::Connected);
+	meta.upsert_profile(alice, conn, &f).await.unwrap();
+	let mut f = prof(ProfileType::Community);
+	f.following = Patch::Value(true);
+	f.status = Patch::Value(ProfileStatus::Blocked);
+	meta.upsert_profile(alice, blocked, &f).await.unwrap();
+	meta.upsert_profile(alice, none, &prof(ProfileType::Community)).await.unwrap();
+
+	let row = |community: &str, slot: &str, exp: i64| ProfileBadgeRow {
+		community: community.into(),
+		verified: Some(VerifiedBadge {
+			slot: slot.into(),
+			level: "verified".into(),
+			exp: Timestamp::from_now(exp),
+		}),
+	};
+	let rows = [
+		row(conn, "PAT", 86_400),
+		row("ZQM-BF-Follow.test", "STD", 86_400),
+		row(follow, "PAT", -10),
+		row(blocked, "STD", 86_400),
+		row(none, "STD", 86_400),
+		ProfileBadgeRow { community: none.into(), verified: None },
+	];
+	meta.replace_profile_badges(alice, holder, &rows).await.unwrap();
+
+	let got = meta.list_profile_badges_for(alice, &[holder]).await.unwrap();
+	let got: Vec<(&str, &str)> = got
+		.get(holder)
+		.map(|v| v.iter().map(|b| (b.community.id_tag.as_str(), b.slot.as_str())).collect())
+		.unwrap_or_default();
+	assert_eq!(got, [(conn, "PAT"), (follow, "STD")]);
+
+	let holders = meta.list_profile_badge_holders(alice, "ZQM-BF-FOLLOW.test").await.unwrap();
+	assert_eq!(holders, vec![Box::<str>::from(holder)], "mixed-case community");
+
+	// The SQL issuer rule against the Rust predicate: one issuer per status, plus a community
+	// neither followed nor connected and a followed person.
+	let statuses = [
+		None,
+		Some(ProfileStatus::Active),
+		Some(ProfileStatus::Muted),
+		Some(ProfileStatus::Blocked),
+		Some(ProfileStatus::Suspended),
+		Some(ProfileStatus::Banned),
+	];
+	let mut issuers = Vec::new();
+	for (i, st) in statuses.iter().enumerate() {
+		let tag = format!("zqm-bf-st-{i}.test");
+		let mut f = prof(ProfileType::Community);
+		f.following = Patch::Value(true);
+		if let Some(st) = st {
+			f.status = Patch::Value(*st);
+		}
+		meta.upsert_profile(alice, &tag, &f).await.unwrap();
+		issuers.push(tag);
+	}
+	issuers.push(none.to_string());
+	let person = "zqm-bf-person.test";
+	let mut f = prof(ProfileType::Person);
+	f.following = Patch::Value(true);
+	meta.upsert_profile(alice, person, &f).await.unwrap();
+	issuers.push(person.to_string());
+
+	let rows: Vec<_> = issuers.iter().map(|c| row(c, "STD", 86_400)).collect();
+	meta.replace_profile_badges(alice, holder, &rows).await.unwrap();
+	let got = meta.list_profile_badges_for(alice, &[holder]).await.unwrap();
+	let shown: Vec<&str> = got
+		.get(holder)
+		.map(|v| v.iter().map(|b| b.community.id_tag.as_str()).collect())
+		.unwrap_or_default();
+	for (i, tag) in issuers.iter().enumerate() {
+		let p = meta.read_profile(alice, tag).await.unwrap().1;
+		let want = cloudillo_types::badges::is_badge_issuer(&p);
+		assert_eq!(shown.contains(&tag.as_str()), want, "{tag}: SQL vs is_badge_issuer");
+		if let Some(st) = statuses.get(i) {
+			assert_eq!(want, ProfileStatus::in_good_standing(*st), "{tag}: good standing");
+		}
+	}
+	assert!(!shown.contains(&none) && !shown.contains(&person), "unrelated / person issuer");
+	meta.replace_profile_badges(alice, holder, &[]).await.unwrap();
+}

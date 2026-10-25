@@ -268,6 +268,36 @@ pub async fn ensure_profile(
 	Ok(())
 }
 
+/// Type-erased `cloudillo_profile::sync::schedule_badge_resync`: schedules a refetch of every
+/// profile holding a badge from a community this tenant just connected to or followed (a
+/// no-op unless the tenant is a person; the task itself skips a profile that, once synced,
+/// is no community). Registered as an extension by the server's app module; used by the
+/// CONN/INVT/FLLW action hooks.
+pub type BadgeResyncFn = Box<
+	dyn for<'a> Fn(
+			&'a app::App,
+			cloudillo_types::types::TnId,
+			&'a str,
+		) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+		+ Send
+		+ Sync,
+>;
+
+/// Schedules a badge resync for `community` through [`BadgeResyncFn`]. Fire-and-forget: a
+/// missing extension is logged.
+pub async fn schedule_badge_resync(
+	app: &app::App,
+	tn_id: cloudillo_types::types::TnId,
+	community: &str,
+) {
+	// Callers run this after the standing write, so a `/me` rebuild sees the new issuer.
+	app.profile_me.invalidate(tn_id);
+	match app.ext::<BadgeResyncFn>() {
+		Ok(f) => f(app, tn_id, community).await,
+		Err(e) => tracing::warn!(%community, "badge resync unavailable: {}", e),
+	}
+}
+
 /// Fetches `id_tag`'s profile through [`ensure_profile`] (failures are logged), then reads
 /// the local row.
 pub async fn fetch_profile(

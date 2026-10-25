@@ -334,6 +334,7 @@ pub async fn update_setting(
 	// Update the setting using the service
 	let prev = prev_alert_email(&app, target_tn_id, &name).await;
 	app.settings.set(target_tn_id, &name, req.value.clone(), &auth.roles).await?;
+	invalidate_profile_me(&app, target_tn_id, &name);
 	audit_setting_change(&app, &auth, &addr, &name, target_tn_id, definition, prev).await;
 
 	info!(
@@ -352,6 +353,13 @@ pub async fn update_setting(
 	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
 
 	Ok((StatusCode::OK, Json(response)))
+}
+
+/// `profile.badges` picks the badges `/api/me` serves, so a write must drop its cached ETag.
+fn invalidate_profile_me(app: &App, tn_id: TnId, name: &str) {
+	if name == "profile.badges" {
+		app.profile_me.invalidate(tn_id);
+	}
 }
 
 /// The current `audit.alert_email`, read before it is changed so the old address is alerted
@@ -443,6 +451,7 @@ pub async fn delete_setting(
 
 	let prev = prev_alert_email(&app, target_tn_id, &name).await;
 	app.settings.clear(target_tn_id, &name, &auth.roles).await?;
+	invalidate_profile_me(&app, target_tn_id, &name);
 	audit_setting_change(&app, &auth, &addr, &name, target_tn_id, definition, prev).await;
 
 	info!("User {} cleared setting {} at tn_id={}", auth.id_tag, name, target_tn_id.0);

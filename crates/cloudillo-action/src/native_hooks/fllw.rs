@@ -48,6 +48,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			} else {
 				debug!("FLLW: Updated audience profile (following=true)");
 			}
+			cloudillo_core::schedule_badge_resync(&app, tn_id, audience).await;
 
 			schedule_history_sync(&app, tn_id, audience).await;
 		}
@@ -64,6 +65,8 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			} else {
 				debug!("FLLW:DEL: Updated audience profile (following=null)");
 			}
+			// `/me` serves badges only from issuers in good standing.
+			app.profile_me.invalidate(tn_id);
 		}
 		Some(subtype) => {
 			warn!("FLLW on_create: Unknown subtype '{}', ignoring", subtype);

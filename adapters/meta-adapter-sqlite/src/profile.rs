@@ -3,14 +3,18 @@
 
 //! Profile management and caching
 
+use std::collections::HashMap;
+
 use sqlx::{Row, SqlitePool};
 
 use crate::utils::{Db, collect_res, inspect, map_res, push_patch};
 use cloudillo_types::meta_adapter::{
-	ListProfileOptions, Profile, ProfileConnectionStatus, ProfileData, ProfileRelation,
-	ProfileStatus, ProfileTrust, ProfileType, PublicProfileRow, UpsertProfileFields, UpsertResult,
+	ListProfileOptions, Profile, ProfileBadgeRow, ProfileConnectionStatus, ProfileData,
+	ProfileRelation, ProfileStatus, ProfileTrust, ProfileType, PublicProfileRow,
+	UpsertProfileFields, UpsertResult,
 };
 use cloudillo_types::prelude::*;
+use cloudillo_types::types::{BadgeView, PublicProfile};
 use cloudillo_types::utils::{normalize_id_tag, parse_roles};
 
 /// Parse the `status` CHAR(1) column into a `ProfileStatus` value.
@@ -288,9 +292,7 @@ pub(crate) async fn get_relationships(
 	db: &SqlitePool,
 	tn_id: TnId,
 	target_id_tags: &[&str],
-) -> ClResult<std::collections::HashMap<String, ProfileRelation>> {
-	use std::collections::HashMap;
-
+) -> ClResult<HashMap<String, ProfileRelation>> {
 	if target_id_tags.is_empty() {
 		return Ok(HashMap::new());
 	}
@@ -300,15 +302,8 @@ pub(crate) async fn get_relationships(
 		"SELECT id_tag, following, follower, connected FROM profiles WHERE tn_id=",
 	);
 	query.push_bind(tn_id.0);
-	query.push(" AND id_tag IN (");
-
-	for (i, id_tag) in target_id_tags.iter().enumerate() {
-		if i > 0 {
-			query.push(", ");
-		}
-		query.push_bind(normalize_id_tag(id_tag).into_owned());
-	}
-	query.push(")");
+	query.push(" AND id_tag");
+	push_id_tag_in(&mut query, target_id_tags);
 
 	let rows = query.build().fetch_all(db).await.db()?;
 
@@ -389,6 +384,16 @@ pub(crate) async fn read(
 	})
 }
 
+/// Push ` IN (?, …)` binding the normalized `id_tags`.
+fn push_id_tag_in(query: &mut sqlx::QueryBuilder<sqlx::Sqlite>, id_tags: &[&str]) {
+	query.push(" IN (");
+	let mut list = query.separated(", ");
+	for id_tag in id_tags {
+		list.push_bind(normalize_id_tag(id_tag).into_owned());
+	}
+	query.push(")");
+}
+
 /// Chunk size for the `IN (…)` batch. Well under SQLite's 999 bound-variable limit with
 /// room for `tn_id`, and it bounds the number of distinct SQL texts this function can
 /// push through sqlx's per-connection statement cache. Callers need not pre-chunk.
@@ -416,15 +421,8 @@ pub(crate) async fn read_many(
 			"SELECT id_tag, name, type, profile_pic FROM profiles WHERE tn_id=",
 		);
 		query.push_bind(tn_id.0);
-		query.push(" AND id_tag IN (");
-
-		for (i, id_tag) in chunk.iter().enumerate() {
-			if i > 0 {
-				query.push(", ");
-			}
-			query.push_bind(normalize_id_tag(id_tag).into_owned());
-		}
-		query.push(")");
+		query.push(" AND id_tag");
+		push_id_tag_in(&mut query, chunk);
 
 		let rows = query.build().fetch_all(db).await.db()?;
 
@@ -446,6 +444,106 @@ pub(crate) async fn read_many(
 	}
 
 	Ok(profiles)
+}
+
+/// Replace every `profile_badges` row of `id_tag`; `ord` is the index in `rows`.
+pub(crate) async fn replace_badges(
+	db: &SqlitePool,
+	tn_id: TnId,
+	id_tag: &str,
+	rows: &[ProfileBadgeRow],
+) -> ClResult<()> {
+	let id_tag = normalize_id_tag(id_tag);
+	let mut tx = db.begin().await.db()?;
+	sqlx::query("DELETE FROM profile_badges WHERE tn_id = ? AND id_tag = ?")
+		.bind(tn_id.0)
+		.bind(id_tag.as_ref())
+		.execute(&mut *tx)
+		.await
+		.db()?;
+	for (ord, row) in rows.iter().enumerate() {
+		sqlx::query(
+			"INSERT INTO profile_badges (tn_id, id_tag, community, slot, level, exp, ord) \
+			VALUES (?, ?, ?, ?, ?, ?, ?)",
+		)
+		.bind(tn_id.0)
+		.bind(id_tag.as_ref())
+		.bind(normalize_id_tag(&row.community).as_ref())
+		// `''` marks an unverified index row in storage only.
+		.bind(row.verified.as_ref().map_or("", |v| &v.slot))
+		.bind(row.verified.as_ref().map(|v| v.level.as_ref()))
+		.bind(row.verified.as_ref().map(|v| v.exp.0))
+		.bind(i64::try_from(ord).unwrap_or(i64::MAX))
+		.execute(&mut *tx)
+		.await
+		.db()?;
+	}
+	tx.commit().await.db()?;
+	Ok(())
+}
+
+/// The id_tags holding any `profile_badges` row (verified or index) from `community`.
+pub(crate) async fn list_badge_holders(
+	db: &SqlitePool,
+	tn_id: TnId,
+	community: &str,
+) -> ClResult<Vec<Box<str>>> {
+	let rows =
+		sqlx::query("SELECT DISTINCT id_tag FROM profile_badges WHERE tn_id = ? AND community = ?")
+			.bind(tn_id.0)
+			.bind(normalize_id_tag(community).as_ref())
+			.fetch_all(db)
+			.await
+			.db()?;
+	rows.iter().map(|r| r.try_get::<Box<str>, _>("id_tag").db()).collect()
+}
+
+/// Displayable badges of `id_tags` (chunked like [`read_many`]): verified (`slot != ''`),
+/// unexpired, and issued by a community profile this tenant is connected to or follows,
+/// whose `status` is in good standing: mirrors `cloudillo_types::badges::is_badge_issuer` and
+/// `ProfileStatus::in_good_standing`.
+/// Its name and picture come from the same join. Ordered by `ord`.
+pub(crate) async fn list_badges_for(
+	db: &SqlitePool,
+	tn_id: TnId,
+	id_tags: &[&str],
+) -> ClResult<HashMap<Box<str>, Vec<BadgeView>>> {
+	let mut out: HashMap<Box<str>, Vec<BadgeView>> = HashMap::new();
+	let now = Timestamp::now().0;
+	for chunk in id_tags.chunks(READ_MANY_CHUNK) {
+		// Pinned to is_badge_issuer by access_matrix profile_badges_adapter_filters.
+		let mut query = sqlx::QueryBuilder::new(
+			"SELECT b.id_tag, b.slot, b.level, b.exp, c.id_tag AS c_id_tag, c.name, c.profile_pic \
+			FROM profile_badges b \
+			JOIN profiles c ON c.tn_id = b.tn_id AND c.id_tag = b.community \
+			WHERE c.type = 'C' AND (c.connected = 1 OR c.following = 1) \
+			AND (c.status IS NULL OR c.status IN ('A', 'M')) \
+			AND b.slot != '' AND b.level IS NOT NULL AND b.exp > ",
+		);
+		query.push_bind(now);
+		query.push(" AND b.tn_id = ");
+		query.push_bind(tn_id.0);
+		query.push(" AND b.id_tag");
+		push_id_tag_in(&mut query, chunk);
+		query.push(" ORDER BY b.id_tag, b.ord");
+
+		for row in query.build().fetch_all(db).await.db()? {
+			let community = PublicProfile::from(PublicProfileRow {
+				id_tag: row.try_get("c_id_tag").db()?,
+				name: row.try_get("name").db()?,
+				typ: ProfileType::Community,
+				profile_pic: row.try_get("profile_pic").db()?,
+			});
+			let id_tag: Box<str> = row.try_get("id_tag").db()?;
+			out.entry(id_tag).or_default().push(BadgeView {
+				community,
+				slot: row.try_get("slot").db()?,
+				level: row.try_get("level").db()?,
+				exp: Timestamp(row.try_get("exp").db()?),
+			});
+		}
+	}
+	Ok(out)
 }
 
 /// List the id_tags of every profile that follows this tenant (broadcast set).

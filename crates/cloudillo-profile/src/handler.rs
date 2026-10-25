@@ -12,14 +12,17 @@ use axum::{
 };
 
 use crate::prelude::*;
+use crate::settings::{BADGES_SETTING, MAX_SHOWN_BADGES};
 use cloudillo_core::IdTag;
 use cloudillo_core::extract::{OptionalAuth, OptionalRequestId};
 use cloudillo_core::profile_visibility::{RequesterTier, SectionVisibility};
+use cloudillo_types::badges::{badge_levels, read_badge_issuer};
 use cloudillo_types::meta_adapter::{self, ProfileType};
 use cloudillo_types::roles::{hat_peer, parse_hat_roles};
 use cloudillo_types::types::{
-	ApiResponse, AppDomainRes, PROTOCOL_VERSION, Profile, ProfileBase, PublicProfile,
+	ApiResponse, AppDomainRes, BadgeView, PROTOCOL_VERSION, Profile, ProfileBase, PublicProfile,
 };
+use cloudillo_types::utils::normalize_id_tag;
 
 /// Suffix appended to a section field name to mark its required visibility.
 const VIS_SUFFIX: &str = ".vis";
@@ -143,6 +146,8 @@ pub async fn get_tenant_profile_base(
 	OptionalRequestId(req_id): OptionalRequestId,
 	headers: HeaderMap,
 ) -> ClResult<Response> {
+	// Read before any state the ETag is built from (keys included).
+	let epoch = app.profile_me.epoch();
 	let auth_profile = app.auth_adapter.read_tenant(&id_tag).await?;
 	let tn_id = auth_profile.tn_id;
 
@@ -163,17 +168,21 @@ pub async fn get_tenant_profile_base(
 	}
 
 	let tenant_meta = app.meta_adapter.read_tenant(tn_id).await?;
+	let (badges, badges_exp) =
+		shown_badges(&app, tn_id, &auth_profile.id_tag, tenant_meta.typ).await?;
 	let profile = ProfileBase {
 		id_tag: auth_profile.id_tag.to_string(),
 		name: tenant_meta.name.to_string(),
 		r#type: tenant_meta.typ.as_str().to_string(),
 		profile_pic: tenant_meta.profile_pic.map(|s| s.to_string()),
 		keys: auth_profile.keys,
+		badges,
 		protocol_version: Some(PROTOCOL_VERSION),
 	};
 	let body = serde_json::to_vec(&profile)?;
 	let etag = compute_etag(&body);
-	app.profile_me.insert(tn_id, etag.clone().into());
+	// Capped at the first badge expiry, so the expired badge drops out of the body and ETag.
+	app.profile_me.insert_capped(tn_id, etag.clone().into(), badges_exp, epoch);
 
 	// Cold/expired cache but content unchanged → still 304.
 	if if_none_match.as_deref() == Some(etag.as_str()) {
@@ -211,6 +220,162 @@ pub async fn get_tenant_app_domain(
 		response = response.with_req_id(id);
 	}
 	Ok((StatusCode::OK, Json(response)))
+}
+
+/// The `profile.badges` keys (`None` when unset or empty) and the newest active (status N/A),
+/// unexpired `BDG:STD`/`BDG:PAT` row the tenant holds per `"<issuer>:<slot>"`.
+async fn active_badges(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+) -> ClResult<Option<(Vec<serde_json::Value>, HashMap<String, meta_adapter::ActionView>)>> {
+	let Some(serde_json::Value::Array(keys)) =
+		app.settings.get_json_opt(tn_id, BADGES_SETTING).await?
+	else {
+		return Ok(None);
+	};
+	if keys.is_empty() {
+		return Ok(None);
+	}
+	let opts = meta_adapter::ListActionOptions {
+		typ: Some(vec!["BDG".into()]),
+		status: Some(vec!["N".into(), "A".into()]),
+		audience: Some(id_tag.into()),
+		include_tokens: Some(true),
+		// one active row per (community, slot), so 200 covers 100 communities;
+		// page through `cursor` if a tenant ever holds more.
+		limit: Some(200),
+		..Default::default()
+	};
+	let now = Timestamp::now();
+	let mut active: HashMap<String, meta_adapter::ActionView> = HashMap::new();
+	for a in app.meta_adapter.list_actions(tn_id, &opts).await? {
+		let (Some(slot), Some(exp)) = (a.sub_typ.as_deref(), a.expires_at) else {
+			continue;
+		};
+		if badge_levels(slot).is_none() || exp <= now {
+			continue;
+		}
+		// Newest first: keep the first row seen per key.
+		active.entry(format!("{}:{}", a.issuer.id_tag, slot)).or_insert(a);
+	}
+	Ok(Some((keys, active)))
+}
+
+/// The tenant's shown badges for `/api/me` and `/api/me/full`: the raw tokens of its active
+/// (status N/A), unexpired `BDG:STD`/`BDG:PAT` rows whose `"<issuer>:<slot>"` key is listed in
+/// `profile.badges`, in setting order, at most [`MAX_SHOWN_BADGES`] — plus the earliest `exp`
+/// among them. `None` when nothing is shown, so a badge-less `/me` body is unchanged.
+async fn shown_badges(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	typ: ProfileType,
+) -> ClResult<(Option<Vec<String>>, Option<Timestamp>)> {
+	if typ != ProfileType::Person {
+		return Ok((None, None));
+	}
+	let Some((keys, active)) = active_badges(app, tn_id, id_tag).await? else {
+		return Ok((None, None));
+	};
+	let mut tokens = Vec::new();
+	let mut min_exp: Option<Timestamp> = None;
+	for a in pick_shown(&keys, active) {
+		let (Some(token), Some(exp)) = (a.token, a.expires_at) else {
+			continue;
+		};
+		if read_badge_issuer(app.meta_adapter.as_ref(), tn_id, &a.issuer.id_tag)
+			.await?
+			.is_none()
+		{
+			continue;
+		}
+		tokens.push(token.into());
+		min_exp = Some(min_exp.map_or(exp, |m| m.min(exp)));
+	}
+	Ok(if tokens.is_empty() { (None, None) } else { (Some(tokens), min_exp) })
+}
+
+/// The tenant's own shown badges as [`BadgeView`]s, for its self entry in `/profiles/batch`.
+/// The owner's node never syncs itself, so `profile_badges` has no rows for its own tag;
+/// this reads them from the tenant's `BDG` actions instead. Rows with an off-catalog level
+/// or an issuer that is not (or no longer) a badge issuer here are skipped.
+async fn own_badge_views(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<Vec<BadgeView>> {
+	let Some((keys, active)) = active_badges(app, tn_id, id_tag).await? else {
+		return Ok(Vec::new());
+	};
+	let mut out = Vec::new();
+	for a in pick_shown(&keys, active) {
+		let (Some(slot), Some(exp)) = (a.sub_typ, a.expires_at) else {
+			continue;
+		};
+		let Some(level) = a.content.as_ref().and_then(|c| c["b"].as_str()) else {
+			continue;
+		};
+		if !badge_levels(&slot).is_some_and(|ls| ls.contains(&level)) {
+			continue;
+		}
+		let Some(community) =
+			read_badge_issuer(app.meta_adapter.as_ref(), tn_id, &a.issuer.id_tag).await?
+		else {
+			continue;
+		};
+		out.push(BadgeView {
+			community: community.into(),
+			slot: slot.into(),
+			level: level.into(),
+			exp,
+		});
+	}
+	Ok(out)
+}
+
+/// Owner-only badge merge for `get_profiles_batch`: the synced badges of `profiles`, plus the
+/// tenant's own when it is in `tag_refs`.
+pub(crate) async fn attach_owner_badges(
+	app: &App,
+	tn_id: TnId,
+	tenant_id_tag: &str,
+	tag_refs: &[&str],
+	profiles: &mut Vec<PublicProfile>,
+) -> ClResult<()> {
+	let mut badges = app.meta_adapter.list_profile_badges_for(tn_id, tag_refs).await?;
+	for p in profiles.iter_mut() {
+		p.badges = badges.remove(p.id_tag.as_str()).map(|mut b| {
+			b.truncate(crate::settings::MAX_SHOWN_BADGES);
+			b
+		});
+	}
+	// The tenant's own badges aren't in `profile_badges` (see `own_badge_views`).
+	let own_tag = normalize_id_tag(tenant_id_tag);
+	if tag_refs.contains(&own_tag.as_ref()) {
+		let own = own_badge_views(app, tn_id, tenant_id_tag).await?;
+		if !own.is_empty() {
+			if let Some(p) = profiles.iter_mut().find(|p| p.id_tag == own_tag) {
+				p.badges = Some(own);
+			} else {
+				let t = app.meta_adapter.read_tenant(tn_id).await?;
+				profiles.push(PublicProfile {
+					id_tag: own_tag.into_owned(),
+					name: t.name.into(),
+					r#type: t.typ.as_str().to_string(),
+					profile_pic: t.profile_pic.map(Into::into),
+					badges: Some(own),
+				});
+			}
+		}
+	}
+	Ok(())
+}
+
+/// The values of `active` (keyed `"<issuer>:<slot>"`) listed in `keys`, in key order, at most
+/// [`MAX_SHOWN_BADGES`]; unknown keys are skipped.
+fn pick_shown<T>(keys: &[serde_json::Value], mut active: HashMap<String, T>) -> Vec<T> {
+	keys.iter()
+		.filter_map(serde_json::Value::as_str)
+		.filter_map(|key| active.remove(key))
+		.take(MAX_SHOWN_BADGES)
+		.collect()
 }
 
 /// Build a `304 Not Modified` carrying `etag`.
@@ -267,6 +432,7 @@ pub async fn get_tenant_profile(
 	};
 
 	let x_map = filter_sections(tenant_meta.x, tier);
+	let (badges, _) = shown_badges(&app, tn_id, &auth_profile.id_tag, tenant_meta.typ).await?;
 
 	let profile = Profile {
 		id_tag: auth_profile.id_tag.to_string(),
@@ -277,6 +443,7 @@ pub async fn get_tenant_profile(
 		keys: auth_profile.keys,
 		x: if x_map.is_empty() { None } else { Some(x_map) },
 		partners,
+		badges,
 		protocol_version: Some(PROTOCOL_VERSION),
 	};
 
@@ -377,6 +544,7 @@ mod tests {
 			name: t.into(),
 			r#type: "community".into(),
 			profile_pic: None,
+			badges: None,
 		};
 		let profile = |partners| Profile {
 			id_tag: "club.test".into(),
@@ -387,6 +555,7 @@ mod tests {
 			keys: Vec::new(),
 			x: None,
 			partners,
+			badges: None,
 			protocol_version: None,
 		};
 		let etag = |p: &Profile| compute_etag(&serde_json::to_vec(p).unwrap());
@@ -417,6 +586,7 @@ mod tests {
 				keys: Vec::new(),
 				x: Some(filter_sections(x, anon())),
 				partners: None,
+				badges: None,
 				protocol_version: None,
 			};
 			compute_etag(&serde_json::to_vec(&p).unwrap())
@@ -525,6 +695,27 @@ mod tests {
 		assert!(parts.contains(&"about"));
 		assert!(parts.contains(&"bio"));
 		assert!(!parts.contains(&"links"));
+	}
+
+	#[test]
+	fn pick_shown_orders_and_caps() {
+		let active = |n: usize| -> HashMap<String, usize> {
+			(0..n).map(|i| (format!("c{i}:STD"), i)).collect()
+		};
+		let keys = |ks: &[&str]| -> Vec<serde_json::Value> {
+			ks.iter().map(|k| serde_json::json!(k)).collect()
+		};
+
+		// Setting order, unknown keys skipped.
+		assert_eq!(pick_shown(&keys(&["c2:STD", "nope:PAT", "c0:STD"]), active(5)), vec![2, 0]);
+
+		// Capped at MAX_SHOWN_BADGES.
+		let all: Vec<String> = (0..MAX_SHOWN_BADGES + 2).map(|i| format!("c{i}:STD")).collect();
+		let all: Vec<&str> = all.iter().map(String::as_str).collect();
+		assert_eq!(pick_shown(&keys(&all), active(MAX_SHOWN_BADGES + 2)).len(), MAX_SHOWN_BADGES);
+
+		assert!(pick_shown(&keys(&["nope:STD"]), active(3)).is_empty());
+		assert!(pick_shown(&[], active(3)).is_empty());
 	}
 }
 

@@ -87,6 +87,8 @@ async fn live_announcement(app: &App, tn_id: TnId, key: &str) -> ClResult<bool> 
 /// A connection with `peer` ended (CONN:DEL either way). A community retracts its partnership;
 /// a person drops the partner edges of what was its membership.
 pub async fn connection_ended(app: &App, tn_id: TnId, tenant_type: &str, peer: &str) {
+	// `/me` serves badges only from issuers in good standing.
+	app.profile_me.invalidate(tn_id);
 	if tenant_type == "community" {
 		retract_partnership(app, tn_id, peer).await;
 	} else if let Err(e) = app.meta_adapter.delete_partner_edges_of(tn_id, peer).await {

@@ -846,6 +846,42 @@ pub const AC: &[Row] = &[
 	("AC-115", "idp-ident@alice", "cur-reject-alice@alice", ActReject, "Deny"),
 	("AC-116", "owner@alice", "cur-reject-alice@alice", ActReject, "Allow"),
 	("AC-117", "sharelink-r@alice", "container-p-tenant-active@alice", Subscribe, "Deny"),
+	// BDG: issued by a community moderator+ (`post_action` role gate), never the base type or an
+	// unknown slot (base `BDG` is server_emitted), never by a person tenant, only to a person
+	// who follows or is connected to the community, with an expiry ≤ 366 days ahead
+	// (`native_hooks::bdg::check_issue`). Rows needing a valid (relative) expiry live in
+	// `inbound_flows.rs`, a static body cannot carry one.
+	("AC-121", "m_contributor@club", "", BDG_STD_NO_EXP, "Deny"),
+	("AC-122", "m_follower@club", "", BDG_STD_NO_EXP, "Deny"),
+	("AC-123", "m_moderator@club", "", BDG_DEL, "Deny"),
+	("AC-124", "m_moderator@club", "", BDG_BASE, "Deny"),
+	("AC-125", "m_moderator@club", "", BDG_STD_NO_EXP, "400"),
+	("AC-126", "m_moderator@club", "", BDG_STD_FAR_EXP, "400"),
+	("AC-127", "m_moderator@club", "", BDG_STD_TO_UNKNOWN, "Deny"),
+	("AC-128", "m_moderator@club", "", BDG_STD_TO_COMMUNITY, "Deny"),
+	("AC-129", "owner@alice", "", BDG_STD_ALICE, "Deny"),
+	("AC-130", "m_leader@club", "", BDG_STD_NO_EXP, "400"),
+	// Never a link, a guest, a stranger, anonymous or an `idp_` key, on either host: denied
+	// before the body's missing expiry is even looked at.
+	("AC-131", "sharelink-r@club", "", BDG_STD_NO_EXP, "Deny"),
+	("AC-132", "anon@club", "", BDG_STD_NO_EXP, "Deny"),
+	("AC-133", "stranger@club", "", BDG_STD_NO_EXP, "Deny"),
+	("AC-134", "g_read@club", "", BDG_STD_NO_EXP, "Deny"),
+	("AC-135", "idp-ident@club", "", BDG_STD_NO_EXP, "Deny"),
+	("AC-136", "idp-mgmt@club", "", BDG_STD_NO_EXP, "Deny"),
+	("AC-137", "idp-key@alice", "", BDG_STD_ALICE, "Deny"),
+	("AC-138", "idp-ident@alice", "", BDG_STD_ALICE, "Deny"),
+	// `POST /api/actions/verify` spends the tenant's outbound budget (`sync`): the tenant
+	// account only, never a credential that merely carries its id_tag.
+	("AC-139", "owner@alice", "", VERIFY, "Allow"),
+	("AC-140", "sharelink-r@alice", "", VERIFY, "Deny"),
+	("AC-141", "idp-key@alice", "", VERIFY, "Deny"),
+	("AC-142", "idp-ident@alice", "", VERIFY, "Deny"),
+	("AC-143", "stranger@alice", "", VERIFY, "Deny"),
+	("AC-144", "follower@alice", "", VERIFY, "Deny"),
+	("AC-145", "g_read@alice", "", VERIFY, "Deny"),
+	("AC-146", "sadm-visit@alice", "", VERIFY, "Deny"),
+	("AC-147", "anon@alice", "", VERIFY, "Deny"),
 ];
 
 /// FSHR to a profile connected to the host (`m-follower.test` on club, `connected.test` on alice),
@@ -885,6 +921,44 @@ const PRINVT_ALICE: Route = Call(
 	"POST",
 	"/api/actions",
 	r#"{"type":"PRINVT","audienceTag":"connected.test","content":{"refId":"zqm-ref"}}"#,
+);
+/// AC-139..147: an undecodable token, so even `sync` makes no outbound request.
+const VERIFY: Route = Call("POST", "/api/actions/verify", r#"{"tokens":["x.y.z"],"sync":true}"#);
+/// BDG issue bodies (AC-121..138). The audience `m-follower.test` is a connected club member.
+const BDG_STD_NO_EXP: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"BDG","subType":"STD","audienceTag":"m-follower.test","content":{"b":"verified"}}"#,
+);
+const BDG_STD_FAR_EXP: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"BDG:STD","audienceTag":"m-follower.test","content":{"b":"verified"},"expiresAt":32503680000}"#,
+);
+const BDG_DEL: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"BDG","subType":"DEL","audienceTag":"m-follower.test","content":{"b":"verified"}}"#,
+);
+const BDG_BASE: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"BDG","audienceTag":"m-follower.test","content":{"b":"verified"}}"#,
+);
+const BDG_STD_TO_UNKNOWN: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"BDG","subType":"STD","audienceTag":"zqm-unknown.test","content":{"b":"verified"}}"#,
+);
+const BDG_STD_TO_COMMUNITY: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"BDG","subType":"STD","audienceTag":"peer.test","content":{"b":"verified"}}"#,
+);
+const BDG_STD_ALICE: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"BDG","subType":"STD","audienceTag":"connected.test","content":{"b":"verified"}}"#,
 );
 const STAT_POST: Route =
 	Call("POST", "/api/actions", r#"{"type":"STAT","parentId":"{obj}","content":{"c":1}}"#);

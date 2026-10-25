@@ -95,6 +95,11 @@ impl Error {
 				| Error::Gone
 		)
 	}
+
+	/// The token itself is bad (forged, expired, malformed) — not a transient fetch failure.
+	pub fn is_invalid_token(&self) -> bool {
+		matches!(self, Self::Unauthorized | Self::ValidationError(_) | Self::PermissionDenied)
+	}
 }
 
 impl std::fmt::Display for Error {
@@ -370,6 +375,16 @@ impl From<image::error::ImageError> for Error {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn invalid_token_vs_transient() {
+		assert!(Error::Unauthorized.is_invalid_token());
+		assert!(Error::PermissionDenied.is_invalid_token());
+		assert!(Error::ValidationError("x".into()).is_invalid_token());
+		assert!(!Error::NotFound.is_invalid_token(), "issuer /me 404 is transient");
+		assert!(!Error::Internal("x".into()).is_invalid_token());
+		assert!(!Error::ServiceUnavailable("x".into()).is_invalid_token());
+	}
 
 	#[test]
 	fn permanent_errors_are_not_retryable() {

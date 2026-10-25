@@ -11,6 +11,7 @@ use cloudillo_core::abac::VisibilityLevel;
 use cloudillo_core::rate_limit::{PenaltyReason, PowPenaltyReason, RateLimitApi};
 use cloudillo_core::roles::{CONTRIBUTOR_LEVEL, role_level};
 use cloudillo_types::auth_adapter::ActionToken;
+use cloudillo_types::badges::is_badge_type;
 use cloudillo_types::meta_adapter::{self, AttachmentView, ProfileStatus, ProfileType};
 use cloudillo_types::roles::hat_peer;
 
@@ -424,6 +425,11 @@ async fn process_inbound_action_token_inner(
 		let tenant_tag = app.meta_adapter.read_tenant(tn_id).await?.id_tag;
 		native_hooks::invt::check_inbound(app, tn_id, &action, &tenant_tag).await?;
 	}
+	// BDG likewise: a stored badge retires the older one by key, so a forged or misaddressed
+	// one must be refused here, not in a hook. Also outside the `pre_approved` guard.
+	if is_badge_type(&action.t) {
+		native_hooks::bdg::check_inbound(app, tn_id, &action).await?;
+	}
 
 	// Check if this is an ephemeral action (forward only, don't persist)
 	let is_ephemeral = definition.behavior.ephemeral.unwrap_or(false);
@@ -506,6 +512,11 @@ async fn process_inbound_action_token_inner(
 
 	if !stored {
 		return Ok(None);
+	}
+	// Storing a badge already retired the older one (`supersede_by_key`): an early return before
+	// activation must not leave `/me` serving it.
+	if is_badge_type(&action.t) {
+		app.profile_me.invalidate(tn_id);
 	}
 
 	// 7. Process attachments (async only)
@@ -601,6 +612,10 @@ async fn process_inbound_action_token_inner(
 	if let Err(e) = app.meta_adapter.update_action_data(tn_id, action_id, &activate_opts).await {
 		warn!("  failed to activate inbound action {}: {}", action_id, e);
 		return Err(e);
+	}
+	// A badge is served by `/me` once at its resting status: drop a body rebuilt meanwhile.
+	if is_badge_type(&action.t) {
+		app.profile_me.invalidate(tn_id);
 	}
 	// The 'V' → 'A' transition is where a federated action becomes searchable;
 	// the earlier 'P'/'V' writes never were. A relayed hatted action is not: it is addressed

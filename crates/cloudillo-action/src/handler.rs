@@ -432,6 +432,13 @@ pub async fn post_action(
 		return Err(Error::ValidationError("conflicting subtype in type and subType".into()));
 	}
 	let sub_typ = action.sub_typ.as_deref().map(str::to_owned).or(embedded_sub);
+	// One spelling for BDG (`type: "BDG"`, `subType: "STD"`): the outbound key is built from the
+	// raw `type` (`task::create_action`), the inbound one from the base type, so a bare
+	// `type: "BDG:STD"` would key as `BDG:STD:STD:…` here and never dedup against its receiver.
+	if typ == "BDG" {
+		action.typ = "BDG".into();
+		action.sub_typ = sub_typ.clone().map(Into::into);
+	}
 	// `server_emitted` types (PTNR, FSHR, STAT, IDP:REG, PRINVT) come from hooks and dedicated
 	// endpoints, never a client's to sign as the tenant. An outbound hook cannot gate them: its
 	// `issuer` is the tenant. Unknown types fall through to validation.
@@ -447,7 +454,7 @@ pub async fn post_action(
 	// an accepted join request is the moderator's (as `/accept`); every other CONN (request,
 	// UPD, empty or unknown subtype) and every FLLW the leader's (as the relationship PATCH).
 	let needed = match (typ.as_str(), sub_typ.as_deref()) {
-		("APRV", _) | ("CONN", Some("ACC")) => roles::MODERATOR_LEVEL,
+		("APRV" | "BDG", _) | ("CONN", Some("ACC")) => roles::MODERATOR_LEVEL,
 		// `CONN:DEL` is the hierarchy guard's below.
 		("CONN", Some("DEL")) => 0,
 		("CONN" | "FLLW", _) => roles::LEADER_LEVEL,
@@ -530,6 +537,11 @@ pub async fn post_action(
 		&auth.id_tag,
 	)
 	.await?;
+
+	// Badge issuing, pre-store for the same reason: no hook can stop the row.
+	if typ == "BDG" {
+		crate::native_hooks::bdg::check_issue(&app, tn_id, &action).await?;
+	}
 
 	// Issued as the tenant, posted by `auth.id_tag` — on a community tenant those differ, and the
 	// attachment visibility upgrade needs the member, not the community.
@@ -723,6 +735,8 @@ pub async fn delete_action(
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	app.meta_adapter.delete_action(tn_id, &action_id).await?;
+	// Cheap; a deleted BDG must drop out of the cached /me.
+	app.profile_me.invalidate(tn_id);
 	cloudillo_core::search_index_action(&app, tn_id, &action_id);
 	info!("Deleted action {}", action_id);
 
@@ -924,6 +938,9 @@ pub async fn post_action_reject(
 		..Default::default()
 	};
 	app.meta_adapter.update_action_data(tn_id, &action_id, &update_opts).await?;
+	if cloudillo_types::badges::is_badge_type(&action.typ) {
+		app.profile_me.invalidate(tn_id);
+	}
 	cloudillo_core::search_index_action(&app, tn_id, &action_id);
 
 	info!(
@@ -1724,6 +1741,137 @@ pub async fn get_outbox(
 	let response =
 		ApiResponse::new(OutboxResponse { items }).with_req_id(req_id.unwrap_or_default());
 	Ok((StatusCode::OK, Json(response)))
+}
+
+/// Body for `POST /api/actions/verify`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyTokensBody {
+	tokens: Vec<String>,
+	/// Sync the issuer's profile first (allowed for a single token only).
+	#[serde(default)]
+	sync: bool,
+}
+
+/// The verified token's issuer, from this tenant's cached profile row.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyTokenIssuer {
+	id_tag: Box<str>,
+	name: Box<str>,
+	#[serde(rename = "type")]
+	typ: &'static str,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	profile_pic: Option<Box<str>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyTokenResult {
+	status: &'static str,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	issuer: Option<VerifyTokenIssuer>,
+}
+
+fn check_verify_body(body: &VerifyTokensBody) -> ClResult<()> {
+	if body.tokens.len() > 100 {
+		return Err(Error::ValidationError("at most 100 tokens per request".into()));
+	}
+	if body.sync && body.tokens.len() > 1 {
+		return Err(Error::ValidationError("sync verifies a single token".into()));
+	}
+	Ok(())
+}
+
+/// Maps a `verify_action_token` result to the wire status: `"invalid"` per
+/// [`Error::is_invalid_token`], anything else — network failure, failure-cache
+/// `ServiceUnavailable` — is transient.
+fn verify_status<T>(res: &ClResult<T>) -> &'static str {
+	match res {
+		Ok(_) => "verified",
+		Err(e) if e.is_invalid_token() => "invalid",
+		Err(_) => "error",
+	}
+}
+
+/// `POST /api/actions/verify` — verify action tokens with this node's cached issuer keys.
+///
+/// Owner only: a key fetch spends this tenant's outbound budget. Without `sync`, only
+/// tokens from issuers already in the profile table are verified; the rest come back
+/// `"unknown"` with no outbound request for the profile.
+pub async fn post_verify_tokens(
+	State(app): State<App>,
+	tn_id: TnId,
+	Auth(auth): Auth,
+	IdTag(id_tag): IdTag,
+	Json(body): Json<VerifyTokensBody>,
+) -> ClResult<Json<ApiResponse<Vec<VerifyTokenResult>>>> {
+	if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
+		return Err(Error::PermissionDenied);
+	}
+	check_verify_body(&body)?;
+
+	let mut profiles: std::collections::HashMap<Box<str>, Option<meta_adapter::Profile<Box<str>>>> =
+		std::collections::HashMap::new();
+	let mut results = Vec::with_capacity(body.tokens.len());
+	// sequential is fine for ≤100 tokens (the failure cache stops a dead issuer
+	// from stalling the loop); go concurrent if latency becomes a problem.
+	for token in &body.tokens {
+		let Ok(claims) = decode_jwt_no_verify::<ActionToken>(token) else {
+			results.push(VerifyTokenResult { status: "invalid", issuer: None });
+			continue;
+		};
+		let iss = claims.iss;
+		if !profiles.contains_key(&iss) {
+			let found = if body.sync {
+				cloudillo_core::fetch_profile(&app, tn_id, &iss).await
+			} else {
+				app.meta_adapter.read_profile(tn_id, &iss).await
+			};
+			profiles.insert(iss.clone(), found.ok().map(|(_, p)| p));
+		}
+		let Some(profile) = profiles.get(&iss).and_then(Option::as_ref) else {
+			let status = if body.sync { "error" } else { "unknown" };
+			results.push(VerifyTokenResult { status, issuer: None });
+			continue;
+		};
+
+		let res = crate::process::verify_action_token(&app, tn_id, token, None).await;
+		let status = verify_status(&res);
+		let issuer = res.is_ok().then(|| VerifyTokenIssuer {
+			id_tag: profile.id_tag.clone(),
+			name: profile.name.clone(),
+			typ: profile.typ.as_str(),
+			profile_pic: profile.profile_pic.clone(),
+		});
+		results.push(VerifyTokenResult { status, issuer });
+	}
+
+	Ok(Json(ApiResponse::new(results)))
+}
+
+#[cfg(test)]
+mod verify_tests {
+	use super::*;
+
+	#[test]
+	fn verify_status_arms() {
+		assert_eq!(verify_status(&Ok(())), "verified");
+		assert_eq!(verify_status::<()>(&Err(Error::Unauthorized)), "invalid");
+		assert_eq!(verify_status::<()>(&Err(Error::ValidationError("x".into()))), "invalid");
+		assert_eq!(verify_status::<()>(&Err(Error::PermissionDenied)), "invalid");
+		assert_eq!(verify_status::<()>(&Err(Error::ServiceUnavailable("x".into()))), "error");
+		assert_eq!(verify_status::<()>(&Err(Error::NotFound)), "error");
+	}
+
+	#[test]
+	fn sync_takes_one_token() {
+		let body = |n: usize, sync| VerifyTokensBody { tokens: vec![String::new(); n], sync };
+		assert!(check_verify_body(&body(1, true)).is_ok());
+		assert!(check_verify_body(&body(2, true)).is_err());
+		assert!(check_verify_body(&body(100, false)).is_ok());
+		assert!(check_verify_body(&body(101, false)).is_err());
+	}
 }
 
 // vim: ts=4

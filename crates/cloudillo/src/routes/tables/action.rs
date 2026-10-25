@@ -8,6 +8,7 @@
 //! | Path | GET | POST | PUT | PATCH | DELETE |
 //! |---|---|---|---|---|---|
 //! | `/api/actions`                        | `list_public()` ᴳ | `create()` ᶜ | | | |
+//! | `/api/actions/verify`                 | | `reader_state()` ᴱ | | | |
 //! | `/api/actions/{action_id}`            | `read()` ᴬ | | | `write()` ᶜ | `write()` ᶜ |
 //! | `/api/actions/{action_id}/publish`    | | `write()` ᶜ | | | |
 //! | `/api/actions/{action_id}/cancel`     | | `write()` ᶜ | | | |
@@ -79,6 +80,8 @@ pub(crate) fn moderate() -> Router<App> {
 ///
 /// - read markers: the reader's own node, forward-only;
 /// - thread subscription level: the reader's own cached row;
+/// - `/api/actions/verify`: token verification with this node's cached keys
+///   (owner only — the handler checks; it spends the tenant's outbound budget);
 /// - `/api/outbox`: federation history sync (peer-initiated pull). Auth is
 ///   enforced by the `Auth` extractor; non-related peers are rejected with an
 ///   empty list inside the handler before any action query runs.
@@ -86,6 +89,7 @@ pub(crate) fn reader_state() -> Router<App> {
 	Router::new()
 		.route("/api/read-marker", put(handler::put_read_marker))
 		.route("/api/actions/{action_id}/subscribe", put(handler::put_action_subscribe))
+		.route("/api/actions/verify", post(handler::post_verify_tokens))
 		.route("/api/outbox", get(handler::get_outbox))
 }
 

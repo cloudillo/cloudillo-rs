@@ -8,6 +8,7 @@
 //!
 //! Modules:
 //! - aprv: Approval action handling (APRV)
+//! - bdg: Community badge checks and notification (BDG:STD, BDG:PAT)
 //! - cmnt: Comment counter management (CMNT)
 //! - conn: Connection lifecycle management (CONN)
 //! - conv: Conversation management (CONV)
@@ -22,6 +23,7 @@
 //! - subs: Subscription management (SUBS)
 
 pub mod aprv;
+pub mod bdg;
 pub mod cmnt;
 pub mod conn;
 pub mod conv;
@@ -267,6 +269,20 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 
 		registry.register_type("PRINVT", prinvt_hooks);
 		tracing::info!("Registered native hooks for PRINVT action type");
+	}
+
+	// BDG hooks (only the issuable slots; the base BDG is never stored)
+	{
+		let bdg_hooks = ActionTypeHooks {
+			on_create: None,
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(bdg::on_receive(app, ctx)))),
+			on_accept: None,
+			on_reject: None,
+		};
+
+		registry.register_type("BDG:STD", bdg_hooks.clone());
+		registry.register_type("BDG:PAT", bdg_hooks);
+		tracing::info!("Registered native hooks for BDG action type");
 	}
 
 	Ok(())

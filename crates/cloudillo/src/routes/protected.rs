@@ -72,6 +72,10 @@ use cloudillo_profile::perm::check_perm_profile;
 /// is a security decision, not a routing one, and
 /// [`tests::public_data_tier_holds_exactly_the_admitted_tables`] pins the set so
 /// it cannot be made by accident.
+///
+/// The batch route's one non-public field, `badges` (it reveals the tenant's own community
+/// memberships), is filled by the handler only for the tenant account itself
+/// (`abac::is_tenant_account`), so a scoped token admitted here never receives it.
 fn public_data_tables() -> Router<App> {
 	Router::new().merge(tables::profile::batch())
 }

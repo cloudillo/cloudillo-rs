@@ -47,6 +47,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+cloudillo-profile = { workspace = true, features = ["test-util"] }
 cloudillo-auth-adapter-sqlite = { workspace = true }
 cloudillo-meta-adapter-sqlite = { workspace = true }
 cloudillo-blob-adapter-fs = { workspace = true }

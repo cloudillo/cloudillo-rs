@@ -9,13 +9,13 @@ use axum::http::Method;
 use serde_json::json;
 
 use cloudillo::auth_adapter::ActionToken;
-use cloudillo::meta_adapter::ListActionOptions;
+use cloudillo::meta_adapter::{ListActionOptions, ProfileStatus, ProfileType};
 use cloudillo::settings::SettingValue;
 use cloudillo::types::{Patch, Timestamp, TnId};
 
-use crate::fixture::{ALICE, CLUB, Fixture, RemoteId, call, req, sign};
+use crate::fixture::{ALICE, CLUB, Fixture, RemoteId, call, prof, req, sign};
 use crate::objects::Obj;
-use crate::ops::{Actual, InboxCell, MARK, action_hash, admitted};
+use crate::ops::{Actual, InboxCell, MARK, action_hash, admitted, bearer, status_class};
 use crate::report::{Mismatch, Report};
 use crate::subjects::Relation;
 use crate::{FIXTURE_LOCK, row, seed_issuer, seed_row, setup};
@@ -31,6 +31,26 @@ async fn issuer(
 	let c =
 		InboxCell { host, typ: "POST", rel, target: false, hat: false, forged: false, ch: None };
 	seed_issuer(fx, &c, name, role).await
+}
+
+/// A fresh issuer seeded on `tn` as `rel`, then retyped a Community (badge issuers).
+async fn community_issuer(fx: &Fixture, tn: TnId, rel: Relation, name: &str) -> RemoteId {
+	let host = if tn == fx.tenants.club.tn_id { CLUB } else { ALICE };
+	let r = issuer(fx, host, rel, "", name).await;
+	fx.app
+		.meta_adapter
+		.upsert_profile(tn, &r.id_tag, &prof(ProfileType::Community))
+		.await
+		.unwrap();
+	r
+}
+
+/// `iss` of a JWT, unverified.
+fn decode_iss(token: &str) -> String {
+	cloudillo::utils::decode_jwt_no_verify::<ActionToken>(token)
+		.unwrap()
+		.iss
+		.to_string()
 }
 
 fn claims(r: &RemoteId, t: &str) -> ActionToken {
@@ -96,6 +116,132 @@ async fn inbound_branches() {
 		t.c = Some(json!({ "role": "member" }));
 		check(&mut rep, id, &r, want, deliver(fx, CLUB, &sign(&r, &t)).await);
 	}
+
+	// BDG inbound (`native_hooks::bdg::check_inbound`): never from a person, never to a
+	// community, never without `aud` or `exp`, never an unknown slot, never a forged signature.
+	let bdg = |r: &RemoteId, typ: &str, aud: &str| {
+		let mut t = claims(r, typ);
+		t.aud = Some(aud.into());
+		t.v = Some('C');
+		t.exp = Some(Timestamp::from_now(86_400));
+		t.c = Some(json!({ "b": "verified" }));
+		t
+	};
+	let r = issuer(fx, ALICE, Relation::WeFollow, "", "ib-bdg-person").await;
+	let t = bdg(&r, "BDG:STD", ALICE);
+	check(&mut rep, "IB-BDG-01", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+	// From here on the issuer is a community alice follows, so each row fails for its own reason.
+	let r = community_issuer(fx, alice, Relation::WeFollow, "ib-bdg-followed").await;
+	// Addressed to someone else (a missing `aud` is the DSL's `audience: Required`, not ours).
+	let t = bdg(&r, "BDG:STD", CLUB);
+	check(&mut rep, "IB-BDG-02", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+	let mut t = bdg(&r, "BDG:STD", ALICE);
+	t.exp = None;
+	check(&mut rep, "IB-BDG-03", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+	let t = bdg(&r, "BDG:XYZ", ALICE);
+	check(&mut rep, "IB-BDG-04", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+	// The slot is everything after the first `:`: `STD:X` is no slot.
+	let t = bdg(&r, "BDG:STD:X", ALICE);
+	check(&mut rep, "IB-BDG-13", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+	let r2 =
+		community_issuer(fx, fx.tenants.club.tn_id, Relation::Connected, "ib-bdg-to-community")
+			.await;
+	let t = bdg(&r2, "BDG:STD", CLUB);
+	check(&mut rep, "IB-BDG-05", &r2, Deny, deliver(fx, CLUB, &sign(&r2, &t)).await);
+	let mut t = bdg(&r, "BDG:STD", ALICE);
+	t.exp = Some(Timestamp::from_now(400 * 86_400));
+	check(&mut rep, "IB-BDG-06", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+	// Refused by the slot's schema enum before `check_inbound` (whose level check is backup).
+	let mut t = bdg(&r, "BDG:PAT", ALICE);
+	t.c = Some(json!({ "b": "verified" }));
+	check(&mut rep, "IB-BDG-07", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+	let r2 = community_issuer(fx, alice, Relation::None, "ib-bdg-unknown").await;
+	let t = bdg(&r2, "BDG:STD", ALICE);
+	check(&mut rep, "IB-BDG-08", &r2, Deny, deliver(fx, ALICE, &sign(&r2, &t)).await);
+	// No `v`: the receiver would store its own default visibility, so it is refused.
+	let mut t = bdg(&r, "BDG:STD", ALICE);
+	t.v = None;
+	check(&mut rep, "IB-BDG-11", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+	// Claims a followed community as issuer, signed by another key (cf. IB-20). A fresh
+	// victim, so the failed key does not fetch-block `r` for the positive rows below.
+	let victim = community_issuer(fx, alice, Relation::WeFollow, "ib-bdg-forged-victim").await;
+	let forger = crate::fixture::remote("ib-bdg-forger");
+	let t = bdg(&victim, "BDG:STD", ALICE);
+	check(&mut rep, "IB-BDG-14", &victim, Deny, deliver(fx, ALICE, &sign(&forger, &t)).await);
+	// Positive controls: a followed and a connected community.
+	let t = bdg(&r, "BDG:STD", ALICE);
+	check(&mut rep, "IB-BDG-09", &r, Allow, deliver(fx, ALICE, &sign(&r, &t)).await);
+	let r2 = community_issuer(fx, alice, Relation::Connected, "ib-bdg-connected").await;
+	let mut t = bdg(&r2, "BDG:PAT", ALICE);
+	t.c = Some(json!({ "b": "gold" }));
+	check(&mut rep, "IB-BDG-10", &r2, Allow, deliver(fx, ALICE, &sign(&r2, &t)).await);
+	// A followed community alice has since blocked is no badge issuer (`is_badge_issuer`).
+	let r3 = community_issuer(fx, alice, Relation::WeFollow, "ib-bdg-blocked").await;
+	let mut f = prof(ProfileType::Community);
+	f.status = Patch::Value(ProfileStatus::Blocked);
+	fx.app.meta_adapter.upsert_profile(alice, &r3.id_tag, &f).await.unwrap();
+	let t = bdg(&r3, "BDG:STD", ALICE);
+	check(&mut rep, "IB-BDG-12", &r3, Deny, deliver(fx, ALICE, &sign(&r3, &t)).await);
+
+	// `/api/me` serves the stored badges `profile.badges` lists, in its order, and no other.
+	// An expired or foreign-audience badge is refused inbound (IB-BDG-02/03/06), so none
+	// reaches alice's store to exercise the read-side filter; `pick_shown`'s unit test and
+	// `shown_badges`' `exp`/`audience` query cover it.
+	let owner = bearer(fx.subject("owner@alice"));
+	let (std_key, pat_key) = (format!("{}:STD", r.id_tag), format!("{}:PAT", r2.id_tag));
+	for (keys, want) in [
+		(json!([pat_key]), vec![&r2]),
+		(json!(["zqm-none.test:STD", pat_key, std_key]), vec![&r2, &r]),
+		(json!(["zqm-none.test:STD", format!("{}:PAT", r.id_tag)]), vec![]),
+	] {
+		let body = Body::from(json!({ "value": keys }).to_string());
+		let put = req(ALICE, Method::PUT, "/api/settings/profile.badges", owner, body);
+		let (st, b) = call(&fx.api, put).await;
+		assert!(st.is_success(), "PUT profile.badges {keys}: {st} {b}");
+		let (st, b) = call(&fx.api, req(ALICE, Method::GET, "/api/me", None, Body::empty())).await;
+		assert!(st.is_success(), "GET /api/me: {st} {b}");
+		let issuers: Vec<String> = b["data"]["badges"]
+			.as_array()
+			.into_iter()
+			.flatten()
+			.filter_map(|t| t.as_str())
+			.map(decode_iss)
+			.collect();
+		let want: Vec<String> = want.iter().map(|w| w.id_tag.clone()).collect();
+		assert_eq!(issuers, want, "/api/me badges for {keys}: {b}");
+	}
+	// Blocking an issuer through `PATCH /api/profiles` drops its badge from a cached `/me`.
+	let me_issuers = || async {
+		let (st, b) = call(&fx.api, req(ALICE, Method::GET, "/api/me", None, Body::empty())).await;
+		assert!(st.is_success(), "GET /api/me: {st} {b}");
+		b["data"]["badges"]
+			.as_array()
+			.into_iter()
+			.flatten()
+			.filter_map(|t| t.as_str())
+			.map(decode_iss)
+			.collect::<Vec<String>>()
+	};
+	let body = Body::from(json!({ "value": [std_key] }).to_string());
+	let put = req(ALICE, Method::PUT, "/api/settings/profile.badges", owner, body);
+	assert!(call(&fx.api, put).await.0.is_success(), "PUT profile.badges");
+	assert_eq!(me_issuers().await, vec![r.id_tag.clone()], "badge shown before the block");
+	let uri = format!("/api/profiles/{}", r.id_tag);
+	let block = Body::from(json!({ "status": "B" }).to_string());
+	let (st, b) = call(&fx.api, req(ALICE, Method::PATCH, &uri, owner, block)).await;
+	assert!(st.is_success(), "PATCH {uri}: {st} {b}");
+	assert!(me_issuers().await.is_empty(), "blocked issuer's badge still on /api/me");
+	let mut f = prof(ProfileType::Community);
+	f.status = Patch::Value(ProfileStatus::Active);
+	fx.app.meta_adapter.upsert_profile(alice, &r.id_tag, &f).await.unwrap();
+	let del = req(
+		ALICE,
+		Method::DELETE,
+		"/api/settings/profile.badges?level=tenant",
+		owner,
+		Body::empty(),
+	);
+	assert!(call(&fx.api, del).await.0.is_success(), "DELETE profile.badges");
 
 	// A hat only on types that allow one, and only under the hat's endorsement.
 	let member = issuer(fx, CLUB, Relation::Member, "contributor", "ib-hat-member").await;
@@ -1148,6 +1294,218 @@ async fn federation_peers_allowlist() {
 	let got = deliver(fx, ALICE, &sign(&other, &post(&other))).await;
 	check(&mut rep, "IB-86", &other, Allow, got);
 	rep.finish();
+}
+
+/// BDG issuing with a live `expiresAt` (curated bodies cannot carry a relative one, AC-121..138
+/// hold the rest): a club moderator+ issues to a person who follows or is connected to club
+/// (either alone suffices; a person with neither is refused), at a level catalogued for the slot
+/// (`native_hooks::bdg::check_issue`, `post_action` role gate).
+#[tokio::test]
+async fn bdg_issue() {
+	use Actual::{Allow, Deny};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let mut rep = Report::new("bdg-issue");
+	let mut f = prof(ProfileType::Person);
+	f.follower = Patch::Value(true);
+	let follower = "zqm-bdg-follower.test";
+	fx.app
+		.meta_adapter
+		.upsert_profile(fx.tenants.club.tn_id, follower, &f)
+		.await
+		.unwrap();
+	let banned = "zqm-bdg-banned.test";
+	f.status = Patch::Value(ProfileStatus::Banned);
+	fx.app
+		.meta_adapter
+		.upsert_profile(fx.tenants.club.tn_id, banned, &f)
+		.await
+		.unwrap();
+	let connected = "zqm-bdg-connected.test";
+	let mut f = prof(ProfileType::Person);
+	f.connected = Patch::Value(cloudillo::meta_adapter::ProfileConnectionStatus::Connected);
+	f.follower = Patch::Value(false);
+	fx.app
+		.meta_adapter
+		.upsert_profile(fx.tenants.club.tn_id, connected, &f)
+		.await
+		.unwrap();
+	let unrelated = "zqm-bdg-unrelated.test";
+	fx.app
+		.meta_adapter
+		.upsert_profile(fx.tenants.club.tn_id, unrelated, &prof(ProfileType::Person))
+		.await
+		.unwrap();
+	let exp = Timestamp::from_now(30 * 86_400).0;
+	let bad = || Actual::HarnessError("400".into());
+	let mod_ = "m-moderator@club.test";
+	let to = "m-follower.test";
+	for (id, who, aud, slot, level, vis, want) in [
+		("BI-01", mod_, to, "STD", "verified", None, Allow),
+		("BI-02", "m-leader@club.test", to, "PAT", "gold", None, Allow),
+		("BI-03", mod_, follower, "STD", "trusted", None, Allow),
+		("BI-04", "m-leader@club.test", follower, "PAT", "bronze", None, Allow),
+		("BI-05", mod_, to, "STD", "platinum", None, bad()),
+		("BI-06", mod_, to, "PAT", "verified", None, bad()),
+		("BI-07", "stranger@club.test", to, "STD", "verified", None, Deny),
+		("BI-08", "m-contributor@club.test", to, "STD", "verified", None, Deny),
+		// Visibility is fixed at 'C': an explicit other one is refused, 'C' itself is fine.
+		("BI-09", mod_, to, "STD", "verified", Some("P"), bad()),
+		("BI-10", mod_, to, "STD", "verified", Some("C"), Allow),
+		// A follower club has banned gets no badge.
+		("BI-11", mod_, banned, "STD", "verified", None, Deny),
+		// Connected without following is enough; neither is not.
+		("BI-12", mod_, connected, "STD", "verified", None, Allow),
+		("BI-13", mod_, unrelated, "STD", "verified", None, Deny),
+	] {
+		let s = fx.subject(who);
+		let mut body = json!({
+			"type": "BDG",
+			"subType": slot,
+			"audienceTag": aud,
+			"content": { "b": level },
+			"expiresAt": exp,
+		});
+		if let Some(v) = vis {
+			body["visibility"] = json!(v);
+		}
+		let r = req(&s.host, Method::POST, "/api/actions", bearer(s), Body::from(body.to_string()));
+		let got = status_class(call(&fx.api, r).await.0);
+		rep.cell();
+		if got != want {
+			rep.add(Mismatch {
+				op: "bdg:issue".into(),
+				rule: id,
+				expected: format!("{want:?}"),
+				actual: format!("{got:?}"),
+				subject: who.into(),
+				object: format!("{slot}:{level}->{aud}"),
+			});
+		}
+	}
+	// Every stored BDG carries 'C' (the DSL default fills it when the body has none).
+	let opts = ListActionOptions { typ: Some(vec!["BDG".into()]), ..Default::default() };
+	let rows = fx.app.meta_adapter.list_actions(fx.tenants.club.tn_id, &opts).await.unwrap();
+	assert!(!rows.is_empty(), "no BDG stored on club");
+	for a in &rows {
+		assert_eq!(a.visibility, Some('C'), "stored BDG {} visibility", a.action_id);
+	}
+	rep.finish();
+}
+
+/// Badge sync from a holder's `/me` (`sync::apply_refresh`, fed the fetch result directly):
+/// verified rows from a trusted issuer, index rows from any other, dedup, and a transient
+/// verify failure leaving no etag. Then the resync task and its person-tenant gate.
+#[tokio::test]
+async fn badge_sync() {
+	use cloudillo::meta_adapter::ListTaskOptions;
+	use cloudillo::profile::sync::{
+		BadgeResyncTask, apply_refresh_for_test, schedule_badge_resync,
+	};
+	use cloudillo::scheduler::Task;
+	use cloudillo::types::ProfileBase;
+	use cloudillo_core::request::ConditionalResult;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let (alice, club) = (fx.tenants.alice.tn_id, fx.tenants.club.tn_id);
+	let meta = &fx.app.meta_adapter;
+	let holder = "zqm-bs-holder.test";
+	meta.upsert_profile(alice, holder, &prof(ProfileType::Person)).await.unwrap();
+	let followed = community_issuer(fx, alice, Relation::WeFollow, "bs-followed").await;
+	let unknown = community_issuer(fx, alice, Relation::None, "bs-unknown").await;
+	let badge = |iss: &str| {
+		let mut t = claims(&followed, "BDG:STD");
+		t.iss = iss.into();
+		t.aud = Some(holder.into());
+		t.v = Some('C');
+		t.exp = Some(Timestamp::from_now(86_400));
+		t.c = Some(json!({ "b": "verified" }));
+		t
+	};
+	let refresh = |tokens: Vec<String>, etag: &str| {
+		let data = ProfileBase {
+			id_tag: holder.into(),
+			name: "Holder".into(),
+			r#type: "person".into(),
+			profile_pic: None,
+			keys: Vec::new(),
+			badges: Some(tokens),
+			protocol_version: None,
+		};
+		let res = Ok(ConditionalResult::Modified { data, etag: Some(etag.into()) });
+		apply_refresh_for_test(&fx.app, alice, holder, res)
+	};
+	let good = sign(&followed, &badge(&followed.id_tag));
+	let foreign = sign(&unknown, &{
+		let mut t = badge(&unknown.id_tag);
+		t.k = unknown.key_id.as_str().into();
+		t
+	});
+	refresh(vec![good.clone(), good, foreign], "e1").await.unwrap();
+	let shown = meta.list_profile_badges_for(alice, &[holder]).await.unwrap();
+	let shown: Vec<_> = shown
+		.get(holder)
+		.into_iter()
+		.flatten()
+		.map(|b| (b.community.id_tag.clone(), b.slot.as_str(), b.level.as_str()))
+		.collect();
+	assert_eq!(shown, vec![(followed.id_tag.clone(), "STD", "verified")], "one verified row");
+	let held = meta.list_profile_badge_holders(alice, &unknown.id_tag).await.unwrap();
+	assert_eq!(held, vec![Box::<str>::from(holder)], "untrusted issuer: index row only");
+	assert_eq!(&*meta.read_profile(alice, holder).await.unwrap().0, "e1");
+
+	// Followed issuers, all bad tokens: forged, wrong `aud`, expired, over the TTL, off-catalog.
+	// A forged signature may take the stale-key refetch path, which fails here with no remote
+	// peer (transient), so only "no row" is asserted, not the etag.
+	let victim = community_issuer(fx, alice, Relation::WeFollow, "bs-forged-victim").await;
+	let forger = crate::fixture::remote("bs-forger");
+	let mut forged = badge(&victim.id_tag);
+	forged.k = victim.key_id.as_str().into();
+	let mut wrong_aud = badge(&followed.id_tag);
+	wrong_aud.aud = Some("zqm-other.test".into());
+	let mut expired = badge(&followed.id_tag);
+	expired.exp = Some(Timestamp::from_now(-60));
+	let mut over_ttl = badge(&followed.id_tag);
+	over_ttl.exp = Some(Timestamp::from_now(400 * 86_400));
+	let mut off_catalog = badge(&followed.id_tag);
+	off_catalog.c = Some(json!({ "b": "gold" }));
+	let bad = vec![
+		sign(&forger, &forged),
+		sign(&followed, &wrong_aud),
+		sign(&followed, &expired),
+		sign(&followed, &over_ttl),
+		sign(&followed, &off_catalog),
+	];
+	refresh(bad, "e1b").await.unwrap();
+	let shown = meta.list_profile_badges_for(alice, &[holder]).await.unwrap();
+	assert!(shown.get(holder).is_none_or(Vec::is_empty), "no row from a bad token");
+
+	// A followed community whose key is not cached and whose host is unreachable: transient.
+	let nokey = "zqm-bs-nokey.test";
+	let mut f = prof(ProfileType::Community);
+	f.following = Patch::Value(true);
+	meta.upsert_profile(alice, nokey, &f).await.unwrap();
+	refresh(vec![sign(&followed, &badge(nokey))], "e2").await.unwrap();
+	assert_eq!(&*meta.read_profile(alice, holder).await.unwrap().0, "", "etag kept");
+
+	// The fixture has no remote peer: the holder's refetch fails and is only logged.
+	let task = BadgeResyncTask { tn_id: alice, community: unknown.id_tag.as_str().into() };
+	task.run(&fx.app).await.unwrap();
+
+	// The scheduler is not started here, so an enqueued task stays pending. Task rows carry no
+	// tenant (`tn_id` 0), so each call names its own community.
+	let pending = |community: &'static str| async move {
+		meta.list_tasks(ListTaskOptions::default())
+			.await
+			.unwrap()
+			.into_iter()
+			.filter(|t| &*t.kind == "profile.badge_resync" && t.input.contains(community))
+			.count()
+	};
+	schedule_badge_resync(&fx.app, club, "zqm-bs-resync-club.test").await;
+	assert_eq!(pending("zqm-bs-resync-club.test").await, 0, "a community tenant enqueues none");
+	schedule_badge_resync(&fx.app, alice, "zqm-bs-resync-alice.test").await;
+	assert_eq!(pending("zqm-bs-resync-alice.test").await, 1, "a person tenant does (control)");
 }
 
 // vim: ts=4

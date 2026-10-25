@@ -46,6 +46,7 @@ pub fn init(app: &App) -> ClResult<()> {
 	app.scheduler.register::<sync::ProfileRefreshBatchTask>()?;
 	app.scheduler.register::<sync::ProfilePicSyncTask>()?;
 	app.scheduler.register::<partners::PartnerSyncTask>()?;
+	app.scheduler.register::<sync::BadgeResyncTask>()?;
 	Ok(())
 }
 

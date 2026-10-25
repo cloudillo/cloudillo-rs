@@ -22,6 +22,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lru::LruCache;
 
@@ -47,6 +48,15 @@ const DEFAULT_CAPACITY: NonZeroUsize = match NonZeroUsize::new(256) {
 struct ProfileMeEntry {
 	etag: Box<str>,
 	valid_until: Timestamp,
+	/// Hard upper bound on `valid_until` (earliest `exp` of a served badge); `touch` never
+	/// extends past it.
+	cap: Option<Timestamp>,
+}
+
+/// `now + TTL`, clamped to `cap`.
+fn capped_valid_until(cap: Option<Timestamp>) -> Timestamp {
+	let ttl = Timestamp::from_now(PROFILE_ME_CACHE_TTL_SECS);
+	cap.map_or(ttl, |c| c.min(ttl))
 }
 
 type ProfileMeCacheInner = LruCache<TnId, ProfileMeEntry>;
@@ -58,6 +68,10 @@ type ProfileMeCacheInner = LruCache<TnId, ProfileMeEntry>;
 #[derive(Debug)]
 pub struct ProfileMeCache {
 	entries: Arc<parking_lot::Mutex<ProfileMeCacheInner>>,
+	/// Bumped by every `invalidate`; a fill computed before the bump is dropped.
+	// global, so any tenant's invalidate skips one concurrent fill (harmless);
+	// per-tenant epochs if that ever matters.
+	epoch: AtomicU64,
 }
 
 impl ProfileMeCache {
@@ -66,7 +80,10 @@ impl ProfileMeCache {
 	}
 
 	pub fn with_capacity(capacity: NonZeroUsize) -> Self {
-		Self { entries: Arc::new(parking_lot::Mutex::new(LruCache::new(capacity))) }
+		Self {
+			entries: Arc::new(parking_lot::Mutex::new(LruCache::new(capacity))),
+			epoch: AtomicU64::new(0),
+		}
 	}
 
 	/// Returns the cached ETag if one is still valid; `None` otherwise.
@@ -78,9 +95,25 @@ impl ProfileMeCache {
 
 	/// Inserts a freshly-computed ETag, stamping its expiry from the configured TTL.
 	pub fn insert(&self, tn_id: TnId, etag: Box<str>) {
-		let valid_until = Timestamp::from_now(PROFILE_ME_CACHE_TTL_SECS);
+		self.insert_capped(tn_id, etag, None, self.epoch());
+	}
+
+	/// Current invalidation epoch. Read it before reading the state an ETag is built from.
+	pub fn epoch(&self) -> u64 {
+		self.epoch.load(Ordering::SeqCst)
+	}
+
+	/// Like [`Self::insert`], but the entry never stays valid past `cap` — not even through
+	/// `touch`. `/api/me` passes the earliest `exp` of the badges it served, so the body is
+	/// rebuilt (and the ETag changes) once a shown badge expires. Skipped when an `invalidate`
+	/// ran since `epoch` was read: the ETag may predate that write.
+	pub fn insert_capped(&self, tn_id: TnId, etag: Box<str>, cap: Option<Timestamp>, epoch: u64) {
+		let valid_until = capped_valid_until(cap);
 		let mut cache = self.entries.lock();
-		cache.put(tn_id, ProfileMeEntry { etag, valid_until });
+		if self.epoch() != epoch {
+			return;
+		}
+		cache.put(tn_id, ProfileMeEntry { etag, valid_until, cap });
 	}
 
 	/// Refresh an existing entry's TTL without recomputing its ETag. Called on a
@@ -95,7 +128,7 @@ impl ProfileMeCache {
 	pub fn touch(&self, tn_id: TnId) {
 		let mut cache = self.entries.lock();
 		if let Some(entry) = cache.get_mut(&tn_id) {
-			entry.valid_until = Timestamp::from_now(PROFILE_ME_CACHE_TTL_SECS);
+			entry.valid_until = capped_valid_until(entry.cap);
 		}
 	}
 
@@ -103,6 +136,7 @@ impl ProfileMeCache {
 	/// can change what `/api/me` returns (profile fields, signing keys).
 	pub fn invalidate(&self, tn_id: TnId) {
 		let mut cache = self.entries.lock();
+		self.epoch.fetch_add(1, Ordering::SeqCst);
 		cache.pop(&tn_id);
 	}
 }
@@ -142,6 +176,27 @@ mod tests {
 			"touch should extend valid_until past now"
 		);
 		assert!(entry.is_some_and(|e| &*e.etag == "etag"), "touch must not change the ETag");
+	}
+
+	#[test]
+	fn touch_respects_cap() {
+		let cache = ProfileMeCache::new();
+		let tn_id = TnId(1);
+		let cap = Timestamp::from_now(5);
+		cache.insert_capped(tn_id, "etag".into(), Some(cap), cache.epoch());
+		cache.touch(tn_id);
+		let inner = cache.entries.lock();
+		assert!(inner.peek(&tn_id).is_some_and(|e| e.valid_until <= cap), "touch passed the cap");
+	}
+
+	#[test]
+	fn insert_after_invalidate_is_dropped() {
+		let cache = ProfileMeCache::new();
+		let tn_id = TnId(1);
+		let epoch = cache.epoch();
+		cache.invalidate(tn_id);
+		cache.insert_capped(tn_id, "stale".into(), None, epoch);
+		assert!(cache.get(tn_id).is_none(), "fill from before an invalidate was cached");
 	}
 
 	#[test]

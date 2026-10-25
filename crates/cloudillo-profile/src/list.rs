@@ -15,7 +15,7 @@ use serde_with::skip_serializing_none;
 
 use crate::prelude::*;
 use cloudillo_core::abac;
-use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
+use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
 use cloudillo_core::profile_visibility::RequesterTier;
 use cloudillo_types::meta_adapter::{
 	ListProfileOptions, ProfileConnectionStatus, ProfileStatus, ProfileTrust, ProfileType,
@@ -138,6 +138,14 @@ fn normalise_batch_tags(raw: &str) -> ClResult<Vec<String>> {
 /// this node has mirrored. Mitigated by the reduced projection, [`PROFILE_BATCH_MAX`],
 /// and the `"general"` rate-limit bucket.
 ///
+/// **Exception, owner-only: `badges`.** Which badges this node verified and displays
+/// reveals the tenant's own community memberships (only badges from communities it is
+/// connected to or follows are shown), so `badges` is filled only for the tenant account
+/// itself ([`abac::is_tenant_account`] — not SADM, not a share-link or other scoped token,
+/// which a bare `id_tag` comparison would admit). Every other caller gets it omitted.
+/// The tenant's own entry carries its shown badges too, read from its `BDG` actions, and is
+/// added from the tenant row when the tenant is not in its own `profiles` table.
+///
 /// ## Behaviour
 ///
 /// - Absent or empty `idTags` → `200` with an empty array.
@@ -152,6 +160,8 @@ fn normalise_batch_tags(raw: &str) -> ClResult<Vec<String>> {
 pub async fn get_profiles_batch(
 	State(app): State<App>,
 	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
+	OptionalAuth(auth): OptionalAuth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Query(params): Query<BatchProfilesQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<PublicProfile>>>)> {
@@ -159,13 +169,19 @@ pub async fn get_profiles_batch(
 	let id_tags = normalise_batch_tags(&raw)?;
 	let tag_refs: Vec<&str> = id_tags.iter().map(String::as_str).collect();
 
-	let profiles: Vec<PublicProfile> = app
+	let mut profiles: Vec<PublicProfile> = app
 		.meta_adapter
 		.read_profiles(tn_id, &tag_refs)
 		.await?
 		.into_iter()
 		.map(PublicProfile::from)
 		.collect();
+
+	// Owner-only (see the doc above).
+	if auth.as_ref().is_some_and(|a| abac::is_tenant_account(a, &tenant_id_tag)) {
+		crate::handler::attach_owner_badges(&app, tn_id, &tenant_id_tag, &tag_refs, &mut profiles)
+			.await?;
+	}
 
 	let response = ApiResponse::new(profiles).with_req_id(req_id.unwrap_or_default());
 
@@ -642,6 +658,7 @@ mod tests {
 				name: "Alice".into(),
 				r#type: "person".into(),
 				profile_pic: profile_pic.map(Into::into),
+				badges: None,
 			})
 			.expect("serialises");
 

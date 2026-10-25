@@ -402,7 +402,9 @@ pub async fn require_auth(
 /// The mounted set is pinned by
 /// `crate::routes::protected::tests::public_data_tier_holds_exactly_the_admitted_tables`
 /// in the `cloudillo` crate. Currently: `GET /api/profiles/batch` — the reduced 4-field
-/// profile projection, which is `GET /api/me` minus `keys`.
+/// profile projection, which is `GET /api/me` minus `keys`, plus an owner-only `badges`
+/// field the handler fills only for the tenant account itself (`abac::is_tenant_account`),
+/// never for a scoped or share-link token.
 pub async fn require_auth_public_data(
 	State(state): State<App>,
 	req: Request<Body>,

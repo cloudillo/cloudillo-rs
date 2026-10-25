@@ -47,7 +47,7 @@ const SYNC_COOLDOWN_SECS: i64 = 300;
 pub(crate) fn is_connected_community<S: AsRef<str>>(p: &Profile<S>) -> bool {
 	p.typ == ProfileType::Community
 		&& p.connected == ProfileConnectionStatus::Connected
-		&& matches!(p.status, None | Some(ProfileStatus::Active | ProfileStatus::Muted))
+		&& ProfileStatus::in_good_standing(p.status)
 }
 
 /// Connected community profiles of this tenant (Active/Muted only).
@@ -199,7 +199,9 @@ pub(crate) async fn sync_membership(
 		id_tag, name, r#type, profile_pic, keys, partners, protocol_version, ..
 	} = data.data;
 	// No etag yet: it is stored only once the edges are.
-	let base = ProfileBase { id_tag, name, r#type, profile_pic, keys, protocol_version };
+	// Communities never hold badges.
+	let base =
+		ProfileBase { id_tag, name, r#type, profile_pic, keys, badges: None, protocol_version };
 	let base = ConditionalResult::Modified { data: base, etag: None };
 	let modified = crate::sync::apply_refresh(app, tn_id, community, Ok(base)).await?;
 
@@ -459,6 +461,7 @@ mod tests {
 			name: id_tag.into(),
 			r#type: "community".into(),
 			profile_pic: None,
+			badges: None,
 		}
 	}
 

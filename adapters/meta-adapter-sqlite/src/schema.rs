@@ -1449,6 +1449,31 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
+	// Profile badges: decoded fields of a viewed person's `GET /api/me` badge tokens, replaced
+	// on every profile sync (no raw tokens). `slot = ''` (NULL level/exp) marks an unverified
+	// issuer community, kept so joining it resyncs the holder (adapter-internal: it maps to
+	// `ProfileBadgeRow::verified = None`). `ord` is the display order.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS profile_badges (
+			tn_id integer NOT NULL,
+			id_tag text NOT NULL,
+			community text NOT NULL,
+			slot text NOT NULL,
+			level text,
+			exp INTEGER,
+			ord integer NOT NULL,
+			PRIMARY KEY(tn_id, id_tag, community, slot)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query(
+		"CREATE INDEX IF NOT EXISTS idx_profile_badges_community \
+		ON profile_badges(tn_id, community)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
 	// Uniqueness enforced via partial indexes below (not a table-level UNIQUE).
 	// SQLite treats NULLs in a UNIQUE index as distinct, so a plain
 	// UNIQUE(tn_id, cal_id, uid, recurrence_id) would let duplicate masters

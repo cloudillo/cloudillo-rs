@@ -12,6 +12,7 @@ pub mod abac;
 pub mod action_types;
 pub mod address;
 pub mod auth_adapter;
+pub mod badges;
 pub mod blob_adapter;
 pub mod crdt_adapter;
 pub mod error;
