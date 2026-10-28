@@ -9,7 +9,30 @@ use std::str::FromStr;
 
 use crate::prelude::*;
 use crate::subject_ref::{SubjectRef, parse_subject_ref};
-use cloudillo_types::meta_adapter::{Channel, MetaAdapter};
+use cloudillo_types::meta_adapter::{
+	ActionView, Channel, ListActionOptions, MetaAdapter, ProfileStatus,
+};
+
+/// Profiles whose SUBS no longer count as membership.
+pub(crate) const INACTIVE_MEMBER_STATUSES: [ProfileStatus; 3] =
+	[ProfileStatus::Suspended, ProfileStatus::Blocked, ProfileStatus::Banned];
+
+// ponytail: one unpaged query, page if groups outgrow this
+const MAX_MEMBER_LIST: u32 = 10_000;
+
+/// Active members of `subject`: SUBS at status `A`, not `DEL`, issuer not suspended, blocked or
+/// banned (enforced in SQL, so an adapter error fails the list rather than failing open).
+pub(crate) fn active_subs_opts(subject: &str) -> ListActionOptions {
+	ListActionOptions {
+		typ: Some(vec!["SUBS".into()]),
+		subject: Some(vec![subject.to_string()]),
+		status: Some(vec!["A".into()]),
+		exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
+		exclude_issuer_profile_status: Some(Box::from(INACTIVE_MEMBER_STATUSES)),
+		limit: Some(MAX_MEMBER_LIST),
+		..Default::default()
+	}
+}
 
 /// Gate an identity-valued action field (`iss`, `aud`) on being a **canonical**
 /// id_tag — a UTS #46 U-label, per [`cloudillo_types::validation::validate_id_tag`].
@@ -131,7 +154,12 @@ pub fn serialize_content(content: Option<&serde_json::Value>) -> Option<String> 
 /// the result at 200 characters. Used by the offline email notification path
 /// (`process::deliver_notification_email`).
 pub(crate) fn content_snippet(content: Option<&serde_json::Value>) -> String {
-	let raw = match content {
+	content_text(content).chars().take(200).collect()
+}
+
+/// The full text behind [`content_snippet`], uncapped.
+fn content_text(content: Option<&serde_json::Value>) -> String {
+	match content {
 		Some(serde_json::Value::String(s)) => s.clone(),
 		Some(serde_json::Value::Object(o)) => o
 			.get("text")
@@ -142,8 +170,216 @@ pub(crate) fn content_snippet(content: Option<&serde_json::Value>) -> String {
 			.unwrap_or_default(),
 		Some(other) => other.to_string(),
 		None => String::new(),
+	}
+}
+
+/// Scan MSG content for `@idTag` mention tokens: returns `(mentions_me, mentions_all)`.
+///
+/// A token is `@` not preceded by an alphanumeric (so `bob@x.org` is no mention),
+/// followed by id_tag characters; a trailing `.` (sentence end) is dropped. `@all` is
+/// reported raw — whether it counts depends on the issuer's role ([`conv_role`]).
+pub fn parse_mentions(content: Option<&serde_json::Value>, me: &str) -> (bool, bool) {
+	let text = content_text(content);
+	let (mut mine, mut all) = (false, false);
+	let mut parts = text.split('@');
+	let mut prev = parts.next().unwrap_or_default();
+	for part in parts {
+		if !prev.chars().next_back().is_some_and(char::is_alphanumeric) {
+			let end = part
+				.find(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_')))
+				.unwrap_or(part.len());
+			let tag = part[..end].trim_end_matches('.');
+			if tag == "all" {
+				all = true;
+			} else if !tag.is_empty() && tag.eq_ignore_ascii_case(me) {
+				mine = true;
+			}
+		}
+		prev = part;
+	}
+	(mine, all)
+}
+
+/// Read-receipt reciprocity: a tenant with `msg.send_read_receipts` off is shown no RCPT but
+/// its own. True when the action (`typ`, `issuer`) must be hidden from the tenant.
+pub(crate) async fn rcpt_hidden(
+	app: &App,
+	tn_id: TnId,
+	typ: &str,
+	issuer: &str,
+	tenant_tag: &str,
+) -> bool {
+	typ == "RCPT"
+		&& issuer != tenant_tag
+		&& !app.settings.get_bool(tn_id, "msg.send_read_receipts").await.unwrap_or(true)
+}
+
+/// Effective role of `issuer` in the conversation `conv`, from **this node's own rows**:
+/// the CONV issuer is `Admin`, anyone else gets the `x.role` of the local
+/// `SUBS:{conv}:{issuer}` row ([`get_subscription_role`]), `Observer` without one — raised on a
+/// community group by the mapped community role ([`effective_role`]).
+///
+/// Only the CONV owner's node has authoritative roles: inbound SUBS rows carry no `x`, so
+/// on a member node every non-creator reads as `Member`. A delegated moderator therefore
+/// counts as moderator on the owner node only; the creator counts everywhere.
+pub async fn conv_role<M: MetaAdapter + ?Sized>(
+	meta: &M,
+	tn_id: TnId,
+	conv: &ActionView,
+	issuer: &str,
+) -> SubscriptionRole {
+	if conv.issuer.id_tag.as_ref() == issuer {
+		return SubscriptionRole::Admin;
+	}
+	let key = format!("SUBS:{}:{}", conv.action_id, issuer);
+	let subs = match meta.get_action_by_key(tn_id, &key).await {
+		Ok(Some(sub)) => get_subscription_role(sub.x.as_ref()),
+		_ => SubscriptionRole::Observer,
 	};
-	raw.chars().take(200).collect()
+	effective_role(meta, tn_id, conv, issuer, subs).await
+}
+
+/// The group role `subs` of `member` in `conv`, combined with their community role:
+/// on a community group (`x.createdBy` set, which only the owning community's row has) it is
+/// max(`subs`, mapped role), leader → `Admin`, moderator → `Moderator`, anyone else keeps
+/// `subs`. A personal group returns `subs` unchanged. Read at every check: there is no
+/// role-change hook, so a lost community role takes effect lazily, at the next one.
+pub async fn effective_role<M: MetaAdapter + ?Sized>(
+	meta: &M,
+	tn_id: TnId,
+	conv: &ActionView,
+	member: &str,
+	subs: SubscriptionRole,
+) -> SubscriptionRole {
+	if conv_created_by(conv.x.as_ref()).is_none() {
+		return subs;
+	}
+	let mapped = match community_level(meta, tn_id, member).await {
+		l if l >= cloudillo_core::roles::LEADER_LEVEL => SubscriptionRole::Admin,
+		l if l >= cloudillo_core::roles::MODERATOR_LEVEL => SubscriptionRole::Moderator,
+		_ => SubscriptionRole::Observer,
+	};
+	subs.max(mapped)
+}
+
+/// `member`'s highest community-ladder level on this tenant (`ROLE_HIERARCHY` index): 0 without
+/// a profile or for an access-restricted one (`read_profile_roles` drops those), 1
+/// (`FOLLOWER_LEVEL`) for a mere follower. A real member is above `FOLLOWER_LEVEL`.
+pub async fn community_level<M: MetaAdapter + ?Sized>(
+	meta: &M,
+	tn_id: TnId,
+	member: &str,
+) -> usize {
+	match meta.read_profile_roles(tn_id, member).await {
+		Ok(Some(roles)) => cloudillo_core::roles::highest_role_level(&roles),
+		_ => 0,
+	}
+}
+
+/// Whether a MSG mentions the reader `me`: a personal `@me` ([`parse_mentions`]), or `@all`
+/// from a moderator+ `issuer` of the group `conv` ([`conv_role`]) unless the reader ignores
+/// `@all` — per conversation (`conv`'s `A:CONV` reader-state `ignoreAll`) or globally (the
+/// `msg.ignore_all` setting). A DM (`conv` None) has no `@all`. Shared by the notify gate
+/// (`process::msg_notify_gate`) and the MSG hook's mention stamp (`native_hooks::msg`).
+pub async fn is_mention(
+	app: &App,
+	tn_id: TnId,
+	me: &str,
+	issuer: &str,
+	content: Option<&serde_json::Value>,
+	conv: Option<&ActionView>,
+) -> bool {
+	let (mine, all) = parse_mentions(content, me);
+	if mine {
+		return true;
+	}
+	let Some(conv) = conv.filter(|_| all) else {
+		return false;
+	};
+	!conv.reader_state.as_ref().is_some_and(|r| r.ignore_all)
+		&& !app.settings.get_bool(tn_id, "msg.ignore_all").await.unwrap_or(false)
+		&& conv_role(app.meta_adapter.as_ref(), tn_id, conv, issuer).await
+			>= SubscriptionRole::Moderator
+}
+
+/// Stamp the reader-state row `kind`/`ref_` with the hook's action (`last_id`/`last_at`;
+/// `insert` creates a missing row). The time is the action's `created_at` capped at now (hooks
+/// run after the insert), the unread timeline's clock: clients mark read by creation time.
+/// Returns the stamped time, even when the write failed. Best-effort: a failure is logged.
+pub(crate) async fn stamp_reader_row(
+	app: &App,
+	ctx: &crate::hooks::HookContext,
+	kind: &str,
+	ref_: &str,
+	insert: bool,
+) -> Timestamp {
+	let now = Timestamp::now().0;
+	let at = Timestamp(ctx.created_at.parse::<i64>().unwrap_or(now).min(now));
+	if let Err(e) = app
+		.meta_adapter
+		.stamp_reader_activity(ctx.tn_id, kind, ref_, &ctx.action_id, at, insert)
+		.await
+	{
+		tracing::warn!("{}: stamping {} {} failed: {}", ctx.action_id, kind, ref_, e);
+	}
+	at
+}
+
+/// The plain group CONV `id` held here (not a CONV:UPD row), `None` otherwise.
+pub(crate) async fn get_group<M: MetaAdapter + ?Sized>(
+	meta: &M,
+	tn_id: TnId,
+	id: &str,
+) -> ClResult<Option<ActionView>> {
+	Ok(meta
+		.get_action(tn_id, id)
+		.await?
+		.filter(|c| &*c.typ == "CONV" && c.sub_typ.as_deref().is_none_or(str::is_empty)))
+}
+
+/// POST `token` to each recipient's inbox, ≤ 8 at a time. Fire-and-forget, for never-stored
+/// hints (a retry would land too late to matter).
+// ponytail: 8 concurrent posts per call; a shared outbound limiter if these pile up
+pub(crate) fn spawn_inbox_posts(app: &App, tn_id: TnId, recipients: Vec<Box<str>>, token: &str) {
+	if recipients.is_empty() {
+		return;
+	}
+	let payload = serde_json::json!({ "token": token });
+	let app = app.clone();
+	tokio::spawn(async move {
+		let mut set = tokio::task::JoinSet::new();
+		for recipient in recipients {
+			if set.len() >= 8 {
+				set.join_next().await;
+			}
+			let app = app.clone();
+			let payload = payload.clone();
+			set.spawn(async move {
+				if let Err(e) = app
+					.request
+					.post::<serde_json::Value>(tn_id, &recipient, "/inbox", &payload)
+					.await
+				{
+					debug!(recipient = %recipient, error = %e, "inbox post failed");
+				}
+			});
+		}
+		while set.join_next().await.is_some() {}
+	});
+}
+
+/// Recompute the stored `unread` of the reader-state row `kind`/`ref_`. Best-effort: a
+/// failure is logged against `action_id`.
+pub(crate) async fn recompute_reader_row(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	kind: &str,
+	ref_: &str,
+) {
+	if let Err(e) = app.meta_adapter.recompute_reader_unread(tn_id, kind, ref_).await {
+		tracing::warn!("{}: unread of {} {} failed: {}", action_id, kind, ref_, e);
+	}
 }
 
 /// Inherit visibility and channel from the parent action, else from an action `subject`.
@@ -176,6 +412,18 @@ pub async fn inherit_context<M: MetaAdapter + ?Sized>(
 	}
 	// Not a root, but the context is unknown here: never fall back to the explicit channel.
 	(visibility, None)
+}
+
+/// The member who created a community group: `x.createdBy` on its CONV, stamped pre-store by
+/// `post_action` (which replaces any client `x`). `None` on a personal group.
+pub fn conv_created_by(x: Option<&serde_json::Value>) -> Option<&str> {
+	x?.get("createdBy")?.as_str()
+}
+
+/// Whether a community group is listed for discovery: CONV content `join` is
+/// `role` or `request`. Absent reads as `private`, unlisted.
+pub fn conv_listed(content: Option<&serde_json::Value>) -> bool {
+	matches!(content.and_then(|c| c.get("join")).and_then(|j| j.as_str()), Some("role" | "request"))
 }
 
 /// Resolve audience tag from parent action for federation.
@@ -298,10 +546,13 @@ impl SubscriptionRole {
 			("SUBS" | "CONV", Some("UPD")) => Self::Admin,
 
 			// Moderator-level actions
-			("SUBS", Some("DEL")) | ("INVT", _) => Self::Moderator,
+			// PIN: also enforced by `native_hooks::pin::check_authority` (PIN does not
+			// require a subscription, so this table alone would not stop it).
+			("SUBS", Some("DEL")) | ("INVT" | "PIN", _) => Self::Moderator,
 
-			// Observer can only view (SUBS without subtype is creating subscription)
-			("SUBS", None) => Self::Observer,
+			// Observer can only view (SUBS without subtype is creating subscription);
+			// a read receipt is part of viewing.
+			("SUBS", None) | ("RCPT", _) => Self::Observer,
 
 			// Member-level actions (participation) and default for unknown action types
 			_ => Self::Member,
@@ -414,6 +665,17 @@ fn room_recipients(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn parse_mentions_tokens() {
+		let c = |s: &str| serde_json::Value::String(s.into());
+		assert_eq!(parse_mentions(Some(&c("hi @bob.org.")), "bob.org"), (true, false));
+		assert_eq!(parse_mentions(Some(&c("mail me@bob.org")), "bob.org"), (false, false));
+		assert_eq!(parse_mentions(Some(&c("@all, @bob.org.uk")), "bob.org"), (false, true));
+		let obj = serde_json::json!({ "text": "(@Bob.org) see" });
+		assert_eq!(parse_mentions(Some(&obj), "bob.org"), (true, false));
+		assert_eq!(parse_mentions(None, "bob.org"), (false, false));
+	}
 
 	fn room(min_role: Option<&str>, closed: bool) -> Channel {
 		Channel {

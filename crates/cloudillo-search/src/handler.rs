@@ -142,6 +142,9 @@ pub struct SearchQuery {
 	///
 	/// With `tags` present, `q` may be empty — that is a tag-only browse.
 	pub tags: Option<String>,
+	/// Conversation scope: a CONV id (its messages) or a peer idTag (DMs with that peer).
+	/// Implies `type=action`.
+	pub conv: Option<String>,
 	pub limit: Option<u32>,
 	pub offset: Option<u32>,
 }
@@ -247,8 +250,16 @@ pub async fn get_search(
 
 	let mut opts = SearchOptions {
 		q: q.q,
-		obj_tp: obj_tp_filter(q.r#type.as_deref()),
+		obj_tp: if q.conv.is_some() { Some(vec!['A']) } else { obj_tp_filter(q.r#type.as_deref()) },
 		file_id: q.file_id,
+		// A peer idTag keys like every other idTag; an action id (`a1~…`) is taken as is.
+		conv: q.conv.map(|c| {
+			if c.contains('~') {
+				c
+			} else {
+				cloudillo_types::utils::normalize_id_tag(&c).into_owned()
+			}
+		}),
 		content_type,
 		tags,
 		limit,

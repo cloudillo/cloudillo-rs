@@ -72,6 +72,23 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				);
 			} else {
 				cloudillo_core::search_index_action(&app, tn_id, subject_action_id);
+				// Our group-settings or member-role request, approved by the CONV's host.
+				let applied = match (&*action.typ, action.sub_typ.as_deref()) {
+					("CONV", Some("UPD")) => {
+						super::conv::apply_upd(&app, tn_id, subject_action_id).await;
+						true
+					}
+					("SUBS", Some("ROLE")) => {
+						super::subs::apply_role(&app, tn_id, subject_action_id).await;
+						true
+					}
+					_ => false,
+				};
+				if applied {
+					// Our own request was never pushed inbound; tell the open UIs to reload.
+					crate::forward::forward_inbound_action_view(&app, tn_id, action, None, None)
+						.await;
+				}
 			}
 		}
 	}

@@ -324,8 +324,8 @@ pub struct Profile {
 ///
 /// It is **not** `ProfileWithStatus`, which leaks the reading tenant's private
 /// relationship state (`status` including Blocked/Muted/Banned, `connected`,
-/// `following`, `follower`, `trust`, and the `feedReadAt`/`msgReadAt` DM read
-/// watermarks), and **not** [`ProfileBase`], which carries `keys`.
+/// `following`, `follower`, `trust`, and the `msgState`/`feedState` reader
+/// state), and **not** [`ProfileBase`], which carries `keys`.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -461,20 +461,13 @@ pub struct ProfileInfo {
 		skip_serializing_if = "Option::is_none"
 	)]
 	pub created_at: Option<Timestamp>,
-	/// Reader's feed read-watermark for this context (seeds `useReadMarker`).
-	/// ISO 8601 string (round-trips with `PUT /api/read-marker`'s `position`).
-	#[serde(
-		serialize_with = "serialize_timestamp_iso_opt",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub feed_read_at: Option<Timestamp>,
-	/// Reader's DM read-watermark for this peer (seeds `useReadMarker`).
-	/// ISO 8601 string (round-trips with `PUT /api/read-marker`'s `position`).
-	#[serde(
-		serialize_with = "serialize_timestamp_iso_opt",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub msg_read_at: Option<Timestamp>,
+	/// Reader's DM state with this peer (`reader_state` row `P:MSG`). Owner-only.
+	/// Serialize-only: `ReaderState` is not `Deserialize`.
+	#[serde(skip_deserializing)]
+	pub msg_state: Option<crate::meta_adapter::ReaderState>,
+	/// Reader's feed state for this context (`reader_state` row `P:POST`). Owner-only.
+	#[serde(skip_deserializing)]
+	pub feed_state: Option<crate::meta_adapter::ReaderState>,
 	/// Composition control for the home feed (community profiles): `Some(true)` =
 	/// hidden from the merged home feed. Absent/`None` = shown (the default).
 	pub hidden_in_home: Option<bool>,

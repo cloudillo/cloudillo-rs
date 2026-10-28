@@ -171,6 +171,7 @@ pub enum FieldType {
 /// - `approvable` - Enables APRV flow, auto-approve for trusted sources
 /// - `requires_subscription` - Validated on both inbound and outbound
 /// - `deliver_subject` - Delivers subject action along with main action
+/// - `fanout_via_subject` - The owner's own parentless one fans out through its subject's group
 /// - `subscribable` - Enables SUBS-based permissions and visibility
 /// - `deliver_to_subject_owner` - Dual delivery to subject owner
 /// - `default_flags` - Applied during action creation
@@ -210,6 +211,11 @@ pub struct BehaviorFlags {
 	/// Deliver subject action along with this action to recipients.
 	/// Used by APRV to include the approved POST when fanning out.
 	pub deliver_subject: Option<bool>,
+
+	/// The owner's own action carrying no parent fans out to the group its `subject` belongs
+	/// to: the target MSG's CONV, or the subject itself when `subscribable`
+	/// (`fanout::group_msg_variant_root`). Used by REACT, PIN, RCPT and MSG edits/deletes.
+	pub fanout_via_subject: Option<bool>,
 
 	/// This action type can have SUBS (subscriptions) pointing to it.
 	/// When true, subscribers are included in visibility checks for Direct visibility.

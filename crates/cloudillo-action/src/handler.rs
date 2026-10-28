@@ -5,13 +5,14 @@ use axum::{
 	Json,
 	extract::{ConnectInfo, Path, Query, State},
 	http::StatusCode,
+	response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use cloudillo_types::hasher::hash;
-use cloudillo_types::utils::decode_jwt_no_verify;
+use cloudillo_types::utils::{decode_jwt_no_verify, normalize_id_tag};
 
 use cloudillo_core::{
 	IdTag,
@@ -43,6 +44,10 @@ pub async fn list_actions(
 	let is_tenant = maybe_auth
 		.as_ref()
 		.is_some_and(|a| cloudillo_core::abac::is_tenant_self(a, &tenant_id_tag));
+	// `subscribed` reads the tenant's own follow state.
+	if opts.subscribed == Some(true) && !is_tenant {
+		return Err(Error::PermissionDenied);
+	}
 	// A credential that names the tenant without being its account (a share link, via-embed)
 	// is anonymous here: every visibility rule below reads the tenant's id_tag as owner.
 	let maybe_auth = maybe_auth
@@ -53,13 +58,33 @@ pub async fn list_actions(
 	let is_moderator = maybe_auth.as_ref().is_some_and(cloudillo_core::abac::is_unscoped_moderator);
 
 	// `status=` narrows, never widens: hidden statuses stay out, and pending moderation (`C`)
-	// is the tenant's and its moderators'.
+	// is the tenant's and its moderators'. A group moderator+ asking for `C` alone gets the
+	// knocks (SUBS) on their own groups, narrowed by `subject` in the query itself so
+	// `limit` stays exact.
 	if let Some(status) = opts.status.take() {
-		let status: Vec<String> = status
+		let knocks_only = !is_tenant && !is_moderator && status.iter().all(|s| s == "C");
+		let mut status: Vec<String> = status
 			.into_iter()
 			.filter(|s| !meta_adapter::HIDDEN_ACTION_STATUSES.contains(&s.as_str()))
-			.filter(|s| is_tenant || is_moderator || s != "C")
+			.filter(|s| is_tenant || is_moderator || knocks_only || s != "C")
 			.collect();
+		if knocks_only && !status.is_empty() {
+			let groups = match maybe_auth.as_ref() {
+				Some(auth) => moderated_groups(&app, tn_id, &auth.id_tag).await?,
+				None => Vec::new(),
+			};
+			let subject: Vec<String> = match opts.subject.take() {
+				Some(asked) => asked.into_iter().filter(|s| groups.contains(s)).collect(),
+				None => groups,
+			};
+			if subject.is_empty()
+				|| opts.typ.as_ref().is_some_and(|t| !t.iter().any(|t| t == "SUBS"))
+			{
+				status.clear();
+			}
+			opts.typ = Some(vec!["SUBS".into()]);
+			opts.subject = Some(subject);
+		}
 		if status.is_empty() {
 			let response = if opts.count == Some(true) {
 				ApiResponse::with_count(0)
@@ -69,6 +94,11 @@ pub async fn list_actions(
 			return Ok((StatusCode::OK, Json(response.with_req_id(req_id.unwrap_or_default()))));
 		}
 		opts.status = Some(status);
+	}
+
+	// A CONV listing lists groups: its settings updates and deletes are CONV rows too.
+	if opts.typ.as_deref().is_some_and(|t| t == ["CONV"]) && opts.exclude_sub_typ.is_none() {
+		opts.exclude_sub_typ = Some(Box::from([Box::from("UPD"), Box::from("DEL")]));
 	}
 
 	// Filter actions by visibility based on subject's access level
@@ -94,7 +124,8 @@ pub async fn list_actions(
 		&& opts.parent_id.is_none()
 		&& opts.root_id.is_none()
 		&& opts.action_id.is_none()
-		&& opts.subject.is_none();
+		&& opts.subject.is_none()
+		&& opts.container.is_none();
 	if is_home_feed {
 		let communities = app
 			.meta_adapter
@@ -146,6 +177,12 @@ pub async fn list_actions(
 		if !muted.is_empty() {
 			opts.muted_channels = Some(muted);
 		}
+	}
+
+	// Read-receipt reciprocity: a tenant that sends none is shown none but its own. The CONV
+	// owner still stores and relays members' receipts; only listing hides them.
+	if !app.settings.get_bool(tn_id, "msg.send_read_receipts").await.unwrap_or(true) {
+		opts.rcpt_issuer = Some(tenant_id_tag.clone());
 	}
 
 	let limit = opts.limit.unwrap_or(20) as usize;
@@ -234,6 +271,13 @@ pub async fn list_actions(
 				a.subject.as_deref().and_then(|id| by_id.get(id)).map(|s| Box::new(s.clone()));
 		}
 	}
+	// Reader state is the account's own, not SADM's (as `/api/reader-state`).
+	if !maybe_auth
+		.as_ref()
+		.is_some_and(|a| cloudillo_core::abac::is_tenant_account(a, &tenant_id_tag))
+	{
+		filtered.iter_mut().for_each(strip_private);
+	}
 
 	// Build next cursor from last item. The cursor's sort value must be the same
 	// column the keyset query orders by, so sort=received cursors carry received_at
@@ -258,99 +302,232 @@ pub async fn list_actions(
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// Body for `PUT /api/read-marker`. `scope` selects the watermark column,
-/// `key` is the entity id (context/peer id_tag for feed/msg, action_id for
-/// thread), `position` is the forward-only watermark value. `position` is a
-/// `Timestamp`, so it accepts an ISO 8601 string (the client's wire format) or
-/// a raw epoch-seconds integer.
-#[derive(Deserialize)]
-pub struct ReadMarkerBody {
-	pub scope: String,
-	pub key: String,
-	pub position: types::Timestamp,
+/// Drops the tenant's own state from a view served to anyone else (embedded subject included).
+fn strip_private(a: &mut meta_adapter::ActionView) {
+	a.reader_state = None;
+	if let Some(s) = a.subject_action.as_mut() {
+		s.reader_state = None;
+	}
 }
 
-/// `PUT /api/read-marker` — set a read-watermark on the reader's own node.
-/// Auth-only (the reader); forward-only is enforced in the adapter UPDATE.
-pub async fn put_read_marker(
+/// `<A|P>:<TYPE>` with an upper-case ASCII type (`P:MSG`, `A:CONV`, …).
+fn valid_reader_kind(kind: &str) -> bool {
+	kind.split_once(':').is_some_and(|(class, typ)| {
+		matches!(class, "A" | "P") && !typ.is_empty() && typ.bytes().all(|b| b.is_ascii_uppercase())
+	})
+}
+
+/// `CursorData.s` of a reader-state cursor; `id` packs `"<kind> <ref>"` (kinds hold no space).
+const READER_CURSOR_SORT: &str = "lastAt";
+
+/// Decode a `GET /api/reader-state` cursor into the adapter keyset `(sort_ts, kind, ref)`.
+fn decode_reader_cursor(cursor: &str) -> Option<(types::Timestamp, Box<str>, Box<str>)> {
+	let c = types::CursorData::decode(cursor).filter(|c| c.s == READER_CURSOR_SORT)?;
+	let (kind, ref_) = c.id.split_once(' ')?;
+	Some((types::Timestamp(c.timestamp()?), kind.into(), ref_.into()))
+}
+
+/// Query of `GET /api/reader-state`. `kind`: comma-separated kinds (`P:MSG,A:CONV`), absent =
+/// every kind; `sort`: only `lastAt` (the default); `limit`: 1..=200, default 50 (clamped);
+/// `cursor`: the previous page's `nextCursor`; `include`: `ref`, `last` (the `lastId` action).
+#[derive(Deserialize)]
+pub struct ListReaderStateQuery {
+	kind: Option<String>,
+	sort: Option<String>,
+	limit: Option<u32>,
+	cursor: Option<String>,
+	include: Option<String>,
+}
+
+/// One `GET /api/reader-state` row: the [`meta_adapter::ReaderState`] plus, for `P:*` rows
+/// with `include=ref`, the wire profile (the adapter embed itself is not serialized).
+#[derive(Serialize)]
+pub struct ReaderStateItem {
+	#[serde(flatten)]
+	state: meta_adapter::ReaderState,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	profile: Option<types::ProfileInfo>,
+}
+
+/// Wire form of a `P:*` row's `include=ref` profile. The owner's own view, so unfiltered;
+/// no `msgState`/`feedState` — the row itself is that state.
+fn reader_profile_info(p: meta_adapter::Profile<Box<str>>) -> types::ProfileInfo {
+	types::ProfileInfo {
+		id_tag: p.id_tag.to_string(),
+		name: p.name.to_string(),
+		r#type: Some(p.typ.as_str().to_string()),
+		profile_pic: p.profile_pic.map(|s| s.to_string()),
+		status: p.status,
+		connected: Some(p.connected.is_connected()),
+		following: Some(p.following),
+		follower: Some(p.follower),
+		trust: p.trust,
+		roles: p.roles.map(|r| r.iter().map(ToString::to_string).collect()),
+		..Default::default()
+	}
+}
+
+/// `GET /api/reader-state` — one page of the reader's own follow state, newest activity
+/// first (`COALESCE(lastAt, createdAt) DESC, kind, ref`), cursor-paginated. Owner only.
+/// 400 on an invalid `kind`, `sort`, `include` or `cursor`.
+pub async fn list_reader_state(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
-	Json(body): Json<ReadMarkerBody>,
-) -> ClResult<StatusCode> {
-	// Caller must be the tenant owner. All read-watermarks are reader-local rows
-	// in this tenant's own DB: `profiles.feed_read_at`/`msg_read_at` on the
-	// reader's per-context/per-peer profile row (keyed by that id_tag), and
-	// `actions.comments_read_at` on the reader's cached action row. The `tn_id`
-	// scoping is the authorization boundary; the owner check just stops a
-	// principal authenticated on this node from moving the owner's markers.
-	if id_tag.as_ref() != auth.id_tag.as_ref() {
+	OptionalRequestId(req_id): OptionalRequestId,
+	Query(q): Query<ListReaderStateQuery>,
+) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ReaderStateItem>>>)> {
+	// Reader state is the tenant owner's alone, never federated.
+	if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
 		return Err(Error::PermissionDenied);
 	}
-	// Verify the target row exists in this tenant before the UPDATE so a bogus key
-	// is a 404 rather than a silently-dropped watermark (consistent across scopes,
-	// and avoids a silent no-op masquerading as success). `feed`/`msg` resolve the
-	// reader's per-context/per-peer `profiles` row; `thread` the cached action row.
-	// An unknown scope falls through to `set_read_marker`, which returns a
-	// ValidationError for it.
-	match body.scope.as_str() {
-		"thread" => {
-			app.meta_adapter.get_action(tn_id, &body.key).await?.ok_or(Error::NotFound)?;
-		}
-		"feed" | "msg" => {
-			// read_profile returns Error::NotFound when the row is absent.
-			app.meta_adapter.read_profile(tn_id, &body.key).await?;
-		}
-		_ => {}
+	if q.sort.as_deref().is_some_and(|s| s != READER_CURSOR_SORT) {
+		return Err(Error::ValidationError("unknown sort".into()));
 	}
-	app.meta_adapter
-		.set_read_marker(tn_id, &body.scope, &body.key, body.position.0)
-		.await?;
-	Ok(StatusCode::NO_CONTENT)
-}
-
-/// Body for `PUT /api/actions/{action_id}/subscribe`. `level` is the W/T/M
-/// subscription level, or `null`/absent to clear the subscription.
-#[derive(Deserialize)]
-pub struct SubscribeBody {
-	pub level: Option<String>,
-}
-
-/// `PUT /api/actions/{action_id}/subscribe` — set the reader's W/T/M thread
-/// subscription level on their locally-cached action row. Auth-only (reader's
-/// own preference); folds into `update_action_data`'s `sub_level` patch.
-pub async fn put_action_subscribe(
-	State(app): State<App>,
-	tn_id: TnId,
-	Auth(auth): Auth,
-	IdTag(id_tag): IdTag,
-	Path(action_id): Path<String>,
-	Json(body): Json<SubscribeBody>,
-) -> ClResult<StatusCode> {
-	// Caller must be the tenant owner: `actions.sub_level` is a tenant-wide row,
-	// so any other authenticated principal would otherwise move the owner's
-	// subscription.
-	if id_tag.as_ref() != auth.id_tag.as_ref() {
-		return Err(Error::PermissionDenied);
-	}
-	let sub_level = match body.level.as_deref() {
-		None => types::Patch::Null,
-		Some("W") => types::Patch::Value('W'),
-		Some("T") => types::Patch::Value('T'),
-		Some("M") => types::Patch::Value('M'),
-		Some(other) => {
-			return Err(Error::ValidationError(format!("invalid subscription level: {other}")));
-		}
+	let list = |s: Option<&str>| -> Vec<String> {
+		s.unwrap_or_default()
+			.split(',')
+			.map(str::trim)
+			.filter(|t| !t.is_empty())
+			.map(Into::into)
+			.collect()
 	};
-	// Verify the action exists in this tenant before mutating, so a bogus id is a
-	// 404 rather than a silent no-op (which would otherwise allow existence-probing).
-	app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+	let kinds: Vec<Box<str>> = list(q.kind.as_deref()).into_iter().map(Into::into).collect();
+	if let Some(bad) = kinds.iter().find(|k| !valid_reader_kind(k)) {
+		return Err(Error::ValidationError(format!("invalid kind: {bad}")));
+	}
+	let mut include_ref = false;
+	let mut include_last = false;
+	for inc in list(q.include.as_deref()) {
+		match inc.as_str() {
+			"ref" => include_ref = true,
+			"last" => include_last = true,
+			_ => return Err(Error::ValidationError(format!("unknown include: {inc}"))),
+		}
+	}
+	let cursor = match q.cursor.as_deref() {
+		None => None,
+		Some(c) => Some(
+			decode_reader_cursor(c)
+				.ok_or_else(|| Error::ValidationError("invalid cursor".into()))?,
+		),
+	};
+	let limit = q.limit.unwrap_or(50).clamp(1, 200);
+	// One extra row tells whether another page exists.
+	let opts = meta_adapter::ListReaderStateOptions {
+		kinds,
+		limit: limit + 1,
+		cursor,
+		include_ref,
+		include_last,
+	};
+	let mut rows = app.meta_adapter.list_reader_state(tn_id, &opts).await?;
+	let page = usize::try_from(limit).unwrap_or(50);
+	let has_more = rows.len() > page;
+	rows.truncate(page);
+	let next_cursor = rows.last().filter(|_| has_more).map(|r| {
+		let ts = r.last_at.unwrap_or(r.created_at);
+		let id = format!("{} {}", r.kind, r.ref_);
+		types::CursorData::new(READER_CURSOR_SORT, serde_json::Value::from(ts.0), &id).encode()
+	});
+	let data = rows
+		.into_iter()
+		.map(|mut state| {
+			let profile = state.profile.take().map(|p| reader_profile_info(*p));
+			ReaderStateItem { state, profile }
+		})
+		.collect();
 
-	let opts = meta_adapter::UpdateActionDataOptions { sub_level, ..Default::default() };
-	app.meta_adapter.update_action_data(tn_id, &action_id, &opts).await?;
+	let response = ApiResponse::with_cursor_pagination(data, next_cursor, has_more)
+		.with_req_id(req_id.unwrap_or_default());
+	Ok((StatusCode::OK, Json(response)))
+}
 
+/// `PATCH /api/reader-state/{kind}/{ref}` — upsert the reader's own state for one followed
+/// thing; body [`meta_adapter::PatchReaderState`] (absent = unchanged, `null` = reset,
+/// `readAt` forward-only and not nullable). `kind` is `P:<TYPE>` (ref = a locally known
+/// profile idTag) or `A` / `A:<TYPE>` (ref = a local action id; the type always comes from
+/// the action row, a mismatching `A:<TYPE>` is a 400). 204; 400 bad kind / notify / body;
+/// 403 non-owner; 404 unknown ref. When `readAt` advances on `P:MSG` / `A:CONV` a read
+/// receipt goes out (the adapter already cleared `U` and recomputed `unread`).
+pub async fn patch_reader_state(
+	State(app): State<App>,
+	tn_id: TnId,
+	Auth(auth): Auth,
+	IdTag(id_tag): IdTag,
+	Path((kind, ref_)): Path<(String, String)>,
+	Json(body): Json<serde_json::Value>,
+) -> ClResult<StatusCode> {
+	if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
+		return Err(Error::PermissionDenied);
+	}
+	// Decoded here rather than by `Json<PatchReaderState>` so a bad body (`readAt: null`,
+	// an unknown field) is a 400 like the other validation errors, not axum's 422.
+	let patch: meta_adapter::PatchReaderState = serde_json::from_value(body)
+		.map_err(|e| Error::ValidationError(format!("invalid reader-state patch: {e}")))?;
+	let (kind, ref_) = if kind == "A" || kind.starts_with("A:") {
+		let actual = app
+			.meta_adapter
+			.action_reader_kind(tn_id, &ref_)
+			.await?
+			.ok_or(Error::NotFound)?;
+		if kind != "A" && kind != actual {
+			return Err(Error::ValidationError(format!("kind {kind} does not match the action")));
+		}
+		(actual, ref_)
+	} else if matches!(kind.as_str(), "P:MSG" | "P:POST") {
+		let ref_ = normalize_id_tag(&ref_).into_owned();
+		// read_profile returns Error::NotFound when the row is absent.
+		app.meta_adapter.read_profile(tn_id, &ref_).await?;
+		(kind, ref_)
+	} else {
+		return Err(Error::ValidationError(format!("invalid kind: {kind}")));
+	};
+	// The stored (clamped) watermark, so a receipt never runs ahead of it.
+	let read_at = app.meta_adapter.patch_reader_state(tn_id, &kind, &ref_, &patch, true).await?;
+	if let Some(read_at) = read_at {
+		let conv =
+			if kind == "A:CONV" { app.meta_adapter.get_action(tn_id, &ref_).await? } else { None };
+		send_read_receipt(&app, tn_id, &id_tag, &kind, &ref_, read_at, conv.as_ref()).await;
+	}
 	Ok(StatusCode::NO_CONTENT)
+}
+
+/// After the owner's read watermark advanced, tell the other side — the DM
+/// peer (`P:MSG`), or every member of a group CONV through its owner (`A:CONV`). Skipped
+/// when the owner turned `msg.send_read_receipts` off. Best-effort: the watermark is
+/// already stored.
+async fn send_read_receipt(
+	app: &App,
+	tn_id: TnId,
+	id_tag: &str,
+	kind: &str,
+	ref_: &str,
+	read_at: types::Timestamp,
+	conv: Option<&meta_adapter::ActionView>,
+) {
+	let (subject, audience): (Option<Box<str>>, Option<Box<str>>) = match (kind, conv) {
+		("P:MSG", _) if ref_ != id_tag => (None, Some(ref_.into())),
+		("A:CONV", Some(conv)) => {
+			let owner = crate::native_hooks::ownership::conv_owner(conv);
+			(Some(conv.action_id.clone()), (owner != id_tag).then(|| owner.into()))
+		}
+		_ => return,
+	};
+	if !app.settings.get_bool(tn_id, "msg.send_read_receipts").await.unwrap_or(true) {
+		return;
+	}
+	let rcpt = CreateAction {
+		typ: "RCPT".into(),
+		subject,
+		audience_tag: audience,
+		content: Some(serde_json::json!(read_at.0)),
+		..Default::default()
+	};
+	if let Err(e) = task::create_action(app, tn_id, id_tag, rcpt).await {
+		warn!("read receipt for {} {} failed: {}", kind, ref_, e);
+	}
 }
 
 /// Attachments are client-supplied file ids, so require the caller can already *read* each
@@ -415,7 +592,7 @@ pub async fn post_action(
 	Auth(auth): Auth,
 	OptionalRequestId(req_id): OptionalRequestId,
 	Json(mut action): Json<CreateAction>,
-) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
+) -> ClResult<axum::response::Response> {
 	// Defense-in-depth: apkg:publish scoped keys can only create APKG actions
 	if let Some(ref scope) = auth.scope
 		&& scope.as_ref() == "apkg:publish"
@@ -439,7 +616,7 @@ pub async fn post_action(
 		action.typ = "BDG".into();
 		action.sub_typ = sub_typ.clone().map(Into::into);
 	}
-	// `server_emitted` types (PTNR, FSHR, STAT, IDP:REG, PRINVT) come from hooks and dedicated
+	// `server_emitted` types (PTNR, FSHR, STAT, IDP:REG, PRINVT, RCPT) come from hooks and dedicated
 	// endpoints, never a client's to sign as the tenant. An outbound hook cannot gate them: its
 	// `issuer` is the tenant. Unknown types fall through to validation.
 	let dsl = app.ext::<Arc<DslEngine>>()?;
@@ -450,6 +627,11 @@ pub async fn post_action(
 	{
 		return Err(Error::PermissionDenied);
 	}
+	// Ephemeral types (PRES, CSIG) are never stored, so there is no row to return below.
+	let ephemeral = dsl
+		.definition_for(&typ, sub_typ.as_deref())
+		.and_then(|d| d.behavior.ephemeral)
+		.unwrap_or(false);
 	// Actions signed as the tenant that commit it to a relationship or endorsement: an APRV or
 	// an accepted join request is the moderator's (as `/accept`); every other CONN (request,
 	// UPD, empty or unknown subtype) and every FLLW the leader's (as the relationship PATCH).
@@ -522,42 +704,45 @@ pub async fn post_action(
 		check_attachments(&app, tn_id, &auth, &id_tag, file_ids).await?;
 	}
 
-	// Community INVT authorization. The `on_create` hook cannot do this: `HookContext` carries
-	// no acting user, and pre-store is the only place a denial prevents the row at all — the
-	// hook runs after `finalize_action` set status 'A', and `continue_processing: false` does
-	// not roll back. An INVT aimed at a *remote* community passes through untouched; that
-	// community gates it on its own side in `check_inbound`.
-	crate::native_hooks::invt::check_community_authority(
+	// Type-specific pre-store gates (`before_create`): `on_create` runs after the row is stored
+	// at 'A' and has no acting user, so a denial there could not prevent the row.
+	let action = crate::hooks::run_before_create(
 		&app,
-		tn_id,
-		&id_tag,
-		(action.typ.as_ref(), action.sub_typ.as_deref()),
-		action.subject.as_deref(),
-		action.audience_tag.as_deref(),
-		&auth.id_tag,
+		crate::hooks::BeforeCreate {
+			tn_id,
+			tenant_tag: id_tag.clone(),
+			actor: auth.id_tag.clone(),
+			actor_roles: auth.roles.clone(),
+			typ,
+			sub_typ,
+			action,
+		},
 	)
 	.await?;
-
-	// Badge issuing, pre-store for the same reason: no hook can stop the row.
-	if typ == "BDG" {
-		crate::native_hooks::bdg::check_issue(&app, tn_id, &action).await?;
-	}
 
 	// Issued as the tenant, posted by `auth.id_tag` — on a community tenant those differ, and the
 	// attachment visibility upgrade needs the member, not the community.
 	let action_id = task::create_action_as(&app, tn_id, &id_tag, &auth.id_tag, action).await?;
 	debug!("actionId {:?}", &action_id);
+	if ephemeral {
+		let response = ApiResponse::new(serde_json::json!({ "actionId": action_id }));
+		return Ok((StatusCode::ACCEPTED, Json(response)).into_response());
+	}
 
 	// `get_action`, not a viewer-less `list_actions`: the list's draft guard hides the caller's
 	// own fresh draft ('R') when no viewer is named.
-	let created = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+	let mut created =
+		app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
+	if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
+		strip_private(&mut created);
+	}
 
 	let mut response = ApiResponse::new(created);
 	if let Some(id) = req_id {
 		response = response.with_req_id(id);
 	}
 
-	Ok((StatusCode::CREATED, Json(response)))
+	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -713,13 +898,33 @@ pub async fn post_inbox_sync(
 pub async fn get_action_by_id(
 	State(app): State<App>,
 	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
+	OptionalAuth(maybe_auth): OptionalAuth,
 	Path(action_id): Path<String>,
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?;
+	let is_account = maybe_auth
+		.as_ref()
+		.is_some_and(|a| cloudillo_core::abac::is_tenant_account(a, &tenant_id_tag));
 
 	match action {
-		Some(a) => {
+		Some(a)
+			if crate::helpers::rcpt_hidden(
+				&app,
+				tn_id,
+				&a.typ,
+				&a.issuer.id_tag,
+				&tenant_id_tag,
+			)
+			.await =>
+		{
+			Err(Error::NotFound)
+		}
+		Some(mut a) => {
+			if !is_account {
+				strip_private(&mut a);
+			}
 			let response = ApiResponse::new(a).with_req_id(req_id.unwrap_or_default());
 			Ok((StatusCode::OK, Json(response)))
 		}
@@ -761,7 +966,16 @@ pub async fn post_action_accept(
 
 	// Authority first: a moderator of the tenant, or the profile the action is addressed to.
 	// Only an authorized caller learns (400) that the action is not resolvable here.
-	if !crate::native_hooks::ownership::accept_authority(&action, &auth.id_tag, &auth.roles) {
+	if !crate::native_hooks::ownership::accept_authority(&action, &auth.id_tag, &auth.roles)
+		&& !crate::native_hooks::ownership::knock_authority(
+			&app,
+			tn_id,
+			&action,
+			&auth.id_tag,
+			&["C"],
+		)
+		.await?
+	{
 		return Err(Error::PermissionDenied);
 	}
 	if !crate::native_hooks::ownership::accept_applicable(&action, &id_tag, &auth.id_tag) {
@@ -867,6 +1081,31 @@ pub async fn post_action_accept(
 	Ok((StatusCode::OK, Json(response)))
 }
 
+/// The groups whose knocks `id_tag` may see and resolve without being a tenant moderator: the
+/// subjects of their own active SUBS rows holding a moderator+ `x.role`. A mapped community
+/// moderator/leader is a tenant moderator already (`is_unscoped_moderator`).
+async fn moderated_groups(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<Vec<String>> {
+	let opts = meta_adapter::ListActionOptions {
+		typ: Some(vec!["SUBS".into()]),
+		issuer: Some(id_tag.into()),
+		status: Some(vec!["A".into()]),
+		exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
+		// ponytail: single page, add paging if one member holds >1000 groups
+		limit: Some(1000),
+		..Default::default()
+	};
+	Ok(app
+		.meta_adapter
+		.list_actions(tn_id, &opts)
+		.await?
+		.into_iter()
+		.filter(|s| {
+			helpers::get_subscription_role(s.x.as_ref()) >= helpers::SubscriptionRole::Moderator
+		})
+		.filter_map(|s| s.subject.map(Into::into))
+		.collect())
+}
+
 /// POST /api/actions/:action_id/reject - Reject an action
 pub async fn post_action_reject(
 	State(app): State<App>,
@@ -883,7 +1122,17 @@ pub async fn post_action_reject(
 
 	// Authority first: a moderator of the tenant, or the profile the action is addressed to.
 	// Only an authorized caller learns (400) that the action is not resolvable here.
-	if !crate::native_hooks::ownership::accept_authority(&action, &auth.id_tag, &auth.roles) {
+	if !crate::native_hooks::ownership::accept_authority(&action, &auth.id_tag, &auth.roles)
+		&& !crate::native_hooks::ownership::knock_authority(
+			&app,
+			tn_id,
+			&action,
+			&auth.id_tag,
+			&["C", "A"],
+		)
+		.await?
+		|| !crate::native_hooks::ownership::kick_allowed(&app, tn_id, &action, &auth.id_tag).await?
+	{
 		return Err(Error::PermissionDenied);
 	}
 	if !crate::native_hooks::ownership::accept_applicable(&action, &id_tag, &auth.id_tag) {

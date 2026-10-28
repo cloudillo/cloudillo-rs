@@ -61,8 +61,6 @@ pub enum Route {
 	ActCount,
 	Search,
 	Outbox,
-	ReadMarker,
-	Subscribe,
 	/// `?access=` value (`None` = omitted).
 	WsCrdt(Option<&'static str>),
 	WsRtdb(Option<&'static str>),
@@ -178,11 +176,11 @@ impl Route {
 			WsCrdt(a) => Op::Ws(WsKind::Crdt, a),
 			WsRtdb(a) => Op::Ws(WsKind::Rtdb, a),
 			WsQuery(k, a) => Op::Ws(k, a),
-			FileUser | ReadMarker | Subscribe | ChanPorch(_) | ChanPorchKeys(_) | ChanCreate(_)
-			| ChanPatch(_) | ChanDelete(_) | ChanMembers(_) | ChanUpload(_) | Profiles(_)
-			| Partners | PartnersMap | PartnersSync | PtnrCreate | PtnrDelCreate | Ids(_)
-			| IdIn(..) | HatsPatch(_) | Fields(..) | AccessShape | AccessPerson(_) | Get(_)
-			| GetQ(_) | CallBasic(..) | Call(..) => {
+			FileUser | ChanPorch(_) | ChanPorchKeys(_) | ChanCreate(_) | ChanPatch(_)
+			| ChanDelete(_) | ChanMembers(_) | ChanUpload(_) | Profiles(_) | Partners
+			| PartnersMap | PartnersSync | PtnrCreate | PtnrDelCreate | Ids(_) | IdIn(..)
+			| HatsPatch(_) | Fields(..) | AccessShape | AccessPerson(_) | Get(_) | GetQ(_)
+			| CallBasic(..) | Call(..) => {
 				return None;
 			}
 		})
@@ -233,14 +231,16 @@ pub const G1: &[Row] = &[
 	("G1-26", WHO[1], "post-p-tenant-active@alice", ActAccept, "Deny"),
 	("G1-27", WHO[0], "", Outbox, "Deny"),
 	("G1-28", WHO[1], "", Outbox, "Deny"),
-	("G1-29", WHO[0], "", ReadMarker, "Deny"),
-	("G1-30", WHO[1], "", ReadMarker, "Deny"),
-	("G1-31", WHO[0], "container-d-tenant-active@alice", Subscribe, "Deny"),
-	("G1-32", WHO[1], "container-d-tenant-active@alice", Subscribe, "Deny"),
+	("G1-29", WHO[0], "", RS_LIST, "Deny"),
+	("G1-30", WHO[1], "", RS_LIST, "Deny"),
+	("G1-31", WHO[0], "container-d-tenant-active@alice", RS_NOTIFY, "Deny"),
+	("G1-32", WHO[1], "container-d-tenant-active@alice", RS_NOTIFY, "Deny"),
 	("G1-33", WHO[0], "tenant-crdt-d-active@alice", WsCrdt(None), "Deny"),
 	("G1-34", WHO[1], "tenant-crdt-d-active@alice", WsCrdt(None), "Deny"),
 	("G1-35", WHO[0], "tenant-rtdb-d-active@alice", WsRtdb(None), "Deny"),
 	("G1-36", WHO[1], "tenant-rtdb-d-active@alice", WsRtdb(None), "Deny"),
+	("G1-37", WHO[0], "post-p-tenant-active@alice", RS_PIN, "Deny"),
+	("G1-38", WHO[1], "post-p-tenant-active@alice", RS_PIN, "Deny"),
 ];
 
 /// G2 columns: `(column, route, object)`; P = Public CRDT, D = `root@alice`.
@@ -785,8 +785,8 @@ pub const AC: &[Row] = &[
 	("AC-62", "stranger@alice", "cur-dismiss-owner@alice", ActDismiss, "Deny"),
 	("AC-63", "sharelink-w@alice", "cur-dismiss-owner@alice", ActDismiss, "Deny"),
 	("AC-64", "idp-mgmt@alice", "cur-dismiss-owner@alice", ActDismiss, "Deny"),
-	("AC-65", "stranger@alice", "post-p-tenant-active@alice", ReadMarker, "Deny"),
-	("AC-66", "idp-mgmt@alice", "post-p-tenant-active@alice", ReadMarker, "Deny"),
+	("AC-65", "stranger@alice", "post-p-tenant-active@alice", RS_READ, "Deny"),
+	("AC-66", "idp-mgmt@alice", "post-p-tenant-active@alice", RS_READ, "Deny"),
 	// `apkg:publish` posts an APKG and nothing else.
 	("AC-67", "apkg-publish@alice", "", POST_ZQM, "Deny"),
 	("AC-68", "apkg-publish@alice", "", APKG_POST, "Allow*"),
@@ -803,6 +803,10 @@ pub const AC: &[Row] = &[
 	("AC-77", "owner@alice", "", IDP_REG_POST, "Deny"),
 	("AC-118", "m_contributor@club", "", PRINVT_CLUB, "Deny"),
 	("AC-119", "owner@alice", "", PRINVT_ALICE, "Deny"),
+	// RCPT goes out from `PATCH /api/reader-state` only: no owner, link or `idp_` key signs one.
+	("AC-186", "owner@alice", "", RCPT_POST, "Deny"),
+	("AC-187", "sharelink-w@alice", "", RCPT_POST, "Deny"),
+	("AC-188", "idp-mgmt@alice", "", RCPT_POST, "Deny"),
 	// The revocation subtype in `subType` instead of embedded in `type`.
 	("AC-120", "m_contributor@club", "tenant-blob-d-active@club", FSHR_SUB_DEL_CLUB, "Deny"),
 	// A root's explicit room: enterable by the actor, a room of this tenant or the audience's.
@@ -845,7 +849,7 @@ pub const AC: &[Row] = &[
 	("AC-114", "sharelink-r@alice", "cur-reject-alice@alice", ActReject, "Deny"),
 	("AC-115", "idp-ident@alice", "cur-reject-alice@alice", ActReject, "Deny"),
 	("AC-116", "owner@alice", "cur-reject-alice@alice", ActReject, "Allow"),
-	("AC-117", "sharelink-r@alice", "container-p-tenant-active@alice", Subscribe, "Deny"),
+	("AC-117", "sharelink-r@alice", "container-p-tenant-active@alice", RS_NOTIFY, "Deny"),
 	// BDG: issued by a community moderator+ (`post_action` role gate), never the base type or an
 	// unknown slot (base `BDG` is server_emitted), never by a person tenant, only to a person
 	// who follows or is connected to the community, with an expiry ≤ 366 days ahead
@@ -882,6 +886,78 @@ pub const AC: &[Row] = &[
 	("AC-145", "g_read@alice", "", VERIFY, "Deny"),
 	("AC-146", "sadm-visit@alice", "", VERIFY, "Deny"),
 	("AC-147", "anon@alice", "", VERIFY, "Deny"),
+	("AC-148", "stranger@alice", "", RS_LIST, "Deny"),
+	("AC-149", "idp-mgmt@alice", "", RS_LIST, "Deny"),
+	// MSG:UPD / MSG:DEL (subject = the row's group MSG): the author edits; the CONV creator
+	// (Admin) may delete another's message but never edit it; a subscriber may do neither.
+	("AC-150", "owner@alice", "child-p-tenant-active@alice", MSG_UPD, "Allow"),
+	("AC-151", "owner@alice", "child-p-remote-active@alice", MSG_UPD, "Deny"),
+	("AC-152", "owner@alice", "child-p-remote-active@alice", MSG_DEL, "Allow"),
+	("AC-153", "subscriber@alice", "child-p-tenant-active@alice", MSG_UPD, "Deny"),
+	("AC-154", "subscriber@alice", "child-p-tenant-active@alice", MSG_DEL, "Deny"),
+	// PIN / PIN:DEL (subject = the row's group MSG): the CONV creator (Admin) pins and unpins
+	// any message; a member subscriber may not, not even their own; nor may a stranger.
+	("AC-155", "owner@alice", "child-p-remote-active@alice", PIN, "Allow"),
+	("AC-156", "owner@alice", "child-p-remote-active@alice", PIN_DEL, "Allow"),
+	("AC-157", "subscriber@alice", "child-p-tenant-active@alice", PIN, "Deny"),
+	("AC-158", "subscriber@alice", "child-p-tenant-active@alice", PIN_DEL, "Deny"),
+	("AC-159", "stranger@alice", "child-p-tenant-active@alice", PIN, "Deny"),
+	// RCPT is server-sent from the reader-state `readAt`; no other caller posts one for the tenant.
+	("AC-160", "stranger@alice", "container-p-tenant-active@alice", RCPT, "Deny"),
+	("AC-161", "subscriber@alice", "container-p-tenant-active@alice", RCPT, "Deny"),
+	// Nor a follower, a guest, a share link or an `idp_` key (the last two carry alice's id_tag).
+	("AC-162", "follower@alice", "child-p-tenant-active@alice", MSG_UPD, "Deny"),
+	("AC-163", "follower@alice", "child-p-tenant-active@alice", MSG_DEL, "Deny"),
+	("AC-164", "follower@alice", "child-p-tenant-active@alice", PIN, "Deny"),
+	("AC-165", "follower@alice", "child-p-tenant-active@alice", PIN_DEL, "Deny"),
+	("AC-166", "follower@alice", "container-p-tenant-active@alice", RCPT, "Deny"),
+	("AC-167", "via-embed@alice", "child-p-tenant-active@alice", MSG_UPD, "Deny"),
+	("AC-168", "via-embed@alice", "child-p-tenant-active@alice", MSG_DEL, "Deny"),
+	("AC-169", "via-embed@alice", "child-p-tenant-active@alice", PIN, "Deny"),
+	("AC-170", "via-embed@alice", "child-p-tenant-active@alice", PIN_DEL, "Deny"),
+	("AC-171", "via-embed@alice", "container-p-tenant-active@alice", RCPT, "Deny"),
+	("AC-172", "sharelink-r@alice", "child-p-tenant-active@alice", MSG_UPD, "Deny"),
+	("AC-173", "sharelink-r@alice", "child-p-tenant-active@alice", MSG_DEL, "Deny"),
+	("AC-174", "sharelink-r@alice", "child-p-tenant-active@alice", PIN, "Deny"),
+	("AC-175", "sharelink-r@alice", "child-p-tenant-active@alice", PIN_DEL, "Deny"),
+	("AC-176", "sharelink-r@alice", "container-p-tenant-active@alice", RCPT, "Deny"),
+	("AC-177", "idp-key@alice", "child-p-tenant-active@alice", MSG_UPD, "Deny"),
+	("AC-178", "idp-key@alice", "child-p-tenant-active@alice", MSG_DEL, "Deny"),
+	("AC-179", "idp-key@alice", "child-p-tenant-active@alice", PIN, "Deny"),
+	("AC-180", "idp-key@alice", "child-p-tenant-active@alice", PIN_DEL, "Deny"),
+	("AC-181", "idp-key@alice", "container-p-tenant-active@alice", RCPT, "Deny"),
+	// On a community every member posts as the CONV-creating tenant: the authority is the
+	// poster's own (`post_action` passes `auth.id_tag`). A contributor neither pins, nor deletes
+	// club's message, nor pins their own. The moderator's Allow rows need a moderator SUBS
+	// (`main.rs` `msg_pin_authority`).
+	("AC-182", "m_contributor@club", "child-p-tenant-active@club", PIN, "Deny"),
+	("AC-183", "m_contributor@club", "child-p-tenant-active@club", MSG_DEL, "Deny"),
+	("AC-184", "m_contributor@club", "child-p-tenant-active@club", MSG_UPD, "Deny"),
+	("AC-185", "m_contributor@club", "child-p-remote-active@club", PIN, "Deny"),
+	// PRES on a CONV needs a member+ actor (`native_hooks::pres::before_create`); a PRES on
+	// anything else is DM presence, addressed and signed by the tenant itself.
+	("AC-226", "owner@alice", "container-p-tenant-active@alice", PRES_TYPING, "Allow"),
+	("AC-227", "stranger@alice", "container-p-tenant-active@alice", PRES_TYPING, "Deny"),
+	("AC-228", "follower@alice", "container-p-tenant-active@alice", PRES_TYPING, "Deny"),
+	("AC-229", "subscriber@alice", "container-p-tenant-active@alice", PRES_TYPING, "Deny"),
+	("AC-230", "via-embed@alice", "container-p-tenant-active@alice", PRES_TYPING, "Deny"),
+	("AC-231", "sharelink-r@alice", "container-p-tenant-active@alice", PRES_TYPING, "Deny"),
+	("AC-232", "idp-key@alice", "container-p-tenant-active@alice", PRES_TYPING, "Deny"),
+	("AC-233", "owner@alice", "post-p-tenant-active@alice", PRES_TYPING, "Deny"),
+	// A group PRES is addressed to the CONV owner (`pres::before_create` sets it): a client
+	// naming another audience is refused.
+	("AC-241", "owner@alice", "container-p-tenant-active@alice", PRES_TYPING_AUD, "Deny"),
+	// DM presence (`pres::before_create`: `audience_tag.is_none() || actor != tenant_tag`).
+	("AC-234", "owner@alice", "post-p-tenant-active@alice", PRES_DM, "Allow"),
+	("AC-235", "stranger@alice", "post-p-tenant-active@alice", PRES_DM, "Deny"),
+	("AC-236", "follower@alice", "post-p-tenant-active@alice", PRES_DM, "Deny"),
+	("AC-237", "subscriber@alice", "post-p-tenant-active@alice", PRES_DM, "Deny"),
+	("AC-238", "via-embed@alice", "post-p-tenant-active@alice", PRES_DM, "Deny"),
+	// Refused earlier: share-link scope does not permit `/api/actions` (`scope_permits`).
+	("AC-239", "sharelink-r@alice", "post-p-tenant-active@alice", PRES_DM, "Deny"),
+	// Carries alice's id_tag without being the tenant: the row that reaches
+	// `actor != tenant_tag`.
+	("AC-240", "idp-key@alice", "post-p-tenant-active@alice", PRES_DM, "Deny"),
 ];
 
 /// FSHR to a profile connected to the host (`m-follower.test` on club, `connected.test` on alice),
@@ -921,6 +997,11 @@ const PRINVT_ALICE: Route = Call(
 	"POST",
 	"/api/actions",
 	r#"{"type":"PRINVT","audienceTag":"connected.test","content":{"refId":"zqm-ref"}}"#,
+);
+const RCPT_POST: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"RCPT","audienceTag":"connected.test","content":1700000000}"#,
 );
 /// AC-139..147: an undecodable token, so even `sync` makes no outbound request.
 const VERIFY: Route = Call("POST", "/api/actions/verify", r#"{"tokens":["x.y.z"],"sync":true}"#);
@@ -1184,6 +1265,76 @@ pub const WS: &[Row] = &[
 
 const WS_BUS: Route = Call("GET", "/ws/bus", "");
 
+/// `MSG:UPD` of the row object's MSG (subject-targeted edit).
+const MSG_UPD: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"MSG","subType":"UPD","content":"zqm","subject":"{obj}"}"#,
+);
+/// `MSG:DEL` of the row object's MSG.
+const MSG_DEL: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"MSG","subType":"DEL","content":"zqm","subject":"{obj}"}"#,
+);
+
+/// `PIN` of the row object's group MSG (the server fills `parent`).
+const PIN: Route = Call("POST", "/api/actions", r#"{"type":"PIN","subject":"{obj}"}"#);
+/// `PIN:DEL` (unpin) of the row object's group MSG.
+const PIN_DEL: Route =
+	Call("POST", "/api/actions", r#"{"type":"PIN","subType":"DEL","subject":"{obj}"}"#);
+/// `PRES:TYPING` on the row object (a CONV for the group gate).
+const PRES_TYPING: Route =
+	Call("POST", "/api/actions", r#"{"type":"PRES","subType":"TYPING","subject":"{obj}"}"#);
+/// `PRES:TYPING` on the row object, addressed to someone other than the CONV owner.
+const PRES_TYPING_AUD: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"PRES","subType":"TYPING","subject":"{obj}","audienceTag":"connected.test"}"#,
+);
+/// DM presence: `PRES:ONLINE` about a connected profile, addressed to it. The subject is the
+/// peer, not `{obj}`: any `a1~` subject takes the CONV branch (AC-233), so the row object is
+/// nominal.
+const PRES_DM: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"PRES","subType":"ONLINE","subject":"connected.test","audienceTag":"connected.test"}"#,
+);
+/// `RCPT` on the row object's CONV.
+const RCPT: Route =
+	Call("POST", "/api/actions", r#"{"type":"RCPT","subject":"{obj}","content":1}"#);
+
+/// `GET /api/reader-state` — the inbox kinds, with embeds.
+const RS_LIST: Route = Get("/api/reader-state?kind=P:MSG,A:CONV&include=ref");
+/// Same, with a malformed `kind` filter.
+const RS_LIST_BAD_KIND: Route = Get("/api/reader-state?kind=bogus");
+/// `PATCH /api/reader-state/A/{obj}`: a forward-only read watermark (in the past: a future
+/// one is clamped to now).
+const RS_READ: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"readAt":1700000000}"#);
+/// Same, the notification level (Watching).
+const RS_NOTIFY: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"notify":"W"}"#);
+/// Same, a flag.
+const RS_PIN: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"pinned":true}"#);
+/// A DM peer with no profile row.
+const RS_UNKNOWN_PEER: Route =
+	Call("PATCH", "/api/reader-state/P:MSG/nobody.test", r#"{"archived":true}"#);
+/// An action id with no row.
+const RS_UNKNOWN_ACTION: Route =
+	Call("PATCH", "/api/reader-state/A/zqm-nope", r#"{"pinned":true}"#);
+/// A `notify` outside `W|T|M`.
+const RS_BAD_NOTIFY: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"notify":"X"}"#);
+/// `readAt` is not nullable.
+const RS_NULL_READ: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"readAt":null}"#);
+/// A well-formed `P:*` kind that is not an inbox kind.
+const RS_P_UNKNOWN: Route = Call("PATCH", "/api/reader-state/P:FOO/{obj}", r#"{"pinned":true}"#);
+/// An unknown embed.
+const RS_LIST_BAD_INCLUDE: Route = Get("/api/reader-state?include=bogus");
+/// A malformed kind.
+const RS_BAD_KIND: Route = Call("PATCH", "/api/reader-state/X:Y/{obj}", r#"{"pinned":true}"#);
+/// `A:<type>` naming another type than the action's own (the row object is a POST).
+const RS_KIND_MISMATCH: Route =
+	Call("PATCH", "/api/reader-state/A:CONV/{obj}", r#"{"pinned":true}"#);
+
 /// Self-enforcing routes.
 pub const SE: &[Row] = &[
 	("SE-01", "anon@alice", "tenant-blob-p-active@alice", FileList, "Present@Read"),
@@ -1196,13 +1347,13 @@ pub const SE: &[Row] = &[
 	("SE-08", "stranger@alice", "post-p-tenant-active@alice", Outbox, "Absent"),
 	("SE-09", "connected@alice", "post-p-remote-active@alice", Outbox, "Absent"),
 	("SE-10", "connected@alice", "post-p-tenant-draft@alice", Outbox, "Absent"),
-	("SE-11", "owner@alice", "post-p-tenant-active@alice", ReadMarker, "Allow"),
-	("SE-12", "sharelink-w@alice", "post-p-tenant-active@alice", ReadMarker, "Deny"),
-	// `sub_level` is the tenant owner's row; a subscriber cannot move it.
-	("SE-13", "subscriber@alice", "container-s-tenant-active@alice", Subscribe, "Deny"),
-	("SE-14", "stranger@alice", "container-d-tenant-active@alice", Subscribe, "Deny"),
-	("SE-15", "owner-scoped-w@alice", "container-p-tenant-active@alice", Subscribe, "Deny"),
-	("SE-16", "owner@alice", "container-p-tenant-active@alice", Subscribe, "Allow"),
+	("SE-11", "owner@alice", "post-p-tenant-active@alice", RS_READ, "Allow"),
+	("SE-12", "sharelink-w@alice", "post-p-tenant-active@alice", RS_READ, "Deny"),
+	// `notify` is the tenant owner's reader-state row; a subscriber cannot move it.
+	("SE-13", "subscriber@alice", "container-s-tenant-active@alice", RS_NOTIFY, "Deny"),
+	("SE-14", "stranger@alice", "container-d-tenant-active@alice", RS_NOTIFY, "Deny"),
+	("SE-15", "owner-scoped-w@alice", "container-p-tenant-active@alice", RS_NOTIFY, "Deny"),
+	("SE-16", "owner@alice", "container-p-tenant-active@alice", RS_NOTIFY, "Allow"),
 	// The outbox is a follower's or a connection's; each peer pulls what it may read.
 	("SE-18", "follower@alice", "post-f-tenant-active@alice", Outbox, "Present"),
 	("SE-19", "follower@alice", "post-p-tenant-active@alice", Outbox, "Present"),
@@ -1217,6 +1368,32 @@ pub const SE: &[Row] = &[
 	("SE-27", "stranger@alice", "", Get(ALICE_CONN), "Allow"),
 	("SE-28", "anon@alice", "", Get(ALICE_CONN), "Deny"),
 	("SE-29", "tampered@alice", "", Get(ALICE_CONN), "Deny"),
+	// The reader-state list is the tenant owner's own, like the PATCH rows above.
+	("SE-30", "owner@alice", "", RS_LIST, "Allow"),
+	("SE-31", "sharelink-w@alice", "", RS_LIST, "Deny"),
+	// A DM peer the tenant has no profile row for: 404, even for the owner.
+	("SE-32", "owner@alice", "", RS_UNKNOWN_PEER, "Deny"),
+	("SE-33", "owner@alice", "post-p-tenant-active@alice", RS_BAD_NOTIFY, "400"),
+	("SE-34", "owner@alice", "post-p-tenant-active@alice", RS_NULL_READ, "400"),
+	("SE-35", "owner@alice", "post-p-tenant-active@alice", RS_BAD_KIND, "400"),
+	("SE-36", "owner@alice", "post-p-tenant-active@alice", RS_KIND_MISMATCH, "400"),
+	// An action id with no row: 404, even for the owner.
+	("SE-37", "owner@alice", "", RS_UNKNOWN_ACTION, "Deny"),
+	("SE-38", "owner@alice", "", RS_LIST_BAD_KIND, "400"),
+	// `P:*` kinds are an allowlist (`P:MSG`, `P:POST`), not any upper-case type.
+	("SE-40", "owner@alice", "post-p-tenant-active@alice", RS_P_UNKNOWN, "400"),
+	// An unknown `include` embed.
+	("SE-41", "owner@alice", "", RS_LIST_BAD_INCLUDE, "400"),
+	("SE-39", "owner-scoped-w@alice", "", RS_LIST, "Deny"),
+	// Reader state is the tenant account's alone: a credential carrying the tenant's id_tag
+	// (an `idp_` key, a share link, a scoped token) is not the tenant. A scoped write must not
+	// move the watermark either, or it would send a read receipt in the tenant's name.
+	("SE-42", "idp-key@alice", "", RS_LIST, "Deny"),
+	("SE-43", "idp-key@alice", "post-p-tenant-active@alice", RS_READ, "Deny"),
+	("SE-44", "sharelink-w@alice", "container-p-tenant-active@alice", RS_NOTIFY, "Deny"),
+	("SE-45", "follower@alice", "", RS_LIST, "Deny"),
+	("SE-46", "anon@alice", "", RS_LIST, "Deny"),
+	("SE-47", "owner-scoped-w@alice", "post-p-tenant-active@alice", RS_READ, "Deny"),
 ];
 
 const ADMIN_TENANTS: Route = Call("GET", "/api/admin/tenants", "");
@@ -3441,9 +3618,6 @@ fn tok(s: &Subject) -> &str {
 	bearer(s).unwrap_or_default()
 }
 
-/// Forward-only read watermark far in the future (epoch seconds).
-const MARKER_POS: i64 = 4_000_000_000;
-
 fn request(s: &Subject, route: Route, tgt: &Tgt) -> Request<Body> {
 	let key = match tgt {
 		Tgt::Obj(o) => obj_key(o),
@@ -3454,13 +3628,6 @@ fn request(s: &Subject, route: Route, tgt: &Tgt) -> Request<Body> {
 	let j = |v: Value| Body::from(v.to_string());
 	match (route, tgt) {
 		(FileUser, _) => raw(Method::PATCH, &format!("/api/files/{key}/user"), j(json!({}))),
-		(ReadMarker, _) => {
-			let body = json!({ "scope": "thread", "key": key, "position": MARKER_POS });
-			raw(Method::PUT, "/api/read-marker", j(body))
-		}
-		(Subscribe, _) => {
-			raw(Method::PUT, &format!("/api/actions/{key}/subscribe"), j(json!({ "level": "W" })))
-		}
 		(ChanCreate(name), _) => raw(Method::POST, "/api/channels", j(json!({ "name": name }))),
 		(ChanPatch(name), _) => {
 			raw(Method::PATCH, &format!("/api/channels/{name}"), j(json!({ "title": MARK })))
@@ -3686,8 +3853,8 @@ const PROFILE_PRIVATE: &[&str] = &[
 	"trust",
 	"following",
 	"follower",
-	"feedReadAt",
-	"msgReadAt",
+	"msgState",
+	"feedState",
 	"hatRoles",
 	"peerHatRoles",
 	"hiddenInHome",

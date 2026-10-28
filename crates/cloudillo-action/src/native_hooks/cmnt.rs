@@ -11,8 +11,11 @@
 //! `actions.comments_ts` the last-comment timestamp (epoch seconds = the newest
 //! active child comment's created_at, federated as STAT `ct`). Both are
 //! recomputed from the live child rows (see `recompute_comment_stats`) on every
-//! create/delete so the count and the unread dot never drift. The client
-//! computes the unread comment dot from `lastCommentAt > commentsReadAt`.
+//! create/delete so the count and the unread dot never drift. The reader's own
+//! thread state lives in the root action's `A:<type>` reader-state row: every
+//! node holding the thread stamps its `lastAt` and recomputes its `unread`
+//! (update-only, `stamp_reader_thread`); the client compares `lastCommentAt`
+//! with `readerState.readAt`.
 //!
 //! Both hooks gate on `ownership::owns_subject` (the parent stands in for the
 //! "subject" here) — community-hosted posts have their `audience` set to the
@@ -28,7 +31,7 @@ use crate::native_hooks::ownership::owns_subject;
 use crate::native_hooks::stat_emit::emit_stat_for_subject;
 use crate::prelude::*;
 use cloudillo_types::meta_adapter::{
-	ActionCountGroupBy, ListActionOptions, UpdateActionDataOptions,
+	ActionCountGroupBy, ActionView, ListActionOptions, UpdateActionDataOptions,
 };
 
 /// CMNT on_create hook - Handle local comment creation
@@ -56,10 +59,9 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	// our node, where the root action is cached. No-op if the root isn't cached.
 	if context.subtype.as_deref() != Some("DEL") {
 		let root_id = parent_action.root_id.as_deref().unwrap_or(parent_id.as_str());
-		if let Err(e) = app.meta_adapter.auto_track_action(tn_id, root_id).await {
-			tracing::warn!("CMNT on_create: auto-track of root {} failed: {}", root_id, e);
-		}
+		super::auto_track_root(&app, tn_id, root_id, "CMNT on_create").await;
 	}
+	stamp_reader_thread(&app, &context, &parent_action, parent_id).await;
 
 	if !owns_subject(&parent_action, &context.tenant_tag) {
 		tracing::debug!(
@@ -129,7 +131,16 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 		return Ok(HookResult::default());
 	};
 
-	if !owns_subject(&parent_action, &context.tenant_tag) {
+	let owned = owns_subject(&parent_action, &context.tenant_tag);
+	// The post author (we host the post) auto-tracks their own thread (coalesce) —
+	// before the reader-state stamp, so a row it creates gets this comment too.
+	if owned {
+		let root_id = parent_action.root_id.as_deref().unwrap_or(parent_id.as_str());
+		super::auto_track_root(&app, tn_id, root_id, "CMNT on_receive").await;
+	}
+	stamp_reader_thread(&app, &context, &parent_action, parent_id).await;
+
+	if !owned {
 		tracing::debug!(
 			"CMNT on_receive: Parent {} not owned by us ({}) — skipping count update (non-authoritative for subject — STAT mirror path will handle counters)",
 			parent_id,
@@ -171,13 +182,34 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 
 	emit_stat_for_subject(&app, tn_id, &context.tenant_tag, parent_id).await;
 
-	// The post author (we host the post) auto-tracks their own thread (coalesce).
-	let root_id = parent_action.root_id.as_deref().unwrap_or(parent_id.as_str()).to_string();
-	if let Err(e) = app.meta_adapter.auto_track_action(tn_id, &root_id).await {
-		tracing::warn!("CMNT on_receive: auto-track of root {} failed: {}", root_id, e);
-	}
-
 	Ok(HookResult::default())
+}
+
+/// Stamp the reader's thread row (`A:<root type>`, ref = the root action) with this
+/// comment and recompute its `unread`. Update-only: the row comes from auto-track or
+/// `PATCH /api/reader-state`. Runs on every node holding the thread, owner or mirror,
+/// so it sits before the ownership gate. Edit/delete markers only recompute.
+/// Best-effort: failures are logged.
+async fn stamp_reader_thread(
+	app: &App,
+	context: &HookContext,
+	parent_action: &ActionView,
+	parent_id: &str,
+) {
+	let tn_id = context.tn_id;
+	let root_id = parent_action.root_id.as_deref().unwrap_or(parent_id);
+	let kind = match app.meta_adapter.action_reader_kind(tn_id, root_id).await {
+		Ok(Some(kind)) => kind,
+		Ok(None) => return,
+		Err(e) => {
+			tracing::warn!("CMNT: reader kind of root {} failed: {}", root_id, e);
+			return;
+		}
+	};
+	if !matches!(context.subtype.as_deref(), Some("DEL" | "UPD")) {
+		crate::helpers::stamp_reader_row(app, context, &kind, root_id, false).await;
+	}
+	crate::helpers::recompute_reader_row(app, tn_id, &context.action_id, &kind, root_id).await;
 }
 
 /// Recompute `(comment_count, last_comment_ts)` for `parent_id` from its live
@@ -194,7 +226,7 @@ pub(crate) async fn recompute_comment_stats(
 ) -> ClResult<(u32, i64)> {
 	let typ: Vec<String> = child_types.iter().map(|t| (*t).to_string()).collect();
 
-	// Count active children (exclude DEL markers), like count_reposts.
+	// Count active children (exclude DEL/UPD markers), like count_reposts.
 	let count_opts = ListActionOptions {
 		typ: Some(typ.clone()),
 		parent_id: Some(parent_id.to_string()),
@@ -206,7 +238,7 @@ pub(crate) async fn recompute_comment_stats(
 		.await?;
 	let total: i64 = grouped
 		.into_iter()
-		.filter(|(sub_type, _)| sub_type.as_deref() != Some("DEL"))
+		.filter(|(sub_type, _)| !matches!(sub_type.as_deref(), Some("DEL" | "UPD")))
 		.map(|(_, cnt)| cnt)
 		.sum();
 	let count = u32::try_from(total).unwrap_or(u32::MAX);
@@ -218,7 +250,7 @@ pub(crate) async fn recompute_comment_stats(
 		sort: Some("created".into()),
 		sort_dir: Some("desc".into()),
 		limit: Some(1),
-		exclude_sub_typ: Some(Box::from([Box::from("DEL") as Box<str>])),
+		exclude_sub_typ: Some(Box::from([Box::from("DEL") as Box<str>, Box::from("UPD")])),
 		..Default::default()
 	};
 	let newest = app.meta_adapter.list_actions(tn_id, &newest_opts).await?;

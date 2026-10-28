@@ -1317,6 +1317,25 @@ fn push_search_filters(
 			.push(")");
 	}
 
+	// Conversation scope: the MSG rows of one CONV, or the top-level DMs between the tenant
+	// and one peer (never a DM between two others that the tenant merely holds).
+	// Edit/delete rows (`MSG:UPD`, `MSG:DEL`) are excluded; the edited target is indexed itself.
+	if let Some(conv) = opts.conv.as_deref() {
+		const ME: &str = "(SELECT t.id_tag FROM tenants t WHERE t.tn_id=d.tn_id)";
+		query
+			.push(
+				" AND d.obj_tp='A' AND EXISTS (SELECT 1 FROM actions cv WHERE cv.tn_id=d.tn_id \
+				 AND cv.action_id=d.obj_id AND cv.type='MSG' \
+				 AND coalesce(cv.sub_type,'') NOT IN ('UPD','DEL') AND (cv.parent_id=",
+			)
+			.push_bind(conv)
+			.push(" OR (cv.parent_id IS NULL AND ((cv.issuer_tag=")
+			.push_bind(conv)
+			.push(format!(" AND cv.audience={ME}) OR (cv.audience="))
+			.push_bind(conv)
+			.push(format!(" AND cv.issuer_tag={ME})))))"));
+	}
+
 	// `take` re-clamps what the handler already rejected past its cap: unbounded,
 	// ~33k values overrun SQLite's 32766 bound-variable limit and the request
 	// comes back a 500.

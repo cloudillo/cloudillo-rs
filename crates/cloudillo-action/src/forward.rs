@@ -12,7 +12,6 @@
 
 use crate::prelude::*;
 use cloudillo_core::ws_broadcast::{BroadcastMessage, DeliveryResult};
-use cloudillo_types::auth_adapter::ActionToken;
 use cloudillo_types::meta_adapter::{ActionView, AttachmentView};
 use serde_json::json;
 
@@ -120,10 +119,23 @@ async fn forward_to_user(
 /// Build a BroadcastMessage from a full ActionView
 ///
 /// Used by post_store when the full ActionView is available from the database.
-fn build_action_view_message(action_view: &ActionView, temp_id: Option<&str>) -> BroadcastMessage {
+fn build_action_view_message(
+	action_view: &ActionView,
+	temp_id: Option<&str>,
+	notify: Option<&str>,
+) -> BroadcastMessage {
 	let mut data = serde_json::to_value(action_view).unwrap_or_default();
+	// Reaches other users' sockets (the audience, a community's members): the tenant's reader
+	// state stays home.
+	if let Some(obj) = data.as_object_mut() {
+		obj.remove("readerState");
+	}
 	if let Some(tid) = temp_id {
 		data["tempId"] = json!(tid);
+	}
+	// Inbound MSG: the mute/mention gate result, so the client toasts like push would.
+	if let Some(n) = notify {
+		data["notify"] = json!(n);
 	}
 	BroadcastMessage::new("ACTION", data, "system")
 }
@@ -135,7 +147,7 @@ pub async fn forward_action_view(
 	action_view: &ActionView,
 	temp_id: Option<&str>,
 ) -> ForwardResult {
-	let msg = build_action_view_message(action_view, temp_id);
+	let msg = build_action_view_message(action_view, temp_id, None);
 	if let Some(ref audience) = action_view.audience {
 		forward_to_user(app, tn_id, &audience.id_tag, msg).await
 	} else {
@@ -149,8 +161,9 @@ pub async fn forward_inbound_action_view(
 	tn_id: TnId,
 	action_view: &ActionView,
 	temp_id: Option<&str>,
+	notify: Option<&str>,
 ) -> ForwardResult {
-	let msg = build_action_view_message(action_view, temp_id);
+	let msg = build_action_view_message(action_view, temp_id, notify);
 	let delivered = app.broadcast.send_to_tenant(tn_id, msg).await;
 
 	ForwardResult {
@@ -194,8 +207,9 @@ fn build_action_message(params: &ForwardActionParams<'_>) -> BroadcastMessage {
 /// Returns true if the action type is configured to send push notifications
 /// when the user is offline.
 pub fn should_push_notify(action_type: &str, sub_type: Option<&str>) -> bool {
-	// DEL subtypes don't trigger notifications, nor does a CONN map update
-	if sub_type == Some("DEL") || (action_type == "CONN" && sub_type == Some("UPD")) {
+	// DEL subtypes don't trigger notifications, nor does a CONN map update or a MSG edit
+	if sub_type == Some("DEL") || (matches!(action_type, "CONN" | "MSG") && sub_type == Some("UPD"))
+	{
 		return false;
 	}
 
@@ -208,21 +222,27 @@ pub fn should_push_notify(action_type: &str, sub_type: Option<&str>) -> bool {
 	)
 }
 
-/// Where a push notification for `action` should navigate.
+/// Where a push notification for an action should navigate (`issuer` and `parent` are the
+/// action's own).
 ///
 /// Relative to the recipient's own app domain, so `~` (home context) is always right.
 /// Mirrors the in-app routing in `shell/src/notifications/notifications.tsx`.
-pub fn notification_path(action_type: &str, action_id: &str, action: &ActionToken) -> String {
+pub fn notification_path(
+	action_type: &str,
+	action_id: &str,
+	issuer: &str,
+	parent: Option<&str>,
+) -> String {
 	match action_type {
 		// Group conversations are keyed by the parent action id, direct ones by the
 		// peer's idTag — see `isGroupId` / `useMessages.ts` in the shell.
 		"MSG" => {
-			let conv = action.p.as_deref().unwrap_or(&action.iss);
+			let conv = parent.unwrap_or(issuer);
 			format!("/~/app/messages/{conv}")
 		}
 		// The comment's own id is not a permalink; the post it hangs off is.
 		"CMNT" => {
-			let post = action.p.as_deref().unwrap_or(action_id);
+			let post = parent.unwrap_or(action_id);
 			format!("/~/app/feed/{post}")
 		}
 		// CONN and FSHR are accept/reject cards with no page of their own.
@@ -312,7 +332,8 @@ pub fn get_push_setting_key(action_type: &str) -> &'static str {
 /// `get_email_setting_key` maps to something other than the bare `notify.email`
 /// master-switch fallback. DEL subtypes never notify.
 pub fn is_email_notifiable(action_type: &str, sub_type: Option<&str>) -> bool {
-	if sub_type == Some("DEL") || (action_type == "CONN" && sub_type == Some("UPD")) {
+	if sub_type == Some("DEL") || (matches!(action_type, "CONN" | "MSG") && sub_type == Some("UPD"))
+	{
 		return false;
 	}
 	// A type-specific cadence key exists (not the bare master-switch fallback).
@@ -405,59 +426,95 @@ mod tests {
 		assert_eq!(notify_action_label("UNKNOWN"), "notification");
 	}
 
-	fn token(iss: &str, p: Option<&str>) -> ActionToken {
-		ActionToken {
-			iss: iss.into(),
-			k: "k1".into(),
-			t: "MSG".into(),
-			c: None,
-			p: p.map(Into::into),
-			a: None,
-			aud: None,
-			sub: None,
-			iat: Timestamp(0),
-			exp: None,
-			f: None,
-			v: None,
-			nonce: None,
-			h: None,
-			ch: None,
-		}
-	}
-
 	/// A group conversation is addressed by its parent action id, a direct one by
 	/// the peer — who, on an inbound message, is the issuer.
 	#[test]
 	fn test_notification_path_msg() {
 		assert_eq!(
-			notification_path("MSG", "a1~msg", &token("bob.org", Some("a1~conv"))),
+			notification_path("MSG", "a1~msg", "bob.org", Some("a1~conv")),
 			"/~/app/messages/a1~conv"
 		);
-		assert_eq!(
-			notification_path("MSG", "a1~msg", &token("bob.org", None)),
-			"/~/app/messages/bob.org"
-		);
+		assert_eq!(notification_path("MSG", "a1~msg", "bob.org", None), "/~/app/messages/bob.org");
 	}
 
 	/// The permalink is the parent post's, never the comment's own id.
 	#[test]
 	fn test_notification_path_cmnt() {
 		assert_eq!(
-			notification_path("CMNT", "a1~cmnt", &token("bob.org", Some("a1~post"))),
+			notification_path("CMNT", "a1~cmnt", "bob.org", Some("a1~post")),
 			"/~/app/feed/a1~post"
 		);
-		assert_eq!(
-			notification_path("CMNT", "a1~cmnt", &token("bob.org", None)),
-			"/~/app/feed/a1~cmnt"
-		);
+		assert_eq!(notification_path("CMNT", "a1~cmnt", "bob.org", None), "/~/app/feed/a1~cmnt");
 	}
 
 	/// Accept/reject cards live on the notifications page and nowhere else.
 	#[test]
 	fn test_notification_path_conn_and_fshr() {
-		let t = token("bob.org", None);
-		assert_eq!(notification_path("CONN", "a1~conn", &t), "/~/notifications");
-		assert_eq!(notification_path("FSHR", "a1~fshr", &t), "/~/notifications");
+		assert_eq!(notification_path("CONN", "a1~conn", "bob.org", None), "/~/notifications");
+		assert_eq!(notification_path("FSHR", "a1~fshr", "bob.org", None), "/~/notifications");
+	}
+
+	/// Both forward paths build through here, so neither pushes the tenant's reader state.
+	#[test]
+	fn test_action_view_message_drops_reader_state() {
+		use cloudillo_types::meta_adapter::{ProfileInfo, ProfileType, ReaderState};
+		let view = ActionView {
+			action_id: "a1~msg".into(),
+			typ: "MSG".into(),
+			sub_typ: None,
+			parent_id: None,
+			root_id: None,
+			issuer: ProfileInfo {
+				id_tag: "alice.example.com".into(),
+				name: "Alice".into(),
+				typ: ProfileType::Person,
+				profile_pic: None,
+			},
+			audience: None,
+			content: None,
+			attachments: None,
+			subject: None,
+			subject_profile: None,
+			subject_action: None,
+			created_at: Timestamp(0),
+			received_at: None,
+			expires_at: None,
+			status: Some("A".into()),
+			stat: None,
+			visibility: None,
+			flags: None,
+			reader_state: Some(ReaderState {
+				kind: "A:MSG".into(),
+				ref_: "a1~msg".into(),
+				read_at: None,
+				last_at: None,
+				last_id: None,
+				unread: None,
+				mentioned_at: None,
+				notify: Some('W'),
+				notify_until: None,
+				pinned: true,
+				archived: false,
+				ignore_all: false,
+				unread_flag: false,
+				created_at: Timestamp(0),
+				updated_at: Timestamp(0),
+				profile: None,
+				action: None,
+				last: None,
+			}),
+			x: None,
+			hat: None,
+			channel: None,
+			token: None,
+		};
+		assert!(serde_json::to_value(&view).is_ok_and(|v| v.get("readerState").is_some()));
+		let msg = build_action_view_message(&view, Some("@1"), None);
+		assert!(msg.data.get("readerState").is_none());
+		assert_eq!(msg.data.get("tempId"), Some(&json!("@1")));
+		assert!(msg.data.get("notify").is_none());
+		let msg = build_action_view_message(&view, None, Some("mention"));
+		assert_eq!(msg.data.get("notify"), Some(&json!("mention")));
 	}
 
 	#[test]

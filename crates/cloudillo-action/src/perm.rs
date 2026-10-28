@@ -203,6 +203,14 @@ async fn load_action_attrs(
 		audience_tag.push(subject_id_tag.into());
 	}
 
+	// Discovery, the same rule the list filter applies (`filter::is_listed_group`).
+	if crate::filter::is_listed_group(&action_view)
+		&& crate::helpers::community_level(app.meta_adapter.as_ref(), tn_id, subject_id_tag).await
+			> cloudillo_core::roles::FOLLOWER_LEVEL
+	{
+		audience_tag.push(subject_id_tag.into());
+	}
+
 	// Get visibility from action metadata - convert char to string representation
 	let visibility: Box<str> = VisibilityLevel::from_char(action_view.visibility).as_str().into();
 

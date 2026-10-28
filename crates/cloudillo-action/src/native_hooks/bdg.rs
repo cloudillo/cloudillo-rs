@@ -25,7 +25,7 @@ use cloudillo_types::badges::{
 };
 use cloudillo_types::meta_adapter::{ProfileStatus, ProfileType};
 
-use crate::hooks::{HookContext, HookResult};
+use crate::hooks::{BeforeCreate, BeforeReceive, HookContext, HookResult};
 use crate::prelude::*;
 
 /// Connected ('C', the BDG default) only: a wider one lists hidden badges to followers.
@@ -107,6 +107,19 @@ pub(crate) async fn check_inbound(app: &App, tn_id: TnId, action: &ActionToken) 
 /// invalidation before the write would let a `/me` rebuild miss the new badge.
 pub async fn on_receive(_app: App, _context: HookContext) -> ClResult<HookResult> {
 	Ok(HookResult { status: Some('N'), ..Default::default() })
+}
+
+/// BDG `before_create`: a stored badge retires the older one by key, so issuing is judged
+/// pre-store.
+pub(crate) async fn before_create(app: App, ctx: BeforeCreate) -> ClResult<CreateAction> {
+	check_issue(&app, ctx.tn_id, &ctx.action).await?;
+	Ok(ctx.action)
+}
+
+/// BDG `before_receive`: a forged or misaddressed badge is refused before it can retire the
+/// held one. Unguarded by `pre_approved`.
+pub(crate) async fn before_receive(app: App, ctx: BeforeReceive) -> ClResult<()> {
+	check_inbound(&app, ctx.tn_id, &ctx.action).await
 }
 
 #[cfg(test)]

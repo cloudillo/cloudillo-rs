@@ -19,6 +19,7 @@ use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
 use cloudillo_core::profile_visibility::RequesterTier;
 use cloudillo_types::meta_adapter::{
 	ListProfileOptions, ProfileConnectionStatus, ProfileStatus, ProfileTrust, ProfileType,
+	ReaderState,
 };
 use cloudillo_types::types::{ApiResponse, ProfileInfo};
 use cloudillo_types::utils::normalize_id_tag;
@@ -38,20 +39,10 @@ pub struct ProfileWithStatus {
 	pub following: Option<bool>,
 	pub follower: Option<bool>,
 	pub trust: Option<ProfileTrust>,
-	/// Reader's feed read-watermark for this context (seeds `useReadMarker`).
-	/// ISO 8601 string (round-trips with `PUT /api/read-marker`'s `position`).
-	#[serde(
-		serialize_with = "cloudillo_types::types::serialize_timestamp_iso_opt",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub feed_read_at: Option<Timestamp>,
-	/// Reader's DM read-watermark for this peer (seeds `useReadMarker`).
-	/// ISO 8601 string (round-trips with `PUT /api/read-marker`'s `position`).
-	#[serde(
-		serialize_with = "cloudillo_types::types::serialize_timestamp_iso_opt",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub msg_read_at: Option<Timestamp>,
+	/// Reader's DM state with this peer (`reader_state` row `P:MSG`; owner only).
+	pub msg_state: Option<ReaderState>,
+	/// Reader's feed state for this context (`reader_state` row `P:POST`; owner only).
+	pub feed_state: Option<ReaderState>,
 	/// Our hat role map for this peer community (leaders only)
 	pub hat_roles: Option<String>,
 	/// The peer community's hat map for our members, mirrored and advisory (leaders only)
@@ -284,7 +275,7 @@ fn parse_status_list(value: &str) -> ClResult<Option<Box<[ProfileStatus]>>> {
 /// Per-caller projection ([`RequesterTier::from_auth`]): only the owner tier gets the above.
 /// For everyone else `status` is forced to `[Active, Muted]` and the `trustSet`,
 /// `following` and `follower` filters are ignored; each row drops `status`, `following`,
-/// `follower`, `trust`, `feedReadAt`, `msgReadAt`, `hiddenInHome`, `hatRoles` and
+/// `follower`, `trust`, `msgState`, `feedState`, `hiddenInHome`, `hatRoles` and
 /// `peerHatRoles`, and non-members also drop `roles`. `hats` is the tenant account's alone.
 /// Connections follow the tenant's `profile.connection_visibility` per connected profile type:
 /// a non-owner lists only the types it may see (none → empty list, a forbidden `type=` → empty
@@ -378,8 +369,8 @@ pub async fn list_profiles(
 				.filter(|_| full || member)
 				.map(|r| r.iter().map(ToString::to_string).collect()),
 			created_at: None, // Not available in Profile type
-			feed_read_at: p.feed_read_at.filter(|_| full),
-			msg_read_at: p.msg_read_at.filter(|_| full),
+			msg_state: p.msg_state.filter(|_| full),
+			feed_state: p.feed_state.filter(|_| full),
 			// NULL/0 in the column both mean "shown" → only surface a positive flag.
 			hidden_in_home: p.hidden_in_home.filter(|&h| h && full),
 			hat_roles: p.hat_roles.filter(|_| full).map(Into::into),
@@ -463,8 +454,8 @@ pub async fn get_profile_by_id_tag(
 				following: Some(p.following).filter(|_| full),
 				follower: Some(p.follower).filter(|_| full),
 				trust: p.trust.filter(|_| full),
-				feed_read_at: p.feed_read_at.filter(|_| full),
-				msg_read_at: p.msg_read_at.filter(|_| full),
+				msg_state: p.msg_state.filter(|_| full),
+				feed_state: p.feed_state.filter(|_| full),
 				hat_roles,
 				peer_hat_roles,
 				hats: tenant_hats(p.hats, is_self),
@@ -642,8 +633,8 @@ mod tests {
 	/// The projection is the whole justification for mounting this route on the
 	/// scope-agnostic tier, so pin the wire shape exactly: the four public fields and
 	/// nothing else — in particular none of the reading tenant's private relationship
-	/// state (`status`, `connected`, `following`, `follower`, `trust`, `feedReadAt`,
-	/// `msgReadAt`) and none of `keys` / `roles`.
+	/// state (`status`, `connected`, `following`, `follower`, `trust`, `msgState`,
+	/// `feedState`) and none of `keys` / `roles`.
 	#[test]
 	fn public_profile_serialises_only_the_four_public_fields() {
 		let cases = [

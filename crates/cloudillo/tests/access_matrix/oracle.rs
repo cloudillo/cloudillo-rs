@@ -475,7 +475,10 @@ pub fn expected_inbox(c: &InboxCell) -> Expect {
 		// connected or pending (`native_hooks/conn.rs`). The receive-side subtypes ride their
 		// base type's definition; what they may change is `inbound_effects`'.
 		"CONN" | "CONN:UPD" | "CONN:ACC" | "CONN:DEL" | "FLLW" | "FLLW:DEL" | "REACT" | "CMNT"
-		| "PRES" | "SUBS" | "SUBS:UPD" => allow("inbox.allow-unknown"),
+		| "SUBS" | "SUBS:UPD" => allow("inbox.allow-unknown"),
+		// A PRES on a CONV is admitted from its issuer or an active member only; no matrix
+		// issuer holds a SUBS on the host's container (IB-110, IB-112..117 cover the member side).
+		"PRES" => deny("inbox.pres.not-member"),
 		"APKG" => deny("inbox.local-only"),
 		// allow_unknown, but `idp.enabled` is off on the host (the hook refuses).
 		"IDP:REG" => deny("inbox.idp-reg.disabled"),
@@ -490,6 +493,14 @@ pub fn expected_inbox(c: &InboxCell) -> Expect {
 		"APRV" => deny("inbox.aprv.not-audience"),
 		"PRINVT" if connected => allow("inbox.connected"),
 		"PRINVT" => deny("inbox.requires-connected"),
+		// Editing/deleting the tenant's message is its author's, or a CONV moderator+'s for a
+		// DEL (`native_hooks::msg::check_edit_authority`); a fresh issuer is neither.
+		"MSG:UPD" | "MSG:DEL" => deny("inbox.msg.not-author"),
+		// Pinning the tenant's group message is a CONV moderator+'s
+		// (`native_hooks::pin::check_authority`); a fresh issuer holds no role there.
+		"PIN" => deny("inbox.pin.not-moderator"),
+		// A receipt on the tenant's CONV needs a subscription to it, as a group MSG does.
+		"RCPT" => deny("inbox.rcpt.requires-subscription"),
 		"MSG" if c.target => deny("inbox.msg.requires-subscription"),
 		// An INVT on our CONV is the tenant's or a moderator subscriber's; a revocation also the
 		// original inviter's. A fresh issuer is none of them, whatever its relation.

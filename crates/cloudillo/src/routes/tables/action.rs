@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: MPL-2.0
 
-//! `/api/actions/**`, `/api/inbox*`, `/api/outbox`, `/api/read-marker`.
+//! `/api/actions/**`, `/api/inbox*`, `/api/outbox`, `/api/reader-state/**`.
 //!
 //! ## Method matrix
 //!
@@ -15,8 +15,8 @@
 //! | `/api/actions/{action_id}/accept`     | | `moderate()` ᴱ | | | |
 //! | `/api/actions/{action_id}/reject`     | | `moderate()` ᴱ | | | |
 //! | `/api/actions/{action_id}/dismiss`    | | `write()` ᶜ | | | |
-//! | `/api/actions/{action_id}/subscribe`  | | | `reader_state()` ᴱ | | |
-//! | `/api/read-marker`                    | | | `reader_state()` ᴱ | | |
+//! | `/api/reader-state`                   | `reader_state()` ᴱ | | | | |
+//! | `/api/reader-state/{kind}/{ref}`      | | | | `reader_state()` ᴱ | |
 //! | `/api/outbox`                         | `reader_state()` ᴱ | | | | |
 //! | `/api/inbox`                          | | `inbox()` ᶠ | | | |
 //! | `/api/inbox/sync`                     | | `inbox()` ᶠ | | | |
@@ -31,7 +31,7 @@
 
 use axum::{
 	Router,
-	routing::{delete, get, post, put},
+	routing::{delete, get, patch, post},
 };
 
 use crate::prelude::*;
@@ -78,8 +78,8 @@ pub(crate) fn moderate() -> Router<App> {
 
 /// The reader's own state — authentication only, no ABAC guard.
 ///
-/// - read markers: the reader's own node, forward-only;
-/// - thread subscription level: the reader's own cached row;
+/// - `/api/reader-state`: the reader's own follow state (read watermark, notify
+///   level, pin/archive/…) on their own node; owner only — the handlers check;
 /// - `/api/actions/verify`: token verification with this node's cached keys
 ///   (owner only — the handler checks; it spends the tenant's outbound budget);
 /// - `/api/outbox`: federation history sync (peer-initiated pull). Auth is
@@ -87,8 +87,8 @@ pub(crate) fn moderate() -> Router<App> {
 ///   empty list inside the handler before any action query runs.
 pub(crate) fn reader_state() -> Router<App> {
 	Router::new()
-		.route("/api/read-marker", put(handler::put_read_marker))
-		.route("/api/actions/{action_id}/subscribe", put(handler::put_action_subscribe))
+		.route("/api/reader-state", get(handler::list_reader_state))
+		.route("/api/reader-state/{kind}/{ref}", patch(handler::patch_reader_state))
 		.route("/api/actions/verify", post(handler::post_verify_tokens))
 		.route("/api/outbox", get(handler::get_outbox))
 }

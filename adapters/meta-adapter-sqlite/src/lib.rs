@@ -24,6 +24,7 @@ mod maintenance;
 mod partner;
 mod profile;
 mod push;
+mod reader_state;
 mod reference;
 mod schema;
 mod search;
@@ -50,13 +51,14 @@ use cloudillo_types::{
 		DeleteFileResult, DocFormat, FileId, FileResolution, FileUserData, FileVariant, FileView,
 		FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
 		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
-		ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions, MetaAdapter, PartnerEdge,
-		Profile, ProfileBadgeRow, ProfileData, ProfileRelation, PublicProfileRow, PublishSiteDoc,
-		PushSubscription, PushSubscriptionData, RefData, SearchObject, SearchOptions, SearchPart,
-		SearchRow, ShareEntry, Site, SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
-		UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData, UpdateChannelData,
-		UpdateFileOptions, UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData,
-		UpsertDocFormat, UpsertProfileFields, UpsertResult, UpsertSite,
+		ListReaderStateOptions, ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions,
+		MetaAdapter, PartnerEdge, PatchReaderState, Profile, ProfileBadgeRow, ProfileData,
+		ProfileRelation, PublicProfileRow, PublishSiteDoc, PushSubscription, PushSubscriptionData,
+		ReaderState, RefData, SearchObject, SearchOptions, SearchPart, SearchRow, ShareEntry, Site,
+		SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta, UpdateActionDataOptions,
+		UpdateAddressBookData, UpdateCalendarData, UpdateChannelData, UpdateFileOptions,
+		UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData, UpsertDocFormat,
+		UpsertProfileFields, UpsertResult, UpsertSite,
 	},
 	prelude::*,
 	snapshot::SnapshotPart,
@@ -258,18 +260,70 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::count(&self.dbr, tn_id, opts).await
 	}
 
-	async fn set_read_marker(
+	async fn get_reader_state(
 		&self,
 		tn_id: TnId,
-		scope: &str,
-		key: &str,
-		position: i64,
+		kind: &str,
+		ref_: &str,
+	) -> ClResult<Option<ReaderState>> {
+		reader_state::get(&self.dbr, tn_id, kind, ref_).await
+	}
+
+	async fn list_reader_state(
+		&self,
+		tn_id: TnId,
+		opts: &ListReaderStateOptions,
+	) -> ClResult<Vec<ReaderState>> {
+		reader_state::list(&self.dbr, tn_id, opts).await
+	}
+
+	async fn patch_reader_state(
+		&self,
+		tn_id: TnId,
+		kind: &str,
+		ref_: &str,
+		patch: &PatchReaderState,
+		insert: bool,
+	) -> ClResult<Option<Timestamp>> {
+		reader_state::patch(&self.db, tn_id, kind, ref_, patch, insert).await
+	}
+
+	async fn stamp_reader_activity(
+		&self,
+		tn_id: TnId,
+		kind: &str,
+		ref_: &str,
+		last_id: &str,
+		last_at: Timestamp,
+		insert: bool,
 	) -> ClResult<()> {
-		action::set_read_marker(&self.db, tn_id, scope, key, position).await
+		reader_state::stamp_activity(&self.db, tn_id, kind, ref_, last_id, last_at, insert).await
+	}
+
+	async fn recompute_reader_unread(&self, tn_id: TnId, kind: &str, ref_: &str) -> ClResult<()> {
+		reader_state::recompute_unread(&self.db, tn_id, kind, ref_).await
+	}
+
+	async fn stamp_reader_mention(
+		&self,
+		tn_id: TnId,
+		kind: &str,
+		ref_: &str,
+		at: Timestamp,
+	) -> ClResult<()> {
+		reader_state::stamp_mention(&self.db, tn_id, kind, ref_, at).await
+	}
+
+	async fn delete_reader_state(&self, tn_id: TnId, kind: &str, ref_: &str) -> ClResult<()> {
+		reader_state::delete(&self.db, tn_id, kind, ref_).await
+	}
+
+	async fn action_reader_kind(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<String>> {
+		reader_state::action_kind(&self.dbr, tn_id, action_id).await
 	}
 
 	async fn auto_track_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()> {
-		action::auto_track(&self.db, tn_id, action_id).await
+		reader_state::auto_track(&self.db, tn_id, action_id).await
 	}
 
 	async fn get_action_id(&self, tn_id: TnId, a_id: u64) -> ClResult<Box<str>> {
@@ -319,6 +373,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn store_action_token(&self, tn_id: TnId, action_id: &str, token: &str) -> ClResult<()> {
 		action::store_token(&self.db, tn_id, action_id, token).await
+	}
+
+	async fn delete_action_token(&self, tn_id: TnId, action_id: &str) -> ClResult<()> {
+		action::delete_token(&self.db, tn_id, action_id).await
 	}
 
 	async fn get_action_token(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<Box<str>>> {
@@ -550,7 +608,13 @@ impl MetaAdapter for MetaAdapterSqlite {
 	}
 
 	async fn delete_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()> {
-		action::delete(&self.db, tn_id, action_id).await
+		// Resolve the `A:<type>` reader-state kind before the row goes away.
+		let kind = reader_state::action_kind(&self.db, tn_id, action_id).await?;
+		action::delete(&self.db, tn_id, action_id).await?;
+		if let Some(kind) = kind {
+			reader_state::delete(&self.db, tn_id, &kind, action_id).await?;
+		}
+		Ok(())
 	}
 
 	// Phase 2: File Management Enhancements

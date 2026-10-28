@@ -6,7 +6,7 @@
 //! Registers global server-level settings for logging, features, etc.
 
 use crate::prelude::*;
-use crate::roles::{FOLLOWER_LEVEL, MODERATOR_LEVEL, role_level};
+use crate::roles::{FOLLOWER_LEVEL, LEADER_LEVEL, MODERATOR_LEVEL, role_level};
 use crate::scheduler::CronSchedule;
 use crate::settings::{
 	PermissionLevel, SettingDefinition, SettingScope, SettingValue, SettingsRegistry,
@@ -129,6 +129,30 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 				}
 				_ => Err(Error::ValidationError(
 					"Room creation role must be supporter, contributor or moderator".into(),
+				)),
+			})
+			.build()?,
+	)?;
+
+	// Lowest community role that may create a community-owned group chat (a CONV the community
+	// issues; gated in `post_action`). Unlike rooms, moderators are not exempt, and `follower`
+	// and below never may.
+	registry.register(
+		SettingDefinition::builder("conv.create_min_role")
+			.description("Lowest community role allowed to create group chats")
+			.default(SettingValue::String("contributor".into()))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.validator(|v| match v {
+				SettingValue::String(s)
+					if role_level(s)
+						.is_some_and(|l| (FOLLOWER_LEVEL + 1..=LEADER_LEVEL).contains(&l)) =>
+				{
+					Ok(())
+				}
+				_ => Err(Error::ValidationError(
+					"Group creation role must be supporter, contributor, moderator or leader"
+						.into(),
 				)),
 			})
 			.build()?,

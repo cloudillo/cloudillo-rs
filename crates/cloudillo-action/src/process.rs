@@ -19,7 +19,7 @@ use crate::{
 	dsl::DslEngine,
 	hat, helpers,
 	key_cache::KeyFetchCache,
-	native_hooks::{self, ownership::owns_subject},
+	native_hooks::ownership::owns_subject,
 	post_store::{self, ProcessingContext},
 	prelude::*,
 	subject_ref::{SubjectRef, parse_subject_ref},
@@ -104,6 +104,10 @@ async fn try_cached_key_verify(
 	}
 }
 
+/// How far in the future an inbound token's `iat` may be. Inbound rows keep `created_at = iat`,
+/// which orders `x_if_newer` updates (SUBS:ROLE, CONV:UPD): a far-future one would freeze them.
+const MAX_IAT_SKEW_SECS: i64 = 300;
+
 /// Verify an action token using 3-tier caching:
 /// 1. Check failure cache (in-memory) - return early if cached failure
 /// 2. Check SQLite key_cache - use if valid
@@ -119,6 +123,10 @@ pub async fn verify_action_token(
 	let action_not_validated: ActionToken = decode_jwt_no_verify(token)?;
 	let issuer = &action_not_validated.iss;
 	let key_id = &action_not_validated.k;
+	if action_not_validated.iat.0 > Timestamp::now().0 + MAX_IAT_SKEW_SECS {
+		warn!("  rejected: iat {} is in the future", action_not_validated.iat.0);
+		return Err(Error::Unauthorized);
+	}
 
 	// The action format constrains its identities (see `helpers::check_identity_field`).
 	// Checked before the key fetch, so a malformed issuer cannot even trigger an
@@ -290,7 +298,8 @@ pub async fn process_inbound_action_token(
 	let app_clone = app.clone();
 	let action_id_clone: Box<str> = action_id.into();
 	tokio::spawn(async move {
-		process_related_actions(&app_clone, tn_id, &action_id_clone, client_address).await;
+		Box::pin(process_related_actions(&app_clone, tn_id, &action_id_clone, client_address))
+			.await;
 	});
 
 	Ok(result)
@@ -339,6 +348,12 @@ async fn process_inbound_action_token_inner(
 	// 2. Verify action token (signature verification - always required!)
 	let mut action =
 		verify_and_handle_failure(app, tn_id, token, is_conn_action, client_ip.as_ref()).await?;
+
+	// 2b. A verified action lifts the automatic "unreachable" suspension; on a failed write the
+	// issuer stays Suspended and `refuse_restricted_issuer` refuses it.
+	if let Err(e) = reactivate_suspended_issuer(app, tn_id, &action.iss).await {
+		warn!(issuer = %action.iss, "Failed to reactivate suspended issuer: {}", e);
+	}
 
 	// 3. Resolve definition (try full type, then base type)
 	let definition = resolve_definition(app, &action.t)?;
@@ -415,21 +430,20 @@ async fn process_inbound_action_token_inner(
 		check_inbound_flags(app, tn_id, &action, definition).await?;
 	}
 
-	// 5c. Community INVT authorization, which must precede the store: the key-pattern dedup
-	// retires the pending INVT as soon as an INVT:DEL row lands, so a post-store hook can
-	// neither stop a revocation nor still see the row it needs to judge one.
-	// Deliberately outside the `via.pre_approved` guard: an INVT arriving inside someone
-	// else's pre-approved bundle must still prove community authority.
-	// Base type, not a prefix: `starts_with` would also catch a future `INVT…` type.
-	if action.t.split(':').next() == Some("INVT") {
-		let tenant_tag = app.meta_adapter.read_tenant(tn_id).await?.id_tag;
-		native_hooks::invt::check_inbound(app, tn_id, &action, &tenant_tag).await?;
-	}
-	// BDG likewise: a stored badge retires the older one by key, so a forged or misaddressed
-	// one must be refused here, not in a hook. Also outside the `pre_approved` guard.
-	if is_badge_type(&action.t) {
-		native_hooks::bdg::check_inbound(app, tn_id, &action).await?;
-	}
+	// 5c. Type-specific pre-store gates (`before_receive`): a post-store hook cannot undo the
+	// row. Before the ephemeral branch, as it is an ephemeral type's only hook.
+	crate::hooks::run_before_receive(
+		app,
+		crate::hooks::BeforeReceive {
+			tn_id,
+			token: token.into(),
+			action: action.clone(),
+			pre_approved: via.pre_approved,
+			relayed: relay.is_some(),
+			primary: via.primary.map(|(t, i)| (t.into(), i.into())),
+		},
+	)
+	.await?;
 
 	// Check if this is an ephemeral action (forward only, don't persist)
 	let is_ephemeral = definition.behavior.ephemeral.unwrap_or(false);
@@ -461,6 +475,8 @@ async fn process_inbound_action_token_inner(
 	let resolved_visibility = if via.pre_approved {
 		visibility
 	} else {
+		// Type default first (e.g. RCPT → 'D', CONV → 'S'), as `task::create_action` does.
+		let visibility = visibility.or(definition.behavior.default_visibility);
 		let visibility = if visibility.is_some() {
 			visibility
 		} else {
@@ -768,7 +784,30 @@ fn resolve_definition<'a>(
 	})
 }
 
-/// The issuer's local profile, if any; a deactivated, blocked or banned issuer is refused.
+/// Suspended is the automatic "unreachable" state (`cloudillo_profile::sync::apply_refresh`),
+/// never moderation: a verified action shows the issuer is back. `synced` bumps `synced_at`
+/// so the refresh batch doesn't re-suspend it at once; a day of failures there still does.
+async fn reactivate_suspended_issuer(app: &App, tn_id: TnId, issuer: &str) -> ClResult<()> {
+	let Ok((_, p)) = app.meta_adapter.read_profile(tn_id, issuer).await else {
+		return Ok(());
+	};
+	if p.status != Some(ProfileStatus::Suspended) {
+		return Ok(());
+	}
+	let fields = meta_adapter::UpsertProfileFields {
+		status: cloudillo_types::types::Patch::Value(ProfileStatus::Active),
+		synced: cloudillo_types::types::Patch::Value(true),
+		..Default::default()
+	};
+	app.meta_adapter.upsert_profile(tn_id, issuer, &fields).await?;
+	// The status gates whether `/me` serves this issuer's badges.
+	app.profile_me.invalidate(tn_id);
+	info!(issuer = %issuer, "Suspended issuer reactivated by a verified action");
+	Ok(())
+}
+
+/// The issuer's local profile, if any; a blocked or banned issuer is refused. Suspended was
+/// lifted at step 2b (`reactivate_suspended_issuer`), so it only reaches here if that write failed.
 async fn refuse_restricted_issuer(
 	app: &App,
 	tn_id: TnId,
@@ -1101,8 +1140,13 @@ async fn check_subscription_permissions(
 				);
 				return Err(Error::PermissionDenied);
 			};
-			// Found root subscription - use it for role checking
-			return check_subscription_role_permission(action, &root_sub);
+			// Found root subscription: judge its role against the root, whose `createdBy`
+			// maps community roles (`helpers::effective_role`)
+			let Some(root) = app.meta_adapter.get_action(tn_id, root_id).await? else {
+				warn!(issuer = %action.iss, root_id = %root_id, "Permission denied - root missing");
+				return Err(Error::PermissionDenied);
+			};
+			return check_subscription_role_permission(app, tn_id, action, &root, &root_sub).await;
 		}
 
 		warn!(
@@ -1115,15 +1159,27 @@ async fn check_subscription_permissions(
 	};
 
 	// Check role permissions
-	check_subscription_role_permission(action, &subscription)
+	check_subscription_role_permission(app, tn_id, action, &target_action, &subscription).await
 }
 
-/// Check if the subscription's role permits the action
-fn check_subscription_role_permission(
+/// Check if the subscription's role permits the action. The role is the effective one
+/// (`helpers::effective_role`): on a community group `target` the issuer's mapped community
+/// role counts too, so a lost community role refuses at the next action.
+async fn check_subscription_role_permission(
+	app: &App,
+	tn_id: TnId,
 	action: &ActionToken,
+	target: &meta_adapter::ActionView,
 	subscription: &meta_adapter::Action<Box<str>>,
 ) -> ClResult<()> {
-	let user_role = helpers::get_subscription_role(subscription.x.as_ref());
+	let user_role = helpers::effective_role(
+		app.meta_adapter.as_ref(),
+		tn_id,
+		target,
+		&action.iss,
+		helpers::get_subscription_role(subscription.x.as_ref()),
+	)
+	.await;
 
 	// Extract action type and subtype
 	let (action_type, subtype) = helpers::extract_type_and_subtype(&action.t);
@@ -1617,8 +1673,17 @@ async fn forward_inbound_action_to_websocket(
 			"User offline - sending push notification"
 		);
 		// Send push notification for offline user
-		send_push_notification(app, tn_id, action_id, action, &action_type, subtype.as_deref())
-			.await;
+		send_push_notification(
+			app,
+			tn_id,
+			action_id,
+			&action_type,
+			subtype.as_deref(),
+			&action.iss,
+			action.p.as_deref(),
+			action.c.as_ref(),
+		)
+		.await;
 		// Offline email notification (presence-suppressed + throttled in the
 		// helper). The recipient is always this node's own tenant, derived inside
 		// the helper.
@@ -1629,6 +1694,7 @@ async fn forward_inbound_action_to_websocket(
 			&action_type,
 			subtype.as_deref(),
 			&action.iss,
+			action.p.as_deref(),
 			action.c.as_ref(),
 		)
 		.await;
@@ -1666,7 +1732,7 @@ async fn forward_inbound_action_to_websocket(
 /// node's own tenant — the helper derives it from the tenant row it loads for
 /// presence/throttle, so callers pass only `tn_id`. Notifying a *different*
 /// tenant is forbidden; that tenant is emailed by its own node's inbound path.
-/// `issuer` is the token issuer (the action author).
+/// `issuer` is the token issuer (the action author), `parent_id` its parent (a MSG's CONV).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn deliver_notification_email(
 	app: &App,
@@ -1675,6 +1741,7 @@ pub(crate) async fn deliver_notification_email(
 	action_type: &str,
 	subtype: Option<&str>,
 	issuer: &str,
+	parent_id: Option<&str>,
 	content: Option<&serde_json::Value>,
 ) {
 	use crate::forward::{get_email_setting_key, is_email_notifiable};
@@ -1700,18 +1767,26 @@ pub(crate) async fn deliver_notification_email(
 		return; // type disabled
 	}
 
-	// Thread mute: if the recipient has muted this thread (sub_level='M' on the
-	// cached root action), suppress engagement emails. Best-effort — on a missing
-	// row or read error, fall through and notify.
+	// Thread mute: if the recipient has muted this thread (`notify = 'M'` on the
+	// cached root action's reader-state row; an expired `notifyUntil` reads as
+	// unset), suppress engagement emails. Best-effort — on a missing row or read
+	// error, fall through and notify.
 	if matches!(action_type, "CMNT" | "REACT")
 		&& let Ok(Some(av)) = app.meta_adapter.get_action(tn_id, action_id).await
 	{
 		let root_id = av.root_id.as_deref().unwrap_or(action_id);
 		if let Ok(Some(root)) = app.meta_adapter.get_action(tn_id, root_id).await
-			&& root.sub_level.as_deref() == Some("M")
+			&& root.reader_state.as_ref().and_then(|r| r.notify) == Some('M')
 		{
 			return;
 		}
+	}
+
+	// Conversation mute (DM: peer profile row, group: local CONV row).
+	if action_type == "MSG"
+		&& msg_notify_gate(app, tn_id, issuer, parent_id, content).await == MsgNotify::Suppress
+	{
+		return;
 	}
 
 	// The recipient is always this node's own tenant. The tenant row also carries
@@ -1813,14 +1888,71 @@ pub(crate) async fn deliver_notification_email(
 	}
 }
 
-/// Send push notification for an action
-async fn send_push_notification(
+/// How an inbound MSG may notify this node's tenant, per its conversation prefs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MsgNotify {
+	/// Muted: no push, no email (WS live delivery still happens, tagged `notify: "none"`).
+	Suppress,
+	/// Notify as a plain message (`notify.push.message`).
+	Message,
+	/// Notify as a mention (`notify.push.mention`).
+	Mention,
+}
+
+/// The mute/mention gate for an inbound MSG. The level is the reader-state `notify` of
+/// the `P:MSG` row (ref = the issuer) for a DM (`parent_id` None) or of the local CONV's
+/// `A:CONV` row for a group: `M` none, `T` mentions only, `W`/unset all (an expired
+/// `notifyUntil` reads as unset). A mention is [`helpers::is_mention`]. Best-effort like
+/// the thread mute: a read error notifies as a plain message. The tenant's own message
+/// (relayed back by a group owner) is always suppressed.
+pub(crate) async fn msg_notify_gate(
+	app: &App,
+	tn_id: TnId,
+	issuer: &str,
+	parent_id: Option<&str>,
+	content: Option<&serde_json::Value>,
+) -> MsgNotify {
+	let Ok(me) = app.auth_adapter.read_id_tag(tn_id).await else {
+		return MsgNotify::Message;
+	};
+	if issuer == me.as_ref() {
+		return MsgNotify::Suppress;
+	}
+	let (level, conv) = if let Some(conv_id) = parent_id {
+		let Ok(Some(conv)) = app.meta_adapter.get_action(tn_id, conv_id).await else {
+			return MsgNotify::Message;
+		};
+		(conv.reader_state.as_ref().and_then(|r| r.notify), Some(conv))
+	} else {
+		let Ok(rs) = app.meta_adapter.get_reader_state(tn_id, "P:MSG", issuer).await else {
+			return MsgNotify::Message;
+		};
+		(rs.and_then(|r| r.notify), None)
+	};
+
+	let mention = helpers::is_mention(app, tn_id, &me, issuer, content, conv.as_ref()).await;
+
+	match level {
+		Some('M') => MsgNotify::Suppress,
+		Some('T') if !mention => MsgNotify::Suppress,
+		_ if mention => MsgNotify::Mention,
+		_ => MsgNotify::Message,
+	}
+}
+
+/// Send push notification for an action. Shared by the ephemeral inbound path and the
+/// stored inbound path (`post_store::forward_to_websocket`); `issuer`, `parent_id` and
+/// `content` are the action's own. MSG goes through [`msg_notify_gate`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_push_notification(
 	app: &App,
 	tn_id: TnId,
 	action_id: &str,
-	action: &cloudillo_types::auth_adapter::ActionToken,
 	action_type: &str,
 	subtype: Option<&str>,
+	issuer: &str,
+	parent_id: Option<&str>,
+	content: Option<&serde_json::Value>,
 ) {
 	use crate::forward::{get_push_setting_key, notification_path, should_push_notify};
 	use cloudillo_push::{NotificationPayload, send_to_tenant};
@@ -1835,8 +1967,30 @@ async fn send_push_notification(
 		return;
 	}
 
+	let master_enabled = app.settings.get_bool(tn_id, "notify.push").await.unwrap_or(true);
+	if !master_enabled {
+		debug!(
+			action_id = %action_id,
+			"Push notifications disabled (master switch)"
+		);
+		return;
+	}
+
+	// Conversation mute decides MSG, and a mention switches to the mention toggle
+	let setting_key = if action_type == "MSG" {
+		match msg_notify_gate(app, tn_id, issuer, parent_id, content).await {
+			MsgNotify::Suppress => {
+				debug!(action_id = %action_id, "Push suppressed by conversation mute");
+				return;
+			}
+			MsgNotify::Mention => "notify.push.mention",
+			MsgNotify::Message => get_push_setting_key(action_type),
+		}
+	} else {
+		get_push_setting_key(action_type)
+	};
+
 	// Check if user has push notifications enabled for this action type
-	let setting_key = get_push_setting_key(action_type);
 	let push_enabled = app.settings.get_bool(tn_id, setting_key).await.unwrap_or(true);
 	if !push_enabled {
 		debug!(
@@ -1848,28 +2002,16 @@ async fn send_push_notification(
 		return;
 	}
 
-	// Also check master switch
-	let master_enabled = app.settings.get_bool(tn_id, "notify.push").await.unwrap_or(true);
-	if !master_enabled {
-		debug!(
-			action_id = %action_id,
-			"Push notifications disabled (master switch)"
-		);
-		return;
-	}
-
 	// Build notification payload
 	let title = match action_type {
-		"MSG" => format!("Message from {}", action.iss),
-		"CONN" => format!("Connection request from {}", action.iss),
-		"FSHR" => format!("{} shared a file", action.iss),
-		"CMNT" => format!("{} commented", action.iss),
-		_ => format!("Notification from {}", action.iss),
+		"MSG" => format!("Message from {issuer}"),
+		"CONN" => format!("Connection request from {issuer}"),
+		"FSHR" => format!("{issuer} shared a file"),
+		"CMNT" => format!("{issuer} commented"),
+		_ => format!("Notification from {issuer}"),
 	};
 
-	let body = action
-		.c
-		.as_ref()
+	let body = content
 		.and_then(|c| c.as_str())
 		.map(|s| s.chars().take(100).collect::<String>())
 		.unwrap_or_default();
@@ -1877,7 +2019,7 @@ async fn send_push_notification(
 	let payload = NotificationPayload {
 		title,
 		body,
-		path: Some(notification_path(action_type, action_id, action)),
+		path: Some(notification_path(action_type, action_id, issuer, parent_id)),
 		image: None,
 		tag: Some(action_type.to_string()),
 	};

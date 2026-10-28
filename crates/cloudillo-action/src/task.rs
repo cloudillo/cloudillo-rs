@@ -8,17 +8,16 @@ use std::sync::Arc;
 // Re-export from cloudillo-types for backward compatibility
 pub use cloudillo_types::action_types::{ACCESS_TOKEN_EXPIRY, CreateAction};
 
-use cloudillo_core::scheduler::{RetryPolicy, Task, TaskId};
+use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_file::descriptor;
 use cloudillo_file::management::may_publish_entry;
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter::{self, FileResolution};
 
 use crate::{
-	delivery::ActionDeliveryTask,
 	dsl::DslEngine,
-	fanout::schedule_subscriber_fanout,
 	helpers,
+	hooks::{HookContext, HookType},
 	post_store::{self, ProcessingContext},
 	prelude::*,
 	process,
@@ -283,17 +282,38 @@ pub async fn create_action_as(
 				// Get the target action to check if we're the creator
 				let target_action = app.meta_adapter.get_action(tn_id, target_id).await?;
 				if let Some(target) = target_action {
+					// On a community group every member posts as the community, the CONV's
+					// issuer, so the creator compare would always pass: judge the posting member.
+					let who = if actor_id_tag != id_tag
+						&& helpers::conv_created_by(target.x.as_ref()).is_some()
+					{
+						actor_id_tag
+					} else {
+						id_tag
+					};
+					if who != id_tag {
+						let (t, s) = helpers::extract_type_and_subtype(&action.typ);
+						let need = helpers::SubscriptionRole::required_for_action(
+							&t,
+							s.as_deref().or(action.sub_typ.as_deref()),
+						);
+						if helpers::conv_role(app.meta_adapter.as_ref(), tn_id, &target, who).await
+							< need
+						{
+							return Err(Error::PermissionDenied);
+						}
+					}
 					// If we're the target action's creator, we always have permission
-					if target.issuer.id_tag.as_ref() != id_tag {
+					if target.issuer.id_tag.as_ref() != who {
 						// Check for active subscription
-						let subs_key = format!("SUBS:{}:{}", target_id, id_tag);
+						let subs_key = format!("SUBS:{}:{}", target_id, who);
 						let subscription =
 							app.meta_adapter.get_action_by_key(tn_id, &subs_key).await?;
 
 						if subscription.is_none() {
 							// Also check root action subscription if target has a root
 							let root_sub = if let Some(root_id) = &target.root_id {
-								let root_subs_key = format!("SUBS:{}:{}", root_id, id_tag);
+								let root_subs_key = format!("SUBS:{}:{}", root_id, who);
 								app.meta_adapter.get_action_by_key(tn_id, &root_subs_key).await?
 							} else {
 								None
@@ -660,8 +680,42 @@ async fn create_ephemeral_action(
 	};
 	let _result = forward::forward_outbound_action(app, tn_id, &params).await;
 
-	// Schedule delivery to remote recipients (if any)
-	schedule_delivery(app, tn_id, id_tag, &action_id, &action).await?;
+	// Never stored, so `ActionDeliveryTask` (loads the token from the DB) can't carry it.
+	// Fire-and-forget: a presence hint is worthless by the time a retry would land.
+	let local_only = dsl
+		.definition_for(&action.typ, action.sub_typ.as_deref())
+		.and_then(|d| d.behavior.local_only)
+		.unwrap_or(false);
+	if !local_only {
+		let recipients = determine_recipients(app, tn_id, id_tag, &action_id, &action).await?;
+		crate::helpers::spawn_inbox_posts(app, tn_id, recipients, &action_token);
+		// `on_create` (e.g. the PRES typing relay), with the signed token in `vars.token`.
+		// Fire-and-forget, like the delivery above.
+		if let Some(resolved_type) = dsl.resolve_action_type(&action.typ, action.sub_typ.as_deref())
+		{
+			let ctx = HookContext::builder()
+				.action_id(&*action_id)
+				.action_type(&*action.typ)
+				.subtype(action.sub_typ.as_ref().map(ToString::to_string))
+				.issuer(id_tag)
+				.audience(action.audience_tag.as_ref().map(ToString::to_string))
+				.parent(action.parent_id.as_ref().map(ToString::to_string))
+				.subject(action.subject.as_ref().map(ToString::to_string))
+				.created_at(Timestamp::now().0.to_string())
+				.tenant(tn_id, id_tag, "")
+				.vars(std::collections::HashMap::from([(
+					"token".into(),
+					action_token.to_string().into(),
+				)]))
+				.outbound()
+				.build();
+			// Boxed: a hook may create actions, which recurses into `create_action`.
+			let hook = Box::pin(dsl.execute_hook(app, &resolved_type, HookType::OnCreate, ctx));
+			if let Err(e) = hook.await {
+				warn!(action_id = %action_id, error = %e, "ephemeral on_create failed");
+			}
+		}
+	}
 
 	info!(action_id = %action_id, "Ephemeral action created and forwarded");
 
@@ -1085,253 +1139,6 @@ async fn determine_recipients(
 	}
 }
 
-/// Schedule delivery tasks for all recipients
-async fn schedule_delivery(
-	app: &App,
-	tn_id: TnId,
-	id_tag: &str,
-	action_id: &str,
-	action: &CreateAction,
-) -> ClResult<()> {
-	let dsl = app.ext::<Arc<DslEngine>>()?;
-
-	// Skip federation entirely for local-only action types (e.g., APKG)
-	if dsl
-		.definition_for(&action.typ, action.sub_typ.as_deref())
-		.and_then(|d| d.behavior.local_only)
-		.unwrap_or(false)
-	{
-		return Ok(());
-	}
-
-	// For APRV actions: check if the subject action should be broadcast to followers
-	if action.typ.as_ref() == "APRV"
-		&& let Some(ref subject_id) = action.subject
-	{
-		// Get the subject action to check its broadcast behavior
-		if let Ok(Some(subject_action)) = app.meta_adapter.get_action(tn_id, subject_id).await {
-			let subject_broadcast = dsl
-				.definition_for(&subject_action.typ, subject_action.sub_typ.as_deref())
-				.and_then(|d| d.behavior.broadcast)
-				.unwrap_or(false);
-
-			if subject_broadcast {
-				debug!(
-					"APRV {} subject {} has broadcast=true, fanning out to followers",
-					action_id, subject_id
-				);
-				// Fan-out APRV to followers with related action (the approved POST)
-				// Also send to author (audience) who may not be a follower
-				return schedule_broadcast_delivery(
-					app,
-					tn_id,
-					id_tag,
-					action_id,
-					Some(subject_id.as_ref()),
-					action.audience_tag.as_deref(),
-					subject_action.channel.as_deref(),
-				)
-				.await;
-			}
-		}
-	}
-
-	// Standard delivery: send to specific audience only
-	let mut recipients = determine_recipients(app, tn_id, id_tag, action_id, action).await?;
-
-	// Get behavior flags
-	let behavior = dsl
-		.definition_for(action.typ.as_ref(), action.sub_typ.as_deref())
-		.map(|d| &d.behavior);
-
-	// Check if this action type should also deliver to subject's owner
-	// This is used by INVT to deliver to both invitee AND the CONV home
-	let deliver_to_subject_owner =
-		behavior.as_ref().and_then(|b| b.deliver_to_subject_owner).unwrap_or(false);
-
-	if deliver_to_subject_owner
-		&& let Some(subject_id) = action.subject.as_deref()
-		&& let Some(sref) = parse_subject_ref(subject_id)
-	{
-		// Resolve the "subject owner" tenant id_tag based on subject form.
-		// - Identity: the subject IS the tenant.
-		// - Action: look up the action and use its issuer.
-		// - Placeholder: should already be resolved to Action by
-		//   resolve_subject before this point; defensive None.
-		let subject_owner: Option<Box<str>> = match sref {
-			SubjectRef::Identity(id_tag) => Some(id_tag.into()),
-			SubjectRef::Action(_) => app
-				.meta_adapter
-				.get_action(tn_id, subject_id)
-				.await
-				.ok()
-				.flatten()
-				.map(|sa| sa.issuer.id_tag),
-			// Channel: the host tenant owns the room.
-			SubjectRef::Channel { tenant, .. } => Some(tenant.into()),
-			SubjectRef::Placeholder(_) => None,
-		};
-
-		if let Some(subject_owner) = subject_owner
-			&& subject_owner.as_ref() != id_tag
-			&& !recipients.iter().any(|r| r.as_ref() == subject_owner.as_ref())
-		{
-			info!(
-				"→ DUAL DELIVERY: Adding subject owner {} for {} (deliver_to_subject_owner)",
-				subject_owner, action_id
-			);
-			recipients.push(subject_owner);
-		}
-	}
-
-	// Fan-out to subscribers of subscribable parent chain (e.g., MSG in CONV)
-	// This schedules its own delivery tasks and returns the list for logging
-	let fanout_recipients = schedule_subscriber_fanout(
-		app,
-		tn_id,
-		action_id,
-		action.parent_id.as_deref(),
-		action.subject.as_deref(),
-		id_tag, // issuer = ourselves for outbound
-	)
-	.await?;
-
-	// Add fanout recipients to the list for logging purposes
-	// (delivery tasks were already scheduled by schedule_subscriber_fanout)
-	for r in fanout_recipients {
-		if !recipients.iter().any(|existing| existing.as_ref() == r.as_ref()) {
-			recipients.push(r);
-		}
-	}
-
-	if !recipients.is_empty() {
-		// Log summary with up to 3 recipient names
-		let recipient_preview: Vec<&str> = recipients.iter().take(3).map(AsRef::as_ref).collect();
-		if recipients.len() <= 3 {
-			info!("→ DELIVERY: {} → [{}]", action_id, recipient_preview.join(", "));
-		} else {
-			info!(
-				"→ DELIVERY: {} → {} recipients [{}...]",
-				action_id,
-				recipients.len(),
-				recipient_preview.join(", ")
-			);
-		}
-	}
-
-	// Check if this action type should deliver its subject along with it
-	let deliver_subject = behavior.as_ref().and_then(|b| b.deliver_subject).unwrap_or(false);
-
-	// Identity-typed subjects (`@<id_tag>`) reference a tenant, not an
-	// action — there is no related token to attach.
-	let related_action_id = if deliver_subject {
-		action.subject.as_deref().and_then(|s| match parse_subject_ref(s) {
-			Some(SubjectRef::Action(_)) => Some(s.into()),
-			// A channel, like an identity, is not an action: no related token.
-			Some(
-				SubjectRef::Identity(_) | SubjectRef::Placeholder(_) | SubjectRef::Channel { .. },
-			)
-			| None => None,
-		})
-	} else {
-		None
-	};
-
-	for recipient_tag in recipients {
-		debug!("Creating delivery task for action {} to {}", action_id, recipient_tag);
-
-		let delivery_task = ActionDeliveryTask::new_with_related(
-			tn_id,
-			action_id.into(),
-			recipient_tag.clone(),
-			recipient_tag.clone(),
-			related_action_id.clone(),
-		);
-
-		let task_key = format!("delivery:{}:{}", action_id, recipient_tag);
-		let retry_policy = RetryPolicy::new((10, 43200), 50);
-
-		app.scheduler
-			.task(delivery_task)
-			.key(&task_key)
-			.with_retry(retry_policy)
-			.schedule()
-			.await?;
-	}
-
-	Ok(())
-}
-
-/// Schedule broadcast delivery to followers (used for APRV fan-out)
-///
-/// This delivers an action to all followers (entities that have FLLW or CONN actions pointing to us),
-/// with an optional related action token included (for APRV, this is the approved action).
-///
-/// Also sends a direct delivery to the author if specified (they may not be a follower).
-async fn schedule_broadcast_delivery(
-	app: &App,
-	tn_id: TnId,
-	id_tag: &str,
-	action_id: &str,
-	related_action_id: Option<&str>,
-	author_id_tag: Option<&str>,
-	channel: Option<&str>,
-) -> ClResult<()> {
-	// Recipient set = profiles with the directional `follower` flag, narrowed to the
-	// approved action's room; see `helpers::broadcast_recipient_tags`.
-	let mut recipients =
-		crate::helpers::broadcast_recipient_tags(app, tn_id, id_tag, channel).await?;
-
-	// Always send to author (they need to know their action was approved, even if not a follower)
-	if let Some(author) = author_id_tag
-		&& author != id_tag
-	{
-		recipients.insert(author.into());
-	}
-
-	// Log summary with up to 3 recipient names
-	let recipients_vec: Vec<&str> = recipients.iter().map(AsRef::as_ref).collect();
-	let recipient_preview: Vec<&str> = recipients_vec.iter().take(3).copied().collect();
-	if !recipients.is_empty() {
-		if recipients.len() <= 3 {
-			info!("→ BROADCAST: {} → [{}]", action_id, recipient_preview.join(", "));
-		} else {
-			info!(
-				"→ BROADCAST: {} → {} recipients [{}...]",
-				action_id,
-				recipients.len(),
-				recipient_preview.join(", ")
-			);
-		}
-	}
-
-	let retry_policy = RetryPolicy::new((10, 43200), 50);
-	let related_box: Option<Box<str>> = related_action_id.map(Into::into);
-
-	for recipient_tag in recipients {
-		debug!("Creating broadcast delivery task for action {} to {}", action_id, recipient_tag);
-
-		let delivery_task = ActionDeliveryTask::new_with_related(
-			tn_id,
-			action_id.into(),
-			recipient_tag.clone(),
-			recipient_tag.clone(),
-			related_box.clone(),
-		);
-
-		let task_key = format!("delivery:{}:{}", action_id, recipient_tag);
-
-		app.scheduler
-			.task(delivery_task)
-			.key(&task_key)
-			.with_retry(retry_policy.clone())
-			.schedule()
-			.await?;
-	}
-
-	Ok(())
-}
-
 /// Draft publish Task - publishes a draft action at a scheduled time
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DraftPublishTask {
@@ -1539,10 +1346,13 @@ impl Task<App> for ActionVerifierTask {
 			status: cloudillo_types::types::Patch::Value('F'),
 			..Default::default()
 		};
-		if let Err(e) = app.meta_adapter.update_action_data(self.tn_id, &action_id, &opts).await {
-			warn!("  failed to mark action {} as 'F' after retry exhaustion: {}", action_id, e);
-		} else {
-			cloudillo_core::search_index_action(app, self.tn_id, &action_id);
+		// A token that was never stored (ephemeral, or refused before storing) has no row.
+		match app.meta_adapter.update_action_data(self.tn_id, &action_id, &opts).await {
+			Ok(()) => cloudillo_core::search_index_action(app, self.tn_id, &action_id),
+			Err(Error::NotFound) => {}
+			Err(e) => {
+				warn!("  failed to mark action {} as 'F' after retry exhaustion: {}", action_id, e);
+			}
 		}
 	}
 }

@@ -82,9 +82,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	// remote-owned subjects; operates on the locally-cached root row.
 	if context.subtype.as_deref() != Some("DEL") {
 		let root_id = subject_action.root_id.as_deref().unwrap_or(subject_id.as_str());
-		if let Err(e) = app.meta_adapter.auto_track_action(tn_id, root_id).await {
-			tracing::warn!("REACT on_create: auto-track of root {} failed: {}", root_id, e);
-		}
+		super::auto_track_root(&app, tn_id, root_id, "REACT on_create").await;
 	}
 
 	if !owns_subject(&subject_action, &context.tenant_tag) {
@@ -198,9 +196,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 	// The post author (we host the subject) auto-tracks their own thread (coalesce).
 	if context.subtype.as_deref() != Some("DEL") {
 		let root_id = subject_action.root_id.as_deref().unwrap_or(subject_id.as_str());
-		if let Err(e) = app.meta_adapter.auto_track_action(tn_id, root_id).await {
-			tracing::warn!("REACT on_receive: auto-track of root {} failed: {}", root_id, e);
-		}
+		super::auto_track_root(&app, tn_id, root_id, "REACT on_receive").await;
 	}
 
 	Ok(HookResult::default())

@@ -287,7 +287,7 @@ pub struct UpdateTenantData {
 	pub notify_email_social_at: Patch<Timestamp>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Profile<S: AsRef<str>> {
 	pub id_tag: S,
 	pub name: S,
@@ -300,10 +300,10 @@ pub struct Profile<S: AsRef<str>> {
 	pub connected: ProfileConnectionStatus,
 	pub roles: Option<Box<[Box<str>]>>,
 	pub trust: Option<ProfileTrust>,
-	/// Reader's feed read-watermark for this context (own/community profile).
-	pub feed_read_at: Option<Timestamp>,
-	/// Reader's DM read-watermark for this peer profile.
-	pub msg_read_at: Option<Timestamp>,
+	/// Reader's DM state with this peer (`reader_state` row `P:MSG`, ref = id_tag).
+	pub msg_state: Option<ReaderState>,
+	/// Reader's feed state for this context (`reader_state` row `P:POST`, ref = id_tag).
+	pub feed_state: Option<ReaderState>,
 	/// Composition control for the home feed: `Some(true)` = this community is
 	/// hidden from the merged home feed (shown only in its own feed); `None` =
 	/// shown (the default). Only meaningful for community profiles.
@@ -318,6 +318,102 @@ pub struct Profile<S: AsRef<str>> {
 	/// themselves). Owner-only UI preference: never federated, never read by an
 	/// access decision.
 	pub hats: Option<Box<[Box<str>]>>,
+}
+
+/// The reader's state about one thing they follow (`reader_state` row), keyed by
+/// `(kind, ref)`: `A:<action type>` + action id, or `P:<stream type>` + profile idTag.
+/// Owner-only, never federated.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[expect(clippy::struct_excessive_bools, reason = "decoded `flags` letters")]
+pub struct ReaderState {
+	pub kind: Box<str>,
+	#[serde(rename = "ref")]
+	pub ref_: Box<str>,
+	/// Read watermark, forward-only.
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	pub read_at: Option<Timestamp>,
+	/// Latest activity on the ref, forward-only.
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	pub last_at: Option<Timestamp>,
+	pub last_id: Option<Box<str>>,
+	/// Recomputed count of unread items; `None` = not maintained for this kind.
+	/// Excludes `unread_flag` (the client shows ≥ 1 when that is set).
+	pub unread: Option<i64>,
+	/// `@` badge shows while `mentioned_at > read_at`.
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	pub mentioned_at: Option<Timestamp>,
+	/// `W` all / `T` relevant / `M` none; `None` = the kind's default. An expired
+	/// `notify_until` already reads as `None` here.
+	pub notify: Option<char>,
+	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
+	pub notify_until: Option<Timestamp>,
+	pub pinned: bool,
+	pub archived: bool,
+	pub ignore_all: bool,
+	/// Manual mark-unread; cleared when `read_at` advances.
+	pub unread_flag: bool,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub created_at: Timestamp,
+	#[serde(serialize_with = "serialize_timestamp_iso")]
+	pub updated_at: Timestamp,
+	/// `include_ref` embed for `P:*` rows (local profile row). The wire form is built
+	/// from it by the handler.
+	#[serde(skip)]
+	pub profile: Option<Box<Profile<Box<str>>>>,
+	/// `include_ref` embed for `A:*` rows.
+	pub action: Option<Box<ActionView>>,
+	/// `include_last` embed: the `last_id` action (preview line).
+	pub last: Option<Box<ActionView>>,
+}
+
+/// Partial update of a [`ReaderState`] (`PATCH /api/reader-state/{kind}/{ref}`). Each
+/// [`Patch`] field: absent = unchanged, `null` = reset, value = set. `read_at` is not
+/// nullable (forward-only): absent = unchanged, `null` is a deserialization error.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PatchReaderState {
+	#[serde(default, deserialize_with = "deserialize_some")]
+	pub read_at: Option<Timestamp>,
+	#[serde(default)]
+	pub pinned: Patch<bool>,
+	#[serde(default)]
+	pub archived: Patch<bool>,
+	#[serde(default)]
+	pub ignore_all: Patch<bool>,
+	#[serde(default)]
+	pub unread_flag: Patch<bool>,
+	/// `W` | `T` | `M` (other values → `ValidationError`).
+	#[serde(default)]
+	pub notify: Patch<char>,
+	#[serde(default)]
+	pub notify_until: Patch<Timestamp>,
+}
+
+/// A present value must be non-null: `null` fails instead of reading as `None`.
+fn deserialize_some<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+	T: Deserialize<'de>,
+{
+	T::deserialize(d).map(Some)
+}
+
+/// Options for [`MetaAdapter::list_reader_state`]. Sorted
+/// `COALESCE(last_at, created_at) DESC, kind, ref`.
+#[derive(Debug, Default)]
+pub struct ListReaderStateOptions {
+	/// Kinds to list; empty = every kind.
+	pub kinds: Vec<Box<str>>,
+	/// Max rows returned.
+	pub limit: u32,
+	/// Keyset: rows strictly after `(sort_ts, kind, ref)` of the previous page's last row.
+	pub cursor: Option<(Timestamp, Box<str>, Box<str>)>,
+	/// Fill `profile` (`P:*`) / `action` (`A:*`).
+	pub include_ref: bool,
+	/// Fill `last` from `last_id`.
+	pub include_last: bool,
 }
 
 /// Reduced, public-safe profile projection returned by
@@ -541,8 +637,6 @@ pub struct UpdateActionDataOptions {
 	pub content: Patch<String>,
 	pub attachments: Patch<String>, // Comma-separated list of attachment IDs
 	pub flags: Patch<String>,
-	/// Reader's W/T/M thread subscription level. `Patch::Null` clears it.
-	pub sub_level: Patch<char>,
 	pub sub_typ: Patch<String>,
 	/// Dual-purpose for actions in status `R` (draft) or `S` (scheduled): the
 	/// `actions.created_at` column holds the target publish instant, not the
@@ -666,14 +760,20 @@ pub struct ListActionOptions {
 	pub parent_id: Option<String>,
 	#[serde(rename = "rootId")]
 	pub root_id: Option<String>,
+	/// A conversation's rows: its children, the actions naming it (and a kick naming one of
+	/// its members' SUBS), and itself. Keeps superseded ('D') SUBS/INVT as history.
+	pub container: Option<String>,
 	#[serde(default, deserialize_with = "deserialize_split")]
 	pub subject: Option<Vec<String>>,
 	#[serde(rename = "createdAfter")]
 	pub created_after: Option<Timestamp>,
 	#[serde(rename = "createdBefore")]
 	pub created_before: Option<Timestamp>,
+	/// HTTP boolean flag: when true, return only actions that carry attachments
+	/// (the Messages "Media & files" tab).
+	pub attachments: Option<bool>,
 	/// HTTP boolean flag: when true, return only rows the viewer is subscribed
-	/// to (`sub_level` set to a followed level). Uses `idx_actions_sub_level`.
+	/// to: its `reader_state` row (`A:<type>`) has `notify` W or T, not expired.
 	pub subscribed: Option<bool>,
 	/// When true, the list path populates each `ActionView.token` with the raw
 	/// signed JWS from `action_tokens`. Opt-in so normal feed payloads stay lean.
@@ -683,7 +783,7 @@ pub struct ListActionOptions {
 	/// its full `stat`) for any row whose `subject` is a real action id (not an
 	/// `@`-prefixed placeholder). Opt-in — unread-dot count probes omit it to stay
 	/// lean; feed/banner/conversation-list paths set it to get the subject's
-	/// commentCount/lastCommentAt/commentsReadAt in one round-trip.
+	/// commentCount/lastCommentAt and `readerState` in one round-trip.
 	#[serde(rename = "includeSubject")]
 	pub include_subject: Option<bool>,
 	/// Exclude actions whose issuer's profile has any of these statuses.
@@ -715,6 +815,9 @@ pub struct ListActionOptions {
 	/// Channels the tenant muted from its unfiltered home feed. Server-set.
 	#[serde(skip)]
 	pub muted_channels: Option<Vec<Box<str>>>,
+	/// Only this issuer's RCPT rows are listed (read-receipt reciprocity). Server-set.
+	#[serde(skip)]
+	pub rcpt_issuer: Option<Box<str>>,
 	/// Feed filter: only actions in this channel (absolute `@tenant~name`).
 	pub channel: Option<String>,
 	/// When true, exclude actions issued by the requesting tenant (issuer == viewer).
@@ -833,9 +936,9 @@ pub struct ActionView {
 	pub stat: Option<serde_json::Value>,
 	pub visibility: Option<char>,
 	pub flags: Option<Box<str>>, // Action flags: R/r (reactions), C/c (comments), O/o (open)
-	/// Reader's W/T/M thread subscription level on this (cached) action row.
-	#[serde(rename = "subLevel", skip_serializing_if = "Option::is_none")]
-	pub sub_level: Option<Box<str>>,
+	/// Reader's own state for this action (`reader_state` row `A:<type>`).
+	#[serde(rename = "readerState", skip_serializing_if = "Option::is_none")]
+	pub reader_state: Option<ReaderState>,
 	pub x: Option<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
 	/// Raw signed JWS for this action, populated only when the list query sets
 	/// `includeTokens=true`. Lets clients verify action signatures locally.
@@ -1615,6 +1718,9 @@ pub struct SearchOptions {
 	/// it — filtering the top-`limit` rows afterwards would silently drop a
 	/// document that matches both the text and the tag but ranks below the cut.
 	pub tags: Option<Vec<String>>,
+	/// Conversation scope: a CONV id matches its MSG children, a peer idTag the
+	/// top-level DMs with that peer. MSG:UPD/MSG:DEL rows never match. Actions only.
+	pub conv: Option<String>,
 	pub limit: u32,
 	pub offset: u32,
 
@@ -2337,23 +2443,69 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// row-list pass uses. `Undefined` (default) counts every matching row.
 	async fn count_actions(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64>;
 
-	/// Set a read-watermark, forward-only (a lower `position` is a no-op).
-	/// Dispatches by `scope`, all against the reader's own (`tn_id`) node:
-	///   - `"feed"`   → `profiles.feed_read_at` for `id_tag = key`
-	///   - `"msg"`    → `profiles.msg_read_at`  for `id_tag = key`
-	///   - `"thread"` → `actions.comments_read_at` for `action_id = key`
-	/// Unknown scope → bad-request error.
-	async fn set_read_marker(
+	// Reader state (`reader_state`): `P:*` refs are idTags and are normalized.
+	/// One row, no embeds. `None` when absent.
+	async fn get_reader_state(
 		&self,
 		tn_id: TnId,
-		scope: &str,
-		key: &str,
-		position: i64,
+		kind: &str,
+		ref_: &str,
+	) -> ClResult<Option<ReaderState>>;
+
+	/// One page of rows, embeds per `opts.include_ref` (a missing local ref → embed absent).
+	async fn list_reader_state(
+		&self,
+		tn_id: TnId,
+		opts: &ListReaderStateOptions,
+	) -> ClResult<Vec<ReaderState>>;
+
+	/// Apply `patch` (`insert`: upsert; else update-only, an absent row is a no-op).
+	/// `read_at` only moves forward. When it strictly advances, `U` is cleared (unless
+	/// the patch sets `unread_flag` itself) and `unread` is recomputed. A `read_at` at or past
+	/// now is clamped to `now - 1`. Returns the stored `read_at` when it advanced, else `None`.
+	/// `notify` other than W/T/M → `ValidationError`.
+	async fn patch_reader_state(
+		&self,
+		tn_id: TnId,
+		kind: &str,
+		ref_: &str,
+		patch: &PatchReaderState,
+		insert: bool,
+	) -> ClResult<Option<Timestamp>>;
+
+	/// Stamp `last_at`/`last_id`, never backwards. `insert`: create a missing row;
+	/// otherwise an absent row is a no-op.
+	async fn stamp_reader_activity(
+		&self,
+		tn_id: TnId,
+		kind: &str,
+		ref_: &str,
+		last_id: &str,
+		last_at: Timestamp,
+		insert: bool,
 	) -> ClResult<()>;
 
-	/// Auto-subscribe at Tracking: set `sub_level='T'` only when it is currently
-	/// NULL (never downgrade an existing Watching). No-op if the row is absent.
-	/// (Manual W/T/M changes go through `update_action_data`'s `sub_level` patch.)
+	/// Recompute the stored `unread` by COUNT (`P:MSG`, `A:CONV`, other `A:*`); no-op
+	/// for kinds without a count (`P:POST`) and for an absent row.
+	async fn recompute_reader_unread(&self, tn_id: TnId, kind: &str, ref_: &str) -> ClResult<()>;
+
+	/// Stamp `mentioned_at`, never backwards. Update-only.
+	async fn stamp_reader_mention(
+		&self,
+		tn_id: TnId,
+		kind: &str,
+		ref_: &str,
+		at: Timestamp,
+	) -> ClResult<()>;
+
+	async fn delete_reader_state(&self, tn_id: TnId, kind: &str, ref_: &str) -> ClResult<()>;
+
+	/// `A:<type>` of a local action row; `None` when the action is unknown.
+	async fn action_reader_kind(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<String>>;
+
+	/// Auto-subscribe at Tracking: upsert the `A:<type>` row with `notify='T'` when it is
+	/// NULL or expired (never overrides a live W/M; clears `notify_until`). A NULL the user set
+	/// through `patch_reader_state` (`notify: null`) is kept. No-op when no local action row exists.
 	async fn auto_track_action(&self, tn_id: TnId, action_id: &str) -> ClResult<()>;
 
 	async fn create_action(
@@ -2391,6 +2543,9 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Store action token for federation (called when action is created)
 	async fn store_action_token(&self, tn_id: TnId, action_id: &str, token: &str) -> ClResult<()>;
+
+	/// Delete the stored action token (no-op when absent)
+	async fn delete_action_token(&self, tn_id: TnId, action_id: &str) -> ClResult<()>;
 
 	/// Get action token for federation
 	async fn get_action_token(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<Box<str>>>;

@@ -21,6 +21,14 @@ fn db_visibility_to_action(s: Option<String>) -> Option<char> {
 	s.and_then(|s| s.chars().next()).filter(|c| *c != 'D')
 }
 
+/// `content` is declared `json` (NUMERIC affinity), so SQLite stores a bare-number content
+/// (RCPT's epoch seconds) as INTEGER/REAL. Read it back as JSON text either way.
+fn content_text(row: &sqlx::sqlite::SqliteRow) -> Result<Option<String>, sqlx::Error> {
+	row.try_get::<Option<String>, _>("content")
+		.or_else(|_| row.try_get::<Option<i64>, _>("content").map(|n| n.map(|n| n.to_string())))
+		.or_else(|_| row.try_get::<Option<f64>, _>("content").map(|n| n.map(|n| n.to_string())))
+}
+
 /// Build `ActionView.hat` from the `ph` join columns (`hat_tag`, `hat_name`,
 /// `hat_profile_pic`). A hat community with no local profile row (a mirror
 /// node) still resolves, named by its id_tag, so attribution never vanishes.
@@ -63,6 +71,12 @@ fn push_action_filters(
 	if let Some(status) = &opts.status {
 		query.push(" AND coalesce(a.status, 'A') IN ");
 		query = push_in(query, status);
+	} else if opts.container.is_some() {
+		// Superseded joins and invites are conversation history.
+		query.push(
+			" AND coalesce(a.status, 'A') NOT IN ('V','F') \
+			 AND (coalesce(a.status, 'A') <> 'D' OR a.type IN ('SUBS','INVT'))",
+		);
 	} else {
 		query.push(" AND coalesce(a.status, 'A') NOT IN ");
 		query = push_in(query, &HIDDEN_ACTION_STATUSES);
@@ -118,6 +132,12 @@ fn push_action_filters(
 		query.push(" AND (a.channel IS NULL OR a.channel NOT IN ");
 		query = push_in(query, muted.as_slice());
 		query.push(")");
+	}
+	if let Some(rcpt_issuer) = &opts.rcpt_issuer {
+		query
+			.push(" AND (a.type <> 'RCPT' OR a.issuer_tag = ")
+			.push_bind(normalize_id_tag(rcpt_issuer).into_owned())
+			.push(")");
 	}
 	if let Some(channel) = &opts.channel {
 		query.push(" AND a.channel=").push_bind(channel.clone());
@@ -176,6 +196,18 @@ fn push_action_filters(
 	if let Some(root_id) = &opts.root_id {
 		query.push(" AND a.root_id=").push_bind(root_id);
 	}
+	if let Some(c) = &opts.container {
+		query
+			.push(" AND (a.parent_id=")
+			.push_bind(c)
+			.push(" OR a.action_id=")
+			.push_bind(c)
+			.push(" OR (a.parent_id IS NULL AND a.subject=")
+			.push_bind(c)
+			.push(") OR (a.parent_id IS NULL AND a.type='SUBS' AND a.subject IN (SELECT s.action_id FROM actions s WHERE s.tn_id=a.tn_id AND s.type='SUBS' AND s.subject=")
+			.push_bind(c)
+			.push(")))");
+	}
 	if let Some(subject) = &opts.subject {
 		if subject.is_empty() {
 			query.push(" AND 1=0"); // explicit empty set → no rows (was: matched all)
@@ -199,10 +231,18 @@ fn push_action_filters(
 	if let Some(created_before) = &opts.created_before {
 		query.push(format!(" AND {range_col}<")).push_bind(created_before.0);
 	}
+	if opts.attachments == Some(true) {
+		query.push(" AND a.attachments IS NOT NULL AND a.attachments!=''");
+	}
 	if opts.subscribed == Some(true) {
-		// Watching + Tracking count as "followed"; Muted is excluded. sub_level lives
-		// on the reader's own cached action rows, so this needs no viewer-scoping.
-		query.push(" AND a.sub_level IN ('W','T')");
+		// Watching + Tracking count as "followed"; Muted and an expired `notify_until`
+		// are excluded. reader_state is per tenant (the reader's own), so this needs no
+		// viewer-scoping. EXISTS rather than a join so the count paths work unchanged.
+		query.push(
+			" AND EXISTS (SELECT 1 FROM reader_state rsf WHERE rsf.tn_id=a.tn_id \
+			 AND rsf.kind='A:'||a.type AND rsf.ref=a.action_id AND rsf.notify IN ('W','T') \
+			 AND coalesce(rsf.notify_until, unixepoch() + 1) > unixepoch())",
+		);
 	}
 	// Materialize excluded-status codes ahead of push_bind so the &str slice
 	// outlives the QueryBuilder (push_in takes references with lifetime 'a).
@@ -292,7 +332,7 @@ fn push_count_from_where(
 		);
 	}
 	// No join for the visibility guard: `push_action_visibility_predicate` reads
-	// the reader's relation from bound values, not from a profile row.
+	// the reader's relation from bound values, not from the issuer's profile row.
 	query.push(" WHERE a.tn_id=");
 	query.push_bind(tn_id.0);
 	query
@@ -369,6 +409,23 @@ pub(crate) fn push_action_visibility_predicate(
 	query.push_bind(viewer.clone().into_owned());
 	query.push(format!(" OR {alias}.audience = "));
 	query.push_bind(viewer.clone().into_owned());
+	// Discovery, the twin of `filter::is_listed_group`: a listed community group shows to any
+	// community member, i.e. an unrestricted profile holding a stored role above `follower`
+	// (`ROLE_HIERARCHY[2..]`, constants, matched against the comma-separated `p.roles` the way
+	// `parse_roles` splits it).
+	let member_roles = cloudillo_types::roles::ROLE_HIERARCHY[2..]
+		.iter()
+		.map(|r| format!("instr(',' || p.roles || ',', ',{r},') > 0"))
+		.collect::<Vec<_>>()
+		.join(" OR ");
+	query.push(format!(
+		" OR ({alias}.type = 'CONV' AND json_extract({alias}.x, '$.createdBy') IS NOT NULL \
+		  AND json_extract({alias}.content, '$.join') IN ('role', 'request') \
+		  AND EXISTS (SELECT 1 FROM profiles p WHERE p.tn_id = {alias}.tn_id AND p.id_tag = "
+	));
+	query.push_bind(viewer.clone().into_owned());
+	query
+		.push(format!(" AND ({member_roles}) AND coalesce(p.status, '') NOT IN ('S', 'B', 'X')))"));
 	query.push(format!(
 		" OR (coalesce({alias}.visibility, 'D') IN ('S', 'D') \
 		      AND EXISTS (SELECT 1 FROM actions s \
@@ -498,7 +555,7 @@ pub(crate) async fn list(
 	tn_id: TnId,
 	opts: &ListActionOptions,
 ) -> ClResult<Vec<ActionView>> {
-	let mut query = sqlx::QueryBuilder::new(
+	let mut query = sqlx::QueryBuilder::new(concat!(
 		"SELECT DISTINCT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
 		pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 		a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
@@ -506,7 +563,9 @@ pub(crate) async fn list(
 		a.hat_tag, a.channel, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 		a.content, a.created_at, a.received_at, a.expires_at,
 		own.sub_type as own_reaction,
-		a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
+		a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.reposts, a.visibility, a.flags, a.x, ",
+		crate::reader_state::rs_cols!("rs"),
+		"
 		FROM actions a
 		LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 		LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
@@ -514,8 +573,9 @@ pub(crate) async fn list(
 			AND a.subject LIKE '@%'
 			AND ps.id_tag = substr(a.subject, 2)
 		LEFT JOIN profiles ph ON ph.tn_id=a.tn_id AND ph.id_tag=a.hat_tag
+		LEFT JOIN reader_state rs ON rs.tn_id=a.tn_id AND rs.kind='A:'||a.type AND rs.ref=a.action_id
 		LEFT JOIN actions own ON own.tn_id=a.tn_id AND own.subject=a.action_id AND own.issuer_tag=",
-	);
+	));
 	query.push_bind(opts.viewer_id_tag.as_deref().map(|v| normalize_id_tag(v).into_owned()));
 	query.push(
 		" AND own.type='REACT' AND own.sub_type!='DEL' AND coalesce(own.status, 'A') NOT IN ('D')
@@ -678,14 +738,11 @@ pub(crate) async fn list(
 			None
 		};
 
-		// stat - reactions string, comment count, last-comment / comments-read
-		// watermarks (ISO), reposts count. `comments` holds the total comment count;
-		// `comments_ts` holds the last-comment timestamp (epoch seconds) — the client
-		// computes the unread dot from lastCommentAt vs commentsReadAt.
+		// stat - reactions, comment count, last-comment time (`comments_ts` epoch, served ISO),
+		// reposts. The client computes the unread dot from lastCommentAt vs readerState.readAt.
 		let reactions: Option<String> = row.try_get("reactions").ok().flatten();
 		let comment_count: i64 = row.try_get("comments").unwrap_or(0);
 		let last_comment_at: Option<i64> = row.try_get("comments_ts").ok().flatten();
-		let comments_read_at: Option<i64> = row.try_get("comments_read_at").ok().flatten();
 		let own_reaction: Option<String> = row.try_get("own_reaction").ok().flatten();
 		let reposts: i64 = row.try_get("reposts").unwrap_or(0);
 		let mut stat_obj = serde_json::json!({});
@@ -694,9 +751,6 @@ pub(crate) async fn list(
 		}
 		if let Some(ts) = last_comment_at {
 			stat_obj["lastCommentAt"] = serde_json::Value::String(Timestamp(ts).to_iso_string());
-		}
-		if let Some(ts) = comments_read_at {
-			stat_obj["commentsReadAt"] = serde_json::Value::String(Timestamp(ts).to_iso_string());
 		}
 		if let Some(reactions) = reactions {
 			stat_obj["reactions"] = serde_json::Value::String(reactions);
@@ -758,10 +812,7 @@ pub(crate) async fn list(
 			channel: row.try_get("channel").ok().flatten(),
 			// Hydrated below for REPOST rows.
 			subject_action: None,
-			content: row
-				.try_get::<Option<String>, _>("content")
-				.db()?
-				.and_then(|s| serde_json::from_str(&s).ok()),
+			content: content_text(&row).db()?.and_then(|s| serde_json::from_str(&s).ok()),
 			attachments,
 			created_at: row.try_get("created_at").map(Timestamp).db()?,
 			received_at: row.try_get::<Option<i64>, _>("received_at").ok().flatten().map(Timestamp),
@@ -770,7 +821,7 @@ pub(crate) async fn list(
 			stat,
 			visibility,
 			flags: row.try_get("flags").db()?,
-			sub_level: row.try_get("sub_level").db()?,
+			reader_state: crate::reader_state::parse_row(&row, "rs").db()?,
 			x: row
 				.try_get::<Option<String>, _>("x")
 				.db()?
@@ -1260,7 +1311,7 @@ pub(crate) async fn get_by_key(
 				parent_id: row.try_get("parent_id").ok().flatten(),
 				root_id: row.try_get("root_id").ok().flatten(),
 				audience_tag: row.try_get("audience").ok().flatten(),
-				content: row.try_get("content").ok().flatten(),
+				content: content_text(&row).db()?.map(Into::into),
 				attachments,
 				subject: row.try_get("subject").ok().flatten(),
 				created_at: row.try_get("created_at").map(Timestamp).db()?,
@@ -1302,6 +1353,17 @@ pub(crate) async fn store_token(
 	.await
 	.db()?;
 
+	Ok(())
+}
+
+/// Delete an action token (an edited / deleted MSG must not keep serving its original text)
+pub(crate) async fn delete_token(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClResult<()> {
+	sqlx::query("DELETE FROM action_tokens WHERE tn_id = ? AND action_id = ?")
+		.bind(tn_id.0)
+		.bind(action_id)
+		.execute(db)
+		.await
+		.db()?;
 	Ok(())
 }
 
@@ -1366,9 +1428,6 @@ pub(crate) async fn update_data(
 	}
 	if !opts.flags.is_undefined() {
 		set_clauses.push("flags = ?");
-	}
-	if !opts.sub_level.is_undefined() {
-		set_clauses.push("sub_level = ?");
 	}
 	if !opts.sub_typ.is_undefined() {
 		set_clauses.push("sub_type = ?");
@@ -1493,14 +1552,6 @@ pub(crate) async fn update_data(
 		};
 		query = query.bind(val);
 	}
-	if !opts.sub_level.is_undefined() {
-		let val: Option<String> = match &opts.sub_level {
-			Patch::Null => None,
-			Patch::Value(c) => Some(c.to_string()),
-			Patch::Undefined => unreachable!(),
-		};
-		query = query.bind(val);
-	}
 	if !opts.sub_typ.is_undefined() {
 		let val: Option<&str> = match &opts.sub_typ {
 			Patch::Null => None,
@@ -1570,14 +1621,16 @@ pub(crate) async fn get(
 	// Handle @{a_id} format for drafts/pending actions
 	let row = if let Some(a_id_str) = action_id.strip_prefix('@') {
 		let a_id: i64 = a_id_str.parse().map_err(|_| Error::NotFound)?;
-		sqlx::query(
+		sqlx::query(concat!(
 			"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
 			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
 			a.hat_tag, a.channel, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 			a.content, a.created_at, a.received_at, a.expires_at,
-			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
+			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.reposts, a.visibility, a.flags, a.x, ",
+			crate::reader_state::rs_cols!("rs"),
+			"
 			FROM actions a
 			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
@@ -1585,22 +1638,25 @@ pub(crate) async fn get(
 				AND a.subject LIKE '@%'
 				AND ps.id_tag = substr(a.subject, 2)
 			LEFT JOIN profiles ph ON ph.tn_id=a.tn_id AND ph.id_tag=a.hat_tag
+			LEFT JOIN reader_state rs ON rs.tn_id=a.tn_id AND rs.kind='A:'||a.type AND rs.ref=a.action_id
 			WHERE a.tn_id=? AND a.a_id=? AND coalesce(a.status, 'A') NOT IN ('D')",
-		)
+		))
 		.bind(tn_id.0)
 		.bind(a_id)
 		.fetch_optional(db)
 		.await
 		.db()?
 	} else {
-		sqlx::query(
+		sqlx::query(concat!(
 			"SELECT a.a_id, a.type, a.sub_type, a.action_id, a.parent_id, a.root_id, a.issuer_tag,
 			pi.name as issuer_name, pi.profile_pic as issuer_profile_pic, pi.type as issuer_type,
 			a.audience, pa.name as audience_name, pa.profile_pic as audience_profile_pic, pa.type as audience_type,
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
 			a.hat_tag, a.channel, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 			a.content, a.created_at, a.received_at, a.expires_at,
-			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.comments_read_at, a.reposts, a.visibility, a.flags, a.sub_level, a.x
+			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.reposts, a.visibility, a.flags, a.x, ",
+			crate::reader_state::rs_cols!("rs"),
+			"
 			FROM actions a
 			LEFT JOIN profiles pi ON pi.tn_id=a.tn_id AND pi.id_tag=a.issuer_tag
 			LEFT JOIN profiles pa ON pa.tn_id=a.tn_id AND pa.id_tag=coalesce(a.audience, a.issuer_tag)
@@ -1608,8 +1664,9 @@ pub(crate) async fn get(
 				AND a.subject LIKE '@%'
 				AND ps.id_tag = substr(a.subject, 2)
 			LEFT JOIN profiles ph ON ph.tn_id=a.tn_id AND ph.id_tag=a.hat_tag
+			LEFT JOIN reader_state rs ON rs.tn_id=a.tn_id AND rs.kind='A:'||a.type AND rs.ref=a.action_id
 			WHERE a.tn_id=? AND a.action_id=? AND coalesce(a.status, 'A') NOT IN ('D')",
-		)
+		))
 		.bind(tn_id.0)
 		.bind(action_id)
 		.fetch_optional(db)
@@ -1684,13 +1741,11 @@ pub(crate) async fn get(
 		None
 	};
 
-	// Build stat: reactions string, comment count, last-comment / comments-read
-	// watermarks (ISO), reposts count. `comments` holds the total comment count;
-	// `comments_ts` holds the last-comment timestamp.
+	// Build stat: reactions, comment count, last-comment time (`comments_ts` epoch, served ISO),
+	// reposts.
 	let reactions: Option<String> = row.try_get("reactions").ok().flatten();
 	let comment_count: i64 = row.try_get("comments").unwrap_or(0);
 	let last_comment_at: Option<i64> = row.try_get("comments_ts").ok().flatten();
-	let comments_read_at: Option<i64> = row.try_get("comments_read_at").ok().flatten();
 	let reposts: i64 = row.try_get("reposts").unwrap_or(0);
 	let mut stat_obj = serde_json::json!({});
 	if comment_count > 0 {
@@ -1698,9 +1753,6 @@ pub(crate) async fn get(
 	}
 	if let Some(ts) = last_comment_at {
 		stat_obj["lastCommentAt"] = serde_json::Value::String(Timestamp(ts).to_iso_string());
-	}
-	if let Some(ts) = comments_read_at {
-		stat_obj["commentsReadAt"] = serde_json::Value::String(Timestamp(ts).to_iso_string());
 	}
 	if let Some(reactions) = reactions {
 		stat_obj["reactions"] = serde_json::Value::String(reactions);
@@ -1806,10 +1858,7 @@ pub(crate) async fn get(
 		hat: hat_info(&row)?,
 		channel: row.try_get("channel").ok().flatten(),
 		subject_action: None,
-		content: row
-			.try_get::<Option<String>, _>("content")
-			.db()?
-			.and_then(|s| serde_json::from_str(&s).ok()),
+		content: content_text(&row).db()?.and_then(|s| serde_json::from_str(&s).ok()),
 		attachments,
 		created_at: row.try_get("created_at").map(Timestamp).db()?,
 		received_at: row.try_get::<Option<i64>, _>("received_at").ok().flatten().map(Timestamp),
@@ -1818,7 +1867,7 @@ pub(crate) async fn get(
 		stat,
 		visibility,
 		flags: row.try_get("flags").db()?,
-		sub_level: row.try_get("sub_level").db()?,
+		reader_state: crate::reader_state::parse_row(&row, "rs").db()?,
 		x: row
 			.try_get::<Option<String>, _>("x")
 			.db()?
@@ -1906,50 +1955,6 @@ pub(crate) async fn delete(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClR
 	Ok(())
 }
 
-/// Set a read-watermark forward-only (lower position is a no-op). Dispatches by
-/// `scope` over the two tables that carry reader-relative state. See the
-/// `MetaAdapter::set_read_marker` doc for the scope/column map.
-pub async fn set_read_marker(
-	db: &SqlitePool,
-	tn_id: TnId,
-	scope: &str,
-	key: &str,
-	position: i64,
-) -> ClResult<()> {
-	let sql = match scope {
-		"feed" => {
-			"UPDATE profiles SET feed_read_at = max(coalesce(feed_read_at, 0), ?) \
-			 WHERE tn_id = ? AND id_tag = ?"
-		}
-		"msg" => {
-			"UPDATE profiles SET msg_read_at = max(coalesce(msg_read_at, 0), ?) \
-			 WHERE tn_id = ? AND id_tag = ?"
-		}
-		"thread" => {
-			"UPDATE actions SET comments_read_at = max(coalesce(comments_read_at, 0), ?) \
-			 WHERE tn_id = ? AND action_id = ?"
-		}
-		_ => return Err(Error::ValidationError(format!("unknown read-marker scope: {scope}"))),
-	};
-	sqlx::query(sql).bind(position).bind(tn_id.0).bind(key).execute(db).await.db()?;
-	Ok(())
-}
-
-/// Auto-subscribe at Tracking: set `sub_level='T'` only when currently NULL
-/// (never downgrade an existing Watching). No-op if the row is absent.
-pub async fn auto_track(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClResult<()> {
-	sqlx::query(
-		"UPDATE actions SET sub_level = 'T' \
-		 WHERE tn_id = ? AND action_id = ? AND sub_level IS NULL",
-	)
-	.bind(tn_id.0)
-	.bind(action_id)
-	.execute(db)
-	.await
-	.db()?;
-	Ok(())
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1997,8 +2002,12 @@ mod tests {
 		let sql = predicate_sql("d", Some("bob.example"));
 		assert!(sql.contains("d.issuer_tag"), "{sql}");
 		assert!(!sql.contains("a.issuer_tag"), "the alias must not be hard-coded: {sql}");
-		// The reader's relation is bound, never looked up per row on the issuer.
-		assert!(!sql.contains("profiles"), "{sql}");
+		// The reader's relation is bound, never looked up per row on the issuer. (The
+		// listed-group discovery arm reads the *viewer's* profile by a bound tag.)
+		assert_eq!(sql.matches("profiles").count(), 1, "{sql}");
+		let lookups: Vec<_> = sql.match_indices("p.id_tag = ").collect();
+		assert_eq!(lookups.len(), 1, "{sql}");
+		assert!(sql[lookups[0].0..].starts_with("p.id_tag = ?"), "{sql}");
 		// Viewer values are bound, never interpolated.
 		assert!(!sql.contains("bob.example"), "{sql}");
 	}
@@ -2483,37 +2492,6 @@ mod tests {
 		assert_eq!(cmnt_count, 1, "CMNT child counted separately from MSG children");
 	}
 
-	// E9: the `thread` read-marker scope writes `comments_read_at` on a CONV row
-	// (the UPDATE is type-agnostic; the watermark is forward-only).
-	#[tokio::test]
-	async fn read_marker_thread_scope_on_conv() {
-		async fn read_marker(db: &SqlitePool, tn_id: TnId, conv: &str) -> Option<i64> {
-			sqlx::query_scalar("SELECT comments_read_at FROM actions WHERE tn_id=? AND action_id=?")
-				.bind(tn_id.0)
-				.bind(conv)
-				.fetch_one(db)
-				.await
-				.expect("select comments_read_at")
-		}
-
-		let dir = tempfile::tempdir().expect("tempdir");
-		let db = test_pool(dir.path()).await;
-		let tn_id = TnId(1);
-		let conv = "a1~conv";
-		insert_action(&db, tn_id, conv, "CONV", "", "").await;
-
-		set_read_marker(&db, tn_id, "thread", conv, 500).await.expect("set 500");
-		assert_eq!(read_marker(&db, tn_id, conv).await, Some(500), "watermark set on CONV row");
-
-		// Forward-only: a lower position is a no-op.
-		set_read_marker(&db, tn_id, "thread", conv, 300).await.expect("set 300");
-		assert_eq!(read_marker(&db, tn_id, conv).await, Some(500), "lower position ignored");
-
-		// Higher position advances.
-		set_read_marker(&db, tn_id, "thread", conv, 700).await.expect("set 700");
-		assert_eq!(read_marker(&db, tn_id, conv).await, Some(700), "higher position advances");
-	}
-
 	// E6/E9: `includeSubject=true` hydrates `subject_action` (with its `stat`) for
 	// ANY row whose subject is a real action id (SUBS→CONV as well as REPOST).
 	// Without the flag it's omitted even for a REPOST.
@@ -2644,6 +2622,144 @@ mod tests {
 			vec![500, 400, 300, 200, 100],
 			"cursor + involved + parentId paginate the CONV thread with no gaps/dupes and exclude the decoy"
 		);
+	}
+
+	// `createdAfter` is a strict `>` and composes with `sortDir=asc` under
+	// `parentId`, so a client loads the window after a target message (target excluded).
+	#[tokio::test]
+	async fn created_after_asc_under_parent() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		for (i, ts) in [100, 200, 300, 400].into_iter().enumerate() {
+			let id = format!("a1~msg-{i}");
+			insert_msg(&db, tn_id, &id, "", "a1~conv", "alice.example", "bob.example", ts).await;
+		}
+		insert_msg(&db, tn_id, "a1~decoy", "", "a1~other", "alice.example", "bob.example", 350)
+			.await;
+
+		let opts = ListActionOptions {
+			typ: Some(vec!["MSG".into()]),
+			parent_id: Some("a1~conv".into()),
+			created_after: Some(cloudillo_types::types::Timestamp(200)),
+			sort_dir: Some("asc".into()),
+			limit: Some(10),
+			..Default::default()
+		};
+		let got: Vec<i64> = list(&db, tn_id, &opts)
+			.await
+			.expect("list")
+			.iter()
+			.map(|a| a.created_at.0)
+			.collect();
+		assert_eq!(got, vec![300, 400], "strict createdAfter, ascending, decoy excluded");
+	}
+
+	// DM side: `createdAfter` + `sortDir=asc` under `involved` (both directions
+	// of the alice<->bob thread, parent NULL), excluding another peer's DM.
+	#[tokio::test]
+	async fn created_after_asc_under_involved() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		let rows = [
+			("a1~d1", "alice.example", "bob.example", 100),
+			("a1~d2", "bob.example", "alice.example", 200),
+			("a1~d3", "alice.example", "bob.example", 300),
+			("a1~d4", "bob.example", "alice.example", 400),
+			("a1~decoy", "alice.example", "carol.example", 250),
+		];
+		for (id, iss, aud, ts) in rows {
+			sqlx::query(
+				"INSERT INTO actions (tn_id, action_id, type, issuer_tag, audience, status, visibility, created_at)
+				VALUES (?, ?, 'MSG', ?, ?, 'A', 'D', ?)",
+			)
+			.bind(tn_id.0)
+			.bind(id)
+			.bind(iss)
+			.bind(aud)
+			.bind(ts)
+			.execute(&db)
+			.await
+			.expect("insert dm");
+		}
+
+		let opts = ListActionOptions {
+			typ: Some(vec!["MSG".into()]),
+			involved: Some("bob.example".into()),
+			viewer_id_tag: Some("alice.example".into()),
+			created_after: Some(cloudillo_types::types::Timestamp(100)),
+			sort_dir: Some("asc".into()),
+			limit: Some(10),
+			..Default::default()
+		};
+		let got: Vec<i64> = list(&db, tn_id, &opts)
+			.await
+			.expect("list")
+			.iter()
+			.map(|a| a.created_at.0)
+			.collect();
+		assert_eq!(got, vec![200, 300, 400], "strict createdAfter, ascending, other peer excluded");
+	}
+
+	#[tokio::test]
+	async fn rcpt_numeric_content_decodes() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		// NUMERIC affinity of `content json` stores this TEXT as INTEGER.
+		sqlx::query(
+			"INSERT INTO actions (tn_id, action_id, type, issuer_tag, content, status, visibility, created_at)
+			VALUES (?, 'a1~r', 'RCPT', 'alice.example', ?, 'A', 'P', 100)",
+		)
+		.bind(tn_id.0)
+		.bind("1761560520")
+		.execute(&db)
+		.await
+		.expect("insert rcpt");
+		let opts = ListActionOptions { typ: Some(vec!["RCPT".into()]), ..Default::default() };
+		let rows = list(&db, tn_id, &opts).await.expect("list");
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0].content, Some(serde_json::json!(1_761_560_520)));
+	}
+
+	// The MSG:UPD / MSG:DEL hook (`native_hooks::msg::apply_edit`) rewrites the
+	// target in place through `update_data` — content + `x` — and the row stays listed.
+	#[tokio::test]
+	async fn msg_edit_rewrites_target_in_place() {
+		use cloudillo_types::types::Patch;
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		insert_msg(&db, tn_id, "a1~m", "", "a1~conv", "alice.example", "bob.example", 100).await;
+		let opts = ListActionOptions {
+			typ: Some(vec!["MSG".into()]),
+			parent_id: Some("a1~conv".into()),
+			..Default::default()
+		};
+
+		let edit = UpdateActionDataOptions {
+			content: Patch::Value("\"edited\"".into()),
+			x: Patch::Value(serde_json::json!({ "editedAt": 150 })),
+			..Default::default()
+		};
+		update_data(&db, tn_id, "a1~m", &edit).await.expect("edit");
+		let rows = list(&db, tn_id, &opts).await.expect("list");
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0].content, Some(serde_json::json!("edited")));
+		assert_eq!(rows[0].x, Some(serde_json::json!({ "editedAt": 150 })));
+
+		let del = UpdateActionDataOptions {
+			content: Patch::Null,
+			attachments: Patch::Null,
+			x: Patch::Value(serde_json::json!({ "deletedBy": "carol.example" })),
+			..Default::default()
+		};
+		update_data(&db, tn_id, "a1~m", &del).await.expect("delete");
+		let rows = list(&db, tn_id, &opts).await.expect("list");
+		assert_eq!(rows.len(), 1, "a tombstone stays listed");
+		assert_eq!(rows[0].content, None);
+		assert_eq!(rows[0].x, Some(serde_json::json!({ "deletedBy": "carol.example" })));
 	}
 
 	// A cursor naming a vanished row pages on from its timestamp, never restarts at page 1.
@@ -2950,5 +3066,75 @@ mod tests {
 		// Patch::Undefined (tenant/owner see-all): every seeded POST row counts.
 		let n = count(&db, tn_id, &vis_count_opts(Patch::Undefined)).await.expect("count");
 		assert_eq!(n, 9, "tenant see-all counts every row regardless of visibility");
+	}
+
+	// The listed-group discovery arm admits a community member (a stored role above
+	// `follower`), not a profile whose only stored role is `public`.
+	#[tokio::test]
+	async fn listed_conv_discovery_needs_a_role_above_follower() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		sqlx::query(
+			"INSERT INTO actions (tn_id, action_id, type, issuer_tag, content, x, status, \
+			 visibility, created_at) VALUES (?, 'a1~conv', 'CONV', 'club.example', \
+			 '{\"join\":\"role\"}', '{\"createdBy\":\"leader.example\"}', 'A', 'D', unixepoch())",
+		)
+		.bind(tn_id.0)
+		.execute(&db)
+		.await
+		.expect("insert conv");
+		for (id_tag, roles) in [("pub.example", "public"), ("member.example", "public,contributor")]
+		{
+			sqlx::query("INSERT INTO profiles (tn_id, id_tag, name, roles) VALUES (?, ?, 'x', ?)")
+				.bind(tn_id.0)
+				.bind(id_tag)
+				.bind(roles)
+				.execute(&db)
+				.await
+				.expect("insert profile");
+		}
+		let seen = async |viewer: &str| {
+			let opts = ListActionOptions {
+				typ: Some(vec!["CONV".into()]),
+				visibility_guard: Patch::Value(viewer.to_string()),
+				..Default::default()
+			};
+			count(&db, tn_id, &opts).await.expect("count")
+		};
+		assert_eq!(seen("pub.example").await, 0, "a `public`-only profile is not a member");
+		assert_eq!(seen("member.example").await, 1, "a contributor discovers the group");
+	}
+
+	// `rcpt_issuer` hides every RCPT but that issuer's, in SQL (so pagination stays whole),
+	// and leaves other types alone.
+	#[tokio::test]
+	async fn rcpt_issuer_keeps_only_own_receipts() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let tn_id = TnId(1);
+		insert_vis(&db, tn_id, "a1~post", VIS_ISSUER, None, "P").await;
+		for (id, issuer) in [("a1~r1", "me.example"), ("a1~r2", VIS_ISSUER)] {
+			sqlx::query(
+				"INSERT INTO actions (tn_id, action_id, type, issuer_tag, status, visibility, \
+				 created_at) VALUES (?, ?, 'RCPT', ?, 'A', 'P', unixepoch())",
+			)
+			.bind(tn_id.0)
+			.bind(id)
+			.bind(issuer)
+			.execute(&db)
+			.await
+			.expect("insert rcpt");
+		}
+		let opts = |rcpt_issuer: Option<&str>| ListActionOptions {
+			rcpt_issuer: rcpt_issuer.map(Into::into),
+			..Default::default()
+		};
+		assert_eq!(count(&db, tn_id, &opts(None)).await.expect("count"), 3);
+		assert_eq!(count(&db, tn_id, &opts(Some("me.example"))).await.expect("count"), 2);
+		let rows = list(&db, tn_id, &opts(Some("me.example"))).await.expect("list");
+		let mut ids: Vec<_> = rows.iter().map(|a| a.action_id.to_string()).collect();
+		ids.sort();
+		assert_eq!(ids, ["a1~post", "a1~r1"]);
 	}
 }

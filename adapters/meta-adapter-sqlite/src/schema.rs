@@ -9,6 +9,19 @@
 use cloudillo_types::prelude::*;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
+async fn has_column(
+	tx: &mut Transaction<'_, Sqlite>,
+	table: &str,
+	column: &str,
+) -> Result<bool, sqlx::Error> {
+	let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?")
+		.bind(table)
+		.bind(column)
+		.fetch_one(&mut **tx)
+		.await?;
+	Ok(n > 0)
+}
+
 /// Add a column only if it is not already present. SQLite has no
 /// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`; a plain ALTER errors with
 /// "duplicate column name" when the column exists. Migrations normally run only
@@ -22,11 +35,7 @@ async fn add_column_if_missing(
 ) -> Result<(), sqlx::Error> {
 	// table/column/decl are internal constants (never user input), so the
 	// dynamic SQL is safe — assert that for the sqlx injection lint.
-	let cols = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
-		.fetch_all(&mut **tx)
-		.await?;
-	let exists = cols.iter().any(|r| r.get::<String, _>("name") == column);
-	if !exists {
+	if !has_column(tx, table, column).await? {
 		sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE {table} ADD COLUMN {column} {decl}")))
 			.execute(&mut **tx)
 			.await?;
@@ -41,17 +50,36 @@ async fn drop_column_if_exists(
 ) -> Result<(), sqlx::Error> {
 	// table/column are internal constants (never user input), so the dynamic SQL
 	// is safe — assert that for the sqlx injection lint.
-	let cols = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
-		.fetch_all(&mut **tx)
-		.await?;
-	let exists = cols.iter().any(|r| r.get::<String, _>("name") == column);
-	if exists {
+	if has_column(tx, table, column).await? {
 		sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE {table} DROP COLUMN {column}")))
 			.execute(&mut **tx)
 			.await?;
 	}
 	Ok(())
 }
+
+/// `reader_state`: the reader's state about one thing they follow, keyed `(tn_id, kind, ref)`.
+/// `kind` = `A:<action type>` (ref = action id) or `P:<stream type>` (ref = profile idTag).
+/// Run by the base schema and by migration 60.
+const READER_STATE_DDL: [&str; 2] = [
+	"CREATE TABLE IF NOT EXISTS reader_state (
+		tn_id INTEGER NOT NULL,
+		kind TEXT NOT NULL,
+		ref TEXT NOT NULL,
+		read_at INTEGER,			-- read watermark, forward-only
+		last_at INTEGER,			-- latest activity, forward-only
+		last_id TEXT,				-- action_id of that activity
+		unread INTEGER,				-- recomputed by COUNT, never incremented
+		mentioned_at INTEGER,		-- `@` badge while mentioned_at > read_at
+		notify CHAR(1),				-- W all / T relevant / M none; NULL = kind default
+		notify_until INTEGER,		-- expired => reads as NULL
+		flags TEXT,					-- P pinned, A archived, I ignore @all, U manual unread
+		created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+		updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+		PRIMARY KEY (tn_id, kind, ref)
+	)",
+	"CREATE INDEX IF NOT EXISTS idx_reader_state_last ON reader_state(tn_id, kind, last_at DESC)",
+];
 
 /// Get the current database version from vars table
 async fn get_db_version(tx: &mut Transaction<'_, Sqlite>) -> i64 {
@@ -360,7 +388,7 @@ async fn migrate_v58_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sql
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 59;
+	const CURRENT_DB_VERSION: i64 = 61;
 
 	let mut tx = db.begin().await?;
 
@@ -479,8 +507,6 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			trust char(1),					-- Per-profile trust preference: 'A' always, 'N' never, NULL ask
 			synced_at INTEGER,
 			etag text,
-			feed_read_at INTEGER,			-- Reader's feed read-watermark for this context
-			msg_read_at INTEGER,			-- Reader's DM read-watermark for this peer
 			hidden_in_home INTEGER,			-- Composition: NULL = community shown in home feed (default), 1 = hidden
 			hat_roles text,					-- My role map for this peer's members (peer_role:local_role,...)
 			peer_hat_roles text,			-- Peer's role map for my members (advisory mirror)
@@ -700,13 +726,11 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			reactions text,
 			comments integer DEFAULT 0,	-- total comment count, federated as STAT `c`
 			comments_ts integer,		-- last-comment timestamp (epoch seconds), federated as STAT `ct`
-			comments_read_at integer,	-- reader's comment read-watermark (epoch seconds)
 			reposts integer,
 			stat_at INTEGER,				-- Highest created_at of any STAT applied to reactions/comments
 			visibility char(1) NOT NULL DEFAULT 'D',	-- D: Direct (owner only), P: Public, V: Verified,
 														-- 2: 2nd degree, F: Follower, C: Connected
 			flags text,						-- Action flags: R/r (reactions), C/c (comments), O/o (open)
-			sub_level char(1),				-- Reader's W/T/M thread subscription level (NULL=none)
 			x json,
 			-- Dual-purpose: for status R (draft) / S (scheduled), holds the
 			-- target publish instant (consumed by ActionCreatorTask + PATCH
@@ -864,6 +888,11 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	)
 	.execute(&mut *tx)
 	.await?;
+
+	// Reader state (per-tenant follow state: read watermark, activity, prefs)
+	for ddl in READER_STATE_DDL {
+		sqlx::query(ddl).execute(&mut *tx).await?;
+	}
 	sqlx::query(
 		"CREATE INDEX IF NOT EXISTS idx_fud_starred ON file_user_data(tn_id, id_tag) WHERE starred = 1",
 	)
@@ -1735,12 +1764,6 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query(
 			"CREATE INDEX IF NOT EXISTS idx_profiles_follower \
 			 ON profiles(tn_id, id_tag) WHERE follower = 1",
-		)
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query(
-			"CREATE INDEX IF NOT EXISTS idx_actions_sub_level \
-			 ON actions(tn_id, sub_level) WHERE sub_level IS NOT NULL",
 		)
 		.execute(&mut *tx)
 		.await?;
@@ -3003,6 +3026,123 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		set_db_version(&mut tx, 59).await;
 	}
 
+	if version < 60 {
+		// Reader state moves into `reader_state`: copy the four per-reader columns, then
+		// drop them. Replay-safe (a test rewinds db_version, so `< 36` re-adds the columns
+		// and this runs again over an existing `reader_state`).
+		for ddl in READER_STATE_DDL {
+			sqlx::query(ddl).execute(&mut *tx).await?;
+		}
+		if has_column(&mut tx, "profiles", "feed_read_at").await? {
+			sqlx::query(
+				"INSERT OR IGNORE INTO reader_state (tn_id, kind, ref, read_at) \
+				 SELECT tn_id, 'P:POST', id_tag, feed_read_at FROM profiles \
+				 WHERE id_tag IS NOT NULL AND feed_read_at IS NOT NULL",
+			)
+			.execute(&mut *tx)
+			.await?;
+		}
+		if has_column(&mut tx, "profiles", "msg_read_at").await? {
+			sqlx::query(
+				"INSERT OR IGNORE INTO reader_state (tn_id, kind, ref, read_at) \
+				 SELECT tn_id, 'P:MSG', id_tag, msg_read_at FROM profiles \
+				 WHERE id_tag IS NOT NULL AND msg_read_at IS NOT NULL",
+			)
+			.execute(&mut *tx)
+			.await?;
+		}
+		// `< 36` adds both columns together, so one check covers the pair.
+		if has_column(&mut tx, "actions", "sub_level").await?
+			&& has_column(&mut tx, "actions", "comments_read_at").await?
+		{
+			sqlx::query(
+				"INSERT OR IGNORE INTO reader_state (tn_id, kind, ref, read_at, notify) \
+				 SELECT tn_id, 'A:' || type, action_id, comments_read_at, sub_level FROM actions \
+				 WHERE action_id IS NOT NULL \
+				 AND (comments_read_at IS NOT NULL OR sub_level IS NOT NULL)",
+			)
+			.execute(&mut *tx)
+			.await?;
+		}
+		sqlx::query("DROP INDEX IF EXISTS idx_actions_sub_level")
+			.execute(&mut *tx)
+			.await?;
+		drop_column_if_exists(&mut tx, "profiles", "feed_read_at").await?;
+		drop_column_if_exists(&mut tx, "profiles", "msg_read_at").await?;
+		drop_column_if_exists(&mut tx, "actions", "comments_read_at").await?;
+		drop_column_if_exists(&mut tx, "actions", "sub_level").await?;
+		set_db_version(&mut tx, 60).await;
+	}
+
+	if version < 61 {
+		// v60 copied only rows that had a read mark: seed the inbox rows every conversation
+		// the tenant is in (`A:CONV`, from its own live SUBS) and every DM peer (`P:MSG`)
+		// needs, then stamp their latest message and recompute `unread`. Replay-safe.
+		for sql in [
+			"INSERT OR IGNORE INTO reader_state (tn_id, kind, ref) \
+			 SELECT s.tn_id, 'A:CONV', s.subject FROM actions s \
+			 JOIN tenants t ON t.tn_id = s.tn_id AND s.issuer_tag = t.id_tag \
+			 JOIN actions c ON c.tn_id = s.tn_id AND c.action_id = s.subject AND c.type = 'CONV' \
+			 AND coalesce(c.status, 'A') <> 'D' \
+			 WHERE s.type = 'SUBS' AND s.status = 'A' AND coalesce(s.sub_type, '') <> 'DEL'",
+			"INSERT OR IGNORE INTO reader_state (tn_id, kind, ref) \
+			 SELECT m.tn_id, 'P:MSG', \
+			 CASE WHEN m.issuer_tag = t.id_tag THEN m.audience ELSE m.issuer_tag END AS peer \
+			 FROM actions m JOIN tenants t ON t.tn_id = m.tn_id \
+			 WHERE m.type = 'MSG' AND m.parent_id IS NULL \
+			 AND (m.issuer_tag = t.id_tag OR m.audience = t.id_tag) \
+			 AND coalesce(m.sub_type, '') NOT IN ('DEL', 'UPD') \
+			 GROUP BY m.tn_id, peer HAVING peer IS NOT NULL",
+		] {
+			sqlx::query(sql).execute(&mut *tx).await?;
+		}
+		// The latest live message of each conversation, either direction for a DM, by local
+		// arrival time (the unread timeline, `reader_state::unread_update`).
+		let latest = |cond: &str| {
+			format!(
+				"(SELECT {{col}} FROM actions m WHERE m.tn_id = reader_state.tn_id \
+				 AND m.type = 'MSG' AND {cond} \
+				 AND coalesce(m.sub_type, '') NOT IN ('DEL', 'UPD') \
+				 AND coalesce(m.status, 'A') <> 'D' \
+				 ORDER BY coalesce(m.received_at, m.created_at) DESC, m.action_id DESC LIMIT 1)"
+			)
+		};
+		let conv = latest("m.parent_id = reader_state.ref");
+		let me = "(SELECT t.id_tag FROM tenants t WHERE t.tn_id = reader_state.tn_id)";
+		let dm = latest(&format!(
+			"m.parent_id IS NULL AND ((m.issuer_tag = reader_state.ref AND m.audience = {me}) \
+			 OR (m.audience = reader_state.ref AND m.issuer_tag = {me}))"
+		));
+		for (kind, pick) in [("A:CONV", conv), ("P:MSG", dm)] {
+			let sql = format!(
+				"UPDATE reader_state SET last_at = {}, last_id = {} \
+				 WHERE kind = ? AND last_at IS NULL",
+				pick.replace("{col}", "coalesce(m.received_at, m.created_at)"),
+				pick.replace("{col}", "m.action_id"),
+			);
+			sqlx::query(sqlx::AssertSqlSafe(sql)).bind(kind).execute(&mut *tx).await?;
+		}
+		// A row with no read mark starts as "read up to now", not as all-unread history.
+		sqlx::query(
+			"UPDATE reader_state SET read_at = last_at WHERE kind IN ('A:CONV', 'P:MSG') \
+			 AND read_at IS NULL AND last_at IS NOT NULL",
+		)
+		.execute(&mut *tx)
+		.await?;
+		let rows: Vec<(i64, String, String)> = sqlx::query_as(
+			"SELECT tn_id, kind, ref FROM reader_state WHERE kind IN ('A:CONV', 'P:MSG')",
+		)
+		.fetch_all(&mut *tx)
+		.await?;
+		for (tn_id, kind, ref_) in rows {
+			let tn_id = TnId(u32::try_from(tn_id).unwrap_or_default());
+			crate::reader_state::recompute(&mut *tx, tn_id, &kind, &ref_)
+				.await
+				.map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+		}
+		set_db_version(&mut tx, 61).await;
+	}
+
 	// Unversioned and idempotent: a DB that reached v58 on a pre-rename build still has
 	// `f_id`. e_id = old f_id, so the rename is the whole rekey; SQLite rewrites the PK and
 	// the `file_user_data_*_at` trigger bodies along with it.
@@ -3251,6 +3391,102 @@ mod tests {
 				(1, Some("a1~old".into())),
 				(2, None),
 				(3, Some("a1~new".into())),
+			]
+		);
+	}
+	// v59 shape with the four per-reader columns: `< 60` copies them into `reader_state`
+	// and drops them.
+	#[tokio::test]
+	async fn v60_copies_reader_columns_into_reader_state() {
+		let db = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.expect("connect");
+		super::init_db(&db).await.expect("init");
+		for sql in [
+			"ALTER TABLE profiles ADD COLUMN feed_read_at INTEGER",
+			"ALTER TABLE profiles ADD COLUMN msg_read_at INTEGER",
+			"ALTER TABLE actions ADD COLUMN comments_read_at INTEGER",
+			"ALTER TABLE actions ADD COLUMN sub_level char(1)",
+			"INSERT INTO profiles (tn_id, id_tag, name, feed_read_at, msg_read_at) \
+			 VALUES (1, 'bob', 'Bob', 100, 200), (1, 'carol', 'Carol', NULL, NULL)",
+			"INSERT INTO actions (tn_id, action_id, type, issuer_tag, comments_read_at, sub_level) \
+			 VALUES (1, 'a1', 'POST', 'bob', 300, 'W'), (1, 'a2', 'POST', 'bob', NULL, NULL)",
+			"UPDATE vars SET value = '59' WHERE key = 'db_version'",
+		] {
+			sqlx::query(sql).execute(&db).await.expect("seed");
+		}
+		super::init_db(&db).await.expect("re-init");
+		let rows: Vec<(String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+			"SELECT kind, ref, read_at, notify FROM reader_state ORDER BY kind, ref",
+		)
+		.fetch_all(&db)
+		.await
+		.expect("rows");
+		assert_eq!(
+			rows,
+			vec![
+				("A:POST".into(), "a1".into(), Some(300), Some("W".into())),
+				("P:MSG".into(), "bob".into(), Some(200), None),
+				("P:POST".into(), "bob".into(), Some(100), None),
+			]
+		);
+		let left: i64 = sqlx::query_scalar(
+			"SELECT (SELECT COUNT(*) FROM pragma_table_info('profiles') \
+			 WHERE name IN ('feed_read_at', 'msg_read_at')) \
+			 + (SELECT COUNT(*) FROM pragma_table_info('actions') \
+			 WHERE name IN ('comments_read_at', 'sub_level'))",
+		)
+		.fetch_one(&db)
+		.await
+		.expect("pragma");
+		assert_eq!(left, 0);
+	}
+
+	// v60 data without inbox rows: `< 61` seeds `A:CONV` from the tenant's own live SUBS and
+	// `P:MSG` per DM peer, with the latest message and the unread count. A row with no read
+	// mark (`dave`) starts read up to its latest message.
+	#[tokio::test]
+	async fn v61_backfills_conversations_and_dm_peers() {
+		type Row = (String, String, Option<String>, Option<i64>, i64);
+		let db = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.expect("connect");
+		super::init_db(&db).await.expect("init");
+		for sql in [
+			"INSERT INTO tenants (tn_id, id_tag) VALUES (1, 'me')",
+			"INSERT INTO actions (tn_id, action_id, type, sub_type, issuer_tag, audience, \
+			 parent_id, subject, status, created_at) VALUES \
+			 (1, 'conv', 'CONV', NULL, 'bob', NULL, NULL, NULL, 'A', 10), \
+			 (1, 'subs', 'SUBS', NULL, 'me', 'bob', NULL, 'conv', 'A', 11), \
+			 (1, 'gm1', 'MSG', NULL, 'bob', NULL, 'conv', NULL, 'A', 20), \
+			 (1, 'gm2', 'MSG', NULL, 'carol', NULL, 'conv', NULL, 'A', 30), \
+			 (1, 'gm3', 'MSG', 'DEL', 'carol', NULL, NULL, 'gm2', 'A', 40), \
+			 (1, 'dm1', 'MSG', NULL, 'dave', 'me', NULL, NULL, 'A', 50), \
+			 (1, 'dm2', 'MSG', NULL, 'me', 'dave', NULL, NULL, 'A', 60), \
+			 (1, 'dm3', 'MSG', NULL, 'erin', 'carol', NULL, NULL, 'A', 70)",
+			// The backfill orders by arrival time: align it with the seeded timeline.
+			"UPDATE actions SET received_at = created_at",
+			"INSERT INTO reader_state (tn_id, kind, ref, read_at) VALUES (1, 'A:CONV', 'conv', 25)",
+			"UPDATE vars SET value = '60' WHERE key = 'db_version'",
+		] {
+			sqlx::query(sql).execute(&db).await.expect("seed");
+		}
+		super::init_db(&db).await.expect("re-init");
+		let rows: Vec<Row> = sqlx::query_as(
+			"SELECT kind, ref, last_id, last_at, unread FROM reader_state ORDER BY kind, ref",
+		)
+		.fetch_all(&db)
+		.await
+		.expect("rows");
+		assert_eq!(
+			rows,
+			vec![
+				("A:CONV".into(), "conv".into(), Some("gm2".into()), Some(30), 1),
+				("P:MSG".into(), "dave".into(), Some("dm2".into()), Some(60), 0),
 			]
 		);
 	}

@@ -218,6 +218,27 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Messages: ignore @all mentions in every conversation (a conversation's own
+	// `ignoreAll` pref adds to this; read by the MSG notification gate)
+	registry.register(
+		SettingDefinition::builder("msg.ignore_all")
+			.description("Ignore @all mentions in conversations")
+			.default(SettingValue::Bool(false))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
+	// Messages: send read receipts (RCPT) when the read marker advances
+	registry.register(
+		SettingDefinition::builder("msg.send_read_receipts")
+			.description("Send read receipts for messages")
+			.default(SettingValue::Bool(true))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.build()?,
+	)?;
+
 	Ok(())
 }
 

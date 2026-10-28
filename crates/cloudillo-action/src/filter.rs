@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use cloudillo_core::abac::{
 	ViewCheckContext, VisibilityLevel, can_view_item, visibility_needs_relation,
 };
-use cloudillo_types::meta_adapter::{ActionView, ListActionOptions};
+use cloudillo_types::meta_adapter::ActionView;
 
 use crate::prelude::*;
 
@@ -67,6 +67,12 @@ pub async fn filter_actions_by_visibility(
 		tenant_id_tag,
 		actions.len()
 	);
+	// Discovery: a listed community group shows to every community member, joined
+	// or not. Read once per batch, and only when the batch holds one.
+	let is_member = actions.iter().any(is_listed_group)
+		&& crate::helpers::community_level(app.meta_adapter.as_ref(), tn_id, subject_id_tag).await
+			> cloudillo_core::roles::FOLLOWER_LEVEL;
+
 	let filtered = actions
 		.into_iter()
 		.filter(|action| {
@@ -80,6 +86,9 @@ pub async fn filter_actions_by_visibility(
 			if let Some(c) = subscriber_container(action)
 				&& subscribers_map.get(c).is_some_and(|subs| subs.contains(subject_id_tag))
 			{
+				audience.push(subject_id_tag);
+			}
+			if is_member && is_listed_group(action) {
 				audience.push(subject_id_tag);
 			}
 
@@ -109,6 +118,16 @@ pub async fn filter_actions_by_visibility(
 		.collect();
 
 	Ok(filtered)
+}
+
+/// A listed community group's CONV row (`x.createdBy` set, `join` = `role` | `request`), which
+/// community members may read unjoined. The CONV keeps its 'S', so its MSG and SUBS
+/// rows are not opened. Shared by the list filter and `perm::load_action_attrs`; the SQL twin is
+/// the discovery arm of the meta adapter's `push_action_visibility_predicate`.
+pub(crate) fn is_listed_group(action: &ActionView) -> bool {
+	&*action.typ == "CONV"
+		&& crate::helpers::conv_created_by(action.x.as_ref()).is_some()
+		&& crate::helpers::conv_listed(action.content.as_ref())
 }
 
 /// Resolve the container id whose subscribers may read a Subscribed ('S') action.
@@ -150,13 +169,7 @@ pub(crate) async fn load_subscribers(
 	let mut subscribers_map: HashMap<String, HashSet<String>> = HashMap::new();
 
 	for action_id in action_ids {
-		let subs_opts = ListActionOptions {
-			typ: Some(vec!["SUBS".into()]),
-			subject: Some(vec![(*action_id).to_string()]),
-			status: Some(vec!["A".into()]),
-			exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
-			..Default::default()
-		};
+		let subs_opts = crate::helpers::active_subs_opts(action_id);
 
 		if let Ok(subs) = app.meta_adapter.list_actions(tn_id, &subs_opts).await {
 			let issuer_tags: HashSet<String> =
@@ -226,7 +239,7 @@ mod tests {
 			stat: None,
 			visibility: Some('S'),
 			flags: None,
-			sub_level: None,
+			reader_state: None,
 			x: None,
 			hat: None,
 			channel: None,

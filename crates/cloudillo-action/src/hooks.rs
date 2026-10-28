@@ -11,6 +11,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::dsl::types::Operation;
+use crate::dsl::DslEngine;
+use crate::helpers;
+use crate::task::CreateAction;
+use cloudillo_types::auth_adapter::ActionToken;
 
 /// Result type for hook functions
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -112,7 +116,7 @@ pub struct HookResult {
 	/// "Abort" skips the rest of `process_after_store` (WS forward, fan-out, delivery) but
 	/// does **not** remove the stored row, which by then rests at 'A'. A hook that must
 	/// *deny* rather than merely stop has to delete the row itself (`fshr::on_create`), or
-	/// the check belongs pre-store (`invt::check_community_authority`).
+	/// the check belongs pre-store (a `before_create`/`before_receive` hook).
 	pub continue_processing: bool,
 
 	/// Optional early return value
@@ -383,9 +387,46 @@ impl HookContextBuilder {
 	}
 }
 
+/// Pre-store gate for a local `POST /api/actions`. Judges the acting user (on a community
+/// tenant the actor differs from the issuer) and may rewrite the action. Err refuses it.
+pub struct BeforeCreate {
+	pub tn_id: TnId,
+	/// The issuer (the tenant).
+	pub tenant_tag: Box<str>,
+	/// The posting user (`auth.id_tag`).
+	pub actor: Box<str>,
+	pub actor_roles: Box<[Box<str>]>,
+	/// Base type and subtype, as `post_action` split them.
+	pub typ: String,
+	pub sub_typ: Option<String>,
+	pub action: CreateAction,
+}
+
+pub type BeforeCreateFn =
+	Arc<dyn Fn(App, BeforeCreate) -> BoxFuture<'static, ClResult<CreateAction>> + Send + Sync>;
+
+/// Pre-store gate for an inbound token. Ephemeral types have no later stage, so this is also
+/// their only hook.
+pub struct BeforeReceive {
+	pub tn_id: TnId,
+	/// The raw JWT (the typing relay re-posts it).
+	pub token: Box<str>,
+	pub action: ActionToken,
+	pub pre_approved: bool,
+	/// Admitted as a hat relay.
+	pub relayed: bool,
+	/// `(type, issuer)` of the primary it was bundled with.
+	pub primary: Option<(Box<str>, Box<str>)>,
+}
+
+pub type BeforeReceiveFn =
+	Arc<dyn Fn(App, BeforeReceive) -> BoxFuture<'static, ClResult<()>> + Send + Sync>;
+
 /// All hooks for a specific action type
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ActionTypeHooks {
+	pub before_create: Option<BeforeCreateFn>,
+	pub before_receive: Option<BeforeReceiveFn>,
 	pub on_create: Option<HookFunction>,
 	pub on_receive: Option<HookFunction>,
 	pub on_accept: Option<HookFunction>,
@@ -395,6 +436,8 @@ pub struct ActionTypeHooks {
 impl std::fmt::Debug for ActionTypeHooks {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("ActionTypeHooks")
+			.field("before_create", &self.before_create.as_ref().map(|_| ".."))
+			.field("before_receive", &self.before_receive.as_ref().map(|_| ".."))
 			.field("on_create", &self.on_create.as_ref().map(|_| ".."))
 			.field("on_receive", &self.on_receive.as_ref().map(|_| ".."))
 			.field("on_accept", &self.on_accept.as_ref().map(|_| ".."))
@@ -422,12 +465,7 @@ impl HookRegistry {
 
 	/// Register a single hook for an action type
 	pub fn register_hook(&mut self, type_name: &str, hook_type: HookType, function: HookFunction) {
-		let entry = self.hooks.entry(type_name.to_string()).or_insert_with(|| ActionTypeHooks {
-			on_create: None,
-			on_receive: None,
-			on_accept: None,
-			on_reject: None,
-		});
+		let entry = self.hooks.entry(type_name.to_string()).or_default();
 
 		match hook_type {
 			HookType::OnCreate => entry.on_create = Some(function),
@@ -455,6 +493,35 @@ impl HookRegistry {
 	/// Get all registered action types
 	pub fn registered_types(&self) -> Vec<&str> {
 		self.hooks.keys().map(String::as_str).collect()
+	}
+}
+
+/// The registry key `post_store::execute_hook` dispatches on, and the hooks under it.
+async fn registered(app: &App, typ: &str, sub: Option<&str>) -> ClResult<Option<ActionTypeHooks>> {
+	let Some(key) = app.ext::<Arc<DslEngine>>()?.resolve_action_type(typ, sub) else {
+		return Ok(None);
+	};
+	let registry = app.ext::<Arc<tokio::sync::RwLock<HookRegistry>>>()?;
+	Ok(registry.read().await.hooks.get(&key).cloned())
+}
+
+/// Run the type's `before_create` hook; no hook passes the action through.
+pub async fn run_before_create(app: &App, ctx: BeforeCreate) -> ClResult<CreateAction> {
+	match registered(app, &ctx.typ, ctx.sub_typ.as_deref())
+		.await?
+		.and_then(|h| h.before_create)
+	{
+		Some(hook) => hook(app.clone(), ctx).await,
+		None => Ok(ctx.action),
+	}
+}
+
+/// Run the type's `before_receive` hook; no hook passes the token through.
+pub async fn run_before_receive(app: &App, ctx: BeforeReceive) -> ClResult<()> {
+	let (typ, sub) = helpers::extract_type_and_subtype(&ctx.action.t);
+	match registered(app, &typ, sub.as_deref()).await?.and_then(|h| h.before_receive) {
+		Some(hook) => hook(app.clone(), ctx).await,
+		None => Ok(()),
 	}
 }
 

@@ -132,10 +132,14 @@ pub(crate) async fn list(
 	tn_id: TnId,
 	opts: &ListProfileOptions,
 ) -> ClResult<Vec<Profile<Box<str>>>> {
-	let mut query = sqlx::QueryBuilder::new(
-		"SELECT id_tag, name, type, profile_pic, status, synced_at, following, follower, connected, roles, trust, feed_read_at, msg_read_at, hidden_in_home, hat_roles, peer_hat_roles, hats
-		 FROM profiles WHERE type IS NOT NULL AND tn_id=",
-	);
+	let mut query = sqlx::QueryBuilder::new(concat!(
+		"SELECT id_tag, name, type, profile_pic, status, synced_at, following, follower, connected, roles, trust, hidden_in_home, hat_roles, peer_hat_roles, hats, ",
+		crate::reader_state::rs_cols!("rm"),
+		", ",
+		crate::reader_state::rs_cols!("rp"),
+		" FROM profiles LEFT JOIN reader_state rm ON rm.tn_id=profiles.tn_id AND rm.kind='P:MSG' AND rm.ref=profiles.id_tag LEFT JOIN reader_state rp ON rp.tn_id=profiles.tn_id AND rp.kind='P:POST' AND rp.ref=profiles.id_tag",
+		" WHERE type IS NOT NULL AND profiles.tn_id=",
+	));
 	query.push_bind(tn_id.0);
 
 	if let Some(typ) = opts.typ {
@@ -273,8 +277,8 @@ pub(crate) async fn list(
 				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
 			}),
 			trust: parse_trust(row)?,
-			feed_read_at: row.try_get::<Option<i64>, _>("feed_read_at")?.map(Timestamp),
-			msg_read_at: row.try_get::<Option<i64>, _>("msg_read_at")?.map(Timestamp),
+			msg_state: crate::reader_state::parse_row(row, "rm")?,
+			feed_state: crate::reader_state::parse_row(row, "rp")?,
 			hidden_in_home: row.try_get::<Option<i64>, _>("hidden_in_home")?.map(|v| v != 0),
 			hat_roles: row.try_get("hat_roles")?,
 			peer_hat_roles: row.try_get("peer_hat_roles")?,
@@ -342,8 +346,14 @@ pub(crate) async fn read(
 ) -> ClResult<(Box<str>, Profile<Box<str>>)> {
 	let id_tag = normalize_id_tag(id_tag);
 	let res = sqlx::query(
-		"SELECT id_tag, type, name, profile_pic, status, synced_at, perm, following, follower, connected, roles, trust, feed_read_at, msg_read_at, hidden_in_home, hat_roles, peer_hat_roles, hats, etag
-		FROM profiles WHERE tn_id=? AND id_tag=?",
+		concat!(
+			"SELECT id_tag, type, name, profile_pic, status, synced_at, perm, following, follower, connected, roles, trust, hidden_in_home, hat_roles, peer_hat_roles, hats, etag, ",
+			crate::reader_state::rs_cols!("rm"),
+			", ",
+			crate::reader_state::rs_cols!("rp"),
+			" FROM profiles LEFT JOIN reader_state rm ON rm.tn_id=profiles.tn_id AND rm.kind='P:MSG' AND rm.ref=profiles.id_tag LEFT JOIN reader_state rp ON rp.tn_id=profiles.tn_id AND rp.kind='P:POST' AND rp.ref=profiles.id_tag",
+			" WHERE profiles.tn_id=? AND profiles.id_tag=?",
+		),
 	)
 	.bind(tn_id.0)
 	.bind(id_tag.as_ref())
@@ -373,8 +383,8 @@ pub(crate) async fn read(
 				s.split(',').map(|r| Box::from(r.trim())).collect::<Vec<_>>().into_boxed_slice()
 			}),
 			trust: parse_trust(&row)?,
-			feed_read_at: row.try_get::<Option<i64>, _>("feed_read_at")?.map(Timestamp),
-			msg_read_at: row.try_get::<Option<i64>, _>("msg_read_at")?.map(Timestamp),
+			msg_state: crate::reader_state::parse_row(&row, "rm")?,
+			feed_state: crate::reader_state::parse_row(&row, "rp")?,
 			hidden_in_home: row.try_get::<Option<i64>, _>("hidden_in_home")?.map(|v| v != 0),
 			hat_roles: row.try_get("hat_roles")?,
 			peer_hat_roles: row.try_get("peer_hat_roles")?,

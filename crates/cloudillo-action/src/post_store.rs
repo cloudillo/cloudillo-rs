@@ -342,6 +342,14 @@ pub(crate) async fn forward_to_websocket(
 		"WS forward preparing"
 	);
 
+	if !ctx.is_outbound()
+		&& let Ok(us) = app.auth_adapter.read_id_tag(tn_id).await
+		&& crate::helpers::rcpt_hidden(app, tn_id, &action.typ, &action.issuer_tag, &us).await
+	{
+		debug!(action_id = %action.action_id, "WS forward: RCPT hidden by reciprocity");
+		return;
+	}
+
 	// Fetch the full ActionView so WS messages match the API response format
 	let mut action_view =
 		app.meta_adapter.get_action(tn_id, &action.action_id).await.ok().flatten();
@@ -359,7 +367,28 @@ pub(crate) async fn forward_to_websocket(
 		if ctx.is_outbound() {
 			forward::forward_action_view(app, tn_id, view, ctx.temp_id()).await
 		} else {
-			forward::forward_inbound_action_view(app, tn_id, view, ctx.temp_id()).await
+			let notify = if action.typ.as_ref() == "MSG"
+				&& !matches!(action.sub_typ.as_deref(), Some("DEL" | "UPD"))
+			{
+				Some(
+					match crate::process::msg_notify_gate(
+						app,
+						tn_id,
+						&action.issuer_tag,
+						action.parent_id.as_deref(),
+						view.content.as_ref(),
+					)
+					.await
+					{
+						crate::process::MsgNotify::Suppress => "none",
+						crate::process::MsgNotify::Mention => "mention",
+						crate::process::MsgNotify::Message => "message",
+					},
+				)
+			} else {
+				None
+			};
+			forward::forward_inbound_action_view(app, tn_id, view, ctx.temp_id(), notify).await
 		}
 	} else {
 		warn!(
@@ -391,7 +420,24 @@ pub(crate) async fn forward_to_websocket(
 			audience = ?action.audience_tag,
 			"User offline - may need push notification"
 		);
-		// TODO: Send push notification for inbound actions when user is offline
+		let content = action_view.as_ref().and_then(|v| v.content.as_ref());
+
+		// Push for stored inbound MSG, behind the conversation mute/mention gate
+		// (`process::msg_notify_gate`, applied inside the helper).
+		// TODO: push for the other stored inbound types `should_push_notify` admits
+		if action.typ.as_ref() == "MSG" {
+			crate::process::send_push_notification(
+				app,
+				tn_id,
+				&action.action_id,
+				&action.typ,
+				action.sub_typ.as_deref(),
+				&action.issuer_tag,
+				action.parent_id.as_deref(),
+				content,
+			)
+			.await;
+		}
 
 		// Offline email only fires for *persisted inbound* actions (the
 		// `ctx.is_inbound()` guard). The recipient is always this node's own
@@ -411,7 +457,6 @@ pub(crate) async fn forward_to_websocket(
 		// rate-limits repeats. Best-effort: errors are logged inside the helper.
 		// The helper reads this node's tenant to derive the recipient and skips
 		// self-authored actions (recipient == issuer).
-		let content = action_view.as_ref().and_then(|v| v.content.as_ref());
 		crate::process::deliver_notification_email(
 			app,
 			tn_id,
@@ -419,6 +464,7 @@ pub(crate) async fn forward_to_websocket(
 			&action.typ,
 			action.sub_typ.as_deref(),
 			&action.issuer_tag,
+			action.parent_id.as_deref(),
 			content,
 		)
 		.await;

@@ -9,7 +9,7 @@ use axum::http::Method;
 use serde_json::json;
 
 use cloudillo::auth_adapter::ActionToken;
-use cloudillo::meta_adapter::{ListActionOptions, ProfileStatus, ProfileType};
+use cloudillo::meta_adapter::{ListActionOptions, PatchReaderState, ProfileStatus, ProfileType};
 use cloudillo::settings::SettingValue;
 use cloudillo::types::{Patch, Timestamp, TnId};
 
@@ -388,6 +388,12 @@ async fn inbound_branches() {
 	t.iat = Timestamp::from_now(-1200);
 	t.exp = Some(Timestamp::from_now(-600));
 	check(&mut rep, "IB-21", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+	// A far-future `iat` (`MAX_IAT_SKEW_SECS`): stored as `created_at`, it would win every
+	// `x_if_newer` ordering (SUBS:ROLE, CONV:UPD) from then on.
+	let r = issuer(fx, ALICE, Relation::Connected, "", "ib-future-iat").await;
+	let mut t = post(&r);
+	t.iat = Timestamp::from_now(3600);
+	check(&mut rep, "IB-163", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
 	let r = issuer(fx, ALICE, Relation::Blocked, "", "ib-blocked").await;
 	check(&mut rep, "IB-23", &r, Deny, deliver(fx, ALICE, &sign(&r, &post(&r))).await);
 
@@ -585,8 +591,8 @@ async fn inbound_authority_and_effects() {
 		check(&mut rep, id, &deleter, Deny, if intact { Deny } else { Allow });
 	}
 
-	// An observer's SUBS:UPD never raises its own subscription role. (Today the update drops
-	// the subscription outright: the hook judges the row that superseded it.)
+	// An observer's SUBS:UPD never raises its own subscription role, and never touches the
+	// membership row (SUBS:UPD keys apart): it stays an active plain SUBS at `observer`.
 	let obs = issuer(fx, ALICE, Relation::Connected, "", "ia-observer").await;
 	seed_subs(conv.into(), obs.id_tag.clone(), Some("observer")).await;
 	let mut t = claims(&obs, "SUBS:UPD");
@@ -594,14 +600,24 @@ async fn inbound_authority_and_effects() {
 	t.sub = Some(conv.into());
 	deliver(fx, ALICE, &sign(&obs, &t)).await;
 	let key = format!("SUBS:{conv}:{}", obs.id_tag);
-	// Promoted = a live row whose role is no longer `observer` (no `x.role` reads as member).
-	let promoted = meta.get_action_by_key(alice, &key).await.unwrap().is_some_and(|r| {
-		r.x.as_ref().and_then(|x| x.get("role")).and_then(|r| r.as_str()) != Some("observer")
-	});
-	check(&mut rep, "IB-42", &obs, Deny, if promoted { Allow } else { Deny });
+	// Intact = a live `A` row, no sub_typ, role still `observer` (no `x.role` reads as member).
+	let intact = match meta.get_action_by_key(alice, &key).await.unwrap() {
+		Some(r) => meta.get_action(alice, &r.action_id).await.unwrap().is_some_and(|v| {
+			v.status.as_deref() == Some("A")
+				&& v.sub_typ.is_none()
+				&& v.x.as_ref().and_then(|x| x.get("role")).and_then(|r| r.as_str())
+					== Some("observer")
+		}),
+		None => false,
+	};
+	check(&mut rep, "IB-42", &obs, Deny, if intact { Deny } else { Allow });
 
-	// Suspended and Banned issuers are refused like a Blocked one (IB-23).
-	for (id, status) in [("IB-44", ProfileStatus::Suspended), ("IB-45", ProfileStatus::Banned)] {
+	// A Banned issuer is refused like a Blocked one (IB-23). Suspended is the automatic
+	// "unreachable" state: a verified action reactivates the issuer and is admitted.
+	for (id, status, expect) in [
+		("IB-44", ProfileStatus::Suspended, Allow),
+		("IB-45", ProfileStatus::Banned, Deny),
+	] {
 		let r =
 			issuer(fx, ALICE, Relation::Connected, "", &format!("ia-{}", id.to_lowercase())).await;
 		let f = cloudillo::meta_adapter::UpsertProfileFields {
@@ -611,7 +627,10 @@ async fn inbound_authority_and_effects() {
 		meta.upsert_profile(alice, &r.id_tag, &f).await.unwrap();
 		let mut t = claims(&r, "POST");
 		t.c = text();
-		check(&mut rep, id, &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+		check(&mut rep, id, &r, expect, deliver(fx, ALICE, &sign(&r, &t)).await);
+		let (_, p) = meta.read_profile(alice, &r.id_tag).await.unwrap();
+		let want = if status == ProfileStatus::Suspended { ProfileStatus::Active } else { status };
+		assert_eq!(p.status, Some(want), "{id}: issuer status after delivery");
 	}
 
 	// We are the hat: a relay needs an audience, and an unrestricted member.
@@ -622,7 +641,7 @@ async fn inbound_authority_and_effects() {
 	check(&mut rep, "IB-46", &member, Deny, deliver(fx, CLUB, &sign(&member, &t)).await);
 	let restricted = issuer(fx, CLUB, Relation::Member, "contributor", "ia-hat-restricted").await;
 	let f = cloudillo::meta_adapter::UpsertProfileFields {
-		status: Patch::Value(ProfileStatus::Suspended),
+		status: Patch::Value(ProfileStatus::Banned),
 		..Default::default()
 	};
 	meta.upsert_profile(club, &restricted.id_tag, &f).await.unwrap();
@@ -717,6 +736,20 @@ async fn inbound_authority_and_effects() {
 		t.sub = Some(target.into());
 		check(&mut rep, id, who, Allow, settled(alice, sign(who, &t)).await);
 	}
+
+	// A member demoted to observer cannot shed the demotion by re-joining with a plain SUBS.
+	let demoted = issuer(fx, ALICE, Relation::Connected, "", "ia-subs-demoted").await;
+	seed_subs(open.into(), demoted.id_tag.clone(), Some("observer")).await;
+	let mut t = claims(&demoted, "SUBS");
+	t.aud = Some(ALICE.into());
+	t.sub = Some(open.into());
+	deliver(fx, ALICE, &sign(&demoted, &t)).await;
+	let key = format!("SUBS:{open}:{}", demoted.id_tag);
+	// Reset = a live row whose role is no longer `observer` (no `x.role` reads as member).
+	let reset = meta.get_action_by_key(alice, &key).await.unwrap().is_some_and(|r| {
+		r.x.as_ref().and_then(|x| x.get("role")).and_then(|r| r.as_str()) != Some("observer")
+	});
+	check(&mut rep, "IB-149", &demoted, Deny, if reset { Allow } else { Deny });
 
 	// Deletions are never flag-gated: a CMNT:DEL under a parent with comments switched off.
 	let flagged = "a1~zqm-ia-flagged";
@@ -1135,8 +1168,8 @@ async fn inbound_edges() {
 	}
 
 	// SUBS:UPD on a pending (`C`) row never activates it (`subs.rs`: only an `A` row updates).
-	// As IB-42 records, the UPD supersedes the row by key before the hook refuses it, so the
-	// pending row is dropped rather than kept: what must not happen is an `A` under the key.
+	// The UPD keys apart (IB-42), so the pending row is untouched: what must not happen is an
+	// `A` under the membership key.
 	let container = obj_id(fx, ALICE, "container-p-tenant-active");
 	let r = issuer(fx, ALICE, Relation::Connected, "", "ie-upd-pending").await;
 	let pending = "a1~zqm-ie-subs-pending";
@@ -1247,6 +1280,49 @@ async fn inbound_edges() {
 	t.sub = Some(held_conv.into());
 	t.c = Some(json!({}));
 	check(&mut rep, "IB-81", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
+	// A DM PRES (subject not a CONV) addressed to us: a stranger's is refused, a connection's
+	// admitted.
+	for (id, rel, want) in
+		[("IB-159", Relation::None, Deny), ("IB-160", Relation::Connected, Allow)]
+	{
+		let r = issuer(fx, ALICE, rel, "", &format!("ie-pres-dm-{}", id.to_lowercase())).await;
+		let mut t = claims(&r, "PRES");
+		t.aud = Some(ALICE.into());
+		t.sub = Some(ALICE.into());
+		t.c = Some(json!({}));
+		check(&mut rep, id, &r, want, deliver(fx, ALICE, &sign(&r, &t)).await);
+	}
+	// The CONV owner's relay of a member's group PRES: parented to the CONV we hold, it is
+	// admitted as a child of it, like a group MSG — once the roster backfill has told us the
+	// issuer is a member.
+	let r = issuer(fx, ALICE, Relation::Connected, "", "ie-pres-relay").await;
+	let mut t = claims(&r, "PRES:TYPING");
+	t.aud = Some("zqm-ie-pres-host.test".into());
+	t.sub = Some(held_conv.into());
+	t.p = Some(held_conv.into());
+	t.c = Some(json!({}));
+	let tok = sign(&r, &t);
+	check(&mut rep, "IB-117", &r, Deny, deliver(fx, ALICE, &tok).await);
+	let mut s = row("a1~zqm-ie-pres-subs", "SUBS", &r.id_tag);
+	s.audience_tag = Some("zqm-ie-pres-host.test");
+	s.subject = Some(held_conv);
+	let key = format!("SUBS:{held_conv}:{}", r.id_tag);
+	seed_row(fx, alice, &s, Some(&key)).await;
+	check(&mut rep, "IB-112", &r, Allow, deliver(fx, ALICE, &tok).await);
+	// The same relay without `p`: a member's hint addressed to someone else, refused as a
+	// foreign audience (`refuse_foreign_audience`). A fresh member, so the throttle that
+	// IB-112 stamped cannot be what refuses it.
+	let r = issuer(fx, ALICE, Relation::Connected, "", "ie-pres-relay-nop").await;
+	let mut s = row("a1~zqm-ie-pres-subs-nop", "SUBS", &r.id_tag);
+	s.audience_tag = Some("zqm-ie-pres-host.test");
+	s.subject = Some(held_conv);
+	let key = format!("SUBS:{held_conv}:{}", r.id_tag);
+	seed_row(fx, alice, &s, Some(&key)).await;
+	let mut t = claims(&r, "PRES:TYPING");
+	t.aud = Some("zqm-ie-pres-host.test".into());
+	t.sub = Some(held_conv.into());
+	t.c = Some(json!({}));
+	check(&mut rep, "IB-162", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
 
 	// A reply in a closed room from a moderator off its roster (`room_of_inbound`).
 	let r = issuer(fx, CLUB, Relation::Member, "moderator", "ie-cw-reply").await;
@@ -1506,6 +1582,891 @@ async fn badge_sync() {
 	assert_eq!(pending("zqm-bs-resync-club.test").await, 0, "a community tenant enqueues none");
 	schedule_badge_resync(&fx.app, alice, "zqm-bs-resync-alice.test").await;
 	assert_eq!(pending("zqm-bs-resync-alice.test").await, 1, "a person tenant does (control)");
+}
+
+/// A pre-approved (APRV-bundled) MSG:UPD / MSG:DEL / PIN skips the author/moderator check, so
+/// the vouch must come from the owner of the target message's CONV (`msg::check_target_room`):
+/// an APRV by the owner of another CONV, or one naming that CONV as `p`, admits nothing. A DM
+/// message is never edited or pinned through a vouch. Control: the room owner's own vouch.
+#[tokio::test]
+async fn preapproved_edit_needs_room_owner() {
+	use Actual::{Allow, Deny};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let mut rep = Report::new("preapproved-edit");
+	let evil = issuer(fx, ALICE, Relation::Connected, "", "pe-evil").await;
+	let owner = issuer(fx, ALICE, Relation::Connected, "", "pe-owner").await;
+	let author = issuer(fx, ALICE, Relation::Connected, "", "pe-author").await;
+	let (conv_a, conv_b) = ("a1~zqm-pe-conv-a", "a1~zqm-pe-conv-b");
+	seed_row(fx, alice, &row(conv_a, "CONV", &evil.id_tag), None).await;
+	seed_row(fx, alice, &row(conv_b, "CONV", &owner.id_tag), None).await;
+	let msg = |id: &'static str, parent: Option<&'static str>| {
+		let mut m = row(id, "MSG", &author.id_tag);
+		m.parent_id = parent;
+		m.root_id = parent;
+		m.audience_tag = parent.is_none().then_some(ALICE);
+		m
+	};
+	let (in_b, dm) = ("a1~zqm-pe-msg-b", "a1~zqm-pe-dm");
+	seed_row(fx, alice, &msg(in_b, Some(conv_b)), None).await;
+	seed_row(fx, alice, &msg(dm, None), None).await;
+	// `signer` bundles `actor`'s `t` on `subject` under an APRV with `p = room`.
+	let vouched =
+		async |signer: &RemoteId, actor: &RemoteId, t: &str, subject: &str, room: Option<&str>| {
+			let mut x = claims(actor, t);
+			x.sub = Some(subject.into());
+			x.aud = Some(signer.id_tag.as_str().into());
+			x.p = room.map(Into::into);
+			if t.starts_with("MSG") {
+				x.c = Some(json!("zqm"));
+			}
+			let x = sign(actor, &x);
+			let mut a = claims(signer, "APRV");
+			a.aud = Some(ALICE.into());
+			a.p = room.map(Into::into);
+			a.sub = Some(action_hash(&x).into());
+			let a = sign(signer, &a);
+			meta.create_inbound_action(alice, &action_hash(&x), &x, Some(&action_hash(&a)))
+				.await
+				.unwrap();
+			deliver(fx, ALICE, &a).await;
+			admitted(fx, alice, &action_hash(&x)).await
+		};
+	let deleted = async |id: &str| {
+		let x = meta.get_action(alice, id).await.unwrap().and_then(|a| a.x);
+		if x.is_some_and(|x| x.get("deletedBy").is_some()) { Allow } else { Deny }
+	};
+
+	// CONV A's owner vouches its own MSG:DEL of a message in CONV B, with and without `p = A`.
+	let got = vouched(&evil, &evil, "MSG:DEL", in_b, Some(conv_a)).await;
+	check(&mut rep, "IB-90", &evil, Deny, got);
+	let got = vouched(&evil, &evil, "MSG:DEL", in_b, None).await;
+	check(&mut rep, "IB-91", &evil, Deny, got);
+	check(&mut rep, "IB-92", &evil, Deny, deleted(in_b).await);
+	let got = vouched(&evil, &evil, "MSG:UPD", in_b, None).await;
+	check(&mut rep, "IB-93", &evil, Deny, got);
+	let got = vouched(&evil, &evil, "PIN", in_b, Some(conv_a)).await;
+	check(&mut rep, "IB-94", &evil, Deny, got);
+	let got = vouched(&evil, &evil, "PIN", in_b, Some(conv_b)).await;
+	check(&mut rep, "IB-95", &evil, Deny, got);
+	// The right owner naming the wrong room is refused too.
+	let got = vouched(&owner, &evil, "PIN:DEL", in_b, Some(conv_a)).await;
+	check(&mut rep, "IB-96", &owner, Deny, got);
+	// A DM message: no vouch reaches it, not even the author's own peer.
+	let got = vouched(&author, &author, "MSG:DEL", dm, None).await;
+	check(&mut rep, "IB-97", &author, Deny, got);
+	// Control: CONV B's owner vouches a member's pin of a message in it.
+	let got = vouched(&owner, &evil, "PIN", in_b, Some(conv_b)).await;
+	check(&mut rep, "IB-98", &owner, Allow, got);
+	rep.finish();
+}
+
+/// DM pins are shared by the two participants (`pin::check_authority`): the peer may unpin the
+/// tenant's pin, a third party may not pin, and a forged peer signature is refused. A group pin
+/// without its CONV as `p` is refused (the token cannot be rewritten).
+#[tokio::test]
+async fn pin_inbound_authority() {
+	use Actual::{Allow, Deny};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let mut rep = Report::new("pin-inbound");
+	let peer = issuer(fx, ALICE, Relation::Connected, "", "pi-peer").await;
+	let other = issuer(fx, ALICE, Relation::Connected, "", "pi-other").await;
+	let dm = "a1~zqm-pi-dm";
+	let mut m = row(dm, "MSG", &peer.id_tag);
+	m.audience_tag = Some(ALICE);
+	seed_row(fx, alice, &m, None).await;
+	let pin = |by: &RemoteId, t: &str, subject: &str, p: Option<&str>| {
+		let mut x = claims(by, t);
+		x.aud = Some(ALICE.into());
+		x.sub = Some(subject.into());
+		x.p = p.map(Into::into);
+		x
+	};
+	check(
+		&mut rep,
+		"IB-99",
+		&other,
+		Deny,
+		deliver(fx, ALICE, &sign(&other, &pin(&other, "PIN", dm, None))).await,
+	);
+	let tok = sign(&other, &pin(&other, "MSG:DEL", dm, None));
+	check(&mut rep, "IB-100", &other, Deny, deliver(fx, ALICE, &tok).await);
+	let tok = sign(&peer, &pin(&peer, "PIN:DEL", dm, None));
+	check(&mut rep, "IB-102", &peer, Allow, deliver(fx, ALICE, &tok).await);
+	// A group message of alice's CONV, pinned by its creator without `p`.
+	let conv = obj_id(fx, ALICE, "container-p-tenant-active");
+	let in_conv = obj_id(fx, ALICE, "child-p-remote-active");
+	let mut c = row("a1~zqm-pi-conv", "CONV", &peer.id_tag);
+	c.audience_tag = Some(ALICE);
+	seed_row(fx, alice, &c, None).await;
+	let mut g = row("a1~zqm-pi-gmsg", "MSG", &other.id_tag);
+	g.parent_id = Some("a1~zqm-pi-conv");
+	g.root_id = Some("a1~zqm-pi-conv");
+	seed_row(fx, alice, &g, None).await;
+	let tok = sign(&peer, &pin(&peer, "PIN", "a1~zqm-pi-gmsg", None));
+	check(&mut rep, "IB-103", &peer, Deny, deliver(fx, ALICE, &tok).await);
+	let tok = sign(&peer, &pin(&peer, "PIN", "a1~zqm-pi-gmsg", Some("a1~zqm-pi-conv")));
+	check(&mut rep, "IB-104", &peer, Allow, deliver(fx, ALICE, &tok).await);
+	// Nor can a third party pin in alice's own CONV (no role there).
+	let tok = sign(&other, &pin(&other, "PIN", &in_conv, Some(&conv)));
+	check(&mut rep, "IB-105", &other, Deny, deliver(fx, ALICE, &tok).await);
+	// `peer`'s claims under `other`'s key. Last: a failed verification blocks `peer`'s key fetch.
+	let forged = sign(&other, &pin(&peer, "PIN:DEL", dm, None));
+	check(&mut rep, "IB-101", &peer, Deny, deliver(fx, ALICE, &forged).await);
+	rep.finish();
+}
+
+/// The pin cap (`pin::retire_oldest`, run on the CONV owner when a member's pin arrives) drops a
+/// pin whose MSG was deleted: a `PIN:DEL` of it would be refused (`check_authority` cannot load
+/// the message), so it would never retire. Inbound, because the fixture never runs the creator
+/// task that would run a local pin's `on_create`. 11 pins are seeded: the arriving pin is still
+/// `V` while `on_receive` runs, so the cap does not count it.
+#[tokio::test]
+async fn pin_cap_drops_pin_of_deleted_msg() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let (alice, meta) = (fx.tenants.alice.tn_id, &fx.app.meta_adapter);
+	let moder = issuer(fx, ALICE, Relation::Connected, "", "pc-moder").await;
+	let conv = "a1~zqm-pc-conv";
+	seed_row(fx, alice, &row(conv, "CONV", ALICE), None).await;
+	let subs = cloudillo::meta_adapter::Action {
+		subject: Some(conv),
+		audience_tag: Some(ALICE),
+		x: Some(json!({ "role": "moderator" })),
+		..row("a1~zqm-pc-subs", "SUBS", &moder.id_tag)
+	};
+	seed_row(fx, alice, &subs, Some(&format!("SUBS:{conv}:{}", moder.id_tag))).await;
+	let ids: Vec<(String, String)> = (0..=11)
+		.map(|i| (format!("a1~zqm-pc-msg-{i}"), format!("a1~zqm-pc-pin-{i}")))
+		.collect();
+	let t0 = Timestamp::now().0 - 100;
+	for (i, (msg, pin)) in ids.iter().enumerate() {
+		let mut m = row(msg, "MSG", "zqm-pc-poster.test");
+		m.parent_id = Some(conv);
+		m.root_id = Some(conv);
+		seed_row(fx, alice, &m, None).await;
+		if i < 11 {
+			let mut p = row(pin, "PIN", ALICE);
+			p.subject = Some(msg);
+			p.parent_id = Some(conv);
+			p.created_at = Timestamp(t0 + i64::try_from(i).unwrap_or(0));
+			seed_row(fx, alice, &p, Some(&format!("PIN:{msg}"))).await;
+		}
+	}
+	let (stale_msg, stale_pin) = &ids[0];
+	meta.delete_action(alice, stale_msg).await.unwrap();
+
+	let mut t = claims(&moder, "PIN");
+	t.aud = Some(ALICE.into());
+	t.sub = Some(ids[11].0.as_str().into());
+	t.p = Some(conv.into());
+	assert_eq!(deliver(fx, ALICE, &sign(&moder, &t)).await, Actual::Allow, "12th pin");
+	// `status_of` settles on any non-`P` status, and the stale pin starts at `A`.
+	let mut dropped = false;
+	for _ in 0..30 {
+		dropped = meta.get_action(alice, stale_pin).await.unwrap().is_none();
+		if dropped {
+			break;
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+	assert!(dropped, "stale pin kept");
+	assert_eq!(status_of(fx, alice, stale_pin).await.as_deref(), Some("D"));
+	for (_, pin) in &ids[1..11] {
+		assert!(meta.get_action(alice, pin).await.unwrap().is_some(), "{pin} retired");
+	}
+}
+
+/// Inbound membership on a community group (`subs::conv_join_status`): a follower and a stranger
+/// never join a `role` group, nor a member a private one. A non-member's `PRES:TYPING` is
+/// refused, and an RCPT signed by one member under another's name is refused.
+#[tokio::test]
+async fn group_conv_inbound_membership() {
+	use Actual::{Allow, Deny};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+	let mut rep = Report::new("group-conv-inbound");
+	let not_active = |s: Option<String>| if s.as_deref() == Some("A") { Allow } else { Deny };
+	let group = |id: &'static str, join: &'static str| cloudillo::meta_adapter::Action {
+		content: Some(join),
+		visibility: Some('S'),
+		x: Some(json!({ "createdBy": "m-leader.test" })),
+		..row(id, "CONV", CLUB)
+	};
+	let (open, private) = ("a1~zqm-gi-open", "a1~zqm-gi-private");
+	seed_row(fx, club, &group(open, r#"{"name":"zqm","join":"role"}"#), None).await;
+	seed_row(fx, club, &group(private, r#"{"name":"zqm","join":"private"}"#), None).await;
+	let join = |r: &RemoteId, conv: &str| {
+		let mut t = claims(r, "SUBS");
+		t.aud = Some(CLUB.into());
+		t.sub = Some(conv.into());
+		sign(r, &t)
+	};
+	let follower = issuer(fx, CLUB, Relation::Follower, "", "gi-follower").await;
+	let stranger = issuer(fx, CLUB, Relation::None, "", "gi-stranger").await;
+	let member = issuer(fx, CLUB, Relation::Member, "contributor", "gi-member").await;
+	let other = issuer(fx, CLUB, Relation::Member, "contributor", "gi-other").await;
+	for (id, who, conv, want) in [
+		("IB-106", &follower, open, Deny),
+		("IB-107", &stranger, open, Deny),
+		("IB-108", &member, private, Deny),
+		// Control: a contributor joins the `role` group.
+		("IB-109", &member, open, Allow),
+	] {
+		let tok = join(who, conv);
+		deliver(fx, CLUB, &tok).await;
+		check(&mut rep, id, who, want, not_active(status_of(fx, club, &action_hash(&tok)).await));
+	}
+
+	// An invitation admits a member to the private group; a revoked one does not. The INVT:DEL
+	// takes over the invite's key and rests at 'A', so it must not read as an invitation.
+	let revoked = issuer(fx, CLUB, Relation::Member, "contributor", "gi-invt-revoked").await;
+	let invited = issuer(fx, CLUB, Relation::Member, "contributor", "gi-invt-live").await;
+	for (id, who, revoke, want) in
+		[("IB-157", &revoked, true, Deny), ("IB-158", &invited, false, Allow)]
+	{
+		let key = format!("INVT:{private}:{}", who.id_tag);
+		let invt_id = format!("a1~zqm-gi-invt-{}", id.to_lowercase());
+		let mut i = row(&invt_id, "INVT", CLUB);
+		i.audience_tag = Some(&who.id_tag);
+		i.subject = Some(private);
+		seed_row(fx, club, &i, Some(&key)).await;
+		if revoke {
+			let del_id = format!("{invt_id}-del");
+			let mut d = row(&del_id, "INVT", CLUB);
+			d.sub_typ = Some("DEL");
+			d.audience_tag = Some(&who.id_tag);
+			d.subject = Some(private);
+			seed_row(fx, club, &d, Some(&key)).await;
+		}
+		let tok = join(who, private);
+		deliver(fx, CLUB, &tok).await;
+		check(&mut rep, id, who, want, not_active(status_of(fx, club, &action_hash(&tok)).await));
+	}
+
+	// Edits of `member`'s group message by `other`, a joined contributor but not its author:
+	// refused sent to the host directly, and as a hat relay through the host (`h` = the club,
+	// `aud` = another community), which skips the permission gates.
+	deliver(fx, CLUB, &join(&other, open)).await;
+	let in_open = "a1~zqm-gi-msg";
+	let mut m = row(in_open, "MSG", &member.id_tag);
+	m.parent_id = Some(open);
+	m.root_id = Some(open);
+	seed_row(fx, club, &m, None).await;
+	let edit = |t: &str, aud: &str, hat: bool| {
+		let mut x = claims(&other, t);
+		x.aud = Some(aud.into());
+		x.sub = Some(in_open.into());
+		x.p = Some(open.into());
+		x.c = Some(json!("zqm"));
+		x.h = hat.then(|| CLUB.into());
+		sign(&other, &x)
+	};
+	let deleted = async || {
+		let x = fx.app.meta_adapter.get_action(club, in_open).await.unwrap().and_then(|a| a.x);
+		if x.is_some_and(|x| x.get("deletedBy").is_some()) { Allow } else { Deny }
+	};
+	let peer = fx.peer.id_tag.as_str();
+	check(&mut rep, "IB-126", &other, Deny, deliver(fx, CLUB, &edit("MSG:UPD", CLUB, false)).await);
+	check(&mut rep, "IB-127", &other, Deny, deliver(fx, CLUB, &edit("MSG:DEL", CLUB, false)).await);
+	check(&mut rep, "IB-128", &other, Deny, deliver(fx, CLUB, &edit("MSG:DEL", peer, true)).await);
+	check(&mut rep, "IB-128", &other, Deny, deleted().await);
+	// A MSG:DEL of a message not held here fails as retryable `NotFound`, not as a refusal: a
+	// DEL that overtakes its original converges on the retry once the original lands.
+	let mut x = claims(&member, "MSG:DEL");
+	x.aud = Some(CLUB.into());
+	x.sub = Some("a1~zqm-gi-msg-missing".into());
+	x.p = Some(open.into());
+	x.c = Some(json!("zqm"));
+	let (st, _) = crate::inbox_post(fx, CLUB, &sign(&member, &x)).await;
+	let not_found = st == axum::http::StatusCode::NOT_FOUND;
+	check(&mut rep, "IB-164", &member, Allow, if not_found { Allow } else { Deny });
+	check(&mut rep, "IB-129", &other, Deny, deliver(fx, CLUB, &edit("MSG:UPD", peer, true)).await);
+
+	// A contributor's PIN of a held group message: refused direct and as a hat relay, and
+	// nothing is stored. PIN allows no hat today, so the relay is refused at the hat gate;
+	// `pin::before_receive` would judge it like a direct one if that changed.
+	let stored = async |tok: &str| {
+		let a = fx.app.meta_adapter.get_action(club, &action_hash(tok)).await.unwrap();
+		if a.is_some() { Allow } else { Deny }
+	};
+	let tok = edit("PIN", peer, true);
+	check(&mut rep, "IB-165", &other, Deny, deliver(fx, CLUB, &tok).await);
+	check(&mut rep, "IB-165", &other, Deny, stored(&tok).await);
+	let tok = edit("PIN", CLUB, false);
+	check(&mut rep, "IB-166", &other, Deny, deliver(fx, CLUB, &tok).await);
+	check(&mut rep, "IB-166", &other, Deny, stored(&tok).await);
+
+	// A MSG naming a member's message (`sub`) by a member holding no SUBS on it falls back to
+	// their SUBS on the CONV (`process::check_subscription_permissions`), whose community role
+	// mapping (`x.createdBy`) applies: a community moderator with an observer SUBS may post
+	// (Member+), a contributor with one may not.
+	let c_moder = issuer(fx, CLUB, Relation::Member, "moderator", "gi-c-moder").await;
+	let c_plain = issuer(fx, CLUB, Relation::Member, "contributor", "gi-c-plain").await;
+	for (id, who) in [("a1~zqm-gi-c-moder", &c_moder), ("a1~zqm-gi-c-plain", &c_plain)] {
+		let who = who.id_tag.as_str();
+		let subs = cloudillo::meta_adapter::Action {
+			subject: Some(open),
+			x: Some(json!({ "role": "observer" })),
+			..row(id, "SUBS", who)
+		};
+		seed_row(fx, club, &subs, Some(&format!("SUBS:{open}:{who}"))).await;
+	}
+	let reply = |r: &RemoteId| {
+		let mut x = claims(r, "MSG");
+		x.aud = Some(CLUB.into());
+		x.sub = Some(in_open.into());
+		x.p = Some(open.into());
+		x.c = Some(json!("zqm"));
+		sign(r, &x)
+	};
+	let tok = reply(&c_plain);
+	check(&mut rep, "IB-167", &c_plain, Deny, deliver(fx, CLUB, &tok).await);
+	check(&mut rep, "IB-167", &c_plain, Deny, stored(&tok).await);
+	let tok = reply(&c_moder);
+	check(&mut rep, "IB-168", &c_moder, Allow, deliver(fx, CLUB, &tok).await);
+	check(&mut rep, "IB-168", &c_moder, Allow, admitted(fx, club, &action_hash(&tok)).await);
+
+	// A group receipt from a non-member, and a DM receipt (no subject) from a stranger.
+	let mut t = claims(&follower, "RCPT");
+	t.aud = Some(CLUB.into());
+	t.sub = Some(open.into());
+	t.c = Some(json!(1_700_000_000));
+	check(&mut rep, "IB-130", &follower, Deny, deliver(fx, CLUB, &sign(&follower, &t)).await);
+	let dm_stranger = issuer(fx, ALICE, Relation::None, "", "gi-rcpt-stranger").await;
+	let mut t = claims(&dm_stranger, "RCPT");
+	t.aud = Some(ALICE.into());
+	t.c = Some(json!(1_700_000_000));
+	let tok = sign(&dm_stranger, &t);
+	check(&mut rep, "IB-131", &dm_stranger, Deny, deliver(fx, ALICE, &tok).await);
+
+	// A DM receipt from a connection carries no `v` and no subject to inherit from: it is
+	// stored Direct (the RCPT type default), not at the tenant's default visibility, so a
+	// follower or a stranger never lists it.
+	let dm_peer = issuer(fx, ALICE, Relation::Connected, "", "gi-rcpt-peer").await;
+	let mut t = claims(&dm_peer, "RCPT");
+	t.aud = Some(ALICE.into());
+	t.c = Some(json!(1_700_000_000));
+	let tok = sign(&dm_peer, &t);
+	check(&mut rep, "IB-152", &dm_peer, Allow, deliver(fx, ALICE, &tok).await);
+	let rcpt = action_hash(&tok);
+	let alice = fx.tenants.alice.tn_id;
+	let _ = status_of(fx, alice, &rcpt).await;
+	// Direct ('D') reads back as `None` (`db_visibility_to_action`).
+	let vis = fx
+		.app
+		.meta_adapter
+		.get_action(alice, &rcpt)
+		.await
+		.unwrap()
+		.map(|a| a.visibility);
+	check(&mut rep, "IB-152", &dm_peer, Allow, if vis == Some(None) { Allow } else { Deny });
+	for (id, name) in [("IB-153", "follower@alice.test"), ("IB-154", "stranger@alice.test")] {
+		let auth = bearer(fx.subject(name));
+		let list = req(ALICE, Method::GET, "/api/actions?type=RCPT&limit=200", auth, Body::empty());
+		let (st, body) = call(&fx.api, list).await;
+		let seen = st.is_success() && body.to_string().contains(&rcpt);
+		check(&mut rep, id, &dm_peer, Deny, if seen { Allow } else { Deny });
+	}
+
+	// PRES is never stored and the relay posts to remote inboxes, which this fixture cannot
+	// observe. Reachable: the PRES gate itself — a CONV hint from the CONV issuer or an active
+	// member only, any other hint addressed to the host.
+	let typing = |r: &RemoteId, sub: &str, aud: &str| {
+		let mut t = claims(r, "PRES:TYPING");
+		t.aud = Some(aud.into());
+		t.sub = Some(sub.into());
+		t.c = Some(json!({}));
+		t
+	};
+	let tok = sign(&stranger, &typing(&stranger, open, CLUB));
+	check(&mut rep, "IB-110", &stranger, Deny, deliver(fx, CLUB, &tok).await);
+	let tok = sign(&follower, &typing(&follower, open, CLUB));
+	check(&mut rep, "IB-113", &follower, Deny, deliver(fx, CLUB, &tok).await);
+	// Control: `member` joined `open` in IB-109.
+	let tok = sign(&member, &typing(&member, open, CLUB));
+	check(&mut rep, "IB-114", &member, Allow, deliver(fx, CLUB, &tok).await);
+	// A second hint within `PRES_INTERVAL` is throttled before the owner relays it.
+	let mut t = typing(&member, open, CLUB);
+	t.c = Some(json!({ "n": 2 }));
+	check(&mut rep, "IB-161", &member, Deny, deliver(fx, CLUB, &sign(&member, &t)).await);
+	// DM presence (no CONV subject) addressed to someone else.
+	let tok = sign(&member, &typing(&member, "dm", "m-leader.test"));
+	check(&mut rep, "IB-115", &member, Deny, deliver(fx, CLUB, &tok).await);
+	// `member`'s hint under `other`'s key. After `member`'s own rows: a failed verification
+	// blocks the claimed issuer's key.
+	let tok = sign(&other, &typing(&member, open, CLUB));
+	check(&mut rep, "IB-116", &member, Deny, deliver(fx, CLUB, &tok).await);
+
+	// `other`'s receipt under `member`'s key. Last: a failed verification blocks `other`'s key.
+	let mut t = claims(&other, "RCPT");
+	t.aud = Some(CLUB.into());
+	t.sub = Some(open.into());
+	t.c = Some(json!(1_700_000_000));
+	check(&mut rep, "IB-111", &other, Deny, deliver(fx, CLUB, &sign(&member, &t)).await);
+	rep.finish();
+}
+
+/// Group settings (`conv::upd_before_receive`): on the host a group admin's request addressed
+/// to it is applied and relayed with an owner APRV, a moderator's is refused. On a member the
+/// vouched copy needs the CONV owner's APRV, and the host's own edit is admitted directly.
+#[tokio::test]
+async fn conv_upd_inbound() {
+	use Actual::{Allow, Deny};
+	fn conv<'a>(id: &'a str, iss: &'a str) -> cloudillo::meta_adapter::Action<&'a str> {
+		cloudillo::meta_adapter::Action {
+			content: Some(r#"{"name":"old"}"#),
+			flags: Some("rco"),
+			x: Some(json!({ "createdBy": "someone" })),
+			..row(id, "CONV", iss)
+		}
+	}
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let (alice, club) = (fx.tenants.alice.tn_id, fx.tenants.club.tn_id);
+	let meta = &fx.app.meta_adapter;
+	let mut rep = Report::new("conv-upd");
+	let admin = issuer(fx, ALICE, Relation::Connected, "", "cu-admin").await;
+	let moder = issuer(fx, ALICE, Relation::Connected, "", "cu-moder").await;
+	let owner = issuer(fx, ALICE, Relation::Connected, "", "cu-owner").await;
+	let evil = issuer(fx, ALICE, Relation::Connected, "", "cu-evil").await;
+	let member = issuer(fx, CLUB, Relation::Member, "contributor", "cu-member").await;
+	let (hosted, remote, comm) = ("a1~zqm-cu-hosted", "a1~zqm-cu-remote", "a1~zqm-cu-comm");
+	seed_row(fx, alice, &conv(hosted, ALICE), None).await;
+	seed_row(fx, alice, &conv(remote, owner.id_tag.as_str()), None).await;
+	seed_row(fx, club, &conv(comm, CLUB), None).await;
+	for (tn, c, who, role) in [
+		(alice, hosted, &admin, "admin"),
+		(alice, hosted, &moder, "moderator"),
+		(club, comm, &member, "admin"),
+	] {
+		let id = format!("a1~zqm-cu-subs-{}-{role}", tn.0);
+		let subs = cloudillo::meta_adapter::Action {
+			subject: Some(c),
+			x: Some(json!({ "role": role })),
+			..row(&id, "SUBS", who.id_tag.as_str())
+		};
+		seed_row(fx, tn, &subs, Some(&format!("SUBS:{c}:{}", who.id_tag))).await;
+	}
+	let upd = |by: &RemoteId, sub: &str, aud: Option<&str>, name: &str| {
+		let mut t = claims(by, "CONV:UPD");
+		t.sub = Some(sub.into());
+		t.aud = aud.map(Into::into);
+		t.c = Some(json!({ "name": name }));
+		t.f = Some("rcO".into());
+		sign(by, &t)
+	};
+	let named = async |tn: TnId, id: &str, name: &str, by: &RemoteId| {
+		let c = meta.get_action(tn, id).await.unwrap().unwrap();
+		let x = c.x.unwrap_or_default();
+		let ok = c.content.is_some_and(|c| c["name"] == name)
+			&& x["editedBy"] == by.id_tag.as_str()
+			&& x["createdBy"] == "someone"
+			&& c.flags.as_deref() == Some("rcO");
+		if ok { Allow } else { Deny }
+	};
+	let vouched = async |signer: &RemoteId, tok: &str| {
+		let mut a = claims(signer, "APRV");
+		a.aud = Some(ALICE.into());
+		a.p = Some(remote.into());
+		a.sub = Some(action_hash(tok).into());
+		let a = sign(signer, &a);
+		meta.create_inbound_action(alice, &action_hash(tok), tok, Some(&action_hash(&a)))
+			.await
+			.unwrap();
+		deliver(fx, ALICE, &a).await;
+		admitted(fx, alice, &action_hash(tok)).await
+	};
+
+	// On the host: a group moderator's request is refused, an admin's applied and vouched.
+	let tok = upd(&moder, hosted, Some(ALICE), "by-moder");
+	check(&mut rep, "IB-118", &moder, Deny, deliver(fx, ALICE, &tok).await);
+	let tok = upd(&admin, hosted, Some(ALICE), "by-admin");
+	check(&mut rep, "IB-119", &admin, Allow, deliver(fx, ALICE, &tok).await);
+	check(&mut rep, "IB-119", &admin, Allow, named(alice, hosted, "by-admin", &admin).await);
+	let aprv = meta
+		.list_actions(
+			alice,
+			&ListActionOptions {
+				typ: Some(vec!["APRV".into()]),
+				subject: Some(vec![action_hash(&tok)]),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	check(&mut rep, "IB-119", &admin, Allow, if aprv.is_empty() { Deny } else { Allow });
+	// A community member (connected to the community) asks its host the same way.
+	let tok = upd(&member, comm, Some(CLUB), "by-member");
+	check(&mut rep, "IB-120", &member, Allow, deliver(fx, CLUB, &tok).await);
+	check(&mut rep, "IB-120", &member, Allow, named(club, comm, "by-member", &member).await);
+
+	// On a member: a vouch from anyone but the CONV's owner admits nothing.
+	let tok = upd(&admin, remote, Some(owner.id_tag.as_str()), "evil-vouch");
+	check(&mut rep, "IB-121", &evil, Deny, vouched(&evil, &tok).await);
+	let tok = upd(&admin, remote, Some(owner.id_tag.as_str()), "owner-vouch");
+	check(&mut rep, "IB-122", &owner, Allow, vouched(&owner, &tok).await);
+	check(&mut rep, "IB-122", &owner, Allow, named(alice, remote, "owner-vouch", &admin).await);
+	// The owner's own edit reaches members by fan-out, unvouched.
+	let tok = upd(&owner, remote, None, "owner-edit");
+	let mut rx = fx.app.broadcast.register_user(alice, ALICE, "zqm-cu-ws").await;
+	check(&mut rep, "IB-123", &owner, Allow, deliver(fx, ALICE, &tok).await);
+	check(&mut rep, "IB-123", &owner, Allow, named(alice, remote, "owner-edit", &owner).await);
+	// The member's open UIs hear about it.
+	let mut pushed = Deny;
+	while let Ok(m) = rx.try_recv() {
+		if m.cmd == "ACTION" && m.data["subType"] == "UPD" && m.data["subject"] == remote {
+			pushed = Allow;
+		}
+	}
+	fx.app.broadcast.unregister_user(alice, ALICE, "zqm-cu-ws").await;
+	check(&mut rep, "IB-123", &owner, Allow, pushed);
+	// An older edit arriving late is stored but changes nothing.
+	let mut t = claims(&owner, "CONV:UPD");
+	t.sub = Some(remote.into());
+	t.c = Some(json!({ "name": "stale" }));
+	t.iat = Timestamp(t.iat.0 - 100);
+	check(&mut rep, "IB-124", &owner, Allow, deliver(fx, ALICE, &sign(&owner, &t)).await);
+	check(&mut rep, "IB-124", &owner, Allow, named(alice, remote, "owner-edit", &owner).await);
+
+	// A CONV listing lists the groups, not their updates.
+	let r = req(
+		ALICE,
+		Method::GET,
+		"/api/actions?type=CONV",
+		bearer(fx.subject("owner@alice")),
+		Body::empty(),
+	);
+	let (_, body) = call(&fx.api, r).await;
+	let listed = body["data"]
+		.as_array()
+		.map_or(0, |d| d.iter().filter(|a| a["subType"].is_string() && a["subType"] != "").count());
+	check(&mut rep, "IB-125", &owner, Allow, if listed == 0 { Allow } else { Deny });
+	rep.finish();
+}
+
+/// A CONV delivered again (`conv::on_receive`) leaves the member's read mark alone: only the
+/// first arrival, with no `A:CONV` row yet, marks the history read.
+#[tokio::test]
+async fn conv_redelivery_keeps_read_mark() {
+	use Actual::{Allow, Deny};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let mut rep = Report::new("conv-redelivery");
+	let owner = issuer(fx, ALICE, Relation::Connected, "", "cr-owner").await;
+	let mut t = claims(&owner, "CONV");
+	t.c = Some(json!({ "name": "zqm" }));
+	let tok = sign(&owner, &t);
+	let conv = action_hash(&tok);
+	let subs = cloudillo::meta_adapter::Action {
+		subject: Some(conv.as_str()),
+		audience_tag: Some(owner.id_tag.as_str()),
+		..row("a1~zqm-cr-self", "SUBS", ALICE)
+	};
+	seed_row(fx, alice, &subs, Some(&format!("SUBS:{conv}:{ALICE}"))).await;
+	let mark = PatchReaderState { read_at: Some(Timestamp(1000)), ..Default::default() };
+	meta.patch_reader_state(alice, "A:CONV", &conv, &mark, true).await.unwrap();
+	check(&mut rep, "IB-156", &owner, Allow, deliver(fx, ALICE, &tok).await);
+	check(&mut rep, "IB-156", &owner, Allow, admitted(fx, alice, &conv).await);
+	let read_at = meta
+		.get_reader_state(alice, "A:CONV", &conv)
+		.await
+		.unwrap()
+		.and_then(|r| r.read_at);
+	check(
+		&mut rep,
+		"IB-156",
+		&owner,
+		Allow,
+		if read_at == Some(Timestamp(1000)) { Allow } else { Deny },
+	);
+	rep.finish();
+}
+
+/// Member roles (`subs::role_before_receive`): on the host a group admin's SUBS:ROLE addressed to
+/// it stamps `x.role` on the member's SUBS and is relayed with an owner APRV; a moderator, a
+/// stranger, the owner's SUBS as target, a parent other than the target's group and an unknown
+/// role are refused. On a member the vouched copy needs the CONV owner's APRV, the owner's own
+/// change is admitted directly, and an older change arriving late changes nothing.
+#[tokio::test]
+async fn subs_role_inbound() {
+	use Actual::{Allow, Deny};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let (alice, club) = (fx.tenants.alice.tn_id, fx.tenants.club.tn_id);
+	let meta = &fx.app.meta_adapter;
+	let mut rep = Report::new("subs-role");
+	let admin = issuer(fx, ALICE, Relation::Connected, "", "sr-admin").await;
+	let moder = issuer(fx, ALICE, Relation::Connected, "", "sr-moder").await;
+	let owner = issuer(fx, ALICE, Relation::Connected, "", "sr-owner").await;
+	let evil = issuer(fx, ALICE, Relation::Connected, "", "sr-evil").await;
+	let stranger = issuer(fx, ALICE, Relation::Connected, "", "sr-stranger").await;
+	let member = issuer(fx, CLUB, Relation::Member, "contributor", "sr-member").await;
+	let coadmin = issuer(fx, ALICE, Relation::Connected, "", "sr-coadmin").await;
+	// A real issuer, so the target can sign its own SUBS:UPD (the M3 check below).
+	let tgt = issuer(fx, ALICE, Relation::Connected, "", "sr-target").await;
+	let (hosted, remote, comm) = ("a1~zqm-sr-hosted", "a1~zqm-sr-remote", "a1~zqm-sr-comm");
+	seed_row(fx, alice, &row(hosted, "CONV", ALICE), None).await;
+	seed_row(fx, alice, &row(remote, "CONV", owner.id_tag.as_str()), None).await;
+	let comm_conv = cloudillo::meta_adapter::Action {
+		x: Some(json!({ "createdBy": "someone" })),
+		..row(comm, "CONV", CLUB)
+	};
+	seed_row(fx, club, &comm_conv, None).await;
+	let target = tgt.id_tag.as_str();
+	let t_coadmin = "a1~zqm-sr-t-coadmin";
+	let (t_hosted, t_owner, t_remote, t_comm) =
+		("a1~zqm-sr-t-hosted", "a1~zqm-sr-t-owner", "a1~zqm-sr-t-remote", "a1~zqm-sr-t-comm");
+	for (tn, c, id, who, role) in [
+		(alice, hosted, "a1~zqm-sr-admin", admin.id_tag.as_str(), "admin"),
+		(alice, hosted, "a1~zqm-sr-moder", moder.id_tag.as_str(), "moderator"),
+		(alice, hosted, t_coadmin, coadmin.id_tag.as_str(), "admin"),
+		(alice, hosted, t_hosted, target, "member"),
+		(alice, hosted, t_owner, ALICE, "admin"),
+		(alice, remote, t_remote, target, "member"),
+		(club, comm, "a1~zqm-sr-member", member.id_tag.as_str(), "admin"),
+		(club, comm, t_comm, target, "member"),
+	] {
+		let subs = cloudillo::meta_adapter::Action {
+			subject: Some(c),
+			x: Some(json!({ "role": role })),
+			..row(id, "SUBS", who)
+		};
+		seed_row(fx, tn, &subs, Some(&format!("SUBS:{c}:{who}"))).await;
+	}
+	let role_tok =
+		|by: &RemoteId, sub: &str, p: &str, aud: Option<&str>, role: &str| -> ActionToken {
+			let mut t = claims(by, "SUBS:ROLE");
+			t.sub = Some(sub.into());
+			t.p = Some(p.into());
+			t.aud = aud.map(Into::into);
+			t.c = Some(json!({ "role": role }));
+			t
+		};
+	let role_is = async |tn: TnId, id: &str, role: &str| {
+		let x = meta.get_action(tn, id).await.unwrap().and_then(|a| a.x).unwrap_or_default();
+		if x["role"] == role { Allow } else { Deny }
+	};
+	let vouched = async |signer: &RemoteId, tok: &str| {
+		let mut a = claims(signer, "APRV");
+		a.aud = Some(ALICE.into());
+		a.p = Some(remote.into());
+		a.sub = Some(action_hash(tok).into());
+		let a = sign(signer, &a);
+		meta.create_inbound_action(alice, &action_hash(tok), tok, Some(&action_hash(&a)))
+			.await
+			.unwrap();
+		deliver(fx, ALICE, &a).await;
+		admitted(fx, alice, &action_hash(tok)).await
+	};
+
+	// On the host: a moderator's request is refused, an admin's applied and vouched.
+	let tok = sign(&moder, &role_tok(&moder, t_hosted, hosted, Some(ALICE), "observer"));
+	check(&mut rep, "IB-132", &moder, Deny, deliver(fx, ALICE, &tok).await);
+	check(&mut rep, "IB-132", &moder, Allow, role_is(alice, t_hosted, "member").await);
+	let tok = sign(&admin, &role_tok(&admin, t_hosted, hosted, Some(ALICE), "moderator"));
+	check(&mut rep, "IB-133", &admin, Allow, deliver(fx, ALICE, &tok).await);
+	check(&mut rep, "IB-133", &admin, Allow, role_is(alice, t_hosted, "moderator").await);
+	let aprv = meta
+		.list_actions(
+			alice,
+			&ListActionOptions {
+				typ: Some(vec!["APRV".into()]),
+				subject: Some(vec![action_hash(&tok)]),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	check(&mut rep, "IB-133", &admin, Allow, if aprv.is_empty() { Deny } else { Allow });
+	// Admins may change peer admins (policy: `ownership::kick_allowed`, "Admin (who may remove
+	// peer Admins)").
+	let tok = sign(&admin, &role_tok(&admin, t_coadmin, hosted, Some(ALICE), "moderator"));
+	check(&mut rep, "AC-242", &admin, Allow, deliver(fx, ALICE, &tok).await);
+	check(&mut rep, "AC-242", &admin, Allow, role_is(alice, t_coadmin, "moderator").await);
+	// AC-243 (an admin's SUBS:ROLE on the CONV owner's own SUBS is refused) is IB-134 below.
+	// The owner's own SUBS, a forged parent, an unknown role, a stranger.
+	let tok = sign(&admin, &role_tok(&admin, t_owner, hosted, Some(ALICE), "observer"));
+	check(&mut rep, "IB-134", &admin, Deny, deliver(fx, ALICE, &tok).await);
+	check(&mut rep, "IB-134", &admin, Allow, role_is(alice, t_owner, "admin").await);
+	let tok = sign(&admin, &role_tok(&admin, t_hosted, remote, Some(ALICE), "observer"));
+	check(&mut rep, "IB-135", &admin, Deny, deliver(fx, ALICE, &tok).await);
+	let tok = sign(&admin, &role_tok(&admin, t_hosted, hosted, Some(ALICE), "wizard"));
+	check(&mut rep, "IB-136", &admin, Deny, deliver(fx, ALICE, &tok).await);
+	let tok = sign(&stranger, &role_tok(&stranger, t_hosted, hosted, Some(ALICE), "observer"));
+	check(&mut rep, "IB-137", &stranger, Deny, deliver(fx, ALICE, &tok).await);
+	check(&mut rep, "IB-137", &stranger, Allow, role_is(alice, t_hosted, "moderator").await);
+	// A community group admin asks the community host the same way.
+	let tok = sign(&member, &role_tok(&member, t_comm, comm, Some(CLUB), "moderator"));
+	check(&mut rep, "IB-138", &member, Allow, deliver(fx, CLUB, &tok).await);
+	check(&mut rep, "IB-138", &member, Allow, role_is(club, t_comm, "moderator").await);
+
+	// On a member: a vouch from anyone but the CONV's owner admits nothing.
+	let aud = Some(owner.id_tag.as_str());
+	let tok = sign(&admin, &role_tok(&admin, t_remote, remote, aud, "observer"));
+	check(&mut rep, "IB-139", &evil, Deny, vouched(&evil, &tok).await);
+	check(&mut rep, "IB-139", &evil, Allow, role_is(alice, t_remote, "member").await);
+	let tok = sign(&admin, &role_tok(&admin, t_remote, remote, aud, "moderator"));
+	check(&mut rep, "IB-140", &owner, Allow, vouched(&owner, &tok).await);
+	check(&mut rep, "IB-140", &owner, Allow, role_is(alice, t_remote, "moderator").await);
+	// The owner's own change reaches members by fan-out, unvouched.
+	let tok = sign(&owner, &role_tok(&owner, t_remote, remote, None, "admin"));
+	check(&mut rep, "IB-141", &owner, Allow, deliver(fx, ALICE, &tok).await);
+	check(&mut rep, "IB-141", &owner, Allow, role_is(alice, t_remote, "admin").await);
+	// An older change arriving late is stored but changes nothing.
+	let mut t = role_tok(&owner, t_remote, remote, None, "observer");
+	t.iat = Timestamp(t.iat.0 - 100);
+	check(&mut rep, "IB-142", &owner, Allow, deliver(fx, ALICE, &sign(&owner, &t)).await);
+	check(&mut rep, "IB-142", &owner, Allow, role_is(alice, t_remote, "admin").await);
+	// The member's own SUBS:UPD keys apart, so the membership row keeps its `x.roleAt` and a
+	// late, older role change still changes nothing (it used to supersede the row and drop it).
+	let mut u = claims(&tgt, "SUBS:UPD");
+	u.aud = Some(ALICE.into());
+	u.sub = Some(hosted.into());
+	deliver(fx, ALICE, &sign(&tgt, &u)).await;
+	let mut t = role_tok(&admin, t_hosted, hosted, Some(ALICE), "observer");
+	t.iat = Timestamp(t.iat.0 - 100);
+	deliver(fx, ALICE, &sign(&admin, &t)).await;
+	check(&mut rep, "IB-142", &tgt, Allow, role_is(alice, t_hosted, "moderator").await);
+	// A far-future `iat` is refused at verification (`MAX_IAT_SKEW_SECS`), so it cannot pin
+	// the role against every later change.
+	let mut t = role_tok(&admin, t_hosted, hosted, Some(ALICE), "observer");
+	t.iat = Timestamp::from_now(3600);
+	check(&mut rep, "IB-163", &admin, Deny, deliver(fx, ALICE, &sign(&admin, &t)).await);
+	check(&mut rep, "IB-163", &admin, Allow, role_is(alice, t_hosted, "moderator").await);
+	rep.finish();
+}
+
+/// Personal-group kicks (`subs::may_kick`, `subs::before_receive`): a SUBS:DEL naming the
+/// member's SUBS. On the host a moderator removes a plain member; a member, a stranger and a
+/// moderator kicking an admin are refused. On a member node a kick is admitted only under the
+/// CONV owner's APRV. A share link or `idp_` key cannot sign an inbound token, so the forged
+/// vouch is the reachable negative case for a credential carrying another's authority.
+#[tokio::test]
+async fn subs_kick_inbound() {
+	use Actual::{Allow, Deny};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let mut rep = Report::new("subs-kick");
+	let moder = issuer(fx, ALICE, Relation::Connected, "", "sk-moder").await;
+	let plain = issuer(fx, ALICE, Relation::Connected, "", "sk-plain").await;
+	let owner = issuer(fx, ALICE, Relation::Connected, "", "sk-owner").await;
+	let evil = issuer(fx, ALICE, Relation::Connected, "", "sk-evil").await;
+	let stranger = issuer(fx, ALICE, Relation::Connected, "", "sk-stranger").await;
+	let (hosted, remote) = ("a1~zqm-sk-hosted", "a1~zqm-sk-remote");
+	seed_row(fx, alice, &row(hosted, "CONV", ALICE), None).await;
+	seed_row(fx, alice, &row(remote, "CONV", owner.id_tag.as_str()), None).await;
+	let (t_member, t_admin, t_remote, t_self) =
+		("a1~zqm-sk-t-member", "a1~zqm-sk-t-admin", "a1~zqm-sk-t-remote", "a1~zqm-sk-t-self");
+	for (c, id, who, role) in [
+		(hosted, "a1~zqm-sk-moder", moder.id_tag.as_str(), "moderator"),
+		(hosted, "a1~zqm-sk-plain", plain.id_tag.as_str(), "member"),
+		(hosted, t_member, "zqm-sk-member.test", "member"),
+		(hosted, t_admin, "zqm-sk-admin.test", "admin"),
+		(remote, t_remote, "zqm-sk-member.test", "member"),
+		(remote, t_self, ALICE, "member"),
+	] {
+		let subs = cloudillo::meta_adapter::Action {
+			subject: Some(c),
+			x: Some(json!({ "role": role })),
+			..row(id, "SUBS", who)
+		};
+		seed_row(fx, alice, &subs, Some(&format!("SUBS:{c}:{who}"))).await;
+	}
+	let kick = |by: &RemoteId, sub: &str, aud: &str| -> String {
+		let mut t = claims(by, "SUBS:DEL");
+		t.sub = Some(sub.into());
+		t.aud = Some(aud.into());
+		sign(by, &t)
+	};
+	let join = |by: &RemoteId, aud: &str| -> String {
+		let mut t = claims(by, "SUBS");
+		t.sub = Some(remote.into());
+		t.aud = Some(aud.into());
+		sign(by, &t)
+	};
+	let read_mark = PatchReaderState { read_at: Some(Timestamp(1000)), ..Default::default() };
+	meta.patch_reader_state(alice, "A:CONV", remote, &read_mark, true)
+		.await
+		.unwrap();
+	let active = async |id: &str| {
+		if status_of(fx, alice, id).await.as_deref() == Some("A") { Allow } else { Deny }
+	};
+	let vouched = async |signer: &RemoteId, tok: &str| {
+		let mut a = claims(signer, "APRV");
+		a.aud = Some(ALICE.into());
+		a.p = Some(remote.into());
+		a.sub = Some(action_hash(tok).into());
+		let a = sign(signer, &a);
+		meta.create_inbound_action(alice, &action_hash(tok), tok, Some(&action_hash(&a)))
+			.await
+			.unwrap();
+		deliver(fx, ALICE, &a).await;
+		admitted(fx, alice, &action_hash(tok)).await
+	};
+
+	// The host refuses a kick before storing it (`subs::before_receive`); the kick's own row
+	// and the target's status tell.
+	let host_kick = async |by: &RemoteId, sub: &str| {
+		let tok = kick(by, sub, ALICE);
+		deliver(fx, ALICE, &tok).await;
+		active(&action_hash(&tok)).await
+	};
+	let kick_stored = async |by: &RemoteId, sub: &str| {
+		let tok = kick(by, sub, ALICE);
+		deliver(fx, ALICE, &tok).await;
+		let a = meta.get_action(alice, &action_hash(&tok)).await.unwrap();
+		if a.is_some() { Allow } else { Deny }
+	};
+
+	// On the host: a member, a stranger, and a moderator against an admin are refused.
+	check(&mut rep, "IB-143", &plain, Deny, host_kick(&plain, t_member).await);
+	check(&mut rep, "IB-143", &plain, Allow, active(t_member).await);
+	check(&mut rep, "IB-144", &stranger, Deny, host_kick(&stranger, t_member).await);
+	check(&mut rep, "IB-144", &stranger, Allow, active(t_member).await);
+	// A refused kick leaves no row (it used to be stored at 'D').
+	check(&mut rep, "IB-169", &plain, Deny, kick_stored(&plain, t_admin).await);
+	check(&mut rep, "IB-170", &stranger, Deny, kick_stored(&stranger, t_admin).await);
+	check(&mut rep, "IB-145", &moder, Deny, host_kick(&moder, t_admin).await);
+	check(&mut rep, "IB-145", &moder, Allow, active(t_admin).await);
+	// A moderator removes a plain member.
+	check(&mut rep, "IB-146", &moder, Allow, host_kick(&moder, t_member).await);
+	check(&mut rep, "IB-146", &moder, Deny, active(t_member).await);
+
+	// On a member node: a vouch from anyone but the CONV's owner admits nothing.
+	// The kick is addressed to `evil`, so `check_aprv_authority` admits evil's APRV; only the
+	// CONV-owner binding in `subs::before_receive` refuses it.
+	let tok = kick(&moder, t_remote, evil.id_tag.as_str());
+	check(&mut rep, "IB-147", &evil, Deny, vouched(&evil, &tok).await);
+	check(&mut rep, "IB-147", &evil, Allow, active(t_remote).await);
+	let aud = owner.id_tag.as_str();
+	let tok = kick(&moder, t_remote, aud);
+	check(&mut rep, "IB-148", &owner, Allow, vouched(&owner, &tok).await);
+	check(&mut rep, "IB-148", &owner, Deny, active(t_remote).await);
+
+	// A join is vouched by the CONV's owner: one addressed to the joiner, who approves it
+	// themselves, passes `check_aprv_authority` (SUBS `aud` == APRV issuer) but is refused by
+	// the subject-owner binding in `subs::before_receive`.
+	let tok = join(&evil, evil.id_tag.as_str());
+	check(&mut rep, "IB-150", &evil, Deny, vouched(&evil, &tok).await);
+	let tok = join(&stranger, owner.id_tag.as_str());
+	check(&mut rep, "IB-151", &owner, Allow, vouched(&owner, &tok).await);
+
+	// A kick of our own membership drops the group from our inbox (`subs::apply_kick`).
+	let tok = kick(&moder, t_self, owner.id_tag.as_str());
+	check(&mut rep, "IB-155", &owner, Allow, vouched(&owner, &tok).await);
+	let row = meta.get_reader_state(alice, "A:CONV", remote).await.unwrap();
+	check(&mut rep, "IB-155", &owner, Deny, if row.is_some() { Allow } else { Deny });
+	rep.finish();
 }
 
 // vim: ts=4

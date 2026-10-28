@@ -21,6 +21,8 @@
 //! therefore disjoint per subject; concurrent writes to the same row by
 //! both paths cannot occur on the same node.
 
+use crate::helpers::{self, SubscriptionRole};
+use crate::prelude::*;
 use cloudillo_core::roles::is_moderator;
 use cloudillo_types::meta_adapter::ActionView;
 
@@ -29,10 +31,12 @@ use cloudillo_types::meta_adapter::ActionView;
 /// For posts with `audience` set (community-hosted), the audience is the
 /// owner; otherwise the issuer is.
 pub(crate) fn owns_subject(subject: &ActionView, tenant_tag: &str) -> bool {
-	match &subject.audience {
-		None => subject.issuer.id_tag.as_ref() == tenant_tag,
-		Some(aud) => aud.id_tag.as_ref() == tenant_tag,
-	}
+	conv_owner(subject) == tenant_tag
+}
+
+/// The owner of `subject` by the rule of [`owns_subject`]: its audience, else its issuer.
+pub(crate) fn conv_owner(subject: &ActionView) -> &str {
+	subject.audience.as_ref().unwrap_or(&subject.issuer).id_tag.as_ref()
 }
 
 /// Applicability gate for accepting / rejecting: is this action resolvable in `tenant_tag`'s
@@ -64,11 +68,74 @@ pub(crate) fn accept_authority(
 			.is_some_and(|aud| aud.id_tag.as_ref() == caller_id_tag)
 }
 
+/// Authority of a group moderator+ over a membership, beside [`accept_authority`]
+/// in the accept / reject handlers: `subject` is a SUBS in one of `statuses` naming a local
+/// community group, and `caller`'s effective role on it ([`helpers::conv_role`]) is moderator+.
+/// Accept passes `["C"]` (a knock); reject also `"A"`, which is the kick (rank-gated by
+/// [`kick_allowed`]). Async, as it reads the CONV, the caller's SUBS and their community role.
+pub(crate) async fn knock_authority(
+	app: &App,
+	tn_id: TnId,
+	subject: &ActionView,
+	caller: &str,
+	statuses: &[&str],
+) -> ClResult<bool> {
+	if &*subject.typ != "SUBS"
+		|| subject.sub_typ.is_some()
+		|| !subject.status.as_deref().is_some_and(|s| statuses.contains(&s))
+	{
+		return Ok(false);
+	}
+	let Some(conv_id) = subject.subject.as_deref() else {
+		return Ok(false);
+	};
+	let Some(conv) = helpers::get_group(app.meta_adapter.as_ref(), tn_id, conv_id).await? else {
+		return Ok(false);
+	};
+	Ok(helpers::conv_created_by(conv.x.as_ref()).is_some()
+		&& helpers::conv_role(app.meta_adapter.as_ref(), tn_id, &conv, caller).await
+			>= SubscriptionRole::Moderator)
+}
+
+/// Rank gate for a kick (reject of an active SUBS on a local community group), applied after
+/// either authority above: `caller`'s effective group role must be strictly above the
+/// target's, or Admin (who may remove peer Admins), as CONN:DEL does. The CONV issuer is
+/// always Admin, so a moderator, group or community, never kicks the creator or a leader.
+/// Anything that is not such a kick passes.
+pub(crate) async fn kick_allowed(
+	app: &App,
+	tn_id: TnId,
+	subject: &ActionView,
+	caller: &str,
+) -> ClResult<bool> {
+	if &*subject.typ != "SUBS"
+		|| subject.sub_typ.is_some()
+		|| subject.status.as_deref() != Some("A")
+	{
+		return Ok(true);
+	}
+	let Some(conv_id) = subject.subject.as_deref() else {
+		return Ok(true);
+	};
+	let conv = match helpers::get_group(app.meta_adapter.as_ref(), tn_id, conv_id).await? {
+		Some(c) if helpers::conv_created_by(c.x.as_ref()).is_some() => c,
+		_ => return Ok(true),
+	};
+	let meta = app.meta_adapter.as_ref();
+	let caller_role = helpers::conv_role(meta, tn_id, &conv, caller).await;
+	let target_role = helpers::conv_role(meta, tn_id, &conv, &subject.issuer.id_tag).await;
+	Ok(outranks(caller_role, target_role))
+}
+
+/// `caller` may act on `target`'s membership: strictly above it, or Admin (peer Admins too).
+pub(crate) fn outranks(caller: SubscriptionRole, target: SubscriptionRole) -> bool {
+	caller > target || caller == SubscriptionRole::Admin
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use cloudillo_types::meta_adapter::{ProfileInfo, ProfileType};
-	use cloudillo_types::types::Timestamp;
 
 	fn profile(id_tag: &str) -> ProfileInfo {
 		ProfileInfo {
@@ -100,7 +167,7 @@ mod tests {
 			stat: None,
 			visibility: None,
 			flags: None,
-			sub_level: None,
+			reader_state: None,
 			x: None,
 			hat: None,
 			channel: None,

@@ -118,7 +118,7 @@ pub enum Actual {
 
 /// The DSL definitions (the base `BDG` aside: only its slots are issuable) plus the
 /// receive-side subtypes, with their target need: `Some(b)` fixed, `None` optional (both cells).
-pub const INBOX_TYPES: [(&str, Option<bool>); 27] = [
+pub const INBOX_TYPES: [(&str, Option<bool>); 31] = [
 	("BDG:STD", Some(true)),
 	("BDG:PAT", Some(true)),
 	("CONN", Some(true)),
@@ -134,6 +134,13 @@ pub const INBOX_TYPES: [(&str, Option<bool>); 27] = [
 	("REACT", Some(true)),
 	("CMNT", Some(true)),
 	("MSG", None),
+	// Subject = the host's tenant-issued group MSG.
+	("MSG:UPD", Some(true)),
+	("MSG:DEL", Some(true)),
+	// Subject = the host's group MSG, parent = its CONV.
+	("PIN", Some(true)),
+	// Subject = the host's CONV.
+	("RCPT", Some(true)),
 	("REPOST", Some(true)),
 	("APRV", Some(true)),
 	// Untargeted: `p` names an action not held here.
@@ -807,6 +814,20 @@ impl InboxCell {
 				if self.target {
 					t.p = conv();
 				}
+			}
+			"MSG:UPD" | "MSG:DEL" => {
+				t.sub = Some(host_action(fx, host, ActionShape::Child).into());
+				t.c = text;
+			}
+			"PIN" => {
+				t.aud = aud;
+				t.sub = Some(host_action(fx, host, ActionShape::Child).into());
+				t.p = conv();
+			}
+			"RCPT" => {
+				t.aud = aud;
+				t.sub = conv();
+				t.c = Some(json!(1_700_000_000));
 			}
 			"IDP:REG" => {
 				t.aud = aud;

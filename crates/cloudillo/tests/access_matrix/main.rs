@@ -4962,6 +4962,28 @@ async fn post_action_as(
 	call(&fx.api, r).await
 }
 
+/// PRES on a community group: one membership rule for a local hint and an inbound one
+/// (`pres::may_signal`). The community's leader holds no SUBS on the group, so their typing
+/// hint is refused, however high their community role; the CONV's issuer is admitted (MG-609).
+#[tokio::test]
+async fn pres_needs_group_membership() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let conv = "a1~zqm-pm-conv";
+	let group = cloudillo::meta_adapter::Action {
+		content: Some(r#"{"name":"zqm","join":"role"}"#),
+		visibility: Some('S'),
+		x: Some(serde_json::json!({ "createdBy": "m-leader.test" })),
+		..row(conv, "CONV", CLUB)
+	};
+	seed_row(fx, fx.tenants.club.tn_id, &group, None).await;
+	let typing = serde_json::json!({ "type": "PRES", "subType": "TYPING", "subject": conv });
+	for (who, ok) in [("m-leader@club.test", false), ("owner@club", true)] {
+		let (st, b) = post_action_as(fx, who, &typing).await;
+		assert_eq!(st.is_success(), ok, "MG-609: {who} PRES:TYPING → {st} {b}");
+	}
+}
+
 /// `requires_subscription` (MSG): a message under a remote CONV needs the tenant's own SUBS on
 /// it (AC-89 refused before, AC-90 admitted after; `task.rs` outbound `requires_subscription`).
 #[tokio::test]
@@ -5785,4 +5807,426 @@ async fn profile_badges_adapter_filters() {
 	}
 	assert!(!shown.contains(&none) && !shown.contains(&person), "unrelated / person issuer");
 	meta.replace_profile_badges(alice, holder, &[]).await.unwrap();
+}
+
+/// Club moderator authority on club's own CONV (the owner node holds the roles): a moderator
+/// SUBS pins and deletes another member's message; a contributor does neither (AC-244..247).
+#[tokio::test]
+async fn msg_pin_authority() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+	let conv = inbound_flows::obj_id(fx, CLUB, "container-v-tenant-active");
+	let subs = cloudillo::meta_adapter::Action {
+		subject: Some(conv.as_str()),
+		audience_tag: Some(CLUB),
+		x: Some(serde_json::json!({ "role": "moderator" })),
+		..row("a1~zqm-mp-subs-mod", "SUBS", "m-moderator.test")
+	};
+	seed_row(fx, club, &subs, Some(&format!("SUBS:{conv}:m-moderator.test"))).await;
+	let msg = |id: &'static str| cloudillo::meta_adapter::Action {
+		parent_id: Some(conv.as_str()),
+		root_id: Some(conv.as_str()),
+		..row(id, "MSG", "m-contributor.test")
+	};
+	for id in ["a1~zqm-mp-msg-1", "a1~zqm-mp-msg-2"] {
+		seed_row(fx, club, &msg(id), None).await;
+	}
+	let act = |t: &str, sub: Option<&str>, subject: &str| {
+		let mut v = serde_json::json!({ "type": t, "subType": sub, "subject": subject });
+		if t == "MSG" {
+			v["content"] = "zqm".into();
+		}
+		v
+	};
+	for (id, who, t, sub, target, ok) in [
+		("AC-244", "m-contributor@club.test", "PIN", None, "a1~zqm-mp-msg-1", false),
+		("AC-245", "m-follower@club.test", "MSG", Some("DEL"), "a1~zqm-mp-msg-1", false),
+		("AC-246", "m-moderator@club.test", "PIN", None, "a1~zqm-mp-msg-1", true),
+		("AC-247", "m-moderator@club.test", "MSG", Some("DEL"), "a1~zqm-mp-msg-2", true),
+	] {
+		let body = act(t, sub, target);
+		let (st, b) = post_action_as(fx, who, &body).await;
+		assert_eq!(st.is_success(), ok, "{id}: {who} {t}:{sub:?} → {st} {b}");
+	}
+}
+
+/// Community-owned group chats: the create gate (`conv.create_min_role`, default contributor),
+/// discovery of a listed group by members only, and the knock queue — listed to and resolved by
+/// the group's moderator+ only, kicks rank-gated, admin ops judged on the poster's group role
+/// (AC-190..). The join policy (`subs::conv_join_status`) is unit-tested in `subs.rs`.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn community_group_gates() {
+	use cloudillo::meta_adapter::UpdateActionDataOptions;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+	let conv = "a1~zqm-cg-conv";
+	let group = cloudillo::meta_adapter::Action {
+		content: Some(r#"{"name":"zqm","join":"role","joinMinRole":"contributor"}"#),
+		visibility: Some('S'),
+		x: Some(serde_json::json!({ "createdBy": "m-leader.test" })),
+		..row(conv, "CONV", CLUB)
+	};
+	seed_row(fx, club, &group, None).await;
+	let subs = |id: &'static str, who: &'static str, role: &str| cloudillo::meta_adapter::Action {
+		subject: Some(conv),
+		audience_tag: Some(CLUB),
+		visibility: Some('S'),
+		x: Some(serde_json::json!({ "role": role })),
+		..row(id, "SUBS", who)
+	};
+	// m-contributor moderates the group; m-supporter (below joinMinRole) knocks.
+	seed_row(
+		fx,
+		club,
+		&subs("a1~zqm-cg-mod", "m-contributor.test", "moderator"),
+		Some(&format!("SUBS:{conv}:m-contributor.test")),
+	)
+	.await;
+	let knock = "a1~zqm-cg-knock";
+	seed_row(
+		fx,
+		club,
+		&subs(knock, "m-supporter.test", "observer"),
+		Some(&format!("SUBS:{conv}:m-supporter.test")),
+	)
+	.await;
+	let pending = UpdateActionDataOptions { status: Patch::Value('C'), ..Default::default() };
+	fx.app.meta_adapter.update_action_data(club, knock, &pending).await.unwrap();
+
+	// Create gate.
+	let create =
+		serde_json::json!({ "type": "CONV", "content": { "name": "zqm", "join": "request" } });
+	for (id, who, ok) in [
+		("AC-190", "m-supporter@club.test", false),
+		("AC-191", "m-contributor@club.test", true),
+	] {
+		let (st, b) = post_action_as(fx, who, &create).await;
+		assert_eq!(st.is_success(), ok, "{id}: {who} CONV create → {st} {b}");
+	}
+	// Nor a follower, a guest, a share link or an `idp_` key (the last carries alice's id_tag).
+	for (id, who) in [
+		("AC-201", "m-follower@club.test"),
+		("AC-202", "g-read@club.test"),
+		("AC-203", "sharelink-w@club"),
+		("AC-204", "idp-ident@club"),
+		("AC-205", "idp-mgmt@club"),
+	] {
+		let (st, b) = post_action_as(fx, who, &create).await;
+		assert!(!st.is_success(), "{id}: {who} CONV create → {st} {b}");
+	}
+
+	let call_as = |name: &'static str, method: Method, uri: String| async move {
+		let s = fx.subject(name);
+		call(&fx.api, req(CLUB, method, &uri, bearer(s), Body::empty())).await
+	};
+	// Discovery: a listed group reads for a member who has not joined, not for a follower.
+	for (id, who, ok) in [
+		("AC-192", "m-supporter@club.test", true),
+		("AC-193", "m-follower@club.test", false),
+	] {
+		let (st, b) = call_as(who, Method::GET, format!("/api/actions/{conv}")).await;
+		assert_eq!(st.is_success(), ok, "{id}: {who} GET listed group → {st} {b}");
+	}
+	// The knock queue lists to the group moderator only.
+	for (id, who, present) in [
+		("AC-194", "m-contributor@club.test", true),
+		("AC-195", "m-supporter@club.test", false),
+	] {
+		let (st, b) = call_as(who, Method::GET, "/api/actions?type=SUBS&status=C".into()).await;
+		assert!(st.is_success(), "{id}: {who} knock list → {st} {b}");
+		assert_eq!(b.to_string().contains(knock), present, "{id}: {who} knock list {b}");
+	}
+	// A share link or an `idp_` key neither accepts nor rejects the knock.
+	for (id, who) in [
+		("AC-206", "sharelink-w@club"),
+		("AC-207", "idp-ident@club"),
+		("AC-208", "idp-mgmt@club"),
+	] {
+		for op in ["accept", "reject"] {
+			let (st, b) = call_as(who, Method::POST, format!("/api/actions/{knock}/{op}")).await;
+			assert!(!st.is_success(), "{id}: {who} {op} knock → {st} {b}");
+		}
+	}
+	// Accept: a follower and the knocker are refused, the group moderator accepts.
+	for (id, who, ok) in [
+		("AC-196", "m-follower@club.test", false),
+		("AC-197", "m-supporter@club.test", false),
+		("AC-198", "m-contributor@club.test", true),
+	] {
+		let (st, b) = call_as(who, Method::POST, format!("/api/actions/{knock}/accept")).await;
+		assert_eq!(st.is_success(), ok, "{id}: {who} accept knock → {st} {b}");
+	}
+	let accepted = fx.app.meta_adapter.get_action(club, knock).await.unwrap().unwrap();
+	assert_eq!(accepted.status.as_deref(), Some("A"), "AC-198: knock accepted");
+	// Nor do they kick.
+	for (id, who) in [
+		("AC-209", "sharelink-w@club"),
+		("AC-210", "idp-ident@club"),
+		("AC-211", "idp-mgmt@club"),
+	] {
+		let (st, b) = call_as(who, Method::POST, format!("/api/actions/{knock}/reject")).await;
+		assert!(!st.is_success(), "{id}: {who} kick → {st} {b}");
+	}
+	// Kick = reject of the member's active SUBS: refused to a follower, done by the moderator.
+	for (id, who, ok) in [
+		("AC-199", "m-follower@club.test", false),
+		("AC-200", "m-contributor@club.test", true),
+	] {
+		let (st, b) = call_as(who, Method::POST, format!("/api/actions/{knock}/reject")).await;
+		assert_eq!(st.is_success(), ok, "{id}: {who} kick → {st} {b}");
+	}
+
+	// A kick needs a rank above the target's, or Admin (`ownership::kick_allowed`): neither the
+	// group moderator nor a community moderator removes a group admin or the creator (a leader,
+	// so Admin); a leader removes a peer admin.
+	let (admin, creator) = ("a1~zqm-cg-admin", "a1~zqm-cg-creator");
+	for (id, who, role) in
+		[(admin, "zqm-cg-admin.test", "admin"), (creator, "m-leader.test", "observer")]
+	{
+		seed_row(fx, club, &subs(id, who, role), Some(&format!("SUBS:{conv}:{who}"))).await;
+	}
+	for (id, who, target, ok) in [
+		("AC-212", "m-contributor@club.test", admin, false),
+		("AC-213", "m-contributor@club.test", creator, false),
+		("AC-214", "m-moderator@club.test", admin, false),
+		("AC-215", "m-moderator@club.test", creator, false),
+		("AC-216", "m-leader@club.test", admin, true),
+	] {
+		let (st, b) = call_as(who, Method::POST, format!("/api/actions/{target}/reject")).await;
+		assert_eq!(st.is_success(), ok, "{id}: {who} kick {target} → {st} {b}");
+	}
+
+	// Group-admin ops posted by a member are judged on the member's own group role
+	// (`conv::check_admin_actor`): SUBS:UPD needs admin and SUBS:DEL moderator. CONV:UPD is the
+	// tenant's alone (`conv::upd_before_create`); a member's goes from their home node.
+	let upd = serde_json::json!({
+		"type": "CONV", "subType": "UPD", "subject": conv, "content": { "name": "x" }
+	});
+	let (st, b) = post_action_as(fx, "m-contributor@club.test", &upd).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "AC-217: group moderator CONV:UPD → {b}");
+	for (id, who, sub) in [
+		("AC-218", "m-contributor@club.test", "UPD"),
+		("AC-219", "m-supporter@club.test", "UPD"),
+		("AC-220", "m-supporter@club.test", "DEL"),
+		("AC-221", "m-follower@club.test", "DEL"),
+	] {
+		let body = serde_json::json!({ "type": "SUBS", "subType": sub, "subject": conv });
+		let (st, b) = post_action_as(fx, who, &body).await;
+		assert_eq!(st, StatusCode::FORBIDDEN, "{id}: {who} SUBS:{sub} → {b}");
+	}
+	// SUBS:ROLE is the tenant's alone (`subs::role_before_create`): a member's goes from their
+	// home node, and a credential carrying the community's id_tag is not the tenant either.
+	let role = serde_json::json!({
+		"type": "SUBS", "subType": "ROLE", "subject": admin, "content": { "role": "member" }
+	});
+	for (id, who) in [
+		("AC-222", "m-contributor@club.test"),
+		("AC-223", "sharelink-w@club"),
+		("AC-224", "idp-ident@club"),
+		("AC-225", "idp-mgmt@club"),
+	] {
+		let (st, b) = post_action_as(fx, who, &role).await;
+		assert!(!st.is_success(), "{id}: {who} SUBS:ROLE → {st} {b}");
+		if id == "AC-222" {
+			assert_eq!(st, StatusCode::FORBIDDEN, "{id}: {who} SUBS:ROLE → {b}");
+		}
+	}
+}
+
+/// SUBS:ROLE on a group the tenant hosts applies at once (`subs::role_on_create`); the owner's
+/// own SUBS is not the group's to change, and a SUBS:UPD naming a member's SUBS is refused.
+#[tokio::test]
+async fn subs_role_outbound() {
+	use cloudillo::action::task::ActionCreatorTask;
+	use cloudillo_core::scheduler::Task;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let conv = "a1~zqm-sro-conv";
+	seed_row(fx, alice, &row(conv, "CONV", ALICE), None).await;
+	let (member, own) = ("a1~zqm-sro-member", "a1~zqm-sro-own");
+	for (id, who) in [(member, "zqm-sro-member.test"), (own, ALICE)] {
+		let subs = cloudillo::meta_adapter::Action {
+			subject: Some(conv),
+			x: Some(serde_json::json!({ "role": "member" })),
+			..row(id, "SUBS", who)
+		};
+		seed_row(fx, alice, &subs, Some(&format!("SUBS:{conv}:{who}"))).await;
+	}
+	let role = |subject: &str| {
+		serde_json::json!({
+			"type": "SUBS", "subType": "ROLE", "subject": subject,
+			"content": { "role": "moderator" }
+		})
+	};
+	let (st, b) = post_action_as(fx, "owner@alice", &role(member)).await;
+	assert_eq!(st, StatusCode::CREATED, "AC-248: owner SUBS:ROLE → {b}");
+	assert_eq!(b["data"]["parentId"], conv, "AC-248: parent set to the group: {b}");
+	// The fixture runs no scheduler, so the queued creator task is run here, as it would be.
+	let task = fx
+		.app
+		.meta_adapter
+		.list_tasks(cloudillo::meta_adapter::ListTaskOptions::default())
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|t| &*t.kind == ActionCreatorTask::kind() && t.input.contains(member))
+		.expect("AC-248: creator task queued");
+	ActionCreatorTask::build(task.task_id, &task.input)
+		.unwrap()
+		.run(&fx.app)
+		.await
+		.unwrap();
+	let x = fx.app.meta_adapter.get_action(alice, member).await.unwrap().unwrap().x;
+	assert_eq!(x.unwrap_or_default()["role"], "moderator", "AC-248: role applied");
+	let (st, b) = post_action_as(fx, "owner@alice", &role(own)).await;
+	assert!(!st.is_success(), "AC-249: owner SUBS:ROLE on own SUBS → {st} {b}");
+	let upd = serde_json::json!({ "type": "SUBS", "subType": "UPD", "subject": member });
+	let (st, b) = post_action_as(fx, "owner@alice", &upd).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "AC-250: SUBS:UPD on a SUBS → {b}");
+}
+
+/// A personal group's kick is a SUBS:DEL naming the member's SUBS (`subs::may_kick`): the
+/// owner's removes the member (their SUBS goes to 'D'); the owner's own SUBS is not removable.
+#[tokio::test]
+async fn subs_kick_personal_group() {
+	use cloudillo::action::task::ActionCreatorTask;
+	use cloudillo_core::scheduler::Task;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let conv = "a1~zqm-kick-conv";
+	seed_row(fx, alice, &row(conv, "CONV", ALICE), None).await;
+	let (member, own) = ("a1~zqm-kick-member", "a1~zqm-kick-own");
+	for (id, who) in [(member, "zqm-kick-member.test"), (own, ALICE)] {
+		let subs = cloudillo::meta_adapter::Action { subject: Some(conv), ..row(id, "SUBS", who) };
+		seed_row(fx, alice, &subs, Some(&format!("SUBS:{conv}:{who}"))).await;
+	}
+	let kick = |subject: &str| {
+		serde_json::json!({
+			"type": "SUBS", "subType": "DEL", "subject": subject, "audienceTag": ALICE
+		})
+	};
+	let (st, b) = post_action_as(fx, "owner@alice", &kick(own)).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "AC-251: owner kicks own SUBS → {b}");
+	let (st, b) = post_action_as(fx, "owner@alice", &kick(member)).await;
+	assert_eq!(st, StatusCode::CREATED, "AC-230: owner kicks a member → {b}");
+	// The fixture runs no scheduler, so the queued creator task is run here, as it would be.
+	let task = fx
+		.app
+		.meta_adapter
+		.list_tasks(cloudillo::meta_adapter::ListTaskOptions::default())
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|t| &*t.kind == ActionCreatorTask::kind() && t.input.contains(member))
+		.expect("AC-230: creator task queued");
+	ActionCreatorTask::build(task.task_id, &task.input)
+		.unwrap()
+		.run(&fx.app)
+		.await
+		.unwrap();
+	let active = cloudillo::meta_adapter::ListActionOptions {
+		action_id: Some(member.into()),
+		status: Some(vec!["A".into()]),
+		..Default::default()
+	};
+	let left = fx.app.meta_adapter.list_actions(alice, &active).await.unwrap();
+	assert!(left.is_empty(), "AC-230: the member's SUBS is no longer active: {left:?}");
+}
+
+/// The tenant's reader state (`readerState`) is its own: listed and single GETs carry it only
+/// for the tenant. `?subscribed=true` reads the tenant's follow state, so it is the tenant's
+/// too. `?attachments=true` stays visibility-filtered. Search's `conv` peer scope lists only
+/// DMs between the tenant and that peer, and only to the tenant (MG-600..).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn reader_state_stays_private() {
+	use cloudillo::meta_adapter::PatchReaderState;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let post = inbound_flows::obj_id(fx, ALICE, "post-p-tenant-active");
+	let pin = PatchReaderState { pinned: Patch::Value(true), ..Default::default() };
+	meta.patch_reader_state(alice, "A:POST", &post, &pin, true).await.unwrap();
+	let get = |name: &'static str, uri: String| async move {
+		let s = fx.subject(name);
+		call(&fx.api, req(ALICE, Method::GET, &uri, bearer(s), Body::empty())).await
+	};
+	let single = format!("/api/actions/{post}");
+	let list = "/api/actions?type=POST&limit=200".to_string();
+	for name in [
+		"stranger@alice.test",
+		"follower@alice.test",
+		"via-embed@alice",
+		"sharelink-r@alice",
+	] {
+		for uri in [&list, &single] {
+			let (st, b) = get(name, uri.clone()).await;
+			assert!(st.is_success(), "MG-600 {name} {uri}: {st} {b}");
+			assert!(!b.to_string().contains("readerState"), "MG-600 {name} {uri} leaks: {b}");
+		}
+		let (st, _) = get(name, "/api/actions?subscribed=true".into()).await;
+		assert_eq!(st, StatusCode::FORBIDDEN, "MG-601 {name} ?subscribed=true");
+	}
+	for uri in [&list, &single] {
+		let (st, b) = get("owner@alice", uri.clone()).await;
+		assert!(b.to_string().contains("readerState"), "MG-602 owner {uri}: {st} {b}");
+		// SADM counts as the tenant for listing, but the reader state is the account's own.
+		let (st, b) = get("sadm-visit@alice", uri.clone()).await;
+		assert!(st.is_success(), "AC-252 sadm {uri}: {st} {b}");
+		assert!(!b.to_string().contains("readerState"), "AC-252 sadm {uri} leaks: {b}");
+	}
+	let (st, b) = get("owner@alice", "/api/actions?subscribed=true".into()).await;
+	assert!(st.is_success(), "MG-603 owner ?subscribed=true: {st} {b}");
+	// A Direct post with an attachment reaches no stranger through `?attachments=true`.
+	let mut d = row("a1~zqm-rsp-att", "POST", ALICE);
+	d.visibility = None;
+	d.attachments = Some(vec!["f1~zqm-rsp-att"]);
+	seed_row(fx, alice, &d, None).await;
+	let (st, b) = get("stranger@alice.test", "/api/actions?attachments=true".into()).await;
+	assert!(st.is_success() && !b.to_string().contains("zqm-rsp-att"), "MG-604: {st} {b}");
+	let (_, b) = get("owner@alice", "/api/actions?attachments=true".into()).await;
+	assert!(b.to_string().contains("zqm-rsp-att"), "MG-605 owner: {b}");
+
+	// DMs: one between alice and `peer`, one between `peer` and a third party alice holds.
+	let peer = "zqm-rsp-peer.test";
+	let text = format!(r#""{} rsp dm""#, ops::MARK);
+	let dm = |id: &'static str, iss: &'static str, aud: &'static str| {
+		let mut m = row(id, "MSG", iss);
+		m.audience_tag = Some(aud);
+		m.visibility = None;
+		m
+	};
+	for m in [
+		dm("a1~zqm-rsp-dm-own", peer, ALICE),
+		dm("a1~zqm-rsp-dm-other", peer, "zqm-rsp-third.test"),
+	] {
+		let m = cloudillo::meta_adapter::Action { content: Some(text.as_str()), ..m };
+		seed_row(fx, alice, &m, None).await;
+		cloudillo_search::objects::index_action(&fx.app, alice, m.action_id)
+			.await
+			.unwrap();
+	}
+	let conv = inbound_flows::obj_id(fx, ALICE, "container-p-tenant-active");
+	let search = |c: &str| format!("/api/search?q={}&conv={c}", ops::MARK);
+	for name in [
+		"stranger@alice.test",
+		"follower@alice.test",
+		"via-embed@alice",
+		"sharelink-r@alice",
+	] {
+		for c in [peer, "ZQM-RSP-PEER.test", conv.as_str()] {
+			let (_, b) = get(name, search(c)).await;
+			assert!(!b.to_string().contains("zqm-rsp-dm"), "MG-606 {name} conv={c}: {b}");
+		}
+	}
+	let (_, b) = get("owner@alice", search("ZQM-RSP-PEER.test")).await;
+	let b = b.to_string();
+	assert!(b.contains("zqm-rsp-dm-own"), "MG-607 owner sees its DM: {b}");
+	assert!(!b.contains("zqm-rsp-dm-other"), "MG-608 a DM between others: {b}");
 }

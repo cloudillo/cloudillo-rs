@@ -9,8 +9,8 @@
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{
 	Action, ActionId, CreateFile, FileStatus, FileView, ListActionOptions, ListProfileOptions,
-	MetaAdapter, ProfileConnectionStatus, ProfileRelation, ProfileStatus, ProfileType,
-	UpdateActionDataOptions, UpdateTenantData, UpsertProfileFields,
+	MetaAdapter, PatchReaderState, ProfileConnectionStatus, ProfileRelation, ProfileStatus,
+	ProfileType, UpdateActionDataOptions, UpdateTenantData, UpsertProfileFields,
 };
 use cloudillo_types::types::{Patch, Timestamp, TnId};
 use cloudillo_types::worker::WorkerPool;
@@ -1649,4 +1649,674 @@ async fn test_snapshot_round_trip() {
 		sqlx::query_scalar::<_, String>(q).fetch_all(&pool).await.unwrap()
 	};
 	assert_eq!(tables(snap).await, tables(src).await);
+}
+
+/// Unread compares local arrival time: align it with a test's `created_at` timeline.
+async fn set_received_at_to_created_at(temp: &TempDir) {
+	let pool = sqlx::sqlite::SqlitePoolOptions::new()
+		.connect(&format!("sqlite://{}/meta.db", temp.path().display()))
+		.await
+		.unwrap();
+	sqlx::query("UPDATE actions SET received_at = created_at")
+		.execute(&pool)
+		.await
+		.unwrap();
+}
+
+/// Reader state: forward-only `read_at`, upsert vs update-only stamps, unread recompute.
+#[tokio::test]
+async fn test_reader_state() {
+	let (adapter, temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.unwrap();
+
+	let msg = |action_id, issuer_tag, audience_tag, parent_id, at, x| Action {
+		action_id,
+		typ: "MSG",
+		sub_typ: None,
+		issuer_tag,
+		parent_id,
+		root_id: parent_id,
+		audience_tag,
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: Timestamp(at),
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x,
+		hat_tag: None,
+		channel: None,
+	};
+	let unread = async |kind, ref_| {
+		adapter.recompute_reader_unread(tn_id, kind, ref_).await.unwrap();
+		adapter
+			.get_reader_state(tn_id, kind, ref_)
+			.await
+			.unwrap()
+			.and_then(|r| r.unread)
+	};
+	let read_at = |t| PatchReaderState { read_at: Some(Timestamp(t)), ..Default::default() };
+
+	// Update-only stamp never creates a row; the insert stamp does.
+	adapter
+		.stamp_reader_activity(tn_id, "P:MSG", "bob", "m1", Timestamp(10), false)
+		.await
+		.unwrap();
+	assert!(adapter.get_reader_state(tn_id, "P:MSG", "bob").await.unwrap().is_none());
+	adapter
+		.stamp_reader_activity(tn_id, "P:MSG", "bob", "m1", Timestamp(10), true)
+		.await
+		.unwrap();
+	let rs = adapter.get_reader_state(tn_id, "P:MSG", "bob").await.unwrap().unwrap();
+	assert_eq!((rs.last_id.as_deref(), rs.last_at), (Some("m1"), Some(Timestamp(10))));
+	// last_at is forward-only too.
+	adapter
+		.stamp_reader_activity(tn_id, "P:MSG", "bob", "m0", Timestamp(5), true)
+		.await
+		.unwrap();
+	let rs = adapter.get_reader_state(tn_id, "P:MSG", "bob").await.unwrap().unwrap();
+	assert_eq!(rs.last_id.as_deref(), Some("m1"));
+
+	// P:MSG unread: bob's direct messages to alice only (not his group MSG, not alice's, not
+	// his DM to carol).
+	for a in [
+		msg("m1", "bob", Some("alice"), None, 10, None),
+		msg("m2", "bob", Some("alice"), None, 20, None),
+		msg("m3", "alice", Some("bob"), None, 30, None),
+		msg("g1", "bob", None, Some("conv1"), 30, None),
+		msg("m4", "bob", Some("carol"), None, 30, None),
+	] {
+		adapter.create_action(tn_id, &a, None).await.unwrap();
+	}
+	set_received_at_to_created_at(&temp).await;
+	assert_eq!(unread("P:MSG", "bob").await, Some(2));
+
+	// Forward-only read_at; an advance recomputes unread itself.
+	assert!(
+		adapter
+			.patch_reader_state(tn_id, "P:MSG", "bob", &read_at(10), true)
+			.await
+			.unwrap() == Some(Timestamp(10))
+	);
+	let rs = adapter.get_reader_state(tn_id, "P:MSG", "bob").await.unwrap().unwrap();
+	assert_eq!((rs.read_at, rs.unread), (Some(Timestamp(10)), Some(1)));
+	assert!(
+		adapter
+			.patch_reader_state(tn_id, "P:MSG", "bob", &read_at(5), true)
+			.await
+			.unwrap()
+			.is_none()
+	);
+	let rs = adapter.get_reader_state(tn_id, "P:MSG", "bob").await.unwrap().unwrap();
+	assert_eq!(rs.read_at, Some(Timestamp(10)));
+
+	// Patch upserts (insert = true) but not when update-only.
+	let pin = PatchReaderState { pinned: Patch::Value(true), ..Default::default() };
+	adapter.patch_reader_state(tn_id, "P:MSG", "carol", &pin, false).await.unwrap();
+	assert!(adapter.get_reader_state(tn_id, "P:MSG", "carol").await.unwrap().is_none());
+	adapter.patch_reader_state(tn_id, "A:CONV", "conv1", &pin, true).await.unwrap();
+	assert!(
+		adapter
+			.get_reader_state(tn_id, "A:CONV", "conv1")
+			.await
+			.unwrap()
+			.unwrap()
+			.pinned
+	);
+
+	// A:CONV unread: others' messages, minus tombstones; never the reader's own.
+	for a in [
+		msg("g2", "carol", None, Some("conv1"), 40, None),
+		msg("g3", "alice", None, Some("conv1"), 50, None),
+		msg(
+			"g4",
+			"carol",
+			None,
+			Some("conv1"),
+			60,
+			Some(serde_json::json!({ "deletedBy": "carol" })),
+		),
+	] {
+		adapter.create_action(tn_id, &a, None).await.unwrap();
+	}
+	assert_eq!(unread("A:CONV", "conv1").await, Some(2));
+}
+
+#[tokio::test]
+async fn test_reader_state_thread_unread() {
+	let (adapter, temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.unwrap();
+	let act = |action_id, typ, issuer_tag, parent_id, at| Action {
+		action_id,
+		typ,
+		sub_typ: None,
+		issuer_tag,
+		parent_id,
+		root_id: parent_id,
+		audience_tag: None,
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: Timestamp(at),
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+		hat_tag: None,
+		channel: None,
+	};
+	// A post, two foreign comments around a read marker, and the reader's own comment.
+	for a in [
+		act("p1", "POST", "bob", None, 10),
+		act("c1", "CMNT", "bob", Some("p1"), 20),
+		act("c2", "CMNT", "carol", Some("p1"), 40),
+		act("c3", "CMNT", "alice", Some("p1"), 50),
+	] {
+		adapter.create_action(tn_id, &a, None).await.unwrap();
+	}
+	set_received_at_to_created_at(&temp).await;
+	let read_at = |t| PatchReaderState { read_at: Some(Timestamp(t)), ..Default::default() };
+	adapter
+		.patch_reader_state(tn_id, "A:POST", "p1", &read_at(30), true)
+		.await
+		.unwrap();
+	adapter.recompute_reader_unread(tn_id, "A:POST", "p1").await.unwrap();
+	let unread = async || {
+		adapter
+			.get_reader_state(tn_id, "A:POST", "p1")
+			.await
+			.unwrap()
+			.and_then(|r| r.unread)
+	};
+	assert_eq!(unread().await, Some(1), "only the foreign comment after the marker");
+	adapter
+		.patch_reader_state(tn_id, "A:POST", "p1", &read_at(45), true)
+		.await
+		.unwrap();
+	assert_eq!(unread().await, Some(0), "moving the marker past it clears the count");
+}
+
+/// Auto-tracking a thread starts it read: the comments already there are not unread.
+#[tokio::test]
+async fn test_auto_track_reads_history() {
+	let (adapter, temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.unwrap();
+	let act = |action_id, typ, issuer_tag, parent_id, at| Action {
+		action_id,
+		typ,
+		sub_typ: None,
+		issuer_tag,
+		parent_id,
+		root_id: parent_id,
+		audience_tag: None,
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: Timestamp(at),
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+		hat_tag: None,
+		channel: None,
+	};
+	for a in [act("p1", "POST", "alice", None, 10), act("c1", "CMNT", "bob", Some("p1"), 20)] {
+		adapter.create_action(tn_id, &a, None).await.unwrap();
+	}
+	set_received_at_to_created_at(&temp).await;
+	adapter.auto_track_action(tn_id, "p1").await.unwrap();
+	adapter.recompute_reader_unread(tn_id, "A:POST", "p1").await.unwrap();
+	let rs = adapter.get_reader_state(tn_id, "A:POST", "p1").await.unwrap().unwrap();
+	assert_eq!(rs.unread, Some(0));
+}
+
+/// A watermark at (or past) now is stored a second back: a message from the same second stays
+/// unread instead of being missed for good.
+#[tokio::test]
+async fn test_reader_state_same_second_unread() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.unwrap();
+	// Retried on a fresh peer if the clock ticks mid-run: the edge is "the same second".
+	for peer in ["bob", "carol", "dave"] {
+		let now = Timestamp::now().0;
+		let id = format!("m-{peer}");
+		let m = Action {
+			action_id: id.as_str(),
+			typ: "MSG",
+			sub_typ: None,
+			issuer_tag: peer,
+			parent_id: None,
+			root_id: None,
+			audience_tag: Some("alice"),
+			content: None,
+			attachments: None,
+			subject: None,
+			created_at: Timestamp(now),
+			expires_at: None,
+			visibility: None,
+			flags: None,
+			x: None,
+			hat_tag: None,
+			channel: None,
+		};
+		adapter.create_action(tn_id, &m, None).await.unwrap();
+		let patch = PatchReaderState { read_at: Some(Timestamp(now + 100)), ..Default::default() };
+		adapter.patch_reader_state(tn_id, "P:MSG", peer, &patch, true).await.unwrap();
+		if Timestamp::now().0 != now {
+			continue;
+		}
+		let rs = adapter.get_reader_state(tn_id, "P:MSG", peer).await.unwrap().unwrap();
+		assert_eq!(rs.unread, Some(1));
+		return;
+	}
+	panic!("the clock ticked during every attempt");
+}
+
+/// A future-dated message (sender-controlled `created_at`) counts by its receive time, so a
+/// read watermark past that clears it.
+#[tokio::test]
+async fn test_reader_state_future_dated_unread() {
+	let (adapter, temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.unwrap();
+	let now = Timestamp::now().0;
+	let m = Action {
+		action_id: "m-future",
+		typ: "MSG",
+		sub_typ: None,
+		issuer_tag: "bob",
+		parent_id: None,
+		root_id: None,
+		audience_tag: Some("alice"),
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: Timestamp(now + 1_000_000),
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+		hat_tag: None,
+		channel: None,
+	};
+	adapter.create_action(tn_id, &m, None).await.unwrap();
+	let pool = sqlx::sqlite::SqlitePoolOptions::new()
+		.connect(&format!("sqlite://{}/meta.db", temp.path().display()))
+		.await
+		.unwrap();
+	sqlx::query("UPDATE actions SET received_at = ? WHERE action_id = 'm-future'")
+		.bind(now - 10)
+		.execute(&pool)
+		.await
+		.unwrap();
+	let patch = PatchReaderState { read_at: Some(Timestamp(now - 5)), ..Default::default() };
+	adapter.patch_reader_state(tn_id, "P:MSG", "bob", &patch, true).await.unwrap();
+	let rs = adapter.get_reader_state(tn_id, "P:MSG", "bob").await.unwrap().unwrap();
+	assert_eq!(rs.unread, Some(0));
+}
+
+/// A join marks the history read; a second read with nothing new since sends no receipt.
+#[tokio::test]
+async fn test_reader_state_join_reads_history() {
+	let (adapter, temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.unwrap();
+	for (id, at) in [("g1", 10), ("g2", 20), ("g3", 30)] {
+		let m = Action {
+			action_id: id,
+			typ: "MSG",
+			sub_typ: None,
+			issuer_tag: "bob",
+			parent_id: Some("conv1"),
+			root_id: Some("conv1"),
+			audience_tag: None,
+			content: None,
+			attachments: None,
+			subject: None,
+			created_at: Timestamp(at),
+			expires_at: None,
+			visibility: None,
+			flags: None,
+			x: None,
+			hat_tag: None,
+			channel: None,
+		};
+		adapter.create_action(tn_id, &m, None).await.unwrap();
+	}
+	set_received_at_to_created_at(&temp).await;
+	adapter
+		.stamp_reader_activity(tn_id, "A:CONV", "conv1", "g3", Timestamp(30), true)
+		.await
+		.unwrap();
+	// Past the latest message, but before now: the second read below is a real advance.
+	let join = PatchReaderState { read_at: Some(Timestamp(40)), ..Default::default() };
+	let first = adapter.patch_reader_state(tn_id, "A:CONV", "conv1", &join, true).await.unwrap();
+	assert!(first.is_some());
+	let rs = adapter.get_reader_state(tn_id, "A:CONV", "conv1").await.unwrap().unwrap();
+	assert_eq!(rs.unread, Some(0));
+	let again = PatchReaderState { read_at: Some(Timestamp::now()), ..Default::default() };
+	let second = adapter
+		.patch_reader_state(tn_id, "A:CONV", "conv1", &again, true)
+		.await
+		.unwrap();
+	assert_eq!(second, None);
+}
+
+/// A delayed delivery is read once `readAt` (a creation time, as clients send it) reaches its
+/// `created_at`, however late it arrived; before that it counts as unread.
+#[tokio::test]
+async fn test_reader_state_late_arrival_unread() {
+	let (adapter, temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.unwrap();
+	let m = Action {
+		action_id: "m-late",
+		typ: "MSG",
+		sub_typ: None,
+		issuer_tag: "bob",
+		parent_id: None,
+		root_id: None,
+		audience_tag: Some("alice"),
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: Timestamp(10),
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+		hat_tag: None,
+		channel: None,
+	};
+	adapter.create_action(tn_id, &m, None).await.unwrap();
+	let pool = sqlx::sqlite::SqlitePoolOptions::new()
+		.connect(&format!("sqlite://{}/meta.db", temp.path().display()))
+		.await
+		.unwrap();
+	sqlx::query("UPDATE actions SET received_at = 13 WHERE action_id = 'm-late'")
+		.execute(&pool)
+		.await
+		.unwrap();
+	let patch = PatchReaderState { read_at: Some(Timestamp(9)), ..Default::default() };
+	adapter.patch_reader_state(tn_id, "P:MSG", "bob", &patch, true).await.unwrap();
+	let rs = adapter.get_reader_state(tn_id, "P:MSG", "bob").await.unwrap().unwrap();
+	assert_eq!(rs.unread, Some(1));
+	let patch = PatchReaderState { read_at: Some(Timestamp(10)), ..Default::default() };
+	adapter.patch_reader_state(tn_id, "P:MSG", "bob", &patch, true).await.unwrap();
+	let rs = adapter.get_reader_state(tn_id, "P:MSG", "bob").await.unwrap().unwrap();
+	assert_eq!(rs.unread, Some(0));
+}
+
+#[tokio::test]
+async fn test_delete_action_token() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.unwrap();
+	adapter.store_action_token(tn_id, "a1~x", "tok").await.unwrap();
+	assert_eq!(adapter.get_action_token(tn_id, "a1~x").await.unwrap().as_deref(), Some("tok"));
+	adapter.delete_action_token(tn_id, "a1~x").await.unwrap();
+	assert!(adapter.get_action_token(tn_id, "a1~x").await.unwrap().is_none());
+	// Absent: a no-op.
+	adapter.delete_action_token(tn_id, "a1~x").await.unwrap();
+}
+
+#[tokio::test]
+async fn test_reader_state_patch() {
+	let (adapter, temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.unwrap();
+	let now = Timestamp::now().0;
+	let get = async |kind, ref_| adapter.get_reader_state(tn_id, kind, ref_).await.unwrap();
+	let apply = async |kind, ref_, p: PatchReaderState| {
+		adapter.patch_reader_state(tn_id, kind, ref_, &p, true).await
+	};
+
+	// The manual unread flag clears once read_at advances, and survives a re-send.
+	let unread_on = || PatchReaderState { unread_flag: Patch::Value(true), ..Default::default() };
+	let read = |t| PatchReaderState { read_at: Some(Timestamp(t)), ..Default::default() };
+	apply("P:MSG", "bob", unread_on()).await.unwrap();
+	assert!(get("P:MSG", "bob").await.unwrap().unread_flag);
+	assert_eq!(apply("P:MSG", "bob", read(now - 100)).await.unwrap(), Some(Timestamp(now - 100)));
+	assert!(!get("P:MSG", "bob").await.unwrap().unread_flag);
+	apply("P:MSG", "bob", unread_on()).await.unwrap();
+	assert!(apply("P:MSG", "bob", read(now - 100)).await.unwrap().is_none());
+	assert!(get("P:MSG", "bob").await.unwrap().unread_flag);
+
+	// A watermark in the future is clamped to a second before now; the stored value is returned.
+	let ret = apply("P:MSG", "bob", read(now + 1_000_000)).await.unwrap();
+	let at = get("P:MSG", "bob").await.unwrap().read_at.unwrap().0;
+	assert!(at < Timestamp::now().0 && at >= now - 1, "clamped read_at {at}");
+	assert_eq!(ret, Some(Timestamp(at)));
+
+	// The watermark never moves backwards.
+	assert_eq!(apply("P:MSG", "carol", read(now - 10)).await.unwrap(), Some(Timestamp(now - 10)));
+	assert!(apply("P:MSG", "carol", read(now - 100)).await.unwrap().is_none());
+	assert_eq!(get("P:MSG", "carol").await.unwrap().read_at, Some(Timestamp(now - 10)));
+
+	// ignoreAll / pinned round-trip; a letter this module does not own is kept.
+	let pool = sqlx::sqlite::SqlitePoolOptions::new()
+		.connect(&format!("sqlite://{}/meta.db", temp.path().display()))
+		.await
+		.unwrap();
+	let flags = async || -> Option<String> {
+		sqlx::query_scalar("SELECT flags FROM reader_state WHERE kind = 'A:CONV' AND ref = 'c1'")
+			.fetch_one(&pool)
+			.await
+			.unwrap()
+	};
+	let both = PatchReaderState {
+		pinned: Patch::Value(true),
+		ignore_all: Patch::Value(true),
+		..Default::default()
+	};
+	apply("A:CONV", "c1", both).await.unwrap();
+	let rs = get("A:CONV", "c1").await.unwrap();
+	assert!(rs.pinned && rs.ignore_all && !rs.archived);
+	sqlx::query("UPDATE reader_state SET flags = flags || 'Z' WHERE ref = 'c1'")
+		.execute(&pool)
+		.await
+		.unwrap();
+	let unpin = PatchReaderState {
+		pinned: Patch::Null,
+		ignore_all: Patch::Value(false),
+		..Default::default()
+	};
+	apply("A:CONV", "c1", unpin).await.unwrap();
+	let rs = get("A:CONV", "c1").await.unwrap();
+	assert!(!rs.pinned && !rs.ignore_all);
+	assert_eq!(flags().await.as_deref(), Some("Z"));
+
+	// An invalid notify level is refused; an expired notifyUntil reads as no level.
+	let bad = PatchReaderState { notify: Patch::Value('X'), ..Default::default() };
+	assert!(matches!(
+		apply("A:CONV", "c1", bad).await,
+		Err(cloudillo_types::error::Error::ValidationError(_))
+	));
+	let lapsed = |c| PatchReaderState {
+		notify: Patch::Value(c),
+		notify_until: Patch::Value(Timestamp(now - 10)),
+		..Default::default()
+	};
+	apply("A:CONV", "c1", lapsed('M')).await.unwrap();
+	assert_eq!(get("A:CONV", "c1").await.unwrap().notify, None);
+
+	// mentioned_at only moves forward.
+	adapter
+		.stamp_reader_mention(tn_id, "A:CONV", "c1", Timestamp(50))
+		.await
+		.unwrap();
+	adapter
+		.stamp_reader_mention(tn_id, "A:CONV", "c1", Timestamp(40))
+		.await
+		.unwrap();
+	assert_eq!(get("A:CONV", "c1").await.unwrap().mentioned_at, Some(Timestamp(50)));
+	// Reading up to the mention's creation time clears the badge (mentioned_at > read_at).
+	apply("A:CONV", "c1", read(50)).await.unwrap();
+	let rs = get("A:CONV", "c1").await.unwrap();
+	assert!(rs.mentioned_at <= rs.read_at, "badge still shown: {rs:?}");
+
+	adapter.delete_reader_state(tn_id, "A:CONV", "c1").await.unwrap();
+	assert!(get("A:CONV", "c1").await.is_none());
+
+	// auto_track: inserts T, never overrides a live W, re-tracks over an expired level.
+	let post = Action {
+		action_id: "p1",
+		typ: "POST",
+		sub_typ: None,
+		issuer_tag: "alice",
+		parent_id: None,
+		root_id: None,
+		audience_tag: None,
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: Timestamp(now - 1000),
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+		hat_tag: None,
+		channel: None,
+	};
+	adapter.create_action(tn_id, &post, None).await.unwrap();
+	adapter.auto_track_action(tn_id, "nope").await.unwrap();
+	assert!(get("A:POST", "nope").await.is_none());
+	adapter.auto_track_action(tn_id, "p1").await.unwrap();
+	assert_eq!(get("A:POST", "p1").await.unwrap().notify, Some('T'));
+	apply("A:POST", "p1", PatchReaderState { notify: Patch::Value('W'), ..Default::default() })
+		.await
+		.unwrap();
+	adapter.auto_track_action(tn_id, "p1").await.unwrap();
+	assert_eq!(get("A:POST", "p1").await.unwrap().notify, Some('W'));
+	apply("A:POST", "p1", lapsed('M')).await.unwrap();
+	adapter.auto_track_action(tn_id, "p1").await.unwrap();
+	let rs = get("A:POST", "p1").await.unwrap();
+	assert_eq!((rs.notify, rs.notify_until), (Some('T'), None));
+	// A user's explicit reset to the default sticks; a row whose notify the user never
+	// touched (here only pinned) still auto-tracks.
+	apply("A:POST", "p1", PatchReaderState { notify: Patch::Null, ..Default::default() })
+		.await
+		.unwrap();
+	adapter.auto_track_action(tn_id, "p1").await.unwrap();
+	assert_eq!(get("A:POST", "p1").await.unwrap().notify, None);
+	adapter
+		.create_action(tn_id, &Action { action_id: "p2", ..post }, None)
+		.await
+		.unwrap();
+	apply("A:POST", "p2", PatchReaderState { pinned: Patch::Value(true), ..Default::default() })
+		.await
+		.unwrap();
+	adapter.auto_track_action(tn_id, "p2").await.unwrap();
+	assert_eq!(get("A:POST", "p2").await.unwrap().notify, Some('T'));
+
+	// list: kinds filter, then a keyset cursor across two pages (newest last_at first).
+	for (peer, at) in [("p-a", 30), ("p-b", 20), ("p-c", 10)] {
+		adapter
+			.stamp_reader_activity(tn_id, "P:POST", peer, "x", Timestamp(at), true)
+			.await
+			.unwrap();
+	}
+	let page = async |cursor| {
+		let opts = cloudillo_types::meta_adapter::ListReaderStateOptions {
+			kinds: vec!["P:POST".into()],
+			limit: 2,
+			cursor,
+			include_ref: false,
+			include_last: false,
+		};
+		adapter.list_reader_state(tn_id, &opts).await.unwrap()
+	};
+	let first = page(None).await;
+	let refs: Vec<&str> = first.iter().map(|r| r.ref_.as_ref()).collect();
+	assert_eq!(refs, ["p-a", "p-b"]);
+	let last = &first[1];
+	let cursor = Some((last.last_at.unwrap(), last.kind.clone(), last.ref_.clone()));
+	let second = page(cursor).await;
+	let refs: Vec<&str> = second.iter().map(|r| r.ref_.as_ref()).collect();
+	assert_eq!(refs, ["p-c"]);
+}
+
+/// `container` lists a conversation's rows: the CONV, its children, the actions naming it
+/// (with a superseded 'D' join kept as history), and a kick naming a member's SUBS.
+#[tokio::test]
+async fn test_list_actions_container() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter
+		.create_tenant(tn_id, "owner.example")
+		.await
+		.expect("Should create tenant");
+
+	let now = Timestamp::now();
+	let row = |action_id: &'static str,
+	           typ: &'static str,
+	           sub_typ: Option<&'static str>,
+	           issuer_tag: &'static str,
+	           parent_id: Option<&'static str>,
+	           subject: Option<&'static str>| Action {
+		action_id,
+		typ,
+		sub_typ,
+		issuer_tag,
+		parent_id,
+		root_id: None,
+		audience_tag: None,
+		content: None,
+		attachments: None,
+		subject,
+		created_at: now,
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+		hat_tag: None,
+		channel: None,
+	};
+	let conv = "a1~conv";
+	let rows = [
+		(row(conv, "CONV", None, "owner.example", None, None), None),
+		(row("a1~msg", "MSG", None, "bob.example", Some(conv), None), None),
+		(row("a1~upd", "CONV", Some("UPD"), "owner.example", None, Some(conv)), None),
+		(row("a1~join", "SUBS", None, "bob.example", None, Some(conv)), Some("SUBS:a1~conv:bob")),
+		(
+			row("a1~leave", "SUBS", Some("DEL"), "bob.example", None, Some(conv)),
+			Some("SUBS:a1~conv:bob"),
+		),
+		(row("a1~carol", "SUBS", None, "carol.example", None, Some(conv)), None),
+		(row("a1~invt", "INVT", None, "owner.example", None, Some(conv)), None),
+		(row("a1~kick", "SUBS", Some("DEL"), "owner.example", None, Some("a1~carol")), None),
+		(row("a1~other", "MSG", None, "bob.example", Some("a1~conv2"), None), None),
+	];
+	for (action, key) in &rows {
+		adapter.create_action(tn_id, action, *key).await.expect("create action");
+	}
+
+	let superseded = ListActionOptions {
+		action_id: Some("a1~join".into()),
+		status: Some(vec!["D".into()]),
+		..Default::default()
+	};
+	let join = adapter.list_actions(tn_id, &superseded).await.expect("list_actions");
+	assert_eq!(join.len(), 1, "the leave supersedes the join");
+
+	let opts = ListActionOptions { container: Some(conv.into()), ..Default::default() };
+	let mut ids: Vec<String> = adapter
+		.list_actions(tn_id, &opts)
+		.await
+		.expect("list_actions")
+		.into_iter()
+		.map(|a| a.action_id.to_string())
+		.collect();
+	ids.sort();
+	assert_eq!(
+		ids,
+		[
+			"a1~carol", "a1~conv", "a1~invt", "a1~join", "a1~kick", "a1~leave", "a1~msg", "a1~upd"
+		]
+	);
 }

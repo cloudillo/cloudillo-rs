@@ -22,8 +22,11 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		post_definition(),
 		post_ldoc_definition(),
 		react_definition(),
+		pin_definition(),
+		rcpt_definition(),
 		comment_definition(),
 		message_definition(),
+		message_del_definition(),
 		repost_definition(),
 		aprv_definition(),
 		stat_definition(),
@@ -32,7 +35,10 @@ pub fn get_definitions() -> Vec<ActionDefinition> {
 		fileshare_del_definition(),
 		pres_definition(),
 		subs_definition(),
+		subs_upd_definition(),
 		conv_definition(),
+		conv_upd_definition(),
+		subs_role_definition(),
 		invt_definition(),
 		prinvt_definition(),
 		apkg_definition(),
@@ -396,6 +402,7 @@ fn react_definition() -> ActionDefinition {
 		},
 		schema: None,
 		behavior: BehaviorFlags {
+			fanout_via_subject: Some(true),
 			allow_hat: Some(true),
 			broadcast: Some(false),
 			allow_unknown: Some(true),
@@ -417,6 +424,123 @@ fn react_definition() -> ActionDefinition {
 			requires_connected: Some(false),
 		}),
 		key_pattern: Some("{type}:{subject}:{issuer}".to_string()), // One reaction per user per action
+		search: None,
+	}
+}
+
+/// PIN - Pin a message in its conversation. `subject` = the MSG; a group pin's
+/// `parent` is the CONV (`post_action` fills it in). Keyed per message, so `PIN:DEL` unpins.
+/// Authority (CONV moderator+, or a DM participant) is checked pre-store by
+/// `native_hooks::pin::check_authority`, not by subscription: a member would pass that
+/// check on their own message as its creator, and a DM has no SUBS at all.
+fn pin_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "PIN".to_string(),
+		version: "1.0".to_string(),
+		description: "Pin a message in its conversation".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("communication".to_string()),
+			tags: Some(vec!["pin".to_string(), "message".to_string()]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: Some(HashMap::from([("DEL".to_string(), "Unpin a message".to_string())])),
+		fields: FieldConstraints {
+			content: Some(FieldConstraint::Forbidden),
+			audience: None, // group: the CONV owner; DM: the peer
+			parent: None,   // group: the CONV
+			attachments: Some(FieldConstraint::Forbidden),
+			subject: Some(FieldConstraint::Required), // the pinned MSG
+		},
+		schema: None,
+		behavior: BehaviorFlags {
+			fanout_via_subject: Some(true),
+			broadcast: Some(false),
+			allow_unknown: Some(true),
+			requires_acceptance: Some(false),
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None, // Native hook (native_hooks::pin)
+			on_receive: HookImplementation::None,
+			on_accept: HookImplementation::None,
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("any".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(false),
+		}),
+		// One pin per message, shared by the room: in a DM either party may pin or unpin it, in
+		// a group CONV moderators and above (`native_hooks::pin::check_authority`).
+		key_pattern: Some("{type}:{subject}".to_string()),
+		search: None,
+	}
+}
+
+/// RCPT - Read receipt. Sent by the server from `PATCH /api/reader-state`, never by
+/// a client. Group: `subject` = the CONV, `audience` = its owner; DM: no subject, `audience` =
+/// the peer. Content is the newest-read timestamp (epoch seconds). The key replaces the
+/// previous receipt of the same issuer in the same conversation, on both ends.
+fn rcpt_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "RCPT".to_string(),
+		version: "1.0".to_string(),
+		description: "Read receipt for a conversation".to_string(),
+		metadata: Some(ActionMetadata {
+			category: Some("communication".to_string()),
+			tags: Some(vec!["receipt".to_string(), "message".to_string()]),
+			deprecated: None,
+			experimental: None,
+		}),
+		subtypes: None,
+		fields: FieldConstraints {
+			content: Some(FieldConstraint::Required),
+			audience: None,
+			parent: Some(FieldConstraint::Forbidden),
+			attachments: Some(FieldConstraint::Forbidden),
+			subject: None, // group: the CONV; DM: none
+		},
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Number,
+				min_length: None,
+				max_length: None,
+				pattern: None,
+				r#enum: None,
+				properties: None,
+				required: None,
+				wrap_scalar: None,
+				description: Some("Newest-read timestamp (epoch seconds)".to_string()),
+			}),
+		}),
+		behavior: BehaviorFlags {
+			fanout_via_subject: Some(true),
+			broadcast: Some(false),
+			allow_unknown: Some(false),
+			requires_acceptance: Some(false),
+			requires_subscription: Some(true), // a group receipt needs a SUBS on the CONV
+			server_emitted: Some(true),
+			// Direct: a DM receipt has no subject to inherit from; a group one inherits the
+			// CONV's 'S'
+			default_visibility: Some('D'),
+			..Default::default()
+		},
+		hooks: ActionHooks {
+			on_create: HookImplementation::None,
+			on_receive: HookImplementation::None,
+			on_accept: HookImplementation::None,
+			on_reject: HookImplementation::None,
+		},
+		permissions: Some(PermissionRules {
+			can_create: Some("authenticated".to_string()),
+			can_receive: Some("authenticated".to_string()),
+			requires_following: Some(false),
+			requires_connected: Some(false),
+		}),
+		// `{audience}` keeps a sender's DM receipts to different peers apart.
+		key_pattern: Some("{type}:{subject}:{audience}:{issuer}".to_string()),
 		search: None,
 	}
 }
@@ -506,13 +630,14 @@ fn message_definition() -> ActionDefinition {
 		subtypes: Some({
 			let mut map = HashMap::new();
 			map.insert("DEL".to_string(), "Delete message".to_string());
+			map.insert("UPD".to_string(), "Edit message".to_string());
 			map
 		}),
 		fields: FieldConstraints {
 			content: Some(FieldConstraint::Required),
 			audience: None, // Optional: for DMs. For CONV messages, inherits from CONV.
 			parent: None,   // Optional: CONV_id for first message, MSG_id for replies
-			subject: None,  // Optional: Reserved for future use
+			subject: None,  // MSG:UPD / MSG:DEL: the target MSG id (native_hooks::msg)
 			..Default::default()
 		},
 		schema: Some(ContentSchemaWrapper {
@@ -529,6 +654,7 @@ fn message_definition() -> ActionDefinition {
 			}),
 		}),
 		behavior: BehaviorFlags {
+			fanout_via_subject: Some(true),
 			allow_hat: Some(true),
 			broadcast: Some(false),
 			allow_unknown: Some(false),
@@ -555,6 +681,26 @@ fn message_definition() -> ActionDefinition {
 			"v": 1,
 			"body": [{ "field": "content", "extract": "text" }]
 		})),
+	}
+}
+
+/// MSG:DEL - a delete names its target as `subject` and carries no content (optional, unchecked).
+/// Not full-text indexed. Everything else is MSG's; `native_hooks` registers the MSG hooks under
+/// this key too, since hook dispatch resolves to it.
+fn message_del_definition() -> ActionDefinition {
+	let base = message_definition();
+	ActionDefinition {
+		r#type: "MSG:DEL".to_string(),
+		description: "Delete a message".to_string(),
+		subtypes: None,
+		fields: FieldConstraints { content: None, ..base.fields },
+		schema: None,
+		search: None,
+		// The subscription gate checks SUBS on the target MSG or its root, which the CONV
+		// creator never holds; `native_hooks::msg::check_edit_authority` (author, or CONV
+		// moderator+) is the gate instead, pre-store on both paths.
+		behavior: BehaviorFlags { requires_subscription: Some(false), ..base.behavior },
+		..base
 	}
 }
 
@@ -1202,7 +1348,7 @@ fn conv_definition() -> ActionDefinition {
 		}),
 		fields: FieldConstraints {
 			content: Some(FieldConstraint::Required), // name, description
-			audience: None, // Optional: community conversations have community as audience
+			audience: None, // Optional; a community group takes none (refused in `post_action`)
 			parent: Some(FieldConstraint::Forbidden),
 			attachments: None,                         // Optional cover image
 			subject: Some(FieldConstraint::Forbidden), // CONV is the root
@@ -1238,6 +1384,41 @@ fn conv_definition() -> ActionDefinition {
 							items: None,
 						},
 					);
+					// Community group join policy (meaningless on a personal group): `role` —
+					// members at or above `joinMinRole` join, those below knock; `request` —
+					// every join is a knock; `private` — invite-only and unlisted. Absent reads
+					// as `private`. Followers and `public` never join or knock (not offered).
+					props.insert(
+						"join".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(10),
+							r#enum: Some(
+								["role", "request", "private"]
+									.into_iter()
+									.map(|s| serde_json::Value::String(s.to_string()))
+									.collect(),
+							),
+							items: None,
+						},
+					);
+					// Absent with `join: "role"` reads as `supporter`.
+					props.insert(
+						"joinMinRole".to_string(),
+						SchemaField {
+							field_type: FieldType::String,
+							min_length: None,
+							max_length: Some(20),
+							r#enum: Some(
+								["supporter", "contributor", "moderator", "leader"]
+									.into_iter()
+									.map(|s| serde_json::Value::String(s.to_string()))
+									.collect(),
+							),
+							items: None,
+						},
+					);
 					props
 				}),
 				required: Some(vec!["name".to_string()]),
@@ -1259,7 +1440,7 @@ fn conv_definition() -> ActionDefinition {
 			..Default::default()
 		},
 		hooks: ActionHooks {
-			on_create: HookImplementation::None, // Native hook creates admin SUBS
+			on_create: HookImplementation::None, // Native hook: admin SUBS for a personal group
 			on_receive: HookImplementation::None,
 			on_accept: HookImplementation::None,
 			on_reject: HookImplementation::None,
@@ -1276,6 +1457,99 @@ fn conv_definition() -> ActionDefinition {
 			"title": ["content.name"],
 			"body": [{ "field": "content", "extract": "text" }]
 		})),
+	}
+}
+
+/// CONV:UPD - group settings, naming the CONV as `subject`. An admin's UPD is addressed to the
+/// CONV's host, which applies it and relays it to the members with an owner APRV
+/// (`fanout::maybe_relay_child_to_subscribers`); the host's own UPD has no audience and fans
+/// out directly (`fanout_via_subject`). Applied by `native_hooks::conv::apply_upd`.
+fn conv_upd_definition() -> ActionDefinition {
+	let base = conv_definition();
+	ActionDefinition {
+		r#type: "CONV:UPD".to_string(),
+		description: "Update conversation settings".to_string(),
+		subtypes: None,
+		fields: FieldConstraints {
+			subject: Some(FieldConstraint::Required),
+			audience: None,
+			..base.fields
+		},
+		behavior: BehaviorFlags {
+			fanout_via_subject: Some(true),
+			// CONV's "rco" would be stamped on the UPD and then copied onto the CONV.
+			default_flags: None,
+			// Not a container: nothing subscribes to or hangs off a UPD.
+			subscribable: None,
+			relay_children: None,
+			..base.behavior
+		},
+		// The apply step re-indexes the CONV.
+		search: None,
+		..base
+	}
+}
+
+/// SUBS:UPD - subscription preferences update. Its own key, like CONN:UPD: a UPD must never
+/// supersede the membership row (inbound that unsubscribes the member, locally it leaves an
+/// active row with `sub_typ = UPD`).
+fn subs_upd_definition() -> ActionDefinition {
+	ActionDefinition {
+		r#type: "SUBS:UPD".to_string(),
+		// SUBS lists UPD among its subTypes; the derived definition has none of its own.
+		subtypes: None,
+		key_pattern: Some("{type}:UPD:{subject}:{issuer}".to_string()),
+		..subs_definition()
+	}
+}
+
+/// SUBS:ROLE - a group admin sets a member's role, naming the member's SUBS as `subject` and the
+/// CONV as `parent` (set by `native_hooks::subs::role_before_create`). Like CONV:UPD: the host's
+/// own change has no audience and fans out through the parent; an admin's request is addressed to
+/// the host, which applies it and relays it with an owner APRV. Applied by
+/// `native_hooks::subs::apply_role`.
+fn subs_role_definition() -> ActionDefinition {
+	let base = subs_definition();
+	ActionDefinition {
+		r#type: "SUBS:ROLE".to_string(),
+		description: "Set a group member's role".to_string(),
+		subtypes: None,
+		fields: FieldConstraints {
+			content: Some(FieldConstraint::Required),
+			audience: None,
+			parent: Some(FieldConstraint::Required),
+			..base.fields
+		},
+		schema: Some(ContentSchemaWrapper {
+			content: Some(ContentSchema {
+				content_type: ContentType::Object,
+				min_length: None,
+				max_length: None,
+				pattern: None,
+				r#enum: None,
+				properties: Some(HashMap::from([(
+					"role".to_string(),
+					SchemaField {
+						field_type: FieldType::String,
+						min_length: None,
+						max_length: Some(20),
+						r#enum: Some(
+							["observer", "member", "moderator", "admin"]
+								.map(serde_json::Value::from)
+								.to_vec(),
+						),
+						items: None,
+					},
+				)])),
+				required: Some(vec!["role".to_string()]),
+				wrap_scalar: None,
+				description: Some("The member's new group role".to_string()),
+			}),
+		}),
+		// The `x.roleAt` ordering guard replaces de-duplication; the base pattern would also
+		// collide with stray SUBS:UPD rows.
+		key_pattern: None,
+		..base
 	}
 }
 
@@ -1555,7 +1829,7 @@ fn bdg_schema(levels: Option<&[&str]>) -> ContentSchemaWrapper {
 
 /// A postable badge slot. Its own key per slot, so a new tier replaces the old one in the same
 /// slot but never the other slot's badge. `allow_unknown`: the outbound gate would refuse a
-/// follower-only audience; the pre-store checks (`post_action`, `bdg::check_inbound`) gate it.
+/// follower-only audience; the pre-store hooks (`bdg::before_create`, `bdg::before_receive`) gate it.
 fn bdg_slot_definition(slot: &str, levels: &[&str]) -> ActionDefinition {
 	let base = bdg_definition();
 	ActionDefinition {
@@ -1873,6 +2147,33 @@ mod tests {
 		assert_eq!(key("CONN", Some("ACC")).as_deref(), Some("CONN:a:b"));
 	}
 
+	/// A `SUBS:UPD` keys apart from the membership row, so storing one never supersedes it.
+	#[test]
+	fn subs_upd_has_its_own_key() {
+		let mut engine = crate::dsl::engine::DslEngine::new();
+		for def in get_definitions() {
+			engine.load_definition(def);
+		}
+		let key = |sub: Option<&str>| {
+			engine
+				.definition_for("SUBS", sub)
+				.and_then(|d| d.key_pattern.as_deref())
+				.map(|p| {
+					crate::helpers::apply_key_pattern(
+						p,
+						"SUBS",
+						"m",
+						None,
+						None,
+						Some("a1~c"),
+						None,
+					)
+				})
+		};
+		assert_eq!(key(None).as_deref(), Some("SUBS:a1~c:m"));
+		assert_eq!(key(Some("UPD")).as_deref(), Some("SUBS:UPD:a1~c:m"));
+	}
+
 	// Regression: CONV defaults to 'S'; MSG/SUBS have no own default and inherit
 	// it via `helpers::inherit_context`. Do not flip CONV to 'C' — see
 	// `helpers::apply_open_flag_visibility` for why that leaks group content and
@@ -1893,6 +2194,22 @@ mod tests {
 				"{typ} must have no own visibility default so it inherits the CONV's 'S'"
 			);
 		}
+	}
+
+	/// A CONV is the root and names no subject; a CONV:UPD names the CONV it updates.
+	#[test]
+	fn conv_upd_requires_subject_and_conv_forbids_it() {
+		let mut engine = crate::dsl::engine::DslEngine::new();
+		for def in get_definitions() {
+			engine.load_definition(def);
+		}
+		let subject = |typ: &str, sub: Option<&str>| {
+			engine.definition_for(typ, sub).and_then(|d| d.fields.subject)
+		};
+		assert_eq!(subject("CONV", Some("UPD")), Some(FieldConstraint::Required));
+		assert_eq!(subject("CONV:UPD", None), Some(FieldConstraint::Required));
+		assert_eq!(subject("CONV", None), Some(FieldConstraint::Forbidden));
+		assert_eq!(subject("CONV", Some("DEL")), Some(FieldConstraint::Forbidden));
 	}
 
 	/// `IdpRegContent` is `#[serde(rename_all = "camelCase")]`, so the wire content is

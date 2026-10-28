@@ -16,6 +16,8 @@
 //! - fshr: File sharing lifecycle management (FSHR)
 //! - idp: Identity provider operations (IDP:REG)
 //! - invt: Invitation management (INVT)
+//! - pin: Pinned-message authority and pin cap (PIN)
+//! - pres: Presence membership gate and group typing relay (PRES)
 //! - prinvt: Profile invite notification (PRINVT)
 //! - ptnr: Community partnership announcement (PTNR)
 //! - react: Reaction management (REACT)
@@ -33,6 +35,8 @@ pub mod idp;
 pub mod invt;
 pub mod msg;
 pub(crate) mod ownership;
+pub mod pin;
+pub(crate) mod pres;
 pub mod prinvt;
 pub mod ptnr;
 pub mod react;
@@ -66,6 +70,13 @@ pub(crate) async fn conn_follower_patch(app: &App, tn_id: TnId, id_tag: &str) ->
 	}
 }
 
+/// Auto-track `root_id` for the local reader (coalesce), logging a failure as `hook`.
+pub(crate) async fn auto_track_root(app: &App, tn_id: TnId, root_id: &str, hook: &str) {
+	if let Err(e) = app.meta_adapter.auto_track_action(tn_id, root_id).await {
+		tracing::warn!("{hook}: auto-track of root {root_id} failed: {e}");
+	}
+}
+
 /// Register all native hooks into the app's hook registry
 pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 	let hook_registry = app.ext::<Arc<tokio::sync::RwLock<HookRegistry>>>()?;
@@ -79,6 +90,7 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(conn::on_receive(app, ctx)))),
 			on_accept: Some(Arc::new(|app, ctx| Box::pin(conn::on_accept(app, ctx)))),
 			on_reject: Some(Arc::new(|app, ctx| Box::pin(conn::on_reject(app, ctx)))),
+			..Default::default()
 		};
 
 		registry.register_type("CONN", conn_hooks.clone());
@@ -91,8 +103,7 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		let fllw_hooks = ActionTypeHooks {
 			on_create: Some(Arc::new(|app, ctx| Box::pin(fllw::on_create(app, ctx)))),
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(fllw::on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..Default::default()
 		};
 
 		registry.register_type("FLLW", fllw_hooks);
@@ -102,10 +113,8 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 	// IDP:REG hooks
 	{
 		let idp_reg_hooks = ActionTypeHooks {
-			on_create: None,
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(idp::idp_reg_on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..Default::default()
 		};
 
 		registry.register_type("IDP:REG", idp_reg_hooks);
@@ -115,10 +124,8 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 	// PTNR hooks (emitted from the CONN hooks via `ptnr::announce_partnership`)
 	{
 		let ptnr_hooks = ActionTypeHooks {
-			on_create: None,
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(ptnr::on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..Default::default()
 		};
 
 		registry.register_type("PTNR", ptnr_hooks);
@@ -131,7 +138,7 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 			on_create: Some(Arc::new(|app, ctx| Box::pin(fshr::on_create(app, ctx)))),
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(fshr::on_receive(app, ctx)))),
 			on_accept: Some(Arc::new(|app, ctx| Box::pin(fshr::on_accept(app, ctx)))),
-			on_reject: None,
+			..Default::default()
 		};
 
 		// FSHR:DEL has its own definition (content-free), so dispatch resolves to that key.
@@ -145,8 +152,7 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		let react_hooks = ActionTypeHooks {
 			on_create: Some(Arc::new(|app, ctx| Box::pin(react::on_create(app, ctx)))),
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(react::on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..Default::default()
 		};
 
 		registry.register_type("REACT", react_hooks);
@@ -158,8 +164,7 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		let repost_hooks = ActionTypeHooks {
 			on_create: Some(Arc::new(|app, ctx| Box::pin(repost::on_create(app, ctx)))),
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(repost::on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..Default::default()
 		};
 
 		registry.register_type("REPOST", repost_hooks);
@@ -171,8 +176,7 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 		let cmnt_hooks = ActionTypeHooks {
 			on_create: Some(Arc::new(|app, ctx| Box::pin(cmnt::on_create(app, ctx)))),
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(cmnt::on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..Default::default()
 		};
 
 		registry.register_type("CMNT", cmnt_hooks);
@@ -183,62 +187,107 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 	// counters, reusing the same machinery CMNT uses (see native_hooks::msg).
 	{
 		let msg_hooks = ActionTypeHooks {
+			before_create: Some(Arc::new(|app, ctx| Box::pin(msg::before_create(app, ctx)))),
+			before_receive: Some(Arc::new(|app, ctx| Box::pin(msg::before_receive(app, ctx)))),
 			on_create: Some(Arc::new(|app, ctx| Box::pin(msg::on_create(app, ctx)))),
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(msg::on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..Default::default()
 		};
 
+		// MSG:DEL has its own definition (content-free), so dispatch resolves to that key.
+		registry.register_type("MSG:DEL", msg_hooks.clone());
 		registry.register_type("MSG", msg_hooks);
 		tracing::info!("Registered native hooks for MSG action type");
+	}
+
+	// PIN hooks — authority pre-store (`before_*`), the 10-pin cap after.
+	// PIN:DEL has no definition of its own, so dispatch resolves it to "PIN".
+	{
+		let pin_hooks = ActionTypeHooks {
+			before_create: Some(Arc::new(|app, ctx| Box::pin(pin::before_create(app, ctx)))),
+			before_receive: Some(Arc::new(|app, ctx| Box::pin(pin::before_receive(app, ctx)))),
+			on_create: Some(Arc::new(|app, ctx| Box::pin(pin::on_store(app, ctx)))),
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(pin::on_store(app, ctx)))),
+			..Default::default()
+		};
+
+		registry.register_type("PIN", pin_hooks);
+		tracing::info!("Registered native hooks for PIN action type");
 	}
 
 	// APRV hooks
 	{
 		let aprv_hooks = ActionTypeHooks {
-			on_create: None,
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(aprv::on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..Default::default()
 		};
 
 		registry.register_type("APRV", aprv_hooks);
 		tracing::info!("Registered native hooks for APRV action type");
 	}
 
-	// SUBS hooks
+	// SUBS hooks — SUBS:DEL has no definition of its own, so dispatch resolves it to "SUBS".
 	{
 		let subs_hooks = ActionTypeHooks {
+			before_create: Some(Arc::new(|app, ctx| Box::pin(subs::before_create(app, ctx)))),
+			before_receive: Some(Arc::new(|app, ctx| Box::pin(subs::before_receive(app, ctx)))),
 			on_create: Some(Arc::new(|app, ctx| Box::pin(subs::on_create(app, ctx)))),
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(subs::on_receive(app, ctx)))),
 			on_accept: Some(Arc::new(|app, ctx| Box::pin(subs::on_accept(app, ctx)))),
-			on_reject: None,
+			on_reject: Some(Arc::new(|app, ctx| Box::pin(subs::on_reject(app, ctx)))),
 		};
 
+		// SUBS:UPD has its own definition (its own key), so dispatch resolves to that key.
+		registry.register_type("SUBS:UPD", subs_hooks.clone());
 		registry.register_type("SUBS", subs_hooks);
+
+		// SUBS:ROLE has its own definition (subject = the member's SUBS), so dispatch resolves
+		// to that key.
+		let subs_role_hooks = ActionTypeHooks {
+			before_create: Some(Arc::new(|app, ctx| Box::pin(subs::role_before_create(app, ctx)))),
+			before_receive: Some(Arc::new(|app, ctx| {
+				Box::pin(subs::role_before_receive(app, ctx))
+			})),
+			on_create: Some(Arc::new(|app, ctx| Box::pin(subs::role_on_create(app, ctx)))),
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(subs::role_on_receive(app, ctx)))),
+			..Default::default()
+		};
+		registry.register_type("SUBS:ROLE", subs_role_hooks);
 		tracing::info!("Registered native hooks for SUBS action type");
 	}
 
 	// CONV hooks
 	{
 		let conv_hooks = ActionTypeHooks {
+			before_create: Some(Arc::new(|app, ctx| Box::pin(conv::before_create(app, ctx)))),
 			on_create: Some(Arc::new(|app, ctx| Box::pin(conv::on_create(app, ctx)))),
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(conv::on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..Default::default()
 		};
 
 		registry.register_type("CONV", conv_hooks);
+
+		// CONV:UPD has its own definition (subject = the CONV), so dispatch resolves to that key.
+		let conv_upd_hooks = ActionTypeHooks {
+			before_create: Some(Arc::new(|app, ctx| Box::pin(conv::upd_before_create(app, ctx)))),
+			before_receive: Some(Arc::new(|app, ctx| Box::pin(conv::upd_before_receive(app, ctx)))),
+			on_create: Some(Arc::new(|app, ctx| Box::pin(conv::upd_on_create(app, ctx)))),
+			on_receive: Some(Arc::new(|app, ctx| Box::pin(conv::upd_on_receive(app, ctx)))),
+			..Default::default()
+		};
+		registry.register_type("CONV:UPD", conv_upd_hooks);
 		tracing::info!("Registered native hooks for CONV action type");
 	}
 
 	// INVT hooks
 	{
 		let invt_hooks = ActionTypeHooks {
+			before_create: Some(Arc::new(|app, ctx| Box::pin(invt::before_create(app, ctx)))),
+			before_receive: Some(Arc::new(|app, ctx| Box::pin(invt::before_receive(app, ctx)))),
 			on_create: Some(Arc::new(|app, ctx| Box::pin(invt::on_create(app, ctx)))),
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(invt::on_receive(app, ctx)))),
 			on_accept: Some(Arc::new(|app, ctx| Box::pin(invt::on_accept(app, ctx)))),
-			on_reject: None,
+			..Default::default()
 		};
 
 		registry.register_type("INVT", invt_hooks);
@@ -248,10 +297,8 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 	// STAT hooks
 	{
 		let stat_hooks = ActionTypeHooks {
-			on_create: None,
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(stat::on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..Default::default()
 		};
 
 		registry.register_type("STAT", stat_hooks);
@@ -261,29 +308,44 @@ pub async fn register_native_hooks(app: &App) -> ClResult<()> {
 	// PRINVT hooks
 	{
 		let prinvt_hooks = ActionTypeHooks {
-			on_create: None,
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(prinvt::on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..Default::default()
 		};
 
 		registry.register_type("PRINVT", prinvt_hooks);
 		tracing::info!("Registered native hooks for PRINVT action type");
 	}
 
-	// BDG hooks (only the issuable slots; the base BDG is never stored)
+	// BDG hooks. The base BDG (an unknown slot resolves to it) is never stored, so it gets only
+	// the pre-store gates, which refuse it.
 	{
+		let bdg_gates = ActionTypeHooks {
+			before_create: Some(Arc::new(|app, ctx| Box::pin(bdg::before_create(app, ctx)))),
+			before_receive: Some(Arc::new(|app, ctx| Box::pin(bdg::before_receive(app, ctx)))),
+			..Default::default()
+		};
 		let bdg_hooks = ActionTypeHooks {
-			on_create: None,
 			on_receive: Some(Arc::new(|app, ctx| Box::pin(bdg::on_receive(app, ctx)))),
-			on_accept: None,
-			on_reject: None,
+			..bdg_gates.clone()
 		};
 
+		registry.register_type("BDG", bdg_gates);
 		registry.register_type("BDG:STD", bdg_hooks.clone());
 		registry.register_type("BDG:PAT", bdg_hooks);
 		tracing::info!("Registered native hooks for BDG action type");
 	}
+
+	// PRES hooks — ephemeral: the pre-store gates, and `on_create` after the forward (the
+	// owner's typing relay). PRES:TYPING resolves here.
+	registry.register_type(
+		"PRES",
+		ActionTypeHooks {
+			before_create: Some(Arc::new(|app, ctx| Box::pin(pres::before_create(app, ctx)))),
+			before_receive: Some(Arc::new(|app, ctx| Box::pin(pres::before_receive(app, ctx)))),
+			on_create: Some(Arc::new(|app, ctx| Box::pin(pres::on_create(app, ctx)))),
+			..Default::default()
+		},
+	);
 
 	Ok(())
 }
@@ -300,6 +362,7 @@ mod tests {
 		let _ = cmnt::on_receive;
 		let _ = msg::on_create;
 		let _ = msg::on_receive;
+		let _ = pin::on_store;
 		let _ = conn::on_create;
 		let _ = conn::on_receive;
 		let _ = conn::on_accept;

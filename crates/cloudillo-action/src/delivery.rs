@@ -91,12 +91,11 @@ impl Task<App> for ActionDeliveryTask {
 		// Get action token
 		let action_token = app.meta_adapter.get_action_token(self.tn_id, &self.action_id).await?;
 
+		// The token is stored before the action goes Active, so a missing one was removed on
+		// purpose (a deleted MSG drops its original); a retry cannot bring it back.
 		let Some(action_token) = action_token else {
-			error!("No action token found for action {}", self.action_id);
-			return Err(Error::Internal(format!(
-				"action token not found for action {}",
-				self.action_id
-			)));
+			warn!("No action token for action {}, marking delivery complete", self.action_id);
+			return Ok(());
 		};
 
 		// Prepare inbox request payload

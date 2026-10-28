@@ -12,7 +12,7 @@
 //!   - DEL: Revoke invitation
 
 use crate::helpers::{self, SubscriptionRole};
-use crate::hooks::{HookContext, HookResult};
+use crate::hooks::{BeforeCreate, BeforeReceive, HookContext, HookResult};
 use crate::prelude::*;
 use crate::subject_ref::{SubjectRef, parse_subject_ref};
 use crate::task::{CreateAction, create_action};
@@ -232,15 +232,10 @@ async fn action_invt_authority(
 	if target.issuer.id_tag.as_ref() != tenant_tag {
 		return Ok(());
 	}
+	// The effective role: on a community group the actor's community role counts too.
 	let moderator = actor == tenant_tag
-		|| app
-			.meta_adapter
-			.get_action_by_key(tn_id, &format!("SUBS:{subject}:{actor}"))
-			.await?
-			.is_some_and(|s| {
-				helpers::get_subscription_role(s.x.as_ref())
-					>= SubscriptionRole::required_for_action("INVT", None)
-			});
+		|| helpers::conv_role(app.meta_adapter.as_ref(), tn_id, &target, actor).await
+			>= SubscriptionRole::required_for_action("INVT", None);
 	let allowed = match subtype.as_deref() {
 		None => moderator,
 		Some("DEL") => {
@@ -609,6 +604,32 @@ async fn on_accept_community(
 	}
 
 	Ok(HookResult::default())
+}
+
+/// INVT `before_create`: community INVT authorization. Pre-store, as a denial after the store
+/// cannot remove the row. An INVT aimed at a *remote* community passes through untouched; that
+/// community gates it on its own side in [`check_inbound`].
+pub(crate) async fn before_create(app: App, ctx: BeforeCreate) -> ClResult<CreateAction> {
+	check_community_authority(
+		&app,
+		ctx.tn_id,
+		&ctx.tenant_tag,
+		(ctx.action.typ.as_ref(), ctx.action.sub_typ.as_deref()),
+		ctx.action.subject.as_deref(),
+		ctx.action.audience_tag.as_deref(),
+		&ctx.actor,
+	)
+	.await?;
+	Ok(ctx.action)
+}
+
+/// INVT `before_receive`: the key-pattern dedup retires the pending INVT as soon as an INVT:DEL
+/// row lands, so a post-store hook could neither stop a revocation nor still see the row it
+/// judges. Unguarded: an INVT inside someone else's pre-approved bundle must still prove
+/// community authority.
+pub(crate) async fn before_receive(app: App, ctx: BeforeReceive) -> ClResult<()> {
+	let tenant_tag = app.meta_adapter.read_tenant(ctx.tn_id).await?.id_tag;
+	check_inbound(&app, ctx.tn_id, &ctx.action, &tenant_tag).await
 }
 
 #[cfg(test)]

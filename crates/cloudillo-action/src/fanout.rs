@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use cloudillo_core::scheduler::RetryPolicy;
-use cloudillo_types::meta_adapter::{self, ProfileStatus};
+use cloudillo_types::meta_adapter;
 
 use crate::{
 	delivery::ActionDeliveryTask,
@@ -29,7 +29,8 @@ use crate::{
 /// * `app` - Application state
 /// * `tn_id` - Tenant ID
 /// * `action_id` - The action being delivered
-/// * `parent_id` - Starting point for parent chain walk (may be None)
+/// * `parent_id` - Starting point for parent chain walk. When None, an owner-local
+///   `fanout_via_subject` action starts from its subject ([`group_msg_variant_root`])
 /// * `subject` - bundled as a `related` token when the type declares
 ///   `deliver_subject` (currently only APRV)
 /// * `issuer` - Action issuer to exclude from delivery (they already have it)
@@ -44,12 +45,22 @@ pub async fn schedule_subscriber_fanout(
 	subject: Option<&str>,
 	issuer: &str,
 ) -> ClResult<Vec<Box<str>>> {
-	let Some(starting_parent) = parent_id else {
-		return Ok(Vec::new());
-	};
-
+	// No parent: only an action-typed subject can lead to a subscribable root.
+	let subject_action =
+		subject.filter(|s| matches!(parse_subject_ref(s), Some(SubjectRef::Action(_))));
 	// Get our id_tag to check for local ownership
 	let our_id_tag: Box<str> = app.auth_adapter.read_id_tag(tn_id).await?;
+
+	let starting_parent: String = match (parent_id, subject_action) {
+		(Some(p), _) => p.to_string(),
+		(None, Some(s)) => {
+			match group_msg_variant_root(app, tn_id, action_id, s, issuer, &our_id_tag).await? {
+				Some(conv) => conv,
+				None => return Ok(Vec::new()),
+			}
+		}
+		(None, None) => return Ok(Vec::new()),
+	};
 
 	// When the action declares `deliver_subject` (only APRV), bundle its
 	// action-typed subject as the `related` token so subscribers accept it
@@ -83,7 +94,7 @@ pub async fn schedule_subscriber_fanout(
 
 	// Walk parent chain to find subscribable root
 	// Use owned String to avoid borrow checker issues across loop iterations
-	let mut current_parent_id: Option<String> = Some(starting_parent.to_string());
+	let mut current_parent_id: Option<String> = Some(starting_parent.clone());
 	let mut recipients = Vec::new();
 
 	while let Some(p_id) = current_parent_id.take() {
@@ -112,21 +123,7 @@ pub async fn schedule_subscriber_fanout(
 				// fails the whole list rather than silently fail-opening.
 				let subs = app
 					.meta_adapter
-					.list_actions(
-						tn_id,
-						&meta_adapter::ListActionOptions {
-							typ: Some(vec!["SUBS".into()]),
-							subject: Some(vec![p_id.clone()]),
-							status: Some(vec!["A".into()]),
-							exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
-							exclude_issuer_profile_status: Some(Box::from([
-								ProfileStatus::Suspended,
-								ProfileStatus::Blocked,
-								ProfileStatus::Banned,
-							])),
-							..Default::default()
-						},
-					)
+					.list_actions(tn_id, &crate::helpers::active_subs_opts(&p_id))
 					.await?;
 
 				for sub in subs {
@@ -175,6 +172,57 @@ pub async fn schedule_subscriber_fanout(
 	Ok(recipients)
 }
 
+/// The owner's **own** `fanout_via_subject` action (REACT / MSG:UPD / MSG:DEL / PIN
+/// on a group message, RCPT on the CONV itself) carries no parent, only `subject` (a PIN
+/// normally has the CONV as parent and never gets here). Returns the target MSG's parent, or a
+/// `subscribable` target itself, from which the caller's walk finds the CONV, so they raw-fan to
+/// subscribers like the owner's MSG does. Foreign ones are relayed by
+/// [`maybe_relay_child_to_subscribers`] instead; DMs (no CONV) and every other type keep their
+/// audience-only delivery.
+async fn group_msg_variant_root(
+	app: &App,
+	tn_id: TnId,
+	action_id: &str,
+	subject: &str,
+	issuer: &str,
+	our_id_tag: &str,
+) -> ClResult<Option<String>> {
+	if issuer != our_id_tag {
+		return Ok(None);
+	}
+	let Some(a) = app.meta_adapter.get_action(tn_id, action_id).await? else {
+		return Ok(None);
+	};
+	// The owner's kick (SUBS:DEL naming a member's SUBS) fans out from that SUBS's CONV.
+	if &*a.typ == "SUBS" && a.sub_typ.as_deref() == Some("DEL") {
+		return Ok(app
+			.meta_adapter
+			.get_action(tn_id, subject)
+			.await?
+			.filter(|t| &*t.typ == "SUBS")
+			.and_then(|t| t.subject.map(Into::into)));
+	}
+	let dsl = app.ext::<Arc<DslEngine>>()?;
+	if dsl
+		.definition_for(&a.typ, a.sub_typ.as_deref())
+		.and_then(|d| d.behavior.fanout_via_subject)
+		!= Some(true)
+	{
+		return Ok(None);
+	}
+	let Some(target) = app.meta_adapter.get_action(tn_id, subject).await? else {
+		return Ok(None);
+	};
+	if target.typ.as_ref() == "MSG" {
+		return Ok(target.parent_id.map(|p| p.to_string()));
+	}
+	let subscribable = dsl
+		.definition_for(&target.typ, target.sub_typ.as_deref())
+		.and_then(|d| d.behavior.subscribable)
+		== Some(true);
+	Ok(subscribable.then(|| subject.to_string()))
+}
+
 /// Walk `start_id` up its parent chain to the first `subscribable` action.
 async fn resolve_subscribable_root(
 	app: &App,
@@ -194,7 +242,11 @@ async fn resolve_subscribable_root(
 		if subscribable {
 			return Ok(Some(act));
 		}
-		current = act.parent_id.as_deref().map(str::to_string);
+		// A SUBS hangs off its subject (a kick names the member's SUBS: SUBS:DEL → SUBS → CONV).
+		current = act
+			.parent_id
+			.or(if &*act.typ == "SUBS" { act.subject } else { None })
+			.map(Into::into);
 	}
 	Ok(None)
 }
@@ -292,7 +344,8 @@ pub async fn maybe_relay_child_to_subscribers(
 }
 
 /// Deliver each existing member's vouching APRV (bundled with their SUBS) to a
-/// newly-joined member, so the joiner learns the full pre-existing roster.
+/// newly-joined member, so the joiner learns the full pre-existing roster, and the
+/// container's own token, which a community group's joiner does not hold yet.
 async fn backfill_roster_to_joiner(
 	app: &App,
 	tn_id: TnId,
@@ -303,19 +356,28 @@ async fn backfill_roster_to_joiner(
 	// Existing active members (active SUBS to the container).
 	let members = app
 		.meta_adapter
-		.list_actions(
-			tn_id,
-			&meta_adapter::ListActionOptions {
-				typ: Some(vec!["SUBS".into()]),
-				subject: Some(vec![container.action_id.to_string()]),
-				status: Some(vec!["A".into()]),
-				exclude_sub_typ: Some(Box::from([Box::from("DEL")])),
-				..Default::default()
-			},
-		)
+		.list_actions(tn_id, &crate::helpers::active_subs_opts(&container.action_id))
 		.await?;
 
 	let retry_policy = RetryPolicy::new((10, 43200), 50);
+
+	// The container itself, first: a community group's joiner created their SUBS against a
+	// subject held only here (`subs::on_create`). `action_id = hash(token)`, so a joiner who
+	// already has it (the INVT bundle) dedups it. It passes the joiner's inbound gate on their
+	// follow/connection to us, which a community member has (followers join only by INVT,
+	// whose bundle already carried it).
+	// No ordering against the roster tasks below; chain them with `depends_on` if
+	// relayed SUBS arriving before their CONV turn out to be dropped.
+	let task =
+		ActionDeliveryTask::new(tn_id, container.action_id.clone(), joiner.into(), joiner.into());
+	let task_key = format!("backfill:{}:{}", joiner, container.action_id.as_ref());
+	app.scheduler
+		.task(task)
+		.key(&task_key)
+		.with_retry(retry_policy.clone())
+		.schedule()
+		.await?;
+
 	for member_subs in members {
 		// The joiner's own SUBS reaches them via its own vouch (minted above).
 		if member_subs.issuer.id_tag.as_ref() == joiner {
