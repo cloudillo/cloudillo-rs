@@ -7,7 +7,7 @@
 			"type": "container",
 			"bom-ref": "cloudillo-native",
 			"name": "cloudillo native components",
-			"description": "Hand-maintained: components compiled from source or copied as bare files into the FROM scratch image. Update in the same commit as any Dockerfile version or digest change."
+			"description": "Hand-maintained: components compiled from source or copied as bare files into the FROM scratch image. Debian packages (debian:source set) are listed without version; release.sh fills in version, purl, .deb URL and SHA-256 from apt. Update when the Dockerfile adds or removes a component, or bumps a pinned source or base image."
 		},
 		"properties": [
 			{
@@ -118,25 +118,9 @@
 		},
 		{
 			"type": "data",
-			"bom-ref": "pkg:deb/debian/ca-certificates@20250419?arch=all&distro=debian-13",
 			"name": "ca-certificates",
-			"version": "20250419",
 			"description": "/etc/ssl/certs/ca-certificates.crt (copied from the rust-builder stage)",
 			"scope": "required",
-			"purl": "pkg:deb/debian/ca-certificates@20250419?arch=all&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "ef590f89563aa4b46c8260d49d1cea0fc1b181d19e8df3782694706adf05c184"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/c/ca-certificates/ca-certificates_20250419_all.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/ca-certificates/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -146,25 +130,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libassuan9@3.0.2-2?arch=amd64&distro=debian-13",
 			"name": "libassuan9",
-			"version": "3.0.2-2",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libassuan9@3.0.2-2?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "9d78ef8f016e7f24b5e20d1ce91939fe0f1f897e5f9059793201e930ded7eb8e"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/liba/libassuan/libassuan9_3.0.2-2_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libassuan9/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -174,25 +142,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libbrotli1@1.1.0-2+b7?arch=amd64&distro=debian-13",
 			"name": "libbrotli1",
-			"version": "1.1.0-2+b7",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libbrotli1@1.1.0-2+b7?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "0fb79f88db210afbd69282ab9649e525f393ec6950ca34da1a6b359250b8d7db"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/b/brotli/libbrotli1_1.1.0-2+b7_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libbrotli1/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -202,25 +154,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libbz2-1.0@1.0.8-6?arch=amd64&distro=debian-13",
 			"name": "libbz2-1.0",
-			"version": "1.0.8-6",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libbz2-1.0@1.0.8-6?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "cba4cda04244b5e481bb15524bc3c983a7d1b6f330013b9b381706a2fcb65310"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/b/bzip2/libbz2-1.0_1.0.8-6_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libbz2-1.0/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -230,25 +166,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libc6@2.41-12+deb13u4?arch=amd64&distro=debian-13",
 			"name": "libc6",
-			"version": "2.41-12+deb13u4",
 			"description": "glibc runtime: ld-linux-x86-64.so.2, libc.so.6, libm.so.6",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libc6@2.41-12+deb13u4?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "967aa62605721081c3eb2a17650611a792aa802d76a6511d1840242623d204c9"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/g/glibc/libc6_2.41-12+deb13u4_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libc6/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -258,25 +178,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libcom-err2@1.47.2-3+b12?arch=amd64&distro=debian-13",
 			"name": "libcom-err2",
-			"version": "1.47.2-3+b12",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libcom-err2@1.47.2-3+b12?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "bd43e020b8fed399db3eebf098111f10fba4c436fff99ccad72cc7e27c9764ec"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/e/e2fsprogs/libcom-err2_1.47.2-3+b12_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libcom-err2/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -286,25 +190,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libcurl3t64-gnutls@8.14.1-2+deb13u7?arch=amd64&distro=debian-13",
 			"name": "libcurl3t64-gnutls",
-			"version": "8.14.1-2+deb13u7",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libcurl3t64-gnutls@8.14.1-2+deb13u7?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "9475c591b338b81859ee6d06bf2a9fbb01b52f184c235afa7f6e7f1652136e55"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://security.debian.org/debian-security/pool/updates/main/c/curl/libcurl3t64-gnutls_8.14.1-2+deb13u7_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libcurl3t64-gnutls/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -314,25 +202,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libdeflate0@1.23-2?arch=amd64&distro=debian-13",
 			"name": "libdeflate0",
-			"version": "1.23-2",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libdeflate0@1.23-2?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "5fe37fb79d53f5c91da6ba3ac4c1a8453e1f2b1ff0e0ea45189c5338bbfdbf82"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libd/libdeflate/libdeflate0_1.23-2_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libdeflate0/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -342,25 +214,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libexpat1@2.9.0-1~deb13u1?arch=amd64&distro=debian-13",
 			"name": "libexpat1",
-			"version": "2.9.0-1~deb13u1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libexpat1@2.9.0-1~deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "feff874772cae904ae4d24e917b35664952bec4b4ae9100a4edda5a7fa746832"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://security.debian.org/debian-security/pool/updates/main/e/expat/libexpat1_2.9.0-1~deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libexpat1/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -370,25 +226,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libffi8@3.4.8-2?arch=amd64&distro=debian-13",
 			"name": "libffi8",
-			"version": "3.4.8-2",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libffi8@3.4.8-2?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "0ebdc340de33333639c3c63874cd4b15ac2e83dfa1ef3053b7eefaf4919f4f68"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libf/libffi/libffi8_3.4.8-2_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libffi8/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -398,25 +238,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libfontconfig1@2.15.0-2.3?arch=amd64&distro=debian-13",
 			"name": "libfontconfig1",
-			"version": "2.15.0-2.3",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libfontconfig1@2.15.0-2.3?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "7ae91ec59857cc8e375eb2bdd371a4a69daea38f7787d06d474a847867d852b1"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/f/fontconfig/libfontconfig1_2.15.0-2.3_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libfontconfig1/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -426,25 +250,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libfreetype6@2.13.3+dfsg-1+deb13u1?arch=amd64&distro=debian-13",
 			"name": "libfreetype6",
-			"version": "2.13.3+dfsg-1+deb13u1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libfreetype6@2.13.3+dfsg-1+deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "e4947f3291528f03d574f2b01d5c5fc45c58c47480f32888a5cdf0f231ab584e"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/f/freetype/libfreetype6_2.13.3+dfsg-1+deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libfreetype6/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -454,25 +262,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libgcc-s1@14.2.0-19?arch=amd64&distro=debian-13",
 			"name": "libgcc-s1",
-			"version": "14.2.0-19",
 			"description": "libgcc_s.so.1 (copied from the rust-builder stage)",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libgcc-s1@14.2.0-19?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "3c71917b490d1a17aed43196a2787a256ecf060526cdb20216a74bedc061b150"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/g/gcc-14/libgcc-s1_14.2.0-19_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libgcc-s1/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -482,25 +274,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libgmp10@2:6.3.0+dfsg-3?arch=amd64&distro=debian-13",
 			"name": "libgmp10",
-			"version": "2:6.3.0+dfsg-3",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libgmp10@2:6.3.0+dfsg-3?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "d0d0265eb01770f17afd0f7c8c0622f80479dcfbbe13653a0debeec61464e622"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/g/gmp/libgmp10_6.3.0+dfsg-3_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libgmp10/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -510,25 +286,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libgnutls30t64@3.8.9-3+deb13u4?arch=amd64&distro=debian-13",
 			"name": "libgnutls30t64",
-			"version": "3.8.9-3+deb13u4",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libgnutls30t64@3.8.9-3+deb13u4?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "18a8bdfd91c7e3bcb01719d55a2b56849c7160b34f1f52b1c4fdfdd41bf1352b"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/g/gnutls28/libgnutls30t64_3.8.9-3+deb13u4_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libgnutls30t64/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -538,25 +298,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libgpg-error0@1.51-4?arch=amd64&distro=debian-13",
 			"name": "libgpg-error0",
-			"version": "1.51-4",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libgpg-error0@1.51-4?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "22b95570fd41c113ef6f5651563b4d748292844baab1278a46eb940c1dec2322"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libg/libgpg-error/libgpg-error0_1.51-4_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libgpg-error0/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -566,25 +310,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libgpgme11t64@1.24.2-3?arch=amd64&distro=debian-13",
 			"name": "libgpgme11t64",
-			"version": "1.24.2-3",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libgpgme11t64@1.24.2-3?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "6650203af59ccf73b22cd6904fb179a799cb70d62885b19ae725c0655c04241c"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/g/gpgme1.0/libgpgme11t64_1.24.2-3_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libgpgme11t64/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -594,25 +322,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libgpgmepp6t64@1.24.2-3?arch=amd64&distro=debian-13",
 			"name": "libgpgmepp6t64",
-			"version": "1.24.2-3",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libgpgmepp6t64@1.24.2-3?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "81860c69f1480af6969de16845e2091dba9fca1e33732411e28437ea62e1a625"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/g/gpgme1.0/libgpgmepp6t64_1.24.2-3_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libgpgmepp6t64/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -622,25 +334,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libgssapi-krb5-2@1.21.3-5+deb13u1?arch=amd64&distro=debian-13",
 			"name": "libgssapi-krb5-2",
-			"version": "1.21.3-5+deb13u1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libgssapi-krb5-2@1.21.3-5+deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "30847c1fde4240567d7ed3aeab4f655dd591203758b857e85e824045aae70299"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/k/krb5/libgssapi-krb5-2_1.21.3-5+deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libgssapi-krb5-2/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -650,25 +346,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libhogweed6t64@3.10.1-1?arch=amd64&distro=debian-13",
 			"name": "libhogweed6t64",
-			"version": "3.10.1-1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libhogweed6t64@3.10.1-1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "b059ed155115ac09da295322de48ee1ed58ef5fa45edcc9e12ff0e94636ef25f"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/n/nettle/libhogweed6t64_3.10.1-1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libhogweed6t64/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -678,25 +358,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libidn2-0@2.3.8-2?arch=amd64&distro=debian-13",
 			"name": "libidn2-0",
-			"version": "2.3.8-2",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libidn2-0@2.3.8-2?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "90b039bcdc4578f8e1c4935adf8dbb525e36a164deefdbbb8c45bac347d48278"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libi/libidn2/libidn2-0_2.3.8-2_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libidn2-0/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -706,25 +370,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libjbig0@2.1-6.1+b2?arch=amd64&distro=debian-13",
 			"name": "libjbig0",
-			"version": "2.1-6.1+b2",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libjbig0@2.1-6.1+b2?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "95cbc44561651e1b3385454df08e8f2efe84498f6963a85259be2cc2fe798709"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/j/jbigkit/libjbig0_2.1-6.1+b2_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libjbig0/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -734,25 +382,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libjpeg62-turbo@1:2.1.5-4?arch=amd64&distro=debian-13",
 			"name": "libjpeg62-turbo",
-			"version": "1:2.1.5-4",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libjpeg62-turbo@1:2.1.5-4?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "5504299ad0e3c0a9ca9f962a68a650a040db52f9f416a109e74df48d55601d3f"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libj/libjpeg-turbo/libjpeg62-turbo_2.1.5-4_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libjpeg62-turbo/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -762,25 +394,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libk5crypto3@1.21.3-5+deb13u1?arch=amd64&distro=debian-13",
 			"name": "libk5crypto3",
-			"version": "1.21.3-5+deb13u1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libk5crypto3@1.21.3-5+deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "7da07ee674b47f1f0be7cc89317c25310086a1f1761217d0f72e6ae2c5a69b84"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/k/krb5/libk5crypto3_1.21.3-5+deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libk5crypto3/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -790,25 +406,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libkeyutils1@1.6.3-6?arch=amd64&distro=debian-13",
 			"name": "libkeyutils1",
-			"version": "1.6.3-6",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libkeyutils1@1.6.3-6?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "0b11ad17be0300b63ad4eeb4c6450fed24d34b7b740f23e5363dcb29ee6d5eba"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/k/keyutils/libkeyutils1_1.6.3-6_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libkeyutils1/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -818,25 +418,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libkrb5-3@1.21.3-5+deb13u1?arch=amd64&distro=debian-13",
 			"name": "libkrb5-3",
-			"version": "1.21.3-5+deb13u1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libkrb5-3@1.21.3-5+deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "47d71d6a7f2e59b9bae5f89602397594805113b95889ad18fa703cd53abafc97"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/k/krb5/libkrb5-3_1.21.3-5+deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libkrb5-3/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -846,25 +430,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libkrb5support0@1.21.3-5+deb13u1?arch=amd64&distro=debian-13",
 			"name": "libkrb5support0",
-			"version": "1.21.3-5+deb13u1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libkrb5support0@1.21.3-5+deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "3a0acd8b37955c0e102c756b52c97df2a31f67b96453c35dab70df218d309117"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/k/krb5/libkrb5support0_1.21.3-5+deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libkrb5support0/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -874,25 +442,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/liblcms2-2@2.16-2+deb13u2?arch=amd64&distro=debian-13",
 			"name": "liblcms2-2",
-			"version": "2.16-2+deb13u2",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/liblcms2-2@2.16-2+deb13u2?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "32e53c2002ccea8c60c02779bea0ba49ac132fef702988a30d64af79b6617806"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/l/lcms2/liblcms2-2_2.16-2+deb13u2_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/liblcms2-2/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -902,25 +454,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libldap2@2.6.10+dfsg-1?arch=amd64&distro=debian-13",
 			"name": "libldap2",
-			"version": "2.6.10+dfsg-1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libldap2@2.6.10+dfsg-1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "60069e4a550ca890113fa89d3001417781b18e146ec5d637d31e368dec9909bd"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/o/openldap/libldap2_2.6.10+dfsg-1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libldap2/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -930,25 +466,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/liblerc4@4.0.0+ds-5?arch=amd64&distro=debian-13",
 			"name": "liblerc4",
-			"version": "4.0.0+ds-5",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/liblerc4@4.0.0+ds-5?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "2e0c13c0ddbde12968c2c713c2e0474a5b78e90d5216031256a725e8c76aa31c"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/l/lerc/liblerc4_4.0.0+ds-5_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/liblerc4/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -958,25 +478,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/liblzma5@5.8.1-1+deb13u2?arch=amd64&distro=debian-13",
 			"name": "liblzma5",
-			"version": "5.8.1-1+deb13u2",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/liblzma5@5.8.1-1+deb13u2?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "b38acab30f295bf1066a6632e31cbd0a1980f2924b38040cda131d5dea5384ec"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://security.debian.org/debian-security/pool/updates/main/x/xz-utils/liblzma5_5.8.1-1+deb13u2_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/liblzma5/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -986,25 +490,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libnettle8t64@3.10.1-1?arch=amd64&distro=debian-13",
 			"name": "libnettle8t64",
-			"version": "3.10.1-1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libnettle8t64@3.10.1-1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "1b03d4a9cd9c8143ba50fe6396f36937e901a317d492d179f4596862c1731cfe"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/n/nettle/libnettle8t64_3.10.1-1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libnettle8t64/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1014,25 +502,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libnghttp2-14@1.64.0-1.1+deb13u1?arch=amd64&distro=debian-13",
 			"name": "libnghttp2-14",
-			"version": "1.64.0-1.1+deb13u1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libnghttp2-14@1.64.0-1.1+deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "896cb217537c09251fb909b8541349010ac279d802d871e98c06a62a2c67ce2c"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/n/nghttp2/libnghttp2-14_1.64.0-1.1+deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libnghttp2-14/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1042,25 +514,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libnghttp3-9@1.8.0-1?arch=amd64&distro=debian-13",
 			"name": "libnghttp3-9",
-			"version": "1.8.0-1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libnghttp3-9@1.8.0-1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "388e4c33b72829cbf0d098afdc8539fa5ba7458eddb077f5538fdb4d5538716b"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/n/nghttp3/libnghttp3-9_1.8.0-1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libnghttp3-9/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1070,25 +526,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libngtcp2-16@1.11.0-1+deb13u1?arch=amd64&distro=debian-13",
 			"name": "libngtcp2-16",
-			"version": "1.11.0-1+deb13u1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libngtcp2-16@1.11.0-1+deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "627eec81ebbd48c4e6091f5cd9dc5070b792b7075000eed60ab08c7daa961caf"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/n/ngtcp2/libngtcp2-16_1.11.0-1+deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libngtcp2-16/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1098,25 +538,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libngtcp2-crypto-gnutls8@1.11.0-1+deb13u1?arch=amd64&distro=debian-13",
 			"name": "libngtcp2-crypto-gnutls8",
-			"version": "1.11.0-1+deb13u1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libngtcp2-crypto-gnutls8@1.11.0-1+deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "2a7f109c0c4db6a800e4661c5e5e34e1f1f83c8162482276183d1ada9da7c96c"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/n/ngtcp2/libngtcp2-crypto-gnutls8_1.11.0-1+deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libngtcp2-crypto-gnutls8/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1126,25 +550,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libnspr4@2:4.36-1?arch=amd64&distro=debian-13",
 			"name": "libnspr4",
-			"version": "2:4.36-1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libnspr4@2:4.36-1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "87fc2039ee89cff2b8010fa9535706b1def40031acfc52bf12197dcb3cb7b064"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/n/nspr/libnspr4_4.36-1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libnspr4/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1154,25 +562,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libnss3@2:3.110-1+deb13u4?arch=amd64&distro=debian-13",
 			"name": "libnss3",
-			"version": "2:3.110-1+deb13u4",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libnss3@2:3.110-1+deb13u4?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "8d20d0754039e15e9bd2c8484e98dc9c2982907d4f20834da29a9501913d00b5"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/n/nss/libnss3_3.110-1+deb13u4_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libnss3/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1182,25 +574,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libopenjp2-7@2.5.3-2.1~deb13u2?arch=amd64&distro=debian-13",
 			"name": "libopenjp2-7",
-			"version": "2.5.3-2.1~deb13u2",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libopenjp2-7@2.5.3-2.1~deb13u2?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "7ddf6360e8845853ba3c9cfaefc2ad6b92b2627eb8564a257f5f2a4c857f8748"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/o/openjpeg2/libopenjp2-7_2.5.3-2.1~deb13u2_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libopenjp2-7/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1210,25 +586,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libp11-kit0@0.25.5-3?arch=amd64&distro=debian-13",
 			"name": "libp11-kit0",
-			"version": "0.25.5-3",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libp11-kit0@0.25.5-3?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "784bf2063e166c8bc851a32623b74ebd85c499043a9d57c5bbd64fa63447f45a"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/p/p11-kit/libp11-kit0_0.25.5-3_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libp11-kit0/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1238,25 +598,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libpng16-16t64@1.6.48-1+deb13u6?arch=amd64&distro=debian-13",
 			"name": "libpng16-16t64",
-			"version": "1.6.48-1+deb13u6",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libpng16-16t64@1.6.48-1+deb13u6?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "0f8034d1c2547760430c81e8d87e5d6acd533a3493c80cf76dbecd0343b6773c"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://security.debian.org/debian-security/pool/updates/main/libp/libpng1.6/libpng16-16t64_1.6.48-1+deb13u6_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libpng16-16t64/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1266,25 +610,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libpoppler147@25.03.0-5+deb13u4?arch=amd64&distro=debian-13",
 			"name": "libpoppler147",
-			"version": "25.03.0-5+deb13u4",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libpoppler147@25.03.0-5+deb13u4?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "2466115f6d92266415f53c5fb88348d980710880bae888d96d6e3cc3a0a1ed3b"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/p/poppler/libpoppler147_25.03.0-5+deb13u4_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libpoppler147/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1294,25 +622,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libpsl5t64@0.21.2-1.1+b1?arch=amd64&distro=debian-13",
 			"name": "libpsl5t64",
-			"version": "0.21.2-1.1+b1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libpsl5t64@0.21.2-1.1+b1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "59d42bb1f9ebc0d1776fe616efb08a7a8568b05982e00f70b03c63863db768ab"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libp/libpsl/libpsl5t64_0.21.2-1.1+b1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libpsl5t64/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1322,25 +634,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/librtmp1@2.4+20151223.gitfa8646d.1-2+b5?arch=amd64&distro=debian-13",
 			"name": "librtmp1",
-			"version": "2.4+20151223.gitfa8646d.1-2+b5",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/librtmp1@2.4+20151223.gitfa8646d.1-2+b5?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "93baa2004cbe6c8721b9e81beed078612540aef120970b4751305c51c6697368"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/r/rtmpdump/librtmp1_2.4+20151223.gitfa8646d.1-2+b5_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/librtmp1/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1350,25 +646,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libsasl2-2@2.1.28+dfsg1-9?arch=amd64&distro=debian-13",
 			"name": "libsasl2-2",
-			"version": "2.1.28+dfsg1-9",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libsasl2-2@2.1.28+dfsg1-9?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "66e49d7ae026811b49a0050f18b0325960a2625ffd1ff60d91b7844a815fa9d2"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/c/cyrus-sasl2/libsasl2-2_2.1.28+dfsg1-9_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libsasl2-2/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1378,25 +658,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libsharpyuv0@1.5.0-0.1?arch=amd64&distro=debian-13",
 			"name": "libsharpyuv0",
-			"version": "1.5.0-0.1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libsharpyuv0@1.5.0-0.1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "51934833d909588f7761fd84362114e90d8d2d38af57edf5df5c4a705e037547"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libw/libwebp/libsharpyuv0_1.5.0-0.1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libsharpyuv0/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1406,25 +670,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libsmartcols1@2.41.5-0+deb13u1?arch=amd64&distro=debian-13",
 			"name": "libsmartcols1",
-			"version": "2.41.5-0+deb13u1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libsmartcols1@2.41.5-0+deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "d96bac9c8805685f2734885098a214b82950da6ebb182c27a6b7a124a0323392"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/u/util-linux/libsmartcols1_2.41.5-0+deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libsmartcols1/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1434,25 +682,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libssh2-1t64@1.11.1-1+deb13u2?arch=amd64&distro=debian-13",
 			"name": "libssh2-1t64",
-			"version": "1.11.1-1+deb13u2",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libssh2-1t64@1.11.1-1+deb13u2?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "dbb1024c192d4d292b7cfa902b96076cfe81b56a5eed4fb28da36e8bf543e49a"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libs/libssh2/libssh2-1t64_1.11.1-1+deb13u2_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libssh2-1t64/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1462,25 +694,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libssl3t64@3.5.7-1~deb13u3?arch=amd64&distro=debian-13",
 			"name": "libssl3t64",
-			"version": "3.5.7-1~deb13u3",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libssl3t64@3.5.7-1~deb13u3?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "ff16bc048bcd7d1b256094450b79c77947d8e76fe2a24bd99b91021d591fa074"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://security.debian.org/debian-security/pool/updates/main/o/openssl/libssl3t64_3.5.7-1~deb13u3_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libssl3t64/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1490,25 +706,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libstdc++6@14.2.0-19?arch=amd64&distro=debian-13",
 			"name": "libstdc++6",
-			"version": "14.2.0-19",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libstdc++6@14.2.0-19?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "ab1fa05837aa7a92aae748fd07a18a35f7d18bb4a71c4724fe2bbf0e32089de0"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/g/gcc-14/libstdc++6_14.2.0-19_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libstdc++6/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1518,25 +718,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libtasn1-6@4.20.0-2+deb13u1?arch=amd64&distro=debian-13",
 			"name": "libtasn1-6",
-			"version": "4.20.0-2+deb13u1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libtasn1-6@4.20.0-2+deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "23fec6e06583ce2bad9b2c04c9b485e90440e259b1abf8677cd80d3ce60831ad"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libt/libtasn1-6/libtasn1-6_4.20.0-2+deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libtasn1-6/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1546,25 +730,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libtiff6@4.7.0-3+deb13u3?arch=amd64&distro=debian-13",
 			"name": "libtiff6",
-			"version": "4.7.0-3+deb13u3",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libtiff6@4.7.0-3+deb13u3?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "6bb2038f36817ae1ee6d33df03917b21835dcc2e0f3e3e80a71390e83c171173"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/t/tiff/libtiff6_4.7.0-3+deb13u3_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libtiff6/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1574,25 +742,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libunistring5@1.3-2?arch=amd64&distro=debian-13",
 			"name": "libunistring5",
-			"version": "1.3-2",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libunistring5@1.3-2?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "6dd3490bef06ea1096f32d10766b7e016cf579bfae8451d1b7df15ce05b8aa46"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libu/libunistring/libunistring5_1.3-2_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libunistring5/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1602,25 +754,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libwebp7@1.5.0-0.1?arch=amd64&distro=debian-13",
 			"name": "libwebp7",
-			"version": "1.5.0-0.1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libwebp7@1.5.0-0.1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "c749744b04abdd1426b0c7718e516362c03a557c5151662092d6d4f2cef6e7c1"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libw/libwebp/libwebp7_1.5.0-0.1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libwebp7/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1630,25 +766,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/libzstd1@1.5.7+dfsg-1?arch=amd64&distro=debian-13",
 			"name": "libzstd1",
-			"version": "1.5.7+dfsg-1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/libzstd1@1.5.7+dfsg-1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "2f6a2aeacfc925eba8b00ac9139bc4bfccf8cacb09eb93de067074b26948eef9"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/libz/libzstd/libzstd1_1.5.7+dfsg-1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/libzstd1/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1658,25 +778,9 @@
 		},
 		{
 			"type": "data",
-			"bom-ref": "pkg:deb/debian/poppler-data@0.4.12-1?arch=all&distro=debian-13",
 			"name": "poppler-data",
-			"version": "0.4.12-1",
 			"description": "CMaps in /usr/share/poppler",
 			"scope": "required",
-			"purl": "pkg:deb/debian/poppler-data@0.4.12-1?arch=all&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "7951512a24fc4ea05c246a0f9891dd1ec9844a886de6550ebd8c50e57db5441d"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/p/poppler-data/poppler-data_0.4.12-1_all.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/poppler-data/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1686,25 +790,9 @@
 		},
 		{
 			"type": "application",
-			"bom-ref": "pkg:deb/debian/poppler-utils@25.03.0-5+deb13u4?arch=amd64&distro=debian-13",
 			"name": "poppler-utils",
-			"version": "25.03.0-5+deb13u4",
 			"description": "pdftoppm, pdfinfo, pdftotext in /usr/bin",
 			"scope": "required",
-			"purl": "pkg:deb/debian/poppler-utils@25.03.0-5+deb13u4?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "7b5bb3607e7fa078e002420d4e5129d7b83c5684ca6f88d229a40af3e76a7b02"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/p/poppler/poppler-utils_25.03.0-5+deb13u4_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/poppler-utils/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1714,25 +802,9 @@
 		},
 		{
 			"type": "application",
-			"bom-ref": "pkg:deb/debian/util-linux@2.41.5-0+deb13u1?arch=amd64&distro=debian-13",
 			"name": "util-linux",
-			"version": "2.41.5-0+deb13u1",
 			"description": "prlimit in /usr/bin",
 			"scope": "required",
-			"purl": "pkg:deb/debian/util-linux@2.41.5-0+deb13u1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "7d5b1176cc3d8cc6b290b3ec17af458f362d9200845f30da22057a8198744430"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/u/util-linux/util-linux_2.41.5-0+deb13u1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/util-linux/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",
@@ -1742,25 +814,9 @@
 		},
 		{
 			"type": "library",
-			"bom-ref": "pkg:deb/debian/zlib1g@1:1.3.dfsg+really1.3.1-1+b1?arch=amd64&distro=debian-13",
 			"name": "zlib1g",
-			"version": "1:1.3.dfsg+really1.3.1-1+b1",
 			"description": "Shared library copied into /lib for the poppler/prlimit binaries",
 			"scope": "required",
-			"purl": "pkg:deb/debian/zlib1g@1:1.3.dfsg+really1.3.1-1+b1?arch=amd64&distro=debian-13",
-			"hashes": [
-				{
-					"alg": "SHA-256",
-					"content": "015be740d6236ad114582dea500c1d907f29e16d6db00566ca32fb68d71ac90d"
-				}
-			],
-			"externalReferences": [
-				{
-					"type": "distribution",
-					"url": "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_amd64.deb",
-					"comment": "SHA-256 is of this .deb; licence per /usr/share/doc/zlib1g/copyright"
-				}
-			],
 			"properties": [
 				{
 					"name": "debian:source",

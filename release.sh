@@ -101,6 +101,42 @@ mapfile -t reports < <(find target -name 'access-matrix-*.md' | sort)
 [ "${#reports[@]}" -gt 0 ] || fail "no access-matrix report found"
 for f in "${reports[@]}"; do cat "$f"; echo; done > "$DIST/cloudillo-$VERSION-access-matrix.md"
 
+# Native SBOM part. The committed file lists the Debian packages (those with a debian:source
+# property) without versions; version, purl, .deb URL and SHA-256 are filled in from apt in
+# the poppler-extractor stage. The scratch image has no package database; that stage and
+# rust-builder both run `apt-get upgrade`, so they resolve the same versions. Local build only,
+# so it runs before anything is pushed.
+docker buildx build --target poppler-extractor --load -t cloudillo-native-check .
+mapfile -t debs < <(jq -r '.components[] | select(any(.properties[]?; .name == "debian:source"))
+	| .name' sbom/native-components.cdx.json)
+# Each line: name version url file size SHA256:hash
+docker run --rm cloudillo-native-check sh -c '
+	set -e
+	for p in "$@"; do
+		v=$(dpkg-query -W -f "\${Version}" "$p")
+		[ -n "$v" ] || { echo "error: $p is not installed" >&2; exit 1; }
+		apt-get download --print-uris -qq "$p=$v" | sed "s|^|$p $v |"
+	done' sh "${debs[@]}" > "$WORK/debs.txt"
+[ "$(wc -l < "$WORK/debs.txt")" -eq "${#debs[@]}" ] || fail "apt did not resolve every package"
+deb_release=$(docker run --rm cloudillo-native-check cat /etc/debian_version)
+jq -R 'split(" ") | {key: .[0], value: {v: .[1], url: (.[2] | gsub("'\''"; "")
+		| sub("^http:"; "https:") | gsub("%2b"; "+")), arch: (.[3] | capture("_(?<a>[^_]+)\\.deb$").a),
+		sha: (.[5] | ltrimstr("SHA256:"))}}' "$WORK/debs.txt" \
+	| jq -s from_entries > "$WORK/debs.json"
+jq --arg v "$VERSION" --arg rel "$deb_release (trixie)" --slurpfile d "$WORK/debs.json" '
+	.metadata.component.version = $v
+	| (.metadata.properties[] | select(.name == "debian:release")).value = $rel
+	| .components |= map(
+		if any(.properties[]?; .name == "debian:source") then
+			$d[0][.name] as $p
+			| "pkg:deb/debian/\(.name)@\($p.v)?arch=\($p.arch)&distro=debian-13" as $purl
+			| {type, "bom-ref": $purl, name, version: $p.v, description, scope, purl: $purl,
+				hashes: [{alg: "SHA-256", content: $p.sha}],
+				externalReferences: [{type: "distribution", url: $p.url,
+					comment: "SHA-256 is of this .deb; licence per /usr/share/doc/\(.name)/copyright"}],
+				properties}
+		else . end)' sbom/native-components.cdx.json > "$DIST/cloudillo-$VERSION-native.cdx.json"
+
 # Approval: everything below pushes.
 echo
 echo "Release $TAG at commit $commit, image $IMAGE"
@@ -125,9 +161,6 @@ mv server/cloudillo-server.json "$DIST/cloudillo-$VERSION-server.cdx.json"
 
 npx --yes @cyclonedx/cdxgen@12.8.7 -t js --no-install-deps --spec-version 1.5 \
 	-o "$DIST/cloudillo-$VERSION-frontend.cdx.json" "$FRONTEND_DIR"
-
-jq --arg v "$VERSION" '.metadata.component.version = $v' sbom/native-components.cdx.json \
-	> "$DIST/cloudillo-$VERSION-native.cdx.json"
 
 # Gate: server SBOM covers the resolved dependency graph
 cargo metadata --format-version 1 --locked --filter-platform x86_64-unknown-linux-gnu \
@@ -168,26 +201,17 @@ for f in "$DIST"/*.cdx.json; do cyclonedx validate --input-file "$f" --fail-on-e
 
 # Gate: syft cross-check. syft sees in the FROM scratch image only what carries its own
 # metadata (e.g. crate lists embedded by cargo auditable); anything it finds must be declared.
-# The scratch image has no package database, so Debian package versions are checked on the
-# poppler-extractor stage (same builder, same layers) against the native part.
 syft scan "registry:$IMAGE@$DIGEST" -o "cyclonedx-json=$WORK/image.cdx.json"
 jq -r '.components[]? | select(.purl) | "\(.name)@\(.version)"' "$WORK/image.cdx.json" \
 	| sort -u > "$WORK/found.txt"
-jq -r '.metadata.component // empty, .components[]? | recurse(.components[]?)
-		| "\(.name)@\(.version)"' "$out" | sort -u > "$WORK/declared.txt"
-comm -23 "$WORK/found.txt" "$WORK/declared.txt" | tee "$WORK/undeclared.txt"
-
-docker buildx build --target poppler-extractor --load -t cloudillo-native-check .
-syft scan docker:cloudillo-native-check -o "syft-json=$WORK/stage.json"
-jq -rn --slurpfile s "$WORK/stage.json" --slurpfile n sbom/native-components.cdx.json '
-	($s[0].artifacts | map(select(.type == "deb") | {key: .name, value: .version})
-		| from_entries) as $have
-	| $n[0].components[] | select((.purl // "") | startswith("pkg:deb/"))
-	| select($have[.name] != null and $have[.name] != .version)
-	| "\(.name): native SBOM \(.version), build \($have[.name])"' | tee "$WORK/drift.txt"
-
-[ ! -s "$WORK/undeclared.txt" ] || fail "image holds undeclared components"
-[ ! -s "$WORK/drift.txt" ] || fail "sbom/native-components.cdx.json is stale"
+# Debian ELF package notes carry the source package name (gcc-14, not libgcc-s1).
+jq -r '.metadata.component // empty, .components[]? | recurse(.components[]?) | . as $c
+		| "\(.name)@\(.version)",
+			(.properties[]? | select(.name == "debian:source") | "\(.value)@\($c.version)")' \
+	"$out" | sort -u > "$WORK/declared.txt"
+comm -23 "$WORK/found.txt" "$WORK/declared.txt" > "$WORK/undeclared.txt"
+[ ! -s "$WORK/undeclared.txt" ] \
+	|| fail "image holds undeclared components: $(tr '\n' ' ' < "$WORK/undeclared.txt")"
 
 # Sign the image, attest the SBOM, sign the checksums (cosign prompts for COSIGN_PASSWORD
 # unless it is set).

@@ -15,7 +15,9 @@ ARG GID=10001
 FROM rust:1-slim-trixie@sha256:4df2ae8cfdfebdfc13a65da7f253b73d68983dc0339f2719bc17a279c913b13d AS rust-builder
 ARG RS_REF
 WORKDIR /app
-RUN apt-get update && apt-get install -y libssl-dev pkg-config git
+# upgrade: like poppler-extractor, whose apt versions release.sh records for the files copied
+# from here (libc6, libgcc-s1, ca-certificates).
+RUN apt-get update && apt-get upgrade -y && apt-get install -y libssl-dev pkg-config git
 # fetch, not `clone --branch`: takes a tag or a commit SHA
 RUN git init -q && git fetch --depth 1 https://github.com/cloudillo/cloudillo-rs.git "${RS_REF:?pass --build-arg RS_REF=<tag>}" && git checkout -q FETCH_HEAD
 # Disable sccache wrapper (not available in Docker)
@@ -167,9 +169,9 @@ RUN ls -lh /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
 FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS poppler-extractor
 # poppler-data carries the predefined CMaps. Without them pdftotext extracts
 # nothing from CJK-encoded PDFs that ship no embedded ToUnicode map.
-# Package versions are recorded in sbom/native-components.cdx.json; the base digest
-# pins the Debian point release, apt still resolves current trixie(-security) versions.
-RUN apt-get update && apt-get install -y poppler-utils poppler-data
+# Packages are listed in sbom/native-components.cdx.json; release.sh takes their versions
+# from apt here. upgrade: the base image's preinstalled packages get trixie-security fixes.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y poppler-utils poppler-data
 
 # Create staging directory
 RUN mkdir -p /staging/usr/bin /staging/usr/share /staging/lib /staging/lib64
