@@ -349,10 +349,14 @@ async fn process_inbound_action_token_inner(
 	let mut action =
 		verify_and_handle_failure(app, tn_id, token, is_conn_action, client_ip.as_ref()).await?;
 
-	// 2b. A verified action lifts the automatic "unreachable" suspension; on a failed write the
-	// issuer stays Suspended and `refuse_restricted_issuer` refuses it.
-	if let Err(e) = reactivate_suspended_issuer(app, tn_id, &action.iss).await {
-		warn!(issuer = %action.iss, "Failed to reactivate suspended issuer: {}", e);
+	// 2b. Only a fresh primary token proves the issuer is alive now and lifts the automatic
+	// "unreachable" suspension. A replayed old token doesn't (it would also bump `synced_at` and
+	// keep a dead peer Active), nor does a related token in someone else's bundle. Runs before
+	// step 4 so `refuse_restricted_issuer` and the permission checks see Active.
+	if !via.pre_approved
+		&& action.iat.0 >= Timestamp::now().0 - cloudillo_core::profile_status::FRESH_CONTACT_SECS
+	{
+		cloudillo_core::profile_status::reactivate_suspended(app, tn_id, &action.iss).await;
 	}
 
 	// 3. Resolve definition (try full type, then base type)
@@ -784,30 +788,9 @@ fn resolve_definition<'a>(
 	})
 }
 
-/// Suspended is the automatic "unreachable" state (`cloudillo_profile::sync::apply_refresh`),
-/// never moderation: a verified action shows the issuer is back. `synced` bumps `synced_at`
-/// so the refresh batch doesn't re-suspend it at once; a day of failures there still does.
-async fn reactivate_suspended_issuer(app: &App, tn_id: TnId, issuer: &str) -> ClResult<()> {
-	let Ok((_, p)) = app.meta_adapter.read_profile(tn_id, issuer).await else {
-		return Ok(());
-	};
-	if p.status != Some(ProfileStatus::Suspended) {
-		return Ok(());
-	}
-	let fields = meta_adapter::UpsertProfileFields {
-		status: cloudillo_types::types::Patch::Value(ProfileStatus::Active),
-		synced: cloudillo_types::types::Patch::Value(true),
-		..Default::default()
-	};
-	app.meta_adapter.upsert_profile(tn_id, issuer, &fields).await?;
-	// The status gates whether `/me` serves this issuer's badges.
-	app.profile_me.invalidate(tn_id);
-	info!(issuer = %issuer, "Suspended issuer reactivated by a verified action");
-	Ok(())
-}
-
-/// The issuer's local profile, if any; a blocked or banned issuer is refused. Suspended was
-/// lifted at step 2b (`reactivate_suspended_issuer`), so it only reaches here if that write failed.
+/// The issuer's local profile, if any; a blocked, banned or still-Suspended issuer is refused.
+/// Step 2b lifts S only on a fresh primary token, so a stale or bundled token from an S issuer
+/// (or one whose lift write failed) is refused here.
 async fn refuse_restricted_issuer(
 	app: &App,
 	tn_id: TnId,

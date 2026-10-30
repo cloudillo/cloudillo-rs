@@ -633,6 +633,84 @@ async fn inbound_authority_and_effects() {
 		assert_eq!(p.status, Some(want), "{id}: issuer status after delivery");
 	}
 
+	// Only a fresh, validly signed primary token is proof of life. A replayed old one, a forged
+	// one, or one riding in someone else's bundle leaves a Suspended issuer S, and S is refused.
+	let suspend = async |r: &RemoteId| {
+		let f = cloudillo::meta_adapter::UpsertProfileFields {
+			status: Patch::Value(ProfileStatus::Suspended),
+			..Default::default()
+		};
+		meta.upsert_profile(club, &r.id_tag, &f).await.unwrap();
+	};
+	let club_status =
+		async |r: &RemoteId| meta.read_profile(club, &r.id_tag).await.unwrap().1.status;
+	let s_member = issuer(fx, CLUB, Relation::Member, "contributor", "ia-s-fresh").await;
+	let post = |r: &RemoteId| {
+		let mut t = claims(r, "POST");
+		t.aud = Some(CLUB.into());
+		t.c = text();
+		t
+	};
+	let mut stale = post(&s_member);
+	stale.iat =
+		Timestamp(Timestamp::now().0 - 2 * cloudillo_core::profile_status::FRESH_CONTACT_SECS);
+	suspend(&s_member).await;
+	let got = deliver(fx, CLUB, &sign(&s_member, &stale)).await;
+	assert_eq!(got, Deny, "a stale token from a suspended issuer is refused");
+	let st = club_status(&s_member).await;
+	assert_eq!(st, Some(ProfileStatus::Suspended), "a stale token: stays S");
+	let got = deliver(fx, CLUB, &sign(&s_member, &post(&s_member))).await;
+	assert_eq!(got, Allow, "a fresh token from a suspended issuer is admitted");
+	let st = club_status(&s_member).await;
+	assert_eq!(st, Some(ProfileStatus::Active), "a fresh token lifts S");
+	// Forged last: the failed verify refetches the issuer's key and caches the failure.
+	suspend(&s_member).await;
+	let forger = crate::fixture::remote("zqm-ia-s-forger");
+	let got = deliver(fx, CLUB, &sign(&forger, &post(&s_member))).await;
+	assert_eq!(got, Deny, "a forged token is refused");
+	let st = club_status(&s_member).await;
+	assert_eq!(st, Some(ProfileStatus::Suspended), "a forged token: stays S");
+	// Bundled: an Active member's APRV vouches for a Suspended member's POST (the pre-approved
+	// path, as in `preapproved_edit_needs_room_owner`). The bundle never lifts its third party.
+	let voucher = issuer(fx, CLUB, Relation::Member, "contributor", "ia-s-voucher").await;
+	let bundled = issuer(fx, CLUB, Relation::Member, "contributor", "ia-s-bundled").await;
+	suspend(&bundled).await;
+	let x = sign(&bundled, &post(&bundled));
+	let mut a = claims(&voucher, "APRV");
+	a.aud = Some(CLUB.into());
+	a.sub = Some(action_hash(&x).into());
+	let a = sign(&voucher, &a);
+	meta.create_inbound_action(club, &action_hash(&x), &x, Some(&action_hash(&a)))
+		.await
+		.unwrap();
+	deliver(fx, CLUB, &a).await;
+	assert_eq!(admitted(fx, club, &action_hash(&x)).await, Deny, "bundled S token admitted");
+	let st = club_status(&bundled).await;
+	assert_eq!(st, Some(ProfileStatus::Suspended), "a bundled token: stays S");
+
+	// The helper the token exchange calls lifts Suspended only, so the member's roles come back;
+	// Blocked and Banned stay put and keep their roles withheld. The endpoint itself is tested in
+	// management_flows (`suspended_lift_*`).
+	for status in [ProfileStatus::Suspended, ProfileStatus::Blocked, ProfileStatus::Banned] {
+		let name = format!("ia-reactivate-{status:?}").to_lowercase();
+		let m = issuer(fx, CLUB, Relation::Member, "contributor", &name).await;
+		let f = cloudillo::meta_adapter::UpsertProfileFields {
+			status: Patch::Value(status),
+			..Default::default()
+		};
+		meta.upsert_profile(club, &m.id_tag, &f).await.unwrap();
+		cloudillo_core::profile_status::reactivate_suspended(&fx.app, club, &m.id_tag).await;
+		let (_, p) = meta.read_profile(club, &m.id_tag).await.unwrap();
+		let roles = meta.read_profile_roles(club, &m.id_tag).await.unwrap();
+		if status == ProfileStatus::Suspended {
+			assert_eq!(p.status, Some(ProfileStatus::Active), "{status:?}: reactivated");
+			assert!(roles.is_some_and(|r| r.iter().any(|r| &**r == "contributor")), "roles back");
+		} else {
+			assert_eq!(p.status, Some(status), "{status:?}: left as is");
+			assert!(roles.is_none(), "{status:?}: roles still withheld");
+		}
+	}
+
 	// We are the hat: a relay needs an audience, and an unrestricted member.
 	let member = issuer(fx, CLUB, Relation::Member, "contributor", "ia-hat-member").await;
 	let mut t = claims(&member, "POST");

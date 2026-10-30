@@ -316,7 +316,7 @@ async fn test_list_tasks() {
 }
 
 #[tokio::test]
-async fn test_list_stale_profiles_excludes_suspended() {
+async fn test_list_stale_profiles_includes_suspended() {
 	let (adapter, _temp) = create_test_adapter().await;
 	let tn_id = TnId(1);
 	adapter.create_tenant(tn_id, "test_user").await.ok();
@@ -344,7 +344,43 @@ async fn test_list_stale_profiles_excludes_suspended() {
 	let id_tags: Vec<String> = stale.iter().map(|(_, id_tag, _)| id_tag.to_string()).collect();
 
 	assert!(id_tags.iter().any(|t| t == "alice"), "active stale profile must be returned");
-	assert!(!id_tags.iter().any(|t| t == "bob"), "suspended profile must be excluded");
+	// Retrying is how an unreachable (Suspended) profile recovers
+	assert!(id_tags.iter().any(|t| t == "bob"), "suspended stale profile must be returned");
+}
+
+#[tokio::test]
+async fn test_list_stale_profiles_orders_suspended_last() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "test_user").await.ok();
+
+	let active =
+		UpsertProfileFields { typ: Patch::Value(ProfileType::Person), ..Default::default() };
+	for id_tag in ["alice", "carol"] {
+		adapter.upsert_profile(tn_id, id_tag, &active).await.expect("upsert active");
+	}
+	let suspended = UpsertProfileFields {
+		typ: Patch::Value(ProfileType::Person),
+		status: Patch::Value(ProfileStatus::Suspended),
+		..Default::default()
+	};
+	adapter
+		.upsert_profile(tn_id, "bob", &suspended)
+		.await
+		.expect("upsert suspended");
+
+	let ids = |rows: Vec<(TnId, Box<str>, Option<Box<str>>)>| -> Vec<String> {
+		rows.iter().map(|(_, id_tag, _)| id_tag.to_string()).collect()
+	};
+	// Count every stale non-S row (the tenant's own row may be one), so the limit is exact.
+	let all = ids(adapter.list_stale_profiles(0, 7 * 86400, 100).await.expect("list all"));
+	let n_active = u32::try_from(all.iter().filter(|t| *t != "bob").count()).unwrap();
+	assert!(n_active >= 2, "both active rows are stale");
+
+	let first = ids(adapter.list_stale_profiles(0, 7 * 86400, n_active).await.expect("list"));
+	assert!(!first.iter().any(|t| t == "bob"), "S row is ordered after every active row");
+	let more = ids(adapter.list_stale_profiles(0, 7 * 86400, n_active + 1).await.expect("list"));
+	assert!(more.iter().any(|t| t == "bob"), "S row still fits the next slot");
 }
 
 async fn make_image(

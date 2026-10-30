@@ -16,6 +16,7 @@ use crate::totp;
 use cloudillo_core::{
 	ActionVerifyFn, Auth,
 	extract::{IdTag, OptionalAuth, OptionalRequestId},
+	profile_status::reactivate_suspended,
 	roles::{active_member_role, expand_roles, expand_roles_preserving_extras},
 	settings::SettingValue,
 };
@@ -25,7 +26,7 @@ use cloudillo_types::{
 	action_types::{ACCESS_TOKEN_EXPIRY, CreateAction},
 	auth_adapter::{self, ActionToken, ListTenantsOptions},
 	meta_adapter::{
-		ListRefsOptions, PASSWORD_REF_TYPE, ProfileStatus, ProfileType, SHARE_FILE_REF_TYPE,
+		self, ListRefsOptions, PASSWORD_REF_TYPE, ProfileStatus, ProfileType, SHARE_FILE_REF_TYPE,
 		WELCOME_REF_TYPE,
 	},
 	roles::{check_hat_aprv, hat_peer, map_hat_role, parse_hat_roles},
@@ -494,6 +495,16 @@ fn hat_params_valid(query: &GetAccessTokenQuery) -> bool {
 			&& query.ref_id.is_none()
 			&& query.api_key.is_none()
 			&& query.via.is_none())
+}
+
+/// [`hat_peer`] for a partner that just signed the endorsement, so a connected Suspended
+/// partner counts.
+fn signed_hat_peer<S: AsRef<str>>(
+	p: &meta_adapter::Profile<S>,
+) -> (ProfileType, bool, Option<&str>) {
+	let (typ, usable, map) = hat_peer(p);
+	let back = p.status == Some(ProfileStatus::Suspended) && p.connected.is_connected();
+	(typ, usable || back, map)
 }
 
 /// B-side check of a session hat endorsement, returning the local role it maps to.
@@ -1032,12 +1043,33 @@ pub async fn get_access_token(
 					&endorsement,
 					&id_tag.0,
 					Timestamp::now().0,
-					peer.as_ref().map(hat_peer),
+					peer.as_ref().map(signed_hat_peer),
 				)?;
+				// The hat never lifts a restriction we placed on the member directly. Suspended
+				// is not ours: the member is lifted below.
+				match app.meta_adapter.read_profile(tn_id, &auth_action.iss).await {
+					Ok((_, p))
+						if p.status.is_some_and(|s| {
+							s != ProfileStatus::Suspended && s.restricts_access()
+						}) =>
+					{
+						warn!(member = %auth_action.iss, "Hat session denied - member restricted");
+						return Err(Error::PermissionDenied);
+					}
+					Ok(_) | Err(Error::NotFound) => {}
+					Err(e) => return Err(e),
+				}
+				// Every credential check passed: a fresh PROXY/APRV proves the peer is reachable.
+				// Later refusals (scope, token mint) refuse the request, not the credential, so
+				// the lift stands.
+				reactivate_suspended(&app, tn_id, &endorsement.iss).await;
 				Some((endorsement.iss, local))
 			}
 			None => None,
 		};
+		// Same proof of life as the hat partner above; lifted before the role read below,
+		// which must see `Active`.
+		reactivate_suspended(&app, tn_id, &auth_action.iss).await;
 
 		debug!(
 			"Creating access token with t={}, u={}, scope={:?}",
@@ -1049,18 +1081,7 @@ pub async fn get_access_token(
 		// Fetch profile roles from meta adapter and expand them
 		// Hat replaces, never adds: a hatted session does not consult the direct roles at all.
 		let read = match &hat {
-			Some((_, local)) => {
-				// The hat never lifts a restriction we placed on the member directly.
-				match app.meta_adapter.read_profile(tn_id, &auth_action.iss).await {
-					Ok((_, p)) if p.status.is_some_and(ProfileStatus::restricts_access) => {
-						warn!(member = %auth_action.iss, "Hat session denied - member restricted");
-						return Err(Error::PermissionDenied);
-					}
-					Ok(_) | Err(Error::NotFound) => {}
-					Err(e) => return Err(e),
-				}
-				Ok(Some(vec![local.clone()].into()))
-			}
+			Some((_, local)) => Ok(Some(vec![local.clone()].into())),
 			None => app.meta_adapter.read_profile_roles(tn_id, &auth_action.iss).await,
 		};
 		let profile_roles = match read {
@@ -1411,7 +1432,9 @@ pub async fn get_hat_endorse(
 	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	let verify_fn = app.ext::<ActionVerifyFn>()?;
-	let proxy = verify_fn(&app, tn_id, &query.token, Some(&addr.ip())).await?;
+	let proxy = verify_fn(&app, tn_id, &query.token, Some(&addr.ip()))
+		.await
+		.map_err(verify_failure_is_401)?;
 	let max_exp = Timestamp::from_now(PROXY_TOKEN_MAX_LIFETIME).0;
 	if proxy.aud.as_deref() != Some(&*id_tag.0)
 		|| !proxy_exchange_allowed(&proxy.t, proxy.exp.map(|e| e.0), max_exp)
@@ -1423,6 +1446,10 @@ pub async fn get_hat_endorse(
 		return Err(Error::ValidationError("invalid peer".into()));
 	}
 
+	// A fresh PROXY to us proves the member is reachable; lifted before the role read below,
+	// which must see `Active`. A later role or peer refusal refuses the endorsement, not the
+	// credential, so the lift stands.
+	reactivate_suspended(&app, tn_id, &proxy.iss).await;
 	// No active role here, no hat.
 	let role = active_member_role(&app, tn_id, &proxy.iss).await?.ok_or(Error::NotFound)?;
 

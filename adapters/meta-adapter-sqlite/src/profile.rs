@@ -883,19 +883,14 @@ pub(crate) async fn delete_public_key(db: &SqlitePool, id_tag: &str, key_id: &st
 /// - stale — `synced_at IS NULL` (never-synced stub rows from relationship
 ///   hooks) or `synced_at` older than `max_age_secs`, AND
 /// - within the give-up window — `synced_at IS NULL` or no older than
-///   `disable_after_secs`, AND
-/// - not `Suspended` (DB code `'S'`; `Active` is stored as NULL, so
-///   `status IS NULL` still passes).
+///   `disable_after_secs`.
 ///
-/// The `disable_after_secs` upper bound is the "give up" cutoff: once a remote
-/// has been unreachable for longer than that, the batch stops hammering it.
-/// Independently, `refresh_profile`'s error branch flips a continuously-failing
-/// profile to `Suspended` after `DEACTIVATE_AFTER_DAYS` (1 day), and excluding
-/// `Suspended` rows here is what makes suspension actually *stop* sync attempts
-/// — so a permanently-unreachable peer is hammered for at most ~1 day, not
-/// forever. Recovery is the explicit `POST /api/profiles/{id_tag}/refresh`
-/// endpoint or an admin un-suspend; both call `refresh_profile` directly and
-/// recover `S → A` on the next successful fetch.
+/// `Suspended` rows (DB code `'S'`) are included, as a successful refresh is how
+/// they recover `S → A`, but ordered last (`status = 'S'` is NULL for `Active`,
+/// which sorts first) so they only take leftover slots. Past the
+/// `disable_after_secs` cutoff the batch gives up; such a peer still recovers via
+/// a verified token exchange or inbound action (`reactivate_suspended` in
+/// `cloudillo_core::profile_status`) or `POST /api/profiles/{id_tag}/refresh`.
 ///
 /// Note: never-synced stub rows (`synced_at IS NULL`) cannot be suspended by the
 /// error-branch logic (it requires a prior success timestamp), so a
@@ -910,7 +905,7 @@ pub(crate) async fn list_stale_profiles(
 		"SELECT tn_id, id_tag, etag FROM profiles
 		WHERE (synced_at IS NULL OR synced_at < unixepoch() - ?1)
 		  AND (synced_at IS NULL OR synced_at >= unixepoch() - ?2)
-		  AND (status IS NULL OR status != 'S')
+		ORDER BY status = 'S', synced_at
 		LIMIT ?3",
 	)
 	.bind(max_age_secs)

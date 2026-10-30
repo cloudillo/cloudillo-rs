@@ -1423,6 +1423,8 @@ const PROF_SETTINGS: Route = Call("GET", "/api/profiles/m-contributor.test/setti
 const PROF_SETTING_PUT: Route =
 	Call("PUT", "/api/profiles/m-contributor.test/settings/zqm.k", r#"{"value":1}"#);
 const PATCH_FOLLOWER: Route = Call("PATCH", "/api/profiles/follower.test", "{}");
+const HAT_ENDORSE_BOGUS: Route = Get("/api/auth/hat-endorse?peer=alice.test&token=x");
+const EXCHANGE_BOGUS: Route = Get("/api/auth/access-token?token=x");
 const PUT_COMMUNITY: Route = Call("PUT", "/api/profiles/zqm-new.test", r#"{"type":"community"}"#);
 const PUT_COMMUNITY_BAD_REF: Route = Call(
 	"PUT",
@@ -1601,6 +1603,33 @@ pub const MG: &[Row] = &[
 		Call("PATCH", "/api/profiles/m-follower.test", "{}"),
 		"Deny",
 	),
+	// Suspended is set by profile sync only: neither PATCH accepts it, whoever asks.
+	(
+		"MG-581",
+		"owner@alice",
+		"",
+		Call("PATCH", "/api/profiles/follower.test", r#"{"status":"S"}"#),
+		"400",
+	),
+	(
+		"MG-582",
+		"m_leader@club",
+		"",
+		Call("PATCH", "/api/admin/profiles/m-follower.test", r#"{"status":"S"}"#),
+		"400",
+	),
+	// Token exchange and hat endorsement (both may lift Suspended) authenticate by the PROXY in
+	// `token`, never by the caller's bearer: no session, guest, share link or `idp_` key carries
+	// one. A valid PROXY needs a remote's key, which a curated row cannot sign; those paths are
+	// `suspended_lift_*` in management_flows.
+	("MG-583", "stranger@club", "", HAT_ENDORSE_BOGUS, "Deny"),
+	("MG-584", "g_read@club", "", HAT_ENDORSE_BOGUS, "Deny"),
+	("MG-585", "sharelink-r@club", "", HAT_ENDORSE_BOGUS, "Deny"),
+	("MG-586", "idp-mgmt@club", "", HAT_ENDORSE_BOGUS, "Deny"),
+	("MG-587", "stranger@club", "", EXCHANGE_BOGUS, "Deny"),
+	("MG-588", "g_read@club", "", EXCHANGE_BOGUS, "Deny"),
+	("MG-589", "sharelink-r@club", "", EXCHANGE_BOGUS, "Deny"),
+	("MG-590", "idp-mgmt@club", "", EXCHANGE_BOGUS, "Deny"),
 	// Community creation needs an invite or SADM; refused before any write either way.
 	("MG-42", "sharelink-w@alice", "", PUT_COMMUNITY, "Deny"),
 	("MG-43", "owner@alice", "", PUT_COMMUNITY_BAD_REF, "Deny"),

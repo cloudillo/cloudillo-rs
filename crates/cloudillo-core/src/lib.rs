@@ -31,6 +31,7 @@ pub mod middleware;
 pub mod prelude;
 pub mod profile_keys;
 pub mod profile_me_cache;
+pub mod profile_status;
 pub mod profile_visibility;
 pub mod proxy_token_cache;
 pub mod rate_limit;

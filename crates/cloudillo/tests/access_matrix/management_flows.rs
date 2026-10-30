@@ -511,6 +511,197 @@ async fn session_refresh_revocation() {
 	assert!(tok.is_none() && status_class(st) == Actual::Deny, "deleted tenant refresh: {st}");
 }
 
+mod sx {
+	//! Shared setup for the Suspended-lift tests.
+	use super::*;
+	use crate::fixture::{RemoteId, remote};
+	use cloudillo::auth_adapter::ActionToken;
+	use cloudillo::meta_adapter::{ProfileStatus, UpsertProfileFields};
+	use cloudillo::types::Timestamp;
+
+	pub async fn status(fx: &Fixture, id: &str) -> Option<ProfileStatus> {
+		fx.app
+			.meta_adapter
+			.read_profile(fx.tenants.club.tn_id, id)
+			.await
+			.unwrap()
+			.1
+			.status
+	}
+
+	pub async fn set_status(fx: &Fixture, id: &str, st: Option<ProfileStatus>) {
+		let f = UpsertProfileFields {
+			status: st.map_or(Patch::Null, Patch::Value),
+			..Default::default()
+		};
+		fx.app.meta_adapter.upsert_profile(fx.tenants.club.tn_id, id, &f).await.unwrap();
+	}
+
+	/// Key cached; a connected Suspended Person on club, with `roles` when given.
+	pub async fn seed(fx: &Fixture, name: &str, roles: Option<&str>) -> RemoteId {
+		let r = remote(name);
+		let meta = &fx.app.meta_adapter;
+		meta.add_profile_public_key(&r.id_tag, &r.key_id, &r.spki_b64, None)
+			.await
+			.unwrap();
+		let mut f = prof(ProfileType::Person);
+		f.connected = Patch::Value(ProfileConnectionStatus::Connected);
+		f.roles = Patch::Value(roles.map(|r| vec![r.into()]));
+		f.status = Patch::Value(ProfileStatus::Suspended);
+		meta.upsert_profile(fx.tenants.club.tn_id, &r.id_tag, &f).await.unwrap();
+		r
+	}
+
+	/// A short-lived PROXY from `r` to club.
+	pub fn claims(r: &RemoteId) -> ActionToken {
+		ActionToken {
+			iss: r.id_tag.as_str().into(),
+			k: r.key_id.as_str().into(),
+			t: "PROXY".into(),
+			aud: Some(CLUB.into()),
+			iat: Timestamp::now(),
+			exp: Some(Timestamp::from_now(60)),
+			..Default::default()
+		}
+	}
+
+	pub async fn get(fx: &Fixture, uri: &str) -> (StatusCode, Option<String>) {
+		let (st, b) = call(&fx.api, req(CLUB, Method::GET, uri, None, Body::empty())).await;
+		(st, find_str(&b, "token"))
+	}
+
+	pub async fn exchange(fx: &Fixture, token: &str, hat: &str) -> (StatusCode, Option<String>) {
+		get(fx, &format!("/api/auth/access-token?token={token}{hat}")).await
+	}
+}
+
+/// Suspended is the automatic "unreachable" state: a fresh, signed, audience-bound PROXY is proof
+/// of life and lifts it. A non-PROXY, a PROXY for another node, one without `exp`, or a forged one
+/// leaves the member Suspended.
+#[tokio::test]
+async fn suspended_lift_on_session_exchange() {
+	use cloudillo::meta_adapter::ProfileStatus::{Active, Suspended};
+	use sx::{claims, exchange, seed, set_status, status};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let club = fx.tenants.club.tn_id;
+
+	let member = seed(fx, "zqm-sx-member", Some("contributor")).await;
+	let mut post = claims(&member);
+	post.t = "POST".into();
+	let mut elsewhere = claims(&member);
+	elsewhere.aud = Some(ALICE.into());
+	let mut no_exp = claims(&member);
+	no_exp.exp = None;
+	for (what, c) in [("a non-PROXY", post), ("a PROXY for alice", elsewhere), ("no exp", no_exp)] {
+		let (st, tok) = exchange(fx, &sign(&member, &c), "").await;
+		assert!(tok.is_none() && !st.is_success(), "{what}: {st}");
+		assert_eq!(status(fx, &member.id_tag).await, Some(Suspended), "{what}: still S");
+	}
+	let (st, tok) = exchange(fx, &sign(&member, &claims(&member)), "").await;
+	let tok = tok.unwrap_or_else(|| panic!("suspended member session: {st}"));
+	let auth = fx.app.auth_adapter.validate_access_token(club, CLUB, &tok).await.unwrap();
+	assert!(auth.roles.iter().any(|r| &**r == "contributor"), "roles back: {:?}", auth.roles);
+	assert_eq!(status(fx, &member.id_tag).await, Some(Active), "lifted by the exchange");
+	// Forged last: the failed verify refetches the member's key and caches the failure.
+	set_status(fx, &member.id_tag, Some(Suspended)).await;
+	let forger = crate::fixture::remote("zqm-sx-forger");
+	let (st, tok) = exchange(fx, &sign(&forger, &claims(&member)), "").await;
+	assert!(tok.is_none() && !st.is_success(), "a forged PROXY: {st}");
+	assert_eq!(status(fx, &member.id_tag).await, Some(Suspended), "forged: still S");
+}
+
+/// A hat session with a Suspended partner (`peer`): the partner's signed APRV and the member's
+/// PROXY are proof of life, so a valid hat lifts both. A refused hat lifts neither, and neither
+/// does one for a member we Blocked — that standing check runs before any lift.
+#[tokio::test]
+async fn suspended_lift_on_hat_exchange() {
+	use cloudillo::meta_adapter::ProfileStatus::{Active, Blocked, Suspended};
+	use cloudillo::types::Timestamp;
+	use sx::{claims, exchange, seed, set_status, status};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+
+	let other = seed(fx, "zqm-sx-other", None).await;
+	let hatted = seed(fx, "zqm-sx-hatted", None).await;
+	let blocked = seed(fx, "zqm-sx-blocked", None).await;
+	set_status(fx, &blocked.id_tag, Some(Blocked)).await;
+	let peer = fx.peer.id_tag.clone();
+	let peer_status = status(fx, &peer).await;
+	set_status(fx, &peer, Some(Suspended)).await;
+	let aprv = |sub: &str, exp: Option<Timestamp>| {
+		let mut c = claims(&fx.peer);
+		c.t = "APRV".into();
+		c.c = Some(serde_json::json!({ "r": "contributor" }));
+		c.sub = Some(format!("@{sub}").into());
+		c.exp = exp;
+		format!("&hat={}", sign(&fx.peer, &c))
+	};
+	let soon = Some(Timestamp::from_now(60));
+
+	// Run every exchange first and restore `peer` before asserting, so a failed assert never
+	// leaves the shared fixture's partner modified.
+	let mut seen = Vec::new();
+	for (what, member, hat) in [
+		("another sub", &hatted, aprv(&other.id_tag, soon)),
+		("no exp", &hatted, aprv(&hatted.id_tag, None)),
+		("a blocked member", &blocked, aprv(&blocked.id_tag, soon)),
+	] {
+		let (st, tok) = exchange(fx, &sign(member, &claims(member)), &hat).await;
+		let after = (status(fx, &peer).await, status(fx, &member.id_tag).await);
+		seen.push((what, st, tok.is_some(), after));
+	}
+	let (st, tok) =
+		exchange(fx, &sign(&hatted, &claims(&hatted)), &aprv(&hatted.id_tag, soon)).await;
+	let valid = (st, tok.is_some(), status(fx, &peer).await, status(fx, &hatted.id_tag).await);
+	set_status(fx, &peer, peer_status).await;
+
+	for (what, st, minted, (partner, member)) in seen {
+		assert!(!minted && !st.is_success(), "hat with {what}: {st}");
+		assert_eq!(partner, Some(Suspended), "hat with {what}: partner S");
+		let want = if what == "a blocked member" { Blocked } else { Suspended };
+		assert_eq!(member, Some(want), "hat with {what}: member unchanged");
+	}
+	let (st, minted, partner, member) = valid;
+	assert!(minted, "a valid hat from a suspended partner: {st}");
+	assert_eq!(partner, Some(Active), "valid hat: partner lifted");
+	assert_eq!(member, Some(Active), "valid hat: member lifted");
+}
+
+/// `/hat-endorse` (club is the hat): a fresh PROXY to us lifts its Suspended issuer, a non-PROXY
+/// does not. An admin may also lift S by hand (that neither PATCH *sets* S is MG-581/582).
+#[tokio::test]
+async fn suspended_lift_on_hat_endorse() {
+	use cloudillo::auth_adapter::ActionToken;
+	use cloudillo::meta_adapter::ProfileStatus::{Active, Suspended};
+	use sx::{claims, get, seed, set_status, status};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let peer = fx.peer.id_tag.clone();
+
+	let endorsed = seed(fx, "zqm-sx-endorsed", Some("contributor")).await;
+	let mut post = claims(&endorsed);
+	post.t = "POST".into();
+	let endorse = |c: &ActionToken| {
+		let uri = format!("/api/auth/hat-endorse?peer={peer}&token={}", sign(&endorsed, c));
+		async move { get(fx, &uri).await }
+	};
+	let (st, _) = endorse(&post).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "hat-endorse with a non-PROXY");
+	assert_eq!(status(fx, &endorsed.id_tag).await, Some(Suspended), "non-PROXY: still S");
+	let (st, _) = endorse(&claims(&endorsed)).await;
+	assert_eq!(st, StatusCode::OK, "hat-endorse for a suspended member");
+	assert_eq!(status(fx, &endorsed.id_tag).await, Some(Active), "hat-endorse lifts it");
+
+	let id = &endorsed.id_tag;
+	set_status(fx, id, Some(Suspended)).await;
+	let leader = fx.subject("m-leader@club.test");
+	let admin = format!("/api/admin/profiles/{id}");
+	let (st, b) = send(fx, leader, Method::PATCH, &admin, r#"{"status":"A"}"#).await;
+	assert!(st.is_success(), "leader lifts S: {st} {b}");
+	assert_eq!(status(fx, id).await, Some(Active), "admin lift");
+}
+
 /// A community leader's `PATCH /api/me` edits the community's record, not its own.
 #[tokio::test]
 async fn me_patch_edits_the_tenant_record() {

@@ -2408,7 +2408,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	///   (stale but not yet abandoned).
 	///
 	/// Profiles with `synced_at < now - disable_after_secs` are excluded so the
-	/// refresh batch stops attempting persistently failing remotes.
+	/// refresh batch stops attempting persistently failing remotes. `Suspended` rows
+	/// are included: a successful refresh is how an unreachable profile recovers.
 	/// Returns `Vec<(tn_id, id_tag, etag)>` tuples for conditional refresh requests.
 	async fn list_stale_profiles(
 		&self,

@@ -159,6 +159,17 @@ fn check_hat_roles_patch(
 	Ok(Some((map, connected)))
 }
 
+/// Suspended is the automatic "unreachable" state: only profile sync sets it, so a verified
+/// contact may lift it (`cloudillo_core::profile_status::reactivate_suspended`). Every other
+/// status, Active included, is still accepted, so an admin can lift S by hand; moderation uses
+/// Blocked/Banned.
+fn refuse_suspended(status: Patch<ProfileStatus>) -> ClResult<()> {
+	if matches!(status, Patch::Value(ProfileStatus::Suspended)) {
+		return Err(Error::ValidationError("status S is set by profile sync only".into()));
+	}
+	Ok(())
+}
+
 /// PATCH /admin/profile/:idTag - Update another user's profile data (admin only)
 ///
 /// The route is mounted behind `check_perm_profile("admin")` ABAC middleware
@@ -175,6 +186,7 @@ pub async fn patch_profile_admin(
 	Json(patch): Json<AdminProfilePatch>,
 ) -> ClResult<(StatusCode, Json<UpdateProfileResponse>)> {
 	let tn_id = auth.tn_id;
+	refuse_suspended(patch.status)?;
 
 	// Snapshot prior status + sync provenance so we can detect S → (anything-else)
 	// transitions and decide whether an immediate refresh makes sense. Done here,
@@ -439,6 +451,7 @@ pub async fn patch_profile_relationship(
 	Json(patch): Json<PatchProfileRelationshipRequest>,
 ) -> ClResult<StatusCode> {
 	let tn_id = auth.tn_id;
+	refuse_suspended(patch.status)?;
 	if !patch.hats.is_undefined() {
 		cloudillo_core::abac::require_tenant_self(&auth, &tenant_id_tag, "hats")?;
 	}
@@ -481,10 +494,9 @@ pub async fn patch_profile_relationship(
 /// local mirror of `id_tag` from its home server, bypassing the scheduled
 /// staleness/abandonment window.
 ///
-/// The scheduled `ProfileRefreshBatchTask` stops attempting a mirror once it is
-/// flipped to `Suspended` — `refresh_profile`'s error branch suspends a
-/// continuously-failing profile after `DEACTIVATE_AFTER_DAYS`, and
-/// `list_stale_profiles` excludes `Suspended` rows from the batch. This is the
+/// The scheduled `ProfileRefreshBatchTask` stops attempting a mirror once its last
+/// success is older than `DISABLE_REFRESH_AFTER_DAYS` (`refresh_profile`'s error
+/// branch has suspended it long before, after `DEACTIVATE_AFTER_DAYS`). This is the
 /// explicit, on-demand recovery path for such a row: a forced, unconditional
 /// `refresh_profile(.., None)` that re-fetches `/me`, re-syncs the `vis.pf`
 /// picture variant, stores `profile_pic`, bumps `synced_at` back to now, and

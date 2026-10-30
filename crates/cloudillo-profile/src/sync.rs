@@ -266,9 +266,8 @@ pub(crate) async fn apply_refresh(
 		.await
 		.ok()
 		.and_then(|(_, p)| p.status);
-	let reactivate = matches!(prev_status, Some(ProfileStatus::Suspended));
-	let reactivate_status =
-		if reactivate { Patch::Value(ProfileStatus::Active) } else { Patch::Undefined };
+	let reactivate_status = cloudillo_core::profile_status::lifted(prev_status);
+	let reactivate = !reactivate_status.is_undefined();
 
 	match result {
 		Ok(ConditionalResult::NotModified) => {
