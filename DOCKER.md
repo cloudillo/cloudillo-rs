@@ -403,7 +403,8 @@ sudo chown -R 10001:10001 /var/vol/cloudillo /var/vol/cloudillo-backup
 If you need a different UID/GID (e.g., to match an existing user), rebuild the image with custom build arguments:
 
 ```bash
-docker build --build-arg UID=1000 --build-arg GID=1000 -t cloudillo/cloudillo:custom .
+docker build --build-arg RS_REF=vX.Y.Z --build-arg FRONTEND_REF=vX.Y.Z \
+	--build-arg UID=1000 --build-arg GID=1000 -t cloudillo/cloudillo:custom .
 ```
 
 ## Getting Help

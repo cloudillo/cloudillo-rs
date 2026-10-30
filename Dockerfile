@@ -1,12 +1,10 @@
 # BUILD ARGUMENTS #
 ###################
 
-# Source refs default to the release tag of this version (bump with the workspace
-# version in Cargo.toml). Never a branch. Tag-pinned, not commit-pinned: tags are mutable;
-# pass a commit SHA via `--build-arg RS_REF=<sha>` (and FRONTEND_REF) for byte-reproducible
-# builds.
-ARG RS_REF=v0.8.21
-ARG FRONTEND_REF=v0.8.21
+# Source refs are required (release.sh passes the release tag). Never a branch. Tags are
+# mutable; pass commit SHAs for byte-reproducible builds.
+ARG RS_REF
+ARG FRONTEND_REF
 ARG UID=10001
 ARG GID=10001
 
@@ -19,7 +17,7 @@ ARG RS_REF
 WORKDIR /app
 RUN apt-get update && apt-get install -y libssl-dev pkg-config git
 # fetch, not `clone --branch`: takes a tag or a commit SHA
-RUN git init -q && git fetch --depth 1 https://github.com/cloudillo/cloudillo-rs.git ${RS_REF} && git checkout -q FETCH_HEAD
+RUN git init -q && git fetch --depth 1 https://github.com/cloudillo/cloudillo-rs.git "${RS_REF:?pass --build-arg RS_REF=<tag>}" && git checkout -q FETCH_HEAD
 # Disable sccache wrapper (not available in Docker)
 ENV RUSTC_WRAPPER=""
 # cargo auditable embeds the resolved crate list in the binary (kept by strip), so scanners
@@ -48,10 +46,10 @@ RUN pip3 install --break-system-packages fonttools brotli
 # Matches packageManager in the frontend's package.json
 RUN npm install -g pnpm@11.4.0
 # fetch, not `clone --branch`: takes a tag or a commit SHA
-RUN git init -q && git fetch --depth 1 https://github.com/cloudillo/cloudillo.git ${FRONTEND_REF} && git checkout -q FETCH_HEAD
+RUN git init -q && git fetch --depth 1 https://github.com/cloudillo/cloudillo.git "${FRONTEND_REF:?pass --build-arg FRONTEND_REF=<tag>}" && git checkout -q FETCH_HEAD
 # Lockfile-bound only; @symbion/opalui comes from npm, pinned by the lockfile.
 RUN pnpm install --frozen-lockfile
-# Ensure fonts are downloaded with TTF files (postinstall may run before wawoff2 is ready)
+# Ensure fonts are downloaded with TTF files (postinstall may run before fonttools is set up)
 RUN node libs/fonts/scripts/download-fonts.js --force
 ENV COMPRESS=true
 RUN pnpm -r --filter '!@cloudillo/storybook' build
