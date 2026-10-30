@@ -36,6 +36,10 @@ for t in git jq cargo cargo-deny cargo-llvm-cov cargo-cyclonedx cyclonedx syft c
 	command -v "$t" > /dev/null || fail "$t not found"
 done
 docker buildx version > /dev/null || fail "docker buildx not available"
+# The default `docker` driver cannot attach provenance or push by digest.
+export BUILDX_BUILDER=cloudillo-release
+docker buildx inspect > /dev/null 2>&1 \
+	|| docker buildx create --name cloudillo-release --driver docker-container > /dev/null
 [ -r "$COSIGN_KEY" ] || fail "cosign key $COSIGN_KEY not readable"
 [ -r cosign.pub ] || fail "cosign.pub missing (README \"Releasing\", one-time setup)"
 [ -d "$FRONTEND_DIR/.git" ] || fail "frontend checkout $FRONTEND_DIR not found"
