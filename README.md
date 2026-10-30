@@ -156,8 +156,7 @@ and `gh auth login`; the release key from the one-time setup below. The frontend
    git tag -a vX.Y.Z -m "Cloudillo X.Y.Z" && git push origin vX.Y.Z
    ```
    `vX.Y.0` is tagged on `main`. Later `vX.Y.Z` are tagged on `release/X.Y` or `lts/X.Y` once the
-   line has such a branch (on `main` before that). A patch release (`Z > 0`) that adds a schema
-   migration is refused unless the tag message contains the line `Release-Allow-Migration: yes`.
+   line has such a branch (on `main` before that).
 3. `./release.sh vX.Y.Z` checks that both tags are pushed unchanged, the versions and the
    changelog, runs `cargo deny check`, the frontend `pnpm audit` and the full test suite with
    coverage (including the access matrix), then asks you to type `X.Y.Z` to go on. Nothing is

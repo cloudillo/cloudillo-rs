@@ -1,0 +1,45 @@
+# cargo-deny configuration: `cargo deny check` (advisories, bans, licenses, sources).
+# Run by .github/workflows/audit.yaml.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# No fixed release exists for these; re-check on every dependency bump.
+ignore = [
+	{ id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken: Cloudillo signs and verifies ES384 only, never uses an RSA private key" },
+	{ id = "RUSTSEC-2024-0436", reason = "paste (unmaintained proc-macro) via image/exr and rav1e: build-time only, no replacement upstream" },
+	{ id = "RUSTSEC-2026-0215", reason = "smallstr (unmaintained) via yrs: no replacement upstream" },
+	{ id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml (unmaintained) via serde_yaml in cloudillo-email: parses bundled templates only" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# Every expression in Cargo.lock must be satisfiable from this list.
+allow = [
+	"0BSD",
+	"Apache-2.0",
+	"BSD-2-Clause",
+	"BSD-3-Clause",
+	"CDLA-Permissive-2.0",
+	"ISC",
+	"MIT",
+	"MPL-2.0",
+	"NCSA",
+	"Unicode-3.0",
+	"Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

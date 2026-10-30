@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# Builds, SBOMs, signs and publishes release vX.Y.Z from this workstation.
+# Spec: 2-03-sbom-signed-releases-spec.md §3-§6; 3-01-lts-release-line-spec.md §4, §11 step 4.
+# Release steps are in README.md "Releasing"; operator verification in DOCKER.md.
+#
+# Usage: ./release.sh vX.Y.Z
+# Env: FRONTEND_DIR (default ../cloudillo), COSIGN_KEY (default ~/.cosign/cloudillo.key),
+#      IMAGE (default docker.io/cloudillo/cloudillo)
+#
+# Everything before the typed confirmation is local and read-only (apart from git fetch and
+# target/); everything after it pushes.
+
+set -euo pipefail
+
+fail() { echo "error: $*" >&2; exit 1; }
+
+[ $# -eq 1 ] || fail "usage: $0 vX.Y.Z"
+TAG=$1
+VERSION="${TAG#v}"
+[[ "$TAG" == v* && "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || fail "tag $TAG is not vX.Y.Z"
+LINE="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+PATCH="${BASH_REMATCH[3]}"
+
+cd "$(dirname "$0")"
+export LC_ALL=C RUSTC_WRAPPER="" CARGO_TERM_COLOR=always
+FRONTEND_DIR=${FRONTEND_DIR:-../cloudillo}
+COSIGN_KEY=${COSIGN_KEY:-$HOME/.cosign/cloudillo.key}
+IMAGE=${IMAGE:-docker.io/cloudillo/cloudillo}
+DIST="target/release-dist/$VERSION"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+# Tools and credentials
+for t in git jq cargo cargo-deny cargo-llvm-cov cargo-cyclonedx cyclonedx syft cosign docker gh \
+	pnpm npx sha256sum; do
+	command -v "$t" > /dev/null || fail "$t not found"
+done
+docker buildx version > /dev/null || fail "docker buildx not available"
+[ -r "$COSIGN_KEY" ] || fail "cosign key $COSIGN_KEY not readable"
+[ -r cosign.pub ] || fail "cosign.pub missing (README \"Releasing\", one-time setup)"
+[ -d "$FRONTEND_DIR/.git" ] || fail "frontend checkout $FRONTEND_DIR not found"
+
+# Both checkouts clean, on the tag, and the tag pushed unchanged: the Dockerfile clones both
+# repositories from GitHub at the tag, so the pushed tag is what gets built.
+for repo in . "$FRONTEND_DIR"; do
+	git -C "$repo" fetch origin --tags
+	[ -z "$(git -C "$repo" status --porcelain)" ] || fail "$repo has uncommitted changes"
+	local_tag=$(git -C "$repo" rev-parse -q --verify "refs/tags/$TAG") \
+		|| fail "$TAG does not exist in $repo"
+	[ "$(git -C "$repo" rev-parse HEAD)" = "$(git -C "$repo" rev-parse "$TAG^{commit}")" ] \
+		|| fail "$repo is not checked out at $TAG"
+	remote_tag=$(git -C "$repo" ls-remote origin "refs/tags/$TAG" | cut -f1)
+	[ "$remote_tag" = "$local_tag" ] || fail "$TAG in $repo is not pushed to origin unchanged"
+done
+
+# Tag, version, branch and changelog gates
+[ "$(git cat-file -t "$TAG")" = tag ] || fail "$TAG must be an annotated tag"
+[ "$(git -C "$FRONTEND_DIR" cat-file -t "$TAG")" = tag ] \
+	|| fail "$TAG in cloudillo/cloudillo must be an annotated tag"
+
+cargo_version=$(cargo metadata --no-deps --format-version 1 --locked \
+	| jq -r '.packages[] | select(.name == "cloudillo-server") | .version')
+[ "$cargo_version" = "$VERSION" ] || fail "Cargo.toml version $cargo_version != $VERSION"
+frontend_version=$(jq -r .version "$FRONTEND_DIR/package.json")
+[ "$frontend_version" = "$VERSION" ] \
+	|| fail "frontend package.json version $frontend_version != $VERSION"
+grep -qF "## [$VERSION]" CHANGELOG.md || fail "CHANGELOG.md has no '## [$VERSION]' section"
+
+# Branch model (3-01 §4): vX.Y.0 from main; later patches from release/X.Y or
+# lts/X.Y once the line has such a branch, from main before it.
+commit=$(git rev-parse "$TAG^{commit}")
+if [ "$PATCH" = 0 ] \
+	|| [ -z "$(git branch -r --list "origin/release/$LINE" "origin/lts/$LINE")" ]; then
+	want="origin/main"
+else
+	want="origin/release/$LINE origin/lts/$LINE"
+fi
+on=$(git branch -r --contains "$commit" | tr -d ' ')
+ok=
+for b in $want; do grep -qxF "$b" <<< "$on" && ok=1; done
+[ -n "$ok" ] || fail "$TAG ($commit) is not on $want"
+
+# ponytail: no migration gate for patch releases (3-01 §11 step 4) while in alpha; restore it
+# from git history when the LTS line starts.
+
+# Dependency policy and audit
+cargo deny check
+(cd "$FRONTEND_DIR" && pnpm audit --prod --audit-level high)
+
+# Full test suite with coverage (includes the access matrix), and its evidence
+rm -rf "$DIST"
+mkdir -p "$DIST"
+find target -name 'access-matrix-*.md' -delete 2>/dev/null || true
+cargo llvm-cov --workspace --locked --no-report
+cargo llvm-cov report --summary-only | tee "$DIST/cloudillo-$VERSION-coverage.txt"
+mapfile -t reports < <(find target -name 'access-matrix-*.md' | sort)
+[ "${#reports[@]}" -gt 0 ] || fail "no access-matrix report found"
+for f in "${reports[@]}"; do cat "$f"; echo; done > "$DIST/cloudillo-$VERSION-access-matrix.md"
+
+# Approval: everything below pushes.
+echo
+echo "Release $TAG at commit $commit, image $IMAGE"
+read -rp "Type $VERSION to build, sign and publish: " answer
+[ "$answer" = "$VERSION" ] || fail "not confirmed"
+
+# Build and push the image (untagged). The Dockerfile clones both repositories at RS_REF /
+# FRONTEND_REF; both are this tag, so the image is built from the sources tested above. Pushed
+# by digest only: the version tags are added once every gate below has passed.
+# provenance keeps the push an image index, so `imagetools create` copies it unchanged.
+docker buildx build --build-arg "RS_REF=$TAG" --build-arg "FRONTEND_REF=$TAG" \
+	--provenance=mode=min --metadata-file "$DIST/../build-meta.json" \
+	--output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" .
+DIGEST=$(jq -r '."containerimage.digest"' "$DIST/../build-meta.json")
+[[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "bad digest '$DIGEST'"
+echo "$DIGEST" > "$DIST/cloudillo-$VERSION.image-digest.txt"
+
+# SBOM parts
+cargo cyclonedx --manifest-path server/Cargo.toml --format json --spec-version 1.5 \
+	--target x86_64-unknown-linux-gnu --override-filename cloudillo-server
+mv server/cloudillo-server.json "$DIST/cloudillo-$VERSION-server.cdx.json"
+
+npx --yes @cyclonedx/cdxgen@12.8.7 -t js --no-install-deps --spec-version 1.5 \
+	-o "$DIST/cloudillo-$VERSION-frontend.cdx.json" "$FRONTEND_DIR"
+
+jq --arg v "$VERSION" '.metadata.component.version = $v' sbom/native-components.cdx.json \
+	> "$DIST/cloudillo-$VERSION-native.cdx.json"
+
+# Gate: server SBOM covers the resolved dependency graph
+cargo metadata --format-version 1 --locked --filter-platform x86_64-unknown-linux-gnu \
+	| jq -r '
+		(.resolve.nodes | map({key: .id, value: [.deps[]
+			| select(any(.dep_kinds[]; .kind == null)) | .pkg]}) | from_entries) as $g
+		| (.packages | map({key: .id, value: "\(.name)@\(.version)"}) | from_entries) as $n
+		| def reach: . as $s | ($s + [$s[] | $g[.][]] | unique) as $t
+			| if ($t | length) == ($s | length) then $s else ($t | reach) end;
+		[.packages[] | select(.name == "cloudillo-server") | .id] | reach | .[] | $n[.]' \
+	| sort -u > "$WORK/expected.txt"
+jq -r '.metadata.component // empty, (.components[]? | recurse(.components[]?))
+		| "\(.name)@\(.version)"' "$DIST/cloudillo-$VERSION-server.cdx.json" \
+	| sort -u > "$WORK/declared-server.txt"
+comm -23 "$WORK/expected.txt" "$WORK/declared-server.txt" | tee "$WORK/missing.txt"
+[ ! -s "$WORK/missing.txt" ] || fail "server SBOM misses resolved packages"
+
+# Release SBOM (merge, complete, validate)
+out="$DIST/cloudillo-$VERSION.cdx.json"
+cyclonedx merge --hierarchical --name cloudillo --version "$VERSION" \
+	--input-files "$DIST/cloudillo-$VERSION-server.cdx.json" \
+		"$DIST/cloudillo-$VERSION-frontend.cdx.json" "$DIST/cloudillo-$VERSION-native.cdx.json" \
+	--output-format json --output-file "$WORK/merged.cdx.json"
+jq --arg v "$VERSION" --arg d "$DIGEST" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+	--arg uuid "$(cat /proc/sys/kernel/random/uuid)" '
+		.serialNumber //= "urn:uuid:\($uuid)"
+		| .metadata.timestamp = $ts
+		| .metadata.tools //= {components: [
+			{type: "application", name: "cyclonedx-cli", version: "0.33.1"},
+			{type: "application", name: "cargo-cyclonedx", version: "0.5.9"},
+			{type: "application", name: "cdxgen", version: "12.8.7"}]}
+		| .metadata.component += {type: "container", name: "cloudillo", version: $v,
+			purl: "pkg:docker/cloudillo/cloudillo@\($v)",
+			licenses: [{license: {id: "MPL-2.0"}}],
+			externalReferences: [{type: "distribution",
+				url: "docker.io/cloudillo/cloudillo@\($d)"}]}' "$WORK/merged.cdx.json" > "$out"
+for f in "$DIST"/*.cdx.json; do cyclonedx validate --input-file "$f" --fail-on-errors; done
+
+# Gate: syft cross-check. syft sees in the FROM scratch image only what carries its own
+# metadata (e.g. crate lists embedded by cargo auditable); anything it finds must be declared.
+# The scratch image has no package database, so Debian package versions are checked on the
+# poppler-extractor stage (same builder, same layers) against the native part.
+syft scan "registry:$IMAGE@$DIGEST" -o "cyclonedx-json=$WORK/image.cdx.json"
+jq -r '.components[]? | select(.purl) | "\(.name)@\(.version)"' "$WORK/image.cdx.json" \
+	| sort -u > "$WORK/found.txt"
+jq -r '.metadata.component // empty, .components[]? | recurse(.components[]?)
+		| "\(.name)@\(.version)"' "$out" | sort -u > "$WORK/declared.txt"
+comm -23 "$WORK/found.txt" "$WORK/declared.txt" | tee "$WORK/undeclared.txt"
+
+docker buildx build --target poppler-extractor --load -t cloudillo-native-check .
+syft scan docker:cloudillo-native-check -o "syft-json=$WORK/stage.json"
+jq -rn --slurpfile s "$WORK/stage.json" --slurpfile n sbom/native-components.cdx.json '
+	($s[0].artifacts | map(select(.type == "deb") | {key: .name, value: .version})
+		| from_entries) as $have
+	| $n[0].components[] | select((.purl // "") | startswith("pkg:deb/"))
+	| select($have[.name] != null and $have[.name] != .version)
+	| "\(.name): native SBOM \(.version), build \($have[.name])"' | tee "$WORK/drift.txt"
+
+[ ! -s "$WORK/undeclared.txt" ] || fail "image holds undeclared components"
+[ ! -s "$WORK/drift.txt" ] || fail "sbom/native-components.cdx.json is stale"
+
+# Sign the image, attest the SBOM, sign the checksums (cosign prompts for COSIGN_PASSWORD
+# unless it is set).
+cosign sign --yes --key "$COSIGN_KEY" "$IMAGE@$DIGEST"
+cosign attest --yes --key "$COSIGN_KEY" --type cyclonedx --predicate "$out" "$IMAGE@$DIGEST"
+(
+	cd "$DIST"
+	sha256sum cloudillo-* > SHA256SUMS
+	cosign sign-blob --yes --key "$COSIGN_KEY" --bundle SHA256SUMS.sigstore.json SHA256SUMS
+)
+
+# Self-check of the operator verification, with the committed public key
+pub="$PWD/cosign.pub"
+(
+	cd "$DIST"
+	cosign verify-blob --key "$pub" --bundle SHA256SUMS.sigstore.json SHA256SUMS
+	sha256sum -c SHA256SUMS
+)
+cosign verify --key cosign.pub "$IMAGE@$DIGEST" > /dev/null
+cosign verify-attestation --key cosign.pub --type cyclonedx "$IMAGE@$DIGEST" > /dev/null
+
+# Tag the image. :X.Y follows the newest release of its line; :latest only the newest release
+# overall.
+tags=(-t "$IMAGE:$VERSION" -t "$IMAGE:${VERSION%.*}")
+newest=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -n1)
+[ "$newest" != "$TAG" ] || tags+=(-t "$IMAGE:latest")
+docker buildx imagetools create "${tags[@]}" "$IMAGE@$DIGEST"
+
+# Publish crates (credentials from `cargo login`)
+cargo publish --workspace --locked
+
+# GitHub release (credentials from `gh auth login`)
+{
+	awk -v h="## [$VERSION]" 'index($0, h) == 1 { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md
+	# shellcheck disable=SC2016 # Markdown backticks
+	printf '\n## Image\n\n`cloudillo/cloudillo@%s`\n\n' "$DIGEST"
+	printf 'Verify before installing: DOCKER.md, "Verifying a release".\n'
+} > "$WORK/notes.md"
+gh release create "$TAG" --verify-tag --title "Cloudillo $VERSION" \
+	--notes-file "$WORK/notes.md" "$DIST"/*
+
+echo "Released $TAG: $IMAGE@$DIGEST"
