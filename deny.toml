@@ -13,6 +13,7 @@ ignore = [
 	{ id = "RUSTSEC-2024-0436", reason = "paste (unmaintained proc-macro) via image/exr and rav1e: build-time only, no replacement upstream" },
 	{ id = "RUSTSEC-2026-0215", reason = "smallstr (unmaintained) via yrs: no replacement upstream" },
 	{ id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml (unmaintained) via serde_yaml in cloudillo-email: parses bundled templates only" },
+	{ id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 via jsonwebtoken's p256/p384 0.13: no fixed 0.5.x; drop when jsonwebtoken moves to elliptic-curve 0.14" },
 ]
 
 [licenses]
