@@ -24,8 +24,8 @@ no section here.
   `script-src 'unsafe-inline'`; the inline boot script moved to `/assets-<ver>/boot.js`.
 - Pinned supply chain: base images by digest, source tarballs checked by SHA-256, pnpm by exact
   version, frontend installs with `--frozen-lockfile` only, CI actions by commit SHA.
-  `deny.toml` (licences, bans, sources) checked by `cargo deny check`; `cargo vet --locked` and a
-  coverage report in CI; native image components listed in `sbom/native-components.cdx.json`.
+  `deny.toml` (licences, bans, sources) checked by `cargo deny check`; a coverage report in
+  CI; native image components listed in `sbom/native-components.cdx.json`.
 - Signed releases: `release.sh` builds the image from the tag, publishes CycloneDX SBOMs and
   test evidence, and signs the image, the SBOM attestation and `SHA256SUMS` with the project's
   `cosign` key (`cosign.pub`). Verification steps are in [DOCKER.md](DOCKER.md#verifying-a-release).
