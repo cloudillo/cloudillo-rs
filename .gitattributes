@@ -1,0 +1,3 @@
+# Hand-written PDF fixtures are byte-exact (20-byte xref entries, required
+# trailing spaces). Never normalise them.
+*.pdf binary
