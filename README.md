@@ -147,8 +147,11 @@ and `gh auth login`; the release key from the one-time setup below. The frontend
 `../cloudillo` (override with `FRONTEND_DIR`), the key `~/.cosign/cloudillo.key` (`COSIGN_KEY`).
 
 1. Set the same version `X.Y.Z` in the workspace `Cargo.toml` and the frontend's `package.json`,
-   and rename `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) to `## [X.Y.Z] - YYYY-MM-DD`,
-   keeping its **Security** section.
+   and rename `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) and in
+   `../cloudillo/CHANGELOG.md` to `## [X.Y.Z] - YYYY-MM-DD`, keeping their **Security** sections.
+   The frontend section is drafted from the release post in `../cloudillo/claude-docs/POSTS.txt`,
+   keeping only what the web client implements. `release.sh` publishes a GitHub release in both
+   repositories from these sections.
 2. Push the same annotated tag to both repositories, the frontend first (the image build clones
    both from GitHub at the tag). Both local checkouts must be clean and checked out at the tag:
    ```bash

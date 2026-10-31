@@ -1,8 +1,9 @@
 # Changelog
 
-All notable changes to Cloudillo are listed here. The server (`cloudillo-rs`), the web client
-(`cloudillo`), the container image and the crates share one version number `X.Y.Z`. The format
-follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); how releases are cut is in
+All notable changes to the Cloudillo server (`cloudillo-rs`), the container image and the crates
+are listed here. Web client changes are in the
+[cloudillo changelog](https://github.com/cloudillo/cloudillo/blob/main/CHANGELOG.md); both share
+the version number `X.Y.Z`. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); how releases are cut is in
 [README.md](README.md#releasing).
 
 Every release has a **Security** section: security fixes and hardening, with links to the

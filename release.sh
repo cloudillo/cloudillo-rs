@@ -20,6 +20,10 @@ VERSION="${TAG#v}"
 [[ "$TAG" == v* && "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || fail "tag $TAG is not vX.Y.Z"
 LINE="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
 PATCH="${BASH_REMATCH[3]}"
+# Print the body of the "## [$VERSION]" section of changelog $1
+changelog_section() {
+	awk -v h="## [$VERSION]" 'index($0, h) == 1 { f = 1; next } /^## / { f = 0 } f' "$1"
+}
 
 cd "$(dirname "$0")"
 export LC_ALL=C RUSTC_WRAPPER="" CARGO_TERM_COLOR=always
@@ -69,6 +73,8 @@ frontend_version=$(jq -r .version "$FRONTEND_DIR/package.json")
 [ "$frontend_version" = "$VERSION" ] \
 	|| fail "frontend package.json version $frontend_version != $VERSION"
 grep -qF "## [$VERSION]" CHANGELOG.md || fail "CHANGELOG.md has no '## [$VERSION]' section"
+grep -qF "## [$VERSION]" "$FRONTEND_DIR/CHANGELOG.md" \
+	|| fail "frontend CHANGELOG.md has no '## [$VERSION]' section"
 
 # Branch model (3-01 §4): vX.Y.0 from main; later patches from release/X.Y or
 # lts/X.Y once the line has such a branch, from main before it.
@@ -158,6 +164,8 @@ echo "$DIGEST" > "$DIST/cloudillo-$VERSION.image-digest.txt"
 cargo cyclonedx --manifest-path server/Cargo.toml --format json --spec-version 1.5 \
 	--target x86_64-unknown-linux-gnu --override-filename cloudillo-server
 mv server/cloudillo-server.json "$DIST/cloudillo-$VERSION-server.cdx.json"
+# It writes one per workspace member; the leftovers would make `cargo publish` refuse.
+find . -name cloudillo-server.json -type f -not -path './target/*' -delete
 
 npx --yes @cyclonedx/cdxgen@12.8.7 -t js --no-install-deps --spec-version 1.5 \
 	-o "$DIST/cloudillo-$VERSION-frontend.cdx.json" "$FRONTEND_DIR"
@@ -245,12 +253,23 @@ cargo publish --workspace --locked
 
 # GitHub release (credentials from `gh auth login`)
 {
-	awk -v h="## [$VERSION]" 'index($0, h) == 1 { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md
+	changelog_section CHANGELOG.md
 	# shellcheck disable=SC2016 # Markdown backticks
 	printf '\n## Image\n\n`cloudillo/cloudillo@%s`\n\n' "$DIGEST"
 	printf 'Verify before installing: DOCKER.md, "Verifying a release".\n'
 } > "$WORK/notes.md"
 gh release create "$TAG" --verify-tag --title "Cloudillo $VERSION" \
 	--notes-file "$WORK/notes.md" "$DIST"/*
+
+# Frontend release; its SBOM's checksum and signature are in the server release's SHA256SUMS
+{
+	changelog_section "$FRONTEND_DIR/CHANGELOG.md"
+	printf '\n## Server and image\n\n'
+	# shellcheck disable=SC2016 # Markdown backticks
+	printf 'Server changes, container image `cloudillo/cloudillo@%s`, signed SBOMs and\n' "$DIGEST"
+	printf 'verification: https://github.com/cloudillo/cloudillo-rs/releases/tag/%s\n' "$TAG"
+} > "$WORK/frontend-notes.md"
+gh release create "$TAG" --repo cloudillo/cloudillo --verify-tag --title "Cloudillo $VERSION" \
+	--notes-file "$WORK/frontend-notes.md" "$DIST/cloudillo-$VERSION-frontend.cdx.json"
 
 echo "Released $TAG: $IMAGE@$DIGEST"
